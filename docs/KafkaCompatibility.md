@@ -8,8 +8,8 @@ Gap classes: `current` (fork max equals the Kafka max) · `behind:N` · `stub` (
 
 | API | Key | Kafka 4.3.1 | Flexible from | Fork | Gap | Notes |
 |---|--:|---|---|---|---|---|
-| Produce | 0 | 3-13 | v9+ | 0-7 | behind:6 (below-floor 0-2) | v8 per-record errors (KIP-467), v9 flexible, v10 leader hints (KIP-951), v11 TRANSACTION_ABORTABLE (KIP-890), v12 transaction-version-2 implicit add-partitions (KIP-890 part 2), v13 topic IDs (KIP-516, Kafka 4.1; may return UNKNOWN_TOPIC_ID). |
-| Fetch | 1 | 4-18 | v12+ | 0-11 | behind:7 (below-floor 0-3) | v11 rack / preferred read replica (KIP-392): the wire fields exist but the follower out-of-range and OFFSET_NOT_AVAILABLE handling does not. v12 flexible + LastFetchedEpoch, v13 topic IDs replace names (KIP-516), v14 OFFSET_MOVED_TO_TIERED_STORAGE (KIP-405), v15 ReplicaState (KIP-903), v16 leader hints (KIP-951), v17 ReplicaDirectoryId (KIP-853), v18 HighWatermark (KIP-1166). |
+| Produce | 0 | 3-13 | v9+ | 3-7 | behind:6 | v8 per-record errors (KIP-467), v9 flexible, v10 leader hints (KIP-951), v11 TRANSACTION_ABORTABLE (KIP-890), v12 transaction-version-2 implicit add-partitions (KIP-890 part 2), v13 topic IDs (KIP-516, Kafka 4.1; may return UNKNOWN_TOPIC_ID). |
+| Fetch | 1 | 4-18 | v12+ | 4-11 | behind:7 | v11 rack / preferred read replica (KIP-392): the wire fields exist but the follower out-of-range and OFFSET_NOT_AVAILABLE handling does not. v12 flexible + LastFetchedEpoch, v13 topic IDs replace names (KIP-516), v14 OFFSET_MOVED_TO_TIERED_STORAGE (KIP-405), v15 ReplicaState (KIP-903), v16 leader hints (KIP-951), v17 ReplicaDirectoryId (KIP-853), v18 HighWatermark (KIP-1166). |
 | ListOffsets | 2 | 1-11 | v6+ | 0-3 | behind:8 (below-floor 0) | v4 leader epoch (KIP-320), v6 flexible, v7 max-timestamp, v8 earliest-local offset (KIP-405). |
 | Metadata | 3 | 0-13 | v9+ | 0-6 | behind:7 | v7 leader epoch (KIP-320), v9 flexible, v10+ topic IDs, v13 adds a top-level error code and is where REBOOTSTRAP_REQUIRED surfaces (KIP-1102). |
 | OffsetCommit | 8 | 2-10 | v8+ | 0-5 | behind:5 (below-floor 0-1) | v6 committed leader epoch (KIP-320), v7 group instance id, v8 flexible, v9 member epoch (KIP-848), v10 topic IDs. |
@@ -72,10 +72,8 @@ Versions implemented here that the pinned broker rejects outright: dead code, an
 | DeleteTopics | 0 | v1 | Kafka 4.0 raised the DeleteTopics floor to v1. | phase-2 exit |
 | DescribeAcls | 0 | v1 | Kafka 4.0 raised the ACL API floors to v1. | phase-2 exit |
 | DescribeConfigs | 0 | v1 | Kafka 4.0 raised the DescribeConfigs floor to v1. | phase-2 exit |
-| Fetch | 0-3 | v4 | Message format v0/v1 read path for these request versions removed by KIP-724; Kafka 4.0 raised the Fetch floor to v4. | phase-2 exit |
 | ListOffsets | 0 | v1 | v0 returned an offset array and predates the timestamp API; Kafka 4.0 raised the floor to v1. | phase-2 exit |
 | OffsetCommit | 0-1 | v2 | v0/v1 stored offsets in ZooKeeper; Kafka 4.0 raised the floor to v2. | phase-2 exit |
-| Produce | 0-2 | v3 | Message format v0/v1 write path removed by KIP-724; Kafka 4.0 raised the Produce floor to v3. | phase-2 exit |
 
 ## Cross-cutting gaps
 

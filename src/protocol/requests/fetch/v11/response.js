@@ -1,5 +1,5 @@
 const Decoder = require('../../../decoder')
-const { parse: parseV1 } = require('../v1/response')
+const { parse: parseV4 } = require('../v4/response')
 const decodeMessages = require('../v4/decodeMessages')
 
 /**
@@ -65,5 +65,5 @@ const decode = async (rawData) => {
 
 module.exports = {
   decode,
-  parse: parseV1,
+  parse: parseV4,
 }

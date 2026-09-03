@@ -182,7 +182,7 @@ describe('scripts/compat/forkVersions', () => {
     })
 
     it('reads the implemented version sets', () => {
-      expect(result.apis.Produce.forkVersions).toEqual([0, 1, 2, 3, 4, 5, 6, 7])
+      expect(result.apis.Produce.forkVersions).toEqual([3, 4, 5, 6, 7])
       expect(result.apis.OffsetFetch.forkVersions).toEqual([1, 2, 3, 4])
       expect(result.apis.FindCoordinator.forkVersions).toEqual([0, 1, 2])
       expect(result.apis.OffsetForLeaderEpoch.stub).toBe(true)

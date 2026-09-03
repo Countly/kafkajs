@@ -1,62 +1,68 @@
 {
   "waivers": [
     {
-      "api": "Produce",
-      "versions": [0, 1, 2],
-      "reason": "Message format v0/v1 write path removed by KIP-724; Kafka 4.0 raised the Produce floor to v3.",
-      "until": "phase-2 exit"
-    },
-    {
-      "api": "Fetch",
-      "versions": [0, 1, 2, 3],
-      "reason": "Message format v0/v1 read path for these request versions removed by KIP-724; Kafka 4.0 raised the Fetch floor to v4.",
-      "until": "phase-2 exit"
-    },
-    {
       "api": "ListOffsets",
-      "versions": [0],
+      "versions": [
+        0
+      ],
       "reason": "v0 returned an offset array and predates the timestamp API; Kafka 4.0 raised the floor to v1.",
       "until": "phase-2 exit"
     },
     {
       "api": "OffsetCommit",
-      "versions": [0, 1],
+      "versions": [
+        0,
+        1
+      ],
       "reason": "v0/v1 stored offsets in ZooKeeper; Kafka 4.0 raised the floor to v2.",
       "until": "phase-2 exit"
     },
     {
       "api": "CreateTopics",
-      "versions": [0, 1],
+      "versions": [
+        0,
+        1
+      ],
       "reason": "Kafka 4.0 raised the CreateTopics floor to v2.",
       "until": "phase-2 exit"
     },
     {
       "api": "DeleteTopics",
-      "versions": [0],
+      "versions": [
+        0
+      ],
       "reason": "Kafka 4.0 raised the DeleteTopics floor to v1.",
       "until": "phase-2 exit"
     },
     {
       "api": "DescribeConfigs",
-      "versions": [0],
+      "versions": [
+        0
+      ],
       "reason": "Kafka 4.0 raised the DescribeConfigs floor to v1.",
       "until": "phase-2 exit"
     },
     {
       "api": "DescribeAcls",
-      "versions": [0],
+      "versions": [
+        0
+      ],
       "reason": "Kafka 4.0 raised the ACL API floors to v1.",
       "until": "phase-2 exit"
     },
     {
       "api": "CreateAcls",
-      "versions": [0],
+      "versions": [
+        0
+      ],
       "reason": "Kafka 4.0 raised the ACL API floors to v1.",
       "until": "phase-2 exit"
     },
     {
       "api": "DeleteAcls",
-      "versions": [0],
+      "versions": [
+        0
+      ],
       "reason": "Kafka 4.0 raised the ACL API floors to v1.",
       "until": "phase-2 exit"
     }

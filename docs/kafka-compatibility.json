@@ -19,9 +19,6 @@
       "deprecatedVersions": null,
       "latestVersionUnstable": false,
       "forkVersions": [
-        0,
-        1,
-        2,
         3,
         4,
         5,
@@ -30,11 +27,7 @@
       ],
       "gap": "behind:6",
       "onFloor": false,
-      "belowFloor": [
-        0,
-        1,
-        2
-      ],
+      "belowFloor": [],
       "notes": "v8 per-record errors (KIP-467), v9 flexible, v10 leader hints (KIP-951), v11 TRANSACTION_ABORTABLE (KIP-890), v12 transaction-version-2 implicit add-partitions (KIP-890 part 2), v13 topic IDs (KIP-516, Kafka 4.1; may return UNKNOWN_TOPIC_ID)."
     },
     {
@@ -51,10 +44,6 @@
       "deprecatedVersions": null,
       "latestVersionUnstable": false,
       "forkVersions": [
-        0,
-        1,
-        2,
-        3,
         4,
         5,
         6,
@@ -66,12 +55,7 @@
       ],
       "gap": "behind:7",
       "onFloor": false,
-      "belowFloor": [
-        0,
-        1,
-        2,
-        3
-      ],
+      "belowFloor": [],
       "notes": "v11 rack / preferred read replica (KIP-392): the wire fields exist but the follower out-of-range and OFFSET_NOT_AVAILABLE handling does not. v12 flexible + LastFetchedEpoch, v13 topic IDs replace names (KIP-516), v14 OFFSET_MOVED_TO_TIERED_STORAGE (KIP-405), v15 ReplicaState (KIP-903), v16 leader hints (KIP-951), v17 ReplicaDirectoryId (KIP-853), v18 HighWatermark (KIP-1166)."
     },
     {
@@ -993,18 +977,6 @@
       "until": "phase-2 exit"
     },
     {
-      "api": "Fetch",
-      "versions": [
-        0,
-        1,
-        2,
-        3
-      ],
-      "kafkaMin": 4,
-      "reason": "Message format v0/v1 read path for these request versions removed by KIP-724; Kafka 4.0 raised the Fetch floor to v4.",
-      "until": "phase-2 exit"
-    },
-    {
       "api": "ListOffsets",
       "versions": [
         0
@@ -1021,17 +993,6 @@
       ],
       "kafkaMin": 2,
       "reason": "v0/v1 stored offsets in ZooKeeper; Kafka 4.0 raised the floor to v2.",
-      "until": "phase-2 exit"
-    },
-    {
-      "api": "Produce",
-      "versions": [
-        0,
-        1,
-        2
-      ],
-      "kafkaMin": 3,
-      "reason": "Message format v0/v1 write path removed by KIP-724; Kafka 4.0 raised the Produce floor to v3.",
       "until": "phase-2 exit"
     }
   ],

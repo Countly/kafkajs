@@ -1,5 +1,6 @@
 const Decoder = require('../../../decoder')
-const { parse: parseV1 } = require('../v1/response')
+const { KafkaJSOffsetOutOfRange } = require('../../../../errors')
+const { failure, createErrorFromCode, errorCodes } = require('../../../error')
 const decodeMessages = require('./decodeMessages')
 
 /**
@@ -49,7 +50,34 @@ const decode = async (rawData) => {
   }
 }
 
+const { code: OFFSET_OUT_OF_RANGE_ERROR_CODE } = errorCodes.find(
+  (e) => e.type === 'OFFSET_OUT_OF_RANGE'
+)
+
+/**
+ * Shared by every Fetch response version. Moved here from v0/response.js when the
+ * pre-4.0 codecs were deleted (Kafka 4.0 broker minVersion for Fetch is 4, KIP-896).
+ */
+const parse = async (data) => {
+  const errors = data.responses.flatMap(({ topicName, partitions }) => {
+    return partitions
+      .filter((partition) => failure(partition.errorCode))
+      .map((partition) => Object.assign({}, partition, { topic: topicName }))
+  })
+
+  if (errors.length > 0) {
+    const { errorCode, topic, partition } = errors[0]
+    if (errorCode === OFFSET_OUT_OF_RANGE_ERROR_CODE) {
+      throw new KafkaJSOffsetOutOfRange(createErrorFromCode(errorCode), { topic, partition })
+    }
+
+    throw createErrorFromCode(errorCode)
+  }
+
+  return data
+}
+
 module.exports = {
   decode,
-  parse: parseV1,
+  parse,
 }
