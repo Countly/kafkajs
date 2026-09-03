@@ -1,0 +1,32 @@
+// Synthetic message definition used only by scripts/compat/__tests__/parse.spec.js.
+// It is not an Apache Kafka API: it exercises every dialect feature the parser must handle.
+{
+  "apiKey": 4242,
+  "type": "request",
+  "listeners": ["broker"],
+  "name": "SyntheticRequest",
+  // Version 1 added Groups. Version 2 added the tagged ClusterId.
+  "validVersions": "0-2",
+  "deprecatedVersions": "0",
+  "flexibleVersions": "2+",
+  "latestVersionUnstable": true,
+  "fields": [
+    { "name": "Url", "type": "string", "versions": "0+",
+      "about": "A doc string containing // not a comment and an escaped \" quote." },
+    { "name": "Groups", "type": "[]GroupSpec", "versions": "1+",
+      "about": "Groups, defined in commonStructs." },
+    { "name": "Topics", "type": "[]TopicSpec", "versions": "0+", "nullableVersions": "1+",
+      "about": "Inline nested struct.", "fields": [
+        { "name": "Name", "type": "string", "versions": "0+", "about": "Topic name." },
+        { "name": "Partitions", "type": "[]int32", "versions": "0+", "about": "Partition ids." }
+      ]},
+    { "name": "ClusterId", "type": "string", "tag": 0, "taggedVersions": "2+",
+      "nullableVersions": "2+", "default": "null", "about": "Tagged cluster id." }
+  ],
+  "commonStructs": [
+    { "name": "GroupSpec", "versions": "1+", "fields": [
+      { "name": "GroupId", "type": "string", "versions": "1+", "about": "The group id." },
+      { "name": "MemberEpoch", "type": "int32", "versions": "1+", "about": "The member epoch." }
+    ]}
+  ]
+}

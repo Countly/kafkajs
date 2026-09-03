@@ -1,0 +1,13 @@
+// Synthetic: a never-flexible, single-version message with a deprecated version.
+{
+  "apiKey": 4243,
+  "type": "request",
+  "listeners": ["broker"],
+  "name": "NeverFlexibleRequest",
+  "validVersions": "0",
+  "deprecatedVersions": "0",
+  "flexibleVersions": "none",
+  "fields": [
+    { "name": "Mechanism", "type": "string", "versions": "0+", "about": "The mechanism." }
+  ]
+}
