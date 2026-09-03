@@ -34,7 +34,7 @@ const MyLogCreator = logLevel => ({ namespace, level, label, log }) => {
 Example using [Winston](https://github.com/winstonjs/winston):
 
 ```javascript
-const { logLevel } = require('kafkajs')
+const { logLevel } = require('@countly/kafkajs')
 const winston = require('winston')
 const toWinstonLogLevel = level => {
     switch(level) {

@@ -11,7 +11,7 @@ We rely on a suite of largely integration tests, using `jest` as a test runner, 
 
 ## Integration tests
 
-Most of the test suite talks to a real Kafka cluster. `yarn test` lints the code, boots the cluster, runs everything, and tears the cluster down again — this is what CI runs.
+Most of the test suite talks to a real Kafka cluster. `yarn test` lints the code, boots the cluster, runs everything, and tears the cluster down again — it's a convenient local shortcut, but it is not what CI runs. CI (see `.github/workflows/ci.yml`) runs `yarn lint`, `yarn test:types`, `yarn test:unit` and `yarn test:pack` separately, plus the six `yarn test:group:<name>:ci` jobs (`broker`, `admin`, `producer`, `consumer`, `others`, `oauthbearer`), each against its own cluster.
 
 For development, it's usually more convenient to boot the cluster yourself and keep the tests running in watch mode. After starting the cluster as described in [Development Environment](DevelopmentEnvironment.md), run:
 

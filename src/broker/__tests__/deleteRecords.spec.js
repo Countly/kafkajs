@@ -191,7 +191,7 @@ describe('Broker > deleteRecords', () => {
       metadata = await retryProtocol('UNKNOWN_TOPIC_OR_PARTITION', () =>
         retryProtocol('LEADER_NOT_AVAILABLE', () => seedBroker.metadata([secondTopicName]))
       )
-      // The KRaft test cluster numbers its nodes 1-3 (docker-compose C1); there is no broker 0.
+      // The KRaft test cluster numbers its nodes 1-3 (`docker-compose.yml`); there is no broker 0.
       partitionLeader = metadata.topicMetadata[0].partitionMetadata[0].leader
       testPartitions = metadata.topicMetadata[0].partitionMetadata
         .filter(({ leader }) => leader === partitionLeader)

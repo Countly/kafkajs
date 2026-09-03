@@ -232,7 +232,7 @@ describe('Cluster > BrokerPool', () => {
     it('updates the list of brokers', async () => {
       expect(brokerPool.brokers).toEqual({})
       await brokerPool.refreshMetadata([topicName])
-      // The KRaft test cluster numbers its nodes 1-3 (docker-compose C1); there is no broker 0.
+      // The KRaft test cluster numbers its nodes 1-3 (`docker-compose.yml`); there is no broker 0.
       expect(Object.keys(brokerPool.brokers).sort()).toEqual(['1', '2', '3'])
       expect(Object.values(brokerPool.brokers)).toEqual(
         expect.arrayContaining([expect.any(Broker), expect.any(Broker), expect.any(Broker)])
@@ -261,7 +261,7 @@ describe('Cluster > BrokerPool', () => {
 
       jest.spyOn(fakeBroker, 'disconnect')
       brokerPool.brokers[nodeId] = fakeBroker
-      // The KRaft test cluster numbers its nodes 1-3 (docker-compose C1); there is no broker 0.
+      // The KRaft test cluster numbers its nodes 1-3 (`docker-compose.yml`); there is no broker 0.
       expect(Object.keys(brokerPool.brokers)).toEqual(['1', '2', '3', 'fakebroker'])
 
       await brokerPool.refreshMetadata([topicName])
@@ -292,7 +292,7 @@ describe('Cluster > BrokerPool', () => {
 
       beforeEach(async () => {
         await brokerPool.refreshMetadata([topicName])
-        // The KRaft test cluster numbers its nodes 1-3 (docker-compose C1); there is no broker 0,
+        // The KRaft test cluster numbers its nodes 1-3 (`docker-compose.yml`); there is no broker 0,
         // so the node to mutate is taken from the pool instead of being hard-coded.
         const nodeIds = Object.keys(brokerPool.brokers)
           .map(Number)

@@ -6,11 +6,18 @@ title: Producer
 The following example assumes that you are using the local Kafka configuration described in [Running Kafka in Development](DockerLocal.md).
 
 ```javascript
-const ip = require('ip')
+const os = require('os')
 
-const { Kafka, CompressionTypes, logLevel } = require('kafkajs')
+const { Kafka, CompressionTypes, logLevel } = require('@countly/kafkajs')
 
-const host = process.env.HOST_IP || ip.address()
+const findIPv4 = () => {
+  const iface = Object.values(os.networkInterfaces())
+    .flat()
+    .find(i => i && i.family === 'IPv4' && !i.internal)
+  return iface && iface.address
+}
+
+const host = process.env.HOST_IP || findIPv4()
 
 const kafka = new Kafka({
   logLevel: logLevel.DEBUG,
@@ -76,7 +83,7 @@ signalTraps.forEach(type => {
 ## <a name="typescript-producer-example"></a> Typescript Example
 
 ```typescript
-import { Kafka, Message, Producer, ProducerBatch, TopicMessages } from 'kafkajs'
+import { Kafka, Message, Producer, ProducerBatch, TopicMessages } from '@countly/kafkajs'
 
 interface CustomMessageFormat { a: string }
 

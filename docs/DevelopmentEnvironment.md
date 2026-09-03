@@ -16,23 +16,24 @@ The test suite runs against a local 3-node Kafka cluster (KRaft mode, no ZooKeep
 From the root of the repository:
 
 ```sh
-./scripts/dockerComposeUp.sh
+NO_LOGS=1 ./scripts/dockerComposeUp.sh
+./scripts/waitForKafka.js
 ./scripts/createScramCredentials.sh
 ```
 
-This boots the cluster described by `docker-compose.yml` (see [scripts/dockerComposeUp.sh](../scripts/dockerComposeUp.sh)). By default it runs `apache/kafka:4.3.1`; pin a different broker version with `KAFKA_VERSION`:
+This boots the cluster described by `docker-compose.yml` (see [scripts/dockerComposeUp.sh](../scripts/dockerComposeUp.sh)). Without `NO_LOGS=1`, the script blocks on `docker compose logs -f`, so set it when you want the shell back. By default it runs `apache/kafka:4.3.1`; pin a different broker version with `KAFKA_VERSION`:
 
 ```sh
-KAFKA_VERSION=4.1.2 ./scripts/dockerComposeUp.sh
+KAFKA_VERSION=4.1.2 NO_LOGS=1 ./scripts/dockerComposeUp.sh
 ```
 
 To use a different compose file (for example the OAUTHBEARER variant), set `COMPOSE_FILE`:
 
 ```sh
-COMPOSE_FILE=docker-compose.oauthbearer.yml ./scripts/dockerComposeUp.sh
+COMPOSE_FILE=docker-compose.oauthbearer.yml NO_LOGS=1 ./scripts/dockerComposeUp.sh
 ```
 
-Once the cluster is up, `docker compose -f docker-compose.yml ps` should show `kafka1`, `kafka2` and `kafka3` running and healthy.
+`./scripts/waitForKafka.js` waits for the cluster to accept connections; run it before `createScramCredentials.sh`, since SCRAM credential creation needs a broker that is already up. Once it returns, `docker compose -f docker-compose.yml ps` should show `kafka1`, `kafka2` and `kafka3` running (no healthcheck is defined, so `docker compose ps` won't report a health status).
 
 `./scripts/createScramCredentials.sh` registers a SCRAM user (`testscram` by default) on the running cluster; pass `-h` to see the available options. The PLAIN SASL users (`test`, `bob`, `alice`) are provisioned as part of the broker configuration itself and need no extra step.
 

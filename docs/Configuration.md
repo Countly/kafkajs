@@ -6,7 +6,7 @@ title: Client Configuration
 The client must be configured with at least one broker. The brokers on the list are considered seed brokers and are only used to bootstrap the client and load initial metadata.
 
 ```javascript
-const { Kafka } = require('kafkajs')
+const { Kafka } = require('@countly/kafkajs')
 
 // Create the client with the broker list
 const kafka = new Kafka({
@@ -369,7 +369,7 @@ KafkaJS has a built-in `STDOUT` logger which outputs JSON. It also accepts a cus
 ##### Log level
 
 ```javascript
-const { Kafka, logLevel } = require('kafkajs')
+const { Kafka, logLevel } = require('@countly/kafkajs')
 
 const kafka = new Kafka({
   clientId: 'my-app',
@@ -381,7 +381,7 @@ const kafka = new Kafka({
 To override the log level after instantiation, call `setLogLevel` on the individual logger.
 
 ```javascript
-const { Kafka, logLevel } = require('kafkajs')
+const { Kafka, logLevel } = require('@countly/kafkajs')
 
 const kafka = new Kafka({
   clientId: 'my-app',
@@ -413,10 +413,10 @@ KAFKAJS_LOG_LEVEL=info node code.js
 To allow for custom socket configurations, the client accepts an optional `socketFactory` property that will be used to construct
 any socket.
 
-`socketFactory` should be a function that returns an object compatible with [`net.Socket`](https://nodejs.org/api/net.html#net_class_net_socket) (see the [default implementation](https://github.com/tulios/kafkajs/tree/master/src/network/socketFactory.js)).
+`socketFactory` should be a function that returns an object compatible with [`net.Socket`](https://nodejs.org/api/net.html#net_class_net_socket) (see the [default implementation](../src/network/socketFactory.js)).
 
 ```javascript
-const { Kafka } = require('kafkajs')
+const { Kafka } = require('@countly/kafkajs')
 
 // Example socket factory setting a custom TTL
 const net = require('net')

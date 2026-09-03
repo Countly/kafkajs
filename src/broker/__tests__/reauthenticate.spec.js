@@ -9,7 +9,7 @@ const { SaslAuthenticate: apiSaslAuthenticateKey } = require('../../protocol/req
 const Broker = require('../index')
 
 /**
- * Session lifetime on broker is configured in docker-compose.2_4_oauthbearer.yml with 15000ms in env KAFKA_CONNECTIONS_MAX_REAUTH_MS
+ * Session lifetime on broker is configured in docker-compose.oauthbearer.yml with 15000ms in env KAFKA_CONNECTIONS_MAX_REAUTH_MS
  * see https://docs.confluent.io/platform/current/installation/configuration/broker-configs.html#brokerconfigs_connections.max.reauth.ms
  */
 describeIfOauthbearerEnabled('Brokers re-authentication with SASL OAUTHBEARER', () => {

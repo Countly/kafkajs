@@ -16,7 +16,8 @@ With `docker` (Compose v2), `yarn` and Node 22+ available:
 ```sh
 yarn test:unit
 # or, with a cluster running (see Development Environment):
-./scripts/dockerComposeUp.sh
+NO_LOGS=1 ./scripts/dockerComposeUp.sh
+./scripts/waitForKafka.js
 ./scripts/createScramCredentials.sh
 yarn test:local:watch
 ```

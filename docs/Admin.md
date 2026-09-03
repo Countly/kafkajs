@@ -317,7 +317,7 @@ await admin.describeConfigs({
 Returning all configs for a given resource:
 
 ```javascript
-const { ConfigResourceTypes } = require('kafkajs')
+const { ConfigResourceTypes } = require('@countly/kafkajs')
 
 await admin.describeConfigs({
   includeSynonyms: false,
@@ -333,7 +333,7 @@ await admin.describeConfigs({
 Returning specific configs for a given resource:
 
 ```javascript
-const { ConfigResourceTypes } = require('kafkajs')
+const { ConfigResourceTypes } = require('@countly/kafkajs')
 
 await admin.describeConfigs({
   includeSynonyms: false,
@@ -406,7 +406,7 @@ await admin.alterConfigs({
 Example:
 
 ```javascript
-const { ConfigResourceTypes } = require('kafkajs')
+const { ConfigResourceTypes } = require('@countly/kafkajs')
 
 await admin.alterConfigs({
     resources: [{
@@ -557,7 +557,7 @@ const {
   AclOperationTypes,
   AclPermissionTypes,
   ResourcePatternTypes,
-} = require('kafkajs')
+} = require('@countly/kafkajs')
 
 const acl = [
   {
@@ -597,7 +597,7 @@ const {
   AclOperationTypes,
   AclPermissionTypes,
   ResourcePatternTypes,
-} = require('kafkajs')
+} = require('@countly/kafkajs')
 
 const acl = {
   resourceName: 'topic-name,
@@ -646,7 +646,7 @@ const {
   AclOperationTypes,
   AclPermissionTypes,
   ResourcePatternTypes,
-} = require('kafkajs')
+} = require('@countly/kafkajs')
 
 await admin.describeAcls({
   resourceName: 'topic-name,

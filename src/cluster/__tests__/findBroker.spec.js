@@ -37,7 +37,7 @@ describe('Cluster > findBroker', () => {
   })
 
   test('refresh metadata on lock timeout', async () => {
-    // The KRaft test cluster numbers its nodes 1-3 (docker-compose C1); there is no broker 0, so a
+    // The KRaft test cluster numbers its nodes 1-3 (`docker-compose.yml`); there is no broker 0, so a
     // refreshMetadata() would drop a mock installed under it.
     const nodeId = cluster.brokerPool.getNodeIds()[0]
     const mockBroker = new Broker({
@@ -62,7 +62,7 @@ describe('Cluster > findBroker', () => {
   })
 
   test('refresh metadata on KafkaJSConnectionError ECONNREFUSED', async () => {
-    // The KRaft test cluster numbers its nodes 1-3 (docker-compose C1); there is no broker 0, so a
+    // The KRaft test cluster numbers its nodes 1-3 (`docker-compose.yml`); there is no broker 0, so a
     // refreshMetadata() would drop a mock installed under it.
     const nodeId = cluster.brokerPool.getNodeIds()[0]
     const mockBroker = new Broker({
@@ -87,7 +87,7 @@ describe('Cluster > findBroker', () => {
   })
 
   test('refresh metadata on KafkaJSBrokerNotFound', async () => {
-    // The KRaft test cluster numbers its nodes 1-3 (docker-compose C1); there is no broker 0, so a
+    // The KRaft test cluster numbers its nodes 1-3 (`docker-compose.yml`); there is no broker 0, so a
     // refreshMetadata() would drop a mock installed under it.
     const nodeId = cluster.brokerPool.getNodeIds()[0]
     cluster.brokerPool.findBroker = jest.fn(() => {
@@ -105,7 +105,7 @@ describe('Cluster > findBroker', () => {
   })
 
   test('refresh metadata on KafkaJSConnectionError Connection Timeout', async () => {
-    // The KRaft test cluster numbers its nodes 1-3 (docker-compose C1); there is no broker 0, so a
+    // The KRaft test cluster numbers its nodes 1-3 (`docker-compose.yml`); there is no broker 0, so a
     // refreshMetadata() would drop a mock installed under it.
     const nodeId = cluster.brokerPool.getNodeIds()[0]
     const mockBroker = new Broker({

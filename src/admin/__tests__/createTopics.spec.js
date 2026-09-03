@@ -94,7 +94,7 @@ describe('Admin', () => {
     })
 
     test('creating topic with manual replica assignment', async () => {
-      // The KRaft test cluster numbers its nodes 1-3 (docker-compose C1); there is no broker 0.
+      // The KRaft test cluster numbers its nodes 1-3 (`docker-compose.yml`); there is no broker 0.
       admin = createAdmin({ cluster: createCluster(), logger: newLogger() })
 
       await admin.connect()

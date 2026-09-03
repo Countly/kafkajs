@@ -106,7 +106,7 @@ describe('Broker > createTopics', () => {
     )
 
     await admin.connect()
-    // The KRaft test cluster numbers its nodes 1-3 (docker-compose C1); there is no broker 0.
+    // The KRaft test cluster numbers its nodes 1-3 (`docker-compose.yml`); there is no broker 0.
     const brokerId = String((await broker.metadata()).brokers[0].nodeId)
     const describeResponse = await admin.describeConfigs({
       resources: [

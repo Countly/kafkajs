@@ -224,7 +224,7 @@ older and want to retain the previous partitioning behavior, use the `LegacyPart
 by importing it and providing it to the Producer constructor:**
 > 
 > ```javascript
-> const { Partitioners } = require('kafkajs')
+> const { Partitioners } = require('@countly/kafkajs')
 > kafka.producer({ createPartitioner: Partitioners.LegacyPartitioner })
 > ```
 
@@ -241,7 +241,7 @@ Since KafkaJS aims to have as small footprint and as few dependencies as possibl
 ### <a name="compression-gzip"></a> GZIP
 
 ```javascript
-const { CompressionTypes } = require('kafkajs')
+const { CompressionTypes } = require('@countly/kafkajs')
 
 async () => {
   await producer.send({
@@ -267,7 +267,7 @@ npm install --save kafkajs-snappy
 ```
 
 ```javascript
-const {  CompressionTypes, CompressionCodecs } = require('kafkajs')
+const {  CompressionTypes, CompressionCodecs } = require('@countly/kafkajs')
 const SnappyCodec = require('kafkajs-snappy')
 
 CompressionCodecs[CompressionTypes.Snappy] = SnappyCodec
@@ -285,7 +285,7 @@ npm install --save kafkajs-lz4
 ```
 
 ```javascript
-const { CompressionTypes, CompressionCodecs } = require('kafkajs')
+const { CompressionTypes, CompressionCodecs } = require('@countly/kafkajs')
 const LZ4 = require('kafkajs-lz4')
 
 CompressionCodecs[CompressionTypes.LZ4] = new LZ4().codec
@@ -303,7 +303,7 @@ npm install --save @kafkajs/zstd
 ```
 
 ```javascript
-const { CompressionTypes, CompressionCodecs } = require('kafkajs')
+const { CompressionTypes, CompressionCodecs } = require('@countly/kafkajs')
 const ZstdCodec = require('@kafkajs/zstd')
 
 CompressionCodecs[CompressionTypes.ZSTD] = ZstdCodec()
@@ -332,7 +332,7 @@ const MyCustomSnappyCodec = {
 Now that we have the codec object, we can wrap it in a function and add it to the implementation:
 
 ```javascript
-const { CompressionTypes, CompressionCodecs } = require('kafkajs')
+const { CompressionTypes, CompressionCodecs } = require('@countly/kafkajs')
 CompressionCodecs[CompressionTypes.Snappy] = () => MyCustomSnappyCodec
 ```
 

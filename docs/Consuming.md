@@ -383,7 +383,7 @@ const MyPartitionAssigner = ({ cluster }) => ({
 The method `assign` has to return an assignment plan with partitions per topic. A partition plan consists of a list of `memberId` and `memberAssignment`. The member assignment has to be encoded, use the `MemberAssignment` utility for that. Example:
 
 ```javascript
-const { AssignerProtocol: { MemberAssignment } } = require('kafkajs')
+const { AssignerProtocol: { MemberAssignment } } = require('@countly/kafkajs')
 
 const MyPartitionAssigner = ({ cluster }) => ({
     version: 1,
@@ -403,7 +403,7 @@ const MyPartitionAssigner = ({ cluster }) => ({
 The method `protocol` has to return `name` and `metadata`. Metadata has to be encoded, use the `MemberMetadata` utility for that. Example:
 
 ```javascript
-const { AssignerProtocol: { MemberMetadata } } = require('kafkajs')
+const { AssignerProtocol: { MemberMetadata } } = require('@countly/kafkajs')
 
 const MyPartitionAssigner = ({ cluster }) => ({
     name: 'MyPartitionAssigner',
@@ -425,7 +425,7 @@ Your `protocol` method will probably look like the example, but it's not impleme
 Once your assigner is done, add it to the list of assigners. It's important to keep the default assigner there to allow the old consumers to have a common ground with the new consumers when deploying.
 
 ```javascript
-const { PartitionAssigners: { roundRobin } } = require('kafkajs')
+const { PartitionAssigners: { roundRobin } } = require('@countly/kafkajs')
 
 kafka.consumer({
     groupId: 'my-group',

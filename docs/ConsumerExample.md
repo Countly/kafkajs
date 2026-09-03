@@ -6,11 +6,18 @@ title: Consumer
 The following example assumes that you are using the local Kafka configuration described in [Running Kafka in Development](DockerLocal.md).
 
 ```javascript
-const ip = require('ip')
+const os = require('os')
 
-const { Kafka, logLevel } = require('kafkajs')
+const { Kafka, logLevel } = require('@countly/kafkajs')
 
-const host = process.env.HOST_IP || ip.address()
+const findIPv4 = () => {
+  const iface = Object.values(os.networkInterfaces())
+    .flat()
+    .find(i => i && i.family === 'IPv4' && !i.internal)
+  return iface && iface.address
+}
+
+const host = process.env.HOST_IP || findIPv4()
 
 const kafka = new Kafka({
   logLevel: logLevel.INFO,
@@ -69,7 +76,7 @@ signalTraps.forEach(type => {
 A similar example in TypeScript
 
 ```typescript
-import { Consumer, ConsumerSubscribeTopics, EachBatchPayload, Kafka, EachMessagePayload } from 'kafkajs'
+import { Consumer, ConsumerSubscribeTopics, EachBatchPayload, Kafka, EachMessagePayload } from '@countly/kafkajs'
 
 export default class ExampleConsumer {
   private kafkaConsumer: Consumer
@@ -145,11 +152,18 @@ export default class ExampleConsumer {
 The following example assumes a valid SSL certificate and SASL authentication using the `scram-sha-256` mechanism. Other mechanisms are also available (see [Client Configuration](Configuration.md#sasl)).
 
 ```javascript
-const ip = require('ip')
+const os = require('os')
 
 const { Kafka, logLevel } = require('../index')
 
-const host = process.env.HOST_IP || ip.address()
+const findIPv4 = () => {
+  const iface = Object.values(os.networkInterfaces())
+    .flat()
+    .find(i => i && i.family === 'IPv4' && !i.internal)
+  return iface && iface.address
+}
+
+const host = process.env.HOST_IP || findIPv4()
 
 const kafka = new Kafka({
   logLevel: logLevel.INFO,

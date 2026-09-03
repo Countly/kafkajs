@@ -25,7 +25,7 @@ If none of the above are possible to provide, please write down the exact steps 
 A clear and concise description of what you expected to happen.
 
 **Observed behavior**
-A clear and concise description of what *did* happen. Please include any relevant logs [with the log level set to debug](https://kafka.js.org/docs/configuration#logging).
+A clear and concise description of what *did* happen. Please include any relevant logs [with the log level set to debug](../../docs/Configuration.md#logging).
 
 **Environment:**
  - OS: [e.g. Mac OS 10.15.3]
