@@ -39,7 +39,7 @@ describe('Protocol > Message > decoder', () => {
       decoder.readInt32()
       decoder.readInt32()
 
-      expect(() => MessageDecoder(offset, size, decoder)).toThrowError(
+      expect(() => MessageDecoder(offset, size, decoder)).toThrow(
         /Tried to decode a partial message/
       )
     })

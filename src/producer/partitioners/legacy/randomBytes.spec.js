@@ -3,7 +3,7 @@ const randomBytes = require('./randomBytes')
 
 describe('Producer > Partitioner > Default > RandomBytes', () => {
   test('it throws when requesting more bytes than entry allows', () => {
-    expect(() => randomBytes(65537)).toThrowError(
+    expect(() => randomBytes(65537)).toThrow(
       new KafkaJSNonRetriableError(
         'Byte length (65537) exceeds the max number of bytes of entropy available (65536)'
       )

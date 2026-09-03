@@ -36,6 +36,7 @@
         ]
       }
     ],
+    "jest/no-alias-methods": "error",
     "jest/no-focused-tests": "error",
     "jest/no-commented-out-tests": "error",
     "jest/no-deprecated-functions": "error",
@@ -48,5 +49,12 @@
   },
   "env": {
     "jest": true
-  }
+  },
+  "overrides": [
+    {
+      "files": ["*.mjs"],
+      "parserOptions": { "sourceType": "module", "ecmaVersion": 2020 },
+      "rules": { "node/no-unsupported-features/es-syntax": "off" }
+    }
+  ]
 }

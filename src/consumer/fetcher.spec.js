@@ -6,7 +6,6 @@ const createWorkerQueue = require('./workerQueue')
 const createWorker = require('./worker')
 const { newLogger } = require('../../testHelpers')
 const Batch = require('./batch')
-const { describe, afterEach } = require('jest-circus')
 
 describe('Fetcher', () => {
   let fetcher, fetch, handler, workerIds, workers, workerQueue, logger, fetcherAssignments

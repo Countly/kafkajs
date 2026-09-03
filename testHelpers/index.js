@@ -3,10 +3,9 @@
 // `callback` is parameterized instead of a static function
 const fs = require('fs')
 const execa = require('execa')
-const uuid = require('uuid/v4')
+const { randomUUID } = require('crypto')
 const semver = require('semver')
 const crypto = require('crypto')
-const jwt = require('jsonwebtoken')
 const Cluster = require('../src/cluster')
 const waitFor = require('../src/utils/waitFor')
 const connectionBuilder = require('../src/cluster/connectionPoolBuilder')
@@ -27,7 +26,18 @@ const newLogger = (opts = {}) =>
 
 const getHost = () => 'localhost'
 const secureRandom = (length = 10) =>
-  `${crypto.randomBytes(length).toString('hex')}-${process.pid}-${uuid()}`
+  `${crypto.randomBytes(length).toString('hex')}-${process.pid}-${randomUUID()}`
+
+// Unsecured JWT (alg "none") accepted by the test broker's OAUTHBEARER unsecured validator.
+const unsecuredJwt = claims => {
+  const encode = obj => Buffer.from(JSON.stringify(obj)).toString('base64url')
+  const now = Math.floor(Date.now() / 1000)
+  return `${encode({ alg: 'none', typ: 'JWT' })}.${encode({
+    iat: now,
+    exp: now + 3600,
+    ...claims,
+  })}.`
+}
 
 const plainTextBrokers = (host = getHost()) => [`${host}:9092`, `${host}:9095`, `${host}:9098`]
 const sslBrokers = (host = getHost()) => [`${host}:9093`, `${host}:9096`, `${host}:9099`]
@@ -120,7 +130,7 @@ const saslOAuthBearerConnectionOpts = () =>
     sasl: {
       mechanism: 'oauthbearer',
       oauthBearerProvider: () => {
-        const token = jwt.sign({ sub: 'test' }, undefined, { algorithm: 'none', expiresIn: '1h' })
+        const token = unsecuredJwt({ sub: 'test' })
 
         return {
           value: token,

@@ -1,3 +1,5 @@
+> **Fork notice** — `@countly/kafkajs` is a standalone, Countly-maintained continuation of [kafkajs](https://github.com/tulios/kafkajs) 2.2.4 targeting **Apache Kafka 4.0+** and **Node.js 22+**. It is under active development and **not yet released**; the first public version will be 3.0.0. Roadmap: `docs/superpowers/specs/`.
+
 [![npm version](https://img.shields.io/npm/v/kafkajs?color=%2344cc11&label=stable)](https://www.npmjs.com/package/kafkajs) [![npm pre-release version](https://img.shields.io/npm/v/kafkajs/beta?label=pre-release)](https://www.npmjs.com/package/kafkajs) [![Build Status](https://dev.azure.com/tulios/kafkajs/_apis/build/status/tulios.kafkajs?branchName=master)](https://dev.azure.com/tulios/kafkajs/_build/latest?definitionId=2&branchName=master) [![Slack Channel](https://join.slack.com/t/kafkajs/shared_invite/zt-1ezd5395v-SOpTqYoYfRCyPKOkUggK0Abadge.svg)](https://join.slack.com/t/kafkajs/shared_invite/zt-1ezd5395v-SOpTqYoYfRCyPKOkUggK0A)
 <br />
 <p align="center">

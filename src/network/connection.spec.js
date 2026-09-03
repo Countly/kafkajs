@@ -179,7 +179,7 @@ describe('Network > Connection', () => {
       }
 
       await connection.connect()
-      await expect(connection.send(protocol)).rejects.toThrowError(KafkaJSRequestTimeoutError)
+      await expect(connection.send(protocol)).rejects.toThrow(KafkaJSRequestTimeoutError)
     })
 
     test('throttles the request queue', async () => {

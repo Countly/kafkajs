@@ -16,8 +16,8 @@ describe('Utils > shuffle', () => {
   })
 
   it('throws if it receives a non-array', () => {
-    expect(() => shuffle()).toThrowError(TypeError)
-    expect(() => shuffle('foo')).toThrowError(TypeError)
-    expect(() => shuffle({})).toThrowError(TypeError)
+    expect(() => shuffle()).toThrow(TypeError)
+    expect(() => shuffle('foo')).toThrow(TypeError)
+    expect(() => shuffle({})).toThrow(TypeError)
   })
 })

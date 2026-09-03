@@ -11,7 +11,6 @@ const { KafkaJSError } = require('../../errors')
 
 const createProducer = require('../index')
 const createConsumer = require('../../consumer/index')
-const { describe } = require('jest-circus')
 
 const arrayUnique = a => [...new Set(a)]
 

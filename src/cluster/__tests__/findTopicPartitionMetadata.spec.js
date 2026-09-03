@@ -24,14 +24,10 @@ describe('Cluster > findTopicPartitionMetadata', () => {
 
   test('throws and error if the topicMetadata is not loaded', () => {
     cluster.brokerPool.metadata = null
-    expect(() => cluster.findTopicPartitionMetadata(topic)).toThrowError(
-      /Topic metadata not loaded/
-    )
+    expect(() => cluster.findTopicPartitionMetadata(topic)).toThrow(/Topic metadata not loaded/)
 
     cluster.brokerPool.metadata = {}
-    expect(() => cluster.findTopicPartitionMetadata(topic)).toThrowError(
-      /Topic metadata not loaded/
-    )
+    expect(() => cluster.findTopicPartitionMetadata(topic)).toThrow(/Topic metadata not loaded/)
   })
 
   it('returns an empty array if there is no metadata for a given topic', () => {
