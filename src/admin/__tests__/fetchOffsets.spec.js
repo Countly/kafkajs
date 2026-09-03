@@ -140,7 +140,8 @@ describe('Admin', () => {
     describe('when used with the resolvedOffsets option', () => {
       let producer, consumer
 
-      beforeEach(async done => {
+      // Jest >= 27 rejects a test/hook that both takes `done` and returns a promise.
+      beforeEach(async () => {
         producer = createProducer({
           cluster,
           createPartitioner: createModPartitioner,
@@ -160,16 +161,18 @@ describe('Admin', () => {
         consumer.run({ eachMessage: () => {} })
         await waitForConsumerToJoinGroup(consumer)
 
-        consumer.on(consumer.events.END_BATCH_PROCESS, async () => {
-          // stop the consumer after the first batch, so only 5 are committed
-          await consumer.stop()
-          // send batch #2
-          await producer.send({
-            acks: 1,
-            topic: topicName,
-            messages: generateMessages({ number: 5 }),
+        const firstBatchProcessed = new Promise(resolve => {
+          consumer.on(consumer.events.END_BATCH_PROCESS, async () => {
+            // stop the consumer after the first batch, so only 5 are committed
+            await consumer.stop()
+            // send batch #2
+            await producer.send({
+              acks: 1,
+              topic: topicName,
+              messages: generateMessages({ number: 5 }),
+            })
+            resolve()
           })
-          done()
         })
 
         // send batch #1
@@ -178,6 +181,8 @@ describe('Admin', () => {
           topic: topicName,
           messages: generateMessages({ number: 5 }),
         })
+
+        await firstBatchProcessed
       })
 
       afterEach(async () => {

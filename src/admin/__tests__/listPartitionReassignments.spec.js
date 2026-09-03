@@ -72,6 +72,7 @@ describe('Admin', () => {
     })
 
     test('list reassignments', async () => {
+      // The KRaft test cluster numbers its nodes 1-3 (docker-compose C1); there is no broker 0.
       admin = createAdmin({ cluster: createCluster(), logger: newLogger() })
 
       await admin.connect()
@@ -81,8 +82,8 @@ describe('Admin', () => {
             {
               topic: topicName,
               replicaAssignment: [
-                { partition: 0, replicas: [1, 0] },
-                { partition: 1, replicas: [2, 1] },
+                { partition: 0, replicas: [2, 1] },
+                { partition: 1, replicas: [3, 2] },
               ],
             },
           ],

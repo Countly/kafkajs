@@ -1,4 +1,11 @@
-const { createConnectionPool, connectionOpts, secureRandom, newLogger } = require('testHelpers')
+const {
+  createConnectionPool,
+  connectionOpts,
+  secureRandom,
+  newLogger,
+  waitFor,
+  retryProtocol,
+} = require('testHelpers')
 const CONFIG_RESOURCE_TYPES = require('../../protocol/configResourceTypes')
 const Broker = require('../index')
 
@@ -42,15 +49,19 @@ describe('Broker > alterConfigs', () => {
     })
 
     const CONFIG_NAME = 'cleanup.policy'
-    let describeResponse = await broker.describeConfigs({
-      resources: [
-        {
-          type: CONFIG_RESOURCE_TYPES.TOPIC,
-          name: topicName1,
-          configNames: [CONFIG_NAME],
-        },
-      ],
-    })
+    // KRaft commits CreateTopics on the controller and the broker's metadata image catches up
+    // asynchronously, so a describeConfigs right after can still answer UNKNOWN_TOPIC_OR_PARTITION.
+    const describeResponse = await retryProtocol('UNKNOWN_TOPIC_OR_PARTITION', () =>
+      broker.describeConfigs({
+        resources: [
+          {
+            type: CONFIG_RESOURCE_TYPES.TOPIC,
+            name: topicName1,
+            configNames: [CONFIG_NAME],
+          },
+        ],
+      })
+    )
 
     let cleanupPolicy = getConfigValue(getConfigEntries(describeResponse), CONFIG_NAME)
 
@@ -84,17 +95,30 @@ describe('Broker > alterConfigs', () => {
       throttleTime: 0,
     })
 
-    describeResponse = await broker.describeConfigs({
-      resources: [
-        {
-          type: CONFIG_RESOURCE_TYPES.TOPIC,
-          name: topicName1,
-          configNames: [CONFIG_NAME],
-        },
-      ],
-    })
+    // KRaft applies AlterConfigs through the controller, so the broker's own view of the topic
+    // config catches up asynchronously.
+    cleanupPolicy = await waitFor(
+      async () => {
+        const configResponse = await broker.describeConfigs({
+          resources: [
+            {
+              type: CONFIG_RESOURCE_TYPES.TOPIC,
+              name: topicName1,
+              configNames: [CONFIG_NAME],
+            },
+          ],
+        })
 
-    cleanupPolicy = getConfigValue(getConfigEntries(describeResponse), CONFIG_NAME)
+        const value = getConfigValue(getConfigEntries(configResponse), CONFIG_NAME)
+        return value === 'compact' ? value : false
+      },
+      {
+        ignoreTimeout: false,
+        maxWait: 10000,
+        timeoutMessage: 'Timed out waiting for cleanup.policy',
+      }
+    )
+
     expect(cleanupPolicy).toEqual('compact')
   })
 })

@@ -38,10 +38,16 @@ describe('Broker > InitProducerId', () => {
   })
 
   test('request with transaction id', async () => {
-    const response = await broker.initProducerId({
-      transactionalId,
-      transactionTimeout: 30000,
-    })
+    // The transaction coordinator can still be loading __transaction_state on a cold 4.x cluster
+    // (codes 14/16, which kafkajs still names GROUP_LOAD_IN_PROGRESS / NOT_COORDINATOR_FOR_GROUP).
+    const response = await retryProtocol('GROUP_LOAD_IN_PROGRESS', () =>
+      retryProtocol('NOT_COORDINATOR_FOR_GROUP', () =>
+        broker.initProducerId({
+          transactionalId,
+          transactionTimeout: 30000,
+        })
+      )
+    )
 
     expect(response).toEqual({
       clientSideThrottleTime: expect.optional(0),
@@ -53,7 +59,15 @@ describe('Broker > InitProducerId', () => {
   })
 
   test('request without transaction id', async () => {
-    const response = await broker.initProducerId({ transactionTimeout: 30000 })
+    // The transaction coordinator can still be loading __transaction_state on a cold 4.x cluster
+    // (codes 14/16, which kafkajs still names GROUP_LOAD_IN_PROGRESS / NOT_COORDINATOR_FOR_GROUP).
+    const response = await retryProtocol('GROUP_LOAD_IN_PROGRESS', () =>
+      retryProtocol('NOT_COORDINATOR_FOR_GROUP', () =>
+        broker.initProducerId({
+          transactionTimeout: 30000,
+        })
+      )
+    )
 
     expect(response).toEqual({
       clientSideThrottleTime: expect.optional(0),

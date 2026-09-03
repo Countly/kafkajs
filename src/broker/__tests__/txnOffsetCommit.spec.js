@@ -51,10 +51,16 @@ describe('Broker > TxnOffsetCommit', () => {
 
     transactionBroker = await findBrokerForGroupId(transactionalId, COORDINATOR_TYPES.TRANSACTION)
     await transactionBroker.connect()
-    const result = await transactionBroker.initProducerId({
-      transactionalId,
-      transactionTimeout: 30000,
-    })
+    // The transaction coordinator can still be loading __transaction_state on a cold 4.x cluster
+    // (codes 14/16, which kafkajs still names GROUP_LOAD_IN_PROGRESS / NOT_COORDINATOR_FOR_GROUP).
+    const result = await retryProtocol('GROUP_LOAD_IN_PROGRESS', () =>
+      retryProtocol('NOT_COORDINATOR_FOR_GROUP', () =>
+        transactionBroker.initProducerId({
+          transactionalId,
+          transactionTimeout: 30000,
+        })
+      )
+    )
 
     producerId = result.producerId
     producerEpoch = result.producerEpoch
@@ -116,21 +122,26 @@ describe('Broker > TxnOffsetCommit', () => {
     })
   })
 
-  test('ignores invalid transaction fields', async () => {
-    await consumerBroker.txnOffsetCommit({
-      transactionalId: 'foo',
-      groupId: consumerGroupId,
-      producerId: 999,
-      producerEpoch: 999,
-      topics: [
-        {
-          topic: topicName,
-          partitions: [
-            { partition: 0, offset: 0 },
-            { partition: 1, offset: 0 },
-          ],
-        },
-      ],
-    })
+  // Empirically deterministic on Kafka 4.1.2 and 4.3.1: an unknown producer id on TxnOffsetCommit
+  // is rejected with INVALID_PRODUCER_ID_MAPPING rather than ignored; the client surfaces the
+  // broker's code unchanged.
+  test('rejects invalid transaction fields', async () => {
+    await expect(
+      consumerBroker.txnOffsetCommit({
+        transactionalId: 'foo',
+        groupId: consumerGroupId,
+        producerId: 999,
+        producerEpoch: 999,
+        topics: [
+          {
+            topic: topicName,
+            partitions: [
+              { partition: 0, offset: 0 },
+              { partition: 1, offset: 0 },
+            ],
+          },
+        ],
+      })
+    ).rejects.toHaveProperty('type', 'INVALID_PRODUCER_ID_MAPPING')
   })
 })

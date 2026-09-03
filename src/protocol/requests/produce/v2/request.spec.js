@@ -1,8 +1,61 @@
 const os = require('os')
 const RequestV2Protocol = require('./request')
+const Decoder = require('../../../decoder')
+const MessageSetDecoder = require('../../../messageSet/decoder')
+const crc32 = require('../../../crc32')
 const { Types } = require('../../../message/compression')
 
 const osType = os.type().toLowerCase()
+
+/**
+ * Decodes a Produce v2 request body down to its (decompressed) message sets, so a comparison
+ * does not depend on the exact bytes the local zlib emits.
+ */
+const decodeRequest = async buffer => {
+  const decoder = new Decoder(buffer)
+  const acks = decoder.readInt16()
+  const timeout = decoder.readInt32()
+  const topicData = []
+
+  for (let topicCount = decoder.readInt32(); topicCount > 0; topicCount--) {
+    const topic = decoder.readString()
+    const partitions = []
+
+    for (let partitionCount = decoder.readInt32(); partitionCount > 0; partitionCount--) {
+      const partition = decoder.readInt32()
+      partitions.push({ partition, messages: await MessageSetDecoder(decoder) })
+    }
+
+    topicData.push({ topic, partitions })
+  }
+
+  return { acks, timeout, topicData }
+}
+
+const GZIP_MAGIC = Buffer.from([0x1f, 0x8b])
+// magicByte(1) + attributes(1) + timestamp(8) + null key(4) + value length(4)
+const VALUE_OFFSET_IN_CONTENT = 18
+
+/**
+ * Reads the single compressed wrapper message of a Produce v2 request: the CRC the encoder wrote
+ * and the exact bytes that CRC covers (magicByte..value, i.e. including the compressed payload).
+ */
+const readWrapperMessage = buffer => {
+  const decoder = new Decoder(buffer)
+  decoder.readInt16() // acks
+  decoder.readInt32() // timeout
+  decoder.readInt32() // topicData array length
+  decoder.readString() // topic
+  decoder.readInt32() // partitions array length
+  decoder.readInt32() // partition
+  decoder.readInt32() // message set size
+  decoder.readInt64() // offset
+  const messageSize = decoder.readInt32()
+  const crc = decoder.readInt32()
+  const content = buffer.slice(decoder.offset, decoder.offset + messageSize - 4)
+
+  return { messageSize, crc, content }
+}
 
 describe('Protocol > Requests > Produce > v2', () => {
   let args
@@ -108,6 +161,21 @@ describe('Protocol > Requests > Produce > v2', () => {
         },
       ],
     }).encode()
-    expect(buffer).toEqual(Buffer.from(require(`../fixtures/v2_request_gzip_${osType}.json`)))
+
+    // zlib's deflate output is not byte-stable across zlib/Node versions (Node 26 emits a stream
+    // three bytes shorter than the recorded fixture), which also shifts the message-set sizes and
+    // the wrapper CRC. Compare the decoded, decompressed request instead of the raw bytes.
+    const expected = Buffer.from(require(`../fixtures/v2_request_gzip_${osType}.json`))
+    expect(await decodeRequest(buffer)).toEqual(await decodeRequest(expected))
+
+    // MessageSetDecoder transparently decompresses, so the wrapper message's own framing is
+    // asserted here: its size and its CRC are computed over the compressed payload.
+    const { messageSize, crc, content } = readWrapperMessage(buffer)
+    expect(messageSize).toEqual(content.length + 4) // the crc int32 plus the content it covers
+    expect(crc).toEqual(crc32({ buffer: content }))
+    expect(content.readInt32BE(VALUE_OFFSET_IN_CONTENT - 4)).toEqual(
+      content.length - VALUE_OFFSET_IN_CONTENT
+    )
+    expect(content.slice(VALUE_OFFSET_IN_CONTENT, VALUE_OFFSET_IN_CONTENT + 2)).toEqual(GZIP_MAGIC)
   })
 })

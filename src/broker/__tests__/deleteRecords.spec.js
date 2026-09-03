@@ -36,9 +36,10 @@ describe('Broker > deleteRecords', () => {
 
     await Promise.all([seedBroker.connect(), producer.connect()])
 
-    metadata = await retryProtocol(
-      'LEADER_NOT_AVAILABLE',
-      async () => await seedBroker.metadata([topicName])
+    // KRaft propagates new-topic metadata asynchronously, so the first read can transiently see
+    // UNKNOWN_TOPIC_OR_PARTITION as well as LEADER_NOT_AVAILABLE.
+    metadata = await retryProtocol('UNKNOWN_TOPIC_OR_PARTITION', () =>
+      retryProtocol('LEADER_NOT_AVAILABLE', () => seedBroker.metadata([topicName]))
     )
     partitionLeader = metadata.topicMetadata[0].partitionMetadata[0].leader
 
@@ -182,16 +183,16 @@ describe('Broker > deleteRecords', () => {
     let secondTopicName, testPartitions
 
     beforeEach(async () => {
-      partitionLeader = 0
       secondTopicName = `test-topic-${secureRandom()}`
 
       // 3 partitions per broker
       await createTopic({ topic: secondTopicName, partitions: 9 })
 
-      metadata = await retryProtocol(
-        'LEADER_NOT_AVAILABLE',
-        async () => await seedBroker.metadata([secondTopicName])
+      metadata = await retryProtocol('UNKNOWN_TOPIC_OR_PARTITION', () =>
+        retryProtocol('LEADER_NOT_AVAILABLE', () => seedBroker.metadata([secondTopicName]))
       )
+      // The KRaft test cluster numbers its nodes 1-3 (docker-compose C1); there is no broker 0.
+      partitionLeader = metadata.topicMetadata[0].partitionMetadata[0].leader
       testPartitions = metadata.topicMetadata[0].partitionMetadata
         .filter(({ leader }) => leader === partitionLeader)
         .map(({ partitionId }) => partitionId)

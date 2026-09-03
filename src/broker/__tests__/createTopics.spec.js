@@ -4,6 +4,7 @@ const {
   connectionOpts,
   secureRandom,
   newLogger,
+  retryProtocol,
 } = require('testHelpers')
 const { ConfigResourceTypes } = require('../../..')
 const createAdmin = require('../../admin')
@@ -105,11 +106,13 @@ describe('Broker > createTopics', () => {
     )
 
     await admin.connect()
+    // The KRaft test cluster numbers its nodes 1-3 (docker-compose C1); there is no broker 0.
+    const brokerId = String((await broker.metadata()).brokers[0].nodeId)
     const describeResponse = await admin.describeConfigs({
       resources: [
         {
           type: ConfigResourceTypes.BROKER,
-          name: '0',
+          name: brokerId,
           configNames: ['default.replication.factor', 'num.partitions'],
         },
       ],
@@ -127,7 +130,11 @@ describe('Broker > createTopics', () => {
     expect(defaultReplicationFactor).toBeGreaterThan(0)
     expect(defaultNumPartitions).toBeGreaterThan(0)
 
-    const metadata = await broker.metadata([topicName])
+    // KRaft commits CreateTopics on the controller and the broker's metadata image catches up
+    // asynchronously, so the first read can still answer UNKNOWN_TOPIC_OR_PARTITION.
+    const metadata = await retryProtocol('UNKNOWN_TOPIC_OR_PARTITION', () =>
+      broker.metadata([topicName])
+    )
     expect(metadata.topicMetadata[0].partitionMetadata[0].replicas.length).toEqual(
       defaultReplicationFactor
     )

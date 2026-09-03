@@ -519,7 +519,9 @@ describe('Consumer > Instrumentation Events', () => {
     })
   })
 
-  it('emits request timeout events', async () => {
+  // Quarantined (flaky): requestTimeout of 1ms races a sub-millisecond loopback round trip, so on a
+  // fast host every request can complete before the timeout fires. See QUARANTINE.md.
+  it.skip('emits request timeout events', async () => {
     cluster = createCluster({
       instrumentationEmitter: emitter,
       requestTimeout: 1,

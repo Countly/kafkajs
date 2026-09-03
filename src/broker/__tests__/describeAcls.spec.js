@@ -1,4 +1,10 @@
-const { createConnectionPool, connectionOpts, secureRandom, newLogger } = require('testHelpers')
+const {
+  createConnectionPool,
+  connectionOpts,
+  secureRandom,
+  newLogger,
+  waitFor,
+} = require('testHelpers')
 
 const Broker = require('../index')
 const ACL_RESOURCE_TYPES = require('../../protocol/aclResourceTypes')
@@ -46,21 +52,32 @@ describe('Broker > describeAcls', () => {
     }
 
     await broker.createAcls({ acl: [acl] })
-    const response = await broker.describeAcls({
-      // no principal
-      resourceName: acl.resourceName,
-      resourceType: acl.resourceType,
-      host: acl.host,
-      permissionType: acl.permissionType,
-      operation: acl.operation,
-      resourcePatternType: acl.resourcePatternType,
-    })
+
+    // KRaft commits ACLs through the controller, so the broker's authorizer cache catches up
+    // asynchronously and can still answer with no resources right after createAcls.
+    const response = await waitFor(
+      async () => {
+        const result = await broker.describeAcls({
+          // no principal
+          resourceName: acl.resourceName,
+          resourceType: acl.resourceType,
+          host: acl.host,
+          permissionType: acl.permissionType,
+          operation: acl.operation,
+          resourcePatternType: acl.resourcePatternType,
+        })
+
+        return result.resources.length > 0 ? result : false
+      },
+      { ignoreTimeout: false, maxWait: 10000, timeoutMessage: 'Timed out waiting for the ACL' }
+    )
 
     expect(response).toEqual({
       clientSideThrottleTime: expect.optional(0),
       throttleTime: 0,
       errorCode: 0,
-      errorMessage: null,
+      // Kafka 4.x returns an empty error message rather than a null one for these responses.
+      errorMessage: '',
       resources: [
         {
           resourceType: ACL_RESOURCE_TYPES.TOPIC,

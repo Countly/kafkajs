@@ -57,7 +57,10 @@ describe('Consumer', () => {
     const coordinator = await cluster.findGroupCoordinator({ groupId })
     const { generationId, memberId } = await coordinator.joinGroup({
       groupId,
+      // Kafka 4.x honours rebalanceTimeout literally; omitting it encodes 0 and the coordinator
+      // drops the member before SyncGroup (UNKNOWN_MEMBER_ID).
       sessionTimeout: 6000,
+      rebalanceTimeout: 30000,
       groupProtocols: [
         {
           name: 'AssignerName',

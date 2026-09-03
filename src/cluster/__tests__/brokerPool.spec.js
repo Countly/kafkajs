@@ -2,6 +2,7 @@ const {
   createConnectionBuilder,
   plainTextBrokers,
   createConnectionPool,
+  createTopic,
   newLogger,
   secureRandom,
 } = require('testHelpers')
@@ -15,6 +16,10 @@ describe('Cluster > BrokerPool', () => {
 
   beforeEach(async () => {
     topicName = `test-topic-${secureRandom()}`
+    // KRaft answers UNKNOWN_TOPIC_OR_PARTITION while a topic is being auto-created; the client only
+    // retries LEADER_NOT_AVAILABLE - Phase 2 fixes the client, see QUARANTINE.md R1. These tests
+    // exercise the broker pool, not auto creation, so the topic is created up front.
+    await createTopic({ topic: topicName })
     brokerPool = new BrokerPool({
       connectionPoolBuilder: createConnectionBuilder(),
       logger: newLogger(),
@@ -227,7 +232,8 @@ describe('Cluster > BrokerPool', () => {
     it('updates the list of brokers', async () => {
       expect(brokerPool.brokers).toEqual({})
       await brokerPool.refreshMetadata([topicName])
-      expect(Object.keys(brokerPool.brokers).sort()).toEqual(['0', '1', '2'])
+      // The KRaft test cluster numbers its nodes 1-3 (docker-compose C1); there is no broker 0.
+      expect(Object.keys(brokerPool.brokers).sort()).toEqual(['1', '2', '3'])
       expect(Object.values(brokerPool.brokers)).toEqual(
         expect.arrayContaining([expect.any(Broker), expect.any(Broker), expect.any(Broker)])
       )
@@ -255,12 +261,13 @@ describe('Cluster > BrokerPool', () => {
 
       jest.spyOn(fakeBroker, 'disconnect')
       brokerPool.brokers[nodeId] = fakeBroker
-      expect(Object.keys(brokerPool.brokers)).toEqual(['0', '1', '2', 'fakebroker'])
+      // The KRaft test cluster numbers its nodes 1-3 (docker-compose C1); there is no broker 0.
+      expect(Object.keys(brokerPool.brokers)).toEqual(['1', '2', '3', 'fakebroker'])
 
       await brokerPool.refreshMetadata([topicName])
 
       expect(fakeBroker.disconnect).toHaveBeenCalled()
-      expect(Object.keys(brokerPool.brokers)).toEqual(['0', '1', '2'])
+      expect(Object.keys(brokerPool.brokers)).toEqual(['1', '2', '3'])
     })
 
     it('retries on LEADER_NOT_AVAILABLE errors', async () => {
@@ -281,11 +288,17 @@ describe('Cluster > BrokerPool', () => {
     })
 
     describe('when replacing nodeIds with different host/port/rack', () => {
-      let lastBroker
+      let lastBroker, targetNodeId
 
       beforeEach(async () => {
         await brokerPool.refreshMetadata([topicName])
-        lastBroker = brokerPool.brokers[Object.keys(brokerPool.brokers).length - 1]
+        // The KRaft test cluster numbers its nodes 1-3 (docker-compose C1); there is no broker 0,
+        // so the node to mutate is taken from the pool instead of being hard-coded.
+        const nodeIds = Object.keys(brokerPool.brokers)
+          .map(Number)
+          .sort((a, b) => a - b)
+        targetNodeId = nodeIds[0]
+        lastBroker = brokerPool.brokers[nodeIds[nodeIds.length - 1]]
         jest.spyOn(brokerPool, 'findConnectedBroker').mockImplementation(() => lastBroker)
       })
 
@@ -293,36 +306,36 @@ describe('Cluster > BrokerPool', () => {
         jest.spyOn(lastBroker, 'metadata').mockImplementationOnce(() => ({
           ...brokerPool.metadata,
           brokers: brokerPool.metadata.brokers.map(broker =>
-            broker.nodeId === 0 ? { ...broker, host: '0.0.0.0' } : broker
+            broker.nodeId === targetNodeId ? { ...broker, host: '0.0.0.0' } : broker
           ),
         }))
 
         await brokerPool.refreshMetadata([topicName])
-        expect(brokerPool.brokers[0].connectionPool.host).toEqual('0.0.0.0')
+        expect(brokerPool.brokers[targetNodeId].connectionPool.host).toEqual('0.0.0.0')
       })
 
       it('replaces the broker when the port change', async () => {
         jest.spyOn(lastBroker, 'metadata').mockImplementationOnce(() => ({
           ...brokerPool.metadata,
           brokers: brokerPool.metadata.brokers.map(broker =>
-            broker.nodeId === 0 ? { ...broker, port: 4321 } : broker
+            broker.nodeId === targetNodeId ? { ...broker, port: 4321 } : broker
           ),
         }))
 
         await brokerPool.refreshMetadata([topicName])
-        expect(brokerPool.brokers[0].connectionPool.port).toEqual(4321)
+        expect(brokerPool.brokers[targetNodeId].connectionPool.port).toEqual(4321)
       })
 
       it('replaces the broker when the rack change', async () => {
         jest.spyOn(lastBroker, 'metadata').mockImplementationOnce(() => ({
           ...brokerPool.metadata,
           brokers: brokerPool.metadata.brokers.map(broker =>
-            broker.nodeId === 0 ? { ...broker, rack: 'south-1' } : broker
+            broker.nodeId === targetNodeId ? { ...broker, rack: 'south-1' } : broker
           ),
         }))
 
         await brokerPool.refreshMetadata([topicName])
-        expect(brokerPool.brokers[0].connectionPool.rack).toEqual('south-1')
+        expect(brokerPool.brokers[targetNodeId].connectionPool.rack).toEqual('south-1')
       })
     })
   })

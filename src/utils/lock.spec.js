@@ -19,9 +19,12 @@ describe('Utils > Lock', () => {
 
     await Promise.all([callResource(), callResource(), callResource()])
     const calls = resource.mock.calls.flat()
+    // setTimeout can fire a hair early relative to Date.now() (libuv vs. wall-clock granularity on
+    // Node 22+), so a 50ms sleep is occasionally measured as 49ms.
+    const minGap = 50 - 1
     expect(calls.length).toEqual(3)
-    expect(calls[1] - calls[0]).toBeGreaterThanOrEqual(50)
-    expect(calls[2] - calls[1]).toBeGreaterThanOrEqual(50)
+    expect(calls[1] - calls[0]).toBeGreaterThanOrEqual(minGap)
+    expect(calls[2] - calls[1]).toBeGreaterThanOrEqual(minGap)
   })
 
   it('throws an error if the lock cannot be acquired within a period', async () => {

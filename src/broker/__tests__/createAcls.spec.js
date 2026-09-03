@@ -50,7 +50,8 @@ describe('Broker > createAcls', () => {
     expect(response).toEqual({
       clientSideThrottleTime: expect.optional(0),
       throttleTime: 0,
-      creationResponses: [{ errorCode: 0, errorMessage: null }],
+      // Kafka 4.x returns an empty error message rather than a null one for these responses.
+      creationResponses: [{ errorCode: 0, errorMessage: '' }],
     })
   })
 })

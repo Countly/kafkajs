@@ -88,9 +88,10 @@ describe('Broker > Fetch', () => {
     await seedBroker.connect()
     await createTopic({ topic: topicName })
 
-    const metadata = await retryProtocol(
-      'LEADER_NOT_AVAILABLE',
-      async () => await seedBroker.metadata([topicName])
+    // KRaft propagates new-topic metadata asynchronously, so the first read can transiently see
+    // UNKNOWN_TOPIC_OR_PARTITION as well as LEADER_NOT_AVAILABLE.
+    const metadata = await retryProtocol('UNKNOWN_TOPIC_OR_PARTITION', () =>
+      retryProtocol('LEADER_NOT_AVAILABLE', () => seedBroker.metadata([topicName]))
     )
 
     // Find leader of partition

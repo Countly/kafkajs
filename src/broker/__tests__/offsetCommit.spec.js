@@ -75,7 +75,10 @@ describe('Broker > OffsetCommit', () => {
     await broker.produce({ topicData: produceData })
     const { generationId, memberId } = await groupCoordinator.joinGroup({
       groupId,
+      // Kafka 4.x honours rebalanceTimeout literally; omitting it encodes 0 and the coordinator
+      // drops the member before SyncGroup (UNKNOWN_MEMBER_ID).
       sessionTimeout: 30000,
+      rebalanceTimeout: 30000,
       groupProtocols: [
         {
           name: 'AssignerName',
@@ -134,7 +137,10 @@ describe('Broker > OffsetCommit', () => {
     await broker.produce({ topicData: produceData })
     const { generationId, memberId } = await groupCoordinator.joinGroup({
       groupId,
+      // Kafka 4.x honours rebalanceTimeout literally; omitting it encodes 0 and the coordinator
+      // drops the member before SyncGroup (UNKNOWN_MEMBER_ID).
       sessionTimeout: 30000,
+      rebalanceTimeout: 30000,
       groupProtocols: [
         {
           name: 'AssignerName',

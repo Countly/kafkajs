@@ -70,7 +70,8 @@ describe('Producer > Idempotent producer', () => {
   })
 
   it('sequential produce() calls > where produce() throws a retriable error, all messages are written to the partition once, in order', async () => {
-    for (const nodeId of [0, 1, 2]) {
+    // Node ids come from the cluster: the KRaft test cluster numbers its nodes 1-3, not 0-2.
+    for (const nodeId of cluster.brokerPool.getNodeIds()) {
       const broker = await cluster.findBroker({ nodeId })
 
       const brokerProduce = jest.spyOn(broker, 'produce')
@@ -95,7 +96,8 @@ describe('Producer > Idempotent producer', () => {
   })
 
   it('sequential produce() calls > where produce() throws a retriable error after the message is written to the log, all messages are written to the partition once, in order', async () => {
-    for (const nodeId of [0, 1, 2]) {
+    // Node ids from the cluster - see above.
+    for (const nodeId of cluster.brokerPool.getNodeIds()) {
       const broker = await cluster.findBroker({ nodeId })
       const originalCall = broker.produce.bind(broker)
       const brokerProduce = jest.spyOn(broker, 'produce')
@@ -136,7 +138,8 @@ describe('Producer > Idempotent producer', () => {
   })
 
   it('concurrent produce() calls > where produce() throws a retriable error on the first call, all messages are written to the partition once', async () => {
-    for (const nodeId of [0, 1, 2]) {
+    // Node ids from the cluster - see above.
+    for (const nodeId of cluster.brokerPool.getNodeIds()) {
       const broker = await cluster.findBroker({ nodeId })
 
       const brokerProduce = jest.spyOn(broker, 'produce')
@@ -160,7 +163,8 @@ describe('Producer > Idempotent producer', () => {
   })
 
   it('concurrent produce() calls > where produce() throws a retriable error on 2nd call, all messages are written to the partition once', async () => {
-    for (const nodeId of [0, 1, 2]) {
+    // Node ids from the cluster - see above.
+    for (const nodeId of cluster.brokerPool.getNodeIds()) {
       const broker = await cluster.findBroker({ nodeId })
 
       const brokerProduce = jest.spyOn(broker, 'produce')
@@ -185,7 +189,8 @@ describe('Producer > Idempotent producer', () => {
   })
 
   it('concurrent produce() calls > where produce() throws a retriable error after the message is written to the log, all messages are written to the partition once', async () => {
-    for (const nodeId of [0, 1, 2]) {
+    // Node ids from the cluster - see above.
+    for (const nodeId of cluster.brokerPool.getNodeIds()) {
       const broker = await cluster.findBroker({ nodeId })
       const originalCall = broker.produce.bind(broker)
       const brokerProduce = jest.spyOn(broker, 'produce')

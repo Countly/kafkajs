@@ -1,4 +1,10 @@
-const { createConnectionPool, connectionOpts, secureRandom, newLogger } = require('testHelpers')
+const {
+  createConnectionPool,
+  connectionOpts,
+  secureRandom,
+  newLogger,
+  retryProtocol,
+} = require('testHelpers')
 const CONFIG_RESOURCE_TYPES = require('../../protocol/configResourceTypes')
 const ConfigSource = require('../../protocol/configSource')
 const Broker = require('../index')
@@ -38,16 +44,20 @@ describe('Broker > describeConfigs', () => {
       topics: [{ topic: topicName1 }, { topic: topicName2 }],
     })
 
-    const response = await broker.describeConfigs({
-      includeSynonyms: true,
-      resources: [
-        {
-          type: CONFIG_RESOURCE_TYPES.TOPIC,
-          name: topicName1,
-          configNames: ['compression.type', 'retention.ms'],
-        },
-      ],
-    })
+    // KRaft commits CreateTopics on the controller and the broker's metadata image catches up
+    // asynchronously, so a describeConfigs right after can still answer UNKNOWN_TOPIC_OR_PARTITION.
+    const response = await retryProtocol('UNKNOWN_TOPIC_OR_PARTITION', () =>
+      broker.describeConfigs({
+        includeSynonyms: true,
+        resources: [
+          {
+            type: CONFIG_RESOURCE_TYPES.TOPIC,
+            name: topicName1,
+            configNames: ['compression.type', 'retention.ms'],
+          },
+        ],
+      })
+    )
 
     expect(response).toEqual({
       resources: [
@@ -79,7 +89,8 @@ describe('Broker > describeConfigs', () => {
             },
           ],
           errorCode: 0,
-          errorMessage: null,
+          // Kafka 4.x returns an empty error message rather than a null one for these responses.
+          errorMessage: '',
           resourceName: topicName1,
           resourceType: CONFIG_RESOURCE_TYPES.TOPIC,
         },
@@ -99,155 +110,37 @@ describe('Broker > describeConfigs', () => {
         topics: [{ topic: topicName1 }, { topic: topicName2 }],
       })
 
-      const response = await broker.describeConfigs({
-        resources: [
-          {
-            type: CONFIG_RESOURCE_TYPES.TOPIC,
-            name: topicName1,
-            configNames: [],
-          },
-        ],
-      })
+      // KRaft commits CreateTopics on the controller and the broker's metadata image catches up
+      // asynchronously, so a describeConfigs right after can still answer UNKNOWN_TOPIC_OR_PARTITION.
+      const response = await retryProtocol('UNKNOWN_TOPIC_OR_PARTITION', () =>
+        broker.describeConfigs({
+          resources: [
+            {
+              type: CONFIG_RESOURCE_TYPES.TOPIC,
+              name: topicName1,
+              configNames: [],
+            },
+          ],
+        })
+      )
 
+      // Kafka 4.x topic defaults: message.format.version, message.downconversion.enable and
+      // message.timestamp.difference.max.ms were removed in 4.0, and max.message.bytes now defaults
+      // to 1048588. min.insync.replicas is asserted by value only: the apache/kafka image ships it
+      // as a cluster-level dynamic default, so its source/isDefault are environment-dependent.
       const expectedConfigEntries = sortByConfigName([
+        {
+          configName: 'cleanup.policy',
+          configValue: 'delete',
+          isDefault: true,
+          configSource: ConfigSource.DEFAULT_CONFIG,
+          isSensitive: false,
+          readOnly: false,
+          configSynonyms: [],
+        },
         {
           configName: 'compression.type',
           configValue: 'producer',
-          isDefault: true,
-          configSource: ConfigSource.DEFAULT_CONFIG,
-          isSensitive: false,
-          readOnly: false,
-          configSynonyms: [],
-        },
-        {
-          configName: 'message.format.version',
-          configValue: expect.stringMatching(/^(0\.11\.0-IV2|1\.1-IV0|2\.[234]-IV1)$/),
-          isDefault: true,
-          configSource: ConfigSource.DEFAULT_CONFIG,
-          isSensitive: false,
-          readOnly: false,
-          configSynonyms: [],
-        },
-        {
-          configName: 'file.delete.delay.ms',
-          configValue: '60000',
-          isDefault: true,
-          configSource: ConfigSource.DEFAULT_CONFIG,
-          isSensitive: false,
-          readOnly: false,
-          configSynonyms: [],
-        },
-        {
-          configName: 'leader.replication.throttled.replicas',
-          configValue: '',
-          isDefault: true,
-          configSource: ConfigSource.DEFAULT_CONFIG,
-          isSensitive: false,
-          readOnly: false,
-          configSynonyms: [],
-        },
-        {
-          configName: 'max.compaction.lag.ms',
-          configSynonyms: [],
-          configValue: '9223372036854775807',
-          isDefault: true,
-          configSource: ConfigSource.DEFAULT_CONFIG,
-          isSensitive: false,
-          readOnly: false,
-        },
-        {
-          configName: 'message.downconversion.enable',
-          configSynonyms: [],
-          configValue: 'true',
-          isDefault: true,
-          configSource: ConfigSource.DEFAULT_CONFIG,
-          isSensitive: false,
-          readOnly: false,
-        },
-        {
-          configName: 'max.message.bytes',
-          configValue: '1000012',
-          isDefault: true,
-          configSource: ConfigSource.DEFAULT_CONFIG,
-          isSensitive: false,
-          readOnly: false,
-          configSynonyms: [],
-        },
-        {
-          configName: 'min.compaction.lag.ms',
-          configValue: '0',
-          isDefault: true,
-          configSource: ConfigSource.DEFAULT_CONFIG,
-          isSensitive: false,
-          readOnly: false,
-          configSynonyms: [],
-        },
-        {
-          configName: 'message.timestamp.type',
-          configValue: 'CreateTime',
-          isDefault: true,
-          configSource: ConfigSource.DEFAULT_CONFIG,
-          isSensitive: false,
-          readOnly: false,
-          configSynonyms: [],
-        },
-        {
-          configName: 'min.insync.replicas',
-          configValue: '1',
-          isDefault: true,
-          configSource: ConfigSource.DEFAULT_CONFIG,
-          isSensitive: false,
-          readOnly: false,
-          configSynonyms: [],
-        },
-        {
-          configName: 'segment.jitter.ms',
-          configValue: '0',
-          isDefault: true,
-          configSource: ConfigSource.DEFAULT_CONFIG,
-          isSensitive: false,
-          readOnly: false,
-          configSynonyms: [],
-        },
-        {
-          configName: 'preallocate',
-          configValue: 'false',
-          isDefault: true,
-          configSource: ConfigSource.DEFAULT_CONFIG,
-          isSensitive: false,
-          readOnly: false,
-          configSynonyms: [],
-        },
-        {
-          configName: 'index.interval.bytes',
-          configValue: '4096',
-          isDefault: true,
-          configSource: ConfigSource.DEFAULT_CONFIG,
-          isSensitive: false,
-          readOnly: false,
-          configSynonyms: [],
-        },
-        {
-          configName: 'min.cleanable.dirty.ratio',
-          configValue: '0.5',
-          isDefault: true,
-          configSource: ConfigSource.DEFAULT_CONFIG,
-          isSensitive: false,
-          readOnly: false,
-          configSynonyms: [],
-        },
-        {
-          configName: 'unclean.leader.election.enable',
-          configValue: 'false',
-          isDefault: true,
-          configSource: ConfigSource.DEFAULT_CONFIG,
-          isSensitive: false,
-          readOnly: false,
-          configSynonyms: [],
-        },
-        {
-          configName: 'retention.bytes',
-          configValue: '-1',
           isDefault: true,
           configSource: ConfigSource.DEFAULT_CONFIG,
           isSensitive: false,
@@ -264,8 +157,17 @@ describe('Broker > describeConfigs', () => {
           configSynonyms: [],
         },
         {
-          configName: 'cleanup.policy',
-          configValue: 'delete',
+          configName: 'file.delete.delay.ms',
+          configValue: '60000',
+          isDefault: true,
+          configSource: ConfigSource.DEFAULT_CONFIG,
+          isSensitive: false,
+          readOnly: false,
+          configSynonyms: [],
+        },
+        {
+          configName: 'flush.messages',
+          configValue: '9223372036854775807',
           isDefault: true,
           configSource: ConfigSource.DEFAULT_CONFIG,
           isSensitive: false,
@@ -291,9 +193,90 @@ describe('Broker > describeConfigs', () => {
           configSynonyms: [],
         },
         {
-          configName: 'segment.bytes',
-          configValue: '1073741824',
+          configName: 'index.interval.bytes',
+          configValue: '4096',
+          isDefault: true,
+          configSource: ConfigSource.DEFAULT_CONFIG,
+          isSensitive: false,
+          readOnly: false,
+          configSynonyms: [],
+        },
+        {
+          configName: 'leader.replication.throttled.replicas',
+          configValue: '',
+          isDefault: true,
+          configSource: ConfigSource.DEFAULT_CONFIG,
+          isSensitive: false,
+          readOnly: false,
+          configSynonyms: [],
+        },
+        {
+          configName: 'max.compaction.lag.ms',
+          configValue: '9223372036854775807',
+          isDefault: true,
+          configSource: ConfigSource.DEFAULT_CONFIG,
+          isSensitive: false,
+          readOnly: false,
+          configSynonyms: [],
+        },
+        {
+          configName: 'max.message.bytes',
+          configValue: '1048588',
+          isDefault: true,
+          configSource: ConfigSource.DEFAULT_CONFIG,
+          isSensitive: false,
+          readOnly: false,
+          configSynonyms: [],
+        },
+        {
+          configName: 'message.timestamp.type',
+          configValue: 'CreateTime',
+          isDefault: true,
+          configSource: ConfigSource.DEFAULT_CONFIG,
+          isSensitive: false,
+          readOnly: false,
+          configSynonyms: [],
+        },
+        {
+          configName: 'min.cleanable.dirty.ratio',
+          configValue: '0.5',
+          isDefault: true,
+          configSource: ConfigSource.DEFAULT_CONFIG,
+          isSensitive: false,
+          readOnly: false,
+          configSynonyms: [],
+        },
+        {
+          configName: 'min.compaction.lag.ms',
+          configValue: '0',
+          isDefault: true,
+          configSource: ConfigSource.DEFAULT_CONFIG,
+          isSensitive: false,
+          readOnly: false,
+          configSynonyms: [],
+        },
+        {
+          configName: 'min.insync.replicas',
+          configValue: '1',
           isDefault: expect.any(Boolean),
+          configSource: expect.any(Number),
+          isSensitive: false,
+          readOnly: false,
+          configSynonyms: [],
+        },
+        {
+          configName: 'preallocate',
+          configValue: 'false',
+          isDefault: true,
+          configSource: ConfigSource.DEFAULT_CONFIG,
+          isSensitive: false,
+          readOnly: false,
+          configSynonyms: [],
+        },
+        {
+          configName: 'retention.bytes',
+          configValue: '-1',
+          isDefault: true,
           configSource: ConfigSource.DEFAULT_CONFIG,
           isSensitive: false,
           readOnly: false,
@@ -302,6 +285,33 @@ describe('Broker > describeConfigs', () => {
         {
           configName: 'retention.ms',
           configValue: '604800000',
+          isDefault: true,
+          configSource: ConfigSource.DEFAULT_CONFIG,
+          isSensitive: false,
+          readOnly: false,
+          configSynonyms: [],
+        },
+        {
+          configName: 'segment.bytes',
+          configValue: '1073741824',
+          isDefault: true,
+          configSource: ConfigSource.DEFAULT_CONFIG,
+          isSensitive: false,
+          readOnly: false,
+          configSynonyms: [],
+        },
+        {
+          configName: 'segment.index.bytes',
+          configValue: '10485760',
+          isDefault: true,
+          configSource: ConfigSource.DEFAULT_CONFIG,
+          isSensitive: false,
+          readOnly: false,
+          configSynonyms: [],
+        },
+        {
+          configName: 'segment.jitter.ms',
+          configValue: '0',
           isDefault: true,
           configSource: ConfigSource.DEFAULT_CONFIG,
           isSensitive: false,
@@ -318,26 +328,8 @@ describe('Broker > describeConfigs', () => {
           configSynonyms: [],
         },
         {
-          configName: 'message.timestamp.difference.max.ms',
-          configValue: '9223372036854775807',
-          isDefault: true,
-          configSource: ConfigSource.DEFAULT_CONFIG,
-          isSensitive: false,
-          readOnly: false,
-          configSynonyms: [],
-        },
-        {
-          configName: 'flush.messages',
-          configValue: '9223372036854775807',
-          isDefault: true,
-          configSource: ConfigSource.DEFAULT_CONFIG,
-          isSensitive: false,
-          readOnly: false,
-          configSynonyms: [],
-        },
-        {
-          configName: 'segment.index.bytes',
-          configValue: '10485760',
+          configName: 'unclean.leader.election.enable',
+          configValue: 'false',
           isDefault: true,
           configSource: ConfigSource.DEFAULT_CONFIG,
           isSensitive: false,
@@ -352,7 +344,8 @@ describe('Broker > describeConfigs', () => {
             expect.objectContaining({
               configEntries: expect.any(Array),
               errorCode: 0,
-              errorMessage: null,
+              // Kafka 4.x returns an empty error message rather than a null one for these responses.
+              errorMessage: '',
               resourceName: topicName1,
               resourceType: CONFIG_RESOURCE_TYPES.TOPIC,
             }),

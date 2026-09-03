@@ -256,18 +256,42 @@ const waitForConsumerToJoinGroup = (consumer, { maxWait = 10000, label = '' } = 
     })
   })
 
+// KRaft commits CreateTopics on the controller and propagates the metadata asynchronously, so the
+// waitForLeaders metadata read can transiently answer UNKNOWN_TOPIC_OR_PARTITION (Kafka 4.x) or
+// LEADER_NOT_AVAILABLE (Kafka <= 3.x). The client bails on the former today -- see QUARANTINE.md R1.
+const TOPIC_NOT_READY_ERRORS = ['UNKNOWN_TOPIC_OR_PARTITION', 'LEADER_NOT_AVAILABLE']
+const CREATE_TOPIC_ATTEMPTS = 10
+const CREATE_TOPIC_RETRY_MS = 200
+
 const createTopic = async ({ topic, partitions = 1, replicas = 1, config = [] }) => {
   const kafka = new Kafka({ clientId: 'testHelpers', brokers: [`${getHost()}:9092`] })
   const admin = kafka.admin()
 
   try {
     await admin.connect()
-    await admin.createTopics({
-      waitForLeaders: true,
-      topics: [
-        { topic, numPartitions: partitions, replicationFactor: replicas, configEntries: config },
-      ],
-    })
+
+    for (let attempt = 1; ; attempt++) {
+      try {
+        await admin.createTopics({
+          waitForLeaders: true,
+          topics: [
+            {
+              topic,
+              numPartitions: partitions,
+              replicationFactor: replicas,
+              configEntries: config,
+            },
+          ],
+        })
+        return
+      } catch (e) {
+        if (!TOPIC_NOT_READY_ERRORS.includes(e.type) || attempt >= CREATE_TOPIC_ATTEMPTS) {
+          throw e
+        }
+
+        await new Promise(resolve => setTimeout(resolve, CREATE_TOPIC_RETRY_MS))
+      }
+    }
   } finally {
     admin && (await admin.disconnect())
   }

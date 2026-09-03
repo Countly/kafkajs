@@ -290,9 +290,15 @@ describe('Broker > Produce', () => {
       })
 
       await producerBroker.connect()
-      const result = await producerBroker.initProducerId({
-        transactionTimeout: 30000,
-      })
+      // The transaction coordinator can still be loading __transaction_state on a cold 4.x cluster
+      // (codes 14/16, which kafkajs still names GROUP_LOAD_IN_PROGRESS / NOT_COORDINATOR_FOR_GROUP).
+      const result = await retryProtocol('GROUP_LOAD_IN_PROGRESS', () =>
+        retryProtocol('NOT_COORDINATOR_FOR_GROUP', () =>
+          producerBroker.initProducerId({
+            transactionTimeout: 30000,
+          })
+        )
+      )
 
       const producerId = result.producerId
       const producerEpoch = result.producerEpoch
@@ -507,11 +513,13 @@ describe('Broker > Produce', () => {
       async () => {
         topicName = `test-max-timestamp-difference-${secureRandom()}`
 
+        // Kafka 4.0 removed message.timestamp.difference.max.ms in favour of the
+        // before/after pair; message.timestamp.before.max.ms is the equivalent knob.
         await createTopic({
           topic: topicName,
           config: [
             {
-              name: 'message.timestamp.difference.max.ms',
+              name: 'message.timestamp.before.max.ms',
               value: '604800000', // 7 days
             },
           ],

@@ -51,10 +51,16 @@ describe('Broker > EndTxn', () => {
 
     await transactionBroker.connect()
 
-    const result = await transactionBroker.initProducerId({
-      transactionalId,
-      transactionTimeout: 30000,
-    })
+    // The transaction coordinator can still be loading __transaction_state on a cold 4.x cluster
+    // (codes 14/16, which kafkajs still names GROUP_LOAD_IN_PROGRESS / NOT_COORDINATOR_FOR_GROUP).
+    const result = await retryProtocol('GROUP_LOAD_IN_PROGRESS', () =>
+      retryProtocol('NOT_COORDINATOR_FOR_GROUP', () =>
+        transactionBroker.initProducerId({
+          transactionalId,
+          transactionTimeout: 30000,
+        })
+      )
+    )
 
     producerId = result.producerId
     producerEpoch = result.producerEpoch

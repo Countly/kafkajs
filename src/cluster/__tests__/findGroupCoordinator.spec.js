@@ -62,18 +62,23 @@ describe('Cluster > findGroupCoordinator', () => {
   })
 
   test('attempt to find coordinator across all brokers until one is found', async () => {
-    jest.spyOn(cluster.brokerPool.brokers[0], 'findGroupCoordinator').mockImplementation(() => {
-      throw new KafkaJSConnectionError('Something went wrong')
-    })
-    jest.spyOn(cluster.brokerPool.brokers[1], 'findGroupCoordinator').mockImplementation(() => {
-      throw new KafkaJSConnectionError('Something went wrong')
-    })
+    // Node ids come from the broker pool: the KRaft test cluster numbers its nodes 1-3, not 0-2.
+    const nodeIds = cluster.brokerPool.getNodeIds()
+    const lastNodeId = nodeIds[nodeIds.length - 1]
+
+    for (const nodeId of nodeIds.slice(0, -1)) {
+      jest
+        .spyOn(cluster.brokerPool.brokers[nodeId], 'findGroupCoordinator')
+        .mockImplementation(() => {
+          throw new KafkaJSConnectionError('Something went wrong')
+        })
+    }
     jest
-      .spyOn(cluster.brokerPool.brokers[2], 'findGroupCoordinator')
-      .mockImplementation(() => ({ coordinator: { nodeId: 2 } }))
+      .spyOn(cluster.brokerPool.brokers[lastNodeId], 'findGroupCoordinator')
+      .mockImplementation(() => ({ coordinator: { nodeId: lastNodeId } }))
 
     await expect(cluster.findGroupCoordinator({ groupId })).resolves.toEqual(
-      cluster.brokerPool.brokers[2]
+      cluster.brokerPool.brokers[lastNodeId]
     )
   })
 

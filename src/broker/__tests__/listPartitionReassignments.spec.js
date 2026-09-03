@@ -31,11 +31,12 @@ describe('Broker > alterPartitionReassignments', () => {
     await broker.connect()
     const topicName = `test-topic-${secureRandom()}`
 
+    // The KRaft test cluster numbers its nodes 1-3 (docker-compose C1); there is no broker 0.
     await broker.createTopics({
       topics: [
         {
           topic: topicName,
-          replicaAssignment: [{ partition: 0, replicas: [0, 2] }],
+          replicaAssignment: [{ partition: 0, replicas: [1, 3] }],
         },
       ],
     })
@@ -44,7 +45,7 @@ describe('Broker > alterPartitionReassignments', () => {
       topics: [
         {
           topic: topicName,
-          partitionAssignment: [{ partition: 0, replicas: [2, 1] }],
+          partitionAssignment: [{ partition: 0, replicas: [3, 2] }],
         },
       ],
     })
@@ -66,7 +67,7 @@ describe('Broker > alterPartitionReassignments', () => {
         {
           name: topicName,
           partitions: [
-            { partition: 0, replicas: [0, 1, 2], addingReplicas: [1], removingReplicas: [0] },
+            { partition: 0, replicas: [1, 2, 3], addingReplicas: [2], removingReplicas: [1] },
           ],
         },
       ],

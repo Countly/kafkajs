@@ -6,6 +6,7 @@ const {
   newLogger,
   saslConnectionOpts,
   saslBrokers,
+  waitFor,
 } = require('testHelpers')
 
 const ACL_RESOURCE_TYPES = require('../../protocol/aclResourceTypes')
@@ -188,15 +189,24 @@ describe('Admin', () => {
         })
       ).resolves.toEqual(true)
 
+      // KRaft commits ACLs through the controller, so the broker's authorizer cache catches up
+      // asynchronously and can still answer with no resources right after createAcls.
       await expect(
-        admin.describeAcls({
-          resourceName: topicName,
-          resourceType: ACL_RESOURCE_TYPES.TOPIC,
-          host: '*',
-          permissionType: ACL_PERMISSION_TYPES.ALLOW,
-          operation: ACL_OPERATION_TYPES.ANY,
-          resourcePatternType: RESOURCE_PATTERN_TYPES.LITERAL,
-        })
+        waitFor(
+          async () => {
+            const result = await admin.describeAcls({
+              resourceName: topicName,
+              resourceType: ACL_RESOURCE_TYPES.TOPIC,
+              host: '*',
+              permissionType: ACL_PERMISSION_TYPES.ALLOW,
+              operation: ACL_OPERATION_TYPES.ANY,
+              resourcePatternType: RESOURCE_PATTERN_TYPES.LITERAL,
+            })
+
+            return result.resources.length > 0 ? result : false
+          },
+          { ignoreTimeout: false, maxWait: 10000, timeoutMessage: 'Timed out waiting for the ACL' }
+        )
       ).resolves.toMatchObject({
         resources: [
           {

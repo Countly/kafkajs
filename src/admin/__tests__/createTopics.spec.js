@@ -94,13 +94,14 @@ describe('Admin', () => {
     })
 
     test('creating topic with manual replica assignment', async () => {
+      // The KRaft test cluster numbers its nodes 1-3 (docker-compose C1); there is no broker 0.
       admin = createAdmin({ cluster: createCluster(), logger: newLogger() })
 
       await admin.connect()
       await expect(
         admin.createTopics({
           waitForLeaders: false,
-          topics: [{ topic: topicName, replicaAssignment: [{ partition: 0, replicas: [0, 1] }] }],
+          topics: [{ topic: topicName, replicaAssignment: [{ partition: 0, replicas: [1, 2] }] }],
         })
       ).resolves.toEqual(true)
     })
