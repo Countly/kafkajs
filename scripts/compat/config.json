@@ -1,0 +1,8 @@
+{
+  "kafkaTag": "4.3.1",
+  "schemaVersion": 1,
+  "outputs": {
+    "markdown": "docs/KafkaCompatibility.md",
+    "json": "docs/kafka-compatibility.json"
+  }
+}

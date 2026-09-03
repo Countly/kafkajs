@@ -1,0 +1,816 @@
+{
+  "kafkaTag": "4.3.1",
+  "source": "clients/src/main/java/org/apache/kafka/common/protocol/Errors.java",
+  "errors": [
+    {
+      "type": "UNKNOWN_SERVER_ERROR",
+      "code": -1,
+      "exception": "UnknownServerException",
+      "message": "The server experienced an unexpected error when processing the request."
+    },
+    {
+      "type": "NONE",
+      "code": 0,
+      "exception": null,
+      "message": null
+    },
+    {
+      "type": "OFFSET_OUT_OF_RANGE",
+      "code": 1,
+      "exception": "OffsetOutOfRangeException",
+      "message": "The requested offset is not within the range of offsets maintained by the server."
+    },
+    {
+      "type": "CORRUPT_MESSAGE",
+      "code": 2,
+      "exception": "CorruptRecordException",
+      "message": "This message has failed its CRC checksum, exceeds the valid size, has a null key for a compacted topic, or is otherwise corrupt."
+    },
+    {
+      "type": "UNKNOWN_TOPIC_OR_PARTITION",
+      "code": 3,
+      "exception": "UnknownTopicOrPartitionException",
+      "message": "This server does not host this topic-partition."
+    },
+    {
+      "type": "INVALID_FETCH_SIZE",
+      "code": 4,
+      "exception": "InvalidFetchSizeException",
+      "message": "The requested fetch size is invalid."
+    },
+    {
+      "type": "LEADER_NOT_AVAILABLE",
+      "code": 5,
+      "exception": "LeaderNotAvailableException",
+      "message": "There is no leader for this topic-partition as we are in the middle of a leadership election."
+    },
+    {
+      "type": "NOT_LEADER_OR_FOLLOWER",
+      "code": 6,
+      "exception": "NotLeaderOrFollowerException",
+      "message": "For requests intended only for the leader, this error indicates that the broker is not the current leader. For requests intended for any replica, this error indicates that the broker is not a replica of the topic partition."
+    },
+    {
+      "type": "REQUEST_TIMED_OUT",
+      "code": 7,
+      "exception": "TimeoutException",
+      "message": "The request timed out."
+    },
+    {
+      "type": "BROKER_NOT_AVAILABLE",
+      "code": 8,
+      "exception": "BrokerNotAvailableException",
+      "message": "The broker is not available."
+    },
+    {
+      "type": "REPLICA_NOT_AVAILABLE",
+      "code": 9,
+      "exception": "ReplicaNotAvailableException",
+      "message": "The replica is not available for the requested topic-partition. Produce/Fetch requests and other requests intended only for the leader or follower return NOT_LEADER_OR_FOLLOWER if the broker is not a replica of the topic-partition."
+    },
+    {
+      "type": "MESSAGE_TOO_LARGE",
+      "code": 10,
+      "exception": "RecordTooLargeException",
+      "message": "The request included a message larger than the max message size the server will accept."
+    },
+    {
+      "type": "STALE_CONTROLLER_EPOCH",
+      "code": 11,
+      "exception": "ControllerMovedException",
+      "message": "The controller moved to another broker."
+    },
+    {
+      "type": "OFFSET_METADATA_TOO_LARGE",
+      "code": 12,
+      "exception": "OffsetMetadataTooLarge",
+      "message": "The metadata field of the offset request was too large."
+    },
+    {
+      "type": "NETWORK_EXCEPTION",
+      "code": 13,
+      "exception": "NetworkException",
+      "message": "The server disconnected before a response was received."
+    },
+    {
+      "type": "COORDINATOR_LOAD_IN_PROGRESS",
+      "code": 14,
+      "exception": "CoordinatorLoadInProgressException",
+      "message": "The coordinator is loading and hence can't process requests."
+    },
+    {
+      "type": "COORDINATOR_NOT_AVAILABLE",
+      "code": 15,
+      "exception": "CoordinatorNotAvailableException",
+      "message": "The coordinator is not available."
+    },
+    {
+      "type": "NOT_COORDINATOR",
+      "code": 16,
+      "exception": "NotCoordinatorException",
+      "message": "This is not the correct coordinator."
+    },
+    {
+      "type": "INVALID_TOPIC_EXCEPTION",
+      "code": 17,
+      "exception": "InvalidTopicException",
+      "message": "The request attempted to perform an operation on an invalid topic."
+    },
+    {
+      "type": "RECORD_LIST_TOO_LARGE",
+      "code": 18,
+      "exception": "RecordBatchTooLargeException",
+      "message": "The request included message batch larger than the configured segment size on the server."
+    },
+    {
+      "type": "NOT_ENOUGH_REPLICAS",
+      "code": 19,
+      "exception": "NotEnoughReplicasException",
+      "message": "Messages are rejected since there are fewer in-sync replicas than required."
+    },
+    {
+      "type": "NOT_ENOUGH_REPLICAS_AFTER_APPEND",
+      "code": 20,
+      "exception": "NotEnoughReplicasAfterAppendException",
+      "message": "Messages are written to the log, but to fewer in-sync replicas than required."
+    },
+    {
+      "type": "INVALID_REQUIRED_ACKS",
+      "code": 21,
+      "exception": "InvalidRequiredAcksException",
+      "message": "Produce request specified an invalid value for required acks."
+    },
+    {
+      "type": "ILLEGAL_GENERATION",
+      "code": 22,
+      "exception": "IllegalGenerationException",
+      "message": "Specified group generation id is not valid."
+    },
+    {
+      "type": "INCONSISTENT_GROUP_PROTOCOL",
+      "code": 23,
+      "exception": "InconsistentGroupProtocolException",
+      "message": "The group member's supported protocols are incompatible with those of existing members or first group member tried to join with empty protocol type or empty protocol list."
+    },
+    {
+      "type": "INVALID_GROUP_ID",
+      "code": 24,
+      "exception": "InvalidGroupIdException",
+      "message": "The group id is invalid."
+    },
+    {
+      "type": "UNKNOWN_MEMBER_ID",
+      "code": 25,
+      "exception": "UnknownMemberIdException",
+      "message": "The coordinator is not aware of this member."
+    },
+    {
+      "type": "INVALID_SESSION_TIMEOUT",
+      "code": 26,
+      "exception": "InvalidSessionTimeoutException",
+      "message": "The session timeout is not within the range allowed by the broker (as configured by group.min.session.timeout.ms and group.max.session.timeout.ms)."
+    },
+    {
+      "type": "REBALANCE_IN_PROGRESS",
+      "code": 27,
+      "exception": "RebalanceInProgressException",
+      "message": "The group is rebalancing, so a rejoin is needed."
+    },
+    {
+      "type": "INVALID_COMMIT_OFFSET_SIZE",
+      "code": 28,
+      "exception": "InvalidCommitOffsetSizeException",
+      "message": "The committing offset data size is not valid."
+    },
+    {
+      "type": "TOPIC_AUTHORIZATION_FAILED",
+      "code": 29,
+      "exception": "TopicAuthorizationException",
+      "message": "Topic authorization failed."
+    },
+    {
+      "type": "GROUP_AUTHORIZATION_FAILED",
+      "code": 30,
+      "exception": "GroupAuthorizationException",
+      "message": "Group authorization failed."
+    },
+    {
+      "type": "CLUSTER_AUTHORIZATION_FAILED",
+      "code": 31,
+      "exception": "ClusterAuthorizationException",
+      "message": "Cluster authorization failed."
+    },
+    {
+      "type": "INVALID_TIMESTAMP",
+      "code": 32,
+      "exception": "InvalidTimestampException",
+      "message": "The timestamp of the message is out of acceptable range."
+    },
+    {
+      "type": "UNSUPPORTED_SASL_MECHANISM",
+      "code": 33,
+      "exception": "UnsupportedSaslMechanismException",
+      "message": "The broker does not support the requested SASL mechanism."
+    },
+    {
+      "type": "ILLEGAL_SASL_STATE",
+      "code": 34,
+      "exception": "IllegalSaslStateException",
+      "message": "Request is not valid given the current SASL state."
+    },
+    {
+      "type": "UNSUPPORTED_VERSION",
+      "code": 35,
+      "exception": "UnsupportedVersionException",
+      "message": "The version of API is not supported."
+    },
+    {
+      "type": "TOPIC_ALREADY_EXISTS",
+      "code": 36,
+      "exception": "TopicExistsException",
+      "message": "Topic with this name already exists."
+    },
+    {
+      "type": "INVALID_PARTITIONS",
+      "code": 37,
+      "exception": "InvalidPartitionsException",
+      "message": "Number of partitions is below 1."
+    },
+    {
+      "type": "INVALID_REPLICATION_FACTOR",
+      "code": 38,
+      "exception": "InvalidReplicationFactorException",
+      "message": "Replication factor is below 1 or larger than the number of available brokers."
+    },
+    {
+      "type": "INVALID_REPLICA_ASSIGNMENT",
+      "code": 39,
+      "exception": "InvalidReplicaAssignmentException",
+      "message": "Replica assignment is invalid."
+    },
+    {
+      "type": "INVALID_CONFIG",
+      "code": 40,
+      "exception": "InvalidConfigurationException",
+      "message": "Configuration is invalid."
+    },
+    {
+      "type": "NOT_CONTROLLER",
+      "code": 41,
+      "exception": "NotControllerException",
+      "message": "This is not the correct controller for this cluster."
+    },
+    {
+      "type": "INVALID_REQUEST",
+      "code": 42,
+      "exception": "InvalidRequestException",
+      "message": "This most likely occurs because of a request being malformed by the client library or the message was sent to an incompatible broker. See the broker logs for more details."
+    },
+    {
+      "type": "UNSUPPORTED_FOR_MESSAGE_FORMAT",
+      "code": 43,
+      "exception": "UnsupportedForMessageFormatException",
+      "message": "The message format version on the broker does not support the request."
+    },
+    {
+      "type": "POLICY_VIOLATION",
+      "code": 44,
+      "exception": "PolicyViolationException",
+      "message": "Request parameters do not satisfy the configured policy."
+    },
+    {
+      "type": "OUT_OF_ORDER_SEQUENCE_NUMBER",
+      "code": 45,
+      "exception": "OutOfOrderSequenceException",
+      "message": "The broker received an out of order sequence number."
+    },
+    {
+      "type": "DUPLICATE_SEQUENCE_NUMBER",
+      "code": 46,
+      "exception": "DuplicateSequenceException",
+      "message": "The broker received a duplicate sequence number."
+    },
+    {
+      "type": "INVALID_PRODUCER_EPOCH",
+      "code": 47,
+      "exception": "InvalidProducerEpochException",
+      "message": "Producer attempted to produce with an old epoch."
+    },
+    {
+      "type": "INVALID_TXN_STATE",
+      "code": 48,
+      "exception": "InvalidTxnStateException",
+      "message": "The producer attempted a transactional operation in an invalid state."
+    },
+    {
+      "type": "INVALID_PRODUCER_ID_MAPPING",
+      "code": 49,
+      "exception": "InvalidPidMappingException",
+      "message": "The producer attempted to use a producer id which is not currently assigned to its transactional id."
+    },
+    {
+      "type": "INVALID_TRANSACTION_TIMEOUT",
+      "code": 50,
+      "exception": "InvalidTxnTimeoutException",
+      "message": "The transaction timeout is larger than the maximum value allowed by the broker (as configured by transaction.max.timeout.ms)."
+    },
+    {
+      "type": "CONCURRENT_TRANSACTIONS",
+      "code": 51,
+      "exception": "ConcurrentTransactionsException",
+      "message": "The producer attempted to update a transaction while another concurrent operation on the same transaction was ongoing."
+    },
+    {
+      "type": "TRANSACTION_COORDINATOR_FENCED",
+      "code": 52,
+      "exception": "TransactionCoordinatorFencedException",
+      "message": "Indicates that the transaction coordinator sending a WriteTxnMarker is no longer the current coordinator for a given producer."
+    },
+    {
+      "type": "TRANSACTIONAL_ID_AUTHORIZATION_FAILED",
+      "code": 53,
+      "exception": "TransactionalIdAuthorizationException",
+      "message": "Transactional Id authorization failed."
+    },
+    {
+      "type": "SECURITY_DISABLED",
+      "code": 54,
+      "exception": "SecurityDisabledException",
+      "message": "Security features are disabled."
+    },
+    {
+      "type": "OPERATION_NOT_ATTEMPTED",
+      "code": 55,
+      "exception": "OperationNotAttemptedException",
+      "message": "The broker did not attempt to execute this operation. This may happen for batched RPCs where some operations in the batch failed, causing the broker to respond without trying the rest."
+    },
+    {
+      "type": "KAFKA_STORAGE_ERROR",
+      "code": 56,
+      "exception": "KafkaStorageException",
+      "message": "Disk error when trying to access log file on the disk."
+    },
+    {
+      "type": "LOG_DIR_NOT_FOUND",
+      "code": 57,
+      "exception": "LogDirNotFoundException",
+      "message": "The user-specified log directory is not found in the broker config."
+    },
+    {
+      "type": "SASL_AUTHENTICATION_FAILED",
+      "code": 58,
+      "exception": "SaslAuthenticationException",
+      "message": "SASL Authentication failed."
+    },
+    {
+      "type": "UNKNOWN_PRODUCER_ID",
+      "code": 59,
+      "exception": "UnknownProducerIdException",
+      "message": "This exception is raised by the broker if it could not locate the producer metadata associated with the producerId in question. This could happen if, for instance, the producer's records were deleted because their retention time had elapsed. Once the last records of the producerId are removed, the producer's metadata is removed from the broker, and future appends by the producer will return this exception."
+    },
+    {
+      "type": "REASSIGNMENT_IN_PROGRESS",
+      "code": 60,
+      "exception": "ReassignmentInProgressException",
+      "message": "A partition reassignment is in progress."
+    },
+    {
+      "type": "DELEGATION_TOKEN_AUTH_DISABLED",
+      "code": 61,
+      "exception": "DelegationTokenDisabledException",
+      "message": "Delegation Token feature is not enabled."
+    },
+    {
+      "type": "DELEGATION_TOKEN_NOT_FOUND",
+      "code": 62,
+      "exception": "DelegationTokenNotFoundException",
+      "message": "Delegation Token is not found on server."
+    },
+    {
+      "type": "DELEGATION_TOKEN_OWNER_MISMATCH",
+      "code": 63,
+      "exception": "DelegationTokenOwnerMismatchException",
+      "message": "Specified Principal is not valid Owner/Renewer."
+    },
+    {
+      "type": "DELEGATION_TOKEN_REQUEST_NOT_ALLOWED",
+      "code": 64,
+      "exception": "UnsupportedByAuthenticationException",
+      "message": "Delegation Token requests are not allowed on PLAINTEXT/1-way SSL channels and on delegation token authenticated channels."
+    },
+    {
+      "type": "DELEGATION_TOKEN_AUTHORIZATION_FAILED",
+      "code": 65,
+      "exception": "DelegationTokenAuthorizationException",
+      "message": "Delegation Token authorization failed."
+    },
+    {
+      "type": "DELEGATION_TOKEN_EXPIRED",
+      "code": 66,
+      "exception": "DelegationTokenExpiredException",
+      "message": "Delegation Token is expired."
+    },
+    {
+      "type": "INVALID_PRINCIPAL_TYPE",
+      "code": 67,
+      "exception": "InvalidPrincipalTypeException",
+      "message": "Supplied principalType is not supported."
+    },
+    {
+      "type": "NON_EMPTY_GROUP",
+      "code": 68,
+      "exception": "GroupNotEmptyException",
+      "message": "The group is not empty."
+    },
+    {
+      "type": "GROUP_ID_NOT_FOUND",
+      "code": 69,
+      "exception": "GroupIdNotFoundException",
+      "message": "The group id does not exist."
+    },
+    {
+      "type": "FETCH_SESSION_ID_NOT_FOUND",
+      "code": 70,
+      "exception": "FetchSessionIdNotFoundException",
+      "message": "The fetch session ID was not found."
+    },
+    {
+      "type": "INVALID_FETCH_SESSION_EPOCH",
+      "code": 71,
+      "exception": "InvalidFetchSessionEpochException",
+      "message": "The fetch session epoch is invalid."
+    },
+    {
+      "type": "LISTENER_NOT_FOUND",
+      "code": 72,
+      "exception": "ListenerNotFoundException",
+      "message": "There is no listener on the leader broker that matches the listener on which metadata request was processed."
+    },
+    {
+      "type": "TOPIC_DELETION_DISABLED",
+      "code": 73,
+      "exception": "TopicDeletionDisabledException",
+      "message": "Topic deletion is disabled."
+    },
+    {
+      "type": "FENCED_LEADER_EPOCH",
+      "code": 74,
+      "exception": "FencedLeaderEpochException",
+      "message": "The leader epoch in the request is older than the epoch on the broker."
+    },
+    {
+      "type": "UNKNOWN_LEADER_EPOCH",
+      "code": 75,
+      "exception": "UnknownLeaderEpochException",
+      "message": "The leader epoch in the request is newer than the epoch on the broker."
+    },
+    {
+      "type": "UNSUPPORTED_COMPRESSION_TYPE",
+      "code": 76,
+      "exception": "UnsupportedCompressionTypeException",
+      "message": "The requesting client does not support the compression type of given partition."
+    },
+    {
+      "type": "STALE_BROKER_EPOCH",
+      "code": 77,
+      "exception": "StaleBrokerEpochException",
+      "message": "Broker epoch has changed."
+    },
+    {
+      "type": "OFFSET_NOT_AVAILABLE",
+      "code": 78,
+      "exception": "OffsetNotAvailableException",
+      "message": "The leader high watermark has not caught up from a recent leader election so the offsets cannot be guaranteed to be monotonically increasing."
+    },
+    {
+      "type": "MEMBER_ID_REQUIRED",
+      "code": 79,
+      "exception": "MemberIdRequiredException",
+      "message": "The group member needs to have a valid member id before actually entering a consumer group."
+    },
+    {
+      "type": "PREFERRED_LEADER_NOT_AVAILABLE",
+      "code": 80,
+      "exception": "PreferredLeaderNotAvailableException",
+      "message": "The preferred leader was not available."
+    },
+    {
+      "type": "GROUP_MAX_SIZE_REACHED",
+      "code": 81,
+      "exception": "GroupMaxSizeReachedException",
+      "message": "The group has reached its maximum size."
+    },
+    {
+      "type": "FENCED_INSTANCE_ID",
+      "code": 82,
+      "exception": "FencedInstanceIdException",
+      "message": "The broker rejected this static consumer since another consumer with the same group.instance.id has registered with a different member.id."
+    },
+    {
+      "type": "ELIGIBLE_LEADERS_NOT_AVAILABLE",
+      "code": 83,
+      "exception": "EligibleLeadersNotAvailableException",
+      "message": "Eligible topic partition leaders are not available."
+    },
+    {
+      "type": "ELECTION_NOT_NEEDED",
+      "code": 84,
+      "exception": "ElectionNotNeededException",
+      "message": "Leader election not needed for topic partition."
+    },
+    {
+      "type": "NO_REASSIGNMENT_IN_PROGRESS",
+      "code": 85,
+      "exception": "NoReassignmentInProgressException",
+      "message": "No partition reassignment is in progress."
+    },
+    {
+      "type": "GROUP_SUBSCRIBED_TO_TOPIC",
+      "code": 86,
+      "exception": "GroupSubscribedToTopicException",
+      "message": "Deleting offsets of a topic is forbidden while the consumer group is actively subscribed to it."
+    },
+    {
+      "type": "INVALID_RECORD",
+      "code": 87,
+      "exception": "InvalidRecordException",
+      "message": "This record has failed the validation on broker and hence will be rejected."
+    },
+    {
+      "type": "UNSTABLE_OFFSET_COMMIT",
+      "code": 88,
+      "exception": "UnstableOffsetCommitException",
+      "message": "There are unstable offsets that need to be cleared."
+    },
+    {
+      "type": "THROTTLING_QUOTA_EXCEEDED",
+      "code": 89,
+      "exception": "ThrottlingQuotaExceededException",
+      "message": "The throttling quota has been exceeded."
+    },
+    {
+      "type": "PRODUCER_FENCED",
+      "code": 90,
+      "exception": "ProducerFencedException",
+      "message": "There is a newer producer with the same transactionalId which fences the current one."
+    },
+    {
+      "type": "RESOURCE_NOT_FOUND",
+      "code": 91,
+      "exception": "ResourceNotFoundException",
+      "message": "A request illegally referred to a resource that does not exist."
+    },
+    {
+      "type": "DUPLICATE_RESOURCE",
+      "code": 92,
+      "exception": "DuplicateResourceException",
+      "message": "A request illegally referred to the same resource twice."
+    },
+    {
+      "type": "UNACCEPTABLE_CREDENTIAL",
+      "code": 93,
+      "exception": "UnacceptableCredentialException",
+      "message": "Requested credential would not meet criteria for acceptability."
+    },
+    {
+      "type": "INCONSISTENT_VOTER_SET",
+      "code": 94,
+      "exception": "InconsistentVoterSetException",
+      "message": "Indicates that the either the sender or recipient of a voter-only request is not one of the expected voters."
+    },
+    {
+      "type": "INVALID_UPDATE_VERSION",
+      "code": 95,
+      "exception": "InvalidUpdateVersionException",
+      "message": "The given update version was invalid."
+    },
+    {
+      "type": "FEATURE_UPDATE_FAILED",
+      "code": 96,
+      "exception": "FeatureUpdateFailedException",
+      "message": "Unable to update finalized features due to an unexpected server error."
+    },
+    {
+      "type": "PRINCIPAL_DESERIALIZATION_FAILURE",
+      "code": 97,
+      "exception": "PrincipalDeserializationException",
+      "message": "Request principal deserialization failed during forwarding. This indicates an internal error on the broker cluster security setup."
+    },
+    {
+      "type": "SNAPSHOT_NOT_FOUND",
+      "code": 98,
+      "exception": "SnapshotNotFoundException",
+      "message": "Requested snapshot was not found."
+    },
+    {
+      "type": "POSITION_OUT_OF_RANGE",
+      "code": 99,
+      "exception": "PositionOutOfRangeException",
+      "message": "Requested position is not greater than or equal to zero, and less than the size of the snapshot."
+    },
+    {
+      "type": "UNKNOWN_TOPIC_ID",
+      "code": 100,
+      "exception": "UnknownTopicIdException",
+      "message": "This server does not host this topic ID."
+    },
+    {
+      "type": "DUPLICATE_BROKER_REGISTRATION",
+      "code": 101,
+      "exception": "DuplicateBrokerRegistrationException",
+      "message": "This broker ID is already in use."
+    },
+    {
+      "type": "BROKER_ID_NOT_REGISTERED",
+      "code": 102,
+      "exception": "BrokerIdNotRegisteredException",
+      "message": "The given broker ID was not registered."
+    },
+    {
+      "type": "INCONSISTENT_TOPIC_ID",
+      "code": 103,
+      "exception": "InconsistentTopicIdException",
+      "message": "The log's topic ID did not match the topic ID in the request."
+    },
+    {
+      "type": "INCONSISTENT_CLUSTER_ID",
+      "code": 104,
+      "exception": "InconsistentClusterIdException",
+      "message": "The clusterId in the request does not match that found on the server."
+    },
+    {
+      "type": "TRANSACTIONAL_ID_NOT_FOUND",
+      "code": 105,
+      "exception": "TransactionalIdNotFoundException",
+      "message": "The transactionalId could not be found."
+    },
+    {
+      "type": "FETCH_SESSION_TOPIC_ID_ERROR",
+      "code": 106,
+      "exception": "FetchSessionTopicIdException",
+      "message": "The fetch session encountered inconsistent topic ID usage."
+    },
+    {
+      "type": "INELIGIBLE_REPLICA",
+      "code": 107,
+      "exception": "IneligibleReplicaException",
+      "message": "The new ISR contains at least one ineligible replica."
+    },
+    {
+      "type": "NEW_LEADER_ELECTED",
+      "code": 108,
+      "exception": "NewLeaderElectedException",
+      "message": "The AlterPartition request successfully updated the partition state but the leader has changed."
+    },
+    {
+      "type": "OFFSET_MOVED_TO_TIERED_STORAGE",
+      "code": 109,
+      "exception": "OffsetMovedToTieredStorageException",
+      "message": "The requested offset is moved to tiered storage."
+    },
+    {
+      "type": "FENCED_MEMBER_EPOCH",
+      "code": 110,
+      "exception": "FencedMemberEpochException",
+      "message": "The member epoch is fenced by the group coordinator. The member must abandon all its partitions and rejoin."
+    },
+    {
+      "type": "UNRELEASED_INSTANCE_ID",
+      "code": 111,
+      "exception": "UnreleasedInstanceIdException",
+      "message": "The instance ID is still used by another member in the consumer group. That member must leave first."
+    },
+    {
+      "type": "UNSUPPORTED_ASSIGNOR",
+      "code": 112,
+      "exception": "UnsupportedAssignorException",
+      "message": "The assignor or its version range is not supported by the consumer group."
+    },
+    {
+      "type": "STALE_MEMBER_EPOCH",
+      "code": 113,
+      "exception": "StaleMemberEpochException",
+      "message": "The member epoch is stale. The member must retry after receiving its updated member epoch via the ConsumerGroupHeartbeat API."
+    },
+    {
+      "type": "MISMATCHED_ENDPOINT_TYPE",
+      "code": 114,
+      "exception": "MismatchedEndpointTypeException",
+      "message": "The request was sent to an endpoint of the wrong type."
+    },
+    {
+      "type": "UNSUPPORTED_ENDPOINT_TYPE",
+      "code": 115,
+      "exception": "UnsupportedEndpointTypeException",
+      "message": "This endpoint type is not supported yet."
+    },
+    {
+      "type": "UNKNOWN_CONTROLLER_ID",
+      "code": 116,
+      "exception": "UnknownControllerIdException",
+      "message": "This controller ID is not known."
+    },
+    {
+      "type": "UNKNOWN_SUBSCRIPTION_ID",
+      "code": 117,
+      "exception": "UnknownSubscriptionIdException",
+      "message": "Client sent a push telemetry request with an invalid or outdated subscription ID."
+    },
+    {
+      "type": "TELEMETRY_TOO_LARGE",
+      "code": 118,
+      "exception": "TelemetryTooLargeException",
+      "message": "Client sent a push telemetry request larger than the maximum size the broker will accept."
+    },
+    {
+      "type": "INVALID_REGISTRATION",
+      "code": 119,
+      "exception": "InvalidRegistrationException",
+      "message": "The controller has considered the broker registration to be invalid."
+    },
+    {
+      "type": "TRANSACTION_ABORTABLE",
+      "code": 120,
+      "exception": "TransactionAbortableException",
+      "message": "The server encountered an error with the transaction. The client can abort the transaction to continue using this transactional ID."
+    },
+    {
+      "type": "INVALID_RECORD_STATE",
+      "code": 121,
+      "exception": "InvalidRecordStateException",
+      "message": "The record state is invalid. The acknowledgement of delivery could not be completed."
+    },
+    {
+      "type": "SHARE_SESSION_NOT_FOUND",
+      "code": 122,
+      "exception": "ShareSessionNotFoundException",
+      "message": "The share session was not found."
+    },
+    {
+      "type": "INVALID_SHARE_SESSION_EPOCH",
+      "code": 123,
+      "exception": "InvalidShareSessionEpochException",
+      "message": "The share session epoch is invalid."
+    },
+    {
+      "type": "FENCED_STATE_EPOCH",
+      "code": 124,
+      "exception": "FencedStateEpochException",
+      "message": "The share coordinator rejected the request because the share-group state epoch did not match."
+    },
+    {
+      "type": "INVALID_VOTER_KEY",
+      "code": 125,
+      "exception": "InvalidVoterKeyException",
+      "message": "The voter key doesn't match the receiving replica's key."
+    },
+    {
+      "type": "DUPLICATE_VOTER",
+      "code": 126,
+      "exception": "DuplicateVoterException",
+      "message": "The voter is already part of the set of voters."
+    },
+    {
+      "type": "VOTER_NOT_FOUND",
+      "code": 127,
+      "exception": "VoterNotFoundException",
+      "message": "The voter is not part of the set of voters."
+    },
+    {
+      "type": "INVALID_REGULAR_EXPRESSION",
+      "code": 128,
+      "exception": "InvalidRegularExpression",
+      "message": "The regular expression is not valid."
+    },
+    {
+      "type": "REBOOTSTRAP_REQUIRED",
+      "code": 129,
+      "exception": "RebootstrapRequiredException",
+      "message": "Client metadata is stale. The client should rebootstrap to obtain new metadata."
+    },
+    {
+      "type": "STREAMS_INVALID_TOPOLOGY",
+      "code": 130,
+      "exception": "StreamsInvalidTopologyException",
+      "message": "The supplied topology is invalid."
+    },
+    {
+      "type": "STREAMS_INVALID_TOPOLOGY_EPOCH",
+      "code": 131,
+      "exception": "StreamsInvalidTopologyEpochException",
+      "message": "The supplied topology epoch is invalid."
+    },
+    {
+      "type": "STREAMS_TOPOLOGY_FENCED",
+      "code": 132,
+      "exception": "StreamsTopologyFencedException",
+      "message": "The supplied topology epoch is outdated."
+    },
+    {
+      "type": "SHARE_SESSION_LIMIT_REACHED",
+      "code": 133,
+      "exception": "ShareSessionLimitReachedException",
+      "message": "The limit of share sessions has been reached."
+    }
+  ]
+}

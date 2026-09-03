@@ -1,0 +1,370 @@
+{
+  "tracked": [
+    {
+      "kafkaName": "Produce",
+      "apiKey": 0,
+      "forkName": "produce",
+      "apiKeysName": "Produce",
+      "planned": "done"
+    },
+    {
+      "kafkaName": "Fetch",
+      "apiKey": 1,
+      "forkName": "fetch",
+      "apiKeysName": "Fetch",
+      "planned": "done"
+    },
+    {
+      "kafkaName": "ListOffsets",
+      "apiKey": 2,
+      "forkName": "listOffsets",
+      "apiKeysName": "ListOffsets",
+      "planned": "done"
+    },
+    {
+      "kafkaName": "Metadata",
+      "apiKey": 3,
+      "forkName": "metadata",
+      "apiKeysName": "Metadata",
+      "planned": "done"
+    },
+    {
+      "kafkaName": "OffsetCommit",
+      "apiKey": 8,
+      "forkName": "offsetCommit",
+      "apiKeysName": "OffsetCommit",
+      "planned": "done"
+    },
+    {
+      "kafkaName": "OffsetFetch",
+      "apiKey": 9,
+      "forkName": "offsetFetch",
+      "apiKeysName": "OffsetFetch",
+      "planned": "done"
+    },
+    {
+      "kafkaName": "FindCoordinator",
+      "apiKey": 10,
+      "forkName": "findCoordinator",
+      "apiKeysName": "GroupCoordinator",
+      "planned": "done"
+    },
+    {
+      "kafkaName": "JoinGroup",
+      "apiKey": 11,
+      "forkName": "joinGroup",
+      "apiKeysName": "JoinGroup",
+      "planned": "done"
+    },
+    {
+      "kafkaName": "Heartbeat",
+      "apiKey": 12,
+      "forkName": "heartbeat",
+      "apiKeysName": "Heartbeat",
+      "planned": "done"
+    },
+    {
+      "kafkaName": "LeaveGroup",
+      "apiKey": 13,
+      "forkName": "leaveGroup",
+      "apiKeysName": "LeaveGroup",
+      "planned": "done"
+    },
+    {
+      "kafkaName": "SyncGroup",
+      "apiKey": 14,
+      "forkName": "syncGroup",
+      "apiKeysName": "SyncGroup",
+      "planned": "done"
+    },
+    {
+      "kafkaName": "DescribeGroups",
+      "apiKey": 15,
+      "forkName": "describeGroups",
+      "apiKeysName": "DescribeGroups",
+      "planned": "done"
+    },
+    {
+      "kafkaName": "ListGroups",
+      "apiKey": 16,
+      "forkName": "listGroups",
+      "apiKeysName": "ListGroups",
+      "planned": "done"
+    },
+    {
+      "kafkaName": "SaslHandshake",
+      "apiKey": 17,
+      "forkName": "saslHandshake",
+      "apiKeysName": "SaslHandshake",
+      "planned": "done"
+    },
+    {
+      "kafkaName": "ApiVersions",
+      "apiKey": 18,
+      "forkName": "apiVersions",
+      "apiKeysName": "ApiVersions",
+      "planned": "done"
+    },
+    {
+      "kafkaName": "CreateTopics",
+      "apiKey": 19,
+      "forkName": "createTopics",
+      "apiKeysName": "CreateTopics",
+      "planned": "done"
+    },
+    {
+      "kafkaName": "DeleteTopics",
+      "apiKey": 20,
+      "forkName": "deleteTopics",
+      "apiKeysName": "DeleteTopics",
+      "planned": "done"
+    },
+    {
+      "kafkaName": "DeleteRecords",
+      "apiKey": 21,
+      "forkName": "deleteRecords",
+      "apiKeysName": "DeleteRecords",
+      "planned": "done"
+    },
+    {
+      "kafkaName": "InitProducerId",
+      "apiKey": 22,
+      "forkName": "initProducerId",
+      "apiKeysName": "InitProducerId",
+      "planned": "done"
+    },
+    {
+      "kafkaName": "OffsetForLeaderEpoch",
+      "apiKey": 23,
+      "forkName": null,
+      "apiKeysName": "OffsetForLeaderEpoch",
+      "planned": "phase-5"
+    },
+    {
+      "kafkaName": "AddPartitionsToTxn",
+      "apiKey": 24,
+      "forkName": "addPartitionsToTxn",
+      "apiKeysName": "AddPartitionsToTxn",
+      "planned": "done"
+    },
+    {
+      "kafkaName": "AddOffsetsToTxn",
+      "apiKey": 25,
+      "forkName": "addOffsetsToTxn",
+      "apiKeysName": "AddOffsetsToTxn",
+      "planned": "done"
+    },
+    {
+      "kafkaName": "EndTxn",
+      "apiKey": 26,
+      "forkName": "endTxn",
+      "apiKeysName": "EndTxn",
+      "planned": "done"
+    },
+    {
+      "kafkaName": "TxnOffsetCommit",
+      "apiKey": 28,
+      "forkName": "txnOffsetCommit",
+      "apiKeysName": "TxnOffsetCommit",
+      "planned": "done"
+    },
+    {
+      "kafkaName": "DescribeAcls",
+      "apiKey": 29,
+      "forkName": "describeAcls",
+      "apiKeysName": "DescribeAcls",
+      "planned": "done"
+    },
+    {
+      "kafkaName": "CreateAcls",
+      "apiKey": 30,
+      "forkName": "createAcls",
+      "apiKeysName": "CreateAcls",
+      "planned": "done"
+    },
+    {
+      "kafkaName": "DeleteAcls",
+      "apiKey": 31,
+      "forkName": "deleteAcls",
+      "apiKeysName": "DeleteAcls",
+      "planned": "done"
+    },
+    {
+      "kafkaName": "DescribeConfigs",
+      "apiKey": 32,
+      "forkName": "describeConfigs",
+      "apiKeysName": "DescribeConfigs",
+      "planned": "done"
+    },
+    {
+      "kafkaName": "AlterConfigs",
+      "apiKey": 33,
+      "forkName": "alterConfigs",
+      "apiKeysName": "AlterConfigs",
+      "planned": "done"
+    },
+    {
+      "kafkaName": "SaslAuthenticate",
+      "apiKey": 36,
+      "forkName": "saslAuthenticate",
+      "apiKeysName": "SaslAuthenticate",
+      "planned": "done"
+    },
+    {
+      "kafkaName": "CreatePartitions",
+      "apiKey": 37,
+      "forkName": "createPartitions",
+      "apiKeysName": "CreatePartitions",
+      "planned": "done"
+    },
+    {
+      "kafkaName": "DeleteGroups",
+      "apiKey": 42,
+      "forkName": "deleteGroups",
+      "apiKeysName": "DeleteGroups",
+      "planned": "done"
+    },
+    {
+      "kafkaName": "IncrementalAlterConfigs",
+      "apiKey": 44,
+      "forkName": null,
+      "apiKeysName": "IncrementalAlterConfigs",
+      "planned": "phase-8"
+    },
+    {
+      "kafkaName": "AlterPartitionReassignments",
+      "apiKey": 45,
+      "forkName": "alterPartitionReassignments",
+      "apiKeysName": "AlterPartitionReassignments",
+      "planned": "done"
+    },
+    {
+      "kafkaName": "ListPartitionReassignments",
+      "apiKey": 46,
+      "forkName": "listPartitionReassignments",
+      "apiKeysName": "ListPartitionReassignments",
+      "planned": "done"
+    },
+    {
+      "kafkaName": "ConsumerGroupHeartbeat",
+      "apiKey": 68,
+      "forkName": null,
+      "apiKeysName": null,
+      "planned": "phase-6"
+    },
+    {
+      "kafkaName": "ConsumerGroupDescribe",
+      "apiKey": 69,
+      "forkName": null,
+      "apiKeysName": null,
+      "planned": "phase-6"
+    },
+    {
+      "kafkaName": "GetTelemetrySubscriptions",
+      "apiKey": 71,
+      "forkName": null,
+      "apiKeysName": null,
+      "planned": "no"
+    },
+    {
+      "kafkaName": "PushTelemetry",
+      "apiKey": 72,
+      "forkName": null,
+      "apiKeysName": null,
+      "planned": "no"
+    },
+    {
+      "kafkaName": "DescribeTopicPartitions",
+      "apiKey": 75,
+      "forkName": null,
+      "apiKeysName": null,
+      "planned": "phase-8"
+    }
+  ],
+  "untracked": [
+    {
+      "kafkaName": "LeaderAndIsr",
+      "apiKey": 4,
+      "forkName": null,
+      "apiKeysName": "LeaderAndIsr",
+      "reason": "ZooKeeper-era controller-to-broker API; still defined upstream at 4.3.1 but never sent by a client. Stub in requests/index.js."
+    },
+    {
+      "kafkaName": "StopReplica",
+      "apiKey": 5,
+      "forkName": null,
+      "apiKeysName": "StopReplica",
+      "reason": "ZooKeeper-era controller-to-broker API. Stub in requests/index.js."
+    },
+    {
+      "kafkaName": "UpdateMetadata",
+      "apiKey": 6,
+      "forkName": null,
+      "apiKeysName": "UpdateMetadata",
+      "reason": "ZooKeeper-era controller-to-broker API. Stub in requests/index.js."
+    },
+    {
+      "kafkaName": "ControlledShutdown",
+      "apiKey": 7,
+      "forkName": null,
+      "apiKeysName": "ControlledShutdown",
+      "reason": "Broker shutdown handshake, not a client API. Stub in requests/index.js."
+    },
+    {
+      "kafkaName": "WriteTxnMarkers",
+      "apiKey": 27,
+      "forkName": null,
+      "apiKeysName": "WriteTxnMarkers",
+      "reason": "Transaction-coordinator to broker only. Stub in requests/index.js."
+    },
+    {
+      "kafkaName": "AlterReplicaLogDirs",
+      "apiKey": 34,
+      "forkName": null,
+      "apiKeysName": "AlterReplicaLogDirs",
+      "reason": "Log-directory administration; not planned. Stub in requests/index.js."
+    },
+    {
+      "kafkaName": "DescribeLogDirs",
+      "apiKey": 35,
+      "forkName": null,
+      "apiKeysName": "DescribeLogDirs",
+      "reason": "Log-directory administration; not planned. Stub in requests/index.js."
+    },
+    {
+      "kafkaName": "CreateDelegationToken",
+      "apiKey": 38,
+      "forkName": null,
+      "apiKeysName": "CreateDelegationToken",
+      "reason": "Delegation tokens (KIP-48); not planned. Stub in requests/index.js."
+    },
+    {
+      "kafkaName": "RenewDelegationToken",
+      "apiKey": 39,
+      "forkName": null,
+      "apiKeysName": "RenewDelegationToken",
+      "reason": "Delegation tokens (KIP-48); not planned. Stub in requests/index.js."
+    },
+    {
+      "kafkaName": "ExpireDelegationToken",
+      "apiKey": 40,
+      "forkName": null,
+      "apiKeysName": "ExpireDelegationToken",
+      "reason": "Delegation tokens (KIP-48); not planned. Stub in requests/index.js."
+    },
+    {
+      "kafkaName": "DescribeDelegationToken",
+      "apiKey": 41,
+      "forkName": null,
+      "apiKeysName": "DescribeDelegationToken",
+      "reason": "Delegation tokens (KIP-48); not planned. Stub in requests/index.js."
+    },
+    {
+      "kafkaName": "ElectLeaders",
+      "apiKey": 43,
+      "forkName": null,
+      "apiKeysName": "ElectPreferredLeaders",
+      "reason": "Preferred-leader election; not planned. apiKeys.js still uses the pre-2.4 name ElectPreferredLeaders while requests/index.js registers the entry as ElectLeaders, so requests[apiKeys name] is undefined - reported by compat:check, fixed outside Phase 3."
+    }
+  ]
+}
