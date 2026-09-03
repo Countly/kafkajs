@@ -1,0 +1,36 @@
+name: Weekly full matrix
+on:
+  schedule: [{ cron: '0 3 * * 1' }]
+  workflow_dispatch:
+    inputs:
+      kafka_version: { description: 'Extra Kafka version to add (e.g. 4.4.0)', required: false }
+jobs:
+  integration:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      max-parallel: 6
+      matrix:
+        node: [22, 24, 26]
+        kafka: ['4.1.2', '4.2.1', '4.3.1']
+        group: [broker, admin, producer, consumer, others, oauthbearer]
+        exclude:
+          - { node: 22, kafka: '4.2.1' }
+          - { node: 26, kafka: '4.1.2' }
+          - { node: 26, kafka: '4.2.1' }
+    # When kafka_version is provided via workflow_dispatch, it overrides KAFKA_VERSION for every
+    # matrix job (not just one), replacing matrix.kafka for the whole run — acceptable for an
+    # ad-hoc check.
+    env:
+      KAFKA_VERSION: ${{ github.event.inputs.kafka_version || matrix.kafka }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: '${{ matrix.node }}', cache: yarn }
+      - run: yarn install --frozen-lockfile
+      - run: yarn test:group:${{ matrix.group }}:ci
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: junit-${{ matrix.node }}-${{ matrix.kafka }}-${{ matrix.group }}
+          path: test-report.xml

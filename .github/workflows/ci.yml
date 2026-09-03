@@ -1,0 +1,68 @@
+name: CI
+on:
+  push: { branches: [master] }
+  pull_request:
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 24, cache: yarn }
+      - run: yarn install --frozen-lockfile
+      - run: yarn lint
+      - run: yarn test:types
+  unit:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix: { node: [22, 24, 26] }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: '${{ matrix.node }}', cache: yarn }
+      - run: yarn install --frozen-lockfile
+      - run: yarn test:unit
+  pack:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 24, cache: yarn }
+      - run: yarn install --frozen-lockfile
+      - run: yarn test:pack
+  integration:
+    runs-on: ubuntu-latest
+    needs: [unit]
+    strategy:
+      fail-fast: false
+      max-parallel: 6
+      matrix:
+        include:
+          - { node: 24, kafka: 4.3.1, group: broker }
+          - { node: 24, kafka: 4.3.1, group: admin }
+          - { node: 24, kafka: 4.3.1, group: producer }
+          - { node: 24, kafka: 4.3.1, group: consumer }
+          - { node: 24, kafka: 4.3.1, group: others }
+          - { node: 24, kafka: 4.3.1, group: oauthbearer }
+          - { node: 22, kafka: 4.3.1, group: broker }
+          - { node: 22, kafka: 4.3.1, group: others }
+          - { node: 26, kafka: 4.3.1, group: broker }
+          - { node: 26, kafka: 4.3.1, group: others }
+    env:
+      KAFKA_VERSION: ${{ matrix.kafka }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: '${{ matrix.node }}', cache: yarn }
+      - run: yarn install --frozen-lockfile
+      - run: docker compose version
+      - run: yarn test:group:${{ matrix.group }}:ci
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: junit-${{ matrix.node }}-${{ matrix.kafka }}-${{ matrix.group }}
+          path: test-report.xml
