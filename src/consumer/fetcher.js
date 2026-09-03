@@ -36,7 +36,7 @@ const createFetcher = ({
           {
             topic: batch.topic,
             partition: batch.partition,
-            assignedFetcher: assignedFetcher,
+            assignedFetcher,
             fetcher: nodeId,
           }
         )

@@ -145,7 +145,7 @@ const saslOAuthBearerConnectionOpts = () =>
  * OAUTHBEARER must be enabled as a special case.
  */
 const saslEntries = []
-if (process.env['OAUTHBEARER_ENABLED'] !== '1') {
+if (process.env.OAUTHBEARER_ENABLED !== '1') {
   saslEntries.push({
     name: 'PLAIN',
     opts: saslConnectionOpts,

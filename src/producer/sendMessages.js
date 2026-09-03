@@ -84,7 +84,7 @@ module.exports = ({ logger, cluster, partitioner, eosManager, retrier }) => {
 
           topicData.forEach(({ topic, partitions }) => {
             partitions.forEach(entry => {
-              entry['firstSequence'] = eosManager.getSequence(topic, entry.partition)
+              entry.firstSequence = eosManager.getSequence(topic, entry.partition)
               eosManager.updateSequence(topic, entry.partition, entry.messages.length)
             })
           })

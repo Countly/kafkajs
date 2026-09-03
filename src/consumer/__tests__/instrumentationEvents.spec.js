@@ -486,8 +486,8 @@ describe('Consumer > Instrumentation Events', () => {
       timestamp: expect.any(Number),
       type: 'consumer.rebalancing',
       payload: {
-        groupId: groupId,
-        memberId: memberId,
+        groupId,
+        memberId,
       },
     })
   })

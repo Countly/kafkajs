@@ -18,7 +18,7 @@ describe('Consumer', () => {
     topic = `test-topic-${secureRandom()}`
     groupId = `consumer-group-id-${secureRandom()}`
 
-    await createTopic({ topic: topic, partitions: 1 })
+    await createTopic({ topic, partitions: 1 })
   })
 
   afterEach(async () => {

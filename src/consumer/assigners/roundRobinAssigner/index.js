@@ -43,7 +43,7 @@ module.exports = ({ cluster }) => ({
 
     const topicsPartitions = topics.flatMap(topic => {
       const partitionMetadata = cluster.findTopicPartitionMetadata(topic)
-      return partitionMetadata.map(m => ({ topic: topic, partitionId: m.partitionId }))
+      return partitionMetadata.map(m => ({ topic, partitionId: m.partitionId }))
     })
 
     topicsPartitions.forEach((topicPartition, i) => {

@@ -17,7 +17,7 @@ const crc32C = buffer => {
 module.exports = crc32C
 
 // prettier-ignore
-var T = new Int32Array([
+const T = new Int32Array([
   0x00000000, 0xf26b8303, 0xe13b70f7, 0x1350f3f4,
   0xc79a971f, 0x35f1141c, 0x26a1e7e8, 0xd4ca64eb,
   0x8ad958cf, 0x78b2dbcc, 0x6be22838, 0x9989ab3b,

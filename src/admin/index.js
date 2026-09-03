@@ -854,7 +854,7 @@ module.exports = ({
   const listGroups = async () => {
     await cluster.refreshMetadata()
     let groups = []
-    for (var nodeId in cluster.brokerPool.brokers) {
+    for (const nodeId in cluster.brokerPool.brokers) {
       const broker = await cluster.findBroker({ nodeId })
       const response = await broker.listGroups()
       groups = groups.concat(response.groups)

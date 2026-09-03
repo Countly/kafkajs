@@ -80,7 +80,7 @@ describe('Network > RequestQueue', () => {
       requestQueue = createRequestQueue({
         instrumentationEmitter: emitter,
         enforceRequestTimeout: true,
-        requestTimeout: requestTimeout,
+        requestTimeout,
       })
       requestQueue.scheduleRequestTimeoutCheck()
       requestQueue.push(request)
@@ -291,7 +291,7 @@ describe('Network > RequestQueue', () => {
         // Pick one of the inflight requests to fulfill
         const correlationId = requestQueue.inflight.keys().next().value
         requestQueue.fulfillRequest({
-          correlationId: correlationId,
+          correlationId,
           payload,
           size,
         })

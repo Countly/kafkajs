@@ -54,7 +54,7 @@ describe('Admin > deleteTopicRecords', () => {
     topicName = `test-topic-${secureRandom()}`
 
     cluster = createCluster()
-    admin = createAdmin({ cluster: cluster, logger })
+    admin = createAdmin({ cluster, logger })
 
     producer = createProducer({
       cluster,

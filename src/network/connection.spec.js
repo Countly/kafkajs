@@ -227,7 +227,7 @@ describe('Network > Connection', () => {
       })
 
       afterAll(() => {
-        process.env['KAFKAJS_DEBUG_PROTOCOL_BUFFERS'] = initialValue
+        process.env.KAFKAJS_DEBUG_PROTOCOL_BUFFERS = initialValue
       })
 
       afterEach(async () => {
@@ -235,7 +235,7 @@ describe('Network > Connection', () => {
       })
 
       test('logs the full payload in case of non-retriable error when "KAFKAJS_DEBUG_PROTOCOL_BUFFERS" runtime flag is set', async () => {
-        process.env['KAFKAJS_DEBUG_PROTOCOL_BUFFERS'] = '1'
+        process.env.KAFKAJS_DEBUG_PROTOCOL_BUFFERS = '1'
         connection = new Connection(connectionOpts())
         const debugStub = jest.fn()
         connection.logger.debug = debugStub
@@ -251,7 +251,7 @@ describe('Network > Connection', () => {
       })
 
       test('filters payload in case of non-retriable error when "KAFKAJS_DEBUG_PROTOCOL_BUFFERS" runtime flag is not set', async () => {
-        delete process.env['KAFKAJS_DEBUG_PROTOCOL_BUFFERS']
+        delete process.env.KAFKAJS_DEBUG_PROTOCOL_BUFFERS
         connection = new Connection(connectionOpts())
         const debugStub = jest.fn()
         connection.logger.debug = debugStub

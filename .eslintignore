@@ -1,4 +1,0 @@
-node_modules
-coverage
-# ESLint 6 cannot parse import.meta
-scripts/packageSmoke.test.mjs

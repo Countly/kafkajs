@@ -1,6 +1,6 @@
 // Based on https://github.com/brianloveswords/buffer-crc32/blob/master/index.js
 
-var CRC_TABLE = new Int32Array([
+const CRC_TABLE = new Int32Array([
   0x00000000,
   0x77073096,
   0xee0e612c,

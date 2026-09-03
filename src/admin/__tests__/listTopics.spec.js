@@ -7,7 +7,7 @@ describe('Admin', () => {
 
   beforeEach(async () => {
     cluster = createCluster()
-    admin = createAdmin({ cluster: cluster, logger: newLogger() })
+    admin = createAdmin({ cluster, logger: newLogger() })
     existingTopicNames = [
       `test-topic-${secureRandom()}`,
       `test-topic-${secureRandom()}`,

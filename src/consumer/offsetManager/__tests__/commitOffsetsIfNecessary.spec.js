@@ -18,7 +18,7 @@ describe('Consumer > OffsetMananger > commitOffsetsIfNecessary', () => {
       },
     })
     offsetManager.commitOffsets = jest.fn()
-    offsetManager.committedOffsets()['topic1'][0] = '-1'
+    offsetManager.committedOffsets().topic1[0] = '-1'
 
     mockCommitOffsets = () => {
       const committedOffsets = offsetManager.committedOffsets()

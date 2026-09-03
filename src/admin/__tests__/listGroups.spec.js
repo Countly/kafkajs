@@ -20,7 +20,7 @@ describe('Admin', () => {
     groupId = `consumer-group-id-${secureRandom()}`
 
     cluster = createCluster()
-    admin = createAdmin({ cluster: cluster, logger: newLogger() })
+    admin = createAdmin({ cluster, logger: newLogger() })
     consumer = createConsumer({
       cluster,
       groupId,

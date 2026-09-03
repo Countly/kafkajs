@@ -14,7 +14,7 @@ const findIPv4 = () => {
   const iface = Object.values(os.networkInterfaces())
     .flat()
     .find(i => i && i.family === 'IPv4' && !i.internal)
-  return iface && iface.address
+  return iface?.address
 }
 
 const host = process.env.HOST_IP || findIPv4()
@@ -160,7 +160,7 @@ const findIPv4 = () => {
   const iface = Object.values(os.networkInterfaces())
     .flat()
     .find(i => i && i.family === 'IPv4' && !i.internal)
-  return iface && iface.address
+  return iface?.address
 }
 
 const host = process.env.HOST_IP || findIPv4()

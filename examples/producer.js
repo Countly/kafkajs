@@ -8,7 +8,7 @@ const findIPv4 = () => {
   const iface = Object.values(os.networkInterfaces())
     .flat()
     .find(i => i && i.family === 'IPv4' && !i.internal)
-  return iface && iface.address
+  return iface?.address
 }
 
 const host = process.env.HOST_IP || findIPv4() || '127.0.0.1'
@@ -78,7 +78,7 @@ run().catch(e => kafka.logger().error(`[example/producer] ${e.message}`, { stack
 const errorTypes = ['unhandledRejection', 'uncaughtException']
 const signalTraps = ['SIGTERM', 'SIGINT', 'SIGUSR2']
 
-errorTypes.map(type => {
+errorTypes.forEach(type => {
   process.on(type, async e => {
     try {
       kafka.logger().info(`process.on ${type}`)
@@ -91,7 +91,7 @@ errorTypes.map(type => {
   })
 })
 
-signalTraps.map(type => {
+signalTraps.forEach(type => {
   process.once(type, async () => {
     console.log('')
     kafka.logger().info('[example/producer] disconnecting')

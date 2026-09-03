@@ -45,7 +45,7 @@ module.exports = async fetchDecoder => {
   // The magic byte was read by the Fetch protocol to distinguish between
   // the record batch and the legacy message set. It's not used here but
   // it has to be read.
-  const magicByte = decoder.readInt8() // eslint-disable-line no-unused-vars
+  const magicByte = decoder.readInt8()
 
   // The library is currently not performing CRC validations
   const crc = decoder.readInt32() // eslint-disable-line no-unused-vars
