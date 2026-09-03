@@ -7,8 +7,6 @@ title: FAQ
 
 **Yes**. KafkaJS is used across hundreds of services running in production across businesses over the world.
 
-> **Note**: If you are using KafkaJS in production, [we would love to hear about what you are doing!](https://github.com/tulios/kafkajs/issues/289)
-
 ## Why am I receiving messages for topics I'm not subscribed to?
 
 If you are seeing the warning `[ConsumerGroup] Consumer group received unsubscribed topics`, it likely means that some members of your consumer group are subscribed to some topics, and some other members of the group are subscribed to a different set of topics. In our experience, the most common cause is re-using `groupId` across several applications or several different independent deployments of the same application. This is normal while deploying a new version of an application where the new version subscribes to a new topic, and the warning will go away once the group stabilizes on a single version.
@@ -42,8 +40,8 @@ For more information, see:
 
 * [#508](https://github.com/tulios/kafkajs/issues/508#issuecomment-535382981)
 * [#36](https://github.com/tulios/kafkajs/issues/36)
-* [Custom Socket Factory](https://kafka.js.org/docs/configuration#custom-socket-factory)
+* [Custom Socket Factory](./Configuration.md#custom-socket-factory)
 
 ## Didn't find what you were looking for?
 
-Please [open an issue](https://github.com/tulios/kafkajs/issues) or [join our Slack community](https://join.slack.com/t/kafkajs/shared_invite/zt-1ezd5395v-SOpTqYoYfRCyPKOkUggK0A)
+Please [open an issue](https://github.com/Countly/kafkajs/issues)

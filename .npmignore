@@ -13,7 +13,6 @@ testHelpers/
 scripts/
 examples/
 docs/
-website/
 docker-compose.yml
 docker-compose.*.yml
 jest.config.js
@@ -25,7 +24,6 @@ jest.config.js
 azure-pipelines.yml
 *.png
 *.svg
-logo
 *.tgz
 .vscode/
 *.java

@@ -13,8 +13,8 @@ A clear and concise description of what the bug is.
 **To Reproduce**
 Please provide either a link to a:
 
-1. [failing test in a KafkaJS fork](https://github.com/tulios/kafkajs/blob/2faef0719eeba50759eccc2b7d8800dbe63803f3/src/consumer/__tests__/consumeMessages.spec.js#L52-L97)
-2. [repository with an example project reproducing the issue](https://github.com/tulios/kafkajs/blob/master/examples/consumer.js)
+1. failing test in a fork of this repository (see `src/consumer/__tests__/consumeMessages.spec.js` for the style)
+2. repository with an example project reproducing the issue (see `examples/consumer.js`)
 
 If none of the above are possible to provide, please write down the exact steps to reproduce the behavior:
 1. Run a producer that continuously produces messages to a topic

@@ -1,99 +1,55 @@
-> **Fork notice** — `@countly/kafkajs` is a standalone, Countly-maintained continuation of [kafkajs](https://github.com/tulios/kafkajs) 2.2.4 targeting **Apache Kafka 4.0+** and **Node.js 22+**. It is under active development and **not yet released**; the first public version will be 3.0.0.
+# @countly/kafkajs
 
-[![npm version](https://img.shields.io/npm/v/kafkajs?color=%2344cc11&label=stable)](https://www.npmjs.com/package/kafkajs) [![npm pre-release version](https://img.shields.io/npm/v/kafkajs/beta?label=pre-release)](https://www.npmjs.com/package/kafkajs) [![Build Status](https://dev.azure.com/tulios/kafkajs/_apis/build/status/tulios.kafkajs?branchName=master)](https://dev.azure.com/tulios/kafkajs/_build/latest?definitionId=2&branchName=master) [![Slack Channel](https://join.slack.com/t/kafkajs/shared_invite/zt-1ezd5395v-SOpTqYoYfRCyPKOkUggK0Abadge.svg)](https://join.slack.com/t/kafkajs/shared_invite/zt-1ezd5395v-SOpTqYoYfRCyPKOkUggK0A)
-<br />
-<p align="center">
-  <a href="https://kafka.js.org">
-      <img src="https://raw.githubusercontent.com/tulios/kafkajs/master/logo/v2/kafkajs_circle.svg" alt="Logo" width="125" height="125">
-  </a>
+A pure-JavaScript [Apache Kafka](https://kafka.apache.org/) client for Node.js, maintained by [Countly](https://github.com/Countly) as a standalone continuation of [KafkaJS](https://github.com/tulios/kafkajs) 2.2.4.
 
-  <h3 align="center">KafkaJS</h3>
+- **Drop-in for KafkaJS users**: same public API, same runtime semantics (`eachMessage`/`eachBatch`, pause/resume, instrumentation events, error classes).
+- **Targets current infrastructure**: Apache Kafka **4.0+** (KRaft) and Node.js **22+**. Older brokers and runtimes are not supported.
+- **Zero runtime dependencies**, CommonJS entry point plus an ES module entry.
 
-  <p align="center">
-    A modern Apache Kafka® client for Node.js
-    <br />
-    <a href="https://kafka.js.org/"><strong>Get Started »</strong></a>
-    <br />
-    <br />
-    <a href="https://kafka.js.org/docs/getting-started" target="_blank">Read the Docs</a>
-    ·
-    <a href="https://github.com/tulios/kafkajs/issues/new?assignees=&labels=&template=bug_report.md&title=">Report Bug</a>
-    ·
-    <a href="https://github.com/tulios/kafkajs/issues/new?assignees=&labels=&template=feature_request.md&title=">Request Feature</a>
-  </p>
-</p>
+> **Status**: under active development, **not yet released**. The first public version will be `3.0.0`. Until then the package is not published to npm and internal pre-release tags (`3.0.0-alpha.N`) are used.
 
-## Table of Contents
+## Features
 
-- [About the project](#about)
-  - [Features](#features)
-  - [Getting Started](#getting-started)
-    - [Usage](#usage)
-- [Contributing](#contributing)
-  - [Help Wanted](#help-wanted)
-  - [Contact](#contact)
-- [License](#license)
-  - [Acknowledgements](#acknowledgements)
+- Producer, with idempotent and transactional modes
+- Consumer groups with pause, resume and seek
+- Message headers
+- GZIP compression built in; Snappy, LZ4 and ZSTD through pluggable codecs
+- PLAINTEXT, SSL and SASL_SSL connections
+- SASL PLAIN, SCRAM-SHA-256, SCRAM-SHA-512, OAUTHBEARER and AWS IAM
+- Admin client
 
-## <a name="about"></a> About the Project
-
-KafkaJS is a modern [Apache Kafka](https://kafka.apache.org/) client for Node.js. It is compatible with Kafka 0.10+ and offers native support for 0.11 features.
-
-<small>KAFKA is a registered trademark of The Apache Software Foundation and has been licensed for use by KafkaJS. KafkaJS has no affiliation with and is not endorsed by The Apache Software Foundation.</small>
-
-### <a name="features"></a> Features
-
-* Producer
-* Consumer groups with pause, resume, and seek
-* Transactional support for producers and consumers
-* Message headers
-* GZIP compression
-  * Snappy, LZ4 and ZSTD compression through pluggable codecs
-* Plain, SSL and SASL_SSL implementations
-* Support for SCRAM-SHA-256 and SCRAM-SHA-512
-* Support for AWS IAM authentication
-* Admin client
-
-### <a name="getting-started"></a> Getting Started
+## Getting started
 
 ```sh
-npm install kafkajs
-# yarn add kafkajs
+npm install @countly/kafkajs
+# yarn add @countly/kafkajs
 ```
 
-#### <a name="usage"></a> Usage
 ```javascript
-const { Kafka } = require('kafkajs')
+const { Kafka } = require('@countly/kafkajs')
+// or: import { Kafka } from '@countly/kafkajs'
 
 const kafka = new Kafka({
   clientId: 'my-app',
-  brokers: ['kafka1:9092', 'kafka2:9092']
+  brokers: ['kafka1:9092', 'kafka2:9092'],
 })
 
 const producer = kafka.producer()
 const consumer = kafka.consumer({ groupId: 'test-group' })
 
 const run = async () => {
-  // Producing
   await producer.connect()
   await producer.send({
     topic: 'test-topic',
-    messages: [
-      { value: 'Hello KafkaJS user!' },
-    ],
+    messages: [{ value: 'Hello Kafka user!' }],
   })
 
-  // Consuming
   await consumer.connect()
   await consumer.subscribe({ topic: 'test-topic', fromBeginning: true })
 
   await consumer.run({
     eachMessage: async ({ topic, partition, message }) => {
-      console.log({
-        partition,
-        offset: message.offset,
-        value: message.value.toString(),
-      })
+      console.log({ partition, offset: message.offset, value: message.value.toString() })
     },
   })
 }
@@ -101,44 +57,21 @@ const run = async () => {
 run().catch(console.error)
 ```
 
-Learn more about using [KafkaJS on the official site!](https://kafka.js.org)
+Documentation lives in the [`docs/`](./docs) folder of this repository:
+[Getting Started](./docs/GettingStarted.md) · [Configuration](./docs/Configuration.md) · [Producing](./docs/Producing.md) · [Consuming](./docs/Consuming.md) · [Admin](./docs/Admin.md) · [Instrumentation events](./docs/InstrumentationEvents.md) · [Transactions](./docs/Transactions.md).
 
-- [Getting Started](https://kafka.js.org/docs/getting-started)
-- [A Brief Intro to Kafka](https://kafka.js.org/docs/introduction)
-- [Configuring KafkaJS](https://kafka.js.org/docs/configuration)
-- [Example Producer](https://kafka.js.org/docs/producer-example)
-- [Example Consumer](https://kafka.js.org/docs/consumer-example)
+## Migrating from `kafkajs`
 
-> _Read something on the website that didn't work with the latest stable version?_  
-[Check the pre-release versions](https://kafka.js.org/docs/pre-releases) - the website is updated on every merge to master.
+Replace the package name; the API is unchanged. Behavior differences introduced by this fork (Kafka 4.0+ only, defaults that follow the Java client) are listed in the [CHANGELOG](./CHANGELOG.md) and, from 3.0.0, in a migration guide.
 
-## <a name="contributing"></a> Contributing
+## Contributing
 
-KafkaJS is an open-source project where development takes place in the open on GitHub. Although the project is maintained by a small group of dedicated volunteers, we are grateful to the community for bug fixes, feature development and other contributions.
+See [CONTRIBUTING.md](./CONTRIBUTING.md) and [docs/DevelopmentEnvironment.md](./docs/DevelopmentEnvironment.md). Bugs and feature requests go to the [issue tracker](https://github.com/Countly/kafkajs/issues). Security reports: see [SECURITY.md](./SECURITY.md).
 
-See [Developing KafkaJS](https://kafka.js.org/docs/contribution-guide) for information on how to run and develop KafkaJS.
+## License
 
-### <a name="help-wanted"></a> Help wanted 🤝
+MIT. See [LICENSE](./LICENSE).
 
-We welcome contributions to KafkaJS, but we also want to see a thriving third-party ecosystem. If you would like to create an open-source project that builds on top of KafkaJS, [please get in touch](https://join.slack.com/t/kafkajs/shared_invite/zt-1ezd5395v-SOpTqYoYfRCyPKOkUggK0A) and we'd be happy to provide feedback and support.
+This project is a fork of KafkaJS, copyright (c) 2018 Túlio Ornelas and the KafkaJS contributors, used under the MIT license. Countly's changes are copyright (c) 2026 Countly and released under the same license. KafkaJS's name, logo and website belong to the original project; this fork does not use the KafkaJS logo and is not affiliated with or endorsed by the KafkaJS maintainers.
 
-Here are some projects that we would like to build, but haven't yet been able to prioritize:
-
-* [Dead Letter Queue](https://eng.uber.com/reliable-reprocessing/) - Automatically reprocess messages
-* ✅ [Schema Registry](https://www.confluent.io/confluent-schema-registry/) - **[Now available!](https://www.npmjs.com/package/@kafkajs/confluent-schema-registry)** thanks to [@erikengervall](https://github.com/erikengervall)
-* [Metrics](https://prometheus.io/) - Integrate with the [instrumentation events](https://kafka.js.org/docs/instrumentation-events) to expose commonly used metrics
-
-### <a name="contact"></a> Contact 💬
-
-[Join our Slack community](https://join.slack.com/t/kafkajs/shared_invite/zt-1ezd5395v-SOpTqYoYfRCyPKOkUggK0A)
-
-## <a name="license"></a> License
-
-See [LICENSE](https://github.com/tulios/kafkajs/blob/master/LICENSE) for more details.
-
-### <a name="acknowledgements"></a> Acknowledgements
-
-* Thanks to [Sebastian Norde](https://github.com/sebastiannorde) for the V1 logo ❤️
-* Thanks to [Tracy (Tan Yun)](https://medium.com/@tanyuntracy) for the V2 logo ❤️
-
-<small>Apache Kafka and Kafka are either registered trademarks or trademarks of The Apache Software Foundation in the United States and other countries. KafkaJS has no affiliation with the Apache Software Foundation.</small>
+Apache Kafka and Kafka are trademarks of The Apache Software Foundation. This project is not affiliated with or endorsed by the Apache Software Foundation.

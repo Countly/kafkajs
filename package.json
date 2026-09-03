@@ -28,20 +28,20 @@
   },
   "repository": {
     "type": "git",
-    "url": "https://github.com/tulios/kafkajs.git"
+    "url": "https://github.com/Countly/kafkajs.git"
   },
   "bugs": {
-    "url": "https://github.com/tulios/kafkajs/issues"
+    "url": "https://github.com/Countly/kafkajs/issues"
   },
-  "homepage": "https://kafka.js.org",
+  "homepage": "https://github.com/Countly/kafkajs#readme",
   "scripts": {
     "jest": "export KAFKA_VERSION=${KAFKA_VERSION:='4.3.1'} && NODE_ENV=test echo \"KAFKA_VERSION: ${KAFKA_VERSION}\" && KAFKAJS_DEBUG_PROTOCOL_BUFFERS=1 jest",
     "test:local": "yarn jest --detectOpenHandles",
     "test:debug": "NODE_ENV=test KAFKAJS_DEBUG_PROTOCOL_BUFFERS=1 node --inspect-brk $(yarn bin 2>/dev/null)/jest --detectOpenHandles --runInBand --watch",
     "test:local:watch": "yarn test:local --watch",
     "test": "yarn lint && JEST_JUNIT_OUTPUT_NAME=test-report.xml ./scripts/testWithKafka.sh 'yarn jest --ci --maxWorkers=4 --no-watchman --forceExit'",
-    "lint": "git ls-files -co --exclude-standard -z -- '*.js' '*.mjs' ':!website' ':!scripts/packageSmoke.test.mjs' | xargs -0 eslint",
-    "format": "git ls-files -co --exclude-standard -z -- '*.js' '*.mjs' ':!website' ':!scripts/packageSmoke.test.mjs' | xargs -0 prettier --write",
+    "lint": "git ls-files -co --exclude-standard -z -- '*.js' '*.mjs' ':!scripts/packageSmoke.test.mjs' | xargs -0 eslint",
+    "format": "git ls-files -co --exclude-standard -z -- '*.js' '*.mjs' ':!scripts/packageSmoke.test.mjs' | xargs -0 prettier --write",
     "test:group:broker": "yarn jest --forceExit --testPathPatterns 'src/broker/.*'",
     "test:group:admin": "yarn jest --forceExit --testPathPatterns 'src/admin/.*'",
     "test:group:producer": "yarn jest --forceExit --testPathPatterns 'src/producer/.*'",

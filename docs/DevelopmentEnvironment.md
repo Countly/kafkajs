@@ -17,7 +17,7 @@ For testing KafkaJS we use a multi-broker Kafka cluster as well as Zookeeper for
 ./scripts/createScramCredentials.sh
 ```
 
-This boots the Kafka cluster using the default docker-compose.yml file described in [scripts/dockerComposeUp.sh](https://github.com/tulios/kafkajs/blob/master/scripts/dockerComposeUp.sh). If you want to run a different version of Kafka, specify a different compose file using the `COMPOSE_FILE` environment variable:
+This boots the Kafka cluster using the default docker-compose.yml file described in [scripts/dockerComposeUp.sh](../scripts/dockerComposeUp.sh). If you want to run a different version of Kafka, specify a different compose file using the `COMPOSE_FILE` environment variable:
 
 ```sh
 COMPOSE_FILE="docker-compose.2_3.yml" ./scripts/dockerComposeUp.sh
@@ -36,7 +36,7 @@ kafkajs_kafka3_1   start-kafka.sh                   Up      0.0.0.0:9098->9098/t
 kafkajs_zk_1       /bin/sh -c /usr/sbin/sshd  ...   Up      0.0.0.0:2181->2181/tcp, 22/tcp, 2888/tcp, 3888/tcp
 ```
 
-The user credentials are listed in [scripts/createScramCredentials.sh](https://github.com/tulios/kafkajs/blob/master/scripts/createScramCredentials.sh). You can also pass in the `-h` flag to this script for more details and controls. 
+The user credentials are listed in [scripts/createScramCredentials.sh](../scripts/createScramCredentials.sh). You can also pass in the `-h` flag to this script for more details and controls. 
 
 You should now be able to connect to your cluster as such:
 

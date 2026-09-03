@@ -2,5 +2,4 @@
 *.yml
 *.yaml
 *.md
-website
 scripts/packageSmoke.test.mjs

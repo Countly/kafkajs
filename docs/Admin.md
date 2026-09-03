@@ -347,7 +347,7 @@ await admin.describeConfigs({
 })
 ```
 
-Take a look at [configResourceTypes](https://github.com/tulios/kafkajs/blob/master/src/protocol/configResourceTypes.js) for a complete list of resources.
+Take a look at [configResourceTypes](../src/protocol/configResourceTypes.js) for a complete list of resources.
 
 Example response:
 
@@ -417,7 +417,7 @@ await admin.alterConfigs({
 })
 ```
 
-Take a look at [configResourceTypes](https://github.com/tulios/kafkajs/blob/master/src/protocol/configResourceTypes.js) for a complete list of resources.
+Take a look at [configResourceTypes](../src/protocol/configResourceTypes.js) for a complete list of resources.
 
 Example response:
 

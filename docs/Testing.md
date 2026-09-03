@@ -27,4 +27,4 @@ KAFKAJS_LOG_LEVEL=debug KAFKAJS_DEBUG_PROTOCOL_BUFFERS=1 KAFKAJS_DEBUG_EXTENDED_
 
 ## Helpers
 
-[`testHelpers/index.js`](https://github.com/tulios/kafkajs/blob/master/testHelpers/index.js) provides several helpers for connecting to your cluster and asserting upon its state. Tests are typically co-located with the code that they are testing. See [`src/consumer/__tests__/consumeMessages.spec.js`](https://github.com/tulios/kafkajs/blob/master/src/consumer/__tests__/consumeMessages.spec.js) for an example that makes use of the helpers to implement an integration test.
+[`testHelpers/index.js`](../testHelpers/index.js) provides several helpers for connecting to your cluster and asserting upon its state. Tests are typically co-located with the code that they are testing. See [`src/consumer/__tests__/consumeMessages.spec.js`](../src/consumer/__tests__/consumeMessages.spec.js) for an example that makes use of the helpers to implement an integration test.
