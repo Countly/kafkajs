@@ -41,6 +41,7 @@
     "test:local:watch": "yarn test:local --watch",
     "test": "yarn lint && JEST_JUNIT_OUTPUT_NAME=test-report.xml ./scripts/testWithKafka.sh 'yarn jest --ci --maxWorkers=4 --no-watchman --forceExit'",
     "lint": "git ls-files -co --exclude-standard -z -- '*.js' '*.mjs' ':!scripts/packageSmoke.test.mjs' | xargs -0 eslint",
+    "test:unit": "NODE_ENV=test jest --testPathPatterns 'src/protocol/.*' 'src/utils/.*' 'src/network/requestQueue/.*' 'src/retry/.*' 'src/producer/partitioners/.*' 'src/consumer/assigners/.*' 'src/loggers/.*' 'src/instrumentation/.*'",
     "format": "git ls-files -co --exclude-standard -z -- '*.js' '*.mjs' ':!scripts/packageSmoke.test.mjs' | xargs -0 prettier --write",
     "test:group:broker": "yarn jest --forceExit --testPathPatterns 'src/broker/.*'",
     "test:group:admin": "yarn jest --forceExit --testPathPatterns 'src/admin/.*'",
