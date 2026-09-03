@@ -50,8 +50,8 @@ describe('Consumer > OffsetMananger > commitOffsets', () => {
   it('commits all the resolved offsets that have not already been committed', async () => {
     const defaultOffsetInt = 2
 
-    Object.keys(memberAssignment).forEach(topic => {
-      memberAssignment[topic].forEach(partition => {
+    Object.keys(memberAssignment).forEach((topic) => {
+      memberAssignment[topic].forEach((partition) => {
         offsetManager.resolveOffset({ topic, partition, offset: defaultOffsetInt.toString() })
       })
     })
@@ -89,14 +89,14 @@ describe('Consumer > OffsetMananger > commitOffsets', () => {
 
     expect(offsetManager.committedOffsets()).toEqual({
       'topic-1': {
-        '0': defaultResolvedOffsetStr,
-        '1': defaultResolvedOffsetStr,
+        0: defaultResolvedOffsetStr,
+        1: defaultResolvedOffsetStr,
       },
       'topic-2': {
-        '0': defaultResolvedOffsetStr,
-        '1': defaultResolvedOffsetStr,
-        '2': defaultResolvedOffsetStr,
-        '3': defaultResolvedOffsetStr,
+        0: defaultResolvedOffsetStr,
+        1: defaultResolvedOffsetStr,
+        2: defaultResolvedOffsetStr,
+        3: defaultResolvedOffsetStr,
       },
     })
   })

@@ -23,12 +23,7 @@ describe('Protocol > Requests > Metadata > v0', () => {
   describe('response', () => {
     test('decode', async () => {
       const encoded = new Encoder()
-        .writeArray([
-          new Encoder()
-            .writeInt32(0)
-            .writeString('localhost')
-            .writeInt32(9092),
-        ])
+        .writeArray([new Encoder().writeInt32(0).writeString('localhost').writeInt32(9092)])
         .writeArray([
           new Encoder()
             .writeInt16(0)

@@ -16,7 +16,9 @@ describe('Consumer', () => {
     topicNames = [`test-topic-${secureRandom()}`, `test-topic-${secureRandom()}`]
     groupId = `consumer-group-id-${secureRandom()}`
 
-    await Promise.all(topicNames.map(topicName => createTopic({ topic: topicName, partitions: 2 })))
+    await Promise.all(
+      topicNames.map((topicName) => createTopic({ topic: topicName, partitions: 2 }))
+    )
 
     consumer1 = createConsumer({
       cluster: createCluster({ metadataMaxAge: 50 }),
@@ -36,7 +38,7 @@ describe('Consumer', () => {
   it('handles receiving assignments for unsubscribed topics', async () => {
     await consumer1.connect()
     await Promise.all(
-      topicNames.map(topicName => consumer1.subscribe({ topic: topicName, fromBeginning: true }))
+      topicNames.map((topicName) => consumer1.subscribe({ topic: topicName, fromBeginning: true }))
     )
 
     consumer1.run({ eachMessage: () => {} })
@@ -74,7 +76,7 @@ describe('Consumer', () => {
 
     // Both consumers receive assignments for one topic
     let assignments = await Promise.all(
-      [consumer1, consumer2].map(async consumer => {
+      [consumer1, consumer2].map(async (consumer) => {
         await consumer.connect()
         await consumer.subscribe({ topic: topicNames[0] })
         consumer.run({ eachMessage: () => {} })
@@ -82,7 +84,7 @@ describe('Consumer', () => {
       })
     )
 
-    assignments.forEach(assignment =>
+    assignments.forEach((assignment) =>
       expect(Object.keys(assignment.payload.memberAssignment)).toEqual([topicNames[0]])
     )
 
@@ -98,7 +100,7 @@ describe('Consumer', () => {
     })
 
     await consumer1.connect()
-    await Promise.all(topicNames.map(topic => consumer1.subscribe({ topic })))
+    await Promise.all(topicNames.map((topic) => consumer1.subscribe({ topic })))
 
     // Second consumer is also replaced, subscribing to both topics
     await consumer2.disconnect()
@@ -112,17 +114,17 @@ describe('Consumer', () => {
     })
 
     await consumer2.connect()
-    await Promise.all(topicNames.map(topic => consumer2.subscribe({ topic })))
+    await Promise.all(topicNames.map((topic) => consumer2.subscribe({ topic })))
 
     consumer1.run({ eachMessage: () => {} })
     consumer2.run({ eachMessage: () => {} })
 
     // Both consumers are assigned to both topics
     assignments = await Promise.all(
-      [consumer1, consumer2].map(consumer => waitForConsumerToJoinGroup(consumer))
+      [consumer1, consumer2].map((consumer) => waitForConsumerToJoinGroup(consumer))
     )
 
-    assignments.forEach(assignment =>
+    assignments.forEach((assignment) =>
       expect(Object.keys(assignment.payload.memberAssignment)).toEqual(topicNames)
     )
   })

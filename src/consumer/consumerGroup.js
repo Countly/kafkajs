@@ -171,7 +171,7 @@ module.exports = class ConsumerGroup {
       sessionTimeout,
       rebalanceTimeout,
       memberId: this.memberId || '',
-      groupProtocols: this.assigners.map(assigner =>
+      groupProtocols: this.assigners.map((assigner) =>
         assigner.protocol({
           topics: this.topicsSubscribed,
         })
@@ -273,7 +273,7 @@ module.exports = class ConsumerGroup {
 
     // Remove unsubscribed topics from the list
     const safeAssignment = arrayDiff(assignedTopics, topicsNotSubscribed)
-    const currentMemberAssignment = safeAssignment.map(topic => ({
+    const currentMemberAssignment = safeAssignment.map((topic) => ({
       topic,
       partitions: decodedAssignment[topic],
     }))
@@ -282,7 +282,7 @@ module.exports = class ConsumerGroup {
     for (const assignment of currentMemberAssignment) {
       const { topic, partitions: assignedPartitions } = assignment
       const knownPartitions = this.partitionsPerSubscribedTopic.get(topic)
-      const isAwareOfAllAssignedPartitions = assignedPartitions.every(partition =>
+      const isAwareOfAllAssignedPartitions = assignedPartitions.every((partition) =>
         knownPartitions.includes(partition)
       )
 
@@ -330,7 +330,7 @@ module.exports = class ConsumerGroup {
 
   joinAndSync() {
     const startJoin = Date.now()
-    return this.retrier(async bail => {
+    return this.retrier(async (bail) => {
       try {
         await this[PRIVATE.JOIN]()
         await this[PRIVATE.SYNC]()
@@ -461,7 +461,7 @@ module.exports = class ConsumerGroup {
           topic,
           partitions: partitions
             .filter(
-              partition =>
+              (partition) =>
                 /**
                  * When recovering from OffsetOutOfRange, each partition can recover
                  * concurrently, which invalidates resolved and committed offsets as part
@@ -479,7 +479,7 @@ module.exports = class ConsumerGroup {
                 committedOffsets[topic][partition] != null &&
                 activeTopicPartitions[topic].has(partition)
             )
-            .map(partition => ({
+            .map((partition) => ({
               partition,
               fetchOffset: this.offsetManager.nextOffset(topic, partition).toString(),
               maxBytes: this.maxBytesPerPartition,
@@ -517,7 +517,7 @@ module.exports = class ConsumerGroup {
               !this.seekOffset.has(topicName, partition) &&
               !this.subscriptionState.isPaused(topicName, partition)
           )
-          .map(partitionData => {
+          .map((partitionData) => {
             const { partition, preferredReadReplica } = partitionData
 
             if (preferredReadReplica != null && preferredReadReplica !== -1) {
@@ -626,7 +626,7 @@ module.exports = class ConsumerGroup {
     for (const topic of this.topicsSubscribed) {
       const partitions = this.cluster
         .findTopicPartitionMetadata(topic)
-        .map(m => m.partitionId)
+        .map((m) => m.partitionId)
         .sort()
 
       map.set(topic, partitions)
@@ -692,7 +692,7 @@ module.exports = class ConsumerGroup {
     const preferredReadReplicas = this.preferredReadReplicasPerTopicPartition[topic]
     return partitions.reduce((result, id) => {
       const partitionId = parseInt(id, 10)
-      const metadata = partitionMetadata.find(p => p.partitionId === partitionId)
+      const metadata = partitionMetadata.find((p) => p.partitionId === partitionId)
       if (!metadata) {
         return result
       }

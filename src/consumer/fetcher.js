@@ -24,11 +24,11 @@ const createFetcher = ({
 
   const getWorkerQueue = () => workerQueue
   const assignmentKey = ({ topic, partition }) => `${topic}|${partition}`
-  const getAssignedFetcher = batch => partitionAssignments.get(assignmentKey(batch))
-  const assignTopicPartition = batch => partitionAssignments.set(assignmentKey(batch), nodeId)
-  const unassignTopicPartition = batch => partitionAssignments.delete(assignmentKey(batch))
-  const filterUnassignedBatches = batches =>
-    batches.filter(batch => {
+  const getAssignedFetcher = (batch) => partitionAssignments.get(assignmentKey(batch))
+  const assignTopicPartition = (batch) => partitionAssignments.set(assignmentKey(batch), nodeId)
+  const unassignTopicPartition = (batch) => partitionAssignments.delete(assignmentKey(batch))
+  const filterUnassignedBatches = (batches) =>
+    batches.filter((batch) => {
       const assignedFetcher = getAssignedFetcher(batch)
       if (assignedFetcher != null && assignedFetcher !== nodeId) {
         logger.info(
@@ -77,7 +77,7 @@ const createFetcher = ({
   const stop = async () => {
     if (!isRunning) return
     isRunning = false
-    await new Promise(resolve => emitter.once('end', () => resolve()))
+    await new Promise((resolve) => emitter.once('end', () => resolve()))
   }
 
   return { start, stop, getWorkerQueue }

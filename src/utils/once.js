@@ -1,4 +1,4 @@
-module.exports = fn => {
+module.exports = (fn) => {
   let called = false
 
   return (...args) => {

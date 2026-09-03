@@ -16,7 +16,7 @@ const { parse, decode: decodeV5 } = require('../v5/response')
  *   throttle_time_ms => INT32
  */
 
-const decode = async rawData => {
+const decode = async (rawData) => {
   const decoded = await decodeV5(rawData)
 
   return {

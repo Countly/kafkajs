@@ -13,9 +13,6 @@ module.exports = ({ groupId, groupGenerationId, memberId }) => ({
   apiVersion: 0,
   apiName: 'Heartbeat',
   encode: async () => {
-    return new Encoder()
-      .writeString(groupId)
-      .writeInt32(groupGenerationId)
-      .writeString(memberId)
+    return new Encoder().writeString(groupId).writeInt32(groupGenerationId).writeString(memberId)
   },
 })

@@ -6,7 +6,7 @@ const seq = require('../utils/seq')
 describe('WorkerQueue', () => {
   const batches = seq(
     100,
-    index =>
+    (index) =>
       new Batch('test-topic', 0, {
         partition: index.toString(),
         highWatermark: '100',
@@ -18,7 +18,7 @@ describe('WorkerQueue', () => {
   beforeEach(() => {
     handler = jest.fn(async () => {})
 
-    workers = seq(3, workerId => createWorker({ handler, workerId }))
+    workers = seq(3, (workerId) => createWorker({ handler, workerId }))
     workerQueue = createWorkerQueue({ workers })
   })
 

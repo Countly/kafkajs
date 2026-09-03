@@ -118,7 +118,7 @@ describe('scripts/compat/render', () => {
       const summary = render(model())
         .split('## Floor watch')[0]
         .split('\n')
-        .filter(line => line.startsWith('| '))
+        .filter((line) => line.startsWith('| '))
       for (const line of summary) {
         expect(line.replace(/\\\|/g, '').split('|').length - 2).toBe(7)
       }

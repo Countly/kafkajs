@@ -59,8 +59,8 @@ describe('Consumer', () => {
     await consumer2.subscribe({ topic: topicName, fromBeginning: true })
 
     const messagesConsumed = []
-    consumer1.run({ eachMessage: async event => messagesConsumed.push(event) })
-    consumer2.run({ eachMessage: async event => messagesConsumed.push(event) })
+    consumer1.run({ eachMessage: async (event) => messagesConsumed.push(event) })
+    consumer2.run({ eachMessage: async (event) => messagesConsumed.push(event) })
 
     await Promise.all([
       waitForConsumerToJoinGroup(consumer1),

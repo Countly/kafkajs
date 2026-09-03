@@ -18,7 +18,7 @@ const { parse: parseV0 } = require('../v0/response')
  *       member_assignment => BYTES
  */
 
-const decoderMember = decoder => ({
+const decoderMember = (decoder) => ({
   memberId: decoder.readString(),
   clientId: decoder.readString(),
   clientHost: decoder.readString(),
@@ -26,7 +26,7 @@ const decoderMember = decoder => ({
   memberAssignment: decoder.readBytes(),
 })
 
-const decodeGroup = decoder => ({
+const decodeGroup = (decoder) => ({
   errorCode: decoder.readInt16(),
   groupId: decoder.readString(),
   state: decoder.readString(),
@@ -35,7 +35,7 @@ const decodeGroup = decoder => ({
   members: decoder.readArray(decoderMember),
 })
 
-const decode = async rawData => {
+const decode = async (rawData) => {
   const decoder = new Decoder(rawData)
   const throttleTime = decoder.readInt32()
   const groups = decoder.readArray(decodeGroup)

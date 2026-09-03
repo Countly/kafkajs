@@ -8,12 +8,9 @@ const BOOTSTRAP = 'kafka1:29092'
 const BIN = '/opt/kafka/bin'
 const secureRandom = (length = 10) => crypto.randomBytes(length).toString('hex')
 
-const findContainerId = node => {
+const findContainerId = (node) => {
   const cmd = `docker ps --filter "status=running" --filter "label=custom.project=kafkajs" --filter "label=custom.service=${node}" --no-trunc -q`
-  const containerId = execa
-    .commandSync(cmd, { shell: true })
-    .stdout.toString('utf-8')
-    .trim()
+  const containerId = execa.commandSync(cmd, { shell: true }).stdout.toString('utf-8').trim()
   if (!containerId)
     throw new Error(`container for ${node} is not running (COMPOSE_FILE=${COMPOSE_FILE})`)
   console.log(`${node}: ${containerId}`)
@@ -27,7 +24,7 @@ const kafkaCli = (containerId, args) =>
     })
     .stdout.toString('utf-8')
 
-const waitForNode = containerId => {
+const waitForNode = (containerId) => {
   const deadline = Date.now() + 120000
   for (;;) {
     try {
@@ -47,7 +44,7 @@ const createTopic = (containerId, topicName) =>
     `kafka-topics.sh --create --if-not-exists --topic ${topicName} --replication-factor 1 --partitions 2 --bootstrap-server ${BOOTSTRAP}`
   )
 
-const consumerGroupDescribe = containerId =>
+const consumerGroupDescribe = (containerId) =>
   kafkaCli(
     containerId,
     `kafka-consumer-groups.sh --bootstrap-server ${BOOTSTRAP} --group test-group-${secureRandom()} --describe`

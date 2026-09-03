@@ -9,12 +9,12 @@ const { failure, createErrorFromCode } = require('../../../error')
  *     error_message => NULLABLE_STRING
  */
 
-const decodeCreationResponse = decoder => ({
+const decodeCreationResponse = (decoder) => ({
   errorCode: decoder.readInt16(),
   errorMessage: decoder.readString(),
 })
 
-const decode = async rawData => {
+const decode = async (rawData) => {
   const decoder = new Decoder(rawData)
   const throttleTime = decoder.readInt32()
   const creationResponses = decoder.readArray(decodeCreationResponse)
@@ -25,7 +25,7 @@ const decode = async rawData => {
   }
 }
 
-const parse = async data => {
+const parse = async (data) => {
   const creationResponsesWithError = data.creationResponses.filter(({ errorCode }) =>
     failure(errorCode)
   )

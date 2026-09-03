@@ -302,7 +302,7 @@ describe('Protocol > Requests > Fetch > v4', () => {
   describe('response with mixed formats (0.10 MessageSet + 0.11 RecordBatch)', () => {
     test('decode only the 0.10 messages, 0.11 should be decoded on the next request', async () => {
       const data = await decode(Buffer.from(require('../fixtures/v4_response_mixed_formats.json')))
-      const messagesMagicBytes = data.responses[0].partitions[0].messages.map(m => m.magicByte)
+      const messagesMagicBytes = data.responses[0].partitions[0].messages.map((m) => m.magicByte)
 
       // the fixture is too big, jest deepCheck matcher takes too long to compare the object,
       // and the purpose of the test is to check if the decoder can skip the 0.11 on this request

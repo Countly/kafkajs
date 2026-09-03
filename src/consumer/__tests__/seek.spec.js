@@ -91,7 +91,7 @@ describe('Consumer', () => {
         await consumer.subscribe({ topic: topicName, fromBeginning: true })
 
         const messagesConsumed = []
-        consumer.run({ eachMessage: async event => messagesConsumed.push(event) })
+        consumer.run({ eachMessage: async (event) => messagesConsumed.push(event) })
         consumer.seek({ topic: topicName, partition: 0, offset: 100 })
 
         await waitForConsumerToJoinGroup(consumer)
@@ -116,19 +116,19 @@ describe('Consumer', () => {
         })
 
         it('should not commit the offset', async () => {
-          await Promise.all([consumer, producer, admin].map(client => client.connect()))
+          await Promise.all([consumer, producer, admin].map((client) => client.connect()))
 
           await producer.send({
             acks: 1,
             topic: topicName,
-            messages: [1, 2, 3].map(n => ({ key: `key-${n}`, value: `value-${n}` })),
+            messages: [1, 2, 3].map((n) => ({ key: `key-${n}`, value: `value-${n}` })),
           })
           await consumer.subscribe({ topic: topicName, fromBeginning: true })
 
           let messagesConsumed = []
           consumer.run({
             autoCommit: false,
-            eachMessage: async event => messagesConsumed.push(event),
+            eachMessage: async (event) => messagesConsumed.push(event),
           })
           consumer.seek({ topic: topicName, partition: 0, offset: 2 })
 
@@ -199,7 +199,7 @@ describe('Consumer', () => {
 
         const messagesConsumed = []
         // must be called after run because the ConsumerGroup must be initialized
-        consumer.run({ eachMessage: async event => messagesConsumed.push(event) })
+        consumer.run({ eachMessage: async (event) => messagesConsumed.push(event) })
         consumer.seek({ topic: topicName, partition: 1, offset: 1 })
 
         await waitForConsumerToJoinGroup(consumer)
@@ -248,7 +248,7 @@ describe('Consumer', () => {
 
         const messagesConsumed = []
         // must be called after run because the ConsumerGroup must be initialized
-        consumer.run({ eachMessage: async event => messagesConsumed.push(event) })
+        consumer.run({ eachMessage: async (event) => messagesConsumed.push(event) })
         consumer.seek({ topic: topicName, partition: 0, offset: 2 })
         consumer.seek({ topic: topicName, partition: 1, offset: 1 })
 
@@ -284,7 +284,7 @@ describe('Consumer', () => {
         await consumer.subscribe({ topic: topicName, fromBeginning: true })
 
         const messagesConsumed = []
-        consumer.run({ eachMessage: async event => messagesConsumed.push(event) })
+        consumer.run({ eachMessage: async (event) => messagesConsumed.push(event) })
         consumer.seek({ topic: topicName, partition: 0, offset: 0 })
         consumer.seek({ topic: topicName, partition: 0, offset: 1 })
         consumer.seek({ topic: topicName, partition: 0, offset: 2 })

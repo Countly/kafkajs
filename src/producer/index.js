@@ -10,7 +10,7 @@ const { KafkaJSNonRetriableError } = require('../errors')
 const { values, keys } = Object
 const eventNames = values(events)
 const eventKeys = keys(events)
-  .map(key => `producer.events.${key}`)
+  .map((key) => `producer.events.${key}`)
   .join(', ')
 
 const { CONNECT, DISCONNECT } = events
@@ -83,9 +83,9 @@ module.exports = ({
       throw new KafkaJSNonRetriableError(`Event name should be one of ${eventKeys}`)
     }
 
-    return instrumentationEmitter.addListener(unwrapEvent(eventName), event => {
+    return instrumentationEmitter.addListener(unwrapEvent(eventName), (event) => {
       event.type = wrapEvent(event.type)
-      Promise.resolve(listener(event)).catch(e => {
+      Promise.resolve(listener(event)).catch((e) => {
         logger.error(`Failed to execute listener: ${e.message}`, {
           eventName,
           stack: e.stack,
@@ -151,15 +151,17 @@ module.exports = ({
 
     const isActive = () => transactionalEosManager.isInTransaction() && !transactionDidEnd
 
-    const transactionGuard = fn => (...args) => {
-      if (!isActive()) {
-        return Promise.reject(
-          new KafkaJSNonRetriableError('Cannot continue to use transaction once ended')
-        )
-      }
+    const transactionGuard =
+      (fn) =>
+      (...args) => {
+        if (!isActive()) {
+          return Promise.reject(
+            new KafkaJSNonRetriableError('Cannot continue to use transaction once ended')
+          )
+        }
 
-      return fn(...args)
-    }
+        return fn(...args)
+      }
 
     return {
       sendBatch: transactionGuard(sendBatchTxn),

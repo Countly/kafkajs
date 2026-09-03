@@ -16,20 +16,20 @@ const { failure, createErrorFromCode } = require('../../../error')
  *       permission_type => INT8
  */
 
-const decodeAcls = decoder => ({
+const decodeAcls = (decoder) => ({
   principal: decoder.readString(),
   host: decoder.readString(),
   operation: decoder.readInt8(),
   permissionType: decoder.readInt8(),
 })
 
-const decodeResources = decoder => ({
+const decodeResources = (decoder) => ({
   resourceType: decoder.readInt8(),
   resourceName: decoder.readString(),
   acls: decoder.readArray(decodeAcls),
 })
 
-const decode = async rawData => {
+const decode = async (rawData) => {
   const decoder = new Decoder(rawData)
   const throttleTime = decoder.readInt32()
   const errorCode = decoder.readInt16()
@@ -44,7 +44,7 @@ const decode = async rawData => {
   }
 }
 
-const parse = async data => {
+const parse = async (data) => {
   if (failure(data.errorCode)) {
     throw createErrorFromCode(data.errorCode)
   }

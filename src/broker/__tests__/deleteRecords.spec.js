@@ -104,7 +104,7 @@ describe('Broker > deleteRecords', () => {
   })
 
   test('request', async () => {
-    const brokerData = metadata.brokers.find(b => b.nodeId === partitionLeader)
+    const brokerData = metadata.brokers.find((b) => b.nodeId === partitionLeader)
 
     broker = new Broker({
       connectionPool: createConnectionPool(brokerData),
@@ -134,7 +134,7 @@ describe('Broker > deleteRecords', () => {
 
   test('rejects the promise when offset is incorrect', async () => {
     recordsToDelete[0].partitions[0].offset = '11'
-    const brokerData = metadata.brokers.find(b => b.nodeId === partitionLeader)
+    const brokerData = metadata.brokers.find((b) => b.nodeId === partitionLeader)
     broker = new Broker({
       connectionPool: createConnectionPool(brokerData),
       logger: newLogger(),
@@ -158,7 +158,7 @@ describe('Broker > deleteRecords', () => {
   })
 
   test('rejects the promise when broker is not the partition leader', async () => {
-    const brokerData = metadata.brokers.find(b => b.nodeId !== partitionLeader)
+    const brokerData = metadata.brokers.find((b) => b.nodeId !== partitionLeader)
     broker = new Broker({
       connectionPool: createConnectionPool(brokerData),
       logger: newLogger(),
@@ -234,7 +234,7 @@ describe('Broker > deleteRecords', () => {
     })
 
     test('rejects the promise with all partition errors', async () => {
-      const brokerData = metadata.brokers.find(b => b.nodeId === partitionLeader)
+      const brokerData = metadata.brokers.find((b) => b.nodeId === partitionLeader)
       broker = new Broker({
         connectionPool: createConnectionPool(brokerData),
         logger: newLogger(),

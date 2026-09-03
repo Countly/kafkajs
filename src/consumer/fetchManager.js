@@ -23,7 +23,7 @@ const createFetchManager = ({
   concurrency = 1,
 }) => {
   const logger = rootLogger.namespace('FetchManager')
-  const workers = seq(concurrency, workerId => createWorker({ handler, workerId }))
+  const workers = seq(concurrency, (workerId) => createWorker({ handler, workerId }))
   const workerQueue = createWorkerQueue({ workers })
 
   let fetchers = []
@@ -41,18 +41,18 @@ const createFetchManager = ({
     const validateShouldRebalance = () => {
       const current = getNodeIds()
       const hasChanged =
-        nodeIds.length !== current.length || nodeIds.some(nodeId => !current.includes(nodeId))
+        nodeIds.length !== current.length || nodeIds.some((nodeId) => !current.includes(nodeId))
       if (hasChanged && current.length !== 0) {
         throw new KafkaJSFetcherRebalanceError()
       }
     }
 
-    const fetchers = nodeIds.map(nodeId =>
+    const fetchers = nodeIds.map((nodeId) =>
       createFetcher({
         nodeId,
         workerQueue,
         partitionAssignments,
-        fetch: async nodeId => {
+        fetch: async (nodeId) => {
           validateShouldRebalance()
           return fetch(nodeId)
         },
@@ -71,7 +71,7 @@ const createFetchManager = ({
       fetchers = createFetchers()
 
       try {
-        await Promise.all(fetchers.map(fetcher => fetcher.start()))
+        await Promise.all(fetchers.map((fetcher) => fetcher.start()))
       } catch (error) {
         await stop()
 
@@ -89,7 +89,7 @@ const createFetchManager = ({
 
   const stop = async () => {
     logger.debug('Stopping fetchers...')
-    await Promise.all(fetchers.map(fetcher => fetcher.stop()))
+    await Promise.all(fetchers.map((fetcher) => fetcher.stop()))
     logger.debug('Stopped fetchers')
   }
 

@@ -30,8 +30,8 @@ const wrappedEvents = {
 }
 
 const reversedWrappedEvents = swapObject(wrappedEvents)
-const unwrap = eventName => wrappedEvents[eventName] || eventName
-const wrap = eventName => reversedWrappedEvents[eventName] || eventName
+const unwrap = (eventName) => wrappedEvents[eventName] || eventName
+const wrap = (eventName) => reversedWrappedEvents[eventName] || eventName
 
 module.exports = {
   events,

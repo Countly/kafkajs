@@ -88,17 +88,20 @@ module.exports = class RequestQueue extends EventEmitter {
     if (this.enforceRequestTimeout) {
       this.destroy()
 
-      this.requestTimeoutIntervalId = setInterval(() => {
-        this.inflight.forEach(request => {
-          if (Date.now() - request.sentAt > request.requestTimeout) {
-            request.timeoutRequest()
-          }
-        })
+      this.requestTimeoutIntervalId = setInterval(
+        () => {
+          this.inflight.forEach((request) => {
+            if (Date.now() - request.sentAt > request.requestTimeout) {
+              request.timeoutRequest()
+            }
+          })
 
-        if (!this.isConnected()) {
-          this.destroy()
-        }
-      }, Math.min(this.requestTimeout, 100))
+          if (!this.isConnected()) {
+            this.destroy()
+          }
+        },
+        Math.min(this.requestTimeout, 100)
+      )
     }
   }
 
@@ -239,7 +242,7 @@ module.exports = class RequestQueue extends EventEmitter {
    * @public
    */
   waitForPendingRequests() {
-    return new Promise(resolve => {
+    return new Promise((resolve) => {
       if (this.pending.length === 0 && this.inflight.size === 0) {
         return resolve()
       }

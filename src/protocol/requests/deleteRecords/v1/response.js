@@ -17,7 +17,7 @@ const responseV0 = require('../v0/response')
 module.exports = ({ topics }) => {
   const { parse, decode: decodeV0 } = responseV0({ topics })
 
-  const decode = async rawData => {
+  const decode = async (rawData) => {
     const decoded = await decodeV0(rawData)
 
     return {

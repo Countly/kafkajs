@@ -49,7 +49,7 @@ describe('Producer > Transactional producer', () => {
         producer2 = newProducer()
         await producer2.connect()
         let transaction2
-        await expect(producer2.transaction().then(t => (transaction2 = t))).resolves.toBeTruthy()
+        await expect(producer2.transaction().then((t) => (transaction2 = t))).resolves.toBeTruthy()
         await transaction2.send({ topic: topicName, messages: [message] })
         await transaction2.commit()
       }

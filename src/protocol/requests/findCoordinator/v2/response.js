@@ -14,7 +14,7 @@ const { parse, decode: decodeV1 } = require('../v1/response')
  *     port => INT32
  */
 
-const decode = async rawData => {
+const decode = async (rawData) => {
   const decoded = await decodeV1(rawData)
 
   return {

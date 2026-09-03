@@ -6,7 +6,7 @@ describe('Consumer > assigners > RoundRobinAssigner', () => {
 
   beforeEach(() => {
     metadata = {}
-    cluster = { findTopicPartitionMetadata: topic => metadata[topic] }
+    cluster = { findTopicPartitionMetadata: (topic) => metadata[topic] }
     assigner = RoundRobinAssigner({ cluster })
     topics = ['topic-A', 'topic-B']
   })

@@ -51,7 +51,7 @@ describe('Network > RequestQueue', () => {
         instrumentationEmitter: emitter,
       })
 
-      const removeListener = emitter.addListener(events.NETWORK_REQUEST_QUEUE_SIZE, event => {
+      const removeListener = emitter.addListener(events.NETWORK_REQUEST_QUEUE_SIZE, (event) => {
         if (event.payload.queueSize === 0) {
           requestQueue.fulfillRequest({
             correlationId: request.entry.correlationId,
@@ -190,7 +190,7 @@ describe('Network > RequestQueue', () => {
     })
 
     it('respects the client-side throttling', async () => {
-      const sendDone = new Promise(resolve => {
+      const sendDone = new Promise((resolve) => {
         request.sendRequest = () => {
           resolve(Date.now())
         }
@@ -212,7 +212,7 @@ describe('Network > RequestQueue', () => {
     })
 
     it('ensure request is sent when client-side throttling delay is marginal', async () => {
-      const sendDone = new Promise(resolve => {
+      const sendDone = new Promise((resolve) => {
         request.sendRequest = () => {
           resolve(Date.now())
         }

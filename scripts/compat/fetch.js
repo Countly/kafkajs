@@ -34,14 +34,14 @@ const ENUM_CONSTANT = new RegExp(
 )
 
 /** Java source string literal, possibly a `"a" + "b"` concatenation, to a JS string. */
-const joinJavaString = literal => {
+const joinJavaString = (literal) => {
   if (literal === 'null') return null
   const chunks = literal.match(/"(?:[^"\\]|\\.)*"/g) || []
-  return chunks.map(chunk => JSON.parse(chunk)).join('')
+  return chunks.map((chunk) => JSON.parse(chunk)).join('')
 }
 
 /** Every constant of the `Errors` enum, sorted by code. Retriable flags are not derivable here. */
-const parseErrorsJava = source => {
+const parseErrorsJava = (source) => {
   const start = source.indexOf('public enum Errors {')
   if (start === -1) throw new Error('Errors.java: `public enum Errors {` not found')
   const end = source.indexOf(');', start)
@@ -74,7 +74,7 @@ const get = async (url, extraHeaders) => {
   return response.text()
 }
 
-const messageFiles = tracked => {
+const messageFiles = (tracked) => {
   const files = ['RequestHeader.json', 'ResponseHeader.json']
   for (const api of tracked)
     files.push(`${api.kafkaName}Request.json`, `${api.kafkaName}Response.json`)
@@ -89,8 +89,10 @@ const githubAuthHeaders = () =>
 
 const discover = async (tag, files) => {
   const listing = JSON.parse(await get(`${CONTENTS}?ref=${tag}`, githubAuthHeaders()))
-  const upstream = listing.map(entry => entry.name).filter(name => name.endsWith('Request.json'))
-  const untracked = upstream.filter(name => files.indexOf(name) === -1).sort()
+  const upstream = listing
+    .map((entry) => entry.name)
+    .filter((name) => name.endsWith('Request.json'))
+  const untracked = upstream.filter((name) => files.indexOf(name) === -1).sort()
   console.log(`\nupstream request definitions at ${tag}: ${upstream.length}`)
   console.log(`not tracked by tracked-apis.json: ${untracked.length}`)
   for (const name of untracked) console.log(`  ${name.replace(/Request\.json$/, '')}`)
@@ -154,7 +156,7 @@ module.exports = {
 }
 
 if (require.main === module) {
-  main().catch(error => {
+  main().catch((error) => {
     console.error(error.message)
     process.exit(1)
   })

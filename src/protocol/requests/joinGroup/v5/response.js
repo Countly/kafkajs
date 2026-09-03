@@ -21,10 +21,10 @@ const {
  *     member_metadata => BYTES
  */
 const { code: MEMBER_ID_REQUIRED_ERROR_CODE } = errorCodes.find(
-  e => e.type === 'MEMBER_ID_REQUIRED'
+  (e) => e.type === 'MEMBER_ID_REQUIRED'
 )
 
-const parse = async data => {
+const parse = async (data) => {
   if (failure(data.errorCode)) {
     if (data.errorCode === MEMBER_ID_REQUIRED_ERROR_CODE) {
       throw new KafkaJSMemberIdRequired(createErrorFromCode(data.errorCode), {
@@ -38,7 +38,7 @@ const parse = async data => {
   return data
 }
 
-const decode = async rawData => {
+const decode = async (rawData) => {
   const decoder = new Decoder(rawData)
   const throttleTime = decoder.readInt32()
   const errorCode = decoder.readInt16()
@@ -53,7 +53,7 @@ const decode = async rawData => {
     groupProtocol: decoder.readString(),
     leaderId: decoder.readString(),
     memberId: decoder.readString(),
-    members: decoder.readArray(decoder => ({
+    members: decoder.readArray((decoder) => ({
       memberId: decoder.readString(),
       groupInstanceId: decoder.readString(),
       memberMetadata: decoder.readBytes(),

@@ -21,7 +21,7 @@
 
 const fs = require('fs')
 
-const stripComments = source => {
+const stripComments = (source) => {
   let out = ''
   let inString = false
   for (let i = 0; i < source.length; i++) {
@@ -46,10 +46,10 @@ const stripComments = source => {
   return out
 }
 
-const parseMessage = source => JSON.parse(stripComments(source))
-const readSpec = file => parseSpec(fs.readFileSync(file, 'utf8'))
+const parseMessage = (source) => JSON.parse(stripComments(source))
+const readSpec = (file) => parseSpec(fs.readFileSync(file, 'utf8'))
 
-const parseVersionRange = spec => {
+const parseVersionRange = (spec) => {
   if (spec == null || spec === 'none') return null
   const text = String(spec).trim()
   const open = /^(\d+)\+$/.exec(text)
@@ -61,7 +61,7 @@ const parseVersionRange = spec => {
   throw new Error(`unparsable version range: ${JSON.stringify(spec)}`)
 }
 
-const parseValidVersions = spec => {
+const parseValidVersions = (spec) => {
   const range = parseVersionRange(spec)
   if (range === null || range.max === null) {
     throw new Error(`validVersions must be a closed range, got ${JSON.stringify(spec)}`)
@@ -69,20 +69,20 @@ const parseValidVersions = spec => {
   return range
 }
 
-const parseFlexibleVersions = spec => {
+const parseFlexibleVersions = (spec) => {
   const range = parseVersionRange(spec)
   return range === null ? null : range.min
 }
 
-const expandVersions = range =>
+const expandVersions = (range) =>
   range === null ? [] : Array.from({ length: range.max - range.min + 1 }, (_, i) => range.min + i)
 
-const structNameOf = type => {
+const structNameOf = (type) => {
   const text = String(type)
   return text.indexOf('[]') === 0 ? text.slice(2) : text
 }
 
-const orNull = value => (value === undefined ? null : value)
+const orNull = (value) => (value === undefined ? null : value)
 
 const flattenFields = (fields, commonStructs, prefix, seen) => {
   const structs = commonStructs || {}
@@ -109,7 +109,7 @@ const flattenFields = (fields, commonStructs, prefix, seen) => {
   return rows
 }
 
-const parseSpec = source => {
+const parseSpec = (source) => {
   const raw = typeof source === 'string' ? parseMessage(source) : source
   const commonStructs = {}
   for (const struct of raw.commonStructs || []) commonStructs[struct.name] = struct

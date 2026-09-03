@@ -265,7 +265,7 @@ module.exports = ({
           })
         })
 
-        const topics = Object.keys(newTopicPartitions).map(topic => ({
+        const topics = Object.keys(newTopicPartitions).map((topic) => ({
           topic,
           partitions: newTopicPartitions[topic],
         }))
@@ -276,7 +276,7 @@ module.exports = ({
         }
 
         topics.forEach(({ topic, partitions }) => {
-          partitions.forEach(partition => {
+          partitions.forEach((partition) => {
             transactionTopicPartitions[topic][partition] = true
           })
         })

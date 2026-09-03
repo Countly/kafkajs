@@ -1,3 +1,3 @@
-const uniq = arr => [...new Set(arr)]
+const uniq = (arr) => [...new Set(arr)]
 
 module.exports = uniq

@@ -10,31 +10,31 @@ const MAX_SAFE_UNSIGNED_INT = 4294967295
 const MIN_SAFE_UNSIGNED_INT = 0
 
 describe('Protocol > Encoder', () => {
-  const signed32 = number => new Encoder().writeVarInt(number).buffer
-  const decode32 = buffer => new Decoder(buffer).readVarInt()
+  const signed32 = (number) => new Encoder().writeVarInt(number).buffer
+  const decode32 = (buffer) => new Decoder(buffer).readVarInt()
 
-  const unsigned32 = number => new Encoder().writeUVarInt(number).buffer
-  const decode32u = buffer => new Decoder(buffer).readUVarInt()
+  const unsigned32 = (number) => new Encoder().writeUVarInt(number).buffer
+  const decode32u = (buffer) => new Decoder(buffer).readUVarInt()
 
-  const signed64 = number => new Encoder().writeVarLong(number).buffer
-  const decode64 = buffer => new Decoder(buffer).readVarLong()
+  const signed64 = (number) => new Encoder().writeVarLong(number).buffer
+  const decode64 = (buffer) => new Decoder(buffer).readVarLong()
 
-  const encodeDouble = number => new Encoder().writeDouble(number).buffer
-  const decodeDouble = buffer => new Decoder(buffer).readDouble()
+  const encodeDouble = (number) => new Encoder().writeDouble(number).buffer
+  const decodeDouble = (buffer) => new Decoder(buffer).readDouble()
 
-  const ustring = string => new Encoder().writeUVarIntString(string).buffer
-  const decodeUString = buffer => new Decoder(buffer).readUVarIntString()
+  const ustring = (string) => new Encoder().writeUVarIntString(string).buffer
+  const decodeUString = (buffer) => new Decoder(buffer).readUVarIntString()
 
-  const ubytes = bytes => new Encoder().writeUVarIntBytes(bytes).buffer
-  const decodeUBytes = buffer => new Decoder(buffer).readUVarIntBytes()
+  const ubytes = (bytes) => new Encoder().writeUVarIntBytes(bytes).buffer
+  const decodeUBytes = (buffer) => new Decoder(buffer).readUVarIntBytes()
 
-  const uarray = array => new Encoder().writeUVarIntArray(array).buffer
+  const uarray = (array) => new Encoder().writeUVarIntArray(array).buffer
 
   const B = (...args) => Buffer.from(args)
-  const L = value => Long.fromString(`${value}`)
+  const L = (value) => Long.fromString(`${value}`)
 
   describe('Unsigned VarInt Array', () => {
-    const encodeUVarInt = number => new Encoder().writeUVarInt(number)
+    const encodeUVarInt = (number) => new Encoder().writeUVarInt(number)
     const array = [7681, 823, 9123, 9812, 3219]
     test('encode uvarint array', () => {
       expect(uarray(array.map(encodeUVarInt))).toEqual(
@@ -43,7 +43,7 @@ describe('Protocol > Encoder', () => {
     })
 
     test('decode uvarint array', () => {
-      const decodeUVarInt = decoder => decoder.readUVarInt()
+      const decodeUVarInt = (decoder) => decoder.readUVarInt()
       const encodedArray = uarray(array.map(encodeUVarInt))
       const decoder = new Decoder(encodedArray)
       expect(decoder.readUVarIntArray(decodeUVarInt)).toEqual(array)

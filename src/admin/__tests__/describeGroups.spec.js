@@ -28,7 +28,7 @@ describe('Admin', () => {
       logger: newLogger(),
     })
 
-    consumers = groupIds.map(groupId =>
+    consumers = groupIds.map((groupId) =>
       createConsumer({
         cluster: createCluster({ metadataMaxAge: 50 }),
         groupId,
@@ -51,14 +51,14 @@ describe('Admin', () => {
     await Promise.all([
       admin.connect(),
       producer.connect(),
-      ...consumers.map(consumer => consumer.connect()),
+      ...consumers.map((consumer) => consumer.connect()),
     ])
 
     const messagesConsumed = []
     await Promise.all(
-      consumers.map(async consumer => {
+      consumers.map(async (consumer) => {
         await consumer.subscribe({ topic: topicName, fromBeginning: true })
-        consumer.run({ eachMessage: async event => messagesConsumed.push(event) })
+        consumer.run({ eachMessage: async (event) => messagesConsumed.push(event) })
         await waitForConsumerToJoinGroup(consumer)
       })
     )
@@ -76,7 +76,7 @@ describe('Admin', () => {
 
   afterAll(async () => {
     admin && (await admin.disconnect())
-    consumers && (await Promise.all(consumers.map(consumer => consumer.disconnect())))
+    consumers && (await Promise.all(consumers.map((consumer) => consumer.disconnect())))
     producer && (await producer.disconnect())
   })
 
@@ -85,7 +85,7 @@ describe('Admin', () => {
       const describeGroupsResponse = await admin.describeGroups(groupIds)
 
       expect(describeGroupsResponse.groups).toIncludeSameMembers(
-        groupIds.map(groupId => ({
+        groupIds.map((groupId) => ({
           errorCode: 0,
           groupId,
           members: [

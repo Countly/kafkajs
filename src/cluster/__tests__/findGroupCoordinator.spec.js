@@ -1,6 +1,6 @@
 jest.mock('../../utils/shuffle')
 const shuffle = require('../../utils/shuffle')
-shuffle.mockImplementation(brokers => brokers.sort((a, b) => a > b))
+shuffle.mockImplementation((brokers) => brokers.sort((a, b) => a > b))
 
 const Broker = require('../../broker')
 const { createCluster, secureRandom } = require('testHelpers')

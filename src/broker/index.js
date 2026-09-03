@@ -128,10 +128,7 @@ module.exports = class Broker {
    */
   async apiVersions() {
     let response
-    const availableVersions = requests.ApiVersions.versions
-      .map(Number)
-      .sort()
-      .reverse()
+    const availableVersions = requests.ApiVersions.versions.map(Number).sort().reverse()
 
     // Find the best version implemented by the server
     for (const candidateVersion of availableVersions) {
@@ -293,7 +290,7 @@ module.exports = class Broker {
 
     // Shuffle topic-partitions to ensure fair response allocation across partitions (KIP-74)
     const flattenedTopicPartitions = topics.reduce((topicPartitions, { topic, partitions }) => {
-      partitions.forEach(partition => {
+      partitions.forEach((partition) => {
         topicPartitions.push({ topic, partition })
       })
       return topicPartitions

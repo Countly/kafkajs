@@ -38,6 +38,6 @@ const encodePartitionAssignment = ({ partition, replicas }) => {
     .writeUVarIntBytes()
 }
 
-const encodeReplicas = replica => {
+const encodeReplicas = (replica) => {
   return new Encoder().writeInt32(replica)
 }

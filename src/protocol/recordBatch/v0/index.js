@@ -56,7 +56,7 @@ const RecordBatch = async ({
     .writeInt32(firstSequence)
 
   if (compression === Compression.None) {
-    if (records.every(v => typeof v === typeof records[0])) {
+    if (records.every((v) => typeof v === typeof records[0])) {
       batchBody.writeArray(records, typeof records[0])
     } else {
       batchBody.writeArray(records)

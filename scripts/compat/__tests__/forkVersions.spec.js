@@ -5,7 +5,7 @@ const { introspect, versionDirs, requestDirectories, readFork } = require('../fo
 const trackedApis = require('../tracked-apis.json')
 
 /** Builds a throwaway src/protocol/requests-shaped tree: { produce: [3, 4], ... }. */
-const buildTree = layout => {
+const buildTree = (layout) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'compat-fork-'))
   for (const name of Object.keys(layout)) {
     const dir = path.join(root, name)
@@ -90,7 +90,7 @@ describe('scripts/compat/forkVersions', () => {
         { Produce: 0 },
         { tracked: [entry('Produce', 0, 'produce', 'Produce')], untracked: [] }
       )
-      expect(result.findings.map(f => f.code)).toEqual(['dir-mismatch'])
+      expect(result.findings.map((f) => f.code)).toEqual(['dir-mismatch'])
     })
 
     it('errors on a request directory missing from tracked-apis.json', () => {
@@ -135,7 +135,7 @@ describe('scripts/compat/forkVersions', () => {
           untracked: [entry('ProduceAgain', 0, null, null)],
         }
       )
-      expect(result.findings.map(f => f.code)).toContain('duplicate-entry')
+      expect(result.findings.map((f) => f.code)).toContain('duplicate-entry')
     })
 
     it('classifies an empty versions array with no directory as a stub', () => {
@@ -174,11 +174,11 @@ describe('scripts/compat/forkVersions', () => {
     const result = readFork(trackedApis)
 
     it('has no error-level findings', () => {
-      expect(result.findings.filter(f => f.level === 'error')).toEqual([])
+      expect(result.findings.filter((f) => f.level === 'error')).toEqual([])
     })
 
     it('reports exactly the known ElectPreferredLeaders naming inconsistency', () => {
-      expect(result.findings.map(f => f.code)).toEqual(['missing-requests-entry'])
+      expect(result.findings.map((f) => f.code)).toEqual(['missing-requests-entry'])
     })
 
     it('reads the implemented version sets', () => {

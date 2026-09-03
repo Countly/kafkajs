@@ -20,23 +20,23 @@ module.exports = class ConnectionPool {
   }
 
   isConnected() {
-    return this.pool.some(c => c.isConnected())
+    return this.pool.some((c) => c.isConnected())
   }
 
   isAuthenticated() {
-    return this.pool.some(c => c.isAuthenticated())
+    return this.pool.some((c) => c.isAuthenticated())
   }
 
   setSupportAuthenticationProtocol(isSupported) {
-    this.map(c => c.setSupportAuthenticationProtocol(isSupported))
+    this.map((c) => c.setSupportAuthenticationProtocol(isSupported))
   }
 
   setVersions(versions) {
-    this.map(c => c.setVersions(versions))
+    this.map((c) => c.setVersions(versions))
   }
 
   map(callback) {
-    return this.pool.map(c => callback(c))
+    return this.pool.map((c) => callback(c))
   }
 
   async send(protocolRequest) {
@@ -60,6 +60,6 @@ module.exports = class ConnectionPool {
   }
 
   async destroy() {
-    await Promise.all(this.map(c => c.disconnect()))
+    await Promise.all(this.map((c) => c.disconnect()))
   }
 }

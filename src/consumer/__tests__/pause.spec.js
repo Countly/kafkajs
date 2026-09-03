@@ -71,7 +71,7 @@ describe('Consumer', () => {
     it('pauses the appropriate topic/partition when pausing via the eachMessage callback', async () => {
       await consumer.connect()
       await producer.connect()
-      const messages = [0, 0, 1, 0].map(partition => {
+      const messages = [0, 0, 1, 0].map((partition) => {
         const key = secureRandom()
         return { key: `key-${key}`, value: `value-${key}`, partition }
       })
@@ -85,11 +85,11 @@ describe('Consumer', () => {
       const messagesConsumed = []
       const resumeCallbacks = []
       consumer.run({
-        eachMessage: async event => {
+        eachMessage: async (event) => {
           const { topic, message, pause } = event
 
           const whichTopic = topics.indexOf(topic)
-          const whichMessage = messages.findIndex(m => String(m.key) === String(message.key))
+          const whichMessage = messages.findIndex((m) => String(m.key) === String(message.key))
 
           if (shouldPause && whichTopic === 0 && whichMessage === 1) {
             resumeCallbacks.push(pause())
@@ -121,7 +121,7 @@ describe('Consumer', () => {
       expect(messagesConsumed).toContainEqual({ topic: 1, message: 3 }) // partition 0
 
       shouldPause = false
-      resumeCallbacks.forEach(resume => resume())
+      resumeCallbacks.forEach((resume) => resume())
 
       await waitForMessages(messagesConsumed, { number: 8 })
 
@@ -134,7 +134,7 @@ describe('Consumer', () => {
     it('avoids calling eachMessage again for paused topics/partitions when paused via consumer.pause', async () => {
       await consumer.connect()
       await producer.connect()
-      const messages = [0, 0, 1, 0].map(partition => {
+      const messages = [0, 0, 1, 0].map((partition) => {
         const key = secureRandom()
         return { key: `key-${key}`, value: `value-${key}`, partition }
       })
@@ -147,11 +147,11 @@ describe('Consumer', () => {
       let shouldPause = true
       const messagesConsumed = []
       consumer.run({
-        eachMessage: async event => {
+        eachMessage: async (event) => {
           const { topic, message, partition } = event
 
           const whichTopic = topics.indexOf(topic)
-          const whichMessage = messages.findIndex(m => String(m.key) === String(message.key))
+          const whichMessage = messages.findIndex((m) => String(m.key) === String(message.key))
 
           messagesConsumed.push({
             topic: whichTopic,
@@ -198,7 +198,7 @@ describe('Consumer', () => {
     it('pauses when pausing via the eachBatch callback', async () => {
       await consumer.connect()
       await producer.connect()
-      const originalMessages = [0, 0, 0, 1].map(partition => {
+      const originalMessages = [0, 0, 0, 1].map((partition) => {
         const key = secureRandom()
         return { key: `key-${key}`, value: `value-${key}`, partition }
       })
@@ -212,17 +212,17 @@ describe('Consumer', () => {
       const messagesConsumed = []
       const resumeCallbacks = []
       consumer.run({
-        eachBatch: async event => {
+        eachBatch: async (event) => {
           const {
             batch: { topic, messages },
             pause,
             resolveOffset,
             commitOffsetsIfNecessary,
           } = event
-          messages.every(message => {
+          messages.every((message) => {
             const whichTopic = topics.indexOf(topic)
             const whichMessage = originalMessages.findIndex(
-              m => String(m.key) === String(message.key)
+              (m) => String(m.key) === String(message.key)
             )
 
             if (shouldPause && whichTopic === 0 && whichMessage === 1) {
@@ -248,7 +248,7 @@ describe('Consumer', () => {
       expect(consumer.paused()).toContainEqual({ topic: topics[0], partitions: [0] })
       expect(consumer.paused()).toContainEqual({ topic: topics[1], partitions: [1] })
       shouldPause = false
-      resumeCallbacks.forEach(resume => resume())
+      resumeCallbacks.forEach((resume) => resume())
       await waitForMessages(messagesConsumed, { number: 8 })
       expect(consumer.paused()).toEqual([])
       expect(messagesConsumed).toContainEqual({ topic: 0, message: 1 })
@@ -270,7 +270,7 @@ describe('Consumer', () => {
       }
 
       const messagesConsumed = []
-      consumer.run({ eachMessage: async event => messagesConsumed.push(event) })
+      consumer.run({ eachMessage: async (event) => messagesConsumed.push(event) })
 
       await waitForConsumerToJoinGroup(consumer)
       await waitForMessages(messagesConsumed, { number: 2 })
@@ -330,7 +330,7 @@ describe('Consumer', () => {
           const value = secureRandom()
           return { key: `key-${value}`, value: `value-${value}` }
         })
-      const forPartition = partition => message => ({ ...message, partition })
+      const forPartition = (partition) => (message) => ({ ...message, partition })
 
       for (const partition of partitions) {
         await producer.send({ acks: 1, topic, messages: messages.map(forPartition(partition)) })
@@ -338,7 +338,7 @@ describe('Consumer', () => {
       await consumer.subscribe({ topic, fromBeginning: true })
 
       const messagesConsumed = []
-      consumer.run({ eachMessage: async event => messagesConsumed.push(event) })
+      consumer.run({ eachMessage: async (event) => messagesConsumed.push(event) })
 
       await waitForConsumerToJoinGroup(consumer)
       await waitForMessages(messagesConsumed, { number: messages.length * partitions.length })
@@ -399,7 +399,7 @@ describe('Consumer', () => {
       await consumer.subscribe({ topic, fromBeginning: true })
 
       consumer.run({
-        eachMessage: async event => {
+        eachMessage: async (event) => {
           messagesConsumed.push(event)
           if (shouldThrow) {
             consumer.pause([{ topic }])
@@ -459,7 +459,7 @@ describe('Consumer', () => {
       await consumer.subscribe({ topic, fromBeginning: true })
 
       consumer.run({
-        eachMessage: async event => {
+        eachMessage: async (event) => {
           messagesConsumed.push(event)
           if (shouldThrow && event.partition === pausedPartition) {
             consumer.pause([{ topic, partitions: [pausedPartition] }])
@@ -578,7 +578,7 @@ describe('Consumer', () => {
       }
 
       const messagesConsumed = []
-      consumer.run({ eachMessage: async event => messagesConsumed.push(event) })
+      consumer.run({ eachMessage: async (event) => messagesConsumed.push(event) })
 
       const [pausedTopic, activeTopic] = topics
       consumer.pause([{ topic: pausedTopic }])
@@ -622,7 +622,7 @@ describe('Consumer', () => {
           const value = secureRandom()
           return { key: `key-${value}`, value: `value-${value}` }
         })
-      const forPartition = partition => message => ({ ...message, partition })
+      const forPartition = (partition) => (message) => ({ ...message, partition })
 
       for (const partition of partitions) {
         await producer.send({ acks: 1, topic, messages: messages.map(forPartition(partition)) })
@@ -630,7 +630,7 @@ describe('Consumer', () => {
       await consumer.subscribe({ topic, fromBeginning: true })
 
       const messagesConsumed = []
-      consumer.run({ eachMessage: async event => messagesConsumed.push(event) })
+      consumer.run({ eachMessage: async (event) => messagesConsumed.push(event) })
 
       await waitForConsumerToJoinGroup(consumer)
       await waitForMessages(messagesConsumed, { number: messages.length * partitions.length })

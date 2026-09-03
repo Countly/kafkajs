@@ -8,7 +8,7 @@ const {
   expandVersions,
 } = require('../parse')
 
-const fixture = name => path.join(__dirname, 'fixtures', `${name}.json`)
+const fixture = (name) => path.join(__dirname, 'fixtures', `${name}.json`)
 
 describe('scripts/compat/parse', () => {
   describe('stripComments', () => {
@@ -70,33 +70,33 @@ describe('scripts/compat/parse', () => {
     })
 
     it('keeps "//" and escaped quotes inside about strings', () => {
-      const url = spec.fields.find(f => f.path === 'Url')
+      const url = spec.fields.find((f) => f.path === 'Url')
       expect(url.about).toBe('A doc string containing // not a comment and an escaped " quote.')
     })
 
     it('flattens inline nested struct fields with a dotted path', () => {
-      const paths = spec.fields.map(f => f.path)
+      const paths = spec.fields.map((f) => f.path)
       expect(paths).toContain('Topics.Name')
       expect(paths).toContain('Topics.Partitions')
-      const topics = spec.fields.find(f => f.path === 'Topics')
+      const topics = spec.fields.find((f) => f.path === 'Topics')
       expect(topics.nullableVersions).toBe('1+')
     })
 
     it('resolves commonStructs references', () => {
-      const paths = spec.fields.map(f => f.path)
+      const paths = spec.fields.map((f) => f.path)
       expect(paths).toContain('Groups.GroupId')
       expect(paths).toContain('Groups.MemberEpoch')
     })
 
     it('reads tagged fields and defaults versions to taggedVersions', () => {
-      const clusterId = spec.fields.find(f => f.path === 'ClusterId')
+      const clusterId = spec.fields.find((f) => f.path === 'ClusterId')
       expect(clusterId.tag).toBe(0)
       expect(clusterId.taggedVersions).toBe('2+')
       expect(clusterId.versions).toBe('2+')
     })
 
     it('emits fields in wire order', () => {
-      expect(spec.fields.map(f => f.path)).toEqual([
+      expect(spec.fields.map((f) => f.path)).toEqual([
         'Url',
         'Groups',
         'Groups.GroupId',
@@ -127,7 +127,10 @@ describe('scripts/compat/parse', () => {
       expect(spec.apiKey).toBe(18)
       expect(spec.validVersions).toEqual({ min: 0, max: 4 })
       expect(spec.flexibleFrom).toBe(3)
-      expect(spec.fields.map(f => f.path)).toEqual(['ClientSoftwareName', 'ClientSoftwareVersion'])
+      expect(spec.fields.map((f) => f.path)).toEqual([
+        'ClientSoftwareName',
+        'ClientSoftwareVersion',
+      ])
     })
 
     it('parses RequestHeader.json (a header file with no apiKey)', () => {

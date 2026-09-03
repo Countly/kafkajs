@@ -11,13 +11,13 @@ const { parse: parseV0 } = require('../v0/response')
 
 const topicNameComparator = (a, b) => a.topic.localeCompare(b.topic)
 
-const topicErrors = decoder => ({
+const topicErrors = (decoder) => ({
   topic: decoder.readString(),
   errorCode: decoder.readInt16(),
   errorMessage: decoder.readString(),
 })
 
-const decode = async rawData => {
+const decode = async (rawData) => {
   const decoder = new Decoder(rawData)
   return {
     topicErrors: decoder.readArray(topicErrors).sort(topicNameComparator),

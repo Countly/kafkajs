@@ -8,7 +8,7 @@ const NETWORK_DELAY = 100
  * The FETCH request can block up to maxWaitTime, which can be bigger than the configured
  * request timeout. It's safer to always use the maxWaitTime
  **/
-const requestTimeout = timeout =>
+const requestTimeout = (timeout) =>
   Number.isSafeInteger(timeout + NETWORK_DELAY) ? timeout + NETWORK_DELAY : timeout
 
 const versions = {

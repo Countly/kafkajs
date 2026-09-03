@@ -14,7 +14,7 @@ const { parse: parseV3 } = require('../v3/response')
  *   throttle_time_ms => INT32
  */
 
-const partition = decoder => ({
+const partition = (decoder) => ({
   partition: decoder.readInt32(),
   errorCode: decoder.readInt16(),
   baseOffset: decoder.readInt64().toString(),
@@ -22,9 +22,9 @@ const partition = decoder => ({
   logStartOffset: decoder.readInt64().toString(),
 })
 
-const decode = async rawData => {
+const decode = async (rawData) => {
   const decoder = new Decoder(rawData)
-  const topics = decoder.readArray(decoder => ({
+  const topics = decoder.readArray((decoder) => ({
     topicName: decoder.readString(),
     partitions: decoder.readArray(partition),
   }))

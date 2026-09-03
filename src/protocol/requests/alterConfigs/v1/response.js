@@ -13,7 +13,7 @@ const { parse, decode: decodeV0 } = require('../v0/response')
  *     resource_name => STRING
  */
 
-const decode = async rawData => {
+const decode = async (rawData) => {
   const decoded = await decodeV0(rawData)
 
   return {

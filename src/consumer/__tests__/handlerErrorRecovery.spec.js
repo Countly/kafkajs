@@ -77,14 +77,14 @@ describe('Consumer', () => {
       await expect(waitFor(() => succeeded)).resolves.toBeTruthy()
 
       // retry the same message
-      expect(messages.map(m => m.offset)).toEqual(['0', '0'])
-      expect(messages.map(m => m.key.toString())).toEqual([`key-${key1}`, `key-${key1}`])
+      expect(messages.map((m) => m.offset)).toEqual(['0', '0'])
+      expect(messages.map((m) => m.key.toString())).toEqual([`key-${key1}`, `key-${key1}`])
     })
 
     it('commits the previous offsets', async () => {
       let raisedError = false
       consumer.run({
-        eachMessage: async event => {
+        eachMessage: async (event) => {
           if (event.message.key.toString() === `key-${key3}`) {
             raisedError = true
             throw new Error('some error')
@@ -122,7 +122,7 @@ describe('Consumer', () => {
       let raisedError = false
       consumer.run({
         autoCommit: false,
-        eachMessage: async event => {
+        eachMessage: async (event) => {
           if (event.message.key.toString() === `key-${key3}`) {
             raisedError = true
             throw new Error('some error')
@@ -195,8 +195,11 @@ describe('Consumer', () => {
       await expect(waitFor(() => succeeded)).resolves.toBeTruthy()
 
       // retry the same batch
-      expect(batches.map(b => b.messages.map(m => m.offset).join(','))).toEqual(['0,1,2', '0,1,2'])
-      const batchMessages = batches.map(b => b.messages.map(m => m.key.toString()).join('-'))
+      expect(batches.map((b) => b.messages.map((m) => m.offset).join(','))).toEqual([
+        '0,1,2',
+        '0,1,2',
+      ])
+      const batchMessages = batches.map((b) => b.messages.map((m) => m.key.toString()).join('-'))
       expect(batchMessages).toEqual([
         `key-${key1}-key-${key2}-key-${key3}`,
         `key-${key1}-key-${key2}-key-${key3}`,

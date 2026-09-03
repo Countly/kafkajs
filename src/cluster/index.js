@@ -299,7 +299,7 @@ module.exports = class Cluster {
       throw new KafkaJSTopicMetadataNotLoaded('Topic metadata not loaded', { topic })
     }
 
-    const topicMetadata = metadata.topicMetadata.find(t => t.topic === topic)
+    const topicMetadata = metadata.topicMetadata.find((t) => t.topic === topic)
     return topicMetadata ? topicMetadata.partitionMetadata : []
   }
 
@@ -317,7 +317,7 @@ module.exports = class Cluster {
     const partitionMetadata = this.findTopicPartitionMetadata(topic)
     return partitions.reduce((result, id) => {
       const partitionId = parseInt(id, 10)
-      const metadata = partitionMetadata.find(p => p.partitionId === partitionId)
+      const metadata = partitionMetadata.find((p) => p.partitionId === partitionId)
 
       if (!metadata) {
         return result
@@ -454,7 +454,7 @@ module.exports = class Cluster {
     const partitionsPerBroker = {}
     const topicConfigurations = {}
 
-    const addDefaultOffset = topic => partition => {
+    const addDefaultOffset = (topic) => (partition) => {
       const { timestamp } = topicConfigurations[topic]
       return { ...partition, timestamp }
     }
@@ -464,29 +464,29 @@ module.exports = class Cluster {
       const { topic, partitions, fromBeginning, fromTimestamp } = topicData
       const partitionsPerLeader = this.findLeaderForPartitions(
         topic,
-        partitions.map(p => p.partition)
+        partitions.map((p) => p.partition)
       )
       const timestamp =
         fromTimestamp != null ? fromTimestamp : this.defaultOffset({ fromBeginning })
 
       topicConfigurations[topic] = { timestamp }
 
-      keys(partitionsPerLeader).forEach(nodeId => {
+      keys(partitionsPerLeader).forEach((nodeId) => {
         partitionsPerBroker[nodeId] = partitionsPerBroker[nodeId] || {}
-        partitionsPerBroker[nodeId][topic] = partitions.filter(p =>
+        partitionsPerBroker[nodeId][topic] = partitions.filter((p) =>
           partitionsPerLeader[nodeId].includes(p.partition)
         )
       })
     }
 
     // Create a list of requests to fetch the offset of all partitions
-    const requests = keys(partitionsPerBroker).map(async nodeId => {
+    const requests = keys(partitionsPerBroker).map(async (nodeId) => {
       const broker = await this.findBroker({ nodeId })
       const partitions = partitionsPerBroker[nodeId]
 
       const { responses: topicOffsets } = await broker.listOffsets({
         isolationLevel: this.isolationLevel,
-        topics: keys(partitions).map(topic => ({
+        topics: keys(partitions).map((topic) => ({
           topic,
           partitions: partitions[topic].map(addDefaultOffset(topic)),
         })),
@@ -499,7 +499,7 @@ module.exports = class Cluster {
     const responses = await Promise.all(requests)
     const partitionsPerTopic = responses.flat().reduce(mergeTopics, {})
 
-    return keys(partitionsPerTopic).map(topic => ({
+    return keys(partitionsPerTopic).map((topic) => ({
       topic,
       partitions: partitionsPerTopic[topic].map(({ partition, offset }) => ({
         partition,

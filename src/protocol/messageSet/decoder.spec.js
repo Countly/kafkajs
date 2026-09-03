@@ -47,9 +47,9 @@ const Fixtures = {
 }
 
 describe('Protocol > MessageSet > decoder', () => {
-  Object.keys(Fixtures).forEach(version => {
+  Object.keys(Fixtures).forEach((version) => {
     describe(`message ${version}`, () => {
-      Object.keys(Fixtures[version]).forEach(option => {
+      Object.keys(Fixtures[version]).forEach((option) => {
         test(`decode ${option} messages`, async () => {
           const { data, output } = Fixtures[version][option]
           const decoder = new Decoder(Buffer.from(data))

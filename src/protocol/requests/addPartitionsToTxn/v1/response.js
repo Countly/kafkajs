@@ -12,7 +12,7 @@ const { parse, decode: decodeV0 } = require('../v0/response')
  *       partition => INT32
  *       error_code => INT16
  */
-const decode = async rawData => {
+const decode = async (rawData) => {
   const decoded = await decodeV0(rawData)
 
   return {

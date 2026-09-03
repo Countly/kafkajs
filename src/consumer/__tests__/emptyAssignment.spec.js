@@ -38,13 +38,13 @@ describe('Consumer', () => {
           [firstMember]: {},
         }
 
-        topics.forEach(topic => {
+        topics.forEach((topic) => {
           const partitionMetadata = cluster.findTopicPartitionMetadata(topic)
-          const partitions = partitionMetadata.map(m => m.partitionId)
+          const partitions = partitionMetadata.map((m) => m.partitionId)
           assignment[firstMember][topic] = partitions
         })
 
-        return Object.keys(assignment).map(memberId => ({
+        return Object.keys(assignment).map((memberId) => ({
           memberId,
           memberAssignment: MemberAssignment.encode({
             version: this.version,
@@ -101,12 +101,14 @@ describe('Consumer', () => {
     expect(emptyAssignments).toHaveLength(1)
 
     await Promise.all(
-      [consumer1, consumer2].map(consumer => waitForNextEvent(consumer, consumer.events.FETCH))
+      [consumer1, consumer2].map((consumer) => waitForNextEvent(consumer, consumer.events.FETCH))
     )
 
     // Both consumers should continue to heartbeat even without receiving any assignments
     await Promise.all(
-      [consumer1, consumer2].map(consumer => waitForNextEvent(consumer, consumer.events.HEARTBEAT))
+      [consumer1, consumer2].map((consumer) =>
+        waitForNextEvent(consumer, consumer.events.HEARTBEAT)
+      )
     )
   })
 })

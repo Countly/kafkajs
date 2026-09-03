@@ -7,7 +7,7 @@ const { failure, createErrorFromCode, failIfVersionNotSupported } = require('../
  *    enabled_mechanisms => STRING
  */
 
-const decode = async rawData => {
+const decode = async (rawData) => {
   const decoder = new Decoder(rawData)
   const errorCode = decoder.readInt16()
 
@@ -15,11 +15,11 @@ const decode = async rawData => {
 
   return {
     errorCode,
-    enabledMechanisms: decoder.readArray(decoder => decoder.readString()),
+    enabledMechanisms: decoder.readArray((decoder) => decoder.readString()),
   }
 }
 
-const parse = async data => {
+const parse = async (data) => {
   if (failure(data.errorCode)) {
     throw createErrorFromCode(data.errorCode)
   }

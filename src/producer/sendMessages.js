@@ -20,7 +20,7 @@ module.exports = ({ logger, cluster, partitioner, eosManager, retrier }) => {
     const responsePerBroker = new Map()
 
     /** @param {Map<import("../../types").Broker, any[]>} responsePerBroker */
-    const createProducerRequests = async responsePerBroker => {
+    const createProducerRequests = async (responsePerBroker) => {
       const topicMetadata = new Map()
 
       await cluster.refreshMetadataIfNecessary()
@@ -62,9 +62,9 @@ module.exports = ({ logger, cluster, partitioner, eosManager, retrier }) => {
       }
 
       const brokers = Array.from(responsePerBroker.keys())
-      const brokersWithoutResponse = brokers.filter(broker => !responsePerBroker.get(broker))
+      const brokersWithoutResponse = brokers.filter((broker) => !responsePerBroker.get(broker))
 
-      return brokersWithoutResponse.map(async broker => {
+      return brokersWithoutResponse.map(async (broker) => {
         const entries = Array.from(topicMetadata.entries())
         const topicDataForBroker = entries
           .filter(([_, { partitionsPerLeader }]) => !!partitionsPerLeader[broker.nodeId])
@@ -83,7 +83,7 @@ module.exports = ({ logger, cluster, partitioner, eosManager, retrier }) => {
           }
 
           topicData.forEach(({ topic, partitions }) => {
-            partitions.forEach(entry => {
+            partitions.forEach((entry) => {
               entry.firstSequence = eosManager.getSequence(topic, entry.partition)
               eosManager.updateSequence(topic, entry.partition, entry.messages.length)
             })
@@ -104,7 +104,7 @@ module.exports = ({ logger, cluster, partitioner, eosManager, retrier }) => {
             })
           } catch (e) {
             topicData.forEach(({ topic, partitions }) => {
-              partitions.forEach(entry => {
+              partitions.forEach((entry) => {
                 eosManager.updateSequence(topic, entry.partition, -entry.messages.length)
               })
             })

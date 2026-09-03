@@ -90,7 +90,7 @@ describe('Cluster > BrokerPool', () => {
       await brokerPool.connect()
       await brokerPool.refreshMetadata([topicName])
 
-      const broker = Object.values(brokerPool.brokers).find(broker => !broker.isConnected())
+      const broker = Object.values(brokerPool.brokers).find((broker) => !broker.isConnected())
       expect(broker).not.toEqual(brokerPool.seedBroker)
 
       await broker.connect()
@@ -168,7 +168,7 @@ describe('Cluster > BrokerPool', () => {
       expect(brokers.length).toEqual(numberOfBrokers - 1)
       expect(
         brokers.find(
-          broker => broker.connectionPool.host === host && broker.connectionPool.port === port
+          (broker) => broker.connectionPool.host === host && broker.connectionPool.port === port
         )
       ).toEqual(undefined)
     })
@@ -201,7 +201,7 @@ describe('Cluster > BrokerPool', () => {
       await brokerPool.connect()
       await brokerPool.refreshMetadata([topicName])
 
-      const broker = Object.values(brokerPool.brokers).find(broker => !broker.isConnected())
+      const broker = Object.values(brokerPool.brokers).find((broker) => !broker.isConnected())
       expect(broker).not.toEqual(brokerPool.seedBroker)
 
       await broker.connect()
@@ -244,8 +244,8 @@ describe('Cluster > BrokerPool', () => {
       const seed = brokerPool.seedBroker.connectionPool
       const brokers = Object.values(brokerPool.brokers)
       const seedFromBrokerPool = brokers
-        .map(b => b.connectionPool)
-        .find(b => b.host === seed.host && b.port === seed.port)
+        .map((b) => b.connectionPool)
+        .find((b) => b.host === seed.host && b.port === seed.port)
 
       expect(seedFromBrokerPool).toEqual(seed)
     })
@@ -305,7 +305,7 @@ describe('Cluster > BrokerPool', () => {
       it('replaces the broker when the host change', async () => {
         jest.spyOn(lastBroker, 'metadata').mockImplementationOnce(() => ({
           ...brokerPool.metadata,
-          brokers: brokerPool.metadata.brokers.map(broker =>
+          brokers: brokerPool.metadata.brokers.map((broker) =>
             broker.nodeId === targetNodeId ? { ...broker, host: '0.0.0.0' } : broker
           ),
         }))
@@ -317,7 +317,7 @@ describe('Cluster > BrokerPool', () => {
       it('replaces the broker when the port change', async () => {
         jest.spyOn(lastBroker, 'metadata').mockImplementationOnce(() => ({
           ...brokerPool.metadata,
-          brokers: brokerPool.metadata.brokers.map(broker =>
+          brokers: brokerPool.metadata.brokers.map((broker) =>
             broker.nodeId === targetNodeId ? { ...broker, port: 4321 } : broker
           ),
         }))
@@ -329,7 +329,7 @@ describe('Cluster > BrokerPool', () => {
       it('replaces the broker when the rack change', async () => {
         jest.spyOn(lastBroker, 'metadata').mockImplementationOnce(() => ({
           ...brokerPool.metadata,
-          brokers: brokerPool.metadata.brokers.map(broker =>
+          brokers: brokerPool.metadata.brokers.map((broker) =>
             broker.nodeId === targetNodeId ? { ...broker, rack: 'south-1' } : broker
           ),
         }))
@@ -401,7 +401,7 @@ describe('Cluster > BrokerPool', () => {
 
     it('connects the broker if it is not connected', async () => {
       const nodeId = Object.keys(brokerPool.brokers).find(
-        id => !brokerPool.brokers[id].isConnected()
+        (id) => !brokerPool.brokers[id].isConnected()
       )
       expect(brokerPool.brokers[nodeId].isConnected()).toEqual(false)
 

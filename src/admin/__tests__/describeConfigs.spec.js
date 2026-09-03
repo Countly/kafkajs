@@ -9,11 +9,11 @@ const NOT_CONTROLLER = 41
 describe('Admin', () => {
   let topicName, admin
 
-  const getConfigEntries = response =>
-    response.resources.find(r => r.resourceType === CONFIG_RESOURCE_TYPES.TOPIC).configEntries
+  const getConfigEntries = (response) =>
+    response.resources.find((r) => r.resourceType === CONFIG_RESOURCE_TYPES.TOPIC).configEntries
 
   const getConfigValue = (configEntries, name) =>
-    configEntries.find(c => c.configName === name).configValue
+    configEntries.find((c) => c.configName === name).configValue
 
   beforeEach(() => {
     topicName = `test-topic-${secureRandom()}`

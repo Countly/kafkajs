@@ -62,16 +62,14 @@ const EntriesDecoder = (decoder, compressedMessage) => {
     const baseOffset = compressedOffset - lastMessageOffset
 
     for (const message of messages) {
-      message.offset = Long.fromValue(message.offset)
-        .add(baseOffset)
-        .toString()
+      message.offset = Long.fromValue(message.offset).add(baseOffset).toString()
     }
   }
 
   return messages
 }
 
-const EntryDecoder = decoder => {
+const EntryDecoder = (decoder) => {
   if (!decoder.canReadInt64()) {
     throw new KafkaJSPartialMessageError(
       `Tried to decode a partial message: There isn't enough bytes to read the offset`

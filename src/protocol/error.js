@@ -566,7 +566,7 @@ const errorCodes = [
   },
 ]
 
-const unknownErrorCode = errorCode => ({
+const unknownErrorCode = (errorCode) => ({
   type: 'KAFKAJS_UNKNOWN_ERROR_CODE',
   code: -99,
   retriable: false,
@@ -576,18 +576,18 @@ const unknownErrorCode = errorCode => ({
 const SUCCESS_CODE = 0
 const UNSUPPORTED_VERSION_CODE = 35
 
-const failure = code => code !== SUCCESS_CODE
-const createErrorFromCode = code => {
-  return new KafkaJSProtocolError(errorCodes.find(e => e.code === code) || unknownErrorCode(code))
+const failure = (code) => code !== SUCCESS_CODE
+const createErrorFromCode = (code) => {
+  return new KafkaJSProtocolError(errorCodes.find((e) => e.code === code) || unknownErrorCode(code))
 }
 
-const failIfVersionNotSupported = code => {
+const failIfVersionNotSupported = (code) => {
   if (code === UNSUPPORTED_VERSION_CODE) {
     throw createErrorFromCode(UNSUPPORTED_VERSION_CODE)
   }
 }
 
-const staleMetadata = e =>
+const staleMetadata = (e) =>
   ['UNKNOWN_TOPIC_OR_PARTITION', 'LEADER_NOT_AVAILABLE', 'NOT_LEADER_FOR_PARTITION'].includes(
     e.type
   )

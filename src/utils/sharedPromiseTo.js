@@ -6,7 +6,7 @@
  * Function that may invoke asyncFunction if there is not a currently executing invocation.
  * Returns promise from the currently executing invocation.
  */
-module.exports = asyncFunction => {
+module.exports = (asyncFunction) => {
   let promise = null
 
   return (...args) => {

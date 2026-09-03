@@ -8,27 +8,26 @@ const LEVELS = {
   DEBUG: 5,
 }
 
-const createLevel = (label, level, currentLevel, namespace, logFunction) => (
-  message,
-  extra = {}
-) => {
-  if (level > currentLevel()) return
-  logFunction({
-    namespace,
-    level,
-    label,
-    log: assign(
-      {
-        timestamp: new Date().toISOString(),
-        logger: 'kafkajs',
-        message,
-      },
-      extra
-    ),
-  })
-}
+const createLevel =
+  (label, level, currentLevel, namespace, logFunction) =>
+  (message, extra = {}) => {
+    if (level > currentLevel()) return
+    logFunction({
+      namespace,
+      level,
+      label,
+      log: assign(
+        {
+          timestamp: new Date().toISOString(),
+          logger: 'kafkajs',
+          message,
+        },
+        extra
+      ),
+    })
+  }
 
-const evaluateLogLevel = logLevel => {
+const evaluateLogLevel = (logLevel) => {
   const envLogLevel = (process.env.KAFKAJS_LOG_LEVEL || '').toUpperCase()
   return LEVELS[envLogLevel] == null ? logLevel : LEVELS[envLogLevel]
 }
@@ -53,7 +52,7 @@ const createLogger = ({ level = LEVELS.INFO, logCreator } = {}) => {
 
     return assign(logger, {
       namespace: createNamespace,
-      setLogLevel: newLevel => {
+      setLogLevel: (newLevel) => {
         logLevel = newLevel
       },
     })

@@ -8,7 +8,7 @@ const { MAGIC_BYTE } = require('../../../recordBatch/v0')
 const MAGIC_OFFSET = 16
 const RECORD_BATCH_OVERHEAD = 49
 
-const decodeMessages = async decoder => {
+const decodeMessages = async (decoder) => {
   const messagesSize = decoder.readInt32()
 
   if (messagesSize <= 0 || !decoder.canReadBytes(messagesSize)) {

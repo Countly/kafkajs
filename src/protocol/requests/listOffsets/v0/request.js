@@ -39,8 +39,5 @@ const encodeTopic = ({ topic, partitions }) => {
 }
 
 const encodePartition = ({ partition, timestamp = -1, maxNumOffsets = 1 }) => {
-  return new Encoder()
-    .writeInt32(partition)
-    .writeInt64(timestamp)
-    .writeInt32(maxNumOffsets)
+  return new Encoder().writeInt32(partition).writeInt64(timestamp).writeInt32(maxNumOffsets)
 }

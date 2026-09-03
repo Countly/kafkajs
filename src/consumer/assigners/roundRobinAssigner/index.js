@@ -41,9 +41,9 @@ module.exports = ({ cluster }) => ({
     const sortedMembers = members.map(({ memberId }) => memberId).sort()
     const assignment = {}
 
-    const topicsPartitions = topics.flatMap(topic => {
+    const topicsPartitions = topics.flatMap((topic) => {
       const partitionMetadata = cluster.findTopicPartitionMetadata(topic)
-      return partitionMetadata.map(m => ({ topic, partitionId: m.partitionId }))
+      return partitionMetadata.map((m) => ({ topic, partitionId: m.partitionId }))
     })
 
     topicsPartitions.forEach((topicPartition, i) => {
@@ -60,7 +60,7 @@ module.exports = ({ cluster }) => ({
       assignment[assignee][topicPartition.topic].push(topicPartition.partitionId)
     })
 
-    return Object.keys(assignment).map(memberId => ({
+    return Object.keys(assignment).map((memberId) => ({
       memberId,
       memberAssignment: MemberAssignment.encode({
         version: this.version,

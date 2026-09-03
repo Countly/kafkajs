@@ -1,6 +1,6 @@
 const { classify, formatVersions } = require('../gaps')
 
-const api = overrides =>
+const api = (overrides) =>
   Object.assign(
     {
       validVersions: { min: 0, max: 3 },
@@ -95,7 +95,7 @@ describe('scripts/compat/gaps', () => {
     // reported as the separate onFloor/belowFloor fields, not as gap values. `ahead` and
     // `unknown` are sentinels for input that must never reach the committed output.
     it('produces the five documented gap values and both sentinels, and nothing else', () => {
-      const produced = new Set(cases.map(c => c.expected.gap.replace(/:\d+$/, '')))
+      const produced = new Set(cases.map((c) => c.expected.gap.replace(/:\d+$/, '')))
       expect([...produced].sort()).toEqual([
         'ahead',
         'behind',

@@ -78,13 +78,13 @@ const requests = {
 
 const names = Object.keys(apiKeys)
 const keys = Object.values(apiKeys)
-const findApiName = apiKey => names[keys.indexOf(apiKey)]
+const findApiName = (apiKey) => names[keys.indexOf(apiKey)]
 
 /**
  * @param {import("../../../types").ApiVersions} versions
  * @returns {Lookup}
  */
-const lookup = versions => (apiKey, definition) => {
+const lookup = (versions) => (apiKey, definition) => {
   const version = versions[apiKey]
   const availableVersions = definition.versions.map(Number)
   const bestImplementedVersion = Math.max(...availableVersions)

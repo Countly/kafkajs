@@ -30,8 +30,8 @@ const secureRandom = (length = 10) =>
   `${crypto.randomBytes(length).toString('hex')}-${process.pid}-${randomUUID()}`
 
 // Unsecured JWT (alg "none") accepted by the test broker's OAUTHBEARER unsecured validator.
-const unsecuredJwt = claims => {
-  const encode = obj => Buffer.from(JSON.stringify(obj)).toString('base64url')
+const unsecuredJwt = (claims) => {
+  const encode = (obj) => Buffer.from(JSON.stringify(obj)).toString('base64url')
   const now = Math.floor(Date.now() / 1000)
   return `${encode({ alg: 'none', typ: 'JWT' })}.${encode({
     iat: now,
@@ -190,11 +190,13 @@ const createConnectionBuilder = (opts = {}, brokers = plainTextBrokers()) => {
 const createCluster = (opts = {}, brokers = plainTextBrokers()) =>
   new Cluster(Object.assign(connectionOpts(), opts, { brokers }))
 
-const createModPartitioner = () => ({ partitionMetadata, message }) => {
-  const numPartitions = partitionMetadata.length
-  const key = parseInt(message.key.replace(/[^\d]/g, ''), 10)
-  return ((key || 0) % 3) % numPartitions
-}
+const createModPartitioner =
+  () =>
+  ({ partitionMetadata, message }) => {
+    const numPartitions = partitionMetadata.length
+    const key = parseInt(message.key.replace(/[^\d]/g, ''), 10)
+    return ((key || 0) % 3) % numPartitions
+  }
 
 const testWaitFor = async (fn, opts = {}) => waitFor(fn, { ignoreTimeout: true, ...opts })
 
@@ -235,11 +237,11 @@ const waitForNextEvent = (consumer, eventName, { maxWait = 10000 } = {}) =>
       () => reject(new Error(`Timeout waiting for '${eventName}'`)),
       maxWait
     )
-    consumer.on(eventName, event => {
+    consumer.on(eventName, (event) => {
       clearTimeout(timeoutId)
       resolve(event)
     })
-    consumer.on(consumer.events.CRASH, event => {
+    consumer.on(consumer.events.CRASH, (event) => {
       clearTimeout(timeoutId)
       reject(event.payload.error)
     })
@@ -252,11 +254,11 @@ const waitForConsumerToJoinGroup = (consumer, { maxWait = 10000, label = '' } = 
         reject(new Error(`Timeout ${label}`.trim()))
       })
     }, maxWait)
-    consumer.on(consumer.events.GROUP_JOIN, event => {
+    consumer.on(consumer.events.GROUP_JOIN, (event) => {
       clearTimeout(timeoutId)
       resolve(event)
     })
-    consumer.on(consumer.events.CRASH, event => {
+    consumer.on(consumer.events.CRASH, (event) => {
       clearTimeout(timeoutId)
       consumer.disconnect().then(() => {
         reject(event.payload.error)
@@ -275,7 +277,7 @@ let propagationBrokers = null
 
 const getPropagationBrokers = () => {
   if (!propagationBrokers) {
-    propagationBrokers = plainTextBrokers().map(address => {
+    propagationBrokers = plainTextBrokers().map((address) => {
       const [host, port] = address.split(':')
       return new Broker({
         connectionPool: createConnectionPool({ host, port: Number(port) }),
@@ -291,7 +293,7 @@ const getPropagationBrokers = () => {
 const disconnectPropagationBrokers = async () => {
   const brokers = propagationBrokers
   propagationBrokers = null
-  brokers && (await Promise.all(brokers.map(broker => broker.disconnect())))
+  brokers && (await Promise.all(brokers.map((broker) => broker.disconnect())))
 }
 
 /**
@@ -305,7 +307,7 @@ const disconnectPropagationBrokers = async () => {
  * @returns {Promise<void>}
  */
 const waitForTopicPropagation = async (topic, partitions) => {
-  const servesTopic = async broker => {
+  const servesTopic = async (broker) => {
     let response
     try {
       await broker.connect() // no-op while connected; reconnects a socket the broker closed
@@ -320,8 +322,8 @@ const waitForTopicPropagation = async (topic, partitions) => {
     const topicMetadata = response.topicMetadata.find(({ topic: name }) => name === topic)
     return Boolean(
       topicMetadata &&
-        topicMetadata.partitionMetadata.length === partitions &&
-        topicMetadata.partitionMetadata.every(({ leader }) => leader >= 0)
+      topicMetadata.partitionMetadata.length === partitions &&
+      topicMetadata.partitionMetadata.every(({ leader }) => leader >= 0)
     )
   }
 
@@ -360,7 +362,7 @@ const createTopic = async ({ topic, partitions = 1, replicas = 1, config = [] })
           throw e
         }
 
-        await new Promise(resolve => setTimeout(resolve, CREATE_TOPIC_RETRY_MS))
+        await new Promise((resolve) => setTimeout(resolve, CREATE_TOPIC_RETRY_MS))
       }
     }
   } finally {
@@ -396,8 +398,8 @@ const testIfKafkaVersion = (version, versionComparator) => {
   return scopedTest
 }
 
-const testIfKafkaVersionLTE = version => testIfKafkaVersion(version, semver.lte)
-const testIfKafkaVersionGTE = version => testIfKafkaVersion(version, semver.gte)
+const testIfKafkaVersionLTE = (version) => testIfKafkaVersion(version, semver.lte)
+const testIfKafkaVersionGTE = (version) => testIfKafkaVersion(version, semver.gte)
 
 const testIfKafkaAtMost_0_10 = testIfKafkaVersionLTE('0.10')
 const testIfKafkaAtLeast_0_11 = testIfKafkaVersionGTE('0.11')
@@ -407,17 +409,21 @@ const flakyTest = (description, callback, testFn = test) =>
   testFn(`[flaky] ${description}`, callback)
 flakyTest.skip = (description, callback) => flakyTest(description, callback, test.skip)
 flakyTest.only = (description, callback) => flakyTest(description, callback, test.only)
-const describeIfEnv = (key, value) => (description, callback, describeFn = describe) => {
-  return value === process.env[key]
-    ? describeFn(description, callback)
-    : describe.skip(description, callback)
-}
+const describeIfEnv =
+  (key, value) =>
+  (description, callback, describeFn = describe) => {
+    return value === process.env[key]
+      ? describeFn(description, callback)
+      : describe.skip(description, callback)
+  }
 
-const describeIfNotEnv = (key, value) => (description, callback, describeFn = describe) => {
-  return value !== process.env[key]
-    ? describeFn(description, callback)
-    : describe.skip(description, callback)
-}
+const describeIfNotEnv =
+  (key, value) =>
+  (description, callback, describeFn = describe) => {
+    return value !== process.env[key]
+      ? describeFn(description, callback)
+      : describe.skip(description, callback)
+  }
 
 /**
  * Conditional describes for SASL OAUTHBEARER.
@@ -431,7 +437,7 @@ const unsupportedVersionResponse = () => Buffer.from({ type: 'Buffer', data: [0,
 const unsupportedVersionResponseWithTimeout = () =>
   Buffer.from({ type: 'Buffer', data: [0, 0, 0, 0, 0, 35] })
 
-const generateMessages = options => {
+const generateMessages = (options) => {
   const { prefix, number = 100 } = options || {}
   const prefixOrEmpty = prefix ? `-${prefix}` : ''
 

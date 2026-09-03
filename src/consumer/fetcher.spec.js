@@ -11,11 +11,11 @@ describe('Fetcher', () => {
   let fetcher, fetch, handler, workerIds, workers, workerQueue, logger, fetcherAssignments
 
   beforeEach(() => {
-    fetch = jest.fn(async nodeId => {
+    fetch = jest.fn(async (nodeId) => {
       await sleep(1)
       return seq(
         10,
-        index =>
+        (index) =>
           new Batch('test-topic', 0, {
             partition: `${nodeId}${index}`,
             highWatermark: '100',
@@ -31,7 +31,7 @@ describe('Fetcher', () => {
     logger = newLogger()
     workerIds = seq(5)
     const workerAssignments = new Map()
-    workers = workerIds.map(workerId =>
+    workers = workerIds.map((workerId) =>
       createWorker({ workerId, handler, partitionAssignments: workerAssignments, logger })
     )
     workerQueue = createWorkerQueue({ workers })
@@ -65,7 +65,7 @@ describe('Fetcher', () => {
     await fetcher.stop()
 
     const calledWorkerIds = handler.mock.calls.map(([, { workerId }]) => workerId)
-    workerIds.forEach(workerId => {
+    workerIds.forEach((workerId) => {
       expect(calledWorkerIds).toContain(workerId)
     })
   })
@@ -74,19 +74,19 @@ describe('Fetcher', () => {
     let fetchers
 
     afterEach(async () => {
-      fetchers && (await Promise.all(fetchers.map(f => f.stop())))
+      fetchers && (await Promise.all(fetchers.map((f) => f.stop())))
     })
 
     it('should filter out batches currently processed by another fetcher', async () => {
       const batches = seq(2).map(
-        index =>
+        (index) =>
           new Batch('test-topic', 0, {
             partition: index.toString(),
             highWatermark: '100',
             messages: [],
           })
       )
-      const fetch = jest.fn(async _ => {
+      const fetch = jest.fn(async (_) => {
         await sleep(1)
         const batch = batches.pop()
 
@@ -101,7 +101,7 @@ describe('Fetcher', () => {
         })
         return [reassignedPartition, batch]
       })
-      const fetchers = seq(2).map(index =>
+      const fetchers = seq(2).map((index) =>
         createFetcher({
           nodeId: index,
           fetch,
@@ -111,10 +111,10 @@ describe('Fetcher', () => {
         })
       )
 
-      fetchers.forEach(fetcher => fetcher.start())
+      fetchers.forEach((fetcher) => fetcher.start())
 
       await waitFor(() => handler.mock.calls.length >= 3)
-      await Promise.all(fetchers.map(fetcher => fetcher.stop()))
+      await Promise.all(fetchers.map((fetcher) => fetcher.stop()))
 
       expect(handler).toHaveBeenCalledTimes(3)
     })

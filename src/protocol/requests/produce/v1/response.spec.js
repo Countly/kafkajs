@@ -29,22 +29,15 @@ describe('Protocol > Requests > Produce > v1', () => {
     test('decode', async () => {
       const encoded = new Encoder()
         .writeArray([
-          new Encoder().writeString('test-topic-1').writeArray([
-            new Encoder()
-              .writeInt32(0)
-              .writeInt16(0)
-              .writeInt64(16),
-            new Encoder()
-              .writeInt32(1)
-              .writeInt16(0)
-              .writeInt64(2),
-          ]),
-          new Encoder().writeString('test-topic-2').writeArray([
-            new Encoder()
-              .writeInt32(4)
-              .writeInt16(0)
-              .writeInt64(11),
-          ]),
+          new Encoder()
+            .writeString('test-topic-1')
+            .writeArray([
+              new Encoder().writeInt32(0).writeInt16(0).writeInt64(16),
+              new Encoder().writeInt32(1).writeInt16(0).writeInt64(2),
+            ]),
+          new Encoder()
+            .writeString('test-topic-2')
+            .writeArray([new Encoder().writeInt32(4).writeInt16(0).writeInt64(11)]),
         ])
         .writeInt32(1000)
 

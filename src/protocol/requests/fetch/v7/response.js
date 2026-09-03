@@ -22,12 +22,12 @@ const decodeMessages = require('../v4/decodeMessages')
  *       record_set => RECORDS
  */
 
-const decodeAbortedTransactions = decoder => ({
+const decodeAbortedTransactions = (decoder) => ({
   producerId: decoder.readInt64().toString(),
   firstOffset: decoder.readInt64().toString(),
 })
 
-const decodePartition = async decoder => ({
+const decodePartition = async (decoder) => ({
   partition: decoder.readInt32(),
   errorCode: decoder.readInt16(),
   highWatermark: decoder.readInt64().toString(),
@@ -37,12 +37,12 @@ const decodePartition = async decoder => ({
   messages: await decodeMessages(decoder),
 })
 
-const decodeResponse = async decoder => ({
+const decodeResponse = async (decoder) => ({
   topicName: decoder.readString(),
   partitions: await decoder.readArrayAsync(decodePartition),
 })
 
-const decode = async rawData => {
+const decode = async (rawData) => {
   const decoder = new Decoder(rawData)
   const throttleTime = decoder.readInt32()
   const errorCode = decoder.readInt16()

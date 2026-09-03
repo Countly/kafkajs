@@ -16,7 +16,7 @@ const { CONNECT, DISCONNECT, STOP, CRASH } = events
 
 const eventNames = values(events)
 const eventKeys = keys(events)
-  .map(key => `consumer.events.${key}`)
+  .map((key) => `consumer.events.${key}`)
   .join(', ')
 
 const specialOffsets = [
@@ -69,7 +69,7 @@ module.exports = ({
 
   const logger = rootLogger.namespace('Consumer')
   const instrumentationEmitter = rootInstrumentationEmitter || new InstrumentationEventEmitter()
-  const assigners = partitionAssigners.map(createAssigner =>
+  const assigners = partitionAssigners.map((createAssigner) =>
     createAssigner({ groupId, logger, cluster })
   )
 
@@ -154,7 +154,9 @@ module.exports = ({
       }
     }
 
-    const hasRegexSubscriptions = subscriptions.some(subscription => subscription instanceof RegExp)
+    const hasRegexSubscriptions = subscriptions.some(
+      (subscription) => subscription instanceof RegExp
+    )
     const metadata = hasRegexSubscriptions ? await cluster.metadata() : undefined
 
     const topicsToSubscribe = []
@@ -164,7 +166,7 @@ module.exports = ({
         const topicRegExp = subscription
         const matchedTopics = metadata.topicMetadata
           .map(({ topic: topicName }) => topicName)
-          .filter(topicName => topicRegExp.test(topicName))
+          .filter((topicName) => topicRegExp.test(topicName))
 
         logger.debug('Subscription based on RegExp', {
           groupId,
@@ -200,7 +202,7 @@ module.exports = ({
       return
     }
 
-    const start = async onCrash => {
+    const start = async (onCrash) => {
       logger.info('Starting', { groupId })
 
       consumerGroup = new ConsumerGroup({
@@ -243,7 +245,7 @@ module.exports = ({
       await runner.start()
     }
 
-    const onCrash = async e => {
+    const onCrash = async (e) => {
       logger.error(`Crash: ${e.name}: ${e.message}`, {
         groupId,
         retryCount: e.retryCount,
@@ -256,7 +258,7 @@ module.exports = ({
 
       await disconnect()
 
-      const getOriginalCause = error => {
+      const getOriginalCause = (error) => {
         if (error.cause) {
           return getOriginalCause(error.cause)
         }
@@ -270,7 +272,7 @@ module.exports = ({
         isErrorRetriable &&
         (!retry ||
           !retry.restartOnFailure ||
-          (await retry.restartOnFailure(e).catch(error => {
+          (await retry.restartOnFailure(e).catch((error) => {
             logger.error(
               'Caught error when invoking user-provided "restartOnFailure" callback. Defaulting to restarting.',
               {
@@ -310,9 +312,9 @@ module.exports = ({
       throw new KafkaJSNonRetriableError(`Event name should be one of ${eventKeys}`)
     }
 
-    return instrumentationEmitter.addListener(unwrapEvent(eventName), event => {
+    return instrumentationEmitter.addListener(unwrapEvent(eventName), (event) => {
       event.type = wrapEvent(event.type)
-      Promise.resolve(listener(event)).catch(e => {
+      Promise.resolve(listener(event)).catch((e) => {
         logger.error(`Failed to execute listener: ${e.message}`, {
           eventName,
           stack: e.stack,
@@ -374,7 +376,7 @@ module.exports = ({
     const topics = Object.keys(commitsByTopic)
 
     return runner.commitOffsets({
-      topics: topics.map(topic => {
+      topics: topics.map((topic) => {
         return {
           topic,
           partitions: commitsByTopic[topic],
@@ -421,7 +423,7 @@ module.exports = ({
     const retrier = createRetry(retry)
     return retrier(async () => {
       const { groups } = await coordinator.describeGroups({ groupIds: [groupId] })
-      return groups.find(group => group.groupId === groupId)
+      return groups.find((group) => group.groupId === groupId)
     })
   }
 

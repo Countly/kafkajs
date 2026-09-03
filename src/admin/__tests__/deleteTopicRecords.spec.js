@@ -164,7 +164,7 @@ describe('Admin > deleteTopicRecords', () => {
     const messagesConsumed = []
     await admin.deleteTopicRecords({ topic: topicName, partitions: recordsToDelete })
     consumer.run({
-      eachMessage: async event => {
+      eachMessage: async (event) => {
         messagesConsumed.push(event)
       },
     })
@@ -299,9 +299,7 @@ describe('Admin > deleteTopicRecords', () => {
     await admin.deleteTopicRecords({ topic: topicName, partitions: recordsToDelete })
 
     expect(logger.warn).toHaveBeenCalledTimes(1)
-    expect(
-      logger.warn
-    ).toHaveBeenCalledWith(
+    expect(logger.warn).toHaveBeenCalledWith(
       'The requested offset is before the earliest offset maintained on the partition - no records will be deleted from this partition',
       { topic: topicName, partition: 1, offset: '3' }
     )

@@ -66,10 +66,7 @@ module.exports = ({ acks, timeout, topicData }) => ({
   apiName: 'Produce',
   expectResponse: () => acks !== 0,
   encode: async () => {
-    return new Encoder()
-      .writeInt16(acks)
-      .writeInt32(timeout)
-      .writeArray(topicData.map(encodeTopic))
+    return new Encoder().writeInt16(acks).writeInt32(timeout).writeArray(topicData.map(encodeTopic))
   },
 })
 
@@ -79,8 +76,5 @@ const encodeTopic = ({ topic, partitions }) => {
 
 const encodePartitions = ({ partition, messages }) => {
   const messageSet = MessageSet({ messageVersion: 0, entries: messages })
-  return new Encoder()
-    .writeInt32(partition)
-    .writeInt32(messageSet.size())
-    .writeEncoder(messageSet)
+  return new Encoder().writeInt32(partition).writeInt32(messageSet.size()).writeEncoder(messageSet)
 }

@@ -8,12 +8,12 @@ const { failure, createErrorFromCode } = require('../../../error')
  *    error_code => INT16
  */
 
-const decodeGroup = decoder => ({
+const decodeGroup = (decoder) => ({
   groupId: decoder.readString(),
   errorCode: decoder.readInt16(),
 })
 
-const decode = async rawData => {
+const decode = async (rawData) => {
   const decoder = new Decoder(rawData)
   const throttleTimeMs = decoder.readInt32()
   const results = decoder.readArray(decodeGroup)
@@ -29,7 +29,7 @@ const decode = async rawData => {
   }
 }
 
-const parse = async data => {
+const parse = async (data) => {
   return data
 }
 

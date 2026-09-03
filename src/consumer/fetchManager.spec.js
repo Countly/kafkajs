@@ -9,15 +9,15 @@ const { KafkaJSNonRetriableError, KafkaJSNoBrokerAvailableError } = require('../
 describe('FetchManager', () => {
   let fetchManager, fetch, handler, getNodeIds, concurrency, batchSize
 
-  const createTestFetchManager = partial =>
+  const createTestFetchManager = (partial) =>
     createFetchManager({ logger: newLogger(), concurrency, fetch, handler, getNodeIds, ...partial })
 
   beforeEach(() => {
     batchSize = 10
-    fetch = jest.fn(async nodeId =>
+    fetch = jest.fn(async (nodeId) =>
       seq(
         batchSize,
-        id =>
+        (id) =>
           new Batch('test-topic', 0, {
             partition: `${nodeId}${id}`,
             highWatermark: '100',
@@ -76,7 +76,7 @@ describe('FetchManager', () => {
 
   describe('when all brokers have become unavailable', () => {
     it('should not rebalance and let the error bubble up', async () => {
-      const fetchMock = jest.fn().mockImplementation(async nodeId => {
+      const fetchMock = jest.fn().mockImplementation(async (nodeId) => {
         if (!getNodeIds().includes(nodeId)) {
           throw new KafkaJSNonRetriableError('Node not found')
         }

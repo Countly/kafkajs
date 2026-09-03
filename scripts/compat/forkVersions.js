@@ -19,17 +19,17 @@ const numeric = (a, b) => a - b
 const versionDirs = (requestsDir, forkName) =>
   fs
     .readdirSync(path.join(requestsDir, forkName), { withFileTypes: true })
-    .filter(entry => entry.isDirectory() && /^v\d+$/.test(entry.name))
-    .map(entry => Number(entry.name.slice(1)))
+    .filter((entry) => entry.isDirectory() && /^v\d+$/.test(entry.name))
+    .map((entry) => Number(entry.name.slice(1)))
     .sort(numeric)
 
 /** Top-level directories that are request definitions (they export an index.js). */
-const requestDirectories = requestsDir =>
+const requestDirectories = (requestsDir) =>
   fs
     .readdirSync(requestsDir, { withFileTypes: true })
-    .filter(entry => entry.isDirectory())
-    .map(entry => entry.name)
-    .filter(name => fs.existsSync(path.join(requestsDir, name, 'index.js')))
+    .filter((entry) => entry.isDirectory())
+    .map((entry) => entry.name)
+    .filter((name) => fs.existsSync(path.join(requestsDir, name, 'index.js')))
     .sort()
 
 const finding = (level, code, message) => ({ level, code, message })
@@ -40,7 +40,7 @@ const finding = (level, code, message) => ({ level, code, message })
  * Covers tracked APIs only — an API missing from tracked-apis.json is reported by the
  * unknown-directory/unknown-api-key findings above, but never introspected itself.
  */
-const introspect = input => {
+const introspect = (input) => {
   const { trackedApis, requestsDir, requests, apiKeys } = input
   const entries = trackedApis.tracked.concat(trackedApis.untracked)
   const findings = []
@@ -122,7 +122,7 @@ const introspect = input => {
   return { apis, findings }
 }
 
-const readFork = trackedApis =>
+const readFork = (trackedApis) =>
   introspect({
     trackedApis,
     requestsDir: REQUESTS_DIR,

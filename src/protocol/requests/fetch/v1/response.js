@@ -15,19 +15,19 @@ const MessageSetDecoder = require('../../../messageSet/decoder')
  *       record_set => RECORDS
  */
 
-const decodePartition = async decoder => ({
+const decodePartition = async (decoder) => ({
   partition: decoder.readInt32(),
   errorCode: decoder.readInt16(),
   highWatermark: decoder.readInt64().toString(),
   messages: await MessageSetDecoder(decoder),
 })
 
-const decodeResponse = async decoder => ({
+const decodeResponse = async (decoder) => ({
   topicName: decoder.readString(),
   partitions: await decoder.readArrayAsync(decodePartition),
 })
 
-const decode = async rawData => {
+const decode = async (rawData) => {
   const decoder = new Decoder(rawData)
   const throttleTime = decoder.readInt32()
   const responses = await decoder.readArrayAsync(decodeResponse)

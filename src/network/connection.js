@@ -18,7 +18,7 @@ const requestInfo = ({ apiName, apiKey, apiVersion }) =>
  * @param request - request from protocol
  * @returns {boolean}
  */
-const isAuthenticatedRequest = request => {
+const isAuthenticatedRequest = (request) => {
   return ![apiKeys.ApiVersions, apiKeys.SaslHandshake, apiKeys.SaslAuthenticate].includes(
     request.apiKey
   )
@@ -106,10 +106,12 @@ module.exports = class Connection {
     this.authHandlers = null
     this.authExpectResponse = false
 
-    const log = level => (message, extra = {}) => {
-      const logFn = this.logger[level]
-      logFn(message, { broker: this.broker, clientId, ...extra })
-    }
+    const log =
+      (level) =>
+      (message, extra = {}) => {
+        const logFn = this.logger[level]
+        logFn(message, { broker: this.broker, clientId, ...extra })
+      }
 
     this.logDebug = log('debug')
     this.logError = log('error')
@@ -180,7 +182,7 @@ module.exports = class Connection {
         resolve(true)
       }
 
-      const onData = data => {
+      const onData = (data) => {
         this.processData(data)
       }
 
@@ -204,7 +206,7 @@ module.exports = class Connection {
         await this.disconnect()
       }
 
-      const onError = async e => {
+      const onError = async (e) => {
         clearTimeout(timeoutId)
 
         const error = new KafkaJSConnectionError(`Connection error: ${e.message}`, {
@@ -329,13 +331,13 @@ module.exports = class Connection {
     /* eslint-disable no-async-promise-executor */
     return new Promise(async (resolve, reject) => {
       this.authHandlers = {
-        onSuccess: rawData => {
+        onSuccess: (rawData) => {
           this.authHandlers = null
           this.authExpectResponse = false
 
           response
             .decode(rawData)
-            .then(data => response.parse(data))
+            .then((data) => response.parse(data))
             .then(resolve)
             .catch(reject)
         },

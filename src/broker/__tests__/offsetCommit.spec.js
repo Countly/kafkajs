@@ -30,7 +30,7 @@ describe('Broker > OffsetCommit', () => {
 
     // Find leader of partition
     const partitionBroker = metadata.topicMetadata[0].partitionMetadata[0].leader
-    const newBrokerData = metadata.brokers.find(b => b.nodeId === partitionBroker)
+    const newBrokerData = metadata.brokers.find((b) => b.nodeId === partitionBroker)
 
     // Connect to the correct broker to produce message
     broker = new Broker({

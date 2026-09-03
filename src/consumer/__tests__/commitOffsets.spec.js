@@ -96,7 +96,7 @@ describe('Consumer', () => {
       await consumer.subscribe({ topic: topicName, fromBeginning: true })
       consumer.run({
         autoCommit: false,
-        eachMessage: async event => {
+        eachMessage: async (event) => {
           offsetsConsumed.push(event.message.offset)
           if (offsetsConsumed.length === 1) {
             await consumer.commitOffsets([{ topic: topicName, partition: 0, offset: '1' }])

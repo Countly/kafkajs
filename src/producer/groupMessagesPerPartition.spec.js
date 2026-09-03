@@ -29,9 +29,9 @@ describe('Producer > groupMessagesPerPartition', () => {
   test('group messages per partition', () => {
     const result = groupMessagesPerPartition({ topic, partitionMetadata, messages, partitioner })
     expect(result).toEqual({
-      '0': [{ key: '3' }, { key: '6' }, { key: '9' }],
-      '1': [{ key: '1' }, { key: '4' }, { key: '7' }],
-      '2': [{ key: '2' }, { key: '5' }, { key: '8' }],
+      0: [{ key: '3' }, { key: '6' }, { key: '9' }],
+      1: [{ key: '1' }, { key: '4' }, { key: '7' }],
+      2: [{ key: '2' }, { key: '5' }, { key: '8' }],
     })
   })
 

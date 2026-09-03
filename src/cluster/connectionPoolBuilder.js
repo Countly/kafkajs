@@ -39,11 +39,11 @@ module.exports = ({
 }) => {
   let index = 0
 
-  const isValidBroker = broker => {
+  const isValidBroker = (broker) => {
     return broker && typeof broker === 'string' && broker.length > 0
   }
 
-  const validateBrokers = brokers => {
+  const validateBrokers = (brokers) => {
     if (!brokers) {
       throw new KafkaJSNonRetriableError(`Failed to connect: brokers should not be null`)
     }

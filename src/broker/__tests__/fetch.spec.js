@@ -25,7 +25,7 @@ const timestamp = 1509827900073
 describe('Broker > Fetch', () => {
   let topicName, seedBroker, broker, newBrokerData
 
-  const headerFor = message => {
+  const headerFor = (message) => {
     const keys = Object.keys(message.headers)
     return { [keys[0]]: Buffer.from(message.headers[keys[0]]) }
   }
@@ -96,7 +96,7 @@ describe('Broker > Fetch', () => {
 
     // Find leader of partition
     const partitionBroker = metadata.topicMetadata[0].partitionMetadata[0].leader
-    newBrokerData = metadata.brokers.find(b => b.nodeId === partitionBroker)
+    newBrokerData = metadata.brokers.find((b) => b.nodeId === partitionBroker)
 
     // Connect to the correct broker to produce message
     broker = new Broker({
@@ -564,7 +564,7 @@ describe('Broker > Fetch', () => {
       'returns transactional messages only after transaction has ended for an isolation level of "read_committed" (default)',
       async () => {
         const targetPartition = 0
-        const messages = generateMessages({ prefix: 'aborted', number: 3 }).map(m => ({
+        const messages = generateMessages({ prefix: 'aborted', number: 3 }).map((m) => ({
           ...m,
           partition: targetPartition,
         }))
@@ -721,7 +721,7 @@ describe('Broker > Fetch', () => {
       'returns transactional messages immediately for an isolation level of "read_uncommitted"',
       async () => {
         const targetPartition = 0
-        const messages = generateMessages({ prefix: 'aborted', number: 3 }).map(m => ({
+        const messages = generateMessages({ prefix: 'aborted', number: 3 }).map((m) => ({
           ...m,
           partition: targetPartition,
         }))

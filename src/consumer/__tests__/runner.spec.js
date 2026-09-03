@@ -24,7 +24,7 @@ describe('Consumer > Runner', () => {
     emptyBatch,
     instrumentationEmitter
 
-  const createTestRunner = partial => {
+  const createTestRunner = (partial) => {
     return new Runner({
       consumerGroup,
       onCrash,
@@ -281,7 +281,7 @@ describe('Consumer > Runner', () => {
       })
 
       const longRunningRequest = () =>
-        new Promise(resolve => {
+        new Promise((resolve) => {
           setTimeout(() => resolve([]), 100)
         })
 
@@ -303,7 +303,7 @@ describe('Consumer > Runner', () => {
       })
 
       const longRunningRequest = () =>
-        new Promise(resolve => {
+        new Promise((resolve) => {
           setTimeout(() => resolve([]), 100)
         })
 

@@ -6,7 +6,7 @@ const {
 } = require('../instrumentationEvents')
 
 const { keys, assign } = Object
-const indexTopics = topics => topics.reduce((obj, topic) => assign(obj, { [topic]: {} }), {})
+const indexTopics = (topics) => topics.reduce((obj, topic) => assign(obj, { [topic]: {} }), {})
 
 const PRIVATE = {
   COMMITTED_OFFSETS: Symbol('private:OffsetManager:committedOffsets'),
@@ -104,9 +104,7 @@ module.exports = class OffsetManager {
    * @param {import("../../../types").TopicPartitionOffset} topicPartitionOffset
    */
   resolveOffset({ topic, partition, offset }) {
-    this.resolvedOffsets[topic][partition] = Long.fromValue(offset)
-      .add(1)
-      .toString()
+    this.resolvedOffsets[topic][partition] = Long.fromValue(offset).add(1).toString()
   }
 
   /**
@@ -123,11 +121,11 @@ module.exports = class OffsetManager {
     }
 
     const subtractPartitionOffsets = (resolvedTopicOffsets, committedTopicOffsets) =>
-      keys(resolvedTopicOffsets).map(partition =>
+      keys(resolvedTopicOffsets).map((partition) =>
         subtractOffsets(resolvedTopicOffsets[partition], committedTopicOffsets[partition])
       )
 
-    const subtractTopicOffsets = topic =>
+    const subtractTopicOffsets = (topic) =>
       subtractPartitionOffsets(this.resolvedOffsets[topic], committedOffsets[topic])
 
     const offsetsDiff = this.topics.flatMap(subtractTopicOffsets)
@@ -172,9 +170,7 @@ module.exports = class OffsetManager {
       this.resolveOffset({
         topic,
         partition,
-        offset: Long.fromValue(offset)
-          .subtract(1)
-          .toString(),
+        offset: Long.fromValue(offset).subtract(1).toString(),
       })
       return
     }
@@ -217,26 +213,26 @@ module.exports = class OffsetManager {
    * @returns {import('../../../types').OffsetsByTopicPartition}
    */
   uncommittedOffsets() {
-    const offsets = topic => keys(this.resolvedOffsets[topic])
+    const offsets = (topic) => keys(this.resolvedOffsets[topic])
     const emptyPartitions = ({ partitions }) => partitions.length > 0
-    const toPartitions = topic => partition => ({
+    const toPartitions = (topic) => (partition) => ({
       partition,
       offset: this.resolvedOffsets[topic][partition],
     })
-    const changedOffsets = topic => ({ partition, offset }) => {
-      return (
-        offset !== this.committedOffsets()[topic][partition] &&
-        Long.fromValue(offset).greaterThanOrEqual(0)
-      )
-    }
+    const changedOffsets =
+      (topic) =>
+      ({ partition, offset }) => {
+        return (
+          offset !== this.committedOffsets()[topic][partition] &&
+          Long.fromValue(offset).greaterThanOrEqual(0)
+        )
+      }
 
     // Select and format updated partitions
     const topicsWithPartitionsToCommit = this.topics
-      .map(topic => ({
+      .map((topic) => ({
         topic,
-        partitions: offsets(topic)
-          .map(toPartitions(topic))
-          .filter(changedOffsets(topic)),
+        partitions: offsets(topic).map(toPartitions(topic)).filter(changedOffsets(topic)),
       }))
       .filter(emptyPartitions)
 
@@ -292,18 +288,18 @@ module.exports = class OffsetManager {
 
   async resolveOffsets() {
     const { groupId } = this
-    const invalidOffset = topic => partition => {
+    const invalidOffset = (topic) => (partition) => {
       return isInvalidOffset(this.committedOffsets()[topic][partition])
     }
 
     const pendingPartitions = this.topics
-      .map(topic => ({
+      .map((topic) => ({
         topic,
         partitions: this.memberAssignment[topic]
           .filter(invalidOffset(topic))
-          .map(partition => ({ partition })),
+          .map((partition) => ({ partition })),
       }))
-      .filter(t => t.partitions.length > 0)
+      .filter((t) => t.partitions.length > 0)
 
     if (pendingPartitions.length === 0) {
       return
@@ -331,7 +327,7 @@ module.exports = class OffsetManager {
       return assign(obj, { [partition]: offset })
     }
 
-    const hasUnresolvedPartitions = () => unresolvedPartitions.some(t => t.partitions.length > 0)
+    const hasUnresolvedPartitions = () => unresolvedPartitions.some((t) => t.partitions.length > 0)
 
     let offsets = consumerOffsets
     if (hasUnresolvedPartitions()) {

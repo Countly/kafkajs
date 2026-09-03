@@ -9,7 +9,7 @@ describe('Protocol > Requests', () => {
         return
       }
 
-      impls.versions.forEach(version => {
+      impls.versions.forEach((version) => {
         test(`${apiName} > v${version} > metadata`, () => {
           const { request } = impls.protocol({ version })({})
           expect(request.apiKey).toEqual(apiKeys[apiName])

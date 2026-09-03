@@ -23,7 +23,7 @@ describe('Admin', () => {
     groupId = `consumer-group-id-${secureRandom()}`
 
     await Promise.all(
-      [topicName, anotherTopicName, yetAnotherTopicName].map(topic =>
+      [topicName, anotherTopicName, yetAnotherTopicName].map((topic) =>
         createTopic({ topic, numPartitions: 1 })
       )
     )
@@ -161,7 +161,7 @@ describe('Admin', () => {
         consumer.run({ eachMessage: () => {} })
         await waitForConsumerToJoinGroup(consumer)
 
-        const firstBatchProcessed = new Promise(resolve => {
+        const firstBatchProcessed = new Promise((resolve) => {
           consumer.on(consumer.events.END_BATCH_PROCESS, async () => {
             // stop the consumer after the first batch, so only 5 are committed
             await consumer.stop()

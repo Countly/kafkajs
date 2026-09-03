@@ -12,13 +12,13 @@ const { parse: parseV0 } = require('../v0/response')
  *   throttle_time_ms => INT32
  */
 
-const apiVersion = decoder => ({
+const apiVersion = (decoder) => ({
   apiKey: decoder.readInt16(),
   minVersion: decoder.readInt16(),
   maxVersion: decoder.readInt16(),
 })
 
-const decode = async rawData => {
+const decode = async (rawData) => {
   const decoder = new Decoder(rawData)
   const errorCode = decoder.readInt16()
 

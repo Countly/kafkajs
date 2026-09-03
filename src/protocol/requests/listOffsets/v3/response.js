@@ -14,7 +14,7 @@ const { parse, decode: decodeV2 } = require('../v2/response')
  *       timestamp => INT64
  *       offset => INT64
  */
-const decode = async rawData => {
+const decode = async (rawData) => {
   const decoded = await decodeV2(rawData)
 
   return {

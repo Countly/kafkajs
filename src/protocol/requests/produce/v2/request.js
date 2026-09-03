@@ -19,14 +19,11 @@ module.exports = ({ acks, timeout, compression = Types.None, topicData }) => ({
       encodedTopicData.push(await encodeTopic(data))
     }
 
-    return new Encoder()
-      .writeInt16(acks)
-      .writeInt32(timeout)
-      .writeArray(encodedTopicData)
+    return new Encoder().writeInt16(acks).writeInt32(timeout).writeArray(encodedTopicData)
   },
 })
 
-const topicEncoder = compression => {
+const topicEncoder = (compression) => {
   const encodePartitions = partitionsEncoder(compression)
 
   return async ({ topic, partitions }) => {
@@ -40,27 +37,29 @@ const topicEncoder = compression => {
   }
 }
 
-const partitionsEncoder = compression => async ({ partition, messages }) => {
-  const messageSet = MessageSet({ messageVersion: 1, compression, entries: messages })
+const partitionsEncoder =
+  (compression) =>
+  async ({ partition, messages }) => {
+    const messageSet = MessageSet({ messageVersion: 1, compression, entries: messages })
 
-  if (compression === Types.None) {
+    if (compression === Types.None) {
+      return new Encoder()
+        .writeInt32(partition)
+        .writeInt32(messageSet.size())
+        .writeEncoder(messageSet)
+    }
+
+    const timestamp = messages[0].timestamp || Date.now()
+
+    const codec = lookupCodec(compression)
+    const compressedValue = await codec.compress(messageSet)
+    const compressedMessageSet = MessageSet({
+      messageVersion: 1,
+      entries: [{ compression, timestamp, value: compressedValue }],
+    })
+
     return new Encoder()
       .writeInt32(partition)
-      .writeInt32(messageSet.size())
-      .writeEncoder(messageSet)
+      .writeInt32(compressedMessageSet.size())
+      .writeEncoder(compressedMessageSet)
   }
-
-  const timestamp = messages[0].timestamp || Date.now()
-
-  const codec = lookupCodec(compression)
-  const compressedValue = await codec.compress(messageSet)
-  const compressedMessageSet = MessageSet({
-    messageVersion: 1,
-    entries: [{ compression, timestamp, value: compressedValue }],
-  })
-
-  return new Encoder()
-    .writeInt32(partition)
-    .writeInt32(compressedMessageSet.size())
-    .writeEncoder(compressedMessageSet)
-}

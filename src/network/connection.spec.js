@@ -139,7 +139,7 @@ describe('Network > Connection', () => {
       connection = new Connection(connectionOpts({ maxInFlightRequests: 2 }))
       const originalProcessData = connection.processData
 
-      connection.processData = async data => {
+      connection.processData = async (data) => {
         await sleep(100)
         originalProcessData.apply(connection, [data])
       }
@@ -173,7 +173,7 @@ describe('Network > Connection', () => {
       )
       const originalProcessData = connection.processData
 
-      connection.processData = async data => {
+      connection.processData = async (data) => {
         await sleep(100)
         originalProcessData.apply(connection, [data])
       }

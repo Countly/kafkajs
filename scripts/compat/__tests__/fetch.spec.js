@@ -3,18 +3,18 @@ const path = require('path')
 const { parseErrorsJava, messageFiles, discover, safeDiscover } = require('../fetch')
 const trackedApis = require('../tracked-apis.json')
 
-const readFixture = name => fs.readFileSync(path.join(__dirname, 'fixtures', name), 'utf8')
+const readFixture = (name) => fs.readFileSync(path.join(__dirname, 'fixtures', name), 'utf8')
 
 describe('scripts/compat/fetch', () => {
   describe('parseErrorsJava', () => {
     const errors = parseErrorsJava(readFixture('ErrorsSample.java'))
 
     it('reads every constant shape, sorted by code', () => {
-      expect(errors.map(e => e.code)).toEqual([-1, 0, 1, 6, 129])
+      expect(errors.map((e) => e.code)).toEqual([-1, 0, 1, 6, 129])
     })
 
     it('reads a lambda-factory constant with a null message', () => {
-      expect(errors.find(e => e.code === 0)).toEqual({
+      expect(errors.find((e) => e.code === 0)).toEqual({
         type: 'NONE',
         code: 0,
         exception: null,
@@ -23,7 +23,7 @@ describe('scripts/compat/fetch', () => {
     })
 
     it('joins a message split across concatenated literals', () => {
-      const notLeader = errors.find(e => e.code === 6)
+      const notLeader = errors.find((e) => e.code === 6)
       expect(notLeader.type).toBe('NOT_LEADER_OR_FOLLOWER')
       expect(notLeader.exception).toBe('NotLeaderOrFollowerException')
       expect(notLeader.message).toBe(
@@ -33,7 +33,7 @@ describe('scripts/compat/fetch', () => {
     })
 
     it('stops at the end of the constant list', () => {
-      expect(errors.map(e => e.type)).not.toContain('CLASS_TO_ERROR')
+      expect(errors.map((e) => e.type)).not.toContain('CLASS_TO_ERROR')
     })
 
     it('rejects a file whose enum declaration is missing', () => {

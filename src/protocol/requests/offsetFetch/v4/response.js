@@ -16,7 +16,7 @@ const { parse, decode: decodeV3 } = require('../v3/response')
  *   error_code => INT16
  */
 
-const decode = async rawData => {
+const decode = async (rawData) => {
   const decoded = await decodeV3(rawData)
 
   return {

@@ -9,7 +9,7 @@ const randomBytes = require('./randomBytes')
  * positive value is the original value bit AND against 0x7fffffff which is not its absolutely
  * value.
  */
-const toPositive = x => x & 0x7fffffff
+const toPositive = (x) => x & 0x7fffffff
 
 /**
  * The default partitioning strategy:
@@ -17,7 +17,7 @@ const toPositive = x => x & 0x7fffffff
  *  - If no partition is specified but a key is present choose a partition based on a hash of the key
  *  - If no partition or key is present choose a partition in a round-robin fashion
  */
-module.exports = murmur2 => () => {
+module.exports = (murmur2) => () => {
   const counters = {}
 
   return ({ topic, partitionMetadata, message }) => {
@@ -25,7 +25,7 @@ module.exports = murmur2 => () => {
       counters[topic] = randomBytes(32).readUInt32BE(0)
     }
     const numPartitions = partitionMetadata.length
-    const availablePartitions = partitionMetadata.filter(p => p.leader >= 0)
+    const availablePartitions = partitionMetadata.filter((p) => p.leader >= 0)
     const numAvailablePartitions = availablePartitions.length
 
     if (message.partition !== null && message.partition !== undefined) {

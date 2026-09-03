@@ -20,7 +20,7 @@ module.exports = class Batch {
     // Apparently fetch can return different offsets than the target offset provided to the fetch API.
     // Discard messages that are not in the requested offset
     // https://github.com/apache/kafka/blob/bf237fa7c576bd141d78fdea9f17f65ea269c290/clients/src/main/java/org/apache/kafka/clients/consumer/internals/Fetcher.java#L912
-    this.messagesWithinOffset = this.rawMessages.filter(message =>
+    this.messagesWithinOffset = this.rawMessages.filter((message) =>
       Long.fromValue(message.offset).gte(longFetchedOffset)
     )
 
@@ -30,7 +30,7 @@ module.exports = class Batch {
     this.messages = filterAbortedMessages({
       messages: this.messagesWithinOffset,
       abortedTransactions,
-    }).filter(message => !message.isControlRecord)
+    }).filter((message) => !message.isControlRecord)
   }
 
   isEmpty() {
@@ -80,9 +80,7 @@ module.exports = class Batch {
     }
 
     if (this.isEmptyIncludingFiltered()) {
-      return Long.fromValue(this.highWatermark)
-        .add(-1)
-        .toString()
+      return Long.fromValue(this.highWatermark).add(-1).toString()
     }
 
     return this.messagesWithinOffset[this.messagesWithinOffset.length - 1].offset

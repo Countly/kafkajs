@@ -25,13 +25,13 @@ const readSnapshot = (tag, root) =>
 /**
  * @param {{ snapshot: {errors: Array}, forkErrorCodes: Array, aliases: object }} input
  */
-const compareErrorTables = input => {
+const compareErrorTables = (input) => {
   const aliases = input.aliases || {}
   const kafka = new Map()
   for (const error of input.snapshot.errors) {
     if (error.code !== SUCCESS_CODE) kafka.set(error.code, error.type)
   }
-  const fork = new Map(input.forkErrorCodes.map(error => [error.code, error.type]))
+  const fork = new Map(input.forkErrorCodes.map((error) => [error.code, error.type]))
 
   const missingInFork = []
   for (const [code, type] of kafka) {
@@ -58,7 +58,7 @@ const compareErrorTables = input => {
 
   const staleAliases = []
   for (const forkType of Object.keys(aliases)) {
-    if (!aliased.some(entry => entry.forkType === forkType)) {
+    if (!aliased.some((entry) => entry.forkType === forkType)) {
       staleAliases.push({ forkType, kafkaType: aliases[forkType].kafkaType })
     }
   }

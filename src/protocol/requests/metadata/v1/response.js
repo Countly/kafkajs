@@ -21,29 +21,29 @@ const { parse: parseV0 } = require('../v0/response')
  *       isr => INT32
  */
 
-const broker = decoder => ({
+const broker = (decoder) => ({
   nodeId: decoder.readInt32(),
   host: decoder.readString(),
   port: decoder.readInt32(),
   rack: decoder.readString(),
 })
 
-const topicMetadata = decoder => ({
+const topicMetadata = (decoder) => ({
   topicErrorCode: decoder.readInt16(),
   topic: decoder.readString(),
   isInternal: decoder.readBoolean(),
   partitionMetadata: decoder.readArray(partitionMetadata),
 })
 
-const partitionMetadata = decoder => ({
+const partitionMetadata = (decoder) => ({
   partitionErrorCode: decoder.readInt16(),
   partitionId: decoder.readInt32(),
   leader: decoder.readInt32(),
-  replicas: decoder.readArray(d => d.readInt32()),
-  isr: decoder.readArray(d => d.readInt32()),
+  replicas: decoder.readArray((d) => d.readInt32()),
+  isr: decoder.readArray((d) => d.readInt32()),
 })
 
-const decode = async rawData => {
+const decode = async (rawData) => {
   const decoder = new Decoder(rawData)
   return {
     brokers: decoder.readArray(broker),

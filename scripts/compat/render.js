@@ -9,17 +9,17 @@
 const { formatVersions } = require('./gaps')
 
 /** Table cells must never break the table: escape pipes, flatten newlines. */
-const cell = value => {
+const cell = (value) => {
   const text = value === null || value === undefined ? '' : String(value)
   return text.replace(/\|/g, '\\|').replace(/\r?\n/g, ' ')
 }
 
-const row = cells => `| ${cells.map(cell).join(' | ')} |`
+const row = (cells) => `| ${cells.map(cell).join(' | ')} |`
 
-const range = bounds =>
+const range = (bounds) =>
   bounds === null ? '—' : bounds[0] === bounds[1] ? `${bounds[0]}` : `${bounds[0]}-${bounds[1]}`
 
-const gapCell = api => {
+const gapCell = (api) => {
   const flags = []
   if (api.onFloor) flags.push('on-floor')
   if (api.belowFloor.length > 0) flags.push(`below-floor ${formatVersions(api.belowFloor)}`)
@@ -54,7 +54,7 @@ const renderSummary = (lines, model) => {
 }
 
 const renderFloorWatch = (lines, model) => {
-  const sitters = model.apis.filter(api => api.onFloor)
+  const sitters = model.apis.filter((api) => api.onFloor)
   section(lines, 'Floor watch')
   lines.push(
     'These APIs implement exactly the minimum version the pinned broker still accepts. The next KIP-896 floor raise breaks them with no warning.'
@@ -165,7 +165,7 @@ const renderUntracked = (lines, model) => {
   }
 }
 
-const render = model => {
+const render = (model) => {
   const lines = []
   lines.push('# Kafka protocol compatibility')
   lines.push('')

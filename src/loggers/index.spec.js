@@ -9,7 +9,7 @@ describe('Loggers', () => {
     MockDate.set(timeNow.getTime())
 
     myLogger = jest.fn()
-    MyLogCreator = jest.fn(logLevel => {
+    MyLogCreator = jest.fn((logLevel) => {
       return jest.fn(({ namespace, level, label, log }) => {
         myLogger(logLevel, { namespace, level, label, log })
       })

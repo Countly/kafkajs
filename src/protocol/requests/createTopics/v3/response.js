@@ -12,7 +12,7 @@ const { parse, decode: decodeV2 } = require('../v2/response')
  *     error_message => NULLABLE_STRING
  */
 
-const decode = async rawData => {
+const decode = async (rawData) => {
   const decoded = await decodeV2(rawData)
 
   return {

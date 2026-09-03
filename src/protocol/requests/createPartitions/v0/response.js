@@ -12,13 +12,13 @@ const { failure, createErrorFromCode } = require('../../../error')
 
 const topicNameComparator = (a, b) => a.topic.localeCompare(b.topic)
 
-const topicErrors = decoder => ({
+const topicErrors = (decoder) => ({
   topic: decoder.readString(),
   errorCode: decoder.readInt16(),
   errorMessage: decoder.readString(),
 })
 
-const decode = async rawData => {
+const decode = async (rawData) => {
   const decoder = new Decoder(rawData)
   const throttleTime = decoder.readInt32()
   return {
@@ -27,7 +27,7 @@ const decode = async rawData => {
   }
 }
 
-const parse = async data => {
+const parse = async (data) => {
   const topicsWithError = data.topicErrors.filter(({ errorCode }) => failure(errorCode))
   if (topicsWithError.length > 0) {
     throw createErrorFromCode(topicsWithError[0].errorCode)

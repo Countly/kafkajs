@@ -18,7 +18,7 @@ const { failure, createErrorFromCode } = require('../../../error')
  *    error_message => COMPACT_NULLABLE_STRING
  */
 
-const decodeResponses = decoder => {
+const decodeResponses = (decoder) => {
   const response = {
     topic: decoder.readUVarIntString(),
     partitions: decoder.readUVarIntArray(decodePartitions),
@@ -28,7 +28,7 @@ const decodeResponses = decoder => {
   return response
 }
 
-const decodePartitions = decoder => {
+const decodePartitions = (decoder) => {
   const partition = {
     partition: decoder.readInt32(),
     errorCode: decoder.readInt16(),
@@ -38,7 +38,7 @@ const decodePartitions = decoder => {
   return partition
 }
 
-const decode = async rawData => {
+const decode = async (rawData) => {
   const decoder = new Decoder(rawData)
   decoder.readTaggedFields()
   const throttleTime = decoder.readInt32()
@@ -51,15 +51,15 @@ const decode = async rawData => {
   }
 }
 
-const parse = async data => {
+const parse = async (data) => {
   if (failure(data.errorCode)) {
     throw new KafkaJSAlterPartitionReassignmentsError(createErrorFromCode(data.errorCode))
   }
 
   const topicPartitionsWithError = data.responses.flatMap(({ partitions, topic }) =>
     partitions
-      .filter(partition => failure(partition.errorCode))
-      .map(partition => ({
+      .filter((partition) => failure(partition.errorCode))
+      .map((partition) => ({
         ...partition,
         topic,
       }))

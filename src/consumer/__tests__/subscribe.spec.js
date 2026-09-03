@@ -51,7 +51,7 @@ describe('Consumer', () => {
       const regexMatchingTopic = `pattern-${testScope}-regex-${secureRandom()}`
       const topics = [`topic-${secureRandom()}`, `topic-${secureRandom()}`, regexMatchingTopic]
 
-      await Promise.all(topics.map(topic => createTopic({ topic })))
+      await Promise.all(topics.map((topic) => createTopic({ topic })))
 
       const messagesConsumed = []
       await consumer.connect()
@@ -60,7 +60,7 @@ describe('Consumer', () => {
         fromBeginning: true,
       })
 
-      consumer.run({ eachMessage: async event => messagesConsumed.push(event) })
+      consumer.run({ eachMessage: async (event) => messagesConsumed.push(event) })
       await waitForConsumerToJoinGroup(consumer)
 
       await producer.connect()
@@ -74,7 +74,7 @@ describe('Consumer', () => {
       })
 
       await waitForMessages(messagesConsumed, { number: 3 })
-      expect(messagesConsumed.map(m => m.message.value.toString())).toEqual(
+      expect(messagesConsumed.map((m) => m.message.value.toString())).toEqual(
         expect.arrayContaining(['drink', 'your', 'ovaltine'])
       )
     })
@@ -106,7 +106,7 @@ describe('Consumer', () => {
           await consumer.connect()
           await consumer.subscribe({ topic, fromBeginning: true })
 
-          consumer.run({ eachMessage: async event => messagesConsumed.push(event) })
+          consumer.run({ eachMessage: async (event) => messagesConsumed.push(event) })
           await waitForConsumerToJoinGroup(consumer)
 
           await producer.connect()
@@ -116,7 +116,9 @@ describe('Consumer', () => {
           })
 
           await waitForMessages(messagesConsumed, { number: 1 })
-          expect(messagesConsumed.map(m => m.message.value.toString()).sort()).toEqual(['value-a'])
+          expect(messagesConsumed.map((m) => m.message.value.toString()).sort()).toEqual([
+            'value-a',
+          ])
         })
       })
 
@@ -129,7 +131,7 @@ describe('Consumer', () => {
           const topicBR = `pattern-${testScope}-br-${secureRandom()}`
 
           await Promise.all(
-            [topicUS, topicSE, topicUK, topicBR].map(topic => createTopic({ topic }))
+            [topicUS, topicSE, topicUK, topicBR].map((topic) => createTopic({ topic }))
           )
 
           const messagesConsumed = []
@@ -139,7 +141,7 @@ describe('Consumer', () => {
             fromBeginning: true,
           })
 
-          consumer.run({ eachMessage: async event => messagesConsumed.push(event) })
+          consumer.run({ eachMessage: async (event) => messagesConsumed.push(event) })
           await waitForConsumerToJoinGroup(consumer)
 
           await producer.connect()
@@ -154,7 +156,7 @@ describe('Consumer', () => {
           })
 
           await waitForMessages(messagesConsumed, { number: 2 })
-          expect(messagesConsumed.map(m => m.message.value.toString()).sort()).toEqual([
+          expect(messagesConsumed.map((m) => m.message.value.toString()).sort()).toEqual([
             'value-br',
             'value-se',
           ])

@@ -16,12 +16,12 @@ describeIfOauthbearerEnabled('Brokers re-authentication with SASL OAUTHBEARER', 
   let broker
 
   const wait = (time = 1000) =>
-    new Promise(resolve => {
+    new Promise((resolve) => {
       setTimeout(resolve, time)
     })
 
-  const getAuthCalls = spy =>
-    spy.mock.calls.filter(mock => mock[0].request.apiKey === apiSaslAuthenticateKey)
+  const getAuthCalls = (spy) =>
+    spy.mock.calls.filter((mock) => mock[0].request.apiKey === apiSaslAuthenticateKey)
 
   test('Does not re-authenticate when still within session validity threshold', async () => {
     const connectionPool = createConnectionPool({

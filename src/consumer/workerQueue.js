@@ -21,13 +21,13 @@ const createWorkerQueue = ({ workers }) => {
    */
   const push = async (...batches) => {
     const promises = batches.map(
-      batch => new Promise((resolve, reject) => queue.push({ batch, resolve, reject }))
+      (batch) => new Promise((resolve, reject) => queue.push({ batch, resolve, reject }))
     )
 
-    workers.forEach(worker => worker.run({ next: () => queue.shift() }))
+    workers.forEach((worker) => worker.run({ next: () => queue.shift() }))
 
     const results = await Promise.allSettled(promises)
-    const rejected = results.find(result => result.status === 'rejected')
+    const rejected = results.find((result) => result.status === 'rejected')
     if (rejected) {
       // @ts-ignore
       throw rejected.reason

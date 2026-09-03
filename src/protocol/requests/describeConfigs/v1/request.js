@@ -24,8 +24,5 @@ module.exports = ({ resources, includeSynonyms = false }) => ({
 })
 
 const encodeResource = ({ type, name, configNames = [] }) => {
-  return new Encoder()
-    .writeInt8(type)
-    .writeString(name)
-    .writeNullableArray(configNames)
+  return new Encoder().writeInt8(type).writeString(name).writeNullableArray(configNames)
 }

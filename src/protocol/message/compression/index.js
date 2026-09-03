@@ -23,8 +23,8 @@ const Codecs = {
   },
 }
 
-const lookupCodec = type => (Codecs[type] ? Codecs[type]() : null)
-const lookupCodecByAttributes = attributes => {
+const lookupCodec = (type) => (Codecs[type] ? Codecs[type]() : null)
+const lookupCodecByAttributes = (attributes) => {
   const codec = Codecs[attributes & COMPRESSION_CODEC_MASK]
   return codec ? codec() : null
 }

@@ -9,7 +9,7 @@ describe('scripts/compat/build', () => {
 
   it('builds one row per tracked API, sorted by api key', () => {
     expect(model.apis).toHaveLength(trackedApis.tracked.length)
-    const keys = model.apis.map(api => api.apiKey)
+    const keys = model.apis.map((api) => api.apiKey)
     expect(keys).toEqual(keys.slice().sort((a, b) => a - b))
     expect(model.kafkaTag).toBe(config.kafkaTag)
   })
@@ -37,7 +37,7 @@ describe('scripts/compat/build', () => {
 
   it('never produces a sentinel gap for the real data', () => {
     const sentinels = model.apis.filter(
-      api => api.gap === 'unknown' || api.gap.indexOf('ahead:') === 0
+      (api) => api.gap === 'unknown' || api.gap.indexOf('ahead:') === 0
     )
     expect(sentinels).toEqual([])
   })
@@ -72,7 +72,7 @@ describe('scripts/compat/build', () => {
   })
 
   it('sorts waivers with the same plain ASCII comparator it exports', () => {
-    const keys = model.waivers.map(waiver => waiver.api)
+    const keys = model.waivers.map((waiver) => waiver.api)
     expect(keys).toEqual(keys.slice().sort(asciiCompare))
   })
 

@@ -64,7 +64,7 @@ describe('Consumer', () => {
     await consumer.subscribe({ topic: topicName, fromBeginning: true })
 
     const messagesConsumed = []
-    consumer.run({ eachMessage: async event => messagesConsumed.push(event) })
+    consumer.run({ eachMessage: async (event) => messagesConsumed.push(event) })
     await waitForConsumerToJoinGroup(consumer)
 
     const messages = Array(100)
@@ -104,7 +104,7 @@ describe('Consumer', () => {
     )
 
     // check if all offsets are present
-    expect(messagesConsumed.map(m => m.message.offset)).toEqual(messages.map((_, i) => `${i}`))
+    expect(messagesConsumed.map((m) => m.message.offset)).toEqual(messages.map((_, i) => `${i}`))
   })
 
   it('consumes messages concurrently', async () => {
@@ -130,7 +130,7 @@ describe('Consumer', () => {
     const messagesConsumed = []
     consumer.run({
       partitionsConsumedConcurrently,
-      eachMessage: async event => {
+      eachMessage: async (event) => {
         await sleep(1)
         messagesConsumed.push(event)
       },
@@ -235,15 +235,15 @@ describe('Consumer', () => {
     })
 
     consumer.run({
-      eachMessage: async payload => {
-        await new Promise(resolve => {
+      eachMessage: async (payload) => {
+        await new Promise((resolve) => {
           setTimeout(resolve, 100)
         })
 
         await payload.heartbeat()
         messagesConsumed.push(payload.message)
 
-        await new Promise(resolve => {
+        await new Promise((resolve) => {
           setTimeout(resolve, 100)
         })
       },
@@ -263,7 +263,7 @@ describe('Consumer', () => {
     await consumer.subscribe({ topic: topicName, fromBeginning: true })
 
     const messagesConsumed = []
-    consumer.run({ eachMessage: async event => messagesConsumed.push(event) })
+    consumer.run({ eachMessage: async (event) => messagesConsumed.push(event) })
     await waitForConsumerToJoinGroup(consumer)
 
     const key1 = secureRandom()
@@ -366,7 +366,7 @@ describe('Consumer', () => {
     await consumer.subscribe({ topic: topicName, fromBeginning: true })
 
     const messagesConsumed = []
-    consumer.run({ eachMessage: async event => messagesConsumed.push(event) })
+    consumer.run({ eachMessage: async (event) => messagesConsumed.push(event) })
     await waitForConsumerToJoinGroup(consumer)
 
     // stop the consumer right after processing the batch, the offsets should be
@@ -412,7 +412,7 @@ describe('Consumer', () => {
     )
 
     // check if all offsets are present
-    expect(messagesConsumed.map(m => m.message.offset)).toEqual(messages.map((_, i) => `${i}`))
+    expect(messagesConsumed.map((m) => m.message.offset)).toEqual(messages.map((_, i) => `${i}`))
     const response = await admin.fetchOffsets({ groupId, topics: [topicName] })
     const { partitions } = response.find(({ topic }) => topic === topicName)
     const partition = partitions.find(({ partition }) => partition === 0)
@@ -445,7 +445,7 @@ describe('Consumer', () => {
     await consumer.subscribe({ topic: topicName2, fromBeginning: true })
 
     const messagesConsumed = []
-    consumer.run({ eachMessage: async event => messagesConsumed.push(event) })
+    consumer.run({ eachMessage: async (event) => messagesConsumed.push(event) })
     await waitForConsumerToJoinGroup(consumer)
 
     const generateMessagesWitHeaders = () =>
@@ -473,8 +473,8 @@ describe('Consumer', () => {
 
     expect(cluster.refreshMetadataIfNecessary).toHaveBeenCalled()
 
-    const messagesFromTopic1 = messagesConsumed.filter(m => m.topic === topicName)
-    const messagesFromTopic2 = messagesConsumed.filter(m => m.topic === topicName2)
+    const messagesFromTopic1 = messagesConsumed.filter((m) => m.topic === topicName)
+    const messagesFromTopic2 = messagesConsumed.filter((m) => m.topic === topicName2)
 
     expect(messagesFromTopic1[0]).toEqual(
       expect.objectContaining({
@@ -551,8 +551,8 @@ describe('Consumer', () => {
     )
 
     // check if all offsets are present
-    expect(messagesFromTopic1.map(m => m.message.offset)).toEqual(messages1.map((_, i) => `${i}`))
-    expect(messagesFromTopic2.map(m => m.message.offset)).toEqual(messages2.map((_, i) => `${i}`))
+    expect(messagesFromTopic1.map((m) => m.message.offset)).toEqual(messages1.map((_, i) => `${i}`))
+    expect(messagesFromTopic2.map((m) => m.message.offset)).toEqual(messages2.map((_, i) => `${i}`))
   })
 
   testIfKafkaAtLeast_0_11('consume GZIP messages with 0.11 format', async () => {
@@ -575,7 +575,7 @@ describe('Consumer', () => {
     await consumer.subscribe({ topic: topicName, fromBeginning: true })
 
     const messagesConsumed = []
-    consumer.run({ eachMessage: async event => messagesConsumed.push(event) })
+    consumer.run({ eachMessage: async (event) => messagesConsumed.push(event) })
     await waitForConsumerToJoinGroup(consumer)
 
     const key1 = secureRandom()
@@ -636,7 +636,7 @@ describe('Consumer', () => {
     let calls = 0
 
     consumer.run({
-      eachMessage: async event => {
+      eachMessage: async (event) => {
         calls++
         await sleep(100)
       },
@@ -870,7 +870,7 @@ describe('Consumer', () => {
       const idempotentMessages = generateMessages({ prefix: 'idempotent' })
 
       consumer.run({
-        eachMessage: async event => messagesConsumed.push(event),
+        eachMessage: async (event) => messagesConsumed.push(event),
       })
       await waitForConsumerToJoinGroup(consumer)
 
@@ -919,7 +919,7 @@ describe('Consumer', () => {
       const nontransactionalMessages2 = generateMessages({ prefix: 'nontransactional2', number: 1 })
 
       consumer.run({
-        eachMessage: async event => messagesConsumed.push(event),
+        eachMessage: async (event) => messagesConsumed.push(event),
       })
       await waitForConsumerToJoinGroup(consumer)
 
@@ -995,7 +995,7 @@ describe('Consumer', () => {
       const committedMessages = generateMessages({ prefix: 'committed-txn', number: 10 })
 
       consumer.run({
-        eachMessage: async event => messagesConsumed.push(event),
+        eachMessage: async (event) => messagesConsumed.push(event),
       })
       await waitForConsumerToJoinGroup(consumer)
 
@@ -1065,7 +1065,7 @@ describe('Consumer', () => {
         const abortedMessages = generateMessages({ prefix: 'aborted-txn1' })
 
         consumer.run({
-          eachMessage: async event => messagesConsumed.push(event),
+          eachMessage: async (event) => messagesConsumed.push(event),
         })
         await waitForConsumerToJoinGroup(consumer)
 
@@ -1259,7 +1259,7 @@ describe('Consumer', () => {
         // 2. Produce messages and consume
 
         const partition = 0
-        const messages = generateMessages().map(message => ({
+        const messages = generateMessages().map((message) => ({
           ...message,
           partition,
         }))

@@ -12,7 +12,7 @@ const { failure, createErrorFromCode, failIfVersionNotSupported } = require('../
  *     port => INT32
  */
 
-const decode = async rawData => {
+const decode = async (rawData) => {
   const decoder = new Decoder(rawData)
   const throttleTime = decoder.readInt32()
   const errorCode = decoder.readInt16()
@@ -34,7 +34,7 @@ const decode = async rawData => {
   }
 }
 
-const parse = async data => {
+const parse = async (data) => {
   if (failure(data.errorCode)) {
     throw createErrorFromCode(data.errorCode)
   }

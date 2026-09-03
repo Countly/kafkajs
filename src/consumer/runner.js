@@ -54,8 +54,8 @@ module.exports = class Runner extends EventEmitter {
     this.fetchManager = createFetchManager({
       logger: this.logger,
       getNodeIds: () => this.consumerGroup.getNodeIds(),
-      fetch: nodeId => this.fetch(nodeId),
-      handler: batch => this.handleBatch(batch),
+      fetch: (nodeId) => this.fetch(nodeId),
+      handler: (batch) => this.handleBatch(batch),
       concurrency,
     })
 
@@ -163,7 +163,7 @@ module.exports = class Runner extends EventEmitter {
       .then(() => {
         this.scheduleFetchManager()
       })
-      .catch(e => {
+      .catch((e) => {
         this.onCrash(e)
         this.consuming = false
         this.running = false
@@ -190,7 +190,7 @@ module.exports = class Runner extends EventEmitter {
   }
 
   waitForConsumer() {
-    return new Promise(resolve => {
+    return new Promise((resolve) => {
       if (!this.consuming) {
         return resolve()
       }
@@ -273,7 +273,7 @@ module.exports = class Runner extends EventEmitter {
     try {
       await this.eachBatch({
         batch,
-        resolveOffset: offset => {
+        resolveOffset: (offset) => {
           /**
            * The transactional producer generates a control record after committing the transaction.
            * The control record is the last record on the RecordBatch, and it is filtered before it
@@ -305,7 +305,7 @@ module.exports = class Runner extends EventEmitter {
          *
          * @param {import('../../types').OffsetsByTopicPartition} [offsets] Optional.
          */
-        commitOffsetsIfNecessary: async offsets => {
+        commitOffsetsIfNecessary: async (offsets) => {
           return offsets
             ? this.consumerGroup.commitOffsets(offsets)
             : this.consumerGroup.commitOffsetsIfNecessary()
@@ -386,7 +386,7 @@ module.exports = class Runner extends EventEmitter {
     }
 
     /** @param {import('./batch')} batch */
-    const onBatch = async batch => {
+    const onBatch = async (batch) => {
       const startBatchProcess = Date.now()
       const payload = {
         topic: batch.topic,

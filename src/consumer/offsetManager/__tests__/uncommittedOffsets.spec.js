@@ -18,8 +18,8 @@ describe('Consumer > OffsetMananger > uncommittedOffsets', () => {
   it('returns all resolved offsets which have not been committed', () => {
     const defaultOffsetInt = 2
 
-    Object.keys(memberAssignment).forEach(topic => {
-      memberAssignment[topic].forEach(partition => {
+    Object.keys(memberAssignment).forEach((topic) => {
+      memberAssignment[topic].forEach((partition) => {
         offsetManager.resolveOffset({ topic, partition, offset: defaultOffsetInt.toString() })
       })
     })

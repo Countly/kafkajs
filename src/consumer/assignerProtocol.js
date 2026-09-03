@@ -11,10 +11,7 @@ const MemberMetadata = {
    * @returns Buffer
    */
   encode({ version, topics, userData = Buffer.alloc(0) }) {
-    return new Encoder()
-      .writeInt16(version)
-      .writeArray(topics)
-      .writeBytes(userData).buffer
+    return new Encoder().writeInt16(version).writeArray(topics).writeBytes(userData).buffer
   },
 
   /**
@@ -25,7 +22,7 @@ const MemberMetadata = {
     const decoder = new Decoder(buffer)
     return {
       version: decoder.readInt16(),
-      topics: decoder.readArray(d => d.readString()),
+      topics: decoder.readArray((d) => d.readString()),
       userData: decoder.readBytes(),
     }
   },
@@ -48,7 +45,7 @@ const MemberAssignment = {
     return new Encoder()
       .writeInt16(version)
       .writeArray(
-        Object.keys(assignment).map(topic =>
+        Object.keys(assignment).map((topic) =>
           new Encoder().writeString(topic).writeArray(assignment[topic])
         )
       )
@@ -61,8 +58,8 @@ const MemberAssignment = {
    */
   decode(buffer) {
     const decoder = new Decoder(buffer)
-    const decodePartitions = d => d.readInt32()
-    const decodeAssignment = d => ({
+    const decodePartitions = (d) => d.readInt32()
+    const decodeAssignment = (d) => ({
       topic: d.readString(),
       partitions: d.readArray(decodePartitions),
     })

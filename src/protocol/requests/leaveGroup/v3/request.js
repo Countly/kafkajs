@@ -20,7 +20,7 @@ module.exports = ({ groupId, members }) => ({
   encode: async () => {
     return new Encoder()
       .writeString(groupId)
-      .writeArray(members.map(member => encodeMember(member)))
+      .writeArray(members.map((member) => encodeMember(member)))
   },
 })
 

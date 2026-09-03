@@ -3,10 +3,10 @@ const trackedApis = require('../tracked-apis.json')
 const { errorCodes } = require('../../../src/protocol/error')
 
 describe('scripts/compat/notes.json', () => {
-  const trackedNames = trackedApis.tracked.map(api => api.kafkaName)
+  const trackedNames = trackedApis.tracked.map((api) => api.kafkaName)
 
   it('has no orphan API note', () => {
-    const orphans = Object.keys(notes.apis).filter(name => trackedNames.indexOf(name) === -1)
+    const orphans = Object.keys(notes.apis).filter((name) => trackedNames.indexOf(name) === -1)
     expect(orphans).toEqual([])
   })
 
@@ -30,7 +30,7 @@ describe('scripts/compat/notes.json', () => {
   })
 
   it('only aliases error types the fork actually defines', () => {
-    const forkTypes = errorCodes.map(error => error.type)
+    const forkTypes = errorCodes.map((error) => error.type)
     for (const forkType of Object.keys(notes.errorAliases)) {
       expect(forkTypes).toContain(forkType)
       expect(notes.errorAliases[forkType].kafkaType).toMatch(/^[A-Z][A-Z0-9_]*$/)

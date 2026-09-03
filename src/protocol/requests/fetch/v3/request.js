@@ -55,8 +55,5 @@ const encodeTopic = ({ topic, partitions }) => {
 }
 
 const encodePartition = ({ partition, fetchOffset, maxBytes }) => {
-  return new Encoder()
-    .writeInt32(partition)
-    .writeInt64(fetchOffset)
-    .writeInt32(maxBytes)
+  return new Encoder().writeInt32(partition).writeInt64(fetchOffset).writeInt32(maxBytes)
 }

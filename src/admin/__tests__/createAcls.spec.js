@@ -14,31 +14,33 @@ const ACL_OPERATION_TYPES = require('../../protocol/aclOperationTypes')
 const ACL_PERMISSION_TYPES = require('../../protocol/aclPermissionTypes')
 const RESOURCE_PATTERN_TYPES = require('../../protocol/resourcePatternTypes')
 
-const createSASLClientForUser = createClient => ({ username, password }) => {
-  const saslConnectionOpts = () => {
-    return Object.assign(sslConnectionOpts(), {
-      port: 9094,
-      sasl: {
-        mechanism: 'plain',
-        username,
-        password,
-      },
+const createSASLClientForUser =
+  (createClient) =>
+  ({ username, password }) => {
+    const saslConnectionOpts = () => {
+      return Object.assign(sslConnectionOpts(), {
+        port: 9094,
+        sasl: {
+          mechanism: 'plain',
+          username,
+          password,
+        },
+      })
+    }
+
+    const client = createClient({
+      logger: newLogger(),
+      cluster: createCluster(
+        {
+          ...saslConnectionOpts(),
+          metadataMaxAge: 50,
+        },
+        saslBrokers()
+      ),
     })
+
+    return client
   }
-
-  const client = createClient({
-    logger: newLogger(),
-    cluster: createCluster(
-      {
-        ...saslConnectionOpts(),
-        metadataMaxAge: 50,
-      },
-      saslBrokers()
-    ),
-  })
-
-  return client
-}
 
 const createSASLAdminClientForUser = createSASLClientForUser(createAdmin)
 const createSASLProducerClientForUser = createSASLClientForUser(createProducer)
@@ -261,7 +263,7 @@ describe('Admin', () => {
       await admin.connect()
       await admin.createTopics({
         waitForLeaders: true,
-        topics: [allowedTopic, notAllowedTopic].map(topic => ({ topic, numPartitions: 1 })),
+        topics: [allowedTopic, notAllowedTopic].map((topic) => ({ topic, numPartitions: 1 })),
       })
       await admin.createAcls({
         acl: [

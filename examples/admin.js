@@ -7,7 +7,7 @@ const PrettyConsoleLogger = require('./prettyConsoleLogger')
 const findIPv4 = () => {
   const iface = Object.values(os.networkInterfaces())
     .flat()
-    .find(i => i && i.family === 'IPv4' && !i.internal)
+    .find((i) => i && i.family === 'IPv4' && !i.internal)
   return iface?.address
 }
 
@@ -45,13 +45,13 @@ const run = async () => {
   })
 }
 
-run().catch(e => kafka.logger().error(`[example/admin] ${e.message}`, { stack: e.stack }))
+run().catch((e) => kafka.logger().error(`[example/admin] ${e.message}`, { stack: e.stack }))
 
 const errorTypes = ['unhandledRejection', 'uncaughtException']
 const signalTraps = ['SIGTERM', 'SIGINT', 'SIGUSR2']
 
-errorTypes.forEach(type => {
-  process.on(type, async e => {
+errorTypes.forEach((type) => {
+  process.on(type, async (e) => {
     try {
       kafka.logger().info(`process.on ${type}`)
       kafka.logger().error(e.message, { stack: e.stack })
@@ -63,7 +63,7 @@ errorTypes.forEach(type => {
   })
 })
 
-signalTraps.forEach(type => {
+signalTraps.forEach((type) => {
   process.once(type, async () => {
     console.log('')
     kafka.logger().info('[example/admin] disconnecting')

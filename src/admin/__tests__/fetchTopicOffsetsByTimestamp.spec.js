@@ -43,7 +43,7 @@ describe('Admin', () => {
       )
     })
 
-    const sendMessages = async n => {
+    const sendMessages = async (n) => {
       await admin.connect()
       await producer.connect()
 

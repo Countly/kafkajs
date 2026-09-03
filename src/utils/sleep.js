@@ -1,4 +1,4 @@
-module.exports = timeInMs =>
-  new Promise(resolve => {
+module.exports = (timeInMs) =>
+  new Promise((resolve) => {
     setTimeout(resolve, timeInMs)
   })

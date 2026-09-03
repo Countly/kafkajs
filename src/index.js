@@ -22,7 +22,7 @@ const PRIVATE = {
 }
 
 const DEFAULT_METADATA_MAX_AGE = 300000
-const warnOfDefaultPartitioner = once(logger => {
+const warnOfDefaultPartitioner = once((logger) => {
   if (process.env.KAFKAJS_NO_PARTITIONER_WARNING == null) {
     logger.warn(
       `KafkaJS v2.0.0 switched default partitioner. To retain the same partitioning behavior as in previous versions, create the producer with the option "createPartitioner: Partitioners.LegacyPartitioner". See the migration guide at ${websiteUrl(

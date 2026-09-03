@@ -44,7 +44,7 @@ describe('Admin', () => {
       expect(topicMetadata).toHaveProperty('name', existingTopicName)
       expect(topicMetadata.partitions).toHaveLength(numPartitions)
 
-      topicMetadata.partitions.forEach(partition => {
+      topicMetadata.partitions.forEach((partition) => {
         expect(partition).toHaveProperty('partitionId')
         expect(partition).toHaveProperty('leader')
         expect(partition).toHaveProperty('replicas')

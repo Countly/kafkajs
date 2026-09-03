@@ -11,7 +11,7 @@ const osType = os.type().toLowerCase()
  * Decodes a Produce v2 request body down to its (decompressed) message sets, so a comparison
  * does not depend on the exact bytes the local zlib emits.
  */
-const decodeRequest = async buffer => {
+const decodeRequest = async (buffer) => {
   const decoder = new Decoder(buffer)
   const acks = decoder.readInt16()
   const timeout = decoder.readInt32()
@@ -40,7 +40,7 @@ const VALUE_OFFSET_IN_CONTENT = 18
  * Reads the single compressed wrapper message of a Produce v2 request: the CRC the encoder wrote
  * and the exact bytes that CRC covers (magicByte..value, i.e. including the compressed payload).
  */
-const readWrapperMessage = buffer => {
+const readWrapperMessage = (buffer) => {
   const decoder = new Decoder(buffer)
   decoder.readInt16() // acks
   decoder.readInt32() // timeout

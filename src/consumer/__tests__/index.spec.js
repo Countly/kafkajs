@@ -88,7 +88,7 @@ describe('Consumer', () => {
       await consumer.connect()
       await consumer.subscribe({ topic: topicName, fromBeginning: true })
       await consumer.run({
-        eachMessage: async event => {
+        eachMessage: async (event) => {
           await sleep(100)
           consumerMessages.push(`${event.partition} ${event.message.value.toString()}`)
         },
@@ -100,7 +100,7 @@ describe('Consumer', () => {
       await consumer2.connect()
       await consumer2.subscribe({ topic: topicName, fromBeginning: true })
       await consumer2.run({
-        eachMessage: async event => {
+        eachMessage: async (event) => {
           await sleep(100)
           consumer2Messages.push(`${event.partition} ${event.message.value.toString()}`)
         },

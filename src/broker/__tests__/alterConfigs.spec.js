@@ -12,11 +12,11 @@ const Broker = require('../index')
 describe('Broker > alterConfigs', () => {
   let seedBroker, broker
 
-  const getConfigEntries = response =>
-    response.resources.find(r => r.resourceType === CONFIG_RESOURCE_TYPES.TOPIC).configEntries
+  const getConfigEntries = (response) =>
+    response.resources.find((r) => r.resourceType === CONFIG_RESOURCE_TYPES.TOPIC).configEntries
 
   const getConfigValue = (configEntries, name) =>
-    configEntries.find(c => c.configName === name).configValue
+    configEntries.find((c) => c.configName === name).configValue
 
   beforeEach(async () => {
     seedBroker = new Broker({
@@ -26,7 +26,7 @@ describe('Broker > alterConfigs', () => {
     await seedBroker.connect()
 
     const metadata = await seedBroker.metadata()
-    const newBrokerData = metadata.brokers.find(b => b.nodeId === metadata.controllerId)
+    const newBrokerData = metadata.brokers.find((b) => b.nodeId === metadata.controllerId)
 
     broker = new Broker({
       connectionPool: createConnectionPool(newBrokerData),

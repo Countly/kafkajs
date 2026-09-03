@@ -1,7 +1,7 @@
 const waitFor = require('./waitFor')
 const Lock = require('./lock')
 
-const sleep = value => waitFor(delay => delay >= value)
+const sleep = (value) => waitFor((delay) => delay >= value)
 
 describe('Utils > Lock', () => {
   it('allows only one resource at a time', async () => {

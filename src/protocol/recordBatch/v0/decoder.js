@@ -26,7 +26,7 @@ const CONTROL_FLAG_MASK = 0x20
  *  Records => [Record]
  */
 
-module.exports = async fetchDecoder => {
+module.exports = async (fetchDecoder) => {
   const firstOffset = fetchDecoder.readInt64().toString()
   const length = fetchDecoder.readInt32()
   const decoder = fetchDecoder.slice(length)
@@ -91,7 +91,7 @@ module.exports = async fetchDecoder => {
 
 const decodeRecords = async (codec, recordsDecoder, recordContext) => {
   if (!codec) {
-    return recordsDecoder.readArray(decoder => decodeRecord(decoder, recordContext))
+    return recordsDecoder.readArray((decoder) => decodeRecord(decoder, recordContext))
   }
 
   const length = recordsDecoder.readInt32()

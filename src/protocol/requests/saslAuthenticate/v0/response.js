@@ -9,7 +9,7 @@ const {
 
 const { KafkaJSProtocolError } = require('../../../../errors')
 const SASL_AUTHENTICATION_FAILED = 58
-const protocolAuthError = errorCodes.find(e => e.code === SASL_AUTHENTICATION_FAILED)
+const protocolAuthError = errorCodes.find((e) => e.code === SASL_AUTHENTICATION_FAILED)
 
 /**
  * SaslAuthenticate Response (Version: 0) => error_code error_message sasl_auth_bytes
@@ -18,7 +18,7 @@ const protocolAuthError = errorCodes.find(e => e.code === SASL_AUTHENTICATION_FA
  *   sasl_auth_bytes => BYTES
  */
 
-const decode = async rawData => {
+const decode = async (rawData) => {
   const decoder = new Decoder(rawData)
   const errorCode = decoder.readInt16()
 
@@ -38,7 +38,7 @@ const decode = async rawData => {
   }
 }
 
-const parse = async data => {
+const parse = async (data) => {
   if (data.errorCode === SASL_AUTHENTICATION_FAILED && data.errorMessage) {
     throw new KafkaJSProtocolError({
       ...protocolAuthError,

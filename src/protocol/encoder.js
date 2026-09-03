@@ -260,11 +260,11 @@ module.exports = class Encoder {
   }
 
   writeEncoderArray(value) {
-    if (!Array.isArray(value) || value.some(v => v == null || !Buffer.isBuffer(v.buf))) {
+    if (!Array.isArray(value) || value.some((v) => v == null || !Buffer.isBuffer(v.buf))) {
       throw new Error('all values should be an instance of Encoder[]')
     }
 
-    value.forEach(v => {
+    value.forEach((v) => {
       this.writeBufferInternal(v.buffer)
     })
     return this
@@ -303,17 +303,17 @@ module.exports = class Encoder {
       switch (type) {
         case 'int32':
         case 'number':
-          array.forEach(value => this.writeInt32(value))
+          array.forEach((value) => this.writeInt32(value))
           break
         case 'string':
-          array.forEach(value => this.writeString(value))
+          array.forEach((value) => this.writeString(value))
           break
         case 'object':
           this.writeEncoderArray(array)
           break
       }
     } else {
-      array.forEach(value => {
+      array.forEach((value) => {
         switch (typeof value) {
           case 'number':
             this.writeInt32(value)
@@ -335,7 +335,7 @@ module.exports = class Encoder {
       this.writeVarInt(array.length)
       this.writeEncoderArray(array)
     } else {
-      const objectArray = array.filter(v => typeof v === 'object')
+      const objectArray = array.filter((v) => typeof v === 'object')
       this.writeVarInt(objectArray.length)
       this.writeEncoderArray(objectArray)
     }
@@ -349,7 +349,7 @@ module.exports = class Encoder {
     } else if (array === null) {
       this.writeUVarInt(0)
     } else {
-      const objectArray = array.filter(v => typeof v === 'object')
+      const objectArray = array.filter((v) => typeof v === 'object')
       this.writeUVarInt(objectArray.length + 1)
       this.writeEncoderArray(objectArray)
     }
@@ -379,12 +379,7 @@ module.exports = class Encoder {
     let longValue = Encoder.encodeZigZag64(value)
 
     while (longValue.and(UNSIGNED_INT64_MAX_NUMBER).notEquals(Long.fromInt(0))) {
-      byteArray.push(
-        longValue
-          .and(OTHER_BITS)
-          .or(MOST_SIGNIFICANT_BIT)
-          .toInt()
-      )
+      byteArray.push(longValue.and(OTHER_BITS).or(MOST_SIGNIFICANT_BIT).toInt())
       longValue = longValue.shiftRightUnsigned(7)
     }
 

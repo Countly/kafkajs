@@ -34,8 +34,5 @@ const encodeTopic = ({ topic, partitions }) => {
 }
 
 const encodePartition = ({ partition, offset, metadata }) => {
-  return new Encoder()
-    .writeInt32(partition)
-    .writeInt64(offset)
-    .writeString(metadata)
+  return new Encoder().writeInt32(partition).writeInt64(offset).writeString(metadata)
 }

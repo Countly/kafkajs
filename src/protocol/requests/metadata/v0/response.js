@@ -18,29 +18,29 @@ const { failure, createErrorFromCode } = require('../../../error')
  *       isr => INT32
  */
 
-const broker = decoder => ({
+const broker = (decoder) => ({
   nodeId: decoder.readInt32(),
   host: decoder.readString(),
   port: decoder.readInt32(),
 })
 
-const topicMetadata = decoder => ({
+const topicMetadata = (decoder) => ({
   topicErrorCode: decoder.readInt16(),
   topic: decoder.readString(),
   partitionMetadata: decoder.readArray(partitionMetadata),
 })
 
-const partitionMetadata = decoder => ({
+const partitionMetadata = (decoder) => ({
   partitionErrorCode: decoder.readInt16(),
   partitionId: decoder.readInt32(),
   // leader: The node id for the kafka broker currently acting as leader
   // for this partition
   leader: decoder.readInt32(),
-  replicas: decoder.readArray(d => d.readInt32()),
-  isr: decoder.readArray(d => d.readInt32()),
+  replicas: decoder.readArray((d) => d.readInt32()),
+  isr: decoder.readArray((d) => d.readInt32()),
 })
 
-const decode = async rawData => {
+const decode = async (rawData) => {
   const decoder = new Decoder(rawData)
   return {
     brokers: decoder.readArray(broker),
@@ -48,15 +48,15 @@ const decode = async rawData => {
   }
 }
 
-const parse = async data => {
-  const topicsWithErrors = data.topicMetadata.filter(topic => failure(topic.topicErrorCode))
+const parse = async (data) => {
+  const topicsWithErrors = data.topicMetadata.filter((topic) => failure(topic.topicErrorCode))
   if (topicsWithErrors.length > 0) {
     const { topicErrorCode } = topicsWithErrors[0]
     throw createErrorFromCode(topicErrorCode)
   }
 
-  const errors = data.topicMetadata.flatMap(topic => {
-    return topic.partitionMetadata.filter(partition => failure(partition.partitionErrorCode))
+  const errors = data.topicMetadata.flatMap((topic) => {
+    return topic.partitionMetadata.filter((partition) => failure(partition.partitionErrorCode))
   })
 
   if (errors.length > 0) {

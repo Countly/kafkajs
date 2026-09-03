@@ -15,11 +15,11 @@ const { failure, createErrorFromCode } = require('../../../error')
  *       removing_replicas => INT32
  */
 
-const decodeReplicas = decoder => {
+const decodeReplicas = (decoder) => {
   return decoder.readInt32()
 }
 
-const decodePartitions = decoder => {
+const decodePartitions = (decoder) => {
   const partition = {
     partition: decoder.readInt32(),
     replicas: decoder.readUVarIntArray(decodeReplicas),
@@ -32,7 +32,7 @@ const decodePartitions = decoder => {
   return partition
 }
 
-const decodeTopics = decoder => {
+const decodeTopics = (decoder) => {
   const topic = {
     name: decoder.readUVarIntString(),
     partitions: decoder.readUVarIntArray(decodePartitions),
@@ -42,7 +42,7 @@ const decodeTopics = decoder => {
   decoder.readTaggedFields()
   return topic
 }
-const decode = async rawData => {
+const decode = async (rawData) => {
   const decoder = new Decoder(rawData)
 
   // Read tagged fields
@@ -58,7 +58,7 @@ const decode = async rawData => {
   }
 }
 
-const parse = async data => {
+const parse = async (data) => {
   if (failure(data.errorCode)) {
     throw createErrorFromCode(data.errorCode)
   }

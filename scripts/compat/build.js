@@ -16,7 +16,7 @@ const { readSnapshot, compareErrorTables } = require('./errors')
 const ROOT = __dirname
 const REPO_ROOT = path.join(__dirname, '..', '..')
 
-const readJson = name => JSON.parse(fs.readFileSync(path.join(ROOT, name), 'utf8'))
+const readJson = (name) => JSON.parse(fs.readFileSync(path.join(ROOT, name), 'utf8'))
 
 /** Plain byte-wise string comparator: deterministic across locales/environments, unlike localeCompare. */
 const asciiCompare = (a, b) => (a < b ? -1 : a > b ? 1 : 0)
@@ -31,7 +31,7 @@ const buildModel = () => {
 
   const fork = readFork(trackedApis)
 
-  const apis = trackedApis.tracked.map(entry => {
+  const apis = trackedApis.tracked.map((entry) => {
     const spec = parse.readSpec(path.join(messagesDir, `${entry.kafkaName}Request.json`))
     const forkInfo = fork.apis[entry.kafkaName]
     const note = notes.apis[entry.kafkaName]
@@ -61,9 +61,9 @@ const buildModel = () => {
   })
   apis.sort((a, b) => a.apiKey - b.apiKey)
 
-  const byName = new Map(apis.map(api => [api.kafkaName, api]))
+  const byName = new Map(apis.map((api) => [api.kafkaName, api]))
   const waivers = waiverFile.waivers
-    .map(waiver => {
+    .map((waiver) => {
       const api = byName.get(waiver.api)
       return {
         api: waiver.api,
@@ -96,7 +96,7 @@ const buildModel = () => {
 }
 
 /** The committed machine-readable artifact (B2): the model minus the transient findings. */
-const toJsonArtifact = model => ({
+const toJsonArtifact = (model) => ({
   generatedFrom: { kafkaTag: model.kafkaTag, tool: model.tool, schemaVersion: model.schemaVersion },
   apis: model.apis,
   waivers: model.waivers,
@@ -105,7 +105,7 @@ const toJsonArtifact = model => ({
   untracked: model.untracked,
 })
 
-const serializeJson = artifact => `${JSON.stringify(artifact, null, 2)}\n`
+const serializeJson = (artifact) => `${JSON.stringify(artifact, null, 2)}\n`
 
 module.exports = {
   ROOT,

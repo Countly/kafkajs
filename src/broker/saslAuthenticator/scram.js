@@ -27,7 +27,7 @@ const DIGESTS = {
   },
 }
 
-const encode64 = str => Buffer.from(str).toString('base64')
+const encode64 = (str) => Buffer.from(str).toString('base64')
 
 class SCRAM {
   /**
@@ -302,20 +302,14 @@ class SCRAM {
    * @private
    */
   H(data) {
-    return crypto
-      .createHash(this.digestDefinition.type)
-      .update(data)
-      .digest()
+    return crypto.createHash(this.digestDefinition.type).update(data).digest()
   }
 
   /**
    * @private
    */
   HMAC(key, data) {
-    return crypto
-      .createHmac(this.digestDefinition.type, key)
-      .update(data)
-      .digest()
+    return crypto.createHmac(this.digestDefinition.type, key).update(data).digest()
   }
 }
 

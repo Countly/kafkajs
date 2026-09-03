@@ -9,7 +9,7 @@ const { parse: parseV0 } = require('../v0/response')
  *   member_assignment => BYTES
  */
 
-const decode = async rawData => {
+const decode = async (rawData) => {
   const decoder = new Decoder(rawData)
   const throttleTime = decoder.readInt32()
   const errorCode = decoder.readInt16()

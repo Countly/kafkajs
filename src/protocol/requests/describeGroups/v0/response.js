@@ -17,7 +17,7 @@ const { failure, createErrorFromCode } = require('../../../error')
  *       member_assignment => BYTES
  */
 
-const decoderMember = decoder => ({
+const decoderMember = (decoder) => ({
   memberId: decoder.readString(),
   clientId: decoder.readString(),
   clientHost: decoder.readString(),
@@ -25,7 +25,7 @@ const decoderMember = decoder => ({
   memberAssignment: decoder.readBytes(),
 })
 
-const decodeGroup = decoder => ({
+const decodeGroup = (decoder) => ({
   errorCode: decoder.readInt16(),
   groupId: decoder.readString(),
   state: decoder.readString(),
@@ -34,7 +34,7 @@ const decodeGroup = decoder => ({
   members: decoder.readArray(decoderMember),
 })
 
-const decode = async rawData => {
+const decode = async (rawData) => {
   const decoder = new Decoder(rawData)
   const groups = decoder.readArray(decodeGroup)
 
@@ -43,7 +43,7 @@ const decode = async rawData => {
   }
 }
 
-const parse = async data => {
+const parse = async (data) => {
   const groupsWithError = data.groups.filter(({ errorCode }) => failure(errorCode))
   if (groupsWithError.length > 0) {
     throw createErrorFromCode(groupsWithError[0].errorCode)

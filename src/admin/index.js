@@ -27,7 +27,7 @@ const NO_CONTROLLER_ID = -1
 const { values, keys, entries } = Object
 const eventNames = values(events)
 const eventKeys = keys(events)
-  .map(key => `admin.events.${key}`)
+  .map((key) => `admin.events.${key}`)
   .join(', ')
 
 const retryOnLeaderNotAvailable = (fn, opts = {}) => {
@@ -45,7 +45,7 @@ const retryOnLeaderNotAvailable = (fn, opts = {}) => {
   return waitFor(callback, opts)
 }
 
-const isConsumerGroupRunning = description => ['Empty', 'Dead'].includes(description.state)
+const isConsumerGroupRunning = (description) => ['Empty', 'Dead'].includes(description.state)
 const findTopicPartitions = async (cluster, topic) => {
   await cluster.addTargetTopic(topic)
   await cluster.refreshMetadataIfNecessary()
@@ -55,7 +55,7 @@ const findTopicPartitions = async (cluster, topic) => {
     .map(({ partitionId }) => partitionId)
     .sort()
 }
-const indexByPartition = array =>
+const indexByPartition = (array) =>
   array.reduce(
     (obj, { partition, ...props }) => Object.assign(obj, { [partition]: { ...props } }),
     {}
@@ -101,7 +101,7 @@ module.exports = ({
    */
   const listTopics = async () => {
     const { topicMetadata } = await cluster.metadata()
-    const topics = topicMetadata.map(t => t.topic)
+    const topics = topicMetadata.map((t) => t.topic)
     return topics
   }
 
@@ -187,7 +187,7 @@ module.exports = ({
         }
 
         if (e instanceof KafkaJSAggregateError) {
-          if (e.errors.every(error => error.type === 'TOPIC_ALREADY_EXISTS')) {
+          if (e.errors.every((error) => error.type === 'TOPIC_ALREADY_EXISTS')) {
             return false
           }
         }
@@ -251,7 +251,7 @@ module.exports = ({
       throw new KafkaJSNonRetriableError(`Invalid topics array ${topics}`)
     }
 
-    if (topics.filter(topic => typeof topic !== 'string').length > 0) {
+    if (topics.filter((topic) => typeof topic !== 'string').length > 0) {
       throw new KafkaJSNonRetriableError('Invalid topics array, the names must be a valid string')
     }
 
@@ -295,7 +295,7 @@ module.exports = ({
    * @param {string} topic
    */
 
-  const fetchTopicOffsets = async topic => {
+  const fetchTopicOffsets = async (topic) => {
     if (!topic || typeof topic !== 'string') {
       throw new KafkaJSNonRetriableError(`Invalid topic ${topic}`)
     }
@@ -312,7 +312,7 @@ module.exports = ({
           {
             topic,
             fromBeginning: false,
-            partitions: metadata.map(p => ({ partition: p.partitionId })),
+            partitions: metadata.map((p) => ({ partition: p.partitionId })),
           },
         ])
 
@@ -320,7 +320,7 @@ module.exports = ({
           {
             topic,
             fromBeginning: true,
-            partitions: metadata.map(p => ({ partition: p.partitionId })),
+            partitions: metadata.map((p) => ({ partition: p.partitionId })),
           },
         ])
 
@@ -362,7 +362,7 @@ module.exports = ({
         await cluster.refreshMetadataIfNecessary()
 
         const metadata = cluster.findTopicPartitionMetadata(topic)
-        const partitions = metadata.map(p => ({ partition: p.partitionId }))
+        const partitions = metadata.map((p) => ({ partition: p.partitionId }))
 
         const high = await cluster.fetchTopicsOffset([
           {
@@ -426,9 +426,9 @@ module.exports = ({
 
     const coordinator = await cluster.findGroupCoordinator({ groupId })
     const topicsToFetch = await Promise.all(
-      topics.map(async topic => {
+      topics.map(async (topic) => {
         const partitions = await findTopicPartitions(cluster, topic)
-        const partitionsToFetch = partitions.map(partition => ({ partition }))
+        const partitionsToFetch = partitions.map((partition) => ({ partition }))
         return { topic, partitions: partitionsToFetch }
       })
     )
@@ -493,7 +493,7 @@ module.exports = ({
     }
 
     const partitions = await findTopicPartitions(cluster, topic)
-    const partitionsToSeek = partitions.map(partition => ({
+    const partitionsToSeek = partitions.map((partition) => ({
       partition,
       offset: cluster.defaultOffset({ fromBeginning: earliest }),
     }))
@@ -540,12 +540,7 @@ module.exports = ({
     }
 
     return new Promise((resolve, reject) => {
-      consumer.on(consumer.events.FETCH, async () =>
-        consumer
-          .stop()
-          .then(resolve)
-          .catch(reject)
-      )
+      consumer.on(consumer.events.FETCH, async () => consumer.stop().then(resolve).catch(reject))
 
       consumer
         .run({
@@ -563,7 +558,7 @@ module.exports = ({
     })
   }
 
-  const isBrokerConfig = type =>
+  const isBrokerConfig = (type) =>
     [CONFIG_RESOURCE_TYPES.BROKER, CONFIG_RESOURCE_TYPES.BROKER_LOGGER].includes(type)
 
   /**
@@ -602,7 +597,7 @@ module.exports = ({
     }
 
     const validResourceTypes = Object.values(CONFIG_RESOURCE_TYPES)
-    const invalidType = resources.find(r => !validResourceTypes.includes(r.type))
+    const invalidType = resources.find((r) => !validResourceTypes.includes(r.type))
 
     if (invalidType) {
       throw new KafkaJSNonRetriableError(
@@ -610,7 +605,7 @@ module.exports = ({
       )
     }
 
-    const invalidName = resources.find(r => !r.name || typeof r.name !== 'string')
+    const invalidName = resources.find((r) => !r.name || typeof r.name !== 'string')
 
     if (invalidName) {
       throw new KafkaJSNonRetriableError(
@@ -619,7 +614,7 @@ module.exports = ({
     }
 
     const invalidConfigs = resources.find(
-      r => !Array.isArray(r.configNames) && r.configNames != null
+      (r) => !Array.isArray(r.configNames) && r.configNames != null
     )
 
     if (invalidConfigs) {
@@ -640,7 +635,7 @@ module.exports = ({
           defaultBroker: controller,
         })
 
-        const describeConfigsAction = async broker => {
+        const describeConfigsAction = async (broker) => {
           const targetBroker = broker || controller
           return targetBroker.describeConfigs({
             resources: resourcerByBroker.get(targetBroker),
@@ -691,7 +686,7 @@ module.exports = ({
     }
 
     const validResourceTypes = Object.values(CONFIG_RESOURCE_TYPES)
-    const invalidType = resources.find(r => !validResourceTypes.includes(r.type))
+    const invalidType = resources.find((r) => !validResourceTypes.includes(r.type))
 
     if (invalidType) {
       throw new KafkaJSNonRetriableError(
@@ -699,7 +694,7 @@ module.exports = ({
       )
     }
 
-    const invalidName = resources.find(r => !r.name || typeof r.name !== 'string')
+    const invalidName = resources.find((r) => !r.name || typeof r.name !== 'string')
 
     if (invalidName) {
       throw new KafkaJSNonRetriableError(
@@ -707,7 +702,7 @@ module.exports = ({
       )
     }
 
-    const invalidConfigs = resources.find(r => !Array.isArray(r.configEntries))
+    const invalidConfigs = resources.find((r) => !Array.isArray(r.configEntries))
 
     if (invalidConfigs) {
       const { configEntries } = invalidConfigs
@@ -716,8 +711,8 @@ module.exports = ({
       )
     }
 
-    const invalidConfigValue = resources.find(r =>
-      r.configEntries.some(e => typeof e.name !== 'string' || typeof e.value !== 'string')
+    const invalidConfigValue = resources.find((r) =>
+      r.configEntries.some((e) => typeof e.name !== 'string' || typeof e.value !== 'string')
     )
 
     if (invalidConfigValue) {
@@ -737,7 +732,7 @@ module.exports = ({
           defaultBroker: controller,
         })
 
-        const alterConfigsAction = async broker => {
+        const alterConfigsAction = async (broker) => {
           const targetBroker = broker || controller
           return targetBroker.alterConfigs({
             resources: resourcerByBroker.get(targetBroker),
@@ -790,7 +785,7 @@ module.exports = ({
    */
   const fetchTopicMetadata = async ({ topics = [] } = {}) => {
     if (topics) {
-      topics.forEach(topic => {
+      topics.forEach((topic) => {
         if (!topic || typeof topic !== 'string') {
           throw new KafkaJSNonRetriableError(`Invalid topic ${topic}`)
         }
@@ -800,7 +795,7 @@ module.exports = ({
     const metadata = await cluster.metadata({ topics })
 
     return {
-      topics: metadata.topicMetadata.map(topicMetadata => ({
+      topics: metadata.topicMetadata.map((topicMetadata) => ({
         name: topicMetadata.topic,
         partitions: topicMetadata.partitionMetadata,
       })),
@@ -872,9 +867,9 @@ module.exports = ({
    *
    * @return {Promise<GroupDescriptions>}
    */
-  const describeGroups = async groupIds => {
+  const describeGroups = async (groupIds) => {
     const coordinatorsForGroup = await Promise.all(
-      groupIds.map(async groupId => {
+      groupIds.map(async (groupId) => {
         const coordinator = await cluster.findGroupCoordinator({ groupId })
         return {
           coordinator,
@@ -922,12 +917,12 @@ module.exports = ({
    * @property {string} groupId
    * @property {number} errorCode
    */
-  const deleteGroups = async groupIds => {
+  const deleteGroups = async (groupIds) => {
     if (!groupIds || !Array.isArray(groupIds)) {
       throw new KafkaJSNonRetriableError(`Invalid groupIds array ${groupIds}`)
     }
 
-    const invalidGroupId = groupIds.some(g => typeof g !== 'string')
+    const invalidGroupId = groupIds.some((g) => typeof g !== 'string')
 
     if (invalidGroupId) {
       throw new KafkaJSNonRetriableError(`Invalid groupId name: ${JSON.stringify(invalidGroupId)}`)
@@ -956,7 +951,7 @@ module.exports = ({
 
         const res = await Promise.all(
           Object.keys(brokersPerNode).map(
-            async nodeId => await brokersPerNode[nodeId].deleteGroups(brokersPerGroups[nodeId])
+            async (nodeId) => await brokersPerNode[nodeId].deleteGroups(brokersPerGroups[nodeId])
           )
         )
 
@@ -1008,7 +1003,7 @@ module.exports = ({
 
     const partitionsByBroker = cluster.findLeaderForPartitions(
       topic,
-      partitions.map(p => p.partition)
+      partitions.map((p) => p.partition)
     )
 
     const partitionsFound = values(partitionsByBroker).flat()
@@ -1027,7 +1022,7 @@ module.exports = ({
         })
         return
       }
-      const { low } = topicOffsets.find(p => p.partition === partition) || {
+      const { low } = topicOffsets.find((p) => p.partition === partition) || {
         high: undefined,
         low: undefined,
       }
@@ -1052,7 +1047,7 @@ module.exports = ({
       (obj, [nodeId, nodePartitions]) => {
         obj[nodeId] = {
           topic,
-          partitions: partitions.filter(p => nodePartitions.includes(p.partition)),
+          partitions: partitions.filter((p) => nodePartitions.includes(p.partition)),
         }
         return obj
       },
@@ -1060,22 +1055,23 @@ module.exports = ({
     )
 
     const retrier = createRetry(retry)
-    return retrier(async bail => {
+    return retrier(async (bail) => {
       try {
         const partitionErrors = []
 
         const brokerRequests = entries(seekEntriesByBroker).map(
-          ([nodeId, { topic, partitions }]) => async () => {
-            const broker = await cluster.findBroker({ nodeId })
-            await broker.deleteRecords({ topics: [{ topic, partitions }] })
-            // remove successful entry so it's ignored on retry
-            delete seekEntriesByBroker[nodeId]
-          }
+          ([nodeId, { topic, partitions }]) =>
+            async () => {
+              const broker = await cluster.findBroker({ nodeId })
+              await broker.deleteRecords({ topics: [{ topic, partitions }] })
+              // remove successful entry so it's ignored on retry
+              delete seekEntriesByBroker[nodeId]
+            }
         )
 
         await Promise.all(
-          brokerRequests.map(request =>
-            request().catch(e => {
+          brokerRequests.map((request) =>
+            request().catch((e) => {
               if (e.name === 'KafkaJSDeleteTopicRecordsError') {
                 e.partitions.forEach(({ partition, offset, error }) => {
                   partitionErrors.push({
@@ -1148,7 +1144,7 @@ module.exports = ({
     let invalidType
     // Validate operation
     const validOperationTypes = Object.values(ACL_OPERATION_TYPES)
-    invalidType = acl.find(i => !validOperationTypes.includes(i.operation))
+    invalidType = acl.find((i) => !validOperationTypes.includes(i.operation))
 
     if (invalidType) {
       throw new KafkaJSNonRetriableError(
@@ -1158,7 +1154,7 @@ module.exports = ({
 
     // Validate resourcePatternTypes
     const validResourcePatternTypes = Object.values(RESOURCE_PATTERN_TYPES)
-    invalidType = acl.find(i => !validResourcePatternTypes.includes(i.resourcePatternType))
+    invalidType = acl.find((i) => !validResourcePatternTypes.includes(i.resourcePatternType))
 
     if (invalidType) {
       throw new KafkaJSNonRetriableError(
@@ -1170,7 +1166,7 @@ module.exports = ({
 
     // Validate permissionTypes
     const validPermissionTypes = Object.values(ACL_PERMISSION_TYPES)
-    invalidType = acl.find(i => !validPermissionTypes.includes(i.permissionType))
+    invalidType = acl.find((i) => !validPermissionTypes.includes(i.permissionType))
 
     if (invalidType) {
       throw new KafkaJSNonRetriableError(
@@ -1180,7 +1176,7 @@ module.exports = ({
 
     // Validate resourceTypes
     const validResourceTypes = Object.values(ACL_RESOURCE_TYPES)
-    invalidType = acl.find(i => !validResourceTypes.includes(i.resourceType))
+    invalidType = acl.find((i) => !validResourceTypes.includes(i.resourceType))
 
     if (invalidType) {
       throw new KafkaJSNonRetriableError(
@@ -1352,7 +1348,7 @@ module.exports = ({
     let invalidType
     // Validate operation
     const validOperationTypes = Object.values(ACL_OPERATION_TYPES)
-    invalidType = filters.find(i => !validOperationTypes.includes(i.operation))
+    invalidType = filters.find((i) => !validOperationTypes.includes(i.operation))
 
     if (invalidType) {
       throw new KafkaJSNonRetriableError(
@@ -1362,7 +1358,7 @@ module.exports = ({
 
     // Validate resourcePatternTypes
     const validResourcePatternTypes = Object.values(RESOURCE_PATTERN_TYPES)
-    invalidType = filters.find(i => !validResourcePatternTypes.includes(i.resourcePatternType))
+    invalidType = filters.find((i) => !validResourcePatternTypes.includes(i.resourcePatternType))
 
     if (invalidType) {
       throw new KafkaJSNonRetriableError(
@@ -1374,7 +1370,7 @@ module.exports = ({
 
     // Validate permissionTypes
     const validPermissionTypes = Object.values(ACL_PERMISSION_TYPES)
-    invalidType = filters.find(i => !validPermissionTypes.includes(i.permissionType))
+    invalidType = filters.find((i) => !validPermissionTypes.includes(i.permissionType))
 
     if (invalidType) {
       throw new KafkaJSNonRetriableError(
@@ -1384,7 +1380,7 @@ module.exports = ({
 
     // Validate resourceTypes
     const validResourceTypes = Object.values(ACL_RESOURCE_TYPES)
-    invalidType = filters.find(i => !validResourceTypes.includes(i.resourceType))
+    invalidType = filters.find((i) => !validResourceTypes.includes(i.resourceType))
 
     if (invalidType) {
       throw new KafkaJSNonRetriableError(
@@ -1461,7 +1457,7 @@ module.exports = ({
           )
         }
 
-        if (replicas.filter(replica => typeof replica !== 'number' || replica < 0).length >= 1) {
+        if (replicas.filter((replica) => typeof replica !== 'number' || replica < 0).length >= 1) {
           throw new KafkaJSNonRetriableError(
             `Invalid replica assignment: ${replicas} for topic: ${topic} on partition: ${partition}. Replicas must be a non negative number`
           )
@@ -1523,7 +1519,8 @@ module.exports = ({
         }
 
         if (
-          partitions.filter(partition => typeof partition !== 'number' || partition < 0).length >= 1
+          partitions.filter((partition) => typeof partition !== 'number' || partition < 0).length >=
+          1
         ) {
           throw new KafkaJSNonRetriableError(
             `Invalid partition array: ${partitions} for topic: ${topic}. The partition indices have to be a valid number greater than 0.`
@@ -1558,9 +1555,9 @@ module.exports = ({
       throw new KafkaJSNonRetriableError(`Event name should be one of ${eventKeys}`)
     }
 
-    return instrumentationEmitter.addListener(unwrapEvent(eventName), event => {
+    return instrumentationEmitter.addListener(unwrapEvent(eventName), (event) => {
       event.type = wrapEvent(event.type)
-      Promise.resolve(listener(event)).catch(e => {
+      Promise.resolve(listener(event)).catch((e) => {
         logger.error(`Failed to execute listener: ${e.message}`, {
           eventName,
           stack: e.stack,

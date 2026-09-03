@@ -17,7 +17,7 @@ describe('Broker > deleteAcls', () => {
     await seedBroker.connect()
 
     const metadata = await seedBroker.metadata()
-    const newBrokerData = metadata.brokers.find(b => b.nodeId === metadata.controllerId)
+    const newBrokerData = metadata.brokers.find((b) => b.nodeId === metadata.controllerId)
 
     broker = new Broker({
       connectionPool: createConnectionPool(newBrokerData),

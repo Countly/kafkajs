@@ -11,7 +11,7 @@ const { parse: parseV0 } = require('../v0/response')
  *       error_code => INT16
  */
 
-const decode = async rawData => {
+const decode = async (rawData) => {
   const decoder = new Decoder(rawData)
   return {
     throttleTime: decoder.readInt32(),
@@ -19,12 +19,12 @@ const decode = async rawData => {
   }
 }
 
-const decodeResponses = decoder => ({
+const decodeResponses = (decoder) => ({
   topic: decoder.readString(),
   partitions: decoder.readArray(decodePartitions),
 })
 
-const decodePartitions = decoder => ({
+const decodePartitions = (decoder) => ({
   partition: decoder.readInt32(),
   errorCode: decoder.readInt16(),
 })

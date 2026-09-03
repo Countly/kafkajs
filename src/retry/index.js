@@ -13,20 +13,20 @@ const randomFromRetryTime = (factor, retryTime) => {
 }
 
 const UNRECOVERABLE_ERRORS = ['RangeError', 'ReferenceError', 'SyntaxError', 'TypeError']
-const isErrorUnrecoverable = e => UNRECOVERABLE_ERRORS.includes(e.name)
-const isErrorRetriable = error =>
+const isErrorUnrecoverable = (e) => UNRECOVERABLE_ERRORS.includes(e.name)
+const isErrorRetriable = (error) =>
   (error.retriable || error.retriable !== false) && !isErrorUnrecoverable(error)
 
 const createRetriable = (configs, resolve, reject, fn) => {
   let aborted = false
   const { factor, multiplier, maxRetryTime, retries } = configs
 
-  const bail = error => {
+  const bail = (error) => {
     aborted = true
     reject(error || new Error('Aborted'))
   }
 
-  const calculateExponentialRetryTime = retryTime => {
+  const calculateExponentialRetryTime = (retryTime) => {
     return Math.min(randomFromRetryTime(factor, retryTime) * multiplier, maxRetryTime)
   }
 
@@ -42,7 +42,7 @@ const createRetriable = (configs, resolve, reject, fn) => {
 
     fn(bail, retryCount, retryTime)
       .then(resolve)
-      .catch(e => {
+      .catch((e) => {
         if (isErrorRetriable(e)) {
           if (shouldRetry) {
             scheduleRetry()
@@ -68,10 +68,12 @@ const createRetriable = (configs, resolve, reject, fn) => {
  * @param {import("../../types").RetryOptions} [opts]
  * @returns {Retrier}
  */
-module.exports = (opts = {}) => fn => {
-  return new Promise((resolve, reject) => {
-    const configs = Object.assign({}, RETRY_DEFAULT, opts)
-    const start = createRetriable(configs, resolve, reject, fn)
-    start(randomFromRetryTime(configs.factor, configs.initialRetryTime))
-  })
-}
+module.exports =
+  (opts = {}) =>
+  (fn) => {
+    return new Promise((resolve, reject) => {
+      const configs = Object.assign({}, RETRY_DEFAULT, opts)
+      const start = createRetriable(configs, resolve, reject, fn)
+      start(randomFromRetryTime(configs.factor, configs.initialRetryTime))
+    })
+  }

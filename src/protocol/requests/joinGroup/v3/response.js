@@ -16,7 +16,7 @@ const { parse, decode: decodeV2 } = require('../v2/response')
  *     member_id => STRING
  *     member_metadata => BYTES
  */
-const decode = async rawData => {
+const decode = async (rawData) => {
   const decoded = await decodeV2(rawData)
 
   return {

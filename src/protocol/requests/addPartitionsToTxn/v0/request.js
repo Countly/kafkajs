@@ -28,6 +28,6 @@ const encodeTopic = ({ topic, partitions }) => {
   return new Encoder().writeString(topic).writeArray(partitions.map(encodePartition))
 }
 
-const encodePartition = partition => {
+const encodePartition = (partition) => {
   return new Encoder().writeInt32(partition)
 }

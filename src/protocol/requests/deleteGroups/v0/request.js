@@ -8,7 +8,7 @@ const { DeleteGroups: apiKey } = require('../../apiKeys')
 
 /**
  */
-module.exports = groupIds => ({
+module.exports = (groupIds) => ({
   apiKey,
   apiVersion: 0,
   apiName: 'DeleteGroups',
@@ -17,6 +17,6 @@ module.exports = groupIds => ({
   },
 })
 
-const encodeGroups = group => {
+const encodeGroups = (group) => {
   return new Encoder().writeString(group)
 }

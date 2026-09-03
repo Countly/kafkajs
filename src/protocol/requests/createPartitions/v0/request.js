@@ -31,6 +31,6 @@ const encodeTopicPartitions = ({ topic, count, assignments = [] }) => {
     .writeNullableArray(assignments.map(encodeAssignments))
 }
 
-const encodeAssignments = brokerIds => {
+const encodeAssignments = (brokerIds) => {
   return new Encoder().writeNullableArray(brokerIds)
 }

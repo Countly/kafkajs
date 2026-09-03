@@ -51,11 +51,11 @@ const checkSnapshot = (trackedApis, tag, failures) => {
 }
 
 const checkBelowFloor = (model, failures) => {
-  const waived = new Map(model.waivers.map(waiver => [waiver.api, waiver]))
+  const waived = new Map(model.waivers.map((waiver) => [waiver.api, waiver]))
   for (const api of model.apis) {
     const waiver = waived.get(api.kafkaName)
     const allowed = waiver === undefined ? [] : waiver.versions
-    const unwaived = api.belowFloor.filter(version => allowed.indexOf(version) === -1)
+    const unwaived = api.belowFloor.filter((version) => allowed.indexOf(version) === -1)
     if (unwaived.length > 0) {
       failures.push(
         `D2 ${api.kafkaName} implements v${formatVersions(unwaived)} below the Kafka ${
@@ -64,7 +64,7 @@ const checkBelowFloor = (model, failures) => {
       )
     }
     if (waiver !== undefined) {
-      const stale = waiver.versions.filter(version => api.belowFloor.indexOf(version) === -1)
+      const stale = waiver.versions.filter((version) => api.belowFloor.indexOf(version) === -1)
       if (stale.length > 0) {
         failures.push(
           `D2 stale waiver: ${api.kafkaName} v${formatVersions(
@@ -74,7 +74,7 @@ const checkBelowFloor = (model, failures) => {
       }
     }
   }
-  const known = new Set(model.apis.map(api => api.kafkaName))
+  const known = new Set(model.apis.map((api) => api.kafkaName))
   for (const waiver of model.waivers) {
     if (!known.has(waiver.api)) {
       failures.push(`D2 waiver for unknown API "${waiver.api}" in scripts/compat/waivers.json`)
@@ -83,7 +83,7 @@ const checkBelowFloor = (model, failures) => {
 }
 
 const checkNotes = (model, notes, failures) => {
-  const known = new Set(model.apis.map(api => api.kafkaName))
+  const known = new Set(model.apis.map((api) => api.kafkaName))
   for (const name of Object.keys(notes.apis)) {
     if (!known.has(name))
       failures.push(`D4 orphan note for unknown API "${name}" in scripts/compat/notes.json`)
@@ -112,7 +112,7 @@ const checkErrors = (model, failures, reports) => {
   )
 }
 
-const check = options => {
+const check = (options) => {
   const failures = []
   const reports = []
   const config = readJson('config.json')
@@ -160,7 +160,7 @@ const check = options => {
     else reports.push(`D4 ${finding.message}`)
   }
 
-  for (const api of model.apis.filter(a => a.onFloor)) {
+  for (const api of model.apis.filter((a) => a.onFloor)) {
     reports.push(
       `D3 floor watch: ${api.kafkaName} v${Math.max.apply(
         null,
@@ -214,8 +214,8 @@ const main = async () => {
 
 if (require.main === module) {
   main().then(
-    code => process.exit(code),
-    error => {
+    (code) => process.exit(code),
+    (error) => {
       console.error(error.stack)
       process.exit(1)
     }

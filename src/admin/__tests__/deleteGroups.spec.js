@@ -41,7 +41,7 @@ describe('Admin', () => {
 
     const messagesConsumed = []
     await consumer.subscribe({ topic: topicName, fromBeginning: true })
-    consumer.run({ eachMessage: async event => messagesConsumed.push(event) })
+    consumer.run({ eachMessage: async (event) => messagesConsumed.push(event) })
     await waitForConsumerToJoinGroup(consumer)
 
     const messages = Array(1)

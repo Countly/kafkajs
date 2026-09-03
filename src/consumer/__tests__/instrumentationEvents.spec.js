@@ -64,7 +64,7 @@ describe('Consumer > Instrumentation Events', () => {
     let heartbeats = 0
 
     consumer = createTestConsumer({ heartbeatInterval: 0 })
-    consumer.on(consumer.events.HEARTBEAT, async event => {
+    consumer.on(consumer.events.HEARTBEAT, async (event) => {
       onHeartbeat(event)
       heartbeats++
     })
@@ -94,7 +94,7 @@ describe('Consumer > Instrumentation Events', () => {
     let commitOffsets = 0
 
     consumer = createTestConsumer()
-    consumer.on(consumer.events.COMMIT_OFFSETS, async event => {
+    consumer.on(consumer.events.COMMIT_OFFSETS, async (event) => {
       onCommitOffsets(event)
       commitOffsets++
     })
@@ -134,7 +134,7 @@ describe('Consumer > Instrumentation Events', () => {
     let groupJoin = 0
 
     consumer = createTestConsumer()
-    consumer.on(consumer.events.GROUP_JOIN, async event => {
+    consumer.on(consumer.events.GROUP_JOIN, async (event) => {
       onGroupJoin(event)
       groupJoin++
     })
@@ -166,7 +166,7 @@ describe('Consumer > Instrumentation Events', () => {
     let fetch = 0
 
     consumer = createTestConsumer()
-    consumer.on(consumer.events.FETCH, async event => {
+    consumer.on(consumer.events.FETCH, async (event) => {
       onFetch(event)
       fetch++
     })
@@ -194,7 +194,7 @@ describe('Consumer > Instrumentation Events', () => {
     let fetch = 0
 
     consumer = createTestConsumer()
-    consumer.on(consumer.events.FETCH_START, async event => {
+    consumer.on(consumer.events.FETCH_START, async (event) => {
       onFetchStart(event)
       fetch++
     })
@@ -220,7 +220,7 @@ describe('Consumer > Instrumentation Events', () => {
     let startBatchProcess = 0
 
     consumer = createTestConsumer()
-    consumer.on(consumer.events.START_BATCH_PROCESS, async event => {
+    consumer.on(consumer.events.START_BATCH_PROCESS, async (event) => {
       onStartBatchProcess(event)
       startBatchProcess++
     })
@@ -254,7 +254,7 @@ describe('Consumer > Instrumentation Events', () => {
     let endBatchProcess = 0
 
     consumer = createTestConsumer()
-    consumer.on(consumer.events.END_BATCH_PROCESS, async event => {
+    consumer.on(consumer.events.END_BATCH_PROCESS, async (event) => {
       onEndBatchProcess(event)
       endBatchProcess++
     })
@@ -459,11 +459,11 @@ describe('Consumer > Instrumentation Events', () => {
     })
 
     let memberId
-    consumer.on(consumer.events.GROUP_JOIN, async event => {
+    consumer.on(consumer.events.GROUP_JOIN, async (event) => {
       memberId = memberId || event.payload.memberId
     })
 
-    consumer.on(consumer.events.REBALANCING, async event => {
+    consumer.on(consumer.events.REBALANCING, async (event) => {
       onRebalancing(event)
     })
 
@@ -535,7 +535,7 @@ describe('Consumer > Instrumentation Events', () => {
     await consumer
       .connect()
       .then(() => consumer.run({ eachMessage: () => true }))
-      .catch(e => e)
+      .catch((e) => e)
 
     expect(requestListener).toHaveBeenCalledWith({
       id: expect.any(Number),
@@ -577,11 +577,11 @@ describe('Consumer > Instrumentation Events', () => {
       consumer
         .connect()
         .then(() => consumer.run({ eachMessage: () => true }))
-        .catch(e => e),
+        .catch((e) => e),
       consumer2
         .connect()
         .then(() => consumer.run({ eachMessage: () => true }))
-        .catch(e => e),
+        .catch((e) => e),
     ])
 
     // add more concurrent requests to make we increate the requests
@@ -631,7 +631,7 @@ describe('Consumer > Instrumentation Events', () => {
 
     await consumer.connect()
     await Promise.all(
-      topicNames.map(topicName => consumer.subscribe({ topic: topicName, fromBeginning: true }))
+      topicNames.map((topicName) => consumer.subscribe({ topic: topicName, fromBeginning: true }))
     )
 
     consumer.run({ eachMessage: () => {} })
@@ -648,14 +648,14 @@ describe('Consumer > Instrumentation Events', () => {
 
     const onReceivedUnsubscribedTopics = jest.fn()
     let receivedUnsubscribedTopics = 0
-    consumer2.on(consumer.events.RECEIVED_UNSUBSCRIBED_TOPICS, async event => {
+    consumer2.on(consumer.events.RECEIVED_UNSUBSCRIBED_TOPICS, async (event) => {
       onReceivedUnsubscribedTopics(event)
       receivedUnsubscribedTopics++
     })
 
     await consumer2.connect()
     await Promise.all(
-      [topicNames[1], otherTopic].map(topicName =>
+      [topicNames[1], otherTopic].map((topicName) =>
         consumer2.subscribe({ topic: topicName, fromBeginning: true })
       )
     )

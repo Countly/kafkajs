@@ -55,65 +55,56 @@ module.exports = ({
   },
 })
 
-const topicEncoder = compression => async ({
-  topic,
-  partitions,
-  transactionalId,
-  producerId,
-  producerEpoch,
-}) => {
-  const encodePartitions = partitionsEncoder(compression)
-  const encodedPartitions = []
+const topicEncoder =
+  (compression) =>
+  async ({ topic, partitions, transactionalId, producerId, producerEpoch }) => {
+    const encodePartitions = partitionsEncoder(compression)
+    const encodedPartitions = []
 
-  for (const data of partitions) {
-    encodedPartitions.push(
-      await encodePartitions({ ...data, transactionalId, producerId, producerEpoch })
-    )
+    for (const data of partitions) {
+      encodedPartitions.push(
+        await encodePartitions({ ...data, transactionalId, producerId, producerEpoch })
+      )
+    }
+
+    return new Encoder().writeString(topic).writeArray(encodedPartitions)
   }
 
-  return new Encoder().writeString(topic).writeArray(encodedPartitions)
-}
+const partitionsEncoder =
+  (compression) =>
+  async ({ partition, messages, transactionalId, firstSequence, producerId, producerEpoch }) => {
+    const dateNow = Date.now()
+    const messageTimestamps = messages
+      .map((m) => m.timestamp)
+      .filter((timestamp) => timestamp != null)
+      .sort()
 
-const partitionsEncoder = compression => async ({
-  partition,
-  messages,
-  transactionalId,
-  firstSequence,
-  producerId,
-  producerEpoch,
-}) => {
-  const dateNow = Date.now()
-  const messageTimestamps = messages
-    .map(m => m.timestamp)
-    .filter(timestamp => timestamp != null)
-    .sort()
+    const timestamps = messageTimestamps.length === 0 ? [dateNow] : messageTimestamps
+    const firstTimestamp = timestamps[0]
+    const maxTimestamp = timestamps[timestamps.length - 1]
 
-  const timestamps = messageTimestamps.length === 0 ? [dateNow] : messageTimestamps
-  const firstTimestamp = timestamps[0]
-  const maxTimestamp = timestamps[timestamps.length - 1]
+    const records = messages.map((message, i) =>
+      Record({
+        ...message,
+        offsetDelta: i,
+        timestampDelta: (message.timestamp || dateNow) - firstTimestamp,
+      })
+    )
 
-  const records = messages.map((message, i) =>
-    Record({
-      ...message,
-      offsetDelta: i,
-      timestampDelta: (message.timestamp || dateNow) - firstTimestamp,
+    const recordBatch = await RecordBatch({
+      compression,
+      records,
+      firstTimestamp,
+      maxTimestamp,
+      producerId,
+      producerEpoch,
+      firstSequence,
+      transactional: !!transactionalId,
+      lastOffsetDelta: records.length - 1,
     })
-  )
 
-  const recordBatch = await RecordBatch({
-    compression,
-    records,
-    firstTimestamp,
-    maxTimestamp,
-    producerId,
-    producerEpoch,
-    firstSequence,
-    transactional: !!transactionalId,
-    lastOffsetDelta: records.length - 1,
-  })
-
-  return new Encoder()
-    .writeInt32(partition)
-    .writeInt32(recordBatch.size())
-    .writeEncoder(recordBatch)
-}
+    return new Encoder()
+      .writeInt32(partition)
+      .writeInt32(recordBatch.size())
+      .writeEncoder(recordBatch)
+  }

@@ -12,7 +12,7 @@ const { KafkaJSError } = require('../../errors')
 const createProducer = require('../index')
 const createConsumer = require('../../consumer/index')
 
-const arrayUnique = a => [...new Set(a)]
+const arrayUnique = (a) => [...new Set(a)]
 
 describe('Producer > Idempotent producer', () => {
   let producer, consumer, topicName, cluster, messages
@@ -60,7 +60,7 @@ describe('Producer > Idempotent producer', () => {
       await producer.send({ acks: -1, topic: topicName, messages: [m] })
     }
 
-    await consumer.run({ eachMessage: async message => messagesConsumed.push(message) })
+    await consumer.run({ eachMessage: async (message) => messagesConsumed.push(message) })
 
     await waitForMessages(messagesConsumed, { number: messages.length })
 
@@ -86,7 +86,7 @@ describe('Producer > Idempotent producer', () => {
       await producer.send({ acks: -1, topic: topicName, messages: [m] })
     }
 
-    await consumer.run({ eachMessage: async message => messagesConsumed.push(message) })
+    await consumer.run({ eachMessage: async (message) => messagesConsumed.push(message) })
 
     await waitForMessages(messagesConsumed, { number: messages.length })
 
@@ -115,7 +115,7 @@ describe('Producer > Idempotent producer', () => {
       await producer.send({ acks: -1, topic: topicName, messages: [m] })
     }
 
-    await consumer.run({ eachMessage: async message => messagesConsumed.push(message) })
+    await consumer.run({ eachMessage: async (message) => messagesConsumed.push(message) })
 
     await waitForMessages(messagesConsumed, { number: messages.length })
 
@@ -128,10 +128,10 @@ describe('Producer > Idempotent producer', () => {
     const messagesConsumed = []
 
     await Promise.all(
-      messages.map(m => producer.send({ acks: -1, topic: topicName, messages: [m] }))
+      messages.map((m) => producer.send({ acks: -1, topic: topicName, messages: [m] }))
     )
 
-    await consumer.run({ eachMessage: async message => messagesConsumed.push(message) })
+    await consumer.run({ eachMessage: async (message) => messagesConsumed.push(message) })
 
     await waitForMessages(messagesConsumed, { number: messages.length })
     expect(messagesConsumed).toHaveLength(messages.length)
@@ -149,11 +149,11 @@ describe('Producer > Idempotent producer', () => {
     }
 
     await Promise.allSettled(
-      messages.map(m => producer.send({ acks: -1, topic: topicName, messages: [m] }))
+      messages.map((m) => producer.send({ acks: -1, topic: topicName, messages: [m] }))
     )
 
     const messagesConsumed = []
-    await consumer.run({ eachMessage: async message => messagesConsumed.push(message) })
+    await consumer.run({ eachMessage: async (message) => messagesConsumed.push(message) })
 
     await waitForMessages(messagesConsumed, { number: messages.length })
 
@@ -175,11 +175,11 @@ describe('Producer > Idempotent producer', () => {
     }
 
     await Promise.allSettled(
-      messages.map(m => producer.send({ acks: -1, topic: topicName, messages: [m] }))
+      messages.map((m) => producer.send({ acks: -1, topic: topicName, messages: [m] }))
     )
 
     const messagesConsumed = []
-    await consumer.run({ eachMessage: async message => messagesConsumed.push(message) })
+    await consumer.run({ eachMessage: async (message) => messagesConsumed.push(message) })
 
     await waitForMessages(messagesConsumed, { number: messages.length })
 
@@ -203,10 +203,10 @@ describe('Producer > Idempotent producer', () => {
     const messagesConsumed = []
 
     await Promise.all(
-      messages.map(m => producer.send({ acks: -1, topic: topicName, messages: [m] }))
+      messages.map((m) => producer.send({ acks: -1, topic: topicName, messages: [m] }))
     )
 
-    await consumer.run({ eachMessage: async message => messagesConsumed.push(message) })
+    await consumer.run({ eachMessage: async (message) => messagesConsumed.push(message) })
 
     await waitForMessages(messagesConsumed, { number: messages.length })
 

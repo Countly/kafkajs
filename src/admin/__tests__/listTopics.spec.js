@@ -13,7 +13,7 @@ describe('Admin', () => {
       `test-topic-${secureRandom()}`,
       `test-topic-${secureRandom()}`,
     ]
-    const topics = existingTopicNames.map(n => ({
+    const topics = existingTopicNames.map((n) => ({
       topic: n,
     }))
     await admin.createTopics({ topics })

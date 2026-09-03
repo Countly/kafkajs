@@ -3,7 +3,7 @@ const groupBy = require('./groupBy')
 describe('Utils > groupBy', () => {
   it('group items by the function return', async () => {
     const input = [1, 2, 3, 4]
-    const groupFn = item => (item % 2 === 0 ? 'even' : 'odd')
+    const groupFn = (item) => (item % 2 === 0 ? 'even' : 'odd')
     const output = new Map([
       ['even', [2, 4]],
       ['odd', [1, 3]],
@@ -14,7 +14,7 @@ describe('Utils > groupBy', () => {
 
   it('works with async functions', async () => {
     const input = [1, 2, 3, 4]
-    const groupFn = async item => (item % 2 === 0 ? 'even' : 'odd')
+    const groupFn = async (item) => (item % 2 === 0 ? 'even' : 'odd')
     const output = new Map([
       ['even', [2, 4]],
       ['odd', [1, 3]],
@@ -28,7 +28,7 @@ describe('Utils > groupBy', () => {
     const odd = {}
 
     const input = [1, 2, 3, 4]
-    const groupFn = async item => (item % 2 === 0 ? even : odd)
+    const groupFn = async (item) => (item % 2 === 0 ? even : odd)
     const output = new Map([
       [even, [2, 4]],
       [odd, [1, 3]],

@@ -18,7 +18,7 @@
  */
 
 /** [0, 1, 2, 5] -> "0-2, 5"; [] -> "none". */
-const formatVersions = versions => {
+const formatVersions = (versions) => {
   if (versions === null || versions === undefined || versions.length === 0) return 'none'
   const sorted = versions.slice().sort((a, b) => a - b)
   const parts = []
@@ -40,7 +40,7 @@ const formatVersions = versions => {
  *           hasCodec: boolean, stub: boolean, planned: string }} input
  * @returns {{ gap: string, onFloor: boolean, belowFloor: number[] }}
  */
-const classify = input => {
+const classify = (input) => {
   const none = { onFloor: false, belowFloor: [] }
   if (input.stub) return Object.assign({ gap: 'stub' }, none)
   if (!input.hasCodec) {
@@ -52,7 +52,7 @@ const classify = input => {
     return Object.assign({ gap: 'unknown' }, none)
   }
   const forkMax = Math.max.apply(null, fork)
-  const belowFloor = fork.filter(version => version < valid.min).sort((a, b) => a - b)
+  const belowFloor = fork.filter((version) => version < valid.min).sort((a, b) => a - b)
   const onFloor = forkMax === valid.min && valid.min > 0
   let gap
   if (forkMax === valid.max) gap = 'current'

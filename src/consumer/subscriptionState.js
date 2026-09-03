@@ -1,4 +1,4 @@
-const createState = topic => ({
+const createState = (topic) => ({
   topic,
   paused: new Set(),
   pauseAll: false,
@@ -37,7 +37,7 @@ module.exports = class SubscriptionState {
         state.resumed.clear()
         state.pauseAll = true
       } else if (Array.isArray(partitions)) {
-        partitions.forEach(partition => {
+        partitions.forEach((partition) => {
           state.paused.add(partition)
           state.resumed.delete(partition)
         })
@@ -60,7 +60,7 @@ module.exports = class SubscriptionState {
         state.resumed.clear()
         state.pauseAll = false
       } else if (Array.isArray(partitions)) {
-        partitions.forEach(partition => {
+        partitions.forEach((partition) => {
           state.paused.delete(partition)
 
           if (state.pauseAll) {
@@ -91,7 +91,7 @@ module.exports = class SubscriptionState {
   active() {
     return Object.values(this.assignedPartitionsByTopic).map(({ topic, partitions }) => ({
       topic,
-      partitions: partitions.filter(partition => !this.isPaused(topic, partition)).sort(),
+      partitions: partitions.filter((partition) => !this.isPaused(topic, partition)).sort(),
     }))
   }
 
@@ -103,7 +103,7 @@ module.exports = class SubscriptionState {
     return Object.values(this.assignedPartitionsByTopic)
       .map(({ topic, partitions }) => ({
         topic,
-        partitions: partitions.filter(partition => this.isPaused(topic, partition)).sort(),
+        partitions: partitions.filter((partition) => this.isPaused(topic, partition)).sort(),
       }))
       .filter(({ partitions }) => partitions.length !== 0)
   }

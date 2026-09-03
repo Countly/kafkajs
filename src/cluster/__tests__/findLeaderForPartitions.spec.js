@@ -62,7 +62,7 @@ describe('Cluster > findLeaderForPartitions', () => {
     }
 
     const partitions = [0, 5]
-    expect(cluster.findLeaderForPartitions(topic, partitions)).toEqual({ '0': [0], '2': [5] })
+    expect(cluster.findLeaderForPartitions(topic, partitions)).toEqual({ 0: [0], 2: [5] })
   })
 
   it('does not include leaders for topics without metadata', () => {

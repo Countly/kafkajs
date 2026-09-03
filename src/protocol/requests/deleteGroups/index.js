@@ -1,10 +1,10 @@
 const versions = {
-  0: groupIds => {
+  0: (groupIds) => {
     const request = require('./v0/request')
     const response = require('./v0/response')
     return { request: request(groupIds), response }
   },
-  1: groupIds => {
+  1: (groupIds) => {
     const request = require('./v1/request')
     const response = require('./v1/response')
     return { request: request(groupIds), response }

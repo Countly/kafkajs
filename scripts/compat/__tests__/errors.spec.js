@@ -3,7 +3,7 @@ const notes = require('../notes.json')
 const config = require('../config.json')
 const { errorCodes } = require('../../../src/protocol/error')
 
-const snapshot = errors => ({ kafkaTag: 'test', errors })
+const snapshot = (errors) => ({ kafkaTag: 'test', errors })
 
 describe('scripts/compat/errors', () => {
   describe('compareErrorTables', () => {
@@ -103,7 +103,7 @@ describe('scripts/compat/errors', () => {
           alpha: { kafkaType: 'X', reason: 'r' },
         },
       })
-      expect(result.staleAliases.map(alias => alias.forkType)).toEqual([
+      expect(result.staleAliases.map((alias) => alias.forkType)).toEqual([
         'NOTLEADER',
         'NOT_LEADER',
         'Zeta',
@@ -126,7 +126,7 @@ describe('scripts/compat/errors', () => {
     })
 
     it('records the five historical KafkaJS names as aliases', () => {
-      expect(result.aliased.map(a => a.forkType).sort()).toEqual([
+      expect(result.aliased.map((a) => a.forkType).sort()).toEqual([
         'GROUP_COORDINATOR_NOT_AVAILABLE',
         'GROUP_LOAD_IN_PROGRESS',
         'NOT_COORDINATOR_FOR_GROUP',

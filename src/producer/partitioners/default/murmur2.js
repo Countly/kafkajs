@@ -11,7 +11,7 @@ const SEED = Long.fromValue(0x9747b28c)
 const M = Long.fromValue(0x5bd1e995)
 const R = Long.fromValue(24)
 
-module.exports = key => {
+module.exports = (key) => {
   const data = Buffer.isBuffer(key) ? key : Buffer.from(String(key))
   const length = data.length
 

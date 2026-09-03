@@ -23,10 +23,10 @@ const Header = require('../../header/v0')
  * @param [headers={}] {Object}
  */
 module.exports = ({ offsetDelta = 0, timestampDelta = 0, key, value, headers = {} }) => {
-  const headersArray = Object.keys(headers).flatMap(headerKey =>
+  const headersArray = Object.keys(headers).flatMap((headerKey) =>
     !Array.isArray(headers[headerKey])
       ? [{ key: headerKey, value: headers[headerKey] }]
-      : headers[headerKey].map(headerValue => ({ key: headerKey, value: headerValue }))
+      : headers[headerKey].map((headerValue) => ({ key: headerKey, value: headerValue }))
   )
 
   const sizeOfBody =
@@ -47,7 +47,7 @@ module.exports = ({ offsetDelta = 0, timestampDelta = 0, key, value, headers = {
     .writeVarIntArray(headersArray.map(Header))
 }
 
-const sizeOfHeaders = headersArray => {
+const sizeOfHeaders = (headersArray) => {
   let size = Encoder.sizeOfVarInt(headersArray.length)
 
   for (const header of headersArray) {

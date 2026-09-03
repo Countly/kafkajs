@@ -5,14 +5,14 @@ const Decoder = require('../../../decoder')
 const ENTRY_REGEX = /^([rsiev])=(.*)$/
 
 module.exports = {
-  decode: async rawData => {
+  decode: async (rawData) => {
     return new Decoder(rawData).readBytes()
   },
-  parse: async data => {
+  parse: async (data) => {
     const processed = data
       .toString()
       .split(',')
-      .map(str => {
+      .map((str) => {
         const [_, key, value] = str.match(ENTRY_REGEX)
         return [key, value]
       })

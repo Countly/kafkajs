@@ -12,13 +12,13 @@ const { parse: parseV1 } = require('../v1/response')
 
 const topicNameComparator = (a, b) => a.topic.localeCompare(b.topic)
 
-const topicErrors = decoder => ({
+const topicErrors = (decoder) => ({
   topic: decoder.readString(),
   errorCode: decoder.readInt16(),
   errorMessage: decoder.readString(),
 })
 
-const decode = async rawData => {
+const decode = async (rawData) => {
   const decoder = new Decoder(rawData)
   return {
     throttleTime: decoder.readInt32(),

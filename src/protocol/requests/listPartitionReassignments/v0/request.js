@@ -29,6 +29,6 @@ const encodeTopics = ({ topic, partitions }) => {
     .writeUVarIntBytes()
 }
 
-const encodePartitions = partition => {
+const encodePartitions = (partition) => {
   return new Encoder().writeInt32(partition)
 }

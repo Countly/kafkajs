@@ -11,14 +11,14 @@ const { failure, createErrorFromCode } = require('../../../error')
  *     resource_name => STRING
  */
 
-const decodeResources = decoder => ({
+const decodeResources = (decoder) => ({
   errorCode: decoder.readInt16(),
   errorMessage: decoder.readString(),
   resourceType: decoder.readInt8(),
   resourceName: decoder.readString(),
 })
 
-const decode = async rawData => {
+const decode = async (rawData) => {
   const decoder = new Decoder(rawData)
   const throttleTime = decoder.readInt32()
   const resources = decoder.readArray(decodeResources)
@@ -29,7 +29,7 @@ const decode = async rawData => {
   }
 }
 
-const parse = async data => {
+const parse = async (data) => {
   const resourcesWithError = data.resources.filter(({ errorCode }) => failure(errorCode))
   if (resourcesWithError.length > 0) {
     throw createErrorFromCode(resourcesWithError[0].errorCode)

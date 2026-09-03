@@ -2,7 +2,7 @@ const createWorker = require('./worker')
 const Batch = require('./batch')
 const seq = require('../utils/seq')
 
-const createBatch = partition =>
+const createBatch = (partition) =>
   new Batch('test-topic', 0, {
     partition: partition.toString(),
     highWatermark: '100',

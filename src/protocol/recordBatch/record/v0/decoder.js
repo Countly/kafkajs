@@ -31,14 +31,10 @@ module.exports = (decoder, batchContext = {}) => {
   const timestamp =
     timestampType === TimestampTypes.LOG_APPEND_TIME && maxTimestamp
       ? maxTimestamp
-      : Long.fromValue(firstTimestamp)
-          .add(timestampDelta)
-          .toString()
+      : Long.fromValue(firstTimestamp).add(timestampDelta).toString()
 
   const offsetDelta = decoder.readVarInt()
-  const offset = Long.fromValue(firstOffset)
-    .add(offsetDelta)
-    .toString()
+  const offset = Long.fromValue(firstOffset).add(offsetDelta).toString()
 
   const key = decoder.readVarIntBytes()
   const value = decoder.readVarIntBytes()
@@ -49,8 +45,8 @@ module.exports = (decoder, batchContext = {}) => {
         obj[key] === undefined
           ? value
           : Array.isArray(obj[key])
-          ? obj[key].concat([value])
-          : [obj[key], value],
+            ? obj[key].concat([value])
+            : [obj[key], value],
     }),
     {}
   )

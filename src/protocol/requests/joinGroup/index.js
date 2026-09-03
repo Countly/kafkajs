@@ -12,7 +12,7 @@ const requestTimeout = ({ rebalanceTimeout, sessionTimeout }) => {
   return Number.isSafeInteger(timeout + NETWORK_DELAY) ? timeout + NETWORK_DELAY : timeout
 }
 
-const logResponseError = memberId => memberId != null && memberId !== ''
+const logResponseError = (memberId) => memberId != null && memberId !== ''
 
 const versions = {
   0: ({ groupId, sessionTimeout, memberId, protocolType, groupProtocols }) => {

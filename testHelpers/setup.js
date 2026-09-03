@@ -46,5 +46,5 @@ const path = require('path')
 // when running tests
 glob
   .sync('src/protocol/requests/**/v*/@(request|response).js')
-  .map(file => path.resolve(file))
+  .map((file) => path.resolve(file))
   .map(require)

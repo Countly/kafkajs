@@ -11,25 +11,25 @@ const { KafkaJSAggregateError, KafkaJSCreateTopicError } = require('../../../../
 
 const topicNameComparator = (a, b) => a.topic.localeCompare(b.topic)
 
-const topicErrors = decoder => ({
+const topicErrors = (decoder) => ({
   topic: decoder.readString(),
   errorCode: decoder.readInt16(),
 })
 
-const decode = async rawData => {
+const decode = async (rawData) => {
   const decoder = new Decoder(rawData)
   return {
     topicErrors: decoder.readArray(topicErrors).sort(topicNameComparator),
   }
 }
 
-const parse = async data => {
+const parse = async (data) => {
   const topicsWithError = data.topicErrors.filter(({ errorCode }) => failure(errorCode))
   if (topicsWithError.length > 0) {
     throw new KafkaJSAggregateError(
       'Topic creation errors',
       topicsWithError.map(
-        error => new KafkaJSCreateTopicError(createErrorFromCode(error.errorCode), error.topic)
+        (error) => new KafkaJSCreateTopicError(createErrorFromCode(error.errorCode), error.topic)
       )
     )
   }

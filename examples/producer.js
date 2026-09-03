@@ -7,7 +7,7 @@ const PrettyConsoleLogger = require('./prettyConsoleLogger')
 const findIPv4 = () => {
   const iface = Object.values(os.networkInterfaces())
     .flat()
-    .find(i => i && i.family === 'IPv4' && !i.internal)
+    .find((i) => i && i.family === 'IPv4' && !i.internal)
   return iface?.address
 }
 
@@ -34,7 +34,7 @@ const topic = 'topic-test'
 const producer = kafka.producer()
 
 const getRandomNumber = () => Math.round(Math.random() * 1000)
-const createMessage = num => ({
+const createMessage = (num) => ({
   key: `key-${num}`,
   value: `value-${num}-${new Date().toISOString()}`,
   headers: {
@@ -47,7 +47,7 @@ let requestNumber = 0
 const sendMessage = () => {
   const messages = Array(getRandomNumber())
     .fill()
-    .map(_ => createMessage(getRandomNumber()))
+    .map((_) => createMessage(getRandomNumber()))
 
   const requestId = requestNumber++
   msgNumber += messages.length
@@ -58,13 +58,13 @@ const sendMessage = () => {
       compression: CompressionTypes.GZIP,
       messages,
     })
-    .then(response => {
+    .then((response) => {
       kafka.logger().info(`Messages sent #${requestId}`, {
         response,
         msgNumber,
       })
     })
-    .catch(e => kafka.logger().error(`[example/producer] ${e.message}`, { stack: e.stack }))
+    .catch((e) => kafka.logger().error(`[example/producer] ${e.message}`, { stack: e.stack }))
 }
 
 let intervalId
@@ -73,13 +73,13 @@ const run = async () => {
   intervalId = setInterval(sendMessage, 3000)
 }
 
-run().catch(e => kafka.logger().error(`[example/producer] ${e.message}`, { stack: e.stack }))
+run().catch((e) => kafka.logger().error(`[example/producer] ${e.message}`, { stack: e.stack }))
 
 const errorTypes = ['unhandledRejection', 'uncaughtException']
 const signalTraps = ['SIGTERM', 'SIGINT', 'SIGUSR2']
 
-errorTypes.forEach(type => {
-  process.on(type, async e => {
+errorTypes.forEach((type) => {
+  process.on(type, async (e) => {
     try {
       kafka.logger().info(`process.on ${type}`)
       kafka.logger().error(e.message, { stack: e.stack })
@@ -91,7 +91,7 @@ errorTypes.forEach(type => {
   })
 })
 
-signalTraps.forEach(type => {
+signalTraps.forEach((type) => {
   process.once(type, async () => {
     console.log('')
     kafka.logger().info('[example/producer] disconnecting')

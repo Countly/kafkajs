@@ -25,7 +25,7 @@ const { parse, decode: decodeV1 } = require('../v5/response')
  *       isr => INT32
  *       offline_replicas => INT32
  */
-const decode = async rawData => {
+const decode = async (rawData) => {
   const decoded = await decodeV1(rawData)
 
   return {

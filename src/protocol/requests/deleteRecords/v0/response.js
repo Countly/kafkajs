@@ -15,14 +15,14 @@ const { failure, createErrorFromCode } = require('../../../error')
 
 const topicNameComparator = (a, b) => a.topic.localeCompare(b.topic)
 
-const decode = async rawData => {
+const decode = async (rawData) => {
   const decoder = new Decoder(rawData)
   return {
     throttleTime: decoder.readInt32(),
     topics: decoder
-      .readArray(decoder => ({
+      .readArray((decoder) => ({
         topic: decoder.readString(),
-        partitions: decoder.readArray(decoder => ({
+        partitions: decoder.readArray((decoder) => ({
           partition: decoder.readInt32(),
           lowWatermark: decoder.readInt64(),
           errorCode: decoder.readInt16(),
@@ -32,7 +32,7 @@ const decode = async rawData => {
   }
 }
 
-const parse = requestTopics => async data => {
+const parse = (requestTopics) => async (data) => {
   const topicsWithErrors = data.topics
     .map(({ partitions }) => ({
       partitionsWithErrors: partitions.filter(({ errorCode }) => failure(errorCode)),
@@ -51,7 +51,7 @@ const parse = requestTopics => async data => {
         partition,
         error: createErrorFromCode(errorCode),
         // attach the original offset from the request, onto the error response
-        offset: requestPartitions.find(p => p.partition === partition).offset,
+        offset: requestPartitions.find((p) => p.partition === partition).offset,
       })),
     })
   }

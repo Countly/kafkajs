@@ -10,7 +10,7 @@ const { failure, createErrorFromCode } = require('../../../error')
  *       partition => INT32
  *       error_code => INT16
  */
-const decode = async rawData => {
+const decode = async (rawData) => {
   const decoder = new Decoder(rawData)
   const throttleTime = decoder.readInt32()
   const topics = await decoder.readArrayAsync(decodeTopic)
@@ -21,17 +21,17 @@ const decode = async rawData => {
   }
 }
 
-const decodeTopic = async decoder => ({
+const decodeTopic = async (decoder) => ({
   topic: decoder.readString(),
   partitions: await decoder.readArrayAsync(decodePartition),
 })
 
-const decodePartition = decoder => ({
+const decodePartition = (decoder) => ({
   partition: decoder.readInt32(),
   errorCode: decoder.readInt16(),
 })
 
-const parse = async data => {
+const parse = async (data) => {
   const topicsWithErrors = data.topics
     .map(({ partitions }) => ({
       partitionsWithErrors: partitions.filter(({ errorCode }) => failure(errorCode)),

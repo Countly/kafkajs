@@ -16,10 +16,10 @@ const { failure, createErrorFromCode, errorCodes } = require('../../../error')
  */
 
 const { code: MEMBER_ID_REQUIRED_ERROR_CODE } = errorCodes.find(
-  e => e.type === 'MEMBER_ID_REQUIRED'
+  (e) => e.type === 'MEMBER_ID_REQUIRED'
 )
 
-const parse = async data => {
+const parse = async (data) => {
   if (failure(data.errorCode)) {
     if (data.errorCode === MEMBER_ID_REQUIRED_ERROR_CODE) {
       throw new KafkaJSMemberIdRequired(createErrorFromCode(data.errorCode), {
