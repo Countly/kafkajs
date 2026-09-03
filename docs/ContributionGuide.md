@@ -3,19 +3,19 @@ id: contribution-guide
 title: Contributing
 ---
 
-KafkaJS is an open-source project where development takes place in the open on GitHub. Although the project is maintained by a small group of dedicated volunteers, we are grateful to the community for bug fixes, feature development and other contributions.
+This is an open-source project where development takes place in the open on GitHub. We're grateful for bug fixes, feature development and other contributions.
 
-Issues are tracked in [Github](https://github.com/Countly/kafkajs/issues). For first time contributors, we maintain a list of [Good First Issues](https://github.com/tulios/kafkajs/issues?q=is%3Aopen+is%3Aissue+label%3A%22good+first+issue%22). If you are planning to implement a new feature or work on fixing a bug, make sure to [check the issue tracker](https://github.com/Countly/kafkajs/issues) to see if someone is already working on it, or [open an issue](https://github.com/tulios/kafkajs/issues/new) before you start your work. [The Slack channel](https://join.slack.com/t/kafkajs/shared_invite/zt-1ezd5395v-SOpTqYoYfRCyPKOkUggK0A) is also a good place if you want to discuss your plans before starting your implementation.
+Issues are tracked on [GitHub](https://github.com/Countly/kafkajs/issues). If you're planning to implement a new feature or fix a bug, check the issue tracker first to see if someone is already working on it, or open an issue before you start.
 
 ## TL;DR
 
-The following chapters will get you set up with a working development environment and teach you how to run the tests. If you are already familiar with the project setup, here's the gist:
+[Development Environment](DevelopmentEnvironment.md), [Running Kafka in Development](DockerLocal.md) and [Testing](Testing.md) cover the full setup and how to run the tests. If you're already familiar with the project setup, here's the gist:
 
-With `docker`, `docker-compose` and `yarn` available:
+With `docker` (Compose v2), `yarn` and Node 22+ available:
 
 ```sh
-yarn test
-# or
+yarn test:unit
+# or, with a cluster running (see Development Environment):
 ./scripts/dockerComposeUp.sh
 ./scripts/createScramCredentials.sh
 yarn test:local:watch

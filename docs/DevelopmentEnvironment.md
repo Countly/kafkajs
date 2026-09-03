@@ -3,54 +3,48 @@ id: development-environment
 title: Development Environment
 ---
 
-When developing KafkaJS, we run a Kafka cluster in a similar way to what is described in [Running Kafka in Development](DockerLocal.md), using [`docker`](https://docs.docker.com/) and [`docker-compose`](https://docs.docker.com/compose/install/). Before you proceed, make sure that you have both `docker` and `docker-compose` available.
+## Requirements
 
-KafkaJS is assuming that [`yarn`](https://yarnpkg.com/) is available globally, so if you haven't installed it yet: `npm install --global yarn`.
+- [Node.js](https://nodejs.org/) 22 or later
+- [`yarn`](https://yarnpkg.com/) (`npm install --global yarn`)
+- [`docker`](https://docs.docker.com/) 20.10.4 or later, with the `docker compose` plugin (Compose v2 — not the standalone `docker-compose` binary)
 
 ## Running Kafka
 
-For testing KafkaJS we use a multi-broker Kafka cluster as well as Zookeeper for authentication. To start the cluster and generate credentials, run the following from the root of the repository:
+The test suite runs against a local 3-node Kafka cluster (KRaft mode, no ZooKeeper) started with `docker compose`. See [Running Kafka in Development](DockerLocal.md) for the cluster layout.
+
+From the root of the repository:
 
 ```sh
-# This will run a Kafka cluster configured with your current IP
 ./scripts/dockerComposeUp.sh
 ./scripts/createScramCredentials.sh
 ```
 
-This boots the Kafka cluster using the default docker-compose.yml file described in [scripts/dockerComposeUp.sh](../scripts/dockerComposeUp.sh). If you want to run a different version of Kafka, specify a different compose file using the `COMPOSE_FILE` environment variable:
+This boots the cluster described by `docker-compose.yml` (see [scripts/dockerComposeUp.sh](../scripts/dockerComposeUp.sh)). By default it runs `apache/kafka:4.3.1`; pin a different broker version with `KAFKA_VERSION`:
 
 ```sh
-COMPOSE_FILE="docker-compose.2_3.yml" ./scripts/dockerComposeUp.sh
+KAFKA_VERSION=4.1.2 ./scripts/dockerComposeUp.sh
 ```
 
-If you run `docker-compose -f docker-compose.2_3.yml ps` (specify whichever compose file you used in the step above), you should see something like:
+To use a different compose file (for example the OAUTHBEARER variant), set `COMPOSE_FILE`:
 
 ```sh
-$ docker-compose -f docker-compose.2_3.yml ps
-WARNING: The HOST_IP variable is not set. Defaulting to a blank string.
-      Name                    Command               State                                   Ports
-----------------------------------------------------------------------------------------------------------------------------------
-kafkajs_kafka1_1   start-kafka.sh                   Up      0.0.0.0:9092->9092/tcp, 0.0.0.0:9093->9093/tcp, 0.0.0.0:9094->9094/tcp
-kafkajs_kafka2_1   start-kafka.sh                   Up      0.0.0.0:9095->9095/tcp, 0.0.0.0:9096->9096/tcp, 0.0.0.0:9097->9097/tcp
-kafkajs_kafka3_1   start-kafka.sh                   Up      0.0.0.0:9098->9098/tcp, 0.0.0.0:9099->9099/tcp, 0.0.0.0:9100->9100/tcp
-kafkajs_zk_1       /bin/sh -c /usr/sbin/sshd  ...   Up      0.0.0.0:2181->2181/tcp, 22/tcp, 2888/tcp, 3888/tcp
+COMPOSE_FILE=docker-compose.oauthbearer.yml ./scripts/dockerComposeUp.sh
 ```
 
-The user credentials are listed in [scripts/createScramCredentials.sh](../scripts/createScramCredentials.sh). You can also pass in the `-h` flag to this script for more details and controls. 
+Once the cluster is up, `docker compose -f docker-compose.yml ps` should show `kafka1`, `kafka2` and `kafka3` running and healthy.
 
-You should now be able to connect to your cluster as such:
+`./scripts/createScramCredentials.sh` registers a SCRAM user (`testscram` by default) on the running cluster; pass `-h` to see the available options. The PLAIN SASL users (`test`, `bob`, `alice`) are provisioned as part of the broker configuration itself and need no extra step.
+
+You should now be able to connect to your cluster:
 
 ```javascript
 const fs = require('fs')
-const ip = require('ip')
-
 const { Kafka, CompressionTypes, logLevel } = require('./index')
-
-const host = process.env.HOST_IP || ip.address()
 
 const kafka = new Kafka({
   logLevel: logLevel.DEBUG,
-  brokers: [`${host}:9094`, `${host}:9097`, `${host}:9100`],
+  brokers: ['localhost:9094', 'localhost:9097', 'localhost:9100'],
   clientId: 'example-producer',
   ssl: {
     servername: 'localhost',
@@ -64,6 +58,18 @@ const kafka = new Kafka({
   },
 })
 ```
+
+## Running the tests
+
+- `yarn test:unit` runs the broker-free unit tests (no cluster required).
+- `yarn test:local` (or `yarn jest`) runs the full test suite against a cluster you've already started, defaulting to `KAFKA_VERSION=4.3.1`.
+- `./scripts/testWithKafka.sh 'yarn jest'` starts the cluster (if it isn't already running), waits for it, creates SCRAM credentials, runs the given command, and tears the cluster down afterwards. Pin a broker version the same way:
+
+  ```sh
+  KAFKA_VERSION=4.1.2 ./scripts/testWithKafka.sh 'yarn jest'
+  ```
+
+See [Testing](Testing.md) for the full breakdown of test scripts.
 
 ## Visual Studio Code Integration
 
