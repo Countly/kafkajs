@@ -19,6 +19,5 @@ if [ -z "$PARTITIONS" ]; then
   exit 1
 fi
 
-docker exec \
-  $(find_container_id) \
-  bash -c "kafka-topics --zookeeper zookeeper:2181 --alter --topic ${TOPIC} --partitions ${PARTITIONS}"
+docker exec $(find_container_id) \
+  bash -c "/opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka1:29092 --alter --topic ${TOPIC} --partitions ${PARTITIONS}"

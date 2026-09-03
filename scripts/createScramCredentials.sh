@@ -75,6 +75,12 @@ echo "username: '${kafka_username}'"
 echo "password_256: '${password_256}'"
 echo "password_512: '${password_512}'"
 
-docker exec \
- $(find_container_id) \
- bash -c "kafka-configs --zookeeper zookeeper:2181 --alter --add-config 'SCRAM-SHA-256=[iterations=8192,password=${password_256}],SCRAM-SHA-512=[password=${password_512}]' --entity-type users --entity-name ${kafka_username}"
+# Kafka 4.3.1's KRaft controller rejects two SCRAM upsertions for the same
+# user in one AlterUserScramCredentials request, even across mechanisms
+# (DuplicateResourceException: "A user credential cannot be altered twice in
+# the same request") -- so each mechanism is set in its own call.
+docker exec $(find_container_id) \
+  bash -c "/opt/kafka/bin/kafka-configs.sh --bootstrap-server kafka1:29092 --alter --add-config 'SCRAM-SHA-256=[iterations=8192,password=${password_256}]' --entity-type users --entity-name ${kafka_username}"
+
+docker exec $(find_container_id) \
+  bash -c "/opt/kafka/bin/kafka-configs.sh --bootstrap-server kafka1:29092 --alter --add-config 'SCRAM-SHA-512=[password=${password_512}]' --entity-type users --entity-name ${kafka_username}"
