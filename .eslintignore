@@ -1,5 +1,5 @@
 node_modules
 coverage
-*.md
-*.yml
-*.json
+website
+# ESLint 6 cannot parse import.meta
+scripts/packageSmoke.test.mjs
