@@ -7,6 +7,7 @@ const { randomUUID } = require('crypto')
 const semver = require('semver')
 const crypto = require('crypto')
 const Cluster = require('../src/cluster')
+const Broker = require('../src/broker')
 const waitFor = require('../src/utils/waitFor')
 const connectionBuilder = require('../src/cluster/connectionPoolBuilder')
 const ConnectionPool = require('../src/network/connectionPool')
@@ -197,6 +198,11 @@ const createModPartitioner = () => ({ partitionMetadata, message }) => {
 
 const testWaitFor = async (fn, opts = {}) => waitFor(fn, { ignoreTimeout: true, ...opts })
 
+// KRaft commits CreateTopics on the controller and propagates the metadata asynchronously, so a
+// broker that has not caught up yet answers UNKNOWN_TOPIC_OR_PARTITION (Kafka 4.x) or
+// LEADER_NOT_AVAILABLE (Kafka <= 3.x). The client bails on the former today -- see QUARANTINE.md R1.
+const TOPIC_NOT_READY_ERRORS = ['UNKNOWN_TOPIC_OR_PARTITION', 'LEADER_NOT_AVAILABLE']
+
 /**
  * @param {import("../types").KafkaJSError} errorType
  * @param {() => Promise<T>} fn
@@ -209,7 +215,9 @@ const retryProtocol = (errorType, fn) =>
       try {
         return await fn()
       } catch (e) {
-        if (e.type !== errorType) {
+        // Also retry the KRaft topic-propagation errors: any request against a broker that has not
+        // caught up with the controller yet can answer these regardless of what `errorType` is.
+        if (e.type !== errorType && !TOPIC_NOT_READY_ERRORS.includes(e.type)) {
           throw e
         }
         return false
@@ -256,12 +264,74 @@ const waitForConsumerToJoinGroup = (consumer, { maxWait = 10000, label = '' } = 
     })
   })
 
-// KRaft commits CreateTopics on the controller and propagates the metadata asynchronously, so the
-// waitForLeaders metadata read can transiently answer UNKNOWN_TOPIC_OR_PARTITION (Kafka 4.x) or
-// LEADER_NOT_AVAILABLE (Kafka <= 3.x). The client bails on the former today -- see QUARANTINE.md R1.
-const TOPIC_NOT_READY_ERRORS = ['UNKNOWN_TOPIC_OR_PARTITION', 'LEADER_NOT_AVAILABLE']
 const CREATE_TOPIC_ATTEMPTS = 10
 const CREATE_TOPIC_RETRY_MS = 200
+const TOPIC_PROPAGATION_DELAY_MS = 100
+const TOPIC_PROPAGATION_MAX_WAIT_MS = 10000
+
+// One connection per broker per test file, not per createTopic() call: reconnecting on every
+// fixture topic floods the brokers with handshakes. `testHelpers/setup.js` closes them in afterAll.
+let propagationBrokers = null
+
+const getPropagationBrokers = () => {
+  if (!propagationBrokers) {
+    propagationBrokers = plainTextBrokers().map(address => {
+      const [host, port] = address.split(':')
+      return new Broker({
+        connectionPool: createConnectionPool({ host, port: Number(port) }),
+        logger: newLogger(),
+        allowAutoTopicCreation: false,
+      })
+    })
+  }
+
+  return propagationBrokers
+}
+
+const disconnectPropagationBrokers = async () => {
+  const brokers = propagationBrokers
+  propagationBrokers = null
+  brokers && (await Promise.all(brokers.map(broker => broker.disconnect())))
+}
+
+/**
+ * Waits until *every* broker serves metadata for `topic` with a leader for each partition.
+ *
+ * `admin.createTopics({ waitForLeaders: true })` only checks the controller, but tests connect to
+ * an arbitrary broker, so on a slow runner they can still hit one that has not caught up.
+ *
+ * @param {string} topic
+ * @param {number} partitions
+ * @returns {Promise<void>}
+ */
+const waitForTopicPropagation = async (topic, partitions) => {
+  const servesTopic = async broker => {
+    let response
+    try {
+      await broker.connect() // no-op while connected; reconnects a socket the broker closed
+      response = await broker.metadata([topic])
+    } catch (e) {
+      if (TOPIC_NOT_READY_ERRORS.includes(e.type)) {
+        return false
+      }
+      throw e
+    }
+
+    const topicMetadata = response.topicMetadata.find(({ topic: name }) => name === topic)
+    return Boolean(
+      topicMetadata &&
+        topicMetadata.partitionMetadata.length === partitions &&
+        topicMetadata.partitionMetadata.every(({ leader }) => leader >= 0)
+    )
+  }
+
+  const brokers = getPropagationBrokers()
+  await waitFor(async () => (await Promise.all(brokers.map(servesTopic))).every(Boolean), {
+    delay: TOPIC_PROPAGATION_DELAY_MS,
+    maxWait: TOPIC_PROPAGATION_MAX_WAIT_MS,
+    timeoutMessage: `Timed out waiting for all brokers to serve metadata for topic "${topic}"`,
+  })
+}
 
 const createTopic = async ({ topic, partitions = 1, replicas = 1, config = [] }) => {
   const kafka = new Kafka({ clientId: 'testHelpers', brokers: [`${getHost()}:9092`] })
@@ -283,6 +353,7 @@ const createTopic = async ({ topic, partitions = 1, replicas = 1, config = [] })
             },
           ],
         })
+        await waitForTopicPropagation(topic, partitions)
         return
       } catch (e) {
         if (!TOPIC_NOT_READY_ERRORS.includes(e.type) || attempt >= CREATE_TOPIC_ATTEMPTS) {
@@ -394,6 +465,8 @@ module.exports = {
   newLogger,
   retryProtocol,
   createTopic,
+  waitForTopicPropagation,
+  disconnectPropagationBrokers,
   waitFor: testWaitFor,
   waitForMessages,
   waitForNextEvent,

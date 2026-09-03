@@ -10,9 +10,12 @@ const createProducer = require('../index')
 describe('Producer > Transactional producer', () => {
   let producer1, producer2, topicName, transactionalId, message
 
+  // The default retry budget (5 retries, ~9s) can be shorter than the coordinator's timed-out
+  // transaction cleanup interval (10s), so initProducerId gives up on CONCURRENT_TRANSACTIONS
+  // before producer1's abandoned transaction is aborted. ~22s covers it on a slow runner.
   const newProducer = () =>
     createProducer({
-      cluster: createCluster(),
+      cluster: createCluster({ retry: { retries: 10, maxRetryTime: 3000 } }),
       logger: newLogger(),
       idempotent: true,
       transactionalId,

@@ -5,6 +5,11 @@ jest.retryTimes(retries)
 
 require('jest-extended/all')
 
+// Close the connections `createTopic` keeps open to watch topic propagation across all brokers.
+afterAll(async () => {
+  await require('./index').disconnectPropagationBrokers()
+})
+
 expect.extend({
   optional(v, value) {
     const pass = typeof v === 'undefined' || v === value

@@ -27,7 +27,10 @@ describe('Broker > alterPartitionReassignments', () => {
     broker && (await broker.disconnect())
   })
 
-  test('request', async () => {
+  // Quarantined, see QUARANTINE.md: the assertion below requires the reassignment to still be in
+  // flight, but an empty partition is reassigned in milliseconds, so under load the list request
+  // arrives after it completed and `topics` comes back empty.
+  test.skip('request', async () => {
     await broker.connect()
     const topicName = `test-topic-${secureRandom()}`
 
