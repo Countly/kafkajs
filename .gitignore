@@ -22,7 +22,6 @@ CLAUDE.md
 agent/
 .superpowers/
 docs/superpowers/
-docs/kafka-compatibility.md
 upgrade-ref/
 upgrade-ref-index.md
 CODEX_brainstorm.md
