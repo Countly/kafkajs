@@ -1,0 +1,213 @@
+{
+  "apis": {
+    "Produce": {
+      "note": "v8 per-record errors (KIP-467), v9 flexible, v10 leader hints (KIP-951), v11 TRANSACTION_ABORTABLE (KIP-890), v12 transaction-version-2 implicit add-partitions (KIP-890 part 2), v13 topic IDs (KIP-516, Kafka 4.1; may return UNKNOWN_TOPIC_ID).",
+      "since": "2026-09-03"
+    },
+    "Fetch": {
+      "note": "v11 rack / preferred read replica (KIP-392): the wire fields exist but the follower out-of-range and OFFSET_NOT_AVAILABLE handling does not. v12 flexible + LastFetchedEpoch, v13 topic IDs replace names (KIP-516), v14 OFFSET_MOVED_TO_TIERED_STORAGE (KIP-405), v15 ReplicaState (KIP-903), v16 leader hints (KIP-951), v17 ReplicaDirectoryId (KIP-853), v18 HighWatermark (KIP-1166).",
+      "since": "2026-09-03"
+    },
+    "ListOffsets": {
+      "note": "v4 leader epoch (KIP-320), v6 flexible, v7 max-timestamp, v8 earliest-local offset (KIP-405).",
+      "since": "2026-09-03"
+    },
+    "Metadata": {
+      "note": "v7 leader epoch (KIP-320), v9 flexible, v10+ topic IDs, v13 adds a top-level error code and is where REBOOTSTRAP_REQUIRED surfaces (KIP-1102).",
+      "since": "2026-09-03"
+    },
+    "OffsetCommit": {
+      "note": "v6 committed leader epoch (KIP-320), v7 group instance id, v8 flexible, v9 member epoch (KIP-848), v10 topic IDs.",
+      "since": "2026-09-03"
+    },
+    "OffsetFetch": {
+      "note": "v5 leader epoch, v6 flexible, v7 require-stable (KIP-447), v8 multi-group batching, v9 member epoch (KIP-848), v10 topic IDs. The fork has no v0 codec, which is correct: v0 read offsets from ZooKeeper.",
+      "since": "2026-09-03"
+    },
+    "FindCoordinator": {
+      "note": "v3 flexible, v4 multi-key batch (KIP-699), v5 TRANSACTION_ABORTABLE (KIP-890), v6 KeyType SHARE=2 (KIP-932, broker-internal). apiKeys.js still calls key 10 GroupCoordinator, the pre-0.11 name.",
+      "since": "2026-09-03"
+    },
+    "JoinGroup": {
+      "note": "v5 encodes groupInstanceId but nothing plumbs it: Broker.joinGroup() has no such parameter, so static membership (KIP-345) is inert today.",
+      "since": "2026-09-03"
+    },
+    "LeaveGroup": {
+      "note": "v3 batch removal by group instance id (KIP-345): the codec exists, but there is no admin removeMembersFromConsumerGroup to drive it.",
+      "since": "2026-09-03"
+    },
+    "DescribeGroups": {
+      "note": "Below v6 the broker reports KIP-848 consumer-protocol groups as Dead; v6 adds ErrorMessage. Full coverage also needs ConsumerGroupDescribe (key 69) routing.",
+      "since": "2026-09-03"
+    },
+    "ListGroups": {
+      "note": "No GroupState filter (v4) or GroupType field (v5), so consumer-protocol groups cannot be told apart from classic ones.",
+      "since": "2026-09-03"
+    },
+    "SaslHandshake": {
+      "note": "Never flexible, and the only API in the matrix that is fully current.",
+      "since": "2026-09-03"
+    },
+    "ApiVersions": {
+      "note": "v0-v3 omit every SupportedFeatures entry whose MinVersion is 0 (KAFKA-17011, fixed in v4 / Kafka 3.9), so a v3-only client sees a truncated feature list. The flexible-protocol pilot targets v4 and falls back to v3 only for brokers below 3.9.",
+      "since": "2026-09-03"
+    },
+    "CreateTopics": {
+      "note": "v5 flexible, v7 returns topic IDs.",
+      "since": "2026-09-03"
+    },
+    "DeleteTopics": {
+      "note": "v6 deletes by topic ID. The fork's v1 sits exactly on the 4.x floor.",
+      "since": "2026-09-03"
+    },
+    "InitProducerId": {
+      "note": "v2+ is flexible, so even v3 needs the flexible-protocol work first. v3 producer-id/epoch re-init (KIP-360), v4 PRODUCER_FENCED, v5 TRANSACTION_ABORTABLE, v6 two-phase commit (KIP-939) and latestVersionUnstable, so brokers advertise 0-5 by default.",
+      "since": "2026-09-03"
+    },
+    "AddPartitionsToTxn": {
+      "note": "Unused under transaction version 2 (KIP-890 part 2), where Produce carries the add-partitions call.",
+      "since": "2026-09-03"
+    },
+    "AddOffsetsToTxn": {
+      "note": "Unused under transaction version 2 (KIP-890 part 2).",
+      "since": "2026-09-03"
+    },
+    "EndTxn": {
+      "note": "v5 returns a bumped producer id and epoch under transaction version 2. The TV2 signal is the transaction.version finalized feature in ApiVersions v3+, not EndTxn's advertised max version.",
+      "since": "2026-09-03"
+    },
+    "TxnOffsetCommit": {
+      "note": "v2 adds the committed leader epoch; v3 is KIP-447 group metadata, which the fork does not implement at all.",
+      "since": "2026-09-03"
+    },
+    "DescribeAcls": {
+      "note": "v1 is the 4.x floor and is also the fork's maximum.",
+      "since": "2026-09-03"
+    },
+    "CreateAcls": {
+      "note": "v1 is the 4.x floor and is also the fork's maximum.",
+      "since": "2026-09-03"
+    },
+    "DeleteAcls": {
+      "note": "v1 is the 4.x floor and is also the fork's maximum.",
+      "since": "2026-09-03"
+    },
+    "AlterConfigs": {
+      "note": "IncrementalAlterConfigs (key 44) is the modern replacement and is unimplemented, so config changes still overwrite rather than merge.",
+      "since": "2026-09-03"
+    },
+    "AlterPartitionReassignments": {
+      "note": "One of the only two flexible-encoded codecs in the fork today: it hand-rolls the tag buffer inside the request body because the request header is still hardcoded to v1. It must migrate when real flexible header selection lands. v1 adds AllowReplicationFactorChange.",
+      "since": "2026-09-03"
+    },
+    "ListPartitionReassignments": {
+      "note": "The other hand-rolled flexible codec; same migration applies. Kafka defines only v0, so the fork is current by accident.",
+      "since": "2026-09-03"
+    },
+    "OffsetForLeaderEpoch": {
+      "note": "Leader-epoch fencing (KIP-320). Without it an unclean leader change can silently duplicate or skip records.",
+      "since": "2026-09-03"
+    },
+    "IncrementalAlterConfigs": {
+      "note": "The replacement for AlterConfigs; needed before any admin config change can be merge-semantics rather than overwrite.",
+      "since": "2026-09-03"
+    },
+    "ConsumerGroupHeartbeat": {
+      "note": "Required for the KIP-848 consumer group protocol (groupProtocol: 'consumer'), GA since Kafka 4.0.",
+      "since": "2026-09-03"
+    },
+    "ConsumerGroupDescribe": {
+      "note": "Admin-side counterpart of KIP-848; needed so group descriptions stop reporting consumer-protocol groups as Dead.",
+      "since": "2026-09-03"
+    },
+    "DescribeTopicPartitions": {
+      "note": "Admin describe at scale, and the only way to read eligible leader replicas. The API does not exist on brokers below 3.8, so the Metadata path must stay as a fallback; ELR arrays are null unless the cluster runs eligible.leader.replicas.version=1.",
+      "since": "2026-09-03"
+    },
+    "GetTelemetrySubscriptions": {
+      "note": "Client telemetry (KIP-714); deferred.",
+      "since": "2026-09-03"
+    },
+    "PushTelemetry": {
+      "note": "Client telemetry (KIP-714); deferred.",
+      "since": "2026-09-03"
+    }
+  },
+  "crossCutting": [
+    {
+      "gap": "Only partial tagged-field support and no flexible request/response headers",
+      "where": "src/protocol/request.js (request header hardcoded to v1), src/protocol/decoder.js readTaggedFields()",
+      "impact": "Empty tag buffers are written and read for keys 45/46 only; a non-empty tag buffer is mis-skipped by one byte and nothing can encode a tagged field. This blocks every flexible version in the table above.",
+      "owner": "phase-4"
+    },
+    {
+      "gap": "ApiVersions is cached once per broker connection and never refreshed",
+      "where": "src/broker/index.js connect()",
+      "impact": "A stale version table during a rolling upgrade, contrary to the KIP-35 negotiation rules.",
+      "owner": "phase-4"
+    },
+    {
+      "gap": "Version negotiation ignores the broker's advertised minimum version",
+      "where": "src/protocol/requests/index.js lookup()",
+      "impact": "Under a raised KIP-896 floor the client silently sends a version the broker rejects instead of failing with a clear error. This is what makes the below-floor list below dangerous rather than merely dead.",
+      "owner": "phase-2"
+    },
+    {
+      "gap": "No topic-ID (UUID) awareness anywhere in cluster metadata",
+      "where": "cluster metadata, fetch and offset paths",
+      "impact": "Blocks Fetch v13+, Produce v13, OffsetCommit/OffsetFetch v10, DeleteTopics v6, CreateTopics v7 ids, KIP-848 assignments, and exact topic-recreation detection.",
+      "owner": "phase-5"
+    },
+    {
+      "gap": "No fetch sessions (KIP-227)",
+      "where": "fetch layer",
+      "impact": "Every poll sends a full fetch request; incremental fetch is a prerequisite for efficient modern Fetch versions.",
+      "owner": "phase-5"
+    },
+    {
+      "gap": "Compression codecs: no built-in zstd (KIP-110) and no bundled LZ4",
+      "where": "src/protocol/message/compression",
+      "impact": "Users must register LZ4 themselves; zstd-compressed batches cannot be read or written out of the box.",
+      "owner": "phase-2"
+    },
+    {
+      "gap": "No rebootstrap support (KIP-899 / KIP-1102)",
+      "where": "src/cluster, src/cluster/brokerPool.js",
+      "impact": "Recovery after every known broker rotates away is accidental rather than designed: no metadata reset, no metadata.recovery.* options, no REBOOTSTRAP_REQUIRED (code 129) handling.",
+      "owner": "phase-5"
+    },
+    {
+      "gap": "Dead message-format v0/v1 write path (KIP-724)",
+      "where": "src/protocol/message/v0, src/protocol/message/v1, src/protocol/messageSet encoders",
+      "impact": "Unreachable against a 4.x broker, which never negotiates Produce below v3 or Fetch below v4. The decoders must stay: old segments can still be returned inside a modern Fetch response.",
+      "owner": "phase-2"
+    }
+  ],
+  "errorAliases": {
+    "UNKNOWN": {
+      "kafkaType": "UNKNOWN_SERVER_ERROR",
+      "reason": "KafkaJS has exposed this name as KafkaJSProtocolError.type since 1.x; renaming it is a breaking public-API change.",
+      "since": "2026-09-03"
+    },
+    "NOT_LEADER_FOR_PARTITION": {
+      "kafkaType": "NOT_LEADER_OR_FOLLOWER",
+      "reason": "Kafka renamed the constant in 2.6 (KIP-392); the KafkaJS name is public API.",
+      "since": "2026-09-03"
+    },
+    "GROUP_LOAD_IN_PROGRESS": {
+      "kafkaType": "COORDINATOR_LOAD_IN_PROGRESS",
+      "reason": "Kafka renamed the constant in 0.11 when coordinators stopped being group-only; the KafkaJS name is public API.",
+      "since": "2026-09-03"
+    },
+    "GROUP_COORDINATOR_NOT_AVAILABLE": {
+      "kafkaType": "COORDINATOR_NOT_AVAILABLE",
+      "reason": "Kafka renamed the constant in 0.11; the KafkaJS name is public API.",
+      "since": "2026-09-03"
+    },
+    "NOT_COORDINATOR_FOR_GROUP": {
+      "kafkaType": "NOT_COORDINATOR",
+      "reason": "Kafka renamed the constant in 0.11; the KafkaJS name is public API.",
+      "since": "2026-09-03"
+    }
+  }
+}
