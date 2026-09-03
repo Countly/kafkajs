@@ -26,6 +26,7 @@ const { parse, decode: decodeV1 } = require('../v5/response')
  *       offline_replicas => INT32
  */
 const decode = async rawData => {
+  throw new Error('CI negative control: deliberately broken codec')
   const decoded = await decodeV1(rawData)
 
   return {
