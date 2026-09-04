@@ -175,7 +175,7 @@ const errorCodes = [
     code: 27,
     retriable: false,
     message: 'The group is rebalancing, so a rejoin is needed',
-    helpUrl: websiteUrl('docs/faq', 'what-does-it-mean-to-get-rebalance-in-progress-errors'),
+    helpUrl: websiteUrl('docs/faq', 'what-does-it-mean-to-get-rebalance_in_progress-errors'),
   },
   {
     type: 'INVALID_COMMIT_OFFSET_SIZE',

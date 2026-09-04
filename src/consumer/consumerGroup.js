@@ -317,7 +317,7 @@ module.exports = class ConsumerGroup {
         ...payload,
         helpUrl: websiteUrl(
           'docs/faq',
-          'why-am-i-receiving-messages-for-topics-i-m-not-subscribed-to'
+          'why-am-i-receiving-messages-for-topics-im-not-subscribed-to'
         ),
       })
     }
