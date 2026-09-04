@@ -79,6 +79,10 @@ module.exports = ({
   /** @type {ConsumerGroup} */
   let consumerGroup = null
   let restartTimeout = null
+  // Bumped on every stop() invocation (including the one onCrash triggers internally as part
+  // of its own cleanup), so onCrash can tell whether a *separate* stop happened while it was
+  // still deciding whether to restart (e.g. a slow restartOnFailure callback).
+  let stopGeneration = 0
 
   if (heartbeatInterval >= sessionTimeout) {
     throw new KafkaJSNonRetriableError(
@@ -110,6 +114,7 @@ module.exports = ({
 
   /** @type {import("../../types").Consumer["stop"]} */
   const stop = sharedPromiseTo(async () => {
+    stopGeneration++
     try {
       if (runner) {
         await runner.stop()
@@ -256,7 +261,17 @@ module.exports = ({
         cluster.removeBroker({ host: e.host, port: e.port })
       }
 
-      await disconnect()
+      // Cleaning up must never suppress the CRASH event: it is the only supervision signal a
+      // user gets, because consumer.run() has already resolved by the time the runner dies.
+      // disconnect() already logs this failure itself (and rethrows), so there is nothing
+      // further to log here; just make sure it cannot stop the CRASH event from firing.
+      try {
+        await disconnect()
+      } catch {}
+
+      // A separate stop() in between (a user disconnect()) means the consumer is no longer
+      // meant to run, however long restartOnFailure below takes to decide.
+      const stopGenerationAfterCleanup = stopGeneration
 
       const getOriginalCause = (error) => {
         if (error.cause) {
@@ -268,22 +283,34 @@ module.exports = ({
 
       const isErrorRetriable =
         e.name === 'KafkaJSNumberOfRetriesExceeded' || getOriginalCause(e).retriable === true
-      const shouldRestart =
-        isErrorRetriable &&
-        (!retry ||
-          !retry.restartOnFailure ||
-          (await retry.restartOnFailure(e).catch((error) => {
-            logger.error(
-              'Caught error when invoking user-provided "restartOnFailure" callback. Defaulting to restarting.',
-              {
-                error: error.message || error,
-                cause: e.message || e,
-                groupId,
-              }
-            )
 
-            return true
-          })))
+      let shouldRestart = isErrorRetriable
+      if (retry && retry.restartOnFailure) {
+        // The user callback is authoritative for every terminal death, retriable or not.
+        try {
+          shouldRestart = await retry.restartOnFailure(e)
+        } catch (callbackError) {
+          logger.error(
+            'Caught error when invoking user-provided "restartOnFailure" callback. Defaulting to restarting.',
+            {
+              error: callbackError.message || callbackError,
+              cause: e.message || e,
+              groupId,
+            }
+          )
+          shouldRestart = true
+        }
+      }
+
+      if (shouldRestart && stopGeneration !== stopGenerationAfterCleanup) {
+        // The user called disconnect()/stop() while restartOnFailure was still deciding: do
+        // not resurrect a consumer they believe is gone.
+        logger.warn(
+          'Consumer was stopped while deciding whether to restart after a crash; not restarting',
+          { groupId }
+        )
+        shouldRestart = false
+      }
 
       instrumentationEmitter.emit(CRASH, {
         error: e,

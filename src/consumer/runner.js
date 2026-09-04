@@ -83,7 +83,19 @@ module.exports = class Runner extends EventEmitter {
       await this.consumerGroup.connect()
       await this.consumerGroup.joinAndSync()
     } catch (e) {
-      return this.onCrash(e)
+      try {
+        return await this.onCrash(e)
+      } catch (crashHandlerError) {
+        // onCrash owns the CRASH event; if it still throws there is nothing left to notify
+        // with, so at least make the failure visible instead of an unhandled rejection.
+        this.logger.error('Crash handler failed', {
+          groupId: this.consumerGroup.groupId,
+          memberId: this.consumerGroup.memberId,
+          error: crashHandlerError.message || crashHandlerError,
+          cause: e.message || e,
+        })
+        return
+      }
     }
 
     this.running = true
@@ -163,10 +175,29 @@ module.exports = class Runner extends EventEmitter {
       .then(() => {
         this.scheduleFetchManager()
       })
-      .catch((e) => {
-        this.onCrash(e)
+      .catch(async (e) => {
+        // consuming must be false before onCrash runs, or waitForConsumer() inside the
+        // onCrash -> disconnect() -> stop() chain would await a CONSUMING_STOP that can only
+        // be emitted after onCrash itself returns (deadlock). running, however, must stay
+        // true until onCrash is done: onCrash's own stop() call needs it true to actually
+        // stop the fetch manager and send LeaveGroup, instead of treating the runner as
+        // already stopped and skipping both.
         this.consuming = false
-        this.running = false
+
+        try {
+          await this.onCrash(e)
+        } catch (crashHandlerError) {
+          // onCrash owns the CRASH event; if it still throws there is nothing left to notify
+          // with, so at least make the failure visible instead of an unhandled rejection.
+          this.logger.error('Crash handler failed', {
+            groupId: this.consumerGroup.groupId,
+            memberId: this.consumerGroup.memberId,
+            error: crashHandlerError.message || crashHandlerError,
+            cause: e.message || e,
+          })
+        } finally {
+          this.running = false
+        }
       })
   }
 

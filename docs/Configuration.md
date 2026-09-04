@@ -334,7 +334,7 @@ __Available options:__
 | factor              | Randomization factor                                                                                                    | `0.2`               |
 | multiplier          | Exponential factor                                                                                                      | `2`                 |
 | retries             | Max number of retries per call                                                                                          | `5`                 |
-| restartOnFailure    | Only used in consumer. See [`restartOnFailure`](#restartonfailure)                                                      | `async () => true`  |
+| restartOnFailure    | Only used in consumer. See [`restartOnFailure`](#restartonfailure)                                                      | none (restart on retriable errors only) |
 
 Example:
 
@@ -358,9 +358,9 @@ The function has the following signature: `(error: Error) => Promise<boolean>`
 * If the promise resolves to `true`: the consumer will restart
 * If the promise resolves to `false`: the consumer will **not** restart
 * If the promise rejects: the consumer will restart
-* If there is no `restartOnFailure` provided: the consumer will restart
+* If there is no `restartOnFailure` provided: the consumer restarts on retriable errors and stops on non-retriable ones (the previous default behavior, unchanged for callers who don't set the callback)
 
-Note that the function will only ever be invoked for what KafkaJS considers retriable errors. On non-retriable errors, the consumer will not be restarted and the `restartOnFailure` function will not be invoked. [See this list](https://kafka.apache.org/protocol#protocol_error_codes) for retriable errors in the Kafka protocol, but note that some additional errors will still be considered retriable in KafkaJS, such as for example network connection errors.
+When `restartOnFailure` is provided, it is authoritative for **every** terminal death of the consumer, retriable or not — this is a deliberate change from earlier versions, where the callback was only consulted for retriable errors. If you need to tell retriable and non-retriable errors apart inside the callback, inspect the error passed to it (for example `error.retriable` or `error.name === 'KafkaJSNumberOfRetriesExceeded'`).
 
 ## Logging
 
