@@ -134,7 +134,7 @@ describe('Broker > connect', () => {
       expect(broker.isConnected()).toEqual(true)
     })
 
-    describe('when SaslAuthenticate protocol is available', () => {
+    describe('SaslAuthenticate flow', () => {
       for (const e of saslEntries) {
         test(`returns true when connected and authenticated on connections with SASL ${e.name}`, async () => {
           const connectionPool = createConnectionPool(e.opts())
