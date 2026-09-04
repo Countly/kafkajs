@@ -13,7 +13,7 @@ const eventKeys = keys(events)
   .map((key) => `producer.events.${key}`)
   .join(', ')
 
-const { CONNECT, DISCONNECT } = events
+const { CONNECT, INITIALIZED, DISCONNECT } = events
 
 /**
  *
@@ -220,11 +220,15 @@ module.exports = ({
     connect: async () => {
       await cluster.connect()
       connectionStatus = CONNECTION_STATUS.CONNECTED
+      // CONNECT stays exactly where it is: it means "the cluster connection is up", and existing
+      // listeners depend on that ordering. INITIALIZED is the new "safe to send()" signal.
       instrumentationEmitter.emit(CONNECT)
 
       if (idempotent && !idempotentEosManager.isInitialized()) {
         await idempotentEosManager.initProducerId()
       }
+
+      instrumentationEmitter.emit(INITIALIZED)
     },
     /**
      * @return {Promise}

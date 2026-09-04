@@ -389,6 +389,7 @@ export interface InstrumentationEvent<T> {
 export type RemoveInstrumentationEventListener<T> = () => void
 
 export type ConnectEvent = InstrumentationEvent<null>
+export type InitializedEvent = InstrumentationEvent<null>
 export type DisconnectEvent = InstrumentationEvent<null>
 export type RequestEvent = InstrumentationEvent<{
   apiKey: number
@@ -778,6 +779,7 @@ type Sender = {
 
 export type ProducerEvents = {
   CONNECT: 'producer.connect'
+  INITIALIZED: 'producer.initialized'
   DISCONNECT: 'producer.disconnect'
   REQUEST: 'producer.network.request'
   REQUEST_TIMEOUT: 'producer.network.request_timeout'
@@ -792,6 +794,10 @@ export type Producer = Sender & {
   on(
     eventName: ProducerEvents['CONNECT'],
     listener: (event: ConnectEvent) => void
+  ): RemoveInstrumentationEventListener<typeof eventName>
+  on(
+    eventName: ProducerEvents['INITIALIZED'],
+    listener: (event: InitializedEvent) => void
   ): RemoveInstrumentationEventListener<typeof eventName>
   on(
     eventName: ProducerEvents['DISCONNECT'],

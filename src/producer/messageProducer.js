@@ -1,6 +1,7 @@
 const createSendMessages = require('./sendMessages')
 const { KafkaJSError, KafkaJSNonRetriableError } = require('../errors')
 const { CONNECTION_STATUS } = require('../network/connectionStatus')
+const sharedPromiseTo = require('../utils/sharedPromiseTo')
 
 module.exports = ({
   logger,
@@ -31,6 +32,19 @@ module.exports = ({
         throw new KafkaJSError('The producer is disconnected')
     }
   }
+
+  /**
+   * A transient InitProducerId failure during connect() must not poison the producer for the
+   * rest of the process lifetime: re-attempt it on the next send instead (Countly patch 2g).
+   * Wrapped in `sharedPromiseTo` so concurrent `send()`/`sendBatch()` calls share a single
+   * in-flight InitProducerId request instead of racing separate ones.
+   */
+  const ensureInitialized = sharedPromiseTo(async () => {
+    if (idempotent && !eosManager.isInitialized()) {
+      logger.debug('Idempotent producer is not initialized, requesting a producer id')
+      await eosManager.initProducerId()
+    }
+  })
 
   /**
    * @typedef {Object} TopicMessages
@@ -80,6 +94,8 @@ module.exports = ({
     }
 
     validateConnectionStatus()
+    await ensureInitialized()
+
     const mergedTopicMessages = topicMessages.reduce((merged, { topic, messages }) => {
       const index = merged.findIndex(({ topic: mergedTopic }) => topic === mergedTopic)
 

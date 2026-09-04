@@ -5,6 +5,7 @@ const producerType = InstrumentationEventType('producer')
 
 const events = {
   CONNECT: producerType('connect'),
+  INITIALIZED: producerType('initialized'),
   DISCONNECT: producerType('disconnect'),
   REQUEST: producerType(networkEvents.NETWORK_REQUEST),
   REQUEST_TIMEOUT: producerType(networkEvents.NETWORK_REQUEST_TIMEOUT),
