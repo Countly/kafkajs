@@ -1,6 +1,9 @@
 #!/usr/bin/env node
 // Waits for the 3 KRaft nodes, then warms the cluster (topics + a consumer-group describe).
 const { execSync } = require('child_process')
+
+// Match the old execa defaults: pipe stderr instead of inheriting it, 10 MB output buffer.
+const EXEC_OPTIONS = { stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 10 * 1024 * 1024 }
 const crypto = require('crypto')
 
 const COMPOSE_FILE = process.env.COMPOSE_FILE || 'docker-compose.yml'
@@ -10,7 +13,7 @@ const secureRandom = (length = 10) => crypto.randomBytes(length).toString('hex')
 
 const findContainerId = (node) => {
   const cmd = `docker ps --filter "status=running" --filter "label=custom.project=kafkajs" --filter "label=custom.service=${node}" --no-trunc -q`
-  const containerId = execSync(cmd).toString('utf-8').trim()
+  const containerId = execSync(cmd, EXEC_OPTIONS).toString('utf-8').trim()
   if (!containerId)
     throw new Error(`container for ${node} is not running (COMPOSE_FILE=${COMPOSE_FILE})`)
   console.log(`${node}: ${containerId}`)
@@ -18,7 +21,10 @@ const findContainerId = (node) => {
 }
 
 const kafkaCli = (containerId, args) =>
-  execSync(`docker exec ${containerId} bash -c "${BIN}/${args} 2> /dev/null"`).toString('utf-8')
+  execSync(
+    `docker exec ${containerId} bash -c "${BIN}/${args} 2> /dev/null"`,
+    EXEC_OPTIONS
+  ).toString('utf-8')
 
 const waitForNode = (containerId) => {
   const deadline = Date.now() + 120000
@@ -53,7 +59,7 @@ console.log('\nWaiting for nodes...')
 ids.forEach(waitForNode)
 
 console.log('\nAll nodes up:')
-console.log(execSync(`docker compose -f ${COMPOSE_FILE} ps`).toString('utf-8'))
+console.log(execSync(`docker compose -f ${COMPOSE_FILE} ps`, EXEC_OPTIONS).toString('utf-8'))
 
 console.log('\nCreating default topics...')
 createTopic(ids[0], 'test-topic-already-exists')

@@ -377,7 +377,7 @@ const addPartitions = async ({ topic, partitions }) => {
   await cluster.connect()
   await cluster.addTargetTopic(topic)
 
-  execSync(cmd)
+  execSync(cmd, { stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 10 * 1024 * 1024 })
 
   waitFor(async () => {
     await cluster.refreshMetadata()

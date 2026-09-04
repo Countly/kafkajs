@@ -47,7 +47,7 @@ Some tests are intentionally skipped against certain broker versions or environm
 
 ## Linting and types
 
-- `npm run lint` runs ESLint over the whole tree (via `.gitignore`/`.prettierignore`-aware ignores, not a `git ls-files` shell-out).
+- `npm run lint` runs ESLint over the whole tree; files listed in `.gitignore` are skipped (Prettier additionally honours `.prettierignore`), so there is no `git ls-files` shell-out.
 - `npm run test:types` type-checks the TypeScript definitions in `types/`.
 
 ## Packaging smoke test
