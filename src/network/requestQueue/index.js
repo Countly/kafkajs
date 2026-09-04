@@ -303,24 +303,34 @@ module.exports = class RequestQueue extends EventEmitter {
   /**
    * Ensure that pending requests will be checked in the future
    *
-   * If there is a client-side throttling in place this will ensure that we will check
-   * the pending request queue eventually.
+   * Reconciles upstream PRs #1755, #1768, #1667 and #1572 with Countly's production patch:
+   * an idle, unthrottled queue schedules nothing (#1704/#1556 busy loop) and the delay is
+   * always non-negative (#1751 TimeoutNegativeWarning on Node >= 24).
    */
   scheduleCheckPendingRequests() {
-    // If we're throttled: Schedule checkPendingRequests when the throttle
-    // should be resolved. If there is already something scheduled we assume that that
-    // will be fine, and potentially fix up a new timeout if needed at that time.
-    // Note that if we're merely "overloaded" by having too many inflight requests
-    // we will anyways check the queue when one of them gets fulfilled.
-    let scheduleAt = this.throttledUntil - Date.now()
-    if (!this.throttleCheckTimeoutId) {
-      if (this.pending.length > 0) {
-        scheduleAt = scheduleAt > 0 ? scheduleAt : CHECK_PENDING_REQUESTS_INTERVAL
-      }
-      this.throttleCheckTimeoutId = setTimeout(() => {
-        this.throttleCheckTimeoutId = null
-        this.checkPendingRequests()
-      }, scheduleAt)
+    // If there is already something scheduled we assume that it will be fine, and potentially
+    // fix up a new timeout if needed at that time.
+    if (this.throttleCheckTimeoutId) {
+      return
     }
+
+    const timeUntilUnthrottled = this.throttledUntil - Date.now()
+    const isThrottled = timeUntilUnthrottled > 0
+
+    // Nothing is waiting and no throttle to wait out: there is nothing for a future check to do.
+    // Note that if we're merely "overloaded" by having too many inflight requests we will
+    // anyway check the queue when one of them gets fulfilled.
+    if (this.pending.length === 0 && !isThrottled) {
+      return
+    }
+
+    const scheduleAt = isThrottled
+      ? Math.max(timeUntilUnthrottled, CHECK_PENDING_REQUESTS_INTERVAL)
+      : CHECK_PENDING_REQUESTS_INTERVAL
+
+    this.throttleCheckTimeoutId = setTimeout(() => {
+      this.throttleCheckTimeoutId = null
+      this.checkPendingRequests()
+    }, scheduleAt)
   }
 }
