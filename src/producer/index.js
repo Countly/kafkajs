@@ -68,6 +68,7 @@ module.exports = ({
     transactionTimeout,
     transactional: false,
     transactionalId,
+    instrumentationEmitter,
   })
 
   const { send, sendBatch, ensureInitialized } = createMessageProducer({
@@ -132,6 +133,7 @@ module.exports = ({
         transactionTimeout,
         transactional: true,
         transactionalId,
+        instrumentationEmitter,
       })
 
     if (transactionalEosManager.isInTransaction()) {

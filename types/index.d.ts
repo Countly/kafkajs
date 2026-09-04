@@ -426,6 +426,11 @@ export type AuthenticationFailureEvent = InstrumentationEvent<{
   mechanism: string
   errorMessage: string
 }>
+export type LockTimeoutEvent = InstrumentationEvent<{
+  description: string
+  waiting: number
+  timeout: number
+}>
 
 export type SeekEntry = PartitionOffset
 
@@ -795,6 +800,7 @@ export type ProducerEvents = {
   REQUEST_TIMEOUT: 'producer.network.request_timeout'
   REQUEST_QUEUE_SIZE: 'producer.network.request_queue_size'
   AUTHENTICATION_FAILURE: 'producer.network.authentication_failure'
+  LOCK_TIMEOUT: 'producer.network.lock_timeout'
 }
 
 export type Producer = Sender & {
@@ -829,6 +835,10 @@ export type Producer = Sender & {
   on(
     eventName: ProducerEvents['AUTHENTICATION_FAILURE'],
     listener: (event: AuthenticationFailureEvent) => void
+  ): RemoveInstrumentationEventListener<typeof eventName>
+  on(
+    eventName: ProducerEvents['LOCK_TIMEOUT'],
+    listener: (event: LockTimeoutEvent) => void
   ): RemoveInstrumentationEventListener<typeof eventName>
   on(
     eventName: ValueOf<ProducerEvents>,

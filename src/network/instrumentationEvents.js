@@ -6,4 +6,5 @@ module.exports = {
   NETWORK_REQUEST_TIMEOUT: eventType('request_timeout'),
   NETWORK_REQUEST_QUEUE_SIZE: eventType('request_queue_size'),
   NETWORK_AUTHENTICATION_FAILURE: eventType('authentication_failure'),
+  NETWORK_LOCK_TIMEOUT: eventType('lock_timeout'),
 }

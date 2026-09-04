@@ -88,4 +88,29 @@ describe('Utils > Lock', () => {
       )
     })
   })
+
+  describe('instrumentation', () => {
+    it('emits an event when a waiter times out', async () => {
+      const emit = jest.fn()
+      const lock = new Lock({
+        timeout: 20,
+        description: 'broker-1',
+        instrumentationEmitter: { emit },
+      })
+
+      await lock.acquire()
+      await expect(lock.acquire()).rejects.toThrow('Timeout while acquiring lock')
+
+      expect(emit).toHaveBeenCalledTimes(1)
+      const [eventName, payload] = emit.mock.calls[0]
+      expect(eventName).toEqual(expect.stringContaining('lock_timeout'))
+      expect(payload).toMatchObject({ description: 'broker-1', waiting: 1, timeout: 20 })
+    })
+
+    it('works without an emitter (existing callers)', async () => {
+      const lock = new Lock({ timeout: 20 })
+      await lock.acquire()
+      await expect(lock.acquire()).rejects.toThrow('Timeout while acquiring lock')
+    })
+  })
 })

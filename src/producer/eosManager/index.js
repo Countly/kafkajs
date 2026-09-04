@@ -37,6 +37,10 @@ const isAddOffsetsRetriable = (e) => e.code === CONCURRENT_TRANSACTIONS_CODE
 /**
  * Manage behavior for an idempotent producer and transactions.
  *
+ * @param {Object} options
+ * @param {import('../../instrumentation/emitter')} [options.instrumentationEmitter] Passed to
+ *   the per-broker mutex (see `acquireBrokerLock`) so a waiter timing out emits
+ *   `NETWORK_LOCK_TIMEOUT` instead of failing silently.
  * @returns {EosManager}
  */
 module.exports = ({
@@ -45,6 +49,7 @@ module.exports = ({
   transactionTimeout = 60000,
   transactional,
   transactionalId,
+  instrumentationEmitter = null,
 }) => {
   if (transactional && !transactionalId) {
     throw new KafkaJSNonRetriableError('Cannot manage transactions without a transactionalId')
@@ -351,10 +356,22 @@ module.exports = ({
         return stateMachine.state() === STATES.TRANSACTING
       },
 
+      /**
+       * Acquire this broker's mutex, serializing idempotent requests against it so sequence
+       * numbers stay ordered. A wait longer than 65535ms rejects with `KafkaJSLockTimeout` and,
+       * if `instrumentationEmitter` was provided, emits `NETWORK_LOCK_TIMEOUT` first.
+       * @param {import('../../broker')} broker
+       * @returns {Promise<void>}
+       */
       async acquireBrokerLock(broker) {
         if (this.isInitialized()) {
           brokerMutexLocks[broker.nodeId] =
-            brokerMutexLocks[broker.nodeId] || new Lock({ timeout: 0xffff })
+            brokerMutexLocks[broker.nodeId] ||
+            new Lock({
+              timeout: 0xffff,
+              description: `broker-${broker.nodeId}`,
+              instrumentationEmitter,
+            })
           await brokerMutexLocks[broker.nodeId].acquire()
         }
       },

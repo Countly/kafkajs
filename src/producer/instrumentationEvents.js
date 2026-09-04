@@ -11,6 +11,7 @@ const events = {
   REQUEST_TIMEOUT: producerType(networkEvents.NETWORK_REQUEST_TIMEOUT),
   REQUEST_QUEUE_SIZE: producerType(networkEvents.NETWORK_REQUEST_QUEUE_SIZE),
   AUTHENTICATION_FAILURE: producerType(networkEvents.NETWORK_AUTHENTICATION_FAILURE),
+  LOCK_TIMEOUT: producerType(networkEvents.NETWORK_LOCK_TIMEOUT),
 }
 
 const wrappedEvents = {
@@ -18,6 +19,7 @@ const wrappedEvents = {
   [events.REQUEST_TIMEOUT]: networkEvents.NETWORK_REQUEST_TIMEOUT,
   [events.REQUEST_QUEUE_SIZE]: networkEvents.NETWORK_REQUEST_QUEUE_SIZE,
   [events.AUTHENTICATION_FAILURE]: networkEvents.NETWORK_AUTHENTICATION_FAILURE,
+  [events.LOCK_TIMEOUT]: networkEvents.NETWORK_LOCK_TIMEOUT,
 }
 
 const reversedWrappedEvents = swapObject(wrappedEvents)
