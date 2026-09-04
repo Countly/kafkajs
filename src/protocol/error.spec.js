@@ -28,7 +28,7 @@ describe('Protocol > error', () => {
       const error = createErrorFromCode(rebalanceInProgressCode)
       expect(error).toHaveProperty(
         'helpUrl',
-        'https://github.com/Countly/kafkajs/blob/master/docs/FAQ.md#what-does-it-mean-to-get-rebalance-in-progress-errors'
+        'https://github.com/Countly/kafkajs/blob/master/docs/FAQ.md#what-does-it-mean-to-get-rebalance_in_progress-errors'
       )
     })
   })
