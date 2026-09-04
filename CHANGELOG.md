@@ -56,4 +56,8 @@ Versions before 3.0.0 are internal alpha tags and are not published.
 - New `optionalDependencies` entry: `lz4-napi ^2.10.0`, the native LZ4 frame codec backing the new built-in LZ4 compression above. Prebuilt binaries ship for the platforms this fork targets (linux-x64/arm64, darwin-arm64, among others); the package stays installable when it's missing, LZ4 just becomes unavailable. `dependencies` stays empty — this is the one allowed exception.
 - `test:unit` and `test:coverage:unit` no longer pass `--forceExit`: `RequestQueue`'s unit specs now call `destroy()` to clear their timers/intervals, closing the last open handle Jest was masking. `test:group:*` (real-cluster suites) keep `--forceExit`.
 
+Quarantined tests retired in this phase: R1 (metadata for auto-created topics), R2 (ListOffsets version floor) and R3 (transactional consume-transform-produce); two rows remain in `QUARANTINE.md`.
+
+Upstream work this phase builds on, with thanks to its authors: PRs #1779, #1695, #1738, #1576, #1558 and #1594 are adopted directly; the request-queue fix is informed by #1755, #1768, #1667 and #1572, but the shipped implementation follows Countly's production patch. Countly production patches retired by this phase: the request-queue idle loop, the SyncGroup timeout, the CRASH bridge, the coordinator refresh, the error-type string matching, the producer init state machine, the hand-registered LZ4 codec and the EoS-warning silencer.
+
 Adopted upstream PRs are credited here by number as they land (Phase 2 onward).
