@@ -21,6 +21,15 @@ test('the ESM wrapper re-exports every named export of index.js', async () => {
   assert.deepEqual(esmNames, Object.keys(cjs).sort())
 })
 
+test('internal error-classification helpers stay private', () => {
+  const cjs = require(PKG)
+  // isRebalancing/isKafkaJSError are deliberately stripped in index.js before re-export; a helper
+  // added to src/errors.js's module.exports must be stripped the same way, not leak onto the root.
+  assert.equal(cjs.isStaleCoordinator, undefined)
+  assert.equal(cjs.isRebalancing, undefined)
+  assert.equal(cjs.isKafkaJSError, undefined)
+})
+
 test('deep paths under src are not exported', () => {
   assert.throws(() => require(`${PKG}/src/index`), { code: 'ERR_PACKAGE_PATH_NOT_EXPORTED' })
   assert.throws(() => require(`${PKG}/src/network/requestQueue`), { code: 'ERR_PACKAGE_PATH_NOT_EXPORTED' })

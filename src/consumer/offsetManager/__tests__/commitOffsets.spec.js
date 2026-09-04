@@ -1,6 +1,7 @@
 const OffsetManager = require('../index')
 const InstrumentationEventEmitter = require('../../../instrumentation/emitter')
 const { createErrorFromCode } = require('../../../protocol/error')
+const { KafkaJSNumberOfRetriesExceeded } = require('../../../errors')
 const NOT_COORDINATOR_FOR_GROUP_CODE = 16
 
 describe('Consumer > OffsetMananger > commitOffsets', () => {
@@ -149,4 +150,25 @@ describe('Consumer > OffsetMananger > commitOffsets', () => {
       expect(mockCluster.findGroupCoordinator).toHaveBeenCalledWith({ groupId })
     }
   )
+
+  it('propagates the original retriable error when re-discovery itself fails', async () => {
+    const originalError = createErrorFromCode(NOT_COORDINATOR_FOR_GROUP_CODE)
+    mockCoordinator.offsetCommit.mockImplementation(() => {
+      throw originalError
+    })
+    mockCluster.findGroupCoordinator.mockImplementation(() => {
+      throw new KafkaJSNumberOfRetriesExceeded(new Error('exhausted'), {
+        retryCount: 5,
+        retryTime: 100,
+      })
+    })
+
+    const offsets = { topics: [{ topic: topic1, partitions: [{ partition: '0', offset: '1' }] }] }
+
+    // The retrier-wrapped findGroupCoordinator rejecting with a non-retriable
+    // KafkaJSNumberOfRetriesExceeded must not replace the retriable original error -- the caller's
+    // own retrier needs to see `originalError` to know it can retry the commit.
+    await expect(offsetManager.commitOffsets(offsets)).rejects.toBe(originalError)
+    expect(mockCluster.refreshMetadata).toHaveBeenCalled()
+  })
 })

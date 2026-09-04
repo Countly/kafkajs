@@ -2,6 +2,7 @@ const createAdmin = require('../index')
 const createConsumer = require('../../consumer')
 const createProducer = require('../../producer')
 const { KafkaJSProtocolError } = require('../../errors')
+const { createErrorFromCode } = require('../../protocol/error')
 
 const {
   createCluster,
@@ -128,4 +129,47 @@ describe('Admin', () => {
       )
     })
   })
+})
+
+// A separate top-level describe (mirroring src/admin/__tests__/deleteTopics.spec.js's mocked
+// "retries if the controller has moved" test) so these don't inherit the live-cluster
+// connect/produce/consume setup above -- only cluster methods are stubbed, no broker required.
+describe('Admin > deleteGroups > stale coordinator recovery', () => {
+  let admin
+
+  afterEach(async () => {
+    admin && (await admin.disconnect())
+  })
+
+  test.each([15, 16])(
+    'retries the delete when the group coordinator is stale (code %i)',
+    async (code) => {
+      const groupId = `consumer-group-id-${secureRandom()}`
+      const cluster = createCluster()
+      const broker = {
+        nodeId: 1,
+        deleteGroups: jest.fn(() => ({
+          results: [{ groupId, errorCode: 0, error: null }],
+        })),
+      }
+
+      cluster.refreshMetadata = jest.fn()
+      cluster.findGroupCoordinator = jest
+        .fn()
+        .mockImplementationOnce(() => {
+          throw new KafkaJSProtocolError(createErrorFromCode(code))
+        })
+        .mockImplementationOnce(() => broker)
+
+      admin = createAdmin({ cluster, logger: newLogger() })
+
+      await expect(admin.deleteGroups([groupId])).resolves.toEqual([
+        { groupId, errorCode: 0, error: null },
+      ])
+
+      expect(cluster.refreshMetadata).toHaveBeenCalledTimes(2)
+      expect(cluster.findGroupCoordinator).toHaveBeenCalledTimes(2)
+      expect(broker.deleteGroups).toHaveBeenCalledTimes(1)
+    }
+  )
 })

@@ -281,9 +281,16 @@ module.exports = class OffsetManager {
     } catch (e) {
       // The coordinator has changed due to a restart or broker reassignment; refresh the
       // metadata *and* re-discover the coordinator so the next attempt targets the right broker.
+      // Best-effort: if the retrier behind findGroupCoordinator exhausts, it rejects with a
+      // non-retriable KafkaJSNumberOfRetriesExceeded, which must not replace the retriable `e`
+      // the caller is waiting for -- the next retry of `e` will attempt discovery again anyway.
       if (isStaleCoordinator(e)) {
-        await this.cluster.refreshMetadata()
-        this.coordinator = await this.cluster.findGroupCoordinator({ groupId: this.groupId })
+        try {
+          await this.cluster.refreshMetadata()
+          this.coordinator = await this.cluster.findGroupCoordinator({ groupId: this.groupId })
+        } catch (_) {
+          // best-effort recovery, see above -- fall through to rethrow the original `e`
+        }
       }
 
       throw e
