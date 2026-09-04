@@ -10,6 +10,16 @@ class KafkaJSError extends Error {
     this.retriable = retriable
     this.helpUrl = e.helpUrl
     this.cause = cause
+
+    // Protocol errors are frequently re-wrapped on the consumer paths (rebalance, unknown
+    // member, retry exhaustion). Losing `type`/`code` forces callers to string-match the
+    // message, so carry them across every wrap. Only set when the source actually has them.
+    if (e != null && e.type !== undefined) {
+      this.type = e.type
+    }
+    if (e != null && e.code !== undefined) {
+      this.code = e.code
+    }
   }
 }
 
@@ -53,6 +63,17 @@ class KafkaJSNumberOfRetriesExceeded extends KafkaJSNonRetriableError {
     this.retryCount = retryCount
     this.retryTime = retryTime
     this.name = 'KafkaJSNumberOfRetriesExceeded'
+
+    // The wrapped error may itself be a wrapper (KafkaJSError around a protocol error), so
+    // walk the chain for the first typed link.
+    let source = e
+    while (source && source.type === undefined && source.cause) {
+      source = source.cause
+    }
+    if (source && source.type !== undefined) {
+      this.type = source.type
+      this.code = source.code
+    }
   }
 }
 
