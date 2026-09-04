@@ -338,3 +338,7 @@ new KafkaJSServerDoesNotSupportApiKey(
     apiName: 'Produce',
   }
 )
+
+// maxInFlightRequests: null is the documented opt-out, positive integers cap in-flight requests
+kafka.producer({ maxInFlightRequests: null })
+kafka.consumer({ groupId: 'g', maxInFlightRequests: 5 })

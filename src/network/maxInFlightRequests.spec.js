@@ -85,3 +85,22 @@ describe('Network > Connection > maxInFlightRequests default', () => {
     expect(createConnection({ maxInFlightRequests: 1 }).requestQueue.maxInFlightRequests).toEqual(1)
   })
 })
+
+describe('Kafka > maxInFlightRequests validation', () => {
+  const Kafka = require('../index')
+  const create = (maxInFlightRequests) =>
+    new Kafka({ clientId: 'v', brokers: ['localhost:9092'], logLevel: 0 }).producer({
+      maxInFlightRequests,
+    })
+
+  it('rejects 0, negatives and fractions up front instead of deadlocking', () => {
+    expect(() => create(0)).toThrow(/maxInFlightRequests must be null/)
+    expect(() => create(-1)).toThrow(/maxInFlightRequests must be null/)
+    expect(() => create(1.5)).toThrow(/maxInFlightRequests must be null/)
+  })
+
+  it('accepts null (unbounded) and positive integers', () => {
+    expect(() => create(null)).not.toThrow()
+    expect(() => create(1)).not.toThrow()
+  })
+})

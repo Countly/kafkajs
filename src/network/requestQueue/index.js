@@ -14,7 +14,7 @@ const CHECK_PENDING_REQUESTS_INTERVAL = 10
 module.exports = class RequestQueue extends EventEmitter {
   /**
    * @param {Object} options
-   * @param {number} options.maxInFlightRequests
+   * @param {number|null} options.maxInFlightRequests
    * @param {number} options.requestTimeout
    * @param {boolean} options.enforceRequestTimeout
    * @param {string} options.clientId

@@ -41,7 +41,7 @@ module.exports = class Cluster {
    * @param {boolean} [options.enforceRequestTimeout]
    * @param {number} options.metadataMaxAge - in milliseconds
    * @param {boolean} options.allowAutoTopicCreation
-   * @param {number} options.maxInFlightRequests
+   * @param {number|null} options.maxInFlightRequests
    * @param {number} options.isolationLevel
    * @param {import("../../types").RetryOptions} options.retry
    * @param {import("../../types").Logger} options.logger

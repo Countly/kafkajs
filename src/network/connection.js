@@ -50,7 +50,7 @@ module.exports = class Connection {
    * @param {number} [options.reauthenticationThreshold=10000]
    * @param {number} options.connectionTimeout The connection timeout, in milliseconds
    * @param {boolean} [options.enforceRequestTimeout]
-   * @param {number} [options.maxInFlightRequests=5] The maximum number of unacknowledged requests on a
+   * @param {number|null} [options.maxInFlightRequests=5] The maximum number of unacknowledged requests on a
    *                                            connection before enqueuing (Java's
    *                                            max.in.flight.requests.per.connection default).
    *                                            Pass null for unbounded (the pre-3.0 behavior).

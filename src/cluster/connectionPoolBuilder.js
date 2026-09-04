@@ -16,7 +16,7 @@ const ConnectionPool = require('../network/connectionPool')
  * @param {number} options.requestTimeout
  * @param {boolean} [options.enforceRequestTimeout]
  * @param {number} [options.connectionTimeout]
- * @param {number} [options.maxInFlightRequests]
+ * @param {number|null} [options.maxInFlightRequests]
  * @param {import("../../types").RetryOptions} [options.retry]
  * @param {import("../../types").Logger} options.logger
  * @param {import("../instrumentation/emitter")} [options.instrumentationEmitter]

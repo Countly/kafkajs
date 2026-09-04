@@ -2,6 +2,7 @@ const {
   createLogger,
   LEVELS: { INFO },
 } = require('./loggers')
+const { KafkaJSNonRetriableError } = require('./errors')
 
 const InstrumentationEventEmitter = require('./instrumentation/emitter')
 const LoggerConsole = require('./loggers/console')
@@ -23,6 +24,21 @@ const PRIVATE = {
 
 const DEFAULT_METADATA_MAX_AGE = 300000
 const DEFAULT_MAX_IN_FLIGHT_REQUESTS = 5
+
+/**
+ * Accept the documented values for maxInFlightRequests: null (unbounded) or an integer >= 1.
+ * Zero would never send anything, so it is rejected up front instead of deadlocking later.
+ * @param {number|null|undefined} value
+ * @returns {number|null}
+ * @throws {KafkaJSNonRetriableError} on 0, negative, fractional or non-numeric values
+ */
+const validateMaxInFlightRequests = (value) => {
+  if (value === null) return null
+  if (Number.isInteger(value) && value >= 1) return value
+  throw new KafkaJSNonRetriableError(
+    `maxInFlightRequests must be null (unbounded) or an integer >= 1, got ${value}`
+  )
+}
 const warnOfDefaultPartitioner = once((logger) => {
   if (process.env.KAFKAJS_NO_PARTITIONER_WARNING == null) {
     logger.warn(
@@ -77,6 +93,7 @@ module.exports = class Client {
       isolationLevel,
     }) =>
       new Cluster({
+        maxInFlightRequests: validateMaxInFlightRequests(maxInFlightRequests),
         logger: this[PRIVATE.LOGGER],
         retry: this[PRIVATE.CLUSTER_RETRY],
         offsets: this[PRIVATE.OFFSETS],
@@ -93,7 +110,6 @@ module.exports = class Client {
         metadataMaxAge,
         instrumentationEmitter,
         allowAutoTopicCreation,
-        maxInFlightRequests,
         isolationLevel,
       })
   }
