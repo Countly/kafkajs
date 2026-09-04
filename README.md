@@ -4,7 +4,7 @@ A pure-JavaScript [Apache Kafka](https://kafka.apache.org/) client for Node.js, 
 
 - **Drop-in for KafkaJS users**: same public API, same runtime semantics (`eachMessage`/`eachBatch`, pause/resume, instrumentation events, error classes).
 - **Targets current infrastructure**: Apache Kafka **4.0+** (KRaft) and Node.js **22+**. Older brokers and runtimes are not supported.
-- **Zero runtime dependencies**, CommonJS entry point plus an ES module entry.
+- **Zero required runtime dependencies** (one optional native dependency, `lz4-napi`, enables LZ4 compression), CommonJS entry point plus an ES module entry.
 
 > **Status**: under active development, **not yet released**. The first public version will be `3.0.0`. Until then the package is not published to npm and internal pre-release tags (`3.0.0-alpha.N`) are used.
 
@@ -13,7 +13,7 @@ A pure-JavaScript [Apache Kafka](https://kafka.apache.org/) client for Node.js, 
 - Producer, with idempotent and transactional modes
 - Consumer groups with pause, resume and seek
 - Message headers
-- GZIP compression built in; Snappy, LZ4 and ZSTD through pluggable codecs
+- GZIP, LZ4 and ZSTD compression built in (LZ4 needs the optional `lz4-napi` dependency); Snappy and any other codec through pluggable codecs
 - PLAINTEXT, SSL and SASL_SSL connections
 - SASL PLAIN, SCRAM-SHA-256, SCRAM-SHA-512, OAUTHBEARER and AWS IAM
 - Admin client

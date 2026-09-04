@@ -16,10 +16,23 @@ const Codecs = {
     throw new KafkaJSNotImplemented('Snappy compression not implemented')
   },
   [Types.LZ4]: () => {
-    throw new KafkaJSNotImplemented('LZ4 compression not implemented')
+    const lz4 = require('./lz4')
+    if (!lz4.isSupported) {
+      throw new KafkaJSNotImplemented(
+        'LZ4 compression requires the optional dependency "lz4-napi". Install it with `npm install lz4-napi`, ' +
+          'or register your own codec with CompressionCodecs[CompressionTypes.LZ4].'
+      )
+    }
+    return lz4
   },
   [Types.ZSTD]: () => {
-    throw new KafkaJSNotImplemented('ZSTD compression not implemented')
+    const zstd = require('./zstd')
+    if (!zstd.isSupported) {
+      throw new KafkaJSNotImplemented(
+        'ZSTD compression requires zstd support in node:zlib (Node >= 22.15 or >= 23.8)'
+      )
+    }
+    return zstd
   },
 }
 

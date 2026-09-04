@@ -1,4 +1,6 @@
+const zlib = require('zlib')
 const Broker = require('../index')
+const apiKeys = require('../../protocol/requests/apiKeys')
 const COORDINATOR_TYPES = require('../../protocol/coordinatorTypes')
 const { Types: Compression } = require('../../protocol/message/compression')
 const { KafkaJSProtocolError } = require('../../errors')
@@ -206,6 +208,50 @@ describe('Broker > Produce', () => {
       clientSideThrottleTime: expect.optional(0),
       throttleTime: 0,
     })
+  })
+
+  describe('ZSTD (KIP-110)', () => {
+    // eslint-disable-next-line n/no-unsupported-features/node-builtins -- feature detection, not a call
+    const hasZstd = typeof zlib.zstdCompressSync === 'function'
+    const testIfZstd = hasZstd ? test : test.skip
+
+    testIfZstd(
+      'a negotiated Produce version below v7 fails with UNSUPPORTED_COMPRESSION_TYPE',
+      async () => {
+        const metadata = await retryProtocol(
+          'LEADER_NOT_AVAILABLE',
+          async () => await broker.metadata([topicName])
+        )
+
+        const partitionBroker = metadata.topicMetadata[0].partitionMetadata[0].leader
+        const newBrokerData = metadata.brokers.find((b) => b.nodeId === partitionBroker)
+
+        broker2 = new Broker({
+          connectionPool: createConnectionPool(newBrokerData),
+          logger: newLogger(),
+        })
+        await broker2.connect()
+
+        // KIP-110: zstd on the wire needs Produce >= v7. Force the negotiated version down to
+        // simulate an older broker and confirm the client surfaces the broker's rejection cleanly.
+        broker2.versions[apiKeys.Produce].maxVersion = 6
+
+        await expect(
+          retryProtocol(
+            'LEADER_NOT_AVAILABLE',
+            async () =>
+              await broker2.produce({
+                compression: Compression.ZSTD,
+                topicData: createTopicData(),
+              })
+          )
+        ).rejects.toEqual(
+          new KafkaJSProtocolError(
+            'The requesting client does not support the compression type of given partition'
+          )
+        )
+      }
+    )
   })
 
   describe('Record batch', () => {

@@ -236,7 +236,7 @@ Take a look at [Retry](Configuration.md#retry) for more information.
 
 ## <a name="compression"></a> Compression
 
-Since KafkaJS aims to have as small footprint and as few dependencies as possible, only the GZIP codec is part of the core functionality, other codecs are available as packages.
+GZIP, LZ4 and ZSTD are built in — no configuration needed to consume messages compressed with any of them, and producing with them only needs the codec to be available (see below). Snappy is not built in; use a codec package as described below. A codec you register yourself under `CompressionCodecs` always takes priority over a built-in one.
 
 ### <a name="compression-gzip"></a> GZIP
 
@@ -276,37 +276,43 @@ Take a look at the official [readme](https://github.com/tulios/kafkajs-snappy) f
 
 ### <a name="compression-lz4"></a> LZ4
 
-LZ4 support is provided by the package `kafkajs-lz4`
+LZ4 (the Kafka frame format, KIP-57) is built in, backed by the optional native dependency `lz4-napi`:
 
 ```sh
-npm install --save kafkajs-lz4
+npm install lz4-napi
 ```
 
 ```javascript
-const { CompressionTypes, CompressionCodecs } = require('@countly/kafkajs')
-const LZ4 = require('kafkajs-lz4')
+const { CompressionTypes } = require('@countly/kafkajs')
 
-CompressionCodecs[CompressionTypes.LZ4] = new LZ4().codec
+async () => {
+  await producer.send({
+    topic: 'topic-name',
+    compression: CompressionTypes.LZ4,
+    messages: [{ key: 'key1', value: 'hello world' }],
+  })
+}
 ```
 
-The package also accepts options to granularly control LZ4 compression & decompression. Take a look at the official [readme](https://github.com/indix/kafkajs-lz4) for more information.
+Without `lz4-napi` installed, requesting `CompressionTypes.LZ4` throws `KafkaJSNotImplemented` naming the missing package. To use a different LZ4 implementation instead, register your own codec under `CompressionCodecs[CompressionTypes.LZ4]` (see [Other](#compression-other)) — it always wins over the built-in one.
 
 ### <a name="compression-zstd"></a> ZSTD
 
-Zstandard support is provided by [`@kafkajs/zstd`](https://github.com/kafkajs/zstd)
-
-```sh
-npm install --save @kafkajs/zstd
-```
+Zstandard (KIP-110) is built in via `node:zlib`'s `zstdCompress`/`zstdDecompress`, available on Node ≥ 22.15 / ≥ 23.8:
 
 ```javascript
-const { CompressionTypes, CompressionCodecs } = require('@countly/kafkajs')
-const ZstdCodec = require('@kafkajs/zstd')
+const { CompressionTypes } = require('@countly/kafkajs')
 
-CompressionCodecs[CompressionTypes.ZSTD] = ZstdCodec()
+async () => {
+  await producer.send({
+    topic: 'topic-name',
+    compression: CompressionTypes.ZSTD,
+    messages: [{ key: 'key1', value: 'hello world' }],
+  })
+}
 ```
 
-Configuration options can be passed to the factory function to control compression & decompression levels and other features. See [the official readme](https://github.com/kafkajs/zstd) for more information.
+No dependency and no setup needed on a Node version that has zstd in `zlib`. On an older Node, requesting `CompressionTypes.ZSTD` throws `KafkaJSNotImplemented` naming the required Node version. ZSTD on the wire needs a broker that accepts Produce ≥ v7 / Fetch ≥ v10; an older negotiated version surfaces `UNSUPPORTED_COMPRESSION_TYPE` instead.
 
 ### <a name="compression-other"></a> Other
 
