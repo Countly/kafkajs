@@ -11,6 +11,9 @@ const OTHER_BITS = 0x7f // 127
 const UNSIGNED_INT32_MAX_NUMBER = 0xffffff80
 const UNSIGNED_INT64_MAX_NUMBER = 0xffffffffffffff80n
 
+const UUID_SIZE = 16
+const UUID_STRING = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
+
 module.exports = class Encoder {
   static encodeZigZag(value) {
     return (value << 1) ^ (value >> 31)
@@ -392,6 +395,69 @@ module.exports = class Encoder {
     byteArray.push(longValue.toInt())
 
     this.writeBufferInternal(Buffer.from(byteArray))
+    return this
+  }
+
+  /**
+   * TAG_BUFFER: the count of tagged fields, then each field as
+   * `(tag, byte length, value)` in strictly ascending tag order. An empty or omitted list is
+   * the single 0x00 byte that every structure of a flexible version must still carry.
+   *
+   * Values arrive already serialized. Dropping a field whose value equals its default is the
+   * codec's decision, not this method's.
+   * @see https://cwiki.apache.org/confluence/display/KAFKA/KIP-482%3A+The+Kafka+Protocol+should+Support+Optional+Tagged+Fields
+   * @param {{ tag: number, value: Buffer|Encoder }[]} [fields]
+   * @returns {Encoder} this
+   * @throws {Error} on a duplicate tag
+   */
+  writeTaggedFields(fields) {
+    if (fields == null || fields.length === 0) {
+      return this.writeUVarInt(0)
+    }
+
+    const sorted = [...fields].sort((a, b) => a.tag - b.tag)
+    this.writeUVarInt(sorted.length)
+
+    let previousTag = -1
+    for (const { tag, value } of sorted) {
+      if (tag === previousTag) {
+        throw new Error(`duplicate tag ${tag} in a tagged-field section`)
+      }
+
+      previousTag = tag
+      const buffer = Buffer.isBuffer(value) ? value : value.buffer
+      this.writeUVarInt(tag)
+      this.writeUVarInt(buffer.length)
+      this.writeBufferInternal(buffer)
+    }
+
+    return this
+  }
+
+  /**
+   * UUID: 16 raw big-endian bytes. The all-zero UUID is the "no UUID" sentinel, so null is
+   * written as 16 zero bytes.
+   * @see https://kafka.apache.org/43/design/protocol
+   * @param {string|Buffer|null} [value] canonical 8-4-4-4-12 hex, raw 16 bytes, or null
+   * @returns {Encoder} this
+   * @throws {Error} when the value is neither a canonical uuid string nor 16 bytes
+   */
+  writeUuid(value) {
+    let raw
+
+    if (value == null) {
+      raw = Buffer.alloc(UUID_SIZE)
+    } else if (Buffer.isBuffer(value)) {
+      raw = value
+    } else if (UUID_STRING.test(value)) {
+      raw = Buffer.from(String(value).replace(/-/g, ''), 'hex')
+    }
+
+    if (raw == null || raw.length !== UUID_SIZE) {
+      throw new Error(`value is not a uuid: ${JSON.stringify(value)}`)
+    }
+
+    this.writeBufferInternal(raw)
     return this
   }
 

@@ -81,3 +81,59 @@ describe('Protocol > tagged fields (KIP-482 TAG_BUFFER)', () => {
     expect(decoder.readInt8()).toEqual(9)
   })
 })
+
+describe('Protocol > tagged fields > writing', () => {
+  const Encoder = require('./encoder')
+
+  test('an empty list writes the single 0x00 sentinel', () => {
+    expect([...new Encoder().writeTaggedFields().buffer]).toEqual([0x00])
+    expect([...new Encoder().writeTaggedFields([]).buffer]).toEqual([0x00])
+  })
+
+  test('writes count, then tag/length/value per field', () => {
+    const buffer = new Encoder().writeTaggedFields([
+      { tag: 0, value: Buffer.from([0xaa, 0xbb]) },
+      { tag: 3, value: Buffer.from([0x01]) },
+    ]).buffer
+
+    expect([...buffer]).toEqual([0x02, 0x00, 0x02, 0xaa, 0xbb, 0x03, 0x01, 0x01])
+  })
+
+  test('sorts by tag regardless of the order given', () => {
+    const buffer = new Encoder().writeTaggedFields([
+      { tag: 5, value: Buffer.from([0x02]) },
+      { tag: 1, value: Buffer.from([0x01]) },
+    ]).buffer
+
+    expect([...buffer]).toEqual([0x02, 0x01, 0x01, 0x01, 0x05, 0x01, 0x02])
+  })
+
+  test('accepts an Encoder as the value', () => {
+    const value = new Encoder().writeInt16(7)
+    const buffer = new Encoder().writeTaggedFields([{ tag: 2, value }]).buffer
+
+    expect([...buffer]).toEqual([0x01, 0x02, 0x02, 0x00, 0x07])
+  })
+
+  test('rejects a duplicate tag', () => {
+    expect(() =>
+      new Encoder().writeTaggedFields([
+        { tag: 1, value: Buffer.alloc(0) },
+        { tag: 1, value: Buffer.alloc(0) },
+      ])
+    ).toThrow(/duplicate tag/)
+  })
+
+  test('round-trips through the decoder', () => {
+    const Decoder = require('./decoder')
+    const fields = [
+      { tag: 0, value: Buffer.from([0xde, 0xad]) },
+      { tag: 300, value: Buffer.from([0x2a]) },
+    ]
+    const decoded = new Decoder(new Encoder().writeTaggedFields(fields).buffer).readTaggedFields()
+
+    expect([...decoded.keys()]).toEqual([0, 300])
+    expect([...decoded.get(0)]).toEqual([0xde, 0xad])
+    expect([...decoded.get(300)]).toEqual([0x2a])
+  })
+})

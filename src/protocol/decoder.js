@@ -14,6 +14,8 @@ const DOUBLE_SIZE = 8
 const MOST_SIGNIFICANT_BIT = 0x80 // 128
 const OTHER_BITS = 0x7f // 127
 
+const UUID_SIZE = 16
+
 /**
  * Shared result for the common empty tag section, so the per-partition tag buffers of a
  * flexible response cost no allocation. Its mutators throw so it can never be poisoned.
@@ -234,6 +236,27 @@ module.exports = class Decoder {
 
   readBoolean() {
     return this.readInt8() === 1
+  }
+
+  /**
+   * UUID: 16 raw big-endian bytes, rendered as the canonical lowercase 8-4-4-4-12 hex form.
+   * The all-zero UUID is the "no UUID" sentinel and reads back as null.
+   * @see https://kafka.apache.org/43/design/protocol
+   * @returns {string|null}
+   */
+  readUuid() {
+    this.ensureReadable(UUID_SIZE, 'readUuid')
+    const hex = this.buffer.toString('hex', this.offset, this.offset + UUID_SIZE)
+    this.offset += UUID_SIZE
+
+    if (hex === '00000000000000000000000000000000') {
+      return null
+    }
+
+    return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(
+      16,
+      20
+    )}-${hex.slice(20)}`
   }
 
   readAll() {

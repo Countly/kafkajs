@@ -67,6 +67,7 @@ Quarantined tests retired in this phase: R1 (metadata for auto-created topics), 
 - `Decoder#readTaggedFields` now returns the tagged values (`Map<number, Buffer>`, unknown tags kept as raw bytes) instead of an empty object, skips each value by its true raw length, and rejects a section whose tags are out of order or duplicated with `KafkaJSPartialMessageError`. Previously it discarded every value and mis-skipped every non-empty one, so the first broker response carrying a real tagged field would have desynchronised the decoder.
 
 #### Additions
+- Protocol primitives for KIP-482 flexible versions: the encoder can write tagged-field sections (`writeTaggedFields`, sorted by tag, empty section = one `0x00`) and the `uuid` type (`writeUuid`/`readUuid`, 16 raw big-endian bytes with the all-zero value as the null sentinel). Internal — `src/**` is not importable.
 
 #### Tooling
 - New `npm run protocol:generate` / `npm run protocol:check`: `src/protocol/flexibleVersions.js` (the first flexible KIP-482 version of every API key) is generated from the committed Apache message-definition snapshot and checked for drift, so the header-version rule can never silently disagree with the protocol.
