@@ -92,22 +92,6 @@ module.exports = class Broker {
 
       this.lookupRequest = lookup(this.versions)
 
-      if (connection.getSupportAuthenticationProtocol() === null) {
-        let supportAuthenticationProtocol = false
-        try {
-          this.lookupRequest(apiKeys.SaslAuthenticate, requests.SaslAuthenticate)
-          supportAuthenticationProtocol = true
-        } catch (_) {
-          supportAuthenticationProtocol = false
-        }
-        this.connectionPool.setSupportAuthenticationProtocol(supportAuthenticationProtocol)
-
-        this.logger.debug(`Verified support for SaslAuthenticate`, {
-          broker: this.brokerAddress,
-          supportAuthenticationProtocol,
-        })
-      }
-
       await connection.authenticate()
     } finally {
       await this.lock.release()

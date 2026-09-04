@@ -18,16 +18,16 @@ const BUILT_IN_AUTHENTICATION_PROVIDERS = {
 const UNLIMITED_SESSION_LIFETIME = '0'
 
 module.exports = class SASLAuthenticator {
-  constructor(connection, logger, versions, supportAuthenticationProtocol) {
+  constructor(connection, logger, versions) {
     this.connection = connection
     this.logger = logger
     this.sessionLifetime = UNLIMITED_SESSION_LIFETIME
 
     const lookupRequest = lookup(versions)
     this.saslHandshake = lookupRequest(apiKeys.SaslHandshake, requests.SaslHandshake)
-    this.protocolAuthentication = supportAuthenticationProtocol
-      ? lookupRequest(apiKeys.SaslAuthenticate, requests.SaslAuthenticate)
-      : null
+    // Kafka 4.x always supports SaslAuthenticate (key 36, versions 0-2); the pre-KIP-152
+    // raw-token path was removed with the rest of the pre-4.0 code.
+    this.protocolAuthentication = lookupRequest(apiKeys.SaslAuthenticate, requests.SaslAuthenticate)
   }
 
   async authenticate() {
@@ -40,26 +40,22 @@ module.exports = class SASLAuthenticator {
     }
 
     const saslAuthenticate = async ({ request, response }) => {
-      if (this.protocolAuthentication) {
-        const requestAuthBytes = await request.encode()
-        const authResponse = await this.connection.send(
-          this.protocolAuthentication({ authBytes: requestAuthBytes })
-        )
+      const requestAuthBytes = await request.encode()
+      const authResponse = await this.connection.send(
+        this.protocolAuthentication({ authBytes: requestAuthBytes })
+      )
 
-        // `0` is a string because `sessionLifetimeMs` is an int64 encoded as string.
-        // This is not present in SaslAuthenticateV0, so we default to `"0"`
-        this.sessionLifetime = authResponse.sessionLifetimeMs || UNLIMITED_SESSION_LIFETIME
+      // `0` is a string because `sessionLifetimeMs` is an int64 encoded as string.
+      // This is not present in SaslAuthenticateV0, so we default to `"0"`
+      this.sessionLifetime = authResponse.sessionLifetimeMs || UNLIMITED_SESSION_LIFETIME
 
-        if (!response) {
-          return
-        }
-
-        const { authBytes: responseAuthBytes } = authResponse
-        const payloadDecoded = await response.decode(responseAuthBytes)
-        return response.parse(payloadDecoded)
+      if (!response) {
+        return
       }
 
-      return this.connection.sendAuthRequest({ request, response })
+      const { authBytes: responseAuthBytes } = authResponse
+      const payloadDecoded = await response.decode(responseAuthBytes)
+      return response.parse(payloadDecoded)
     }
 
     if (

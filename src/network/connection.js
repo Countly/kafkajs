@@ -103,9 +103,6 @@ module.exports = class Connection {
 
     this.versions = null
 
-    this.authHandlers = null
-    this.authExpectResponse = false
-
     const log =
       (level) =>
       (message, extra = {}) => {
@@ -123,7 +120,6 @@ module.exports = class Connection {
 
     this.authenticatedAt = null
     this.sessionLifetime = Long.ZERO
-    this.supportAuthenticationProtocol = null
 
     /**
      * @private
@@ -131,26 +127,13 @@ module.exports = class Connection {
      */
     this[PRIVATE.AUTHENTICATE] = sharedPromiseTo(async () => {
       if (this.sasl && !this.isAuthenticated()) {
-        const authenticator = new SASLAuthenticator(
-          this,
-          this.logger,
-          this.versions,
-          this.supportAuthenticationProtocol
-        )
+        const authenticator = new SASLAuthenticator(this, this.logger, this.versions)
 
         await authenticator.authenticate()
         this.authenticatedAt = process.hrtime()
         this.sessionLifetime = Long.fromValue(authenticator.sessionLifetime)
       }
     })
-  }
-
-  getSupportAuthenticationProtocol() {
-    return this.supportAuthenticationProtocol
-  }
-
-  setSupportAuthenticationProtocol(isSupported) {
-    this.supportAuthenticationProtocol = isSupported
   }
 
   setVersions(versions) {
@@ -191,9 +174,7 @@ module.exports = class Connection {
 
         const wasConnected = this.isConnected()
 
-        if (this.authHandlers) {
-          this.authHandlers.onError()
-        } else if (wasConnected) {
+        if (wasConnected) {
           this.logDebug('Kafka server has closed connection')
           this.rejectRequests(
             new KafkaJSConnectionClosedError('Closed connection', {
@@ -315,53 +296,6 @@ module.exports = class Connection {
   /** @public */
   async authenticate() {
     await this[PRIVATE.AUTHENTICATE]()
-  }
-
-  /**
-   * @public
-   * @returns {Promise}
-   */
-  sendAuthRequest({ request, response }) {
-    this.authExpectResponse = !!response
-
-    /**
-     * TODO: rewrite removing the async promise executor
-     */
-
-    /* eslint-disable no-async-promise-executor */
-    return new Promise(async (resolve, reject) => {
-      this.authHandlers = {
-        onSuccess: (rawData) => {
-          this.authHandlers = null
-          this.authExpectResponse = false
-
-          response
-            .decode(rawData)
-            .then((data) => response.parse(data))
-            .then(resolve)
-            .catch(reject)
-        },
-        onError: () => {
-          this.authHandlers = null
-          this.authExpectResponse = false
-
-          reject(
-            new KafkaJSConnectionError('Connection closed by the server', {
-              broker: `${this.host}:${this.port}`,
-            })
-          )
-        },
-      }
-
-      try {
-        const requestPayload = await request.encode()
-
-        this.failIfNotConnected()
-        this.socket.write(requestPayload, 'binary')
-      } catch (e) {
-        reject(e)
-      }
-    })
   }
 
   /**
@@ -488,10 +422,6 @@ module.exports = class Connection {
    * @private
    */
   processData(rawData) {
-    if (this.authHandlers && !this.authExpectResponse) {
-      return this.authHandlers.onSuccess(rawData)
-    }
-
     // Accumulate the new chunk
     this.chunks.push(rawData)
     this.bytesBuffered += Buffer.byteLength(rawData)
@@ -518,12 +448,6 @@ module.exports = class Connection {
       this.chunks = [remainderBuffer]
       this.bytesBuffered = Buffer.byteLength(remainderBuffer)
       this.bytesNeeded = Decoder.int32Size()
-
-      if (this.authHandlers) {
-        const rawResponseSize = Decoder.int32Size() + expectedResponseSize
-        const rawResponseBuffer = buffer.slice(0, rawResponseSize)
-        return this.authHandlers.onSuccess(rawResponseBuffer)
-      }
 
       const correlationId = response.readInt32()
       const payload = response.readAll()

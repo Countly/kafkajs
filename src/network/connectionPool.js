@@ -27,10 +27,6 @@ module.exports = class ConnectionPool {
     return this.pool.some((c) => c.isAuthenticated())
   }
 
-  setSupportAuthenticationProtocol(isSupported) {
-    this.map((c) => c.setSupportAuthenticationProtocol(isSupported))
-  }
-
   setVersions(versions) {
     this.map((c) => c.setVersions(versions))
   }

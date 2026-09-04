@@ -174,17 +174,6 @@ describe('Broker > connect', () => {
 
           expect(broker.isConnected()).toEqual(true)
         })
-
-        testIfKafkaAtLeast_1_1_0(`authenticate with SASL ${e.name} if configured`, async () => {
-          const connectionPool = createConnectionPool(e.opts())
-          broker = new Broker({ connectionPool, logger: newLogger() })
-          expect(broker.isConnected()).toEqual(false)
-          await broker.connect()
-          expect(broker.isConnected()).toEqual(true)
-
-          const connection = await connectionPool.getConnection()
-          expect(connection.getSupportAuthenticationProtocol()).toEqual(true)
-        })
       }
     })
 
