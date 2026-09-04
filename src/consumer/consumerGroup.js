@@ -609,9 +609,11 @@ module.exports = class ConsumerGroup {
   }
 
   async recoverFromOffsetOutOfRange(e) {
-    // If we are fetching from a follower try with the leader before resetting offsets
+    // If we are fetching from a follower try with the leader before resetting offsets.
+    // The stored value is { nodeId, expireAt } (see the JSDoc on
+    // preferredReadReplicasPerTopicPartition), not a bare nodeId.
     const preferredReadReplicas = this.preferredReadReplicasPerTopicPartition[e.topic]
-    if (preferredReadReplicas && typeof preferredReadReplicas[e.partition] === 'number') {
+    if (preferredReadReplicas && preferredReadReplicas[e.partition] != null) {
       this.logger.info('Offset out of range while fetching from follower, retrying with leader', {
         topic: e.topic,
         partition: e.partition,
