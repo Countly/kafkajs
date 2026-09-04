@@ -1,6 +1,7 @@
 const Long = require('../../utils/long')
 const isInvalidOffset = require('./isInvalidOffset')
 const initializeConsumerOffsets = require('./initializeConsumerOffsets')
+const { isStaleCoordinator } = require('../../errors')
 const {
   events: { COMMIT_OFFSETS },
 } = require('../instrumentationEvents')
@@ -87,7 +88,9 @@ module.exports = class OffsetManager {
    */
   async getCoordinator() {
     if (!this.coordinator.isConnected()) {
-      this.coordinator = await this.cluster.findBroker(this.coordinator)
+      // findBroker() would resolve the same (stale) node after a failover; ask the cluster
+      // which broker currently owns the group instead. Upstream PR #1779.
+      this.coordinator = await this.cluster.findGroupCoordinator({ groupId: this.groupId })
     }
 
     return this.coordinator
@@ -276,10 +279,11 @@ module.exports = class OffsetManager {
 
       this.lastCommit = Date.now()
     } catch (e) {
-      // metadata is stale, the coordinator has changed due to a restart or
-      // broker reassignment
-      if (e.type === 'NOT_COORDINATOR_FOR_GROUP') {
+      // The coordinator has changed due to a restart or broker reassignment; refresh the
+      // metadata *and* re-discover the coordinator so the next attempt targets the right broker.
+      if (isStaleCoordinator(e)) {
         await this.cluster.refreshMetadata()
+        this.coordinator = await this.cluster.findGroupCoordinator({ groupId: this.groupId })
       }
 
       throw e

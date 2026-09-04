@@ -265,10 +265,24 @@ class KafkaJSNoBrokerAvailableError extends KafkaJSError {
   }
 }
 
+/**
+ * Group-coordinator error codes. The error table still emits the legacy type names for
+ * 14/15/16 (GROUP_LOAD_IN_PROGRESS / GROUP_COORDINATOR_NOT_AVAILABLE / NOT_COORDINATOR_FOR_GROUP)
+ * for compatibility, so callers must match on the code, not the type string.
+ */
+const COORDINATOR_LOAD_IN_PROGRESS_CODE = 14
+const COORDINATOR_NOT_AVAILABLE_CODE = 15
+const NOT_COORDINATOR_CODE = 16
+
+/** The cached group coordinator is wrong or gone: re-run FindCoordinator before retrying. */
+const isStaleCoordinator = (e) =>
+  e.code === COORDINATOR_NOT_AVAILABLE_CODE || e.code === NOT_COORDINATOR_CODE
+
 const isRebalancing = (e) =>
   e.type === 'REBALANCE_IN_PROGRESS' ||
   e.type === 'NOT_COORDINATOR_FOR_GROUP' ||
-  e.type === 'ILLEGAL_GENERATION'
+  e.type === 'ILLEGAL_GENERATION' ||
+  e.code === COORDINATOR_LOAD_IN_PROGRESS_CODE
 
 const isKafkaJSError = (e) => e instanceof KafkaJSError
 
@@ -305,5 +319,6 @@ module.exports = {
   KafkaJSNoBrokerAvailableError,
   KafkaJSAlterPartitionReassignmentsError,
   isRebalancing,
+  isStaleCoordinator,
   isKafkaJSError,
 }

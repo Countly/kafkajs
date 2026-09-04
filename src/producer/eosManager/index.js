@@ -1,6 +1,6 @@
 const createRetry = require('../../retry')
 const Lock = require('../../utils/lock')
-const { KafkaJSNonRetriableError } = require('../../errors')
+const { KafkaJSNonRetriableError, isStaleCoordinator } = require('../../errors')
 const COORDINATOR_TYPES = require('../../protocol/coordinatorTypes')
 const createStateMachine = require('./transactionStateMachine')
 const { INT_32_MAX_VALUE } = require('../../constants')
@@ -20,11 +20,12 @@ const INIT_PRODUCER_RETRIABLE_PROTOCOL_ERRORS = [
    */
   'CONCURRENT_TRANSACTIONS',
 ]
-const COMMIT_RETRIABLE_PROTOCOL_ERRORS = [
-  'UNKNOWN_TOPIC_OR_PARTITION',
-  'COORDINATOR_LOAD_IN_PROGRESS',
-]
-const COMMIT_STALE_COORDINATOR_PROTOCOL_ERRORS = ['COORDINATOR_NOT_AVAILABLE', 'NOT_COORDINATOR']
+const COMMIT_RETRIABLE_PROTOCOL_ERRORS = ['UNKNOWN_TOPIC_OR_PARTITION']
+const COORDINATOR_LOAD_IN_PROGRESS_CODE = 14
+
+/** Codes 14/15/16 are emitted with legacy type names (see src/protocol/error.js), match on code. */
+const isCommitRetriable = (e) =>
+  COMMIT_RETRIABLE_PROTOCOL_ERRORS.includes(e.type) || e.code === COORDINATOR_LOAD_IN_PROGRESS_CODE
 
 /**
  * @typedef {Object} EosManager
@@ -406,7 +407,7 @@ module.exports = ({
               topics,
             })
           } catch (e) {
-            if (COMMIT_RETRIABLE_PROTOCOL_ERRORS.includes(e.type)) {
+            if (isCommitRetriable(e)) {
               logger.debug('Group coordinator is not ready yet, retrying', {
                 error: e.message,
                 stack: e.stack,
@@ -418,10 +419,7 @@ module.exports = ({
               throw e
             }
 
-            if (
-              COMMIT_STALE_COORDINATOR_PROTOCOL_ERRORS.includes(e.type) ||
-              e.code === 'ECONNREFUSED'
-            ) {
+            if (isStaleCoordinator(e) || e.code === 'ECONNREFUSED') {
               logger.debug(
                 'Invalid group coordinator, finding new group coordinator and retrying',
                 {

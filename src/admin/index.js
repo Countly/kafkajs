@@ -11,6 +11,7 @@ const {
   KafkaJSBrokerNotFound,
   KafkaJSDeleteTopicRecordsError,
   KafkaJSAggregateError,
+  isStaleCoordinator,
 } = require('../errors')
 const { staleMetadata } = require('../protocol/error')
 const CONFIG_RESOURCE_TYPES = require('../protocol/configResourceTypes')
@@ -971,7 +972,7 @@ module.exports = ({
 
         return results
       } catch (e) {
-        if (e.type === 'NOT_CONTROLLER' || e.type === 'COORDINATOR_NOT_AVAILABLE') {
+        if (e.type === 'NOT_CONTROLLER' || isStaleCoordinator(e)) {
           logger.warn('Could not delete groups', { error: e.message, retryCount, retryTime })
           throw e
         }

@@ -2,6 +2,7 @@ const { newLogger } = require('testHelpers')
 const createEosManager = require('.')
 const { KafkaJSNonRetriableError } = require('../../errors')
 const COORDINATOR_TYPES = require('../../protocol/coordinatorTypes')
+const { createErrorFromCode } = require('../../protocol/error')
 
 describe('Producer > eosManager', () => {
   const topic = 'topic-name'
@@ -351,6 +352,81 @@ describe('Producer > eosManager', () => {
         groupId: consumerGroupId,
         topics,
       })
+    })
+
+    describe('recovering from coordinator errors on txnOffsetCommit', () => {
+      let consumerGroupId, topics
+
+      beforeEach(() => {
+        consumerGroupId = 'consumer-group-id'
+        topics = [{ topic: 'test-topic-1', partitions: [{ partition: 0 }] }]
+      })
+
+      // sendOffsets also looks up the *transaction* coordinator (for addOffsetsToTxn), so count
+      // only the group-coordinator lookups used for txnOffsetCommit.
+      const groupCoordinatorLookups = () =>
+        cluster.findGroupCoordinator.mock.calls.filter(
+          ([{ coordinatorType }]) => coordinatorType === COORDINATOR_TYPES.GROUP
+        ).length
+
+      test('code 14 (coordinator loading) is retried against the same coordinator', async () => {
+        const eosManager = createEosManager({
+          logger: newLogger(),
+          cluster,
+          transactionTimeout: 30000,
+          transactional: true,
+          transactionalId,
+        })
+        await eosManager.initProducerId()
+        await eosManager.beginTransaction()
+
+        let attempt = 0
+        broker.txnOffsetCommit.mockImplementation(() => {
+          attempt += 1
+          if (attempt === 1) throw createErrorFromCode(14)
+        })
+
+        cluster.findGroupCoordinator.mockClear()
+
+        await expect(eosManager.sendOffsets({ consumerGroupId, topics })).resolves.not.toThrow()
+
+        expect(broker.txnOffsetCommit).toHaveBeenCalledTimes(2)
+        // Only the initial lookup from sendOffsets itself -- no extra re-discovery on retry.
+        expect(groupCoordinatorLookups()).toBe(1)
+      })
+
+      test.each([[15], [16]])(
+        'code %i refreshes the group coordinator before retrying',
+        async (code) => {
+          const eosManager = createEosManager({
+            logger: newLogger(),
+            cluster,
+            transactionTimeout: 30000,
+            transactional: true,
+            transactionalId,
+          })
+          await eosManager.initProducerId()
+          await eosManager.beginTransaction()
+
+          let attempt = 0
+          broker.txnOffsetCommit.mockImplementation(() => {
+            attempt += 1
+            if (attempt === 1) throw createErrorFromCode(code)
+          })
+
+          cluster.findGroupCoordinator.mockClear()
+
+          await expect(eosManager.sendOffsets({ consumerGroupId, topics })).resolves.not.toThrow()
+
+          expect(broker.txnOffsetCommit).toHaveBeenCalledTimes(2)
+          // Initial lookup from sendOffsets itself, plus one re-discovery after the error.
+          expect(groupCoordinatorLookups()).toBe(2)
+          expect(cluster.findGroupCoordinator).toHaveBeenLastCalledWith({
+            groupId: consumerGroupId,
+            coordinatorType: COORDINATOR_TYPES.GROUP,
+          })
+        }
+      )
     })
 
     test('aborting transaction when no operation have been made should not send EndTxn', async () => {
