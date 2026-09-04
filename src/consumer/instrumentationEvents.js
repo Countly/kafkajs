@@ -21,12 +21,14 @@ const events = {
   REQUEST: consumerType(networkEvents.NETWORK_REQUEST),
   REQUEST_TIMEOUT: consumerType(networkEvents.NETWORK_REQUEST_TIMEOUT),
   REQUEST_QUEUE_SIZE: consumerType(networkEvents.NETWORK_REQUEST_QUEUE_SIZE),
+  AUTHENTICATION_FAILURE: consumerType(networkEvents.NETWORK_AUTHENTICATION_FAILURE),
 }
 
 const wrappedEvents = {
   [events.REQUEST]: networkEvents.NETWORK_REQUEST,
   [events.REQUEST_TIMEOUT]: networkEvents.NETWORK_REQUEST_TIMEOUT,
   [events.REQUEST_QUEUE_SIZE]: networkEvents.NETWORK_REQUEST_QUEUE_SIZE,
+  [events.AUTHENTICATION_FAILURE]: networkEvents.NETWORK_AUTHENTICATION_FAILURE,
 }
 
 const reversedWrappedEvents = swapObject(wrappedEvents)

@@ -47,6 +47,7 @@ Instrumentation Event:
 | REQUEST_TIMEOUT     | {`broker`, `clientId`, `correlationId`, `createdAt`, `sentAt`, `pendingDuration`, `apiName`, `apiKey`, `apiVersion`}                                 | Request to a broker has timed out. |
 | REQUEST_QUEUE_SIZE  | {`broker`, `clientId`, `queueSize`}                                                                                                                                                      | All requests go through a request queue where concurrency is managed (`maxInflightRequests`). Whenever the size of the queue changes, this event is emitted. |
 | RECEIVED_UNSUBSCRIBED_TOPICS | {`groupId`, `generationId`, `memberId`, `assignedTopics`, `topicsSubscribed`, `topicsNotSubscribed`} | Event emitted when some members of your consumer group are subscribed to some topics, and some other members of the group are subscribed to a different set of topics. |
+| AUTHENTICATION_FAILURE | {`broker`, `mechanism`, `errorMessage`} | A broker rejected SASL authentication (`SASL_AUTHENTICATION_FAILED`), carrying its own error message. The broker is blacked out for a short window (at least `authenticationTimeout`, minimum 1 second) before it is retried, to avoid a reconnect storm against a broker that will keep rejecting the same credentials. |
 
 ### <a name="producer"></a> Producer
 
@@ -58,6 +59,7 @@ Instrumentation Event:
 | DISCONNECT         |                                                                                                                                                                                                               | Producer has disconnected. |
 | REQUEST_TIMEOUT    | {`broker`, `clientId`, `correlationId`, `createdAt`, `sentAt`, `pendingDuration`, `apiName`, `apiKey`, `apiVersion`}                                 | Request to a broker has timed out. |
 | REQUEST_QUEUE_SIZE | {`broker`, `clientId`, `queueSize`}                                                                                                                                                      | All requests go through a request queue where concurrency is managed (`maxInflightRequests`). Whenever the size of the queue changes, this event is emitted. |
+| AUTHENTICATION_FAILURE | {`broker`, `mechanism`, `errorMessage`} | A broker rejected SASL authentication (`SASL_AUTHENTICATION_FAILED`), carrying its own error message. The broker is blacked out for a short window (at least `authenticationTimeout`, minimum 1 second) before it is retried, to avoid a reconnect storm against a broker that will keep rejecting the same credentials. |
 
 
 ### <a name="admin"></a> Admin
@@ -69,3 +71,4 @@ Instrumentation Event:
 | DISCONNECT         |                                                                                                                                                                                                               | Admin client has disconnected. |
 | REQUEST_TIMEOUT    | {`broker`, `clientId`, `correlationId`, `createdAt`, `sentAt`, `pendingDuration`, `apiName`, `apiKey`, `apiVersion`}                                 | Request to a broker has timed out. |
 | REQUEST_QUEUE_SIZE | {`broker`, `clientId`, `queueSize`}                                                                                                                                                      | All requests go through a request queue where concurrency is managed (`maxInflightRequests`). Whenever the size of the queue changes, this event is emitted. |
+| AUTHENTICATION_FAILURE | {`broker`, `mechanism`, `errorMessage`} | A broker rejected SASL authentication (`SASL_AUTHENTICATION_FAILED`), carrying its own error message. The broker is blacked out for a short window (at least `authenticationTimeout`, minimum 1 second) before it is retried, to avoid a reconnect storm against a broker that will keep rejecting the same credentials. |

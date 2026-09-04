@@ -17,6 +17,9 @@ const BUILT_IN_AUTHENTICATION_PROVIDERS = {
 
 const UNLIMITED_SESSION_LIFETIME = '0'
 
+// src/protocol/error.js: SASL_AUTHENTICATION_FAILED
+const SASL_AUTHENTICATION_FAILED_CODE = 58
+
 module.exports = class SASLAuthenticator {
   constructor(connection, logger, versions) {
     this.connection = connection
@@ -41,9 +44,22 @@ module.exports = class SASLAuthenticator {
 
     const saslAuthenticate = async ({ request, response }) => {
       const requestAuthBytes = await request.encode()
-      const authResponse = await this.connection.send(
-        this.protocolAuthentication({ authBytes: requestAuthBytes })
-      )
+
+      let authResponse
+      try {
+        authResponse = await this.connection.send(
+          this.protocolAuthentication({ authBytes: requestAuthBytes })
+        )
+      } catch (e) {
+        // Only the raw protocol error carries the broker's own error_message and code;
+        // built-in mechanisms (plain/scram/oauthBearer/awsIam) re-wrap it into
+        // KafkaJSSASLAuthenticationError with a plain string, losing both. Report here,
+        // before that happens, then re-throw unchanged so the thrown class is unaffected.
+        if (e.code === SASL_AUTHENTICATION_FAILED_CODE) {
+          this.connection.reportAuthenticationFailure(mechanism, e.message)
+        }
+        throw e
+      }
 
       // `0` is a string because `sessionLifetimeMs` is an int64 encoded as string.
       // This is not present in SaslAuthenticateV0, so we default to `"0"`

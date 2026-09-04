@@ -1,6 +1,7 @@
 const createSocket = require('./socket')
 const createRequest = require('../protocol/request')
 const Decoder = require('../protocol/decoder')
+const { NETWORK_AUTHENTICATION_FAILURE } = require('./instrumentationEvents')
 const { KafkaJSConnectionError, KafkaJSConnectionClosedError } = require('../errors')
 const { INT_32_MAX_VALUE } = require('../constants')
 const getEnv = require('../env')
@@ -52,6 +53,10 @@ module.exports = class Connection {
    * @param {number} [options.maxInFlightRequests=null] The maximum number of unacknowledged requests on a connection before
    *                                            enqueuing
    * @param {import("../instrumentation/emitter")} [options.instrumentationEmitter=null]
+   * @param {() => void} [options.onAuthenticationFailure=null] Called when the broker rejects
+   *                                            SaslAuthenticate (code 58), after the
+   *                                            NETWORK_AUTHENTICATION_FAILURE event is emitted.
+   *                                            Used by ConnectionPool to blackout the broker.
    */
   constructor({
     host,
@@ -68,6 +73,7 @@ module.exports = class Connection {
     enforceRequestTimeout = true,
     maxInFlightRequests = null,
     instrumentationEmitter = null,
+    onAuthenticationFailure = null,
   }) {
     this.host = host
     this.port = port
@@ -83,6 +89,8 @@ module.exports = class Connection {
     this.requestTimeout = requestTimeout
     this.connectionTimeout = connectionTimeout
     this.reauthenticationThreshold = reauthenticationThreshold
+    this.instrumentationEmitter = instrumentationEmitter
+    this.onAuthenticationFailure = onAuthenticationFailure
 
     this.bytesBuffered = 0
     this.bytesNeeded = Decoder.int32Size()
@@ -296,6 +304,28 @@ module.exports = class Connection {
   /** @public */
   async authenticate() {
     await this[PRIVATE.AUTHENTICATE]()
+  }
+
+  /**
+   * @public
+   * Reports a SASL authentication failure diagnosed from the broker's own response
+   * (SASL_AUTHENTICATION_FAILED, code 58): emits NETWORK_AUTHENTICATION_FAILURE and lets
+   * the owning ConnectionPool blackout this broker before the next connection attempt.
+   * @param {string} mechanism
+   * @param {string} errorMessage
+   */
+  reportAuthenticationFailure(mechanism, errorMessage) {
+    if (this.instrumentationEmitter) {
+      this.instrumentationEmitter.emit(NETWORK_AUTHENTICATION_FAILURE, {
+        broker: this.broker,
+        mechanism,
+        errorMessage,
+      })
+    }
+
+    if (this.onAuthenticationFailure) {
+      this.onAuthenticationFailure()
+    }
   }
 
   /**

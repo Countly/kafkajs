@@ -377,6 +377,7 @@ export type AdminEvents = {
   REQUEST: 'admin.network.request'
   REQUEST_TIMEOUT: 'admin.network.request_timeout'
   REQUEST_QUEUE_SIZE: 'admin.network.request_queue_size'
+  AUTHENTICATION_FAILURE: 'admin.network.authentication_failure'
 }
 
 export interface InstrumentationEvent<T> {
@@ -419,6 +420,11 @@ export type RequestQueueSizeEvent = InstrumentationEvent<{
   broker: string
   clientId: string
   queueSize: number
+}>
+export type AuthenticationFailureEvent = InstrumentationEvent<{
+  broker: string
+  mechanism: string
+  errorMessage: string
 }>
 
 export type SeekEntry = PartitionOffset
@@ -570,6 +576,10 @@ export type Admin = {
   on(
     eventName: AdminEvents['REQUEST_TIMEOUT'],
     listener: (event: RequestTimeoutEvent) => void
+  ): RemoveInstrumentationEventListener<typeof eventName>
+  on(
+    eventName: AdminEvents['AUTHENTICATION_FAILURE'],
+    listener: (event: AuthenticationFailureEvent) => void
   ): RemoveInstrumentationEventListener<typeof eventName>
   on(
     eventName: ValueOf<AdminEvents>,
@@ -784,6 +794,7 @@ export type ProducerEvents = {
   REQUEST: 'producer.network.request'
   REQUEST_TIMEOUT: 'producer.network.request_timeout'
   REQUEST_QUEUE_SIZE: 'producer.network.request_queue_size'
+  AUTHENTICATION_FAILURE: 'producer.network.authentication_failure'
 }
 
 export type Producer = Sender & {
@@ -814,6 +825,10 @@ export type Producer = Sender & {
   on(
     eventName: ProducerEvents['REQUEST_TIMEOUT'],
     listener: (event: RequestTimeoutEvent) => void
+  ): RemoveInstrumentationEventListener<typeof eventName>
+  on(
+    eventName: ProducerEvents['AUTHENTICATION_FAILURE'],
+    listener: (event: AuthenticationFailureEvent) => void
   ): RemoveInstrumentationEventListener<typeof eventName>
   on(
     eventName: ValueOf<ProducerEvents>,
@@ -919,6 +934,7 @@ export type ConsumerEvents = {
   REQUEST: 'consumer.network.request'
   REQUEST_TIMEOUT: 'consumer.network.request_timeout'
   REQUEST_QUEUE_SIZE: 'consumer.network.request_queue_size'
+  AUTHENTICATION_FAILURE: 'consumer.network.authentication_failure'
 }
 export type ConsumerHeartbeatEvent = InstrumentationEvent<{
   groupId: string
@@ -1110,6 +1126,10 @@ export type Consumer = {
   on(
     eventName: ConsumerEvents['REQUEST_QUEUE_SIZE'],
     listener: (event: RequestQueueSizeEvent) => void
+  ): RemoveInstrumentationEventListener<typeof eventName>
+  on(
+    eventName: ConsumerEvents['AUTHENTICATION_FAILURE'],
+    listener: (event: AuthenticationFailureEvent) => void
   ): RemoveInstrumentationEventListener<typeof eventName>
   on(
     eventName: ValueOf<ConsumerEvents>,

@@ -9,12 +9,14 @@ const events = {
   REQUEST: adminType(networkEvents.NETWORK_REQUEST),
   REQUEST_TIMEOUT: adminType(networkEvents.NETWORK_REQUEST_TIMEOUT),
   REQUEST_QUEUE_SIZE: adminType(networkEvents.NETWORK_REQUEST_QUEUE_SIZE),
+  AUTHENTICATION_FAILURE: adminType(networkEvents.NETWORK_AUTHENTICATION_FAILURE),
 }
 
 const wrappedEvents = {
   [events.REQUEST]: networkEvents.NETWORK_REQUEST,
   [events.REQUEST_TIMEOUT]: networkEvents.NETWORK_REQUEST_TIMEOUT,
   [events.REQUEST_QUEUE_SIZE]: networkEvents.NETWORK_REQUEST_QUEUE_SIZE,
+  [events.AUTHENTICATION_FAILURE]: networkEvents.NETWORK_AUTHENTICATION_FAILURE,
 }
 
 const reversedWrappedEvents = swapObject(wrappedEvents)

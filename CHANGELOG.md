@@ -17,6 +17,7 @@ Versions before 3.0.0 are internal alpha tags and are not published.
 - The pre-KIP-152 raw SASL token path (used only when a broker lacked `SaslAuthenticate`) is removed; every mechanism goes through `SaslAuthenticate`.
 - Version negotiation now rejects an API whose broker range does not overlap the client range with `KafkaJSServerDoesNotSupportApiKey` (message names both ranges) instead of sending a version the broker rejects or selecting one the client does not implement.
 - `retry.restartOnFailure`, when supplied, is now consulted for every terminal consumer crash, retriable or not — previously it was only invoked for errors KafkaJS considered retriable, so a callback returning `true`/`false` was silently ignored on non-retriable errors. Callers who never set `restartOnFailure` see no change: the default remains "restart on retriable errors, stop on non-retriable ones". If the consumer is stopped or disconnected while the callback is still deciding, no restart is scheduled.
+- A broker whose SASL authentication just failed (`SASL_AUTHENTICATION_FAILED`, code 58) is now blacked out for `max(authenticationTimeout, 1000ms)` before the next connection attempt, instead of being retried immediately — this avoids a reconnect storm against a broker that will keep rejecting the same credentials. The thrown error class is unchanged (`KafkaJSSASLAuthenticationError`/`KafkaJSConnectionError`).
 
 #### Fixes
 - Request queue: an idle, unthrottled queue no longer re-arms a timer after every response (hundreds of wakeups per second at idle, `TimeoutNegativeWarning` on Node ≥ 24). Informed by upstream #1755, #1768, #1667, #1572 (issues #1704, #1751, #1556); implementation follows the Countly production patch and keeps the 10 ms re-check for a queue blocked by the in-flight limit. Retires Countly patch 1a.
@@ -33,6 +34,7 @@ Versions before 3.0.0 are internal alpha tags and are not published.
 
 #### Additions
 - New producer instrumentation event `INITIALIZED` (`producer.events.INITIALIZED`), emitted for idempotent producers once a producer id has been obtained — i.e. once it's safe to `send()` — whether that happens during `connect()` or via the lazy re-init path above; not emitted for non-idempotent producers. `CONNECT` keeps firing exactly where it always has.
+- New `AUTHENTICATION_FAILURE` instrumentation event (consumer/producer/admin), emitted when a broker rejects SASL authentication with `SASL_AUTHENTICATION_FAILED` (code 58). Payload: `{ broker, mechanism, errorMessage }`, where `errorMessage` is the broker's own `error_message` when it sent one.
 
 #### Performance
 - `arrayDiff` now builds a `Set` from the second array once and does an O(1) membership check per element, instead of an `indexOf` scan of the second array for every element of the first (O(n·m)). It's on the hot path for `ConsumerGroup#checkForStaleAssignment`, `BrokerPool#refreshMetadata`, and rebalancing, so this matters most on high-partition-count topics. Behavior is unchanged except for `NaN` (`Set#has` uses SameValueZero, `indexOf` uses strict equality), which never appears in a topic name, partition id, or broker id. Adopts upstream PR #1738.

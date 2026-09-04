@@ -49,6 +49,10 @@ module.exports = class Broker {
     this.authenticationTimeout = authenticationTimeout
     this.allowAutoTopicCreation = allowAutoTopicCreation
 
+    // ConnectionPool doesn't otherwise know the client's authenticationTimeout; it needs it
+    // to size the post-SASL-failure blackout window (see ConnectionPool#recordAuthenticationFailure).
+    this.connectionPool.authenticationTimeout = authenticationTimeout
+
     // The lock timeout has twice the connectionTimeout because the same timeout is used
     // for the first apiVersions call
     const lockTimeout = 2 * this.connectionPool.connectionTimeout + this.authenticationTimeout
