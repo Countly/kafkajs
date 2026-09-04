@@ -33,7 +33,7 @@ module.exports = class BrokerPool {
     this.metadataMaxAge = metadataMaxAge || 0
     this.logger = logger.namespace('BrokerPool')
     this.retrier = createRetry(assign({}, retry))
-    this.authenticationTimeout = authenticationTimeout
+    this.authenticationTimeout = authenticationTimeout ?? 10000
 
     // Broker address -> blackout entry, shared by every ConnectionPool this BrokerPool builds
     // (see buildConnectionPool), so a pool rebuilt after a connection error (seed rotation,
@@ -145,6 +145,7 @@ module.exports = class BrokerPool {
     this.brokers = {}
     this.metadata = null
     this.versions = null
+    this.authenticationBlackout.clear()
   }
 
   /**
