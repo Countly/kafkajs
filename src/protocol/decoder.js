@@ -178,6 +178,12 @@ module.exports = class Decoder {
     return stringBuffer
   }
 
+  /**
+   * COMPACT_BYTES / COMPACT_NULLABLE_BYTES: an unsigned varint holding the payload length + 1,
+   * then that many bytes. 0 is the null sentinel, 1 is empty.
+   * @see https://kafka.apache.org/43/design/protocol
+   * @returns {Buffer|null}
+   */
   readUVarIntBytes() {
     const byteLength = this.readUVarInt()
 
@@ -185,10 +191,26 @@ module.exports = class Decoder {
       return null
     }
 
-    this.ensureReadable(byteLength - 1, 'readUVarIntBytes')
-    const stringBuffer = this.buffer.slice(this.offset, this.offset + byteLength)
-    this.offset += byteLength - 1
-    return stringBuffer
+    const payloadLength = byteLength - 1
+    this.ensureReadable(payloadLength, 'readUVarIntBytes')
+    const payload = this.buffer.slice(this.offset, this.offset + payloadLength)
+    this.offset += payloadLength
+    return payload
+  }
+
+  /**
+   * A tagged field's size prefix is the raw serialized byte count, not the compact
+   * "length + 1" used by COMPACT_BYTES, so tag sections cannot be read with
+   * readUVarIntBytes().
+   * @see https://cwiki.apache.org/confluence/display/KAFKA/KIP-482%3A+The+Kafka+Protocol+should+Support+Optional+Tagged+Fields
+   * @returns {Buffer} exactly the next N bytes, where N is the unsigned varint just read
+   */
+  readRawUVarIntBytes() {
+    const byteLength = this.readUVarInt()
+    this.ensureReadable(byteLength, 'readRawUVarIntBytes')
+    const payload = this.buffer.slice(this.offset, this.offset + byteLength)
+    this.offset += byteLength
+    return payload
   }
 
   readBoolean() {

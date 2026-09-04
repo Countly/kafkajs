@@ -63,6 +63,7 @@ Quarantined tests retired in this phase: R1 (metadata for auto-created topics), 
 #### Behavior changes
 
 #### Fixes
+- `Decoder#readUVarIntBytes` returned one byte too many for every COMPACT_BYTES field: it correctly advanced the offset by the payload length (compact prefixes encode *length + 1*) but sliced `length + 1` bytes, so the returned buffer carried the first byte of whatever followed — or, at the end of a frame, silently came back short, because the bounds check only covered the payload. No shipped codec read a non-empty compact bytes field, so nothing decoded wrongly in 2.2.4; the flexible codecs added in this release do.
 
 #### Additions
 

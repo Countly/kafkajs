@@ -228,9 +228,15 @@ module.exports = class Encoder {
     return this
   }
 
+  /**
+   * COMPACT_BYTES / COMPACT_NULLABLE_BYTES: the payload length + 1 as an unsigned varint,
+   * then the payload. null writes the single 0x00 sentinel.
+   * @param {Buffer|string|null} [value]
+   * @returns {Encoder} this
+   */
   writeUVarIntBytes(value) {
     if (value == null) {
-      this.writeVarInt(0)
+      this.writeUVarInt(0)
       return this
     }
 
