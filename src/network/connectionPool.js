@@ -1,6 +1,6 @@
 const apiKeys = require('../protocol/requests/apiKeys')
 const Connection = require('./connection')
-const { KafkaJSConnectionError } = require('../errors')
+const { KafkaJSSASLAuthenticationError } = require('../errors')
 
 // Floor for the post-authentication-failure blackout, applied even when authenticationTimeout
 // is unset or shorter, so a misconfigured broker can't be hammered in a tight reconnect loop.
@@ -8,7 +8,10 @@ const MIN_AUTHENTICATION_BLACKOUT_MS = 1000
 
 module.exports = class ConnectionPool {
   /**
-   * @param {ConstructorParameters<typeof Connection>[0] & { authenticationTimeout?: number }} options
+   * @param {ConstructorParameters<typeof Connection>[0] & {
+   *   authenticationTimeout?: number,
+   *   authenticationBlackout?: Map<string, { until: number, errorMessage: string }>
+   * }} options
    */
   constructor(options) {
     this.logger = options.logger.namespace('ConnectionPool')
@@ -23,14 +26,16 @@ module.exports = class ConnectionPool {
     this.authenticationTimeout = options.authenticationTimeout
     this.brokerAddress = `${this.host}:${this.port}`
 
-    /** @type {Map<string, number>} broker address -> timestamp (ms) until which it is blacked out */
-    this.authenticationBlackout = new Map()
+    // Broker address -> blackout entry. Defaults to a pool-local map, but a BrokerPool
+    // rebuilding this pool after a connection error injects its own long-lived map instead
+    // (see BrokerPool#buildConnectionPool), so the blackout survives the rebuild.
+    this.authenticationBlackout = options.authenticationBlackout || new Map()
 
     this.pool = new Array(2).fill().map(
       () =>
         new Connection({
           ...options,
-          onAuthenticationFailure: () => this.recordAuthenticationFailure(),
+          onAuthenticationFailure: (errorMessage) => this.recordAuthenticationFailure(errorMessage),
         })
     )
   }
@@ -38,31 +43,37 @@ module.exports = class ConnectionPool {
   /**
    * Called when a Connection reports SASL_AUTHENTICATION_FAILED (code 58). Blacks this
    * broker out for `max(authenticationTimeout, 1000ms)`, so getConnection() refuses to
-   * reconnect immediately and turn a bad credential into a reconnect storm.
+   * (re)authenticate immediately and turn a bad credential into a reconnect storm.
    * @public
+   * @param {string} errorMessage The broker's own error message, surfaced again if a later
+   *                              attempt is refused during the blackout.
    */
-  recordAuthenticationFailure() {
+  recordAuthenticationFailure(errorMessage) {
     const blackoutMs = Math.max(this.authenticationTimeout || 0, MIN_AUTHENTICATION_BLACKOUT_MS)
-    this.authenticationBlackout.set(this.brokerAddress, Date.now() + blackoutMs)
+    this.authenticationBlackout.set(this.brokerAddress, {
+      until: Date.now() + blackoutMs,
+      errorMessage,
+    })
   }
 
   /**
    * @private
-   * @returns {number|null} ms remaining in the blackout window, or null if not blacked out
+   * @returns {{ remainingMs: number, errorMessage: string }|null} the active blackout entry
+   *          for this broker, or null if it isn't blacked out (expired entries are pruned)
    */
-  authenticationBlackoutRemaining() {
-    const until = this.authenticationBlackout.get(this.brokerAddress)
-    if (until == null) {
+  authenticationBlackoutEntry() {
+    const entry = this.authenticationBlackout.get(this.brokerAddress)
+    if (entry == null) {
       return null
     }
 
-    const remaining = until - Date.now()
-    if (remaining <= 0) {
+    const remainingMs = entry.until - Date.now()
+    if (remainingMs <= 0) {
       this.authenticationBlackout.delete(this.brokerAddress)
       return null
     }
 
-    return remaining
+    return { remainingMs, errorMessage: entry.errorMessage }
   }
 
   isConnected() {
@@ -91,16 +102,27 @@ module.exports = class ConnectionPool {
     return this.getConnection(index)
   }
 
+  /**
+   * @public
+   * @param {number} [index=0]
+   * @returns {Promise<Connection>}
+   */
   async getConnection(index = 0) {
-    const remainingBlackoutMs = this.authenticationBlackoutRemaining()
-    if (remainingBlackoutMs != null) {
-      throw new KafkaJSConnectionError(
-        `SASL authentication recently failed for ${this.brokerAddress}; refusing to reconnect for another ${remainingBlackoutMs}ms`,
-        { broker: this.brokerAddress }
-      )
-    }
-
     const connection = this.pool[index]
+
+    // The blackout only ever needs to gate a (re)authentication attempt: a connection that
+    // is already connected and authenticated keeps working untouched, on this index and on
+    // its sibling, even while another index is blacked out for this same broker.
+    const needsAuthenticationAttempt =
+      !connection.isConnected() || (this.sasl && !connection.isAuthenticated())
+    if (needsAuthenticationAttempt) {
+      const blackout = this.authenticationBlackoutEntry()
+      if (blackout != null) {
+        throw new KafkaJSSASLAuthenticationError(
+          `SASL authentication recently failed for ${this.brokerAddress} (${blackout.errorMessage}); refusing to reconnect for another ${blackout.remainingMs}ms`
+        )
+      }
+    }
 
     if (!connection.isConnected()) {
       await connection.connect()

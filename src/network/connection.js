@@ -53,7 +53,8 @@ module.exports = class Connection {
    * @param {number} [options.maxInFlightRequests=null] The maximum number of unacknowledged requests on a connection before
    *                                            enqueuing
    * @param {import("../instrumentation/emitter")} [options.instrumentationEmitter=null]
-   * @param {() => void} [options.onAuthenticationFailure=null] Called when the broker rejects
+   * @param {(errorMessage: string) => void} [options.onAuthenticationFailure=null] Called with the
+   *                                            broker's error message when it rejects
    *                                            SaslAuthenticate (code 58), after the
    *                                            NETWORK_AUTHENTICATION_FAILURE event is emitted.
    *                                            Used by ConnectionPool to blackout the broker.
@@ -324,7 +325,7 @@ module.exports = class Connection {
     }
 
     if (this.onAuthenticationFailure) {
-      this.onAuthenticationFailure()
+      this.onAuthenticationFailure(errorMessage)
     }
   }
 
