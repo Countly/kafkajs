@@ -31,6 +31,10 @@ describe('Network > RequestQueue', () => {
     requestQueue = createRequestQueue()
   })
 
+  afterEach(() => {
+    requestQueue.destroy()
+  })
+
   describe('#waitForPendingRequests', () => {
     let request, send, size, payload
 
