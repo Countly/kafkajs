@@ -6,29 +6,28 @@ under `src/` other than `*.spec.js` and `__snapshots__/*.snap` was changed to ma
 
 | Spec | Test | Reason | Class | Owner phase |
 |---|---|---|---|---|
-| `src/admin/__tests__/fetchTopicMetadata.spec.js` | Admin > fetchTopicMetadata &gt; creates a new topic if the topic does not exist and "allowAutoTopicCreation" is true | Phase 2 (R1): client-side auto topic creation is broken on KRaft — the broker answers UNKNOWN_TOPIC_OR_PARTITION while creating the topic and the client only retries LEADER_NOT_AVAILABLE. Upstream: tulios/kafkajs#1558, issue #1752 | (b) | Phase 2 |
 | `src/consumer/__tests__/instrumentationEvents.spec.js` | Consumer > Instrumentation Events &gt; emits request timeout events | flaky: `requestTimeout: 1` races a sub-millisecond loopback round trip, so the timeout often never fires (`Number of calls: 0`); observed once in ~12 group runs | (c) | Phase 2 (rewrite: drive the timeout from a stubbed socket instead of a 1 ms budget) |
 | `src/broker/__tests__/listPartitionReassignments.spec.js` | Broker > alterPartitionReassignments &gt; request | flaky: the assertion requires the reassignment to still be *in flight* (`addingReplicas: [2], removingReplicas: [1]`), but the partition is empty and the controller completes the reassignment in milliseconds, so under load the list request arrives afterwards and `response.topics` is `[]` (`TypeError: Cannot read properties of undefined (reading 'partitions')`). Observed once in ~7 broker-group runs; 8/8 green when the spec runs alone, i.e. it fails exactly when the group is slow — which is the CI condition. Cannot be stabilised from test infra: replication throttles do not hold an empty partition. The v0 response decoder is still covered by `src/protocol/requests/listPartitionReassignments/v0/response.spec.js` | (c) | Phase 2 (rewrite: produce data into the partition and apply a follower replication throttle so the reassignment stays pending, or assert the completed shape instead) |
 
 ## Root causes
 
-- **R1 — auto topic creation / metadata propagation.** In KRaft the broker answers a `Metadata`
-  request for a not-yet-created topic with `UNKNOWN_TOPIC_OR_PARTITION` and creates the topic
-  asynchronously through the controller; ZooKeeper-era brokers created it inline and answered
-  `LEADER_NOT_AVAILABLE`. `src/cluster/brokerPool.js:208-213` (`refreshMetadata`: re-throw only on
-  `LEADER_NOT_AVAILABLE`, otherwise `bail`) and `src/admin/index.js:33-45`
-  (`retryOnLeaderNotAvailable`) therefore give up on the first attempt. Reproduced directly: a first
-  `broker.metadata([newTopic])` throws `UNKNOWN_TOPIC_OR_PARTITION`, the second succeeds. Upstream
-  fix in flight: [tulios/kafkajs#1558](https://github.com/tulios/kafkajs/pull/1558) ("refreshMetadata
-  should retry if topic does not exist and allowAutoTopicCreation…"), reported as
-  [#1752](https://github.com/tulios/kafkajs/issues/1752).
+- **R1 — auto topic creation / metadata propagation (retired Phase 2, task 25).** In KRaft the
+  broker answers a `Metadata` request for a not-yet-created topic with `UNKNOWN_TOPIC_OR_PARTITION`
+  and creates the topic asynchronously through the controller; ZooKeeper-era brokers created it
+  inline and answered `LEADER_NOT_AVAILABLE`. `BrokerPool#refreshMetadata` (`src/cluster/brokerPool.js`)
+  and `Admin`'s `retryOnLeaderNotAvailable` (`src/admin/index.js`) now also retry on
+  `UNKNOWN_TOPIC_OR_PARTITION` when the broker/cluster allows auto topic creation, matching the
+  existing `LEADER_NOT_AVAILABLE` guard; with auto creation disabled the error still surfaces on
+  the first attempt. Adopts upstream [tulios/kafkajs#1558](https://github.com/tulios/kafkajs/pull/1558)
+  ("refreshMetadata should retry if topic does not exist and allowAutoTopicCreation…"), reported as
+  [#1752](https://github.com/tulios/kafkajs/issues/1752) (see also #815). The previously-quarantined
+  test — `src/admin/__tests__/fetchTopicMetadata.spec.js` > Admin > fetchTopicMetadata > creates a
+  new topic if the topic does not exist and "allowAutoTopicCreation" is true — is unskipped and
+  green (verified 3/3 cold runs, plus the full `admin` and `cluster` groups).
 
-  Only the one test above is quarantined for R1 — the single place where auto creation is the
-  behavior under test. Everywhere else the race only affected *fixture setup*, and is handled
-  without hiding the bug: `testHelpers.createTopic` retries the two transient error types with a
-  bounded backoff (10 × 200 ms), and specs that need a topic now create it explicitly instead of
-  relying on the client to auto-create it (`src/cluster/__tests__/brokerPool.spec.js`,
-  `src/broker/__tests__/describeGroups.spec.js`).
+  `testHelpers.createTopic`'s bounded retry and the explicit-topic-creation specs
+  (`src/cluster/__tests__/brokerPool.spec.js`, `src/broker/__tests__/describeGroups.spec.js`) are
+  test infrastructure, not part of the quarantine, and are left as-is.
 
 ## Not quarantined
 
@@ -42,5 +41,5 @@ There is also one pre-existing upstream skip that this task did not add and does
 `src/consumer/__tests__/instrumentationEvents.spec.js` — `emits request queue size events`
 (commented "This test is too flaky, we need to think about a better way of testing this").
 
-Counting check: `grep -rn '\.skip(' --include='*.spec.js' src/` returns 4 — the 3 rows above plus
+Counting check: `grep -rn '\.skip(' --include='*.spec.js' src/` returns 3 — the 2 rows above plus
 that one pre-existing skip.

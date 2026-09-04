@@ -93,6 +93,10 @@ module.exports = class Cluster {
       timeout: requestTimeout,
     })
     this.isolationLevel = isolationLevel
+    // Exposed so callers (e.g. Admin#fetchTopicMetadata) can decide whether an
+    // UNKNOWN_TOPIC_OR_PARTITION response is a still-propagating auto-created topic worth
+    // retrying, rather than a real "no such topic".
+    this.allowAutoTopicCreation = allowAutoTopicCreation
     this.brokerPool = new BrokerPool({
       connectionPoolBuilder: this.connectionPoolBuilder,
       logger: this.rootLogger,

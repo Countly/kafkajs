@@ -33,6 +33,12 @@ module.exports = class BrokerPool {
     this.metadataMaxAge = metadataMaxAge || 0
     this.logger = logger.namespace('BrokerPool')
     this.retrier = createRetry(assign({}, retry))
+    this.authenticationTimeout = authenticationTimeout
+
+    // Broker address -> blackout entry, shared by every ConnectionPool this BrokerPool builds
+    // (see buildConnectionPool), so a pool rebuilt after a connection error (seed rotation,
+    // illegal SASL state) keeps the blackout instead of starting over with an empty one.
+    this.authenticationBlackout = new Map()
 
     this.createBroker = (options) =>
       new Broker({
@@ -48,6 +54,24 @@ module.exports = class BrokerPool {
     this.metadata = null
     this.metadataExpireAt = null
     this.versions = null
+  }
+
+  /**
+   * Builds a connection pool via the injected builder and stamps it with this client's
+   * authenticationTimeout and this BrokerPool's shared authenticationBlackout map. Every pool
+   * this BrokerPool creates goes through here so a pool rebuilt after a connection error keeps
+   * both, instead of a fresh pool silently losing the blackout (and falling back to the 1s
+   * floor for its window) the way a bare `connectionPoolBuilder.build()` call would.
+   *
+   * @private
+   * @param {{ host?: string, port?: number, rack?: string }} [destination]
+   * @returns {Promise<import("../network/connectionPool")>}
+   */
+  async buildConnectionPool(destination) {
+    const connectionPool = await this.connectionPoolBuilder.build(destination)
+    connectionPool.authenticationTimeout = this.authenticationTimeout
+    connectionPool.authenticationBlackout = this.authenticationBlackout
+    return connectionPool
   }
 
   /**
@@ -67,7 +91,7 @@ module.exports = class BrokerPool {
       await this.seedBroker.disconnect()
     }
 
-    const connectionPool = await this.connectionPoolBuilder.build()
+    const connectionPool = await this.buildConnectionPool()
 
     this.seedBroker = this.createBroker({
       connectionPool,
@@ -145,6 +169,14 @@ module.exports = class BrokerPool {
   }
 
   /**
+   * Fetches fresh cluster metadata and rebuilds the broker map from it.
+   *
+   * Retries transparently (re-throwing into the retrier) on `LEADER_NOT_AVAILABLE`, and on
+   * `UNKNOWN_TOPIC_OR_PARTITION` when the broker allows auto topic creation — KRaft answers the
+   * latter while a not-yet-created topic is still being created asynchronously through the
+   * controller, so a bare retry is enough once the topic lands. Any other error bails out
+   * immediately.
+   *
    * @public
    * @param {Array<String>} topics
    * @returns {Promise<null>}
@@ -184,7 +216,7 @@ module.exports = class BrokerPool {
               [nodeId]: this.createBroker({
                 logger: this.rootLogger,
                 versions: this.versions,
-                connectionPool: await this.connectionPoolBuilder.build({ host, port, rack }),
+                connectionPool: await this.buildConnectionPool({ host, port, rack }),
                 nodeId,
               }),
             })
@@ -206,7 +238,10 @@ module.exports = class BrokerPool {
         const replacedBrokersDisconnects = replacedBrokers.map((broker) => broker.disconnect())
         await Promise.all([...brokerDisconnects, ...replacedBrokersDisconnects])
       } catch (e) {
-        if (e.type === 'LEADER_NOT_AVAILABLE') {
+        if (
+          e.type === 'LEADER_NOT_AVAILABLE' ||
+          (broker.allowAutoTopicCreation && e.type === 'UNKNOWN_TOPIC_OR_PARTITION')
+        ) {
           throw e
         }
 
@@ -330,7 +365,7 @@ module.exports = class BrokerPool {
 
         if (e.type === 'ILLEGAL_SASL_STATE') {
           // Rebuild the connection pool since it can't recover from illegal SASL state
-          broker.connectionPool = await this.connectionPoolBuilder.build({
+          broker.connectionPool = await this.buildConnectionPool({
             host: broker.connectionPool.host,
             port: broker.connectionPool.port,
             rack: broker.connectionPool.rack,

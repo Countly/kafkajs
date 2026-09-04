@@ -31,12 +31,31 @@ const eventKeys = keys(events)
   .map((key) => `admin.events.${key}`)
   .join(', ')
 
+/**
+ * Runs `fn` until it resolves with a truthy value, retrying (via {@link waitFor}) on
+ * `LEADER_NOT_AVAILABLE` and, when `opts.allowAutoTopicCreation` is set, also on
+ * `UNKNOWN_TOPIC_OR_PARTITION` — KRaft answers the latter while a not-yet-created topic is still
+ * being created asynchronously through the controller. Any other error, or the timeout expiring,
+ * rejects.
+ *
+ * @param {() => Promise<any>} fn
+ * @param {Object} [opts]
+ * @param {boolean} [opts.allowAutoTopicCreation=false]
+ * @param {number} [opts.delay]
+ * @param {number} [opts.maxWait]
+ * @param {string} [opts.timeoutMessage]
+ * @returns {Promise<any>}
+ * @throws {KafkaJSTimeout} if `fn` keeps failing/returning falsy past `opts.maxWait`
+ */
 const retryOnLeaderNotAvailable = (fn, opts = {}) => {
+  const { allowAutoTopicCreation = false } = opts
   const callback = async () => {
     try {
       return await fn()
     } catch (e) {
-      if (e.type !== 'LEADER_NOT_AVAILABLE') {
+      const isAutoCreationInFlight =
+        allowAutoTopicCreation && e.type === 'UNKNOWN_TOPIC_OR_PARTITION'
+      if (e.type !== 'LEADER_NOT_AVAILABLE' && !isAutoCreationInFlight) {
         throw e
       }
       return false
@@ -764,11 +783,17 @@ module.exports = ({
    * Fetch metadata for provided topics.
    *
    * If no topics are provided fetch metadata for all topics.
+   *
+   * When the cluster allows auto topic creation, a not-yet-created topic answers
+   * `UNKNOWN_TOPIC_OR_PARTITION` while KRaft creates it asynchronously through the controller;
+   * this retries through that window instead of failing on the first attempt.
+   *
    * @see https://kafka.apache.org/protocol#The_Messages_Metadata
    *
    * @param {Object} [options]
    * @param {string[]} [options.topics]
    * @return {Promise<TopicsMetadata>}
+   * @throws {KafkaJSNonRetriableError} if a topic name is not a valid string
    *
    * @typedef {Object} TopicsMetadata
    * @property {Array<TopicMetadata>} topics
@@ -793,7 +818,9 @@ module.exports = ({
       })
     }
 
-    const metadata = await cluster.metadata({ topics })
+    const metadata = await retryOnLeaderNotAvailable(() => cluster.metadata({ topics }), {
+      allowAutoTopicCreation: cluster.allowAutoTopicCreation,
+    })
 
     return {
       topics: metadata.topicMetadata.map((topicMetadata) => ({
