@@ -321,11 +321,15 @@ module.exports = class Broker {
    * @param {string} request.groupId The group id
    * @param {number} request.groupGenerationId The generation of the group
    * @param {string} request.memberId The member id assigned by the group coordinator
+   * @param {string} [request.groupInstanceId=null] Static membership id (KIP-345); identifies this
+   *                                member across restarts. Requires Heartbeat v3+.
    * @returns {Promise}
    */
-  async heartbeat({ groupId, groupGenerationId, memberId }) {
+  async heartbeat({ groupId, groupGenerationId, memberId, groupInstanceId }) {
     const heartbeat = this.lookupRequest(apiKeys.Heartbeat, requests.Heartbeat)
-    return await this[PRIVATE.SEND_REQUEST](heartbeat({ groupId, groupGenerationId, memberId }))
+    return await this[PRIVATE.SEND_REQUEST](
+      heartbeat({ groupId, groupGenerationId, memberId, groupInstanceId })
+    )
   }
 
   /**
@@ -350,6 +354,9 @@ module.exports = class Broker {
    * @param {number} request.rebalanceTimeout The maximum time that the coordinator will wait for each member
    *                                  to rejoin when rebalancing the group
    * @param {string} [request.memberId=""] The assigned consumer id or an empty string for a new consumer
+   * @param {string} [request.groupInstanceId=null] Static membership id (KIP-345); identifies this member
+   *                                across restarts so it keeps its partitions instead of rebalancing.
+   *                                Requires JoinGroup v5+.
    * @param {string} [request.protocolType="consumer"] Unique name for class of protocols implemented by group
    * @param {Array} request.groupProtocols List of protocols that the member supports (assignment strategy)
    *                                [{ name: 'AssignerName', metadata: '{"version": 1, "topics": []}' }]
@@ -360,6 +367,7 @@ module.exports = class Broker {
     sessionTimeout,
     rebalanceTimeout,
     memberId = '',
+    groupInstanceId = null,
     protocolType = 'consumer',
     groupProtocols,
   }) {
@@ -371,6 +379,7 @@ module.exports = class Broker {
           sessionTimeout,
           rebalanceTimeout,
           memberId: assignedMemberId,
+          groupInstanceId,
           protocolType,
           groupProtocols,
         })
@@ -392,11 +401,14 @@ module.exports = class Broker {
    * @param {object} request
    * @param {string} request.groupId
    * @param {string} request.memberId
+   * @param {string} [request.groupInstanceId=null] Static membership id (KIP-345). A static member
+   *                                does not send LeaveGroup on a normal shutdown (see
+   *                                `Runner#stop`); this is only reached for an explicit leave.
    * @returns {Promise}
    */
-  async leaveGroup({ groupId, memberId }) {
+  async leaveGroup({ groupId, memberId, groupInstanceId }) {
     const leaveGroup = this.lookupRequest(apiKeys.LeaveGroup, requests.LeaveGroup)
-    return await this[PRIVATE.SEND_REQUEST](leaveGroup({ groupId, memberId }))
+    return await this[PRIVATE.SEND_REQUEST](leaveGroup({ groupId, memberId, groupInstanceId }))
   }
 
   /**
@@ -405,6 +417,8 @@ module.exports = class Broker {
    * @param {string} request.groupId
    * @param {number} request.generationId
    * @param {string} request.memberId
+   * @param {string} [request.groupInstanceId=null] Static membership id (KIP-345); identifies this
+   *                                member across restarts. Requires SyncGroup v3+.
    * @param {object} request.groupAssignment
    * @param {number} [request.sessionTimeout] Used to derive the SyncGroup request timeout
    * @param {number} [request.rebalanceTimeout] Used to derive the SyncGroup request timeout
@@ -414,6 +428,7 @@ module.exports = class Broker {
     groupId,
     generationId,
     memberId,
+    groupInstanceId,
     groupAssignment,
     sessionTimeout,
     rebalanceTimeout,
@@ -424,6 +439,7 @@ module.exports = class Broker {
         groupId,
         generationId,
         memberId,
+        groupInstanceId,
         groupAssignment,
         sessionTimeout,
         rebalanceTimeout,

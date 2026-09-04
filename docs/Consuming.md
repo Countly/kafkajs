@@ -245,7 +245,8 @@ kafka.consumer({
   maxWaitTimeInMs: <Number>,
   retry: <Object>,
   maxInFlightRequests: <Number>,
-  rackId: <String>
+  rackId: <String>,
+  groupInstanceId: <String>
 })
 ```
 
@@ -265,6 +266,26 @@ kafka.consumer({
 | readUncommitted        | Configures the consumer isolation level. If `false` (default), the consumer will not return any transactional messages which were not committed.                                                                                                                                                                                                   | `false`                           |
 | maxInFlightRequests | Max number of requests that may be in progress at any time. If falsey then no limit.                                    | `null` _(no limit)_ |
 | rackId                 | Configure the "rack" in which the consumer resides to enable [follower fetching](#follower-fetching)                 | `null` _(fetch from the leader always)_ |
+| groupInstanceId        | Static membership id (KIP-345). See [Static membership](#static-membership)                                          | `null` _(dynamic membership)_ |
+
+## <a name="static-membership"></a> Static membership
+
+By default, a consumer is a **dynamic member** of its group: every time it disconnects (even briefly, e.g. a deploy), it leaves the group and the broker immediately rebalances the remaining members. Setting `groupInstanceId` makes the consumer a **static member** (KIP-345) instead — it keeps its identity and assigned partitions across a restart, as long as it reconnects within `sessionTimeout`.
+
+```javascript
+const consumer = kafka.consumer({ groupId: 'my-group', groupInstanceId: 'my-group-consumer-1' })
+```
+
+`groupInstanceId` must be unique within the group — think of it as a stable identifier for one deployed instance (one per pod/host), not a value shared across replicas.
+
+Static membership changes two behaviors:
+
+- **`consumer.disconnect()` does not send LeaveGroup.** A static member keeps its slot in the group; the broker only reassigns its partitions once `sessionTimeout` elapses without a heartbeat. This means a rolling restart no longer triggers a rebalance for every replica, at the cost of the group holding those partitions idle until the old process is confirmed gone (or the new one rejoins under the same `groupInstanceId`).
+- **A duplicate `groupInstanceId` fences the newer member.** If two consumers connect with the same `groupInstanceId` to the same group, the broker rejects the second one with `FENCED_INSTANCE_ID` (error code 82). The consumer crashes and does **not** restart (`CRASH` event payload has `restart: false`, regardless of any `retry.restartOnFailure` callback) — restarting would immediately re-fence into the same loop. Fix the duplicate `groupInstanceId` (or the deploy that produced it) and start a fresh consumer.
+
+Requires the broker to support JoinGroup v5 / SyncGroup v3 / Heartbeat v3 / LeaveGroup v3 (Kafka 2.3+); this fork's floor is Kafka 4.0+, so this is always available. If a broker somehow negotiates an older JoinGroup version, a one-time warning is logged and static membership is silently inactive (the consumer behaves as a dynamic member).
+
+> KIP-1092 (an explicit `leaveGroup` override independent of `groupInstanceId`) is deferred; see the [`ConsumerConfig`](#options) table above for what is configurable today.
 
 ## <a name="pause-resume"></a> Pause & Resume
 

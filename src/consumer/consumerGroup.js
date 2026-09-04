@@ -18,6 +18,8 @@ const {
   KafkaJSStaleTopicMetadataAssignment,
   isRebalancing,
 } = require('../errors')
+const apiKeys = require('../protocol/requests/apiKeys')
+const { requests } = require('../protocol/requests')
 
 const { keys } = Object
 
@@ -59,6 +61,9 @@ module.exports = class ConsumerGroup {
    * @param {number} options.autoCommitThreshold
    * @param {number} options.isolationLevel
    * @param {string} options.rackId
+   * @param {string} [options.groupInstanceId=null] Static membership id (KIP-345); sent on
+   *                                JoinGroup/SyncGroup/Heartbeat/LeaveGroup so the coordinator
+   *                                recognizes this member across restarts.
    * @param {number} options.metadataMaxAge
    */
   constructor({
@@ -81,6 +86,7 @@ module.exports = class ConsumerGroup {
     autoCommitThreshold,
     isolationLevel,
     rackId,
+    groupInstanceId = null,
     metadataMaxAge,
   }) {
     /** @type {import("../../types").Cluster} */
@@ -104,7 +110,9 @@ module.exports = class ConsumerGroup {
     this.autoCommitThreshold = autoCommitThreshold
     this.isolationLevel = isolationLevel
     this.rackId = rackId
+    this.groupInstanceId = groupInstanceId
     this.metadataMaxAge = metadataMaxAge
+    this.staticMembershipInactiveWarned = false
 
     this.seekOffset = new SeekOffsets()
     this.coordinator = null
@@ -138,6 +146,7 @@ module.exports = class ConsumerGroup {
           groupId,
           memberId,
           groupGenerationId: generationId,
+          groupInstanceId: this.groupInstanceId,
         }
 
         await this.coordinator.heartbeat(payload)
@@ -162,15 +171,20 @@ module.exports = class ConsumerGroup {
   }
 
   async [PRIVATE.JOIN]() {
-    const { groupId, sessionTimeout, rebalanceTimeout } = this
+    const { groupId, sessionTimeout, rebalanceTimeout, groupInstanceId } = this
 
     this.coordinator = await this.cluster.findGroupCoordinator({ groupId })
+
+    if (groupInstanceId) {
+      this.warnIfStaticMembershipInactive()
+    }
 
     const groupData = await this.coordinator.joinGroup({
       groupId,
       sessionTimeout,
       rebalanceTimeout,
       memberId: this.memberId || '',
+      groupInstanceId,
       groupProtocols: this.assigners.map((assigner) =>
         assigner.protocol({
           topics: this.topicsSubscribed,
@@ -183,12 +197,43 @@ module.exports = class ConsumerGroup {
     this.memberId = groupData.memberId
     this.members = groupData.members
     this.groupProtocol = groupData.groupProtocol
+    // JoinGroup v5's response carries no group_instance_id field for this member: it only
+    // appears per-entry in `members`, populated for the leader. this.groupInstanceId is the
+    // value the caller configured and must not be overwritten with undefined here.
+  }
+
+  /**
+   * Warn once (per instance) when `groupInstanceId` is configured but the broker negotiated a
+   * JoinGroup version below 5: only v5+ carries `group_instance_id` on the wire (KIP-345), so
+   * static membership is silently inactive on an older negotiated version.
+   */
+  warnIfStaticMembershipInactive() {
+    if (this.staticMembershipInactiveWarned) {
+      return
+    }
+
+    const joinGroupVersions = requests.JoinGroup.versions.map(Number)
+    const bestImplementedVersion = Math.max(...joinGroupVersions)
+    const brokerVersion = this.coordinator.versions && this.coordinator.versions[apiKeys.JoinGroup]
+    if (!brokerVersion) {
+      return
+    }
+
+    const negotiatedVersion = Math.min(bestImplementedVersion, brokerVersion.maxVersion)
+    if (negotiatedVersion < 5) {
+      this.logger.warn(
+        `groupInstanceId is set but the broker negotiated JoinGroup v${negotiatedVersion} - static membership is inactive`,
+        { groupId: this.groupId, groupInstanceId: this.groupInstanceId, negotiatedVersion }
+      )
+    }
+
+    this.staticMembershipInactiveWarned = true
   }
 
   async leave() {
-    const { groupId, memberId } = this
+    const { groupId, memberId, groupInstanceId } = this
     if (memberId) {
-      await this.coordinator.leaveGroup({ groupId, memberId })
+      await this.coordinator.leaveGroup({ groupId, memberId, groupInstanceId })
       this.memberId = null
     }
   }
@@ -206,6 +251,7 @@ module.exports = class ConsumerGroup {
       coordinator,
       sessionTimeout,
       rebalanceTimeout,
+      groupInstanceId,
     } = this
 
     if (this.isLeader()) {
@@ -236,6 +282,7 @@ module.exports = class ConsumerGroup {
       groupId,
       generationId,
       memberId,
+      groupInstanceId,
       groupAssignment: assignment,
       sessionTimeout,
       rebalanceTimeout,

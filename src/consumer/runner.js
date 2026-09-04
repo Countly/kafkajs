@@ -228,7 +228,20 @@ module.exports = class Runner extends EventEmitter {
       })
   }
 
-  async stop() {
+  /**
+   * Stop the runner: halt fetching, wait for in-flight processing, then leave the group.
+   *
+   * A static member (`groupInstanceId` set) keeps its group slot across a normal shutdown
+   * instead (KIP-345 default: Java gates this the same way via
+   * `AbstractCoordinator.shouldSendLeaveGroupRequest = LEAVE_GROUP || isDynamicMember()`), so
+   * no LeaveGroup is sent unless the caller explicitly asks for one.
+   *
+   * @param {object} [options]
+   * @param {boolean} [options.leaveGroup] Force sending (`true`) or skipping (`false`)
+   *                                LeaveGroup, overriding the static-membership default.
+   * @returns {Promise<void>}
+   */
+  async stop({ leaveGroup } = {}) {
     if (!this.running) {
       return
     }
@@ -243,7 +256,13 @@ module.exports = class Runner extends EventEmitter {
     try {
       await this.fetchManager.stop()
       await this.waitForConsumer()
-      await this.consumerGroup.leave()
+
+      const shouldLeave = leaveGroup ?? !this.consumerGroup.groupInstanceId
+      if (shouldLeave) {
+        await this.consumerGroup.leave()
+      } else {
+        this.consumerGroup.memberId = null
+      }
     } catch (e) {}
   }
 

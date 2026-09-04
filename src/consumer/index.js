@@ -5,7 +5,7 @@ const ConsumerGroup = require('./consumerGroup')
 const Runner = require('./runner')
 const { events, wrap: wrapEvent, unwrap: unwrapEvent } = require('./instrumentationEvents')
 const InstrumentationEventEmitter = require('../instrumentation/emitter')
-const { KafkaJSNonRetriableError } = require('../errors')
+const { KafkaJSNonRetriableError, isFencedInstance } = require('../errors')
 const { roundRobin } = require('./assigners')
 const { EARLIEST_OFFSET, LATEST_OFFSET } = require('../constants')
 const ISOLATION_LEVEL = require('../protocol/isolationLevel')
@@ -40,6 +40,13 @@ const specialOffsets = [
  * @param {number} [params.maxWaitTimeInMs]
  * @param {number} [params.isolationLevel]
  * @param {string} [params.rackId]
+ * @param {String} [params.groupInstanceId=null] Static membership id (KIP-345). When set, this
+ *                                consumer keeps its group slot across a `disconnect()`/reconnect
+ *                                within `sessionTimeout` instead of triggering a rebalance, and
+ *                                does not send LeaveGroup on a normal shutdown. A duplicate
+ *                                `groupInstanceId` in the same group fences the newer member
+ *                                (`FENCED_INSTANCE_ID`, code 82); the consumer crashes without
+ *                                restarting rather than loop against a fencing broker.
  * @param {InstrumentationEventEmitter} [params.instrumentationEmitter]
  * @param {number} params.metadataMaxAge
  *
@@ -60,6 +67,7 @@ module.exports = ({
   maxWaitTimeInMs = 5000,
   isolationLevel = ISOLATION_LEVEL.READ_COMMITTED,
   rackId = '',
+  groupInstanceId = null,
   instrumentationEmitter: rootInstrumentationEmitter,
   metadataMaxAge,
 }) => {
@@ -235,6 +243,7 @@ module.exports = ({
         instrumentationEmitter,
         isolationLevel,
         rackId,
+        groupInstanceId,
         metadataMaxAge,
         autoCommit,
         autoCommitInterval,
@@ -308,6 +317,13 @@ module.exports = ({
           )
           shouldRestart = true
         }
+      }
+
+      if (isFencedInstance(e)) {
+        // A fenced static member (FENCED_INSTANCE_ID, 82) has been evicted by a duplicate
+        // groupInstanceId elsewhere; restarting would immediately re-fence into the same loop.
+        // This overrides restartOnFailure, unlike every other terminal error.
+        shouldRestart = false
       }
 
       if (shouldRestart && stopGeneration !== stopGenerationAfterCleanup) {

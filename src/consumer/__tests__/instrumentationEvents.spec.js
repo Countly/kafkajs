@@ -85,6 +85,7 @@ describe('Consumer > Instrumentation Events', () => {
         groupId,
         memberId: expect.any(String),
         groupGenerationId: expect.any(Number),
+        groupInstanceId: null,
       },
     })
   })

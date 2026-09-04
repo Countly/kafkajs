@@ -63,4 +63,29 @@ describe('Broker > JoinGroup', () => {
       ]),
     })
   })
+
+  test('request with groupInstanceId (KIP-345 static membership)', async () => {
+    const response = await broker.joinGroup({
+      groupId,
+      sessionTimeout: 30000,
+      rebalanceTimeout: 60000,
+      groupInstanceId: `static-${secureRandom()}`,
+      groupProtocols: [
+        {
+          name: 'AssignerName',
+          metadata: MemberMetadata.encode({ version: 1, topics: [topicName] }),
+        },
+      ],
+    })
+
+    expect(response.errorCode).toEqual(0)
+    expect(response.members).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          memberId: response.memberId,
+          groupInstanceId: expect.stringMatching(/^static-/),
+        }),
+      ])
+    )
+  })
 })

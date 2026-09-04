@@ -99,4 +99,48 @@ describe('Broker > Heartbeat', () => {
       errorCode: 0,
     })
   })
+
+  test('request with groupInstanceId (KIP-345 static membership)', async () => {
+    const groupInstanceId = `static-${secureRandom()}`
+
+    const { generationId, memberId } = await groupCoordinator.joinGroup({
+      groupId,
+      sessionTimeout: 30000,
+      rebalanceTimeout: 30000,
+      groupInstanceId,
+      groupProtocols: [
+        {
+          name: 'AssignerName',
+          metadata: MemberMetadata.encode({ version: 1, topics: [topicName] }),
+        },
+      ],
+    })
+
+    const memberAssignment = MemberAssignment.encode({
+      version: 1,
+      assignment: { [topicName]: [0] },
+    })
+
+    const groupAssignment = [{ memberId, memberAssignment }]
+    await groupCoordinator.syncGroup({
+      groupId,
+      generationId,
+      memberId,
+      groupInstanceId,
+      groupAssignment,
+    })
+
+    const response = await groupCoordinator.heartbeat({
+      groupId,
+      groupGenerationId: generationId,
+      memberId,
+      groupInstanceId,
+    })
+
+    expect(response).toEqual({
+      clientSideThrottleTime: expect.optional(0),
+      throttleTime: 0,
+      errorCode: 0,
+    })
+  })
 })

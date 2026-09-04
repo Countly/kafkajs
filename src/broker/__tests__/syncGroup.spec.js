@@ -67,4 +67,42 @@ describe('Broker > SyncGroup', () => {
       memberAssignment,
     })
   })
+
+  test('request with groupInstanceId (KIP-345 static membership)', async () => {
+    const groupInstanceId = `static-${secureRandom()}`
+
+    const { generationId, memberId } = await groupCoordinator.joinGroup({
+      groupId,
+      sessionTimeout: 30000,
+      rebalanceTimeout: 60000,
+      groupInstanceId,
+      groupProtocols: [
+        {
+          name: 'AssignerName',
+          metadata: MemberMetadata.encode({ version: 1, topics: [topicName] }),
+        },
+      ],
+    })
+
+    const memberAssignment = MemberAssignment.encode({
+      version: 1,
+      assignment: { [topicName]: [0] },
+    })
+
+    const groupAssignment = [{ memberId, memberAssignment }]
+    const response = await groupCoordinator.syncGroup({
+      groupId,
+      generationId,
+      memberId,
+      groupInstanceId,
+      groupAssignment,
+    })
+
+    expect(response).toEqual({
+      clientSideThrottleTime: expect.optional(0),
+      throttleTime: 0,
+      errorCode: 0,
+      memberAssignment,
+    })
+  })
 })
