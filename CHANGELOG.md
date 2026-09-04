@@ -73,6 +73,7 @@ Quarantined tests retired in this phase: R1 (metadata for auto-created topics), 
 
 #### Tooling
 - New `npm run protocol:generate` / `npm run protocol:check`: `src/protocol/flexibleVersions.js` (the first flexible KIP-482 version of every API key) is generated from the committed Apache message-definition snapshot and checked for drift, so the header-version rule can never silently disagree with the protocol.
+- New `node scripts/protocol/index.js scaffold <Api> <version>`: emits a codec skeleton (fields in wire order, per-version gating, classic-vs-compact writers, tag buffers, a JSDoc block quoting the schema, and the machine-checkable `schema` export) from the committed Apache message-definition snapshot. It never overwrites an existing file; codecs stay hand-written and hand-finished.
 
 Upstream work this phase builds on, with thanks to its authors: PRs #1779, #1695, #1738, #1576, #1558 and #1594 are adopted directly; the request-queue fix is informed by #1755, #1768, #1667 and #1572, but the shipped implementation follows Countly's production patch. Countly production patches retired by this phase: the request-queue idle loop, the SyncGroup timeout, the CRASH bridge, the coordinator refresh, the error-type string matching, the producer init state machine, the hand-registered LZ4 codec and the EoS-warning silencer.
 

@@ -1,0 +1,79 @@
+const Decoder = require('../../../decoder')
+
+/**
+ * ApiVersionsResponse (Version: 3) — flexible (KIP-482)
+ *
+ * ErrorCode => INT16 (0+)
+ * ApiKeys => COMPACT_ARRAY (0+)
+ *   ApiKey => INT16 (0+)
+ *   MinVersion => INT16 (0+)
+ *   MaxVersion => INT16 (0+)
+ *   TAG_BUFFER
+ * ThrottleTimeMs => INT32 (1+)
+ * TAG_BUFFER
+ *   tag 0 SupportedFeatures => COMPACT_ARRAY (3+)
+ *   tag 1 FinalizedFeaturesEpoch => INT64 (3+)
+ *   tag 2 FinalizedFeatures => COMPACT_ARRAY (3+)
+ *   tag 3 ZkMigrationReady => BOOLEAN (3+)
+ *
+ * @see https://kafka.apache.org/43/design/protocol
+ * @see clients/src/main/resources/common/message/ApiVersionsResponse.json (Apache Kafka 4.3.1)
+ */
+const decodeApiKeys = (decoder) => {
+  const apiKeys = {
+    apiKey: decoder.readInt16(),
+    minVersion: decoder.readInt16(),
+    maxVersion: decoder.readInt16(),
+  }
+
+  decoder.readTaggedFields()
+  return apiKeys
+}
+
+const decode = async (rawData) => {
+  const decoder = new Decoder(rawData)
+  const errorCode = decoder.readInt16()
+  const apiKeys = decoder.readUVarIntArray(decodeApiKeys)
+  const throttleTimeMs = decoder.readInt32()
+  const taggedFields = decoder.readTaggedFields()
+
+  return {
+    errorCode,
+    apiKeys,
+    throttleTimeMs,
+    taggedFields,
+  }
+}
+
+const parse = async (data) => {
+  return data
+}
+
+module.exports = {
+  decode,
+  parse,
+}
+
+module.exports.schema = {
+  api: 'ApiVersions',
+  version: 3,
+  direction: 'response',
+  fields: [
+    { name: 'ErrorCode', type: 'int16', versions: '0+' },
+    { name: 'ApiKeys', type: '[]ApiVersion', versions: '0+' },
+    { name: 'ApiKeys.ApiKey', type: 'int16', versions: '0+' },
+    { name: 'ApiKeys.MinVersion', type: 'int16', versions: '0+' },
+    { name: 'ApiKeys.MaxVersion', type: 'int16', versions: '0+' },
+    { name: 'ThrottleTimeMs', type: 'int32', versions: '1+' },
+    { name: 'SupportedFeatures', type: '[]SupportedFeatureKey', versions: '3+', tag: 0 },
+    { name: 'SupportedFeatures.Name', type: 'string', versions: '3+' },
+    { name: 'SupportedFeatures.MinVersion', type: 'int16', versions: '3+' },
+    { name: 'SupportedFeatures.MaxVersion', type: 'int16', versions: '3+' },
+    { name: 'FinalizedFeaturesEpoch', type: 'int64', versions: '3+', tag: 1 },
+    { name: 'FinalizedFeatures', type: '[]FinalizedFeatureKey', versions: '3+', tag: 2 },
+    { name: 'FinalizedFeatures.Name', type: 'string', versions: '3+' },
+    { name: 'FinalizedFeatures.MaxVersionLevel', type: 'int16', versions: '3+' },
+    { name: 'FinalizedFeatures.MinVersionLevel', type: 'int16', versions: '3+' },
+    { name: 'ZkMigrationReady', type: 'bool', versions: '3+', tag: 3 },
+  ],
+}

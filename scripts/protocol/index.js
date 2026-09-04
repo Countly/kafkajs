@@ -7,6 +7,8 @@
  *   npm run protocol:generate   rewrite src/protocol/flexibleVersions.js from the snapshot
  *   npm run protocol:check      regenerate in memory, diff against the committed file,
  *                               report and exit 1 on any failure (--json for machine output)
+ *   node scripts/protocol/index.js scaffold <ApiName> <version>
+ *                               emit a hand-finishable codec skeleton for one API version
  *
  * The snapshot is the one scripts/compat already commits, pinned by scripts/compat/config.json.
  */
@@ -66,7 +68,20 @@ const main = () => {
   const options = { json: args.indexOf('--json') !== -1 }
   if (command === 'generate') return generate()
   if (command === 'check') return check(options)
-  console.error('usage: node scripts/protocol/index.js generate | check [--json]')
+  if (command === 'scaffold') {
+    const [, apiName, version] = args
+    if (apiName === undefined || version === undefined) {
+      console.error('usage: node scripts/protocol/index.js scaffold <ApiName> <version>')
+      return 1
+    }
+    for (const file of require('./scaffold').write(apiName, Number(version))) {
+      console.log(`wrote ${file}`)
+    }
+    return 0
+  }
+  console.error(
+    'usage: node scripts/protocol/index.js generate | check [--json] | scaffold <ApiName> <version>'
+  )
   return 1
 }
 
