@@ -23,14 +23,10 @@ jobs:
     # ad-hoc check.
     env:
       KAFKA_VERSION: ${{ github.event.inputs.kafka_version || matrix.kafka }}
+      COMPOSE_FILE: ${{ matrix.group == 'oauthbearer' && 'docker-compose.oauthbearer.yml' || 'docker-compose.yml' }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
-        with: { node-version: '${{ matrix.node }}', cache: yarn }
-      - run: yarn install --frozen-lockfile
-      - run: yarn test:group:${{ matrix.group }}:ci
-      - uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: junit-${{ matrix.node }}-${{ matrix.kafka }}-${{ matrix.group }}
-          path: test-report.xml
+        with: { node-version: '${{ matrix.node }}', cache: npm }
+      - run: npm ci
+      - run: ./scripts/testWithKafka.sh "npm run test:group:${{ matrix.group }} -- --ci --maxWorkers=4"

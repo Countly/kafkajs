@@ -81,7 +81,7 @@ const renderFloorWatch = (lines, model) => {
 const renderWaivers = (lines, model) => {
   section(lines, 'Below-floor waivers')
   lines.push(
-    'Versions implemented here that the pinned broker rejects outright: dead code, and dangerous while version negotiation ignores the broker minimum. Each is waived until the phase named below deletes it; an unwaived below-floor version fails `yarn compat:check`.'
+    'Versions implemented here that the pinned broker rejects outright: dead code, and dangerous while version negotiation ignores the broker minimum. Each is waived until the phase named below deletes it; an unwaived below-floor version fails `npm run compat:check`.'
   )
   lines.push('')
   if (model.waivers.length === 0) {
@@ -170,7 +170,7 @@ const render = (model) => {
   lines.push('# Kafka protocol compatibility')
   lines.push('')
   lines.push(
-    `Generated from the committed Apache Kafka **${model.kafkaTag}** message definitions in \`scripts/compat/messages/${model.kafkaTag}/\`. **Do not edit by hand** — run \`yarn compat:generate\`; \`yarn compat:check\` fails when this file and the generator disagree.`
+    `Generated from the committed Apache Kafka **${model.kafkaTag}** message definitions in \`scripts/compat/messages/${model.kafkaTag}/\`. **Do not edit by hand** — run \`npm run compat:generate\`; \`npm run compat:check\` fails when this file and the generator disagree.`
   )
   lines.push('')
   lines.push(

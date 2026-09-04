@@ -11,11 +11,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
-        with: { node-version: 24, cache: yarn }
-      - run: yarn install --frozen-lockfile
-      - run: yarn lint
-      - run: yarn compat:check
-      - run: yarn test:types
+        with: { node-version: 24, cache: npm }
+      - run: npm ci
+      - run: npm run lint
+      - run: npm run compat:check
+      - run: npm run test:types
   unit:
     runs-on: ubuntu-latest
     strategy:
@@ -24,17 +24,17 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
-        with: { node-version: '${{ matrix.node }}', cache: yarn }
-      - run: yarn install --frozen-lockfile
-      - run: yarn test:unit
+        with: { node-version: '${{ matrix.node }}', cache: npm }
+      - run: npm ci
+      - run: npm run test:unit
   pack:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
-        with: { node-version: 24, cache: yarn }
-      - run: yarn install --frozen-lockfile
-      - run: yarn test:pack
+        with: { node-version: 24, cache: npm }
+      - run: npm ci
+      - run: npm run test:pack
   integration:
     runs-on: ubuntu-latest
     needs: [unit]
@@ -48,22 +48,18 @@ jobs:
           - { node: 24, kafka: 4.3.1, group: producer }
           - { node: 24, kafka: 4.3.1, group: consumer }
           - { node: 24, kafka: 4.3.1, group: others }
-          - { node: 24, kafka: 4.3.1, group: oauthbearer }
+          - { node: 24, kafka: 4.3.1, group: oauthbearer, compose: docker-compose.oauthbearer.yml }
           - { node: 22, kafka: 4.3.1, group: broker }
           - { node: 22, kafka: 4.3.1, group: others }
           - { node: 26, kafka: 4.3.1, group: broker }
           - { node: 26, kafka: 4.3.1, group: others }
     env:
       KAFKA_VERSION: ${{ matrix.kafka }}
+      COMPOSE_FILE: ${{ matrix.compose || 'docker-compose.yml' }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
-        with: { node-version: '${{ matrix.node }}', cache: yarn }
-      - run: yarn install --frozen-lockfile
+        with: { node-version: '${{ matrix.node }}', cache: npm }
+      - run: npm ci
       - run: docker compose version
-      - run: yarn test:group:${{ matrix.group }}:ci
-      - uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: junit-${{ matrix.node }}-${{ matrix.kafka }}-${{ matrix.group }}
-          path: test-report.xml
+      - run: ./scripts/testWithKafka.sh "npm run test:group:${{ matrix.group }} -- --ci --maxWorkers=4"

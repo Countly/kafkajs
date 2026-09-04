@@ -263,7 +263,6 @@ Snappy support is provided by the package `kafkajs-snappy`
 
 ```sh
 npm install --save kafkajs-snappy
-# yarn add kafkajs-snappy
 ```
 
 ```javascript
@@ -281,7 +280,6 @@ LZ4 support is provided by the package `kafkajs-lz4`
 
 ```sh
 npm install --save kafkajs-lz4
-# yarn add kafkajs-lz4
 ```
 
 ```javascript
@@ -299,7 +297,6 @@ Zstandard support is provided by [`@kafkajs/zstd`](https://github.com/kafkajs/zs
 
 ```sh
 npm install --save @kafkajs/zstd
-# yarn add @kafkajs/zstd
 ```
 
 ```javascript

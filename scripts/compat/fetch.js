@@ -2,7 +2,7 @@
 'use strict'
 
 /**
- * `yarn compat:fetch` — the only networked part of the compat tool.
+ * `npm run compat:fetch` — the only networked part of the compat tool.
  *
  * Refreshes the committed snapshot for the tag pinned in config.json:
  *   messages/<tag>/<Name>{Request,Response}.json  verbatim upstream bytes

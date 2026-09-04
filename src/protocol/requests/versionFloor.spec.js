@@ -11,7 +11,7 @@ const describeConfigs = require('./describeConfigs')
 
 /**
  * Kafka 4.x request-version floors (KIP-896 / KIP-724), taken from the 4.3 message JSON
- * reflected in docs/KafkaCompatibility.md (yarn compat:generate). Implementing a version below the
+ * reflected in docs/KafkaCompatibility.md (npm run compat:generate). Implementing a version below the
  * floor is dead code: a 4.x broker never advertises it.
  */
 const FLOORS = {

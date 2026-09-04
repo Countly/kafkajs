@@ -25,5 +25,6 @@ Versions before 3.0.0 are internal alpha tags and are not published.
 - ESLint 9 flat config and Prettier 3 replace ESLint 6 / Prettier 1 (`eslint-config-standard` rules ported explicitly).
 - Coverage is measured and gated: `test:coverage` enforces a floor of statements 94 / branches 84 / functions 96 / lines 94 (baseline 95.6 / 85.7 / 97.7 / 95.6 on the full suite against Kafka 4.3.1).
 - The generated compatibility inventory (`docs/KafkaCompatibility.md`) has no below-floor waivers left.
+- Toolchain switched from Yarn 1 to npm only (`package-lock.json`, `engines.npm >=10`); scripts collapsed (the six `test:group:*:ci` wrappers, `jest`, `test:local`, `test:local:watch` are gone in favor of `test:kafka -- "<command>"` plus environment defaults moved into `testHelpers/setup.js`); `lint`/`format` now cover the whole tree via `.gitignore`/`.prettierignore` instead of shelling out to `git ls-files`. Removed devDependencies `jest-junit`, `execa` and `glob` (replaced by `node:child_process` and `fs.globSync`); added `@eslint/compat`.
 
 Adopted upstream PRs are credited here by number as they land (Phase 2 onward).

@@ -11,13 +11,13 @@ Issues are tracked on [GitHub](https://github.com/Countly/kafkajs/issues). If yo
 
 [Development Environment](DevelopmentEnvironment.md), [Running Kafka in Development](DockerLocal.md) and [Testing](Testing.md) cover the full setup and how to run the tests. If you're already familiar with the project setup, here's the gist:
 
-With `docker` (Compose v2), `yarn` and Node 22+ available:
+With `docker` (Compose v2), `npm` and Node 22+ available:
 
 ```sh
-yarn test:unit
+npm run test:unit
 # or, with a cluster running (see Development Environment):
 NO_LOGS=1 ./scripts/dockerComposeUp.sh
 ./scripts/waitForKafka.js
 ./scripts/createScramCredentials.sh
-yarn test:local:watch
+npx jest --watch
 ```

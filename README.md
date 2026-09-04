@@ -22,7 +22,6 @@ A pure-JavaScript [Apache Kafka](https://kafka.apache.org/) client for Node.js, 
 
 ```sh
 npm install @countly/kafkajs
-# yarn add @countly/kafkajs
 ```
 
 ```javascript

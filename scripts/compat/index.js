@@ -4,11 +4,11 @@
 /**
  * Compatibility inventory CLI.
  *
- *   yarn compat:generate   write docs/KafkaCompatibility.md + docs/kafka-compatibility.json
- *   yarn compat:check      regenerate in memory, diff against the committed files, run the
- *                          drift checks, print a report, exit 1 on any failure (--json for
- *                          machine output)
- *   yarn compat:fetch      refresh the committed snapshot from the pinned tag (network)
+ *   npm run compat:generate   write docs/KafkaCompatibility.md + docs/kafka-compatibility.json
+ *   npm run compat:check      regenerate in memory, diff against the committed files, run the
+ *                             drift checks, print a report, exit 1 on any failure (--json for
+ *                             machine output)
+ *   npm run compat:fetch      refresh the committed snapshot from the pinned tag (network)
  *
  * Nothing here reads or writes anything under src/ — this is inventory only.
  */
@@ -130,10 +130,10 @@ const check = (options) => {
     : null
   const actualJson = fs.existsSync(paths.json) ? fs.readFileSync(paths.json, 'utf8') : null
   if (actualMarkdown !== expectedMarkdown) {
-    failures.push(`D1 ${paths.markdownRelative} is out of date — run \`yarn compat:generate\``)
+    failures.push(`D1 ${paths.markdownRelative} is out of date — run \`npm run compat:generate\``)
   }
   if (actualJson !== expectedJson) {
-    failures.push(`D1 ${paths.jsonRelative} is out of date — run \`yarn compat:generate\``)
+    failures.push(`D1 ${paths.jsonRelative} is out of date — run \`npm run compat:generate\``)
   }
 
   checkBelowFloor(model, failures)

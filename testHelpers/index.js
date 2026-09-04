@@ -2,7 +2,7 @@
 // Disabled to allow for higher order test functions where
 // `callback` is parameterized instead of a static function
 const fs = require('fs')
-const execa = require('execa')
+const { execSync } = require('child_process')
 const { randomUUID } = require('crypto')
 const semver = require('semver')
 const crypto = require('crypto')
@@ -377,7 +377,7 @@ const addPartitions = async ({ topic, partitions }) => {
   await cluster.connect()
   await cluster.addTargetTopic(topic)
 
-  execa.commandSync(cmd, { shell: true })
+  execSync(cmd)
 
   waitFor(async () => {
     await cluster.refreshMetadata()

@@ -1,11 +1,15 @@
+import { fileURLToPath } from 'node:url'
 import js from '@eslint/js'
 import globals from 'globals'
 import n from 'eslint-plugin-n'
 import jest from 'eslint-plugin-jest'
 import prettierPlugin from 'eslint-plugin-prettier'
 import prettierConfig from 'eslint-config-prettier'
+import { includeIgnoreFile } from '@eslint/compat'
 
 export default [
+  // Reads .gitignore so lint covers the whole tree without shelling out to `git ls-files`.
+  includeIgnoreFile(fileURLToPath(new URL('.gitignore', import.meta.url))),
   {
     ignores: ['node_modules/**', 'coverage/**'],
   },
@@ -163,6 +167,17 @@ export default [
       // until 23.0.0 (eslint-plugin-n's data confirms this), even though it has been enabled
       // by default since 19.0.0 and works fine across this repo's >=22.0.0 engines range —
       // the feature-detection here is deliberate, not a bug to fix.
+      'n/no-unsupported-features/node-builtins': 'off',
+    },
+  },
+  {
+    files: ['testHelpers/setup.js'],
+    rules: {
+      // `fs.globSync` isn't backported until Node 22.17.0 (eslint-plugin-n's data), below this
+      // package's published `engines.node` floor of >=22.0.0. That floor describes the runtime
+      // for consumers of `index.js`/`index.mjs`; this file is dev-only test tooling (excluded
+      // from the npm package via .npmignore) run against the Node versions actually in the CI
+      // matrix and used locally, all well above 22.17.
       'n/no-unsupported-features/node-builtins': 'off',
     },
   },

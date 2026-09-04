@@ -5,8 +5,7 @@ title: Development Environment
 
 ## Requirements
 
-- [Node.js](https://nodejs.org/) 22 or later
-- [`yarn`](https://yarnpkg.com/) (`npm install --global yarn`)
+- [Node.js](https://nodejs.org/) 22 or later (npm 10+, bundled with Node)
 - [`docker`](https://docs.docker.com/) 20.10.4 or later, with the `docker compose` plugin (Compose v2 — not the standalone `docker-compose` binary)
 
 ## Running Kafka
@@ -62,12 +61,12 @@ const kafka = new Kafka({
 
 ## Running the tests
 
-- `yarn test:unit` runs the broker-free unit tests (no cluster required).
-- `yarn test:local` (or `yarn jest`) runs the full test suite against a cluster you've already started, defaulting to `KAFKA_VERSION=4.3.1`.
-- `./scripts/testWithKafka.sh 'yarn jest'` starts the cluster (if it isn't already running), waits for it, creates SCRAM credentials, runs the given command, and tears the cluster down afterwards. Pin a broker version the same way:
+- `npm run test:unit` runs the broker-free unit tests (no cluster required).
+- `npx jest` runs the full test suite against a cluster you've already started, defaulting to `KAFKA_VERSION=4.3.1`.
+- `npm run test:kafka -- "npx jest"` starts the cluster (if it isn't already running), waits for it, creates SCRAM credentials, runs the given command, and tears the cluster down afterwards. Pin a broker version the same way:
 
   ```sh
-  KAFKA_VERSION=4.1.2 ./scripts/testWithKafka.sh 'yarn jest'
+  KAFKA_VERSION=4.1.2 npm run test:kafka -- "npx jest"
   ```
 
 See [Testing](Testing.md) for the full breakdown of test scripts.

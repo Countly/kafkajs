@@ -1,9 +1,6 @@
 .DS_Store
 node_modules
-test-report.xml
-junit.xml
 coverage/
-yarn-error.log
 .vscode
 .vs
 build/

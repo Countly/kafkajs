@@ -1,9 +1,5 @@
 .DS_Store
-test-report.xml
-junit.xml
 coverage/
-yarn-error.log
-yarn.lock
 **/*.spec.js
 !src/retry/defaults.test.js
 __tests__
@@ -19,8 +15,6 @@ jest.config.js
 .prettierrc
 .prettierignore
 eslint.config.mjs
-.travis.yml
-azure-pipelines.yml
 *.png
 *.svg
 *.tgz

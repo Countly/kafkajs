@@ -9,7 +9,7 @@ module.exports = {
   testPathIgnorePatterns: ['/node_modules/'],
   testEnvironment: 'node',
   testRegex: '(/__tests__/.*\\.spec\\.js|(\\.|/)spec)\\.jsx?$',
-  reporters: ['default', 'jest-junit'],
+  watchman: false,
   coverageDirectory: 'coverage',
   coverageReporters: ['text-summary', 'lcov', 'json-summary'],
   collectCoverageFrom: [
@@ -19,7 +19,7 @@ module.exports = {
     '!src/**/fixtures/**',
   ],
   // Baseline measured 2026-09-03 (full suite, apache/kafka 4.3.1): S 95.62 / B 85.65 / F 97.71 / L 95.64.
-  // Floor is floor(baseline) - 1 per metric (decision D21). Only `yarn test:coverage` enforces it;
+  // Floor is floor(baseline) - 1 per metric (decision D21). Only `npm run test:coverage` enforces it;
   // `test:coverage:unit` passes --coverageThreshold '{}' because it covers a strict subset of `src/`.
   coverageThreshold: {
     global: {

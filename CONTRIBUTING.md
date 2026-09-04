@@ -8,7 +8,7 @@ Contributions are made through Issues and Pull Requests on https://github.com/Co
 - Issues are not a support channel for general Kafka questions.
 
 ## Pull requests
-- One concern per PR; add tests for fixed or changed behavior (`yarn test:unit` for broker-free specs, `./scripts/testWithKafka.sh 'yarn jest'` for the integration suite — see `docs/DevelopmentEnvironment.md`).
+- One concern per PR; add tests for fixed or changed behavior (`npm run test:unit` for broker-free specs, `npm run test:kafka -- "npx jest"` for the integration suite — see `docs/DevelopmentEnvironment.md`).
 - Update `types/index.d.ts` when a public interface changes, and the relevant page under `docs/`.
 - Behavior changes to the public API need an issue first; the API is a compatibility contract with existing KafkaJS users.
 - Upstream KafkaJS fixes adopted here are credited by PR number in `CHANGELOG.md`; keep that convention.

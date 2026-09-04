@@ -1,3 +1,8 @@
+// Defaults for a bare `npx jest ...` run (previously set by the package.json script wrappers).
+process.env.NODE_ENV ||= 'test'
+process.env.KAFKA_VERSION ||= '4.3.1'
+process.env.KAFKAJS_DEBUG_PROTOCOL_BUFFERS ||= '1'
+
 jest.setTimeout(90000)
 
 const retries = process.env.TEST_RETRIES != null ? parseInt(process.env.TEST_RETRIES, 10) : 0
@@ -38,13 +43,12 @@ expect.extend({
   },
 })
 
-const glob = require('glob')
+const fs = require('fs')
 const path = require('path')
 
 // Protocol files are imported on demand depending on the APIs supported by Kafka,
 // but this behavior doesn't help Jest. Therefore, all files are eagerly imported
 // when running tests
-glob
-  .sync('src/protocol/requests/**/v*/@(request|response).js')
+fs.globSync('src/protocol/requests/**/v*/@(request|response).js')
   .map((file) => path.resolve(file))
   .map(require)

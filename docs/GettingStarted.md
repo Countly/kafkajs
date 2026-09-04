@@ -6,13 +6,7 @@ sidebar_label: Getting Started
 
 > `@countly/kafkajs` is not published to npm yet. The install commands below describe the intended usage once it is released.
 
-Install using `yarn`:
-
-```bash
-yarn add @countly/kafkajs
-```
-
-Or `npm`:
+Install using `npm`:
 
 ```bash
 npm install @countly/kafkajs

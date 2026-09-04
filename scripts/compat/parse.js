@@ -16,7 +16,7 @@
  *   field.versions         "0+" / "3+" / "0-2"; defaults to `taggedVersions` when absent
  *   field.tag/taggedVersions  KIP-482 optional field, only legal in flexible versions
  *
- * Zero dependencies by design — see docs/Testing.md and `yarn compat:generate`.
+ * Zero dependencies by design — see docs/Testing.md and `npm run compat:generate`.
  */
 
 const fs = require('fs')

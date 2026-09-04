@@ -1,6 +1,6 @@
 # Kafka protocol compatibility
 
-Generated from the committed Apache Kafka **4.3.1** message definitions in `scripts/compat/messages/4.3.1/`. **Do not edit by hand** — run `yarn compat:generate`; `yarn compat:check` fails when this file and the generator disagree.
+Generated from the committed Apache Kafka **4.3.1** message definitions in `scripts/compat/messages/4.3.1/`. **Do not edit by hand** — run `npm run compat:generate`; `npm run compat:check` fails when this file and the generator disagree.
 
 Gap classes: `current` (fork max equals the Kafka max) · `behind:N` · `stub` (the key is known but unimplemented) · `missing` (planned, no codec) · `not-planned`. `on-floor` and `below-floor` are reported alongside the class, not instead of it.
 
@@ -62,7 +62,7 @@ These APIs implement exactly the minimum version the pinned broker still accepts
 
 ## Below-floor waivers
 
-Versions implemented here that the pinned broker rejects outright: dead code, and dangerous while version negotiation ignores the broker minimum. Each is waived until the phase named below deletes it; an unwaived below-floor version fails `yarn compat:check`.
+Versions implemented here that the pinned broker rejects outright: dead code, and dangerous while version negotiation ignores the broker minimum. Each is waived until the phase named below deletes it; an unwaived below-floor version fails `npm run compat:check`.
 
 None — the waiver list is empty.
 
