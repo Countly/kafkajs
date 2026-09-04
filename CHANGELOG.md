@@ -10,4 +10,19 @@ Versions before 3.0.0 are internal alpha tags and are not published.
 - Node.js 22+ required; Jest 30; TypeScript 5 for the type tests.
 - Test cluster moved to `apache/kafka` 4.x (KRaft); Kafka < 4.0 is no longer supported.
 
+### Phase 2 — bug fixes and dead-path cleanup
+
+#### Behavior changes
+- Request versions below the Kafka 4.0 floors (KIP-896, KIP-724) are no longer implemented: Produce v0–2, Fetch v0–3, ListOffsets v0, OffsetCommit v0–1, CreateTopics v0–1, DeleteTopics v0, DescribeAcls/CreateAcls/DeleteAcls v0, DescribeConfigs v0. A 4.x broker never negotiates them. The MessageSet (magic 0/1) *read* path is kept because old segments can still be served inside Fetch ≥ v4.
+- The pre-KIP-152 raw SASL token path (used only when a broker lacked `SaslAuthenticate`) is removed; every mechanism goes through `SaslAuthenticate`.
+- Version negotiation now rejects an API whose broker range does not overlap the client range with `KafkaJSServerDoesNotSupportApiKey` (message names both ranges) instead of sending a version the broker rejects or selecting one the client does not implement.
+
+#### Fixes
+- Request queue: an idle, unthrottled queue no longer re-arms a timer after every response (hundreds of wakeups per second at idle, `TimeoutNegativeWarning` on Node ≥ 24). Informed by upstream #1755, #1768, #1667, #1572 (issues #1704, #1751, #1556); implementation follows the Countly production patch and keeps the 10 ms re-check for a queue blocked by the in-flight limit. Retires Countly patch 1a.
+
+#### Tooling
+- ESLint 9 flat config and Prettier 3 replace ESLint 6 / Prettier 1 (`eslint-config-standard` rules ported explicitly).
+- Coverage is measured and gated: `test:coverage` enforces a floor of statements 94 / branches 84 / functions 96 / lines 94 (baseline 95.6 / 85.7 / 97.7 / 95.6 on the full suite against Kafka 4.3.1).
+- The generated compatibility inventory (`docs/KafkaCompatibility.md`) has no below-floor waivers left.
+
 Adopted upstream PRs are credited here by number as they land (Phase 2 onward).
