@@ -11,9 +11,36 @@ const sharedPromiseTo = require('../utils/sharedPromiseTo')
 const Long = require('../utils/long')
 const SASLAuthenticator = require('../broker/saslAuthenticator')
 const apiKeys = require('../protocol/requests/apiKeys')
+const { responseHeaderVersion, RESPONSE_HEADER_V1 } = require('../protocol/headers')
 
 const requestInfo = ({ apiName, apiKey, apiVersion }) =>
   `${apiName}(key: ${apiKey}, version: ${apiVersion})`
+
+/**
+ * The response header of a flexible version carries a tagged-field buffer after the
+ * correlation id. `processData` only knows the correlation id, so the buffer is consumed here,
+ * where the request entry says which `(apiKey, apiVersion)` produced this payload. ApiVersions
+ * is the standing exception: its response header is always v0.
+ * @see https://kafka.apache.org/43/design/protocol
+ * @param {{ apiKey: number, apiVersion: number }} entry
+ * @param {Buffer} payload the response bytes after the correlation id
+ * @returns {Buffer} the body the codec should decode
+ */
+const responseBody = ({ apiKey, apiVersion }, payload) => {
+  if (responseHeaderVersion(apiKey, apiVersion) !== RESPONSE_HEADER_V1) {
+    return payload
+  }
+
+  // Fast path: no broker sends a non-empty response header tag buffer today, and this runs on
+  // every response, so the common case skips allocating a Decoder and a Map to consume one byte.
+  if (payload[0] === 0) {
+    return payload.slice(1)
+  }
+
+  const decoder = new Decoder(payload)
+  decoder.readTaggedFields()
+  return payload.slice(decoder.offset)
+}
 
 /**
  * @param request - request from protocol
@@ -391,7 +418,7 @@ module.exports = class Connection {
     }
 
     try {
-      const payloadDecoded = await response.decode(payload)
+      const payloadDecoded = await response.decode(responseBody(entry, payload))
 
       /**
        * @see KIP-219

@@ -45,8 +45,6 @@ const decodeTopics = (decoder) => {
 const decode = async (rawData) => {
   const decoder = new Decoder(rawData)
 
-  // Read tagged fields
-  decoder.readTaggedFields()
   const throttleTime = decoder.readInt32()
   const errorCode = decoder.readInt16()
   // Read error message
@@ -69,4 +67,22 @@ const parse = async (data) => {
 module.exports = {
   decode,
   parse,
+}
+
+module.exports.schema = {
+  api: 'ListPartitionReassignments',
+  version: 0,
+  direction: 'response',
+  fields: [
+    { name: 'ThrottleTimeMs', type: 'int32', versions: '0+' },
+    { name: 'ErrorCode', type: 'int16', versions: '0+' },
+    { name: 'ErrorMessage', type: 'string', versions: '0+', nullable: true },
+    { name: 'Topics', type: '[]OngoingTopicReassignment', versions: '0+' },
+    { name: 'Topics.Name', type: 'string', versions: '0+' },
+    { name: 'Topics.Partitions', type: '[]OngoingPartitionReassignment', versions: '0+' },
+    { name: 'Topics.Partitions.PartitionIndex', type: 'int32', versions: '0+' },
+    { name: 'Topics.Partitions.Replicas', type: '[]int32', versions: '0+' },
+    { name: 'Topics.Partitions.AddingReplicas', type: '[]int32', versions: '0+' },
+    { name: 'Topics.Partitions.RemovingReplicas', type: '[]int32', versions: '0+' },
+  ],
 }

@@ -7,6 +7,7 @@ const { KafkaJSRequestTimeoutError } = require('../errors')
 const Connection = require('./connection')
 const { CONNECTION_STATUS } = require('./connectionStatus')
 const EventEmitter = require('events')
+const apiKeys = require('../protocol/requests/apiKeys')
 
 describe('Network > Connection', () => {
   const invalidHost = 'kafkajs.test'
@@ -187,7 +188,7 @@ describe('Network > Connection', () => {
       // Create a fictitious request with a response that indicates client-side throttling is needed
       const protocol = {
         request: {
-          apiKey: -1,
+          apiKey: apiKeys.Metadata,
           apiVersion: 0,
           expectResponse: () => true,
           encode: () => new Encoder(),

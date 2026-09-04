@@ -40,7 +40,6 @@ const decodePartitions = (decoder) => {
 
 const decode = async (rawData) => {
   const decoder = new Decoder(rawData)
-  decoder.readTaggedFields()
   const throttleTime = decoder.readInt32()
   const errorCode = decoder.readInt16()
   decoder.readUVarIntString()
@@ -85,4 +84,21 @@ const parse = async (data) => {
 module.exports = {
   decode,
   parse,
+}
+
+module.exports.schema = {
+  api: 'AlterPartitionReassignments',
+  version: 0,
+  direction: 'response',
+  fields: [
+    { name: 'ThrottleTimeMs', type: 'int32', versions: '0+' },
+    { name: 'ErrorCode', type: 'int16', versions: '0+' },
+    { name: 'ErrorMessage', type: 'string', versions: '0+', nullable: true },
+    { name: 'Responses', type: '[]ReassignableTopicResponse', versions: '0+' },
+    { name: 'Responses.Name', type: 'string', versions: '0+' },
+    { name: 'Responses.Partitions', type: '[]ReassignablePartitionResponse', versions: '0+' },
+    { name: 'Responses.Partitions.PartitionIndex', type: 'int32', versions: '0+' },
+    { name: 'Responses.Partitions.ErrorCode', type: 'int16', versions: '0+' },
+    { name: 'Responses.Partitions.ErrorMessage', type: 'string', versions: '0+', nullable: true },
+  ],
 }

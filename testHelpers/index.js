@@ -21,6 +21,7 @@ const {
 
 const LoggerConsole = require('../src/loggers/console')
 const { Kafka } = require('../index')
+const { createFakeSocketFactory, respondWithFrame, readRequestHeader } = require('./fakeSocket')
 
 const newLogger = (opts = {}) =>
   createLogger(Object.assign({ level: NOTHING, logCreator: LoggerConsole }, opts))
@@ -487,4 +488,7 @@ module.exports = {
   unsupportedVersionResponse,
   generateMessages,
   unsupportedVersionResponseWithTimeout,
+  createFakeSocketFactory,
+  respondWithFrame,
+  readRequestHeader,
 }
