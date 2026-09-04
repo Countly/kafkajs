@@ -38,6 +38,13 @@ const isAddOffsetsRetriable = (e) => e.code === CONCURRENT_TRANSACTIONS_CODE
  * Manage behavior for an idempotent producer and transactions.
  *
  * @param {Object} options
+ * @param {import('../../../types').Logger} options.logger
+ * @param {import('../../../types').Cluster} options.cluster
+ * @param {number} [options.transactionTimeout=60000] Passed as `InitProducerId`'s
+ *   `transactionTimeout`.
+ * @param {boolean} options.transactional Whether this manager is for a transactional (vs. plain
+ *   idempotent) producer; gates the transactional methods (`beginTransaction`, `commit`, ...).
+ * @param {string} [options.transactionalId] Required when `transactional` is true.
  * @param {import('../../instrumentation/emitter')} [options.instrumentationEmitter] Passed to
  *   the per-broker mutex (see `acquireBrokerLock`) so a waiter timing out emits
  *   `NETWORK_LOCK_TIMEOUT` instead of failing silently.
@@ -369,7 +376,7 @@ module.exports = ({
             brokerMutexLocks[broker.nodeId] ||
             new Lock({
               timeout: 0xffff,
-              description: `broker-${broker.nodeId}`,
+              description: broker.brokerAddress,
               instrumentationEmitter,
             })
           await brokerMutexLocks[broker.nodeId].acquire()

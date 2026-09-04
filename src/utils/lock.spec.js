@@ -1,5 +1,6 @@
 const waitFor = require('./waitFor')
 const Lock = require('./lock')
+const { KafkaJSLockTimeout } = require('../errors')
 
 const sleep = (value) => waitFor((delay) => delay >= value)
 
@@ -111,6 +112,22 @@ describe('Utils > Lock', () => {
       const lock = new Lock({ timeout: 20 })
       await lock.acquire()
       await expect(lock.acquire()).rejects.toThrow('Timeout while acquiring lock')
+    })
+
+    it('still rejects with KafkaJSLockTimeout when the emitter listener throws', async () => {
+      const emit = jest.fn(() => {
+        throw new Error('listener boom')
+      })
+      const lock = new Lock({
+        timeout: 20,
+        description: 'broker-1',
+        instrumentationEmitter: { emit },
+      })
+
+      await lock.acquire()
+      await expect(lock.acquire()).rejects.toThrow(KafkaJSLockTimeout)
+
+      expect(emit).toHaveBeenCalledTimes(1)
     })
   })
 })

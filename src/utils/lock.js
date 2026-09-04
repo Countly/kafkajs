@@ -29,8 +29,8 @@ module.exports = class Lock {
    *   `NETWORK_LOCK_TIMEOUT` event payload.
    * @param {import('../instrumentation/emitter')} [options.instrumentationEmitter] When set, a
    *   waiter timing out emits `NETWORK_LOCK_TIMEOUT` with `{ description, waiting, timeout }`
-   *   before rejecting. Omit to keep the lock silent, as every caller did before this option
-   *   existed.
+   *   before rejecting; a listener that throws is caught and ignored so it can never affect the
+   *   rejection. Omit to keep the lock silent, as every caller did before this option existed.
    * @throws {TypeError} If `timeout` is not a number.
    */
   constructor({ timeout, description = null, instrumentationEmitter = null } = {}) {
@@ -43,8 +43,8 @@ module.exports = class Lock {
     this[PRIVATE.WAITING] = new Set()
     this[PRIVATE.EMITTER] = instrumentationEmitter
     this[PRIVATE.DESCRIPTION] = description
-    this[PRIVATE.TIMEOUT_ERROR_MESSAGE] = () => {
-      const timeoutMessage = format(TIMEOUT_MESSAGE, this[PRIVATE.WAITING].size)
+    this[PRIVATE.TIMEOUT_ERROR_MESSAGE] = (waitingCount) => {
+      const timeoutMessage = format(TIMEOUT_MESSAGE, waitingCount)
       return description ? `${timeoutMessage}: "${description}"` : timeoutMessage
     }
   }
@@ -74,16 +74,22 @@ module.exports = class Lock {
 
       this[PRIVATE.WAITING].add(tryToAcquire)
       timeoutId = setTimeout(() => {
-        // The message should contain the number of waiters _including_ this one
-        const error = new KafkaJSLockTimeout(this[PRIVATE.TIMEOUT_ERROR_MESSAGE]())
+        // waitingCount includes this waiter itself, since it's still in WAITING at this point;
+        // both the error message and the event payload below read the same count.
+        const waitingCount = this[PRIVATE.WAITING].size
+        const error = new KafkaJSLockTimeout(this[PRIVATE.TIMEOUT_ERROR_MESSAGE](waitingCount))
         this[PRIVATE.WAITING].delete(tryToAcquire)
 
         if (this[PRIVATE.EMITTER]) {
-          this[PRIVATE.EMITTER].emit(NETWORK_LOCK_TIMEOUT, {
-            description: this[PRIVATE.DESCRIPTION],
-            waiting: this[PRIVATE.WAITING].size + 1,
-            timeout: this[PRIVATE.TIMEOUT],
-          })
+          try {
+            this[PRIVATE.EMITTER].emit(NETWORK_LOCK_TIMEOUT, {
+              description: this[PRIVATE.DESCRIPTION],
+              waiting: waitingCount,
+              timeout: this[PRIVATE.TIMEOUT],
+            })
+          } catch (_e) {
+            // A throwing listener must never affect the rejection below.
+          }
         }
 
         reject(error)
