@@ -358,6 +358,7 @@ The function has the following signature: `(error: Error) => Promise<boolean>`
 * If the promise resolves to `true`: the consumer will restart
 * If the promise resolves to `false`: the consumer will **not** restart
 * If the promise rejects: the consumer will restart
+* If `consumer.disconnect()` (or `stop()`) is called while the callback is still deciding: the consumer will **not** restart, whatever the callback returns
 * If there is no `restartOnFailure` provided: the consumer restarts on retriable errors and stops on non-retriable ones (the previous default behavior, unchanged for callers who don't set the callback)
 
 When `restartOnFailure` is provided, it is authoritative for **every** terminal death of the consumer, retriable or not — this is a deliberate change from earlier versions, where the callback was only consulted for retriable errors. If you need to tell retriable and non-retriable errors apart inside the callback, inspect the error passed to it (for example `error.retriable` or `error.name === 'KafkaJSNumberOfRetriesExceeded'`).

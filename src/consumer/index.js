@@ -112,9 +112,7 @@ module.exports = ({
     }
   }
 
-  /** @type {import("../../types").Consumer["stop"]} */
-  const stop = sharedPromiseTo(async () => {
-    stopGeneration++
+  const stopShared = sharedPromiseTo(async () => {
     try {
       if (runner) {
         await runner.stop()
@@ -134,6 +132,16 @@ module.exports = ({
       throw e
     }
   })
+
+  /**
+   * Every call bumps the stop generation, even when it joins an in-flight stop, so a crash
+   * handler deciding whether to restart can tell that the user asked for a stop meanwhile.
+   * @type {import("../../types").Consumer["stop"]}
+   */
+  const stop = (...args) => {
+    stopGeneration++
+    return stopShared(...args)
+  }
 
   /** @type {import("../../types").Consumer["subscribe"]} */
   const subscribe = async ({ topic, topics: subscriptionTopics, fromBeginning = false }) => {
