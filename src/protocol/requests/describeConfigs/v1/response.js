@@ -1,5 +1,5 @@
 const Decoder = require('../../../decoder')
-const { parse: parseV0 } = require('../v0/response')
+const { failure, createErrorFromCode } = require('../../../error')
 const { DEFAULT_CONFIG } = require('../../../configSource')
 
 /**
@@ -66,7 +66,16 @@ const decode = async (rawData) => {
   }
 }
 
+const parse = async (data) => {
+  const resourcesWithError = data.resources.filter(({ errorCode }) => failure(errorCode))
+  if (resourcesWithError.length > 0) {
+    throw createErrorFromCode(resourcesWithError[0].errorCode)
+  }
+
+  return data
+}
+
 module.exports = {
   decode,
-  parse: parseV0,
+  parse,
 }

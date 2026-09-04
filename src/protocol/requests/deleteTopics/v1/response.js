@@ -1,5 +1,5 @@
 const Decoder = require('../../../decoder')
-const { parse: parseV0 } = require('../v0/response')
+const { failure, createErrorFromCode } = require('../../../error')
 
 /**
  * Starting in version 1, on quota violation, brokers send out responses before throttling.
@@ -30,7 +30,16 @@ const decode = async (rawData) => {
   }
 }
 
+const parse = async (data) => {
+  const topicsWithError = data.topicErrors.filter(({ errorCode }) => failure(errorCode))
+  if (topicsWithError.length > 0) {
+    throw createErrorFromCode(topicsWithError[0].errorCode)
+  }
+
+  return data
+}
+
 module.exports = {
   decode,
-  parse: parseV0,
+  parse,
 }

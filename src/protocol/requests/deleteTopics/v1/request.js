@@ -1,10 +1,16 @@
-const requestV0 = require('../v0/request')
+const Encoder = require('../../../encoder')
+const { DeleteTopics: apiKey } = require('../../apiKeys')
 
 /**
  * DeleteTopics Request (Version: 1) => [topics] timeout
  *   topics => STRING
  *   timeout => INT32
  */
-
-module.exports = ({ topics, timeout }) =>
-  Object.assign(requestV0({ topics, timeout }), { apiVersion: 1 })
+module.exports = ({ topics, timeout = 5000 }) => ({
+  apiKey,
+  apiVersion: 1,
+  apiName: 'DeleteTopics',
+  encode: async () => {
+    return new Encoder().writeArray(topics).writeInt32(timeout)
+  },
+})

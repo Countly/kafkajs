@@ -1,5 +1,5 @@
 const Decoder = require('../../../decoder')
-const { parse: parseV0 } = require('../v0/response')
+const { parse: parseV0 } = require('../v2/response')
 
 /**
  * OffsetCommit Response (Version: 3) => throttle_time_ms [responses]

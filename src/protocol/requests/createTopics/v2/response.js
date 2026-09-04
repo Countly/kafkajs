@@ -1,5 +1,6 @@
 const Decoder = require('../../../decoder')
-const { parse: parseV1 } = require('../v1/response')
+const { failure, createErrorFromCode } = require('../../../error')
+const { KafkaJSAggregateError, KafkaJSCreateTopicError } = require('../../../../errors')
 
 /**
  * CreateTopics Response (Version: 2) => throttle_time_ms [topic_errors]
@@ -26,7 +27,21 @@ const decode = async (rawData) => {
   }
 }
 
+const parse = async (data) => {
+  const topicsWithError = data.topicErrors.filter(({ errorCode }) => failure(errorCode))
+  if (topicsWithError.length > 0) {
+    throw new KafkaJSAggregateError(
+      'Topic creation errors',
+      topicsWithError.map(
+        (error) => new KafkaJSCreateTopicError(createErrorFromCode(error.errorCode), error.topic)
+      )
+    )
+  }
+
+  return data
+}
+
 module.exports = {
   decode,
-  parse: parseV1,
+  parse,
 }

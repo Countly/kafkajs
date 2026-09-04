@@ -72,16 +72,13 @@
       "deprecatedVersions": null,
       "latestVersionUnstable": false,
       "forkVersions": [
-        0,
         1,
         2,
         3
       ],
       "gap": "behind:8",
       "onFloor": false,
-      "belowFloor": [
-        0
-      ],
+      "belowFloor": [],
       "notes": "v4 leader epoch (KIP-320), v6 flexible, v7 max-timestamp, v8 earliest-local offset (KIP-405)."
     },
     {
@@ -125,8 +122,6 @@
       "deprecatedVersions": null,
       "latestVersionUnstable": false,
       "forkVersions": [
-        0,
-        1,
         2,
         3,
         4,
@@ -134,10 +129,7 @@
       ],
       "gap": "behind:5",
       "onFloor": false,
-      "belowFloor": [
-        0,
-        1
-      ],
+      "belowFloor": [],
       "notes": "v6 committed leader epoch (KIP-320), v7 group instance id, v8 flexible, v9 member epoch (KIP-848), v10 topic IDs."
     },
     {
@@ -390,17 +382,12 @@
       "deprecatedVersions": null,
       "latestVersionUnstable": false,
       "forkVersions": [
-        0,
-        1,
         2,
         3
       ],
       "gap": "behind:4",
       "onFloor": false,
-      "belowFloor": [
-        0,
-        1
-      ],
+      "belowFloor": [],
       "notes": "v5 flexible, v7 returns topic IDs."
     },
     {
@@ -417,14 +404,11 @@
       "deprecatedVersions": null,
       "latestVersionUnstable": false,
       "forkVersions": [
-        0,
         1
       ],
       "gap": "behind:5",
       "onFloor": true,
-      "belowFloor": [
-        0
-      ],
+      "belowFloor": [],
       "notes": "v6 deletes by topic ID. The fork's v1 sits exactly on the 4.x floor."
     },
     {
@@ -592,14 +576,11 @@
       "deprecatedVersions": null,
       "latestVersionUnstable": false,
       "forkVersions": [
-        0,
         1
       ],
       "gap": "behind:2",
       "onFloor": true,
-      "belowFloor": [
-        0
-      ],
+      "belowFloor": [],
       "notes": "v1 is the 4.x floor and is also the fork's maximum."
     },
     {
@@ -616,14 +597,11 @@
       "deprecatedVersions": null,
       "latestVersionUnstable": false,
       "forkVersions": [
-        0,
         1
       ],
       "gap": "behind:2",
       "onFloor": true,
-      "belowFloor": [
-        0
-      ],
+      "belowFloor": [],
       "notes": "v1 is the 4.x floor and is also the fork's maximum."
     },
     {
@@ -640,14 +618,11 @@
       "deprecatedVersions": null,
       "latestVersionUnstable": false,
       "forkVersions": [
-        0,
         1
       ],
       "gap": "behind:2",
       "onFloor": true,
-      "belowFloor": [
-        0
-      ],
+      "belowFloor": [],
       "notes": "v1 is the 4.x floor and is also the fork's maximum."
     },
     {
@@ -664,15 +639,12 @@
       "deprecatedVersions": null,
       "latestVersionUnstable": false,
       "forkVersions": [
-        0,
         1,
         2
       ],
       "gap": "behind:2",
       "onFloor": false,
-      "belowFloor": [
-        0
-      ],
+      "belowFloor": [],
       "notes": ""
     },
     {
@@ -920,82 +892,7 @@
       "notes": "Admin describe at scale, and the only way to read eligible leader replicas. The API does not exist on brokers below 3.8, so the Metadata path must stay as a fallback; ELR arrays are null unless the cluster runs eligible.leader.replicas.version=1."
     }
   ],
-  "waivers": [
-    {
-      "api": "CreateAcls",
-      "versions": [
-        0
-      ],
-      "kafkaMin": 1,
-      "reason": "Kafka 4.0 raised the ACL API floors to v1.",
-      "until": "phase-2 exit"
-    },
-    {
-      "api": "CreateTopics",
-      "versions": [
-        0,
-        1
-      ],
-      "kafkaMin": 2,
-      "reason": "Kafka 4.0 raised the CreateTopics floor to v2.",
-      "until": "phase-2 exit"
-    },
-    {
-      "api": "DeleteAcls",
-      "versions": [
-        0
-      ],
-      "kafkaMin": 1,
-      "reason": "Kafka 4.0 raised the ACL API floors to v1.",
-      "until": "phase-2 exit"
-    },
-    {
-      "api": "DeleteTopics",
-      "versions": [
-        0
-      ],
-      "kafkaMin": 1,
-      "reason": "Kafka 4.0 raised the DeleteTopics floor to v1.",
-      "until": "phase-2 exit"
-    },
-    {
-      "api": "DescribeAcls",
-      "versions": [
-        0
-      ],
-      "kafkaMin": 1,
-      "reason": "Kafka 4.0 raised the ACL API floors to v1.",
-      "until": "phase-2 exit"
-    },
-    {
-      "api": "DescribeConfigs",
-      "versions": [
-        0
-      ],
-      "kafkaMin": 1,
-      "reason": "Kafka 4.0 raised the DescribeConfigs floor to v1.",
-      "until": "phase-2 exit"
-    },
-    {
-      "api": "ListOffsets",
-      "versions": [
-        0
-      ],
-      "kafkaMin": 1,
-      "reason": "v0 returned an offset array and predates the timestamp API; Kafka 4.0 raised the floor to v1.",
-      "until": "phase-2 exit"
-    },
-    {
-      "api": "OffsetCommit",
-      "versions": [
-        0,
-        1
-      ],
-      "kafkaMin": 2,
-      "reason": "v0/v1 stored offsets in ZooKeeper; Kafka 4.0 raised the floor to v2.",
-      "until": "phase-2 exit"
-    }
-  ],
+  "waivers": [],
   "crossCutting": [
     {
       "gap": "Only partial tagged-field support and no flexible request/response headers",

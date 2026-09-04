@@ -10,9 +10,9 @@ Gap classes: `current` (fork max equals the Kafka max) · `behind:N` · `stub` (
 |---|--:|---|---|---|---|---|
 | Produce | 0 | 3-13 | v9+ | 3-7 | behind:6 | v8 per-record errors (KIP-467), v9 flexible, v10 leader hints (KIP-951), v11 TRANSACTION_ABORTABLE (KIP-890), v12 transaction-version-2 implicit add-partitions (KIP-890 part 2), v13 topic IDs (KIP-516, Kafka 4.1; may return UNKNOWN_TOPIC_ID). |
 | Fetch | 1 | 4-18 | v12+ | 4-11 | behind:7 | v11 rack / preferred read replica (KIP-392): the wire fields exist but the follower out-of-range and OFFSET_NOT_AVAILABLE handling does not. v12 flexible + LastFetchedEpoch, v13 topic IDs replace names (KIP-516), v14 OFFSET_MOVED_TO_TIERED_STORAGE (KIP-405), v15 ReplicaState (KIP-903), v16 leader hints (KIP-951), v17 ReplicaDirectoryId (KIP-853), v18 HighWatermark (KIP-1166). |
-| ListOffsets | 2 | 1-11 | v6+ | 0-3 | behind:8 (below-floor 0) | v4 leader epoch (KIP-320), v6 flexible, v7 max-timestamp, v8 earliest-local offset (KIP-405). |
+| ListOffsets | 2 | 1-11 | v6+ | 1-3 | behind:8 | v4 leader epoch (KIP-320), v6 flexible, v7 max-timestamp, v8 earliest-local offset (KIP-405). |
 | Metadata | 3 | 0-13 | v9+ | 0-6 | behind:7 | v7 leader epoch (KIP-320), v9 flexible, v10+ topic IDs, v13 adds a top-level error code and is where REBOOTSTRAP_REQUIRED surfaces (KIP-1102). |
-| OffsetCommit | 8 | 2-10 | v8+ | 0-5 | behind:5 (below-floor 0-1) | v6 committed leader epoch (KIP-320), v7 group instance id, v8 flexible, v9 member epoch (KIP-848), v10 topic IDs. |
+| OffsetCommit | 8 | 2-10 | v8+ | 2-5 | behind:5 | v6 committed leader epoch (KIP-320), v7 group instance id, v8 flexible, v9 member epoch (KIP-848), v10 topic IDs. |
 | OffsetFetch | 9 | 1-10 | v6+ | 1-4 | behind:6 | v5 leader epoch, v6 flexible, v7 require-stable (KIP-447), v8 multi-group batching, v9 member epoch (KIP-848), v10 topic IDs. The fork has no v0 codec, which is correct: v0 read offsets from ZooKeeper. |
 | FindCoordinator | 10 | 0-6 | v3+ | 0-2 | behind:4 | v3 flexible, v4 multi-key batch (KIP-699), v5 TRANSACTION_ABORTABLE (KIP-890), v6 KeyType SHARE=2 (KIP-932, broker-internal). apiKeys.js still calls key 10 GroupCoordinator, the pre-0.11 name. |
 | JoinGroup | 11 | 0-9 | v6+ | 0-5 | behind:4 | v5 encodes groupInstanceId but nothing plumbs it: Broker.joinGroup() has no such parameter, so static membership (KIP-345) is inert today. |
@@ -23,8 +23,8 @@ Gap classes: `current` (fork max equals the Kafka max) · `behind:N` · `stub` (
 | ListGroups | 16 | 0-5 | v3+ | 0-2 | behind:3 | No GroupState filter (v4) or GroupType field (v5), so consumer-protocol groups cannot be told apart from classic ones. |
 | SaslHandshake | 17 | 0-1 | never | 0-1 | current | Never flexible, and the only API in the matrix that is fully current. |
 | ApiVersions | 18 | 0-4 | v3+ | 0-2 | behind:2 | v0-v3 omit every SupportedFeatures entry whose MinVersion is 0 (KAFKA-17011, fixed in v4 / Kafka 3.9), so a v3-only client sees a truncated feature list. The flexible-protocol pilot targets v4 and falls back to v3 only for brokers below 3.9. |
-| CreateTopics | 19 | 2-7 | v5+ | 0-3 | behind:4 (below-floor 0-1) | v5 flexible, v7 returns topic IDs. |
-| DeleteTopics | 20 | 1-6 | v4+ | 0-1 | behind:5 (on-floor, below-floor 0) | v6 deletes by topic ID. The fork's v1 sits exactly on the 4.x floor. |
+| CreateTopics | 19 | 2-7 | v5+ | 2-3 | behind:4 | v5 flexible, v7 returns topic IDs. |
+| DeleteTopics | 20 | 1-6 | v4+ | 1 | behind:5 (on-floor) | v6 deletes by topic ID. The fork's v1 sits exactly on the 4.x floor. |
 | DeleteRecords | 21 | 0-2 | v2+ | 0-1 | behind:1 |  |
 | InitProducerId | 22 | 0-6 | v2+ | 0-1 | behind:5 | v2+ is flexible, so even v3 needs the flexible-protocol work first. v3 producer-id/epoch re-init (KIP-360), v4 PRODUCER_FENCED, v5 TRANSACTION_ABORTABLE, v6 two-phase commit (KIP-939) and latestVersionUnstable, so brokers advertise 0-5 by default. |
 | OffsetForLeaderEpoch | 23 | 2-4 | v4+ | — | stub | Leader-epoch fencing (KIP-320). Without it an unclean leader change can silently duplicate or skip records. |
@@ -32,10 +32,10 @@ Gap classes: `current` (fork max equals the Kafka max) · `behind:N` · `stub` (
 | AddOffsetsToTxn | 25 | 0-4 | v3+ | 0-1 | behind:3 | Unused under transaction version 2 (KIP-890 part 2). |
 | EndTxn | 26 | 0-5 | v3+ | 0-1 | behind:4 | v5 returns a bumped producer id and epoch under transaction version 2. The TV2 signal is the transaction.version finalized feature in ApiVersions v3+, not EndTxn's advertised max version. |
 | TxnOffsetCommit | 28 | 0-5 | v3+ | 0-1 | behind:4 | v2 adds the committed leader epoch; v3 is KIP-447 group metadata, which the fork does not implement at all. |
-| DescribeAcls | 29 | 1-3 | v2+ | 0-1 | behind:2 (on-floor, below-floor 0) | v1 is the 4.x floor and is also the fork's maximum. |
-| CreateAcls | 30 | 1-3 | v2+ | 0-1 | behind:2 (on-floor, below-floor 0) | v1 is the 4.x floor and is also the fork's maximum. |
-| DeleteAcls | 31 | 1-3 | v2+ | 0-1 | behind:2 (on-floor, below-floor 0) | v1 is the 4.x floor and is also the fork's maximum. |
-| DescribeConfigs | 32 | 1-4 | v4+ | 0-2 | behind:2 (below-floor 0) |  |
+| DescribeAcls | 29 | 1-3 | v2+ | 1 | behind:2 (on-floor) | v1 is the 4.x floor and is also the fork's maximum. |
+| CreateAcls | 30 | 1-3 | v2+ | 1 | behind:2 (on-floor) | v1 is the 4.x floor and is also the fork's maximum. |
+| DeleteAcls | 31 | 1-3 | v2+ | 1 | behind:2 (on-floor) | v1 is the 4.x floor and is also the fork's maximum. |
+| DescribeConfigs | 32 | 1-4 | v4+ | 1-2 | behind:2 |  |
 | AlterConfigs | 33 | 0-2 | v2+ | 0-1 | behind:1 | IncrementalAlterConfigs (key 44) is the modern replacement and is unimplemented, so config changes still overwrite rather than merge. |
 | SaslAuthenticate | 36 | 0-2 | v2+ | 0-1 | behind:1 |  |
 | CreatePartitions | 37 | 0-3 | v2+ | 0-1 | behind:2 |  |
@@ -64,16 +64,7 @@ These APIs implement exactly the minimum version the pinned broker still accepts
 
 Versions implemented here that the pinned broker rejects outright: dead code, and dangerous while version negotiation ignores the broker minimum. Each is waived until the phase named below deletes it; an unwaived below-floor version fails `yarn compat:check`.
 
-| API | Waived versions | Kafka 4.3.1 minimum | Reason | Until |
-|---|---|--:|---|---|
-| CreateAcls | 0 | v1 | Kafka 4.0 raised the ACL API floors to v1. | phase-2 exit |
-| CreateTopics | 0-1 | v2 | Kafka 4.0 raised the CreateTopics floor to v2. | phase-2 exit |
-| DeleteAcls | 0 | v1 | Kafka 4.0 raised the ACL API floors to v1. | phase-2 exit |
-| DeleteTopics | 0 | v1 | Kafka 4.0 raised the DeleteTopics floor to v1. | phase-2 exit |
-| DescribeAcls | 0 | v1 | Kafka 4.0 raised the ACL API floors to v1. | phase-2 exit |
-| DescribeConfigs | 0 | v1 | Kafka 4.0 raised the DescribeConfigs floor to v1. | phase-2 exit |
-| ListOffsets | 0 | v1 | v0 returned an offset array and predates the timestamp API; Kafka 4.0 raised the floor to v1. | phase-2 exit |
-| OffsetCommit | 0-1 | v2 | v0/v1 stored offsets in ZooKeeper; Kafka 4.0 raised the floor to v2. | phase-2 exit |
+None — the waiver list is empty.
 
 ## Cross-cutting gaps
 

@@ -1,4 +1,5 @@
-const { parse, decode: decodeV0 } = require('../v0/response')
+const Decoder = require('../../../decoder')
+const { failure, createErrorFromCode } = require('../../../error')
 
 /**
  * Starting in version 1, on quota violation, brokers send out responses before throttling.
@@ -11,6 +12,22 @@ const { parse, decode: decodeV0 } = require('../v0/response')
  *     error_message => NULLABLE_STRING
  */
 
+const decodeCreationResponse = (decoder) => ({
+  errorCode: decoder.readInt16(),
+  errorMessage: decoder.readString(),
+})
+
+const decodeV0 = async (rawData) => {
+  const decoder = new Decoder(rawData)
+  const throttleTime = decoder.readInt32()
+  const creationResponses = decoder.readArray(decodeCreationResponse)
+
+  return {
+    throttleTime,
+    creationResponses,
+  }
+}
+
 const decode = async (rawData) => {
   const decoded = await decodeV0(rawData)
 
@@ -19,6 +36,18 @@ const decode = async (rawData) => {
     throttleTime: 0,
     clientSideThrottleTime: decoded.throttleTime,
   }
+}
+
+const parse = async (data) => {
+  const creationResponsesWithError = data.creationResponses.filter(({ errorCode }) =>
+    failure(errorCode)
+  )
+
+  if (creationResponsesWithError.length > 0) {
+    throw createErrorFromCode(creationResponsesWithError[0].errorCode)
+  }
+
+  return data
 }
 
 module.exports = {

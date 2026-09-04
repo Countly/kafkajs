@@ -27,36 +27,15 @@ const FLOORS = {
   DescribeConfigs: [describeConfigs, 1],
 }
 
-// Task 4 deletes these versions. Until then the below-floor assertion would fail (the APIs
-// still implement version 0), so only that half runs as it.todo. The floor-version assertion
-// stays live for every API: it guards against Task 4 accidentally deleting the floor version
-// itself. Task 4 restores the below-floor assertion with a one-line change: remove the API
-// name from this set once its below-floor versions are deleted.
-const PENDING_TASK_4 = new Set([
-  'ListOffsets',
-  'OffsetCommit',
-  'CreateTopics',
-  'DeleteTopics',
-  'DescribeAcls',
-  'CreateAcls',
-  'DeleteAcls',
-  'DescribeConfigs',
-])
-
 describe('Protocol > Requests > Kafka 4.x version floors', () => {
   for (const [apiName, [definition, floor]] of Object.entries(FLOORS)) {
     const belowFloorName = `${apiName} implements no version below v${floor}`
     const stillFloorName = `${apiName} still implements the floor version v${floor}`
 
-    if (PENDING_TASK_4.has(apiName)) {
-      // Task 4 deletes these versions
-      it.todo(belowFloorName)
-    } else {
-      it(belowFloorName, () => {
-        const belowFloor = definition.versions.map(Number).filter((v) => v < floor)
-        expect(belowFloor).toEqual([])
-      })
-    }
+    it(belowFloorName, () => {
+      const belowFloor = definition.versions.map(Number).filter((v) => v < floor)
+      expect(belowFloor).toEqual([])
+    })
 
     it(stillFloorName, () => {
       expect(definition.versions.map(Number)).toContain(floor)

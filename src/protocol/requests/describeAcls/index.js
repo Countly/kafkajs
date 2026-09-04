@@ -1,12 +1,4 @@
 const versions = {
-  0: ({ resourceType, resourceName, principal, host, operation, permissionType }) => {
-    const request = require('./v0/request')
-    const response = require('./v0/response')
-    return {
-      request: request({ resourceType, resourceName, principal, host, operation, permissionType }),
-      response,
-    }
-  },
   1: ({
     resourceType,
     resourceName,

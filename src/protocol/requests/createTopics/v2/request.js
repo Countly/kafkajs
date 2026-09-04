@@ -1,4 +1,5 @@
-const requestV1 = require('../v1/request')
+const Encoder = require('../../../encoder')
+const { CreateTopics: apiKey } = require('../../apiKeys')
 
 /**
  * CreateTopics Request (Version: 2) => [create_topic_requests] timeout validate_only
@@ -16,5 +17,37 @@ const requestV1 = require('../v1/request')
  *   validate_only => BOOLEAN
  */
 
-module.exports = ({ topics, validateOnly, timeout }) =>
-  Object.assign(requestV1({ topics, validateOnly, timeout }), { apiVersion: 2 })
+module.exports = ({ topics, validateOnly = false, timeout = 5000 }) => ({
+  apiKey,
+  apiVersion: 2,
+  apiName: 'CreateTopics',
+  encode: async () => {
+    return new Encoder()
+      .writeArray(topics.map(encodeTopics))
+      .writeInt32(timeout)
+      .writeBoolean(validateOnly)
+  },
+})
+
+const encodeTopics = ({
+  topic,
+  numPartitions = -1,
+  replicationFactor = -1,
+  replicaAssignment = [],
+  configEntries = [],
+}) => {
+  return new Encoder()
+    .writeString(topic)
+    .writeInt32(numPartitions)
+    .writeInt16(replicationFactor)
+    .writeArray(replicaAssignment.map(encodeReplicaAssignment))
+    .writeArray(configEntries.map(encodeConfigEntries))
+}
+
+const encodeReplicaAssignment = ({ partition, replicas }) => {
+  return new Encoder().writeInt32(partition).writeArray(replicas)
+}
+
+const encodeConfigEntries = ({ name, value }) => {
+  return new Encoder().writeString(name).writeString(value)
+}
