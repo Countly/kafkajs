@@ -22,10 +22,13 @@ const INIT_PRODUCER_RETRIABLE_PROTOCOL_ERRORS = [
 ]
 const COMMIT_RETRIABLE_PROTOCOL_ERRORS = ['UNKNOWN_TOPIC_OR_PARTITION']
 const COORDINATOR_LOAD_IN_PROGRESS_CODE = 14
+const CONCURRENT_TRANSACTIONS_CODE = 51
 
 /** Codes 14/15/16 are emitted with legacy type names (see src/protocol/error.js), match on code. */
 const isCommitRetriable = (e) =>
   COMMIT_RETRIABLE_PROTOCOL_ERRORS.includes(e.type) || e.code === COORDINATOR_LOAD_IN_PROGRESS_CODE
+
+const isAddOffsetsRetriable = (e) => e.code === CONCURRENT_TRANSACTIONS_CODE
 
 /**
  * @typedef {Object} EosManager
@@ -380,14 +383,35 @@ module.exports = ({
         assert(consumerGroupId, 'Missing consumerGroupId')
         assert(topics, 'Missing offset topics')
 
-        const transactionCoordinator = await findTransactionCoordinator()
+        // Kafka answers CONCURRENT_TRANSACTIONS while a previous transaction on the same
+        // transactional id is still completing and expects the client to retry, the same as
+        // initProducerId above. The coordinator lookup happens inside the retrier so a
+        // coordinator move is picked up on retry.
+        await retrier(async (bail, retryCount, retryTime) => {
+          const transactionCoordinator = await findTransactionCoordinator()
 
-        // Do we need to add offsets if we've already done so for this consumer group?
-        await transactionCoordinator.addOffsetsToTxn({
-          transactionalId,
-          producerId,
-          producerEpoch,
-          groupId: consumerGroupId,
+          try {
+            await transactionCoordinator.addOffsetsToTxn({
+              transactionalId,
+              producerId,
+              producerEpoch,
+              groupId: consumerGroupId,
+            })
+          } catch (e) {
+            if (isAddOffsetsRetriable(e)) {
+              logger.debug('There is an ongoing transaction on this transactionId, retrying', {
+                error: e.message,
+                stack: e.stack,
+                transactionalId,
+                retryCount,
+                retryTime,
+              })
+
+              throw e
+            }
+
+            bail(e)
+          }
         })
 
         hasOffsetsAddedToTransaction = true

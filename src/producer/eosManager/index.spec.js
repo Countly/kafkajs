@@ -354,6 +354,33 @@ describe('Producer > eosManager', () => {
       })
     })
 
+    describe('retrying addOffsetsToTxn on CONCURRENT_TRANSACTIONS', () => {
+      test('code 51 is retried against a freshly looked-up transaction coordinator', async () => {
+        const consumerGroupId = 'consumer-group-id'
+        const topics = [{ topic: 'test-topic-1', partitions: [{ partition: 0 }] }]
+        const eosManager = createEosManager({
+          logger: newLogger(),
+          cluster,
+          transactionTimeout: 30000,
+          transactional: true,
+          transactionalId,
+        })
+        await eosManager.initProducerId()
+        await eosManager.beginTransaction()
+
+        let attempt = 0
+        broker.addOffsetsToTxn.mockImplementation(() => {
+          attempt += 1
+          if (attempt === 1) throw createErrorFromCode(51)
+        })
+
+        await expect(eosManager.sendOffsets({ consumerGroupId, topics })).resolves.not.toThrow()
+
+        expect(broker.addOffsetsToTxn).toHaveBeenCalledTimes(2)
+        expect(broker.txnOffsetCommit).toHaveBeenCalled()
+      })
+    })
+
     describe('recovering from coordinator errors on txnOffsetCommit', () => {
       let consumerGroupId, topics
 

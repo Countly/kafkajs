@@ -1088,12 +1088,7 @@ describe('Consumer', () => {
       }
     )
 
-    // Quarantined (Phase 2): eosManager.sendOffsets() does not retry CONCURRENT_TRANSACTIONS on
-    // AddOffsetsToTxn, although initProducerId in the same file does and Kafka expects clients to
-    // retry that code. Intermittent on 4.x. See QUARANTINE.md.
-    // When un-skipping, restore `testIfKafkaAtLeast_0_11` in place of `test.skip`.
-    // prettier-ignore
-    test.skip(
+    testIfKafkaAtLeast_0_11(
       'respects offsets sent by a committed transaction ("consume-transform-produce" flow)',
       async () => {
         cluster = createCluster()
@@ -1141,7 +1136,7 @@ describe('Consumer', () => {
         // 2. Produce messages and consume
 
         const partition = 0
-        const messages = generateMessages().map(message => ({
+        const messages = generateMessages().map((message) => ({
           ...message,
           partition,
         }))
