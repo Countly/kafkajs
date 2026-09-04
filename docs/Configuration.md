@@ -316,6 +316,19 @@ new Kafka({
 })
 ```
 
+## Max In Flight Requests
+
+`maxInFlightRequests`, available on `producer()` and `consumer()`, caps the number of
+unacknowledged requests allowed on a broker connection before further requests are queued
+client-side. The default is `5`, matching the Java client's
+`max.in.flight.requests.per.connection`. Pass `null` to restore the previous unbounded behavior.
+
+```javascript
+kafka.producer({
+  maxInFlightRequests: 1
+})
+```
+
 ## Default Retry
 
 The `retry` option can be used to set the configuration of the retry mechanism, which is used to retry connections and API calls to Kafka (when using producers or consumers).

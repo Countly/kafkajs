@@ -50,8 +50,10 @@ module.exports = class Connection {
    * @param {number} [options.reauthenticationThreshold=10000]
    * @param {number} options.connectionTimeout The connection timeout, in milliseconds
    * @param {boolean} [options.enforceRequestTimeout]
-   * @param {number} [options.maxInFlightRequests=null] The maximum number of unacknowledged requests on a connection before
-   *                                            enqueuing
+   * @param {number} [options.maxInFlightRequests=5] The maximum number of unacknowledged requests on a
+   *                                            connection before enqueuing (Java's
+   *                                            max.in.flight.requests.per.connection default).
+   *                                            Pass null for unbounded (the pre-3.0 behavior).
    * @param {import("../instrumentation/emitter")} [options.instrumentationEmitter=null]
    * @param {(errorMessage: string) => void} [options.onAuthenticationFailure=null] Called with the
    *                                            broker's error message when it rejects
@@ -72,7 +74,7 @@ module.exports = class Connection {
     clientId = 'kafkajs',
     connectionTimeout,
     enforceRequestTimeout = true,
-    maxInFlightRequests = null,
+    maxInFlightRequests = 5,
     instrumentationEmitter = null,
     onAuthenticationFailure = null,
   }) {

@@ -103,7 +103,11 @@ export interface ProducerConfig {
   idempotent?: boolean
   transactionalId?: string
   transactionTimeout?: number
-  maxInFlightRequests?: number
+  /**
+   * Maximum unacknowledged requests per broker connection. Defaults to 5 (Java parity).
+   * Pass null for unbounded (the pre-3.0 behavior).
+   */
+  maxInFlightRequests?: number | null
 }
 
 export interface Message {
@@ -162,7 +166,11 @@ export interface ConsumerConfig {
   maxWaitTimeInMs?: number
   retry?: RetryOptions & { restartOnFailure?: (err: Error) => Promise<boolean> }
   allowAutoTopicCreation?: boolean
-  maxInFlightRequests?: number
+  /**
+   * Maximum unacknowledged requests per broker connection. Defaults to 5 (Java parity).
+   * Pass null for unbounded (the pre-3.0 behavior).
+   */
+  maxInFlightRequests?: number | null
   readUncommitted?: boolean
   rackId?: string
   groupInstanceId?: string

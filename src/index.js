@@ -22,6 +22,7 @@ const PRIVATE = {
 }
 
 const DEFAULT_METADATA_MAX_AGE = 300000
+const DEFAULT_MAX_IN_FLIGHT_REQUESTS = 5
 const warnOfDefaultPartitioner = once((logger) => {
   if (process.env.KAFKAJS_NO_PARTITIONER_WARNING == null) {
     logger.warn(
@@ -69,7 +70,9 @@ module.exports = class Client {
     this[PRIVATE.CREATE_CLUSTER] = ({
       metadataMaxAge,
       allowAutoTopicCreation = true,
-      maxInFlightRequests = null,
+      // Java's max.in.flight.requests.per.connection default. Pass null for the pre-3.0
+      // unbounded behavior.
+      maxInFlightRequests = DEFAULT_MAX_IN_FLIGHT_REQUESTS,
       instrumentationEmitter = null,
       isolationLevel,
     }) =>
