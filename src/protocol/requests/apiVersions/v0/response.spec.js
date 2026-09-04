@@ -35,8 +35,22 @@ describe('Protocol > Requests > ApiVersions > v0', () => {
   })
 
   test('throws KafkaJSProtocolError if the api is not supported', async () => {
-    await expect(decode(unsupportedVersionResponse())).rejects.toThrow(
-      /The version of API is not supported/
-    )
+    // failIfVersionNotSupported moved out of decode() (KIP-511): the api_keys array must be
+    // read before anything throws, so the error now comes from parse().
+    const data = await decode(unsupportedVersionResponse())
+    await expect(parse(data)).rejects.toThrow(/The version of API is not supported/)
+  })
+
+  test('carries the api_keys hint on UNSUPPORTED_VERSION', async () => {
+    const promise = parse({
+      errorCode: 35,
+      apiVersions: [{ apiKey: 18, minVersion: 0, maxVersion: 2 }],
+    })
+
+    await expect(promise).rejects.toHaveProperty('type', 'UNSUPPORTED_VERSION')
+    await expect(promise).rejects.toHaveProperty('retriable', false)
+    await expect(promise).rejects.toHaveProperty('apiVersions', [
+      { apiKey: 18, minVersion: 0, maxVersion: 2 },
+    ])
   })
 })

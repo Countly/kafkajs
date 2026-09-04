@@ -1,5 +1,5 @@
 const Decoder = require('../../../decoder')
-const { failure, createErrorFromCode, failIfVersionNotSupported } = require('../../../error')
+const { failure, createErrorFromCode } = require('../../../error')
 
 /**
  * ApiVersionResponse => ApiVersions
@@ -17,11 +17,14 @@ const apiVersion = (decoder) => ({
   maxVersion: decoder.readInt16(),
 })
 
+/**
+ * Unlike v1+, this decoder does not call `failIfVersionNotSupported`: doing so before
+ * `api_keys` is read would discard the KIP-511 hint the broker sends alongside
+ * UNSUPPORTED_VERSION (35), which `Broker#apiVersions()` needs for its retry.
+ */
 const decode = async (rawData) => {
   const decoder = new Decoder(rawData)
   const errorCode = decoder.readInt16()
-
-  failIfVersionNotSupported(errorCode)
 
   return {
     errorCode,
@@ -29,9 +32,18 @@ const decode = async (rawData) => {
   }
 }
 
+/**
+ * @param {{ errorCode: number, apiVersions: { apiKey: number, minVersion: number, maxVersion: number }[] }} data
+ * @throws {Error} carrying the decoded `apiVersions` as `error.apiVersions` (KIP-511) so a caller
+ *         can retry at the version the broker actually supports without a second round trip.
+ */
 const parse = async (data) => {
   if (failure(data.errorCode)) {
-    throw createErrorFromCode(data.errorCode)
+    const error = createErrorFromCode(data.errorCode)
+    // KIP-511: the broker sends the ApiVersions api_keys entry alongside UNSUPPORTED_VERSION so
+    // the client can retry at the right version. Carried on the error, not as a new error class.
+    error.apiVersions = data.apiVersions
+    throw error
   }
 
   return data

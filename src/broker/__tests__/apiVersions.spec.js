@@ -1,7 +1,8 @@
 const { createConnectionPool, connectionOpts, newLogger } = require('testHelpers')
-const { KafkaJSProtocolError, KafkaJSNonRetriableError } = require('../../errors')
+const { KafkaJSProtocolError } = require('../../errors')
 const { createErrorFromCode } = require('../../protocol/error')
 const { requests } = require('../../protocol/requests')
+const apiKeys = require('../../protocol/requests/apiKeys')
 const Broker = require('../index')
 
 const UNSUPPORTED_VERSION_CODE = 35
@@ -21,29 +22,40 @@ describe('Broker > ApiVersions', () => {
     broker && (await broker.disconnect())
   })
 
+  afterEach(() => jest.restoreAllMocks())
+
   test('request', async () => {
     await expect(broker.apiVersions()).resolves.toBeTruthy()
   })
 
-  test('try to use the latest version', async () => {
+  test('negotiates the highest implemented version', async () => {
+    jest.spyOn(requests.ApiVersions, 'protocol')
+
+    await broker.apiVersions()
+
+    expect(requests.ApiVersions.protocol).toHaveBeenCalledTimes(1)
+    expect(requests.ApiVersions.protocol).toHaveBeenCalledWith({ version: 4 })
+  })
+
+  test('retries once at the version the broker hints (KIP-511)', async () => {
     jest.spyOn(requests.ApiVersions, 'protocol').mockImplementationOnce(() => () => {
-      throw new KafkaJSProtocolError(createErrorFromCode(UNSUPPORTED_VERSION_CODE))
+      const error = new KafkaJSProtocolError(createErrorFromCode(UNSUPPORTED_VERSION_CODE))
+      error.apiVersions = [{ apiKey: apiKeys.ApiVersions, minVersion: 0, maxVersion: 1 }]
+      throw error
     })
 
     await expect(broker.apiVersions()).resolves.toBeTruthy()
-    expect(requests.ApiVersions.protocol).toHaveBeenCalledWith({ version: 2 })
+    expect(requests.ApiVersions.protocol).toHaveBeenCalledWith({ version: 4 })
     expect(requests.ApiVersions.protocol).toHaveBeenCalledWith({ version: 1 })
-    expect(requests.ApiVersions.protocol).not.toHaveBeenCalledWith({ version: 0 })
+    expect(requests.ApiVersions.protocol).not.toHaveBeenCalledWith({ version: 2 })
   })
 
-  test('throws if API versions cannot be used', async () => {
+  test('does not retry a second time', async () => {
     jest.spyOn(requests.ApiVersions, 'protocol').mockImplementation(() => () => {
       throw new KafkaJSProtocolError(createErrorFromCode(UNSUPPORTED_VERSION_CODE))
     })
 
-    await expect(broker.apiVersions()).rejects.toThrow(
-      KafkaJSNonRetriableError,
-      'API Versions not supported'
-    )
+    await expect(broker.apiVersions()).rejects.toThrow('The version of API is not supported')
+    expect(requests.ApiVersions.protocol).toHaveBeenCalledTimes(2)
   })
 })

@@ -361,9 +361,11 @@
       "forkVersions": [
         0,
         1,
-        2
+        2,
+        3,
+        4
       ],
-      "gap": "behind:2",
+      "gap": "current",
       "onFloor": false,
       "belowFloor": [],
       "notes": "v0-v3 omit every SupportedFeatures entry whose MinVersion is 0 (KAFKA-17011, fixed in v4 / Kafka 3.9), so a v3-only client sees a truncated feature list. The flexible-protocol pilot targets v4 and falls back to v3 only for brokers below 3.9."

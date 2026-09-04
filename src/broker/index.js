@@ -7,12 +7,27 @@ const shuffle = require('../utils/shuffle')
 
 const PRIVATE = {
   SEND_REQUEST: Symbol('private:Broker:sendRequest'),
+  API_VERSIONS_AT: Symbol('private:Broker:apiVersionsAt'),
+  NEGOTIATE_API_VERSIONS_VERSION: Symbol('private:Broker:negotiateApiVersionsVersion'),
 }
 
 /** @type {import("../protocol/requests").Lookup} */
 const notInitializedLookup = () => {
   throw new Error('Broker not connected')
 }
+
+/**
+ * @param {{ apiVersions: { apiKey: number, minVersion: number, maxVersion: number }[] }} response
+ * @returns {import("../../types").ApiVersions}
+ */
+const toVersionMap = (response) =>
+  response.apiVersions.reduce(
+    (obj, version) =>
+      Object.assign(obj, {
+        [version.apiKey]: { minVersion: version.minVersion, maxVersion: version.maxVersion },
+      }),
+    {}
+  )
 
 /**
  * Each node in a Kafka cluster is called broker. This class contains
@@ -111,43 +126,84 @@ module.exports = class Broker {
   }
 
   /**
+   * Negotiates the API versions of the current connection (KIP-35, KIP-511).
+   *
+   * The client asks for the highest ApiVersions version it implements. A broker that does not
+   * support it answers UNSUPPORTED_VERSION (35) with a **v0-shaped body** that still carries the
+   * `api_keys` entry for ApiVersions itself, so the retry can pick the exact best version in one
+   * step. An empty array means a pre-2.4 broker: fall back to v0. INVALID_REQUEST (42) means the
+   * broker rejected the client software name or version and is fatal for this connection; it is
+   * only handled on the first attempt, since the retried version is always ≤ v2 and sends no
+   * client software identity for a broker to reject.
+   * @see https://cwiki.apache.org/confluence/display/KAFKA/KIP-511%3A+Collect+and+Expose+Client%27s+Name+and+Version+in+the+Brokers
+   *
    * @public
    * @returns {Promise<import("../../types").ApiVersions>}
    */
   async apiVersions() {
-    let response
-    const availableVersions = requests.ApiVersions.versions.map(Number).sort().reverse()
+    const bestImplementedVersion = Math.max(...requests.ApiVersions.versions.map(Number))
 
-    // Find the best version implemented by the server
-    for (const candidateVersion of availableVersions) {
-      try {
-        const apiVersions = requests.ApiVersions.protocol({ version: candidateVersion })
-        response = await this[PRIVATE.SEND_REQUEST]({
-          ...apiVersions(),
-          requestTimeout: this.connectionPool.connectionTimeout,
-        })
-        break
-      } catch (e) {
-        if (e.type !== 'UNSUPPORTED_VERSION') {
-          throw e
-        }
-      }
-    }
-
-    if (!response) {
-      throw new KafkaJSNonRetriableError('API Versions not supported')
-    }
-
-    return response.apiVersions.reduce(
-      (obj, version) =>
-        Object.assign(obj, {
-          [version.apiKey]: {
-            minVersion: version.minVersion,
-            maxVersion: version.maxVersion,
+    try {
+      return toVersionMap(await this[PRIVATE.API_VERSIONS_AT](bestImplementedVersion))
+    } catch (e) {
+      if (e.type === 'INVALID_REQUEST') {
+        await this.disconnect()
+        throw new KafkaJSNonRetriableError(
+          {
+            message: `The broker rejected this client's software name or version (INVALID_REQUEST); see KIP-511`,
+            type: e.type,
+            code: e.code,
           },
-        }),
-      {}
+          { cause: e }
+        )
+      }
+
+      if (e.type !== 'UNSUPPORTED_VERSION') {
+        throw e
+      }
+
+      const retryVersion = this[PRIVATE.NEGOTIATE_API_VERSIONS_VERSION](
+        e.apiVersions,
+        bestImplementedVersion
+      )
+
+      return toVersionMap(await this[PRIVATE.API_VERSIONS_AT](retryVersion))
+    }
+  }
+
+  /**
+   * @private
+   * @param {number} version
+   */
+  async [PRIVATE.API_VERSIONS_AT](version) {
+    const apiVersions = requests.ApiVersions.protocol({ version })
+    return await this[PRIVATE.SEND_REQUEST]({
+      ...apiVersions(),
+      requestTimeout: this.connectionPool.connectionTimeout,
+    })
+  }
+
+  /**
+   * @private
+   * @param {{ apiKey: number, maxVersion: number }[]} [brokerVersions] the api_keys array the
+   *        broker returned alongside UNSUPPORTED_VERSION
+   * @param {number} bestImplementedVersion
+   * @returns {number} the single version to retry with
+   */
+  [PRIVATE.NEGOTIATE_API_VERSIONS_VERSION](brokerVersions, bestImplementedVersion) {
+    const advertised = (brokerVersions || []).find(
+      (version) => version.apiKey === apiKeys.ApiVersions
     )
+
+    if (advertised == null) {
+      return 0
+    }
+
+    const candidate = Math.min(bestImplementedVersion, advertised.maxVersion)
+
+    // A malformed api_keys entry (missing or negative maxVersion) must not turn the retry into
+    // `versions[undefined] is not a function`; v0 is always implemented and always parseable.
+    return requests.ApiVersions.versions.includes(String(candidate)) ? candidate : 0
   }
 
   /**
