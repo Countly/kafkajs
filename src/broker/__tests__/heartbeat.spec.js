@@ -100,6 +100,10 @@ describe('Broker > Heartbeat', () => {
     })
   })
 
+  // Heartbeat v3's response carries no group_instance_id to echo (throttle_time_ms + error_code
+  // only), so a passing request/response round-trip alone would still pass if
+  // Broker#heartbeat silently dropped the field. This is a smoke test for that round-trip; the
+  // test below it is what actually proves groupInstanceId reached the wire.
   test('request with groupInstanceId (KIP-345 static membership)', async () => {
     const groupInstanceId = `static-${secureRandom()}`
 
@@ -142,5 +146,45 @@ describe('Broker > Heartbeat', () => {
       throttleTime: 0,
       errorCode: 0,
     })
+  })
+
+  test('groupInstanceId reaches the wire: a superseded member is fenced on Heartbeat', async () => {
+    const groupInstanceId = `static-${secureRandom()}`
+    const protocols = [
+      {
+        name: 'AssignerName',
+        metadata: MemberMetadata.encode({ version: 1, topics: [topicName] }),
+      },
+    ]
+
+    const first = await groupCoordinator.joinGroup({
+      groupId,
+      sessionTimeout: 30000,
+      rebalanceTimeout: 30000,
+      groupInstanceId,
+      groupProtocols: protocols,
+    })
+
+    // A second join under the *same* groupInstanceId replaces the coordinator's
+    // group.instance.id -> member.id mapping (KIP-345); the coordinator can only know to do
+    // this - and therefore only fence `first`'s heartbeat below - if groupInstanceId actually
+    // reached the wire on the first joinGroup call. This is the negative assertion the
+    // request/response round-trip above cannot provide.
+    await groupCoordinator.joinGroup({
+      groupId,
+      sessionTimeout: 30000,
+      rebalanceTimeout: 30000,
+      groupInstanceId,
+      groupProtocols: protocols,
+    })
+
+    await expect(
+      groupCoordinator.heartbeat({
+        groupId,
+        groupGenerationId: first.generationId,
+        memberId: first.memberId,
+        groupInstanceId,
+      })
+    ).rejects.toMatchObject({ type: 'FENCED_INSTANCE_ID', code: 82 })
   })
 })

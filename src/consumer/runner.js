@@ -234,14 +234,13 @@ module.exports = class Runner extends EventEmitter {
    * A static member (`groupInstanceId` set) keeps its group slot across a normal shutdown
    * instead (KIP-345 default: Java gates this the same way via
    * `AbstractCoordinator.shouldSendLeaveGroupRequest = LEAVE_GROUP || isDynamicMember()`), so
-   * no LeaveGroup is sent unless the caller explicitly asks for one.
+   * no LeaveGroup is sent for it. There is no override for this today (KIP-1092 adds an
+   * explicit one in a later phase) — lower `sessionTimeout`, or drop `groupInstanceId`, to bound
+   * or remove the delay before the group reassigns a static member's partitions.
    *
-   * @param {object} [options]
-   * @param {boolean} [options.leaveGroup] Force sending (`true`) or skipping (`false`)
-   *                                LeaveGroup, overriding the static-membership default.
    * @returns {Promise<void>}
    */
-  async stop({ leaveGroup } = {}) {
+  async stop() {
     if (!this.running) {
       return
     }
@@ -257,11 +256,10 @@ module.exports = class Runner extends EventEmitter {
       await this.fetchManager.stop()
       await this.waitForConsumer()
 
-      const shouldLeave = leaveGroup ?? !this.consumerGroup.groupInstanceId
-      if (shouldLeave) {
-        await this.consumerGroup.leave()
-      } else {
+      if (this.consumerGroup.groupInstanceId) {
         this.consumerGroup.memberId = null
+      } else {
+        await this.consumerGroup.leave()
       }
     } catch (e) {}
   }

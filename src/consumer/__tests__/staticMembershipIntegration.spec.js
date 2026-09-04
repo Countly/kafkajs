@@ -1,5 +1,6 @@
 const createConsumer = require('../index')
 const createAdmin = require('../../admin')
+const waitFor = require('../../utils/waitFor')
 const {
   secureRandom,
   createCluster,
@@ -83,12 +84,17 @@ describe('Consumer > static membership (KIP-345) > integration', () => {
     second.run({ eachMessage: async () => {} })
     await waitForConsumerToJoinGroup(second)
 
-    // Give the first consumer's heartbeat loop (heartbeatInterval default 3000ms) a couple of
-    // cycles to hit the coordinator and observe the fencing.
-    await new Promise((resolve) => setTimeout(resolve, 10000))
+    // Bounded wait for the first consumer's heartbeat loop (heartbeatInterval default 3000ms)
+    // to hit the coordinator and observe the fencing, instead of paying a fixed sleep on every
+    // run. Guard against an unrelated crash landing first by matching on the fenced one
+    // specifically, rather than assuming crashes[0] is it.
+    await waitFor(() => crashes.some((c) => c.error.type === 'FENCED_INSTANCE_ID'), {
+      maxWait: 20000,
+      delay: 250,
+    })
 
-    expect(crashes.length).toBeGreaterThan(0)
-    expect(crashes[0].error.type).toEqual('FENCED_INSTANCE_ID')
-    expect(crashes[0].restart).toBe(false)
+    const fenced = crashes.find((c) => c.error.type === 'FENCED_INSTANCE_ID')
+    expect(fenced).toBeDefined()
+    expect(fenced.restart).toBe(false)
   }, 60000)
 })

@@ -44,9 +44,10 @@ const specialOffsets = [
  *                                consumer keeps its group slot across a `disconnect()`/reconnect
  *                                within `sessionTimeout` instead of triggering a rebalance, and
  *                                does not send LeaveGroup on a normal shutdown. A duplicate
- *                                `groupInstanceId` in the same group fences the newer member
- *                                (`FENCED_INSTANCE_ID`, code 82); the consumer crashes without
- *                                restarting rather than loop against a fencing broker.
+ *                                `groupInstanceId` in the same group admits the new joiner and
+ *                                fences the *existing* member instead (`FENCED_INSTANCE_ID`, code
+ *                                82); the fenced consumer crashes without restarting rather than
+ *                                loop against a fencing broker.
  * @param {InstrumentationEventEmitter} [params.instrumentationEmitter]
  * @param {number} params.metadataMaxAge
  *

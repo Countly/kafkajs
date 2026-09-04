@@ -959,6 +959,7 @@ export type ConsumerHeartbeatEvent = InstrumentationEvent<{
   groupId: string
   memberId: string
   groupGenerationId: number
+  groupInstanceId: string | null
 }>
 export type ConsumerCommitOffsetsEvent = InstrumentationEvent<{
   groupId: string

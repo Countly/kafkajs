@@ -68,6 +68,16 @@ describe('Broker > SyncGroup', () => {
     })
   })
 
+  // SyncGroup v3's response carries no group_instance_id to echo back (throttle_time_ms,
+  // error_code, member_assignment only - see v3/response.js), and unlike Heartbeat, the
+  // coordinator's fencing decision is made at JoinGroup time, not observable via a SyncGroup
+  // call itself (a stale member's SyncGroup would fail on its now-invalid member/generation
+  // regardless of what its own request's groupInstanceId carries). So there is no cheap
+  // broker-observable negative that isolates "did *this* SyncGroup call put the field on the
+  // wire" the way Heartbeat's fencing test does (see heartbeat.spec.js). This is a request/
+  // response round-trip smoke test: it proves the call succeeds with groupInstanceId set, not
+  // that dropping the field would fail it. Codec-level coverage that the field is only
+  // destructured/encoded for v3 lives in the protocol layer (src/protocol/requests/syncGroup).
   test('request with groupInstanceId (KIP-345 static membership)', async () => {
     const groupInstanceId = `static-${secureRandom()}`
 
