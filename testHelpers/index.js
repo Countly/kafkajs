@@ -202,7 +202,7 @@ const testWaitFor = async (fn, opts = {}) => waitFor(fn, { ignoreTimeout: true, 
 
 // KRaft commits CreateTopics on the controller and propagates the metadata asynchronously, so a
 // broker that has not caught up yet answers UNKNOWN_TOPIC_OR_PARTITION (Kafka 4.x) or
-// LEADER_NOT_AVAILABLE (Kafka <= 3.x). The client bails on the former today -- see QUARANTINE.md R1.
+// LEADER_NOT_AVAILABLE (Kafka <= 3.x). Test setup retries both so a spec never races the controller.
 const TOPIC_NOT_READY_ERRORS = ['UNKNOWN_TOPIC_OR_PARTITION', 'LEADER_NOT_AVAILABLE']
 
 /**
