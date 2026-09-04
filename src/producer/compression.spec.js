@@ -1,6 +1,7 @@
 const zlib = require('zlib')
 const createProducer = require('./index')
 const createConsumer = require('../consumer')
+const waitFor = require('../utils/waitFor')
 const Compression = require('../protocol/message/compression')
 const { KafkaJSNotImplemented } = require('../errors')
 
@@ -11,11 +12,10 @@ const {
   connectionOpts,
   newLogger,
   createCluster,
-  waitForMessages,
 } = require('testHelpers')
 
 describe('Producer', () => {
-  let topicName, cluster, producer
+  let topicName, cluster, producer, consumer
 
   beforeEach(async () => {
     topicName = `test-topic-${secureRandom()}`
@@ -28,6 +28,8 @@ describe('Producer', () => {
 
   afterEach(async () => {
     producer && (await producer.disconnect())
+    consumer && (await consumer.disconnect())
+    consumer = undefined
   })
 
   // eslint-disable-next-line n/no-unsupported-features/node-builtins -- feature detection, not a call
@@ -80,7 +82,7 @@ describe('Producer', () => {
 
         await producer.send({ topic: topicName, compression: codec, messages: [{ key, value }] })
 
-        const consumer = createConsumer({
+        consumer = createConsumer({
           cluster: createCluster(),
           groupId: `consumer-group-id-${secureRandom()}`,
           logger: newLogger(),
@@ -92,13 +94,18 @@ describe('Producer', () => {
         const received = []
         await consumer.run({ eachMessage: async (event) => received.push(event) })
 
-        // waitForMessages resolves once `number` messages have arrived; a broken codec never
-        // delivers one, so the test fails via Jest's own timeout instead of hanging forever.
-        const [{ message }] = await waitForMessages(received, { number: 1 })
+        // Bounded wait (unlike testHelpers' waitForMessages, which never times out): a broken
+        // codec fails this test in 15s with a clear message instead of hanging until Jest's own
+        // (much longer) test timeout. afterEach disconnects the consumer either way.
+        await waitFor(() => (received.length > 0 ? received : false), {
+          delay: 50,
+          maxWait: 15000,
+          timeoutMessage: 'Timed out waiting for the compressed message to be consumed',
+        })
+
+        const [{ message }] = received
         expect(message.key).toEqual(Buffer.from(key))
         expect(message.value).toEqual(Buffer.from(value))
-
-        await consumer.disconnect()
       })
     })
   }

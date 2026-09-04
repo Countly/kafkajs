@@ -1,9 +1,17 @@
+/**
+ * @module protocol/message/compression/zstd
+ * @description Zstandard compression (KIP-110) via `node:zlib`'s `zstdCompress`/`zstdDecompress`,
+ * available on Node >= 22.15 / >= 23.8 and still Stability 1 (Experimental) through Node 26 —
+ * detected at load time rather than assumed, so requiring this module never throws. Kafka's own
+ * default compression level is 3.
+ */
 const { promisify } = require('util')
 const zlib = require('zlib')
+const { KafkaJSNotImplemented } = require('../../../errors')
 
-// node:zlib gained zstd in Node 22.15 / 23.8 and it is still Stability 1 (Experimental)
-// through Node 26, so detect it instead of assuming it. Kafka's own default level is 3.
 const DEFAULT_COMPRESSION_LEVEL = 3
+const NOT_SUPPORTED_MESSAGE =
+  'ZSTD compression requires zstd support in node:zlib (Node >= 22.15 or >= 23.8)'
 
 // eslint-disable-next-line n/no-unsupported-features/node-builtins -- feature-detected, not called unless supported
 const isSupported = typeof zlib.zstdCompressSync === 'function'
@@ -13,15 +21,30 @@ const zstdCompress = isSupported ? promisify(zlib.zstdCompress) : null
 const zstdDecompress = isSupported ? promisify(zlib.zstdDecompress) : null
 /* eslint-enable n/no-unsupported-features/node-builtins */
 
+const unavailable = () => {
+  throw new KafkaJSNotImplemented(NOT_SUPPORTED_MESSAGE)
+}
+
 module.exports = {
+  /** @type {boolean} Whether this Node build has zstd support in `node:zlib`; `index.js` uses
+   *  this to decide between returning this codec and throwing `KafkaJSNotImplemented`. */
   isSupported,
+
+  /** The message thrown when `isSupported` is false; exported so `index.js` and this module's
+   *  own guard never drift apart. */
+  NOT_SUPPORTED_MESSAGE,
 
   /**
    * @param {{ buffer: Buffer }} encoder
-   * @param {{ level?: number }} [options]
+   * @param {{ level?: number }} [options] Compression level (default 3, Kafka's own default).
+   *   No supported caller reaches this today — the public producer API doesn't thread a level
+   *   through — but it's kept for a caller that constructs this codec directly, e.g. wrapping it
+   *   in a custom `CompressionCodecs` registration.
    * @returns {Promise<Buffer>}
+   * @throws {KafkaJSNotImplemented} when this Node build has no zstd support in `node:zlib`
    */
   async compress(encoder, { level = DEFAULT_COMPRESSION_LEVEL } = {}) {
+    if (!isSupported) unavailable()
     return await zstdCompress(encoder.buffer, {
       // eslint-disable-next-line n/no-unsupported-features/node-builtins -- guarded by isSupported above
       params: { [zlib.constants.ZSTD_c_compressionLevel]: level },
@@ -31,8 +54,10 @@ module.exports = {
   /**
    * @param {Buffer} buffer
    * @returns {Promise<Buffer>}
+   * @throws {KafkaJSNotImplemented} when this Node build has no zstd support in `node:zlib`
    */
   async decompress(buffer) {
+    if (!isSupported) unavailable()
     return await zstdDecompress(buffer)
   },
 }
