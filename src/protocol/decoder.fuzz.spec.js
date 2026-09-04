@@ -57,7 +57,9 @@ describe('Protocol > Decoder > bounds checking', () => {
 
   it('reads an empty tagged-field section at the end of the buffer', () => {
     const decoder = new Decoder(Buffer.from([0x00]))
-    expect(decoder.readTaggedFields()).toBeNull()
+    const fields = decoder.readTaggedFields()
+    expect(fields).toBeInstanceOf(Map)
+    expect(fields.size).toEqual(0)
   })
 
   it('survives random garbage without an ERR_BUFFER_OUT_OF_BOUNDS', () => {

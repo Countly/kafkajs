@@ -14,6 +14,25 @@ const DOUBLE_SIZE = 8
 const MOST_SIGNIFICANT_BIT = 0x80 // 128
 const OTHER_BITS = 0x7f // 127
 
+/**
+ * Shared result for the common empty tag section, so the per-partition tag buffers of a
+ * flexible response cost no allocation. Its mutators throw so it can never be poisoned.
+ * @type {Map<number, Buffer>}
+ */
+const EMPTY_TAGGED_FIELDS = Object.freeze(
+  Object.assign(new Map(), {
+    set: () => {
+      throw new TypeError('The empty tagged-fields Map is shared and read-only')
+    },
+    delete: () => {
+      throw new TypeError('The empty tagged-fields Map is shared and read-only')
+    },
+    clear: () => {
+      throw new TypeError('The empty tagged-fields Map is shared and read-only')
+    },
+  })
+)
+
 module.exports = class Decoder {
   static int32Size() {
     return INT32_SIZE
@@ -323,19 +342,42 @@ module.exports = class Decoder {
     return result >>> 0
   }
 
+  /**
+   * TAG_BUFFER: every structure in a flexible version ends with one. The section is a count,
+   * then that many `(tag, length, value)` triples in strictly ascending tag order; an empty
+   * section is a single 0x00 byte. Values are returned raw — the codec that knows the tag
+   * decodes them; unknown tags are kept as bytes so nothing is silently dropped.
+   * @see https://cwiki.apache.org/confluence/display/KAFKA/KIP-482%3A+The+Kafka+Protocol+should+Support+Optional+Tagged+Fields
+   * The returned Map is **read-only**: an empty section returns a single shared instance, because
+   * every struct of a flexible message ends with a tag buffer and almost all of them are empty —
+   * a Metadata v12 response with 100 topics of 50 partitions would otherwise allocate ~5 100 Maps
+   * per refresh.
+   *
+   * @returns {Map<number, Buffer>} raw tagged values, in the order they appeared
+   * @throws {KafkaJSPartialMessageError} when the section is malformed or truncated
+   */
   readTaggedFields() {
     const numberOfTaggedFields = this.readUVarInt()
 
     if (numberOfTaggedFields === 0) {
-      return null
+      return EMPTY_TAGGED_FIELDS
     }
 
-    const taggedFields = {}
+    const taggedFields = new Map()
+    let previousTag = -1
 
     for (let i = 0; i < numberOfTaggedFields; i++) {
-      // Right now this will read tag, the field length, and then length number of bytes for the field value skipping over the tag
-      this.readUVarInt()
-      this.readUVarIntBytes()
+      const tag = this.readUVarInt()
+
+      if (tag <= previousTag) {
+        throw new KafkaJSPartialMessageError(
+          `Tagged fields must be serialized in ascending tag order without duplicates, ` +
+            `read tag ${tag} after ${previousTag} at offset ${this.offset}`
+        )
+      }
+
+      previousTag = tag
+      taggedFields.set(tag, this.readRawUVarIntBytes())
     }
 
     return taggedFields
