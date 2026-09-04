@@ -15,6 +15,8 @@ const {
   isKafkaJSError,
   isLostMember,
   isRevoked,
+  isFencedInstance,
+  isUnknownMemberId,
   ...errors
 } = require('./src/errors')
 const { LEVELS } = require('./src/loggers')

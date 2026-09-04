@@ -30,6 +30,8 @@ test('internal error-classification helpers stay private', () => {
   assert.equal(cjs.isKafkaJSError, undefined)
   assert.equal(cjs.isLostMember, undefined)
   assert.equal(cjs.isRevoked, undefined)
+  assert.equal(cjs.isFencedInstance, undefined)
+  assert.equal(cjs.isUnknownMemberId, undefined)
 })
 
 test('deep paths under src are not exported', () => {

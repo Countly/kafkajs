@@ -1,4 +1,12 @@
-const { isRebalancing, isStaleCoordinator, isLostMember, isRevoked } = require('./errors')
+const {
+  isRebalancing,
+  isStaleCoordinator,
+  isLostMember,
+  isRevoked,
+  isFencedInstance,
+  isUnknownMemberId,
+} = require('./errors')
+const { createErrorFromCode } = require('./protocol/error')
 
 describe('isRebalancing', () => {
   it.each(['REBALANCE_IN_PROGRESS', 'NOT_COORDINATOR_FOR_GROUP', 'ILLEGAL_GENERATION'])(
@@ -46,15 +54,44 @@ describe('isLostMember', () => {
 })
 
 describe('isRevoked', () => {
-  it.each([27, 16])('returns true for code %i (partitions revoked / coordinator moved)', (code) => {
-    expect(isRevoked({ code })).toBe(true)
+  it.each([27, 16, 14])(
+    'returns true for code %i (rebalance-class, member still valid)',
+    (code) => {
+      expect(isRevoked(createErrorFromCode(code))).toBe(true)
+    }
+  )
+
+  it.each([22, 25, 82])('returns false for code %i (member is lost, not revoked)', (code) => {
+    expect(isRevoked(createErrorFromCode(code))).toBe(false)
   })
 
-  it.each([22, 25, 82, 14])('returns false for code %i (member is lost, not revoked)', (code) => {
-    expect(isRevoked({ code })).toBe(false)
+  it('returns true for a type-only REBALANCE_IN_PROGRESS error with no code', () => {
+    expect(isRevoked({ type: 'REBALANCE_IN_PROGRESS' })).toBe(true)
   })
 
-  it('returns false when the error has no code', () => {
+  it('returns false when the error has no code or type', () => {
     expect(isRevoked({})).toBe(false)
+  })
+})
+
+describe('isFencedInstance', () => {
+  it('returns true for code 82', () => {
+    expect(isFencedInstance({ code: 82 })).toBe(true)
+  })
+
+  it('returns false for other codes', () => {
+    expect(isFencedInstance({ code: 22 })).toBe(false)
+    expect(isFencedInstance({})).toBe(false)
+  })
+})
+
+describe('isUnknownMemberId', () => {
+  it('returns true for code 25', () => {
+    expect(isUnknownMemberId({ code: 25 })).toBe(true)
+  })
+
+  it('returns false for other codes', () => {
+    expect(isUnknownMemberId({ code: 22 })).toBe(false)
+    expect(isUnknownMemberId({})).toBe(false)
   })
 })

@@ -1,9 +1,14 @@
 const { EventEmitter } = require('events')
 const Long = require('../utils/long')
 const createRetry = require('../retry')
-const { isKafkaJSError, isRebalancing, isLostMember, isRevoked } = require('../errors')
-
-const FENCED_INSTANCE_ID_CODE = 82
+const {
+  isKafkaJSError,
+  isRebalancing,
+  isLostMember,
+  isRevoked,
+  isFencedInstance,
+  isUnknownMemberId,
+} = require('../errors')
 
 const {
   events: { FETCH, FETCH_START, START_BATCH_PROCESS, END_BATCH_PROCESS, REBALANCING },
@@ -133,16 +138,28 @@ module.exports = class Runner extends EventEmitter {
             error: e.message,
           })
 
+          // The consumer is rejoining, same as the isRebalancing branch below - emit the same
+          // public instrumentation event before acting on it.
+          this.instrumentationEmitter.emit(REBALANCING, {
+            groupId: this.consumerGroup.groupId,
+            memberId: this.consumerGroup.memberId,
+          })
+
           this.consumerGroup.discardUncommittedOffsets()
 
-          if (e.code !== FENCED_INSTANCE_ID_CODE) {
-            // A fenced static member must not rejoin under a fresh member id into the same
-            // fencing loop; a lost dynamic member gets a fresh member id and rejoins.
-            this.consumerGroup.memberId = null
+          if (!isFencedInstance(e)) {
+            if (isUnknownMemberId(e)) {
+              // Only an unrecognized member id needs a fresh one. A stale generation
+              // (ILLEGAL_GENERATION) does not invalidate the member id itself, so keep it and
+              // avoid an extra MEMBER_ID_REQUIRED round-trip.
+              this.consumerGroup.memberId = null
+            }
             await this.consumerGroup.joinAndSync()
             return
           }
 
+          // A fenced static member must not rejoin under a fresh member id into the same
+          // fencing loop.
           throw e
         }
 

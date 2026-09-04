@@ -286,7 +286,6 @@ const isRebalancing = (e) =>
 
 const ILLEGAL_GENERATION_CODE = 22
 const UNKNOWN_MEMBER_ID_CODE = 25
-const REBALANCE_IN_PROGRESS_CODE = 27
 const FENCED_INSTANCE_ID_CODE = 82
 
 /**
@@ -300,12 +299,21 @@ const isLostMember = (e) =>
   e.code === UNKNOWN_MEMBER_ID_CODE ||
   e.code === FENCED_INSTANCE_ID_CODE
 
+/** True for a member fenced out of the group by a duplicate static instance id (code 82). */
+const isFencedInstance = (e) => e.code === FENCED_INSTANCE_ID_CODE
+
+/** True for a member the coordinator no longer recognizes by member id (code 25). */
+const isUnknownMemberId = (e) => e.code === UNKNOWN_MEMBER_ID_CODE
+
 /**
- * The member is still valid: partitions are being revoked (27) or the coordinator moved (16,
- * re-discovered via FindCoordinator). Either way the generation is still good, so a final commit
- * of already-resolved offsets is allowed before rejoining.
+ * The member is still valid: every rebalance-class error isRebalancing() matches (partitions
+ * revoked, the coordinator moved or is still loading, ...) minus the LOST codes above. The
+ * generation is good in all of these, so a final commit of already-resolved offsets is allowed
+ * before rejoining. Defined this way (rather than an explicit code list) so this set stays
+ * byte-identical to isRebalancing()'s, minus whatever isLostMember() claims - no code that
+ * isRebalancing() covers today or in the future is silently dropped from the commit-allowed set.
  */
-const isRevoked = (e) => e.code === REBALANCE_IN_PROGRESS_CODE || e.code === NOT_COORDINATOR_CODE
+const isRevoked = (e) => isRebalancing(e) && !isLostMember(e)
 
 const isKafkaJSError = (e) => e instanceof KafkaJSError
 
@@ -345,5 +353,7 @@ module.exports = {
   isStaleCoordinator,
   isLostMember,
   isRevoked,
+  isFencedInstance,
+  isUnknownMemberId,
   isKafkaJSError,
 }
