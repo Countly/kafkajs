@@ -33,6 +33,9 @@ Versions before 3.0.0 are internal alpha tags and are not published.
 #### Additions
 - New producer instrumentation event `INITIALIZED` (`producer.events.INITIALIZED`), emitted for idempotent producers once a producer id has been obtained — i.e. once it's safe to `send()` — whether that happens during `connect()` or via the lazy re-init path above; not emitted for non-idempotent producers. `CONNECT` keeps firing exactly where it always has.
 
+#### Performance
+- `arrayDiff` now builds a `Set` from the second array once and does an O(1) membership check per element, instead of an `indexOf` scan of the second array for every element of the first (O(n·m)). It's on the hot path for `ConsumerGroup#checkForStaleAssignment`, `BrokerPool#refreshMetadata`, and rebalancing, so this matters most on high-partition-count topics. Behavior is unchanged except for `NaN` (`Set#has` uses SameValueZero, `indexOf` uses strict equality), which never appears in a topic name, partition id, or broker id. Adopts upstream PR #1738.
+
 #### Tooling
 - ESLint 9 flat config and Prettier 3 replace ESLint 6 / Prettier 1 (`eslint-config-standard` rules ported explicitly).
 - Coverage is measured and gated: `test:coverage` enforces a floor of statements 94 / branches 84 / functions 96 / lines 94 (baseline 95.6 / 85.7 / 97.7 / 95.6 on the full suite against Kafka 4.3.1).
