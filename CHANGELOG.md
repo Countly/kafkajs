@@ -19,6 +19,7 @@ Versions before 3.0.0 are internal alpha tags and are not published.
 
 #### Fixes
 - Request queue: an idle, unthrottled queue no longer re-arms a timer after every response (hundreds of wakeups per second at idle, `TimeoutNegativeWarning` on Node ≥ 24). Informed by upstream #1755, #1768, #1667, #1572 (issues #1704, #1751, #1556); implementation follows the Countly production patch and keeps the 10 ms re-check for a queue blocked by the in-flight limit. Retires Countly patch 1a.
+- SyncGroup gets its own request timeout derived from `rebalanceTimeout` (or `sessionTimeout`) plus 5 s, as JoinGroup already did, so a rebalance whose assignment takes longer than the client-wide `requestTimeout` no longer dies with `KafkaJSRequestTimeoutError` and loops. No upstream issue exists for this; retires Countly patch 1b.
 
 #### Tooling
 - ESLint 9 flat config and Prettier 3 replace ESLint 6 / Prettier 1 (`eslint-config-standard` rules ported explicitly).

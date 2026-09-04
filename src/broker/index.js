@@ -402,9 +402,18 @@ module.exports = class Broker {
    * @param {number} request.generationId
    * @param {string} request.memberId
    * @param {object} request.groupAssignment
+   * @param {number} [request.sessionTimeout] Used to derive the SyncGroup request timeout
+   * @param {number} [request.rebalanceTimeout] Used to derive the SyncGroup request timeout
    * @returns {Promise}
    */
-  async syncGroup({ groupId, generationId, memberId, groupAssignment }) {
+  async syncGroup({
+    groupId,
+    generationId,
+    memberId,
+    groupAssignment,
+    sessionTimeout,
+    rebalanceTimeout,
+  }) {
     const syncGroup = this.lookupRequest(apiKeys.SyncGroup, requests.SyncGroup)
     return await this[PRIVATE.SEND_REQUEST](
       syncGroup({
@@ -412,6 +421,8 @@ module.exports = class Broker {
         generationId,
         memberId,
         groupAssignment,
+        sessionTimeout,
+        rebalanceTimeout,
       })
     )
   }

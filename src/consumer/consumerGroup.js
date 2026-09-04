@@ -204,6 +204,8 @@ module.exports = class ConsumerGroup {
       topics,
       topicsSubscribed,
       coordinator,
+      sessionTimeout,
+      rebalanceTimeout,
     } = this
 
     if (this.isLeader()) {
@@ -235,6 +237,8 @@ module.exports = class ConsumerGroup {
       generationId,
       memberId,
       groupAssignment: assignment,
+      sessionTimeout,
+      rebalanceTimeout,
     })
 
     const decodedMemberAssignment = MemberAssignment.decode(memberAssignment)
