@@ -2,7 +2,7 @@ const Decoder = require('../../../decoder')
 const { failure, createErrorFromCode } = require('../../../error')
 
 /**
- * OffsetCommit Response (Version: 1) => [responses]
+ * OffsetCommit Response (Version: 2) => [responses]
  *   responses => topic [partition_responses]
  *     topic => STRING
  *     partition_responses => partition error_code

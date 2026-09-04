@@ -17,7 +17,7 @@ const decodeCreationResponse = (decoder) => ({
   errorMessage: decoder.readString(),
 })
 
-const decodeV0 = async (rawData) => {
+const decodeResponse = async (rawData) => {
   const decoder = new Decoder(rawData)
   const throttleTime = decoder.readInt32()
   const creationResponses = decoder.readArray(decodeCreationResponse)
@@ -29,7 +29,7 @@ const decodeV0 = async (rawData) => {
 }
 
 const decode = async (rawData) => {
-  const decoded = await decodeV0(rawData)
+  const decoded = await decodeResponse(rawData)
 
   return {
     ...decoded,

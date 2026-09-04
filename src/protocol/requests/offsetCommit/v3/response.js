@@ -1,5 +1,5 @@
 const Decoder = require('../../../decoder')
-const { parse: parseV0 } = require('../v2/response')
+const { parse: parseV2 } = require('../v2/response')
 
 /**
  * OffsetCommit Response (Version: 3) => throttle_time_ms [responses]
@@ -31,5 +31,5 @@ const decodePartitions = (decoder) => ({
 
 module.exports = {
   decode,
-  parse: parseV0,
+  parse: parseV2,
 }
