@@ -50,8 +50,13 @@ module.exports = ({
 
   const logger = rootLogger.namespace('Producer')
 
-  if (idempotent && retry.retries < Number.MAX_SAFE_INTEGER) {
-    logger.warn('Limiting retries for the idempotent producer may invalidate EoS guarantees')
+  // A user who deliberately picked a generous, finite retry budget has already made the
+  // trade-off; only warn below the non-idempotent default, where exhaustion is plausible.
+  const MIN_SAFE_IDEMPOTENT_RETRIES = 5
+  if (idempotent && retry.retries < MIN_SAFE_IDEMPOTENT_RETRIES) {
+    logger.warn('Limiting retries for the idempotent producer may invalidate EoS guarantees', {
+      retries: retry.retries,
+    })
   }
 
   const partitioner = createPartitioner()
