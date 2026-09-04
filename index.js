@@ -9,7 +9,14 @@ const AclResourceTypes = require('./src/protocol/aclResourceTypes')
 const AclOperationTypes = require('./src/protocol/aclOperationTypes')
 const AclPermissionTypes = require('./src/protocol/aclPermissionTypes')
 const ResourcePatternTypes = require('./src/protocol/resourcePatternTypes')
-const { isRebalancing, isStaleCoordinator, isKafkaJSError, ...errors } = require('./src/errors')
+const {
+  isRebalancing,
+  isStaleCoordinator,
+  isKafkaJSError,
+  isLostMember,
+  isRevoked,
+  ...errors
+} = require('./src/errors')
 const { LEVELS } = require('./src/loggers')
 
 module.exports = {

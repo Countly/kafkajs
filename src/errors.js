@@ -284,6 +284,29 @@ const isRebalancing = (e) =>
   e.type === 'ILLEGAL_GENERATION' ||
   e.code === COORDINATOR_LOAD_IN_PROGRESS_CODE
 
+const ILLEGAL_GENERATION_CODE = 22
+const UNKNOWN_MEMBER_ID_CODE = 25
+const REBALANCE_IN_PROGRESS_CODE = 27
+const FENCED_INSTANCE_ID_CODE = 82
+
+/**
+ * The member is no longer part of the group: its generation, member id or static instance id
+ * has been invalidated by the coordinator. Uncommitted offsets belong to a generation the
+ * coordinator has already discarded, so committing them fails forever (upstream #1712, #1466,
+ * #1527, #1009). Discard the uncommitted offsets and rejoin instead.
+ */
+const isLostMember = (e) =>
+  e.code === ILLEGAL_GENERATION_CODE ||
+  e.code === UNKNOWN_MEMBER_ID_CODE ||
+  e.code === FENCED_INSTANCE_ID_CODE
+
+/**
+ * The member is still valid: partitions are being revoked (27) or the coordinator moved (16,
+ * re-discovered via FindCoordinator). Either way the generation is still good, so a final commit
+ * of already-resolved offsets is allowed before rejoining.
+ */
+const isRevoked = (e) => e.code === REBALANCE_IN_PROGRESS_CODE || e.code === NOT_COORDINATOR_CODE
+
 const isKafkaJSError = (e) => e instanceof KafkaJSError
 
 module.exports = {
@@ -320,5 +343,7 @@ module.exports = {
   KafkaJSAlterPartitionReassignmentsError,
   isRebalancing,
   isStaleCoordinator,
+  isLostMember,
+  isRevoked,
   isKafkaJSError,
 }

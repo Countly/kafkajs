@@ -169,6 +169,20 @@ Having both flavors at the same time is also possible, the consumer will commit 
 
 `autoCommit`: Advanced option to disable auto committing altogether. Instead, you can [manually commit offsets](#manual-commits). Default: `true`
 
+## <a name="membership-errors"></a> Membership errors during rebalance
+
+When the group coordinator rejects a heartbeat or a fetch, the consumer tells apart two kinds of error and reacts differently:
+
+| Error | Code | Meaning | Consumer action |
+|---|--:|---|---|
+| `ILLEGAL_GENERATION` | 22 | member is **LOST** | discard uncommitted offsets, never autocommit, rejoin |
+| `UNKNOWN_MEMBER_ID` | 25 | member is **LOST** | same, plus reset the member id |
+| `FENCED_INSTANCE_ID` | 82 | member is **LOST** (fenced by a duplicate static member) | same, and do not rejoin |
+| `REBALANCE_IN_PROGRESS` | 27 | partitions are being **REVOKED** | a final commit is allowed before rejoining |
+| `NOT_COORDINATOR_FOR_GROUP` | 16 | the coordinator moved | a final commit is allowed once the new coordinator is found |
+
+A LOST member's generation, member id, or static instance id has already been invalidated by the coordinator, so any offsets committed under it would be rejected forever — that used to surface as a repeating "Specified group generation id is not valid" error. A REVOKED member is still a valid part of the group, so committing its already-resolved offsets before rejoining is safe.
+
 ## <a name="manual-commits"></a> Manual committing
 
 When disabling [`autoCommit`](#auto-commit) you can still manually commit message offsets, in a couple of different ways:

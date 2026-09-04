@@ -1,7 +1,9 @@
 const { EventEmitter } = require('events')
 const Long = require('../utils/long')
 const createRetry = require('../retry')
-const { isKafkaJSError, isRebalancing } = require('../errors')
+const { isKafkaJSError, isRebalancing, isLostMember, isRevoked } = require('../errors')
+
+const FENCED_INSTANCE_ID_CODE = 82
 
 const {
   events: { FETCH, FETCH_START, START_BATCH_PROCESS, END_BATCH_PROCESS, REBALANCING },
@@ -124,6 +126,26 @@ module.exports = class Runner extends EventEmitter {
       try {
         await this.fetchManager.start()
       } catch (e) {
+        if (isLostMember(e)) {
+          this.logger.error('Membership lost, discarding uncommitted offsets and re-joining', {
+            groupId: this.consumerGroup.groupId,
+            memberId: this.consumerGroup.memberId,
+            error: e.message,
+          })
+
+          this.consumerGroup.discardUncommittedOffsets()
+
+          if (e.code !== FENCED_INSTANCE_ID_CODE) {
+            // A fenced static member must not rejoin under a fresh member id into the same
+            // fencing loop; a lost dynamic member gets a fresh member id and rejoins.
+            this.consumerGroup.memberId = null
+            await this.consumerGroup.joinAndSync()
+            return
+          }
+
+          throw e
+        }
+
         if (isRebalancing(e)) {
           this.logger.warn('The group is rebalancing, re-joining', {
             groupId: this.consumerGroup.groupId,
@@ -136,18 +158,6 @@ module.exports = class Runner extends EventEmitter {
             memberId: this.consumerGroup.memberId,
           })
 
-          await this.consumerGroup.joinAndSync()
-          return
-        }
-
-        if (e.type === 'UNKNOWN_MEMBER_ID') {
-          this.logger.error('The coordinator is not aware of this member, re-joining the group', {
-            groupId: this.consumerGroup.groupId,
-            memberId: this.consumerGroup.memberId,
-            error: e.message,
-          })
-
-          this.consumerGroup.memberId = null
           await this.consumerGroup.joinAndSync()
           return
         }
@@ -239,7 +249,16 @@ module.exports = class Runner extends EventEmitter {
     try {
       await this.consumerGroup.heartbeat({ interval: this.heartbeatInterval })
     } catch (e) {
-      if (isRebalancing(e)) {
+      if (isLostMember(e)) {
+        // The generation/member id is stale: these offsets can never be committed. Committing
+        // them would fail with the same error forever (the "generation id is not valid" loop).
+        this.logger.warn('Membership lost, discarding uncommitted offsets and rejoining', {
+          groupId: this.consumerGroup.groupId,
+          memberId: this.consumerGroup.memberId,
+          error: e.message,
+        })
+        this.consumerGroup.discardUncommittedOffsets()
+      } else if (isRevoked(e)) {
         await this.autoCommitOffsets()
       }
       throw e

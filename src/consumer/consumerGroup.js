@@ -443,6 +443,16 @@ module.exports = class ConsumerGroup {
     return this.offsetManager.uncommittedOffsets()
   }
 
+  /**
+   * Drop every resolved-but-uncommitted offset. Used when the member is fenced or its
+   * generation is stale: those offsets belong to a generation the coordinator has discarded.
+   */
+  discardUncommittedOffsets() {
+    if (this.offsetManager) {
+      this.offsetManager.clearAllOffsets()
+    }
+  }
+
   async heartbeat({ interval }) {
     return this[PRIVATE.SHARED_HEARTBEAT]({ interval })
   }
