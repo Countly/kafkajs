@@ -1,6 +1,9 @@
 const Runner = require('../runner')
 const { newLogger } = require('testHelpers')
 const InstrumentationEventEmitter = require('../../instrumentation/emitter')
+const {
+  events: { REBALANCING },
+} = require('../instrumentationEvents')
 const { createErrorFromCode } = require('../../protocol/error')
 
 const ILLEGAL_GENERATION = 22
@@ -23,16 +26,17 @@ const createRunner = (consumerGroupOverrides) => {
     ...consumerGroupOverrides,
   }
 
+  const instrumentationEmitter = new InstrumentationEventEmitter()
   const runner = new Runner({
     logger: newLogger(),
     consumerGroup,
-    instrumentationEmitter: new InstrumentationEventEmitter(),
+    instrumentationEmitter,
     autoCommit: true,
     concurrency: 1,
     onCrash: jest.fn(),
   })
 
-  return { runner, consumerGroup }
+  return { runner, consumerGroup, instrumentationEmitter }
 }
 
 describe('Consumer > Runner > stale generation', () => {
@@ -79,7 +83,9 @@ describe('Consumer > Runner > stale generation', () => {
   ])(
     'discards offsets and rejoins when the fetch manager fails with %s',
     async (_name, code, expectedMemberId) => {
-      const { runner, consumerGroup } = createRunner({})
+      const { runner, consumerGroup, instrumentationEmitter } = createRunner({})
+      const rebalancing = jest.fn()
+      instrumentationEmitter.addListener(REBALANCING, rebalancing)
       // Stop the runner once it has rejoined, so the fetch-manager retry loop (which would
       // otherwise re-enter scheduleFetchManager on every settle, since fetchManager.start keeps
       // failing the same way) terminates after a single pass instead of spinning forever.
@@ -99,6 +105,9 @@ describe('Consumer > Runner > stale generation', () => {
 
       expect(consumerGroup.discardUncommittedOffsets).toHaveBeenCalled()
       expect(consumerGroup.joinAndSync).toHaveBeenCalled()
+      // A lost member rejoins, so the public REBALANCING event fires just like a revocation.
+      expect(rebalancing).toHaveBeenCalledTimes(1)
+      expect(rebalancing.mock.calls[0][0].payload).toEqual({ groupId: 'g', memberId: 'm' })
       // Offsets must be discarded before rejoining, not after.
       expect(consumerGroup.discardUncommittedOffsets.mock.invocationCallOrder[0]).toBeLessThan(
         consumerGroup.joinAndSync.mock.invocationCallOrder[0]
