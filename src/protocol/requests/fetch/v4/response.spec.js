@@ -1,5 +1,9 @@
 const { decode, parse } = require('./response')
-const { KafkaJSNotImplemented } = require('../../../../errors')
+const {
+  KafkaJSNotImplemented,
+  KafkaJSOffsetOutOfRange,
+  KafkaJSProtocolError,
+} = require('../../../../errors')
 
 describe('Protocol > Requests > Fetch > v4', () => {
   const batchContext = {
@@ -315,6 +319,42 @@ describe('Protocol > Requests > Fetch > v4', () => {
       await expect(
         decode(Buffer.from(require('../fixtures/v4_response_snappy.json')))
       ).rejects.toThrow(KafkaJSNotImplemented)
+    })
+  })
+
+  describe('parse', () => {
+    test('rejects with KafkaJSOffsetOutOfRange and carries topic/partition of the first failing partition', async () => {
+      const data = {
+        responses: [
+          {
+            topicName: 't',
+            partitions: [
+              { partition: 0, errorCode: 0 },
+              { partition: 3, errorCode: 1 },
+            ],
+          },
+        ],
+      }
+
+      await expect(parse(data)).rejects.toThrow(KafkaJSOffsetOutOfRange)
+      await expect(parse(data)).rejects.toMatchObject({ topic: 't', partition: 3 })
+    })
+
+    test('rejects with the protocol error produced by createErrorFromCode for any other failure code', async () => {
+      const data = {
+        responses: [{ topicName: 't', partitions: [{ partition: 0, errorCode: 3 }] }],
+      }
+
+      await expect(parse(data)).rejects.toThrow(KafkaJSProtocolError)
+      await expect(parse(data)).rejects.toMatchObject({ type: 'UNKNOWN_TOPIC_OR_PARTITION' })
+    })
+
+    test('resolves to the same data object when every partition succeeds', async () => {
+      const data = {
+        responses: [{ topicName: 't', partitions: [{ partition: 0, errorCode: 0 }] }],
+      }
+
+      await expect(parse(data)).resolves.toBe(data)
     })
   })
 })
