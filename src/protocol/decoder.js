@@ -1,4 +1,8 @@
-const { KafkaJSInvalidVarIntError, KafkaJSInvalidLongError } = require('../errors')
+const {
+  KafkaJSPartialMessageError,
+  KafkaJSInvalidVarIntError,
+  KafkaJSInvalidLongError,
+} = require('../errors')
 const Long = require('../utils/long')
 
 const INT8_SIZE = 1
@@ -28,7 +32,23 @@ module.exports = class Decoder {
     this.offset = 0
   }
 
+  /**
+   * A response frame can be truncated or corrupt. Reading past the end of the buffer crashes
+   * with Node's ERR_BUFFER_OUT_OF_BOUNDS (upstream #1374) instead of a typed, catchable error.
+   * @param {number} length bytes the caller is about to consume
+   * @param {string} reader name of the calling reader, for the message
+   */
+  ensureReadable(length, reader) {
+    if (length < 0 || !this.canReadBytes(length)) {
+      throw new KafkaJSPartialMessageError(
+        `Tried to read ${length} byte(s) with ${reader} at offset ${this.offset}, ` +
+          `but only ${Buffer.byteLength(this.buffer) - this.offset} byte(s) remain`
+      )
+    }
+  }
+
   readInt8() {
+    this.ensureReadable(INT8_SIZE, 'readInt8')
     const value = this.buffer.readInt8(this.offset)
     this.offset += INT8_SIZE
     return value
@@ -39,6 +59,7 @@ module.exports = class Decoder {
   }
 
   readInt16() {
+    this.ensureReadable(INT16_SIZE, 'readInt16')
     const value = this.buffer.readInt16BE(this.offset)
     this.offset += INT16_SIZE
     return value
@@ -49,6 +70,7 @@ module.exports = class Decoder {
   }
 
   readInt32() {
+    this.ensureReadable(INT32_SIZE, 'readInt32')
     const value = this.buffer.readInt32BE(this.offset)
     this.offset += INT32_SIZE
     return value
@@ -59,6 +81,7 @@ module.exports = class Decoder {
   }
 
   readInt64() {
+    this.ensureReadable(INT64_SIZE, 'readInt64')
     const first = this.buffer[this.offset]
     const last = this.buffer[this.offset + 7]
 
@@ -78,6 +101,7 @@ module.exports = class Decoder {
   }
 
   readDouble() {
+    this.ensureReadable(DOUBLE_SIZE, 'readDouble')
     const value = this.buffer.readDoubleBE(this.offset)
     this.offset += DOUBLE_SIZE
     return value
@@ -90,6 +114,7 @@ module.exports = class Decoder {
       return null
     }
 
+    this.ensureReadable(byteLength, 'readString')
     const stringBuffer = this.buffer.slice(this.offset, this.offset + byteLength)
     const value = stringBuffer.toString('utf8')
     this.offset += byteLength
@@ -103,6 +128,7 @@ module.exports = class Decoder {
       return null
     }
 
+    this.ensureReadable(byteLength, 'readVarIntString')
     const stringBuffer = this.buffer.slice(this.offset, this.offset + byteLength)
     const value = stringBuffer.toString('utf8')
     this.offset += byteLength
@@ -116,6 +142,7 @@ module.exports = class Decoder {
       return null
     }
 
+    this.ensureReadable(byteLength - 1, 'readUVarIntString')
     const stringBuffer = this.buffer.slice(this.offset, this.offset + byteLength - 1)
     const value = stringBuffer.toString('utf8')
 
@@ -132,6 +159,7 @@ module.exports = class Decoder {
       return null
     }
 
+    this.ensureReadable(byteLength, 'readBytes')
     const stringBuffer = this.buffer.slice(this.offset, this.offset + byteLength)
     this.offset += byteLength
     return stringBuffer
@@ -144,6 +172,7 @@ module.exports = class Decoder {
       return null
     }
 
+    this.ensureReadable(byteLength, 'readVarIntBytes')
     const stringBuffer = this.buffer.slice(this.offset, this.offset + byteLength)
     this.offset += byteLength
     return stringBuffer
@@ -156,6 +185,7 @@ module.exports = class Decoder {
       return null
     }
 
+    this.ensureReadable(byteLength - 1, 'readUVarIntBytes')
     const stringBuffer = this.buffer.slice(this.offset, this.offset + byteLength)
     this.offset += byteLength - 1
     return stringBuffer
@@ -178,6 +208,7 @@ module.exports = class Decoder {
       return []
     }
 
+    this.ensureReadable(length, 'readArray')
     const array = new Array(length)
     for (let i = 0; i < length; i++) {
       array[i] = reader(this)
@@ -193,6 +224,7 @@ module.exports = class Decoder {
       return []
     }
 
+    this.ensureReadable(length, 'readVarIntArray')
     const array = new Array(length)
     for (let i = 0; i < length; i++) {
       array[i] = reader(this)
@@ -210,6 +242,7 @@ module.exports = class Decoder {
       return null
     }
 
+    this.ensureReadable(length - 1, 'readUVarIntArray')
     const array = new Array(length - 1)
     for (let i = 0; i < length - 1; i++) {
       array[i] = reader(this)
@@ -225,6 +258,7 @@ module.exports = class Decoder {
       return []
     }
 
+    this.ensureReadable(length, 'readArrayAsync')
     const array = new Array(length)
     for (let i = 0; i < length; i++) {
       array[i] = await reader(this)
@@ -239,6 +273,7 @@ module.exports = class Decoder {
     let i = 0
 
     do {
+      this.ensureReadable(1, 'readVarInt')
       currentByte = this.buffer[this.offset++]
       result += (currentByte & OTHER_BITS) << i
       i += 7
@@ -253,12 +288,14 @@ module.exports = class Decoder {
     let currentByte
     let result = 0
     let i = 0
+    this.ensureReadable(1, 'readUVarInt')
     while (((currentByte = this.buffer[this.offset++]) & MOST_SIGNIFICANT_BIT) !== 0) {
       result |= (currentByte & OTHER_BITS) << i
       i += 7
       if (i > 28) {
         throw new KafkaJSInvalidVarIntError('Invalid VarInt, must contain 5 bytes or less')
       }
+      this.ensureReadable(1, 'readUVarInt')
     }
     result |= currentByte << i
     return result >>> 0
@@ -291,6 +328,7 @@ module.exports = class Decoder {
       if (i > 63) {
         throw new KafkaJSInvalidLongError('Invalid Long, must contain 9 bytes or less')
       }
+      this.ensureReadable(1, 'readVarLong')
       currentByte = this.buffer[this.offset++]
       result = result.add(Long.fromInt(currentByte & OTHER_BITS).shiftLeft(i))
       i += 7
