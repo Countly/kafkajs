@@ -159,49 +159,17 @@ describe('Broker > ListOffsets', () => {
     })
   })
 
-  describe('v0', () => {
-    // Quarantined: Kafka 4.0 removed ListOffsets v0 (KIP-896, broker minVersion is 1) and the client
-    // still picks min(ourMax, brokerMax) without honouring brokerMin, so this closes the connection.
-    test.skip('request', async () => {
+  describe('when the broker only offers versions below the client floor', () => {
+    it('fails with KafkaJSServerDoesNotSupportApiKey instead of sending a rejected version', async () => {
+      // Kafka 4.0 removed ListOffsets v0 (KIP-896); the client implements v1+ only.
       broker.versions[apiKeys.ListOffsets].minVersion = 0
       broker.versions[apiKeys.ListOffsets].maxVersion = 0
 
-      const produceData = [
-        {
-          topic: topicName,
-          partitions: [
-            {
-              partition: 0,
-              messages: [{ key: `key-0`, value: `some-value-0` }],
-            },
-          ],
-        },
-      ]
+      const topics = [{ topic: topicName, partitions: [{ partition: 0 }] }]
 
-      await broker.produce({ topicData: produceData })
-
-      const topics = [
-        {
-          topic: topicName,
-          partitions: [{ partition: 0 }],
-        },
-      ]
-
-      const response = await broker.listOffsets({ topics })
-      expect(response).toEqual({
-        responses: [
-          {
-            topic: topicName,
-            partitions: expect.arrayContaining([
-              {
-                errorCode: 0,
-                offset: expect.stringMatching(/\d+/),
-                partition: 0,
-              },
-            ]),
-          },
-        ],
-      })
+      await expect(broker.listOffsets({ topics })).rejects.toThrow(
+        /does not support any version of ListOffsets/
+      )
     })
   })
 })

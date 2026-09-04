@@ -67,5 +67,55 @@ describe('Protocol > Requests', () => {
         )
       })
     })
+
+    describe('when the broker minimum version is above every version the client implements', () => {
+      it('throws KafkaJSServerDoesNotSupportApiKey naming both ranges', () => {
+        const apiKey = apiKeys.Produce
+        const protocol = jest.fn(() => true)
+
+        // A future broker that dropped Produce v0-v8 (KIP-896 style floor raise)
+        const versions = { [apiKey]: { minVersion: 9, maxVersion: 13 } }
+        const definition = { versions: ['3', '4', '5', '6', '7'], protocol }
+
+        expect(() => lookup(versions)(apiKey, definition)).toThrow(
+          KafkaJSServerDoesNotSupportApiKey
+        )
+        expect(() => lookup(versions)(apiKey, definition)).toThrow(
+          /Produce.*client implements v3-v7.*broker supports v9-v13/
+        )
+        expect(protocol).not.toHaveBeenCalled()
+      })
+    })
+
+    describe('when the broker maximum version is below every version the client implements', () => {
+      it('throws KafkaJSServerDoesNotSupportApiKey instead of selecting an unimplemented version', () => {
+        const apiKey = apiKeys.Fetch
+        const protocol = jest.fn(() => true)
+
+        const versions = { [apiKey]: { minVersion: 0, maxVersion: 3 } }
+        const definition = { versions: ['4', '5', '6'], protocol }
+
+        expect(() => lookup(versions)(apiKey, definition)).toThrow(
+          KafkaJSServerDoesNotSupportApiKey
+        )
+        expect(protocol).not.toHaveBeenCalled()
+      })
+    })
+
+    describe('against the real Kafka 4.x version table', () => {
+      // Kafka 4.3 ranges, as recorded in docs/KafkaCompatibility.md (generated from the apache/kafka 4.3 message JSON)
+      const KAFKA_4_3 = {
+        [apiKeys.Produce]: { minVersion: 3, maxVersion: 13 },
+        [apiKeys.Fetch]: { minVersion: 4, maxVersion: 18 },
+        [apiKeys.ListOffsets]: { minVersion: 1, maxVersion: 11 },
+        [apiKeys.OffsetCommit]: { minVersion: 2, maxVersion: 10 },
+        [apiKeys.CreateTopics]: { minVersion: 2, maxVersion: 7 },
+      }
+
+      it.each(Object.keys(KAFKA_4_3).map(Number))('resolves api key %i', (apiKey) => {
+        const apiName = Object.keys(apiKeys).find((name) => apiKeys[name] === apiKey)
+        expect(() => lookup(KAFKA_4_3)(apiKey, requests[apiName])).not.toThrow()
+      })
+    })
   })
 })

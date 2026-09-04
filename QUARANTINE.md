@@ -7,7 +7,6 @@ under `src/` other than `*.spec.js` and `__snapshots__/*.snap` was changed to ma
 | Spec | Test | Reason | Class | Owner phase |
 |---|---|---|---|---|
 | `src/admin/__tests__/fetchTopicMetadata.spec.js` | Admin > fetchTopicMetadata &gt; creates a new topic if the topic does not exist and "allowAutoTopicCreation" is true | Phase 2 (R1): client-side auto topic creation is broken on KRaft — the broker answers UNKNOWN_TOPIC_OR_PARTITION while creating the topic and the client only retries LEADER_NOT_AVAILABLE. Upstream: tulios/kafkajs#1558, issue #1752 | (b) | Phase 2 |
-| `src/broker/__tests__/listOffsets.spec.js` | Broker > ListOffsets &gt; v0 &gt; request | Phase 2 (R2): version negotiation ignores the broker `minVersion`; Kafka 4.0 removed ListOffsets v0 (KIP-896), so pinning v0 closes the connection instead of returning UNSUPPORTED_VERSION | (b) | Phase 2 |
 | `src/consumer/__tests__/instrumentationEvents.spec.js` | Consumer > Instrumentation Events &gt; emits request timeout events | flaky: `requestTimeout: 1` races a sub-millisecond loopback round trip, so the timeout often never fires (`Number of calls: 0`); observed once in ~12 group runs | (c) | Phase 2 (rewrite: drive the timeout from a stubbed socket instead of a 1 ms budget) |
 | `src/broker/__tests__/listPartitionReassignments.spec.js` | Broker > alterPartitionReassignments &gt; request | flaky: the assertion requires the reassignment to still be *in flight* (`addingReplicas: [2], removingReplicas: [1]`), but the partition is empty and the controller completes the reassignment in milliseconds, so under load the list request arrives afterwards and `response.topics` is `[]` (`TypeError: Cannot read properties of undefined (reading 'partitions')`). Observed once in ~7 broker-group runs; 8/8 green when the spec runs alone, i.e. it fails exactly when the group is slow — which is the CI condition. Cannot be stabilised from test infra: replication throttles do not hold an empty partition. The v0 response decoder is still covered by `src/protocol/requests/listPartitionReassignments/v0/response.spec.js` | (c) | Phase 2 (rewrite: produce data into the partition and apply a follower replication throttle so the reassignment stays pending, or assert the completed shape instead) |
 | `src/consumer/__tests__/consumeMessages.spec.js` | Consumer > transactions &gt; respects offsets sent by a committed transaction ("consume-transform-produce" flow) | Phase 2 (R3): `eosManager.sendOffsets()` does not retry `CONCURRENT_TRANSACTIONS` on AddOffsetsToTxn (`src/producer/eosManager/index.js:385`), although `initProducerId` in the same file does (`:170`) and Kafka expects clients to retry that code. When un-skipping, restore `testIfKafkaAtLeast_0_11` in place of `test.skip` | (b) | Phase 2 |
@@ -38,10 +37,6 @@ under `src/` other than `*.spec.js` and `__snapshots__/*.snap` was changed to ma
   retries it around `initProducerId` and `addPartitionsToTxn` but not around `sendOffsets`.
   Observed twice in ~14 group runs. One line to fix.
 
-- **R2 — protocol version floors.** `src/protocol/requests/index.js` `lookup` picks
-  `min(ourMax, brokerMax)` and ignores the broker's `minVersion`. Kafka 4.0 removed pre-2.1 request
-  versions (KIP-896); the live cluster reports `ListOffsets(2): 1 to 11`.
-
 ## Not quarantined
 
 `--ci` runs also report skips that are **not** quarantine: the version-conditional helpers in
@@ -54,6 +49,6 @@ There is also one pre-existing upstream skip that this task did not add and does
 `src/consumer/__tests__/instrumentationEvents.spec.js` — `emits request queue size events`
 (commented "This test is too flaky, we need to think about a better way of testing this").
 
-Counting check: `grep -rn '\.skip(' --include='*.spec.js' src/` returns 6 — the 5 rows above plus
+Counting check: `grep -rn '\.skip(' --include='*.spec.js' src/` returns 5 — the 4 rows above plus
 that one pre-existing skip. (Match on `.skip(` with the paren: a comment in
 `consumeMessages.spec.js` mentions `test.skip` in prose and would otherwise be counted.)

@@ -88,11 +88,27 @@ const lookup = (versions) => (apiKey, definition) => {
   const version = versions[apiKey]
   const availableVersions = definition.versions.map(Number)
   const bestImplementedVersion = Math.max(...availableVersions)
+  const lowestImplementedVersion = Math.min(...availableVersions)
+  const apiName = findApiName(apiKey)
 
   if (!version || version.maxVersion == null) {
     throw new KafkaJSServerDoesNotSupportApiKey(
       `The Kafka server does not support the requested API version`,
-      { apiKey, apiName: findApiName(apiKey) }
+      { apiKey, apiName }
+    )
+  }
+
+  const brokerMinVersion = version.minVersion == null ? 0 : version.minVersion
+
+  // The client and broker version ranges must overlap. Kafka 4.0 raised the floor for most
+  // APIs (KIP-896/KIP-724) and future majors will raise it again; without this check we would
+  // send a version the broker rejects, or select a version we do not implement.
+  if (brokerMinVersion > bestImplementedVersion || version.maxVersion < lowestImplementedVersion) {
+    throw new KafkaJSServerDoesNotSupportApiKey(
+      `The Kafka server does not support any version of ${apiName} implemented by this client: ` +
+        `client implements v${lowestImplementedVersion}-v${bestImplementedVersion}, ` +
+        `broker supports v${brokerMinVersion}-v${version.maxVersion}`,
+      { apiKey, apiName }
     )
   }
 
