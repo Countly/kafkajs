@@ -20,16 +20,46 @@ const {
 // via spies that still delegate to the real implementation. The genuine failover case (the
 // coordinator moving to a different node) is covered separately by a manual broker-restart run.
 //
-// Two races have to be closed for the assertion to mean anything:
-//   - a heartbeat on the same Broker object between disconnect() and commitOffsets() would
-//     transparently reconnect the socket first (ConnectionPool#send does that regardless of
-//     Broker#isConnected()), making getCoordinator() short-circuit and never call
-//     findGroupCoordinator -- a false negative that would flake instead of failing outright.
-//   - anything that trips isRebalancing during that window makes ConsumerGroup rejoin, which also
+// Races closed for the assertion to mean anything, found by tracing runner.js/consumerGroup.js
+// and, for the last one, by instrumenting a live run (Connection.prototype.connect patched to log
+// a stack trace) because reasoning about the code alone missed it:
+//   - anything that trips isRebalancing during the window makes ConsumerGroup rejoin, which also
 //     calls cluster.findGroupCoordinator({ groupId }) -- a byte-identical call that would satisfy
-//     the spy assertion without the offset manager ever recovering -- a false positive.
-// Fixed by giving the consumer a heartbeat interval far longer than the test, pausing the fetch
-// loop before disconnecting, and asserting no rebalance happened in the window.
+//     the spy assertion without the offset manager ever recovering (false positive). Closed by
+//     recording REBALANCING events and asserting none fired.
+//   - a heartbeat firing between disconnect() and commitOffsets() would transparently reconnect
+//     the coordinator's socket first, making getCoordinator() short-circuit and never call
+//     findGroupCoordinator (false negative). ConsumerGroup's shared heartbeat is gated purely by
+//     wall-clock time (`now >= this.lastRequest + interval`, `lastRequest` set once at
+//     construction), not by pause() -- so a heartbeatInterval merely "longer than the test
+//     typically takes" is not enough: under load, wall-clock time can approach the test's own
+//     Jest timeout while the test still finishes within it. Closed by setting heartbeatInterval
+//     well above this test's own timeout, so the interval is structurally unreachable -- Jest
+//     would kill the test on its own budget long before it could elapse -- not merely improbable.
+//   - the one that actually flaked in CI, and is invisible from reading runner.js alone: once the
+//     sole partition is paused, ConsumerGroup#fetch's per-node requests array is empty, so it
+//     never calls cluster.findBroker/broker.fetch for data -- but it *unconditionally* calls
+//     cluster.refreshMetadataIfNecessary() first, on every ~100ms cycle, regardless of pause.
+//     BrokerPool's metadataMaxAge defaults to 0 (`this.metadataMaxAge = metadataMaxAge || 0`,
+//     src/cluster/brokerPool.js:33), so that refresh is not a once-per-test no-op: it happens on
+//     essentially every idle cycle, from all 3 per-node fetchers (FetchManager creates one per
+//     cluster.getNodeIds(), not per assigned partition). refreshMetadata() picks a broker via
+//     findConnectedBroker(), whose notion of "connected" is `CONNECTED_STATUS = [CONNECTED,
+//     DISCONNECTING]` (src/network/connectionStatus.js) -- so a broker mid-disconnect() still
+//     counts, because its Fetch-side pooled connection (index 1) is usually still draining an
+//     in-flight long-poll request via requestQueue.waitForPendingRequests(). If the *other*
+//     pooled connection (index 0, used for Metadata/Heartbeat/OffsetCommit/everything but Fetch)
+//     has already finished disconnecting by then, findConnectedBroker() can pick our own poisoned
+//     coordinator for the metadata refresh, and ConnectionPool#getConnection transparently
+//     reconnects that index-0 connection to serve it -- all while our own
+//     `await cachedCoordinator.disconnect()` is still awaiting the slower Fetch-side teardown.
+//     By the time our disconnect() call resolves, the coordinator is connected again, and the
+//     precondition below observes true instead of false. Closed by giving the *cluster* (not the
+//     consumer -- metadataMaxAge is a Cluster/BrokerPool option; a consumer-level metadataMaxAge
+//     only feeds an unrelated preferred-read-replica cache in consumerGroup.js and has no effect
+//     on this refresh path) a metadataMaxAge far longer than the test, so
+//     refreshMetadataIfNecessary() is a genuine no-op after the initial join and this path is
+//     never taken again.
 describe('Consumer > coordinator recovery', () => {
   let topicName, groupId, cluster, consumer, producer
 
@@ -37,7 +67,10 @@ describe('Consumer > coordinator recovery', () => {
     topicName = `test-topic-${secureRandom()}`
     groupId = `consumer-group-id-${secureRandom()}`
     await createTopic({ topic: topicName })
-    cluster = createCluster()
+    // metadataMaxAge is a Cluster/BrokerPool option, not a consumer one -- passing it to
+    // createConsumer() below has no effect on this cluster's own metadata cache (see the file
+    // header). It must be set here, on the Cluster the consumer is handed.
+    cluster = createCluster({ metadataMaxAge: 3600000 })
   })
 
   afterEach(async () => {
@@ -52,9 +85,10 @@ describe('Consumer > coordinator recovery', () => {
       logger: newLogger(),
       maxWaitTimeInMs: 100,
       autoCommit: false,
-      // No heartbeat should fire between disconnect() and commitOffsets() below.
-      sessionTimeout: 60000,
-      heartbeatInterval: 55000,
+      // Structurally unreachable within the test's own lifetime, not just "usually enough
+      // headroom" -- see the file header for why that distinction matters for both.
+      sessionTimeout: 130000,
+      heartbeatInterval: 120000,
     })
 
     const rebalances = []
