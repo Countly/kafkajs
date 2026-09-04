@@ -1140,6 +1140,10 @@ export class KafkaJSError extends Error {
   readonly retriable: boolean
   readonly helpUrl?: string
   readonly cause?: Error
+  /** Protocol error type, carried through when the wrapped error had one */
+  readonly type?: string
+  /** Protocol error code, carried through when the wrapped error had one */
+  readonly code?: number
 
   constructor(e: Error | string, metadata?: KafkaJSErrorMetadata)
 }
