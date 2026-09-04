@@ -79,4 +79,29 @@ describe('Protocol > Decoder', () => {
       await expect(decoder.readArrayAsync(async (d) => d.readInt8())).resolves.toEqual([])
     })
   })
+  describe('exact-fit reads do not throw', () => {
+    it.each([
+      ['readInt8', [0x01], 1],
+      ['readInt16', [0x00, 0x01], 1],
+      ['readInt32', [0x00, 0x00, 0x00, 0x01], 1],
+      ['readDouble', [0x3f, 0xf0, 0, 0, 0, 0, 0, 0], 1],
+    ])('%s consumes a buffer that holds exactly one value', (reader, bytes, expected) => {
+      const decoder = new Decoder(Buffer.from(bytes))
+      expect(decoder[reader]()).toEqual(expected)
+      expect(decoder.offset).toEqual(bytes.length)
+    })
+
+    it('readInt64 consumes exactly eight bytes', () => {
+      const decoder = new Decoder(Buffer.from([0, 0, 0, 0, 0, 0, 0, 0x2a]))
+      expect(decoder.readInt64().toString()).toEqual('42')
+      expect(decoder.offset).toEqual(8)
+    })
+
+    it('readString and readBytes consume a payload that ends the buffer', () => {
+      expect(new Decoder(Buffer.from([0x00, 0x02, 0x68, 0x69])).readString()).toEqual('hi')
+      expect(new Decoder(Buffer.from([0x00, 0x00, 0x00, 0x01, 0x07])).readBytes()).toEqual(
+        Buffer.from([0x07])
+      )
+    })
+  })
 })

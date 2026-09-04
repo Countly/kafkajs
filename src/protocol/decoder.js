@@ -42,7 +42,7 @@ module.exports = class Decoder {
     if (length < 0 || !this.canReadBytes(length)) {
       throw new KafkaJSPartialMessageError(
         `Tried to read ${length} byte(s) with ${reader} at offset ${this.offset}, ` +
-          `but only ${Buffer.byteLength(this.buffer) - this.offset} byte(s) remain`
+          `but only ${this.buffer.length - this.offset} byte(s) remain`
       )
     }
   }
@@ -151,7 +151,7 @@ module.exports = class Decoder {
   }
 
   canReadBytes(length) {
-    return Buffer.byteLength(this.buffer) - this.offset >= length
+    return this.buffer.length - this.offset >= length
   }
 
   readBytes(byteLength = this.readInt32()) {
