@@ -14,3 +14,13 @@ module.exports = ({ topics }) => ({
     return new Encoder().writeArray(topics)
   },
 })
+
+module.exports.schema = {
+  api: 'Metadata',
+  version: 0,
+  direction: 'request',
+  fields: [
+    { name: 'Topics', type: '[]MetadataRequestTopic', versions: '0+' },
+    { name: 'Topics.Name', type: 'string', versions: '0+' },
+  ],
+}

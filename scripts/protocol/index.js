@@ -43,6 +43,7 @@ const checkTable = (failures) => {
 const check = (options) => {
   const failures = []
   const reports = []
+  require('./schema').checkSchemas(failures, reports)
   checkTable(failures)
   return finish(failures, reports, options)
 }
