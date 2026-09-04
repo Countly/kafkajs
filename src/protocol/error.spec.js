@@ -33,3 +33,12 @@ describe('Protocol > error', () => {
     })
   })
 })
+
+describe('THROTTLING_QUOTA_EXCEEDED (89)', () => {
+  it('is a known, retriable protocol error', () => {
+    const error = createErrorFromCode(89)
+    expect(error.type).toEqual('THROTTLING_QUOTA_EXCEEDED')
+    expect(error.code).toEqual(89)
+    expect(error.retriable).toBe(true)
+  })
+})

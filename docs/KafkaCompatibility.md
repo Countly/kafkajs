@@ -83,9 +83,9 @@ Not per-API, and not derivable from the message definitions. Each row names the 
 
 ## Error table
 
-`src/protocol/error.js` defines 89 codes; Kafka 4.3.1 defines 134 (excluding `NONE`, which is the success sentinel). Retriable flags are hand-set here and are **not** checked: `RetriableException` inheritance is not visible in `Errors.java`, so this table says nothing about whether a retriable flag is right.
+`src/protocol/error.js` defines 90 codes; Kafka 4.3.1 defines 134 (excluding `NONE`, which is the success sentinel). Retriable flags are hand-set here and are **not** checked: `RetriableException` inheritance is not visible in `Errors.java`, so this table says nothing about whether a retriable flag is right.
 
-- Defined upstream, missing here: **45** (reported, not a failure).
+- Defined upstream, missing here: **44** (reported, not a failure).
 - Defined here, unknown to Kafka 4.3.1: **0** (a failure).
 - Type-name mismatches on a shared code: **0** (a failure), plus **5** accepted historical aliases.
 
@@ -93,7 +93,6 @@ Missing codes:
 
 | Code | Kafka type |
 |--:|---|
-| 89 | THROTTLING_QUOTA_EXCEEDED |
 | 90 | PRODUCER_FENCED |
 | 91 | RESOURCE_NOT_FOUND |
 | 92 | DUPLICATE_RESOURCE |

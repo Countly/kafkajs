@@ -136,10 +136,10 @@ describe('scripts/compat/errors', () => {
     })
 
     it('reports the codes Phase 4 still has to add', () => {
-      expect(result.counts).toEqual({ kafka: 134, fork: 89 })
-      expect(result.missingInFork).toHaveLength(45)
-      expect(result.missingInFork[0]).toEqual({ code: 89, type: 'THROTTLING_QUOTA_EXCEEDED' })
-      expect(result.missingInFork[44]).toEqual({ code: 133, type: 'SHARE_SESSION_LIMIT_REACHED' })
+      expect(result.counts).toEqual({ kafka: 134, fork: 90 })
+      expect(result.missingInFork).toHaveLength(44)
+      expect(result.missingInFork[0]).toEqual({ code: 90, type: 'PRODUCER_FENCED' })
+      expect(result.missingInFork[43]).toEqual({ code: 133, type: 'SHARE_SESSION_LIMIT_REACHED' })
     })
   })
 })

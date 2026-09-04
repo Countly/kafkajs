@@ -946,13 +946,9 @@
   "errors": {
     "counts": {
       "kafka": 134,
-      "fork": 89
+      "fork": 90
     },
     "missingInFork": [
-      {
-        "code": 89,
-        "type": "THROTTLING_QUOTA_EXCEEDED"
-      },
       {
         "code": 90,
         "type": "PRODUCER_FENCED"
