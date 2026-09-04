@@ -11,6 +11,8 @@ module.exports = ({
   idempotent,
   retrier,
   getConnectionStatus,
+  instrumentationEmitter,
+  INITIALIZED,
 }) => {
   const sendMessages = createSendMessages({
     logger,
@@ -36,13 +38,16 @@ module.exports = ({
   /**
    * A transient InitProducerId failure during connect() must not poison the producer for the
    * rest of the process lifetime: re-attempt it on the next send instead (Countly patch 2g).
-   * Wrapped in `sharedPromiseTo` so concurrent `send()`/`sendBatch()` calls share a single
-   * in-flight InitProducerId request instead of racing separate ones.
+   * Shared (via `sharedPromiseTo`) between connect() and send()/sendBatch(), so whichever one
+   * gets there first is the only one to issue an InitProducerId request; the others await the
+   * same in-flight promise instead of racing separate ones. Emits INITIALIZED once the request
+   * that actually initialized the producer succeeds, regardless of which caller triggered it.
    */
   const ensureInitialized = sharedPromiseTo(async () => {
     if (idempotent && !eosManager.isInitialized()) {
       logger.debug('Idempotent producer is not initialized, requesting a producer id')
       await eosManager.initProducerId()
+      instrumentationEmitter.emit(INITIALIZED)
     }
   })
 
@@ -144,5 +149,6 @@ module.exports = ({
   return {
     send,
     sendBatch,
+    ensureInitialized,
   }
 }

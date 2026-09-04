@@ -31,7 +31,7 @@ Versions before 3.0.0 are internal alpha tags and are not published.
 - `THROTTLING_QUOTA_EXCEEDED` (code 89) is now a known, retriable protocol error instead of decoding as `KAFKAJS_UNKNOWN_ERROR_CODE` (non-retriable), so a quota-throttled request retries instead of failing outright. Adopts upstream PR #1695.
 
 #### Additions
-- New producer instrumentation event `INITIALIZED` (`producer.events.INITIALIZED`), emitted after the producer is connected and, for idempotent producers, has a producer id — i.e. once it's safe to `send()`. `CONNECT` keeps firing exactly where it always has.
+- New producer instrumentation event `INITIALIZED` (`producer.events.INITIALIZED`), emitted for idempotent producers once a producer id has been obtained — i.e. once it's safe to `send()` — whether that happens during `connect()` or via the lazy re-init path above; not emitted for non-idempotent producers. `CONNECT` keeps firing exactly where it always has.
 
 #### Tooling
 - ESLint 9 flat config and Prettier 3 replace ESLint 6 / Prettier 1 (`eslint-config-standard` rules ported explicitly).

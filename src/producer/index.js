@@ -65,7 +65,7 @@ module.exports = ({
     transactionalId,
   })
 
-  const { send, sendBatch } = createMessageProducer({
+  const { send, sendBatch, ensureInitialized } = createMessageProducer({
     logger,
     cluster,
     partitioner,
@@ -73,6 +73,8 @@ module.exports = ({
     idempotent,
     retrier,
     getConnectionStatus: () => connectionStatus,
+    instrumentationEmitter,
+    INITIALIZED,
   })
 
   let transactionalEosManager
@@ -147,6 +149,8 @@ module.exports = ({
       eosManager: transactionalEosManager,
       idempotent: true,
       getConnectionStatus: () => connectionStatus,
+      instrumentationEmitter,
+      INITIALIZED,
     })
 
     const isActive = () => transactionalEosManager.isInTransaction() && !transactionDidEnd
@@ -224,11 +228,11 @@ module.exports = ({
       // listeners depend on that ordering. INITIALIZED is the new "safe to send()" signal.
       instrumentationEmitter.emit(CONNECT)
 
-      if (idempotent && !idempotentEosManager.isInitialized()) {
-        await idempotentEosManager.initProducerId()
-      }
-
-      instrumentationEmitter.emit(INITIALIZED)
+      // Shares the same deduped ensureInitialized() as send()/sendBatch(), so an un-awaited
+      // connect() racing a concurrent send() issues exactly one InitProducerId request instead
+      // of two (which would otherwise allocate two producer ids and reset sequences underneath
+      // in-flight sends).
+      await ensureInitialized()
     },
     /**
      * @return {Promise}

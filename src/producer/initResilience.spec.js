@@ -57,6 +57,9 @@ describe('Producer > idempotent init resilience', () => {
     cluster.findControllerBroker.mockImplementation(async () => broker)
     cluster.findBroker.mockImplementation(async () => broker)
 
+    const instrumentationEmitter = new InstrumentationEventEmitter()
+    const initializedEvents = []
+
     const producer = createProducer({
       cluster,
       logger: newLogger(),
@@ -65,11 +68,14 @@ describe('Producer > idempotent init resilience', () => {
       // retries" guard in src/producer/index.js; this only governs send()'s own retrier, not
       // eosManager's InitProducerId retries (those come from cluster.retry above).
       retry: { retries: 1 },
-      instrumentationEmitter: new InstrumentationEventEmitter(),
+      instrumentationEmitter,
     })
+    producer.on(producer.events.INITIALIZED, () => initializedEvents.push('initialized'))
 
     await expect(producer.connect()).rejects.toThrow()
     expect(initAttempts).toBe(1)
+    // The failed connect() must not have announced readiness.
+    expect(initializedEvents).toEqual([])
 
     // The producer must not stay poisoned: the next send re-initializes and succeeds.
     await expect(
@@ -77,7 +83,12 @@ describe('Producer > idempotent init resilience', () => {
     ).resolves.toBeDefined()
 
     expect(initAttempts).toBe(2)
-    expect(produce).toHaveBeenCalled()
+    // The lazy re-init on send() is the readiness signal here — INITIALIZED must fire exactly
+    // once, from the recovery path, since connect() never got there.
+    expect(initializedEvents).toEqual(['initialized'])
+    // The recovered send must genuinely carry the producer id InitProducerId just handed back,
+    // not merely prove initProducerId was called again.
+    expect(produce).toHaveBeenCalledWith(expect.objectContaining({ producerId: '1' }))
     expect(cluster.addMultipleTargetTopics).toHaveBeenCalledWith(['t'])
   })
 
@@ -129,5 +140,128 @@ describe('Producer > idempotent init resilience', () => {
     await expect(producer.connect()).rejects.toThrow()
     await new Promise((resolve) => setImmediate(resolve))
     expect(seen).toEqual([])
+  })
+
+  it('does not emit INITIALIZED for a non-idempotent producer', async () => {
+    const cluster = createFakeCluster()
+    const instrumentationEmitter = new InstrumentationEventEmitter()
+    const seen = []
+
+    const producer = createProducer({
+      cluster,
+      logger: newLogger(),
+      instrumentationEmitter,
+    })
+    producer.on(producer.events.CONNECT, () => seen.push('connect'))
+    producer.on(producer.events.INITIALIZED, () => seen.push('initialized'))
+
+    await producer.connect()
+    await new Promise((resolve) => setImmediate(resolve))
+
+    // Nothing to initialize for a non-idempotent producer, so INITIALIZED never fires; CONNECT
+    // alone means "ready to send()" for this producer.
+    expect(seen).toEqual(['connect'])
+    expect(cluster.findControllerBroker).not.toHaveBeenCalled()
+  })
+
+  // F1: connect() and send()/sendBatch() must share the same deduped InitProducerId call so an
+  // un-awaited connect() racing a concurrent send() cannot issue two InitProducerId requests
+  // (which would allocate two producer ids and reset sequences out from under an in-flight send).
+  it('shares a single InitProducerId request between an un-awaited connect() and a concurrent send()', async () => {
+    const cluster = createFakeCluster()
+    let initAttempts = 0
+    let resolveInit
+    const produce = jest.fn(async () => ({ topics: [] }))
+
+    const broker = {
+      nodeId: 0,
+      initProducerId: () =>
+        new Promise((resolve) => {
+          initAttempts += 1
+          resolveInit = () => resolve({ producerId: '1', producerEpoch: 0 })
+        }),
+      produce,
+    }
+    cluster.findControllerBroker.mockImplementation(async () => broker)
+    cluster.findBroker.mockImplementation(async () => broker)
+
+    const producer = createProducer({
+      cluster,
+      logger: newLogger(),
+      idempotent: true,
+      retry: { retries: 1 },
+      instrumentationEmitter: new InstrumentationEventEmitter(),
+    })
+
+    const connectPromise = producer.connect()
+    // Let connect() run up to (and including) the InitProducerId call before send() starts.
+    await new Promise((resolve) => setImmediate(resolve))
+    expect(initAttempts).toBe(1)
+
+    const sendPromise = producer.send({ topic: 't', messages: [{ key: 'k', value: 'v' }] })
+
+    // send() must not have started a second InitProducerId request while one is already in flight.
+    expect(initAttempts).toBe(1)
+    resolveInit()
+
+    await expect(connectPromise).resolves.toBeUndefined()
+    await expect(sendPromise).resolves.toBeDefined()
+    expect(initAttempts).toBe(1)
+  })
+
+  // F4: the same dedup must hold between two concurrent send()/sendBatch() calls recovering from
+  // a poisoned producer, not just between connect() and send().
+  it('shares a single lazy InitProducerId request between two concurrent send() calls', async () => {
+    const cluster = createFakeCluster()
+    let initAttempts = 0
+    let resolveSecondInit
+    const produce = jest.fn(async () => ({ topics: [] }))
+
+    const broker = {
+      nodeId: 0,
+      initProducerId: () => {
+        initAttempts += 1
+        if (initAttempts === 1) {
+          return Promise.reject(
+            Object.assign(new Error('transient'), {
+              type: 'GROUP_LOAD_IN_PROGRESS',
+              code: 14,
+              retriable: true,
+            })
+          )
+        }
+        return new Promise((resolve) => {
+          resolveSecondInit = () => resolve({ producerId: '1', producerEpoch: 0 })
+        })
+      },
+      produce,
+    }
+    cluster.findControllerBroker.mockImplementation(async () => broker)
+    cluster.findBroker.mockImplementation(async () => broker)
+
+    const producer = createProducer({
+      cluster,
+      logger: newLogger(),
+      idempotent: true,
+      retry: { retries: 1 },
+      instrumentationEmitter: new InstrumentationEventEmitter(),
+    })
+
+    await expect(producer.connect()).rejects.toThrow()
+    expect(initAttempts).toBe(1)
+
+    const firstSend = producer.send({ topic: 't', messages: [{ key: 'k', value: 'v' }] })
+    await new Promise((resolve) => setImmediate(resolve))
+    expect(initAttempts).toBe(2)
+
+    const secondSend = producer.send({ topic: 't', messages: [{ key: 'k2', value: 'v2' }] })
+    // The second send() must share the first send()'s in-flight InitProducerId request instead
+    // of starting its own third one.
+    expect(initAttempts).toBe(2)
+
+    resolveSecondInit()
+    await expect(firstSend).resolves.toBeDefined()
+    await expect(secondSend).resolves.toBeDefined()
+    expect(initAttempts).toBe(2)
   })
 })
