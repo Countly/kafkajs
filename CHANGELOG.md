@@ -35,6 +35,7 @@ Versions before 3.0.0 are internal alpha tags and are not published.
 
 #### Performance
 - `arrayDiff` now builds a `Set` from the second array once and does an O(1) membership check per element, instead of an `indexOf` scan of the second array for every element of the first (O(n·m)). It's on the hot path for `ConsumerGroup#checkForStaleAssignment`, `BrokerPool#refreshMetadata`, and rebalancing, so this matters most on high-partition-count topics. Behavior is unchanged except for `NaN` (`Set#has` uses SameValueZero, `indexOf` uses strict equality), which never appears in a topic name, partition id, or broker id. Adopts upstream PR #1738.
+- `groupMessagesPerPartition` now pushes each message onto its partition's array in place instead of spreading the whole array into a new one per message (`reduce` + `[...current, message]`, O(n²) for n messages landing on the same partition). Grouping, order and the plain-object return shape are unchanged. A throwaway benchmark (messages into a single partition) measured roughly 480× faster at n=32 000 (590ms → 1.2ms; 2 000: 4.0ms → 0.2ms, 8 000: 27.8ms → 0.2ms). Adopts upstream PR #1576.
 
 #### Tooling
 - ESLint 9 flat config and Prettier 3 replace ESLint 6 / Prettier 1 (`eslint-config-standard` rules ported explicitly).

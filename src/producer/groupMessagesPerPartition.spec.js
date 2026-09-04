@@ -41,3 +41,81 @@ describe('Producer > groupMessagesPerPartition', () => {
     ).toEqual({})
   })
 })
+
+describe('grouping semantics', () => {
+  const partitionMetadata = [{ partitionId: 0 }, { partitionId: 1 }, { partitionId: 2 }]
+
+  it('preserves message order within each partition', () => {
+    const messages = Array.from({ length: 300 }, (_, i) => ({ value: `v-${i}` }))
+    const partitioner = ({ message }) => Number(message.value.split('-')[1]) % 3
+
+    const grouped = groupMessagesPerPartition({
+      topic: 't',
+      partitionMetadata,
+      messages,
+      partitioner,
+    })
+
+    expect(Object.keys(grouped).sort()).toEqual(['0', '1', '2'])
+    for (const partition of [0, 1, 2]) {
+      expect(grouped[partition]).toHaveLength(100)
+      const indices = grouped[partition].map((m) => Number(m.value.split('-')[1]))
+      expect(indices).toEqual([...indices].sort((a, b) => a - b))
+    }
+  })
+
+  it('puts every message in exactly one partition', () => {
+    const messages = Array.from({ length: 1000 }, (_, i) => ({ value: `v-${i}` }))
+    const partitioner = () => 1
+
+    const grouped = groupMessagesPerPartition({
+      topic: 't',
+      partitionMetadata,
+      messages,
+      partitioner,
+    })
+
+    expect(Object.keys(grouped)).toEqual(['1'])
+    expect(grouped[1]).toHaveLength(1000)
+    expect(grouped[1][0]).toBe(messages[0])
+    expect(grouped[1][999]).toBe(messages[999])
+  })
+
+  it('returns a plain object, not a Map (createTopicData consumes it as such)', () => {
+    const grouped = groupMessagesPerPartition({
+      topic: 't',
+      partitionMetadata,
+      messages: [{ value: 'a' }],
+      partitioner: () => 0,
+    })
+    expect(grouped.constructor).toBe(Object)
+  })
+
+  it('returns {} when there is no partition metadata', () => {
+    expect(
+      groupMessagesPerPartition({
+        topic: 't',
+        partitionMetadata: [],
+        messages: [{ value: 'a' }],
+        partitioner: () => 0,
+      })
+    ).toEqual({})
+  })
+
+  it('invokes the partitioner exactly once per message with the expected argument shape', () => {
+    const messages = [{ value: 'a' }, { value: 'b' }, { value: 'c' }]
+    const partitioner = jest.fn(() => 0)
+
+    groupMessagesPerPartition({
+      topic: 't',
+      partitionMetadata,
+      messages,
+      partitioner,
+    })
+
+    expect(partitioner).toHaveBeenCalledTimes(messages.length)
+    messages.forEach((message, i) => {
+      expect(partitioner).toHaveBeenNthCalledWith(i + 1, { topic: 't', partitionMetadata, message })
+    })
+  })
+})
