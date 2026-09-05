@@ -1,4 +1,5 @@
 const Broker = require('../broker')
+const MetadataCache = require('./metadataCache')
 const createRetry = require('../retry')
 const shuffle = require('../utils/shuffle')
 const arrayDiff = require('../utils/arrayDiff')
@@ -15,6 +16,11 @@ module.exports = class BrokerPool {
    * @param {object} options
    * @param {import("./connectionPoolBuilder").ConnectionPoolBuilder} options.connectionPoolBuilder
    * @param {import("../../types").Logger} options.logger
+   * @param {import("./metadataCache")} [options.metadataCache] defaulted rather than required:
+   *   `BrokerPool` is also constructed directly by its own integration spec, and a pool without a
+   *   `Cluster` around it still needs somewhere to put topic ids and leader epochs. `Cluster`
+   *   always injects its own, which is the instance every route reads.
+   * @param {import("../instrumentation/emitter")|null} [options.instrumentationEmitter]
    * @param {import("../../types").RetryOptions} [options.retry]
    * @param {boolean} [options.allowAutoTopicCreation]
    * @param {number} [options.authenticationTimeout]
@@ -23,6 +29,8 @@ module.exports = class BrokerPool {
   constructor({
     connectionPoolBuilder,
     logger,
+    metadataCache,
+    instrumentationEmitter,
     retry,
     allowAutoTopicCreation,
     authenticationTimeout,
@@ -34,6 +42,8 @@ module.exports = class BrokerPool {
     this.logger = logger.namespace('BrokerPool')
     this.retrier = createRetry(assign({}, retry))
     this.authenticationTimeout = authenticationTimeout ?? 10000
+    this.metadataCache = metadataCache ?? new MetadataCache({ logger })
+    this.instrumentationEmitter = instrumentationEmitter ?? null
 
     // Broker address -> blackout entry, shared by every ConnectionPool this BrokerPool builds
     // (see buildConnectionPool), so a pool rebuilt after a connection error (seed rotation,
@@ -178,6 +188,10 @@ module.exports = class BrokerPool {
    * controller, so a bare retry is enough once the topic lands. Any other error bails out
    * immediately.
    *
+   * Feeds the fresh response to `metadataCache.update()` synchronously, right after the
+   * `this.metadata` assignment, so every route reading cached leader/epoch data sees a
+   * consistent view before anything else in this method runs.
+   *
    * @public
    * @param {Array<String>} topics
    * @returns {Promise<null>}
@@ -189,6 +203,9 @@ module.exports = class BrokerPool {
     return this.retrier(async (bail, retryCount, retryTime) => {
       try {
         this.metadata = await broker.metadata(topics)
+        // Applied here, on the statement after the assignment and before any await, so no reader
+        // can observe the fresh response with the monotonic leader guard not yet applied.
+        this.metadataCache.update(this.metadata)
         this.metadataExpireAt = Date.now() + this.metadataMaxAge
 
         const replacedBrokers = []

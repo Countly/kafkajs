@@ -1,5 +1,6 @@
 const swapObject = require('../utils/swapObject')
 const networkEvents = require('../network/instrumentationEvents')
+const clusterEvents = require('../cluster/instrumentationEvents')
 const InstrumentationEventType = require('../instrumentation/eventType')
 const adminType = InstrumentationEventType('admin')
 
@@ -10,6 +11,7 @@ const events = {
   REQUEST_TIMEOUT: adminType(networkEvents.NETWORK_REQUEST_TIMEOUT),
   REQUEST_QUEUE_SIZE: adminType(networkEvents.NETWORK_REQUEST_QUEUE_SIZE),
   AUTHENTICATION_FAILURE: adminType(networkEvents.NETWORK_AUTHENTICATION_FAILURE),
+  TOPIC_RECREATED: adminType(clusterEvents.CLUSTER_TOPIC_RECREATED),
 }
 
 const wrappedEvents = {
@@ -17,6 +19,7 @@ const wrappedEvents = {
   [events.REQUEST_TIMEOUT]: networkEvents.NETWORK_REQUEST_TIMEOUT,
   [events.REQUEST_QUEUE_SIZE]: networkEvents.NETWORK_REQUEST_QUEUE_SIZE,
   [events.AUTHENTICATION_FAILURE]: networkEvents.NETWORK_AUTHENTICATION_FAILURE,
+  [events.TOPIC_RECREATED]: clusterEvents.CLUSTER_TOPIC_RECREATED,
 }
 
 const reversedWrappedEvents = swapObject(wrappedEvents)

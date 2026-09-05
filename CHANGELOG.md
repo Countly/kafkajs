@@ -99,10 +99,12 @@ Upstream work this phase builds on, with thanks to its authors: PRs #1779, #1695
 #### Behavior changes
 
 - Metadata requests are now sent at **v13** instead of v12. The only wire change is a top-level error code in the response, which the client now surfaces ahead of any topic- or partition-level error — this is how a broker tells a client its metadata is stale and it should rebootstrap (`REBOOTSTRAP_REQUIRED`, code 129). The decoded metadata gains an additive `errorCode` field; every existing key is unchanged.
+
 #### Fixes
 
 #### Additions
 - Internal metadata cache: the client now keeps each topic's id and each partition's leader epoch from the Metadata response, with a monotonic guard so a stale refresh cannot move a partition's leader backwards. Nothing user-visible changes yet; the cache is what the leader-hint, rebootstrap and topic-recreation behaviour described under Behavior changes is built on.
+- New instrumentation event `TOPIC_RECREATED` on the consumer, producer and admin clients (`consumer.events.TOPIC_RECREATED`, delivered as `consumer.cluster.topic_recreated`, and the producer/admin equivalents). It fires when a metadata refresh sees a topic name it already knew come back with a different topic id — that is, the topic was deleted and recreated. Payload: `{ topic, previousTopicId, topicId }`.
 
 #### Tooling
 

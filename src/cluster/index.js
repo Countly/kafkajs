@@ -1,4 +1,6 @@
 const BrokerPool = require('./brokerPool')
+const MetadataCache = require('./metadataCache')
+const { CLUSTER_TOPIC_RECREATED } = require('./instrumentationEvents')
 const Lock = require('../utils/lock')
 const sharedPromiseTo = require('../utils/sharedPromiseTo')
 const createRetry = require('../retry')
@@ -47,7 +49,10 @@ module.exports = class Cluster {
    * @param {import("../../types").Logger} options.logger
    * @param {import("../../types").ISocketFactory} options.socketFactory
    * @param {Map} [options.offsets]
-   * @param {import("../instrumentation/emitter")} [options.instrumentationEmitter=null]
+   * @param {import("../instrumentation/emitter")} [options.instrumentationEmitter=null] stored on
+   *   the instance (`this.instrumentationEmitter`) and shared with the `MetadataCache` and the
+   *   `BrokerPool`, so a topic recreation seen by either surfaces on the same emitter the client
+   *   already wraps for its public `on()`.
    */
   constructor({
     logger: rootLogger,
@@ -97,9 +102,13 @@ module.exports = class Cluster {
     // UNKNOWN_TOPIC_OR_PARTITION response is a still-propagating auto-created topic worth
     // retrying, rather than a real "no such topic".
     this.allowAutoTopicCreation = allowAutoTopicCreation
+    this.instrumentationEmitter = instrumentationEmitter
+    this.metadataCache = new MetadataCache({ logger: rootLogger, instrumentationEmitter })
     this.brokerPool = new BrokerPool({
       connectionPoolBuilder: this.connectionPoolBuilder,
       logger: this.rootLogger,
+      metadataCache: this.metadataCache,
+      instrumentationEmitter,
       retry,
       allowAutoTopicCreation,
       authenticationTimeout,
@@ -305,6 +314,36 @@ module.exports = class Cluster {
 
     const topicMetadata = metadata.topicMetadata.find((t) => t.topic === topic)
     return topicMetadata ? topicMetadata.partitionMetadata : []
+  }
+
+  /**
+   * The current id of a topic, as of the last Metadata response that mentioned it.
+   *
+   * Internal: this is the seam the consumer's topic-recreation reset uses to tell one
+   * incarnation of a topic from another. It is not part of the public Cluster surface.
+   *
+   * @param {string} topic
+   * @returns {string|undefined} the topic id, or undefined when the cache has not seen it
+   */
+  topicId(topic) {
+    return this.metadataCache.topicId(topic)
+  }
+
+  /**
+   * Subscribes to the cluster-level "a known topic name came back with a different id" event.
+   *
+   * Internal: the consumer uses it to schedule a one-shot offset reset. Applications observe the
+   * same event through `consumer.events.TOPIC_RECREATED` and its producer/admin equivalents.
+   *
+   * @param {(event: import('../instrumentation/event')) => void} handler
+   * @returns {() => void} removes the listener
+   */
+  onTopicRecreated(handler) {
+    if (!this.instrumentationEmitter) {
+      return () => {}
+    }
+
+    return this.instrumentationEmitter.addListener(CLUSTER_TOPIC_RECREATED, handler)
   }
 
   /**

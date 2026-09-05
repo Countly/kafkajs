@@ -394,6 +394,7 @@ export type AdminEvents = {
   REQUEST_TIMEOUT: 'admin.network.request_timeout'
   REQUEST_QUEUE_SIZE: 'admin.network.request_queue_size'
   AUTHENTICATION_FAILURE: 'admin.network.authentication_failure'
+  TOPIC_RECREATED: 'admin.cluster.topic_recreated'
 }
 
 export interface InstrumentationEvent<T> {
@@ -446,6 +447,11 @@ export type LockTimeoutEvent = InstrumentationEvent<{
   description: string
   waiting: number
   timeout: number
+}>
+export type TopicRecreatedEvent = InstrumentationEvent<{
+  topic: string
+  previousTopicId: string
+  topicId: string
 }>
 
 export type SeekEntry = PartitionOffset
@@ -601,6 +607,10 @@ export type Admin = {
   on(
     eventName: AdminEvents['AUTHENTICATION_FAILURE'],
     listener: (event: AuthenticationFailureEvent) => void
+  ): RemoveInstrumentationEventListener<typeof eventName>
+  on(
+    eventName: AdminEvents['TOPIC_RECREATED'],
+    listener: (event: TopicRecreatedEvent) => void
   ): RemoveInstrumentationEventListener<typeof eventName>
   on(
     eventName: ValueOf<AdminEvents>,
@@ -818,6 +828,7 @@ export type ProducerEvents = {
   REQUEST_QUEUE_SIZE: 'producer.network.request_queue_size'
   AUTHENTICATION_FAILURE: 'producer.network.authentication_failure'
   LOCK_TIMEOUT: 'producer.network.lock_timeout'
+  TOPIC_RECREATED: 'producer.cluster.topic_recreated'
 }
 
 export type Producer = Sender & {
@@ -856,6 +867,10 @@ export type Producer = Sender & {
   on(
     eventName: ProducerEvents['LOCK_TIMEOUT'],
     listener: (event: LockTimeoutEvent) => void
+  ): RemoveInstrumentationEventListener<typeof eventName>
+  on(
+    eventName: ProducerEvents['TOPIC_RECREATED'],
+    listener: (event: TopicRecreatedEvent) => void
   ): RemoveInstrumentationEventListener<typeof eventName>
   on(
     eventName: ValueOf<ProducerEvents>,
@@ -962,6 +977,7 @@ export type ConsumerEvents = {
   REQUEST_TIMEOUT: 'consumer.network.request_timeout'
   REQUEST_QUEUE_SIZE: 'consumer.network.request_queue_size'
   AUTHENTICATION_FAILURE: 'consumer.network.authentication_failure'
+  TOPIC_RECREATED: 'consumer.cluster.topic_recreated'
 }
 export type ConsumerHeartbeatEvent = InstrumentationEvent<{
   groupId: string
@@ -1158,6 +1174,10 @@ export type Consumer = {
   on(
     eventName: ConsumerEvents['AUTHENTICATION_FAILURE'],
     listener: (event: AuthenticationFailureEvent) => void
+  ): RemoveInstrumentationEventListener<typeof eventName>
+  on(
+    eventName: ConsumerEvents['TOPIC_RECREATED'],
+    listener: (event: TopicRecreatedEvent) => void
   ): RemoveInstrumentationEventListener<typeof eventName>
   on(
     eventName: ValueOf<ConsumerEvents>,
