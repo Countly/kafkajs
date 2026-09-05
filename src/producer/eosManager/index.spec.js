@@ -52,6 +52,33 @@ describe('Producer > eosManager', () => {
     expect(eosManager.isInitialized()).toEqual(true)
   })
 
+  test.each([
+    ['PRODUCER_FENCED', 90],
+    ['TRANSACTION_ABORTABLE', 120],
+  ])(
+    '%s from initProducerId reaches the caller unchanged, with no retry loop',
+    async (type, code) => {
+      const eosManager = createEosManager({
+        logger: newLogger(),
+        cluster,
+        transactionTimeout: 30000,
+      })
+
+      broker.initProducerId.mockImplementation(() => {
+        throw createErrorFromCode(code)
+      })
+
+      await expect(eosManager.initProducerId()).rejects.toMatchObject({
+        name: 'KafkaJSProtocolError',
+        type,
+        code,
+        retriable: false,
+      })
+
+      expect(broker.initProducerId).toHaveBeenCalledTimes(1)
+    }
+  )
+
   test('getting & updating the sequence per topic-partition', async () => {
     const eosManager = createEosManager({ logger: newLogger(), cluster })
 
