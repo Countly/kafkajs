@@ -25,9 +25,11 @@
         6,
         7,
         8,
-        9
+        9,
+        10,
+        11
       ],
-      "gap": "behind:4",
+      "gap": "behind:2",
       "onFloor": false,
       "belowFloor": [],
       "notes": "v8 per-record errors (KIP-467), v9 flexible, v10 leader hints (KIP-951), v11 TRANSACTION_ABORTABLE (KIP-890), v12 transaction-version-2 implicit add-partitions (KIP-890 part 2), v13 topic IDs (KIP-516, Kafka 4.1; may return UNKNOWN_TOPIC_ID)."
@@ -134,9 +136,12 @@
         2,
         3,
         4,
-        5
+        5,
+        6,
+        7,
+        8
       ],
-      "gap": "behind:5",
+      "gap": "behind:2",
       "onFloor": false,
       "belowFloor": [],
       "notes": "v6 committed leader epoch (KIP-320), v7 group instance id, v8 flexible, v9 member epoch (KIP-848), v10 topic IDs."
@@ -463,9 +468,13 @@
       "latestVersionUnstable": true,
       "forkVersions": [
         0,
-        1
+        1,
+        2,
+        3,
+        4,
+        5
       ],
-      "gap": "behind:5",
+      "gap": "behind:1",
       "onFloor": false,
       "belowFloor": [],
       "notes": "v2+ is flexible, so even v3 needs the flexible-protocol work first. v3 producer-id/epoch re-init (KIP-360), v4 PRODUCER_FENCED, v5 TRANSACTION_ABORTABLE, v6 two-phase commit (KIP-939) and latestVersionUnstable, so brokers advertise 0-5 by default."

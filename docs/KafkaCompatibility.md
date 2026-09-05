@@ -8,11 +8,11 @@ Gap classes: `current` (fork max equals the Kafka max) · `behind:N` · `stub` (
 
 | API | Key | Kafka 4.3.1 | Flexible from | Fork | Gap | Notes |
 |---|--:|---|---|---|---|---|
-| Produce | 0 | 3-13 | v9+ | 3-9 | behind:4 | v8 per-record errors (KIP-467), v9 flexible, v10 leader hints (KIP-951), v11 TRANSACTION_ABORTABLE (KIP-890), v12 transaction-version-2 implicit add-partitions (KIP-890 part 2), v13 topic IDs (KIP-516, Kafka 4.1; may return UNKNOWN_TOPIC_ID). |
+| Produce | 0 | 3-13 | v9+ | 3-11 | behind:2 | v8 per-record errors (KIP-467), v9 flexible, v10 leader hints (KIP-951), v11 TRANSACTION_ABORTABLE (KIP-890), v12 transaction-version-2 implicit add-partitions (KIP-890 part 2), v13 topic IDs (KIP-516, Kafka 4.1; may return UNKNOWN_TOPIC_ID). |
 | Fetch | 1 | 4-18 | v12+ | 4-11 | behind:7 | v11 rack / preferred read replica (KIP-392): the wire fields exist but the follower out-of-range and OFFSET_NOT_AVAILABLE handling does not. v12 flexible + LastFetchedEpoch, v13 topic IDs replace names (KIP-516), v14 OFFSET_MOVED_TO_TIERED_STORAGE (KIP-405), v15 ReplicaState (KIP-903), v16 leader hints (KIP-951), v17 ReplicaDirectoryId (KIP-853), v18 HighWatermark (KIP-1166). |
 | ListOffsets | 2 | 1-11 | v6+ | 1-3 | behind:8 | v4 leader epoch (KIP-320), v6 flexible, v7 max-timestamp, v8 earliest-local offset (KIP-405). |
 | Metadata | 3 | 0-13 | v9+ | 0-13 | current | v7 leader epoch (KIP-320), v9 flexible, v10+ topic IDs, v13 adds a top-level error code and is where REBOOTSTRAP_REQUIRED surfaces (KIP-1102). |
-| OffsetCommit | 8 | 2-10 | v8+ | 2-5 | behind:5 | v6 committed leader epoch (KIP-320), v7 group instance id, v8 flexible, v9 member epoch (KIP-848), v10 topic IDs. |
+| OffsetCommit | 8 | 2-10 | v8+ | 2-8 | behind:2 | v6 committed leader epoch (KIP-320), v7 group instance id, v8 flexible, v9 member epoch (KIP-848), v10 topic IDs. |
 | OffsetFetch | 9 | 1-10 | v6+ | 1-4 | behind:6 | v5 leader epoch, v6 flexible, v7 require-stable (KIP-447), v8 multi-group batching, v9 member epoch (KIP-848), v10 topic IDs. The fork has no v0 codec, which is correct: v0 read offsets from ZooKeeper. |
 | FindCoordinator | 10 | 0-6 | v3+ | 0-6 | current | v3 flexible, v4 multi-key batch (KIP-699), v5 TRANSACTION_ABORTABLE (KIP-890), v6 KeyType SHARE=2 (KIP-932, broker-internal). apiKeys.js still calls key 10 GroupCoordinator, the pre-0.11 name. |
 | JoinGroup | 11 | 0-9 | v6+ | 0-5 | behind:4 | v5 encodes groupInstanceId but nothing plumbs it: Broker.joinGroup() has no such parameter, so static membership (KIP-345) is inert today. |
@@ -26,7 +26,7 @@ Gap classes: `current` (fork max equals the Kafka max) · `behind:N` · `stub` (
 | CreateTopics | 19 | 2-7 | v5+ | 2-3 | behind:4 | v5 flexible, v7 returns topic IDs. |
 | DeleteTopics | 20 | 1-6 | v4+ | 1 | behind:5 (on-floor) | v6 deletes by topic ID. The fork's v1 sits exactly on the 4.x floor. |
 | DeleteRecords | 21 | 0-2 | v2+ | 0-1 | behind:1 |  |
-| InitProducerId | 22 | 0-6 | v2+ | 0-1 | behind:5 | v2+ is flexible, so even v3 needs the flexible-protocol work first. v3 producer-id/epoch re-init (KIP-360), v4 PRODUCER_FENCED, v5 TRANSACTION_ABORTABLE, v6 two-phase commit (KIP-939) and latestVersionUnstable, so brokers advertise 0-5 by default. |
+| InitProducerId | 22 | 0-6 | v2+ | 0-5 | behind:1 | v2+ is flexible, so even v3 needs the flexible-protocol work first. v3 producer-id/epoch re-init (KIP-360), v4 PRODUCER_FENCED, v5 TRANSACTION_ABORTABLE, v6 two-phase commit (KIP-939) and latestVersionUnstable, so brokers advertise 0-5 by default. |
 | OffsetForLeaderEpoch | 23 | 2-4 | v4+ | — | stub | Leader-epoch fencing (KIP-320). Without it an unclean leader change can silently duplicate or skip records. |
 | AddPartitionsToTxn | 24 | 0-5 | v3+ | 0-1 | behind:4 | Unused under transaction version 2 (KIP-890 part 2), where Produce carries the add-partitions call. |
 | AddOffsetsToTxn | 25 | 0-4 | v3+ | 0-1 | behind:3 | Unused under transaction version 2 (KIP-890 part 2). |

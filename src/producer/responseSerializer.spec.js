@@ -66,4 +66,40 @@ describe('Producer > responseSerializer', () => {
     expect(metadata).not.toHaveProperty('recordErrors')
     expect(metadata).not.toHaveProperty('errorMessage')
   })
+
+  const ALLOWLISTED_KEYS = [
+    'topicName',
+    'partition',
+    'errorCode',
+    'baseOffset',
+    'logAppendTime',
+    'logStartOffset',
+  ]
+
+  test('a v9 response serializes to exactly the allowlisted RecordMetadata keys', async () => {
+    const { decode } = require('../protocol/requests/produce/v9/response')
+    const data = await decode(
+      Buffer.from(require('../protocol/requests/produce/fixtures/v9_response.json'))
+    )
+
+    const [metadata] = responseSerializer(data)
+
+    expect(Object.keys(metadata)).toEqual(ALLOWLISTED_KEYS)
+  })
+
+  test('a v10 response carrying the KIP-951 leader hint still serializes to exactly the allowlisted RecordMetadata keys', async () => {
+    // v10_response_not_leader decodes an errored partition (errorCode 6) with currentLeader set;
+    // responseSerializer only ever runs on a fully successful response in production, but the
+    // allowlist must hold regardless of what the decoder attaches to the partition object, so this
+    // proves currentLeader can never leak through even if it were present.
+    const { decode } = require('../protocol/requests/produce/v10/response')
+    const data = await decode(
+      Buffer.from(require('../protocol/requests/produce/fixtures/v10_response_not_leader.json'))
+    )
+
+    const [metadata] = responseSerializer(data)
+
+    expect(Object.keys(metadata)).toEqual(ALLOWLISTED_KEYS)
+    expect(metadata).not.toHaveProperty('currentLeader')
+  })
 })
