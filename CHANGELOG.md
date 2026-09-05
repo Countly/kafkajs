@@ -94,4 +94,15 @@ Upstream work this phase builds on, with thanks to its authors: PRs #1779, #1695
 - New development-only `node scripts/protocol/capture.js`: records the raw bytes a live broker exchanges (through the public `socketFactory` hook, so it touches no internals), strips the protocol header, normalises the values that vary per run, and writes byte fixtures. The flexible codecs in this release are tested against captures from both Kafka 4.3.1 and 4.1.2.
 - The internal version-lookup helper accepts a per-API ceiling, used by tests to pin a request to a specific protocol version. There is no user-facing version pin: the client always negotiates the highest version both sides support.
 
+### Phase 5A — core APIs, part 1
+
+#### Behavior changes
+
+#### Fixes
+
+#### Additions
+- Internal metadata cache: the client now keeps each topic's id and each partition's leader epoch from the Metadata response, with a monotonic guard so a stale refresh cannot move a partition's leader backwards. Nothing user-visible changes yet; the cache is what the leader-hint, rebootstrap and topic-recreation behaviour described under Behavior changes is built on.
+
+#### Tooling
+
 Adopted upstream PRs are credited here by number as they land (Phase 2 onward).
