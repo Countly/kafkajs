@@ -5,7 +5,7 @@ const shuffle = require('../utils/shuffle')
 const arrayDiff = require('../utils/arrayDiff')
 const sharedPromiseTo = require('../utils/sharedPromiseTo')
 const { CLUSTER_REBOOTSTRAP } = require('./instrumentationEvents')
-const { KafkaJSBrokerNotFound, KafkaJSProtocolError } = require('../errors')
+const { KafkaJSBrokerNotFound, KafkaJSConnectionError, KafkaJSProtocolError } = require('../errors')
 
 const { keys, assign, values } = Object
 const hasBrokerBeenReplaced = (broker, { host, port, rack }) =>
@@ -45,10 +45,10 @@ module.exports = class BrokerPool {
    * @param {object} options
    * @param {import("./connectionPoolBuilder").ConnectionPoolBuilder} options.connectionPoolBuilder
    * @param {import("../../types").Logger} options.logger
-   * @param {import("./metadataCache")} [options.metadataCache] defaulted rather than required:
-   *   `BrokerPool` is also constructed directly by its own integration spec, and a pool without a
-   *   `Cluster` around it still needs somewhere to put topic ids and leader epochs. `Cluster`
-   *   always injects its own, which is the instance every route reads.
+   * @param {import("./metadataCache")} [options.metadataCache] optional: a `BrokerPool` owns its
+   *   metadata and is usable standalone, so it defaults to a private cache rather than requiring
+   *   a collaborator it can build itself. `Cluster` always injects its own, which is then the
+   *   single instance every route reads.
    * @param {import("../instrumentation/emitter")|null} [options.instrumentationEmitter]
    * @param {import("../../types").RetryOptions} [options.retry]
    * @param {boolean} [options.allowAutoTopicCreation]
@@ -120,20 +120,21 @@ module.exports = class BrokerPool {
 
     this[PRIVATE.REBOOTSTRAP] = sharedPromiseTo(async (reason) => {
       const brokers = values(this.brokers)
-      const seedBroker = this.seedBroker
 
       this.brokers = {}
       this.metadata = null
       this.metadataExpireAt = null
       this.metadataCache.clear()
 
-      await Promise.all([
-        ...brokers.map((broker) => broker.disconnect()),
-        seedBroker ? seedBroker.disconnect() : Promise.resolve(),
-      ])
-
-      this.seedBroker = undefined
-      await this.createSeedBroker()
+      // The replacement seed is built, installed and only then is the previous one disconnected
+      // (see createSeedBroker), so `this.seedBroker` always points at a usable broker: a
+      // concurrent reader - `connect()`'s retry callback, `hasConnectedBrokers()` - landing in
+      // this window must never find it unset.
+      try {
+        await this.createSeedBroker()
+      } finally {
+        await Promise.all(brokers.map((broker) => broker.disconnect()))
+      }
 
       this.lastRebootstrapAt = Date.now()
       // Both clocks reset, and they are reset for different reasons. `metadataUnavailableSince`
@@ -159,7 +160,9 @@ module.exports = class BrokerPool {
    * kept across a reconnect - it belongs to the broker software, not to the metadata.
    *
    * `this.brokers` is emptied *before* the disconnects are awaited, so a concurrent `findBroker`
-   * or `findConnectedBroker` cannot be handed a broker that is mid-teardown. Each disconnect
+   * or `findConnectedBroker` cannot be handed a broker that is mid-teardown, and the replacement
+   * seed is installed before any of them is torn down, so a concurrent `connect()` never finds
+   * `this.seedBroker` unset. Each disconnect
    * itself first *drains* that broker's pending requests (`Connection#disconnect` awaits
    * `requestQueue.waitForPendingRequests()`) before closing the socket, so an in-flight request
    * normally completes rather than being rejected - the wait is bounded only by
@@ -296,20 +299,38 @@ module.exports = class BrokerPool {
     )
   }
 
+  /**
+   * Builds a replacement seed broker from the next address the connection-pool builder offers,
+   * installs it, and only then disconnects the one it replaced.
+   *
+   * The order matters: `this.seedBroker` is read without a lock by `connect()`'s retry callback,
+   * `hasConnectedBrokers()` and `findConnectedBroker()`'s fallback, so it must never be unset -
+   * nor point at a broker that is already tearing down - across the awaits in here.
+   *
+   * @public
+   * @returns {Promise<void>}
+   */
   async createSeedBroker() {
-    if (this.seedBroker) {
-      await this.seedBroker.disconnect()
-    }
-
+    const previousSeedBroker = this.seedBroker
     const connectionPool = await this.buildConnectionPool()
 
     this.seedBroker = this.createBroker({
       connectionPool,
       logger: this.rootLogger,
     })
+
+    previousSeedBroker && (await previousSeedBroker.disconnect())
   }
 
   /**
+   * Connects the seed broker, retrying and rotating through the configured broker list.
+   *
+   * The seed is re-read *inside* the retry callback: a rebootstrap or a `removeBroker()` can
+   * replace (or, for `removeBroker`, unset) `this.seedBroker` between two scheduled attempts, so
+   * a reference captured before the retrier would connect an object nothing else uses. A missing
+   * seed is reported as a retriable connection error rather than dereferenced - the retrier
+   * treats a `TypeError` as unrecoverable and would turn a transient window into a crash.
+   *
    * @public
    * @returns {Promise<void>}
    */
@@ -323,9 +344,15 @@ module.exports = class BrokerPool {
     }
 
     return this.retrier(async (bail, retryCount, retryTime) => {
+      const seedBroker = this.seedBroker
+
+      if (!seedBroker) {
+        throw new KafkaJSConnectionError('No seed broker available, the client is rebootstrapping')
+      }
+
       try {
-        await this.seedBroker.connect()
-        this.versions = this.seedBroker.versions
+        await seedBroker.connect()
+        this.versions = seedBroker.versions
       } catch (e) {
         if (e.name === 'KafkaJSConnectionError' || e.type === 'ILLEGAL_SASL_STATE') {
           // Connection builder will always rotate the seed broker
@@ -424,10 +451,9 @@ module.exports = class BrokerPool {
 
         // Captured once, before any `await` in this callback: a concurrent rebootstrap (reachable
         // because `Cluster#metadata()` calls `refreshMetadataIfNecessary` directly, bypassing
-        // both of `Cluster`'s shared-promise guards) sets `this.seedBroker = undefined` partway
-        // through its own teardown, and re-reading `this.seedBroker` after the `await` below
-        // would then throw a `TypeError` - which the retrier classifies as unrecoverable and
-        // never retries.
+        // both of `Cluster`'s shared-promise guards) swaps `this.seedBroker` for a fresh instance
+        // partway through, and re-reading it after the `await` below would mix the two seeds'
+        // state within one attempt.
         const seedBroker = this.seedBroker
         const { host: seedHost, port: seedPort } = seedBroker ? seedBroker.connectionPool : {}
 
@@ -444,8 +470,9 @@ module.exports = class BrokerPool {
           const metadata = this.metadata
           // Applied here, on the statement after the assignment and before any await, so no
           // reader can observe the fresh response with the monotonic leader guard not yet
-          // applied.
-          this.metadataCache.update(metadata)
+          // applied. An empty topic list is encoded as the null array, which asks for every topic
+          // in the cluster - the cache prunes what such a response does not carry.
+          this.metadataCache.update(metadata, { full: !topics || topics.length === 0 })
           this.metadataExpireAt = Date.now() + this.metadataMaxAge
 
           const replacedBrokers = []
@@ -765,12 +792,30 @@ module.exports = class BrokerPool {
   }
 
   /**
-   * Emits a cluster-level instrumentation event, mirroring `MetadataCache#emit`.
+   * Emits a cluster-level instrumentation event, best-effort, exactly as `MetadataCache#emit`
+   * does. Listeners are invoked synchronously by the emitter and the clients' public `on()`
+   * wrapper only guards a rejected promise, so an application listener that throws synchronously
+   * would otherwise reject the shared `rebootstrap()` promise - and with it the metadata refresh
+   * that triggered the rebootstrap, replacing the caller's original error with the listener's.
+   * A throw is logged and dropped instead.
+   *
    * @private
    * @param {string} eventName
    * @param {object} payload
+   * @returns {void}
    */
   emit(eventName, payload) {
-    this.instrumentationEmitter && this.instrumentationEmitter.emit(eventName, payload)
+    if (!this.instrumentationEmitter) {
+      return
+    }
+
+    try {
+      this.instrumentationEmitter.emit(eventName, payload)
+    } catch (e) {
+      this.logger.error('Instrumentation event listener threw, ignoring it', {
+        eventName,
+        error: e.message,
+      })
+    }
   }
 }

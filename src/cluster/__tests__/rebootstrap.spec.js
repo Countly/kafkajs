@@ -355,6 +355,29 @@ describe('BrokerPool > rebootstrap', () => {
       expect(metadataResponses).toEqual(2)
     })
 
+    test('a broker that keeps answering 129 costs one rebootstrap per call, by design', async () => {
+      // Trigger (b) is deliberately not rate-limited, so the amplification is measured rather
+      // than assumed: N metadata calls answered with REBOOTSTRAP_REQUIRED produce exactly N
+      // teardowns and N events - throttled only by the caller's own retry/backoff.
+      const { cluster, events } = createCluster()
+      const pool = cluster.brokerPool
+      stubSeed(pool, async () => {
+        throw Object.assign(new Error('rebootstrap'), {
+          type: 'REBOOTSTRAP_REQUIRED',
+          code: 129,
+          name: 'KafkaJSProtocolError',
+          retriable: false,
+        })
+      })
+
+      const calls = 3
+      for (let i = 0; i < calls; i++) {
+        await pool.refreshMetadata([]).catch(() => {})
+      }
+
+      expect(events).toEqual(new Array(calls).fill({ reason: 'required' }))
+    })
+
     test('metadataRecoveryStrategy: "none" leaves 129 as the protocol error it already is', async () => {
       const { cluster, events } = createCluster({ metadataRecoveryStrategy: 'none' })
       const pool = cluster.brokerPool
@@ -593,6 +616,120 @@ describe('BrokerPool > rebootstrap', () => {
       }
 
       await expect(pool.refreshMetadata([])).resolves.toBeUndefined()
+    })
+
+    test('the seed broker is never unset while a rebootstrap is in flight', async () => {
+      // Every await inside rebootstrap() samples what a concurrent reader would find. The
+      // replacement must be installed before anything is torn down: connect()'s retry callback
+      // and hasConnectedBrokers() read this.seedBroker with no lock.
+      const { cluster } = createCluster()
+      const pool = cluster.brokerPool
+      const samples = []
+      const previousSeed = {
+        nodeId: 0,
+        isConnected: () => true,
+        connect: async () => {},
+        disconnect: async () => samples.push(pool.seedBroker),
+        metadata: async () => ok,
+        connectionPool: { host: '127.0.0.1', port: 9092, rack: null },
+      }
+
+      pool.seedBroker = previousSeed
+      pool.brokers = {
+        1: {
+          isConnected: () => true,
+          connect: async () => {},
+          disconnect: async () => samples.push(pool.seedBroker),
+        },
+      }
+      pool.buildConnectionPool = async (destination) => {
+        samples.push(pool.seedBroker)
+        await new Promise(setImmediate)
+        return { ...destination }
+      }
+      pool.createBroker = ({ connectionPool }) => ({ ...previousSeed, connectionPool })
+
+      await pool.rebootstrap('timeout')
+
+      const replacement = pool.seedBroker
+      expect(replacement).not.toBe(previousSeed)
+      // Built while the old seed was still installed, then both disconnects saw the replacement.
+      expect(samples).toEqual([previousSeed, replacement, replacement])
+    })
+
+    test('connect() treats a missing seed as retriable rather than dereferencing it', async () => {
+      // removeBroker() can leave this.seedBroker unset, and the retry callback re-reads it on
+      // every scheduled attempt. A TypeError there is classified as unrecoverable and would crash
+      // a consumer instead of retrying.
+      const { cluster } = createCluster({
+        retry: { retries: 1, initialRetryTime: 1, maxRetryTime: 2 },
+      })
+      const pool = cluster.brokerPool
+      pool.hasConnectedBrokers = () => false
+      pool.createSeedBroker = async () => {}
+      pool.seedBroker = undefined
+
+      await expect(pool.connect()).rejects.toMatchObject({
+        name: 'KafkaJSNumberOfRetriesExceeded',
+        cause: expect.objectContaining({ name: 'KafkaJSConnectionError' }),
+      })
+    })
+
+    test('connect() picks up the seed a rebootstrap installs between two attempts', async () => {
+      const { cluster } = createCluster({
+        retry: { retries: 10, initialRetryTime: 5, maxRetryTime: 20 },
+      })
+      const pool = cluster.brokerPool
+      const replacement = {
+        connect: jest.fn(async () => {}),
+        versions: { 3: { minVersion: 0, maxVersion: 13 } },
+        isConnected: () => false,
+      }
+
+      pool.hasConnectedBrokers = () => false
+      pool.createSeedBroker = async () => {}
+      pool.seedBroker = undefined
+      setTimeout(() => {
+        pool.seedBroker = replacement
+      }, 5)
+
+      await expect(pool.connect()).resolves.toBeUndefined()
+      expect(replacement.connect).toHaveBeenCalled()
+      expect(pool.versions).toEqual(replacement.versions)
+    })
+
+    test('a REBOOTSTRAP listener that throws cannot fail the rebootstrap', async () => {
+      // Listeners run synchronously and the clients' public on() wrapper only guards a rejected
+      // promise, so an unguarded emit would reject the shared rebootstrap promise - and with it
+      // the metadata refresh that triggered it, replacing the caller's original error.
+      const { cluster, events } = createCluster()
+      const pool = cluster.brokerPool
+      const seedOf = stubSeed(pool, async () => ok)
+      const previousSeed = seedOf()
+
+      cluster.instrumentationEmitter.addListener(CLUSTER_REBOOTSTRAP, () => {
+        throw new Error('boom from a listener')
+      })
+
+      await expect(pool.rebootstrap('timeout')).resolves.toBeUndefined()
+      expect(seedOf()).not.toBe(previousSeed)
+      expect(events).toEqual([{ reason: 'timeout' }])
+    })
+
+    test('the old brokers are disconnected even when the replacement seed cannot be built', async () => {
+      const { cluster } = createCluster()
+      const pool = cluster.brokerPool
+      stubSeed(pool, async () => ok)
+      const disconnect = jest.fn(async () => {})
+      pool.brokers = { 1: { nodeId: 1, isConnected: () => true, disconnect } }
+      pool.createSeedBroker = async () => {
+        throw new Error('bad broker list')
+      }
+
+      await expect(pool.rebootstrap('timeout')).rejects.toThrow('bad broker list')
+
+      expect(disconnect).toHaveBeenCalledTimes(1)
+      expect(pool.brokers).toEqual({})
     })
 
     test('two direct rebootstrap() calls join one in-flight teardown', async () => {

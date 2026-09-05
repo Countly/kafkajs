@@ -41,40 +41,60 @@ module.exports = class MetadataCache {
      * is what makes the write-through work: an accepted leader hint writes onto it, and every
      * cluster route reads it. It is re-seated on every refresh **for topics present in that
      * refresh's response** (both the accept and the defend branch), because `brokerPool.metadata`
-     * replaces the objects for those topics each time; a topic absent from a scoped refresh (e.g.
-     * `Cluster#metadata({ topics: [...] })`) keeps its previous `decoded` reference untouched, by
-     * the same rule that leaves its epoch and id untouched (see `update()`).
+     * replaces the objects for those topics each time; a topic **absent** from a response keeps
+     * its id and epochs but releases `decoded` (set to `null`), because that object belongs to a
+     * response nothing reads any more and holding it would pin the whole partition record.
+     *
+     * `seenAt` is the refresh generation that last carried the topic; it is what the release and
+     * prune pass at the end of `update()` compares against.
      *
      * Entries are mutated in place and reused across refreshes - only a first sighting, a topic
      * recreation or `clear()` allocates.
      *
-     * @type {Map<string, { topicId: string|null, partitions: Map<number, { leader: number, leaderEpoch: number, decoded: object }> }>}
+     * @type {Map<string, { topicId: string|null, seenAt: number, decodedReleased: boolean, partitions: Map<number, { leader: number, leaderEpoch: number, decoded: object|null }> }>}
      */
     this.topics = new Map()
     /** @type {Map<string, string>} topic id -> topic name */
     this.topicIds = new Map()
+    /** Incremented once per `update()`; stamped onto every topic that response carried. */
+    this.generation = 0
   }
 
   /**
    * Applies a decoded Metadata response, in three ordered steps, and writes accepted
    * leader/leaderEpoch pairs back onto the response's own partition objects.
    *
-   * Topics absent from the response are left untouched: a Metadata response is scoped to the
-   * topics it was asked for, so absence is never evidence of deletion or recreation.
+   * A topic absent from the response keeps its id and its epochs - a Metadata response is scoped
+   * to the topics it was asked for, so absence is never evidence of deletion or recreation - but
+   * releases its `decoded` references, which belong to a response no route reads any more. When
+   * the response is a **full-cluster** one (the refresh asked for no topics, so the broker
+   * answered with every topic it has), absence *is* evidence: those topics are pruned outright,
+   * which is what stops one regex subscription or one `listTopics()` from seeding this cache with
+   * every topic in the cluster forever.
    *
-   * Allocation contract: one `Set` of live broker ids per call, and one entry per topic and per
-   * partition only on its first sighting (or after a recreation or a `clear()`). A steady-state
-   * refresh mutates the existing entries - this runs on every admin call, since the admin client
-   * has no `metadataMaxAge`.
+   * `TOPIC_RECREATED` is emitted last, once every entry above has been written, so a listener
+   * that throws cannot leave the cache un-advanced and re-diffing the same recreation on every
+   * later refresh - and `emit()` swallows such a throw anyway.
+   *
+   * Allocation contract: one `Set` of live broker ids per call (plus one array only when a
+   * recreation actually happened), and one entry per topic and per partition only on its first
+   * sighting (or after a recreation or a `clear()`). A steady-state refresh mutates the existing
+   * entries - this runs on every admin call, since the admin client has no `metadataMaxAge`.
    *
    * @param {{ brokers: Array<{ nodeId: number }>, topicMetadata: Array<{ topic: string, topicId?: string|null, partitionMetadata: Array<{ partitionId: number, leader: number, leaderEpoch: number }> }> }} metadata decoded response, mutated in place
+   * @param {object} [options]
+   * @param {boolean} [options.full=false] true when the refresh was unscoped, i.e. the response
+   *        describes every topic in the cluster
    * @returns {void}
    */
-  update(metadata) {
+  update(metadata, { full = false } = {}) {
     const liveBrokerIds = new Set()
     for (const { nodeId } of metadata.brokers) {
       liveBrokerIds.add(nodeId)
     }
+
+    this.generation += 1
+    let recreations = null
 
     for (const topicMetadata of metadata.topicMetadata) {
       const name = topicMetadata.topic
@@ -82,14 +102,23 @@ module.exports = class MetadataCache {
 
       // Step 1 - topic-id diff, before any epoch comparison. A recreation drops this topic's
       // partition entries entirely, so the new incarnation's epoch 0 is accepted.
-      const recreated = this.diffTopicId(name, entry, topicMetadata.topicId)
+      const recreation = this.diffTopicId(name, entry, topicMetadata.topicId)
 
-      if (!entry || recreated) {
-        entry = { topicId: null, partitions: new Map() }
+      if (!entry || recreation) {
+        entry = { topicId: null, seenAt: 0, decodedReleased: false, partitions: new Map() }
         this.topics.set(name, entry)
       }
 
-      entry.topicId = topicMetadata.topicId ?? null
+      if (recreation) {
+        recreations = recreations || []
+        recreations.push(recreation)
+      }
+
+      // The all-zero uuid is "no id", not an id: recording it would make the next real id look
+      // like a recreation, and would let `topicId()` hand a caller a sentinel to route on.
+      entry.topicId = this.usableTopicId(topicMetadata.topicId)
+      entry.seenAt = this.generation
+      entry.decodedReleased = false
 
       for (const partition of topicMetadata.partitionMetadata) {
         const cached = entry.partitions.get(partition.partitionId)
@@ -129,46 +158,95 @@ module.exports = class MetadataCache {
         cached.decoded = partition
       }
 
-      if (topicMetadata.topicId && topicMetadata.topicId !== NO_TOPIC_ID) {
-        this.topicIds.set(topicMetadata.topicId, name)
+      if (entry.topicId != null) {
+        this.topicIds.set(entry.topicId, name)
+      }
+    }
+
+    this.releaseTopicsAbsentFrom(full)
+
+    for (const recreation of recreations || []) {
+      this.emit(CLUSTER_TOPIC_RECREATED, recreation)
+    }
+  }
+
+  /**
+   * Second pass of `update()`: every cached topic the response did not carry either loses its
+   * `decoded` references (a scoped response says nothing about it) or is dropped entirely (a
+   * full-cluster response says it no longer exists). Bounded by the number of cached topics, and
+   * skipped per topic once released, so a steady state costs one comparison per topic.
+   *
+   * @private
+   * @param {boolean} full true when the response described the whole cluster
+   * @returns {void}
+   */
+  releaseTopicsAbsentFrom(full) {
+    for (const [name, entry] of this.topics) {
+      if (entry.seenAt === this.generation) {
+        continue
+      }
+
+      if (full) {
+        this.topics.delete(name)
+        entry.topicId != null && this.topicIds.delete(entry.topicId)
+        continue
+      }
+
+      if (!entry.decodedReleased) {
+        for (const cached of entry.partitions.values()) {
+          cached.decoded = null
+        }
+        entry.decodedReleased = true
       }
     }
   }
 
   /**
    * @private
+   * @param {string|null|undefined} topicId
+   * @returns {string|null} the id, or null when it is absent or the all-zero "no id" sentinel
+   */
+  usableTopicId(topicId) {
+    return topicId != null && topicId !== NO_TOPIC_ID ? topicId : null
+  }
+
+  /**
+   * Detects a recreation (a known name arriving under a different, non-zero id) and forgets the
+   * previous id. Deliberately does **not** emit: `update()` emits once the cache has advanced.
+   *
+   * @private
    * @param {string} name
    * @param {{ topicId: string|null }|undefined} entry
    * @param {string|null|undefined} topicId the id the fresh response carries
-   * @returns {boolean} true when this is a recreation (a known name, a different non-zero id)
+   * @returns {{ topic: string, previousTopicId: string, topicId: string }|null} the event payload
+   *          for a recreation, null otherwise
    */
   diffTopicId(name, entry, topicId) {
     const previousTopicId = entry && entry.topicId
+    const freshTopicId = this.usableTopicId(topicId)
     const isRecreation =
-      previousTopicId != null &&
-      topicId != null &&
-      topicId !== NO_TOPIC_ID &&
-      topicId !== previousTopicId
+      previousTopicId != null && freshTopicId != null && freshTopicId !== previousTopicId
 
     if (!isRecreation) {
-      return false
+      return null
     }
 
     this.topicIds.delete(previousTopicId)
     this.logger.debug('Topic has been recreated under a new id', {
       topic: name,
       previousTopicId,
-      topicId,
+      topicId: freshTopicId,
     })
-    this.emit(CLUSTER_TOPIC_RECREATED, { topic: name, previousTopicId, topicId })
-    return true
+    return { topic: name, previousTopicId, topicId: freshTopicId }
   }
 
   /**
    * Applies a leader hint the broker attached to a produce error (KIP-951). Synchronous, and the
    * write-through onto the decoded partition object makes it visible to every cluster route
    * immediately - `findLeaderForPartitions`, `fetchTopicsOffset` and the consumer's read-replica
-   * selection all read that object.
+   * selection all read that object. A topic whose `decoded` reference was released (it was absent
+   * from the last response) still updates the cached pair; the next refresh that carries the
+   * topic re-seats `decoded` and the routing structure catches up there.
    *
    * @param {string} topic
    * @param {number} partition
@@ -195,8 +273,12 @@ module.exports = class MetadataCache {
 
     cached.leader = leaderId
     cached.leaderEpoch = leaderEpoch
-    cached.decoded.leader = leaderId
-    cached.decoded.leaderEpoch = leaderEpoch
+
+    if (cached.decoded) {
+      cached.decoded.leader = leaderId
+      cached.decoded.leaderEpoch = leaderEpoch
+    }
+
     return true
   }
 
@@ -234,11 +316,30 @@ module.exports = class MetadataCache {
   }
 
   /**
+   * Emits an instrumentation event, best-effort. Listeners are invoked synchronously by the
+   * emitter, and the clients' public `on()` wrapper only guards a *rejected promise*, not a
+   * synchronous throw - so one application listener that throws would otherwise propagate out of
+   * a metadata refresh and take the client's metadata path down with it. A throw is logged and
+   * dropped instead.
+   *
    * @private
    * @param {string} eventName
    * @param {object} payload
+   * @returns {void}
    */
   emit(eventName, payload) {
-    this.instrumentationEmitter && this.instrumentationEmitter.emit(eventName, payload)
+    if (!this.instrumentationEmitter) {
+      return
+    }
+
+    try {
+      this.instrumentationEmitter.emit(eventName, payload)
+    } catch (e) {
+      this.logger.error('Instrumentation event listener threw, ignoring it', {
+        eventName,
+        topic: payload && payload.topic,
+        error: e.message,
+      })
+    }
   }
 }

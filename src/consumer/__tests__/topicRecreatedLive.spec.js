@@ -41,7 +41,7 @@ const distinctOffsets = (records) =>
   [...new Set(records.map(({ message }) => Number(message.offset)))].sort((a, b) => a - b)
 
 /**
- * Live-cluster proof of the topic-recreation one-shot offset reset (spec 5A-6/5A-18): a single,
+ * Live-cluster proof of the topic-recreation one-shot offset reset: a single,
  * continuously running consumer survives a real delete + recreate of its subscribed topic, sees
  * `TOPIC_RECREATED`, and resumes per its own `fromBeginning` instead of trusting a committed
  * offset that belonged to the deleted incarnation - no record silently skipped, though an

@@ -73,7 +73,7 @@ describe('Cluster > MetadataCache', () => {
 
   test('leaderEpoch() never returns undefined, even for a decoded partition missing the field', () => {
     // Kafka 4.0+ Metadata codecs always decode leaderEpoch, but leaderEpoch() is a public
-    // contract ("-1 when unknown") that later tasks (5A-14) feed straight onto the wire.
+    // contract ("-1 when unknown") that ListOffsets feeds straight onto the wire.
     const metadata = response()
     delete metadata.topicMetadata[0].partitionMetadata[0].leaderEpoch
     cache.update(metadata)
@@ -246,6 +246,98 @@ describe('Cluster > MetadataCache', () => {
       expect(cache.applyLeaderHint('test-topic', 0, { leaderId: 3, leaderEpoch: 7 })).toBe(true)
       expect(partition0(stale).leader).toEqual(3)
       expect(partition0(stale).leaderEpoch).toEqual(7)
+    })
+  })
+
+  describe('a throwing TOPIC_RECREATED listener', () => {
+    beforeEach(() => {
+      // Registered after the recording listener in the outer beforeEach, so the recording one
+      // still runs: what is asserted here is the cache's own resilience, not listener ordering.
+      emitter.addListener(CLUSTER_TOPIC_RECREATED, () => {
+        throw new Error('boom from a listener')
+      })
+    })
+
+    test('cannot fail the update, and cannot stop the cache from advancing', () => {
+      cache.update(response({ topicId: ID_A }))
+
+      expect(() => cache.update(response({ topicId: ID_B }))).not.toThrow()
+      expect(cache.topicId('test-topic')).toEqual(ID_B)
+
+      // The entry advanced, so the recreation is not re-diffed (and not re-emitted) forever.
+      expect(() => cache.update(response({ topicId: ID_B }))).not.toThrow()
+      expect(events).toEqual([{ topic: 'test-topic', previousTopicId: ID_A, topicId: ID_B }])
+    })
+  })
+
+  test('the all-zero topic id is treated as no id at all', () => {
+    cache.update(response({ topicId: '00000000-0000-0000-0000-000000000000' }))
+    expect(cache.topicId('test-topic')).toBeUndefined()
+
+    // The first real id is therefore a first sighting, not a recreation.
+    cache.update(response({ topicId: ID_A }))
+    expect(events).toEqual([])
+    expect(cache.topicId('test-topic')).toEqual(ID_A)
+  })
+
+  describe('retention', () => {
+    const otherTopic = (options) => {
+      const metadata = response(options)
+      metadata.topicMetadata[0].topic = 'other-topic'
+      return metadata
+    }
+
+    test('a scoped refresh releases the decoded objects of the topics it does not carry', () => {
+      // Those objects belong to a response no route reads any more; holding them pins the whole
+      // partition record (replicas/isr/offlineReplicas included) for the client's lifetime.
+      const first = response({ topicId: ID_A, leaderEpoch: 5 })
+      cache.update(first)
+      expect(cache.topics.get('test-topic').partitions.get(0).decoded).toBe(partition0(first))
+
+      cache.update(otherTopic({ topicId: ID_B, leaderEpoch: 1 }))
+
+      const cached = cache.topics.get('test-topic').partitions.get(0)
+      expect(cached.decoded).toBeNull()
+      // The id and the epoch stay: absence from a scoped response is not evidence of anything.
+      expect(cached.leaderEpoch).toEqual(5)
+      expect(cache.topicId('test-topic')).toEqual(ID_A)
+    })
+
+    test('a full-cluster refresh prunes the topics it does not carry, ids included', () => {
+      cache.update(response({ topicId: ID_A }))
+      cache.update(otherTopic({ topicId: ID_B }), { full: true })
+
+      expect(cache.topics.has('test-topic')).toBe(false)
+      expect(cache.topicId('test-topic')).toBeUndefined()
+      expect(cache.topicName(ID_A)).toBeUndefined()
+      expect(cache.topicId('other-topic')).toEqual(ID_B)
+    })
+
+    test('a topic the refresh does carry keeps its entry, and nothing is reallocated', () => {
+      cache.update(response({ topicId: ID_A, leaderEpoch: 5 }))
+      const entry = cache.topics.get('test-topic')
+      const cached = entry.partitions.get(0)
+
+      const fresh = response({ topicId: ID_A, leaderEpoch: 6 })
+      cache.update(fresh, { full: true })
+
+      expect(cache.topics.get('test-topic')).toBe(entry)
+      expect(entry.partitions.get(0)).toBe(cached)
+      expect(cached.decoded).toBe(partition0(fresh))
+    })
+
+    test('a hint still moves the leader for a topic whose decoded object was released', () => {
+      cache.update(response({ leader: 1, leaderEpoch: 5 }))
+      cache.update(otherTopic({ topicId: ID_B }))
+
+      expect(cache.applyLeaderHint('test-topic', 0, { leaderId: 2, leaderEpoch: 6 })).toBe(true)
+      expect(cache.leaderEpoch('test-topic', 0)).toEqual(6)
+
+      // The next refresh carrying the topic re-seats decoded, and routing catches up there.
+      const back = response({ leader: 3, leaderEpoch: 6 })
+      cache.update(back)
+      expect(partition0(back).leader).toEqual(3)
+      expect(cache.topics.get('test-topic').partitions.get(0).decoded).toBe(partition0(back))
     })
   })
 

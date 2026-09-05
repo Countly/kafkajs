@@ -13,7 +13,7 @@ const {
   KafkaJSAggregateError,
   isStaleCoordinator,
 } = require('../errors')
-const { staleMetadata } = require('../protocol/error')
+const { staleMetadata, staleLeaderEpoch } = require('../protocol/error')
 const CONFIG_RESOURCE_TYPES = require('../protocol/configResourceTypes')
 const ACL_RESOURCE_TYPES = require('../protocol/aclResourceTypes')
 const ACL_OPERATION_TYPES = require('../protocol/aclOperationTypes')
@@ -359,6 +359,12 @@ module.exports = ({
           throw e
         }
 
+        // A leader election between the metadata refresh and the ListOffsets call fences the
+        // epoch the request carried. The cluster has already refreshed; retry on fresh metadata.
+        if (staleLeaderEpoch(e)) {
+          throw e
+        }
+
         bail(e)
       }
     })
@@ -413,6 +419,12 @@ module.exports = ({
       } catch (e) {
         if (e.type === 'UNKNOWN_TOPIC_OR_PARTITION') {
           await cluster.refreshMetadata()
+          throw e
+        }
+
+        // See fetchTopicOffsets: a fenced leader epoch is retriable, and the cluster refreshed
+        // metadata before rethrowing it.
+        if (staleLeaderEpoch(e)) {
           throw e
         }
 

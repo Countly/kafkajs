@@ -2,6 +2,7 @@ const Cluster = require('../index')
 const BrokerPool = require('../brokerPool')
 const InstrumentationEventEmitter = require('../../instrumentation/emitter')
 const { CLUSTER_TOPIC_RECREATED } = require('../instrumentationEvents')
+const { createErrorFromCode } = require('../../protocol/error')
 const consumerEvents = require('../../consumer/instrumentationEvents')
 const producerEvents = require('../../producer/instrumentationEvents')
 const adminEvents = require('../../admin/instrumentationEvents')
@@ -237,6 +238,69 @@ describe('Cluster > metadata cache wiring', () => {
       partition: 0,
       currentLeaderEpoch: -1,
     })
+  })
+
+  test('fetchTopicsOffset refreshes metadata and rethrows a fenced leader epoch', async () => {
+    // ListOffsets v4+ carries CurrentLeaderEpoch, so a leader election between the refresh and
+    // the call is answered with error 74/75. Both are retriable: the caller's retrier must get
+    // the original error back, after the client has refreshed the epoch it will send next.
+    stubBrokers(cluster, [metadata({ topicId: ID_A, leader: 1, leaderEpoch: 5 })])
+    await cluster.brokerPool.refreshMetadata(['test-topic'])
+
+    const refresh = jest.spyOn(cluster, 'refreshMetadata').mockResolvedValue()
+    cluster.findBroker = async () => ({
+      listOffsets: async () => {
+        throw createErrorFromCode(74)
+      },
+    })
+
+    await expect(
+      cluster.fetchTopicsOffset([
+        { topic: 'test-topic', partitions: [{ partition: 0 }], fromBeginning: true },
+      ])
+    ).rejects.toMatchObject({ type: 'FENCED_LEADER_EPOCH', retriable: true })
+
+    expect(refresh).toHaveBeenCalledTimes(1)
+  })
+
+  test('fetchTopicsOffset does not refresh metadata for an unrelated failure', async () => {
+    stubBrokers(cluster, [metadata({ topicId: ID_A, leader: 1, leaderEpoch: 5 })])
+    await cluster.brokerPool.refreshMetadata(['test-topic'])
+
+    const refresh = jest.spyOn(cluster, 'refreshMetadata').mockResolvedValue()
+    cluster.findBroker = async () => ({
+      listOffsets: async () => {
+        throw createErrorFromCode(29) // TOPIC_AUTHORIZATION_FAILED
+      },
+    })
+
+    await expect(
+      cluster.fetchTopicsOffset([
+        { topic: 'test-topic', partitions: [{ partition: 0 }], fromBeginning: true },
+      ])
+    ).rejects.toMatchObject({ type: 'TOPIC_AUTHORIZATION_FAILED' })
+
+    expect(refresh).not.toHaveBeenCalled()
+  })
+
+  test('an unscoped refresh prunes vanished topics, a scoped one leaves them alone', async () => {
+    // An empty topic list is encoded as the null array, so the response describes the whole
+    // cluster - which is what makes a topic missing from it evidence that it is gone.
+    const empty = { ...metadata({ topicId: ID_A, leader: 1, leaderEpoch: 5 }), topicMetadata: [] }
+    stubBrokers(cluster, [
+      metadata({ topicId: ID_A, leader: 1, leaderEpoch: 5 }),
+      { ...empty },
+      { ...empty },
+    ])
+
+    await cluster.brokerPool.refreshMetadata(['test-topic'])
+    expect(cluster.topicId('test-topic')).toEqual(ID_A)
+
+    await cluster.brokerPool.refreshMetadata(['other-topic'])
+    expect(cluster.topicId('test-topic')).toEqual(ID_A)
+
+    await cluster.brokerPool.refreshMetadata([])
+    expect(cluster.topicId('test-topic')).toBeUndefined()
   })
 
   test('onTopicRecreated is a safe no-op unsubscribe when the cluster has no emitter', () => {

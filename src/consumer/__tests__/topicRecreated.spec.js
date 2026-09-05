@@ -521,8 +521,10 @@ describe('Consumer > topic recreation', () => {
     seekOffsets.set(TOPIC, 1, '2')
     seekOffsets.set('other', 0, '3')
 
-    expect(seekOffsets.deleteTopic(TOPIC)).toEqual(2)
+    seekOffsets.deleteTopic(TOPIC)
+
     expect(seekOffsets.has(TOPIC, 0)).toBe(false)
+    expect(seekOffsets.has(TOPIC, 1)).toBe(false)
     expect(seekOffsets.has('other', 0)).toBe(true)
   })
 

@@ -1,4 +1,4 @@
-const { errorCodes, createErrorFromCode, staleMetadata } = require('./error')
+const { errorCodes, createErrorFromCode, staleMetadata, staleLeaderEpoch } = require('./error')
 
 describe('Protocol > error', () => {
   describe('#createErrorFromCode', () => {
@@ -95,5 +95,21 @@ describe('#staleMetadata', () => {
 
   test('does not treat an unrelated error as stale metadata', () => {
     expect(staleMetadata(createErrorFromCode(87))).toBe(false) // INVALID_RECORD
+  })
+})
+
+describe('#staleLeaderEpoch', () => {
+  test.each([
+    [74, 'FENCED_LEADER_EPOCH'],
+    [75, 'UNKNOWN_LEADER_EPOCH'],
+  ])('treats %s (%s) as a rejected leader epoch, and it is retriable', (code) => {
+    const error = createErrorFromCode(code)
+    expect(staleLeaderEpoch(error)).toBe(true)
+    expect(error.retriable).toBe(true)
+  })
+
+  test('does not treat a plain stale-metadata error as a rejected leader epoch', () => {
+    expect(staleLeaderEpoch(createErrorFromCode(3))).toBe(false) // UNKNOWN_TOPIC_OR_PARTITION
+    expect(staleLeaderEpoch(createErrorFromCode(29))).toBe(false) // TOPIC_AUTHORIZATION_FAILED
   })
 })

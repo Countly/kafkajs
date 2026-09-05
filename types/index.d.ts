@@ -1250,6 +1250,14 @@ export class KafkaJSNonRetriableError extends KafkaJSError {
 export class KafkaJSProtocolError extends KafkaJSError {
   readonly code: number
   readonly type: string
+  /** Set when the error came from a per-partition response (e.g. a failed produce batch) */
+  readonly topic?: string
+  /** Set when the error came from a per-partition response (e.g. a failed produce batch) */
+  readonly partition?: number
+  /** The broker's own message for this error, when it sent one */
+  readonly errorMessage?: string | null
+  /** The records the broker rejected individually out of a failed produce batch (KIP-467) */
+  readonly recordErrors?: ProduceRecordError[]
   constructor(e: Error | string)
 }
 

@@ -14,6 +14,7 @@ const {
   KafkaJSGroupCoordinatorNotFound,
 } = require('../errors')
 const COORDINATOR_TYPES = require('../protocol/coordinatorTypes')
+const { staleLeaderEpoch } = require('../protocol/error')
 
 const { keys } = Object
 
@@ -581,6 +582,11 @@ module.exports = class Cluster {
    * Each requested partition carries `currentLeaderEpoch`, the client's current view of that
    * partition's leader epoch from `MetadataCache#leaderEpoch` (-1 when the cache has not seen
    * the partition), letting the broker fence a request built on metadata that has since moved.
+   *
+   * When the broker does fence it (`FENCED_LEADER_EPOCH`/`UNKNOWN_LEADER_EPOCH`, both retriable),
+   * metadata is refreshed here and the original error is rethrown, so the caller's own retrier
+   * makes the next attempt with the epoch that refresh produced. The refresh is best-effort: a
+   * failing refresh must not replace the retriable error the caller is about to retry on.
    */
   async fetchTopicsOffset(topics) {
     const partitionsPerBroker = {}
@@ -632,7 +638,13 @@ module.exports = class Cluster {
     })
 
     // Execute all requests, merge and normalize the responses
-    const responses = await Promise.all(requests)
+    const responses = await Promise.all(requests).catch(async (e) => {
+      if (staleLeaderEpoch(e)) {
+        await this.refreshMetadataBestEffort()
+      }
+
+      throw e
+    })
     const partitionsPerTopic = responses.flat().reduce(mergeTopics, {})
 
     return keys(partitionsPerTopic).map((topic) => ({

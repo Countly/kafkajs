@@ -893,10 +893,32 @@ const STALE_METADATA_ERROR_TYPES = [
  */
 const staleMetadata = (e) => STALE_METADATA_ERROR_TYPES.includes(e.type)
 
+/**
+ * Errors that mean "the leader epoch this request carried is not the one the broker has": the
+ * client's metadata moved (a leader election) between building the request and sending it. Both
+ * are retriable, and both are fixed by refreshing metadata and sending the request again with the
+ * epoch that refresh produced.
+ *
+ * Kept separate from `staleMetadata`: on the consumer these two codes additionally drive a group
+ * rejoin, which is why the consumer's own list carries them and the producer's does not.
+ *
+ * @see clients/src/main/resources/common/message/ListOffsetsRequest.json (CurrentLeaderEpoch)
+ */
+const STALE_LEADER_EPOCH_ERROR_TYPES = ['FENCED_LEADER_EPOCH', 'UNKNOWN_LEADER_EPOCH']
+
+/**
+ * Reports whether a protocol error is a rejected leader epoch, i.e. the request was built on
+ * metadata the broker has since moved past.
+ * @param {Error} e
+ * @returns {boolean}
+ */
+const staleLeaderEpoch = (e) => STALE_LEADER_EPOCH_ERROR_TYPES.includes(e.type)
+
 module.exports = {
   failure,
   errorCodes,
   createErrorFromCode,
   failIfVersionNotSupported,
   staleMetadata,
+  staleLeaderEpoch,
 }
