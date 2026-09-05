@@ -54,3 +54,109 @@ change not listed here did not change observable behavior.
   (and `cluster.metadata()`) now include `leaderEpoch`; topics include `topicId` and
   `topicAuthorizedOperations`. Existing keys are unchanged; deep-equality snapshots of these
   results need updating.
+
+### Phase 5A — core APIs, part 1
+
+- **Client rebootstrap is on by default.** Two new `Kafka` options control it:
+  `metadataRecoveryStrategy`, which is `'rebootstrap'` by default and `'none'` to opt out, and
+  `metadataRecoveryRebootstrapTriggerMs`, which defaults to `300000` and must be an integer of at
+  least `1`. With the default strategy the client rebuilds its connections and its metadata from
+  the broker list you configured when any of three things happen: metadata has been failing
+  *continuously* for the trigger window, a broker answers `REBOOTSTRAP_REQUIRED` (error code 129),
+  or every broker the client knows about has become unreachable. "Continuously" is measured from
+  the first failure that follows a success, and any success clears it — so an idle client that hits
+  one transient metadata failure and then succeeds never rebootstraps, however long it has been
+  running. A rebootstrap waits for each connection's in-flight requests to drain and then closes
+  every connection, so requests still outstanding fail with `KafkaJSConnectionClosedError` and go
+  through the caller's normal retry path against the rebuilt cluster. Until the idempotent producer
+  is on by default, that retry is not deduplicated: **a produce request that the broker had already
+  appended, but whose response was lost when the connection closed, is sent again on the retry and
+  can duplicate those records.** The SASL authentication blackout survives a rebootstrap, and an
+  authentication failure is never a trigger — a rejected credential means the broker is reachable
+  and healthy, which no rebootstrap can fix. Setting `metadataRecoveryStrategy: 'none'` disables
+  all three triggers and restores the previous behavior exactly, with code 129 surfacing as the
+  non-retriable protocol error it already was.
+- **A recreated topic resets that topic's consumer offsets once.** Previously, when a topic was
+  deleted and recreated under a running consumer, the consumer kept using the committed offset from
+  the *previous* incarnation. Because the cleanup of `__consumer_offsets` is asynchronous, that
+  stale offset was often still there, and if it happened to fall inside the new topic's offset
+  range the broker accepted it: the consumer resumed in the middle of the new log and silently
+  skipped every record before that point, with no `OFFSET_OUT_OF_RANGE` and nothing in the log to
+  say so. Now a metadata refresh that sees a subscribed topic come back with a different topic id
+  emits `TOPIC_RECREATED`, drops the client's cached state for that topic, and resolves that
+  topic's next offsets from the boundary the subscription configured (`fromBeginning`) instead of
+  from the coordinator's committed offset. The reset is **one-shot** — it applies at the first
+  offset resolution after the recreation and then stops, so offsets committed against the *new*
+  incarnation are never discarded — and it is per that subscription's `fromBeginning`, not a global
+  reset. Partitions you paused stay paused across a recreation, because pausing is user intent
+  rather than offset state. There is no opt-out. An application that relied on offsets surviving a
+  topic recreation must stop relying on it; it was never a guarantee the broker made.
+- **Produce errors carry per-record detail.** The error thrown by a failed `send()`/`sendBatch()`
+  now carries `topic`, `partition`, the broker's own `errorMessage`, and, when the broker rejected
+  individual records rather than the whole partition, `recordErrors`: an array of
+  `{ batchIndex, record, errorMessage }`, where `record` is the message object you passed in, not a
+  copy or an index into a flattened list. `type`, `code` and `retriable` are unchanged. Which
+  failure is reported is also unchanged — the first failing partition in the response, exactly as
+  before — and there is still no automatic re-batching: a batch containing one rejected record
+  fails as a whole, as it always did.
+- **The producer follows leader hints.** When a produce request fails with a leadership error, a
+  Kafka 4.x broker also names the node that now leads the partition and, where the client may not
+  know it, that node's address. The producer now applies both immediately, so its next retry
+  attempt goes straight to the new leader instead of routing to the old one until the metadata
+  refresh finishes. Retry timing, the retry unit (the whole per-broker request) and the idempotent
+  producer's sequence bookkeeping are all unchanged. The one consequence to know about: if a hint
+  replaces the connection to a broker that had *already succeeded* within the current `send()`,
+  that broker's partitions are produced again on the next attempt. This slightly widens the
+  duplicate-on-retry window that already existed, and the array `send()` resolves with can then
+  contain two `RecordMetadata` entries for the same partition instead of one.
+- **Negotiated protocol versions moved up.** Against a Kafka 4.1 or 4.3 broker the client now
+  negotiates: Metadata **v13** (was v12), Produce **v11** (was v7), FindCoordinator **v6** (was
+  v2), OffsetCommit **v8** (was v5), OffsetFetch **v8** (was v4), ListOffsets **v9** (was v3) and
+  InitProducerId **v5** (was v1). What each means for a caller:
+  - *Metadata v13* adds a top-level error code to the response, surfaced ahead of any topic- or
+    partition-level error; it is how a broker asks a client to rebootstrap. Decoded metadata gains
+    an additive `errorCode`.
+  - *Produce v11* moves the hottest write path onto the compact (flexible) encoding and is what
+    makes the per-record errors and leader hints above possible.
+  - *FindCoordinator v6* takes a list of coordinator keys and answers with a list; this client asks
+    for one and reads one, so the decoded result keeps the shape it always had.
+  - *OffsetCommit v8* is what finally sends `groupInstanceId` on offset commits for consumers using
+    static membership — previously it reached JoinGroup, SyncGroup, Heartbeat and LeaveGroup only.
+    The per-partition committed leader epoch the protocol gained at v6 is sent as its default
+    (`-1`): it means the leader epoch of the *consumed record*, which this release does not track.
+  - *OffsetFetch v8* takes and returns a list of groups; again one is sent and one is read. Each
+    partition additionally carries `committedLeaderEpoch`, which nothing in this release reads.
+    `RequireStable` is sent `false`, so a transactional producer's in-flight offsets are returned
+    exactly as before.
+  - *ListOffsets v9* sends the leader epoch the client currently believes is in effect for each
+    partition (`-1` when it does not know one), so a broker can reject a request built on metadata
+    that has since moved; the response's per-partition leader epoch is decoded and returned
+    additively. Because the request now carries an epoch, `FENCED_LEADER_EPOCH` and
+    `UNKNOWN_LEADER_EPOCH` can now come back from the offset APIs, where they could not before —
+    the client refreshes metadata and retries, so callers see a slower call rather than a failure.
+  - *InitProducerId v5* sends the producer id and epoch fields added at v3 as their defaults
+    (`-1`), since this release does not re-initialise a fenced producer under its previous identity.
+    `PRODUCER_FENCED` and `TRANSACTION_ABORTABLE` can now reach an idempotent or transactional
+    producer's initialisation, both as the non-retriable protocol errors they already are.
+
+  Two versions are deliberately not implemented. **ListOffsets stops at v9**: v10 and v11 exist for
+  tiered storage — asynchronous remote list-offsets and the earliest pending upload offset — which
+  this client does not use, and both change the request's shape and semantics. **InitProducerId
+  stops at v5**: v6 is the two-phase-commit protocol, which upstream still marks unstable, so
+  brokers do not advertise it by default.
+- **Six new instrumentation events.** `TOPIC_RECREATED` and `REBOOTSTRAP` are available on all
+  three clients. Subscribe with `client.events.TOPIC_RECREATED` / `client.events.REBOOTSTRAP` as
+  usual; the `type` string delivered on the event is `consumer.cluster.topic_recreated`,
+  `producer.cluster.topic_recreated`, `admin.cluster.topic_recreated`,
+  `consumer.cluster.rebootstrap`, `producer.cluster.rebootstrap` and
+  `admin.cluster.rebootstrap` respectively. `TOPIC_RECREATED`'s payload is
+  `{ topic, previousTopicId, topicId }` and fires when a topic name the client already had metadata
+  for comes back with a different topic id; on a consumer it accompanies the one-shot offset reset
+  described above, while on a producer and an admin client it is purely observational.
+  `REBOOTSTRAP`'s payload is `{ reason }`, where `reason` is `'timeout'`, `'required'` or
+  `'all-brokers-unavailable'` for the three triggers described above; it never fires under
+  `metadataRecoveryStrategy: 'none'`.
+- **The `COMMIT_OFFSETS` event's payload gains `groupInstanceId`.** It is `string | null` and is
+  present for every consumer, not only those configured for static membership — the same additive
+  change `HEARTBEAT`'s payload received in the previous release. Every key the payload already had
+  is unchanged, so only code that deep-equality-compares the whole payload is affected.
