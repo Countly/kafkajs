@@ -137,6 +137,8 @@ describe('scripts/protocol > schema validation', () => {
       'src/protocol/requests/metadata/v11/response.js',
       'src/protocol/requests/metadata/v12/request.js',
       'src/protocol/requests/metadata/v12/response.js',
+      'src/protocol/requests/metadata/v13/request.js',
+      'src/protocol/requests/metadata/v13/response.js',
       'src/protocol/requests/metadata/v7/request.js',
       'src/protocol/requests/metadata/v7/response.js',
       'src/protocol/requests/metadata/v8/request.js',

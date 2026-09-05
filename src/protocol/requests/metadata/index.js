@@ -64,6 +64,11 @@ const versions = {
     const response = require('./v12/response')
     return { request: request({ topics, allowAutoTopicCreation }), response }
   },
+  13: ({ topics, allowAutoTopicCreation }) => {
+    const request = require('./v13/request')
+    const response = require('./v13/response')
+    return { request: request({ topics, allowAutoTopicCreation }), response }
+  },
 }
 
 module.exports = {

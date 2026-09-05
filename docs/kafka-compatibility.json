@@ -107,9 +107,10 @@
         9,
         10,
         11,
-        12
+        12,
+        13
       ],
-      "gap": "behind:1",
+      "gap": "current",
       "onFloor": false,
       "belowFloor": [],
       "notes": "v7 leader epoch (KIP-320), v9 flexible, v10+ topic IDs, v13 adds a top-level error code and is where REBOOTSTRAP_REQUIRED surfaces (KIP-1102)."

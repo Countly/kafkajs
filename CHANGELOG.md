@@ -98,6 +98,7 @@ Upstream work this phase builds on, with thanks to its authors: PRs #1779, #1695
 
 #### Behavior changes
 
+- Metadata requests are now sent at **v13** instead of v12. The only wire change is a top-level error code in the response, which the client now surfaces ahead of any topic- or partition-level error — this is how a broker tells a client its metadata is stale and it should rebootstrap (`REBOOTSTRAP_REQUIRED`, code 129). The decoded metadata gains an additive `errorCode` field; every existing key is unchanged.
 #### Fixes
 
 #### Additions
