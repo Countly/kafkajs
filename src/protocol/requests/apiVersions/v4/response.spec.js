@@ -101,4 +101,16 @@ describe('Protocol > Requests > ApiVersions > v4', () => {
     expect(data.apiVersions).toEqual([])
     expect(data.zkMigrationReady).toBe(false)
   })
+
+  test.each([
+    ['4.3.1', '../fixtures/v4_response_kafka431.json'],
+    ['4.1.2', '../fixtures/v4_response_kafka412.json'],
+  ])('decodes a real broker response from Kafka %s', async (_version, fixture) => {
+    const data = await decode(Buffer.from(require(fixture)))
+
+    const apiVersions = data.apiVersions.find((entry) => entry.apiKey === 18)
+    expect(apiVersions).toBeDefined()
+    expect(apiVersions.maxVersion).toBeGreaterThanOrEqual(4)
+    expect(data.supportedFeatures.length).toBeGreaterThan(0)
+  })
 })

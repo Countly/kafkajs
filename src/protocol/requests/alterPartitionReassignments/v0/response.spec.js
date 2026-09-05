@@ -54,4 +54,11 @@ describe('Protocol > Requests > AlterPartitionReassignments > v0', () => {
       })
     )
   })
+
+  test('decodes a captured Kafka 4.3.1 response', async () => {
+    const data = await decode(Buffer.from(require('../fixtures/v0_response_kafka431.json')))
+
+    expect(data.errorCode).toEqual(0)
+    expect(Array.isArray(data.responses)).toBe(true)
+  })
 })

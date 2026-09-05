@@ -149,4 +149,18 @@ describe('Protocol > Requests > Metadata > v12', () => {
       offlineReplicas: [],
     })
   })
+
+  test.each([
+    ['4.3.1', '../fixtures/v12_response_kafka431.json'],
+    ['4.1.2', '../fixtures/v12_response_kafka412.json'],
+  ])('decodes a real broker response from Kafka %s', async (_version, fixture) => {
+    const data = await decode(Buffer.from(require(fixture)))
+
+    expect(data.clusterId).toEqual('kafkajs-capture-clstr0')
+    expect(data.brokers.length).toBeGreaterThan(0)
+    const topic = data.topicMetadata.find((entry) => entry.topic === 'kafkajs-capture-topic')
+    expect(topic.topicId).toEqual('01020304-0506-0708-090a-0b0c0d0e0f10')
+    expect(topic.topicAuthorizedOperations).toEqual(-2147483648)
+    expect(topic.partitionMetadata[0].leaderEpoch).toBeGreaterThanOrEqual(0)
+  })
 })

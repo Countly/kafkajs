@@ -20,4 +20,16 @@ describe('Protocol > Requests > AlterPartitionReassignments > v0', () => {
     }).encode()
     expect(buffer).toEqual(Buffer.from(require('../fixtures/v0_request.json')))
   })
+
+  test('encodes to match a captured Kafka 4.3.1 request', async () => {
+    const { buffer } = await RequestV0Protocol({
+      topics: [
+        {
+          topic: 'kafkajs-capture-topic',
+          partitionAssignment: [{ partition: 0, replicas: [1, 2] }],
+        },
+      ],
+    }).encode()
+    expect(buffer).toEqual(Buffer.from(require('../fixtures/v0_request_kafka431.json')))
+  })
 })
