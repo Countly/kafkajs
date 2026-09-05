@@ -131,6 +131,10 @@ describe('scripts/protocol > schema validation', () => {
       'src/protocol/requests/listPartitionReassignments/v0/request.js',
       'src/protocol/requests/listPartitionReassignments/v0/response.js',
       'src/protocol/requests/metadata/v0/request.js',
+      'src/protocol/requests/metadata/v7/request.js',
+      'src/protocol/requests/metadata/v7/response.js',
+      'src/protocol/requests/metadata/v8/request.js',
+      'src/protocol/requests/metadata/v8/response.js',
     ])
   })
 })

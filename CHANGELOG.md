@@ -77,6 +77,7 @@ Quarantined tests retired in this phase: R1 (metadata for auto-created topics), 
 
 #### Additions
 - Protocol primitives for KIP-482 flexible versions: the encoder can write tagged-field sections (`writeTaggedFields`, sorted by tag, empty section = one `0x00`) and the `uuid` type (`writeUuid`/`readUuid`, 16 raw big-endian bytes with the all-zero value as the null sentinel). Internal — `src/**` is not importable.
+- Metadata v7 and v8 codecs. The decoded metadata now carries the partition `leaderEpoch` (v7+) and the topic/cluster authorized-operations bitfields (v8+); the client requests neither authorized-operations set (both flags are sent `false`). Nothing routes on these values yet.
 
 #### Tooling
 - New `npm run protocol:generate` / `npm run protocol:check`: `src/protocol/flexibleVersions.js` (the first flexible KIP-482 version of every API key) is generated from the committed Apache message-definition snapshot and checked for drift, so the header-version rule can never silently disagree with the protocol.
