@@ -354,14 +354,10 @@ module.exports = ({
             .offset,
         }))
       } catch (e) {
-        if (e.type === 'UNKNOWN_TOPIC_OR_PARTITION') {
+        // Stale metadata - an unknown or moved partition, or a leader epoch the broker fenced -
+        // is refreshed and retried; anything else fails fast.
+        if (staleMetadata(e) || staleLeaderEpoch(e)) {
           await cluster.refreshMetadata()
-          throw e
-        }
-
-        // A leader election between the metadata refresh and the ListOffsets call fences the
-        // epoch the request carried. The cluster has already refreshed; retry on fresh metadata.
-        if (staleLeaderEpoch(e)) {
           throw e
         }
 
@@ -417,14 +413,10 @@ module.exports = ({
                   .offset,
         }))
       } catch (e) {
-        if (e.type === 'UNKNOWN_TOPIC_OR_PARTITION') {
+        // Stale metadata - an unknown or moved partition, or a leader epoch the broker fenced -
+        // is refreshed and retried; anything else fails fast.
+        if (staleMetadata(e) || staleLeaderEpoch(e)) {
           await cluster.refreshMetadata()
-          throw e
-        }
-
-        // See fetchTopicOffsets: a fenced leader epoch is retriable, and the cluster refreshed
-        // metadata before rethrowing it.
-        if (staleLeaderEpoch(e)) {
           throw e
         }
 

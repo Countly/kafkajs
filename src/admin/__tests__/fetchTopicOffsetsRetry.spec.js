@@ -3,6 +3,7 @@ const { createErrorFromCode } = require('../../protocol/error')
 const { newLogger } = require('testHelpers')
 
 const TOPIC = 'test-topic'
+const NOT_LEADER_FOR_PARTITION = 6
 const FENCED_LEADER_EPOCH = 74
 const UNKNOWN_LEADER_EPOCH = 75
 const TOPIC_AUTHORIZATION_FAILED = 29
@@ -23,7 +24,7 @@ const stubCluster = (fetchTopicsOffset) => ({
 // Rebuilt per call: the admin methods `pop()` the array they are handed.
 const offsets = () => [{ topic: TOPIC, partitions: [{ partition: 0, offset: '5' }] }]
 
-describe('Admin > offset APIs > a fenced leader epoch is retried, not bailed', () => {
+describe('Admin > offset APIs > stale metadata is refreshed and retried, not bailed', () => {
   const retry = { retries: 3, initialRetryTime: 1, maxRetryTime: 2 }
 
   const failFirstCall = (code) => {
@@ -41,20 +42,20 @@ describe('Admin > offset APIs > a fenced leader epoch is retried, not bailed', (
   }
 
   test.each([
+    [NOT_LEADER_FOR_PARTITION, 'NOT_LEADER_FOR_PARTITION'],
     [FENCED_LEADER_EPOCH, 'FENCED_LEADER_EPOCH'],
     [UNKNOWN_LEADER_EPOCH, 'UNKNOWN_LEADER_EPOCH'],
   ])('fetchTopicOffsets succeeds after one %s (%s)', async (code) => {
     const state = failFirstCall(code)
-    const admin = createAdmin({
-      logger: newLogger(),
-      retry,
-      cluster: stubCluster(state.fetchTopicsOffset),
-    })
+    const cluster = stubCluster(state.fetchTopicsOffset)
+    cluster.refreshMetadata = jest.fn(async () => {})
+    const admin = createAdmin({ logger: newLogger(), retry, cluster })
 
     await expect(admin.fetchTopicOffsets(TOPIC)).resolves.toEqual([
       { partition: 0, offset: '5', high: '5', low: '5' },
     ])
     expect(state.calls).toBeGreaterThan(1)
+    expect(cluster.refreshMetadata).toHaveBeenCalledTimes(1)
   })
 
   test('fetchTopicOffsetsByTimestamp succeeds after one fenced leader epoch', async () => {
