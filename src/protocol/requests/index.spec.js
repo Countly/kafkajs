@@ -117,5 +117,32 @@ describe('Protocol > Requests', () => {
         expect(() => lookup(KAFKA_4_3)(apiKey, requests[apiName])).not.toThrow()
       })
     })
+
+    describe('lookup with an internal version cap', () => {
+      const versions = { 3: { minVersion: 0, maxVersion: 13 } }
+      const definition = { versions: ['0', '6', '12'], protocol: ({ version }) => ({ version }) }
+
+      test('caps the negotiated version for one API', () => {
+        expect(lookup(versions, { 3: 6 })(3, definition)).toEqual({ version: 6 })
+      })
+
+      test('leaves other APIs alone', () => {
+        expect(lookup(versions, { 18: 2 })(3, definition)).toEqual({ version: 12 })
+      })
+
+      test('a cap above the negotiated version changes nothing', () => {
+        expect(lookup(versions, { 3: 99 })(3, definition)).toEqual({ version: 12 })
+      })
+
+      test('a cap below every implemented version is rejected like any other non-overlap', () => {
+        expect(() => lookup(versions, { 3: -1 })(3, definition)).toThrow(
+          KafkaJSServerDoesNotSupportApiKey
+        )
+      })
+
+      test('no cap behaves exactly as before', () => {
+        expect(lookup(versions)(3, definition)).toEqual({ version: 12 })
+      })
+    })
   })
 })
