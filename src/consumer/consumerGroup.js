@@ -67,6 +67,11 @@ module.exports = class ConsumerGroup {
    *                                JoinGroup/SyncGroup/Heartbeat/LeaveGroup so the coordinator
    *                                recognizes this member across restarts.
    * @param {number} options.metadataMaxAge
+   * @param {Map<string, string>} [options.pendingTopicResets] Topics deleted and recreated while
+   *                                subscribed, each keyed by topic and stamped with its new topic
+   *                                id (owned by the long-lived `Consumer`; passed through to every
+   *                                `OffsetManager` this group builds, since the group itself is
+   *                                rebuilt on every crash restart).
    */
   constructor({
     retry,
@@ -91,6 +96,7 @@ module.exports = class ConsumerGroup {
     checkCrcs,
     groupInstanceId = null,
     metadataMaxAge,
+    pendingTopicResets = new Map(),
   }) {
     /** @type {import("../../types").Cluster} */
     this.cluster = cluster
@@ -116,6 +122,7 @@ module.exports = class ConsumerGroup {
     this.checkCrcs = checkCrcs
     this.groupInstanceId = groupInstanceId
     this.metadataMaxAge = metadataMaxAge
+    this.pendingTopicResets = pendingTopicResets
     this.staticMembershipInactiveWarned = false
 
     this.seekOffset = new SeekOffsets()
@@ -380,6 +387,7 @@ module.exports = class ConsumerGroup {
       groupId,
       generationId,
       memberId,
+      pendingTopicResets: this.pendingTopicResets,
     })
   }
 
@@ -449,6 +457,35 @@ module.exports = class ConsumerGroup {
    */
   seek({ topic, partition, offset }) {
     this.seekOffset.set(topic, partition, offset)
+  }
+
+  /**
+   * Drops every piece of state this member holds for one topic, because that topic was deleted
+   * and recreated: its offsets, its preferred read replicas, and any pending seek. The
+   * corresponding one-shot reset is applied at the next offset resolution.
+   *
+   * A no-op before the first sync (`offsetManager` is null until then) and for a topic outside
+   * the current member assignment - the second guard keeps this member from writing a key it
+   * does not own into the committed-offsets map, which is shared by every consumer built from
+   * the same client with the same group id.
+   *
+   * Precedence with `seek()`: a seek pending here (queued but not yet applied) targets the
+   * *old* incarnation and is dropped along with everything else, via `seekOffset.deleteTopic()`.
+   * A seek issued *after* this call returns, applied in the same `seekOffsets()` cycle, targets
+   * the current incarnation and wins over the reset for that partition - see
+   * `ConsumerGroup#seekOffsets()` and `OffsetManager#drainPendingTopicResets()`.
+   *
+   * @param {string} topic
+   * @returns {void}
+   */
+  invalidateTopic(topic) {
+    if (!this.offsetManager || !Object.hasOwn(this.offsetManager.memberAssignment, topic)) {
+      return
+    }
+
+    this.preferredReadReplicasPerTopicPartition[topic] = {}
+    this.seekOffset.deleteTopic(topic)
+    this.offsetManager.resetOffsetsForTopic(topic)
   }
 
   pause(topicPartitions) {
@@ -722,7 +759,17 @@ module.exports = class ConsumerGroup {
     }
   }
 
+  /**
+   * Applies every pending `seek()` for the given topic/partitions, then resolves offsets for the
+   * rest. A seek applied here that lands on a topic with a pending recreation reset (set by
+   * `invalidateTopic()` earlier in this same fetch cycle) wins over that reset for its own
+   * partition: `resolveOffsets()` is told which partitions were just seeked and leaves them
+   * alone. No `Set` is allocated when nothing was seeked.
+   * @param {import("../../types").TopicPartitions[]} topicPartitions
+   * @returns {Promise<void>}
+   */
   async seekOffsets(topicPartitions) {
+    let seekedPartitions
     for (const { topic, partitions } of topicPartitions) {
       for (const partition of partitions) {
         const seekEntry = this.seekOffset.pop(topic, partition)
@@ -735,11 +782,18 @@ module.exports = class ConsumerGroup {
           memberId: this.memberId,
           seek: seekEntry,
         })
-        await this.offsetManager.seek(seekEntry)
+
+        const applied = await this.offsetManager.seek(seekEntry)
+        if (applied) {
+          seekedPartitions = seekedPartitions || new Set()
+          seekedPartitions.add(
+            OffsetManager.seekedPartitionKey(seekEntry.topic, seekEntry.partition)
+          )
+        }
       }
     }
 
-    await this.offsetManager.resolveOffsets()
+    await this.offsetManager.resolveOffsets(seekedPartitions)
   }
 
   hasSeekOffset({ topic, partition }) {

@@ -24,4 +24,23 @@ module.exports = class SeekOffsets extends Map {
     this.delete(key)
     return { topic, partition, offset }
   }
+
+  /**
+   * Drops every pending seek for one topic. Used when a topic is recreated: a seek against the
+   * previous incarnation means nothing against the new one.
+   * @param {string} topic
+   * @returns {number} how many entries were removed
+   */
+  deleteTopic(topic) {
+    let removed = 0
+
+    for (const key of [...super.keys()]) {
+      if (JSON.parse(key)[0] === topic) {
+        this.delete(key)
+        removed += 1
+      }
+    }
+
+    return removed
+  }
 }

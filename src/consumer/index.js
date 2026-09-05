@@ -104,8 +104,58 @@ module.exports = ({
     )
   }
 
+  /**
+   * Topics deleted and recreated while this consumer was subscribed, each stamped with the new
+   * topic id. Owned here rather than on the ConsumerGroup or the OffsetManager because both of
+   * those are rebuilt - the group on every crash restart, the manager on every sync - and a
+   * rebalance is exactly what a recreation provokes.
+   * @type {Map<string, string>}
+   */
+  const pendingTopicResets = new Map()
+  let removeTopicRecreatedListener = null
+
+  /**
+   * Subscribes to the cluster's topic-recreation event, at most once. Called at construction and
+   * again from connect(), run() and start(), so a consumer reused after disconnect() - including
+   * the restart onCrash schedules, which reaches start() alone - re-arms rather than running
+   * with the reset silently inert.
+   *
+   * The handler body is wrapped in try/catch: it runs synchronously inside the cluster's
+   * `emit()`, called from `BrokerPool#refreshMetadata` - an uncaught throw here would escape as
+   * a metadata-refresh failure and could itself trigger a rebootstrap, turning a topic
+   * recreation into a connection storm.
+   * @returns {void}
+   */
+  const ensureTopicRecreatedSubscription = () => {
+    if (removeTopicRecreatedListener) {
+      return
+    }
+
+    removeTopicRecreatedListener = cluster.onTopicRecreated(({ payload }) => {
+      try {
+        const { topic, topicId } = payload
+
+        if (!Object.hasOwn(topics, topic)) {
+          return
+        }
+
+        pendingTopicResets.set(topic, topicId)
+        consumerGroup && consumerGroup.invalidateTopic(topic)
+      } catch (e) {
+        logger.error(`Failed to handle topic recreation: ${e.message}`, {
+          groupId,
+          stack: e.stack,
+          payload,
+        })
+      }
+    })
+  }
+
+  ensureTopicRecreatedSubscription()
+
   /** @type {import("../../types").Consumer["connect"]} */
   const connect = async () => {
+    ensureTopicRecreatedSubscription()
     await cluster.connect()
     instrumentationEmitter.emit(CONNECT)
   }
@@ -123,6 +173,9 @@ module.exports = ({
         groupId,
       })
       throw e
+    } finally {
+      removeTopicRecreatedListener && removeTopicRecreatedListener()
+      removeTopicRecreatedListener = null
     }
   }
 
@@ -224,12 +277,15 @@ module.exports = ({
     eachBatch = null,
     eachMessage = null,
   } = {}) => {
+    ensureTopicRecreatedSubscription()
+
     if (consumerGroup) {
       logger.warn('consumer#run was called, but the consumer is already running', { groupId })
       return
     }
 
     const start = async (onCrash) => {
+      ensureTopicRecreatedSubscription()
       logger.info('Starting', { groupId })
 
       consumerGroup = new ConsumerGroup({
@@ -255,6 +311,7 @@ module.exports = ({
         autoCommit,
         autoCommitInterval,
         autoCommitThreshold,
+        pendingTopicResets,
       })
 
       runner = new Runner({

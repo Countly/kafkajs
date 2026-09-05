@@ -11,6 +11,7 @@ const createFakeCluster = ({ connect = async () => {} } = {}) => ({
   removeBroker: jest.fn(),
   isConnected: () => true,
   addMultipleTargetTopics: jest.fn(async () => {}),
+  onTopicRecreated: () => () => {},
   retry: {},
 })
 
