@@ -13,14 +13,26 @@
  * @param {{ topics: { topicName: string, partitions: object[] }[] }} response decoded response
  * @returns {object[]} one flattened record per partition, exactly `RecordMetadata`'s shape
  */
+/** The public RecordMetadata keys, in type order; decoder-only fields never pass through. */
+const RECORD_METADATA_KEYS = [
+  'partition',
+  'errorCode',
+  'offset',
+  'timestamp',
+  'baseOffset',
+  'logAppendTime',
+  'logStartOffset',
+]
+
 module.exports = ({ topics }) =>
   topics.flatMap(({ topicName, partitions }) =>
-    partitions.map(({ partition, errorCode, baseOffset, logAppendTime, logStartOffset }) => ({
-      topicName,
-      partition,
-      errorCode,
-      baseOffset,
-      logAppendTime,
-      logStartOffset,
-    }))
+    partitions.map((partition) => {
+      const metadata = { topicName }
+      for (const key of RECORD_METADATA_KEYS) {
+        if (partition[key] !== undefined) {
+          metadata[key] = partition[key]
+        }
+      }
+      return metadata
+    })
   )
