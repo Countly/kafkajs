@@ -72,8 +72,6 @@ Not per-API, and not derivable from the message definitions. Each row names the 
 
 | Gap | Where | Impact | Owner |
 |---|---|---|---|
-| Only partial tagged-field support and no flexible request/response headers | src/protocol/request.js (request header hardcoded to v1), src/protocol/decoder.js readTaggedFields() | Empty tag buffers are written and read for keys 45/46 only; a non-empty tag buffer is mis-skipped by one byte and nothing can encode a tagged field. This blocks every flexible version in the table above. | phase-4 |
-| ApiVersions is cached once per broker connection and never refreshed | src/broker/index.js connect() | A stale version table during a rolling upgrade, contrary to the KIP-35 negotiation rules. | phase-4 |
 | Version negotiation ignores the broker's advertised minimum version | src/protocol/requests/index.js lookup() | Under a raised KIP-896 floor the client silently sends a version the broker rejects instead of failing with a clear error. This is what makes the below-floor list below dangerous rather than merely dead. | phase-2 |
 | No topic-ID (UUID) awareness anywhere in cluster metadata | cluster metadata, fetch and offset paths | Blocks Fetch v13+, Produce v13, OffsetCommit/OffsetFetch v10, DeleteTopics v6, CreateTopics v7 ids, KIP-848 assignments, and exact topic-recreation detection. | phase-5 |
 | No fetch sessions (KIP-227) | fetch layer | Every poll sends a full fetch request; incremental fetch is a prerequisite for efficient modern Fetch versions. | phase-5 |

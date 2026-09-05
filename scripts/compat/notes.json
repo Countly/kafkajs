@@ -135,18 +135,6 @@
   },
   "crossCutting": [
     {
-      "gap": "Only partial tagged-field support and no flexible request/response headers",
-      "where": "src/protocol/request.js (request header hardcoded to v1), src/protocol/decoder.js readTaggedFields()",
-      "impact": "Empty tag buffers are written and read for keys 45/46 only; a non-empty tag buffer is mis-skipped by one byte and nothing can encode a tagged field. This blocks every flexible version in the table above.",
-      "owner": "phase-4"
-    },
-    {
-      "gap": "ApiVersions is cached once per broker connection and never refreshed",
-      "where": "src/broker/index.js connect()",
-      "impact": "A stale version table during a rolling upgrade, contrary to the KIP-35 negotiation rules.",
-      "owner": "phase-4"
-    },
-    {
       "gap": "Version negotiation ignores the broker's advertised minimum version",
       "where": "src/protocol/requests/index.js lookup()",
       "impact": "Under a raised KIP-896 floor the client silently sends a version the broker rejects instead of failing with a clear error. This is what makes the below-floor list below dangerous rather than merely dead.",
