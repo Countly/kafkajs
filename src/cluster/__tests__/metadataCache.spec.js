@@ -5,6 +5,7 @@ const { newLogger } = require('testHelpers')
 
 const ID_A = '01020304-0506-0708-090a-0b0c0d0e0f10'
 const ID_B = '11121314-1516-1718-191a-1b1c1d1e1f20'
+const NO_TOPIC_ID = '00000000-0000-0000-0000-000000000000'
 
 /**
  * A decoded Metadata response shaped exactly like metadata/v12/response.js#decode returns:
@@ -92,6 +93,31 @@ describe('Cluster > MetadataCache', () => {
   test('the first sighting of a topic is not a recreation', () => {
     cache.update(response({ topicId: ID_A }))
     expect(events).toEqual([])
+  })
+
+  test('a deleted window (the topic answered with the all-zero id) keeps the remembered id, so the recreation that follows is detected', () => {
+    cache.update(response({ topicId: ID_A }))
+
+    const deleted = response({ topicId: NO_TOPIC_ID })
+    deleted.topicMetadata[0].topicErrorCode = 3
+    deleted.topicMetadata[0].partitionMetadata = []
+    cache.update(deleted)
+
+    expect(events).toEqual([])
+    expect(cache.topicId('test-topic')).toEqual(ID_A)
+
+    cache.update(response({ topicId: ID_B, leaderEpoch: 0 }))
+
+    expect(events).toEqual([{ topic: 'test-topic', previousTopicId: ID_A, topicId: ID_B }])
+    expect(cache.topicId('test-topic')).toEqual(ID_B)
+  })
+
+  test('a topic first seen with the all-zero id is not a recreation when its real id arrives', () => {
+    cache.update(response({ topicId: NO_TOPIC_ID }))
+    cache.update(response({ topicId: ID_A }))
+
+    expect(events).toEqual([])
+    expect(cache.topicId('test-topic')).toEqual(ID_A)
   })
 
   test('a topic-id change resets that topic epochs, so epoch 0 on the new incarnation is accepted', () => {

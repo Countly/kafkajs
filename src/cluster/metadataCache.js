@@ -114,9 +114,11 @@ module.exports = class MetadataCache {
         recreations.push(recreation)
       }
 
-      // The all-zero uuid is "no id", not an id: recording it would make the next real id look
-      // like a recreation, and would let `topicId()` hand a caller a sentinel to route on.
-      entry.topicId = this.usableTopicId(topicMetadata.topicId)
+      // The all-zero uuid is "no id", not an id: a broker answers with it while a topic is deleted
+      // or still being created. It is never recorded - `topicId()` must not hand out a sentinel -
+      // and it never erases a remembered id either, so the real id that follows a deleted window
+      // still compares against the previous incarnation and the recreation is detected.
+      entry.topicId = this.usableTopicId(topicMetadata.topicId) ?? entry.topicId
       entry.seenAt = this.generation
       entry.decodedReleased = false
 
