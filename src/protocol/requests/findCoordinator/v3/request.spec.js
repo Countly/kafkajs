@@ -14,4 +14,13 @@ describe('Protocol > Requests > FindCoordinator > v3', () => {
     expect(decoder.readTaggedFields().size).toEqual(0)
     expect(decoder.canReadBytes(1)).toBe(false)
   })
+
+  test('encodes byte-identically to the Apache kafka-clients 4.3.1 codec', async () => {
+    const { buffer } = await RequestV3Protocol({
+      coordinatorKey: 'test-group',
+      coordinatorType: 0,
+    }).encode()
+
+    expect(buffer).toEqual(Buffer.from(require('../fixtures/v3_request_java.json')))
+  })
 })

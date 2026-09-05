@@ -61,4 +61,27 @@ describe('Protocol > Requests > Metadata > v13', () => {
 
     await expect(parse(data)).rejects.toMatchObject({ type: 'REBOOTSTRAP_REQUIRED' })
   })
+
+  test('decodes the vector the Apache kafka-clients 4.3.1 codec produced', async () => {
+    const fromJava = await decode(Buffer.from(require('../fixtures/v13_response_java.json')))
+    const fromHand = await decode(Buffer.from(require('../fixtures/v13_response.json')))
+
+    expect(fromJava).toEqual(fromHand)
+  })
+
+  test.each([
+    ['4.3.1', '../fixtures/v13_response_kafka431.json'],
+    ['4.1.2', '../fixtures/v13_response_kafka412.json'],
+  ])('decodes a real broker response from Kafka %s', async (_version, fixture) => {
+    const data = await decode(Buffer.from(require(fixture)))
+
+    expect(data.errorCode).toEqual(0)
+    expect(data.clusterId).toEqual('kafkajs-capture-clstr0')
+    expect(data.brokers.length).toBeGreaterThan(0)
+
+    const topic = data.topicMetadata.find((entry) => entry.topic === 'kafkajs-capture-topic')
+    expect(topic.topicId).toEqual('01020304-0506-0708-090a-0b0c0d0e0f10')
+    expect(topic.topicErrorCode).toEqual(0)
+    expect(topic.partitionMetadata[0].leaderEpoch).toBeGreaterThanOrEqual(0)
+  })
 })

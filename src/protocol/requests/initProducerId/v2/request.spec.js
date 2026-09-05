@@ -19,4 +19,13 @@ describe('Protocol > Requests > InitProducerId > v2', () => {
     const { buffer } = await RequestV2Protocol({ transactionTimeout: 5000 }).encode()
     expect(buffer[0]).toEqual(0) // compact null string
   })
+
+  test('encodes byte-identically to the Apache kafka-clients 4.3.1 codec', async () => {
+    const { buffer } = await RequestV2Protocol({
+      transactionalId: 'test-transactional-id',
+      transactionTimeout: 30000,
+    }).encode()
+
+    expect(buffer).toEqual(Buffer.from(require('../fixtures/v2_request_java.json')))
+  })
 })

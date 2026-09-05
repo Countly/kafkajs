@@ -17,4 +17,19 @@ describe('Protocol > Requests > ListOffsets > v7', () => {
     const { apiVersion } = RequestV7Protocol({ replicaId: -1, isolationLevel: 0, topics: [] })
     expect(apiVersion).toEqual(7)
   })
+
+  test('encodes byte-identically to the Apache kafka-clients 4.3.1 codec', async () => {
+    const { buffer } = await RequestV7Protocol({
+      replicaId: -1,
+      isolationLevel: 0,
+      topics: [
+        {
+          topic: 'test-topic',
+          partitions: [{ partition: 0, currentLeaderEpoch: 5, timestamp: -2 }],
+        },
+      ],
+    }).encode()
+
+    expect(buffer).toEqual(Buffer.from(require('../fixtures/v7_request_java.json')))
+  })
 })

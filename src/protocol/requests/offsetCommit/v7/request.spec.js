@@ -64,4 +64,16 @@ describe('Protocol > Requests > OffsetCommit > v7', () => {
     })
     expect(decoder.canReadBytes(1)).toBe(false)
   })
+
+  test('encodes byte-identically to the Apache kafka-clients 4.3.1 codec', async () => {
+    const { buffer } = await RequestV7Protocol({
+      groupId: 'test-group',
+      groupGenerationId: 5,
+      memberId: 'test-member',
+      groupInstanceId: 'test-instance',
+      topics: [{ topic: 'test-topic', partitions: [{ partition: 0, offset: '10' }] }],
+    }).encode()
+
+    expect(buffer).toEqual(Buffer.from(require('../fixtures/v7_request_java.json')))
+  })
 })

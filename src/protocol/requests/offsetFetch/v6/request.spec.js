@@ -30,4 +30,13 @@ describe('Protocol > Requests > OffsetFetch > v6', () => {
     decoder.readUVarIntString()
     expect(decoder.readUVarIntArray(() => {})).toBeNull()
   })
+
+  test('encodes byte-identically to the Apache kafka-clients 4.3.1 codec', async () => {
+    const { buffer } = await RequestV6Protocol({
+      groupId: 'test-group',
+      topics: [{ topic: 'test-topic', partitions: [{ partition: 0 }] }],
+    }).encode()
+
+    expect(buffer).toEqual(Buffer.from(require('../fixtures/v6_request_java.json')))
+  })
 })

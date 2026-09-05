@@ -32,4 +32,9 @@ describe('Protocol > Requests > Metadata > v13', () => {
     const { buffer } = await RequestV13Protocol({ topics: [] }).encode()
     expect(buffer[0]).toEqual(0)
   })
+
+  test('encodes byte-identically to the Apache kafka-clients 4.3.1 codec', async () => {
+    const { buffer } = await RequestV13Protocol({ topics: ['test-topic'] }).encode()
+    expect(buffer).toEqual(Buffer.from(require('../fixtures/v13_request_java.json')))
+  })
 })

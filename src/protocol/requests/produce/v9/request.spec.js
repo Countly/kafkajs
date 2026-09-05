@@ -106,4 +106,31 @@ describe('Protocol > Requests > Produce > v9', () => {
     expect(RequestV9Protocol({ acks: 0, timeout: 1, topicData }).expectResponse()).toBe(false)
     expect(RequestV9Protocol({ acks: -1, timeout: 1, topicData }).expectResponse()).toBe(true)
   })
+
+  test('decodes the vector the Apache kafka-clients 4.3.1 codec produced', async () => {
+    // The generator emits a null Records field: a record batch carries a wall-clock timestamp and
+    // a CRC over it, so no second encoder can reproduce one byte-for-byte.
+    const decoder = new Decoder(Buffer.from(require('../fixtures/v9_request_java.json')))
+
+    expect(decoder.readUVarIntString()).toBeNull() // transactionalId
+    expect(decoder.readInt16()).toEqual(-1) // acks
+    expect(decoder.readInt32()).toEqual(30000) // timeoutMs
+
+    const topics = decoder.readUVarIntArray((d) => {
+      const topic = {
+        name: d.readUVarIntString(),
+        partitions: d.readUVarIntArray((p) => {
+          const partition = { index: p.readInt32(), records: p.readUVarIntBytes() }
+          p.readTaggedFields()
+          return partition
+        }),
+      }
+      d.readTaggedFields()
+      return topic
+    })
+
+    expect(topics).toEqual([{ name: 'test-topic', partitions: [{ index: 0, records: null }] }])
+    expect(decoder.readTaggedFields().size).toEqual(0)
+    expect(decoder.canReadBytes(1)).toBe(false)
+  })
 })

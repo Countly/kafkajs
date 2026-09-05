@@ -15,4 +15,13 @@ describe('Protocol > Requests > OffsetFetch > v5', () => {
     const { buffer } = await RequestV5Protocol({ groupId, topics }).encode()
     expect(buffer).toEqual(Buffer.from(require('../fixtures/v3_request.json')))
   })
+
+  test('encodes byte-identically to the Apache kafka-clients 4.3.1 codec', async () => {
+    const { buffer } = await RequestV5Protocol({
+      groupId: 'test-group',
+      topics: [{ topic: 'test-topic', partitions: [{ partition: 0 }] }],
+    }).encode()
+
+    expect(buffer).toEqual(Buffer.from(require('../fixtures/v5_request_java.json')))
+  })
 })

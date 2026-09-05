@@ -66,4 +66,20 @@ describe('Protocol > Requests > Produce > v10', () => {
     expect(data.topics[0].partitions[0].currentLeader).toEqual({ leaderId: 2, leaderEpoch: 7 })
     expect(data.nodeEndpoints).toEqual([])
   })
+
+  test('decodes the vector the Apache kafka-clients 4.3.1 codec produced', async () => {
+    const data = await decode(Buffer.from(require('../fixtures/v10_response_java.json')))
+
+    expect(data.topics[0].partitions[0]).toEqual({
+      partition: 0,
+      errorCode: 0,
+      baseOffset: '100',
+      logAppendTime: '-1',
+      logStartOffset: '0',
+      recordErrors: [],
+      errorMessage: null,
+      currentLeader: { leaderId: 2, leaderEpoch: 7 },
+    })
+    expect(data.nodeEndpoints).toEqual([{ nodeId: 2, host: '127.0.0.1', port: 9092, rack: null }])
+  })
 })

@@ -36,4 +36,18 @@ describe('Protocol > Requests > FindCoordinator > v4', () => {
       retriable: false,
     })
   })
+
+  test('decodes the vector the Apache kafka-clients 4.3.1 codec produced', async () => {
+    const data = await decode(Buffer.from(require('../fixtures/v4_response_java.json')))
+
+    expect(data).toEqual({
+      throttleTime: 0,
+      clientSideThrottleTime: 0,
+      errorCode: 0,
+      errorMessage: null,
+      coordinator: { nodeId: 1, host: '127.0.0.1', port: 9092 },
+    })
+
+    await expect(parse(data)).resolves.toBeTruthy()
+  })
 })

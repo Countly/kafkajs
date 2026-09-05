@@ -21,4 +21,13 @@ describe('Protocol > Requests > FindCoordinator > v4', () => {
     // KeyType is the first byte at v4; at v3 the first byte is the compact string length of Key.
     expect(buffer[0]).toEqual(1)
   })
+
+  test('encodes byte-identically to the Apache kafka-clients 4.3.1 codec', async () => {
+    const { buffer } = await RequestV4Protocol({
+      coordinatorKey: 'test-group',
+      coordinatorType: 0,
+    }).encode()
+
+    expect(buffer).toEqual(Buffer.from(require('../fixtures/v4_request_java.json')))
+  })
 })
