@@ -163,9 +163,13 @@
         1,
         2,
         3,
-        4
+        4,
+        5,
+        6,
+        7,
+        8
       ],
-      "gap": "behind:6",
+      "gap": "behind:2",
       "onFloor": false,
       "belowFloor": [],
       "notes": "v5 leader epoch, v6 flexible, v7 require-stable (KIP-447), v8 multi-group batching, v9 member epoch (KIP-848), v10 topic IDs. The fork has no v0 codec, which is correct: v0 read offsets from ZooKeeper."

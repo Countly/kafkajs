@@ -13,7 +13,7 @@ Gap classes: `current` (fork max equals the Kafka max) · `behind:N` · `stub` (
 | ListOffsets | 2 | 1-11 | v6+ | 1-3 | behind:8 | v4 leader epoch (KIP-320), v6 flexible, v7 max-timestamp, v8 earliest-local offset (KIP-405). |
 | Metadata | 3 | 0-13 | v9+ | 0-13 | current | v7 leader epoch (KIP-320), v9 flexible, v10+ topic IDs, v13 adds a top-level error code and is where REBOOTSTRAP_REQUIRED surfaces (KIP-1102). |
 | OffsetCommit | 8 | 2-10 | v8+ | 2-8 | behind:2 | v6 committed leader epoch (KIP-320), v7 group instance id, v8 flexible, v9 member epoch (KIP-848), v10 topic IDs. |
-| OffsetFetch | 9 | 1-10 | v6+ | 1-4 | behind:6 | v5 leader epoch, v6 flexible, v7 require-stable (KIP-447), v8 multi-group batching, v9 member epoch (KIP-848), v10 topic IDs. The fork has no v0 codec, which is correct: v0 read offsets from ZooKeeper. |
+| OffsetFetch | 9 | 1-10 | v6+ | 1-8 | behind:2 | v5 leader epoch, v6 flexible, v7 require-stable (KIP-447), v8 multi-group batching, v9 member epoch (KIP-848), v10 topic IDs. The fork has no v0 codec, which is correct: v0 read offsets from ZooKeeper. |
 | FindCoordinator | 10 | 0-6 | v3+ | 0-6 | current | v3 flexible, v4 multi-key batch (KIP-699), v5 TRANSACTION_ABORTABLE (KIP-890), v6 KeyType SHARE=2 (KIP-932, broker-internal). apiKeys.js still calls key 10 GroupCoordinator, the pre-0.11 name. |
 | JoinGroup | 11 | 0-9 | v6+ | 0-5 | behind:4 | v5 encodes groupInstanceId but nothing plumbs it: Broker.joinGroup() has no such parameter, so static membership (KIP-345) is inert today. |
 | Heartbeat | 12 | 0-4 | v4+ | 0-3 | behind:1 |  |

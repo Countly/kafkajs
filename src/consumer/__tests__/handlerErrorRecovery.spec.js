@@ -111,7 +111,9 @@ describe('Consumer', () => {
         errorCode: 0,
         responses: [
           {
-            partitions: [{ errorCode: 0, metadata: '', offset: '2', partition: 0 }],
+            partitions: [
+              { committedLeaderEpoch: -1, errorCode: 0, metadata: '', offset: '2', partition: 0 },
+            ],
             topic: topicName,
           },
         ],
@@ -149,7 +151,9 @@ describe('Consumer', () => {
         errorCode: 0,
         responses: [
           {
-            partitions: [{ errorCode: 0, metadata: '', offset: '-1', partition: 0 }], // the offset stays the same
+            partitions: [
+              { committedLeaderEpoch: -1, errorCode: 0, metadata: '', offset: '-1', partition: 0 },
+            ], // the offset stays the same
             topic: topicName,
           },
         ],
@@ -239,7 +243,9 @@ describe('Consumer', () => {
         errorCode: 0,
         responses: [
           {
-            partitions: [{ errorCode: 0, metadata: '', offset: '2', partition: 0 }],
+            partitions: [
+              { committedLeaderEpoch: -1, errorCode: 0, metadata: '', offset: '2', partition: 0 },
+            ],
             topic: topicName,
           },
         ],
