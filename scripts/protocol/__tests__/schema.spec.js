@@ -128,6 +128,14 @@ describe('scripts/protocol > schema validation', () => {
       'src/protocol/requests/apiVersions/v3/response.js',
       'src/protocol/requests/apiVersions/v4/request.js',
       'src/protocol/requests/apiVersions/v4/response.js',
+      'src/protocol/requests/findCoordinator/v3/request.js',
+      'src/protocol/requests/findCoordinator/v3/response.js',
+      'src/protocol/requests/findCoordinator/v4/request.js',
+      'src/protocol/requests/findCoordinator/v4/response.js',
+      'src/protocol/requests/findCoordinator/v5/request.js',
+      'src/protocol/requests/findCoordinator/v5/response.js',
+      'src/protocol/requests/findCoordinator/v6/request.js',
+      'src/protocol/requests/findCoordinator/v6/response.js',
       'src/protocol/requests/listPartitionReassignments/v0/request.js',
       'src/protocol/requests/listPartitionReassignments/v0/response.js',
       'src/protocol/requests/metadata/v0/request.js',
@@ -145,6 +153,10 @@ describe('scripts/protocol > schema validation', () => {
       'src/protocol/requests/metadata/v8/response.js',
       'src/protocol/requests/metadata/v9/request.js',
       'src/protocol/requests/metadata/v9/response.js',
+      'src/protocol/requests/produce/v8/request.js',
+      'src/protocol/requests/produce/v8/response.js',
+      'src/protocol/requests/produce/v9/request.js',
+      'src/protocol/requests/produce/v9/response.js',
     ])
   })
 })

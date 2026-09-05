@@ -2,8 +2,7 @@ const Long = require('../../../../utils/long')
 const Encoder = require('../../../encoder')
 const { Produce: apiKey } = require('../../apiKeys')
 const { Types } = require('../../../message/compression')
-const Record = require('../../../recordBatch/record/v0')
-const { RecordBatch } = require('../../../recordBatch/v0')
+const buildRecordBatch = require('../buildRecordBatch')
 
 /**
  * Produce Request (Version: 3) => transactional_id acks timeout [topic_data]
@@ -73,34 +72,13 @@ const topicEncoder =
 const partitionsEncoder =
   (compression) =>
   async ({ partition, messages, transactionalId, firstSequence, producerId, producerEpoch }) => {
-    const dateNow = Date.now()
-    const messageTimestamps = messages
-      .map((m) => m.timestamp)
-      .filter((timestamp) => timestamp != null)
-      .sort()
-
-    const timestamps = messageTimestamps.length === 0 ? [dateNow] : messageTimestamps
-    const firstTimestamp = timestamps[0]
-    const maxTimestamp = timestamps[timestamps.length - 1]
-
-    const records = messages.map((message, i) =>
-      Record({
-        ...message,
-        offsetDelta: i,
-        timestampDelta: (message.timestamp || dateNow) - firstTimestamp,
-      })
-    )
-
-    const recordBatch = await RecordBatch({
+    const recordBatch = await buildRecordBatch({
       compression,
-      records,
-      firstTimestamp,
-      maxTimestamp,
+      messages,
+      transactionalId,
+      firstSequence,
       producerId,
       producerEpoch,
-      firstSequence,
-      transactional: !!transactionalId,
-      lastOffsetDelta: records.length - 1,
     })
 
     return new Encoder()

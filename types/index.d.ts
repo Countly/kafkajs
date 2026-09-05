@@ -825,6 +825,12 @@ export interface Offsets {
 }
 
 type Sender = {
+  /**
+   * Sends a produce request for one topic's messages. Rejects with a `KafkaJSProtocolError`
+   * (`topic`, `partition`, `errorMessage` set) when the broker fails the whole batch; when it
+   * rejected individual records (KIP-467), the error also carries
+   * `recordErrors: ProduceRecordError[]`.
+   */
   send(record: ProducerRecord): Promise<RecordMetadata[]>
   sendBatch(batch: ProducerBatch): Promise<RecordMetadata[]>
 }
@@ -1244,6 +1250,18 @@ export class KafkaJSProtocolError extends KafkaJSError {
   readonly code: number
   readonly type: string
   constructor(e: Error | string)
+}
+
+/**
+ * A single record the broker rejected out of an otherwise-failed produce batch (KIP-467).
+ * `batchIndex` is the record's position as sent to that partition; `record` is the corresponding
+ * entry from the `messages` array passed to `Producer#send`/`sendBatch`, when the client could
+ * resolve it.
+ */
+export type ProduceRecordError = {
+  batchIndex: number
+  record?: Message
+  errorMessage: string | null
 }
 
 export class KafkaJSAggregateError extends Error {

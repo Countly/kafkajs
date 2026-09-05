@@ -7,6 +7,34 @@ const responseSerializer = require('./responseSerializer')
 const { keys } = Object
 
 /**
+ * Resolves each `batchIndex` the broker reported (KIP-467, Produce v8+) to the record it refers
+ * to. `BatchIndex` indexes the records as they were grouped for that partition, which is exactly
+ * what `topicData` carries, so this is a lookup rather than a re-derivation.
+ *
+ * @param {Error} e the error thrown by the produce request
+ * @param {{topic: string, partitions: {partition: number, messages: object[]}[]}[]} topicData
+ * @returns {void}
+ */
+const attachFailingRecords = (e, topicData) => {
+  if (!Array.isArray(e.recordErrors) || e.recordErrors.length === 0) {
+    return
+  }
+
+  const matchedTopic = topicData.find(({ topic }) => topic === e.topic)
+  const matchedPartition =
+    matchedTopic && matchedTopic.partitions.find(({ partition }) => partition === e.partition)
+
+  if (!matchedPartition) {
+    return
+  }
+
+  e.recordErrors = e.recordErrors.map((recordError) => {
+    const record = matchedPartition.messages[recordError.batchIndex]
+    return record === undefined ? recordError : { ...recordError, record }
+  })
+}
+
+/**
  * @param {Object} options
  * @param {import("../../types").Logger} options.logger
  * @param {import("../../types").Cluster} options.cluster
@@ -116,6 +144,7 @@ module.exports = ({ logger, cluster, partitioner, eosManager, retrier }) => {
 
           responsePerBroker.set(broker, formattedResponse)
         } catch (e) {
+          attachFailingRecords(e, topicData)
           responsePerBroker.delete(broker)
           throw e
         } finally {

@@ -23,9 +23,11 @@
         4,
         5,
         6,
-        7
+        7,
+        8,
+        9
       ],
-      "gap": "behind:6",
+      "gap": "behind:4",
       "onFloor": false,
       "belowFloor": [],
       "notes": "v8 per-record errors (KIP-467), v9 flexible, v10 leader hints (KIP-951), v11 TRANSACTION_ABORTABLE (KIP-890), v12 transaction-version-2 implicit add-partitions (KIP-890 part 2), v13 topic IDs (KIP-516, Kafka 4.1; may return UNKNOWN_TOPIC_ID)."
@@ -179,9 +181,13 @@
       "forkVersions": [
         0,
         1,
-        2
+        2,
+        3,
+        4,
+        5,
+        6
       ],
-      "gap": "behind:4",
+      "gap": "current",
       "onFloor": false,
       "belowFloor": [],
       "notes": "v3 flexible, v4 multi-key batch (KIP-699), v5 TRANSACTION_ABORTABLE (KIP-890), v6 KeyType SHARE=2 (KIP-932, broker-internal). apiKeys.js still calls key 10 GroupCoordinator, the pre-0.11 name."
