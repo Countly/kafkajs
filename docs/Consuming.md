@@ -184,6 +184,8 @@ When the group coordinator rejects a heartbeat or a fetch, the consumer tells ap
 
 A LOST member's generation, member id, or static instance id has already been invalidated by the coordinator, so any offsets committed under it would be rejected forever — that used to surface as a repeating "Specified group generation id is not valid" error. A REVOKED member is still a valid part of the group, so committing its already-resolved offsets before rejoining is safe — this covers every rebalance-class error above and beyond it, not just 27/16. On the fetch path, a LOST or REVOKED error emits the same public `REBALANCING` instrumentation event before the consumer rejoins.
 
+Not every fetch-path error is a rebalance signal, though: a CRC32C mismatch on a record batch (`checkCrcs`, see [Options](#options)) is a **non-retriable** error, handled like any other non-retriable error — the consumer crashes rather than rejoining, and the offset is not advanced past the corrupt batch.
+
 ## <a name="manual-commits"></a> Manual committing
 
 When disabling [`autoCommit`](#auto-commit) you can still manually commit message offsets, in a couple of different ways:
@@ -243,6 +245,7 @@ kafka.consumer({
   minBytes: <Number>,
   maxBytes: <Number>,
   maxWaitTimeInMs: <Number>,
+  checkCrcs: <Boolean>,
   retry: <Object>,
   maxInFlightRequests: <Number>,
   rackId: <String>,
@@ -262,6 +265,7 @@ kafka.consumer({
 | minBytes               | Minimum amount of data the server should return for a fetch request, otherwise wait up to `maxWaitTimeInMs` for more data to accumulate.                                                                                                                                                                                                           | `1`                               |
 | maxBytes               | Maximum amount of bytes to accumulate in the response. Supported by Kafka >= `0.10.1.0`                                                                                                                                                                                                                                                            | `10485760` (10MB)                 |
 | maxWaitTimeInMs        | The maximum amount of time in milliseconds the server will block before answering the fetch request if there isn’t sufficient data to immediately satisfy the requirement given by `minBytes`                                                                                                                                                      | `5000`                            |
+| checkCrcs              | Verify the CRC32C checksum of every record batch received. Default `true` (Java's `check.crcs`). A mismatch is treated as a **non-retriable** error: no message from that batch is delivered, the consumer crashes with `KafkaJSPartialMessageError` (marked with `crcMismatch: true`, distinguishing it from an ordinary truncated fetch tail; the `CRASH` event's `restart` follows `retry.restartOnFailure` as for any other non-retriable error), and the committed offset is **not** advanced past the corrupt batch — so a restart re-reads it. Set to `false` to skip the check and restore the pre-3.0 behaviour, where a corrupt batch was delivered to the application as if it were valid. | `true` |
 | retry                  | See [retry](Configuration.md#retry) for more information                                                                                                                                                                                                                                                                                           | `{ retries: 5 }`                 |
 | readUncommitted        | Configures the consumer isolation level. If `false` (default), the consumer will not return any transactional messages which were not committed.                                                                                                                                                                                                   | `false`                           |
 | maxInFlightRequests | Max number of requests that may be in progress at any time. If falsey then no limit.                                    | `null` _(no limit)_ |

@@ -164,6 +164,13 @@ export interface ConsumerConfig {
   minBytes?: number
   maxBytes?: number
   maxWaitTimeInMs?: number
+  /**
+   * Verify the CRC32C checksum of every record batch received (Java's `check.crcs`). Default
+   * `true`. A mismatch is a non-retriable error: no message from that batch is delivered, the
+   * consumer crashes, and the committed offset is not advanced past it. Set to `false` to skip
+   * the check and restore the pre-3.0 behavior.
+   */
+  checkCrcs?: boolean
   retry?: RetryOptions & { restartOnFailure?: (err: Error) => Promise<boolean> }
   allowAutoTopicCreation?: boolean
   /**
@@ -706,6 +713,7 @@ export type Broker = {
       partitions: Array<{ partition: number; fetchOffset: string; maxBytes: number }>
     }>
     rackId?: string
+    checkCrcs?: boolean
   }): Promise<any>
   produce(request: {
     topicData: Array<{
@@ -1263,6 +1271,8 @@ export class KafkaJSBrokerNotFound extends KafkaJSError {
 
 export class KafkaJSPartialMessageError extends KafkaJSError {
   constructor()
+  /** Set when this error is a record-batch CRC32C mismatch (see `checkCrcs`), rather than a truncated fetch tail. */
+  crcMismatch?: boolean
 }
 
 export class KafkaJSSASLAuthenticationError extends KafkaJSError {

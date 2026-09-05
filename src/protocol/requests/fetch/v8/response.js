@@ -27,39 +27,59 @@ const decodeAbortedTransactions = (decoder) => ({
   firstOffset: decoder.readInt64().toString(),
 })
 
-const decodePartition = async (decoder) => ({
-  partition: decoder.readInt32(),
-  errorCode: decoder.readInt16(),
-  highWatermark: decoder.readInt64().toString(),
-  lastStableOffset: decoder.readInt64().toString(),
-  lastStartOffset: decoder.readInt64().toString(),
-  abortedTransactions: decoder.readArray(decodeAbortedTransactions),
-  messages: await decodeMessages(decoder),
-})
+/**
+ * Builds the reader chain for one value of `checkCrcs`. Called twice at module load so a fetch
+ * response allocates no closures.
+ * @param {{ checkCrcs: boolean }} options
+ * @returns {(rawData: Buffer) => Promise<object>}
+ */
+const buildDecode = (options) => {
+  const decodePartition = async (decoder) => ({
+    partition: decoder.readInt32(),
+    errorCode: decoder.readInt16(),
+    highWatermark: decoder.readInt64().toString(),
+    lastStableOffset: decoder.readInt64().toString(),
+    lastStartOffset: decoder.readInt64().toString(),
+    abortedTransactions: decoder.readArray(decodeAbortedTransactions),
+    messages: await decodeMessages(decoder, options),
+  })
 
-const decodeResponse = async (decoder) => ({
-  topicName: decoder.readString(),
-  partitions: await decoder.readArrayAsync(decodePartition),
-})
+  const decodeResponse = async (decoder) => ({
+    topicName: decoder.readString(),
+    partitions: await decoder.readArrayAsync(decodePartition),
+  })
 
-const decode = async (rawData) => {
-  const decoder = new Decoder(rawData)
-  const clientSideThrottleTime = decoder.readInt32()
-  const errorCode = decoder.readInt16()
-  const sessionId = decoder.readInt32()
-  const responses = await decoder.readArrayAsync(decodeResponse)
+  return async (rawData) => {
+    const decoder = new Decoder(rawData)
+    const clientSideThrottleTime = decoder.readInt32()
+    const errorCode = decoder.readInt16()
+    const sessionId = decoder.readInt32()
+    const responses = await decoder.readArrayAsync(decodeResponse)
 
-  // Report a `throttleTime` of 0: The broker will not have throttled
-  // this request, but if the `clientSideThrottleTime` is >0 then it
-  // expects us to do that -- and it will ignore requests.
-  return {
-    throttleTime: 0,
-    clientSideThrottleTime,
-    errorCode,
-    sessionId,
-    responses,
+    // Report a `throttleTime` of 0: The broker will not have throttled
+    // this request, but if the `clientSideThrottleTime` is >0 then it
+    // expects us to do that -- and it will ignore requests.
+    return {
+      throttleTime: 0,
+      clientSideThrottleTime,
+      errorCode,
+      sessionId,
+      responses,
+    }
   }
 }
+
+const decoders = {
+  true: buildDecode({ checkCrcs: true }),
+  false: buildDecode({ checkCrcs: false }),
+}
+
+/**
+ * @param {Buffer} rawData
+ * @param {{ checkCrcs?: boolean }} [options]
+ * @returns {Promise<object>}
+ */
+const decode = (rawData, options = {}) => decoders[options.checkCrcs !== false](rawData)
 
 module.exports = {
   decode,

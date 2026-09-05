@@ -61,6 +61,8 @@ module.exports = class ConsumerGroup {
    * @param {number} options.autoCommitThreshold
    * @param {number} options.isolationLevel
    * @param {string} options.rackId
+   * @param {boolean} options.checkCrcs verify the CRC32C checksum of every record batch received
+   *                                (Java's `check.crcs`); a mismatch is a non-retriable error
    * @param {string} [options.groupInstanceId=null] Static membership id (KIP-345); sent on
    *                                JoinGroup/SyncGroup/Heartbeat/LeaveGroup so the coordinator
    *                                recognizes this member across restarts.
@@ -86,6 +88,7 @@ module.exports = class ConsumerGroup {
     autoCommitThreshold,
     isolationLevel,
     rackId,
+    checkCrcs,
     groupInstanceId = null,
     metadataMaxAge,
   }) {
@@ -110,6 +113,7 @@ module.exports = class ConsumerGroup {
     this.autoCommitThreshold = autoCommitThreshold
     this.isolationLevel = isolationLevel
     this.rackId = rackId
+    this.checkCrcs = checkCrcs
     this.groupInstanceId = groupInstanceId
     this.metadataMaxAge = metadataMaxAge
     this.staticMembershipInactiveWarned = false
@@ -562,6 +566,7 @@ module.exports = class ConsumerGroup {
         isolationLevel: this.isolationLevel,
         topics: requests,
         rackId: this.rackId,
+        checkCrcs: this.checkCrcs,
       })
 
       return responses.flatMap(({ topicName, partitions }) => {

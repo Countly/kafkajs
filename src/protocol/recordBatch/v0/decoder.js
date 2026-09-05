@@ -3,6 +3,7 @@ const { KafkaJSPartialMessageError } = require('../../../errors')
 const { lookupCodecByAttributes } = require('../../message/compression')
 const RecordDecoder = require('../record/v0/decoder')
 const TimestampTypes = require('../../timestampTypes')
+const crc32C = require('../crc32C')
 
 const TIMESTAMP_TYPE_FLAG_MASK = 0x8
 const TRANSACTIONAL_FLAG_MASK = 0x10
@@ -26,7 +27,18 @@ const CONTROL_FLAG_MASK = 0x20
  *  Records => [Record]
  */
 
-module.exports = async (fetchDecoder) => {
+/**
+ * Decodes a v0 record batch.
+ * @param {Decoder} fetchDecoder positioned at the start of the record batch
+ * @param {object} [options]
+ * @param {boolean} [options.checkCrcs=true] verify the batch CRC32C (Java's `check.crcs`);
+ *        a mismatch throws {@link KafkaJSPartialMessageError} with `crcMismatch: true`, which
+ *        `src/protocol/requests/fetch/v4/decodeMessages.js` re-throws instead of treating as a
+ *        truncated tail
+ * @returns {Promise<object>} the decoded record batch, including its records
+ * @throws {KafkaJSPartialMessageError} on a truncated batch, or (when `checkCrcs`) a CRC32C mismatch
+ */
+module.exports = async (fetchDecoder, { checkCrcs = true } = {}) => {
   const firstOffset = fetchDecoder.readInt64().toString()
   const length = fetchDecoder.readInt32()
   const decoder = fetchDecoder.slice(length)
@@ -47,8 +59,22 @@ module.exports = async (fetchDecoder) => {
   // it has to be read.
   const magicByte = decoder.readInt8()
 
-  // The library is currently not performing CRC validations
-  const crc = decoder.readInt32() // eslint-disable-line no-unused-vars
+  const crc = decoder.readInt32()
+
+  if (checkCrcs) {
+    // The CRC32C covers every byte after the CRC field itself, i.e. Attributes onwards.
+    // @see https://kafka.apache.org/43/implementation/message-format
+    const covered = decoder.buffer.slice(decoder.offset)
+    const computed = crc32C(covered) | 0
+
+    if (computed !== crc) {
+      const error = new KafkaJSPartialMessageError(
+        `Record batch CRC32C mismatch: expected ${crc}, computed ${computed}`
+      )
+      error.crcMismatch = true
+      throw error
+    }
+  }
 
   const attributes = decoder.readInt16()
   const lastOffsetDelta = decoder.readInt32()

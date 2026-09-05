@@ -40,6 +40,10 @@ const specialOffsets = [
  * @param {number} [params.maxWaitTimeInMs]
  * @param {number} [params.isolationLevel]
  * @param {string} [params.rackId]
+ * @param {boolean} [params.checkCrcs=true] Verify the CRC32C checksum of every record batch
+ *                                received (Java's `check.crcs`). A mismatch is a non-retriable
+ *                                error: no message from that batch is delivered, the consumer
+ *                                crashes, and the offset is not advanced past it.
  * @param {String} [params.groupInstanceId=null] Static membership id (KIP-345). When set, this
  *                                consumer keeps its group slot across a `disconnect()`/reconnect
  *                                within `sessionTimeout` instead of triggering a rebalance, and
@@ -68,6 +72,7 @@ module.exports = ({
   maxWaitTimeInMs = 5000,
   isolationLevel = ISOLATION_LEVEL.READ_COMMITTED,
   rackId = '',
+  checkCrcs = true,
   groupInstanceId = null,
   instrumentationEmitter: rootInstrumentationEmitter,
   metadataMaxAge,
@@ -244,6 +249,7 @@ module.exports = ({
         instrumentationEmitter,
         isolationLevel,
         rackId,
+        checkCrcs,
         groupInstanceId,
         metadataMaxAge,
         autoCommit,

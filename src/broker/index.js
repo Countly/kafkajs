@@ -372,6 +372,9 @@ module.exports = class Broker {
    *                        ]
    * @param {string} [request.rackId=''] A rack identifier for this client. This can be any string value which indicates where this
    *                           client is physically located. It corresponds with the broker config `broker.rack`.
+   * @param {boolean} [request.checkCrcs=true] Verify the CRC32C checksum of every record batch in the response
+   *                           (Java's `check.crcs`). A mismatch throws `KafkaJSPartialMessageError` with
+   *                           `crcMismatch: true` instead of silently accepting the batch.
    * @returns {Promise}
    */
   async fetch({
@@ -382,6 +385,7 @@ module.exports = class Broker {
     maxBytes = 10485760,
     topics,
     rackId = '',
+    checkCrcs = true,
   }) {
     // TODO: validate topics not null/empty
     const fetch = this.lookupRequest(apiKeys.Fetch, requests.Fetch)
@@ -421,6 +425,7 @@ module.exports = class Broker {
         maxBytes,
         topics: consolidatedTopicPartitions,
         rackId,
+        checkCrcs,
       })
     )
   }

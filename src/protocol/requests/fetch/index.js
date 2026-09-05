@@ -11,6 +11,18 @@ const NETWORK_DELAY = 100
 const requestTimeout = (timeout) =>
   Number.isSafeInteger(timeout + NETWORK_DELAY) ? timeout + NETWORK_DELAY : timeout
 
+/**
+ * The Fetch response modules are stateless singletons, so the per-request `checkCrcs` option is
+ * bound here rather than threaded through `Connection#send`.
+ * @param {{ decode: Function, parse: Function }} response
+ * @param {{ checkCrcs: boolean }} options
+ * @returns {{ decode: Function, parse: Function }}
+ */
+const withOptions = (response, options) => ({
+  decode: (rawData) => response.decode(rawData, options),
+  parse: response.parse,
+})
+
 const versions = {
   4: ({
     replicaId = REPLICA_ID,
@@ -19,12 +31,13 @@ const versions = {
     minBytes,
     maxBytes,
     topics,
+    checkCrcs = true,
   }) => {
     const request = require('./v4/request')
     const response = require('./v4/response')
     return {
       request: request({ replicaId, isolationLevel, maxWaitTime, minBytes, maxBytes, topics }),
-      response,
+      response: withOptions(response, { checkCrcs }),
       requestTimeout: requestTimeout(maxWaitTime),
     }
   },
@@ -35,12 +48,13 @@ const versions = {
     minBytes,
     maxBytes,
     topics,
+    checkCrcs = true,
   }) => {
     const request = require('./v5/request')
     const response = require('./v5/response')
     return {
       request: request({ replicaId, isolationLevel, maxWaitTime, minBytes, maxBytes, topics }),
-      response,
+      response: withOptions(response, { checkCrcs }),
       requestTimeout: requestTimeout(maxWaitTime),
     }
   },
@@ -51,12 +65,13 @@ const versions = {
     minBytes,
     maxBytes,
     topics,
+    checkCrcs = true,
   }) => {
     const request = require('./v6/request')
     const response = require('./v6/response')
     return {
       request: request({ replicaId, isolationLevel, maxWaitTime, minBytes, maxBytes, topics }),
-      response,
+      response: withOptions(response, { checkCrcs }),
       requestTimeout: requestTimeout(maxWaitTime),
     }
   },
@@ -70,6 +85,7 @@ const versions = {
     minBytes,
     maxBytes,
     topics,
+    checkCrcs = true,
   }) => {
     const request = require('./v7/request')
     const response = require('./v7/response')
@@ -85,7 +101,7 @@ const versions = {
         maxBytes,
         topics,
       }),
-      response,
+      response: withOptions(response, { checkCrcs }),
       requestTimeout: requestTimeout(maxWaitTime),
     }
   },
@@ -99,6 +115,7 @@ const versions = {
     minBytes,
     maxBytes,
     topics,
+    checkCrcs = true,
   }) => {
     const request = require('./v8/request')
     const response = require('./v8/response')
@@ -114,7 +131,7 @@ const versions = {
         maxBytes,
         topics,
       }),
-      response,
+      response: withOptions(response, { checkCrcs }),
       requestTimeout: requestTimeout(maxWaitTime),
     }
   },
@@ -128,6 +145,7 @@ const versions = {
     minBytes,
     maxBytes,
     topics,
+    checkCrcs = true,
   }) => {
     const request = require('./v9/request')
     const response = require('./v9/response')
@@ -143,7 +161,7 @@ const versions = {
         maxBytes,
         topics,
       }),
-      response,
+      response: withOptions(response, { checkCrcs }),
       requestTimeout: requestTimeout(maxWaitTime),
     }
   },
@@ -157,6 +175,7 @@ const versions = {
     minBytes,
     maxBytes,
     topics,
+    checkCrcs = true,
   }) => {
     const request = require('./v10/request')
     const response = require('./v10/response')
@@ -172,7 +191,7 @@ const versions = {
         maxBytes,
         topics,
       }),
-      response,
+      response: withOptions(response, { checkCrcs }),
       requestTimeout: requestTimeout(maxWaitTime),
     }
   },
@@ -187,6 +206,7 @@ const versions = {
     maxBytes,
     topics,
     rackId,
+    checkCrcs = true,
   }) => {
     const request = require('./v11/request')
     const response = require('./v11/response')
@@ -203,7 +223,7 @@ const versions = {
         topics,
         rackId,
       }),
-      response,
+      response: withOptions(response, { checkCrcs }),
       requestTimeout: requestTimeout(maxWaitTime),
     }
   },

@@ -25,31 +25,48 @@ const decodeAbortedTransactions = (decoder) => ({
   firstOffset: decoder.readInt64().toString(),
 })
 
-const decodePartition = async (decoder) => ({
-  partition: decoder.readInt32(),
-  errorCode: decoder.readInt16(),
-  highWatermark: decoder.readInt64().toString(),
-  lastStableOffset: decoder.readInt64().toString(),
-  lastStartOffset: decoder.readInt64().toString(),
-  abortedTransactions: decoder.readArray(decodeAbortedTransactions),
-  messages: await decodeMessages(decoder),
-})
+/**
+ * Builds the reader chain for one value of `checkCrcs`. Called twice at module load so a fetch
+ * response allocates no closures.
+ * @param {{ checkCrcs: boolean }} options
+ * @returns {(rawData: Buffer) => Promise<object>}
+ */
+const buildDecode = (options) => {
+  const decodePartition = async (decoder) => ({
+    partition: decoder.readInt32(),
+    errorCode: decoder.readInt16(),
+    highWatermark: decoder.readInt64().toString(),
+    lastStableOffset: decoder.readInt64().toString(),
+    lastStartOffset: decoder.readInt64().toString(),
+    abortedTransactions: decoder.readArray(decodeAbortedTransactions),
+    messages: await decodeMessages(decoder, options),
+  })
 
-const decodeResponse = async (decoder) => ({
-  topicName: decoder.readString(),
-  partitions: await decoder.readArrayAsync(decodePartition),
-})
+  const decodeResponse = async (decoder) => ({
+    topicName: decoder.readString(),
+    partitions: await decoder.readArrayAsync(decodePartition),
+  })
 
-const decode = async (rawData) => {
-  const decoder = new Decoder(rawData)
-  const throttleTime = decoder.readInt32()
-  const responses = await decoder.readArrayAsync(decodeResponse)
+  return async (rawData) => {
+    const decoder = new Decoder(rawData)
+    const throttleTime = decoder.readInt32()
+    const responses = await decoder.readArrayAsync(decodeResponse)
 
-  return {
-    throttleTime,
-    responses,
+    return { throttleTime, responses }
   }
 }
+
+const decoders = {
+  true: buildDecode({ checkCrcs: true }),
+  false: buildDecode({ checkCrcs: false }),
+}
+
+/**
+ * @param {Buffer} rawData
+ * @param {{ checkCrcs?: boolean }} [options]
+ * @returns {Promise<object>}
+ */
+const decode = (rawData, options = {}) => decoders[options.checkCrcs !== false](rawData)
 
 module.exports = {
   decode,

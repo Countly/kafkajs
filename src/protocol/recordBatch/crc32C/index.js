@@ -1,4 +1,7 @@
 const crc32C = require('./crc32C')
-const unsigned = (value) => Uint32Array.from([value])[0]
 
-module.exports = (buffer) => unsigned(crc32C(buffer))
+/**
+ * @param {Buffer} buffer
+ * @returns {number} unsigned 32-bit CRC32C checksum
+ */
+module.exports = (buffer) => crc32C(buffer) >>> 0

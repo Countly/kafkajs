@@ -8,7 +8,16 @@ const { MAGIC_BYTE } = require('../../../recordBatch/v0')
 const MAGIC_OFFSET = 16
 const RECORD_BATCH_OVERHEAD = 49
 
-const decodeMessages = async (decoder) => {
+/**
+ * Decodes the `RECORDS` portion of a Fetch response partition.
+ * @param {import('../../../decoder')} decoder
+ * @param {object} [options]
+ * @param {boolean} [options.checkCrcs=true] forwarded to {@link RecordBatchDecoder}; see its JSDoc
+ * @returns {Promise<object[]>} the decoded records
+ * @throws {KafkaJSPartialMessageError} on a CRC32C mismatch (`crcMismatch: true`); a genuinely
+ *         truncated tail batch (from `maxBytes`) is swallowed instead, as before
+ */
+const decodeMessages = async (decoder, options = {}) => {
   const messagesSize = decoder.readInt32()
 
   if (messagesSize <= 0 || !decoder.canReadBytes(messagesSize)) {
@@ -24,12 +33,13 @@ const decodeMessages = async (decoder) => {
 
     while (messagesDecoder.canReadBytes(RECORD_BATCH_OVERHEAD)) {
       try {
-        const recordBatch = await RecordBatchDecoder(messagesDecoder)
+        const recordBatch = await RecordBatchDecoder(messagesDecoder, options)
         records.push(...recordBatch.records)
       } catch (e) {
-        // The tail of the record batches can have incomplete records
-        // due to how maxBytes works. See https://cwiki.apache.org/confluence/display/KAFKA/A+Guide+To+The+Kafka+Protocol#AGuideToTheKafkaProtocol-FetchAPI
-        if (e.name === 'KafkaJSPartialMessageError') {
+        // The tail of the record batches can be an incomplete record because of how maxBytes
+        // works, which is not an error. A CRC mismatch is.
+        // See https://cwiki.apache.org/confluence/display/KAFKA/A+Guide+To+The+Kafka+Protocol#AGuideToTheKafkaProtocol-FetchAPI
+        if (e.name === 'KafkaJSPartialMessageError' && e.crcMismatch !== true) {
           break
         }
 
