@@ -49,6 +49,10 @@ module.exports = class Cluster {
    * @param {import("../../types").Logger} options.logger
    * @param {import("../../types").ISocketFactory} options.socketFactory
    * @param {Map} [options.offsets]
+   * @param {'rebootstrap'|'none'} [options.metadataRecoveryStrategy] forwarded to `BrokerPool`
+   *   unchanged; `Cluster` stores neither this nor the trigger window.
+   * @param {number} [options.metadataRecoveryRebootstrapTriggerMs] forwarded to `BrokerPool`
+   *   unchanged.
    * @param {import("../instrumentation/emitter")} [options.instrumentationEmitter=null] stored on
    *   the instance (`this.instrumentationEmitter`) and shared with the `MetadataCache` and the
    *   `BrokerPool`, so a topic recreation seen by either surfaces on the same emitter the client
@@ -73,6 +77,8 @@ module.exports = class Cluster {
     isolationLevel,
     instrumentationEmitter = null,
     offsets = new Map(),
+    metadataRecoveryStrategy,
+    metadataRecoveryRebootstrapTriggerMs,
   }) {
     this.rootLogger = rootLogger
     this.logger = rootLogger.namespace('Cluster')
@@ -113,6 +119,8 @@ module.exports = class Cluster {
       allowAutoTopicCreation,
       authenticationTimeout,
       metadataMaxAge,
+      metadataRecoveryStrategy,
+      metadataRecoveryRebootstrapTriggerMs,
     })
     this.committedOffsetsByGroup = offsets
 
@@ -264,6 +272,32 @@ module.exports = class Cluster {
   }
 
   /**
+   * Calls `refreshMetadata()` for its side effect only, swallowing whatever it rejects with.
+   *
+   * Every caller of this helper is already inside its own `catch` block, refreshing metadata as a
+   * best-effort attempt to fix staleness before its *own* error is rethrown (or before a
+   * surrounding retrier tries again). If the refresh itself fails (e.g.
+   * `KafkaJSNumberOfRetriesExceeded` while the pool cannot reach anything right now), that failure
+   * must never replace the original error the caller is already handling - an unguarded `await`
+   * here would let it do exactly that, silently changing the error class, `retryCount`/`retryTime`
+   * and any `instanceof`/name check downstream depends on.
+   *
+   * @private
+   * @returns {Promise<void>}
+   */
+  async refreshMetadataBestEffort() {
+    // `Promise.resolve(...)` tolerates a test double that returns `undefined` instead of a
+    // promise (several specs stub `refreshMetadata` with a bare `jest.fn()`); the real,
+    // production `refreshMetadata()` is an `async` method and always returns a genuine promise,
+    // so this changes nothing there.
+    await Promise.resolve(this.refreshMetadata()).catch((refreshError) => {
+      this.logger.debug('Best-effort metadata refresh failed, continuing with the original error', {
+        error: refreshError.message,
+      })
+    })
+  }
+
+  /**
    * @public
    * @param {object} options
    * @param {string} options.nodeId
@@ -279,7 +313,7 @@ module.exports = class Cluster {
         e.name === 'KafkaJSLockTimeout' ||
         e.name === 'KafkaJSConnectionError'
       ) {
-        await this.refreshMetadata()
+        await this.refreshMetadataBestEffort()
       }
 
       throw e
@@ -401,7 +435,7 @@ module.exports = class Cluster {
             retryTime,
           })
 
-          await this.refreshMetadata()
+          await this.refreshMetadataBestEffort()
           throw e
         }
 

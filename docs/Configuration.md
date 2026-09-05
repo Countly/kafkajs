@@ -329,6 +329,54 @@ kafka.producer({
 })
 ```
 
+## Metadata recovery
+
+`metadataRecoveryStrategy` and `metadataRecoveryRebootstrapTriggerMs`, available on the `Kafka`
+constructor, control what the client does when it loses its view of the cluster (KIP-899/KIP-1102,
+matching the Java client's `metadata.recovery.strategy` and
+`metadata.recovery.rebootstrap.trigger.ms`).
+
+```javascript
+new Kafka({
+  clientId: 'my-app',
+  brokers: ['kafka1:9092', 'kafka2:9092'],
+  metadataRecoveryStrategy: 'rebootstrap',
+  metadataRecoveryRebootstrapTriggerMs: 300000,
+})
+```
+
+- `metadataRecoveryStrategy`: `'rebootstrap'` (the default) or `'none'`. With `'rebootstrap'`, the
+  client rebuilds its connections and metadata from the configured broker list when:
+  1. metadata has been failing to refresh **continuously** for `metadataRecoveryRebootstrapTriggerMs`;
+  2. a broker responds with `REBOOTSTRAP_REQUIRED` (protocol error code 129); or
+  3. every broker the client currently knows about has become unreachable.
+
+  With `'none'`, none of the above happen: a `REBOOTSTRAP_REQUIRED` response surfaces as the
+  non-retriable `KafkaJSProtocolError` it already is, restoring the pre-3.0 behavior.
+- `metadataRecoveryRebootstrapTriggerMs`: how long metadata must fail continuously before trigger
+  1 above fires. Defaults to `300000` (5 minutes, matching the Java client). Must be an integer
+  **≥ 1** — `0` is rejected rather than meaning "rebootstrap immediately": at `0` the trigger would
+  fire on the very next failed attempt, and one unreachable cluster would produce a full teardown
+  per metadata refresh instead of at most one per window.
+
+"Continuously" means the client has not seen a single successful metadata response since the
+first failure. The clock starts at the first metadata failure that follows a success and is
+cleared by any success — so a client that has been idle for a while (nothing refreshes metadata
+until it is stale) and then hits one transient failure, such as a rolling restart or a leader
+election, does **not** rebootstrap; it only rebootstraps once the failures are back-to-back for
+the whole window.
+
+A rebootstrap waits for each connection's in-flight requests to drain, then closes every
+connection the client holds. A request already in flight when it starts normally completes on the
+old socket rather than being rejected; the connections themselves are gone by the time
+`rebootstrap()` returns, so the *next* request the caller makes goes through the caller's normal
+retry path (the producer's or consumer's own `retry` configuration) against the rebuilt cluster —
+it is not itself a source of message loss, but until the idempotent producer is on by default a
+retried produce can duplicate records the broker had already appended. SASL authentication state
+(the blackout applied after a rejected credential) is preserved across a rebootstrap, and a SASL
+authentication failure is never a rebootstrap trigger — a rejected credential means the broker is
+reachable and fine, only this client's credentials are bad, which no rebootstrap can fix.
+
 ## Default Retry
 
 The `retry` option can be used to set the configuration of the retry mechanism, which is used to retry connections and API calls to Kafka (when using producers or consumers).

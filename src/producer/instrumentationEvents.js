@@ -14,6 +14,7 @@ const events = {
   AUTHENTICATION_FAILURE: producerType(networkEvents.NETWORK_AUTHENTICATION_FAILURE),
   LOCK_TIMEOUT: producerType(networkEvents.NETWORK_LOCK_TIMEOUT),
   TOPIC_RECREATED: producerType(clusterEvents.CLUSTER_TOPIC_RECREATED),
+  REBOOTSTRAP: producerType(clusterEvents.CLUSTER_REBOOTSTRAP),
 }
 
 const wrappedEvents = {
@@ -23,6 +24,7 @@ const wrappedEvents = {
   [events.AUTHENTICATION_FAILURE]: networkEvents.NETWORK_AUTHENTICATION_FAILURE,
   [events.LOCK_TIMEOUT]: networkEvents.NETWORK_LOCK_TIMEOUT,
   [events.TOPIC_RECREATED]: clusterEvents.CLUSTER_TOPIC_RECREATED,
+  [events.REBOOTSTRAP]: clusterEvents.CLUSTER_REBOOTSTRAP,
 }
 
 const reversedWrappedEvents = swapObject(wrappedEvents)

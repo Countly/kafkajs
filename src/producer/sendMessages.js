@@ -142,8 +142,21 @@ module.exports = ({ logger, cluster, partitioner, eosManager, retrier }) => {
             retryCount,
             retryTime,
           })
-          await cluster.connect()
-          await cluster.refreshMetadata()
+          // Best-effort reconnect/refresh: this is here to put the cluster back in a usable
+          // state before the retrier's next attempt, not to replace `e` - a failure of either
+          // step (e.g. still unreachable) must not turn `e` into a different error class and
+          // strip its `retryCount`/`retryTime` on its way to the `throw` below. `Promise.resolve`
+          // tolerates a test double that returns `undefined` instead of a promise.
+          await Promise.resolve(cluster.connect()).catch((connectError) => {
+            logger.debug(
+              `Best-effort reconnect failed, continuing with the original error: ${connectError.message}`
+            )
+          })
+          await Promise.resolve(cluster.refreshMetadata()).catch((refreshError) => {
+            logger.debug(
+              `Best-effort metadata refresh failed, continuing with the original error: ${refreshError.message}`
+            )
+          })
           throw e
         }
 
@@ -157,7 +170,15 @@ module.exports = ({ logger, cluster, partitioner, eosManager, retrier }) => {
           (e.name === 'KafkaJSProtocolError' && e.retriable)
         ) {
           logger.error(`Failed to send messages: ${e.message}`, { retryCount, retryTime })
-          await cluster.refreshMetadata()
+          // Best-effort, same reasoning as above: a stale-metadata refresh that itself fails
+          // must not replace the retriable send error (e.g. NOT_LEADER_FOR_PARTITION) with a
+          // non-retriable one and short-circuit the retry a leader election would otherwise let
+          // through.
+          await Promise.resolve(cluster.refreshMetadata()).catch((refreshError) => {
+            logger.debug(
+              `Best-effort metadata refresh failed, continuing with the original error: ${refreshError.message}`
+            )
+          })
           throw e
         }
 

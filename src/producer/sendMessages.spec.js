@@ -211,6 +211,61 @@ describe('Producer > sendMessages', () => {
     expect(cluster.refreshMetadata).toHaveBeenCalled()
   })
 
+  test('a failing reconnect/refresh after a disconnect does not replace the original send error', async () => {
+    // retries: 0 so the retrier's own wrap (KafkaJSNumberOfRetriesExceeded) happens on the first
+    // failure, whose `cause` is what the catch block actually threw - exactly what the (buggy)
+    // unguarded `await cluster.connect(); await cluster.refreshMetadata()` would have replaced
+    // with "connect boom" instead of the original KafkaJSConnectionClosedError.
+    const sendMessages = createSendMessages({
+      retrier: retry({ retries: 0 }),
+      logger: newLogger(),
+      cluster,
+      partitioner,
+      eosManager,
+    })
+
+    const sendError = Object.assign(new Error('closed'), {
+      name: 'KafkaJSConnectionClosedError',
+      host: 'a',
+      port: 1,
+    })
+    brokers[1].produce.mockImplementationOnce(() => {
+      throw sendError
+    })
+    cluster.removeBroker = jest.fn()
+    cluster.isConnected.mockReturnValue(false)
+    cluster.connect = jest.fn(() => Promise.reject(new Error('connect boom')))
+    cluster.refreshMetadata.mockImplementation(() => Promise.reject(new Error('refresh boom')))
+
+    await expect(sendMessages({ topicMessages: [{ topic, messages }] })).rejects.toMatchObject({
+      cause: expect.objectContaining({ name: 'KafkaJSConnectionClosedError' }),
+    })
+    expect(cluster.connect).toHaveBeenCalled()
+    expect(cluster.refreshMetadata).toHaveBeenCalled()
+  })
+
+  test('a failing best-effort refresh after a stale-metadata error does not replace the original error', async () => {
+    const sendMessages = createSendMessages({
+      retrier: retry({ retries: 0 }),
+      logger: newLogger(),
+      cluster,
+      partitioner,
+      eosManager,
+    })
+
+    brokers[1].produce.mockImplementationOnce(() => {
+      throw createErrorFromCode(
+        errorCodes.find(({ type }) => type === 'NOT_LEADER_FOR_PARTITION').code
+      )
+    })
+    cluster.refreshMetadata.mockImplementation(() => Promise.reject(new Error('refresh boom')))
+
+    await expect(sendMessages({ topicMessages: [{ topic, messages }] })).rejects.toMatchObject({
+      cause: expect.objectContaining({ type: 'NOT_LEADER_FOR_PARTITION' }),
+    })
+    expect(cluster.refreshMetadata).toHaveBeenCalled()
+  })
+
   test('retrieves sequence information from the transaction manager and updates', async () => {
     const sendMessages = createSendMessages({
       retrier,

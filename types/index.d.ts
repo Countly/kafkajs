@@ -61,6 +61,8 @@ export interface KafkaConfig {
   socketFactory?: ISocketFactory
   logLevel?: logLevel
   logCreator?: logCreator
+  metadataRecoveryStrategy?: 'rebootstrap' | 'none'
+  metadataRecoveryRebootstrapTriggerMs?: number
 }
 
 export interface ISocketFactoryArgs {
@@ -395,6 +397,7 @@ export type AdminEvents = {
   REQUEST_QUEUE_SIZE: 'admin.network.request_queue_size'
   AUTHENTICATION_FAILURE: 'admin.network.authentication_failure'
   TOPIC_RECREATED: 'admin.cluster.topic_recreated'
+  REBOOTSTRAP: 'admin.cluster.rebootstrap'
 }
 
 export interface InstrumentationEvent<T> {
@@ -452,6 +455,9 @@ export type TopicRecreatedEvent = InstrumentationEvent<{
   topic: string
   previousTopicId: string
   topicId: string
+}>
+export type RebootstrapEvent = InstrumentationEvent<{
+  reason: 'timeout' | 'required' | 'all-brokers-unavailable'
 }>
 
 export type SeekEntry = PartitionOffset
@@ -611,6 +617,10 @@ export type Admin = {
   on(
     eventName: AdminEvents['TOPIC_RECREATED'],
     listener: (event: TopicRecreatedEvent) => void
+  ): RemoveInstrumentationEventListener<typeof eventName>
+  on(
+    eventName: AdminEvents['REBOOTSTRAP'],
+    listener: (event: RebootstrapEvent) => void
   ): RemoveInstrumentationEventListener<typeof eventName>
   on(
     eventName: ValueOf<AdminEvents>,
@@ -829,6 +839,7 @@ export type ProducerEvents = {
   AUTHENTICATION_FAILURE: 'producer.network.authentication_failure'
   LOCK_TIMEOUT: 'producer.network.lock_timeout'
   TOPIC_RECREATED: 'producer.cluster.topic_recreated'
+  REBOOTSTRAP: 'producer.cluster.rebootstrap'
 }
 
 export type Producer = Sender & {
@@ -871,6 +882,10 @@ export type Producer = Sender & {
   on(
     eventName: ProducerEvents['TOPIC_RECREATED'],
     listener: (event: TopicRecreatedEvent) => void
+  ): RemoveInstrumentationEventListener<typeof eventName>
+  on(
+    eventName: ProducerEvents['REBOOTSTRAP'],
+    listener: (event: RebootstrapEvent) => void
   ): RemoveInstrumentationEventListener<typeof eventName>
   on(
     eventName: ValueOf<ProducerEvents>,
@@ -978,6 +993,7 @@ export type ConsumerEvents = {
   REQUEST_QUEUE_SIZE: 'consumer.network.request_queue_size'
   AUTHENTICATION_FAILURE: 'consumer.network.authentication_failure'
   TOPIC_RECREATED: 'consumer.cluster.topic_recreated'
+  REBOOTSTRAP: 'consumer.cluster.rebootstrap'
 }
 export type ConsumerHeartbeatEvent = InstrumentationEvent<{
   groupId: string
@@ -1178,6 +1194,10 @@ export type Consumer = {
   on(
     eventName: ConsumerEvents['TOPIC_RECREATED'],
     listener: (event: TopicRecreatedEvent) => void
+  ): RemoveInstrumentationEventListener<typeof eventName>
+  on(
+    eventName: ConsumerEvents['REBOOTSTRAP'],
+    listener: (event: RebootstrapEvent) => void
   ): RemoveInstrumentationEventListener<typeof eventName>
   on(
     eventName: ValueOf<ConsumerEvents>,

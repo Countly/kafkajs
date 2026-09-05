@@ -86,7 +86,7 @@ describe('Network > Connection > maxInFlightRequests default', () => {
   })
 })
 
-describe('Kafka > maxInFlightRequests validation', () => {
+describe('Kafka > client option validation', () => {
   const Kafka = require('../index')
   const create = (maxInFlightRequests) =>
     new Kafka({ clientId: 'v', brokers: ['localhost:9092'], logLevel: 0 }).producer({
@@ -102,5 +102,26 @@ describe('Kafka > maxInFlightRequests validation', () => {
   it('accepts null (unbounded) and positive integers', () => {
     expect(() => create(null)).not.toThrow()
     expect(() => create(1)).not.toThrow()
+  })
+
+  const createKafka = (options) =>
+    new Kafka({ clientId: 'v', brokers: ['localhost:9092'], logLevel: 0, ...options })
+
+  it('rejects a metadataRecoveryRebootstrapTriggerMs of 0, negative or fractional', () => {
+    expect(() => createKafka({ metadataRecoveryRebootstrapTriggerMs: 0 })).toThrow(
+      /metadataRecoveryRebootstrapTriggerMs must be an integer >= 1/
+    )
+    expect(() => createKafka({ metadataRecoveryRebootstrapTriggerMs: -1 })).toThrow(
+      /metadataRecoveryRebootstrapTriggerMs must be an integer >= 1/
+    )
+    expect(() => createKafka({ metadataRecoveryRebootstrapTriggerMs: 1.5 })).toThrow(
+      /metadataRecoveryRebootstrapTriggerMs must be an integer >= 1/
+    )
+  })
+
+  it('rejects an unrecognised metadataRecoveryStrategy', () => {
+    expect(() => createKafka({ metadataRecoveryStrategy: 'nope' })).toThrow(
+      /metadataRecoveryStrategy must be one of/
+    )
   })
 })

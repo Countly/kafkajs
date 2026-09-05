@@ -24,6 +24,9 @@ const PRIVATE = {
 
 const DEFAULT_METADATA_MAX_AGE = 300000
 const DEFAULT_MAX_IN_FLIGHT_REQUESTS = 5
+const DEFAULT_METADATA_RECOVERY_STRATEGY = 'rebootstrap'
+const DEFAULT_METADATA_RECOVERY_REBOOTSTRAP_TRIGGER_MS = 300000
+const METADATA_RECOVERY_STRATEGIES = ['rebootstrap', 'none']
 
 /**
  * Accept the documented values for maxInFlightRequests: null (unbounded) or an integer >= 1.
@@ -39,6 +42,37 @@ const validateMaxInFlightRequests = (value) => {
     `maxInFlightRequests must be null (unbounded) or an integer >= 1, got ${value}`
   )
 }
+
+/**
+ * Accept the documented values for metadataRecoveryStrategy. Java's client uses the same two
+ * names and the same default.
+ * @param {string} value
+ * @returns {string}
+ * @throws {KafkaJSNonRetriableError} on anything else
+ */
+const validateMetadataRecoveryStrategy = (value) => {
+  if (METADATA_RECOVERY_STRATEGIES.includes(value)) return value
+  throw new KafkaJSNonRetriableError(
+    `metadataRecoveryStrategy must be one of ${METADATA_RECOVERY_STRATEGIES.join(', ')}, got ${value}`
+  )
+}
+
+/**
+ * Zero is rejected, not accepted as "rebootstrap immediately": with 0 the window comparison is
+ * trivially true on the second consecutive failure, so one unreachable cluster would produce a
+ * full teardown per refresh - the storm the armed-once-per-cycle rules exist to prevent. Same
+ * shape as `maxInFlightRequests: 0`.
+ * @param {number} value
+ * @returns {number}
+ * @throws {KafkaJSNonRetriableError} on 0, negative, fractional or non-numeric values
+ */
+const validateMetadataRecoveryRebootstrapTriggerMs = (value) => {
+  if (Number.isInteger(value) && value >= 1) return value
+  throw new KafkaJSNonRetriableError(
+    `metadataRecoveryRebootstrapTriggerMs must be an integer >= 1, got ${value}`
+  )
+}
+
 const warnOfDefaultPartitioner = once((logger) => {
   if (process.env.KAFKAJS_NO_PARTITIONER_WARNING == null) {
     logger.warn(
@@ -64,6 +98,11 @@ module.exports = class Client {
    * @param {boolean} [options.enforceRequestTimeout]
    * @param {import("../types").RetryOptions} [options.retry]
    * @param {import("../types").ISocketFactory} [options.socketFactory]
+   * @param {'rebootstrap'|'none'} [options.metadataRecoveryStrategy='rebootstrap'] KIP-899/1102:
+   *   `'rebootstrap'` rebuilds the client's connections and metadata from the configured broker
+   *   list when metadata is unreachable; `'none'` restores pre-3.0 behavior.
+   * @param {number} [options.metadataRecoveryRebootstrapTriggerMs=300000] how long metadata must
+   *   fail *continuously* before a rebootstrap is triggered. Must be an integer >= 1.
    */
   constructor({
     brokers,
@@ -79,10 +118,18 @@ module.exports = class Client {
     socketFactory = defaultSocketFactory(),
     logLevel = INFO,
     logCreator = LoggerConsole,
+    metadataRecoveryStrategy = DEFAULT_METADATA_RECOVERY_STRATEGY,
+    metadataRecoveryRebootstrapTriggerMs = DEFAULT_METADATA_RECOVERY_REBOOTSTRAP_TRIGGER_MS,
   }) {
     this[PRIVATE.OFFSETS] = new Map()
     this[PRIVATE.LOGGER] = createLogger({ level: logLevel, logCreator })
     this[PRIVATE.CLUSTER_RETRY] = retry
+
+    const validatedMetadataRecoveryStrategy =
+      validateMetadataRecoveryStrategy(metadataRecoveryStrategy)
+    const validatedMetadataRecoveryRebootstrapTriggerMs =
+      validateMetadataRecoveryRebootstrapTriggerMs(metadataRecoveryRebootstrapTriggerMs)
+
     this[PRIVATE.CREATE_CLUSTER] = ({
       metadataMaxAge,
       allowAutoTopicCreation = true,
@@ -111,6 +158,8 @@ module.exports = class Client {
         instrumentationEmitter,
         allowAutoTopicCreation,
         isolationLevel,
+        metadataRecoveryStrategy: validatedMetadataRecoveryStrategy,
+        metadataRecoveryRebootstrapTriggerMs: validatedMetadataRecoveryRebootstrapTriggerMs,
       })
   }
 
