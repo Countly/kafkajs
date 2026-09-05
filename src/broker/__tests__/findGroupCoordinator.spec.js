@@ -25,7 +25,9 @@ describe('Broker > FindGroupCoordinator', () => {
 
     expect(response).toEqual({
       errorCode: 0,
-      errorMessage: expect.toBeOneOf([null, 'NONE']),
+      // v6's ErrorMessage is a COMPACT_NULLABLE_STRING; the broker sends a compact length of 1
+      // (empty string), not 0 (null), on success. `null`/'NONE' was the v0-v3 shape.
+      errorMessage: '',
       clientSideThrottleTime: expect.optional(0),
       throttleTime: 0,
       coordinator: {
