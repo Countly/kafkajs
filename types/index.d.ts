@@ -1011,6 +1011,7 @@ export type ConsumerCommitOffsetsEvent = InstrumentationEvent<{
   groupId: string
   memberId: string
   groupGenerationId: number
+  groupInstanceId: string | null
   topics: TopicOffsets[]
 }>
 export interface IMemberAssignment {

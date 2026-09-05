@@ -115,6 +115,7 @@ Upstream work this phase builds on, with thanks to its authors: PRs #1779, #1695
 - Internal metadata cache: the client now keeps each topic's id and each partition's leader epoch from the Metadata response, with a monotonic guard so a stale refresh cannot move a partition's leader backwards. Nothing user-visible changes yet; the cache is what the leader-hint, rebootstrap and topic-recreation behaviour described under Behavior changes is built on.
 - New instrumentation event `TOPIC_RECREATED` on the consumer, producer and admin clients (`consumer.events.TOPIC_RECREATED`, delivered as `consumer.cluster.topic_recreated`, and the producer/admin equivalents). It fires when a metadata refresh sees a topic name it already knew come back with a different topic id — that is, the topic was deleted and recreated. Payload: `{ topic, previousTopicId, topicId }`.
 - New instrumentation event `REBOOTSTRAP` on the consumer, producer and admin clients, payload `{ reason: 'timeout' | 'required' | 'all-brokers-unavailable' }`.
+- The `COMMIT_OFFSETS` instrumentation event's payload gains `groupInstanceId` (`string | null`), for every consumer, matching what `HEARTBEAT` already carries.
 
 #### Tooling
 

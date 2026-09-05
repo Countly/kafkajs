@@ -387,6 +387,7 @@ module.exports = class ConsumerGroup {
       groupId,
       generationId,
       memberId,
+      groupInstanceId: this.groupInstanceId,
       pendingTopicResets: this.pendingTopicResets,
     })
   }

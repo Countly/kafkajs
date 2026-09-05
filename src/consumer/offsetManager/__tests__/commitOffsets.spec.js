@@ -70,6 +70,7 @@ describe('Consumer > OffsetMananger > commitOffsets', () => {
       groupId,
       memberId,
       groupGenerationId: generationId,
+      groupInstanceId: null,
       topics: [
         {
           topic: topic1,
@@ -112,6 +113,7 @@ describe('Consumer > OffsetMananger > commitOffsets', () => {
       groupId,
       memberId,
       groupGenerationId: generationId,
+      groupInstanceId: null,
       topics: [
         {
           topic: topic1,

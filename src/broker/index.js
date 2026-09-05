@@ -603,6 +603,8 @@ module.exports = class Broker {
    * @param {string} request.groupId
    * @param {number} request.groupGenerationId
    * @param {string} request.memberId
+   * @param {string} [request.groupInstanceId=null] Static membership id (KIP-345); identifies this
+   *                                member across restarts. Requires OffsetCommit v7+.
    * @param {number} [request.retentionTime=-1] -1 signals to the broker that its default configuration
    *                                    should be used.
    * @param {object} request.topics Topics to commit offsets, e.g:
@@ -616,13 +618,21 @@ module.exports = class Broker {
    *                  ]
    * @returns {Promise}
    */
-  async offsetCommit({ groupId, groupGenerationId, memberId, retentionTime, topics }) {
+  async offsetCommit({
+    groupId,
+    groupGenerationId,
+    memberId,
+    groupInstanceId,
+    retentionTime,
+    topics,
+  }) {
     const offsetCommit = this.lookupRequest(apiKeys.OffsetCommit, requests.OffsetCommit)
     return await this[PRIVATE.SEND_REQUEST](
       offsetCommit({
         groupId,
         groupGenerationId,
         memberId,
+        groupInstanceId,
         retentionTime,
         topics,
       })
