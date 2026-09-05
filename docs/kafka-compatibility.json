@@ -78,12 +78,18 @@
       "forkVersions": [
         1,
         2,
-        3
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9
       ],
-      "gap": "behind:8",
+      "gap": "behind:2",
       "onFloor": false,
       "belowFloor": [],
-      "notes": "v4 leader epoch (KIP-320), v6 flexible, v7 max-timestamp, v8 earliest-local offset (KIP-405)."
+      "notes": "v4 leader epoch (KIP-320), v6 flexible, v7 max-timestamp (KIP-734), v8 earliest-local offset (KIP-405), v9 last-tiered offset (KIP-1005). v10 (async remote list offsets, KIP-1075) and v11 (earliest pending upload offset, KIP-1023) are deliberate gaps, not a waiver: both are tiered-storage features this client does not use."
     },
     {
       "kafkaName": "Metadata",

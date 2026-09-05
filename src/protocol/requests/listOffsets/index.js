@@ -19,6 +19,36 @@ const versions = {
     const response = require('./v3/response')
     return { request: request({ replicaId, isolationLevel, topics }), response }
   },
+  4: ({ replicaId = REPLICA_ID, isolationLevel = ISOLATION_LEVEL.READ_COMMITTED, topics }) => {
+    const request = require('./v4/request')
+    const response = require('./v4/response')
+    return { request: request({ replicaId, isolationLevel, topics }), response }
+  },
+  5: ({ replicaId = REPLICA_ID, isolationLevel = ISOLATION_LEVEL.READ_COMMITTED, topics }) => {
+    const request = require('./v5/request')
+    const response = require('./v5/response')
+    return { request: request({ replicaId, isolationLevel, topics }), response }
+  },
+  6: ({ replicaId = REPLICA_ID, isolationLevel = ISOLATION_LEVEL.READ_COMMITTED, topics }) => {
+    const request = require('./v6/request')
+    const response = require('./v6/response')
+    return { request: request({ replicaId, isolationLevel, topics }), response }
+  },
+  7: ({ replicaId = REPLICA_ID, isolationLevel = ISOLATION_LEVEL.READ_COMMITTED, topics }) => {
+    const request = require('./v7/request')
+    const response = require('./v7/response')
+    return { request: request({ replicaId, isolationLevel, topics }), response }
+  },
+  8: ({ replicaId = REPLICA_ID, isolationLevel = ISOLATION_LEVEL.READ_COMMITTED, topics }) => {
+    const request = require('./v8/request')
+    const response = require('./v8/response')
+    return { request: request({ replicaId, isolationLevel, topics }), response }
+  },
+  9: ({ replicaId = REPLICA_ID, isolationLevel = ISOLATION_LEVEL.READ_COMMITTED, topics }) => {
+    const request = require('./v9/request')
+    const response = require('./v9/response')
+    return { request: request({ replicaId, isolationLevel, topics }), response }
+  },
 }
 
 module.exports = {

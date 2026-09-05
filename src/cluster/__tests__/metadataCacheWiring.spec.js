@@ -190,6 +190,55 @@ describe('Cluster > metadata cache wiring', () => {
     expect(between).not.toMatch(/\bawait\b/)
   })
 
+  test('fetchTopicsOffset fills currentLeaderEpoch from the cache', async () => {
+    stubBrokers(cluster, [metadata({ topicId: ID_A, leader: 1, leaderEpoch: 5 })])
+    await cluster.brokerPool.refreshMetadata(['test-topic'])
+
+    const requests = []
+    cluster.findBroker = async () => ({
+      listOffsets: async (request) => {
+        requests.push(request)
+        return { responses: [{ topic: 'test-topic', partitions: [{ partition: 0, offset: '0' }] }] }
+      },
+    })
+
+    await cluster.fetchTopicsOffset([
+      { topic: 'test-topic', partitions: [{ partition: 0 }], fromBeginning: true },
+    ])
+
+    expect(requests[0].topics[0].partitions[0]).toMatchObject({
+      partition: 0,
+      currentLeaderEpoch: 5,
+    })
+  })
+
+  test('fetchTopicsOffset sends -1 when the metadata carried an unknown leader epoch', async () => {
+    // The only reachable "unknown" here: a partition missing from the metadata is dropped by
+    // findLeaderForPartitions (cluster/index.js:325-328) and never reaches addDefaultOffset, and
+    // absent metadata throws KafkaJSTopicMetadataNotLoaded before that. So the case is a
+    // partition the cluster does advertise whose decoded leaderEpoch is -1.
+    stubBrokers(cluster, [metadata({ topicId: ID_A, leader: 1, leaderEpoch: -1 })])
+    await cluster.brokerPool.refreshMetadata(['test-topic'])
+    expect(cluster.metadataCache.leaderEpoch('test-topic', 0)).toEqual(-1)
+
+    const requests = []
+    cluster.findBroker = async () => ({
+      listOffsets: async (request) => {
+        requests.push(request)
+        return { responses: [{ topic: 'test-topic', partitions: [{ partition: 0, offset: '0' }] }] }
+      },
+    })
+
+    await cluster.fetchTopicsOffset([
+      { topic: 'test-topic', partitions: [{ partition: 0 }], fromBeginning: true },
+    ])
+
+    expect(requests[0].topics[0].partitions[0]).toMatchObject({
+      partition: 0,
+      currentLeaderEpoch: -1,
+    })
+  })
+
   test('onTopicRecreated is a safe no-op unsubscribe when the cluster has no emitter', () => {
     const noEmitterCluster = new Cluster({ ...connectionOpts(), logger: newLogger() })
 

@@ -577,6 +577,10 @@ module.exports = class Cluster {
    *                              ],
    *                            },
    *                          ]
+   *
+   * Each requested partition carries `currentLeaderEpoch`, the client's current view of that
+   * partition's leader epoch from `MetadataCache#leaderEpoch` (-1 when the cache has not seen
+   * the partition), letting the broker fence a request built on metadata that has since moved.
    */
   async fetchTopicsOffset(topics) {
     const partitionsPerBroker = {}
@@ -584,7 +588,11 @@ module.exports = class Cluster {
 
     const addDefaultOffset = (topic) => (partition) => {
       const { timestamp } = topicConfigurations[topic]
-      return { ...partition, timestamp }
+      return {
+        ...partition,
+        timestamp,
+        currentLeaderEpoch: this.metadataCache.leaderEpoch(topic, partition.partition),
+      }
     }
 
     // Index all topics and partitions per leader (nodeId)

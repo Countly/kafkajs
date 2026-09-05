@@ -9,7 +9,7 @@
       "since": "2026-09-03"
     },
     "ListOffsets": {
-      "note": "v4 leader epoch (KIP-320), v6 flexible, v7 max-timestamp, v8 earliest-local offset (KIP-405).",
+      "note": "v4 leader epoch (KIP-320), v6 flexible, v7 max-timestamp (KIP-734), v8 earliest-local offset (KIP-405), v9 last-tiered offset (KIP-1005). v10 (async remote list offsets, KIP-1075) and v11 (earliest pending upload offset, KIP-1023) are deliberate gaps, not a waiver: both are tiered-storage features this client does not use.",
       "since": "2026-09-03"
     },
     "Metadata": {
