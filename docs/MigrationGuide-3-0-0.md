@@ -26,8 +26,10 @@ change not listed here did not change observable behavior.
   package's version. Operators watching a broker's `clientSoftwareName`/`clientSoftwareVersion`
   metrics or request logs will see this name where kafkajs 2.2.4 previously showed `unknown`.
 - **Negotiated protocol versions moved up**: ApiVersions from v2 to v4, and Metadata from v6 to
-  v12. ApiVersions is now re-negotiated on every (re)connect to a broker rather than once per
-  broker object, so each (re)connect costs one extra round trip per broker.
+  v12. ApiVersions is now re-negotiated whenever a broker is (re)connected through `connect()`
+  rather than once per broker object, so each such (re)connect costs one extra round trip per
+  broker. A fetch socket that the connection pool re-establishes on its own, while the broker's
+  other socket stays up, keeps the current version table until the next `connect()`.
 - **ApiVersions failures surface differently**. When a broker rejects every ApiVersions version
   the client can send, `connect()` now rejects with the broker's own `KafkaJSProtocolError`
   (`The version of API is not supported`) instead of a `KafkaJSNonRetriableError('API Versions
@@ -43,3 +45,12 @@ change not listed here did not change observable behavior.
   back by `Cluster#findBroker` and friends reports `true` only once its socket is up **and**
   ApiVersions has been negotiated, so a caller can no longer observe a connected-but-unusable
   broker. This can only turn a previously wrong `true` into a correct `false`.
+- **Error codes 90–133 are now recognised**. Errors a Kafka 4.x broker returns with those codes
+  used to surface as `type: 'KAFKAJS_UNKNOWN_ERROR_CODE'`; they now carry their real type (for
+  example `PRODUCER_FENCED`, `TRANSACTION_ABORTABLE`, `REBOOTSTRAP_REQUIRED`) and a `retriable`
+  flag derived from Kafka's own exception hierarchy, so codes 100, 103, 106, 122, 123 and 133 are
+  retried where 2.2.4 failed fast. Types, messages and flags of codes 0–89 are unchanged.
+- **Metadata results gain fields**. Partition objects returned by `admin.fetchTopicMetadata()`
+  (and `cluster.metadata()`) now include `leaderEpoch`; topics include `topicId` and
+  `topicAuthorizedOperations`. Existing keys are unchanged; deep-equality snapshots of these
+  results need updating.
