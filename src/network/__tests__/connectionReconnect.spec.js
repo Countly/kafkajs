@@ -4,7 +4,7 @@ const ConnectionPool = require('../connectionPool')
 const Encoder = require('../../protocol/encoder')
 const { CONNECTION_STATUS } = require('../connectionStatus')
 const { KafkaJSConnectionError } = require('../../errors')
-const { newLogger } = require('testHelpers')
+const { newLogger, respondWithFrame, readRequestHeader } = require('testHelpers')
 
 /**
  * A minimal fake socket factory that records every socket it creates. `mode: 'async'` (the
@@ -241,6 +241,43 @@ describe('Connection > reconnect safety', () => {
 
     releaseDrain()
     await disconnectPromise
+  })
+
+  test('a response that arrives while disconnect() drains pending requests still settles that request, so the drain finishes', async () => {
+    const { factory, sockets } = createTrackingSocketFactory()
+    const connection = new Connection(connectionOptsWith(factory))
+    await connection.connect()
+    const writes = []
+    sockets[0].write = (buffer) => {
+      writes.push(buffer)
+      return true
+    }
+
+    const request = {
+      apiKey: 3,
+      apiName: 'Metadata',
+      apiVersion: 1,
+      expectResponse: () => true,
+      encode: async () => new Encoder().writeInt8(0x2a),
+    }
+    const response = { decode: async (raw) => raw, parse: async (data) => data }
+    const inFlight = connection.send({ request, response })
+    await new Promise((resolve) => setImmediate(resolve))
+    expect(writes).toHaveLength(1)
+
+    // disconnect() must keep listening for the reply to the request it is waiting on: dropping it
+    // as stale leaves the drain waiting for a request that can never complete.
+    const disconnectPromise = connection.disconnect()
+    const { correlationId } = readRequestHeader(writes[0])
+    respondWithFrame({ socket: sockets[0] }, correlationId, 0, Buffer.from([0x01]))
+
+    await expect(inFlight).resolves.toBeDefined()
+    const outcome = await Promise.race([
+      disconnectPromise.then(() => 'disconnected'),
+      new Promise((resolve) => setTimeout(() => resolve('timed out'), 500)),
+    ])
+    expect(outcome).toEqual('disconnected')
+    expect(connection.connectionStatus).toEqual(CONNECTION_STATUS.DISCONNECTED)
   })
 })
 

@@ -405,13 +405,22 @@ module.exports = class Connection {
         })
       )
     }
-    // Ends the current attempt's epoch: a handler still attached to the socket torn down below
-    // (possibly mid-connect, possibly long since connected) recognises itself as stale from here.
-    this.connectAttempt += 1
     const socket = this.socket
     const epoch = this.connectAttempt
 
+    // In-flight requests still need this socket's data handler, so the drain runs on the
+    // current epoch; the epoch ends only afterwards.
     await this.requestQueue.waitForPendingRequests()
+
+    // A newer connect()/disconnect() pair that ran while the drain was yielding already owns
+    // this connection's socket and status; this disconnect() has nothing left to do.
+    if (this.connectAttempt !== epoch) {
+      return true
+    }
+
+    // Ends the attempt's epoch: every handler still attached to the socket torn down below
+    // (possibly mid-connect, possibly long since connected) recognises itself as stale from here.
+    this.connectAttempt += 1
     this.requestQueue.destroy()
 
     if (socket) {
@@ -426,12 +435,8 @@ module.exports = class Connection {
       socket.unref()
     }
 
-    // A newer connect()/disconnect() pair that ran while the drain above was yielding already
-    // owns this connection's status; only the disconnect() that is still current sets it.
-    if (this.connectAttempt === epoch) {
-      this.connectionStatus = CONNECTION_STATUS.DISCONNECTED
-      this.logDebug('disconnected')
-    }
+    this.connectionStatus = CONNECTION_STATUS.DISCONNECTED
+    this.logDebug('disconnected')
     return true
   }
 
