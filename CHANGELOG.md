@@ -124,5 +124,6 @@ Upstream work this phase builds on, with thanks to its authors: PRs #1779, #1695
 #### Tooling
 
 - Every protocol codec added in this release is checked against two independent sources as well as its own hand-built fixtures: byte vectors generated from Apache Kafka's own codecs (`scripts/protocol/javaVectors/run.sh`, extended to cover Produce, FindCoordinator, OffsetCommit, OffsetFetch, ListOffsets, InitProducerId and Metadata v13), and bytes captured from a live broker (`node scripts/protocol/capture.js`, extended to drive a producer and a consumer as well as an admin client). Captures are taken on both Kafka 4.3.1 and 4.1.2, within whatever version each broker advertises.
+- New development-only `node scripts/benchmarks/produceResponseDecode.js`: measures the classic against the flexible produce-response decoder over the committed fixtures, so the cost of moving the produce path onto compact encoding is measured rather than assumed.
 
 Adopted upstream PRs are credited here by number as they land (Phase 2 onward).
