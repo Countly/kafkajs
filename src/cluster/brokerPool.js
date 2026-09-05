@@ -203,6 +203,88 @@ module.exports = class BrokerPool {
   }
 
   /**
+   * Applies the broker endpoints a leadership error carried (KIP-951), so the client can talk to
+   * a new leader without waiting for a metadata refresh.
+   *
+   * A `Broker` wraps a connection pool whose address is fixed at construction, so an endpoint
+   * whose host, port or rack differs from the cached one is a *replacement*, not an update: a new
+   * pool is built (through `buildConnectionPool`, which carries the shared authentication
+   * blackout) and the old broker is disconnected. The replacement is built with the same fields
+   * the metadata refresh path uses, `versions` included, so the request the hint is trying to
+   * make fast does not pay a fresh ApiVersions round trip.
+   *
+   * Three cases never build a bare replacement:
+   * - **The seed broker.** `refreshMetadata` can adopt `this.seedBroker` into `this.brokers` under
+   *   a real node id; every other broker-pool method (`hasConnectedBrokers`, `connect`,
+   *   `findConnectedBroker`'s fallback) reads `this.seedBroker` directly, so swapping that object
+   *   out from under it would leave them holding a stale, disconnected reference. When the entry
+   *   at `nodeId` *is* the seed, its connection pool is swapped in place instead - the seed's
+   *   identity and `this.seedBroker` never change - and the pool it was using is drained
+   *   separately, mirroring how `refreshMetadata`'s reduce keeps the seed object rather than
+   *   rebuilding it when it recognises the address (see `refreshMetadata` above).
+   * - **An endpoint with no usable address.** A blank host or a non-positive port is exactly the
+   *   input `connectionPoolBuilder` treats as "no destination given" and answers with the next
+   *   configured bootstrap broker - silently pointing this node id at an unrelated broker. Such an
+   *   endpoint is skipped.
+   * - **A world that moved on underneath one `await`.** Between reading the current broker and the
+   *   built replacement pool becoming ready, a concurrent rebootstrap/disconnect can empty
+   *   `this.brokers`, or a second hint for the same node id can already have written its own
+   *   replacement. The table is re-checked before writing; on a mismatch the freshly built pool -
+   *   never handed to a `Broker` - is closed instead of overwriting whatever is there now.
+   *
+   * Adding an unknown node id is allowed; removing one is not - only a metadata response may
+   * shrink the broker table.
+   *
+   * @see https://cwiki.apache.org/confluence/display/KAFKA/KIP-951%3A+Leader+discovery+optimisations+for+the+client
+   * @public
+   * @param {{ nodeId: number, host: string, port: number, rack: string|null }[]} [nodeEndpoints]
+   * @returns {Promise<void>}
+   */
+  async applyNodeEndpoints(nodeEndpoints) {
+    if (!nodeEndpoints || nodeEndpoints.length === 0) {
+      return
+    }
+
+    const replaced = []
+
+    for (const { nodeId, host, port, rack } of nodeEndpoints) {
+      if (!host || !Number.isInteger(port) || port <= 0) {
+        continue
+      }
+
+      const broker = this.brokers[nodeId]
+
+      if (broker && !hasBrokerBeenReplaced(broker, { host, port, rack })) {
+        continue
+      }
+
+      if (broker && broker === this.seedBroker) {
+        const oldConnectionPool = broker.connectionPool
+        broker.replaceConnectionPool(await this.buildConnectionPool({ host, port, rack }))
+        await oldConnectionPool.destroy()
+        continue
+      }
+
+      const connectionPool = await this.buildConnectionPool({ host, port, rack })
+
+      if (this.brokers[nodeId] !== broker) {
+        await connectionPool.destroy()
+        continue
+      }
+
+      broker && replaced.push(broker)
+      this.brokers[nodeId] = this.createBroker({
+        logger: this.rootLogger,
+        versions: this.versions,
+        connectionPool,
+        nodeId,
+      })
+    }
+
+    await Promise.all(replaced.map((broker) => broker.disconnect()))
+  }
+
+  /**
    * @public
    * @returns {Boolean}
    */

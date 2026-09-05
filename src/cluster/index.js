@@ -364,6 +364,57 @@ module.exports = class Cluster {
   }
 
   /**
+   * Applies a leader hint a produce error carried (KIP-951): the broker that now owns the
+   * partition, and the endpoints of the nodes it named.
+   *
+   * The epoch check runs first, so a hint that does not advance the partition's leader epoch
+   * costs nothing (unless the partition itself is unknown to the cache - see below). The endpoint
+   * work runs **before** the cache write, because the cache write is synchronous and immediately
+   * visible to routing: writing it first would publish a node id for which no broker object
+   * exists yet, and a concurrent send would take the broker-not-found path and force a metadata
+   * refresh - the exact latency this hint exists to avoid. That ordering only closes the window
+   * when the hint actually carries an endpoint for `leaderId`; a hint with no `nodeEndpoints` (the
+   * broker believes the client already knows the node) can still publish a node id the broker
+   * table has never heard of, which takes the broker-not-found path regardless of ordering here.
+   *
+   * The pre-check mirrors `MetadataCache#applyLeaderHint`'s own **epoch** guard exactly (an
+   * unknown cached epoch, `-1`, never rejects) so it can only short-circuit a hint the cache would
+   * reject anyway, never one it would accept; the cache stays the single authority, since it also
+   * knows about topics and partitions this pre-check cannot see. A hint for a partition the cache
+   * does not know at all is one such case the pre-check cannot short-circuit: the epoch compares
+   * as advancing (nothing cached to compare against), so the endpoint work still runs, and only
+   * `MetadataCache#applyLeaderHint`'s own `!cached` branch rejects it afterwards.
+   *
+   * @see https://cwiki.apache.org/confluence/display/KAFKA/KIP-951%3A+Leader+discovery+optimisations+for+the+client
+   * @public
+   * @param {object} hint
+   * @param {string} hint.topic
+   * @param {number} hint.partition
+   * @param {number} hint.leaderId
+   * @param {number} hint.leaderEpoch
+   * @param {{ nodeId: number, host: string, port: number, rack: string|null }[]} [hint.nodeEndpoints]
+   * @returns {Promise<boolean>} `false` when the hint was rejected - a non-advancing epoch, a
+   *   `leaderId` of `-1` (no hint offered), or an unknown topic/partition - `true` when it was
+   *   applied
+   */
+  async applyLeaderHint({ topic, partition, leaderId, leaderEpoch, nodeEndpoints }) {
+    // Mirrors MetadataCache#applyLeaderHint's own no-hint-offered guard, so this pre-check can
+    // never itself pay for the endpoint work below on the broker's `{ -1, -1 }` default.
+    if (leaderId === -1) {
+      return false
+    }
+
+    const cachedLeaderEpoch = this.metadataCache.leaderEpoch(topic, partition)
+
+    if (cachedLeaderEpoch > -1 && leaderEpoch <= cachedLeaderEpoch) {
+      return false
+    }
+
+    await this.brokerPool.applyNodeEndpoints(nodeEndpoints)
+    return this.metadataCache.applyLeaderHint(topic, partition, { leaderId, leaderEpoch })
+  }
+
+  /**
    * Subscribes to the cluster-level "a known topic name came back with a different id" event.
    *
    * Internal: the consumer uses it to schedule a one-shot offset reset. Applications observe the

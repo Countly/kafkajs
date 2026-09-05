@@ -166,6 +166,29 @@ module.exports = ({ logger, cluster, partitioner, eosManager, retrier }) => {
           cluster.removeBroker({ host: e.host, port: e.port })
         }
 
+        // KIP-951: the broker told us which node now leads this partition. Applying it updates
+        // the leader-epoch cache and the broker table, so the next attempt - scheduled by the
+        // retrier below, on its normal backoff - routes there. Nothing about the retry unit, the
+        // backoff or the sequence bookkeeping changes. Best-effort, same reasoning as the other
+        // side channels below: a rejection here (e.g. a bad address in `nodeEndpoints`) must not
+        // replace the original produce error's `type`/`code`/`retriable` and skip the
+        // `staleMetadata` fall-through below.
+        if (e.name === 'KafkaJSProtocolError' && e.currentLeader) {
+          await cluster
+            .applyLeaderHint({
+              topic: e.topic,
+              partition: e.partition,
+              leaderId: e.currentLeader.leaderId,
+              leaderEpoch: e.currentLeader.leaderEpoch,
+              nodeEndpoints: e.nodeEndpoints,
+            })
+            .catch((hintError) => {
+              logger.debug(
+                `Best-effort leader hint application failed, continuing with the original error: ${hintError.message}`
+              )
+            })
+        }
+
         if (!cluster.isConnected()) {
           logger.debug(`Cluster has disconnected, reconnecting: ${e.message}`, {
             retryCount,
