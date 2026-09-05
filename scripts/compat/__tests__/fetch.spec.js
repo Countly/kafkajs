@@ -1,6 +1,14 @@
 const fs = require('fs')
 const path = require('path')
-const { parseErrorsJava, messageFiles, discover, safeDiscover } = require('../fetch')
+const {
+  parseErrorsJava,
+  messageFiles,
+  discover,
+  safeDiscover,
+  parseExtendsClause,
+  resolvesToRetriable,
+  resolveExceptionHierarchy,
+} = require('../fetch')
 const trackedApis = require('../tracked-apis.json')
 
 const readFixture = (name) => fs.readFileSync(path.join(__dirname, 'fixtures', name), 'utf8')
@@ -55,6 +63,114 @@ describe('scripts/compat/fetch', () => {
     it('matches the committed snapshot exactly', () => {
       const snapshot = fs.readdirSync(path.join(__dirname, '..', 'messages', '4.3.1')).sort()
       expect(files).toEqual(snapshot)
+    })
+  })
+
+  describe('parseExtendsClause', () => {
+    it('reads the direct superclass from a class file with a license header and Javadoc', () => {
+      const superclass = parseExtendsClause(readFixture('ExceptionClassSample.java'))
+      expect(superclass).toBe('InvalidMetadataException')
+    })
+
+    it('returns null when the source declares no `extends` clause', () => {
+      expect(parseExtendsClause('public class Foo {\n}\n')).toBeNull()
+    })
+
+    it('strips a fully-qualified superclass down to its simple name', () => {
+      const source = 'public class Foo extends org.apache.kafka.common.KafkaException {\n}\n'
+      expect(parseExtendsClause(source)).toBe('KafkaException')
+    })
+  })
+
+  describe('resolvesToRetriable', () => {
+    it('is true once the chain reaches RetriableException', () => {
+      const extendsByName = new Map([
+        ['UnknownTopicIdException', 'InvalidMetadataException'],
+        ['InvalidMetadataException', 'RetriableException'],
+      ])
+      expect(resolvesToRetriable('UnknownTopicIdException', extendsByName)).toBe(true)
+    })
+
+    it('is false once the chain reaches a JDK exception root', () => {
+      const extendsByName = new Map([
+        ['ProducerFencedException', 'ApiException'],
+        ['ApiException', 'KafkaException'],
+        ['KafkaException', 'RuntimeException'],
+      ])
+      expect(resolvesToRetriable('ProducerFencedException', extendsByName)).toBe(false)
+    })
+
+    it('throws on a cycle instead of looping forever', () => {
+      const extendsByName = new Map([
+        ['A', 'B'],
+        ['B', 'A'],
+      ])
+      expect(() => resolvesToRetriable('A', extendsByName)).toThrow('cycle')
+    })
+
+    it('throws when the chain leaves the resolved set', () => {
+      expect(() => resolvesToRetriable('Unresolved', new Map())).toThrow(
+        'no extends information resolved for Unresolved'
+      )
+    })
+  })
+
+  describe('resolveExceptionHierarchy (injected fetch, no network)', () => {
+    const originalFetch = globalThis.fetch
+
+    afterEach(() => {
+      globalThis.fetch = originalFetch
+    })
+
+    /** A minimal fake source tree: url -> { ok, status, text }. */
+    const fakeFetch = (sources) => (url) => {
+      const entry = sources[url]
+      if (entry === undefined) return Promise.resolve({ ok: false, status: 404 })
+      return Promise.resolve({ ok: true, status: 200, text: () => Promise.resolve(entry) })
+    }
+
+    it('walks the chain across the default errors package', async () => {
+      const tag = 'test-tag'
+      const dir = 'clients/src/main/java/org/apache/kafka/common/errors'
+      globalThis.fetch = jest.fn(
+        fakeFetch({
+          [`https://raw.githubusercontent.com/apache/kafka/${tag}/${dir}/UnknownTopicIdException.java`]:
+            'public class UnknownTopicIdException extends InvalidMetadataException {\n}\n',
+          [`https://raw.githubusercontent.com/apache/kafka/${tag}/${dir}/InvalidMetadataException.java`]:
+            'public class InvalidMetadataException extends RetriableException {\n}\n',
+        })
+      )
+
+      const result = await resolveExceptionHierarchy(tag, ['UnknownTopicIdException'], {})
+      expect(result.get('UnknownTopicIdException')).toBe(true)
+    })
+
+    it('falls back to the override map when the default location 404s', async () => {
+      const tag = 'test-tag'
+      globalThis.fetch = jest.fn(
+        fakeFetch({
+          'https://raw.githubusercontent.com/apache/kafka/test-tag/clients/src/main/java/org/apache/kafka/common/KafkaException.java':
+            'public class KafkaException extends RuntimeException {\n}\n',
+        })
+      )
+
+      const overridePaths = {
+        KafkaException: 'clients/src/main/java/org/apache/kafka/common/KafkaException.java',
+      }
+      const result = await resolveExceptionHierarchy(tag, ['KafkaException'], overridePaths)
+      expect(result.get('KafkaException')).toBe(false)
+    })
+
+    it('reports every unresolved class instead of guessing', async () => {
+      globalThis.fetch = jest.fn(fakeFetch({}))
+
+      expect.assertions(2)
+      try {
+        await resolveExceptionHierarchy('test-tag', ['MysteryException'], {})
+      } catch (error) {
+        expect(error.message).toContain('MysteryException')
+        expect(error.unresolved).toEqual(['MysteryException'])
+      }
     })
   })
 

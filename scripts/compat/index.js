@@ -107,6 +107,11 @@ const checkErrors = (model, failures, reports) => {
       `F1 stale alias ${stale.forkType} -> ${stale.kafkaType} in notes.json: it no longer matches the snapshot`
     )
   }
+  for (const mismatch of errors.retriableMismatches) {
+    failures.push(
+      `F1 code ${mismatch.code} (${mismatch.type}): this client's retriable is ${mismatch.forkRetriable}, Kafka ${model.kafkaTag} is ${mismatch.kafkaRetriable}`
+    )
+  }
   reports.push(
     `F1 ${errors.missingInFork.length} error codes defined by Kafka ${model.kafkaTag} are missing here`
   )

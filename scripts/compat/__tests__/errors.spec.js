@@ -78,6 +78,31 @@ describe('scripts/compat/errors', () => {
       expect(result.staleAliases).toEqual([{ forkType: 'FORK_NAME', kafkaType: 'SOMETHING_ELSE' }])
     })
 
+    it('reports a retriable mismatch on a code whose type matches', () => {
+      const result = compareErrorTables({
+        snapshot: snapshot([{ code: 5, type: 'SAME', retriable: true }]),
+        forkErrorCodes: [{ code: 5, type: 'SAME', retriable: false }],
+        aliases: {},
+      })
+      expect(result.retriableMismatches).toEqual([
+        { code: 5, type: 'SAME', forkRetriable: false, kafkaRetriable: true },
+      ])
+    })
+
+    it('reports a retriable mismatch on a code whose type is an accepted alias', () => {
+      const result = compareErrorTables({
+        snapshot: snapshot([{ code: 5, type: 'KAFKA_NAME', retriable: true }]),
+        forkErrorCodes: [{ code: 5, type: 'FORK_NAME', retriable: false }],
+        aliases: { FORK_NAME: { kafkaType: 'KAFKA_NAME', reason: 'public API' } },
+      })
+      expect(result.aliased).toEqual([
+        { code: 5, forkType: 'FORK_NAME', kafkaType: 'KAFKA_NAME', reason: 'public API' },
+      ])
+      expect(result.retriableMismatches).toEqual([
+        { code: 5, type: 'FORK_NAME', forkRetriable: false, kafkaRetriable: true },
+      ])
+    })
+
     it('reports an alias that no longer applies as stale', () => {
       const result = compareErrorTables({
         snapshot: snapshot([{ code: 5, type: 'SAME' }]),
@@ -123,6 +148,7 @@ describe('scripts/compat/errors', () => {
       expect(result.unknownToKafka).toEqual([])
       expect(result.mismatches).toEqual([])
       expect(result.staleAliases).toEqual([])
+      expect(result.retriableMismatches).toEqual([])
     })
 
     it('records the five historical KafkaJS names as aliases', () => {
@@ -135,11 +161,9 @@ describe('scripts/compat/errors', () => {
       ])
     })
 
-    it('reports the codes Phase 4 still has to add', () => {
-      expect(result.counts).toEqual({ kafka: 134, fork: 90 })
-      expect(result.missingInFork).toHaveLength(44)
-      expect(result.missingInFork[0]).toEqual({ code: 90, type: 'PRODUCER_FENCED' })
-      expect(result.missingInFork[43]).toEqual({ code: 133, type: 'SHARE_SESSION_LIMIT_REACHED' })
+    it('covers every error code Kafka defines, codes 90-133 included', () => {
+      expect(result.counts).toEqual({ kafka: 134, fork: 134 })
+      expect(result.missingInFork).toEqual([])
     })
   })
 })

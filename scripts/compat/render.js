@@ -120,7 +120,7 @@ const renderErrors = (lines, model) => {
   const errors = model.errors
   section(lines, 'Error table')
   lines.push(
-    `\`src/protocol/error.js\` defines ${errors.counts.fork} codes; Kafka ${model.kafkaTag} defines ${errors.counts.kafka} (excluding \`NONE\`, which is the success sentinel). Retriable flags are hand-set here and are **not** checked: \`RetriableException\` inheritance is not visible in \`Errors.java\`, so this table says nothing about whether a retriable flag is right.`
+    `\`src/protocol/error.js\` defines ${errors.counts.fork} codes; Kafka ${model.kafkaTag} defines ${errors.counts.kafka} (excluding \`NONE\`, which is the success sentinel). \`retriable\` is derived from each error's exception hierarchy upstream and checked against this table: a mismatch is a failure.`
   )
   lines.push('')
   lines.push(

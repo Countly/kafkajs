@@ -4,13 +4,15 @@
  * Error-table comparison (spec F1). The fork's src/protocol/error.js is compared with the
  * committed Errors.java snapshot for the pinned tag:
  *
- *   missingInFork   defined upstream, absent here            -> report only (Phase 4 work)
- *   unknownToKafka  defined here, not by the pinned Kafka    -> failure
- *   mismatches      same code, different type name           -> failure unless aliased
- *   aliased         a known historical KafkaJS name          -> report only
+ *   missingInFork       defined upstream, absent here            -> report only
+ *   unknownToKafka      defined here, not by the pinned Kafka    -> failure
+ *   mismatches          same code, different type name           -> failure unless aliased
+ *   aliased             a known historical KafkaJS name          -> report only
+ *   retriableMismatches same code and type, different retriable  -> failure
  *
- * Retriable flags are neither checked nor generated: RetriableException inheritance is not
- * visible in Errors.java (spec A5/F2).
+ * `retriable` is derived by scripts/compat/fetch.js from each exception class's superclass
+ * chain (RetriableException inheritance, not visible in Errors.java itself) and committed into
+ * the snapshot, so it can be compared here like any other field.
  */
 
 const fs = require('fs')
@@ -29,30 +31,48 @@ const compareErrorTables = (input) => {
   const aliases = input.aliases || {}
   const kafka = new Map()
   for (const error of input.snapshot.errors) {
-    if (error.code !== SUCCESS_CODE) kafka.set(error.code, error.type)
+    if (error.code !== SUCCESS_CODE) {
+      kafka.set(error.code, { type: error.type, retriable: error.retriable })
+    }
   }
-  const fork = new Map(input.forkErrorCodes.map((error) => [error.code, error.type]))
+  const fork = new Map(
+    input.forkErrorCodes.map((error) => [
+      error.code,
+      { type: error.type, retriable: error.retriable },
+    ])
+  )
 
   const missingInFork = []
-  for (const [code, type] of kafka) {
-    if (!fork.has(code)) missingInFork.push({ code, type })
+  for (const [code, entry] of kafka) {
+    if (!fork.has(code)) missingInFork.push({ code, type: entry.type })
   }
 
   const unknownToKafka = []
   const mismatches = []
   const aliased = []
-  for (const [code, type] of fork) {
+  const retriableMismatches = []
+  for (const [code, entry] of fork) {
+    const { type, retriable } = entry
     if (!kafka.has(code)) {
       unknownToKafka.push({ code, type })
       continue
     }
-    const kafkaType = kafka.get(code)
-    if (kafkaType === type) continue
-    const alias = aliases[type]
-    if (alias !== undefined && alias.kafkaType === kafkaType) {
-      aliased.push({ code, forkType: type, kafkaType, reason: alias.reason })
-    } else {
-      mismatches.push({ code, forkType: type, kafkaType })
+    const kafkaEntry = kafka.get(code)
+    if (kafkaEntry.type !== type) {
+      const alias = aliases[type]
+      if (alias === undefined || alias.kafkaType !== kafkaEntry.type) {
+        mismatches.push({ code, forkType: type, kafkaType: kafkaEntry.type })
+        continue
+      }
+      aliased.push({ code, forkType: type, kafkaType: kafkaEntry.type, reason: alias.reason })
+    }
+    if (retriable !== kafkaEntry.retriable) {
+      retriableMismatches.push({
+        code,
+        type,
+        forkRetriable: retriable,
+        kafkaRetriable: kafkaEntry.retriable,
+      })
     }
   }
 
@@ -73,6 +93,7 @@ const compareErrorTables = (input) => {
     mismatches: mismatches.sort(byCode),
     aliased: aliased.sort(byCode),
     staleAliases: staleAliases.sort(byForkType),
+    retriableMismatches: retriableMismatches.sort(byCode),
   }
 }
 

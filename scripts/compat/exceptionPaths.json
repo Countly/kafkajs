@@ -1,0 +1,4 @@
+{
+  "KafkaException": "clients/src/main/java/org/apache/kafka/common/KafkaException.java",
+  "InvalidRecordException": "clients/src/main/java/org/apache/kafka/common/InvalidRecordException.java"
+}

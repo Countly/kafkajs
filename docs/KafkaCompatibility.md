@@ -83,60 +83,11 @@ Not per-API, and not derivable from the message definitions. Each row names the 
 
 ## Error table
 
-`src/protocol/error.js` defines 90 codes; Kafka 4.3.1 defines 134 (excluding `NONE`, which is the success sentinel). Retriable flags are hand-set here and are **not** checked: `RetriableException` inheritance is not visible in `Errors.java`, so this table says nothing about whether a retriable flag is right.
+`src/protocol/error.js` defines 134 codes; Kafka 4.3.1 defines 134 (excluding `NONE`, which is the success sentinel). `retriable` is derived from each error's exception hierarchy upstream and checked against this table: a mismatch is a failure.
 
-- Defined upstream, missing here: **44** (reported, not a failure).
+- Defined upstream, missing here: **0** (reported, not a failure).
 - Defined here, unknown to Kafka 4.3.1: **0** (a failure).
 - Type-name mismatches on a shared code: **0** (a failure), plus **5** accepted historical aliases.
-
-Missing codes:
-
-| Code | Kafka type |
-|--:|---|
-| 90 | PRODUCER_FENCED |
-| 91 | RESOURCE_NOT_FOUND |
-| 92 | DUPLICATE_RESOURCE |
-| 93 | UNACCEPTABLE_CREDENTIAL |
-| 94 | INCONSISTENT_VOTER_SET |
-| 95 | INVALID_UPDATE_VERSION |
-| 96 | FEATURE_UPDATE_FAILED |
-| 97 | PRINCIPAL_DESERIALIZATION_FAILURE |
-| 98 | SNAPSHOT_NOT_FOUND |
-| 99 | POSITION_OUT_OF_RANGE |
-| 100 | UNKNOWN_TOPIC_ID |
-| 101 | DUPLICATE_BROKER_REGISTRATION |
-| 102 | BROKER_ID_NOT_REGISTERED |
-| 103 | INCONSISTENT_TOPIC_ID |
-| 104 | INCONSISTENT_CLUSTER_ID |
-| 105 | TRANSACTIONAL_ID_NOT_FOUND |
-| 106 | FETCH_SESSION_TOPIC_ID_ERROR |
-| 107 | INELIGIBLE_REPLICA |
-| 108 | NEW_LEADER_ELECTED |
-| 109 | OFFSET_MOVED_TO_TIERED_STORAGE |
-| 110 | FENCED_MEMBER_EPOCH |
-| 111 | UNRELEASED_INSTANCE_ID |
-| 112 | UNSUPPORTED_ASSIGNOR |
-| 113 | STALE_MEMBER_EPOCH |
-| 114 | MISMATCHED_ENDPOINT_TYPE |
-| 115 | UNSUPPORTED_ENDPOINT_TYPE |
-| 116 | UNKNOWN_CONTROLLER_ID |
-| 117 | UNKNOWN_SUBSCRIPTION_ID |
-| 118 | TELEMETRY_TOO_LARGE |
-| 119 | INVALID_REGISTRATION |
-| 120 | TRANSACTION_ABORTABLE |
-| 121 | INVALID_RECORD_STATE |
-| 122 | SHARE_SESSION_NOT_FOUND |
-| 123 | INVALID_SHARE_SESSION_EPOCH |
-| 124 | FENCED_STATE_EPOCH |
-| 125 | INVALID_VOTER_KEY |
-| 126 | DUPLICATE_VOTER |
-| 127 | VOTER_NOT_FOUND |
-| 128 | INVALID_REGULAR_EXPRESSION |
-| 129 | REBOOTSTRAP_REQUIRED |
-| 130 | STREAMS_INVALID_TOPOLOGY |
-| 131 | STREAMS_INVALID_TOPOLOGY_EPOCH |
-| 132 | STREAMS_TOPOLOGY_FENCED |
-| 133 | SHARE_SESSION_LIMIT_REACHED |
 
 Accepted aliases (the KafkaJS name is public API and is deliberately kept):
 
