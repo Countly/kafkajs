@@ -131,10 +131,18 @@ describe('scripts/protocol > schema validation', () => {
       'src/protocol/requests/listPartitionReassignments/v0/request.js',
       'src/protocol/requests/listPartitionReassignments/v0/response.js',
       'src/protocol/requests/metadata/v0/request.js',
+      'src/protocol/requests/metadata/v10/request.js',
+      'src/protocol/requests/metadata/v10/response.js',
+      'src/protocol/requests/metadata/v11/request.js',
+      'src/protocol/requests/metadata/v11/response.js',
+      'src/protocol/requests/metadata/v12/request.js',
+      'src/protocol/requests/metadata/v12/response.js',
       'src/protocol/requests/metadata/v7/request.js',
       'src/protocol/requests/metadata/v7/response.js',
       'src/protocol/requests/metadata/v8/request.js',
       'src/protocol/requests/metadata/v8/response.js',
+      'src/protocol/requests/metadata/v9/request.js',
+      'src/protocol/requests/metadata/v9/response.js',
     ])
   })
 })
