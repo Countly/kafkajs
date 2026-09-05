@@ -1,4 +1,4 @@
-const { errorCodes, createErrorFromCode } = require('./error')
+const { errorCodes, createErrorFromCode, staleMetadata } = require('./error')
 
 describe('Protocol > error', () => {
   describe('#createErrorFromCode', () => {
@@ -73,5 +73,27 @@ describe('error codes 90-133 (Kafka 4.3.1 Errors.java)', () => {
     for (const code of [110, 111, 112, 113]) {
       expect(createErrorFromCode(code).type).not.toEqual('KAFKAJS_UNKNOWN_ERROR_CODE')
     }
+  })
+})
+
+describe('#staleMetadata', () => {
+  test.each([
+    [100, 'UNKNOWN_TOPIC_ID'],
+    [103, 'INCONSISTENT_TOPIC_ID'],
+    [106, 'FETCH_SESSION_TOPIC_ID_ERROR'],
+    [3, 'UNKNOWN_TOPIC_OR_PARTITION'],
+    [5, 'LEADER_NOT_AVAILABLE'],
+    [6, 'NOT_LEADER_FOR_PARTITION'],
+  ])('treats %s (%s) as stale metadata', (code) => {
+    expect(staleMetadata(createErrorFromCode(code))).toBe(true)
+  })
+
+  test('does not treat the consumer-only leader-epoch codes as stale metadata', () => {
+    expect(staleMetadata(createErrorFromCode(74))).toBe(false) // FENCED_LEADER_EPOCH
+    expect(staleMetadata(createErrorFromCode(75))).toBe(false) // UNKNOWN_LEADER_EPOCH
+  })
+
+  test('does not treat an unrelated error as stale metadata', () => {
+    expect(staleMetadata(createErrorFromCode(87))).toBe(false) // INVALID_RECORD
   })
 })

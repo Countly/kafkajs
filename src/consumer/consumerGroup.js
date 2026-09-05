@@ -31,6 +31,12 @@ const STALE_METADATA_ERRORS = [
   'FENCED_LEADER_EPOCH',
   'UNKNOWN_LEADER_EPOCH',
   'UNKNOWN_TOPIC_OR_PARTITION',
+  // Fetch/Metadata topic-id routing errors: the topic id in the request no longer matches a topic
+  'UNKNOWN_TOPIC_ID',
+  // the broker's topic id for a partition disagrees with what the client sent
+  'INCONSISTENT_TOPIC_ID',
+  // a fetch session was built against a topic id the broker no longer recognises
+  'FETCH_SESSION_TOPIC_ID_ERROR',
 ]
 
 const PRIVATE = {

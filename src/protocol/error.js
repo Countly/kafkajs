@@ -867,10 +867,31 @@ const failIfVersionNotSupported = (code) => {
   }
 }
 
-const staleMetadata = (e) =>
-  ['UNKNOWN_TOPIC_OR_PARTITION', 'LEADER_NOT_AVAILABLE', 'NOT_LEADER_FOR_PARTITION'].includes(
-    e.type
-  )
+/**
+ * Errors that mean "the metadata this request was built on is out of date": the client should
+ * refresh and retry rather than fail. The topic-id codes belong here because a topic id the
+ * broker rejects or does not recognise is, from the client's side, exactly a stale-metadata
+ * condition - it is routing on an incarnation of a topic that no longer exists.
+ *
+ * This list is deliberately narrower than the consumer's own `STALE_METADATA_ERRORS`: the two
+ * leader-epoch codes that list carries drive a group rejoin, which has no producer equivalent.
+ */
+const STALE_METADATA_ERROR_TYPES = [
+  'UNKNOWN_TOPIC_OR_PARTITION',
+  'LEADER_NOT_AVAILABLE',
+  'NOT_LEADER_FOR_PARTITION',
+  'UNKNOWN_TOPIC_ID',
+  'INCONSISTENT_TOPIC_ID',
+  'FETCH_SESSION_TOPIC_ID_ERROR',
+]
+
+/**
+ * Reports whether a protocol error means the client's metadata is stale and it should refresh
+ * and retry rather than surface a failure.
+ * @param {Error} e
+ * @returns {boolean}
+ */
+const staleMetadata = (e) => STALE_METADATA_ERROR_TYPES.includes(e.type)
 
 module.exports = {
   failure,
