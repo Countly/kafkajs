@@ -26,10 +26,12 @@ describe('ConnectionPool', () => {
   })
 
   it('should return different connection for Fetch requests', async () => {
-    const heartbeatConnection = pool.getConnectionByRequest({
+    const heartbeatConnection = await pool.getConnectionByRequest({
       request: { apiKey: apiKeys.Heartbeat },
     })
-    const fetchConnection = pool.getConnectionByRequest({ request: { apiKey: apiKeys.Fetch } })
+    const fetchConnection = await pool.getConnectionByRequest({
+      request: { apiKey: apiKeys.Fetch },
+    })
     expect(heartbeatConnection !== fetchConnection).toBe(true)
   })
 

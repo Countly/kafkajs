@@ -80,6 +80,16 @@ module.exports = class ConnectionPool {
     return this.pool.some((c) => c.isConnected())
   }
 
+  /**
+   * Changes whenever any socket in this pool is (re)established. Version information is only
+   * valid for the connection it was learned on (KIP-35), so Broker keys its negotiated table on
+   * this value rather than on one connection.
+   * @returns {number}
+   */
+  get generation() {
+    return this.pool[0].generation + this.pool[1].generation
+  }
+
   isAuthenticated() {
     return this.pool.some((c) => c.isAuthenticated())
   }

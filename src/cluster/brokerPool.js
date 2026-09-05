@@ -365,12 +365,17 @@ module.exports = class BrokerPool {
         }
 
         if (e.type === 'ILLEGAL_SASL_STATE') {
-          // Rebuild the connection pool since it can't recover from illegal SASL state
-          broker.connectionPool = await this.buildConnectionPool({
-            host: broker.connectionPool.host,
-            port: broker.connectionPool.port,
-            rack: broker.connectionPool.rack,
-          })
+          // Rebuild the connection pool since it can't recover from illegal SASL state.
+          // replaceConnectionPool also resets versionsGeneration, so the next connect() always
+          // re-negotiates against the replacement pool (KIP-35 rule 7) rather than comparing
+          // against the generation the old, discarded pool had reached.
+          broker.replaceConnectionPool(
+            await this.buildConnectionPool({
+              host: broker.connectionPool.host,
+              port: broker.connectionPool.port,
+              rack: broker.connectionPool.rack,
+            })
+          )
 
           this.logger.error(`Failed to connect to broker, reconnecting`, { retryCount, retryTime })
           throw new KafkaJSProtocolError(e, { retriable: true })

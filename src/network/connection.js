@@ -55,6 +55,9 @@ const isAuthenticatedRequest = (request) => {
 const PRIVATE = {
   SHOULD_REAUTHENTICATE: Symbol('private:Connection:shouldReauthenticate'),
   AUTHENTICATE: Symbol('private:Connection:authenticate'),
+  CONNECT: Symbol('private:Connection:connect'),
+  CONNECT_ATTEMPT: Symbol('private:Connection:connectAttempt'),
+  ABORT_CONNECT: Symbol('private:Connection:abortConnect'),
 }
 
 module.exports = class Connection {
@@ -128,6 +131,31 @@ module.exports = class Connection {
 
     this.connectionStatus = CONNECTION_STATUS.DISCONNECTED
     this.correlationId = 0
+
+    /**
+     * Bumped every time a socket is established. Version information learned over one socket is
+     * only valid for that socket (KIP-35), so callers key their caches on this.
+     * @type {number}
+     */
+    this.generation = 0
+
+    /**
+     * Identifies the current `connect()` attempt (0 = none yet). Taken before the socket for
+     * that attempt is created — not after, and not derived from `this.socket` — so an attempt
+     * is recognised as current regardless of when its `socketFactory` calls `onConnect`, and so
+     * that `disconnect()` can invalidate a superseded attempt by bumping this counter alone.
+     * @type {number}
+     */
+    this.connectAttempt = 0
+
+    /**
+     * Rejects the in-flight `connect()` attempt, if any; set for the lifetime of one attempt and
+     * cleared once it settles. `disconnect()` calls it so a caller blocked on `connect()` is
+     * rejected immediately when the attempt is superseded, rather than left to its own timeout.
+     * @type {((error: Error) => void)|null}
+     */
+    this[PRIVATE.ABORT_CONNECT] = null
+
     this.requestQueue = new RequestQueue({
       instrumentationEmitter,
       maxInFlightRequests,
@@ -172,6 +200,12 @@ module.exports = class Connection {
         this.sessionLifetime = Long.fromValue(authenticator.sessionLifetime)
       }
     })
+
+    /**
+     * @private
+     * @returns {Promise}
+     */
+    this[PRIVATE.CONNECT] = sharedPromiseTo(() => this[PRIVATE.CONNECT_ATTEMPT]())
   }
 
   setVersions(versions) {
@@ -183,11 +217,44 @@ module.exports = class Connection {
   }
 
   /**
+   * Connects this connection's socket, negotiating nothing itself. Concurrent callers — the
+   * request path calls this whenever a socket looks disconnected, with no lock — share one
+   * underlying attempt and settle together, so at most one socket is ever being created at a
+   * time for this connection.
+   *
    * @public
    * @returns {Promise}
    */
   connect() {
+    return this[PRIVATE.CONNECT]()
+  }
+
+  /**
+   * The actual connect attempt, wrapped by `connect()` in `sharedPromiseTo` so overlapping
+   * callers share it. Every socket event handler below is tied to this attempt's token
+   * (`this.connectAttempt`), taken *before* `createSocket` runs so a `socketFactory` that
+   * invokes `onConnect` synchronously — a documented extension point — is still recognised as
+   * current; comparing against `this.socket` instead broke exactly that case. A later attempt,
+   * or a `disconnect()` call, bumps `this.connectAttempt` and turns every handler here into a
+   * no-op for the attempt it belonged to.
+   *
+   * @private
+   * @returns {Promise}
+   */
+  [PRIVATE.CONNECT_ATTEMPT]() {
     return new Promise((resolve, reject) => {
+      // CONNECTED_STATUS treats DISCONNECTING as "connected" so requests already in flight can
+      // still complete while draining — right for send()/RequestQueue, wrong here: resolving
+      // `true` while a disconnect() is in progress would hand back a connection that is seconds
+      // (or a tick) from being DISCONNECTED, with no new socket ever created for this caller.
+      if (this.connectionStatus === CONNECTION_STATUS.DISCONNECTING) {
+        return reject(
+          new KafkaJSConnectionError('Connection is disconnecting', {
+            broker: `${this.host}:${this.port}`,
+          })
+        )
+      }
+
       if (this.isConnected()) {
         return resolve(true)
       }
@@ -195,19 +262,34 @@ module.exports = class Connection {
       this.authenticatedAt = null
 
       let timeoutId
+      const attempt = ++this.connectAttempt
+      const isCurrentAttempt = () => this.connectAttempt === attempt
+
+      const abort = (error) => {
+        if (!isCurrentAttempt()) return
+        clearTimeout(timeoutId)
+        this[PRIVATE.ABORT_CONNECT] = null
+        reject(error)
+      }
+      this[PRIVATE.ABORT_CONNECT] = abort
 
       const onConnect = () => {
+        if (!isCurrentAttempt()) return
         clearTimeout(timeoutId)
+        this[PRIVATE.ABORT_CONNECT] = null
         this.connectionStatus = CONNECTION_STATUS.CONNECTED
         this.requestQueue.scheduleRequestTimeoutCheck()
+        this.generation += 1
         resolve(true)
       }
 
       const onData = (data) => {
+        if (!isCurrentAttempt()) return
         this.processData(data)
       }
 
       const onEnd = async () => {
+        if (!isCurrentAttempt()) return
         clearTimeout(timeoutId)
 
         const wasConnected = this.isConnected()
@@ -222,11 +304,16 @@ module.exports = class Connection {
           )
         }
 
+        // Deliberately does not clear ABORT_CONNECT: if this fires before the socket ever
+        // connected, the disconnect() below finds it still set and rejects this attempt's
+        // promise instead of leaving it to hang past its own timeout (already cleared above).
         await this.disconnect()
       }
 
       const onError = async (e) => {
+        if (!isCurrentAttempt()) return
         clearTimeout(timeoutId)
+        this[PRIVATE.ABORT_CONNECT] = null
 
         const error = new KafkaJSConnectionError(`Connection error: ${e.message}`, {
           broker: `${this.host}:${this.port}`,
@@ -241,6 +328,9 @@ module.exports = class Connection {
       }
 
       const onTimeout = async () => {
+        if (!isCurrentAttempt()) return
+        this[PRIVATE.ABORT_CONNECT] = null
+
         const error = new KafkaJSConnectionError('Connection timeout', {
           broker: `${this.host}:${this.port}`,
         })
@@ -271,6 +361,7 @@ module.exports = class Connection {
         })
       } catch (e) {
         clearTimeout(timeoutId)
+        this[PRIVATE.ABORT_CONNECT] = null
         reject(
           new KafkaJSConnectionError(`Failed to connect: ${e.message}`, {
             broker: `${this.host}:${this.port}`,
@@ -281,6 +372,22 @@ module.exports = class Connection {
   }
 
   /**
+   * Tears down the current socket, rejecting any in-flight `connect()` attempt it supersedes
+   * (KIP-35 rule 7 depends on a reconnect never leaving a caller hanging past its timeout) with a
+   * plain, retriable `KafkaJSConnectionError` — not `KafkaJSConnectionClosedError`, which several
+   * `src/cluster/` branches don't recognise by name, since it would otherwise skip seed-broker
+   * rotation and metadata refresh on a connect that was merely superseded, not actually refused.
+   * `data`/`end`/`timeout` are detached from the socket before it is closed: those events are
+   * only ever meaningful to the attempt that owned the socket, and the peer's own FIN can be
+   * delivered asynchronously, possibly after a new socket has already replaced this one. `error`
+   * stays attached — inert once this attempt is no longer current — so a post-close error on the
+   * old socket (e.g. `ECONNRESET`) cannot become an uncaught exception. The socket to tear down
+   * and the epoch to downgrade to DISCONNECTED are both captured up front, before
+   * `waitForPendingRequests()` yields: a concurrent `disconnect()`/`connect()` pair can otherwise
+   * install a new socket (and move the status past DISCONNECTING) while this call is still
+   * draining, and this call's continuation must act on the socket and epoch it actually owns, not
+   * on whatever `this.socket`/`this.connectAttempt` happen to hold once it resumes.
+   *
    * @public
    * @returns {Promise}
    */
@@ -289,16 +396,42 @@ module.exports = class Connection {
     this.connectionStatus = CONNECTION_STATUS.DISCONNECTING
     this.logDebug('disconnecting...')
 
+    const abortConnect = this[PRIVATE.ABORT_CONNECT]
+    this[PRIVATE.ABORT_CONNECT] = null
+    if (abortConnect) {
+      abortConnect(
+        new KafkaJSConnectionError('Connection closed while connecting', {
+          broker: `${this.host}:${this.port}`,
+        })
+      )
+    }
+    // Ends the current attempt's epoch: a handler still attached to the socket torn down below
+    // (possibly mid-connect, possibly long since connected) recognises itself as stale from here.
+    this.connectAttempt += 1
+    const socket = this.socket
+    const epoch = this.connectAttempt
+
     await this.requestQueue.waitForPendingRequests()
     this.requestQueue.destroy()
 
-    if (this.socket) {
-      this.socket.end()
-      this.socket.unref()
+    if (socket) {
+      // socketFactory's documented contract is a real net.Socket, which always has this; guarded
+      // anyway since nothing else here needs more than end()/unref() from the socket.
+      if (typeof socket.removeAllListeners === 'function') {
+        socket.removeAllListeners('data')
+        socket.removeAllListeners('end')
+        socket.removeAllListeners('timeout')
+      }
+      socket.end()
+      socket.unref()
     }
 
-    this.connectionStatus = CONNECTION_STATUS.DISCONNECTED
-    this.logDebug('disconnected')
+    // A newer connect()/disconnect() pair that ran while the drain above was yielding already
+    // owns this connection's status; only the disconnect() that is still current sets it.
+    if (this.connectAttempt === epoch) {
+      this.connectionStatus = CONNECTION_STATUS.DISCONNECTED
+      this.logDebug('disconnected')
+    }
     return true
   }
 
@@ -457,10 +590,22 @@ module.exports = class Connection {
   }
 
   /**
+   * Gates a *new* send, not an already in-flight one: deliberately stricter than `isConnected()`,
+   * which also counts `DISCONNECTING` so `ConnectionPool` doesn't race a reconnect against an
+   * orderly teardown. `disconnect()` sets `DISCONNECTING` synchronously, before its first
+   * `await`, so this check rejects a `send()` call arriving during the drain immediately, at the
+   * earliest possible point — before `socket.write()` or `requestQueue.push()` ever run. Letting
+   * such a send() through used to be able to enqueue a request in the gap between the queue
+   * reporting empty and `disconnect()`'s continuation destroying it and detaching the socket's
+   * listeners, leaving that request with no response path, no close path and no timeout timer:
+   * it would never settle. A request already in flight when `disconnect()` starts is unaffected —
+   * it settles via `processData`, `rejectRequests`, or the timeout interval, none of which route
+   * through this check.
+   *
    * @private
    */
   failIfNotConnected() {
-    if (!this.isConnected()) {
+    if (this.connectionStatus !== CONNECTION_STATUS.CONNECTED) {
       throw new KafkaJSConnectionError('Not connected', {
         broker: `${this.host}:${this.port}`,
       })

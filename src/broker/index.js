@@ -61,6 +61,15 @@ module.exports = class Broker {
     this.rootLogger = logger
     this.logger = logger.namespace('Broker')
     this.versions = versions
+
+    /**
+     * The `connectionPool.generation` the cached `versions` were learned at, or `null` before
+     * the first negotiation. Versions handed in by `BrokerPool` are a hint only — KIP-35 rule 7
+     * makes them valid per connection — so `connect()` re-negotiates whenever this doesn't match
+     * the pool's current generation, and applies the fresh table to both pooled sockets.
+     * @type {number|null}
+     */
+    this.versionsGeneration = null
     this.authenticationTimeout = authenticationTimeout
     this.allowAutoTopicCreation = allowAutoTopicCreation
 
@@ -82,16 +91,56 @@ module.exports = class Broker {
   }
 
   /**
+   * Swaps in a whole new connection pool (e.g. after `ILLEGAL_SASL_STATE`, which the old pool
+   * can't recover from). The new pool restarts its generation count at 0, which can coincide
+   * with the value `versionsGeneration` already holds — resetting it here, rather than leaving
+   * that to the caller, guarantees the next `connect()` always re-negotiates against the
+   * replacement pool instead of comparing across two unrelated pools' generations.
+   *
+   * @public
+   * @param {import("../network/connectionPool")} connectionPool
+   */
+  replaceConnectionPool(connectionPool) {
+    this.connectionPool = connectionPool
+    this.connectionPool.authenticationTimeout = this.authenticationTimeout
+    this.versionsGeneration = null
+  }
+
+  /**
+   * A broker is only "connected" once it can actually serve a request: the pool's socket(s) are
+   * up, authenticated where required, **and** at least one ApiVersions negotiation has completed
+   * so `lookupRequest` is no longer the placeholder that throws. Without the last condition, a
+   * caller outside `connect()`'s lock (`BrokerPool#connectBroker`'s own `isConnected()` check,
+   * most notably) could see a freshly-connected-but-not-yet-negotiated socket as ready, skip
+   * calling `connect()` altogether, and crash the first real request on "Broker not connected".
+   * A later reconnect that leaves a *stale but still valid* table in place while re-negotiating
+   * does not fail this check — `lookupRequest` is only ever the placeholder before the first
+   * negotiation ever completes, never again afterwards.
+   *
+   * This tightens `isConnected()`'s public meaning: it used to report only socket-level
+   * connectivity, so a `Broker` handed to user code (e.g. via `Cluster#findBroker`) could see
+   * `true` before this broker was actually able to serve a request. The only direction this can
+   * change an answer is false-"connected" becoming a correct `false`; a broker this previously
+   * reported connected for is unaffected.
+   *
    * @public
    * @returns {boolean}
    */
   isConnected() {
-    return this.connectionPool.sasl
+    const connected = this.connectionPool.sasl
       ? this.connectionPool.isConnected() && this.connectionPool.isAuthenticated()
       : this.connectionPool.isConnected()
+    return connected && this.lookupRequest !== notInitializedLookup
   }
 
   /**
+   * Establishes the connection pool and negotiates API versions.
+   *
+   * ApiVersions is re-run whenever this broker's connection pool has been (re)established since
+   * the last negotiation — either of its two pooled sockets being new counts (KIP-35 rule 7),
+   * since version information is only valid for the connection it was learned on. The resulting
+   * table is shared by both pooled sockets.
+   *
    * @public
    * @returns {Promise}
    */
@@ -104,11 +153,16 @@ module.exports = class Broker {
 
       const connection = await this.connectionPool.getConnection()
 
-      if (!this.versions) {
+      // Read once: this is the generation the negotiated table below is learned at, not
+      // whatever the pool happens to report after the round trip (a concurrent socket coming
+      // up mid-negotiation must not be attributed to this table).
+      const generation = this.connectionPool.generation
+      if (this.versionsGeneration !== generation) {
         this.versions = await this.apiVersions()
+        this.versionsGeneration = generation
       }
-      this.connectionPool.setVersions(this.versions)
 
+      this.connectionPool.setVersions(this.versions)
       this.lookupRequest = lookup(this.versions)
 
       await connection.authenticate()
