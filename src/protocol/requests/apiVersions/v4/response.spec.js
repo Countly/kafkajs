@@ -21,6 +21,13 @@ describe('Protocol > Requests > ApiVersions > v4', () => {
     await expect(parse(data)).resolves.toBeTruthy()
   })
 
+  test('decodes the vector produced by the Apache kafka-clients 4.3.1 codec', async () => {
+    const fromJava = await decode(Buffer.from(require('../fixtures/v4_response_java.json')))
+    const fromHand = await decode(Buffer.from(require('../fixtures/v4_response.json')))
+
+    expect(fromJava).toEqual(fromHand)
+  })
+
   test('skips a tagged field it does not know', async () => {
     const Encoder = require('../../../encoder')
     const body = new Encoder()

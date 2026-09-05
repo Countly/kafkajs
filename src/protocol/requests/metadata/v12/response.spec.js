@@ -64,6 +64,13 @@ const expectedTopic = (overrides = {}) => ({
 })
 
 describe('Protocol > Requests > Metadata > v12', () => {
+  test('decodes the vector produced by the Apache kafka-clients 4.3.1 codec', async () => {
+    const fromJava = await decode(Buffer.from(require('../fixtures/v12_response_java.json')))
+    const fromHand = await decode(Buffer.from(require('../fixtures/v12_response.json')))
+
+    expect(fromJava).toEqual(fromHand)
+  })
+
   test('response', async () => {
     const data = await decode(Buffer.from(require('../fixtures/v12_response.json')))
 

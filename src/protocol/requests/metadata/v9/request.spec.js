@@ -19,6 +19,11 @@ describe('Protocol > Requests > Metadata > v9', () => {
     expect(decoder.readTaggedFields().size).toEqual(0)
   })
 
+  test('matches the vector produced by the Apache kafka-clients 4.3.1 codec', async () => {
+    const { buffer } = await RequestV9Protocol({ topics: ['test-topic'] }).encode()
+    expect(buffer).toEqual(Buffer.from(require('../fixtures/v9_request_java.json')))
+  })
+
   test('an empty topic list is the null compact array (every topic)', async () => {
     const { buffer } = await RequestV9Protocol({ topics: [] }).encode()
     expect(buffer[0]).toEqual(0)

@@ -14,6 +14,15 @@ describe('Protocol > Requests > ApiVersions > v4', () => {
     )
   })
 
+  test('matches the vector produced by the Apache kafka-clients 4.3.1 codec', async () => {
+    const { buffer } = await RequestV4Protocol({
+      clientSoftwareName: 'countly-kafkajs',
+      clientSoftwareVersion: '3.0.0-alpha.4',
+    }).encode()
+
+    expect(buffer).toEqual(Buffer.from(require('../fixtures/v4_request_java.json')))
+  })
+
   test('defaults to this package identity', async () => {
     const { CLIENT_SOFTWARE_NAME, clientSoftwareVersion } = require('../../../clientSoftware')
     const request = RequestV4Protocol({})

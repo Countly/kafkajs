@@ -68,6 +68,19 @@ const expectedTopic = (overrides = {}) => ({
 })
 
 describe('Protocol > Requests > Metadata > v11', () => {
+  test('decodes the vector produced by the Apache kafka-clients 4.3.1 codec', async () => {
+    const data = await decode(Buffer.from(require('../fixtures/v11_response_java.json')))
+
+    expect(data).toEqual({
+      throttleTime: 0,
+      clientSideThrottleTime: 0,
+      brokers: [{ nodeId: 0, host: '127.0.0.1', port: 9092, rack: null }],
+      clusterId: 'test-cluster-id',
+      controllerId: 0,
+      topicMetadata: [expectedTopic()],
+    })
+  })
+
   test('response', async () => {
     const data = await decode(response())
 

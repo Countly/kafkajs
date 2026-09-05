@@ -26,6 +26,11 @@ describe('Protocol > Requests > Metadata > v10', () => {
     expect([...buffer.slice(1, 17)]).toEqual(ZERO_UUID_BYTES)
   })
 
+  test('matches the vector produced by the Apache kafka-clients 4.3.1 codec', async () => {
+    const { buffer } = await RequestV10Protocol({ topics: ['test-topic'] }).encode()
+    expect(buffer).toEqual(Buffer.from(require('../fixtures/v10_request_java.json')))
+  })
+
   test('an empty topic list is the null compact array (every topic)', async () => {
     const { buffer } = await RequestV10Protocol({ topics: [] }).encode()
     expect(buffer[0]).toEqual(0)
