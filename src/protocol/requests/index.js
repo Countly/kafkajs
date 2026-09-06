@@ -81,68 +81,82 @@ const keys = Object.values(apiKeys)
 const findApiName = (apiKey) => names[keys.indexOf(apiKey)]
 
 /**
+ * Chooses the version this client will use for one API on one connection: the highest version
+ * both sides implement, subject to an optional internal ceiling.
+ *
+ * Extracted from `lookup()` so a caller can ask *which* version would be selected without
+ * building a request — `definition.protocol({ version })` returns a builder in every API in this
+ * repo, so `apiVersion` is only observable on a built request. There is one selection rule, and
+ * this is it; `lookup()` calls it.
+ *
+ * @param {import("../../../types").ApiVersions} versions the broker's advertised ranges
+ * @param {number} apiKey
+ * @param {RequestDefinitions} definition
+ * @param {{ [apiKey: number]: number }} [maxVersions] internal per-API ceiling
+ * @returns {number} the selected version
+ * @throws {KafkaJSServerDoesNotSupportApiKey} when the broker does not advertise the API, the two
+ *   version ranges do not overlap, or the cap excludes every implemented version
+ */
+const selectVersion = (versions, apiKey, definition, maxVersions = {}) => {
+  const version = versions[apiKey]
+  const cap = maxVersions[apiKey]
+  const availableVersions = definition.versions
+    .map(Number)
+    .filter((available) => cap === undefined || available <= cap)
+  const apiName = findApiName(apiKey)
+
+  if (!version || version.maxVersion == null) {
+    throw new KafkaJSServerDoesNotSupportApiKey(
+      `The Kafka server does not support the requested API version`,
+      { apiKey, apiName }
+    )
+  }
+
+  if (availableVersions.length === 0) {
+    throw new KafkaJSServerDoesNotSupportApiKey(
+      `No implemented version of ${apiName} is at or below the internal cap v${cap}`,
+      { apiKey, apiName }
+    )
+  }
+
+  const bestImplementedVersion = Math.max(...availableVersions)
+  const lowestImplementedVersion = Math.min(...availableVersions)
+  const brokerMinVersion = version.minVersion == null ? 0 : version.minVersion
+
+  // The client and broker version ranges must overlap. Kafka 4.0 raised the floor for most
+  // APIs (KIP-896/KIP-724) and future majors will raise it again; without this check we would
+  // send a version the broker rejects, or select a version we do not implement.
+  if (brokerMinVersion > bestImplementedVersion || version.maxVersion < lowestImplementedVersion) {
+    throw new KafkaJSServerDoesNotSupportApiKey(
+      `The Kafka server does not support any version of ${apiName} implemented by this client: ` +
+        `client implements v${lowestImplementedVersion}-v${bestImplementedVersion}, ` +
+        `broker supports v${brokerMinVersion}-v${version.maxVersion}`,
+      { apiKey, apiName }
+    )
+  }
+
+  return Math.min(bestImplementedVersion, version.maxVersion)
+}
+
+/**
  * Builds the per-API version selector for one connection.
  *
- * `maxVersions` is an internal cap — `{ [apiKey]: version }` — used by tests and by
- * per-request downgrades. It is never surfaced as a user-facing option: the client always
- * negotiates the highest mutually supported version otherwise.
+ * `maxVersions` is an internal cap — `{ [apiKey]: version }` — used by tests and by per-request
+ * downgrades. It is never surfaced as a user-facing option: the client always negotiates the
+ * highest mutually supported version otherwise.
  *
  * @param {import("../../../types").ApiVersions} versions the broker's advertised ranges
  * @param {{ [apiKey: number]: number }} [maxVersions] internal per-API ceiling
  * @returns {Lookup}
- * @throws {KafkaJSServerDoesNotSupportApiKey} from the returned selector when the broker does not
- *   advertise the API, the two version ranges do not overlap, or the cap excludes every
- *   implemented version
+ * @throws {KafkaJSServerDoesNotSupportApiKey} from the returned selector, via `selectVersion`
  */
 const lookup =
   (versions, maxVersions = {}) =>
-  (apiKey, definition) => {
-    const version = versions[apiKey]
-    const cap = maxVersions[apiKey]
-    const availableVersions = definition.versions
-      .map(Number)
-      .filter((available) => cap === undefined || available <= cap)
-    const apiName = findApiName(apiKey)
-
-    if (!version || version.maxVersion == null) {
-      throw new KafkaJSServerDoesNotSupportApiKey(
-        `The Kafka server does not support the requested API version`,
-        { apiKey, apiName }
-      )
-    }
-
-    if (availableVersions.length === 0) {
-      throw new KafkaJSServerDoesNotSupportApiKey(
-        `No implemented version of ${apiName} is at or below the internal cap v${cap}`,
-        { apiKey, apiName }
-      )
-    }
-
-    const bestImplementedVersion = Math.max(...availableVersions)
-    const lowestImplementedVersion = Math.min(...availableVersions)
-
-    const brokerMinVersion = version.minVersion == null ? 0 : version.minVersion
-
-    // The client and broker version ranges must overlap. Kafka 4.0 raised the floor for most
-    // APIs (KIP-896/KIP-724) and future majors will raise it again; without this check we would
-    // send a version the broker rejects, or select a version we do not implement.
-    if (
-      brokerMinVersion > bestImplementedVersion ||
-      version.maxVersion < lowestImplementedVersion
-    ) {
-      throw new KafkaJSServerDoesNotSupportApiKey(
-        `The Kafka server does not support any version of ${apiName} implemented by this client: ` +
-          `client implements v${lowestImplementedVersion}-v${bestImplementedVersion}, ` +
-          `broker supports v${brokerMinVersion}-v${version.maxVersion}`,
-        { apiKey, apiName }
-      )
-    }
-
-    const bestSupportedVersion = Math.min(bestImplementedVersion, version.maxVersion)
-    return definition.protocol({ version: bestSupportedVersion })
-  }
+  (apiKey, definition) =>
+    definition.protocol({ version: selectVersion(versions, apiKey, definition, maxVersions) })
 
 module.exports = {
   requests,
   lookup,
+  selectVersion,
 }

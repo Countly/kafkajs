@@ -1,6 +1,6 @@
 const Lock = require('../utils/lock')
 const { Types: Compression } = require('../protocol/message/compression')
-const { requests, lookup } = require('../protocol/requests')
+const { requests, lookup, selectVersion } = require('../protocol/requests')
 const { KafkaJSNonRetriableError } = require('../errors')
 const apiKeys = require('../protocol/requests/apiKeys')
 const shuffle = require('../utils/shuffle')
@@ -9,6 +9,7 @@ const PRIVATE = {
   SEND_REQUEST: Symbol('private:Broker:sendRequest'),
   API_VERSIONS_AT: Symbol('private:Broker:apiVersionsAt'),
   NEGOTIATE_API_VERSIONS_VERSION: Symbol('private:Broker:negotiateApiVersionsVersion'),
+  CAPPED_LOOKUPS: Symbol('private:Broker:cappedLookups'),
 }
 
 /** @type {import("../protocol/requests").Lookup} */
@@ -88,6 +89,7 @@ module.exports = class Broker {
     })
 
     this.lookupRequest = notInitializedLookup
+    this[PRIVATE.CAPPED_LOOKUPS] = new Map()
   }
 
   /**
@@ -104,6 +106,7 @@ module.exports = class Broker {
     this.connectionPool = connectionPool
     this.connectionPool.authenticationTimeout = this.authenticationTimeout
     this.versionsGeneration = null
+    this[PRIVATE.CAPPED_LOOKUPS].clear()
   }
 
   /**
@@ -164,6 +167,7 @@ module.exports = class Broker {
 
       this.connectionPool.setVersions(this.versions)
       this.lookupRequest = lookup(this.versions)
+      this[PRIVATE.CAPPED_LOOKUPS].clear()
 
       await connection.authenticate()
     } finally {
@@ -223,6 +227,66 @@ module.exports = class Broker {
 
       return toVersionMap(await this[PRIVATE.API_VERSIONS_AT](retryVersion))
     }
+  }
+
+  /**
+   * The version `lookup()` would select for one API on this broker's current table, as a number.
+   *
+   * `lookup()` returns a *builder*, so a caller cannot read the negotiated version without
+   * building a request; this answers the question directly. It never throws: a broker that
+   * advertises nothing usable answers `null`, which callers read as "this API is not available
+   * here" and degrade rather than crash.
+   *
+   * @public
+   * @param {number} apiKey
+   * @param {object} definition the entry from `requests`
+   * @param {{ [apiKey: number]: number }} [maxVersions] the same optional ceiling `lookup` takes
+   * @returns {number|null}
+   */
+  negotiatedVersion(apiKey, definition, maxVersions) {
+    try {
+      return selectVersion(this.versions, apiKey, definition, maxVersions)
+    } catch (e) {
+      if (e.name === 'KafkaJSServerDoesNotSupportApiKey') {
+        return null
+      }
+
+      throw e
+    }
+  }
+
+  /**
+   * `lookupRequest`, with an optional per-request ceiling.
+   *
+   * A capped builder is memoised per `(apiKey, maxVersion)` because the cap is a hot-path
+   * decision — a fetch downgraded to v12 while a topic id is unknown, a produce capped at v11
+   * inside a transaction — and rebuilding the selector per request would allocate on it. In
+   * practice this map holds at most two entries per `Broker` instance. It is cleared wherever
+   * `lookupRequest` or `versionsGeneration` is assigned, so it can never outlive the version
+   * table it was derived from.
+   *
+   * @public
+   * @param {number} apiKey
+   * @param {object} definition the entry from `requests`
+   * @param {number} [maxVersion] the highest version this request may negotiate
+   * @returns {import("../protocol/requests").Request}
+   * @throws {KafkaJSServerDoesNotSupportApiKey} when no implemented version is at or below the cap
+   */
+  lookupRequestWithMax(apiKey, definition, maxVersion) {
+    if (maxVersion === undefined) {
+      return this.lookupRequest(apiKey, definition)
+    }
+
+    const key = `${apiKey}:${maxVersion}`
+    const memoised = this[PRIVATE.CAPPED_LOOKUPS].get(key)
+
+    if (memoised) {
+      return memoised
+    }
+
+    const built = lookup(this.versions, { [apiKey]: maxVersion })(apiKey, definition)
+    this[PRIVATE.CAPPED_LOOKUPS].set(key, built)
+    return built
   }
 
   /**

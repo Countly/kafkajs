@@ -138,7 +138,11 @@ Upstream work this phase builds on, with thanks to its authors: PRs #1779, #1695
 
 #### Fixes
 
+- Consumer group version negotiation no longer duplicates the protocol layer: the JoinGroup version behind the "static membership is inactive" warning is now read from the same selection rule every request uses, instead of being recomputed from the broker's advertised maximum. A coordinator that advertises no usable JoinGroup version is still handled silently.
+
 #### Additions
+
+- Internal: requests can now be negotiated with a per-request version ceiling, which is what lets a single fetch fall back to topic names, or a single produce stay below the transaction-version-2 semantics, without changing the version every other request uses.
 
 #### Tooling
 

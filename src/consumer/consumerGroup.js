@@ -220,23 +220,30 @@ module.exports = class ConsumerGroup {
   }
 
   /**
-   * Warn once (per instance) when `groupInstanceId` is configured but the broker negotiated a
+   * Warn once (per instance) when `groupInstanceId` is configured but the coordinator negotiated a
    * JoinGroup version below 5: only v5+ carries `group_instance_id` on the wire (KIP-345), so
    * static membership is silently inactive on an older negotiated version.
+   *
+   * The version comes from the protocol layer's own selection rule rather than being recomputed
+   * here. A coordinator that advertises no usable JoinGroup at all answers `null` and this returns
+   * quietly, matching the previous behaviour — `lookupRequest` would have thrown, inside the sync.
+   * @see https://cwiki.apache.org/confluence/display/KAFKA/KIP-345%3A+Introduce+static+membership+protocol+to+reduce+consumer+rebalances
+   * @returns {void}
    */
   warnIfStaticMembershipInactive() {
     if (this.staticMembershipInactiveWarned) {
       return
     }
 
-    const joinGroupVersions = requests.JoinGroup.versions.map(Number)
-    const bestImplementedVersion = Math.max(...joinGroupVersions)
-    const brokerVersion = this.coordinator.versions && this.coordinator.versions[apiKeys.JoinGroup]
-    if (!brokerVersion) {
+    const negotiatedVersion = this.coordinator.negotiatedVersion(
+      apiKeys.JoinGroup,
+      requests.JoinGroup
+    )
+
+    if (negotiatedVersion == null) {
       return
     }
 
-    const negotiatedVersion = Math.min(bestImplementedVersion, brokerVersion.maxVersion)
     if (negotiatedVersion < 5) {
       this.logger.warn(
         `groupInstanceId is set but the broker negotiated JoinGroup v${negotiatedVersion} - static membership is inactive`,
