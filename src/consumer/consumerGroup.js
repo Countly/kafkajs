@@ -464,10 +464,10 @@ module.exports = class ConsumerGroup {
   }
 
   /**
-   * @param {import("../../types").TopicPartitionOffset} topicPartitionOffset
+   * @param {import("../../types").TopicPartitionOffset & { leaderEpoch?: number }} topicPartitionOffset
    */
-  resolveOffset({ topic, partition, offset }) {
-    this.offsetManager.resolveOffset({ topic, partition, offset })
+  resolveOffset({ topic, partition, offset, leaderEpoch }) {
+    this.offsetManager.resolveOffset({ topic, partition, offset, leaderEpoch })
   }
 
   /**

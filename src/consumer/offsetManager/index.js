@@ -124,10 +124,15 @@ module.exports = class OffsetManager {
   }
 
   /**
+   * Rewinds the resolved offset back to the committed one, dropping the tracked epoch with it: the
+   * position moves without a record behind it, and keeping the epoch of a record further ahead
+   * would overstate where this partition actually is.
    * @param {import("../../../types").TopicPartition} topicPartition
+   * @returns {void}
    */
   resetOffset({ topic, partition }) {
     this.resolvedOffsets[topic][partition] = this.committedOffsets()[topic][partition]
+    this.resolvedEpochs[topic][partition] = -1
   }
 
   /**
@@ -140,13 +145,48 @@ module.exports = class OffsetManager {
   resetOffsetsForTopic(topic) {
     this.committedOffsets()[topic] = {}
     this.resolvedOffsets[topic] = {}
+    this.resolvedEpochs[topic] = {}
   }
 
   /**
-   * @param {import("../../../types").TopicPartitionOffset} topicPartitionOffset
+   * @param {import("../../../types").TopicPartitionOffset & { leaderEpoch?: number }} topicPartitionOffset
+   *   `leaderEpoch` is the epoch of the record at `offset`, or -1 when no record backs it - a
+   *   position advanced past a log-compacted batch, an offset outside the batch a handler
+   *   resolved, or a seek. It defaults to -1 so an omission is safe rather than stale: keeping a
+   *   previous epoch would understate the position and could seek the partition backwards.
    */
-  resolveOffset({ topic, partition, offset }) {
+  resolveOffset({ topic, partition, offset, leaderEpoch = -1 }) {
     this.resolvedOffsets[topic][partition] = Long.fromValue(offset).add(1).toString()
+    this.resolvedEpochs[topic][partition] = leaderEpoch
+  }
+
+  /**
+   * @param {string} topic
+   * @param {number} partition
+   * @returns {number} the leader epoch of the last record consumed on this partition, -1 when unknown
+   */
+  lastConsumedEpoch(topic, partition) {
+    const epoch = this.resolvedEpochs[topic] && this.resolvedEpochs[topic][partition]
+    return typeof epoch === 'number' ? epoch : -1
+  }
+
+  /**
+   * Forgets the tracked epoch **without touching the offset** - the only writer that does.
+   *
+   * It exists for the one transition that needs it: position validation gave up on a partition
+   * (its bounded retries were exhausted), so the partition must be fetched again unvalidated, from
+   * the same offset. `resolveOffset` would advance the offset, and every other clearing path
+   * (`seek`, `setDefaultOffset`, `clearOffsets`, `clearAllOffsets`, `resetOffsetsForTopic`) drops
+   * the committed offset too.
+   *
+   * @param {string} topic
+   * @param {number} partition
+   * @returns {void}
+   */
+  forgetConsumedEpoch(topic, partition) {
+    if (this.resolvedEpochs[topic]) {
+      this.resolvedEpochs[topic][partition] = -1
+    }
   }
 
   /**
@@ -219,6 +259,8 @@ module.exports = class OffsetManager {
         topic,
         partition,
         offset: Long.fromValue(offset).subtract(1).toString(),
+        // A seek names a position, not a record: nothing has been consumed at it yet.
+        leaderEpoch: -1,
       })
       return true
     }
@@ -268,6 +310,7 @@ module.exports = class OffsetManager {
     const toPartitions = (topic) => (partition) => ({
       partition,
       offset: this.resolvedOffsets[topic][partition],
+      leaderEpoch: this.lastConsumedEpoch(topic, partition),
     })
     const changedOffsets =
       (topic) =>
@@ -289,6 +332,17 @@ module.exports = class OffsetManager {
     return { topics: topicsWithPartitionsToCommit }
   }
 
+  /**
+   * Commits `offsets.topics`, defaulting to everything resolved since the last commit, and emits
+   * `COMMIT_OFFSETS` with the payload that was sent.
+   *
+   * When the offsets come from `uncommittedOffsets()` each partition entry carries `leaderEpoch`
+   * (-1 when no record backs the offset), so that key is visible on the emitted payload too.
+   * Offsets a caller supplies are forwarded untouched and carry whatever they were given.
+   *
+   * @param {import('../../../types').Offsets} [offsets]
+   * @returns {Promise<void>}
+   */
   async commitOffsets(offsets = {}) {
     const { groupId, generationId, memberId, groupInstanceId } = this
     const { topics = this.uncommittedOffsets().topics } = offsets
@@ -385,6 +439,25 @@ module.exports = class OffsetManager {
 
     this.drainPendingTopicResets(consumerOffsets, seekedPartitions)
 
+    // Seed the tracked epoch from what the coordinator has committed, before
+    // initializeConsumerOffsets rebuilds these entries as { partition, offset } and drops every
+    // other field - for every partition, not only the ones it resolved. An invalid offset here is
+    // the "this partition is being reset" signal drainPendingTopicResets just wrote, so its stale
+    // epoch is deliberately not seeded.
+    for (const { topic, partitions } of consumerOffsets) {
+      const epochs = this.resolvedEpochs[topic]
+      if (!epochs) {
+        continue
+      }
+
+      for (const entry of partitions) {
+        if (isInvalidOffset(entry.offset) || typeof entry.committedLeaderEpoch !== 'number') {
+          continue
+        }
+        epochs[entry.partition] = entry.committedLeaderEpoch
+      }
+    }
+
     const unresolvedPartitions = consumerOffsets.map(({ topic, partitions }) =>
       assign(
         {
@@ -471,6 +544,7 @@ module.exports = class OffsetManager {
   clearOffsets({ topic, partition }) {
     delete this.committedOffsets()[topic][partition]
     delete this.resolvedOffsets[topic][partition]
+    delete this.resolvedEpochs[topic][partition]
   }
 
   /**
@@ -488,6 +562,14 @@ module.exports = class OffsetManager {
     }
 
     this.resolvedOffsets = indexTopics(this.topics)
+
+    /**
+     * The leader epoch of the last record consumed on each partition, beside its resolved offset.
+     * -1 means unknown, which disables position validation for that partition until it consumes a
+     * record again. Cleared with the offset by every path that clears an offset.
+     * @type {{[topic: string]: {[partition: number]: number}}}
+     */
+    this.resolvedEpochs = indexTopics(this.topics)
   }
 
   committedOffsets() {

@@ -121,4 +121,28 @@ describe('Protocol > Requests > OffsetCommit > v8', () => {
     expect(decoder.readTaggedFields().size).toEqual(0)
     expect(decoder.canReadBytes(1)).toBe(false)
   })
+
+  test('writes the leader epoch it is given, and -1 when given none', async () => {
+    const withEpoch = await RequestV8Protocol({
+      groupId: 'test-group',
+      groupGenerationId: 1,
+      memberId: 'test-member',
+      topics: [
+        { topic: 'test-topic', partitions: [{ partition: 0, offset: '10', leaderEpoch: 4 }] },
+      ],
+    }).encode()
+    const withoutEpoch = await RequestV8Protocol({
+      groupId: 'test-group',
+      groupGenerationId: 1,
+      memberId: 'test-member',
+      topics: [{ topic: 'test-topic', partitions: [{ partition: 0, offset: '10' }] }],
+    }).encode()
+
+    // The field sits between CommittedOffset and CommittedMetadata; the two buffers differ only
+    // in those four bytes.
+    expect(withEpoch.buffer.length).toEqual(withoutEpoch.buffer.length)
+    expect(withEpoch.buffer).not.toEqual(withoutEpoch.buffer)
+    expect(withEpoch.buffer.includes(Buffer.from([0, 0, 0, 4]))).toBe(true)
+    expect(withoutEpoch.buffer.includes(Buffer.from([0xff, 0xff, 0xff, 0xff]))).toBe(true)
+  })
 })

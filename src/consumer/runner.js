@@ -335,7 +335,12 @@ module.exports = class Runner extends EventEmitter {
         throw e
       }
 
-      this.consumerGroup.resolveOffset({ topic, partition, offset: message.offset })
+      this.consumerGroup.resolveOffset({
+        topic,
+        partition,
+        offset: message.offset,
+        leaderEpoch: message.batchContext ? message.batchContext.partitionLeaderEpoch : -1,
+      })
       await this.heartbeat()
       await this.autoCommitOffsetsIfNecessary()
 
@@ -376,7 +381,12 @@ module.exports = class Runner extends EventEmitter {
               ? batch.lastOffset()
               : offset
 
-          this.consumerGroup.resolveOffset({ topic, partition, offset: offsetToResolve })
+          this.consumerGroup.resolveOffset({
+            topic,
+            partition,
+            offset: offsetToResolve,
+            leaderEpoch: batch.leaderEpochAt(offsetToResolve),
+          })
         },
         heartbeat: () => this.heartbeat(),
         /**
@@ -418,7 +428,13 @@ module.exports = class Runner extends EventEmitter {
     // resolveOffset for the last offset can be disabled to allow the users of eachBatch to
     // stop their consumers without resolving unprocessed offsets (issues/18)
     if (this.eachBatchAutoResolve) {
-      this.consumerGroup.resolveOffset({ topic, partition, offset: batch.lastOffset() })
+      const lastOffset = batch.lastOffset()
+      this.consumerGroup.resolveOffset({
+        topic,
+        partition,
+        offset: lastOffset,
+        leaderEpoch: batch.leaderEpochAt(lastOffset),
+      })
     }
   }
 
@@ -504,10 +520,12 @@ module.exports = class Runner extends EventEmitter {
       if (batch.isEmptyDueToFiltering()) {
         this.instrumentationEmitter.emit(START_BATCH_PROCESS, payload)
 
+        const lastOffset = batch.lastOffset()
         this.consumerGroup.resolveOffset({
           topic: batch.topic,
           partition: batch.partition,
-          offset: batch.lastOffset(),
+          offset: lastOffset,
+          leaderEpoch: batch.leaderEpochAt(lastOffset),
         })
         await this.autoCommitOffsetsIfNecessary()
 

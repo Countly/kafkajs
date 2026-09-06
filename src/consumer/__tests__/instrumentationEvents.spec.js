@@ -123,6 +123,9 @@ describe('Consumer > Instrumentation Events', () => {
               {
                 offset: '1',
                 partition: '0',
+                // The epoch of the record behind the committed offset; its value depends on the
+                // cluster's leader elections, so only its presence is asserted here.
+                leaderEpoch: expect.any(Number),
               },
             ],
           },

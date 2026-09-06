@@ -1185,7 +1185,9 @@ describe('Consumer', () => {
           topics: [
             {
               topic: topicName,
-              partitions: [{ partition: partition.toString(), offset: '100' }],
+              partitions: [
+                { partition: partition.toString(), offset: '100', leaderEpoch: expect.any(Number) },
+              ],
             },
           ],
         })
@@ -1309,7 +1311,12 @@ describe('Consumer', () => {
         expect(getCurrentUncommittedOffsets()).toEqual(lastUncommittedOffsets)
         expect(getCurrentUncommittedOffsets()).toEqual({
           topics: [
-            { topic: topicName, partitions: [{ partition: partition.toString(), offset: '100' }] },
+            {
+              topic: topicName,
+              partitions: [
+                { partition: partition.toString(), offset: '100', leaderEpoch: expect.any(Number) },
+              ],
+            },
           ],
         })
       }

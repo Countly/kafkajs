@@ -2,13 +2,6 @@ const Encoder = require('../../../encoder')
 const { OffsetCommit: apiKey } = require('../../apiKeys')
 
 /**
- * The leader epoch of the *consumed record* whose offset is being committed. See v6/request.js
- * for why this client always sends the field's own default.
- * @see clients/src/main/resources/common/message/OffsetCommitRequest.json (Apache Kafka 4.3.1)
- */
-const COMMITTED_LEADER_EPOCH = -1
-
-/**
  * OffsetCommitRequest (Version: 7) => group_id generation_id member_id group_instance_id [topics]
  *   group_id => STRING
  *   generation_id => INT32
@@ -33,7 +26,11 @@ const COMMITTED_LEADER_EPOCH = -1
  * @param {number} options.groupGenerationId
  * @param {string} options.memberId
  * @param {string} [options.groupInstanceId=null] Static membership id (KIP-345)
- * @param {{topic: string, partitions: {partition: number, offset: string, metadata?: string}[]}[]} options.topics
+ * @param {{topic: string, partitions: {partition: number, offset: string, leaderEpoch?: number, metadata?: string}[]}[]} options.topics
+ *   `leaderEpoch` is the leader epoch of the record whose offset is being committed. It defaults
+ *   to -1, the field's own wire default, which means "no record backs this offset": an offset
+ *   committed by an older client, an offset the caller supplied itself, or a position advanced
+ *   past a log-compacted batch.
  */
 module.exports = ({ groupId, groupGenerationId, memberId, groupInstanceId = null, topics }) => ({
   apiKey,
@@ -52,11 +49,11 @@ module.exports = ({ groupId, groupGenerationId, memberId, groupInstanceId = null
 const encodeTopic = ({ topic, partitions }) =>
   new Encoder().writeString(topic).writeArray(partitions.map(encodePartition))
 
-const encodePartition = ({ partition, offset, metadata = null }) =>
+const encodePartition = ({ partition, offset, leaderEpoch = -1, metadata = null }) =>
   new Encoder()
     .writeInt32(partition)
     .writeInt64(offset)
-    .writeInt32(COMMITTED_LEADER_EPOCH)
+    .writeInt32(leaderEpoch)
     .writeString(metadata)
 
 module.exports.schema = {

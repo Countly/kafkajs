@@ -2,6 +2,16 @@ const Long = require('../utils/long')
 const filterAbortedMessages = require('./filterAbortedMessages')
 
 /**
+ * The leader epoch a decoded record carries, or -1 when it carries none (a legacy message set).
+ * @param {{ batchContext?: { partitionLeaderEpoch?: number } }} message
+ * @returns {number}
+ */
+const epochOf = (message) => {
+  const epoch = message.batchContext && message.batchContext.partitionLeaderEpoch
+  return typeof epoch === 'number' ? epoch : -1
+}
+
+/**
  * A batch collects messages returned from a single fetch call.
  *
  * A batch could contain _multiple_ Kafka RecordBatches.
@@ -31,6 +41,48 @@ module.exports = class Batch {
       messages: this.messagesWithinOffset,
       abortedTransactions,
     }).filter((message) => !message.isControlRecord)
+
+    this.leaderEpochIndex = null
+  }
+
+  /**
+   * The leader epoch of the record at `offset`, or `-1` when no record in this batch carries it.
+   *
+   * Searches `messagesWithinOffset` rather than `messages`, because `messages` excludes control
+   * and aborted records while `lastOffset()` and the control-record fast-forward can both resolve
+   * to exactly those offsets - and answering -1 for an offset whose epoch is known would
+   * understate the tracked epoch, which is what turns a healthy position into a false truncation.
+   *
+   * The last entry is checked first (the overwhelmingly common case: resolving the end of a
+   * batch), and an index is built lazily only for a lookup that is not the last entry, so a
+   * handler resolving many offsets is linear overall rather than quadratic.
+   *
+   * @param {string} offset The offset exactly as the decoder produced it. Offsets are compared as
+   *   strings, so a numeric or `Long` offset answers -1 rather than the epoch it carries; that
+   *   degrades safely (unknown disables validation, it never reports a stale epoch).
+   * @returns {number}
+   */
+  leaderEpochAt(offset) {
+    const messages = this.messagesWithinOffset
+
+    if (messages.length === 0) {
+      return -1
+    }
+
+    const last = messages[messages.length - 1]
+    if (last.offset === offset) {
+      return epochOf(last)
+    }
+
+    if (!this.leaderEpochIndex) {
+      this.leaderEpochIndex = new Map()
+      for (const message of messages) {
+        this.leaderEpochIndex.set(message.offset, epochOf(message))
+      }
+    }
+
+    const epoch = this.leaderEpochIndex.get(offset)
+    return epoch === undefined ? -1 : epoch
   }
 
   isEmpty() {

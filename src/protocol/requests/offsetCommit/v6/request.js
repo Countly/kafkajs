@@ -2,15 +2,6 @@ const Encoder = require('../../../encoder')
 const { OffsetCommit: apiKey } = require('../../apiKeys')
 
 /**
- * The leader epoch of the *consumed record* whose offset is being committed. This client does
- * not track it yet - the fetch path it would come from has not moved - so the field's own
- * default is sent. Sending the current metadata epoch instead would be a different quantity and
- * would mislead a broker performing log-truncation checks.
- * @see clients/src/main/resources/common/message/OffsetCommitRequest.json (Apache Kafka 4.3.1)
- */
-const COMMITTED_LEADER_EPOCH = -1
-
-/**
  * OffsetCommitRequest (Version: 6) => group_id generation_id member_id [topics]
  *   group_id => STRING
  *   generation_id => INT32
@@ -23,9 +14,8 @@ const COMMITTED_LEADER_EPOCH = -1
  *       committed_leader_epoch => INT32
  *       metadata => NULLABLE_STRING
  *
- * v6 adds CommittedLeaderEpoch (for fencing against stale-leader commits); this client always
- * sends the field's own default (see COMMITTED_LEADER_EPOCH above). RetentionTimeMs's range
- * closed at v4 and stays absent.
+ * v6 adds CommittedLeaderEpoch (for fencing against stale-leader commits), carried per partition
+ * by the caller. RetentionTimeMs's range closed at v4 and stays absent.
  * @see https://kafka.apache.org/43/design/protocol
  * @see clients/src/main/resources/common/message/OffsetCommitRequest.json (Apache Kafka 4.3.1)
  *
@@ -33,7 +23,11 @@ const COMMITTED_LEADER_EPOCH = -1
  * @param {string} options.groupId
  * @param {number} options.groupGenerationId
  * @param {string} options.memberId
- * @param {{topic: string, partitions: {partition: number, offset: string, metadata?: string}[]}[]} options.topics
+ * @param {{topic: string, partitions: {partition: number, offset: string, leaderEpoch?: number, metadata?: string}[]}[]} options.topics
+ *   `leaderEpoch` is the leader epoch of the record whose offset is being committed. It defaults
+ *   to -1, the field's own wire default, which means "no record backs this offset": an offset
+ *   committed by an older client, an offset the caller supplied itself, or a position advanced
+ *   past a log-compacted batch.
  */
 module.exports = ({ groupId, groupGenerationId, memberId, topics }) => ({
   apiKey,
@@ -51,11 +45,11 @@ module.exports = ({ groupId, groupGenerationId, memberId, topics }) => ({
 const encodeTopic = ({ topic, partitions }) =>
   new Encoder().writeString(topic).writeArray(partitions.map(encodePartition))
 
-const encodePartition = ({ partition, offset, metadata = null }) =>
+const encodePartition = ({ partition, offset, leaderEpoch = -1, metadata = null }) =>
   new Encoder()
     .writeInt32(partition)
     .writeInt64(offset)
-    .writeInt32(COMMITTED_LEADER_EPOCH)
+    .writeInt32(leaderEpoch)
     .writeString(metadata)
 
 module.exports.schema = {

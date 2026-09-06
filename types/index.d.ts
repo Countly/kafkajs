@@ -714,7 +714,10 @@ export type Broker = {
     groupGenerationId: number
     memberId: string
     retentionTime?: number
-    topics: TopicOffsets[]
+    topics: Array<{
+      topic: string
+      partitions: Array<PartitionOffset & { leaderEpoch?: number }>
+    }>
   }): Promise<any>
   offsetFetch(request: {
     groupId: string

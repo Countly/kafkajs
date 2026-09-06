@@ -710,10 +710,13 @@ module.exports = class Broker {
    *                    {
    *                      topic: 'topic-name',
    *                      partitions: [
-   *                        { partition: 0, offset: '11' }
+   *                        { partition: 0, offset: '11', leaderEpoch: 4 }
    *                      ]
    *                    }
    *                  ]
+   *                  `leaderEpoch` is optional and requires OffsetCommit v6+: the leader epoch of
+   *                  the record whose offset is being committed, or -1 (the default) when no
+   *                  record backs the offset. Older versions ignore it.
    * @returns {Promise}
    */
   async offsetCommit({

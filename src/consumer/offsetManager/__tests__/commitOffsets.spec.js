@@ -75,16 +75,16 @@ describe('Consumer > OffsetMananger > commitOffsets', () => {
         {
           topic: topic1,
           partitions: [
-            { partition: '0', offset: defaultResolvedOffsetStr },
-            { partition: '1', offset: defaultResolvedOffsetStr },
+            { partition: '0', offset: defaultResolvedOffsetStr, leaderEpoch: -1 },
+            { partition: '1', offset: defaultResolvedOffsetStr, leaderEpoch: -1 },
           ],
         },
         {
           topic: topic2,
           partitions: [
-            { partition: '1', offset: defaultResolvedOffsetStr },
-            { partition: '2', offset: defaultResolvedOffsetStr },
-            { partition: '3', offset: defaultResolvedOffsetStr },
+            { partition: '1', offset: defaultResolvedOffsetStr, leaderEpoch: -1 },
+            { partition: '2', offset: defaultResolvedOffsetStr, leaderEpoch: -1 },
+            { partition: '3', offset: defaultResolvedOffsetStr, leaderEpoch: -1 },
           ],
         },
       ],

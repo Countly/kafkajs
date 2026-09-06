@@ -112,12 +112,21 @@ describe('Consumer', () => {
         responses: [
           {
             partitions: [
-              { committedLeaderEpoch: -1, errorCode: 0, metadata: '', offset: '2', partition: 0 },
+              {
+                // A committed offset now carries the leader epoch of the record behind it, so the
+                // exact value depends on the cluster's leader elections - only the sentinel is ruled out.
+                committedLeaderEpoch: expect.any(Number),
+                errorCode: 0,
+                metadata: '',
+                offset: '2',
+                partition: 0,
+              },
             ],
             topic: topicName,
           },
         ],
       })
+      expect(offsets.responses[0].partitions[0].committedLeaderEpoch).toBeGreaterThanOrEqual(0)
     })
 
     it('does not commit the offset if autoCommit=false', async () => {
@@ -244,12 +253,21 @@ describe('Consumer', () => {
         responses: [
           {
             partitions: [
-              { committedLeaderEpoch: -1, errorCode: 0, metadata: '', offset: '2', partition: 0 },
+              {
+                // A committed offset now carries the leader epoch of the record behind it, so the
+                // exact value depends on the cluster's leader elections - only the sentinel is ruled out.
+                committedLeaderEpoch: expect.any(Number),
+                errorCode: 0,
+                metadata: '',
+                offset: '2',
+                partition: 0,
+              },
             ],
             topic: topicName,
           },
         ],
       })
+      expect(offsets.responses[0].partitions[0].committedLeaderEpoch).toBeGreaterThanOrEqual(0)
     })
   })
 })

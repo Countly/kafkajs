@@ -36,16 +36,16 @@ describe('Consumer > OffsetMananger > uncommittedOffsets', () => {
         {
           topic: topic1,
           partitions: [
-            { partition: '0', offset: defaultResolvedOffsetInt.toString() },
-            { partition: '1', offset: defaultResolvedOffsetInt.toString() },
+            { partition: '0', offset: defaultResolvedOffsetInt.toString(), leaderEpoch: -1 },
+            { partition: '1', offset: defaultResolvedOffsetInt.toString(), leaderEpoch: -1 },
           ],
         },
         {
           topic: topic2,
           partitions: [
-            { partition: '1', offset: defaultResolvedOffsetInt.toString() },
-            { partition: '2', offset: defaultResolvedOffsetInt.toString() },
-            { partition: '3', offset: defaultResolvedOffsetInt.toString() },
+            { partition: '1', offset: defaultResolvedOffsetInt.toString(), leaderEpoch: -1 },
+            { partition: '2', offset: defaultResolvedOffsetInt.toString(), leaderEpoch: -1 },
+            { partition: '3', offset: defaultResolvedOffsetInt.toString(), leaderEpoch: -1 },
           ],
         },
       ],

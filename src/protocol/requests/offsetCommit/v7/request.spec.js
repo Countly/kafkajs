@@ -76,4 +76,28 @@ describe('Protocol > Requests > OffsetCommit > v7', () => {
 
     expect(buffer).toEqual(Buffer.from(require('../fixtures/v7_request_java.json')))
   })
+
+  test('writes the leader epoch it is given, and -1 when given none', async () => {
+    const withEpoch = await RequestV7Protocol({
+      groupId: 'test-group',
+      groupGenerationId: 1,
+      memberId: 'test-member',
+      topics: [
+        { topic: 'test-topic', partitions: [{ partition: 0, offset: '10', leaderEpoch: 4 }] },
+      ],
+    }).encode()
+    const withoutEpoch = await RequestV7Protocol({
+      groupId: 'test-group',
+      groupGenerationId: 1,
+      memberId: 'test-member',
+      topics: [{ topic: 'test-topic', partitions: [{ partition: 0, offset: '10' }] }],
+    }).encode()
+
+    // The field sits between CommittedOffset and CommittedMetadata; the two buffers differ only
+    // in those four bytes.
+    expect(withEpoch.buffer.length).toEqual(withoutEpoch.buffer.length)
+    expect(withEpoch.buffer).not.toEqual(withoutEpoch.buffer)
+    expect(withEpoch.buffer.includes(Buffer.from([0, 0, 0, 4]))).toBe(true)
+    expect(withoutEpoch.buffer.includes(Buffer.from([0xff, 0xff, 0xff, 0xff]))).toBe(true)
+  })
 })
