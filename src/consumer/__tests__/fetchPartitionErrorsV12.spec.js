@@ -23,6 +23,8 @@ const createConsumerGroup = (broker) => {
     findBroker: async () => broker,
     findTopicPartitionMetadata: () => [{ partitionId: 0, leader: NODE_ID }],
     committedOffsets: () => ({}),
+    topicId: () => undefined,
+    leaderEpoch: () => -1,
   }
 
   const consumerGroup = new ConsumerGroup({

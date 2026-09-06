@@ -506,7 +506,10 @@ module.exports = class Broker {
    *   this request. A request that supplies none is capped at the last version keyed by name, so a
    *   caller that knows nothing about topic ids keeps working unchanged.
    * @param {number} [request.maxVersion] an additional ceiling; the lower of the two wins.
-   * @returns {Promise}
+   * @returns {Promise<object>} `{ responses: [{ topicName, partitions }] }` at every version. An
+   *   id this request did not ask for (a broker bug) comes back as `topicName: null` with its
+   *   `topicId` intact; deciding what to do about that belongs to the caller, which is why nothing
+   *   is logged here.
    */
   async fetch({
     replicaId,
@@ -556,19 +559,48 @@ module.exports = class Broker {
       []
     )
 
-    return await this[PRIVATE.SEND_REQUEST](
-      fetch({
-        replicaId,
-        isolationLevel,
-        maxWaitTime,
-        minBytes,
-        maxBytes,
-        topics: consolidatedTopicPartitions,
-        topicIds,
-        rackId,
-        checkCrcs,
-      })
-    )
+    const built = fetch({
+      replicaId,
+      isolationLevel,
+      maxWaitTime,
+      minBytes,
+      maxBytes,
+      topics: consolidatedTopicPartitions,
+      topicIds,
+      rackId,
+      checkCrcs,
+    })
+
+    const response = await this[PRIVATE.SEND_REQUEST](built)
+
+    // `lookupRequest` returns a builder, so the negotiated version is only observable on the
+    // request it built. Below v13 the response is already keyed by name and nothing is allocated.
+    if (topicIds == null || built.request.apiVersion <= FETCH_TOPIC_NAMES_MAX_VERSION) {
+      return response
+    }
+
+    // The request's own mapping, never the metadata cache: a topic recreated between request and
+    // response would make a cache lookup answer with the new incarnation's pairing.
+    const topicNames = new Map()
+    for (const [name, id] of topicIds) {
+      topicNames.set(id, name)
+    }
+
+    for (const entry of response.responses) {
+      const name = topicNames.get(entry.topicId)
+
+      if (name === undefined) {
+        entry.topicName = null
+        continue
+      }
+
+      entry.topicName = name
+      // Deleted rather than set to undefined: the returned shape is exactly
+      // `{ topicName, partitions }` at every version, so the key must not survive at all.
+      delete entry.topicId
+    }
+
+    return response
   }
 
   /**

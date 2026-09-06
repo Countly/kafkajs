@@ -152,9 +152,12 @@ const createFakeBroker = (answer) => {
 const createConsumerGroup = (broker, { checkCrcs }) => {
   const cluster = {
     refreshMetadataIfNecessary: async () => {},
+    refreshMetadata: async () => {},
     findBroker: async () => broker,
     findTopicPartitionMetadata: () => [{ partitionId: 0, leader: NODE_ID }],
     committedOffsets: () => ({}),
+    topicId: () => undefined,
+    leaderEpoch: () => -1,
   }
 
   const consumerGroup = new ConsumerGroup({

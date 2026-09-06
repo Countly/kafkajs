@@ -733,8 +733,15 @@ export type Broker = {
     maxBytes?: number
     topics: Array<{
       topic: string
-      partitions: Array<{ partition: number; fetchOffset: string; maxBytes: number }>
+      partitions: Array<{
+        partition: number
+        fetchOffset: string
+        maxBytes: number
+        currentLeaderEpoch?: number
+      }>
     }>
+    topicIds?: Map<string, string>
+    maxVersion?: number
     rackId?: string
     checkCrcs?: boolean
   }): Promise<any>

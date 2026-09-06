@@ -47,6 +47,11 @@ const STALE_METADATA_ERRORS = [
   'FETCH_SESSION_TOPIC_ID_ERROR',
 ]
 
+// The last Fetch version that keys topics by name. A request whose topics are not all known by id
+// is capped here rather than being split across two versions.
+// @see clients/src/main/resources/common/message/FetchRequest.json (Apache Kafka 4.3.1)
+const FETCH_TOPIC_NAMES_MAX_VERSION = 12
+
 const PRIVATE = {
   JOIN: Symbol('private:ConsumerGroup:join'),
   SYNC: Symbol('private:ConsumerGroup:sync'),
@@ -567,6 +572,29 @@ module.exports = class ConsumerGroup {
     return this[PRIVATE.SHARED_HEARTBEAT]({ interval })
   }
 
+  /**
+   * Runs one fetch round against a single broker: resolves what this node owes, sends one Fetch,
+   * and turns the response into batches for the runner.
+   *
+   * Topic ids are all-or-nothing per round. Every topic in the request is looked up in the
+   * metadata cache; if all have ids the request negotiates the broker's highest Fetch version and
+   * is keyed by id, and if even one is missing the whole request is capped at the last version
+   * keyed by name. No extra metadata refresh is issued for a missing id.
+   *
+   * At most one metadata refresh happens here, after the response has been walked, and only when
+   * the broker answered with a topic id this request never asked for.
+   *
+   * A partition-level error code is surfaced by throwing the first one found, which is what the
+   * fetch codecs below v12 do inside their own `parse`; from v12 the codec returns the codes as
+   * data and this method throws them instead, so the behaviour a caller sees is the same.
+   *
+   * Errors are not propagated: anything thrown is handed to `recoverFromFetch`, which either
+   * recovers or rethrows, and the round then yields no batches.
+   *
+   * @param {number} nodeId the broker to fetch from
+   * @returns {Promise<Batch[]>} one batch per fetched partition; empty when nothing was owed,
+   *   when the round was recovered from an error, or when every response entry was dropped
+   */
   async fetch(nodeId) {
     try {
       await this.cluster.refreshMetadataIfNecessary()
@@ -606,6 +634,11 @@ module.exports = class ConsumerGroup {
             .map((partition) => ({
               partition,
               fetchOffset: this.offsetManager.nextOffset(topic, partition).toString(),
+              // The client's current view of this partition's leader epoch, so the broker can
+              // reject a request built on metadata that has since moved. -1 when the cache has
+              // not seen the partition, which is the field's own wire default and means
+              // "do not fence".
+              currentLeaderEpoch: this.cluster.leaderEpoch(topic, partition),
               maxBytes: this.maxBytesPerPartition,
             })),
         }))
@@ -616,6 +649,24 @@ module.exports = class ConsumerGroup {
         return []
       }
 
+      // Topic ids are all-or-nothing per request: a fetch goes out keyed by id only when every
+      // topic in it has one, otherwise the whole request falls back to the last version keyed by
+      // name. This is the rule the Java consumer applies, and it avoids splitting one round into
+      // two requests at two versions. No extra metadata refresh is issued for a missing id: the
+      // round already refreshed if necessary, and an id is only missing inside a delete/recreate
+      // window.
+      let topicIds = new Map()
+      let maxVersion
+      for (const { topic } of requests) {
+        const topicId = this.cluster.topicId(topic)
+        if (topicId === undefined) {
+          topicIds = undefined
+          maxVersion = FETCH_TOPIC_NAMES_MAX_VERSION
+          break
+        }
+        topicIds.set(topic, topicId)
+      }
+
       const broker = await this.cluster.findBroker({ nodeId })
 
       const { responses } = await broker.fetch({
@@ -624,6 +675,8 @@ module.exports = class ConsumerGroup {
         maxBytes: this.maxBytes,
         isolationLevel: this.isolationLevel,
         topics: requests,
+        topicIds,
+        maxVersion,
         rackId: this.rackId,
         checkCrcs: this.checkCrcs,
       })
@@ -652,7 +705,22 @@ module.exports = class ConsumerGroup {
         throw createErrorFromCode(errorCode)
       }
 
-      return responses.flatMap(({ topicName, partitions }) => {
+      let needsRefresh = false
+
+      const batches = responses.flatMap(({ topicName, topicId, partitions }) => {
+        if (topicName == null) {
+          // Only reachable if a broker answered with a topic id this request never asked for.
+          // Treated as stale metadata rather than dropped silently, and checked before the lookup
+          // below, whose `undefined` would make the next line a TypeError.
+          this.logger.warn('Fetch response carried an unknown topic id, refreshing metadata', {
+            groupId: this.groupId,
+            memberId: this.memberId,
+            topicId,
+          })
+          needsRefresh = true
+          return []
+        }
+
         const topicRequestData = requests.find(({ topic }) => topic === topicName)
 
         let preferredReadReplicas = this.preferredReadReplicasPerTopicPartition[topicName]
@@ -693,6 +761,12 @@ module.exports = class ConsumerGroup {
             return new Batch(topicName, fetchedOffset, partitionData)
           })
       })
+
+      if (needsRefresh) {
+        await this.cluster.refreshMetadata()
+      }
+
+      return batches
     } catch (e) {
       await this.recoverFromFetch(e)
       return []
