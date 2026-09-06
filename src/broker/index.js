@@ -10,6 +10,11 @@ const shuffle = require('../utils/shuffle')
 // @see clients/src/main/resources/common/message/FetchRequest.json (Apache Kafka 4.3.1)
 const FETCH_TOPIC_NAMES_MAX_VERSION = 12
 
+// The last Produce version keyed by topic name. A request that supplies no topic ids cannot be
+// sent above it, whatever the broker advertises.
+// @see clients/src/main/resources/common/message/ProduceRequest.json (Apache Kafka 4.3.1)
+const PRODUCE_TOPIC_NAMES_MAX_VERSION = 11
+
 const PRIVATE = {
   SEND_REQUEST: Symbol('private:Broker:sendRequest'),
   API_VERSIONS_AT: Symbol('private:Broker:apiVersionsAt'),
@@ -405,24 +410,62 @@ module.exports = class Broker {
    * @param {number} [request.producerId=-1] Broker assigned producerId
    * @param {number} [request.producerEpoch=0] Broker assigned producerEpoch
    * @param {import("../../types").CompressionTypes} [request.compression=CompressionTypes.None] Compression codec
+   * @param {Map<string, string>} [request.topicIds] topic name to topic id. When every topic in
+   *   this request has one, the request can be negotiated at v13, which keys topics by id
+   *   (KIP-516); the inverse map is derived here and bound onto the response codec so the decoded
+   *   shape - and the `topic` field of a produce error - is unchanged at every version.
+   * @param {number} [request.maxVersion] the highest version this request may negotiate
    * @returns {Promise}
    */
   async produce({
     topicData,
+    topicIds,
     transactionalId,
     producerId,
     producerEpoch,
     acks = -1,
     timeout = 30000,
     compression = Compression.None,
+    maxVersion,
   }) {
-    const produce = this.lookupRequest(apiKeys.Produce, requests.Produce)
+    // Ids are what v13 is keyed by, so a request without them cannot be sent above v12's shape -
+    // and v12 is only reachable inside a transaction-version-2 produce, so the floor for a
+    // caller-supplied-nothing request is v11. This is permanent, not scaffolding: `Broker` is a
+    // public type and `broker.produce({ topicData })` must keep working forever. A caller may
+    // still ask for something lower.
+    const cap =
+      topicIds == null
+        ? Math.min(
+            PRODUCE_TOPIC_NAMES_MAX_VERSION,
+            maxVersion === undefined ? Infinity : maxVersion
+          )
+        : maxVersion
+
+    const produce = this.lookupRequestWithMax(apiKeys.Produce, requests.Produce, cap)
+    // `negotiatedVersion` with no cap map is the uncapped question; passing a sentinel through the
+    // map to mean "no cap" would be a workaround for `undefined`.
+    const version =
+      cap === undefined
+        ? this.negotiatedVersion(apiKeys.Produce, requests.Produce)
+        : this.negotiatedVersion(apiKeys.Produce, requests.Produce, { [apiKeys.Produce]: cap })
+
+    // Built only at v13, the only version that needs it: below that nothing extra is allocated.
+    let topicNames
+    if (topicIds != null && version >= 13) {
+      topicNames = new Map()
+      for (const [name, id] of topicIds) {
+        topicNames.set(id, name)
+      }
+    }
+
     return await this[PRIVATE.SEND_REQUEST](
       produce({
         acks,
         timeout,
         compression,
         topicData,
+        topicIds,
+        topicNames,
         transactionalId,
         producerId,
         producerEpoch,

@@ -173,6 +173,11 @@ const parse = async (data) => {
 module.exports = {
   decode,
   parse,
+  // v13 keys each topic by id instead of by name, so it decodes `TopicId` itself and reuses these
+  // three helpers unchanged rather than duplicating them.
+  decodePartition,
+  decodeNodeEndpoints,
+  RESPONSE_NODE_ENDPOINTS_TAG,
 }
 
 module.exports.schema = {

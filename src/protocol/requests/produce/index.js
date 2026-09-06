@@ -143,6 +143,54 @@ const versions = {
       response,
     }
   },
+  12: ({ acks, timeout, compression, topicData, transactionalId, producerId, producerEpoch }) => {
+    const request = require('./v12/request')
+    const response = require('./v12/response')
+    return {
+      request: request({
+        acks,
+        timeout,
+        compression,
+        topicData,
+        transactionalId,
+        producerId,
+        producerEpoch,
+      }),
+      response,
+    }
+  },
+  13: ({
+    acks,
+    timeout,
+    compression,
+    topicData,
+    topicIds,
+    topicNames,
+    transactionalId,
+    producerId,
+    producerEpoch,
+  }) => {
+    const request = require('./v13/request')
+    const response = require('./v13/response')
+    return {
+      request: request({
+        acks,
+        timeout,
+        compression,
+        topicData,
+        topicIds,
+        transactionalId,
+        producerId,
+        producerEpoch,
+      }),
+      // The stateless response module gets this request's own id-to-name map, exactly as
+      // fetch/index.js binds `checkCrcs`. Nothing else in the codec layer is per-request.
+      response: {
+        decode: (rawData) => response.decode(rawData, { topicNames }),
+        parse: response.parse,
+      },
+    }
+  },
 }
 
 module.exports = {

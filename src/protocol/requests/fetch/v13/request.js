@@ -2,6 +2,7 @@ const Encoder = require('../../../encoder')
 const { Fetch: apiKey } = require('../../apiKeys')
 const ISOLATION_LEVEL = require('../../../isolationLevel')
 const { LAST_FETCHED_EPOCH } = require('../v12/request')
+const { KafkaJSInvariantViolation } = require('../../../../errors')
 
 /**
  * FetchRequest (Version: 13) — flexible (KIP-482), topic ids (KIP-516)
@@ -49,12 +50,36 @@ module.exports = ({
       .writeTaggedFields(),
 })
 
+/**
+ * @param {Map<string, string>} topicIds
+ * @param {string} topic
+ * @returns {string} the topic's id
+ * @throws {import('../../../../errors').KafkaJSInvariantViolation} when `topic` has no id -
+ *   callers (`Broker#fetch`'s v13 cap) never reach this codec without one for every topic, so this
+ *   can only mean a caller bypassed that cap; an all-zero uuid would otherwise go out on the wire
+ *   silently instead.
+ */
+const requireTopicId = (topicIds, topic) => {
+  const topicId = topicIds.get(topic)
+
+  if (topicId === undefined) {
+    throw new KafkaJSInvariantViolation(
+      `Fetch v13 request is missing a topic id for topic "${topic}"`
+    )
+  }
+
+  return topicId
+}
+
 const encodeForgottenTopics = ({ topic, partitions }, topicIds) =>
-  new Encoder().writeUuid(topicIds.get(topic)).writeUVarIntArray(partitions).writeTaggedFields()
+  new Encoder()
+    .writeUuid(requireTopicId(topicIds, topic))
+    .writeUVarIntArray(partitions)
+    .writeTaggedFields()
 
 const encodeTopic = ({ topic, partitions }, topicIds) =>
   new Encoder()
-    .writeUuid(topicIds.get(topic))
+    .writeUuid(requireTopicId(topicIds, topic))
     .writeUVarIntArray(partitions.map(encodePartition))
     .writeTaggedFields()
 

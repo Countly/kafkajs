@@ -1,5 +1,6 @@
 const RequestV13Protocol = require('./request')
 const Decoder = require('../../../decoder')
+const { KafkaJSInvariantViolation } = require('../../../../errors')
 
 const TOPIC_ID = '01020304-0506-0708-090a-0b0c0d0e0f10'
 
@@ -83,6 +84,27 @@ describe('Protocol > Requests > Fetch > v13', () => {
     })
 
     expect(ids).toEqual([TOPIC_ID, TOPIC_ID])
+  })
+
+  test('throws rather than encoding an all-zero uuid when a topic has no id', async () => {
+    // Defensive only: `Broker#fetch`'s v13 cap never reaches this codec without an id for every
+    // topic, so this can only happen if a caller bypasses that cap.
+    const { encode } = RequestV13Protocol({
+      replicaId: -1,
+      maxWaitTime: 5000,
+      minBytes: 1,
+      maxBytes: 10485760,
+      isolationLevel: 1,
+      sessionId: 0,
+      sessionEpoch: -1,
+      forgottenTopics: [],
+      rackId: '',
+      topics: [{ topic: 'unknown-topic', partitions: partitions([0]) }],
+      topicIds: new Map(),
+    })
+
+    await expect(encode()).rejects.toThrow(KafkaJSInvariantViolation)
+    await expect(encode()).rejects.toThrow(/unknown-topic/)
   })
 
   test('forgotten topics are keyed by id too', async () => {

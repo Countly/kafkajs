@@ -272,5 +272,30 @@ describe('Broker > capped lookup and negotiated version', () => {
 
       expect(sentVersions[apiKeys.Fetch]).toEqual(12)
     })
+
+    test('a produce with no topicIds is sent at v11 against a broker advertising 13', async () => {
+      const { broker, sentVersions } = createRecordingBroker({
+        [apiKeys.Produce]: { minVersion: 3, maxVersion: 13 },
+      })
+
+      await broker.produce({
+        acks: -1,
+        timeout: 30000,
+        topicData: [
+          {
+            topic: 'test-topic',
+            partitions: [
+              {
+                partition: 0,
+                firstSequence: 0,
+                messages: [{ value: 'a', timestamp: 1700000000000 }],
+              },
+            ],
+          },
+        ],
+      })
+
+      expect(sentVersions[apiKeys.Produce]).toEqual(11)
+    })
   })
 })
