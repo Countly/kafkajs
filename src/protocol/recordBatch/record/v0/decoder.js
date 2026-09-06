@@ -49,7 +49,8 @@ const setHeader = (headers, key, value) => {
  *   `firstOffset` itself is a string and `offsetDelta` a number, so adding the raw fields would
  *   concatenate rather than add - which is why the numeric base is passed separately and the fast
  *   path is guarded on both the base and the sum being safe integers. Above that, or when the base
- *   is absent, the exact 64-bit arithmetic is used unchanged.
+ *   is absent, the exact 64-bit arithmetic is used unchanged. Either way the resulting string comes
+ *   from `Long`, never from `Number#toString`.
  * @returns {object} the decoded record: `{ magicByte, attributes, timestamp, offset, key, value,
  *   headers, isControlRecord, batchContext }`, with `timestamp` and `offset` as decimal strings
  */
@@ -72,9 +73,13 @@ module.exports = (decoder, batchContext = {}, firstOffsetNumber) => {
 
   const offsetDelta = decoder.readVarInt()
   const offsetSum = firstOffsetNumber + offsetDelta
+  // The sum is rendered through `Long`, not `Number#toString`. Both produce the same string, but
+  // `Number#toString` interns its result in V8's number-to-string cache, and a consumer decodes one
+  // distinct offset per record - which measurably slows the consumer's later pass over the decoded
+  // messages, without costing decode itself. See `scripts/benchmarks/consumeThroughput.js`.
   const offset =
     Number.isSafeInteger(firstOffsetNumber) && Number.isSafeInteger(offsetSum)
-      ? offsetSum.toString()
+      ? Long.fromNumber(offsetSum).toString()
       : Long.fromValue(firstOffset).add(offsetDelta).toString()
 
   const key = decoder.readVarIntBytes()

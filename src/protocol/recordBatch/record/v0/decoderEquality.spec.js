@@ -208,6 +208,37 @@ describe('Protocol > RecordBatch > record decoder', () => {
     expect(records.map(({ offset }) => offset)).toEqual(['1000', '1001', '1002'])
   })
 
+  test('renders offsets without Number#toString, whose cache costs the consumer hot path', async () => {
+    const buffer = await buildBatch({
+      firstOffset: '1000',
+      firstTimestamp: FIRST_TIMESTAMP,
+      maxTimestamp: FIRST_TIMESTAMP,
+      records: [
+        RecordEncoder({ value: Buffer.from('a'), offsetDelta: 0 }),
+        RecordEncoder({ value: Buffer.from('b'), offsetDelta: 1 }),
+      ],
+    })
+
+    const original = Number.prototype.toString
+    const calls = []
+    // eslint-disable-next-line no-extend-native
+    Number.prototype.toString = function (...args) {
+      calls.push(original.apply(this, args))
+      return original.apply(this, args)
+    }
+
+    let records
+    try {
+      ;({ records } = await RecordBatchDecoder(new Decoder(buffer), { checkCrcs: false }))
+    } finally {
+      // eslint-disable-next-line no-extend-native
+      Number.prototype.toString = original
+    }
+
+    expect(records.map(({ offset }) => offset)).toEqual(['1000', '1001'])
+    expect(calls).toEqual([])
+  })
+
   test('an above-safe-integer first offset falls back to the exact 64-bit path', async () => {
     const buffer = await buildBatch({
       firstOffset: '9223372036854775800',
