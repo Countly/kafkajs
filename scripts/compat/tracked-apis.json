@@ -136,9 +136,9 @@
     {
       "kafkaName": "OffsetForLeaderEpoch",
       "apiKey": 23,
-      "forkName": null,
+      "forkName": "offsetForLeaderEpoch",
       "apiKeysName": "OffsetForLeaderEpoch",
-      "planned": "phase-5"
+      "planned": "done"
     },
     {
       "kafkaName": "AddPartitionsToTxn",

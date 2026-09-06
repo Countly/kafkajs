@@ -758,6 +758,28 @@ export type Broker = {
     topics?: TopicPartitions[]
     timeout?: number
   }): Promise<ListPartitionReassignmentsResponse>
+  offsetForLeaderEpoch(request: {
+    topics: Array<{
+      topic: string
+      partitions: Array<{
+        partition: number
+        currentLeaderEpoch?: number
+        leaderEpoch: number
+      }>
+    }>
+  }): Promise<{
+    throttleTime: number
+    clientSideThrottleTime: number
+    topics: Array<{
+      topic: string
+      partitions: Array<{
+        errorCode: number
+        partition: number
+        leaderEpoch: number
+        endOffset: string
+      }>
+    }>
+  }>
 }
 
 interface MessageSetEntry {

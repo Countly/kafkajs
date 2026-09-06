@@ -105,8 +105,8 @@
       "since": "2026-09-03"
     },
     "OffsetForLeaderEpoch": {
-      "note": "Leader-epoch fencing (KIP-320). Without it an unclean leader change can silently duplicate or skip records.",
-      "since": "2026-09-03"
+      "note": "Leader-epoch fencing (KIP-320): v3 and v4 are implemented. v2 is a deliberate gap, not a waiver - versions below 3 require CLUSTER permission, which clients are not typically granted, and the Java consumer pins its own floor at v3 for that reason.",
+      "since": "2026-09-06"
     },
     "IncrementalAlterConfigs": {
       "note": "The replacement for AlterConfigs; needed before any admin config change can be merge-semantics rather than overwrite.",

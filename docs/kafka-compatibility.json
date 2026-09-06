@@ -27,9 +27,11 @@
         8,
         9,
         10,
-        11
+        11,
+        12,
+        13
       ],
-      "gap": "behind:2",
+      "gap": "current",
       "onFloor": false,
       "belowFloor": [],
       "notes": "v8 per-record errors (KIP-467), v9 flexible, v10 leader hints (KIP-951), v11 TRANSACTION_ABORTABLE (KIP-890), v12 transaction-version-2 implicit add-partitions (KIP-890 part 2), v13 topic IDs (KIP-516, Kafka 4.1; may return UNKNOWN_TOPIC_ID)."
@@ -499,9 +501,9 @@
     {
       "kafkaName": "OffsetForLeaderEpoch",
       "apiKey": 23,
-      "forkName": null,
+      "forkName": "offsetForLeaderEpoch",
       "apiKeysName": "OffsetForLeaderEpoch",
-      "planned": "phase-5",
+      "planned": "done",
       "validVersions": [
         2,
         4
@@ -509,11 +511,14 @@
       "flexibleFrom": 4,
       "deprecatedVersions": null,
       "latestVersionUnstable": false,
-      "forkVersions": null,
-      "gap": "stub",
+      "forkVersions": [
+        3,
+        4
+      ],
+      "gap": "current",
       "onFloor": false,
       "belowFloor": [],
-      "notes": "Leader-epoch fencing (KIP-320). Without it an unclean leader change can silently duplicate or skip records."
+      "notes": "Leader-epoch fencing (KIP-320): v3 and v4 are implemented. v2 is a deliberate gap, not a waiver - versions below 3 require CLUSTER permission, which clients are not typically granted, and the Java consumer pins its own floor at v3 for that reason."
     },
     {
       "kafkaName": "AddPartitionsToTxn",

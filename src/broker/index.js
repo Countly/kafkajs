@@ -696,6 +696,29 @@ module.exports = class Broker {
   }
 
   /**
+   * Asks the leader for the end offset of a leader epoch, so a consumer can tell whether its
+   * position still exists on this leader after a leadership change (KIP-320).
+   *
+   * Per-partition error codes come back in the response rather than as a rejection: the caller
+   * classifies them, because a retriable code means "ask again" and a non-retriable one means
+   * "stop validating", and neither is an outcome this method can choose.
+   *
+   * @see https://cwiki.apache.org/confluence/display/KAFKA/KIP-320%3A+Allow+fetchers+to+detect+and+handle+log+truncation
+   * @public
+   * @param {object} request
+   * @param {{topic: string, partitions: {partition: number, currentLeaderEpoch?: number, leaderEpoch: number}[]}[]} request.topics
+   * @returns {Promise<object>} `{ throttleTime, clientSideThrottleTime, topics: [{ topic,
+   *   partitions: [{ errorCode, partition, leaderEpoch, endOffset }] }] }`; `endOffset` is a string
+   */
+  async offsetForLeaderEpoch({ topics }) {
+    const offsetForLeaderEpoch = this.lookupRequest(
+      apiKeys.OffsetForLeaderEpoch,
+      requests.OffsetForLeaderEpoch
+    )
+    return await this[PRIVATE.SEND_REQUEST](offsetForLeaderEpoch({ topics }))
+  }
+
+  /**
    * @public
    * @param {object} request
    * @param {string} request.groupId

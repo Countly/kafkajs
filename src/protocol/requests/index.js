@@ -50,7 +50,7 @@ const requests = {
   DeleteTopics: require('./deleteTopics'),
   DeleteRecords: require('./deleteRecords'),
   InitProducerId: require('./initProducerId'),
-  OffsetForLeaderEpoch: noImplementedRequestDefinitions,
+  OffsetForLeaderEpoch: require('./offsetForLeaderEpoch'),
   AddPartitionsToTxn: require('./addPartitionsToTxn'),
   AddOffsetsToTxn: require('./addOffsetsToTxn'),
   EndTxn: require('./endTxn'),
