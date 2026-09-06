@@ -501,4 +501,80 @@ describe('Consumer > position validation', () => {
       expect(group.positionValidator.isAwaiting(TOPIC, 0)).toBe(false)
     }
   })
+
+  describe('a partition with no committed offset', () => {
+    /** The resolved offsets of the topic, including any key holding no value. */
+    const resolvedKeys = (offsetManager) => Object.keys(offsetManager.resolvedOffsets[TOPIC])
+
+    test('is not read by validation, so nothing it touches can hold an offset that is not one', async () => {
+      const { group, offsetManager } = await createGroup()
+      // What a concurrent OffsetOutOfRange recovery does to a partition mid-round.
+      offsetManager.clearOffsets({ topic: TOPIC, partition: 0 })
+      const nextOffset = jest.spyOn(offsetManager, 'nextOffset')
+
+      await group.validatePositions([{ topic: TOPIC, partitions: [0] }])
+
+      expect(nextOffset).not.toHaveBeenCalled()
+      expect(resolvedKeys(offsetManager)).toEqual([])
+      expect(() => offsetManager.countResolvedOffsets()).not.toThrow()
+      expect(() => offsetManager.uncommittedOffsets()).not.toThrow()
+    })
+
+    test('is not read when it loses its offset while its validation reply is in flight', async () => {
+      const harness = await createGroup()
+      const nextOffset = jest.spyOn(harness.offsetManager, 'nextOffset')
+      let readsBeforeTheClear
+
+      harness.setValidationResponse((partitions) => {
+        harness.offsetManager.clearOffsets({ topic: TOPIC, partition: 0 })
+        readsBeforeTheClear = nextOffset.mock.calls.length
+        return offsetForLeaderEpochResponse(
+          partitions.map((partition) => ({ partition, endOffset: '20' }))
+        )
+      })
+
+      await harness.group.fetch(NODE_ID)
+
+      // The reply lands after the clear, and applying it must not read the position back.
+      expect(nextOffset.mock.calls.length).toEqual(readsBeforeTheClear)
+      expect(resolvedKeys(harness.offsetManager)).toEqual([])
+      // Both walk the resolved offsets, and both are on the auto-commit path.
+      expect(() => harness.offsetManager.countResolvedOffsets()).not.toThrow()
+      expect(() => harness.offsetManager.uncommittedOffsets()).not.toThrow()
+    })
+  })
+
+  test('a round that finishes after a rebalance leaves the new assignment alone', async () => {
+    const harness = await createGroup()
+    const validator = harness.group.positionValidator
+
+    harness.setValidationResponse((partitions) => {
+      // The rebalance runs while this request is in flight, and the fetcher that owns the
+      // partition in the new assignment puts it back into validation against the new epoch.
+      validator.clear()
+      validator.request(TOPIC, 0, { offset: '10', trackedEpoch: 4, currentLeaderEpoch: 9 })
+      return offsetForLeaderEpochResponse(
+        partitions.map((partition) => ({ partition, endOffset: '20' }))
+      )
+    })
+
+    await harness.group.fetch(NODE_ID)
+
+    // The old round's sweep must not answer for the new one: its epoch was never checked.
+    expect(validator.isAwaiting(TOPIC, 0)).toBe(true)
+    expect(validator.validatedAgainst(TOPIC, 0)).toBeUndefined()
+  })
+
+  test('a round whose partitions are already validated reads no offset and asks nothing', async () => {
+    const { group, offsetManager } = await createGroup()
+    await group.fetch(NODE_ID)
+
+    const request = jest.spyOn(group.positionValidator, 'request')
+    const nextOffset = jest.spyOn(offsetManager, 'nextOffset')
+
+    await group.validatePositions([{ topic: TOPIC, partitions: [0] }])
+
+    expect(request).not.toHaveBeenCalled()
+    expect(nextOffset).not.toHaveBeenCalled()
+  })
 })

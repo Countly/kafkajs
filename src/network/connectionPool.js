@@ -105,6 +105,10 @@ module.exports = class ConnectionPool {
   /**
    * Sends one request on this pool.
    *
+   * A caller-supplied connection is reconnected here if it died meanwhile - it may have been
+   * resolved several awaits ago - so that this path behaves like `getConnection()`, which the
+   * caller would otherwise have gone through.
+   *
    * @param {object} protocolRequest a built request, as produced by a request builder
    * @param {Connection} [connection] the connection to send on, if the caller already resolved
    *                                  it (e.g. via `getConnectionByRequest`) for its own purposes;
@@ -114,6 +118,11 @@ module.exports = class ConnectionPool {
    */
   async send(protocolRequest, connection = null) {
     const resolvedConnection = connection || (await this.getConnectionByRequest(protocolRequest))
+
+    if (!resolvedConnection.isConnected()) {
+      await resolvedConnection.connect()
+    }
+
     return resolvedConnection.send(protocolRequest)
   }
 

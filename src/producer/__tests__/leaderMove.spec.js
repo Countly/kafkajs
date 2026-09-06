@@ -13,7 +13,10 @@ const enabled = process.env.LEADER_MOVE_E2E === '1'
 const describeLive = enabled ? describe : describe.skip
 
 /**
- * Live confirmation of the KIP-951 produce path (spec §3.3).
+ * Live confirmation of the KIP-951 produce path: a produce that learns its partition's new leader
+ * from the error response itself.
+ *
+ * Run it with `npm run test:e2e:leader-move`.
  *
  * A stopped broker can never answer with a hint - its socket is gone before it could respond, so
  * the client only ever recovers through the ordinary connection-error/refresh path, never through
@@ -35,7 +38,8 @@ const describeLive = enabled ? describe : describe.skip
  *
  * Reassigning/electing on a shared cluster is not safe alongside the other producer specs running
  * in parallel workers, so this suite is gated exactly like the rebootstrap e2e: skipped unless
- * `LEADER_MOVE_E2E=1`, and run in its own foreground `docker compose` invocation.
+ * `LEADER_MOVE_E2E=1`, and run in its own foreground `docker compose` invocation - which is what
+ * the `test:e2e:leader-move` script does.
  * @see https://cwiki.apache.org/confluence/display/KAFKA/KIP-951%3A+Leader+discovery+optimisations+for+the+client
  */
 describeLive('Producer > leader move (live)', () => {

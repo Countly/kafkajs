@@ -58,6 +58,13 @@ let removeListener = consumer.on(consumer.events.HEARTBEAT, e =>
 )
 removeListener()
 
+// The committed leader epoch is part of the COMMIT_OFFSETS payload and of the uncommitted offsets
+consumer.on(consumer.events.COMMIT_OFFSETS, e => {
+  const committedLeaderEpoch: number | undefined = e.payload.topics[0].partitions[0].leaderEpoch
+  const committedOffset: string = e.payload.topics[0].partitions[0].offset
+  console.log(committedLeaderEpoch, committedOffset)
+})
+
 const runConsumer = async () => {
   await consumer.connect()
   await consumer.subscribe({ topics: [topic] })
@@ -81,7 +88,10 @@ const runConsumer = async () => {
           },
         ],
       })
-      uncommittedOffsets()
+      const uncommitted = uncommittedOffsets()
+      const uncommittedLeaderEpoch: number | undefined =
+        uncommitted.topics[0].partitions[0].leaderEpoch
+      console.log(uncommittedLeaderEpoch)
       isRunning()
       isStale()
       console.log(batch)

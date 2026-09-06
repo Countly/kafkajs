@@ -33,7 +33,7 @@ const metadataBody = () =>
 
 /**
  * A two-socket pool over two fake sockets, whose `generation` is the sum of both — the real
- * `ConnectionPool` shape (`connectionPool.js:89-91`). `bumpIndex1()` simulates the pool
+ * `ConnectionPool` shape (its `generation` getter). `bumpIndex1()` simulates the pool
  * re-establishing the Fetch socket on its own, without any `Broker#connect()`.
  */
 const createPool = () => {

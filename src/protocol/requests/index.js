@@ -135,7 +135,10 @@ const selectVersion = (versions, apiKey, definition, maxVersions = {}) => {
     )
   }
 
-  return Math.min(bestImplementedVersion, version.maxVersion)
+  // By membership, not by `Math.min`: the highest version this client actually implements at or
+  // below the broker's maximum. An implemented set with a hole would otherwise select a version
+  // with no codec, and `definition.protocol({ version })` would return undefined.
+  return Math.max(...availableVersions.filter((available) => available <= version.maxVersion))
 }
 
 /**

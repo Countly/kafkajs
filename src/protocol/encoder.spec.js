@@ -48,6 +48,15 @@ describe('Protocol > Encoder', () => {
       const decoder = new Decoder(encodedArray)
       expect(decoder.readUVarIntArray(decodeUVarInt)).toEqual(array)
     })
+
+    test("an int32 array is written as int32s, and is dropped without the 'int32' type", () => {
+      // A compact []int32 field such as ForgottenTopicsData.Partitions: raw numbers, not
+      // sub-encoders. Untyped, the elements are filtered out and only the length survives.
+      const encoded = new Encoder().writeUVarIntArray([0, 1, 2], 'int32').buffer
+      expect(encoded).toEqual(B(0x04, 0, 0, 0, 0, 0, 0, 0, 0x01, 0, 0, 0, 0x02))
+      expect(new Decoder(encoded).readUVarIntArray((d) => d.readInt32())).toEqual([0, 1, 2])
+      expect(new Encoder().writeUVarIntArray([0, 1, 2]).buffer).toEqual(B(0x01))
+    })
   })
 
   describe('Unsigned VarInt Bytes', () => {

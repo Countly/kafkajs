@@ -281,6 +281,26 @@ describe('Connection > reconnect safety', () => {
   })
 })
 
+describe('ConnectionPool > send', () => {
+  test('reconnects a caller-supplied connection that died since the caller resolved it', async () => {
+    const { factory } = createTrackingSocketFactory()
+    const pool = new ConnectionPool(connectionOptsWith(factory))
+    const connection = await pool.getConnection(0)
+    const send = jest.spyOn(connection, 'send').mockResolvedValue('response')
+
+    // The window `Broker[SEND_REQUEST]` opens: the connection is resolved, then an ApiVersions
+    // round trip is awaited, and the socket can die before the request is dispatched.
+    await connection.disconnect()
+    expect(connection.isConnected()).toBe(false)
+
+    await expect(pool.send({ request: { apiKey: 1 } }, connection)).resolves.toEqual('response')
+    expect(connection.isConnected()).toBe(true)
+    expect(send).toHaveBeenCalledTimes(1)
+
+    await pool.destroy()
+  })
+})
+
 describe('ConnectionPool > generation', () => {
   test('is the sum of both pooled connections generations, and changes when either is replaced', async () => {
     const { factory } = createTrackingSocketFactory()

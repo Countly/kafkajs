@@ -640,71 +640,14 @@ module.exports = class ConsumerGroup {
       await this.seekOffsets(topicPartitions)
       await this.validatePositions(topicPartitions)
 
-      const committedOffsets = this.offsetManager.committedOffsets()
-      const activeTopicPartitions = this.getActiveTopicPartitions()
-
-      const requests = topicPartitions
-        .map(({ topic, partitions }) => ({
-          topic,
-          partitions: partitions
-            .filter(
-              (partition) =>
-                /**
-                 * When recovering from OffsetOutOfRange, each partition can recover
-                 * concurrently, which invalidates resolved and committed offsets as part
-                 * of the recovery mechanism (see OffsetManager.clearOffsets). In concurrent
-                 * scenarios this can initiate a new fetch with invalid offsets.
-                 *
-                 * This was further highlighted by https://github.com/tulios/kafkajs/pull/570,
-                 * which increased concurrency, making this more likely to happen.
-                 *
-                 * This is solved by only making requests for partitions with initialized offsets.
-                 *
-                 * See the following pull request which explains the context of the problem:
-                 * @issue https://github.com/tulios/kafkajs/pull/578
-                 */
-                committedOffsets[topic][partition] != null &&
-                activeTopicPartitions[topic].has(partition) &&
-                // A partition another fetcher put into validation is left out of this request:
-                // its position is the thing being checked, so fetching from it would be reading
-                // from an offset this client is not yet sure still exists.
-                !this.positionValidator.isAwaiting(topic, partition)
-            )
-            .map((partition) => ({
-              partition,
-              fetchOffset: this.offsetManager.nextOffset(topic, partition).toString(),
-              // The client's current view of this partition's leader epoch, so the broker can
-              // reject a request built on metadata that has since moved. -1 when the cache has
-              // not seen the partition, which is the field's own wire default and means
-              // "do not fence".
-              currentLeaderEpoch: this.cluster.leaderEpoch(topic, partition),
-              maxBytes: this.maxBytesPerPartition,
-            })),
-        }))
-        .filter(({ partitions }) => partitions.length)
+      const requests = this.buildFetchRequests(topicPartitions)
 
       if (!requests.length) {
         await sleep(this.maxWaitTime)
         return []
       }
 
-      // Topic ids are all-or-nothing per request: a fetch goes out keyed by id only when every
-      // topic in it has one, otherwise the whole request falls back to the last version keyed by
-      // name. This is the rule the Java consumer applies, and it avoids splitting one round into
-      // two requests at two versions. No extra metadata refresh is issued for a missing id: the
-      // round already refreshed if necessary, and an id is only missing inside a delete/recreate
-      // window.
-      let topicIds = new Map()
-      let maxVersion
-      for (const { topic } of requests) {
-        const topicId = this.cluster.topicId(topic)
-        if (topicId === undefined) {
-          topicIds = undefined
-          maxVersion = FETCH_TOPIC_NAMES_MAX_VERSION
-          break
-        }
-        topicIds.set(topic, topicId)
-      }
+      const { topicIds, maxVersion } = this.resolveTopicIds(requests)
 
       if (this.logger.debugEnabled()) {
         this.logger.debug('Fetching', {
@@ -740,26 +683,14 @@ module.exports = class ConsumerGroup {
         checkCrcs: this.checkCrcs,
       })
 
-      let needsRefresh = false
-
       // The top-level code is only decoded from Fetch v7 up, so an older response carries none -
       // and `failure(undefined)` is true, which is why the guard is on the field's presence.
       if (topLevelErrorCode != null && failure(topLevelErrorCode)) {
-        if (topLevelFetchAction(topLevelErrorCode) === 'throw') {
-          // Everything not in the table keeps the recovery path a request-level fetch error has
-          // always taken: refresh and rejoin for stale metadata, crash for anything else.
-          throw createErrorFromCode(topLevelErrorCode)
-        }
-
-        this.logger.warn('Fetch response carried a top-level error, refreshing metadata', {
-          groupId: this.groupId,
-          memberId: this.memberId,
-          errorCode: topLevelErrorCode,
-        })
-        await this.cluster.refreshMetadata()
+        await this.handleFetchTopLevelError(topLevelErrorCode)
         return []
       }
 
+      let needsRefresh = false
       const batches = []
       // Hoisted out of the per-partition loop: the response row below is the hot path, and its
       // payload must not be built once per partition per round only to be discarded.
@@ -786,102 +717,19 @@ module.exports = class ConsumerGroup {
           this.preferredReadReplicasPerTopicPartition[topicName] = preferredReadReplicas = {}
         }
 
+        // Built once per topic, not once per partition: the loop below is the consume hot path.
+        const context = {
+          topicName,
+          topicRequestData,
+          preferredReadReplicas,
+          nodeEndpoints,
+          batches,
+          debug,
+        }
+
         for (const partitionData of partitions) {
-          const { partition, errorCode, preferredReadReplica } = partitionData
-
-          if (debug) {
-            this.logger.debug('Fetch response partition', {
-              topic: topicName,
-              partition,
-              errorCode,
-              highWatermark: partitionData.highWatermark,
-              messageCount: partitionData.messages ? partitionData.messages.length : 0,
-            })
-          }
-
-          if (failure(errorCode)) {
-            const action = partitionFetchAction(errorCode)
-
-            if (action === 'throw') {
-              throw createErrorFromCode(errorCode)
-            }
-
-            this.recordFetchError(topicName, partition, errorCode)
-
-            if (action === 'offset-out-of-range') {
-              // The existing recovery, for this partition only: drop the preferred replica if one
-              // is set, otherwise reset per the topic's own fromBeginning.
-              await this.recoverFromOffsetOutOfRange({ topic: topicName, partition })
-            } else if (action === 'skip-and-forget-epoch') {
-              // The client is ahead of this broker. Defending the cached epoch would make every
-              // retry resend the same rejected value; forgetting it makes the next request carry
-              // -1 and the next metadata response converge. Warned every time, because this
-              // rewrites cached cluster state and usually clears on the very next round.
-              this.logger.warn('Broker does not know the leader epoch we sent, forgetting it', {
-                groupId: this.groupId,
-                memberId: this.memberId,
-                topic: topicName,
-                partition,
-              })
-              this.cluster.forgetLeaderEpoch(topicName, partition)
-            } else if (action === 'stale-metadata') {
-              const applied = await this.applyFetchLeaderHint(
-                topicName,
-                partition,
-                partitionData.currentLeader,
-                nodeEndpoints
-              )
-
-              // A partition whose hint was usable already knows where to go next round; one whose
-              // hint was dropped, or that never carried one, needs the refresh.
-              needsRefresh = needsRefresh || !applied
-            }
-
-            continue
-          }
-
-          const dropReason = fetchedPartitionDropReason({
-            seeked: this.seekOffset.has(topicName, partition),
-            paused: this.subscriptionState.isPaused(topicName, partition),
-            awaitingValidation: this.positionValidator.isAwaiting(topicName, partition),
-          })
-
-          if (dropReason != null) {
-            this.logger.debug('Dropping fetched partition', {
-              topic: topicName,
-              partition,
-              reason: dropReason,
-            })
-            continue
-          }
-
-          // Guarded on the map being non-empty: in a healthy steady state it always is empty, and
-          // this is the per-partition success path of every fetch round.
-          if (this.consecutiveFetchErrors.size !== 0) {
-            this.consecutiveFetchErrors.delete(`${topicName}|${partition}`)
-          }
-
-          if (preferredReadReplica != null && preferredReadReplica !== -1) {
-            const { nodeId: currentPreferredReadReplica } = preferredReadReplicas[partition] || {}
-            if (currentPreferredReadReplica !== preferredReadReplica) {
-              this.logger.info(`Preferred read replica is now ${preferredReadReplica}`, {
-                groupId: this.groupId,
-                memberId: this.memberId,
-                topic: topicName,
-                partition,
-              })
-            }
-            preferredReadReplicas[partition] = {
-              nodeId: preferredReadReplica,
-              expireAt: Date.now() + this.metadataMaxAge,
-            }
-          }
-
-          const partitionRequestData = topicRequestData.partitions.find(
-            (requested) => requested.partition === partition
-          )
-
-          batches.push(new Batch(topicName, partitionRequestData.fetchOffset, partitionData))
+          const partitionNeedsRefresh = await this.handleFetchedPartition(partitionData, context)
+          needsRefresh = needsRefresh || partitionNeedsRefresh
         }
       }
 
@@ -896,6 +744,238 @@ module.exports = class ConsumerGroup {
     }
   }
 
+  /**
+   * Builds this round's request entries from the node-filtered assignment.
+   *
+   * Three filters decide what is asked for. A partition with no committed offset is left out
+   * because recovering from `OFFSET_OUT_OF_RANGE` clears offsets per partition
+   * (`OffsetManager#clearOffsets`), and a concurrent round would otherwise fetch from an offset
+   * that is being rebuilt - see https://github.com/tulios/kafkajs/pull/570 for the concurrency
+   * that exposed it and https://github.com/tulios/kafkajs/pull/578 for the filter. A paused
+   * partition is left out, and so is one whose position another fetcher is validating: its
+   * position is the thing being checked, so fetching from it would read from an offset this
+   * client is not yet sure still exists.
+   *
+   * @private
+   * @param {import("../../types").TopicPartitions[]} topicPartitions the node-filtered assignment
+   * @returns {{topic: string, partitions: {partition: number, fetchOffset: string,
+   *   currentLeaderEpoch: number, maxBytes: number}[]}[]} one entry per topic with something to
+   *   fetch; a topic whose partitions were all filtered out is absent
+   */
+  buildFetchRequests(topicPartitions) {
+    const committedOffsets = this.offsetManager.committedOffsets()
+    const activeTopicPartitions = this.getActiveTopicPartitions()
+
+    return topicPartitions
+      .map(({ topic, partitions }) => ({
+        topic,
+        partitions: partitions
+          .filter(
+            (partition) =>
+              committedOffsets[topic][partition] != null &&
+              activeTopicPartitions[topic].has(partition) &&
+              !this.positionValidator.isAwaiting(topic, partition)
+          )
+          .map((partition) => ({
+            partition,
+            fetchOffset: this.offsetManager.nextOffset(topic, partition).toString(),
+            // The client's current view of this partition's leader epoch, so the broker can
+            // reject a request built on metadata that has since moved. -1 when the cache has
+            // not seen the partition, which is the field's own wire default and means
+            // "do not fence".
+            currentLeaderEpoch: this.cluster.leaderEpoch(topic, partition),
+            maxBytes: this.maxBytesPerPartition,
+          })),
+      }))
+      .filter(({ partitions }) => partitions.length)
+  }
+
+  /**
+   * Resolves the topic ids for one round's requests, all-or-nothing.
+   *
+   * A fetch goes out keyed by id only when every topic in it has one, otherwise the whole request
+   * falls back to the last version keyed by name. This is the rule the Java consumer applies, and
+   * it avoids splitting one round into two requests at two versions. No extra metadata refresh is
+   * issued for a missing id: the round already refreshed if necessary, and an id is only missing
+   * inside a delete/recreate window.
+   *
+   * @private
+   * @param {{topic: string}[]} requests this round's request entries
+   * @returns {{topicIds: Map<string, string>|undefined, maxVersion: number|undefined}} the
+   *   name -> id map and no ceiling when every topic has an id; `undefined` and the last
+   *   name-keyed version when any is missing
+   */
+  resolveTopicIds(requests) {
+    const topicIds = new Map()
+
+    for (const { topic } of requests) {
+      const topicId = this.cluster.topicId(topic)
+
+      if (topicId === undefined) {
+        return { topicIds: undefined, maxVersion: FETCH_TOPIC_NAMES_MAX_VERSION }
+      }
+
+      topicIds.set(topic, topicId)
+    }
+
+    return { topicIds, maxVersion: undefined }
+  }
+
+  /**
+   * Recovers from the fetch response's top-level error code, or rethrows it.
+   *
+   * @private
+   * @param {number} errorCode the response's top-level code, already known to be a failure
+   * @returns {Promise<void>} resolves once the round can be abandoned with no batches
+   * @throws {Error} the error the code maps to, for a code with no classification: that keeps the
+   *   recovery path a request-level fetch error has always taken - refresh and rejoin for stale
+   *   metadata, crash for anything else.
+   */
+  async handleFetchTopLevelError(errorCode) {
+    if (topLevelFetchAction(errorCode) === 'throw') {
+      throw createErrorFromCode(errorCode)
+    }
+
+    this.logger.warn('Fetch response carried a top-level error, refreshing metadata', {
+      groupId: this.groupId,
+      memberId: this.memberId,
+      errorCode,
+    })
+
+    await this.cluster.refreshMetadata()
+  }
+
+  /**
+   * Turns one partition of a fetch response into a batch, or applies the recovery its error code
+   * asks for.
+   *
+   * A partition-level error costs only its own partition: no batch is produced, the offset is left
+   * where it was, and a rejoin is never triggered by it. A code with no classification is thrown,
+   * which is the behaviour every version had.
+   *
+   * The batch is appended to `context.batches` rather than returned, so that the success path of
+   * the consume hot path allocates nothing but the batch itself.
+   *
+   * @private
+   * @param {object} partitionData one decoded partition of the response
+   * @param {object} context this topic's state for the round
+   * @param {string} context.topicName
+   * @param {object} context.topicRequestData the request entry this topic was fetched with
+   * @param {object} context.preferredReadReplicas this topic's preferred-replica map, written here
+   * @param {object[]} [context.nodeEndpoints] the response's KIP-951 endpoints, if any
+   * @param {import('./batch')[]} context.batches the round's batches, appended to
+   * @param {boolean} context.debug whether debug logging is on for this round
+   * @returns {Promise<boolean>} whether this partition asks for a metadata refresh
+   * @throws {Error} the error an unclassified partition code maps to
+   */
+  async handleFetchedPartition(partitionData, context) {
+    const { topicName, topicRequestData, preferredReadReplicas, nodeEndpoints, batches, debug } =
+      context
+    const { partition, errorCode, preferredReadReplica } = partitionData
+
+    if (debug) {
+      this.logger.debug('Fetch response partition', {
+        topic: topicName,
+        partition,
+        errorCode,
+        highWatermark: partitionData.highWatermark,
+        messageCount: partitionData.messages ? partitionData.messages.length : 0,
+      })
+    }
+
+    if (failure(errorCode)) {
+      const action = partitionFetchAction(errorCode)
+
+      if (action === 'throw') {
+        throw createErrorFromCode(errorCode)
+      }
+
+      this.recordFetchError(topicName, partition, errorCode)
+
+      if (action === 'offset-out-of-range') {
+        // The existing recovery, for this partition only: drop the preferred replica if one is
+        // set, otherwise reset per the topic's own fromBeginning.
+        await this.recoverFromOffsetOutOfRange({ topic: topicName, partition })
+      } else if (action === 'skip-and-forget-epoch') {
+        // The client is ahead of this broker. Defending the cached epoch would make every retry
+        // resend the same rejected value; forgetting it makes the next request carry -1 and the
+        // next metadata response converge. Warned every time, because this rewrites cached
+        // cluster state and usually clears on the very next round.
+        this.logger.warn('Broker does not know the leader epoch we sent, forgetting it', {
+          groupId: this.groupId,
+          memberId: this.memberId,
+          topic: topicName,
+          partition,
+        })
+        this.cluster.forgetLeaderEpoch(topicName, partition)
+      } else if (action === 'stale-metadata') {
+        const applied = await this.applyFetchLeaderHint(
+          topicName,
+          partition,
+          partitionData.currentLeader,
+          nodeEndpoints
+        )
+
+        // A partition whose hint was usable already knows where to go next round; one whose hint
+        // was dropped, or that never carried one, needs the refresh.
+        return !applied
+      }
+
+      return false
+    }
+
+    const dropReason = fetchedPartitionDropReason(
+      this.seekOffset.size !== 0 && this.seekOffset.has(topicName, partition),
+      this.subscriptionState.isPaused(topicName, partition),
+      this.positionValidator.isAwaiting(topicName, partition)
+    )
+
+    if (dropReason != null) {
+      this.logger.debug('Dropping fetched partition', {
+        topic: topicName,
+        partition,
+        reason: dropReason,
+      })
+      return false
+    }
+
+    // Guarded on the map being non-empty: in a healthy steady state it always is empty, and this
+    // is the per-partition success path of every fetch round.
+    if (this.consecutiveFetchErrors.size !== 0) {
+      this.consecutiveFetchErrors.delete(`${topicName}|${partition}`)
+    }
+
+    if (preferredReadReplica != null && preferredReadReplica !== -1) {
+      const { nodeId: currentPreferredReadReplica } = preferredReadReplicas[partition] || {}
+      if (currentPreferredReadReplica !== preferredReadReplica) {
+        this.logger.info(`Preferred read replica is now ${preferredReadReplica}`, {
+          groupId: this.groupId,
+          memberId: this.memberId,
+          topic: topicName,
+          partition,
+        })
+      }
+      preferredReadReplicas[partition] = {
+        nodeId: preferredReadReplica,
+        expireAt: Date.now() + this.metadataMaxAge,
+      }
+    }
+
+    const partitionRequestData = topicRequestData.partitions.find(
+      (requested) => requested.partition === partition
+    )
+
+    batches.push(new Batch(topicName, partitionRequestData.fetchOffset, partitionData))
+    return false
+  }
+
+  /**
+   * Recovers from an error thrown by a fetch round, or rethrows it.
+   * @param {Error} e
+   * @returns {Promise<void>}
+   * @throws {Error} `e` itself when it is not one of the errors this method knows how to recover
+   *   from
+   */
   async recoverFromFetch(e) {
     if (STALE_METADATA_ERRORS.includes(e.type) || e.name === 'KafkaJSTopicMetadataNotLoaded') {
       this.logger.debug('Stale cluster metadata, refreshing...', {
@@ -1167,12 +1247,13 @@ module.exports = class ConsumerGroup {
    * @see https://cwiki.apache.org/confluence/display/KAFKA/KIP-320%3A+Allow+fetchers+to+detect+and+handle+log+truncation
    * @param {import("../../types").TopicPartitions[]} topicPartitions the node-filtered assignment,
    *   which is a superset of what the request keeps: it also contains partitions with no committed
-   *   offset, whose tracked epoch was cleared with that offset, so they answer 'validated' with no
-   *   request and are safe to touch.
+   *   offset, which are skipped here - there is no position to check, and reading one would create
+   *   a resolved offset holding `undefined`.
    * @returns {Promise<void>}
    */
   async validatePositions(topicPartitions) {
     let awaiting
+    const committedOffsets = this.offsetManager.committedOffsets()
 
     try {
       for (const { topic, partitions } of topicPartitions) {
@@ -1180,11 +1261,25 @@ module.exports = class ConsumerGroup {
           // A queued user seek is newer, more specific intent than anything validation could
           // conclude. seekOffsets() has just popped this round's seeks, so the only entries this
           // can find are seeks that arrived while validation itself was awaiting.
-          if (this.seekOffset.has(topic, partition)) {
+          if (this.seekOffset.size !== 0 && this.seekOffset.has(topic, partition)) {
             continue
           }
 
           const currentLeaderEpoch = this.cluster.leaderEpoch(topic, partition)
+
+          // Asked before anything is read or allocated: the steady state of a round is that every
+          // partition is already validated against this epoch, and that round must cost nothing.
+          if (!this.positionValidator.needsValidation(topic, partition, currentLeaderEpoch)) {
+            continue
+          }
+
+          // The same filter the request build applies. `nextOffset()` writes the committed offset
+          // into the resolved ones, so calling it for a partition whose offset was just cleared
+          // would store `undefined` there and break the next commit.
+          if (committedOffsets[topic][partition] == null) {
+            continue
+          }
+
           const trackedEpoch = this.offsetManager.lastConsumedEpoch(topic, partition)
           // No early return while validation is disabled: `request()` still answers 'validated'
           // rather than 'unchanged' for a partition whose leader epoch moved, and the
@@ -1223,10 +1318,12 @@ module.exports = class ConsumerGroup {
         error: e.message,
       })
     } finally {
-      // The invariant: no partition may be left awaiting with no request in flight.
-      for (const { topic, partition, currentLeaderEpoch } of awaiting || []) {
+      // The invariant: no partition may be left awaiting with no request in flight. Carries the
+      // generation each entry was requested under, so a sweep that runs after a rebalance cannot
+      // record another fetcher's fresh entry as validated against this round's epoch.
+      for (const { topic, partition, currentLeaderEpoch, generation } of awaiting || []) {
         if (this.positionValidator.isAwaiting(topic, partition)) {
-          this.positionValidator.markValidated(topic, partition, currentLeaderEpoch)
+          this.positionValidator.markValidated(topic, partition, currentLeaderEpoch, generation)
         }
       }
     }
@@ -1351,15 +1448,20 @@ module.exports = class ConsumerGroup {
       })
 
       for (const { topic, entries } of pending) {
-        for (const { partition, currentLeaderEpoch } of entries) {
+        for (const { partition, currentLeaderEpoch, generation } of entries) {
           if (!this.positionValidator.isAwaiting(topic, partition)) {
             continue
           }
 
           // The epoch is cleared and the offset left alone: the partition is fetched from where it
-          // is, unvalidated, and validates again once it consumes a record.
-          this.offsetManager.forgetConsumedEpoch(topic, partition)
-          this.positionValidator.markValidated(topic, partition, currentLeaderEpoch)
+          // is, unvalidated, and validates again once it consumes a record. Both only happen when
+          // the mark applied - on a stale generation this round's exhaustion says nothing about
+          // the partition the current assignment holds.
+          if (
+            this.positionValidator.markValidated(topic, partition, currentLeaderEpoch, generation)
+          ) {
+            this.offsetManager.forgetConsumedEpoch(topic, partition)
+          }
         }
       }
     }
@@ -1393,6 +1495,14 @@ module.exports = class ConsumerGroup {
         const reply = replies.get(`${topic}|${entry.partition}`)
 
         if (!reply) {
+          continue
+        }
+
+        // The partition lost its committed offset while the request was in flight - a concurrent
+        // OffsetOutOfRange recovery cleared it. There is no position left to compare the reply
+        // with, and reading one would store `undefined` as its resolved offset. Left to the
+        // caller's awaiting sweep, like a partition the reply never mentioned.
+        if (this.offsetManager.committedOffsets()[topic][entry.partition] == null) {
           continue
         }
 
@@ -1463,14 +1573,18 @@ module.exports = class ConsumerGroup {
 
   /**
    * Moves every partition of these entries on without a reply, leaving their tracked epochs alone.
+   *
+   * Each entry is marked under the generation it was requested with, so an entry belonging to a
+   * previous assignment is a no-op rather than a claim about the current one.
+   *
    * @private
    * @param {{topic: string, entries: object[]}[]} topics
    * @returns {void}
    */
   markAllValidated(topics) {
     for (const { topic, entries } of topics) {
-      for (const { partition, currentLeaderEpoch } of entries) {
-        this.positionValidator.markValidated(topic, partition, currentLeaderEpoch)
+      for (const { partition, currentLeaderEpoch, generation } of entries) {
+        this.positionValidator.markValidated(topic, partition, currentLeaderEpoch, generation)
       }
     }
   }

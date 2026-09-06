@@ -54,7 +54,7 @@ describe('Producer', () => {
     })
   })
 
-  // LZ4 and ZSTD are built in from Phase 2 — when available they must round-trip, and when the
+  // LZ4 and ZSTD are built in — when available they must round-trip, and when the
   // platform cannot provide them the error must still be the documented KafkaJSNotImplemented.
   const builtInCodecs = [
     { name: 'lz4', codec: Compression.Types.LZ4, available: hasLz4 },

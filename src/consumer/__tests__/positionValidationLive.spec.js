@@ -15,6 +15,10 @@ const {
   startBroker,
 } = require('testHelpers')
 
+// Gated because both scenarios move leadership on the shared cluster, which is not safe alongside
+// the other consumer specs. Run them one at a time, each in its own foreground cluster:
+// `npm run test:e2e:leader-move` and `npm run test:e2e:log-truncation` - the truncation scenario
+// stops and starts brokers, so it must run alone.
 const describeLeaderMove = process.env.LEADER_MOVE_E2E === '1' ? describe : describe.skip
 
 // Produced after the move is confirmed, so every one of them is delivered post-move.

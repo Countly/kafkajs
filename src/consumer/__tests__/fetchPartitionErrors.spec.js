@@ -314,9 +314,12 @@ describe('Consumer > fetch partition error contract', () => {
     it('names the reason a fetched partition was dropped', async () => {
       const { group, logger, setResponse } = await createFetchGroup({ partitions: [0] })
       const debug = jest.spyOn(logger, 'debug')
-      // A seek queued between the request going out and its response arriving: the response is
-      // for a position the consumer no longer wants, which is exactly what the drop reason names.
-      jest.spyOn(group.seekOffset, 'has').mockReturnValue(true)
+      // A seek queued between the round's drain and the response arriving: the response is for a
+      // position the consumer no longer wants, which is exactly what the drop reason names. The
+      // queue is real, so the `size` guard on the drop check sees it; only the drain is stubbed
+      // out, standing in for a seek that arrived after it ran.
+      group.seekOffset.set(TOPIC, 0, '5')
+      jest.spyOn(group.seekOffset, 'pop').mockReturnValue(undefined)
 
       setResponse(fetchResponse([{ partition: 0, errorCode: 0, records: true }]))
       const batches = await group.fetch(NODE_ID)

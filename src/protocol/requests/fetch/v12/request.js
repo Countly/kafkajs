@@ -71,7 +71,7 @@ module.exports = ({
 })
 
 const encodeForgottenTopics = ({ topic, partitions }) =>
-  new Encoder().writeUVarIntString(topic).writeUVarIntArray(partitions).writeTaggedFields()
+  new Encoder().writeUVarIntString(topic).writeUVarIntArray(partitions, 'int32').writeTaggedFields()
 
 const encodeTopic = ({ topic, partitions }) =>
   new Encoder()

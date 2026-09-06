@@ -93,13 +93,22 @@ module.exports = class OffsetManager {
   }
 
   /**
+   * The offset this partition would be fetched from next, seeding the resolved offset from the
+   * committed one the first time.
+   *
+   * The seeding is skipped when there is no committed offset: writing one in would leave an own,
+   * enumerable key holding `undefined`, which `countResolvedOffsets()` and `uncommittedOffsets()`
+   * both walk. Such a partition is not fetched this round anyway.
+   *
    * @param {string} topic
    * @param {number} partition
-   * @returns {Long}
+   * @returns {Long} the committed offset, or 0 when there is none or it is invalid
    */
   nextOffset(topic, partition) {
-    if (!this.resolvedOffsets[topic][partition]) {
-      this.resolvedOffsets[topic][partition] = this.committedOffsets()[topic][partition]
+    const committedOffset = this.committedOffsets()[topic][partition]
+
+    if (!this.resolvedOffsets[topic][partition] && committedOffset != null) {
+      this.resolvedOffsets[topic][partition] = committedOffset
     }
 
     let offset = this.resolvedOffsets[topic][partition]
@@ -196,6 +205,11 @@ module.exports = class OffsetManager {
     const committedOffsets = this.committedOffsets()
 
     const subtractOffsets = (resolvedOffset, committedOffset) => {
+      // A key with no value is "nothing resolved", not an offset: `Long.fromValue` would throw.
+      if (resolvedOffset == null) {
+        return Long.fromValue(0)
+      }
+
       const resolvedOffsetLong = Long.fromValue(resolvedOffset)
       return isInvalidOffset(committedOffset)
         ? resolvedOffsetLong
@@ -316,6 +330,7 @@ module.exports = class OffsetManager {
       (topic) =>
       ({ partition, offset }) => {
         return (
+          offset != null &&
           offset !== this.committedOffsets()[topic][partition] &&
           Long.fromValue(offset).greaterThanOrEqual(0)
         )

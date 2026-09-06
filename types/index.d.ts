@@ -1054,7 +1054,10 @@ export type ConsumerCommitOffsetsEvent = InstrumentationEvent<{
   memberId: string
   groupGenerationId: number
   groupInstanceId: string | null
-  topics: TopicOffsets[]
+  topics: Array<{
+    topic: string
+    partitions: Array<PartitionOffset & { leaderEpoch?: number }>
+  }>
 }>
 export interface IMemberAssignment {
   [key: string]: number[]
@@ -1107,7 +1110,10 @@ export type ConsumerReceivedUnsubcribedTopicsEvent = InstrumentationEvent<{
 }>
 
 export interface OffsetsByTopicPartition {
-  topics: TopicOffsets[]
+  topics: Array<{
+    topic: string
+    partitions: Array<PartitionOffset & { leaderEpoch?: number }>
+  }>
 }
 
 export interface EachMessagePayload {

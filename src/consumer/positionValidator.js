@@ -100,16 +100,54 @@ module.exports = class PositionValidator {
    * answered: a leader that cannot serve the API, a retry budget that ran out, a non-retriable
    * error, or an unexpected failure inside the validation round.
    *
+   * Generation-guarded like `complete()`: an exit that belongs to a previous assignment writes
+   * nothing, so a fetcher finishing its round after a rebalance cannot record another fetcher's
+   * fresh entry as validated against the epoch it observed.
+   *
    * @param {string} topic
    * @param {number} partition
    * @param {number} currentLeaderEpoch
-   * @returns {void}
+   * @param {number} [generation] the generation `request()` returned for this partition; defaults
+   *   to the current one, which is the caller that has no round to be stale against
+   * @returns {boolean} whether it was recorded; `false` means the generation was stale and nothing
+   *   was written, which is also the caller's signal to leave the partition's tracked epoch alone
    */
-  markValidated(topic, partition, currentLeaderEpoch) {
+  markValidated(topic, partition, currentLeaderEpoch, generation = this.assignmentGeneration) {
+    if (generation !== this.assignmentGeneration) {
+      return false
+    }
+
     this.entries.set(this.getKey(topic, partition), {
       validatedAgainst: currentLeaderEpoch,
       pending: null,
     })
+
+    return true
+  }
+
+  /**
+   * Whether this partition's position has to be examined this round, without allocating anything
+   * beyond the map key.
+   *
+   * The steady state of a fetch round is that nothing needs validating, and this is the check that
+   * keeps that round free of the offset read, the position literal and `request()`'s return
+   * object. `request()` remains the only path into `awaiting`.
+   *
+   * @param {string} topic
+   * @param {number} partition
+   * @param {number} currentLeaderEpoch the cached leader epoch
+   * @returns {boolean} true when the partition is unvalidated or was validated against a different
+   *   epoch; false when it is already validated against this epoch, or a request is in flight for
+   *   it (whoever put it there owns its exit)
+   */
+  needsValidation(topic, partition, currentLeaderEpoch) {
+    const entry = this.entries.get(this.getKey(topic, partition))
+
+    if (!entry) {
+      return true
+    }
+
+    return entry.pending ? false : entry.validatedAgainst !== currentLeaderEpoch
   }
 
   /**
@@ -208,6 +246,10 @@ module.exports = class PositionValidator {
   }
 
   /**
+   * Diagnostic accessor: nothing in the consumer reads it, and the decision it would support is
+   * `needsValidation()`'s. It is kept because the state it reports is the class's whole contract
+   * and is otherwise only observable through a request.
+   *
    * @param {string} topic
    * @param {number} partition
    * @returns {number|undefined} the leader epoch the position was last validated against, or
@@ -216,11 +258,6 @@ module.exports = class PositionValidator {
   validatedAgainst(topic, partition) {
     const entry = this.entries.get(this.getKey(topic, partition))
     return entry ? entry.validatedAgainst : undefined
-  }
-
-  /** @returns {number} the current assignment generation */
-  generation() {
-    return this.assignmentGeneration
   }
 
   /**

@@ -83,6 +83,20 @@ describe('Broker > capped lookup and negotiated version', () => {
       ).toEqual(12)
     })
 
+    test('returns an implemented version, not the broker maximum, when the set has a hole', () => {
+      // A definition whose implemented versions skip 6 and 7. min(best, brokerMax) would answer 7,
+      // for which `protocol({ version })` has no builder.
+      const holed = {
+        versions: ['4', '5', '8'],
+        protocol: ({ version }) => version,
+      }
+
+      expect(
+        selectVersion({ [apiKeys.Fetch]: { minVersion: 4, maxVersion: 7 } }, apiKeys.Fetch, holed)
+      ).toEqual(5)
+      expect(holed.protocol({ version: 5 })).toBeDefined()
+    })
+
     test('throws when the broker advertises nothing usable', () => {
       expect(() => selectVersion({}, apiKeys.Fetch, requests.Fetch)).toThrow(
         'The Kafka server does not support the requested API version'
@@ -121,6 +135,14 @@ describe('Broker > capped lookup and negotiated version', () => {
     // instead of pinning today's implemented ceiling as a literal number, so this stays true
     // however many versions the codec implements - including after a later task extends Fetch
     // toward v18.
+    test('answers null before the broker has negotiated anything', () => {
+      const broker = createBroker()
+      broker.versions = null
+
+      // Documented as total: a caller reads null as "not available here" and degrades.
+      expect(broker.negotiatedVersion(apiKeys.Fetch, requests.Fetch)).toBeNull()
+    })
+
     test('tracks the real Fetch codec inventory, uncapped and capped', () => {
       const broker = createBroker()
       const brokerMax = versions[apiKeys.Fetch].maxVersion
@@ -256,23 +278,6 @@ describe('Broker > capped lookup and negotiated version', () => {
       expect(sentVersions[apiKeys.Fetch]).toEqual(11)
     })
 
-    test('a fetch with no topicIds is still sent at v12 once v18 is registered', async () => {
-      const { broker, sentVersions } = createRecordingBroker({
-        [apiKeys.Fetch]: { minVersion: 4, maxVersion: 18 },
-      })
-
-      await broker.fetch({
-        maxWaitTime: 100,
-        minBytes: 1,
-        maxBytes: 1024,
-        topics: [
-          { topic: 'test-topic', partitions: [{ partition: 0, fetchOffset: '0', maxBytes: 1024 }] },
-        ],
-      })
-
-      expect(sentVersions[apiKeys.Fetch]).toEqual(12)
-    })
-
     test('a produce with no topicIds is sent at v11 against a broker advertising 13', async () => {
       const { broker, sentVersions } = createRecordingBroker({
         [apiKeys.Produce]: { minVersion: 3, maxVersion: 13 },
@@ -295,6 +300,36 @@ describe('Broker > capped lookup and negotiated version', () => {
         ],
       })
 
+      expect(sentVersions[apiKeys.Produce]).toEqual(11)
+    })
+
+    test('a transactional produce is sent at v11 even when every topic has an id', async () => {
+      const { broker, sentVersions } = createRecordingBroker({
+        [apiKeys.Produce]: { minVersion: 3, maxVersion: 13 },
+      })
+
+      await broker.produce({
+        acks: -1,
+        timeout: 30000,
+        transactionalId: 'transactional-id',
+        producerId: '1000',
+        producerEpoch: 0,
+        topicIds: new Map([['test-topic', '01020304-0506-0708-090a-0b0c0d0e0f10']]),
+        topicData: [
+          {
+            topic: 'test-topic',
+            partitions: [
+              {
+                partition: 0,
+                firstSequence: 0,
+                messages: [{ value: 'a', timestamp: 1700000000000 }],
+              },
+            ],
+          },
+        ],
+      })
+
+      // v12 and up imply adding the partition to the transaction, which this client does not do.
       expect(sentVersions[apiKeys.Produce]).toEqual(11)
     })
   })

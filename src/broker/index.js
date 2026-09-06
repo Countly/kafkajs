@@ -259,13 +259,19 @@ module.exports = class Broker {
    * advertises nothing usable answers `null`, which callers read as "this API is not available
    * here" and degrade rather than crash.
    *
-   * @public
+   * @internal
    * @param {number} apiKey
    * @param {object} definition the entry from `requests`
    * @param {{ [apiKey: number]: number }} [maxVersions] the same optional ceiling `lookup` takes
-   * @returns {number|null}
+   * @returns {number|null} the version, or null when this broker cannot serve the API - including
+   *   before it has been connected, when nothing has been negotiated yet
    */
   negotiatedVersion(apiKey, definition, maxVersions) {
+    // Null until the first successful connect(), and `selectVersion` would dereference it.
+    if (this.versions == null) {
+      return null
+    }
+
     try {
       return selectVersion(this.versions, apiKey, definition, maxVersions)
     } catch (e) {
@@ -287,7 +293,7 @@ module.exports = class Broker {
    * `lookupRequest` or `versionsGeneration` is assigned, so it can never outlive the version
    * table it was derived from.
    *
-   * @public
+   * @internal
    * @param {number} apiKey
    * @param {object} definition the entry from `requests`
    * @param {number} [maxVersion] the highest version this request may negotiate
@@ -433,8 +439,11 @@ module.exports = class Broker {
     // caller-supplied-nothing request is v11. This is permanent, not scaffolding: `Broker` is a
     // public type and `broker.produce({ topicData })` must keep working forever. A caller may
     // still ask for something lower.
+    //
+    // A transactional send takes the same floor whatever ids it carries: v12 and above imply
+    // adding the partition to the transaction, which this client does not do yet.
     const cap =
-      topicIds == null
+      topicIds == null || transactionalId != null
         ? Math.min(
             PRODUCE_TOPIC_NAMES_MAX_VERSION,
             maxVersion === undefined ? Infinity : maxVersion
@@ -442,6 +451,8 @@ module.exports = class Broker {
         : maxVersion
 
     const produce = this.lookupRequestWithMax(apiKeys.Produce, requests.Produce, cap)
+    // Asked rather than read off the built request, unlike `fetch`: the id -> name map below has
+    // to exist before the builder runs, because the response codec is bound to it.
     // `negotiatedVersion` with no cap map is the uncapped question; passing a sentinel through the
     // map to mean "no cap" would be a workaround for `undefined`.
     const version =

@@ -14,7 +14,7 @@ describe('Consumer > PositionValidator', () => {
 
       expect(
         validator.request(TOPIC, 0, { offset: '10', trackedEpoch: 4, currentLeaderEpoch: 5 })
-      ).toEqual({ action: 'awaiting', generation: validator.generation() })
+      ).toEqual({ action: 'awaiting', generation: expect.any(Number) })
       expect(validator.isAwaiting(TOPIC, 0)).toBe(true)
       expect(validator.validatedAgainst(TOPIC, 0)).toBeUndefined()
     })
@@ -172,6 +172,12 @@ describe('Consumer > PositionValidator', () => {
     describe('discards, each returning the partition to unvalidated', () => {
       it('when the partition is no longer awaiting', () => {
         const validator = create()
+        // The generation a request would observe right now, so only the awaiting guard can fire.
+        const { generation } = validator.request('another-topic', 0, {
+          offset: '10',
+          trackedEpoch: 4,
+          currentLeaderEpoch: 5,
+        })
 
         expect(
           validator.complete(TOPIC, 0, position('10', 4), {
@@ -179,7 +185,7 @@ describe('Consumer > PositionValidator', () => {
             endOffset: '10',
             leaderEpoch: 4,
             seekQueued: false,
-            generation: validator.generation(), // current, so only the awaiting guard can fire
+            generation,
           })
         ).toEqual({ action: 'discarded', divergingOffset: null, leaderEpoch: -1 })
       })
@@ -338,18 +344,63 @@ describe('Consumer > PositionValidator', () => {
     })
   })
 
+  describe('needsValidation', () => {
+    it('is true for a partition that was never validated', () => {
+      expect(create().needsValidation(TOPIC, 0, 5)).toBe(true)
+    })
+
+    it('is true when the leader epoch moved since the last validation', () => {
+      const validator = create()
+      validator.markValidated(TOPIC, 0, 4)
+
+      expect(validator.needsValidation(TOPIC, 0, 5)).toBe(true)
+    })
+
+    it('is false once validated against that epoch, which is the steady state of a round', () => {
+      const validator = create()
+      validator.markValidated(TOPIC, 0, 5)
+
+      expect(validator.needsValidation(TOPIC, 0, 5)).toBe(false)
+    })
+
+    it('is false while a request is in flight: whoever put it there owns its exit', () => {
+      const validator = create()
+      validator.request(TOPIC, 0, { offset: '10', trackedEpoch: 4, currentLeaderEpoch: 5 })
+
+      expect(validator.needsValidation(TOPIC, 0, 5)).toBe(false)
+      expect(validator.needsValidation(TOPIC, 0, 9)).toBe(false)
+    })
+
+    it('agrees with request(): it is false exactly when request answers unchanged', () => {
+      const validator = create()
+      validator.markValidated(TOPIC, 0, 5)
+
+      expect(validator.needsValidation(TOPIC, 0, 5)).toBe(false)
+      expect(
+        validator.request(TOPIC, 0, { offset: '10', trackedEpoch: 4, currentLeaderEpoch: 5 }).action
+      ).toEqual('unchanged')
+    })
+  })
+
   describe('lifetime', () => {
     it('clear drops every key, stamps a new generation and re-arms validation', () => {
       const validator = create()
+      const observe = () =>
+        validator.request('generation-probe', 0, {
+          offset: '10',
+          trackedEpoch: 4,
+          currentLeaderEpoch: 5,
+        }).generation
+
       validator.markValidated(TOPIC, 0, 5)
       validator.disable()
-      const before = validator.generation()
+      const before = observe()
 
       validator.clear()
 
       expect(validator.validatedAgainst(TOPIC, 0)).toBeUndefined()
       expect(validator.isDisabled()).toBe(false)
-      expect(validator.generation()).not.toEqual(before)
+      expect(observe()).not.toEqual(before)
     })
 
     it('forgetTopic drops exactly that topic partitions', () => {
@@ -371,6 +422,28 @@ describe('Consumer > PositionValidator', () => {
 
       expect(() => validator.forgetTopic(TOPIC)).not.toThrow()
       expect(validator.validatedAgainst('other-topic', 0)).toEqual(5)
+    })
+
+    it('markValidated from a previous assignment writes nothing', () => {
+      const validator = create()
+      // Fetcher A's round puts the partition into validation...
+      const { generation } = validator.request(TOPIC, 0, {
+        offset: '10',
+        trackedEpoch: 4,
+        currentLeaderEpoch: 5,
+      })
+
+      // ...a rebalance drops it, and fetcher B validates it against the new leader epoch.
+      validator.clear()
+      validator.request(TOPIC, 0, { offset: '10', trackedEpoch: 4, currentLeaderEpoch: 9 })
+
+      // A's sweep, retry exhaustion or markAllValidated now runs with the epoch it observed.
+      expect(validator.markValidated(TOPIC, 0, 5, generation)).toBe(false)
+      expect(validator.isAwaiting(TOPIC, 0)).toBe(true)
+      expect(validator.validatedAgainst(TOPIC, 0)).toBeUndefined()
+
+      expect(validator.markValidated(TOPIC, 0, 9)).toBe(true)
+      expect(validator.validatedAgainst(TOPIC, 0)).toEqual(9)
     })
 
     it('every mutation is idempotent per key, so two fetchers cannot corrupt one entry', () => {

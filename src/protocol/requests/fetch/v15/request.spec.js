@@ -1,6 +1,7 @@
 const RequestV15Protocol = require('./request')
 const RequestV14Protocol = require('../v14/request')
 const Decoder = require('../../../decoder')
+const { KafkaJSInvariantViolation } = require('../../../../errors')
 
 const TOPIC_ID = '01020304-0506-0708-090a-0b0c0d0e0f10'
 const args = {
@@ -85,6 +86,65 @@ describe('Protocol > Requests > Fetch > v15', () => {
 
     expect(decoder.readTaggedFields().size).toEqual(0) // no ReplicaState (tag 1), no ClusterId
     expect(decoder.canReadBytes(1)).toBe(false)
+  })
+
+  test('throws rather than encoding an all-zero uuid when a topic has no id', async () => {
+    // The version the client actually negotiates, and the one v16-v18 delegate their encoder to.
+    // `Broker#fetch` caps a request without ids at the last name-keyed version, so reaching here
+    // without one means a caller bypassed that cap - a partial map included.
+    const partial = {
+      ...args,
+      topics: [
+        ...args.topics,
+        {
+          topic: 'unknown-topic',
+          partitions: [{ partition: 0, fetchOffset: '0', maxBytes: 1024 }],
+        },
+      ],
+    }
+
+    const { encode } = RequestV15Protocol(partial)
+
+    await expect(encode()).rejects.toThrow(KafkaJSInvariantViolation)
+    await expect(encode()).rejects.toThrow(/unknown-topic/)
+  })
+
+  test('a non-empty forgottenTopics is keyed by id and carries its partitions as int32s', async () => {
+    const { buffer } = await RequestV15Protocol({
+      ...args,
+      forgottenTopics: [{ topic: 'test-topic', partitions: [0, 3] }],
+    }).encode()
+
+    const decoder = new Decoder(buffer)
+    decoder.readInt32() // maxWaitMs
+    decoder.readInt32() // minBytes
+    decoder.readInt32() // maxBytes
+    decoder.readInt8() //  isolationLevel
+    decoder.readInt32() // sessionId
+    decoder.readInt32() // sessionEpoch
+    decoder.readUVarIntArray((d) => {
+      d.readUuid()
+      d.readUVarIntArray((p) => {
+        p.readInt32()
+        p.readInt32()
+        p.readInt64()
+        p.readInt32()
+        p.readInt64()
+        p.readInt32()
+        p.readTaggedFields()
+      })
+      d.readTaggedFields()
+    })
+
+    const forgotten = decoder.readUVarIntArray((d) => {
+      const topicId = d.readUuid()
+      const partitions = d.readUVarIntArray((p) => p.readInt32())
+      d.readTaggedFields()
+      return { topicId, partitions }
+    })
+
+    expect(forgotten).toEqual([{ topicId: TOPIC_ID, partitions: [0, 3] }])
+    expect(decoder.readUVarIntString()).toEqual('') // rackId, so the decode stayed in step
   })
 
   test('encodes byte-identically to the vector Apache own codec produced', async () => {

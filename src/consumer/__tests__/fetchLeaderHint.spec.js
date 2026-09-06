@@ -382,6 +382,8 @@ describe('Consumer > v11 behaviour is unchanged at v18', () => {
     const [batch] = await group.fetch(NODE_ID)
 
     expect(batch.rawMessages.length).toBeGreaterThan(batch.messages.length)
-    expect(batch.messages.every(({ offset }) => Number(offset) >= 101)).toBe(true)
+    // Named, not counted: `every` is true on an empty array, so a filter that dropped the
+    // committed record too would pass a length-only assertion.
+    expect(batch.messages.map(({ offset }) => offset)).toEqual(['101'])
   })
 })

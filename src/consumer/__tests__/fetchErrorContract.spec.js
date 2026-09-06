@@ -70,32 +70,30 @@ describe('Consumer > fetch error contract', () => {
 
   describe('fetchedPartitionDropReason', () => {
     test('returns null when nothing drops the partition', () => {
-      expect(
-        fetchedPartitionDropReason({ seeked: false, paused: false, awaitingValidation: false })
-      ).toBeNull()
+      expect(fetchedPartitionDropReason(false, false, false)).toBeNull()
     })
 
     test.each([
-      [{ seeked: true, paused: false, awaitingValidation: false }, 'seeked'],
-      [{ seeked: false, paused: true, awaitingValidation: false }, 'paused'],
-      [{ seeked: false, paused: false, awaitingValidation: true }, 'awaiting-validation'],
-    ])('%o drops for %s', (input, reason) => {
-      expect(fetchedPartitionDropReason(input)).toEqual(reason)
+      [[true, false, false], 'seeked'],
+      [[false, true, false], 'paused'],
+      [[false, false, true], 'awaiting-validation'],
+    ])('%o drops for %s', ([seeked, paused, awaitingValidation], reason) => {
+      expect(fetchedPartitionDropReason(seeked, paused, awaitingValidation)).toEqual(reason)
     })
 
     test('the precedence is seeked, then paused, then awaiting validation', () => {
-      expect(
-        fetchedPartitionDropReason({ seeked: true, paused: true, awaitingValidation: true })
-      ).toEqual('seeked')
-      expect(
-        fetchedPartitionDropReason({ seeked: false, paused: true, awaitingValidation: true })
-      ).toEqual('paused')
+      expect(fetchedPartitionDropReason(true, true, true)).toEqual('seeked')
+      expect(fetchedPartitionDropReason(false, true, true)).toEqual('paused')
+    })
+
+    test('takes its three flags positionally, so a fetched partition costs no argument object', () => {
+      expect(fetchedPartitionDropReason.length).toEqual(3)
     })
   })
 
   test('the lookups are module-level constants, not per-call constructions', () => {
     // Keying by number exists so a failing partition costs a Map lookup rather than an Error
-    // construction or a scan of the 134-entry error table. That cost is measured by the phase's
+    // construction or a scan of the 134-entry error table. That cost is measured by the
     // consume benchmark, not here. What this case pins is the *shape* the claim depends on: the
     // module exports four pure functions and **no factory**, so nothing can construct per-call
     // state through this surface. The export-key-set and arity assertions are the two that
@@ -114,7 +112,6 @@ describe('Consumer > fetch error contract', () => {
       'validationPartitionAction',
     ])
 
-    expect(partitionFetchAction(6)).toEqual(partitionFetchAction(6))
     expect(partitionFetchAction.length).toEqual(1) // takes a code, not a factory argument
   })
 })

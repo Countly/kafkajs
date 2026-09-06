@@ -2,6 +2,7 @@ const Encoder = require('../../../encoder')
 const { Fetch: apiKey } = require('../../apiKeys')
 const ISOLATION_LEVEL = require('../../../isolationLevel')
 const { LAST_FETCHED_EPOCH } = require('../v12/request')
+const { requireTopicId } = require('../v13/request')
 
 /**
  * FetchRequest (Version: 15) — flexible, KIP-903
@@ -45,11 +46,14 @@ module.exports = ({
 })
 
 const encodeForgottenTopics = ({ topic, partitions }, topicIds) =>
-  new Encoder().writeUuid(topicIds.get(topic)).writeUVarIntArray(partitions).writeTaggedFields()
+  new Encoder()
+    .writeUuid(requireTopicId(topicIds, topic))
+    .writeUVarIntArray(partitions, 'int32')
+    .writeTaggedFields()
 
 const encodeTopic = ({ topic, partitions }, topicIds) =>
   new Encoder()
-    .writeUuid(topicIds.get(topic))
+    .writeUuid(requireTopicId(topicIds, topic))
     .writeUVarIntArray(partitions.map(encodePartition))
     .writeTaggedFields()
 

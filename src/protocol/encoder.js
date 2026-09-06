@@ -351,12 +351,25 @@ module.exports = class Encoder {
     return this
   }
 
+  /**
+   * Compact array (KIP-482): the element count plus one as an unsigned varint, then the elements.
+   *
+   * Without `type` only sub-encoders are written and everything else is dropped, which is why an
+   * array of raw numbers - a `[]int32` field such as `ForgottenTopicsData.Partitions` - has to say
+   * so explicitly.
+   *
+   * @param {any[]} array
+   * @param {'int32'|'number'|'object'} [type]
+   */
   writeUVarIntArray(array, type) {
     if (type === 'object') {
       this.writeUVarInt(array.length + 1)
       this.writeEncoderArray(array)
     } else if (array === null) {
       this.writeUVarInt(0)
+    } else if (type === 'int32' || type === 'number') {
+      this.writeUVarInt(array.length + 1)
+      array.forEach((value) => this.writeInt32(value))
     } else {
       const objectArray = array.filter((v) => typeof v === 'object')
       this.writeUVarInt(objectArray.length + 1)

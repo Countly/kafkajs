@@ -51,21 +51,23 @@ module.exports = ({
 })
 
 /**
+ * Looks up one topic's id, refusing to encode a request that does not have it.
+ *
+ * Shared with the v15 encoder (which v16-v18 delegate to), so every id-keyed Fetch version carries
+ * the same invariant: topic ids are all-or-nothing per request, and `Broker#fetch` caps a request
+ * without them at the last name-keyed version. Reaching this codec without an id can only mean a
+ * caller bypassed that cap; an all-zero uuid would otherwise go out on the wire silently instead.
+ *
  * @param {Map<string, string>} topicIds
  * @param {string} topic
  * @returns {string} the topic's id
- * @throws {import('../../../../errors').KafkaJSInvariantViolation} when `topic` has no id -
- *   callers (`Broker#fetch`'s v13 cap) never reach this codec without one for every topic, so this
- *   can only mean a caller bypassed that cap; an all-zero uuid would otherwise go out on the wire
- *   silently instead.
+ * @throws {import('../../../../errors').KafkaJSInvariantViolation} when `topic` has no id
  */
 const requireTopicId = (topicIds, topic) => {
   const topicId = topicIds.get(topic)
 
   if (topicId === undefined) {
-    throw new KafkaJSInvariantViolation(
-      `Fetch v13 request is missing a topic id for topic "${topic}"`
-    )
+    throw new KafkaJSInvariantViolation(`Fetch request is missing a topic id for topic "${topic}"`)
   }
 
   return topicId
@@ -74,7 +76,7 @@ const requireTopicId = (topicIds, topic) => {
 const encodeForgottenTopics = ({ topic, partitions }, topicIds) =>
   new Encoder()
     .writeUuid(requireTopicId(topicIds, topic))
-    .writeUVarIntArray(partitions)
+    .writeUVarIntArray(partitions, 'int32')
     .writeTaggedFields()
 
 const encodeTopic = ({ topic, partitions }, topicIds) =>
@@ -98,6 +100,8 @@ const encodePartition = ({
     .writeInt64(logStartOffset)
     .writeInt32(maxBytes)
     .writeTaggedFields()
+
+module.exports.requireTopicId = requireTopicId
 
 module.exports.schema = {
   api: 'Fetch',

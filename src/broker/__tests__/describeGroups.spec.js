@@ -16,7 +16,7 @@ describe('Broker > DescribeGroups', () => {
     groupId = `consumer-group-id-${secureRandom()}`
     topicName = `test-topic-${secureRandom()}`
     // KRaft answers UNKNOWN_TOPIC_OR_PARTITION while a topic is being auto-created; the client only
-    // retries LEADER_NOT_AVAILABLE - Phase 2 fixes the client, see QUARANTINE.md R1. This test is
+    // retries LEADER_NOT_AVAILABLE, see QUARANTINE.md R1. This test is
     // about DescribeGroups, so the subscribed topic is created up front.
     await createTopic({ topic: topicName })
     seedBroker = new Broker({

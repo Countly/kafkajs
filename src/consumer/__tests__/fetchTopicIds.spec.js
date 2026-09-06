@@ -1,18 +1,12 @@
-const Broker = require('../../broker')
-const Connection = require('../../network/connection')
-const Decoder = require('../../protocol/decoder')
 const Encoder = require('../../protocol/encoder')
 const ConsumerGroup = require('../consumerGroup')
 const OffsetManager = require('../offsetManager')
 const InstrumentationEventEmitter = require('../../instrumentation/emitter')
 const apiKeys = require('../../protocol/requests/apiKeys')
-const { responseHeaderVersion } = require('../../protocol/headers')
-const {
-  newLogger,
-  createFakeSocketFactory,
-  respondWithFrame,
-  readRequestHeader,
-} = require('testHelpers')
+const { newLogger, readRequestHeader } = require('testHelpers')
+// The wire decoder and the fake broker are shared with the other fetch specs: two copies of a
+// hand-written request decoder would drift the first time the request layout changes.
+const { apiVersionsBody, decodeFetchRequest, createFakeBroker } = require('./fixtures/fetchHarness')
 
 const TOPIC = 'test-topic'
 const OTHER_TOPIC = 'other-topic'
@@ -20,20 +14,6 @@ const TOPIC_ID = '01020304-0506-0708-090a-0b0c0d0e0f10'
 const OTHER_TOPIC_ID = '11121314-1516-1718-191a-1b1c1d1e1f20'
 const UNKNOWN_TOPIC_ID = '21222324-2526-2728-292a-2b2c2d2e2f30'
 const NODE_ID = 0
-
-/** A v3/v4-shaped ApiVersions body advertising one Fetch range. */
-const apiVersionsBody = (fetchMaxVersion) =>
-  new Encoder()
-    .writeInt16(0)
-    .writeUVarIntArray([
-      new Encoder()
-        .writeInt16(apiKeys.Fetch)
-        .writeInt16(4)
-        .writeInt16(fetchMaxVersion)
-        .writeTaggedFields(),
-    ])
-    .writeInt32(0)
-    .writeTaggedFields().buffer
 
 /**
  * A flexible (v12+) Fetch response body: one empty partition per topic, keyed by whichever of
@@ -69,148 +49,6 @@ const flexibleFetchResponse = (topics) =>
     .writeTaggedFields().buffer
 
 /**
- * Decodes the **last** Fetch request written to the fake socket.
- *
- * The version is read off the request header, because the leading scalars differ by it:
- * `ReplicaId` exists from v0 to v14 and is gone from v15, and topics are keyed by name up to v12
- * and by id from v13. Everything else is identical across v12-v18.
- *
- * Only v12 and above: the header read below always consumes a tag buffer, which a classic
- * (sub-v12) frame does not carry.
- *
- * @param {Buffer[]} writes `state.writes`
- * @returns {{ apiVersion: number, replicaId: number|null, maxWaitMs: number, minBytes: number,
- *   maxBytes: number, isolationLevel: number, sessionId: number, sessionEpoch: number,
- *   topics: {topic: string|null, topicId: string|null, partitions: {partition: number,
- *   currentLeaderEpoch: number, fetchOffset: string, lastFetchedEpoch: number,
- *   logStartOffset: string, maxBytes: number}[]}[], rackId: string }}
- */
-const decodeFetchRequest = (writes) => {
-  const frame = [...writes].reverse().find((w) => readRequestHeader(w).apiKey === apiKeys.Fetch)
-  const { apiVersion } = readRequestHeader(frame)
-
-  // size(4) apiKey(2) apiVersion(2) correlationId(4) clientId then a tag buffer - request header
-  // v2, whose clientId stays an INT16-prefixed string (see src/protocol/request.js).
-  const decoder = new Decoder(frame)
-  decoder.readInt32()
-  decoder.readInt16()
-  decoder.readInt16()
-  decoder.readInt32()
-  decoder.readString()
-  decoder.readTaggedFields()
-
-  const replicaId = apiVersion <= 14 ? decoder.readInt32() : null
-  const maxWaitMs = decoder.readInt32()
-  const minBytes = decoder.readInt32()
-  const maxBytes = decoder.readInt32()
-  const isolationLevel = decoder.readInt8()
-  const sessionId = decoder.readInt32()
-  const sessionEpoch = decoder.readInt32()
-
-  const topics = decoder.readUVarIntArray((d) => {
-    const topic = apiVersion <= 12 ? d.readUVarIntString() : null
-    const topicId = apiVersion >= 13 ? d.readUuid() : null
-    const partitions = d.readUVarIntArray((p) => {
-      const entry = {
-        partition: p.readInt32(),
-        currentLeaderEpoch: p.readInt32(),
-        fetchOffset: p.readInt64().toString(),
-        lastFetchedEpoch: p.readInt32(),
-        logStartOffset: p.readInt64().toString(),
-        maxBytes: p.readInt32(),
-      }
-      p.readTaggedFields()
-      return entry
-    })
-    d.readTaggedFields()
-    return { topic, topicId, partitions }
-  })
-
-  // forgottenTopicsData: this client always sends it empty, so the element reader is never called
-  // and the decode stays in step.
-  decoder.readUVarIntArray(() => {})
-  const rackId = decoder.readUVarIntString()
-  decoder.readTaggedFields()
-
-  return {
-    apiVersion,
-    replicaId,
-    maxWaitMs,
-    minBytes,
-    maxBytes,
-    isolationLevel,
-    sessionId,
-    sessionEpoch,
-    topics,
-    rackId,
-  }
-}
-
-/**
- * Builds a real `Broker` wired to a real `Connection` over the fake socket from `testHelpers`.
- * `answer` receives each outgoing request's header and returns the response body to play back;
- * each response is framed with the header version that request's api key and version imply, so a
- * Fetch above v11 is answered flexibly and ApiVersions stays classic.
- * @param {(header: { apiKey: number, apiVersion: number }) => Buffer} answer
- * @returns {{ broker: Broker, state: { writes: Buffer[] } }}
- */
-const createFakeBroker = (answer) => {
-  const { factory, state } = createFakeSocketFactory()
-  const connection = new Connection({
-    host: '127.0.0.1',
-    port: 9092,
-    logger: newLogger(),
-    socketFactory: factory,
-    clientId: 'test-client',
-    connectionTimeout: 1000,
-    requestTimeout: 1000,
-    enforceRequestTimeout: false,
-  })
-
-  let answered = 0
-  const pump = async () => {
-    while (answered < state.writes.length) {
-      const header = readRequestHeader(state.writes[answered])
-      answered += 1
-      respondWithFrame(
-        state,
-        header.correlationId,
-        responseHeaderVersion(header.apiKey, header.apiVersion),
-        answer(header)
-      )
-    }
-  }
-
-  const connectionPool = {
-    host: '127.0.0.1',
-    port: 9092,
-    sasl: null,
-    generation: 0,
-    connectionTimeout: 1000,
-    isConnected: () => connection.isConnected(),
-    isAuthenticated: () => true,
-    getConnection: async () => {
-      await connection.connect()
-      return connection
-    },
-    getConnectionByRequest: async () => {
-      await connection.connect()
-      return connection
-    },
-    send: async (protocolRequest) => {
-      const promise = connection.send(protocolRequest)
-      await new Promise(setImmediate)
-      await pump()
-      return promise
-    },
-    setVersions: () => {},
-    destroy: async () => connection.disconnect(),
-  }
-
-  return { broker: new Broker({ connectionPool, logger: newLogger() }), state }
-}
-
-/**
  * Builds a `ConsumerGroup` whose join/sync dance is skipped -- `subscriptionState` and
  * `offsetManager` are primed directly -- over a real `Broker` on the fake socket, so every hop
  * from version negotiation through the Fetch codec and back is real.
@@ -234,7 +72,7 @@ const createGroup = async ({
   respond,
 }) => {
   const { broker, state } = createFakeBroker((header) =>
-    header.apiKey === apiKeys.ApiVersions ? apiVersionsBody(fetchMaxVersion) : respond()
+    header.apiKey === apiKeys.ApiVersions ? apiVersionsBody(fetchMaxVersion, false) : respond()
   )
   await broker.connect()
 
@@ -479,7 +317,7 @@ describe('Consumer > fetch topic ids', () => {
   test('an unknown id is mapped by Broker#fetch itself, with no consumer group involved', async () => {
     const { broker } = createFakeBroker((header) =>
       header.apiKey === apiKeys.ApiVersions
-        ? apiVersionsBody(18)
+        ? apiVersionsBody(18, false)
         : flexibleFetchResponse([{ topicId: OTHER_TOPIC_ID }])
     )
     await broker.connect()
@@ -499,7 +337,7 @@ describe('Consumer > fetch topic ids', () => {
   test('a mapped id leaves no topicId behind, so the decoded shape is unchanged at every version', async () => {
     const { broker } = createFakeBroker((header) =>
       header.apiKey === apiKeys.ApiVersions
-        ? apiVersionsBody(18)
+        ? apiVersionsBody(18, false)
         : flexibleFetchResponse([{ topicId: TOPIC_ID }])
     )
     await broker.connect()
@@ -517,10 +355,28 @@ describe('Consumer > fetch topic ids', () => {
     expect(Object.keys(responses[0]).sort()).toEqual(['partitions', 'topicName'])
   })
 
-  test('the codecs stay silent: nothing is logged from inside the protocol layer', async () => {
+  test('the codecs stay silent: no Fetch codec can log, and none holds per-request state', () => {
+    // Read as source, because a logger call added to a codec is only visible in the code: the
+    // decision to warn about a topic id the request never asked for belongs to the caller.
+    const fs = require('fs')
+    const path = require('path')
+    const dir = path.join(__dirname, '../../protocol/requests/fetch')
+    const codecs = [12, 13, 14, 15, 16, 17, 18].flatMap((version) =>
+      ['request.js', 'response.js'].map((file) => path.join(dir, `v${version}`, file))
+    )
+
+    for (const file of codecs) {
+      const source = fs
+        .readFileSync(file, 'utf8')
+        .replace(/\/\*[\s\S]*?\*\//g, '')
+        .replace(/\/\/.*$/gm, '')
+      expect({ file, mentionsLogger: /logger/i.test(source) }).toEqual({
+        file,
+        mentionsLogger: false,
+      })
+    }
+
     const responseV13 = require('../../protocol/requests/fetch/v13/response')
-    // A codec has no logger to log with, and no per-request closure to hold one.
-    expect(Object.keys(responseV13)).toEqual(expect.arrayContaining(['decode', 'parse']))
     expect(responseV13.parse).toBe(require('../../protocol/requests/fetch/v12/parse').parse)
   })
 })

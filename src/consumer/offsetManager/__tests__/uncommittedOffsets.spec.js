@@ -51,4 +51,22 @@ describe('Consumer > OffsetMananger > uncommittedOffsets', () => {
       ],
     })
   })
+
+  it('tolerates a resolved offset key that holds no offset', () => {
+    // Whatever creates it, a key with no value is "nothing resolved": both walkers key off
+    // Object.keys, and feeding an absent value to Long is a TypeError, which is not retriable.
+    offsetManager.resolvedOffsets[topic1][0] = undefined
+
+    expect(offsetManager.uncommittedOffsets()).toEqual({ topics: [] })
+    expect(offsetManager.countResolvedOffsets().toString()).toEqual('0')
+  })
+
+  it('nextOffset does not create a resolved offset for a partition with no committed one', () => {
+    expect(offsetManager.nextOffset(topic1, 0).toString()).toEqual('0')
+    expect(Object.keys(offsetManager.resolvedOffsets[topic1])).toEqual([])
+
+    offsetManager.committedOffsets()[topic1][0] = '7'
+    expect(offsetManager.nextOffset(topic1, 0).toString()).toEqual('7')
+    expect(offsetManager.resolvedOffsets[topic1][0]).toEqual('7')
+  })
 })

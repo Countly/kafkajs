@@ -101,13 +101,15 @@ const validationPartitionAction = (errorCode) => {
  * queued seek is the newest user intent, a pause is standing user intent, and a partition awaiting
  * position validation should not have been in the request at all (that check is defensive).
  *
- * @param {object} state
- * @param {boolean} state.seeked a `seek()` is queued for this partition
- * @param {boolean} state.paused the partition is paused
- * @param {boolean} state.awaitingValidation the partition's position is being validated
+ * Positional rather than named, because it is called once per fetched partition per round and a
+ * named-argument object would be one allocation per call on the consume hot path.
+ *
+ * @param {boolean} seeked a `seek()` is queued for this partition
+ * @param {boolean} paused the partition is paused
+ * @param {boolean} awaitingValidation the partition's position is being validated
  * @returns {'seeked'|'paused'|'awaiting-validation'|null}
  */
-const fetchedPartitionDropReason = ({ seeked, paused, awaitingValidation }) => {
+const fetchedPartitionDropReason = (seeked, paused, awaitingValidation) => {
   if (seeked) return 'seeked'
   if (paused) return 'paused'
   if (awaitingValidation) return 'awaiting-validation'

@@ -18,6 +18,7 @@ const FRESH = ['localhost:9192']
 const compose = (...args) =>
   execFileSync('docker', ['compose', '-f', COMPOSE_FILE, ...args], { stdio: 'pipe' })
 
+// Needs this spec's own compose file and a cluster to itself: `npm run test:e2e:rebootstrap`.
 const enabled = process.env.REBOOTSTRAP_E2E === '1'
 const describeLive = enabled ? describe : describe.skip
 

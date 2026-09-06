@@ -26,7 +26,7 @@ describe('Utils > arrayDiff', () => {
 })
 
 describe('equivalence with the indexOf implementation', () => {
-  // The reference is the pre-Phase-2 body, kept here so the Set rewrite is provably behavior-
+  // The reference is the original indexOf body, kept here so the Set rewrite is provably behavior-
   // preserving. Set#has uses SameValueZero and indexOf uses strict equality; they differ only
   // for NaN, which never appears in a topic name, partition id or broker id.
   const referenceDiff = (a, b) => {
