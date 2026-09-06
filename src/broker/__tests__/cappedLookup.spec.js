@@ -185,4 +185,92 @@ describe('Broker > capped lookup and negotiated version', () => {
       ).toEqual(11)
     })
   })
+
+  describe('the fetch cap defends itself', () => {
+    /**
+     * A `Broker` whose pool records the version of every request it is asked to send and answers
+     * with an empty decoded body, so a case can assert which version the selection rule picked
+     * without a socket. Built on this file's `createBroker` stub pool.
+     * @param {import("../../../types").ApiVersions} versions the broker's advertised ranges
+     * @returns {{ broker: import('../index'), sentVersions: {[apiKey: number]: number} }}
+     */
+    const createRecordingBroker = (versions) => {
+      const sentVersions = {}
+      const connectionPool = {
+        host: '127.0.0.1',
+        port: 9092,
+        sasl: null,
+        generation: 0,
+        connectionTimeout: 1000,
+        isConnected: () => true,
+        isAuthenticated: () => true,
+        setVersions: () => {},
+        destroy: async () => {},
+        getConnectionByRequest: async () => ({}),
+        send: async (protocolRequest) => {
+          sentVersions[protocolRequest.request.apiKey] = protocolRequest.request.apiVersion
+          // Nothing decodes here: the assertion is about the version that was selected, and a real
+          // response would need a version-specific fixture per case.
+          return { responses: [], topics: [] }
+        },
+      }
+
+      const broker = new Broker({ connectionPool, logger: newLogger(), versions })
+      broker.lookupRequest = lookup(versions)
+      broker.versionsGeneration = 0
+      return { broker, sentVersions }
+    }
+
+    test('a fetch with no topicIds is sent at v12 against a broker advertising 18', async () => {
+      const { broker, sentVersions } = createRecordingBroker({
+        [apiKeys.Fetch]: { minVersion: 4, maxVersion: 18 },
+      })
+
+      await broker.fetch({
+        maxWaitTime: 100,
+        minBytes: 1,
+        maxBytes: 1024,
+        topics: [
+          { topic: 'test-topic', partitions: [{ partition: 0, fetchOffset: '0', maxBytes: 1024 }] },
+        ],
+      })
+
+      expect(sentVersions[apiKeys.Fetch]).toEqual(12)
+    })
+
+    test('an explicit lower maxVersion still wins over the cap', async () => {
+      const { broker, sentVersions } = createRecordingBroker({
+        [apiKeys.Fetch]: { minVersion: 4, maxVersion: 18 },
+      })
+
+      await broker.fetch({
+        maxWaitTime: 100,
+        minBytes: 1,
+        maxBytes: 1024,
+        maxVersion: 11,
+        topics: [
+          { topic: 'test-topic', partitions: [{ partition: 0, fetchOffset: '0', maxBytes: 1024 }] },
+        ],
+      })
+
+      expect(sentVersions[apiKeys.Fetch]).toEqual(11)
+    })
+
+    test('a fetch with no topicIds is still sent at v12 once v18 is registered', async () => {
+      const { broker, sentVersions } = createRecordingBroker({
+        [apiKeys.Fetch]: { minVersion: 4, maxVersion: 18 },
+      })
+
+      await broker.fetch({
+        maxWaitTime: 100,
+        minBytes: 1,
+        maxBytes: 1024,
+        topics: [
+          { topic: 'test-topic', partitions: [{ partition: 0, fetchOffset: '0', maxBytes: 1024 }] },
+        ],
+      })
+
+      expect(sentVersions[apiKeys.Fetch]).toEqual(12)
+    })
+  })
 })

@@ -293,6 +293,175 @@ const versions = {
       requestTimeout: requestTimeout(maxWaitTime),
     }
   },
+  14: ({
+    replicaId = REPLICA_ID,
+    isolationLevel = ISOLATION_LEVEL.READ_COMMITTED,
+    sessionId = 0,
+    sessionEpoch = -1,
+    forgottenTopics = [],
+    maxWaitTime,
+    minBytes,
+    maxBytes,
+    topics,
+    topicIds,
+    rackId,
+    checkCrcs = true,
+  }) => {
+    const request = require('./v14/request')
+    const response = require('./v14/response')
+    return {
+      request: request({
+        replicaId,
+        isolationLevel,
+        sessionId,
+        sessionEpoch,
+        forgottenTopics,
+        maxWaitTime,
+        minBytes,
+        maxBytes,
+        topics,
+        topicIds,
+        rackId,
+      }),
+      response: withOptions(response, { checkCrcs }),
+      requestTimeout: requestTimeout(maxWaitTime),
+    }
+  },
+  // v15 replaces the top-level ReplicaId with the replica-only ReplicaState tag (KIP-903): the
+  // request builder below has no such field, so replicaId is kept in the destructured parameter
+  // list (with its usual default) but deliberately not forwarded.
+  15: ({
+    replicaId = REPLICA_ID,
+    isolationLevel = ISOLATION_LEVEL.READ_COMMITTED,
+    sessionId = 0,
+    sessionEpoch = -1,
+    forgottenTopics = [],
+    maxWaitTime,
+    minBytes,
+    maxBytes,
+    topics,
+    topicIds,
+    rackId,
+    checkCrcs = true,
+  }) => {
+    const request = require('./v15/request')
+    const response = require('./v15/response')
+    return {
+      request: request({
+        isolationLevel,
+        sessionId,
+        sessionEpoch,
+        forgottenTopics,
+        maxWaitTime,
+        minBytes,
+        maxBytes,
+        topics,
+        topicIds,
+        rackId,
+      }),
+      response: withOptions(response, { checkCrcs }),
+      requestTimeout: requestTimeout(maxWaitTime),
+    }
+  },
+  16: ({
+    replicaId = REPLICA_ID,
+    isolationLevel = ISOLATION_LEVEL.READ_COMMITTED,
+    sessionId = 0,
+    sessionEpoch = -1,
+    forgottenTopics = [],
+    maxWaitTime,
+    minBytes,
+    maxBytes,
+    topics,
+    topicIds,
+    rackId,
+    checkCrcs = true,
+  }) => {
+    const request = require('./v16/request')
+    const response = require('./v16/response')
+    return {
+      request: request({
+        isolationLevel,
+        sessionId,
+        sessionEpoch,
+        forgottenTopics,
+        maxWaitTime,
+        minBytes,
+        maxBytes,
+        topics,
+        topicIds,
+        rackId,
+      }),
+      response: withOptions(response, { checkCrcs }),
+      requestTimeout: requestTimeout(maxWaitTime),
+    }
+  },
+  17: ({
+    replicaId = REPLICA_ID,
+    isolationLevel = ISOLATION_LEVEL.READ_COMMITTED,
+    sessionId = 0,
+    sessionEpoch = -1,
+    forgottenTopics = [],
+    maxWaitTime,
+    minBytes,
+    maxBytes,
+    topics,
+    topicIds,
+    rackId,
+    checkCrcs = true,
+  }) => {
+    const request = require('./v17/request')
+    const response = require('./v17/response')
+    return {
+      request: request({
+        isolationLevel,
+        sessionId,
+        sessionEpoch,
+        forgottenTopics,
+        maxWaitTime,
+        minBytes,
+        maxBytes,
+        topics,
+        topicIds,
+        rackId,
+      }),
+      response: withOptions(response, { checkCrcs }),
+      requestTimeout: requestTimeout(maxWaitTime),
+    }
+  },
+  18: ({
+    replicaId = REPLICA_ID,
+    isolationLevel = ISOLATION_LEVEL.READ_COMMITTED,
+    sessionId = 0,
+    sessionEpoch = -1,
+    forgottenTopics = [],
+    maxWaitTime,
+    minBytes,
+    maxBytes,
+    topics,
+    topicIds,
+    rackId,
+    checkCrcs = true,
+  }) => {
+    const request = require('./v18/request')
+    const response = require('./v18/response')
+    return {
+      request: request({
+        isolationLevel,
+        sessionId,
+        sessionEpoch,
+        forgottenTopics,
+        maxWaitTime,
+        minBytes,
+        maxBytes,
+        topics,
+        topicIds,
+        rackId,
+      }),
+      response: withOptions(response, { checkCrcs }),
+      requestTimeout: requestTimeout(maxWaitTime),
+    }
+  },
 }
 
 module.exports = {
