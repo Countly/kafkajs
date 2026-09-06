@@ -285,6 +285,41 @@ module.exports = class MetadataCache {
   }
 
   /**
+   * Forgets one partition's leader epoch, in the cache **and** in its write-through copy, so both
+   * views agree. `leader` is left untouched in both: the client still knows where to route, it
+   * just stops claiming to know which epoch it is routing against.
+   *
+   * This is the answer to `UNKNOWN_LEADER_EPOCH` (75), which means the *client* is ahead of the
+   * broker. The monotonic guard in `update()` would otherwise defend the higher cached epoch, the
+   * refresh that follows would be rejected, and every retry would resend the same epoch forever.
+   * With the epoch unknown, the next request carries `-1` (no fencing) and the next metadata
+   * response is accepted outright by the "either side unknown" branch.
+   *
+   * @see https://kafka.apache.org/43/design/protocol
+   * @param {string} topic
+   * @param {number} partition
+   * @returns {boolean} true when a cached entry existed and was forgotten
+   */
+  forgetLeaderEpoch(topic, partition) {
+    const entry = this.topics.get(topic)
+    const cached = entry && entry.partitions.get(partition)
+
+    if (!cached) {
+      return false
+    }
+
+    cached.leaderEpoch = UNKNOWN_EPOCH
+
+    // `decoded` is null for a topic released by `releaseTopicsAbsentFrom`; guarded exactly as
+    // `applyLeaderHint` guards it.
+    if (cached.decoded) {
+      cached.decoded.leaderEpoch = UNKNOWN_EPOCH
+    }
+
+    return true
+  }
+
+  /**
    * @param {string} topic
    * @param {number} partition
    * @returns {number} the current leader epoch, or -1 when unknown

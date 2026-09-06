@@ -641,6 +641,21 @@ module.exports = class BrokerPool {
   }
 
   /**
+   * Whether this pool currently holds a broker for the given node id.
+   *
+   * The broker map is keyed by `Object.keys`, i.e. **strings**, while every node id decoded off
+   * the wire is an `int32` **number**. This is the one place that boundary is crossed, so callers
+   * never have to know which side they are on.
+   *
+   * @public
+   * @param {number|string} nodeId
+   * @returns {boolean}
+   */
+  hasNode(nodeId) {
+    return String(nodeId) in this.brokers
+  }
+
+  /**
    * @public
    * @param {object} options
    * @param {string} options.nodeId

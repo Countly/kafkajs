@@ -1,4 +1,6 @@
 const MetadataCache = require('../metadataCache')
+const BrokerPool = require('../brokerPool')
+const Cluster = require('../index')
 const InstrumentationEventEmitter = require('../../instrumentation/emitter')
 const { CLUSTER_TOPIC_RECREATED } = require('../instrumentationEvents')
 const { newLogger } = require('testHelpers')
@@ -371,5 +373,151 @@ describe('Cluster > MetadataCache', () => {
     const quiet = new MetadataCache({ logger: newLogger(), instrumentationEmitter: null })
     quiet.update(response({ topicId: ID_A }))
     expect(() => quiet.update(response({ topicId: ID_B }))).not.toThrow()
+  })
+
+  describe('forgetLeaderEpoch', () => {
+    const response = () => ({
+      brokers: [{ nodeId: 1 }, { nodeId: 2 }],
+      topicMetadata: [
+        {
+          topic: 'test-topic',
+          topicId: '01020304-0506-0708-090a-0b0c0d0e0f10',
+          partitionMetadata: [{ partitionId: 0, leader: 1, leaderEpoch: 7 }],
+        },
+      ],
+    })
+
+    it('sets the cached epoch and its write-through copy to -1, leaving the leader alone', () => {
+      const cache = new MetadataCache({ logger: newLogger() })
+      const metadata = response()
+      cache.update(metadata)
+
+      expect(cache.forgetLeaderEpoch('test-topic', 0)).toBe(true)
+
+      expect(cache.leaderEpoch('test-topic', 0)).toEqual(-1)
+      expect(metadata.topicMetadata[0].partitionMetadata[0]).toEqual({
+        partitionId: 0,
+        leader: 1,
+        leaderEpoch: -1,
+      })
+    })
+
+    it('lets the next metadata response win outright, whatever its epoch', () => {
+      const cache = new MetadataCache({ logger: newLogger() })
+      cache.update(response())
+      cache.forgetLeaderEpoch('test-topic', 0)
+
+      const lower = response()
+      lower.topicMetadata[0].partitionMetadata[0].leaderEpoch = 3
+      cache.update(lower)
+
+      // Without the forget, the monotonic guard would have defended 7 and rewritten the
+      // decoded object back to 7 - the non-convergence this exists to break.
+      expect(cache.leaderEpoch('test-topic', 0)).toEqual(3)
+      expect(lower.topicMetadata[0].partitionMetadata[0].leaderEpoch).toEqual(3)
+    })
+
+    it('is a no-op for an unknown topic or partition', () => {
+      const cache = new MetadataCache({ logger: newLogger() })
+      cache.update(response())
+
+      expect(cache.forgetLeaderEpoch('other-topic', 0)).toBe(false)
+      expect(cache.forgetLeaderEpoch('test-topic', 9)).toBe(false)
+    })
+
+    it('forgets a partition whose decoded reference was released', () => {
+      const cache = new MetadataCache({ logger: newLogger() })
+      cache.update(response())
+      // A later scoped response that does not carry this topic releases `decoded` (null).
+      cache.update({ brokers: [{ nodeId: 1 }], topicMetadata: [] })
+
+      expect(() => cache.forgetLeaderEpoch('test-topic', 0)).not.toThrow()
+      expect(cache.forgetLeaderEpoch('test-topic', 0)).toBe(true)
+      expect(cache.leaderEpoch('test-topic', 0)).toEqual(-1)
+    })
+  })
+
+  describe('node membership across the string/number boundary', () => {
+    it('BrokerPool#hasNode answers for a numeric node id even though the map is keyed by string', () => {
+      const pool = new BrokerPool({
+        connectionBuilder: { build: () => ({}) },
+        logger: newLogger(),
+        retry: { retries: 0 },
+      })
+      pool.brokers = { 1: {}, 2: {} }
+
+      expect(pool.getNodeIds()).toEqual(['1', '2'])
+      expect(pool.getNodeIds().includes(1)).toBe(false) // the trap this seam exists for
+      expect(pool.hasNode(1)).toBe(true)
+      expect(pool.hasNode('1')).toBe(true)
+      expect(pool.hasNode(9)).toBe(false)
+    })
+  })
+
+  describe('fetchTopicsOffset forgets the epoch only when the client is ahead', () => {
+    const buildCluster = (errorType) => {
+      const cache = new MetadataCache({ logger: newLogger() })
+      cache.update({
+        brokers: [{ nodeId: 1 }],
+        topicMetadata: [
+          {
+            topic: 'test-topic',
+            topicId: '01020304-0506-0708-090a-0b0c0d0e0f10',
+            partitionMetadata: [
+              { partitionId: 0, leader: 1, leaderEpoch: 7 },
+              { partitionId: 1, leader: 1, leaderEpoch: 7 },
+            ],
+          },
+        ],
+      })
+
+      const cluster = new Cluster({
+        logger: newLogger(),
+        brokers: ['localhost:9092'],
+        socketFactory: () => {},
+        retry: { retries: 0 },
+      })
+      cluster.metadataCache = cache
+      cluster.refreshMetadataBestEffort = jest.fn(async () => {})
+      cluster.findLeaderForPartitions = () => ({ 1: [0, 1] })
+      cluster.findBroker = async () => ({
+        listOffsets: async () => {
+          const error = new Error(errorType)
+          error.type = errorType
+          error.retriable = true
+          throw error
+        },
+      })
+
+      return { cluster, cache }
+    }
+
+    it('forgets every partition of the request on UNKNOWN_LEADER_EPOCH', async () => {
+      const { cluster, cache } = buildCluster('UNKNOWN_LEADER_EPOCH')
+
+      await expect(
+        cluster.fetchTopicsOffset([
+          { topic: 'test-topic', partitions: [{ partition: 0 }, { partition: 1 }] },
+        ])
+      ).rejects.toThrow('UNKNOWN_LEADER_EPOCH')
+
+      expect(cache.leaderEpoch('test-topic', 0)).toEqual(-1)
+      expect(cache.leaderEpoch('test-topic', 1)).toEqual(-1)
+      expect(cluster.refreshMetadataBestEffort).toHaveBeenCalledTimes(1)
+    })
+
+    it('keeps the epoch on FENCED_LEADER_EPOCH, where a refresh converges on its own', async () => {
+      const { cluster, cache } = buildCluster('FENCED_LEADER_EPOCH')
+
+      await expect(
+        cluster.fetchTopicsOffset([
+          { topic: 'test-topic', partitions: [{ partition: 0 }, { partition: 1 }] },
+        ])
+      ).rejects.toThrow('FENCED_LEADER_EPOCH')
+
+      expect(cache.leaderEpoch('test-topic', 0)).toEqual(7)
+      expect(cache.leaderEpoch('test-topic', 1)).toEqual(7)
+      expect(cluster.refreshMetadataBestEffort).toHaveBeenCalledTimes(1)
+    })
   })
 })

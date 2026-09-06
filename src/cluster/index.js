@@ -365,6 +365,39 @@ module.exports = class Cluster {
   }
 
   /**
+   * The cached leader epoch of one partition, as of the last Metadata response or accepted leader
+   * hint. Internal seam for the consumer's fetch path; not on the public Cluster surface.
+   * @param {string} topic
+   * @param {number} partition
+   * @returns {number} the epoch, or -1 when unknown
+   */
+  leaderEpoch(topic, partition) {
+    return this.metadataCache.leaderEpoch(topic, partition)
+  }
+
+  /**
+   * Forgets one partition's cached leader epoch. Called when a broker reports the client is ahead
+   * of it (`UNKNOWN_LEADER_EPOCH`), so the next request stops fencing on an epoch the broker does
+   * not have and the next metadata response converges.
+   * @param {string} topic
+   * @param {number} partition
+   * @returns {boolean} true when a cached entry existed and was forgotten
+   */
+  forgetLeaderEpoch(topic, partition) {
+    return this.metadataCache.forgetLeaderEpoch(topic, partition)
+  }
+
+  /**
+   * Whether the broker table currently holds a node with this id. Used before trusting a leader
+   * hint that carries no endpoint for the node it names.
+   * @param {number|string} nodeId
+   * @returns {boolean}
+   */
+  hasNode(nodeId) {
+    return this.brokerPool.hasNode(nodeId)
+  }
+
+  /**
    * Applies a leader hint a produce error carried (KIP-951): the broker that now owns the
    * partition, and the endpoints of the nodes it named.
    *
@@ -640,6 +673,21 @@ module.exports = class Cluster {
     // Execute all requests, merge and normalize the responses
     const responses = await Promise.all(requests).catch(async (e) => {
       if (staleLeaderEpoch(e)) {
+        // UNKNOWN_LEADER_EPOCH means this client is *ahead* of the broker, so defending the
+        // cached epoch makes every retry resend the same rejected value. FENCED_LEADER_EPOCH is
+        // the opposite - the client is behind - and a refresh converges on its own, so the epoch
+        // is kept there. This catch runs on a Promise.all and has no per-partition information,
+        // so it forgets the epoch of every partition in the request; the cost is one unfenced
+        // round for partitions that were not at fault, and the next metadata response
+        // repopulates them.
+        if (e.type === 'UNKNOWN_LEADER_EPOCH') {
+          for (const topicData of topics) {
+            for (const { partition } of topicData.partitions) {
+              this.metadataCache.forgetLeaderEpoch(topicData.topic, partition)
+            }
+          }
+        }
+
         await this.refreshMetadataBestEffort()
       }
 
