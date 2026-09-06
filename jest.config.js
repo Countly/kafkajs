@@ -18,15 +18,16 @@ module.exports = {
     '!src/**/__tests__/**',
     '!src/**/fixtures/**',
   ],
-  // Baseline measured 2026-09-03 (full suite, apache/kafka 4.3.1): S 95.62 / B 85.65 / F 97.71 / L 95.64.
-  // Floor is floor(baseline) - 1 per metric (decision D21). Only `npm run test:coverage` enforces it;
+  // Baseline measured 2026-09-06 at 3.0.0-alpha.5b (full suite, apache/kafka 4.3.1):
+  // S 97.15 / B 90.09 / F 97.96 / L 97.28. The floor ratchets to each phase exit's measurement,
+  // rounded down to one decimal, so coverage can only go up. Only `npm run test:coverage` enforces it;
   // `test:coverage:unit` passes --coverageThreshold '{}' because it covers a strict subset of `src/`.
   coverageThreshold: {
     global: {
-      statements: 94,
-      branches: 84,
-      functions: 96,
-      lines: 94,
+      statements: 97.1,
+      branches: 90,
+      functions: 97.9,
+      lines: 97.2,
     },
   },
   bail: false,
