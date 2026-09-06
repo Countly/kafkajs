@@ -3,6 +3,7 @@
 exports[`Admin gives access to its logger 1`] = `
 {
   "debug": [Function],
+  "debugEnabled": [Function],
   "error": [Function],
   "info": [Function],
   "namespace": [Function],

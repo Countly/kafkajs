@@ -12,6 +12,8 @@ x-kafka-common: &kafka-common
     KAFKA_LOG_DIRS: '/tmp/kraft-combined-logs'
     KAFKA_AUTO_CREATE_TOPICS_ENABLE: 'true'
     KAFKA_DEFAULT_REPLICATION_FACTOR: '2'
+    # The live topic-recreation consumer spec creates its topic with this many partitions, so
+    # that an incarnation the broker auto-creates has the same shape; keep the two in step.
     KAFKA_NUM_PARTITIONS: '2'
     KAFKA_DELETE_TOPIC_ENABLE: 'true'
     KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: '0'

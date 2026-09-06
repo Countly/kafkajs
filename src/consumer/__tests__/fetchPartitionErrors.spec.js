@@ -284,4 +284,62 @@ describe('Consumer > fetch partition error contract', () => {
     // and asserting it is empty would be a test that cannot fail.
     expect([...group.consecutiveFetchErrors.keys()]).toEqual([`${TOPIC}|0`])
   })
+  describe('debug logging', () => {
+    it('records what was asked for and what came back', async () => {
+      const { group, logger, setResponse } = await createFetchGroup({ partitions: [0] })
+      jest.spyOn(logger, 'debugEnabled').mockReturnValue(true)
+      const debug = jest.spyOn(logger, 'debug')
+
+      setResponse(fetchResponse([{ partition: 0, errorCode: 0, records: true }]))
+      await group.fetch(NODE_ID)
+
+      expect(debug).toHaveBeenCalledWith(
+        'Fetching',
+        expect.objectContaining({
+          nodeId: NODE_ID,
+          topics: [
+            expect.objectContaining({
+              topic: TOPIC,
+              partitions: [expect.objectContaining({ partition: 0 })],
+            }),
+          ],
+        })
+      )
+      expect(debug).toHaveBeenCalledWith(
+        'Fetch response partition',
+        expect.objectContaining({ topic: TOPIC, partition: 0, errorCode: 0 })
+      )
+    })
+
+    it('names the reason a fetched partition was dropped', async () => {
+      const { group, logger, setResponse } = await createFetchGroup({ partitions: [0] })
+      const debug = jest.spyOn(logger, 'debug')
+      // A seek queued between the request going out and its response arriving: the response is
+      // for a position the consumer no longer wants, which is exactly what the drop reason names.
+      jest.spyOn(group.seekOffset, 'has').mockReturnValue(true)
+
+      setResponse(fetchResponse([{ partition: 0, errorCode: 0, records: true }]))
+      const batches = await group.fetch(NODE_ID)
+
+      expect(batches).toEqual([])
+      expect(debug).toHaveBeenCalledWith('Dropping fetched partition', {
+        topic: TOPIC,
+        partition: 0,
+        reason: 'seeked',
+      })
+    })
+
+    it('does not build the fetching payload at the default level', async () => {
+      const { group, logger, setResponse } = await createFetchGroup({ partitions: [0] })
+      const debug = jest.spyOn(logger, 'debug')
+      jest.spyOn(logger, 'debugEnabled').mockReturnValue(false)
+
+      setResponse(fetchResponse([{ partition: 0, errorCode: 0, records: true }]))
+      await group.fetch(NODE_ID)
+
+      expect(debug).not.toHaveBeenCalledWith('Fetching', expect.anything())
+      expect(debug).not.toHaveBeenCalledWith('Resolved offsets', expect.anything())
+      expect(debug).not.toHaveBeenCalledWith('Fetch response partition', expect.anything())
+    })
+  })
 })

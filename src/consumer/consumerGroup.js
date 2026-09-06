@@ -706,6 +706,22 @@ module.exports = class ConsumerGroup {
         topicIds.set(topic, topicId)
       }
 
+      if (this.logger.debugEnabled()) {
+        this.logger.debug('Fetching', {
+          nodeId,
+          maxVersion,
+          topics: requests.map(({ topic, partitions }) => ({
+            topic,
+            topicId: topicIds && topicIds.get(topic),
+            partitions: partitions.map(({ partition, fetchOffset, currentLeaderEpoch }) => ({
+              partition,
+              fetchOffset,
+              currentLeaderEpoch,
+            })),
+          })),
+        })
+      }
+
       const broker = await this.cluster.findBroker({ nodeId })
 
       const {
@@ -745,6 +761,9 @@ module.exports = class ConsumerGroup {
       }
 
       const batches = []
+      // Hoisted out of the per-partition loop: the response row below is the hot path, and its
+      // payload must not be built once per partition per round only to be discarded.
+      const debug = this.logger.debugEnabled()
 
       for (const { topicName, topicId, partitions } of responses) {
         if (topicName == null) {
@@ -769,6 +788,16 @@ module.exports = class ConsumerGroup {
 
         for (const partitionData of partitions) {
           const { partition, errorCode, preferredReadReplica } = partitionData
+
+          if (debug) {
+            this.logger.debug('Fetch response partition', {
+              topic: topicName,
+              partition,
+              errorCode,
+              highWatermark: partitionData.highWatermark,
+              messageCount: partitionData.messages ? partitionData.messages.length : 0,
+            })
+          }
 
           if (failure(errorCode)) {
             const action = partitionFetchAction(errorCode)
@@ -818,6 +847,11 @@ module.exports = class ConsumerGroup {
           })
 
           if (dropReason != null) {
+            this.logger.debug('Dropping fetched partition', {
+              topic: topicName,
+              partition,
+              reason: dropReason,
+            })
             continue
           }
 
@@ -1096,6 +1130,19 @@ module.exports = class ConsumerGroup {
     }
 
     await this.offsetManager.resolveOffsets(seekedPartitions)
+
+    // Guarded, not just level-checked: this runs once per fetch round, and most rounds resolve
+    // nothing, so the per-topic payload must not be built to be thrown away.
+    if (this.logger.debugEnabled()) {
+      const committedOffsets = this.offsetManager.committedOffsets()
+      for (const { topic } of topicPartitions) {
+        this.logger.debug('Resolved offsets', {
+          groupId: this.groupId,
+          topic,
+          partitions: committedOffsets[topic],
+        })
+      }
+    }
   }
 
   hasSeekOffset({ topic, partition }) {

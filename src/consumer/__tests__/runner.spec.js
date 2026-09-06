@@ -342,4 +342,62 @@ describe('Consumer > Runner', () => {
       await runner.fetch()
     })
   })
+  describe('batch debug logging', () => {
+    const batchOf = (messages) => new Batch(topicName, 0, { partition, highWatermark: 5, messages })
+
+    beforeEach(async () => {
+      runner.scheduleFetchManager = jest.fn()
+      await runner.start()
+    })
+
+    it('records how a batch with messages was handled', async () => {
+      jest.spyOn(runner.logger, 'debugEnabled').mockReturnValue(true)
+      const debug = jest.spyOn(runner.logger, 'debug')
+
+      await runner.handleBatch(batchOf([{ offset: 4, key: '1', value: '2' }]))
+
+      expect(debug).toHaveBeenCalledWith('Batch', {
+        topic: topicName,
+        partition,
+        fetchedOffset: 0,
+        rawMessages: 1,
+        withinOffset: 1,
+        messages: 1,
+        firstOffset: 4,
+        lastOffset: 4,
+        branch: 'processed',
+      })
+    })
+
+    it('distinguishes an empty batch from one emptied by filtering', async () => {
+      jest.spyOn(runner.logger, 'debugEnabled').mockReturnValue(true)
+      const debug = jest.spyOn(runner.logger, 'debug')
+
+      await runner.handleBatch(batchOf([]))
+      await runner.handleBatch(batchOf([{ offset: 4, isControlRecord: true }]))
+
+      expect(debug).toHaveBeenCalledWith(
+        'Batch',
+        expect.objectContaining({ rawMessages: 0, messages: 0, branch: 'empty' })
+      )
+      expect(debug).toHaveBeenCalledWith(
+        'Batch',
+        expect.objectContaining({
+          rawMessages: 1,
+          withinOffset: 1,
+          messages: 0,
+          branch: 'empty-due-to-filtering',
+        })
+      )
+    })
+
+    it('does not build the payload at the default level', async () => {
+      jest.spyOn(runner.logger, 'debugEnabled').mockReturnValue(false)
+      const debug = jest.spyOn(runner.logger, 'debug')
+
+      await runner.handleBatch(batchOf([{ offset: 4, key: '1', value: '2' }]))
+
+      expect(debug).not.toHaveBeenCalledWith('Batch', expect.anything())
+    })
+  })
 })

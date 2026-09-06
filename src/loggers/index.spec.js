@@ -108,4 +108,43 @@ describe('Loggers', () => {
       },
     })
   })
+  describe('debugEnabled', () => {
+    const previousEnvLogLevel = process.env.KAFKAJS_LOG_LEVEL
+
+    beforeEach(() => {
+      delete process.env.KAFKAJS_LOG_LEVEL
+    })
+
+    afterAll(() => {
+      if (previousEnvLogLevel === undefined) {
+        delete process.env.KAFKAJS_LOG_LEVEL
+      } else {
+        process.env.KAFKAJS_LOG_LEVEL = previousEnvLogLevel
+      }
+    })
+
+    it('reports the effective level', () => {
+      const logger = createLogger({ level: LEVELS.DEBUG, logCreator: () => () => {} })
+      expect(logger.debugEnabled()).toBe(true)
+
+      const quiet = createLogger({ level: LEVELS.INFO, logCreator: () => () => {} })
+      expect(quiet.debugEnabled()).toBe(false)
+    })
+
+    it('a namespaced logger answers for its own level, not the root one', () => {
+      const logger = createLogger({ level: LEVELS.INFO, logCreator: () => () => {} })
+      const namespaced = logger.namespace('Loud', LEVELS.DEBUG)
+
+      expect(logger.debugEnabled()).toBe(false)
+      expect(namespaced.debugEnabled()).toBe(true)
+    })
+
+    it('follows setLogLevel at runtime', () => {
+      const logger = createLogger({ level: LEVELS.INFO, logCreator: () => () => {} })
+      expect(logger.debugEnabled()).toBe(false)
+
+      logger.setLogLevel(LEVELS.DEBUG)
+      expect(logger.debugEnabled()).toBe(true)
+    })
+  })
 })

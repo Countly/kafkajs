@@ -48,6 +48,14 @@ const createLogger = ({ level = LEVELS.INFO, logCreator } = {}) => {
       error: createLevel('ERROR', LEVELS.ERROR, currentLogLevel, namespace, logFunction),
       warn: createLevel('WARN', LEVELS.WARN, currentLogLevel, namespace, logFunction),
       debug: createLevel('DEBUG', LEVELS.DEBUG, currentLogLevel, namespace, logFunction),
+      /**
+       * Whether `debug()` would emit at this logger's effective level, so a caller can skip
+       * building an expensive payload the level check would discard anyway. Internal: it is
+       * deliberately absent from the public `Logger` type, because users supply a log *creator*
+       * and never a logger object of their own.
+       * @returns {boolean}
+       */
+      debugEnabled: () => LEVELS.DEBUG <= currentLogLevel(),
     }
 
     return assign(logger, {

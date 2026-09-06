@@ -506,6 +506,24 @@ module.exports = class Runner extends EventEmitter {
         lastOffset: batch.lastOffset(),
       }
 
+      if (this.logger.debugEnabled()) {
+        this.logger.debug('Batch', {
+          topic: batch.topic,
+          partition: batch.partition,
+          fetchedOffset: batch.fetchedOffset,
+          rawMessages: batch.rawMessages.length,
+          withinOffset: batch.messagesWithinOffset.length,
+          messages: batch.messages.length,
+          firstOffset: payload.firstOffset,
+          lastOffset: payload.lastOffset,
+          branch: batch.isEmptyDueToFiltering()
+            ? 'empty-due-to-filtering'
+            : batch.isEmpty()
+              ? 'empty'
+              : 'processed',
+        })
+      }
+
       /**
        * If the batch contained only control records or only aborted messages then we still
        * need to resolve and auto-commit to ensure the consumer can move forward.
