@@ -64,6 +64,10 @@ describe('Producer > sendMessages', () => {
       findTopicPartitionMetadata: jest.fn(() => topicPartitionMetadata),
       findLeaderForPartitions: jest.fn(() => partitionsPerLeader),
       findBroker: jest.fn(({ nodeId }) => brokers[nodeId]),
+      // No topic in this suite has a known id, so every produce stays on the pre-topic-id path
+      // (topicIds undefined, capped at the last name-keyed version) - exactly this suite's
+      // existing expectations.
+      topicId: jest.fn(() => undefined),
       targetTopics: new Set(),
       isConnected: jest.fn(() => true),
     }

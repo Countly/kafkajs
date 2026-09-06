@@ -6,6 +6,11 @@ const responseSerializer = require('./responseSerializer')
 
 const { keys } = Object
 
+// The last Produce version that keys topics by name, and the highest a transactional send uses:
+// from v12 a produce inside a transaction implicitly adds the partition to the transaction.
+// @see clients/src/main/resources/common/message/ProduceRequest.json (Apache Kafka 4.3.1)
+const PRODUCE_TOPIC_NAMES_MAX_VERSION = 11
+
 /**
  * Resolves each `batchIndex` the broker reported (KIP-467, Produce v8+) to the record it refers
  * to. `BatchIndex` indexes the records as they were grouped for that partition, which is exactly
@@ -103,10 +108,33 @@ module.exports = ({ logger, cluster, partitioner, eosManager, retrier }) => {
           }))
 
         const topicData = createTopicData(topicDataForBroker)
+        const isTransactional = eosManager.isTransactional()
+
+        // Topic ids are decided per broker request, not per send(): a global rule would downgrade
+        // one broker's request because a *different* broker's topic had an unknown id. A
+        // transactional send stays below v13 unconditionally - from v12 a produce inside a
+        // transaction implicitly adds the partition to the transaction under transaction version
+        // 2, which this client does not implement yet.
+        let topicIds
+        let maxVersion = PRODUCE_TOPIC_NAMES_MAX_VERSION
+
+        if (!isTransactional) {
+          topicIds = new Map()
+          maxVersion = undefined
+          for (const { topic } of topicDataForBroker) {
+            const topicId = cluster.topicId(topic)
+            if (topicId === undefined) {
+              topicIds = undefined
+              maxVersion = PRODUCE_TOPIC_NAMES_MAX_VERSION
+              break
+            }
+            topicIds.set(topic, topicId)
+          }
+        }
 
         await eosManager.acquireBrokerLock(broker)
         try {
-          if (eosManager.isTransactional()) {
+          if (isTransactional) {
             await eosManager.addPartitionsToTransaction(topicData)
           }
 
@@ -120,15 +148,15 @@ module.exports = ({ logger, cluster, partitioner, eosManager, retrier }) => {
           let response
           try {
             response = await broker.produce({
-              transactionalId: eosManager.isTransactional()
-                ? eosManager.getTransactionalId()
-                : undefined,
+              transactionalId: isTransactional ? eosManager.getTransactionalId() : undefined,
               producerId: eosManager.getProducerId(),
               producerEpoch: eosManager.getProducerEpoch(),
               acks,
               timeout,
               compression,
               topicData,
+              topicIds,
+              maxVersion,
             })
           } catch (e) {
             topicData.forEach(({ topic, partitions }) => {

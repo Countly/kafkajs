@@ -87,7 +87,11 @@ const createFakeBroker = (answer) => {
   return { broker: new Broker({ connectionPool, logger: newLogger(), nodeId: NODE_ID }), state }
 }
 
-/** Minimal `Cluster` stub: every partition of `TOPIC` is led by the one fake broker. */
+/**
+ * Minimal `Cluster` stub: every partition of `TOPIC` is led by the one fake broker. `topicId`
+ * always answers `undefined` - these fixtures exercise the pre-KIP-516 (name-keyed) versions, so
+ * every case stays on that path regardless of what the broker would otherwise negotiate.
+ */
 const createCluster = (broker, partitionMetadata) => ({
   addMultipleTargetTopics: async () => {},
   refreshMetadataIfNecessary: async () => {},
@@ -95,6 +99,7 @@ const createCluster = (broker, partitionMetadata) => ({
   findTopicPartitionMetadata: () => partitionMetadata,
   findLeaderForPartitions: (topic, partitions) => ({ [NODE_ID]: partitions.map(Number) }),
   findBroker: async () => broker,
+  topicId: () => undefined,
   targetTopics: new Set(),
   isConnected: () => true,
 })

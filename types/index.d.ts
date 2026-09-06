@@ -750,6 +750,8 @@ export type Broker = {
       topic: string
       partitions: Array<{ partition: number; firstSequence?: number; messages: Message[] }>
     }>
+    topicIds?: Map<string, string>
+    maxVersion?: number
     transactionalId?: string
     producerId?: number
     producerEpoch?: number

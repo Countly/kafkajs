@@ -3,10 +3,10 @@ const { newLogger } = require('testHelpers')
 const InstrumentationEventEmitter = require('../instrumentation/emitter')
 
 // Everything src/producer/sendMessages.js touches on the cluster, in call order:
-//   :26  refreshMetadataIfNecessary   :29  findTopicPartitionMetadata   :34  targetTopics
-//   :48  findLeaderForPartitions      :57  findBroker                   :129 addMultipleTargetTopics
-//   :137 removeBroker                 :140 isConnected                  :145 connect
-//   :146,:160 refreshMetadata
+//   :59  refreshMetadataIfNecessary   :62  findTopicPartitionMetadata   :67  targetTopics
+//   :81  findLeaderForPartitions      :90  findBroker                   :124 topicId
+//   :187 addMultipleTargetTopics      :195 removeBroker                 :221 isConnected
+//   :231 connect                      :236,:258 refreshMetadata
 // A fake missing any of these fails with "… is not a function" *after* the fix as well as
 // before, so the test could never go green.
 const createFakeCluster = () => ({
@@ -21,6 +21,8 @@ const createFakeCluster = () => ({
   findTopicPartitionMetadata: jest.fn(() => [{ partitionId: 0, leader: 0 }]),
   findLeaderForPartitions: jest.fn(() => ({ 0: [0] })),
   findBroker: jest.fn(),
+  // No topic here has a known id, so every send stays on the pre-topic-id (name-keyed) path.
+  topicId: jest.fn(() => undefined),
   removeBroker: jest.fn(),
   isConnected: () => true,
   // retries: 0 so the eosManager's own retrier (built from cluster.retry) does not swallow the
