@@ -230,6 +230,8 @@ await consumer.subscribe({ topics: ['other-topic'], fromBeginning: false })
 
 When `fromBeginning` is `true`, the group will use the earliest offset. If set to `false`, it will use the latest offset. The default is `false`.
 
+If the partition's leader changes and the new leader's log diverges from what this consumer had already consumed — the tail of the old leader's log was never replicated — the consumer detects it before its next fetch and repositions the partition. When the divergence point is known, the partition moves to the first offset known to diverge and resumes from there; when it is not, the partition is reset per its `fromBeginning` setting, and that reset offset is committed to the coordinator even under `autoCommit: false`, which an offset that is out of range has always done. Either way the consumer logs a warning and emits [`LOG_TRUNCATION`](InstrumentationEvents.md#consumer). A paused partition can be repositioned this way and stays paused — pausing is your intent, not offset state.
+
 ## <a name="topic-recreation"></a> Topic recreation
 
 If a subscribed topic is deleted and recreated, the new topic is a different entity from the broker's point of view even though it has the same name — it gets a new topic id and starts back at offset 0. A committed offset from the old topic is meaningless against it, and because cleanup of the internal `__consumer_offsets` topic is asynchronous, that stale offset can still be there — and can still look like a perfectly valid offset into the new topic's log.

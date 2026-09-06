@@ -7,6 +7,7 @@ const consumerType = InstrumentationEventType('consumer')
 /** @type {import('types').ConsumerEvents} */
 const events = {
   HEARTBEAT: consumerType('heartbeat'),
+  LOG_TRUNCATION: consumerType('log_truncation'),
   COMMIT_OFFSETS: consumerType('commit_offsets'),
   GROUP_JOIN: consumerType('group_join'),
   FETCH: consumerType('fetch'),

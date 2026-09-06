@@ -982,6 +982,7 @@ export type DeleteGroupsResult = {
 
 export type ConsumerEvents = {
   HEARTBEAT: 'consumer.heartbeat'
+  LOG_TRUNCATION: 'consumer.log_truncation'
   COMMIT_OFFSETS: 'consumer.commit_offsets'
   GROUP_JOIN: 'consumer.group_join'
   FETCH_START: 'consumer.fetch_start'
@@ -1001,6 +1002,13 @@ export type ConsumerEvents = {
   TOPIC_RECREATED: 'consumer.cluster.topic_recreated'
   REBOOTSTRAP: 'consumer.cluster.rebootstrap'
 }
+export type LogTruncationEvent = InstrumentationEvent<{
+  topic: string
+  partition: number
+  offset: string
+  divergingOffset: string | null
+  leaderEpoch: number
+}>
 export type ConsumerHeartbeatEvent = InstrumentationEvent<{
   groupId: string
   memberId: string
@@ -1133,6 +1141,10 @@ export type Consumer = {
   on(
     eventName: ConsumerEvents['HEARTBEAT'],
     listener: (event: ConsumerHeartbeatEvent) => void
+  ): RemoveInstrumentationEventListener<typeof eventName>
+  on(
+    eventName: ConsumerEvents['LOG_TRUNCATION'],
+    listener: (event: LogTruncationEvent) => void
   ): RemoveInstrumentationEventListener<typeof eventName>
   on(
     eventName: ConsumerEvents['COMMIT_OFFSETS'],
