@@ -22,6 +22,17 @@ const {
 const LoggerConsole = require('../src/loggers/console')
 const { Kafka } = require('../index')
 const { createFakeSocketFactory, respondWithFrame, readRequestHeader } = require('./fakeSocket')
+const {
+  execInKafka1,
+  compose,
+  stopBroker,
+  startBroker,
+  reassignPreferredReplica,
+  reassignmentIsComplete,
+  waitForReassignmentToComplete,
+  triggerPreferredElection,
+  triggerUncleanElection,
+} = require('./leaderElection')
 
 const newLogger = (opts = {}) =>
   createLogger(Object.assign({ level: NOTHING, logCreator: LoggerConsole }, opts))
@@ -491,4 +502,13 @@ module.exports = {
   createFakeSocketFactory,
   respondWithFrame,
   readRequestHeader,
+  execInKafka1,
+  compose,
+  stopBroker,
+  startBroker,
+  reassignPreferredReplica,
+  reassignmentIsComplete,
+  waitForReassignmentToComplete,
+  triggerPreferredElection,
+  triggerUncleanElection,
 }

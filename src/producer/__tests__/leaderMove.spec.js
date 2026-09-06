@@ -1,88 +1,16 @@
-const { execFileSync } = require('child_process')
 const { Kafka, logLevel } = require('../../../index')
 const Cluster = require('../../cluster')
-const { secureRandom, plainTextBrokers, createTopic } = require('testHelpers')
+const {
+  secureRandom,
+  plainTextBrokers,
+  createTopic,
+  reassignPreferredReplica,
+  waitForReassignmentToComplete,
+  triggerPreferredElection,
+} = require('testHelpers')
 
 const enabled = process.env.LEADER_MOVE_E2E === '1'
 const describeLive = enabled ? describe : describe.skip
-
-const BOOTSTRAP_SERVER = 'kafka1:29092'
-// Suffixed with this process's pid so two overlapping runs (there should never be one, but the
-// file is otherwise never cleaned up) cannot clobber each other's reassignment plan.
-const REASSIGNMENT_FILE = `/tmp/leader-move-reassignment-${process.pid}.json`
-const KAFKA_BIN = '/opt/kafka/bin'
-
-/** Runs a command inside the kafka1 container, piping `input` to its stdin when given. */
-const execInKafka1 = (args, input) =>
-  execFileSync('docker', ['compose', 'exec', '-T', 'kafka1', ...args], {
-    stdio: 'pipe',
-    input,
-  })
-
-/**
- * Reassigns a partition's replica set so `newLeaderId` is first (the preferred leader), without
- * moving any replica off or onto a broker that doesn't already host it - this is a *reordering*,
- * not a real data move, so `--verify` completes almost immediately.
- */
-const reassignPreferredReplica = (topic, replicas, newLeaderId) => {
-  const reorderedReplicas = [
-    newLeaderId,
-    ...replicas.filter((replicaId) => replicaId !== newLeaderId),
-  ]
-  const reassignmentJson = {
-    version: 1,
-    partitions: [{ topic, partition: 0, replicas: reorderedReplicas }],
-  }
-
-  execInKafka1(['sh', '-c', `cat > ${REASSIGNMENT_FILE}`], JSON.stringify(reassignmentJson))
-  execInKafka1([
-    `${KAFKA_BIN}/kafka-reassign-partitions.sh`,
-    '--bootstrap-server',
-    BOOTSTRAP_SERVER,
-    '--reassignment-json-file',
-    REASSIGNMENT_FILE,
-    '--execute',
-  ])
-}
-
-/** True once `kafka-reassign-partitions.sh --verify` reports the reassignment finished. */
-const reassignmentIsComplete = () => {
-  const output = execInKafka1([
-    `${KAFKA_BIN}/kafka-reassign-partitions.sh`,
-    '--bootstrap-server',
-    BOOTSTRAP_SERVER,
-    '--reassignment-json-file',
-    REASSIGNMENT_FILE,
-    '--verify',
-  ]).toString()
-
-  // Kafka 4.3.1's actual wording, confirmed against a live broker: "Reassignment of partition
-  // <topic>-<partition> is completed." - note the trailing "d", which a bare `is complete\b`
-  // word-boundary check misses entirely.
-  return /reassignment of partition .* is completed/i.test(output)
-}
-
-const waitForReassignmentToComplete = async (deadlineMs = 60000) => {
-  const deadline = Date.now() + deadlineMs
-  while (Date.now() < deadline) {
-    if (reassignmentIsComplete()) return
-    await new Promise((resolve) => setTimeout(resolve, 500))
-  }
-  throw new Error('Partition reassignment did not complete in time')
-}
-
-const triggerPreferredElection = (topic) =>
-  execInKafka1([
-    `${KAFKA_BIN}/kafka-leader-election.sh`,
-    '--bootstrap-server',
-    BOOTSTRAP_SERVER,
-    '--election-type',
-    'PREFERRED',
-    '--topic',
-    topic,
-    '--partition',
-    '0',
-  ])
 
 /**
  * Live confirmation of the KIP-951 produce path (spec §3.3).
