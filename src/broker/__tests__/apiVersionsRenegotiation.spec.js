@@ -88,18 +88,20 @@ describe('Broker > connect (KIP-35 rule 7)', () => {
     expect(pool.generation).toEqual(3)
   })
 
-  test('does NOT re-negotiate while the other socket is still up (recorded limitation)', async () => {
+  test('re-negotiates when only the other socket has been reconnected, even though the control socket is still up', async () => {
     const broker = new Broker({ connectionPool: pool, logger: newLogger() })
 
     await broker.connect()
+    // The pool re-establishes index 1 (Fetch) on its own; the control socket (index 0) is
+    // untouched. isConnected() now also compares the negotiated generation against the pool's,
+    // so this alone is enough to report not-connected and force a re-negotiation on both sockets.
     await pool.getConnection(1)
-    // Only the control socket drops. Broker.isConnected() is pool.some(...), so connect()
-    // returns at its first `if` and the changed pool generation is never read. This is the
-    // documented gap, pinned so a future change to it is deliberate rather than accidental.
-    connections[0].connected = false
+
+    expect(broker.isConnected()).toBe(false)
+
     await broker.connect()
 
-    expect(apiVersionsCalls).toEqual(1)
+    expect(apiVersionsCalls).toEqual(2)
     expect(pool.generation).toEqual(2)
   })
 

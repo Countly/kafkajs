@@ -70,6 +70,10 @@ const createFakeBroker = (answer) => {
       await connection.connect()
       return connection
     },
+    getConnectionByRequest: async () => {
+      await connection.connect()
+      return connection
+    },
     send: async (protocolRequest) => {
       const promise = connection.send(protocolRequest)
       await new Promise(setImmediate)

@@ -102,9 +102,19 @@ module.exports = class ConnectionPool {
     return this.pool.map((c) => callback(c))
   }
 
-  async send(protocolRequest) {
-    const connection = await this.getConnectionByRequest(protocolRequest)
-    return connection.send(protocolRequest)
+  /**
+   * Sends one request on this pool.
+   *
+   * @param {object} protocolRequest a built request, as produced by a request builder
+   * @param {Connection} [connection] the connection to send on, if the caller already resolved
+   *                                  it (e.g. via `getConnectionByRequest`) for its own purposes;
+   *                                  resolving it again here would be redundant, since it is
+   *                                  always the same connection this request would resolve to
+   * @returns {Promise} the broker's parsed response for `protocolRequest`
+   */
+  async send(protocolRequest, connection = null) {
+    const resolvedConnection = connection || (await this.getConnectionByRequest(protocolRequest))
+    return resolvedConnection.send(protocolRequest)
   }
 
   getConnectionByRequest({ request: { apiKey } }) {

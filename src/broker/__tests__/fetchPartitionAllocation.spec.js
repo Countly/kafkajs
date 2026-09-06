@@ -2,6 +2,7 @@ jest.mock('../../utils/shuffle', () => jest.fn())
 
 const Broker = require('../index')
 const mockShuffle = require('../../utils/shuffle')
+const apiKeys = require('../../protocol/requests/apiKeys')
 
 const { createConnectionPool, newLogger } = require('testHelpers')
 
@@ -30,7 +31,13 @@ describe('Broker > Fetch', () => {
 
   beforeEach(async () => {
     connection = createConnectionPool()
-    connection.send = jest.fn()
+    // `Broker#fetch` now negotiates versions on its own send path (per-socket re-negotiation),
+    // which sends a real ApiVersions request against the live cluster; only the Fetch itself
+    // (built from `fetchRequestMock`'s fake, unencodable request) is stubbed out.
+    const realSend = connection.send.bind(connection)
+    connection.send = jest.fn((protocolRequest) =>
+      protocolRequest.request.apiKey === apiKeys.ApiVersions ? realSend(protocolRequest) : undefined
+    )
     broker = new Broker({
       connectionPool: connection,
       logger: newLogger(),

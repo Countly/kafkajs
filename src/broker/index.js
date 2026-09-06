@@ -131,6 +131,14 @@ module.exports = class Broker {
    * change an answer is false-"connected" becoming a correct `false`; a broker this previously
    * reported connected for is unaffected.
    *
+   * It also requires the negotiated table to belong to the *current* connection generation. The
+   * pool re-establishes a socket on its own — most importantly the Fetch socket, which is pool
+   * index 1 — without going through `connect()`, and a version table learned over a superseded
+   * socket is not valid for the new one (KIP-35 rule 7). Reporting `false` sends every existing
+   * readiness gate back through `connect()`, which re-negotiates and re-applies the table to both
+   * pooled sockets. As with the negotiation term above, the only answer this can change is a
+   * false "connected" becoming a correct `false`.
+   *
    * @public
    * @returns {boolean}
    */
@@ -138,7 +146,11 @@ module.exports = class Broker {
     const connected = this.connectionPool.sasl
       ? this.connectionPool.isConnected() && this.connectionPool.isAuthenticated()
       : this.connectionPool.isConnected()
-    return connected && this.lookupRequest !== notInitializedLookup
+    return (
+      connected &&
+      this.lookupRequest !== notInitializedLookup &&
+      this.versionsGeneration === this.connectionPool.generation
+    )
   }
 
   /**
@@ -1120,11 +1132,40 @@ module.exports = class Broker {
   }
 
   /**
+   * Dispatches one built request over the pool.
+   *
+   * The connection is obtained **before** dispatching so a socket the pool has just
+   * re-established is visible here: if its generation no longer matches the table this broker
+   * negotiated, `connect()` runs first. The check is skipped for `ApiVersions`, which *is* the
+   * negotiation request and would otherwise re-enter `connect()`'s non-reentrant lock.
+   *
+   * The connection resolved for the generation check is passed on to `connectionPool.send()`,
+   * which sends on it directly instead of resolving it a second time; `connect()` only ever
+   * (re)establishes pool index 0, so a connection already resolved at another index (e.g.
+   * Fetch's index 1) stays valid across the `connect()` call above and is safe to reuse.
+   *
+   * It never re-versions a request that has already been built: the caller chose its version
+   * before the socket was re-established, and the honest outcome for the rare case where that
+   * version is no longer supported is the broker's own `UNSUPPORTED_VERSION`, exactly as before.
+   *
    * @private
+   * @param {{ request: { apiKey: number } }} protocolRequest a built request, as produced by
+   *                                          `lookup()`/`lookupRequestWithMax()`'s returned builder
+   * @returns {Promise} the broker's parsed response for `protocolRequest`
    */
   async [PRIVATE.SEND_REQUEST](protocolRequest) {
     try {
-      return await this.connectionPool.send(protocolRequest)
+      if (protocolRequest.request.apiKey === apiKeys.ApiVersions) {
+        return await this.connectionPool.send(protocolRequest)
+      }
+
+      const connection = await this.connectionPool.getConnectionByRequest(protocolRequest)
+
+      if (this.versionsGeneration !== this.connectionPool.generation) {
+        await this.connect()
+      }
+
+      return await this.connectionPool.send(protocolRequest, connection)
     } catch (e) {
       if (e.name === 'KafkaJSConnectionClosedError') {
         await this.disconnect()
