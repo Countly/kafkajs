@@ -195,6 +195,8 @@ describe('scripts/protocol > schema validation', () => {
       'src/protocol/requests/produce/v8/response.js',
       'src/protocol/requests/produce/v9/request.js',
       'src/protocol/requests/produce/v9/response.js',
+      'src/protocol/requests/saslAuthenticate/v2/request.js',
+      'src/protocol/requests/saslAuthenticate/v2/response.js',
     ])
   })
 })

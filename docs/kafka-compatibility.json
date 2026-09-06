@@ -55,9 +55,11 @@
         8,
         9,
         10,
-        11
+        11,
+        12,
+        13
       ],
-      "gap": "behind:7",
+      "gap": "behind:5",
       "onFloor": false,
       "belowFloor": [],
       "notes": "v11 rack / preferred read replica (KIP-392): the wire fields exist but the follower out-of-range and OFFSET_NOT_AVAILABLE handling does not. v12 flexible + LastFetchedEpoch, v13 topic IDs replace names (KIP-516), v14 OFFSET_MOVED_TO_TIERED_STORAGE (KIP-405), v15 ReplicaState (KIP-903), v16 leader hints (KIP-951), v17 ReplicaDirectoryId (KIP-853), v18 HighWatermark (KIP-1166)."
@@ -718,9 +720,10 @@
       "latestVersionUnstable": false,
       "forkVersions": [
         0,
-        1
+        1,
+        2
       ],
-      "gap": "behind:1",
+      "gap": "current",
       "onFloor": false,
       "belowFloor": [],
       "notes": ""

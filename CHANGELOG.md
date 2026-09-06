@@ -143,6 +143,7 @@ Upstream work this phase builds on, with thanks to its authors: PRs #1779, #1695
 #### Additions
 
 - Internal: requests can now be negotiated with a per-request version ceiling, which is what lets a single fetch fall back to topic names, or a single produce stay below the transaction-version-2 semantics, without changing the version every other request uses.
+- `SaslAuthenticate` v2 is implemented (flexible encoding, request header v2). Custom authentication mechanisms are unaffected: a provider still returns length-prefixed bytes from `request.encode()` and still receives length-prefixed bytes in `response.decode()` — the framing change is contained inside the codec. A provider that returns a buffer whose length prefix disagrees with its contents now fails with a `KafkaJSSASLAuthenticationError` naming the mechanism, instead of putting a malformed frame on the wire.
 
 #### Tooling
 

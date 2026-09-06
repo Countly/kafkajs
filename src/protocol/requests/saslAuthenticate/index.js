@@ -9,6 +9,11 @@ const versions = {
     const response = require('./v1/response')
     return { request: request({ authBytes }), response }
   },
+  2: ({ authBytes, mechanism }) => {
+    const request = require('./v2/request')
+    const response = require('./v2/response')
+    return { request: request({ authBytes, mechanism }), response }
+  },
 }
 
 module.exports = {

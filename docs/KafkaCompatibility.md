@@ -9,7 +9,7 @@ Gap classes: `current` (fork max equals the Kafka max) · `behind:N` · `stub` (
 | API | Key | Kafka 4.3.1 | Flexible from | Fork | Gap | Notes |
 |---|--:|---|---|---|---|---|
 | Produce | 0 | 3-13 | v9+ | 3-11 | behind:2 | v8 per-record errors (KIP-467), v9 flexible, v10 leader hints (KIP-951), v11 TRANSACTION_ABORTABLE (KIP-890), v12 transaction-version-2 implicit add-partitions (KIP-890 part 2), v13 topic IDs (KIP-516, Kafka 4.1; may return UNKNOWN_TOPIC_ID). |
-| Fetch | 1 | 4-18 | v12+ | 4-11 | behind:7 | v11 rack / preferred read replica (KIP-392): the wire fields exist but the follower out-of-range and OFFSET_NOT_AVAILABLE handling does not. v12 flexible + LastFetchedEpoch, v13 topic IDs replace names (KIP-516), v14 OFFSET_MOVED_TO_TIERED_STORAGE (KIP-405), v15 ReplicaState (KIP-903), v16 leader hints (KIP-951), v17 ReplicaDirectoryId (KIP-853), v18 HighWatermark (KIP-1166). |
+| Fetch | 1 | 4-18 | v12+ | 4-13 | behind:5 | v11 rack / preferred read replica (KIP-392): the wire fields exist but the follower out-of-range and OFFSET_NOT_AVAILABLE handling does not. v12 flexible + LastFetchedEpoch, v13 topic IDs replace names (KIP-516), v14 OFFSET_MOVED_TO_TIERED_STORAGE (KIP-405), v15 ReplicaState (KIP-903), v16 leader hints (KIP-951), v17 ReplicaDirectoryId (KIP-853), v18 HighWatermark (KIP-1166). |
 | ListOffsets | 2 | 1-11 | v6+ | 1-9 | behind:2 | v4 leader epoch (KIP-320), v6 flexible, v7 max-timestamp (KIP-734), v8 earliest-local offset (KIP-405), v9 last-tiered offset (KIP-1005). v10 (async remote list offsets, KIP-1075) and v11 (earliest pending upload offset, KIP-1023) are deliberate gaps, not a waiver: both are tiered-storage features this client does not use. |
 | Metadata | 3 | 0-13 | v9+ | 0-13 | current | v7 leader epoch (KIP-320), v9 flexible, v10+ topic IDs, v13 adds a top-level error code and is where REBOOTSTRAP_REQUIRED surfaces (KIP-1102). |
 | OffsetCommit | 8 | 2-10 | v8+ | 2-8 | behind:2 | v6 committed leader epoch (KIP-320), v7 group instance id, v8 flexible, v9 member epoch (KIP-848), v10 topic IDs. |
@@ -37,7 +37,7 @@ Gap classes: `current` (fork max equals the Kafka max) · `behind:N` · `stub` (
 | DeleteAcls | 31 | 1-3 | v2+ | 1 | behind:2 (on-floor) | v1 is the 4.x floor and is also the fork's maximum. |
 | DescribeConfigs | 32 | 1-4 | v4+ | 1-2 | behind:2 |  |
 | AlterConfigs | 33 | 0-2 | v2+ | 0-1 | behind:1 | IncrementalAlterConfigs (key 44) is the modern replacement and is unimplemented, so config changes still overwrite rather than merge. |
-| SaslAuthenticate | 36 | 0-2 | v2+ | 0-1 | behind:1 |  |
+| SaslAuthenticate | 36 | 0-2 | v2+ | 0-2 | current |  |
 | CreatePartitions | 37 | 0-3 | v2+ | 0-1 | behind:2 |  |
 | DeleteGroups | 42 | 0-2 | v2+ | 0-1 | behind:1 |  |
 | IncrementalAlterConfigs | 44 | 0-1 | v1+ | — | stub | The replacement for AlterConfigs; needed before any admin config change can be merge-semantics rather than overwrite. |

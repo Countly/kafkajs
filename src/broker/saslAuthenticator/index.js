@@ -48,7 +48,7 @@ module.exports = class SASLAuthenticator {
       let authResponse
       try {
         authResponse = await this.connection.send(
-          this.protocolAuthentication({ authBytes: requestAuthBytes })
+          this.protocolAuthentication({ authBytes: requestAuthBytes, mechanism })
         )
       } catch (e) {
         // Only the raw protocol error carries the broker's own error_message and code;
