@@ -597,7 +597,8 @@ module.exports = class ConsumerGroup {
    * batch, its offset is left where it was, and a rejoin is never triggered by it. A code with no
    * classification is thrown, which is the behaviour every version had. At most one metadata
    * refresh runs per round, after the response has been walked, however many partitions asked for
-   * one. The top-level code is classified the same way, before the walk.
+   * one. The top-level code is classified the same way, before the walk. A partition whose error
+   * carried a usable leader hint routes itself next round and asks for no refresh at all.
    *
    * Errors are not propagated: anything thrown is handed to `recoverFromFetch`, which either
    * recovers or rethrows, and the round then yields no batches.
@@ -680,7 +681,11 @@ module.exports = class ConsumerGroup {
 
       const broker = await this.cluster.findBroker({ nodeId })
 
-      const { errorCode: topLevelErrorCode, responses } = await broker.fetch({
+      const {
+        errorCode: topLevelErrorCode,
+        responses,
+        nodeEndpoints,
+      } = await broker.fetch({
         maxWaitTime: this.maxWaitTime,
         minBytes: this.minBytes,
         maxBytes: this.maxBytes,
@@ -764,7 +769,16 @@ module.exports = class ConsumerGroup {
               })
               this.cluster.forgetLeaderEpoch(topicName, partition)
             } else if (action === 'stale-metadata') {
-              needsRefresh = true
+              const applied = await this.applyFetchLeaderHint(
+                topicName,
+                partition,
+                partitionData.currentLeader,
+                nodeEndpoints
+              )
+
+              // A partition whose hint was usable already knows where to go next round; one whose
+              // hint was dropped, or that never carried one, needs the refresh.
+              needsRefresh = needsRefresh || !applied
             }
 
             continue
@@ -896,6 +910,66 @@ module.exports = class ConsumerGroup {
         consecutiveRounds,
       })
     }
+  }
+
+  /**
+   * Applies a leader hint a fetch response attached to a failing partition (KIP-951), so the next
+   * round routes to the new leader instead of waiting for a metadata refresh.
+   *
+   * A hint is only safe once the client can reach the node it names. It can, in one of two ways:
+   * the response carried an endpoint **for that leader**, which is applied before the cache write
+   * publishes the id, or the client already knows the node. Otherwise the write-through would
+   * publish a node id that has no broker behind it, the partition would be bucketed under a
+   * fetcher that does not exist, and it would stop being fetched with no error, no event and no
+   * log until the next metadata refresh. In that case the hint is dropped and the caller refreshes
+   * instead.
+   *
+   * Endpoints that name *other* nodes do not vouch for this leader - a response can move several
+   * partitions and omit the listener for one of them - but they are still forwarded, because they
+   * are the freshest addresses the client has for the nodes they do name.
+   *
+   * The membership test goes through `cluster.hasNode`, which owns the one place a node id crosses
+   * the string/number boundary: the broker map is keyed by string and a decoded leader id is a
+   * number.
+   *
+   * @see https://cwiki.apache.org/confluence/display/KAFKA/KIP-951%3A+Leader+discovery+optimisations+for+the+client
+   * @private
+   * @param {string} topic
+   * @param {number} partition
+   * @param {{ leaderId: number, leaderEpoch: number }|null} currentLeader
+   * @param {{ nodeId: number, host: string, port: number, rack: string|null }[]} [nodeEndpoints]
+   *   absent below Fetch v16, empty on a v16+ response that carried no hint
+   * @returns {Promise<boolean>} true when the hint was applied and no refresh is needed for it
+   */
+  async applyFetchLeaderHint(topic, partition, currentLeader, nodeEndpoints) {
+    if (currentLeader == null || currentLeader.leaderId === -1) {
+      return false
+    }
+
+    const { leaderId, leaderEpoch } = currentLeader
+    const endpoints =
+      Array.isArray(nodeEndpoints) && nodeEndpoints.length > 0 ? nodeEndpoints : undefined
+    const canReachLeader =
+      (endpoints != null && endpoints.some(({ nodeId }) => nodeId === leaderId)) ||
+      this.cluster.hasNode(leaderId)
+
+    if (!canReachLeader) {
+      this.logger.debug('Dropping a leader hint for an unknown node, refreshing metadata instead', {
+        groupId: this.groupId,
+        topic,
+        partition,
+        leaderId,
+      })
+      return false
+    }
+
+    return await this.cluster.applyLeaderHint({
+      topic,
+      partition,
+      leaderId,
+      leaderEpoch,
+      nodeEndpoints: endpoints,
+    })
   }
 
   async recoverFromOffsetOutOfRange(e) {
