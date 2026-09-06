@@ -15,19 +15,21 @@ const { MemberAssignment } = require('./assignerProtocol')
 const {
   KafkaJSError,
   KafkaJSNonRetriableError,
-  KafkaJSOffsetOutOfRange,
   KafkaJSStaleTopicMetadataAssignment,
   isRebalancing,
 } = require('../errors')
-const { failure, createErrorFromCode, errorCodes } = require('../protocol/error')
+const { failure, createErrorFromCode } = require('../protocol/error')
+const {
+  partitionFetchAction,
+  topLevelFetchAction,
+  fetchedPartitionDropReason,
+} = require('./fetchErrorContract')
 const apiKeys = require('../protocol/requests/apiKeys')
 const { requests } = require('../protocol/requests')
 
-// The one error code `fetch()` below special-cases, the same way fetch/v4/response.js's `parse`
-// does for every Fetch version whose parse throws on a partition error.
-const { code: OFFSET_OUT_OF_RANGE_ERROR_CODE } = errorCodes.find(
-  (e) => e.type === 'OFFSET_OUT_OF_RANGE'
-)
+// One warning once a partition has failed five rounds running, then one every twenty-five.
+const FETCH_ERROR_WARN_THRESHOLD = 5
+const FETCH_ERROR_WARN_INTERVAL = 25
 
 const { keys } = Object
 
@@ -162,6 +164,14 @@ module.exports = class ConsumerGroup {
      * @type {{[topicName: string]: {[partition: number]: {nodeId: number, expireAt: number}}}}
      */
     this.preferredReadReplicasPerTopicPartition = {}
+    /**
+     * Consecutive fetch rounds in which a partition produced an error instead of a batch, keyed by
+     * `topic|partition`. Reset on that partition's next delivered batch, and wholesale at sync -
+     * nothing enumerates "partitions that left the assignment", so the sync reset is what bounds
+     * it. Its only purpose is to make a partition that is quietly making no progress audible.
+     * @type {Map<string, number>}
+     */
+    this.consecutiveFetchErrors = new Map()
     this.offsetManager = null
     this.subscriptionState = new SubscriptionState()
 
@@ -416,6 +426,7 @@ module.exports = class ConsumerGroup {
       groupInstanceId: this.groupInstanceId,
       pendingTopicResets: this.pendingTopicResets,
     })
+    this.consecutiveFetchErrors.clear()
   }
 
   joinAndSync() {
@@ -581,12 +592,12 @@ module.exports = class ConsumerGroup {
    * is keyed by id, and if even one is missing the whole request is capped at the last version
    * keyed by name. No extra metadata refresh is issued for a missing id.
    *
-   * At most one metadata refresh happens here, after the response has been walked, and only when
-   * the broker answered with a topic id this request never asked for.
-   *
-   * A partition-level error code is surfaced by throwing the first one found, which is what the
-   * fetch codecs below v12 do inside their own `parse`; from v12 the codec returns the codes as
-   * data and this method throws them instead, so the behaviour a caller sees is the same.
+   * Error codes are classified rather than thrown wholesale. A partition-level code costs only
+   * its own partition - the rest of the response is still delivered, the partition yields no
+   * batch, its offset is left where it was, and a rejoin is never triggered by it. A code with no
+   * classification is thrown, which is the behaviour every version had. At most one metadata
+   * refresh runs per round, after the response has been walked, however many partitions asked for
+   * one. The top-level code is classified the same way, before the walk.
    *
    * Errors are not propagated: anything thrown is handed to `recoverFromFetch`, which either
    * recovers or rethrows, and the round then yields no batches.
@@ -669,7 +680,7 @@ module.exports = class ConsumerGroup {
 
       const broker = await this.cluster.findBroker({ nodeId })
 
-      const { responses } = await broker.fetch({
+      const { errorCode: topLevelErrorCode, responses } = await broker.fetch({
         maxWaitTime: this.maxWaitTime,
         minBytes: this.minBytes,
         maxBytes: this.maxBytes,
@@ -681,33 +692,29 @@ module.exports = class ConsumerGroup {
         checkCrcs: this.checkCrcs,
       })
 
-      /**
-       * Partition errors are surfaced here for the versions whose parse does not throw. Below
-       * this, `broker.fetch` has already thrown for a failing partition and this is unreached;
-       * from here, the first failing partition across every response is thrown exactly as
-       * fetch/v4/response.js's `parse` throws it, so everything downstream - including
-       * `recoverFromFetch`/`recoverFromOffsetOutOfRange` - sees the same error it always has.
-       */
-      const failedPartition = responses
-        .flatMap(({ topicName, partitions }) =>
-          partitions
-            .filter((partition) => failure(partition.errorCode))
-            .map((partition) => Object.assign({}, partition, { topic: topicName }))
-        )
-        .shift()
-
-      if (failedPartition) {
-        const { errorCode, topic, partition } = failedPartition
-        if (errorCode === OFFSET_OUT_OF_RANGE_ERROR_CODE) {
-          throw new KafkaJSOffsetOutOfRange(createErrorFromCode(errorCode), { topic, partition })
-        }
-
-        throw createErrorFromCode(errorCode)
-      }
-
       let needsRefresh = false
 
-      const batches = responses.flatMap(({ topicName, topicId, partitions }) => {
+      // The top-level code is only decoded from Fetch v7 up, so an older response carries none -
+      // and `failure(undefined)` is true, which is why the guard is on the field's presence.
+      if (topLevelErrorCode != null && failure(topLevelErrorCode)) {
+        if (topLevelFetchAction(topLevelErrorCode) === 'throw') {
+          // Everything not in the table keeps the recovery path a request-level fetch error has
+          // always taken: refresh and rejoin for stale metadata, crash for anything else.
+          throw createErrorFromCode(topLevelErrorCode)
+        }
+
+        this.logger.warn('Fetch response carried a top-level error, refreshing metadata', {
+          groupId: this.groupId,
+          memberId: this.memberId,
+          errorCode: topLevelErrorCode,
+        })
+        await this.cluster.refreshMetadata()
+        return []
+      }
+
+      const batches = []
+
+      for (const { topicName, topicId, partitions } of responses) {
         if (topicName == null) {
           // Only reachable if a broker answered with a topic id this request never asked for.
           // Treated as stale metadata rather than dropped silently, and checked before the lookup
@@ -718,7 +725,7 @@ module.exports = class ConsumerGroup {
             topicId,
           })
           needsRefresh = true
-          return []
+          continue
         }
 
         const topicRequestData = requests.find(({ topic }) => topic === topicName)
@@ -728,39 +735,80 @@ module.exports = class ConsumerGroup {
           this.preferredReadReplicasPerTopicPartition[topicName] = preferredReadReplicas = {}
         }
 
-        return partitions
-          .filter(
-            ({ partition }) =>
-              !this.seekOffset.has(topicName, partition) &&
-              !this.subscriptionState.isPaused(topicName, partition)
-          )
-          .map((partitionData) => {
-            const { partition, preferredReadReplica } = partitionData
+        for (const partitionData of partitions) {
+          const { partition, errorCode, preferredReadReplica } = partitionData
 
-            if (preferredReadReplica != null && preferredReadReplica !== -1) {
-              const { nodeId: currentPreferredReadReplica } = preferredReadReplicas[partition] || {}
-              if (currentPreferredReadReplica !== preferredReadReplica) {
-                this.logger.info(`Preferred read replica is now ${preferredReadReplica}`, {
-                  groupId: this.groupId,
-                  memberId: this.memberId,
-                  topic: topicName,
-                  partition,
-                })
-              }
-              preferredReadReplicas[partition] = {
-                nodeId: preferredReadReplica,
-                expireAt: Date.now() + this.metadataMaxAge,
-              }
+          if (failure(errorCode)) {
+            const action = partitionFetchAction(errorCode)
+
+            if (action === 'throw') {
+              throw createErrorFromCode(errorCode)
             }
 
-            const partitionRequestData = topicRequestData.partitions.find(
-              ({ partition }) => partition === partitionData.partition
-            )
+            this.recordFetchError(topicName, partition, errorCode)
 
-            const fetchedOffset = partitionRequestData.fetchOffset
-            return new Batch(topicName, fetchedOffset, partitionData)
+            if (action === 'offset-out-of-range') {
+              // The existing recovery, for this partition only: drop the preferred replica if one
+              // is set, otherwise reset per the topic's own fromBeginning.
+              await this.recoverFromOffsetOutOfRange({ topic: topicName, partition })
+            } else if (action === 'skip-and-forget-epoch') {
+              // The client is ahead of this broker. Defending the cached epoch would make every
+              // retry resend the same rejected value; forgetting it makes the next request carry
+              // -1 and the next metadata response converge. Warned every time, because this
+              // rewrites cached cluster state and usually clears on the very next round.
+              this.logger.warn('Broker does not know the leader epoch we sent, forgetting it', {
+                groupId: this.groupId,
+                memberId: this.memberId,
+                topic: topicName,
+                partition,
+              })
+              this.cluster.forgetLeaderEpoch(topicName, partition)
+            } else if (action === 'stale-metadata') {
+              needsRefresh = true
+            }
+
+            continue
+          }
+
+          const dropReason = fetchedPartitionDropReason({
+            seeked: this.seekOffset.has(topicName, partition),
+            paused: this.subscriptionState.isPaused(topicName, partition),
+            awaitingValidation: false,
           })
-      })
+
+          if (dropReason != null) {
+            continue
+          }
+
+          // Guarded on the map being non-empty: in a healthy steady state it always is empty, and
+          // this is the per-partition success path of every fetch round.
+          if (this.consecutiveFetchErrors.size !== 0) {
+            this.consecutiveFetchErrors.delete(`${topicName}|${partition}`)
+          }
+
+          if (preferredReadReplica != null && preferredReadReplica !== -1) {
+            const { nodeId: currentPreferredReadReplica } = preferredReadReplicas[partition] || {}
+            if (currentPreferredReadReplica !== preferredReadReplica) {
+              this.logger.info(`Preferred read replica is now ${preferredReadReplica}`, {
+                groupId: this.groupId,
+                memberId: this.memberId,
+                topic: topicName,
+                partition,
+              })
+            }
+            preferredReadReplicas[partition] = {
+              nodeId: preferredReadReplica,
+              expireAt: Date.now() + this.metadataMaxAge,
+            }
+          }
+
+          const partitionRequestData = topicRequestData.partitions.find(
+            (requested) => requested.partition === partition
+          )
+
+          batches.push(new Batch(topicName, partitionRequestData.fetchOffset, partitionData))
+        }
+      }
 
       if (needsRefresh) {
         await this.cluster.refreshMetadata()
@@ -815,6 +863,39 @@ module.exports = class ConsumerGroup {
     }
 
     throw e
+  }
+
+  /**
+   * Records that one partition produced an error instead of a batch this round, and makes a
+   * partition that keeps failing audible: one warning at five consecutive error rounds, then one
+   * every twenty-five. Without it a partition parked on a "skip" code would make no progress and
+   * no noise at the default log level.
+   *
+   * @private
+   * @param {string} topic
+   * @param {number} partition
+   * @param {number} errorCode
+   * @returns {void}
+   */
+  recordFetchError(topic, partition, errorCode) {
+    const key = `${topic}|${partition}`
+    const consecutiveRounds = (this.consecutiveFetchErrors.get(key) || 0) + 1
+    this.consecutiveFetchErrors.set(key, consecutiveRounds)
+
+    if (
+      consecutiveRounds === FETCH_ERROR_WARN_THRESHOLD ||
+      (consecutiveRounds > FETCH_ERROR_WARN_THRESHOLD &&
+        (consecutiveRounds - FETCH_ERROR_WARN_THRESHOLD) % FETCH_ERROR_WARN_INTERVAL === 0)
+    ) {
+      this.logger.warn('Partition has produced consecutive fetch errors', {
+        groupId: this.groupId,
+        memberId: this.memberId,
+        topic,
+        partition,
+        errorCode,
+        consecutiveRounds,
+      })
+    }
   }
 
   async recoverFromOffsetOutOfRange(e) {
