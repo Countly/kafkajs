@@ -94,6 +94,10 @@ describe('Consumer > fetch partition error contract', () => {
       group.preferredReadReplicasPerTopicPartition[TOPIC] = {
         0: { nodeId: 2, expireAt: Date.now() + 60000 },
       }
+      // A steady-state round: the partition's position was already checked against the leader
+      // epoch the cluster reports, so entering position validation is not what drops the
+      // preference here - only the skip could.
+      group.positionValidator.markValidated(TOPIC, 0, cluster.leaderEpoch())
 
       setResponse(fetchResponse([{ partition: 0, errorCode: 78 }]))
       // The round is addressed to the preferred replica: a partition with a live preference is

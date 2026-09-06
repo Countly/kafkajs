@@ -4,6 +4,7 @@ const Decoder = require('../../../protocol/decoder')
 const Encoder = require('../../../protocol/encoder')
 const ConsumerGroup = require('../../consumerGroup')
 const OffsetManager = require('../../offsetManager')
+const { MemberAssignment } = require('../../assignerProtocol')
 const InstrumentationEventEmitter = require('../../../instrumentation/emitter')
 const apiKeys = require('../../../protocol/requests/apiKeys')
 const { responseHeaderVersion } = require('../../../protocol/headers')
@@ -78,19 +79,37 @@ const prepareRecordBatches = async () => {
   }
 }
 
-/** A v3/v4-shaped ApiVersions body advertising one Fetch range. */
-const apiVersionsBody = (fetchMaxVersion) =>
-  new Encoder()
-    .writeInt16(0)
-    .writeUVarIntArray([
+/**
+ * A v3/v4-shaped ApiVersions body advertising one Fetch range and, optionally, the
+ * OffsetForLeaderEpoch range this client implements. Omitting the latter is how a broker that
+ * cannot serve position validation is modelled: the version is decided from this table, never
+ * from a thrown error.
+ * @param {number} fetchMaxVersion
+ * @param {boolean} [offsetForLeaderEpoch] whether api key 23 appears at all
+ * @returns {Buffer}
+ */
+const apiVersionsBody = (fetchMaxVersion, offsetForLeaderEpoch = true) => {
+  const apis = [
+    new Encoder()
+      .writeInt16(apiKeys.Fetch)
+      .writeInt16(4)
+      .writeInt16(fetchMaxVersion)
+      .writeTaggedFields(),
+  ]
+
+  if (offsetForLeaderEpoch) {
+    apis.push(
       new Encoder()
-        .writeInt16(apiKeys.Fetch)
+        .writeInt16(apiKeys.OffsetForLeaderEpoch)
+        .writeInt16(0)
         .writeInt16(4)
-        .writeInt16(fetchMaxVersion)
-        .writeTaggedFields(),
-    ])
-    .writeInt32(0)
-    .writeTaggedFields().buffer
+        .writeTaggedFields()
+    )
+  }
+
+  return new Encoder().writeInt16(0).writeUVarIntArray(apis).writeInt32(0).writeTaggedFields()
+    .buffer
+}
 
 /**
  * The leader-hint tag body carried on a fetch response: a compact array of NodeId/Host/Port/Rack
@@ -271,6 +290,75 @@ const decodeFetchRequest = (writes) => {
 }
 
 /**
+ * An OffsetForLeaderEpoch v4 response body: one topic, one entry per partition.
+ *
+ * @see clients/src/main/resources/common/message/OffsetForLeaderEpochResponse.json (Apache Kafka 4.3.1)
+ * @param {{ partition: number, errorCode?: number, leaderEpoch?: number, endOffset?: string }[]} partitions
+ * @returns {Buffer}
+ */
+const offsetForLeaderEpochResponse = (partitions) =>
+  new Encoder()
+    .writeInt32(0) // throttleTimeMs
+    .writeUVarIntArray([
+      new Encoder()
+        .writeUVarIntString(TOPIC)
+        .writeUVarIntArray(
+          partitions.map(({ partition, errorCode = 0, leaderEpoch = 4, endOffset = '20' }) =>
+            new Encoder()
+              .writeInt16(errorCode)
+              .writeInt32(partition)
+              .writeInt32(leaderEpoch)
+              .writeInt64(endOffset)
+              .writeTaggedFields()
+          )
+        )
+        .writeTaggedFields(),
+    ])
+    .writeTaggedFields().buffer
+
+/**
+ * Decodes every OffsetForLeaderEpoch frame written to the fake socket, oldest first, so a spec can
+ * assert both how many attempts went out and which partitions each one carried.
+ *
+ * @see clients/src/main/resources/common/message/OffsetForLeaderEpochRequest.json (Apache Kafka 4.3.1)
+ * @param {Buffer[]} writes `state.writes`
+ * @returns {{ replicaId: number, topics: { topic: string, partitions: { partition: number,
+ *   currentLeaderEpoch: number, leaderEpoch: number }[] }[] }[]}
+ */
+const decodeOffsetForLeaderEpochRequests = (writes) =>
+  writes
+    .filter((w) => readRequestHeader(w).apiKey === apiKeys.OffsetForLeaderEpoch)
+    .map((frame) => {
+      // size(4) apiKey(2) apiVersion(2) correlationId(4) clientId then a tag buffer - request
+      // header v2, whose clientId stays an INT16-prefixed string (see src/protocol/request.js).
+      const decoder = new Decoder(frame)
+      decoder.readInt32()
+      decoder.readInt16()
+      decoder.readInt16()
+      decoder.readInt32()
+      decoder.readString()
+      decoder.readTaggedFields()
+
+      const replicaId = decoder.readInt32()
+      const topics = decoder.readUVarIntArray((d) => {
+        const topic = d.readUVarIntString()
+        const partitions = d.readUVarIntArray((p) => {
+          const entry = {
+            partition: p.readInt32(),
+            currentLeaderEpoch: p.readInt32(),
+            leaderEpoch: p.readInt32(),
+          }
+          p.readTaggedFields()
+          return entry
+        })
+        d.readTaggedFields()
+        return { topic, partitions }
+      })
+
+      return { replicaId, topics }
+    })
+
+/**
  * Builds a real `Broker` wired to a real `Connection` over the fake socket from `testHelpers`.
  * `answer` receives each outgoing request's header and returns the response body to play back;
  * each response is framed with the header version that request's api key and version imply.
@@ -336,12 +424,21 @@ const createFakeBroker = (answer) => {
 /**
  * Builds a `ConsumerGroup` whose join/sync dance is skipped: `subscriptionState` and
  * `offsetManager` are primed directly, mirroring what a real join would have produced.
- * @param {{ cluster: object, broker: Broker, partitions: number[], checkCrcs: boolean }} options
+ * @param {{ cluster: object, broker: Broker, partitions: number[], checkCrcs: boolean,
+ *   autoCommit: boolean, retry: object, position: string }} options
  * @returns {ConsumerGroup}
  */
-const buildConsumerGroup = ({ cluster, broker, partitions, checkCrcs }) => {
+const buildConsumerGroup = ({
+  cluster,
+  broker,
+  partitions,
+  checkCrcs,
+  autoCommit,
+  retry,
+  position,
+}) => {
   const group = new ConsumerGroup({
-    retry: { retries: 0 },
+    retry,
     cluster,
     groupId: 'test-group',
     topics: [TOPIC],
@@ -355,7 +452,7 @@ const buildConsumerGroup = ({ cluster, broker, partitions, checkCrcs }) => {
     minBytes: 1,
     maxBytes: 1048576,
     maxWaitTimeInMs: 100,
-    autoCommit: false,
+    autoCommit,
     autoCommitInterval: null,
     autoCommitThreshold: null,
     isolationLevel: 0,
@@ -369,7 +466,7 @@ const buildConsumerGroup = ({ cluster, broker, partitions, checkCrcs }) => {
     cluster,
     coordinator: broker,
     memberAssignment: { [TOPIC]: partitions },
-    autoCommit: false,
+    autoCommit,
     topicConfigurations: { [TOPIC]: {} },
     instrumentationEmitter: new InstrumentationEventEmitter(),
     groupId: 'test-group',
@@ -380,7 +477,7 @@ const buildConsumerGroup = ({ cluster, broker, partitions, checkCrcs }) => {
   // A real join would have resolved these from OffsetFetch; priming them directly is what lets
   // this scenario skip the join dance while keeping the Fetch path completely real.
   for (const partition of partitions) {
-    group.offsetManager.committedOffsets()[TOPIC][partition] = '0'
+    group.offsetManager.committedOffsets()[TOPIC][partition] = position
   }
 
   return group
@@ -389,10 +486,16 @@ const buildConsumerGroup = ({ cluster, broker, partitions, checkCrcs }) => {
 /**
  * A primed `ConsumerGroup` over a real `Broker`/`Connection`/fake socket, whose Fetch responses
  * are **scripted per round**: `setResponse(body)` decides what the next fetch answers with, so
- * one case can drive several rounds with different bodies.
+ * one case can drive several rounds with different bodies. A function may be passed instead of a
+ * buffer, and is called at the moment the fake broker answers the frame - which is the window
+ * between the request being built and the response being walked.
+ *
+ * The same broker answers OffsetForLeaderEpoch from the validation options below, or from the
+ * function `setValidationResponse` installs, which receives the partitions the frame asked for.
  *
  * `joinAndSync` is stubbed (and returned) because the contract under test is that a partition
- * error never reaches it; leaving the real one in place would attempt a real join.
+ * error never reaches it; leaving the real one in place would attempt a real join. `sync()` still
+ * drives the real sequence, against the stubbed coordinator.
  *
  * @param {object} [options]
  * @param {number[]} [options.partitions] the assigned partitions, all led by `NODE_ID` initially
@@ -405,9 +508,29 @@ const buildConsumerGroup = ({ cluster, broker, partitions, checkCrcs }) => {
  * @param {number} [options.applyLeaderHintMovesLeaderTo] when set, an applied leader hint also
  *   rewrites the hinted partition's leader in the metadata the cluster answers with, so the next
  *   round's routing follows the hint the way it would against a real cluster
- * @returns {Promise<{ group: ConsumerGroup, cluster: object, logger: object,
- *   offsetManager: OffsetManager, joinAndSync: jest.SpyInstance, setResponse: (body: Buffer) => void,
- *   findBrokerCalls: {nodeId: number}[], lastFetchRequest: () => object[],
+ * @param {boolean} [options.autoCommit] the group's and the offset manager's auto-commit setting
+ * @param {object} [options.retry] the group's own retry options
+ * @param {string} [options.position] the committed offset every partition starts from
+ * @param {number} [options.committedEpoch] the tracked leader epoch every partition starts with;
+ *   `-1`, the default, means "unknown", which is what keeps a spec that is not about validation
+ *   free of OffsetForLeaderEpoch traffic
+ * @param {number} [options.leaderEpoch] what `cluster.leaderEpoch` answers
+ * @param {string} [options.endOffset] the `EndOffset` the OffsetForLeaderEpoch reply carries
+ * @param {number} [options.validationErrorCode] the per-partition code that reply carries
+ * @param {boolean} [options.validationThrows] make the OffsetForLeaderEpoch answer throw
+ * @param {boolean} [options.advertiseOffsetForLeaderEpoch] whether ApiVersions lists api key 23
+ * @param {number[]} [options.withholdValidationFor] partitions the reply leaves out entirely
+ * @param {number} [options.preferredReadReplica] seeds every partition's preferred read replica
+ * @param {Record<number, number>} [options.partitionLeaders] the leader of each partition; every
+ *   partition is led by `NODE_ID` unless this says otherwise
+ * @returns {Promise<{ group: ConsumerGroup, cluster: object, broker: Broker, logger: object,
+ *   offsetManager: OffsetManager, offsetCommit: jest.SpyInstance, joinAndSync: jest.SpyInstance,
+ *   setResponse: (body: Buffer|(() => Buffer)) => void,
+ *   setValidationResponse: (fn: (partitions: number[]) => Buffer) => void,
+ *   findBrokerCalls: {nodeId: number}[], sync: () => Promise<void>,
+ *   requests: () => object[], validationRequests: () => object[],
+ *   fetchRequestPartitions: () => number[], fetchRequestOffsets: () => string[],
+ *   lastFetchRequest: () => object[],
  *   lastFetchApiVersion: () => number, lastFetchHeaderFields: () => object }>}
  */
 const createFetchGroup = async ({
@@ -417,6 +540,18 @@ const createFetchGroup = async ({
   fetchMaxVersion = 18,
   applyLeaderHintResolves = true,
   applyLeaderHintMovesLeaderTo,
+  autoCommit = false,
+  retry = { retries: 0 },
+  position = '0',
+  committedEpoch = -1,
+  leaderEpoch = 5,
+  endOffset = '20',
+  validationErrorCode = 0,
+  validationThrows = false,
+  advertiseOffsetForLeaderEpoch = true,
+  withholdValidationFor = [],
+  preferredReadReplica,
+  partitionLeaders,
 } = {}) => {
   let nextResponse = fetchResponse(
     partitions.map((partition) => ({ partition, errorCode: 0 })),
@@ -426,13 +561,65 @@ const createFetchGroup = async ({
     nextResponse = body
   }
 
-  const { broker, state } = createFakeBroker((header) =>
-    header.apiKey === apiKeys.ApiVersions ? apiVersionsBody(fetchMaxVersion) : nextResponse
-  )
+  let validationAnswer = (requestedPartitions) => {
+    if (validationThrows) {
+      throw new Error('connection lost')
+    }
+
+    return offsetForLeaderEpochResponse(
+      requestedPartitions
+        .filter((partition) => !withholdValidationFor.includes(partition))
+        .map((partition) => ({
+          partition,
+          errorCode: validationErrorCode,
+          leaderEpoch: 4,
+          endOffset,
+        }))
+    )
+  }
+  const setValidationResponse = (fn) => {
+    validationAnswer = fn
+  }
+
+  const { broker, state } = createFakeBroker((header) => {
+    if (header.apiKey === apiKeys.ApiVersions) {
+      return apiVersionsBody(fetchMaxVersion, advertiseOffsetForLeaderEpoch)
+    }
+
+    if (header.apiKey === apiKeys.OffsetForLeaderEpoch) {
+      const sent = decodeOffsetForLeaderEpochRequests(state.writes)
+      const requested = sent[sent.length - 1].topics[0].partitions.map(({ partition }) => partition)
+      return validationAnswer(requested)
+    }
+
+    return typeof nextResponse === 'function' ? nextResponse() : nextResponse
+  })
   await broker.connect()
 
-  const leaders = new Map(partitions.map((partition) => [partition, NODE_ID]))
+  const leaders = new Map(
+    partitions.map((partition) => [
+      partition,
+      partitionLeaders ? partitionLeaders[partition] : NODE_ID,
+    ])
+  )
   const findBrokerCalls = []
+  const coordinator = {
+    isConnected: () => true,
+    joinGroup: async () => ({
+      generationId: 1,
+      leaderId: 'leader-1',
+      memberId: 'member-1',
+      members: [],
+      groupProtocol: 'RoundRobinAssigner',
+    }),
+    syncGroup: async () => ({
+      memberAssignment: MemberAssignment.encode({
+        version: 1,
+        assignment: { [TOPIC]: partitions },
+      }),
+    }),
+    offsetCommit: async () => ({}),
+  }
   const cluster = {
     refreshMetadataIfNecessary: async () => {},
     refreshMetadata: jest.fn(async () => {}),
@@ -440,11 +627,18 @@ const createFetchGroup = async ({
       findBrokerCalls.push(args)
       return broker
     },
+    findGroupCoordinator: async () => coordinator,
     findTopicPartitionMetadata: () =>
       partitions.map((partitionId) => ({ partitionId, leader: leaders.get(partitionId) })),
+    findLeaderForPartitions: (topic, partitionIds) =>
+      partitionIds.reduce((result, id) => {
+        const leader = leaders.get(Number(id))
+        return { ...result, [leader]: [...(result[leader] || []), Number(id)] }
+      }, {}),
     committedOffsets: () => ({}),
+    defaultOffset: () => '-2',
     topicId: () => TOPIC_ID,
-    leaderEpoch: () => 5,
+    leaderEpoch: () => leaderEpoch,
     forgetLeaderEpoch: jest.fn(() => true),
     applyLeaderHint: jest.fn(async ({ partition }) => {
       if (applyLeaderHintResolves && applyLeaderHintMovesLeaderTo != null) {
@@ -455,17 +649,62 @@ const createFetchGroup = async ({
     hasNode: jest.fn((nodeId) => knownNodes.includes(Number(nodeId))),
   }
 
-  const group = buildConsumerGroup({ cluster, broker, partitions, checkCrcs })
+  const group = buildConsumerGroup({
+    cluster,
+    broker,
+    partitions,
+    checkCrcs,
+    autoCommit,
+    retry,
+    position,
+  })
+
+  for (const partition of partitions) {
+    group.offsetManager.resolvedEpochs[TOPIC][partition] = committedEpoch
+  }
+
+  if (preferredReadReplica != null) {
+    group.preferredReadReplicasPerTopicPartition[TOPIC] = Object.fromEntries(
+      partitions.map((partition) => [
+        partition,
+        { nodeId: preferredReadReplica, expireAt: Date.now() + 60000 },
+      ])
+    )
+  }
+
+  // Every offset commit the group makes in these specs (an auto-commit seek, a reset) would go to
+  // the fake broker, whose version table advertises no OffsetCommit; the coordinator round trip is
+  // not what any of them is about.
+  const offsetCommit = jest.spyOn(broker, 'offsetCommit').mockResolvedValue({ topics: [] })
+
+  // Captured before the stub so `sync()` can drive the production join/sync against the stubbed
+  // coordinator, while the fetch path keeps seeing a rejoin it must never trigger.
+  const realJoinAndSync = group.joinAndSync.bind(group)
   const joinAndSync = jest.spyOn(group, 'joinAndSync').mockResolvedValue(undefined)
 
   return {
     group,
     cluster,
+    broker,
     logger: group.logger,
     offsetManager: group.offsetManager,
+    offsetCommit,
     joinAndSync,
     setResponse,
+    setValidationResponse,
     findBrokerCalls,
+    /** Drives the real join/sync sequence against the stubbed coordinator. */
+    sync: () => realJoinAndSync(),
+    /** The header of every request written to the socket, oldest first. */
+    requests: () => state.writes.map(readRequestHeader),
+    /** Every OffsetForLeaderEpoch frame written to the socket, decoded, oldest first. */
+    validationRequests: () => decodeOffsetForLeaderEpochRequests(state.writes),
+    /** The partitions of the last Fetch frame on the wire. */
+    fetchRequestPartitions: () =>
+      decodeFetchRequest(state.writes).topics[0].partitions.map(({ partition }) => partition),
+    /** The fetch offsets of the last Fetch frame on the wire. */
+    fetchRequestOffsets: () =>
+      decodeFetchRequest(state.writes).topics[0].partitions.map(({ fetchOffset }) => fetchOffset),
     /** The per-partition fields of the last Fetch frame actually written to the socket. */
     lastFetchRequest: () => decodeFetchRequest(state.writes).topics[0].partitions,
     /** The version the last Fetch frame was actually encoded at. */
@@ -502,5 +741,6 @@ module.exports = {
   TOPIC_ID,
   prepareRecordBatches,
   fetchResponse,
+  offsetForLeaderEpochResponse,
   createFetchGroup,
 }

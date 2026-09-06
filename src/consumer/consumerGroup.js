@@ -8,8 +8,9 @@ const OffsetManager = require('./offsetManager')
 const Batch = require('./batch')
 const SeekOffsets = require('./seekOffsets')
 const SubscriptionState = require('./subscriptionState')
+const PositionValidator = require('./positionValidator')
 const {
-  events: { GROUP_JOIN, HEARTBEAT, CONNECT, RECEIVED_UNSUBSCRIBED_TOPICS },
+  events: { GROUP_JOIN, HEARTBEAT, CONNECT, RECEIVED_UNSUBSCRIBED_TOPICS, LOG_TRUNCATION },
 } = require('./instrumentationEvents')
 const { MemberAssignment } = require('./assignerProtocol')
 const {
@@ -172,6 +173,24 @@ module.exports = class ConsumerGroup {
      * @type {Map<string, number>}
      */
     this.consecutiveFetchErrors = new Map()
+
+    /** @type {PositionValidator} */
+    this.positionValidator = new PositionValidator({ logger: this.logger })
+
+    /**
+     * Brokers already logged as unable to serve position validation, so the notice is one per
+     * broker per assignment rather than one per round. Cleared at sync with the validator.
+     * @type {Set<number>}
+     */
+    this.validationUnusableLogged = new Set()
+
+    /**
+     * Position validation gets its own bounded retrier rather than the group's: the group's budget
+     * comes from the user's `retry` options and could block a whole node's fetch loop while a
+     * partition that is merely unvalidated could have been fetched.
+     */
+    this.validationRetrier = createRetry({ retries: 2, maxRetryTime: 5000 })
+
     this.offsetManager = null
     this.subscriptionState = new SubscriptionState()
 
@@ -427,6 +446,8 @@ module.exports = class ConsumerGroup {
       pendingTopicResets: this.pendingTopicResets,
     })
     this.consecutiveFetchErrors.clear()
+    this.positionValidator.clear()
+    this.validationUnusableLogged.clear()
   }
 
   joinAndSync() {
@@ -523,6 +544,7 @@ module.exports = class ConsumerGroup {
 
     this.preferredReadReplicasPerTopicPartition[topic] = {}
     this.seekOffset.deleteTopic(topic)
+    this.positionValidator.forgetTopic(topic, this.offsetManager.memberAssignment[topic])
     this.offsetManager.resetOffsetsForTopic(topic)
   }
 
@@ -616,6 +638,7 @@ module.exports = class ConsumerGroup {
       topicPartitions = this.filterPartitionsByNode(nodeId, topicPartitions)
 
       await this.seekOffsets(topicPartitions)
+      await this.validatePositions(topicPartitions)
 
       const committedOffsets = this.offsetManager.committedOffsets()
       const activeTopicPartitions = this.getActiveTopicPartitions()
@@ -641,7 +664,11 @@ module.exports = class ConsumerGroup {
                  * @issue https://github.com/tulios/kafkajs/pull/578
                  */
                 committedOffsets[topic][partition] != null &&
-                activeTopicPartitions[topic].has(partition)
+                activeTopicPartitions[topic].has(partition) &&
+                // A partition another fetcher put into validation is left out of this request:
+                // its position is the thing being checked, so fetching from it would be reading
+                // from an offset this client is not yet sure still exists.
+                !this.positionValidator.isAwaiting(topic, partition)
             )
             .map((partition) => ({
               partition,
@@ -787,7 +814,7 @@ module.exports = class ConsumerGroup {
           const dropReason = fetchedPartitionDropReason({
             seeked: this.seekOffset.has(topicName, partition),
             paused: this.subscriptionState.isPaused(topicName, partition),
-            awaitingValidation: false,
+            awaitingValidation: this.positionValidator.isAwaiting(topicName, partition),
           })
 
           if (dropReason != null) {
@@ -1073,6 +1100,376 @@ module.exports = class ConsumerGroup {
 
   hasSeekOffset({ topic, partition }) {
     return this.seekOffset.has(topic, partition)
+  }
+
+  /**
+   * Checks, before this round's request is built, that each assigned partition's position still
+   * exists on its current leader (KIP-320).
+   *
+   * A partition is examined when the leader epoch it was last validated against has changed - or
+   * was never recorded - and both its tracked epoch and the cached leader epoch are known. Java
+   * uses the same two triggers and no others. Validation is a **blocking gate**: a partition still
+   * awaiting a reply is absent from the request built afterwards, which is why this method must
+   * never return leaving one in that state.
+   *
+   * Nothing this method does may reach the caller as an exception. A transport failure, a
+   * coordinator failure or anything unexpected is warned and swallowed, every partition it touched
+   * is marked validated, and the round proceeds - validation is an optimisation over
+   * correctness-on-the-next-round, never a reason to crash a consumer.
+   *
+   * @see https://cwiki.apache.org/confluence/display/KAFKA/KIP-320%3A+Allow+fetchers+to+detect+and+handle+log+truncation
+   * @param {import("../../types").TopicPartitions[]} topicPartitions the node-filtered assignment,
+   *   which is a superset of what the request keeps: it also contains partitions with no committed
+   *   offset, whose tracked epoch was cleared with that offset, so they answer 'validated' with no
+   *   request and are safe to touch.
+   * @returns {Promise<void>}
+   */
+  async validatePositions(topicPartitions) {
+    let awaiting
+
+    try {
+      for (const { topic, partitions } of topicPartitions) {
+        for (const partition of partitions) {
+          // A queued user seek is newer, more specific intent than anything validation could
+          // conclude. seekOffsets() has just popped this round's seeks, so the only entries this
+          // can find are seeks that arrived while validation itself was awaiting.
+          if (this.seekOffset.has(topic, partition)) {
+            continue
+          }
+
+          const currentLeaderEpoch = this.cluster.leaderEpoch(topic, partition)
+          const trackedEpoch = this.offsetManager.lastConsumedEpoch(topic, partition)
+          // No early return while validation is disabled: `request()` still answers 'validated'
+          // rather than 'unchanged' for a partition whose leader epoch moved, and the
+          // preferred-read-replica clearing below still has to happen - a replica chosen under the
+          // old leader is not a safe place to keep reading from, whether or not this client is
+          // still asking the leader about its position.
+          const { action, generation } = this.positionValidator.request(topic, partition, {
+            offset: this.offsetManager.nextOffset(topic, partition).toString(),
+            trackedEpoch,
+            currentLeaderEpoch,
+          })
+
+          if (action === 'unchanged') {
+            continue
+          }
+
+          const replicas = this.preferredReadReplicasPerTopicPartition[topic]
+          if (replicas) {
+            delete replicas[partition]
+          }
+
+          if (action === 'awaiting') {
+            awaiting = awaiting || []
+            awaiting.push({ topic, partition, trackedEpoch, currentLeaderEpoch, generation })
+          }
+        }
+      }
+
+      if (awaiting) {
+        await this.runValidationRequests(awaiting)
+      }
+    } catch (e) {
+      this.logger.warn('Position validation failed, fetching unvalidated', {
+        groupId: this.groupId,
+        memberId: this.memberId,
+        error: e.message,
+      })
+    } finally {
+      // The invariant: no partition may be left awaiting with no request in flight.
+      for (const { topic, partition, currentLeaderEpoch } of awaiting || []) {
+        if (this.positionValidator.isAwaiting(topic, partition)) {
+          this.positionValidator.markValidated(topic, partition, currentLeaderEpoch)
+        }
+      }
+    }
+  }
+
+  /**
+   * Issues the OffsetForLeaderEpoch requests for the partitions `validatePositions()` put into
+   * flight, and applies every partition's outcome.
+   *
+   * Grouping is by **leader**, not by the node this round fetches from: a partition may be read
+   * from a preferred replica while only its leader can answer for its epochs. It is by topic as
+   * well, because `Topic` is a map key on the request.
+   *
+   * @private
+   * @param {{topic: string, partition: number, trackedEpoch: number, currentLeaderEpoch: number,
+   *   generation: number}[]} awaiting
+   * @returns {Promise<void>}
+   */
+  async runValidationRequests(awaiting) {
+    const entriesByTopic = new Map()
+    for (const entry of awaiting) {
+      const entries = entriesByTopic.get(entry.topic) || []
+      entries.push(entry)
+      entriesByTopic.set(entry.topic, entries)
+    }
+
+    /** @type {Map<number, {topic: string, entries: object[]}[]>} */
+    const perLeader = new Map()
+    for (const [topic, entries] of entriesByTopic) {
+      const partitionsPerLeader = this.cluster.findLeaderForPartitions(
+        topic,
+        entries.map(({ partition }) => partition)
+      )
+
+      for (const [leader, partitions] of Object.entries(partitionsPerLeader)) {
+        const nodeId = Number(leader)
+        const led = new Set(partitions)
+        const topics = perLeader.get(nodeId) || []
+        topics.push({ topic, entries: entries.filter(({ partition }) => led.has(partition)) })
+        perLeader.set(nodeId, topics)
+      }
+    }
+
+    for (const [nodeId, topics] of perLeader) {
+      await this.validateOnLeader(nodeId, topics)
+    }
+  }
+
+  /**
+   * Validates one leader's share of this round, retrying only the partitions that asked for it.
+   *
+   * Whether the leader can serve the API at all is decided from its advertised versions, never by
+   * catching `KafkaJSServerDoesNotSupportApiKey`: that error is non-retriable and would reach the
+   * fetch's own recovery, crashing the consumer once per round.
+   *
+   * @private
+   * @param {number} nodeId the leader of every partition in `topics`
+   * @param {{topic: string, entries: object[]}[]} topics
+   * @returns {Promise<void>}
+   */
+  async validateOnLeader(nodeId, topics) {
+    // A non-retriable reply from an earlier leader in this same round switched validation off for
+    // the assignment; asking the remaining leaders would buy nothing and cost a round trip each.
+    if (this.positionValidator.isDisabled()) {
+      this.markAllValidated(topics)
+      return
+    }
+
+    const broker = await this.cluster.findBroker({ nodeId })
+    const version = broker.negotiatedVersion(
+      apiKeys.OffsetForLeaderEpoch,
+      requests.OffsetForLeaderEpoch
+    )
+
+    if (version == null) {
+      if (!this.validationUnusableLogged.has(nodeId)) {
+        this.validationUnusableLogged.add(nodeId)
+        this.logger.info('Broker cannot validate positions, fetching unvalidated', {
+          groupId: this.groupId,
+          memberId: this.memberId,
+          nodeId,
+        })
+      }
+
+      this.markAllValidated(topics)
+      return
+    }
+
+    let pending = topics
+
+    try {
+      await this.validationRetrier(async () => {
+        const response = await broker.offsetForLeaderEpoch({
+          topics: pending.map(({ topic, entries }) => ({
+            topic,
+            partitions: entries.map(({ partition, currentLeaderEpoch, trackedEpoch }) => ({
+              partition,
+              currentLeaderEpoch,
+              leaderEpoch: trackedEpoch,
+            })),
+          })),
+        })
+
+        pending = await this.applyValidationResponse(pending, response)
+
+        if (pending.length > 0) {
+          // `createRetry` only retries a thrown error, and the response codec deliberately does
+          // not throw on a per-partition code.
+          throw new KafkaJSError('Position validation retriable')
+        }
+      })
+    } catch (e) {
+      if (e.name !== 'KafkaJSNumberOfRetriesExceeded') {
+        throw e
+      }
+
+      this.logger.warn('Position validation did not complete, fetching unvalidated', {
+        groupId: this.groupId,
+        memberId: this.memberId,
+        nodeId,
+        error: e.message,
+      })
+
+      for (const { topic, entries } of pending) {
+        for (const { partition, currentLeaderEpoch } of entries) {
+          if (!this.positionValidator.isAwaiting(topic, partition)) {
+            continue
+          }
+
+          // The epoch is cleared and the offset left alone: the partition is fetched from where it
+          // is, unvalidated, and validates again once it consumes a record.
+          this.offsetManager.forgetConsumedEpoch(topic, partition)
+          this.positionValidator.markValidated(topic, partition, currentLeaderEpoch)
+        }
+      }
+    }
+  }
+
+  /**
+   * Classifies every partition of one OffsetForLeaderEpoch reply and applies its outcome.
+   *
+   * @private
+   * @param {{topic: string, entries: object[]}[]} pending the partitions this attempt asked about
+   * @param {object} response the decoded reply
+   * @returns {Promise<{topic: string, entries: object[]}[]>} the partitions to ask again about,
+   *   empty when the round is done. A partition the reply does not mention is left to the caller's
+   *   awaiting sweep rather than retried: the broker answered without it.
+   */
+  async applyValidationResponse(pending, response) {
+    const replies = new Map()
+    for (const { topic, partitions } of response.topics) {
+      for (const reply of partitions) {
+        replies.set(`${topic}|${reply.partition}`, reply)
+      }
+    }
+
+    const retry = []
+    let fatal = false
+
+    for (const { topic, entries } of pending) {
+      const retriable = []
+
+      for (const entry of entries) {
+        const reply = replies.get(`${topic}|${entry.partition}`)
+
+        if (!reply) {
+          continue
+        }
+
+        // Read again now, not the pair captured when the request was made: comparing the captured
+        // pair with itself could never detect a position that moved under the request.
+        const offset = this.offsetManager.nextOffset(topic, entry.partition).toString()
+        const outcome = this.positionValidator.complete(
+          topic,
+          entry.partition,
+          { offset, trackedEpoch: this.offsetManager.lastConsumedEpoch(topic, entry.partition) },
+          {
+            errorCode: reply.errorCode,
+            endOffset: reply.endOffset,
+            leaderEpoch: reply.leaderEpoch,
+            seekQueued: this.seekOffset.has(topic, entry.partition),
+            generation: entry.generation,
+          }
+        )
+
+        if (outcome.action === 'retry') {
+          retriable.push(entry)
+        } else if (outcome.action === 'fatal') {
+          fatal = true
+        } else {
+          try {
+            await this.applyValidationOutcome(topic, entry.partition, offset, outcome)
+          } catch (e) {
+            // `complete()` already recorded the partition as validated, so leaving it there would
+            // hide a divergence for good: the next round would answer 'unchanged' and the position
+            // it was told to leave would stand, with no event and no second attempt. Returning the
+            // key to unvalidated is what makes the next round decide it again.
+            this.positionValidator.forgetTopic(topic, [entry.partition])
+            this.logger.warn('Could not apply a position validation outcome, retrying next round', {
+              groupId: this.groupId,
+              memberId: this.memberId,
+              topic,
+              partition: entry.partition,
+              error: e.message,
+            })
+          }
+        }
+      }
+
+      if (retriable.length > 0) {
+        retry.push({ topic, entries: retriable })
+      }
+    }
+
+    if (fatal) {
+      // Once per assignment, and only from the call that flips validation off: `disable()` makes
+      // `request()` answer without a reply from here on and `validateOnLeader` returns early for
+      // every remaining leader of this round, but fetchers run one per node and two of them can
+      // reach a non-retriable reply at the same moment.
+      if (!this.positionValidator.isDisabled()) {
+        this.logger.warn('Positions cannot be validated, continuing without validation', {
+          groupId: this.groupId,
+          memberId: this.memberId,
+        })
+        this.positionValidator.disable()
+      }
+
+      this.markAllValidated(pending)
+      return []
+    }
+
+    return retry
+  }
+
+  /**
+   * Moves every partition of these entries on without a reply, leaving their tracked epochs alone.
+   * @private
+   * @param {{topic: string, entries: object[]}[]} topics
+   * @returns {void}
+   */
+  markAllValidated(topics) {
+    for (const { topic, entries } of topics) {
+      for (const { partition, currentLeaderEpoch } of entries) {
+        this.positionValidator.markValidated(topic, partition, currentLeaderEpoch)
+      }
+    }
+  }
+
+  /**
+   * Applies one validation outcome that concluded the log diverged, and announces it.
+   *
+   * @private
+   * @param {string} topic
+   * @param {number} partition
+   * @param {string} offset the position that was validated
+   * @param {{action: string, divergingOffset: string|null, leaderEpoch: number}} outcome
+   * @returns {Promise<void>}
+   */
+  async applyValidationOutcome(topic, partition, offset, outcome) {
+    if (outcome.action === 'truncated') {
+      this.logger.warn('Log truncation detected, repositioning the partition', {
+        groupId: this.groupId,
+        topic,
+        partition,
+        offset,
+        divergingOffset: outcome.divergingOffset,
+      })
+      // Applied inline, not through the seek queue: the queue is drained at the top of a round, so
+      // a queued seek would land one round late - and would overwrite a user seek queued in the
+      // same window, since the queue is last-writer-wins per key.
+      await this.offsetManager.seek({ topic, partition, offset: outcome.divergingOffset })
+    } else if (outcome.action === 'reset') {
+      this.logger.warn('Log truncation detected but the divergence point is unknown, resetting', {
+        groupId: this.groupId,
+        topic,
+        partition,
+        offset,
+      })
+      await this.offsetManager.setDefaultOffset({ topic, partition })
+    } else {
+      return
+    }
+
+    this.instrumentationEmitter.emit(LOG_TRUNCATION, {
+      topic,
+      partition,
+      offset,
+      divergingOffset: outcome.divergingOffset,
+      leaderEpoch: outcome.leaderEpoch,
+    })
   }
 
   /**
