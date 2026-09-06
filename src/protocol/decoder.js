@@ -331,6 +331,29 @@ module.exports = class Decoder {
     return array
   }
 
+  /**
+   * `readUVarIntArray`'s compact-array framing (a UVarInt length, 0 meaning null), with each
+   * element read through an async reader. Used where an element decode itself awaits, such as a
+   * Fetch v12+ partition's record batch.
+   * @param {(decoder: Decoder) => Promise<*>} reader
+   * @returns {Promise<Array|null>}
+   */
+  async readUVarIntArrayAsync(reader) {
+    const length = this.readUVarInt()
+
+    if (length === 0) {
+      return null
+    }
+
+    this.ensureReadable(length - 1, 'readUVarIntArrayAsync')
+    const array = new Array(length - 1)
+    for (let i = 0; i < length - 1; i++) {
+      array[i] = await reader(this)
+    }
+
+    return array
+  }
+
   readVarInt() {
     let currentByte
     let result = 0

@@ -5,6 +5,11 @@ const { KafkaJSNonRetriableError } = require('../errors')
 const apiKeys = require('../protocol/requests/apiKeys')
 const shuffle = require('../utils/shuffle')
 
+// The last Fetch version keyed by topic name. A request that supplies no topic ids cannot be sent
+// above it, whatever the broker advertises.
+// @see clients/src/main/resources/common/message/FetchRequest.json (Apache Kafka 4.3.1)
+const FETCH_TOPIC_NAMES_MAX_VERSION = 12
+
 const PRIVATE = {
   SEND_REQUEST: Symbol('private:Broker:sendRequest'),
   API_VERSIONS_AT: Symbol('private:Broker:apiVersionsAt'),
@@ -270,10 +275,13 @@ module.exports = class Broker {
    * @param {object} definition the entry from `requests`
    * @param {number} [maxVersion] the highest version this request may negotiate
    * @returns {import("../protocol/requests").Request}
+   * @throws {Error} `Broker not connected` before the first successful `connect()`, same as
+   *   `lookupRequest` itself — a cap must not bypass that guard by reaching for `this.versions`
+   *   (still `null` at that point) directly.
    * @throws {KafkaJSServerDoesNotSupportApiKey} when no implemented version is at or below the cap
    */
   lookupRequestWithMax(apiKey, definition, maxVersion) {
-    if (maxVersion === undefined) {
+    if (maxVersion === undefined || this.lookupRequest === notInitializedLookup) {
       return this.lookupRequest(apiKey, definition)
     }
 
@@ -439,6 +447,10 @@ module.exports = class Broker {
    * @param {boolean} [request.checkCrcs=true] Verify the CRC32C checksum of every record batch in the response
    *                           (Java's `check.crcs`). A mismatch throws `KafkaJSPartialMessageError` with
    *                           `crcMismatch: true` instead of silently accepting the batch.
+   * @param {Map<string, string>} [request.topicIds] topic name -> topic id, for every topic in
+   *   this request. A request that supplies none is capped at the last version keyed by name, so a
+   *   caller that knows nothing about topic ids keeps working unchanged.
+   * @param {number} [request.maxVersion] an additional ceiling; the lower of the two wins.
    * @returns {Promise}
    */
   async fetch({
@@ -448,11 +460,20 @@ module.exports = class Broker {
     minBytes = 1,
     maxBytes = 10485760,
     topics,
+    topicIds,
+    maxVersion,
     rackId = '',
     checkCrcs = true,
   }) {
     // TODO: validate topics not null/empty
-    const fetch = this.lookupRequest(apiKeys.Fetch, requests.Fetch)
+    // Ids are what v13+ is keyed by, so a request without them cannot be sent above v12. A caller
+    // may still ask for something lower.
+    const cap =
+      topicIds == null
+        ? Math.min(FETCH_TOPIC_NAMES_MAX_VERSION, maxVersion === undefined ? Infinity : maxVersion)
+        : maxVersion
+
+    const fetch = this.lookupRequestWithMax(apiKeys.Fetch, requests.Fetch, cap)
 
     // Shuffle topic-partitions to ensure fair response allocation across partitions (KIP-74)
     const flattenedTopicPartitions = topics.reduce((topicPartitions, { topic, partitions }) => {
@@ -488,6 +509,7 @@ module.exports = class Broker {
         minBytes,
         maxBytes,
         topics: consolidatedTopicPartitions,
+        topicIds,
         rackId,
         checkCrcs,
       })

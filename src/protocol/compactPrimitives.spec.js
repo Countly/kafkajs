@@ -91,6 +91,18 @@ describe('Protocol > compact primitives (KIP-482)', () => {
       expect(new Decoder(bytes(1)).readUVarIntArray((d) => d.readInt8())).toEqual([])
       expect(new Decoder(bytes(3, 7, 8)).readUVarIntArray((d) => d.readInt8())).toEqual([7, 8])
     })
+
+    test('readUVarIntArrayAsync awaits each element reader with the same framing', async () => {
+      await expect(
+        new Decoder(bytes(0)).readUVarIntArrayAsync(async (d) => d.readInt8())
+      ).resolves.toBeNull()
+      await expect(
+        new Decoder(bytes(1)).readUVarIntArrayAsync(async (d) => d.readInt8())
+      ).resolves.toEqual([])
+      await expect(
+        new Decoder(bytes(3, 7, 8)).readUVarIntArrayAsync(async (d) => d.readInt8())
+      ).resolves.toEqual([7, 8])
+    })
   })
 
   describe('readRawUVarIntBytes', () => {

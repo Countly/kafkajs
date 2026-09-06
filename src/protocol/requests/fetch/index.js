@@ -227,6 +227,72 @@ const versions = {
       requestTimeout: requestTimeout(maxWaitTime),
     }
   },
+  12: ({
+    replicaId = REPLICA_ID,
+    isolationLevel = ISOLATION_LEVEL.READ_COMMITTED,
+    sessionId = 0,
+    sessionEpoch = -1,
+    forgottenTopics = [],
+    maxWaitTime,
+    minBytes,
+    maxBytes,
+    topics,
+    rackId,
+    checkCrcs = true,
+  }) => {
+    const request = require('./v12/request')
+    const response = require('./v12/response')
+    return {
+      request: request({
+        replicaId,
+        isolationLevel,
+        sessionId,
+        sessionEpoch,
+        forgottenTopics,
+        maxWaitTime,
+        minBytes,
+        maxBytes,
+        topics,
+        rackId,
+      }),
+      response: withOptions(response, { checkCrcs }),
+      requestTimeout: requestTimeout(maxWaitTime),
+    }
+  },
+  13: ({
+    replicaId = REPLICA_ID,
+    isolationLevel = ISOLATION_LEVEL.READ_COMMITTED,
+    sessionId = 0,
+    sessionEpoch = -1,
+    forgottenTopics = [],
+    maxWaitTime,
+    minBytes,
+    maxBytes,
+    topics,
+    topicIds,
+    rackId,
+    checkCrcs = true,
+  }) => {
+    const request = require('./v13/request')
+    const response = require('./v13/response')
+    return {
+      request: request({
+        replicaId,
+        isolationLevel,
+        sessionId,
+        sessionEpoch,
+        forgottenTopics,
+        maxWaitTime,
+        minBytes,
+        maxBytes,
+        topics,
+        topicIds,
+        rackId,
+      }),
+      response: withOptions(response, { checkCrcs }),
+      requestTimeout: requestTimeout(maxWaitTime),
+    }
+  },
 }
 
 module.exports = {

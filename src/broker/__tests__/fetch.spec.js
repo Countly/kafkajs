@@ -315,6 +315,9 @@ describe('Broker > Fetch', () => {
                 lastStartOffset: '0',
                 partition: 0,
                 preferredReadReplica: expect.optional(-1),
+                divergingEpoch: null,
+                currentLeader: null,
+                snapshotId: null,
                 messages: [
                   {
                     magicByte: 2,
@@ -399,6 +402,9 @@ describe('Broker > Fetch', () => {
                 lastStartOffset: '0',
                 partition: 0,
                 preferredReadReplica: expect.optional(-1),
+                divergingEpoch: null,
+                currentLeader: null,
+                snapshotId: null,
                 messages: [
                   {
                     magicByte: 2,
@@ -483,6 +489,9 @@ describe('Broker > Fetch', () => {
                 lastStartOffset: '0',
                 partition: 0,
                 preferredReadReplica: expect.optional(-1),
+                divergingEpoch: null,
+                currentLeader: null,
+                snapshotId: null,
                 messages: [
                   {
                     magicByte: 2,
@@ -606,6 +615,9 @@ describe('Broker > Fetch', () => {
                   highWatermark: '3',
                   partition: 0,
                   preferredReadReplica: expect.optional(-1),
+                  divergingEpoch: null,
+                  currentLeader: null,
+                  snapshotId: null,
                   messages: [],
                 },
               ],
@@ -644,6 +656,9 @@ describe('Broker > Fetch', () => {
                     lastStartOffset: '0',
                     partition: 0,
                     preferredReadReplica: expect.optional(-1),
+                    divergingEpoch: null,
+                    currentLeader: null,
+                    snapshotId: null,
                     messages: [
                       {
                         magicByte: 2,
@@ -773,6 +788,9 @@ describe('Broker > Fetch', () => {
                   lastStartOffset: '0',
                   partition: 0,
                   preferredReadReplica: expect.optional(-1),
+                  divergingEpoch: null,
+                  currentLeader: null,
+                  snapshotId: null,
                   messages: [
                     {
                       magicByte: 2,
@@ -862,6 +880,9 @@ describe('Broker > Fetch', () => {
                     lastStartOffset: '0',
                     partition: 0,
                     preferredReadReplica: expect.optional(-1),
+                    divergingEpoch: null,
+                    currentLeader: null,
+                    snapshotId: null,
                     messages: [
                       // Control record
                       {

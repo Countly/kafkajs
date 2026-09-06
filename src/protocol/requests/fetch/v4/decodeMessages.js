@@ -13,12 +13,16 @@ const RECORD_BATCH_OVERHEAD = 49
  * @param {import('../../../decoder')} decoder
  * @param {object} [options]
  * @param {boolean} [options.checkCrcs=true] forwarded to {@link RecordBatchDecoder}; see its JSDoc
+ * @param {boolean} [options.compact=false] read the records block as COMPACT_RECORDS (a UVarInt of
+ *        length + 1, 0 meaning null) rather than as an INT32 length. Fetch v12+ is flexible; every
+ *        earlier version keeps the INT32. Only the size read changes — the record-batch loop, the
+ *        CRC check and the partial-tail tolerance are shared.
  * @returns {Promise<object[]>} the decoded records
  * @throws {KafkaJSPartialMessageError} on a CRC32C mismatch (`crcMismatch: true`); a genuinely
  *         truncated tail batch (from `maxBytes`) is swallowed instead, as before
  */
 const decodeMessages = async (decoder, options = {}) => {
-  const messagesSize = decoder.readInt32()
+  const messagesSize = options.compact ? decoder.readUVarInt() - 1 : decoder.readInt32()
 
   if (messagesSize <= 0 || !decoder.canReadBytes(messagesSize)) {
     return []

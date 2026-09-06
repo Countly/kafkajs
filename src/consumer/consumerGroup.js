@@ -15,11 +15,19 @@ const { MemberAssignment } = require('./assignerProtocol')
 const {
   KafkaJSError,
   KafkaJSNonRetriableError,
+  KafkaJSOffsetOutOfRange,
   KafkaJSStaleTopicMetadataAssignment,
   isRebalancing,
 } = require('../errors')
+const { failure, createErrorFromCode, errorCodes } = require('../protocol/error')
 const apiKeys = require('../protocol/requests/apiKeys')
 const { requests } = require('../protocol/requests')
+
+// The one error code `fetch()` below special-cases, the same way fetch/v4/response.js's `parse`
+// does for every Fetch version whose parse throws on a partition error.
+const { code: OFFSET_OUT_OF_RANGE_ERROR_CODE } = errorCodes.find(
+  (e) => e.type === 'OFFSET_OUT_OF_RANGE'
+)
 
 const { keys } = Object
 
@@ -619,6 +627,30 @@ module.exports = class ConsumerGroup {
         rackId: this.rackId,
         checkCrcs: this.checkCrcs,
       })
+
+      /**
+       * Partition errors are surfaced here for the versions whose parse does not throw. Below
+       * this, `broker.fetch` has already thrown for a failing partition and this is unreached;
+       * from here, the first failing partition across every response is thrown exactly as
+       * fetch/v4/response.js's `parse` throws it, so everything downstream - including
+       * `recoverFromFetch`/`recoverFromOffsetOutOfRange` - sees the same error it always has.
+       */
+      const failedPartition = responses
+        .flatMap(({ topicName, partitions }) =>
+          partitions
+            .filter((partition) => failure(partition.errorCode))
+            .map((partition) => Object.assign({}, partition, { topic: topicName }))
+        )
+        .shift()
+
+      if (failedPartition) {
+        const { errorCode, topic, partition } = failedPartition
+        if (errorCode === OFFSET_OUT_OF_RANGE_ERROR_CODE) {
+          throw new KafkaJSOffsetOutOfRange(createErrorFromCode(errorCode), { topic, partition })
+        }
+
+        throw createErrorFromCode(errorCode)
+      }
 
       return responses.flatMap(({ topicName, partitions }) => {
         const topicRequestData = requests.find(({ topic }) => topic === topicName)

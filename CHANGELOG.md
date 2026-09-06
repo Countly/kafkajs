@@ -144,6 +144,7 @@ Upstream work this phase builds on, with thanks to its authors: PRs #1779, #1695
 
 - Internal: requests can now be negotiated with a per-request version ceiling, which is what lets a single fetch fall back to topic names, or a single produce stay below the transaction-version-2 semantics, without changing the version every other request uses.
 - `SaslAuthenticate` v2 is implemented (flexible encoding, request header v2). Custom authentication mechanisms are unaffected: a provider still returns length-prefixed bytes from `request.encode()` and still receives length-prefixed bytes in `response.decode()` — the framing change is contained inside the codec. A provider that returns a buffer whose length prefix disagrees with its contents now fails with a `KafkaJSSASLAuthenticationError` naming the mechanism, instead of putting a malformed frame on the wire.
+- Fetch v12 and v13 are implemented: v12 moves the fetch request and response onto the flexible encoding (compact strings, arrays and records, tagged fields), and v13 keys topics by id instead of by name (KIP-516). **Fetch requests move from v11 to v12 with this change**; v13 and above are only negotiated once the caller supplies topic ids, which the consumer starts doing in a later change in this release. A `broker.fetch(...)` call that supplies no ids stays at v12 permanently.
 
 #### Tooling
 

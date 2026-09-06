@@ -36,7 +36,10 @@ describe('Broker > Fetch', () => {
       logger: newLogger(),
     })
 
-    broker.lookupRequest = () => fetchRequestMock
+    // `Broker#fetch` now selects through `lookupRequestWithMax` (a call with no `topicIds` is
+    // permanently capped at v12), so that is the seam this shuffle/consolidation test stubs;
+    // stubbing `lookupRequest` alone would no longer be reached for a topics-only fetch.
+    broker.lookupRequestWithMax = () => fetchRequestMock
   })
 
   /**
