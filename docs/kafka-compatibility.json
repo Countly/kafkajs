@@ -69,7 +69,7 @@
       "gap": "current",
       "onFloor": false,
       "belowFloor": [],
-      "notes": "v11 rack / preferred read replica (KIP-392): the wire fields exist but the follower out-of-range and OFFSET_NOT_AVAILABLE handling does not. v12 flexible + LastFetchedEpoch, v13 topic IDs replace names (KIP-516), v14 OFFSET_MOVED_TO_TIERED_STORAGE (KIP-405), v15 ReplicaState (KIP-903), v16 leader hints (KIP-951), v17 ReplicaDirectoryId (KIP-853), v18 HighWatermark (KIP-1166)."
+      "notes": "v11 rack / preferred read replica (KIP-392), now fully handled: OFFSET_NOT_AVAILABLE (78) skips the partition for one round and keeps the follower, and an OFFSET_OUT_OF_RANGE from a follower drops the preferred replica and re-resolves against the leader. v12 flexible + LastFetchedEpoch (sent at its -1 default; truncation is detected through OffsetForLeaderEpoch instead), v13 topic IDs replace names (KIP-516; a request whose topics are not all known by id is capped at v12), v14 OFFSET_MOVED_TO_TIERED_STORAGE (KIP-405), v15 ReplicaState (KIP-903), v16 leader hints (KIP-951), v17 ReplicaDirectoryId (KIP-853), v18 HighWatermark (KIP-1166). Fetch sessions (KIP-227) are not implemented: every fetch is a full fetch (sessionId 0, sessionEpoch -1)."
     },
     {
       "kafkaName": "ListOffsets",
@@ -736,7 +736,7 @@
       "gap": "current",
       "onFloor": false,
       "belowFloor": [],
-      "notes": ""
+      "notes": "v1 adds SessionLifetimeMs (KIP-368 re-authentication), v2 is flexible. The mechanism-provider contract is unchanged at every version: a provider returns INT32-length-prefixed bytes from request.encode() and receives them in response.decode() - v2 strips and re-wraps that prefix inside its own codec."
     },
     {
       "kafkaName": "CreatePartitions",
@@ -942,34 +942,16 @@
   "waivers": [],
   "crossCutting": [
     {
-      "gap": "Version negotiation ignores the broker's advertised minimum version",
-      "where": "src/protocol/requests/index.js lookup()",
-      "impact": "Under a raised KIP-896 floor the client silently sends a version the broker rejects instead of failing with a clear error. This is what makes the below-floor list below dangerous rather than merely dead.",
-      "owner": "phase-2"
-    },
-    {
-      "gap": "No topic-ID (UUID) awareness anywhere in cluster metadata",
-      "where": "cluster metadata, fetch and offset paths",
-      "impact": "Blocks Fetch v13+, Produce v13, OffsetCommit/OffsetFetch v10, DeleteTopics v6, CreateTopics v7 ids, KIP-848 assignments, and exact topic-recreation detection.",
-      "owner": "phase-5"
+      "gap": "Topic IDs (UUIDs) are not yet used by every API that accepts them",
+      "where": "offset-commit and offset-fetch paths, topic administration",
+      "impact": "Cluster metadata caches each topic's id, and Fetch and Produce are keyed by it (falling back to names for a request whose ids are not all known). What remains: OffsetCommit v10 and OffsetFetch v10, KIP-848 assignments (phase-6), and topic ids on CreateTopics v7 / DeleteTopics v6 (phase-8).",
+      "owner": "phase-6"
     },
     {
       "gap": "No fetch sessions (KIP-227)",
       "where": "fetch layer",
-      "impact": "Every poll sends a full fetch request; incremental fetch is a prerequisite for efficient modern Fetch versions.",
-      "owner": "phase-5"
-    },
-    {
-      "gap": "Compression codecs: no built-in zstd (KIP-110) and no bundled LZ4",
-      "where": "src/protocol/message/compression",
-      "impact": "Users must register LZ4 themselves; zstd-compressed batches cannot be read or written out of the box.",
-      "owner": "phase-2"
-    },
-    {
-      "gap": "No rebootstrap support (KIP-899 / KIP-1102)",
-      "where": "src/cluster, src/cluster/brokerPool.js",
-      "impact": "Recovery after every known broker rotates away is accidental rather than designed: no metadata reset, no metadata.recovery.* options, no REBOOTSTRAP_REQUIRED (code 129) handling.",
-      "owner": "phase-5"
+      "impact": "Every fetch is a full request - sessionId 0, sessionEpoch -1, an empty forgotten-topics list - so a poll re-sends every assigned partition rather than only what changed. This is a decision, not an oversight: 3.0.0 ships sessionless (decision D31), and the three fetch-session error codes are mapped defensively so an unexpected one cannot crash a consumer. Incremental fetch is the prerequisite for reducing request size on a large assignment.",
+      "owner": "backlog"
     },
     {
       "gap": "Dead message-format v0/v1 write path (KIP-724)",

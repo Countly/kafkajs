@@ -25,7 +25,7 @@ describe('scripts/compat/notes.json', () => {
       expect(row.gap.length).toBeGreaterThan(0)
       expect(row.where.length).toBeGreaterThan(0)
       expect(row.impact.length).toBeGreaterThan(0)
-      expect(row.owner).toMatch(/^phase-\d$/)
+      expect(row.owner).toMatch(/^(phase-\d|backlog)$/)
     }
   })
 

@@ -9,7 +9,7 @@ Gap classes: `current` (fork max equals the Kafka max) · `behind:N` · `stub` (
 | API | Key | Kafka 4.3.1 | Flexible from | Fork | Gap | Notes |
 |---|--:|---|---|---|---|---|
 | Produce | 0 | 3-13 | v9+ | 3-13 | current | v8 per-record errors (KIP-467), v9 flexible, v10 leader hints (KIP-951), v11 TRANSACTION_ABORTABLE (KIP-890), v12 transaction-version-2 implicit add-partitions (KIP-890 part 2), v13 topic IDs (KIP-516, Kafka 4.1; may return UNKNOWN_TOPIC_ID). |
-| Fetch | 1 | 4-18 | v12+ | 4-18 | current | v11 rack / preferred read replica (KIP-392): the wire fields exist but the follower out-of-range and OFFSET_NOT_AVAILABLE handling does not. v12 flexible + LastFetchedEpoch, v13 topic IDs replace names (KIP-516), v14 OFFSET_MOVED_TO_TIERED_STORAGE (KIP-405), v15 ReplicaState (KIP-903), v16 leader hints (KIP-951), v17 ReplicaDirectoryId (KIP-853), v18 HighWatermark (KIP-1166). |
+| Fetch | 1 | 4-18 | v12+ | 4-18 | current | v11 rack / preferred read replica (KIP-392), now fully handled: OFFSET_NOT_AVAILABLE (78) skips the partition for one round and keeps the follower, and an OFFSET_OUT_OF_RANGE from a follower drops the preferred replica and re-resolves against the leader. v12 flexible + LastFetchedEpoch (sent at its -1 default; truncation is detected through OffsetForLeaderEpoch instead), v13 topic IDs replace names (KIP-516; a request whose topics are not all known by id is capped at v12), v14 OFFSET_MOVED_TO_TIERED_STORAGE (KIP-405), v15 ReplicaState (KIP-903), v16 leader hints (KIP-951), v17 ReplicaDirectoryId (KIP-853), v18 HighWatermark (KIP-1166). Fetch sessions (KIP-227) are not implemented: every fetch is a full fetch (sessionId 0, sessionEpoch -1). |
 | ListOffsets | 2 | 1-11 | v6+ | 1-9 | behind:2 | v4 leader epoch (KIP-320), v6 flexible, v7 max-timestamp (KIP-734), v8 earliest-local offset (KIP-405), v9 last-tiered offset (KIP-1005). v10 (async remote list offsets, KIP-1075) and v11 (earliest pending upload offset, KIP-1023) are deliberate gaps, not a waiver: both are tiered-storage features this client does not use. |
 | Metadata | 3 | 0-13 | v9+ | 0-13 | current | v7 leader epoch (KIP-320), v9 flexible, v10+ topic IDs, v13 adds a top-level error code and is where REBOOTSTRAP_REQUIRED surfaces (KIP-1102). |
 | OffsetCommit | 8 | 2-10 | v8+ | 2-8 | behind:2 | v6 committed leader epoch (KIP-320), v7 group instance id, v8 flexible, v9 member epoch (KIP-848), v10 topic IDs. |
@@ -37,7 +37,7 @@ Gap classes: `current` (fork max equals the Kafka max) · `behind:N` · `stub` (
 | DeleteAcls | 31 | 1-3 | v2+ | 1 | behind:2 (on-floor) | v1 is the 4.x floor and is also the fork's maximum. |
 | DescribeConfigs | 32 | 1-4 | v4+ | 1-2 | behind:2 |  |
 | AlterConfigs | 33 | 0-2 | v2+ | 0-1 | behind:1 | IncrementalAlterConfigs (key 44) is the modern replacement and is unimplemented, so config changes still overwrite rather than merge. |
-| SaslAuthenticate | 36 | 0-2 | v2+ | 0-2 | current |  |
+| SaslAuthenticate | 36 | 0-2 | v2+ | 0-2 | current | v1 adds SessionLifetimeMs (KIP-368 re-authentication), v2 is flexible. The mechanism-provider contract is unchanged at every version: a provider returns INT32-length-prefixed bytes from request.encode() and receives them in response.decode() - v2 strips and re-wraps that prefix inside its own codec. |
 | CreatePartitions | 37 | 0-3 | v2+ | 0-1 | behind:2 |  |
 | DeleteGroups | 42 | 0-2 | v2+ | 0-1 | behind:1 |  |
 | IncrementalAlterConfigs | 44 | 0-1 | v1+ | — | stub | The replacement for AlterConfigs; needed before any admin config change can be merge-semantics rather than overwrite. |
@@ -72,11 +72,8 @@ Not per-API, and not derivable from the message definitions. Each row names the 
 
 | Gap | Where | Impact | Owner |
 |---|---|---|---|
-| Version negotiation ignores the broker's advertised minimum version | src/protocol/requests/index.js lookup() | Under a raised KIP-896 floor the client silently sends a version the broker rejects instead of failing with a clear error. This is what makes the below-floor list below dangerous rather than merely dead. | phase-2 |
-| No topic-ID (UUID) awareness anywhere in cluster metadata | cluster metadata, fetch and offset paths | Blocks Fetch v13+, Produce v13, OffsetCommit/OffsetFetch v10, DeleteTopics v6, CreateTopics v7 ids, KIP-848 assignments, and exact topic-recreation detection. | phase-5 |
-| No fetch sessions (KIP-227) | fetch layer | Every poll sends a full fetch request; incremental fetch is a prerequisite for efficient modern Fetch versions. | phase-5 |
-| Compression codecs: no built-in zstd (KIP-110) and no bundled LZ4 | src/protocol/message/compression | Users must register LZ4 themselves; zstd-compressed batches cannot be read or written out of the box. | phase-2 |
-| No rebootstrap support (KIP-899 / KIP-1102) | src/cluster, src/cluster/brokerPool.js | Recovery after every known broker rotates away is accidental rather than designed: no metadata reset, no metadata.recovery.* options, no REBOOTSTRAP_REQUIRED (code 129) handling. | phase-5 |
+| Topic IDs (UUIDs) are not yet used by every API that accepts them | offset-commit and offset-fetch paths, topic administration | Cluster metadata caches each topic's id, and Fetch and Produce are keyed by it (falling back to names for a request whose ids are not all known). What remains: OffsetCommit v10 and OffsetFetch v10, KIP-848 assignments (phase-6), and topic ids on CreateTopics v7 / DeleteTopics v6 (phase-8). | phase-6 |
+| No fetch sessions (KIP-227) | fetch layer | Every fetch is a full request - sessionId 0, sessionEpoch -1, an empty forgotten-topics list - so a poll re-sends every assigned partition rather than only what changed. This is a decision, not an oversight: 3.0.0 ships sessionless (decision D31), and the three fetch-session error codes are mapped defensively so an unexpected one cannot crash a consumer. Incremental fetch is the prerequisite for reducing request size on a large assignment. | backlog |
 | Dead message-format v0/v1 write path (KIP-724) | src/protocol/message/v0, src/protocol/message/v1, src/protocol/messageSet encoders | Unreachable against a 4.x broker, which never negotiates Produce below v3 or Fetch below v4. The decoders must stay: old segments can still be returned inside a modern Fetch response. | phase-2 |
 
 ## Error table
