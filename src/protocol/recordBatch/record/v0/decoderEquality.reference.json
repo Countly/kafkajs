@@ -1,0 +1,1645 @@
+{
+  "batches": {
+    "create-time batch with headers": {
+      "firstOffset": "1000",
+      "firstTimestamp": "1700000000000",
+      "partitionLeaderEpoch": 0,
+      "inTransaction": false,
+      "isControlBatch": false,
+      "lastOffsetDelta": 0,
+      "producerId": "-1",
+      "producerEpoch": 0,
+      "firstSequence": 0,
+      "maxTimestamp": "1700000000500",
+      "timestampType": 0,
+      "records": [
+        {
+          "magicByte": 2,
+          "attributes": 0,
+          "timestamp": "1700000000000",
+          "offset": "1000",
+          "key": {
+            "type": "Buffer",
+            "data": [
+              107,
+              101,
+              121,
+              45,
+              97
+            ]
+          },
+          "value": {
+            "type": "Buffer",
+            "data": [
+              97
+            ]
+          },
+          "headers": {
+            "header-key": {
+              "type": "Buffer",
+              "data": [
+                104,
+                101,
+                97,
+                100,
+                101,
+                114,
+                45,
+                118,
+                97,
+                108,
+                117,
+                101
+              ]
+            }
+          },
+          "isControlRecord": false,
+          "batchContext": {
+            "firstOffset": "1000",
+            "firstTimestamp": "1700000000000",
+            "partitionLeaderEpoch": 0,
+            "inTransaction": false,
+            "isControlBatch": false,
+            "lastOffsetDelta": 0,
+            "producerId": "-1",
+            "producerEpoch": 0,
+            "firstSequence": 0,
+            "maxTimestamp": "1700000000500",
+            "timestampType": 0,
+            "magicByte": 2
+          }
+        },
+        {
+          "magicByte": 2,
+          "attributes": 0,
+          "timestamp": "1700000000250",
+          "offset": "1001",
+          "key": {
+            "type": "Buffer",
+            "data": [
+              107,
+              101,
+              121,
+              45,
+              98
+            ]
+          },
+          "value": {
+            "type": "Buffer",
+            "data": [
+              98
+            ]
+          },
+          "headers": {},
+          "isControlRecord": false,
+          "batchContext": {
+            "firstOffset": "1000",
+            "firstTimestamp": "1700000000000",
+            "partitionLeaderEpoch": 0,
+            "inTransaction": false,
+            "isControlBatch": false,
+            "lastOffsetDelta": 0,
+            "producerId": "-1",
+            "producerEpoch": 0,
+            "firstSequence": 0,
+            "maxTimestamp": "1700000000500",
+            "timestampType": 0,
+            "magicByte": 2
+          }
+        },
+        {
+          "magicByte": 2,
+          "attributes": 0,
+          "timestamp": "1700000000500",
+          "offset": "1002",
+          "key": null,
+          "value": {
+            "type": "Buffer",
+            "data": [
+              99
+            ]
+          },
+          "headers": {},
+          "isControlRecord": false,
+          "batchContext": {
+            "firstOffset": "1000",
+            "firstTimestamp": "1700000000000",
+            "partitionLeaderEpoch": 0,
+            "inTransaction": false,
+            "isControlBatch": false,
+            "lastOffsetDelta": 0,
+            "producerId": "-1",
+            "producerEpoch": 0,
+            "firstSequence": 0,
+            "maxTimestamp": "1700000000500",
+            "timestampType": 0,
+            "magicByte": 2
+          }
+        }
+      ]
+    },
+    "log-append-time batch": {
+      "firstOffset": "1000",
+      "firstTimestamp": "1700000000000",
+      "partitionLeaderEpoch": 0,
+      "inTransaction": false,
+      "isControlBatch": false,
+      "lastOffsetDelta": 0,
+      "producerId": "-1",
+      "producerEpoch": 0,
+      "firstSequence": 0,
+      "maxTimestamp": "1700000000500",
+      "timestampType": 1,
+      "records": [
+        {
+          "magicByte": 2,
+          "attributes": 0,
+          "timestamp": "1700000000500",
+          "offset": "1000",
+          "key": {
+            "type": "Buffer",
+            "data": [
+              107,
+              101,
+              121,
+              45,
+              97
+            ]
+          },
+          "value": {
+            "type": "Buffer",
+            "data": [
+              97
+            ]
+          },
+          "headers": {
+            "header-key": {
+              "type": "Buffer",
+              "data": [
+                104,
+                101,
+                97,
+                100,
+                101,
+                114,
+                45,
+                118,
+                97,
+                108,
+                117,
+                101
+              ]
+            }
+          },
+          "isControlRecord": false,
+          "batchContext": {
+            "firstOffset": "1000",
+            "firstTimestamp": "1700000000000",
+            "partitionLeaderEpoch": 0,
+            "inTransaction": false,
+            "isControlBatch": false,
+            "lastOffsetDelta": 0,
+            "producerId": "-1",
+            "producerEpoch": 0,
+            "firstSequence": 0,
+            "maxTimestamp": "1700000000500",
+            "timestampType": 1,
+            "magicByte": 2
+          }
+        },
+        {
+          "magicByte": 2,
+          "attributes": 0,
+          "timestamp": "1700000000500",
+          "offset": "1001",
+          "key": {
+            "type": "Buffer",
+            "data": [
+              107,
+              101,
+              121,
+              45,
+              98
+            ]
+          },
+          "value": {
+            "type": "Buffer",
+            "data": [
+              98
+            ]
+          },
+          "headers": {},
+          "isControlRecord": false,
+          "batchContext": {
+            "firstOffset": "1000",
+            "firstTimestamp": "1700000000000",
+            "partitionLeaderEpoch": 0,
+            "inTransaction": false,
+            "isControlBatch": false,
+            "lastOffsetDelta": 0,
+            "producerId": "-1",
+            "producerEpoch": 0,
+            "firstSequence": 0,
+            "maxTimestamp": "1700000000500",
+            "timestampType": 1,
+            "magicByte": 2
+          }
+        },
+        {
+          "magicByte": 2,
+          "attributes": 0,
+          "timestamp": "1700000000500",
+          "offset": "1002",
+          "key": null,
+          "value": {
+            "type": "Buffer",
+            "data": [
+              99
+            ]
+          },
+          "headers": {},
+          "isControlRecord": false,
+          "batchContext": {
+            "firstOffset": "1000",
+            "firstTimestamp": "1700000000000",
+            "partitionLeaderEpoch": 0,
+            "inTransaction": false,
+            "isControlBatch": false,
+            "lastOffsetDelta": 0,
+            "producerId": "-1",
+            "producerEpoch": 0,
+            "firstSequence": 0,
+            "maxTimestamp": "1700000000500",
+            "timestampType": 1,
+            "magicByte": 2
+          }
+        }
+      ]
+    },
+    "control batch": {
+      "firstOffset": "1000",
+      "firstTimestamp": "1700000000000",
+      "partitionLeaderEpoch": 0,
+      "inTransaction": false,
+      "isControlBatch": true,
+      "lastOffsetDelta": 0,
+      "producerId": "-1",
+      "producerEpoch": 0,
+      "firstSequence": 0,
+      "maxTimestamp": "1700000000500",
+      "timestampType": 0,
+      "records": [
+        {
+          "magicByte": 2,
+          "attributes": 0,
+          "timestamp": "1700000000000",
+          "offset": "1000",
+          "key": {
+            "type": "Buffer",
+            "data": [
+              107,
+              101,
+              121,
+              45,
+              97
+            ]
+          },
+          "value": {
+            "type": "Buffer",
+            "data": [
+              97
+            ]
+          },
+          "headers": {
+            "header-key": {
+              "type": "Buffer",
+              "data": [
+                104,
+                101,
+                97,
+                100,
+                101,
+                114,
+                45,
+                118,
+                97,
+                108,
+                117,
+                101
+              ]
+            }
+          },
+          "isControlRecord": true,
+          "batchContext": {
+            "firstOffset": "1000",
+            "firstTimestamp": "1700000000000",
+            "partitionLeaderEpoch": 0,
+            "inTransaction": false,
+            "isControlBatch": true,
+            "lastOffsetDelta": 0,
+            "producerId": "-1",
+            "producerEpoch": 0,
+            "firstSequence": 0,
+            "maxTimestamp": "1700000000500",
+            "timestampType": 0,
+            "magicByte": 2
+          }
+        },
+        {
+          "magicByte": 2,
+          "attributes": 0,
+          "timestamp": "1700000000250",
+          "offset": "1001",
+          "key": {
+            "type": "Buffer",
+            "data": [
+              107,
+              101,
+              121,
+              45,
+              98
+            ]
+          },
+          "value": {
+            "type": "Buffer",
+            "data": [
+              98
+            ]
+          },
+          "headers": {},
+          "isControlRecord": true,
+          "batchContext": {
+            "firstOffset": "1000",
+            "firstTimestamp": "1700000000000",
+            "partitionLeaderEpoch": 0,
+            "inTransaction": false,
+            "isControlBatch": true,
+            "lastOffsetDelta": 0,
+            "producerId": "-1",
+            "producerEpoch": 0,
+            "firstSequence": 0,
+            "maxTimestamp": "1700000000500",
+            "timestampType": 0,
+            "magicByte": 2
+          }
+        },
+        {
+          "magicByte": 2,
+          "attributes": 0,
+          "timestamp": "1700000000500",
+          "offset": "1002",
+          "key": null,
+          "value": {
+            "type": "Buffer",
+            "data": [
+              99
+            ]
+          },
+          "headers": {},
+          "isControlRecord": true,
+          "batchContext": {
+            "firstOffset": "1000",
+            "firstTimestamp": "1700000000000",
+            "partitionLeaderEpoch": 0,
+            "inTransaction": false,
+            "isControlBatch": true,
+            "lastOffsetDelta": 0,
+            "producerId": "-1",
+            "producerEpoch": 0,
+            "firstSequence": 0,
+            "maxTimestamp": "1700000000500",
+            "timestampType": 0,
+            "magicByte": 2
+          }
+        }
+      ]
+    },
+    "gzip-compressed batch": {
+      "firstOffset": "1000",
+      "firstTimestamp": "1700000000000",
+      "partitionLeaderEpoch": 0,
+      "inTransaction": false,
+      "isControlBatch": false,
+      "lastOffsetDelta": 0,
+      "producerId": "-1",
+      "producerEpoch": 0,
+      "firstSequence": 0,
+      "maxTimestamp": "1700000000500",
+      "timestampType": 0,
+      "records": [
+        {
+          "magicByte": 2,
+          "attributes": 0,
+          "timestamp": "1700000000000",
+          "offset": "1000",
+          "key": {
+            "type": "Buffer",
+            "data": [
+              107,
+              101,
+              121,
+              45,
+              97
+            ]
+          },
+          "value": {
+            "type": "Buffer",
+            "data": [
+              97
+            ]
+          },
+          "headers": {
+            "header-key": {
+              "type": "Buffer",
+              "data": [
+                104,
+                101,
+                97,
+                100,
+                101,
+                114,
+                45,
+                118,
+                97,
+                108,
+                117,
+                101
+              ]
+            }
+          },
+          "isControlRecord": false,
+          "batchContext": {
+            "firstOffset": "1000",
+            "firstTimestamp": "1700000000000",
+            "partitionLeaderEpoch": 0,
+            "inTransaction": false,
+            "isControlBatch": false,
+            "lastOffsetDelta": 0,
+            "producerId": "-1",
+            "producerEpoch": 0,
+            "firstSequence": 0,
+            "maxTimestamp": "1700000000500",
+            "timestampType": 0,
+            "magicByte": 2
+          }
+        },
+        {
+          "magicByte": 2,
+          "attributes": 0,
+          "timestamp": "1700000000250",
+          "offset": "1001",
+          "key": {
+            "type": "Buffer",
+            "data": [
+              107,
+              101,
+              121,
+              45,
+              98
+            ]
+          },
+          "value": {
+            "type": "Buffer",
+            "data": [
+              98
+            ]
+          },
+          "headers": {},
+          "isControlRecord": false,
+          "batchContext": {
+            "firstOffset": "1000",
+            "firstTimestamp": "1700000000000",
+            "partitionLeaderEpoch": 0,
+            "inTransaction": false,
+            "isControlBatch": false,
+            "lastOffsetDelta": 0,
+            "producerId": "-1",
+            "producerEpoch": 0,
+            "firstSequence": 0,
+            "maxTimestamp": "1700000000500",
+            "timestampType": 0,
+            "magicByte": 2
+          }
+        },
+        {
+          "magicByte": 2,
+          "attributes": 0,
+          "timestamp": "1700000000500",
+          "offset": "1002",
+          "key": null,
+          "value": {
+            "type": "Buffer",
+            "data": [
+              99
+            ]
+          },
+          "headers": {},
+          "isControlRecord": false,
+          "batchContext": {
+            "firstOffset": "1000",
+            "firstTimestamp": "1700000000000",
+            "partitionLeaderEpoch": 0,
+            "inTransaction": false,
+            "isControlBatch": false,
+            "lastOffsetDelta": 0,
+            "producerId": "-1",
+            "producerEpoch": 0,
+            "firstSequence": 0,
+            "maxTimestamp": "1700000000500",
+            "timestampType": 0,
+            "magicByte": 2
+          }
+        }
+      ]
+    },
+    "duplicate header keys": {
+      "firstOffset": "0",
+      "firstTimestamp": "1700000000000",
+      "partitionLeaderEpoch": 0,
+      "inTransaction": false,
+      "isControlBatch": false,
+      "lastOffsetDelta": 0,
+      "producerId": "-1",
+      "producerEpoch": 0,
+      "firstSequence": 0,
+      "maxTimestamp": "1700000000000",
+      "timestampType": 0,
+      "records": [
+        {
+          "magicByte": 2,
+          "attributes": 0,
+          "timestamp": "1700000000000",
+          "offset": "0",
+          "key": null,
+          "value": {
+            "type": "Buffer",
+            "data": [
+              97
+            ]
+          },
+          "headers": {
+            "k": [
+              {
+                "type": "Buffer",
+                "data": [
+                  49
+                ]
+              },
+              {
+                "type": "Buffer",
+                "data": [
+                  50
+                ]
+              },
+              {
+                "type": "Buffer",
+                "data": [
+                  51
+                ]
+              }
+            ],
+            "single": {
+              "type": "Buffer",
+              "data": [
+                111,
+                110,
+                108,
+                121
+              ]
+            }
+          },
+          "isControlRecord": false,
+          "batchContext": {
+            "firstOffset": "0",
+            "firstTimestamp": "1700000000000",
+            "partitionLeaderEpoch": 0,
+            "inTransaction": false,
+            "isControlBatch": false,
+            "lastOffsetDelta": 0,
+            "producerId": "-1",
+            "producerEpoch": 0,
+            "firstSequence": 0,
+            "maxTimestamp": "1700000000000",
+            "timestampType": 0,
+            "magicByte": 2
+          }
+        }
+      ]
+    },
+    "a header key of __proto__": {
+      "firstOffset": "0",
+      "firstTimestamp": "1700000000000",
+      "partitionLeaderEpoch": 0,
+      "inTransaction": false,
+      "isControlBatch": false,
+      "lastOffsetDelta": 0,
+      "producerId": "-1",
+      "producerEpoch": 0,
+      "firstSequence": 0,
+      "maxTimestamp": "1700000000000",
+      "timestampType": 0,
+      "records": [
+        {
+          "magicByte": 2,
+          "attributes": 0,
+          "timestamp": "1700000000000",
+          "offset": "0",
+          "key": null,
+          "value": {
+            "type": "Buffer",
+            "data": [
+              97
+            ]
+          },
+          "headers": {
+            "__proto__": [
+              {},
+              {
+                "type": "Buffer",
+                "data": [
+                  112,
+                  111,
+                  108,
+                  108,
+                  117,
+                  116,
+                  101,
+                  100
+                ]
+              }
+            ],
+            "safe": {
+              "type": "Buffer",
+              "data": [
+                107,
+                101,
+                112,
+                116
+              ]
+            }
+          },
+          "isControlRecord": false,
+          "batchContext": {
+            "firstOffset": "0",
+            "firstTimestamp": "1700000000000",
+            "partitionLeaderEpoch": 0,
+            "inTransaction": false,
+            "isControlBatch": false,
+            "lastOffsetDelta": 0,
+            "producerId": "-1",
+            "producerEpoch": 0,
+            "firstSequence": 0,
+            "maxTimestamp": "1700000000000",
+            "timestampType": 0,
+            "magicByte": 2
+          }
+        }
+      ]
+    },
+    "offsets beyond 2^31": {
+      "firstOffset": "4294967290",
+      "firstTimestamp": "1700000000000",
+      "partitionLeaderEpoch": 0,
+      "inTransaction": false,
+      "isControlBatch": false,
+      "lastOffsetDelta": 0,
+      "producerId": "-1",
+      "producerEpoch": 0,
+      "firstSequence": 0,
+      "maxTimestamp": "1700000000500",
+      "timestampType": 0,
+      "records": [
+        {
+          "magicByte": 2,
+          "attributes": 0,
+          "timestamp": "1700000000000",
+          "offset": "4294967290",
+          "key": {
+            "type": "Buffer",
+            "data": [
+              107,
+              101,
+              121,
+              45,
+              97
+            ]
+          },
+          "value": {
+            "type": "Buffer",
+            "data": [
+              97
+            ]
+          },
+          "headers": {
+            "header-key": {
+              "type": "Buffer",
+              "data": [
+                104,
+                101,
+                97,
+                100,
+                101,
+                114,
+                45,
+                118,
+                97,
+                108,
+                117,
+                101
+              ]
+            }
+          },
+          "isControlRecord": false,
+          "batchContext": {
+            "firstOffset": "4294967290",
+            "firstTimestamp": "1700000000000",
+            "partitionLeaderEpoch": 0,
+            "inTransaction": false,
+            "isControlBatch": false,
+            "lastOffsetDelta": 0,
+            "producerId": "-1",
+            "producerEpoch": 0,
+            "firstSequence": 0,
+            "maxTimestamp": "1700000000500",
+            "timestampType": 0,
+            "magicByte": 2
+          }
+        },
+        {
+          "magicByte": 2,
+          "attributes": 0,
+          "timestamp": "1700000000250",
+          "offset": "4294967291",
+          "key": {
+            "type": "Buffer",
+            "data": [
+              107,
+              101,
+              121,
+              45,
+              98
+            ]
+          },
+          "value": {
+            "type": "Buffer",
+            "data": [
+              98
+            ]
+          },
+          "headers": {},
+          "isControlRecord": false,
+          "batchContext": {
+            "firstOffset": "4294967290",
+            "firstTimestamp": "1700000000000",
+            "partitionLeaderEpoch": 0,
+            "inTransaction": false,
+            "isControlBatch": false,
+            "lastOffsetDelta": 0,
+            "producerId": "-1",
+            "producerEpoch": 0,
+            "firstSequence": 0,
+            "maxTimestamp": "1700000000500",
+            "timestampType": 0,
+            "magicByte": 2
+          }
+        },
+        {
+          "magicByte": 2,
+          "attributes": 0,
+          "timestamp": "1700000000500",
+          "offset": "4294967292",
+          "key": null,
+          "value": {
+            "type": "Buffer",
+            "data": [
+              99
+            ]
+          },
+          "headers": {},
+          "isControlRecord": false,
+          "batchContext": {
+            "firstOffset": "4294967290",
+            "firstTimestamp": "1700000000000",
+            "partitionLeaderEpoch": 0,
+            "inTransaction": false,
+            "isControlBatch": false,
+            "lastOffsetDelta": 0,
+            "producerId": "-1",
+            "producerEpoch": 0,
+            "firstSequence": 0,
+            "maxTimestamp": "1700000000500",
+            "timestampType": 0,
+            "magicByte": 2
+          }
+        }
+      ]
+    },
+    "offsets beyond 2^53": {
+      "firstOffset": "9223372036854775800",
+      "firstTimestamp": "1700000000000",
+      "partitionLeaderEpoch": 0,
+      "inTransaction": false,
+      "isControlBatch": false,
+      "lastOffsetDelta": 0,
+      "producerId": "-1",
+      "producerEpoch": 0,
+      "firstSequence": 0,
+      "maxTimestamp": "1700000000500",
+      "timestampType": 0,
+      "records": [
+        {
+          "magicByte": 2,
+          "attributes": 0,
+          "timestamp": "1700000000000",
+          "offset": "9223372036854775800",
+          "key": {
+            "type": "Buffer",
+            "data": [
+              107,
+              101,
+              121,
+              45,
+              97
+            ]
+          },
+          "value": {
+            "type": "Buffer",
+            "data": [
+              97
+            ]
+          },
+          "headers": {
+            "header-key": {
+              "type": "Buffer",
+              "data": [
+                104,
+                101,
+                97,
+                100,
+                101,
+                114,
+                45,
+                118,
+                97,
+                108,
+                117,
+                101
+              ]
+            }
+          },
+          "isControlRecord": false,
+          "batchContext": {
+            "firstOffset": "9223372036854775800",
+            "firstTimestamp": "1700000000000",
+            "partitionLeaderEpoch": 0,
+            "inTransaction": false,
+            "isControlBatch": false,
+            "lastOffsetDelta": 0,
+            "producerId": "-1",
+            "producerEpoch": 0,
+            "firstSequence": 0,
+            "maxTimestamp": "1700000000500",
+            "timestampType": 0,
+            "magicByte": 2
+          }
+        },
+        {
+          "magicByte": 2,
+          "attributes": 0,
+          "timestamp": "1700000000250",
+          "offset": "9223372036854775801",
+          "key": {
+            "type": "Buffer",
+            "data": [
+              107,
+              101,
+              121,
+              45,
+              98
+            ]
+          },
+          "value": {
+            "type": "Buffer",
+            "data": [
+              98
+            ]
+          },
+          "headers": {},
+          "isControlRecord": false,
+          "batchContext": {
+            "firstOffset": "9223372036854775800",
+            "firstTimestamp": "1700000000000",
+            "partitionLeaderEpoch": 0,
+            "inTransaction": false,
+            "isControlBatch": false,
+            "lastOffsetDelta": 0,
+            "producerId": "-1",
+            "producerEpoch": 0,
+            "firstSequence": 0,
+            "maxTimestamp": "1700000000500",
+            "timestampType": 0,
+            "magicByte": 2
+          }
+        },
+        {
+          "magicByte": 2,
+          "attributes": 0,
+          "timestamp": "1700000000500",
+          "offset": "9223372036854775802",
+          "key": null,
+          "value": {
+            "type": "Buffer",
+            "data": [
+              99
+            ]
+          },
+          "headers": {},
+          "isControlRecord": false,
+          "batchContext": {
+            "firstOffset": "9223372036854775800",
+            "firstTimestamp": "1700000000000",
+            "partitionLeaderEpoch": 0,
+            "inTransaction": false,
+            "isControlBatch": false,
+            "lastOffsetDelta": 0,
+            "producerId": "-1",
+            "producerEpoch": 0,
+            "firstSequence": 0,
+            "maxTimestamp": "1700000000500",
+            "timestampType": 0,
+            "magicByte": 2
+          }
+        }
+      ]
+    },
+    "an above-safe first offset with a negative delta": {
+      "firstOffset": "9007199254740993",
+      "firstTimestamp": "1700000000000",
+      "partitionLeaderEpoch": 0,
+      "inTransaction": false,
+      "isControlBatch": false,
+      "lastOffsetDelta": 0,
+      "producerId": "-1",
+      "producerEpoch": 0,
+      "firstSequence": 0,
+      "maxTimestamp": "1700000000500",
+      "timestampType": 0,
+      "records": [
+        {
+          "magicByte": 2,
+          "attributes": 0,
+          "timestamp": "1700000000000",
+          "offset": "9007199254740983",
+          "key": null,
+          "value": {
+            "type": "Buffer",
+            "data": [
+              97
+            ]
+          },
+          "headers": {},
+          "isControlRecord": false,
+          "batchContext": {
+            "firstOffset": "9007199254740993",
+            "firstTimestamp": "1700000000000",
+            "partitionLeaderEpoch": 0,
+            "inTransaction": false,
+            "isControlBatch": false,
+            "lastOffsetDelta": 0,
+            "producerId": "-1",
+            "producerEpoch": 0,
+            "firstSequence": 0,
+            "maxTimestamp": "1700000000500",
+            "timestampType": 0,
+            "magicByte": 2
+          }
+        }
+      ]
+    },
+    "a safe first offset with a sum that rounds": {
+      "firstOffset": "9007199254740991",
+      "firstTimestamp": "1700000000000",
+      "partitionLeaderEpoch": 0,
+      "inTransaction": false,
+      "isControlBatch": false,
+      "lastOffsetDelta": 0,
+      "producerId": "-1",
+      "producerEpoch": 0,
+      "firstSequence": 0,
+      "maxTimestamp": "1700000000500",
+      "timestampType": 0,
+      "records": [
+        {
+          "magicByte": 2,
+          "attributes": 0,
+          "timestamp": "1700000000000",
+          "offset": "9007199254740997",
+          "key": null,
+          "value": {
+            "type": "Buffer",
+            "data": [
+              97
+            ]
+          },
+          "headers": {},
+          "isControlRecord": false,
+          "batchContext": {
+            "firstOffset": "9007199254740991",
+            "firstTimestamp": "1700000000000",
+            "partitionLeaderEpoch": 0,
+            "inTransaction": false,
+            "isControlBatch": false,
+            "lastOffsetDelta": 0,
+            "producerId": "-1",
+            "producerEpoch": 0,
+            "firstSequence": 0,
+            "maxTimestamp": "1700000000500",
+            "timestampType": 0,
+            "magicByte": 2
+          }
+        }
+      ]
+    },
+    "a safe first offset with an unsafe sum": {
+      "firstOffset": "9007199254740991",
+      "firstTimestamp": "1700000000000",
+      "partitionLeaderEpoch": 0,
+      "inTransaction": false,
+      "isControlBatch": false,
+      "lastOffsetDelta": 0,
+      "producerId": "-1",
+      "producerEpoch": 0,
+      "firstSequence": 0,
+      "maxTimestamp": "1700000000500",
+      "timestampType": 0,
+      "records": [
+        {
+          "magicByte": 2,
+          "attributes": 0,
+          "timestamp": "1700000000000",
+          "offset": "9007199254740996",
+          "key": null,
+          "value": {
+            "type": "Buffer",
+            "data": [
+              97
+            ]
+          },
+          "headers": {},
+          "isControlRecord": false,
+          "batchContext": {
+            "firstOffset": "9007199254740991",
+            "firstTimestamp": "1700000000000",
+            "partitionLeaderEpoch": 0,
+            "inTransaction": false,
+            "isControlBatch": false,
+            "lastOffsetDelta": 0,
+            "producerId": "-1",
+            "producerEpoch": 0,
+            "firstSequence": 0,
+            "maxTimestamp": "1700000000500",
+            "timestampType": 0,
+            "magicByte": 2
+          }
+        }
+      ]
+    }
+  },
+  "fetchFixtures": {
+    "fetch v11 response": [
+      {
+        "topicName": "test-topic-2077b9d2b36c4082e594-4020-b5a52b27-56df-4b87-800d-82c1cf26317d",
+        "partitions": [
+          {
+            "partition": 0,
+            "errorCode": 0,
+            "highWatermark": "3",
+            "lastStableOffset": "3",
+            "lastStartOffset": "0",
+            "abortedTransactions": [],
+            "preferredReadReplica": 0,
+            "messages": [
+              {
+                "magicByte": 2,
+                "attributes": 0,
+                "timestamp": "1509827900073",
+                "offset": "0",
+                "key": {
+                  "type": "Buffer",
+                  "data": [
+                    107,
+                    101,
+                    121,
+                    45,
+                    48
+                  ]
+                },
+                "value": {
+                  "type": "Buffer",
+                  "data": [
+                    115,
+                    111,
+                    109,
+                    101,
+                    45,
+                    118,
+                    97,
+                    108,
+                    117,
+                    101,
+                    45,
+                    48
+                  ]
+                },
+                "headers": {
+                  "header-key-0": {
+                    "type": "Buffer",
+                    "data": [
+                      104,
+                      101,
+                      97,
+                      100,
+                      101,
+                      114,
+                      45,
+                      118,
+                      97,
+                      108,
+                      117,
+                      101,
+                      45,
+                      48
+                    ]
+                  }
+                },
+                "isControlRecord": false,
+                "batchContext": {
+                  "firstOffset": "0",
+                  "firstTimestamp": "1509827900073",
+                  "partitionLeaderEpoch": 0,
+                  "inTransaction": false,
+                  "isControlBatch": false,
+                  "lastOffsetDelta": 2,
+                  "producerId": "-1",
+                  "producerEpoch": 0,
+                  "firstSequence": 0,
+                  "maxTimestamp": "1509827900073",
+                  "timestampType": 0,
+                  "magicByte": 2
+                }
+              },
+              {
+                "magicByte": 2,
+                "attributes": 0,
+                "timestamp": "1509827900073",
+                "offset": "1",
+                "key": {
+                  "type": "Buffer",
+                  "data": [
+                    107,
+                    101,
+                    121,
+                    45,
+                    49
+                  ]
+                },
+                "value": {
+                  "type": "Buffer",
+                  "data": [
+                    115,
+                    111,
+                    109,
+                    101,
+                    45,
+                    118,
+                    97,
+                    108,
+                    117,
+                    101,
+                    45,
+                    49
+                  ]
+                },
+                "headers": {
+                  "header-key-1": {
+                    "type": "Buffer",
+                    "data": [
+                      104,
+                      101,
+                      97,
+                      100,
+                      101,
+                      114,
+                      45,
+                      118,
+                      97,
+                      108,
+                      117,
+                      101,
+                      45,
+                      49
+                    ]
+                  }
+                },
+                "isControlRecord": false,
+                "batchContext": {
+                  "firstOffset": "0",
+                  "firstTimestamp": "1509827900073",
+                  "partitionLeaderEpoch": 0,
+                  "inTransaction": false,
+                  "isControlBatch": false,
+                  "lastOffsetDelta": 2,
+                  "producerId": "-1",
+                  "producerEpoch": 0,
+                  "firstSequence": 0,
+                  "maxTimestamp": "1509827900073",
+                  "timestampType": 0,
+                  "magicByte": 2
+                }
+              },
+              {
+                "magicByte": 2,
+                "attributes": 0,
+                "timestamp": "1509827900073",
+                "offset": "2",
+                "key": {
+                  "type": "Buffer",
+                  "data": [
+                    107,
+                    101,
+                    121,
+                    45,
+                    50
+                  ]
+                },
+                "value": {
+                  "type": "Buffer",
+                  "data": [
+                    115,
+                    111,
+                    109,
+                    101,
+                    45,
+                    118,
+                    97,
+                    108,
+                    117,
+                    101,
+                    45,
+                    50
+                  ]
+                },
+                "headers": {
+                  "header-key-2": {
+                    "type": "Buffer",
+                    "data": [
+                      104,
+                      101,
+                      97,
+                      100,
+                      101,
+                      114,
+                      45,
+                      118,
+                      97,
+                      108,
+                      117,
+                      101,
+                      45,
+                      50
+                    ]
+                  }
+                },
+                "isControlRecord": false,
+                "batchContext": {
+                  "firstOffset": "0",
+                  "firstTimestamp": "1509827900073",
+                  "partitionLeaderEpoch": 0,
+                  "inTransaction": false,
+                  "isControlBatch": false,
+                  "lastOffsetDelta": 2,
+                  "producerId": "-1",
+                  "producerEpoch": 0,
+                  "firstSequence": 0,
+                  "maxTimestamp": "1509827900073",
+                  "timestampType": 0,
+                  "magicByte": 2
+                }
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "fetch v4 gzip response": [
+      {
+        "topicName": "test-topic-43c95a3dc68dbf78a359",
+        "partitions": [
+          {
+            "partition": 0,
+            "errorCode": 0,
+            "highWatermark": "6",
+            "lastStableOffset": "6",
+            "abortedTransactions": [],
+            "messages": [
+              {
+                "magicByte": 2,
+                "attributes": 0,
+                "timestamp": "1509827900073",
+                "offset": "0",
+                "key": {
+                  "type": "Buffer",
+                  "data": [
+                    107,
+                    101,
+                    121,
+                    45,
+                    48
+                  ]
+                },
+                "value": {
+                  "type": "Buffer",
+                  "data": [
+                    115,
+                    111,
+                    109,
+                    101,
+                    45,
+                    118,
+                    97,
+                    108,
+                    117,
+                    101,
+                    45,
+                    48
+                  ]
+                },
+                "headers": {},
+                "isControlRecord": false,
+                "batchContext": {
+                  "firstOffset": "0",
+                  "firstTimestamp": "1509827900073",
+                  "partitionLeaderEpoch": 0,
+                  "inTransaction": false,
+                  "isControlBatch": false,
+                  "lastOffsetDelta": 2,
+                  "producerId": "-1",
+                  "producerEpoch": 0,
+                  "firstSequence": 0,
+                  "maxTimestamp": "1509827900073",
+                  "timestampType": 0,
+                  "magicByte": 2
+                }
+              },
+              {
+                "magicByte": 2,
+                "attributes": 0,
+                "timestamp": "1509827900073",
+                "offset": "1",
+                "key": {
+                  "type": "Buffer",
+                  "data": [
+                    107,
+                    101,
+                    121,
+                    45,
+                    49
+                  ]
+                },
+                "value": {
+                  "type": "Buffer",
+                  "data": [
+                    115,
+                    111,
+                    109,
+                    101,
+                    45,
+                    118,
+                    97,
+                    108,
+                    117,
+                    101,
+                    45,
+                    49
+                  ]
+                },
+                "headers": {},
+                "isControlRecord": false,
+                "batchContext": {
+                  "firstOffset": "0",
+                  "firstTimestamp": "1509827900073",
+                  "partitionLeaderEpoch": 0,
+                  "inTransaction": false,
+                  "isControlBatch": false,
+                  "lastOffsetDelta": 2,
+                  "producerId": "-1",
+                  "producerEpoch": 0,
+                  "firstSequence": 0,
+                  "maxTimestamp": "1509827900073",
+                  "timestampType": 0,
+                  "magicByte": 2
+                }
+              },
+              {
+                "magicByte": 2,
+                "attributes": 0,
+                "timestamp": "1509827900073",
+                "offset": "2",
+                "key": {
+                  "type": "Buffer",
+                  "data": [
+                    107,
+                    101,
+                    121,
+                    45,
+                    50
+                  ]
+                },
+                "value": {
+                  "type": "Buffer",
+                  "data": [
+                    115,
+                    111,
+                    109,
+                    101,
+                    45,
+                    118,
+                    97,
+                    108,
+                    117,
+                    101,
+                    45,
+                    50
+                  ]
+                },
+                "headers": {},
+                "isControlRecord": false,
+                "batchContext": {
+                  "firstOffset": "0",
+                  "firstTimestamp": "1509827900073",
+                  "partitionLeaderEpoch": 0,
+                  "inTransaction": false,
+                  "isControlBatch": false,
+                  "lastOffsetDelta": 2,
+                  "producerId": "-1",
+                  "producerEpoch": 0,
+                  "firstSequence": 0,
+                  "maxTimestamp": "1509827900073",
+                  "timestampType": 0,
+                  "magicByte": 2
+                }
+              },
+              {
+                "magicByte": 2,
+                "attributes": 0,
+                "timestamp": "1509827900073",
+                "offset": "3",
+                "key": {
+                  "type": "Buffer",
+                  "data": [
+                    107,
+                    101,
+                    121,
+                    45,
+                    49
+                  ]
+                },
+                "value": {
+                  "type": "Buffer",
+                  "data": [
+                    115,
+                    111,
+                    109,
+                    101,
+                    45,
+                    118,
+                    97,
+                    108,
+                    117,
+                    101,
+                    45,
+                    49
+                  ]
+                },
+                "headers": {},
+                "isControlRecord": false,
+                "batchContext": {
+                  "firstOffset": "3",
+                  "firstTimestamp": "1509827900073",
+                  "partitionLeaderEpoch": 0,
+                  "inTransaction": false,
+                  "isControlBatch": false,
+                  "lastOffsetDelta": 2,
+                  "producerId": "-1",
+                  "producerEpoch": 0,
+                  "firstSequence": 0,
+                  "maxTimestamp": "1509827900073",
+                  "timestampType": 0,
+                  "magicByte": 2
+                }
+              },
+              {
+                "magicByte": 2,
+                "attributes": 0,
+                "timestamp": "1509827900073",
+                "offset": "4",
+                "key": {
+                  "type": "Buffer",
+                  "data": [
+                    107,
+                    101,
+                    121,
+                    45,
+                    50
+                  ]
+                },
+                "value": {
+                  "type": "Buffer",
+                  "data": [
+                    115,
+                    111,
+                    109,
+                    101,
+                    45,
+                    118,
+                    97,
+                    108,
+                    117,
+                    101,
+                    45,
+                    50
+                  ]
+                },
+                "headers": {},
+                "isControlRecord": false,
+                "batchContext": {
+                  "firstOffset": "3",
+                  "firstTimestamp": "1509827900073",
+                  "partitionLeaderEpoch": 0,
+                  "inTransaction": false,
+                  "isControlBatch": false,
+                  "lastOffsetDelta": 2,
+                  "producerId": "-1",
+                  "producerEpoch": 0,
+                  "firstSequence": 0,
+                  "maxTimestamp": "1509827900073",
+                  "timestampType": 0,
+                  "magicByte": 2
+                }
+              },
+              {
+                "magicByte": 2,
+                "attributes": 0,
+                "timestamp": "1509827900073",
+                "offset": "5",
+                "key": {
+                  "type": "Buffer",
+                  "data": [
+                    107,
+                    101,
+                    121,
+                    45,
+                    51
+                  ]
+                },
+                "value": {
+                  "type": "Buffer",
+                  "data": [
+                    115,
+                    111,
+                    109,
+                    101,
+                    45,
+                    118,
+                    97,
+                    108,
+                    117,
+                    101,
+                    45,
+                    51
+                  ]
+                },
+                "headers": {},
+                "isControlRecord": false,
+                "batchContext": {
+                  "firstOffset": "3",
+                  "firstTimestamp": "1509827900073",
+                  "partitionLeaderEpoch": 0,
+                  "inTransaction": false,
+                  "isControlBatch": false,
+                  "lastOffsetDelta": 2,
+                  "producerId": "-1",
+                  "producerEpoch": 0,
+                  "firstSequence": 0,
+                  "maxTimestamp": "1509827900073",
+                  "timestampType": 0,
+                  "magicByte": 2
+                }
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  }
+}

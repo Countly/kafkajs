@@ -107,7 +107,17 @@ module.exports = async (fetchDecoder, { checkCrcs = true } = {}) => {
     timestampType,
   }
 
-  const records = await decodeRecords(codec, decoder, { ...recordContext, magicByte })
+  // Computed once per batch and threaded to the record decoder as an argument, not as a field on
+  // recordContext: that object is attached to every message as `batchContext`, and its shape is
+  // part of the public message.
+  const firstOffsetNumber = Number(firstOffset)
+
+  const records = await decodeRecords(
+    codec,
+    decoder,
+    { ...recordContext, magicByte },
+    firstOffsetNumber
+  )
 
   return {
     ...recordContext,
@@ -115,9 +125,19 @@ module.exports = async (fetchDecoder, { checkCrcs = true } = {}) => {
   }
 }
 
-const decodeRecords = async (codec, recordsDecoder, recordContext) => {
+/**
+ * Decodes the records section of a batch, decompressing it first when the batch is compressed.
+ * @param {object|null} codec the compression codec for this batch, or null when uncompressed
+ * @param {Decoder} recordsDecoder positioned at the start of the records section
+ * @param {object} recordContext the batch-level values shared by every record in the batch
+ * @param {number} firstOffsetNumber `Number(firstOffset)`, computed once per batch
+ * @returns {Promise<object[]>} the decoded records, in wire order
+ */
+const decodeRecords = async (codec, recordsDecoder, recordContext, firstOffsetNumber) => {
   if (!codec) {
-    return recordsDecoder.readArray((decoder) => decodeRecord(decoder, recordContext))
+    return recordsDecoder.readArray((decoder) =>
+      decodeRecord(decoder, recordContext, firstOffsetNumber)
+    )
   }
 
   const length = recordsDecoder.readInt32()
@@ -132,13 +152,20 @@ const decodeRecords = async (codec, recordsDecoder, recordContext) => {
   const records = new Array(length)
 
   for (let i = 0; i < length; i++) {
-    records[i] = decodeRecord(decompressedRecordDecoder, recordContext)
+    records[i] = decodeRecord(decompressedRecordDecoder, recordContext, firstOffsetNumber)
   }
 
   return records
 }
 
-const decodeRecord = (decoder, recordContext) => {
+/**
+ * Decodes one length-prefixed record.
+ * @param {Decoder} decoder positioned at the record's length varint
+ * @param {object} recordContext the batch-level values shared by every record in the batch
+ * @param {number} firstOffsetNumber `Number(firstOffset)`, computed once per batch
+ * @returns {object} the decoded record
+ */
+const decodeRecord = (decoder, recordContext, firstOffsetNumber) => {
   const recordBuffer = decoder.readVarIntBytes()
-  return RecordDecoder(new Decoder(recordBuffer), recordContext)
+  return RecordDecoder(new Decoder(recordBuffer), recordContext, firstOffsetNumber)
 }

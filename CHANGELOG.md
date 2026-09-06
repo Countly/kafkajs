@@ -139,6 +139,7 @@ Upstream work this phase builds on, with thanks to its authors: PRs #1779, #1695
 #### Fixes
 
 - Consumer group version negotiation no longer duplicates the protocol layer: the JoinGroup version behind the "static membership is inactive" warning is now read from the same selection rule every request uses, instead of being recomputed from the broker's advertised maximum. A coordinator that advertises no usable JoinGroup version is still handled silently.
+- Decoding a record batch allocates less on the consume path: a record's offset is computed with plain integer arithmetic when both the batch's first offset and the resulting offset are safe integers (falling back to exact 64-bit arithmetic otherwise), and message headers are collected into one object instead of one object per header. The decoded message is unchanged — offsets and timestamps are still strings, and duplicate header keys still become arrays; a header key of literally `__proto__` behaves exactly as it did before.
 
 #### Additions
 
@@ -149,4 +150,5 @@ Upstream work this phase builds on, with thanks to its authors: PRs #1779, #1695
 
 #### Tooling
 
+- Two new development-only benchmarks: `node scripts/benchmarks/consumeThroughput.js` measures consume throughput and per-batch handling latency against a live cluster over a fixed corpus, and `node scripts/benchmarks/recordBatchDecode.js` measures the record-batch decoder over a committed fixture.
 Adopted upstream PRs are credited here by number as they land (Phase 2 onward).
