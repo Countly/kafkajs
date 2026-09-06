@@ -39,4 +39,9 @@ describe('Protocol > Requests > OffsetForLeaderEpoch > v4', () => {
     expect(decoder.readTaggedFields().size).toEqual(0)
     expect(decoder.canReadBytes(1)).toBe(false)
   })
+
+  test('encodes byte-identically to the vector Apache own codec produced', async () => {
+    const { buffer } = await RequestV4Protocol(args).encode()
+    expect(buffer).toEqual(Buffer.from(require('../fixtures/v4_request_java.json')))
+  })
 })

@@ -29,4 +29,13 @@ describe('Protocol > Requests > SaslAuthenticate > v2', () => {
       message: 'Invalid username or password',
     })
   })
+
+  test('decodes the vector Apache own codec produced', async () => {
+    const data = await decode(Buffer.from(require('../fixtures/v2_response_java.json')))
+
+    expect(data.errorCode).toEqual(0)
+    expect(data.errorMessage).toBeNull()
+    expect(data.sessionLifetimeMs).toEqual('3600000')
+    expect(new Decoder(data.authBytes).readBytes()).toEqual(Buffer.from('server-final-message'))
+  })
 })

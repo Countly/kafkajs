@@ -48,4 +48,11 @@ describe('Protocol > Requests > SaslAuthenticate > v2', () => {
       RequestV2Protocol({ authBytes: malformed, mechanism: 'custom' }).encode()
     ).rejects.toThrow(/custom/)
   })
+
+  test('encodes byte-identically to the vector Apache own codec produced', async () => {
+    const authBytes = prefixed(Buffer.from('server-final-message'))
+    const { buffer } = await RequestV2Protocol({ authBytes }).encode()
+
+    expect(buffer).toEqual(Buffer.from(require('../fixtures/v2_request_java.json')))
+  })
 })

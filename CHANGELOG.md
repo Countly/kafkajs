@@ -157,4 +157,5 @@ Upstream work this phase builds on, with thanks to its authors: PRs #1779, #1695
 #### Tooling
 
 - Two new development-only benchmarks: `node scripts/benchmarks/consumeThroughput.js` measures consume throughput and per-batch handling latency against a live cluster over a fixed corpus, and `node scripts/benchmarks/recordBatchDecode.js` measures the record-batch decoder over a committed fixture.
+- Every protocol codec added in this release is checked against two independent sources as well as its own hand-built fixtures: byte vectors generated from Apache Kafka's own codecs (`scripts/protocol/javaVectors/run.sh`, extended to cover Fetch v12–v18, Produce v12/v13, OffsetForLeaderEpoch v3/v4 and SaslAuthenticate v2), and bytes captured from a live broker (`node scripts/protocol/capture.js`, whose version report now covers those APIs too). Versions no broker in the test matrix negotiates, and the SASL codec the capture client cannot reach, are recorded as deliberate capture gaps with the Java vector as the second source.
 Adopted upstream PRs are credited here by number as they land (Phase 2 onward).

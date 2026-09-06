@@ -97,4 +97,14 @@ describe('Protocol > Requests > Fetch > v12', () => {
 
     await expect(parse(data)).resolves.toBe(data)
   })
+
+  test('decodes the vector Apache own codec produced', async () => {
+    const data = await decode(Buffer.from(require('../fixtures/v12_response_java.json')))
+
+    expect(data.responses[0].topicName).toEqual('test-topic')
+    expect(data.responses[0].partitions[0].highWatermark).toEqual('100')
+    expect(data.responses[0].partitions[0].lastStableOffset).toEqual('100')
+    expect(data.responses[0].partitions[0].messages).toEqual([])
+    expect(data).toEqual(await decode(Buffer.from(require('../fixtures/v12_response.json'))))
+  })
 })

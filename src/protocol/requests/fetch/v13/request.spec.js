@@ -4,6 +4,34 @@ const { KafkaJSInvariantViolation } = require('../../../../errors')
 
 const TOPIC_ID = '01020304-0506-0708-090a-0b0c0d0e0f10'
 
+// The values `GenerateVectors.java` encodes: a consumer's full fetch of one partition at offset 42.
+const javaVectorArgs = {
+  replicaId: -1,
+  maxWaitTime: 5000,
+  minBytes: 1,
+  maxBytes: 10485760,
+  isolationLevel: 1,
+  sessionId: 0,
+  sessionEpoch: -1,
+  forgottenTopics: [],
+  rackId: '',
+  topicIds: new Map([['test-topic', TOPIC_ID]]),
+  topics: [
+    {
+      topic: 'test-topic',
+      partitions: [
+        {
+          partition: 0,
+          currentLeaderEpoch: 5,
+          fetchOffset: '42',
+          logStartOffset: -1,
+          maxBytes: 1048576,
+        },
+      ],
+    },
+  ],
+}
+
 describe('Protocol > Requests > Fetch > v13', () => {
   const partitions = (ids) =>
     ids.map((partition) => ({ partition, fetchOffset: '0', maxBytes: 1024 }))
@@ -112,5 +140,10 @@ describe('Protocol > Requests > Fetch > v13', () => {
     // Sent empty by this client, so the assertion is that the empty compact array is still one
     // byte and that nothing about the id substitution changed its framing.
     expect(buffer.includes(Buffer.from([0x01, 0x01, 0x00]))).toBe(true)
+  })
+
+  test('encodes byte-identically to the vector Apache own codec produced', async () => {
+    const { buffer } = await RequestV13Protocol(javaVectorArgs).encode()
+    expect(buffer).toEqual(Buffer.from(require('../fixtures/v13_request_java.json')))
   })
 })

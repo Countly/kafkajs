@@ -69,4 +69,31 @@ describe('Protocol > Requests > Produce > v13', () => {
     await expect(encode()).rejects.toThrow(KafkaJSInvariantViolation)
     await expect(encode()).rejects.toThrow(/unknown-topic/)
   })
+
+  test('decodes the vector Apache own codec produced', async () => {
+    // Decoded rather than byte-compared: the generator emits a null Records block, because a
+    // record batch carries a wall-clock timestamp and a CRC over it no second encoder reproduces.
+    const decoder = new Decoder(Buffer.from(require('../fixtures/v13_request_java.json')))
+
+    expect(decoder.readUVarIntString()).toBeNull() // transactionalId
+    expect(decoder.readInt16()).toEqual(-1) // acks
+    expect(decoder.readInt32()).toEqual(30000) // timeoutMs
+
+    const topics = decoder.readUVarIntArray((d) => {
+      const topic = {
+        topicId: d.readUuid(),
+        partitions: d.readUVarIntArray((p) => {
+          const partition = { index: p.readInt32(), records: p.readUVarIntBytes() }
+          p.readTaggedFields()
+          return partition
+        }),
+      }
+      d.readTaggedFields()
+      return topic
+    })
+
+    expect(topics).toEqual([{ topicId: TOPIC_ID, partitions: [{ index: 0, records: null }] }])
+    expect(decoder.readTaggedFields().size).toEqual(0)
+    expect(decoder.canReadBytes(1)).toBe(false)
+  })
 })

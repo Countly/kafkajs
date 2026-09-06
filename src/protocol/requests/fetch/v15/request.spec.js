@@ -19,6 +19,25 @@ const args = {
   topicIds: new Map([['test-topic', TOPIC_ID]]),
 }
 
+// The values `GenerateVectors.java` encodes: a consumer's full fetch of one partition at offset 42.
+const javaVectorArgs = {
+  ...args,
+  topics: [
+    {
+      topic: 'test-topic',
+      partitions: [
+        {
+          partition: 0,
+          currentLeaderEpoch: 5,
+          fetchOffset: '42',
+          logStartOffset: -1,
+          maxBytes: 1048576,
+        },
+      ],
+    },
+  ],
+}
+
 describe('Protocol > Requests > Fetch > v15', () => {
   test('writes no ReplicaId: the field closed at v14 and the replacement is replica-only', async () => {
     const v15 = await RequestV15Protocol(args).encode()
@@ -66,5 +85,10 @@ describe('Protocol > Requests > Fetch > v15', () => {
 
     expect(decoder.readTaggedFields().size).toEqual(0) // no ReplicaState (tag 1), no ClusterId
     expect(decoder.canReadBytes(1)).toBe(false)
+  })
+
+  test('encodes byte-identically to the vector Apache own codec produced', async () => {
+    const { buffer } = await RequestV15Protocol(javaVectorArgs).encode()
+    expect(buffer).toEqual(Buffer.from(require('../fixtures/v15_request_java.json')))
   })
 })

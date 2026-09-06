@@ -94,4 +94,9 @@ describe('Protocol > Requests > Fetch > v12', () => {
     expect(decoder.readTaggedFields().size).toEqual(0)
     expect(decoder.canReadBytes(1)).toBe(false)
   })
+
+  test('encodes byte-identically to the vector Apache own codec produced', async () => {
+    const { buffer } = await build().encode()
+    expect(buffer).toEqual(Buffer.from(require('../fixtures/v12_request_java.json')))
+  })
 })

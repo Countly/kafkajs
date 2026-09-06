@@ -22,6 +22,11 @@
  * wall-clock timestamp and a CRC over it, which no length-preserving substitution can normalise
  * and no second encoder can reproduce. Only the Produce response is written.
  *
+ * The Fetch **request** is captured: its only run-varying values are the fetch offset and the
+ * cached leader epoch, fixed-width integers that shift no other byte, and its topic uuid is
+ * substituted like any other. They are left as captured for the same reason the `memberId` is —
+ * rewriting them would be a re-encode — and no spec asserts on them.
+ *
  * Usage: node scripts/protocol/capture.js --brokers localhost:9092 --tag 431
  *        node scripts/protocol/capture.js --brokers localhost:9092 --print-versions
  *
@@ -67,6 +72,9 @@ const VERSION_REPORT_APIS = [
   { name: 'OffsetFetch', apiKey: apiKeys.OffsetFetch },
   { name: 'FindCoordinator', apiKey: apiKeys.GroupCoordinator },
   { name: 'InitProducerId', apiKey: apiKeys.InitProducerId },
+  { name: 'Fetch', apiKey: apiKeys.Fetch },
+  { name: 'OffsetForLeaderEpoch', apiKey: apiKeys.OffsetForLeaderEpoch },
+  { name: 'SaslAuthenticate', apiKey: apiKeys.SaslAuthenticate },
 ]
 
 /**
@@ -82,6 +90,8 @@ const CAPTURE_LIST = [
   { apiKey: apiKeys.Metadata, apiVersion: 12, dir: 'metadata', directions: ['response'] },
   { apiKey: apiKeys.Metadata, apiVersion: 13, dir: 'metadata', directions: ['response'] },
   { apiKey: apiKeys.Produce, apiVersion: 11, dir: 'produce', directions: ['response'] },
+  { apiKey: apiKeys.Produce, apiVersion: 13, dir: 'produce', directions: ['response'] },
+  { apiKey: apiKeys.Fetch, apiVersion: 18, dir: 'fetch', directions: ['request', 'response'] },
   {
     apiKey: apiKeys.GroupCoordinator,
     apiVersion: 6,

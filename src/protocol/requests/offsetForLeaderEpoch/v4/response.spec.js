@@ -16,4 +16,15 @@ describe('Protocol > Requests > OffsetForLeaderEpoch > v4', () => {
 
     await expect(parse(data)).resolves.toBe(data)
   })
+
+  test('decodes the vector Apache own codec produced', async () => {
+    const data = await decode(Buffer.from(require('../fixtures/v4_response_java.json')))
+
+    expect(data.topics).toEqual([
+      {
+        topic: 'test-topic',
+        partitions: [{ errorCode: 0, partition: 0, leaderEpoch: 5, endOffset: '120' }],
+      },
+    ])
+  })
 })

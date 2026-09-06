@@ -88,6 +88,9 @@ describe('scripts/protocol > capture', () => {
       { apiKey: apiKeys.OffsetCommit, minVersion: 2, maxVersion: 10 },
       { apiKey: apiKeys.OffsetFetch, minVersion: 1, maxVersion: 10 },
       { apiKey: apiKeys.InitProducerId, minVersion: 0, maxVersion: 6 },
+      { apiKey: apiKeys.Fetch, minVersion: 0, maxVersion: 18 },
+      { apiKey: apiKeys.OffsetForLeaderEpoch, minVersion: 2, maxVersion: 4 },
+      { apiKey: apiKeys.SaslAuthenticate, minVersion: 0, maxVersion: 2 },
     ]
 
     expect(maxVersionsForCapturedApis(advertised)).toEqual([
@@ -98,6 +101,20 @@ describe('scripts/protocol > capture', () => {
       { name: 'OffsetFetch', apiKey: apiKeys.OffsetFetch, maxVersion: 10 },
       { name: 'FindCoordinator', apiKey: apiKeys.GroupCoordinator, maxVersion: null },
       { name: 'InitProducerId', apiKey: apiKeys.InitProducerId, maxVersion: 6 },
+      { name: 'Fetch', apiKey: apiKeys.Fetch, maxVersion: 18 },
+      { name: 'OffsetForLeaderEpoch', apiKey: apiKeys.OffsetForLeaderEpoch, maxVersion: 4 },
+      { name: 'SaslAuthenticate', apiKey: apiKeys.SaslAuthenticate, maxVersion: 2 },
     ])
+  })
+
+  test('the report covers ten apis, so a ceiling is read for every captured codec', () => {
+    const report = maxVersionsForCapturedApis([])
+
+    expect(report).toHaveLength(10)
+    expect(report.map(({ name }) => name)).toEqual(
+      expect.arrayContaining(['Fetch', 'OffsetForLeaderEpoch', 'SaslAuthenticate'])
+    )
+    // Nothing advertised, so every ceiling is reported as absent rather than guessed.
+    expect(report.every(({ maxVersion }) => maxVersion === null)).toBe(true)
   })
 })

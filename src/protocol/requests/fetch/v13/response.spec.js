@@ -59,4 +59,13 @@ describe('Protocol > Requests > Fetch > v13', () => {
     data.responses[0].partitions[0].errorCode = 100 // UNKNOWN_TOPIC_ID
     await expect(parse(data)).resolves.toBe(data)
   })
+
+  test('decodes the vector Apache own codec produced', async () => {
+    const data = await decode(Buffer.from(require('../fixtures/v13_response_java.json')))
+
+    expect(data.responses[0].topicId).toEqual('01020304-0506-0708-090a-0b0c0d0e0f10')
+    expect(data.responses[0].partitions[0].highWatermark).toEqual('100')
+    expect(data.responses[0].partitions[0].lastStableOffset).toEqual('100')
+    expect(data.responses[0].partitions[0].messages).toEqual([])
+  })
 })

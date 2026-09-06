@@ -10,6 +10,8 @@ import java.util.UUID;
 import org.apache.kafka.common.Uuid;
 import org.apache.kafka.common.message.ApiVersionsRequestData;
 import org.apache.kafka.common.message.ApiVersionsResponseData;
+import org.apache.kafka.common.message.FetchRequestData;
+import org.apache.kafka.common.message.FetchResponseData;
 import org.apache.kafka.common.message.FindCoordinatorRequestData;
 import org.apache.kafka.common.message.FindCoordinatorResponseData;
 import org.apache.kafka.common.message.InitProducerIdRequestData;
@@ -22,8 +24,12 @@ import org.apache.kafka.common.message.OffsetCommitRequestData;
 import org.apache.kafka.common.message.OffsetCommitResponseData;
 import org.apache.kafka.common.message.OffsetFetchRequestData;
 import org.apache.kafka.common.message.OffsetFetchResponseData;
+import org.apache.kafka.common.message.OffsetForLeaderEpochRequestData;
+import org.apache.kafka.common.message.OffsetForLeaderEpochResponseData;
 import org.apache.kafka.common.message.ProduceRequestData;
 import org.apache.kafka.common.message.ProduceResponseData;
+import org.apache.kafka.common.message.SaslAuthenticateRequestData;
+import org.apache.kafka.common.message.SaslAuthenticateResponseData;
 import org.apache.kafka.common.protocol.ByteBufferAccessor;
 import org.apache.kafka.common.protocol.Message;
 import org.apache.kafka.common.protocol.ObjectSerializationCache;
@@ -46,6 +52,7 @@ import org.apache.kafka.common.protocol.ObjectSerializationCache;
  * @see <a href="https://kafka.apache.org/43/design/protocol">Kafka protocol guide</a>
  * @see <a href="https://github.com/apache/kafka/blob/4.3.1/clients/src/main/resources/common/message/ApiVersionsRequest.json">ApiVersionsRequest.json</a>
  * @see <a href="https://github.com/apache/kafka/blob/4.3.1/clients/src/main/resources/common/message/MetadataRequest.json">MetadataRequest.json</a>
+ * @see <a href="https://github.com/apache/kafka/blob/4.3.1/clients/src/main/resources/common/message/FetchRequest.json">FetchRequest.json</a>
  */
 public final class GenerateVectors {
 
@@ -76,6 +83,25 @@ public final class GenerateVectors {
   private static final int LEADER_ID = 2;
   private static final int LEADER_EPOCH = 7;
 
+  /** Consumers identify themselves with -1 in both Fetch and OffsetForLeaderEpoch. */
+  private static final int CONSUMER_REPLICA_ID = -1;
+
+  private static final int FETCH_MAX_WAIT_MS = 5000;
+  private static final int FETCH_MIN_BYTES = 1;
+  private static final int FETCH_MAX_BYTES = 10485760;
+  private static final int PARTITION_MAX_BYTES = 1048576;
+  private static final long FETCH_OFFSET = 42L;
+  private static final long LOG_START_OFFSET = -1L;
+  private static final int LAST_FETCHED_EPOCH = -1;
+  private static final byte READ_COMMITTED = 1;
+  private static final long HIGH_WATERMARK = 100L;
+
+  private static final int VALIDATED_LEADER_EPOCH = 4;
+  private static final long EPOCH_END_OFFSET = 120L;
+
+  private static final String SASL_AUTH_BYTES = "server-final-message";
+  private static final long SASL_SESSION_LIFETIME_MS = 3600000L;
+
   private GenerateVectors() {}
 
   /**
@@ -99,6 +125,9 @@ public final class GenerateVectors {
     writeOffsetFetchVectors(fixturesDir(outputDir, "offsetFetch"));
     writeListOffsetsVectors(fixturesDir(outputDir, "listOffsets"));
     writeInitProducerIdVectors(fixturesDir(outputDir, "initProducerId"));
+    writeFetchVectors(fixturesDir(outputDir, "fetch"));
+    writeOffsetForLeaderEpochVectors(fixturesDir(outputDir, "offsetForLeaderEpoch"));
+    writeSaslAuthenticateVectors(fixturesDir(outputDir, "saslAuthenticate"));
   }
 
   /**
@@ -143,14 +172,15 @@ public final class GenerateVectors {
   }
 
   /**
-   * Emits the Produce v8-v11 request and response vectors: one topic, one partition.
+   * Emits the Produce v8-v13 request and response vectors: one topic, one partition. From v13 the
+   * topic is keyed by id instead of by name (KIP-516).
    *
    * @param dir target fixtures directory
    * @throws IOException if a fixture file cannot be written
    */
   private static void writeProduceVectors(Path dir) throws IOException {
-    for (short version : new short[] {8, 9, 10, 11}) {
-      writeVector(dir, "v" + version + "_request_java.json", buildProduceRequest(), version);
+    for (short version : new short[] {8, 9, 10, 11, 12, 13}) {
+      writeVector(dir, "v" + version + "_request_java.json", buildProduceRequest(version), version);
       writeVector(dir, "v" + version + "_response_java.json", buildProduceResponse(version), version);
     }
   }
@@ -376,20 +406,28 @@ public final class GenerateVectors {
    * One topic, one partition, and a null {@code Records} field. A record batch carries a wall-clock
    * timestamp and a CRC over it, so no second encoder can reproduce one byte-for-byte; the JS specs
    * therefore decode this vector's framing rather than comparing it against an encoded request.
+   * The topic travels as {@code Name} through v12 and as {@code TopicId} from v13 (KIP-516).
    *
+   * @param version the Produce request version, 8-13
    * @return a populated {@code ProduceRequestData}
    */
-  private static ProduceRequestData buildProduceRequest() {
-    ProduceRequestData.TopicProduceDataCollection topicData =
-        new ProduceRequestData.TopicProduceDataCollection();
-    topicData.add(
+  private static ProduceRequestData buildProduceRequest(short version) {
+    ProduceRequestData.TopicProduceData topic =
         new ProduceRequestData.TopicProduceData()
-            .setName(TOPIC_NAME)
             .setPartitionData(
                 Collections.singletonList(
                     new ProduceRequestData.PartitionProduceData()
                         .setIndex(PARTITION_INDEX)
-                        .setRecords(null))));
+                        .setRecords(null)));
+    if (version <= 12) {
+      topic.setName(TOPIC_NAME);
+    } else {
+      topic.setTopicId(responseTopicId());
+    }
+
+    ProduceRequestData.TopicProduceDataCollection topicData =
+        new ProduceRequestData.TopicProduceDataCollection();
+    topicData.add(topic);
 
     return new ProduceRequestData()
         .setTransactionalId(null)
@@ -403,7 +441,9 @@ public final class GenerateVectors {
    * populated too — a {@code CurrentLeader} on the partition and a matching {@code NodeEndpoints}
    * entry at the top level — so the decoder's tagged-field handling is exercised, not just skipped.
    *
-   * @param version the Produce response version, 8-11
+   * The topic travels as {@code Name} through v12 and as {@code TopicId} from v13 (KIP-516).
+   *
+   * @param version the Produce response version, 8-13
    * @return a populated {@code ProduceResponseData}
    */
   private static ProduceResponseData buildProduceResponse(short version) {
@@ -424,12 +464,18 @@ public final class GenerateVectors {
               .setLeaderEpoch(LEADER_EPOCH));
     }
 
+    ProduceResponseData.TopicProduceResponse topic =
+        new ProduceResponseData.TopicProduceResponse()
+            .setPartitionResponses(Collections.singletonList(partition));
+    if (version <= 12) {
+      topic.setName(TOPIC_NAME);
+    } else {
+      topic.setTopicId(responseTopicId());
+    }
+
     ProduceResponseData.TopicProduceResponseCollection responses =
         new ProduceResponseData.TopicProduceResponseCollection();
-    responses.add(
-        new ProduceResponseData.TopicProduceResponse()
-            .setName(TOPIC_NAME)
-            .setPartitionResponses(Collections.singletonList(partition)));
+    responses.add(topic);
 
     ProduceResponseData response =
         new ProduceResponseData().setResponses(responses).setThrottleTimeMs(0);
@@ -707,6 +753,222 @@ public final class GenerateVectors {
         .setErrorCode((short) 0)
         .setProducerId(PRODUCER_ID)
         .setProducerEpoch(PRODUCER_EPOCH);
+  }
+
+  /**
+   * Emits the Fetch v12-v18 request and response vectors: one topic, one partition, a full (never
+   * incremental) fetch. The topic is keyed by name through v12 and by id from v13 (KIP-516); the
+   * response carries one {@code NodeEndpoint} from v16 (KIP-951).
+   *
+   * @param dir target fixtures directory
+   * @throws IOException if a fixture file cannot be written
+   */
+  private static void writeFetchVectors(Path dir) throws IOException {
+    for (short version : new short[] {12, 13, 14, 15, 16, 17, 18}) {
+      writeVector(dir, "v" + version + "_request_java.json", buildFetchRequest(version), version);
+      writeVector(dir, "v" + version + "_response_java.json", buildFetchResponse(version), version);
+    }
+  }
+
+  /**
+   * Emits the OffsetForLeaderEpoch v3/v4 request and response vectors, one topic and one
+   * partition. v4 re-encodes v3's fields as compact; no field is added or removed.
+   *
+   * @param dir target fixtures directory
+   * @throws IOException if a fixture file cannot be written
+   */
+  private static void writeOffsetForLeaderEpochVectors(Path dir) throws IOException {
+    for (short version : new short[] {3, 4}) {
+      writeVector(
+          dir,
+          "v" + version + "_request_java.json",
+          buildOffsetForLeaderEpochRequest(),
+          version);
+      writeVector(
+          dir,
+          "v" + version + "_response_java.json",
+          buildOffsetForLeaderEpochResponse(),
+          version);
+    }
+  }
+
+  /**
+   * Emits the SaslAuthenticate v2 request and response vectors, the flexible re-encoding of v1.
+   *
+   * @param dir target fixtures directory
+   * @throws IOException if a fixture file cannot be written
+   */
+  private static void writeSaslAuthenticateVectors(Path dir) throws IOException {
+    short version = 2;
+    writeVector(dir, "v2_request_java.json", buildSaslAuthenticateRequest(), version);
+    writeVector(dir, "v2_response_java.json", buildSaslAuthenticateResponse(), version);
+  }
+
+  /**
+   * A consumer's full fetch: no session ({@code SessionId} 0, {@code SessionEpoch} -1), no
+   * forgotten topics, no rack. {@code ReplicaId} closes at v14 and its v15 replacement
+   * ({@code ReplicaState}, tag 1) is replica-only, so it is left at its default and never written.
+   *
+   * @param version the Fetch request version, 12-18
+   * @return a populated {@code FetchRequestData}
+   */
+  private static FetchRequestData buildFetchRequest(short version) {
+    FetchRequestData.FetchPartition partition =
+        new FetchRequestData.FetchPartition()
+            .setPartition(PARTITION_INDEX)
+            .setCurrentLeaderEpoch(CURRENT_LEADER_EPOCH)
+            .setFetchOffset(FETCH_OFFSET)
+            .setLastFetchedEpoch(LAST_FETCHED_EPOCH)
+            .setLogStartOffset(LOG_START_OFFSET)
+            .setPartitionMaxBytes(PARTITION_MAX_BYTES);
+
+    FetchRequestData.FetchTopic topic =
+        new FetchRequestData.FetchTopic().setPartitions(Collections.singletonList(partition));
+    if (version <= 12) {
+      topic.setTopic(TOPIC_NAME);
+    } else {
+      topic.setTopicId(responseTopicId());
+    }
+
+    FetchRequestData request =
+        new FetchRequestData()
+            .setMaxWaitMs(FETCH_MAX_WAIT_MS)
+            .setMinBytes(FETCH_MIN_BYTES)
+            .setMaxBytes(FETCH_MAX_BYTES)
+            .setIsolationLevel(READ_COMMITTED)
+            .setSessionId(0)
+            .setSessionEpoch(-1)
+            .setTopics(Collections.singletonList(topic))
+            .setForgottenTopicsData(Collections.emptyList())
+            .setRackId("");
+
+    if (version <= 14) {
+      request.setReplicaId(CONSUMER_REPLICA_ID);
+    }
+
+    return request;
+  }
+
+  /**
+   * One topic, one partition at high watermark 100 with no records — a null {@code Records} block,
+   * which is the compact null every idle fetch answers with. From v16 one {@code NodeEndpoints}
+   * entry (tag 0) is populated so the KIP-951 hint is exercised rather than skipped.
+   *
+   * @param version the Fetch response version, 12-18
+   * @return a populated {@code FetchResponseData}
+   */
+  private static FetchResponseData buildFetchResponse(short version) {
+    FetchResponseData.PartitionData partition =
+        new FetchResponseData.PartitionData()
+            .setPartitionIndex(PARTITION_INDEX)
+            .setErrorCode((short) 0)
+            .setHighWatermark(HIGH_WATERMARK)
+            .setLastStableOffset(HIGH_WATERMARK)
+            .setLogStartOffset(0L)
+            .setAbortedTransactions(Collections.emptyList())
+            .setPreferredReadReplica(-1)
+            .setRecords(null);
+
+    FetchResponseData.FetchableTopicResponse topic =
+        new FetchResponseData.FetchableTopicResponse()
+            .setPartitions(Collections.singletonList(partition));
+    if (version <= 12) {
+      topic.setTopic(TOPIC_NAME);
+    } else {
+      topic.setTopicId(responseTopicId());
+    }
+
+    FetchResponseData response =
+        new FetchResponseData()
+            .setThrottleTimeMs(0)
+            .setErrorCode((short) 0)
+            .setSessionId(0)
+            .setResponses(Collections.singletonList(topic));
+
+    if (version >= 16) {
+      FetchResponseData.NodeEndpointCollection endpoints =
+          new FetchResponseData.NodeEndpointCollection();
+      endpoints.add(
+          new FetchResponseData.NodeEndpoint()
+              .setNodeId(LEADER_ID)
+              .setHost(BROKER_HOST)
+              .setPort(BROKER_PORT)
+              .setRack(null));
+      response.setNodeEndpoints(endpoints);
+    }
+
+    return response;
+  }
+
+  /**
+   * One topic, one partition asking whether leader epoch 4 is still on the leader's log, at cached
+   * leader epoch 5. {@code ReplicaId} is -1: the definition's own default is -2 ("debugging
+   * consumer"), and a consumer sends -1.
+   *
+   * @return a populated {@code OffsetForLeaderEpochRequestData}
+   */
+  private static OffsetForLeaderEpochRequestData buildOffsetForLeaderEpochRequest() {
+    OffsetForLeaderEpochRequestData.OffsetForLeaderTopicCollection topics =
+        new OffsetForLeaderEpochRequestData.OffsetForLeaderTopicCollection();
+    topics.add(
+        new OffsetForLeaderEpochRequestData.OffsetForLeaderTopic()
+            .setTopic(TOPIC_NAME)
+            .setPartitions(
+                Collections.singletonList(
+                    new OffsetForLeaderEpochRequestData.OffsetForLeaderPartition()
+                        .setPartition(PARTITION_INDEX)
+                        .setCurrentLeaderEpoch(CURRENT_LEADER_EPOCH)
+                        .setLeaderEpoch(VALIDATED_LEADER_EPOCH))));
+
+    return new OffsetForLeaderEpochRequestData()
+        .setReplicaId(CONSUMER_REPLICA_ID)
+        .setTopics(topics);
+  }
+
+  /**
+   * One topic, one partition answering end offset 120 at leader epoch 5, no error.
+   *
+   * @return a populated {@code OffsetForLeaderEpochResponseData}
+   */
+  private static OffsetForLeaderEpochResponseData buildOffsetForLeaderEpochResponse() {
+    OffsetForLeaderEpochResponseData.OffsetForLeaderTopicResultCollection topics =
+        new OffsetForLeaderEpochResponseData.OffsetForLeaderTopicResultCollection();
+    topics.add(
+        new OffsetForLeaderEpochResponseData.OffsetForLeaderTopicResult()
+            .setTopic(TOPIC_NAME)
+            .setPartitions(
+                Collections.singletonList(
+                    new OffsetForLeaderEpochResponseData.EpochEndOffset()
+                        .setErrorCode((short) 0)
+                        .setPartition(PARTITION_INDEX)
+                        .setLeaderEpoch(CURRENT_LEADER_EPOCH)
+                        .setEndOffset(EPOCH_END_OFFSET))));
+
+    return new OffsetForLeaderEpochResponseData().setThrottleTimeMs(0).setTopics(topics);
+  }
+
+  /**
+   * One mechanism payload, carried as compact bytes at v2. The payload's content is opaque to the
+   * codec, so the same bytes serve both directions.
+   *
+   * @return a populated {@code SaslAuthenticateRequestData}
+   */
+  private static SaslAuthenticateRequestData buildSaslAuthenticateRequest() {
+    return new SaslAuthenticateRequestData()
+        .setAuthBytes(SASL_AUTH_BYTES.getBytes(StandardCharsets.UTF_8));
+  }
+
+  /**
+   * A successful authentication with a one-hour session lifetime and no error message.
+   *
+   * @return a populated {@code SaslAuthenticateResponseData}
+   */
+  private static SaslAuthenticateResponseData buildSaslAuthenticateResponse() {
+    return new SaslAuthenticateResponseData()
+        .setErrorCode((short) 0)
+        .setErrorMessage(null)
+        .setAuthBytes(SASL_AUTH_BYTES.getBytes(StandardCharsets.UTF_8))
+        .setSessionLifetimeMs(SASL_SESSION_LIFETIME_MS);
   }
 
   /**
