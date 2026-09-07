@@ -198,6 +198,9 @@ module.exports = class Runner extends EventEmitter {
       }
 
       try {
+        // The fetch manager (re)starting is the start of a fresh poll cycle: after a rebalance,
+        // after a retry backoff, and on every loop of the retrier.
+        this.pollTimer.reset()
         await this.fetchManager.start()
       } catch (e) {
         // One rebalance must produce one REBALANCING and one join, even when the runner learns of
@@ -657,6 +660,9 @@ module.exports = class Runner extends EventEmitter {
     })
 
     if (batches.length === 0) {
+      // A round that produced nothing is still a poll: an idle consumer must not be evicted for
+      // not having handed a handler anything.
+      this.pollTimer.poll()
       await this.heartbeat()
     }
 
@@ -703,6 +709,11 @@ module.exports = class Runner extends EventEmitter {
 
       return
     }
+
+    // Once per batch hand-off, before the handler. Deliberately not per message: one
+    // `performance.now()` write per batch keeps the hottest path in the client untouched, at the
+    // cost of measuring a very large batch as a whole.
+    this.pollTimer.poll()
 
     if (this.isBatchStale(batch)) {
       this.logger.debug('Dropping a batch that outlived the assignment it was fetched under', {

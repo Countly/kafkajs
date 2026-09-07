@@ -139,6 +139,11 @@ module.exports = class ClassicGroupProtocol {
   /**
    * The JoinGroup half. Resolves the coordinator first, so a coordinator that moved between
    * rounds is found before the request rather than after it fails.
+   *
+   * The attached heartbeat manager, when there is one, is disabled for the duration of the
+   * JoinGroup request and re-enabled in a `finally`, so a join that throws or is retried keeps
+   * heartbeating.
+   *
    * @param {{ topicsSubscribed: string[] }} context
    * @returns {Promise<void>}
    */
@@ -151,16 +156,37 @@ module.exports = class ClassicGroupProtocol {
       this.warnIfStaticMembershipInactive()
     }
 
-    const groupData = await this.coordinator.joinGroup({
-      groupId,
-      sessionTimeout,
-      rebalanceTimeout,
-      memberId: this.memberId || '',
-      groupInstanceId,
-      groupProtocols: this.assigners.map((assigner) =>
-        this.subscriptionFor(assigner, topicsSubscribed)
-      ),
-    })
+    let groupData
+
+    try {
+      // Heartbeats are suspended for exactly this request and no longer. The broker keeps an
+      // existing member alive only while a join or sync future is pending, and the Java client
+      // re-enables its heartbeat thread on the JoinGroup response - before SyncGroup - so
+      // everything after this call, including the leader's assign window and any retry backoff,
+      // must keep heartbeating.
+      // @see https://github.com/apache/kafka/blob/4.3/group-coordinator/src/main/java/org/apache/kafka/coordinator/group/classic/ClassicGroupMember.java
+      // @see https://github.com/apache/kafka/blob/4.3/clients/src/main/java/org/apache/kafka/clients/consumer/internals/AbstractCoordinator.java
+      if (this.heartbeatManager) {
+        this.heartbeatManager.disable()
+      }
+
+      groupData = await this.coordinator.joinGroup({
+        groupId,
+        sessionTimeout,
+        rebalanceTimeout,
+        memberId: this.memberId || '',
+        groupInstanceId,
+        groupProtocols: this.assigners.map((assigner) =>
+          this.subscriptionFor(assigner, topicsSubscribed)
+        ),
+      })
+    } finally {
+      // In the `finally`, so a join that threw, bailed or is about to be retried heartbeats
+      // through its own backoff - which is precisely the window that needs them.
+      if (this.heartbeatManager) {
+        this.heartbeatManager.enable()
+      }
+    }
 
     this.generationId = groupData.generationId
     this.leaderId = groupData.leaderId

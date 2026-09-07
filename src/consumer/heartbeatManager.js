@@ -10,7 +10,9 @@
  *
  * The manager emits nothing and depends on neither the runner nor the instrumentation emitter.
  * It reports through two injected callbacks, so the component it reports to can hold every rule
- * about what a verdict means.
+ * about what a verdict means. The tick is also where the handler's poll deadline is DETECTED -
+ * only while heartbeats are enabled, and never in place of one: an overrun hands off to
+ * `onPollExpired` and the tick ends there.
  *
  * @see https://cwiki.apache.org/confluence/display/KAFKA/KIP-62%3A+Allow+consumer+to+send+heartbeats+from+a+background+thread
  */
@@ -23,8 +25,8 @@ module.exports = class HeartbeatManager {
    * @param {import('../../types').Logger} options.logger
    * @param {(error: Error) => void} options.onError called with whatever a heartbeat threw
    * @param {(details: { elapsedMs: number }) => Promise<void>} options.onPollExpired the sequence
-   *   a poll-interval overrun runs. Held, not yet called: the deadline only means something once
-   *   a batch hand-off records one, so the tick evaluates it beside those reset points, not here.
+   *   a poll-interval overrun runs. It owns everything an overrun implies, including stopping
+   *   this manager, so the tick awaits it and then evaluates nothing further.
    */
   constructor({ groupMembership, pollTimer, heartbeatInterval, logger, onError, onPollExpired }) {
     this.groupMembership = groupMembership
@@ -37,6 +39,12 @@ module.exports = class HeartbeatManager {
     this.handle = null
     this.disabled = false
     this.inFlight = false
+    /**
+     * Identifies the armed chain. A tick captures it before its `await` and compares it after, so
+     * a `stop()` + `ensureStarted()` landing inside an in-flight heartbeat cannot leave the
+     * settling tick scheduling a second chain on top of the new one.
+     */
+    this.chainId = 0
   }
 
   /** @returns {boolean} whether the chain is armed */
@@ -56,6 +64,7 @@ module.exports = class HeartbeatManager {
       return
     }
 
+    this.chainId++
     this.schedule()
   }
 
@@ -82,24 +91,35 @@ module.exports = class HeartbeatManager {
    * @returns {void}
    */
   schedule() {
-    this.handle = setTimeout(() => this.tick(), this.heartbeatInterval)
+    const { chainId } = this
+    this.handle = setTimeout(() => this.tick(chainId), this.heartbeatInterval)
   }
 
   /**
-   * One tick: reschedule while suspended, send otherwise, and never queue a second send behind a
-   * slow one.
+   * One tick, in the Java client's order: suspended, then the poll deadline, then the heartbeat.
+   * Reschedules while suspended, sends otherwise, and never queues a second send behind a slow
+   * one.
    * @private
+   * @param {number} [chainId] the chain this tick belongs to; a tick from a superseded chain
+   *   returns without sending or rescheduling
    * @returns {Promise<void>}
    */
-  async tick() {
+  async tick(chainId = this.chainId) {
     // A stopped manager must NOT reschedule: it would resurrect itself and leak the handle.
     // A disabled one must, because `enable()` does not re-arm anything.
-    if (!this.handle) {
+    if (!this.handle || chainId !== this.chainId) {
       return
     }
 
     if (this.disabled) {
       this.schedule()
+      return
+    }
+
+    // A JoinGroup request timeout can exceed the poll deadline, so evaluating this while
+    // suspended would send LeaveGroup for a member whose own join is still in flight.
+    if (this.pollTimer.expired()) {
+      await this.reportPollExpired(chainId)
       return
     }
 
@@ -113,9 +133,13 @@ module.exports = class HeartbeatManager {
     try {
       await this.groupMembership.heartbeat({ interval: this.heartbeatInterval })
     } catch (error) {
-      // An in-flight response landing after `stop()` belongs to a generation nobody is in any
-      // more; classifying it would raise a verdict for a member that has already left.
-      if (this.handle) {
+      // A result that landed after `stop()`, after the chain was re-armed under a new generation,
+      // or inside the JoinGroup window belongs to a generation nobody is in any more: it is
+      // DISCARDED, not classified. Classifying it would raise a verdict - and for codes the
+      // rebalance path never drops, an abort and a discard of uncommitted offsets - for a
+      // generation this member's own join is already replacing.
+      // @see https://github.com/apache/kafka/blob/4.3/clients/src/main/java/org/apache/kafka/clients/consumer/internals/AbstractCoordinator.java
+      if (this.handle && chainId === this.chainId && !this.disabled) {
         // The callback is injected, so its throw-safety is not this class's to assume: an escape
         // here would be an unhandled rejection (the tick's promise is discarded by setTimeout)
         // AND would skip the reschedule below, killing the chain until the session expires.
@@ -128,16 +152,53 @@ module.exports = class HeartbeatManager {
           })
         }
       } else {
-        this.logger.debug('Discarding heartbeat result received after stop', {
-          error: error.message,
-        })
+        this.logger.debug(
+          'Discarding heartbeat result received after stop or inside the join window',
+          {
+            error: error.message,
+          }
+        )
       }
     } finally {
       this.inFlight = false
     }
 
-    if (this.handle) {
+    if (this.handle && chainId === this.chainId) {
       this.schedule()
+    }
+  }
+
+  /**
+   * Hands the overrun to the injected sequence and evaluates nothing further this tick.
+   *
+   * The chain is deliberately NOT rescheduled on success: the sequence stops this manager and the
+   * round that recovers re-arms it through `ensureStarted()`. It IS rescheduled when the sequence
+   * throws, because a manager that never heartbeats again would lose the session outright.
+   *
+   * @private
+   * @param {number} chainId
+   * @returns {Promise<void>}
+   */
+  async reportPollExpired(chainId) {
+    try {
+      await this.onPollExpired({ elapsedMs: this.pollTimer.elapsed() })
+
+      // This class's own invariant, not the sequence's: `handle` must never point at a timeout
+      // that has already fired, or `isRunning()` reports an armed chain that does not exist and
+      // `ensureStarted()` refuses to re-arm it. The sequence normally stops this manager itself,
+      // in which case this is a no-op - but it also has a path that returns without doing so. The
+      // chain check keeps it from cancelling a chain the recovery re-armed inside the await.
+      if (chainId === this.chainId) {
+        this.stop()
+      }
+    } catch (error) {
+      this.logger.error('Poll-interval overrun handler failed', {
+        error: error.message || error,
+      })
+
+      if (this.handle && chainId === this.chainId) {
+        this.schedule()
+      }
     }
   }
 }

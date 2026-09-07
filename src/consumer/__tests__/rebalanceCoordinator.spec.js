@@ -1,6 +1,7 @@
 const RebalanceCoordinator = require('../rebalanceCoordinator')
 const Batch = require('../batch')
 const PollTimer = require('../pollTimer')
+const HeartbeatManager = require('../heartbeatManager')
 const ConsumerGroup = require('../consumerGroup')
 const InstrumentationEventEmitter = require('../../instrumentation/emitter')
 const { events } = require('../instrumentationEvents')
@@ -951,6 +952,55 @@ describe('Consumer > RebalanceCoordinator', () => {
       expect(calls.indexOf('heartbeatManager.stop')).toBeLessThan(calls.indexOf('joinAndSync'))
       expect(calls.indexOf('joinAndSync')).toBeLessThan(calls.indexOf('ensureStarted'))
     })
+
+    it('runs the whole expiry sequence and re-arms the manager', async () => {
+      jest.useFakeTimers()
+      const { coordinator, consumerGroup, calls } = build()
+      const pollTimer = new PollTimer({ pollDeadline: 50 })
+      const manager = new HeartbeatManager({
+        groupMembership: consumerGroup,
+        pollTimer,
+        heartbeatInterval: 100,
+        logger: newLogger(),
+        onError: jest.fn(),
+        onPollExpired: ({ elapsedMs }) => coordinator.onPollExpired({ elapsedMs, isStatic: false }),
+      })
+      // Stubbing a collaborator on an instance, so the sequence runs against the real timer and
+      // the real manager rather than the recording doubles.
+      coordinator.heartbeatManager = manager
+      coordinator.pollTimer = pollTimer
+
+      try {
+        manager.ensureStarted()
+
+        await jest.advanceTimersByTimeAsync(120)
+
+        // The tick detected expiry; the coordinator stopped the manager, left, reset and raised
+        // the verdict - and nothing rescheduled, so the timer is gone.
+        expect(calls).toEqual(
+          expect.arrayContaining([
+            events.POLL_INTERVAL_EXCEEDED,
+            'leave',
+            'resetGenerationLocally',
+            'fetchManager.stop',
+          ])
+        )
+        expect(calls.indexOf(events.POLL_INTERVAL_EXCEEDED)).toBeLessThan(calls.indexOf('leave'))
+        expect(calls.indexOf('leave')).toBeLessThan(calls.indexOf('resetGenerationLocally'))
+        expect(manager.isRunning()).toBe(false)
+        expect(jest.getTimerCount()).toEqual(0)
+
+        // The recovery round re-arms it through the same idempotent entry.
+        await coordinator.runRound(coordinator.takeVerdict().reason, 'lost')
+        expect(manager.isRunning()).toBe(true)
+        expect(jest.getTimerCount()).toEqual(1)
+      } finally {
+        manager.stop()
+        jest.useRealTimers()
+      }
+
+      expect(manager.isRunning()).toBe(false)
+    })
   })
 
   describe('a batch that outlived the assignment it was fetched under', () => {
@@ -1163,22 +1213,70 @@ describe('Consumer > RebalanceCoordinator', () => {
     })
   })
 
-  describe('the poll deadline is not armed yet', () => {
-    it('a freshly constructed runner never schedules a poll-expiry tick', async () => {
+  describe('the poll deadline reaches the coordinator through the runner', () => {
+    it('reports an overrun once, with the member kind the group is configured for', async () => {
       jest.useFakeTimers()
 
       try {
         // The manager the Runner built, carrying the Runner's own onPollExpired closure - not the
         // recording double, which would prove nothing about the wiring.
         const { runner, realHeartbeatManager } = createRealRunner()
-        const onPollExpired = jest.spyOn(runner.rebalanceCoordinator, 'onPollExpired')
+        const onPollExpired = jest
+          .spyOn(runner.rebalanceCoordinator, 'onPollExpired')
+          .mockImplementation(async () => {})
 
         realHeartbeatManager.ensureStarted()
-        // Far past the configured deadline, with no batch ever handed off.
-        await jest.advanceTimersByTimeAsync(runner.pollTimer.deadline() * 2)
+        // Past the configured deadline, with no batch ever handed off.
+        await jest.advanceTimersByTimeAsync(runner.pollTimer.deadline() + 3000)
 
         expect(runner.pollTimer.deadline()).toEqual(300000)
-        expect(runner.pollTimer.expired()).toBe(true)
+        expect(onPollExpired).toHaveBeenCalledTimes(1)
+        expect(onPollExpired.mock.calls[0][0].isStatic).toBe(false)
+        expect(onPollExpired.mock.calls[0][0].elapsedMs).toBeGreaterThan(300000)
+
+        realHeartbeatManager.stop()
+      } finally {
+        jest.useRealTimers()
+      }
+    })
+
+    it('reports a static member as static', async () => {
+      jest.useFakeTimers()
+
+      try {
+        const { runner, consumerGroup, realHeartbeatManager } = createRealRunner()
+        consumerGroup.groupInstanceId = 'instance-1'
+        const onPollExpired = jest
+          .spyOn(runner.rebalanceCoordinator, 'onPollExpired')
+          .mockImplementation(async () => {})
+
+        realHeartbeatManager.ensureStarted()
+        await jest.advanceTimersByTimeAsync(runner.pollTimer.deadline() + 3000)
+
+        expect(onPollExpired.mock.calls[0][0].isStatic).toBe(true)
+
+        realHeartbeatManager.stop()
+      } finally {
+        jest.useRealTimers()
+      }
+    })
+
+    it('never reports one while a batch keeps being handed off', async () => {
+      jest.useFakeTimers()
+
+      try {
+        const { runner, realHeartbeatManager } = createRealRunner()
+        const onPollExpired = jest
+          .spyOn(runner.rebalanceCoordinator, 'onPollExpired')
+          .mockImplementation(async () => {})
+
+        realHeartbeatManager.ensureStarted()
+
+        for (let i = 0; i < 5; i++) {
+          runner.pollTimer.poll()
+          await jest.advanceTimersByTimeAsync(200000)
+        }
+
         expect(onPollExpired).not.toHaveBeenCalled()
 
         realHeartbeatManager.stop()
