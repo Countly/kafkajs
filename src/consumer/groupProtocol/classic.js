@@ -29,6 +29,7 @@ module.exports = class ClassicGroupProtocol {
    * @param {number} options.rebalanceTimeout the value sent on the wire as RebalanceTimeoutMs
    * @param {import('../../../types').Assigner[]} options.assigners
    * @param {import('./interface').RebalanceProtocol} [options.mode]
+   * @param {string} [options.rackId] the consumer's rack; the empty string means "no rack"
    * @param {import('../../instrumentation/emitter')} options.instrumentationEmitter
    * @param {import('../../../types').Logger} options.logger
    */
@@ -40,6 +41,7 @@ module.exports = class ClassicGroupProtocol {
     rebalanceTimeout,
     assigners,
     mode = EAGER,
+    rackId = '',
     instrumentationEmitter,
     logger,
   }) {
@@ -50,6 +52,8 @@ module.exports = class ClassicGroupProtocol {
     this.rebalanceTimeout = rebalanceTimeout
     this.assigners = assigners
     this.mode = mode
+    // The empty string is the shipped default and means "no rack", which on the wire is null.
+    this.rackId = rackId === '' ? null : rackId
     this.instrumentationEmitter = instrumentationEmitter
     // The group's own logger object, NOT a new namespace: `logger.namespace()` returns a fresh
     // object, and existing spies on the group's logger must keep observing what is logged here.
@@ -124,8 +128,8 @@ module.exports = class ClassicGroupProtocol {
   /**
    * One JoinGroup followed by one SyncGroup.
    * @param {{ topics: string[], topicsSubscribed: string[], beforeSync: () => void }} context
-   * @returns {Promise<{ assignment: Object }>} the decoded member assignment, `{}` when the
-   *   coordinator assigned nothing
+   * @returns {Promise<{ assignment: Object, userData: Buffer|null }>} the decoded member
+   *   assignment, `{}` when the coordinator assigned nothing
    */
   async rebalance({ topics, topicsSubscribed, beforeSync }) {
     await this.join({ topicsSubscribed })
@@ -170,12 +174,30 @@ module.exports = class ClassicGroupProtocol {
 
   /**
    * The subscription entry one assigner contributes to JoinGroup, in configuration order.
+   *
+   * The argument is widened additively: an assigner that reads only `topics` emits exactly the
+   * bytes it emitted before IF it declares version 0; the subscription codec is positional, so
+   * the version it declares - not which keys it forwards - decides the layout.
+   * `subscriptionUserData` is deliberately NOT consulted here - it is an input to bytes
+   * `protocol()` owns, and the built-in assigners call their own from inside their own
+   * `protocol()`.
+   * @private
    * @param {import('../../../types').Assigner} assigner
    * @param {string[]} topicsSubscribed
    * @returns {{ name: string, metadata: Buffer }}
    */
   subscriptionFor(assigner, topicsSubscribed) {
-    return assigner.protocol({ topics: topicsSubscribed })
+    return assigner.protocol({
+      topics: topicsSubscribed,
+      // A copy: `ownedPartitions` reaches third-party code here, and an assigner that sorts or
+      // splices its argument would otherwise corrupt the ownership set this object rebalances on.
+      ownedPartitions: this.ownedPartitions.map(({ topic, partitions }) => ({
+        topic,
+        partitions: [...partitions],
+      })),
+      generationId: this.generationId == null ? -1 : this.generationId,
+      rackId: this.rackId,
+    })
   }
 
   /**
@@ -183,7 +205,7 @@ module.exports = class ClassicGroupProtocol {
    * own back. `beforeSync` runs between the leader's `assign()` and the request, which is where
    * the caller refreshes the partitions it knows about for its subscribed topics.
    * @param {{ topics: string[], topicsSubscribed: string[], beforeSync: () => void }} context
-   * @returns {Promise<{ assignment: Object }>}
+   * @returns {Promise<{ assignment: Object, userData: Buffer|null }>}
    * @throws {KafkaJSNonRetriableError} when the coordinator picked an assignor this member does
    *   not have
    */
@@ -236,7 +258,10 @@ module.exports = class ClassicGroupProtocol {
     })
 
     const decoded = MemberAssignment.decode(memberAssignment)
-    return { assignment: decoded != null ? decoded.assignment : {} }
+    return {
+      assignment: decoded != null ? decoded.assignment : {},
+      userData: decoded != null ? decoded.userData : null,
+    }
   }
 
   /**
@@ -247,6 +272,38 @@ module.exports = class ClassicGroupProtocol {
     return this.sharedHeartbeat({ interval })
   }
 
+  /**
+   * Hands the applied assignment to every assigner that wants it. Assigners are built once per
+   * consumer and reused across every run and restart, so a stateful one (the sticky family)
+   * learns what it owns only through this callback.
+   * @param {{ partitions: import('./interface').TopicPartitions[], userData: Buffer|null }} assignment
+   * @returns {void}
+   */
+  notifyAssignment(assignment) {
+    for (const assigner of this.assigners) {
+      if (assigner.onAssignment) {
+        assigner.onAssignment(assignment, {
+          generationId: this.generationId,
+          groupProtocol: this.groupProtocol,
+        })
+      }
+    }
+  }
+
+  /**
+   * Tells every assigner to forget what it retained. Called when this member leaves the group or
+   * loses its generation: retained state from a generation that no longer exists would otherwise
+   * be used to compute the next assignment.
+   * @returns {void}
+   */
+  clearAssignerState() {
+    for (const assigner of this.assigners) {
+      if (assigner.onAssignment) {
+        assigner.onAssignment(null, { generationId: -1, groupProtocol: null })
+      }
+    }
+  }
+
   /** @returns {Promise<void>} */
   async leave() {
     const { groupId, memberId, groupInstanceId } = this
@@ -254,6 +311,8 @@ module.exports = class ClassicGroupProtocol {
       await this.coordinator.leaveGroup({ groupId, memberId, groupInstanceId })
       this.memberId = null
     }
+
+    this.clearAssignerState()
   }
 
   /**
@@ -273,6 +332,8 @@ module.exports = class ClassicGroupProtocol {
     if (clearMemberId) {
       this.memberId = null
     }
+
+    this.clearAssignerState()
   }
 
   /** @returns {import('./interface').Membership} allocates; instrumentation only */

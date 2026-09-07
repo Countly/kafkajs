@@ -21,6 +21,7 @@ const {
 const apiKeys = require('../protocol/requests/apiKeys')
 const { requests } = require('../protocol/requests')
 const ClassicGroupProtocol = require('./groupProtocol/classic')
+const { EAGER } = require('./groupProtocol/interface')
 
 // One warning once a partition has failed five rounds running, then one every twenty-five.
 const FETCH_ERROR_WARN_THRESHOLD = 5
@@ -73,6 +74,9 @@ module.exports = class ConsumerGroup {
    * @param {string} options.rackId
    * @param {boolean} options.checkCrcs verify the CRC32C checksum of every record batch received
    *                                (Java's `check.crcs`); a mismatch is a non-retriable error
+   * @param {import('./groupProtocol/interface').RebalanceProtocol} [options.rebalanceProtocol]
+   *                                the mode chosen from the configured assigners; defaults to
+   *                                eager, the protocol every assigner supports.
    * @param {string} [options.groupInstanceId=null] Static membership id (KIP-345); sent on
    *                                JoinGroup/SyncGroup/Heartbeat/LeaveGroup so the coordinator
    *                                recognizes this member across restarts.
@@ -105,6 +109,7 @@ module.exports = class ConsumerGroup {
     rackId,
     checkCrcs,
     groupInstanceId = null,
+    rebalanceProtocol = EAGER,
     metadataMaxAge,
     pendingTopicResets = new Map(),
   }) {
@@ -141,6 +146,8 @@ module.exports = class ConsumerGroup {
       sessionTimeout,
       rebalanceTimeout,
       assigners,
+      mode: rebalanceProtocol,
+      rackId,
       instrumentationEmitter,
       // `this.logger`, already namespaced, rather than the raw `logger`: the protocol logs through
       // the same object the group exposes, so anything observing the group's logger keeps working.
@@ -280,6 +287,14 @@ module.exports = class ConsumerGroup {
     return this.groupMembership.leave()
   }
 
+  /**
+   * Tells every assigner to forget the state it retained across rounds.
+   * @returns {void}
+   */
+  clearAssignerState() {
+    return this.groupMembership.clearAssignerState()
+  }
+
   getNodeIds() {
     return this.cluster.getNodeIds()
   }
@@ -298,7 +313,7 @@ module.exports = class ConsumerGroup {
    * rebuilds the offset manager, and clears the per-assignment caches. Emits exactly one event,
    * `RECEIVED_UNSUBSCRIBED_TOPICS`, which it already owned.
    *
-   * @param {{ assignment: Object }} result the decoded sync result
+   * @param {{ assignment: Object, userData?: Buffer|null }} result the decoded sync result
    * @returns {Promise<import('./groupProtocol/interface').RebalanceResult>}
    */
   async applyRebalanceResult(result) {
@@ -397,6 +412,11 @@ module.exports = class ConsumerGroup {
     this.consecutiveFetchErrors.clear()
     this.positionValidator.clear()
     this.validationUnusableLogged.clear()
+
+    this.groupMembership.notifyAssignment({
+      partitions: currentMemberAssignment,
+      userData: result.userData == null ? null : result.userData,
+    })
 
     this.groupMembership.setOwned(currentMemberAssignment)
 

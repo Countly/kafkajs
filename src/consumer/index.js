@@ -3,6 +3,7 @@ const createRetry = require('../retry')
 const { initialRetryTime } = require('../retry/defaults')
 const ConsumerGroup = require('./consumerGroup')
 const resolveGroupTimeouts = require('./groupTimeouts')
+const { selectRebalanceProtocol } = require('./groupProtocol/interface')
 const Runner = require('./runner')
 const { events, wrap: wrapEvent, unwrap: unwrapEvent } = require('./instrumentationEvents')
 const InstrumentationEventEmitter = require('../instrumentation/emitter')
@@ -112,6 +113,14 @@ module.exports = ({
     sessionTimeout,
     heartbeatInterval,
     logger,
+  })
+
+  const rebalanceProtocol = selectRebalanceProtocol(assigners)
+  logger.info('Rebalance protocol selected', {
+    groupId,
+    rebalanceProtocol,
+    assigners: assigners.map(({ name }) => name),
+    reason: 'the highest protocol every configured assigner supports',
   })
 
   /**
@@ -317,6 +326,7 @@ module.exports = ({
         rackId,
         checkCrcs,
         groupInstanceId,
+        rebalanceProtocol,
         metadataMaxAge,
         autoCommit,
         autoCommitInterval,
