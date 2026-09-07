@@ -1,8 +1,9 @@
-const { KafkaJSNonRetriableError } = require('../errors')
+const { KafkaJSNonRetriableError, isFencedInstance } = require('../errors')
 const {
   rebalanceAction,
   rebalanceReason,
   pollIntervalExceededError,
+  sentGeneration,
 } = require('./rebalanceErrorContract')
 const { COOPERATIVE } = require('./groupProtocol/interface')
 const {
@@ -266,6 +267,17 @@ module.exports = class RebalanceCoordinator {
       return
     }
 
+    if (this.isStaleGenerationVerdict(verdict)) {
+      this.logger.debug('Ignoring a lost-membership answer for a generation already left', {
+        groupId: this.groupId,
+        memberId: this.consumerGroup.memberId,
+        reason: verdict.reason,
+        error: verdict.error.message,
+      })
+
+      return
+    }
+
     const aborting =
       verdict.kind === 'lost' || this.consumerGroup.rebalanceProtocol() !== COOPERATIVE
 
@@ -298,6 +310,37 @@ module.exports = class RebalanceCoordinator {
         })
       }
     })
+  }
+
+  /**
+   * Whether a lost-membership verdict is news about a generation this member has already left.
+   *
+   * Under cooperative rebalancing the delivery path keeps running for the whole round, so a
+   * heartbeat or an offset commit issued before the round's JoinGroup answers is still in flight
+   * when the coordinator moves the group on. Its answer is `ILLEGAL_GENERATION` or
+   * `UNKNOWN_MEMBER_ID` - which, taken at face value, discards this member's uncommitted offsets,
+   * stops the world and chains a needless round that reports the partitions it kept as lost.
+   *
+   * This is the Java client's `generationUnchanged()` rule: a response error only resets the
+   * generation when it belongs to the generation the member currently holds. The heartbeat and
+   * the offset commit record the generation they were sent under on whatever they throw, which is
+   * what makes the comparison possible.
+   * @see clients/src/main/java/org/apache/kafka/clients/consumer/internals/AbstractCoordinator.java
+   *
+   * Two verdicts are never stale by this rule: a fenced static member, which must die rather than
+   * rejoin, and any verdict that does not come from a group request's answer - a poll-interval
+   * overrun, say, which resets the generation itself on purpose and carries no stamp.
+   *
+   * @param {Verdict} verdict
+   * @returns {boolean}
+   */
+  isStaleGenerationVerdict(verdict) {
+    if (verdict.kind !== 'lost' || isFencedInstance(verdict.error)) {
+      return false
+    }
+
+    const sentUnder = sentGeneration(verdict.error)
+    return sentUnder != null && sentUnder !== this.consumerGroup.generationId
   }
 
   /**

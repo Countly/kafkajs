@@ -2,6 +2,7 @@ const Long = require('../../utils/long')
 const isInvalidOffset = require('./isInvalidOffset')
 const initializeConsumerOffsets = require('./initializeConsumerOffsets')
 const { isStaleCoordinator } = require('../../errors')
+const { stampGeneration } = require('../rebalanceErrorContract')
 const {
   events: { COMMIT_OFFSETS },
 } = require('../instrumentationEvents')
@@ -221,12 +222,6 @@ module.exports = class OffsetManager {
    * @returns {void}
    */
   updateAssignment({ revoked, memberAssignment, generationId, memberId, coordinator }) {
-    for (const { topic, partitions } of revoked) {
-      for (const partition of partitions) {
-        this.clearOffsets({ topic, partition })
-      }
-    }
-
     this.memberAssignment = memberAssignment
     this.assignedPartitions = OffsetManager.indexAssignment(memberAssignment)
     this.topics = keys(memberAssignment)
@@ -234,11 +229,19 @@ module.exports = class OffsetManager {
     this.memberId = memberId
     this.coordinator = coordinator
 
+    // Keys first, prune second: another consumer of this group on the same client shares the
+    // committed-offsets object and may have removed a topic key since the last round.
     const committedOffsets = this.committedOffsets()
     for (const topic of this.topics) {
       committedOffsets[topic] = committedOffsets[topic] || {}
       this.resolvedOffsets[topic] = this.resolvedOffsets[topic] || {}
       this.resolvedEpochs[topic] = this.resolvedEpochs[topic] || {}
+    }
+
+    for (const { topic, partitions } of revoked) {
+      for (const partition of partitions) {
+        this.clearOffsets({ topic, partition })
+      }
     }
   }
 
@@ -483,7 +486,9 @@ module.exports = class OffsetManager {
         }
       }
 
-      throw e
+      // A commit issued before a rebalance and answered after it is answered about the generation
+      // it was sent under, not the one this member holds by then.
+      throw stampGeneration(e, generationId)
     }
   }
 
@@ -630,9 +635,22 @@ module.exports = class OffsetManager {
    * @param {import("../../../types").TopicPartition} topicPartition
    */
   clearOffsets({ topic, partition }) {
-    delete this.committedOffsets()[topic][partition]
-    delete this.resolvedOffsets[topic][partition]
-    delete this.resolvedEpochs[topic][partition]
+    // Each key is guarded: the committed-offsets object is shared with every other consumer of
+    // this group on the same client, so a topic this manager once held can be absent by the time
+    // it prunes it.
+    const committedOffsets = this.committedOffsets()
+
+    if (committedOffsets[topic]) {
+      delete committedOffsets[topic][partition]
+    }
+
+    if (this.resolvedOffsets[topic]) {
+      delete this.resolvedOffsets[topic][partition]
+    }
+
+    if (this.resolvedEpochs[topic]) {
+      delete this.resolvedEpochs[topic][partition]
+    }
   }
 
   /**
@@ -641,12 +659,17 @@ module.exports = class OffsetManager {
   clearAllOffsets() {
     const committedOffsets = this.committedOffsets()
 
-    for (const topic in committedOffsets) {
-      delete committedOffsets[topic]
-    }
-
     for (const topic of this.topics) {
-      committedOffsets[topic] = {}
+      const partitions = committedOffsets[topic]
+
+      if (!partitions) {
+        committedOffsets[topic] = {}
+        continue
+      }
+
+      for (const partition of this.memberAssignment[topic]) {
+        delete partitions[partition]
+      }
     }
 
     this.resolvedOffsets = indexTopics(this.topics)

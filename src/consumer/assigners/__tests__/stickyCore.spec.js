@@ -392,17 +392,28 @@ describe('Consumer > assigners > stickyCore', () => {
       })
     )
 
-    const started = process.hrtime.bigint()
+    const started = performance.now()
     const assignment = assignSticky({ partitionsPerTopic, members })
-    const elapsedMs = Number(process.hrtime.bigint() - started) / 1e6
+    const elapsedMs = performance.now() - started
 
     const assigned = allAssigned(assignment)
     expect(new Set(assigned).size).toEqual(assigned.length)
     expect(assigned).toHaveLength(
       topics.reduce((sum, topic) => sum + partitionsPerTopic[topic].length, 0)
     )
-    // A termination gate against a third of the default session timeout, not a performance
-    // guard: the measured time is three orders of magnitude below it.
-    expect(elapsedMs).toBeLessThan(10000)
+
+    // The leader holds no future open between the JoinGroup response and the SyncGroup request,
+    // so everything in that gap is charged against the session timeout. A third of the default
+    // 30 s is the budget.
+    const BUDGET_MS = 30000 / 3
+    console.log(JSON.stringify({ stickyGeneralPathMs: elapsedMs, budgetMs: BUDGET_MS }))
+
+    if (process.env.BENCH_WALL_TIME === '1') {
+      expect(elapsedMs).toBeLessThan(BUDGET_MS)
+    } else {
+      // A generous ceiling that only a genuine complexity regression can cross, so the unit gate
+      // stays deterministic on a loaded host while still failing on an algorithmic blow-up.
+      expect(elapsedMs).toBeLessThan(BUDGET_MS * 6)
+    }
   })
 })

@@ -205,6 +205,8 @@ Upstream work this phase builds on, with thanks to its authors: PRs #1779, #1695
 - A consumer that learned of the same rebalance twice — once from a fetch error, once from a heartbeat — no longer rejoins twice or emits two `consumer.rebalancing` events for it.
 - A stale assignment detected inside a fetch no longer rejoins from within the fetcher's own call stack. The rejoin is requested and the fetch returns, so the fetch loop is not blocked for the duration of a join.
 - A stale assignment detected during a fetch now produces one warning and one rejoin request per pending period, instead of one per fetch round per broker.
+- Two consumers built from the same `Kafka` client no longer clear each other's cached committed offsets. That cache is one object per client per group, and building a consumer's offset state emptied it wholesale, so the second consumer of a group lost the first one's entries. Under cooperative rebalancing, where a joining member's first assignment is deliberately empty, this crashed the other member with a non-retriable `TypeError` and silently dropped it out of the group. Each consumer now only ever touches the partitions it holds.
+- A cooperative rebalance no longer reports the partitions it kept as lost. During a cooperative round the consumer keeps fetching and committing, so a heartbeat or an offset commit sent before the round could be answered `ILLEGAL_GENERATION` after it — which was read as lost membership, discarded uncommitted offsets, stopped the fetch loop and forced another rebalance, roughly one extra round per join. Such an answer is now matched against the generation the request was sent under and ignored when it is about a generation the consumer has already left, as the Java client does.
 
 #### Additions
 

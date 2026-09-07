@@ -118,4 +118,39 @@ const pollIntervalExceededError = ({ elapsedMs, maxPollInterval }) => {
   return error
 }
 
-module.exports = { REBALANCE_PATHS, rebalanceAction, rebalanceReason, pollIntervalExceededError }
+/**
+ * The generation a group request was sent under, remembered on the error its answer produced.
+ *
+ * Symbol-keyed, so it never reaches a user's logger or a JSON dump of the error - it exists only
+ * so a lost-membership answer can be matched against the generation the member holds now.
+ */
+const SENT_GENERATION = Symbol('rebalance:sentGenerationId')
+
+/**
+ * Records the generation a failing group request was sent under.
+ * @param {Error} error
+ * @param {number|null} generationId
+ * @returns {Error} the same error
+ */
+const stampGeneration = (error, generationId) => {
+  if (error && generationId != null) {
+    error[SENT_GENERATION] = generationId
+  }
+
+  return error
+}
+
+/**
+ * @param {Error} error
+ * @returns {number|undefined} the generation the request behind this error was sent under
+ */
+const sentGeneration = (error) => error && error[SENT_GENERATION]
+
+module.exports = {
+  REBALANCE_PATHS,
+  rebalanceAction,
+  rebalanceReason,
+  pollIntervalExceededError,
+  stampGeneration,
+  sentGeneration,
+}

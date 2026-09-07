@@ -296,6 +296,17 @@ module.exports = class Runner extends EventEmitter {
    */
   async handleRebalanceError(verdictOrError) {
     const verdict = this.toVerdict(verdictOrError)
+
+    if (this.rebalanceCoordinator.isStaleGenerationVerdict(verdict)) {
+      this.logger.debug('Ignoring a lost-membership answer for a generation already left', {
+        groupId: this.consumerGroup.groupId,
+        memberId: this.consumerGroup.memberId,
+        error: verdict.error.message,
+      })
+
+      return
+    }
+
     const lost = verdict.kind === 'lost'
     const stopsTheWorld =
       lost || (verdict.kind === 'revoked' && this.consumerGroup.rebalanceProtocol() !== COOPERATIVE)

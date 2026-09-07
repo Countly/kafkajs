@@ -7,6 +7,7 @@ const {
   events: { HEARTBEAT },
 } = require('../instrumentationEvents')
 const { EAGER, COOPERATIVE } = require('./interface')
+const { stampGeneration } = require('../rebalanceErrorContract')
 
 /**
  * Membership over the classic JoinGroup/SyncGroup protocol.
@@ -88,7 +89,14 @@ module.exports = class ClassicGroupProtocol {
           groupInstanceId: this.groupInstanceId,
         }
 
-        await this.coordinator.heartbeat(payload)
+        try {
+          await this.coordinator.heartbeat(payload)
+        } catch (e) {
+          // A heartbeat sent before a rebalance and answered after it is answered about the
+          // generation it was sent under, not the one this member holds by then.
+          throw stampGeneration(e, generationId)
+        }
+
         this.instrumentationEmitter.emit(HEARTBEAT, payload)
         this.lastRequest = Date.now()
       }

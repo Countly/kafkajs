@@ -1,4 +1,6 @@
 const ConsumerGroup = require('../consumerGroup')
+const OffsetManager = require('../offsetManager')
+const Cluster = require('../../cluster')
 const Runner = require('../runner')
 const Batch = require('../batch')
 const ClassicGroupProtocol = require('../groupProtocol/classic')
@@ -8,7 +10,12 @@ const { MemberMetadata, MemberAssignment } = require('../assignerProtocol')
 const { COOPERATIVE, EAGER } = require('../groupProtocol/interface')
 const InstrumentationEventEmitter = require('../../instrumentation/emitter')
 const { events } = require('../instrumentationEvents')
+const { createErrorFromCode } = require('../../protocol/error')
+const { stampGeneration, sentGeneration } = require('../rebalanceErrorContract')
 const { newLogger } = require('testHelpers')
+
+const ILLEGAL_GENERATION = 22
+const FENCED_INSTANCE_ID = 82
 
 const TOPIC_A = 'topic-a'
 const TOPIC_B = 'topic-b'
@@ -20,8 +27,11 @@ const partitionMetadata = (count) =>
  * A real `ConsumerGroup` with a stubbed cluster and a real `OffsetManager`, so every assertion is
  * about the shipped apply rather than a double of it.
  */
-const createGroup = ({ mode = COOPERATIVE, topics = [TOPIC_A, TOPIC_B] } = {}) => {
-  const committedOffsets = {}
+const createGroup = ({
+  mode = COOPERATIVE,
+  topics = [TOPIC_A, TOPIC_B],
+  committedOffsets = {},
+} = {}) => {
   const cluster = {
     refreshMetadata: jest.fn(async () => {}),
     refreshMetadataIfNecessary: jest.fn(async () => {}),
@@ -90,6 +100,10 @@ const createCoordinator = () => {
   const applies = []
   const consumerGroup = {
     rebalanceProtocol: () => COOPERATIVE,
+    generationId: 1,
+    groupId: 'cooperative-group',
+    discardUncommittedOffsets: jest.fn(),
+    attach: jest.fn(),
     assigned: () => [],
     memberId: 'member-1',
     leaderId: 'member-1',
@@ -425,6 +439,148 @@ describe('Consumer > cooperative rebalance apply', () => {
     })
   })
 
+  describe('a generation this member has already left', () => {
+    const answeredUnder = (code, generationId) =>
+      stampGeneration(createErrorFromCode(code), generationId)
+
+    it('records the generation a heartbeat was sent under on what it throws', async () => {
+      const protocol = new ClassicGroupProtocol({
+        cluster: {},
+        groupId: 'cooperative-group',
+        sessionTimeout: 30000,
+        rebalanceTimeout: 60000,
+        assigners: [],
+        mode: COOPERATIVE,
+        instrumentationEmitter: new InstrumentationEventEmitter(),
+        logger: newLogger(),
+      })
+      protocol.memberId = 'member-1'
+      protocol.generationId = 7
+      protocol.lastRequest = 0
+      protocol.coordinator = {
+        heartbeat: jest.fn(async () => {
+          // The round the answer is late for: the member is already in generation 8.
+          protocol.generationId = 8
+          throw createErrorFromCode(ILLEGAL_GENERATION)
+        }),
+      }
+
+      const error = await protocol.heartbeat({ interval: 3000 }).catch((e) => e)
+
+      expect(sentGeneration(error)).toEqual(7)
+    })
+
+    it('records the generation an offset commit was sent under on what it throws', async () => {
+      const manager = new OffsetManager({
+        cluster: { committedOffsets: () => ({}) },
+        coordinator: {
+          isConnected: () => true,
+          offsetCommit: jest.fn(async () => {
+            throw createErrorFromCode(ILLEGAL_GENERATION)
+          }),
+        },
+        memberAssignment: { [TOPIC_A]: [0] },
+        autoCommit: false,
+        autoCommitInterval: null,
+        autoCommitThreshold: null,
+        topicConfigurations: {},
+        instrumentationEmitter: new InstrumentationEventEmitter(),
+        groupId: 'cooperative-group',
+        generationId: 7,
+        memberId: 'member-1',
+      })
+
+      const error = await manager
+        .commitOffsets({
+          topics: [{ topic: TOPIC_A, partitions: [{ partition: 0, offset: '5' }] }],
+        })
+        .catch((e) => e)
+
+      expect(sentGeneration(error)).toEqual(7)
+    })
+
+    it('drops a lost verdict answered about a generation the member has left', () => {
+      const { coordinator, consumerGroup, fetchManager } = createCoordinator()
+      consumerGroup.generationId = 2
+
+      coordinator.requestRejoin({
+        kind: 'lost',
+        reason: 'lost',
+        error: answeredUnder(ILLEGAL_GENERATION, 1),
+      })
+
+      expect(fetchManager.stop).not.toHaveBeenCalled()
+      expect(coordinator.takeVerdict()).toBeNull()
+    })
+
+    it('keeps a lost verdict answered about the generation the member still holds', () => {
+      const { coordinator, consumerGroup, fetchManager } = createCoordinator()
+      consumerGroup.generationId = 2
+
+      coordinator.requestRejoin({
+        kind: 'lost',
+        reason: 'lost',
+        error: answeredUnder(ILLEGAL_GENERATION, 2),
+      })
+
+      expect(fetchManager.stop).toHaveBeenCalled()
+      expect(coordinator.takeVerdict()).not.toBeNull()
+    })
+
+    it('never drops a fenced static member, whatever the generation says', () => {
+      const { coordinator, consumerGroup, fetchManager } = createCoordinator()
+      consumerGroup.generationId = 2
+
+      coordinator.requestRejoin({
+        kind: 'lost',
+        reason: 'lost',
+        error: answeredUnder(FENCED_INSTANCE_ID, 1),
+      })
+
+      expect(fetchManager.stop).toHaveBeenCalled()
+    })
+
+    it('never drops a verdict that came from no group request, such as a poll overrun', () => {
+      const { coordinator, consumerGroup, fetchManager } = createCoordinator()
+      consumerGroup.generationId = null
+
+      coordinator.requestRejoin({
+        kind: 'lost',
+        reason: 'poll-interval-exceeded',
+        error: new Error('the handler overran'),
+      })
+
+      expect(fetchManager.stop).toHaveBeenCalled()
+    })
+
+    it('does not discard offsets or rejoin for it on the fetch path', async () => {
+      const { coordinator, consumerGroup } = createCoordinator()
+      const runner = new Runner({
+        logger: newLogger(),
+        consumerGroup,
+        instrumentationEmitter: new InstrumentationEventEmitter(),
+        concurrency: 1,
+        heartbeatInterval: 3000,
+        maxPollInterval: 300000,
+        eachBatch: async () => {},
+        onCrash: jest.fn(),
+      })
+      runner.heartbeatManager.stop()
+      runner.rebalanceCoordinator = coordinator
+      consumerGroup.generationId = 2
+
+      await runner.handleRebalanceError({
+        kind: 'lost',
+        reason: 'lost',
+        error: answeredUnder(ILLEGAL_GENERATION, 1),
+      })
+
+      expect(consumerGroup.discardUncommittedOffsets).not.toHaveBeenCalled()
+      expect(runner.quiescing).toBe(false)
+      expect(consumerGroup.joinAndSync).not.toHaveBeenCalled()
+    })
+  })
+
   describe('the delta the apply reports', () => {
     it('returns assignment, added and revoked, carries no lost, and emits nothing', async () => {
       const { group, emitted } = createGroup()
@@ -735,6 +891,118 @@ describe('Consumer > cooperative rebalance apply', () => {
       expect(group.staleAssignmentPending).toBe(false)
       withStaleMetadata(group)
       expect(() => group.checkForStaleAssignment()).toThrow('Topic has been updated')
+    })
+  })
+
+  describe('the committed-offsets cache shared by one client', () => {
+    const buildManager = (cluster, memberAssignment) =>
+      new OffsetManager({
+        cluster,
+        coordinator: { isConnected: () => true },
+        memberAssignment,
+        autoCommit: false,
+        autoCommitInterval: null,
+        autoCommitThreshold: null,
+        topicConfigurations: {},
+        instrumentationEmitter: new InstrumentationEventEmitter(),
+        groupId: 'shared-group',
+        generationId: 1,
+        memberId: 'member-1',
+      })
+
+    it('is one object per client for a group, which is what makes the sharing real', () => {
+      const offsets = new Map()
+      const options = { brokers: ['localhost:9092'], logger: newLogger(), offsets }
+      const one = new Cluster(options)
+      const two = new Cluster(options)
+
+      expect(one.committedOffsets({ groupId: 'shared-group' })).toBe(
+        two.committedOffsets({ groupId: 'shared-group' })
+      )
+    })
+
+    it("leaves another member's keys alone when a manager is built", () => {
+      const committedOffsets = { [TOPIC_A]: { 0: '10', 1: '20' }, [TOPIC_B]: { 0: '30' } }
+      const cluster = { committedOffsets: () => committedOffsets }
+
+      buildManager(cluster, { [TOPIC_A]: [0] })
+
+      expect(committedOffsets[TOPIC_A][1]).toEqual('20')
+      expect(committedOffsets[TOPIC_B]).toEqual({ 0: '30' })
+      // Its own partition is reset, which is what a fresh manager means.
+      expect(committedOffsets[TOPIC_A][0]).toBeUndefined()
+    })
+
+    it("leaves another member's keys alone when uncommitted offsets are discarded", () => {
+      const committedOffsets = { [TOPIC_A]: { 0: '10', 1: '20' } }
+      const cluster = { committedOffsets: () => committedOffsets }
+      const manager = buildManager(cluster, { [TOPIC_A]: [0] })
+      committedOffsets[TOPIC_A][0] = '11'
+
+      manager.clearAllOffsets()
+
+      expect(committedOffsets[TOPIC_A]).toEqual({ 1: '20' })
+    })
+
+    it("prunes a revoked partition without touching another member's", () => {
+      const committedOffsets = { [TOPIC_A]: { 0: '10', 1: '20', 2: '30' } }
+      const cluster = { committedOffsets: () => committedOffsets }
+      const manager = buildManager(cluster, { [TOPIC_A]: [0, 1] })
+      committedOffsets[TOPIC_A][0] = '11'
+      committedOffsets[TOPIC_A][1] = '21'
+
+      manager.updateAssignment({
+        revoked: [{ topic: TOPIC_A, partitions: [1] }],
+        memberAssignment: { [TOPIC_A]: [0] },
+        generationId: 2,
+        memberId: 'member-1',
+        coordinator: { isConnected: () => true },
+      })
+
+      expect(committedOffsets[TOPIC_A]).toEqual({ 0: '11', 2: '30' })
+    })
+
+    it('survives a sibling manager whose interim assignment is empty', () => {
+      const committedOffsets = { [TOPIC_A]: { 0: '10' } }
+      const cluster = { committedOffsets: () => committedOffsets }
+      const incumbent = buildManager(cluster, { [TOPIC_A]: [0, 1] })
+      committedOffsets[TOPIC_A][0] = '11'
+
+      // The joining member's withheld first round: a manager over no topics at all.
+      buildManager(cluster, {})
+
+      expect(() =>
+        incumbent.updateAssignment({
+          revoked: [{ topic: TOPIC_A, partitions: [1] }],
+          memberAssignment: { [TOPIC_A]: [0] },
+          generationId: 2,
+          memberId: 'member-1',
+          coordinator: { isConnected: () => true },
+        })
+      ).not.toThrow()
+
+      expect(committedOffsets[TOPIC_A][0]).toEqual('11')
+    })
+
+    it('keeps two consumer groups of one client alive through a cooperative round', async () => {
+      const committedOffsets = {}
+      const incumbent = createGroup({ committedOffsets, topics: [TOPIC_A] }).group
+      const joining = createGroup({ committedOffsets, topics: [TOPIC_A] }).group
+      joining.memberId = 'member-2'
+
+      await applyCooperative(incumbent, { [TOPIC_A]: [0, 1] })
+      incumbent.resolveOffset({ topic: TOPIC_A, partition: 0, offset: '10', leaderEpoch: 4 })
+
+      // Round 1: the joining member is withheld everything, the incumbent gives up partition 1.
+      await applyCooperative(joining, {})
+      await expect(applyCooperative(incumbent, { [TOPIC_A]: [0] })).resolves.toBeDefined()
+
+      // Round 2: the withheld partition reaches its new owner.
+      await applyCooperative(joining, { [TOPIC_A]: [1] })
+
+      expect(incumbent.offsetManager.resolvedOffsets[TOPIC_A][0]).toEqual('11')
+      expect(incumbent.offsetManager.resolvedEpochs[TOPIC_A][0]).toEqual(4)
+      expect(joining.offsetManager.memberAssignment).toEqual({ [TOPIC_A]: [1] })
     })
   })
 
