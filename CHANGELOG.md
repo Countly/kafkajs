@@ -189,6 +189,7 @@ Upstream work this phase builds on, with thanks to its authors: PRs #1779, #1695
 #### Fixes
 
 - A subscription that declares `version: 1` or higher now writes the fields that version defines. The shipped codec wrote the same three fields for every declared version, so a `version: 1` subscription carried a v0 body under a v1 header — readable by another kafkajs member, and unreadable by any client that decodes `ConsumerProtocolSubscription` at the declared version, which is what the Java client does. A custom assigner that declares `version: 1` now emits four more bytes (an empty `OwnedPartitions`); one that declares `version: 0` — including the built-in round-robin assigner and therefore the default configuration — is byte-identical.
+- Stopping the consumer's fetch layer now actually stops it. The fetch manager rebuilds its fetchers in place whenever the broker set changes, and a stop that arrived during that rebuild awaited a set that had already been replaced — so the manager kept fetching and the call that was waiting for it never returned. A stop now latches, and the internal rebuild path is unaffected: an ordinary broker-pool change still re-creates the fetchers and keeps fetching.
 
 #### Additions
 
