@@ -48,18 +48,31 @@ const respondWithFrame = (state, correlationId, headerVersion, body, headerTags)
 
 /**
  * Reads the request header off a recorded write.
+ *
+ * `byteLength` is where the header ends and the codec's own body begins, which is what a
+ * byte-for-byte frame comparison needs: the correlation id and the client id live in the header
+ * and move with call order. The header length is version-dependent — a flexible request header
+ * carries a tagged-field buffer after the client id, a classic one does not.
+ * @see https://kafka.apache.org/43/design/protocol
  * @param {Buffer} frame
- * @returns {{ apiKey: number, apiVersion: number, correlationId: number }}
+ * @returns {{ apiKey: number, apiVersion: number, correlationId: number, clientId: string,
+ *   byteLength: number }}
  */
 const readRequestHeader = (frame) => {
   const Decoder = require('../src/protocol/decoder')
+  const { requestHeaderVersion, REQUEST_HEADER_V2 } = require('../src/protocol/headers')
   const decoder = new Decoder(frame)
   decoder.readInt32()
-  return {
-    apiKey: decoder.readInt16(),
-    apiVersion: decoder.readInt16(),
-    correlationId: decoder.readInt32(),
+  const apiKey = decoder.readInt16()
+  const apiVersion = decoder.readInt16()
+  const correlationId = decoder.readInt32()
+  const clientId = decoder.readString()
+
+  if (requestHeaderVersion(apiKey, apiVersion) === REQUEST_HEADER_V2) {
+    decoder.readTaggedFields()
   }
+
+  return { apiKey, apiVersion, correlationId, clientId, byteLength: decoder.offset }
 }
 
 module.exports = { createFakeSocketFactory, respondWithFrame, readRequestHeader }

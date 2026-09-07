@@ -189,5 +189,6 @@ Upstream work this phase builds on, with thanks to its authors: PRs #1779, #1695
 #### Tooling
 
 - New development-only benchmark `scripts/benchmarks/rebalanceLatency.js`, measuring the time from a member joining a group to the next batch delivered on a partition the existing member keeps across the round. Its eager baseline, measured on the previous release, is committed at `scripts/benchmarks/baselines/rebalanceLatency.json` so later runs are comparable. Not part of `npm test`.
+- The four classic group requests (JoinGroup v5, SyncGroup v3, Heartbeat v3, LeaveGroup v3) now have committed golden request frames, recorded through a real broker over a fake socket with a pinned ApiVersions table, so a refactor of the membership path is proved byte-for-byte rather than argued.
 
 Adopted upstream PRs are credited here by number as they land (Phase 2 onward).

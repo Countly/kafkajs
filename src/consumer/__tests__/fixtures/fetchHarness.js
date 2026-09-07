@@ -422,6 +422,74 @@ const createFakeBroker = (answer) => {
 }
 
 /**
+ * The ApiVersions table the membership harness pins, so version negotiation is a constant of this
+ * file rather than whatever a broker happens to advertise. The maxima are the versions this repo
+ * implements for the four classic group requests.
+ * @see https://kafka.apache.org/43/design/protocol
+ * @returns {Buffer}
+ */
+const membershipApiVersionsBody = () => {
+  const api = (apiKey, minVersion, maxVersion) =>
+    new Encoder()
+      .writeInt16(apiKey)
+      .writeInt16(minVersion)
+      .writeInt16(maxVersion)
+      .writeTaggedFields()
+
+  return new Encoder()
+    .writeInt16(0)
+    .writeUVarIntArray([
+      api(apiKeys.JoinGroup, 0, 5),
+      api(apiKeys.SyncGroup, 0, 3),
+      api(apiKeys.Heartbeat, 0, 3),
+      api(apiKeys.LeaveGroup, 0, 3),
+    ])
+    .writeInt32(0)
+    .writeTaggedFields().buffer
+}
+
+/**
+ * A real `Broker` over a fake socket, pinned to the membership ApiVersions table above and
+ * answering JoinGroup/SyncGroup/Heartbeat/LeaveGroup with the bodies `answer` returns.
+ *
+ * `bodyOf(apiKey)` returns the LAST request written for that api key with its request header
+ * stripped, which is what a golden frame comparison needs: the correlation id and the client id
+ * live in the header and move with call order, while the body is the thing the codec produced.
+ *
+ * @param {(header: { apiKey: number, apiVersion: number }) => Buffer} answer
+ * @returns {Promise<{ broker: Broker, state: { writes: Buffer[] },
+ *   bodyOf: (apiKey: number) => { apiKey: number, apiVersion: number, body: Buffer } }>}
+ * @throws {Error} from `bodyOf` when no request was written for the requested api key
+ */
+const createFakeCoordinator = async (answer) => {
+  const { broker, state } = createFakeBroker((header) =>
+    header.apiKey === apiKeys.ApiVersions ? membershipApiVersionsBody() : answer(header)
+  )
+
+  await broker.connect()
+
+  const bodyOf = (apiKey) => {
+    for (let i = state.writes.length - 1; i >= 0; i--) {
+      const write = state.writes[i]
+      const header = readRequestHeader(write)
+      if (header.apiKey !== apiKey) {
+        continue
+      }
+
+      return {
+        apiKey: header.apiKey,
+        apiVersion: header.apiVersion,
+        body: write.subarray(header.byteLength),
+      }
+    }
+
+    throw new Error(`no request written for apiKey ${apiKey}`)
+  }
+
+  return { broker, state, bodyOf }
+}
+
+/**
  * Builds a `ConsumerGroup` whose join/sync dance is skipped: `subscriptionState` and
  * `offsetManager` are primed directly, mirroring what a real join would have produced.
  * @param {{ cluster: object, broker: Broker, partitions: number[], checkCrcs: boolean,
@@ -743,6 +811,7 @@ module.exports = {
   apiVersionsBody,
   decodeFetchRequest,
   createFakeBroker,
+  createFakeCoordinator,
   fetchResponse,
   offsetForLeaderEpochResponse,
   createFetchGroup,
