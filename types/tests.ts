@@ -22,6 +22,8 @@ import {
   KafkaJSStaleTopicMetadataAssignment,
   PartitionMetadata,
   KafkaJSServerDoesNotSupportApiKey,
+  AssignerProtocol,
+  MemberMetadata,
 } from './index'
 
 const { roundRobin } = PartitionAssigners
@@ -360,3 +362,17 @@ const noInternalPredicateIsPublic: 'isPollIntervalExceeded' extends keyof typeof
   ? never
   : true = true
 void noInternalPredicateIsPublic
+
+// The documented custom assigner still compiles unchanged.
+AssignerProtocol.MemberMetadata.encode({ version: 1, topics: ['t'] })
+// The new fields are optional and typed.
+AssignerProtocol.MemberMetadata.encode({
+  version: 3,
+  topics: ['t'],
+  userData: null,
+  ownedPartitions: [{ topic: 't', partitions: [0] }],
+  generationId: 1,
+  rackId: 'rack-1',
+})
+const decoded: MemberMetadata | null = AssignerProtocol.MemberMetadata.decode(Buffer.alloc(0))
+void decoded

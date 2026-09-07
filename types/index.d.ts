@@ -631,15 +631,34 @@ export type Admin = {
 
 export const PartitionAssigners: { roundRobin: PartitionAssigner }
 
-export interface ISerializer<T> {
-  encode(value: T): Buffer
-  decode(buffer: Buffer): T | null
+export interface ISerializer<TIn, TOut = TIn> {
+  encode(value: TIn): Buffer
+  decode(buffer: Buffer): TOut | null
 }
 
+/**
+ * What `AssignerProtocol.MemberMetadata.encode` accepts. `userData: null` writes the wire null
+ * sentinel; omitting it, or passing `undefined`, writes an empty byte string. The wire format is
+ * positional, so the `version` decides which of the optional fields are written, each omitted
+ * value taking its Kafka default.
+ */
+export type MemberMetadataInput = {
+  version: number
+  topics: string[]
+  userData?: Buffer | null
+  ownedPartitions?: Array<{ topic: string; partitions: number[] }>
+  generationId?: number
+  rackId?: string | null
+}
+
+/** What `AssignerProtocol.MemberMetadata.decode` returns. */
 export type MemberMetadata = {
   version: number
   topics: string[]
   userData: Buffer
+  ownedPartitions?: Array<{ topic: string; partitions: number[] }>
+  generationId?: number
+  rackId?: string | null
 }
 
 export type MemberAssignment = {
@@ -649,7 +668,7 @@ export type MemberAssignment = {
 }
 
 export const AssignerProtocol: {
-  MemberMetadata: ISerializer<MemberMetadata>
+  MemberMetadata: ISerializer<MemberMetadataInput, MemberMetadata>
   MemberAssignment: ISerializer<MemberAssignment>
 }
 

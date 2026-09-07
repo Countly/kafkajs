@@ -15,7 +15,11 @@ describe('Consumer > assignerProtocol', () => {
         topics: ['topic-test'],
       })
 
-      expect(buffer).toEqual(FIXTURE_ROUND_ROBIN_METADATA)
+      // v1 now writes the OwnedPartitions group the version declares; the fixture is the v0
+      // prefix, which is byte-identical, plus that group's empty INT32.
+      expect(buffer).toEqual(
+        Buffer.concat([FIXTURE_ROUND_ROBIN_METADATA, Buffer.from([0, 0, 0, 0])])
+      )
     })
 
     test('decode', () => {
