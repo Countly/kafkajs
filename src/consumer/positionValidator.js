@@ -289,6 +289,27 @@ module.exports = class PositionValidator {
   }
 
   /**
+   * Drops the state of partitions this member no longer holds, WITHOUT bumping the assignment
+   * generation.
+   *
+   * A bump would strand every retained partition that has a validation in flight: `complete()`
+   * discards on a generation mismatch and writes nothing, `needsValidation()` returns false while
+   * a request is pending, and an awaiting partition is excluded from the fetch - so it would never
+   * be fetched again. Deleting only the revoked keys gives the fence that is actually needed: a
+   * late reply for a deleted entry hits the absent-key guard in `complete()` and is discarded.
+   *
+   * @param {Array<{topic: string, partitions: number[]}>} topicPartitions
+   * @returns {void}
+   */
+  forgetPartitions(topicPartitions) {
+    for (const { topic, partitions } of topicPartitions) {
+      for (const partition of partitions) {
+        this.entries.delete(this.getKey(topic, partition))
+      }
+    }
+  }
+
+  /**
    * Drops every partition, re-arms validation and stamps the next assignment generation. Called
    * when the group syncs: a partition that was revoked and reassigned must not keep counting as
    * validated against an epoch it no longer holds, and a reply to a request the previous

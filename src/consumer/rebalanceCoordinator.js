@@ -179,7 +179,11 @@ module.exports = class RebalanceCoordinator {
       const result = await this.consumerGroup.joinAndSync()
       // Only the delta is read here: the GROUP_JOIN payload below is built from the APPLIED
       // assignment through `consumerGroup.assigned()`, which is what keeps it the full set.
-      const { revoked, added } = await this.consumerGroup.applyRebalanceResult(result)
+      // A cooperative round runs alongside the fetch loop, so the apply must keep what this
+      // member retained; an eager round revoked everything before joining and rebuilds.
+      const { revoked, added } = await this.consumerGroup.applyRebalanceResult(result, {
+        rebuildOffsets: this.consumerGroup.rebalanceProtocol() !== COOPERATIVE,
+      })
 
       if (revoked.length) {
         this.emitPartitions(PARTITIONS_REVOKED, revoked)

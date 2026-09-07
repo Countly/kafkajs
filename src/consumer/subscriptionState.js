@@ -37,6 +37,21 @@ module.exports = class SubscriptionState {
   }
 
   /**
+   * Replaces the assignment without touching the pause state.
+   *
+   * `assign()` has never cleared `subscriptionStatesByTopic`, so a paused partition survives a
+   * rebalance today; an incremental apply must keep that property. Delegating to `assign()` is
+   * deliberate - one body, so the two cannot drift apart - and the name is what documents the
+   * intent at the call site.
+   *
+   * @param {Array<TopicPartitions>} topicPartitions Example: [{ topic: 'topic-name', partitions: [1, 2] }]
+   * @returns {void}
+   */
+  update(topicPartitions = []) {
+    this.assign(topicPartitions)
+  }
+
+  /**
    * @param {Array<TopicPartitions>} topicPartitions Example: [{ topic: 'topic-name', partitions: [1, 2] }]
    */
   pause(topicPartitions = []) {

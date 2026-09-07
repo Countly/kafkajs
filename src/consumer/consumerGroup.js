@@ -351,15 +351,24 @@ module.exports = class ConsumerGroup {
    * Applies one sync result to this member's local state and reports what changed.
    *
    * Filters out topics the member is not subscribed to, refreshes metadata once when the
-   * assignment names a partition the member has never heard of, replaces the assignment and
-   * rebuilds the offset manager, and clears the per-assignment caches. Emits exactly one event,
-   * `RECEIVED_UNSUBSCRIBED_TOPICS`, which it already owned.
+   * assignment names a partition the member has never heard of, and replaces the assignment.
+   * Emits exactly one event, `RECEIVED_UNSUBSCRIBED_TOPICS`, which it already owned.
+   *
+   * Two ways to apply the offsets:
+   *
+   * - **rebuild** (the default, and what an eager round does): a fresh `OffsetManager`, the whole
+   *   position-validation state dropped, every fetch-error counter cleared, and the assignment
+   *   epoch moved so batches fetched under the previous assignment are recognised and dropped.
+   * - **incremental** (`rebuildOffsets: false`, what a cooperative round does): the manager is
+   *   kept and told the delta, so a retained partition keeps its position, its committed offset
+   *   and its tracked epoch; only the revoked partitions lose theirs. The epoch does not move,
+   *   because batches in flight for retained partitions are still valid.
+   *
+   * Pause state survives either way: `subscriptionState.update()` replaces the assignment only.
    *
    * @param {{ assignment: Object, userData?: Buffer|null }} result the decoded sync result
-   * @param {{ rebuildOffsets?: boolean }} [options] `rebuildOffsets: false` applies the assignment
-   *   without replacing the offsets, for an apply that keeps what this member already owns. The
-   *   assignment epoch only moves when the offsets are replaced, because that is what makes a
-   *   batch fetched under the previous assignment stale.
+   * @param {{ rebuildOffsets?: boolean }} [options] `rebuildOffsets: false` selects the
+   *   incremental apply; it still builds the first manager, because there is nothing to keep
    * @returns {Promise<import('./groupProtocol/interface').RebalanceResult>}
    */
   async applyRebalanceResult(result, { rebuildOffsets = true } = {}) {
@@ -433,20 +442,25 @@ module.exports = class ConsumerGroup {
 
     const { added, revoked } = this.groupMembership.diffAssignment(currentMemberAssignment)
 
-    this.subscriptionState.assign(currentMemberAssignment)
+    // Narrowed before the apply mutates anything: a revoked partition must stop being advertised
+    // and stop accepting resolved offsets the instant the apply decides it is gone. `setOwned`
+    // below is the widening half.
+    this.groupMembership.narrowOwned(currentMemberAssignment)
 
-    if (rebuildOffsets) {
+    const memberAssignment = currentMemberAssignment.reduce(
+      (partitionsByTopic, { topic, partitions }) => ({
+        ...partitionsByTopic,
+        [topic]: partitions,
+      }),
+      {}
+    )
+
+    if (rebuildOffsets || !this.offsetManager) {
       this.offsetManager = new OffsetManager({
         cluster: this.cluster,
         topicConfigurations: this.topicConfigurations,
         instrumentationEmitter: this.instrumentationEmitter,
-        memberAssignment: currentMemberAssignment.reduce(
-          (partitionsByTopic, { topic, partitions }) => ({
-            ...partitionsByTopic,
-            [topic]: partitions,
-          }),
-          {}
-        ),
+        memberAssignment,
         autoCommit: this.autoCommit,
         autoCommitInterval: this.autoCommitInterval,
         autoCommitThreshold: this.autoCommitThreshold,
@@ -458,11 +472,32 @@ module.exports = class ConsumerGroup {
         pendingTopicResets: this.pendingTopicResets,
       })
       this.assignmentEpoch += 1
+
+      this.consecutiveFetchErrors.clear()
+      this.positionValidator.clear()
+    } else {
+      this.offsetManager.updateAssignment({
+        revoked,
+        memberAssignment,
+        generationId,
+        memberId,
+        coordinator,
+      })
+
+      for (const { topic, partitions } of revoked) {
+        for (const partition of partitions) {
+          this.consecutiveFetchErrors.delete(`${topic}|${partition}`)
+          this.seekOffset.pop(topic, partition)
+        }
+      }
+
+      this.positionValidator.forgetPartitions(revoked)
     }
 
-    this.consecutiveFetchErrors.clear()
-    this.positionValidator.clear()
+    // Wholesale in both branches: its members are broker node ids, not partitions.
     this.validationUnusableLogged.clear()
+
+    this.subscriptionState.update(currentMemberAssignment)
 
     this.groupMembership.notifyAssignment({
       partitions: currentMemberAssignment,
@@ -470,6 +505,7 @@ module.exports = class ConsumerGroup {
     })
 
     this.groupMembership.setOwned(currentMemberAssignment)
+    this.clearStaleAssignmentPending()
 
     return { assignment: currentMemberAssignment, added, revoked }
   }
@@ -1221,8 +1257,21 @@ module.exports = class ConsumerGroup {
     return map
   }
 
+  /**
+   * Raises `KafkaJSStaleTopicMetadataAssignment` the first time this member's view of a subscribed
+   * topic's partitions falls behind the cluster's.
+   *
+   * Latched: the check is skipped while a report is pending, so it costs one warning and one
+   * rejoin request per pending period rather than one per fetch round per broker. A cooperative
+   * round stops no fetcher, and the sleep that paces an idle round is downstream of this throw, so
+   * an unlatched check would spin every fetcher for the whole duration of the round it asked for.
+   * The latch is cleared by the apply, and by the rebalance chain's own `finally`.
+   *
+   * @returns {void}
+   * @throws {KafkaJSStaleTopicMetadataAssignment} when a subscribed topic gained partitions
+   */
   checkForStaleAssignment() {
-    if (!this.partitionsPerSubscribedTopic) {
+    if (!this.partitionsPerSubscribedTopic || this.staleAssignmentPending) {
       return
     }
 
@@ -1232,6 +1281,7 @@ module.exports = class ConsumerGroup {
       const diff = arrayDiff(partitions, this.partitionsPerSubscribedTopic.get(topic))
 
       if (diff.length > 0) {
+        this.staleAssignmentPending = true
         throw new KafkaJSStaleTopicMetadataAssignment('Topic has been updated', {
           topic,
           unknownPartitions: diff,

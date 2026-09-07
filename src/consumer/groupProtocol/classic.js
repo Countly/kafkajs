@@ -1,12 +1,12 @@
 const sharedPromiseTo = require('../../utils/sharedPromiseTo')
 const apiKeys = require('../../protocol/requests/apiKeys')
 const { requests } = require('../../protocol/requests')
-const { MemberAssignment } = require('../assignerProtocol')
+const { MemberAssignment, MemberMetadata } = require('../assignerProtocol')
 const { KafkaJSNonRetriableError } = require('../../errors')
 const {
   events: { HEARTBEAT },
 } = require('../instrumentationEvents')
-const { EAGER } = require('./interface')
+const { EAGER, COOPERATIVE } = require('./interface')
 
 /**
  * Membership over the classic JoinGroup/SyncGroup protocol.
@@ -262,6 +262,15 @@ module.exports = class ClassicGroupProtocol {
       await this.cluster.refreshMetadata()
       assignment = await assigner.assign({ members, topics: topicsSubscribed })
 
+      // An incremental rebalance must never hand a partition to a member while another member
+      // still owns it: the new owner would fetch it while the old one is still delivering.
+      // `cooperative-sticky` guarantees this through its own withhold rule, so it is exempt; any
+      // other assignor configured under this mode has to be checked.
+      // @see https://cwiki.apache.org/confluence/display/KAFKA/KIP-429%3A+Kafka+Consumer+Incremental+Rebalance+Protocol
+      if (this.mode === COOPERATIVE && groupProtocol !== 'cooperative-sticky') {
+        this.assertNoDoubleAssignment({ members, assignment })
+      }
+
       this.logger.debug('Group assignment', {
         groupId,
         generationId,
@@ -288,6 +297,61 @@ module.exports = class ClassicGroupProtocol {
       assignment: decoded != null ? decoded.assignment : {},
       userData: decoded != null ? decoded.userData : null,
     }
+  }
+
+  /**
+   * Throws when a leader-computed assignment hands a partition to one member while another still
+   * owns it, which an incremental rebalance must never do.
+   *
+   * A member whose subscription carries no owned partitions - a v0 subscription, or one this
+   * member cannot decode - contributes nothing to the ownership set, so an unknown owner is never
+   * treated as a conflict.
+   *
+   * @param {{ members: Array<{memberId: string, memberMetadata: Buffer}>,
+   *   assignment: Array<{memberId: string, memberAssignment: Buffer}> }} round
+   * @returns {void}
+   * @throws {KafkaJSNonRetriableError} naming the topic, the partition and both member ids
+   */
+  assertNoDoubleAssignment({ members, assignment }) {
+    const ownerOf = new Map()
+
+    for (const { memberId, memberMetadata } of members) {
+      const decoded = this.decodeSubscription(memberMetadata)
+      for (const { topic, partitions } of (decoded && decoded.ownedPartitions) || []) {
+        for (const partition of partitions) {
+          ownerOf.set(`${topic}|${partition}`, memberId)
+        }
+      }
+    }
+
+    for (const { memberId, memberAssignment } of assignment) {
+      const decoded = MemberAssignment.decode(memberAssignment)
+      for (const [topic, partitions] of Object.entries(decoded ? decoded.assignment : {})) {
+        for (const partition of partitions) {
+          const owner = ownerOf.get(`${topic}|${partition}`)
+
+          if (owner !== undefined && owner !== memberId) {
+            throw new KafkaJSNonRetriableError(
+              `Cooperative rebalance would assign ${topic}-${partition} to ${memberId} while ${owner} still owns it; use the cooperative-sticky assigner or an assignor that withholds moved partitions`
+            )
+          }
+        }
+      }
+    }
+  }
+
+  /**
+   * Decodes one member's subscription, tolerating a buffer this client did not write.
+   * @private
+   * @param {Buffer} memberMetadata
+   * @returns {Object|null} null when the buffer carries no readable version header
+   */
+  decodeSubscription(memberMetadata) {
+    // Two bytes is the version header every version of the subscription starts with; anything
+    // shorter cannot be decoded and belongs to a member whose ownership is simply unknown.
+    return memberMetadata && memberMetadata.length >= 2
+      ? MemberMetadata.decode(memberMetadata)
+      : null
   }
 
   /**

@@ -30,6 +30,15 @@ module.exports = class OffsetManager {
   }
 
   /**
+   * @private
+   * @param {import("../../../types").IMemberAssignment} memberAssignment
+   * @returns {Map<string, Set<number>>}
+   */
+  static indexAssignment(memberAssignment) {
+    return new Map(keys(memberAssignment).map((topic) => [topic, new Set(memberAssignment[topic])]))
+  }
+
+  /**
    * @param {Object} options
    * @param {import("../../../types").Cluster} options.cluster
    * @param {import("../../../types").Broker} options.coordinator
@@ -74,6 +83,13 @@ module.exports = class OffsetManager {
     //   'topic2': [0, 1, 2, 3, 4, 5],
     // }
     this.memberAssignment = memberAssignment
+
+    /**
+     * The assignment as a lookup, so the ownership guard on the resolve path is a Set membership
+     * test rather than a linear scan of a partition array on every resolved offset.
+     * @type {Map<string, Set<number>>}
+     */
+    this.assignedPartitions = OffsetManager.indexAssignment(memberAssignment)
 
     this.topicConfigurations = topicConfigurations
     this.instrumentationEmitter = instrumentationEmitter
@@ -165,8 +181,65 @@ module.exports = class OffsetManager {
    *   previous epoch would understate the position and could seek the partition backwards.
    */
   resolveOffset({ topic, partition, offset, leaderEpoch = -1 }) {
+    // A handler can still be running for a partition this member lost during a cooperative
+    // round. Writing its position back would resolve an offset against a generation that no
+    // longer owns the partition, and the commit would then roll the new owner back.
+    if (!this.owns(topic, partition)) {
+      return
+    }
+
     this.resolvedOffsets[topic][partition] = Long.fromValue(offset).add(1).toString()
     this.resolvedEpochs[topic][partition] = leaderEpoch
+  }
+
+  /**
+   * @param {string} topic
+   * @param {number} partition
+   * @returns {boolean} whether this member holds this partition at the current generation
+   */
+  owns(topic, partition) {
+    const partitions = this.assignedPartitions.get(topic)
+    return partitions !== undefined && partitions.has(partition)
+  }
+
+  /**
+   * Moves this manager to a new assignment without discarding what the retained partitions know.
+   *
+   * Only the incremental (cooperative) apply calls this; an apply that revokes everything builds a
+   * fresh manager instead. Pruning is at PARTITION level, so a fully revoked topic keeps an empty
+   * object: `nextOffset` indexes `[topic][partition]` unguarded, and a topic-level prune would
+   * silently rewind a partition this member kept back to the start of its log.
+   *
+   * @param {object} options
+   * @param {Array<{topic: string, partitions: number[]}>} options.revoked partitions to prune
+   * @param {import("../../../types").IMemberAssignment} options.memberAssignment the full new one;
+   *   it already names every added topic, so the keys they need are created from it
+   * @param {number} options.generationId
+   * @param {string} options.memberId
+   * @param {import("../../../types").Broker} options.coordinator re-resolved every sync, so a
+   *   coordinator that moved is used for the next commit
+   * @returns {void}
+   */
+  updateAssignment({ revoked, memberAssignment, generationId, memberId, coordinator }) {
+    for (const { topic, partitions } of revoked) {
+      for (const partition of partitions) {
+        this.clearOffsets({ topic, partition })
+      }
+    }
+
+    this.memberAssignment = memberAssignment
+    this.assignedPartitions = OffsetManager.indexAssignment(memberAssignment)
+    this.topics = keys(memberAssignment)
+    this.generationId = generationId
+    this.memberId = memberId
+    this.coordinator = coordinator
+
+    const committedOffsets = this.committedOffsets()
+    for (const topic of this.topics) {
+      committedOffsets[topic] = committedOffsets[topic] || {}
+      this.resolvedOffsets[topic] = this.resolvedOffsets[topic] || {}
+      this.resolvedEpochs[topic] = this.resolvedEpochs[topic] || {}
+    }
   }
 
   /**

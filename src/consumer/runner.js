@@ -591,9 +591,25 @@ module.exports = class Runner extends EventEmitter {
          * @param {import('../../types').OffsetsByTopicPartition} [offsets] Optional.
          */
         commitOffsetsIfNecessary: async (offsets) => {
-          return offsets
-            ? this.consumerGroup.commitOffsets(offsets)
-            : this.consumerGroup.commitOffsetsIfNecessary()
+          if (offsets) {
+            return this.commitOwnedOffsets(offsets)
+          }
+
+          // The no-argument form commits on this batch's behalf, so it follows this batch's
+          // partition: a handler still running for one a rebalance revoked must not move an
+          // offset the new owner controls.
+          if (!this.consumerGroup.isAssigned(topic, partition)) {
+            this.logger.debug('Skipping a commit for a partition this member no longer holds', {
+              groupId: this.consumerGroup.groupId,
+              memberId: this.consumerGroup.memberId,
+              topic,
+              partition,
+            })
+
+            return
+          }
+
+          return this.consumerGroup.commitOffsetsIfNecessary()
         },
         uncommittedOffsets: () => this.consumerGroup.uncommittedOffsets(),
         isRunning: () => this.running,
@@ -627,6 +643,48 @@ module.exports = class Runner extends EventEmitter {
         leaderEpoch: batch.leaderEpochAt(lastOffset),
       })
     }
+  }
+
+  /**
+   * Commits a caller-supplied offsets payload, dropping the partitions this member no longer
+   * holds.
+   *
+   * `eachBatch`'s `commitOffsetsIfNecessary(offsets)` takes a full payload, which may name
+   * partitions other than the batch's own - so ownership is decided per partition rather than
+   * from the batch. A payload naming only partitions that were revoked commits nothing at all,
+   * rather than committing an offset the new owner controls.
+   *
+   * A payload with no `topics` list means "commit what is resolved", which the offset manager
+   * already keeps free of revoked partitions, so it passes through untouched.
+   *
+   * @param {import('../../types').OffsetsByTopicPartition} offsets
+   * @returns {Promise<void>}
+   */
+  async commitOwnedOffsets(offsets) {
+    if (!Array.isArray(offsets.topics)) {
+      return this.consumerGroup.commitOffsets(offsets)
+    }
+
+    const topics = offsets.topics
+      .map((entry) => ({
+        ...entry,
+        partitions: (entry.partitions || []).filter(({ partition }) =>
+          this.consumerGroup.isAssigned(entry.topic, partition)
+        ),
+      }))
+      .filter(({ partitions }) => partitions.length > 0)
+
+    if (topics.length === 0) {
+      this.logger.debug('Skipping a commit for partitions this member no longer holds', {
+        groupId: this.consumerGroup.groupId,
+        memberId: this.consumerGroup.memberId,
+        topics: offsets.topics.map(({ topic }) => topic),
+      })
+
+      return
+    }
+
+    return this.consumerGroup.commitOffsets({ ...offsets, topics })
   }
 
   async fetch(nodeId) {
