@@ -1,5 +1,6 @@
 import * as fs from 'fs'
 
+import * as kafkajs from './index'
 import {
   Kafka,
   PartitionAssigners,
@@ -352,3 +353,10 @@ new KafkaJSServerDoesNotSupportApiKey(
 // maxInFlightRequests: null is the documented opt-out, positive integers cap in-flight requests
 kafka.producer({ maxInFlightRequests: null })
 kafka.consumer({ groupId: 'g', maxInFlightRequests: 5 })
+
+// The poll-interval predicate is internal. If it ever reaches the public surface this stops
+// compiling, which is the point: no predicate is exported, and this one least of all.
+const noInternalPredicateIsPublic: 'isPollIntervalExceeded' extends keyof typeof kafkajs
+  ? never
+  : true = true
+void noInternalPredicateIsPublic

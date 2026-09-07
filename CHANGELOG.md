@@ -187,6 +187,7 @@ Upstream work this phase builds on, with thanks to its authors: PRs #1779, #1695
 #### Additions
 
 - Membership (the group coordinator handle, JoinGroup/SyncGroup/Heartbeat/LeaveGroup, the member id and generation, and assignor selection) moved out of the consumer group into a dedicated classic-protocol object, leaving the fetch loop, offsets, seek and pause where they were. No behavior, no wire bytes and no public API changed — the four group requests are byte-identical to the recorded golden frames.
+- The consumer's rebalance-error classification moved into one module with one truth table, derived from the existing error predicates rather than a second list of codes. No error code changed meaning, no error class was added, and the deliberate deviation from the Java client for `NOT_COORDINATOR_FOR_GROUP` (16) — which this client treats as a revocation rather than only re-discovering the coordinator — is unchanged.
 
 #### Tooling
 

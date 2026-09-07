@@ -336,6 +336,13 @@ const isUnknownMemberId = (e) => e.code === UNKNOWN_MEMBER_ID_CODE
  */
 const isRevoked = (e) => isRebalancing(e) && !isLostMember(e)
 
+/**
+ * The consumer exceeded its own poll-interval deadline. This is the client's own condition, not
+ * a broker error code, and it deliberately has no public error class: it exists so the rebalance
+ * paths - all of which are error-shaped - can carry it like any other verdict.
+ */
+const isPollIntervalExceeded = (e) => e.type === 'POLL_INTERVAL_EXCEEDED'
+
 const isKafkaJSError = (e) => e instanceof KafkaJSError
 
 module.exports = {
@@ -376,5 +383,6 @@ module.exports = {
   isRevoked,
   isFencedInstance,
   isUnknownMemberId,
+  isPollIntervalExceeded,
   isKafkaJSError,
 }

@@ -17,6 +17,7 @@ const {
   isRevoked,
   isFencedInstance,
   isUnknownMemberId,
+  isPollIntervalExceeded,
   ...errors
 } = require('./src/errors')
 const { LEVELS } = require('./src/loggers')
