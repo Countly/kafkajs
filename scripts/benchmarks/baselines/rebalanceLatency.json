@@ -1,0 +1,14 @@
+{
+  "recordedOn": "3.0.0-alpha.5b",
+  "recordedOnCommit": "c5208ed3",
+  "kafkaVersion": "4.3.1",
+  "protocol": "eager",
+  "partitions": 6,
+  "members": 2,
+  "runs": 7,
+  "groupInitialRebalanceDelayMs": 0,
+  "samplesMs": [
+    13.108292, 30.044375, 29.246792, 40.211542, 29.341917, 42.814459, 38.411084
+  ],
+  "medianMs": 30.044375
+}

@@ -178,4 +178,16 @@ Upstream work this phase builds on, with thanks to its authors: PRs #1779, #1695
 - Every protocol codec added in this release is checked against two independent sources as well as its own hand-built fixtures: byte vectors generated from Apache Kafka's own codecs (`scripts/protocol/javaVectors/run.sh`, extended to cover Fetch v12–v18, Produce v12/v13, OffsetForLeaderEpoch v3/v4 and SaslAuthenticate v2), and bytes captured from a live broker (`node scripts/protocol/capture.js`, whose version report now covers those APIs too). Versions no broker in the test matrix negotiates, and the SASL codec the capture client cannot reach, are recorded as deliberate capture gaps with the Java vector as the second source.
 - The coverage floor enforced by `npm run test:coverage` now ratchets: it is set to the coverage measured at each internal release, rounded down to one decimal (97.1 % statements, 90 % branches, 97.9 % functions, 97.2 % lines at this one), so coverage can only go up.
 
+### Phase 6A — classic-protocol consumer foundation
+
+#### Behavior changes
+
+#### Fixes
+
+#### Additions
+
+#### Tooling
+
+- New development-only benchmark `scripts/benchmarks/rebalanceLatency.js`, measuring the time from a member joining a group to the next batch delivered on a partition the existing member keeps across the round. Its eager baseline, measured on the previous release, is committed at `scripts/benchmarks/baselines/rebalanceLatency.json` so later runs are comparable. Not part of `npm test`.
+
 Adopted upstream PRs are credited here by number as they land (Phase 2 onward).
