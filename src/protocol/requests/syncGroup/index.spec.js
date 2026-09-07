@@ -14,12 +14,12 @@ const build = (version, overrides = {}) =>
 describe('Protocol > Requests > SyncGroup', () => {
   versions.forEach((version) => {
     describe(`v${version}`, () => {
-      it('derives the request timeout from the rebalance timeout', () => {
+      it('caps the request timeout at 60 s plus the network delay', () => {
         const { requestTimeout } = build(version, {
           rebalanceTimeout: 120000,
           sessionTimeout: 60000,
         })
-        expect(requestTimeout).toEqual(120000 + NETWORK_DELAY)
+        expect(requestTimeout).toEqual(65000)
       })
 
       it('falls back to the session timeout when there is no rebalance timeout', () => {
@@ -27,9 +27,9 @@ describe('Protocol > Requests > SyncGroup', () => {
         expect(requestTimeout).toEqual(60000 + NETWORK_DELAY)
       })
 
-      it('does not overflow past MAX_SAFE_INTEGER', () => {
+      it('caps a MAX_SAFE_INTEGER rebalance timeout rather than overflowing', () => {
         const { requestTimeout } = build(version, { rebalanceTimeout: Number.MAX_SAFE_INTEGER })
-        expect(requestTimeout).toEqual(Number.MAX_SAFE_INTEGER)
+        expect(requestTimeout).toEqual(65000)
       })
 
       it('leaves the timeout unset when neither is supplied (client default applies)', () => {

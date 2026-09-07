@@ -2,17 +2,23 @@ const NETWORK_DELAY = 5000
 
 /**
  * The SYNC_GROUP request blocks on the coordinator until the group leader delivers the
- * assignment, which can take up to rebalanceTimeout. Using the client-wide requestTimeout
- * (30s by default) kills slow rebalances client-side and starts a non-converging rejoin loop.
- * Mirrors the JoinGroup rule in ../joinGroup/index.js, including its overflow guard:
- * sessionTimeout can be configured as Number.MAX_SAFE_INTEGER.
+ * assignment. The client-wide requestTimeout (30s by default) kills slow rebalances client-side
+ * and starts a non-converging rejoin loop, so the timeout is derived from the rebalance timeout
+ * as JoinGroup's is - but CAPPED, because the rebalance timeout is now the 5-minute
+ * max.poll.interval.ms while Java sends SyncGroup with the plain request.timeout.ms.
+ * `||`, not `??`: a configured rebalanceTimeout of 0 falls back to sessionTimeout, unchanged.
+ * The cap subsumes the previous overflow guard - min(timeout, 60000) + 5000 cannot leave the
+ * safe-integer range however large sessionTimeout is configured - so that guard is removed
+ * rather than left as unreachable code.
  */
+const MAX_TIMEOUT = 60000
+
 const requestTimeout = ({ rebalanceTimeout, sessionTimeout }) => {
   const timeout = rebalanceTimeout || sessionTimeout
   if (timeout == null) {
     return undefined
   }
-  return Number.isSafeInteger(timeout + NETWORK_DELAY) ? timeout + NETWORK_DELAY : timeout
+  return Math.min(timeout, MAX_TIMEOUT) + NETWORK_DELAY
 }
 
 const versions = {

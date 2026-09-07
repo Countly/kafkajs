@@ -182,10 +182,15 @@ Upstream work this phase builds on, with thanks to its authors: PRs #1779, #1695
 
 #### Behavior changes
 
+- **The rebalance timeout default changes from 60 s to 5 minutes.** The JoinGroup rebalance timeout is now `maxPollInterval`, default 300000 ms, matching the Java client. If you never set `rebalanceTimeout`, a member that stops responding now holds up a group rebalance for up to 5 minutes instead of 60 seconds. **To keep the old 60 s rebalance timing, set `rebalanceTimeout: 60000`** — the legacy alias still goes on the wire unchanged, and it never becomes a handler-eviction deadline below 5 minutes. Setting `maxPollInterval: 60000` instead would also shorten your handler deadline to 60 s, which is usually not what you want. The SyncGroup client-side timeout is now explicitly capped at 60 s + 5 s rather than left to follow the rebalance timeout. At the default it is unchanged, but **if you set a rebalance timeout above 60 s it is shortened**: a `rebalanceTimeout: 120000` used to wait 125 s for the assignment and now waits 65 s, matching what the Java client sends for SyncGroup. If your group leader needs longer than that to compute an assignment, raise the client-wide `requestTimeout` instead, which still raises this one with it.
+- **`rebalanceTimeout` is deprecated, and it does not become your eviction deadline.** It still works, still goes on the wire when it is the only one you set, and `rebalanceTimeout: 0` is unchanged — including its request timeouts, which still fall back to `sessionTimeout + 5000`. A legacy configuration's handler deadline is `max(rebalanceTimeout, 300000)`, so a 20 s or 60 s rebalance timeout never turns into a 20 s or 60 s handler deadline. Set `maxPollInterval` explicitly to make the two one number, as Java does. Setting `rebalanceTimeout` now logs a deprecation warning, once per consumer you construct.
+- A `heartbeatInterval` above a third of `sessionTimeout` now logs a warning at construction. It is not an error, and nothing else changed: the existing hard failure when `heartbeatInterval >= sessionTimeout` is untouched.
+
 #### Fixes
 
 #### Additions
 
+- New consumer option `maxPollInterval` (default 300000 ms), the Java client's `max.poll.interval.ms`: the rebalance timeout sent on the wire and the deadline a handler has to return within.
 - Membership (the group coordinator handle, JoinGroup/SyncGroup/Heartbeat/LeaveGroup, the member id and generation, and assignor selection) moved out of the consumer group into a dedicated classic-protocol object, leaving the fetch loop, offsets, seek and pause where they were. No behavior, no wire bytes and no public API changed — the four group requests are byte-identical to the recorded golden frames.
 - The consumer's rebalance-error classification moved into one module with one truth table, derived from the existing error predicates rather than a second list of codes. No error code changed meaning, no error class was added, and the deliberate deviation from the Java client for `NOT_COORDINATOR_FOR_GROUP` (16) — which this client treats as a revocation rather than only re-discovering the coordinator — is unchanged.
 

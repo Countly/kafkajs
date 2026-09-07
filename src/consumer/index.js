@@ -2,6 +2,7 @@ const Long = require('../utils/long')
 const createRetry = require('../retry')
 const { initialRetryTime } = require('../retry/defaults')
 const ConsumerGroup = require('./consumerGroup')
+const resolveGroupTimeouts = require('./groupTimeouts')
 const Runner = require('./runner')
 const { events, wrap: wrapEvent, unwrap: unwrapEvent } = require('./instrumentationEvents')
 const InstrumentationEventEmitter = require('../instrumentation/emitter')
@@ -32,7 +33,13 @@ const specialOffsets = [
  * @param {import('../../types').Logger} params.logger
  * @param {import('../../types').PartitionAssigner[]} [params.partitionAssigners]
  * @param {number} [params.sessionTimeout]
- * @param {number} [params.rebalanceTimeout]
+ * @param {number} [params.maxPollInterval=300000] The maximum time between two batches handed to
+ *                                your handler, and the rebalance timeout sent on the wire. A
+ *                                handler that exceeds it loses its partitions and the consumer
+ *                                rejoins, as in the Java client's `max.poll.interval.ms`.
+ * @param {number} [params.rebalanceTimeout] Deprecated alias for the wire rebalance timeout only.
+ *                                It is sent as configured, but never lowers the poll deadline,
+ *                                which stays at least 300000 ms.
  * @param {number} [params.heartbeatInterval]
  * @param {number} [params.maxBytesPerPartition]
  * @param {number} [params.minBytes]
@@ -64,7 +71,8 @@ module.exports = ({
   logger: rootLogger,
   partitionAssigners = [roundRobin],
   sessionTimeout = 30000,
-  rebalanceTimeout = 60000,
+  maxPollInterval,
+  rebalanceTimeout,
   heartbeatInterval = 3000,
   maxBytesPerPartition = 1048576, // 1MB
   minBytes = 1,
@@ -98,11 +106,13 @@ module.exports = ({
   // still deciding whether to restart (e.g. a slow restartOnFailure callback).
   let stopGeneration = 0
 
-  if (heartbeatInterval >= sessionTimeout) {
-    throw new KafkaJSNonRetriableError(
-      `Consumer heartbeatInterval (${heartbeatInterval}) must be lower than sessionTimeout (${sessionTimeout}). It is recommended to set heartbeatInterval to approximately a third of the sessionTimeout.`
-    )
-  }
+  const groupTimeouts = resolveGroupTimeouts({
+    maxPollInterval,
+    rebalanceTimeout,
+    sessionTimeout,
+    heartbeatInterval,
+    logger,
+  })
 
   /**
    * Topics deleted and recreated while this consumer was subscribed, each stamped with the new
@@ -296,8 +306,8 @@ module.exports = ({
         cluster,
         groupId,
         assigners,
-        sessionTimeout,
-        rebalanceTimeout,
+        sessionTimeout: groupTimeouts.sessionTimeout,
+        rebalanceTimeout: groupTimeouts.rebalanceTimeout,
         maxBytesPerPartition,
         minBytes,
         maxBytes,
@@ -318,7 +328,7 @@ module.exports = ({
         logger: rootLogger,
         consumerGroup,
         instrumentationEmitter,
-        heartbeatInterval,
+        heartbeatInterval: groupTimeouts.heartbeatInterval,
         retry,
         autoCommit,
         eachBatchAutoResolve,

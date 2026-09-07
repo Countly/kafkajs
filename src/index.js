@@ -201,6 +201,11 @@ module.exports = class Client {
   }
 
   /**
+   * Creates a consumer.
+   *
+   * `maxPollInterval` (default 300000 ms) is both the rebalance timeout sent on the wire and the
+   * local deadline a handler has to return within; `rebalanceTimeout` is its deprecated alias for
+   * the wire half only.
    * @public
    */
   consumer({
@@ -209,6 +214,7 @@ module.exports = class Client {
     metadataMaxAge = DEFAULT_METADATA_MAX_AGE,
     sessionTimeout,
     rebalanceTimeout,
+    maxPollInterval,
     heartbeatInterval,
     maxBytesPerPartition,
     minBytes,
@@ -243,6 +249,7 @@ module.exports = class Client {
       partitionAssigners,
       sessionTimeout,
       rebalanceTimeout,
+      maxPollInterval,
       heartbeatInterval,
       maxBytesPerPartition,
       minBytes,
