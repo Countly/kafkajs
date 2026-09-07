@@ -1,23 +1,22 @@
 const { EventEmitter } = require('events')
 const Long = require('../utils/long')
 const createRetry = require('../retry')
-const {
-  isKafkaJSError,
-  isRebalancing,
-  isLostMember,
-  isRevoked,
-  isFencedInstance,
-  isUnknownMemberId,
-} = require('../errors')
+const { isKafkaJSError, isFencedInstance, isUnknownMemberId } = require('../errors')
 
 const {
-  events: { FETCH, FETCH_START, START_BATCH_PROCESS, END_BATCH_PROCESS, REBALANCING },
+  events: { FETCH, FETCH_START, START_BATCH_PROCESS, END_BATCH_PROCESS },
 } = require('./instrumentationEvents')
 const createFetchManager = require('./fetchManager')
+const RebalanceCoordinator = require('./rebalanceCoordinator')
+const PollTimer = require('./pollTimer')
+const HeartbeatManager = require('./heartbeatManager')
+const { REBALANCE_PATHS, rebalanceReason } = require('./rebalanceErrorContract')
+const { COOPERATIVE } = require('./groupProtocol/interface')
 
 const isSameOffset = (offsetA, offsetB) => Long.fromValue(offsetA).equals(Long.fromValue(offsetB))
 const CONSUMING_START = 'consuming-start'
 const CONSUMING_STOP = 'consuming-stop'
+const HANDLERS_IDLE = 'handlers-idle'
 
 module.exports = class Runner extends EventEmitter {
   /**
@@ -30,6 +29,7 @@ module.exports = class Runner extends EventEmitter {
    * @param {(payload: import("../../types").EachBatchPayload) => Promise<void>} [options.eachBatch]
    * @param {(payload: import("../../types").EachMessagePayload) => Promise<void>} [options.eachMessage]
    * @param {number} [options.heartbeatInterval]
+   * @param {number} options.maxPollInterval the resolved poll deadline, in milliseconds
    * @param {(reason: Error) => void} options.onCrash
    * @param {import("../../types").RetryOptions} [options.retry]
    * @param {boolean} [options.autoCommit=true]
@@ -43,6 +43,7 @@ module.exports = class Runner extends EventEmitter {
     eachBatch,
     eachMessage,
     heartbeatInterval,
+    maxPollInterval,
     onCrash,
     retry,
     autoCommit = true,
@@ -68,6 +69,55 @@ module.exports = class Runner extends EventEmitter {
 
     this.running = false
     this.consuming = false
+    this.stopRequested = false
+    /** Handlers currently inside `eachMessage`/`eachBatch`. */
+    this.inFlightHandlers = 0
+    /** Set while an eager rebalance is stopping the world; see `handleRebalanceError`. */
+    this.quiescing = false
+    this.pollTimer = new PollTimer({ pollDeadline: maxPollInterval })
+    this.heartbeatManager = new HeartbeatManager({
+      groupMembership: consumerGroup,
+      pollTimer: this.pollTimer,
+      heartbeatInterval,
+      logger: this.logger,
+      // Closures, not references: the coordinator is built on the next line and the manager is
+      // its collaborator, so the two can only be tied together at call time.
+      onError: (error) => this.onHeartbeatError(error),
+      onPollExpired: ({ elapsedMs }) =>
+        this.rebalanceCoordinator.onPollExpired({
+          elapsedMs,
+          isStatic: Boolean(this.consumerGroup.groupInstanceId),
+        }),
+    })
+    this.rebalanceCoordinator = new RebalanceCoordinator({
+      runner: this,
+      consumerGroup,
+      fetchManager: this.fetchManager,
+      heartbeatManager: this.heartbeatManager,
+      pollTimer: this.pollTimer,
+      instrumentationEmitter,
+      logger: this.logger,
+      groupId: consumerGroup.groupId,
+    })
+
+    consumerGroup.attach({
+      rebalanceCoordinator: this.rebalanceCoordinator,
+      heartbeatManager: this.heartbeatManager,
+    })
+  }
+
+  /**
+   * Routes whatever a background heartbeat threw. Classification lives here rather than in the
+   * manager, because it needs the error contract and the rebalance mode.
+   * @param {Error} error
+   * @returns {void}
+   */
+  onHeartbeatError(error) {
+    const verdict = this.rebalanceCoordinator.classify(error, REBALANCE_PATHS.HEARTBEAT)
+
+    if (verdict) {
+      this.rebalanceCoordinator.requestRejoin(verdict)
+    }
   }
 
   get consuming() {
@@ -88,8 +138,13 @@ module.exports = class Runner extends EventEmitter {
 
     try {
       await this.consumerGroup.connect()
-      await this.consumerGroup.joinAndSync()
+      // `running` is set BEFORE the first round: the round guard is `stopRequested`, which only
+      // `stop()` sets, and guarding on `running` would have made the initial round dead code.
+      this.running = true
+      await this.rebalanceCoordinator.runRound(null, 'initial')
     } catch (e) {
+      this.running = false
+
       try {
         return await this.onCrash(e)
       } catch (crashHandlerError) {
@@ -102,10 +157,24 @@ module.exports = class Runner extends EventEmitter {
           cause: e.message || e,
         })
         return
+      } finally {
+        // A round that armed the manager before the chain threw leaves it running, and `stop()`
+        // returns early on the `running` this catch has already cleared - so nothing else would
+        // ever cancel it, and the handle is not unref'd. Last word deliberately: it runs after
+        // `onCrash` (and the disconnect/stop inside it), so a late re-arm is undone too.
+        this.heartbeatManager.stop()
+        this.pollTimer.stop()
       }
     }
 
-    this.running = true
+    // A `stop()` that landed while the initial join was in flight has already cancelled the
+    // manager and sent LeaveGroup. Re-arming here would keep heartbeating - and hold the event
+    // loop open, since the handle is deliberately not unref'd - for a member that has left.
+    if (this.stopRequested) {
+      return
+    }
+
+    this.heartbeatManager.ensureStarted()
     this.scheduleFetchManager()
   }
 
@@ -131,59 +200,20 @@ module.exports = class Runner extends EventEmitter {
       try {
         await this.fetchManager.start()
       } catch (e) {
-        if (isLostMember(e)) {
-          this.logger.error('Membership lost, discarding uncommitted offsets and re-joining', {
-            groupId: this.consumerGroup.groupId,
-            memberId: this.consumerGroup.memberId,
-            error: e.message,
-          })
+        // One rebalance must produce one REBALANCING and one join, even when the runner learns of
+        // it twice - once as this throw, once as a slot entry. Merging and clearing first is what
+        // guarantees that.
+        const pending = this.rebalanceCoordinator.takeVerdict()
+        const thrown = this.rebalanceCoordinator.classify(e, REBALANCE_PATHS.FETCH)
+        const merged =
+          thrown && pending ? this.mergeThrownWithSlot(thrown, pending) : thrown || pending
 
-          // The consumer is rejoining, same as the isRebalancing branch below - emit the same
-          // public instrumentation event before acting on it.
-          this.instrumentationEmitter.emit(REBALANCING, {
-            groupId: this.consumerGroup.groupId,
-            memberId: this.consumerGroup.memberId,
-          })
-
-          this.consumerGroup.discardUncommittedOffsets()
-
-          if (!isFencedInstance(e)) {
-            if (isUnknownMemberId(e)) {
-              // Only an unrecognized member id needs a fresh one. A stale generation
-              // (ILLEGAL_GENERATION) does not invalidate the member id itself, so keep it and
-              // avoid an extra MEMBER_ID_REQUIRED round-trip.
-              this.consumerGroup.memberId = null
-            }
-            await this.consumerGroup.joinAndSync()
-            return
-          }
-
-          // A fenced static member must not rejoin under a fresh member id into the same
-          // fencing loop.
-          throw e
-        }
-
-        if (isRebalancing(e)) {
-          this.logger.warn('The group is rebalancing, re-joining', {
-            groupId: this.consumerGroup.groupId,
-            memberId: this.consumerGroup.memberId,
-            error: e.message,
-          })
-
-          this.instrumentationEmitter.emit(REBALANCING, {
-            groupId: this.consumerGroup.groupId,
-            memberId: this.consumerGroup.memberId,
-          })
-
-          await this.consumerGroup.joinAndSync()
+        if (merged) {
+          await this.handleRebalanceError(merged)
           return
         }
 
-        if (e.name === 'KafkaJSNotImplemented') {
-          return bail(e)
-        }
-
-        if (e.name === 'KafkaJSNoBrokerAvailableError') {
+        if (e.name === 'KafkaJSNotImplemented' || e.name === 'KafkaJSNoBrokerAvailableError') {
           return bail(e)
         }
 
@@ -197,6 +227,11 @@ module.exports = class Runner extends EventEmitter {
         })
 
         throw e
+      }
+
+      const verdict = this.rebalanceCoordinator.takeVerdict()
+      if (verdict) {
+        await this.handleRebalanceError(verdict)
       }
     })
       .then(() => {
@@ -224,8 +259,136 @@ module.exports = class Runner extends EventEmitter {
           })
         } finally {
           this.running = false
+          // A crashed runner is done: nothing will call `stop()` on it if the crash handler
+          // decided not to, and its heartbeat handle is not unref'd, so it would keep the whole
+          // cluster graph alive. A restart builds a new runner and arms its own.
+          this.heartbeatManager.stop()
+          this.pollTimer.stop()
         }
       })
+  }
+
+  /**
+   * Merges an error the fetch manager threw with whatever the slot already held, under the
+   * coordinator's LOST > REVOKED precedence. The slot entry is the pending one.
+   * @param {import('./rebalanceCoordinator').Verdict} thrown
+   * @param {import('./rebalanceCoordinator').Verdict} pending
+   * @returns {import('./rebalanceCoordinator').Verdict}
+   */
+  mergeThrownWithSlot(thrown, pending) {
+    return this.rebalanceCoordinator.mergeVerdict(pending, thrown)
+  }
+
+  /**
+   * The one place a rebalance discards or auto-commits.
+   *
+   * LOST means the generation or member id the offsets belong to no longer exists, so committing
+   * them would fail forever; REVOKED means the generation is still good and a final commit is
+   * allowed. A fenced static member does both halves of LOST and then dies: rejoining under a
+   * fresh member id would walk straight back into the same fencing loop.
+   *
+   * @param {Error} e
+   * @returns {Promise<void>}
+   * @throws {Error} `e` itself for a fenced member, and for anything that is not a rebalance
+   */
+  async handleRebalanceError(verdictOrError) {
+    const verdict = this.toVerdict(verdictOrError)
+    const lost = verdict.kind === 'lost'
+    const stopsTheWorld =
+      lost || (verdict.kind === 'revoked' && this.consumerGroup.rebalanceProtocol() !== COOPERATIVE)
+
+    if (!stopsTheWorld) {
+      return this.resolveRebalanceVerdict(verdict)
+    }
+
+    // Java runs onJoinPrepare between polls, never under a running handler. The round below
+    // replaces the offsets, so anything a handler resolves after that point lands in a manager
+    // that is about to be discarded - and is re-delivered. Stopping the world first is what makes
+    // the discard/auto-commit below see everything the handlers actually processed, and nothing
+    // they had not.
+    //
+    // Neither await can wait on its own caller: `stop()` is latching and idempotent, and a
+    // handler that threw the error being handled here has already returned.
+    this.quiescing = true
+
+    try {
+      await this.fetchManager.stop()
+      await this.waitForHandlers()
+
+      return await this.resolveRebalanceVerdict(verdict)
+    } finally {
+      this.quiescing = false
+    }
+  }
+
+  /**
+   * Normalises whatever reached `handleRebalanceError` into a verdict.
+   *
+   * A verdict raised by a path that knows why it is rebalancing - a stale assignment, say -
+   * carries a `kind` and a `reason` the error itself does not have, and re-deriving them from the
+   * error would lose both. An error arriving on its own is classified as it always was.
+   *
+   * @private
+   * @param {import('./rebalanceCoordinator').Verdict|Error} input
+   * @returns {{ kind: string|null, reason: string|null, error: Error }}
+   */
+  toVerdict(input) {
+    if (input && input.kind && input.error) {
+      return input
+    }
+
+    const classified = this.rebalanceCoordinator.classify(input, REBALANCE_PATHS.FETCH)
+
+    return classified || { kind: null, reason: rebalanceReason(input), error: input }
+  }
+
+  /**
+   * The verdict half of `handleRebalanceError`: discard or auto-commit, then rejoin.
+   * @private
+   * @param {{ kind: string|null, reason: string|null, error: Error }} verdict
+   * @returns {Promise<void>}
+   * @throws {Error} the verdict's error for a fenced member, and for anything that is not a
+   *   rebalance
+   */
+  async resolveRebalanceVerdict({ kind, reason, error: e }) {
+    if (kind === 'lost') {
+      this.logger.error('Membership lost, discarding uncommitted offsets and re-joining', {
+        groupId: this.consumerGroup.groupId,
+        memberId: this.consumerGroup.memberId,
+        error: e.message,
+      })
+
+      this.consumerGroup.discardUncommittedOffsets()
+
+      if (isFencedInstance(e)) {
+        this.rebalanceCoordinator.abandon('lost')
+        throw e
+      }
+
+      if (isUnknownMemberId(e)) {
+        // Only an unrecognized member id needs a fresh one. A stale generation
+        // (ILLEGAL_GENERATION) does not invalidate the member id itself, so keep it and avoid an
+        // extra MEMBER_ID_REQUIRED round-trip.
+        this.consumerGroup.memberId = null
+      }
+
+      await this.rebalanceCoordinator.runRound(reason, 'lost')
+      return
+    }
+
+    if (kind === 'revoked') {
+      this.logger.warn('The group is rebalancing, re-joining', {
+        groupId: this.consumerGroup.groupId,
+        memberId: this.consumerGroup.memberId,
+        error: e.message,
+      })
+
+      await this.autoCommitOffsets()
+      await this.rebalanceCoordinator.runRound(reason, 'revoked')
+      return
+    }
+
+    throw e
   }
 
   /**
@@ -250,11 +413,21 @@ module.exports = class Runner extends EventEmitter {
       memberId: this.consumerGroup.memberId,
     })
 
+    this.stopRequested = true
     this.running = false
+    this.heartbeatManager.stop()
+    this.pollTimer.stop()
+    this.rebalanceCoordinator.clearVerdict()
 
     try {
+      // A background cooperative round must finish before LeaveGroup, or its JoinGroup would
+      // re-register a member this runner has just left. Bounded by the current round, which is
+      // the property waitForConsumer() already has.
+      await this.rebalanceCoordinator.idle()
       await this.fetchManager.stop()
       await this.waitForConsumer()
+
+      this.consumerGroup.clearAssignerState()
 
       if (this.consumerGroup.groupInstanceId) {
         this.consumerGroup.memberId = null
@@ -279,22 +452,33 @@ module.exports = class Runner extends EventEmitter {
     })
   }
 
+  /**
+   * The user-facing heartbeat, shared with the timer through the group's own promise.
+   *
+   * It classifies and routes, and does nothing else: the offset work belongs to
+   * `handleRebalanceError`, which is reached once per rebalance. Under cooperative rebalancing a
+   * revocation RESOLVES instead of throwing, so the error never reaches the worker, the fetcher
+   * or the fetch manager's own teardown - which is the whole point of not stopping the world.
+   * @returns {Promise<void>}
+   */
   async heartbeat() {
     try {
       await this.consumerGroup.heartbeat({ interval: this.heartbeatInterval })
     } catch (e) {
-      if (isLostMember(e)) {
-        // The generation/member id is stale: these offsets can never be committed. Committing
-        // them would fail with the same error forever (the "generation id is not valid" loop).
-        this.logger.warn('Membership lost, discarding uncommitted offsets and rejoining', {
-          groupId: this.consumerGroup.groupId,
-          memberId: this.consumerGroup.memberId,
-          error: e.message,
-        })
-        this.consumerGroup.discardUncommittedOffsets()
-      } else if (isRevoked(e)) {
-        await this.autoCommitOffsets()
+      const verdict = this.rebalanceCoordinator.classify(e, REBALANCE_PATHS.HEARTBEAT)
+
+      if (verdict) {
+        this.rebalanceCoordinator.requestRejoin(verdict)
       }
+
+      if (
+        verdict &&
+        verdict.kind === 'revoked' &&
+        this.consumerGroup.rebalanceProtocol() === COOPERATIVE
+      ) {
+        return
+      }
+
       throw e
     }
   }
@@ -307,7 +491,11 @@ module.exports = class Runner extends EventEmitter {
       return () => this.consumerGroup.resume([{ topic, partitions: [partition] }])
     }
     for (const message of batch.messages) {
-      if (!this.running || this.consumerGroup.hasSeekOffset({ topic, partition })) {
+      if (
+        !this.running ||
+        this.consumerGroup.hasSeekOffset({ topic, partition }) ||
+        this.isBatchStale(batch)
+      ) {
         break
       }
 
@@ -475,11 +663,55 @@ module.exports = class Runner extends EventEmitter {
     return batches
   }
 
+  /**
+   * Whether a batch has outlived the assignment it was fetched under.
+   *
+   * Two ways it can: the partition moved to another member, or it stayed but the offsets were
+   * replaced and the new assignment is already re-fetching the same records. Either way,
+   * delivering it duplicates records and committing for it moves an offset this member no longer
+   * controls. Checked when a batch is picked up AND between messages, because a rebalance can
+   * land in the middle of a batch a handler is already working through.
+   *
+   * @param {import('./batch')} batch
+   * @returns {boolean}
+   */
+  isBatchStale(batch) {
+    // An eager rebalance is about to replace the offsets, so a batch the worker picks up while it
+    // is being handled would resolve into a manager that is already gone. Waiting for the
+    // handlers to go idle is not enough on its own: the queue hands the worker the next batch the
+    // instant the current one returns.
+    if (this.quiescing) {
+      return true
+    }
+
+    if (
+      batch.assignmentEpoch != null &&
+      batch.assignmentEpoch !== this.consumerGroup.assignmentEpoch
+    ) {
+      return true
+    }
+
+    return !this.consumerGroup.isAssigned(batch.topic, batch.partition)
+  }
+
   async handleBatch(batch) {
     if (!this.running) {
       this.logger.debug('consumer not running, exiting', {
         groupId: this.consumerGroup.groupId,
         memberId: this.consumerGroup.memberId,
+      })
+
+      return
+    }
+
+    if (this.isBatchStale(batch)) {
+      this.logger.debug('Dropping a batch that outlived the assignment it was fetched under', {
+        groupId: this.consumerGroup.groupId,
+        memberId: this.consumerGroup.memberId,
+        topic: batch.topic,
+        partition: batch.partition,
+        batchAssignmentEpoch: batch.assignmentEpoch,
+        assignmentEpoch: this.consumerGroup.assignmentEpoch,
       })
 
       return
@@ -578,7 +810,41 @@ module.exports = class Runner extends EventEmitter {
       await this.heartbeat()
     }
 
-    await onBatch(batch)
+    this.inFlightHandlers++
+
+    try {
+      await onBatch(batch)
+    } finally {
+      this.inFlightHandlers--
+
+      if (this.inFlightHandlers === 0) {
+        this.emit(HANDLERS_IDLE)
+      }
+    }
+  }
+
+  /**
+   * Resolves once no handler is inside `eachMessage`/`eachBatch`.
+   *
+   * The same shape as `waitForConsumer()`, one level down: that one waits for the fetch loop to
+   * finish, this one for the handlers it feeds. A handler that is itself the reason a rebalance
+   * was raised has already returned by the time anything awaits this, so the wait cannot be on
+   * the caller's own stack.
+   *
+   * @returns {Promise<void>}
+   */
+  waitForHandlers() {
+    if (this.inFlightHandlers === 0) {
+      return Promise.resolve()
+    }
+
+    this.logger.debug('waiting for in-flight handlers to return...', {
+      groupId: this.consumerGroup.groupId,
+      memberId: this.consumerGroup.memberId,
+      inFlightHandlers: this.inFlightHandlers,
+    })
+
+    return new Promise((resolve) => this.once(HANDLERS_IDLE, () => resolve()))
   }
 
   autoCommitOffsets() {

@@ -593,6 +593,7 @@ const buildConsumerGroup = ({
  *   partition is led by `NODE_ID` unless this says otherwise
  * @returns {Promise<{ group: ConsumerGroup, cluster: object, broker: Broker, logger: object,
  *   offsetManager: OffsetManager, offsetCommit: jest.SpyInstance, joinAndSync: jest.SpyInstance,
+ *   requestRejoin: jest.Mock,
  *   setResponse: (body: Buffer|(() => Buffer)) => void,
  *   setValidationResponse: (fn: (partitions: number[]) => Buffer) => void,
  *   findBrokerCalls: {nodeId: number}[], sync: () => Promise<void>,
@@ -750,6 +751,12 @@ const createFetchGroup = async ({
   const realJoinAndSync = group.joinAndSync.bind(group)
   const joinAndSync = jest.spyOn(group, 'joinAndSync').mockResolvedValue(undefined)
 
+  // The observable for "a fetch error never rejoins": `recoverFromFetch` asks the coordinator,
+  // it does not call `joinAndSync` any more. `heartbeatManager` is deliberately null - the
+  // join bracket is guarded on its presence and these groups never join.
+  const requestRejoin = jest.fn()
+  group.attach({ rebalanceCoordinator: { requestRejoin }, heartbeatManager: null })
+
   return {
     group,
     cluster,
@@ -758,11 +765,15 @@ const createFetchGroup = async ({
     offsetManager: group.offsetManager,
     offsetCommit,
     joinAndSync,
+    requestRejoin,
     setResponse,
     setValidationResponse,
     findBrokerCalls,
-    /** Drives the real join/sync sequence against the stubbed coordinator. */
-    sync: () => realJoinAndSync(),
+    /** Drives the real join/sync sequence, and the apply that used to live inside it. */
+    sync: async () => {
+      const result = await realJoinAndSync()
+      return group.applyRebalanceResult(result)
+    },
     /** The header of every request written to the socket, oldest first. */
     requests: () => state.writes.map(readRequestHeader),
     /** Every OffsetForLeaderEpoch frame written to the socket, decoded, oldest first. */

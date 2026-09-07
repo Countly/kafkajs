@@ -12,16 +12,43 @@ const REBALANCE_IN_PROGRESS = 27
 const NOT_COORDINATOR_FOR_GROUP = 16
 const FENCED_INSTANCE_ID = 82
 
+const runners = []
+
+afterEach(async () => {
+  while (runners.length) {
+    const runner = runners.pop()
+    // The fetch-path cases clear `running` from inside a stubbed `joinAndSync` to end the retry
+    // loop; production only clears it where the heartbeat chain is cancelled too, so restore it
+    // and tear the runner down through its own `stop()`.
+    runner.running = true
+    await runner.stop()
+  }
+})
+
 const createRunner = (consumerGroupOverrides) => {
   const consumerGroup = {
     groupId: 'g',
     memberId: 'm',
     generationId: 1,
+    leaderId: null,
+    groupInstanceId: null,
+    groupMembership: {},
+    attach: jest.fn(),
+    rebalanceProtocol: () => 'eager',
+    // `runChain` reads both before it can report a round: `assigned()` before the JoinGroup and
+    // `isLeader()` when it builds the GROUP_JOIN payload.
+    assigned: () => [],
+    isLeader: () => false,
+    applyRebalanceResult: jest.fn(async () => ({ assignment: [], added: [], revoked: [] })),
+    clearStaleAssignmentPending: jest.fn(),
+    clearAssignerState: jest.fn(),
+    resetGenerationLocally: jest.fn(),
+    leave: jest.fn(async () => {}),
     heartbeat: jest.fn(async () => {}),
     commitOffsetsIfNecessary: jest.fn(async () => {}),
     commitOffsets: jest.fn(async () => {}),
     discardUncommittedOffsets: jest.fn(),
-    joinAndSync: jest.fn(async () => {}),
+    joinAndSync: jest.fn(async () => ({ assignment: {} })),
     getNodeIds: () => [],
     ...consumerGroupOverrides,
   }
@@ -33,9 +60,12 @@ const createRunner = (consumerGroupOverrides) => {
     instrumentationEmitter,
     autoCommit: true,
     concurrency: 1,
+    heartbeatInterval: 3000,
+    maxPollInterval: 300000,
     onCrash: jest.fn(),
   })
 
+  runners.push(runner)
   return { runner, consumerGroup, instrumentationEmitter }
 }
 
@@ -44,18 +74,31 @@ describe('Consumer > Runner > stale generation', () => {
     ['ILLEGAL_GENERATION', ILLEGAL_GENERATION],
     ['UNKNOWN_MEMBER_ID', UNKNOWN_MEMBER_ID],
     ['FENCED_INSTANCE_ID', FENCED_INSTANCE_ID],
-  ])('discards offsets and does not autocommit on %s (member is LOST)', async (_name, code) => {
-    const { runner, consumerGroup } = createRunner({
-      heartbeat: jest.fn(async () => {
-        throw createErrorFromCode(code)
-      }),
-    })
+  ])(
+    'routes %s as a LOST rejoin, and discards only where the rebalance is handled',
+    async (_name, code) => {
+      const { runner, consumerGroup } = createRunner({
+        heartbeat: jest.fn(async () => {
+          throw createErrorFromCode(code)
+        }),
+      })
+      const requestRejoin = jest.spyOn(runner.rebalanceCoordinator, 'requestRejoin')
 
-    await expect(runner.heartbeat()).rejects.toThrow()
-    expect(consumerGroup.discardUncommittedOffsets).toHaveBeenCalled()
-    expect(consumerGroup.commitOffsetsIfNecessary).not.toHaveBeenCalled()
-    expect(consumerGroup.commitOffsets).not.toHaveBeenCalled()
-  })
+      await expect(runner.heartbeat()).rejects.toThrow()
+      expect(requestRejoin).toHaveBeenCalledWith(expect.objectContaining({ kind: 'lost' }))
+      // The callback itself neither discards nor commits any more; both belong to the one site.
+      expect(consumerGroup.discardUncommittedOffsets).not.toHaveBeenCalled()
+      expect(consumerGroup.commitOffsets).not.toHaveBeenCalled()
+
+      // Only a fenced static member rethrows; 22 and 25 discard and rejoin.
+      const handled = runner.handleRebalanceError(createErrorFromCode(code))
+      await (code === FENCED_INSTANCE_ID ? expect(handled).rejects.toBeDefined() : handled)
+
+      expect(consumerGroup.discardUncommittedOffsets).toHaveBeenCalled()
+      expect(consumerGroup.commitOffsetsIfNecessary).not.toHaveBeenCalled()
+      expect(consumerGroup.commitOffsets).not.toHaveBeenCalled()
+    }
+  )
 
   it.each([
     ['REBALANCE_IN_PROGRESS', REBALANCE_IN_PROGRESS],
@@ -66,10 +109,14 @@ describe('Consumer > Runner > stale generation', () => {
         throw createErrorFromCode(code)
       }),
     })
+    const requestRejoin = jest.spyOn(runner.rebalanceCoordinator, 'requestRejoin')
 
     await expect(runner.heartbeat()).rejects.toThrow()
-    // heartbeat's autoCommitOffsets() calls commitOffsets() unconditionally, exactly as it did
-    // before this fix for every isRebalancing() error - only the LOST codes above now skip it.
+    expect(requestRejoin).toHaveBeenCalledWith(expect.objectContaining({ kind: 'revoked' }))
+
+    // The rebalance is handled once, and that is where the final commit of a still-valid
+    // generation happens - exactly as it did for every isRebalancing() error before.
+    await runner.handleRebalanceError(createErrorFromCode(code))
     expect(consumerGroup.commitOffsets).toHaveBeenCalled()
     expect(consumerGroup.discardUncommittedOffsets).not.toHaveBeenCalled()
   })
@@ -91,6 +138,7 @@ describe('Consumer > Runner > stale generation', () => {
       // failing the same way) terminates after a single pass instead of spinning forever.
       consumerGroup.joinAndSync = jest.fn(async () => {
         runner.running = false
+        return { assignment: {} }
       })
       runner.running = true
       runner.fetchManager = {
@@ -107,7 +155,14 @@ describe('Consumer > Runner > stale generation', () => {
       expect(consumerGroup.joinAndSync).toHaveBeenCalled()
       // A lost member rejoins, so the public REBALANCING event fires just like a revocation.
       expect(rebalancing).toHaveBeenCalledTimes(1)
-      expect(rebalancing.mock.calls[0][0].payload).toEqual({ groupId: 'g', memberId: 'm' })
+      // The payload now carries `reason`, and its `memberId` is the one the round will actually
+      // join with: an unrecognized id is dropped before the rejoin, so the event reports null
+      // rather than the id the coordinator just rejected.
+      expect(rebalancing.mock.calls[0][0].payload).toEqual({
+        groupId: 'g',
+        memberId: expectedMemberId,
+        reason: 'lost',
+      })
       // Offsets must be discarded before rejoining, not after.
       expect(consumerGroup.discardUncommittedOffsets.mock.invocationCallOrder[0]).toBeLessThan(
         consumerGroup.joinAndSync.mock.invocationCallOrder[0]

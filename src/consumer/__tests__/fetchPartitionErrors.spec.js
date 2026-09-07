@@ -11,7 +11,7 @@ beforeAll(prepareRecordBatches)
 describe('Consumer > fetch partition error contract', () => {
   describe('one case per partition-table row', () => {
     test('OFFSET_OUT_OF_RANGE (1) resets only that partition, and the others are delivered', async () => {
-      const { group, offsetManager, joinAndSync, setResponse } = await createFetchGroup({
+      const { group, offsetManager, requestRejoin, setResponse } = await createFetchGroup({
         partitions: [0, 1],
       })
       // The real reset commits through a coordinator this harness has no broker for; what the
@@ -30,7 +30,10 @@ describe('Consumer > fetch partition error contract', () => {
 
       expect(setDefaultOffset).toHaveBeenCalledWith({ topic: TOPIC, partition: 0 })
       expect(batches.map(({ partition }) => partition)).toEqual([1])
-      expect(joinAndSync).not.toHaveBeenCalled()
+      // Every delivered batch carries the assignment it was fetched under, so one that outlives
+      // that assignment can be recognised before it reaches a handler.
+      expect(batches.map(({ assignmentEpoch }) => assignmentEpoch)).toEqual([group.assignmentEpoch])
+      expect(requestRejoin).not.toHaveBeenCalled()
     })
 
     test.each([
@@ -46,7 +49,7 @@ describe('Consumer > fetch partition error contract', () => {
     ])(
       '%i (%s) refreshes metadata once, delivers the other partitions and never rejoins',
       async (errorCode) => {
-        const { group, cluster, joinAndSync, setResponse } = await createFetchGroup({
+        const { group, cluster, requestRejoin, setResponse } = await createFetchGroup({
           partitions: [0, 1],
         })
 
@@ -60,7 +63,7 @@ describe('Consumer > fetch partition error contract', () => {
 
         expect(cluster.refreshMetadata).toHaveBeenCalledTimes(1)
         expect(batches.map(({ partition }) => partition)).toEqual([1])
-        expect(joinAndSync).not.toHaveBeenCalled()
+        expect(requestRejoin).not.toHaveBeenCalled()
       }
     )
 

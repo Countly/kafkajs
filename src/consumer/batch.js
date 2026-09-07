@@ -26,6 +26,13 @@ module.exports = class Batch {
     this.partition = partitionData.partition
     this.highWatermark = partitionData.highWatermark
 
+    /**
+     * The assignment this batch was fetched under, stamped by `ConsumerGroup#fetch`. `null` on a
+     * batch built outside a fetch, which is never stale by construction.
+     * @type {number|null}
+     */
+    this.assignmentEpoch = null
+
     this.rawMessages = messages
     // Apparently fetch can return different offsets than the target offset provided to the fetch API.
     // Discard messages that are not in the requested offset

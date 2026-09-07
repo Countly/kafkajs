@@ -8,6 +8,13 @@ const createState = (topic) => ({
 module.exports = class SubscriptionState {
   constructor() {
     this.assignedPartitionsByTopic = {}
+    /**
+     * The same assignment as a membership index. Rebuilt in `assign()`, which runs once per
+     * apply, so the per-message ownership check is a hash lookup instead of a scan of the whole
+     * partition list for that topic.
+     * @type {Map<string, Set<number>>}
+     */
+    this.assignedPartitionSetsByTopic = new Map()
     this.subscriptionStatesByTopic = {}
   }
 
@@ -22,6 +29,10 @@ module.exports = class SubscriptionState {
         return { ...assigned, [topic]: { topic, partitions } }
       },
       {}
+    )
+
+    this.assignedPartitionSetsByTopic = new Map(
+      topicPartitions.map(({ topic, partitions = [] }) => [topic, new Set(partitions)])
     )
   }
 
@@ -106,6 +117,21 @@ module.exports = class SubscriptionState {
         partitions: partitions.filter((partition) => this.isPaused(topic, partition)).sort(),
       }))
       .filter(({ partitions }) => partitions.length !== 0)
+  }
+
+  /**
+   * Whether a topic-partition is part of the current assignment.
+   *
+   * A batch is fetched under one assignment and handed to a worker under whatever assignment is
+   * current when the worker gets to it, so the two can differ across a rebalance.
+   *
+   * @param {string} topic
+   * @param {number} partition
+   * @returns {boolean}
+   */
+  isAssigned(topic, partition) {
+    const partitions = this.assignedPartitionSetsByTopic.get(topic)
+    return partitions !== undefined && partitions.has(partition)
   }
 
   isPaused(topic, partition) {

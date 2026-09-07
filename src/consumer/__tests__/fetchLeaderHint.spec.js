@@ -19,7 +19,9 @@ beforeAll(async () => {
 
 describe('Consumer > KIP-951 leader hints on fetch', () => {
   test('a CurrentLeader hint re-routes the next round without a rejoin', async () => {
-    const { group, cluster, joinAndSync, setResponse } = await createFetchGroup({ partitions: [0] })
+    const { group, cluster, requestRejoin, setResponse } = await createFetchGroup({
+      partitions: [0],
+    })
 
     setResponse(
       fetchResponse(
@@ -40,7 +42,7 @@ describe('Consumer > KIP-951 leader hints on fetch', () => {
     })
     // A usable hint is the refresh: nothing else is needed this round.
     expect(cluster.refreshMetadata).not.toHaveBeenCalled()
-    expect(joinAndSync).not.toHaveBeenCalled()
+    expect(requestRejoin).not.toHaveBeenCalled()
   })
 
   test('a hint with no endpoints naming a KNOWN node id is applied', async () => {

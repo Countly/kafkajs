@@ -32,6 +32,8 @@ describe('Consumer > Runner', () => {
       logger: newLogger(),
       eachBatch,
       concurrency: 1,
+      heartbeatInterval: 3000,
+      maxPollInterval: 300000,
       ...partial,
     })
   }
@@ -49,11 +51,27 @@ describe('Consumer > Runner', () => {
     eachBatch = jest.fn()
     onCrash = jest.fn()
     consumerGroup = {
+      groupId: 'test-group',
+      memberId: 'test-member',
+      generationId: 1,
+      leaderId: 'test-member',
+      groupInstanceId: null,
+      groupMembership: {},
+      attach: jest.fn(),
+      rebalanceProtocol: jest.fn(() => 'eager'),
+      applyRebalanceResult: jest.fn(async () => ({ assignment: [], added: [], revoked: [] })),
+      discardUncommittedOffsets: jest.fn(),
+      clearStaleAssignmentPending: jest.fn(),
+      clearAssignerState: jest.fn(),
+      resetGenerationLocally: jest.fn(),
+      hasSeekOffset: () => false,
+      isAssigned: () => true,
+      leave: jest.fn(async () => {}),
       getNodeIds: jest.fn(() => [1, 2, 3]),
       connect: jest.fn(),
       join: jest.fn(),
       sync: jest.fn(),
-      joinAndSync: jest.fn(),
+      joinAndSync: jest.fn(async () => ({ assignment: {} })),
       fetch: jest.fn(async () => [emptyBatch]),
       resolveOffset: jest.fn(),
       commitOffsets: jest.fn(),
@@ -70,7 +88,15 @@ describe('Consumer > Runner', () => {
   })
 
   afterEach(async () => {
-    runner && (await runner.stop())
+    if (!runner) {
+      return
+    }
+
+    // Several cases set `running` directly to simulate a stopped consumer. Production only ever
+    // clears it inside `stop()` or the crash path, both of which cancel the heartbeat chain, so
+    // the flag is restored here and the runner is torn down through its own `stop()`.
+    runner.running = true
+    await runner.stop()
   })
 
   describe('when the group is rebalancing before the new consumer has joined', () => {

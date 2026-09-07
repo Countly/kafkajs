@@ -9,7 +9,7 @@ const SeekOffsets = require('./seekOffsets')
 const SubscriptionState = require('./subscriptionState')
 const PositionValidator = require('./positionValidator')
 const {
-  events: { GROUP_JOIN, CONNECT, RECEIVED_UNSUBSCRIBED_TOPICS, LOG_TRUNCATION },
+  events: { CONNECT, RECEIVED_UNSUBSCRIBED_TOPICS, LOG_TRUNCATION },
 } = require('./instrumentationEvents')
 const { KafkaJSError, KafkaJSStaleTopicMetadataAssignment, isRebalancing } = require('../errors')
 const { failure, createErrorFromCode } = require('../protocol/error')
@@ -122,9 +122,6 @@ module.exports = class ConsumerGroup {
     this.logger = logger.namespace('ConsumerGroup')
     this.instrumentationEmitter = instrumentationEmitter
     this.retrier = createRetry(Object.assign({}, retry))
-    this.assigners = assigners
-    this.sessionTimeout = sessionTimeout
-    this.rebalanceTimeout = rebalanceTimeout
     this.maxBytesPerPartition = maxBytesPerPartition
     this.minBytes = minBytes
     this.maxBytes = maxBytes
@@ -194,6 +191,51 @@ module.exports = class ConsumerGroup {
 
     this.offsetManager = null
     this.subscriptionState = new SubscriptionState()
+
+    /** @type {Object|null} set by `attach`, absent until a `Runner` exists */
+    this.rebalanceCoordinator = null
+
+    /**
+     * Bumped every time the assignment is applied in a way that replaces the offsets, so a batch
+     * fetched under the previous one can be recognised and dropped instead of re-delivered.
+     * @type {number}
+     */
+    this.assignmentEpoch = 0
+
+    /**
+     * Set while a stale assignment has been reported and the rejoin it asked for has not settled,
+     * so the report is made once per pending period rather than once per fetch round.
+     */
+    this.staleAssignmentPending = false
+  }
+
+  /**
+   * Late-binds the collaborators the `Runner` owns. The group is constructed before the runner
+   * that builds them, so they cannot arrive through this object's constructor.
+   * @param {{ rebalanceCoordinator: Object, heartbeatManager: Object }} deps
+   * @returns {void}
+   */
+  attach({ rebalanceCoordinator, heartbeatManager }) {
+    this.rebalanceCoordinator = rebalanceCoordinator
+    this.groupMembership.attach({ rebalanceCoordinator, heartbeatManager })
+  }
+
+  /**
+   * Drops this member's generation and member id without telling the coordinator. Used after a
+   * poll-interval overrun, where the LeaveGroup has already been sent (or deliberately not sent,
+   * for a static member) and the next round must take the lost-membership branch.
+   * @returns {void}
+   */
+  resetGenerationLocally() {
+    this.groupMembership.resetGeneration({ clearMemberId: true })
+  }
+
+  /**
+   * Re-arms stale-assignment detection.
+   * @returns {void}
+   */
+  clearStaleAssignmentPending() {
+    this.staleAssignmentPending = false
   }
 
   get memberId() {
@@ -314,9 +356,13 @@ module.exports = class ConsumerGroup {
    * `RECEIVED_UNSUBSCRIBED_TOPICS`, which it already owned.
    *
    * @param {{ assignment: Object, userData?: Buffer|null }} result the decoded sync result
+   * @param {{ rebuildOffsets?: boolean }} [options] `rebuildOffsets: false` applies the assignment
+   *   without replacing the offsets, for an apply that keeps what this member already owns. The
+   *   assignment epoch only moves when the offsets are replaced, because that is what makes a
+   *   batch fetched under the previous assignment stale.
    * @returns {Promise<import('./groupProtocol/interface').RebalanceResult>}
    */
-  async applyRebalanceResult(result) {
+  async applyRebalanceResult(result, { rebuildOffsets = true } = {}) {
     const { groupId, generationId, memberId, topicsSubscribed, coordinator } = this
     const decodedAssignment = result.assignment
     this.logger.debug('Received assignment', {
@@ -388,27 +434,32 @@ module.exports = class ConsumerGroup {
     const { added, revoked } = this.groupMembership.diffAssignment(currentMemberAssignment)
 
     this.subscriptionState.assign(currentMemberAssignment)
-    this.offsetManager = new OffsetManager({
-      cluster: this.cluster,
-      topicConfigurations: this.topicConfigurations,
-      instrumentationEmitter: this.instrumentationEmitter,
-      memberAssignment: currentMemberAssignment.reduce(
-        (partitionsByTopic, { topic, partitions }) => ({
-          ...partitionsByTopic,
-          [topic]: partitions,
-        }),
-        {}
-      ),
-      autoCommit: this.autoCommit,
-      autoCommitInterval: this.autoCommitInterval,
-      autoCommitThreshold: this.autoCommitThreshold,
-      coordinator,
-      groupId,
-      generationId,
-      memberId,
-      groupInstanceId: this.groupInstanceId,
-      pendingTopicResets: this.pendingTopicResets,
-    })
+
+    if (rebuildOffsets) {
+      this.offsetManager = new OffsetManager({
+        cluster: this.cluster,
+        topicConfigurations: this.topicConfigurations,
+        instrumentationEmitter: this.instrumentationEmitter,
+        memberAssignment: currentMemberAssignment.reduce(
+          (partitionsByTopic, { topic, partitions }) => ({
+            ...partitionsByTopic,
+            [topic]: partitions,
+          }),
+          {}
+        ),
+        autoCommit: this.autoCommit,
+        autoCommitInterval: this.autoCommitInterval,
+        autoCommitThreshold: this.autoCommitThreshold,
+        coordinator,
+        groupId,
+        generationId,
+        memberId,
+        groupInstanceId: this.groupInstanceId,
+        pendingTopicResets: this.pendingTopicResets,
+      })
+      this.assignmentEpoch += 1
+    }
+
     this.consecutiveFetchErrors.clear()
     this.positionValidator.clear()
     this.validationUnusableLogged.clear()
@@ -424,45 +475,25 @@ module.exports = class ConsumerGroup {
   }
 
   /**
-   * Joins the group, syncs, and applies the resulting assignment, retrying the whole sequence on
-   * a rebalance-class error. `REBALANCE_IN_PROGRESS` is not a retriable protocol error on its own
-   * - the member has to go back through FindCoordinator and JoinGroup - so it is re-thrown as a
-   * retriable `KafkaJSError` to restart the sequence through the retrier.
-   * @returns {Promise<{ assignment: Object }>} the decoded sync result
+   * Joins the group and syncs, retrying the whole sequence on a rebalance-class error.
+   * `REBALANCE_IN_PROGRESS` is not a retriable protocol error on its own - the member has to go
+   * back through FindCoordinator and JoinGroup - so it is re-thrown as a retriable
+   * `KafkaJSError` to restart the sequence through the retrier.
+   *
+   * Applying the result and reporting the round belong to the caller: this method performs one
+   * exchange and returns what it decoded.
+   * @returns {Promise<{ assignment: Object, userData: Buffer|null }>} the decoded sync result
    */
   joinAndSync() {
-    const startJoin = Date.now()
     return this.retrier(async (bail) => {
       try {
-        const result = await this.groupMembership.rebalance({
+        return await this.groupMembership.rebalance({
           topics: this.topics,
           topicsSubscribed: this.topicsSubscribed,
           beforeSync: () => {
             this.partitionsPerSubscribedTopic = this.generatePartitionsPerSubscribedTopic()
           },
         })
-
-        await this.applyRebalanceResult(result)
-
-        const memberAssignment = this.assigned().reduce(
-          (result, { topic, partitions }) => ({ ...result, [topic]: partitions }),
-          {}
-        )
-
-        const payload = {
-          groupId: this.groupId,
-          memberId: this.memberId,
-          leaderId: this.leaderId,
-          isLeader: this.isLeader(),
-          memberAssignment,
-          groupProtocol: this.groupProtocol,
-          duration: Date.now() - startJoin,
-        }
-
-        this.instrumentationEmitter.emit(GROUP_JOIN, payload)
-        this.logger.info('Consumer has joined the group', payload)
-
-        return result
       } catch (e) {
         if (isRebalancing(e)) {
           throw new KafkaJSError(e)
@@ -551,6 +582,19 @@ module.exports = class ConsumerGroup {
     return this.subscriptionState.assigned()
   }
 
+  /**
+   * Whether a topic-partition is still part of this member's assignment.
+   *
+   * Positional, and deliberately so: this is called once per message, and an options object would
+   * be an allocation per record on the consume hot path.
+   * @param {string} topic
+   * @param {number} partition
+   * @returns {boolean}
+   */
+  isAssigned(topic, partition) {
+    return this.subscriptionState.isAssigned(topic, partition)
+  }
+
   paused() {
     return this.subscriptionState.paused()
   }
@@ -621,6 +665,9 @@ module.exports = class ConsumerGroup {
 
       let topicPartitions = this.subscriptionState.assigned()
       topicPartitions = this.filterPartitionsByNode(nodeId, topicPartitions)
+      // Captured before anything is awaited: this is the assignment the request below is built
+      // from, and it is what every batch this round produces is stamped with.
+      const assignmentEpoch = this.assignmentEpoch
 
       await this.seekOffsets(topicPartitions)
       await this.validatePositions(topicPartitions)
@@ -720,6 +767,10 @@ module.exports = class ConsumerGroup {
 
       if (needsRefresh) {
         await this.cluster.refreshMetadata()
+      }
+
+      for (const batch of batches) {
+        batch.assignmentEpoch = assignmentEpoch
       }
 
       return batches
@@ -970,7 +1021,7 @@ module.exports = class ConsumerGroup {
       })
 
       await this.cluster.refreshMetadata()
-      await this.joinAndSync()
+      this.requestResync(e)
       return
     }
 
@@ -982,7 +1033,7 @@ module.exports = class ConsumerGroup {
         unknownPartitions: e.unknownPartitions,
       })
 
-      await this.joinAndSync()
+      this.requestResync(e)
       return
     }
 
@@ -1003,6 +1054,35 @@ module.exports = class ConsumerGroup {
     }
 
     throw e
+  }
+
+  /**
+   * Asks for a rejoin because this member's view of the assignment is stale, WITHOUT awaiting the
+   * round.
+   *
+   * This runs inside the fetcher's own awaited fetch, so awaiting a round here would block that
+   * fetcher's iteration for the whole join and, through the single-flight chain, everything
+   * waiting on it. Before a run is in flight there is no coordinator to ask, and refreshing
+   * metadata is all that can be done.
+   *
+   * @private
+   * @param {Error} error
+   * @returns {void}
+   */
+  requestResync(error) {
+    if (!this.rebalanceCoordinator) {
+      this.logger.debug('No rebalance coordinator attached; refreshed metadata only', {
+        groupId: this.groupId,
+        error: error.message,
+      })
+      return
+    }
+
+    this.rebalanceCoordinator.requestRejoin({
+      kind: 'revoked',
+      reason: 'stale-assignment',
+      error,
+    })
   }
 
   /**

@@ -160,6 +160,7 @@ describe('Consumer > Instrumentation Events', () => {
         isLeader: true,
         leaderId: expect.any(String),
         groupProtocol: expect.any(String),
+        rebalanceProtocol: 'eager',
         memberId: expect.any(String),
         memberAssignment: { [topicName]: [0] },
       },
@@ -493,6 +494,7 @@ describe('Consumer > Instrumentation Events', () => {
       payload: {
         groupId,
         memberId,
+        reason: expect.any(String),
       },
     })
   })

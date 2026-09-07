@@ -210,6 +210,10 @@ describe('Runner > crash handling from the fetch-loop path', () => {
   const createStubConsumerGroup = (overrides = {}) => ({
     groupId: 'runner-crash-test',
     memberId: 'member-1',
+    attach: jest.fn(),
+    // `stop()` clears the assigner state before LeaveGroup, inside the same try: a missing stub
+    // would swallow the very leave() the assertions below depend on.
+    clearAssignerState: jest.fn(),
     leave: jest.fn(async () => {}),
     getNodeIds: () => [],
     ...overrides,

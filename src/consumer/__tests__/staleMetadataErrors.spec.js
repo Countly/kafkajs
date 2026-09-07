@@ -5,9 +5,10 @@ const { newLogger } = require('testHelpers')
 
 /**
  * `ConsumerGroup#recoverFromFetch` is the only reader of the consumer's own list, and its
- * stale-metadata branch is observable: it refreshes metadata and rejoins. Driving it is how this
- * spec tests that list — `STALE_METADATA_ERRORS` is a module-local const in `consumerGroup.js`
- * and stays one; nothing is exported from production for a test.
+ * stale-metadata branch is observable: it refreshes metadata and asks the rebalance coordinator
+ * for a rejoin. Driving it is how this spec tests that list — `STALE_METADATA_ERRORS` is a
+ * module-local const in `consumerGroup.js` and stays one; nothing is exported from production
+ * for a test.
  */
 const buildGroup = () => {
   const cluster = {
@@ -42,9 +43,12 @@ const buildGroup = () => {
     pendingTopicResets: new Map(),
   })
 
-  const joinAndSync = jest.spyOn(consumerGroup, 'joinAndSync').mockResolvedValue()
-  return { consumerGroup, cluster, joinAndSync }
+  const requestRejoin = jest.fn()
+  consumerGroup.attach({ rebalanceCoordinator: { requestRejoin }, heartbeatManager: {} })
+  return { consumerGroup, cluster, requestRejoin }
 }
+
+const RESYNC = { kind: 'revoked', reason: 'stale-assignment', error: expect.anything() }
 
 describe('stale-metadata error classification', () => {
   const NEW_CODES = [
@@ -63,12 +67,12 @@ describe('stale-metadata error classification', () => {
   test.each(NEW_CODES)(
     '%s makes the consumer refresh metadata and rejoin, not crash',
     async (_type, code) => {
-      const { consumerGroup, cluster, joinAndSync } = buildGroup()
+      const { consumerGroup, cluster, requestRejoin } = buildGroup()
 
       await consumerGroup.recoverFromFetch(createErrorFromCode(code))
 
       expect(cluster.refreshMetadata).toHaveBeenCalled()
-      expect(joinAndSync).toHaveBeenCalled()
+      expect(requestRejoin).toHaveBeenCalledWith(RESYNC)
     }
   )
 
@@ -77,19 +81,33 @@ describe('stale-metadata error classification', () => {
     expect(staleMetadata(createErrorFromCode(74))).toBe(false)
     expect(staleMetadata(createErrorFromCode(3))).toBe(true) // UNKNOWN_TOPIC_OR_PARTITION
 
-    const { consumerGroup, joinAndSync } = buildGroup()
+    const { consumerGroup, requestRejoin } = buildGroup()
     await consumerGroup.recoverFromFetch(createErrorFromCode(74))
-    expect(joinAndSync).toHaveBeenCalled()
+    expect(requestRejoin).toHaveBeenCalledWith(RESYNC)
   })
 
   test('an unrelated error is neither, and still propagates', async () => {
     expect(staleMetadata(createErrorFromCode(87))).toBe(false) // INVALID_RECORD
 
-    const { consumerGroup, cluster, joinAndSync } = buildGroup()
+    const { consumerGroup, cluster, requestRejoin } = buildGroup()
     await expect(consumerGroup.recoverFromFetch(createErrorFromCode(87))).rejects.toMatchObject({
       code: 87,
     })
     expect(cluster.refreshMetadata).not.toHaveBeenCalled()
-    expect(joinAndSync).not.toHaveBeenCalled()
+    expect(requestRejoin).not.toHaveBeenCalled()
+  })
+
+  test('a group with no coordinator attached refreshes metadata, logs and returns', async () => {
+    const { consumerGroup, cluster } = buildGroup()
+    consumerGroup.rebalanceCoordinator = null
+    const debug = jest.spyOn(consumerGroup.logger, 'debug')
+
+    await expect(consumerGroup.recoverFromFetch(createErrorFromCode(100))).resolves.toBeUndefined()
+
+    expect(cluster.refreshMetadata).toHaveBeenCalled()
+    expect(debug).toHaveBeenCalledWith(
+      'No rebalance coordinator attached; refreshed metadata only',
+      expect.objectContaining({ groupId: 'test-group' })
+    )
   })
 })

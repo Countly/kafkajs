@@ -172,7 +172,7 @@ describe('Consumer > position validation', () => {
   })
 
   test('nothing thrown inside validation reaches the fetch', async () => {
-    const { group, cluster, logger, requests, joinAndSync } = await createGroup()
+    const { group, cluster, logger, requests, requestRejoin } = await createGroup()
     const warn = jest.spyOn(logger, 'warn')
     cluster.findLeaderForPartitions = () => {
       throw new Error('metadata gone')
@@ -182,7 +182,7 @@ describe('Consumer > position validation', () => {
     expect(warn).toHaveBeenCalledTimes(1)
     expect(apiKeysOf(requests)).toContain(apiKeys.Fetch)
     expect(group.positionValidator.isAwaiting(TOPIC, 0)).toBe(false)
-    expect(joinAndSync).not.toHaveBeenCalled()
+    expect(requestRejoin).not.toHaveBeenCalled()
   })
 
   test('a reposition that fails leaves the partition unvalidated, and the next round applies it', async () => {
@@ -207,7 +207,7 @@ describe('Consumer > position validation', () => {
   })
 
   test('an unexpected failure inside validation is warned, never thrown, and asked once', async () => {
-    const { group, logger, requests, joinAndSync, setValidationResponse } = await createGroup()
+    const { group, logger, requests, requestRejoin, setValidationResponse } = await createGroup()
     const warn = jest.spyOn(logger, 'warn')
     setValidationResponse(() => {
       throw new TypeError('answer is not a function')
@@ -218,7 +218,7 @@ describe('Consumer > position validation', () => {
     // An unrecoverable error is not retried, so the round costs exactly one attempt.
     expect(validationCount(requests)).toEqual(1)
     expect(group.positionValidator.isAwaiting(TOPIC, 0)).toBe(false)
-    expect(joinAndSync).not.toHaveBeenCalled()
+    expect(requestRejoin).not.toHaveBeenCalled()
   })
 
   test('a rebalance during a failing validation leaves the tracked epoch alone', async () => {
@@ -466,7 +466,7 @@ describe('Consumer > position validation', () => {
     })
 
     setValidationResponse((partitions) => {
-      group.positionValidator.clear() // what [PRIVATE.SYNC] does when the group re-syncs
+      group.positionValidator.clear() // what applyRebalanceResult does when the group re-syncs
       return offsetForLeaderEpochResponse(
         partitions.map((partition) => ({ partition, endOffset: '100' }))
       )

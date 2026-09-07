@@ -279,20 +279,18 @@ describe('Consumer > classic group protocol > joinAndSync contract', () => {
     expect(group.groupMembership.rebalance).toHaveBeenCalledTimes(1)
   })
 
-  it('applies the result and emits GROUP_JOIN once, in that order', async () => {
+  it('is one exchange: it neither applies the result nor reports the round', async () => {
     const group = buildGroup(0)
-    jest.spyOn(group.groupMembership, 'rebalance').mockResolvedValue({ assignment: {} })
-    const calls = []
-    group.applyRebalanceResult = jest.fn(async () => {
-      calls.push('apply')
-      return { assignment: [], added: [], revoked: [] }
-    })
+    const result = { assignment: { 'accessor-topic': [0] }, userData: null }
+    jest.spyOn(group.groupMembership, 'rebalance').mockResolvedValue(result)
     // `InstrumentationEventEmitter` exposes only `emit` and `addListener` - there is no `on`,
     // and calling one is a TypeError, not a failing assertion.
-    group.instrumentationEmitter.addListener(GROUP_JOIN, () => calls.push('group_join'))
+    const groupJoin = jest.fn()
+    group.instrumentationEmitter.addListener(GROUP_JOIN, groupJoin)
 
-    await group.joinAndSync()
+    await expect(group.joinAndSync()).resolves.toEqual(result)
 
-    expect(calls).toEqual(['apply', 'group_join'])
+    expect(group.applyRebalanceResult).not.toHaveBeenCalled()
+    expect(groupJoin).not.toHaveBeenCalled()
   })
 })

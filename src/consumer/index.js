@@ -339,6 +339,7 @@ module.exports = ({
         consumerGroup,
         instrumentationEmitter,
         heartbeatInterval: groupTimeouts.heartbeatInterval,
+        maxPollInterval: groupTimeouts.pollDeadline,
         retry,
         autoCommit,
         eachBatchAutoResolve,

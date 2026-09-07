@@ -254,7 +254,9 @@ describe('Consumer', () => {
     await producer.send({ acks: 1, topic: topicName, messages: [{ key: 'value', value: 'value' }] })
     await waitForMessages(messagesConsumed, { number: 1 })
 
-    expect(heartbeats).toBe(1)
+    // Heartbeats no longer come only from the handler: a background timer sends them too, so the
+    // count this handler's own call contributes is a floor, not the total.
+    expect(heartbeats).toBeGreaterThanOrEqual(1)
   })
 
   it('consume GZIP messages', async () => {
