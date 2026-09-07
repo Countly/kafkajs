@@ -57,6 +57,7 @@ describe('Consumer > Runner', () => {
       leaderId: 'test-member',
       groupInstanceId: null,
       groupMembership: {},
+      assignmentEpoch: 0,
       attach: jest.fn(),
       rebalanceProtocol: jest.fn(() => 'eager'),
       applyRebalanceResult: jest.fn(async () => ({ assignment: [], added: [], revoked: [] })),
@@ -424,6 +425,90 @@ describe('Consumer > Runner', () => {
       await runner.handleBatch(batchOf([{ offset: 4, key: '1', value: '2' }]))
 
       expect(debug).not.toHaveBeenCalledWith('Batch', expect.anything())
+    })
+  })
+
+  describe('when the assignment is dropped while the handler runs', () => {
+    const batchWithEpoch = (assignmentEpoch) => {
+      const batch = new Batch(topicName, 0, {
+        partition,
+        highWatermark: 5,
+        messages: [
+          { offset: 4, key: '1', value: '2' },
+          { offset: 5, key: '3', value: '4' },
+        ],
+      })
+      batch.assignmentEpoch = assignmentEpoch
+      return batch
+    }
+
+    it('does not commit for a batch whose epoch moved on while "eachBatch" ran', async () => {
+      eachBatch.mockImplementation(async () => {
+        consumerGroup.assignmentEpoch += 1
+      })
+
+      runner.scheduleFetchManager = jest.fn()
+      await runner.start()
+      await runner.handleBatch(batchWithEpoch(0))
+
+      expect(eachBatch).toHaveBeenCalled()
+      expect(consumerGroup.commitOffsets).not.toHaveBeenCalled()
+      expect(consumerGroup.heartbeat).not.toHaveBeenCalled()
+    })
+
+    it('commits for a batch whose epoch is still current', async () => {
+      runner.scheduleFetchManager = jest.fn()
+      await runner.start()
+      await runner.handleBatch(batchWithEpoch(0))
+
+      expect(eachBatch).toHaveBeenCalled()
+      expect(consumerGroup.commitOffsets).toHaveBeenCalled()
+    })
+
+    it('stops "eachMessage" after the message it was inside, resolving only that offset', async () => {
+      const eachMessage = jest.fn(async () => {
+        consumerGroup.assignmentEpoch += 1
+      })
+      runner = createTestRunner({ eachBatch: undefined, eachMessage })
+
+      runner.scheduleFetchManager = jest.fn()
+      await runner.start()
+      await runner.handleBatch(batchWithEpoch(0))
+
+      expect(eachMessage).toHaveBeenCalledTimes(1)
+      expect(consumerGroup.resolveOffset).toHaveBeenCalledTimes(1)
+      expect(consumerGroup.commitOffsetsIfNecessary).not.toHaveBeenCalled()
+      expect(consumerGroup.commitOffsets).not.toHaveBeenCalled()
+      expect(consumerGroup.heartbeat).not.toHaveBeenCalled()
+    })
+  })
+
+  describe('stop', () => {
+    it('stops the fetch manager before waiting for a background rebalance round', async () => {
+      const calls = []
+      runner.fetchManager = {
+        start: jest.fn(async () => {}),
+        stop: jest.fn(async () => {
+          calls.push('fetchManager.stop')
+        }),
+      }
+      runner.rebalanceCoordinator = {
+        clearVerdict: jest.fn(),
+        idle: jest.fn(async () => {
+          calls.push('rebalanceCoordinator.idle')
+          // The round is only reachable if a fetch issued in this window returns instead of
+          // spinning the loop it belongs to.
+          await expect(runner.fetch(1)).resolves.toEqual([])
+        }),
+      }
+
+      runner.running = true
+      await runner.stop()
+
+      expect(calls).toEqual(['fetchManager.stop', 'rebalanceCoordinator.idle'])
+      expect(consumerGroup.leave).toHaveBeenCalled()
+
+      runner = null
     })
   })
 })

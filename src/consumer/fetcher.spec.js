@@ -70,6 +70,37 @@ describe('Fetcher', () => {
     })
   })
 
+  it('yields to the event loop when a fetch round returns no batches', async () => {
+    // Bounded on purpose: a loop that never yields would starve jest's own timeout, so the fetch
+    // stops the fetcher itself after enough rounds and the assertion is on how many rounds ran
+    // before a zero-delay timer got its turn.
+    const SPIN_LIMIT = 1000
+    const emptyFetch = jest.fn(async () => {
+      if (emptyFetch.mock.calls.length >= SPIN_LIMIT) {
+        spinningFetcher.stop()
+      }
+      return []
+    })
+    const spinningFetcher = createFetcher({
+      nodeId: 1,
+      fetch: emptyFetch,
+      workerQueue,
+      logger,
+      partitionAssignments: fetcherAssignments,
+    })
+
+    const started = spinningFetcher.start()
+    const roundsBeforeTimer = await new Promise((resolve) =>
+      setTimeout(() => resolve(emptyFetch.mock.calls.length), 0)
+    )
+    await spinningFetcher.stop()
+    await started
+
+    expect(roundsBeforeTimer).toBeGreaterThan(0)
+    expect(roundsBeforeTimer).toBeLessThan(SPIN_LIMIT)
+    expect(handler).not.toHaveBeenCalled()
+  })
+
   describe('handles partition reassignment', () => {
     let fetchers
 

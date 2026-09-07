@@ -404,7 +404,7 @@ describe('Consumer > RebalanceCoordinator', () => {
       await expect(coordinator.idle()).resolves.toBeUndefined()
     })
 
-    it('awaits idle() before stopping the fetch manager and before LeaveGroup', async () => {
+    it('stops the fetch manager first, then awaits idle() before LeaveGroup', async () => {
       const { runner, consumerGroup, calls } = createRealRunner({ mode: COOPERATIVE })
       const gate = deferred()
       consumerGroup.joinAndSync.mockImplementation(async () => {
@@ -421,8 +421,10 @@ describe('Consumer > RebalanceCoordinator', () => {
       gate.resolve()
       await stopping
 
-      expect(calls.indexOf('applyRebalanceResult')).toBeLessThan(calls.indexOf('fetchManager.stop'))
-      expect(calls.indexOf('fetchManager.stop')).toBeLessThan(calls.indexOf('leave'))
+      // The fetch layer goes first so the event loop keeps turning for the round on the wire;
+      // the round still has to finish before LeaveGroup, or its JoinGroup would re-register.
+      expect(calls.indexOf('fetchManager.stop')).toBeLessThan(calls.indexOf('applyRebalanceResult'))
+      expect(calls.indexOf('applyRebalanceResult')).toBeLessThan(calls.indexOf('leave'))
     })
 
     it('joins when only `running` is false, and refuses once stopRequested is set', async () => {

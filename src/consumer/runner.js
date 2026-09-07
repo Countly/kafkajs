@@ -434,11 +434,15 @@ module.exports = class Runner extends EventEmitter {
     this.rebalanceCoordinator.clearVerdict()
 
     try {
+      // The fetch layer goes first: with `running` already false every fetch returns [] without
+      // awaiting anything, so a fetcher left spinning would resolve in microtasks only and starve
+      // the event loop the background round needs to make progress on the wire.
+      await this.fetchManager.stop()
       // A background cooperative round must finish before LeaveGroup, or its JoinGroup would
       // re-register a member this runner has just left. Bounded by the current round, which is
-      // the property waitForConsumer() already has.
+      // the property waitForConsumer() already has. Nothing in that round re-arms the fetch
+      // manager, so stopping it first cannot strand the round.
       await this.rebalanceCoordinator.idle()
-      await this.fetchManager.stop()
       await this.waitForConsumer()
 
       this.consumerGroup.clearAssignerState()
@@ -543,6 +547,14 @@ module.exports = class Runner extends EventEmitter {
         offset: message.offset,
         leaderEpoch: message.batchContext ? message.batchContext.partitionLeaderEpoch : -1,
       })
+
+      // The offset stays resolved - an EAGER quiesce still commits it through
+      // `resolveRebalanceVerdict` - but a membership dropped while this message ran cannot carry
+      // a heartbeat or a commit of its own.
+      if (this.isBatchStale(batch)) {
+        break
+      }
+
       await this.heartbeat()
       await this.autoCommitOffsetsIfNecessary()
 
@@ -885,6 +897,22 @@ module.exports = class Runner extends EventEmitter {
         ...payload,
         duration: Date.now() - startBatchProcess,
       })
+
+      // A rebalance can land while the handler runs - a poll-interval overrun drops the
+      // membership outright - so the batch that was live on entry may be void by now. Committing
+      // or heartbeating for it would use a generation this member no longer holds.
+      if (this.isBatchStale(batch)) {
+        this.logger.debug('Not committing a batch that outlived the assignment it ran under', {
+          groupId: this.consumerGroup.groupId,
+          memberId: this.consumerGroup.memberId,
+          topic: batch.topic,
+          partition: batch.partition,
+          batchAssignmentEpoch: batch.assignmentEpoch,
+          assignmentEpoch: this.consumerGroup.assignmentEpoch,
+        })
+
+        return
+      }
 
       await this.autoCommitOffsets()
       await this.heartbeat()

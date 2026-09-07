@@ -271,12 +271,22 @@ describePollGuard('Consumer > poll-interval guard (live)', () => {
       expect(rejoinJoinGroup).toBeDefined()
       expect(lost.timestamp).toBeLessThanOrEqual(rejoinJoinGroup.sentAt)
 
-      // Nothing is committed against the generation the member has already lost.
+      // Nothing is committed against the generation the member has already lost. Every request in
+      // this window predates the rejoin's JoinGroup or sits between it and the new GROUP_JOIN, so
+      // the ordered timeline is carried into the failure: it is the only way to tell which
+      // generation a commit here belonged to.
       const commitsInWindow = observed.requests.filter(
         ({ apiName, sentAt }) =>
           apiName === 'OffsetCommit' && sentAt >= expiry.timestamp && sentAt <= rejoin.timestamp
       )
-      expect(commitsInWindow).toEqual([])
+      const windowTimeline = observed.requests
+        .filter(
+          ({ sentAt }) => sentAt >= expiry.timestamp - 1000 && sentAt <= rejoin.timestamp + 1000
+        )
+        .sort((left, right) => left.sentAt - right.sentAt)
+        .map(({ apiName, sentAt }) => `${apiName}@+${sentAt - expiry.timestamp}ms`)
+
+      expect({ commits: commitsInWindow, timeline: windowTimeline }).toMatchObject({ commits: [] })
 
       // It resumes: records produced after the rejoin are delivered by the same consumer.
       const deliveredBeforeResume = observed.received.length

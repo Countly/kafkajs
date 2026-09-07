@@ -224,10 +224,15 @@ module.exports = class ConsumerGroup {
    * Drops this member's generation and member id without telling the coordinator. Used after a
    * poll-interval overrun, where the LeaveGroup has already been sent (or deliberately not sent,
    * for a static member) and the next round must take the lost-membership branch.
+   *
+   * Bumps `assignmentEpoch` too: the assignment was held under the membership being dropped, so
+   * every batch fetched under it is stale and must neither be committed nor heartbeated for. The
+   * next `applyRebalanceResult` bumps again, so staleness can never stick.
    * @returns {void}
    */
   resetGenerationLocally() {
     this.groupMembership.resetGeneration({ clearMemberId: true })
+    this.assignmentEpoch += 1
   }
 
   /**

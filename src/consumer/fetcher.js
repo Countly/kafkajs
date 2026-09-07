@@ -53,6 +53,14 @@ const createFetcher = ({
     while (isRunning) {
       try {
         const batches = await fetch(nodeId)
+
+        // Yield floor. A normal empty round has already long-polled `maxWaitTime` on the wire, so
+        // this costs nothing; it turns an iteration that resolved in microtasks only - a fetch
+        // short-circuited while the runner is stopping - into a live loop instead of a hang.
+        if (batches.length === 0) {
+          await new Promise((resolve) => setImmediate(resolve))
+        }
+
         if (isRunning) {
           const availableBatches = filterUnassignedBatches(batches)
 

@@ -22,6 +22,20 @@ describe('ConsumerGroup', () => {
     })
   })
 
+  describe('resetGenerationLocally', () => {
+    it('drops the generation and moves the assignment epoch on', () => {
+      consumerGroup.groupMembership = { resetGeneration: jest.fn() }
+      const before = consumerGroup.assignmentEpoch
+
+      consumerGroup.resetGenerationLocally()
+
+      expect(consumerGroup.groupMembership.resetGeneration).toHaveBeenCalledWith({
+        clearMemberId: true,
+      })
+      expect(consumerGroup.assignmentEpoch).toBe(before + 1)
+    })
+  })
+
   describe('commitOffsets', () => {
     it("calls the offset manager's commitOffsets", async () => {
       consumerGroup.offsetManager = { commitOffsets: jest.fn(() => Promise.resolve()) }
