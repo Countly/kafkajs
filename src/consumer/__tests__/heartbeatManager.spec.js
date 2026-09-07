@@ -3,6 +3,7 @@ const PollTimer = require('../pollTimer')
 const ClassicGroupProtocol = require('../groupProtocol/classic')
 const InstrumentationEventEmitter = require('../../instrumentation/emitter')
 const { createErrorFromCode } = require('../../protocol/error')
+const { events } = require('../instrumentationEvents')
 const { newLogger } = require('testHelpers')
 
 const ILLEGAL_GENERATION = 22
@@ -476,6 +477,65 @@ describe('Consumer > HeartbeatManager > poll expiry', () => {
 
     await jest.advanceTimersByTimeAsync(300)
     expect(heartbeat).toHaveBeenCalledTimes(4)
+
+    manager.stop()
+    expect(jest.getTimerCount()).toEqual(0)
+  })
+})
+
+describe('Consumer > HeartbeatManager > the HEARTBEAT event', () => {
+  beforeEach(() => jest.useFakeTimers())
+  afterEach(() => jest.useRealTimers())
+
+  it('is emitted for a timer-driven send, not only for the handler callback', async () => {
+    // The emit lives beside the request inside the group protocol, so the fixture is a real
+    // protocol with a stubbed coordinator: nothing else can prove the timer's send is emitted.
+    const heartbeat = jest.fn(async () => {})
+    const instrumentationEmitter = new InstrumentationEventEmitter()
+    const emitted = []
+    instrumentationEmitter.addListener(events.HEARTBEAT, ({ payload }) => emitted.push(payload))
+
+    const protocol = new ClassicGroupProtocol({
+      cluster: {
+        findGroupCoordinator: async () => ({
+          joinGroup: async () => ({
+            generationId: 7,
+            leaderId: 'm',
+            memberId: 'm',
+            members: [],
+            groupProtocol: 'x',
+          }),
+          heartbeat,
+          negotiatedVersion: () => 5,
+        }),
+      },
+      groupId: 'heartbeat-group',
+      groupInstanceId: null,
+      sessionTimeout: 30000,
+      rebalanceTimeout: 300000,
+      assigners: [],
+      mode: 'eager',
+      rackId: '',
+      instrumentationEmitter,
+      logger: newLogger(),
+    })
+
+    const { manager } = build({ groupMembership: protocol })
+    protocol.attach({ rebalanceCoordinator: {}, heartbeatManager: manager })
+    await protocol.join({ topicsSubscribed: ['t'] })
+
+    manager.ensureStarted()
+    await jest.advanceTimersByTimeAsync(100)
+
+    expect(heartbeat).toHaveBeenCalledTimes(1)
+    expect(emitted).toEqual([
+      {
+        groupId: 'heartbeat-group',
+        memberId: 'm',
+        groupGenerationId: 7,
+        groupInstanceId: null,
+      },
+    ])
 
     manager.stop()
     expect(jest.getTimerCount()).toEqual(0)

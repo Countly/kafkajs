@@ -160,6 +160,18 @@ export interface ConsumerConfig {
   partitionAssigners?: PartitionAssigner[]
   metadataMaxAge?: number
   sessionTimeout?: number
+  /**
+   * The maximum time between two batches handed to your handler, in milliseconds, and the
+   * rebalance timeout sent on the wire. Default 300000, matching the Java client's
+   * `max.poll.interval.ms`. A handler that exceeds it loses its partitions and the consumer
+   * rejoins.
+   */
+  maxPollInterval?: number
+  /**
+   * @deprecated Use `maxPollInterval`. This value is still sent on the wire as the JoinGroup
+   * rebalance timeout when it is the only one you set, but it never becomes your handler
+   * deadline: that stays at least 300000 ms.
+   */
   rebalanceTimeout?: number
   heartbeatInterval?: number
   maxBytesPerPartition?: number
@@ -230,7 +242,12 @@ export type Cluster = {
 
 export type Assignment = { [topic: string]: number[] }
 
-export type GroupMember = { memberId: string; memberMetadata: Buffer }
+export type GroupMember = {
+  memberId: string
+  memberMetadata: Buffer
+  /** The member's static membership id (KIP-345), `null` for a dynamic member. */
+  groupInstanceId?: string | null
+}
 
 export type GroupMemberAssignment = { memberId: string; memberAssignment: Buffer }
 
@@ -240,7 +257,24 @@ export type Assigner = {
   name: string
   version: number
   assign(group: { members: GroupMember[]; topics: string[] }): Promise<GroupMemberAssignment[]>
-  protocol(subscription: { topics: string[] }): GroupState
+  protocol(subscription: {
+    topics: string[]
+    ownedPartitions?: Array<{ topic: string; partitions: number[] }>
+    generationId?: number
+    rackId?: string | null
+  }): GroupState
+  /** Which rebalance protocols this assigner can take part in. Absent means `['eager']`. */
+  supportedProtocols?(): Array<'eager' | 'cooperative'>
+  /** Optional bytes for the subscription. An assigner that defines `protocol()` calls this itself. */
+  subscriptionUserData?(topics: string[]): Buffer | null
+  /** Invoked after every successful sync, and with `null` when the member leaves or resets. */
+  onAssignment?(
+    assignment: {
+      partitions: Array<{ topic: string; partitions: number[] }>
+      userData: Buffer | null
+    } | null,
+    metadata: { generationId: number; groupProtocol: string | null }
+  ): void
 }
 
 export interface RetryOptions {
@@ -629,7 +663,12 @@ export type Admin = {
   readonly events: AdminEvents
 }
 
-export const PartitionAssigners: { roundRobin: PartitionAssigner }
+export const PartitionAssigners: {
+  roundRobin: PartitionAssigner
+  range: PartitionAssigner
+  sticky: PartitionAssigner
+  cooperativeSticky: PartitionAssigner
+}
 
 export interface ISerializer<TIn, TOut = TIn> {
   encode(value: TIn): Buffer
@@ -1047,6 +1086,10 @@ export type ConsumerEvents = {
   STOP: 'consumer.stop'
   CRASH: 'consumer.crash'
   REBALANCING: 'consumer.rebalancing'
+  PARTITIONS_ASSIGNED: 'consumer.partitions_assigned'
+  PARTITIONS_REVOKED: 'consumer.partitions_revoked'
+  PARTITIONS_LOST: 'consumer.partitions_lost'
+  POLL_INTERVAL_EXCEEDED: 'consumer.poll_interval_exceeded'
   RECEIVED_UNSUBSCRIBED_TOPICS: 'consumer.received_unsubscribed_topics'
   REQUEST: 'consumer.network.request'
   REQUEST_TIMEOUT: 'consumer.network.request_timeout'
@@ -1089,6 +1132,7 @@ export type ConsumerGroupJoinEvent = InstrumentationEvent<{
   groupProtocol: string
   memberId: string
   memberAssignment: IMemberAssignment
+  rebalanceProtocol: 'eager' | 'cooperative'
 }>
 export type ConsumerFetchStartEvent = InstrumentationEvent<{ nodeId: number }>
 export type ConsumerFetchEvent = InstrumentationEvent<{
@@ -1117,7 +1161,36 @@ export type ConsumerCrashEvent = InstrumentationEvent<{
 }>
 export type ConsumerRebalancingEvent = InstrumentationEvent<{
   groupId: string
-  memberId: string
+  /** `null` when the coordinator rejected this member's id, which is dropped before the rejoin. */
+  memberId: string | null
+  /** Why the rebalance started. Absent on the first join of a run, which reports no reason. */
+  reason?:
+    | 'rebalance-in-progress'
+    | 'lost'
+    | 'poll-interval-exceeded'
+    | 'partitions-revoked'
+    | 'stale-assignment'
+    | 'coordinator-changed'
+}>
+/** Payload of `PARTITIONS_ASSIGNED`, `PARTITIONS_REVOKED` and `PARTITIONS_LOST`. */
+export type ConsumerPartitionsEvent = InstrumentationEvent<{
+  groupId: string
+  /** `null` while this member has no id: before its first successful join, or after one was lost. */
+  memberId: string | null
+  generationId: number
+  partitions: Array<{ topic: string; partitions: number[] }>
+}>
+export type ConsumerPartitionsAssignedEvent = ConsumerPartitionsEvent
+export type ConsumerPartitionsRevokedEvent = ConsumerPartitionsEvent
+export type ConsumerPartitionsLostEvent = ConsumerPartitionsEvent
+export type ConsumerPollIntervalExceededEvent = InstrumentationEvent<{
+  groupId: string
+  /** `null` while this member has no id: before its first successful join, or after one was lost. */
+  memberId: string | null
+  generationId: number
+  maxPollInterval: number
+  elapsedMs: number
+  isStatic: boolean
 }>
 export type ConsumerReceivedUnsubcribedTopicsEvent = InstrumentationEvent<{
   groupId: string
@@ -1248,6 +1321,22 @@ export type Consumer = {
   on(
     eventName: ConsumerEvents['REBALANCING'],
     listener: (event: ConsumerRebalancingEvent) => void
+  ): RemoveInstrumentationEventListener<typeof eventName>
+  on(
+    eventName: ConsumerEvents['PARTITIONS_ASSIGNED'],
+    listener: (event: ConsumerPartitionsAssignedEvent) => void
+  ): RemoveInstrumentationEventListener<typeof eventName>
+  on(
+    eventName: ConsumerEvents['PARTITIONS_REVOKED'],
+    listener: (event: ConsumerPartitionsRevokedEvent) => void
+  ): RemoveInstrumentationEventListener<typeof eventName>
+  on(
+    eventName: ConsumerEvents['PARTITIONS_LOST'],
+    listener: (event: ConsumerPartitionsLostEvent) => void
+  ): RemoveInstrumentationEventListener<typeof eventName>
+  on(
+    eventName: ConsumerEvents['POLL_INTERVAL_EXCEEDED'],
+    listener: (event: ConsumerPollIntervalExceededEvent) => void
   ): RemoveInstrumentationEventListener<typeof eventName>
   on(
     eventName: ConsumerEvents['RECEIVED_UNSUBSCRIBED_TOPICS'],

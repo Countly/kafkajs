@@ -24,6 +24,8 @@ import {
   KafkaJSServerDoesNotSupportApiKey,
   AssignerProtocol,
   MemberMetadata,
+  Assigner,
+  GroupMember,
 } from './index'
 
 const { roundRobin } = PartitionAssigners
@@ -376,3 +378,44 @@ AssignerProtocol.MemberMetadata.encode({
 })
 const decoded: MemberMetadata | null = AssignerProtocol.MemberMetadata.decode(Buffer.alloc(0))
 void decoded
+
+// The four typed listeners.
+consumer.on(consumer.events.PARTITIONS_ASSIGNED, e => {
+  const topics: string[] = e.payload.partitions.map(({ topic }) => topic)
+  void topics
+})
+// A rejected member id is reported as null, on the rebalance and on the partition events alike.
+consumer.on(consumer.events.REBALANCING, e => {
+  const memberId: string | null = e.payload.memberId
+  void memberId
+})
+consumer.on(consumer.events.PARTITIONS_LOST, e => {
+  const memberId: string | null = e.payload.memberId
+  void memberId
+})
+consumer.on(consumer.events.POLL_INTERVAL_EXCEEDED, e => {
+  const elapsed: number = e.payload.elapsedMs
+  const isStatic: boolean = e.payload.isStatic
+  void elapsed
+  void isStatic
+})
+// The option and the deprecated alias both compile.
+kafka.consumer({ groupId: 'g', maxPollInterval: 300000 })
+kafka.consumer({ groupId: 'g', rebalanceTimeout: 60000 })
+// A 2.2.4-shaped assigner literal still satisfies Assigner under strictFunctionTypes.
+const legacyAssigner: Assigner = {
+  name: 'legacy',
+  version: 1,
+  assign: async () => [],
+  protocol: ({ topics }) => ({ name: 'legacy', metadata: Buffer.from(topics.join(',')) }),
+}
+void legacyAssigner
+// The new built-ins are exported by name.
+kafka.consumer({ groupId: 'g', partitionAssigners: [PartitionAssigners.cooperativeSticky] })
+// GroupMember carries the optional static id.
+const member: GroupMember = {
+  memberId: 'm',
+  memberMetadata: Buffer.alloc(0),
+  groupInstanceId: null,
+}
+void member

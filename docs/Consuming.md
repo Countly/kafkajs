@@ -184,6 +184,8 @@ When the group coordinator rejects a heartbeat or a fetch, the consumer tells ap
 
 A LOST member's generation, member id, or static instance id has already been invalidated by the coordinator, so any offsets committed under it would be rejected forever — that used to surface as a repeating "Specified group generation id is not valid" error. A REVOKED member is still a valid part of the group, so committing its already-resolved offsets before rejoining is safe — this covers every rebalance-class error above and beyond it, not just 27/16. On the fetch path, a LOST or REVOKED error emits the same public `REBALANCING` instrumentation event before the consumer rejoins.
 
+Two more things happen around a rebalance, both new in 3.0.0. A handler that has not returned within `maxPollInterval` (see [Options](#options)) is treated as a lost member: the consumer logs a warning, emits `POLL_INTERVAL_EXCEEDED`, gives up its partitions and rejoins, and the batch that handler eventually returns is dropped and redelivered afterwards. The deadline is reset on every batch handed to your handler *and* on every fetch round that comes back empty, and there is one fetcher per broker, so the guard fires only when every fetcher is stalled behind the overrunning handler — in practice a single-broker assignment with `partitionsConsumedConcurrently: 1`. And on the **cooperative** path a `REBALANCE_IN_PROGRESS` no longer comes out of the `heartbeat()` callback into your handler — the call resolves and the rejoin runs in the background while your handler keeps the partitions it is not losing. On the default eager path that callback still throws, as before.
+
 Not every fetch-path error is a rebalance signal, though: a CRC32C mismatch on a record batch (`checkCrcs`, see [Options](#options)) is a **non-retriable** error, handled like any other non-retriable error — the consumer crashes rather than rejoining, and the offset is not advanced past the corrupt batch.
 
 ## <a name="manual-commits"></a> Manual committing
@@ -247,7 +249,7 @@ kafka.consumer({
   groupId: <String>,
   partitionAssigners: <Array>,
   sessionTimeout: <Number>,
-  rebalanceTimeout: <Number>,
+  maxPollInterval: <Number>,
   heartbeatInterval: <Number>,
   metadataMaxAge: <Number>,
   allowAutoTopicCreation: <Boolean>,
@@ -267,7 +269,8 @@ kafka.consumer({
 | ---------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------- |
 | partitionAssigners     | List of partition assigners                                                                                                                                                                                                                                                                                                                        | `[PartitionAssigners.roundRobin]` |
 | sessionTimeout         | Timeout in milliseconds used to detect failures. The consumer sends periodic heartbeats to indicate its liveness to the broker. If no heartbeats are received by the broker before the expiration of this session timeout, then the broker will remove this consumer from the group and initiate a rebalance                                       | `30000`                           |
-| rebalanceTimeout       | The maximum time that the coordinator will wait for each member to rejoin when rebalancing the group                                                                                                                                                                                                                                               | `60000`                           |
+| maxPollInterval        | The maximum time, in milliseconds, your `eachMessage`/`eachBatch` handler may take to return, and the rebalance timeout sent to the coordinator. It is the Java client's `max.poll.interval.ms`. A handler that takes longer loses its partitions and the consumer rejoins the group; see [Membership errors during rebalance](#membership-errors) | `300000` (5 minutes)              |
+| rebalanceTimeout       | **Deprecated — use `maxPollInterval`.** The maximum time that the coordinator will wait for each member to rejoin when rebalancing the group. Still sent on the wire when it is the only one of the two you set, and setting it logs a deprecation warning once per consumer you create. It never becomes your handler deadline: that stays at `max(rebalanceTimeout, 300000)`, so an existing 20 s or 60 s rebalance timeout cannot turn into a 20 s or 60 s handler deadline. If you set both, `maxPollInterval` wins | `300000` (5 minutes, from `maxPollInterval`) |
 | heartbeatInterval      | The expected time in milliseconds between heartbeats to the consumer coordinator. Heartbeats are used to ensure that the consumer's session stays active. The value must be set lower than session timeout                                                                                                                                         | `3000`                            |
 | metadataMaxAge         | The period of time in milliseconds after which we force a refresh of metadata even if we haven't seen any partition leadership changes to proactively discover any new brokers or partitions                                                                                                                                                       | `300000` (5 minutes)              |
 | allowAutoTopicCreation | Allow topic creation when querying metadata for non-existent topics                                                                                                                                                                                                                                                                                | `true`                            |
@@ -413,6 +416,45 @@ consumer.run({
 consumer.seek({ topic: 'example', partition: 0, offset: "12384" })
 ```
 
+## <a name="partition-assigners"></a> Built-in partition assigners
+
+`PartitionAssigners` exports four assigners. The default is unchanged: a consumer you create without `partitionAssigners` uses `[PartitionAssigners.roundRobin]`, exactly as before.
+
+| Assigner | Name on the wire | What it does |
+| --- | --- | --- |
+| `roundRobin` | `RoundRobinAssigner` | The default. Deals every partition of every subscribed topic out to the members in turn. No Java client understands this name, so a group using it is a JavaScript-only group. |
+| `range` | `range` | Kafka's `RangeAssignor`: per topic, the partitions are split into contiguous ranges, one per member. Members subscribed to the same few topics tend to get the same partition numbers of each. |
+| `sticky` | `sticky` | Kafka's `StickyAssignor`: balances partitions while moving as few of them as possible from their current owners. |
+| `cooperativeSticky` | `cooperative-sticky` | Kafka's `CooperativeStickyAssignor` (KIP-429): the same balancing as `sticky`, plus incremental rebalancing — a member keeps the partitions it is not losing instead of giving up everything at the start of each round. |
+
+`range`, `sticky` and `cooperativeSticky` use the same names and the same algorithms as the Java client, so a group can mix this client with Java consumers. Rack-aware assignment is not implemented: your `rackId` is sent to the leader and ignored when partitions are assigned.
+
+```javascript
+const { PartitionAssigners: { sticky } } = require('@countly/kafkajs')
+
+kafka.consumer({ groupId: 'my-group', partitionAssigners: [sticky] })
+```
+
+### <a name="cooperative-rebalancing"></a> Cooperative rebalancing, and how to roll it out
+
+With the default (eager) rebalancing, every member gives up all of its partitions at the start of a rebalance and gets a new set at the end, so the whole group stops consuming for the length of the round. With cooperative rebalancing a member only gives up the partitions it is actually losing, and keeps consuming the rest throughout.
+
+The protocol is chosen once, when you create the consumer: it is the strongest protocol *every* assigner in your list supports. `cooperativeSticky` supports both, and the other three support only eager — so a list containing any of them is an eager list. That is what makes a safe rollout possible, and it is why turning cooperative rebalancing on takes **two deploys**:
+
+```javascript
+const { PartitionAssigners: { roundRobin, cooperativeSticky } } = require('@countly/kafkajs')
+
+// Deploy 1 — every member learns the new assigner. Still eager.
+kafka.consumer({ groupId: 'my-group', partitionAssigners: [roundRobin, cooperativeSticky] })
+
+// Deploy 2 — only once every member is running deploy 1. Now cooperative.
+kafka.consumer({ groupId: 'my-group', partitionAssigners: [cooperativeSticky] })
+```
+
+Every consumer logs one INFO line when you create it, naming the rebalance protocol it selected and the assigners it selected it from, so you can see which of the two deploys a running process is on.
+
+Going straight to deploy 2 splits the group: members still running the old code and members running the new one share no assigner name, and the coordinator rejects the join with `INCONSISTENT_GROUP_PROTOCOL` until the rollout finishes. During deploy 2 the group is briefly mixed — some members computing eagerly, some cooperatively — which is safe, because the eager ones have already given up everything before they rejoin and the cooperative algorithm never hands a partition to a member that still owns it.
+
 ## <a name="custom-partition-assigner"></a> Custom partition assigner
 
 It's possible to configure the strategy the consumer will use to distribute partitions amongst the consumer group. KafkaJS has a round robin assigner configured by default.
@@ -469,6 +511,10 @@ const MyPartitionAssigner = ({ cluster }) => ({
 ```
 
 Your `protocol` method will probably look like the example, but it's not implemented by default because extra data can be included as `userData`. Take a look at the `MemberMetadata#encode` for more information.
+
+As of 3.0.0 the object passed to `protocol` carries three more keys beside `topics` — `ownedPartitions` (the partitions this member holds right now), `generationId` and `rackId` — which an assigner that only cares about topics can keep ignoring, exactly as the example above does. Two optional methods go with them, and both may be left out: `supportedProtocols()` returns the rebalance protocols your assigner can take part in (leaving it out means `['eager']`, which is what every 2.2.4 assigner gets), and `onAssignment(assignment, metadata)` is called after every successful rebalance — and with `null` when the member leaves the group or loses its generation — if your assigner needs to remember what it was given.
+
+The example above declares `version: 1`, and its code is still correct as written, but one thing about it changed in 3.0.0: the subscription format is positional, so the version you declare now decides which fields go on the wire. An assigner declaring `version: 1` therefore emits the v1 layout (four more bytes, an empty `ownedPartitions` list). That is harmless between members of this client, and it is what a Java group leader needs in order to read the subscription at all. Declare `version: 0` if your assigner only ever sends topics and `userData`.
 
 Once your assigner is done, add it to the list of assigners. It's important to keep the default assigner there to allow the old consumers to have a common ground with the new consumers when deploying.
 

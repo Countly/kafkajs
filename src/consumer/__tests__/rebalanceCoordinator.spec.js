@@ -1502,4 +1502,89 @@ describe('Consumer > RebalanceCoordinator', () => {
       expect(consumerGroup.clearStaleAssignmentPending).toHaveBeenCalled()
     })
   })
+
+  describe('the documented REBALANCING reasons', () => {
+    /**
+     * The union `types/index.d.ts` and `docs/InstrumentationEvents.md` publish. Every value is
+     * driven below from its own trigger, and the set is compared both ways: a documented reason
+     * nothing produces fails, and a reason no documentation names fails too.
+     */
+    const DOCUMENTED = [
+      'coordinator-changed',
+      'lost',
+      'partitions-revoked',
+      'poll-interval-exceeded',
+      'rebalance-in-progress',
+      'stale-assignment',
+    ]
+
+    it('are exactly the reasons the triggers produce', async () => {
+      const observed = new Set()
+      const collect = ({ emitted }) => {
+        for (const { reason } of payloadsOf(emitted, events.REBALANCING)) {
+          observed.add(reason)
+        }
+      }
+
+      // Each error goes through `classify`, so the reason comes from the contract and not the test.
+      for (const error of [
+        createErrorFromCode(REBALANCE_IN_PROGRESS),
+        { type: 'REBALANCE_IN_PROGRESS' },
+        createErrorFromCode(ILLEGAL_GENERATION),
+        createErrorFromCode(UNKNOWN_MEMBER_ID),
+        createErrorFromCode(COORDINATOR_LOAD_IN_PROGRESS),
+        createErrorFromCode(NOT_COORDINATOR_FOR_GROUP),
+        { type: 'NOT_COORDINATOR_FOR_GROUP' },
+      ]) {
+        const built = build()
+        const verdict = built.coordinator.classify(error, 'heartbeat')
+        await built.coordinator.runRound(verdict.reason, verdict.kind)
+        collect(built)
+      }
+
+      // A poll-interval overrun: the expiry sequence raises the verdict, the round reports it.
+      const expired = build()
+      await expired.coordinator.onPollExpired({ elapsedMs: 9000, isStatic: false })
+      const pollVerdict = expired.coordinator.takeVerdict()
+      await expired.coordinator.runRound(pollVerdict.reason, pollVerdict.kind)
+      collect(expired)
+      expect(expired.fetchManager.stop).toHaveBeenCalled()
+
+      // A cooperative round that revoked something schedules the follow-up round that reports it.
+      const cooperative = build({
+        mode: COOPERATIVE,
+        deltas: [{ revoked: [{ topic: 't', partitions: [0] }] }],
+      })
+      await cooperative.coordinator.runRound('rebalance-in-progress', 'revoked')
+      collect(cooperative)
+      expect(cooperative.consumerGroup.joinAndSync).toHaveBeenCalledTimes(2)
+
+      // A stale assignment, through the production path: a fetch error a real ConsumerGroup
+      // recovers from, never a hand-made verdict.
+      const { group } = createRealGroup()
+      const built = build({ mode: COOPERATIVE })
+      const stale = { emitted: [] }
+      const coordinator = new RebalanceCoordinator({
+        runner: built.runner,
+        consumerGroup: group,
+        fetchManager: built.fetchManager,
+        heartbeatManager: built.heartbeatManager,
+        pollTimer: new PollTimer({ pollDeadline: 8000 }),
+        instrumentationEmitter: group.instrumentationEmitter,
+        logger: newLogger(),
+        groupId: 'real-group',
+      })
+      group.instrumentationEmitter.addListener(events.REBALANCING, ({ type, payload }) =>
+        stale.emitted.push({ type, payload })
+      )
+      group.attach({ rebalanceCoordinator: coordinator, heartbeatManager: null })
+      // The join never settles, which keeps the round out of a real broker: the REBALANCING is
+      // emitted before the JoinGroup, so the reason is observable without one.
+      jest.spyOn(group, 'joinAndSync').mockImplementation(() => new Promise(() => {}))
+      await group.recoverFromFetch(createErrorFromCode(6)) // NOT_LEADER_FOR_PARTITION
+      collect(stale)
+
+      expect([...observed].sort()).toEqual(DOCUMENTED)
+    })
+  })
 })

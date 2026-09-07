@@ -284,3 +284,149 @@ change not listed here did not change observable behavior.
   fetches that partition unvalidated rather than stalling. Partitions whose epoch did not change are
   fetched throughout. In practice this is a latency change measured in milliseconds, visible only
   around leader elections and at the first fetch of a new assignment, and never a stall.
+
+### Phase 6A — classic-protocol consumer foundation
+
+- **The rebalance timeout default changes from 60 s to 5 minutes.** The rebalance timeout sent to
+  the coordinator is now the new `maxPollInterval` option, which defaults to 300000 ms and matches
+  the Java client's `max.poll.interval.ms`. If you never set `rebalanceTimeout`, a member that stops
+  responding now holds up a group rebalance for up to 5 minutes instead of 60 seconds. **To keep the
+  old 60 s rebalance timing, set `rebalanceTimeout: 60000`** — the legacy option still goes on the
+  wire unchanged, and it never becomes a handler deadline below 5 minutes (see the third item).
+  Setting `maxPollInterval: 60000` instead would also shorten your handler deadline to 60 s, which
+  is usually not what you want. One related timing does change if you had raised the rebalance
+  timeout above 60 s: the client-side timeout on the SyncGroup request is now capped at 65 s, where
+  it used to follow the rebalance timeout, so a `rebalanceTimeout: 120000` waits 65 s for the
+  assignment instead of 125 s. That is what the Java client sends. If your group leader genuinely
+  needs longer to compute an assignment, raise the client-wide `requestTimeout`, which still raises
+  this one with it. At the default nothing changes: it was 65 s and it stays 65 s.
+- **A handler that runs longer than the poll deadline now loses its partitions.** There is now a
+  poll-interval guard, as in the Java client. If your `eachMessage`/`eachBatch` handler takes longer
+  than `maxPollInterval` (5 minutes by default) to return, the consumer logs a warning, emits
+  `consumer.poll_interval_exceeded`, leaves the group (or, for a static member, resets its
+  generation and keeps its slot), discards uncommitted offsets and rejoins. Two details are worth
+  knowing. The deadline is measured **per batch handed to your handler**, not per message: with
+  `eachMessage`, one KafkaJS batch is bounded by `maxBytesPerPartition` rather than by a record
+  count, so a very large batch is measured as a whole — unlike the Java client, which resets the
+  clock on every poll of at most `max.poll.records`. And the overrun is noticed on the next
+  heartbeat tick after the deadline passes, never while a JoinGroup is in flight. **The guard is
+  weaker than it sounds whenever more than one fetch can make progress**: the deadline is reset on
+  every batch hand-off *and* on every fetch round that comes back empty, and fetching is done by one
+  fetcher per broker, so it fires only when every one of those fetchers is stalled behind the
+  overrunning handler. A single stuck handler does not trip it while another broker's fetcher keeps
+  polling or another partition keeps flowing — in practice that means a single-broker assignment
+  with `partitionsConsumedConcurrently: 1`. The batch the overrunning handler finally returns is
+  dropped, so that work is redelivered after the rejoin.
+  In kafkajs 2.2.4 a long handler was never evicted as long as it called `heartbeat()`. If you have
+  handlers that legitimately run for a long time, set `maxPollInterval` to cover them.
+- **`rebalanceTimeout` is deprecated, and it does not become your eviction deadline.** It still
+  works, it still goes on the wire when it is the only one of the two you set, and
+  `rebalanceTimeout: 0` is unchanged — including its request timeouts, which still fall back to
+  `sessionTimeout + 5000`. What it does **not** do is become the poll-interval guard: a legacy
+  configuration's handler deadline is `max(rebalanceTimeout, 300000)`, so a 20 s or 60 s rebalance
+  timeout never turns into a 20 s or 60 s handler deadline. Set `maxPollInterval` explicitly to make
+  the two one number, as Java does. Setting `rebalanceTimeout` now logs a deprecation warning once
+  per consumer you create.
+- **Heartbeats now happen on a timer — with one limit.** Heartbeats are sent by a background timer
+  at `heartbeatInterval`, so a handler that *awaits* no longer risks a session timeout while it
+  works. A handler that blocks the event loop without awaiting still blocks them, because Node has
+  one thread; that case is unchanged from 2.2.4, and such a handler also cannot trigger its own
+  poll-interval eviction. The `heartbeat()` callback keeps working exactly as before: it and the
+  timer share one in-flight request and one interval gate, so neither sends twice. Because the timer
+  is a second source of heartbeats, a test that counts `consumer.heartbeat` events over a run will
+  see more of them than it did in 2.2.4.
+- **Cooperative rebalancing is available, opt-in, and needs two deploys.**
+  `PartitionAssigners.cooperativeSticky` implements KIP-429, where a member keeps the partitions it
+  is not losing instead of giving up everything at the start of each round. Turning it on takes two
+  deploys, exactly as it does for the Java client:
+
+  ```javascript
+  // Deploy 1 — every member learns the new assigner. Still eager.
+  partitionAssigners: [PartitionAssigners.roundRobin, PartitionAssigners.cooperativeSticky]
+
+  // Deploy 2 — only once every member is running deploy 1. Now cooperative.
+  partitionAssigners: [PartitionAssigners.cooperativeSticky]
+  ```
+
+  The protocol is chosen when you create the consumer, as the strongest one *every* configured
+  assigner supports, so deploy 1 is still eager. During deploy 2 the group is briefly mixed —
+  members on deploy 1 computing eagerly, restarted ones computing cooperatively, with the
+  coordinator picking `cooperative-sticky` for everyone because it is the only name they share. That
+  is safe by construction: the eager members have already given up everything before they rejoin,
+  and the cooperative algorithm never hands a partition to a member that still owns it. Going
+  straight to deploy 2 splits the group with `INCONSISTENT_GROUP_PROTOCOL` until the rollout
+  finishes.
+- **Java-compatible assigners are available.** `PartitionAssigners.range`, `.sticky` and
+  `.cooperativeSticky` implement the Java algorithms and advertise the Java names `range`, `sticky`
+  and `cooperative-sticky`, so a group can mix this client with Java consumers. The export key and
+  the name on the wire are different things: the default assigner keeps the wire name
+  `RoundRobinAssigner`, which no Java client understands — renaming it would split every existing
+  group — and the default assigner list is unchanged at `[PartitionAssigners.roundRobin]`, so a
+  consumer you do not reconfigure behaves exactly as before. Rack-aware assignment is not
+  implemented: `rackId` is sent to the leader and ignored when partitions are assigned. One
+  small caveat if you run a mixed group: on a shape where more than one balanced sticky assignment
+  is equally correct — an incumbent tie-break during a scale-up — a Java leader and a leader running
+  this client can pick different ones, so a leader change between the two may move one partition
+  more than Java alone would. The result is always balanced and always valid.
+- **New instrumentation events, and two payloads gain a field.** `consumer.partitions_assigned`,
+  `consumer.partitions_revoked`, `consumer.partitions_lost` and `consumer.poll_interval_exceeded`
+  are new, and the first three fire on the default eager path as well as the cooperative one.
+  `consumer.rebalancing` gains a `reason` and `consumer.group_join` a `rebalanceProtocol`;
+  `group_join`'s `groupProtocol` still carries the assignor name and `memberAssignment` is still the
+  full assignment. Every key those payloads already had is unchanged, so only code that
+  deep-equality-compares a whole payload needs attention. One value does move: the
+  `consumer.rebalancing` raised by an `UNKNOWN_MEMBER_ID` now reports `memberId: null` rather than
+  the member id the coordinator had just rejected, because the id is dropped before the rejoin is
+  reported — the payload names the id the round will actually join with. Code that reads
+  `payload.memberId` from this event to correlate a rebalance should fall back to the id from the
+  following `consumer.group_join`.
+- **Two new log lines for configurations that changed nothing.** Every consumer now logs one INFO
+  line at construction naming the rebalance protocol it selected and the assigners it selected it
+  from, and a WARN if you set the deprecated `rebalanceTimeout` (or set it together with a
+  `maxPollInterval` that disagrees, in which case `maxPollInterval` wins). A third WARN is new for a
+  configuration that was already legal: a `heartbeatInterval` above a third of `sessionTimeout`. The
+  existing hard failure when `heartbeatInterval` is not lower than `sessionTimeout` is unchanged.
+  None of these change behavior; they are new output at the default log level.
+- **On the cooperative path, `heartbeat()` no longer throws when a rebalance starts.** With a
+  cooperative assigner configured, a `REBALANCE_IN_PROGRESS` no longer propagates out of the
+  `heartbeat()` callback into your handler: the call resolves and the rejoin runs in the background
+  while your handler keeps its partitions. `consumer.stop()` and `disconnect()` wait for that
+  background round to finish before leaving the group, so shutdown is unaffected. On the default
+  eager path the behavior is unchanged — the callback still throws and your handler is interrupted.
+  If you catch and act on that error today, note that it will stop firing once you opt into
+  cooperative rebalancing.
+- **A custom assigner that declares a subscription version above 0 now emits that version's
+  layout.** The subscription your assigner's `protocol()` builds with
+  `AssignerProtocol.MemberMetadata.encode` is a positional format, and the `version` you declare
+  decides which fields are written. Previously every declared version wrote the same three fields,
+  so a `version: 1` subscription carried a v0 body under a v1 header — readable by another kafkajs
+  member and unreadable by anything that decodes it at the version it claims, which is what the Java
+  client does. An assigner declaring `version: 0` is byte-identical to before, including the
+  built-in round-robin assigner and therefore the default configuration. An assigner declaring
+  `version: 1` now emits four more bytes, an empty `OwnedPartitions` list, and higher versions
+  likewise write the fields they define, each omitted value taking its Kafka default. This is what
+  makes a custom assigner's subscription readable by a Java group leader, and it is what a mixed
+  Java/JavaScript group needs. If you declared a version whose fields you never send, either drop to
+  `version: 0` or start sending them; see the custom-assigner example in
+  [Consuming.md](Consuming.md#custom-partition-assigner).
+- **An eager rebalance now stops the world before it rejoins, and stale batches are dropped.** On
+  the default eager path — and on any rebalance where the coordinator has invalidated this member's
+  generation — the consumer stops fetching and waits for every running `eachMessage`/`eachBatch` to
+  return before it commits or discards offsets and rejoins, which is what the Java client does by
+  only rebalancing between polls. Two things follow. The rejoin is delayed by however long your
+  handler takes to return from the batch it is on, bounded in practice by `maxPollInterval`. And a
+  batch that was fetched under the previous assignment is dropped rather than handed to your
+  handler: its records are fetched again after the group has rejoined, where before they could
+  arrive twice — once from the queued batch and once from the new assignment re-reading the same
+  offsets. A rebalance also issues exactly one auto-commit now; the heartbeat path and the fetch
+  path each used to issue one, so a default eager rebalance sent two OffsetCommits. On the
+  cooperative path nothing waits, which is the point of it.
+- **`resolveOffset` and `commitOffsetsIfNecessary` are ignored for a partition you no longer hold.**
+  This only comes up under cooperative rebalancing, where a round runs alongside your handler. A
+  handler that is already running when its partition is revoked still runs to completion — it is
+  never interrupted — but its position updates and commits for that partition are dropped, because
+  another member owns it by then and committing would roll that member's position back. Batches
+  fetched for a revoked partition are dropped before the handler for the same reason. When you pass
+  your own offsets to `commitOffsetsIfNecessary(offsets)` from `eachBatch`, the payload is filtered
+  per partition rather than rejected as a whole: the partitions you still hold are committed and the
+  rest are dropped, so one revoked partition in a payload does not cost you the others.
