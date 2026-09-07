@@ -1,0 +1,47 @@
+{
+  "assignor": "range",
+  "caseId": "even_split",
+  "subscriptionVersion": 3,
+  "assignmentVersion": 3,
+  "nodes": [
+    { "id": 0, "host": "broker-0", "port": 9092 },
+    { "id": 1, "host": "broker-1", "port": 9092 }
+  ],
+  "topics": {
+    "t-a": [{ "partition": 0, "leader": 0 }, { "partition": 1, "leader": 1 }, { "partition": 2, "leader": 0 }, { "partition": 3, "leader": 1 }]
+  },
+  "members": [
+    {
+      "memberId": "m-1",
+      "groupInstanceId": null,
+      "topics": ["t-a"],
+      "ownedPartitions": [],
+      "generationId": -1,
+      "rackId": null,
+      "userDataHex": null,
+      "subscriptionBytesHex": "0003000000010003742d61ffffffff00000000ffffffffffff"
+    },
+    {
+      "memberId": "m-2",
+      "groupInstanceId": null,
+      "topics": ["t-a"],
+      "ownedPartitions": [],
+      "generationId": -1,
+      "rackId": null,
+      "userDataHex": null,
+      "subscriptionBytesHex": "0003000000010003742d61ffffffff00000000ffffffffffff"
+    }
+  ],
+  "expected": {
+    "m-1": {
+      "t-a": [0, 1]
+    },
+    "m-2": {
+      "t-a": [2, 3]
+    }
+  },
+  "expectedAssignmentBytesHex": {
+    "m-1": "0003000000010003742d61000000020000000000000001ffffffff",
+    "m-2": "0003000000010003742d61000000020000000200000003ffffffff"
+  }
+}

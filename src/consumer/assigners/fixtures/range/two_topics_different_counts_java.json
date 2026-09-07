@@ -1,0 +1,65 @@
+{
+  "assignor": "range",
+  "caseId": "two_topics_different_counts",
+  "subscriptionVersion": 3,
+  "assignmentVersion": 3,
+  "nodes": [
+    { "id": 0, "host": "broker-0", "port": 9092 },
+    { "id": 1, "host": "broker-1", "port": 9092 }
+  ],
+  "topics": {
+    "t-a": [{ "partition": 0, "leader": 0 }, { "partition": 1, "leader": 1 }, { "partition": 2, "leader": 0 }, { "partition": 3, "leader": 1 }],
+    "t-b": [{ "partition": 0, "leader": 0 }, { "partition": 1, "leader": 1 }, { "partition": 2, "leader": 0 }, { "partition": 3, "leader": 1 }, { "partition": 4, "leader": 0 }, { "partition": 5, "leader": 1 }, { "partition": 6, "leader": 0 }]
+  },
+  "members": [
+    {
+      "memberId": "m-1",
+      "groupInstanceId": null,
+      "topics": ["t-a", "t-b"],
+      "ownedPartitions": [],
+      "generationId": -1,
+      "rackId": null,
+      "userDataHex": null,
+      "subscriptionBytesHex": "0003000000020003742d610003742d62ffffffff00000000ffffffffffff"
+    },
+    {
+      "memberId": "m-2",
+      "groupInstanceId": null,
+      "topics": ["t-a", "t-b"],
+      "ownedPartitions": [],
+      "generationId": -1,
+      "rackId": null,
+      "userDataHex": null,
+      "subscriptionBytesHex": "0003000000020003742d610003742d62ffffffff00000000ffffffffffff"
+    },
+    {
+      "memberId": "m-3",
+      "groupInstanceId": null,
+      "topics": ["t-a", "t-b"],
+      "ownedPartitions": [],
+      "generationId": -1,
+      "rackId": null,
+      "userDataHex": null,
+      "subscriptionBytesHex": "0003000000020003742d610003742d62ffffffff00000000ffffffffffff"
+    }
+  ],
+  "expected": {
+    "m-1": {
+      "t-a": [0, 1],
+      "t-b": [0, 1, 2]
+    },
+    "m-2": {
+      "t-a": [2],
+      "t-b": [3, 4]
+    },
+    "m-3": {
+      "t-a": [3],
+      "t-b": [5, 6]
+    }
+  },
+  "expectedAssignmentBytesHex": {
+    "m-1": "0003000000020003742d62000000030000000000000001000000020003742d61000000020000000000000001ffffffff",
+    "m-2": "0003000000020003742d620000000200000003000000040003742d610000000100000002ffffffff",
+    "m-3": "0003000000020003742d620000000200000005000000060003742d610000000100000003ffffffff"
+  }
+}

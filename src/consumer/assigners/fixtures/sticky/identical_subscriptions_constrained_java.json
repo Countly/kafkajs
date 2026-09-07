@@ -1,0 +1,85 @@
+{
+  "assignor": "sticky",
+  "caseId": "identical_subscriptions_constrained",
+  "subscriptionVersion": 3,
+  "assignmentVersion": 3,
+  "nodes": [
+    { "id": 0, "host": "broker-0", "port": 9092 },
+    { "id": 1, "host": "broker-1", "port": 9092 }
+  ],
+  "topics": {
+    "t-a": [{ "partition": 0, "leader": 0 }, { "partition": 1, "leader": 1 }, { "partition": 2, "leader": 0 }, { "partition": 3, "leader": 1 }, { "partition": 4, "leader": 0 }, { "partition": 5, "leader": 1 }],
+    "t-b": [{ "partition": 0, "leader": 0 }, { "partition": 1, "leader": 1 }, { "partition": 2, "leader": 0 }, { "partition": 3, "leader": 1 }, { "partition": 4, "leader": 0 }, { "partition": 5, "leader": 1 }],
+    "t-c": [{ "partition": 0, "leader": 0 }, { "partition": 1, "leader": 1 }, { "partition": 2, "leader": 0 }, { "partition": 3, "leader": 1 }, { "partition": 4, "leader": 0 }, { "partition": 5, "leader": 1 }]
+  },
+  "members": [
+    {
+      "memberId": "m-1",
+      "groupInstanceId": null,
+      "topics": ["t-a", "t-b", "t-c"],
+      "ownedPartitions": [],
+      "generationId": -1,
+      "rackId": null,
+      "userDataHex": null,
+      "subscriptionBytesHex": "0003000000030003742d610003742d620003742d63ffffffff00000000ffffffffffff"
+    },
+    {
+      "memberId": "m-2",
+      "groupInstanceId": null,
+      "topics": ["t-a", "t-b", "t-c"],
+      "ownedPartitions": [],
+      "generationId": -1,
+      "rackId": null,
+      "userDataHex": null,
+      "subscriptionBytesHex": "0003000000030003742d610003742d620003742d63ffffffff00000000ffffffffffff"
+    },
+    {
+      "memberId": "m-3",
+      "groupInstanceId": null,
+      "topics": ["t-a", "t-b", "t-c"],
+      "ownedPartitions": [],
+      "generationId": -1,
+      "rackId": null,
+      "userDataHex": null,
+      "subscriptionBytesHex": "0003000000030003742d610003742d620003742d63ffffffff00000000ffffffffffff"
+    },
+    {
+      "memberId": "m-4",
+      "groupInstanceId": null,
+      "topics": ["t-a", "t-b", "t-c"],
+      "ownedPartitions": [],
+      "generationId": -1,
+      "rackId": null,
+      "userDataHex": null,
+      "subscriptionBytesHex": "0003000000030003742d610003742d620003742d63ffffffff00000000ffffffffffff"
+    }
+  ],
+  "expected": {
+    "m-1": {
+      "t-a": [0, 4],
+      "t-b": [2],
+      "t-c": [0, 4]
+    },
+    "m-2": {
+      "t-a": [1, 5],
+      "t-b": [3],
+      "t-c": [1, 5]
+    },
+    "m-3": {
+      "t-a": [2],
+      "t-b": [0, 4],
+      "t-c": [2]
+    },
+    "m-4": {
+      "t-a": [3],
+      "t-b": [1, 5],
+      "t-c": [3]
+    }
+  },
+  "expectedAssignmentBytesHex": {
+    "m-1": "0003000000030003742d610000000200000000000000040003742d6200000001000000020003742d63000000020000000000000004ffffffff",
+    "m-2": "0003000000030003742d610000000200000001000000050003742d6200000001000000030003742d63000000020000000100000005ffffffff",
+    "m-3": "0003000000030003742d6100000001000000020003742d620000000200000000000000040003742d630000000100000002ffffffff",
+    "m-4": "0003000000030003742d6100000001000000030003742d620000000200000001000000050003742d630000000100000003ffffffff"
+  }
+}
