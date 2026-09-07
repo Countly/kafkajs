@@ -2,7 +2,6 @@ const sleep = require('../utils/sleep')
 const websiteUrl = require('../utils/websiteUrl')
 const arrayDiff = require('../utils/arrayDiff')
 const createRetry = require('../retry')
-const sharedPromiseTo = require('../utils/sharedPromiseTo')
 
 const OffsetManager = require('./offsetManager')
 const Batch = require('./batch')
@@ -10,15 +9,9 @@ const SeekOffsets = require('./seekOffsets')
 const SubscriptionState = require('./subscriptionState')
 const PositionValidator = require('./positionValidator')
 const {
-  events: { GROUP_JOIN, HEARTBEAT, CONNECT, RECEIVED_UNSUBSCRIBED_TOPICS, LOG_TRUNCATION },
+  events: { GROUP_JOIN, CONNECT, RECEIVED_UNSUBSCRIBED_TOPICS, LOG_TRUNCATION },
 } = require('./instrumentationEvents')
-const { MemberAssignment } = require('./assignerProtocol')
-const {
-  KafkaJSError,
-  KafkaJSNonRetriableError,
-  KafkaJSStaleTopicMetadataAssignment,
-  isRebalancing,
-} = require('../errors')
+const { KafkaJSError, KafkaJSStaleTopicMetadataAssignment, isRebalancing } = require('../errors')
 const { failure, createErrorFromCode } = require('../protocol/error')
 const {
   partitionFetchAction,
@@ -27,6 +20,7 @@ const {
 } = require('./fetchErrorContract')
 const apiKeys = require('../protocol/requests/apiKeys')
 const { requests } = require('../protocol/requests')
+const ClassicGroupProtocol = require('./groupProtocol/classic')
 
 // One warning once a partition has failed five rounds running, then one every twenty-five.
 const FETCH_ERROR_WARN_THRESHOLD = 5
@@ -54,12 +48,6 @@ const STALE_METADATA_ERRORS = [
 // is capped here rather than being split across two versions.
 // @see clients/src/main/resources/common/message/FetchRequest.json (Apache Kafka 4.3.1)
 const FETCH_TOPIC_NAMES_MAX_VERSION = 12
-
-const PRIVATE = {
-  JOIN: Symbol('private:ConsumerGroup:join'),
-  SYNC: Symbol('private:ConsumerGroup:sync'),
-  SHARED_HEARTBEAT: Symbol('private:ConsumerGroup:sharedHeartbeat'),
-}
 
 module.exports = class ConsumerGroup {
   /**
@@ -142,18 +130,24 @@ module.exports = class ConsumerGroup {
     this.isolationLevel = isolationLevel
     this.rackId = rackId
     this.checkCrcs = checkCrcs
-    this.groupInstanceId = groupInstanceId
     this.metadataMaxAge = metadataMaxAge
     this.pendingTopicResets = pendingTopicResets
-    this.staticMembershipInactiveWarned = false
+
+    /** @type {ClassicGroupProtocol} */
+    this.groupMembership = new ClassicGroupProtocol({
+      cluster,
+      groupId,
+      groupInstanceId,
+      sessionTimeout,
+      rebalanceTimeout,
+      assigners,
+      instrumentationEmitter,
+      // `this.logger`, already namespaced, rather than the raw `logger`: the protocol logs through
+      // the same object the group exposes, so anything observing the group's logger keeps working.
+      logger: this.logger,
+    })
 
     this.seekOffset = new SeekOffsets()
-    this.coordinator = null
-    this.generationId = null
-    this.leaderId = null
-    this.memberId = null
-    this.members = null
-    this.groupProtocol = null
 
     this.partitionsPerSubscribedTopic = null
     /**
@@ -193,30 +187,97 @@ module.exports = class ConsumerGroup {
 
     this.offsetManager = null
     this.subscriptionState = new SubscriptionState()
+  }
 
-    this.lastRequest = Date.now()
+  get memberId() {
+    return this.groupMembership.memberId
+  }
 
-    this[PRIVATE.SHARED_HEARTBEAT] = sharedPromiseTo(async ({ interval }) => {
-      const { groupId, generationId, memberId } = this
-      const now = Date.now()
+  set memberId(value) {
+    this.groupMembership.memberId = value
+  }
 
-      if (memberId && now >= this.lastRequest + interval) {
-        const payload = {
-          groupId,
-          memberId,
-          groupGenerationId: generationId,
-          groupInstanceId: this.groupInstanceId,
-        }
+  get generationId() {
+    return this.groupMembership.generationId
+  }
 
-        await this.coordinator.heartbeat(payload)
-        this.instrumentationEmitter.emit(HEARTBEAT, payload)
-        this.lastRequest = Date.now()
-      }
-    })
+  set generationId(value) {
+    this.groupMembership.generationId = value
+  }
+
+  get leaderId() {
+    return this.groupMembership.leaderId
+  }
+
+  set leaderId(value) {
+    this.groupMembership.leaderId = value
+  }
+
+  get members() {
+    return this.groupMembership.members
+  }
+
+  set members(value) {
+    this.groupMembership.members = value
+  }
+
+  get groupProtocol() {
+    return this.groupMembership.groupProtocol
+  }
+
+  set groupProtocol(value) {
+    this.groupMembership.groupProtocol = value
+  }
+
+  get groupInstanceId() {
+    return this.groupMembership.groupInstanceId
+  }
+
+  set groupInstanceId(value) {
+    this.groupMembership.groupInstanceId = value
+  }
+
+  get coordinator() {
+    return this.groupMembership.coordinator
+  }
+
+  set coordinator(value) {
+    this.groupMembership.coordinator = value
+  }
+
+  get lastRequest() {
+    return this.groupMembership.lastRequest
+  }
+
+  set lastRequest(value) {
+    this.groupMembership.lastRequest = value
   }
 
   isLeader() {
-    return this.leaderId && this.memberId === this.leaderId
+    return this.groupMembership.isLeader()
+  }
+
+  /** @returns {import('./groupProtocol/interface').RebalanceProtocol} */
+  rebalanceProtocol() {
+    return this.groupMembership.rebalanceProtocol()
+  }
+
+  /**
+   * Warns once when static membership is configured but the negotiated JoinGroup version cannot
+   * carry it. Kept on the group because callers reach for it here.
+   * @returns {void}
+   */
+  warnIfStaticMembershipInactive() {
+    return this.groupMembership.warnIfStaticMembershipInactive()
+  }
+
+  /**
+   * Leaves the group, so the coordinator rebalances immediately instead of waiting for the
+   * session to expire.
+   * @returns {Promise<void>}
+   */
+  async leave() {
+    return this.groupMembership.leave()
   }
 
   getNodeIds() {
@@ -229,135 +290,20 @@ module.exports = class ConsumerGroup {
     await this.cluster.refreshMetadataIfNecessary()
   }
 
-  async [PRIVATE.JOIN]() {
-    const { groupId, sessionTimeout, rebalanceTimeout, groupInstanceId } = this
-
-    this.coordinator = await this.cluster.findGroupCoordinator({ groupId })
-
-    if (groupInstanceId) {
-      this.warnIfStaticMembershipInactive()
-    }
-
-    const groupData = await this.coordinator.joinGroup({
-      groupId,
-      sessionTimeout,
-      rebalanceTimeout,
-      memberId: this.memberId || '',
-      groupInstanceId,
-      groupProtocols: this.assigners.map((assigner) =>
-        assigner.protocol({
-          topics: this.topicsSubscribed,
-        })
-      ),
-    })
-
-    this.generationId = groupData.generationId
-    this.leaderId = groupData.leaderId
-    this.memberId = groupData.memberId
-    this.members = groupData.members
-    this.groupProtocol = groupData.groupProtocol
-    // JoinGroup v5's response carries no group_instance_id field for this member: it only
-    // appears per-entry in `members`, populated for the leader. this.groupInstanceId is the
-    // value the caller configured and must not be overwritten with undefined here.
-  }
-
   /**
-   * Warn once (per instance) when `groupInstanceId` is configured but the coordinator negotiated a
-   * JoinGroup version below 5: only v5+ carries `group_instance_id` on the wire (KIP-345), so
-   * static membership is silently inactive on an older negotiated version.
+   * Applies one sync result to this member's local state and reports what changed.
    *
-   * The version comes from the protocol layer's own selection rule rather than being recomputed
-   * here. A coordinator that advertises no usable JoinGroup at all answers `null` and this returns
-   * quietly, matching the previous behaviour — `lookupRequest` would have thrown, inside the sync.
-   * @see https://cwiki.apache.org/confluence/display/KAFKA/KIP-345%3A+Introduce+static+membership+protocol+to+reduce+consumer+rebalances
-   * @returns {void}
+   * Filters out topics the member is not subscribed to, refreshes metadata once when the
+   * assignment names a partition the member has never heard of, replaces the assignment and
+   * rebuilds the offset manager, and clears the per-assignment caches. Emits exactly one event,
+   * `RECEIVED_UNSUBSCRIBED_TOPICS`, which it already owned.
+   *
+   * @param {{ assignment: Object }} result the decoded sync result
+   * @returns {Promise<import('./groupProtocol/interface').RebalanceResult>}
    */
-  warnIfStaticMembershipInactive() {
-    if (this.staticMembershipInactiveWarned) {
-      return
-    }
-
-    const negotiatedVersion = this.coordinator.negotiatedVersion(
-      apiKeys.JoinGroup,
-      requests.JoinGroup
-    )
-
-    if (negotiatedVersion == null) {
-      return
-    }
-
-    if (negotiatedVersion < 5) {
-      this.logger.warn(
-        `groupInstanceId is set but the broker negotiated JoinGroup v${negotiatedVersion} - static membership is inactive`,
-        { groupId: this.groupId, groupInstanceId: this.groupInstanceId, negotiatedVersion }
-      )
-    }
-
-    this.staticMembershipInactiveWarned = true
-  }
-
-  async leave() {
-    const { groupId, memberId, groupInstanceId } = this
-    if (memberId) {
-      await this.coordinator.leaveGroup({ groupId, memberId, groupInstanceId })
-      this.memberId = null
-    }
-  }
-
-  async [PRIVATE.SYNC]() {
-    let assignment = []
-    const {
-      groupId,
-      generationId,
-      memberId,
-      members,
-      groupProtocol,
-      topics,
-      topicsSubscribed,
-      coordinator,
-      sessionTimeout,
-      rebalanceTimeout,
-      groupInstanceId,
-    } = this
-
-    if (this.isLeader()) {
-      this.logger.debug('Chosen as group leader', { groupId, generationId, memberId, topics })
-      const assigner = this.assigners.find(({ name }) => name === groupProtocol)
-
-      if (!assigner) {
-        throw new KafkaJSNonRetriableError(
-          `Unsupported partition assigner "${groupProtocol}", the assigner wasn't found in the assigners list`
-        )
-      }
-
-      await this.cluster.refreshMetadata()
-      assignment = await assigner.assign({ members, topics: topicsSubscribed })
-
-      this.logger.debug('Group assignment', {
-        groupId,
-        generationId,
-        groupProtocol,
-        assignment,
-        topics: topicsSubscribed,
-      })
-    }
-
-    // Keep track of the partitions for the subscribed topics
-    this.partitionsPerSubscribedTopic = this.generatePartitionsPerSubscribedTopic()
-    const { memberAssignment } = await this.coordinator.syncGroup({
-      groupId,
-      generationId,
-      memberId,
-      groupInstanceId,
-      groupAssignment: assignment,
-      sessionTimeout,
-      rebalanceTimeout,
-    })
-
-    const decodedMemberAssignment = MemberAssignment.decode(memberAssignment)
-    const decodedAssignment =
-      decodedMemberAssignment != null ? decodedMemberAssignment.assignment : {}
-
+  async applyRebalanceResult(result) {
+    const { groupId, generationId, memberId, topicsSubscribed, coordinator } = this
+    const decodedAssignment = result.assignment
     this.logger.debug('Received assignment', {
       groupId,
       generationId,
@@ -423,6 +369,9 @@ module.exports = class ConsumerGroup {
     }
 
     this.topics = currentMemberAssignment.map(({ topic }) => topic)
+
+    const { added, revoked } = this.groupMembership.diffAssignment(currentMemberAssignment)
+
     this.subscriptionState.assign(currentMemberAssignment)
     this.offsetManager = new OffsetManager({
       cluster: this.cluster,
@@ -448,14 +397,32 @@ module.exports = class ConsumerGroup {
     this.consecutiveFetchErrors.clear()
     this.positionValidator.clear()
     this.validationUnusableLogged.clear()
+
+    this.groupMembership.setOwned(currentMemberAssignment)
+
+    return { assignment: currentMemberAssignment, added, revoked }
   }
 
+  /**
+   * Joins the group, syncs, and applies the resulting assignment, retrying the whole sequence on
+   * a rebalance-class error. `REBALANCE_IN_PROGRESS` is not a retriable protocol error on its own
+   * - the member has to go back through FindCoordinator and JoinGroup - so it is re-thrown as a
+   * retriable `KafkaJSError` to restart the sequence through the retrier.
+   * @returns {Promise<{ assignment: Object }>} the decoded sync result
+   */
   joinAndSync() {
     const startJoin = Date.now()
     return this.retrier(async (bail) => {
       try {
-        await this[PRIVATE.JOIN]()
-        await this[PRIVATE.SYNC]()
+        const result = await this.groupMembership.rebalance({
+          topics: this.topics,
+          topicsSubscribed: this.topicsSubscribed,
+          beforeSync: () => {
+            this.partitionsPerSubscribedTopic = this.generatePartitionsPerSubscribedTopic()
+          },
+        })
+
+        await this.applyRebalanceResult(result)
 
         const memberAssignment = this.assigned().reduce(
           (result, { topic, partitions }) => ({ ...result, [topic]: partitions }),
@@ -474,12 +441,10 @@ module.exports = class ConsumerGroup {
 
         this.instrumentationEmitter.emit(GROUP_JOIN, payload)
         this.logger.info('Consumer has joined the group', payload)
+
+        return result
       } catch (e) {
         if (isRebalancing(e)) {
-          // Rebalance in progress isn't a retriable protocol error since the consumer
-          // has to go through find coordinator and join again before it can
-          // actually retry the operation. We wrap the original error in a retriable error
-          // here instead in order to restart the join + sync sequence using the retrier.
           throw new KafkaJSError(e)
         }
 
@@ -602,7 +567,7 @@ module.exports = class ConsumerGroup {
   }
 
   async heartbeat({ interval }) {
-    return this[PRIVATE.SHARED_HEARTBEAT]({ interval })
+    return this.groupMembership.heartbeat({ interval })
   }
 
   /**

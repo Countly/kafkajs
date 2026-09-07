@@ -186,6 +186,8 @@ Upstream work this phase builds on, with thanks to its authors: PRs #1779, #1695
 
 #### Additions
 
+- Membership (the group coordinator handle, JoinGroup/SyncGroup/Heartbeat/LeaveGroup, the member id and generation, and assignor selection) moved out of the consumer group into a dedicated classic-protocol object, leaving the fetch loop, offsets, seek and pause where they were. No behavior, no wire bytes and no public API changed — the four group requests are byte-identical to the recorded golden frames.
+
 #### Tooling
 
 - New development-only benchmark `scripts/benchmarks/rebalanceLatency.js`, measuring the time from a member joining a group to the next batch delivered on a partition the existing member keeps across the round. Its eager baseline, measured on the previous release, is committed at `scripts/benchmarks/baselines/rebalanceLatency.json` so later runs are comparable. Not part of `npm test`.
