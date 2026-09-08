@@ -10,9 +10,12 @@ const { KafkaJSFetcherRebalanceError, KafkaJSNoBrokerAvailableError } = require(
  * @param {object} options
  * @param {import('../../types').Logger} options.logger
  * @param {() => number[]} options.getNodeIds
- * @param {(nodeId: number) => Promise<import('../../types').Batch[]>} options.fetch
+ * @param {(nodeId: number, options?: { offsetOverrides: Map<string, string>, prefetch: boolean }) => Promise<import('../../types').Batch[]>} options.fetch
  * @param {import('./worker').Handler<T>} options.handler
  * @param {number} [options.concurrency]
+ * @param {0|1} [options.maxPrefetchBatches=0] forwarded to every fetcher; `0` disables prefetching
+ * @param {(batch: import('../../types').Batch) => boolean} [options.isFullyResolved] forwarded to
+ *        every fetcher; a fetcher without it never prefetches
  * @template T
  */
 const createFetchManager = ({
@@ -21,6 +24,8 @@ const createFetchManager = ({
   fetch,
   handler,
   concurrency = 1,
+  maxPrefetchBatches = 0,
+  isFullyResolved,
 }) => {
   const logger = rootLogger.namespace('FetchManager')
   const workers = seq(concurrency, (workerId) => createWorker({ handler, workerId }))
@@ -59,11 +64,13 @@ const createFetchManager = ({
         nodeId,
         workerQueue,
         partitionAssignments,
-        fetch: async (nodeId) => {
+        fetch: async (nodeId, options) => {
           validateShouldRebalance()
-          return fetch(nodeId)
+          return fetch(nodeId, options)
         },
         logger,
+        maxPrefetchBatches,
+        isFullyResolved,
       })
     )
 

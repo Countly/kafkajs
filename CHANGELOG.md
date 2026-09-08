@@ -248,6 +248,8 @@ Adopted upstream PRs are credited here by number as they land (Phase 2 onward).
 
 - **A cooperative rebalance now commits the partitions it gives up, before it gives them up.** With `autoCommit: true` and a cooperative assigner (`CooperativeStickyAssigner`, or any assigner selecting the cooperative protocol), a round that revokes partitions now commits whatever your handler resolved on those partitions before they are pruned, using the generation the round just established. Previously those offsets were dropped, so a partition moving between members redelivered everything since the last periodic commit. The commit is best-effort: any failure — including a lost membership — is logged at warn and the rebalance proceeds, exactly as the Java client does. With `autoCommit: false` nothing changes: your `eachBatch` commits stay yours. Eager rounds are unaffected — they already committed everything before joining.
 
+- With `maxPrefetchBatches: 1`, a prefetch round that comes back empty counts as a poll and can reset the poll deadline while one of your handlers is still running. The effect is bounded to at most one extra `maxPollInterval` per stuck handler, and it does not exist at the default `maxPrefetchBatches: 0`.
+
 #### Fixes
 
 #### Additions
@@ -287,6 +289,8 @@ Adopted upstream PRs are credited here by number as they land (Phase 2 onward).
 - Offset commits and fetches follow the group protocol: under `groupProtocol: 'consumer'` the commit carries the member epoch (OffsetCommit v9's `GenerationIdOrMemberEpoch`) and the fetch carries `MemberId`/`MemberEpoch` (OffsetFetch v9). Classic consumers and the admin client send neither and are byte-compatible with 2.2.4. A `STALE_MEMBER_EPOCH` (113) answer is handled per call site, as the Java client does: an interval auto-commit is logged and skipped (the next one carries the fresh epoch), the commit a rebalance issues before releasing partitions is re-sent under the new epoch within the rebalance timeout, and a deliberate `commitOffsets()` fails with the protocol error. 113 remains non-retriable, matching `Errors.java`.
 
 - The consumer group is built from a `groupProtocol` option: `'classic'` (the default, unchanged) or `'consumer'` (KIP-848). Under `'consumer'` it also accepts `groupRemoteAssignor` and a regex subscription, and forwards the membership's kind, epoch and heartbeat interval to the components that need them.
+
+- New consumer option `maxPrefetchBatches` (default `0`, the only other accepted value is `1`). At `1`, each fetcher may keep one Fetch in flight while the previous response's batches are still with your handlers, which overlaps network time with handler time. It arms only when every partition of the previous dispatch was fully resolved, the run-ahead offsets are carried on that one request and stored nowhere, and a prefetched batch that no longer matches the resolved offset when it is dispatched is dropped and re-read by the next ordinary fetch — so no record can be skipped, whatever your handler does. At the default `0` the fetch loop reaches no new code path. A value of `2` or more is rejected at construction rather than clamped, because deeper prefetch does not exist yet and accepting the number would freeze the wrong meaning.
 
 #### Tooling
 
