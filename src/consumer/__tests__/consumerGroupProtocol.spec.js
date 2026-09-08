@@ -217,6 +217,14 @@ const startStep = async (h, ctx = context()) => {
   return pending
 }
 
+/**
+ * Lets an un-awaited metadata refresh and the target re-read it triggers settle. Microtasks rather
+ * than a timer: the suite runs on fake timers, and nothing on this path is scheduled on one.
+ */
+const flushRefresh = async () => {
+  for (let i = 0; i < 10; i++) await Promise.resolve()
+}
+
 // The requests the coordinator double receives are the broker method's payload, so the assertions
 // read its field names rather than the wire's.
 const partitionsSentOn = (request) =>
@@ -461,6 +469,204 @@ describe('Consumer > groupProtocol > ConsumerGroupProtocol', () => {
 
       expect(h.refreshedIds).toHaveLength(2)
       expect(h.protocol.needsReconciliation()).toBe(false)
+    })
+  })
+
+  describe('A target naming a topic id this member has never seen', () => {
+    const TARGET_A = assignmentOf([[TOPIC_ID_A, [0]]])
+    const TARGET_A_AND_B = assignmentOf([
+      [TOPIC_ID_A, [0]],
+      [TOPIC_ID_B, [0]],
+    ])
+
+    /**
+     * A member that owns topic-a and has acknowledged it, with every later heartbeat answered by
+     * `later` - the coordinator widening the target with an id the client has never resolved. The
+     * caller ticks, so it can arm the cluster double first.
+     */
+    const memberOwningTopicA = async ({ names, metadataMaxAge = 300000, later }) => {
+      const h = build({
+        names,
+        metadataMaxAge,
+        answers: [heartbeatResponse({ assignment: TARGET_A }), later],
+      })
+
+      await await startStep(h)
+      h.protocol.setOwned([{ topic: 'topic-a', partitions: [0] }])
+      h.rebalanceCoordinator.requestRejoin.mockClear()
+
+      return h
+    }
+
+    it('asks the cluster for that id in the same turn and then reconciles onto the topic', async () => {
+      const names = { [TOPIC_ID_A]: 'topic-a' }
+      const h = await memberOwningTopicA({
+        names,
+        later: heartbeatResponse({ memberEpoch: 2, assignment: TARGET_A_AND_B }),
+      })
+
+      // What a Metadata response by id does to the cache: the name arrives with the response, a
+      // turn after the request, never inside the call.
+      const answerRefresh = h.cluster.refreshMetadataForTopicIds.getMockImplementation()
+      h.cluster.refreshMetadataForTopicIds.mockImplementation(async (ids) => {
+        await Promise.resolve()
+        names[TOPIC_ID_B] = 'topic-b'
+        return answerRefresh(ids)
+      })
+
+      await h.manager.tick()
+
+      // The same turn as the response that named the id: no second heartbeat, and no wait for the
+      // metadata max age, which is the shipped default 300000 here.
+      expect(h.cluster.refreshMetadataForTopicIds).toHaveBeenCalledWith([TOPIC_ID_B])
+      expect(h.sent).toHaveLength(2)
+
+      await flushRefresh()
+
+      expect(h.refreshedIds).toEqual([[TOPIC_ID_B]])
+
+      expect(h.protocol.state).toEqual(RECONCILING)
+      expect(h.rebalanceCoordinator.requestRejoin).toHaveBeenCalledTimes(1)
+      expect((await h.protocol.rebalance(context())).assignment).toEqual({
+        'topic-a': [0],
+        'topic-b': [0],
+      })
+    })
+
+    it('asks once now, then once per metadata max age, and starts the budget over on a new target', async () => {
+      let answer = heartbeatResponse({ memberEpoch: 2, assignment: TARGET_A_AND_B })
+      const h = await memberOwningTopicA({
+        names: { [TOPIC_ID_A]: 'topic-a' },
+        metadataMaxAge: 10000,
+        later: () => answer,
+      })
+
+      await h.manager.tick()
+      expect(h.refreshedIds).toEqual([[TOPIC_ID_B]])
+
+      // Inside the window every heartbeat carries the same target, and nothing is asked again.
+      jest.advanceTimersByTime(5000)
+      await h.manager.tick()
+      expect(h.refreshedIds).toHaveLength(1)
+
+      jest.advanceTimersByTime(6000)
+      await h.manager.tick()
+      expect(h.refreshedIds).toHaveLength(2)
+
+      // Two misses is the whole budget for one target, whatever the immediate ask spent of it.
+      for (let i = 0; i < 3; i++) {
+        jest.advanceTimersByTime(11000)
+        await h.manager.tick()
+      }
+      expect(h.refreshedIds).toHaveLength(2)
+
+      // A new target naming the same id is the coordinator asserting it exists, so it is asked for
+      // again, at once.
+      answer = heartbeatResponse({
+        memberEpoch: 3,
+        assignment: assignmentOf([
+          [TOPIC_ID_A, [0]],
+          [TOPIC_ID_B, [0, 1]],
+        ]),
+      })
+      jest.advanceTimersByTime(5000)
+      await h.manager.tick()
+
+      expect(h.refreshedIds).toHaveLength(3)
+      expect(h.refreshedIds[2]).toEqual([TOPIC_ID_B])
+    })
+
+    it('keeps a failure in the re-read after a refresh off the process', async () => {
+      const names = { [TOPIC_ID_A]: 'topic-a' }
+      const h = await memberOwningTopicA({
+        names,
+        later: heartbeatResponse({ memberEpoch: 2, assignment: TARGET_A_AND_B }),
+      })
+
+      const answerRefresh = h.cluster.refreshMetadataForTopicIds.getMockImplementation()
+      h.cluster.refreshMetadataForTopicIds.mockImplementation(async (ids) => {
+        await Promise.resolve()
+        names[TOPIC_ID_B] = 'topic-b'
+        return answerRefresh(ids)
+      })
+      h.rebalanceCoordinator.requestRejoin.mockImplementation(() => {
+        throw new Error('the round loop is gone')
+      })
+
+      await h.manager.tick()
+      await flushRefresh()
+
+      // The suite-wide unhandled-rejection check is the other half of this assertion: the re-read
+      // runs with no caller, so what it raises would otherwise reach the process.
+      expect(h.logged.debug).toHaveBeenCalledWith(
+        'Could not re-read the target after refreshing its topic ids',
+        expect.objectContaining({ groupId: GROUP_ID, error: 'the round loop is gone' })
+      )
+    })
+
+    it('drops a refresh that lands after the target was cleared', async () => {
+      const names = { [TOPIC_ID_A]: 'topic-a' }
+      const h = await memberOwningTopicA({
+        names,
+        later: heartbeatResponse({ memberEpoch: 2, assignment: TARGET_A_AND_B }),
+      })
+
+      const releases = []
+      h.cluster.refreshMetadataForTopicIds.mockImplementation(async (ids) => {
+        await new Promise((resolve) => releases.push(resolve))
+        names[TOPIC_ID_B] = 'topic-b'
+        return { resolved: ids, unresolved: [] }
+      })
+
+      await h.manager.tick()
+      expect(h.cluster.refreshMetadataForTopicIds).toHaveBeenCalledTimes(1)
+
+      h.protocol.onMembershipError(createErrorFromCode(25))
+      expect(h.protocol.state).toEqual(FENCED)
+
+      releases[0]()
+      await flushRefresh()
+
+      // The target is gone, so there is nothing to re-read: reading it anyway would move a fenced
+      // member and would reach the suite's unhandled-rejection check.
+      expect(h.protocol.state).toEqual(FENCED)
+      expect(h.protocol.target).toBeNull()
+      expect(h.rebalanceCoordinator.requestRejoin).not.toHaveBeenCalled()
+    })
+
+    it('drops a refresh that lands after a newer target superseded the one it was resolving', async () => {
+      const names = { [TOPIC_ID_A]: 'topic-a' }
+      let answer = heartbeatResponse({ memberEpoch: 2, assignment: TARGET_A_AND_B })
+      const h = await memberOwningTopicA({ names, later: () => answer })
+
+      const releases = []
+      h.cluster.refreshMetadataForTopicIds.mockImplementation(async (ids) => {
+        await new Promise((resolve) => releases.push(resolve))
+        names[TOPIC_ID_B] = 'topic-b'
+        return { resolved: ids, unresolved: [] }
+      })
+
+      await h.manager.tick()
+      expect(releases).toHaveLength(1)
+
+      answer = heartbeatResponse({
+        memberEpoch: 3,
+        assignment: assignmentOf([
+          [TOPIC_ID_A, [0]],
+          [TOPIC_ID_B, [0, 1]],
+        ]),
+      })
+      jest.advanceTimersByTime(5000)
+      await h.manager.tick()
+      h.rebalanceCoordinator.requestRejoin.mockClear()
+
+      releases[0]()
+      await flushRefresh()
+
+      // The stale refresh resolved a name the current target also wants, so re-reading it would
+      // ask for a round under an epoch that is no longer this member's.
+      expect(h.rebalanceCoordinator.requestRejoin).not.toHaveBeenCalled()
+      expect(h.protocol.state).toEqual(STABLE)
     })
   })
 

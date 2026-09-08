@@ -1097,6 +1097,14 @@ module.exports = class ConsumerGroupProtocol {
       byTopicId,
     }
 
+    if (changed) {
+      // A new target is the coordinator asserting these ids exist, so the attempt budget starts
+      // over: an id given up on under an older target is worth asking about again.
+      for (const topicId of byTopicId.keys()) {
+        this.unresolvedAttempts.delete(topicId)
+      }
+    }
+
     return changed
   }
 
@@ -1108,12 +1116,14 @@ module.exports = class ConsumerGroupProtocol {
    * @returns {void}
    */
   evaluateTarget({ targetChanged }) {
+    const wasJoining = this.state === JOINING
     const wasReconciling = this.state === RECONCILING
     const resolved = this.resolveFromCache(this.target)
     const grew = this.recordResolution(resolved)
+    const converged = this.matchesOwned(resolved)
 
-    if (this.matchesOwned(resolved)) {
-      if (wasReconciling || this.state === JOINING) {
+    if (converged) {
+      if (wasReconciling || wasJoining) {
         this.transitionTo(STABLE)
       }
     } else {
@@ -1126,14 +1136,69 @@ module.exports = class ConsumerGroupProtocol {
       }
     }
 
-    if (
-      this.unresolvedTopicIds.size &&
-      Date.now() - this.lastMetadataRefreshAt >= this.metadataMaxAge
-    ) {
-      // Deliberately not awaited, and cannot reject: the refresh swallows its own failures, and a
-      // heartbeat must not wait on metadata.
-      this.refreshMetadataForTopicIds([...this.unresolvedTopicIds])
-    }
+    // A reconciliation step resolves unknown ids by id itself, and one is coming for every target
+    // this member has not converged on yet - so the converged case is the only one that can strand
+    // an id with nothing to resolve it.
+    const stepWillResolve = wasJoining || wasReconciling || !converged
+
+    this.refreshUnresolvedTopicIds({ immediate: (targetChanged || grew) && !stepWillResolve })
+  }
+
+  /**
+   * Asks the cluster to name the target's unknown topic ids, and re-reads the target when a name
+   * arrives.
+   *
+   * Immediately when the coordinator has just handed over ids this member cannot name and no
+   * reconciliation step is coming to resolve them - the case nothing else covers, and without it a
+   * topic assigned after the member reached its steady state (a regex match, or a subscribed name
+   * whose topic was created later) is picked up only after a whole metadata max age. Otherwise on
+   * the metadata max age, as the slow retry for ids that stayed unresolved, bounded per id by the
+   * attempt cap in `refreshMetadataForTopicIds`.
+   *
+   * @see https://github.com/apache/kafka/blob/4.3/clients/src/main/java/org/apache/kafka/clients/consumer/internals/AbstractMembershipManager.java
+   * @private
+   * @param {{ immediate: boolean }} options
+   * @returns {void}
+   */
+  refreshUnresolvedTopicIds({ immediate }) {
+    if (!this.unresolvedTopicIds.size) return
+    if (!immediate && Date.now() - this.lastMetadataRefreshAt < this.metadataMaxAge) return
+
+    const topicIds = [...this.unresolvedTopicIds]
+    const { localEpoch } = this.target
+
+    // Deliberately not awaited - a heartbeat must not wait on metadata - so nothing raised here
+    // has a caller: the refresh swallows its own failures and the re-read is logged rather than
+    // left to the process as an unhandled rejection.
+    this.refreshMetadataForTopicIds(topicIds)
+      .then(() => this.onTopicIdsRefreshed(topicIds, localEpoch))
+      .catch((error) => {
+        this.logger.debug('Could not re-read the target after refreshing its topic ids', {
+          groupId: this.groupId,
+          error: error.message,
+        })
+      })
+  }
+
+  /**
+   * Re-evaluates the target once a by-id refresh has run, so a name that has just arrived starts
+   * its round now rather than on the next heartbeat.
+   *
+   * Does nothing unless the refresh actually named one of the ids it asked about and the target it
+   * was resolving is still this member's: a refresh landing after a fencing, a leave or a newer
+   * target must not move the machine. The local epoch is the identity that matters - the target
+   * object is replaced by every heartbeat carrying an assignment, changed or not.
+   * @private
+   * @param {string[]} topicIds the ids the refresh asked about
+   * @param {number} localEpoch the local epoch of the target it was resolving
+   * @returns {void}
+   */
+  onTopicIdsRefreshed(topicIds, localEpoch) {
+    if (this.target == null || this.target.localEpoch !== localEpoch) return
+    if (isNotInGroup(this.state) || isLeavingGroup(this.state)) return
+    if (!topicIds.some((topicId) => this.cluster.topicName(topicId) != null)) return
+
+    this.evaluateTarget({ targetChanged: false })
   }
 
   /**
