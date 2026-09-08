@@ -1,7 +1,8 @@
 const Long = require('../../utils/long')
+const sleep = require('../../utils/sleep')
 const isInvalidOffset = require('./isInvalidOffset')
 const initializeConsumerOffsets = require('./initializeConsumerOffsets')
-const { isStaleCoordinator } = require('../../errors')
+const { KafkaJSError, isStaleCoordinator } = require('../../errors')
 const { stampGeneration } = require('../rebalanceErrorContract')
 const {
   events: { COMMIT_OFFSETS },
@@ -9,6 +10,15 @@ const {
 
 const { keys, assign } = Object
 const indexTopics = (topics) => topics.reduce((obj, topic) => assign(obj, { [topic]: {} }), {})
+
+/** @see https://github.com/apache/kafka/blob/4.3/clients/src/main/java/org/apache/kafka/common/protocol/Errors.java */
+const STALE_MEMBER_EPOCH = 'STALE_MEMBER_EPOCH'
+
+/** How long a stale-epoch offset fetch waits before re-sending under the epoch it holds by then. */
+const STALE_EPOCH_RETRY_INTERVAL = 100
+
+/** Used when no logger is injected, so a manager built without one still runs and logs nothing. */
+const SILENT_LOGGER = { debug() {}, info() {}, warn() {}, error() {} }
 
 const PRIVATE = {
   COMMITTED_OFFSETS: Symbol('private:OffsetManager:committedOffsets'),
@@ -59,6 +69,17 @@ module.exports = class OffsetManager {
    *                                subscribed, each keyed by topic and stamped with its new topic
    *                                id (owned by the long-lived `Consumer`; shared by reference
    *                                across every `OffsetManager` a session builds).
+   * @param {'classic'|'consumer'} [options.membershipProtocol='classic'] which group protocol this
+   *                                member runs. Under `'consumer'` the offset fetch carries the
+   *                                member id and epoch, which is how the coordinator validates a
+   *                                read against a live member (KIP-848).
+   * @param {number} [options.staleEpochTimeout=300000] how long an offset fetch answered with a
+   *                                stale member epoch keeps being re-sent under a fresh one.
+   * @param {import('../../../types').Logger} [options.logger] where this manager reports a stale
+   *                                member epoch. Optional and silent by default: the consumer group
+   *                                is the only production caller and passes its own namespaced
+   *                                logger, while every test that constructs a manager directly
+   *                                cares about offsets rather than log lines.
    */
   constructor({
     cluster,
@@ -74,6 +95,9 @@ module.exports = class OffsetManager {
     memberId,
     groupInstanceId = null,
     pendingTopicResets = new Map(),
+    membershipProtocol = 'classic',
+    staleEpochTimeout = 300000,
+    logger = SILENT_LOGGER,
   }) {
     this.cluster = cluster
     this.coordinator = coordinator
@@ -99,6 +123,9 @@ module.exports = class OffsetManager {
     this.memberId = memberId
     this.groupInstanceId = groupInstanceId
     this.pendingTopicResets = pendingTopicResets
+    this.membershipProtocol = membershipProtocol
+    this.staleEpochTimeout = staleEpochTimeout
+    this.logger = logger
 
     this.autoCommit = autoCommit
     this.autoCommitInterval = autoCommitInterval
@@ -134,6 +161,21 @@ module.exports = class OffsetManager {
     }
 
     return Long.fromValue(offset)
+  }
+
+  /**
+   * The offset this partition has resolved to, exactly as stored.
+   *
+   * A pure read, on the fetch hot path: no seeding (unlike `nextOffset`, which writes
+   * `resolvedOffsets` when it seeds from the committed offset), no allocation, and no throw for a
+   * topic whose entries were pruned or never created.
+   * @param {string} topic
+   * @param {number} partition
+   * @returns {string|undefined} the decimal string, or undefined when nothing is resolved
+   */
+  resolvedOffsetAt(topic, partition) {
+    const offsets = this.resolvedOffsets[topic]
+    return offsets ? offsets[partition] : undefined
   }
 
   /**
@@ -243,6 +285,31 @@ module.exports = class OffsetManager {
         this.clearOffsets({ topic, partition })
       }
     }
+  }
+
+  /**
+   * Points this manager at the membership it should send under, without touching the assignment,
+   * the resolved offsets or the committed cache.
+   *
+   * `updateAssignment` is the wrong tool for this: it prunes offsets and rebuilds the topic index.
+   * A commit issued between two rebalances - the pre-release commit, above all - only needs the
+   * generation, the member id and the coordinator to be current, because a request built from a
+   * stale generation draws ILLEGAL_GENERATION under the classic protocol and STALE_MEMBER_EPOCH
+   * under the consumer one.
+   *
+   * Under the consumer protocol `generationId` IS the member epoch: `ConsumerGroup.generationId`
+   * aliases it, so the same field carries `GenerationIdOrMemberEpoch` on the wire.
+   *
+   * @param {object} membership
+   * @param {number} membership.generationId
+   * @param {string} membership.memberId
+   * @param {import("../../../types").Broker} membership.coordinator
+   * @returns {void}
+   */
+  useMembership({ generationId, memberId, coordinator }) {
+    this.generationId = generationId
+    this.memberId = memberId
+    this.coordinator = coordinator
   }
 
   /**
@@ -386,7 +453,7 @@ module.exports = class OffsetManager {
       this.countResolvedOffsets().gte(Long.fromValue(this.autoCommitThreshold))
 
     if (timeoutReached || thresholdReached) {
-      return this.commitOffsets()
+      return this.commitOffsets({}, { auto: true })
     }
   }
 
@@ -424,6 +491,32 @@ module.exports = class OffsetManager {
   }
 
   /**
+   * `uncommittedOffsets().topics`, optionally narrowed to a set of topic-partitions.
+   * @private
+   * @param {import('../groupProtocol/interface').TopicPartitions[]|null} partitions
+   * @returns {import('../../../types').OffsetsByTopicPartition["topics"]}
+   */
+  selectUncommitted(partitions) {
+    const { topics } = this.uncommittedOffsets()
+
+    if (!partitions) {
+      return topics
+    }
+
+    const wanted = new Map(partitions.map(({ topic, partitions: ps }) => [topic, new Set(ps)]))
+
+    return topics
+      .map(({ topic, partitions: entries }) => ({
+        topic,
+        partitions: entries.filter(({ partition }) => {
+          const selected = wanted.get(topic)
+          return selected !== undefined && selected.has(Number(partition))
+        }),
+      }))
+      .filter(({ partitions: entries }) => entries.length > 0)
+  }
+
+  /**
    * Commits `offsets.topics`, defaulting to everything resolved since the last commit, and emits
    * `COMMIT_OFFSETS` with the payload that was sent.
    *
@@ -432,11 +525,20 @@ module.exports = class OffsetManager {
    * Offsets a caller supplies are forwarded untouched and carry whatever they were given.
    *
    * @param {import('../../../types').Offsets} [offsets]
+   * @param {object} [options]
+   * @param {import('../groupProtocol/interface').TopicPartitions[]|null} [options.partitions=null]
+   *   restrict the default (uncommitted) selection to these topic-partitions. Applied HERE rather
+   *   than by the caller, so a retry re-reads what is uncommitted now instead of replaying a list
+   *   built before the last batch resolved. Ignored when `offsets.topics` is given.
+   * @param {boolean} [options.auto=false] this is the interval/threshold auto-commit rather than a
+   *   deliberate one. A stale member epoch is logged and swallowed for it, because the next
+   *   interval carries whatever epoch the heartbeats have installed by then; every other caller
+   *   sees the error.
    * @returns {Promise<void>}
    */
-  async commitOffsets(offsets = {}) {
+  async commitOffsets(offsets = {}, { partitions = null, auto = false } = {}) {
     const { groupId, generationId, memberId, groupInstanceId } = this
-    const { topics = this.uncommittedOffsets().topics } = offsets
+    const { topics = this.selectUncommitted(partitions) } = offsets
 
     if (topics.length === 0) {
       this.lastCommit = Date.now()
@@ -486,6 +588,37 @@ module.exports = class OffsetManager {
         }
       }
 
+      if (e.type === STALE_MEMBER_EPOCH) {
+        stampGeneration(e, generationId)
+
+        if (auto) {
+          // Java does not even back this off: the epoch is not retriable, and the next interval
+          // commit is built from whatever epoch the heartbeats have installed by then.
+          // @see https://github.com/apache/kafka/blob/4.3/clients/src/main/java/org/apache/kafka/clients/consumer/internals/CommitRequestManager.java
+          this.logger.error('Auto-commit rejected with a stale member epoch; skipping this one', {
+            groupId,
+            memberId,
+            memberEpoch: generationId,
+          })
+
+          this.lastCommit = Date.now()
+          return
+        }
+
+        throw stampGeneration(
+          new KafkaJSError(
+            {
+              message: `OffsetCommit failed with stale member epoch. ${e.message}`,
+              type: e.type,
+              code: e.code,
+              helpUrl: e.helpUrl,
+            },
+            { retriable: false, cause: e }
+          ),
+          generationId
+        )
+      }
+
       // A commit issued before a rebalance and answered after it is answered about the generation
       // it was sent under, not the one this member holds by then.
       throw stampGeneration(e, generationId)
@@ -506,7 +639,6 @@ module.exports = class OffsetManager {
    * @returns {Promise<void>}
    */
   async resolveOffsets(seekedPartitions = EMPTY_SEEKED_PARTITIONS) {
-    const { groupId } = this
     const invalidOffset = (topic) => (partition) => {
       return isInvalidOffset(this.committedOffsets()[topic][partition])
     }
@@ -524,11 +656,7 @@ module.exports = class OffsetManager {
       return
     }
 
-    const coordinator = await this.getCoordinator()
-    const { responses: consumerOffsets } = await coordinator.offsetFetch({
-      groupId,
-      topics: pendingPartitions,
-    })
+    const { responses: consumerOffsets } = await this.fetchCommittedOffsets(pendingPartitions)
 
     this.drainPendingTopicResets(consumerOffsets, seekedPartitions)
 
@@ -580,6 +708,60 @@ module.exports = class OffsetManager {
         ...this.committedOffsets()[topic],
       })
     })
+  }
+
+  /**
+   * One OffsetFetch, carrying this member's identity when the coordinator wants it.
+   *
+   * Under the consumer group protocol the coordinator validates the read against a live member, so
+   * the request carries `MemberId` and `MemberEpoch` (OffsetFetch v9). Under the classic protocol -
+   * and for every admin read - nothing is sent and the request is byte-identical to what it was.
+   * @see https://github.com/apache/kafka/blob/4.3/clients/src/main/resources/common/message/OffsetFetchRequest.json
+   *
+   * A stale member epoch is re-sent under whatever epoch the heartbeats have installed, while one
+   * is available and the deadline has not passed - Java's
+   * `isStaleEpochErrorAndValidEpochAvailable`. It is NOT made retriable in the error table: that
+   * would change every other decoder of a 113, including the admin client's.
+   * @private
+   * @param {{topic: string, partitions: {partition: number}[]}[]} topics
+   * @returns {Promise<{responses: Array}>}
+   * @throws {Error} the last error, once the deadline passes or the member has no epoch
+   */
+  async fetchCommittedOffsets(topics) {
+    const deadline = Date.now() + this.staleEpochTimeout
+
+    for (;;) {
+      const coordinator = await this.getCoordinator()
+      const memberFields =
+        this.membershipProtocol === 'consumer'
+          ? { memberId: this.memberId, memberEpoch: this.generationId }
+          : undefined
+
+      try {
+        return await coordinator.offsetFetch({
+          groupId: this.groupId,
+          topics,
+          ...memberFields,
+        })
+      } catch (e) {
+        if (
+          e.type !== STALE_MEMBER_EPOCH ||
+          this.membershipProtocol !== 'consumer' ||
+          this.generationId <= 0 ||
+          Date.now() >= deadline
+        ) {
+          throw e
+        }
+
+        this.logger.debug('OffsetFetch rejected with a stale member epoch, re-sending', {
+          groupId: this.groupId,
+          memberId: this.memberId,
+          memberEpoch: this.generationId,
+        })
+
+        await sleep(STALE_EPOCH_RETRY_INTERVAL)
+      }
+    }
   }
 
   /**
