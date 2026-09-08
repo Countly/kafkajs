@@ -391,13 +391,18 @@ consumer.on(consumer.events.REBALANCING, e => {
 })
 consumer.on(consumer.events.PARTITIONS_LOST, e => {
   const memberId: string | null = e.payload.memberId
+  // The generation is gone on this event, so it is nullable too.
+  const generationId: number | null = e.payload.generationId
   void memberId
+  void generationId
 })
 consumer.on(consumer.events.POLL_INTERVAL_EXCEEDED, e => {
   const elapsed: number = e.payload.elapsedMs
   const isStatic: boolean = e.payload.isStatic
+  const generationId: number | null = e.payload.generationId
   void elapsed
   void isStatic
+  void generationId
 })
 // The option and the deprecated alias both compile.
 kafka.consumer({ groupId: 'g', maxPollInterval: 300000 })

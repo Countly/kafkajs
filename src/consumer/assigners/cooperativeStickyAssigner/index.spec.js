@@ -229,6 +229,48 @@ describe('Consumer > assigners > CooperativeStickyAssigner', () => {
     expect(followUp['member-2']['topic-A']).toEqual([2, 3])
   })
 
+  test('withholds a partition two members of the same generation both claim', async () => {
+    metadata['topic-A'] = partitions(2)
+
+    const result = decodeAssignment(
+      await assigner.assign({
+        members: [
+          member('member-a', {
+            owned: [{ topic: 'topic-A', partitions: [0, 1] }],
+            generationId: 5,
+          }),
+          member('member-b', { owned: [{ topic: 'topic-A', partitions: [0] }], generationId: 5 }),
+        ],
+        topics: ['topic-A'],
+      })
+    )
+
+    // One of the two is working from a membership it has already lost, and nothing here says
+    // which - so partition 0 goes to neither, and the follow-up round hands it over.
+    expect(result).toEqual({ 'member-a': { 'topic-A': [1] }, 'member-b': {} })
+  })
+
+  test('hands a contested partition straight to the newer claim when the generations differ', async () => {
+    metadata['topic-A'] = partitions(2)
+
+    const result = decodeAssignment(
+      await assigner.assign({
+        members: [
+          member('member-a', {
+            owned: [{ topic: 'topic-A', partitions: [0, 1] }],
+            generationId: 4,
+          }),
+          member('member-b', { owned: [{ topic: 'topic-A', partitions: [0] }], generationId: 5 }),
+        ],
+        topics: ['topic-A'],
+      })
+    )
+
+    // member-b reported the newer generation, so its claim is the live one: nothing is contested
+    // and nothing is withheld.
+    expect(result).toEqual({ 'member-a': { 'topic-A': [1] }, 'member-b': { 'topic-A': [0] } })
+  })
+
   test('carries the four-byte userData into the subscription', () => {
     const { name, metadata: encoded } = assigner.protocol({
       topics: ['topic-A'],

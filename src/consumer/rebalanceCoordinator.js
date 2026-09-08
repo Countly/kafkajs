@@ -131,6 +131,9 @@ module.exports = class RebalanceCoordinator {
       this.inFlight = null
       this.rounds = 0
       this.pendingKind = null
+      // A chain that threw must not hand its pending reason to the next one: the trigger belonged
+      // to the membership that chain was replacing, and the next chain would run a round for it.
+      this.rejoinRequested = null
       // A chain that threw must not leave stale-assignment detection off for the life of the
       // group: the latch is cleared here as well as by a successful apply.
       this.consumerGroup.clearStaleAssignmentPending()
@@ -168,6 +171,11 @@ module.exports = class RebalanceCoordinator {
       }
 
       const previous = this.consumerGroup.assigned()
+      const cooperative = this.consumerGroup.rebalanceProtocol() === COOPERATIVE
+      // A round that gives everything up rebuilds from scratch: an eager round revoked its whole
+      // assignment before joining, and a lost one held its under a membership that is now void,
+      // so the incremental apply has nothing valid to keep.
+      const rebuildOffsets = kind === 'lost' || !cooperative
 
       // Java's onPartitionsLost timing: the partitions are gone before the JoinGroup, not after
       // the sync that replaces them.
@@ -176,22 +184,35 @@ module.exports = class RebalanceCoordinator {
         this.emitPartitions(PARTITIONS_LOST, previous)
       }
 
-      const roundStartedAt = Date.now()
-      const result = await this.consumerGroup.joinAndSync()
-      // Only the delta is read here: the GROUP_JOIN payload below is built from the APPLIED
-      // assignment through `consumerGroup.assigned()`, which is what keeps it the full set.
-      // A cooperative round runs alongside the fetch loop, so the apply must keep what this
-      // member retained; an eager round revoked everything before joining and rebuilds.
-      const { revoked, added } = await this.consumerGroup.applyRebalanceResult(result, {
-        rebuildOffsets: this.consumerGroup.rebalanceProtocol() !== COOPERATIVE,
-      })
-
-      if (revoked.length) {
-        this.emitPartitions(PARTITIONS_REVOKED, revoked)
+      // Java's onJoinPrepare: the same rounds stop advertising ownership before they join, so
+      // the JoinGroup carries no `OwnedPartitions` and no peer withholds a partition for a
+      // member that has already given it up.
+      // @see clients/src/main/java/org/apache/kafka/clients/consumer/internals/ConsumerCoordinator.java
+      if (rebuildOffsets) {
+        this.consumerGroup.forgetOwnedPartitions()
       }
 
-      if (added.length) {
-        this.emitPartitions(PARTITIONS_ASSIGNED, added)
+      const roundStartedAt = Date.now()
+      const result = await this.consumerGroup.joinAndSync()
+      const { revoked, added } = await this.consumerGroup.applyRebalanceResult(result, {
+        rebuildOffsets,
+      })
+
+      // Java's onJoinComplete: the round decides what the two events carry, not the apply. A
+      // cooperative round reports the apply's delta; an eager one reports both whole sets; a lost
+      // one reports no revocation at all, because `PARTITIONS_LOST` already named those
+      // partitions.
+      const assignment = this.consumerGroup.assigned()
+      const reportsDelta = cooperative && kind !== 'lost'
+      const gaveUp = kind === 'lost' ? [] : reportsDelta ? revoked : previous
+      const tookOn = reportsDelta ? added : assignment
+
+      if (gaveUp.length) {
+        this.emitPartitions(PARTITIONS_REVOKED, gaveUp)
+      }
+
+      if (tookOn.length) {
+        this.emitPartitions(PARTITIONS_ASSIGNED, tookOn)
       }
 
       const payload = {
@@ -199,9 +220,10 @@ module.exports = class RebalanceCoordinator {
         memberId: this.consumerGroup.memberId,
         leaderId: this.consumerGroup.leaderId,
         isLeader: this.consumerGroup.isLeader(),
-        memberAssignment: this.consumerGroup
-          .assigned()
-          .reduce((byTopic, { topic, partitions }) => ({ ...byTopic, [topic]: partitions }), {}),
+        memberAssignment: assignment.reduce(
+          (byTopic, { topic, partitions }) => ({ ...byTopic, [topic]: partitions }),
+          {}
+        ),
         groupProtocol: this.consumerGroup.groupProtocol,
         duration: Date.now() - roundStartedAt,
         rebalanceProtocol: this.consumerGroup.rebalanceProtocol(),
@@ -217,8 +239,6 @@ module.exports = class RebalanceCoordinator {
       if (!this.runner.stopRequested) {
         this.heartbeatManager.ensureStarted()
       }
-
-      const cooperative = this.consumerGroup.rebalanceProtocol() === COOPERATIVE
 
       kind = this.takePendingKind() || 'revoked'
       reason =
@@ -346,10 +366,10 @@ module.exports = class RebalanceCoordinator {
   /**
    * Classifies an error into a verdict, or into nothing.
    *
-   * A coordinator that must simply be re-discovered is deliberately NOT a verdict: the cached
-   * coordinator handle is dropped and the next attempt re-runs FindCoordinator, which is what the
-   * Java client does with `markCoordinatorUnknown`. Raising a rebalance for it would emit a
-   * `REBALANCING` for something that is not one.
+   * A coordinator that must simply be re-discovered is deliberately NOT a verdict: the next
+   * round's `join()` re-runs FindCoordinator anyway, which is what the Java client does after
+   * `markCoordinatorUnknown`. Raising a rebalance for it would emit a `REBALANCING` for something
+   * that is not one.
    *
    * @see clients/src/main/java/org/apache/kafka/clients/consumer/internals/AbstractCoordinator.java
    * @param {Error} error
@@ -496,7 +516,12 @@ module.exports = class RebalanceCoordinator {
       groupId: this.groupId,
       memberId: this.consumerGroup.memberId,
       generationId: this.consumerGroup.generationId,
-      partitions,
+      // A copy: the arrays behind this are the member's own assignment state, and a listener that
+      // sorts or splices the payload must not edit it.
+      partitions: partitions.map(({ topic, partitions }) => ({
+        topic,
+        partitions: [...partitions],
+      })),
     })
   }
 }

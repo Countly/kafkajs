@@ -88,6 +88,7 @@ module.exports = class Runner extends EventEmitter {
           elapsedMs,
           isStatic: Boolean(this.consumerGroup.groupInstanceId),
         }),
+      isRebalancing: () => this.rebalanceCoordinator.isRebalancing(),
     })
     this.rebalanceCoordinator = new RebalanceCoordinator({
       runner: this,
@@ -115,9 +116,22 @@ module.exports = class Runner extends EventEmitter {
   onHeartbeatError(error) {
     const verdict = this.rebalanceCoordinator.classify(error, REBALANCE_PATHS.HEARTBEAT)
 
-    if (verdict) {
-      this.rebalanceCoordinator.requestRejoin(verdict)
+    if (!verdict) {
+      // Nothing else reports this one: the timer discards the tick's promise, so an authorization
+      // failure or a connection error on the heartbeat path would otherwise be silent until the
+      // fetch loop happens to hit the same error.
+      this.logger.debug('Background heartbeat failed without a rebalance verdict', {
+        groupId: this.consumerGroup.groupId,
+        memberId: this.consumerGroup.memberId,
+        error: error.message || error,
+        type: error.type,
+        name: error.name,
+      })
+
+      return
     }
+
+    this.rebalanceCoordinator.requestRejoin(verdict)
   }
 
   get consuming() {

@@ -453,7 +453,7 @@ kafka.consumer({ groupId: 'my-group', partitionAssigners: [cooperativeSticky] })
 
 Every consumer logs one INFO line when you create it, naming the rebalance protocol it selected and the assigners it selected it from, so you can see which of the two deploys a running process is on.
 
-Going straight to deploy 2 splits the group: members still running the old code and members running the new one share no assigner name, and the coordinator rejects the join with `INCONSISTENT_GROUP_PROTOCOL` until the rollout finishes. During deploy 2 the group is briefly mixed — some members computing eagerly, some cooperatively — which is safe, because the eager ones have already given up everything before they rejoin and the cooperative algorithm never hands a partition to a member that still owns it.
+Going straight to deploy 2 splits the group: members still running the old code and members running the new one share no assigner name, and the coordinator rejects the join with `INCONSISTENT_GROUP_PROTOCOL` until the rollout finishes. During deploy 2 the group is briefly mixed — some members computing eagerly, some cooperatively — which is safe, because an eager member's JoinGroup advertises no owned partitions at all — it gives everything up before it rejoins — and the cooperative algorithm never hands a partition to a member that still owns it.
 
 ## <a name="custom-partition-assigner"></a> Custom partition assigner
 

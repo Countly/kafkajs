@@ -41,6 +41,7 @@ const createRunner = (consumerGroupOverrides) => {
     isLeader: () => false,
     applyRebalanceResult: jest.fn(async () => ({ assignment: [], added: [], revoked: [] })),
     clearStaleAssignmentPending: jest.fn(),
+    forgetOwnedPartitions: jest.fn(),
     clearAssignerState: jest.fn(),
     resetGenerationLocally: jest.fn(),
     leave: jest.fn(async () => {}),

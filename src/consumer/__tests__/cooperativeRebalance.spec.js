@@ -115,6 +115,7 @@ const createCoordinator = () => {
       return { assignment: [], added: [], revoked: [] }
     }),
     clearStaleAssignmentPending: jest.fn(),
+    forgetOwnedPartitions: jest.fn(),
   }
 
   const fetchManager = {
@@ -717,6 +718,36 @@ describe('Consumer > cooperative rebalance apply', () => {
       expect(group.offsetManager.resolvedOffsets[TOPIC_A][1]).toBeUndefined()
       expect(commitOffsetsIfNecessary).not.toHaveBeenCalled()
       expect(commitOffsets).not.toHaveBeenCalledWith({ topics: [] })
+    })
+
+    it('resolves nothing for a partition revoked mid-batch, and still resolves a retained one', async () => {
+      const { group } = createGroup()
+      await applyCooperative(group, { [TOPIC_A]: [0, 1] })
+      jest.spyOn(group, 'heartbeat').mockImplementation(async () => {})
+
+      const eachBatch = jest.fn(async ({ batch, resolveOffset }) => {
+        if (batch.partition === 1) {
+          // The round that takes this partition away lands while the handler holds it.
+          await applyCooperative(group, { [TOPIC_A]: [0] })
+        }
+
+        resolveOffset(batch.messages[0].offset)
+      })
+
+      const runner = buildRunner({ group, eachBatch })
+      await runner.handleBatch(messageBatch(TOPIC_A, 1))
+      await runner.handleBatch(messageBatch(TOPIC_A, 0))
+
+      expect(group.offsetManager.resolvedOffsets[TOPIC_A][1]).toBeUndefined()
+      expect(group.offsetManager.resolvedOffsets[TOPIC_A][0]).toEqual('1')
+      // And nothing was committed for it either: only the retained partition reaches the wire.
+      expect(
+        group.coordinator.offsetCommit.mock.calls.flatMap(([{ topics }]) =>
+          topics.flatMap(({ topic, partitions }) =>
+            partitions.map(({ partition }) => `${topic}-${partition}`)
+          )
+        )
+      ).toEqual([`${TOPIC_A}-0`])
     })
 
     it('still commits for a partition this member retained', async () => {

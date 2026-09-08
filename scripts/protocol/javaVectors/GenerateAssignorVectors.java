@@ -749,6 +749,17 @@ public final class GenerateAssignorVectors {
                 cooperativeMember("m-1", a, tps("t-a", 0), 1),
                 cooperativeMember("m-2", a, Collections.emptyList(), DEFAULT_GENERATION))));
 
+    // Both members claim t-a-0 in the same generation, so one of them is working from a
+    // membership it has already lost: Java gives the partition to neither.
+    cases.add(
+        vector(
+            "cooperative_same_generation_conflict",
+            COOPERATIVE,
+            pair,
+            List.of(
+                cooperativeMember("m-1", a, tps("t-a", 0, 1), 5),
+                cooperativeMember("m-2", a, tps("t-a", 0), 5))));
+
     // Subscription v1 carries OwnedPartitions but no GenerationId, so the generation is read back
     // out of the userData instead.
     cases.add(

@@ -42,7 +42,7 @@ change, and commit the regenerated files alongside the codec change.
 compiling `GenerateAssignorVectors.java` against the same jar plus `slf4j-api` and writing
 `src/consumer/assigners/fixtures/<assignor>/<caseId>_java.json`. It runs Apache Kafka's own
 `RangeAssignor`, `StickyAssignor` and `CooperativeStickyAssignor` through
-`ConsumerPartitionAssignor#assign(Cluster, GroupSubscription)` over 32 subscription, ownership and
+`ConsumerPartitionAssignor#assign(Cluster, GroupSubscription)` over 33 subscription, ownership and
 generation shapes, so the built-in `range`, `sticky` and `cooperative-sticky` assigners are checked
 against the reference implementation rather than against a reading of it. The extra jar is not
 optional: all three assignors extend `AbstractPartitionAssignor`, which holds a static
@@ -53,7 +53,7 @@ optional: all three assignors extend `AbstractPartitionAssignor`, which holds a 
 |---|---|
 | `range` | 8 |
 | `sticky` | 20 |
-| `cooperative-sticky` | 4 |
+| `cooperative-sticky` | 5 |
 
 ### Fixture schema
 

@@ -355,6 +355,31 @@ describe('Consumer > HeartbeatManager > poll expiry', () => {
     expect(jest.getTimerCount()).toEqual(0)
   })
 
+  it('does not report expiry while a rebalance round is in flight, and heartbeats instead', async () => {
+    const pollTimer = new PollTimer({ pollDeadline: 50 })
+    let rebalancing = true
+    const { manager, heartbeat, onPollExpired } = build({
+      pollTimer,
+      isRebalancing: () => rebalancing,
+    })
+    manager.ensureStarted()
+
+    // The JoinGroup of a slow round blocks for longer than the poll deadline, which is the same
+    // number as the rebalance timeout - that time is the coordinator's, not the handler's.
+    await jest.advanceTimersByTimeAsync(300)
+
+    expect(onPollExpired).not.toHaveBeenCalled()
+    expect(heartbeat.mock.calls.length).toBeGreaterThan(1)
+
+    // The same deadline, once the round is over, is a real overrun.
+    rebalancing = false
+    await jest.advanceTimersByTimeAsync(100)
+
+    expect(onPollExpired).toHaveBeenCalledTimes(1)
+    manager.stop()
+    expect(jest.getTimerCount()).toEqual(0)
+  })
+
   it('does not report expiry while disabled', async () => {
     const pollTimer = new PollTimer({ pollDeadline: 50 })
     const { manager, onPollExpired } = build({ pollTimer })

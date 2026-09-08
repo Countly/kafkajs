@@ -11,8 +11,8 @@
  * The manager emits nothing and depends on neither the runner nor the instrumentation emitter.
  * It reports through two injected callbacks, so the component it reports to can hold every rule
  * about what a verdict means. The tick is also where the handler's poll deadline is DETECTED -
- * only while heartbeats are enabled, and never in place of one: an overrun hands off to
- * `onPollExpired` and the tick ends there.
+ * only while heartbeats are enabled, only while no rebalance round is in flight, and never in
+ * place of one: an overrun hands off to `onPollExpired` and the tick ends there.
  *
  * @see https://cwiki.apache.org/confluence/display/KAFKA/KIP-62%3A+Allow+consumer+to+send+heartbeats+from+a+background+thread
  */
@@ -27,14 +27,25 @@ module.exports = class HeartbeatManager {
    * @param {(details: { elapsedMs: number }) => Promise<void>} options.onPollExpired the sequence
    *   a poll-interval overrun runs. It owns everything an overrun implies, including stopping
    *   this manager, so the tick awaits it and then evaluates nothing further.
+   * @param {() => boolean} [options.isRebalancing] whether a rebalance round is running right now;
+   *   the poll deadline is not evaluated while one is
    */
-  constructor({ groupMembership, pollTimer, heartbeatInterval, logger, onError, onPollExpired }) {
+  constructor({
+    groupMembership,
+    pollTimer,
+    heartbeatInterval,
+    logger,
+    onError,
+    onPollExpired,
+    isRebalancing = () => false,
+  }) {
     this.groupMembership = groupMembership
     this.pollTimer = pollTimer
     this.heartbeatInterval = heartbeatInterval
     this.logger = logger.namespace('HeartbeatManager')
     this.onError = onError
     this.onPollExpired = onPollExpired
+    this.isRebalancing = isRebalancing
 
     this.handle = null
     this.disabled = false
@@ -116,9 +127,12 @@ module.exports = class HeartbeatManager {
       return
     }
 
-    // A JoinGroup request timeout can exceed the poll deadline, so evaluating this while
-    // suspended would send LeaveGroup for a member whose own join is still in flight.
-    if (this.pollTimer.expired()) {
+    // Time spent inside a rebalance round is the coordinator's, not the handler's: a JoinGroup is
+    // held until every member rejoins, and the rebalance timeout is the same number as the poll
+    // deadline, so a slow round would otherwise expire a member that was never slow - mid-round,
+    // where the LeaveGroup lands under a generation its own SyncGroup is still using. The round
+    // resets the deadline itself once it completes.
+    if (this.pollTimer.expired() && !this.isRebalancing()) {
       await this.reportPollExpired(chainId)
       return
     }

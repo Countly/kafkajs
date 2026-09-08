@@ -1177,7 +1177,8 @@ export type ConsumerPartitionsEvent = InstrumentationEvent<{
   groupId: string
   /** `null` while this member has no id: before its first successful join, or after one was lost. */
   memberId: string | null
-  generationId: number
+  /** `null` once the generation has been dropped, which is the case on `PARTITIONS_LOST`. */
+  generationId: number | null
   partitions: Array<{ topic: string; partitions: number[] }>
 }>
 export type ConsumerPartitionsAssignedEvent = ConsumerPartitionsEvent
@@ -1187,7 +1188,8 @@ export type ConsumerPollIntervalExceededEvent = InstrumentationEvent<{
   groupId: string
   /** `null` while this member has no id: before its first successful join, or after one was lost. */
   memberId: string | null
-  generationId: number
+  /** `null` once the generation has been dropped. */
+  generationId: number | null
   maxPollInterval: number
   elapsedMs: number
   isStatic: boolean

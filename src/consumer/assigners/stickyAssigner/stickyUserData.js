@@ -54,4 +54,4 @@ const stickyUserData = {
   },
 }
 
-module.exports = { stickyUserData, DEFAULT_GENERATION }
+module.exports = { stickyUserData }

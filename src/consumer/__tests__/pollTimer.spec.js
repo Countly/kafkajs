@@ -94,6 +94,7 @@ describe('Consumer > PollTimer call sites', () => {
       hasSeekOffset: () => false,
       discardUncommittedOffsets: jest.fn(),
       clearStaleAssignmentPending: jest.fn(),
+      forgetOwnedPartitions: jest.fn(),
       clearAssignerState: jest.fn(),
     }
 

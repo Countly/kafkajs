@@ -23,14 +23,6 @@ const COOPERATIVE = 'cooperative'
  * @property {TopicPartitions[]} added      assignment minus what was previously owned
  * @property {TopicPartitions[]} revoked    previously owned minus assignment
  *
- * @typedef {Object} Membership
- * @property {string|null} memberId
- * @property {number} generationId
- * @property {string|null} leaderId
- * @property {string|null} groupInstanceId
- * @property {boolean} isLeader
- * @property {string|null} groupProtocol the assignor NAME the coordinator selected
- *
  * @typedef {Object} GroupProtocol
  * @property {() => Promise<void>} connect resolves the group coordinator
  * @property {(context: { topics: string[], topicsSubscribed: string[],
@@ -42,7 +34,6 @@ const COOPERATIVE = 'cooperative'
  *   Late-bound collaborators, forwarded by `ConsumerGroup#attach`.
  * @property {(options: { interval: number }) => Promise<void>} heartbeat
  * @property {() => Promise<void>} leave
- * @property {() => Membership} membership snapshot; allocates, so instrumentation only
  * @property {() => RebalanceProtocol} rebalanceProtocol
  * @property {(options?: { clearMemberId?: boolean }) => void} resetGeneration
  * @property {() => TopicPartitions[]} owned

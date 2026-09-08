@@ -1,7 +1,13 @@
 const Encoder = require('../../../protocol/encoder')
 const Decoder = require('../../../protocol/decoder')
 const { MemberMetadata, MemberAssignment } = require('../../assignerProtocol')
-const { assignSticky, DEFAULT_GENERATION } = require('../stickyAssigner/stickyCore')
+const {
+  assignSticky,
+  DEFAULT_GENERATION,
+  keyOf,
+  topicOf,
+  partitionOf,
+} = require('../stickyAssigner/stickyCore')
 
 /**
  * @param {Buffer|null} userData
@@ -33,17 +39,12 @@ const generationOf = (metadata) =>
     ? decodeGeneration(metadata.userData)
     : metadata.generationId
 
-/** Separator for the flat partition key. A Kafka topic name cannot contain a NUL. */
-const SEP = '\u0000'
-
 /**
  * @param {Array<{topic: string, partitions: number[]}>} byTopic
  * @returns {string[]} flat partition keys, for set arithmetic
  */
 const flatten = (byTopic) =>
-  byTopic.flatMap(({ topic, partitions }) =>
-    partitions.map((partition) => `${topic}${SEP}${partition}`)
-  )
+  byTopic.flatMap(({ topic, partitions }) => partitions.map((partition) => keyOf(topic, partition)))
 
 /**
  * Java's `CooperativeStickyAssignor`, under its wire name.
@@ -51,8 +52,10 @@ const flatten = (byTopic) =>
  * The assignment itself is the sticky one; what makes it cooperative is a single subtraction
  * afterwards. A partition that is being added to one member *and* revoked from another is
  * withheld this round: the member losing it revokes it and triggers a follow-up round, and only
- * then does the new owner get it. Nothing else is withheld - a brand-new partition, or one whose
- * previous owner has left, is handed over immediately.
+ * then does the new owner get it. So is a partition two members of the same generation both
+ * claim - one of them is working from a membership it has already lost, and neither may fetch it
+ * until the next round says who owns it. Nothing else is withheld - a brand-new partition, or one
+ * whose previous owner has left, is handed over immediately.
  *
  * Ownership comes from the subscription's `OwnedPartitions`, not from userData: under the
  * cooperative protocol a member still holds its partitions while it rejoins, so the protocol
@@ -100,8 +103,9 @@ module.exports = ({ cluster }) => ({
         .map(({ partitionId }) => partitionId)
     }
 
-    const assignment = assignSticky({ partitionsPerTopic, members: decoded })
-    this.withholdTransferringPartitions(decoded, assignment)
+    const contested = new Set()
+    const assignment = assignSticky({ partitionsPerTopic, members: decoded, contested })
+    this.withholdTransferringPartitions(decoded, assignment, contested)
 
     return [...assignment].map(([memberId, byTopic]) => ({
       memberId,
@@ -110,14 +114,17 @@ module.exports = ({ cluster }) => ({
   },
 
   /**
-   * Removes every partition that is simultaneously added to one member and revoked from another.
+   * Removes every partition that is simultaneously added to one member and revoked from another,
+   * and every partition two members of the same generation both claimed.
    * @private
    * @param {Array<{memberId: string, ownedPartitions: Array<{topic: string, partitions: number[]}>}>} members
    * @param {Map<string, {[topic: string]: number[]}>} assignment mutated in place
+   * @param {Set<string>} contested flat keys claimed twice in one generation
    * @returns {void}
    */
-  withholdTransferringPartitions(members, assignment) {
-    const added = new Map()
+  withholdTransferringPartitions(members, assignment, contested) {
+    const holderOf = new Map()
+    const added = new Set()
     const revoked = new Set()
 
     for (const { memberId, ownedPartitions } of members) {
@@ -128,8 +135,10 @@ module.exports = ({ cluster }) => ({
       )
 
       for (const key of assigned) {
+        holderOf.set(key, memberId)
+
         if (!owned.has(key)) {
-          added.set(key, memberId)
+          added.add(key)
         }
       }
 
@@ -140,14 +149,15 @@ module.exports = ({ cluster }) => ({
       }
     }
 
-    for (const [key, memberId] of added) {
-      if (!revoked.has(key)) {
+    for (const [key, memberId] of holderOf) {
+      if (!contested.has(key) && !(added.has(key) && revoked.has(key))) {
         continue
       }
 
-      const [topic, partition] = key.split(SEP)
+      const topic = topicOf(key)
+      const partition = partitionOf(key)
       const byTopic = assignment.get(memberId)
-      byTopic[topic] = byTopic[topic].filter((p) => p !== Number(partition))
+      byTopic[topic] = byTopic[topic].filter((p) => p !== partition)
 
       if (byTopic[topic].length === 0) {
         delete byTopic[topic]

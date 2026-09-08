@@ -63,6 +63,7 @@ describe('Consumer > Runner', () => {
       applyRebalanceResult: jest.fn(async () => ({ assignment: [], added: [], revoked: [] })),
       discardUncommittedOffsets: jest.fn(),
       clearStaleAssignmentPending: jest.fn(),
+      forgetOwnedPartitions: jest.fn(),
       clearAssignerState: jest.fn(),
       resetGenerationLocally: jest.fn(),
       hasSeekOffset: () => false,

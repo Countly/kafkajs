@@ -434,28 +434,17 @@ module.exports = class ClassicGroupProtocol {
     this.clearAssignerState()
   }
 
-  /** @returns {import('./interface').Membership} allocates; instrumentation only */
-  membership() {
-    return {
-      memberId: this.memberId,
-      generationId: this.generationId,
-      leaderId: this.leaderId,
-      groupInstanceId: this.groupInstanceId,
-      isLeader: this.isLeader(),
-      groupProtocol: this.groupProtocol,
-    }
-  }
-
   /** @returns {import('./interface').TopicPartitions[]} */
   owned() {
     return this.ownedPartitions
   }
 
   /**
-   * Shrinks `owned` to its intersection with the given set — it never widens. Called before
-   * anything asynchronous in a cooperative apply, so a revoked partition stops being advertised
-   * immediately, while a partition this member is only about to GAIN is not claimed before the
-   * apply has actually happened. The widening half is `setOwned`, after the apply.
+   * Shrinks `owned` to its intersection with the given set — it never widens. Called before the
+   * cooperative apply touches the offset manager or the subscription state, so a revoked partition
+   * stops being advertised before anything can resolve an offset for it, while a partition this
+   * member is only about to GAIN is not claimed before the apply has actually happened. The
+   * widening half is `setOwned`, after the apply.
    * @param {import('./interface').TopicPartitions[]} topicPartitions
    * @returns {void}
    */

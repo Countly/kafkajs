@@ -236,6 +236,18 @@ module.exports = class ConsumerGroup {
   }
 
   /**
+   * Stops advertising ownership of anything, without touching the generation or the live
+   * assignment. Java's `onJoinPrepare` does the same (`assignFromSubscribed(emptySet)`) before a
+   * round that gives everything up: the JoinGroup then carries no `OwnedPartitions`, so no peer
+   * withholds a partition on this member's behalf and the round reports the whole previous
+   * assignment as revoked rather than a delta against a set it no longer holds.
+   * @returns {void}
+   */
+  forgetOwnedPartitions() {
+    this.groupMembership.setOwned([])
+  }
+
+  /**
    * Re-arms stale-assignment detection.
    * @returns {void}
    */
@@ -504,8 +516,13 @@ module.exports = class ConsumerGroup {
 
     this.subscriptionState.update(currentMemberAssignment)
 
+    // A copy: the assignment reaches third-party assigners here, and one that sorts or splices
+    // its argument would otherwise corrupt the ownership set `setOwned` retains below.
     this.groupMembership.notifyAssignment({
-      partitions: currentMemberAssignment,
+      partitions: currentMemberAssignment.map(({ topic, partitions }) => ({
+        topic,
+        partitions: [...partitions],
+      })),
       userData: result.userData == null ? null : result.userData,
     })
 

@@ -130,7 +130,7 @@ describe('Consumer > assigners > Java golden vectors', () => {
   it('found the committed fixtures', () => {
     // A directory rename, or a `test.each([])`, would otherwise turn the whole suite into zero
     // silent passes.
-    expect(CASES.length).toBeGreaterThanOrEqual(32)
+    expect(CASES.length).toBeGreaterThanOrEqual(33)
   })
 
   describe('each vector reproduces Apache Kafka exactly', () => {

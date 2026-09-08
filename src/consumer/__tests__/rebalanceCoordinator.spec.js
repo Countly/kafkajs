@@ -8,6 +8,7 @@ const { events } = require('../instrumentationEvents')
 const { COOPERATIVE, EAGER } = require('../groupProtocol/interface')
 const { pollIntervalExceededError } = require('../rebalanceErrorContract')
 const { createErrorFromCode } = require('../../protocol/error')
+const { MemberMetadata } = require('../assignerProtocol')
 const { newLogger, waitFor } = require('testHelpers')
 
 const ILLEGAL_GENERATION = 22
@@ -55,6 +56,8 @@ const build = ({ mode = EAGER, assignment = [], deltas = [] } = {}) => {
       calls.push('applyRebalanceResult')
       return { assignment, added: [], revoked: [], ...(deltas.shift() || {}) }
     }),
+    forgetOwnedPartitions: jest.fn(() => calls.push('forgetOwnedPartitions')),
+    heartbeat: jest.fn(async () => calls.push('heartbeat')),
     discardUncommittedOffsets: jest.fn(() => calls.push('discard')),
     leave: jest.fn(async () => calls.push('leave')),
     resetGenerationLocally: jest.fn(() => calls.push('resetGenerationLocally')),
@@ -166,21 +169,27 @@ const createRealRunner = (options = {}) => {
   return { ...built, runner, realHeartbeatManager }
 }
 
-/** A real `ConsumerGroup`, for the one case whose subject is `recoverFromFetch` itself. */
-const createRealGroup = ({ mode = COOPERATIVE } = {}) => {
+/**
+ * A real `ConsumerGroup`, for the cases whose subject is `recoverFromFetch` or the apply itself.
+ */
+const createRealGroup = ({ mode = COOPERATIVE, topics = ['test-topic'], partitions = 0 } = {}) => {
+  const committedOffsets = {}
   const cluster = {
     refreshMetadata: jest.fn(async () => {}),
     refreshMetadataIfNecessary: async () => {},
-    committedOffsets: () => ({}),
-    findTopicPartitionMetadata: () => [],
+    committedOffsets: () => committedOffsets,
+    findTopicPartitionMetadata: (topic) =>
+      topics.includes(topic)
+        ? Array.from({ length: partitions }, (_, partitionId) => ({ partitionId }))
+        : [],
   }
 
   const group = new ConsumerGroup({
     retry: { retries: 0 },
     cluster,
     groupId: 'real-group',
-    topics: ['test-topic'],
-    topicConfigurations: { 'test-topic': {} },
+    topics,
+    topicConfigurations: topics.reduce((all, topic) => ({ ...all, [topic]: {} }), {}),
     logger: newLogger(),
     instrumentationEmitter: new InstrumentationEventEmitter(),
     assigners: [],
@@ -203,6 +212,82 @@ const createRealGroup = ({ mode = COOPERATIVE } = {}) => {
 
   return { group, cluster }
 }
+
+/**
+ * A real `RebalanceCoordinator` over a REAL `ConsumerGroup`, so the partition events are the ones
+ * the shipped apply and the shipped ownership tracking produce. `round(assignment, ...)` answers
+ * every JoinGroup of that chain with the same assignment, which is what makes a cooperative
+ * follow-up round converge.
+ */
+const createRealRound = ({ mode = EAGER, partitions = 4 } = {}) => {
+  const { group } = createRealGroup({ mode, topics: ['t'], partitions })
+
+  group.memberId = 'member-1'
+  group.generationId = 1
+  group.coordinator = {
+    isConnected: () => true,
+    nodeId: 0,
+    offsetFetch: jest.fn(async () => ({ responses: [] })),
+    offsetCommit: jest.fn(async () => {}),
+  }
+  group.partitionsPerSubscribedTopic = group.generatePartitionsPerSubscribedTopic()
+
+  const emitted = []
+  for (const name of [
+    events.PARTITIONS_ASSIGNED,
+    events.PARTITIONS_REVOKED,
+    events.PARTITIONS_LOST,
+    events.GROUP_JOIN,
+  ]) {
+    group.instrumentationEmitter.addListener(name, ({ type, payload }) =>
+      emitted.push({ type, payload })
+    )
+  }
+
+  const coordinator = new RebalanceCoordinator({
+    runner: { stopRequested: false, onCrash: jest.fn() },
+    consumerGroup: group,
+    fetchManager: { start: jest.fn(async () => {}), stop: jest.fn(async () => {}) },
+    heartbeatManager: { ensureStarted: jest.fn(), stop: jest.fn() },
+    pollTimer: new PollTimer({ pollDeadline: 8000 }),
+    instrumentationEmitter: group.instrumentationEmitter,
+    logger: newLogger(),
+    groupId: 'real-group',
+  })
+  group.attach({ rebalanceCoordinator: coordinator, heartbeatManager: null })
+
+  const subscriptions = []
+  const joinAndSync = jest.spyOn(group, 'joinAndSync')
+
+  const round = async (assignment, reason, kind) => {
+    joinAndSync.mockImplementation(async () => {
+      // The subscription this member WOULD send, encoded by the real protocol at the moment the
+      // real round joins.
+      subscriptions.push(
+        MemberMetadata.decode(group.groupMembership.subscriptionFor(probeAssigner, ['t']).metadata)
+      )
+      return { assignment }
+    })
+
+    emitted.length = 0
+    await coordinator.runRound(reason, kind)
+  }
+
+  return { group, coordinator, emitted, subscriptions, round }
+}
+
+/** Encodes whatever the protocol hands it, so a test can read the subscription off the wire. */
+const probeAssigner = {
+  name: 'probe',
+  version: 3,
+  protocol: (subscription) => ({
+    name: 'probe',
+    metadata: MemberMetadata.encode({ version: 3, userData: null, ...subscription }),
+  }),
+}
+
+const partitionsOf = (emitted, type) =>
+  payloadsOf(emitted, type).map(({ partitions }) => partitions)
 
 describe('Consumer > RebalanceCoordinator', () => {
   let unhandled
@@ -328,6 +413,28 @@ describe('Consumer > RebalanceCoordinator', () => {
       expect(consumerGroup.joinAndSync).toHaveBeenCalledTimes(1)
       expect(payloadsOf(emitted, events.REBALANCING)).toHaveLength(1)
       expect(coordinator.rejoinRequested).toBeNull()
+    })
+
+    it('drops a pending reason when the chain throws, instead of handing it to the next chain', async () => {
+      const { coordinator, consumerGroup } = build()
+      const gate = deferred()
+      consumerGroup.joinAndSync.mockImplementationOnce(async () => {
+        await gate.promise
+        throw new Error('join failed')
+      })
+
+      const chain = coordinator.runRound('first', 'revoked')
+      await Promise.resolve()
+      coordinator.runRound('mid-chain', 'revoked')
+      gate.resolve()
+
+      await expect(chain).rejects.toThrow('join failed')
+      expect(coordinator.rejoinRequested).toBeNull()
+
+      // The reason belonged to the membership the failed chain was replacing: the next chain runs
+      // its own round and no more.
+      await coordinator.runRound('next', 'revoked')
+      expect(consumerGroup.joinAndSync).toHaveBeenCalledTimes(2)
     })
 
     it('drains rejoinRequested at the bottom of the loop, not in the finally', async () => {
@@ -784,18 +891,86 @@ describe('Consumer > RebalanceCoordinator', () => {
       })
     })
 
-    it('reports the whole assignment on every eager round', async () => {
-      const assignment = [{ topic: 't', partitions: [0, 1] }]
-      const { coordinator, emitted } = build({
-        assignment,
-        deltas: [{ revoked: assignment, added: assignment }],
-      })
+    it('reports the whole previous and the whole new assignment on an eager round', async () => {
+      const { emitted, round } = createRealRound()
 
-      await coordinator.runRound('rebalance-in-progress', 'revoked')
+      await round({ t: [0, 1, 2, 3] }, 'first', 'revoked')
+      await round({ t: [0, 1] }, 'second', 'revoked')
 
-      expect(payloadsOf(emitted, events.PARTITIONS_REVOKED)[0].partitions).toEqual(assignment)
-      expect(payloadsOf(emitted, events.PARTITIONS_ASSIGNED)[0].partitions).toEqual(assignment)
-      expect(payloadsOf(emitted, events.GROUP_JOIN)[0].rebalanceProtocol).toEqual(EAGER)
+      expect(partitionsOf(emitted, events.PARTITIONS_REVOKED)).toEqual([
+        [{ topic: 't', partitions: [0, 1, 2, 3] }],
+      ])
+      expect(partitionsOf(emitted, events.PARTITIONS_ASSIGNED)).toEqual([
+        [{ topic: 't', partitions: [0, 1] }],
+      ])
+      expect(emitted.map(({ type }) => type)).toEqual([
+        events.PARTITIONS_REVOKED,
+        events.PARTITIONS_ASSIGNED,
+        events.GROUP_JOIN,
+      ])
+    })
+
+    it('reports both, with the whole set, when an eager round changes nothing', async () => {
+      const { emitted, round } = createRealRound()
+
+      await round({ t: [0, 1] }, 'first', 'revoked')
+      await round({ t: [0, 1] }, 'second', 'revoked')
+
+      // The apply replaced the OffsetManager and moved the epoch, so a listener that reopens
+      // per-partition resources has to be told - a delta would have said nothing at all here.
+      expect(partitionsOf(emitted, events.PARTITIONS_REVOKED)).toEqual([
+        [{ topic: 't', partitions: [0, 1] }],
+      ])
+      expect(partitionsOf(emitted, events.PARTITIONS_ASSIGNED)).toEqual([
+        [{ topic: 't', partitions: [0, 1] }],
+      ])
+    })
+
+    it('reports no revocation on a lost round, only the loss and the new assignment', async () => {
+      const { emitted, round } = createRealRound({ mode: COOPERATIVE })
+
+      await round({ t: [0, 1, 2, 3] }, 'first', 'revoked')
+      await round({ t: [0, 1] }, 'lost', 'lost')
+
+      expect(partitionsOf(emitted, events.PARTITIONS_LOST)).toEqual([
+        [{ topic: 't', partitions: [0, 1, 2, 3] }],
+      ])
+      expect(partitionsOf(emitted, events.PARTITIONS_REVOKED)).toEqual([])
+      expect(partitionsOf(emitted, events.PARTITIONS_ASSIGNED)).toEqual([
+        [{ topic: 't', partitions: [0, 1] }],
+      ])
+    })
+
+    it('still reports only the delta on a cooperative round', async () => {
+      const { emitted, round } = createRealRound({ mode: COOPERATIVE })
+
+      await round({ t: [0, 1, 2, 3] }, 'first', 'revoked')
+      await round({ t: [0, 1] }, 'second', 'revoked')
+
+      expect(partitionsOf(emitted, events.PARTITIONS_REVOKED)).toEqual([
+        [{ topic: 't', partitions: [2, 3] }],
+      ])
+      expect(partitionsOf(emitted, events.PARTITIONS_ASSIGNED)).toEqual([])
+    })
+
+    it('advertises no owned partitions in the JoinGroup of an eager round', async () => {
+      const eager = createRealRound()
+
+      await eager.round({ t: [0, 1] }, 'first', 'revoked')
+      await eager.round({ t: [0, 1] }, 'second', 'revoked')
+
+      expect(eager.subscriptions.map(({ ownedPartitions }) => ownedPartitions)).toEqual([[], []])
+
+      // The control: a cooperative member still holds its partitions while it rejoins, so its
+      // subscription has to keep claiming them.
+      const cooperative = createRealRound({ mode: COOPERATIVE })
+
+      await cooperative.round({ t: [0, 1] }, 'first', 'revoked')
+      await cooperative.round({ t: [0, 1] }, 'second', 'revoked')
+
+      expect(cooperative.subscriptions[1].ownedPartitions).toEqual([
+        { topic: 't', partitions: [0, 1] },
+      ])
     })
   })
 
@@ -953,6 +1128,53 @@ describe('Consumer > RebalanceCoordinator', () => {
 
       expect(calls.indexOf('heartbeatManager.stop')).toBeLessThan(calls.indexOf('joinAndSync'))
       expect(calls.indexOf('joinAndSync')).toBeLessThan(calls.indexOf('ensureStarted'))
+    })
+
+    it('does not evict a member whose own round is holding the JoinGroup', async () => {
+      jest.useFakeTimers()
+      const { coordinator, consumerGroup, calls, emitted } = build()
+      const pollTimer = new PollTimer({ pollDeadline: 50 })
+      const manager = new HeartbeatManager({
+        groupMembership: consumerGroup,
+        pollTimer,
+        heartbeatInterval: 20,
+        logger: newLogger(),
+        onError: jest.fn(),
+        onPollExpired: ({ elapsedMs }) => coordinator.onPollExpired({ elapsedMs, isStatic: false }),
+        isRebalancing: () => coordinator.isRebalancing(),
+      })
+      coordinator.heartbeatManager = manager
+      coordinator.pollTimer = pollTimer
+
+      // The coordinator holds JoinGroup until every member rejoins, and the rebalance timeout is
+      // the same number as the poll deadline - so the deadline passes inside the round.
+      const gate = deferred()
+      consumerGroup.joinAndSync.mockImplementation(async () => {
+        await gate.promise
+        return { assignment: {} }
+      })
+
+      try {
+        manager.ensureStarted()
+        const chain = coordinator.runRound('rebalance-in-progress', 'revoked')
+
+        await jest.advanceTimersByTimeAsync(300)
+
+        expect(payloadsOf(emitted, events.POLL_INTERVAL_EXCEEDED)).toHaveLength(0)
+        expect(consumerGroup.leave).not.toHaveBeenCalled()
+        expect(consumerGroup.resetGenerationLocally).not.toHaveBeenCalled()
+        expect(calls.filter((name) => name === 'heartbeat').length).toBeGreaterThan(1)
+
+        gate.resolve()
+        await chain
+
+        // The round completed under its own membership, and reset the deadline itself.
+        expect(payloadsOf(emitted, events.GROUP_JOIN)[0].memberId).toEqual('member-1')
+        expect(pollTimer.expired()).toBe(false)
+      } finally {
+        manager.stop()
+        jest.useRealTimers()
+      }
     })
 
     it('runs the whole expiry sequence and re-arms the manager', async () => {

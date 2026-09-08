@@ -299,7 +299,14 @@ change not listed here did not change observable behavior.
   it used to follow the rebalance timeout, so a `rebalanceTimeout: 120000` waits 65 s for the
   assignment instead of 125 s. That is what the Java client sends. If your group leader genuinely
   needs longer to compute an assignment, raise the client-wide `requestTimeout`, which still raises
-  this one with it. At the default nothing changes: it was 65 s and it stays 65 s.
+  this one with it. At the default nothing changes: it was 65 s and it stays 65 s. The JoinGroup
+  request goes the other way: its client-side timeout is `maxPollInterval + 5000`, so 305 s at the
+  default where 2.2.4 gave 65 s. A JoinGroup is held open by the coordinator until every member has
+  rejoined, so the client has to be willing to wait out the whole rebalance timeout — the Java
+  client sizes it the same way — but a coordinator that accepts a join and then goes silent now
+  stalls that consumer for about five minutes instead of about one, holding an in-flight request
+  slot for that long. A lower client-wide `requestTimeout` does not shorten it; a lower
+  `maxPollInterval` does.
 - **A handler that runs longer than the poll deadline now loses its partitions.** There is now a
   poll-interval guard, as in the Java client. If your `eachMessage`/`eachBatch` handler takes longer
   than `maxPollInterval` (5 minutes by default) to return, the consumer logs a warning, emits
@@ -309,7 +316,11 @@ change not listed here did not change observable behavior.
   `eachMessage`, one KafkaJS batch is bounded by `maxBytesPerPartition` rather than by a record
   count, so a very large batch is measured as a whole — unlike the Java client, which resets the
   clock on every poll of at most `max.poll.records`. And the overrun is noticed on the next
-  heartbeat tick after the deadline passes, never while a JoinGroup is in flight. **The guard is
+  heartbeat tick after the deadline passes, and never while a rebalance round is in flight: the time
+  a member spends blocked in its own JoinGroup belongs to the coordinator, not to your handler, and
+  the round restarts the deadline when it completes. A handler that was already overrunning when a
+  cooperative round began is therefore measured from the end of that round — at most one extra
+  deadline before it is evicted. **The guard is
   weaker than it sounds whenever more than one fetch can make progress**: the deadline is reset on
   every batch hand-off *and* on every fetch round that comes back empty, and fetching is done by one
   fetcher per broker, so it fires only when every one of those fetchers is stalled behind the
@@ -352,10 +363,13 @@ change not listed here did not change observable behavior.
   assigner supports, so deploy 1 is still eager. During deploy 2 the group is briefly mixed —
   members on deploy 1 computing eagerly, restarted ones computing cooperatively, with the
   coordinator picking `cooperative-sticky` for everyone because it is the only name they share. That
-  is safe by construction: the eager members have already given up everything before they rejoin,
-  and the cooperative algorithm never hands a partition to a member that still owns it. Going
-  straight to deploy 2 splits the group with `INCONSISTENT_GROUP_PROTOCOL` until the rollout
-  finishes.
+  is safe by construction: an eager member's JoinGroup advertises no owned partitions — it has
+  given everything up before it rejoins — and the cooperative algorithm never hands a partition to a
+  member that still owns it. It also withholds a partition that two members claim in the same
+  generation, which is what happens when one of them is working from a membership it has already
+  lost: neither gets it for a round, and the follow-up round hands it to whichever member is still
+  in the group. Going straight to deploy 2 splits the group with `INCONSISTENT_GROUP_PROTOCOL` until
+  the rollout finishes.
 - **Java-compatible assigners are available.** `PartitionAssigners.range`, `.sticky` and
   `.cooperativeSticky` implement the Java algorithms and advertise the Java names `range`, `sticky`
   and `cooperative-sticky`, so a group can mix this client with Java consumers. The export key and

@@ -354,8 +354,7 @@ class ConstrainedAssignmentBuilder {
  * Java's general (KIP-54) path, taken as soon as two members subscribe to different topics.
  *
  * It keeps every still-valid previous assignment, hands the rest to the least loaded subscriber,
- * and then repeatedly moves single partitions towards a more balanced assignment - reverting the
- * whole balancing pass when it did not actually improve the balance score.
+ * and then repeatedly moves single partitions towards a more balanced assignment.
  *
  * @see https://github.com/apache/kafka/blob/4.3/clients/src/main/java/org/apache/kafka/clients/consumer/internals/AbstractStickyAssignor.java
  */
@@ -576,7 +575,7 @@ class GeneralAssignmentBuilder {
 
   /**
    * Places the unassigned partitions, then moves partitions around until no move improves the
-   * balance, reverting the whole pass when the balance score did not improve.
+   * balance.
    * @private
    * @param {Map<string, { memberId: string, generation: number }>} previousOwner
    * @param {string[]} unassigned
@@ -827,11 +826,14 @@ class PartitionMovements {
  * @param {{[topic: string]: number[]}} input.partitionsPerTopic every partition of every topic
  *   any member subscribes to
  * @param {StickyMember[]} input.members
+ * @param {Set<string>} [input.contested] filled with the flat keys of the partitions two members
+ *   of the same generation both claimed. They belong to nobody: the cooperative caller withholds
+ *   them for a round, the eager one has no use for them and passes nothing.
  * @returns {Map<string, {[topic: string]: number[]}>} one entry per member, including members
  *   that end up with nothing
  * @see https://github.com/apache/kafka/blob/4.3/clients/src/main/java/org/apache/kafka/clients/consumer/internals/AbstractStickyAssignor.java
  */
-const assignSticky = ({ partitionsPerTopic, members }) => {
+const assignSticky = ({ partitionsPerTopic, members, contested }) => {
   const ordered = [...members].sort(compareMembers)
   const subscribed = new Set(ordered.flatMap(({ topics }) => topics))
   const partitions = {}
@@ -849,6 +851,12 @@ const assignSticky = ({ partitionsPerTopic, members }) => {
     members: ordered,
     allTopics: new Set(Object.keys(partitions)),
   })
+
+  if (contested) {
+    for (const key of doublyClaimed) {
+      contested.add(key)
+    }
+  }
 
   const builder = subscriptionsEqual
     ? new ConstrainedAssignmentBuilder({
@@ -869,4 +877,4 @@ const assignSticky = ({ partitionsPerTopic, members }) => {
   return new Map(ordered.map(({ memberId }) => [memberId, groupByTopic(assigned.get(memberId))]))
 }
 
-module.exports = { assignSticky, DEFAULT_GENERATION }
+module.exports = { assignSticky, DEFAULT_GENERATION, keyOf, topicOf, partitionOf }

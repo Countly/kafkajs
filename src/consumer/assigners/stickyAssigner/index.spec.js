@@ -1,5 +1,6 @@
 const StickyAssigner = require('./index')
-const { stickyUserData, DEFAULT_GENERATION } = require('./stickyUserData')
+const { stickyUserData } = require('./stickyUserData')
+const { DEFAULT_GENERATION } = require('./stickyCore')
 const { MemberAssignment, MemberMetadata } = require('../../assignerProtocol')
 const Encoder = require('../../../protocol/encoder')
 
