@@ -178,6 +178,17 @@ Upstream work this phase builds on, with thanks to its authors: PRs #1779, #1695
 - Every protocol codec added in this release is checked against two independent sources as well as its own hand-built fixtures: byte vectors generated from Apache Kafka's own codecs (`scripts/protocol/javaVectors/run.sh`, extended to cover Fetch v12–v18, Produce v12/v13, OffsetForLeaderEpoch v3/v4 and SaslAuthenticate v2), and bytes captured from a live broker (`node scripts/protocol/capture.js`, whose version report now covers those APIs too). Versions no broker in the test matrix negotiates, and the SASL codec the capture client cannot reach, are recorded as deliberate capture gaps with the Java vector as the second source.
 - The coverage floor enforced by `npm run test:coverage` now ratchets: it is set to the coverage measured at each internal release, rounded down to one decimal (97.1 % statements, 90 % branches, 97.9 % functions, 97.2 % lines at this one), so coverage can only go up.
 
+### Phase 6B — KIP-848 consumer protocol, admin group visibility, fetch prefetch
+
+#### Behavior changes
+
+#### Fixes
+
+#### Additions
+- Added the member state machine and the member-id generator the new consumer group protocol is built on: the ten states and their legal predecessors are the Java client's table, an illegal transition raises an invariant violation rather than being silently allowed, and a member id is 16 random bytes rendered as 22 unpadded base64url characters, re-drawn on the reserved uuid values.
+
+#### Tooling
+
 ### Phase 6A — classic-protocol consumer foundation
 
 #### Behavior changes
