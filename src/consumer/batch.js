@@ -33,6 +33,14 @@ module.exports = class Batch {
      */
     this.assignmentEpoch = null
 
+    /**
+     * Whether this batch came from a fetch issued ahead of the workers, stamped by
+     * `ConsumerGroup#fetch`. A prefetched batch is dropped at dispatch when its partition has
+     * moved on; an ordinary batch never is.
+     * @type {boolean}
+     */
+    this.prefetched = false
+
     this.rawMessages = messages
     // Apparently fetch can return different offsets than the target offset provided to the fetch API.
     // Discard messages that are not in the requested offset

@@ -10,6 +10,7 @@ const { MemberMetadata, MemberAssignment } = require('../assignerProtocol')
 const { COOPERATIVE, EAGER } = require('../groupProtocol/interface')
 const InstrumentationEventEmitter = require('../../instrumentation/emitter')
 const { events } = require('../instrumentationEvents')
+const { KafkaJSProtocolError } = require('../../errors')
 const { createErrorFromCode } = require('../../protocol/error')
 const { stampGeneration, sentGeneration } = require('../rebalanceErrorContract')
 const { newLogger } = require('testHelpers')
@@ -1035,6 +1036,39 @@ describe('Consumer > cooperative rebalance apply', () => {
       expect(incumbent.offsetManager.resolvedEpochs[TOPIC_A][0]).toEqual(4)
       expect(joining.offsetManager.memberAssignment).toEqual({ [TOPIC_A]: [1] })
     })
+
+    it('survives the pre-release commit writing a key the apply then deletes', async () => {
+      const committedOffsets = {}
+      const cluster = { committedOffsets: () => committedOffsets }
+      const offsetCommit = jest.fn(async () => {})
+      // Both managers are built BEFORE the cache is seeded: a fresh manager resets its own
+      // partitions, so seeding first would be undone here rather than in production.
+      const releasing = buildManager(cluster, { [TOPIC_A]: [0, 1] })
+      const sibling = buildManager(cluster, { [TOPIC_B]: [0] })
+      releasing.coordinator = { isConnected: () => true, offsetCommit }
+      committedOffsets[TOPIC_A] = { 0: '10', 1: '20' }
+      committedOffsets[TOPIC_B] = { 0: '30' }
+
+      releasing.resolveOffset({ topic: TOPIC_A, partition: 1, offset: '41' })
+      await releasing.commitOffsets({}, { partitions: [{ topic: TOPIC_A, partitions: [1] }] })
+
+      // The commit wrote into the object every manager on this client shares.
+      expect(committedOffsets[TOPIC_A][1]).toEqual('42')
+
+      releasing.updateAssignment({
+        revoked: [{ topic: TOPIC_A, partitions: [1] }],
+        memberAssignment: { [TOPIC_A]: [0] },
+        generationId: 2,
+        memberId: 'member-1',
+        coordinator: { isConnected: () => true },
+      })
+
+      // The window itself: the key the commit just wrote is gone, and nothing else is - not the
+      // partition this member kept, and not the sibling's topic.
+      expect(committedOffsets[TOPIC_A]).toEqual({ 0: '10' })
+      expect(committedOffsets[TOPIC_B]).toEqual({ 0: '30' })
+      expect(sibling.committedOffsets()[TOPIC_B]).toEqual({ 0: '30' })
+    })
   })
 
   describe('the leader-side cooperative check', () => {
@@ -1173,5 +1207,140 @@ describe('Consumer > cooperative rebalance apply', () => {
         protocol.sync({ topics: [TOPIC_A], topicsSubscribed: [TOPIC_A], beforeSync: () => {} })
       ).resolves.toMatchObject({ assignment: {} })
     })
+  })
+})
+
+describe('Consumer > cooperative rebalance > commit before release', () => {
+  /**
+   * Applies a first assignment, resolves an offset on every partition of it, then applies the
+   * second one incrementally. The resolve is what gives the pre-release commit something to send.
+   */
+  const applyTwice = async (group, { first, second, autoCommit = true, resolve = true }) => {
+    group.autoCommit = autoCommit
+    await group.applyRebalanceResult({ assignment: first }, { rebuildOffsets: true })
+
+    if (resolve) {
+      for (const [topic, partitions] of Object.entries(first)) {
+        for (const partition of partitions) {
+          group.resolveOffset({ topic, partition, offset: `${10 + partition}` })
+        }
+      }
+    }
+
+    return group.applyRebalanceResult({ assignment: second }, { rebuildOffsets: false })
+  }
+
+  it('commits the resolved offsets of the revoked partitions before pruning them', async () => {
+    const { group } = createGroup()
+    const offsetCommit = jest.fn(async () => {})
+    group.coordinator.offsetCommit = offsetCommit
+
+    await applyTwice(group, {
+      first: { [TOPIC_A]: [0, 1] },
+      second: { [TOPIC_A]: [0] },
+    })
+
+    // The commit went out, and it named the partition being released - and only that one.
+    expect(offsetCommit).toHaveBeenCalledTimes(1)
+    const [{ topics }] = offsetCommit.mock.calls[0]
+    const released = topics
+      .find(({ topic }) => topic === TOPIC_A)
+      .partitions.map(({ partition }) => Number(partition))
+    expect(released).toEqual([1])
+  })
+
+  it('sends it under the refreshed membership, not the previous snapshot', async () => {
+    const { group } = createGroup()
+    const offsetCommit = jest.fn(async () => {})
+    group.autoCommit = true
+    group.coordinator.offsetCommit = offsetCommit
+
+    await group.applyRebalanceResult(
+      { assignment: { [TOPIC_A]: [0, 1] } },
+      { rebuildOffsets: true }
+    )
+    group.resolveOffset({ topic: TOPIC_A, partition: 1, offset: '10' })
+    group.generationId = 7
+    group.memberId = 'member-7'
+
+    await group.applyRebalanceResult({ assignment: { [TOPIC_A]: [0] } }, { rebuildOffsets: false })
+
+    expect(offsetCommit).toHaveBeenCalledWith(
+      expect.objectContaining({ groupGenerationId: 7, memberId: 'member-7' })
+    )
+  })
+
+  it('proceeds with the round when the commit fails', async () => {
+    const { group } = createGroup()
+    const offsetCommit = jest.fn(async () => {
+      throw new Error('coordinator is unavailable')
+    })
+    group.coordinator.offsetCommit = offsetCommit
+
+    const result = await applyTwice(group, {
+      first: { [TOPIC_A]: [0, 1] },
+      second: { [TOPIC_A]: [0] },
+    })
+
+    // The throwing mock was actually reached, and the round still completed.
+    expect(offsetCommit).toHaveBeenCalledTimes(1)
+    expect(result.revoked).toEqual([{ topic: TOPIC_A, partitions: [1] }])
+    expect(group.assigned()).toEqual([{ topic: TOPIC_A, partitions: [0] }])
+  })
+
+  it('swallows a LOST-class commit failure instead of throwing out of the apply', async () => {
+    const { group } = createGroup()
+    const offsetCommit = jest.fn(async () => {
+      throw new KafkaJSProtocolError(createErrorFromCode(ILLEGAL_GENERATION))
+    })
+    group.coordinator.offsetCommit = offsetCommit
+
+    await expect(
+      applyTwice(group, { first: { [TOPIC_A]: [0, 1] }, second: { [TOPIC_A]: [0] } })
+    ).resolves.toMatchObject({ revoked: [{ topic: TOPIC_A, partitions: [1] }] })
+    expect(offsetCommit).toHaveBeenCalledTimes(1)
+  })
+
+  it('does not commit when autoCommit is off', async () => {
+    const { group } = createGroup()
+    const offsetCommit = jest.fn(async () => {})
+    group.coordinator.offsetCommit = offsetCommit
+
+    await applyTwice(group, {
+      first: { [TOPIC_A]: [0, 1] },
+      second: { [TOPIC_A]: [0] },
+      autoCommit: false,
+    })
+
+    expect(offsetCommit).not.toHaveBeenCalled()
+  })
+
+  it('does not commit when a cooperative round revokes nothing', async () => {
+    const { group } = createGroup()
+    const offsetCommit = jest.fn(async () => {})
+    group.coordinator.offsetCommit = offsetCommit
+
+    await applyTwice(group, {
+      first: { [TOPIC_A]: [0] },
+      second: { [TOPIC_A]: [0, 1] },
+    })
+
+    expect(offsetCommit).not.toHaveBeenCalled()
+  })
+
+  it('does not commit on the rebuild path, where the verdict already committed', async () => {
+    const { group } = createGroup()
+    const offsetCommit = jest.fn(async () => {})
+    group.autoCommit = true
+    group.coordinator.offsetCommit = offsetCommit
+
+    await group.applyRebalanceResult(
+      { assignment: { [TOPIC_A]: [0, 1] } },
+      { rebuildOffsets: true }
+    )
+    group.resolveOffset({ topic: TOPIC_A, partition: 1, offset: '10' })
+    await group.applyRebalanceResult({ assignment: { [TOPIC_A]: [0] } }, { rebuildOffsets: true })
+
+    expect(offsetCommit).not.toHaveBeenCalled()
   })
 })

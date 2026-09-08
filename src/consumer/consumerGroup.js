@@ -11,7 +11,14 @@ const PositionValidator = require('./positionValidator')
 const {
   events: { CONNECT, RECEIVED_UNSUBSCRIBED_TOPICS, LOG_TRUNCATION },
 } = require('./instrumentationEvents')
-const { KafkaJSError, KafkaJSStaleTopicMetadataAssignment, isRebalancing } = require('../errors')
+const {
+  KafkaJSError,
+  KafkaJSStaleTopicMetadataAssignment,
+  isRebalancing,
+  isLostMember,
+  isFatalMembership,
+  isFencedInstance,
+} = require('../errors')
 const { failure, createErrorFromCode } = require('../protocol/error')
 const {
   partitionFetchAction,
@@ -21,7 +28,15 @@ const {
 const apiKeys = require('../protocol/requests/apiKeys')
 const { requests } = require('../protocol/requests')
 const ClassicGroupProtocol = require('./groupProtocol/classic')
+const ConsumerGroupProtocol = require('./groupProtocol/consumer')
+const { sentGeneration } = require('./rebalanceErrorContract')
 const { EAGER } = require('./groupProtocol/interface')
+
+/** @see https://github.com/apache/kafka/blob/4.3/clients/src/main/java/org/apache/kafka/common/protocol/Errors.java */
+const STALE_MEMBER_EPOCH = 'STALE_MEMBER_EPOCH'
+
+/** How often the pre-release commit re-checks whether the heartbeats have installed a new epoch. */
+const STALE_EPOCH_POLL_INTERVAL = 100
 
 // One warning once a partition has failed five rounds running, then one every twenty-five.
 const FETCH_ERROR_WARN_THRESHOLD = 5
@@ -86,6 +101,21 @@ module.exports = class ConsumerGroup {
    *                                id (owned by the long-lived `Consumer`; passed through to every
    *                                `OffsetManager` this group builds, since the group itself is
    *                                rebuilt on every crash restart).
+   * @param {'classic'|'consumer'} [options.groupProtocol='classic'] which group membership protocol
+   *                                to run. `'consumer'` is the broker-driven KIP-848 protocol.
+   * @param {string|null} [options.groupRemoteAssignor=null] the server-side assignor name to ask
+   *                                for; `null` lets the coordinator pick its first configured one.
+   *                                Consumer protocol only.
+   * @param {string|null} [options.subscribedTopicRegex=null] an RE2 pattern sent to the coordinator
+   *                                verbatim; consumer protocol only.
+   * @param {{ fromBeginning: boolean }|null} [options.regexSubscription=null] the options the regex
+   *                                subscription was made with, copied to a name-keyed
+   *                                `topicConfigurations` entry for every name the regex resolves to.
+   * @param {0|1} [options.maxPrefetchBatches=0] how many fetch responses may be in flight ahead of
+   *                                the workers. Accepted here and used by the fetch layer.
+   * @param {number} [options.heartbeatInterval=3000] the configured heartbeat cadence. Forwarded to
+   *                                the classic membership, which owns the interval; under the
+   *                                consumer protocol the coordinator owns it and this is ignored.
    */
   constructor({
     retry,
@@ -112,6 +142,12 @@ module.exports = class ConsumerGroup {
     rebalanceProtocol = EAGER,
     metadataMaxAge,
     pendingTopicResets = new Map(),
+    groupProtocol = 'classic',
+    groupRemoteAssignor = null,
+    subscribedTopicRegex = null,
+    regexSubscription = null,
+    maxPrefetchBatches = 0,
+    heartbeatInterval = 3000,
   }) {
     /** @type {import("../../types").Cluster} */
     this.cluster = cluster
@@ -135,21 +171,43 @@ module.exports = class ConsumerGroup {
     this.metadataMaxAge = metadataMaxAge
     this.pendingTopicResets = pendingTopicResets
 
-    /** @type {ClassicGroupProtocol} */
-    this.groupMembership = new ClassicGroupProtocol({
+    this.rebalanceTimeout = rebalanceTimeout
+    this.subscribedTopicRegex = subscribedTopicRegex
+    this.regexSubscription = regexSubscription
+    this.maxPrefetchBatches = maxPrefetchBatches
+
+    const membershipOptions = {
       cluster,
       groupId,
       groupInstanceId,
-      sessionTimeout,
       rebalanceTimeout,
-      assigners,
-      mode: rebalanceProtocol,
       rackId,
       instrumentationEmitter,
       // `this.logger`, already namespaced, rather than the raw `logger`: the protocol logs through
       // the same object the group exposes, so anything observing the group's logger keeps working.
       logger: this.logger,
-    })
+    }
+
+    /** @type {import('./groupProtocol/interface').GroupProtocol} */
+    this.groupMembership =
+      groupProtocol === 'consumer'
+        ? new ConsumerGroupProtocol({
+            ...membershipOptions,
+            // The protocol calls it `serverAssignor` because that is the wire field's name; this
+            // layer calls it `groupRemoteAssignor` because that is the public option's name.
+            serverAssignor: groupRemoteAssignor,
+            topics: this.topics,
+            subscribedTopicRegex,
+            metadataMaxAge,
+            retry,
+          })
+        : new ClassicGroupProtocol({
+            ...membershipOptions,
+            sessionTimeout,
+            heartbeatInterval,
+            assigners,
+            mode: rebalanceProtocol,
+          })
 
     this.seekOffset = new SeekOffsets()
 
@@ -212,12 +270,19 @@ module.exports = class ConsumerGroup {
   /**
    * Late-binds the collaborators the `Runner` owns. The group is constructed before the runner
    * that builds them, so they cannot arrive through this object's constructor.
+   *
+   * The membership is also given the pre-release commit, because a leave at epoch > 0 has to
+   * commit before it gives its partitions up and the membership cannot reach an offset manager.
    * @param {{ rebalanceCoordinator: Object, heartbeatManager: Object }} deps
    * @returns {void}
    */
   attach({ rebalanceCoordinator, heartbeatManager }) {
     this.rebalanceCoordinator = rebalanceCoordinator
-    this.groupMembership.attach({ rebalanceCoordinator, heartbeatManager })
+    this.groupMembership.attach({
+      rebalanceCoordinator,
+      heartbeatManager,
+      commitBeforeRelease: (partitions) => this.commitBeforeRelease(partitions),
+    })
   }
 
   /**
@@ -317,6 +382,81 @@ module.exports = class ConsumerGroup {
 
   set lastRequest(value) {
     this.groupMembership.lastRequest = value
+  }
+
+  /**
+   * Which membership protocol is running. Read by the coordinator's follow-up condition and stale-
+   * verdict guard, by the runner's stop and heartbeat paths, and by the error contract - none of
+   * which can reach the protocol object.
+   * @returns {'classic'|'consumer'}
+   */
+  get kind() {
+    return this.groupMembership.kind
+  }
+
+  /** @returns {number|null} the current member epoch, null under the classic protocol */
+  get memberEpoch() {
+    return this.groupMembership.memberEpoch ?? null
+  }
+
+  /**
+   * The delay the heartbeat chain should use next. Configured under classic; the coordinator's
+   * `HeartbeatIntervalMs`, or a pending backoff's remainder, under the consumer protocol.
+   * @returns {number} milliseconds
+   */
+  heartbeatInterval() {
+    return this.groupMembership.heartbeatInterval()
+  }
+
+  /**
+   * Whether the membership holds a target assignment that still differs from what this member
+   * owns. Always false under classic. Unresolved topic ids deliberately do NOT make it true - an
+   * id that can never resolve would otherwise spin the rebalance chain into its convergence guard.
+   * @returns {boolean}
+   */
+  needsReconciliation() {
+    return this.groupMembership.needsReconciliation()
+  }
+
+  /**
+   * Routes an error raised on the commit or fetch path into the membership state machine, so a
+   * fencing learned somewhere other than a heartbeat still leaves the member where the recovery
+   * round expects it. Idempotent; a no-op under classic.
+   * @param {Error} error
+   * @returns {void}
+   */
+  onMembershipError(error) {
+    return this.groupMembership.onMembershipError(error)
+  }
+
+  /**
+   * Tells the membership the consumer is shutting down, so a join waiting on the coordinator is
+   * rejected rather than waiting for a heartbeat chain that is about to be cancelled. A no-op
+   * under classic.
+   * @returns {void}
+   */
+  onStopRequested() {
+    return this.groupMembership.onStopRequested()
+  }
+
+  /**
+   * The poll-expiry variant of `leave()`: no commit, no callbacks, response ignored. A no-op under
+   * classic, whose poll-expiry path uses `leave()` or sends nothing at all.
+   * @returns {Promise<void>}
+   */
+  async leaveForPollExpiry() {
+    return this.groupMembership.leaveForPollExpiry()
+  }
+
+  /**
+   * The offset this partition has resolved to, as the decimal string the offset manager stores.
+   * A pure read: no seeding, no allocation, and `undefined` before an offset manager exists.
+   * @param {string} topic
+   * @param {number} partition
+   * @returns {string|undefined}
+   */
+  resolvedOffsetAt(topic, partition) {
+    return this.offsetManager ? this.offsetManager.resolvedOffsetAt(topic, partition) : undefined
   }
 
   isLeader() {
@@ -459,6 +599,12 @@ module.exports = class ConsumerGroup {
 
     const { added, revoked } = this.groupMembership.diffAssignment(currentMemberAssignment)
 
+    // Before anything prunes them, and before `updateAssignment` replaces the membership the
+    // offset manager commits under.
+    if (!rebuildOffsets && revoked.length) {
+      await this.commitBeforeRelease(revoked)
+    }
+
     // Narrowed before the apply mutates anything: a revoked partition must stop being advertised
     // and stop accepting resolved offsets the instant the apply decides it is gone. `setOwned`
     // below is the widening half.
@@ -487,6 +633,9 @@ module.exports = class ConsumerGroup {
         memberId,
         groupInstanceId: this.groupInstanceId,
         pendingTopicResets: this.pendingTopicResets,
+        membershipProtocol: this.kind,
+        staleEpochTimeout: this.rebalanceTimeout,
+        logger: this.logger,
       })
       this.assignmentEpoch += 1
 
@@ -551,6 +700,7 @@ module.exports = class ConsumerGroup {
           beforeSync: () => {
             this.partitionsPerSubscribedTopic = this.generatePartitionsPerSubscribedTopic()
           },
+          growSubscription: (names) => this.growSubscription(names),
         })
       } catch (e) {
         if (isRebalancing(e)) {
@@ -558,13 +708,64 @@ module.exports = class ConsumerGroup {
         }
 
         if (e.type === 'UNKNOWN_MEMBER_ID') {
-          this.memberId = null
+          // KIP-848 members keep their id for life: the coordinator answers 25 for an epoch it no
+          // longer recognises, not for an id it wants replaced.
+          if (this.kind === 'classic') {
+            this.memberId = null
+          }
+
+          throw new KafkaJSError(e)
+        }
+
+        // A fencing that lands while the join is in flight must rejoin, not crash. It is not in
+        // `isRebalancing`'s list, and under the classic protocol the equivalent code (22) is - so
+        // this arm exists only because the consumer protocol's fencing codes are different.
+        if (isLostMember(e) && !isFatalMembership(e) && !isFencedInstance(e)) {
+          throw new KafkaJSError(e)
+        }
+
+        // A join the membership gave up on because the coordinator took longer than the rebalance
+        // timeout to answer. Retried rather than fatal: the next attempt starts a fresh deadline,
+        // and a round that never settles is what the deadline exists to prevent.
+        if (e.type === 'JOIN_DEADLINE_EXCEEDED') {
           throw new KafkaJSError(e)
         }
 
         bail(e)
       }
     })
+  }
+
+  /**
+   * Widens the subscription with names a broker-computed assignment resolved to, before the apply
+   * can filter them out as unsubscribed.
+   *
+   * Three things in order, each of which something downstream would otherwise trip over: the name
+   * set, a name-keyed `topicConfigurations` entry (the offset manager indexes it positionally and
+   * destructures the result), and a cluster target topic (without which metadata is never fetched
+   * for it).
+   *
+   * NEVER pushes: `this.topics` and `this.topicsSubscribed` are the same array object at
+   * construction, so a mutation would edit both.
+   * @param {string[]} names newly resolved topic names
+   * @returns {Promise<void>}
+   */
+  async growSubscription(names) {
+    const added = names.filter((name) => !this.topicsSubscribed.includes(name))
+
+    if (!added.length) {
+      return
+    }
+
+    this.topicsSubscribed = [...this.topicsSubscribed, ...added]
+
+    for (const name of added) {
+      this.topicConfigurations[name] = this.topicConfigurations[name] || {
+        ...this.regexSubscription,
+      }
+    }
+
+    await this.cluster.addMultipleTargetTopics(added)
   }
 
   /**
@@ -670,8 +871,14 @@ module.exports = class ConsumerGroup {
     await this.offsetManager.commitOffsetsIfNecessary()
   }
 
-  async commitOffsets(offsets) {
-    await this.offsetManager.commitOffsets(offsets)
+  /**
+   * @param {import("../../types").Offsets} [offsets]
+   * @param {{ partitions?: import('./groupProtocol/interface').TopicPartitions[]|null, auto?: boolean }} [options]
+   *   forwarded verbatim to the offset manager, which owns what each flag means
+   * @returns {Promise<void>}
+   */
+  async commitOffsets(offsets, options) {
+    await this.offsetManager.commitOffsets(offsets, options)
   }
 
   uncommittedOffsets() {
@@ -686,6 +893,105 @@ module.exports = class ConsumerGroup {
     if (this.offsetManager) {
       this.offsetManager.clearAllOffsets()
     }
+  }
+
+  /**
+   * Commits what handlers resolved on the partitions this member is about to stop owning, before
+   * anything prunes them.
+   *
+   * Called with the revoked delta by the incremental apply, and with the whole owned set by a
+   * group exit - hence "release" rather than "revoke". Without it a partition that moves between
+   * members redelivers everything since the last periodic commit.
+   *
+   * Every failure is logged and SWALLOWED, including a lost membership. This runs inside
+   * `applyRebalanceResult`, which a background rebalance chain drives and whose only error sink is
+   * the consumer's crash handler; a throw here would turn a failed commit into a dead consumer.
+   * The next heartbeat reports the membership loss on a path that has a verdict.
+   * @see https://github.com/apache/kafka/blob/4.3/clients/src/main/java/org/apache/kafka/clients/consumer/internals/ConsumerMembershipManager.java
+   *
+   * A stale member epoch is the one retried case: the request is rebuilt from the membership and
+   * the offsets each attempt, so a retry carries the epoch the heartbeats have installed by then.
+   * Bounded by `rebalanceTimeout` - the limit the broker enforces on the reconciliation - and
+   * abandoned the moment a stop is requested, because the chain this runs inside is one the
+   * runner's `stop()` waits for.
+   *
+   * @param {import('./groupProtocol/interface').TopicPartitions[]} partitions the partitions this
+   *   member is about to stop owning
+   * @returns {Promise<void>} always resolves
+   */
+  async commitBeforeRelease(partitions) {
+    if (!this.autoCommit || !this.offsetManager || !partitions.length) {
+      return
+    }
+
+    const deadline = Date.now() + this.rebalanceTimeout
+
+    for (;;) {
+      // The manager's membership snapshot is still the previous generation at this point: it is
+      // written at construction and at `updateAssignment`, and this call deliberately precedes
+      // both.
+      this.offsetManager.useMembership({
+        generationId: this.generationId,
+        memberId: this.memberId,
+        coordinator: this.coordinator,
+      })
+
+      try {
+        await this.offsetManager.commitOffsets({}, { partitions })
+        return
+      } catch (e) {
+        if (!(await this.awaitFreshEpochFor(e, deadline))) {
+          this.logger.warn(
+            'Commit before releasing partitions failed; proceeding with the rebalance',
+            {
+              groupId: this.groupId,
+              memberId: this.memberId,
+              generationId: this.generationId,
+              error: e.message || e,
+            }
+          )
+
+          return
+        }
+      }
+    }
+  }
+
+  /**
+   * Whether a failed pre-release commit is worth re-sending, and if so waits until it is.
+   *
+   * Only a stale member epoch qualifies, and only once the coordinator has actually given this
+   * member a newer one - re-sending the same epoch would draw the same answer forever.
+   * @private
+   * @param {Error} error
+   * @param {number} deadline `Date.now()` past which the commit is abandoned
+   * @returns {Promise<boolean>}
+   */
+  async awaitFreshEpochFor(error, deadline) {
+    if (this.kind !== 'consumer' || error.type !== STALE_MEMBER_EPOCH) {
+      return false
+    }
+
+    const sentUnder = sentGeneration(error)
+
+    while (Date.now() < deadline && !this.isStopping()) {
+      if (this.generationId > 0 && this.generationId !== sentUnder) {
+        return true
+      }
+
+      await sleep(STALE_EPOCH_POLL_INTERVAL)
+    }
+
+    return false
+  }
+
+  /** @private @returns {boolean} whether the runner has been asked to stop */
+  isStopping() {
+    return Boolean(
+      this.rebalanceCoordinator &&
+      this.rebalanceCoordinator.runner &&
+      this.rebalanceCoordinator.runner.stopRequested
+    )
   }
 
   async heartbeat({ interval }) {
@@ -713,10 +1019,16 @@ module.exports = class ConsumerGroup {
    * recovers or rethrows, and the round then yields no batches.
    *
    * @param {number} nodeId the broker to fetch from
+   * @param {object} [options]
+   * @param {Map<string, string>|null} [options.offsetOverrides=null] `topic|partition` -> the
+   *   offset to fetch from instead of the resolved one. Ephemeral: it belongs to this request and
+   *   nothing stores it.
+   * @param {boolean} [options.prefetch=false] stamps every batch this request produces, so the
+   *   dispatch can drop one whose partition has moved on.
    * @returns {Promise<Batch[]>} one batch per fetched partition; empty when nothing was owed,
    *   when the round was recovered from an error, or when every response entry was dropped
    */
-  async fetch(nodeId) {
+  async fetch(nodeId, { offsetOverrides = null, prefetch = false } = {}) {
     try {
       await this.cluster.refreshMetadataIfNecessary()
       this.checkForStaleAssignment()
@@ -730,7 +1042,7 @@ module.exports = class ConsumerGroup {
       await this.seekOffsets(topicPartitions)
       await this.validatePositions(topicPartitions)
 
-      const requests = this.buildFetchRequests(topicPartitions)
+      const requests = this.buildFetchRequests(topicPartitions, { offsetOverrides })
 
       if (!requests.length) {
         await sleep(this.maxWaitTime)
@@ -829,6 +1141,7 @@ module.exports = class ConsumerGroup {
 
       for (const batch of batches) {
         batch.assignmentEpoch = assignmentEpoch
+        batch.prefetched = prefetch
       }
 
       return batches
@@ -852,11 +1165,14 @@ module.exports = class ConsumerGroup {
    *
    * @private
    * @param {import("../../types").TopicPartitions[]} topicPartitions the node-filtered assignment
+   * @param {object} [options]
+   * @param {Map<string, string>|null} [options.offsetOverrides=null] `topic|partition` -> the
+   *   offset to fetch from instead of the resolved one, for the partitions it names
    * @returns {{topic: string, partitions: {partition: number, fetchOffset: string,
    *   currentLeaderEpoch: number, maxBytes: number}[]}[]} one entry per topic with something to
    *   fetch; a topic whose partitions were all filtered out is absent
    */
-  buildFetchRequests(topicPartitions) {
+  buildFetchRequests(topicPartitions, { offsetOverrides = null } = {}) {
     const committedOffsets = this.offsetManager.committedOffsets()
     const activeTopicPartitions = this.getActiveTopicPartitions()
 
@@ -872,7 +1188,9 @@ module.exports = class ConsumerGroup {
           )
           .map((partition) => ({
             partition,
-            fetchOffset: this.offsetManager.nextOffset(topic, partition).toString(),
+            fetchOffset:
+              (offsetOverrides && offsetOverrides.get(`${topic}|${partition}`)) ||
+              this.offsetManager.nextOffset(topic, partition).toString(),
             // The client's current view of this partition's leader epoch, so the broker can
             // reject a request built on metadata that has since moved. -1 when the cache has
             // not seen the partition, which is the field's own wire default and means

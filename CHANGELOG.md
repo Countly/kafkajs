@@ -246,6 +246,8 @@ Adopted upstream PRs are credited here by number as they land (Phase 2 onward).
 
 - `admin.describeGroups()` still sends one request per coordinator, and an error the newer API reports for a single group no longer fails that whole request: it is carried on that group's row as `errorCode`/`errorMessage` while the other groups come back normally. Missing-group and unsupported-version answers from the newer API are routing signals and are never raised. A coordinator that is loading or has moved is retried on the configured retry budget as before, and a transport or coordinator error that outlives the budget still fails the call. Results are not returned in the order you passed the ids in — they were not before either, and it is now stated.
 
+- **A cooperative rebalance now commits the partitions it gives up, before it gives them up.** With `autoCommit: true` and a cooperative assigner (`CooperativeStickyAssigner`, or any assigner selecting the cooperative protocol), a round that revokes partitions now commits whatever your handler resolved on those partitions before they are pruned, using the generation the round just established. Previously those offsets were dropped, so a partition moving between members redelivered everything since the last periodic commit. The commit is best-effort: any failure — including a lost membership — is logged at warn and the rebalance proceeds, exactly as the Java client does. With `autoCommit: false` nothing changes: your `eachBatch` commits stay yours. Eager rounds are unaffected — they already committed everything before joining.
+
 #### Fixes
 
 #### Additions
@@ -281,6 +283,8 @@ Adopted upstream PRs are credited here by number as they land (Phase 2 onward).
 - `admin.describeGroups()` now describes both classic and KIP-848 consumer groups. Each group id is described through ConsumerGroupDescribe where the broker offers it and through DescribeGroups otherwise, in one result shape that keeps every field the call returned before — `errorCode` included — and adds `groupType`, `groupEpoch`, `assignmentEpoch`, `assignorName`, `authorizedOperations`, `errorMessage`, and per member `groupInstanceId`, `rackId`, `memberEpoch`, `assignment`, `targetAssignment`, `memberType`, `subscribedTopics` and `subscribedTopicRegex`. A consumer-group member's `memberAssignment` buffer is produced by this client from the assignment the broker sent, so tooling that decodes it keeps working.
 
 - Offset commits and fetches follow the group protocol: under `groupProtocol: 'consumer'` the commit carries the member epoch (OffsetCommit v9's `GenerationIdOrMemberEpoch`) and the fetch carries `MemberId`/`MemberEpoch` (OffsetFetch v9). Classic consumers and the admin client send neither and are byte-compatible with 2.2.4. A `STALE_MEMBER_EPOCH` (113) answer is handled per call site, as the Java client does: an interval auto-commit is logged and skipped (the next one carries the fresh epoch), the commit a rebalance issues before releasing partitions is re-sent under the new epoch within the rebalance timeout, and a deliberate `commitOffsets()` fails with the protocol error. 113 remains non-retriable, matching `Errors.java`.
+
+- The consumer group is built from a `groupProtocol` option: `'classic'` (the default, unchanged) or `'consumer'` (KIP-848). Under `'consumer'` it also accepts `groupRemoteAssignor` and a regex subscription, and forwards the membership's kind, epoch and heartbeat interval to the components that need them.
 
 #### Tooling
 
