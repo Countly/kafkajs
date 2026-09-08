@@ -248,15 +248,15 @@
     {
       "kafkaName": "ConsumerGroupHeartbeat",
       "apiKey": 68,
-      "forkName": null,
-      "apiKeysName": null,
-      "planned": "phase-6"
+      "forkName": "consumerGroupHeartbeat",
+      "apiKeysName": "ConsumerGroupHeartbeat",
+      "planned": "done"
     },
     {
       "kafkaName": "ConsumerGroupDescribe",
       "apiKey": 69,
       "forkName": null,
-      "apiKeysName": null,
+      "apiKeysName": "ConsumerGroupDescribe",
       "planned": "phase-6"
     },
     {

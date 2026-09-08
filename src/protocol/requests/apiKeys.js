@@ -46,4 +46,6 @@ module.exports = {
   IncrementalAlterConfigs: 44,
   AlterPartitionReassignments: 45,
   ListPartitionReassignments: 46,
+  ConsumerGroupHeartbeat: 68, // KIP-848; the whole membership protocol is this one API
+  ConsumerGroupDescribe: 69, // KIP-848 admin counterpart
 }
