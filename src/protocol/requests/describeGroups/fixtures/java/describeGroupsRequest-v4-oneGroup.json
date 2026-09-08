@@ -1,0 +1,7 @@
+{
+  "message": "DescribeGroupsRequest",
+  "version": 4,
+  "case": "oneGroup",
+  "hex": "00000001000a746573742d67726f757001",
+  "fields": { "groupIds": ["test-group"], "includeAuthorizedOperations": true }
+}

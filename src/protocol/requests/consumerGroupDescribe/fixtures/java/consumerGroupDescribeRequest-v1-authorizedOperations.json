@@ -1,0 +1,7 @@
+{
+  "message": "ConsumerGroupDescribeRequest",
+  "version": 1,
+  "case": "authorizedOperations",
+  "hex": "020b746573742d67726f75700100",
+  "fields": { "groupIds": ["test-group"], "includeAuthorizedOperations": true }
+}

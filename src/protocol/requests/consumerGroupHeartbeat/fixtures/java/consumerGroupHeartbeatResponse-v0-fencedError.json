@@ -1,0 +1,7 @@
+{
+  "message": "ConsumerGroupHeartbeatResponse",
+  "version": 0,
+  "case": "fencedError",
+  "hex": "00000000006e6c546865206d656d6265722065706f63682069732066656e636564206279207468652067726f757020636f6f7264696e61746f722e20546865206d656d626572206d757374206162616e646f6e20616c6c2069747320706172746974696f6e7320616e642072656a6f696e2e000000000000000000ff00",
+  "fields": { "throttleTime": 0, "errorCode": 110, "errorMessage": "The member epoch is fenced by the group coordinator. The member must abandon all its partitions and rejoin.", "memberId": null, "memberEpoch": 0, "heartbeatIntervalMs": 0, "assignment": null }
+}

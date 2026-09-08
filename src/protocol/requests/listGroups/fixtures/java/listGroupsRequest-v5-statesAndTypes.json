@@ -1,0 +1,7 @@
+{
+  "message": "ListGroupsRequest",
+  "version": 5,
+  "case": "statesAndTypes",
+  "hex": "0207537461626c650209436f6e73756d657200",
+  "fields": { "states": ["Stable"], "types": ["Consumer"] }
+}

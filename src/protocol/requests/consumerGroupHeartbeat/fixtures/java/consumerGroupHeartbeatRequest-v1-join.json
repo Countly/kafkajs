@@ -1,0 +1,7 @@
+{
+  "message": "ConsumerGroupHeartbeatRequest",
+  "version": 1,
+  "case": "join",
+  "hex": "0b746573742d67726f75700c746573742d6d656d626572000000000000000493e0020b746573742d746f70696300000100",
+  "fields": { "groupId": "test-group", "memberId": "test-member", "memberEpoch": 0, "instanceId": null, "rackId": null, "rebalanceTimeoutMs": 300000, "subscribedTopicNames": ["test-topic"], "subscribedTopicRegex": null, "serverAssignor": null, "topicPartitions": [] }
+}

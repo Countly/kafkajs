@@ -1,0 +1,7 @@
+{
+  "message": "ConsumerGroupHeartbeatRequest",
+  "version": 0,
+  "case": "staticJoinWithAssignor",
+  "hex": "0b746573742d67726f75700c746573742d6d656d626572000000000e746573742d696e7374616e63650a746573742d7261636b000493e0020b746573742d746f70696308756e69666f726d0100",
+  "fields": { "groupId": "test-group", "memberId": "test-member", "memberEpoch": 0, "instanceId": "test-instance", "rackId": "test-rack", "rebalanceTimeoutMs": 300000, "subscribedTopicNames": ["test-topic"], "serverAssignor": "uniform", "topicPartitions": [] }
+}

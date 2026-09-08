@@ -1,0 +1,7 @@
+{
+  "message": "ConsumerGroupHeartbeatRequest",
+  "version": 0,
+  "case": "ownedPartitions",
+  "hex": "0b746573742d67726f75700c746573742d6d656d626572000000050000ffffffff0000020102030405060708090a0b0c0d0e0f100300000000000000020000",
+  "fields": { "groupId": "test-group", "memberId": "test-member", "memberEpoch": 5, "instanceId": null, "rackId": null, "rebalanceTimeoutMs": -1, "subscribedTopicNames": null, "serverAssignor": null, "topicPartitions": [{ "topicId": "01020304-0506-0708-090a-0b0c0d0e0f10", "partitions": [0, 2] }] }
+}

@@ -36,6 +36,67 @@ The jar itself is downloaded into a temporary directory and is never committed t
 — only the emitted `*_java.json` fixtures are. Re-run the script whenever a codec's fixture values
 change, and commit the regenerated files alongside the codec change.
 
+## Message vectors for the consumer-protocol and group-visibility APIs
+
+`scripts/protocol/javaVectors/runAssignors.sh messages` is the third entry point. It compiles
+`GenerateMessageVectors.java` against the same two jars and writes 45 fixtures under
+`src/protocol/requests/<api>/fixtures/java/`, one per case, covering:
+
+| API | Key | Versions | Vectors |
+|---|---|---|---|
+| ConsumerGroupHeartbeat | 68 | 0, 1 | 17 |
+| ConsumerGroupDescribe | 69 | 0, 1 | 6 |
+| ListGroups | 16 | 3, 4, 5 | 8 |
+| DescribeGroups | 15 | 3, 4, 5, 6 | 9 |
+| OffsetCommit | 8 | 9 | 2 |
+| OffsetFetch | 9 | 9 | 3 |
+
+`runAssignors.sh` with no subcommand, or with `assignors`, does exactly what it did before, and
+`run.sh`/`GenerateVectors.java` are unchanged and still own every pre-6B vector.
+
+### Fixture schema
+
+These files are named `<message>-v<version>-<case>.json` and live in a `java/` subdirectory, which
+is what distinguishes them from the older `v<N>_<request|response>_java.json` fixtures written
+directly under `<api>/fixtures/`. Each holds one case:
+
+| Field | Meaning |
+|---|---|
+| `message` | the Apache message name, e.g. `ConsumerGroupHeartbeatRequest` |
+| `version` | the version the bytes were serialized at |
+| `case` | the case name, matching the file name |
+| `hex` | the message body Kafka's own codec produced, lower-case hex, no request header |
+| `fields` | the values the message was built from, in the **Java message field names** (lower-camel: `throttleTime`, `topics`, `leaderEpoch`, …) — **not** this client's decoded key names, which the shipped decoders choose per API (`responses`, `committedLeaderEpoch`, `clientSideThrottleTime`, …). A codec test compares the **hex** both ways and maps `fields` onto its own decoded shape explicitly; it must never assume the two key sets coincide |
+
+`fields` speaks the decoder's vocabulary rather than the schema's — `topic` not `Name`,
+`state`/`protocol` not `GroupState`/`ProtocolData`, `groupGenerationId` not
+`GenerationIdOrMemberEpoch`, and an int64 offset as a string — so a spec can encode from `fields`
+and compare against `hex`, and decode `hex` and compare against `fields`, in one `toEqual` each. A
+field a version does not carry is rendered as the value the decoder reports for it (`""`,
+`null`), never omitted. `memberMetadata`/`memberAssignment` travel as hex strings so they compare
+cleanly with a `Buffer`.
+
+The topic id constant is written in canonical 8-4-4-4-12 form and parsed through
+`java.util.UUID`, because `Uuid.fromString` decodes Kafka's base64 uuid form instead.
+
+### The two cases that exist to pin one byte
+
+Neither distinction is visible in the message JSON, and getting either backwards is silent:
+
+- **A null versus a present `Assignment`** in `ConsumerGroupHeartbeatResponse`. The field is
+  `nullableVersions: 0+`, so a flexible message writes a one-byte presence marker before the
+  struct. `-v0-emptyAssignment` and `-v0-nullAssignment` are identical except that byte (`0x01`
+  present, `0xff` null), and `-v0-assignment` differs from the empty one only inside the struct.
+  The trio separates "one topic", "you own nothing" and "nothing new to reconcile toward".
+- **An empty versus a null `SubscribedTopicNames`.** The wire default is null, meaning "unchanged
+  since the last heartbeat"; the empty list is the only way to say "no names", which is what a
+  regex subscription must send. Compact-array null is `0x00` and empty is `0x01`.
+  `consumerGroupHeartbeatRequest-v1-regexSubscription.json` is the named vector for the empty
+  form.
+
+The same reasoning applies to `ListGroups`' two filters, which are not nullable: "no filter" is
+the empty compact array, so every version emits both a filtered and an unfiltered request.
+
 ## Assignor vectors
 
 `scripts/protocol/javaVectors/runAssignors.sh` is a second generator with the same shape,

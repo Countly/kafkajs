@@ -1,0 +1,7 @@
+{
+  "message": "OffsetCommitRequest",
+  "version": 9,
+  "case": "basic",
+  "hex": "0b746573742d67726f7570000000050c746573742d6d656d6265720e746573742d696e7374616e6365020b746573742d746f7069630200000000000000000000000affffffff00000000",
+  "fields": { "groupId": "test-group", "groupGenerationId": 5, "memberId": "test-member", "groupInstanceId": "test-instance", "topics": [{ "topic": "test-topic", "partitions": [{ "partition": 0, "offset": "10", "leaderEpoch": -1, "metadata": null }] }] }
+}

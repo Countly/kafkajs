@@ -1,0 +1,7 @@
+{
+  "message": "ListGroupsResponse",
+  "version": 3,
+  "case": "groups",
+  "hex": "000000000000020b746573742d67726f757009636f6e73756d65720000",
+  "fields": { "throttleTime": 0, "errorCode": 0, "groups": [{ "groupId": "test-group", "protocolType": "consumer", "groupState": "", "groupType": "" }] }
+}

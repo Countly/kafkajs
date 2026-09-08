@@ -1,0 +1,7 @@
+{
+  "message": "DescribeGroupsResponse",
+  "version": 5,
+  "case": "describedGroup",
+  "hex": "000000000200000b746573742d67726f757007537461626c6509636f6e73756d657213526f756e64526f62696e41737369676e6572020c746573742d6d656d6265720e746573742d696e7374616e63650c746573742d636c69656e740b2f3132372e302e302e31070003000000010700030000000100800000000000",
+  "fields": { "throttleTime": 0, "groups": [{ "errorCode": 0, "errorMessage": null, "groupId": "test-group", "state": "Stable", "protocolType": "consumer", "protocol": "RoundRobinAssigner", "members": [{ "memberId": "test-member", "groupInstanceId": "test-instance", "clientId": "test-client", "clientHost": "/127.0.0.1", "memberMetadata": "000300000001", "memberAssignment": "000300000001" }], "authorizedOperations": -2147483648 }] }
+}

@@ -1,0 +1,7 @@
+{
+  "message": "ConsumerGroupDescribeResponse",
+  "version": 0,
+  "case": "mixedErrors",
+  "hex": "00000000030000000b746573742d67726f757006456d707479000000070000000708756e69666f726d018000000000001d1c546f70696320617574686f72697a6174696f6e206661696c65642e0c6f746865722d67726f75700100000000000000000101800000000000",
+  "fields": { "throttleTime": 0, "groups": [{ "errorCode": 0, "errorMessage": null, "groupId": "test-group", "groupState": "Empty", "groupEpoch": 7, "assignmentEpoch": 7, "assignorName": "uniform", "members": [], "authorizedOperations": -2147483648 }, { "errorCode": 29, "errorMessage": "Topic authorization failed.", "groupId": "other-group", "groupState": "", "groupEpoch": 0, "assignmentEpoch": 0, "assignorName": "", "members": [], "authorizedOperations": -2147483648 }] }
+}

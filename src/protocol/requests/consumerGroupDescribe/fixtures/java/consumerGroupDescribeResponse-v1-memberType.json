@@ -1,0 +1,7 @@
+{
+  "message": "ConsumerGroupDescribeResponse",
+  "version": 1,
+  "case": "memberType",
+  "hex": "00000000020000000b746573742d67726f757007537461626c65000000070000000708756e69666f726d020c746573742d6d656d6265720e746573742d696e7374616e636500000000050c746573742d636c69656e740b2f3132372e302e302e31020b746573742d746f70696300020102030405060708090a0b0c0d0e0f100b746573742d746f7069630300000000000000020000020102030405060708090a0b0c0d0e0f100b746573742d746f70696303000000000000000200000100800000000000",
+  "fields": { "throttleTime": 0, "groups": [{ "errorCode": 0, "errorMessage": null, "groupId": "test-group", "groupState": "Stable", "groupEpoch": 7, "assignmentEpoch": 7, "assignorName": "uniform", "members": [{ "memberId": "test-member", "instanceId": "test-instance", "rackId": null, "memberEpoch": 5, "clientId": "test-client", "clientHost": "/127.0.0.1", "subscribedTopicNames": ["test-topic"], "subscribedTopicRegex": null, "assignment": { "topicPartitions": [{ "topicId": "01020304-0506-0708-090a-0b0c0d0e0f10", "topicName": "test-topic", "partitions": [0, 2] }] }, "targetAssignment": { "topicPartitions": [{ "topicId": "01020304-0506-0708-090a-0b0c0d0e0f10", "topicName": "test-topic", "partitions": [0, 2] }] }, "memberType": 1 }], "authorizedOperations": -2147483648 }] }
+}

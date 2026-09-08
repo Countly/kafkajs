@@ -1,0 +1,7 @@
+{
+  "message": "ConsumerGroupHeartbeatRequest",
+  "version": 1,
+  "case": "regexSubscription",
+  "hex": "0b746573742d67726f75700c746573742d6d656d626572000000000000000493e001095e746573742d2e2a000100",
+  "fields": { "groupId": "test-group", "memberId": "test-member", "memberEpoch": 0, "instanceId": null, "rackId": null, "rebalanceTimeoutMs": 300000, "subscribedTopicNames": [], "subscribedTopicRegex": "^test-.*", "serverAssignor": null, "topicPartitions": [] }
+}

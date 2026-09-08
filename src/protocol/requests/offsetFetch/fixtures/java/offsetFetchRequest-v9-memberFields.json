@@ -1,0 +1,7 @@
+{
+  "message": "OffsetFetchRequest",
+  "version": 9,
+  "case": "memberFields",
+  "hex": "020b746573742d67726f75700c746573742d6d656d62657200000005020b746573742d746f706963020000000000000000",
+  "fields": { "groupId": "test-group", "memberId": "test-member", "memberEpoch": 5, "topics": [{ "topic": "test-topic", "partitions": [{ "partition": 0 }] }] }
+}

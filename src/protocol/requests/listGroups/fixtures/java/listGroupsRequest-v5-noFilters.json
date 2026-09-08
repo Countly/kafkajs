@@ -1,0 +1,7 @@
+{
+  "message": "ListGroupsRequest",
+  "version": 5,
+  "case": "noFilters",
+  "hex": "010100",
+  "fields": { "states": [], "types": [] }
+}

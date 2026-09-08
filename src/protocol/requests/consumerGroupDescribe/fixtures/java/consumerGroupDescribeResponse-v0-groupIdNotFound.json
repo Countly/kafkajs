@@ -1,0 +1,7 @@
+{
+  "message": "ConsumerGroupDescribeResponse",
+  "version": 0,
+  "case": "groupIdNotFound",
+  "hex": "000000000200451c47726f757020746573742d67726f7570206e6f7420666f756e642e0b746573742d67726f75700100000000000000000101800000000000",
+  "fields": { "throttleTime": 0, "groups": [{ "errorCode": 69, "errorMessage": "Group test-group not found.", "groupId": "test-group", "groupState": "", "groupEpoch": 0, "assignmentEpoch": 0, "assignorName": "", "members": [], "authorizedOperations": -2147483648 }] }
+}

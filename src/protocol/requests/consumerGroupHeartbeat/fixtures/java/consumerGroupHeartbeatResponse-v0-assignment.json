@@ -1,0 +1,7 @@
+{
+  "message": "ConsumerGroupHeartbeatResponse",
+  "version": 0,
+  "case": "assignment",
+  "hex": "000000000000000c746573742d6d656d62657200000005000001f401020102030405060708090a0b0c0d0e0f10030000000000000002000000",
+  "fields": { "throttleTime": 0, "errorCode": 0, "errorMessage": null, "memberId": "test-member", "memberEpoch": 5, "heartbeatIntervalMs": 500, "assignment": { "topicPartitions": [{ "topicId": "01020304-0506-0708-090a-0b0c0d0e0f10", "partitions": [0, 2] }] } }
+}

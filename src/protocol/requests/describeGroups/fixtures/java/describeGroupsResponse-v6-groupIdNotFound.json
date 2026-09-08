@@ -1,0 +1,7 @@
+{
+  "message": "DescribeGroupsResponse",
+  "version": 6,
+  "case": "groupIdNotFound",
+  "hex": "000000000200451c47726f757020746573742d67726f7570206e6f7420666f756e642e0b746573742d67726f75700544656164010101800000000000",
+  "fields": { "throttleTime": 0, "groups": [{ "errorCode": 69, "errorMessage": "Group test-group not found.", "groupId": "test-group", "state": "Dead", "protocolType": "", "protocol": "", "members": [], "authorizedOperations": -2147483648 }] }
+}
