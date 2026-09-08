@@ -444,3 +444,115 @@ change not listed here did not change observable behavior.
   your own offsets to `commitOffsetsIfNecessary(offsets)` from `eachBatch`, the payload is filtered
   per partition rather than rejected as a whole: the partitions you still hold are committed and the
   rest are dropped, so one revoked partition in a payload does not cost you the others.
+
+### Phase 6B — KIP-848 consumer protocol, admin group visibility, fetch prefetch
+
+- **A cooperative rebalance now commits before it releases partitions.** This applies to the
+  classic cooperative path you may already be using (`cooperativeSticky`, or any assigner that
+  selects the cooperative protocol) as well as to the new consumer protocol. With
+  `autoCommit: true`, whatever your handlers resolved on the partitions a round is about to revoke
+  is committed before those partitions are pruned. What changes for you: fewer redeliveries after a
+  cooperative round, and one extra `OffsetCommit` per round that revokes something. A failure of
+  that commit — including a membership that was lost meanwhile — is logged at warn and the round
+  proceeds, so nothing new can fail your consumer. With `autoCommit: false` nothing changes: your
+  own commits stay yours, and eager rounds already committed everything before rejoining.
+- **A stale member epoch is handled per commit under `groupProtocol: 'consumer'`.** When the
+  coordinator answers an `OffsetCommit` with `STALE_MEMBER_EPOCH` (113) — the epoch moved on while
+  the commit was in flight — what happens depends on who asked for it:
+  - An **interval or threshold auto-commit** is logged at error (`Auto-commit rejected with a stale
+    member epoch; skipping this one`) and skipped. Nothing is raised, and the next interval commit
+    goes out under the epoch the heartbeats have installed by then, so the offsets are committed one
+    interval later rather than lost.
+  - **`commitOffsetsIfNecessary()` called with no arguments from `eachBatch`** follows that same
+    rule, because it is the auto-commit primitive: the call resolves, and the commit it skipped is
+    picked up by the next one. If you rely on that call rejecting to detect a failed commit, note
+    that this one case resolves instead.
+  - **`consumer.commitOffsets(offsets)`**, and `commitOffsetsIfNecessary(offsets)` with your own
+    payload, still fail: they reject with a non-retriable error whose message begins `OffsetCommit
+    failed with stale member epoch.` and whose `type` is `STALE_MEMBER_EPOCH`. Handle it as you would
+    any other commit failure — retrying it yourself under the same epoch cannot succeed.
+
+  An `OffsetFetch` rejected the same way is re-sent under the fresh epoch for up to the rebalance
+  timeout, so a first fetch of committed offsets around a rebalance can take longer without failing.
+  Classic consumers are unaffected: they see `ILLEGAL_GENERATION` for a stale generation, exactly as
+  before.
+- **A static member under `groupProtocol: 'consumer'` sends a leave on close and on poll expiry.**
+  A static classic member (`groupInstanceId` set) sends nothing when it stops: the coordinator only
+  notices at `sessionTimeout`. A static consumer-protocol member instead sends one heartbeat
+  carrying member epoch −2, the protocol's "this static member is going away" signal, which tells
+  the coordinator about the departure straight away while keeping the assignment reserved for that
+  `groupInstanceId` — the protocol has no way for a static member to leave permanently. Two things
+  follow for you. The coordinator learns about a shutdown immediately instead of waiting out the
+  session timeout. And because a member that still holds a live epoch gives its partitions up
+  properly, closing one emits `PARTITIONS_REVOKED` and, with `autoCommit: true`, commits the
+  offsets its handlers resolved first — where a static classic member emits neither. The same
+  −2 heartbeat is sent when the poll deadline expires, which is the case `POLL_INTERVAL_EXCEEDED`'s
+  `isStatic: true` reports.
+- **A fatal membership error never restarts under `groupProtocol: 'consumer'`.** Five conditions
+  will be answered the same way by every rejoin, so the consumer stops instead of looping: the group
+  is at its configured size limit (`GROUP_MAX_SIZE_REACHED`, 81), the static instance id is still
+  held by another member (`UNRELEASED_INSTANCE_ID`, 111), the server assignor you asked for does not
+  exist (`UNSUPPORTED_ASSIGNOR`, 112), the subscription regex is one the broker will not accept
+  (`INVALID_REGULAR_EXPRESSION`, 128), or the cluster does not implement the consumer protocol at
+  all. Each emits `CRASH` with `restart: false` **regardless of `retry.restartOnFailure`** — a
+  callback returning `true` does not bring the consumer back. What to do: fix the configuration, the
+  assignor name, the pattern or the duplicate `groupInstanceId`, and create a new consumer. Classic
+  consumers are unaffected — they keep restarting on the same codes — so only
+  `groupProtocol: 'consumer'` users see this.
+- **Under `groupProtocol: 'consumer'`, a topic you are not authorized to read is logged, not
+  raised.** When the coordinator answers `TOPIC_AUTHORIZATION_FAILED` for part of the subscription,
+  the member stays in the group and keeps serving the partitions it can, and the failure is
+  reported as an error-level log line (once per distinct message). The Java client raises it to the
+  application; this client does not, so the log line is your signal that an ACL is missing.
+- **Poll-overrun detection is less immediate under `groupProtocol: 'consumer'`.** Your deadline is
+  still `maxPollInterval`, and an overrun still costs the member its partitions. But the expiry is
+  noticed on a heartbeat tick, and never while a reconciliation is in flight, so how quickly it is
+  noticed is bounded by the heartbeat interval the coordinator asked for rather than by a
+  `heartbeatInterval` you configured. Expect the detection to lag the deadline by up to one
+  server-driven heartbeat interval.
+- **`maxPrefetchBatches: 1` can hide at most one `maxPollInterval` per stuck handler.** A prefetch
+  round that comes back empty counts as a poll, and a prefetched batch that is dropped as stale
+  resets the poll deadline, so a handler that has stopped making progress can go one further
+  `maxPollInterval` before the poll guard fires. Stopping the consumer can also take up to one
+  extra Fetch round trip, because a prefetch already on the wire is awaited. None of this applies
+  at the default `maxPrefetchBatches: 0`, where the fetch loop is exactly what it was.
+- **A regex subscription's resolved topic set only grows.** Under `subscribe({ regex })` the names
+  the pattern has resolved to are remembered for the life of the membership: a topic the pattern
+  stops matching stays in the subscription until the consumer rebuilds its membership (a restart or
+  a crash recovery). It is bounded by the number of distinct topics the pattern ever matched.
+
+The rest of this section is additive — nothing here changes unless you opt in.
+
+- **`groupProtocol` is opt-in and defaults to `'classic'`.** Setting `groupProtocol: 'consumer'`
+  moves a consumer to the KIP-848 protocol, where the coordinator computes the assignment and the
+  member reconciles it over its heartbeats. It requires Kafka 4.0 or newer.
+
+  ```javascript
+  const consumer = kafka.consumer({ groupId: 'my-group', groupProtocol: 'consumer' })
+  ```
+
+  Options the broker owns under that protocol are rejected at construction rather than ignored:
+  setting `partitionAssigners`, `heartbeatInterval` or `sessionTimeout` throws
+  `partitionAssigners, heartbeatInterval, sessionTimeout cannot be set when groupProtocol=consumer`
+  (naming only the ones you actually set), and setting `groupRemoteAssignor` under the classic
+  protocol throws `groupRemoteAssignor cannot be set when groupProtocol=classic`.
+  `rebalanceTimeout` and `maxPollInterval` are legal under both. `groupRemoteAssignor` names the
+  server-side assignor to ask for (`'uniform'` and `'range'` on a stock 4.x broker); left `null`,
+  the coordinator picks. See [Consumer group protocols](Consuming.md#group-protocols).
+- **`subscribe({ regex })` is a new subscription form**, available only under
+  `groupProtocol: 'consumer'`. The pattern is **RE2, evaluated by the broker**, not a JavaScript
+  `RegExp`, so topics created later join the subscription without a client-side metadata poll. A
+  consumer subscribes to names or to a regex, never both. A JavaScript `RegExp` inside `topics`
+  keeps its 2.2.4 behaviour under both protocols: matched client-side, once, at `subscribe()` time.
+- **`admin.listGroups` takes filters, and `admin.describeGroups` reports errors per group id.**
+  `admin.listGroups({ states, types })` filters server-side with lower-case values, and every row
+  now carries `groupState` and `groupType`. `admin.describeGroups` describes classic and consumer
+  groups in one shape; `errorCode` is retained on every row, as it always has been, and a group id
+  that does not exist comes back as a `Dead` row carrying `errorCode: 69` instead of failing the
+  call. Rows are not returned in the order the ids were passed. See
+  [List groups](Admin.md#list-groups) and [Describe groups](Admin.md#describe-groups).
+- **`maxPrefetchBatches` is off by default.** `0` (the default) keeps the fetch loop unchanged; `1`
+  lets each fetcher keep one Fetch on the wire while the previous response is being handled. A
+  value of `2` or more is rejected at construction rather than clamped, because deeper prefetch
+  does not exist yet. See [Prefetching](Consuming.md#prefetching).
+

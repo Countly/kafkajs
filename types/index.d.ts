@@ -195,6 +195,32 @@ export interface ConsumerConfig {
   readUncommitted?: boolean
   rackId?: string
   groupInstanceId?: string
+  /**
+   * Which group membership protocol to use. `'classic'` (the default) is the JoinGroup/SyncGroup
+   * protocol every kafkajs release has used. `'consumer'` is the KIP-848 protocol, in which the
+   * coordinator computes assignments and the member reconciles them over heartbeats; it requires
+   * Kafka 4.0 or newer.
+   *
+   * Under `'consumer'` the broker owns the session timeout and the heartbeat interval and there are
+   * no client-side assigners, so setting `sessionTimeout`, `heartbeatInterval` or
+   * `partitionAssigners` alongside it throws at construction.
+   */
+  groupProtocol?: 'classic' | 'consumer'
+  /**
+   * Name of the server-side assignor to request under `groupProtocol: 'consumer'`, e.g. `'uniform'`
+   * or `'range'`. `null` (the default) lets the coordinator pick its first configured assignor.
+   * Setting it under `groupProtocol: 'classic'` throws at construction.
+   */
+  groupRemoteAssignor?: string | null
+  /**
+   * How many prefetched batches may be in flight ahead of your handlers. `0` (the default) disables
+   * prefetching entirely. `1` lets each fetcher keep one fetch on the wire while the previous
+   * response is being handled, which overlaps network time with handler time; it arms only for a
+   * dispatch whose every partition was fully resolved last time round, and a prefetched batch that
+   * no longer matches the resolved offset is dropped and re-read. The extra memory ceiling is one
+   * fetch response (`maxBytes`) per fetcher. Values other than `0` and `1` throw at construction.
+   */
+  maxPrefetchBatches?: 0 | 1
 }
 
 export type PartitionAssigner = (config: {
@@ -608,7 +634,7 @@ export type Admin = {
     includeSynonyms: boolean
   }): Promise<DescribeConfigResponse>
   alterConfigs(configs: { validateOnly: boolean; resources: IResourceConfig[] }): Promise<any>
-  listGroups(): Promise<{ groups: GroupOverview[] }>
+  listGroups(options?: ListGroupsOptions): Promise<{ groups: GroupOverview[] }>
   deleteGroups(groupIds: string[]): Promise<DeleteGroupsResult[]>
   describeGroups(groupIds: string[]): Promise<GroupDescriptions>
   describeAcls(options: AclFilter): Promise<DescribeAclResponse>
@@ -1013,9 +1039,26 @@ export type MemberDescription = {
   memberId: string
   memberAssignment: Buffer
   memberMetadata: Buffer
+  /** Static membership id, `null` for a dynamic member. */
+  groupInstanceId?: string | null
+  rackId?: string | null
+  /** Consumer-protocol members only; `null` for a classic member. */
+  memberEpoch?: number | null
+  /** Decoded current assignment. `[]` for a classic member whose assignment could not be decoded. */
+  assignment?: TopicPartitions[]
+  /** Consumer-protocol members only; `null` otherwise. */
+  targetAssignment?: TopicPartitions[] | null
+  /** Reported by ConsumerGroupDescribe v1 only; `null` otherwise. */
+  memberType?: 'classic' | 'consumer' | null
+  /** Consumer-protocol members only; `[]` for a classic member. */
+  subscribedTopics?: string[]
+  /** Consumer-protocol members only; `null` otherwise. */
+  subscribedTopicRegex?: string | null
 }
 
 // See https://github.com/apache/kafka/blob/2.4.0/clients/src/main/java/org/apache/kafka/common/ConsumerGroupState.java#L25
+// 'Assigning', 'Reconciling' and 'NotReady' are the newer group states of
+// https://github.com/apache/kafka/blob/trunk/clients/src/main/java/org/apache/kafka/common/GroupState.java
 export type ConsumerGroupState =
   | 'Unknown'
   | 'PreparingRebalance'
@@ -1023,6 +1066,9 @@ export type ConsumerGroupState =
   | 'Stable'
   | 'Dead'
   | 'Empty'
+  | 'Assigning'
+  | 'Reconciling'
+  | 'NotReady'
 
 export type GroupDescription = {
   groupId: string
@@ -1030,6 +1076,17 @@ export type GroupDescription = {
   protocol: string
   protocolType: string
   state: ConsumerGroupState
+  /** Group-level error for this id; `0` when the description succeeded. */
+  errorCode: number
+  errorMessage?: string | null
+  groupType?: 'classic' | 'consumer' | 'share' | 'streams' | 'unknown'
+  /** Consumer groups only; `null` for a classic group. */
+  groupEpoch?: number | null
+  assignmentEpoch?: number | null
+  /** Server-side assignor name for a consumer group; `null` for a classic group. */
+  assignorName?: string | null
+  /** `null` when authorized operations were not requested. */
+  authorizedOperations?: number | null
 }
 
 export type GroupDescriptions = {
@@ -1061,9 +1118,16 @@ export type Batch = {
   offsetLagLow(): string
 }
 
+/** Filters for `admin.listGroups`. Values are lower-case, e.g. `'stable'`, `'consumer'`. */
+export type ListGroupsOptions = { states?: string[]; types?: string[] }
+
 export type GroupOverview = {
   groupId: string
   protocolType: string
+  /** Wire-cased state, e.g. `'Stable'`. `''` against a broker whose ListGroups version lacks it. */
+  groupState: string
+  /** Lower-cased by the client. `''` against a broker whose ListGroups version lacks it. */
+  groupType: 'classic' | 'consumer' | 'share' | 'streams' | 'unknown' | ''
 }
 
 export type DeleteGroupsResult = {
@@ -1128,8 +1192,12 @@ export type ConsumerGroupJoinEvent = InstrumentationEvent<{
   duration: number
   groupId: string
   isLeader: boolean
-  leaderId: string
+  /** `null` under `groupProtocol: 'consumer'`, where the group has no leader. */
+  leaderId: string | null
+  /** The selected assigner protocol name; the server assignor name, or `''`, under 'consumer'. */
   groupProtocol: string
+  /** Which membership protocol this member joined with. */
+  membershipProtocol: 'classic' | 'consumer'
   memberId: string
   memberAssignment: IMemberAssignment
   rebalanceProtocol: 'eager' | 'cooperative'
@@ -1163,6 +1231,8 @@ export type ConsumerRebalancingEvent = InstrumentationEvent<{
   groupId: string
   /** `null` when the coordinator rejected this member's id, which is dropped before the rejoin. */
   memberId: string | null
+  /** Which membership protocol this round belongs to. */
+  membershipProtocol: 'classic' | 'consumer'
   /** Why the rebalance started. Absent on the first join of a run, which reports no reason. */
   reason?:
     | 'rebalance-in-progress'
@@ -1171,6 +1241,8 @@ export type ConsumerRebalancingEvent = InstrumentationEvent<{
     | 'partitions-revoked'
     | 'stale-assignment'
     | 'coordinator-changed'
+    | 'assignment-changed'
+    | 'fenced'
 }>
 /** Payload of `PARTITIONS_ASSIGNED`, `PARTITIONS_REVOKED` and `PARTITIONS_LOST`. */
 export type ConsumerPartitionsEvent = InstrumentationEvent<{
@@ -1259,11 +1331,20 @@ export type ConsumerRunConfig = {
  */
 export type ConsumerSubscribeTopic = { topic: string | RegExp; fromBeginning?: boolean }
 export type ConsumerSubscribeTopics = { topics: (string | RegExp)[]; fromBeginning?: boolean }
+/**
+ * A broker-evaluated regular expression subscription, available only under
+ * `groupProtocol: 'consumer'`. The pattern is sent verbatim as an RE2 expression and is evaluated
+ * by the coordinator, so topics created later are picked up without a client-side metadata poll.
+ * It cannot be combined with a topic or `topics` subscription on the same consumer.
+ */
+export type ConsumerSubscribeRegex = { regex: string; fromBeginning?: boolean }
 
 export type Consumer = {
   connect(): Promise<void>
   disconnect(): Promise<void>
-  subscribe(subscription: ConsumerSubscribeTopics | ConsumerSubscribeTopic): Promise<void>
+  subscribe(
+    subscription: ConsumerSubscribeTopics | ConsumerSubscribeTopic | ConsumerSubscribeRegex
+  ): Promise<void>
   stop(): Promise<void>
   run(config?: ConsumerRunConfig): Promise<void>
   commitOffsets(topicPartitions: Array<TopicPartitionOffsetAndMetadata>): Promise<void>

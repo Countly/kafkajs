@@ -261,7 +261,10 @@ kafka.consumer({
   retry: <Object>,
   maxInFlightRequests: <Number>,
   rackId: <String>,
-  groupInstanceId: <String>
+  groupInstanceId: <String>,
+  groupProtocol: <String>,
+  groupRemoteAssignor: <String>,
+  maxPrefetchBatches: <Number>
 })
 ```
 
@@ -277,6 +280,7 @@ kafka.consumer({
 | maxBytesPerPartition   | The maximum amount of data per-partition the server will return. This size must be at least as large as the maximum message size the server allows or else it is possible for the producer to send messages larger than the consumer can fetch. If that happens, the consumer can get stuck trying to fetch a large message on a certain partition | `1048576` (1MB)                   |
 | minBytes               | Minimum amount of data the server should return for a fetch request, otherwise wait up to `maxWaitTimeInMs` for more data to accumulate.                                                                                                                                                                                                           | `1`                               |
 | maxBytes               | Maximum amount of bytes to accumulate in the response. Supported by Kafka >= `0.10.1.0`                                                                                                                                                                                                                                                            | `10485760` (10MB)                 |
+| maxPrefetchBatches     | How many fetch responses may be in flight ahead of your handlers. `0` keeps the fetch loop exactly as it was. `1` lets each fetcher keep one fetch on the wire while the previous response is still being handled, which overlaps network time with handler time; the extra memory ceiling is one fetch response (`maxBytes`) per fetcher. Any other value is rejected when you create the consumer. See [Prefetching](#prefetching) | `0` _(no prefetching)_ |
 | maxWaitTimeInMs        | The maximum amount of time in milliseconds the server will block before answering the fetch request if there isn’t sufficient data to immediately satisfy the requirement given by `minBytes`                                                                                                                                                      | `5000`                            |
 | checkCrcs              | Verify the CRC32C checksum of every record batch received. Default `true` (Java's `check.crcs`). A mismatch is treated as a **non-retriable** error: no message from that batch is delivered, the consumer crashes with `KafkaJSPartialMessageError` (marked with `crcMismatch: true`, distinguishing it from an ordinary truncated fetch tail; the `CRASH` event's `restart` follows `retry.restartOnFailure` as for any other non-retriable error), and the committed offset is **not** advanced past the corrupt batch — so a restart re-reads it. Set to `false` to skip the check and restore the pre-3.0 behaviour, where a corrupt batch was delivered to the application as if it were valid. | `true` |
 | retry                  | See [retry](Configuration.md#retry) for more information                                                                                                                                                                                                                                                                                           | `{ retries: 5 }`                 |
@@ -284,6 +288,8 @@ kafka.consumer({
 | maxInFlightRequests | Max number of requests that may be in progress at any time. If falsey then no limit.                                    | `null` _(no limit)_ |
 | rackId                 | Configure the "rack" in which the consumer resides to enable [follower fetching](#follower-fetching)                 | `null` _(fetch from the leader always)_ |
 | groupInstanceId        | Static membership id (KIP-345). See [Static membership](#static-membership)                                          | `null` _(dynamic membership)_ |
+| groupProtocol          | The group membership protocol: `'classic'` or `'consumer'` (KIP-848, Kafka 4.0+). See [Consumer group protocols](#group-protocols) | `'classic'` |
+| groupRemoteAssignor    | The server-side assignor to ask the coordinator for, under `groupProtocol: 'consumer'` only. `null` lets the coordinator pick its first configured assignor | `null` _(coordinator's choice)_ |
 
 ## <a name="static-membership"></a> Static membership
 
@@ -454,6 +460,96 @@ kafka.consumer({ groupId: 'my-group', partitionAssigners: [cooperativeSticky] })
 Every consumer logs one INFO line when you create it, naming the rebalance protocol it selected and the assigners it selected it from, so you can see which of the two deploys a running process is on.
 
 Going straight to deploy 2 splits the group: members still running the old code and members running the new one share no assigner name, and the coordinator rejects the join with `INCONSISTENT_GROUP_PROTOCOL` until the rollout finishes. During deploy 2 the group is briefly mixed — some members computing eagerly, some cooperatively — which is safe, because an eager member's JoinGroup advertises no owned partitions at all — it gives everything up before it rejoins — and the cooperative algorithm never hands a partition to a member that still owns it.
+
+## <a name="group-protocols"></a> Consumer group protocols
+
+A consumer group can run on either of two membership protocols. You choose with `groupProtocol`, and the default is unchanged.
+
+| | `'classic'` (default) | `'consumer'` (KIP-848) |
+| --- | --- | --- |
+| Who computes the assignment | one member, elected leader | the group coordinator |
+| How a member learns its assignment | JoinGroup + SyncGroup round trip | its own heartbeats |
+| What a rebalance costs the group | every member waits for the round (the whole assignment with an eager assigner, the part it loses with a cooperative one) | nothing group-wide: each member reconciles its own share while the others keep consuming |
+| Assigners | your `partitionAssigners` run in the client | the broker's, named by `groupRemoteAssignor` |
+| Broker requirement | any supported broker | Kafka 4.0 or newer |
+
+Under `'consumer'` there is no group-wide barrier: the coordinator hands each member a target assignment on a heartbeat response, and the member reconciles towards it one step at a time — giving up what it no longer owns, then acknowledging what it took on. A member that is slow to reconcile delays nobody but itself.
+
+### Turning it on
+
+```javascript
+const consumer = kafka.consumer({ groupId: 'my-group', groupProtocol: 'consumer' })
+```
+
+### What the broker owns
+
+Under `'consumer'` the coordinator owns the session timeout, the heartbeat interval and the assignment itself. Passing an option that would silently be ignored is an error rather than a surprise, so creating the consumer throws a `KafkaJSNonRetriableError`:
+
+| Configuration | Message |
+| --- | --- |
+| `sessionTimeout`, `heartbeatInterval` or `partitionAssigners` with `groupProtocol: 'consumer'` | `partitionAssigners, heartbeatInterval, sessionTimeout cannot be set when groupProtocol=consumer` (only the options you actually set are named, in that order) |
+| `groupRemoteAssignor` with `groupProtocol: 'classic'` | `groupRemoteAssignor cannot be set when groupProtocol=classic` |
+| Any other `groupProtocol` value | `groupProtocol must be one of "classic" or "consumer"` |
+| `groupRemoteAssignor` set to something other than a non-empty string | `Argument "groupRemoteAssignor" must be a non-empty string` |
+
+`rebalanceTimeout` and `maxPollInterval` are legal under both protocols and keep their meaning: `maxPollInterval` is your handler deadline, and the rebalance timeout is what the member tells the coordinator it needs to give partitions up.
+
+### Choosing a server-side assignor
+
+```javascript
+kafka.consumer({ groupId: 'my-group', groupProtocol: 'consumer', groupRemoteAssignor: 'uniform' })
+```
+
+A stock 4.x broker offers `uniform` and `range`. Leave `groupRemoteAssignor` unset (`null`) to let the coordinator pick its first configured assignor. A name the cluster does not offer is a fatal membership error: the consumer crashes and does not restart, because every rejoin would be answered the same way.
+
+### Regex subscriptions
+
+Under `'consumer'` you can hand the coordinator a pattern instead of topic names:
+
+```javascript
+await consumer.subscribe({ regex: '^orders-.*', fromBeginning: true })
+```
+
+- The pattern is **RE2, not JavaScript**. It is sent verbatim and evaluated by the broker, so what matches is decided by Kafka's dialect, not by `RegExp`. A pattern the broker rejects is a fatal membership error.
+- The coordinator holds the pattern and re-evaluates it as topics come and go, so a topic created *after* you subscribe joins the subscription on its own — no client-side metadata poll, no resubscribe.
+- One consumer subscribes to names or to a regex, never both: mixing them throws `Subscribe to topics or to a regex, not both`. Under `'classic'` the form itself is rejected, with `A regex subscription requires groupProtocol: 'consumer'`.
+- A JavaScript `RegExp` inside `topics` is unchanged under both protocols: it is matched client-side once, at `subscribe()` time, against the topics that exist then.
+- The set of topic names a regex subscription has resolved to only grows for the life of the membership. A topic the pattern stops matching — because it was deleted, or renamed out of the pattern — stays in the subscription until the consumer rebuilds its membership (a restart, or a crash recovery). The set is bounded by the number of distinct topics the pattern ever matched.
+
+### Fencing and loss
+
+Under `'consumer'` the two ways a member can be separated from its partitions stay clearly apart:
+
+- **Fenced, or the poll deadline expired.** The coordinator rejected this member's epoch or id, or your handler took longer than `maxPollInterval`. The member emits [`PARTITIONS_LOST`](InstrumentationEvents.md#consumer) for its **whole** owned set and commits nothing for it: the epoch those offsets were resolved under is gone, so a commit would be rejected anyway. It then rejoins from scratch.
+- **Reconciled away.** The coordinator moved some partitions to another member. With `autoCommit: true` the offsets your handlers resolved on those partitions are committed **first**, and then [`PARTITIONS_REVOKED`](InstrumentationEvents.md#consumer) reports them. The partitions you keep are never interrupted.
+
+A poll-interval overrun is detected on a heartbeat tick and never while a reconciliation is in flight, so under `'consumer'` detection is bounded by the heartbeat interval the coordinator asked for rather than by one you configured.
+
+### Migrating in either direction
+
+`groupProtocol` is a per-consumer option, so a group can be moved one deployment at a time. See the [migration guide](MigrationGuide-3-0-0.md) for what changes for callers in each direction, including the behaviour changes that also apply to classic consumers.
+
+### Limitations
+
+- **No client-side assigners.** The broker assigns; `partitionAssigners` is rejected, and a custom assigner has no equivalent under this protocol.
+- **Rack-aware assignment is the broker's.** Your `rackId` is sent to the coordinator, but rack-aware assignment is still work in progress upstream.
+- **Consumer groups only.** `groupProtocol` does not address share groups or streams groups.
+
+## <a name="prefetching"></a> Prefetching
+
+By default a fetcher sends the next Fetch only after your handlers have finished with the previous response's batches, so network time and handler time never overlap. Setting `maxPrefetchBatches: 1` lets each fetcher keep one Fetch on the wire while the previous response is still being handled:
+
+```javascript
+const consumer = kafka.consumer({ groupId: 'my-group', maxPrefetchBatches: 1 })
+```
+
+- It arms only for a dispatch whose **every** partition was fully resolved on the previous round. A handler that resolved less than it was given leaves the next offset unknown, and nothing is run ahead for it.
+- The run-ahead offsets travel on that one request and are stored nowhere, so nothing your handler does or does not resolve moves the client's idea of where to read next. A prefetched batch that no longer matches the resolved offset when it is dispatched — after a `seek`, a pause, an offset reset, a partial resolve or a handler that threw — is dropped and re-read by the next ordinary fetch. No record can be skipped.
+- The extra memory ceiling is one fetch response (`maxBytes`) per fetcher.
+- `stop()` and `disconnect()` wait for a prefetch that is already on the wire, so stopping while a handler is running can take up to one extra Fetch round trip.
+- A prefetch round that comes back empty still counts as a poll and still heartbeats, and a dropped prefetched batch still resets the poll deadline — so with `maxPrefetchBatches: 1` a stuck handler can go at most one extra `maxPollInterval` before the poll guard fires.
+
+Any value other than `0` or `1` is rejected when you create the consumer, with `maxPrefetchBatches must be 0 or 1; deeper prefetch is not supported yet`.
 
 ## <a name="custom-partition-assigner"></a> Custom partition assigner
 

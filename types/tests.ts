@@ -26,6 +26,11 @@ import {
   MemberMetadata,
   Assigner,
   GroupMember,
+  ListGroupsOptions,
+  GroupDescription,
+  MemberDescription,
+  ConsumerGroupState,
+  TopicPartitions,
 } from './index'
 
 const { roundRobin } = PartitionAssigners
@@ -358,9 +363,9 @@ new KafkaJSServerDoesNotSupportApiKey(
 kafka.producer({ maxInFlightRequests: null })
 kafka.consumer({ groupId: 'g', maxInFlightRequests: 5 })
 
-// The poll-interval predicate is internal. If it ever reaches the public surface this stops
-// compiling, which is the point: no predicate is exported, and this one least of all.
-const noInternalPredicateIsPublic: 'isPollIntervalExceeded' extends keyof typeof kafkajs
+// The membership predicates are internal. If either ever reaches the public surface this stops
+// compiling, which is the point: no predicate is exported, and these least of all.
+const noInternalPredicateIsPublic: 'isPollIntervalExceeded' | 'isFatalMembership' extends keyof typeof kafkajs
   ? never
   : true = true
 void noInternalPredicateIsPublic
@@ -424,3 +429,71 @@ const member: GroupMember = {
   groupInstanceId: null,
 }
 void member
+
+// The two membership options and the prefetch knob compile.
+kafka.consumer({ groupId: 'g', groupProtocol: 'consumer' })
+kafka.consumer({ groupId: 'g', groupProtocol: 'consumer', groupRemoteAssignor: 'uniform' })
+kafka.consumer({ groupId: 'g', groupProtocol: 'classic' })
+kafka.consumer({ groupId: 'g', maxPrefetchBatches: 0 })
+kafka.consumer({ groupId: 'g', maxPrefetchBatches: 1 })
+// @ts-expect-error deeper prefetch is rejected at runtime, so it is a type error too
+kafka.consumer({ groupId: 'g', maxPrefetchBatches: 2 })
+
+// The regex subscription form.
+const regexConsumer = kafka.consumer({ groupId: 'g', groupProtocol: 'consumer' })
+regexConsumer.subscribe({ regex: '^orders-.*', fromBeginning: true })
+// The two existing forms still compile.
+regexConsumer.subscribe({ topics: ['t'], fromBeginning: false })
+regexConsumer.subscribe({ topic: /^t-.*/ })
+
+// listGroups filters and the two new row fields.
+const listGroupsOptions: ListGroupsOptions = { states: ['stable'], types: ['consumer'] }
+admin.listGroups(listGroupsOptions).then(({ groups }) => {
+  const state: string = groups[0].groupState
+  const type: 'classic' | 'consumer' | 'share' | 'streams' | 'unknown' | '' = groups[0].groupType
+  void state
+  void type
+})
+admin.listGroups().then(({ groups }) => void groups)
+
+// describeGroups keeps errorCode and adds the new fields.
+admin.describeGroups(['g']).then(({ groups }) => {
+  const group: GroupDescription = groups[0]
+  const code: number = group.errorCode
+  const state: ConsumerGroupState = group.state
+  const epoch: number | null | undefined = group.groupEpoch
+  const member: MemberDescription = group.members[0]
+  const memberEpoch: number | null | undefined = member.memberEpoch
+  const assignment: TopicPartitions[] | undefined = member.assignment
+  void code
+  void state
+  void epoch
+  void memberEpoch
+  void assignment
+})
+
+// A 'Reconciling' state is assignable, and a made-up one is not.
+const reconciling: ConsumerGroupState = 'Reconciling'
+const assigning: ConsumerGroupState = 'Assigning'
+void reconciling
+void assigning
+// @ts-expect-error not a group state
+const notAState: ConsumerGroupState = 'Rebalancing'
+void notAState
+
+// The two event payloads.
+regexConsumer.on(regexConsumer.events.GROUP_JOIN, e => {
+  const membership: 'classic' | 'consumer' = e.payload.membershipProtocol
+  const leader: string | null = e.payload.leaderId
+  const assigner: string = e.payload.groupProtocol
+  void membership
+  void leader
+  void assigner
+})
+regexConsumer.on(regexConsumer.events.REBALANCING, e => {
+  const membership: 'classic' | 'consumer' = e.payload.membershipProtocol
+  void membership
+  if (e.payload.reason === 'assignment-changed' || e.payload.reason === 'fenced') {
+    void e.payload.reason
+  }
+})

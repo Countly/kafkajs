@@ -446,37 +446,107 @@ Example response:
 ```javascript
 {
     groups: [
-        {groupId: 'testgroup', protocolType: 'consumer'}
+        {groupId: 'testgroup', protocolType: 'consumer', groupState: 'Stable', groupType: 'classic'}
     ]
 }
 ```
+
+Every row carries two fields beyond the group id and its protocol type:
+
+| field | value |
+| --- | --- |
+| `groupState` | the group's state as the broker spells it, e.g. `'Stable'`, `'Empty'`, `'PreparingRebalance'` |
+| `groupType` | the group's type, lower-cased by this client: `'classic'`, `'consumer'`, `'share'`, `'streams'` or `'unknown'` |
+
+Both read `''` against a broker whose `ListGroups` version does not carry them, so one row shape works everywhere.
+
+### Filtering
+
+You can ask the brokers to filter instead of filtering the answer yourself:
+
+```javascript
+// Only KIP-848 consumer groups
+await admin.listGroups({ types: ['consumer'] })
+
+// Only groups that are stable or empty
+await admin.listGroups({ states: ['stable', 'empty'] })
+
+// Both filters at once
+await admin.listGroups({ states: ['stable'], types: ['classic', 'consumer'] })
+```
+
+Filter values are given in lower case and are mapped to the names the wire uses:
+
+| filter | accepted values |
+| --- | --- |
+| `states` | `unknown`, `preparingrebalance`, `completingrebalance`, `stable`, `dead`, `empty`, `assigning`, `reconciling`, `notready` |
+| `types` | `unknown`, `classic`, `consumer`, `share`, `streams` |
+
+A value Kafka does not define throws a `KafkaJSNonRetriableError` naming the accepted values, before anything is sent.
+
+Older brokers cannot answer every filter, and this client follows the Java client's rules rather than quietly widening your query:
+
+1. **A `states` filter needs `ListGroups` v4.** Against an older broker the call fails with `KafkaJSServerDoesNotSupportApiKey` — answering without the filter would be a different question.
+2. **A `types` filter needs v5**, with one exception: asking for exactly `['classic']`, or for `['classic', 'consumer']`, is answered by an older broker with the filter dropped, because every group on such a broker is classic and the result is the same set.
+3. **Any other type filter fails on an older broker**, `['consumer']` included: dropping it would answer "all groups" to "consumer groups only".
+
+A filter a broker's version cannot serve fails on the first attempt and is not retried. A broker whose coordinator is loading or not yet available is retried on the configured retry budget.
+
+The call still fans out to every broker, one after another, and is all-or-nothing: a single unreachable broker fails the whole call.
 
 ## <a name="describe-groups"></a> Describe groups
 
 Describe consumer groups by `groupId`s. This is similar to [consumer.describeGroup()](Consuming.md#describe-group), except
 it allows you to describe multiple groups and does not require you to have a consumer be part of any of those groups.
 
+Classic groups and KIP-848 consumer groups are both described, in one shape:
+
 ```js
 await admin.describeGroups([ 'testgroup' ])
 // {
 //   groups: [{
-//     errorCode: 0,
 //     groupId: 'testgroup',
+//     protocol: 'RoundRobinAssigner',    // the server-side assignor's name for a consumer group
+//     protocolType: 'consumer',          // synthesised as 'consumer' for a consumer group, which carries none on the wire
+//     state: 'Stable',
+//     errorCode: 0,                      // group-level error for this id; 0 when the description succeeded
+//     errorMessage: null,                // the broker's message for that error, when it sent one
+//     groupType: 'classic',              // 'classic' or 'consumer'
+//     groupEpoch: null,                  // consumer groups only; null for a classic group
+//     assignmentEpoch: null,             // consumer groups only; null for a classic group
+//     assignorName: null,                // consumer groups only; null for a classic group
+//     authorizedOperations: null,        // always null today: authorized operations are not requested
 //     members: [
 //       {
 //         clientHost: '/172.19.0.1',
 //         clientId: 'test-3e93246fe1f4efa7380a',
-//         memberAssignment: Buffer,
 //         memberId: 'test-3e93246fe1f4efa7380a-ff87d06d-5c87-49b8-a1f1-c4f8e3ffe7eb',
-//         memberMetadata: Buffer,
+//         memberAssignment: Buffer,      // for a consumer-group member this client builds it from the assignment the broker sent
+//         memberMetadata: Buffer,        // empty for a consumer-group member: the protocol carries none
+//         groupInstanceId: null,         // static membership id, null for a dynamic member
+//         rackId: null,
+//         memberEpoch: null,             // consumer-group members only
+//         assignment: [],                // [{ topic, partitions }] — decoded current assignment
+//         targetAssignment: null,        // consumer-group members only
+//         memberType: null,              // 'classic' or 'consumer', reported by ConsumerGroupDescribe v1 only
+//         subscribedTopics: [],          // consumer-group members only
+//         subscribedTopicRegex: null,    // consumer-group members only
 //       },
 //     ],
-//     protocol: 'RoundRobinAssigner',
-//     protocolType: 'consumer',
-//     state: 'Stable',
 //   }]
 // }
 ```
+
+Two of those fields are produced by this client rather than sent by the broker, so that tooling written against a classic description keeps working against a consumer group: a consumer group's `protocolType` (`'consumer'`), and each consumer-group member's `memberAssignment` buffer, which is encoded here from the assignment the coordinator reported.
+
+Errors are reported per group id, not per call:
+
+- A group that does not exist comes back as a row in state `Dead` with `errorCode: 69` (`GROUP_ID_NOT_FOUND`) and the broker's `errorMessage`. The call resolves normally.
+- Any other group-level error — an authorization failure, for instance — is carried on that group's row as `errorCode`/`errorMessage` while the other ids come back described.
+- A coordinator that is loading or has moved is retried on the configured retry budget; a transport or coordinator error that outlives the budget still fails the call.
+- **Rows are not returned in the order you passed the ids in.** Match them by `groupId`.
+
+These calls model classic groups and KIP-848 consumer groups. A group id neither of those paths recognises falls back to `DescribeGroups`, so whatever that API answers for it is what you get, on a row carrying `groupType: 'classic'` because that is the API the row came from — against a 4.x broker expect a `Dead` row with `errorCode: 69` rather than a description. Share groups and streams groups are not modelled here and are not covered by these calls.
 Helper function to decode `memeberMetadata` and `memberAssignment` is available in `AssignerProtocol`
 
 Example: 
