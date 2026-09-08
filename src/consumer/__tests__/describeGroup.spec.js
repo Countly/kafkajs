@@ -50,11 +50,13 @@ describe('Consumer', () => {
 
       await expect(consumer.describeGroup()).resolves.toEqual({
         errorCode: 0,
+        errorMessage: null,
         groupId,
         members: [
           {
             clientHost: expect.any(String),
             clientId: expect.any(String),
+            groupInstanceId: null,
             memberId: expect.any(String),
             memberAssignment: expect.anything(),
             memberMetadata: expect.anything(),
@@ -63,6 +65,9 @@ describe('Consumer', () => {
         protocol: 'RoundRobinAssigner',
         protocolType: 'consumer',
         state: 'Stable',
+        // DescribeGroups v3+ reports the caller's authorized operations; the request does not ask
+        // for them, and the broker answers with the "not requested" sentinel.
+        authorizedOperations: -2147483648,
       })
     })
   })
