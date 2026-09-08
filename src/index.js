@@ -206,6 +206,11 @@ module.exports = class Client {
    * `maxPollInterval` (default 300000 ms) is both the rebalance timeout sent on the wire and the
    * local deadline a handler has to return within; `rebalanceTimeout` is its deprecated alias for
    * the wire half only.
+   *
+   * `groupProtocol` selects the group membership protocol: `'classic'` (the default) or
+   * `'consumer'` (KIP-848, broker-driven assignment). Under `'consumer'`, `groupRemoteAssignor`
+   * names the server-side assignor to ask for. `maxPrefetchBatches` (`0` or `1`, default `0`) is a
+   * local fetch-loop knob.
    * @public
    */
   consumer({
@@ -227,6 +232,9 @@ module.exports = class Client {
     rackId = '',
     checkCrcs = true,
     groupInstanceId = null,
+    groupProtocol,
+    groupRemoteAssignor,
+    maxPrefetchBatches,
   } = {}) {
     const isolationLevel = readUncommitted
       ? ISOLATION_LEVEL.READ_UNCOMMITTED
@@ -261,6 +269,9 @@ module.exports = class Client {
       checkCrcs,
       groupInstanceId,
       metadataMaxAge,
+      groupProtocol,
+      groupRemoteAssignor,
+      maxPrefetchBatches,
     })
   }
 

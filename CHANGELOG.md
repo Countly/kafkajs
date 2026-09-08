@@ -248,11 +248,17 @@ Adopted upstream PRs are credited here by number as they land (Phase 2 onward).
 
 - **A cooperative rebalance now commits the partitions it gives up, before it gives them up.** With `autoCommit: true` and a cooperative assigner (`CooperativeStickyAssigner`, or any assigner selecting the cooperative protocol), a round that revokes partitions now commits whatever your handler resolved on those partitions before they are pruned, using the generation the round just established. Previously those offsets were dropped, so a partition moving between members redelivered everything since the last periodic commit. The commit is best-effort: any failure — including a lost membership — is logged at warn and the rebalance proceeds, exactly as the Java client does. With `autoCommit: false` nothing changes: your `eachBatch` commits stay yours. Eager rounds are unaffected — they already committed everything before joining.
 
+- A crash caused by a membership error the group protocol will answer identically forever — an unsupported server assignor, an invalid subscription regex, an unreleased static instance id, a group at its configured size limit, or a cluster that does not implement the consumer protocol — now emits `CRASH` with `restart: false` and does not restart, overriding `retry.restartOnFailure`. This matches the existing rule for a fenced static member (`FENCED_INSTANCE_ID`, 82). Only consumers using `groupProtocol: 'consumer'` can reach the new codes.
+
 - With `maxPrefetchBatches: 1`, a prefetch round that comes back empty counts as a poll and can reset the poll deadline while one of your handlers is still running. The effect is bounded to at most one extra `maxPollInterval` per stuck handler, and it does not exist at the default `maxPrefetchBatches: 0`.
 
 #### Fixes
 
 #### Additions
+
+- New consumer options: `groupProtocol: 'classic' | 'consumer'` (default `'classic'`), `groupRemoteAssignor` (consumer protocol only — the server-side assignor to ask for; `null` lets the coordinator choose), and `maxPrefetchBatches` (`0` or `1`, default `0`). Options the broker owns under the consumer protocol — `partitionAssigners`, `heartbeatInterval`, `sessionTimeout` — are rejected at construction rather than silently ignored, and so is `groupRemoteAssignor` under the classic protocol. `rebalanceTimeout` and `maxPollInterval` keep their meaning under both. `maxPrefetchBatches` above 1 is rejected rather than clamped, so a deeper prefetch can be added later without changing what an accepted configuration does.
+
+- `consumer.subscribe({ regex, fromBeginning })` subscribes to a broker-evaluated RE2 pattern (consumer protocol only). The pattern is sent to the coordinator verbatim and matched there, so topics created later join the subscription without the client polling metadata. A JavaScript `RegExp` in `topics` keeps its 2.2.4 behaviour under both protocols: it is matched client-side once, at `subscribe()` time. A consumer subscribes to names or to a regex, never both.
 
 - The heartbeat timer can now be asked for an immediate tick (`requestTick()`), and reads its delay from the group membership on every schedule instead of once at construction. With the classic protocol the membership's answer is the configured `heartbeatInterval`, so the cadence and the wire are unchanged; with the consumer protocol it is the `HeartbeatIntervalMs` the coordinator returned on the last heartbeat.
 

@@ -7,7 +7,7 @@ const { selectRebalanceProtocol } = require('./groupProtocol/interface')
 const Runner = require('./runner')
 const { events, wrap: wrapEvent, unwrap: unwrapEvent } = require('./instrumentationEvents')
 const InstrumentationEventEmitter = require('../instrumentation/emitter')
-const { KafkaJSNonRetriableError, isFencedInstance } = require('../errors')
+const { KafkaJSNonRetriableError, isFencedInstance, isFatalMembership } = require('../errors')
 const { roundRobin } = require('./assigners')
 const { EARLIEST_OFFSET, LATEST_OFFSET } = require('../constants')
 const ISOLATION_LEVEL = require('../protocol/isolationLevel')
@@ -25,6 +25,71 @@ const specialOffsets = [
   Long.fromValue(EARLIEST_OFFSET).toString(),
   Long.fromValue(LATEST_OFFSET).toString(),
 ]
+
+/**
+ * Keys the classic protocol owns, in the order the Java client lists them, so a rejection naming
+ * several reads the same way theirs does.
+ */
+const CLASSIC_ONLY_KEYS = ['partitionAssigners', 'heartbeatInterval', 'sessionTimeout']
+
+/**
+ * Whether the user actually set this option.
+ *
+ * Presence alone carries no intent: `Kafka#consumer()` rebuilds its argument as a fresh object
+ * literal, so every option it forwards is an own key holding `undefined` when nothing was set.
+ * @param {object} params
+ * @param {string} key
+ * @returns {boolean}
+ */
+const isExplicit = (params, key) => Object.hasOwn(params, key) && params[key] !== undefined
+
+/**
+ * Rejects a configuration that mixes options from the two group protocols, and a prefetch depth
+ * this release does not implement.
+ *
+ * The broker owns the session timeout, the heartbeat interval and the assignment under the consumer
+ * protocol, so accepting those options would silently ignore them; and a `maxPrefetchBatches` above
+ * 1 is rejected rather than clamped, so a value whose semantics do not exist yet cannot freeze the
+ * wrong contract when deeper prefetch lands.
+ * @see https://cwiki.apache.org/confluence/display/KAFKA/KIP-848%3A+The+Next+Generation+of+the+Consumer+Rebalance+Protocol
+ * @param {object} params the raw options object, before any default is applied
+ * @returns {void}
+ * @throws {KafkaJSNonRetriableError}
+ */
+const validateGroupProtocolOptions = (params) => {
+  const groupProtocol = isExplicit(params, 'groupProtocol') ? params.groupProtocol : 'classic'
+
+  if (groupProtocol !== 'classic' && groupProtocol !== 'consumer') {
+    throw new KafkaJSNonRetriableError('groupProtocol must be one of "classic" or "consumer"')
+  }
+
+  if (groupProtocol === 'consumer') {
+    const offending = CLASSIC_ONLY_KEYS.filter((key) => isExplicit(params, key))
+
+    if (offending.length) {
+      throw new KafkaJSNonRetriableError(
+        `${offending.join(', ')} cannot be set when groupProtocol=consumer`
+      )
+    }
+  } else if (isExplicit(params, 'groupRemoteAssignor')) {
+    throw new KafkaJSNonRetriableError(
+      'groupRemoteAssignor cannot be set when groupProtocol=classic'
+    )
+  }
+
+  if (
+    isExplicit(params, 'groupRemoteAssignor') &&
+    (typeof params.groupRemoteAssignor !== 'string' || params.groupRemoteAssignor.length === 0)
+  ) {
+    throw new KafkaJSNonRetriableError('Argument "groupRemoteAssignor" must be a non-empty string')
+  }
+
+  if (isExplicit(params, 'maxPrefetchBatches') && ![0, 1].includes(params.maxPrefetchBatches)) {
+    throw new KafkaJSNonRetriableError(
+      'maxPrefetchBatches must be 0 or 1; deeper prefetch is not supported yet'
+    )
+  }
+}
 
 /**
  * @param {Object} params
@@ -62,42 +127,67 @@ const specialOffsets = [
  *                                loop against a fencing broker.
  * @param {InstrumentationEventEmitter} [params.instrumentationEmitter]
  * @param {number} params.metadataMaxAge
+ * @param {'classic'|'consumer'} [params.groupProtocol='classic'] The group membership protocol.
+ *                                `'consumer'` (KIP-848) lets the coordinator compute the
+ *                                assignment, so `partitionAssigners`, `heartbeatInterval` and
+ *                                `sessionTimeout` are rejected with it.
+ * @param {string|null} [params.groupRemoteAssignor=null] The server-side assignor to ask for under
+ *                                the consumer protocol; `null` lets the coordinator choose.
+ *                                Rejected under the classic protocol.
+ * @param {0|1} [params.maxPrefetchBatches=0] How many fetch responses may be in flight ahead of the
+ *                                batch being processed. Anything else is rejected rather than
+ *                                clamped.
  *
  * @returns {import("../../types").Consumer}
  */
-module.exports = ({
-  cluster,
-  groupId,
-  retry,
-  logger: rootLogger,
-  partitionAssigners = [roundRobin],
-  sessionTimeout = 30000,
-  maxPollInterval,
-  rebalanceTimeout,
-  heartbeatInterval = 3000,
-  maxBytesPerPartition = 1048576, // 1MB
-  minBytes = 1,
-  maxBytes = 10485760, // 10MB
-  maxWaitTimeInMs = 5000,
-  isolationLevel = ISOLATION_LEVEL.READ_COMMITTED,
-  rackId = '',
-  checkCrcs = true,
-  groupInstanceId = null,
-  instrumentationEmitter: rootInstrumentationEmitter,
-  metadataMaxAge,
-}) => {
+module.exports = (params) => {
+  validateGroupProtocolOptions(params)
+
+  const {
+    cluster,
+    groupId,
+    retry,
+    logger: rootLogger,
+    partitionAssigners = [roundRobin],
+    sessionTimeout = 30000,
+    maxPollInterval,
+    rebalanceTimeout,
+    heartbeatInterval = 3000,
+    maxBytesPerPartition = 1048576, // 1MB
+    minBytes = 1,
+    maxBytes = 10485760, // 10MB
+    maxWaitTimeInMs = 5000,
+    isolationLevel = ISOLATION_LEVEL.READ_COMMITTED,
+    rackId = '',
+    checkCrcs = true,
+    groupInstanceId = null,
+    instrumentationEmitter: rootInstrumentationEmitter,
+    metadataMaxAge,
+    groupProtocol = 'classic',
+    groupRemoteAssignor = null,
+    maxPrefetchBatches = 0,
+  } = params
+
   if (!groupId) {
     throw new KafkaJSNonRetriableError('Consumer groupId must be a non-empty string.')
   }
 
   const logger = rootLogger.namespace('Consumer')
   const instrumentationEmitter = rootInstrumentationEmitter || new InstrumentationEventEmitter()
-  const assigners = partitionAssigners.map((createAssigner) =>
-    createAssigner({ groupId, logger, cluster })
-  )
+  const isConsumerProtocol = groupProtocol === 'consumer'
+
+  // The coordinator computes the assignment under the consumer protocol, so there is nothing to
+  // build and no protocol to select from an empty list.
+  const assigners = isConsumerProtocol
+    ? []
+    : partitionAssigners.map((createAssigner) => createAssigner({ groupId, logger, cluster }))
 
   /** @type {Record<string, { fromBeginning?: boolean }>} */
   const topics = {}
+  /** @type {string|null} the RE2 pattern a regex subscription sent, verbatim */
+  let subscribedTopicRegex = null
+  /** @type {{ fromBeginning: boolean }|null} the options that subscription was made with */
+  let regexSubscription = null
   let runner = null
   /** @type {ConsumerGroup} */
   let consumerGroup = null
@@ -115,13 +205,16 @@ module.exports = ({
     logger,
   })
 
-  const rebalanceProtocol = selectRebalanceProtocol(assigners)
-  logger.info('Rebalance protocol selected', {
-    groupId,
-    rebalanceProtocol,
-    assigners: assigners.map(({ name }) => name),
-    reason: 'the highest protocol every configured assigner supports',
-  })
+  const rebalanceProtocol = isConsumerProtocol ? undefined : selectRebalanceProtocol(assigners)
+
+  if (!isConsumerProtocol) {
+    logger.info('Rebalance protocol selected', {
+      groupId,
+      rebalanceProtocol,
+      assigners: assigners.map(({ name }) => name),
+      reason: 'the highest protocol every configured assigner supports',
+    })
+  }
 
   /**
    * Topics deleted and recreated while this consumer was subscribed, each stamped with the new
@@ -230,9 +323,41 @@ module.exports = ({
   }
 
   /** @type {import("../../types").Consumer["subscribe"]} */
-  const subscribe = async ({ topic, topics: subscriptionTopics, fromBeginning = false }) => {
+  const subscribe = async (subscription = {}) => {
+    const { topic, topics: subscriptionTopics, regex, fromBeginning = false } = subscription
+
     if (consumerGroup) {
       throw new KafkaJSNonRetriableError('Cannot subscribe to topic while consumer is running')
+    }
+
+    const wantsRegex = isExplicit(subscription, 'regex')
+    const wantsNames = topic != null || subscriptionTopics != null
+
+    // The combination rule comes first, so a call that is wrong several ways reports the thing the
+    // user has to change: you subscribe one way or the other, not both.
+    if (
+      (wantsRegex && (wantsNames || keys(topics).length > 0)) ||
+      (wantsNames && subscribedTopicRegex != null)
+    ) {
+      throw new KafkaJSNonRetriableError('Subscribe to topics or to a regex, not both')
+    }
+
+    if (wantsRegex) {
+      if (!isConsumerProtocol) {
+        throw new KafkaJSNonRetriableError(
+          "A regex subscription requires groupProtocol: 'consumer'"
+        )
+      }
+
+      if (typeof regex !== 'string' || regex.length === 0) {
+        throw new KafkaJSNonRetriableError('Argument "regex" must be a non-empty string')
+      }
+
+      // Sent to the coordinator verbatim: RE2 is the broker's dialect, not JavaScript's, so there
+      // is nothing this client can usefully validate about the pattern itself.
+      subscribedTopicRegex = regex
+      regexSubscription = { fromBeginning }
+      return
     }
 
     if (!topic && !subscriptionTopics) {
@@ -317,6 +442,9 @@ module.exports = ({
         assigners,
         sessionTimeout: groupTimeouts.sessionTimeout,
         rebalanceTimeout: groupTimeouts.rebalanceTimeout,
+        // The classic membership owns the heartbeat cadence and the timer reads it from there, so
+        // without this line every classic consumer would silently drop to the membership's own
+        // 3000 ms default whatever the user configured.
         heartbeatInterval: groupTimeouts.heartbeatInterval,
         maxBytesPerPartition,
         minBytes,
@@ -328,6 +456,11 @@ module.exports = ({
         checkCrcs,
         groupInstanceId,
         rebalanceProtocol,
+        groupProtocol,
+        groupRemoteAssignor,
+        subscribedTopicRegex,
+        regexSubscription,
+        maxPrefetchBatches,
         metadataMaxAge,
         autoCommit,
         autoCommitInterval,
@@ -348,6 +481,7 @@ module.exports = ({
         eachMessage,
         onCrash,
         concurrency,
+        maxPrefetchBatches,
       })
 
       await runner.start()
@@ -405,10 +539,12 @@ module.exports = ({
         }
       }
 
-      if (isFencedInstance(e)) {
-        // A fenced static member (FENCED_INSTANCE_ID, 82) has been evicted by a duplicate
-        // groupInstanceId elsewhere; restarting would immediately re-fence into the same loop.
-        // This overrides restartOnFailure, unlike every other terminal error.
+      if (isFencedInstance(e) || (isConsumerProtocol && isFatalMembership(e))) {
+        // A fenced static member (82) has been evicted by a duplicate groupInstanceId elsewhere,
+        // and a fatal membership error - unsupported assignor, invalid subscription regex,
+        // unreleased instance id, group at capacity, a cluster without the consumer protocol -
+        // will answer the same way to every rejoin. Both override restartOnFailure, unlike every
+        // other terminal error.
         shouldRestart = false
       }
 
