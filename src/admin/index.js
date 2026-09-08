@@ -14,6 +14,8 @@ const {
   isStaleCoordinator,
 } = require('../errors')
 const { staleMetadata, staleLeaderEpoch } = require('../protocol/error')
+const { GROUP_TYPES } = require('../protocol/groupTypes')
+const { createGroupDescriptions } = require('./groupDescriptions')
 const CONFIG_RESOURCE_TYPES = require('../protocol/configResourceTypes')
 const ACL_RESOURCE_TYPES = require('../protocol/aclResourceTypes')
 const ACL_OPERATION_TYPES = require('../protocol/aclOperationTypes')
@@ -80,6 +82,36 @@ const indexByPartition = (array) =>
     (obj, { partition, ...props }) => Object.assign(obj, { [partition]: { ...props } }),
     {}
   )
+
+/** @throws {KafkaJSNonRetriableError} unless `value` is an array of strings */
+const assertStringArray = (name, value) => {
+  if (!Array.isArray(value) || value.some((entry) => typeof entry !== 'string')) {
+    throw new KafkaJSNonRetriableError(`Expected ${name} to be an array of strings`)
+  }
+}
+
+/**
+ * One ListGroups row in its public form.
+ *
+ * `groupType` is lower-case on this API while the wire carries a display name, so the mapping is
+ * done here rather than in the broker method, whose job is the wire. It goes through the shared
+ * table rather than a bare `toLowerCase()`, so the public union and the protocol table cannot drift
+ * apart; a value the table does not know is passed through lower-cased rather than dropped.
+ * `groupState` deliberately keeps its wire casing: that is what this client has always returned and
+ * what `ConsumerGroupState` types.
+ * @param {{ groupId: string, protocolType: string, groupState?: string, groupType?: string }} row
+ * @returns {{ groupId: string, protocolType: string, groupState: string, groupType: string }}
+ */
+const toPublicGroupOverview = (row) => {
+  const known = Object.keys(GROUP_TYPES).find((name) => GROUP_TYPES[name] === row.groupType)
+
+  return {
+    groupId: row.groupId,
+    protocolType: row.protocolType,
+    groupState: row.groupState || '',
+    groupType: known || (row.groupType ? row.groupType.toLowerCase() : ''),
+  }
+}
 
 /**
  *
@@ -867,77 +899,52 @@ module.exports = ({
   }
 
   /**
-   * List groups in a broker
+   * Lists the groups every broker knows about, optionally filtered by state and by type.
    *
-   * @return {Promise<ListGroups>}
+   * The fan-out is sequential and all-or-nothing: one unreachable broker fails the whole call, as
+   * it always has. A broker whose coordinator is still loading or not yet available answers with a
+   * retriable error and is asked again on the configured retry budget; anything else fails at once.
+   * Filters are lower-case here and are mapped to the wire display names by the broker method,
+   * which also applies the version rules - asking for states needs ListGroups v4 and asking for
+   * types needs v5, with one narrow exception for filters that a pre-v5 broker can answer correctly
+   * by ignoring them. A filter the broker's version cannot serve is not retriable and fails on the
+   * first attempt.
    *
-   * @typedef {Object} ListGroups
-   * @property {Array<ListGroup>} groups
-   *
-   * @typedef {Object} ListGroup
-   * @property {string} groupId
-   * @property {string} protocolType
+   * @param {object} [options]
+   * @param {string[]} [options.states=[]] e.g. `['stable', 'empty']`
+   * @param {string[]} [options.types=[]] e.g. `['consumer', 'classic']`
+   * @returns {Promise<{ groups: Array<{ groupId: string, protocolType: string, groupState: string, groupType: 'classic'|'consumer'|'share'|'streams'|'unknown'|'' }>}>}
+   *          `groupType` is lower-case; `groupState` keeps the wire casing it has always had
+   *          (`'Stable'`). Both are `''` against a broker whose version lacks them
+   * @throws {KafkaJSNonRetriableError} when a filter is not an array of strings
    */
-  const listGroups = async () => {
+  const listGroups = async ({ states = [], types = [] } = {}) => {
+    assertStringArray('states', states)
+    assertStringArray('types', types)
+
     await cluster.refreshMetadata()
     let groups = []
     for (const nodeId in cluster.brokerPool.brokers) {
       const broker = await cluster.findBroker({ nodeId })
-      const response = await broker.listGroups()
-      groups = groups.concat(response.groups)
+      const response = await createRetry(retry)(() => broker.listGroups({ states, types }))
+      groups = groups.concat(response.groups.map(toPublicGroupOverview))
     }
 
     return { groups }
   }
 
   /**
-   * Describe groups by group ids
-   * @param {Array<string>} groupIds
+   * Describes groups of both protocols by group id.
    *
-   * @typedef {Object} GroupDescriptions
-   * @property {Array<GroupDescription>} groups
+   * Each id is described through ConsumerGroupDescribe where the broker supports it, and through
+   * DescribeGroups otherwise, so classic and consumer groups come back in one shape. Rows are not
+   * returned in the order the ids were given.
    *
-   * @return {Promise<GroupDescriptions>}
+   * @param {string[]} groupIds
+   * @returns {Promise<{ groups: object[] }>}
    */
-  const describeGroups = async (groupIds) => {
-    const coordinatorsForGroup = await Promise.all(
-      groupIds.map(async (groupId) => {
-        const coordinator = await cluster.findGroupCoordinator({ groupId })
-        return {
-          coordinator,
-          groupId,
-        }
-      })
-    )
-
-    const groupsByCoordinator = Object.values(
-      coordinatorsForGroup.reduce((coordinators, { coordinator, groupId }) => {
-        const group = coordinators[coordinator.nodeId]
-
-        if (group) {
-          coordinators[coordinator.nodeId] = {
-            ...group,
-            groupIds: [...group.groupIds, groupId],
-          }
-        } else {
-          coordinators[coordinator.nodeId] = { coordinator, groupIds: [groupId] }
-        }
-        return coordinators
-      }, {})
-    )
-
-    const responses = await Promise.all(
-      groupsByCoordinator.map(async ({ coordinator, groupIds }) => {
-        const retrier = createRetry(retry)
-        const { groups } = await retrier(() => coordinator.describeGroups({ groupIds }))
-        return groups
-      })
-    )
-
-    const groups = [].concat.apply([], responses)
-
-    return { groups }
-  }
+  const describeGroups = async (groupIds) =>
+    createGroupDescriptions({ cluster, retry, logger: rootLogger }).describe(groupIds)
 
   /**
    * Delete groups in a broker
