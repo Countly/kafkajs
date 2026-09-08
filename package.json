@@ -59,6 +59,7 @@
     "test:e2e:poll-guard": "npm run test:kafka -- \"POLL_GUARD_E2E=1 npx jest --forceExit --runInBand --testPathPatterns 'src/consumer/__tests__/pollGuardLive\\.spec\\.js'\"",
     "test:e2e:long-handler": "npm run test:kafka -- \"LONG_HANDLER_E2E=1 npx jest --forceExit --runInBand --testPathPatterns 'src/consumer/__tests__/longHandlerLive\\.spec\\.js'\"",
     "test:e2e:java-interop": "npm run test:kafka -- \"JAVA_INTEROP_E2E=1 npx jest --forceExit --runInBand --testPathPatterns 'src/consumer/__tests__/javaInteropLive\\.spec\\.js'\"",
+    "probe:group-conversion": "npm run test:kafka -- \"node scripts/e2e/javaConsumer/groupConversionProbe.js\"",
     "test:debug": "node --inspect-brk node_modules/.bin/jest --runInBand --watch",
     "test:types": "tsc -p types/",
     "test:pack": "./scripts/packSmoke.sh",

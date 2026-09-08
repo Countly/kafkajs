@@ -3,7 +3,10 @@
 # Runs one Java group member against the local test cluster, for the mixed Java/JS interop
 # scenario. The jars are downloaded into a temporary directory and are never committed.
 #
-# Usage: scripts/e2e/javaConsumer/run.sh <bootstrapServers> <groupId> <topic> <assignorClass> <runForMs>
+# Usage: scripts/e2e/javaConsumer/run.sh [--group-protocol classic|consumer] [--report-group-type] \
+#          <bootstrapServers> <groupId> <topic> <assignor> <runForMs>
+#        scripts/e2e/javaConsumer/run.sh --probe
+#        scripts/e2e/javaConsumer/run.sh --describe-group <bootstrapServers> <groupId>
 # Requires: a JDK on PATH (javac + java), network access to Maven Central on first run.
 
 KAFKA_CLIENTS_VERSION="${KAFKA_CLIENTS_VERSION:-4.3.1}"
@@ -11,6 +14,9 @@ SLF4J_VERSION="${SLF4J_VERSION:-1.7.36}"
 WORK_DIR="${JAVA_E2E_WORK_DIR:-$(mktemp -d -t kafkajs-java-consumer-XXXXXX)}"
 # A caller-provided work dir is a cache and is kept; a temp one is removed on exit.
 if [ -z "${JAVA_E2E_WORK_DIR:-}" ]; then trap 'rm -rf "${WORK_DIR}"' EXIT; fi
+# A caller-provided work dir need not exist yet; without this the first download fails with
+# curl's opaque "(56) Failure writing output to destination" rather than a usable message.
+mkdir -p "${WORK_DIR}"
 SRC_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 CLIENTS_JAR="${WORK_DIR}/kafka-clients-${KAFKA_CLIENTS_VERSION}.jar"

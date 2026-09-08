@@ -17,6 +17,15 @@ x-kafka-common: &kafka-common
     KAFKA_NUM_PARTITIONS: '2'
     KAFKA_DELETE_TOPIC_ENABLE: 'true'
     KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: '0'
+    # The consumer-protocol (KIP-848) group coordinator owns the heartbeat interval and the
+    # session timeout, so the client cannot shorten them: the test cluster does. Each value has
+    # to move together with its own minimum, because the coordinator validates against the bound
+    # rather than clamping to it. Kafka's own defaults are 5000/5000 and 45000/45000.
+    # @see https://github.com/apache/kafka/blob/4.3/group-coordinator/src/main/java/org/apache/kafka/coordinator/group/GroupCoordinatorConfig.java
+    KAFKA_GROUP_CONSUMER_HEARTBEAT_INTERVAL_MS: '500'
+    KAFKA_GROUP_CONSUMER_MIN_HEARTBEAT_INTERVAL_MS: '500'
+    KAFKA_GROUP_CONSUMER_SESSION_TIMEOUT_MS: '6000'
+    KAFKA_GROUP_CONSUMER_MIN_SESSION_TIMEOUT_MS: '6000'
     KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: '2'
     KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: '2'
     KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: '1'

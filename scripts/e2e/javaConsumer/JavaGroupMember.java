@@ -8,6 +8,9 @@ import java.util.Properties;
 import java.util.Set;
 import java.util.TreeMap;
 
+import org.apache.kafka.clients.admin.Admin;
+import org.apache.kafka.clients.admin.AdminClientConfig;
+import org.apache.kafka.clients.admin.GroupListing;
 import org.apache.kafka.clients.consumer.ConsumerConfig;
 import org.apache.kafka.clients.consumer.ConsumerRebalanceListener;
 import org.apache.kafka.clients.consumer.KafkaConsumer;
@@ -24,7 +27,10 @@ import org.apache.kafka.common.TopicPartition;
  * whole suite. The printed set is always this member's FULL assignment, not the round's delta:
  * cooperative callbacks report deltas, and the JavaScript side compares full sets.
  *
- * <p>Arguments: bootstrapServers groupId topic assignorClassName runForMs
+ * <p>Arguments: [--group-protocol classic|consumer] [--report-group-type] bootstrapServers
+ * groupId topic assignor runForMs. Under {@code --group-protocol consumer} the assignor
+ * argument is the SERVER assignor name. {@code --describe-group bootstrapServers groupId}
+ * prints one group's type and state without joining.
  *
  * @see <a href="https://kafka.apache.org/documentation/#consumerconfigs">Consumer configuration</a>
  */
@@ -41,45 +47,85 @@ public final class JavaGroupMember {
     "org.apache.kafka.clients.consumer.RangeAssignor",
     "org.apache.kafka.clients.consumer.StickyAssignor",
     "org.apache.kafka.clients.consumer.CooperativeStickyAssignor",
+    "org.apache.kafka.clients.admin.Admin",
+    "org.apache.kafka.common.GroupType",
+    "org.apache.kafka.common.GroupState",
   };
 
   /**
-   * Runs one group member until its deadline, or answers the classpath pre-flight.
+   * Runs one group member until its deadline, answers the classpath pre-flight, or reports one
+   * group's type and exits.
    *
-   * @param args bootstrapServers groupId topic assignorClassName runForMs, or the single
-   *     argument {@code --probe}
+   * @param args {@code [--group-protocol classic|consumer] [--report-group-type]
+   *     bootstrapServers groupId topic assignor runForMs}, or {@code --probe}, or
+   *     {@code --describe-group bootstrapServers groupId}
    */
   public static void main(String[] args) {
-    // FIRST, before any positional read: the pre-flight wants to know only whether this run could
-    // work at all. `args[4]` below would throw for a one-argument invocation.
-    if (args.length == 1 && "--probe".equals(args[0])) {
-      probe();
-      return;
+    List<String> flagless = new ArrayList<>();
+    String groupProtocol = "classic";
+    boolean reportGroupType = false;
+
+    for (int i = 0; i < args.length; i++) {
+      switch (args[i]) {
+        case "--probe":
+          probe();
+          return;
+        case "--group-protocol":
+          groupProtocol = args[++i];
+          break;
+        case "--report-group-type":
+          reportGroupType = true;
+          break;
+        case "--describe-group":
+          // Non-zero when the admin call failed, so a caller can tell "the group is unknown"
+          // (a line with empty values) from "the cluster could not be asked" (no line at all).
+          if (!printGroupType(args[i + 1], args[i + 2])) {
+            System.exit(1);
+          }
+          return;
+        default:
+          flagless.add(args[i]);
+      }
     }
 
-    String bootstrapServers = args[0];
-    String groupId = args[1];
-    String topic = args[2];
-    String assignor = args[3];
-    long runForMs = Long.parseLong(args[4]);
+    if (!"classic".equals(groupProtocol) && !"consumer".equals(groupProtocol)) {
+      System.err.println("--group-protocol must be classic or consumer, got " + groupProtocol);
+      System.exit(2);
+    }
+
+    String bootstrapServers = flagless.get(0);
+    String groupId = flagless.get(1);
+    String topic = flagless.get(2);
+    String assignor = flagless.get(3);
+    long runForMs = Long.parseLong(flagless.get(4));
 
     Properties properties = new Properties();
     properties.put(ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG, bootstrapServers);
     properties.put(ConsumerConfig.GROUP_ID_CONFIG, groupId);
-    properties.put(ConsumerConfig.PARTITION_ASSIGNMENT_STRATEGY_CONFIG, assignor);
     properties.put(ConsumerConfig.KEY_DESERIALIZER_CLASS_CONFIG,
         "org.apache.kafka.common.serialization.ByteArrayDeserializer");
     properties.put(ConsumerConfig.VALUE_DESERIALIZER_CLASS_CONFIG,
         "org.apache.kafka.common.serialization.ByteArrayDeserializer");
     properties.put(ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, "latest");
     properties.put(ConsumerConfig.ENABLE_AUTO_COMMIT_CONFIG, "false");
-    properties.put(ConsumerConfig.SESSION_TIMEOUT_MS_CONFIG, "10000");
-    properties.put(ConsumerConfig.HEARTBEAT_INTERVAL_MS_CONFIG, "3000");
-    // Pinned, not inherited: `classic` is the 4.3 default but changes in a later release, and
-    // KAFKA_CLIENTS_VERSION is env-overridable - a member that silently joined with the
-    // consumer protocol would void every assertion in this scenario.
+    // Pinned rather than inherited: `classic` is the 4.3 default but changes in a later release,
+    // and KAFKA_CLIENTS_VERSION is env-overridable - a member that silently joined with the
+    // other protocol would void every assertion the caller makes.
     // @see https://cwiki.apache.org/confluence/display/KAFKA/KIP-848%3A+The+Next+Generation+of+the+Consumer+Rebalance+Protocol
-    properties.put("group.protocol", "classic");
+    properties.put("group.protocol", groupProtocol);
+
+    if ("consumer".equals(groupProtocol)) {
+      // The coordinator owns both timings under this protocol and ConsumerConfig REJECTS all
+      // three classic keys outright, so they are not merely unused here: setting any of them
+      // fails construction. The 4th argument is the SERVER assignor name (uniform, range)
+      // rather than a client assignor class, because client-side assignors do not exist here.
+      // @see https://github.com/apache/kafka/blob/4.3/clients/src/main/java/org/apache/kafka/clients/consumer/ConsumerConfig.java
+      properties.put("group.remote.assignor", assignor);
+    } else {
+      properties.put(ConsumerConfig.PARTITION_ASSIGNMENT_STRATEGY_CONFIG, assignor);
+      properties.put(ConsumerConfig.SESSION_TIMEOUT_MS_CONFIG, "10000");
+      properties.put(ConsumerConfig.HEARTBEAT_INTERVAL_MS_CONFIG, "3000");
+    }
 
     long deadline = System.currentTimeMillis() + runForMs;
 
@@ -114,13 +160,62 @@ public final class JavaGroupMember {
             }
           });
 
+      boolean reported = false;
       while (System.currentTimeMillis() < deadline) {
         consumer.poll(Duration.ofMillis(500));
+        if (reportGroupType && !reported && !owned.isEmpty()) {
+          reported = printGroupType(bootstrapServers, groupId);
+        }
       }
     }
 
     System.out.println("{\"event\":\"done\"}");
     System.out.flush();
+  }
+
+  /**
+   * Prints one group's type and state as JSON, read through the Java admin client, and closes
+   * the client. Both values are optional on the wire: a broker that predates the field, or a
+   * group the coordinator does not know, yields the empty string rather than a crash.
+   *
+   * <p>An admin client that could not answer at all prints NOTHING on stdout and reports the
+   * exception on stderr, so a failed measurement can never be read as a group whose type is
+   * empty - the two would otherwise produce the same line.
+   *
+   * @param bootstrapServers the cluster to ask
+   * @param groupId the group to look for
+   * @return {@code true} when a line was printed, {@code false} when the admin call threw
+   * @see <a href="https://github.com/apache/kafka/blob/4.3/clients/src/main/java/org/apache/kafka/clients/admin/GroupListing.java">GroupListing.java</a>
+   */
+  private static boolean printGroupType(String bootstrapServers, String groupId) {
+    Properties properties = new Properties();
+    properties.put(AdminClientConfig.BOOTSTRAP_SERVERS_CONFIG, bootstrapServers);
+
+    String type = "";
+    String state = "";
+    try (Admin admin = Admin.create(properties)) {
+      for (GroupListing listing : admin.listGroups().all().get()) {
+        if (!listing.groupId().equals(groupId)) {
+          continue;
+        }
+        type = listing.type().map(Object::toString).orElse("");
+        state = listing.groupState().map(Object::toString).orElse("");
+      }
+    } catch (Exception e) {
+      System.err.println("could not read the group type: " + e);
+      return false;
+    }
+
+    System.out.println(
+        "{\"event\":\"group-type\",\"groupId\":\""
+            + groupId
+            + "\",\"groupType\":\""
+            + type
+            + "\",\"groupState\":\""
+            + state
+            + "\"}");
+    System.out.flush();
+    return true;
   }
 
   /**
