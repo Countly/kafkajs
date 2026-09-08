@@ -953,11 +953,16 @@ module.exports = class Broker {
    *                      ]
    *                    }
    *                  ]
+   * @param {string|null} [request.memberId=null] the consumer-protocol member id; the coordinator
+   *                  validates it together with the epoch from OffsetFetch v9 upward. A classic
+   *                  member and an admin client pass nothing, which sends the field's own "no
+   *                  membership" defaults; every version below 9 drops both fields.
+   * @param {number} [request.memberEpoch=-1] the consumer-protocol member epoch
    * @returns {Promise}
    */
-  async offsetFetch({ groupId, topics }) {
+  async offsetFetch({ groupId, topics, memberId = null, memberEpoch = -1 }) {
     const offsetFetch = this.lookupRequest(apiKeys.OffsetFetch, requests.OffsetFetch)
-    return await this[PRIVATE.SEND_REQUEST](offsetFetch({ groupId, topics }))
+    return await this[PRIVATE.SEND_REQUEST](offsetFetch({ groupId, topics, memberId, memberEpoch }))
   }
 
   /**

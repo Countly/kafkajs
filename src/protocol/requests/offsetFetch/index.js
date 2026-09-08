@@ -39,6 +39,11 @@ const versions = {
     const response = require('./v8/response')
     return { request: request({ groupId, topics }), response }
   },
+  9: ({ groupId, topics, memberId, memberEpoch }) => {
+    const request = require('./v9/request')
+    const response = require('./v9/response')
+    return { request: request({ groupId, topics, memberId, memberEpoch }), response }
+  },
 }
 
 module.exports = {

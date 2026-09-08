@@ -98,6 +98,22 @@ const versions = {
       response,
     }
   },
+  // `groupGenerationId` carries the member epoch under the KIP-848 consumer protocol; the bytes
+  // are v8's.
+  9: ({ groupId, groupGenerationId, memberId, groupInstanceId, topics }) => {
+    const request = require('./v9/request')
+    const response = require('./v9/response')
+    return {
+      request: request({
+        groupId,
+        groupGenerationId,
+        memberId,
+        groupInstanceId,
+        topics,
+      }),
+      response,
+    }
+  },
 }
 
 module.exports = {
