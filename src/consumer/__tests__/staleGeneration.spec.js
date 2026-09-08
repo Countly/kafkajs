@@ -162,6 +162,7 @@ describe('Consumer > Runner > stale generation', () => {
       expect(rebalancing.mock.calls[0][0].payload).toEqual({
         groupId: 'g',
         memberId: expectedMemberId,
+        membershipProtocol: 'classic',
         reason: 'lost',
       })
       // Offsets must be discarded before rejoining, not after.

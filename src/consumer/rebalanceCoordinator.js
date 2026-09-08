@@ -1,4 +1,4 @@
-const { KafkaJSNonRetriableError, isFencedInstance } = require('../errors')
+const { KafkaJSNonRetriableError, isFencedInstance, isUnknownMemberId } = require('../errors')
 const {
   rebalanceAction,
   rebalanceReason,
@@ -23,6 +23,29 @@ const {
  * partitions from each other would otherwise chain forever.
  */
 const MAX_REJOIN_ROUNDS = 20
+
+/**
+ * The longest a chain waits between two rounds of one reconciliation. Matches Kafka's default
+ * `group.consumer.heartbeat.interval.ms`: the yield exists to space coordinator trips, not to sleep
+ * out a backoff - and the membership's interval IS the backoff remainder while one is armed, which
+ * is capped at `retry.maxRetryTime`.
+ * @see https://kafka.apache.org/documentation/#consumerconfigs
+ */
+const MAX_RECONCILE_YIELD_MS = 5000
+
+/**
+ * The `type` of the internal error the consumer group protocol rejects its pending join with when
+ * the runner asks it to stop. Matched by type rather than by class, as the member-id branch of
+ * `ConsumerGroup#joinAndSync` matches `UNKNOWN_MEMBER_ID`.
+ */
+const CONSUMER_STOPPING = 'CONSUMER_STOPPING'
+
+/**
+ * The second of the two codes a coordinator uses to stop recognising a consumer-protocol member.
+ * The first, `UNKNOWN_MEMBER_ID`, already has an exported predicate.
+ * @see https://github.com/apache/kafka/blob/4.3/clients/src/main/java/org/apache/kafka/common/protocol/Errors.java
+ */
+const FENCED_MEMBER_EPOCH_CODE = 110
 
 /** The Java client's message, adapted to this client's option names. */
 const POLL_TIMEOUT_WARNING =
@@ -143,7 +166,12 @@ module.exports = class RebalanceCoordinator {
   }
 
   /**
-   * The round loop itself: join, sync, apply, report, and decide whether another round is owed.
+   * One rebalance chain, with the shutdown rule around it.
+   *
+   * A join cancelled because the consumer is shutting down is not a crash: `Runner#stop()` rejects
+   * the pending join deliberately, so the chain settles and `idle()` resolves. Any other error, and
+   * this same error outside a shutdown, still reaches the caller - whose only sink is the
+   * consumer's crash handler.
    * @private
    * @param {string|null} reason
    * @param {'lost'|'revoked'|'initial'} kind
@@ -151,6 +179,31 @@ module.exports = class RebalanceCoordinator {
    * @throws {KafkaJSNonRetriableError} when the chain does not converge
    */
   async runChain(reason, kind) {
+    try {
+      await this.runRounds(reason, kind)
+    } catch (error) {
+      if (error && error.type === CONSUMER_STOPPING && this.runner.stopRequested) {
+        this.logger.debug('Rebalance chain abandoned because the consumer is stopping', {
+          groupId: this.groupId,
+          memberId: this.consumerGroup.memberId,
+        })
+
+        return
+      }
+
+      throw error
+    }
+  }
+
+  /**
+   * The rounds of one chain. Called only by `runChain`, which owns the shutdown rule.
+   * @private
+   * @param {string|null} reason
+   * @param {'lost'|'revoked'|'initial'} kind
+   * @returns {Promise<void>}
+   * @throws {KafkaJSNonRetriableError} when the chain does not converge
+   */
+  async runRounds(reason, kind) {
     do {
       if (this.runner.stopRequested) {
         return
@@ -166,6 +219,7 @@ module.exports = class RebalanceCoordinator {
         this.instrumentationEmitter.emit(REBALANCING, {
           groupId: this.groupId,
           memberId: this.consumerGroup.memberId,
+          membershipProtocol: this.consumerGroup.kind || 'classic',
           reason,
         })
       }
@@ -225,6 +279,7 @@ module.exports = class RebalanceCoordinator {
           {}
         ),
         groupProtocol: this.consumerGroup.groupProtocol,
+        membershipProtocol: this.consumerGroup.kind || 'classic',
         duration: Date.now() - roundStartedAt,
         rebalanceProtocol: this.consumerGroup.rebalanceProtocol(),
       }
@@ -240,13 +295,35 @@ module.exports = class RebalanceCoordinator {
         this.heartbeatManager.ensureStarted()
       }
 
+      // `kind` here is the ROUND kind, only 'lost' | 'revoked'. The MEMBERSHIP kind is a separate
+      // variable: testing the round kind against 'classic' would be permanently false and would
+      // delete the shipped classic cooperative follow-up below. Defaulted, because a group object
+      // without the accessor is a classic one.
+      const protocol = this.consumerGroup.kind || 'classic'
+
       kind = this.takePendingKind() || 'revoked'
       reason =
         kind === 'lost'
           ? this.takeRejoinRequested()
-          : revoked.length && cooperative
+          : revoked.length && cooperative && protocol === 'classic'
             ? 'partitions-revoked'
-            : this.takeRejoinRequested()
+            : protocol === 'consumer' && this.consumerGroup.needsReconciliation()
+              ? 'assignment-changed'
+              : this.takeRejoinRequested()
+
+      if (reason && protocol === 'consumer' && !this.runner.stopRequested) {
+        // One coordinator trip's worth of spacing, so a multi-trip reconciliation spends the
+        // 20-round budget on real trips instead of spinning the event loop. Capped and skipped
+        // while stopping: this runs inside a chain `Runner#stop()` awaits through `idle()`.
+        // Deliberately not `unref()`ed: the chain awaits this timer, so an unreferenced one would
+        // strand the round whenever nothing else keeps the loop alive.
+        await new Promise((resolve) =>
+          setTimeout(
+            resolve,
+            Math.min(this.consumerGroup.heartbeatInterval(), MAX_RECONCILE_YIELD_MS)
+          )
+        )
+      }
     } while (reason)
   }
 
@@ -261,6 +338,7 @@ module.exports = class RebalanceCoordinator {
     this.instrumentationEmitter.emit(REBALANCING, {
       groupId: this.groupId,
       memberId: this.consumerGroup.memberId,
+      membershipProtocol: this.consumerGroup.kind || 'classic',
       reason,
     })
   }
@@ -359,6 +437,18 @@ module.exports = class RebalanceCoordinator {
       return false
     }
 
+    // Under the consumer group protocol the member epoch moves on every reconciliation, so
+    // comparing the epoch a fencing was sent under against the one held now carries no
+    // information - and the epoch is deliberately NOT zeroed when the member is fenced, so every
+    // fencing verdict would compare unequal and be dropped, leaving a member that sends nothing
+    // and never rejoins.
+    if (
+      this.consumerGroup.kind === 'consumer' &&
+      (isUnknownMemberId(verdict.error) || verdict.error.code === FENCED_MEMBER_EPOCH_CODE)
+    ) {
+      return false
+    }
+
     const sentUnder = sentGeneration(verdict.error)
     return sentUnder != null && sentUnder !== this.consumerGroup.generationId
   }
@@ -377,13 +467,14 @@ module.exports = class RebalanceCoordinator {
    * @returns {Verdict|null}
    */
   classify(error, path) {
-    const { action } = rebalanceAction(error, path)
+    const kind = this.consumerGroup.kind
+    const { action } = rebalanceAction(error, path, { kind })
 
     if (action !== 'lost' && action !== 'revoked') {
       return null
     }
 
-    return { kind: action, reason: rebalanceReason(error), error }
+    return { kind: action, reason: rebalanceReason(error, { kind }), error }
   }
 
   /** @returns {Verdict|null} the slot, cleared */
@@ -434,7 +525,18 @@ module.exports = class RebalanceCoordinator {
 
     this.heartbeatManager.stop()
 
-    if (!isStatic) {
+    // KIP-848 members always tell the coordinator they are gone, static or not - the protocol picks
+    // epoch -1 or -2 from `groupInstanceId`. KIP-345's "a static member sends nothing" rule is the
+    // CLASSIC rule, and staying silent here would leave a static consumer-protocol member out of
+    // `STALE`, so it would never rejoin.
+    // @see https://cwiki.apache.org/confluence/display/KAFKA/KIP-848%3A+The+Next+Generation+of+the+Consumer+Rebalance+Protocol
+    if (this.consumerGroup.kind === 'consumer') {
+      await this.consumerGroup.leaveForPollExpiry().catch((error) => {
+        this.logger.debug('The poll-expiry leave failed; the member is treated as lost anyway', {
+          error: error.message,
+        })
+      })
+    } else if (!isStatic) {
       await this.consumerGroup.leave().catch((error) => {
         this.logger.debug('LeaveGroup failed after a poll-interval overrun', {
           error: error.message,
@@ -506,7 +608,10 @@ module.exports = class RebalanceCoordinator {
   }
 
   /**
-   * @private
+   * Emits one of the three partition events with the payload every listener expects.
+   *
+   * Not private: the group membership emits `PARTITIONS_LOST` through this method for a loss it
+   * learns about outside a round, so the coordinator stays the only emitter of these three events.
    * @param {string} event one of the three partition event names
    * @param {import('./groupProtocol/interface').TopicPartitions[]} partitions
    * @returns {void}

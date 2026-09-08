@@ -6,7 +6,12 @@ const ConsumerGroup = require('../consumerGroup')
 const InstrumentationEventEmitter = require('../../instrumentation/emitter')
 const { events } = require('../instrumentationEvents')
 const { COOPERATIVE, EAGER } = require('../groupProtocol/interface')
-const { pollIntervalExceededError } = require('../rebalanceErrorContract')
+const {
+  pollIntervalExceededError,
+  stampGeneration,
+  REBALANCE_PATHS,
+} = require('../rebalanceErrorContract')
+const { KafkaJSNonRetriableError, KafkaJSProtocolError } = require('../../errors')
 const { createErrorFromCode } = require('../../protocol/error')
 const { MemberMetadata } = require('../assignerProtocol')
 const { newLogger, waitFor } = require('testHelpers')
@@ -41,6 +46,7 @@ const build = ({ mode = EAGER, assignment = [], deltas = [] } = {}) => {
     leaderId: 'member-1',
     groupInstanceId: null,
     groupProtocol: 'RoundRobinAssigner',
+    kind: 'classic',
     groupMembership: {},
     isLeader: () => true,
     rebalanceProtocol: () => mode,
@@ -796,7 +802,12 @@ describe('Consumer > RebalanceCoordinator', () => {
       expect(consumerGroup.discardUncommittedOffsets).toHaveBeenCalledTimes(1)
       expect(calls.indexOf('discard')).toBeLessThan(calls.indexOf(events.REBALANCING))
       expect(payloadsOf(emitted, events.REBALANCING)).toEqual([
-        { groupId: 'coordinator-group', memberId: 'member-1', reason: 'lost' },
+        {
+          groupId: 'coordinator-group',
+          memberId: 'member-1',
+          membershipProtocol: 'classic',
+          reason: 'lost',
+        },
       ])
       expect(consumerGroup.joinAndSync).not.toHaveBeenCalled()
       expect(payloadsOf(emitted, events.GROUP_JOIN)).toHaveLength(0)
@@ -1619,6 +1630,7 @@ describe('Consumer > RebalanceCoordinator', () => {
         {
           groupId: 'coordinator-group',
           memberId: 'member-1',
+          membershipProtocol: 'classic',
           reason: 'stale-assignment',
         },
       ])
@@ -1810,5 +1822,310 @@ describe('Consumer > RebalanceCoordinator', () => {
 
       expect([...observed].sort()).toEqual(DOCUMENTED)
     })
+  })
+})
+
+describe('Consumer > RebalanceCoordinator > the consumer group protocol', () => {
+  beforeEach(() => jest.useFakeTimers())
+  afterEach(() => jest.useRealTimers())
+
+  /**
+   * The shipped `build()` returns { coordinator, consumerGroup, emitted, calls, ... }. These cases
+   * only ever add members to `consumerGroup`, which is a plain object double.
+   */
+  const asConsumerProtocol = (consumerGroup, { needsReconciliation = () => false } = {}) => {
+    consumerGroup.kind = 'consumer'
+    consumerGroup.needsReconciliation = jest.fn(needsReconciliation)
+    consumerGroup.heartbeatInterval = jest.fn(() => 500)
+    consumerGroup.leaveForPollExpiry = jest.fn(async () => {})
+    consumerGroup.rebalanceProtocol = jest.fn(() => 'cooperative')
+    return consumerGroup
+  }
+
+  it('runs a follow-up round while the membership still needs reconciliation', async () => {
+    const { coordinator, consumerGroup, emitted } = build()
+    let outstanding = 2
+    asConsumerProtocol(consumerGroup, {
+      needsReconciliation: () => outstanding-- > 0,
+    })
+
+    const chain = coordinator.runRound('assignment-changed', 'revoked')
+    await jest.advanceTimersByTimeAsync(20000)
+    await chain
+
+    const rounds = emitted.filter(({ type }) => type === events.REBALANCING)
+    expect(rounds.map(({ payload }) => payload.reason)).toEqual([
+      'assignment-changed',
+      'assignment-changed',
+      'assignment-changed',
+    ])
+    expect(consumerGroup.joinAndSync).toHaveBeenCalledTimes(3)
+  })
+
+  it('yields one membership interval between rounds, capped, and not while stopping', async () => {
+    const { coordinator, consumerGroup, runner } = build()
+    let outstanding = 1
+    asConsumerProtocol(consumerGroup, { needsReconciliation: () => outstanding-- > 0 })
+    consumerGroup.heartbeatInterval = jest.fn(() => 30000)
+
+    const chain = coordinator.runRound('assignment-changed', 'revoked')
+    await jest.advanceTimersByTimeAsync(4999)
+    expect(consumerGroup.joinAndSync).toHaveBeenCalledTimes(1)
+
+    await jest.advanceTimersByTimeAsync(1)
+    await chain
+    expect(consumerGroup.joinAndSync).toHaveBeenCalledTimes(2)
+
+    // A stop landing MID-ROUND - the ordinary shape - skips the yield outright, so `stop()` is
+    // never held open by it. The round still owes a follow-up: only the guard stops the sleep.
+    outstanding = 1
+    consumerGroup.joinAndSync.mockClear()
+    consumerGroup.heartbeatInterval.mockClear()
+    consumerGroup.applyRebalanceResult.mockImplementation(async () => {
+      runner.stopRequested = true
+      return { assignment: [], added: [], revoked: [] }
+    })
+
+    const stopping = coordinator.runRound('assignment-changed', 'revoked')
+    await jest.advanceTimersByTimeAsync(30000)
+    await stopping
+
+    expect(jest.getTimerCount()).toEqual(0)
+    expect(consumerGroup.heartbeatInterval).not.toHaveBeenCalled()
+    expect(consumerGroup.joinAndSync).toHaveBeenCalledTimes(1)
+
+    // And a stop already requested before the round never joins at all.
+    consumerGroup.joinAndSync.mockClear()
+    await coordinator.runRound('assignment-changed', 'revoked')
+    expect(consumerGroup.joinAndSync).not.toHaveBeenCalled()
+  })
+
+  // The shipped classic follow-up must survive the round-kind/protocol split.
+  it('keeps the classic cooperative follow-up round', async () => {
+    const { coordinator, consumerGroup, emitted } = build()
+    consumerGroup.kind = 'classic'
+    consumerGroup.rebalanceProtocol = jest.fn(() => 'cooperative')
+    consumerGroup.applyRebalanceResult
+      .mockResolvedValueOnce({
+        assignment: [],
+        added: [],
+        revoked: [{ topic: 'topic-a', partitions: [0] }],
+      })
+      .mockResolvedValue({ assignment: [], added: [], revoked: [] })
+
+    await coordinator.runRound(null, 'initial')
+
+    expect(
+      emitted.filter(({ type }) => type === events.REBALANCING).map(({ payload }) => payload.reason)
+    ).toEqual(['partitions-revoked'])
+  })
+
+  // A group object that predates the `kind` accessor is a classic one: without the default the
+  // follow-up above would be deleted for it, silently.
+  it('keeps that follow-up for a group object without the kind accessor', async () => {
+    const { coordinator, consumerGroup, emitted } = build()
+    delete consumerGroup.kind
+    consumerGroup.rebalanceProtocol = jest.fn(() => 'cooperative')
+    consumerGroup.applyRebalanceResult
+      .mockResolvedValueOnce({
+        assignment: [],
+        added: [],
+        revoked: [{ topic: 'topic-a', partitions: [0] }],
+      })
+      .mockResolvedValue({ assignment: [], added: [], revoked: [] })
+
+    await coordinator.runRound(null, 'initial')
+
+    expect(
+      emitted.filter(({ type }) => type === events.REBALANCING).map(({ payload }) => payload.reason)
+    ).toEqual(['partitions-revoked'])
+  })
+
+  it('does not consult needsReconciliation under the classic protocol', async () => {
+    const { coordinator, consumerGroup } = build()
+    consumerGroup.kind = 'classic'
+    consumerGroup.needsReconciliation = jest.fn(() => true)
+
+    await coordinator.runRound(null, 'initial')
+    expect(consumerGroup.needsReconciliation).not.toHaveBeenCalled()
+  })
+
+  it('carries membershipProtocol on both REBALANCING sites and on GROUP_JOIN', async () => {
+    const { coordinator, consumerGroup, emitted } = build()
+    asConsumerProtocol(consumerGroup)
+
+    await coordinator.runRound('assignment-changed', 'revoked')
+    coordinator.abandon('lost')
+
+    const rebalancing = emitted.filter(({ type }) => type === events.REBALANCING)
+    expect(rebalancing).toHaveLength(2)
+    for (const { payload } of rebalancing) {
+      expect(payload.membershipProtocol).toEqual('consumer')
+    }
+
+    const [groupJoin] = emitted.filter(({ type }) => type === events.GROUP_JOIN)
+    expect(groupJoin.payload.membershipProtocol).toEqual('consumer')
+    // `groupProtocol` keeps its 2.2.4 meaning: the assignor name, not the membership.
+    expect(groupJoin.payload).toHaveProperty('groupProtocol')
+  })
+
+  it('reports membershipProtocol classic when nothing selected the consumer protocol', async () => {
+    const { coordinator, consumerGroup, emitted } = build()
+    // Deleted rather than set: a group object that predates the `kind` getter must still report
+    // 'classic', which is what keeps this key additive for every existing listener.
+    delete consumerGroup.kind
+
+    await coordinator.runRound('rebalance-in-progress', 'revoked')
+    coordinator.abandon('lost')
+
+    // All three payload sites default, not just the round's own.
+    for (const { payload } of emitted.filter(
+      ({ type }) => type === events.REBALANCING || type === events.GROUP_JOIN
+    )) {
+      expect(payload.membershipProtocol).toEqual('classic')
+    }
+  })
+
+  it('returns quietly when the chain is abandoned because the consumer is stopping', async () => {
+    const { coordinator, consumerGroup, runner } = build()
+    asConsumerProtocol(consumerGroup)
+
+    const stopping = new KafkaJSNonRetriableError('consumer is stopping')
+    stopping.type = 'CONSUMER_STOPPING'
+    consumerGroup.joinAndSync.mockImplementation(async () => {
+      runner.stopRequested = true
+      throw stopping
+    })
+
+    await expect(coordinator.runRound('assignment-changed', 'revoked')).resolves.toBeUndefined()
+    expect(runner.onCrash).not.toHaveBeenCalled()
+  })
+
+  it('still throws the stop error when no stop was requested', async () => {
+    const { coordinator, consumerGroup } = build()
+    asConsumerProtocol(consumerGroup)
+
+    const stopping = new KafkaJSNonRetriableError('consumer is stopping')
+    stopping.type = 'CONSUMER_STOPPING'
+    consumerGroup.joinAndSync.mockRejectedValue(stopping)
+
+    await expect(coordinator.runRound('assignment-changed', 'revoked')).rejects.toThrow(
+      'consumer is stopping'
+    )
+  })
+
+  it('sends the poll-expiry leave for a static consumer-protocol member', async () => {
+    const { coordinator, consumerGroup } = build()
+    asConsumerProtocol(consumerGroup)
+
+    await coordinator.onPollExpired({ elapsedMs: 400000, isStatic: true })
+
+    expect(consumerGroup.leaveForPollExpiry).toHaveBeenCalledTimes(1)
+    expect(consumerGroup.leave).not.toHaveBeenCalled()
+    expect(consumerGroup.resetGenerationLocally).toHaveBeenCalledTimes(1)
+  })
+
+  it('swallows a failing poll-expiry leave and still raises the lost verdict', async () => {
+    // Real timers: the unhandled-rejection probe below needs a real macrotask to settle on.
+    jest.useRealTimers()
+    const { coordinator, consumerGroup, fetchManager } = build()
+    asConsumerProtocol(consumerGroup)
+    consumerGroup.leaveForPollExpiry = jest.fn(async () => {
+      throw new Error('coordinator unreachable')
+    })
+
+    const unhandled = []
+    const onUnhandledRejection = (reason) => unhandled.push(reason)
+    process.on('unhandledRejection', onUnhandledRejection)
+
+    try {
+      await expect(
+        coordinator.onPollExpired({ elapsedMs: 400000, isStatic: false })
+      ).resolves.toBeUndefined()
+      // Give any same-tick unhandled rejection a chance to surface before we stop listening.
+      await new Promise((resolve) => setImmediate(resolve))
+    } finally {
+      process.off('unhandledRejection', onUnhandledRejection)
+    }
+
+    expect(unhandled).toHaveLength(0)
+    expect(consumerGroup.leaveForPollExpiry).toHaveBeenCalledTimes(1)
+    expect(consumerGroup.resetGenerationLocally).toHaveBeenCalledTimes(1)
+    // The verdict still lands: an unreachable coordinator must not cost the member its rejoin.
+    expect(coordinator.takeVerdict()).toMatchObject({
+      kind: 'lost',
+      reason: 'poll-interval-exceeded',
+    })
+    expect(fetchManager.stop).toHaveBeenCalledTimes(1)
+  })
+
+  it('keeps the classic static rule: no leave on a poll expiry', async () => {
+    const { coordinator, consumerGroup } = build()
+    consumerGroup.kind = 'classic'
+
+    await coordinator.onPollExpired({ elapsedMs: 400000, isStatic: true })
+
+    expect(consumerGroup.leave).not.toHaveBeenCalled()
+    expect(consumerGroup.leaveForPollExpiry).toBeUndefined()
+  })
+
+  // A fencing sent at epoch 7 must not be discarded as stale.
+  it('never treats a consumer-protocol fencing as a stale generation', () => {
+    const { coordinator, consumerGroup } = build()
+    asConsumerProtocol(consumerGroup)
+    consumerGroup.generationId = 9
+
+    for (const code of [25, 110]) {
+      const error = new KafkaJSProtocolError(createErrorFromCode(code))
+      stampGeneration(error, 7)
+      expect(coordinator.isStaleGenerationVerdict({ kind: 'lost', reason: 'fenced', error })).toBe(
+        false
+      )
+    }
+  })
+
+  it('still discards a classic stale-generation verdict', () => {
+    const { coordinator, consumerGroup } = build()
+    consumerGroup.kind = 'classic'
+    consumerGroup.generationId = 9
+
+    const error = new KafkaJSProtocolError(createErrorFromCode(22))
+    stampGeneration(error, 7)
+    expect(coordinator.isStaleGenerationVerdict({ kind: 'lost', reason: 'lost', error })).toBe(true)
+  })
+
+  it('classifies through the membership kind', () => {
+    const { coordinator, consumerGroup } = build()
+    asConsumerProtocol(consumerGroup)
+
+    const fenced = new KafkaJSProtocolError(createErrorFromCode(110))
+    expect(coordinator.classify(fenced, REBALANCE_PATHS.HEARTBEAT)).toMatchObject({
+      kind: 'lost',
+      reason: 'fenced',
+    })
+
+    consumerGroup.kind = 'classic'
+    const illegalGeneration = new KafkaJSProtocolError(createErrorFromCode(22))
+    expect(coordinator.classify(illegalGeneration, REBALANCE_PATHS.HEARTBEAT)).toMatchObject({
+      kind: 'lost',
+      reason: 'lost',
+    })
+  })
+
+  // No production line changes for this, so it is pinned rather than implemented.
+  it('rebuilds offsets on a LOST round under both protocols', async () => {
+    for (const kind of ['classic', 'consumer']) {
+      const { coordinator, consumerGroup } = build()
+      consumerGroup.kind = kind
+      consumerGroup.rebalanceProtocol = jest.fn(() => 'cooperative')
+      consumerGroup.needsReconciliation = jest.fn(() => false)
+
+      await coordinator.runRound('fenced', 'lost')
+
+      expect(consumerGroup.applyRebalanceResult).toHaveBeenCalledWith(expect.anything(), {
+        rebuildOffsets: true,
+      })
+      expect(consumerGroup.forgetOwnedPartitions).toHaveBeenCalled()
+    }
   })
 })
