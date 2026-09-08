@@ -186,6 +186,7 @@ Upstream work this phase builds on, with thanks to its authors: PRs #1779, #1695
 
 #### Additions
 - Added the member state machine and the member-id generator the new consumer group protocol is built on: the ten states and their legal predecessors are the Java client's table, an illegal transition raises an invariant violation rather than being silently allowed, and a member id is 16 random bytes rendered as 22 unpadded base64url characters, re-drawn on the reserved uuid values.
+- The heartbeat timer can now be asked for an immediate tick (`requestTick()`), and reads its delay from the group membership on every schedule instead of once at construction. With the classic protocol the membership's answer is the configured `heartbeatInterval`, so the cadence and the wire are unchanged; with the consumer protocol it is the `HeartbeatIntervalMs` the coordinator returned on the last heartbeat.
 
 #### Tooling
 

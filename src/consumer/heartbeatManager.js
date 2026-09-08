@@ -14,6 +14,12 @@
  * only while heartbeats are enabled, only while no rebalance round is in flight, and never in
  * place of one: an overrun hands off to `onPollExpired` and the tick ends there.
  *
+ * Two entry points arm the chain: `ensureStarted()`, which is idempotent and does nothing when a
+ * chain is already armed, and `requestTick()`, which supersedes whatever is armed with a
+ * zero-delay one. The tick's delay and the `interval` it reports are read from the membership on
+ * every schedule, so a protocol whose cadence the coordinator owns is followed rather than
+ * approximated.
+ *
  * @see https://cwiki.apache.org/confluence/display/KAFKA/KIP-62%3A+Allow+consumer+to+send+heartbeats+from+a+background+thread
  */
 module.exports = class HeartbeatManager {
@@ -56,6 +62,11 @@ module.exports = class HeartbeatManager {
      * settling tick scheduling a second chain on top of the new one.
      */
     this.chainId = 0
+    /**
+     * Set by `requestTick()` while a tick is in flight, consumed by that tick's `finally`. The
+     * flag exists because arming a second chain under a running one would double it.
+     */
+    this.tickRequested = false
   }
 
   /** @returns {boolean} whether the chain is armed */
@@ -98,12 +109,83 @@ module.exports = class HeartbeatManager {
   }
 
   /**
+   * Asks for a heartbeat NOW instead of at the next scheduled tick.
+   *
+   * The KIP-848 membership needs three heartbeats to leave immediately - the joining one, the ack
+   * and the leave - and `schedule()` alone would delay them by up to one server interval, which
+   * for the ack also delays the "on generated" state transition that follows it.
+   *
+   * Deliberately UNguarded on `handle`: the join runs before `ensureStarted()` does, so this is
+   * what arms the chain in the first place. The chain it arms is the same one `ensureStarted()`
+   * would have armed later, so nothing is doubled. A DISABLED manager is left alone, because
+   * `enable()` re-arms nothing.
+   * @returns {void}
+   */
+  requestTick() {
+    if (this.disabled) {
+      return
+    }
+
+    // A tick already sending cannot be pre-empted: arming here would leave two live chains, so
+    // the flag is handed to that tick's `finally`, which re-arms through `armNow()`.
+    if (this.inFlight) {
+      this.tickRequested = true
+      return
+    }
+
+    this.armNow()
+  }
+
+  /**
+   * Supersedes whatever is armed with a zero-delay chain.
+   *
+   * `chainId` is bumped and CAPTURED, exactly as `schedule()` does: a callback that read the live
+   * field would always match `tick()`'s own guard, so a chain superseded between arming and firing
+   * would not be rejected.
+   * @private
+   * @returns {void}
+   */
+  armNow() {
+    if (this.handle) {
+      clearTimeout(this.handle)
+      this.handle = null
+    }
+
+    const chainId = ++this.chainId
+    this.handle = setTimeout(() => this.tick(chainId), 0)
+  }
+
+  /**
+   * The delay the next tick is armed with, and the `interval` that tick reports to the membership.
+   *
+   * Read PER SCHEDULE rather than once at construction: under the consumer group protocol the
+   * cadence is the `HeartbeatIntervalMs` of the last response and moves whenever the coordinator
+   * says so, and while a backoff is armed it is the backoff's remaining delay.
+   * @see https://cwiki.apache.org/confluence/display/KAFKA/KIP-848%3A+The+Next+Generation+of+the+Consumer+Rebalance+Protocol
+   *
+   * A membership that does not answer keeps the configured value, which is what the classic
+   * implementation's interval is.
+   * @private
+   * @returns {number} milliseconds
+   */
+  nextInterval() {
+    const fromMembership = this.groupMembership.heartbeatInterval
+
+    if (typeof fromMembership !== 'function') {
+      return this.heartbeatInterval
+    }
+
+    const interval = fromMembership.call(this.groupMembership)
+    return Number.isFinite(interval) && interval >= 0 ? interval : this.heartbeatInterval
+  }
+
+  /**
    * @private
    * @returns {void}
    */
   schedule() {
     const { chainId } = this
-    this.handle = setTimeout(() => this.tick(chainId), this.heartbeatInterval)
+    this.handle = setTimeout(() => this.tick(chainId), this.nextInterval())
   }
 
   /**
@@ -143,9 +225,10 @@ module.exports = class HeartbeatManager {
     }
 
     this.inFlight = true
+    let rearm = false
 
     try {
-      await this.groupMembership.heartbeat({ interval: this.heartbeatInterval })
+      await this.groupMembership.heartbeat({ interval: this.nextInterval() })
     } catch (error) {
       // A result that landed after `stop()`, after the chain was re-armed under a new generation,
       // or inside the JoinGroup window belongs to a generation nobody is in any more: it is
@@ -175,9 +258,19 @@ module.exports = class HeartbeatManager {
       }
     } finally {
       this.inFlight = false
+      // Guarded on `handle`, which is the one fact `stop()` sets: a tick only ever runs on a
+      // manager that WAS armed, so a null handle here means a stop landed inside this heartbeat
+      // and re-arming would leave a non-unref'd timer holding the event loop open after the member
+      // has left.
+      rearm = this.tickRequested && this.handle !== null
+      this.tickRequested = false
     }
 
-    if (this.handle && chainId === this.chainId) {
+    if (rearm) {
+      // Bumps `chainId`, so this tick's captured id no longer matches and the tail below cannot
+      // add a second chain on top of the one just armed.
+      this.armNow()
+    } else if (this.handle && chainId === this.chainId) {
       this.schedule()
     }
   }
