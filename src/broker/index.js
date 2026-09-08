@@ -1,8 +1,9 @@
 const Lock = require('../utils/lock')
 const { Types: Compression } = require('../protocol/message/compression')
 const { requests, lookup, selectVersion } = require('../protocol/requests')
-const { KafkaJSNonRetriableError } = require('../errors')
+const { KafkaJSNonRetriableError, KafkaJSServerDoesNotSupportApiKey } = require('../errors')
 const apiKeys = require('../protocol/requests/apiKeys')
+const { GROUP_STATES, GROUP_TYPES, toDisplayName } = require('../protocol/groupTypes')
 const shuffle = require('../utils/shuffle')
 
 // The last Fetch version keyed by topic name. A request that supplies no topic ids cannot be sent
@@ -39,6 +40,20 @@ const toVersionMap = (response) =>
       }),
     {}
   )
+
+/**
+ * @param {string[]} typeFilters display names
+ * @returns {boolean} whether dropping the filter on a broker with no group types yields the same
+ *   set of groups: true only for `{Classic}` and for `{Classic, Consumer}`, because on such a
+ *   broker every group is classic
+ */
+const isDroppableTypeFilter = (typeFilters) => {
+  const requested = new Set(typeFilters)
+  return (
+    requested.has(GROUP_TYPES.classic) &&
+    [...requested].every((type) => type === GROUP_TYPES.classic || type === GROUP_TYPES.consumer)
+  )
+}
 
 /**
  * Each node in a Kafka cluster is called broker. This class contains
@@ -1192,13 +1207,61 @@ module.exports = class Broker {
   }
 
   /**
-   * Send request for list of groups
+   * Lists the groups this broker coordinates, optionally filtered by state and by type.
+   *
+   * Both filters are given in lower case (`'stable'`, `'consumer'`) and are mapped to the display
+   * names the wire carries. What happens when the broker is too old to understand a filter is
+   * Java's rule, verbatim, because the alternatives are all wrong in one direction or the other:
+   *
+   * - a state filter needs v4; below that it throws, since answering unfiltered would be a
+   *   different question;
+   * - a type filter needs v5, EXCEPT when it asks for exactly `classic`, or for `classic` and
+   *   `consumer`, on a broker with no group types at all - there every group is classic, so
+   *   dropping the filter yields the same set. Any other filter throws, `consumer` alone
+   *   included: dropping that one would answer "all groups" to "consumer groups only".
+   *
    * @public
-   * @returns {Promise}
+   * @param {object} [filters]
+   * @param {string[]} [filters.states=[]] lower-case group states
+   * @param {string[]} [filters.types=[]] lower-case group types
+   * @returns {Promise<object>} the decoded response; rows carry `groupState`/`groupType` as the
+   *   broker's display strings, or `''` on a version that does not have them
+   * @throws {KafkaJSServerDoesNotSupportApiKey} when a filter needs a version this broker does
+   *   not offer and cannot be dropped without changing the answer
+   * @throws {KafkaJSNonRetriableError} when a filter value is not one Kafka defines
+   * @see https://github.com/apache/kafka/blob/4.3/clients/src/main/java/org/apache/kafka/common/requests/ListGroupsRequest.java
    */
-  async listGroups() {
+  async listGroups({ states = [], types = [] } = {}) {
+    const version = this.negotiatedVersion(apiKeys.ListGroups, requests.ListGroups)
+    const stateFilters = states.map((state) => toDisplayName(GROUP_STATES, state, 'group state'))
+    let typeFilters = types.map((type) => toDisplayName(GROUP_TYPES, type, 'group type'))
+
+    // A null version means the broker advertises nothing usable for this API. That is
+    // `lookupRequest`'s error to report, not a filter downgrade, so the two checks below are
+    // skipped rather than misreporting "we need v4" for a broker that offers no ListGroups at all.
+    if (version !== null && stateFilters.length > 0 && version < 4) {
+      throw new KafkaJSServerDoesNotSupportApiKey(
+        `The broker only supports ListGroups v${version}, but we need v4 or newer to request groups by states.`,
+        { apiKey: apiKeys.ListGroups, apiName: 'ListGroups' }
+      )
+    }
+
+    if (version !== null && typeFilters.length > 0 && version < 5) {
+      if (isDroppableTypeFilter(typeFilters)) {
+        typeFilters = []
+      } else {
+        throw new KafkaJSServerDoesNotSupportApiKey(
+          `The broker only supports ListGroups v${version}, but we need v5 or newer to request groups by type. ` +
+            `Requested group types: [${typeFilters.join(', ')}].`,
+          { apiKey: apiKeys.ListGroups, apiName: 'ListGroups' }
+        )
+      }
+    }
+
     const listGroups = this.lookupRequest(apiKeys.ListGroups, requests.ListGroups)
-    return await this[PRIVATE.SEND_REQUEST](listGroups())
+    return await this[PRIVATE.SEND_REQUEST](
+      listGroups({ states: stateFilters, types: typeFilters })
+    )
   }
 
   /**

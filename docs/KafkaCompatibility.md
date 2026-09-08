@@ -20,7 +20,7 @@ Gap classes: `current` (fork max equals the Kafka max) · `behind:N` · `stub` (
 | LeaveGroup | 13 | 0-5 | v4+ | 0-3 | behind:2 | v3 batch removal by group instance id (KIP-345): the codec exists, but there is no admin removeMembersFromConsumerGroup to drive it. |
 | SyncGroup | 14 | 0-5 | v4+ | 0-3 | behind:2 |  |
 | DescribeGroups | 15 | 0-6 | v5+ | 0-2 | behind:4 | Below v6 the broker reports KIP-848 consumer-protocol groups as Dead; v6 adds ErrorMessage. Full coverage also needs ConsumerGroupDescribe (key 69) routing. |
-| ListGroups | 16 | 0-5 | v3+ | 0-2 | behind:3 | No GroupState filter (v4) or GroupType field (v5), so consumer-protocol groups cannot be told apart from classic ones. |
+| ListGroups | 16 | 0-5 | v3+ | 0-5 | current | v3 flexible, v4 StatesFilter/GroupState (KIP-518), v5 TypesFilter/GroupType (KIP-848). Java's downgrade rule applies to the filters on older brokers: a state filter needs v4, and a type filter needs v5 unless it asks only for classic (and consumer), which a broker without group types answers identically unfiltered. |
 | SaslHandshake | 17 | 0-1 | never | 0-1 | current | Never flexible, and the only API in the matrix that is fully current. |
 | ApiVersions | 18 | 0-4 | v3+ | 0-4 | current | v0-v3 omit every SupportedFeatures entry whose MinVersion is 0 (KAFKA-17011, fixed in v4 / Kafka 3.9), so a v3-only client sees a truncated feature list. The flexible-protocol pilot targets v4 and falls back to v3 only for brokers below 3.9. |
 | CreateTopics | 19 | 2-7 | v5+ | 2-3 | behind:4 | v5 flexible, v7 returns topic IDs. |

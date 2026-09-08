@@ -41,8 +41,8 @@
       "since": "2026-09-03"
     },
     "ListGroups": {
-      "note": "No GroupState filter (v4) or GroupType field (v5), so consumer-protocol groups cannot be told apart from classic ones.",
-      "since": "2026-09-03"
+      "note": "v3 flexible, v4 StatesFilter/GroupState (KIP-518), v5 TypesFilter/GroupType (KIP-848). Java's downgrade rule applies to the filters on older brokers: a state filter needs v4, and a type filter needs v5 unless it asks only for classic (and consumer), which a broker without group types answers identically unfiltered.",
+      "since": "2026-09-08"
     },
     "SaslHandshake": {
       "note": "Never flexible, and the only API in the matrix that is fully current.",

@@ -353,12 +353,15 @@
       "forkVersions": [
         0,
         1,
-        2
+        2,
+        3,
+        4,
+        5
       ],
-      "gap": "behind:3",
+      "gap": "current",
       "onFloor": false,
       "belowFloor": [],
-      "notes": "No GroupState filter (v4) or GroupType field (v5), so consumer-protocol groups cannot be told apart from classic ones."
+      "notes": "v3 flexible, v4 StatesFilter/GroupState (KIP-518), v5 TypesFilter/GroupType (KIP-848). Java's downgrade rule applies to the filters on older brokers: a state filter needs v4, and a type filter needs v5 unless it asks only for classic (and consumer), which a broker without group types answers identically unfiltered."
     },
     {
       "kafkaName": "SaslHandshake",

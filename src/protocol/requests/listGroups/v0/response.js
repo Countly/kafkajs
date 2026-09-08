@@ -12,6 +12,11 @@ const { failure, createErrorFromCode } = require('../../../error')
 const decodeGroup = (decoder) => ({
   groupId: decoder.readString(),
   protocolType: decoder.readString(),
+  // Neither field exists before v4/v5. Reporting them as the empty string rather than leaving
+  // them out keeps one row shape at every negotiated version, which is what lets a caller read
+  // a row without asking which version answered it.
+  groupState: '',
+  groupType: '',
 })
 
 const decode = async (rawData) => {

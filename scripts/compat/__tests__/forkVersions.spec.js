@@ -193,6 +193,7 @@ describe('scripts/compat/forkVersions', () => {
       expect(result.apis.OffsetForLeaderEpoch.stub).toBe(false)
       expect(result.apis.ConsumerGroupHeartbeat.forkVersions).toEqual([0, 1])
       expect(result.apis.ConsumerGroupHeartbeat.stub).toBe(false)
+      expect(result.apis.ListGroups.forkVersions).toEqual([0, 1, 2, 3, 4, 5])
       expect(result.apis.ConsumerGroupDescribe.forkVersions).toEqual([0, 1])
       expect(result.apis.ConsumerGroupDescribe.stub).toBe(false)
       expect(result.apis.GetTelemetrySubscriptions.hasCodec).toBe(false)
