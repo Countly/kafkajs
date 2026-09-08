@@ -84,23 +84,27 @@ describe('Admin', () => {
     test('returns describe group response for multiple groups', async () => {
       const describeGroupsResponse = await admin.describeGroups(groupIds)
 
+      // objectContaining at both levels: rows and members grow fields as the negotiated version
+      // does, and what this test pins is the fields it names, not the absence of others.
       expect(describeGroupsResponse.groups).toIncludeSameMembers(
-        groupIds.map((groupId) => ({
-          errorCode: 0,
-          groupId,
-          members: [
-            {
-              clientHost: expect.any(String),
-              clientId: expect.any(String),
-              memberId: expect.any(String),
-              memberAssignment: expect.anything(),
-              memberMetadata: expect.anything(),
-            },
-          ],
-          protocol: 'RoundRobinAssigner',
-          protocolType: 'consumer',
-          state: 'Stable',
-        }))
+        groupIds.map((groupId) =>
+          expect.objectContaining({
+            errorCode: 0,
+            groupId,
+            members: [
+              expect.objectContaining({
+                clientHost: expect.any(String),
+                clientId: expect.any(String),
+                memberId: expect.any(String),
+                memberAssignment: expect.anything(),
+                memberMetadata: expect.anything(),
+              }),
+            ],
+            protocol: 'RoundRobinAssigner',
+            protocolType: 'consumer',
+            state: 'Stable',
+          })
+        )
       )
     })
 
@@ -108,16 +112,19 @@ describe('Admin', () => {
       const groupId = `non-existent-consumer-group-id-${secureRandom()}`
       const response = await admin.describeGroups([groupId])
 
+      // From DescribeGroups v6 the broker answers GROUP_ID_NOT_FOUND (69) with a message for a
+      // group that is not there, and the row keeps the shape it has always had.
       expect(response).toEqual({
         groups: [
-          {
-            errorCode: 0,
+          expect.objectContaining({
+            errorCode: 69,
+            errorMessage: expect.any(String),
             groupId,
             members: [],
             protocol: '',
             protocolType: '',
             state: 'Dead',
-          },
+          }),
         ],
       })
     })

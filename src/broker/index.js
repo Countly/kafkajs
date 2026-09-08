@@ -961,14 +961,27 @@ module.exports = class Broker {
   }
 
   /**
+   * Describes classic groups. A KIP-848 consumer-protocol group is not describable here at any
+   * version: below v6 a broker reports it as `Dead`, and from v6 it answers `GROUP_ID_NOT_FOUND`
+   * for a group of another type as it does for a missing one (KIP-1043) - which is what makes
+   * such a group recognisable, so the caller can describe it through ConsumerGroupDescribe.
+   *
+   * From v6 a group that does not exist comes back as a row carrying `GROUP_ID_NOT_FOUND` rather
+   * than as a `Dead` row with no error; every other group-level error still fails the whole call.
+   *
    * @public
    * @param {object} request
-   * @param {Array} request.groupIds
-   * @returns {Promise}
+   * @param {string[]} request.groupIds
+   * @param {boolean} [request.includeAuthorizedOperations=false] requires v3+; ignored below it
+   * @returns {Promise<object>} the decoded response
+   * @throws {KafkaJSProtocolError} on any group-level error code other than `GROUP_ID_NOT_FOUND`
+   * @see https://cwiki.apache.org/confluence/display/KAFKA/KIP-1043%3A+Administration+of+groups
    */
-  async describeGroups({ groupIds }) {
+  async describeGroups({ groupIds, includeAuthorizedOperations = false }) {
     const describeGroups = this.lookupRequest(apiKeys.DescribeGroups, requests.DescribeGroups)
-    return await this[PRIVATE.SEND_REQUEST](describeGroups({ groupIds }))
+    return await this[PRIVATE.SEND_REQUEST](
+      describeGroups({ groupIds, includeAuthorizedOperations })
+    )
   }
 
   /**

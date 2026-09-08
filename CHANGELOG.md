@@ -242,6 +242,8 @@ Adopted upstream PRs are credited here by number as they land (Phase 2 onward).
 
 #### Behavior changes
 
+- **`admin.describeGroups` and `consumer.describeGroup()` now negotiate `DescribeGroups` up to v6, and a group that does not exist is reported differently.** Against a 4.x broker the request used to be capped at v2, where a missing group came back as a row in state `Dead` with `errorCode: 0`. At v6 the broker answers `GROUP_ID_NOT_FOUND` (69) with a message. The row keeps the shape it has always had — `state: 'Dead'`, `members: []`, `protocol: ''`, `protocolType: ''` — and now also carries `errorCode: 69` and the broker's `errorMessage`: the call still resolves, is not retried (69 is not a retriable error), and still returns one row per requested group id. Code that tested `state === 'Dead'` keeps working; code that treats `errorCode: 0` as "the group exists", or that compares a whole row for deep equality, needs updating. Every other group-level error still fails the call and is still retried exactly as before. Rows also gain `errorMessage` and `authorizedOperations`, and members gain `groupInstanceId` (static membership).
+
 #### Fixes
 
 #### Additions
@@ -261,6 +263,8 @@ Adopted upstream PRs are credited here by number as they land (Phase 2 onward).
 - `ConsumerGroupDescribe` (API key 69) v0–v1 is implemented, so a KIP-848 consumer group can be described with its real state, epochs, assignor and members — including each member's current and target assignment and, at v1, whether it upgraded from the classic protocol. Group-level errors are reported per group rather than failing the call, because `GROUP_ID_NOT_FOUND` on this API means "that is a classic group" rather than "no such group". The admin client starts using it later in this release.
 
 - `ListGroups` (API key 16) v3–v5 are implemented, so a 4.x broker answers with each group's state (v4, KIP-518) and type (v5, KIP-848) instead of only its id and protocol type, and a caller can ask for one state or one type rather than filtering client-side. Rows report the empty string for a field the negotiated version does not carry, so one row shape reads at every version. The admin surface for the filters and the two new fields lands with the rest of the group-visibility work later in this release.
+
+- `DescribeGroups` (API key 15) v3–v6 are implemented: v3 can request a group's authorized operations, v4 reports each member's `groupInstanceId` (static membership), v5 is the flexible framing, and v6 carries an error message per group. v6 also makes a KIP-848 consumer group recognisable — below v6 a broker reported one as `Dead`, from v6 it answers `GROUP_ID_NOT_FOUND` for a group of another type — which is what lets the admin client fall back to `ConsumerGroupDescribe` for it.
 
 - `consumer.rebalancing` and `consumer.group_join` now carry `membershipProtocol: 'classic' | 'consumer'`, saying which group protocol produced the round. `groupProtocol` on `group_join` keeps its existing meaning — the selected assignor protocol name. `consumer.rebalancing`'s `reason` gains `'assignment-changed'` and `'fenced'`.
 

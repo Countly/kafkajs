@@ -330,12 +330,16 @@
       "forkVersions": [
         0,
         1,
-        2
+        2,
+        3,
+        4,
+        5,
+        6
       ],
-      "gap": "behind:4",
+      "gap": "current",
       "onFloor": false,
       "belowFloor": [],
-      "notes": "Below v6 the broker reports KIP-848 consumer-protocol groups as Dead; v6 adds ErrorMessage. Full coverage also needs ConsumerGroupDescribe (key 69) routing."
+      "notes": "v3 IncludeAuthorizedOperations/AuthorizedOperations (KIP-430), v4 member GroupInstanceId (KIP-345), v5 flexible, v6 per-group ErrorMessage and GROUP_ID_NOT_FOUND for a group that does not exist (KIP-1043). Below v6 a broker reports a KIP-848 consumer-protocol group as Dead, so describing one also needs ConsumerGroupDescribe (key 69) routing."
     },
     {
       "kafkaName": "ListGroups",

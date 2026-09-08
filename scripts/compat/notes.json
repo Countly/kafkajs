@@ -37,8 +37,8 @@
       "since": "2026-09-03"
     },
     "DescribeGroups": {
-      "note": "Below v6 the broker reports KIP-848 consumer-protocol groups as Dead; v6 adds ErrorMessage. Full coverage also needs ConsumerGroupDescribe (key 69) routing.",
-      "since": "2026-09-03"
+      "note": "v3 IncludeAuthorizedOperations/AuthorizedOperations (KIP-430), v4 member GroupInstanceId (KIP-345), v5 flexible, v6 per-group ErrorMessage and GROUP_ID_NOT_FOUND for a group that does not exist (KIP-1043). Below v6 a broker reports a KIP-848 consumer-protocol group as Dead, so describing one also needs ConsumerGroupDescribe (key 69) routing.",
+      "since": "2026-09-08"
     },
     "ListGroups": {
       "note": "v3 flexible, v4 StatesFilter/GroupState (KIP-518), v5 TypesFilter/GroupType (KIP-848). Java's downgrade rule applies to the filters on older brokers: a state filter needs v4, and a type filter needs v5 unless it asks only for classic (and consumer), which a broker without group types answers identically unfiltered.",

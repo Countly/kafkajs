@@ -63,22 +63,24 @@ describe('Broker > DescribeGroups', () => {
       clientSideThrottleTime: expect.optional(0),
       throttleTime: 0,
       groups: [
-        {
+        // objectContaining at both levels: this response grows fields as the negotiated version
+        // does, and what this test pins is the fields it names, not the absence of others.
+        expect.objectContaining({
           errorCode: 0,
           groupId,
           members: [
-            {
+            expect.objectContaining({
               clientHost: expect.any(String),
               clientId: expect.any(String),
               memberAssignment: expect.anything(),
               memberId: expect.any(String),
               memberMetadata: expect.anything(),
-            },
+            }),
           ],
           protocol: 'RoundRobinAssigner',
           protocolType: 'consumer',
           state: 'Stable',
-        },
+        }),
       ],
     })
   })
