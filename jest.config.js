@@ -18,16 +18,33 @@ module.exports = {
     '!src/**/__tests__/**',
     '!src/**/fixtures/**',
   ],
-  // Baseline measured 2026-09-06 at 3.0.0-alpha.5b (full suite, apache/kafka 4.3.1):
-  // S 97.15 / B 90.09 / F 97.96 / L 97.28. The floor ratchets to each phase exit's measurement,
-  // rounded down to one decimal, so coverage can only go up. Only `npm run test:coverage` enforces it;
-  // `test:coverage:unit` passes --coverageThreshold '{}' because it covers a strict subset of `src/`.
+  // The floor ratchets to each phase exit's measurement, rounded down to one decimal, so coverage
+  // can only go up. Only `npm run test:coverage` enforces it; `test:coverage:unit` passes
+  // --coverageThreshold '{}' because it covers a strict subset of `src/`.
+  // The two path keys below take their files OUT of the global aggregate, so the global numbers
+  // were re-derived over the remaining files on 2026-09-08 at 3.0.0-alpha.6a (S 97.24 / B 90.51 /
+  // F 98.13 / L 97.36) rather than carried over from the 3.0.0-alpha.5b measurement.
   coverageThreshold: {
     global: {
-      statements: 97.1,
-      branches: 90,
-      functions: 97.9,
+      statements: 97.2,
+      branches: 90.5,
+      functions: 98.1,
+      lines: 97.3,
+    },
+    // Measured 97.45 / 91.24 / 99.15 / 97.24. Lines sit 0.12 below the global figure because
+    // stickyCore.js keeps PartitionMovements' repeat-move bookkeeping, which no input reaches.
+    './src/consumer/assigners/': {
+      statements: 97.4,
+      branches: 91.2,
+      functions: 99.1,
       lines: 97.2,
+    },
+    // Measured 98.24 / 90.79 / 100.00 / 98.18.
+    './src/consumer/groupProtocol/': {
+      statements: 98.2,
+      branches: 90.7,
+      functions: 100.0,
+      lines: 98.1,
     },
   },
   bail: false,
