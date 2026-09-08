@@ -317,6 +317,7 @@ module.exports = ({
         assigners,
         sessionTimeout: groupTimeouts.sessionTimeout,
         rebalanceTimeout: groupTimeouts.rebalanceTimeout,
+        heartbeatInterval: groupTimeouts.heartbeatInterval,
         maxBytesPerPartition,
         minBytes,
         maxBytes,

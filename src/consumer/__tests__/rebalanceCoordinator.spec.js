@@ -36,7 +36,7 @@ const deferred = () => {
 const payloadsOf = (emitted, type) =>
   emitted.filter((event) => event.type === type).map(({ payload }) => payload)
 
-const build = ({ mode = EAGER, assignment = [], deltas = [] } = {}) => {
+const build = ({ mode = EAGER, assignment = [], deltas = [], heartbeatInterval = 3000 } = {}) => {
   const calls = []
 
   const consumerGroup = {
@@ -68,6 +68,12 @@ const build = ({ mode = EAGER, assignment = [], deltas = [] } = {}) => {
     leave: jest.fn(async () => calls.push('leave')),
     resetGenerationLocally: jest.fn(() => calls.push('resetGenerationLocally')),
     clearStaleAssignmentPending: jest.fn(),
+    // The membership seam the runner drives: the real ConsumerGroup answers all three. Under the
+    // classic protocol the interval is the configured one, which is what the cases building a
+    // real HeartbeatManager rely on.
+    heartbeatInterval: () => heartbeatInterval,
+    onStopRequested: jest.fn(),
+    onMembershipError: jest.fn(() => calls.push('onMembershipError')),
   }
 
   const fetchManager = {
@@ -1143,7 +1149,7 @@ describe('Consumer > RebalanceCoordinator', () => {
 
     it('does not evict a member whose own round is holding the JoinGroup', async () => {
       jest.useFakeTimers()
-      const { coordinator, consumerGroup, calls, emitted } = build()
+      const { coordinator, consumerGroup, calls, emitted } = build({ heartbeatInterval: 20 })
       const pollTimer = new PollTimer({ pollDeadline: 50 })
       const manager = new HeartbeatManager({
         groupMembership: consumerGroup,
@@ -1190,7 +1196,7 @@ describe('Consumer > RebalanceCoordinator', () => {
 
     it('runs the whole expiry sequence and re-arms the manager', async () => {
       jest.useFakeTimers()
-      const { coordinator, consumerGroup, calls } = build()
+      const { coordinator, consumerGroup, calls } = build({ heartbeatInterval: 100 })
       const pollTimer = new PollTimer({ pollDeadline: 50 })
       const manager = new HeartbeatManager({
         groupMembership: consumerGroup,

@@ -94,6 +94,9 @@ describe('Consumer > PollTimer call sites', () => {
       hasSeekOffset: () => false,
       discardUncommittedOffsets: jest.fn(),
       clearStaleAssignmentPending: jest.fn(),
+      // The membership seam the runner drives: the real ConsumerGroup answers both.
+      heartbeatInterval: () => 3000,
+      onStopRequested: jest.fn(),
       forgetOwnedPartitions: jest.fn(),
       clearAssignerState: jest.fn(),
     }

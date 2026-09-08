@@ -1,7 +1,12 @@
 const { EventEmitter } = require('events')
 const Long = require('../utils/long')
 const createRetry = require('../retry')
-const { isKafkaJSError, isFencedInstance, isUnknownMemberId } = require('../errors')
+const {
+  isKafkaJSError,
+  isFencedInstance,
+  isUnknownMemberId,
+  isFatalMembership,
+} = require('../errors')
 
 const {
   events: { FETCH, FETCH_START, START_BATCH_PROCESS, END_BATCH_PROCESS },
@@ -33,6 +38,8 @@ module.exports = class Runner extends EventEmitter {
    * @param {(reason: Error) => void} options.onCrash
    * @param {import("../../types").RetryOptions} [options.retry]
    * @param {boolean} [options.autoCommit=true]
+   * @param {0|1} [options.maxPrefetchBatches=0] how many fetch responses may be in flight ahead of
+   *   the workers. `0` disables the prefetch entirely and reaches no new code path.
    */
   constructor({
     logger,
@@ -47,6 +54,7 @@ module.exports = class Runner extends EventEmitter {
     onCrash,
     retry,
     autoCommit = true,
+    maxPrefetchBatches = 0,
   }) {
     super()
     this.logger = logger.namespace('Runner')
@@ -59,12 +67,19 @@ module.exports = class Runner extends EventEmitter {
     this.retrier = createRetry(Object.assign({}, retry))
     this.onCrash = onCrash
     this.autoCommit = autoCommit
+    this.maxPrefetchBatches = maxPrefetchBatches
     this.fetchManager = createFetchManager({
       logger: this.logger,
       getNodeIds: () => this.consumerGroup.getNodeIds(),
-      fetch: (nodeId) => this.fetch(nodeId),
+      // Two parameters, not one: the fetch layer's prefetch passes an ephemeral per-request
+      // override, and a one-parameter lambda would drop it here without any signal.
+      fetch: (nodeId, options) => this.fetch(nodeId, options),
       handler: (batch) => this.handleBatch(batch),
       concurrency,
+      maxPrefetchBatches,
+      // Injected rather than derived inside the fetch layer: eligibility is a question about the
+      // offset manager, which no fetcher can reach.
+      isFullyResolved: (batch) => this.isFullyResolved(batch),
     })
 
     this.running = false
@@ -123,6 +138,8 @@ module.exports = class Runner extends EventEmitter {
       this.logger.debug('Background heartbeat failed without a rebalance verdict', {
         groupId: this.consumerGroup.groupId,
         memberId: this.consumerGroup.memberId,
+        path: REBALANCE_PATHS.HEARTBEAT,
+        membershipProtocol: this.consumerGroup.kind || 'classic',
         error: error.message || error,
         type: error.type,
         name: error.name,
@@ -322,6 +339,14 @@ module.exports = class Runner extends EventEmitter {
     }
 
     const lost = verdict.kind === 'lost'
+
+    if (lost) {
+      // The heartbeat response handler is the only thing that moves the membership state machine
+      // on its own; a fencing learned on the commit or the fetch path has to be told. Idempotent,
+      // because the same fencing can arrive on two paths at once. A no-op under classic.
+      this.consumerGroup.onMembershipError(verdict.error)
+    }
+
     const stopsTheWorld =
       lost || (verdict.kind === 'revoked' && this.consumerGroup.rebalanceProtocol() !== COOPERATIVE)
 
@@ -367,7 +392,13 @@ module.exports = class Runner extends EventEmitter {
 
     const classified = this.rebalanceCoordinator.classify(input, REBALANCE_PATHS.FETCH)
 
-    return classified || { kind: null, reason: rebalanceReason(input), error: input }
+    return (
+      classified || {
+        kind: null,
+        reason: rebalanceReason(input, { kind: this.consumerGroup.kind }),
+        error: input,
+      }
+    )
   }
 
   /**
@@ -388,7 +419,10 @@ module.exports = class Runner extends EventEmitter {
 
       this.consumerGroup.discardUncommittedOffsets()
 
-      if (isFencedInstance(e)) {
+      // A fatal membership error must never rejoin: an unsupported assignor, an invalid regex, a
+      // duplicate instance id or a group at capacity would loop straight back into itself. Gated on
+      // the consumer protocol, because a classic member's handling of the same codes is unchanged.
+      if (isFencedInstance(e) || (this.consumerGroup.kind === 'consumer' && isFatalMembership(e))) {
         this.rebalanceCoordinator.abandon('lost')
         throw e
       }
@@ -422,12 +456,14 @@ module.exports = class Runner extends EventEmitter {
   /**
    * Stop the runner: halt fetching, wait for in-flight processing, then leave the group.
    *
-   * A static member (`groupInstanceId` set) keeps its group slot across a normal shutdown
-   * instead (KIP-345 default: Java gates this the same way via
+   * Under the classic protocol a static member (`groupInstanceId` set) keeps its group slot
+   * across a normal shutdown instead (KIP-345 default: Java gates this the same way via
    * `AbstractCoordinator.shouldSendLeaveGroupRequest = LEAVE_GROUP || isDynamicMember()`), so
    * no LeaveGroup is sent for it. There is no override for this today (KIP-1092 adds an
    * explicit one in a later phase) — lower `sessionTimeout`, or drop `groupInstanceId`, to bound
-   * or remove the delay before the group reassigns a static member's partitions.
+   * or remove the delay before the group reassigns a static member's partitions. Under the
+   * consumer protocol a static member always leaves, with the static leave epoch (-2), so the
+   * coordinator can hand its partitions to a returning instance without waiting.
    *
    * @returns {Promise<void>}
    */
@@ -443,6 +479,10 @@ module.exports = class Runner extends EventEmitter {
 
     this.stopRequested = true
     this.running = false
+    // Before the manager is stopped, deliberately: a join waiting on its first heartbeat response
+    // is only retried by the chain this next line cancels, so the rejection has to be in flight
+    // first or `idle()` below never resolves.
+    this.consumerGroup.onStopRequested()
     this.heartbeatManager.stop()
     this.pollTimer.stop()
     this.rebalanceCoordinator.clearVerdict()
@@ -461,12 +501,24 @@ module.exports = class Runner extends EventEmitter {
 
       this.consumerGroup.clearAssignerState()
 
-      if (this.consumerGroup.groupInstanceId) {
+      // KIP-345's "a static member sends no LeaveGroup" is a CLASSIC rule. A KIP-848 member always
+      // tells the coordinator it is gone; the protocol picks epoch -1 or -2 from `groupInstanceId`.
+      // @see https://cwiki.apache.org/confluence/display/KAFKA/KIP-848%3A+The+Next+Generation+of+the+Consumer+Rebalance+Protocol
+      if (this.consumerGroup.kind === 'classic' && this.consumerGroup.groupInstanceId) {
         this.consumerGroup.memberId = null
       } else {
         await this.consumerGroup.leave()
       }
-    } catch (e) {}
+    } catch (e) {
+      // The shutdown continues either way - the runner is already stopped by this point - but a
+      // LeaveGroup that never reached the coordinator costs the whole session timeout before the
+      // group reassigns, so it must not be swallowed silently.
+      this.logger.error('Error while stopping the consumer group', {
+        groupId: this.consumerGroup.groupId,
+        memberId: this.consumerGroup.memberId,
+        error: e.message || e,
+      })
+    }
   }
 
   waitForConsumer() {
@@ -495,7 +547,7 @@ module.exports = class Runner extends EventEmitter {
    */
   async heartbeat() {
     try {
-      await this.consumerGroup.heartbeat({ interval: this.heartbeatInterval })
+      await this.consumerGroup.heartbeat({ interval: this.consumerGroup.heartbeatInterval() })
     } catch (e) {
       const verdict = this.rebalanceCoordinator.classify(e, REBALANCE_PATHS.HEARTBEAT)
 
@@ -724,7 +776,16 @@ module.exports = class Runner extends EventEmitter {
     return this.consumerGroup.commitOffsets({ ...offsets, topics })
   }
 
-  async fetch(nodeId) {
+  /**
+   * One fetch round against one broker.
+   *
+   * @param {number} nodeId
+   * @param {{ offsetOverrides?: Map<string, string>|null, prefetch?: boolean }} [options] forwarded
+   *   verbatim to the consumer group. `undefined` for every ordinary fetch, which is what keeps the
+   *   request byte-identical to what it was.
+   * @returns {Promise<import('./batch')[]>}
+   */
+  async fetch(nodeId, options) {
     if (!this.running) {
       this.logger.debug('consumer not running, exiting', {
         groupId: this.consumerGroup.groupId,
@@ -738,7 +799,7 @@ module.exports = class Runner extends EventEmitter {
 
     this.instrumentationEmitter.emit(FETCH_START, { nodeId })
 
-    const batches = await this.consumerGroup.fetch(nodeId)
+    const batches = await this.consumerGroup.fetch(nodeId, options)
 
     this.instrumentationEmitter.emit(FETCH, {
       /**
@@ -795,6 +856,54 @@ module.exports = class Runner extends EventEmitter {
     return !this.consumerGroup.isAssigned(batch.topic, batch.partition)
   }
 
+  /**
+   * Whether the previous dispatch on this batch's partition resolved everything it handed over.
+   *
+   * The prefetch runs one Fetch ahead only for partitions whose last batch was fully consumed: a
+   * handler that resolved less than it was given leaves the next offset unknowable without a
+   * stored fetch position, and this phase deliberately stores none.
+   *
+   * `Batch#lastOffset()` answers a string, so the comparison goes through Long.
+   * @param {import('./batch')} batch
+   * @returns {boolean}
+   */
+  isFullyResolved(batch) {
+    const resolved = this.consumerGroup.resolvedOffsetAt(batch.topic, batch.partition)
+
+    return (
+      resolved !== undefined && resolved === Long.fromValue(batch.lastOffset()).add(1).toString()
+    )
+  }
+
+  /**
+   * Whether a PREFETCHED batch no longer matches the partition it was fetched for.
+   *
+   * Consulted only for batches a prefetching Fetch produced; ordinary batches keep 2.2.4 semantics
+   * whatever the knob is set to, and `isBatchStale` runs first for both.
+   *
+   * The offset comparison subsumes a seek, an offset reset, a handler that resolved part of the
+   * previous batch and a handler that threw: in every one of those the resolved offset is not
+   * where the prefetch assumed. `firstOffset()` is deliberately never consulted - it is null for a
+   * batch filtered down to nothing, which is exactly the batch the empty-due-to-filtering branch
+   * exists to resolve.
+   * @param {import('./batch')} batch
+   * @returns {boolean}
+   */
+  isPrefetchStale(batch) {
+    if (!batch.prefetched) {
+      return false
+    }
+
+    const { topic, partition } = batch
+
+    return (
+      batch.fetchedOffset !== this.consumerGroup.resolvedOffsetAt(topic, partition) ||
+      this.consumerGroup.isPaused(topic, partition) ||
+      this.consumerGroup.hasSeekOffset({ topic, partition }) ||
+      this.consumerGroup.pendingTopicResets.has(topic)
+    )
+  }
+
   async handleBatch(batch) {
     if (!this.running) {
       this.logger.debug('consumer not running, exiting', {
@@ -818,6 +927,17 @@ module.exports = class Runner extends EventEmitter {
         partition: batch.partition,
         batchAssignmentEpoch: batch.assignmentEpoch,
         assignmentEpoch: this.consumerGroup.assignmentEpoch,
+      })
+
+      return
+    }
+
+    if (this.isPrefetchStale(batch)) {
+      this.logger.debug('Dropping a prefetched batch whose partition has moved on', {
+        groupId: this.consumerGroup.groupId,
+        topic: batch.topic,
+        partition: batch.partition,
+        fetchedOffset: batch.fetchedOffset,
       })
 
       return
@@ -971,7 +1091,7 @@ module.exports = class Runner extends EventEmitter {
 
   autoCommitOffsets() {
     if (this.autoCommit) {
-      return this.consumerGroup.commitOffsets()
+      return this.consumerGroup.commitOffsets({}, { auto: true })
     }
   }
 

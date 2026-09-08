@@ -214,6 +214,9 @@ describe('Runner > crash handling from the fetch-loop path', () => {
     // `stop()` clears the assigner state before LeaveGroup, inside the same try: a missing stub
     // would swallow the very leave() the assertions below depend on.
     clearAssignerState: jest.fn(),
+    // `stop()` tells the membership before it cancels the heartbeat chain; the real ConsumerGroup
+    // always answers this.
+    onStopRequested: jest.fn(),
     leave: jest.fn(async () => {}),
     getNodeIds: () => [],
     ...overrides,
