@@ -5,12 +5,14 @@ const {
   isRevoked,
   isFencedInstance,
   isUnknownMemberId,
+  isFatalMembership,
+  CONSUMER_PROTOCOL_UNSUPPORTED,
   KafkaJSError,
   KafkaJSNonRetriableError,
   KafkaJSNumberOfRetriesExceeded,
   KafkaJSProtocolError,
 } = require('./errors')
-const { createErrorFromCode } = require('./protocol/error')
+const { createErrorFromCode, errorCodes } = require('./protocol/error')
 
 describe('isRebalancing', () => {
   it.each(['REBALANCE_IN_PROGRESS', 'NOT_COORDINATOR_FOR_GROUP', 'ILLEGAL_GENERATION'])(
@@ -149,4 +151,46 @@ describe('error wrapping preserves the protocol type', () => {
     expect(wrapped.type).toEqual('FENCED_INSTANCE_ID')
     expect(wrapped.code).toEqual(82)
   })
+})
+
+describe('membership predicates', () => {
+  it('treats a fenced member epoch as a lost membership', () => {
+    expect(isLostMember(createErrorFromCode(110))).toBe(true)
+    // 110 is only ever raised for a group the coordinator runs under the consumer protocol, so
+    // widening the predicate cannot change what a classic member does.
+    expect(isLostMember(createErrorFromCode(22))).toBe(true)
+    expect(isLostMember(createErrorFromCode(25))).toBe(true)
+    expect(isLostMember(createErrorFromCode(82))).toBe(true)
+    expect(isLostMember(createErrorFromCode(113))).toBe(false)
+  })
+
+  it('names the membership errors a member must never rejoin after', () => {
+    for (const code of [81, 111, 112, 128]) {
+      expect(isFatalMembership(createErrorFromCode(code))).toBe(true)
+    }
+
+    for (const code of [14, 15, 16, 22, 25, 27, 30, 35, 42, 82, 110, 113]) {
+      expect(isFatalMembership(createErrorFromCode(code))).toBe(false)
+    }
+
+    expect(isFatalMembership({ type: CONSUMER_PROTOCOL_UNSUPPORTED })).toBe(true)
+    expect(isFatalMembership({})).toBe(false)
+  })
+})
+
+describe('the shipped error table, for the codes the membership depends on', () => {
+  it('keeps a stale member epoch non-retriable', () => {
+    // Flipping this would feed every generic retrier a request that re-sends the same stale
+    // epoch, and would auto-restart the consumer through the crash handler's retriable check.
+    expect(errorCodes.find(({ code }) => code === 113).retriable).toBe(false)
+  })
+
+  test.each([[81], [82], [110], [111], [112], [113], [128], [29], [30], [42], [69]])(
+    'code %i is present and non-retriable',
+    (code) => {
+      const entry = errorCodes.find((row) => row.code === code)
+      expect(entry).toBeDefined()
+      expect(entry.retriable).toBe(false)
+    }
+  )
 })

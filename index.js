@@ -18,6 +18,8 @@ const {
   isFencedInstance,
   isUnknownMemberId,
   isPollIntervalExceeded,
+  isFatalMembership,
+  CONSUMER_PROTOCOL_UNSUPPORTED,
   ...errors
 } = require('./src/errors')
 const { LEVELS } = require('./src/loggers')

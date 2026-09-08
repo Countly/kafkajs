@@ -175,4 +175,221 @@ describe('Consumer > rebalance error contract', () => {
       expect(Object.keys(publicApi)).not.toContain('isPollIntervalExceeded')
     })
   })
+
+  describe('the membership protocol changes three rows and one reason', () => {
+    const CONSUMER = { kind: 'consumer' }
+
+    const ROWS = [
+      [
+        14,
+        { action: 'revoked', fatal: false, clearsMemberId: false },
+        { action: null, fatal: false, clearsMemberId: false },
+      ],
+      [
+        15,
+        { action: 'retry-coordinator', fatal: false, clearsMemberId: false },
+        { action: 'retry-coordinator', fatal: false, clearsMemberId: false },
+      ],
+      [
+        16,
+        { action: 'revoked', fatal: false, clearsMemberId: false },
+        { action: 'retry-coordinator', fatal: false, clearsMemberId: false },
+      ],
+      [
+        25,
+        { action: 'lost', fatal: false, clearsMemberId: true },
+        { action: 'lost', fatal: false, clearsMemberId: false },
+      ],
+      [
+        110,
+        { action: 'lost', fatal: false, clearsMemberId: false },
+        { action: 'lost', fatal: false, clearsMemberId: false },
+      ],
+      [
+        82,
+        { action: 'lost', fatal: true, clearsMemberId: false },
+        { action: 'lost', fatal: true, clearsMemberId: false },
+      ],
+      [
+        81,
+        { action: null, fatal: false, clearsMemberId: false },
+        { action: 'lost', fatal: true, clearsMemberId: false },
+      ],
+      [
+        111,
+        { action: null, fatal: false, clearsMemberId: false },
+        { action: 'lost', fatal: true, clearsMemberId: false },
+      ],
+      [
+        112,
+        { action: null, fatal: false, clearsMemberId: false },
+        { action: 'lost', fatal: true, clearsMemberId: false },
+      ],
+      [
+        128,
+        { action: null, fatal: false, clearsMemberId: false },
+        { action: 'lost', fatal: true, clearsMemberId: false },
+      ],
+      [
+        42,
+        { action: null, fatal: false, clearsMemberId: false },
+        { action: 'lost', fatal: true, clearsMemberId: false },
+      ],
+      [
+        30,
+        { action: null, fatal: false, clearsMemberId: false },
+        { action: 'lost', fatal: true, clearsMemberId: false },
+      ],
+      [
+        113,
+        { action: null, fatal: false, clearsMemberId: false },
+        { action: null, fatal: false, clearsMemberId: false },
+      ],
+    ]
+
+    test.each(ROWS)(
+      'code %i classifies as %p classically and %p under the consumer protocol',
+      (code, classic, consumer) => {
+        for (const path of PATHS) {
+          expect(rebalanceAction(createErrorFromCode(code), path)).toEqual(classic)
+          expect(rebalanceAction(createErrorFromCode(code), path, { kind: 'classic' })).toEqual(
+            classic
+          )
+          expect(rebalanceAction(createErrorFromCode(code), path, CONSUMER)).toEqual(consumer)
+        }
+      }
+    )
+
+    it('never asks the consumer protocol to clear a member id', () => {
+      // The member id is generated once per membership and survives every fencing, so no row may
+      // answer `true` here - 25, which does clear it classically, included.
+      for (const [code] of ROWS) {
+        for (const path of PATHS) {
+          expect(rebalanceAction(createErrorFromCode(code), path, CONSUMER).clearsMemberId).toBe(
+            false
+          )
+        }
+      }
+    })
+
+    const REASONS = [
+      [25, 'lost', 'fenced'],
+      [110, 'lost', 'fenced'],
+      [82, 'lost', 'lost'],
+      [22, 'lost', 'lost'],
+      [112, null, 'lost'],
+      [27, 'rebalance-in-progress', 'rebalance-in-progress'],
+      [16, 'coordinator-changed', 'coordinator-changed'],
+    ]
+
+    test.each(REASONS)(
+      'code %i reads %p classically and %p under the consumer protocol',
+      (code, classic, consumer) => {
+        expect(rebalanceReason(createErrorFromCode(code))).toEqual(classic)
+        expect(rebalanceReason(createErrorFromCode(code), { kind: 'classic' })).toEqual(classic)
+        expect(rebalanceReason(createErrorFromCode(code), { kind: 'consumer' })).toEqual(consumer)
+      }
+    )
+
+    it('never derives assignment-changed from an error; the caller supplies it', () => {
+      const { errorCodes } = require('../../protocol/error')
+
+      for (const { code } of errorCodes) {
+        expect(rebalanceReason(createErrorFromCode(code), { kind: 'consumer' })).not.toEqual(
+          'assignment-changed'
+        )
+      }
+    })
+
+    it('keeps the reason map total under the consumer protocol', () => {
+      for (const { code } of require('../../protocol/error').errorCodes) {
+        const error = createErrorFromCode(code)
+        const { action } = rebalanceAction(error, REBALANCE_PATHS.HEARTBEAT, { kind: 'consumer' })
+
+        if (action === 'lost' || action === 'revoked') {
+          expect(rebalanceReason(error, { kind: 'consumer' })).not.toBeNull()
+        }
+      }
+    })
+  })
+
+  describe('the consumer-protocol fatal set', () => {
+    const { isConsumerProtocolFatal } = require('../rebalanceErrorContract')
+    const { isFatalMembership } = require('../../errors')
+
+    test.each([[81], [111], [112], [128], [82], [42], [30]])(
+      'code %i is fatal to the membership',
+      (code) => {
+        expect(isConsumerProtocolFatal(createErrorFromCode(code))).toBe(true)
+      }
+    )
+
+    test.each([[14], [15], [16], [25], [110], [113], [27], [22]])('code %i is not', (code) => {
+      expect(isConsumerProtocolFatal(createErrorFromCode(code))).toBe(false)
+    })
+
+    it('keeps 30 and 42 out of the exported predicate, so the classic path is untouched', () => {
+      expect(isFatalMembership(createErrorFromCode(30))).toBe(false)
+      expect(isFatalMembership(createErrorFromCode(42))).toBe(false)
+      expect(isFatalMembership(createErrorFromCode(35))).toBe(false)
+    })
+  })
+
+  describe('the internal errors the membership and the join paths carry', () => {
+    const {
+      assignmentChangedError,
+      consumerStoppingError,
+      joinDeadlineError,
+      unsupportedConsumerProtocolError,
+    } = require('../rebalanceErrorContract')
+    const { isFatalMembership } = require('../../errors')
+
+    it('are shaped so the verdict path does what each one needs', () => {
+      expect(assignmentChangedError()).toMatchObject({
+        type: 'ASSIGNMENT_CHANGED',
+        retriable: false,
+      })
+      expect(consumerStoppingError()).toMatchObject({ type: 'CONSUMER_STOPPING', retriable: false })
+      expect(joinDeadlineError({ rebalanceTimeoutMs: 1000 })).toMatchObject({
+        type: 'JOIN_DEADLINE_EXCEEDED',
+        retriable: true,
+      })
+      expect(joinDeadlineError({ rebalanceTimeoutMs: 1000 }).message).toContain('1000')
+    })
+
+    it('classify as nothing, so none of them can raise a rebalance on its own', () => {
+      for (const error of [
+        assignmentChangedError(),
+        consumerStoppingError(),
+        joinDeadlineError({ rebalanceTimeoutMs: 1 }),
+      ]) {
+        expect(
+          rebalanceAction(error, REBALANCE_PATHS.HEARTBEAT, { kind: 'consumer' }).action
+        ).toBeNull()
+        expect(rebalanceReason(error, { kind: 'consumer' })).toBeNull()
+      }
+    })
+
+    it('makes the unsupported-protocol error fatal, and says what to set instead', () => {
+      const error = unsupportedConsumerProtocolError(createErrorFromCode(35))
+
+      expect(error.message).toEqual(
+        "The cluster does not support the new CONSUMER group protocol. Set groupProtocol: 'classic' on the consumer until the cluster is upgraded."
+      )
+      expect(isFatalMembership(error)).toBe(true)
+      expect(error.retriable).toBe(false)
+      expect(rebalanceAction(error, REBALANCE_PATHS.HEARTBEAT, { kind: 'consumer' })).toEqual({
+        action: 'lost',
+        fatal: true,
+        clearsMemberId: false,
+      })
+    })
+
+    it('is not a public export, and neither is the new predicate', () => {
+      const publicApi = require('../../../index')
+
+      expect(Object.keys(publicApi)).not.toContain('isFatalMembership')
+      expect(Object.keys(publicApi)).not.toContain('CONSUMER_PROTOCOL_UNSUPPORTED')
+    })
+  })
 })

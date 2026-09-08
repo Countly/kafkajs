@@ -308,23 +308,57 @@ const isRebalancing = (e) =>
 const ILLEGAL_GENERATION_CODE = 22
 const UNKNOWN_MEMBER_ID_CODE = 25
 const FENCED_INSTANCE_ID_CODE = 82
+const FENCED_MEMBER_EPOCH_CODE = 110
 
 /**
- * The member is no longer part of the group: its generation, member id or static instance id
- * has been invalidated by the coordinator. Uncommitted offsets belong to a generation the
- * coordinator has already discarded, so committing them fails forever (upstream #1712, #1466,
+ * The member is no longer part of the group: its generation, member id, static instance id or
+ * member epoch has been invalidated by the coordinator. Uncommitted offsets belong to a generation
+ * the coordinator has already discarded, so committing them fails forever (upstream #1712, #1466,
  * #1527, #1009). Discard the uncommitted offsets and rejoin instead.
+ *
+ * 110 is raised only for a group the coordinator runs under the consumer protocol, so recognising
+ * it here cannot change what a classic member does with any answer it can actually receive.
  */
 const isLostMember = (e) =>
   e.code === ILLEGAL_GENERATION_CODE ||
   e.code === UNKNOWN_MEMBER_ID_CODE ||
-  e.code === FENCED_INSTANCE_ID_CODE
+  e.code === FENCED_INSTANCE_ID_CODE ||
+  e.code === FENCED_MEMBER_EPOCH_CODE
 
 /** True for a member fenced out of the group by a duplicate static instance id (code 82). */
 const isFencedInstance = (e) => e.code === FENCED_INSTANCE_ID_CODE
 
 /** True for a member the coordinator no longer recognizes by member id (code 25). */
 const isUnknownMemberId = (e) => e.code === UNKNOWN_MEMBER_ID_CODE
+
+/**
+ * The internal type of the error raised when the cluster cannot speak the new group protocol -
+ * either it answered UNSUPPORTED_VERSION or it offers no version of the heartbeat API at all.
+ * Exported so the predicate below and whatever builds the error agree on one string.
+ */
+const CONSUMER_PROTOCOL_UNSUPPORTED = 'CONSUMER_PROTOCOL_UNSUPPORTED'
+
+const FATAL_MEMBERSHIP_CODES = new Set([
+  81, // GROUP_MAX_SIZE_REACHED
+  111, // UNRELEASED_INSTANCE_ID
+  112, // UNSUPPORTED_ASSIGNOR
+  128, // INVALID_REGULAR_EXPRESSION
+])
+
+/**
+ * The membership can never be recovered by rejoining: the group is full, the instance id belongs to
+ * someone else, the assignor or the pattern is one the cluster will not accept, or the cluster does
+ * not speak the protocol at all. Restarting into any of them repeats the same failure forever, so
+ * this overrides `restartOnFailure`.
+ *
+ * UNSUPPORTED_VERSION is deliberately matched by the internal type rather than by code 35: every
+ * API can raise 35, and only the membership's own error means "this cluster cannot do this at all".
+ * @see https://github.com/apache/kafka/blob/4.3/clients/src/main/java/org/apache/kafka/clients/consumer/internals/AbstractHeartbeatRequestManager.java
+ * @param {Error} e
+ * @returns {boolean}
+ */
+const isFatalMembership = (e) =>
+  FATAL_MEMBERSHIP_CODES.has(e.code) || e.type === CONSUMER_PROTOCOL_UNSUPPORTED
 
 /**
  * The member is still valid: every rebalance-class error isRebalancing() matches (partitions
@@ -384,5 +418,7 @@ module.exports = {
   isFencedInstance,
   isUnknownMemberId,
   isPollIntervalExceeded,
+  isFatalMembership,
+  CONSUMER_PROTOCOL_UNSUPPORTED,
   isKafkaJSError,
 }

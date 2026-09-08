@@ -1,11 +1,14 @@
 const {
   KafkaJSError,
+  KafkaJSNonRetriableError,
   isLostMember,
   isRevoked,
   isFencedInstance,
   isUnknownMemberId,
   isStaleCoordinator,
   isPollIntervalExceeded,
+  isFatalMembership,
+  CONSUMER_PROTOCOL_UNSUPPORTED,
 } = require('../errors')
 
 /**
@@ -22,31 +25,83 @@ const REBALANCE_PATHS = {
 
 const PATH_VALUES = new Set(Object.values(REBALANCE_PATHS))
 
+const COORDINATOR_LOAD_IN_PROGRESS = 14
+const GROUP_AUTHORIZATION_FAILED = 30
+const INVALID_REQUEST = 42
+const UNKNOWN_MEMBER_ID = 25
+const FENCED_MEMBER_EPOCH = 110
+
+/** The message the Java client gives when the cluster cannot speak the new group protocol. */
+const CONSUMER_PROTOCOL_UNSUPPORTED_MESSAGE =
+  "The cluster does not support the new CONSUMER group protocol. Set groupProtocol: 'classic' on the consumer until the cluster is upgraded."
+
+/**
+ * Every error that ends a consumer-protocol membership for good.
+ *
+ * Wider than the exported `isFatalMembership` by two codes, on purpose: a fenced instance id, a
+ * group authorization failure and a malformed request are all fatal to a member of a consumer-type
+ * group, but the exported predicate is also honoured on the classic path - where adding them would
+ * change behaviour no decision asked to change.
+ * @param {Error} error
+ * @returns {boolean}
+ */
+const isConsumerProtocolFatal = (error) =>
+  isFatalMembership(error) ||
+  isFencedInstance(error) ||
+  error.code === GROUP_AUTHORIZATION_FAILED ||
+  error.code === INVALID_REQUEST
+
 /**
  * Classifies one rebalance-class error.
  *
- * Every code decision is delegated to the predicates in `src/errors.js`, which stay the single
- * source of truth: this module holds no code list of its own, so a predicate that grows a code
- * grows this contract with it.
+ * The consumer-protocol rows are the coordinator's own handling of the same codes: a loading
+ * coordinator is retried by the heartbeat itself rather than being treated as a rebalance, a moved
+ * coordinator is re-found, and the group-level failures are not rejoined into.
  *
- * `clearsMemberId` distinguishes the two lost codes: `UNKNOWN_MEMBER_ID` (25) means the
- * coordinator does not recognise the id, so it must be dropped, while `ILLEGAL_GENERATION` (22)
- * invalidates only the generation - keeping the id avoids an extra MEMBER_ID_REQUIRED round trip.
- *
+ * @see https://cwiki.apache.org/confluence/display/KAFKA/KIP-848%3A+The+Next+Generation+of+the+Consumer+Rebalance+Protocol
+ * @see https://github.com/apache/kafka/blob/4.3/clients/src/main/java/org/apache/kafka/clients/consumer/internals/AbstractHeartbeatRequestManager.java
  * @param {Error} error
  * @param {string} path one of `REBALANCE_PATHS`
+ * @param {{ kind?: 'classic' | 'consumer' }} [membership] which membership protocol raised it. The
+ *   default keeps every classic caller's answer identical; three codes classify differently under
+ *   the consumer protocol, where a coordinator move is not a rebalance and the group's fatal errors
+ *   must not be rejoined into
  * @returns {{ action: 'lost'|'revoked'|'retry-coordinator'|null, fatal: boolean,
- *   clearsMemberId: boolean }} `action` is null for an error that is not a rebalance;
- *   `fatal` marks a fenced static member, which must not rejoin into the same fencing loop
+ *   clearsMemberId: boolean }}
  * @throws {Error} when `path` is not one of the four known paths
  */
-const rebalanceAction = (error, path) => {
+const rebalanceAction = (error, path, { kind = 'classic' } = {}) => {
   if (!PATH_VALUES.has(path)) {
     throw new Error(`Unknown rebalance path "${path}"`)
   }
 
   if (isPollIntervalExceeded(error)) {
     return { action: 'lost', fatal: false, clearsMemberId: true }
+  }
+
+  if (kind === 'consumer') {
+    // A loading coordinator is retried by the membership itself and is not a rebalance at all;
+    // a coordinator that moved is simply re-found. Both are matched by `isRebalancing` below,
+    // which is why they have to be answered first.
+    if (error.code === COORDINATOR_LOAD_IN_PROGRESS) {
+      return { action: null, fatal: false, clearsMemberId: false }
+    }
+
+    if (isStaleCoordinator(error)) {
+      return { action: 'retry-coordinator', fatal: false, clearsMemberId: false }
+    }
+
+    if (isConsumerProtocolFatal(error)) {
+      return { action: 'lost', fatal: true, clearsMemberId: false }
+    }
+
+    if (isLostMember(error)) {
+      // Never clears the member id, 25 included: this protocol generates its id once per membership
+      // and keeps it across fencings, so a caller acting on `clearsMemberId` would be told to do
+      // something the membership refuses to do anyway. Saying `false` here is what makes the
+      // contract's answer and the membership's behaviour the same statement.
+      return { action: 'lost', fatal: isFencedInstance(error), clearsMemberId: false }
+    }
   }
 
   if (isLostMember(error)) {
@@ -69,20 +124,33 @@ const rebalanceAction = (error, path) => {
 }
 
 /**
- * The `reason` a rebalance triggered by this error reports, total for every rebalance-class
- * error so an emit can never be skipped for want of a reason.
+ * The reason string a rebalance round reports for one error.
  *
- * The order matters. `isLostMember` is code-only, so a bare `{ type: 'ILLEGAL_GENERATION' }`
- * falls through to the coordinator-changed branch, which is what the shipped runner already did
- * with it.
+ * The consumer-protocol rows follow the coordinator's own vocabulary: an unknown member id and a
+ * stale member epoch both mean the coordinator has stopped recognising this member, which it calls
+ * fencing rather than loss.
  *
+ * @see https://cwiki.apache.org/confluence/display/KAFKA/KIP-848%3A+The+Next+Generation+of+the+Consumer+Rebalance+Protocol
+ * @see https://github.com/apache/kafka/blob/4.3/clients/src/main/java/org/apache/kafka/clients/consumer/internals/AbstractHeartbeatRequestManager.java
  * @param {Error} error
- * @returns {'lost'|'poll-interval-exceeded'|'rebalance-in-progress'|'coordinator-changed'|null}
- *   null for an error that is not a rebalance at all
+ * @param {{ kind?: 'classic' | 'consumer' }} [membership]
+ * @returns {'lost'|'fenced'|'poll-interval-exceeded'|'rebalance-in-progress'|'coordinator-changed'|null}
+ *   null for an error that is not a rebalance at all. `assignment-changed` is never returned: it is
+ *   supplied by whoever raises the verdict, because no error describes it
  */
-const rebalanceReason = (error) => {
+const rebalanceReason = (error, { kind = 'classic' } = {}) => {
   if (isPollIntervalExceeded(error)) {
     return 'poll-interval-exceeded'
+  }
+
+  if (kind === 'consumer') {
+    if (error.code === UNKNOWN_MEMBER_ID || error.code === FENCED_MEMBER_EPOCH) {
+      return 'fenced'
+    }
+
+    if (isConsumerProtocolFatal(error)) {
+      return 'lost'
+    }
   }
 
   if (isLostMember(error)) {
@@ -119,6 +187,64 @@ const pollIntervalExceededError = ({ elapsedMs, maxPollInterval }) => {
 }
 
 /**
+ * The verdict a new target assignment raises. Never surfaces to a user: the verdict paths are all
+ * error-shaped, and this one carries no failure at all.
+ * @returns {KafkaJSError}
+ */
+const assignmentChangedError = () => {
+  const error = new KafkaJSError('The group coordinator assigned a different set of partitions', {
+    retriable: false,
+  })
+  error.type = 'ASSIGNMENT_CHANGED'
+  return error
+}
+
+/**
+ * Fails whatever the membership is waiting on because the consumer is stopping. The round loop
+ * returns rather than rethrowing when it sees this while a stop is in progress, so a normal
+ * shutdown reports no crash.
+ * @returns {KafkaJSError}
+ */
+const consumerStoppingError = () => {
+  const error = new KafkaJSError('The consumer is stopping', { retriable: false })
+  error.type = 'CONSUMER_STOPPING'
+  return error
+}
+
+/**
+ * The deadline a join is allowed to take. Retriable on purpose: a coordinator that is still loading
+ * answers an error the membership swallows, so without a deadline the round would never settle and
+ * a stop would never complete - and the right response to it is another attempt, not a crash.
+ * @param {{ rebalanceTimeoutMs: number }} details
+ * @returns {KafkaJSError}
+ */
+const joinDeadlineError = ({ rebalanceTimeoutMs }) => {
+  const error = new KafkaJSError(`Timed out joining the group after ${rebalanceTimeoutMs} ms`, {
+    retriable: true,
+  })
+  error.type = 'JOIN_DEADLINE_EXCEEDED'
+  return error
+}
+
+/**
+ * The cluster cannot speak the new group protocol: it answered UNSUPPORTED_VERSION to a heartbeat,
+ * or it advertises no version of the heartbeat API at all.
+ * @see https://cwiki.apache.org/confluence/display/KAFKA/KIP-848%3A+The+Next+Generation+of+the+Consumer+Rebalance+Protocol
+ * @param {Error} [cause] the answer that proved it, when there was one
+ * @returns {KafkaJSNonRetriableError}
+ */
+const unsupportedConsumerProtocolError = (cause) => {
+  const error = new KafkaJSNonRetriableError(CONSUMER_PROTOCOL_UNSUPPORTED_MESSAGE)
+  error.type = CONSUMER_PROTOCOL_UNSUPPORTED
+
+  if (cause && cause.code != null) {
+    error.code = cause.code
+  }
+
+  return error
+}
+
+/**
  * The generation a group request was sent under, remembered on the error its answer produced.
  *
  * Symbol-keyed, so it never reaches a user's logger or a JSON dump of the error - it exists only
@@ -150,7 +276,12 @@ module.exports = {
   REBALANCE_PATHS,
   rebalanceAction,
   rebalanceReason,
+  isConsumerProtocolFatal,
   pollIntervalExceededError,
+  assignmentChangedError,
+  consumerStoppingError,
+  joinDeadlineError,
+  unsupportedConsumerProtocolError,
   stampGeneration,
   sentGeneration,
 }
