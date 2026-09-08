@@ -957,6 +957,31 @@ module.exports = class Broker {
   }
 
   /**
+   * Describes consumer-protocol (KIP-848) groups. The classic `describeGroups` cannot: below
+   * DescribeGroups v6 a broker reports such a group as `Dead`.
+   *
+   * Group-level error codes are RETURNED, not thrown: `GROUP_ID_NOT_FOUND` here means "this is
+   * not a consumer-protocol group" and is the caller's signal to ask `describeGroups` for that
+   * id instead.
+   *
+   * @public
+   * @param {object} request
+   * @param {string[]} request.groupIds
+   * @param {boolean} [request.includeAuthorizedOperations=false]
+   * @returns {Promise<object>} the decoded response, one entry per requested group
+   * @see https://github.com/apache/kafka/blob/4.3/clients/src/main/java/org/apache/kafka/clients/admin/internals/DescribeConsumerGroupsHandler.java
+   */
+  async consumerGroupDescribe({ groupIds, includeAuthorizedOperations = false }) {
+    const consumerGroupDescribe = this.lookupRequest(
+      apiKeys.ConsumerGroupDescribe,
+      requests.ConsumerGroupDescribe
+    )
+    return await this[PRIVATE.SEND_REQUEST](
+      consumerGroupDescribe({ groupIds, includeAuthorizedOperations })
+    )
+  }
+
+  /**
    * @public
    * @param {object} request
    * @param {Array} request.topics e.g:

@@ -75,9 +75,7 @@ const requests = {
   AlterPartitionReassignments: require('./alterPartitionReassignments'),
   ListPartitionReassignments: require('./listPartitionReassignments'),
   ConsumerGroupHeartbeat: require('./consumerGroupHeartbeat'),
-  // The codec lands with the admin routing that needs it; the key is declared now so both
-  // entries move together and `lookup()` reports "not implemented" rather than "unknown key".
-  ConsumerGroupDescribe: noImplementedRequestDefinitions,
+  ConsumerGroupDescribe: require('./consumerGroupDescribe'),
 }
 
 const names = Object.keys(apiKeys)

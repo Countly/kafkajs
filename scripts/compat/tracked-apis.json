@@ -255,9 +255,9 @@
     {
       "kafkaName": "ConsumerGroupDescribe",
       "apiKey": 69,
-      "forkName": null,
+      "forkName": "consumerGroupDescribe",
       "apiKeysName": "ConsumerGroupDescribe",
-      "planned": "phase-6"
+      "planned": "done"
     },
     {
       "kafkaName": "GetTelemetrySubscriptions",

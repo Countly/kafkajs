@@ -868,9 +868,9 @@
     {
       "kafkaName": "ConsumerGroupDescribe",
       "apiKey": 69,
-      "forkName": null,
+      "forkName": "consumerGroupDescribe",
       "apiKeysName": "ConsumerGroupDescribe",
-      "planned": "phase-6",
+      "planned": "done",
       "validVersions": [
         0,
         1
@@ -878,8 +878,11 @@
       "flexibleFrom": 0,
       "deprecatedVersions": null,
       "latestVersionUnstable": false,
-      "forkVersions": null,
-      "gap": "stub",
+      "forkVersions": [
+        0,
+        1
+      ],
+      "gap": "current",
       "onFloor": false,
       "belowFloor": [],
       "notes": "Admin-side counterpart of KIP-848; needed so group descriptions stop reporting consumer-protocol groups as Dead."
