@@ -27,6 +27,8 @@ module.exports = class ClassicGroupProtocol {
    * @param {string} options.groupId
    * @param {string|null} options.groupInstanceId static membership id (KIP-345)
    * @param {number} options.sessionTimeout
+   * @param {number|null} [options.heartbeatInterval] how long between heartbeats, in
+   *   milliseconds; null leaves the cadence to whoever schedules the heartbeats
    * @param {number} options.rebalanceTimeout the value sent on the wire as RebalanceTimeoutMs
    * @param {import('../../../types').Assigner[]} options.assigners
    * @param {import('./interface').RebalanceProtocol} [options.mode]
@@ -40,6 +42,7 @@ module.exports = class ClassicGroupProtocol {
     groupInstanceId = null,
     sessionTimeout,
     rebalanceTimeout,
+    heartbeatInterval = null,
     assigners,
     mode = EAGER,
     rackId = '',
@@ -51,6 +54,7 @@ module.exports = class ClassicGroupProtocol {
     this.groupInstanceId = groupInstanceId
     this.sessionTimeout = sessionTimeout
     this.rebalanceTimeout = rebalanceTimeout
+    this.heartbeatIntervalMs = heartbeatInterval
     this.assigners = assigners
     this.mode = mode
     // The empty string is the shipped default and means "no rack", which on the wire is null.
@@ -117,6 +121,39 @@ module.exports = class ClassicGroupProtocol {
   /** @returns {import('./interface').RebalanceProtocol} */
   rebalanceProtocol() {
     return this.mode
+  }
+
+  /** @returns {'classic'} */
+  get kind() {
+    return 'classic'
+  }
+
+  /**
+   * How long until the next heartbeat should go out: the configured interval, always. The heartbeat
+   * manager reads this rather than its own constructor value so both membership implementations
+   * answer the same question, and this one's answer is the one it always was.
+   *
+   * Null until a caller configures it, which is not a gap: the manager falls back to the interval
+   * it was built with for a membership that does not answer a usable number, so an unconfigured
+   * protocol keeps exactly the cadence it had rather than substituting a default of its own.
+   * @returns {number|null}
+   */
+  heartbeatInterval() {
+    return this.heartbeatIntervalMs
+  }
+
+  /** No-op: a lost membership is handled by the round, not by a state machine. @returns {void} */
+  onMembershipError() {}
+
+  /** No-op: nothing is awaited across a stop. @returns {void} */
+  onStopRequested() {}
+
+  /** No-op: a poll overrun leaves through the ordinary leave path. @returns {Promise<void>} */
+  async leaveForPollExpiry() {}
+
+  /** @returns {false} the assignment is decided at join time, so nothing is ever outstanding */
+  needsReconciliation() {
+    return false
   }
 
   /** @returns {boolean} */

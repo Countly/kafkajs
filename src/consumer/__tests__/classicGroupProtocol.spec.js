@@ -113,6 +113,24 @@ const recordFrames = async () => {
 }
 
 /**
+ * A bare classic protocol, with only the constructor fields it actually reads.
+ * @param {Object} [overrides] merged last, so a case can set `heartbeatInterval`
+ * @returns {ClassicGroupProtocol}
+ */
+const buildProtocol = (overrides = {}) =>
+  new ClassicGroupProtocol({
+    cluster: {},
+    groupId: 'seam-group',
+    groupInstanceId: null,
+    sessionTimeout: SESSION_TIMEOUT,
+    rebalanceTimeout: REBALANCE_TIMEOUT,
+    assigners: [],
+    instrumentationEmitter: new InstrumentationEventEmitter(),
+    logger: newLogger(),
+    ...overrides,
+  })
+
+/**
  * A `ConsumerGroup` with a stub cluster, used to exercise the membership accessors and the
  * join/sync retry contract without a broker.
  * @param {number} retries
@@ -292,5 +310,27 @@ describe('Consumer > classic group protocol > joinAndSync contract', () => {
 
     expect(group.applyRebalanceResult).not.toHaveBeenCalled()
     expect(groupJoin).not.toHaveBeenCalled()
+  })
+})
+
+describe('Consumer > groupProtocol > ClassicGroupProtocol > the seam members the two protocols share', () => {
+  it('identifies itself as the classic protocol', () => {
+    expect(buildProtocol().kind).toEqual('classic')
+  })
+
+  it('reports the configured heartbeat interval, and nothing at all when it has none', () => {
+    expect(buildProtocol({ heartbeatInterval: 5000 }).heartbeatInterval()).toEqual(5000)
+    // Not a default of its own: an unconfigured protocol leaves the cadence to whoever schedules
+    // the heartbeats, which is the interval that consumer was already built with.
+    expect(buildProtocol().heartbeatInterval()).toBeNull()
+  })
+
+  it('answers the new seam members without doing anything', async () => {
+    const protocol = buildProtocol()
+
+    expect(protocol.needsReconciliation()).toBe(false)
+    expect(protocol.onMembershipError(new Error('boom'))).toBeUndefined()
+    expect(protocol.onStopRequested()).toBeUndefined()
+    await expect(protocol.leaveForPollExpiry()).resolves.toBeUndefined()
   })
 })

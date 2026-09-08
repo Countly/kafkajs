@@ -24,16 +24,33 @@ const COOPERATIVE = 'cooperative'
  * @property {TopicPartitions[]} revoked    previously owned minus assignment
  *
  * @typedef {Object} GroupProtocol
+ * @property {'classic' | 'consumer'} kind which membership implementation this is; read by the
+ *   round loop, the poll-expiry path and the error contract, none of which can reach the protocol
+ *   except through `ConsumerGroup`
+ * @property {number} memberEpoch the current member epoch, or null for a protocol that has none
  * @property {() => Promise<void>} connect resolves the group coordinator
  * @property {(context: { topics: string[], topicsSubscribed: string[],
- *   beforeSync: () => void }) => Promise<Object>} rebalance
- *   ONE JoinGroup + SyncGroup exchange, returning the raw decoded sync result. Plain, not
- *   self-guarded and not a loop: the single flight, the round loop and the instrumentation
- *   events belong to the caller.
- * @property {(deps: { rebalanceCoordinator: Object, heartbeatManager: Object }) => void} attach
+ *   beforeSync: () => void, growSubscription?: (names: string[]) => Promise<void> }) => Promise<Object>} rebalance
+ *   ONE exchange with the coordinator - a JoinGroup + SyncGroup for the classic protocol, one
+ *   reconciliation step for the consumer protocol - returning the result the caller applies.
+ *   Plain, not self-guarded and not a loop: the single flight, the round loop and the
+ *   instrumentation events belong to the caller. `growSubscription` is supplied only by a caller
+ *   whose subscription the coordinator may widen.
+ * @property {(deps: { rebalanceCoordinator: Object, heartbeatManager: Object,
+ *   commitBeforeRelease?: Function }) => void} attach
  *   Late-bound collaborators, forwarded by `ConsumerGroup#attach`.
  * @property {(options: { interval: number }) => Promise<void>} heartbeat
+ * @property {() => number} heartbeatInterval how long until the next heartbeat should go out; the
+ *   heartbeat manager reads this and nothing else when it schedules
+ * @property {() => boolean} needsReconciliation whether the coordinator wants something this member
+ *   does not have yet; always false for a protocol whose assignment is decided at join time
+ * @property {(error: Error) => void} onMembershipError performs the state move a lost-membership
+ *   error implies, wherever it was learned - the heartbeat, an offset commit or a fetch
+ * @property {() => void} onStopRequested fails whatever the protocol is waiting on, because the
+ *   consumer is stopping
  * @property {() => Promise<void>} leave
+ * @property {() => Promise<void>} leaveForPollExpiry the poll-overrun variant of `leave`: no
+ *   commit, no partition events, the response ignored
  * @property {() => RebalanceProtocol} rebalanceProtocol
  * @property {(options?: { clearMemberId?: boolean }) => void} resetGeneration
  * @property {() => TopicPartitions[]} owned
