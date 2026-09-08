@@ -12,13 +12,20 @@ const { Metadata: apiKey } = require('../../apiKeys')
  * IncludeTopicAuthorizedOperations => BOOLEAN (8+)
  * TAG_BUFFER
  *
- * This client always asks by topic name, so TopicId is written as the all-zero "no uuid"
- * sentinel and Name is never null. An empty topic list is encoded as the null array, which the
- * broker reads as "every topic" — the behaviour of every earlier version of this codec.
+ * A topic is requested by NAME - TopicId written as the all-zero "no uuid" sentinel, Name set -
+ * or by ID, which writes the uuid and a null Name. Asking by id is how a topic that arrived in a
+ * broker-computed assignment as a uuid gets resolved to a name. An empty topic list is encoded as
+ * the null array, which the broker reads as "every topic" - the behaviour of every earlier
+ * version of this codec.
+ *
+ * A request whose topics are ALL identified by id writes AllowAutoTopicCreation as false: such a
+ * request names no topic, and a broker only auto-creates topics requested by name, so the flag
+ * has nothing it could act on.
  * @see clients/src/main/resources/common/message/MetadataRequest.json
  *
  * @param {object} options
- * @param {string[]} options.topics
+ * @param {Array<string|{topicId: string}>} options.topics each entry is a topic name or an
+ *   object carrying a `topicId`; no other value is accepted
  * @param {boolean} [options.allowAutoTopicCreation=true]
  * @param {boolean} [options.includeTopicAuthorizedOperations=false]
  */
@@ -33,14 +40,37 @@ module.exports = ({
   encode: async () => {
     return new Encoder()
       .writeUVarIntArray(topics.length === 0 ? null : topics.map(encodeTopic))
-      .writeBoolean(allowAutoTopicCreation)
+      .writeBoolean(allowAutoTopicCreation && !isTopicIdOnly(topics))
       .writeBoolean(includeTopicAuthorizedOperations)
       .writeTaggedFields()
   },
 })
 
+/**
+ * One requested topic, by name or by id.
+ *
+ * Asking by name writes the all-zero "no uuid" sentinel and the name, which is what every caller
+ * before the consumer protocol did and what the committed golden vectors pin. Asking by id writes
+ * the uuid and a NULL name - the form Name became nullable at v10 - and the only way to
+ * resolve an id that arrived in a broker-computed assignment.
+ *
+ * @param {string|{topicId: string}} topic a topic name, or a topic id
+ * @returns {Encoder}
+ */
 const encodeTopic = (topic) =>
-  new Encoder().writeUuid(null).writeUVarIntString(topic).writeTaggedFields()
+  typeof topic === 'string'
+    ? new Encoder().writeUuid(null).writeUVarIntString(topic).writeTaggedFields()
+    : new Encoder().writeUuid(topic.topicId).writeUVarIntString(null).writeTaggedFields()
+
+/**
+ * @param {Array<string|{topicId: string}>} topics
+ * @returns {boolean} whether every requested topic is identified by id alone. Such a request
+ *   names no topic, and a broker auto-creates only topics requested by name, so the
+ *   auto-creation flag has nothing to act on and is written as false rather than carried through
+ *   as a value that cannot apply.
+ */
+const isTopicIdOnly = (topics) =>
+  topics.length > 0 && topics.every((topic) => typeof topic !== 'string')
 
 module.exports.schema = {
   api: 'Metadata',

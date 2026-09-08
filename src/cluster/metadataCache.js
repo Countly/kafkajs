@@ -88,10 +88,7 @@ module.exports = class MetadataCache {
    * @returns {void}
    */
   update(metadata, { full = false } = {}) {
-    const liveBrokerIds = new Set()
-    for (const { nodeId } of metadata.brokers) {
-      liveBrokerIds.add(nodeId)
-    }
+    const liveBrokerIds = this.liveBrokerIds(metadata)
 
     this.generation += 1
     let recreations = null
@@ -136,13 +133,7 @@ module.exports = class MetadataCache {
 
         // Step 2 - never defend a leader the cluster no longer advertises.
         // Step 3 - compare only when both sides know their epoch.
-        const defends =
-          liveBrokerIds.has(cached.leader) &&
-          cached.leaderEpoch > UNKNOWN_EPOCH &&
-          partition.leaderEpoch > UNKNOWN_EPOCH &&
-          partition.leaderEpoch < cached.leaderEpoch
-
-        if (defends) {
+        if (this.isStale(cached, partition, liveBrokerIds)) {
           this.logger.debug('Ignoring stale metadata for partition, keeping the cached leader', {
             topic: name,
             partition: partition.partitionId,
@@ -201,6 +192,115 @@ module.exports = class MetadataCache {
         entry.decodedReleased = true
       }
     }
+  }
+
+  /**
+   * Records the topics a **scoped, non-routing** Metadata response names, and nothing else.
+   *
+   * `update()` is for the response that becomes `brokerPool.metadata`: it bumps the generation,
+   * re-seats every `decoded` write-through reference, and releases the references of every topic
+   * the response did not carry. A response fetched only to resolve topic ids is routed nowhere, so
+   * putting it through `update()` would release the write-through of every *other* cached topic -
+   * and an accepted leader hint would then stop reaching `findLeaderForPartitions` until the next
+   * full refresh.
+   *
+   * This entry point therefore touches only the topics the response names: their id (recreation
+   * detection included) and their partitions' leader/leaderEpoch, under the same monotonic rule
+   * `update()` applies. It never seats a `decoded` reference - the response's partition objects
+   * are not the ones the routing path reads - and never releases, prunes or re-stamps another
+   * entry. A pair it accepts *is* written through to an existing `decoded`, exactly as
+   * `applyLeaderHint` does, so the cached view and the routing view cannot diverge.
+   *
+   * @param {{ brokers: Array<{ nodeId: number }>, topicMetadata: Array<{ topic: string, topicId?: string|null, partitionMetadata: Array<{ partitionId: number, leader: number, leaderEpoch: number }> }> }} metadata decoded response; not mutated
+   * @returns {void}
+   */
+  updateTopicsById(metadata) {
+    const liveBrokerIds = this.liveBrokerIds(metadata)
+    let recreations = null
+
+    for (const topicMetadata of metadata.topicMetadata) {
+      const name = topicMetadata.topic
+      let entry = this.topics.get(name)
+      const recreation = this.diffTopicId(name, entry, topicMetadata.topicId)
+
+      if (!entry || recreation) {
+        entry = { topicId: null, seenAt: 0, decodedReleased: false, partitions: new Map() }
+        this.topics.set(name, entry)
+      }
+
+      if (recreation) {
+        recreations = recreations || []
+        recreations.push(recreation)
+      }
+
+      entry.topicId = this.usableTopicId(topicMetadata.topicId) ?? entry.topicId
+
+      for (const partition of topicMetadata.partitionMetadata) {
+        const cached = entry.partitions.get(partition.partitionId)
+
+        if (!cached) {
+          entry.partitions.set(partition.partitionId, {
+            leader: partition.leader,
+            leaderEpoch: partition.leaderEpoch,
+            decoded: null,
+          })
+          continue
+        }
+
+        if (this.isStale(cached, partition, liveBrokerIds)) {
+          continue
+        }
+
+        cached.leader = partition.leader
+        cached.leaderEpoch = partition.leaderEpoch
+
+        if (cached.decoded) {
+          cached.decoded.leader = partition.leader
+          cached.decoded.leaderEpoch = partition.leaderEpoch
+        }
+      }
+
+      if (entry.topicId != null) {
+        this.topicIds.set(entry.topicId, name)
+      }
+    }
+
+    for (const recreation of recreations || []) {
+      this.emit(CLUSTER_TOPIC_RECREATED, recreation)
+    }
+  }
+
+  /**
+   * @private
+   * @param {{ brokers: Array<{ nodeId: number }> }} metadata
+   * @returns {Set<number>} the node ids the response advertises
+   */
+  liveBrokerIds(metadata) {
+    const ids = new Set()
+    for (const { nodeId } of metadata.brokers) {
+      ids.add(nodeId)
+    }
+    return ids
+  }
+
+  /**
+   * Whether a response's partition is provably behind what the cache already accepted: the cached
+   * leader is still advertised, both sides know their epoch, and the response's is older. Shared
+   * by `update()` and `updateTopicsById()` so the monotonic rule cannot drift between them.
+   *
+   * @private
+   * @param {{ leader: number, leaderEpoch: number }} cached
+   * @param {{ leader: number, leaderEpoch: number }} partition
+   * @param {Set<number>} liveBrokerIds
+   * @returns {boolean}
+   */
+  isStale(cached, partition, liveBrokerIds) {
+    return (
+      liveBrokerIds.has(cached.leader) &&
+      cached.leaderEpoch > UNKNOWN_EPOCH &&
+      partition.leaderEpoch > UNKNOWN_EPOCH &&
+      partition.leaderEpoch < cached.leaderEpoch
+    )
   }
 
   /**

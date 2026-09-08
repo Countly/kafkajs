@@ -21,8 +21,9 @@ const { parse } = require('../v0/response')
  *   TAG_BUFFER
  * TAG_BUFFER
  *
- * TopicId follows Name here, but precedes it in the request struct. This client never requests
- * by topic id, so a null Name here (decoded as `topic: null`) is not expected to occur.
+ * TopicId follows Name here, but precedes it in the request struct. A null Name (decoded as
+ * `topic: null`) arrives when the broker reports a topic-level error for a topic the client asked
+ * for by id; `parse` throws on that error code before any caller reads the name.
  * @see clients/src/main/resources/common/message/MetadataResponse.json
  */
 

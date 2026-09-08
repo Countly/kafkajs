@@ -14,6 +14,8 @@ const {
   KafkaJSGroupCoordinatorNotFound,
 } = require('../errors')
 const COORDINATOR_TYPES = require('../protocol/coordinatorTypes')
+const apiKeys = require('../protocol/requests/apiKeys')
+const { requests } = require('../protocol/requests')
 const { staleLeaderEpoch } = require('../protocol/error')
 
 const { keys } = Object
@@ -22,6 +24,31 @@ const mergeTopics = (obj, { topic, partitions }) => ({
   ...obj,
   [topic]: [...(obj[topic] || []), ...partitions],
 })
+
+/**
+ * Metadata error codes that describe ONE topic rather than the request: the response carries them
+ * per topic, and the client's `parse` throws on the first one it meets, taking the whole batch
+ * with it.
+ * @see clients/src/main/java/org/apache/kafka/common/protocol/Errors.java
+ */
+const PER_TOPIC_METADATA_ERRORS = [
+  'UNKNOWN_TOPIC_ID',
+  'TOPIC_AUTHORIZATION_FAILED',
+  'UNKNOWN_TOPIC_OR_PARTITION',
+]
+
+/**
+ * @param {Error} e
+ * @returns {boolean} whether the failure is about one topic in the request, not the request
+ */
+const isPerTopicError = (e) => PER_TOPIC_METADATA_ERRORS.includes(e.type)
+
+/** A broker was asked by id and its answer reached the metadata cache. */
+const RESOLVED = 'resolved'
+/** The negotiated Metadata version cannot carry a topic id, so the ids need another route. */
+const TOO_OLD = 'too-old'
+/** The broker was asked, but nothing usable came back. */
+const FAILED = 'failed'
 
 const PRIVATE = {
   CONNECT: Symbol('private:Cluster:connect'),
@@ -203,6 +230,146 @@ module.exports = class Cluster {
   }
 
   /**
+   * Fetches metadata for topics identified only by their id, so their names can be resolved.
+   *
+   * An assignment computed by the group coordinator names topics by uuid, and nothing in this
+   * client can fetch from a topic it cannot name. Metadata v10 is the first version whose request
+   * carries a topic id (`TopicId` is `10+`, and `Name` becomes nullable there), so on an older
+   * negotiated version this falls back to a full refresh by name and leaves the ids to the
+   * caller's own retry.
+   *
+   * Deliberately NOT routed through `BrokerPool#refreshMetadata`: that method replaces
+   * `brokerPool.metadata` with its response, and `findTopicPartitionMetadata` reads that object
+   * for every topic - so a two-id refresh would make the client believe the cluster has two
+   * topics. The response feeds `MetadataCache#updateTopicsById`, the entry point for a response that
+   * routes nowhere, which records the named topics without disturbing the write-through of any
+   * other one; the names it resolves are registered as target topics by the caller, and that
+   * registration triggers an ordinary complete refresh.
+   *
+   * Not wrapped in `sharedPromiseTo` either, unlike every other refresh here: those all ask the
+   * same question, this one takes an argument, and de-duplicating two different id sets would
+   * silently drop one.
+   *
+   * Best effort by design: it never throws, whatever happened. It is called from the heartbeat
+   * path, where a throw would take the membership down over a metadata hiccup the next tick
+   * retries anyway. Two consequences of "best effort" worth stating: a *response* failure is not
+   * retried against a second broker (the callback returns rather than throws, so `withBroker`'s
+   * fan-out never runs), and `unresolved` says only that the cache still cannot name the id - not
+   * whether the cluster refused it or the client never managed to ask.
+   *
+   * @see https://kafka.apache.org/43/design/protocol
+   * @see clients/src/main/resources/common/message/MetadataRequest.json
+   * @public
+   * @param {string[]} topicIds canonical uuid strings
+   * @returns {Promise<{ resolved: string[], unresolved: string[] }>} the requested ids, split by
+   *   whether the cache can name them now. Duplicates and nulls are dropped from both lists.
+   */
+  async refreshMetadataForTopicIds(topicIds) {
+    const ids = [...new Set(topicIds)].filter((topicId) => topicId != null)
+
+    if (ids.length === 0) {
+      return { resolved: [], unresolved: [] }
+    }
+
+    let outcome = null
+
+    try {
+      outcome = await this.brokerPool.withBroker(async ({ broker }) => {
+        const version = broker.negotiatedVersion(apiKeys.Metadata, requests.Metadata)
+
+        if (version == null || version < 10) {
+          return TOO_OLD
+        }
+
+        return await this.fetchMetadataByTopicIds(broker, ids)
+      })
+
+      if (outcome === TOO_OLD) {
+        this.logger.debug('Cannot request metadata by topic id; refreshing by name instead', {
+          topicIds: ids,
+        })
+        await this.refreshMetadata()
+      }
+    } catch (e) {
+      // `withBroker` throws KafkaJSBrokerNotFound on an empty pool (before the first connect, and
+      // after a rebootstrap), and `refreshMetadata` can reject for any transport reason. Both are
+      // reachable from the heartbeat path.
+      this.logger.debug('Could not refresh metadata for topic ids', {
+        topicIds: ids,
+        error: e.message,
+      })
+    }
+
+    const resolution = {
+      resolved: ids.filter((topicId) => this.metadataCache.topicName(topicId) != null),
+      unresolved: ids.filter((topicId) => this.metadataCache.topicName(topicId) == null),
+    }
+
+    if (resolution.unresolved.length > 0) {
+      this.logger.debug('Some topic ids could not be resolved to a name', {
+        ...resolution,
+        outcome,
+      })
+    }
+
+    return resolution
+  }
+
+  /**
+   * One broker's answer to a by-id metadata request, with a per-id retry on a topic-level failure.
+   *
+   * `MetadataResponse`'s `parse` throws on the **first** topic carrying an error code, so a batch
+   * holding one id the cluster will never resolve - a deleted topic (`UNKNOWN_TOPIC_ID`), one the
+   * member may not describe (`TOPIC_AUTHORIZATION_FAILED`) - discards the ids that decoded
+   * perfectly alongside it. Left alone, that one id would block every other id in the set for as
+   * long as the membership holds it. So a topic-level failure is re-asked one id at a time: the
+   * healthy ids resolve, the bad ones fail on their own and are simply left unnamed. The extra
+   * round trips are paid only on that path.
+   *
+   * A transport failure is not retried per id - it says nothing about any particular id - and is
+   * logged and swallowed like everything else here.
+   *
+   * @private
+   * @param {import("../broker")} broker
+   * @param {string[]} ids
+   * @returns {Promise<'resolved'|'failed'>} whether the client managed to ask at all
+   */
+  async fetchMetadataByTopicIds(broker, ids) {
+    try {
+      this.metadataCache.updateTopicsById(
+        await broker.metadata(ids.map((topicId) => ({ topicId })))
+      )
+      return RESOLVED
+    } catch (e) {
+      if (ids.length === 1 || !isPerTopicError(e)) {
+        this.logger.debug('Metadata by topic id failed; leaving the ids unresolved', {
+          topicIds: ids,
+          error: e.message,
+        })
+        return FAILED
+      }
+
+      this.logger.debug('A topic id in the batch failed; asking for each one separately', {
+        topicIds: ids,
+        error: e.message,
+      })
+
+      for (const topicId of ids) {
+        try {
+          this.metadataCache.updateTopicsById(await broker.metadata([{ topicId }]))
+        } catch (topicError) {
+          this.logger.debug('Topic id could not be resolved to a name', {
+            topicId,
+            error: topicError.message,
+          })
+        }
+      }
+
+      return RESOLVED
+    }
+  }
+
+  /**
    * @public
    * @returns {Promise<import("../../types").BrokerMetadata>}
    */
@@ -362,6 +529,20 @@ module.exports = class Cluster {
    */
   topicId(topic) {
     return this.metadataCache.topicId(topic)
+  }
+
+  /**
+   * The name of a topic, as of the last Metadata response that mentioned it.
+   *
+   * Internal: the read half of the id-to-name seam, mirroring `topicId(topic)` above. A
+   * broker-computed assignment names topics by uuid, and this is how the consumer resolves one
+   * without reaching into the metadata cache itself.
+   *
+   * @param {string} topicId
+   * @returns {string|undefined} the topic's name, or undefined when the cache has not seen it
+   */
+  topicName(topicId) {
+    return this.metadataCache.topicName(topicId)
   }
 
   /**
@@ -655,7 +836,7 @@ module.exports = class Cluster {
     }
 
     // Create a list of requests to fetch the offset of all partitions
-    const requests = keys(partitionsPerBroker).map(async (nodeId) => {
+    const offsetRequests = keys(partitionsPerBroker).map(async (nodeId) => {
       const broker = await this.findBroker({ nodeId })
       const partitions = partitionsPerBroker[nodeId]
 
@@ -671,7 +852,7 @@ module.exports = class Cluster {
     })
 
     // Execute all requests, merge and normalize the responses
-    const responses = await Promise.all(requests).catch(async (e) => {
+    const responses = await Promise.all(offsetRequests).catch(async (e) => {
       if (staleLeaderEpoch(e)) {
         // UNKNOWN_LEADER_EPOCH means this client is *ahead* of the broker, so defending the
         // cached epoch makes every retry resend the same rejected value. FENCED_LEADER_EPOCH is
