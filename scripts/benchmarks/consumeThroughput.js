@@ -1,13 +1,16 @@
 /**
- * Consume-throughput probe: produces a fixed corpus, consumes it with eachBatch, and reports
- * messages/sec plus p50/p90/p99 per-batch handling latency.
+ * Consume-throughput probe: produces a fixed corpus, consumes it, and reports messages/sec plus
+ * p50/p90/p99 handling latency.
  * Usage: node scripts/benchmarks/consumeThroughput.js [--messages 200000] [--size 200]
- *          [--partitions 6] [--timeout <ms>]
- * Prints one JSON line: { messages, size, partitions, messagesPerSecond, p50, p90, p99 }
+ *          [--partitions 6] [--timeout <ms>] [--handler eachBatch|eachMessage]
+ * Prints one JSON line: { messages, size, partitions, handler, messagesPerSecond, p50, p90, p99 }
  *
  * The corpus is fixed on purpose: 200000 messages of 200 B across one topic of 6 partitions, no
- * compression, `eachBatch` with `eachBatchAutoResolve`, `autoCommit: false`, one discarded warm-up
- * run, and a fresh consumer group per run.
+ * compression, `autoCommit: false`, one discarded warm-up run, and a fresh consumer group per run.
+ *
+ * Two arms, selected by `--handler`. `eachBatch` (the default, so earlier numbers stay comparable)
+ * uses `eachBatchAutoResolve` and times each batch hand-off; `eachMessage` times each record and so
+ * exercises the per-record path, which the batch arm never touches.
  *
  * A run that never receives the whole corpus fails on the deadline instead of hanging, so a lost
  * partition or a wrong `--messages` costs one error line rather than a cluster slot.
@@ -19,6 +22,12 @@ const arg = (name, fallback) => {
   return i === -1 ? fallback : Number(process.argv[i + 1])
 }
 
+const stringArg = (name, fallback) => {
+  const i = process.argv.indexOf(`--${name}`)
+  return i === -1 ? fallback : process.argv[i + 1]
+}
+
+const HANDLER = stringArg('handler', 'eachBatch')
 const MESSAGES = arg('messages', 200000)
 const SIZE = arg('size', 200)
 const PARTITIONS = arg('partitions', 6)
@@ -27,6 +36,11 @@ const MS_PER_MESSAGE_BUDGET = 2
 const TIMEOUT_MS = arg('timeout', Math.max(60000, MESSAGES * MS_PER_MESSAGE_BUDGET))
 const GENERATED_TOPIC = `bench-consume-throughput-${Date.now()}`
 const TOPIC = process.env.BENCH_TOPIC || GENERATED_TOPIC
+
+if (HANDLER !== 'eachBatch' && HANDLER !== 'eachMessage') {
+  console.error(`--handler must be eachBatch or eachMessage, got ${HANDLER}`)
+  process.exit(1)
+}
 
 const percentile = (sorted, p) => sorted[Math.min(sorted.length - 1, Math.floor(sorted.length * p))]
 
@@ -90,11 +104,12 @@ const produceCorpus = async (kafka) => {
 }
 
 /**
- * Consumes the whole corpus once with a fresh group, timing every `eachBatch` call.
+ * Consumes the whole corpus once with a fresh group, timing every handler call: per batch under
+ * `--handler eachBatch`, per record under `--handler eachMessage`.
  * @param {import('../../index').Kafka} kafka the client to consume with
  * @param {number} run run number, used to keep each run on its own consumer group
  * @returns {Promise<{ messagesPerSecond: number, p50: number, p90: number, p99: number }>}
- *   throughput over the consume phase and per-batch handling latency in ms
+ *   throughput over the consume phase and handling latency in ms
  */
 const consumeOnce = async (kafka, run) => {
   const consumer = kafka.consumer({ groupId: `${TOPIC}-run-${run}` })
@@ -123,7 +138,7 @@ const consumeOnce = async (kafka, run) => {
     )
   })
 
-  await consumer.run({
+  const eachBatchArm = {
     eachBatchAutoResolve: true,
     autoCommit: false,
     eachBatch: async ({ batch }) => {
@@ -143,7 +158,28 @@ const consumeOnce = async (kafka, run) => {
         resolveWhenDrained()
       }
     },
-  })
+  }
+
+  const eachMessageArm = {
+    autoCommit: false,
+    eachMessage: async ({ message }) => {
+      const messageStartedAt = process.hrtime.bigint()
+      if (startedAt === undefined) {
+        startedAt = messageStartedAt
+      }
+
+      bytes += message.value.length
+      consumed += 1
+
+      latencies.push(Number(process.hrtime.bigint() - messageStartedAt) / 1e6)
+
+      if (consumed >= MESSAGES) {
+        resolveWhenDrained()
+      }
+    },
+  }
+
+  await consumer.run(HANDLER === 'eachMessage' ? eachMessageArm : eachBatchArm)
 
   try {
     await Promise.race([drained, deadline])
@@ -191,6 +227,7 @@ const consumeOnce = async (kafka, run) => {
         messages: MESSAGES,
         size: SIZE,
         partitions: PARTITIONS,
+        handler: HANDLER,
         ...measured,
       })
     )

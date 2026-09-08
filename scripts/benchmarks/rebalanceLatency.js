@@ -3,12 +3,13 @@
  * rebalance waits for its next batch on that partition.
  *
  * Usage: node scripts/benchmarks/rebalanceLatency.js [--partitions 6] [--runs 7]
- *          [--timeout <ms>] [--protocol eager]
+ *          [--timeout <ms>] [--protocol eager|cooperative]
  * Prints one JSON line:
  *   { protocol, partitions, members, runs, groupInitialRebalanceDelayMs, samplesMs, medianMs }
  *
- * `--protocol` is a LABEL ONLY in this task: every run uses the default eager assigner. Task 15
- * threads `partitionAssigners` through so the cooperative arm measures what it says.
+ * `--protocol` selects the assigner: `eager` leaves the client defaults in place, `cooperative`
+ * configures every member with `PartitionAssigners.cooperativeSticky`, so the two arms measure the
+ * same thing under the two rebalance protocols.
  *
  * Only a partition held BOTH before and after the round is measured. A partition that moves
  * measures reassignment, and a first-ever assignment measures group formation; neither is the
@@ -22,7 +23,7 @@
  * the caller's. A run that never sees a kept-partition batch fails on the deadline rather than
  * hanging.
  */
-const { Kafka, logLevel } = require('../../index')
+const { Kafka, logLevel, PartitionAssigners } = require('../../index')
 
 const arg = (name, fallback) => {
   const i = process.argv.indexOf(`--${name}`)
@@ -119,7 +120,9 @@ const startFeeding = (producer, topic) => {
  */
 const measureOnce = async (kafka, topic, run) => {
   const groupId = `bench-rebalance-latency-${Date.now()}-${run}`
-  const consumers = Array.from({ length: MEMBERS }, () => kafka.consumer({ groupId }))
+  const assigners =
+    PROTOCOL === 'cooperative' ? { partitionAssigners: [PartitionAssigners.cooperativeSticky] } : {}
+  const consumers = Array.from({ length: MEMBERS }, () => kafka.consumer({ groupId, ...assigners }))
   const [first, second] = consumers
 
   let heldBefore = new Set()
