@@ -510,12 +510,6 @@ change not listed here did not change observable behavior.
   noticed is bounded by the heartbeat interval the coordinator asked for rather than by a
   `heartbeatInterval` you configured. Expect the detection to lag the deadline by up to one
   server-driven heartbeat interval.
-- **`maxPrefetchBatches: 1` can hide at most one `maxPollInterval` per stuck handler.** A prefetch
-  round that comes back empty counts as a poll, and a prefetched batch that is dropped as stale
-  resets the poll deadline, so a handler that has stopped making progress can go one further
-  `maxPollInterval` before the poll guard fires. Stopping the consumer can also take up to one
-  extra Fetch round trip, because a prefetch already on the wire is awaited. None of this applies
-  at the default `maxPrefetchBatches: 0`, where the fetch loop is exactly what it was.
 - **A regex subscription's resolved topic set only grows.** Under `subscribe({ regex })` the names
   the pattern has resolved to are remembered for the life of the membership: a topic the pattern
   stops matching stays in the subscription until the consumer rebuilds its membership (a restart or
@@ -551,8 +545,10 @@ The rest of this section is additive — nothing here changes unless you opt in.
   that does not exist comes back as a `Dead` row carrying `errorCode: 69` instead of failing the
   call. Rows are not returned in the order the ids were passed. See
   [List groups](Admin.md#list-groups) and [Describe groups](Admin.md#describe-groups).
-- **`maxPrefetchBatches` is off by default.** `0` (the default) keeps the fetch loop unchanged; `1`
-  lets each fetcher keep one Fetch on the wire while the previous response is being handled. A
-  value of `2` or more is rejected at construction rather than clamped, because deeper prefetch
-  does not exist yet. See [Prefetching](Consuming.md#prefetching).
+- **`maxPrefetchBatches` is accepted but inert.** `0` (the default) and `1` behave identically:
+  the fetch loop is exactly what it was. The one-deep prefetch the option was to control measured
+  +2.45 % throughput against the ≥ +10 % the design required of it, and was withdrawn on that
+  number; the option is reserved so a later release can turn the prefetch on without a
+  configuration change. A value of `2` or more is rejected at construction rather than clamped.
+  See [Prefetching](Consuming.md#prefetching).
 

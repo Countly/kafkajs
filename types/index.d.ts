@@ -213,12 +213,11 @@ export interface ConsumerConfig {
    */
   groupRemoteAssignor?: string | null
   /**
-   * How many prefetched batches may be in flight ahead of your handlers. `0` (the default) disables
-   * prefetching entirely. `1` lets each fetcher keep one fetch on the wire while the previous
-   * response is being handled, which overlaps network time with handler time; it arms only for a
-   * dispatch whose every partition was fully resolved last time round, and a prefetched batch that
-   * no longer matches the resolved offset is dropped and re-read. The extra memory ceiling is one
-   * fetch response (`maxBytes`) per fetcher. Values other than `0` and `1` throw at construction.
+   * How many prefetched batches may be in flight ahead of your handlers. **Inert in this release**:
+   * `0` (the default) and `1` behave identically, and the fetch loop is exactly what it was. The
+   * one-deep prefetch the option was to control did not clear the throughput bar it was designed
+   * against and was withdrawn; the option is reserved so a later release can turn the prefetch on
+   * without a configuration change. Values other than `0` and `1` throw at construction.
    */
   maxPrefetchBatches?: 0 | 1
 }

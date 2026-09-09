@@ -859,9 +859,10 @@ module.exports = class Runner extends EventEmitter {
   /**
    * Whether the previous dispatch on this batch's partition resolved everything it handed over.
    *
-   * The prefetch runs one Fetch ahead only for partitions whose last batch was fully consumed: a
-   * handler that resolved less than it was given leaves the next offset unknowable without a
-   * stored fetch position, and this phase deliberately stores none.
+   * Reserved for a fetch layer that runs one Fetch ahead: it may do so only for partitions whose
+   * last batch was fully consumed, because a handler that resolved less than it was given leaves
+   * the next offset unknowable without a stored fetch position, and none is stored. No shipped
+   * fetcher runs ahead in this release, so the predicate is consulted but never changes a fetch.
    *
    * `Batch#lastOffset()` answers a string, so the comparison goes through Long.
    * @param {import('./batch')} batch

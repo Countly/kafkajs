@@ -296,6 +296,8 @@ Adopted upstream PRs are credited here by number as they land (Phase 2 onward).
 
 - The consumer group is built from a `groupProtocol` option: `'classic'` (the default, unchanged) or `'consumer'` (KIP-848). Under `'consumer'` it also accepts `groupRemoteAssignor` and a regex subscription, and forwards the membership's kind, epoch and heartbeat interval to the components that need them.
 
+- The consumer option `maxPrefetchBatches` is accepted with a value of `0` or `1` and is inert in this release: it changes nothing at either value. The one-deep fetch prefetch it was to control measured **+2.45 %** throughput against the **≥ +10 %** acceptance the design set for it, and was withdrawn on that number. The option stays accepted, and rejects anything but `0` or `1`, so a later release can turn the prefetch on without asking you to change your configuration.
+
 - Types and documentation for the consumer group protocols: `groupProtocol`, `groupRemoteAssignor` and `maxPrefetchBatches` on `ConsumerConfig`, the `{ regex }` subscribe form, `ListGroupsOptions`, the new `GroupOverview`/`GroupDescription`/`MemberDescription` fields (`errorCode` now declared as well as returned), `'Assigning'`, `'Reconciling'` and `'NotReady'` on `ConsumerGroupState`, and `membershipProtocol` on the group-join and rebalancing event payloads. `ConsumerGroupJoinEvent.leaderId` widens to `string | null`, which is source-compatible for readers, because a KIP-848 group has no leader. A new "Consumer group protocols" section in `docs/Consuming.md` covers both protocols, the configuration rejections, regex subscriptions, fencing semantics and the current limitations, and a "Prefetching" section covers `maxPrefetchBatches`.
 
 #### Tooling
