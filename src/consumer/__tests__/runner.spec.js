@@ -834,5 +834,51 @@ describe('Consumer > Runner', () => {
       consumerGroup.isPaused = jest.fn(() => true)
       expect(runner.isPrefetchStale(batch)).toBe(true)
     })
+
+    // The case above never lets either of the last two clauses decide: the offset clause or the
+    // pause clause is already true wherever they are exercised. Each is isolated here with the
+    // three others held false, so a deleted clause turns the case red.
+    it('drops a prefetched batch on a pending seek, with every other clause false', () => {
+      const runner = createTestRunner({ maxPrefetchBatches: 1 })
+      const batch = new Batch(topicName, '4', {
+        partition,
+        highWatermark: '10',
+        messages: [{ offset: '4', key: null, value: null }],
+      })
+      batch.prefetched = true
+
+      consumerGroup.resolvedOffsetAt = jest.fn(() => '4')
+      consumerGroup.isPaused = jest.fn(() => false)
+      consumerGroup.hasSeekOffset = jest.fn(() => false)
+      consumerGroup.pendingTopicResets = new Map()
+
+      expect(runner.isPrefetchStale(batch)).toBe(false)
+
+      consumerGroup.hasSeekOffset = jest.fn(() => true)
+
+      expect(runner.isPrefetchStale(batch)).toBe(true)
+      expect(consumerGroup.hasSeekOffset).toHaveBeenCalledWith({ topic: topicName, partition })
+    })
+
+    it('drops a prefetched batch on a pending topic reset, with every other clause false', () => {
+      const runner = createTestRunner({ maxPrefetchBatches: 1 })
+      const batch = new Batch(topicName, '4', {
+        partition,
+        highWatermark: '10',
+        messages: [{ offset: '4', key: null, value: null }],
+      })
+      batch.prefetched = true
+
+      consumerGroup.resolvedOffsetAt = jest.fn(() => '4')
+      consumerGroup.isPaused = jest.fn(() => false)
+      consumerGroup.hasSeekOffset = jest.fn(() => false)
+      consumerGroup.pendingTopicResets = new Map([['another-topic', 'earliest']])
+
+      expect(runner.isPrefetchStale(batch)).toBe(false)
+
+      consumerGroup.pendingTopicResets = new Map([[topicName, 'earliest']])
+
+      expect(runner.isPrefetchStale(batch)).toBe(true)
+    })
   })
 })
