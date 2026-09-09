@@ -110,10 +110,44 @@ describe('Admin > listGroups > filters and fields', () => {
     })
     const admin = createAdmin({ logger: newLogger(), retry, cluster: stubCluster(listGroups) })
 
-    await expect(admin.listGroups({ types: ['consumer'] })).rejects.toThrow(
-      'we need v5 or newer to request groups by type'
-    )
+    // SF-3: the retrier bails with the ORIGINAL instance rather than wrapping it, so the two
+    // fields that name the unsupported request survive.
+    const caught = await admin.listGroups({ types: ['consumer'] }).catch((e) => e)
+
+    expect(caught).toBeInstanceOf(KafkaJSServerDoesNotSupportApiKey)
+    expect(caught.message).toContain('we need v5 or newer to request groups by type')
+    expect(caught.apiKey).toEqual(16)
+    expect(caught.apiName).toEqual('ListGroups')
     expect(listGroups).toHaveBeenCalledTimes(1)
+  })
+
+  // SF-3: 2.2.4 let the raw KafkaJSProtocolError reach the caller. Every per-broker call now runs
+  // inside the retrier, so what a caller catches is the retrier's own class with the broker's
+  // error on `cause` - documented in the changelog's behaviour changes.
+  it('rejects with the retrier class, keeping type, code and cause', async () => {
+    const listGroups = jest.fn(async () => {
+      throw createErrorFromCode(GROUP_AUTHORIZATION_FAILED)
+    })
+    const admin = createAdmin({ logger: newLogger(), retry, cluster: stubCluster(listGroups) })
+
+    const caught = await admin.listGroups().catch((e) => e)
+
+    expect(caught.name).toEqual('KafkaJSNonRetriableError')
+    expect(caught.type).toEqual('GROUP_AUTHORIZATION_FAILED')
+    expect(caught.code).toEqual(GROUP_AUTHORIZATION_FAILED)
+    expect(caught.cause.name).toEqual('KafkaJSProtocolError')
+  })
+
+  it('rejects with KafkaJSNumberOfRetriesExceeded once the budget is spent', async () => {
+    const listGroups = jest.fn(async () => {
+      throw createErrorFromCode(COORDINATOR_LOAD_IN_PROGRESS)
+    })
+    const admin = createAdmin({ logger: newLogger(), retry, cluster: stubCluster(listGroups) })
+
+    const caught = await admin.listGroups().catch((e) => e)
+
+    expect(caught.name).toEqual('KafkaJSNumberOfRetriesExceeded')
+    expect(caught.cause.code).toEqual(COORDINATOR_LOAD_IN_PROGRESS)
   })
 
   it('asks a broker again when its coordinator is still loading', async () => {

@@ -202,6 +202,42 @@ describe('Consumer > HeartbeatManager > requestTick', () => {
     manager.stop()
   })
 
+  // The other half of the pair above: `Runner#stop()` latches the manager, and a reconciliation
+  // still settling afterwards must not bring the chain back.
+  it('arms nothing after shutdown(), however it is asked', async () => {
+    const { manager, heartbeat } = build()
+    manager.ensureStarted()
+    manager.shutdown()
+
+    expect(manager.stopped).toBe(true)
+    expect(jest.getTimerCount()).toEqual(0)
+
+    manager.requestTick()
+    manager.ensureStarted()
+    manager.requestTick()
+
+    expect(fields(manager)).toEqual({
+      armed: false,
+      chainId: 1,
+      inFlight: false,
+      disabled: false,
+      tickRequested: false,
+    })
+    expect(jest.getTimerCount()).toEqual(0)
+
+    await jest.advanceTimersByTimeAsync(5000)
+    expect(heartbeat).not.toHaveBeenCalled()
+    expect(jest.getTimerCount()).toEqual(0)
+  })
+
+  it('shuts down a manager that was never started, and stays shut', () => {
+    const { manager } = build()
+    manager.shutdown()
+    manager.requestTick()
+
+    expect(jest.getTimerCount()).toEqual(0)
+  })
+
   it('does nothing while disabled', () => {
     const { manager } = build()
     manager.disable()

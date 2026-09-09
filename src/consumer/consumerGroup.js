@@ -111,8 +111,9 @@ module.exports = class ConsumerGroup {
    * @param {{ fromBeginning: boolean }|null} [options.regexSubscription=null] the options the regex
    *                                subscription was made with, copied to a name-keyed
    *                                `topicConfigurations` entry for every name the regex resolves to.
-   * @param {0|1} [options.maxPrefetchBatches=0] how many fetch responses may be in flight ahead of
-   *                                the workers. Accepted here and used by the fetch layer.
+   * @param {0|1} [options.maxPrefetchBatches=0] reserved for a fetch layer that runs one Fetch
+   *                                ahead of the workers. Accepted and stored; inert in this
+   *                                release, and read by nothing.
    * @param {number} [options.heartbeatInterval=3000] the configured heartbeat cadence. Forwarded to
    *                                the classic membership, which owns the interval; under the
    *                                consumer protocol the coordinator owns it and this is ignored.
@@ -635,6 +636,15 @@ module.exports = class ConsumerGroup {
         pendingTopicResets: this.pendingTopicResets,
         membershipProtocol: this.kind,
         staleEpochTimeout: this.rebalanceTimeout,
+        // Live reads, not the snapshot above: the stale-epoch retry inside the manager needs the
+        // epoch the heartbeats install while it is sleeping, and it must abandon its deadline the
+        // moment the runner is asked to stop.
+        membership: () => ({
+          generationId: this.generationId,
+          memberId: this.memberId,
+          coordinator: this.coordinator,
+        }),
+        isStopping: () => this.isStopping(),
         logger: this.logger,
       })
       this.assignmentEpoch += 1
@@ -1019,16 +1029,10 @@ module.exports = class ConsumerGroup {
    * recovers or rethrows, and the round then yields no batches.
    *
    * @param {number} nodeId the broker to fetch from
-   * @param {object} [options]
-   * @param {Map<string, string>|null} [options.offsetOverrides=null] `topic|partition` -> the
-   *   offset to fetch from instead of the resolved one. Ephemeral: it belongs to this request and
-   *   nothing stores it.
-   * @param {boolean} [options.prefetch=false] stamps every batch this request produces, so the
-   *   dispatch can drop one whose partition has moved on.
    * @returns {Promise<Batch[]>} one batch per fetched partition; empty when nothing was owed,
    *   when the round was recovered from an error, or when every response entry was dropped
    */
-  async fetch(nodeId, { offsetOverrides = null, prefetch = false } = {}) {
+  async fetch(nodeId) {
     try {
       await this.cluster.refreshMetadataIfNecessary()
       this.checkForStaleAssignment()
@@ -1042,7 +1046,7 @@ module.exports = class ConsumerGroup {
       await this.seekOffsets(topicPartitions)
       await this.validatePositions(topicPartitions)
 
-      const requests = this.buildFetchRequests(topicPartitions, { offsetOverrides })
+      const requests = this.buildFetchRequests(topicPartitions)
 
       if (!requests.length) {
         await sleep(this.maxWaitTime)
@@ -1141,7 +1145,6 @@ module.exports = class ConsumerGroup {
 
       for (const batch of batches) {
         batch.assignmentEpoch = assignmentEpoch
-        batch.prefetched = prefetch
       }
 
       return batches
@@ -1165,14 +1168,11 @@ module.exports = class ConsumerGroup {
    *
    * @private
    * @param {import("../../types").TopicPartitions[]} topicPartitions the node-filtered assignment
-   * @param {object} [options]
-   * @param {Map<string, string>|null} [options.offsetOverrides=null] `topic|partition` -> the
-   *   offset to fetch from instead of the resolved one, for the partitions it names
    * @returns {{topic: string, partitions: {partition: number, fetchOffset: string,
    *   currentLeaderEpoch: number, maxBytes: number}[]}[]} one entry per topic with something to
    *   fetch; a topic whose partitions were all filtered out is absent
    */
-  buildFetchRequests(topicPartitions, { offsetOverrides = null } = {}) {
+  buildFetchRequests(topicPartitions) {
     const committedOffsets = this.offsetManager.committedOffsets()
     const activeTopicPartitions = this.getActiveTopicPartitions()
 
@@ -1188,9 +1188,7 @@ module.exports = class ConsumerGroup {
           )
           .map((partition) => ({
             partition,
-            fetchOffset:
-              (offsetOverrides && offsetOverrides.get(`${topic}|${partition}`)) ||
-              this.offsetManager.nextOffset(topic, partition).toString(),
+            fetchOffset: this.offsetManager.nextOffset(topic, partition).toString(),
             // The client's current view of this partition's leader epoch, so the broker can
             // reject a request built on metadata that has since moved. -1 when the cache has
             // not seen the partition, which is the field's own wire default and means

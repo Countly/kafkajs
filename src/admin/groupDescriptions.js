@@ -130,6 +130,7 @@ class GroupDescriptions {
    */
   async #describeBatch({ coordinator, ids }) {
     let target = coordinator
+    let batchIds = ids
     let coordinatorMoved = false
     let response
 
@@ -137,11 +138,23 @@ class GroupDescriptions {
       response = await createRetry(this.retry)(async () => {
         if (coordinatorMoved) {
           await this.cluster.refreshMetadata()
-          target = await this.cluster.findGroupCoordinator({ groupId: ids[0] })
+          // Regrouped, not re-pointed at the first id's new coordinator: a `__consumer_offsets`
+          // leader move can split ids that shared a coordinator across two brokers, and sending
+          // the whole batch to one of them would keep drawing NOT_COORDINATOR for the rest until
+          // the budget ran out. Each sub-batch retries on its own from here.
+          const regrouped = await this.#groupByCoordinator(batchIds)
+
+          if (regrouped.length > 1) {
+            const perBatch = await Promise.all(regrouped.map((batch) => this.#describeBatch(batch)))
+            return { split: perBatch.flat() }
+          }
+
+          target = regrouped[0].coordinator
+          batchIds = regrouped[0].ids
           coordinatorMoved = false
         }
 
-        const answer = await target.consumerGroupDescribe({ groupIds: ids })
+        const answer = await target.consumerGroupDescribe({ groupIds: batchIds })
         const unsettled = answer.groups.find(({ errorCode }) => RETRIES_BATCH.has(errorCode))
 
         if (unsettled) {
@@ -164,13 +177,18 @@ class GroupDescriptions {
       throw e
     }
 
+    // The batch split across coordinators: the sub-batches above already produced the routed rows.
+    if (response.split) {
+      return response.split
+    }
+
     const answered = new Set(response.groups.map(({ groupId }) => groupId))
 
     return [
       ...response.groups.map((row) => this.#routeRow(row)),
       // An id the coordinator left out of its answer is described through the older API instead,
       // with no error to carry forward, rather than being dropped from the result.
-      ...ids
+      ...batchIds
         .filter((groupId) => !answered.has(groupId))
         .map((groupId) => ({ groupId, needsFallback: true })),
     ]
@@ -250,17 +268,22 @@ class GroupDescriptions {
    * @returns {object}
    */
   #shapeConsumerGroup(row) {
+    // An errored row describes nothing: the coordinator answered a code instead of a group, so its
+    // type and protocol are unknown rather than 'consumer'. Reporting them as 'consumer' would make
+    // a dashboard call a classic group the caller merely lacks a Describe ACL for a KIP-848 group.
+    const described = row.errorCode === 0
+
     return {
       groupId: row.groupId,
       // ConsumerGroupDescribe carries no protocolType. It is produced here so that tooling written
       // against a classic description keeps working against a consumer group.
-      protocolType: 'consumer',
+      protocolType: described ? 'consumer' : '',
       // What kafka-consumer-groups.sh shows in the PROTOCOL column for such a group.
       protocol: row.assignorName || '',
       state: row.groupState,
       errorCode: row.errorCode,
       errorMessage: row.errorMessage == null ? null : row.errorMessage,
-      groupType: 'consumer',
+      groupType: described ? 'consumer' : '',
       groupEpoch: row.groupEpoch,
       assignmentEpoch: row.assignmentEpoch,
       assignorName: row.assignorName == null ? null : row.assignorName,

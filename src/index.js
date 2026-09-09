@@ -209,8 +209,8 @@ module.exports = class Client {
    *
    * `groupProtocol` selects the group membership protocol: `'classic'` (the default) or
    * `'consumer'` (KIP-848, broker-driven assignment). Under `'consumer'`, `groupRemoteAssignor`
-   * names the server-side assignor to ask for. `maxPrefetchBatches` (`0` or `1`, default `0`) is a
-   * local fetch-loop knob.
+   * names the server-side assignor to ask for. `maxPrefetchBatches` (`0` or `1`, default `0`) is
+   * accepted and inert in this release.
    * @public
    */
   consumer({

@@ -128,6 +128,32 @@ describe('Protocol > Requests > ConsumerGroupHeartbeat > v1', () => {
     ])
   })
 
+  // SF-18: `TopicPartitions.Partitions` is declared NON-nullable, and the encoder writes the
+  // 0x00 null sentinel for a null array - which Kafka's generated reader rejects outright with
+  // "non-nullable field Partitions was serialized as null", failing the whole heartbeat. The
+  // nested encoder is shared with v0, whose Java vector pins the non-empty form.
+  test('never writes the non-nullable Partitions as the null compact array', async () => {
+    const owned = require('../fixtures/java/consumerGroupHeartbeatRequest-v0-ownedPartitions.json')
+    const topicId = owned.fields.topicPartitions[0].topicId
+    const base = { ...vector('join').fields }
+
+    const { buffer: empty } = await RequestV1Protocol({
+      ...base,
+      topicPartitions: [{ topicId, partitions: [] }],
+    }).encode()
+    const { buffer: nulled } = await RequestV1Protocol({
+      ...base,
+      topicPartitions: [{ topicId, partitions: null }],
+    }).encode()
+
+    expect(nulled).toEqual(empty)
+    expect(decodeRequest(nulled).topicPartitions).toEqual([{ topicId, partitions: [] }])
+    // Two partitions are 0x03 (count + 1) in the Java vector; the empty array is 0x01, and the
+    // null sentinel this must never be is 0x00.
+    expect(Buffer.from(owned.hex, 'hex')).toContain(0x03)
+    expect(nulled).toContain(0x01)
+  })
+
   test('takes every send-if-changed default when the caller omits a field', async () => {
     const { buffer } = await RequestV1Protocol({
       groupId: 'g',

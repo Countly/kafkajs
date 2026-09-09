@@ -20,6 +20,12 @@
  * every schedule, so a protocol whose cadence the coordinator owns is followed rather than
  * approximated.
  *
+ * `stop()` and `shutdown()` are different verbs. `stop()` cancels the chain but leaves the manager
+ * usable, because the poll-interval guard stops it and the recovery round rejoins through
+ * `requestTick()`. `shutdown()` is terminal: the consumer is going away, and neither entry point
+ * may arm anything after it, or heartbeats and a non-unref'd timer would outlive
+ * `consumer.disconnect()`.
+ *
  * @see https://cwiki.apache.org/confluence/display/KAFKA/KIP-62%3A+Allow+consumer+to+send+heartbeats+from+a+background+thread
  */
 module.exports = class HeartbeatManager {
@@ -57,6 +63,12 @@ module.exports = class HeartbeatManager {
     this.disabled = false
     this.inFlight = false
     /**
+     * Latched by `shutdown()` only. Once set, neither `ensureStarted()` nor `requestTick()` arms
+     * anything again: the runner has left the group and any chain armed after that would keep
+     * heartbeating - and hold the event loop open - for a member that is gone.
+     */
+    this.stopped = false
+    /**
      * Identifies the armed chain. A tick captures it before its `await` and compares it after, so
      * a `stop()` + `ensureStarted()` landing inside an in-flight heartbeat cannot leave the
      * settling tick scheduling a second chain on top of the new one.
@@ -82,7 +94,7 @@ module.exports = class HeartbeatManager {
    * @returns {void}
    */
   ensureStarted() {
-    if (this.handle) {
+    if (this.handle || this.stopped) {
       return
     }
 
@@ -90,12 +102,25 @@ module.exports = class HeartbeatManager {
     this.schedule()
   }
 
-  /** Cancels the chain. @returns {void} */
+  /** Cancels the chain, leaving the manager armable again. @returns {void} */
   stop() {
     if (this.handle) {
       clearTimeout(this.handle)
       this.handle = null
     }
+  }
+
+  /**
+   * Cancels the chain for good.
+   *
+   * The terminal counterpart of `stop()`, called when the runner is shutting down or has crashed.
+   * A plain `stop()` cannot carry this meaning: the poll-interval guard stops the manager too, and
+   * the round that recovers from an overrun rejoins by arming a heartbeat on the stopped manager.
+   * @returns {void}
+   */
+  shutdown() {
+    this.stopped = true
+    this.stop()
   }
 
   /** Suspends evaluation without cancelling the chain. @returns {void} */
@@ -116,13 +141,14 @@ module.exports = class HeartbeatManager {
    * for the ack also delays the "on generated" state transition that follows it.
    *
    * Deliberately UNguarded on `handle`: the join runs before `ensureStarted()` does, so this is
-   * what arms the chain in the first place. The chain it arms is the same one `ensureStarted()`
+   * what arms the chain in the first place, and the poll-expiry recovery round rejoins the same
+   * way on a manager the guard has stopped. The chain it arms is the same one `ensureStarted()`
    * would have armed later, so nothing is doubled. A DISABLED manager is left alone, because
-   * `enable()` re-arms nothing.
+   * `enable()` re-arms nothing, and a SHUT DOWN one is left alone for good.
    * @returns {void}
    */
   requestTick() {
-    if (this.disabled) {
+    if (this.disabled || this.stopped) {
       return
     }
 

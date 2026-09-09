@@ -9,6 +9,7 @@ const {
   KafkaJSNumberOfRetriesExceeded,
 } = require('../../errors')
 const { createErrorFromCode } = require('../../protocol/error')
+const { stampOffsetCommit } = require('../rebalanceErrorContract')
 
 const UNKNOWN = -1
 const REBALANCE_IN_PROGRESS = 27
@@ -90,9 +91,6 @@ describe('Consumer > Runner', () => {
       leaveForPollExpiry: jest.fn(async () => {}),
       needsReconciliation: jest.fn(() => false),
       resolvedOffsetAt: jest.fn(() => undefined),
-      // `isPrefetchStale` dereferences this on every prefetched batch; the real ConsumerGroup
-      // always has it (`consumerGroup.js` takes it as a constructor option), and without it the
-      // third prefetch case throws a TypeError instead of asserting.
       pendingTopicResets: new Map(),
     }
     instrumentationEmitter = new InstrumentationEventEmitter()
@@ -506,6 +504,7 @@ describe('Consumer > Runner', () => {
       }
       runner.rebalanceCoordinator = {
         clearVerdict: jest.fn(),
+        notifyStopRequested: jest.fn(),
         idle: jest.fn(async () => {
           calls.push('rebalanceCoordinator.idle')
           // The round is only reachable if a fetch issued in this window returns instead of
@@ -544,6 +543,26 @@ describe('Consumer > Runner', () => {
       await runner.stop()
 
       expect(order).toEqual(['onStopRequested', 'managerStop'])
+    })
+
+    // MF-1: the reconciliation chain `stop()` awaits can still reach `requestTick()` through an
+    // acknowledgement or a coordinator move. Before the shutdown latch that armed a fresh chain,
+    // so heartbeats kept going out after LeaveGroup and the timer held the process open.
+    it('leaves no armed heartbeat chain, whatever asks for one after stop()', async () => {
+      asConsumerProtocol()
+      const runner = createTestRunner()
+      runner.running = true
+
+      await runner.stop()
+
+      expect(runner.heartbeatManager.isRunning()).toBe(false)
+
+      runner.heartbeatManager.requestTick()
+      runner.heartbeatManager.ensureStarted()
+      runner.heartbeatManager.requestTick()
+
+      expect(runner.heartbeatManager.isRunning()).toBe(false)
+      expect(runner.heartbeatManager.handle).toBeNull()
     })
 
     it('leaves the group on stop for a static consumer-protocol member', async () => {
@@ -699,23 +718,44 @@ describe('Consumer > Runner', () => {
       expect(consumerGroup.memberId).toBeNull()
     })
 
-    it('forwards fetch options through to the consumer group', async () => {
-      const runner = createTestRunner()
-      runner.running = true
-      const options = { offsetOverrides: new Map([['t|0', '42']]), prefetch: true }
-
-      await runner.fetch(1, options)
-
-      expect(consumerGroup.fetch).toHaveBeenCalledWith(1, options)
-    })
-
-    it('fetches with no options when none are given, exactly as it does today', async () => {
+    it('fetches with the node id alone, exactly as it always has', async () => {
       const runner = createTestRunner()
       runner.running = true
 
       await runner.fetch(1)
 
-      expect(consumerGroup.fetch).toHaveBeenCalledWith(1, undefined)
+      expect(consumerGroup.fetch).toHaveBeenCalledWith(1)
+    })
+
+    // MF-5: at OffsetCommit v9 the broker answers a deleted group with GROUP_ID_NOT_FOUND (69)
+    // where v8 answered ILLEGAL_GENERATION (22). A classic consumer must rejoin either way.
+    it('rejoins on a commit answered 69, exactly as it does on a 22', async () => {
+      const runner = createTestRunner()
+      runner.running = true
+      const runRound = jest.spyOn(runner.rebalanceCoordinator, 'runRound').mockResolvedValue()
+
+      const verdictFor = (code) =>
+        runner.toVerdict(stampOffsetCommit(new KafkaJSProtocolError(createErrorFromCode(code))))
+
+      expect(verdictFor(69)).toMatchObject({ kind: 'lost', reason: 'lost' })
+      expect(verdictFor(69).kind).toEqual(verdictFor(22).kind)
+      expect(verdictFor(69).reason).toEqual(verdictFor(22).reason)
+
+      await runner.handleRebalanceError(verdictFor(69))
+
+      expect(runRound).toHaveBeenCalledWith('lost', 'lost')
+      expect(consumerGroup.discardUncommittedOffsets).toHaveBeenCalled()
+      // The member id is still this member's; only the group is gone.
+      expect(consumerGroup.memberId).toEqual('test-member')
+    })
+
+    it('still crashes on an unstamped 69, which no commit produced', async () => {
+      const runner = createTestRunner()
+      runner.running = true
+      const error = new KafkaJSProtocolError(createErrorFromCode(69))
+
+      expect(runner.toVerdict(error)).toMatchObject({ kind: null, reason: null })
+      await expect(runner.handleRebalanceError(error)).rejects.toMatchObject({ code: 69 })
     })
 
     // The two places the runner clears the member id are here and in `stop()`; a classic member
@@ -751,17 +791,18 @@ describe('Consumer > Runner', () => {
     })
   })
 
-  describe('Consumer > Runner > the prefetch seam', () => {
-    it('injects the knob and the eligibility predicate into the fetch manager', () => {
+  describe('Consumer > Runner > the prefetch knob', () => {
+    it('stores maxPrefetchBatches without wiring it to anything', () => {
       const runner = createTestRunner({ maxPrefetchBatches: 1 })
 
       expect(runner.maxPrefetchBatches).toEqual(1)
-      expect(typeof runner.isFullyResolved).toEqual('function')
+      expect(runner.isFullyResolved).toBeUndefined()
+      expect(runner.isPrefetchStale).toBeUndefined()
     })
 
-    // The lambda, not `Runner#fetch`: this is the only place a dropped second parameter shows up
-    // before the fetch layer starts passing one.
-    it('hands the fetch manager a fetch that carries the options through', async () => {
+    // The lambda the fetch manager is handed, not `Runner#fetch`: the manager destructures a fixed
+    // option set, so anything the runner adds here would be dropped without a signal.
+    it('hands the fetch manager only the options it destructures', () => {
       let mockManagerOptions
 
       jest.isolateModules(() => {
@@ -785,100 +826,13 @@ describe('Consumer > Runner', () => {
         isolated.running = true
       })
 
-      expect(mockManagerOptions.maxPrefetchBatches).toEqual(1)
-      expect(typeof mockManagerOptions.isFullyResolved).toEqual('function')
-
-      await mockManagerOptions.fetch(7, { prefetch: true })
-
-      expect(consumerGroup.fetch).toHaveBeenCalledWith(7, { prefetch: true })
-    })
-
-    it('reports a batch as fully resolved only when the resolved offset is past its last one', () => {
-      const runner = createTestRunner({ maxPrefetchBatches: 1 })
-      const batch = new Batch(topicName, 0, {
-        partition,
-        highWatermark: '10',
-        messages: [{ offset: '4', key: null, value: null }],
-      })
-
-      consumerGroup.resolvedOffsetAt = jest.fn(() => '5')
-      expect(runner.isFullyResolved(batch)).toBe(true)
-
-      consumerGroup.resolvedOffsetAt = jest.fn(() => '4')
-      expect(runner.isFullyResolved(batch)).toBe(false)
-
-      consumerGroup.resolvedOffsetAt = jest.fn(() => undefined)
-      expect(runner.isFullyResolved(batch)).toBe(false)
-    })
-
-    it('applies the prefetch drop rule only to prefetched batches', () => {
-      const runner = createTestRunner({ maxPrefetchBatches: 1 })
-      const batch = new Batch(topicName, '4', {
-        partition,
-        highWatermark: '10',
-        messages: [{ offset: '4', key: null, value: null }],
-      })
-
-      consumerGroup.resolvedOffsetAt = jest.fn(() => '9')
-      consumerGroup.isPaused = jest.fn(() => false)
-      consumerGroup.hasSeekOffset = jest.fn(() => false)
-
-      expect(runner.isPrefetchStale(batch)).toBe(false)
-
-      batch.prefetched = true
-      expect(runner.isPrefetchStale(batch)).toBe(true)
-
-      consumerGroup.resolvedOffsetAt = jest.fn(() => '4')
-      expect(runner.isPrefetchStale(batch)).toBe(false)
-
-      consumerGroup.isPaused = jest.fn(() => true)
-      expect(runner.isPrefetchStale(batch)).toBe(true)
-    })
-
-    // The case above never lets either of the last two clauses decide: the offset clause or the
-    // pause clause is already true wherever they are exercised. Each is isolated here with the
-    // three others held false, so a deleted clause turns the case red.
-    it('drops a prefetched batch on a pending seek, with every other clause false', () => {
-      const runner = createTestRunner({ maxPrefetchBatches: 1 })
-      const batch = new Batch(topicName, '4', {
-        partition,
-        highWatermark: '10',
-        messages: [{ offset: '4', key: null, value: null }],
-      })
-      batch.prefetched = true
-
-      consumerGroup.resolvedOffsetAt = jest.fn(() => '4')
-      consumerGroup.isPaused = jest.fn(() => false)
-      consumerGroup.hasSeekOffset = jest.fn(() => false)
-      consumerGroup.pendingTopicResets = new Map()
-
-      expect(runner.isPrefetchStale(batch)).toBe(false)
-
-      consumerGroup.hasSeekOffset = jest.fn(() => true)
-
-      expect(runner.isPrefetchStale(batch)).toBe(true)
-      expect(consumerGroup.hasSeekOffset).toHaveBeenCalledWith({ topic: topicName, partition })
-    })
-
-    it('drops a prefetched batch on a pending topic reset, with every other clause false', () => {
-      const runner = createTestRunner({ maxPrefetchBatches: 1 })
-      const batch = new Batch(topicName, '4', {
-        partition,
-        highWatermark: '10',
-        messages: [{ offset: '4', key: null, value: null }],
-      })
-      batch.prefetched = true
-
-      consumerGroup.resolvedOffsetAt = jest.fn(() => '4')
-      consumerGroup.isPaused = jest.fn(() => false)
-      consumerGroup.hasSeekOffset = jest.fn(() => false)
-      consumerGroup.pendingTopicResets = new Map([['another-topic', 'earliest']])
-
-      expect(runner.isPrefetchStale(batch)).toBe(false)
-
-      consumerGroup.pendingTopicResets = new Map([[topicName, 'earliest']])
-
-      expect(runner.isPrefetchStale(batch)).toBe(true)
+      expect(Object.keys(mockManagerOptions).sort()).toEqual([
+        'concurrency',
+        'fetch',
+        'getNodeIds',
+        'handler',
+        'logger',
+      ])
     })
   })
 })

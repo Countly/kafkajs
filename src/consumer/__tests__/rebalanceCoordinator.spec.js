@@ -85,6 +85,7 @@ const build = ({ mode = EAGER, assignment = [], deltas = [], heartbeatInterval =
   const heartbeatManager = {
     ensureStarted: jest.fn(() => calls.push('ensureStarted')),
     stop: jest.fn(() => calls.push('heartbeatManager.stop')),
+    shutdown: jest.fn(() => calls.push('heartbeatManager.shutdown')),
   }
 
   const runner = { stopRequested: false, onCrash: jest.fn() }
@@ -260,7 +261,7 @@ const createRealRound = ({ mode = EAGER, partitions = 4 } = {}) => {
     runner: { stopRequested: false, onCrash: jest.fn() },
     consumerGroup: group,
     fetchManager: { start: jest.fn(async () => {}), stop: jest.fn(async () => {}) },
-    heartbeatManager: { ensureStarted: jest.fn(), stop: jest.fn() },
+    heartbeatManager: { ensureStarted: jest.fn(), stop: jest.fn(), shutdown: jest.fn() },
     pollTimer: new PollTimer({ pollDeadline: 8000 }),
     instrumentationEmitter: group.instrumentationEmitter,
     logger: newLogger(),
@@ -300,6 +301,57 @@ const probeAssigner = {
 
 const partitionsOf = (emitted, type) =>
   payloadsOf(emitted, type).map(({ partitions }) => partitions)
+
+// SF-5: the inter-round yield runs inside the chain `Runner#stop()` awaits through `idle()`.
+// Guarding before the timer is armed is not enough - a stop landing one tick later waited the
+// whole delay, up to MAX_RECONCILE_YIELD_MS.
+describe('Consumer > RebalanceCoordinator > the inter-round yield', () => {
+  beforeEach(() => jest.useFakeTimers())
+  afterEach(() => jest.useRealTimers())
+
+  it('ends at once when a stop is requested, leaving no timer', async () => {
+    const { coordinator } = build()
+    coordinator.consumerGroup.heartbeatInterval = () => 3000
+
+    let resolved = false
+    const yielding = coordinator.yieldBetweenRounds().then(() => (resolved = true))
+
+    expect(jest.getTimerCount()).toEqual(1)
+    await jest.advanceTimersByTimeAsync(10)
+    expect(resolved).toBe(false)
+
+    coordinator.notifyStopRequested()
+    await yielding
+
+    expect(resolved).toBe(true)
+    expect(jest.getTimerCount()).toEqual(0)
+    expect(coordinator.stopWaiters.size).toEqual(0)
+  })
+
+  it('otherwise waits the capped interval and cleans its waiter up', async () => {
+    const { coordinator } = build()
+    coordinator.consumerGroup.heartbeatInterval = () => 60000
+
+    let resolved = false
+    const yielding = coordinator.yieldBetweenRounds().then(() => (resolved = true))
+
+    await jest.advanceTimersByTimeAsync(4999)
+    expect(resolved).toBe(false)
+
+    await jest.advanceTimersByTimeAsync(1)
+    await yielding
+
+    expect(resolved).toBe(true)
+    expect(jest.getTimerCount()).toEqual(0)
+    expect(coordinator.stopWaiters.size).toEqual(0)
+  })
+
+  it('is a no-op to notify when nothing is waiting', () => {
+    const { coordinator } = build()
+
+    expect(() => coordinator.notifyStopRequested()).not.toThrow()
+  })
+})
 
 describe('Consumer > RebalanceCoordinator', () => {
   let unhandled

@@ -259,6 +259,72 @@ describe('Admin > describeGroups > routing', () => {
     })
   })
 
+  // SF-1: two ids that shared a coordinator can land on different brokers after a
+  // `__consumer_offsets` leader move. Re-pointing the whole batch at the first id's new
+  // coordinator burned the budget on NOT_COORDINATOR for the other one.
+  it('re-groups a batch that split across coordinators, so both ids still resolve', async () => {
+    let moved = false
+    const asked = []
+    const cluster = stubCluster({
+      consumerGroupDescribe: async ({ groupIds }) => {
+        asked.push([...groupIds])
+
+        if (!moved) {
+          moved = true
+          return {
+            groups: groupIds.map((groupId) => ({
+              ...consumerGroupRow(groupId),
+              errorCode: NOT_COORDINATOR,
+            })),
+          }
+        }
+
+        return { groups: groupIds.map((groupId) => consumerGroupRow(groupId)) }
+      },
+      describeGroups: jest.fn(),
+      nodeIdFor: (groupId) => (moved && groupId === 'g2' ? 1 : 0),
+    })
+    const admin = createAdmin({ logger: newLogger(), retry: boundedRetry, cluster })
+
+    const { groups } = await admin.describeGroups(['g1', 'g2'])
+
+    expect(groups.map(({ groupId, errorCode }) => [groupId, errorCode]).sort()).toEqual([
+      ['g1', 0],
+      ['g2', 0],
+    ])
+    expect(asked[0]).toEqual(['g1', 'g2'])
+    expect(asked.slice(1).sort()).toEqual([['g1'], ['g2']])
+  })
+
+  // SF-2: a code instead of a group describes nothing, so its type and protocol are unknown.
+  it('does not call an errored row a consumer group', async () => {
+    const cluster = stubCluster({
+      consumerGroupDescribe: async ({ groupIds }) => ({
+        groups: groupIds.map((groupId) => ({
+          ...consumerGroupRow(groupId),
+          errorCode: GROUP_AUTHORIZATION_FAILED,
+          errorMessage: 'not authorized',
+          groupState: '',
+          assignorName: null,
+          members: [],
+        })),
+      }),
+      describeGroups: jest.fn(),
+    })
+    const admin = createAdmin({ logger: newLogger(), retry, cluster })
+
+    const { groups } = await admin.describeGroups(['g1'])
+
+    expect(groups[0]).toMatchObject({
+      groupId: 'g1',
+      errorCode: GROUP_AUTHORIZATION_FAILED,
+      groupType: '',
+      protocolType: '',
+      protocol: '',
+      members: [],
+    })
+  })
+
   it('retries a COORDINATOR_LOAD_IN_PROGRESS and re-finds the coordinator on a NOT_COORDINATOR', async () => {
     const found = []
     let call = 0

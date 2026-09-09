@@ -3,7 +3,7 @@ const sleep = require('../../utils/sleep')
 const isInvalidOffset = require('./isInvalidOffset')
 const initializeConsumerOffsets = require('./initializeConsumerOffsets')
 const { KafkaJSError, isStaleCoordinator } = require('../../errors')
-const { stampGeneration } = require('../rebalanceErrorContract')
+const { stampGeneration, stampOffsetCommit } = require('../rebalanceErrorContract')
 const {
   events: { COMMIT_OFFSETS },
 } = require('../instrumentationEvents')
@@ -75,6 +75,18 @@ module.exports = class OffsetManager {
    *                                read against a live member (KIP-848).
    * @param {number} [options.staleEpochTimeout=300000] how long an offset fetch answered with a
    *                                stale member epoch keeps being re-sent under a fresh one.
+   * @param {() => {generationId: number, memberId: string,
+   *                                coordinator: import("../../../types").Broker}} [options.membership]
+   *                                a LIVE read of the membership this manager should send under.
+   *                                The stale-epoch retry consults it before every attempt, because
+   *                                the epoch it needs is installed by the heartbeats while the
+   *                                retry loop is running - a snapshot would re-send the rejected
+   *                                epoch forever. Defaults to this manager's own snapshot, which
+   *                                is what every caller that has no membership to offer wants.
+   * @param {() => boolean} [options.isStopping] whether the consumer has been asked to stop. The
+   *                                stale-epoch retry abandons its deadline the moment this is
+   *                                true, because the fetch loop it runs inside is one
+   *                                `Runner#stop()` waits for.
    * @param {import('../../../types').Logger} [options.logger] where this manager reports a stale
    *                                member epoch. Optional and silent by default: the consumer group
    *                                is the only production caller and passes its own namespaced
@@ -97,6 +109,8 @@ module.exports = class OffsetManager {
     pendingTopicResets = new Map(),
     membershipProtocol = 'classic',
     staleEpochTimeout = 300000,
+    membership = null,
+    isStopping = null,
     logger = SILENT_LOGGER,
   }) {
     this.cluster = cluster
@@ -125,6 +139,14 @@ module.exports = class OffsetManager {
     this.pendingTopicResets = pendingTopicResets
     this.membershipProtocol = membershipProtocol
     this.staleEpochTimeout = staleEpochTimeout
+    this.membership =
+      membership ||
+      (() => ({
+        generationId: this.generationId,
+        memberId: this.memberId,
+        coordinator: this.coordinator,
+      }))
+    this.isStopping = isStopping || (() => false)
     this.logger = logger
 
     this.autoCommit = autoCommit
@@ -176,6 +198,29 @@ module.exports = class OffsetManager {
   resolvedOffsetAt(topic, partition) {
     const offsets = this.resolvedOffsets[topic]
     return offsets ? offsets[partition] : undefined
+  }
+
+  /**
+   * One OffsetCommit, with every failure marked as raised on the commit path.
+   *
+   * Every commit this manager sends goes through here - the periodic auto-commit, a user's
+   * `commitOffsets`, the pre-release commit, `seek` and the out-of-range reset - so the stamp is
+   * on the error however it later reaches the rebalance contract. It has to be recorded here
+   * because the contract classifies a commit failure far from where it was raised: an
+   * auto-commit's error surfaces out of the fetch round and is classified on the FETCH path.
+   * @private
+   * @param {object} payload the `Broker#offsetCommit` payload
+   * @returns {Promise<object>} the decoded response
+   * @throws {Error} whatever the coordinator answered, stamped
+   */
+  async sendOffsetCommit(payload) {
+    const coordinator = await this.getCoordinator()
+
+    try {
+      return await coordinator.offsetCommit(payload)
+    } catch (e) {
+      throw stampOffsetCommit(e)
+    }
   }
 
   /**
@@ -313,6 +358,25 @@ module.exports = class OffsetManager {
   }
 
   /**
+   * Re-reads the membership this manager sends under from the injected accessor.
+   *
+   * The coordinator is kept when the membership has none: a consumer-protocol membership nulls its
+   * own `coordinator` while it re-finds one after a `NOT_COORDINATOR`, and `getCoordinator()`
+   * dereferences the field. The stale broker it keeps is re-resolved there anyway.
+   * @private
+   * @returns {void}
+   */
+  refreshMembership() {
+    const { generationId, memberId, coordinator } = this.membership()
+
+    this.useMembership({
+      generationId,
+      memberId,
+      coordinator: coordinator || this.coordinator,
+    })
+  }
+
+  /**
    * @param {string} topic
    * @param {number} partition
    * @returns {number} the leader epoch of the last record consumed on this partition, -1 when unknown
@@ -377,9 +441,7 @@ module.exports = class OffsetManager {
   async setDefaultOffset({ topic, partition }) {
     const { groupId, generationId, memberId, groupInstanceId } = this
     const defaultOffset = this.cluster.defaultOffset(this.topicConfigurations[topic])
-    const coordinator = await this.getCoordinator()
-
-    await coordinator.offsetCommit({
+    await this.sendOffsetCommit({
       groupId,
       memberId,
       groupGenerationId: generationId,
@@ -423,9 +485,8 @@ module.exports = class OffsetManager {
     }
 
     const { groupId, generationId, memberId, groupInstanceId } = this
-    const coordinator = await this.getCoordinator()
 
-    await coordinator.offsetCommit({
+    await this.sendOffsetCommit({
       groupId,
       memberId,
       groupGenerationId: generationId,
@@ -554,8 +615,7 @@ module.exports = class OffsetManager {
     }
 
     try {
-      const coordinator = await this.getCoordinator()
-      await coordinator.offsetCommit(payload)
+      await this.sendOffsetCommit(payload)
       this.instrumentationEmitter.emit(COMMIT_OFFSETS, payload)
 
       // Update local reference of committed offsets
@@ -606,14 +666,16 @@ module.exports = class OffsetManager {
         }
 
         throw stampGeneration(
-          new KafkaJSError(
-            {
-              message: `OffsetCommit failed with stale member epoch. ${e.message}`,
-              type: e.type,
-              code: e.code,
-              helpUrl: e.helpUrl,
-            },
-            { retriable: false, cause: e }
+          stampOffsetCommit(
+            new KafkaJSError(
+              {
+                message: `OffsetCommit failed with stale member epoch. ${e.message}`,
+                type: e.type,
+                code: e.code,
+                helpUrl: e.helpUrl,
+              },
+              { retriable: false, cause: e }
+            )
           ),
           generationId
         )
@@ -720,17 +782,26 @@ module.exports = class OffsetManager {
    *
    * A stale member epoch is re-sent under whatever epoch the heartbeats have installed, while one
    * is available and the deadline has not passed - Java's
-   * `isStaleEpochErrorAndValidEpochAvailable`. It is NOT made retriable in the error table: that
-   * would change every other decoder of a 113, including the admin client's.
+   * `isStaleEpochErrorAndValidEpochAvailable`. The epoch is re-read from the injected `membership`
+   * accessor before EVERY attempt, because it is the heartbeat chain that installs a fresh one
+   * while this loop is sleeping; re-sending this manager's construction-time snapshot would draw
+   * the same answer until the deadline. A stop abandons the loop at once: the fetch round it runs
+   * inside is one `Runner#stop()` waits for. The error is NOT made retriable in the error table:
+   * that would change every other decoder of a 113, including the admin client's.
    * @private
    * @param {{topic: string, partitions: {partition: number}[]}[]} topics
    * @returns {Promise<{responses: Array}>}
-   * @throws {Error} the last error, once the deadline passes or the member has no epoch
+   * @throws {Error} the last error, once the deadline passes, the consumer is stopping, or the
+   *   member has no epoch
    */
   async fetchCommittedOffsets(topics) {
     const deadline = Date.now() + this.staleEpochTimeout
 
     for (;;) {
+      if (this.membershipProtocol === 'consumer') {
+        this.refreshMembership()
+      }
+
       const coordinator = await this.getCoordinator()
       const memberFields =
         this.membershipProtocol === 'consumer'
@@ -748,6 +819,7 @@ module.exports = class OffsetManager {
           e.type !== STALE_MEMBER_EPOCH ||
           this.membershipProtocol !== 'consumer' ||
           this.generationId <= 0 ||
+          this.isStopping() ||
           Date.now() >= deadline
         ) {
           throw e
@@ -760,6 +832,10 @@ module.exports = class OffsetManager {
         })
 
         await sleep(STALE_EPOCH_RETRY_INTERVAL)
+
+        if (this.isStopping()) {
+          throw e
+        }
       }
     }
   }

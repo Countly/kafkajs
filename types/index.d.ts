@@ -1125,8 +1125,14 @@ export type GroupOverview = {
   protocolType: string
   /** Wire-cased state, e.g. `'Stable'`. `''` against a broker whose ListGroups version lacks it. */
   groupState: string
-  /** Lower-cased by the client. `''` against a broker whose ListGroups version lacks it. */
-  groupType: 'classic' | 'consumer' | 'share' | 'streams' | 'unknown' | ''
+  /**
+   * Lower-cased by the client. `''` against a broker whose ListGroups version lacks it.
+   *
+   * The literals are the group types Kafka defines today and are there for autocomplete; a type a
+   * newer broker introduces is passed through lower-cased rather than dropped, so the union stays
+   * open and an exhaustive `switch` over it needs a `default`.
+   */
+  groupType: 'classic' | 'consumer' | 'share' | 'streams' | 'unknown' | '' | (string & {})
 }
 
 export type DeleteGroupsResult = {
@@ -1328,15 +1334,31 @@ export type ConsumerRunConfig = {
 /**
  * @deprecated Replaced by ConsumerSubscribeTopics
  */
-export type ConsumerSubscribeTopic = { topic: string | RegExp; fromBeginning?: boolean }
-export type ConsumerSubscribeTopics = { topics: (string | RegExp)[]; fromBeginning?: boolean }
+export type ConsumerSubscribeTopic = {
+  topic: string | RegExp
+  topics?: never
+  regex?: never
+  fromBeginning?: boolean
+}
+export type ConsumerSubscribeTopics = {
+  topics: (string | RegExp)[]
+  topic?: never
+  regex?: never
+  fromBeginning?: boolean
+}
 /**
  * A broker-evaluated regular expression subscription, available only under
  * `groupProtocol: 'consumer'`. The pattern is sent verbatim as an RE2 expression and is evaluated
  * by the coordinator, so topics created later are picked up without a client-side metadata poll.
- * It cannot be combined with a topic or `topics` subscription on the same consumer.
+ * It cannot be combined with a topic or `topics` subscription on the same consumer - the runtime
+ * throws, and the `never`-branded keys above make the same mistake a compile error.
  */
-export type ConsumerSubscribeRegex = { regex: string; fromBeginning?: boolean }
+export type ConsumerSubscribeRegex = {
+  regex: string
+  topic?: never
+  topics?: never
+  fromBeginning?: boolean
+}
 
 export type Consumer = {
   connect(): Promise<void>

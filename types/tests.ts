@@ -445,12 +445,24 @@ regexConsumer.subscribe({ regex: '^orders-.*', fromBeginning: true })
 // The two existing forms still compile.
 regexConsumer.subscribe({ topics: ['t'], fromBeginning: false })
 regexConsumer.subscribe({ topic: /^t-.*/ })
+// @ts-expect-error a regex cannot be combined with topics; the runtime throws for this too
+regexConsumer.subscribe({ regex: '^orders-.*', topics: ['t'] })
+// @ts-expect-error nor with a single topic
+regexConsumer.subscribe({ regex: '^orders-.*', topic: 't' })
+// @ts-expect-error and the two topic forms stay mutually exclusive
+regexConsumer.subscribe({ topic: 't', topics: ['t'] })
+
+// `groupRemoteAssignor: null` is the documented default and compiles under both protocols.
+kafka.consumer({ groupId: 'g', groupRemoteAssignor: null })
+kafka.consumer({ groupId: 'g', groupProtocol: 'consumer', groupRemoteAssignor: null })
 
 // listGroups filters and the two new row fields.
 const listGroupsOptions: ListGroupsOptions = { states: ['stable'], types: ['consumer'] }
 admin.listGroups(listGroupsOptions).then(({ groups }) => {
   const state: string = groups[0].groupState
-  const type: 'classic' | 'consumer' | 'share' | 'streams' | 'unknown' | '' = groups[0].groupType
+  // The union is open: a group type a newer broker introduces is passed through, so a consumer
+  // reads it as a string and an exhaustive switch needs a default.
+  const type: string = groups[0].groupType
   void state
   void type
 })

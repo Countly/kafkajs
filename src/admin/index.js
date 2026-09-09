@@ -913,10 +913,19 @@ module.exports = ({
    * @param {object} [options]
    * @param {string[]} [options.states=[]] e.g. `['stable', 'empty']`
    * @param {string[]} [options.types=[]] e.g. `['consumer', 'classic']`
+   * Every per-broker call runs inside the retrier, so what a caller catches is the retrier's
+   * rejection (`KafkaJSNonRetriableError`, or `KafkaJSNumberOfRetriesExceeded` once the budget is
+   * spent) with the broker's error on `cause`, rather than the raw `KafkaJSProtocolError` 2.2.4
+   * surfaced. `.type` and `.code` are carried through. The one exception is a filter this broker's
+   * version cannot serve: that bails out of the retrier with the original error instance, so its
+   * `apiKey` and `apiName` survive.
+   *
    * @returns {Promise<{ groups: Array<{ groupId: string, protocolType: string, groupState: string, groupType: 'classic'|'consumer'|'share'|'streams'|'unknown'|'' }>}>}
    *          `groupType` is lower-case; `groupState` keeps the wire casing it has always had
    *          (`'Stable'`). Both are `''` against a broker whose version lacks them
    * @throws {KafkaJSNonRetriableError} when a filter is not an array of strings
+   * @throws {KafkaJSServerDoesNotSupportApiKey} when a filter needs a version the broker does not
+   *          offer
    */
   const listGroups = async ({ states = [], types = [] } = {}) => {
     assertStringArray('states', states)
@@ -926,7 +935,19 @@ module.exports = ({
     let groups = []
     for (const nodeId in cluster.brokerPool.brokers) {
       const broker = await cluster.findBroker({ nodeId })
-      const response = await createRetry(retry)(() => broker.listGroups({ states, types }))
+      const response = await createRetry(retry)(async (bail) => {
+        try {
+          return await broker.listGroups({ states, types })
+        } catch (e) {
+          if (e.name === 'KafkaJSServerDoesNotSupportApiKey') {
+            // `bail` rejects with this instance rather than a wrapper, so the `apiKey`/`apiName`
+            // that name the unsupported request reach the caller.
+            return bail(e)
+          }
+
+          throw e
+        }
+      })
       groups = groups.concat(response.groups.map(toPublicGroupOverview))
     }
 

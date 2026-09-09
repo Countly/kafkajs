@@ -486,7 +486,7 @@ describe('Consumer > ConsumerGroup > the offset manager it builds', () => {
   })
 })
 
-describe('Consumer > ConsumerGroup > the fetch override seam', () => {
+describe('Consumer > ConsumerGroup > buildFetchRequests', () => {
   /** A group with an offset manager and a committed offset on both partitions of TOPIC_A. */
   const createFetchingGroup = async () => {
     const group = createGroup()
@@ -498,24 +498,17 @@ describe('Consumer > ConsumerGroup > the fetch override seam', () => {
     return group
   }
 
-  it('builds byte-for-byte the same request with no options', async () => {
+  it('fetches every assigned partition from the offset manager, and takes no options', async () => {
     const group = await createFetchingGroup()
-    const topicPartitions = [{ topic: TOPIC_A, partitions: [0, 1] }]
+    const [{ topic, partitions }] = group.buildFetchRequests([
+      { topic: TOPIC_A, partitions: [0, 1] },
+    ])
 
-    expect(group.buildFetchRequests(topicPartitions)).toEqual(
-      group.buildFetchRequests(topicPartitions, {})
-    )
-  })
-
-  it('uses an override where one exists and nextOffset everywhere else', async () => {
-    const group = await createFetchingGroup()
-    const overrides = new Map([[`${TOPIC_A}|1`, '99']])
-
-    const [{ partitions }] = group.buildFetchRequests([{ topic: TOPIC_A, partitions: [0, 1] }], {
-      offsetOverrides: overrides,
-    })
-
-    expect(partitions.find(({ partition }) => partition === 1).fetchOffset).toEqual('99')
-    expect(partitions.find(({ partition }) => partition === 0).fetchOffset).not.toEqual('99')
+    expect(group.buildFetchRequests).toHaveLength(1)
+    expect(topic).toEqual(TOPIC_A)
+    expect(partitions.map(({ partition, fetchOffset }) => [partition, fetchOffset])).toEqual([
+      [0, '10'],
+      [1, '20'],
+    ])
   })
 })

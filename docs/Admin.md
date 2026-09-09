@@ -456,7 +456,7 @@ Every row carries two fields beyond the group id and its protocol type:
 | field | value |
 | --- | --- |
 | `groupState` | the group's state as the broker spells it, e.g. `'Stable'`, `'Empty'`, `'PreparingRebalance'` |
-| `groupType` | the group's type, lower-cased by this client: `'classic'`, `'consumer'`, `'share'`, `'streams'` or `'unknown'` |
+| `groupType` | the group's type, lower-cased by this client: `'classic'`, `'consumer'`, `'share'`, `'streams'` or `'unknown'`. A type a newer broker introduces is passed through lower-cased rather than dropped, so treat this as an open set and give an exhaustive `switch` over it a `default` branch |
 
 Both read `''` against a broker whose `ListGroups` version does not carry them, so one row shape works everywhere.
 

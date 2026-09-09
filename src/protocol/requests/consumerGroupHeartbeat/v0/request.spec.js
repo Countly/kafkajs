@@ -90,6 +90,29 @@ describe('Protocol > Requests > ConsumerGroupHeartbeat > v0', () => {
     expect(stable[stable.length - 2]).toEqual(0x00)
   })
 
+  // SF-18: `TopicPartitions.Partitions` is declared NON-nullable, and the encoder writes the
+  // 0x00 null sentinel for a null array - which Kafka's generated reader rejects outright with
+  // "non-nullable field Partitions was serialized as null", failing the whole heartbeat.
+  test('never writes the non-nullable Partitions as the null compact array', async () => {
+    const { fields } = vector('ownedPartitions')
+    const topicId = fields.topicPartitions[0].topicId
+    const base = { ...fields, topicPartitions: [{ topicId, partitions: [] }] }
+
+    const { buffer: empty } = await RequestV0Protocol(base).encode()
+    const { buffer: nulled } = await RequestV0Protocol({
+      ...base,
+      topicPartitions: [{ topicId, partitions: null }],
+    }).encode()
+
+    expect(nulled).toEqual(empty)
+    expect(decodeRequest(nulled).topicPartitions).toEqual([{ topicId, partitions: [] }])
+    // The Java vector for the same field with two partitions writes 0x03 (count + 1); the empty
+    // array is 0x01, and the null sentinel this must never be is 0x00.
+    expect(Buffer.from(vector('ownedPartitions').hex, 'hex')).toContain(0x03)
+    expect(nulled).toContain(0x01)
+    expect(nulled).not.toEqual(Buffer.from(vector('ownedPartitions').hex, 'hex'))
+  })
+
   test('takes every send-if-changed default when the caller omits a field', async () => {
     const { buffer } = await RequestV0Protocol({
       groupId: 'g',

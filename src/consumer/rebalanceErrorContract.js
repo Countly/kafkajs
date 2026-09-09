@@ -30,6 +30,48 @@ const GROUP_AUTHORIZATION_FAILED = 30
 const INVALID_REQUEST = 42
 const UNKNOWN_MEMBER_ID = 25
 const FENCED_MEMBER_EPOCH = 110
+const GROUP_ID_NOT_FOUND = 69
+
+/**
+ * Marks an error as one an OffsetCommit produced.
+ *
+ * Symbol-keyed for the same reason `SENT_GENERATION` is: it never reaches a user's logger or a
+ * JSON dump. It exists because a commit failure is not classified where it is raised - an
+ * auto-commit's error travels out through the fetch round and is classified on the FETCH path -
+ * so the request that drew it has to be recorded on the error itself.
+ */
+const OFFSET_COMMIT_ORIGIN = Symbol('rebalance:offsetCommit')
+
+/**
+ * Records that this error answered an OffsetCommit.
+ * @param {Error} error
+ * @returns {Error} the same error
+ */
+const stampOffsetCommit = (error) => {
+  if (error) {
+    error[OFFSET_COMMIT_ORIGIN] = true
+  }
+
+  return error
+}
+
+/**
+ * Whether a vanished group answered this member's OffsetCommit.
+ *
+ * Apache Kafka's `OffsetMetadataManager.validateOffsetCommit` answers `GROUP_ID_NOT_FOUND` (69) at
+ * OffsetCommit v9 and above where v8 answered `ILLEGAL_GENERATION` (22) - the version branch is
+ * explicit in the broker, and this client negotiates v9 against every Kafka 4.x broker. The two
+ * codes mean the same thing to a member (the group it committed under is gone), so 69 takes the
+ * verdict 22 has always taken: give up the uncommitted offsets and rejoin, rather than crash.
+ * Scoped to the commit path by the stamp, so 69 keeps its own meaning everywhere else - it is
+ * still a non-retriable "no such group" for `admin.fetchOffsets`, and still the signal that routes
+ * a `ConsumerGroupDescribe` row to the classic API.
+ * @see https://github.com/apache/kafka/blob/4.3/group-coordinator/src/main/java/org/apache/kafka/coordinator/group/OffsetMetadataManager.java
+ * @param {Error} error
+ * @returns {boolean}
+ */
+const isDeletedGroupCommit = (error) =>
+  error.code === GROUP_ID_NOT_FOUND && Boolean(error[OFFSET_COMMIT_ORIGIN])
 
 /** The message the Java client gives when the cluster cannot speak the new group protocol. */
 const CONSUMER_PROTOCOL_UNSUPPORTED_MESSAGE =
@@ -77,6 +119,12 @@ const rebalanceAction = (error, path, { kind = 'classic' } = {}) => {
 
   if (isPollIntervalExceeded(error)) {
     return { action: 'lost', fatal: false, clearsMemberId: true }
+  }
+
+  // Before every other row, and for both protocols: the member id is still valid (only the group
+  // is gone), so this is the ILLEGAL_GENERATION verdict, not the UNKNOWN_MEMBER_ID one.
+  if (isDeletedGroupCommit(error)) {
+    return { action: 'lost', fatal: false, clearsMemberId: false }
   }
 
   if (kind === 'consumer') {
@@ -141,6 +189,10 @@ const rebalanceAction = (error, path, { kind = 'classic' } = {}) => {
 const rebalanceReason = (error, { kind = 'classic' } = {}) => {
   if (isPollIntervalExceeded(error)) {
     return 'poll-interval-exceeded'
+  }
+
+  if (isDeletedGroupCommit(error)) {
+    return 'lost'
   }
 
   if (kind === 'consumer') {
@@ -277,6 +329,8 @@ module.exports = {
   rebalanceAction,
   rebalanceReason,
   isConsumerProtocolFatal,
+  stampOffsetCommit,
+  isDeletedGroupCommit,
   pollIntervalExceededError,
   assignmentChangedError,
   consumerStoppingError,

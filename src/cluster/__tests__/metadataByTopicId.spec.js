@@ -178,8 +178,10 @@ describe('Cluster > refreshMetadataForTopicIds', () => {
     expect(cluster.brokerPool.metadata).toBe(before)
   })
 
-  test('falls back to a refresh by name below Metadata v10', async () => {
-    await useBroker(9)
+  test.each([9, 10, 11])('falls back to a refresh by name at Metadata v%i', async (maxVersion) => {
+    // v10 and v11 carry TopicId in the schema but the server never reads it there
+    // (MetadataRequest.json), so the fallback floor is v12, not v10.
+    await useBroker(maxVersion)
 
     const result = await cluster.refreshMetadataForTopicIds([TOPIC_ID])
 

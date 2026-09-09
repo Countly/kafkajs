@@ -472,10 +472,11 @@ change not listed here did not change observable behavior.
     failed with stale member epoch.` and whose `type` is `STALE_MEMBER_EPOCH`. Handle it as you would
     any other commit failure — retrying it yourself under the same epoch cannot succeed.
 
-  An `OffsetFetch` rejected the same way is re-sent under the fresh epoch for up to the rebalance
-  timeout, so a first fetch of committed offsets around a rebalance can take longer without failing.
-  Classic consumers are unaffected: they see `ILLEGAL_GENERATION` for a stale generation, exactly as
-  before.
+  An `OffsetFetch` rejected the same way is re-sent under whatever epoch the heartbeats have
+  installed by then, for up to the rebalance timeout, so a first fetch of committed offsets around a
+  rebalance can take longer without failing. The retry is abandoned as soon as you call
+  `stop()`/`disconnect()`, so a shutdown is not held open by it. Classic consumers see
+  `ILLEGAL_GENERATION` for a stale generation, exactly as before.
 - **A static member under `groupProtocol: 'consumer'` sends a leave on close and on poll expiry.**
   A static classic member (`groupInstanceId` set) sends nothing when it stops: the coordinator only
   notices at `sessionTimeout`. A static consumer-protocol member instead sends one heartbeat
@@ -488,16 +489,19 @@ change not listed here did not change observable behavior.
   offsets its handlers resolved first — where a static classic member emits neither. The same
   −2 heartbeat is sent when the poll deadline expires, which is the case `POLL_INTERVAL_EXCEEDED`'s
   `isStatic: true` reports.
-- **A fatal membership error never restarts under `groupProtocol: 'consumer'`.** Five conditions
+- **A fatal membership error never restarts under `groupProtocol: 'consumer'`.** These conditions
   will be answered the same way by every rejoin, so the consumer stops instead of looping: the group
   is at its configured size limit (`GROUP_MAX_SIZE_REACHED`, 81), the static instance id is still
   held by another member (`UNRELEASED_INSTANCE_ID`, 111), the server assignor you asked for does not
   exist (`UNSUPPORTED_ASSIGNOR`, 112), the subscription regex is one the broker will not accept
-  (`INVALID_REGULAR_EXPRESSION`, 128), or the cluster does not implement the consumer protocol at
-  all. Each emits `CRASH` with `restart: false` **regardless of `retry.restartOnFailure`** — a
-  callback returning `true` does not bring the consumer back. What to do: fix the configuration, the
-  assignor name, the pattern or the duplicate `groupInstanceId`, and create a new consumer. Classic
-  consumers are unaffected — they keep restarting on the same codes — so only
+  (`INVALID_REGULAR_EXPRESSION`, 128), the caller is not authorized for the group
+  (`GROUP_AUTHORIZATION_FAILED`, 30), the coordinator rejected the request as malformed
+  (`INVALID_REQUEST`, 42), a duplicate `groupInstanceId` fenced this member (`FENCED_INSTANCE_ID`,
+  82), or the cluster does not implement the consumer protocol at all. Each emits `CRASH` with
+  `restart: false` **regardless of `retry.restartOnFailure`** — a callback returning `true` does not
+  bring the consumer back. What to do: fix the ACL, the configuration, the assignor name, the
+  pattern or the duplicate `groupInstanceId`, and create a new consumer. Classic consumers are
+  unaffected — they keep restarting on 30 and 42 as they always have — so only
   `groupProtocol: 'consumer'` users see this.
 - **Under `groupProtocol: 'consumer'`, a topic you are not authorized to read is logged, not
   raised.** When the coordinator answers `TOPIC_AUTHORIZATION_FAILED` for part of the subscription,
@@ -514,6 +518,60 @@ change not listed here did not change observable behavior.
   the pattern has resolved to are remembered for the life of the membership: a topic the pattern
   stops matching stays in the subscription until the consumer rebuilds its membership (a restart or
   a crash recovery). It is bounded by the number of distinct topics the pattern ever matched.
+
+- **A commit for a group that no longer exists rejoins instead of crashing, and the broker's code
+  for it changed.** `OffsetCommit` is now negotiated up to v9 against a Kafka 4.x broker. From v9
+  the coordinator answers `GROUP_ID_NOT_FOUND` (69) where v8 answered `ILLEGAL_GENERATION` (22) for
+  a commit from a member whose group has been deleted (`admin.deleteGroups`, or expiry after
+  `offsets.retention.minutes`). This client maps a 69 **on the commit path** to exactly the verdict
+  22 has always taken — discard the uncommitted offsets, rejoin, keep running — so a classic
+  consumer behaves as it did before. Nothing else about 69 changes: it is still a non-retriable
+  "no such group" for `admin.fetchOffsets`, and still the signal that routes a describe to the
+  classic API. If you match on the error code in a `CRASH` handler or a log filter, expect 69 rather
+  than 22 for this case.
+- **`consumer.describeGroup()` returns the unified description.** It is now routed through the same
+  describer `admin.describeGroups` uses, so a `groupProtocol: 'consumer'` group describes itself
+  correctly instead of coming back as a `Dead` row with `errorCode: 69`. Every field 2.2.4 returned
+  is unchanged in name and meaning; the row additionally carries `groupType`, `groupEpoch`,
+  `assignmentEpoch`, `assignorName` and `errorMessage`, and each member carries `groupInstanceId`,
+  `rackId`, `memberEpoch`, `assignment`, `targetAssignment`, `memberType`, `subscribedTopics` and
+  `subscribedTopicRegex`. One value changed: `authorizedOperations` is `null` rather than the raw
+  `-2147483648` sentinel when authorized operations were not requested, which is what
+  `admin.describeGroups` has always reported and what the `GroupDescription` type declares. A
+  deep-equality assertion against the whole row needs updating; reading individual fields does not.
+- **`admin.listGroups()` rejects with the retrier's error class.** Every per-broker call now runs
+  inside the configured retrier, so what you catch is `KafkaJSNonRetriableError` (or
+  `KafkaJSNumberOfRetriesExceeded` once the budget is spent) with the broker's error on `cause`,
+  where 2.2.4 surfaced the raw `KafkaJSProtocolError`. `.type` and `.code` are still on the error
+  you catch; `catch (e) { if (e.name === 'KafkaJSProtocolError') … }` is not. The one exception is a
+  filter this broker's version cannot serve, which still rejects with the
+  `KafkaJSServerDoesNotSupportApiKey` instance itself, `apiKey` and `apiName` intact.
+- **`admin.listGroups()` rows always carry `groupState` and `groupType`.** Against a broker whose
+  `ListGroups` version has neither field (v0–v2) they are decoded as `''` rather than being absent,
+  so one row shape works at every version. A deep-equality assertion against a pre-v3 row needs the
+  two keys.
+
+### TypeScript: source-breaking type changes
+
+The runtime is unchanged by these; they can fail `tsc` on an existing codebase.
+
+- **`ConsumerGroupJoinEvent.payload.leaderId` is now `string | null`.** Under
+  `groupProtocol: 'consumer'` there is no leader, and the event says so. Under `strictNullChecks`
+  `const leader: string = event.payload.leaderId` is now `TS2322` and `event.payload.leaderId
+  .slice(0, 8)` is `TS18047`, for every user — including one who never sets `groupProtocol`. Guard
+  the value (`event.payload.leaderId ?? ''`) or narrow it before use.
+- **`ConsumerGroupState` gained `'Assigning' | 'Reconciling' | 'NotReady'`**, the states
+  `GroupState.java` adds for consumer groups. An exhaustive `switch` over the union without a
+  `default` no longer compiles; add the three cases or a `default`.
+- **`GroupOverview.groupState`, `GroupOverview.groupType` and `GroupDescription.errorCode` are
+  required.** Code that *constructs* these types — test fixtures, admin mocks, a function typed
+  `(): GroupOverview` — must supply them. Code that only reads them is unaffected.
+  `GroupOverview.groupType` keeps its literals for autocomplete but accepts any string, because a
+  group type a newer broker introduces is passed through lower-cased; an exhaustive `switch` over it
+  needs a `default`.
+- **`subscribe()`'s three shapes are now mutually exclusive.** `{ regex, topics }`,
+  `{ regex, topic }` and `{ topic, topics }` are compile errors, matching the runtime, which has
+  always thrown for them.
 
 The rest of this section is additive — nothing here changes unless you opt in.
 

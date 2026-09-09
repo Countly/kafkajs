@@ -233,10 +233,11 @@ module.exports = class Cluster {
    * Fetches metadata for topics identified only by their id, so their names can be resolved.
    *
    * An assignment computed by the group coordinator names topics by uuid, and nothing in this
-   * client can fetch from a topic it cannot name. Metadata v10 is the first version whose request
-   * carries a topic id (`TopicId` is `10+`, and `Name` becomes nullable there), so on an older
-   * negotiated version this falls back to a full refresh by name and leaves the ids to the
-   * caller's own retry.
+   * client can fetch from a topic it cannot name. `TopicId` appears in the request schema at v10,
+   * but `MetadataRequest.json` says the server never implemented it there: "Versions 10 and 11
+   * should not use the topicId field or set topic name to null. Version 12 supports topic Id." So
+   * v12 is the floor, and on an older negotiated version this falls back to a full refresh by name
+   * and leaves the ids to the caller's own retry.
    *
    * Deliberately NOT routed through `BrokerPool#refreshMetadata`: that method replaces
    * `brokerPool.metadata` with its response, and `findTopicPartitionMetadata` reads that object
@@ -277,7 +278,7 @@ module.exports = class Cluster {
       outcome = await this.brokerPool.withBroker(async ({ broker }) => {
         const version = broker.negotiatedVersion(apiKeys.Metadata, requests.Metadata)
 
-        if (version == null || version < 10) {
+        if (version == null || version < 12) {
           return TOO_OLD
         }
 

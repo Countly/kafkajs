@@ -24,13 +24,26 @@ const {
 } = MEMBER_STATES
 
 // The table, retyped from MemberState.java rather than imported, so a typo in the module is a
-// failing test rather than a test that agrees with the typo.
+// failing test rather than a test that agrees with the typo. The FATAL row carries this client's
+// one documented widening: FENCED and STALE are legal predecessors here and not in Java, because
+// this client can learn a fatal error on the commit or fetch path while the member is out of the
+// group, where Java only ever learns one from a heartbeat response.
 // @see https://github.com/apache/kafka/blob/4.3/clients/src/main/java/org/apache/kafka/clients/consumer/internals/MemberState.java
 const TABLE = {
   [STABLE]: [JOINING, ACKNOWLEDGING, RECONCILING],
   [RECONCILING]: [STABLE, JOINING, ACKNOWLEDGING, RECONCILING],
   [ACKNOWLEDGING]: [RECONCILING],
-  [FATAL]: [JOINING, STABLE, RECONCILING, ACKNOWLEDGING, PREPARE_LEAVING, LEAVING, UNSUBSCRIBED],
+  [FATAL]: [
+    JOINING,
+    STABLE,
+    RECONCILING,
+    ACKNOWLEDGING,
+    PREPARE_LEAVING,
+    LEAVING,
+    UNSUBSCRIBED,
+    FENCED,
+    STALE,
+  ],
   [FENCED]: [JOINING, STABLE, RECONCILING, ACKNOWLEDGING, PREPARE_LEAVING, LEAVING],
   [JOINING]: [FENCED, UNSUBSCRIBED, STALE],
   [PREPARE_LEAVING]: [JOINING, STABLE, RECONCILING, ACKNOWLEDGING, UNSUBSCRIBED],
@@ -82,12 +95,12 @@ describe('Consumer > groupProtocol > memberState', () => {
   })
 
   it('counts the edges, so a row silently deleted from the table fails here', () => {
-    // 100 ordered pairs: 34 the table allows (one of which, RECONCILING -> RECONCILING, is also a
+    // 100 ordered pairs: 36 the table allows (one of which, RECONCILING -> RECONCILING, is also a
     // self-edge), 9 further self-edges the table does not list but the machine still allows, and
-    // 57 genuinely forbidden.
-    expect(legalEdges()).toHaveLength(34)
+    // 55 genuinely forbidden.
+    expect(legalEdges()).toHaveLength(36)
     expect(selfEdges()).toHaveLength(10)
-    expect(illegalEdges()).toHaveLength(57)
+    expect(illegalEdges()).toHaveLength(55)
     expect(legalEdges().length + illegalEdges().length + selfEdges().length).toEqual(
       ALL.length * ALL.length + 1
     )

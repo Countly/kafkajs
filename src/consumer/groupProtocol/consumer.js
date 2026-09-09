@@ -1370,7 +1370,10 @@ module.exports = class ConsumerGroupProtocol {
   transitionToFatal(error) {
     this.fatalError = error
 
-    if (this.state !== FATAL && !(this.state === FENCED || this.state === STALE)) {
+    // FENCED and STALE included: a fatal error learned on the commit or fetch path while the
+    // member is out of the group must still end the membership, or `rebalance()` - which only
+    // throws `fatalError` from FATAL - would rejoin straight back into it.
+    if (this.state !== FATAL) {
       this.transitionTo(FATAL)
       this.sentFields.reset()
       this.clearTarget()

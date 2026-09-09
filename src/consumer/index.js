@@ -1,13 +1,14 @@
 const Long = require('../utils/long')
-const createRetry = require('../retry')
 const { initialRetryTime } = require('../retry/defaults')
 const ConsumerGroup = require('./consumerGroup')
+const { createGroupDescriptions } = require('../admin/groupDescriptions')
 const resolveGroupTimeouts = require('./groupTimeouts')
 const { selectRebalanceProtocol } = require('./groupProtocol/interface')
 const Runner = require('./runner')
 const { events, wrap: wrapEvent, unwrap: unwrapEvent } = require('./instrumentationEvents')
 const InstrumentationEventEmitter = require('../instrumentation/emitter')
-const { KafkaJSNonRetriableError, isFencedInstance, isFatalMembership } = require('../errors')
+const { KafkaJSNonRetriableError, isFencedInstance } = require('../errors')
+const { isConsumerProtocolFatal } = require('./rebalanceErrorContract')
 const { roundRobin } = require('./assigners')
 const { EARLIEST_OFFSET, LATEST_OFFSET } = require('../constants')
 const ISOLATION_LEVEL = require('../protocol/isolationLevel')
@@ -44,6 +45,19 @@ const CLASSIC_ONLY_KEYS = ['partitionAssigners', 'heartbeatInterval', 'sessionTi
 const isExplicit = (params, key) => Object.hasOwn(params, key) && params[key] !== undefined
 
 /**
+ * Whether the user actually set a NULLABLE option.
+ *
+ * `groupRemoteAssignor`'s documented default is `null` - "let the coordinator pick its first
+ * configured assignor" - so `null` has to read as "not set", both for the classic rejection and
+ * for the non-empty-string rule. Threading an optional config value that is `null` when absent
+ * must not make a consumer unconstructible.
+ * @param {object} params
+ * @param {string} key
+ * @returns {boolean}
+ */
+const isExplicitAndNotNull = (params, key) => isExplicit(params, key) && params[key] !== null
+
+/**
  * Rejects a configuration that mixes options from the two group protocols, and a prefetch depth
  * this release does not implement.
  *
@@ -71,14 +85,14 @@ const validateGroupProtocolOptions = (params) => {
         `${offending.join(', ')} cannot be set when groupProtocol=consumer`
       )
     }
-  } else if (isExplicit(params, 'groupRemoteAssignor')) {
+  } else if (isExplicitAndNotNull(params, 'groupRemoteAssignor')) {
     throw new KafkaJSNonRetriableError(
       'groupRemoteAssignor cannot be set when groupProtocol=classic'
     )
   }
 
   if (
-    isExplicit(params, 'groupRemoteAssignor') &&
+    isExplicitAndNotNull(params, 'groupRemoteAssignor') &&
     (typeof params.groupRemoteAssignor !== 'string' || params.groupRemoteAssignor.length === 0)
   ) {
     throw new KafkaJSNonRetriableError('Argument "groupRemoteAssignor" must be a non-empty string')
@@ -539,12 +553,14 @@ module.exports = (params) => {
         }
       }
 
-      if (isFencedInstance(e) || (isConsumerProtocol && isFatalMembership(e))) {
+      if (isFencedInstance(e) || (isConsumerProtocol && isConsumerProtocolFatal(e))) {
         // A fenced static member (82) has been evicted by a duplicate groupInstanceId elsewhere,
         // and a fatal membership error - unsupported assignor, invalid subscription regex,
-        // unreleased instance id, group at capacity, a cluster without the consumer protocol -
-        // will answer the same way to every rejoin. Both override restartOnFailure, unlike every
-        // other terminal error.
+        // unreleased instance id, group at capacity, a revoked group ACL, a malformed request, a
+        // cluster without the consumer protocol - will answer the same way to every rejoin. Both
+        // override restartOnFailure, unlike every other terminal error. The predicate is the
+        // error contract's own consumer-protocol set, so the CRASH event's `restart` flag agrees
+        // with the verdict that produced it.
         shouldRestart = false
       }
 
@@ -690,14 +706,24 @@ module.exports = (params) => {
     consumerGroup.seek({ topic, partition, offset: seekOffset.toString() })
   }
 
-  /** @type {import("../../types").Consumer["describeGroup"]} */
+  /**
+   * Describes the group this consumer belongs to, whatever protocol runs it.
+   *
+   * Routed through the same describer `admin.describeGroups` uses, so a KIP-848 group is described
+   * through ConsumerGroupDescribe and a classic one through DescribeGroups. Asking DescribeGroups
+   * directly - which is what this did - answers `GROUP_ID_NOT_FOUND` for a consumer-protocol group
+   * and reports it as `Dead` with no members.
+   *
+   * @type {import("../../types").Consumer["describeGroup"]}
+   */
   const describeGroup = async () => {
-    const coordinator = await cluster.findGroupCoordinator({ groupId })
-    const retrier = createRetry(retry)
-    return retrier(async () => {
-      const { groups } = await coordinator.describeGroups({ groupIds: [groupId] })
-      return groups.find((group) => group.groupId === groupId)
-    })
+    const { groups } = await createGroupDescriptions({
+      cluster,
+      retry,
+      logger: rootLogger,
+    }).describe([groupId])
+
+    return groups.find((group) => group.groupId === groupId)
   }
 
   /**

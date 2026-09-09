@@ -118,6 +118,55 @@ module.exports = class RebalanceCoordinator {
     this.verdict = null
     /** Consecutive rounds in the current chain. */
     this.rounds = 0
+    /**
+     * Callbacks that end a wait a stop has made pointless, armed by `yieldBetweenRounds` and
+     * fired by `notifyStopRequested`.
+     * @type {Set<() => void>}
+     */
+    this.stopWaiters = new Set()
+  }
+
+  /**
+   * Ends every wait that a requested stop makes pointless.
+   *
+   * Called by `Runner#stop()` as it sets `stopRequested`. Without it the inter-round yield below
+   * runs to its full delay - up to `MAX_RECONCILE_YIELD_MS` - inside the chain `stop()` then
+   * awaits through `idle()`, so `consumer.disconnect()` would wait for a pause that no longer has
+   * a next round to space out.
+   * @returns {void}
+   */
+  notifyStopRequested() {
+    for (const waiter of [...this.stopWaiters]) {
+      waiter()
+    }
+  }
+
+  /**
+   * One coordinator trip's worth of spacing between two consumer-protocol reconciliation rounds,
+   * so a multi-trip reconciliation spends its round budget on real trips instead of spinning the
+   * event loop.
+   *
+   * Raced against the stop signal rather than merely guarded before it: a stop landing one tick
+   * after the timer is armed would otherwise hold `stop()` open for the whole delay. Deliberately
+   * not `unref()`ed - the chain awaits this timer, so an unreferenced one would strand the round
+   * whenever nothing else keeps the loop alive.
+   * @private
+   * @returns {Promise<void>}
+   */
+  yieldBetweenRounds() {
+    const delay = Math.min(this.consumerGroup.heartbeatInterval(), MAX_RECONCILE_YIELD_MS)
+
+    return new Promise((resolve) => {
+      let timer = null
+      const finish = () => {
+        clearTimeout(timer)
+        this.stopWaiters.delete(finish)
+        resolve()
+      }
+
+      timer = setTimeout(finish, delay)
+      this.stopWaiters.add(finish)
+    })
   }
 
   /** @returns {boolean} whether a round is running right now */
@@ -312,17 +361,7 @@ module.exports = class RebalanceCoordinator {
               : this.takeRejoinRequested()
 
       if (reason && protocol === 'consumer' && !this.runner.stopRequested) {
-        // One coordinator trip's worth of spacing, so a multi-trip reconciliation spends the
-        // 20-round budget on real trips instead of spinning the event loop. Capped and skipped
-        // while stopping: this runs inside a chain `Runner#stop()` awaits through `idle()`.
-        // Deliberately not `unref()`ed: the chain awaits this timer, so an unreferenced one would
-        // strand the round whenever nothing else keeps the loop alive.
-        await new Promise((resolve) =>
-          setTimeout(
-            resolve,
-            Math.min(this.consumerGroup.heartbeatInterval(), MAX_RECONCILE_YIELD_MS)
-          )
-        )
+        await this.yieldBetweenRounds()
       }
     } while (reason)
   }

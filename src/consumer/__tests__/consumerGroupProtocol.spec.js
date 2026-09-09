@@ -743,6 +743,40 @@ describe('Consumer > groupProtocol > ConsumerGroupProtocol', () => {
       expect(h.protocol.state).toEqual(FATAL)
     })
 
+    // SF-7: a fatal error can reach `onMembershipError` from the commit or the fetch path while
+    // the member is out of the group. Recording it without entering FATAL dropped it - the member
+    // rejoined and hit the same error again, and the stale `fatalError` outlived the rejoin.
+    it('enters FATAL from FENCED, so the round does not rejoin into the same error', async () => {
+      const h = build({ answers: [heartbeatResponse({ memberEpoch: 4 })] })
+      await await startStep(h)
+
+      h.protocol.onMembershipError(createErrorFromCode(25))
+      expect(h.protocol.state).toEqual(FENCED)
+
+      h.protocol.onMembershipError(createErrorFromCode(112))
+
+      expect(h.protocol.state).toEqual(FATAL)
+      await expect(h.protocol.rebalance(context())).rejects.toMatchObject({ code: 112 })
+    })
+
+    it('enters FATAL from STALE too', async () => {
+      const h = build({
+        answers: [
+          heartbeatResponse({ memberEpoch: 3, assignment: assignmentOf([[TOPIC_ID_A, [0]]]) }),
+        ],
+      })
+      await await startStep(h)
+      h.protocol.setOwned([{ topic: 'topic-a', partitions: [0] }])
+      h.manager.stop()
+      await h.protocol.leaveForPollExpiry()
+      expect(h.protocol.state).toEqual(STALE)
+
+      h.protocol.onMembershipError(createErrorFromCode(112))
+
+      expect(h.protocol.state).toEqual(FATAL)
+      await expect(h.protocol.rebalance(context())).rejects.toMatchObject({ code: 112 })
+    })
+
     it('refuses to rejoin once fatal', async () => {
       const h = build({ answers: [createErrorFromCode(112)] })
       await expect(startStep(h).then((pending) => pending)).rejects.toThrow()

@@ -2,6 +2,8 @@ const {
   rebalanceAction,
   rebalanceReason,
   pollIntervalExceededError,
+  stampOffsetCommit,
+  isDeletedGroupCommit,
   REBALANCE_PATHS,
 } = require('../rebalanceErrorContract')
 const {
@@ -71,6 +73,68 @@ describe('Consumer > rebalance error contract', () => {
       // Recorded as a control rather than a behaviour: Broker#joinGroup retries with the member id
       // the error carried, so code 79 does not reach this contract.
       expect(rebalanceAction(createErrorFromCode(79), REBALANCE_PATHS.MEMBERSHIP).action).toBeNull()
+    })
+  })
+
+  // MF-5. Apache Kafka's OffsetMetadataManager.validateOffsetCommit answers GROUP_ID_NOT_FOUND
+  // (69) at OffsetCommit v9+ where v8 answered ILLEGAL_GENERATION (22). A member must not tell
+  // those two apart, and nothing else about 69 may change.
+  describe('a vanished group answering an OffsetCommit', () => {
+    const committed = (code) => stampOffsetCommit(createErrorFromCode(code))
+
+    it.each([['classic'], ['consumer']])(
+      'takes the ILLEGAL_GENERATION verdict under %s',
+      (kind) => {
+        const asIllegalGeneration = rebalanceAction(
+          createErrorFromCode(22),
+          REBALANCE_PATHS.FETCH,
+          {
+            kind,
+          }
+        )
+
+        for (const path of PATHS) {
+          expect(rebalanceAction(committed(69), path, { kind })).toEqual(asIllegalGeneration)
+        }
+
+        expect(rebalanceReason(committed(69), { kind })).toEqual(
+          rebalanceReason(createErrorFromCode(22), { kind })
+        )
+      }
+    )
+
+    it('keeps the member id, which a vanished group does not invalidate', () => {
+      expect(rebalanceAction(committed(69), REBALANCE_PATHS.OFFSET_COMMIT)).toEqual({
+        action: 'lost',
+        fatal: false,
+        clearsMemberId: false,
+      })
+    })
+
+    it('leaves an unstamped 69 alone, on every path and under both protocols', () => {
+      for (const kind of ['classic', 'consumer']) {
+        for (const path of PATHS) {
+          expect(rebalanceAction(createErrorFromCode(69), path, { kind }).action).toBeNull()
+        }
+
+        expect(rebalanceReason(createErrorFromCode(69), { kind })).toBeNull()
+      }
+
+      expect(isDeletedGroupCommit(createErrorFromCode(69))).toBe(false)
+    })
+
+    it('leaves every other stamped code alone', () => {
+      expect(isDeletedGroupCommit(committed(22))).toBe(false)
+      expect(rebalanceAction(committed(27), REBALANCE_PATHS.FETCH)).toEqual(
+        rebalanceAction(createErrorFromCode(27), REBALANCE_PATHS.FETCH)
+      )
+    })
+
+    it('does not make 69 retriable, so admin reads still fail at once', () => {
+      // `admin.fetchOffsets` and the describe router both read this flag; the stamp is a
+      // classification input for the consumer, not a change to the error table.
+      expect(createErrorFromCode(69).retriable).toBe(false)
+      expect(committed(69).retriable).toBe(false)
     })
   })
 

@@ -298,6 +298,45 @@ describeConsumerProtocol('Consumer > the consumer group protocol (live)', () => 
     ROW_BUDGET_MS
   )
 
+  // MF-3: `consumer.describeGroup()` asked DescribeGroups directly, which answers
+  // GROUP_ID_NOT_FOUND for a consumer-type group - so a live KIP-848 member described its own
+  // group as `Dead` with no members.
+  it(
+    'describes its own group correctly through ConsumerGroupDescribe',
+    async () => {
+      const { consumer, observed } = createMember('describer')
+
+      await consumer.connect()
+      await consumer.subscribe({ topic, fromBeginning: true })
+      await consumer.run({ eachMessage: async () => {} })
+
+      expect(
+        await waitForCondition(() => ownedBy(observed).length === PARTITIONS, ASSIGNMENT_BUDGET)
+      ).toBe(true)
+
+      const description = await consumer.describeGroup()
+
+      expect(description.groupId).toEqual(groupId)
+      expect(description.errorCode).toEqual(0)
+      expect(description.groupType).toEqual('consumer')
+      expect(description.state).not.toEqual('Dead')
+      expect(description.members).toHaveLength(1)
+      expect(description.members[0].memberEpoch).toBeGreaterThan(0)
+      expect(description.members[0].subscribedTopics).toEqual([topic])
+      expect(
+        description.members[0].assignment
+          .filter(({ topic: assignedTopic }) => assignedTopic === topic)
+          .flatMap(({ partitions }) => partitions)
+          .sort((a, b) => a - b)
+      ).toEqual(allPartitions())
+      // The coordinator's own fields, which the classic API cannot report.
+      expect(description.groupEpoch).toBeGreaterThan(0)
+      expect(typeof description.assignorName).toEqual('string')
+      expect(observed.crashes).toEqual([])
+    },
+    ROW_BUDGET_MS
+  )
+
   it(
     'keeps a static member’s partitions across a restart, and releases a dynamic member’s on leave',
     async () => {

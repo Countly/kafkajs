@@ -48,6 +48,9 @@ describe('Consumer', () => {
       consumer.run({ eachMessage: jest.fn() })
       await waitForConsumerToJoinGroup(consumer)
 
+      // The 2.2.4 fields, unchanged in name and meaning, plus the additive ones the unified
+      // describer produces: `describeGroup()` now routes through the same module
+      // `admin.describeGroups` uses, so one shape describes a group of either protocol.
       await expect(consumer.describeGroup()).resolves.toEqual({
         errorCode: 0,
         errorMessage: null,
@@ -60,14 +63,25 @@ describe('Consumer', () => {
             memberId: expect.any(String),
             memberAssignment: expect.anything(),
             memberMetadata: expect.anything(),
+            assignment: [{ topic: topicName, partitions: [0] }],
+            targetAssignment: null,
+            memberEpoch: null,
+            memberType: null,
+            rackId: null,
+            subscribedTopics: [],
+            subscribedTopicRegex: null,
           },
         ],
         protocol: 'RoundRobinAssigner',
         protocolType: 'consumer',
         state: 'Stable',
-        // DescribeGroups v3+ reports the caller's authorized operations; the request does not ask
-        // for them, and the broker answers with the "not requested" sentinel.
-        authorizedOperations: -2147483648,
+        groupType: 'classic',
+        groupEpoch: null,
+        assignmentEpoch: null,
+        assignorName: null,
+        // The request does not ask for authorized operations, and the "not requested" sentinel is
+        // reported as null - the same mapping `admin.describeGroups` has always applied.
+        authorizedOperations: null,
       })
     })
   })

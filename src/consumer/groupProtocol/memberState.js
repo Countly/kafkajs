@@ -31,15 +31,22 @@ const {
 } = MEMBER_STATES
 
 /**
- * Every state's legal predecessors, copied from `MemberState.previousValidStates`. This object is
- * the machine: `transition` is a lookup in it and the assignment predicate is derived from it, so
- * a row cannot change without both changing with it.
+ * Every state's legal predecessors, copied from `MemberState.previousValidStates` - with the one
+ * documented widening noted on the `FATAL` row. This object is the machine: `transition` is a
+ * lookup in it and the assignment predicate is derived from it, so a row cannot change without
+ * both changing with it.
  * @type {Readonly<Record<string, string[]>>}
  */
 const PREVIOUS_VALID_STATES = Object.freeze({
   [STABLE]: Object.freeze([JOINING, ACKNOWLEDGING, RECONCILING]),
   [RECONCILING]: Object.freeze([STABLE, JOINING, ACKNOWLEDGING, RECONCILING]),
   [ACKNOWLEDGING]: Object.freeze([RECONCILING]),
+  // FENCED and STALE are this client's two additions to Java's row. Java only ever learns a fatal
+  // error from a heartbeat response, and a fenced or stale member sends none; this client also
+  // routes a commit or a fetch failure through `onMembershipError`, so it can learn of an
+  // unsupported assignor while fenced. Without the two edges that error would be recorded and
+  // never acted on, and the member would rejoin straight back into it.
+  // @see https://github.com/apache/kafka/blob/4.3/clients/src/main/java/org/apache/kafka/clients/consumer/internals/MemberState.java
   [FATAL]: Object.freeze([
     JOINING,
     STABLE,
@@ -48,6 +55,8 @@ const PREVIOUS_VALID_STATES = Object.freeze({
     PREPARE_LEAVING,
     LEAVING,
     UNSUBSCRIBED,
+    FENCED,
+    STALE,
   ]),
   [FENCED]: Object.freeze([JOINING, STABLE, RECONCILING, ACKNOWLEDGING, PREPARE_LEAVING, LEAVING]),
   [JOINING]: Object.freeze([FENCED, UNSUBSCRIBED, STALE]),

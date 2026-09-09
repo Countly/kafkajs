@@ -19,6 +19,25 @@ describe('Protocol > Requests', () => {
       })
     })
   })
+  // SF-20: the version factories of the two group APIs added in 6B destructured their options
+  // object with no default, so a shape probe - reading an api key, name and version without
+  // building a real request - threw where `ListGroups` returns.
+  describe('a shape-only request, built with no options', () => {
+    const PROBEABLE = ['ConsumerGroupHeartbeat', 'ConsumerGroupDescribe', 'ListGroups']
+
+    PROBEABLE.forEach((apiName) => {
+      requests[apiName].versions.forEach((version) => {
+        test(`${apiName} > v${version}`, () => {
+          const { request } = requests[apiName].protocol({ version })()
+
+          expect(request.apiKey).toEqual(apiKeys[apiName])
+          expect(request.apiVersion).toEqual(Number(version))
+          expect(request.apiName).toEqual(apiName)
+        })
+      })
+    })
+  })
+
   describe('lookup', () => {
     describe('when the client support more versions than the server', () => {
       it('returns the maximum version supported by the server', async () => {

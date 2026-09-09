@@ -1,5 +1,6 @@
 const { Kafka } = require('../../../index')
 const createConsumer = require('../index')
+const ConsumerGroupProtocol = require('../groupProtocol/consumer')
 const {
   KafkaJSNonRetriableError,
   KafkaJSProtocolError,
@@ -118,6 +119,30 @@ describe('Consumer > configuration > groupProtocol', () => {
     expect(() =>
       kafka().consumer({ groupId: 'group-a', groupProtocol: 'consumer', groupRemoteAssignor: '' })
     ).toThrow('Argument "groupRemoteAssignor" must be a non-empty string')
+  })
+
+  // MF-4: `null` IS the documented default ("let the coordinator pick its first configured
+  // assignor"), so writing it down must not make a consumer unconstructible under either
+  // protocol - and a `null` threaded from an optional config value must not either.
+  it.each([
+    ['classic', {}],
+    ['consumer', { groupProtocol: 'consumer' }],
+  ])('treats a null groupRemoteAssignor as "not set" under %s', (_protocol, extra) => {
+    expect(() =>
+      kafka().consumer({ groupId: 'group-a', groupRemoteAssignor: null, ...extra })
+    ).not.toThrow()
+  })
+
+  it('asks the coordinator for no named assignor when the value is null', () => {
+    const membership = new ConsumerGroupProtocol({
+      cluster: fakeCluster(),
+      groupId: 'group-a',
+      logger: newLogger(),
+      serverAssignor: null,
+    })
+
+    expect(membership.serverAssignor).toBeNull()
+    expect(membership.groupProtocol).toEqual('')
   })
 
   // The rule the object-literal rebuild in src/index.js would otherwise break.
@@ -303,6 +328,43 @@ describe('Consumer > onCrash > a fatal membership error', () => {
     })
 
     expect(crashes[0].restart).toBe(false)
+    await consumer.disconnect()
+  })
+
+  // SF-6: the error contract already called 30 and 42 fatal for a consumer-protocol member; the
+  // runner and this override were gated on the narrower exported predicate, so such a member
+  // crashed and was then restarted straight back into the same failure for ever.
+  it.each([
+    [30, 'GROUP_AUTHORIZATION_FAILED'],
+    [42, 'INVALID_REQUEST'],
+  ])(
+    'emits CRASH with restart: false for code %i (%s) under the consumer protocol',
+    async (code) => {
+      const { consumer, cluster, crashes } = await crashWith(
+        new KafkaJSProtocolError(createErrorFromCode(code)),
+        { restartOnFailure: async () => true }
+      )
+
+      expect(crashes).toHaveLength(1)
+      expect(crashes[0].restart).toBe(false)
+
+      await sleep(200)
+      expect(cluster.connect).toHaveBeenCalledTimes(1)
+
+      await consumer.disconnect()
+    }
+  )
+
+  it('leaves a classic member answered 30 restarting, exactly as it did', async () => {
+    const { consumer, cluster, crashes } = await crashWith(
+      new KafkaJSProtocolError(createErrorFromCode(30)),
+      { groupProtocol: 'classic', restartOnFailure: async () => true }
+    )
+
+    expect(crashes).toHaveLength(1)
+    expect(crashes[0].restart).toBe(true)
+    await waitFor(() => cluster.connect.mock.calls.length > 1, { delay: 10, maxWait: 2000 })
+
     await consumer.disconnect()
   })
 

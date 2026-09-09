@@ -9,7 +9,7 @@ const versions = {
     subscribedTopicNames,
     serverAssignor,
     topicPartitions,
-  }) => {
+  } = {}) => {
     const request = require('./v0/request')
     const response = require('./v0/response')
     return {
@@ -38,7 +38,7 @@ const versions = {
     subscribedTopicRegex,
     serverAssignor,
     topicPartitions,
-  }) => {
+  } = {}) => {
     const request = require('./v1/request')
     const response = require('./v1/response')
     return {

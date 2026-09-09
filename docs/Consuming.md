@@ -626,12 +626,13 @@ kafka.consumer({
 
 > **Experimental** - This feature may be removed or changed in new versions of KafkaJS
 
-Returns metadata for the configured consumer group, example:
+Returns metadata for the configured consumer group. It is routed exactly as [`admin.describeGroups`](Admin.md#describe-groups) is, so a group running either membership protocol describes itself correctly and both return the same row shape:
 
 ```javascript
 const data = await consumer.describeGroup()
 // {
 //  errorCode: 0,
+//  errorMessage: null,
 //  groupId: 'consumer-group-id-f104efb0e1044702e5f6',
 //  members: [
 //    {
@@ -640,13 +641,28 @@ const data = await consumer.describeGroup()
 //      memberAssignment: Buffer,
 //      memberId: 'test-3e93246fe1f4efa7380a-ff87d06d-5c87-49b8-a1f1-c4f8e3ffe7eb',
 //      memberMetadata: Buffer,
+//      groupInstanceId: null,
+//      rackId: null,
+//      memberEpoch: null,
+//      assignment: [{ topic: 'topic-a', partitions: [0, 1] }],
+//      targetAssignment: null,
+//      memberType: null,
+//      subscribedTopics: [],
+//      subscribedTopicRegex: null,
 //    },
 //  ],
 //  protocol: 'RoundRobinAssigner',
 //  protocolType: 'consumer',
 //  state: 'Stable',
+//  groupType: 'classic',
+//  groupEpoch: null,
+//  assignmentEpoch: null,
+//  assignorName: null,
+//  authorizedOperations: null,
 // },
 ```
+
+Under `groupProtocol: 'consumer'` the same call is answered by `ConsumerGroupDescribe`, so `groupType` is `'consumer'`, `groupEpoch`/`assignmentEpoch`/`assignorName` carry the coordinator's values, `protocol` is the server-side assignor's name, and each member carries its `memberEpoch`, `assignment`, `targetAssignment`, `subscribedTopics` and `subscribedTopicRegex`. `authorizedOperations` is `null` unless authorized operations were requested. See [Admin: describe groups](Admin.md#describe-groups) for the full field list.
 
 ## <a name="compression"></a> Compression
 

@@ -52,26 +52,24 @@ describe('Protocol > Requests > Metadata > v10', () => {
     expect(decoder.canReadBytes(1)).toBe(false)
   })
 
-  test('writes a topic id with a null name', async () => {
-    const { buffer } = await RequestV10Protocol({
-      topics: [{ topicId: TOPIC_ID }],
-    }).encode()
-    const decoder = new Decoder(buffer)
-    const topics = decoder.readUVarIntArray((d) => {
-      const topic = { topicId: d.readUuid(), name: d.readUVarIntString() }
-      d.readTaggedFields()
-      return topic
-    })
-
-    expect(topics).toEqual([{ topicId: TOPIC_ID, name: null }])
+  test('refuses a topic identified by id: the server reads TopicId only from v12', async () => {
+    // MetadataRequest.json: "Versions 10 and 11 should not use the topicId field or set topic
+    // name to null. Version 12 supports topic Id."
+    await expect(RequestV10Protocol({ topics: [{ topicId: TOPIC_ID }] }).encode()).rejects.toThrow(
+      'Metadata v10 cannot request a topic by id'
+    )
   })
 
-  test('never asks a broker to auto-create a topic it identified only by id', async () => {
-    // A topic requested by id carries no name, and a broker only auto-creates topics requested
-    // BY NAME - so the flag cannot apply, and sending `true` would only be misleading.
+  test('refuses a mixed list too, rather than encoding half of it', async () => {
+    await expect(
+      RequestV10Protocol({ topics: ['test-topic', { topicId: TOPIC_ID }] }).encode()
+    ).rejects.toThrow('Metadata v10 cannot request a topic by id')
+  })
+
+  test('carries allowAutoTopicCreation through for a list of names', async () => {
     const { buffer } = await RequestV10Protocol({
-      topics: [{ topicId: TOPIC_ID }],
-      allowAutoTopicCreation: true,
+      topics: ['test-topic'],
+      allowAutoTopicCreation: false,
     }).encode()
     const decoder = new Decoder(buffer)
     decoder.readUVarIntArray((d) => {
@@ -81,27 +79,5 @@ describe('Protocol > Requests > Metadata > v10', () => {
     })
 
     expect(decoder.readBoolean()).toBe(false)
-  })
-
-  test('leaves the flag alone when any topic is named', async () => {
-    // The rule is about a request that CANNOT create anything, not about mixed requests: one
-    // named topic in the list is one topic the broker could auto-create.
-    const { buffer } = await RequestV10Protocol({
-      topics: ['test-topic', { topicId: TOPIC_ID }],
-      allowAutoTopicCreation: true,
-    }).encode()
-    const decoder = new Decoder(buffer)
-    const topics = decoder.readUVarIntArray((d) => {
-      const topic = { topicId: d.readUuid(), name: d.readUVarIntString() }
-      d.readTaggedFields()
-      return topic
-    })
-
-    // A by-name topic writes the all-zero "no uuid" sentinel, which `readUuid` reads back as null.
-    expect(topics).toEqual([
-      { topicId: null, name: 'test-topic' },
-      { topicId: TOPIC_ID, name: null },
-    ])
-    expect(decoder.readBoolean()).toBe(true)
   })
 })
