@@ -7,9 +7,16 @@
  * design; this is what proves it does not keep it forever.
  *
  * Usage: node --expose-gc scripts/benchmarks/rebalanceStorm.js [--rounds 200] [--partitions 6]
- * Prints one JSON line:
- *   { rounds, partitions, samples: [{ round, heapUsedBytes }], deltaBytes, slopeBytesPerRound,
- *     ceilingBytes, withinCeiling, slopeGateBytesPerRound, withinSlopeGate }
+ *          [--group-protocol classic|consumer]
+ * Prints one JSON line on stdout:
+ *   { groupProtocol, rounds, partitions, samples: [{ round, heapUsedBytes }], deltaBytes,
+ *     slopeBytesPerRound, ceilingBytes, withinCeiling, slopeGateBytesPerRound, withinSlopeGate }
+ * and one progress line per 20 rounds on stderr, so a 200-round run is never silent for the whole
+ * of its wall time while the single result line on stdout stays parseable.
+ *
+ * `--group-protocol` selects the membership protocol: `classic` keeps the cooperative-sticky
+ * assigner the storm was written for, `consumer` is the KIP-848 ConsumerGroupHeartbeat
+ * reconciliation, where the coordinator assigns.
  *
  * Gate: the LAST-THIRD slope must be at most 32 KB per round. The total delta is recorded against
  * an 8 MB ceiling but is not the gate: a one-off allocation early in the run is not a leak, and a
@@ -22,17 +29,44 @@ const arg = (name, fallback) => {
   return i === -1 ? fallback : Number(process.argv[i + 1])
 }
 
+const stringArg = (name, fallback) => {
+  const i = process.argv.indexOf(`--${name}`)
+  return i === -1 ? fallback : process.argv[i + 1]
+}
+
 const ROUNDS = arg('rounds', 200)
 const PARTITIONS = arg('partitions', 6)
+const GROUP_PROTOCOL = stringArg('group-protocol', 'classic')
 const SAMPLES = 5
 const CEILING_BYTES = 8 * 1024 * 1024
 const SLOPE_GATE_BYTES_PER_ROUND = 32 * 1024
 const ROUND_TIMEOUT_MS = 60000
+const PROGRESS_EVERY_ROUNDS = 20
 
 if (typeof global.gc !== 'function') {
   console.error('run with: node --expose-gc scripts/benchmarks/rebalanceStorm.js')
   process.exit(1)
 }
+
+if (GROUP_PROTOCOL !== 'classic' && GROUP_PROTOCOL !== 'consumer') {
+  console.error(`--group-protocol must be classic or consumer, got ${GROUP_PROTOCOL}`)
+  process.exit(1)
+}
+
+/**
+ * The classic arm's membership options: the storm is a cooperative scenario by construction.
+ * @returns {object} consumer options
+ */
+const classicMembershipOptions = () => ({
+  groupProtocol: 'classic',
+  partitionAssigners: [PartitionAssigners.cooperativeSticky],
+})
+
+// The assigner choice only means anything under the classic protocol: a KIP-848 group is assigned
+// by the coordinator, and passing `partitionAssigners` alongside it throws at construction.
+// @see https://cwiki.apache.org/confluence/display/KAFKA/KIP-848%3A+The+Next+Generation+of+the+Consumer+Rebalance+Protocol
+const membershipOptions =
+  GROUP_PROTOCOL === 'consumer' ? { groupProtocol: 'consumer' } : classicMembershipOptions()
 
 /**
  * Creates the run's topic and waits for its leaders, so the first fetch is not a metadata retry.
@@ -78,10 +112,7 @@ const deleteTopic = async (kafka, topic) => {
  * @returns {Promise<void>}
  */
 const oneRound = async (kafka, groupId, topic, nextJoin) => {
-  const second = kafka.consumer({
-    groupId,
-    partitionAssigners: [PartitionAssigners.cooperativeSticky],
-  })
+  const second = kafka.consumer({ groupId, ...membershipOptions })
   await second.connect()
   await second.subscribe({ topic, fromBeginning: false })
   const joined = nextJoin()
@@ -131,10 +162,7 @@ const slope = (points) => {
   const groupId = `bench-rebalance-storm-${Date.now()}`
   await createTopic(kafka, topic)
 
-  const first = kafka.consumer({
-    groupId,
-    partitionAssigners: [PartitionAssigners.cooperativeSticky],
-  })
+  const first = kafka.consumer({ groupId, ...membershipOptions })
 
   // The first member's GROUP_JOIN is the round's clock: each half of a round waits for the next
   // one, so a round ends when the group has actually rebalanced.
@@ -189,6 +217,13 @@ const slope = (points) => {
       if (sampleAt.has(round)) {
         samples.push({ round, heapUsedBytes: sampleHeap() })
       }
+      if (round % PROGRESS_EVERY_ROUNDS === 0) {
+        console.error(
+          JSON.stringify({
+            progress: { round, rounds: ROUNDS, heapUsedBytes: process.memoryUsage().heapUsed },
+          })
+        )
+      }
     }
 
     const deltaBytes = samples[samples.length - 1].heapUsedBytes - samples[0].heapUsedBytes
@@ -199,6 +234,7 @@ const slope = (points) => {
 
     console.log(
       JSON.stringify({
+        groupProtocol: GROUP_PROTOCOL,
         rounds: ROUNDS,
         partitions: PARTITIONS,
         samples,

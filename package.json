@@ -45,6 +45,7 @@
     "test:coverage": "npm run test:kafka -- \"jest --ci --coverage --maxWorkers=4 --forceExit\"",
     "test:kafka": "./scripts/testWithKafka.sh",
     "bench:rebalance-storm": "node --expose-gc scripts/benchmarks/rebalanceStorm.js",
+    "bench:rebalance-storm:consumer": "node --expose-gc scripts/benchmarks/rebalanceStorm.js --group-protocol consumer",
     "test:group:broker": "jest --forceExit --testPathPatterns 'src/broker/.*'",
     "test:group:admin": "jest --forceExit --testPathPatterns 'src/admin/.*'",
     "test:group:producer": "jest --forceExit --testPathPatterns 'src/producer/.*'",

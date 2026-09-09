@@ -314,3 +314,5 @@ Adopted upstream PRs are credited here by number as they land (Phase 2 onward).
 
 - The rebalance-storm, poll-guard, long-handler and Java-interop end-to-end scenarios now run under both group protocols, and the Java interop member joins with the consumer protocol under the two server assignors. The cooperative rolling-upgrade scenario stays classic-only; the classic-to-consumer migration has its own scenario.
 
+- The rebalance-latency and rebalance-storm benchmarks take `--group-protocol classic|consumer`, so both membership protocols are measured with the same script; the storm streams one progress line per 20 rounds.
+

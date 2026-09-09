@@ -3,13 +3,19 @@
  * rebalance waits for its next batch on that partition.
  *
  * Usage: node scripts/benchmarks/rebalanceLatency.js [--partitions 6] [--runs 7]
- *          [--timeout <ms>] [--protocol eager|cooperative]
+ *          [--timeout <ms>] [--protocol eager|cooperative] [--group-protocol classic|consumer]
  * Prints one JSON line:
- *   { protocol, partitions, members, runs, groupInitialRebalanceDelayMs, samplesMs, medianMs }
+ *   { groupProtocol, protocol, partitions, members, runs, groupInitialRebalanceDelayMs, samplesMs,
+ *     medianMs }
  *
  * `--protocol` selects the assigner: `eager` leaves the client defaults in place, `cooperative`
  * configures every member with `PartitionAssigners.cooperativeSticky`, so the two arms measure the
- * same thing under the two rebalance protocols.
+ * same thing under the two rebalance protocols. It only means anything under the classic membership
+ * protocol.
+ *
+ * `--group-protocol` selects the membership protocol: `classic` is JoinGroup/SyncGroup with a
+ * client-side assigner, `consumer` is the KIP-848 ConsumerGroupHeartbeat reconciliation, where the
+ * coordinator assigns and passing `partitionAssigners` alongside it is rejected at construction.
  *
  * Only a partition held BOTH before and after the round is measured. A partition that moves
  * measures reassignment, and a first-ever assignment measures group formation; neither is the
@@ -38,6 +44,7 @@ const stringArg = (name, fallback) => {
 const PARTITIONS = arg('partitions', 6)
 const RUNS = arg('runs', 7)
 const PROTOCOL = stringArg('protocol', 'eager')
+const GROUP_PROTOCOL = stringArg('group-protocol', 'classic')
 const TIMEOUT_MS = arg('timeout', 60000)
 const MEMBERS = 2
 const PRODUCE_INTERVAL_MS = 50
@@ -46,6 +53,28 @@ const PRODUCE_INTERVAL_MS = 50
 // 3000, which would dominate every sample. Recorded so a number measured elsewhere is comparable.
 // @see https://kafka.apache.org/documentation/#brokerconfigs_group.initial.rebalance.delay.ms
 const GROUP_INITIAL_REBALANCE_DELAY_MS = arg('initial-rebalance-delay', 0)
+
+if (GROUP_PROTOCOL !== 'classic' && GROUP_PROTOCOL !== 'consumer') {
+  console.error(`--group-protocol must be classic or consumer, got ${GROUP_PROTOCOL}`)
+  process.exit(1)
+}
+
+/**
+ * The classic arm's membership options; `--protocol cooperative` is the only thing that changes.
+ * @returns {object} consumer options
+ */
+const classicMembershipOptions = () => ({
+  groupProtocol: 'classic',
+  ...(PROTOCOL === 'cooperative'
+    ? { partitionAssigners: [PartitionAssigners.cooperativeSticky] }
+    : {}),
+})
+
+// The assigner choice only means anything under the classic protocol: a KIP-848 group is assigned
+// by the coordinator, and passing `partitionAssigners` alongside it throws at construction.
+// @see https://cwiki.apache.org/confluence/display/KAFKA/KIP-848%3A+The+Next+Generation+of+the+Consumer+Rebalance+Protocol
+const membershipOptions =
+  GROUP_PROTOCOL === 'consumer' ? { groupProtocol: 'consumer' } : classicMembershipOptions()
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
 const median = (values) => [...values].sort((a, b) => a - b)[Math.floor(values.length / 2)]
@@ -120,9 +149,9 @@ const startFeeding = (producer, topic) => {
  */
 const measureOnce = async (kafka, topic, run) => {
   const groupId = `bench-rebalance-latency-${Date.now()}-${run}`
-  const assigners =
-    PROTOCOL === 'cooperative' ? { partitionAssigners: [PartitionAssigners.cooperativeSticky] } : {}
-  const consumers = Array.from({ length: MEMBERS }, () => kafka.consumer({ groupId, ...assigners }))
+  const consumers = Array.from({ length: MEMBERS }, () =>
+    kafka.consumer({ groupId, ...membershipOptions })
+  )
   const [first, second] = consumers
 
   let heldBefore = new Set()
@@ -216,6 +245,7 @@ const measureOnce = async (kafka, topic, run) => {
 
     console.log(
       JSON.stringify({
+        groupProtocol: GROUP_PROTOCOL,
         protocol: PROTOCOL,
         partitions: PARTITIONS,
         members: MEMBERS,
