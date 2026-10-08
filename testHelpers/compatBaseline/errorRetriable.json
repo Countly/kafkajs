@@ -1,0 +1,672 @@
+[
+  {
+    "code": -1,
+    "type": "UNKNOWN",
+    "retriable": false
+  },
+  {
+    "code": 1,
+    "type": "OFFSET_OUT_OF_RANGE",
+    "retriable": false
+  },
+  {
+    "code": 2,
+    "type": "CORRUPT_MESSAGE",
+    "retriable": true
+  },
+  {
+    "code": 3,
+    "type": "UNKNOWN_TOPIC_OR_PARTITION",
+    "retriable": true
+  },
+  {
+    "code": 4,
+    "type": "INVALID_FETCH_SIZE",
+    "retriable": false
+  },
+  {
+    "code": 5,
+    "type": "LEADER_NOT_AVAILABLE",
+    "retriable": true
+  },
+  {
+    "code": 6,
+    "type": "NOT_LEADER_FOR_PARTITION",
+    "retriable": true
+  },
+  {
+    "code": 7,
+    "type": "REQUEST_TIMED_OUT",
+    "retriable": true
+  },
+  {
+    "code": 8,
+    "type": "BROKER_NOT_AVAILABLE",
+    "retriable": false
+  },
+  {
+    "code": 9,
+    "type": "REPLICA_NOT_AVAILABLE",
+    "retriable": true
+  },
+  {
+    "code": 10,
+    "type": "MESSAGE_TOO_LARGE",
+    "retriable": false
+  },
+  {
+    "code": 11,
+    "type": "STALE_CONTROLLER_EPOCH",
+    "retriable": false
+  },
+  {
+    "code": 12,
+    "type": "OFFSET_METADATA_TOO_LARGE",
+    "retriable": false
+  },
+  {
+    "code": 13,
+    "type": "NETWORK_EXCEPTION",
+    "retriable": true
+  },
+  {
+    "code": 14,
+    "type": "GROUP_LOAD_IN_PROGRESS",
+    "retriable": true
+  },
+  {
+    "code": 15,
+    "type": "GROUP_COORDINATOR_NOT_AVAILABLE",
+    "retriable": true
+  },
+  {
+    "code": 16,
+    "type": "NOT_COORDINATOR_FOR_GROUP",
+    "retriable": true
+  },
+  {
+    "code": 17,
+    "type": "INVALID_TOPIC_EXCEPTION",
+    "retriable": false
+  },
+  {
+    "code": 18,
+    "type": "RECORD_LIST_TOO_LARGE",
+    "retriable": false
+  },
+  {
+    "code": 19,
+    "type": "NOT_ENOUGH_REPLICAS",
+    "retriable": true
+  },
+  {
+    "code": 20,
+    "type": "NOT_ENOUGH_REPLICAS_AFTER_APPEND",
+    "retriable": true
+  },
+  {
+    "code": 21,
+    "type": "INVALID_REQUIRED_ACKS",
+    "retriable": false
+  },
+  {
+    "code": 22,
+    "type": "ILLEGAL_GENERATION",
+    "retriable": false
+  },
+  {
+    "code": 23,
+    "type": "INCONSISTENT_GROUP_PROTOCOL",
+    "retriable": false
+  },
+  {
+    "code": 24,
+    "type": "INVALID_GROUP_ID",
+    "retriable": false
+  },
+  {
+    "code": 25,
+    "type": "UNKNOWN_MEMBER_ID",
+    "retriable": false
+  },
+  {
+    "code": 26,
+    "type": "INVALID_SESSION_TIMEOUT",
+    "retriable": false
+  },
+  {
+    "code": 27,
+    "type": "REBALANCE_IN_PROGRESS",
+    "retriable": false
+  },
+  {
+    "code": 28,
+    "type": "INVALID_COMMIT_OFFSET_SIZE",
+    "retriable": false
+  },
+  {
+    "code": 29,
+    "type": "TOPIC_AUTHORIZATION_FAILED",
+    "retriable": false
+  },
+  {
+    "code": 30,
+    "type": "GROUP_AUTHORIZATION_FAILED",
+    "retriable": false
+  },
+  {
+    "code": 31,
+    "type": "CLUSTER_AUTHORIZATION_FAILED",
+    "retriable": false
+  },
+  {
+    "code": 32,
+    "type": "INVALID_TIMESTAMP",
+    "retriable": false
+  },
+  {
+    "code": 33,
+    "type": "UNSUPPORTED_SASL_MECHANISM",
+    "retriable": false
+  },
+  {
+    "code": 34,
+    "type": "ILLEGAL_SASL_STATE",
+    "retriable": false
+  },
+  {
+    "code": 35,
+    "type": "UNSUPPORTED_VERSION",
+    "retriable": false
+  },
+  {
+    "code": 36,
+    "type": "TOPIC_ALREADY_EXISTS",
+    "retriable": false
+  },
+  {
+    "code": 37,
+    "type": "INVALID_PARTITIONS",
+    "retriable": false
+  },
+  {
+    "code": 38,
+    "type": "INVALID_REPLICATION_FACTOR",
+    "retriable": false
+  },
+  {
+    "code": 39,
+    "type": "INVALID_REPLICA_ASSIGNMENT",
+    "retriable": false
+  },
+  {
+    "code": 40,
+    "type": "INVALID_CONFIG",
+    "retriable": false
+  },
+  {
+    "code": 41,
+    "type": "NOT_CONTROLLER",
+    "retriable": true
+  },
+  {
+    "code": 42,
+    "type": "INVALID_REQUEST",
+    "retriable": false
+  },
+  {
+    "code": 43,
+    "type": "UNSUPPORTED_FOR_MESSAGE_FORMAT",
+    "retriable": false
+  },
+  {
+    "code": 44,
+    "type": "POLICY_VIOLATION",
+    "retriable": false
+  },
+  {
+    "code": 45,
+    "type": "OUT_OF_ORDER_SEQUENCE_NUMBER",
+    "retriable": false
+  },
+  {
+    "code": 46,
+    "type": "DUPLICATE_SEQUENCE_NUMBER",
+    "retriable": false
+  },
+  {
+    "code": 47,
+    "type": "INVALID_PRODUCER_EPOCH",
+    "retriable": false
+  },
+  {
+    "code": 48,
+    "type": "INVALID_TXN_STATE",
+    "retriable": false
+  },
+  {
+    "code": 49,
+    "type": "INVALID_PRODUCER_ID_MAPPING",
+    "retriable": false
+  },
+  {
+    "code": 50,
+    "type": "INVALID_TRANSACTION_TIMEOUT",
+    "retriable": false
+  },
+  {
+    "code": 51,
+    "type": "CONCURRENT_TRANSACTIONS",
+    "retriable": true
+  },
+  {
+    "code": 52,
+    "type": "TRANSACTION_COORDINATOR_FENCED",
+    "retriable": false
+  },
+  {
+    "code": 53,
+    "type": "TRANSACTIONAL_ID_AUTHORIZATION_FAILED",
+    "retriable": false
+  },
+  {
+    "code": 54,
+    "type": "SECURITY_DISABLED",
+    "retriable": false
+  },
+  {
+    "code": 55,
+    "type": "OPERATION_NOT_ATTEMPTED",
+    "retriable": false
+  },
+  {
+    "code": 56,
+    "type": "KAFKA_STORAGE_ERROR",
+    "retriable": true
+  },
+  {
+    "code": 57,
+    "type": "LOG_DIR_NOT_FOUND",
+    "retriable": false
+  },
+  {
+    "code": 58,
+    "type": "SASL_AUTHENTICATION_FAILED",
+    "retriable": false
+  },
+  {
+    "code": 59,
+    "type": "UNKNOWN_PRODUCER_ID",
+    "retriable": false
+  },
+  {
+    "code": 60,
+    "type": "REASSIGNMENT_IN_PROGRESS",
+    "retriable": false
+  },
+  {
+    "code": 61,
+    "type": "DELEGATION_TOKEN_AUTH_DISABLED",
+    "retriable": false
+  },
+  {
+    "code": 62,
+    "type": "DELEGATION_TOKEN_NOT_FOUND",
+    "retriable": false
+  },
+  {
+    "code": 63,
+    "type": "DELEGATION_TOKEN_OWNER_MISMATCH",
+    "retriable": false
+  },
+  {
+    "code": 64,
+    "type": "DELEGATION_TOKEN_REQUEST_NOT_ALLOWED",
+    "retriable": false
+  },
+  {
+    "code": 65,
+    "type": "DELEGATION_TOKEN_AUTHORIZATION_FAILED",
+    "retriable": false
+  },
+  {
+    "code": 66,
+    "type": "DELEGATION_TOKEN_EXPIRED",
+    "retriable": false
+  },
+  {
+    "code": 67,
+    "type": "INVALID_PRINCIPAL_TYPE",
+    "retriable": false
+  },
+  {
+    "code": 68,
+    "type": "NON_EMPTY_GROUP",
+    "retriable": false
+  },
+  {
+    "code": 69,
+    "type": "GROUP_ID_NOT_FOUND",
+    "retriable": false
+  },
+  {
+    "code": 70,
+    "type": "FETCH_SESSION_ID_NOT_FOUND",
+    "retriable": true
+  },
+  {
+    "code": 71,
+    "type": "INVALID_FETCH_SESSION_EPOCH",
+    "retriable": true
+  },
+  {
+    "code": 72,
+    "type": "LISTENER_NOT_FOUND",
+    "retriable": true
+  },
+  {
+    "code": 73,
+    "type": "TOPIC_DELETION_DISABLED",
+    "retriable": false
+  },
+  {
+    "code": 74,
+    "type": "FENCED_LEADER_EPOCH",
+    "retriable": true
+  },
+  {
+    "code": 75,
+    "type": "UNKNOWN_LEADER_EPOCH",
+    "retriable": true
+  },
+  {
+    "code": 76,
+    "type": "UNSUPPORTED_COMPRESSION_TYPE",
+    "retriable": false
+  },
+  {
+    "code": 77,
+    "type": "STALE_BROKER_EPOCH",
+    "retriable": false
+  },
+  {
+    "code": 78,
+    "type": "OFFSET_NOT_AVAILABLE",
+    "retriable": true
+  },
+  {
+    "code": 79,
+    "type": "MEMBER_ID_REQUIRED",
+    "retriable": false
+  },
+  {
+    "code": 80,
+    "type": "PREFERRED_LEADER_NOT_AVAILABLE",
+    "retriable": true
+  },
+  {
+    "code": 81,
+    "type": "GROUP_MAX_SIZE_REACHED",
+    "retriable": false
+  },
+  {
+    "code": 82,
+    "type": "FENCED_INSTANCE_ID",
+    "retriable": false
+  },
+  {
+    "code": 83,
+    "type": "ELIGIBLE_LEADERS_NOT_AVAILABLE",
+    "retriable": true
+  },
+  {
+    "code": 84,
+    "type": "ELECTION_NOT_NEEDED",
+    "retriable": true
+  },
+  {
+    "code": 85,
+    "type": "NO_REASSIGNMENT_IN_PROGRESS",
+    "retriable": false
+  },
+  {
+    "code": 86,
+    "type": "GROUP_SUBSCRIBED_TO_TOPIC",
+    "retriable": false
+  },
+  {
+    "code": 87,
+    "type": "INVALID_RECORD",
+    "retriable": false
+  },
+  {
+    "code": 88,
+    "type": "UNSTABLE_OFFSET_COMMIT",
+    "retriable": true
+  },
+  {
+    "code": 89,
+    "type": "THROTTLING_QUOTA_EXCEEDED",
+    "retriable": true
+  },
+  {
+    "code": 90,
+    "type": "PRODUCER_FENCED",
+    "retriable": false
+  },
+  {
+    "code": 91,
+    "type": "RESOURCE_NOT_FOUND",
+    "retriable": false
+  },
+  {
+    "code": 92,
+    "type": "DUPLICATE_RESOURCE",
+    "retriable": false
+  },
+  {
+    "code": 93,
+    "type": "UNACCEPTABLE_CREDENTIAL",
+    "retriable": false
+  },
+  {
+    "code": 94,
+    "type": "INCONSISTENT_VOTER_SET",
+    "retriable": false
+  },
+  {
+    "code": 95,
+    "type": "INVALID_UPDATE_VERSION",
+    "retriable": false
+  },
+  {
+    "code": 96,
+    "type": "FEATURE_UPDATE_FAILED",
+    "retriable": false
+  },
+  {
+    "code": 97,
+    "type": "PRINCIPAL_DESERIALIZATION_FAILURE",
+    "retriable": false
+  },
+  {
+    "code": 98,
+    "type": "SNAPSHOT_NOT_FOUND",
+    "retriable": false
+  },
+  {
+    "code": 99,
+    "type": "POSITION_OUT_OF_RANGE",
+    "retriable": false
+  },
+  {
+    "code": 100,
+    "type": "UNKNOWN_TOPIC_ID",
+    "retriable": true
+  },
+  {
+    "code": 101,
+    "type": "DUPLICATE_BROKER_REGISTRATION",
+    "retriable": false
+  },
+  {
+    "code": 102,
+    "type": "BROKER_ID_NOT_REGISTERED",
+    "retriable": false
+  },
+  {
+    "code": 103,
+    "type": "INCONSISTENT_TOPIC_ID",
+    "retriable": true
+  },
+  {
+    "code": 104,
+    "type": "INCONSISTENT_CLUSTER_ID",
+    "retriable": false
+  },
+  {
+    "code": 105,
+    "type": "TRANSACTIONAL_ID_NOT_FOUND",
+    "retriable": false
+  },
+  {
+    "code": 106,
+    "type": "FETCH_SESSION_TOPIC_ID_ERROR",
+    "retriable": true
+  },
+  {
+    "code": 107,
+    "type": "INELIGIBLE_REPLICA",
+    "retriable": false
+  },
+  {
+    "code": 108,
+    "type": "NEW_LEADER_ELECTED",
+    "retriable": false
+  },
+  {
+    "code": 109,
+    "type": "OFFSET_MOVED_TO_TIERED_STORAGE",
+    "retriable": false
+  },
+  {
+    "code": 110,
+    "type": "FENCED_MEMBER_EPOCH",
+    "retriable": false
+  },
+  {
+    "code": 111,
+    "type": "UNRELEASED_INSTANCE_ID",
+    "retriable": false
+  },
+  {
+    "code": 112,
+    "type": "UNSUPPORTED_ASSIGNOR",
+    "retriable": false
+  },
+  {
+    "code": 113,
+    "type": "STALE_MEMBER_EPOCH",
+    "retriable": false
+  },
+  {
+    "code": 114,
+    "type": "MISMATCHED_ENDPOINT_TYPE",
+    "retriable": false
+  },
+  {
+    "code": 115,
+    "type": "UNSUPPORTED_ENDPOINT_TYPE",
+    "retriable": false
+  },
+  {
+    "code": 116,
+    "type": "UNKNOWN_CONTROLLER_ID",
+    "retriable": false
+  },
+  {
+    "code": 117,
+    "type": "UNKNOWN_SUBSCRIPTION_ID",
+    "retriable": false
+  },
+  {
+    "code": 118,
+    "type": "TELEMETRY_TOO_LARGE",
+    "retriable": false
+  },
+  {
+    "code": 119,
+    "type": "INVALID_REGISTRATION",
+    "retriable": false
+  },
+  {
+    "code": 120,
+    "type": "TRANSACTION_ABORTABLE",
+    "retriable": false
+  },
+  {
+    "code": 121,
+    "type": "INVALID_RECORD_STATE",
+    "retriable": false
+  },
+  {
+    "code": 122,
+    "type": "SHARE_SESSION_NOT_FOUND",
+    "retriable": true
+  },
+  {
+    "code": 123,
+    "type": "INVALID_SHARE_SESSION_EPOCH",
+    "retriable": true
+  },
+  {
+    "code": 124,
+    "type": "FENCED_STATE_EPOCH",
+    "retriable": false
+  },
+  {
+    "code": 125,
+    "type": "INVALID_VOTER_KEY",
+    "retriable": false
+  },
+  {
+    "code": 126,
+    "type": "DUPLICATE_VOTER",
+    "retriable": false
+  },
+  {
+    "code": 127,
+    "type": "VOTER_NOT_FOUND",
+    "retriable": false
+  },
+  {
+    "code": 128,
+    "type": "INVALID_REGULAR_EXPRESSION",
+    "retriable": false
+  },
+  {
+    "code": 129,
+    "type": "REBOOTSTRAP_REQUIRED",
+    "retriable": false
+  },
+  {
+    "code": 130,
+    "type": "STREAMS_INVALID_TOPOLOGY",
+    "retriable": false
+  },
+  {
+    "code": 131,
+    "type": "STREAMS_INVALID_TOPOLOGY_EPOCH",
+    "retriable": false
+  },
+  {
+    "code": 132,
+    "type": "STREAMS_TOPOLOGY_FENCED",
+    "retriable": false
+  },
+  {
+    "code": 133,
+    "type": "SHARE_SESSION_LIMIT_REACHED",
+    "retriable": true
+  }
+]

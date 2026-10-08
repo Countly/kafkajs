@@ -1,7 +1,9 @@
 module.exports = {
   verbose: !!process.env.VERBOSE,
   moduleNameMapper: {
-    testHelpers: '<rootDir>/testHelpers/index.js',
+    // Anchored: an unanchored key matches any require path that merely contains the name, so a
+    // module under testHelpers/ would resolve to the index instead of itself.
+    '^testHelpers$': '<rootDir>/testHelpers/index.js',
   },
   setupFilesAfterEnv: ['<rootDir>/testHelpers/setup.js'],
   // Only these trees hold specs; keeps stray local directories out of test discovery.

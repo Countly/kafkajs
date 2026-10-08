@@ -1,0 +1,210 @@
+[
+  {
+    "case": "defaultsExhausted",
+    "config": {},
+    "succeedOnAttempt": null,
+    "nonRetriableOnAttempt": null,
+    "outcome": {
+      "resolved": false,
+      "name": "KafkaJSNumberOfRetriesExceeded",
+      "type": "REQUEST_TIMED_OUT",
+      "retryCount": 15
+    },
+    "attempts": [
+      {
+        "retryCount": 0,
+        "retryTime": 51
+      },
+      {
+        "retryCount": 1,
+        "retryTime": 76.5
+      },
+      {
+        "retryCount": 2,
+        "retryTime": 117
+      },
+      {
+        "retryCount": 3,
+        "retryTime": 174
+      },
+      {
+        "retryCount": 4,
+        "retryTime": 261
+      },
+      {
+        "retryCount": 5,
+        "retryTime": 394.5
+      },
+      {
+        "retryCount": 6,
+        "retryTime": 588
+      },
+      {
+        "retryCount": 7,
+        "retryTime": 876
+      },
+      {
+        "retryCount": 8,
+        "retryTime": 1000
+      },
+      {
+        "retryCount": 9,
+        "retryTime": 1000
+      },
+      {
+        "retryCount": 10,
+        "retryTime": 1000
+      },
+      {
+        "retryCount": 11,
+        "retryTime": 1000
+      },
+      {
+        "retryCount": 12,
+        "retryTime": 1000
+      },
+      {
+        "retryCount": 13,
+        "retryTime": 1000
+      },
+      {
+        "retryCount": 14,
+        "retryTime": 1000
+      },
+      {
+        "retryCount": 15,
+        "retryTime": 1000
+      }
+    ],
+    "delays": [
+      51,
+      76.5,
+      117,
+      174,
+      261,
+      394.5,
+      588,
+      876,
+      1000,
+      1000,
+      1000,
+      1000,
+      1000,
+      1000,
+      1000
+    ]
+  },
+  {
+    "case": "productionDefaultsExhausted",
+    "config": {
+      "maxRetryTime": 30000,
+      "initialRetryTime": 300,
+      "factor": 0.2,
+      "multiplier": 2,
+      "retries": 5
+    },
+    "succeedOnAttempt": null,
+    "nonRetriableOnAttempt": null,
+    "outcome": {
+      "resolved": false,
+      "name": "KafkaJSNumberOfRetriesExceeded",
+      "type": "REQUEST_TIMED_OUT",
+      "retryCount": 5
+    },
+    "attempts": [
+      {
+        "retryCount": 0,
+        "retryTime": 326
+      },
+      {
+        "retryCount": 1,
+        "retryTime": 598
+      },
+      {
+        "retryCount": 2,
+        "retryTime": 1414
+      },
+      {
+        "retryCount": 3,
+        "retryTime": 2378
+      },
+      {
+        "retryCount": 4,
+        "retryTime": 4526
+      },
+      {
+        "retryCount": 5,
+        "retryTime": 9610
+      }
+    ],
+    "delays": [
+      326,
+      598,
+      1414,
+      2378,
+      4526
+    ]
+  },
+  {
+    "case": "succeedsOnThirdAttempt",
+    "config": {
+      "retries": 3,
+      "initialRetryTime": 100,
+      "factor": 0,
+      "multiplier": 3,
+      "maxRetryTime": 1000
+    },
+    "succeedOnAttempt": 3,
+    "nonRetriableOnAttempt": null,
+    "outcome": {
+      "resolved": true
+    },
+    "attempts": [
+      {
+        "retryCount": 0,
+        "retryTime": 100
+      },
+      {
+        "retryCount": 1,
+        "retryTime": 300
+      },
+      {
+        "retryCount": 2,
+        "retryTime": 900
+      }
+    ],
+    "delays": [
+      100,
+      300
+    ]
+  },
+  {
+    "case": "bailsOnNonRetriable",
+    "config": {
+      "retries": 2,
+      "initialRetryTime": 10,
+      "maxRetryTime": 20
+    },
+    "succeedOnAttempt": null,
+    "nonRetriableOnAttempt": 2,
+    "outcome": {
+      "resolved": false,
+      "name": "KafkaJSNonRetriableError",
+      "type": "INVALID_RECORD",
+      "retryCount": null
+    },
+    "attempts": [
+      {
+        "retryCount": 0,
+        "retryTime": 11
+      },
+      {
+        "retryCount": 1,
+        "retryTime": 16.5
+      }
+    ],
+    "delays": [
+      11
+    ]
+  }
+]

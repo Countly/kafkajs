@@ -1,10 +1,9 @@
 /**
- * Helpers shared by the live consumer scenarios: bounded polling, bounded teardown, and the offset
- * ledger every delivery assertion is made against.
+ * Helpers shared by the live consumer and admin scenarios: bounded polling, bounded teardown, and
+ * the offset ledger every delivery assertion is made against.
  *
- * Kept out of `testHelpers/` deliberately: `jest.config.js`'s `moduleNameMapper` rewrites any
- * request containing `testHelpers` to `testHelpers/index.js`, so a second module there cannot be
- * required by name.
+ * Kept beside the live scenarios that use it (consumer and admin) rather than under `testHelpers/`,
+ * which holds helpers shared across the test tree.
  */
 
 /** @param {number} ms @returns {Promise<void>} */

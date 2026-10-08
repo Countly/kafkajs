@@ -1,0 +1,76 @@
+{
+  "case": "leadersOutOfTopicOrder",
+  "input": {
+    "leaders": {
+      "baseline-topic-a": {
+        "0": 2,
+        "1": 1
+      },
+      "baseline-topic-b": {
+        "0": 1
+      }
+    },
+    "topicIds": {
+      "baseline-topic-a": "01020304-0506-0708-090a-0b0c0d0e0f10",
+      "baseline-topic-b": "11121314-1516-1718-191a-1b1c1d1e1f20"
+    },
+    "acks": -1,
+    "compression": 0,
+    "topicMessages": [
+      {
+        "topic": "baseline-topic-a",
+        "messages": [
+          {
+            "partition": 0,
+            "key": "key-0-0",
+            "value": "value-0-0",
+            "timestamp": 1700000000000
+          },
+          {
+            "partition": 1,
+            "key": "key-1-0",
+            "value": "value-1-0",
+            "timestamp": 1700000000000
+          }
+        ]
+      },
+      {
+        "topic": "baseline-topic-b",
+        "messages": [
+          {
+            "partition": 0,
+            "key": "key-0-0",
+            "value": "value-0-0",
+            "timestamp": 1700000000000
+          }
+        ]
+      }
+    ]
+  },
+  "metadata": [
+    {
+      "topicName": "baseline-topic-a",
+      "partition": 1,
+      "errorCode": 0,
+      "baseOffset": "1001",
+      "logAppendTime": "-1",
+      "logStartOffset": "0"
+    },
+    {
+      "topicName": "baseline-topic-b",
+      "partition": 0,
+      "errorCode": 0,
+      "baseOffset": "1000",
+      "logAppendTime": "-1",
+      "logStartOffset": "0"
+    },
+    {
+      "topicName": "baseline-topic-a",
+      "partition": 0,
+      "errorCode": 0,
+      "baseOffset": "2000",
+      "logAppendTime": "-1",
+      "logStartOffset": "0"
+    }
+  ]
+}

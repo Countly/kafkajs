@@ -1,0 +1,289 @@
+[
+  {
+    "case": "acksAllOneTopic",
+    "input": {
+      "leaders": {
+        "baseline-topic-a": {
+          "0": 1
+        }
+      },
+      "topicIds": {
+        "baseline-topic-a": "01020304-0506-0708-090a-0b0c0d0e0f10"
+      },
+      "topicMessages": [
+        {
+          "topic": "baseline-topic-a",
+          "messages": [
+            {
+              "partition": 0,
+              "key": "key-0-0",
+              "value": "value-0-0",
+              "timestamp": 1700000000000,
+              "headers": {
+                "trace-id": "baseline"
+              }
+            },
+            {
+              "partition": 0,
+              "key": "key-0-1",
+              "value": "value-0-1",
+              "timestamp": 1700000000001
+            }
+          ]
+        }
+      ],
+      "acks": -1,
+      "compression": 0
+    },
+    "requests": [
+      {
+        "nodeId": 1,
+        "apiKey": 0,
+        "apiVersion": 13,
+        "bodyHex": "00ffff00007530020102030405060708090a0b0c0d0e0f1002000000007e0000000000000000000000710000000002b9db78a50000000000010000018bcfe568000000018bcfe56801ffffffffffffffff00000000000000000002500000000e6b65792d302d301276616c75652d302d30021074726163652d696410626173656c696e652c0002020e6b65792d302d311276616c75652d302d3100000000"
+      }
+    ]
+  },
+  {
+    "case": "acksLeaderOneTopic",
+    "input": {
+      "leaders": {
+        "baseline-topic-a": {
+          "0": 1
+        }
+      },
+      "topicIds": {
+        "baseline-topic-a": "01020304-0506-0708-090a-0b0c0d0e0f10"
+      },
+      "topicMessages": [
+        {
+          "topic": "baseline-topic-a",
+          "messages": [
+            {
+              "partition": 0,
+              "key": "key-0-0",
+              "value": "value-0-0",
+              "timestamp": 1700000000000,
+              "headers": {
+                "trace-id": "baseline"
+              }
+            },
+            {
+              "partition": 0,
+              "key": "key-0-1",
+              "value": "value-0-1",
+              "timestamp": 1700000000001
+            }
+          ]
+        }
+      ],
+      "acks": 1,
+      "compression": 0
+    },
+    "requests": [
+      {
+        "nodeId": 1,
+        "apiKey": 0,
+        "apiVersion": 13,
+        "bodyHex": "00000100007530020102030405060708090a0b0c0d0e0f1002000000007e0000000000000000000000710000000002b9db78a50000000000010000018bcfe568000000018bcfe56801ffffffffffffffff00000000000000000002500000000e6b65792d302d301276616c75652d302d30021074726163652d696410626173656c696e652c0002020e6b65792d302d311276616c75652d302d3100000000"
+      }
+    ]
+  },
+  {
+    "case": "acksNoneOneTopic",
+    "input": {
+      "leaders": {
+        "baseline-topic-a": {
+          "0": 1
+        }
+      },
+      "topicIds": {
+        "baseline-topic-a": "01020304-0506-0708-090a-0b0c0d0e0f10"
+      },
+      "topicMessages": [
+        {
+          "topic": "baseline-topic-a",
+          "messages": [
+            {
+              "partition": 0,
+              "key": "key-0-0",
+              "value": "value-0-0",
+              "timestamp": 1700000000000,
+              "headers": {
+                "trace-id": "baseline"
+              }
+            },
+            {
+              "partition": 0,
+              "key": "key-0-1",
+              "value": "value-0-1",
+              "timestamp": 1700000000001
+            }
+          ]
+        }
+      ],
+      "acks": 0,
+      "compression": 0
+    },
+    "requests": [
+      {
+        "nodeId": 1,
+        "apiKey": 0,
+        "apiVersion": 13,
+        "bodyHex": "00000000007530020102030405060708090a0b0c0d0e0f1002000000007e0000000000000000000000710000000002b9db78a50000000000010000018bcfe568000000018bcfe56801ffffffffffffffff00000000000000000002500000000e6b65792d302d301276616c75652d302d30021074726163652d696410626173656c696e652c0002020e6b65792d302d311276616c75652d302d3100000000"
+      }
+    ]
+  },
+  {
+    "case": "gzipOneTopic",
+    "input": {
+      "leaders": {
+        "baseline-topic-a": {
+          "0": 1
+        }
+      },
+      "topicIds": {
+        "baseline-topic-a": "01020304-0506-0708-090a-0b0c0d0e0f10"
+      },
+      "topicMessages": [
+        {
+          "topic": "baseline-topic-a",
+          "messages": [
+            {
+              "partition": 0,
+              "key": "key-0-0",
+              "value": "value-0-0",
+              "timestamp": 1700000000000,
+              "headers": {
+                "trace-id": "baseline"
+              }
+            },
+            {
+              "partition": 0,
+              "key": "key-0-1",
+              "value": "value-0-1",
+              "timestamp": 1700000000001
+            }
+          ]
+        }
+      ],
+      "acks": -1,
+      "compression": 1
+    },
+    "requests": [
+      {
+        "nodeId": 1,
+        "apiKey": 0,
+        "apiVersion": 13,
+        "bodyHex": "00ffff00007530020102030405060708090a0b0c0d0e0f1002000000008c0100000000000000000000007f000000000271326b700001000000010000018bcfe568000000018bcfe56801ffffffffffffffff00000000000000000002626173656c696e652d677a69703a500000000e6b65792d302d301276616c75652d302d30021074726163652d696410626173656c696e652c0002020e6b65792d302d311276616c75652d302d3100000000"
+      }
+    ]
+  },
+  {
+    "case": "topicIdUnknown",
+    "input": {
+      "leaders": {
+        "baseline-topic-a": {
+          "0": 1
+        }
+      },
+      "topicIds": {},
+      "topicMessages": [
+        {
+          "topic": "baseline-topic-a",
+          "messages": [
+            {
+              "partition": 0,
+              "key": "key-0-0",
+              "value": "value-0-0",
+              "timestamp": 1700000000000,
+              "headers": {
+                "trace-id": "baseline"
+              }
+            },
+            {
+              "partition": 0,
+              "key": "key-0-1",
+              "value": "value-0-1",
+              "timestamp": 1700000000001
+            }
+          ]
+        }
+      ],
+      "acks": -1,
+      "compression": 0
+    },
+    "requests": [
+      {
+        "nodeId": 1,
+        "apiKey": 0,
+        "apiVersion": 11,
+        "bodyHex": "00ffff000075300211626173656c696e652d746f7069632d6102000000007e0000000000000000000000710000000002b9db78a50000000000010000018bcfe568000000018bcfe56801ffffffffffffffff00000000000000000002500000000e6b65792d302d301276616c75652d302d30021074726163652d696410626173656c696e652c0002020e6b65792d302d311276616c75652d302d3100000000"
+      }
+    ]
+  },
+  {
+    "case": "twoTopicsTwoBrokers",
+    "input": {
+      "leaders": {
+        "baseline-topic-a": {
+          "0": 1,
+          "1": 2
+        },
+        "baseline-topic-b": {
+          "0": 1
+        }
+      },
+      "topicIds": {
+        "baseline-topic-a": "01020304-0506-0708-090a-0b0c0d0e0f10",
+        "baseline-topic-b": "11121314-1516-1718-191a-1b1c1d1e1f20"
+      },
+      "acks": -1,
+      "compression": 0,
+      "topicMessages": [
+        {
+          "topic": "baseline-topic-a",
+          "messages": [
+            {
+              "partition": 0,
+              "key": "key-0-0",
+              "value": "value-0-0",
+              "timestamp": 1700000000000
+            },
+            {
+              "partition": 1,
+              "key": "key-1-0",
+              "value": "value-1-0",
+              "timestamp": 1700000000000
+            }
+          ]
+        },
+        {
+          "topic": "baseline-topic-b",
+          "messages": [
+            {
+              "partition": 0,
+              "key": "key-0-0",
+              "value": "value-0-0",
+              "timestamp": 1700000000000
+            }
+          ]
+        }
+      ]
+    },
+    "requests": [
+      {
+        "nodeId": 1,
+        "apiKey": 0,
+        "apiVersion": 13,
+        "bodyHex": "00ffff00007530030102030405060708090a0b0c0d0e0f100200000000550000000000000000000000480000000002dd1b93a50000000000000000018bcfe568000000018bcfe56800ffffffffffffffff000000000000000000012c0000000e6b65792d302d301276616c75652d302d300000001112131415161718191a1b1c1d1e1f200200000000550000000000000000000000480000000002dd1b93a50000000000000000018bcfe568000000018bcfe56800ffffffffffffffff000000000000000000012c0000000e6b65792d302d301276616c75652d302d3000000000"
+      },
+      {
+        "nodeId": 2,
+        "apiKey": 0,
+        "apiVersion": 13,
+        "bodyHex": "00ffff00007530020102030405060708090a0b0c0d0e0f10020000000155000000000000000000000048000000000254596c5b0000000000000000018bcfe568000000018bcfe56800ffffffffffffffff000000000000000000012c0000000e6b65792d312d301276616c75652d312d3000000000"
+      }
+    ]
+  }
+]
