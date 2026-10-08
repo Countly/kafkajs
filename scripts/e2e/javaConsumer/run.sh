@@ -1,12 +1,19 @@
 #!/bin/bash -e
 #
-# Runs one Java group member against the local test cluster, for the mixed Java/JS interop
-# scenario. The jars are downloaded into a temporary directory and are never committed.
+# Runs one Java group member, or one Java transactional member, against the local test cluster,
+# for the mixed Java/JS interop scenarios. The jars are downloaded into a temporary directory and
+# are never committed.
 #
 # Usage: scripts/e2e/javaConsumer/run.sh [--group-protocol classic|consumer] [--report-group-type] \
 #          <bootstrapServers> <groupId> <topic> <assignor> <runForMs>
 #        scripts/e2e/javaConsumer/run.sh --probe
 #        scripts/e2e/javaConsumer/run.sh --describe-group <bootstrapServers> <groupId>
+#        scripts/e2e/javaConsumer/run.sh --role transactional-producer [--abort-every <n>] \
+#          [--hold-open-ms <ms>] [--crash-after-produce] \
+#          <bootstrapServers> <transactionalId> <topic> <transactions> <recordsPerTransaction>
+#        scripts/e2e/javaConsumer/run.sh --role read-committed-consumer \
+#          <bootstrapServers> <groupId> <topic> <runForMs>
+#        scripts/e2e/javaConsumer/run.sh --role <either role> --probe
 # Requires: a JDK on PATH (javac + java), network access to Maven Central on first run.
 
 KAFKA_CLIENTS_VERSION="${KAFKA_CLIENTS_VERSION:-4.3.1}"
@@ -33,11 +40,19 @@ SLF4J_JAR="${WORK_DIR}/slf4j-api-${SLF4J_VERSION}.jar"
   -o "${SLF4J_JAR}"
 
 CP="${CLIENTS_JAR}:${SLF4J_JAR}"
-javac -cp "${CP}" -d "${WORK_DIR}" "${SRC_DIR}/JavaGroupMember.java"
+javac -cp "${CP}" -d "${WORK_DIR}" "${SRC_DIR}/JavaGroupMember.java" "${SRC_DIR}/JavaTransactionalMember.java"
+
+# --role selects the transactional member; without it the group member runs exactly as before.
+MEMBER_CLASS="JavaGroupMember"
+for arg in "$@"; do
+  if [ "${arg}" = "--role" ]; then
+    MEMBER_CLASS="JavaTransactionalMember"
+  fi
+done
 
 # --probe: download, compile and force-load only. The live spec runs this once at collection time
 # to decide whether the scenario can run at all - a missing JDK, an unreachable Maven Central or a
 # NoClassDefFoundError all fail here, before jest has built the suite, where a skip is still
-# expressible. The probe loads the consumer and the three assignors explicitly, because the JVM
-# would otherwise resolve them lazily and a classpath hole would only surface mid-run.
-exec java -cp "${CP}:${WORK_DIR}" JavaGroupMember "$@"
+# expressible. Each member loads the classes it needs explicitly, because the JVM would otherwise
+# resolve them lazily and a classpath hole would only surface mid-run.
+exec java -cp "${CP}:${WORK_DIR}" "${MEMBER_CLASS}" "$@"

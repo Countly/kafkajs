@@ -1,0 +1,115 @@
+# TV1 test arm: the three-node cluster of docker-compose.yml with the finalized feature
+# transaction.version at level 1, so the transaction protocol that predates KIP-890's second
+# part - AddPartitionsToTxn and AddOffsetsToTxn on the wire, EndTxn at v4 or lower, no epoch bump
+# per transaction - can be exercised live. Nothing in the client selects it: the client reads the
+# level from the FinalizedFeatures field of its ApiVersions response, as on any cluster. Select it
+# with COMPOSE_FILE=docker-compose.transaction-v1.yml.
+#
+# Mechanism: runtime downgrade (kafka-features.sh). The brokers start at the release's default
+# level 2, because the image formats storage itself with default features. The one-shot service
+# transactionVersionDowngrade then runs kafka-features.sh downgrade --feature
+# transaction.version=1 against the live cluster until the brokers answer: each attempt is cut off
+# after twenty seconds and followed by two seconds' rest, for at most sixty attempts, so the service
+# gives up after about twenty-two minutes however the brokers behave. The level therefore changes a
+# few seconds after the brokers first answer: a test that needs level 1 reads the finalized feature
+# and waits for it, and skips with a reason when it never arrives. The storage-format flag,
+# kafka-storage.sh format --feature transaction.version=1, is the alternative this arm does not use;
+# scripts/e2e/transactionVersionProbe.js measures whether it works on the image and reports it as
+# formatFlag. $$ is compose's escape for a literal $.
+# @see https://github.com/apache/kafka/blob/4.3/tools/src/main/java/org/apache/kafka/tools/FeatureCommand.java
+# @see https://cwiki.apache.org/confluence/display/KAFKA/KIP-890%3A+Transactions+Server-Side+Defense
+# Verified by npm run probe:transaction-version on 2026-10-08: apache/kafka:4.3.1, mechanism downgrade, FinalizedFeaturesEpoch 192, transaction.version level 1; the storage-format flag: pinned.
+# Also verified on apache/kafka:4.1.2 (FinalizedFeaturesEpoch 210).
+x-kafka-common: &kafka-common
+  image: apache/kafka:${KAFKA_VERSION:-4.3.1}
+  environment: &kafka-env
+    KAFKA_PROCESS_ROLES: 'broker,controller'
+    KAFKA_CONTROLLER_QUORUM_VOTERS: '1@kafka1:19093,2@kafka2:19093,3@kafka3:19093'
+    KAFKA_CONTROLLER_LISTENER_NAMES: 'CONTROLLER'
+    KAFKA_INTER_BROKER_LISTENER_NAME: 'INTERNAL'
+    KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: 'CONTROLLER:PLAINTEXT,INTERNAL:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT,SSL_HOST:SSL,SASL_SSL_HOST:SASL_SSL'
+    CLUSTER_ID: '9JrAXWqaTk-meTZW2p46oA'
+    KAFKA_LOG_DIRS: '/tmp/kraft-combined-logs'
+    KAFKA_AUTO_CREATE_TOPICS_ENABLE: 'true'
+    KAFKA_DEFAULT_REPLICATION_FACTOR: '2'
+    KAFKA_NUM_PARTITIONS: '2'
+    KAFKA_DELETE_TOPIC_ENABLE: 'true'
+    KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: '0'
+    KAFKA_GROUP_CONSUMER_HEARTBEAT_INTERVAL_MS: '500'
+    KAFKA_GROUP_CONSUMER_MIN_HEARTBEAT_INTERVAL_MS: '500'
+    KAFKA_GROUP_CONSUMER_SESSION_TIMEOUT_MS: '6000'
+    KAFKA_GROUP_CONSUMER_MIN_SESSION_TIMEOUT_MS: '6000'
+    KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: '2'
+    KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: '2'
+    KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: '1'
+    KAFKA_SHARE_COORDINATOR_STATE_TOPIC_REPLICATION_FACTOR: '2'
+    KAFKA_SHARE_COORDINATOR_STATE_TOPIC_MIN_ISR: '1'
+    KAFKA_CONNECTIONS_MAX_REAUTH_MS: '15000'
+    KAFKA_AUTHORIZER_CLASS_NAME: 'org.apache.kafka.metadata.authorizer.StandardAuthorizer'
+    KAFKA_ALLOW_EVERYONE_IF_NO_ACL_FOUND: 'true'
+    KAFKA_SUPER_USERS: 'User:ANONYMOUS'
+    KAFKA_SSL_KEYSTORE_LOCATION: '/etc/kafka/secrets/kafka.server.keystore.jks'
+    KAFKA_SSL_KEYSTORE_PASSWORD: 'testtest'
+    KAFKA_SSL_KEY_PASSWORD: 'testtest'
+    KAFKA_SSL_TRUSTSTORE_LOCATION: '/etc/kafka/secrets/kafka.server.truststore.jks'
+    KAFKA_SSL_TRUSTSTORE_PASSWORD: 'testtest'
+    KAFKA_SASL_ENABLED_MECHANISMS: 'PLAIN,SCRAM-SHA-256,SCRAM-SHA-512'
+    KAFKA_OPTS: '-Djava.security.auth.login.config=/etc/kafka/secrets/server-jaas.conf'
+  volumes:
+    - ./testHelpers/certs/kafka.server.keystore.jks:/etc/kafka/secrets/kafka.server.keystore.jks:ro,z
+    - ./testHelpers/certs/kafka.server.truststore.jks:/etc/kafka/secrets/kafka.server.truststore.jks:ro,z
+    - ./testHelpers/kafka/server-jaas.conf:/etc/kafka/secrets/server-jaas.conf:ro,z
+
+services:
+  kafka1:
+    <<: *kafka-common
+    hostname: kafka1
+    container_name: kafka1
+    labels: ['custom.project=kafkajs', 'custom.service=kafka1']
+    ports: ['9092:9092', '9093:9093', '9094:9094']
+    environment:
+      <<: *kafka-env
+      KAFKA_NODE_ID: '1'
+      KAFKA_LISTENERS: 'PLAINTEXT_HOST://0.0.0.0:9092,SSL_HOST://0.0.0.0:9093,SASL_SSL_HOST://0.0.0.0:9094,INTERNAL://0.0.0.0:29092,CONTROLLER://0.0.0.0:19093'
+      KAFKA_ADVERTISED_LISTENERS: 'PLAINTEXT_HOST://localhost:9092,SSL_HOST://localhost:9093,SASL_SSL_HOST://localhost:9094,INTERNAL://kafka1:29092'
+
+  kafka2:
+    <<: *kafka-common
+    hostname: kafka2
+    container_name: kafka2
+    labels: ['custom.project=kafkajs', 'custom.service=kafka2']
+    ports: ['9095:9095', '9096:9096', '9097:9097']
+    environment:
+      <<: *kafka-env
+      KAFKA_NODE_ID: '2'
+      KAFKA_LISTENERS: 'PLAINTEXT_HOST://0.0.0.0:9095,SSL_HOST://0.0.0.0:9096,SASL_SSL_HOST://0.0.0.0:9097,INTERNAL://0.0.0.0:29095,CONTROLLER://0.0.0.0:19093'
+      KAFKA_ADVERTISED_LISTENERS: 'PLAINTEXT_HOST://localhost:9095,SSL_HOST://localhost:9096,SASL_SSL_HOST://localhost:9097,INTERNAL://kafka2:29095'
+
+  kafka3:
+    <<: *kafka-common
+    hostname: kafka3
+    container_name: kafka3
+    labels: ['custom.project=kafkajs', 'custom.service=kafka3']
+    ports: ['9098:9098', '9099:9099', '9100:9100']
+    environment:
+      <<: *kafka-env
+      KAFKA_NODE_ID: '3'
+      KAFKA_LISTENERS: 'PLAINTEXT_HOST://0.0.0.0:9098,SSL_HOST://0.0.0.0:9099,SASL_SSL_HOST://0.0.0.0:9100,INTERNAL://0.0.0.0:29098,CONTROLLER://0.0.0.0:19093'
+      KAFKA_ADVERTISED_LISTENERS: 'PLAINTEXT_HOST://localhost:9098,SSL_HOST://localhost:9099,SASL_SSL_HOST://localhost:9100,INTERNAL://kafka3:29098'
+
+  # One-shot: runs the downgrade and exits. The brokers define no healthcheck, so depends_on only
+  # orders the start and the retry loop, each attempt capped by timeout, is the wait; it has no
+  # custom.project label, so waitForKafka.js and createScramCredentials.sh ignore it.
+  transactionVersionDowngrade:
+    image: apache/kafka:${KAFKA_VERSION:-4.3.1}
+    container_name: transactionVersionDowngrade
+    depends_on: [kafka1, kafka2, kafka3]
+    command:
+      - bash
+      - -c
+      - |
+        for i in $$(seq 1 60); do
+          timeout 20 /opt/kafka/bin/kafka-features.sh --bootstrap-server kafka1:29092 downgrade --feature transaction.version=1 && exit 0
+          sleep 2
+        done
+        exit 1

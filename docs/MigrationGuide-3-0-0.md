@@ -551,6 +551,10 @@ change not listed here did not change observable behavior.
   so one row shape works at every version. A deep-equality assertion against a pre-v3 row needs the
   two keys.
 
+### Phase 7 — Transactions TV2, the KIP-1050 taxonomy and producer performance
+
+The producer becomes idempotent by default and transactions move to the transaction protocol Kafka 4.x brokers speak; each change below says what you may notice and what, if anything, to do.
+
 ### TypeScript: source-breaking type changes
 
 The runtime is unchanged by these; they can fail `tsc` on an existing codebase.

@@ -7,6 +7,8 @@ build/
 *.class
 .idea/
 temp/
+# Evidence the gated end-to-end scenarios write (testHelpers/e2eEvidence.js); never committed.
+.tmp/
 jsconfig.json
 # cloned competitor repos used only for source-level comparison (upgrade-ref/lib-comparison.md)
 vendor-explore/

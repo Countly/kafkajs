@@ -1,40 +1,28 @@
-const Encoder = require('../../../encoder')
 const { decode, parse } = require('./response')
 const responseV8 = require('../v8/response')
 
 const vector = require('../fixtures/java/offsetFetchResponse-v9-basic.json')
 
+/** ThrottleTimeMs (INT32) is the body's first field. */
+const THROTTLE_TIME_OFFSET = 0
 /**
- * Builds a v9 response body; no committed vector carries a non-zero throttle or a failing code.
- * @param {object} options
- * @param {number} options.throttleTime
- * @param {number} options.errorCode group-level error code
+ * The group-level ErrorCode (INT16): ThrottleTimeMs 4, Groups 1, GroupId 1 + 10, Topics 1, Name
+ * 1 + 10, Partitions 1, PartitionIndex 4, CommittedOffset 8, CommittedLeaderEpoch 4, Metadata 1,
+ * ErrorCode 2, partition tags 1, topic tags 1.
+ */
+const GROUP_ERROR_CODE_OFFSET = 50
+
+/**
+ * The Apache vector's own bytes with one field overwritten in place, so a frame the assertions
+ * below read was written by Kafka's codec, never by this repo's encoder for its own decoder.
+ * @param {(buffer: Buffer) => void} patch
  * @returns {Buffer}
  */
-const buildResponse = ({ throttleTime = 0, errorCode = 0 } = {}) =>
-  new Encoder()
-    .writeInt32(throttleTime)
-    .writeUVarIntArray([
-      new Encoder()
-        .writeUVarIntString('test-group')
-        .writeUVarIntArray([
-          new Encoder()
-            .writeUVarIntString('test-topic')
-            .writeUVarIntArray([
-              new Encoder()
-                .writeInt32(0)
-                .writeInt64('10')
-                .writeInt32(3)
-                .writeUVarIntString(null)
-                .writeInt16(0)
-                .writeTaggedFields(),
-            ])
-            .writeTaggedFields(),
-        ])
-        .writeInt16(errorCode)
-        .writeTaggedFields(),
-    ])
-    .writeTaggedFields().buffer
+const vectorWith = (patch) => {
+  const buffer = Buffer.from(vector.hex, 'hex')
+  patch(buffer)
+  return buffer
+}
 
 describe('Protocol > Requests > OffsetFetch > v9', () => {
   test('decodes the vector the Apache 4.3.1 codec produced into the v8 shape', async () => {
@@ -63,14 +51,18 @@ describe('Protocol > Requests > OffsetFetch > v9', () => {
   })
 
   test('reports a non-zero throttle as clientSideThrottleTime (KIP-219 split)', async () => {
-    const data = await decode(buildResponse({ throttleTime: 4321 }))
+    const data = await decode(
+      vectorWith((buffer) => buffer.writeInt32BE(4321, THROTTLE_TIME_OFFSET))
+    )
 
     expect(data.throttleTime).toEqual(0)
     expect(data.clientSideThrottleTime).toEqual(4321)
   })
 
   test('throws on STALE_MEMBER_EPOCH, the code v9 exists to carry', async () => {
-    const data = await decode(buildResponse({ errorCode: 113 }))
+    const data = await decode(
+      vectorWith((buffer) => buffer.writeInt16BE(113, GROUP_ERROR_CODE_OFFSET))
+    )
 
     expect(data.errorCode).toEqual(113)
     await expect(parse(data)).rejects.toMatchObject({

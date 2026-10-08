@@ -74,8 +74,10 @@ class GroupDescriptions {
    *          every field 2.2.4 returned plus the additive ones. An id a coordinator leaves out of
    *          its answer is described through the older API rather than dropped
    * @throws {KafkaJSNumberOfRetriesExceeded} when a coordinator never settles within the retry
-   *         budget, and whatever a transport or a protocol error raises - a group-level error the
-   *         newer API reports stays on that group's row instead
+   *         budget, and whatever a transport or a protocol error raises. A group-level error the
+   *         newer API reports stays on that group's row instead; one DescribeGroups reports for an
+   *         id that fell back to it fails the call, because that API's own parse throws every
+   *         group-level code but GROUP_ID_NOT_FOUND
    */
   async describe(groupIds) {
     const described = await this.#describeByCoordinator(groupIds)
@@ -296,6 +298,9 @@ class GroupDescriptions {
   /**
    * A DescribeGroups row in the same shape, carrying the stashed key-69 error when both calls
    * reported the group unknown.
+   *
+   * Such a row carries `errorCode` 0 or GROUP_ID_NOT_FOUND (69) and nothing else: DescribeGroups'
+   * own `parse` throws every other group-level code, so the call fails before a row exists.
    * @private
    * @param {object} row
    * @param {{errorCode: number, errorMessage: string|null}} [stashed]

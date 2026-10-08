@@ -1,6 +1,9 @@
 const createAdmin = require('../index')
 const { MemberAssignment } = require('../../consumer/assignerProtocol')
 const { newLogger } = require('testHelpers')
+const {
+  parse: parseDescribeGroupsV6,
+} = require('../../protocol/requests/describeGroups/v6/response')
 
 const GROUP_ID_NOT_FOUND = 69
 const UNSUPPORTED_VERSION = 35
@@ -259,7 +262,7 @@ describe('Admin > describeGroups > routing', () => {
     })
   })
 
-  // SF-1: two ids that shared a coordinator can land on different brokers after a
+  // Two ids that shared a coordinator can land on different brokers after a
   // `__consumer_offsets` leader move. Re-pointing the whole batch at the first id's new
   // coordinator burned the budget on NOT_COORDINATOR for the other one.
   it('re-groups a batch that split across coordinators, so both ids still resolve', async () => {
@@ -296,7 +299,7 @@ describe('Admin > describeGroups > routing', () => {
     expect(asked.slice(1).sort()).toEqual([['g1'], ['g2']])
   })
 
-  // SF-2: a code instead of a group describes nothing, so its type and protocol are unknown.
+  // A code instead of a group describes nothing, so its type and protocol are unknown.
   it('does not call an errored row a consumer group', async () => {
     const cluster = stubCluster({
       consumerGroupDescribe: async ({ groupIds }) => ({
@@ -668,23 +671,26 @@ describe('Admin > describeGroups > routing', () => {
     })
   })
 
-  it('returns a classic group of another framework, error and all, without decoding its buffers', async () => {
+  it('returns a classic group of another framework as it is, without decoding its buffers', async () => {
+    const foreignAssignment = Buffer.from('not-a-consumer-assignment')
     const cluster = stubCluster({
       consumerGroupDescribe: async () => {
         const error = new Error('The broker does not support CONSUMER_GROUP_DESCRIBE')
         error.name = 'KafkaJSServerDoesNotSupportApiKey'
         throw error
       },
-      describeGroups: async ({ groupIds }) => ({
-        groups: groupIds.map((groupId) => ({
-          ...classicGroupRow(groupId),
-          protocolType: 'connect',
-          errorCode: GROUP_AUTHORIZATION_FAILED,
-          errorMessage: 'not authorized',
-          members: undefined,
-          authorizedOperations: 4,
-        })),
-      }),
+      describeGroups: async ({ groupIds }) =>
+        parseDescribeGroupsV6({
+          groups: groupIds.map((groupId) => ({
+            ...classicGroupRow(groupId),
+            protocolType: 'connect',
+            protocol: 'sessioned',
+            members: [
+              { ...classicGroupRow(groupId).members[0], memberAssignment: foreignAssignment },
+            ],
+            authorizedOperations: 4,
+          })),
+        }),
     })
     const admin = createAdmin({ logger: newLogger(), retry, cluster })
 
@@ -693,10 +699,40 @@ describe('Admin > describeGroups > routing', () => {
     expect(groups[0]).toMatchObject({
       protocolType: 'connect',
       groupType: 'classic',
-      errorCode: GROUP_AUTHORIZATION_FAILED,
-      errorMessage: 'not authorized',
+      errorCode: 0,
+      errorMessage: null,
       authorizedOperations: 4,
-      members: [],
+    })
+    expect(groups[0].members[0].memberAssignment).toBe(foreignAssignment)
+    expect(groups[0].members[0].assignment).toEqual([])
+  })
+
+  it('fails the call when DescribeGroups answers a group-level code other than GROUP_ID_NOT_FOUND', async () => {
+    // DescribeGroups' own parse throws such a code, so no classic row can carry one: the id that
+    // fell back to the older API fails the call through the retrier instead.
+    const cluster = stubCluster({
+      consumerGroupDescribe: async ({ groupIds }) => ({
+        groups: groupIds.map((groupId) => ({
+          ...consumerGroupRow(groupId),
+          errorCode: GROUP_ID_NOT_FOUND,
+          errorMessage: 'Group g1 is not a consumer group',
+        })),
+      }),
+      describeGroups: async ({ groupIds }) =>
+        parseDescribeGroupsV6({
+          groups: groupIds.map((groupId) => ({
+            ...classicGroupRow(groupId),
+            errorCode: GROUP_AUTHORIZATION_FAILED,
+            errorMessage: 'not authorized',
+          })),
+        }),
+    })
+    const admin = createAdmin({ logger: newLogger(), retry, cluster })
+
+    await expect(admin.describeGroups(['g1'])).rejects.toMatchObject({
+      name: 'KafkaJSNonRetriableError',
+      type: 'GROUP_AUTHORIZATION_FAILED',
+      code: GROUP_AUTHORIZATION_FAILED,
     })
   })
 

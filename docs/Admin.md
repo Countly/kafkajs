@@ -542,7 +542,7 @@ Two of those fields are produced by this client rather than sent by the broker, 
 Errors are reported per group id, not per call:
 
 - A group that does not exist comes back as a row in state `Dead` with `errorCode: 69` (`GROUP_ID_NOT_FOUND`) and the broker's `errorMessage`. The call resolves normally.
-- Any other group-level error — an authorization failure, for instance — is carried on that group's row as `errorCode`/`errorMessage` while the other ids come back described.
+- Any other group-level error `ConsumerGroupDescribe` reports — an authorization failure, for instance — is carried on that group's row as `errorCode`/`errorMessage` while the other ids come back described. An id that falls back to `DescribeGroups` has no such row: that API reports any code other than `GROUP_ID_NOT_FOUND` by failing the call, as it always has.
 - A coordinator that is loading or has moved is retried on the configured retry budget; a transport or coordinator error that outlives the budget still fails the call.
 - **Rows are not returned in the order you passed the ids in.** Match them by `groupId`.
 

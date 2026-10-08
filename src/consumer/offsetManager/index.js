@@ -726,17 +726,32 @@ module.exports = class OffsetManager {
     // initializeConsumerOffsets rebuilds these entries as { partition, offset } and drops every
     // other field - for every partition, not only the ones it resolved. An invalid offset here is
     // the "this partition is being reset" signal drainPendingTopicResets just wrote, so its stale
-    // epoch is deliberately not seeded.
+    // epoch is deliberately not seeded. Nor is a position that has moved off the committed offset
+    // since this request was sent: one fetcher per broker runs this over the whole assignment, so
+    // a reply can land after a record was consumed or a seek applied, and that position owns its
+    // epoch. An unknown committed epoch (-1, a commit that carried no epoch) never replaces a
+    // known one, even at the committed offset.
     for (const { topic, partitions } of consumerOffsets) {
       const epochs = this.resolvedEpochs[topic]
       if (!epochs) {
         continue
       }
 
+      const positions = this.resolvedOffsets[topic]
       for (const entry of partitions) {
         if (isInvalidOffset(entry.offset) || typeof entry.committedLeaderEpoch !== 'number') {
           continue
         }
+
+        const position = positions && positions[entry.partition]
+        if (position != null && position !== entry.offset) {
+          continue
+        }
+
+        if (entry.committedLeaderEpoch < 0 && epochs[entry.partition] >= 0) {
+          continue
+        }
+
         epochs[entry.partition] = entry.committedLeaderEpoch
       }
     }

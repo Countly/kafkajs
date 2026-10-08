@@ -361,3 +361,23 @@ Adopted upstream PRs are credited here by number as they land (Phase 2 onward).
 - The rebalance-latency and rebalance-storm benchmarks take `--group-protocol classic|consumer`, so both membership protocols are measured with the same script; the storm streams one progress line per 20 rounds.
 
 - The coverage floors are re-derived at this release. `src/consumer/groupProtocol/` gained four files, which changes the population the global aggregate is measured over, so the global numbers were re-measured across the remaining files rather than carried over. Coverage did not drop; the population changed.
+
+### Phase 7 — Transactions TV2, the KIP-1050 taxonomy and producer performance
+
+#### Behavior changes
+
+#### Fixes
+
+- A consumer's tracked leader epoch is no longer overwritten by a late committed-offset reply. Every broker a consumer fetches from resolves the group's committed offsets for the whole assignment, so after a join several `OffsetFetch` requests can be in flight at once; one answered after the consumer had already moved — consumed a record, or applied a `seek()` — replaced that position's epoch with the committed one, which is −1 for an offset committed without an epoch. `uncommittedOffsets()` then reported `leaderEpoch: -1` for a position that had a real epoch, the next commit carried it, and position validation (KIP-320) was off for that partition until it consumed again. A committed epoch now seeds a position only while that position is still the committed offset or has not been resolved yet, and an unknown committed epoch (−1) never replaces a known one.
+
+#### Additions
+
+#### Tooling
+
+- Two development-only cluster arms, each a standalone compose file selected with `COMPOSE_FILE`: `docker-compose.transaction-v1.yml` runs the usual three-node cluster and, once the brokers are up, downgrades the `transaction.version` feature to level 1 from a one-shot service, so the transaction protocol that predates KIP-890's second part can be exercised live; `docker-compose.acl.yml` enforces ACLs with a SASL principal that holds none. `npm run probe:transaction-version` brings the first arm up and asserts, from this client's own `ApiVersions` response, that the level is 1 (it also records whether formatting the storage with the feature flag would have pinned it), and `npm run probe:idempotent-authz` measures what an idempotent producer's `InitProducerId`, and a non-idempotent producer's connect and send, get on the second arm before and after a topic `WRITE` grant. None of them runs as part of `npm test`.
+
+- The development-only Java interop member gains a transactional role: `scripts/e2e/javaConsumer/run.sh --role transactional-producer` runs a Java `KafkaProducer` through committed, aborted, held-open or deliberately crashed transactions, and `--role read-committed-consumer` reads a topic at `read_committed`, each printing one JSON line per step. Without `--role` the script runs the group member exactly as before.
+
+- A test helper (`writeEvidence` from `testHelpers`) lets gated end-to-end scenarios write what they measured to `.tmp/e2e/<scenario>.jsonl`, so the evidence of a passing run survives it — a passing suite's console output does not. The two probes above use it, each appending its JSON line to `.tmp/e2e/transaction-version-probe.jsonl` and `.tmp/e2e/idempotent-authz-probe.jsonl`. `.tmp/` is ignored by git and npm.
+
+- The broker-free parts of those development scripts — the evidence writer's name and path rules, the probes' readers of an `ApiVersions` response and of a nested error code — are covered by `scripts/e2e/__tests__/e2eTooling.spec.js`, which runs in `npm run test:unit` and the unit coverage run.

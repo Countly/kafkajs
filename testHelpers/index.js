@@ -22,6 +22,7 @@ const {
 const LoggerConsole = require('../src/loggers/console')
 const { Kafka } = require('../index')
 const { createFakeSocketFactory, respondWithFrame, readRequestHeader } = require('./fakeSocket')
+const { evidencePath, writeEvidence } = require('./e2eEvidence')
 const {
   execInKafka1,
   compose,
@@ -502,6 +503,8 @@ module.exports = {
   createFakeSocketFactory,
   respondWithFrame,
   readRequestHeader,
+  evidencePath,
+  writeEvidence,
   execInKafka1,
   compose,
   stopBroker,
