@@ -1,0 +1,7 @@
+{
+  "message": "AddOffsetsToTxnRequest",
+  "version": 4,
+  "case": "basic",
+  "hex": "16746573742d7472616e73616374696f6e616c2d696400000000000003e800030b746573742d67726f757000",
+  "fields": { "transactionalId": "test-transactional-id", "producerId": "1000", "producerEpoch": 3, "groupId": "test-group" }
+}

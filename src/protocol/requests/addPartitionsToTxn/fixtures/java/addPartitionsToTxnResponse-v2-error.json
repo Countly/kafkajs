@@ -1,0 +1,7 @@
+{
+  "message": "AddPartitionsToTxnResponse",
+  "version": 2,
+  "case": "error",
+  "hex": "0000001900000001000a746573742d746f70696300000002000000000000000000020033",
+  "fields": { "throttleTime": 25, "errors": [{ "topic": "test-topic", "partitionErrors": [{ "partition": 0, "errorCode": 0 }, { "partition": 2, "errorCode": 51 }] }] }
+}

@@ -1,0 +1,7 @@
+{
+  "message": "InitProducerIdRequest",
+  "version": 5,
+  "case": "nullTransactionalId",
+  "hex": "0000007530ffffffffffffffffffff00",
+  "fields": { "transactionalId": null, "transactionTimeout": 30000, "producerId": "-1", "producerEpoch": -1 }
+}

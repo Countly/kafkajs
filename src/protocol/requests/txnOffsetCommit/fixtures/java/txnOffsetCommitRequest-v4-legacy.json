@@ -1,0 +1,7 @@
+{
+  "message": "TxnOffsetCommitRequest",
+  "version": 4,
+  "case": "legacy",
+  "hex": "16746573742d7472616e73616374696f6e616c2d69640b746573742d67726f757000000000000003e80003ffffffff0100020b746573742d746f7069630200000000000000000000000affffffff00000000",
+  "fields": { "transactionalId": "test-transactional-id", "groupId": "test-group", "producerId": "1000", "producerEpoch": 3, "generationId": -1, "memberId": "", "groupInstanceId": null, "topics": [{ "topic": "test-topic", "partitions": [{ "partition": 0, "offset": "10", "leaderEpoch": -1, "metadata": null }] }] }
+}

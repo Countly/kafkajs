@@ -1,0 +1,7 @@
+{
+  "message": "EndTxnRequest",
+  "version": 3,
+  "case": "commit",
+  "hex": "16746573742d7472616e73616374696f6e616c2d696400000000000003e800030100",
+  "fields": { "transactionalId": "test-transactional-id", "producerId": "1000", "producerEpoch": 3, "transactionResult": true }
+}

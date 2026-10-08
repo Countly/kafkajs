@@ -1,0 +1,7 @@
+{
+  "message": "InitProducerIdRequest",
+  "version": 3,
+  "case": "firstInit",
+  "hex": "16746573742d7472616e73616374696f6e616c2d696400007530ffffffffffffffffffff00",
+  "fields": { "transactionalId": "test-transactional-id", "transactionTimeout": 30000, "producerId": "-1", "producerEpoch": -1 }
+}

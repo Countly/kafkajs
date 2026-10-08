@@ -1,0 +1,7 @@
+{
+  "message": "AddPartitionsToTxnRequest",
+  "version": 2,
+  "case": "basic",
+  "hex": "0015746573742d7472616e73616374696f6e616c2d696400000000000003e8000300000001000a746573742d746f706963000000020000000000000002",
+  "fields": { "transactionalId": "test-transactional-id", "producerId": "1000", "producerEpoch": 3, "topics": [{ "topic": "test-topic", "partitions": [0, 2] }] }
+}

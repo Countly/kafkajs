@@ -1,0 +1,7 @@
+{
+  "message": "AddOffsetsToTxnResponse",
+  "version": 3,
+  "case": "error",
+  "hex": "00000019003300",
+  "fields": { "throttleTime": 25, "errorCode": 51 }
+}

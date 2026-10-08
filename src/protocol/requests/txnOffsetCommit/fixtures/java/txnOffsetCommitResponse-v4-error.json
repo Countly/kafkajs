@@ -1,0 +1,7 @@
+{
+  "message": "TxnOffsetCommitResponse",
+  "version": 4,
+  "case": "error",
+  "hex": "00000019020b746573742d746f70696302000000000016000000",
+  "fields": { "throttleTime": 25, "topics": [{ "topic": "test-topic", "partitions": [{ "partition": 0, "errorCode": 22 }] }] }
+}

@@ -1,0 +1,7 @@
+{
+  "message": "EndTxnResponse",
+  "version": 2,
+  "case": "error",
+  "hex": "00000019005a",
+  "fields": { "throttleTime": 25, "errorCode": 90 }
+}

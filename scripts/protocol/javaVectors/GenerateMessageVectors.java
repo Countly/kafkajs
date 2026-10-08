@@ -11,25 +11,34 @@ import java.util.List;
 import java.util.UUID;
 
 import org.apache.kafka.common.Uuid;
+import org.apache.kafka.common.message.AddOffsetsToTxnRequestData;
+import org.apache.kafka.common.message.AddOffsetsToTxnResponseData;
+import org.apache.kafka.common.message.AddPartitionsToTxnRequestData;
+import org.apache.kafka.common.message.AddPartitionsToTxnResponseData;
 import org.apache.kafka.common.message.ConsumerGroupDescribeRequestData;
 import org.apache.kafka.common.message.ConsumerGroupDescribeResponseData;
 import org.apache.kafka.common.message.ConsumerGroupHeartbeatRequestData;
 import org.apache.kafka.common.message.ConsumerGroupHeartbeatResponseData;
 import org.apache.kafka.common.message.DescribeGroupsRequestData;
 import org.apache.kafka.common.message.DescribeGroupsResponseData;
+import org.apache.kafka.common.message.EndTxnRequestData;
+import org.apache.kafka.common.message.EndTxnResponseData;
+import org.apache.kafka.common.message.InitProducerIdRequestData;
 import org.apache.kafka.common.message.ListGroupsRequestData;
 import org.apache.kafka.common.message.ListGroupsResponseData;
 import org.apache.kafka.common.message.OffsetCommitRequestData;
 import org.apache.kafka.common.message.OffsetCommitResponseData;
 import org.apache.kafka.common.message.OffsetFetchRequestData;
 import org.apache.kafka.common.message.OffsetFetchResponseData;
+import org.apache.kafka.common.message.TxnOffsetCommitRequestData;
+import org.apache.kafka.common.message.TxnOffsetCommitResponseData;
 import org.apache.kafka.common.protocol.ByteBufferAccessor;
 import org.apache.kafka.common.protocol.Message;
 import org.apache.kafka.common.protocol.ObjectSerializationCache;
 
 /**
- * Generates golden byte vectors for the six APIs the KIP-848 consumer protocol and its admin
- * surface need, by running Apache Kafka's own generated message codecs
+ * Generates golden byte vectors for the APIs the KIP-848 consumer protocol, its admin surface and
+ * the transaction protocol need, by running Apache Kafka's own generated message codecs
  * ({@code org.apache.kafka.common.message.*Data}) over pinned values.
  *
  * <p>Development-only: run via {@code scripts/protocol/javaVectors/runAssignors.sh messages}.
@@ -46,9 +55,21 @@ import org.apache.kafka.common.protocol.ObjectSerializationCache;
  * (compact-array null {@code 0x00} versus empty {@code 0x01}), and a null versus a present
  * {@code Assignment} struct.
  *
+ * <p>The transaction vectors cover the versions a client sends: AddPartitionsToTxn v2-v3 (the
+ * schema reserves v4+ for brokers), AddOffsetsToTxn v2-v4, EndTxn v2-v5, TxnOffsetCommit v2-v5,
+ * InitProducerId v3-v5 and OffsetFetch v7-v9. A field the schema gives no wire presence in a
+ * version ({@code 5+}, {@code 3+}) is left out of that vector's {@code fields}: the writer drops an
+ * {@code ignorable} one silently (the EndTxn response's ProducerId and ProducerEpoch below v5) and
+ * throws on a non-default value of any other (TxnOffsetCommit's GenerationId, MemberId and
+ * GroupInstanceId below v3), which is why {@code groupMetadata} starts at v3. The one exception is
+ * a TxnOffsetCommit request, whose {@code fields} always name that triple, at its defaults below
+ * v3, so one request shape serves all four versions.
+ *
  * @see <a href="https://kafka.apache.org/43/design/protocol">Kafka protocol guide</a>
  * @see <a href="https://github.com/apache/kafka/blob/4.3.1/clients/src/main/resources/common/message/ConsumerGroupHeartbeatRequest.json">ConsumerGroupHeartbeatRequest.json</a>
  * @see <a href="https://github.com/apache/kafka/blob/4.3.1/clients/src/main/resources/common/message/ConsumerGroupDescribeResponse.json">ConsumerGroupDescribeResponse.json</a>
+ * @see <a href="https://github.com/apache/kafka/blob/4.3.1/clients/src/main/resources/common/message/EndTxnResponse.json">EndTxnResponse.json</a>
+ * @see <a href="https://github.com/apache/kafka/blob/4.3.1/clients/src/main/resources/common/message/TxnOffsetCommitRequest.json">TxnOffsetCommitRequest.json</a>
  */
 public final class GenerateMessageVectors {
 
@@ -97,6 +118,24 @@ public final class GenerateMessageVectors {
   private static final String TOPIC_AUTHORIZATION_FAILED_MESSAGE = "Topic authorization failed.";
 
   private static final List<Integer> PARTITIONS = Arrays.asList(0, 2);
+
+  private static final String TRANSACTIONAL_ID = "test-transactional-id";
+  private static final int TRANSACTION_TIMEOUT_MS = 30000;
+  private static final long PRODUCER_ID = 1000L;
+  private static final short PRODUCER_EPOCH = 3;
+
+  /** The epoch an EndTxn v5 answer hands back after bumping {@link #PRODUCER_EPOCH} (KIP-890). */
+  private static final short BUMPED_PRODUCER_EPOCH = 4;
+
+  /** A non-zero throttle on every transaction-API response, so a decoder's KIP-219 split shows. */
+  private static final int TXN_THROTTLE_TIME_MS = 25;
+
+  private static final String COMMITTED_METADATA = "test-metadata";
+
+  /** The error cases' codes: CONCURRENT_TRANSACTIONS, ILLEGAL_GENERATION and PRODUCER_FENCED. */
+  private static final short CONCURRENT_TRANSACTIONS = 51;
+  private static final short ILLEGAL_GENERATION = 22;
+  private static final short PRODUCER_FENCED = 90;
 
   private GenerateMessageVectors() {}
 
@@ -160,6 +199,12 @@ public final class GenerateMessageVectors {
     vectors.addAll(describeGroups());
     vectors.addAll(offsetCommit());
     vectors.addAll(offsetFetch());
+    vectors.addAll(offsetFetchRequireStable());
+    vectors.addAll(initProducerId());
+    vectors.addAll(addPartitionsToTxn());
+    vectors.addAll(addOffsetsToTxn());
+    vectors.addAll(endTxn());
+    vectors.addAll(txnOffsetCommit());
     return vectors;
   }
 
@@ -1125,6 +1170,475 @@ public final class GenerateMessageVectors {
                                         kv("errorCode", "0"))))))))));
 
     return vectors;
+  }
+
+  /**
+   * OffsetFetch (9) v7-v9 requests, once with RequireStable and once without (KIP-447). The two
+   * of a version differ in that one boolean, the last byte before the request's tag buffer. v7
+   * names one group at the top level; v8 and v9 carry a one-element Groups list, and v9 its
+   * member fields at their wire defaults - what a classic member and an admin client send.
+   *
+   * @return the vectors
+   */
+  private static List<Vector> offsetFetchRequireStable() {
+    List<Vector> vectors = new ArrayList<>();
+    String api = "offsetFetch";
+
+    for (short version : new short[] {7, 8, 9}) {
+      for (boolean requireStable : new boolean[] {true, false}) {
+        OffsetFetchRequestData data;
+        if (version == 7) {
+          data =
+              new OffsetFetchRequestData()
+                  .setGroupId(GROUP_ID)
+                  .setTopics(
+                      Collections.singletonList(
+                          new OffsetFetchRequestData.OffsetFetchRequestTopic()
+                              .setName(TOPIC_NAME)
+                              .setPartitionIndexes(Collections.singletonList(PARTITION_INDEX))))
+                  .setRequireStable(requireStable);
+        } else {
+          data =
+              new OffsetFetchRequestData()
+                  .setGroups(
+                      Collections.singletonList(
+                          new OffsetFetchRequestData.OffsetFetchRequestGroup()
+                              .setGroupId(GROUP_ID)
+                              .setMemberId(null)
+                              .setMemberEpoch(-1)
+                              .setTopics(
+                                  Collections.singletonList(
+                                      new OffsetFetchRequestData.OffsetFetchRequestTopics()
+                                          .setName(TOPIC_NAME)
+                                          .setPartitionIndexes(
+                                              Collections.singletonList(PARTITION_INDEX))))))
+                  .setRequireStable(requireStable);
+        }
+
+        String topics =
+            array(
+                obj(
+                    kv("topic", str(TOPIC_NAME)),
+                    kv("partitions", array(obj(kv("partition", String.valueOf(PARTITION_INDEX)))))));
+        String fields =
+            version == 9
+                ? obj(
+                    kv("groupId", str(GROUP_ID)),
+                    kv("memberId", "null"),
+                    kv("memberEpoch", "-1"),
+                    kv("topics", topics),
+                    kv("requireStable", String.valueOf(requireStable)))
+                : obj(
+                    kv("groupId", str(GROUP_ID)),
+                    kv("topics", topics),
+                    kv("requireStable", String.valueOf(requireStable)));
+
+        vectors.add(
+            new Vector(api, "OffsetFetchRequest", version,
+                requireStable ? "requireStable" : "notRequireStable", data, fields));
+      }
+    }
+
+    return vectors;
+  }
+
+  /**
+   * InitProducerId (22) v3-v5 requests: a first initialization, which carries the -1/-1 defaults,
+   * a KIP-360 re-initialization, which carries the producer id and epoch the client holds, and the
+   * first initialization of a producer with no transactional id - every default producer's first
+   * InitProducerId once idempotence is the default - whose TransactionalId is the null compact
+   * string, the single byte 0x00. The first two differ in the ten bytes of producer id and epoch;
+   * the third differs from the first in the TransactionalId alone.
+   *
+   * @see <a href="https://github.com/apache/kafka/blob/4.3.1/clients/src/main/resources/common/message/InitProducerIdRequest.json">InitProducerIdRequest.json</a>
+   * @return the vectors
+   */
+  private static List<Vector> initProducerId() {
+    List<Vector> vectors = new ArrayList<>();
+    String api = "initProducerId";
+
+    for (short version : new short[] {3, 4, 5}) {
+      vectors.add(
+          initProducerIdRequest(api, version, "firstInit", TRANSACTIONAL_ID, -1L, (short) -1));
+      vectors.add(
+          initProducerIdRequest(
+              api, version, "reinit", TRANSACTIONAL_ID, PRODUCER_ID, PRODUCER_EPOCH));
+      vectors.add(
+          initProducerIdRequest(api, version, "nullTransactionalId", null, -1L, (short) -1));
+    }
+
+    return vectors;
+  }
+
+  /**
+   * One InitProducerId request vector.
+   *
+   * @param api the fixtures directory name
+   * @param version 3, 4 or 5
+   * @param caseId the case name, which is also the file name's last part
+   * @param transactionalId the transactional id, or null for a producer that is idempotent but not
+   *     transactional
+   * @param producerId the producer id the client holds, or -1 on a first initialization
+   * @param producerEpoch the producer epoch the client holds, or -1 on a first initialization
+   * @return the vector
+   */
+  private static Vector initProducerIdRequest(
+      String api, short version, String caseId, String transactionalId, long producerId,
+      short producerEpoch) {
+    return new Vector(api, "InitProducerIdRequest", version, caseId,
+        new InitProducerIdRequestData()
+            .setTransactionalId(transactionalId)
+            .setTransactionTimeoutMs(TRANSACTION_TIMEOUT_MS)
+            .setProducerId(producerId)
+            .setProducerEpoch(producerEpoch),
+        obj(
+            kv("transactionalId", str(transactionalId)),
+            kv("transactionTimeout", String.valueOf(TRANSACTION_TIMEOUT_MS)),
+            kv("producerId", str(String.valueOf(producerId))),
+            kv("producerEpoch", String.valueOf(producerEpoch))));
+  }
+
+  /**
+   * AddPartitionsToTxn (24) v2-v3, request and response - what a client sends while transaction
+   * version 2 is off. v3 is the first flexible version and the client ceiling: the schema reserves
+   * v4 and above for brokers. The request uses the {@code V3AndBelow*} fields; the response keeps
+   * one topic with two partitions, the second of which carries the error case's code.
+   *
+   * @see <a href="https://github.com/apache/kafka/blob/4.3.1/clients/src/main/resources/common/message/AddPartitionsToTxnRequest.json">AddPartitionsToTxnRequest.json</a>
+   * @return the vectors
+   */
+  private static List<Vector> addPartitionsToTxn() {
+    List<Vector> vectors = new ArrayList<>();
+    String api = "addPartitionsToTxn";
+
+    for (short version : new short[] {2, 3}) {
+      AddPartitionsToTxnRequestData.AddPartitionsToTxnTopicCollection topics =
+          new AddPartitionsToTxnRequestData.AddPartitionsToTxnTopicCollection();
+      topics.add(
+          new AddPartitionsToTxnRequestData.AddPartitionsToTxnTopic()
+              .setName(TOPIC_NAME)
+              .setPartitions(PARTITIONS));
+
+      vectors.add(
+          new Vector(api, "AddPartitionsToTxnRequest", version, "basic",
+              new AddPartitionsToTxnRequestData()
+                  .setV3AndBelowTransactionalId(TRANSACTIONAL_ID)
+                  .setV3AndBelowProducerId(PRODUCER_ID)
+                  .setV3AndBelowProducerEpoch(PRODUCER_EPOCH)
+                  .setV3AndBelowTopics(topics),
+              obj(
+                  kv("transactionalId", str(TRANSACTIONAL_ID)),
+                  kv("producerId", str(String.valueOf(PRODUCER_ID))),
+                  kv("producerEpoch", String.valueOf(PRODUCER_EPOCH)),
+                  kv("topics",
+                      array(
+                          obj(kv("topic", str(TOPIC_NAME)), kv("partitions", intArray(PARTITIONS))))))));
+
+      vectors.add(addPartitionsToTxnResponse(api, version, "ok", (short) 0));
+      vectors.add(addPartitionsToTxnResponse(api, version, "error", CONCURRENT_TRANSACTIONS));
+    }
+
+    return vectors;
+  }
+
+  /**
+   * One AddPartitionsToTxn response: one topic, two partitions, the first always clean.
+   *
+   * @param api the fixtures directory name
+   * @param version 2 or 3
+   * @param caseId the case name, which is also the file name's last part
+   * @param secondError the error code the second partition carries, 0 for none
+   * @return the vector
+   */
+  private static Vector addPartitionsToTxnResponse(
+      String api, short version, String caseId, short secondError) {
+    AddPartitionsToTxnResponseData.AddPartitionsToTxnPartitionResultCollection results =
+        new AddPartitionsToTxnResponseData.AddPartitionsToTxnPartitionResultCollection();
+    results.add(
+        new AddPartitionsToTxnResponseData.AddPartitionsToTxnPartitionResult()
+            .setPartitionIndex(PARTITIONS.get(0))
+            .setPartitionErrorCode((short) 0));
+    results.add(
+        new AddPartitionsToTxnResponseData.AddPartitionsToTxnPartitionResult()
+            .setPartitionIndex(PARTITIONS.get(1))
+            .setPartitionErrorCode(secondError));
+
+    AddPartitionsToTxnResponseData.AddPartitionsToTxnTopicResultCollection topicResults =
+        new AddPartitionsToTxnResponseData.AddPartitionsToTxnTopicResultCollection();
+    topicResults.add(
+        new AddPartitionsToTxnResponseData.AddPartitionsToTxnTopicResult()
+            .setName(TOPIC_NAME)
+            .setResultsByPartition(results));
+
+    return new Vector(api, "AddPartitionsToTxnResponse", version, caseId,
+        new AddPartitionsToTxnResponseData()
+            .setThrottleTimeMs(TXN_THROTTLE_TIME_MS)
+            .setResultsByTopicV3AndBelow(topicResults),
+        obj(
+            kv("throttleTime", String.valueOf(TXN_THROTTLE_TIME_MS)),
+            kv("errors",
+                array(
+                    obj(
+                        kv("topic", str(TOPIC_NAME)),
+                        kv("partitionErrors",
+                            array(
+                                obj(
+                                    kv("partition", String.valueOf(PARTITIONS.get(0))),
+                                    kv("errorCode", "0")),
+                                obj(
+                                    kv("partition", String.valueOf(PARTITIONS.get(1))),
+                                    kv("errorCode", String.valueOf(secondError))))))))));
+  }
+
+  /**
+   * AddOffsetsToTxn (25) v2-v4, request and response. v3 is the first flexible version; v4 only
+   * widens the error codes the broker may answer, so v3 and v4 are the same bytes.
+   *
+   * @return the vectors
+   */
+  private static List<Vector> addOffsetsToTxn() {
+    List<Vector> vectors = new ArrayList<>();
+    String api = "addOffsetsToTxn";
+
+    for (short version : new short[] {2, 3, 4}) {
+      vectors.add(
+          new Vector(api, "AddOffsetsToTxnRequest", version, "basic",
+              new AddOffsetsToTxnRequestData()
+                  .setTransactionalId(TRANSACTIONAL_ID)
+                  .setProducerId(PRODUCER_ID)
+                  .setProducerEpoch(PRODUCER_EPOCH)
+                  .setGroupId(GROUP_ID),
+              obj(
+                  kv("transactionalId", str(TRANSACTIONAL_ID)),
+                  kv("producerId", str(String.valueOf(PRODUCER_ID))),
+                  kv("producerEpoch", String.valueOf(PRODUCER_EPOCH)),
+                  kv("groupId", str(GROUP_ID)))));
+
+      for (short errorCode : new short[] {0, CONCURRENT_TRANSACTIONS}) {
+        vectors.add(
+            new Vector(api, "AddOffsetsToTxnResponse", version, errorCode == 0 ? "ok" : "error",
+                new AddOffsetsToTxnResponseData()
+                    .setThrottleTimeMs(TXN_THROTTLE_TIME_MS)
+                    .setErrorCode(errorCode),
+                obj(
+                    kv("throttleTime", String.valueOf(TXN_THROTTLE_TIME_MS)),
+                    kv("errorCode", String.valueOf(errorCode)))));
+      }
+    }
+
+    return vectors;
+  }
+
+  /**
+   * EndTxn (26) v2-v5, request and response. Commit and abort differ in the Committed byte alone.
+   * v5's response carries the producer id and epoch the coordinator moved the producer to
+   * (KIP-890): {@code producerIdAndEpoch} is a TV2 commit's answer, {@code defaults} the same
+   * success with the fields at their -1/-1 defaults - every v5 body carries both fields, they are
+   * not tagged - and {@code error} a fenced producer's answer. Below v5 the fields do not exist and
+   * {@code fields} does not name them.
+   *
+   * @see <a href="https://github.com/apache/kafka/blob/4.3.1/clients/src/main/resources/common/message/EndTxnResponse.json">EndTxnResponse.json</a>
+   * @return the vectors
+   */
+  private static List<Vector> endTxn() {
+    List<Vector> vectors = new ArrayList<>();
+    String api = "endTxn";
+
+    for (short version : new short[] {2, 3, 4, 5}) {
+      for (boolean committed : new boolean[] {true, false}) {
+        vectors.add(
+            new Vector(api, "EndTxnRequest", version, committed ? "commit" : "abort",
+                new EndTxnRequestData()
+                    .setTransactionalId(TRANSACTIONAL_ID)
+                    .setProducerId(PRODUCER_ID)
+                    .setProducerEpoch(PRODUCER_EPOCH)
+                    .setCommitted(committed),
+                obj(
+                    kv("transactionalId", str(TRANSACTIONAL_ID)),
+                    kv("producerId", str(String.valueOf(PRODUCER_ID))),
+                    kv("producerEpoch", String.valueOf(PRODUCER_EPOCH)),
+                    kv("transactionResult", String.valueOf(committed)))));
+      }
+
+      if (version < 5) {
+        vectors.add(endTxnResponse(api, version, "ok", (short) 0, -1L, (short) -1));
+        vectors.add(endTxnResponse(api, version, "error", PRODUCER_FENCED, -1L, (short) -1));
+      } else {
+        vectors.add(
+            endTxnResponse(api, version, "producerIdAndEpoch", (short) 0, PRODUCER_ID,
+                BUMPED_PRODUCER_EPOCH));
+        vectors.add(endTxnResponse(api, version, "defaults", (short) 0, -1L, (short) -1));
+        vectors.add(endTxnResponse(api, version, "error", PRODUCER_FENCED, -1L, (short) -1));
+      }
+    }
+
+    return vectors;
+  }
+
+  /**
+   * One EndTxn response. The producer id and epoch are written, and named in {@code fields}, at v5
+   * only; below v5 the writer drops them whatever the arguments are.
+   *
+   * @param api the fixtures directory name
+   * @param version 2, 3, 4 or 5
+   * @param caseId the case name, which is also the file name's last part
+   * @param errorCode the response's error code, 0 for none
+   * @param producerId the producer id the coordinator hands back, -1 for the default
+   * @param producerEpoch the producer epoch the coordinator hands back, -1 for the default
+   * @return the vector
+   */
+  private static Vector endTxnResponse(
+      String api, short version, String caseId, short errorCode, long producerId,
+      short producerEpoch) {
+    EndTxnResponseData data =
+        new EndTxnResponseData().setThrottleTimeMs(TXN_THROTTLE_TIME_MS).setErrorCode(errorCode);
+    String fields;
+
+    if (version >= 5) {
+      data.setProducerId(producerId).setProducerEpoch(producerEpoch);
+      fields =
+          obj(
+              kv("throttleTime", String.valueOf(TXN_THROTTLE_TIME_MS)),
+              kv("errorCode", String.valueOf(errorCode)),
+              kv("producerId", str(String.valueOf(producerId))),
+              kv("producerEpoch", String.valueOf(producerEpoch)));
+    } else {
+      fields =
+          obj(
+              kv("throttleTime", String.valueOf(TXN_THROTTLE_TIME_MS)),
+              kv("errorCode", String.valueOf(errorCode)));
+    }
+
+    return new Vector(api, "EndTxnResponse", version, caseId, data, fields);
+  }
+
+  /**
+   * TxnOffsetCommit (28) v2-v5, request and response. v2 adds CommittedLeaderEpoch; v3 is the first
+   * flexible version and adds the GenerationId/MemberId/GroupInstanceId triple (KIP-447), which is
+   * why v2 has a {@code leaderEpoch} case where v3-v5 have {@code groupMetadata}: Kafka's writer
+   * refuses a non-default triple at v2. {@code legacy} is what the 2.2.4-shaped
+   * {@code sendOffsets({ consumerGroupId })} sends - every new field at its default.
+   *
+   * @see <a href="https://github.com/apache/kafka/blob/4.3.1/clients/src/main/resources/common/message/TxnOffsetCommitRequest.json">TxnOffsetCommitRequest.json</a>
+   * @return the vectors
+   */
+  private static List<Vector> txnOffsetCommit() {
+    List<Vector> vectors = new ArrayList<>();
+    String api = "txnOffsetCommit";
+
+    for (short version : new short[] {2, 3, 4, 5}) {
+      vectors.add(txnOffsetCommitRequest(api, version, "legacy", -1, "", null, -1, null));
+      if (version == 2) {
+        vectors.add(
+            txnOffsetCommitRequest(api, version, "leaderEpoch", -1, "", null,
+                COMMITTED_LEADER_EPOCH, null));
+      } else {
+        vectors.add(
+            txnOffsetCommitRequest(api, version, "groupMetadata", GENERATION_ID, MEMBER_ID,
+                GROUP_INSTANCE_ID, COMMITTED_LEADER_EPOCH, COMMITTED_METADATA));
+      }
+
+      vectors.add(txnOffsetCommitResponse(api, version, "ok", (short) 0));
+      vectors.add(txnOffsetCommitResponse(api, version, "error", ILLEGAL_GENERATION));
+    }
+
+    return vectors;
+  }
+
+  /**
+   * One TxnOffsetCommit request for one partition of {@link #TOPIC_NAME}. The writer throws on a
+   * non-default {@code generationId}, {@code memberId} or {@code groupInstanceId} below v3.
+   *
+   * @param api the fixtures directory name
+   * @param version 2, 3, 4 or 5
+   * @param caseId the case name, which is also the file name's last part
+   * @param generationId the consumer group generation, -1 when the producer sends no group metadata
+   * @param memberId the consumer group member id, empty when there is no group metadata
+   * @param groupInstanceId the static member id, or null
+   * @param leaderEpoch the committed leader epoch, -1 when unknown
+   * @param metadata the committed metadata string, or null
+   * @return the vector
+   */
+  private static Vector txnOffsetCommitRequest(
+      String api, short version, String caseId, int generationId, String memberId,
+      String groupInstanceId, int leaderEpoch, String metadata) {
+    TxnOffsetCommitRequestData data =
+        new TxnOffsetCommitRequestData()
+            .setTransactionalId(TRANSACTIONAL_ID)
+            .setGroupId(GROUP_ID)
+            .setProducerId(PRODUCER_ID)
+            .setProducerEpoch(PRODUCER_EPOCH)
+            .setGenerationId(generationId)
+            .setMemberId(memberId)
+            .setGroupInstanceId(groupInstanceId)
+            .setTopics(
+                Collections.singletonList(
+                    new TxnOffsetCommitRequestData.TxnOffsetCommitRequestTopic()
+                        .setName(TOPIC_NAME)
+                        .setPartitions(
+                            Collections.singletonList(
+                                new TxnOffsetCommitRequestData.TxnOffsetCommitRequestPartition()
+                                    .setPartitionIndex(PARTITION_INDEX)
+                                    .setCommittedOffset(COMMITTED_OFFSET)
+                                    .setCommittedLeaderEpoch(leaderEpoch)
+                                    .setCommittedMetadata(metadata)))));
+
+    return new Vector(api, "TxnOffsetCommitRequest", version, caseId, data,
+        obj(
+            kv("transactionalId", str(TRANSACTIONAL_ID)),
+            kv("groupId", str(GROUP_ID)),
+            kv("producerId", str(String.valueOf(PRODUCER_ID))),
+            kv("producerEpoch", String.valueOf(PRODUCER_EPOCH)),
+            kv("generationId", String.valueOf(generationId)),
+            kv("memberId", str(memberId)),
+            kv("groupInstanceId", str(groupInstanceId)),
+            kv("topics",
+                array(
+                    obj(
+                        kv("topic", str(TOPIC_NAME)),
+                        kv("partitions",
+                            array(
+                                obj(
+                                    kv("partition", String.valueOf(PARTITION_INDEX)),
+                                    kv("offset", str(String.valueOf(COMMITTED_OFFSET))),
+                                    kv("leaderEpoch", String.valueOf(leaderEpoch)),
+                                    kv("metadata", str(metadata))))))))));
+  }
+
+  /**
+   * One TxnOffsetCommit response for one partition of {@link #TOPIC_NAME}.
+   *
+   * @param api the fixtures directory name
+   * @param version 2, 3, 4 or 5
+   * @param caseId the case name, which is also the file name's last part
+   * @param errorCode the error code the partition carries, 0 for none
+   * @return the vector
+   */
+  private static Vector txnOffsetCommitResponse(
+      String api, short version, String caseId, short errorCode) {
+    return new Vector(api, "TxnOffsetCommitResponse", version, caseId,
+        new TxnOffsetCommitResponseData()
+            .setThrottleTimeMs(TXN_THROTTLE_TIME_MS)
+            .setTopics(
+                Collections.singletonList(
+                    new TxnOffsetCommitResponseData.TxnOffsetCommitResponseTopic()
+                        .setName(TOPIC_NAME)
+                        .setPartitions(
+                            Collections.singletonList(
+                                new TxnOffsetCommitResponseData.TxnOffsetCommitResponsePartition()
+                                    .setPartitionIndex(PARTITION_INDEX)
+                                    .setErrorCode(errorCode))))),
+        obj(
+            kv("throttleTime", String.valueOf(TXN_THROTTLE_TIME_MS)),
+            kv("topics",
+                array(
+                    obj(
+                        kv("topic", str(TOPIC_NAME)),
+                        kv("partitions",
+                            array(
+                                obj(
+                                    kv("partition", String.valueOf(PARTITION_INDEX)),
+                                    kv("errorCode", String.valueOf(errorCode))))))))));
   }
 
   /**

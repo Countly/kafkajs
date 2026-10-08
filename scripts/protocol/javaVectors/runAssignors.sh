@@ -1,8 +1,8 @@
 #!/bin/bash -e
 #
 # Generates golden vectors by running Apache Kafka's own code: `assignors` (the default) runs the
-# partition assignors, `messages` runs the generated message codecs for the consumer-protocol
-# and group-visibility APIs.
+# partition assignors, `messages` runs the generated message codecs for the consumer-protocol,
+# group-visibility and transaction APIs.
 # The kafka-clients jar is downloaded into a temporary directory and is never committed.
 #
 # Usage: scripts/protocol/javaVectors/runAssignors.sh [assignors|messages] [output-dir]
@@ -13,6 +13,9 @@ SLF4J_VERSION="${SLF4J_VERSION:-1.7.36}"
 WORK_DIR="${JAVA_VECTORS_WORK_DIR:-$(mktemp -d -t kafkajs-assignor-vectors-XXXXXX)}"
 # A caller-provided work dir is a cache and is kept; a temp one is removed on exit.
 if [ -z "${JAVA_VECTORS_WORK_DIR:-}" ]; then trap 'rm -rf "${WORK_DIR}"' EXIT; fi
+# A caller-provided work dir need not exist yet; without this the first download fails with
+# curl's opaque "(23) Failure writing output to destination".
+mkdir -p "${WORK_DIR}"
 SRC_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 # Subcommand: `assignors` (the default, and what this script did before) or `messages`.

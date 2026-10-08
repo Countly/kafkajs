@@ -36,10 +36,10 @@ The jar itself is downloaded into a temporary directory and is never committed t
 — only the emitted `*_java.json` fixtures are. Re-run the script whenever a codec's fixture values
 change, and commit the regenerated files alongside the codec change.
 
-## Message vectors for the consumer-protocol and group-visibility APIs
+## Message vectors for the consumer-protocol, group-visibility and transaction APIs
 
 `scripts/protocol/javaVectors/runAssignors.sh messages` is the third entry point. It compiles
-`GenerateMessageVectors.java` against the same two jars and writes 45 fixtures under
+`GenerateMessageVectors.java` against the same two jars and writes 108 fixtures under
 `src/protocol/requests/<api>/fixtures/java/`, one per case, covering:
 
 | API | Key | Versions | Vectors |
@@ -49,7 +49,12 @@ change, and commit the regenerated files alongside the codec change.
 | ListGroups | 16 | 3, 4, 5 | 8 |
 | DescribeGroups | 15 | 3, 4, 5, 6 | 9 |
 | OffsetCommit | 8 | 9 | 2 |
-| OffsetFetch | 9 | 9 | 3 |
+| OffsetFetch | 9 | 7, 8, 9 | 9 |
+| InitProducerId | 22 | 3, 4, 5 | 9 |
+| AddPartitionsToTxn | 24 | 2, 3 | 6 |
+| AddOffsetsToTxn | 25 | 2, 3, 4 | 9 |
+| EndTxn | 26 | 2, 3, 4, 5 | 17 |
+| TxnOffsetCommit | 28 | 2, 3, 4, 5 | 16 |
 
 `runAssignors.sh` with no subcommand, or with `assignors`, does exactly what it did before, and
 `run.sh`/`GenerateVectors.java` are unchanged and still own every pre-6B vector.
@@ -73,8 +78,9 @@ directly under `<api>/fixtures/`. Each holds one case:
 `GenerationIdOrMemberEpoch`, and an int64 offset as a string — so a spec can encode from `fields`
 and compare against `hex`, and decode `hex` and compare against `fields`, in one `toEqual` each. A
 field a version does not carry is rendered as the value the decoder reports for it (`""`,
-`null`), never omitted. `memberMetadata`/`memberAssignment` travel as hex strings so they compare
-cleanly with a `Buffer`.
+`null`), never omitted — except in the transaction-API vectors, where it is left out of `fields`
+(see "What the transaction vectors pin"). `memberMetadata`/`memberAssignment` travel as hex strings
+so they compare cleanly with a `Buffer`.
 
 The topic id constant is written in canonical 8-4-4-4-12 form and parsed through
 `java.util.UUID`, because `Uuid.fromString` decodes Kafka's base64 uuid form instead.
@@ -96,6 +102,41 @@ Neither distinction is visible in the message JSON, and getting either backwards
 
 The same reasoning applies to `ListGroups`' two filters, which are not nullable: "no filter" is
 the empty compact array, so every version emits both a filtered and an unfiltered request.
+
+### What the transaction vectors pin
+
+Every transaction-API response carries a non-zero `ThrottleTimeMs` (25), so a decoder that does not
+split it into `clientSideThrottleTime` (KIP-219) fails against the vector rather than passing on a zero.
+Pairs that differ in one field, and the field they differ in:
+
+- `offsetFetchRequest-v{7,8,9}-requireStable` / `-notRequireStable`: the `RequireStable` boolean, the
+  last byte before the request's tag buffer (KIP-447).
+- `initProducerIdRequest-v{3,4,5}-firstInit` / `-reinit`: the ten bytes of `ProducerId` and
+  `ProducerEpoch`, `-1/-1` on a first initialization and the held pair on a KIP-360 re-initialization.
+- `initProducerIdRequest-v{3,4,5}-firstInit` / `-nullTransactionalId`: the `TransactionalId` alone, the
+  compact nullable string `null` (the single byte `0x00`) of a producer that is idempotent but not
+  transactional - what every default producer sends once idempotence is the default.
+- `endTxnRequest-v{2..5}-commit` / `-abort`: the `Committed` byte.
+- `endTxnResponse-v5-producerIdAndEpoch` / `-defaults`: the ten bytes of the pair the coordinator hands
+  back after bumping the epoch (KIP-890). Both fields are plain `5+` fields, not tagged, so every v5 body
+  carries them; `defaults` is that body with both at `-1`. There is no separate v5 `ok` case: it would
+  be one of these two.
+- `txnOffsetCommitRequest-v2-legacy` / `-leaderEpoch`: the four bytes of `CommittedLeaderEpoch`.
+  The `GenerationId`/`MemberId`/`GroupInstanceId` triple only exists from v3, so `groupMetadata` starts
+  at v3.
+
+AddPartitionsToTxn stops at v3: the schema reserves v4 and above for brokers. Several versions change
+what the broker does or answers, not the bytes, and the vectors show it: EndTxn requests v3–v5,
+TxnOffsetCommit v3–v5, AddOffsetsToTxn v3–v4 and InitProducerId v3–v5 are identical per case.
+
+Unlike the vectors above, a field a version does not carry is left out of `fields`, because the `5+`/`3+`
+schema gives it no wire presence there: the EndTxn v2–v4 responses name no `producerId`/`producerEpoch`,
+and the OffsetFetch v7–v8 requests name no `memberId`/`memberEpoch`. Kafka's writer treats such a field
+by whether the schema marks it `ignorable`: EndTxn's `ProducerId`/`ProducerEpoch` below v5 are dropped
+silently, whatever the builder set, while a non-ignorable one - the TxnOffsetCommit group triple below
+v3 - makes the writer throw on a non-default value. The one field the vectors do render below its first
+version is that triple, at its defaults (`-1`, `""`, `null`): every `txnOffsetCommitRequest` has the same
+shape at v2 to v5.
 
 ## Assignor vectors
 

@@ -1,0 +1,7 @@
+{
+  "message": "EndTxnResponse",
+  "version": 5,
+  "case": "error",
+  "hex": "00000019005affffffffffffffffffff00",
+  "fields": { "throttleTime": 25, "errorCode": 90, "producerId": "-1", "producerEpoch": -1 }
+}
