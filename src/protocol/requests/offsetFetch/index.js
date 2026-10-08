@@ -29,20 +29,20 @@ const versions = {
     const response = require('./v6/response')
     return { request: request({ groupId, topics }), response }
   },
-  7: ({ groupId, topics }) => {
+  7: ({ groupId, topics, requireStable }) => {
     const request = require('./v7/request')
     const response = require('./v7/response')
-    return { request: request({ groupId, topics }), response }
+    return { request: request({ groupId, topics, requireStable }), response }
   },
-  8: ({ groupId, topics }) => {
+  8: ({ groupId, topics, requireStable }) => {
     const request = require('./v8/request')
     const response = require('./v8/response')
-    return { request: request({ groupId, topics }), response }
+    return { request: request({ groupId, topics, requireStable }), response }
   },
-  9: ({ groupId, topics, memberId, memberEpoch }) => {
+  9: ({ groupId, topics, memberId, memberEpoch, requireStable }) => {
     const request = require('./v9/request')
     const response = require('./v9/response')
-    return { request: request({ groupId, topics, memberId, memberEpoch }), response }
+    return { request: request({ groupId, topics, memberId, memberEpoch, requireStable }), response }
   },
 }
 

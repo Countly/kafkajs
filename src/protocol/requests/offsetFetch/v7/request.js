@@ -2,15 +2,6 @@ const Encoder = require('../../../encoder')
 const { OffsetFetch: apiKey } = require('../../apiKeys')
 
 /**
- * Whether the coordinator must hold back unstable (in-flight transactional) offsets and return a
- * retriable error for those partitions instead (KIP-447). This client always requests the fast
- * path; wiring `true` in belongs with the transactional-consumer work of a later phase.
- * @see https://cwiki.apache.org/confluence/display/KAFKA/KIP-447%3A+Producer+scalability+for+exactly+once+semantics
- * @see clients/src/main/resources/common/message/OffsetFetchRequest.json (Apache Kafka 4.3.1)
- */
-const REQUIRE_STABLE = false
-
-/**
  * OffsetFetch Request (Version: 7) — flexible (KIP-482), request header v2
  *
  * GroupId => COMPACT_STRING
@@ -21,15 +12,20 @@ const REQUIRE_STABLE = false
  * RequireStable => BOOLEAN
  * TAG_BUFFER
  *
- * v7 adds `RequireStable`, sent as the field's own default (see REQUIRE_STABLE above).
+ * v7 adds `RequireStable` (KIP-447): when true, the coordinator holds back the offset of a
+ * partition that has a transactional offset commit still pending and answers that partition with
+ * the retriable UNSTABLE_OFFSET_COMMIT instead. Left out, it is the field's own default, false.
  * @see https://kafka.apache.org/43/design/protocol
+ * @see https://cwiki.apache.org/confluence/display/KAFKA/KIP-447%3A+Producer+scalability+for+exactly+once+semantics
  * @see clients/src/main/resources/common/message/OffsetFetchRequest.json (Apache Kafka 4.3.1)
  *
  * @param {object} options
  * @param {string} options.groupId
  * @param {{topic: string, partitions: {partition: number}[]}[]} options.topics
+ * @param {boolean} [options.requireStable=false] ask for stable offsets only
+ * @returns {object} the protocol request
  */
-module.exports = ({ groupId, topics }) => ({
+module.exports = ({ groupId, topics, requireStable = false }) => ({
   apiKey,
   apiVersion: 7,
   apiName: 'OffsetFetch',
@@ -37,7 +33,7 @@ module.exports = ({ groupId, topics }) => ({
     new Encoder()
       .writeUVarIntString(groupId)
       .writeUVarIntArray(topics == null || topics.length === 0 ? null : topics.map(encodeTopic))
-      .writeBoolean(REQUIRE_STABLE)
+      .writeBoolean(requireStable)
       .writeTaggedFields(),
 })
 

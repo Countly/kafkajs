@@ -1,5 +1,6 @@
 const RequestV9Protocol = require('./request')
 const Decoder = require('../../../decoder')
+const { protocol } = require('../index')
 
 const vector = (caseId) => require(`../fixtures/java/offsetFetchRequest-v9-${caseId}.json`)
 
@@ -83,7 +84,7 @@ describe('Protocol > Requests > OffsetFetch > v9', () => {
     expect(decoded.groups[0].topics).toEqual([
       { topic: 'test-topic', partitions: [{ partition: 0 }] },
     ])
-    // This client has never asked the broker to hold back unstable offsets, at any version.
+    // The memberFields vector names no requireStable, so the flag is the field's own default.
     expect(decoded.requireStable).toBe(false)
   })
 
@@ -114,5 +115,41 @@ describe('Protocol > Requests > OffsetFetch > v9', () => {
       { topic: 'topic-a', partitions: [{ partition: 0 }, { partition: 3 }] },
       { topic: 'topic-b', partitions: [{ partition: 1 }] },
     ])
+  })
+
+  test.each(['requireStable', 'notRequireStable'])(
+    'encodes the Apache 4.3.1 %s vector byte for byte',
+    async (caseId) => {
+      const { hex, fields } = vector(caseId)
+      const { buffer } = await RequestV9Protocol(fields).encode()
+
+      expect(buffer.toString('hex')).toEqual(hex)
+    }
+  )
+
+  test.each(['requireStable', 'notRequireStable'])(
+    'the %s vector decodes back to the values it was built from',
+    (caseId) => {
+      const { hex, fields } = vector(caseId)
+      const { groups, requireStable } = decodeRequest(Buffer.from(hex, 'hex'))
+
+      expect(groups).toHaveLength(1)
+      expect({ ...groups[0], requireStable }).toEqual(fields)
+    }
+  )
+
+  test('the version map passes requireStable through with the member fields', async () => {
+    const { hex, fields } = vector('requireStable')
+    const { request } = protocol({ version: 9 })(fields)
+
+    expect(request).toMatchObject({ apiName: 'OffsetFetch', apiVersion: 9 })
+    expect((await request.encode()).buffer.toString('hex')).toEqual(hex)
+  })
+
+  test('through the version map, a caller that names none of the three sends the wire defaults', async () => {
+    const { hex, fields } = vector('notRequireStable')
+    const { request } = protocol({ version: 9 })({ groupId: fields.groupId, topics: fields.topics })
+
+    expect((await request.encode()).buffer.toString('hex')).toEqual(hex)
   })
 })

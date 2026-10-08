@@ -2,12 +2,6 @@ const Encoder = require('../../../encoder')
 const { OffsetFetch: apiKey } = require('../../apiKeys')
 
 /**
- * See v7/request.js for why this client always sends the field's own default.
- * @see clients/src/main/resources/common/message/OffsetFetchRequest.json (Apache Kafka 4.3.1)
- */
-const REQUIRE_STABLE = false
-
-/**
  * OffsetFetch Request (Version: 9) — flexible (KIP-482), request header v2
  *
  * Groups => COMPACT_ARRAY
@@ -26,7 +20,7 @@ const REQUIRE_STABLE = false
  * the member id and epoch and answers STALE_MEMBER_EPOCH or UNKNOWN_MEMBER_ID when they are
  * wrong. Their wire defaults — null and -1 — mean "no consumer-protocol membership", which is
  * exactly what a classic member and an admin client mean, so those callers pass nothing and get
- * v8's semantics.
+ * v8's semantics. `RequireStable` stays request-level and means what it means at v7.
  * @see https://cwiki.apache.org/confluence/display/KAFKA/KIP-848%3A+The+Next+Generation+of+the+Consumer+Rebalance+Protocol
  * @see clients/src/main/resources/common/message/OffsetFetchRequest.json (Apache Kafka 4.3.1)
  *
@@ -36,9 +30,16 @@ const REQUIRE_STABLE = false
  *   absent list asks for every topic in the group, as at every earlier version
  * @param {string|null} [options.memberId=null]
  * @param {number} [options.memberEpoch=-1]
+ * @param {boolean} [options.requireStable=false] ask for stable offsets only (KIP-447, see v7)
  * @returns {object} the protocol request
  */
-module.exports = ({ groupId, topics, memberId = null, memberEpoch = -1 }) => ({
+module.exports = ({
+  groupId,
+  topics,
+  memberId = null,
+  memberEpoch = -1,
+  requireStable = false,
+}) => ({
   apiKey,
   apiVersion: 9,
   apiName: 'OffsetFetch',
@@ -52,7 +53,7 @@ module.exports = ({ groupId, topics, memberId = null, memberEpoch = -1 }) => ({
           .writeUVarIntArray(topics == null || topics.length === 0 ? null : topics.map(encodeTopic))
           .writeTaggedFields(),
       ])
-      .writeBoolean(REQUIRE_STABLE)
+      .writeBoolean(requireStable)
       .writeTaggedFields(),
 })
 

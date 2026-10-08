@@ -14,20 +14,29 @@ const versions = {
     const response = require('./v2/response')
     return { request: request({ transactionalId, transactionTimeout }), response }
   },
-  3: ({ transactionalId, transactionTimeout = 5000 }) => {
+  3: ({ transactionalId, transactionTimeout = 5000, producerId, producerEpoch }) => {
     const request = require('./v3/request')
     const response = require('./v3/response')
-    return { request: request({ transactionalId, transactionTimeout }), response }
+    return {
+      request: request({ transactionalId, transactionTimeout, producerId, producerEpoch }),
+      response,
+    }
   },
-  4: ({ transactionalId, transactionTimeout = 5000 }) => {
+  4: ({ transactionalId, transactionTimeout = 5000, producerId, producerEpoch }) => {
     const request = require('./v4/request')
     const response = require('./v4/response')
-    return { request: request({ transactionalId, transactionTimeout }), response }
+    return {
+      request: request({ transactionalId, transactionTimeout, producerId, producerEpoch }),
+      response,
+    }
   },
-  5: ({ transactionalId, transactionTimeout = 5000 }) => {
+  5: ({ transactionalId, transactionTimeout = 5000, producerId, producerEpoch }) => {
     const request = require('./v5/request')
     const response = require('./v5/response')
-    return { request: request({ transactionalId, transactionTimeout }), response }
+    return {
+      request: request({ transactionalId, transactionTimeout, producerId, producerEpoch }),
+      response,
+    }
   },
 }
 

@@ -1,5 +1,28 @@
 const Decoder = require('../../../decoder')
 const RequestV5Protocol = require('./request')
+const requestV3 = require('../v3/request')
+const { protocol } = require('../index')
+
+const CASES = ['firstInit', 'reinit', 'nullTransactionalId']
+const vector = (caseId) => require(`../fixtures/java/initProducerIdRequest-v5-${caseId}.json`)
+
+/**
+ * Reads a v5 request body back into the builder's arguments: the other direction of the byte check.
+ * @param {Buffer} buffer
+ * @returns {{ transactionalId: string|null, transactionTimeout: number, producerId: string, producerEpoch: number }}
+ */
+const decodeRequest = (buffer) => {
+  const decoder = new Decoder(buffer)
+  const fields = {
+    transactionalId: decoder.readUVarIntString(),
+    transactionTimeout: decoder.readInt32(),
+    producerId: decoder.readInt64().toString(),
+    producerEpoch: decoder.readInt16(),
+  }
+  expect(decoder.readTaggedFields().size).toEqual(0)
+  expect(decoder.canReadBytes(1)).toBe(false)
+  return fields
+}
 
 describe('Protocol > Requests > InitProducerId > v5', () => {
   test('sends producerId and producerEpoch as -1', async () => {
@@ -43,5 +66,36 @@ describe('Protocol > Requests > InitProducerId > v5', () => {
     expect(decoder.readInt16()).toEqual(-1) // producerEpoch
     expect(decoder.readTaggedFields().size).toEqual(0)
     expect(decoder.canReadBytes(1)).toBe(false)
+  })
+
+  test.each(CASES)('encodes the Apache 4.3.1 %s vector byte for byte', async (caseId) => {
+    const { hex, fields } = vector(caseId)
+    const { buffer } = await RequestV5Protocol(fields).encode()
+
+    expect(buffer.toString('hex')).toEqual(hex)
+  })
+
+  test.each(CASES)('the %s vector decodes back to the values it was built from', (caseId) => {
+    const { hex, fields } = vector(caseId)
+
+    expect(decodeRequest(Buffer.from(hex, 'hex'))).toEqual(fields)
+  })
+
+  test('is the v3 body under its own version number', async () => {
+    for (const caseId of CASES) {
+      const { fields } = vector(caseId)
+      const request = RequestV5Protocol(fields)
+
+      expect(request.apiVersion).toEqual(5)
+      expect((await request.encode()).buffer).toEqual((await requestV3(fields).encode()).buffer)
+    }
+  })
+
+  test('the version map passes the producer id and epoch through', async () => {
+    const { hex, fields } = vector('reinit')
+    const { request } = protocol({ version: 5 })(fields)
+
+    expect(request).toMatchObject({ apiName: 'InitProducerId', apiVersion: 5 })
+    expect((await request.encode()).buffer.toString('hex')).toEqual(hex)
   })
 })

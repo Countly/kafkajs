@@ -2,12 +2,6 @@ const Encoder = require('../../../encoder')
 const { OffsetFetch: apiKey } = require('../../apiKeys')
 
 /**
- * See v7/request.js for why this client always sends the field's own default.
- * @see clients/src/main/resources/common/message/OffsetFetchRequest.json (Apache Kafka 4.3.1)
- */
-const REQUIRE_STABLE = false
-
-/**
  * OffsetFetch Request (Version: 8) — flexible (KIP-482), request header v2
  *
  * Groups => COMPACT_ARRAY
@@ -25,14 +19,17 @@ const REQUIRE_STABLE = false
  * shape is unchanged — so `groupId`/`topics` are wrapped into a one-element `Groups` array here.
  * An empty or absent topics list is encoded as the null compact array, which the broker reads as
  * "every topic for this group" — the behaviour of every earlier version of this codec.
+ * `RequireStable` stays request-level and means what it means at v7.
  * @see https://cwiki.apache.org/confluence/display/KAFKA/KIP-709%3A+Extend+OffsetFetch+requests+to+accept+multiple+group+ids
  * @see clients/src/main/resources/common/message/OffsetFetchRequest.json (Apache Kafka 4.3.1)
  *
  * @param {object} options
  * @param {string} options.groupId
  * @param {{topic: string, partitions: {partition: number}[]}[]} options.topics
+ * @param {boolean} [options.requireStable=false] ask for stable offsets only (KIP-447, see v7)
+ * @returns {object} the protocol request
  */
-module.exports = ({ groupId, topics }) => ({
+module.exports = ({ groupId, topics, requireStable = false }) => ({
   apiKey,
   apiVersion: 8,
   apiName: 'OffsetFetch',
@@ -44,7 +41,7 @@ module.exports = ({ groupId, topics }) => ({
           .writeUVarIntArray(topics == null || topics.length === 0 ? null : topics.map(encodeTopic))
           .writeTaggedFields(),
       ])
-      .writeBoolean(REQUIRE_STABLE)
+      .writeBoolean(requireStable)
       .writeTaggedFields(),
 })
 

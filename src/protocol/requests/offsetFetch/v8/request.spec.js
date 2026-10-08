@@ -1,5 +1,9 @@
 const RequestV8Protocol = require('./request')
 const Decoder = require('../../../decoder')
+const { protocol } = require('../index')
+
+const CASES = ['requireStable', 'notRequireStable']
+const vector = (caseId) => require(`../fixtures/java/offsetFetchRequest-v8-${caseId}.json`)
 
 const decodeGroups = (decoder) =>
   decoder.readUVarIntArray((groupDecoder) => {
@@ -19,6 +23,33 @@ const decodeGroups = (decoder) =>
     groupDecoder.readTaggedFields()
     return group
   })
+
+/**
+ * Reads a v8 request body back into the builder's arguments: the one group's id and topics, then
+ * the request's `RequireStable` flag.
+ * @param {Buffer} buffer
+ * @returns {{ groupId: string, topics: object[]|null, requireStable: boolean }}
+ */
+const decodeRequest = (buffer) => {
+  const decoder = new Decoder(buffer)
+  const groups = decodeGroups(decoder)
+  const requireStable = decoder.readBoolean()
+  expect(decoder.readTaggedFields().size).toEqual(0)
+  expect(decoder.canReadBytes(1)).toBe(false)
+  expect(groups).toHaveLength(1)
+
+  const [{ groupId, topics }] = groups
+  return {
+    groupId,
+    topics:
+      topics &&
+      topics.map(({ topic, partitions }) => ({
+        topic,
+        partitions: partitions.map((partition) => ({ partition })),
+      })),
+    requireStable,
+  }
+}
 
 describe('Protocol > Requests > OffsetFetch > v8', () => {
   test('sends exactly one group, carrying the caller topics list', async () => {
@@ -75,5 +106,33 @@ describe('Protocol > Requests > OffsetFetch > v8', () => {
     expect(decoder.readBoolean()).toEqual(false) // requireStable
     expect(decoder.readTaggedFields().size).toEqual(0)
     expect(decoder.canReadBytes(1)).toBe(false)
+  })
+
+  test.each(CASES)('encodes the Apache 4.3.1 %s vector byte for byte', async (caseId) => {
+    const { hex, fields } = vector(caseId)
+    const { buffer } = await RequestV8Protocol(fields).encode()
+
+    expect(buffer.toString('hex')).toEqual(hex)
+  })
+
+  test.each(CASES)('the %s vector decodes back to the values it was built from', (caseId) => {
+    const { hex, fields } = vector(caseId)
+
+    expect(decodeRequest(Buffer.from(hex, 'hex'))).toEqual(fields)
+  })
+
+  test('the version map passes requireStable through', async () => {
+    const { hex, fields } = vector('requireStable')
+    const { request } = protocol({ version: 8 })(fields)
+
+    expect(request).toMatchObject({ apiName: 'OffsetFetch', apiVersion: 8 })
+    expect((await request.encode()).buffer.toString('hex')).toEqual(hex)
+  })
+
+  test('through the version map, a caller that does not name it sends false', async () => {
+    const { hex, fields } = vector('notRequireStable')
+    const { request } = protocol({ version: 8 })({ groupId: fields.groupId, topics: fields.topics })
+
+    expect((await request.encode()).buffer.toString('hex')).toEqual(hex)
   })
 })
