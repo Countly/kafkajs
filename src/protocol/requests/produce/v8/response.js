@@ -1,5 +1,5 @@
 const Decoder = require('../../../decoder')
-const { failure, createErrorFromCode } = require('../../../error')
+const { parse } = require('../partitionResults')
 
 /**
  * ProduceResponse (Version: 8)
@@ -57,44 +57,6 @@ const decode = async (rawData) => {
     topics,
     throttleTime,
   }
-}
-
-/**
- * Produce responses report at most one failure to the caller: the first failing partition across
- * every topic in the response, which is the rule every version of this codec has used. From v8
- * the broker also sends a human-readable message for that partition and, when it dropped
- * individual records, the batch index of each one (KIP-467); both are attached to the thrown
- * error rather than changing the shape of a successful response.
- *
- * `recordErrors[].batchIndex` indexes the records **as grouped for that partition**, not the
- * caller's flat message list; the producer resolves each index to its record.
- *
- * @param {object} data decoded response
- * @returns {Promise<object>} data, when every partition succeeded
- * @throws {import('../../../../errors').KafkaJSProtocolError} enriched with topic, partition,
- *   errorMessage and recordErrors
- * @see https://cwiki.apache.org/confluence/display/KAFKA/KIP-467%3A+Augment+ProduceResponse+error+messaging+for+specific+culprit+records
- */
-const parse = async (data) => {
-  for (const response of data.topics) {
-    for (const partition of response.partitions) {
-      if (!failure(partition.errorCode)) {
-        continue
-      }
-
-      const error = createErrorFromCode(partition.errorCode)
-      error.topic = response.topicName
-      error.partition = partition.partition
-      error.errorMessage = partition.errorMessage
-      error.recordErrors = partition.recordErrors.map(({ batchIndex, batchIndexErrorMessage }) => ({
-        batchIndex,
-        errorMessage: batchIndexErrorMessage,
-      }))
-      throw error
-    }
-  }
-
-  return data
 }
 
 module.exports = {

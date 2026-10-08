@@ -1,5 +1,5 @@
 const Decoder = require('../../../decoder')
-const { parse: parseV8 } = require('../v8/response')
+const { parse } = require('../partitionResults')
 
 /**
  * ProduceResponse (Version: 10) — flexible (KIP-482), response header v1
@@ -140,33 +140,6 @@ const decode = async (rawData) => {
     topics,
     throttleTime,
     nodeEndpoints: decodeNodeEndpoints(tags),
-  }
-}
-
-/**
- * v8's selection and enrichment, plus the leader hint the broker attaches on a leadership error
- * (KIP-951). `currentLeader` and `nodeEndpoints` are internal: they exist so the producer can
- * route its next attempt at the new leader without waiting for a metadata refresh, and are not
- * part of the error's documented surface.
- * @param {object} data decoded response
- * @returns {Promise<object>} data, when every partition succeeded
- * @throws {import('../../../../errors').KafkaJSProtocolError} as v8, plus internal
- *   `currentLeader`/`nodeEndpoints` when the broker sent the KIP-951 hint for the failing partition
- * @see https://cwiki.apache.org/confluence/display/KAFKA/KIP-951%3A+Leader+discovery+optimisations+for+the+client
- */
-const parse = async (data) => {
-  try {
-    return await parseV8(data)
-  } catch (e) {
-    const topic = data.topics.find(({ topicName }) => topicName === e.topic)
-    const partition = topic && topic.partitions.find((p) => p.partition === e.partition)
-
-    if (partition && partition.currentLeader) {
-      e.currentLeader = partition.currentLeader
-      e.nodeEndpoints = data.nodeEndpoints
-    }
-
-    throw e
   }
 }
 

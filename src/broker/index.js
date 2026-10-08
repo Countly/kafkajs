@@ -1,6 +1,7 @@
 const Lock = require('../utils/lock')
 const { Types: Compression } = require('../protocol/message/compression')
 const { requests, lookup, selectVersion } = require('../protocol/requests')
+const { partitionResults } = require('../protocol/requests/produce/partitionResults')
 const { KafkaJSNonRetriableError, KafkaJSServerDoesNotSupportApiKey } = require('../errors')
 const apiKeys = require('../protocol/requests/apiKeys')
 const { GROUP_STATES, GROUP_TYPES, toDisplayName } = require('../protocol/groupTypes')
@@ -16,10 +17,58 @@ const FETCH_TOPIC_NAMES_MAX_VERSION = 12
 // @see clients/src/main/resources/common/message/ProduceRequest.json (Apache Kafka 4.3.1)
 const PRODUCE_TOPIC_NAMES_MAX_VERSION = 11
 
+// The last Produce, EndTxn and TxnOffsetCommit versions a transaction may use while its
+// coordinator runs transaction version 1: the next version of each carries the second part of
+// KIP-890 (partitions and offsets added implicitly, the epoch bumped per transaction).
+// @see clients/src/main/java/org/apache/kafka/common/requests/EndTxnRequest.java (Apache Kafka 4.3, LAST_STABLE_VERSION_BEFORE_TRANSACTION_V2)
+const TRANSACTION_V1_MAX_VERSIONS = {
+  [apiKeys.Produce]: 11,
+  [apiKeys.EndTxn]: 4,
+  [apiKeys.TxnOffsetCommit]: 4,
+}
+
+/**
+ * The version cap a transactional EndTxn or TxnOffsetCommit takes: the last version before the
+ * second part of KIP-890 under transaction version 1, none under 2.
+ * @param {number} apiKey
+ * @param {number} transactionVersion only 2 means transaction version 2
+ * @returns {number|undefined} undefined when nothing caps the request
+ */
+const transactionVersionCap = (apiKey, transactionVersion) =>
+  transactionVersion === 2 ? undefined : TRANSACTION_V1_MAX_VERSIONS[apiKey]
+
+// A transactional Produce under transaction version 2 is sent at exactly this version: v13 keys
+// topics by id, while a transaction tracks its partitions by name.
+// @see clients/src/main/resources/common/message/ProduceRequest.json (Apache Kafka 4.3.1)
+const TRANSACTION_V2_PRODUCE_VERSION = 12
+
+/**
+ * The highest Produce version one request may negotiate before the caller's own `maxVersion`.
+ * A request without topic ids is keyed by name, so it stays at v11 or below. A transactional one
+ * is gated by its transaction version instead, whatever ids it carries: v11 or below under 1,
+ * exactly v12 under 2, whose broker adds the partitions to the transaction itself (KIP-890).
+ * @param {object} request
+ * @param {string|null} [request.transactionalId]
+ * @param {number} request.transactionVersion only 2 means transaction version 2
+ * @param {Map<string, string>} [request.topicIds]
+ * @returns {number|undefined} undefined when nothing caps the request
+ * @see https://cwiki.apache.org/confluence/display/KAFKA/KIP-890%3A+Transactions+Server-Side+Defense
+ */
+const produceCeiling = ({ transactionalId, transactionVersion, topicIds }) => {
+  if (transactionalId != null) {
+    return transactionVersion === 2
+      ? TRANSACTION_V2_PRODUCE_VERSION
+      : TRANSACTION_V1_MAX_VERSIONS[apiKeys.Produce]
+  }
+
+  return topicIds == null ? PRODUCE_TOPIC_NAMES_MAX_VERSION : undefined
+}
+
 const PRIVATE = {
   SEND_REQUEST: Symbol('private:Broker:sendRequest'),
   API_VERSIONS_AT: Symbol('private:Broker:apiVersionsAt'),
   NEGOTIATE_API_VERSIONS_VERSION: Symbol('private:Broker:negotiateApiVersionsVersion'),
+  NEGOTIATE: Symbol('private:Broker:negotiate'),
   CAPPED_LOOKUPS: Symbol('private:Broker:cappedLookups'),
 }
 
@@ -40,6 +89,24 @@ const toVersionMap = (response) =>
       }),
     {}
   )
+
+/**
+ * The finalized features an ApiVersions response carries from v3 (tagged fields 1 and 2), keyed by
+ * feature name. A response below v3, or one without the tags, finalizes nothing: `{}` and -1.
+ * The epoch is an int64 the codec decodes as a decimal string.
+ * @param {{ finalizedFeatures?: { name: string, minVersionLevel: number, maxVersionLevel: number }[], finalizedFeaturesEpoch?: string }} response
+ * @returns {{ finalizedFeatures: { [name: string]: { minVersionLevel: number, maxVersionLevel: number } }, finalizedFeaturesEpoch: number }}
+ * @see clients/src/main/resources/common/message/ApiVersionsResponse.json (Apache Kafka 4.3.1)
+ */
+const toFinalizedFeatures = ({ finalizedFeatures = [], finalizedFeaturesEpoch = '-1' }) => ({
+  finalizedFeatures: Object.fromEntries(
+    finalizedFeatures.map(({ name, minVersionLevel, maxVersionLevel }) => [
+      name,
+      { minVersionLevel, maxVersionLevel },
+    ])
+  ),
+  finalizedFeaturesEpoch: Number(finalizedFeaturesEpoch),
+})
 
 /**
  * @param {string[]} typeFilters display names
@@ -87,6 +154,21 @@ module.exports = class Broker {
     this.rootLogger = logger
     this.logger = logger.namespace('Broker')
     this.versions = versions
+
+    /**
+     * The finalized features of the ApiVersions response `versions` came from (v3+), keyed by
+     * feature name. Replaced together with `versions` at every negotiation, so both always
+     * describe the same connection generation; `{}` before the first one.
+     * @type {{ [name: string]: { minVersionLevel: number, maxVersionLevel: number } }}
+     */
+    this.finalizedFeatures = {}
+
+    /**
+     * The epoch `finalizedFeatures` were finalized at: -1 when the broker sent none, which every
+     * response below ApiVersions v3 does. The features are meaningful only when it is >= 0.
+     * @type {number}
+     */
+    this.finalizedFeaturesEpoch = -1
 
     /**
      * The `connectionPool.generation` the cached `versions` were learned at, or `null` before
@@ -179,7 +261,8 @@ module.exports = class Broker {
    * ApiVersions is re-run whenever this broker's connection pool has been (re)established since
    * the last negotiation — either of its two pooled sockets being new counts (KIP-35 rule 7),
    * since version information is only valid for the connection it was learned on. The resulting
-   * table is shared by both pooled sockets.
+   * table is shared by both pooled sockets. The same negotiation also retains the broker's
+   * finalized features (`finalizedFeatures`, `finalizedFeaturesEpoch`).
    *
    * @public
    * @returns {Promise}
@@ -198,7 +281,11 @@ module.exports = class Broker {
       // up mid-negotiation must not be attributed to this table).
       const generation = this.connectionPool.generation
       if (this.versionsGeneration !== generation) {
-        this.versions = await this.apiVersions()
+        const response = await this[PRIVATE.NEGOTIATE]()
+        const { finalizedFeatures, finalizedFeaturesEpoch } = toFinalizedFeatures(response)
+        this.versions = toVersionMap(response)
+        this.finalizedFeatures = finalizedFeatures
+        this.finalizedFeaturesEpoch = finalizedFeaturesEpoch
         this.versionsGeneration = generation
       }
 
@@ -236,10 +323,21 @@ module.exports = class Broker {
    * @returns {Promise<import("../../types").ApiVersions>}
    */
   async apiVersions() {
+    return toVersionMap(await this[PRIVATE.NEGOTIATE]())
+  }
+
+  /**
+   * The ApiVersions round trip behind `apiVersions()`, resolving the whole decoded response so
+   * `connect()` can keep its finalized features as well as its version table.
+   * @private
+   * @returns {Promise<object>} the decoded ApiVersions response
+   * @throws {KafkaJSNonRetriableError} when the broker rejects this client's software identity
+   */
+  async [PRIVATE.NEGOTIATE]() {
     const bestImplementedVersion = Math.max(...requests.ApiVersions.versions.map(Number))
 
     try {
-      return toVersionMap(await this[PRIVATE.API_VERSIONS_AT](bestImplementedVersion))
+      return await this[PRIVATE.API_VERSIONS_AT](bestImplementedVersion)
     } catch (e) {
       if (e.type === 'INVALID_REQUEST') {
         await this.disconnect()
@@ -262,7 +360,7 @@ module.exports = class Broker {
         bestImplementedVersion
       )
 
-      return toVersionMap(await this[PRIVATE.API_VERSIONS_AT](retryVersion))
+      return await this[PRIVATE.API_VERSIONS_AT](retryVersion)
     }
   }
 
@@ -302,11 +400,11 @@ module.exports = class Broker {
    * `lookupRequest`, with an optional per-request ceiling.
    *
    * A capped builder is memoised per `(apiKey, maxVersion)` because the cap is a hot-path
-   * decision — a fetch downgraded to v12 while a topic id is unknown, a produce capped at v11
-   * inside a transaction — and rebuilding the selector per request would allocate on it. In
-   * practice this map holds at most two entries per `Broker` instance. It is cleared wherever
-   * `lookupRequest` or `versionsGeneration` is assigned, so it can never outlive the version
-   * table it was derived from.
+   * decision — a fetch downgraded to v12 while a topic id is unknown, a produce held at v11 or
+   * v12 by its transaction version — and rebuilding the selector per request would allocate on
+   * it. The map holds one entry per cap a caller uses, a handful per `Broker` instance. It is
+   * cleared wherever `lookupRequest` or `versionsGeneration` is assigned, so it can never outlive
+   * the version table it was derived from.
    *
    * @internal
    * @param {number} apiKey
@@ -436,7 +534,18 @@ module.exports = class Broker {
    *   (KIP-516); the inverse map is derived here and bound onto the response codec so the decoded
    *   shape - and the `topic` field of a produce error - is unchanged at every version.
    * @param {number} [request.maxVersion] the highest version this request may negotiate
-   * @returns {Promise}
+   * @param {1|2} [request.transactionVersion=1] the transaction version in force for a request
+   *   carrying a `transactionalId`: 1 keeps it at v11 or below; 2 sends it at v12, whose broker
+   *   adds the partitions to the transaction itself (KIP-890). A transactional request never uses
+   *   v13. Ignored without a `transactionalId`.
+   * @param {boolean} [request.perPartitionResults=false] resolve every partition's outcome, a
+   *   failing one included, instead of throwing the first failing partition's error. With
+   *   `acks: 0` the broker sends no response, so the call resolves `undefined` either way.
+   *   Internal: serves the producer's send path; not typed.
+   * @returns {Promise<object|import('../protocol/requests/produce/partitionResults').PartitionResult[]|undefined>}
+   *   the decoded response, or with `perPartitionResults` one `PartitionResult` per partition;
+   *   `undefined` with `acks: 0`
+   * @see https://cwiki.apache.org/confluence/display/KAFKA/KIP-890%3A+Transactions+Server-Side+Defense
    */
   async produce({
     topicData,
@@ -448,22 +557,16 @@ module.exports = class Broker {
     timeout = 30000,
     compression = Compression.None,
     maxVersion,
+    transactionVersion = 1,
+    perPartitionResults = false,
   }) {
-    // Ids are what v13 is keyed by, so a request without them cannot be sent above v12's shape -
-    // and v12 is only reachable inside a transaction-version-2 produce, so the floor for a
-    // caller-supplied-nothing request is v11. This is permanent, not scaffolding: `Broker` is a
-    // public type and `broker.produce({ topicData })` must keep working forever. A caller may
-    // still ask for something lower.
-    //
-    // A transactional send takes the same floor whatever ids it carries: v12 and above imply
-    // adding the partition to the transaction, which this client does not do yet.
+    // The ceiling is permanent, not scaffolding: `Broker` is a public type and
+    // `broker.produce({ topicData })` must keep working forever. A caller may still ask for less.
+    const ceiling = produceCeiling({ transactionalId, transactionVersion, topicIds })
     const cap =
-      topicIds == null || transactionalId != null
-        ? Math.min(
-            PRODUCE_TOPIC_NAMES_MAX_VERSION,
-            maxVersion === undefined ? Infinity : maxVersion
-          )
-        : maxVersion
+      ceiling === undefined
+        ? maxVersion
+        : Math.min(ceiling, maxVersion === undefined ? Infinity : maxVersion)
 
     const produce = this.lookupRequestWithMax(apiKeys.Produce, requests.Produce, cap)
     // Asked rather than read off the built request, unlike `fetch`: the id -> name map below has
@@ -484,19 +587,26 @@ module.exports = class Broker {
       }
     }
 
-    return await this[PRIVATE.SEND_REQUEST](
-      produce({
-        acks,
-        timeout,
-        compression,
-        topicData,
-        topicIds,
-        topicNames,
-        transactionalId,
-        producerId,
-        producerEpoch,
-      })
-    )
+    const protocolRequest = produce({
+      acks,
+      timeout,
+      compression,
+      topicData,
+      topicIds,
+      topicNames,
+      transactionalId,
+      producerId,
+      producerEpoch,
+    })
+
+    if (!perPartitionResults) {
+      return await this[PRIVATE.SEND_REQUEST](protocolRequest)
+    }
+
+    return await this[PRIVATE.SEND_REQUEST]({
+      ...protocolRequest,
+      response: { decode: protocolRequest.response.decode, parse: partitionResults },
+    })
   }
 
   /**
@@ -958,11 +1068,17 @@ module.exports = class Broker {
    *                  member and an admin client pass nothing, which sends the field's own "no
    *                  membership" defaults; every version below 9 drops both fields.
    * @param {number} [request.memberEpoch=-1] the consumer-protocol member epoch
+   * @param {boolean} [request.requireStable=false] ask the coordinator to hold back the offset of a
+   *   partition that has a transactional offset commit pending, answering it with the retriable
+   *   UNSTABLE_OFFSET_COMMIT instead (KIP-447, v7+; dropped below v7). The consumer asks for it;
+   *   the admin client keeps the default.
    * @returns {Promise}
    */
-  async offsetFetch({ groupId, topics, memberId = null, memberEpoch = -1 }) {
+  async offsetFetch({ groupId, topics, memberId = null, memberEpoch = -1, requireStable = false }) {
     const offsetFetch = this.lookupRequest(apiKeys.OffsetFetch, requests.OffsetFetch)
-    return await this[PRIVATE.SEND_REQUEST](offsetFetch({ groupId, topics, memberId, memberEpoch }))
+    return await this[PRIVATE.SEND_REQUEST](
+      offsetFetch({ groupId, topics, memberId, memberEpoch, requireStable })
+    )
   }
 
   /**
@@ -1120,11 +1236,23 @@ module.exports = class Broker {
    * @param {object} request
    * @param {number} request.transactionTimeout The time in ms to wait for before aborting idle transactions
    * @param {number} [request.transactionalId] The transactional id or null if the producer is not transactional
+   * @param {string|number} [request.producerId=-1] the producer id held, on a KIP-360
+   *   re-initialization; -1 on a first initialization. Sent from v3, dropped below it
+   * @param {number} [request.producerEpoch=-1] the epoch held, on a re-initialization; -1 on a
+   *   first initialization
    * @returns {Promise}
+   * @see https://cwiki.apache.org/confluence/pages/viewpage.action?pageId=89068820
    */
-  async initProducerId({ transactionalId, transactionTimeout }) {
+  async initProducerId({
+    transactionalId,
+    transactionTimeout,
+    producerId = -1,
+    producerEpoch = -1,
+  }) {
     const initProducerId = this.lookupRequest(apiKeys.InitProducerId, requests.InitProducerId)
-    return await this[PRIVATE.SEND_REQUEST](initProducerId({ transactionalId, transactionTimeout }))
+    return await this[PRIVATE.SEND_REQUEST](
+      initProducerId({ transactionalId, transactionTimeout, producerId, producerEpoch })
+    )
   }
 
   /**
@@ -1180,12 +1308,19 @@ module.exports = class Broker {
    * Request should be made to the consumer coordinator.
    * @public
    * @param {object} request
-   * @param {OffsetCommitTopic[]} request.topics
    * @param {string} request.transactionalId The transactional id corresponding to the transaction.
    * @param {string} request.groupId The unique group identifier (for the consumer group)
    * @param {number} request.producerId Current producer id in use by the transactional id.
    * @param {number} request.producerEpoch Current epoch associated with the producer id.
    * @param {OffsetCommitTopic[]} request.topics
+   * @param {number} [request.generationId=-1] the consumer's generation - its member epoch under
+   *   the consumer group protocol - so the group coordinator can fence a stale member (KIP-447,
+   *   v3+); -1 commits without group fencing
+   * @param {string} [request.memberId=''] the consumer's member id; '' commits without group fencing
+   * @param {string|null} [request.groupInstanceId=null] the consumer's static instance id
+   * @param {1|2} [request.transactionVersion=1] the transaction version in force for this
+   *   transaction: 1 keeps the request at v4 or below; 2 allows v5, which also adds the offsets to
+   *   the transaction (KIP-890)
    *
    * @typedef {Object} OffsetCommitTopic
    * @property {string} topic
@@ -1197,11 +1332,35 @@ module.exports = class Broker {
    * @property {string} [metadata]
    *
    * @returns {Promise}
+   * @see https://cwiki.apache.org/confluence/display/KAFKA/KIP-447%3A+Producer+scalability+for+exactly+once+semantics
    */
-  async txnOffsetCommit({ transactionalId, groupId, producerId, producerEpoch, topics }) {
-    const txnOffsetCommit = this.lookupRequest(apiKeys.TxnOffsetCommit, requests.TxnOffsetCommit)
+  async txnOffsetCommit({
+    transactionalId,
+    groupId,
+    producerId,
+    producerEpoch,
+    topics,
+    generationId = -1,
+    memberId = '',
+    groupInstanceId = null,
+    transactionVersion = 1,
+  }) {
+    const txnOffsetCommit = this.lookupRequestWithMax(
+      apiKeys.TxnOffsetCommit,
+      requests.TxnOffsetCommit,
+      transactionVersionCap(apiKeys.TxnOffsetCommit, transactionVersion)
+    )
     return await this[PRIVATE.SEND_REQUEST](
-      txnOffsetCommit({ transactionalId, groupId, producerId, producerEpoch, topics })
+      txnOffsetCommit({
+        transactionalId,
+        groupId,
+        producerId,
+        producerEpoch,
+        topics,
+        generationId,
+        memberId,
+        groupInstanceId,
+      })
     )
   }
 
@@ -1215,10 +1374,24 @@ module.exports = class Broker {
    * @param {number} request.producerId Current producer id in use by the transactional id.
    * @param {number} request.producerEpoch Current epoch associated with the producer id.
    * @param {boolean} request.transactionResult The result of the transaction (false = ABORT, true = COMMIT)
+   * @param {1|2} [request.transactionVersion=1] the transaction version in force for this
+   *   transaction: 1 keeps the request at v4 or below; 2 allows v5, whose response carries the
+   *   producer id and epoch the coordinator bumped to (KIP-890)
    * @returns {Promise}
+   * @see https://cwiki.apache.org/confluence/display/KAFKA/KIP-890%3A+Transactions+Server-Side+Defense
    */
-  async endTxn({ transactionalId, producerId, producerEpoch, transactionResult }) {
-    const endTxn = this.lookupRequest(apiKeys.EndTxn, requests.EndTxn)
+  async endTxn({
+    transactionalId,
+    producerId,
+    producerEpoch,
+    transactionResult,
+    transactionVersion = 1,
+  }) {
+    const endTxn = this.lookupRequestWithMax(
+      apiKeys.EndTxn,
+      requests.EndTxn,
+      transactionVersionCap(apiKeys.EndTxn, transactionVersion)
+    )
     return await this[PRIVATE.SEND_REQUEST](
       endTxn({ transactionalId, producerId, producerEpoch, transactionResult })
     )
