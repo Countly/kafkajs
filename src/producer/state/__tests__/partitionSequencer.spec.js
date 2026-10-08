@@ -932,6 +932,91 @@ describe('PartitionSequencer', () => {
       expect(drain(sequencer, BUMPED)).toEqual([fresh])
       expect(fresh).toMatchObject({ firstSequence: 0, ...BUMPED })
     })
+
+    test('two bumps in one response leave each restarted partition numbering on after its re-send', () => {
+      const sequencer = build()
+      const [first, second] = send(sequencer, createBatch(), createBatch({ partition: 1 }))
+
+      sequencer.restartPartition(TOPIC, 0)
+      sequencer.markStaleExcept(TOPIC, 0)
+      sequencer.requeue(first, 0)
+      sequencer.restartPartition(TOPIC, 1)
+      sequencer.markStaleExcept(TOPIC, 1)
+      sequencer.requeue(second, 0)
+
+      expect(drain(sequencer, BUMPED)).toEqual([first, second])
+      sequencer.complete(first, { baseOffset: '0' })
+      sequencer.complete(second, { baseOffset: '0' })
+      const next = createBatch()
+      sequencer.enqueue([next])
+
+      expect(drain(sequencer, BUMPED)).toEqual([next])
+      expect(next).toMatchObject({ firstSequence: 5, ...BUMPED })
+    })
+
+    const markers = [
+      ['markStaleExcept()', (sequencer) => sequencer.markStaleExcept(OTHER, 0)],
+      ['markAllStale()', (sequencer) => sequencer.markAllStale()],
+    ]
+
+    test.each(markers)(
+      '%s leaves alone a partition whose batches in flight were all restarted since they were sent',
+      (_, mark) => {
+        const sequencer = build()
+        const [batch] = send(sequencer, createBatch())
+        sequencer.restartPartition(TOPIC, 0)
+
+        mark(sequencer)
+
+        expect(sequencer.entry(TOPIC, 0).stale).toBe(false)
+        sequencer.requeue(batch, 0)
+        expect(drain(sequencer, OTHER_PRODUCER)).toEqual([batch])
+        sequencer.complete(batch, { baseOffset: '0' })
+        const next = createBatch()
+        sequencer.enqueue([next])
+        expect(drain(sequencer, OTHER_PRODUCER)).toEqual([next])
+        expect(next).toMatchObject({ firstSequence: 5, ...OTHER_PRODUCER })
+      }
+    )
+
+    test.each(markers)('%s still marks a partition with nothing in flight', (_, mark) => {
+      const sequencer = build()
+      sequencer.complete(send(sequencer, createBatch())[0], { baseOffset: '0' })
+
+      mark(sequencer)
+
+      expect(sequencer.entry(TOPIC, 0).stale).toBe(true)
+      const next = createBatch()
+      sequencer.enqueue([next])
+      expect(drain(sequencer, BUMPED)).toEqual([next])
+      expect(next).toMatchObject({ firstSequence: 0, ...BUMPED })
+    })
+
+    test.each(markers)('%s still marks a partition with a stamped batch in flight', (_, mark) => {
+      const sequencer = build()
+      send(sequencer, createBatch())
+
+      mark(sequencer)
+
+      expect(sequencer.entry(TOPIC, 0).stale).toBe(true)
+    })
+
+    test.each(markers)(
+      '%s still marks a partition whose batches in flight are only partly restarted',
+      (_, mark) => {
+        const sequencer = build()
+        const [first] = send(sequencer, createBatch())
+        const [second] = send(sequencer, createBatch())
+        sequencer.restartPartition(TOPIC, 0)
+        sequencer.requeue(first, 0)
+        sequencer.requeue(second, 0)
+        expect(drain(sequencer, BUMPED)).toEqual([first])
+
+        mark(sequencer)
+
+        expect(sequencer.entry(TOPIC, 0).stale).toBe(true)
+      }
+    )
   })
 
   describe('the unresolved sequence', () => {

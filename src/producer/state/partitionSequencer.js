@@ -104,6 +104,17 @@ const createEntry = (topic, partition) => ({
 })
 
 /**
+ * Whether every batch a partition has in flight was restarted since it was sent: each carries no
+ * producer stamp, so the next drain re-sends them from 0 under the pair in force then. Such a
+ * partition already numbers under the next pair, and marking it stale would restart it at 0
+ * again once those re-sends are acknowledged. False for a partition with nothing in flight.
+ * @param {PartitionEntry} entry
+ * @returns {boolean}
+ */
+const restartedSinceSent = (entry) =>
+  entry.inFlight.length > 0 && entry.inFlight.every((batch) => batch.producerEpoch == null)
+
+/**
  * @typedef {Object} PartitionBatch
  * @property {number} id
  * @property {string} topic
@@ -492,6 +503,12 @@ class PartitionSequencer {
    * Marks every partition but one stale after a local epoch bump: a stale partition keeps the
    * sequences of its batches in flight, numbers nothing new until they have settled, and then
    * restarts at 0 under the new epoch.
+   *
+   * A partition whose batches in flight were all restarted since they were sent is left alone:
+   * its re-sends already go out from 0 under the newest pair, so a second bump in the same Produce
+   * response must not restart it again. A partition with nothing in flight, or with any batch
+   * still stamped, is marked. So is a partly restarted one: its unstamped re-sends then draw one
+   * more `OUT_OF_ORDER_SEQUENCE_NUMBER` and one more bump, and no record is lost.
    * @param {string} topic the partition that triggered the bump, restarted separately
    * @param {number} partition
    * @returns {void}
@@ -499,20 +516,23 @@ class PartitionSequencer {
   markStaleExcept(topic, partition) {
     const trigger = this.#lookup(topic, partition)
     for (const entry of this.#entries()) {
-      if (entry !== trigger) {
+      if (entry !== trigger && !restartedSinceSent(entry)) {
         entry.stale = true
       }
     }
   }
 
   /**
-   * Marks every partition stale, for a new epoch no partition has restarted under yet. A stale
-   * partition behaves as `markStaleExcept` describes.
+   * Marks every partition stale, for a new producer id or epoch no partition has restarted under
+   * yet. A stale partition behaves as `markStaleExcept` describes, which also names the
+   * partitions left alone: those whose batches in flight were all restarted since they were sent.
    * @returns {void}
    */
   markAllStale() {
     for (const entry of this.#entries()) {
-      entry.stale = true
+      if (!restartedSinceSent(entry)) {
+        entry.stale = true
+      }
     }
   }
 
