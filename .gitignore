@@ -14,6 +14,7 @@ vendor-explore/
 # Local-only agent/planning artifacts — never committed or pushed (user rule 2026-09-03).
 # If any of these ever land in the remote: revert the commit and force-push.
 CLAUDE.md
+AGENT.md
 .claude/
 .agents/
 agent/
