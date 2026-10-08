@@ -15,7 +15,7 @@ const ISOLATION_LEVEL = require('../protocol/isolationLevel')
 const sharedPromiseTo = require('../utils/sharedPromiseTo')
 
 const { keys, values } = Object
-const { CONNECT, DISCONNECT, STOP, CRASH } = events
+const { CONNECT, DISCONNECT, STOP, CRASH, GROUP_JOIN } = events
 
 const eventNames = values(events)
 const eventKeys = keys(events)
@@ -210,6 +210,24 @@ module.exports = (params) => {
   // of its own cleanup), so onCrash can tell whether a *separate* stop happened while it was
   // still deciding whether to restart (e.g. a slow restartOnFailure callback).
   let stopGeneration = 0
+
+  /**
+   * The generation and member id of this consumer's last completed join, or null before its
+   * first. `groupMetadata()` reports the classic pair from here because the live classic
+   * membership drops both when a generation is lost (a poll-interval overrun, UNKNOWN_MEMBER_ID),
+   * and a classic group accepts a transactional offset commit carrying no generation and no member
+   * id without fencing it. Java's classic consumer keeps its group metadata from the last join the
+   * same way.
+   * @see https://github.com/apache/kafka/blob/4.3/clients/src/main/java/org/apache/kafka/clients/consumer/internals/ConsumerCoordinator.java
+   * @see https://github.com/apache/kafka/blob/4.3/group-coordinator/src/main/java/org/apache/kafka/coordinator/group/classic/ClassicGroup.java
+   * @type {{ generationId: number, memberId: string }|null}
+   */
+  let lastJoin = null
+  instrumentationEmitter.addListener(GROUP_JOIN, () => {
+    if (consumerGroup) {
+      lastJoin = { generationId: consumerGroup.generationId, memberId: consumerGroup.memberId }
+    }
+  })
 
   const groupTimeouts = resolveGroupTimeouts({
     maxPollInterval,
@@ -800,6 +818,46 @@ module.exports = (params) => {
   }
 
   /**
+   * This consumer's group membership, for a transactional offset commit the group coordinator can
+   * fence (KIP-447): pass it to `transaction.sendOffsets({ consumerGroupMetadata, topics })`. It is
+   * a snapshot taken at the call, so read it again after every rebalance.
+   *
+   * Before the consumer's first completed join it reports generation -1 and an empty member id,
+   * as the Java client does. Under the classic protocol it then reports the generation and member
+   * id of the last completed join, which a lost generation does not erase. Under
+   * `groupProtocol: 'consumer'` `generationId` is the live member epoch and `memberId` the live
+   * member id, the same pair OffsetCommit v9 carries. The last joined pair is kept across
+   * `stop()`/`run()` and a crash restart until the next join; under `groupProtocol: 'consumer'`
+   * the new membership is read live.
+   * @see https://cwiki.apache.org/confluence/display/KAFKA/KIP-447%3A+Producer+scalability+for+exactly+once+semantics
+   * @returns {{ groupId: string, generationId: number, memberId: string, groupInstanceId: string|null }}
+   * @throws {KafkaJSNonRetriableError} before `run()` and after `stop()`
+   */
+  const groupMetadata = () => {
+    if (!consumerGroup) {
+      throw new KafkaJSNonRetriableError(
+        'Consumer group was not initialized, consumer#run must be called first'
+      )
+    }
+
+    const { groupInstanceId } = consumerGroup
+    if (lastJoin === null) {
+      return { groupId, generationId: -1, memberId: '', groupInstanceId }
+    }
+
+    if (consumerGroup.kind === 'consumer') {
+      return {
+        groupId,
+        generationId: consumerGroup.memberEpoch,
+        memberId: consumerGroup.memberId,
+        groupInstanceId,
+      }
+    }
+
+    return { groupId, ...lastJoin, groupInstanceId }
+  }
+
+  /**
    * @return {Object} logger
    */
   const getLogger = () => logger
@@ -816,6 +874,7 @@ module.exports = (params) => {
     pause,
     paused,
     resume,
+    groupMetadata,
     on,
     events,
     logger: getLogger,
