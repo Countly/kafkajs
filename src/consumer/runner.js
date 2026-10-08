@@ -63,7 +63,9 @@ module.exports = class Runner extends EventEmitter {
     this.eachBatch = eachBatch
     this.eachMessage = eachMessage
     this.heartbeatInterval = heartbeatInterval
-    this.retrier = createRetry(Object.assign({}, retry))
+    // The fetch loop is one retrier call for as long as the consumer runs, so a total-time
+    // deadline would crash it on the first failure after that time.
+    this.retrier = createRetry(Object.assign({}, retry, { maxTotalTime: undefined }))
     this.onCrash = onCrash
     this.autoCommit = autoCommit
     this.maxPrefetchBatches = maxPrefetchBatches

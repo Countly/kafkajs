@@ -267,6 +267,30 @@ describe('Consumer > Runner', () => {
     expect(onCrash).toHaveBeenCalledWith(notImplementedError)
   })
 
+  it('retries a fetch loop failure in place after the client retry.maxTotalTime has passed', async () => {
+    runner = createTestRunner({ retry: { maxTotalTime: 1, retries: 3, initialRetryTime: 5 } })
+    runner.running = true
+
+    let attempts = 0
+    runner.fetchManager = {
+      start: jest.fn(async () => {
+        attempts += 1
+        if (attempts === 1) {
+          await sleep(10)
+          throw new Error('fetch loop failed')
+        }
+        runner.running = false
+      }),
+      stop: jest.fn(async () => {}),
+    }
+
+    runner.scheduleFetchManager()
+    await waitFor(() => !runner.consuming)
+
+    expect(runner.fetchManager.start).toHaveBeenCalledTimes(2)
+    expect(onCrash).not.toHaveBeenCalled()
+  })
+
   describe('commitOffsets', () => {
     let offsets
 
