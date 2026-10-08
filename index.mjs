@@ -45,6 +45,11 @@ export const {
   KafkaJSFetcherRebalanceError,
   KafkaJSNoBrokerAvailableError,
   KafkaJSAlterPartitionReassignmentsError,
+  KafkaJSRefreshRetriableError,
+  KafkaJSTransactionAbortableError,
+  KafkaJSApplicationRecoverableError,
+  KafkaJSInvalidConfigurationError,
+  KafkaJSDeliveryTimeout,
 } = cjs
 
 export default cjs

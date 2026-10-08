@@ -555,6 +555,26 @@ change not listed here did not change observable behavior.
 
 The producer becomes idempotent by default and transactions move to the transaction protocol Kafka 4.x brokers speak; each change below says what you may notice and what, if anything, to do.
 
+- **Every error this client raises through a KafkaJS error class carries a `category`, and five
+  error classes are added.** `error.category` is one of `retriable`, `refreshRetriable`,
+  `abortable`, `applicationRecoverable` or `invalidConfiguration` (KIP-1050) and names the remedy:
+  retry, refresh and retry, abort the transaction and keep the producer, create a new producer, or
+  fix the configuration, record or ACL. Errors are **not** re-wrapped: `err.name`, `instanceof` and
+  every field an error already carried are unchanged, and `category` is the one new key. The new
+  classes are
+  `KafkaJSTransactionAbortableError`, `KafkaJSApplicationRecoverableError`,
+  `KafkaJSInvalidConfigurationError`, `KafkaJSDeliveryTimeout` (all `KafkaJSNonRetriableError`
+  subclasses) and `KafkaJSRefreshRetriableError`. `TRANSACTION_ABORTABLE` (120) and
+  `PRODUCER_FENCED` (90) are known codes rather than `KAFKAJS_UNKNOWN_ERROR_CODE`.
+  *What to do:* prefer `error.category` over string-matching. `error.retriable` keeps its meaning;
+  `KafkaJSRefreshRetriableError` is retriable, the other four new classes are not. Snapshot tests
+  over serialized errors will see one added field — `category` is an own enumerable property, so
+  it appears in `JSON.stringify(error)` and in structured logs. On the transaction APIs a fenced
+  epoch now arrives as `PRODUCER_FENCED` (90) rather than `INVALID_PRODUCER_EPOCH` (47); code that
+  matched 47 should match `error.category` or both codes. Outside a transaction,
+  `KafkaJSNumberOfRetriesExceeded` means the send ran out of its retry budget; the producer remains
+  usable, and retrying the send is safe on an idempotent producer.
+
 ### TypeScript: source-breaking type changes
 
 The runtime is unchanged by these; they can fail `tsc` on an existing codebase.

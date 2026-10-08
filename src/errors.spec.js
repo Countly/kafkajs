@@ -1,3 +1,4 @@
+const errors = require('./errors')
 const {
   isRebalancing,
   isStaleCoordinator,
@@ -11,8 +12,17 @@ const {
   KafkaJSNonRetriableError,
   KafkaJSNumberOfRetriesExceeded,
   KafkaJSProtocolError,
-} = require('./errors')
+  KafkaJSRefreshRetriableError,
+  KafkaJSTransactionAbortableError,
+  KafkaJSApplicationRecoverableError,
+  KafkaJSInvalidConfigurationError,
+  KafkaJSDeliveryTimeout,
+  KafkaJSAggregateError,
+  KafkaJSFetcherRebalanceError,
+} = errors
 const { createErrorFromCode, errorCodes } = require('./protocol/error')
+const { classify } = require('./producer/state/errorClassifier')
+const packageEntry = require('../index')
 
 describe('isRebalancing', () => {
   it.each(['REBALANCE_IN_PROGRESS', 'NOT_COORDINATOR_FOR_GROUP', 'ILLEGAL_GENERATION'])(
@@ -193,4 +203,227 @@ describe('the shipped error table, for the codes the membership depends on', () 
       expect(entry.retriable).toBe(false)
     }
   )
+})
+
+const CATEGORIES = [
+  'retriable',
+  'refreshRetriable',
+  'abortable',
+  'applicationRecoverable',
+  'invalidConfiguration',
+]
+const RETRIABLE_CATEGORIES = ['retriable', 'refreshRetriable']
+const CATEGORY_CLASS_NAMES = [
+  'KafkaJSRefreshRetriableError',
+  'KafkaJSTransactionAbortableError',
+  'KafkaJSApplicationRecoverableError',
+  'KafkaJSInvalidConfigurationError',
+  'KafkaJSDeliveryTimeout',
+]
+
+describe('the five category classes', () => {
+  test.each([
+    [
+      'KafkaJSRefreshRetriableError',
+      KafkaJSRefreshRetriableError,
+      KafkaJSError,
+      true,
+      'refreshRetriable',
+    ],
+    [
+      'KafkaJSTransactionAbortableError',
+      KafkaJSTransactionAbortableError,
+      KafkaJSNonRetriableError,
+      false,
+      'abortable',
+    ],
+    [
+      'KafkaJSApplicationRecoverableError',
+      KafkaJSApplicationRecoverableError,
+      KafkaJSNonRetriableError,
+      false,
+      'applicationRecoverable',
+    ],
+    [
+      'KafkaJSInvalidConfigurationError',
+      KafkaJSInvalidConfigurationError,
+      KafkaJSNonRetriableError,
+      false,
+      'invalidConfiguration',
+    ],
+    [
+      'KafkaJSDeliveryTimeout',
+      KafkaJSDeliveryTimeout,
+      KafkaJSNonRetriableError,
+      false,
+      'abortable',
+    ],
+  ])('%s', (name, ErrorClass, Parent, retriable, category) => {
+    const cause = new KafkaJSError('the error underneath')
+    const error = new ErrorClass('the message', { cause })
+
+    expect(error).toBeInstanceOf(Parent)
+    expect(error).toBeInstanceOf(KafkaJSError)
+    expect(error).toMatchObject({ name, message: 'the message', retriable, category })
+    expect(error.cause).toBe(cause)
+  })
+
+  test('a delivery timeout is abortable, whatever error it gave up on', () => {
+    const error = new KafkaJSDeliveryTimeout('Delivery timed out after 120000 ms', {
+      cause: new KafkaJSError('NOT_LEADER_FOR_PARTITION, still retrying'),
+    })
+
+    expect(error.category).toEqual('abortable')
+    expect(error.retriable).toBe(false)
+  })
+
+  test('each is exported from the package entry as the same class', () => {
+    for (const name of CATEGORY_CLASS_NAMES) {
+      expect(typeof errors[name]).toEqual('function')
+      expect(packageEntry[name]).toBe(errors[name])
+    }
+  })
+
+  test('error.retriable === true holds for the two retriable categories and for none of the others', () => {
+    const byCategory = {
+      retriable: new KafkaJSError('a'),
+      refreshRetriable: new KafkaJSRefreshRetriableError('b'),
+      abortable: new KafkaJSTransactionAbortableError('c'),
+      applicationRecoverable: new KafkaJSApplicationRecoverableError('d'),
+      invalidConfiguration: new KafkaJSInvalidConfigurationError('e'),
+    }
+
+    for (const [category, error] of Object.entries(byCategory)) {
+      expect(error.category).toEqual(category)
+      expect(error.retriable === true).toBe(RETRIABLE_CATEGORIES.includes(category))
+    }
+  })
+})
+
+describe('every error class this package exports carries an own, enumerable category', () => {
+  // Constructor arguments for the classes that need more than a message.
+  const ARGUMENTS = {
+    KafkaJSOffsetOutOfRange: () => [createErrorFromCode(1), { topic: 'topic', partition: 0 }],
+    KafkaJSMemberIdRequired: () => [createErrorFromCode(79), { memberId: 'member' }],
+    KafkaJSNumberOfRetriesExceeded: () => [
+      createErrorFromCode(7),
+      { retryCount: 5, retryTime: 100 },
+    ],
+    KafkaJSDeleteTopicRecordsError: () => [{ partitions: [] }],
+    KafkaJSAggregateError: () => ['two topics failed', []],
+  }
+  const CLASSES = Object.entries(errors).filter(
+    ([, value]) => typeof value === 'function' && value.prototype instanceof Error
+  )
+
+  test('the list includes the five category classes', () => {
+    const names = CLASSES.map(([name]) => name)
+    expect(names).toEqual(expect.arrayContaining(CATEGORY_CLASS_NAMES))
+  })
+
+  test.each(CLASSES)('%s', (name, ErrorClass) => {
+    const error = new ErrorClass(...(ARGUMENTS[name] ? ARGUMENTS[name]() : ['boom']))
+
+    expect(Object.keys(error)).toContain('category')
+    expect(CATEGORIES).toContain(error.category)
+    expect(RETRIABLE_CATEGORIES.includes(error.category)).toBe(error.retriable === true)
+    expect(JSON.parse(JSON.stringify(error)).category).toEqual(error.category)
+  })
+
+  test('the two errors outside the KafkaJSError tree carry it too, and the fetcher signal keeps its name', () => {
+    const rebalance = new KafkaJSFetcherRebalanceError()
+
+    expect(new KafkaJSAggregateError('two topics failed', []).category).toEqual(
+      'applicationRecoverable'
+    )
+    expect(rebalance.category).toEqual('applicationRecoverable')
+    expect(rebalance.name).toEqual('Error')
+  })
+})
+
+describe('a protocol error rebuilt from another one', () => {
+  test('keeps the category a producer request refined, not the one its code has everywhere', () => {
+    const rejected = createErrorFromCode(87)
+
+    expect(rejected.category).toEqual('applicationRecoverable')
+    classify(rejected, 'produce', { transactional: true })
+    expect(rejected.category).toEqual('invalidConfiguration')
+
+    expect(new KafkaJSProtocolError(rejected).category).toEqual('invalidConfiguration')
+  })
+
+  test('takes the category the flag it is built with implies, whatever the row said', () => {
+    const row = { type: 'CLUSTER_AUTHORIZATION_FAILED', code: 31, retriable: false, message: 'm' }
+
+    expect(new KafkaJSProtocolError(row).category).toEqual('invalidConfiguration')
+
+    const forced = new KafkaJSProtocolError(row, { retriable: true })
+
+    expect(forced.retriable).toBe(true)
+    expect(forced.category).toEqual('retriable')
+  })
+})
+
+describe('a wrap keeps the wrapped error category when it keeps its retriable flag', () => {
+  test('a non-retriable wrap of a non-retriable error keeps its category', () => {
+    expect(
+      new KafkaJSNonRetriableError(new KafkaJSInvalidConfigurationError('fix the ACL')).category
+    ).toEqual('invalidConfiguration')
+    expect(
+      new KafkaJSNonRetriableError(new KafkaJSTransactionAbortableError('abort it')).category
+    ).toEqual('abortable')
+  })
+
+  test('a wrap that changes the retriable flag takes the category its own flag implies', () => {
+    const exceeded = new KafkaJSNumberOfRetriesExceeded(new KafkaJSRefreshRetriableError('moved'), {
+      retryCount: 5,
+      retryTime: 100,
+    })
+
+    expect(exceeded.retriable).toBe(false)
+    expect(exceeded.category).toEqual('applicationRecoverable')
+    expect(new KafkaJSError(new KafkaJSInvalidConfigurationError('x')).category).toEqual(
+      'retriable'
+    )
+  })
+
+  test('a message wrapped around a cause keeps the cause category on the same terms', () => {
+    const fixTheAcl = new KafkaJSInvalidConfigurationError('fix the ACL')
+
+    expect(
+      new KafkaJSNonRetriableError('Could not initialize the producer', { cause: fixTheAcl })
+        .category
+    ).toEqual('invalidConfiguration')
+    expect(
+      new KafkaJSNonRetriableError('Could not initialize the producer', {
+        cause: new KafkaJSRefreshRetriableError('moved'),
+      }).category
+    ).toEqual('applicationRecoverable')
+    expect(
+      new KafkaJSNonRetriableError(new KafkaJSTransactionAbortableError('abort it'), {
+        cause: fixTheAcl,
+      }).category
+    ).toEqual('abortable')
+  })
+
+  test('without a wrapped category the retriable flag decides', () => {
+    expect(new KafkaJSError('boom').category).toEqual('retriable')
+    expect(new KafkaJSError('boom', { retriable: false }).category).toEqual(
+      'applicationRecoverable'
+    )
+    expect(new KafkaJSNonRetriableError(new Error('plain')).category).toEqual(
+      'applicationRecoverable'
+    )
+  })
+
+  test('a protocol error keeps every code its table row gave it', () => {
+    for (const row of errorCodes) {
+      expect(createErrorFromCode(row.code)).toMatchObject({
+        type: row.type,
+        code: row.code,
+        retriable: row.retriable,
+      })
+      expect(createErrorFromCode(row.code)).toBeInstanceOf(KafkaJSProtocolError)
+    }
+  })
 })

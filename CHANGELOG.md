@@ -366,11 +366,15 @@ Adopted upstream PRs are credited here by number as they land (Phase 2 onward).
 
 #### Behavior changes
 
+- **Every error carries a `category`, naming the remedy** (KIP-1050). Each error this client raises through a KafkaJS error class has an own, enumerable `category` — `retriable`, `refreshRetriable`, `abortable`, `applicationRecoverable` or `invalidConfiguration`: retry it, refresh metadata or the coordinator and retry it, abort the transaction and keep the producer, create a new producer, or fix the configuration, record or ACL. It is stamped on the error the client already produced and nothing is re-wrapped, so `name`, `instanceof` and every attached field (`type`, `code`, `topic`, `partition`, `recordErrors`, the leader hint) are unchanged, and `error.retriable` keeps its meaning: it is `true` exactly when the category is `retriable` or `refreshRetriable`, for every code in the protocol error table. A protocol error carries the category its code has on every request, and the transactional producer refines it for the request that failed — `INVALID_TXN_STATE` is abortable on Produce, a stale generation on a transactional offset commit means abort and rejoin. An error built from another one keeps its category when the two agree on `retriable`, as it already kept `type` and `code`, and so does one built from a message and a `cause`. Because the field is enumerable it appears in `JSON.stringify(error)` and in structured logs, so a snapshot of a serialized error gains one key.
+
 #### Fixes
 
 - A consumer's tracked leader epoch is no longer overwritten by a late committed-offset reply. Every broker a consumer fetches from resolves the group's committed offsets for the whole assignment, so after a join several `OffsetFetch` requests can be in flight at once; one answered after the consumer had already moved — consumed a record, or applied a `seek()` — replaced that position's epoch with the committed one, which is −1 for an offset committed without an epoch. `uncommittedOffsets()` then reported `leaderEpoch: -1` for a position that had a real epoch, the next commit carried it, and position validation (KIP-320) was off for that partition until it consumed again. A committed epoch now seeds a position only while that position is still the committed offset or has not been resolved yet, and an unknown committed epoch (−1) never replaces a known one.
 
 #### Additions
+
+- Five error classes, exported from the package root: `KafkaJSTransactionAbortableError` (`abortable`), `KafkaJSApplicationRecoverableError` (`applicationRecoverable`), `KafkaJSInvalidConfigurationError` (`invalidConfiguration`) and `KafkaJSDeliveryTimeout` (`abortable` — a send that ran out of its delivery deadline), all subclasses of `KafkaJSNonRetriableError`, and `KafkaJSRefreshRetriableError` (`refreshRetriable`), a retriable `KafkaJSError`. `KafkaJSAggregateError` and `KafkaJSFetcherRebalanceError`, which extend `Error` directly, carry `category` too; the latter keeps its `name` of `'Error'`.
 
 #### Tooling
 

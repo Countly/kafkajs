@@ -1,13 +1,60 @@
 const pkgJson = require('../package.json')
 const { bugs } = pkgJson
 
+const { categoryOf } = require('./protocol/errorCategories')
+
+/**
+ * @param {*} source an error, or whatever a constructor was given in its place
+ * @param {boolean} retriable the `retriable` flag of the error being built
+ * @returns {string|undefined} the source's category, when it carries one and the same flag
+ */
+const keptCategory = (source, retriable) =>
+  source != null && typeof source.category === 'string' && source.retriable === retriable
+    ? source.category
+    : undefined
+
+/**
+ * The category a new error starts with (KIP-1050): the one it keeps from the error it wraps — the
+ * constructor's first argument, else its `cause` — when that error has the same `retriable` flag;
+ * otherwise the one the flag implies. Keeping a category only when the flag is kept is what makes
+ * `retriable === true` hold exactly for the `retriable` and `refreshRetriable` categories.
+ * @param {*} e the constructor's first argument: a message, or the error being wrapped
+ * @param {Error|undefined} cause the constructor's `cause` option
+ * @param {boolean} retriable the new error's `retriable` flag
+ * @returns {string}
+ */
+const initialCategory = (e, cause, retriable) =>
+  keptCategory(e, retriable) ??
+  keptCategory(cause, retriable) ??
+  (retriable === true ? 'retriable' : 'applicationRecoverable')
+
+/**
+ * Base class of the errors this client raises.
+ *
+ * `retriable` says whether repeating the operation may succeed. `category` (KIP-1050) says what
+ * the caller should do: `retriable` and `refreshRetriable` errors are retried by the client,
+ * `abortable` ends the current transaction but keeps the producer, `applicationRecoverable` needs a
+ * new producer, and `invalidConfiguration` needs the configuration, the record or an ACL fixed.
+ * `retriable === true` exactly when the category is `retriable` or `refreshRetriable`. An error
+ * built from another one keeps its `type` and `code`, and keeps its `category` — taken from the
+ * first argument or, for a message, from `cause` — when the two errors agree on `retriable`.
+ * `category` is own and enumerable, so it appears in `JSON.stringify(error)`.
+ * @see https://cwiki.apache.org/confluence/display/KAFKA/KIP-1050:+Consistent+error+handling+for+Transactions
+ */
 class KafkaJSError extends Error {
+  /**
+   * @param {Error|string|object} e the message, or the error this one is built from
+   * @param {object} [options]
+   * @param {boolean} [options.retriable=true]
+   * @param {Error} [options.cause]
+   */
   constructor(e, { retriable = true, cause } = {}) {
     super(e, { cause })
     Error.captureStackTrace(this, this.constructor)
     this.message = e.message || e
     this.name = 'KafkaJSError'
     this.retriable = retriable
+    this.category = initialCategory(e, cause, retriable)
     this.helpUrl = e.helpUrl
     this.cause = cause
 
@@ -30,12 +77,27 @@ class KafkaJSNonRetriableError extends KafkaJSError {
   }
 }
 
+/**
+ * An error the broker reported by its Kafka error code. Its `category` is the one the code has on
+ * every request; a category that depends on the request (INVALID_RECORD on Produce, say) is
+ * stamped later by the producer's classifier, which knows which request failed. An error rebuilt
+ * from another protocol error keeps that error's category.
+ */
 class KafkaJSProtocolError extends KafkaJSError {
+  /**
+   * @param {{ type: string, code: number, retriable: boolean, message: string, category?: string }} e
+   *   a row of the protocol error table, or an error built from one
+   * @param {{ retriable?: boolean }} [options] overrides the row's `retriable` flag
+   */
   constructor(e, { retriable = e.retriable } = {}) {
     super(e, { retriable })
     this.type = e.type
     this.code = e.code
     this.name = 'KafkaJSProtocolError'
+
+    if (typeof e.code === 'number' && e.category === undefined) {
+      this.category = categoryOf(e.code, { retriable: this.retriable })
+    }
   }
 }
 
@@ -269,20 +331,125 @@ class KafkaJSAlterPartitionReassignmentsError extends KafkaJSProtocolError {
   }
 }
 
+/**
+ * Several errors from one request, reported together (one per failed topic or partition). It
+ * extends `Error` directly, so it sets `category` itself: the caller has to inspect `errors`.
+ */
 class KafkaJSAggregateError extends Error {
+  /**
+   * @param {string} message
+   * @param {Error[]} errors
+   */
   constructor(message, errors) {
     super(message)
     this.errors = errors
     this.name = 'KafkaJSAggregateError'
+    this.category = 'applicationRecoverable'
   }
 }
 
-class KafkaJSFetcherRebalanceError extends Error {}
+/**
+ * Raised inside the fetch loop to make a fetcher stop and start again when the group rebalances.
+ * Flow control rather than a failure; it extends `Error` directly and keeps the `name` `'Error'`
+ * it has always had, so it only gains the `category` every error carries.
+ */
+class KafkaJSFetcherRebalanceError extends Error {
+  constructor() {
+    super(...arguments)
+    this.category = 'applicationRecoverable'
+  }
+}
 
 class KafkaJSNoBrokerAvailableError extends KafkaJSError {
   constructor() {
     super('No broker available')
     this.name = 'KafkaJSNoBrokerAvailableError'
+  }
+}
+
+/**
+ * A transient error the client recovers from by refreshing what it knows — topic metadata, or the
+ * coordinator — and retrying. Retriable, like every `KafkaJSError` whose `retriable` is true.
+ * @see https://github.com/apache/kafka/blob/4.3/clients/src/main/java/org/apache/kafka/common/errors/RefreshRetriableException.java
+ */
+class KafkaJSRefreshRetriableError extends KafkaJSError {
+  /**
+   * @param {Error|string} e
+   * @param {{ cause?: Error }} [options]
+   */
+  constructor(e, { cause } = {}) {
+    super(e, { retriable: true, cause })
+    this.name = 'KafkaJSRefreshRetriableError'
+    this.category = 'refreshRetriable'
+  }
+}
+
+/**
+ * The current transaction cannot complete and has to be aborted; the producer stays usable for
+ * the next one. `commit()` rejects with it and `abort()` succeeds.
+ * @see https://github.com/apache/kafka/blob/4.3/clients/src/main/java/org/apache/kafka/common/errors/TransactionAbortableException.java
+ */
+class KafkaJSTransactionAbortableError extends KafkaJSNonRetriableError {
+  /**
+   * @param {Error|string} e
+   * @param {{ cause?: Error }} [options]
+   */
+  constructor(e, { cause } = {}) {
+    super(e, { cause })
+    this.name = 'KafkaJSTransactionAbortableError'
+    this.category = 'abortable'
+  }
+}
+
+/**
+ * The producer cannot continue — it was fenced, or its producer id is no longer valid — and has
+ * to be replaced by a new instance; every later call on it rejects.
+ * @see https://github.com/apache/kafka/blob/4.3/clients/src/main/java/org/apache/kafka/common/errors/ApplicationRecoverableException.java
+ */
+class KafkaJSApplicationRecoverableError extends KafkaJSNonRetriableError {
+  /**
+   * @param {Error|string} e
+   * @param {{ cause?: Error }} [options]
+   */
+  constructor(e, { cause } = {}) {
+    super(e, { cause })
+    this.name = 'KafkaJSApplicationRecoverableError'
+    this.category = 'applicationRecoverable'
+  }
+}
+
+/**
+ * The configuration, a record or an ACL is wrong: retrying, aborting or re-creating the producer
+ * does not help until it is fixed.
+ * @see https://cwiki.apache.org/confluence/display/KAFKA/KIP-1050:+Consistent+error+handling+for+Transactions
+ */
+class KafkaJSInvalidConfigurationError extends KafkaJSNonRetriableError {
+  /**
+   * @param {Error|string} e
+   * @param {{ cause?: Error }} [options]
+   */
+  constructor(e, { cause } = {}) {
+    super(e, { cause })
+    this.name = 'KafkaJSInvalidConfigurationError'
+    this.category = 'invalidConfiguration'
+  }
+}
+
+/**
+ * A send did not complete within `deliveryTimeout` ms (KIP-91); `cause` is the last error it
+ * met. Abortable: inside a transaction the transaction has to be aborted, outside one the producer
+ * stays usable.
+ * @see https://cwiki.apache.org/confluence/display/KAFKA/KIP-91+Provide+Intuitive+User+Timeouts+in+The+Producer
+ */
+class KafkaJSDeliveryTimeout extends KafkaJSNonRetriableError {
+  /**
+   * @param {Error|string} e
+   * @param {{ cause?: Error }} [options]
+   */
+  constructor(e, { cause } = {}) {
+    super(e, { cause })
+    this.name = 'KafkaJSDeliveryTimeout'
+    this.category = 'abortable'
   }
 }
 
@@ -411,6 +578,11 @@ module.exports = {
   KafkaJSFetcherRebalanceError,
   KafkaJSNoBrokerAvailableError,
   KafkaJSAlterPartitionReassignmentsError,
+  KafkaJSRefreshRetriableError,
+  KafkaJSTransactionAbortableError,
+  KafkaJSApplicationRecoverableError,
+  KafkaJSInvalidConfigurationError,
+  KafkaJSDeliveryTimeout,
   isRebalancing,
   isStaleCoordinator,
   isLostMember,
