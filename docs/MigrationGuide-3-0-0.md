@@ -575,6 +575,21 @@ The producer becomes idempotent by default and transactions move to the transact
   `KafkaJSNumberOfRetriesExceeded` means the send ran out of its retry budget; the producer remains
   usable, and retrying the send is safe on an idempotent producer.
 
+- **A consumer resolving its position waits for open transactions** (KIP-447). Every `OffsetFetch`
+  a consumer sends to find its committed offsets now asks for stable offsets (`RequireStable`),
+  under both group protocols and whatever the isolation level, as the Java consumer does. A
+  partition whose committed offset is held by a transaction that is still open answers
+  `UNSTABLE_OFFSET_COMMIT`, and the consumer asks again — after 100 ms, backing off to once a
+  second — until the transaction commits or aborts, for at most its rebalance timeout
+  (`maxPollInterval`, 300 000 ms by default). While it waits it still counts as polling, and it
+  stops waiting within a second for a `stop()` or for a rebalance that pauses fetching. Position
+  resolution can therefore take longer while a transaction is open. A transaction left open past
+  that bound fails the lookup with `UNSTABLE_OFFSET_COMMIT` (retriable) — 2.2.4 never raised it
+  here, because it read the unstable offset — and the consumer's retry policy retries the lookup.
+  `admin.fetchOffsets` is unchanged.
+  *What to do:* no action. If you run long transactions, note that a rebalancing consumer waits
+  for them to resolve instead of reading a position that may be rolled back.
+
 ### TypeScript: source-breaking type changes
 
 The runtime is unchanged by these; they can fail `tsc` on an existing codebase.

@@ -13,9 +13,16 @@ const indexTopics = (topics) => topics.reduce((obj, topic) => assign(obj, { [top
 
 /** @see https://github.com/apache/kafka/blob/4.3/clients/src/main/java/org/apache/kafka/common/protocol/Errors.java */
 const STALE_MEMBER_EPOCH = 'STALE_MEMBER_EPOCH'
+const UNSTABLE_OFFSET_COMMIT = 'UNSTABLE_OFFSET_COMMIT'
 
-/** How long a stale-epoch offset fetch waits before re-sending under the epoch it holds by then. */
-const STALE_EPOCH_RETRY_INTERVAL = 100
+/**
+ * How long a retried offset fetch first waits before it is sent again, and the ceiling an
+ * UNSTABLE_OFFSET_COMMIT wait doubles up to: the Java client's `retry.backoff.ms` and
+ * `retry.backoff.max.ms` defaults.
+ * @see https://github.com/apache/kafka/blob/4.3/clients/src/main/java/org/apache/kafka/clients/CommonClientConfigs.java
+ */
+const RETRY_INTERVAL = 100
+const UNSTABLE_RETRY_MAX_INTERVAL = 1000
 
 /** Used when no logger is injected, so a manager built without one still runs and logs nothing. */
 const SILENT_LOGGER = { debug() {}, info() {}, warn() {}, error() {} }
@@ -73,25 +80,35 @@ module.exports = class OffsetManager {
    *                                member runs. Under `'consumer'` the offset fetch carries the
    *                                member id and epoch, which is how the coordinator validates a
    *                                read against a live member (KIP-848).
-   * @param {number} [options.staleEpochTimeout=300000] how long an offset fetch answered with a
-   *                                stale member epoch keeps being re-sent under a fresh one.
+   * @param {number} [options.staleEpochTimeout=300000] how long an offset fetch answered with
+   *                                UNSTABLE_OFFSET_COMMIT, or with a stale member epoch, keeps
+   *                                being re-sent.
    * @param {() => {generationId: number, memberId: string,
    *                                coordinator: import("../../../types").Broker}} [options.membership]
    *                                a LIVE read of the membership this manager should send under.
-   *                                The stale-epoch retry consults it before every attempt, because
-   *                                the epoch it needs is installed by the heartbeats while the
-   *                                retry loop is running - a snapshot would re-send the rejected
-   *                                epoch forever. Defaults to this manager's own snapshot, which
-   *                                is what every caller that has no membership to offer wants.
+   *                                The offset-fetch retry consults it before every attempt under
+   *                                the consumer protocol, because the epoch it needs is installed
+   *                                by the heartbeats while the retry loop is running - a snapshot
+   *                                would re-send a rejected epoch forever. Defaults to this
+   *                                manager's own snapshot, which is what every caller that has no
+   *                                membership to offer wants.
    * @param {() => boolean} [options.isStopping] whether the consumer has been asked to stop. The
-   *                                stale-epoch retry abandons its deadline the moment this is
+   *                                offset-fetch retry abandons its deadline the moment this is
    *                                true, because the fetch loop it runs inside is one
    *                                `Runner#stop()` waits for.
+   * @param {() => boolean} [options.isRebalancePending] whether a rebalance is waiting for the
+   *                                current fetch round to end. The offset-fetch retry abandons its
+   *                                deadline the moment this is true, so the member can rejoin.
+   *                                Defaults to never.
+   * @param {() => void} [options.markPolled] called before each UNSTABLE_OFFSET_COMMIT re-send: a
+   *                                fetch round waiting on an open transaction is still polling, as
+   *                                an empty round is. Defaults to a no-op.
    * @param {import('../../../types').Logger} [options.logger] where this manager reports a stale
-   *                                member epoch. Optional and silent by default: the consumer group
-   *                                is the only production caller and passes its own namespaced
-   *                                logger, while every test that constructs a manager directly
-   *                                cares about offsets rather than log lines.
+   *                                member epoch and why an offset fetch is re-sent. Optional and
+   *                                silent by default: the consumer group is the only production
+   *                                caller and passes its own namespaced logger, while every test
+   *                                that constructs a manager directly cares about offsets rather
+   *                                than log lines.
    */
   constructor({
     cluster,
@@ -111,6 +128,8 @@ module.exports = class OffsetManager {
     staleEpochTimeout = 300000,
     membership = null,
     isStopping = null,
+    isRebalancePending = null,
+    markPolled = null,
     logger = SILENT_LOGGER,
   }) {
     this.cluster = cluster
@@ -147,6 +166,8 @@ module.exports = class OffsetManager {
         coordinator: this.coordinator,
       }))
     this.isStopping = isStopping || (() => false)
+    this.isRebalancePending = isRebalancePending || (() => false)
+    this.markPolled = markPolled || (() => {})
     this.logger = logger
 
     this.autoCommit = autoCommit
@@ -788,29 +809,41 @@ module.exports = class OffsetManager {
   }
 
   /**
-   * One OffsetFetch, carrying this member's identity when the coordinator wants it.
+   * One OffsetFetch, carrying this member's identity when the coordinator wants it, and asking for
+   * stable offsets only.
    *
    * Under the consumer group protocol the coordinator validates the read against a live member, so
    * the request carries `MemberId` and `MemberEpoch` (OffsetFetch v9). Under the classic protocol -
    * and for every admin read - nothing is sent and the request is byte-identical to what it was.
    * @see https://github.com/apache/kafka/blob/4.3/clients/src/main/resources/common/message/OffsetFetchRequest.json
    *
-   * A stale member epoch is re-sent under whatever epoch the heartbeats have installed, while one
-   * is available and the deadline has not passed - Java's
-   * `isStaleEpochErrorAndValidEpochAvailable`. The epoch is re-read from the injected `membership`
-   * accessor before EVERY attempt, because it is the heartbeat chain that installs a fresh one
-   * while this loop is sleeping; re-sending this manager's construction-time snapshot would draw
-   * the same answer until the deadline. A stop abandons the loop at once: the fetch round it runs
-   * inside is one `Runner#stop()` waits for. The error is NOT made retriable in the error table:
-   * that would change every other decoder of a 113, including the admin client's.
+   * Every request sets `RequireStable` (OffsetFetch v7+; dropped below), under both protocols and
+   * whatever the isolation level, as the Java consumer does: a partition with a transactional
+   * offset commit still open answers UNSTABLE_OFFSET_COMMIT instead of an offset the transaction
+   * may yet roll back (KIP-447).
+   * @see https://cwiki.apache.org/confluence/display/KAFKA/KIP-447%3A+Producer+scalability+for+exactly+once+semantics
+   *
+   * Two answers are re-sent until the deadline (`staleEpochTimeout`, on a monotonic clock)
+   * passes. UNSTABLE_OFFSET_COMMIT, under both protocols, until the transaction resolves: 100 ms
+   * apart at first, doubling to a 1 000 ms ceiling, and each re-send counts as a poll
+   * (`markPolled`) so a member waiting on a transaction is not evicted for it. A stale member
+   * epoch, under the consumer protocol while the member holds an epoch, 100 ms apart - Java's
+   * `isStaleEpochErrorAndValidEpochAvailable`. Under the consumer protocol the membership is
+   * re-read from the injected `membership` accessor before EVERY attempt, because it is the
+   * heartbeat chain that installs a fresh epoch while this loop is sleeping; re-sending this
+   * manager's construction-time snapshot would draw the same answer until the deadline. A stop or
+   * a pending rebalance abandons the loop within one interval: the fetch round it runs inside is
+   * one that `Runner#stop()` and the rejoin both wait for. Neither error is made retriable in the
+   * error table: that would change every other decoder of them, including the admin client's.
    * @private
    * @param {{topic: string, partitions: {partition: number}[]}[]} topics
    * @returns {Promise<{responses: Array}>}
-   * @throws {Error} the last error, once the deadline passes, the consumer is stopping, or the
-   *   member has no epoch
+   * @throws {Error} the last error, once the deadline passes, the consumer is stopping, a
+   *   rebalance is pending, or - for a stale epoch - the member has no epoch
    */
   async fetchCommittedOffsets(topics) {
-    const deadline = Date.now() + this.staleEpochTimeout
+    const deadline = performance.now() + this.staleEpochTimeout
+    let unstableInterval = RETRY_INTERVAL
 
     for (;;) {
       if (this.membershipProtocol === 'consumer') {
@@ -828,28 +861,44 @@ module.exports = class OffsetManager {
           groupId: this.groupId,
           topics,
           ...memberFields,
+          requireStable: true,
         })
       } catch (e) {
+        const unstable = e.type === UNSTABLE_OFFSET_COMMIT
+        const staleEpoch =
+          e.type === STALE_MEMBER_EPOCH &&
+          this.membershipProtocol === 'consumer' &&
+          this.generationId > 0
+
         if (
-          e.type !== STALE_MEMBER_EPOCH ||
-          this.membershipProtocol !== 'consumer' ||
-          this.generationId <= 0 ||
+          !(unstable || staleEpoch) ||
           this.isStopping() ||
-          Date.now() >= deadline
+          this.isRebalancePending() ||
+          performance.now() >= deadline
         ) {
           throw e
         }
 
-        this.logger.debug('OffsetFetch rejected with a stale member epoch, re-sending', {
-          groupId: this.groupId,
-          memberId: this.memberId,
-          memberEpoch: this.generationId,
-        })
+        this.logger.debug(
+          unstable
+            ? 'OffsetFetch answered while a transactional offset commit is open, re-sending'
+            : 'OffsetFetch rejected with a stale member epoch, re-sending',
+          {
+            groupId: this.groupId,
+            memberId: this.memberId,
+            memberEpoch: this.generationId,
+          }
+        )
 
-        await sleep(STALE_EPOCH_RETRY_INTERVAL)
+        await sleep(unstable ? unstableInterval : RETRY_INTERVAL)
 
-        if (this.isStopping()) {
+        if (this.isStopping() || this.isRebalancePending()) {
           throw e
+        }
+
+        if (unstable) {
+          unstableInterval = Math.min(unstableInterval * 2, UNSTABLE_RETRY_MAX_INTERVAL)
+          this.markPolled()
         }
       }
     }
