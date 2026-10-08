@@ -1,53 +1,49 @@
-/* eslint-disable */
-const Long = require('../../../utils/long')
-
-// Based on the kafka client 0.10.2 murmur2 implementation
-// https://github.com/apache/kafka/blob/0.10.2/clients/src/main/java/org/apache/kafka/common/utils/Utils.java#L364
-
-const SEED = Long.fromValue(0x9747b28c)
+const SEED = 0x9747b28c
 
 // 'm' and 'r' are mixing constants generated offline.
 // They're not really 'magic', they just happen to work well.
-const M = Long.fromValue(0x5bd1e995)
-const R = Long.fromValue(24)
+const M = 0x5bd1e995
+const R = 24
 
+/**
+ * Kafka's murmur2 hash, as `Utils.murmur2` computes it, so a keyed record lands on the partition a
+ * Java producer picks for the same key bytes.
+ *
+ * Every step is 32-bit integer arithmetic, exactly as in Java: `Math.imul` is Java's wrapping
+ * `int` multiply, `>>>` its unsigned shift, and each 4-byte block is read little-endian as Java's
+ * `INT_HANDLE` reads it. No 64-bit emulation is needed, so nothing is allocated per block on a
+ * path every keyed record takes.
+ * @see https://github.com/apache/kafka/blob/4.3/clients/src/main/java/org/apache/kafka/common/utils/Utils.java
+ * @param {Buffer|string|number} key a Buffer is hashed as is; anything else as the bytes of `String(key)`
+ * @returns {number} the signed 32-bit hash
+ */
 module.exports = (key) => {
   const data = Buffer.isBuffer(key) ? key : Buffer.from(String(key))
   const length = data.length
+  const tail = length & ~3
+  let h = SEED ^ length
 
-  // Initialize the hash to a random value
-  let h = Long.fromValue(SEED.xor(length))
-  let length4 = Math.floor(length / 4)
-
-  for (let i = 0; i < length4; i++) {
-    const i4 = i * 4
-    let k =
-      (data[i4 + 0] & 0xff) +
-      ((data[i4 + 1] & 0xff) << 8) +
-      ((data[i4 + 2] & 0xff) << 16) +
-      ((data[i4 + 3] & 0xff) << 24)
-    k = Long.fromValue(k)
-    k = k.multiply(M)
-    k = k.xor(k.toInt() >>> R)
-    k = Long.fromValue(k).multiply(M)
-    h = h.multiply(M)
-    h = h.xor(k)
+  for (let i = 0; i < tail; i += 4) {
+    let k = data.readInt32LE(i)
+    k = Math.imul(k, M)
+    k ^= k >>> R
+    k = Math.imul(k, M)
+    h = Math.imul(h, M) ^ k
   }
 
-  // Handle the last few bytes of the input array
-  switch (length % 4) {
+  switch (length - tail) {
     case 3:
-      h = h.xor((data[(length & ~3) + 2] & 0xff) << 16)
+      h ^= data[tail + 2] << 16
+    // falls through
     case 2:
-      h = h.xor((data[(length & ~3) + 1] & 0xff) << 8)
+      h ^= data[tail + 1] << 8
+    // falls through
     case 1:
-      h = h.xor(data[length & ~3] & 0xff)
-      h = h.multiply(M)
+      h ^= data[tail]
+      h = Math.imul(h, M)
   }
 
-  h = h.xor(h.toInt() >>> 13)
-  h = h.multiply(M)
-  h = h.xor(h.toInt() >>> 15)
-
-  return h.toInt()
+  h ^= h >>> 13
+  h = Math.imul(h, M)
+  return h ^ (h >>> 15)
 }

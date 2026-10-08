@@ -213,7 +213,13 @@ kafka.producer({ createPartitioner: MyPartitioner })
 
 ### Default Partitioners
 
-KafkaJS ships with 2 partitioners: `DefaultPartitioner` and `LegacyPartitioner`.
+KafkaJS ships with 3 partitioners: `DefaultPartitioner`, `UniformStickyPartitioner` and `LegacyPartitioner`.
+
+| Partitioner | Keyed records | Records without a key | Choose it when |
+|---|---|---|---|
+| `DefaultPartitioner` (the default) | `murmur2(key)`, as the Java client | round-robin over the partitions that have a leader | you need Java-compatible keyed placement and an even spread of every keyless record |
+| `UniformStickyPartitioner()` | the same as `DefaultPartitioner` | one partition per topic until `stickyBytes` have gone to it, then a new one picked at random (it may be the same partition again) | most records have no key and you want fewer, larger batches per partition (see below) |
+| `LegacyPartitioner` | the hash KafkaJS used before v2.0.0 | round-robin | you need the partitioning of KafkaJS before v2.0.0 |
 
 The `DefaultPartitioner` should be compatible with the default partitioner that ships with the Java Kafka client. This can be important to meet the [co-partitioning requirement](https://docs.confluent.io/current/ksql/docs/developer-guide/partition-data.html#co-partitioning-requirements) when joining multiple topics.
 
@@ -227,6 +233,37 @@ by importing it and providing it to the Producer constructor:**
 > const { Partitioners } = require('@countly/kafkajs')
 > kafka.producer({ createPartitioner: Partitioners.LegacyPartitioner })
 > ```
+
+#### Uniform sticky partitioner
+
+`UniformStickyPartitioner` is the strictly uniform sticky partitioner of KIP-794. It is opt-in, and
+unlike the other two you call it: pass `Partitioners.UniformStickyPartitioner()` for the defaults, or
+call it with options:
+
+```javascript
+const { Partitioners } = require('@countly/kafkajs')
+kafka.producer({ createPartitioner: Partitioners.UniformStickyPartitioner({ stickyBytes: 16384 }) })
+```
+
+| Option | Description | Default |
+|---|---|---|
+| stickyBytes | Bytes of key and value assigned to one partition before the next record without a key picks another | `16384` |
+| ignoreKeys | Partition keyed records by the sticky rule too, instead of by key | `false` |
+
+A record without a key goes to its topic's sticky partition until `stickyBytes` of key and value
+have been assigned to it; the record that reaches the threshold still goes there, and the next one
+goes to a partition picked uniformly at random among those with a leader (among all of them when
+none has a leader — the pick can land on the same partition again). The stickiness carries across
+`send()` calls, but each `send()` still goes out as its own request: the keyless records of one
+`send()` with many messages fill a few batches instead of one record per partition, and records
+from separate `send()` calls share a batch only when the opt-in accumulator (`linger`) is on. A
+record with an explicit `partition` goes there. Keyed records keep
+`DefaultPartitioner`'s mapping, so topics co-partitioned with Java producers stay co-partitioned —
+unless you pass `ignoreKeys: true`.
+
+The Java client's adaptive partitioning (`partitioner.adaptive.partitioning.enable`,
+`partitioner.availability.timeout.ms`) is not implemented: it needs per-partition queue depths this
+client does not track.
 
 ## <a name="retry"></a> Retry
 
