@@ -65,12 +65,12 @@
       "since": "2026-09-03"
     },
     "AddPartitionsToTxn": {
-      "note": "Unused under transaction version 2 (KIP-890 part 2), where Produce carries the add-partitions call.",
-      "since": "2026-09-03"
+      "note": "v2 PRODUCER_FENCED, v3 flexible. v3 is the client ceiling: the message definition keeps v4 (batched transactions, VerifyOnly) and v5 for broker-to-broker calls, so behind:2 is this API's steady state. Under transaction version 2 (KIP-890 part 2) a client does not send it: Produce v12 adds the partition implicitly.",
+      "since": "2026-10-07"
     },
     "AddOffsetsToTxn": {
-      "note": "Unused under transaction version 2 (KIP-890 part 2).",
-      "since": "2026-09-03"
+      "note": "v2 PRODUCER_FENCED, v3 flexible, v4 TRANSACTION_ABORTABLE (KIP-890). Under transaction version 2 (KIP-890 part 2) a client does not send it: TxnOffsetCommit v5 adds the offsets implicitly.",
+      "since": "2026-10-07"
     },
     "EndTxn": {
       "note": "v5 returns a bumped producer id and epoch under transaction version 2. The TV2 signal is the transaction.version finalized feature in ApiVersions v3+, not EndTxn's advertised max version.",

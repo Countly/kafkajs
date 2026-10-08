@@ -115,12 +115,76 @@ describe('scripts/protocol > schema validation', () => {
     })
   })
 
+  describe('a field under a parent that is not alive at the version', () => {
+    // A common struct's fields carry the struct's own range, so `Batches.Topics.Name` reads `0+`
+    // even though `Batches` only exists from v4 - the shape of AddPartitionsToTxnRequest.
+    const spec = parseSpec({
+      apiKey: 9998,
+      type: 'request',
+      name: 'SyntheticNestedRequest',
+      validVersions: '0-5',
+      flexibleVersions: '3+',
+      fields: [
+        {
+          name: 'Batches',
+          type: '[]Batch',
+          versions: '4+',
+          fields: [{ name: 'Topics', type: '[]Topic', versions: '4+' }],
+        },
+        { name: 'V3AndBelowTopics', type: '[]Topic', versions: '0-3' },
+      ],
+      commonStructs: [
+        {
+          name: 'Topic',
+          versions: '0+',
+          fields: [{ name: 'Name', type: 'string', versions: '0+' }],
+        },
+      ],
+    })
+
+    test('is dropped with its parent', () => {
+      expect(fieldsFromSpec(spec, 3).map((f) => f.name)).toEqual([
+        'V3AndBelowTopics',
+        'V3AndBelowTopics.Name',
+      ])
+    })
+
+    test('comes back with its parent', () => {
+      expect(fieldsFromSpec(spec, 4).map((f) => f.name)).toEqual([
+        'Batches',
+        'Batches.Topics',
+        'Batches.Topics.Name',
+      ])
+    })
+
+    test('resolves AddPartitionsToTxnRequest v3 to the fields a client sends', () => {
+      expect(expectedFields('AddPartitionsToTxn', 'request', 3).map((f) => f.name)).toEqual([
+        'V3AndBelowTransactionalId',
+        'V3AndBelowProducerId',
+        'V3AndBelowProducerEpoch',
+        'V3AndBelowTopics',
+        'V3AndBelowTopics.Name',
+        'V3AndBelowTopics.Partitions',
+      ])
+    })
+  })
+
   test('discovers every committed codec and reports the unvalidated ones', () => {
     const codecs = discover()
     expect(codecs.length).toBeGreaterThan(100)
     const validated = codecs.filter((codec) => codec.schema != null)
     // Grows as codecs gain a schema export; keep it sorted.
     expect(validated.map((codec) => codec.file).sort()).toEqual([
+      'src/protocol/requests/addOffsetsToTxn/v2/request.js',
+      'src/protocol/requests/addOffsetsToTxn/v2/response.js',
+      'src/protocol/requests/addOffsetsToTxn/v3/request.js',
+      'src/protocol/requests/addOffsetsToTxn/v3/response.js',
+      'src/protocol/requests/addOffsetsToTxn/v4/request.js',
+      'src/protocol/requests/addOffsetsToTxn/v4/response.js',
+      'src/protocol/requests/addPartitionsToTxn/v2/request.js',
+      'src/protocol/requests/addPartitionsToTxn/v2/response.js',
+      'src/protocol/requests/addPartitionsToTxn/v3/request.js',
+      'src/protocol/requests/addPartitionsToTxn/v3/response.js',
       'src/protocol/requests/alterPartitionReassignments/v0/request.js',
       'src/protocol/requests/alterPartitionReassignments/v0/response.js',
       'src/protocol/requests/apiVersions/v0/response.js',

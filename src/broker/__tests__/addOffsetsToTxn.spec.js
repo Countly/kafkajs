@@ -84,7 +84,10 @@ describe('Broker > AddOffsetsToTxn', () => {
     )
   })
 
-  test('throws for incorrect producer epoch', async () => {
+  test('throws PRODUCER_FENCED for a producer epoch the coordinator does not hold', async () => {
+    // From AddOffsetsToTxn v2 the broker answers PRODUCER_FENCED here; it rewrites that to
+    // INVALID_PRODUCER_EPOCH only for v0-v1 requests (handleAddOffsetsToTxnRequest,
+    // https://github.com/apache/kafka/blob/4.3/core/src/main/scala/kafka/server/KafkaApis.scala).
     await expect(
       broker.addOffsetsToTxn({
         transactionalId,
@@ -92,10 +95,6 @@ describe('Broker > AddOffsetsToTxn', () => {
         producerEpoch: producerEpoch + 1,
         groupId: consumerGroupId,
       })
-    ).rejects.toEqual(
-      new KafkaJSProtocolError(
-        "Producer attempted an operation with an old epoch. Either there is a newer producer with the same transactionalId, or the producer's transaction has been expired by the broker"
-      )
-    )
+    ).rejects.toMatchObject({ name: 'KafkaJSProtocolError', type: 'PRODUCER_FENCED', code: 90 })
   })
 })

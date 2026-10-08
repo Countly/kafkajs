@@ -544,12 +544,14 @@
       "latestVersionUnstable": false,
       "forkVersions": [
         0,
-        1
+        1,
+        2,
+        3
       ],
-      "gap": "behind:4",
+      "gap": "behind:2",
       "onFloor": false,
       "belowFloor": [],
-      "notes": "Unused under transaction version 2 (KIP-890 part 2), where Produce carries the add-partitions call."
+      "notes": "v2 PRODUCER_FENCED, v3 flexible. v3 is the client ceiling: the message definition keeps v4 (batched transactions, VerifyOnly) and v5 for broker-to-broker calls, so behind:2 is this API's steady state. Under transaction version 2 (KIP-890 part 2) a client does not send it: Produce v12 adds the partition implicitly."
     },
     {
       "kafkaName": "AddOffsetsToTxn",
@@ -566,12 +568,15 @@
       "latestVersionUnstable": false,
       "forkVersions": [
         0,
-        1
+        1,
+        2,
+        3,
+        4
       ],
-      "gap": "behind:3",
+      "gap": "current",
       "onFloor": false,
       "belowFloor": [],
-      "notes": "Unused under transaction version 2 (KIP-890 part 2)."
+      "notes": "v2 PRODUCER_FENCED, v3 flexible, v4 TRANSACTION_ABORTABLE (KIP-890). Under transaction version 2 (KIP-890 part 2) a client does not send it: TxnOffsetCommit v5 adds the offsets implicitly."
     },
     {
       "kafkaName": "EndTxn",

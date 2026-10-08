@@ -28,8 +28,8 @@ Gap classes: `current` (fork max equals the Kafka max) · `behind:N` · `stub` (
 | DeleteRecords | 21 | 0-2 | v2+ | 0-1 | behind:1 |  |
 | InitProducerId | 22 | 0-6 | v2+ | 0-5 | behind:1 | v2+ is flexible, so even v3 needs the flexible-protocol work first. v3 producer-id/epoch re-init (KIP-360), v4 PRODUCER_FENCED, v5 TRANSACTION_ABORTABLE, v6 two-phase commit (KIP-939) and latestVersionUnstable, so brokers advertise 0-5 by default. |
 | OffsetForLeaderEpoch | 23 | 2-4 | v4+ | 3-4 | current | Leader-epoch fencing (KIP-320): v3 and v4 are implemented. v2 is a deliberate gap, not a waiver - versions below 3 require CLUSTER permission, which clients are not typically granted, and the Java consumer pins its own floor at v3 for that reason. |
-| AddPartitionsToTxn | 24 | 0-5 | v3+ | 0-1 | behind:4 | Unused under transaction version 2 (KIP-890 part 2), where Produce carries the add-partitions call. |
-| AddOffsetsToTxn | 25 | 0-4 | v3+ | 0-1 | behind:3 | Unused under transaction version 2 (KIP-890 part 2). |
+| AddPartitionsToTxn | 24 | 0-5 | v3+ | 0-3 | behind:2 | v2 PRODUCER_FENCED, v3 flexible. v3 is the client ceiling: the message definition keeps v4 (batched transactions, VerifyOnly) and v5 for broker-to-broker calls, so behind:2 is this API's steady state. Under transaction version 2 (KIP-890 part 2) a client does not send it: Produce v12 adds the partition implicitly. |
+| AddOffsetsToTxn | 25 | 0-4 | v3+ | 0-4 | current | v2 PRODUCER_FENCED, v3 flexible, v4 TRANSACTION_ABORTABLE (KIP-890). Under transaction version 2 (KIP-890 part 2) a client does not send it: TxnOffsetCommit v5 adds the offsets implicitly. |
 | EndTxn | 26 | 0-5 | v3+ | 0-1 | behind:4 | v5 returns a bumped producer id and epoch under transaction version 2. The TV2 signal is the transaction.version finalized feature in ApiVersions v3+, not EndTxn's advertised max version. |
 | TxnOffsetCommit | 28 | 0-5 | v3+ | 0-1 | behind:4 | v2 adds the committed leader epoch; v3 is KIP-447 group metadata, which the fork does not implement at all. |
 | DescribeAcls | 29 | 1-3 | v2+ | 1 | behind:2 (on-floor) | v1 is the 4.x floor and is also the fork's maximum. |

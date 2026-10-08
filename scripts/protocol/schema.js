@@ -106,17 +106,28 @@ const discover = () => {
  * `versions` key is absent or explicitly `null`, so nothing but `taggedVersions` says when it is
  * alive); such a row is range-tested and reported using its `taggedVersions` instead, never
  * dropped silently by a `null` range.
+ *
+ * A field nested under a field that is not alive at `version` is not alive either, whatever its
+ * own range says: a common struct's fields carry the struct's range even where the struct is only
+ * reachable through a version-limited parent (AddPartitionsToTxnRequest's `Transactions.Topics`,
+ * v4+, reuses the `0+` topic struct of `V3AndBelowTopics`). `flattenFields` emits every parent
+ * before its children, so one pass decides it.
  * @param {{fields: object[]}} spec a parsed message spec
  * @param {number} version the concrete API version to resolve fields for
  * @returns {{name: string, type: string, versions: string, nullable?: true, tag?: number}[]}
  */
 const fieldsFromSpec = (spec, version) => {
   const rows = []
+  const alive = new Set()
 
   for (const field of spec.fields) {
+    const parent = field.path.slice(0, Math.max(0, field.path.lastIndexOf('.')))
+    if (parent !== '' && !alive.has(parent)) continue
+
     const versions = field.versions === null ? field.taggedVersions : field.versions
     if (!rangeContains(parseVersionRange(versions), version)) continue
 
+    alive.add(field.path)
     const row = { name: field.path, type: field.type, versions }
     if (rangeContains(parseVersionRange(field.nullableVersions), version)) row.nullable = true
     if (field.tag !== null) row.tag = field.tag
