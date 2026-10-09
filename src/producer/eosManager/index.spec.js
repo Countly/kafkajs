@@ -1,6 +1,11 @@
 const { newLogger } = require('testHelpers')
 const createEosManager = require('.')
-const { KafkaJSNonRetriableError, KafkaJSLockTimeout } = require('../../errors')
+const ProducerStateManager = require('../state')
+const {
+  KafkaJSNonRetriableError,
+  KafkaJSLockTimeout,
+  KafkaJSInvalidConfigurationError,
+} = require('../../errors')
 const COORDINATOR_TYPES = require('../../protocol/coordinatorTypes')
 const { createErrorFromCode } = require('../../protocol/error')
 
@@ -45,7 +50,12 @@ describe('Producer > eosManager', () => {
     await eosManager.initProducerId()
 
     expect(cluster.refreshMetadataIfNecessary).toHaveBeenCalled()
-    expect(broker.initProducerId).toHaveBeenCalledWith({ transactionTimeout: 30000 })
+    expect(broker.initProducerId).toHaveBeenCalledWith({
+      transactionalId: null,
+      transactionTimeout: 30000,
+      producerId: -1,
+      producerEpoch: -1,
+    })
 
     expect(eosManager.getProducerId()).toEqual(mockInitProducerIdResponse.producerId)
     expect(eosManager.getProducerEpoch()).toEqual(mockInitProducerIdResponse.producerEpoch)
@@ -136,6 +146,8 @@ describe('Producer > eosManager', () => {
       expect(broker.initProducerId).toHaveBeenCalledWith({
         transactionalId,
         transactionTimeout: 30000,
+        producerId: -1,
+        producerEpoch: -1,
       })
 
       expect(eosManager.getProducerId()).toEqual(mockInitProducerIdResponse.producerId)
@@ -151,7 +163,7 @@ describe('Producer > eosManager', () => {
         transactional: true,
       })
       await eosManager.initProducerId()
-      eosManager.beginTransaction()
+      await eosManager.beginTransaction()
 
       const topicData = [
         {
@@ -538,8 +550,8 @@ describe('Producer > eosManager', () => {
       })
     }
 
-    test(`beginTransaction throws`, async () => {
-      expect(() => eosManager.beginTransaction()).toThrow(
+    test(`beginTransaction rejects`, async () => {
+      await expect(eosManager.beginTransaction()).rejects.toThrow(
         new KafkaJSNonRetriableError('Method unavailable if non-transactional')
       )
     })
@@ -548,6 +560,262 @@ describe('Producer > eosManager', () => {
     testTransactionalGuardAsync('sendOffsets')
     testTransactionalGuardAsync('commit')
     testTransactionalGuardAsync('abort')
+  })
+
+  describe('over the producer state manager', () => {
+    const transactionalId = 'transactional-id'
+    const create = (options = {}) =>
+      createEosManager({ logger: newLogger(), cluster, transactionTimeout: 30000, ...options })
+    const transactionalManager = () => create({ transactional: true, transactionalId })
+
+    test('exposes the manager it delegates to, read-only', () => {
+      const eosManager = create()
+
+      expect(eosManager.stateManager).toBeInstanceOf(ProducerStateManager)
+      expect(Object.getOwnPropertyDescriptor(eosManager, 'stateManager').set).toBeUndefined()
+    })
+
+    test.each([
+      ['getSequence', [topic, 1], 'nextSequence'],
+      ['updateSequence', [topic, 1, 5], 'advance'],
+    ])('%s forwards to the manager once, with the same arguments', async (method, args, member) => {
+      const eosManager = create()
+      await eosManager.initProducerId()
+      const spy = jest.spyOn(eosManager.stateManager, member)
+
+      eosManager[method](...args)
+
+      expect(spy).toHaveBeenCalledTimes(1)
+      expect(spy).toHaveBeenCalledWith(...args)
+    })
+
+    test('initProducerId, isInitialized, getProducerId and getProducerEpoch read the manager', async () => {
+      const eosManager = create()
+      const { stateManager } = eosManager
+      const initialize = jest.spyOn(stateManager, 'initialize')
+      const isInitialized = jest.spyOn(stateManager, 'isInitialized')
+      const id = jest.spyOn(stateManager, 'producerId', 'get')
+      const epoch = jest.spyOn(stateManager, 'producerEpoch', 'get')
+
+      await eosManager.initProducerId()
+      expect(initialize).toHaveBeenCalledTimes(1)
+      expect(initialize).toHaveBeenCalledWith()
+      initialize.mockClear()
+      id.mockClear()
+      epoch.mockClear()
+
+      expect(eosManager.isInitialized()).toBe(true)
+      expect(eosManager.getProducerId()).toEqual(producerId)
+      expect(eosManager.getProducerEpoch()).toEqual(producerEpoch)
+      expect(isInitialized).toHaveBeenCalled()
+      expect(id).toHaveBeenCalledTimes(1)
+      expect(epoch).toHaveBeenCalledTimes(1)
+      expect(initialize).not.toHaveBeenCalled()
+    })
+
+    test('beginTransaction, commit, abort and isInTransaction move and read the manager state', async () => {
+      const eosManager = transactionalManager()
+      const transitions = jest.spyOn(eosManager.stateManager, 'transitionTo')
+      await eosManager.initProducerId()
+
+      await eosManager.beginTransaction()
+      expect(eosManager.isInTransaction()).toBe(true)
+      await eosManager.commit()
+      await eosManager.beginTransaction()
+      await eosManager.abort()
+
+      expect(transitions.mock.calls.map(([state]) => state)).toEqual([
+        'READY',
+        'IN_TRANSACTION',
+        'COMMITTING',
+        'READY',
+        'IN_TRANSACTION',
+        'ABORTING',
+        'READY',
+      ])
+      expect(eosManager.isInTransaction()).toBe(false)
+    })
+
+    test('addPartitionsToTransaction registers each partition with the manager once', async () => {
+      const eosManager = transactionalManager()
+      await eosManager.initProducerId()
+      await eosManager.beginTransaction()
+      const register = jest.spyOn(eosManager.stateManager, 'addPartitionToTransaction')
+
+      await eosManager.addPartitionsToTransaction([
+        { topic: 'test-1', partitions: [{ partition: 1 }, { partition: 2 }] },
+      ])
+
+      expect(register.mock.calls).toEqual([
+        ['test-1', 1],
+        ['test-1', 2],
+      ])
+    })
+
+    test('sendOffsets marks the offsets as part of the transaction on the manager', async () => {
+      const eosManager = transactionalManager()
+      await eosManager.initProducerId()
+      await eosManager.beginTransaction()
+      const mark = jest.spyOn(eosManager.stateManager, 'markOffsetsAdded')
+
+      await eosManager.sendOffsets({
+        consumerGroupId: 'consumer-group-id',
+        topics: [{ topic: 'test-topic-1', partitions: [{ partition: 0, offset: '1' }] }],
+      })
+
+      expect(mark).toHaveBeenCalledTimes(1)
+      expect(eosManager.stateManager.transactionStarted()).toBe(true)
+    })
+
+    test('a producer id another call acquired during the retry backoff is kept, not replaced', async () => {
+      const eosManager = transactionalManager()
+      let requests = 0
+      broker.initProducerId.mockImplementation(async () => {
+        requests += 1
+        if (requests === 1) {
+          throw createErrorFromCode(51)
+        }
+        return { producerId: String(requests * 1000), producerEpoch: 0 }
+      })
+
+      await Promise.all([eosManager.initProducerId(), eosManager.initProducerId()])
+
+      expect(broker.initProducerId).toHaveBeenCalledTimes(2)
+      expect(eosManager.getProducerId()).toEqual('2000')
+    })
+
+    test('initProducerId on an initialized producer still acquires a new producer id after a retry', async () => {
+      const eosManager = transactionalManager()
+      await eosManager.initProducerId()
+      broker.initProducerId.mockRejectedValueOnce(createErrorFromCode(51))
+      broker.initProducerId.mockResolvedValueOnce({ producerId: '2000', producerEpoch: 0 })
+
+      await eosManager.initProducerId()
+
+      expect(broker.initProducerId).toHaveBeenCalledTimes(3)
+      expect(eosManager.getProducerId()).toEqual('2000')
+    })
+
+    test('beginTransaction outside READY is refused before the coordinator lookup', async () => {
+      const eosManager = transactionalManager()
+
+      await expect(eosManager.beginTransaction()).rejects.toThrow(
+        'Transaction state exception: Cannot call "beginTransaction" in state "UNINITIALIZED"'
+      )
+      expect(cluster.findGroupCoordinator).not.toHaveBeenCalled()
+    })
+
+    test('initProducerId inside a transaction is refused before any request', async () => {
+      const eosManager = transactionalManager()
+      await eosManager.initProducerId()
+      await eosManager.beginTransaction()
+
+      await expect(eosManager.initProducerId()).rejects.toThrow(
+        'Transaction state exception: Cannot call "initProducerId" in state "IN_TRANSACTION"'
+      )
+      expect(broker.initProducerId).toHaveBeenCalledTimes(1)
+      expect(eosManager.isInTransaction()).toBe(true)
+    })
+
+    test('isTransactional and getTransactionalId answer from the options it was built with', () => {
+      expect(transactionalManager().isTransactional()).toBe(true)
+      expect(transactionalManager().getTransactionalId()).toEqual(transactionalId)
+      expect(create().isTransactional()).toBeFalsy()
+    })
+
+    test('a partition that joined one transaction joins the next one again', async () => {
+      const eosManager = transactionalManager()
+      await eosManager.initProducerId()
+      const topicData = [{ topic: 'test-1', partitions: [{ partition: 1 }] }]
+
+      await eosManager.beginTransaction()
+      await eosManager.addPartitionsToTransaction(topicData)
+      await eosManager.commit()
+      await eosManager.beginTransaction()
+      await eosManager.addPartitionsToTransaction(topicData)
+
+      expect(broker.addPartitionsToTxn).toHaveBeenCalledTimes(2)
+    })
+
+    test('CLUSTER_AUTHORIZATION_FAILED from InitProducerId is a configuration error naming both remedies, not retried', async () => {
+      const eosManager = create()
+      broker.initProducerId.mockImplementation(() => {
+        throw createErrorFromCode(31)
+      })
+
+      const initialized = eosManager.initProducerId()
+
+      await expect(initialized).rejects.toThrow(KafkaJSInvalidConfigurationError)
+      await expect(initialized).rejects.toThrow(/IDEMPOTENT_WRITE.*idempotent: false/)
+      expect(broker.initProducerId).toHaveBeenCalledTimes(1)
+      expect(eosManager.isInitialized()).toBe(false)
+    })
+
+    describe('an abort that ends ABORTABLE_ERROR', () => {
+      /** A transaction holding a partition, armed abortable by TRANSACTION_ABORTABLE. */
+      const armed = async () => {
+        broker.negotiatedVersion = jest.fn(() => 5)
+        broker.initProducerId.mockImplementation(
+          async ({ producerId: id, producerEpoch: epoch }) =>
+            id === -1 ? mockInitProducerIdResponse : { producerId: id, producerEpoch: epoch + 1 }
+        )
+        const eosManager = transactionalManager()
+        await eosManager.initProducerId()
+        await eosManager.beginTransaction()
+        await eosManager.addPartitionsToTransaction([{ topic, partitions: [{ partition: 0 }] }])
+        const error = createErrorFromCode(120)
+        eosManager.stateManager.classify(error, 'txn')
+        eosManager.stateManager.arm(error)
+        expect(eosManager.stateManager.state()).toEqual('ABORTABLE_ERROR')
+        broker.initProducerId.mockClear()
+        return eosManager
+      }
+
+      test('sends the EndTxn abort and then bumps the epoch with the current producer id', async () => {
+        const eosManager = await armed()
+
+        await eosManager.abort()
+
+        expect(broker.endTxn).toHaveBeenCalledWith({
+          producerId,
+          producerEpoch,
+          transactionalId,
+          transactionResult: false,
+        })
+        expect(broker.initProducerId).toHaveBeenCalledTimes(1)
+        expect(broker.initProducerId).toHaveBeenCalledWith({
+          transactionalId,
+          transactionTimeout: 30000,
+          producerId,
+          producerEpoch,
+        })
+        expect(eosManager.getProducerEpoch()).toEqual(producerEpoch + 1)
+        expect(eosManager.stateManager.state()).toEqual('READY')
+      })
+
+      test('retries the bump while the coordinator still answers CONCURRENT_TRANSACTIONS', async () => {
+        const eosManager = await armed()
+        broker.initProducerId.mockRejectedValueOnce(createErrorFromCode(51))
+
+        await eosManager.abort()
+
+        expect(broker.initProducerId).toHaveBeenCalledTimes(2)
+        expect(eosManager.getProducerEpoch()).toEqual(producerEpoch + 1)
+      })
+
+      test('an ordinary abort bumps nothing', async () => {
+        const eosManager = transactionalManager()
+        await eosManager.initProducerId()
+        await eosManager.beginTransaction()
+        await eosManager.addPartitionsToTransaction([{ topic, partitions: [{ partition: 0 }] }])
+        broker.initProducerId.mockClear()
+
+        await eosManager.abort()
+
+        expect(broker.endTxn).toHaveBeenCalledTimes(1)
+        expect(broker.initProducerId).not.toHaveBeenCalled()
+      })
+    })
   })
 
   describe('broker mutex instrumentation', () => {

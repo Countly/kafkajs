@@ -2,13 +2,10 @@ const createRetry = require('../../retry')
 const Lock = require('../../utils/lock')
 const { KafkaJSNonRetriableError, isStaleCoordinator } = require('../../errors')
 const COORDINATOR_TYPES = require('../../protocol/coordinatorTypes')
-const createStateMachine = require('./transactionStateMachine')
-const { INT_32_MAX_VALUE } = require('../../constants')
+const ProducerStateManager = require('../state')
 const assert = require('assert')
 
 const STATES = require('./transactionStates')
-const NO_PRODUCER_ID = -1
-const SEQUENCE_START = 0
 const INIT_PRODUCER_RETRIABLE_PROTOCOL_ERRORS = [
   'NOT_COORDINATOR_FOR_GROUP',
   'GROUP_COORDINATOR_NOT_AVAILABLE',
@@ -35,7 +32,10 @@ const isAddOffsetsRetriable = (e) => e.code === CONCURRENT_TRANSACTIONS_CODE
  */
 
 /**
- * Manage behavior for an idempotent producer and transactions.
+ * Manage behavior for an idempotent producer and transactions: a facade over the producer's
+ * `ProducerStateManager`, which owns the producer id and epoch, the sequences, the transaction
+ * state and its version. The facade keeps the coordinator lookups, the retries of its own
+ * requests and the per-broker mutex of the send path.
  *
  * @param {Object} options
  * @param {import('../../../types').Logger} options.logger
@@ -45,6 +45,9 @@ const isAddOffsetsRetriable = (e) => e.code === CONCURRENT_TRANSACTIONS_CODE
  * @param {boolean} options.transactional Whether this manager is for a transactional (vs. plain
  *   idempotent) producer; gates the transactional methods (`beginTransaction`, `commit`, ...).
  * @param {string} [options.transactionalId] Required when `transactional` is true.
+ * @param {import('../../../types').RetryOptions} [options.retry=cluster.retry] the producer's
+ *   retry options: they bound every batch's re-sends and the requests the state manager makes on
+ *   the send path
  * @param {import('../../instrumentation/emitter')} [options.instrumentationEmitter] Passed to
  *   the per-broker mutex (see `acquireBrokerLock`) so a waiter timing out emits
  *   `NETWORK_LOCK_TIMEOUT` instead of failing silently.
@@ -56,6 +59,7 @@ module.exports = ({
   transactionTimeout = 60000,
   transactional,
   transactionalId,
+  retry = cluster.retry,
   instrumentationEmitter = null,
 }) => {
   if (transactional && !transactionalId) {
@@ -65,44 +69,9 @@ module.exports = ({
   const retrier = createRetry(cluster.retry)
 
   /**
-   * Current producer ID
-   */
-  let producerId = NO_PRODUCER_ID
-
-  /**
-   * Current producer epoch
-   */
-  let producerEpoch = 0
-
-  /**
-   * Idempotent production requires that the producer track the sequence number of messages.
-   *
-   * Sequences are sent with every Record Batch and tracked per Topic-Partition
-   */
-  let producerSequence = {}
-
-  /**
    * Idempotent production requires a mutex lock per broker to serialize requests with sequence number handling
    */
   let brokerMutexLocks = {}
-
-  /**
-   * Topic partitions already participating in the transaction
-   */
-  let transactionTopicPartitions = {}
-
-  /**
-   * Offsets have been added to the transaction
-   */
-  let hasOffsetsAddedToTransaction = false
-
-  const stateMachine = createStateMachine({ logger })
-  stateMachine.on('transition', ({ to }) => {
-    if (to === STATES.READY) {
-      transactionTopicPartitions = {}
-      hasOffsetsAddedToTransaction = false
-    }
-  })
 
   const findTransactionCoordinator = () => {
     return cluster.findGroupCoordinator({
@@ -111,6 +80,28 @@ module.exports = ({
     })
   }
 
+  const stateManager = new ProducerStateManager({
+    logger,
+    transactional,
+    transactionalId,
+    transactionTimeout,
+    retry,
+    findBroker: async () => {
+      await cluster.refreshMetadataIfNecessary()
+      // If non-transactional we can request the PID from any broker
+      return transactional ? findTransactionCoordinator() : cluster.findControllerBroker()
+    },
+    addPartitionsToTxn: async (topics) => {
+      const broker = await findTransactionCoordinator()
+      await broker.addPartitionsToTxn({
+        transactionalId,
+        producerId: stateManager.producerId,
+        producerEpoch: stateManager.producerEpoch,
+        topics,
+      })
+    },
+  })
+
   const transactionalGuard = () => {
     if (!transactional) {
       throw new KafkaJSNonRetriableError('Method unavailable if non-transactional')
@@ -118,393 +109,362 @@ module.exports = ({
   }
 
   /**
-   * A transaction is ongoing when offsets or partitions added to it
-   *
-   * @returns {boolean}
+   * Runs one InitProducerId - a first one, or a KIP-360 re-initialization - under the facade's
+   * retrier, retrying the coordinator answers that clear by themselves and handing every other
+   * error to the caller unchanged.
+   * @param {() => Promise<void>} request
+   * @returns {Promise<void>}
    */
-  const isOngoing = () => {
-    return (
-      hasOffsetsAddedToTransaction ||
-      Object.entries(transactionTopicPartitions).some(([, partitions]) => {
-        return Object.entries(partitions).some(
-          ([, isPartitionAddedToTransaction]) => isPartitionAddedToTransaction
-        )
-      })
-    )
-  }
-
-  const eosManager = stateMachine.createGuarded(
-    {
-      /**
-       * Get the current producer id
-       * @returns {number}
-       */
-      getProducerId() {
-        return producerId
-      },
-
-      /**
-       * Get the current producer epoch
-       * @returns {number}
-       */
-      getProducerEpoch() {
-        return producerEpoch
-      },
-
-      getTransactionalId() {
-        return transactionalId
-      },
-
-      /**
-       * Initialize the idempotent producer by making an `InitProducerId` request.
-       * Overwrites any existing state in this transaction manager
-       */
-      async initProducerId() {
-        return retrier(async (bail, retryCount, retryTime) => {
-          try {
-            await cluster.refreshMetadataIfNecessary()
-
-            // If non-transactional we can request the PID from any broker
-            const broker = await (transactional
-              ? findTransactionCoordinator()
-              : cluster.findControllerBroker())
-
-            const result = await broker.initProducerId({
-              transactionalId: transactional ? transactionalId : undefined,
-              transactionTimeout,
-            })
-
-            stateMachine.transitionTo(STATES.READY)
-            producerId = result.producerId
-            producerEpoch = result.producerEpoch
-            producerSequence = {}
-            brokerMutexLocks = {}
-
-            logger.debug('Initialized producer id & epoch', { producerId, producerEpoch })
-          } catch (e) {
-            if (INIT_PRODUCER_RETRIABLE_PROTOCOL_ERRORS.includes(e.type)) {
-              if (e.type === 'CONCURRENT_TRANSACTIONS') {
-                logger.debug('There is an ongoing transaction on this transactionId, retrying', {
-                  error: e.message,
-                  stack: e.stack,
-                  transactionalId,
-                  retryCount,
-                  retryTime,
-                })
-              }
-
-              throw e
-            }
-
-            bail(e)
-          }
-        })
-      },
-
-      /**
-       * Get the current sequence for a given Topic-Partition. Defaults to 0.
-       *
-       * @param {string} topic
-       * @param {string} partition
-       * @returns {number}
-       */
-      getSequence(topic, partition) {
-        if (!eosManager.isInitialized()) {
-          return SEQUENCE_START
-        }
-
-        producerSequence[topic] = producerSequence[topic] || {}
-        producerSequence[topic][partition] = producerSequence[topic][partition] || SEQUENCE_START
-
-        return producerSequence[topic][partition]
-      },
-
-      /**
-       * Update the sequence for a given Topic-Partition.
-       *
-       * Do nothing if not yet initialized (not idempotent)
-       * @param {string} topic
-       * @param {string} partition
-       * @param {number} increment
-       */
-      updateSequence(topic, partition, increment) {
-        if (!eosManager.isInitialized()) {
-          return
-        }
-
-        const previous = eosManager.getSequence(topic, partition)
-        let sequence = previous + increment
-
-        // Sequence is defined as Int32 in the Record Batch,
-        // so theoretically should need to rotate here
-        if (sequence >= INT_32_MAX_VALUE) {
-          logger.debug(
-            `Sequence for ${topic} ${partition} exceeds max value (${sequence}). Rotating to 0.`
-          )
-          sequence = 0
-        }
-
-        producerSequence[topic][partition] = sequence
-      },
-
-      /**
-       * Begin a transaction
-       */
-      beginTransaction() {
-        transactionalGuard()
-        stateMachine.transitionTo(STATES.TRANSACTING)
-      },
-
-      /**
-       * Add partitions to a transaction if they are not already marked as participating.
-       *
-       * Should be called prior to sending any messages during a transaction
-       * @param {TopicData[]} topicData
-       *
-       * @typedef {Object} TopicData
-       * @property {string} topic
-       * @property {object[]} partitions
-       * @property {number} partitions[].partition
-       */
-      async addPartitionsToTransaction(topicData) {
-        transactionalGuard()
-        const newTopicPartitions = {}
-
-        topicData.forEach(({ topic, partitions }) => {
-          transactionTopicPartitions[topic] = transactionTopicPartitions[topic] || {}
-
-          partitions.forEach(({ partition }) => {
-            if (!transactionTopicPartitions[topic][partition]) {
-              newTopicPartitions[topic] = newTopicPartitions[topic] || []
-              newTopicPartitions[topic].push(partition)
-            }
-          })
-        })
-
-        const topics = Object.keys(newTopicPartitions).map((topic) => ({
-          topic,
-          partitions: newTopicPartitions[topic],
-        }))
-
-        if (topics.length) {
-          const broker = await findTransactionCoordinator()
-          await broker.addPartitionsToTxn({ transactionalId, producerId, producerEpoch, topics })
-        }
-
-        topics.forEach(({ topic, partitions }) => {
-          partitions.forEach((partition) => {
-            transactionTopicPartitions[topic][partition] = true
-          })
-        })
-      },
-
-      /**
-       * Commit the ongoing transaction
-       */
-      async commit() {
-        transactionalGuard()
-        stateMachine.transitionTo(STATES.COMMITTING)
-
-        if (!isOngoing()) {
-          logger.debug('No partitions or offsets registered, not sending EndTxn')
-
-          stateMachine.transitionTo(STATES.READY)
-          return
-        }
-
-        const broker = await findTransactionCoordinator()
-        await broker.endTxn({
-          producerId,
-          producerEpoch,
-          transactionalId,
-          transactionResult: true,
-        })
-
-        stateMachine.transitionTo(STATES.READY)
-      },
-
-      /**
-       * Abort the ongoing transaction
-       */
-      async abort() {
-        transactionalGuard()
-        stateMachine.transitionTo(STATES.ABORTING)
-
-        if (!isOngoing()) {
-          logger.debug('No partitions or offsets registered, not sending EndTxn')
-
-          stateMachine.transitionTo(STATES.READY)
-          return
-        }
-
-        const broker = await findTransactionCoordinator()
-        await broker.endTxn({
-          producerId,
-          producerEpoch,
-          transactionalId,
-          transactionResult: false,
-        })
-
-        stateMachine.transitionTo(STATES.READY)
-      },
-
-      /**
-       * Whether the producer id has already been initialized
-       */
-      isInitialized() {
-        return producerId !== NO_PRODUCER_ID
-      },
-
-      isTransactional() {
-        return transactional
-      },
-
-      isInTransaction() {
-        return stateMachine.state() === STATES.TRANSACTING
-      },
-
-      /**
-       * Acquire this broker's mutex, serializing idempotent requests against it so sequence
-       * numbers stay ordered. A wait longer than 65535ms rejects with `KafkaJSLockTimeout` and,
-       * if `instrumentationEmitter` was provided, emits `NETWORK_LOCK_TIMEOUT` first.
-       * @param {import('../../broker')} broker
-       * @returns {Promise<void>}
-       */
-      async acquireBrokerLock(broker) {
-        if (this.isInitialized()) {
-          brokerMutexLocks[broker.nodeId] =
-            brokerMutexLocks[broker.nodeId] ||
-            new Lock({
-              timeout: 0xffff,
-              description: broker.brokerAddress,
-              instrumentationEmitter,
-            })
-          await brokerMutexLocks[broker.nodeId].acquire()
-        }
-      },
-
-      releaseBrokerLock(broker) {
-        if (this.isInitialized()) brokerMutexLocks[broker.nodeId].release()
-      },
-
-      /**
-       * Mark the provided offsets as participating in the transaction for the given consumer group.
-       *
-       * This allows us to commit an offset as consumed only if the transaction passes.
-       * @param {string} consumerGroupId The unique group identifier
-       * @param {OffsetCommitTopic[]} topics The unique group identifier
-       * @returns {Promise}
-       *
-       * @typedef {Object} OffsetCommitTopic
-       * @property {string} topic
-       * @property {OffsetCommitTopicPartition[]} partitions
-       *
-       * @typedef {Object} OffsetCommitTopicPartition
-       * @property {number} partition
-       * @property {number} offset
-       */
-      async sendOffsets({ consumerGroupId, topics }) {
-        assert(consumerGroupId, 'Missing consumerGroupId')
-        assert(topics, 'Missing offset topics')
-
-        // Kafka answers CONCURRENT_TRANSACTIONS while a previous transaction on the same
-        // transactional id is still completing and expects the client to retry, the same as
-        // initProducerId above. The coordinator lookup happens inside the retrier so a
-        // coordinator move is picked up on retry.
-        await retrier(async (bail, retryCount, retryTime) => {
-          const transactionCoordinator = await findTransactionCoordinator()
-
-          try {
-            await transactionCoordinator.addOffsetsToTxn({
+  const retryingInitProducerId = (request) =>
+    retrier(async (bail, retryCount, retryTime) => {
+      try {
+        await request()
+      } catch (e) {
+        if (INIT_PRODUCER_RETRIABLE_PROTOCOL_ERRORS.includes(e.type)) {
+          if (e.type === 'CONCURRENT_TRANSACTIONS') {
+            logger.debug('There is an ongoing transaction on this transactionId, retrying', {
+              error: e.message,
+              stack: e.stack,
               transactionalId,
-              producerId,
-              producerEpoch,
-              groupId: consumerGroupId,
+              retryCount,
+              retryTime,
             })
-          } catch (e) {
-            if (isAddOffsetsRetriable(e)) {
-              logger.debug('There is an ongoing transaction on this transactionId, retrying', {
-                error: e.message,
-                stack: e.stack,
-                transactionalId,
-                retryCount,
-                retryTime,
-              })
-
-              throw e
-            }
-
-            bail(e)
           }
-        })
 
-        hasOffsetsAddedToTransaction = true
+          throw e
+        }
 
-        let groupCoordinator = await cluster.findGroupCoordinator({
-          groupId: consumerGroupId,
-          coordinatorType: COORDINATOR_TYPES.GROUP,
-        })
+        bail(e)
+      }
+    })
 
-        return retrier(async (bail, retryCount, retryTime) => {
-          try {
-            await groupCoordinator.txnOffsetCommit({
-              transactionalId,
-              producerId,
-              producerEpoch,
-              groupId: consumerGroupId,
-              topics,
-            })
-          } catch (e) {
-            if (isCommitRetriable(e)) {
-              logger.debug('Group coordinator is not ready yet, retrying', {
-                error: e.message,
-                stack: e.stack,
-                transactionalId,
-                retryCount,
-                retryTime,
-              })
-
-              throw e
-            }
-
-            if (isStaleCoordinator(e) || e.code === 'ECONNREFUSED') {
-              logger.debug(
-                'Invalid group coordinator, finding new group coordinator and retrying',
-                {
-                  error: e.message,
-                  stack: e.stack,
-                  transactionalId,
-                  retryCount,
-                  retryTime,
-                }
-              )
-
-              groupCoordinator = await cluster.findGroupCoordinator({
-                groupId: consumerGroupId,
-                coordinatorType: COORDINATOR_TYPES.GROUP,
-              })
-
-              throw e
-            }
-
-            bail(e)
-          }
-        })
-      },
+  const eosManager = {
+    /**
+     * The producer's state: producer id and epoch, sequences, transaction state and version.
+     * Read-only; the send path reaches the sequencer through it.
+     * @returns {ProducerStateManager}
+     */
+    get stateManager() {
+      return stateManager
     },
 
     /**
-     * Transaction state guards
+     * Get the current producer id
+     * @returns {string|number} -1 before the first `initProducerId()`
      */
-    {
-      initProducerId: { legalStates: [STATES.UNINITIALIZED, STATES.READY] },
-      beginTransaction: { legalStates: [STATES.READY], async: false },
-      addPartitionsToTransaction: { legalStates: [STATES.TRANSACTING] },
-      sendOffsets: { legalStates: [STATES.TRANSACTING] },
-      commit: { legalStates: [STATES.TRANSACTING] },
-      abort: { legalStates: [STATES.TRANSACTING] },
-    }
-  )
+    getProducerId() {
+      return stateManager.producerId
+    },
+
+    /**
+     * Get the current producer epoch
+     * @returns {number} 0 before the first `initProducerId()`, the epoch a non-idempotent
+     *   Produce request carries
+     */
+    getProducerEpoch() {
+      return stateManager.isInitialized() ? stateManager.producerEpoch : 0
+    },
+
+    getTransactionalId() {
+      return transactionalId
+    },
+
+    /**
+     * Initialize the idempotent producer by making an `InitProducerId` request.
+     * Overwrites any existing state in this transaction manager. A call made with no producer id
+     * held keeps one that another call acquired while it was waiting to retry, instead of
+     * replacing it, as the Java producer shares one InitProducerId between its callers.
+     * @see https://github.com/apache/kafka/blob/4.3/clients/src/main/java/org/apache/kafka/clients/producer/internals/TransactionManager.java
+     * @returns {Promise<void>}
+     * @throws {import('../../errors').KafkaJSInvalidConfigurationError} CLUSTER_AUTHORIZATION_FAILED,
+     *   naming both remedies
+     */
+    async initProducerId() {
+      stateManager.transaction.guard('initProducerId')
+      const held = stateManager.isInitialized()
+      await retryingInitProducerId(async () => {
+        if (held || !stateManager.isInitialized()) {
+          await stateManager.initialize()
+        }
+      })
+      stateManager.transitionTo(STATES.READY)
+      brokerMutexLocks = {}
+
+      logger.debug('Initialized producer id & epoch', {
+        producerId: stateManager.producerId,
+        producerEpoch: stateManager.producerEpoch,
+      })
+    },
+
+    /**
+     * Get the current sequence for a given Topic-Partition. Defaults to 0.
+     *
+     * @param {string} topic
+     * @param {string} partition
+     * @returns {number}
+     */
+    getSequence(topic, partition) {
+      if (!eosManager.isInitialized()) {
+        return 0
+      }
+
+      return stateManager.nextSequence(topic, partition)
+    },
+
+    /**
+     * Update the sequence for a given Topic-Partition.
+     *
+     * Do nothing if not yet initialized (not idempotent)
+     * @param {string} topic
+     * @param {string} partition
+     * @param {number} increment
+     */
+    updateSequence(topic, partition, increment) {
+      if (!eosManager.isInitialized()) {
+        return
+      }
+
+      stateManager.advance(topic, partition, increment)
+    },
+
+    /**
+     * Begin a transaction. Resolves the transaction coordinator first, so a failed lookup rejects
+     * the call and leaves the producer `READY`.
+     * @returns {Promise<void>}
+     */
+    async beginTransaction() {
+      stateManager.transaction.guard('beginTransaction')
+      transactionalGuard()
+      await findTransactionCoordinator()
+      stateManager.transitionTo(STATES.IN_TRANSACTION)
+    },
+
+    /**
+     * Add partitions to a transaction if they are not already marked as participating.
+     *
+     * Should be called prior to sending any messages during a transaction
+     * @param {TopicData[]} topicData
+     *
+     * @typedef {Object} TopicData
+     * @property {string} topic
+     * @property {object[]} partitions
+     * @property {number} partitions[].partition
+     */
+    async addPartitionsToTransaction(topicData) {
+      stateManager.transaction.guard('addPartitionsToTransaction')
+      transactionalGuard()
+      const pending = []
+      for (const { topic, partitions } of topicData) {
+        for (const { partition } of partitions) {
+          const added = stateManager.addPartitionToTransaction(topic, partition)
+          if (added !== null) {
+            pending.push(added)
+          }
+        }
+      }
+
+      await Promise.all(pending)
+    },
+
+    /**
+     * Commit the ongoing transaction
+     */
+    async commit() {
+      stateManager.transaction.guard('commit')
+      transactionalGuard()
+      stateManager.transitionTo(STATES.COMMITTING)
+
+      if (!stateManager.transactionStarted()) {
+        logger.debug('No partitions or offsets registered, not sending EndTxn')
+
+        stateManager.transitionTo(STATES.READY)
+        return
+      }
+
+      const broker = await findTransactionCoordinator()
+      await broker.endTxn({
+        producerId: stateManager.producerId,
+        producerEpoch: stateManager.producerEpoch,
+        transactionalId,
+        transactionResult: true,
+      })
+
+      stateManager.transitionTo(STATES.READY)
+    },
+
+    /**
+     * Abort the ongoing transaction. An abort that ends `ABORTABLE_ERROR` under transaction
+     * version 1 then bumps the producer epoch (KIP-360), as the Java producer does, so the next
+     * transaction starts with no sequence left over from the failed one.
+     * @see https://github.com/apache/kafka/blob/4.3/clients/src/main/java/org/apache/kafka/clients/producer/internals/TransactionManager.java
+     */
+    async abort() {
+      stateManager.transaction.guard('abort')
+      transactionalGuard()
+      const recovering = stateManager.state() === STATES.ABORTABLE_ERROR
+      stateManager.transitionTo(STATES.ABORTING)
+
+      if (stateManager.transactionStarted()) {
+        const broker = await findTransactionCoordinator()
+        await broker.endTxn({
+          producerId: stateManager.producerId,
+          producerEpoch: stateManager.producerEpoch,
+          transactionalId,
+          transactionResult: false,
+        })
+      } else {
+        logger.debug('No partitions or offsets registered, not sending EndTxn')
+      }
+
+      stateManager.transitionTo(STATES.READY)
+
+      if (recovering && stateManager.transactionVersion() === 1) {
+        await retryingInitProducerId(() => stateManager.reinitialize())
+      }
+    },
+
+    /**
+     * Whether the producer id has already been initialized
+     */
+    isInitialized() {
+      return stateManager.isInitialized()
+    },
+
+    isTransactional() {
+      return transactional
+    },
+
+    isInTransaction() {
+      return stateManager.state() === STATES.IN_TRANSACTION
+    },
+
+    /**
+     * Acquire this broker's mutex, serializing idempotent requests against it so sequence
+     * numbers stay ordered. A wait longer than 65535ms rejects with `KafkaJSLockTimeout` and,
+     * if `instrumentationEmitter` was provided, emits `NETWORK_LOCK_TIMEOUT` first.
+     * @param {import('../../broker')} broker
+     * @returns {Promise<void>}
+     */
+    async acquireBrokerLock(broker) {
+      if (eosManager.isInitialized()) {
+        brokerMutexLocks[broker.nodeId] =
+          brokerMutexLocks[broker.nodeId] ||
+          new Lock({
+            timeout: 0xffff,
+            description: broker.brokerAddress,
+            instrumentationEmitter,
+          })
+        await brokerMutexLocks[broker.nodeId].acquire()
+      }
+    },
+
+    releaseBrokerLock(broker) {
+      if (eosManager.isInitialized()) brokerMutexLocks[broker.nodeId].release()
+    },
+
+    /**
+     * Mark the provided offsets as participating in the transaction for the given consumer group.
+     *
+     * This allows us to commit an offset as consumed only if the transaction passes.
+     * @param {string} consumerGroupId The unique group identifier
+     * @param {OffsetCommitTopic[]} topics The unique group identifier
+     * @returns {Promise}
+     *
+     * @typedef {Object} OffsetCommitTopic
+     * @property {string} topic
+     * @property {OffsetCommitTopicPartition[]} partitions
+     *
+     * @typedef {Object} OffsetCommitTopicPartition
+     * @property {number} partition
+     * @property {number} offset
+     */
+    async sendOffsets({ consumerGroupId, topics } = {}) {
+      stateManager.transaction.guard('sendOffsets')
+      assert(consumerGroupId, 'Missing consumerGroupId')
+      assert(topics, 'Missing offset topics')
+
+      // Kafka answers CONCURRENT_TRANSACTIONS while a previous transaction on the same
+      // transactional id is still completing and expects the client to retry, the same as
+      // initProducerId above. The coordinator lookup happens inside the retrier so a
+      // coordinator move is picked up on retry.
+      await retrier(async (bail, retryCount, retryTime) => {
+        const transactionCoordinator = await findTransactionCoordinator()
+
+        try {
+          await transactionCoordinator.addOffsetsToTxn({
+            transactionalId,
+            producerId: stateManager.producerId,
+            producerEpoch: stateManager.producerEpoch,
+            groupId: consumerGroupId,
+          })
+        } catch (e) {
+          if (isAddOffsetsRetriable(e)) {
+            logger.debug('There is an ongoing transaction on this transactionId, retrying', {
+              error: e.message,
+              stack: e.stack,
+              transactionalId,
+              retryCount,
+              retryTime,
+            })
+
+            throw e
+          }
+
+          bail(e)
+        }
+      })
+
+      stateManager.markOffsetsAdded()
+
+      let groupCoordinator = await cluster.findGroupCoordinator({
+        groupId: consumerGroupId,
+        coordinatorType: COORDINATOR_TYPES.GROUP,
+      })
+
+      return retrier(async (bail, retryCount, retryTime) => {
+        try {
+          await groupCoordinator.txnOffsetCommit({
+            transactionalId,
+            producerId: stateManager.producerId,
+            producerEpoch: stateManager.producerEpoch,
+            groupId: consumerGroupId,
+            topics,
+          })
+        } catch (e) {
+          if (isCommitRetriable(e)) {
+            logger.debug('Group coordinator is not ready yet, retrying', {
+              error: e.message,
+              stack: e.stack,
+              transactionalId,
+              retryCount,
+              retryTime,
+            })
+
+            throw e
+          }
+
+          if (isStaleCoordinator(e) || e.code === 'ECONNREFUSED') {
+            logger.debug('Invalid group coordinator, finding new group coordinator and retrying', {
+              error: e.message,
+              stack: e.stack,
+              transactionalId,
+              retryCount,
+              retryTime,
+            })
+
+            groupCoordinator = await cluster.findGroupCoordinator({
+              groupId: consumerGroupId,
+              coordinatorType: COORDINATOR_TYPES.GROUP,
+            })
+
+            throw e
+          }
+
+          bail(e)
+        }
+      })
+    },
+  }
 
   return eosManager
 }

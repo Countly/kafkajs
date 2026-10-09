@@ -17,6 +17,15 @@ const eventKeys = keys(events)
 const { CONNECT, INITIALIZED, DISCONNECT } = events
 
 /**
+ * The error `transaction()` rejects with while another transaction is ongoing.
+ * @returns {KafkaJSNonRetriableError}
+ */
+const ongoingTransactionError = () =>
+  new KafkaJSNonRetriableError(
+    'There is already an ongoing transaction for this producer. Please end the transaction before beginning another.'
+  )
+
+/**
  *
  * @param {Object} params
  * @param {import('../../types').Cluster} params.cluster
@@ -99,6 +108,7 @@ module.exports = ({
     transactionTimeout,
     transactional: false,
     transactionalId,
+    retry: retryOptions,
     instrumentationEmitter,
   })
 
@@ -166,20 +176,27 @@ module.exports = ({
         transactionTimeout,
         transactional: true,
         transactionalId,
+        retry: retryOptions,
         instrumentationEmitter,
       })
 
     if (transactionalEosManager.isInTransaction()) {
-      throw new KafkaJSNonRetriableError(
-        'There is already an ongoing transaction for this producer. Please end the transaction before beginning another.'
-      )
+      throw ongoingTransactionError()
     }
 
     // We only initialize the producer id once
     if (!transactionalEosManager.isInitialized()) {
       await transactionalEosManager.initProducerId()
     }
-    transactionalEosManager.beginTransaction()
+    try {
+      await transactionalEosManager.beginTransaction()
+    } catch (error) {
+      // Another transaction() began while this one was finding the coordinator.
+      if (transactionalEosManager.isInTransaction()) {
+        throw ongoingTransactionError()
+      }
+      throw error
+    }
 
     const { send: sendTxn, sendBatch: sendBatchTxn } = createMessageProducer({
       logger,

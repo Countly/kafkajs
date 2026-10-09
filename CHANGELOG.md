@@ -386,11 +386,17 @@ Adopted upstream PRs are credited here by number as they land (Phase 2 onward).
 
 - A producer created with a `transactionalId` counts as having asked for idempotence, whatever `idempotent` says: it never turns idempotence off, and `acks` 0 or 1 on any of its sends — its own or its transactions' — or `maxInFlightRequests` above 5 or `null`, or `retries: 0`, throws `KafkaJSInvalidConfigurationError`. `maxInFlightRequests: 1`, the common 2.2.4 work-around, is below the cap and unaffected.
 
+- An `InitProducerId` refused with `CLUSTER_AUTHORIZATION_FAILED` (31) — at `connect()`, or when a send retries the initialization — now rejects with `KafkaJSInvalidConfigurationError` reading "The broker refused InitProducerId: the principal needs IDEMPOTENT_WRITE on the cluster (or WRITE on any topic, from Kafka 2.8), or create the producer with idempotent: false", `category` `'invalidConfiguration'`, the broker's `KafkaJSProtocolError` as its `cause`. It used to reject with that protocol error itself, so code that matched `error.type === 'CLUSTER_AUTHORIZATION_FAILED'` should read `error.category`, or `error.cause.type`.
+
+- `producer.transaction()` now finds the transaction coordinator before it resolves: a lookup that fails rejects `transaction()` itself and leaves the producer ready for the next call, where the failure used to surface on the transaction's first request. Each transaction sends one more FindCoordinator request, when it begins.
+
 #### Fixes
 
 - A consumer's tracked leader epoch is no longer overwritten by a late committed-offset reply. Every broker a consumer fetches from resolves the group's committed offsets for the whole assignment, so after a join several `OffsetFetch` requests can be in flight at once; one answered after the consumer had already moved — consumed a record, or applied a `seek()` — replaced that position's epoch with the committed one, which is −1 for an offset committed without an epoch. `uncommittedOffsets()` then reported `leaderEpoch: -1` for a position that had a real epoch, the next commit carried it, and position validation (KIP-320) was off for that partition until it consumed again. A committed epoch now seeds a position only while that position is still the committed offset or has not been resolved yet, and an unknown committed epoch (−1) never replaces a known one.
 
 - Keyed partitioning no longer allocates for every four bytes of a key. `murmur2`, which `DefaultPartitioner` runs for every keyed record, emulated Java's 32-bit `int` arithmetic with a 64-bit value object per 4-byte block; it now uses plain 32-bit integer operations, which compute exactly the same hash — every key still lands on the partition the Java client picks, checked against the Java-generated fixtures and against the previous implementation over 6,564 keys.
+
+- Two `producer.transaction()` calls made before the producer has a producer id now acquire it once: they share the first `InitProducerId`, and a retry after a coordinator error keeps the producer id the other call already received. Each call used to send its own `InitProducerId`, and the later answer could fence a transaction the first call had already begun.
 
 #### Additions
 

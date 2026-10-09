@@ -1,12 +1,10 @@
 /**
- * The transaction states. `TRANSACTING` is the name `transactionStateMachine.js` gives the state
- * `IN_TRANSACTION`.
+ * The transaction states.
  * @typedef {'UNINITIALIZED'|'READY'|'IN_TRANSACTION'|'COMMITTING'|'ABORTING'|'ABORTABLE_ERROR'|'FATAL_ERROR'} State
  */
 module.exports = {
   UNINITIALIZED: 'UNINITIALIZED',
   READY: 'READY',
-  TRANSACTING: 'TRANSACTING',
   IN_TRANSACTION: 'IN_TRANSACTION',
   COMMITTING: 'COMMITTING',
   ABORTING: 'ABORTING',

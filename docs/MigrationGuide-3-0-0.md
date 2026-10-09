@@ -612,7 +612,10 @@ The producer becomes idempotent by default and transactions move to the transact
 - **`connect()` can now fail with an authorization error** on a cluster that grants the
   principal neither `IDEMPOTENT_WRITE` nor, from Kafka 2.8, `WRITE` on any topic, because an
   idempotent producer issues `InitProducerId` there. *What to do:* grant the ACL, or create the
-  producer with `idempotent: false`. The error names both remedies.
+  producer with `idempotent: false`. The error names both remedies. It is a
+  `KafkaJSInvalidConfigurationError` (`category` `'invalidConfiguration'`) whose `cause` is the
+  broker's `KafkaJSProtocolError`; code that matched `error.type === 'CLUSTER_AUTHORIZATION_FAILED'`
+  reads `error.cause.type`, or `error.category`, instead.
 - **`retry: { retries: 0 }` disables idempotence — or throws if you asked for it.** A producer
   that never mentioned `idempotent` keeps its fail-fast configuration and logs one warning;
   `idempotent: true` (or a `transactionalId`) with `retries: 0` throws at construction. A
@@ -628,6 +631,13 @@ The producer becomes idempotent by default and transactions move to the transact
   `maxInFlightRequests: null` on a transactional producer now throws; drop it. A transactional
   producer's own `send()` with `acks` 0 or 1 now throws: send with `acks: -1`, or use a separate
   non-transactional producer for those sends.
+
+- **`producer.transaction()` can now reject when the transaction coordinator cannot be found.**
+  It looks the coordinator up before it resolves, so a lookup failure rejects `transaction()`
+  itself instead of the transaction's first `send()`, `sendOffsets()` or `commit()`; the producer
+  stays ready and the next `transaction()` tries again. *What to do:* nothing if you already
+  handle a rejected `transaction()` — it could reject in 2.2.4 too, for example on its first
+  InitProducerId.
 
 ### TypeScript: source-breaking type changes
 
