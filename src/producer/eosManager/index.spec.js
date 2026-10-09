@@ -1,11 +1,7 @@
 const { newLogger } = require('testHelpers')
 const createEosManager = require('.')
 const ProducerStateManager = require('../state')
-const {
-  KafkaJSNonRetriableError,
-  KafkaJSLockTimeout,
-  KafkaJSInvalidConfigurationError,
-} = require('../../errors')
+const { KafkaJSNonRetriableError, KafkaJSInvalidConfigurationError } = require('../../errors')
 const COORDINATOR_TYPES = require('../../protocol/coordinatorTypes')
 const { createErrorFromCode } = require('../../protocol/error')
 
@@ -815,41 +811,6 @@ describe('Producer > eosManager', () => {
         expect(broker.endTxn).toHaveBeenCalledTimes(1)
         expect(broker.initProducerId).not.toHaveBeenCalled()
       })
-    })
-  })
-
-  describe('broker mutex instrumentation', () => {
-    it('passes description/instrumentationEmitter through to the per-broker Lock, which emits on timeout', async () => {
-      jest.useFakeTimers()
-
-      try {
-        const emit = jest.fn()
-        const lockedBroker = { nodeId: 3, brokerAddress: '10.0.1.4:9092' }
-        const eosManager = createEosManager({
-          logger: newLogger(),
-          cluster,
-          instrumentationEmitter: { emit },
-        })
-
-        await eosManager.initProducerId()
-        await eosManager.acquireBrokerLock(lockedBroker) // first caller acquires immediately
-
-        const secondAcquire = eosManager.acquireBrokerLock(lockedBroker) // queues behind the first
-        jest.advanceTimersByTime(0xffff)
-
-        await expect(secondAcquire).rejects.toThrow(KafkaJSLockTimeout)
-
-        expect(emit).toHaveBeenCalledTimes(1)
-        const [eventName, payload] = emit.mock.calls[0]
-        expect(eventName).toEqual(expect.stringContaining('lock_timeout'))
-        expect(payload).toMatchObject({
-          description: lockedBroker.brokerAddress,
-          waiting: 1,
-          timeout: 0xffff,
-        })
-      } finally {
-        jest.useRealTimers()
-      }
     })
   })
 })

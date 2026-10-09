@@ -124,8 +124,6 @@ const createProducerCluster = ({
   }
 
   const eosManager = {
-    acquireBrokerLock: async () => {},
-    releaseBrokerLock: async () => {},
     isTransactional: () => transactional,
     addPartitionsToTransaction: async () => {},
     getTransactionalId: () => 'a-transactional-id',

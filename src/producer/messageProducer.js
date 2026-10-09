@@ -1,11 +1,6 @@
 const createSendMessages = require('./sendMessages')
 const createEosManager = require('./eosManager')
-const {
-  KafkaJSError,
-  KafkaJSNonRetriableError,
-  KafkaJSInvalidConfigurationError,
-} = require('../errors')
-const { CONNECTION_STATUS } = require('../network/connectionStatus')
+const { KafkaJSNonRetriableError, KafkaJSInvalidConfigurationError } = require('../errors')
 const sharedPromiseTo = require('../utils/sharedPromiseTo')
 
 /**
@@ -39,7 +34,17 @@ module.exports = ({
   instrumentationEmitter,
   INITIALIZED,
 }) => {
-  const idempotentSend = createSendMessages({ logger, cluster, retrier, partitioner, eosManager })
+  const idempotentSend = createSendMessages({
+    logger,
+    cluster,
+    retrier,
+    partitioner,
+    eosManager,
+    idempotence,
+    retry,
+    deliveryTimeout,
+    getConnectionStatus,
+  })
   let plainSend = null
 
   /**
@@ -67,15 +72,9 @@ module.exports = ({
   }
 
   const validateConnectionStatus = () => {
-    const connectionStatus = getConnectionStatus()
-
-    switch (connectionStatus) {
-      case CONNECTION_STATUS.DISCONNECTING:
-        throw new KafkaJSNonRetriableError(
-          `The producer is disconnecting; therefore, it can't safely accept messages anymore`
-        )
-      case CONNECTION_STATUS.DISCONNECTED:
-        throw new KafkaJSError('The producer is disconnected')
+    const error = createSendMessages.connectionStatusError(getConnectionStatus())
+    if (error !== null) {
+      throw error
     }
   }
 

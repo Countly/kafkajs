@@ -283,12 +283,9 @@ describe('Producer', () => {
       clientId: 'test-client-id11111',
     })
 
-    // Non-idempotent: an idempotent producer sends one Produce per broker at a time, so the
-    // second send would never wait in the request queue.
     producer = createProducer({
       cluster,
       logger: newLogger(),
-      idempotent: false,
       instrumentationEmitter: emitter,
     })
 
@@ -296,24 +293,27 @@ describe('Producer', () => {
     producer.on(producer.events.REQUEST_QUEUE_SIZE, requestListener)
 
     await producer.connect()
+    // A partition holds its next batch until the previous one is answered, so the second request
+    // must be for another partition of the same broker; the different timeouts keep the two
+    // batches out of one request.
+    await cluster.addTargetTopic(topicName)
+    const partitionsByLeader = new Map()
+    for (const { partitionId, leader } of cluster.findTopicPartitionMetadata(topicName)) {
+      partitionsByLeader.set(leader, [...(partitionsByLeader.get(leader) || []), partitionId])
+    }
+    const [first, second] = [...partitionsByLeader.values()].find((ids) => ids.length > 1)
     await Promise.all([
       producer.send({
         acks: -1,
+        timeout: 30000,
         topic: topicName,
-        messages: [
-          { partition: 0, value: 'value-0' },
-          { partition: 1, value: 'value-1' },
-          { partition: 2, value: 'value-2' },
-        ],
+        messages: [{ partition: first, value: 'value-0' }],
       }),
       producer.send({
         acks: -1,
+        timeout: 30001,
         topic: topicName,
-        messages: [
-          { partition: 0, value: 'value-0' },
-          { partition: 1, value: 'value-1' },
-          { partition: 2, value: 'value-2' },
-        ],
+        messages: [{ partition: second, value: 'value-1' }],
       }),
     ])
 

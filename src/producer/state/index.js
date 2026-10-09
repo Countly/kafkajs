@@ -4,6 +4,7 @@ const {
   KafkaJSInvariantViolation,
   KafkaJSTransactionAbortableError,
 } = require('../../errors')
+const { RETRIABLE_CATEGORIES } = require('../../protocol/errorCategories')
 const { classify, transactionStateFor } = require('./errorClassifier')
 const ProducerIdAndEpoch = require('./producerIdAndEpoch')
 const PartitionSequencer = require('./partitionSequencer')
@@ -372,8 +373,9 @@ class ProducerStateManager {
    *   sequencer - with its sequences given back, or the epoch bumped - and the caller rejects it.
    *   `FAIL_BATCH` arms `ABORTABLE_ERROR` for a transactional `UNKNOWN_PRODUCER_ID` or
    *   `OUT_OF_ORDER_SEQUENCE_NUMBER` and for an expired batch inside a transaction, and
-   *   `FATAL_ERROR` for `INVALID_PRODUCER_ID_MAPPING`; an expired batch that had been re-sent
-   *   leaves its partition's sequence unresolved, and a transactional `UNKNOWN_PRODUCER_ID`
+   *   `FATAL_ERROR` for `INVALID_PRODUCER_ID_MAPPING`; an expired batch, and a re-sent one
+   *   that ran out of retries on a retriable error, leave their partition's sequence unresolved -
+   *   the broker may hold them - and a transactional `UNKNOWN_PRODUCER_ID`
    *   resets its partition (an idempotent-only one never ends in `FAIL_BATCH` for it).
    * @see https://github.com/apache/kafka/blob/4.3/clients/src/main/java/org/apache/kafka/clients/producer/internals/TransactionManager.java
    * @param {PartitionBatch} batch a batch that was drained and not yet settled
@@ -416,7 +418,7 @@ class ProducerStateManager {
         }
         return verdict
       case 'FAIL_BATCH':
-        if (expired) {
+        if (expired || this.#outOfRetries(batch, category)) {
           this.sequencer.markUnresolved(batch)
         }
         this.sequencer.fail(batch)
@@ -534,6 +536,20 @@ class ProducerStateManager {
    */
   #isPartitionInTransaction = (topic, partition) =>
     !this.#transactional || this.#partitions.get(topic)?.has(Number(partition)) === true
+
+  /**
+   * Whether a batch ran out of retries on a retriable error. The broker may hold one that was
+   * re-sent, so - as for an expired batch, which is where Java meets this case - its sequence is
+   * left unresolved and the partition's next batch waits for the outcome; `markUnresolved` leaves
+   * a batch never re-sent alone.
+   * @see https://github.com/apache/kafka/blob/4.3/clients/src/main/java/org/apache/kafka/clients/producer/internals/TransactionManager.java
+   * @param {PartitionBatch} batch
+   * @param {Category} category
+   * @returns {boolean}
+   */
+  #outOfRetries(batch, category) {
+    return batch.attempt >= this.#retries && RETRIABLE_CATEGORIES.has(category)
+  }
 
   /** @returns {boolean} whether `ABORTABLE_ERROR` or `FATAL_ERROR` is armed */
   #armed() {

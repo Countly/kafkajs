@@ -639,6 +639,38 @@ The producer becomes idempotent by default and transactions move to the transact
   handle a rejected `transaction()` — it could reject in 2.2.4 too, for example on its first
   InitProducerId.
 
+- **The producer's per-broker lock is gone.** An idempotent or transactional producer used to
+  send one request at a time to each broker, behind a mutex that rejected with
+  `KafkaJSLockTimeout` after 65.5 s and emitted `producer.events.LOCK_TIMEOUT` first. Batches of
+  different partitions are now pipelined, up to 5 requests per broker (fewer when the
+  connection's `maxInFlightRequests` is lower); within one partition a batch waits for the
+  previous one's answer, which keeps the partition in order. `LOCK_TIMEOUT` can no longer be
+  emitted. The event stays declared and the error class stays exported: a `send()` registering its
+  topics with the cluster, and connecting to a broker, can still raise `KafkaJSLockTimeout`.
+  *What to do:* `LOCK_TIMEOUT` listeners on a producer will never be called and can be removed.
+  Keep any `catch` that matches `KafkaJSLockTimeout` by name. `maxInFlightRequests: 1` on a
+  transactional producer is no longer needed and now costs throughput.
+
+- **A failed send no longer cancels the partitions that were still going, and `retry.retries` is
+  now per partition batch** on an idempotent producer (the default). In 2.2.4 one non-retriable
+  error bailed the whole `send()` and no further partition was written; now each topic-partition
+  is retried and fails on its own, so a rejecting `send()` may have written the partitions whose
+  batches succeeded, and a multi-partition send can take up to `retries` attempts per partition
+  before it gives up. The promise still settles once — after every batch has settled — and still
+  rejects with one error: the first one any of its batches failed with.
+  *What to do:* if you depended on a rejected `send()` meaning "nothing after the failure was
+  written", pass `idempotent: false` for 2.2.4's all-or-nothing bail. If you tune `retry.retries`
+  for worst-case latency, budget it per partition of a send rather than per call.
+
+- **`send()`/`sendBatch()` resolve their `RecordMetadata[]` in a different order** on an
+  idempotent producer (the default): sorted by topic name, then partition ascending. 2.2.4's order
+  was grouped by the broker that led each partition, in the order the call listed its topics — an
+  artifact of how the request was split, not a documented contract — so a multi-broker send, or a
+  send listing its topics out of name order, returns the same entries in a different sequence.
+  Every entry still carries `topicName` and `partition`. The non-idempotent path is unchanged.
+  *What to do:* match results by `topicName`/`partition` rather than by array index. A
+  single-partition send is unaffected; so is any caller that already reads the fields.
+
 ### TypeScript: source-breaking type changes
 
 The runtime is unchanged by these; they can fail `tsc` on an existing codebase.

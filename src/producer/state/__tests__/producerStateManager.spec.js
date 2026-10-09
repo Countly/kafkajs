@@ -1,3 +1,17 @@
+/**
+ * The per-partition limit the next manager's sequencer is built with. Unset, it is the production
+ * default of one batch in flight; the blocks that call `withSeveralBatchesInFlight()` raise it.
+ */
+let mockMaxInFlightPerPartition
+jest.mock('../partitionSequencer', () => {
+  const PartitionSequencer = jest.requireActual('../partitionSequencer')
+  return class extends PartitionSequencer {
+    constructor(options) {
+      super({ ...options, maxInFlightPerPartition: mockMaxInFlightPerPartition })
+    }
+  }
+})
+
 const ProducerStateManager = require('..')
 const createRetry = require('../../../retry')
 const { createErrorFromCode } = require('../../../protocol/error')
@@ -140,6 +154,20 @@ const failure = (code) => createErrorFromCode(code)
 
 /** Lets every pending promise callback run. */
 const settle = () => new Promise((resolve) => setImmediate(resolve))
+
+/**
+ * Builds every manager of the enclosing block with room for several batches of one partition in
+ * flight: states that cannot occur at the production limit of one batch per partition, kept for a
+ * future per-partition pipelining.
+ */
+const withSeveralBatchesInFlight = () => {
+  beforeEach(() => {
+    mockMaxInFlightPerPartition = 5
+  })
+  afterEach(() => {
+    mockMaxInFlightPerPartition = undefined
+  })
+}
 
 describe('Producer > state > ProducerStateManager', () => {
   describe('resets of the producer id and the sequences', () => {
@@ -442,6 +470,8 @@ describe('Producer > state > ProducerStateManager', () => {
   })
 
   describe('a permanent failure with attempts left', () => {
+    withSeveralBatchesInFlight()
+
     test('transactional: gives the sequences back and renumbers what follows, arming nothing', async () => {
       const manager = await transactionalManager()
       const [a] = send(manager, createBatch())
@@ -515,16 +545,19 @@ describe('Producer > state > ProducerStateManager', () => {
   })
 
   describe('an OUT_OF_ORDER_SEQUENCE_NUMBER retried until its attempts are spent', () => {
+    withSeveralBatchesInFlight()
+
     /**
-     * Batch a fails for good with its re-sends used up, so nothing is given back and b, still in
-     * flight at sequence 5, can never be the next sequence: every answer for it is a 45.
+     * Batch a fails for good on a non-retriable error with its re-sends used up, so nothing is
+     * given back or left unresolved, and b, still in flight at sequence 5, can never be the next
+     * sequence: every answer for it is a 45.
      */
     const gapBehind = async (build) => {
       const manager = await build()
       const [a] = send(manager, createBatch())
       const [b] = send(manager, createBatch())
       a.attempt = RETRIES
-      expect(manager.fail(a, failure(REQUEST_TIMED_OUT))).toEqual('FAIL_BATCH')
+      expect(manager.fail(a, failure(INVALID_RECORD))).toEqual('FAIL_BATCH')
 
       for (let attempt = 0; attempt < RETRIES; attempt += 1) {
         expect(manager.fail(b, failure(OUT_OF_ORDER_SEQUENCE_NUMBER))).toEqual('RETRY_IN_ORDER')
@@ -580,6 +613,8 @@ describe('Producer > state > ProducerStateManager', () => {
   })
 
   describe('a batch that expires after it was re-sent (deliveryTimeout)', () => {
+    withSeveralBatchesInFlight()
+
     const expiry = () =>
       new KafkaJSDeliveryTimeout('The batch expired', { cause: failure(REQUEST_TIMED_OUT) })
 
@@ -667,13 +702,13 @@ describe('Producer > state > ProducerStateManager', () => {
       )
     })
 
-    test('without a delivery deadline a spent retry budget never marks a sequence unresolved', async () => {
+    test('without a delivery deadline, a re-sent batch whose retries are spent marks its sequence unresolved as well', async () => {
       const { manager, b } = await reSendWaiting(idempotentManager)
       b.attempt = RETRIES
 
       expect(manager.fail(b, failure(REQUEST_TIMED_OUT))).toEqual('FAIL_BATCH')
 
-      expect(manager.sequencer.entry(TOPIC, 0).unresolvedNextSequence).toBeNull()
+      expect(manager.sequencer.entry(TOPIC, 0).unresolvedNextSequence).toEqual(10)
     })
 
     test('an expiry is judged by its own error, not by the UNKNOWN_PRODUCER_ID it gave up on', async () => {
@@ -693,6 +728,81 @@ describe('Producer > state > ProducerStateManager', () => {
         lastAckedOffset: 14,
         unresolvedNextSequence: 10,
       })
+    })
+  })
+
+  describe('one batch per partition in flight: a re-sent batch that fails for good', () => {
+    const expiry = () =>
+      new KafkaJSDeliveryTimeout('The batch expired', { cause: failure(REQUEST_TIMED_OUT) })
+
+    /**
+     * Sends a and queues b behind it, then fails a retriably and re-sends it until its retries
+     * are spent; b stays unnumbered all along.
+     */
+    const reSentUntilSpent = async (build) => {
+      const manager = await build()
+      const [a] = send(manager, createBatch())
+      const b = createBatch()
+      manager.enqueue([b])
+      for (let attempt = 0; attempt < RETRIES; attempt += 1) {
+        expect(manager.fail(a, failure(REQUEST_TIMED_OUT))).toEqual('RETRY_IN_ORDER')
+        manager.sequencer.requeue(a, 0)
+        expect(manager.drain(NODE, LEADERS)).toEqual([a])
+      }
+      expect(b.firstSequence).toBeNull()
+      return { manager, a, b }
+    }
+
+    test('idempotent-only: out of retries, its sequence is unresolved and the next batch goes out at 0 after the bump', async () => {
+      const { manager, a, b } = await reSentUntilSpent(idempotentManager)
+
+      expect(manager.fail(a, failure(REQUEST_TIMED_OUT))).toEqual('FAIL_BATCH')
+      expect(manager.sequencer.entry(TOPIC, 0).unresolvedNextSequence).toEqual(5)
+
+      expect(manager.drain(NODE, LEADERS)).toEqual([b])
+      expect(b).toMatchObject({ firstSequence: 0, producerEpoch: 1 })
+      expect(manager.state()).toEqual(READY)
+    })
+
+    test('transactional: out of retries, its sequence is unresolved and the next drain arms ABORTABLE_ERROR', async () => {
+      const { manager, a, b } = await reSentUntilSpent(transactionalManager)
+
+      expect(manager.fail(a, failure(REQUEST_TIMED_OUT))).toEqual('FAIL_BATCH')
+      expect(manager.sequencer.entry(TOPIC, 0).unresolvedNextSequence).toEqual(5)
+
+      expect(manager.drain(NODE, LEADERS)).toEqual([])
+      expect(manager.state()).toEqual(ABORTABLE_ERROR)
+      expect(b.settlers[0].reject).toHaveBeenCalledWith(manager.transaction.armedError())
+      expect(manager.producerEpoch).toEqual(0)
+    })
+
+    test('a batch that was never re-sent fails as before: nothing is unresolved and the next batch follows it', async () => {
+      const manager = await idempotentManager({ retry: { ...RETRY, retries: 0 } })
+      const [a] = send(manager, createBatch())
+      const b = createBatch()
+      manager.enqueue([b])
+
+      expect(manager.fail(a, failure(REQUEST_TIMED_OUT))).toEqual('FAIL_BATCH')
+
+      expect(manager.sequencer.entry(TOPIC, 0)?.unresolvedNextSequence ?? null).toBeNull()
+      expect(manager.drain(NODE, LEADERS)).toEqual([b])
+      expect(b).toMatchObject({ firstSequence: 5, producerEpoch: 0 })
+    })
+
+    test('idempotent-only: an expired re-send leaves the next batch waiting, then it goes out at 0 after the bump', async () => {
+      const manager = await idempotentManager()
+      const [a] = send(manager, createBatch())
+      const b = createBatch()
+      manager.enqueue([b])
+      expect(manager.fail(a, failure(REQUEST_TIMED_OUT))).toEqual('RETRY_IN_ORDER')
+      manager.sequencer.requeue(a, 0)
+      expect(b.firstSequence).toBeNull()
+
+      expect(manager.fail(a, expiry())).toEqual('FAIL_BATCH')
+      expect(manager.sequencer.entry(TOPIC, 0).unresolvedNextSequence).toEqual(5)
+
+      expect(manager.drain(NODE, LEADERS)).toEqual([b])
+      expect(b).toMatchObject({ firstSequence: 0, producerEpoch: 1 })
     })
   })
 

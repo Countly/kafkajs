@@ -1,9 +1,12 @@
+const { partitionResults } = require('../../../protocol/requests/produce/partitionResults')
+
 /**
  * The cluster surface a producer reads - its send path, its eosManager and its transactions -
  * over one broker that leads every partition, answers InitProducerId with producer id 1000 at
- * epoch 0, and answers every Produce with success unless told otherwise. Every broker method is
- * a `jest.fn`, so a spec can read what was sent. For unit specs that drive a real producer
- * without a cluster.
+ * epoch 0, and answers every Produce with success unless told otherwise - per partition, as
+ * `Broker#produce` resolves it, when the request asks for `perPartitionResults`. Every broker
+ * method is a `jest.fn`, so a spec can read what was sent. For unit specs that drive a real
+ * producer without a cluster.
  * @param {object} [options]
  * @param {number} [options.partitions=1] partitions per topic
  * @param {(request: object) => Promise<object>} [options.produce] replaces the Produce answer
@@ -23,10 +26,14 @@ const createFakeCluster = ({ partitions = 1, produce, options = {} } = {}) => {
       })),
     })),
   })
+  const answer = produce || succeed
   const broker = {
     nodeId: 0,
     initProducerId: jest.fn(async () => ({ producerId: '1000', producerEpoch: 0 })),
-    produce: jest.fn(produce || succeed),
+    produce: jest.fn(async (request) => {
+      const response = await answer(request)
+      return request.perPartitionResults ? partitionResults(response) : response
+    }),
     addPartitionsToTxn: jest.fn(async () => ({})),
     endTxn: jest.fn(async () => ({})),
   }

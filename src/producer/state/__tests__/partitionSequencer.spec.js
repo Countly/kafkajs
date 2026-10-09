@@ -59,7 +59,18 @@ const createGate = (overrides = {}) => ({
   ...overrides,
 })
 
-const build = () => new PartitionSequencer({ logger: newLogger() })
+/**
+ * A sequencer with no partition state.
+ * @param {{ maxInFlightPerPartition?: number }} [options] `PIPELINED` raises the production
+ *   limit of one batch in flight per partition
+ */
+const build = (options = {}) => new PartitionSequencer({ logger: newLogger(), ...options })
+
+/**
+ * The limit of the cases with several batches of one partition in flight: states that cannot occur
+ * at the production limit of one batch per partition, kept for a future per-partition pipelining.
+ */
+const PIPELINED = { maxInFlightPerPartition: 5 }
 
 /** One drain for broker 1. */
 const drain = (sequencer, gate) => sequencer.drain(NODE, LEADERS, createGate(gate))
@@ -103,7 +114,7 @@ const createBrokerLog = (lastSequence = -1) => ({
 
 /** Two batches in flight; the first was re-sent once and then expired. */
 const expiredInRetry = () => {
-  const sequencer = build()
+  const sequencer = build(PIPELINED)
   const batches = [createBatch(), createBatch()]
   sequencer.enqueue(batches)
   drain(sequencer)
@@ -117,9 +128,55 @@ const expiredInRetry = () => {
 }
 
 describe('PartitionSequencer', () => {
-  describe('drain()', () => {
-    test('takes one batch per partition per call and numbers it there; nothing caps a partition', () => {
+  describe('the per-partition limit', () => {
+    test('by default holds a never-sent batch while its partition has a batch in flight', () => {
       const sequencer = build()
+      const [first, second] = [createBatch(), createBatch()]
+      sequencer.enqueue([first, second])
+
+      expect(drain(sequencer)).toEqual([first])
+      expect(drain(sequencer)).toEqual([])
+      expect(second.firstSequence).toBeNull()
+
+      sequencer.complete(first, { baseOffset: '0' })
+      expect(drain(sequencer)).toEqual([second])
+      expect(second.firstSequence).toEqual(5)
+    })
+
+    test('does not hold a re-send', () => {
+      const sequencer = build()
+      const [first, second] = [createBatch(), createBatch()]
+      sequencer.enqueue([first, second])
+      drain(sequencer)
+
+      sequencer.requeue(first, 0)
+
+      expect(drain(sequencer)).toEqual([first])
+      expect(first.attempt).toEqual(1)
+      expect(second.firstSequence).toBeNull()
+    })
+
+    test('a higher limit lets that many batches of a partition be in flight', () => {
+      const sequencer = build({ maxInFlightPerPartition: 3 })
+      const batches = [createBatch(), createBatch(), createBatch(), createBatch()]
+      sequencer.enqueue(batches)
+
+      expect([drain(sequencer), drain(sequencer), drain(sequencer)]).toEqual([
+        [batches[0]],
+        [batches[1]],
+        [batches[2]],
+      ])
+      expect(drain(sequencer)).toEqual([])
+
+      sequencer.complete(batches[0], { baseOffset: '0' })
+      expect(drain(sequencer)).toEqual([batches[3]])
+      expect(sequencesOf(batches)).toEqual([0, 5, 10, 15])
+    })
+  })
+
+  describe('drain()', () => {
+    test('takes one batch per partition per call and numbers it there, up to the limit', () => {
+      const sequencer = build(PIPELINED)
       const batches = [createBatch(), createBatch(), createBatch()]
       sequencer.enqueue(batches)
 
@@ -134,7 +191,7 @@ describe('PartitionSequencer', () => {
     })
 
     test('numbers each partition contiguously across interleaved calls, independently of the others', () => {
-      const sequencer = build()
+      const sequencer = build(PIPELINED)
       const a = [
         createBatch({ records: 2 }),
         createBatch({ records: 3 }),
@@ -316,7 +373,7 @@ describe('PartitionSequencer', () => {
     })
 
     test('a batch queued behind a re-send that waits for a lower sequence stays queued too', () => {
-      const sequencer = build()
+      const sequencer = build(PIPELINED)
       const inFlight = [createBatch(), createBatch()]
       sequencer.enqueue(inFlight)
       drain(sequencer)
@@ -335,7 +392,7 @@ describe('PartitionSequencer', () => {
     })
 
     test('holds a re-send until it is the lowest sequence in flight, while other partitions flow', () => {
-      const sequencer = build()
+      const sequencer = build(PIPELINED)
       const batches = [createBatch(), createBatch(), createBatch()]
       sequencer.enqueue(batches)
       drain(sequencer)
@@ -370,7 +427,7 @@ describe('PartitionSequencer', () => {
       ['in sequence order', [0, 1]],
       ['in reverse order', [1, 0]],
     ])('re-sends failed %s go back by sequence, ahead of every batch never sent', (_, order) => {
-      const sequencer = build()
+      const sequencer = build(PIPELINED)
       const batches = [createBatch(), createBatch(), createBatch()]
       sequencer.enqueue(batches)
       drain(sequencer)
@@ -683,7 +740,7 @@ describe('PartitionSequencer', () => {
     })
 
     test('an earlier batch completing late moves nothing back', () => {
-      const sequencer = build()
+      const sequencer = build(PIPELINED)
       const batches = [createBatch(), createBatch()]
       sequencer.enqueue(batches)
       drain(sequencer)
@@ -699,7 +756,7 @@ describe('PartitionSequencer', () => {
     })
 
     test('clears the renumbered flag, as a re-drain does', () => {
-      const sequencer = build()
+      const sequencer = build(PIPELINED)
       const batches = [createBatch(), createBatch()]
       sequencer.enqueue(batches)
       drain(sequencer)
@@ -763,7 +820,7 @@ describe('PartitionSequencer', () => {
     })
 
     test('with 0, 5 and 10 in flight, failing 5 moves 10 down to 5; the queued batch follows at 10', () => {
-      const sequencer = build()
+      const sequencer = build(PIPELINED)
       const inFlight = [createBatch(), createBatch(), createBatch()]
       sequencer.enqueue(inFlight)
       drain(sequencer)
@@ -795,7 +852,7 @@ describe('PartitionSequencer', () => {
     })
 
     test('gives sequences back across the int32 wrap', () => {
-      const sequencer = build()
+      const sequencer = build(PIPELINED)
       sequencer.advance(TOPIC, 0, INT_32_MAX_VALUE - 4)
       const [failed] = send(sequencer, createBatch({ records: 5 }))
       const [later] = send(sequencer, createBatch({ records: 3 }))
@@ -808,7 +865,7 @@ describe('PartitionSequencer', () => {
     })
 
     test('a failed batch that is never given back leaves a gap the broker refuses', () => {
-      const sequencer = build()
+      const sequencer = build(PIPELINED)
       const broker = createBrokerLog()
       const batches = [createBatch(), createBatch()]
       sequencer.enqueue(batches)
@@ -825,7 +882,7 @@ describe('PartitionSequencer', () => {
 
   describe('restarting at 0', () => {
     test('renumbers the batches in flight from 0 and keeps counting from their total', () => {
-      const sequencer = build()
+      const sequencer = build(PIPELINED)
       const [acked] = send(sequencer, createBatch())
       sequencer.complete(acked, { baseOffset: '0' })
       const pending = [createBatch({ records: 5 }), createBatch({ records: 3 })]
@@ -900,7 +957,7 @@ describe('PartitionSequencer', () => {
     })
 
     test('a stale partition with one batch in flight drains nothing new until it settles, then restarts at 0', () => {
-      const sequencer = build()
+      const sequencer = build(PIPELINED)
       const [inFlight] = send(sequencer, createBatch({ partition: 1 }))
       sequencer.complete(send(sequencer, createBatch({ partition: 1 }))[0], { baseOffset: '0' })
       sequencer.markStaleExcept(TOPIC, 0)
@@ -1004,7 +1061,7 @@ describe('PartitionSequencer', () => {
     test.each(markers)(
       '%s still marks a partition whose batches in flight are only partly restarted',
       (_, mark) => {
-        const sequencer = build()
+        const sequencer = build(PIPELINED)
         const [first] = send(sequencer, createBatch())
         const [second] = send(sequencer, createBatch())
         sequencer.restartPartition(TOPIC, 0)
@@ -1057,7 +1114,7 @@ describe('PartitionSequencer', () => {
       ['in numbering order', [0, 1]],
       ['in reverse order', [1, 0]],
     ])('only grows across the int32 wrap, marked %s', (_, order) => {
-      const sequencer = build()
+      const sequencer = build(PIPELINED)
       sequencer.advance(TOPIC, 0, INT_32_MAX_VALUE - 9)
       const batches = [createBatch(), createBatch()]
       sequencer.enqueue(batches)
@@ -1146,7 +1203,7 @@ describe('PartitionSequencer', () => {
     })
 
     test('clears across the int32 wrap once the acknowledged sequences reach the next one', () => {
-      const sequencer = build()
+      const sequencer = build(PIPELINED)
       sequencer.advance(TOPIC, 0, INT_32_MAX_VALUE - 9)
       const batches = [createBatch(), createBatch()]
       sequencer.enqueue(batches)
@@ -1389,7 +1446,7 @@ describe('PartitionSequencer', () => {
 
   describe('the int32 sequence', () => {
     test('wraps to 0 right after INT_32_MAX_VALUE, as the broker expects', () => {
-      const sequencer = build()
+      const sequencer = build(PIPELINED)
       sequencer.advance(TOPIC, 0, INT_32_MAX_VALUE - 4)
       const broker = createBrokerLog(INT_32_MAX_VALUE - 5)
 
@@ -1405,7 +1462,7 @@ describe('PartitionSequencer', () => {
     })
 
     test('a batch that crosses INT_32_MAX_VALUE continues from the wrapped sequence', () => {
-      const sequencer = build()
+      const sequencer = build(PIPELINED)
       sequencer.advance(TOPIC, 0, INT_32_MAX_VALUE - 5)
 
       const [crossing] = send(sequencer, createBatch({ records: 5 }))
@@ -1420,7 +1477,7 @@ describe('PartitionSequencer', () => {
       ['in numbering order', [0, 1]],
       ['in reverse order', [1, 0]],
     ])('re-sends requeued %s across the wrap go out in numbering order', (_, order) => {
-      const sequencer = build()
+      const sequencer = build(PIPELINED)
       sequencer.advance(TOPIC, 0, INT_32_MAX_VALUE - 4)
       const batches = [createBatch({ records: 5 }), createBatch({ records: 2 })]
       sequencer.enqueue(batches)

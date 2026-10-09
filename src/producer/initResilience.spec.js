@@ -31,6 +31,25 @@ const createFakeCluster = () => ({
   retry: { retries: 0, initialRetryTime: 1 },
 })
 
+/**
+ * A Produce answer acknowledging every partition the request carries, one result per partition as
+ * the idempotent send path asks for them.
+ * @param {{ topicData: { topic: string, partitions: { partition: number }[] }[] }} request
+ * @returns {Promise<object[]>}
+ */
+const acknowledge = async ({ topicData }) =>
+  topicData.flatMap(({ topic, partitions }) =>
+    partitions.map(({ partition }) => ({
+      topicName: topic,
+      partition,
+      errorCode: 0,
+      baseOffset: '0',
+      logAppendTime: '-1',
+      logStartOffset: '0',
+      error: null,
+    }))
+  )
+
 describe('Producer > idempotent init resilience', () => {
   // The real defect (Countly 2g): connect() fails InitProducerId once, the caller catches it and
   // keeps producing, and every later send() goes out with no producer id until the process
@@ -39,7 +58,7 @@ describe('Producer > idempotent init resilience', () => {
   it('retries InitProducerId on the next send() after a failed connect()', async () => {
     const cluster = createFakeCluster()
     let initAttempts = 0
-    const produce = jest.fn(async () => ({ topics: [] }))
+    const produce = jest.fn(acknowledge)
 
     const broker = {
       nodeId: 0,
@@ -174,7 +193,7 @@ describe('Producer > idempotent init resilience', () => {
     const cluster = createFakeCluster()
     let initAttempts = 0
     let resolveInit
-    const produce = jest.fn(async () => ({ topics: [] }))
+    const produce = jest.fn(acknowledge)
 
     const broker = {
       nodeId: 0,
@@ -218,7 +237,7 @@ describe('Producer > idempotent init resilience', () => {
     const cluster = createFakeCluster()
     let initAttempts = 0
     let resolveSecondInit
-    const produce = jest.fn(async () => ({ topics: [] }))
+    const produce = jest.fn(acknowledge)
 
     const broker = {
       nodeId: 0,

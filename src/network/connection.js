@@ -55,6 +55,9 @@ const isAuthenticatedRequest = (request) => {
 const PRIVATE = {
   SHOULD_REAUTHENTICATE: Symbol('private:Connection:shouldReauthenticate'),
   AUTHENTICATE: Symbol('private:Connection:authenticate'),
+  PREPARE: Symbol('private:Connection:prepare'),
+  ENQUEUE: Symbol('private:Connection:enqueue'),
+  QUEUED: Symbol('private:Connection:queued'),
   CONNECT: Symbol('private:Connection:connect'),
   CONNECT_ATTEMPT: Symbol('private:Connection:connectAttempt'),
   ABORT_CONNECT: Symbol('private:Connection:abortConnect'),
@@ -186,6 +189,9 @@ module.exports = class Connection {
 
     this.authenticatedAt = null
     this.sessionLifetime = Long.ZERO
+
+    /** Settles once the latest request has reached the request queue, whatever its outcome. */
+    this[PRIVATE.QUEUED] = Promise.resolve()
 
     /**
      * @private
@@ -497,6 +503,15 @@ module.exports = class Connection {
   }
 
   /**
+   * Sends one request and resolves with its parsed response.
+   *
+   * Requests reach this connection's request queue - and so the socket - in the order `send()` was
+   * called. Each one authenticates (when due) and encodes at once, concurrently with the others,
+   * and is pushed into the queue only after the request before it was, so a request that takes
+   * longer to encode is never overtaken by a later one. The idempotent producer relies on it, since
+   * the batches of one partition must reach the broker in the order they were numbered. The SASL
+   * handshake and the ApiVersions exchange that authentication itself sends are not ordered, or the
+   * first request would wait for itself.
    * @public
    * @param {object} protocol
    * @param {object} protocol.request It is defined by the protocol and consists of an object with "apiKey",
@@ -511,45 +526,25 @@ module.exports = class Connection {
    * @returns {Promise<data>} where data is the return of "response#parse"
    */
   async send({ request, response, requestTimeout = null, logResponseError = true }) {
-    if (!this.isAuthenticated() && isAuthenticatedRequest(request)) {
-      await this[PRIVATE.AUTHENTICATE]()
-    }
-
-    this.failIfNotConnected()
-
     const expectResponse = !request.expectResponse || request.expectResponse()
-    const sendRequest = async () => {
-      const { clientId } = this
-      const correlationId = this.nextCorrelationId()
+    const prepared = this[PRIVATE.PREPARE]({ request, expectResponse })
+    const enqueue = (encoded) => this[PRIVATE.ENQUEUE](encoded, requestTimeout)
 
-      const requestPayload = await createRequest({ request, correlationId, clientId })
-      const { apiKey, apiName, apiVersion } = request
-      this.logDebug(`Request ${requestInfo(request)}`, {
-        correlationId,
-        expectResponse,
-        size: Buffer.byteLength(requestPayload.buffer),
-      })
-
-      return new Promise((resolve, reject) => {
-        try {
-          this.failIfNotConnected()
-          const entry = { apiKey, apiName, apiVersion, correlationId, resolve, reject }
-
-          this.requestQueue.push({
-            entry,
-            expectResponse,
-            requestTimeout,
-            sendRequest: () => {
-              this.socket.write(requestPayload.buffer, 'binary')
-            },
-          })
-        } catch (e) {
-          reject(e)
-        }
-      })
+    let queued
+    if (isAuthenticatedRequest(request)) {
+      // It may reject before the chain reaches it; marked handled so Node does not report it.
+      prepared.catch(() => {})
+      queued = this[PRIVATE.QUEUED].then(() => prepared).then(enqueue)
+      this[PRIVATE.QUEUED] = queued.then(
+        () => {},
+        () => {}
+      )
+    } else {
+      queued = prepared.then(enqueue)
     }
 
-    const { correlationId, size, entry, payload } = await sendRequest()
+    const { answered } = await queued
+    const { correlationId, size, entry, payload } = await answered
 
     if (!expectResponse) {
       return
@@ -592,6 +587,65 @@ module.exports = class Connection {
 
       throw e
     }
+  }
+
+  /**
+   * Authenticates when needed and encodes the request under the next correlation id.
+   * @private
+   * @param {{ request: object, expectResponse: boolean }} options
+   * @returns {Promise<{ request: object, expectResponse: boolean, correlationId: number,
+   *   requestPayload: object }>}
+   */
+  async [PRIVATE.PREPARE]({ request, expectResponse }) {
+    if (!this.isAuthenticated() && isAuthenticatedRequest(request)) {
+      await this[PRIVATE.AUTHENTICATE]()
+    }
+
+    this.failIfNotConnected()
+
+    const { clientId } = this
+    const correlationId = this.nextCorrelationId()
+    const requestPayload = await createRequest({ request, correlationId, clientId })
+    this.logDebug(`Request ${requestInfo(request)}`, {
+      correlationId,
+      expectResponse,
+      size: Buffer.byteLength(requestPayload.buffer),
+    })
+
+    return { request, expectResponse, correlationId, requestPayload }
+  }
+
+  /**
+   * Pushes an encoded request into the request queue.
+   * @private
+   * @param {{ request: object, expectResponse: boolean, correlationId: number,
+   *   requestPayload: object }} encoded what `PREPARE` resolved with
+   * @param {number|null} requestTimeout
+   * @returns {{ answered: Promise<{ correlationId: number, size: number, entry: object,
+   *   payload: Buffer }> }} `answered` settles with the response frame; wrapped so that waiting
+   *   for the push does not wait for the response
+   */
+  [PRIVATE.ENQUEUE]({ request, expectResponse, correlationId, requestPayload }, requestTimeout) {
+    const { apiKey, apiName, apiVersion } = request
+    const answered = new Promise((resolve, reject) => {
+      try {
+        this.failIfNotConnected()
+        const entry = { apiKey, apiName, apiVersion, correlationId, resolve, reject }
+
+        this.requestQueue.push({
+          entry,
+          expectResponse,
+          requestTimeout,
+          sendRequest: () => {
+            this.socket.write(requestPayload.buffer, 'binary')
+          },
+        })
+      } catch (e) {
+        reject(e)
+      }
+    })
+
+    return { answered }
   }
 
   /**

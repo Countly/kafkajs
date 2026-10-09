@@ -89,8 +89,6 @@ describe('Producer > sendMessages', () => {
       updateSequence: jest.fn(),
       isTransactional: jest.fn().mockReturnValue(false),
       addPartitionsToTransaction: jest.fn(),
-      acquireBrokerLock: jest.fn(),
-      releaseBrokerLock: jest.fn(),
     }
 
     retrier = retry({ retries: 5 })
@@ -270,7 +268,7 @@ describe('Producer > sendMessages', () => {
     expect(cluster.refreshMetadata).toHaveBeenCalled()
   })
 
-  test('retrieves sequence information from the transaction manager and updates', async () => {
+  test('a non-idempotent send takes no lock, numbers nothing and adds no partition to a transaction', async () => {
     const sendMessages = createSendMessages({
       retrier,
       logger: newLogger(),
@@ -278,86 +276,17 @@ describe('Producer > sendMessages', () => {
       partitioner,
       eosManager,
     })
-
-    eosManager.getSequence.mockReturnValue(5)
-
-    cluster.findTopicPartitionMetadata
-      .mockImplementationOnce(() => [])
-      .mockImplementationOnce(() => topicPartitionMetadata)
-
-    await sendMessages({
-      topicMessages: [{ topic, messages }],
-    })
-
-    expect(brokers[1].produce.mock.calls[0][0].topicData[0].partitions[0]).toHaveProperty(
-      'firstSequence',
-      5
-    )
-    expect(brokers[2].produce.mock.calls[0][0].topicData[0].partitions[0]).toHaveProperty(
-      'firstSequence',
-      5
-    )
-    expect(brokers[3].produce.mock.calls[0][0].topicData[0].partitions[0]).toHaveProperty(
-      'firstSequence',
-      5
-    )
-
-    expect(eosManager.updateSequence).toHaveBeenCalledWith(
-      'topic-name',
-      0,
-      messagesPerPartition[0].length
-    )
-    expect(eosManager.updateSequence).toHaveBeenCalledWith(
-      'topic-name',
-      1,
-      messagesPerPartition[1].length
-    )
-    expect(eosManager.updateSequence).toHaveBeenCalledWith(
-      'topic-name',
-      2,
-      messagesPerPartition[2].length
-    )
-  })
-
-  test('adds partitions to the transaction if transactional', async () => {
-    const sendMessages = createSendMessages({
-      retrier,
-      logger: newLogger(),
-      cluster,
-      partitioner,
-      eosManager,
-    })
-
-    cluster.findTopicPartitionMetadata
-      .mockImplementationOnce(() => [])
-      .mockImplementationOnce(() => topicPartitionMetadata)
-
     eosManager.isTransactional.mockReturnValue(true)
 
-    await sendMessages({
-      topicMessages: [{ topic, messages }],
-    })
+    await sendMessages({ topicMessages: [{ topic, messages }] })
 
-    const numTargetBrokers = 3
-    expect(eosManager.addPartitionsToTransaction).toHaveBeenCalledTimes(numTargetBrokers)
-    expect(eosManager.addPartitionsToTransaction).toHaveBeenCalledWith([
-      {
-        topic: 'topic-name',
-        partitions: [expect.objectContaining({ partition: 0 })],
-      },
-    ])
-    expect(eosManager.addPartitionsToTransaction).toHaveBeenCalledWith([
-      {
-        topic: 'topic-name',
-        partitions: [expect.objectContaining({ partition: 1 })],
-      },
-    ])
-    expect(eosManager.addPartitionsToTransaction).toHaveBeenCalledWith([
-      {
-        topic: 'topic-name',
-        partitions: [expect.objectContaining({ partition: 2 })],
-      },
-    ])
+    for (const broker of [brokers[1], brokers[2], brokers[3]]) {
+      const [{ topicData }] = broker.produce.mock.calls[0]
+      expect(topicData[0].partitions[0]).not.toHaveProperty('firstSequence')
+    }
+    expect(eosManager.getSequence).not.toHaveBeenCalled()
+    expect(eosManager.updateSequence).not.toHaveBeenCalled()
+    expect(eosManager.addPartitionsToTransaction).not.toHaveBeenCalled()
   })
 
   test('if transactional produces with the transactional id and producer id & epoch', async () => {

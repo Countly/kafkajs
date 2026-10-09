@@ -112,8 +112,6 @@ const createEosManager = () => ({
   updateSequence: () => {},
   isTransactional: () => false,
   addPartitionsToTransaction: async () => {},
-  acquireBrokerLock: async () => {},
-  releaseBrokerLock: async () => {},
 })
 
 /** Routes each message to the partition explicitly set on it, bypassing any real partitioner. */

@@ -179,8 +179,6 @@ const notLeaderWithHint = ({ leaderId = 2, leaderEpoch = 6, nodeEndpoints } = {}
 
 /** The minimal EosManager surface `sendMessages` calls, for a non-transactional producer. */
 const eosManagerStub = ({ updateSequence = jest.fn() } = {}) => ({
-  acquireBrokerLock: async () => {},
-  releaseBrokerLock: async () => {},
   isTransactional: () => false,
   getSequence: () => 0,
   updateSequence,
@@ -414,7 +412,7 @@ describe('Producer > KIP-951 leader hint', () => {
     expect(withHint.produced).toHaveLength(without.produced.length)
   })
 
-  test('the same rollback holds when applyNodeEndpoints replaced the Broker of an already-succeeded node', async () => {
+  test('a Broker that applyNodeEndpoints replaced is produced to again, and no sequence is touched', async () => {
     // 'test-topic-2' (leader 2) succeeds before 'test-topic' (leader 1) fails with a hint that
     // hands node 2 a new address. Replacing node 2's Broker makes responsePerBroker treat it as
     // unsent, so the next attempt re-produces 'test-topic-2' alongside the legitimate retry of
@@ -440,18 +438,8 @@ describe('Producer > KIP-951 leader hint', () => {
     await send({ acks: -1, timeout: 30000, topicMessages: topicMessagesTwoLeaders })
 
     expect(produced.map(({ nodeId }) => nodeId)).toEqual([2, 1, 2])
-
-    const increments = updateSequence.mock.calls.filter(([, , n]) => n > 0)
-    const rollbacks = updateSequence.mock.calls.filter(([, , n]) => n < 0)
-
-    // One failure (node 1's 'test-topic' attempt), one matching rollback.
-    expect(rollbacks).toHaveLength(1)
-    // 'test-topic-2' increments twice (its original success, then the duplicate on the replaced
-    // node 2 broker); 'test-topic' increments twice (the rolled-back attempt, then the retry that
-    // lands on node 2) - four increments net one rollback, matching the two topics' three actual
-    // successful deliveries (one of them a duplicate).
-    expect(increments).toHaveLength(4)
-    expect(increments.length - rollbacks.length).toEqual(3)
+    // A non-idempotent request carries no sequence, so a retry has none to give back.
+    expect(updateSequence).not.toHaveBeenCalled()
   })
 
   test('a rejecting applyLeaderHint does not replace the produce error or skip the staleMetadata fall-through', async () => {

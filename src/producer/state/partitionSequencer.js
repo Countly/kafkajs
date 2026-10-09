@@ -174,6 +174,7 @@ const restartedSinceSent = (entry) =>
  */
 class PartitionSequencer {
   #logger
+  #maxInFlightPerPartition
   /** @type {Map<string, Map<number, PartitionEntry>>} */
   #topics = new Map()
   /** @type {Set<PartitionEntry>} */
@@ -183,9 +184,14 @@ class PartitionSequencer {
    * Creates a sequencer that holds no partitions.
    * @param {object} options
    * @param {import('../../../types').Logger} options.logger
+   * @param {number} [options.maxInFlightPerPartition=1] how many batches of one partition may be
+   *   numbered and unacknowledged at once. One keeps a partition in order whatever happens to a
+   *   request on its way to the broker: a later batch is numbered only once the one before it was
+   *   answered, so it can never reach the broker first.
    */
-  constructor({ logger }) {
+  constructor({ logger, maxInFlightPerPartition = 1 }) {
     this.#logger = logger
+    this.#maxInFlightPerPartition = maxInFlightPerPartition
   }
 
   /**
@@ -208,8 +214,9 @@ class PartitionSequencer {
    * A partition is skipped - and the rest of the pass goes on - while its head batch waits out a
    * backoff, while it is not yet in the transaction, and while one of these holds:
    * - no producer id is held (no partition is drained at all);
-   * - the head batch was never sent, and the partition has an unresolved sequence, or is stale
-   *   with batches still in flight. A stale partition with nothing in flight restarts at 0 first;
+   * - the head batch was never sent, and the partition already has `maxInFlightPerPartition`
+   *   batches in flight, has an unresolved sequence, or is stale with batches still in flight. A
+   *   stale partition with nothing in flight restarts at 0 first;
    * - the head batch is a re-send that is not the partition's first batch in flight, the
    *   earliest numbered.
    * Java breaks out of the node's pass at a blocked partition; skipping lets unrelated partitions
@@ -250,7 +257,11 @@ class PartitionSequencer {
         }
 
         if (head.firstSequence === null) {
-          if (entry.unresolvedNextSequence !== null || (entry.stale && entry.inFlight.length > 0)) {
+          if (
+            entry.inFlight.length >= this.#maxInFlightPerPartition ||
+            entry.unresolvedNextSequence !== null ||
+            (entry.stale && entry.inFlight.length > 0)
+          ) {
             continue
           }
         } else if (entry.inFlight[0] !== head) {

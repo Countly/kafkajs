@@ -1,5 +1,4 @@
 const createRetry = require('../../retry')
-const Lock = require('../../utils/lock')
 const { KafkaJSNonRetriableError, isStaleCoordinator } = require('../../errors')
 const COORDINATOR_TYPES = require('../../protocol/coordinatorTypes')
 const ProducerStateManager = require('../state')
@@ -34,8 +33,8 @@ const isAddOffsetsRetriable = (e) => e.code === CONCURRENT_TRANSACTIONS_CODE
 /**
  * Manage behavior for an idempotent producer and transactions: a facade over the producer's
  * `ProducerStateManager`, which owns the producer id and epoch, the sequences, the transaction
- * state and its version. The facade keeps the coordinator lookups, the retries of its own
- * requests and the per-broker mutex of the send path.
+ * state and its version. The facade keeps the coordinator lookups and the retries of its own
+ * requests.
  *
  * @param {Object} options
  * @param {import('../../../types').Logger} options.logger
@@ -48,9 +47,6 @@ const isAddOffsetsRetriable = (e) => e.code === CONCURRENT_TRANSACTIONS_CODE
  * @param {import('../../../types').RetryOptions} [options.retry=cluster.retry] the producer's
  *   retry options: they bound every batch's re-sends and the requests the state manager makes on
  *   the send path
- * @param {import('../../instrumentation/emitter')} [options.instrumentationEmitter] Passed to
- *   the per-broker mutex (see `acquireBrokerLock`) so a waiter timing out emits
- *   `NETWORK_LOCK_TIMEOUT` instead of failing silently.
  * @returns {EosManager}
  */
 module.exports = ({
@@ -60,18 +56,12 @@ module.exports = ({
   transactional,
   transactionalId,
   retry = cluster.retry,
-  instrumentationEmitter = null,
 }) => {
   if (transactional && !transactionalId) {
     throw new KafkaJSNonRetriableError('Cannot manage transactions without a transactionalId')
   }
 
   const retrier = createRetry(cluster.retry)
-
-  /**
-   * Idempotent production requires a mutex lock per broker to serialize requests with sequence number handling
-   */
-  let brokerMutexLocks = {}
 
   const findTransactionCoordinator = () => {
     return cluster.findGroupCoordinator({
@@ -188,7 +178,6 @@ module.exports = ({
         }
       })
       stateManager.transitionTo(STATES.READY)
-      brokerMutexLocks = {}
 
       logger.debug('Initialized producer id & epoch', {
         producerId: stateManager.producerId,
@@ -336,30 +325,6 @@ module.exports = ({
 
     isInTransaction() {
       return stateManager.state() === STATES.IN_TRANSACTION
-    },
-
-    /**
-     * Acquire this broker's mutex, serializing idempotent requests against it so sequence
-     * numbers stay ordered. A wait longer than 65535ms rejects with `KafkaJSLockTimeout` and,
-     * if `instrumentationEmitter` was provided, emits `NETWORK_LOCK_TIMEOUT` first.
-     * @param {import('../../broker')} broker
-     * @returns {Promise<void>}
-     */
-    async acquireBrokerLock(broker) {
-      if (eosManager.isInitialized()) {
-        brokerMutexLocks[broker.nodeId] =
-          brokerMutexLocks[broker.nodeId] ||
-          new Lock({
-            timeout: 0xffff,
-            description: broker.brokerAddress,
-            instrumentationEmitter,
-          })
-        await brokerMutexLocks[broker.nodeId].acquire()
-      }
-    },
-
-    releaseBrokerLock(broker) {
-      if (eosManager.isInitialized()) brokerMutexLocks[broker.nodeId].release()
     },
 
     /**
