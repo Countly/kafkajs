@@ -4,8 +4,8 @@ const requestV11 = require('../v11/request')
  * ProduceRequest (Version: 12) - flexible, request header v2
  *
  * Wire-identical to v11. From v12 a produce inside a transaction implicitly adds the partition to
- * the transaction under transaction version 2 (KIP-890), which is why a transactional send from
- * this client stays below v12 until that path is implemented.
+ * the transaction under transaction version 2 (KIP-890), so a transactional send from this client
+ * uses v12 only under transaction version 2 and stays at v11 or below under version 1.
  * @see clients/src/main/resources/common/message/ProduceRequest.json (Apache Kafka 4.3.1)
  * @see https://cwiki.apache.org/confluence/display/KAFKA/KIP-890%3A+Transactions+Server-Side+Defense
  */

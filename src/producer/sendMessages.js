@@ -6,22 +6,18 @@ const {
   KafkaJSInvariantViolation,
   KafkaJSDeliveryTimeout,
   KafkaJSNumberOfRetriesExceeded,
+  KafkaJSTransactionAbortableError,
 } = require('../errors')
 const { staleMetadata } = require('../protocol/error')
 const { RETRIABLE_CATEGORIES } = require('../protocol/errorCategories')
 const { CONNECTION_STATUS } = require('../network/connectionStatus')
-const { ABORTABLE_ERROR, FATAL_ERROR } = require('./eosManager/transactionStates')
+const { isArmed } = require('./eosManager/transactionStates')
+const { surfaceInTransaction } = require('./eosManager')
 const groupMessagesPerPartition = require('./groupMessagesPerPartition')
 const createTopicData = require('./createTopicData')
 const responseSerializer = require('./responseSerializer')
 
 const { keys } = Object
-
-/**
- * @param {string} state a transaction state
- * @returns {boolean} whether an error state is armed
- */
-const isArmed = (state) => state === ABORTABLE_ERROR || state === FATAL_ERROR
 
 // The last Produce version that keys topics by name, and the highest a transactional send uses:
 // from v12 a produce inside a transaction implicitly adds the partition to the transaction.
@@ -562,7 +558,9 @@ class DrainLoop {
   /**
    * Fails every live send with `error`, after a fault the loop's own code raised: a batch still
    * queued leaves its queue as `#abandon` describes; a batch on the wire is settled now and its
-   * answer, when it comes, only updates the sequencer.
+   * answer, when it comes, only updates the sequencer. A transactional producer is then unusable:
+   * the fault came from the loop's own code - an error that is not this client's own is armed as
+   * an invariant violation - and a batch it settled may still be on the wire.
    * @param {Error} error
    * @returns {void}
    */
@@ -581,6 +579,10 @@ class DrainLoop {
         }
       }
     }
+    this.#inTransaction(
+      manager,
+      error instanceof KafkaJSError ? error : new KafkaJSInvariantViolation(error)
+    )
   }
 
   /**
@@ -706,20 +708,34 @@ class DrainLoop {
   }
 
   /**
-   * Rejects every queued batch with `error`, as `#abandon` describes.
+   * Rejects every queued batch with `error`, the producer's connection status, as `#abandon`
+   * describes. A transactional producer that dropped a batch so is then abort-only: the armed
+   * error is a `KafkaJSTransactionAbortableError` with `error` as its cause, never `error` itself,
+   * whose category could make the producer unusable for a mere `disconnect()`.
    * @param {import('./state')} manager
    * @param {Error} error
    * @returns {void}
    */
   #abandonQueued(manager, error) {
+    let dropped = false
     for (const partitions of this.#queues.values()) {
       for (const queue of partitions.values()) {
         for (const delivery of queue) {
           if (!delivery.settled && !delivery.onWire) {
             this.#abandon(manager, delivery, error)
+            dropped = true
           }
         }
       }
+    }
+
+    if (dropped && this.#eosManager.isTransactional()) {
+      manager.arm(
+        new KafkaJSTransactionAbortableError(
+          `A batch of the transaction was dropped (${error.message}); call abort() on it before starting another`,
+          { cause: error }
+        )
+      )
     }
   }
 
@@ -772,10 +788,13 @@ class DrainLoop {
       `No leader for ${batch.topic} partition ${batch.partition}`
     )
     if (head.routingFailures >= this.#retries) {
-      const exhausted = new KafkaJSNumberOfRetriesExceeded(error, {
-        retryCount: head.routingFailures,
-        retryTime: head.retryTime,
-      })
+      const exhausted = this.#inTransaction(
+        manager,
+        new KafkaJSNumberOfRetriesExceeded(error, {
+          retryCount: head.routingFailures,
+          retryTime: head.retryTime,
+        })
+      )
       for (const delivery of queue) {
         if (!delivery.settled && !delivery.onWire) {
           this.#abandon(manager, delivery, exhausted)
@@ -985,8 +1004,31 @@ class DrainLoop {
         manager.sequencer.requeue(batch, Date.now() + this.#nextRetryTime(delivery))
         return
       default:
-        rejectBatch(batch, this.#exhausted(batch, error, delivery) ?? error)
+        rejectBatch(
+          batch,
+          this.#inTransaction(manager, this.#exhausted(batch, error, delivery) ?? error)
+        )
     }
+  }
+
+  /**
+   * The error a batch that failed for good rejects with. Inside a transaction it also arms the
+   * state its category calls for, as the Java producer does for every failed batch: the
+   * transaction is missing that batch's records. A retriable error that ran out of retries arms
+   * - and surfaces as - `KafkaJSTransactionAbortableError`.
+   * @see https://github.com/apache/kafka/blob/4.3/clients/src/main/java/org/apache/kafka/clients/producer/internals/TransactionManager.java
+   * @param {import('./state')} manager
+   * @param {Error} error a classified error
+   * @returns {Error}
+   */
+  #inTransaction(manager, error) {
+    if (!this.#eosManager.isTransactional()) {
+      return error
+    }
+
+    const surfaced = surfaceInTransaction(error)
+    manager.arm(surfaced)
+    return surfaced
   }
 
   /**
@@ -1144,6 +1186,27 @@ const createSendMessages = ({
 }) => {
   const isIdempotent = () => idempotence !== undefined && idempotence.isEnabled()
   let loop = null
+
+  /**
+   * The error a transactional send whose records could not be assigned to partitions rejects
+   * with: a client error arms the state its category calls for, as a failed batch does. Any other
+   * error - a custom partitioner's own, say - leaves the transaction as it was, as the Java
+   * producer's `doSend` arms only for an `ApiException`.
+   * @see https://github.com/apache/kafka/blob/4.3/clients/src/main/java/org/apache/kafka/clients/producer/KafkaProducer.java
+   * @param {Error} error
+   * @returns {Error}
+   */
+  const inTransaction = (error) => {
+    if (!eosManager.isTransactional() || !(error instanceof KafkaJSError)) {
+      return error
+    }
+
+    const { stateManager } = eosManager
+    stateManager.classify(error, 'produce')
+    const surfaced = surfaceInTransaction(error)
+    stateManager.arm(surfaced)
+    return surfaced
+  }
 
   /**
    * The non-idempotent send: one request per leader, the whole call retried by `retrier`.
@@ -1479,7 +1542,9 @@ const createSendMessages = ({
     }
 
     const createdAt = Date.now()
-    const batches = await partition(topicMessages)
+    const batches = await partition(topicMessages).catch((error) => {
+      throw inTransaction(error)
+    })
     for (const batch of batches) {
       batch.createdAt = createdAt
     }

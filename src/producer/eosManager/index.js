@@ -1,7 +1,14 @@
 const createRetry = require('../../retry')
-const { KafkaJSNonRetriableError, isStaleCoordinator } = require('../../errors')
+const {
+  KafkaJSError,
+  KafkaJSInvariantViolation,
+  KafkaJSNonRetriableError,
+  KafkaJSNumberOfRetriesExceeded,
+  KafkaJSTransactionAbortableError,
+} = require('../../errors')
 const COORDINATOR_TYPES = require('../../protocol/coordinatorTypes')
 const ProducerStateManager = require('../state')
+const { transactionStateFor } = require('../state/errorClassifier')
 const assert = require('assert')
 
 const STATES = require('./transactionStates')
@@ -16,15 +23,62 @@ const INIT_PRODUCER_RETRIABLE_PROTOCOL_ERRORS = [
    */
   'CONCURRENT_TRANSACTIONS',
 ]
-const COMMIT_RETRIABLE_PROTOCOL_ERRORS = ['UNKNOWN_TOPIC_OR_PARTITION']
-const COORDINATOR_LOAD_IN_PROGRESS_CODE = 14
-const CONCURRENT_TRANSACTIONS_CODE = 51
 
-/** Codes 14/15/16 are emitted with legacy type names (see src/protocol/error.js), match on code. */
-const isCommitRetriable = (e) =>
-  COMMIT_RETRIABLE_PROTOCOL_ERRORS.includes(e.type) || e.code === COORDINATOR_LOAD_IN_PROGRESS_CODE
+/**
+ * The error a request made inside a transaction surfaces with, and arms: a retriable error that ran
+ * out of retries, and an error that is not this client's own - a `TypeError` while encoding a
+ * record or an offset, say - become a `KafkaJSTransactionAbortableError` with it as the cause: the
+ * transaction can only be aborted now, and the producer stays usable (KIP-1050). Every other error
+ * is surfaced as it is, so its category decides, and an invariant violation stays fatal. The Java
+ * producer encodes a record before it appends it; this client encodes once the batch was queued
+ * and numbered, so such a failure can leave a hole in the transaction.
+ * @see https://cwiki.apache.org/confluence/display/KAFKA/KIP-1050%3A+Consistent+error+handling+for+Transactions
+ * @param {Error} error
+ * @returns {Error}
+ */
+const surfaceInTransaction = (error) => {
+  if (error instanceof KafkaJSNumberOfRetriesExceeded) {
+    return new KafkaJSTransactionAbortableError(
+      `Ran out of retries inside a transaction, which can now only be aborted: ${error.message}`,
+      { cause: error }
+    )
+  }
 
-const isAddOffsetsRetriable = (e) => e.code === CONCURRENT_TRANSACTIONS_CODE
+  if (!(error instanceof KafkaJSError)) {
+    return new KafkaJSTransactionAbortableError(
+      `Failed inside a transaction, which can now only be aborted: ${error.message}`,
+      { cause: error }
+    )
+  }
+
+  return error
+}
+
+/**
+ * The consumer group a transactional offset commit is for: the membership `consumerGroupMetadata`
+ * names (KIP-447), or a bare `consumerGroupId`, which commits with no member to fence.
+ * @param {{ consumerGroupId?: string, consumerGroupMetadata?: { groupId: string,
+ *   generationId: number, memberId: string, groupInstanceId: string|null } }} options
+ * @returns {{ groupId: string, generationId: number, memberId: string,
+ *   groupInstanceId: string|null }}
+ * @throws {KafkaJSNonRetriableError} when both are given, or neither
+ */
+const consumerGroupOf = ({ consumerGroupId, consumerGroupMetadata }) => {
+  if ((consumerGroupId == null) === (consumerGroupMetadata == null)) {
+    throw new KafkaJSNonRetriableError(
+      'sendOffsets takes exactly one of consumerGroupMetadata and consumerGroupId'
+    )
+  }
+
+  return (
+    consumerGroupMetadata ?? {
+      groupId: consumerGroupId,
+      generationId: -1,
+      memberId: '',
+      groupInstanceId: null,
+    }
+  )
+}
 
 /**
  * @typedef {Object} EosManager
@@ -49,7 +103,7 @@ const isAddOffsetsRetriable = (e) => e.code === CONCURRENT_TRANSACTIONS_CODE
  *   the send path
  * @returns {EosManager}
  */
-module.exports = ({
+const createEosManager = ({
   logger,
   cluster,
   transactionTimeout = 60000,
@@ -128,6 +182,116 @@ module.exports = ({
       }
     })
 
+  /** Whether a KIP-360 epoch bump is owed before the next transaction; kept until one succeeds. */
+  let bumpOwed = false
+  let bumping = null
+
+  /**
+   * Performs the epoch bump owed, if any: one re-initialization shared by concurrent callers. A
+   * failure keeps the bump owed, so the next transaction tries it again.
+   * @returns {Promise<void>}
+   */
+  const bumpIfOwed = () => {
+    if (!bumpOwed) {
+      return Promise.resolve()
+    }
+
+    bumping =
+      bumping ||
+      retryingInitProducerId(() => stateManager.reinitialize())
+        .then(() => {
+          bumpOwed = false
+        })
+        .finally(() => {
+          bumping = null
+        })
+    return bumping
+  }
+
+  /**
+   * Arms the state a failed transactional request leaves, from its already classified error, and
+   * returns the error the request rejects with: the armed one - a `KafkaJSTransactionAbortableError`
+   * or a `KafkaJSApplicationRecoverableError` with the request's error as its cause - or, when
+   * nothing could be armed, the request's own.
+   * @param {Error} error
+   * @returns {Error}
+   */
+  const armWith = (error) => {
+    const surfaced = surfaceInTransaction(error)
+    stateManager.arm(surfaced)
+    return stateManager.transaction.armedError() || surfaced
+  }
+
+  /**
+   * Swallows a failure inside `abort()` - an abort always ends the transaction (KIP-1050) - unless
+   * it leaves the producer unusable, which arms `FATAL_ERROR` and is thrown.
+   * @param {Error} error
+   * @returns {void}
+   * @throws {import('../../errors').KafkaJSApplicationRecoverableError} the armed error
+   */
+  const swallowUnlessFatal = (error) => {
+    stateManager.classify(error, 'txn')
+    if (transactionStateFor(error) === STATES.FATAL_ERROR) {
+      stateManager.arm(error)
+      throw stateManager.transaction.armedError()
+    }
+
+    logger.warn(`Ignoring a failure while aborting the transaction: ${error.message}`, {
+      transactionalId,
+    })
+  }
+
+  /**
+   * Ends the transaction with one EndTxn at the version the transaction began under, retried while
+   * the coordinator moves or is busy, and under transaction version 2 adopts the producer id and
+   * epoch it returns (KIP-890), which restarts every sequence. A transaction that never produced
+   * and never sent offsets ends locally with no EndTxn, under either version. No EndTxn goes out
+   * while a batch is in flight, as the Java producer holds it until every batch completed: the
+   * caller waited for the transaction's sends, so only a fault in the send loop leaves one.
+   * @see https://github.com/apache/kafka/blob/4.3/clients/src/main/java/org/apache/kafka/clients/producer/internals/TransactionManager.java
+   * @param {boolean} committed
+   * @returns {Promise<boolean>} whether a new producer id and epoch were adopted
+   * @throws {KafkaJSInvariantViolation} while a batch is in flight; nothing is sent
+   * @throws {Error} the EndTxn's error, classified; `KafkaJSNumberOfRetriesExceeded` once the
+   *   retries run out
+   */
+  const endTransaction = async (committed) => {
+    if (!stateManager.transactionStarted()) {
+      logger.debug('No partitions or offsets registered, not sending EndTxn')
+      return false
+    }
+
+    if (stateManager.sequencer.hasInFlight()) {
+      throw new KafkaJSInvariantViolation('EndTxn with a batch of the transaction in flight')
+    }
+
+    const transactionVersion = stateManager.transactionVersion()
+    const ended = await retrier(async (bail) => {
+      const coordinator = await findTransactionCoordinator()
+      try {
+        return await coordinator.endTxn({
+          producerId: stateManager.producerId,
+          producerEpoch: stateManager.producerEpoch,
+          transactionalId,
+          transactionResult: committed,
+          transactionVersion,
+        })
+      } catch (e) {
+        stateManager.classify(e, 'txn')
+        if (e.retriable) {
+          throw e
+        }
+        bail(e)
+      }
+    })
+
+    if (transactionVersion === 2 && ended.producerId != null && String(ended.producerId) !== '-1') {
+      stateManager.adopt({ producerId: ended.producerId, producerEpoch: ended.producerEpoch })
+      return true
+    }
+    return false
+  }
+
   const eosManager = {
     /**
      * The producer's state: producer id and epoch, sequences, transaction state and version.
@@ -155,6 +319,9 @@ module.exports = ({
       return stateManager.isInitialized() ? stateManager.producerEpoch : 0
     },
 
+    /**
+     * @returns {string|undefined} the transactional id this manager was built with
+     */
     getTransactionalId() {
       return transactionalId
     },
@@ -217,14 +384,26 @@ module.exports = ({
     },
 
     /**
-     * Begin a transaction. Resolves the transaction coordinator first, so a failed lookup rejects
-     * the call and leaves the producer `READY`.
+     * Begin a transaction. Resolves the transaction coordinator and reads the transaction version
+     * it finalizes, fixed for this transaction. When that version moved from 1 to 2, or an epoch
+     * bump is still owed from an earlier abort, the producer id is re-initialized first (KIP-360);
+     * a failure there rejects the call, leaves the producer `READY` and keeps the bump owed for the
+     * next call. A failed lookup rejects the call the same way.
+     * @see https://cwiki.apache.org/confluence/display/KAFKA/KIP-890%3A+Transactions+Server-Side+Defense
      * @returns {Promise<void>}
+     * @throws {import('../../errors').KafkaJSNonRetriableError} outside `READY`, or on a producer
+     *   that is not transactional
+     * @throws {Error} the coordinator lookup's error, or the re-initialization's; the producer
+     *   stays `READY` (`FATAL_ERROR` when the re-initialization failed fatally)
      */
     async beginTransaction() {
       stateManager.transaction.guard('beginTransaction')
       transactionalGuard()
-      await findTransactionCoordinator()
+      const coordinator = await findTransactionCoordinator()
+      if (stateManager.version.begin(coordinator).bumpRequired) {
+        bumpOwed = true
+      }
+      await bumpIfOwed()
       stateManager.transitionTo(STATES.IN_TRANSACTION)
     },
 
@@ -256,84 +435,128 @@ module.exports = ({
     },
 
     /**
-     * Commit the ongoing transaction
+     * Commit the ongoing transaction, once every AddPartitionsToTxn it started has settled. The
+     * caller waits for the transaction's own sends first: nothing of it may still be in flight. A
+     * partition whose sequence is still unresolved - a batch the broker may or may not hold - makes
+     * the transaction abort-only first, so no EndTxn commits over it.
+     * @returns {Promise<void>}
+     * @throws {import('../../errors').KafkaJSTransactionAbortableError} the armed error when the
+     *   transaction can only be aborted; a failed EndTxn arms `ABORTABLE_ERROR` and rejects with it
+     * @throws {import('../../errors').KafkaJSApplicationRecoverableError} the armed error once the
+     *   producer is unusable, a fatal EndTxn answer included
      */
     async commit() {
       stateManager.transaction.guard('commit')
       transactionalGuard()
+      await stateManager.whenPartitionsAdded()
+      stateManager.resolveSequences()
+      stateManager.transaction.guard('commit')
       stateManager.transitionTo(STATES.COMMITTING)
 
-      if (!stateManager.transactionStarted()) {
-        logger.debug('No partitions or offsets registered, not sending EndTxn')
-
-        stateManager.transitionTo(STATES.READY)
-        return
+      try {
+        await endTransaction(true)
+      } catch (error) {
+        throw armWith(error)
       }
-
-      const broker = await findTransactionCoordinator()
-      await broker.endTxn({
-        producerId: stateManager.producerId,
-        producerEpoch: stateManager.producerEpoch,
-        transactionalId,
-        transactionResult: true,
-      })
 
       stateManager.transitionTo(STATES.READY)
     },
 
     /**
-     * Abort the ongoing transaction. An abort that ends `ABORTABLE_ERROR` under transaction
-     * version 1 then bumps the producer epoch (KIP-360), as the Java producer does, so the next
-     * transaction starts with no sequence left over from the failed one.
+     * Abort the ongoing transaction, once every AddPartitionsToTxn it started has settled. The
+     * caller first rejects the transaction's queued batches and waits for those in flight. A
+     * partition whose sequence is still unresolved makes the transaction abort-only before the
+     * abort decides on the epoch, so it bumps rather than leave the gap. An abort always ends the
+     * transaction: a failure inside it is logged and swallowed, unless it leaves the producer
+     * unusable (`FATAL_ERROR`), and it never rejects with `KafkaJSTransactionAbortableError`
+     * (KIP-1050). An abort that ends `ABORTABLE_ERROR`, or whose caller dropped queued batches that
+     * already carried a sequence, then bumps the producer epoch (KIP-360), so the next transaction
+     * starts with no sequence left over from this one - unless its EndTxn handed back a new epoch
+     * (transaction version 2), which restarts every sequence already. An abort whose EndTxn failed
+     * bumps the epoch under either version: the coordinator
+     * may still hold the transaction, or have fenced its epoch, and an InitProducerId with the
+     * current id and epoch aborts what is left of it. A bump that fails is owed to the next
+     * transaction, and the abort resolves with the producer `READY`; only a bump that fails fatally
+     * rejects it, after a successful EndTxn, with the producer in `FATAL_ERROR`.
      * @see https://github.com/apache/kafka/blob/4.3/clients/src/main/java/org/apache/kafka/clients/producer/internals/TransactionManager.java
+     * @param {object} [options]
+     * @param {boolean} [options.droppedSequences=false] whether the caller dropped queued batches
+     *   that had already been sent, so their sequences are spent
+     * @returns {Promise<void>}
+     * @throws {import('../../errors').KafkaJSApplicationRecoverableError} when the abort itself
+     *   failed fatally, or a fatal answer armed `FATAL_ERROR` while it waited
      */
-    async abort() {
+    async abort({ droppedSequences = false } = {}) {
       stateManager.transaction.guard('abort')
       transactionalGuard()
-      const recovering = stateManager.state() === STATES.ABORTABLE_ERROR
+      stateManager.resolveSequences()
+      const bump = droppedSequences || stateManager.state() === STATES.ABORTABLE_ERROR
       stateManager.transitionTo(STATES.ABORTING)
+      await stateManager.whenPartitionsAdded()
+      if (stateManager.state() === STATES.FATAL_ERROR) {
+        throw stateManager.transaction.armedError()
+      }
 
-      if (stateManager.transactionStarted()) {
-        const broker = await findTransactionCoordinator()
-        await broker.endTxn({
-          producerId: stateManager.producerId,
-          producerEpoch: stateManager.producerEpoch,
-          transactionalId,
-          transactionResult: false,
-        })
-      } else {
-        logger.debug('No partitions or offsets registered, not sending EndTxn')
+      let ended = true
+      let adopted = false
+      try {
+        adopted = await endTransaction(false)
+      } catch (error) {
+        swallowUnlessFatal(error)
+        ended = false
       }
 
       stateManager.transitionTo(STATES.READY)
 
-      if (recovering && stateManager.transactionVersion() === 1) {
-        await retryingInitProducerId(() => stateManager.reinitialize())
+      if (!ended || (bump && !adopted)) {
+        bumpOwed = true
+        await bumpIfOwed().catch(swallowUnlessFatal)
       }
     },
 
     /**
-     * Whether the producer id has already been initialized
+     * @returns {boolean} whether a producer id is held
      */
     isInitialized() {
       return stateManager.isInitialized()
     },
 
+    /**
+     * @returns {boolean} whether this manager was built for a transactional producer
+     */
     isTransactional() {
       return transactional
     },
 
+    /**
+     * @returns {boolean} whether a transaction is open and usable: `IN_TRANSACTION`, so false
+     *   while it commits or aborts and in either error state
+     */
     isInTransaction() {
       return stateManager.state() === STATES.IN_TRANSACTION
     },
 
     /**
-     * Mark the provided offsets as participating in the transaction for the given consumer group.
+     * Mark the provided offsets as participating in the transaction for the given consumer group,
+     * so they are committed only if the transaction is.
      *
-     * This allows us to commit an offset as consumed only if the transaction passes.
-     * @param {string} consumerGroupId The unique group identifier
-     * @param {OffsetCommitTopic[]} topics The unique group identifier
-     * @returns {Promise}
+     * Under transaction version 1 an AddOffsetsToTxn goes to the transaction coordinator first;
+     * under version 2 the TxnOffsetCommit (v5) adds the offsets itself (KIP-890). The TxnOffsetCommit
+     * carries the consumer's generation, member id and instance id from `consumerGroupMetadata`
+     * (KIP-447), so the group coordinator fences a stale or zombie member; `consumerGroupId` alone
+     * sends -1, "" and null, which commits with no member to fence, as 2.2.4 did. Each request is
+     * retried while it fails retriably, a moved group coordinator looked up again. Any other failure
+     * arms the state its category calls for - a stale generation or member (ILLEGAL_GENERATION,
+     * UNKNOWN_MEMBER_ID, FENCED_INSTANCE_ID, STALE_MEMBER_EPOCH) arms `ABORTABLE_ERROR`: abort, let
+     * the consumer rejoin, reprocess - and rejects with it.
+     * @see https://cwiki.apache.org/confluence/display/KAFKA/KIP-447%3A+Producer+scalability+for+exactly+once+semantics
+     * @param {object} options
+     * @param {import('../../../types').ConsumerGroupMetadata} [options.consumerGroupMetadata]
+     * @param {string} [options.consumerGroupId]
+     * @param {OffsetCommitTopic[]} options.topics
+     * @returns {Promise<void>}
+     * @throws {KafkaJSNonRetriableError} when both `consumerGroupMetadata` and `consumerGroupId`
+     *   are given, or neither; nothing is armed then
      *
      * @typedef {Object} OffsetCommitTopic
      * @property {string} topic
@@ -341,95 +564,94 @@ module.exports = ({
      *
      * @typedef {Object} OffsetCommitTopicPartition
      * @property {number} partition
-     * @property {number} offset
+     * @property {string} offset
+     * @property {number} [leaderEpoch] the committed leader epoch; -1 when absent
+     * @property {string|null} [metadata]
      */
-    async sendOffsets({ consumerGroupId, topics } = {}) {
+    async sendOffsets({ consumerGroupId, consumerGroupMetadata, topics } = {}) {
       stateManager.transaction.guard('sendOffsets')
-      assert(consumerGroupId, 'Missing consumerGroupId')
+      const { groupId, generationId, memberId, groupInstanceId } = consumerGroupOf({
+        consumerGroupId,
+        consumerGroupMetadata,
+      })
       assert(topics, 'Missing offset topics')
+      const transactionVersion = stateManager.transactionVersion()
 
-      // Kafka answers CONCURRENT_TRANSACTIONS while a previous transaction on the same
-      // transactional id is still completing and expects the client to retry, the same as
-      // initProducerId above. The coordinator lookup happens inside the retrier so a
-      // coordinator move is picked up on retry.
-      await retrier(async (bail, retryCount, retryTime) => {
-        const transactionCoordinator = await findTransactionCoordinator()
-
-        try {
-          await transactionCoordinator.addOffsetsToTxn({
-            transactionalId,
-            producerId: stateManager.producerId,
-            producerEpoch: stateManager.producerEpoch,
-            groupId: consumerGroupId,
+      try {
+        if (transactionVersion === 1) {
+          await retrier(async (bail, retryCount, retryTime) => {
+            const transactionCoordinator = await findTransactionCoordinator()
+            try {
+              await transactionCoordinator.addOffsetsToTxn({
+                transactionalId,
+                producerId: stateManager.producerId,
+                producerEpoch: stateManager.producerEpoch,
+                groupId,
+              })
+            } catch (e) {
+              stateManager.classify(e, 'txn')
+              if (e.retriable) {
+                logger.debug('AddOffsetsToTxn failed retriably, retrying', {
+                  error: e.message,
+                  transactionalId,
+                  retryCount,
+                  retryTime,
+                })
+                throw e
+              }
+              bail(e)
+            }
           })
-        } catch (e) {
-          if (isAddOffsetsRetriable(e)) {
-            logger.debug('There is an ongoing transaction on this transactionId, retrying', {
-              error: e.message,
-              stack: e.stack,
-              transactionalId,
-              retryCount,
-              retryTime,
-            })
-
-            throw e
-          }
-
-          bail(e)
         }
-      })
 
-      stateManager.markOffsetsAdded()
+        stateManager.markOffsetsAdded()
 
-      let groupCoordinator = await cluster.findGroupCoordinator({
-        groupId: consumerGroupId,
-        coordinatorType: COORDINATOR_TYPES.GROUP,
-      })
-
-      return retrier(async (bail, retryCount, retryTime) => {
-        try {
-          await groupCoordinator.txnOffsetCommit({
-            transactionalId,
-            producerId: stateManager.producerId,
-            producerEpoch: stateManager.producerEpoch,
-            groupId: consumerGroupId,
-            topics,
-          })
-        } catch (e) {
-          if (isCommitRetriable(e)) {
-            logger.debug('Group coordinator is not ready yet, retrying', {
-              error: e.message,
-              stack: e.stack,
+        let groupCoordinator = await cluster.findGroupCoordinator({
+          groupId,
+          coordinatorType: COORDINATOR_TYPES.GROUP,
+        })
+        await retrier(async (bail, retryCount, retryTime) => {
+          try {
+            await groupCoordinator.txnOffsetCommit({
               transactionalId,
-              retryCount,
-              retryTime,
+              producerId: stateManager.producerId,
+              producerEpoch: stateManager.producerEpoch,
+              groupId,
+              topics,
+              generationId,
+              memberId,
+              groupInstanceId,
+              transactionVersion,
             })
-
-            throw e
+          } catch (e) {
+            const { category } = stateManager.classify(e, 'offsets')
+            if (e.retriable) {
+              logger.debug('TxnOffsetCommit failed retriably, retrying', {
+                error: e.message,
+                transactionalId,
+                retryCount,
+                retryTime,
+              })
+              if (category === 'refreshRetriable' || e.code === 'ECONNREFUSED') {
+                groupCoordinator = await cluster.findGroupCoordinator({
+                  groupId,
+                  coordinatorType: COORDINATOR_TYPES.GROUP,
+                })
+              }
+              throw e
+            }
+            bail(e)
           }
-
-          if (isStaleCoordinator(e) || e.code === 'ECONNREFUSED') {
-            logger.debug('Invalid group coordinator, finding new group coordinator and retrying', {
-              error: e.message,
-              stack: e.stack,
-              transactionalId,
-              retryCount,
-              retryTime,
-            })
-
-            groupCoordinator = await cluster.findGroupCoordinator({
-              groupId: consumerGroupId,
-              coordinatorType: COORDINATOR_TYPES.GROUP,
-            })
-
-            throw e
-          }
-
-          bail(e)
-        }
-      })
+        })
+      } catch (error) {
+        throw armWith(error)
+      }
     },
   }
 
   return eosManager
 }
+
+createEosManager.surfaceInTransaction = surfaceInTransaction
+
+module.exports = createEosManager

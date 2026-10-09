@@ -545,6 +545,8 @@ module.exports = class Broker {
    * @returns {Promise<object|import('../protocol/requests/produce/partitionResults').PartitionResult[]|undefined>}
    *   the decoded response, or with `perPartitionResults` one `PartitionResult` per partition;
    *   `undefined` with `acks: 0`
+   * @throws {KafkaJSServerDoesNotSupportApiKey} under transaction version 2, when this broker
+   *   offers no Produce v12: a lower version would not add the partition to the transaction
    * @see https://cwiki.apache.org/confluence/display/KAFKA/KIP-890%3A+Transactions+Server-Side+Defense
    */
   async produce({
@@ -569,6 +571,16 @@ module.exports = class Broker {
         : Math.min(ceiling, maxVersion === undefined ? Infinity : maxVersion)
 
     const produce = this.lookupRequestWithMax(apiKeys.Produce, requests.Produce, cap)
+    if (ceiling === TRANSACTION_V2_PRODUCE_VERSION) {
+      const offered = this.versions[apiKeys.Produce]
+      if (offered.maxVersion < TRANSACTION_V2_PRODUCE_VERSION) {
+        throw new KafkaJSServerDoesNotSupportApiKey(
+          `Broker ${this.brokerAddress} offers Produce v${offered.minVersion}-v${offered.maxVersion}, ` +
+            `but a transaction under transaction version 2 needs v${TRANSACTION_V2_PRODUCE_VERSION}`,
+          { apiKey: apiKeys.Produce, apiName: 'Produce' }
+        )
+      }
+    }
     // Asked rather than read off the built request, unlike `fetch`: the id -> name map below has
     // to exist before the builder runs, because the response codec is bound to it.
     // `negotiatedVersion` with no cap map is the uncapped question; passing a sentinel through the

@@ -14,8 +14,8 @@ const {
   READY,
   IN_TRANSACTION,
   COMMITTING,
-  ABORTABLE_ERROR,
   FATAL_ERROR,
+  isArmed,
 } = require('../eosManager/transactionStates')
 
 /** @see https://github.com/apache/kafka/blob/4.3/clients/src/main/java/org/apache/kafka/common/protocol/Errors.java */
@@ -334,7 +334,7 @@ class ProducerStateManager {
    * @returns {PartitionBatch[]}
    */
   drain(broker, leaders) {
-    this.#resolveUnresolved()
+    this.resolveSequences()
     if (this.#armed()) {
       this.sequencer.abortQueued(this.transaction.armedError())
       return []
@@ -347,6 +347,29 @@ class ProducerStateManager {
       producerEpoch: this.#identity.producerEpoch,
       isPartitionInTransaction: this.#isPartitionInTransaction,
     })
+  }
+
+  /**
+   * Settles the unresolved sequences of partitions with nothing left in flight: a gap bumps the
+   * epoch of an idempotent-only producer and arms `ABORTABLE_ERROR` on a transactional one, which
+   * rejects the queued batches. Runs before every drain, and before a transaction's `EndTxn`, as
+   * the Java sender resolves sequences on every pass, so no transaction commits over a batch the
+   * broker may or may not hold.
+   * @see https://github.com/apache/kafka/blob/4.3/clients/src/main/java/org/apache/kafka/clients/producer/internals/TransactionManager.java
+   * @returns {void}
+   */
+  resolveSequences() {
+    for (const { topic, partition, outcome } of this.sequencer.resolveUnresolved()) {
+      if (outcome === 'cleared') {
+        continue
+      }
+
+      if (this.#transactional) {
+        this.arm(new KafkaJSTransactionAbortableError(UNACKED_MESSAGES))
+      } else {
+        this.#bump(topic, partition)
+      }
+    }
   }
 
   /**
@@ -553,8 +576,7 @@ class ProducerStateManager {
 
   /** @returns {boolean} whether `ABORTABLE_ERROR` or `FATAL_ERROR` is armed */
   #armed() {
-    const state = this.transaction.state()
-    return state === ABORTABLE_ERROR || state === FATAL_ERROR
+    return isArmed(this.transaction.state())
   }
 
   /**
@@ -602,25 +624,6 @@ class ProducerStateManager {
       this.sequencer.markAllStale()
     } else {
       this.sequencer.resetAll()
-    }
-  }
-
-  /**
-   * Settles the unresolved sequences of partitions with nothing left in flight: a gap bumps the
-   * epoch of an idempotent-only producer and arms `ABORTABLE_ERROR` on a transactional one.
-   * @returns {void}
-   */
-  #resolveUnresolved() {
-    for (const { topic, partition, outcome } of this.sequencer.resolveUnresolved()) {
-      if (outcome === 'cleared') {
-        continue
-      }
-
-      if (this.#transactional) {
-        this.arm(new KafkaJSTransactionAbortableError(UNACKED_MESSAGES))
-      } else {
-        this.#bump(topic, partition)
-      }
     }
   }
 

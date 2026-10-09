@@ -1,7 +1,13 @@
 const { newLogger } = require('testHelpers')
 const createEosManager = require('.')
 const ProducerStateManager = require('../state')
-const { KafkaJSNonRetriableError, KafkaJSInvalidConfigurationError } = require('../../errors')
+const {
+  KafkaJSApplicationRecoverableError,
+  KafkaJSInvalidConfigurationError,
+  KafkaJSInvariantViolation,
+  KafkaJSNonRetriableError,
+  KafkaJSTransactionAbortableError,
+} = require('../../errors')
 const COORDINATOR_TYPES = require('../../protocol/coordinatorTypes')
 const { createErrorFromCode } = require('../../protocol/error')
 
@@ -261,6 +267,7 @@ describe('Producer > eosManager', () => {
         producerEpoch,
         transactionalId,
         transactionResult: true,
+        transactionVersion: 1,
       })
 
       await eosManager.beginTransaction()
@@ -280,6 +287,7 @@ describe('Producer > eosManager', () => {
         producerEpoch,
         transactionalId,
         transactionResult: true,
+        transactionVersion: 1,
       })
     })
 
@@ -320,6 +328,7 @@ describe('Producer > eosManager', () => {
         producerEpoch,
         transactionalId,
         transactionResult: false,
+        transactionVersion: 1,
       })
 
       await eosManager.beginTransaction()
@@ -339,6 +348,7 @@ describe('Producer > eosManager', () => {
         producerEpoch,
         transactionalId,
         transactionResult: false,
+        transactionVersion: 1,
       })
     })
 
@@ -386,6 +396,10 @@ describe('Producer > eosManager', () => {
         producerEpoch,
         groupId: consumerGroupId,
         topics,
+        generationId: -1,
+        memberId: '',
+        groupInstanceId: null,
+        transactionVersion: 1,
       })
     })
 
@@ -713,6 +727,77 @@ describe('Producer > eosManager', () => {
       expect(eosManager.isInTransaction()).toBe(true)
     })
 
+    test('commit() waits for an AddPartitionsToTxn still in flight before deciding whether to send EndTxn', async () => {
+      const eosManager = transactionalManager()
+      await eosManager.initProducerId()
+      await eosManager.beginTransaction()
+      let added
+      broker.addPartitionsToTxn.mockImplementation(
+        () =>
+          new Promise((resolve) => {
+            added = resolve
+          })
+      )
+
+      const adding = eosManager.addPartitionsToTransaction([
+        { topic: 'test-1', partitions: [{ partition: 1 }] },
+      ])
+      const committing = eosManager.commit()
+      await new Promise((resolve) => setImmediate(resolve))
+      added({})
+      await Promise.all([adding, committing])
+
+      expect(broker.endTxn).toHaveBeenCalledWith(
+        expect.objectContaining({ transactionResult: true })
+      )
+    })
+
+    test('an AddPartitionsToTxn that fails while commit() waits for it makes commit() reject with the armed error', async () => {
+      const eosManager = transactionalManager()
+      await eosManager.initProducerId()
+      await eosManager.beginTransaction()
+      broker.addPartitionsToTxn.mockRejectedValue(createErrorFromCode(120))
+
+      const adding = eosManager
+        .addPartitionsToTransaction([{ topic: 'test-1', partitions: [{ partition: 1 }] }])
+        .catch((e) => e)
+      const error = await eosManager.commit().catch((e) => e)
+
+      expect(await adding).toMatchObject({ code: 120 })
+      expect(error).toBe(eosManager.stateManager.transaction.armedError())
+      expect(broker.endTxn).not.toHaveBeenCalled()
+    })
+
+    test.each([
+      ['TRANSACTIONAL_ID_AUTHORIZATION_FAILED', 53],
+      ['GROUP_AUTHORIZATION_FAILED', 30],
+    ])(
+      'an AddOffsetsToTxn refused with %s leaves the transaction unstarted: abort() sends no EndTxn',
+      async (_, code) => {
+        broker.negotiatedVersion = jest.fn(() => 5)
+        broker.initProducerId.mockImplementation(
+          async ({ producerId: id, producerEpoch: epoch }) =>
+            id === -1 ? mockInitProducerIdResponse : { producerId: id, producerEpoch: epoch + 1 }
+        )
+        broker.addOffsetsToTxn.mockRejectedValue(createErrorFromCode(code))
+        const eosManager = transactionalManager()
+        await eosManager.initProducerId()
+        await eosManager.beginTransaction()
+
+        await expect(
+          eosManager.sendOffsets({
+            consumerGroupId: 'consumer-group-id',
+            topics: [{ topic: 'test-topic-1', partitions: [{ partition: 0, offset: '1' }] }],
+          })
+        ).rejects.toThrow()
+        expect(eosManager.stateManager.transactionStarted()).toBe(false)
+        await eosManager.abort().catch(() => {})
+
+        expect(broker.txnOffsetCommit).not.toHaveBeenCalled()
+        expect(broker.endTxn).not.toHaveBeenCalled()
+      }
+    )
+
     test('isTransactional and getTransactionalId answer from the options it was built with', () => {
       expect(transactionalManager().isTransactional()).toBe(true)
       expect(transactionalManager().getTransactionalId()).toEqual(transactionalId)
@@ -747,6 +832,100 @@ describe('Producer > eosManager', () => {
       expect(eosManager.isInitialized()).toBe(false)
     })
 
+    describe('a sequence left unresolved, or a batch still in flight, at the end of a transaction', () => {
+      const LEADERS = { [topic]: { 1: [0] } }
+      const REQUEST_TIMED_OUT = 7
+
+      /** A transaction (version 1) holding partition 0 of `topic`, whose one batch was sent once. */
+      const sentOnce = async () => {
+        broker.negotiatedVersion = jest.fn(() => 5)
+        broker.initProducerId.mockImplementation(
+          async ({ producerId: id, producerEpoch: epoch }) =>
+            id === -1 ? mockInitProducerIdResponse : { producerId: id, producerEpoch: epoch + 1 }
+        )
+        const eosManager = create({ transactional: true, transactionalId, retry: { retries: 1 } })
+        await eosManager.initProducerId()
+        await eosManager.beginTransaction()
+        await eosManager.addPartitionsToTransaction([{ topic, partitions: [{ partition: 0 }] }])
+        const { stateManager } = eosManager
+        const batch = {
+          topic,
+          partition: 0,
+          messages: [{ value: 'value' }],
+          acks: -1,
+          timeout: 30000,
+          compression: 0,
+          firstSequence: null,
+          producerId: null,
+          producerEpoch: null,
+          attempt: 0,
+          settlers: [],
+          backoffUntil: 0,
+          createdAt: 0,
+          sequenceReset: false,
+        }
+        stateManager.enqueue([batch])
+        expect(stateManager.drain({ nodeId: 1 }, LEADERS)).toEqual([batch])
+        broker.initProducerId.mockClear()
+        return { eosManager, stateManager, batch }
+      }
+
+      /** The same, the batch re-sent until its retries ran out: its sequence is unresolved, nothing armed. */
+      const unresolved = async () => {
+        const sent = await sentOnce()
+        const { stateManager, batch } = sent
+        expect(stateManager.fail(batch, createErrorFromCode(REQUEST_TIMED_OUT))).toEqual(
+          'RETRY_IN_ORDER'
+        )
+        stateManager.sequencer.requeue(batch, 0)
+        expect(stateManager.drain({ nodeId: 1 }, LEADERS)).toEqual([batch])
+        expect(stateManager.fail(batch, createErrorFromCode(REQUEST_TIMED_OUT))).toEqual(
+          'FAIL_BATCH'
+        )
+        expect(stateManager.state()).toEqual('IN_TRANSACTION')
+        return sent
+      }
+
+      test('commit() checks for it before EndTxn: it rejects, the transaction can only be aborted', async () => {
+        const { eosManager } = await unresolved()
+
+        const error = await eosManager.commit().catch((e) => e)
+
+        expect(error).toBeInstanceOf(KafkaJSTransactionAbortableError)
+        expect(error.message).toMatch(/hasn't received acknowledgment/)
+        expect(eosManager.stateManager.state()).toEqual('ABORTABLE_ERROR')
+        expect(broker.endTxn).not.toHaveBeenCalled()
+      })
+
+      test('abort() checks for it before deciding on the epoch: under transaction version 1 it bumps', async () => {
+        const { eosManager } = await unresolved()
+
+        await eosManager.abort()
+
+        expect(broker.endTxn).toHaveBeenCalledWith(
+          expect.objectContaining({ transactionResult: false, transactionVersion: 1 })
+        )
+        expect(broker.initProducerId).toHaveBeenCalledTimes(1)
+        expect(broker.initProducerId).toHaveBeenCalledWith(
+          expect.objectContaining({ producerId, producerEpoch })
+        )
+        expect(eosManager.getProducerEpoch()).toEqual(producerEpoch + 1)
+      })
+
+      test.each(['commit', 'abort'])(
+        '%s() sends no EndTxn while a batch is in flight, and the producer is unusable',
+        async (end) => {
+          const { eosManager } = await sentOnce()
+
+          const error = await eosManager[end]().catch((e) => e)
+
+          expect(error).toBeInstanceOf(KafkaJSApplicationRecoverableError)
+          expect(error.cause).toBeInstanceOf(KafkaJSInvariantViolation)
+          expect(broker.endTxn).not.toHaveBeenCalled()
+        }
+      )
+    })
+
     describe('an abort that ends ABORTABLE_ERROR', () => {
       /** A transaction holding a partition, armed abortable by TRANSACTION_ABORTABLE. */
       const armed = async () => {
@@ -777,6 +956,7 @@ describe('Producer > eosManager', () => {
           producerEpoch,
           transactionalId,
           transactionResult: false,
+          transactionVersion: 1,
         })
         expect(broker.initProducerId).toHaveBeenCalledTimes(1)
         expect(broker.initProducerId).toHaveBeenCalledWith({

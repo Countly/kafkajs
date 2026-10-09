@@ -1,4 +1,5 @@
 const Encoder = require('../../protocol/encoder')
+const { KafkaJSServerDoesNotSupportApiKey } = require('../../errors')
 const apiKeys = require('../../protocol/requests/apiKeys')
 const { createGroupApiBroker } = require('./fixtures/groupApiHarness')
 
@@ -79,6 +80,25 @@ describe('Broker > produce > the transaction-version gate', () => {
 
   test('a transactional produce with no transaction version never goes above v11', async () => {
     expect(await versionSentFor({ ...TRANSACTIONAL, ...WITH_TOPIC_IDS })).toEqual(11)
+  })
+
+  test('transaction version 2 refuses a broker that offers no Produce v12, naming it and its versions, and sends nothing', async () => {
+    const harness = createGroupApiBroker({
+      versions: { [apiKeys.Produce]: { minVersion: 3, maxVersion: 11 } },
+      respond: () => EMPTY_FLEXIBLE_RESPONSE,
+    })
+    harnesses.push(harness)
+
+    const error = await harness.broker
+      .produce({ acks: -1, timeout: 30000, topicData, ...TRANSACTIONAL, transactionVersion: 2 })
+      .catch((e) => e)
+
+    expect(error).toBeInstanceOf(KafkaJSServerDoesNotSupportApiKey)
+    expect(error).toMatchObject({ apiKey: apiKeys.Produce, apiName: 'Produce', retriable: false })
+    expect(error.message).toEqual(
+      'Broker 127.0.0.1:9092 offers Produce v3-v11, but a transaction under transaction version 2 needs v12'
+    )
+    expect(harness.requests).toHaveLength(0)
   })
 
   test('a lower maxVersion from the caller still wins under transaction version 2', async () => {

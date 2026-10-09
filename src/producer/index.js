@@ -6,7 +6,12 @@ const createEosManager = require('./eosManager')
 const createMessageProducer = require('./messageProducer')
 const Idempotence = require('./idempotence')
 const { events, wrap: wrapEvent, unwrap: unwrapEvent } = require('./instrumentationEvents')
-const { KafkaJSNonRetriableError, KafkaJSInvalidConfigurationError } = require('../errors')
+const {
+  KafkaJSNonRetriableError,
+  KafkaJSInvalidConfigurationError,
+  KafkaJSTransactionAbortableError,
+} = require('../errors')
+const { IN_TRANSACTION, isArmed } = require('./eosManager/transactionStates')
 
 const { values, keys } = Object
 const eventNames = values(events)
@@ -24,6 +29,13 @@ const ongoingTransactionError = () =>
   new KafkaJSNonRetriableError(
     'There is already an ongoing transaction for this producer. Please end the transaction before beginning another.'
   )
+
+/**
+ * The error a transaction's methods reject with once it has ended.
+ * @returns {KafkaJSNonRetriableError}
+ */
+const endedTransactionError = () =>
+  new KafkaJSNonRetriableError('Cannot continue to use transaction once ended')
 
 /**
  *
@@ -109,7 +121,6 @@ module.exports = ({
     transactional: false,
     transactionalId,
     retry: retryOptions,
-    instrumentationEmitter,
   })
 
   const { send, sendBatch, ensureInitialized } = createMessageProducer({
@@ -127,6 +138,7 @@ module.exports = ({
   })
 
   let transactionalEosManager
+  let transactionalMessageProducer
 
   /** @type {import("../../types").Producer["on"]} */
   const on = (eventName, listener) => {
@@ -153,11 +165,23 @@ module.exports = ({
    *
    * Calling any of the transactional methods after the transaction has ended
    * will raise an exception (use `isActive` to ascertain if ended).
+   *
+   * A send or `sendOffsets` that fails inside the transaction leaves it abort-only, or the producer
+   * unusable, as the error's category decides: from then on `send`, `sendBatch`, `sendOffsets` and
+   * `commit` reject with that armed error, `abort()` still ends the transaction, and
+   * `producer.transaction()` rejects with it until the transaction is aborted. `commit()` and
+   * `abort()` first wait for every send and `sendOffsets` of the transaction to settle, as the Java
+   * producer flushes before it commits; `abort()` rejects the batches still queued first.
+   * @see https://cwiki.apache.org/confluence/display/KAFKA/KIP-1050%3A+Consistent+error+handling+for+Transactions
    * @returns {Promise<Transaction>}
+   * @throws {import('../errors').KafkaJSTransactionAbortableError} while the previous transaction
+   *   is abort-only
+   * @throws {import('../errors').KafkaJSApplicationRecoverableError} once the producer is unusable
    *
    * @typedef {Object} Transaction
    * @property {Function} send  Identical to the producer "send" method
    * @property {Function} sendBatch Identical to the producer "sendBatch" method
+   * @property {Function} sendOffsets Add consumed offsets to the transaction
    * @property {Function} abort Abort the transaction
    * @property {Function} commit  Commit the transaction
    * @property {Function} isActive  Whether the transaction is active
@@ -167,7 +191,6 @@ module.exports = ({
       throw new KafkaJSNonRetriableError('Must provide transactional id for transactional producer')
     }
 
-    let transactionDidEnd = false
     transactionalEosManager =
       transactionalEosManager ||
       createEosManager({
@@ -177,89 +200,168 @@ module.exports = ({
         transactional: true,
         transactionalId,
         retry: retryOptions,
-        instrumentationEmitter,
       })
+    transactionalMessageProducer =
+      transactionalMessageProducer ||
+      createMessageProducer({
+        logger,
+        cluster,
+        partitioner,
+        retrier,
+        retry: retryOptions,
+        deliveryTimeout,
+        eosManager: transactionalEosManager,
+        idempotence,
+        getConnectionStatus: () => connectionStatus,
+        instrumentationEmitter,
+        INITIALIZED,
+      })
+    const { stateManager } = transactionalEosManager
 
     if (transactionalEosManager.isInTransaction()) {
       throw ongoingTransactionError()
     }
 
-    // We only initialize the producer id once
-    if (!transactionalEosManager.isInitialized()) {
-      await transactionalEosManager.initProducerId()
-    }
     try {
+      // We only initialize the producer id once
+      if (!transactionalEosManager.isInitialized()) {
+        await transactionalEosManager.initProducerId()
+      }
       await transactionalEosManager.beginTransaction()
     } catch (error) {
-      // Another transaction() began while this one was finding the coordinator.
+      // Another transaction() began while this one was initializing or finding the coordinator.
       if (transactionalEosManager.isInTransaction()) {
         throw ongoingTransactionError()
       }
       throw error
     }
 
-    const { send: sendTxn, sendBatch: sendBatchTxn } = createMessageProducer({
-      logger,
-      cluster,
-      partitioner,
-      retrier,
-      retry: retryOptions,
-      deliveryTimeout,
-      eosManager: transactionalEosManager,
-      idempotence,
-      getConnectionStatus: () => connectionStatus,
-      instrumentationEmitter,
-      INITIALIZED,
-    })
+    const { send: sendTxn, sendBatch: sendBatchTxn } = transactionalMessageProducer
 
-    const isActive = () => transactionalEosManager.isInTransaction() && !transactionDidEnd
+    let transactionDidEnd = false
+    /** @type {Promise<void>|null} the last `commit()` or `abort()` called; the next one waits for it */
+    let ending = null
+    /** @type {Set<Promise<unknown>>} the sends and `sendOffsets` not settled yet */
+    const pending = new Set()
 
+    /**
+     * Keeps an operation of this transaction until it settles: `commit()` and `abort()` wait for
+     * every one of them.
+     * @param {Promise<unknown>} operation
+     * @returns {Promise<unknown>} the operation
+     */
+    const track = (operation) => {
+      pending.add(operation)
+      const forget = () => pending.delete(operation)
+      operation.then(forget, forget)
+      return operation
+    }
+
+    /**
+     * Wraps `send`, `sendBatch` or `sendOffsets`: refused once the transaction has ended, with the
+     * armed error while it can only be aborted or the producer is unusable, and once it is ending.
+     * @param {Function} fn
+     * @returns {Function}
+     */
     const transactionGuard =
       (fn) =>
       (...args) => {
-        if (!isActive()) {
-          return Promise.reject(
-            new KafkaJSNonRetriableError('Cannot continue to use transaction once ended')
-          )
+        if (transactionDidEnd) {
+          return Promise.reject(endedTransactionError())
+        }
+        const state = stateManager.state()
+        if (isArmed(state)) {
+          return Promise.reject(stateManager.transaction.armedError())
+        }
+        if (ending !== null || state !== IN_TRANSACTION) {
+          return Promise.reject(endedTransactionError())
         }
 
-        return fn(...args)
+        return track(fn(...args))
       }
+
+    /**
+     * Ends the transaction once its own operations have settled. A `commit()` or `abort()` called
+     * while another one is under way waits for it, and is refused if it ended the transaction: so a
+     * failed `commit()` can still be followed by `abort()`, and two ends never race.
+     * @param {() => Promise<void>} end
+     * @returns {Promise<void>}
+     */
+    const endWith = (end) => {
+      const previous = ending === null ? Promise.resolve() : ending.catch(() => {})
+      ending = previous.then(async () => {
+        if (transactionDidEnd) {
+          throw endedTransactionError()
+        }
+
+        await Promise.allSettled(pending)
+        await end()
+        transactionDidEnd = true
+      })
+      return ending
+    }
+
+    const isActive = () => transactionalEosManager.isInTransaction() && !transactionDidEnd
 
     return {
       sendBatch: transactionGuard(sendBatchTxn),
       send: transactionGuard(sendTxn),
       /**
-       * Abort the ongoing transaction.
+       * Abort the ongoing transaction: rejects the batches still queued, waits for the rest of the
+       * transaction's operations, then aborts it. It ends the transaction even when the abort
+       * fails, unless the producer is unusable. A rejected batch that was already sent once leaves
+       * its sequence spent, so the abort then moves the producer to a new epoch (see `abort()` on
+       * the eosManager). Called while a `commit()` of the transaction is under way, it rejects no
+       * batch and waits for the commit: the commit keeps every record, and the abort is refused if
+       * the commit ended the transaction.
        *
        * @throws {KafkaJSNonRetriableError} If transaction has ended
+       * @throws {import('../errors').KafkaJSApplicationRecoverableError} once the producer is
+       *   unusable
        */
-      abort: transactionGuard(async () => {
-        await transactionalEosManager.abort()
-        transactionDidEnd = true
-      }),
+      abort: () => {
+        const dropped =
+          ending === null && stateManager.state() === IN_TRANSACTION
+            ? stateManager.sequencer.abortQueued(
+                new KafkaJSTransactionAbortableError(
+                  'The transaction was aborted while this batch was waiting to be sent'
+                )
+              )
+            : []
+        const droppedSequences = dropped.some(({ firstSequence }) => firstSequence !== null)
+        return endWith(() => transactionalEosManager.abort({ droppedSequences }))
+      },
       /**
-       * Commit the ongoing transaction.
+       * Commit the ongoing transaction, once every send and `sendOffsets` of it has settled.
        *
        * @throws {KafkaJSNonRetriableError} If transaction has ended
+       * @throws {import('../errors').KafkaJSTransactionAbortableError} the armed error, when an
+       *   operation of the transaction failed; nothing is sent to the broker then
        */
-      commit: transactionGuard(async () => {
-        await transactionalEosManager.commit()
-        transactionDidEnd = true
-      }),
+      commit: () => endWith(() => transactionalEosManager.commit()),
       /**
-       * Sends a list of specified offsets to the consumer group coordinator, and also marks those offsets as part of the current transaction.
+       * Sends a list of specified offsets to the consumer group coordinator, and also marks those
+       * offsets as part of the current transaction. Takes the consumer's `consumerGroupMetadata`
+       * (`consumer.groupMetadata()`), so a stale or zombie member is fenced (KIP-447), or a
+       * `consumerGroupId`, which commits with no member to fence; exactly one of them. The offsets
+       * are marked committed in this client's cache, for that group, once they are sent.
        *
-       * @throws {KafkaJSNonRetriableError} If transaction has ended
+       * @throws {KafkaJSNonRetriableError} If transaction has ended, or when both or neither of
+       *   `consumerGroupMetadata` and `consumerGroupId` are given
        */
-      sendOffsets: transactionGuard(async ({ consumerGroupId, topics }) => {
-        await transactionalEosManager.sendOffsets({ consumerGroupId, topics })
+      sendOffsets: transactionGuard(async ({ consumerGroupMetadata, consumerGroupId, topics }) => {
+        await transactionalEosManager.sendOffsets({
+          consumerGroupMetadata,
+          consumerGroupId,
+          topics,
+        })
+        const groupId = consumerGroupId ?? consumerGroupMetadata.groupId
 
         for (const topicOffsets of topics) {
           const { topic, partitions } = topicOffsets
           for (const { partition, offset } of partitions) {
             cluster.markOffsetAsCommitted({
-              groupId: consumerGroupId,
+              groupId,
               topic,
               partition,
               offset,

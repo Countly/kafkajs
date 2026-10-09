@@ -671,6 +671,76 @@ The producer becomes idempotent by default and transactions move to the transact
   *What to do:* match results by `topicName`/`partition` rather than by array index. A
   single-partition send is unaffected; so is any caller that already reads the fields.
 
+- **Transactions use the transaction protocol version 2 on Kafka 4.x clusters** (KIP-890). The
+  producer reads the cluster's `transaction.version` feature from the transaction coordinator at
+  the start of every transaction. Under version 2 the producer epoch changes on every commit and
+  abort, `AddPartitionsToTxn` and `AddOffsetsToTxn` are no longer sent (Produce v12 and
+  `TxnOffsetCommit` v5 add the partition and the offsets themselves), and a transaction in which
+  nothing was produced and no offsets were sent still issues no `EndTxn` at all — as in 2.2.4 and
+  as in the Java client. A cluster that moves from version 1 to 2 costs one extra `InitProducerId`
+  before the next transaction.
+  *What to do:* no application change. If you log `producerEpoch`, expect it to change per
+  transaction; if you assert on the request sequence, it is now Produce v12 + `EndTxn` v5.
+
+- **A send that fails inside a transaction ends that transaction — how depends on the error.** An
+  `abortable` error, a retriable one that ran out of retries, and every `invalidConfiguration` code
+  except `CLUSTER_AUTHORIZATION_FAILED`, `TRANSACTIONAL_ID_AUTHORIZATION_FAILED` and
+  `UNSUPPORTED_VERSION` make the transaction abort-only: `commit()` then rejects with a
+  `KafkaJSTransactionAbortableError` without contacting the broker, and `abort()` works. An
+  `applicationRecoverable` error and those three codes make the producer itself unusable: every
+  later call rejects with a `KafkaJSApplicationRecoverableError` telling you to create a new
+  producer. `producer.transaction()` called again from either state rejects with that error rather
+  than "Cannot continue to use transaction once ended". A retriable error that ran out of retries
+  inside a transaction reaches you as a `KafkaJSTransactionAbortableError` whose `cause` is the
+  `KafkaJSNumberOfRetriesExceeded`. A batch dropped because the producer was disconnecting or
+  disconnected ends the transaction the same way; a fault in the client's own send loop makes the
+  producer unusable; and an error the client raised itself rather than the broker — a `TypeError`
+  while encoding a header value or an offset — makes the transaction abort-only as a
+  `KafkaJSTransactionAbortableError` whose `cause` is that error, leaving the producer usable. A
+  batch that had been sent before it gave up may have been written all the same, so its partition's
+  sequence stays unresolved: `commit()` and `abort()` check every partition's sequence before
+  `EndTxn`, and a gap nothing else reported makes the transaction abort-only ("The client hasn't
+  received acknowledgment for some previously sent messages and can no longer retry them. It is safe
+  to abort the transaction and continue."), and no `EndTxn` is sent while a batch is still in flight
+  — which only a send-loop fault, having already made the producer unusable, can leave behind.
+  `commit()` and `abort()` wait for the transaction's own sends and `sendOffsets` to settle; an
+  `abort()` called while a `commit()` is under way waits for it and ends the transaction only if the
+  commit failed. `abort()` always ends the transaction: a failure inside it is logged unless it
+  leaves the producer unusable. Under transaction version 1 an abort bumps the producer epoch
+  (KIP-360) when the transaction was abort-only, as the Java client does, or when it cancelled a
+  batch that had already been sent once; under either version it does so when its own `EndTxn`
+  failed. A send refused before any record was queued — for its own arguments (an empty topic, a
+  message without a value) or by a custom partitioner that threw — leaves the transaction as it was.
+  *What to do:* wrap the transaction in `try` and, on any error, `abort()` first. A send rejects
+  with its own error — the broker's, such as a `KafkaJSProtocolError` with code 90 when another
+  producer took over the `transactionalId` — and the wrapper classes come from `commit()`, `abort()`
+  and every later call: `abort()` rejects only when the producer cannot continue, with a
+  `KafkaJSApplicationRecoverableError`, and that is when to create a new producer; otherwise keep
+  it, and for `invalidConfiguration` also fix the record, config or ACL. A send rejected inside a
+  transaction after its records were queued always ends that transaction, so `commit()` after one
+  will not silently publish a partial transaction.
+
+- **`consumer.groupMetadata()` is new, and `sendOffsets` accepts `consumerGroupMetadata`**
+  (KIP-447). Passed through, the consumer's generation, member id and group instance id go on the
+  `TxnOffsetCommit`, so the group coordinator rejects a commit from a member that a rebalance
+  replaced. The legacy `{ consumerGroupId }` shape still works and still commits without group
+  fencing. Passing both, or neither, throws `KafkaJSNonRetriableError`.
+  *What to do:* switch consume-transform-produce loops to
+  `sendOffsets({ consumerGroupMetadata: consumer.groupMetadata(), topics })` and re-read the
+  metadata after every rebalance. Unchanged from 2.2.4: `sendOffsets` marks the offsets committed in
+  the client's own cluster cache as soon as they are sent, not after `commit()` succeeds, so an
+  aborted transaction leaves that cache optimistic — the same behaviour, and the same work-around,
+  as in 2.2.4.
+
+- **`ILLEGAL_GENERATION`, `UNKNOWN_MEMBER_ID`, `FENCED_INSTANCE_ID` and `STALE_MEMBER_EPOCH` from a
+  transactional offset commit are abortable**, not a bare failure: `sendOffsets` rejects with a
+  `KafkaJSTransactionAbortableError` whose `cause` is the broker's error (`category: 'abortable'`),
+  and the transaction must be aborted and the consumer rejoined. On every other request those
+  codes keep the category they have.
+  *What to do:* abort, let the consumer rejoin, reprocess from the committed offsets. A
+  classic-protocol member sees code 22 and a `groupProtocol: 'consumer'` member sees 113 for the
+  same condition.
+
 ### TypeScript: source-breaking type changes
 
 The runtime is unchanged by these; they can fail `tsc` on an existing codebase.
