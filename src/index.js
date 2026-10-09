@@ -2,7 +2,7 @@ const {
   createLogger,
   LEVELS: { INFO },
 } = require('./loggers')
-const { KafkaJSNonRetriableError } = require('./errors')
+const { KafkaJSNonRetriableError, KafkaJSInvalidConfigurationError } = require('./errors')
 
 const InstrumentationEventEmitter = require('./instrumentation/emitter')
 const LoggerConsole = require('./loggers/console')
@@ -20,10 +20,19 @@ const PRIVATE = {
   CLUSTER_RETRY: Symbol('private:Kafka:clusterRetry'),
   LOGGER: Symbol('private:Kafka:logger'),
   OFFSETS: Symbol('private:Kafka:offsets'),
+  REQUEST_TIMEOUT: Symbol('private:Kafka:requestTimeout'),
 }
 
 const DEFAULT_METADATA_MAX_AGE = 300000
 const DEFAULT_MAX_IN_FLIGHT_REQUESTS = 5
+// The Cluster's own default for `requestTimeout`.
+const DEFAULT_REQUEST_TIMEOUT = 30000
+// Java's MAX_IN_FLIGHT_REQUESTS_PER_CONNECTION_FOR_IDEMPOTENCE, and its 4.x defaults for an
+// accumulator that is switched on (linger.ms, batch.size).
+// @see clients/src/main/java/org/apache/kafka/clients/producer/ProducerConfig.java (Apache Kafka 4.3)
+const MAX_IN_FLIGHT_REQUESTS_FOR_IDEMPOTENCE = 5
+const DEFAULT_LINGER = 5
+const DEFAULT_BATCH_SIZE = 16384
 const DEFAULT_METADATA_RECOVERY_STRATEGY = 'rebootstrap'
 const DEFAULT_METADATA_RECOVERY_REBOOTSTRAP_TRIGGER_MS = 300000
 const METADATA_RECOVERY_STRATEGIES = ['rebootstrap', 'none']
@@ -71,6 +80,106 @@ const validateMetadataRecoveryRebootstrapTriggerMs = (value) => {
   throw new KafkaJSNonRetriableError(
     `metadataRecoveryRebootstrapTriggerMs must be an integer >= 1, got ${value}`
   )
+}
+
+/**
+ * The idempotence a producer is created with once `maxInFlightRequests` has had its say: more
+ * than 5 requests in flight per connection - or `null`, unbounded - is more than idempotence
+ * allows. A producer that did not ask for idempotence runs without it and says so once; one that
+ * did, with `idempotent: true` or a `transactionalId`, cannot be created. This deviates from the
+ * Java client, which refuses the combination whether or not idempotence was asked for, so that a
+ * 2.2.4 configuration with `maxInFlightRequests: null` keeps working. `idempotent` and
+ * `transactionalId` are read by truthiness, as 2.2.4 read them.
+ * @param {object} options
+ * @param {boolean|undefined} options.idempotent as the caller passed it
+ * @param {string} [options.transactionalId]
+ * @param {number|null} options.maxInFlightRequests already validated; `null` is unbounded
+ * @param {import("../types").Logger} options.logger
+ * @returns {boolean|undefined} `idempotent` unchanged, or `false` when it was turned off
+ * @throws {KafkaJSInvalidConfigurationError} for a producer that asked for idempotence
+ */
+const resolveIdempotent = ({
+  idempotent,
+  transactionalId,
+  maxInFlightRequests: inFlight,
+  logger,
+}) => {
+  const transactional = Boolean(transactionalId)
+  const requested = transactional || idempotent == null || Boolean(idempotent)
+  if (!requested || (inFlight !== null && inFlight <= MAX_IN_FLIGHT_REQUESTS_FOR_IDEMPOTENCE)) {
+    return idempotent
+  }
+
+  if (transactional) {
+    throw new KafkaJSInvalidConfigurationError(
+      `maxInFlightRequests must be 5 or lower for a transactional producer, got ${inFlight}; pass a value <= 5`
+    )
+  }
+
+  if (idempotent != null) {
+    throw new KafkaJSInvalidConfigurationError(
+      'maxInFlightRequests must be 5 or lower when idempotent: true is set; pass a value <= 5, ' +
+        'or drop idempotent: true to run non-idempotent'
+    )
+  }
+
+  logger.warn(
+    `Idempotence disabled: maxInFlightRequests is ${inFlight === null ? 'null (unbounded)' : inFlight}, ` +
+      'above the maximum of 5 for an idempotent producer. Pass maxInFlightRequests <= 5 to keep ' +
+      'idempotence, or idempotent: false to silence this warning.',
+    { rule: 'maxInFlightRequests' }
+  )
+  return false
+}
+
+/**
+ * Checks the producer's accumulator options and its delivery deadline, and resolves the
+ * accumulator's defaults: it is off unless `linger` or `batchSize` is passed, and then the unset
+ * one takes the Java 4.x default. The deadline must leave room for one request after the linger,
+ * `deliveryTimeout >= linger + requestTimeout` (Java's `KafkaProducer.configureDeliveryTimeout`),
+ * with `linger` 0 while the accumulator is off.
+ * @param {object} options
+ * @param {number} [options.linger]
+ * @param {number} [options.batchSize]
+ * @param {number} [options.deliveryTimeout]
+ * @param {number} options.requestTimeout
+ * @returns {{ linger: number|undefined, batchSize: number|undefined }} both undefined while the
+ *   accumulator is off
+ * @throws {KafkaJSInvalidConfigurationError} naming the option at fault
+ */
+const resolveDelivery = ({ linger, batchSize, deliveryTimeout, requestTimeout }) => {
+  if (linger !== undefined && !(Number.isInteger(linger) && linger >= 0)) {
+    throw new KafkaJSInvalidConfigurationError(`linger must be an integer >= 0, got ${linger}`)
+  }
+
+  if (batchSize !== undefined && !(Number.isInteger(batchSize) && batchSize >= 1)) {
+    throw new KafkaJSInvalidConfigurationError(
+      `batchSize must be an integer >= 1, got ${batchSize}`
+    )
+  }
+
+  const accumulating = linger !== undefined || batchSize !== undefined
+  const resolved = {
+    linger: accumulating ? (linger ?? DEFAULT_LINGER) : undefined,
+    batchSize: accumulating ? (batchSize ?? DEFAULT_BATCH_SIZE) : undefined,
+  }
+
+  if (deliveryTimeout != null) {
+    if (!(Number.isInteger(deliveryTimeout) && deliveryTimeout >= 1)) {
+      throw new KafkaJSInvalidConfigurationError(
+        `deliveryTimeout must be an integer >= 1, got ${deliveryTimeout}`
+      )
+    }
+
+    const floor = (resolved.linger ?? 0) + requestTimeout
+    if (deliveryTimeout < floor) {
+      throw new KafkaJSInvalidConfigurationError(
+        `deliveryTimeout must be at least linger + requestTimeout (${floor} ms), got ${deliveryTimeout}`
+      )
+    }
+  }
+
+  return resolved
 }
 
 const warnOfDefaultPartitioner = once((logger) => {
@@ -124,6 +233,7 @@ module.exports = class Client {
     this[PRIVATE.OFFSETS] = new Map()
     this[PRIVATE.LOGGER] = createLogger({ level: logLevel, logCreator })
     this[PRIVATE.CLUSTER_RETRY] = retry
+    this[PRIVATE.REQUEST_TIMEOUT] = requestTimeout ?? DEFAULT_REQUEST_TIMEOUT
 
     const validatedMetadataRecoveryStrategy =
       validateMetadataRecoveryStrategy(metadataRecoveryStrategy)
@@ -164,7 +274,18 @@ module.exports = class Client {
   }
 
   /**
+   * Creates a producer. It is idempotent unless `idempotent: false` is passed; a setting that
+   * does not allow idempotence - `maxInFlightRequests` above 5 or `null` here, `retry.retries` of
+   * 0, or `acks` other than -1 on a send - turns it off with a warning, or is refused when
+   * `idempotent: true` or a `transactionalId` asked for it.
    * @public
+   * @param {object} [options]
+   * @param {number} [options.linger] the opt-in accumulator: ms a batch waits for more records
+   * @param {number} [options.batchSize] the opt-in accumulator: bytes at which a batch is sent
+   * @param {number} [options.deliveryTimeout] ms one send may take, retries included; at least
+   *   `linger + requestTimeout`
+   * @throws {KafkaJSInvalidConfigurationError} for a setting idempotence asked for explicitly
+   *   does not allow, and for an invalid `linger`, `batchSize` or `deliveryTimeout`
    */
   producer({
     createPartitioner,
@@ -175,12 +296,30 @@ module.exports = class Client {
     transactionalId,
     transactionTimeout,
     maxInFlightRequests,
+    linger,
+    batchSize,
+    deliveryTimeout,
   } = {}) {
+    const delivery = resolveDelivery({
+      linger,
+      batchSize,
+      deliveryTimeout,
+      requestTimeout: this[PRIVATE.REQUEST_TIMEOUT],
+    })
+    const inFlight = validateMaxInFlightRequests(
+      maxInFlightRequests === undefined ? DEFAULT_MAX_IN_FLIGHT_REQUESTS : maxInFlightRequests
+    )
+    const resolvedIdempotent = resolveIdempotent({
+      idempotent,
+      transactionalId,
+      maxInFlightRequests: inFlight,
+      logger: this[PRIVATE.LOGGER].namespace('Producer'),
+    })
     const instrumentationEmitter = new InstrumentationEventEmitter()
     const cluster = this[PRIVATE.CREATE_CLUSTER]({
       metadataMaxAge,
       allowAutoTopicCreation,
-      maxInFlightRequests,
+      maxInFlightRequests: inFlight,
       instrumentationEmitter,
     })
 
@@ -193,9 +332,12 @@ module.exports = class Client {
       logger: this[PRIVATE.LOGGER],
       cluster,
       createPartitioner,
-      idempotent,
+      idempotent: resolvedIdempotent,
       transactionalId,
       transactionTimeout,
+      linger: delivery.linger,
+      batchSize: delivery.batchSize,
+      deliveryTimeout,
       instrumentationEmitter,
     })
   }

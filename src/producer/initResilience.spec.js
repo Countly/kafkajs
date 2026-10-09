@@ -152,6 +152,7 @@ describe('Producer > idempotent init resilience', () => {
     const producer = createProducer({
       cluster,
       logger: newLogger(),
+      idempotent: false,
       instrumentationEmitter,
     })
     producer.on(producer.events.CONNECT, () => seen.push('connect'))

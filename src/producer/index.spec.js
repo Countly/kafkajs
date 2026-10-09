@@ -14,7 +14,8 @@ jest.mock('./eosManager', () => {
 })
 
 jest.mock('../retry', () => {
-  const spy = jest.fn().mockImplementation(jest.requireActual('../retry'))
+  const actual = jest.requireActual('../retry')
+  const spy = Object.assign(jest.fn().mockImplementation(actual), actual)
   retrySpy = spy
   return spy
 })
@@ -282,9 +283,12 @@ describe('Producer', () => {
       clientId: 'test-client-id11111',
     })
 
+    // Non-idempotent: an idempotent producer sends one Produce per broker at a time, so the
+    // second send would never wait in the request queue.
     producer = createProducer({
       cluster,
       logger: newLogger(),
+      idempotent: false,
       instrumentationEmitter: emitter,
     })
 
@@ -746,13 +750,17 @@ describe('Producer', () => {
       )
     })
 
-    test('sets the default retry value to MAX_SAFE_INTEGER', async () => {
+    test('keeps the retry budget it is given: no Number.MAX_SAFE_INTEGER default', async () => {
       const cluster = createCluster({
         createPartitioner: createModPartitioner,
       })
 
+      retrySpy.mockClear()
       producer = createProducer({ cluster, logger: newLogger(), idempotent: true })
-      expect(retrySpy).toHaveBeenCalledWith({ retries: Number.MAX_SAFE_INTEGER })
+      expect(retrySpy).toHaveBeenCalledWith({ ...cluster.retry, maxTotalTime: undefined })
+      expect(retrySpy).not.toHaveBeenCalledWith(
+        expect.objectContaining({ retries: Number.MAX_SAFE_INTEGER })
+      )
     })
 
     test('throws an error if retries < 1', async () => {

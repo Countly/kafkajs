@@ -1143,7 +1143,7 @@ describe('Consumer', () => {
           partition,
         }))
         await producer.send({
-          acks: 1,
+          acks: -1,
           topic: topicName,
           messages,
         })
@@ -1263,7 +1263,7 @@ describe('Consumer', () => {
           partition,
         }))
         await producer.send({
-          acks: 1,
+          acks: -1,
           topic: topicName,
           messages,
         })

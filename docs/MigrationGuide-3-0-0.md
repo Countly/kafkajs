@@ -589,6 +589,45 @@ The producer becomes idempotent by default and transactions move to the transact
   `admin.fetchOffsets` is unchanged.
   *What to do:* no action. If you run long transactions, note that a rebalancing consumer waits
   for them to resolve instead of reading a position that may be rolled back.
+- **`kafka.producer()` is idempotent by default.** Every send requires `acks: -1` and the
+  producer allocates a producer id at `connect()`. The retry budget is unchanged: every producer
+  keeps its `retry.retries` (5 unless set), as in 2.2.4. `producer.isIdempotent()` reports
+  `false` after a configuration turned idempotence off (the `maxInFlightRequests` and `retries`
+  items below).
+  *What to do:* producers are idempotent unless you pass `idempotent: false`. If you relied on
+  `acks: 1` or `acks: 0`, either keep passing it — the producer then logs a warning once and runs
+  non-idempotent — or pass `idempotent: false` explicitly. Nothing about retries changes; if you
+  check `producer.isIdempotent()`, read it after `connect()`.
+- **`idempotent: true` plus `acks` 0 or 1 still throws, with a new class.** The error is now
+  `KafkaJSInvalidConfigurationError`, still a `KafkaJSNonRetriableError`, with the same message.
+  *What to do:* catch blocks keying on `KafkaJSNonRetriableError` are unaffected; the new class is
+  a subclass.
+- **`maxInFlightRequests` above 5, or `null`, disables idempotence — or throws if you asked for
+  it.** A producer that never mentioned `idempotent` keeps working and logs one warning; a
+  producer created with `idempotent: true` and more than 5 in-flight requests now throws at
+  construction. *What to do:* if you pass `maxInFlightRequests: null` or a value above 5 and want
+  idempotence, lower it to 5 or less; otherwise nothing to do — the producer runs non-idempotent
+  as it did in 2.2.4 and says so once in the log. With `idempotent: true` the combination is
+  rejected, as it is in the Java client.
+- **`connect()` can now fail with an authorization error** on a cluster that grants the
+  principal neither `IDEMPOTENT_WRITE` nor, from Kafka 2.8, `WRITE` on any topic, because an
+  idempotent producer issues `InitProducerId` there. *What to do:* grant the ACL, or create the
+  producer with `idempotent: false`. The error names both remedies.
+- **`retry: { retries: 0 }` disables idempotence — or throws if you asked for it.** A producer
+  that never mentioned `idempotent` keeps its fail-fast configuration and logs one warning;
+  `idempotent: true` (or a `transactionalId`) with `retries: 0` throws at construction. A
+  producer that is still idempotent with `retries` between 1 and 4 logs the "limiting retries may
+  invalidate EoS guarantees" warning — new for a producer that did not pass `idempotent: true`,
+  since 2.2.4 logged it only for one that did. *What to do:* nothing for a fail-fast
+  producer: it behaves exactly as in 2.2.4 and says once in the log that idempotence is off. If
+  you want idempotence with `retries: 0`, you cannot have it — raise `retries`.
+- **A `transactionalId` implies `idempotent: true` explicitly.** A transactional producer never
+  downgrades: an `acks`, `maxInFlightRequests` or `retries` conflict throws rather than silently
+  turning idempotence off. *What to do:* if you create a transactional producer with
+  `maxInFlightRequests: 1` (a common 2.2.4 work-around) nothing changes — it is below the cap.
+  `maxInFlightRequests: null` on a transactional producer now throws; drop it. A transactional
+  producer's own `send()` with `acks` 0 or 1 now throws: send with `acks: -1`, or use a separate
+  non-transactional producer for those sends.
 
 ### TypeScript: source-breaking type changes
 

@@ -306,6 +306,8 @@ new Kafka({
 })
 ```
 
+A producer's `deliveryTimeout` must be at least its `linger` plus this value - see [Delivery timeout](Producing.md#delivery-timeout).
+
 The request timeout can be disabled by setting `enforceRequestTimeout` to `false`.
 
 ```javascript
@@ -328,6 +330,8 @@ kafka.producer({
   maxInFlightRequests: 1
 })
 ```
+
+An idempotent producer - the default - allows at most 5. A producer that did not ask for idempotence and passes more, or `null`, runs without it and logs one warning; with `idempotent: true` or a `transactionalId` the combination throws `KafkaJSInvalidConfigurationError`. See [Idempotence](Producing.md#idempotence).
 
 ## Metadata recovery
 
@@ -395,6 +399,7 @@ __Available options:__
 | factor              | Randomization factor                                                                                                    | `0.2`               |
 | multiplier          | Exponential factor                                                                                                      | `2`                 |
 | retries             | Max number of retries per call                                                                                          | `5`                 |
+| maxTotalTime        | Deadline in ms for one call, from its first attempt: when the wait before the next attempt would end past it, the call rejects with `KafkaJSDeliveryTimeout`, whose `cause` is the last attempt's error. Running out of `retries` first still rejects with `KafkaJSNumberOfRetriesExceeded`. An integer of at least 1. A producer's `deliveryTimeout` sets it for that producer's sends | none (no deadline) |
 | restartOnFailure    | Only used in consumer. See [`restartOnFailure`](#restartonfailure)                                                      | none (restart on retriable errors only) |
 
 Example:

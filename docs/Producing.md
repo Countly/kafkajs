@@ -27,8 +27,29 @@ const producer = kafka.producer({
 | metadataMaxAge         | The period of time in milliseconds after which we force a refresh of metadata even if we haven't seen any partition leadership changes to proactively discover any new brokers or partitions | `300000` - 5 minutes |
 | allowAutoTopicCreation | Allow topic creation when querying metadata for non-existent topics                                                                                                                          | `true`               |
 | transactionTimeout | The maximum amount of time in ms that the transaction coordinator will wait for a transaction status update from the producer before proactively aborting the ongoing transaction. If this value is larger than the `transaction.max.timeout.ms` setting in the __broker__, the request will fail with a `InvalidTransactionTimeout` error | `60000`                            |
-| idempotent         | _Experimental._ If enabled producer will ensure each message is written exactly once. Acks _must_ be set to -1 ("all"). Retries will default to MAX_SAFE_INTEGER. If `retry.retries` is set below `5` (the non-idempotent default) a warning is logged that EoS guarantees may be invalidated; `retries` below `1` throws instead. A finite `retries` of `5` or more (including `MAX_SAFE_INTEGER`) is silent — it's treated as a deliberate choice. | `false`                            |
-| maxInFlightRequests | Max number of requests that may be in progress at any time. If falsey then no limit.                                    | `null` _(no limit)_ |
+| idempotent         | Write every message exactly once per partition, in order, even when a request is retried (KIP-679). On unless `false` is passed: the producer allocates a producer id at `connect()` and needs `acks` -1 on every send, at most 5 requests in flight per connection and `retry.retries` of at least 1. A setting that conflicts turns idempotence off with one warning, or throws when `idempotent: true` or a `transactionalId` asked for it — see [Idempotence](#idempotence). If `retry.retries` is set below `5` a warning is logged that EoS guarantees may be invalidated. | `true`                            |
+| maxInFlightRequests | Max number of requests in progress per broker connection; `null` means no limit. Above 5, or `null`, is more than an idempotent producer allows — see [Idempotence](#idempotence). | `5` |
+| deliveryTimeout | Upper bound, in ms, on one `send()`/`sendBatch()`, retries included. Past it the send rejects with `KafkaJSDeliveryTimeout`, its `cause` the last error; running out of `retry.retries` first still rejects with `KafkaJSNumberOfRetriesExceeded`. An integer of at least `linger + requestTimeout` (`linger` is 0 unless the accumulator is on). | unset (no deadline) |
+
+## <a name="idempotence"></a> Idempotence
+
+A producer is idempotent unless it is created with `idempotent: false`: it allocates a producer id when it connects and numbers every batch it sends, so a retried request can never write a record twice or out of order. Three settings must leave room for that. When one does not, a producer that did not ask for idempotence turns it off for the rest of its life and logs one warning naming the setting and both remedies; a producer created with `idempotent: true`, or with a `transactionalId`, refuses instead.
+
+| Setting | Idempotence needs | `idempotent` not passed | `idempotent: true` or a `transactionalId` |
+| --- | --- | --- | --- |
+| `acks` on a send | `-1`, the default | the send goes out non-idempotent, with one warning | the send rejects with `KafkaJSInvalidConfigurationError` |
+| `maxInFlightRequests` | 5 or less; the default is 5 | one warning at `kafka.producer()` | `kafka.producer()` throws `KafkaJSInvalidConfigurationError` |
+| `retry.retries` | 1 or more; the default is 5 | one warning at `kafka.producer()` | `kafka.producer()` throws `KafkaJSInvalidConfigurationError` |
+
+`producer.isIdempotent()` reports `false` once idempotence is off. The retry budget is the same with or without idempotence. The principal an idempotent producer connects as needs the `IDEMPOTENT_WRITE` ACL on the cluster, or `WRITE` on any topic (Kafka 2.8 and later); without either, `connect()` fails with an error naming both remedies, and a later `send()` tries again.
+
+### <a name="delivery-timeout"></a> Delivery timeout
+
+`deliveryTimeout` bounds how long one `send()` or `sendBatch()` may take, retries included (KIP-91). It has no default; when it is set it must be at least `linger + requestTimeout`, so that one request can complete after the accumulator's wait.
+
+```javascript
+const producer = kafka.producer({ deliveryTimeout: 120000 })
+```
 
 ## Producing messages
 

@@ -60,6 +60,7 @@ describe('Admin > deleteTopicRecords', () => {
       cluster,
       createPartitioner: createModPartitioner,
       logger,
+      idempotent: false,
     })
 
     await Promise.all([admin.connect(), producer.connect()])

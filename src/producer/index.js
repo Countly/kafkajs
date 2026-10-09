@@ -4,8 +4,9 @@ const { DefaultPartitioner } = require('./partitioners/')
 const InstrumentationEventEmitter = require('../instrumentation/emitter')
 const createEosManager = require('./eosManager')
 const createMessageProducer = require('./messageProducer')
+const Idempotence = require('./idempotence')
 const { events, wrap: wrapEvent, unwrap: unwrapEvent } = require('./instrumentationEvents')
-const { KafkaJSNonRetriableError } = require('../errors')
+const { KafkaJSNonRetriableError, KafkaJSInvalidConfigurationError } = require('../errors')
 
 const { values, keys } = Object
 const eventNames = values(events)
@@ -21,46 +22,76 @@ const { CONNECT, INITIALIZED, DISCONNECT } = events
  * @param {import('../../types').Cluster} params.cluster
  * @param {import('../../types').Logger} params.logger
  * @param {import('../../types').ICustomPartitioner} [params.createPartitioner]
- * @param {import('../../types').RetryOptions} [params.retry]
- * @param {boolean} [params.idempotent]
+ * @param {import('../../types').RetryOptions} [params.retry] merged over `cluster.retry`; a
+ *   producer that sets neither keeps the retrier's default budget
+ * @param {boolean} [params.idempotent] idempotent unless falsy (`undefined` and `null` mean not
+ *   passed); a value passed, or a non-empty `transactionalId`, makes a conflicting `retry.retries`
+ *   or `acks` an error instead of a reason to turn idempotence off with a warning
  * @param {string} [params.transactionalId]
  * @param {number} [params.transactionTimeout]
+ * @param {number} [params.linger] ms an accumulated batch waits for more records; set together
+ *   with `batchSize`, or neither
+ * @param {number} [params.batchSize] bytes at which an accumulated batch is sent
+ * @param {number} [params.deliveryTimeout] ms one send may take, retries included; past it the
+ *   send rejects with `KafkaJSDeliveryTimeout`
  * @param {InstrumentationEventEmitter} [params.instrumentationEmitter]
  *
  * @returns {import('../../types').Producer}
+ * @throws {KafkaJSInvalidConfigurationError} `retry.retries` below 1 on a producer that asked for
+ *   idempotence
  */
 module.exports = ({
   cluster,
   logger: rootLogger,
   createPartitioner = DefaultPartitioner,
-  retry,
-  idempotent = false,
+  retry = {},
+  idempotent,
   transactionalId,
   transactionTimeout,
+  linger,
+  batchSize,
+  deliveryTimeout,
   instrumentationEmitter: rootInstrumentationEmitter,
 }) => {
   let connectionStatus = CONNECTION_STATUS.DISCONNECTED
-  retry = retry || { retries: idempotent ? Number.MAX_SAFE_INTEGER : 5 }
+  const logger = rootLogger.namespace('Producer')
+  const transactional = Boolean(transactionalId)
+  const idempotence = new Idempotence({
+    enabled: transactional || idempotent == null || Boolean(idempotent),
+    explicit: transactional || idempotent != null,
+    logger,
+  })
 
-  if (idempotent && retry.retries < 1) {
-    throw new KafkaJSNonRetriableError(
-      'Idempotent producer must allow retries to protect against transient errors'
+  if (idempotence.isEnabled() && retry.retries < 1) {
+    if (idempotence.isExplicit()) {
+      throw new KafkaJSInvalidConfigurationError(
+        'Idempotent producer must allow retries to protect against transient errors'
+      )
+    }
+
+    idempotence.disable(
+      'retries',
+      `Idempotence disabled: retry.retries is ${retry.retries}, and an idempotent producer must ` +
+        'retry. Pass retry.retries of 1 or more to keep idempotence, or idempotent: false to ' +
+        'silence this warning.'
     )
   }
-
-  const logger = rootLogger.namespace('Producer')
 
   // A user who deliberately picked a generous, finite retry budget has already made the
   // trade-off; only warn below the non-idempotent default, where exhaustion is plausible.
   const MIN_SAFE_IDEMPOTENT_RETRIES = 5
-  if (idempotent && retry.retries < MIN_SAFE_IDEMPOTENT_RETRIES) {
+  if (idempotence.isEnabled() && retry.retries < MIN_SAFE_IDEMPOTENT_RETRIES) {
     logger.warn('Limiting retries for the idempotent producer may invalidate EoS guarantees', {
       retries: retry.retries,
     })
   }
 
   const partitioner = createPartitioner()
-  const retrier = createRetry(Object.assign({}, cluster.retry, retry))
+  const retryOptions = Object.assign({}, cluster.retry, retry)
+  const retrier = createRetry({
+    ...retryOptions,
+    maxTotalTime: deliveryTimeout ?? retryOptions.maxTotalTime,
+  })
   const instrumentationEmitter = rootInstrumentationEmitter || new InstrumentationEventEmitter()
   const idempotentEosManager = createEosManager({
     logger,
@@ -76,8 +107,10 @@ module.exports = ({
     cluster,
     partitioner,
     eosManager: idempotentEosManager,
-    idempotent,
+    idempotence,
     retrier,
+    retry: retryOptions,
+    deliveryTimeout,
     getConnectionStatus: () => connectionStatus,
     instrumentationEmitter,
     INITIALIZED,
@@ -153,8 +186,10 @@ module.exports = ({
       cluster,
       partitioner,
       retrier,
+      retry: retryOptions,
+      deliveryTimeout,
       eosManager: transactionalEosManager,
-      idempotent: true,
+      idempotence,
       getConnectionStatus: () => connectionStatus,
       instrumentationEmitter,
       INITIALIZED,
@@ -250,9 +285,11 @@ module.exports = ({
       connectionStatus = CONNECTION_STATUS.DISCONNECTED
       instrumentationEmitter.emit(DISCONNECT)
     },
-    isIdempotent: () => {
-      return idempotent
-    },
+    /**
+     * @returns {boolean} whether the producer sends idempotently; false once a configuration
+     *   that does not allow it has turned idempotence off
+     */
+    isIdempotent: () => idempotence.isEnabled(),
     events,
     on,
     send,
