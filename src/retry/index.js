@@ -155,4 +155,12 @@ const createRetry = (opts = {}) => {
 
 createRetry.backoff = createBackoff
 
+/**
+ * The values the retrier gives an option the caller leaves unset - the test defaults under
+ * `NODE_ENV=test`, as for the retrier itself. Read-only.
+ * @type {Readonly<{ maxRetryTime: number, initialRetryTime: number, factor: number,
+ *   multiplier: number, retries: number }>}
+ */
+createRetry.defaults = Object.freeze({ ...RETRY_DEFAULT })
+
 module.exports = createRetry
