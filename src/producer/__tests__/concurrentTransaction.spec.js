@@ -12,10 +12,15 @@ describe('Producer > Transactional producer', () => {
 
   // The default retry budget (5 retries, ~9s) can be shorter than the coordinator's timed-out
   // transaction cleanup interval (10s), so initProducerId gives up on CONCURRENT_TRANSACTIONS
-  // before producer1's abandoned transaction is aborted. ~22s covers it on a slow runner.
+  // before producer1's abandoned transaction is aborted. The budget below waits ~21s in total
+  // (50 ms doubling to a 3 s cap, 12 retries) whatever the retrier's run-mode defaults are. It
+  // starts at 50 ms because the test cluster's coordinator left the abort pending for minutes when
+  // the first retry came as late as 300 ms. It goes to the producer: that is where
+  // initProducerId's retries read it from.
   const newProducer = () =>
     createProducer({
-      cluster: createCluster({ retry: { retries: 10, maxRetryTime: 3000 } }),
+      cluster: createCluster(),
+      retry: { retries: 12, initialRetryTime: 50, multiplier: 2, maxRetryTime: 3000 },
       logger: newLogger(),
       idempotent: true,
       transactionalId,

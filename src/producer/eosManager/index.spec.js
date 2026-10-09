@@ -3,9 +3,11 @@ const createEosManager = require('.')
 const ProducerStateManager = require('../state')
 const {
   KafkaJSApplicationRecoverableError,
+  KafkaJSDeliveryTimeout,
   KafkaJSInvalidConfigurationError,
   KafkaJSInvariantViolation,
   KafkaJSNonRetriableError,
+  KafkaJSNumberOfRetriesExceeded,
   KafkaJSTransactionAbortableError,
 } = require('../../errors')
 const COORDINATOR_TYPES = require('../../protocol/coordinatorTypes')
@@ -990,6 +992,94 @@ describe('Producer > eosManager', () => {
 
         expect(broker.endTxn).toHaveBeenCalledTimes(1)
         expect(broker.initProducerId).not.toHaveBeenCalled()
+      })
+    })
+
+    describe('the retry option on a cluster that has none', () => {
+      const concurrent = () => createErrorFromCode(51)
+
+      test('bounds the InitProducerId retries on CONCURRENT_TRANSACTIONS', async () => {
+        let attempts = 0
+        broker.initProducerId.mockImplementation(async () => {
+          attempts += 1
+          // Answers beyond the budget only so a retrier that ignores it fails fast, not by timeout
+          if (attempts > 3) return mockInitProducerIdResponse
+          throw concurrent()
+        })
+        const eosManager = create({
+          transactional: true,
+          transactionalId,
+          retry: { retries: 1, initialRetryTime: 1 },
+        })
+
+        await expect(eosManager.initProducerId()).rejects.toBeInstanceOf(
+          KafkaJSNumberOfRetriesExceeded
+        )
+
+        expect(broker.initProducerId).toHaveBeenCalledTimes(2)
+      })
+
+      test('outlasts the default budget when the option is larger', async () => {
+        let attempts = 0
+        // 17 refusals: past the default budget of a run (5 retries) and of a test run (15)
+        broker.initProducerId.mockImplementation(async () => {
+          attempts += 1
+          if (attempts <= 17) throw concurrent()
+          return mockInitProducerIdResponse
+        })
+        const eosManager = create({
+          transactional: true,
+          transactionalId,
+          retry: { retries: 20, initialRetryTime: 1, maxRetryTime: 1 },
+        })
+
+        await eosManager.initProducerId()
+
+        expect(broker.initProducerId).toHaveBeenCalledTimes(18)
+        expect(eosManager.getProducerId()).toEqual(producerId)
+      })
+
+      test('bounds the InitProducerId retries by maxTotalTime', async () => {
+        let attempts = 0
+        broker.initProducerId.mockImplementation(async () => {
+          attempts += 1
+          // Answers beyond the deadline only so a retrier that ignores it fails fast
+          if (attempts > 3) return mockInitProducerIdResponse
+          throw concurrent()
+        })
+        // The first wait (about 100 ms) would end past the 50 ms deadline
+        const eosManager = create({
+          transactional: true,
+          transactionalId,
+          retry: { retries: 20, initialRetryTime: 100, maxTotalTime: 50 },
+        })
+
+        await expect(eosManager.initProducerId()).rejects.toBeInstanceOf(KafkaJSDeliveryTimeout)
+
+        expect(broker.initProducerId).toHaveBeenCalledTimes(1)
+      })
+
+      test('outlasts the default budget on AddOffsetsToTxn when the option is larger', async () => {
+        const eosManager = create({
+          transactional: true,
+          transactionalId,
+          retry: { retries: 20, initialRetryTime: 1, maxRetryTime: 1 },
+        })
+        await eosManager.initProducerId()
+        await eosManager.beginTransaction()
+        let attempts = 0
+        broker.addOffsetsToTxn.mockImplementation(async () => {
+          attempts += 1
+          if (attempts <= 17) throw concurrent()
+        })
+
+        await eosManager.sendOffsets({
+          consumerGroupId: 'consumer-group-id',
+          topics: [{ topic, partitions: [{ partition: 0, offset: '0' }] }],
+        })
+
+        expect(broker.addOffsetsToTxn).toHaveBeenCalledTimes(18)
+        expect(broker.txnOffsetCommit).toHaveBeenCalledTimes(1)
       })
     })
   })

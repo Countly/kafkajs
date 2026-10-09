@@ -416,6 +416,8 @@ Adopted upstream PRs are credited here by number as they land (Phase 2 onward).
 
 - A request that took longer to encode — a Produce with more partitions, say — could reach the broker after a later request on the same connection, because each request was queued only once its own encode finished. Requests now reach a broker connection in the order they were sent (the SASL exchange that authentication itself runs excepted).
 
+- The `retry` options of the client and of the producer now bound the producer's own transaction retries, which ignored them: `InitProducerId` while the coordinator is still aborting another transaction for the same `transactionalId` (`CONCURRENT_TRANSACTIONS`), and the `EndTxn`, `AddOffsetsToTxn` and `TxnOffsetCommit` retries. They always ran the default budget (5 retries, about 9 s), so a producer that set a larger `retry.retries` still gave up on `CONCURRENT_TRANSACTIONS` after about 9 s; they now run the producer's merged `retry` options, so a smaller `retries`, a shorter `maxRetryTime` or a `maxTotalTime` now shortens them too. Unchanged on the default retry options. kafkajs 2.2.4 had the same defect.
+
 #### Additions
 
 - Five error classes, exported from the package root: `KafkaJSTransactionAbortableError` (`abortable`), `KafkaJSApplicationRecoverableError` (`applicationRecoverable`), `KafkaJSInvalidConfigurationError` (`invalidConfiguration`) and `KafkaJSDeliveryTimeout` (`abortable` — a send that ran out of its delivery deadline), all subclasses of `KafkaJSNonRetriableError`, and `KafkaJSRefreshRetriableError` (`refreshRetriable`), a retriable `KafkaJSError`. `KafkaJSAggregateError` and `KafkaJSFetcherRebalanceError`, which extend `Error` directly, carry `category` too; the latter keeps its `name` of `'Error'`.

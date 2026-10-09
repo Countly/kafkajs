@@ -25,10 +25,6 @@ const createFakeCluster = () => ({
   topicId: jest.fn(() => undefined),
   removeBroker: jest.fn(),
   isConnected: () => true,
-  // retries: 0 so the eosManager's own retrier (built from cluster.retry) does not swallow the
-  // single transient InitProducerId failure by retrying it internally — that would make
-  // connect() resolve instead of reject and the test would never reach the poisoned state.
-  retry: { retries: 0, initialRetryTime: 1 },
 })
 
 /**
@@ -66,8 +62,8 @@ describe('Producer > idempotent init resilience', () => {
         initAttempts += 1
         if (initAttempts === 1) {
           throw Object.assign(new Error('transient'), {
-            type: 'GROUP_LOAD_IN_PROGRESS',
-            code: 14,
+            type: 'REQUEST_TIMED_OUT',
+            code: 7,
             retriable: true,
           })
         }
@@ -86,8 +82,9 @@ describe('Producer > idempotent init resilience', () => {
       logger: newLogger(),
       idempotent: true,
       // retries: 1 (not 0) so construction doesn't trip the "idempotent producer must allow
-      // retries" guard in src/producer/index.js; this only governs send()'s own retrier, not
-      // eosManager's InitProducerId retries (those come from cluster.retry above).
+      // retries" guard in src/producer/index.js. The failure thrown above is one that
+      // InitProducerId's own retries do not absorb, so connect() still rejects and reaches the
+      // poisoned state.
       retry: { retries: 1 },
       instrumentationEmitter,
     })
@@ -246,8 +243,8 @@ describe('Producer > idempotent init resilience', () => {
         if (initAttempts === 1) {
           return Promise.reject(
             Object.assign(new Error('transient'), {
-              type: 'GROUP_LOAD_IN_PROGRESS',
-              code: 14,
+              type: 'REQUEST_TIMED_OUT',
+              code: 7,
               retriable: true,
             })
           )
