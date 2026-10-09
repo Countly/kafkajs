@@ -102,14 +102,41 @@ export interface ProducerConfig {
   retry?: RetryOptions
   metadataMaxAge?: number
   allowAutoTopicCreation?: boolean
+  /**
+   * Idempotent produce (KIP-679): every record written once per partition, in order. Defaults to
+   * true from 3.0.0; `false` runs without idempotence (ignored with a `transactionalId`). A
+   * setting idempotence does not allow (`acks` other than -1 on a send, `maxInFlightRequests`
+   * above 5 or null, `retry.retries` of 0) turns it off with a warning, or throws when
+   * `idempotent: true` or a `transactionalId` asked for it.
+   */
   idempotent?: boolean
   transactionalId?: string
   transactionTimeout?: number
   /**
    * Maximum unacknowledged requests per broker connection. Defaults to 5 (Java parity).
-   * Pass null for unbounded (the pre-3.0 behavior).
+   * Pass null for unbounded (the pre-3.0 behavior). Above 5, or null, is more than an idempotent
+   * producer allows.
    */
   maxInFlightRequests?: number | null
+  /**
+   * Opt-in accumulator: ms a partition's batch waits for records of further sends. An integer
+   * from 0 to 2147483647. Off unless `linger` or `batchSize` is passed; the other one then takes
+   * the Java default (5 ms / 16384 bytes).
+   */
+  linger?: number
+  /**
+   * Opt-in accumulator: bytes of keys and values at which a batch is sent without waiting for
+   * `linger`. An integer of at least 1. Off unless `linger` or `batchSize` is passed; the other
+   * one then takes the Java default (5 ms / 16384 bytes).
+   */
+  batchSize?: number
+  /**
+   * Opt-in upper bound, in ms, on one send, retries included (KIP-91); past it the send rejects
+   * with `KafkaJSDeliveryTimeout`. An integer of at least `linger + requestTimeout` (`linger`
+   * counts as 0 while the accumulator is off) and at most 2147483647. With the accumulator on,
+   * the bound includes waiting for the producer id.
+   */
+  deliveryTimeout?: number
 }
 
 export interface Message {
@@ -140,6 +167,15 @@ export const Partitioners: {
    * and made to be the default in 2.0.0.
    */
   JavaCompatiblePartitioner: DefaultPartitioner
+  /**
+   * KIP-794 uniform sticky partitioner (opt-in): keyless records stick to a partition for
+   * `stickyBytes` of keys and values, keyed ones keep `DefaultPartitioner`'s mapping unless
+   * `ignoreKeys`.
+   */
+  UniformStickyPartitioner: (options?: {
+    stickyBytes?: number
+    ignoreKeys?: boolean
+  }) => ICustomPartitioner
 }
 
 export type PartitionMetadata = {
@@ -308,6 +344,12 @@ export interface RetryOptions {
   factor?: number
   multiplier?: number
   retries?: number
+  /**
+   * Deadline in ms for one retried operation, from its first attempt: when the wait before the
+   * next attempt would end past it, the operation rejects with `KafkaJSDeliveryTimeout`. An
+   * integer from 1 to 2147483647.
+   */
+  maxTotalTime?: number
   restartOnFailure?: (e: Error) => Promise<boolean>
 }
 
@@ -786,6 +828,13 @@ export interface ApiVersions {
 }
 
 export type Broker = {
+  /**
+   * The finalized features of the ApiVersions response the broker's current versions came from;
+   * `{}` before the first negotiation.
+   */
+  finalizedFeatures: { [name: string]: { minVersionLevel: number; maxVersionLevel: number } }
+  /** The epoch `finalizedFeatures` were finalized at; -1 when the broker sent none. */
+  finalizedFeaturesEpoch: number
   isConnected(): boolean
   connect(): Promise<void>
   disconnect(): Promise<void>
@@ -805,6 +854,10 @@ export type Broker = {
   offsetFetch(request: {
     groupId: string
     topics: TopicOffsets[]
+    memberId?: string | null
+    memberEpoch?: number
+    /** Hold back offsets with a transactional commit pending (KIP-447); default false. */
+    requireStable?: boolean
   }): Promise<{
     responses: TopicOffsets[]
   }>
@@ -836,11 +889,50 @@ export type Broker = {
     topicIds?: Map<string, string>
     maxVersion?: number
     transactionalId?: string
-    producerId?: number
+    producerId?: number | string
     producerEpoch?: number
     acks?: number
     timeout?: number
     compression?: CompressionTypes
+    /** With a `transactionalId`: 2 sends Produce v12, which adds the partition itself (KIP-890). */
+    transactionVersion?: 1 | 2
+  }): Promise<any>
+  /**
+   * InitProducerId; on a re-initialization (KIP-360) pass the producer id and epoch held, which
+   * default to -1 for a first one.
+   */
+  initProducerId(request: {
+    transactionalId?: string | null
+    /** In ms; 5000 when omitted. */
+    transactionTimeout?: number
+    producerId?: number | string
+    producerEpoch?: number
+  }): Promise<{ errorCode: number; producerId: string; producerEpoch: number }>
+  /**
+   * EndTxn; under transaction version 2 the response carries the bumped producer id and epoch
+   * (-1 and -1 when the coordinator has no pair to report).
+   */
+  endTxn(request: {
+    transactionalId: string
+    producerId: number | string
+    producerEpoch: number
+    transactionResult: boolean
+    transactionVersion?: 1 | 2
+  }): Promise<{ errorCode: number; producerId?: string; producerEpoch?: number }>
+  /**
+   * TxnOffsetCommit; the consumer's generation, member id and group instance id let the group
+   * coordinator fence a stale member (KIP-447), and default to an unfenced commit.
+   */
+  txnOffsetCommit(request: {
+    transactionalId: string
+    groupId: string
+    producerId: number | string
+    producerEpoch: number
+    topics: TransactionOffsets['topics']
+    generationId?: number
+    memberId?: string
+    groupInstanceId?: string | null
+    transactionVersion?: 1 | 2
   }): Promise<any>
   alterPartitionReassignments(request: {
     topics: PartitionReassignment[]
@@ -1018,8 +1110,41 @@ export type Producer = Sender & {
   logger(): Logger
 }
 
+/** What `consumer.groupMetadata()` returns: the membership a transactional offset commit carries. */
+export interface ConsumerGroupMetadata {
+  groupId: string
+  /** Generation id under the classic protocol; member epoch under groupProtocol: 'consumer'. */
+  generationId: number
+  memberId: string
+  groupInstanceId: string | null
+}
+
+export type TransactionOffsets = {
+  topics: Array<{
+    topic: string
+    partitions: Array<{
+      partition: number
+      offset: string
+      /** KIP-320 committed leader epoch; -1 when omitted. */
+      leaderEpoch?: number
+      metadata?: string | null
+    }>
+  }>
+}
+
 export type Transaction = Sender & {
-  sendOffsets(offsets: Offsets & { consumerGroupId: string }): Promise<void>
+  /**
+   * Adds consumed offsets to the transaction: with `consumerGroupMetadata` (from
+   * `consumer.groupMetadata()`) the commit is fenced against a stale member (KIP-447), with
+   * `consumerGroupId` it is not. Exactly one of the two.
+   */
+  sendOffsets(
+    offsets: TransactionOffsets &
+      (
+        | { consumerGroupMetadata: ConsumerGroupMetadata; consumerGroupId?: never }
+        | { consumerGroupId: string; consumerGroupMetadata?: never }
+      )
+  ): Promise<void>
   commit(): Promise<void>
   abort(): Promise<void>
   isActive(): boolean
@@ -1368,6 +1493,12 @@ export type Consumer = {
   ): Promise<void>
   stop(): Promise<void>
   run(config?: ConsumerRunConfig): Promise<void>
+  /**
+   * The consumer's group membership, for `transaction.sendOffsets({ consumerGroupMetadata })`.
+   * A snapshot taken at the call: read it again after every rebalance.
+   * @throws KafkaJSNonRetriableError before run() and after stop()
+   */
+  groupMetadata(): ConsumerGroupMetadata
   commitOffsets(topicPartitions: Array<TopicPartitionOffsetAndMetadata>): Promise<void>
   seek(topicPartitionOffset: TopicPartitionOffset): void
   describeGroup(): Promise<GroupDescription>
@@ -1493,10 +1624,20 @@ export var CompressionCodecs: {
   [CompressionTypes.ZSTD]: () => any
 }
 
+/** What the caller should do about an error (KIP-1050). */
+export type KafkaJSErrorCategory =
+  | 'retriable'
+  | 'refreshRetriable'
+  | 'abortable'
+  | 'applicationRecoverable'
+  | 'invalidConfiguration'
+
 export class KafkaJSError extends Error {
   readonly message: Error['message']
   readonly name: string
   readonly retriable: boolean
+  /** KIP-1050 category. Present on every error this package raises through its error classes. */
+  readonly category: KafkaJSErrorCategory
   readonly helpUrl?: string
   readonly cause?: Error
   /** Protocol error type, carried through when the wrapped error had one */
@@ -1539,7 +1680,42 @@ export type ProduceRecordError = {
 
 export class KafkaJSAggregateError extends Error {
   readonly errors: (Error | string)[]
+  readonly category: KafkaJSErrorCategory
   constructor(message: Error | string, errors: (Error | string)[])
+}
+
+/** Raised inside the consumer's fetch loop when the group rebalances; its `name` is `'Error'`. */
+export class KafkaJSFetcherRebalanceError extends Error {
+  readonly category: KafkaJSErrorCategory
+}
+
+/** Retriable once the client refreshed its metadata or coordinator. */
+export class KafkaJSRefreshRetriableError extends KafkaJSError {
+  constructor(e: Error | string, options?: { cause?: Error })
+}
+
+/** The transaction cannot complete: abort it and keep the producer. */
+export class KafkaJSTransactionAbortableError extends KafkaJSNonRetriableError {
+  constructor(e: Error | string, options?: { cause?: Error })
+}
+
+/** The producer cannot continue: create a new one. */
+export class KafkaJSApplicationRecoverableError extends KafkaJSNonRetriableError {
+  constructor(e: Error | string, options?: { cause?: Error })
+}
+
+/** The configuration, a record or an ACL is wrong: fix it. */
+export class KafkaJSInvalidConfigurationError extends KafkaJSNonRetriableError {
+  constructor(e: Error | string, options?: { cause?: Error })
+}
+
+/**
+ * A send ran out of its `deliveryTimeout` (KIP-91), or any retried operation out of its
+ * `retry.maxTotalTime`; `cause` is the last error it met. Abortable: inside a transaction the
+ * transaction has to be aborted, outside one the producer stays usable.
+ */
+export class KafkaJSDeliveryTimeout extends KafkaJSNonRetriableError {
+  constructor(e: Error | string, options?: { cause?: Error })
 }
 
 export class KafkaJSOffsetOutOfRange extends KafkaJSProtocolError {

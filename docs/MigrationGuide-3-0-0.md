@@ -773,6 +773,11 @@ The runtime is unchanged by these; they can fail `tsc` on an existing codebase.
 - **`subscribe()`'s three shapes are now mutually exclusive.** `{ regex, topics }`,
   `{ regex, topic }` and `{ topic, topics }` are compile errors, matching the runtime, which has
   always thrown for them.
+- **`Consumer`, `Broker`, `typeof Partitioners` and `KafkaJSError` gained required members**:
+  `consumer.groupMetadata()`; the broker's `finalizedFeatures`, `finalizedFeaturesEpoch`,
+  `initProducerId`, `endTxn` and `txnOffsetCommit`; `Partitioners.UniformStickyPartitioner`; and
+  every error's `category`. Code that *constructs* these types by hand — test fixtures, mocks, an
+  object typed `Consumer` — must supply them. Code that only reads or calls them is unaffected.
 
 The rest of this section is additive — nothing here changes unless you opt in.
 

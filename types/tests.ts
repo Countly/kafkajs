@@ -31,6 +31,21 @@ import {
   MemberDescription,
   ConsumerGroupState,
   TopicPartitions,
+  Partitioners,
+  Broker,
+  Offsets,
+  ConsumerGroupMetadata,
+  TransactionOffsets,
+  KafkaJSErrorCategory,
+  KafkaJSNonRetriableError,
+  KafkaJSRefreshRetriableError,
+  KafkaJSTransactionAbortableError,
+  KafkaJSApplicationRecoverableError,
+  KafkaJSInvalidConfigurationError,
+  KafkaJSDeliveryTimeout,
+  KafkaJSAggregateError,
+  KafkaJSFetcherRebalanceError,
+  KafkaJSLockTimeout,
 } from './index'
 
 const { roundRobin } = PartitionAssigners
@@ -509,3 +524,173 @@ regexConsumer.on(regexConsumer.events.REBALANCING, e => {
     void e.payload.reason
   }
 })
+
+// The producer options: idempotent by default, the opt-in accumulator and delivery deadline, and
+// the retrier's deadline; every 2.2.4 form still compiles.
+kafka.producer({ idempotent: true, maxInFlightRequests: 5 })
+kafka.producer({ idempotent: false, transactionalId: 'tx', transactionTimeout: 30000 })
+kafka.producer({ linger: 5, batchSize: 16384, deliveryTimeout: 120000 })
+kafka.producer({ linger: 0 })
+kafka.producer({ retry: { retries: 5, maxTotalTime: 60000 } })
+new Kafka({ brokers: ['localhost:9092'], retry: { maxTotalTime: 30000 } })
+// @ts-expect-error linger is a number of milliseconds
+kafka.producer({ linger: '5' })
+
+// The uniform sticky partitioner, with its options or none.
+kafka.producer({
+  createPartitioner: Partitioners.UniformStickyPartitioner({ stickyBytes: 8192, ignoreKeys: true }),
+})
+kafka.producer({ createPartitioner: Partitioners.UniformStickyPartitioner() })
+kafka.producer({ createPartitioner: Partitioners.DefaultPartitioner })
+
+// groupMetadata() and the two sendOffsets shapes.
+const runTransaction = async () => {
+  const transactional = kafka.producer({ transactionalId: 'tx' })
+  const metadata: ConsumerGroupMetadata = consumer.groupMetadata()
+  const generationId: number = metadata.generationId
+  const groupInstanceId: string | null = metadata.groupInstanceId
+  void generationId
+  void groupInstanceId
+  const built: ConsumerGroupMetadata = {
+    groupId: 'g',
+    generationId: 1,
+    memberId: 'member',
+    groupInstanceId: null,
+  }
+  void built
+  const offsets: TransactionOffsets['topics'] = [
+    { topic, partitions: [{ partition: 0, offset: '5', leaderEpoch: 3, metadata: null }] },
+  ]
+
+  const transaction = await transactional.transaction()
+  await transaction.sendOffsets({ consumerGroupMetadata: metadata, topics: offsets })
+  await transaction.sendOffsets({ consumerGroupId: 'g', topics: offsets })
+  // The 2.2.4 shape, partitions without a leader epoch.
+  await transaction.sendOffsets({
+    consumerGroupId: 'g',
+    topics: [{ topic, partitions: [{ partition: 0, offset: '5' }] }],
+  })
+  // The 2.2.4 type, a value declared as Offsets with a group id.
+  const legacy: Offsets & { consumerGroupId: string } = {
+    consumerGroupId: 'g',
+    topics: [{ topic, partitions: [{ partition: 0, offset: '5' }] }],
+  }
+  await transaction.sendOffsets(legacy)
+  // @ts-expect-error both identifiers at once; the runtime throws for this too
+  await transaction.sendOffsets({ consumerGroupMetadata: metadata, consumerGroupId: 'g', topics: offsets })
+  // @ts-expect-error neither identifier
+  await transaction.sendOffsets({ topics: offsets })
+  await transaction.commit()
+
+  await consumer.run({
+    eachBatch: async ({ uncommittedOffsets }) => {
+      const next = await transactional.transaction()
+      // The uncommitted offsets of a batch are what sendOffsets takes.
+      await next.sendOffsets({
+        consumerGroupMetadata: consumer.groupMetadata(),
+        topics: uncommittedOffsets().topics,
+      })
+      await next.commit()
+    },
+  })
+}
+runTransaction().catch(console.error)
+
+// Every error carries its category, and the five classes exist.
+const categoryOf = (error: KafkaJSError): KafkaJSErrorCategory => error.category
+categoryOf(new KafkaJSError('x'))
+const categories: KafkaJSErrorCategory[] = [
+  'retriable',
+  'refreshRetriable',
+  'abortable',
+  'applicationRecoverable',
+  'invalidConfiguration',
+]
+void categories
+const cause = new Error('cause')
+const abortable: KafkaJSNonRetriableError = new KafkaJSTransactionAbortableError('x', { cause })
+const recoverable: KafkaJSNonRetriableError = new KafkaJSApplicationRecoverableError('x')
+const invalid: KafkaJSNonRetriableError = new KafkaJSInvalidConfigurationError('x', { cause })
+const expired: KafkaJSNonRetriableError = new KafkaJSDeliveryTimeout('x', { cause })
+const refresh: KafkaJSError = new KafkaJSRefreshRetriableError('x')
+void [abortable, recoverable, invalid, expired, refresh]
+const aggregateCategory: KafkaJSErrorCategory = new KafkaJSAggregateError('x', []).category
+const rebalanceCategory: KafkaJSErrorCategory = new KafkaJSFetcherRebalanceError('x').category
+void aggregateCategory
+void rebalanceCategory
+// @ts-expect-error not a category
+const notACategory: KafkaJSErrorCategory = 'fatal'
+void notACategory
+// KafkaJSLockTimeout stays exported.
+new KafkaJSLockTimeout()
+
+// The broker surface transactions use.
+const useBroker = async (broker: Broker) => {
+  const offsets: TransactionOffsets['topics'] = [
+    { topic, partitions: [{ partition: 0, offset: '5' }] },
+  ]
+  const level: number = broker.finalizedFeatures['transaction.version'].maxVersionLevel
+  const featuresEpoch: number = broker.finalizedFeaturesEpoch
+  void level
+  void featuresEpoch
+  const { producerId, producerEpoch } = await broker.initProducerId({
+    transactionalId: 'tx',
+    transactionTimeout: 60000,
+    producerId: '1000',
+    producerEpoch: 3,
+  })
+  const heldProducerId: string = producerId
+  const heldProducerEpoch: number = producerEpoch
+  void heldProducerId
+  void heldProducerEpoch
+  await broker.initProducerId({ transactionalId: null, transactionTimeout: 60000 })
+  // The defaults: no transaction timeout, no producer id held.
+  await broker.initProducerId({ transactionalId: 'tx' })
+  await broker.initProducerId({})
+  await broker.produce({ topicData: [], transactionalId: 'tx', transactionVersion: 2 })
+  await broker.produce({ topicData: [], producerId: '1000', producerEpoch: 3 })
+  await broker.produce({ topicData: [], producerId: 1000, producerEpoch: 3 })
+  // @ts-expect-error only transaction versions 1 and 2 exist
+  await broker.produce({ topicData: [], transactionalId: 'tx', transactionVersion: 3 })
+  await broker.offsetFetch({ groupId: 'g', topics: [], requireStable: true })
+  await broker.offsetFetch({ groupId: 'g', topics: [], memberId: null, memberEpoch: -1 })
+  await broker.txnOffsetCommit({
+    transactionalId: 'tx',
+    groupId: 'g',
+    producerId,
+    producerEpoch,
+    topics: [{ topic, partitions: [{ partition: 0, offset: '5', leaderEpoch: 3 }] }],
+    generationId: 7,
+    memberId: 'member',
+    groupInstanceId: null,
+    transactionVersion: 2,
+  })
+  // The defaults: an unfenced commit under transaction version 1.
+  await broker.txnOffsetCommit({
+    transactionalId: 'tx',
+    groupId: 'g',
+    producerId,
+    producerEpoch,
+    topics: offsets,
+  })
+  const ended = await broker.endTxn({
+    transactionalId: 'tx',
+    producerId,
+    producerEpoch,
+    transactionResult: true,
+    transactionVersion: 2,
+  })
+  const bumped: string | undefined = ended.producerId
+  void bumped
+  // @ts-expect-error the producer id is a decimal string
+  const bumpedAsNumber: number | undefined = ended.producerId
+  void bumpedAsNumber
+  // @ts-expect-error the pair is absent from an EndTxn response below v5
+  void ended.producerId.length
+  // @ts-expect-error likewise the epoch
+  const bumpedEpoch: number = ended.producerEpoch
+  void bumpedEpoch
+  // @ts-expect-error only transaction versions 1 and 2 exist
+  await broker.endTxn({ transactionalId: 'tx', producerId, producerEpoch, transactionResult: false, transactionVersion: 3 })
+}
+void useBroker

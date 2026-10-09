@@ -1341,6 +1341,8 @@ module.exports = class Broker {
    * @typedef {Object} OffsetCommitTopicPartition
    * @property {number} partition
    * @property {number} offset
+   * @property {number} [leaderEpoch] the leader epoch of the consumed record, sent as the
+   *   partition's `CommittedLeaderEpoch` (v2+); -1 when omitted
    * @property {string} [metadata]
    *
    * @returns {Promise}
