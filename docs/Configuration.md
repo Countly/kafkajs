@@ -306,7 +306,7 @@ new Kafka({
 })
 ```
 
-A producer's `deliveryTimeout` must be at least its `linger` plus this value - see [Delivery timeout](Producing.md#delivery-timeout).
+A producer's `deliveryTimeout` must be at least its `linger` (0 unless the [accumulator](Producing.md#accumulator) is on) plus this value - see [Delivery timeout](Producing.md#delivery-timeout).
 
 The request timeout can be disabled by setting `enforceRequestTimeout` to `false`.
 
@@ -399,7 +399,7 @@ __Available options:__
 | factor              | Randomization factor                                                                                                    | `0.2`               |
 | multiplier          | Exponential factor                                                                                                      | `2`                 |
 | retries             | Max number of retries per call                                                                                          | `5`                 |
-| maxTotalTime        | Deadline in ms for one call, from its first attempt: when the wait before the next attempt would end past it, the call rejects with `KafkaJSDeliveryTimeout`, whose `cause` is the last attempt's error. Running out of `retries` first still rejects with `KafkaJSNumberOfRetriesExceeded`. An integer of at least 1. A producer's `deliveryTimeout` sets it for that producer's sends | none (no deadline) |
+| maxTotalTime        | Deadline in ms for one call, from its first attempt: when the wait before the next attempt would end past it, the call rejects with `KafkaJSDeliveryTimeout`, whose `cause` is the last attempt's error. Running out of `retries` first still rejects with `KafkaJSNumberOfRetriesExceeded`. An integer from 1 to 2147483647. A producer's `deliveryTimeout` sets it for that producer's sends | none (no deadline) |
 | restartOnFailure    | Only used in consumer. See [`restartOnFailure`](#restartonfailure)                                                      | none (restart on retriable errors only) |
 
 Example:

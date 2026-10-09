@@ -45,18 +45,34 @@ const backoffOf = ({ initialRetryTime, factor, multiplier, maxRetryTime }) => ({
  */
 const createBackoff = (opts = {}) => backoffOf(Object.assign({}, RETRY_DEFAULT, opts))
 
+// The longest delay Node's `setTimeout` honours; a longer one runs after 1 ms.
+// @see https://nodejs.org/api/timers.html
+const MAX_TIMER_DELAY = 2147483647
+
 /**
- * Refuses a `maxTotalTime` that is set but is not an integer of at least 1: `0` or a negative
- * number would reject at the first failure, a fraction or a numeric string is not a millisecond
- * count, and silently ignoring it would hide a deadline the caller meant to set.
+ * Refuses a `maxTotalTime` that is set but is not an integer from 1 to 2147483647: `0` or a
+ * negative number would reject at the first failure, a fraction or a numeric string is not a
+ * millisecond count, a larger value arms timers Node runs after 1 ms (the producer's wake-up at a
+ * queued batch's deadline), and silently ignoring it would hide a deadline the caller meant to
+ * set.
  * @param {unknown} maxTotalTime `undefined` and `null` mean no deadline
  * @returns {void}
  * @throws {KafkaJSInvalidConfigurationError}
  */
 const assertMaxTotalTime = (maxTotalTime) => {
-  if (maxTotalTime != null && !(Number.isInteger(maxTotalTime) && maxTotalTime >= 1)) {
+  if (maxTotalTime == null) {
+    return
+  }
+
+  if (!(Number.isInteger(maxTotalTime) && maxTotalTime >= 1)) {
     throw new KafkaJSInvalidConfigurationError(
       `retry.maxTotalTime must be an integer of at least 1, got ${inspect(maxTotalTime)}`
+    )
+  }
+
+  if (maxTotalTime > MAX_TIMER_DELAY) {
+    throw new KafkaJSInvalidConfigurationError(
+      `retry.maxTotalTime must be an integer of at least 1 and at most ${MAX_TIMER_DELAY}, got ${maxTotalTime}`
     )
   }
 }
@@ -137,8 +153,8 @@ const createRetriable = (configs, backoff, resolve, reject, fn) => {
  * `undefined` or `null`, the retrier behaves exactly as without it.
  * @param {import("../../types").RetryOptions & { maxTotalTime?: number }} [opts]
  * @returns {Retrier}
- * @throws {KafkaJSInvalidConfigurationError} when `maxTotalTime` is set and is not an integer of at
- *   least 1; thrown here, before any retrier is returned
+ * @throws {KafkaJSInvalidConfigurationError} when `maxTotalTime` is set and is not an integer from
+ *   1 to 2147483647; thrown here, before any retrier is returned
  */
 const createRetry = (opts = {}) => {
   assertMaxTotalTime(opts?.maxTotalTime)

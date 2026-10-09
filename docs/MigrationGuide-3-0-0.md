@@ -644,9 +644,11 @@ The producer becomes idempotent by default and transactions move to the transact
   `KafkaJSLockTimeout` after 65.5 s and emitted `producer.events.LOCK_TIMEOUT` first. Batches of
   different partitions are now pipelined, up to 5 requests per broker (fewer when the
   connection's `maxInFlightRequests` is lower); within one partition a batch waits for the
-  previous one's answer, which keeps the partition in order. `LOCK_TIMEOUT` can no longer be
-  emitted. The event stays declared and the error class stays exported: a `send()` registering its
-  topics with the cluster, and connecting to a broker, can still raise `KafkaJSLockTimeout`.
+  previous one's answer, which keeps the partition in order. A busy partition can gather the
+  records of several sends into each batch with the opt-in `linger` (below). `LOCK_TIMEOUT` can
+  no longer be emitted. The event stays declared and the error class stays exported: a `send()`
+  registering its topics with the cluster, and connecting to a broker, can still raise
+  `KafkaJSLockTimeout`.
   *What to do:* `LOCK_TIMEOUT` listeners on a producer will never be called and can be removed.
   Keep any `catch` that matches `KafkaJSLockTimeout` by name. `maxInFlightRequests: 1` on a
   transactional producer is no longer needed and now costs throughput.
@@ -740,6 +742,15 @@ The producer becomes idempotent by default and transactions move to the transact
   *What to do:* abort, let the consumer rejoin, reprocess from the committed offsets. A
   classic-protocol member sees code 22 and a `groupProtocol: 'consumer'` member sees 113 for the
   same condition.
+
+- **Four opt-ins, none of them on by default**: the accumulator (`linger`, `batchSize`), which
+  gathers the records of several sends to one partition into one batch;
+  `Partitioners.UniformStickyPartitioner`; `deliveryTimeout`; and `leaderEpoch` on the partitions
+  given to `sendOffsets`. With the accumulator on, a send resolves only once the batch carrying its
+  records has been acknowledged, sends that shared a batch succeed or fail together, and a record
+  whose key, value, header values or timestamp cannot be encoded fails its own send at once, with
+  `KafkaJSInvalidConfigurationError`.
+  *What to do:* nothing. Without them the producer behaves as it did.
 
 ### TypeScript: source-breaking type changes
 

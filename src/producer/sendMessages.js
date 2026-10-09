@@ -1406,7 +1406,8 @@ const createSendMessages = ({
   /**
    * Assigns each record to a partition once, after making sure the topics' metadata is loaded:
    * the partitioner never runs again for these records. Retried by `retrier` while the metadata
-   * cannot be loaded.
+   * cannot be loaded. A transactional producer's failure arms the transaction as `inTransaction`
+   * says.
    * @param {{ topic: string, messages: object[] }[]} topicMessages
    * @returns {Promise<{ topic: string, partition: number, messages: object[] }[]>}
    */
@@ -1443,6 +1444,8 @@ const createSendMessages = ({
         if (e.retriable) throw e
         bail(e)
       }
+    }).catch((error) => {
+      throw inTransaction(error)
     })
 
   /**
@@ -1542,9 +1545,7 @@ const createSendMessages = ({
     }
 
     const createdAt = Date.now()
-    const batches = await partition(topicMessages).catch((error) => {
-      throw inTransaction(error)
-    })
+    const batches = await partition(topicMessages)
     for (const batch of batches) {
       batch.createdAt = createdAt
     }

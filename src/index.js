@@ -33,6 +33,9 @@ const DEFAULT_REQUEST_TIMEOUT = 30000
 const MAX_IN_FLIGHT_REQUESTS_FOR_IDEMPOTENCE = 5
 const DEFAULT_LINGER = 5
 const DEFAULT_BATCH_SIZE = 16384
+// The longest delay Node's `setTimeout` honours; a longer one runs after 1 ms.
+// @see https://nodejs.org/api/timers.html
+const MAX_TIMER_DELAY = 2147483647
 const DEFAULT_METADATA_RECOVERY_STRATEGY = 'rebootstrap'
 const DEFAULT_METADATA_RECOVERY_REBOOTSTRAP_TRIGGER_MS = 300000
 const METADATA_RECOVERY_STRATEGIES = ['rebootstrap', 'none']
@@ -137,7 +140,8 @@ const resolveIdempotent = ({
  * accumulator's defaults: it is off unless `linger` or `batchSize` is passed, and then the unset
  * one takes the Java 4.x default. The deadline must leave room for one request after the linger,
  * `deliveryTimeout >= linger + requestTimeout` (Java's `KafkaProducer.configureDeliveryTimeout`),
- * with `linger` 0 while the accumulator is off.
+ * with `linger` 0 while the accumulator is off. `linger` and `deliveryTimeout` are at most
+ * 2147483647 ms, the longest timer delay.
  * @param {object} options
  * @param {number} [options.linger]
  * @param {number} [options.batchSize]
@@ -148,8 +152,13 @@ const resolveIdempotent = ({
  * @throws {KafkaJSInvalidConfigurationError} naming the option at fault
  */
 const resolveDelivery = ({ linger, batchSize, deliveryTimeout, requestTimeout }) => {
-  if (linger !== undefined && !(Number.isInteger(linger) && linger >= 0)) {
-    throw new KafkaJSInvalidConfigurationError(`linger must be an integer >= 0, got ${linger}`)
+  if (
+    linger !== undefined &&
+    !(Number.isInteger(linger) && linger >= 0 && linger <= MAX_TIMER_DELAY)
+  ) {
+    throw new KafkaJSInvalidConfigurationError(
+      `linger must be an integer >= 0 and <= ${MAX_TIMER_DELAY}, got ${linger}`
+    )
   }
 
   if (batchSize !== undefined && !(Number.isInteger(batchSize) && batchSize >= 1)) {
@@ -165,9 +174,13 @@ const resolveDelivery = ({ linger, batchSize, deliveryTimeout, requestTimeout })
   }
 
   if (deliveryTimeout != null) {
-    if (!(Number.isInteger(deliveryTimeout) && deliveryTimeout >= 1)) {
+    if (!(
+      Number.isInteger(deliveryTimeout) &&
+      deliveryTimeout >= 1 &&
+      deliveryTimeout <= MAX_TIMER_DELAY
+    )) {
       throw new KafkaJSInvalidConfigurationError(
-        `deliveryTimeout must be an integer >= 1, got ${deliveryTimeout}`
+        `deliveryTimeout must be an integer >= 1 and <= ${MAX_TIMER_DELAY}, got ${deliveryTimeout}`
       )
     }
 

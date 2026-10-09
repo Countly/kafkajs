@@ -29,7 +29,9 @@ const producer = kafka.producer({
 | transactionTimeout | The maximum amount of time in ms that the transaction coordinator will wait for a transaction status update from the producer before proactively aborting the ongoing transaction. If this value is larger than the `transaction.max.timeout.ms` setting in the __broker__, the request will fail with a `InvalidTransactionTimeout` error | `60000`                            |
 | idempotent         | Write every message exactly once per partition, in order, even when a request is retried (KIP-679). On unless `false` is passed: the producer allocates a producer id at `connect()` and needs `acks` -1 on every send, at most 5 requests in flight per connection and `retry.retries` of at least 1. A setting that conflicts turns idempotence off with one warning, or throws when `idempotent: true` or a `transactionalId` asked for it — see [Idempotence](#idempotence). If `retry.retries` is set below `5` a warning is logged that EoS guarantees may be invalidated. | `true`                            |
 | maxInFlightRequests | Max number of requests in progress per broker connection; `null` means no limit. Above 5, or `null`, is more than an idempotent producer allows — see [Idempotence](#idempotence). | `5` |
-| deliveryTimeout | Upper bound, in ms, on one `send()`/`sendBatch()`, retries included. Past it the send rejects with `KafkaJSDeliveryTimeout`, its `cause` the last error; running out of `retry.retries` first still rejects with `KafkaJSNumberOfRetriesExceeded`. An integer of at least `linger + requestTimeout` (`linger` is 0 unless the accumulator is on). | unset (no deadline) |
+| linger | Turns the [accumulator](#accumulator) on: ms a batch of one partition waits for records from further sends before it goes out. An integer from 0 to 2147483647 | off; `5` once `batchSize` is set |
+| batchSize | Turns the [accumulator](#accumulator) on: bytes of message keys and values at which a batch goes out without waiting for `linger`. An integer of at least 1 | off; `16384` once `linger` is set |
+| deliveryTimeout | Upper bound, in ms, on one `send()`/`sendBatch()`, retries included. Past it the send rejects with `KafkaJSDeliveryTimeout`, its `cause` the last error; running out of `retry.retries` first still rejects with `KafkaJSNumberOfRetriesExceeded`. An integer of at least `linger + requestTimeout` (`linger` is 0 unless the accumulator is on) and at most 2147483647. With the accumulator on and `idempotent: false`, the bound runs from the moment a batch goes out, so a send can take up to `deliveryTimeout + linger`. With the accumulator on, the bound includes waiting for the producer id, as in the Java client. | unset (no deadline) |
 
 ## <a name="idempotence"></a> Idempotence
 
@@ -45,11 +47,26 @@ A producer is idempotent unless it is created with `idempotent: false`: it alloc
 
 ### <a name="delivery-timeout"></a> Delivery timeout
 
-`deliveryTimeout` bounds how long one `send()` or `sendBatch()` may take, retries included (KIP-91). It has no default; when it is set it must be at least `linger + requestTimeout`, so that one request can complete after the accumulator's wait.
+`deliveryTimeout` bounds how long one `send()` or `sendBatch()` may take, retries included (KIP-91). It has no default; when it is set it must be at least `linger + requestTimeout`, so that one request can complete after the accumulator's wait, and at most 2147483647, the longest delay a Node.js timer takes.
 
 ```javascript
 const producer = kafka.producer({ deliveryTimeout: 120000 })
 ```
+
+### <a name="accumulator"></a> Accumulator
+
+By default every `send()` and `sendBatch()` goes out as its own request. Passing `linger` or `batchSize` turns the accumulator on (the other one then takes the Java client's default: `linger` 5 ms, `batchSize` 16384): the records of several sends to one topic-partition are gathered into one batch, in the order their records reach the accumulator, normally the order the sends were made, and go out together - so a busy partition sends fewer, larger requests. It works the same with or without idempotence.
+
+```javascript
+const producer = kafka.producer({ linger: 10, batchSize: 65536 })
+```
+
+- A batch goes out `linger` ms after its first records arrived, or as soon as its keys and values reach `batchSize` bytes. Records that would take it past `batchSize` start the next batch, and the records of one send are never split: a send larger than `batchSize` goes out on its own. Batches of different partitions that are due at the same moment go out together, so they can share a request.
+- An idempotent producer keeps one batch of a partition in flight at a time. While it waits for that batch's answer, the partition's next batch stays open past its `linger` and keeps gathering records, up to `batchSize`, and goes out when the answer arrives - as the Java client does - so a busy partition sends batches as large as its round trip allows rather than many small ones queued behind each other.
+- A send whose `acks`, `timeout` or `compression` differs from the batch waiting for its partition sends that batch first and starts a new one. A send with `acks` 0 or 1 that turns idempotence off sends every waiting batch first, while they still carry the producer id.
+- A send resolves once every batch carrying its records has been acknowledged, with one `RecordMetadata` per partition whose `baseOffset` is the offset of its own first record there, and rejects with the error of the batch that failed - the sends that share a batch succeed or fail together. On an idempotent producer `deliveryTimeout` counts from the moment the batch's first send was made, so with the accumulator on the bound includes waiting for the producer id, as in the Java client; without idempotence, from the moment the batch goes out.
+- A record whose key, value, header values or timestamp cannot be encoded fails its own send at once with `KafkaJSInvalidConfigurationError`, before it joins a batch: a key, value or header value must be a string, a `Buffer` or `null` (header values: not `null`), and a timestamp must hold an integer - a number, a numeric string, a `Date`, a `BigInt` or a `Long`.
+- A transaction's `commit()` and `abort()` send its waiting batches at once - `abort()` then rejects them with the rest of the transaction's queued batches - and `producer.disconnect()` sends every waiting batch, and every send begun before it, and waits for them before it disconnects, refusing new sends meanwhile, so nothing accumulated is lost.
 
 ## Producing messages
 
@@ -277,7 +294,7 @@ goes to a partition picked uniformly at random among those with a leader (among 
 none has a leader — the pick can land on the same partition again). The stickiness carries across
 `send()` calls, but each `send()` still goes out as its own request: the keyless records of one
 `send()` with many messages fill a few batches instead of one record per partition, and records
-from separate `send()` calls share a batch only when the opt-in accumulator (`linger`) is on. A
+from separate `send()` calls share a batch only when the opt-in [accumulator](#accumulator) is on. A
 record with an explicit `partition` goes there. Keyed records keep
 `DefaultPartitioner`'s mapping, so topics co-partitioned with Java producers stay co-partitioned —
 unless you pass `ignoreKeys: true`.

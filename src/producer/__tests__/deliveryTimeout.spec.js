@@ -62,6 +62,25 @@ describe('Producer > deliveryTimeout', () => {
       expect(() => createKafka().producer(options)).toThrow(message)
     })
 
+    test.each([
+      ['linger', /linger must be an integer >= 0 and <= 2147483647, got 2147483648/],
+      [
+        'deliveryTimeout',
+        /deliveryTimeout must be an integer >= 1 and <= 2147483647, got 2147483648/,
+      ],
+    ])(
+      '%s is accepted up to 2147483647 ms, the longest timer delay, and refused above it',
+      (option, message) => {
+        const kafka = createKafka()
+
+        expect(() => kafka.producer({ [option]: 2147483647 })).not.toThrow()
+        expect(() => kafka.producer({ [option]: 2147483648 })).toThrow(
+          KafkaJSInvalidConfigurationError
+        )
+        expect(() => kafka.producer({ [option]: 2147483648 })).toThrow(message)
+      }
+    )
+
     test('unset, nothing is checked and no deadline applies', () => {
       expect(() => createKafka({ requestTimeout: 1000 }).producer()).not.toThrow()
     })

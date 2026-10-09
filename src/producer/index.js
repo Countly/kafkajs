@@ -75,6 +75,12 @@ module.exports = ({
   instrumentationEmitter: rootInstrumentationEmitter,
 }) => {
   let connectionStatus = CONNECTION_STATUS.DISCONNECTED
+  /**
+   * @type {Promise<void>|null} while `disconnect()` delivers the accumulated batches: every send,
+   *   the producer's own and its transactions', is refused, and concurrent calls share it
+   */
+  let closing = null
+  const isClosing = () => closing !== null
   const logger = rootLogger.namespace('Producer')
   const transactional = Boolean(transactionalId)
   const idempotence = new Idempotence({
@@ -123,7 +129,7 @@ module.exports = ({
     retry: retryOptions,
   })
 
-  const { send, sendBatch, ensureInitialized } = createMessageProducer({
+  const { send, sendBatch, ensureInitialized, close } = createMessageProducer({
     logger,
     cluster,
     partitioner,
@@ -132,7 +138,10 @@ module.exports = ({
     retrier,
     retry: retryOptions,
     deliveryTimeout,
+    linger,
+    batchSize,
     getConnectionStatus: () => connectionStatus,
+    isClosing,
     instrumentationEmitter,
     INITIALIZED,
   })
@@ -210,9 +219,12 @@ module.exports = ({
         retrier,
         retry: retryOptions,
         deliveryTimeout,
+        linger,
+        batchSize,
         eosManager: transactionalEosManager,
         idempotence,
         getConnectionStatus: () => connectionStatus,
+        isClosing,
         instrumentationEmitter,
         INITIALIZED,
       })
@@ -307,19 +319,21 @@ module.exports = ({
       sendBatch: transactionGuard(sendBatchTxn),
       send: transactionGuard(sendTxn),
       /**
-       * Abort the ongoing transaction: rejects the batches still queued, waits for the rest of the
-       * transaction's operations, then aborts it. It ends the transaction even when the abort
-       * fails, unless the producer is unusable. A rejected batch that was already sent once leaves
-       * its sequence spent, so the abort then moves the producer to a new epoch (see `abort()` on
-       * the eosManager). Called while a `commit()` of the transaction is under way, it rejects no
-       * batch and waits for the commit: the commit keeps every record, and the abort is refused if
-       * the commit ended the transaction.
+       * Abort the ongoing transaction: rejects the batches still queued - accumulated ones
+       * included - waits for the rest of the transaction's operations, then aborts it. It ends the
+       * transaction even when the abort fails, unless the producer is unusable. A rejected batch
+       * that was already sent once leaves its sequence spent, so the abort then moves the producer
+       * to a new epoch (see `abort()` on the eosManager). Called while a `commit()` of the
+       * transaction is under way, it rejects no batch and waits for the commit: the commit keeps
+       * every record, and the abort is refused if the commit ended the transaction.
        *
        * @throws {KafkaJSNonRetriableError} If transaction has ended
        * @throws {import('../errors').KafkaJSApplicationRecoverableError} once the producer is
        *   unusable
        */
       abort: () => {
+        // The accumulated batches join the queue, so the abort rejects them with the rest.
+        transactionalMessageProducer.flush()
         const dropped =
           ending === null && stateManager.state() === IN_TRANSACTION
             ? stateManager.sequencer.abortQueued(
@@ -329,16 +343,24 @@ module.exports = ({
               )
             : []
         const droppedSequences = dropped.some(({ firstSequence }) => firstSequence !== null)
-        return endWith(() => transactionalEosManager.abort({ droppedSequences }))
+        const ended = endWith(() => transactionalEosManager.abort({ droppedSequences }))
+        transactionalMessageProducer.flush(ended)
+        return ended
       },
       /**
-       * Commit the ongoing transaction, once every send and `sendOffsets` of it has settled.
+       * Commit the ongoing transaction, once every send and `sendOffsets` of it has settled. The
+       * transaction's accumulated batches are sent at once rather than after their `linger`, and so
+       * is every batch its sends form until the commit ends.
        *
        * @throws {KafkaJSNonRetriableError} If transaction has ended
        * @throws {import('../errors').KafkaJSTransactionAbortableError} the armed error, when an
        *   operation of the transaction failed; nothing is sent to the broker then
        */
-      commit: () => endWith(() => transactionalEosManager.commit()),
+      commit: () => {
+        const ended = endWith(() => transactionalEosManager.commit())
+        transactionalMessageProducer.flush(ended)
+        return ended
+      },
       /**
        * Sends a list of specified offsets to the consumer group coordinator, and also marks those
        * offsets as part of the current transaction. Takes the consumer's `consumerGroupMetadata`
@@ -378,6 +400,18 @@ module.exports = ({
    */
   const getLogger = () => logger
 
+  /**
+   * Delivers every accumulated batch, the producer's own and its transaction's, while every send
+   * is refused, then leaves the producer `DISCONNECTING`. Concurrent calls share one delivery.
+   * @returns {Promise<void>} never rejects
+   */
+  const deliverAccumulated = () =>
+    (closing ??= Promise.all([close(), transactionalMessageProducer?.close()]).then(() => {
+      // In one step, so no send passes between the gate and the status.
+      connectionStatus = CONNECTION_STATUS.DISCONNECTING
+      closing = null
+    }))
+
   return {
     /**
      * @returns {Promise}
@@ -396,9 +430,15 @@ module.exports = ({
       await ensureInitialized()
     },
     /**
+     * Disconnects the producer. With the accumulator on, it first delivers every batch still
+     * lingering, its own and its transaction's, and the sends begun before it, refusing new sends
+     * meanwhile; nothing accumulated is lost.
      * @return {Promise}
      */
     disconnect: async () => {
+      if (linger !== undefined) {
+        await deliverAccumulated()
+      }
       connectionStatus = CONNECTION_STATUS.DISCONNECTING
       await cluster.disconnect()
       connectionStatus = CONNECTION_STATUS.DISCONNECTED

@@ -165,6 +165,17 @@ describe('Retry > maxTotalTime, the delay clamp and the shared backoff', () => {
     }
   })
 
+  test('a maxTotalTime is accepted up to 2147483647 ms, the longest timer delay, and refused above it', () => {
+    const build = () => createRetry({ maxTotalTime: 2147483648 })
+
+    expect(() => createRetry({ maxTotalTime: 2147483647 })).not.toThrow()
+    expect(build).toThrow(KafkaJSInvalidConfigurationError)
+    expect(build).toThrow(
+      'retry.maxTotalTime must be an integer of at least 1 and at most 2147483647, got 2147483648'
+    )
+    expect(build).toThrow(expect.objectContaining({ category: 'invalidConfiguration' }))
+  })
+
   test('a factor above 1 never schedules a negative delay', async () => {
     jest.spyOn(Math, 'random').mockReturnValue(0)
     const setTimeoutSpy = jest.spyOn(global, 'setTimeout')
