@@ -73,12 +73,12 @@
       "since": "2026-10-07"
     },
     "EndTxn": {
-      "note": "v5 returns a bumped producer id and epoch under transaction version 2. The TV2 signal is the transaction.version finalized feature in ApiVersions v3+, not EndTxn's advertised max version.",
-      "since": "2026-09-03"
+      "note": "v2 PRODUCER_FENCED, v3 flexible, v4 TRANSACTION_ABORTABLE, v5 returns the producer id and epoch the coordinator bumped to (KIP-890 part 2). A transaction stays at v4 or below unless its coordinator finalizes transaction.version at level 2 or above in ApiVersions v3+; v5 being advertised is not the signal.",
+      "since": "2026-10-08"
     },
     "TxnOffsetCommit": {
-      "note": "v2 adds the committed leader epoch; v3 is KIP-447 group metadata, which the fork does not implement at all.",
-      "since": "2026-09-03"
+      "note": "v2 committed leader epoch, v3 flexible with KIP-447 group metadata (generation, member id, group instance id), v4 TRANSACTION_ABORTABLE, v5 adds the offsets to the transaction itself under transaction version 2, so no AddOffsetsToTxn precedes it. A transaction stays at v4 or below unless its coordinator finalizes transaction.version at level 2 or above.",
+      "since": "2026-10-08"
     },
     "DescribeAcls": {
       "note": "v1 is the 4.x floor and is also the fork's maximum.",

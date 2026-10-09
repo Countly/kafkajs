@@ -15,6 +15,38 @@ const versions = {
       response,
     }
   },
+  2: ({ transactionalId, producerId, producerEpoch, transactionResult }) => {
+    const request = require('./v2/request')
+    const response = require('./v2/response')
+    return {
+      request: request({ transactionalId, producerId, producerEpoch, transactionResult }),
+      response,
+    }
+  },
+  3: ({ transactionalId, producerId, producerEpoch, transactionResult }) => {
+    const request = require('./v3/request')
+    const response = require('./v3/response')
+    return {
+      request: request({ transactionalId, producerId, producerEpoch, transactionResult }),
+      response,
+    }
+  },
+  4: ({ transactionalId, producerId, producerEpoch, transactionResult }) => {
+    const request = require('./v4/request')
+    const response = require('./v4/response')
+    return {
+      request: request({ transactionalId, producerId, producerEpoch, transactionResult }),
+      response,
+    }
+  },
+  5: ({ transactionalId, producerId, producerEpoch, transactionResult }) => {
+    const request = require('./v5/request')
+    const response = require('./v5/response')
+    return {
+      request: request({ transactionalId, producerId, producerEpoch, transactionResult }),
+      response,
+    }
+  },
 }
 
 module.exports = {

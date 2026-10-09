@@ -593,12 +593,16 @@
       "latestVersionUnstable": false,
       "forkVersions": [
         0,
-        1
+        1,
+        2,
+        3,
+        4,
+        5
       ],
-      "gap": "behind:4",
+      "gap": "current",
       "onFloor": false,
       "belowFloor": [],
-      "notes": "v5 returns a bumped producer id and epoch under transaction version 2. The TV2 signal is the transaction.version finalized feature in ApiVersions v3+, not EndTxn's advertised max version."
+      "notes": "v2 PRODUCER_FENCED, v3 flexible, v4 TRANSACTION_ABORTABLE, v5 returns the producer id and epoch the coordinator bumped to (KIP-890 part 2). A transaction stays at v4 or below unless its coordinator finalizes transaction.version at level 2 or above in ApiVersions v3+; v5 being advertised is not the signal."
     },
     {
       "kafkaName": "TxnOffsetCommit",
@@ -615,12 +619,16 @@
       "latestVersionUnstable": false,
       "forkVersions": [
         0,
-        1
+        1,
+        2,
+        3,
+        4,
+        5
       ],
-      "gap": "behind:4",
+      "gap": "current",
       "onFloor": false,
       "belowFloor": [],
-      "notes": "v2 adds the committed leader epoch; v3 is KIP-447 group metadata, which the fork does not implement at all."
+      "notes": "v2 committed leader epoch, v3 flexible with KIP-447 group metadata (generation, member id, group instance id), v4 TRANSACTION_ABORTABLE, v5 adds the offsets to the transaction itself under transaction version 2, so no AddOffsetsToTxn precedes it. A transaction stays at v4 or below unless its coordinator finalizes transaction.version at level 2 or above."
     },
     {
       "kafkaName": "DescribeAcls",
