@@ -590,14 +590,17 @@ The producer becomes idempotent by default and transactions move to the transact
   *What to do:* no action. If you run long transactions, note that a rebalancing consumer waits
   for them to resolve instead of reading a position that may be rolled back.
 - **`kafka.producer()` is idempotent by default.** Every send requires `acks: -1` and the
-  producer allocates a producer id at `connect()`. The retry budget is unchanged: every producer
-  keeps its `retry.retries` (5 unless set), as in 2.2.4. `producer.isIdempotent()` reports
+  producer allocates a producer id at `connect()`. The size of the retry budget is unchanged:
+  every producer keeps its `retry.retries` (5 unless set), as in 2.2.4; what it counts is per
+  partition now (the retry items below). `producer.isIdempotent()` reports
   `false` after a configuration turned idempotence off (the `maxInFlightRequests` and `retries`
   items below).
   *What to do:* producers are idempotent unless you pass `idempotent: false`. If you relied on
   `acks: 1` or `acks: 0`, either keep passing it — the producer then logs a warning once and runs
-  non-idempotent — or pass `idempotent: false` explicitly. Nothing about retries changes; if you
-  check `producer.isIdempotent()`, read it after `connect()`.
+  non-idempotent — or pass `idempotent: false` explicitly. `idempotent: false` drops the producer
+  id and the sequence numbers; it does not restore 2.2.4's send path, which every producer shares
+  (the accumulator and per-partition retry items below). If you check `producer.isIdempotent()`,
+  read it after `connect()`.
 - **`idempotent: true` plus `acks` 0 or 1 still throws, with a new class.** The error is now
   `KafkaJSInvalidConfigurationError`, still a `KafkaJSNonRetriableError`, with the same message.
   *What to do:* catch blocks keying on `KafkaJSNonRetriableError` are unaffected; the new class is
@@ -607,7 +610,7 @@ The producer becomes idempotent by default and transactions move to the transact
   producer created with `idempotent: true` and more than 5 in-flight requests now throws at
   construction. *What to do:* if you pass `maxInFlightRequests: null` or a value above 5 and want
   idempotence, lower it to 5 or less; otherwise nothing to do — the producer runs non-idempotent
-  as it did in 2.2.4 and says so once in the log. With `idempotent: true` the combination is
+  and says so once in the log. With `idempotent: true` the combination is
   rejected, as it is in the Java client.
 - **`connect()` can now fail with an authorization error** on a cluster that grants the
   principal neither `IDEMPOTENT_WRITE` nor, from Kafka 2.8, `WRITE` on any topic, because an
@@ -622,7 +625,8 @@ The producer becomes idempotent by default and transactions move to the transact
   producer that is still idempotent with `retries` between 1 and 4 logs the "limiting retries may
   invalidate EoS guarantees" warning — new for a producer that did not pass `idempotent: true`,
   since 2.2.4 logged it only for one that did. *What to do:* nothing for a fail-fast
-  producer: it behaves exactly as in 2.2.4 and says once in the log that idempotence is off. If
+  producer: it still sends each partition once, without retrying, and says once in the log that
+  idempotence is off. If
   you want idempotence with `retries: 0`, you cannot have it — raise `retries`.
 - **A `transactionalId` implies `idempotent: true` explicitly.** A transactional producer never
   downgrades: an `acks`, `maxInFlightRequests` or `retries` conflict throws rather than silently
@@ -644,8 +648,8 @@ The producer becomes idempotent by default and transactions move to the transact
   `KafkaJSLockTimeout` after 65.5 s and emitted `producer.events.LOCK_TIMEOUT` first. Batches of
   different partitions are now pipelined, up to 5 requests per broker (fewer when the
   connection's `maxInFlightRequests` is lower); within one partition a batch waits for the
-  previous one's answer, which keeps the partition in order. A busy partition can gather the
-  records of several sends into each batch with the opt-in `linger` (below). `LOCK_TIMEOUT` can
+  previous one's answer, which keeps the partition in order. A busy partition gathers the records
+  of several sends into each batch while it waits (the accumulator, below). `LOCK_TIMEOUT` can
   no longer be emitted. The event stays declared and the error class stays exported: a `send()`
   registering its topics with the cluster, and connecting to a broker, can still raise
   `KafkaJSLockTimeout`.
@@ -661,15 +665,31 @@ The producer becomes idempotent by default and transactions move to the transact
   before it gives up. The promise still settles once — after every batch has settled — and still
   rejects with one error: the first one any of its batches failed with.
   *What to do:* if you depended on a rejected `send()` meaning "nothing after the failure was
-  written", pass `idempotent: false` for 2.2.4's all-or-nothing bail. If you tune `retry.retries`
-  for worst-case latency, budget it per partition of a send rather than per call.
+  written", check which partitions it wrote: no setting restores the all-or-nothing bail, since an
+  `idempotent: false` producer now settles each partition on its own too (below). If you tune
+  `retry.retries` for worst-case latency, budget it per partition of a send rather than per call.
 
-- **`send()`/`sendBatch()` resolve their `RecordMetadata[]` in a different order** on an
-  idempotent producer (the default): sorted by topic name, then partition ascending. 2.2.4's order
-  was grouped by the broker that led each partition, in the order the call listed its topics — an
+- **An `idempotent: false` producer settles and retries each partition on its own, too.** In
+  2.2.4 a `send()` was retried as a whole call: a failed request was sent again with every
+  partition it carried, written ones included, and an error that is not retriable bailed the call.
+  Now each partition's batch settles on its own answer, as in the Java client: one written
+  resolves at once and is never sent again, so a retriable error on one partition no longer writes
+  the others twice; one refused with an error that is not retriable rejects alone; and only the
+  partitions whose answer was retriable go out again, within one `retry.retries` budget shared by
+  the partitions that went out together; a topic or broker that cannot be looked up holds back
+  only its own partitions, and the slowest broker of an attempt paces the next one. Sends to
+  different partitions that shared a request no longer share each other's failure, and a rejected
+  `send()` may have written its other partitions. Records are assigned to partitions once, before they are sent, under a retry budget
+  of their own, so waiting for a topic's metadata no longer spends the send's retries.
+  *What to do:* nothing, unless you relied on a rejected `send()` writing nothing: check the
+  partitions it wrote. `retry: { retries: 0 }` still sends each partition once.
+
+- **`send()`/`sendBatch()` resolve their `RecordMetadata[]` in a different order** on every
+  producer, idempotent or not: sorted by topic name, then partition ascending. 2.2.4's order was
+  grouped by the broker that led each partition, in the order the call listed its topics — an
   artifact of how the request was split, not a documented contract — so a multi-broker send, or a
   send listing its topics out of name order, returns the same entries in a different sequence.
-  Every entry still carries `topicName` and `partition`. The non-idempotent path is unchanged.
+  Every entry still carries `topicName` and `partition`; sorting changes no request.
   *What to do:* match results by `topicName`/`partition` rather than by array index. A
   single-partition send is unaffected; so is any caller that already reads the fields.
 
@@ -697,7 +717,7 @@ The producer becomes idempotent by default and transactions move to the transact
   `KafkaJSNumberOfRetriesExceeded`. A batch dropped because the producer was disconnecting or
   disconnected ends the transaction the same way; a fault in the client's own send loop makes the
   producer unusable; and an error the client raised itself rather than the broker — a `TypeError`
-  while encoding a header value or an offset — makes the transaction abort-only as a
+  while encoding an offset, say — makes the transaction abort-only as a
   `KafkaJSTransactionAbortableError` whose `cause` is that error, leaving the producer usable. A
   batch that had been sent before it gave up may have been written all the same, so its partition's
   sequence stays unresolved: `commit()` and `abort()` check every partition's sequence before
@@ -712,7 +732,8 @@ The producer becomes idempotent by default and transactions move to the transact
   (KIP-360) when the transaction was abort-only, as the Java client does, or when it cancelled a
   batch that had already been sent once; under either version it does so when its own `EndTxn`
   failed. A send refused before any record was queued — for its own arguments (an empty topic, a
-  message without a value) or by a custom partitioner that threw — leaves the transaction as it was.
+  message without a value, a record that cannot be encoded) or by a custom partitioner that threw —
+  leaves the transaction as it was.
   *What to do:* wrap the transaction in `try` and, on any error, `abort()` first. A send rejects
   with its own error — the broker's, such as a `KafkaJSProtocolError` with code 90 when another
   producer took over the `transactionalId` — and the wrapper classes come from `commit()`, `abort()`
@@ -743,14 +764,57 @@ The producer becomes idempotent by default and transactions move to the transact
   classic-protocol member sees code 22 and a `groupProtocol: 'consumer'` member sees 113 for the
   same condition.
 
-- **Four opt-ins, none of them on by default**: the accumulator (`linger`, `batchSize`), which
-  gathers the records of several sends to one partition into one batch;
-  `Partitioners.UniformStickyPartitioner`; `deliveryTimeout`; and `leaderEpoch` on the partitions
-  given to `sendOffsets`. With the accumulator on, a send resolves only once the batch carrying its
-  records has been acknowledged, sends that shared a batch succeed or fail together, and a record
-  whose key, value, header values or timestamp cannot be encoded fails its own send at once, with
-  `KafkaJSInvalidConfigurationError`.
-  *What to do:* nothing. Without them the producer behaves as it did.
+- **Every producer gathers sends into batches, so a `send()` may wait up to 5 ms before its
+  request leaves.** The accumulator is on for every producer, idempotent or not, with the Java
+  client's defaults: `linger` 5 ms (Java's `linger.ms` moved from 0 to 5 in Kafka 4.0) and
+  `batchSize` 16384 bytes of keys and values. In 2.2.4 every `send()` and `sendBatch()` was its own
+  request; now the records of sends made within `linger` of each other to one topic-partition
+  share a batch, a batch goes out once it reaches `batchSize`, and one `send()` or `sendBatch()`
+  usually makes one Produce request per broker: its records that join a batch an earlier send
+  began leave with that batch, so one call can reach a broker in two requests. On an idempotent
+  producer a partition's next batch also keeps gathering sends while the batch before it waits for
+  its answer.
+  *What to do:* nothing for code that sends without awaiting each send. Code that awaits every
+  `send()` before the next one waits up to `linger` each time: pass `linger: 0`, which sends at
+  once, with no timer, and on an idempotent producer still merges the sends that queue behind a
+  partition's batch in flight.
+  No setting restores one request per `send()`; the Java client has none either.
+
+- **Sends to one topic-partition can share a batch, and then succeed or fail together.** A batch
+  is one unit on the wire: when the broker rejects it, every send whose records it carries rejects
+  with that error, and when it is written, every one of them resolves — each with the
+  `baseOffset` of its own first record.
+  *What to do:* treat a rejected send as before. Keep `batchSize` below the topic's
+  `max.message.bytes`, so a merged batch is never refused for its size; header bytes are not
+  counted in `batchSize`.
+
+- **A record that cannot be encoded rejects its own send with `KafkaJSInvalidConfigurationError`**
+  (`category` `'invalidConfiguration'`), before it joins a batch, instead of a `TypeError` failing
+  every send of its request. A key, value or header value must be a string, a `Buffer` or `null`
+  (header values: not `null`), and a timestamp must hold an integer — a number, a numeric string,
+  a `Date`, a `BigInt` or a `Long`. Inside a transaction such a send leaves the transaction as it
+  was.
+  *What to do:* code that caught a `TypeError` from `send()` catches
+  `KafkaJSInvalidConfigurationError` instead, and fixes the record.
+
+- **`producer.disconnect()` delivers before it disconnects.** It sends every waiting batch, its
+  own and its transaction's, and waits for every send begun before it — retries included, up to
+  `deliveryTimeout` or the retry budget — refusing new sends meanwhile. 2.2.4 disconnected at once,
+  failing the sends still under way.
+  *What to do:* nothing for a clean shutdown. A shutdown with a hard time limit, such as a
+  container's grace period, can wait out the retry budget while the cluster is unreachable: set
+  `deliveryTimeout` to bound each send, or race `disconnect()` against a timer.
+
+- **`deliveryTimeout` counts the wait for `linger` and for the producer id.** A send's deadline
+  starts when the send is made, as the Java client's does, so the `linger` wait - and on an
+  idempotent producer the `InitProducerId` wait - count against it, and its floor is
+  `linger + requestTimeout`: 30005 ms with both defaults.
+  *What to do:* nothing unless you set `deliveryTimeout`, new in this release: give it at least
+  `linger + requestTimeout`.
+
+- **Three opt-ins, none of them on by default**: `Partitioners.UniformStickyPartitioner`;
+  `deliveryTimeout`; and `leaderEpoch` on the partitions given to `sendOffsets`.
+  *What to do:* nothing; leaving them unset changes nothing beyond the items above.
 
 ### TypeScript: source-breaking type changes
 

@@ -375,6 +375,33 @@ describe('Producer > options: the idempotent default and the settings that confl
     })
   })
 
+  describe('the accumulator', () => {
+    afterEach(() => {
+      jest.useRealTimers()
+    })
+
+    test.each([
+      ['an idempotent producer', {}],
+      ['an idempotent: false producer', { idempotent: false }],
+    ])(
+      '%s from kafka.producer() holds a lone send for linger, 5 ms by default',
+      async (_, options) => {
+        jest.useFakeTimers({ now: 0 })
+        const producer = createKafka().producer(options)
+        await producer.connect()
+        const { produce } = lastCluster().broker
+
+        const sent = producer.send({ topic: TOPIC, messages: MESSAGES })
+        await jest.advanceTimersByTimeAsync(4)
+        expect(produce).not.toHaveBeenCalled()
+        await jest.advanceTimersByTimeAsync(1)
+
+        expect(produce).toHaveBeenCalledTimes(1)
+        await expect(sent).resolves.toEqual([expect.objectContaining({ topicName: TOPIC })])
+      }
+    )
+  })
+
   describe('created directly', () => {
     const logger = () => createLogger({ level: LEVELS.NOTHING, logCreator: () => () => {} })
 

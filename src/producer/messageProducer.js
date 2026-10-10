@@ -7,7 +7,7 @@ const sharedPromiseTo = require('../utils/sharedPromiseTo')
 
 /**
  * `send()`/`sendBatch()` over one eosManager: validation, the `acks` rule of an idempotent
- * producer, the shared lazy `InitProducerId`, the opt-in accumulator, and the send itself.
+ * producer, the shared lazy `InitProducerId`, and the accumulator every send goes through.
  * @param {object} options
  * @param {import('../../types').Logger} options.logger
  * @param {import('../../types').Cluster} options.cluster
@@ -19,10 +19,8 @@ const sharedPromiseTo = require('../utils/sharedPromiseTo')
  * @param {import('../../types').RetryOptions} options.retry the producer's retry options, merged
  *   over the client's
  * @param {number} [options.deliveryTimeout] the producer's delivery deadline in ms
- * @param {number} [options.linger] turns the accumulator on, with `batchSize`: ms a batch waits
- *   for more records
- * @param {number} [options.batchSize] bytes of keys and values at which an accumulated batch is
- *   sent
+ * @param {number} options.linger ms a batch waits for more records; 0 sends it at once
+ * @param {number} options.batchSize bytes of keys and values at which a batch is sent
  * @param {() => string} options.getConnectionStatus
  * @param {() => boolean} options.isClosing whether the producer's `disconnect()` is delivering
  *   the accumulated batches: sends are refused and batches no longer linger
@@ -78,17 +76,13 @@ module.exports = ({
         logger,
         cluster,
         retrier,
+        retry,
+        deliveryTimeout,
         partitioner,
         eosManager: createEosManager({ logger, cluster, transactional: false }),
       })
     return plainSend
   }
-
-  /**
-   * @param {object} request
-   * @returns {Promise<object[]>}
-   */
-  const sendMessages = (request) => sendPath()(request)
 
   const validateConnectionStatus = () => {
     const status = isClosing() ? CONNECTION_STATUS.DISCONNECTING : getConnectionStatus()
@@ -98,38 +92,35 @@ module.exports = ({
     }
   }
 
-  const accumulator =
-    linger === undefined
-      ? null
-      : new Accumulator({
-          linger,
-          batchSize,
-          partition: async (topicMessages) => {
-            await ensureInitialized()
-            return idempotentSend.partition(topicMessages)
-          },
-          sendPartitioned: (request) => {
-            const error = createSendMessages.connectionStatusError(getConnectionStatus())
-            return error === null ? sendPath().sendPartitioned(request) : Promise.reject(error)
-          },
-          lingers: () =>
-            !isClosing() && hurried === 0 && getConnectionStatus() === CONNECTION_STATUS.CONNECTED,
-          holds: () => idempotence.isEnabled(),
-          deadline: deliveryTimeout ?? retry.maxTotalTime,
-        })
+  const accumulator = new Accumulator({
+    linger,
+    batchSize,
+    partition: async (topicMessages) => {
+      await ensureInitialized()
+      return idempotentSend.partition(topicMessages)
+    },
+    sendPartitioned: (request) => {
+      // The idempotent path refuses the batches of a producer that is not connected itself, and
+      // arms a transaction with the refusal; the plain path would send them.
+      const error = idempotence.isEnabled()
+        ? null
+        : createSendMessages.connectionStatusError(getConnectionStatus())
+      return error === null ? sendPath().sendPartitioned(request) : Promise.reject(error)
+    },
+    lingers: () =>
+      !isClosing() && hurried === 0 && getConnectionStatus() === CONNECTION_STATUS.CONNECTED,
+    holds: () => idempotence.isEnabled(),
+    deadline: deliveryTimeout ?? retry.maxTotalTime,
+  })
 
   /**
    * Hands every accumulated batch to the send path now and, until `until` settles, every batch
    * that forms meanwhile as soon as it forms - the sends of a transaction that is ending wait for
-   * no `linger`. A no-op without the accumulator.
+   * no `linger`.
    * @param {Promise<unknown>} [until]
    * @returns {Promise<void>} settles once the batches pending now have settled; never rejects
    */
   const flush = (until) => {
-    if (accumulator === null) {
-      return Promise.resolve()
-    }
-
     if (until !== undefined) {
       hurried += 1
       const done = () => {
@@ -146,7 +137,7 @@ module.exports = ({
    * join one only now included. The producer refuses new sends meanwhile (`isClosing`).
    * @returns {Promise<void>} never rejects
    */
-  const close = () => (accumulator === null ? Promise.resolve() : accumulator.close())
+  const close = () => accumulator.close()
 
   /**
    * A transient InitProducerId failure during connect() must not poison the producer for the
@@ -223,9 +214,6 @@ module.exports = ({
     }
 
     validateConnectionStatus()
-    if (accumulator === null) {
-      await ensureInitialized()
-    }
 
     const mergedTopicMessages = topicMessages.reduce((merged, { topic, messages }) => {
       const index = merged.findIndex(({ topic: mergedTopic }) => topic === mergedTopic)
@@ -239,9 +227,13 @@ module.exports = ({
       return merged
     }, [])
 
-    const request = { acks, timeout, compression, topicMessages: mergedTopicMessages }
     // The accumulator acquires the producer id itself, so `close()` waits for this send from here.
-    return await (accumulator === null ? sendMessages(request) : accumulator.append(request))
+    return await accumulator.append({
+      acks,
+      timeout,
+      compression,
+      topicMessages: mergedTopicMessages,
+    })
   }
 
   /**

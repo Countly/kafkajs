@@ -50,6 +50,14 @@
   "metadata": [
     {
       "topicName": "baseline-topic-a",
+      "partition": 0,
+      "errorCode": 0,
+      "baseOffset": "2000",
+      "logAppendTime": "-1",
+      "logStartOffset": "0"
+    },
+    {
+      "topicName": "baseline-topic-a",
       "partition": 1,
       "errorCode": 0,
       "baseOffset": "1001",
@@ -61,14 +69,6 @@
       "partition": 0,
       "errorCode": 0,
       "baseOffset": "1000",
-      "logAppendTime": "-1",
-      "logStartOffset": "0"
-    },
-    {
-      "topicName": "baseline-topic-a",
-      "partition": 0,
-      "errorCode": 0,
-      "baseOffset": "2000",
       "logAppendTime": "-1",
       "logStartOffset": "0"
     }

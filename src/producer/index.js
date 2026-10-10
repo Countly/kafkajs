@@ -38,6 +38,12 @@ const endedTransactionError = () =>
   new KafkaJSNonRetriableError('Cannot continue to use transaction once ended')
 
 /**
+ * The accumulator's defaults: the Java client's 4.x `linger.ms` and `batch.size`.
+ * @see https://github.com/apache/kafka/blob/4.3/clients/src/main/java/org/apache/kafka/clients/producer/ProducerConfig.java
+ */
+const DEFAULTS = Object.freeze({ linger: 5, batchSize: 16384 })
+
+/**
  *
  * @param {Object} params
  * @param {import('../../types').Cluster} params.cluster
@@ -50,9 +56,8 @@ const endedTransactionError = () =>
  *   or `acks` an error instead of a reason to turn idempotence off with a warning
  * @param {string} [params.transactionalId]
  * @param {number} [params.transactionTimeout]
- * @param {number} [params.linger] ms an accumulated batch waits for more records; set together
- *   with `batchSize`, or neither
- * @param {number} [params.batchSize] bytes at which an accumulated batch is sent
+ * @param {number} [params.linger=5] ms a batch waits for more records; 0 sends it at once
+ * @param {number} [params.batchSize=16384] bytes of keys and values at which a batch is sent
  * @param {number} [params.deliveryTimeout] ms one send may take, retries included; past it the
  *   send rejects with `KafkaJSDeliveryTimeout`
  * @param {InstrumentationEventEmitter} [params.instrumentationEmitter]
@@ -61,7 +66,7 @@ const endedTransactionError = () =>
  * @throws {KafkaJSInvalidConfigurationError} `retry.retries` below 1 on a producer that asked for
  *   idempotence
  */
-module.exports = ({
+const createProducer = ({
   cluster,
   logger: rootLogger,
   createPartitioner = DefaultPartitioner,
@@ -69,8 +74,8 @@ module.exports = ({
   idempotent,
   transactionalId,
   transactionTimeout,
-  linger,
-  batchSize,
+  linger = DEFAULTS.linger,
+  batchSize = DEFAULTS.batchSize,
   deliveryTimeout,
   instrumentationEmitter: rootInstrumentationEmitter,
 }) => {
@@ -430,16 +435,13 @@ module.exports = ({
       await ensureInitialized()
     },
     /**
-     * Disconnects the producer. With the accumulator on, it first delivers every batch still
-     * lingering, its own and its transaction's, and the sends begun before it, refusing new sends
-     * meanwhile; nothing accumulated is lost.
+     * Disconnects the producer. It first delivers every batch still lingering, its own and its
+     * transaction's, and the sends begun before it, refusing new sends meanwhile; nothing
+     * accumulated is lost.
      * @return {Promise}
      */
     disconnect: async () => {
-      if (linger !== undefined) {
-        await deliverAccumulated()
-      }
-      connectionStatus = CONNECTION_STATUS.DISCONNECTING
+      await deliverAccumulated()
       await cluster.disconnect()
       connectionStatus = CONNECTION_STATUS.DISCONNECTED
       instrumentationEmitter.emit(DISCONNECT)
@@ -457,3 +459,8 @@ module.exports = ({
     logger: getLogger,
   }
 }
+
+/** The accumulator's defaults, `linger` and `batchSize`, for every producer. */
+createProducer.defaults = DEFAULTS
+
+module.exports = createProducer

@@ -525,7 +525,7 @@ regexConsumer.on(regexConsumer.events.REBALANCING, e => {
   }
 })
 
-// The producer options: idempotent by default, the opt-in accumulator and delivery deadline, and
+// The producer options: idempotent by default, the accumulator and the delivery deadline, and
 // the retrier's deadline; every 2.2.4 form still compiles.
 kafka.producer({ idempotent: true, maxInFlightRequests: 5 })
 kafka.producer({ idempotent: false, transactionalId: 'tx', transactionTimeout: 30000 })

@@ -237,11 +237,13 @@ class RecordingConnectionPool {
   async destroy() {}
 
   /**
-   * @param {{ request: object }} protocolRequest what `Broker` sends
-   * @returns {Promise<object|null>} the decoded-and-parsed response `Broker` would return; `null`
-   *   for a request that expects none (`acks: 0`)
+   * @param {{ request: object, response: { parse: Function } }} protocolRequest what `Broker`
+   *   sends
+   * @returns {Promise<object|null>} what the request's own `response.parse` makes of the decoded
+   *   success answer, as a connection returns it; `null` for a request that expects none
+   *   (`acks: 0`)
    */
-  async send({ request }) {
+  async send({ request, response }) {
     if (request.apiKey === apiKeys.ApiVersions) {
       return API_VERSIONS_RESPONSE
     }
@@ -258,7 +260,7 @@ class RecordingConnectionPool {
       return null
     }
 
-    return {
+    return response.parse({
       topics: this.topicData.map(({ topic, partitions }) => ({
         topicName: topic,
         partitions: partitions.map(({ partition }) => ({
@@ -269,7 +271,7 @@ class RecordingConnectionPool {
           logStartOffset: '0',
         })),
       })),
-    }
+    })
   }
 }
 

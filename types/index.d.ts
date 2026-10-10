@@ -119,22 +119,22 @@ export interface ProducerConfig {
    */
   maxInFlightRequests?: number | null
   /**
-   * Opt-in accumulator: ms a partition's batch waits for records of further sends. An integer
-   * from 0 to 2147483647. Off unless `linger` or `batchSize` is passed; the other one then takes
-   * the Java default (5 ms / 16384 bytes).
+   * ms a partition's batch waits for records of further sends before it goes out. An integer
+   * from 0 to 2147483647; defaults to 5 (Java parity). A lone send waits up to this long; 0 sends
+   * at once - on an idempotent producer still merging the sends that queue behind a partition's
+   * batch in flight.
    */
   linger?: number
   /**
-   * Opt-in accumulator: bytes of keys and values at which a batch is sent without waiting for
-   * `linger`. An integer of at least 1. Off unless `linger` or `batchSize` is passed; the other
-   * one then takes the Java default (5 ms / 16384 bytes).
+   * Bytes of keys and values at which a batch is sent without waiting for `linger`. An integer of
+   * at least 1; defaults to 16384 (Java parity).
    */
   batchSize?: number
   /**
    * Opt-in upper bound, in ms, on one send, retries included (KIP-91); past it the send rejects
-   * with `KafkaJSDeliveryTimeout`. An integer of at least `linger + requestTimeout` (`linger`
-   * counts as 0 while the accumulator is off) and at most 2147483647. With the accumulator on,
-   * the bound includes waiting for the producer id.
+   * with `KafkaJSDeliveryTimeout`. An integer of at least `linger + requestTimeout` (5 ms more
+   * than `requestTimeout` at the default `linger`) and at most 2147483647. The bound runs from the
+   * send and includes the wait for `linger` and, on an idempotent producer, for the producer id.
    */
   deliveryTimeout?: number
 }

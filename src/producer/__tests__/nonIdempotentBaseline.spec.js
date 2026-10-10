@@ -41,10 +41,13 @@ describe('Producer > idempotent: false, against the captured baseline of the sen
     expect(await captureMetadataOrder(METADATA_ORDER_CASE)).toEqual(capturedMetadataOrder)
   })
 
-  test('that order is grouped by the broker that led each partition, not sorted', () => {
+  test('that order is by topic, then partition, not grouped by the broker that led each partition', () => {
     const order = capturedMetadataOrder.metadata.map(metadataKey)
 
-    expect(order).toEqual(['baseline-topic-a/1', 'baseline-topic-b/0', 'baseline-topic-a/0'])
-    expect(order).not.toEqual([...order].sort())
+    expect(order).toEqual(['baseline-topic-a/0', 'baseline-topic-a/1', 'baseline-topic-b/0'])
+    expect(capturedMetadataOrder.input.leaders).toEqual({
+      'baseline-topic-a': { 0: 2, 1: 1 },
+      'baseline-topic-b': { 0: 1 },
+    })
   })
 })

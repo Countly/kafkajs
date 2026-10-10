@@ -1156,8 +1156,9 @@ class DrainLoop {
 
 /**
  * The send path. An idempotent producer's sends go through the drain loop above; every other
- * send runs the per-broker requests of a non-idempotent producer, retried as a whole by
- * `retrier`, exactly as before the drain loop existed.
+ * send runs the per-broker requests of a non-idempotent producer, retried by `retrier`: records
+ * already assigned to partitions settle and retry per partition, other records as a whole call,
+ * as before the drain loop existed.
  *
  * @param {Object} options
  * @param {import("../../types").Logger} options.logger
@@ -1209,17 +1210,125 @@ const createSendMessages = ({
   }
 
   /**
-   * The non-idempotent send: one request per leader, the whole call retried by `retrier`.
+   * Gets the cluster ready for the next attempt after a failed produce, as the non-idempotent send
+   * always has: a closed connection's broker is dropped, a leader hint is applied, a disconnected
+   * cluster reconnects and refreshes its metadata, and stale metadata is refreshed.
+   * @param {Error} e the attempt's error
+   * @param {(error: Error) => void} bail the retrier's bail
+   * @param {number} retryCount
+   * @param {number} retryTime
+   * @returns {Promise<never>} rethrows `e` for the retrier, or bails with it when it is not
+   *   retriable
+   */
+  const recover = async (e, bail, retryCount, retryTime) => {
+    if (e.name === 'KafkaJSConnectionClosedError') {
+      cluster.removeBroker({ host: e.host, port: e.port })
+    }
+
+    // KIP-951: the broker told us which node now leads this partition. Applying it updates
+    // the leader-epoch cache and the broker table, so the next attempt - scheduled by the
+    // retrier below, on its normal backoff - routes there. Nothing about the retry unit or
+    // the backoff changes. Best-effort, same reasoning as the other side channels below: a
+    // rejection here (e.g. a bad address in `nodeEndpoints`) must not replace the original
+    // produce error's `type`/`code`/`retriable` and skip the `staleMetadata` fall-through
+    // below.
+    if (e.name === 'KafkaJSProtocolError' && e.currentLeader) {
+      await cluster
+        .applyLeaderHint({
+          topic: e.topic,
+          partition: e.partition,
+          leaderId: e.currentLeader.leaderId,
+          leaderEpoch: e.currentLeader.leaderEpoch,
+          nodeEndpoints: e.nodeEndpoints,
+        })
+        .catch((hintError) => {
+          logger.debug(
+            `Best-effort leader hint application failed, continuing with the original error: ${hintError.message}`
+          )
+        })
+    }
+
+    if (!cluster.isConnected()) {
+      logger.debug(`Cluster has disconnected, reconnecting: ${e.message}`, {
+        retryCount,
+        retryTime,
+      })
+      // Best-effort reconnect/refresh: this is here to put the cluster back in a usable
+      // state before the retrier's next attempt, not to replace `e` - a failure of either
+      // step (e.g. still unreachable) must not turn `e` into a different error class and
+      // strip its `retryCount`/`retryTime` on its way to the `throw` below. `Promise.resolve`
+      // tolerates a test double that returns `undefined` instead of a promise.
+      await Promise.resolve(cluster.connect()).catch((connectError) => {
+        logger.debug(
+          `Best-effort reconnect failed, continuing with the original error: ${connectError.message}`
+        )
+      })
+      await Promise.resolve(cluster.refreshMetadata()).catch((refreshError) => {
+        logger.debug(
+          `Best-effort metadata refresh failed, continuing with the original error: ${refreshError.message}`
+        )
+      })
+      throw e
+    }
+
+    // This is necessary in case the metadata is stale and the number of partitions
+    // for this topic has increased in the meantime
+    if (refreshesMetadata(e)) {
+      logger.error(`Failed to send messages: ${e.message}`, { retryCount, retryTime })
+      // Best-effort, same reasoning as above: a stale-metadata refresh that itself fails
+      // must not replace the retriable send error (e.g. NOT_LEADER_FOR_PARTITION) with a
+      // non-retriable one and short-circuit the retry a leader election would otherwise let
+      // through.
+      await Promise.resolve(cluster.refreshMetadata()).catch((refreshError) => {
+        logger.debug(
+          `Best-effort metadata refresh failed, continuing with the original error: ${refreshError.message}`
+        )
+      })
+      throw e
+    }
+
+    logger.error(`${e.message}`, { retryCount, retryTime })
+    if (e.retriable) throw e
+    bail(e)
+  }
+
+  /**
+   * The produce arguments of one non-idempotent request to `broker`, past its topic data.
+   * Topic ids are decided per broker request, not per send(): a global rule would downgrade one
+   * broker's request because a *different* broker's topic had an unknown id.
+   * @param {string[]} topics the request's topics
+   * @returns {object}
+   */
+  const plainRequestOf = (topics) => {
+    const isTransactional = eosManager.isTransactional()
+    let topicIds
+    let maxVersion = PRODUCE_TOPIC_NAMES_MAX_VERSION
+
+    if (!isTransactional) {
+      topicIds = topicIdsOf(cluster, topics)
+      maxVersion = topicIds === undefined ? PRODUCE_TOPIC_NAMES_MAX_VERSION : undefined
+    }
+
+    return {
+      transactionalId: isTransactional ? eosManager.getTransactionalId() : undefined,
+      producerId: eosManager.getProducerId(),
+      producerEpoch: eosManager.getProducerEpoch(),
+      topicIds,
+      maxVersion,
+    }
+  }
+
+  /**
+   * The non-idempotent send of records the partitioner has not seen: one request per leader, the
+   * whole call retried by `retrier`.
    * @param {object} request
    * @param {number} request.acks
    * @param {number} request.timeout
    * @param {number} request.compression
    * @param {{ topic: string, messages: object[] }[]} request.topicMessages
-   * @param {{ [topic: string]: { [partition: string]: object[] } }} [request.partitioned] the
-   *   records already assigned to partitions; the partitioner is not run then
    * @returns {Promise<object[]>} `RecordMetadata`, grouped by broker
    */
-  const sendPlain = async ({ acks, timeout, compression, topicMessages, partitioned }) => {
+  const sendPlain = async ({ acks, timeout, compression, topicMessages }) => {
     /** @type {Map<import("../../types").Broker, any[]>} */
     const responsePerBroker = new Map()
 
@@ -1241,14 +1350,12 @@ const createSendMessages = ({
           throw new KafkaJSMetadataNotLoaded('Producing to topic without metadata')
         }
 
-        const messagesPerPartition = partitioned
-          ? partitioned[topic]
-          : groupMessagesPerPartition({
-              topic,
-              partitionMetadata,
-              messages,
-              partitioner,
-            })
+        const messagesPerPartition = groupMessagesPerPartition({
+          topic,
+          partitionMetadata,
+          messages,
+          partitioner,
+        })
 
         const partitions = keys(messagesPerPartition)
         const partitionsPerLeader = cluster.findLeaderForPartitions(topic, partitions)
@@ -1281,32 +1388,14 @@ const createSendMessages = ({
           }))
 
         const topicData = createTopicData(topicDataForBroker)
-        const isTransactional = eosManager.isTransactional()
-
-        // Topic ids are decided per broker request, not per send(): a global rule would downgrade
-        // one broker's request because a *different* broker's topic had an unknown id.
-        let topicIds
-        let maxVersion = PRODUCE_TOPIC_NAMES_MAX_VERSION
-
-        if (!isTransactional) {
-          topicIds = topicIdsOf(
-            cluster,
-            topicDataForBroker.map(({ topic }) => topic)
-          )
-          maxVersion = topicIds === undefined ? PRODUCE_TOPIC_NAMES_MAX_VERSION : undefined
-        }
 
         try {
           const response = await broker.produce({
-            transactionalId: isTransactional ? eosManager.getTransactionalId() : undefined,
-            producerId: eosManager.getProducerId(),
-            producerEpoch: eosManager.getProducerEpoch(),
+            ...plainRequestOf(topicDataForBroker.map(({ topic }) => topic)),
             acks,
             timeout,
             compression,
             topicData,
-            topicIds,
-            maxVersion,
           })
 
           const expectResponse = acks !== 0
@@ -1330,75 +1419,7 @@ const createSendMessages = ({
         await Promise.all(requests)
         return Array.from(responsePerBroker.values()).flat()
       } catch (e) {
-        if (e.name === 'KafkaJSConnectionClosedError') {
-          cluster.removeBroker({ host: e.host, port: e.port })
-        }
-
-        // KIP-951: the broker told us which node now leads this partition. Applying it updates
-        // the leader-epoch cache and the broker table, so the next attempt - scheduled by the
-        // retrier below, on its normal backoff - routes there. Nothing about the retry unit or
-        // the backoff changes. Best-effort, same reasoning as the other side channels below: a
-        // rejection here (e.g. a bad address in `nodeEndpoints`) must not replace the original
-        // produce error's `type`/`code`/`retriable` and skip the `staleMetadata` fall-through
-        // below.
-        if (e.name === 'KafkaJSProtocolError' && e.currentLeader) {
-          await cluster
-            .applyLeaderHint({
-              topic: e.topic,
-              partition: e.partition,
-              leaderId: e.currentLeader.leaderId,
-              leaderEpoch: e.currentLeader.leaderEpoch,
-              nodeEndpoints: e.nodeEndpoints,
-            })
-            .catch((hintError) => {
-              logger.debug(
-                `Best-effort leader hint application failed, continuing with the original error: ${hintError.message}`
-              )
-            })
-        }
-
-        if (!cluster.isConnected()) {
-          logger.debug(`Cluster has disconnected, reconnecting: ${e.message}`, {
-            retryCount,
-            retryTime,
-          })
-          // Best-effort reconnect/refresh: this is here to put the cluster back in a usable
-          // state before the retrier's next attempt, not to replace `e` - a failure of either
-          // step (e.g. still unreachable) must not turn `e` into a different error class and
-          // strip its `retryCount`/`retryTime` on its way to the `throw` below. `Promise.resolve`
-          // tolerates a test double that returns `undefined` instead of a promise.
-          await Promise.resolve(cluster.connect()).catch((connectError) => {
-            logger.debug(
-              `Best-effort reconnect failed, continuing with the original error: ${connectError.message}`
-            )
-          })
-          await Promise.resolve(cluster.refreshMetadata()).catch((refreshError) => {
-            logger.debug(
-              `Best-effort metadata refresh failed, continuing with the original error: ${refreshError.message}`
-            )
-          })
-          throw e
-        }
-
-        // This is necessary in case the metadata is stale and the number of partitions
-        // for this topic has increased in the meantime
-        if (refreshesMetadata(e)) {
-          logger.error(`Failed to send messages: ${e.message}`, { retryCount, retryTime })
-          // Best-effort, same reasoning as above: a stale-metadata refresh that itself fails
-          // must not replace the retriable send error (e.g. NOT_LEADER_FOR_PARTITION) with a
-          // non-retriable one and short-circuit the retry a leader election would otherwise let
-          // through.
-          await Promise.resolve(cluster.refreshMetadata()).catch((refreshError) => {
-            logger.debug(
-              `Best-effort metadata refresh failed, continuing with the original error: ${refreshError.message}`
-            )
-          })
-          throw e
-        }
-
-        logger.error(`${e.message}`, { retryCount, retryTime })
-        if (e.retriable) throw e
-        bail(e)
+        await recover(e, bail, retryCount, retryTime)
       }
     })
   }
@@ -1451,7 +1472,7 @@ const createSendMessages = ({
   /**
    * Sends records already assigned to partitions, one batch per entry, and settles each entry's
    * `settlers` as its batch settles. Idempotent: through the drain loop. Otherwise: one
-   * non-idempotent call over all entries, whose outcome settles every entry.
+   * non-idempotent call over all entries, each settled and retried on its own partition's answer.
    * @param {object} request
    * @param {number} request.acks
    * @param {number} request.timeout
@@ -1490,37 +1511,243 @@ const createSendMessages = ({
     return loop.send({ acks, timeout, compression, batches })
   }
 
+  /** ms from a send's start to its delivery deadline, the producer's */
+  const deadlineMs = deliveryTimeout ?? retry.maxTotalTime
+
   /**
-   * `sendPartitioned` without idempotence.
+   * The retrier of one non-idempotent hand-off: the producer's, with the delivery deadline that is
+   * left to its earliest batch, as an idempotent batch's deadline counts from its first send.
+   * @param {{ createdAt?: number }[]} batches
+   * @returns {import("../retry").Retrier|null} null once that deadline has passed
+   */
+  const retrierWithin = (batches) => {
+    if (deadlineMs == null) {
+      return retrier
+    }
+
+    const now = Date.now()
+    const createdAt = batches.reduce(
+      (earliest, batch) => Math.min(earliest, batch.createdAt ?? now),
+      now
+    )
+    const remaining = createdAt + deadlineMs - now
+    return remaining < 1 ? null : createRetry({ ...retry, maxTotalTime: remaining })
+  }
+
+  /**
+   * The leaders of a topic's partitions, once its metadata is loaded.
+   * @param {string} topic
+   * @param {string[]} partitions
+   * @returns {{ [nodeId: string]: number[] }}
+   * @throws {KafkaJSMetadataNotLoaded} while the topic has no metadata
+   */
+  const leadersOf = (topic, partitions) => {
+    if (cluster.findTopicPartitionMetadata(topic).length === 0) {
+      logger.debug('Producing to topic without metadata', {
+        topic,
+        targetTopics: Array.from(cluster.targetTopics),
+      })
+      throw new KafkaJSMetadataNotLoaded('Producing to topic without metadata')
+    }
+    return cluster.findLeaderForPartitions(topic, partitions)
+  }
+
+  /**
+   * `sendPartitioned` without idempotence: the batches still unsettled go out in one request per
+   * leader, retried by `retrier`, and each settles on its own partition's answer, as the Java
+   * producer completes each partition's batch. A batch answered OK resolves at once and is never
+   * sent again; one answered with an error that is not retriable rejects alone; one answered with a
+   * retriable error, or whose whole request failed with one, goes out again on the next attempt,
+   * within the call's retry budget. A request that fails as a whole, or a topic or broker that
+   * cannot be looked up, leaves its own batches for the next attempt when the error is retriable
+   * and rejects them otherwise; the other batches go out. Each attempt waits for every broker's
+   * answer, so the slowest broker paces the retries. The budget ends at the delivery deadline of
+   * the earliest batch, counted from its first send; a hand-off past it rejects without sending.
+   * Once the budget runs out, or the call fails before any request, the batches still unsettled
+   * reject with the retrier's error.
+   * @see https://github.com/apache/kafka/blob/4.3/clients/src/main/java/org/apache/kafka/clients/producer/internals/Sender.java
    * @param {object} request see `sendPartitioned`
-   * @returns {Promise<object[]>}
+   * @returns {Promise<object[]>} the `RecordMetadata` of every batch, once all have settled;
+   *   rejects with the first error a batch failed with
    */
   const sendPartitionedPlain = async ({ acks, timeout, compression, batches }) => {
-    const topicMessages = []
-    const partitioned = {}
-    for (const { topic, partition, messages } of batches) {
-      if (partitioned[topic] === undefined) {
-        partitioned[topic] = {}
-        topicMessages.push({ topic, messages: [] })
+    const unsettled = new Set(batches)
+    const metadata = []
+    let failure = null
+
+    const resolve = (batch, value) => {
+      unsettled.delete(batch)
+      if (value !== undefined) {
+        metadata.push(value)
       }
-      partitioned[topic][partition] = messages
+      batch.settlers?.forEach((settler) => settler.resolve(value))
+    }
+    const reject = (batch, error) => {
+      unsettled.delete(batch)
+      failure = failure || error
+      batch.settlers?.forEach((settler) => settler.reject(error))
+    }
+
+    /**
+     * Sends `broker` the batches it leads and settles those its answer settles.
+     * @param {object} broker
+     * @param {{ topic: string, partitions: number[], batches: object }[]} owned the batches by
+     *   topic, `batches` keyed by partition
+     * @returns {Promise<Error|null>} the retriable error that leaves a batch for the next attempt
+     */
+    const produceTo = async (broker, owned) => {
+      const sent = owned.flatMap(({ partitions, batches }) =>
+        partitions.map((partition) => batches[partition])
+      )
+      const topicData = owned.map(({ topic, partitions, batches }) => ({
+        topic,
+        partitions: partitions.map((partition) => ({
+          partition,
+          messages: batches[partition].messages,
+        })),
+      }))
+
+      let results
+      try {
+        results = await broker.produce({
+          ...plainRequestOf(owned.map(({ topic }) => topic)),
+          acks,
+          timeout,
+          compression,
+          topicData,
+          perPartitionResults: true,
+        })
+      } catch (e) {
+        attachFailingRecords(e, topicData)
+        if (e.retriable) {
+          return e
+        }
+        sent.forEach((batch) => reject(batch, e))
+        return null
+      }
+
+      if (acks === 0) {
+        sent.forEach((batch) => resolve(batch, undefined))
+        return null
+      }
+
+      let retriable = null
+      sent.forEach((batch, index) => {
+        const result = resultFor(results, index, batch)
+        const error =
+          result === undefined
+            ? new KafkaJSError(`No result for ${batch.topic} partition ${batch.partition}`)
+            : result.error
+        if (error === null) {
+          resolve(batch, metadataOf(result))
+        } else if (error.retriable) {
+          resolveFailingRecords(error, batch.messages)
+          retriable = retriable || error
+        } else {
+          resolveFailingRecords(error, batch.messages)
+          reject(batch, error)
+        }
+      })
+      return retriable
+    }
+
+    const handOffRetrier = retrierWithin(batches)
+    if (handOffRetrier === null) {
+      batches.forEach((batch) =>
+        reject(
+          batch,
+          new KafkaJSDeliveryTimeout(
+            `Gave up on ${batch.topic} partition ${batch.partition} before sending it: its ` +
+              `${deadlineMs} ms delivery deadline passed`
+          )
+        )
+      )
+      throw failure
     }
 
     try {
-      const metadata = await sendPlain({ acks, timeout, compression, topicMessages, partitioned })
-      for (const batch of batches) {
-        const found = metadata.find(
-          ({ topicName, partition }) => topicName === batch.topic && partition === batch.partition
-        )
-        batch.settlers?.forEach((settler) => settler.resolve(found))
-      }
-      return metadata
+      await handOffRetrier(async (bail, retryCount, retryTime) => {
+        const topics = []
+        const byTopic = {}
+        for (const batch of unsettled) {
+          if (byTopic[batch.topic] === undefined) {
+            byTopic[batch.topic] = {}
+            topics.push(batch.topic)
+          }
+          byTopic[batch.topic][batch.partition] = batch
+        }
+        await cluster.addMultipleTargetTopics(topics)
+
+        try {
+          await cluster.refreshMetadataIfNecessary()
+
+          /** @type {Error[]} the retriable lookup failures that leave batches for the next attempt */
+          const left = []
+          /**
+           * A topic's or a broker's lookup failed: a retriable error leaves its batches for the next
+           * attempt, any other rejects them.
+           * @param {object[]} lost
+           * @param {Error} e
+           */
+          const leave = (lost, e) => {
+            if (e.retriable) {
+              left.push(e)
+            } else {
+              lost.forEach((batch) => reject(batch, e))
+            }
+          }
+
+          /** @type {Map<object, { topic: string, partitions: number[], batches: object }[]>} */
+          const perBroker = new Map()
+          for (const topic of topics) {
+            let partitionsPerLeader
+            try {
+              partitionsPerLeader = leadersOf(topic, keys(byTopic[topic]))
+            } catch (e) {
+              leave(Object.values(byTopic[topic]), e)
+              continue
+            }
+
+            for (const nodeId of keys(partitionsPerLeader)) {
+              const partitions = partitionsPerLeader[nodeId]
+              let broker
+              try {
+                broker = await cluster.findBroker({ nodeId })
+              } catch (e) {
+                leave(
+                  partitions.map((partition) => byTopic[topic][partition]),
+                  e
+                )
+                continue
+              }
+              const owned = perBroker.get(broker) || []
+              owned.push({ topic, partitions, batches: byTopic[topic] })
+              perBroker.set(broker, owned)
+            }
+          }
+
+          const errors = await Promise.all(
+            Array.from(perBroker, ([broker, owned]) => produceTo(broker, owned))
+          )
+          const retriable = [...left, ...errors].find((error) => error !== null)
+          if (retriable !== undefined) {
+            throw retriable
+          }
+          if (unsettled.size > 0) {
+            throw new KafkaJSMetadataNotLoaded('Producing to a partition without metadata')
+          }
+        } catch (e) {
+          await recover(e, bail, retryCount, retryTime)
+        }
+      })
     } catch (error) {
-      for (const batch of batches) {
-        batch.settlers?.forEach((settler) => settler.reject(error))
-      }
-      throw error
+      unsettled.forEach((batch) => reject(batch, error))
     }
+
+    if (failure !== null) {
+      throw failure
+    }
+    return metadata
   }
 
   /**

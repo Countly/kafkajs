@@ -262,21 +262,23 @@ class Settler {
  */
 
 /**
- * The opt-in accumulator (`linger`, `batchSize`): coalesces the records of several sends into one
- * batch per topic-partition, in the order they reach it, and hands each batch to the send path as
- * it flushes. A batch is due `linger` ms after its first records arrived; it goes out at once when it
- * reaches `batchSize` bytes of keys and values, and before records that would take it past
- * `batchSize`, or whose `acks`, `timeout` or `compression` differ, start the next one; records of
- * one send are never split, so a send larger than `batchSize` goes out on its own. Batches that
- * are due when one of their timers fires go out together, so partitions sent together can share a
- * request. While `holds()` is true - one batch in flight per partition, on an idempotent
- * producer - a due batch whose partition still has a batch handed on and not settled stays open
- * for more records, up to `batchSize`, and goes out when that batch settles: as the Java client's
- * accumulator keeps its last batch open while the sender skips a partition with a batch in flight.
- * A held batch goes out at its delivery deadline at the latest, so the send path expires it then,
- * as the Java client expires the head of a waiting partition's queue.
- * While `lingers()` is false - a transaction is ending, the producer is disconnecting - a batch goes
- * out as soon as it forms. Each pending batch holds at most one timer, cleared when it flushes.
+ * The accumulator every send goes through (`linger`, `batchSize`): coalesces the records of
+ * several sends into one batch per topic-partition, in the order they reach it, and hands each
+ * batch to the send path as it flushes. A batch is due `linger` ms after its first records
+ * arrived - at once, with no timer, when `linger` is 0; it goes out at once when it reaches
+ * `batchSize` bytes of keys and values, and before records that would take it past `batchSize`,
+ * or whose `acks`, `timeout` or `compression` differ, start the next one; records of one send are
+ * never split, so a send larger than `batchSize` goes out on its own. The batches one send fills
+ * go out together, and so do batches that are due when one of their timers fires, or in the same
+ * tick when `linger` is 0, so partitions sent together can share a request. While `holds()` is
+ * true - one batch in flight per partition, on an idempotent producer - a due batch whose
+ * partition still has a batch handed on and not settled stays open for more records, up to
+ * `batchSize`, and goes out when that batch settles: as the Java client's accumulator keeps its
+ * last batch open while the sender skips a partition with a batch in flight. A held batch goes out
+ * at its delivery deadline at the latest, so the send path expires it then, as the Java client
+ * expires the head of a waiting partition's queue. While `lingers()` is false - a transaction is
+ * ending, the producer is disconnecting - a batch goes out as soon as it forms. Each pending batch
+ * holds at most one timer, cleared when it flushes.
  * `close()` hands everything on and waits until nothing is left to deliver.
  * One accumulator serves one transactional context: a producer's own sends, or its transactions'.
  * @see https://github.com/apache/kafka/blob/4.3/clients/src/main/java/org/apache/kafka/clients/producer/internals/RecordAccumulator.java
@@ -302,7 +304,7 @@ class Accumulator {
 
   /**
    * @param {object} options
-   * @param {number} options.linger ms a batch waits for more records
+   * @param {number} options.linger ms a batch waits for more records; 0 for none
    * @param {number} options.batchSize bytes of keys and values at which a batch is sent
    * @param {(topicMessages: { topic: string, messages: object[] }[]) =>
    *   Promise<{ topic: string, partition: number, messages: object[] }[]>} options.partition
@@ -374,7 +376,11 @@ class Accumulator {
   }
 
   /**
-   * Adds one append's records, assigned to their partitions, to the pending batches.
+   * Adds one append's records, assigned to their partitions, to the pending batches. When they
+   * fill a batch, every batch carrying them goes on in one hand-off - after any older batch of a
+   * partition that had to go first, in its own call - so one send usually makes one request per
+   * broker. When none fills, its records that join a batch an earlier append began leave with
+   * that batch, on its timer, so one send can still reach a broker in two requests.
    * @param {{ topic: string, partition: number, messages: object[] }[]} entries
    * @param {{ acks: number, timeout?: number, compression?: number, createdAt: number }} options
    * @returns {Promise<object[]>} the append's outcome, as `append()` describes it
@@ -382,6 +388,12 @@ class Accumulator {
   #join(entries, { acks, timeout, compression, createdAt }) {
     const send = new AppendedSend(entries.length)
     const options = `${acks}/${timeout}/${compression}`
+    // One due time for every batch this append creates, so they fall due together.
+    const dueAt = Date.now() + this.#linger
+    /** @type {PendingBatch[]} the batches this append fills, out of the pending ones */
+    const full = []
+    /** @type {PendingBatch[]} the other batches carrying its records, still pending */
+    const joined = []
     for (const { topic, partition, messages } of entries) {
       const key = `${topic}/${partition}`
       const bytes = sizeOf(messages)
@@ -406,7 +418,7 @@ class Accumulator {
           settlers: [],
           bytes: 0,
           createdAt,
-          dueAt: Date.now() + this.#linger,
+          dueAt,
           timer: null,
           due: false,
         }
@@ -421,10 +433,31 @@ class Accumulator {
       batch.bytes += bytes
 
       if (batch.bytes >= this.#batchSize || !this.#lingers()) {
-        this.#flushBatch(batch)
-      } else if (batch.timer === null && !batch.due) {
+        clearTimeout(batch.timer)
+        this.#pending.delete(key)
+        full.push(batch)
+      } else {
+        joined.push(batch)
+      }
+    }
+
+    const due = full.length > 0 || this.#linger === 0
+    for (const batch of joined) {
+      if (batch.due) {
+        continue
+      }
+      if (due) {
+        clearTimeout(batch.timer)
+        batch.timer = null
+        batch.due = true
+      } else if (batch.timer === null) {
         batch.timer = setTimeout(() => this.#expire(batch), this.#linger)
       }
+    }
+    if (full.length > 0) {
+      this.#handOnDue(full)
+    } else if (this.#linger === 0) {
+      this.#queueHandOff()
     }
     return send.promise
   }
@@ -480,7 +513,8 @@ class Accumulator {
    * @returns {void}
    */
   #expire(expired) {
-    const now = Date.now()
+    // Timers run on the event loop's cached clock, which can lag `Date.now()`.
+    const now = Math.max(Date.now(), expired.dueAt)
     for (const batch of this.#pending.values()) {
       if (batch === expired || (!batch.due && batch.dueAt <= now)) {
         clearTimeout(batch.timer)
@@ -492,11 +526,12 @@ class Accumulator {
   }
 
   /**
-   * Hands on every due batch that is not held for its partition's batch in flight; a held one
-   * with a delivery deadline is timed to go out at it.
+   * Hands on every due batch that is not held for its partition's batch in flight, in one call
+   * with `full` per options; a held one with a delivery deadline is timed to go out at it.
+   * @param {PendingBatch[]} [full] batches already taken out of the pending ones, never held
    * @returns {void}
    */
-  #handOnDue() {
+  #handOnDue(full = []) {
     const ready = []
     for (const batch of this.#pending.values()) {
       if (!batch.due) {
@@ -513,7 +548,7 @@ class Accumulator {
       clearTimeout(batch.timer)
       this.#pending.delete(batch.key)
     }
-    this.#sendGrouped(ready)
+    this.#sendGrouped([...full, ...ready])
   }
 
   /**
@@ -528,15 +563,27 @@ class Accumulator {
       return
     }
     this.#unsettled.delete(key)
-    if (this.#pending.get(key)?.due && !this.#handOffQueued) {
+    if (this.#pending.get(key)?.due) {
       // Batches of one Produce response settle together: their partitions go out together.
-      this.#handOffQueued = true
-      queueMicrotask(() => {
-        this.#handOffQueued = false
-        this.#handOnDue()
-      })
+      this.#queueHandOff()
     }
     this.#checkIdle()
+  }
+
+  /**
+   * Hands on the due batches once the current microtasks have run, so the batches that fall due
+   * in one tick go out together; one hand-off is queued at a time.
+   * @returns {void}
+   */
+  #queueHandOff() {
+    if (this.#handOffQueued) {
+      return
+    }
+    this.#handOffQueued = true
+    queueMicrotask(() => {
+      this.#handOffQueued = false
+      this.#handOnDue()
+    })
   }
 
   /**

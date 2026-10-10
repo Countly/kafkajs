@@ -755,7 +755,7 @@ describe('Producer > the idempotent drain loop', () => {
       expect(harness.produced).toHaveLength(2)
     })
 
-    test('a send that began idempotent stays idempotent when another send turns idempotence off while it partitions', async () => {
+    test('a send still assigning partitions when another send turns idempotence off goes out without the producer id, never with it and no sequence', async () => {
       const cluster = createFakeCluster()
       const producer = createProducer({ cluster, logger: newLogger() })
       await producer.connect()
@@ -773,8 +773,8 @@ describe('Producer > the idempotent drain loop', () => {
         .map(([request]) => request)
         .find(({ topicData }) => topicData[0].partitions[0].messages[0].value === 'second')
       expect(producer.isIdempotent()).toBe(false)
-      expect(second).toMatchObject({ acks: -1, producerId: '1000', perPartitionResults: true })
-      expect(second.topicData[0].partitions[0].firstSequence).toEqual(1)
+      expect(second).toMatchObject({ acks: -1, producerId: -1, producerEpoch: 0 })
+      expect(second.topicData[0].partitions[0].firstSequence).toBeUndefined()
     })
 
     test("a producer's retry options, not the cluster's, bound a batch's re-sends", async () => {
@@ -1143,7 +1143,7 @@ describe('Producer > the idempotent drain loop', () => {
       expect(harness.produced).toHaveLength(4)
     })
 
-    test('the metadata of a two-topic, two-broker send is sorted by topic then partition; a non-idempotent one keeps its broker order', async () => {
+    test('the metadata of a two-topic, two-broker send is sorted by topic then partition, as a non-idempotent producer’s is', async () => {
       const { leaders, topicMessages } = METADATA_ORDER_CASE.input
       const harness = createHarness({ layout: leaders })
       await harness.start()
@@ -1635,7 +1635,7 @@ describe('Producer > the idempotent drain loop', () => {
       ])
     })
 
-    test('without idempotence the entries go out as one non-idempotent call, and each settles with its outcome', async () => {
+    test('without idempotence each entry settles with its own partition’s outcome: a request that fails rejects only its own entries', async () => {
       const harness = createHarness({ layout: { [TOPIC]: { 0: 1, 1: 2 } } })
       const plain = createSendMessages({
         logger: newLogger(),
@@ -1645,12 +1645,13 @@ describe('Producer > the idempotent drain loop', () => {
         eosManager: harness.eosManager,
         idempotence: new Idempotence({ enabled: false, explicit: false, logger: newLogger() }),
       })
-      const decoded = async ({ topicData }) => ({
-        topics: topicData.map(({ topic, partitions }) => ({
-          topicName: topic,
-          partitions: partitions.map(({ partition }) => ({ partition, errorCode: 0 })),
-        })),
-      })
+      const decoded = async ({ topicData }) =>
+        partitionResults({
+          topics: topicData.map(({ topic, partitions }) => ({
+            topicName: topic,
+            partitions: partitions.map(({ partition }) => ({ partition, errorCode: 0 })),
+          })),
+        })
       harness.broker(1).produce.mockImplementation(decoded)
       harness.broker(2).produce.mockImplementation(decoded)
       const settlers = [0, 1].map(() => ({ resolve: jest.fn(), reject: jest.fn() }))
@@ -1666,7 +1667,11 @@ describe('Producer > the idempotent drain loop', () => {
         .sendPartitioned({ acks: 1, timeout: 30000, compression: 0, batches })
         .catch((e) => e)
       expect(error).toMatchObject({ code: INVALID_RECORD })
-      expect(settlers.map(({ reject }) => reject.mock.calls[0][0])).toEqual([error, error])
+      expect(settlers[0].resolve).toHaveBeenCalledWith(expect.objectContaining({ partition: 0 }))
+      expect(settlers[0].reject).not.toHaveBeenCalled()
+      expect(settlers[1].reject).toHaveBeenCalledWith(error)
+      expect(settlers[1].resolve).not.toHaveBeenCalled()
+      settlers.forEach(({ resolve }) => resolve.mockClear())
 
       const metadata = await plain.sendPartitioned({
         acks: 1,

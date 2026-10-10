@@ -27,12 +27,9 @@ const DEFAULT_METADATA_MAX_AGE = 300000
 const DEFAULT_MAX_IN_FLIGHT_REQUESTS = 5
 // The Cluster's own default for `requestTimeout`.
 const DEFAULT_REQUEST_TIMEOUT = 30000
-// Java's MAX_IN_FLIGHT_REQUESTS_PER_CONNECTION_FOR_IDEMPOTENCE, and its 4.x defaults for an
-// accumulator that is switched on (linger.ms, batch.size).
+// Java's MAX_IN_FLIGHT_REQUESTS_PER_CONNECTION_FOR_IDEMPOTENCE.
 // @see clients/src/main/java/org/apache/kafka/clients/producer/ProducerConfig.java (Apache Kafka 4.3)
 const MAX_IN_FLIGHT_REQUESTS_FOR_IDEMPOTENCE = 5
-const DEFAULT_LINGER = 5
-const DEFAULT_BATCH_SIZE = 16384
 // The longest delay Node's `setTimeout` honours; a longer one runs after 1 ms.
 // @see https://nodejs.org/api/timers.html
 const MAX_TIMER_DELAY = 2147483647
@@ -137,18 +134,16 @@ const resolveIdempotent = ({
 
 /**
  * Checks the producer's accumulator options and its delivery deadline, and resolves the
- * accumulator's defaults: it is off unless `linger` or `batchSize` is passed, and then the unset
- * one takes the Java 4.x default. The deadline must leave room for one request after the linger,
- * `deliveryTimeout >= linger + requestTimeout` (Java's `KafkaProducer.configureDeliveryTimeout`),
- * with `linger` 0 while the accumulator is off. `linger` and `deliveryTimeout` are at most
+ * accumulator's defaults, `createProducer.defaults`, for the options not passed. The deadline must
+ * leave room for one request after the linger, `deliveryTimeout >= linger + requestTimeout`
+ * (Java's `KafkaProducer.configureDeliveryTimeout`). `linger` and `deliveryTimeout` are at most
  * 2147483647 ms, the longest timer delay.
  * @param {object} options
  * @param {number} [options.linger]
  * @param {number} [options.batchSize]
  * @param {number} [options.deliveryTimeout]
  * @param {number} options.requestTimeout
- * @returns {{ linger: number|undefined, batchSize: number|undefined }} both undefined while the
- *   accumulator is off
+ * @returns {{ linger: number, batchSize: number }}
  * @throws {KafkaJSInvalidConfigurationError} naming the option at fault
  */
 const resolveDelivery = ({ linger, batchSize, deliveryTimeout, requestTimeout }) => {
@@ -167,10 +162,9 @@ const resolveDelivery = ({ linger, batchSize, deliveryTimeout, requestTimeout })
     )
   }
 
-  const accumulating = linger !== undefined || batchSize !== undefined
   const resolved = {
-    linger: accumulating ? (linger ?? DEFAULT_LINGER) : undefined,
-    batchSize: accumulating ? (batchSize ?? DEFAULT_BATCH_SIZE) : undefined,
+    linger: linger ?? createProducer.defaults.linger,
+    batchSize: batchSize ?? createProducer.defaults.batchSize,
   }
 
   if (deliveryTimeout != null) {
@@ -184,7 +178,7 @@ const resolveDelivery = ({ linger, batchSize, deliveryTimeout, requestTimeout })
       )
     }
 
-    const floor = (resolved.linger ?? 0) + requestTimeout
+    const floor = resolved.linger + requestTimeout
     if (deliveryTimeout < floor) {
       throw new KafkaJSInvalidConfigurationError(
         `deliveryTimeout must be at least linger + requestTimeout (${floor} ms), got ${deliveryTimeout}`
@@ -293,8 +287,8 @@ module.exports = class Client {
    * `idempotent: true` or a `transactionalId` asked for it.
    * @public
    * @param {object} [options]
-   * @param {number} [options.linger] the opt-in accumulator: ms a batch waits for more records
-   * @param {number} [options.batchSize] the opt-in accumulator: bytes at which a batch is sent
+   * @param {number} [options.linger=5] ms a batch waits for more records; 0 sends it at once
+   * @param {number} [options.batchSize=16384] bytes of keys and values at which a batch is sent
    * @param {number} [options.deliveryTimeout] ms one send may take, retries included; at least
    *   `linger + requestTimeout`
    * @throws {KafkaJSInvalidConfigurationError} for a setting idempotence asked for explicitly

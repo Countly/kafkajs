@@ -306,7 +306,7 @@ new Kafka({
 })
 ```
 
-A producer's `deliveryTimeout` must be at least its `linger` (0 unless the [accumulator](Producing.md#accumulator) is on) plus this value - see [Delivery timeout](Producing.md#delivery-timeout).
+A producer's `deliveryTimeout` must be at least its `linger` (5 ms unless the producer sets another, see the [accumulator](Producing.md#accumulator)) plus this value - 30005 ms with both defaults - see [Delivery timeout](Producing.md#delivery-timeout).
 
 The request timeout can be disabled by setting `enforceRequestTimeout` to `false`.
 

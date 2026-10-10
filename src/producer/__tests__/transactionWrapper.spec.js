@@ -5,6 +5,7 @@ const encodeProduce = require('../../protocol/requests/produce/v12/request')
 const { createErrorFromCode } = require('../../protocol/error')
 const {
   KafkaJSApplicationRecoverableError,
+  KafkaJSError,
   KafkaJSInvalidConfigurationError,
   KafkaJSInvariantViolation,
   KafkaJSNonRetriableError,
@@ -66,13 +67,14 @@ const answer = ({ topicData }, errorCode = 0) => ({
  * A transactional producer over the fake cluster, its coordinator at transaction version
  * `level`; every Produce goes through `produce`.
  * @param {{ level?: number, produce?: (request: object) => Promise<object>, retry?: object,
- *   partitions?: number }} [options]
+ *   partitions?: number, linger?: number }} [options]
  */
 const createTransactionalProducer = ({
   level = 2,
   produce,
   retry = RETRY,
   partitions = 1,
+  linger,
 } = {}) => {
   const cluster = createFakeCluster({
     partitions,
@@ -97,6 +99,7 @@ const createTransactionalProducer = ({
     logger: newLogger(),
     transactionalId: TRANSACTIONAL_ID,
     retry,
+    linger,
   })
   return { cluster, broker, producer }
 }
@@ -280,10 +283,11 @@ describe('Producer > the transaction wrapper', () => {
 
     /**
      * A transaction whose one batch was answered REQUEST_TIMED_OUT and was waiting out its
-     * backoff when `disconnect()` dropped it; the producer is connected again.
+     * backoff when `disconnect()` began, which waited for it to run out of retries; the producer
+     * is connected again.
      * @param {number} level the transaction version
      */
-    const reSendDroppedByDisconnect = async (level) => {
+    const reSendFailingThroughDisconnect = async (level) => {
       let fail = true
       const { broker, producer } = createTransactionalProducer({
         level,
@@ -301,29 +305,24 @@ describe('Producer > the transaction wrapper', () => {
       return { broker, producer, transaction, sendError }
     }
 
-    test('a queued batch dropped while the producer disconnects makes the transaction abort-only, not the producer unusable', async () => {
+    test('a batch dropped because an earlier disconnect() ended after a reconnect makes the transaction abort-only, not the producer unusable', async () => {
       const { cluster, broker, producer } = createTransactionalProducer({ level: 1 })
       await producer.connect()
-      const added = deferred()
-      broker.addPartitionsToTxn.mockImplementationOnce(() => added.promise)
-      const closed = deferred()
-      cluster.disconnect.mockImplementationOnce(() => closed.promise)
+      const torn = deferred()
+      cluster.disconnect.mockImplementationOnce(() => torn.promise)
+      const disconnected = producer.disconnect()
+      await settle()
+      await producer.connect()
       const transaction = await producer.transaction()
 
       const sent = transaction.send({ topic: TOPIC, messages: ONE }).catch((e) => e)
       await settle()
-      const disconnecting = producer.disconnect()
-      added.resolve({})
+      torn.resolve()
+      await disconnected
       const sendError = await sent
       const commitError = await transaction.commit().catch((e) => e)
-      closed.resolve()
-      await disconnecting
 
-      expect(sendError).toEqual(
-        new KafkaJSNonRetriableError(
-          "The producer is disconnecting; therefore, it can't safely accept messages anymore"
-        )
-      )
+      expect(sendError).toEqual(new KafkaJSError('The producer is disconnected'))
       expect(commitError).toBeInstanceOf(KafkaJSTransactionAbortableError)
       expect(commitError.cause).toBe(sendError)
       expect(broker.produce).not.toHaveBeenCalled()
@@ -332,20 +331,22 @@ describe('Producer > the transaction wrapper', () => {
       await expect(transaction.abort()).resolves.toBeUndefined()
     })
 
-    test('a re-send dropped by disconnect() makes the transaction abort-only: commit() after reconnecting sends no EndTxn', async () => {
-      const { broker, transaction, sendError } = await reSendDroppedByDisconnect(2)
+    test('disconnect() waits for a failing re-send to run out of retries, which makes the transaction abort-only: commit() after reconnecting sends no EndTxn', async () => {
+      const { broker, transaction, sendError } = await reSendFailingThroughDisconnect(2)
 
       const commitError = await transaction.commit().catch((e) => e)
 
-      expect(sendError.message).toEqual('The producer is disconnected')
-      expect(commitError).toBeInstanceOf(KafkaJSTransactionAbortableError)
+      expect(sendError).toBeInstanceOf(KafkaJSTransactionAbortableError)
+      expect(sendError.cause).toBeInstanceOf(KafkaJSNumberOfRetriesExceeded)
+      expect(broker.produce).toHaveBeenCalledTimes(6)
+      expect(commitError).toBe(sendError)
       expect(broker.endTxn).not.toHaveBeenCalled()
     })
 
     test.each([1, 2])(
-      'under transaction version %p, aborting after a re-send was dropped leaves the next transaction clean',
+      'under transaction version %p, aborting after a re-send ran out of retries during disconnect() leaves the next transaction clean',
       async (level) => {
-        const { broker, producer, transaction } = await reSendDroppedByDisconnect(level)
+        const { broker, producer, transaction } = await reSendFailingThroughDisconnect(level)
 
         await expect(transaction.abort()).resolves.toBeUndefined()
         const next = await producer.transaction()
@@ -392,6 +393,7 @@ describe('Producer > the transaction wrapper', () => {
         const { broker, producer } = createTransactionalProducer({
           level,
           partitions: 2,
+          linger: 0,
           produce: async (request) => {
             calls += 1
             await (calls === 1 ? first : second).promise
@@ -447,7 +449,7 @@ describe('Producer > the transaction wrapper', () => {
       expect(broker.endTxn).not.toHaveBeenCalled()
     })
 
-    test('a record the client cannot encode makes the transaction abort-only, not the producer unusable', async () => {
+    test('an error the client raises while it sends a batch makes the transaction abort-only, not the producer unusable', async () => {
       const { broker, producer } = createTransactionalProducer({
         produce: async (request) => {
           await encodeProduce(request).encode()
@@ -456,10 +458,11 @@ describe('Producer > the transaction wrapper', () => {
       })
       await producer.connect()
       const transaction = await producer.transaction()
+      broker.produce.mockImplementationOnce(async () => {
+        Buffer.byteLength(5)
+      })
 
-      const sendError = await transaction
-        .send({ topic: TOPIC, messages: [{ value: 'value', headers: { attempt: 5 } }] })
-        .catch((e) => e)
+      const sendError = await transaction.send({ topic: TOPIC, messages: ONE }).catch((e) => e)
       const commitError = await transaction.commit().catch((e) => e)
 
       expect(sendError).toBeInstanceOf(KafkaJSTransactionAbortableError)
@@ -631,6 +634,7 @@ describe('Producer > the transaction wrapper', () => {
     test('a new transaction cannot begin while a send of the previous one is still in flight', async () => {
       const held = []
       const { broker, producer } = createTransactionalProducer({
+        linger: 0,
         produce: (request) => {
           const release = deferred()
           held.push(() => release.resolve(answer(request)))
@@ -662,6 +666,7 @@ describe('Producer > the transaction wrapper', () => {
     test('abort() called while commit() waits for its sends waits for the commit, which keeps every record, and is then refused', async () => {
       const held = []
       const { broker, producer } = createTransactionalProducer({
+        linger: 0,
         produce: (request) => {
           const release = deferred()
           held.push(() => release.resolve(answer(request)))
@@ -671,6 +676,7 @@ describe('Producer > the transaction wrapper', () => {
       await producer.connect()
       const transaction = await producer.transaction()
       const sent = transaction.send({ topic: TOPIC, messages: ONE })
+      await settle()
       const queued = transaction.send({ topic: TOPIC, messages: ONE })
       await settle()
 
@@ -753,6 +759,7 @@ describe('Producer > the transaction wrapper', () => {
         let refuse = false
         const { broker, producer } = createTransactionalProducer({
           level,
+          linger: 0,
           retry: { retries: 2, initialRetryTime: 5000, maxRetryTime: 5000 },
           produce: async ({ topicData, producerEpoch }) => ({
             topics: topicData.map(({ topic, partitions: sent }) => ({
