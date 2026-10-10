@@ -90,7 +90,7 @@ describe('Protocol > Requests > ConsumerGroupHeartbeat > v0', () => {
     expect(stable[stable.length - 2]).toEqual(0x00)
   })
 
-  // SF-18: `TopicPartitions.Partitions` is declared NON-nullable, and the encoder writes the
+  // `TopicPartitions.Partitions` is declared NON-nullable, and the encoder writes the
   // 0x00 null sentinel for a null array - which Kafka's generated reader rejects outright with
   // "non-nullable field Partitions was serialized as null", failing the whole heartbeat.
   test('never writes the non-nullable Partitions as the null compact array', async () => {

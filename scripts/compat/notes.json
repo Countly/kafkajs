@@ -61,8 +61,8 @@
       "since": "2026-09-03"
     },
     "InitProducerId": {
-      "note": "v2+ is flexible, so even v3 needs the flexible-protocol work first. v3 producer-id/epoch re-init (KIP-360), v4 PRODUCER_FENCED, v5 TRANSACTION_ABORTABLE, v6 two-phase commit (KIP-939) and latestVersionUnstable, so brokers advertise 0-5 by default.",
-      "since": "2026-09-03"
+      "note": "v2 flexible, v3 re-initialization with the producer's current id and epoch (KIP-360), v4 PRODUCER_FENCED, v5 TRANSACTION_ABORTABLE, v6 two-phase commit (KIP-939) and latestVersionUnstable, so brokers advertise 0-5 by default.",
+      "since": "2026-10-10"
     },
     "AddPartitionsToTxn": {
       "note": "v2 PRODUCER_FENCED, v3 flexible. v3 is the client ceiling: the message definition keeps v4 (batched transactions, VerifyOnly) and v5 for broker-to-broker calls, so behind:2 is this API's steady state. Under transaction version 2 (KIP-890 part 2) a client does not send it: Produce v12 adds the partition implicitly.",

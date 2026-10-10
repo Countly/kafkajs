@@ -743,7 +743,7 @@ describe('Consumer > groupProtocol > ConsumerGroupProtocol', () => {
       expect(h.protocol.state).toEqual(FATAL)
     })
 
-    // SF-7: a fatal error can reach `onMembershipError` from the commit or the fetch path while
+    // A fatal error can reach `onMembershipError` from the commit or the fetch path while
     // the member is out of the group. Recording it without entering FATAL dropped it - the member
     // rejoined and hit the same error again, and the stale `fatalError` outlived the rejoin.
     it('enters FATAL from FENCED, so the round does not rejoin into the same error', async () => {

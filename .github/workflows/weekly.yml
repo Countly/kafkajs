@@ -12,12 +12,12 @@ jobs:
       max-parallel: 6
       matrix:
         node: [22, 24, 26]
-        kafka: ['4.1.2', '4.2.1', '4.3.1']
+        kafka: ['4.1.2', '4.2.2', '4.3.1']
         group: [broker, admin, producer, consumer, others, oauthbearer]
         exclude:
-          - { node: 22, kafka: '4.2.1' }
+          - { node: 22, kafka: '4.2.2' }
           - { node: 26, kafka: '4.1.2' }
-          - { node: 26, kafka: '4.2.1' }
+          - { node: 26, kafka: '4.2.2' }
     # When kafka_version is provided via workflow_dispatch, it overrides KAFKA_VERSION for every
     # matrix job (not just one), replacing matrix.kafka for the whole run — acceptable for an
     # ad-hoc check.

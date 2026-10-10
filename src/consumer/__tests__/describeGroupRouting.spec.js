@@ -58,7 +58,7 @@ describe('Consumer > describeGroup > routing', () => {
     }
   })
 
-  // MF-3: this used to ask DescribeGroups directly, which answers GROUP_ID_NOT_FOUND for a
+  // This used to ask DescribeGroups directly, which answers GROUP_ID_NOT_FOUND for a
   // consumer-type group - so a live KIP-848 group described itself as `Dead` with no members.
   it('describes its own KIP-848 group through ConsumerGroupDescribe', async () => {
     let consumer
@@ -116,7 +116,7 @@ describe('Consumer > describeGroup > routing', () => {
     expect(Buffer.isBuffer(description.members[0].memberAssignment)).toBe(true)
   })
 
-  // SF-9: `admin.describeGroups` maps the "not requested" sentinel to null and this now agrees,
+  // `admin.describeGroups` maps the "not requested" sentinel to null and this now agrees,
   // so one declared `GroupDescription` type describes both.
   it('reports authorizedOperations as null on both paths, as the type says', async () => {
     let consumer

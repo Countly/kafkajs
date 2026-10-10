@@ -57,7 +57,8 @@ change, and commit the regenerated files alongside the codec change.
 | TxnOffsetCommit | 28 | 2, 3, 4, 5 | 16 |
 
 `runAssignors.sh` with no subcommand, or with `assignors`, does exactly what it did before, and
-`run.sh`/`GenerateVectors.java` are unchanged and still own every pre-6B vector.
+`run.sh`/`GenerateVectors.java` are unchanged and still own every vector the message generator
+does not write.
 
 ### Fixture schema
 

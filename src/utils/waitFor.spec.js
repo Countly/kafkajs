@@ -30,9 +30,13 @@ describe('Utils > waitFor', () => {
       'Timeout'
     )
 
-    // Verify that the check is not rescheduled after a timeout
-    await sleep(10)
-    expect(condition).toHaveBeenCalledTimes(2)
+    // The check is not rescheduled after a timeout. The one already under way when it fired may
+    // still run, so the count is read once that has had time to land and must not grow after.
+    await sleep(50)
+    const calls = condition.mock.calls.length
+    await sleep(50)
+    expect(calls).toBeGreaterThan(0)
+    expect(condition).toHaveBeenCalledTimes(calls)
   })
 
   it('rejects the promise with a custom timeout message', async () => {

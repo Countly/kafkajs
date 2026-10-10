@@ -3,14 +3,16 @@ let sendOffsetsSpy
 let retrySpy
 
 jest.mock('./eosManager', () => {
-  return (...args) => {
-    const eosManager = jest.requireActual('./eosManager')(...args)
+  const createEosManager = jest.requireActual('./eosManager')
+  // The factory's own exports (`surfaceInTransaction`) stay reachable through the mock.
+  return Object.assign((...args) => {
+    const eosManager = createEosManager(...args)
 
     initProducerIdSpy = jest.spyOn(eosManager, 'initProducerId')
     sendOffsetsSpy = jest.spyOn(eosManager, 'sendOffsets')
 
     return eosManager
-  }
+  }, createEosManager)
 })
 
 jest.mock('../retry', () => {

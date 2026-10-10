@@ -569,7 +569,7 @@ describe('Consumer > Runner', () => {
       expect(order).toEqual(['onStopRequested', 'managerStop'])
     })
 
-    // MF-1: the reconciliation chain `stop()` awaits can still reach `requestTick()` through an
+    // The reconciliation chain `stop()` awaits can still reach `requestTick()` through an
     // acknowledgement or a coordinator move. Before the shutdown latch that armed a fresh chain,
     // so heartbeats kept going out after LeaveGroup and the timer held the process open.
     it('leaves no armed heartbeat chain, whatever asks for one after stop()', async () => {
@@ -751,7 +751,7 @@ describe('Consumer > Runner', () => {
       expect(consumerGroup.fetch).toHaveBeenCalledWith(1)
     })
 
-    // MF-5: at OffsetCommit v9 the broker answers a deleted group with GROUP_ID_NOT_FOUND (69)
+    // At OffsetCommit v9 the broker answers a deleted group with GROUP_ID_NOT_FOUND (69)
     // where v8 answered ILLEGAL_GENERATION (22). A classic consumer must rejoin either way.
     it('rejoins on a commit answered 69, exactly as it does on a 22', async () => {
       const runner = createTestRunner()

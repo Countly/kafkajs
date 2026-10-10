@@ -121,7 +121,7 @@ describe('Consumer > configuration > groupProtocol', () => {
     ).toThrow('Argument "groupRemoteAssignor" must be a non-empty string')
   })
 
-  // MF-4: `null` IS the documented default ("let the coordinator pick its first configured
+  // `null` IS the documented default ("let the coordinator pick its first configured
   // assignor"), so writing it down must not make a consumer unconstructible under either
   // protocol - and a `null` threaded from an optional config value must not either.
   it.each([
@@ -331,7 +331,7 @@ describe('Consumer > onCrash > a fatal membership error', () => {
     await consumer.disconnect()
   })
 
-  // SF-6: the error contract already called 30 and 42 fatal for a consumer-protocol member; the
+  // The error contract already called 30 and 42 fatal for a consumer-protocol member; the
   // runner and this override were gated on the narrower exported predicate, so such a member
   // crashed and was then restarted straight back into the same failure for ever.
   it.each([

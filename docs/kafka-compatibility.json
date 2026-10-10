@@ -505,7 +505,7 @@
       "gap": "behind:1",
       "onFloor": false,
       "belowFloor": [],
-      "notes": "v2+ is flexible, so even v3 needs the flexible-protocol work first. v3 producer-id/epoch re-init (KIP-360), v4 PRODUCER_FENCED, v5 TRANSACTION_ABORTABLE, v6 two-phase commit (KIP-939) and latestVersionUnstable, so brokers advertise 0-5 by default."
+      "notes": "v2 flexible, v3 re-initialization with the producer's current id and epoch (KIP-360), v4 PRODUCER_FENCED, v5 TRANSACTION_ABORTABLE, v6 two-phase commit (KIP-939) and latestVersionUnstable, so brokers advertise 0-5 by default."
     },
     {
       "kafkaName": "OffsetForLeaderEpoch",
@@ -1114,7 +1114,7 @@
       "apiKey": 43,
       "forkName": null,
       "apiKeysName": "ElectPreferredLeaders",
-      "reason": "Preferred-leader election; not planned. apiKeys.js still uses the pre-2.4 name ElectPreferredLeaders while requests/index.js registers the entry as ElectLeaders, so requests[apiKeys name] is undefined - reported by compat:check, fixed outside Phase 3."
+      "reason": "Preferred-leader election; not planned. apiKeys.js still uses the pre-2.4 name ElectPreferredLeaders while requests/index.js registers the entry as ElectLeaders, so requests[apiKeys name] is undefined - reported by compat:check."
     }
   ]
 }

@@ -302,7 +302,7 @@ const probeAssigner = {
 const partitionsOf = (emitted, type) =>
   payloadsOf(emitted, type).map(({ partitions }) => partitions)
 
-// SF-5: the inter-round yield runs inside the chain `Runner#stop()` awaits through `idle()`.
+// The inter-round yield runs inside the chain `Runner#stop()` awaits through `idle()`.
 // Guarding before the timer is armed is not enough - a stop landing one tick later waited the
 // whole delay, up to MAX_RECONCILE_YIELD_MS.
 describe('Consumer > RebalanceCoordinator > the inter-round yield', () => {

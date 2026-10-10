@@ -19,7 +19,7 @@ describe('Protocol > Requests', () => {
       })
     })
   })
-  // SF-20: the version factories of the two group APIs added in 6B destructured their options
+  // The version factories of the two consumer-group APIs destructured their options
   // object with no default, so a shape probe - reading an api key, name and version without
   // building a real request - threw where `ListGroups` returns.
   describe('a shape-only request, built with no options', () => {

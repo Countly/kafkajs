@@ -392,7 +392,8 @@ module.exports = class Connection {
    * `waitForPendingRequests()` yields: a concurrent `disconnect()`/`connect()` pair can otherwise
    * install a new socket (and move the status past DISCONNECTING) while this call is still
    * draining, and this call's continuation must act on the socket and epoch it actually owns, not
-   * on whatever `this.socket`/`this.connectAttempt` happen to hold once it resumes.
+   * on whatever `this.socket`/`this.connectAttempt` happen to hold once it resumes. A socket the
+   * broker already destroyed is left alone, so repeated calls add no listeners to it.
    *
    * @public
    * @returns {Promise}
@@ -429,7 +430,9 @@ module.exports = class Connection {
     this.connectAttempt += 1
     this.requestQueue.destroy()
 
-    if (socket) {
+    // A socket already closed is left alone: unref() on it queues a 'connect' listener that never
+    // fires, one per disconnect() call.
+    if (socket && !socket.destroyed) {
       // socketFactory's documented contract is a real net.Socket, which always has this; guarded
       // anyway since nothing else here needs more than end()/unref() from the socket.
       if (typeof socket.removeAllListeners === 'function') {

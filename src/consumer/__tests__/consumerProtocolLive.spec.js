@@ -298,7 +298,7 @@ describeConsumerProtocol('Consumer > the consumer group protocol (live)', () => 
     ROW_BUDGET_MS
   )
 
-  // MF-3: `consumer.describeGroup()` asked DescribeGroups directly, which answers
+  // `consumer.describeGroup()` used to ask DescribeGroups directly, which answers
   // GROUP_ID_NOT_FOUND for a consumer-type group - so a live KIP-848 member described its own
   // group as `Dead` with no members.
   it(

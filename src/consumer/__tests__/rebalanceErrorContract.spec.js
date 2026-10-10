@@ -76,7 +76,7 @@ describe('Consumer > rebalance error contract', () => {
     })
   })
 
-  // MF-5. Apache Kafka's OffsetMetadataManager.validateOffsetCommit answers GROUP_ID_NOT_FOUND
+  // Apache Kafka's OffsetMetadataManager.validateOffsetCommit answers GROUP_ID_NOT_FOUND
   // (69) at OffsetCommit v9+ where v8 answered ILLEGAL_GENERATION (22). A member must not tell
   // those two apart, and nothing else about 69 may change.
   describe('a vanished group answering an OffsetCommit', () => {

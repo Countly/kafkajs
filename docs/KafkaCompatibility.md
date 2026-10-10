@@ -26,7 +26,7 @@ Gap classes: `current` (fork max equals the Kafka max) · `behind:N` · `stub` (
 | CreateTopics | 19 | 2-7 | v5+ | 2-3 | behind:4 | v5 flexible, v7 returns topic IDs. |
 | DeleteTopics | 20 | 1-6 | v4+ | 1 | behind:5 (on-floor) | v6 deletes by topic ID. The fork's v1 sits exactly on the 4.x floor. |
 | DeleteRecords | 21 | 0-2 | v2+ | 0-1 | behind:1 |  |
-| InitProducerId | 22 | 0-6 | v2+ | 0-5 | behind:1 | v2+ is flexible, so even v3 needs the flexible-protocol work first. v3 producer-id/epoch re-init (KIP-360), v4 PRODUCER_FENCED, v5 TRANSACTION_ABORTABLE, v6 two-phase commit (KIP-939) and latestVersionUnstable, so brokers advertise 0-5 by default. |
+| InitProducerId | 22 | 0-6 | v2+ | 0-5 | behind:1 | v2 flexible, v3 re-initialization with the producer's current id and epoch (KIP-360), v4 PRODUCER_FENCED, v5 TRANSACTION_ABORTABLE, v6 two-phase commit (KIP-939) and latestVersionUnstable, so brokers advertise 0-5 by default. |
 | OffsetForLeaderEpoch | 23 | 2-4 | v4+ | 3-4 | current | Leader-epoch fencing (KIP-320): v3 and v4 are implemented. v2 is a deliberate gap, not a waiver - versions below 3 require CLUSTER permission, which clients are not typically granted, and the Java consumer pins its own floor at v3 for that reason. |
 | AddPartitionsToTxn | 24 | 0-5 | v3+ | 0-3 | behind:2 | v2 PRODUCER_FENCED, v3 flexible. v3 is the client ceiling: the message definition keeps v4 (batched transactions, VerifyOnly) and v5 for broker-to-broker calls, so behind:2 is this API's steady state. Under transaction version 2 (KIP-890 part 2) a client does not send it: Produce v12 adds the partition implicitly. |
 | AddOffsetsToTxn | 25 | 0-4 | v3+ | 0-4 | current | v2 PRODUCER_FENCED, v3 flexible, v4 TRANSACTION_ABORTABLE (KIP-890). Under transaction version 2 (KIP-890 part 2) a client does not send it: TxnOffsetCommit v5 adds the offsets implicitly. |
@@ -111,4 +111,4 @@ Keys this client declares but deliberately does not track in the matrix: they ar
 | RenewDelegationToken | 39 | RenewDelegationToken | Delegation tokens (KIP-48); not planned. Stub in requests/index.js. |
 | ExpireDelegationToken | 40 | ExpireDelegationToken | Delegation tokens (KIP-48); not planned. Stub in requests/index.js. |
 | DescribeDelegationToken | 41 | DescribeDelegationToken | Delegation tokens (KIP-48); not planned. Stub in requests/index.js. |
-| ElectLeaders | 43 | ElectPreferredLeaders | Preferred-leader election; not planned. apiKeys.js still uses the pre-2.4 name ElectPreferredLeaders while requests/index.js registers the entry as ElectLeaders, so requests[apiKeys name] is undefined - reported by compat:check, fixed outside Phase 3. |
+| ElectLeaders | 43 | ElectPreferredLeaders | Preferred-leader election; not planned. apiKeys.js still uses the pre-2.4 name ElectPreferredLeaders while requests/index.js registers the entry as ElectLeaders, so requests[apiKeys name] is undefined - reported by compat:check. |

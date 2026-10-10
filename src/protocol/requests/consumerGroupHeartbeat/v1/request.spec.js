@@ -128,7 +128,7 @@ describe('Protocol > Requests > ConsumerGroupHeartbeat > v1', () => {
     ])
   })
 
-  // SF-18: `TopicPartitions.Partitions` is declared NON-nullable, and the encoder writes the
+  // `TopicPartitions.Partitions` is declared NON-nullable, and the encoder writes the
   // 0x00 null sentinel for a null array - which Kafka's generated reader rejects outright with
   // "non-nullable field Partitions was serialized as null", failing the whole heartbeat. The
   // nested encoder is shared with v0, whose Java vector pins the non-empty form.

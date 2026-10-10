@@ -222,7 +222,7 @@ describe('Consumer > OffsetManager > STALE_MEMBER_EPOCH per call site', () => {
     jest.useRealTimers()
   })
 
-  // MF-1 of the fix round's sibling: before the live accessor the loop re-sent the manager's
+  // Before the live accessor the loop re-sent the manager's
   // construction-time epoch on every attempt, so no retry could ever be answered anything else.
   it('re-sends under the epoch the heartbeats installed, and succeeds', async () => {
     jest.useFakeTimers()
@@ -344,7 +344,7 @@ describe('Consumer > OffsetManager > the OffsetFetch member fields', () => {
   })
 })
 
-// MF-5: the commit error is classified far from where it is raised - an auto-commit's error
+// The commit error is classified far from where it is raised - an auto-commit's error
 // surfaces out of the fetch round - so the request that drew it is recorded on the error itself.
 describe('Consumer > OffsetManager > the offset-commit origin stamp', () => {
   const groupIdNotFound = () => new KafkaJSProtocolError(createErrorFromCode(69))
