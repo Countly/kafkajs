@@ -36,6 +36,7 @@ describe('Producer > eosManager', () => {
       refreshMetadataIfNecessary: jest.fn(),
       findGroupCoordinator: jest.fn().mockReturnValue(broker),
       findControllerBroker: jest.fn().mockReturnValue(broker),
+      findConnectedBroker: jest.fn().mockReturnValue(broker),
     }
   })
 
@@ -53,7 +54,9 @@ describe('Producer > eosManager', () => {
 
     await eosManager.initProducerId()
 
-    expect(cluster.refreshMetadataIfNecessary).toHaveBeenCalled()
+    expect(cluster.refreshMetadataIfNecessary).not.toHaveBeenCalled()
+    expect(cluster.findControllerBroker).not.toHaveBeenCalled()
+    expect(cluster.findConnectedBroker).toHaveBeenCalledTimes(1)
     expect(broker.initProducerId).toHaveBeenCalledWith({
       transactionalId: null,
       transactionTimeout: 30000,
@@ -142,7 +145,8 @@ describe('Producer > eosManager', () => {
 
       await eosManager.initProducerId()
 
-      expect(cluster.refreshMetadataIfNecessary).toHaveBeenCalled()
+      expect(cluster.refreshMetadataIfNecessary).not.toHaveBeenCalled()
+      expect(cluster.findConnectedBroker).not.toHaveBeenCalled()
       expect(cluster.findGroupCoordinator).toHaveBeenCalledWith({
         groupId: transactionalId,
         coordinatorType: COORDINATOR_TYPES.TRANSACTION,

@@ -9,6 +9,8 @@ const { EARLIEST_OFFSET, LATEST_OFFSET } = require('../constants')
 const {
   KafkaJSError,
   KafkaJSBrokerNotFound,
+  KafkaJSConnectionError,
+  KafkaJSRequestTimeoutError,
   KafkaJSMetadataNotLoaded,
   KafkaJSTopicMetadataNotLoaded,
   KafkaJSGroupCoordinatorNotFound,
@@ -498,6 +500,20 @@ module.exports = class Cluster {
   }
 
   /**
+   * Any connected broker: a cached one already connected, else the first cached one that
+   * connects, else the seed broker. Needs no metadata, so it serves a request any broker answers,
+   * such as a non-transactional InitProducerId, which the Java producer sends to its least loaded
+   * node.
+   * @see https://github.com/apache/kafka/blob/4.3/clients/src/main/java/org/apache/kafka/clients/producer/internals/Sender.java
+   * @public
+   * @returns {Promise<import("../../types").Broker>}
+   * @throws {Error} the seed broker's connection error, when no broker connects
+   */
+  async findConnectedBroker() {
+    return await this.brokerPool.findConnectedBroker()
+  }
+
+  /**
    * @public
    * @param {string} topic
    * @returns {import("../../types").PartitionMetadata[]} Example:
@@ -678,6 +694,11 @@ module.exports = class Cluster {
   }
 
   /**
+   * The broker coordinating a group or a transactional id. A coordinator the broker table does
+   * not hold yet is reached at the address FindCoordinator answered with, as the Java client
+   * reaches it, so no Metadata response is needed first. A coordinator the table holds is
+   * reached through its cached broker.
+   * @see https://github.com/apache/kafka/blob/4.3/clients/src/main/java/org/apache/kafka/clients/producer/internals/TransactionManager.java
    * @public
    * @param {object} params
    * @param {string} params.groupId
@@ -691,6 +712,11 @@ module.exports = class Cluster {
           groupId,
           coordinatorType,
         })
+
+        if (!this.brokerPool.hasNode(coordinator.nodeId)) {
+          await this.brokerPool.applyNodeEndpoints([{ ...coordinator, rack: null }])
+        }
+
         return await this.findBroker({ nodeId: coordinator.nodeId })
       } catch (e) {
         // A new broker can join the cluster before we have the chance
@@ -719,14 +745,19 @@ module.exports = class Cluster {
   }
 
   /**
+   * One FindCoordinator answer, from the first cached broker that gives one. Before the first
+   * Metadata response the broker table is empty, and the seed broker is asked instead; a
+   * connection failure or a timeout there is retriable, as the next cached broker would be.
    * @public
    * @param {object} params
    * @param {string} params.groupId
    * @param {import("../protocol/coordinatorTypes").CoordinatorType} [params.coordinatorType=0]
    * @returns {Promise<Object>}
+   * @throws {KafkaJSBrokerNotFound} when the seed broker's connection failed or timed out
+   * @throws {KafkaJSGroupCoordinatorNotFound} when no broker answered
    */
   async findGroupCoordinatorMetadata({ groupId, coordinatorType }) {
-    const brokerMetadata = await this.brokerPool.withBroker(async ({ nodeId, broker }) => {
+    const findCoordinator = async ({ nodeId, broker }) => {
       return await this.retrier(async (bail, retryCount, retryTime) => {
         try {
           const brokerMetadata = await broker.findGroupCoordinator({ groupId, coordinatorType })
@@ -755,7 +786,22 @@ module.exports = class Cluster {
           bail(e)
         }
       })
-    })
+    }
+
+    let brokerMetadata
+    if (this.brokerPool.getNodeIds().length > 0) {
+      brokerMetadata = await this.brokerPool.withBroker(findCoordinator)
+    } else {
+      const broker = await this.brokerPool.findConnectedBroker()
+      brokerMetadata = await findCoordinator({ nodeId: broker.nodeId, broker }).catch((e) => {
+        if (e instanceof KafkaJSConnectionError || e instanceof KafkaJSRequestTimeoutError) {
+          const message = `FindCoordinator failed on the seed broker: ${e.message}`
+          throw new KafkaJSBrokerNotFound(message, { cause: e })
+        }
+
+        return null
+      })
+    }
 
     if (brokerMetadata) {
       return brokerMetadata

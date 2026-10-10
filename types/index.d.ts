@@ -286,6 +286,7 @@ export type Cluster = {
   addTargetTopic(topic: string): Promise<void>
   findBroker(node: { nodeId: string }): Promise<Broker>
   findControllerBroker(): Promise<Broker>
+  findConnectedBroker(): Promise<Broker>
   findTopicPartitionMetadata(topic: string): PartitionMetadata[]
   findLeaderForPartitions(topic: string, partitions: number[]): { [leader: string]: number[] }
   findGroupCoordinator(group: { groupId: string }): Promise<Broker>

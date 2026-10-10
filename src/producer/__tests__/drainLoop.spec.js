@@ -450,7 +450,7 @@ const createHarness = ({
           : { ...result, [leader]: [...(result[leader] || []), Number(id)] }
       }, {}),
     findBroker: jest.fn(async ({ nodeId }) => brokerFor(nodeId)),
-    findControllerBroker: jest.fn(async () => coordinator),
+    findConnectedBroker: jest.fn(async () => coordinator),
     findGroupCoordinator: jest.fn(async () => coordinator),
     topicId: () => undefined,
     removeBroker: jest.fn(),

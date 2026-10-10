@@ -131,11 +131,11 @@ const createEosManager = ({
     transactionalId,
     transactionTimeout,
     retry,
-    findBroker: async () => {
-      await cluster.refreshMetadataIfNecessary()
-      // If non-transactional we can request the PID from any broker
-      return transactional ? findTransactionCoordinator() : cluster.findControllerBroker()
-    },
+    // Asks for no metadata first: a Metadata request for every topic fails on any leaderless
+    // partition in the cluster. As in the Java producer, a non-transactional InitProducerId goes
+    // to any connected broker, and a transactional one to its coordinator.
+    findBroker: () =>
+      transactional ? findTransactionCoordinator() : cluster.findConnectedBroker(),
     addPartitionsToTxn: async (topics) => {
       const broker = await findTransactionCoordinator()
       await broker.addPartitionsToTxn({

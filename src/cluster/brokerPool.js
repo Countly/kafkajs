@@ -8,10 +8,15 @@ const { CLUSTER_REBOOTSTRAP } = require('./instrumentationEvents')
 const { KafkaJSBrokerNotFound, KafkaJSConnectionError, KafkaJSProtocolError } = require('../errors')
 
 const { keys, assign, values } = Object
-const hasBrokerBeenReplaced = (broker, { host, port, rack }) =>
-  broker.connectionPool.host !== host ||
-  broker.connectionPool.port !== port ||
-  broker.connectionPool.rack !== rack
+/**
+ * Whether a cached broker now has another address. A rack is not part of a broker's identity: a
+ * new rack is written onto the cached connection pool in place, with no new connection.
+ * @param {Broker} broker
+ * @param {{ host: string, port: number }} address
+ * @returns {boolean}
+ */
+const hasBrokerMoved = (broker, { host, port }) =>
+  broker.connectionPool.host !== host || broker.connectionPool.port !== port
 
 // Bounds the `.cause` walk below: no currently-reachable chain is anywhere near this deep, so it
 // only guards against a future, accidentally self-referential `cause` looping forever.
@@ -210,11 +215,16 @@ module.exports = class BrokerPool {
    * a new leader without waiting for a metadata refresh.
    *
    * A `Broker` wraps a connection pool whose address is fixed at construction, so an endpoint
-   * whose host, port or rack differs from the cached one is a *replacement*, not an update: a new
-   * pool is built (through `buildConnectionPool`, which carries the shared authentication
-   * blackout) and the old broker is disconnected. The replacement is built with the same fields
-   * the metadata refresh path uses, `versions` included, so the request the hint is trying to
-   * make fast does not pay a fresh ApiVersions round trip.
+   * whose host or port differs from the cached one is a *replacement*, not an update: a new pool
+   * is built (through `buildConnectionPool`, which carries the shared authentication blackout)
+   * and the old broker is disconnected. The replacement is built with the same fields the
+   * metadata refresh path uses, `versions` included, so the request the hint is trying to make
+   * fast does not pay a fresh ApiVersions round trip. A new rack alone is written in place.
+   *
+   * An unknown node id at the seed broker's address adopts the seed, as `refreshMetadata`'s reduce
+   * does, so the seed's address is not connected twice; a seed the table already holds under
+   * another id is never adopted again. `Cluster#findGroupCoordinator` adds a coordinator it
+   * reached through FindCoordinator this way too.
    *
    * Three cases never build a bare replacement:
    * - **The seed broker.** `refreshMetadata` can adopt `this.seedBroker` into `this.brokers` under
@@ -257,7 +267,20 @@ module.exports = class BrokerPool {
 
       const broker = this.brokers[nodeId]
 
-      if (broker && !hasBrokerBeenReplaced(broker, { host, port, rack })) {
+      if (broker && !hasBrokerMoved(broker, { host, port })) {
+        broker.connectionPool.rack = rack
+        continue
+      }
+
+      if (
+        !broker &&
+        this.seedBroker &&
+        !values(this.brokers).includes(this.seedBroker) &&
+        !hasBrokerMoved(this.seedBroker, { host, port })
+      ) {
+        this.seedBroker.nodeId = nodeId
+        this.seedBroker.connectionPool.rack = rack
+        this.brokers[nodeId] = this.seedBroker
         continue
       }
 
@@ -419,6 +442,10 @@ module.exports = class BrokerPool {
    * `this.metadata` assignment, so every route reading cached leader/epoch data sees a
    * consistent view before anything else in this method runs.
    *
+   * A cached broker whose host and port the response repeats keeps its object, and with it every
+   * reference a caller holds; a new rack is written onto it in place. Only a moved broker is
+   * rebuilt and the old one disconnected.
+   *
    * `findConnectedBroker()` and the seed host/port read happen **inside** the retry callback:
    * a rebootstrap partway through this method (trigger (c), fired from inside
    * `findConnectedBroker()`, or a concurrent direct `rebootstrap()` call) disconnects the broker
@@ -487,7 +514,8 @@ module.exports = class BrokerPool {
               const result = await resultPromise
 
               if (result[nodeId]) {
-                if (!hasBrokerBeenReplaced(result[nodeId], { host, port, rack })) {
+                if (!hasBrokerMoved(result[nodeId], { host, port })) {
+                  result[nodeId].connectionPool.rack = rack
                   return result
                 }
 

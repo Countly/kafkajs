@@ -14,7 +14,7 @@ const createFakeCluster = () => ({
   disconnect: jest.fn(async () => {}),
   refreshMetadata: jest.fn(async () => {}),
   refreshMetadataIfNecessary: jest.fn(async () => {}),
-  findControllerBroker: jest.fn(),
+  findConnectedBroker: jest.fn(),
   addTargetTopic: jest.fn(async () => {}),
   addMultipleTargetTopics: jest.fn(async () => {}),
   targetTopics: new Set(['t']),
@@ -71,7 +71,7 @@ describe('Producer > idempotent init resilience', () => {
       },
       produce,
     }
-    cluster.findControllerBroker.mockImplementation(async () => broker)
+    cluster.findConnectedBroker.mockImplementation(async () => broker)
     cluster.findBroker.mockImplementation(async () => broker)
 
     const instrumentationEmitter = new InstrumentationEventEmitter()
@@ -112,7 +112,7 @@ describe('Producer > idempotent init resilience', () => {
 
   it('emits INITIALIZED after InitProducerId succeeds, without moving CONNECT', async () => {
     const cluster = createFakeCluster()
-    cluster.findControllerBroker.mockResolvedValue({
+    cluster.findConnectedBroker.mockResolvedValue({
       initProducerId: async () => ({ producerId: '1', producerEpoch: 0 }),
     })
     const instrumentationEmitter = new InstrumentationEventEmitter()
@@ -136,7 +136,7 @@ describe('Producer > idempotent init resilience', () => {
 
   it('does not emit INITIALIZED when InitProducerId fails', async () => {
     const cluster = createFakeCluster()
-    cluster.findControllerBroker.mockResolvedValue({
+    cluster.findConnectedBroker.mockResolvedValue({
       initProducerId: async () => {
         throw Object.assign(new Error('nope'), { type: 'GROUP_LOAD_IN_PROGRESS', code: 14 })
       },
@@ -180,7 +180,7 @@ describe('Producer > idempotent init resilience', () => {
     // Nothing to initialize for a non-idempotent producer, so INITIALIZED never fires; CONNECT
     // alone means "ready to send()" for this producer.
     expect(seen).toEqual(['connect'])
-    expect(cluster.findControllerBroker).not.toHaveBeenCalled()
+    expect(cluster.findConnectedBroker).not.toHaveBeenCalled()
   })
 
   // F1: connect() and send()/sendBatch() must share the same deduped InitProducerId call so an
@@ -201,7 +201,7 @@ describe('Producer > idempotent init resilience', () => {
         }),
       produce,
     }
-    cluster.findControllerBroker.mockImplementation(async () => broker)
+    cluster.findConnectedBroker.mockImplementation(async () => broker)
     cluster.findBroker.mockImplementation(async () => broker)
 
     const producer = createProducer({
@@ -255,7 +255,7 @@ describe('Producer > idempotent init resilience', () => {
       },
       produce,
     }
-    cluster.findControllerBroker.mockImplementation(async () => broker)
+    cluster.findConnectedBroker.mockImplementation(async () => broker)
     cluster.findBroker.mockImplementation(async () => broker)
 
     const producer = createProducer({
