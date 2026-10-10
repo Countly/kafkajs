@@ -117,6 +117,19 @@ const createEosManager = () => ({
 /** Routes each message to the partition explicitly set on it, bypassing any real partitioner. */
 const partitionerByMessage = ({ message }) => message.partition
 
+/**
+ * One send as the producer makes it: the records assigned to partitions once, then those batches
+ * sent.
+ * @param {ReturnType<typeof createSendMessages>} sender
+ * @param {{ topic: string, messages: object[] }[]} topicMessages
+ */
+const send = async (sender, topicMessages) =>
+  sender.sendPartitioned({
+    acks: -1,
+    timeout: 30000,
+    batches: await sender.partition(topicMessages),
+  })
+
 describe('Producer > sendMessages > recordErrors (KIP-467, real codec over a fake broker)', () => {
   test('a v9 (flexible) failure resolves recordErrors[].record through the per-partition grouping', async () => {
     const messages = [
@@ -144,11 +157,7 @@ describe('Producer > sendMessages > recordErrors (KIP-467, real codec over a fak
       retrier: retry({ retries: 0 }),
     })
 
-    const error = await sendMessages({
-      acks: -1,
-      timeout: 30000,
-      topicMessages: [{ topic: TOPIC, messages }],
-    }).catch((e) => e)
+    const error = await send(sendMessages, [{ topic: TOPIC, messages }]).catch((e) => e)
 
     // Pins the version this case is actually exercising, rather than leaving it implicit in the
     // fixture choice: this is the flexible (v9) request/response path, not just "some" version.
@@ -195,11 +204,7 @@ describe('Producer > sendMessages > recordErrors (KIP-467, real codec over a fak
       retrier: retry({ retries: 0 }),
     })
 
-    const error = await sendMessages({
-      acks: -1,
-      timeout: 30000,
-      topicMessages: [{ topic: TOPIC, messages }],
-    }).catch((e) => e)
+    const error = await send(sendMessages, [{ topic: TOPIC, messages }]).catch((e) => e)
 
     // Pins the version this case is actually exercising: the classic (v8) request/response path.
     expect(readRequestHeader(state.writes[1]).apiVersion).toEqual(8)

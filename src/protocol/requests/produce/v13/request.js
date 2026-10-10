@@ -20,7 +20,7 @@ const { KafkaJSInvariantViolation } = require('../../../../errors')
  * @param [compression=CompressionTypes.None] {CompressionTypes}
  * @param topicData {Array}
  * @param {Map<string, string>} topicIds topic name to topic id. `TopicId` is a `mapKey`, so each
- *   topic appears exactly once per request - which `src/producer/createTopicData.js` already
+ *   topic appears exactly once per request - which `src/producer/sendMessages.js` already
  *   guarantees by grouping every partition of a topic into one entry. (Fetch is the opposite:
  *   `FetchRequest.json` marks neither key, so duplicate topic entries are legal there.)
  */

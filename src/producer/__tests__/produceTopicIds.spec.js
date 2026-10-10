@@ -1,6 +1,7 @@
 const apiKeys = require('../../protocol/requests/apiKeys')
 const { requests, selectVersion } = require('../../protocol/requests')
 const { createErrorFromCode } = require('../../protocol/error')
+const { partitionResults } = require('../../protocol/requests/produce/partitionResults')
 const createSendMessages = require('../sendMessages')
 const createRetry = require('../../retry')
 const createDefaultPartitioner = require('../partitioners/default')
@@ -58,7 +59,12 @@ const createProducerCluster = ({
     if (brokersByNode[nodeId] === undefined) {
       brokersByNode[nodeId] = {
         nodeId,
-        produce: async ({ topicData, topicIds: requestTopicIds, maxVersion }) => {
+        produce: async ({
+          topicData,
+          topicIds: requestTopicIds,
+          maxVersion,
+          perPartitionResults,
+        }) => {
           const maxVersions =
             maxVersion === undefined ? undefined : { [apiKeys.Produce]: maxVersion }
           const apiVersion = selectVersion(
@@ -87,7 +93,7 @@ const createProducerCluster = ({
             throw buildFailure(failWith, { topic, partition })
           }
 
-          return {
+          const response = {
             topics: topicData.map((entry) => ({
               topicName: entry.topic,
               partitions: entry.partitions.map((p) => ({
@@ -99,6 +105,7 @@ const createProducerCluster = ({
               })),
             })),
           }
+          return perPartitionResults ? partitionResults(response) : response
         },
       }
     }
@@ -141,8 +148,14 @@ const createProducerCluster = ({
     retrier: createRetry({ retries: 2, initialRetryTime: 1, maxRetryTime: 2 }),
   })
 
-  const send = ({ acks = -1, timeout = 30000, compression, topicMessages }) =>
-    sendMessages({ acks, timeout, compression, topicMessages })
+  /** One send as the producer makes it: the records assigned once, then those batches sent. */
+  const send = async ({ acks = -1, timeout = 30000, compression, topicMessages }) =>
+    sendMessages.sendPartitioned({
+      acks,
+      timeout,
+      compression,
+      batches: await sendMessages.partition(topicMessages),
+    })
 
   return { cluster, send, produceCalls, refreshMetadata: cluster.refreshMetadata }
 }

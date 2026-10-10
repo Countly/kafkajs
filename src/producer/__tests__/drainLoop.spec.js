@@ -484,9 +484,19 @@ const createHarness = ({
     }
   }
 
-  /** One send of `topicMessages`, with the request-level options a send() passes. */
-  const send = (topicMessages, { acks = -1, timeout = 30000, compression = 0 } = {}) =>
-    sendMessages({ acks, timeout, compression, topicMessages })
+  /**
+   * One send of `topicMessages`, with the request-level options a send() passes, as the producer
+   * makes it: the records assigned to partitions once, then those batches sent, their delivery
+   * deadline counted from the send's start.
+   */
+  const send = async (topicMessages, { acks = -1, timeout = 30000, compression = 0 } = {}) => {
+    const createdAt = Date.now()
+    const batches = await sendMessages.partition(topicMessages)
+    for (const batch of batches) {
+      batch.createdAt = createdAt
+    }
+    return sendMessages.sendPartitioned({ acks, timeout, compression, batches })
+  }
 
   /** The partitions, with their sequences and producer epoch, each recorded request carried. */
   const sent = () =>
@@ -1158,12 +1168,10 @@ describe('Producer > the idempotent drain loop', () => {
       expect(await captureMetadataOrder(METADATA_ORDER_CASE)).toEqual(capturedMetadataOrder)
     })
 
-    test('an empty send resolves at once with nothing sent, queued or looked up', async () => {
+    test('a send with no batches resolves at once with nothing sent, queued or looked up', async () => {
       const harness = createHarness()
       await harness.start()
 
-      await expect(harness.send([])).resolves.toEqual([])
-      await expect(harness.send([{ topic: TOPIC, messages: [] }])).resolves.toEqual([])
       await expect(
         harness.sendMessages.sendPartitioned({
           acks: -1,

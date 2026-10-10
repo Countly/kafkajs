@@ -81,7 +81,7 @@ describe('grouping semantics', () => {
     expect(grouped[1][999]).toBe(messages[999])
   })
 
-  it('returns a plain object, not a Map (createTopicData consumes it as such)', () => {
+  it('returns a plain object, not a Map (the producer reads it with Object.keys)', () => {
     const grouped = groupMessagesPerPartition({
       topic: 't',
       partitionMetadata,

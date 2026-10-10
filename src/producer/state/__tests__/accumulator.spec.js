@@ -937,6 +937,7 @@ describe('Producer > the accumulator', () => {
       const { accumulator, partition } = createAccumulator()
 
       await expect(append(accumulator, [])).resolves.toEqual([])
+      await expect(accumulator.append({ acks: -1, topicMessages: [] })).resolves.toEqual([])
       expect(partition).not.toHaveBeenCalled()
       expect(jest.getTimerCount()).toBe(0)
     })

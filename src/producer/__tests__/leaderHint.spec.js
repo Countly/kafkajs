@@ -7,6 +7,7 @@ const {
   parse: parseProduceV11Response,
 } = require('../../protocol/requests/produce/v11/response')
 const v10NotLeaderFixture = require('../../protocol/requests/produce/fixtures/v10_response_not_leader.json')
+const { partitionResults } = require('../../protocol/requests/produce/partitionResults')
 const { newLogger, connectionOpts } = require('../../../testHelpers')
 
 const BROKERS_METADATA = [
@@ -65,6 +66,25 @@ const twoLeadersMetadataResponse = () =>
   ])
 
 const topicMessages = [{ topic: 'test-topic', messages: [{ key: 'k', value: 'v', partition: 0 }] }]
+
+/**
+ * A stub broker's answer that accepts every partition of the request it is given, as
+ * `Broker#produce({ perPartitionResults: true })` resolves it.
+ * @param {{ request: { topicData: { topic: string, partitions: { partition: number }[] }[] } }} call
+ */
+const acceptAll = ({ request }) =>
+  partitionResults({
+    topics: request.topicData.map(({ topic, partitions }) => ({
+      topicName: topic,
+      partitions: partitions.map(({ partition }) => ({
+        partition,
+        errorCode: 0,
+        baseOffset: '0',
+        logAppendTime: '-1',
+        logStartOffset: '0',
+      })),
+    })),
+  })
 
 const topicMessagesTwoLeaders = [
   { topic: 'test-topic-2', messages: [{ key: 'a', value: 'va', partition: 0 }] },
@@ -186,21 +206,28 @@ const eosManagerStub = ({ updateSequence = jest.fn() } = {}) => ({
   getProducerEpoch: () => -1,
 })
 
-const createSend = ({ cluster, eosManager = eosManagerStub(), retrier }) =>
-  createSendMessages({
+/**
+ * A non-idempotent send over `cluster`, as the producer makes it: the records assigned to
+ * partitions once, then those batches sent.
+ */
+const createSend = ({ cluster, eosManager = eosManagerStub(), retrier }) => {
+  const sender = createSendMessages({
     logger: newLogger(),
     cluster,
     partitioner: createDefaultPartitioner(),
     eosManager,
     retrier: retrier ?? createRetry({ retries: 2, initialRetryTime: 1, maxRetryTime: 2 }),
   })
+  return async ({ acks, timeout, topicMessages }) =>
+    sender.sendPartitioned({ acks, timeout, batches: await sender.partition(topicMessages) })
+}
 
 describe('Producer > KIP-951 leader hint', () => {
   test('an accepted hint changes the leader the next retrier attempt routes to', async () => {
     const { cluster, produced } = createHintCluster({
-      answer: async ({ attempt }) => {
+      answer: async ({ request, attempt }) => {
         if (attempt === 1) throw await notLeaderWithHint({ leaderId: 2, leaderEpoch: 6 })
-        return { topics: [] }
+        return acceptAll({ request })
       },
     })
 
@@ -213,9 +240,9 @@ describe('Producer > KIP-951 leader hint', () => {
 
   test('a lower-epoch hint is ignored and the attempt routes unchanged', async () => {
     const { cluster, produced } = createHintCluster({
-      answer: async ({ attempt }) => {
+      answer: async ({ request, attempt }) => {
         if (attempt <= 2) throw await notLeaderWithHint({ leaderId: 2, leaderEpoch: 4 })
-        return { topics: [] }
+        return acceptAll({ request })
       },
     })
 
@@ -227,7 +254,7 @@ describe('Producer > KIP-951 leader hint', () => {
   })
 
   test('applyNodeEndpoints replaces a broker whose host/port/rack moved, and preserves the blackout', async () => {
-    const { cluster, brokers } = createHintCluster({ answer: async () => ({ topics: [] }) })
+    const { cluster, brokers } = createHintCluster({ answer: acceptAll })
     const pool = cluster.brokerPool
     const before = brokers[2]
     pool.authenticationBlackout.set('127.0.0.1:9092', { until: Date.now() + 60000 })
@@ -248,7 +275,7 @@ describe('Producer > KIP-951 leader hint', () => {
   })
 
   test('an endpoint identical to the cached one replaces nothing', async () => {
-    const { cluster, brokers } = createHintCluster({ answer: async () => ({ topics: [] }) })
+    const { cluster, brokers } = createHintCluster({ answer: acceptAll })
     const pool = cluster.brokerPool
 
     await pool.applyNodeEndpoints([{ nodeId: 2, host: '127.0.0.1', port: 9092, rack: null }])
@@ -261,7 +288,7 @@ describe('Producer > KIP-951 leader hint', () => {
     // refreshMetadata can adopt the seed Broker into `this.brokers` under a real node id
     // (brokerPool.js's reduce: `assign(result, { [nodeId]: seedBroker })`); this reproduces that
     // state directly, since the harness's stub brokers never go through a real refresh.
-    const { cluster, brokers } = createHintCluster({ answer: async () => ({ topics: [] }) })
+    const { cluster, brokers } = createHintCluster({ answer: acceptAll })
     const pool = cluster.brokerPool
     const seed = brokers[1]
     pool.seedBroker = seed
@@ -279,7 +306,7 @@ describe('Producer > KIP-951 leader hint', () => {
   })
 
   test('applyNodeEndpoints runs before the cache write - no window where routing names a node with no Broker', async () => {
-    const { cluster } = createHintCluster({ answer: async () => ({ topics: [] }) })
+    const { cluster } = createHintCluster({ answer: acceptAll })
     const order = []
     const build = cluster.brokerPool.buildConnectionPool
     cluster.brokerPool.buildConnectionPool = async (d) => {
@@ -311,7 +338,7 @@ describe('Producer > KIP-951 leader hint', () => {
     // endpoint work. A hint for an unknown partition therefore still pays for `applyNodeEndpoints`
     // even though it is ultimately rejected - the opposite of "a rejected hint costs nothing",
     // true only for the epoch-rejection case.
-    const { cluster } = createHintCluster({ answer: async () => ({ topics: [] }) })
+    const { cluster } = createHintCluster({ answer: acceptAll })
 
     await expect(
       cluster.applyLeaderHint({
@@ -329,7 +356,7 @@ describe('Producer > KIP-951 leader hint', () => {
   test.each([[undefined], [[]]])(
     'nodeEndpoints %p is a no-op and the hint still applies',
     async (nodeEndpoints) => {
-      const { cluster } = createHintCluster({ answer: async () => ({ topics: [] }) })
+      const { cluster } = createHintCluster({ answer: acceptAll })
 
       await expect(
         cluster.applyLeaderHint({
@@ -349,7 +376,7 @@ describe('Producer > KIP-951 leader hint', () => {
   test('a hint with an unknown epoch is not short-circuited by the pre-check', async () => {
     // The two guards must agree at -1: the cache accepts against an unknown cached epoch, so the
     // pre-check must not reject before the endpoint work runs.
-    const { cluster } = createHintCluster({ answer: async () => ({ topics: [] }) })
+    const { cluster } = createHintCluster({ answer: acceptAll })
     cluster.metadataCache.update(metadataResponse({ leader: 1, leaderEpoch: -1 }))
 
     await expect(
@@ -370,9 +397,9 @@ describe('Producer > KIP-951 leader hint', () => {
     async (metadataRecoveryStrategy) => {
       const { cluster, produced } = createHintCluster({
         metadataRecoveryStrategy,
-        answer: async ({ attempt }) => {
+        answer: async ({ request, attempt }) => {
           if (attempt === 1) throw await notLeaderWithHint({ leaderId: 2, leaderEpoch: 6 })
-          return { topics: [] }
+          return acceptAll({ request })
         },
       })
 
@@ -386,7 +413,7 @@ describe('Producer > KIP-951 leader hint', () => {
   test('no change to retry timing or to the per-broker sequence rollback', async () => {
     const run = async ({ withHint }) => {
       const { cluster, produced } = createHintCluster({
-        answer: async ({ attempt }) => {
+        answer: async ({ request, attempt }) => {
           if (attempt === 1) {
             const error = await notLeaderWithHint({ leaderId: 2, leaderEpoch: 6 })
             if (!withHint) {
@@ -395,7 +422,7 @@ describe('Producer > KIP-951 leader hint', () => {
             }
             throw error
           }
-          return { topics: [] }
+          return acceptAll({ request })
         },
       })
 
@@ -412,16 +439,14 @@ describe('Producer > KIP-951 leader hint', () => {
     expect(withHint.produced).toHaveLength(without.produced.length)
   })
 
-  test('a Broker that applyNodeEndpoints replaced is produced to again, and no sequence is touched', async () => {
+  test('a Broker that applyNodeEndpoints replaced takes the retry, without the partition it already answered, and no sequence is touched', async () => {
     // 'test-topic-2' (leader 2) succeeds before 'test-topic' (leader 1) fails with a hint that
-    // hands node 2 a new address. Replacing node 2's Broker makes responsePerBroker treat it as
-    // unsent, so the next attempt re-produces 'test-topic-2' alongside the legitimate retry of
-    // 'test-topic' - a replaced broker is treated as unsent, an accepted widening of the
-    // duplicate-on-retry window. This is asserted directly (node 2 is produced to twice) rather
-    // than through a derived formula, so a future change cannot widen it further unnoticed.
+    // moves its leadership to node 2 and hands node 2 a new address. The retry goes to node 2's
+    // replacement Broker and carries 'test-topic' alone: a partition already answered is never
+    // sent again, even though the Broker that answered it was replaced.
     const { cluster, produced } = createHintCluster({
       initialMetadata: twoLeadersMetadataResponse(),
-      answer: async ({ nodeId, attempt }) => {
+      answer: async ({ nodeId, request, attempt }) => {
         if (nodeId === 1 && attempt === 2) {
           throw await notLeaderWithHint({
             leaderId: 2,
@@ -429,7 +454,7 @@ describe('Producer > KIP-951 leader hint', () => {
             nodeEndpoints: [{ nodeId: 2, host: '127.0.0.9', port: 9099, rack: null }],
           })
         }
-        return { topics: [] }
+        return acceptAll({ request })
       },
     })
 
@@ -438,15 +463,23 @@ describe('Producer > KIP-951 leader hint', () => {
     await send({ acks: -1, timeout: 30000, topicMessages: topicMessagesTwoLeaders })
 
     expect(produced.map(({ nodeId }) => nodeId)).toEqual([2, 1, 2])
+    expect(produced.map(({ request }) => request.topicData.map(({ topic }) => topic))).toEqual([
+      ['test-topic-2'],
+      ['test-topic'],
+      ['test-topic'],
+    ])
+    expect(cluster.brokerPool.createBroker).toHaveBeenCalledWith(
+      expect.objectContaining({ nodeId: 2 })
+    )
     // A non-idempotent request carries no sequence, so a retry has none to give back.
     expect(updateSequence).not.toHaveBeenCalled()
   })
 
   test('a rejecting applyLeaderHint does not replace the produce error or skip the staleMetadata fall-through', async () => {
     const { cluster, produced } = createHintCluster({
-      answer: async ({ attempt }) => {
+      answer: async ({ request, attempt }) => {
         if (attempt === 1) throw await notLeaderWithHint({ leaderId: 2, leaderEpoch: 6 })
-        return { topics: [] }
+        return acceptAll({ request })
       },
     })
 
@@ -459,7 +492,9 @@ describe('Producer > KIP-951 leader hint', () => {
     const refreshMetadataSpy = jest.spyOn(cluster, 'refreshMetadata')
 
     const send = createSend({ cluster })
-    await expect(send({ acks: -1, timeout: 30000, topicMessages })).resolves.toEqual([])
+    await expect(send({ acks: -1, timeout: 30000, topicMessages })).resolves.toEqual([
+      expect.objectContaining({ topicName: 'test-topic', partition: 0, errorCode: 0 }),
+    ])
 
     expect(cluster.applyLeaderHint).toHaveBeenCalled()
     // The staleMetadata fall-through still ran - the rejection did not skip it.

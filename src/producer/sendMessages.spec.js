@@ -1,32 +1,58 @@
 jest.mock('./groupMessagesPerPartition')
 const { newLogger } = require('testHelpers')
 const { errorCodes, createErrorFromCode } = require('../protocol/error')
+const { KafkaJSConnectionClosedError } = require('../errors')
+const { partitionResults } = require('../protocol/requests/produce/partitionResults')
 const retry = require('../retry')
 const createSendMessages = require('./sendMessages')
 
-const createProducerResponse = (topicName, partition) => ({
-  topics: [
-    {
-      topicName,
-      partitions: [
-        {
-          errorCode: 0,
-          offset: `${partition}`,
-          partition,
-          timestamp: '-1',
-        },
-      ],
-    },
-  ],
+/**
+ * A broker's answer to a non-idempotent Produce request: every partition it carried succeeds, at
+ * an offset equal to its partition number.
+ * @param {{ topicData: { topic: string, partitions: { partition: number }[] }[] }} request
+ */
+const okResults = ({ topicData }) =>
+  partitionResults({
+    topics: topicData.map(({ topic, partitions }) => ({
+      topicName: topic,
+      partitions: partitions.map(({ partition }) => ({
+        partition,
+        errorCode: 0,
+        baseOffset: `${partition}`,
+        logAppendTime: '-1',
+        logStartOffset: '0',
+      })),
+    })),
+  })
+
+/** The `RecordMetadata` `okResults` resolves a partition of `topicName` to. */
+const okMetadata = (topicName, partition) => ({
+  topicName,
+  partition,
+  errorCode: 0,
+  baseOffset: `${partition}`,
+  logAppendTime: '-1',
+  logStartOffset: '0',
 })
+
+/**
+ * One send through the factory's two entry points, as the producer makes it: the records are
+ * assigned to partitions once, then those batches are sent.
+ * @param {ReturnType<typeof createSendMessages>} sender
+ */
+const sendThrough =
+  (sender) =>
+  async ({ acks = -1, timeout = 30000, compression, topicMessages }) =>
+    sender.sendPartitioned({
+      acks,
+      timeout,
+      compression,
+      batches: await sender.partition(topicMessages),
+    })
 
 describe('Producer > sendMessages', () => {
   const topic = 'topic-name'
-  const partitionsPerLeader = {
-    1: [0],
-    2: [1],
-    3: [2],
-  }
+  let leaderOf
   let mockProducerId, mockProducerEpoch, mockTransactionalId
 
   let messages,
@@ -42,11 +68,12 @@ describe('Producer > sendMessages', () => {
     messages = []
     partitioner = jest.fn()
     brokers = {
-      1: { nodeId: 1, produce: jest.fn(() => createProducerResponse(topic, 0)) },
-      2: { nodeId: 2, produce: jest.fn(() => createProducerResponse(topic, 1)) },
-      3: { nodeId: 3, produce: jest.fn(() => createProducerResponse(topic, 2)) },
-      4: { nodeId: 4, produce: jest.fn(() => createProducerResponse(topic, 1)) },
+      1: { nodeId: 1, produce: jest.fn(okResults) },
+      2: { nodeId: 2, produce: jest.fn(okResults) },
+      3: { nodeId: 3, produce: jest.fn(okResults) },
+      4: { nodeId: 4, produce: jest.fn(okResults) },
     }
+    leaderOf = { 0: 1, 1: 2, 2: 3 }
     topicPartitionMetadata = [
       {
         isr: [2],
@@ -62,7 +89,12 @@ describe('Producer > sendMessages', () => {
       refreshMetadata: jest.fn(),
       refreshMetadataIfNecessary: jest.fn(),
       findTopicPartitionMetadata: jest.fn(() => topicPartitionMetadata),
-      findLeaderForPartitions: jest.fn(() => partitionsPerLeader),
+      findLeaderForPartitions: jest.fn((_, partitions) =>
+        partitions.reduce((leaders, partition) => {
+          const leader = leaderOf[partition]
+          return { ...leaders, [leader]: [...(leaders[leader] || []), Number(partition)] }
+        }, {})
+      ),
       findBroker: jest.fn(({ nodeId }) => brokers[nodeId]),
       // No topic in this suite has a known id, so every produce stays on the pre-topic-id path
       // (topicIds undefined, capped at the last name-keyed version) - exactly this suite's
@@ -97,19 +129,21 @@ describe('Producer > sendMessages', () => {
   })
 
   test('only retry failed brokers', async () => {
-    const sendMessages = createSendMessages({
-      retrier,
-      logger: newLogger(),
-      cluster,
-      partitioner,
-      eosManager,
-    })
+    const send = sendThrough(
+      createSendMessages({
+        retrier,
+        logger: newLogger(),
+        cluster,
+        partitioner,
+        eosManager,
+      })
+    )
 
     brokers[1].produce
       .mockImplementationOnce(() => {
         throw createErrorFromCode(5)
       })
-      .mockImplementationOnce(() => createProducerResponse(topic, 0))
+      .mockImplementationOnce(okResults)
 
     brokers[3].produce
       .mockImplementationOnce(() => {
@@ -118,9 +152,9 @@ describe('Producer > sendMessages', () => {
       .mockImplementationOnce(() => {
         throw createErrorFromCode(5)
       })
-      .mockImplementationOnce(() => createProducerResponse(topic, 2))
+      .mockImplementationOnce(okResults)
 
-    const response = await sendMessages({ topicMessages: [{ topic, messages }] })
+    const response = await send({ topicMessages: [{ topic, messages }] })
 
     expect(cluster.refreshMetadataIfNecessary).toHaveBeenCalled()
     expect(eosManager.addPartitionsToTransaction).not.toHaveBeenCalled()
@@ -128,11 +162,13 @@ describe('Producer > sendMessages', () => {
     expect(brokers[1].produce).toHaveBeenCalledTimes(2)
     expect(brokers[2].produce).toHaveBeenCalledTimes(1)
     expect(brokers[3].produce).toHaveBeenCalledTimes(3)
-    expect(response).toEqual([
-      { errorCode: 0, offset: '1', partition: 1, timestamp: '-1', topicName: 'topic-name' },
-      { errorCode: 0, offset: '0', partition: 0, timestamp: '-1', topicName: 'topic-name' },
-      { errorCode: 0, offset: '2', partition: 2, timestamp: '-1', topicName: 'topic-name' },
+    expect(brokers[1].produce.mock.calls[1][0].topicData[0].partitions).toEqual([
+      expect.objectContaining({ partition: 0 }),
     ])
+    expect(brokers[3].produce.mock.calls[2][0].topicData[0].partitions).toEqual([
+      expect.objectContaining({ partition: 2 }),
+    ])
+    expect(response).toEqual([okMetadata(topic, 1), okMetadata(topic, 0), okMetadata(topic, 2)])
   })
 
   const PRODUCE_ERRORS = [
@@ -143,72 +179,71 @@ describe('Producer > sendMessages', () => {
 
   for (const errorType of PRODUCE_ERRORS) {
     test(`refresh stale metadata on ${errorType}`, async () => {
-      const sendMessages = createSendMessages({
-        retrier,
-        logger: newLogger(),
-        cluster,
-        partitioner,
-        eosManager,
-      })
+      const send = sendThrough(
+        createSendMessages({
+          retrier,
+          logger: newLogger(),
+          cluster,
+          partitioner,
+          eosManager,
+        })
+      )
       brokers[1].produce
         .mockImplementationOnce(() => {
           throw createErrorFromCode(errorCodes.find(({ type }) => type === errorType).code)
         })
-        .mockImplementationOnce(() => createProducerResponse(topic, 0))
+        .mockImplementationOnce(okResults)
 
-      await sendMessages({ topicMessages: [{ topic, messages }] })
+      await send({ topicMessages: [{ topic, messages }] })
       expect(brokers[1].produce).toHaveBeenCalledTimes(2)
       expect(cluster.refreshMetadata).toHaveBeenCalled()
     })
   }
 
   test('does not re-produce messages to brokers that are no longer leaders after metadata refresh', async () => {
-    const sendMessages = createSendMessages({
-      retrier,
-      logger: newLogger(),
-      cluster,
-      partitioner,
-      eosManager,
+    const send = sendThrough(
+      createSendMessages({
+        retrier,
+        logger: newLogger(),
+        cluster,
+        partitioner,
+        eosManager,
+      })
+    )
+
+    brokers[2].produce.mockImplementationOnce(() => {
+      leaderOf[1] = 4 // Broker 4 replaces broker 2 as leader for partition 1
+      throw createErrorFromCode(
+        errorCodes.find(({ type }) => type === 'NOT_LEADER_FOR_PARTITION').code
+      )
     })
 
-    brokers[2].produce
-      .mockImplementationOnce(() => {
-        throw createErrorFromCode(
-          errorCodes.find(({ type }) => type === 'NOT_LEADER_FOR_PARTITION').code
-        )
-      })
-      .mockImplementationOnce(() => createProducerResponse(topic, 0))
-    cluster.findLeaderForPartitions
-      .mockImplementationOnce(() => partitionsPerLeader)
-      .mockImplementationOnce(() => ({
-        1: [0],
-        4: [1], // Broker 4 replaces broker 2 as leader for partition 1
-        3: [2],
-      }))
+    const response = await send({ topicMessages: [{ topic, messages }] })
 
-    const response = await sendMessages({ topicMessages: [{ topic, messages }] })
-
-    expect(response).toEqual([
-      { errorCode: 0, offset: '0', partition: 0, timestamp: '-1', topicName: 'topic-name' },
-      { errorCode: 0, offset: '2', partition: 2, timestamp: '-1', topicName: 'topic-name' },
-      { errorCode: 0, offset: '1', partition: 1, timestamp: '-1', topicName: 'topic-name' },
+    expect(brokers[2].produce).toHaveBeenCalledTimes(1)
+    expect(brokers[4].produce).toHaveBeenCalledTimes(1)
+    expect(brokers[4].produce.mock.calls[0][0].topicData[0].partitions).toEqual([
+      expect.objectContaining({ partition: 1 }),
     ])
+    expect(response).toEqual([okMetadata(topic, 0), okMetadata(topic, 2), okMetadata(topic, 1)])
   })
 
   test('refreshes metadata if partition metadata is empty', async () => {
-    const sendMessages = createSendMessages({
-      retrier,
-      logger: newLogger(),
-      cluster,
-      partitioner,
-      eosManager,
-    })
+    const send = sendThrough(
+      createSendMessages({
+        retrier,
+        logger: newLogger(),
+        cluster,
+        partitioner,
+        eosManager,
+      })
+    )
 
     cluster.findTopicPartitionMetadata
       .mockImplementationOnce(() => [])
       .mockImplementationOnce(() => topicPartitionMetadata)
 
-    await sendMessages({ topicMessages: [{ topic, messages }] })
+    await send({ topicMessages: [{ topic, messages }] })
 
     expect(cluster.refreshMetadata).toHaveBeenCalled()
   })
@@ -218,19 +253,17 @@ describe('Producer > sendMessages', () => {
     // failure, whose `cause` is what the catch block actually threw - exactly what the (buggy)
     // unguarded `await cluster.connect(); await cluster.refreshMetadata()` would have replaced
     // with "connect boom" instead of the original KafkaJSConnectionClosedError.
-    const sendMessages = createSendMessages({
-      retrier: retry({ retries: 0 }),
-      logger: newLogger(),
-      cluster,
-      partitioner,
-      eosManager,
-    })
+    const send = sendThrough(
+      createSendMessages({
+        retrier: retry({ retries: 0 }),
+        logger: newLogger(),
+        cluster,
+        partitioner,
+        eosManager,
+      })
+    )
 
-    const sendError = Object.assign(new Error('closed'), {
-      name: 'KafkaJSConnectionClosedError',
-      host: 'a',
-      port: 1,
-    })
+    const sendError = new KafkaJSConnectionClosedError('closed', { host: 'a', port: 1 })
     brokers[1].produce.mockImplementationOnce(() => {
       throw sendError
     })
@@ -239,7 +272,7 @@ describe('Producer > sendMessages', () => {
     cluster.connect = jest.fn(() => Promise.reject(new Error('connect boom')))
     cluster.refreshMetadata.mockImplementation(() => Promise.reject(new Error('refresh boom')))
 
-    await expect(sendMessages({ topicMessages: [{ topic, messages }] })).rejects.toMatchObject({
+    await expect(send({ topicMessages: [{ topic, messages }] })).rejects.toMatchObject({
       cause: expect.objectContaining({ name: 'KafkaJSConnectionClosedError' }),
     })
     expect(cluster.connect).toHaveBeenCalled()
@@ -247,13 +280,15 @@ describe('Producer > sendMessages', () => {
   })
 
   test('a failing best-effort refresh after a stale-metadata error does not replace the original error', async () => {
-    const sendMessages = createSendMessages({
-      retrier: retry({ retries: 0 }),
-      logger: newLogger(),
-      cluster,
-      partitioner,
-      eosManager,
-    })
+    const send = sendThrough(
+      createSendMessages({
+        retrier: retry({ retries: 0 }),
+        logger: newLogger(),
+        cluster,
+        partitioner,
+        eosManager,
+      })
+    )
 
     brokers[1].produce.mockImplementationOnce(() => {
       throw createErrorFromCode(
@@ -262,23 +297,57 @@ describe('Producer > sendMessages', () => {
     })
     cluster.refreshMetadata.mockImplementation(() => Promise.reject(new Error('refresh boom')))
 
-    await expect(sendMessages({ topicMessages: [{ topic, messages }] })).rejects.toMatchObject({
+    await expect(send({ topicMessages: [{ topic, messages }] })).rejects.toMatchObject({
       cause: expect.objectContaining({ type: 'NOT_LEADER_FOR_PARTITION' }),
     })
     expect(cluster.refreshMetadata).toHaveBeenCalled()
   })
 
-  test('a non-idempotent send takes no lock, numbers nothing and adds no partition to a transaction', async () => {
-    const sendMessages = createSendMessages({
-      retrier,
-      logger: newLogger(),
-      cluster,
-      partitioner,
-      eosManager,
+  test('a metadata lookup refused without retry on a later attempt rejects the batches still unsettled with its own error', async () => {
+    const send = sendThrough(
+      createSendMessages({
+        retrier,
+        logger: newLogger(),
+        cluster,
+        partitioner,
+        eosManager,
+      })
+    )
+    const refused = createErrorFromCode(
+      errorCodes.find(({ type }) => type === 'TOPIC_AUTHORIZATION_FAILED').code
+    )
+    brokers[1].produce.mockImplementationOnce(() => {
+      throw createErrorFromCode(5)
     })
+    cluster.refreshMetadataIfNecessary
+      .mockImplementationOnce(async () => {}) // assigning the partitions
+      .mockImplementationOnce(async () => {}) // the first attempt
+      .mockImplementationOnce(async () => {
+        throw refused
+      })
+
+    const error = await send({ topicMessages: [{ topic, messages }] }).catch((e) => e)
+
+    expect(error).toBe(refused)
+    expect(cluster.refreshMetadataIfNecessary).toHaveBeenCalledTimes(3)
+    expect(brokers[1].produce).toHaveBeenCalledTimes(1)
+    expect(brokers[2].produce).toHaveBeenCalledTimes(1)
+    expect(brokers[3].produce).toHaveBeenCalledTimes(1)
+  })
+
+  test('a non-idempotent send takes no lock, numbers nothing and adds no partition to a transaction', async () => {
+    const send = sendThrough(
+      createSendMessages({
+        retrier,
+        logger: newLogger(),
+        cluster,
+        partitioner,
+        eosManager,
+      })
+    )
     eosManager.isTransactional.mockReturnValue(true)
 
-    await sendMessages({ topicMessages: [{ topic, messages }] })
+    await send({ topicMessages: [{ topic, messages }] })
 
     for (const broker of [brokers[1], brokers[2], brokers[3]]) {
       const [{ topicData }] = broker.produce.mock.calls[0]
@@ -290,13 +359,15 @@ describe('Producer > sendMessages', () => {
   })
 
   test('if transactional produces with the transactional id and producer id & epoch', async () => {
-    const sendMessages = createSendMessages({
-      retrier,
-      logger: newLogger(),
-      cluster,
-      partitioner,
-      eosManager,
-    })
+    const send = sendThrough(
+      createSendMessages({
+        retrier,
+        logger: newLogger(),
+        cluster,
+        partitioner,
+        eosManager,
+      })
+    )
 
     cluster.findTopicPartitionMetadata
       .mockImplementationOnce(() => [])
@@ -308,7 +379,7 @@ describe('Producer > sendMessages', () => {
     mockProducerEpoch = 1
     mockTransactionalId = 'transactionalid'
 
-    await sendMessages({
+    await send({
       topicMessages: [{ topic, messages }],
     })
 
@@ -336,13 +407,15 @@ describe('Producer > sendMessages', () => {
   })
 
   test('if idempotent produces with the producer id & epoch without the transactional id', async () => {
-    const sendMessages = createSendMessages({
-      retrier,
-      logger: newLogger(),
-      cluster,
-      partitioner,
-      eosManager,
-    })
+    const send = sendThrough(
+      createSendMessages({
+        retrier,
+        logger: newLogger(),
+        cluster,
+        partitioner,
+        eosManager,
+      })
+    )
 
     cluster.findTopicPartitionMetadata
       .mockImplementationOnce(() => [])
@@ -354,7 +427,7 @@ describe('Producer > sendMessages', () => {
     mockProducerEpoch = 1
     mockTransactionalId = 'transactionalid'
 
-    await sendMessages({
+    await send({
       topicMessages: [{ topic, messages }],
     })
 
@@ -384,13 +457,15 @@ describe('Producer > sendMessages', () => {
   test("leaves recordErrors unresolved when the reported partition is not in this broker's topicData", async () => {
     // A malformed or unexpected `partition` on the thrown error (KIP-467) must not throw out of
     // attachFailingRecords - it should just leave recordErrors as the broker sent them.
-    const sendMessages = createSendMessages({
-      retrier: retry({ retries: 0 }),
-      logger: newLogger(),
-      cluster,
-      partitioner,
-      eosManager,
-    })
+    const send = sendThrough(
+      createSendMessages({
+        retrier: retry({ retries: 0 }),
+        logger: newLogger(),
+        cluster,
+        partitioner,
+        eosManager,
+      })
+    )
 
     const sendError = Object.assign(createErrorFromCode(87), {
       topic,
@@ -401,7 +476,7 @@ describe('Producer > sendMessages', () => {
       throw sendError
     })
 
-    const error = await sendMessages({ topicMessages: [{ topic, messages }] }).catch((e) => e)
+    const error = await send({ topicMessages: [{ topic, messages }] }).catch((e) => e)
 
     expect(error.recordErrors).toEqual([{ batchIndex: 0, errorMessage: 'record too large' }])
   })

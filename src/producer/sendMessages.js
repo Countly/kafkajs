@@ -14,8 +14,6 @@ const { CONNECTION_STATUS } = require('../network/connectionStatus')
 const { isArmed } = require('./eosManager/transactionStates')
 const { surfaceInTransaction } = require('./eosManager')
 const groupMessagesPerPartition = require('./groupMessagesPerPartition')
-const createTopicData = require('./createTopicData')
-const responseSerializer = require('./responseSerializer')
 
 const { keys } = Object
 
@@ -1155,10 +1153,10 @@ class DrainLoop {
 }
 
 /**
- * The send path. An idempotent producer's sends go through the drain loop above; every other
- * send runs the per-broker requests of a non-idempotent producer, retried by `retrier`: records
- * already assigned to partitions settle and retry per partition, other records as a whole call,
- * as before the drain loop existed.
+ * The send path: `partition` assigns a send's records to partitions, and `sendPartitioned` sends
+ * those batches. An idempotent producer's batches go through the drain loop above; every other
+ * batch goes out in the per-broker requests of a non-idempotent producer, retried by `retrier`,
+ * each batch settled and retried on its own partition's answer.
  *
  * @param {Object} options
  * @param {import("../../types").Logger} options.logger
@@ -1172,7 +1170,7 @@ class DrainLoop {
  *   options, for the idempotent path's per-batch budget and backoff
  * @param {number} [options.deliveryTimeout] ms from `send()` to each batch's last answer
  * @param {() => string} [options.getConnectionStatus] the producer's connection status
- * @returns {Function & { sendPartitioned: Function, partition: Function }} `sendMessages`
+ * @returns {{ sendPartitioned: Function, partition: Function }}
  */
 const createSendMessages = ({
   logger,
@@ -1319,112 +1317,6 @@ const createSendMessages = ({
   }
 
   /**
-   * The non-idempotent send of records the partitioner has not seen: one request per leader, the
-   * whole call retried by `retrier`.
-   * @param {object} request
-   * @param {number} request.acks
-   * @param {number} request.timeout
-   * @param {number} request.compression
-   * @param {{ topic: string, messages: object[] }[]} request.topicMessages
-   * @returns {Promise<object[]>} `RecordMetadata`, grouped by broker
-   */
-  const sendPlain = async ({ acks, timeout, compression, topicMessages }) => {
-    /** @type {Map<import("../../types").Broker, any[]>} */
-    const responsePerBroker = new Map()
-
-    /** @param {Map<import("../../types").Broker, any[]>} responsePerBroker */
-    const createProducerRequests = async (responsePerBroker) => {
-      const topicMetadata = new Map()
-
-      await cluster.refreshMetadataIfNecessary()
-
-      for (const { topic, messages } of topicMessages) {
-        const partitionMetadata = cluster.findTopicPartitionMetadata(topic)
-
-        if (partitionMetadata.length === 0) {
-          logger.debug('Producing to topic without metadata', {
-            topic,
-            targetTopics: Array.from(cluster.targetTopics),
-          })
-
-          throw new KafkaJSMetadataNotLoaded('Producing to topic without metadata')
-        }
-
-        const messagesPerPartition = groupMessagesPerPartition({
-          topic,
-          partitionMetadata,
-          messages,
-          partitioner,
-        })
-
-        const partitions = keys(messagesPerPartition)
-        const partitionsPerLeader = cluster.findLeaderForPartitions(topic, partitions)
-        const leaders = keys(partitionsPerLeader)
-
-        topicMetadata.set(topic, {
-          partitionsPerLeader,
-          messagesPerPartition,
-        })
-
-        for (const nodeId of leaders) {
-          const broker = await cluster.findBroker({ nodeId })
-          if (!responsePerBroker.has(broker)) {
-            responsePerBroker.set(broker, null)
-          }
-        }
-      }
-
-      const brokers = Array.from(responsePerBroker.keys())
-      const brokersWithoutResponse = brokers.filter((broker) => !responsePerBroker.get(broker))
-
-      return brokersWithoutResponse.map(async (broker) => {
-        const entries = Array.from(topicMetadata.entries())
-        const topicDataForBroker = entries
-          .filter(([_, { partitionsPerLeader }]) => !!partitionsPerLeader[broker.nodeId])
-          .map(([topic, { partitionsPerLeader, messagesPerPartition }]) => ({
-            topic,
-            partitions: partitionsPerLeader[broker.nodeId],
-            messagesPerPartition,
-          }))
-
-        const topicData = createTopicData(topicDataForBroker)
-
-        try {
-          const response = await broker.produce({
-            ...plainRequestOf(topicDataForBroker.map(({ topic }) => topic)),
-            acks,
-            timeout,
-            compression,
-            topicData,
-          })
-
-          const expectResponse = acks !== 0
-          const formattedResponse = expectResponse ? responseSerializer(response) : []
-
-          responsePerBroker.set(broker, formattedResponse)
-        } catch (e) {
-          attachFailingRecords(e, topicData)
-          responsePerBroker.delete(broker)
-          throw e
-        }
-      })
-    }
-
-    return retrier(async (bail, retryCount, retryTime) => {
-      const topics = topicMessages.map(({ topic }) => topic)
-      await cluster.addMultipleTargetTopics(topics)
-
-      try {
-        const requests = await createProducerRequests(responsePerBroker)
-        await Promise.all(requests)
-        return Array.from(responsePerBroker.values()).flat()
-      } catch (e) {
-        await recover(e, bail, retryCount, retryTime)
-      }
-    })
-  }
-
-  /**
    * Assigns each record to a partition once, after making sure the topics' metadata is loaded:
    * the partitioner never runs again for these records. Retried by `retrier` while the metadata
    * cannot be loaded. A transactional producer's failure arms the transaction as `inTransaction`
@@ -1489,9 +1381,8 @@ const createSendMessages = ({
       : sendPartitionedPlain({ acks, timeout, compression, batches })
 
   /**
-   * The idempotent half of `sendPartitioned`, for a caller that already chose the idempotent path:
-   * it does not ask again, so a send keeps the path it began on even if idempotence is turned off
-   * while it waits.
+   * The idempotent half of `sendPartitioned`: the batches go through the drain loop, created on
+   * the first send.
    * @param {object} request see `sendPartitioned`
    * @returns {Promise<object[]>}
    * @throws {KafkaJSInvariantViolation} an `acks` other than -1
@@ -1750,38 +1641,7 @@ const createSendMessages = ({
     return metadata
   }
 
-  /**
-   * Sends `topicMessages`, on the path idempotence chose when the call began. Idempotent: an empty
-   * send resolves at once; otherwise every record is assigned a partition once and the batches go
-   * through the drain loop, resolving with their `RecordMetadata` by topic, then partition.
-   * Otherwise: the non-idempotent send, whose `RecordMetadata` are grouped by broker.
-   * @param {object} request
-   * @param {number} request.acks
-   * @param {number} request.timeout
-   * @param {number} request.compression
-   * @param {{ topic: string, messages: object[] }[]} request.topicMessages
-   * @returns {Promise<object[]>}
-   */
-  const sendMessages = async ({ acks, timeout, compression, topicMessages }) => {
-    if (!isIdempotent()) {
-      return sendPlain({ acks, timeout, compression, topicMessages })
-    }
-
-    if (!topicMessages.some(({ messages }) => messages.length > 0)) {
-      return []
-    }
-
-    const createdAt = Date.now()
-    const batches = await partition(topicMessages)
-    for (const batch of batches) {
-      batch.createdAt = createdAt
-    }
-    return sendIdempotent({ acks, timeout, compression, batches })
-  }
-
-  sendMessages.sendPartitioned = sendPartitioned
-  sendMessages.partition = partition
-  return sendMessages
+  return { sendPartitioned, partition }
 }
 
 createSendMessages.connectionStatusError = connectionStatusError

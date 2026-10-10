@@ -44,7 +44,7 @@ describe('Protocol > Requests > Produce > v13', () => {
     })
 
     // ProduceRequest.json marks both Name and TopicId as mapKey: exactly one entry per topic,
-    // which is what createTopicData's grouping already guarantees.
+    // which is what the producer's grouping by topic already guarantees.
     expect(topics).toEqual([{ topicId: TOPIC_ID, partitions: [0, 1] }])
     expect(build([]).apiVersion).toEqual(13)
     expect(decoder.readTaggedFields().size).toEqual(0)

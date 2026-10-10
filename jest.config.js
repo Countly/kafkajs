@@ -23,24 +23,25 @@ module.exports = {
   // The floor ratchets to each phase exit's measurement, rounded down to one decimal, so coverage
   // can only go up. Only `npm run test:coverage` enforces it; `test:coverage:unit` passes
   // --coverageThreshold '{}' because it covers a strict subset of `src/`.
-  // The two path keys below take their files OUT of the global aggregate, so the global numbers
+  // The three path keys below take their files OUT of the global aggregate, so the global numbers
   // are re-derived over the remaining files at every exit that changes that population. Re-derived
-  // on 2026-09-09 at 3.0.0-alpha.6b (S 97.42 / B 91.67 / F 98.07 / L 97.55): `groupProtocol/` gained
-  // four files, and because they carry 168 fully covered functions their departure from the global
-  // aggregate moves the global functions figure from 98.20 to 98.07. That is the re-derivation, not
-  // a regression — the same run scores 98.20 with those files counted globally.
-  // Every floor below is the LOWEST of two full runs, rounded down: the live suite decides one
-  // branch in groupProtocol/classic.js by timing (63 or 64 of 69), which moves that directory's
-  // branch figure between 93.51 and 93.74.
+  // on 2026-10-10 at 3.0.0-alpha.7 (S 97.89 / B 93.06 / F 98.39 / L 98.01): `src/producer/state/`
+  // now has its own key, so its files left the global aggregate. That is the re-derivation, not a
+  // floor moved down to hide a drop - counted globally as before, the same files score
+  // S 98.04 / B 93.79 / F 98.47 / L 98.15, above every earlier global floor.
+  // Every floor below is the LOWEST of two full runs, rounded down: the live suite decides some
+  // branches by broker timing (groupProtocol/ read 94.58 and 94.81 on its branches). Global
+  // branches and lines, and groupProtocol/ branches, sit a step lower still: three runs covered
+  // 3846 to 3849 of 4135 global branches (93.0 needs 3846), and the other two had a margin of one.
   coverageThreshold: {
     global: {
-      statements: 97.4,
-      branches: 91.6,
-      functions: 98.0,
-      lines: 97.5,
+      statements: 97.8,
+      branches: 92.9,
+      functions: 98.3,
+      lines: 97.9,
     },
-    // Measured 97.45 / 91.24 / 99.15 / 97.24, unchanged from 3.0.0-alpha.6a — no 6B task touched
-    // this tree. Branches and lines sit below the global figures because stickyCore.js keeps
+    // Measured 97.45 / 91.24 / 99.15 / 97.24, unchanged from 3.0.0-alpha.6b; nothing touched this
+    // tree. Branches and lines sit below the global figures because stickyCore.js keeps
     // PartitionMovements' repeat-move bookkeeping (B 86.29, L 95.92), which no input reaches.
     './src/consumer/assigners/': {
       statements: 97.4,
@@ -48,12 +49,20 @@ module.exports = {
       functions: 99.1,
       lines: 97.2,
     },
-    // Measured 99.26 / 93.51-93.74 / 100.00 / 99.48; the branch floor takes the lower reading.
+    // Measured 99.26 / 94.58-94.81 / 100.00 / 99.48; the branch floor takes the lower reading.
     './src/consumer/groupProtocol/': {
       statements: 99.2,
-      branches: 93.5,
+      branches: 94.3,
       functions: 100.0,
       lines: 99.4,
+    },
+    // Every file of the producer's state is covered by its own unit specs, line for line and
+    // branch for branch.
+    './src/producer/state/': {
+      statements: 100.0,
+      branches: 100.0,
+      functions: 100.0,
+      lines: 100.0,
     },
   },
   bail: false,
