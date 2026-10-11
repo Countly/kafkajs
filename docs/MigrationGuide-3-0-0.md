@@ -6,6 +6,91 @@ so most applications need no code changes. This guide lists every behavior chang
 actually notice, phase by phase, as the fork is developed. It grows with each release; the goal is that a
 change not listed here did not change observable behavior.
 
+### Phase 1 — foundation
+
+- **The package is now `@countly/kafkajs`.** Install it in place of `kafkajs` and change every
+  `require('kafkajs')` and `import … from 'kafkajs'` to `@countly/kafkajs`. The API behind the name
+  is the one 2.2.4 had: everything 2.2.4 exported is still exported under the same name, and the
+  additions and changes are listed below. A third-party package that requires
+  `kafkajs` itself keeps loading the original package, which is a separate module and shares no
+  state with this one. *What to do:* replace the dependency and every import; for a dependency that
+  needs `kafkajs`, check whether it can be pointed at this package.
+- **Only the documented entry points can be imported (`exports`).** The package's `exports` map
+  lists `.` (the CommonJS entry, the ESM entry and the types) and `./package.json`; nothing under
+  `src/` can be imported. kafkajs 2.2.4 had no `exports` map, so `require('kafkajs/src/…')` worked
+  there; against this package it throws `ERR_PACKAGE_PATH_NOT_EXPORTED`. *What to do:* search your
+  code and your test helpers for deep imports of the package (patches of its internals, direct
+  uses of `src/` classes) and move them to the public API; if the API has no equivalent, ask for
+  one rather than importing a path that is no longer exported.
+- **`import` has its own ESM entry.** `import { Kafka } from '@countly/kafkajs'` resolves
+  `index.mjs`, which re-exports every named export of the CommonJS entry and the CommonJS module
+  itself as `default`; `require('@countly/kafkajs')` resolves `index.js`. Both give the same
+  objects, so a class from one passes `instanceof` against the other. *What to do:* nothing for
+  CommonJS; ESM code can import any export by name, or take the default. Under 2.2.4, Node's
+  CommonJS interop could import only `Kafka`, `PartitionAssigners`, `AssignerProtocol`,
+  `Partitioners`, `logLevel` and `CompressionTypes` by name; the error classes,
+  `CompressionCodecs` and the other enums were reachable only through the default import, which
+  keeps working.
+- **Node.js 22 or newer is required.** The package declares `engines.node >=22.0.0` and
+  `engines.npm >=10`, where 2.2.4 declared Node `>=14.0.0`, and targets Node 22, 24 and 26.
+  *What to do:* run it on Node 22 or newer.
+- **Apache Kafka 4.0 or newer is required.** Brokers before 4.0, including every ZooKeeper-mode
+  broker, are not supported, and the client no longer implements the request versions Kafka 4.0
+  removed ("Request versions below the Kafka 4.0 floors are gone."). *What to do:* upgrade the
+  cluster to Kafka 4.0 or newer, which is KRaft-only, before you upgrade the client.
+
+### Phase 2 — bug fixes and dead-path cleanup
+
+- **Request versions below the Kafka 4.0 floors are gone.** The client no longer implements Produce
+  v0–2, Fetch v0–3, ListOffsets v0, OffsetCommit v0–1, CreateTopics v0–1, DeleteTopics v0,
+  DescribeAcls/CreateAcls/DeleteAcls v0 and DescribeConfigs v0 (KIP-896, KIP-724). A Kafka 4.x
+  broker never negotiates them. Reading old message-format (magic 0 and 1) records out of a Fetch
+  response still works, because old segments can be served inside Fetch v4 and later. *What to
+  do:* nothing against a Kafka 4.x cluster.
+- **The raw SASL token path is gone.** The pre-KIP-152 exchange, used only when a broker lacked
+  `SaslAuthenticate`, is removed; every mechanism goes through `SaslAuthenticate`, which every 4.x
+  broker has. *What to do:* nothing against a Kafka 4.x cluster.
+- **A version range that does not overlap fails with `KafkaJSServerDoesNotSupportApiKey`.**
+  Version negotiation now rejects an API whose broker range and client range share no version,
+  and the error message names both ranges, where 2.2.4 sent a version the broker rejected or chose
+  one the client does not implement. *What to do:* none against a Kafka 4.x broker; if you see the
+  error, the message says which API and which two ranges did not meet.
+- **`retry.restartOnFailure` is consulted for every terminal consumer crash.** It used to be
+  invoked only for errors KafkaJS considered retriable, so a callback that returned `true` or
+  `false` for a non-retriable error was silently ignored. If you never set it, nothing changes: the
+  default is still "restart on retriable errors, stop on non-retriable ones". If the consumer is
+  stopped or disconnected while the callback is still deciding, no restart is scheduled. A fenced
+  static member (`FENCED_INSTANCE_ID`, 82) and, under `groupProtocol: 'consumer'`, a fatal
+  membership error never restart, whatever the callback returns (see "A fatal membership error
+  never restarts under `groupProtocol: 'consumer'`"). *What to do:* check that a
+  `restartOnFailure` you already pass returns what you want for non-retriable errors too.
+- **A broker that just rejected your SASL credentials is left alone for a while.** After a
+  `SASL_AUTHENTICATION_FAILED` (58) the client waits `max(authenticationTimeout, 1000 ms)` — 10 s
+  at the default `authenticationTimeout` — before it authenticates to that broker again, to avoid
+  a reconnect storm against credentials that will keep failing. A refused attempt throws the same
+  non-retriable `KafkaJSSASLAuthenticationError` class as the original failure, whose message
+  contains the broker's own message, so a retrier stops at once instead of ending in
+  `KafkaJSNumberOfRetriesExceeded`. A connection that is already authenticated is unaffected.
+  *What to do:* after fixing credentials, expect the first reconnect to wait out the window.
+- **`groupInstanceId` makes a static member that does not leave the group on
+  `consumer.disconnect()`.**
+  The option (static membership, KIP-345) now takes effect; in 2.2.4 it was not a consumer option
+  and passing it did nothing. A consumer that passes it keeps its slot and its partitions when it
+  disconnects, until `sessionTimeout` elapses, instead of triggering a rebalance for every replica
+  of a rolling restart. A restart that rejoins under the same `groupInstanceId` before
+  `sessionTimeout` takes its partitions over with no rebalance, and the old, superseded process is
+  fenced (`FENCED_INSTANCE_ID`, 82) and crashes without restarting. *What to do:* a static member
+  that disconnects and is not coming back holds its partitions until `sessionTimeout`; lower
+  `sessionTimeout` for that consumer, or do not pass `groupInstanceId`.
+  Under `groupProtocol: 'consumer'` a static member does send a leave (see "A static member under
+  `groupProtocol: 'consumer'` sends a leave on close and on poll expiry").
+- **`maxInFlightRequests` defaults to 5, for producers and consumers.** It was unbounded. It is
+  Java's `max.in.flight.requests.per.connection`: once five requests are outstanding on a broker
+  connection, the next ones queue client-side. The admin client (`kafka.admin()`) gets the same
+  default and has no option for it. No ordering guarantee is claimed by this change.
+  *What to do:* nothing, unless you relied on unbounded pipelining; `maxInFlightRequests: null`
+  restores it (and turns idempotence off for a producer — see the producer items).
+
 ### Phase 4 — flexible protocol foundation
 
 - **CRC32C verification is on by default (`checkCrcs`)**. The consumer now checks every fetched
@@ -444,6 +529,13 @@ change not listed here did not change observable behavior.
   your own offsets to `commitOffsetsIfNecessary(offsets)` from `eachBatch`, the payload is filtered
   per partition rather than rejected as a whole: the partitions you still hold are committed and the
   rest are dropped, so one revoked partition in a payload does not cost you the others.
+- **Two ordering details around a rebalance.** The auto-commit a revocation triggers is now always
+  sent before `consumer.rebalancing` is emitted; which came first used to depend on which path
+  noticed the rebalance. And a rejoin caused by a stale assignment — a fetch that finds the member
+  no longer owns what it is fetching — now emits `consumer.rebalancing` and auto-commits like every
+  other revocation; 2.2.4 rejoined silently and committed nothing. *What to do:* if you use
+  `consumer.rebalancing` to flush your own state, expect it in the stale-assignment case too, after
+  the commit.
 
 ### Phase 6B — KIP-848 consumer protocol, admin group visibility, fetch prefetch
 
@@ -550,6 +642,23 @@ change not listed here did not change observable behavior.
   `ListGroups` version has neither field (v0–v2) they are decoded as `''` rather than being absent,
   so one row shape works at every version. A deep-equality assertion against a pre-v3 row needs the
   two keys.
+- **`admin.describeGroups` and `consumer.describeGroup()` negotiate `DescribeGroups` up to v6, and a
+  group that does not exist is reported differently.** Against a 4.x broker the request used to be
+  capped at v2, where a missing group came back as a row in state `Dead` with `errorCode: 0`. At v6
+  the broker answers `GROUP_ID_NOT_FOUND` (69) with a message. The row keeps its shape —
+  `state: 'Dead'`, `members: []`, `protocol: ''`, `protocolType: ''` — and now also carries
+  `errorCode: 69` and the broker's `errorMessage`; the call still resolves, is not retried (69 is
+  not retriable) and returns one row per requested group id. Both calls ask the consumer-protocol
+  API, `ConsumerGroupDescribe`, first, and an error that API reports for one group no longer
+  fails the whole request: it is carried on that group's row as `errorCode`/`errorMessage`
+  while the other groups come back normally. Every other group-level error that `DescribeGroups`
+  itself reports still fails the call and is still retried exactly as before. A coordinator that
+  is loading or has moved is retried on the configured budget as before, and a transport or
+  coordinator error that outlives it still fails the call. Rows are not returned in the order the
+  ids were passed, as before. Rows also gain `errorMessage` and `authorizedOperations`, and
+  members gain `groupInstanceId` (static membership). *What to do:* code that tested
+  `state === 'Dead'` keeps working; code that reads `errorCode: 0` as "the group exists", or
+  compares a whole row for deep equality, needs updating.
 
 ### Phase 7 — Transactions TV2, the KIP-1050 taxonomy and producer performance
 
@@ -621,12 +730,14 @@ The producer becomes idempotent by default and transactions move to the transact
   reads `error.cause.type`, or `error.category`, instead.
 - **`retry: { retries: 0 }` disables idempotence — or throws if you asked for it.** A producer
   that never mentioned `idempotent` keeps its fail-fast configuration and logs one warning;
-  `idempotent: true` (or a `transactionalId`) with `retries: 0` throws at construction. A
-  producer that is still idempotent with `retries` between 1 and 4 logs the "limiting retries may
-  invalidate EoS guarantees" warning — new for a producer that did not pass `idempotent: true`,
-  since 2.2.4 logged it only for one that did. *What to do:* nothing for a fail-fast
-  producer: it still sends each partition once, without retrying, and says once in the log that
-  idempotence is off. If
+  `idempotent: true` (or a `transactionalId`) with `retries: 0` throws at construction. That
+  throw is a `KafkaJSInvalidConfigurationError` — a `KafkaJSNonRetriableError` subclass, where 2.2.4
+  threw `KafkaJSNonRetriableError` itself — with the message
+  `Idempotent producer must allow retries to protect against transient errors`. A producer that
+  is still idempotent with `retries` between 1 and 4 logs the "limiting retries may invalidate EoS
+  guarantees" warning — new for a producer that did not pass `idempotent: true`, since 2.2.4
+  logged it only for one that did. *What to do:* nothing for a fail-fast producer: it still sends
+  each partition once, without retrying, and says once in the log that idempotence is off. If
   you want idempotence with `retries: 0`, you cannot have it — raise `retries`.
 - **A `transactionalId` implies `idempotent: true` explicitly.** A transactional producer never
   downgrades: an `acks`, `maxInFlightRequests` or `retries` conflict throws rather than silently
