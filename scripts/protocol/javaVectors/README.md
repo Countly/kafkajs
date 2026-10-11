@@ -36,11 +36,13 @@ The jar itself is downloaded into a temporary directory and is never committed t
 — only the emitted `*_java.json` fixtures are. Re-run the script whenever a codec's fixture values
 change, and commit the regenerated files alongside the codec change.
 
-## Message vectors for the consumer-protocol, group-visibility and transaction APIs
+## Message vectors for the consumer-protocol, group-visibility, transaction and admin APIs
 
 `scripts/protocol/javaVectors/runAssignors.sh messages` is the third entry point. It compiles
-`GenerateMessageVectors.java` against the same two jars and writes 108 fixtures under
-`src/protocol/requests/<api>/fixtures/java/`, one per case, covering:
+`GenerateMessageVectors.java` against the same two jars (it uses records, so it needs JDK 17 or
+newer) and writes the fixtures under `src/protocol/requests/<api>/fixtures/java/`, one per case. The
+first run downloads the jars from Maven Central into `JAVA_VECTORS_WORK_DIR`, a temporary directory
+that is removed afterwards when the variable is unset and reused when it is set. The script covers:
 
 | API | Key | Versions | Vectors |
 |---|---|---|---|
@@ -55,6 +57,18 @@ change, and commit the regenerated files alongside the codec change.
 | AddOffsetsToTxn | 25 | 2, 3, 4 | 9 |
 | EndTxn | 26 | 2, 3, 4, 5 | 17 |
 | TxnOffsetCommit | 28 | 2, 3, 4, 5 | 16 |
+| IncrementalAlterConfigs | 44 | 0, 1 | 16 |
+| DescribeConfigs | 32 | 3, 4 | 10 |
+| AlterConfigs | 33 | 2 | 4 |
+| CreateTopics | 19 | 4, 5, 6, 7 | 23 |
+| DeleteTopics | 20 | 2, 3, 4, 5, 6 | 19 |
+| CreatePartitions | 37 | 2, 3 | 10 |
+| DeleteRecords | 21 | 2 | 3 |
+| DeleteGroups | 42 | 2 | 3 |
+| DescribeAcls | 29 | 2, 3 | 8 |
+| CreateAcls | 30 | 2, 3 | 7 |
+| DeleteAcls | 31 | 2, 3 | 8 |
+| DescribeTopicPartitions | 75 | 0 | 8 |
 
 `runAssignors.sh` with no subcommand, or with `assignors`, does exactly what it did before, and
 `run.sh`/`GenerateVectors.java` are unchanged and still own every vector the message generator
@@ -72,16 +86,16 @@ directly under `<api>/fixtures/`. Each holds one case:
 | `version` | the version the bytes were serialized at |
 | `case` | the case name, matching the file name |
 | `hex` | the message body Kafka's own codec produced, lower-case hex, no request header |
-| `fields` | the values the message was built from, in the **Java message field names** (lower-camel: `throttleTime`, `topics`, `leaderEpoch`, …) — **not** this client's decoded key names, which the shipped decoders choose per API (`responses`, `committedLeaderEpoch`, `clientSideThrottleTime`, …). A codec test compares the **hex** both ways and maps `fields` onto its own decoded shape explicitly; it must never assume the two key sets coincide |
+| `fields` | the values the message was built from, in the **Java message field names** (lower-camel: `throttleTime`, `topics`, `leaderEpoch`, …) — **not** this client's decoded key names, which the shipped decoders choose per API (`responses`, `committedLeaderEpoch`, `clientSideThrottleTime`, …). A codec test compares the **hex** both ways and maps `fields` onto its own decoded shape explicitly; it must never assume the two key sets coincide. The admin vectors are the exception: their `fields` are the request builder's arguments and the decoder's keys (see "What the admin vectors pin") |
 
 `fields` speaks the decoder's vocabulary rather than the schema's — `topic` not `Name`,
 `state`/`protocol` not `GroupState`/`ProtocolData`, `groupGenerationId` not
 `GenerationIdOrMemberEpoch`, and an int64 offset as a string — so a spec can encode from `fields`
 and compare against `hex`, and decode `hex` and compare against `fields`, in one `toEqual` each. A
 field a version does not carry is rendered as the value the decoder reports for it (`""`,
-`null`), never omitted — except in the transaction-API vectors, where it is left out of `fields`
-(see "What the transaction vectors pin"). `memberMetadata`/`memberAssignment` travel as hex strings
-so they compare cleanly with a `Buffer`.
+`null`), never omitted — except in the transaction-API and admin-API vectors, where it is left out
+of `fields` (see "What the transaction vectors pin" and "What the admin vectors pin").
+`memberMetadata`/`memberAssignment` travel as hex strings so they compare cleanly with a `Buffer`.
 
 The topic id constant is written in canonical 8-4-4-4-12 form and parsed through
 `java.util.UUID`, because `Uuid.fromString` decodes Kafka's base64 uuid form instead.
@@ -138,6 +152,44 @@ silently, whatever the builder set, while a non-ignorable one - the TxnOffsetCom
 v3 - makes the writer throw on a non-default value. The one field the vectors do render below its first
 version is that triple, at its defaults (`-1`, `""`, `null`): every `txnOffsetCommitRequest` has the same
 shape at v2 to v5.
+
+### What the admin vectors pin
+
+The admin vectors use the same fixture schema, with three rules of their own. A request's `fields`
+are the arguments the client's request builder takes (`topic`, `configEntries`, `topicPartitions`,
+`resourcePatternType`), and a response's are the keys its decoder returns (`topicErrors`,
+`creationResponses`, `filterResponses`, `configEntries`); a key the decoder derives rather than
+reads (`isDefault`) or splits (`clientSideThrottleTime`) is not a field, and the raw
+`ThrottleTimeMs` is `throttleTime`. A field a version does not carry is left out of `fields`, as in
+the transaction vectors. A uuid is the canonical 8-4-4-4-12 string, and the zero uuid, which the
+client reads as `null`, is `null` in a response's `fields`. Every response carries
+`ThrottleTimeMs` 25.
+
+Pairs that differ in one distinction, and the distinction:
+
+- `incrementalAlterConfigsRequest-v{0,1}-delete`: a DELETE writes a null `Value`, `ffff` in the
+  classic v0 body and `00` in the compact v1 body. v1 is v0's body in flexible framing.
+- `describeConfigsRequest-v{3,4}-keys` / `-allKeys`: a named key list against the null list
+  (`ffffffff` classic, `00` compact); `-allKeys` / `-includeDocumentation` / `-noSynonyms` differ in
+  one boolean each. A request builder given no key list, or an empty one, writes `-allKeys`.
+- `createTopicsResponse-v7-*`: `TopicId` sits between `Name` and `ErrorCode`, and a failed topic
+  carries the zero uuid. `createTopicsResponse-v{5,6,7}-topicConfigError` carries
+  `TopicConfigErrorCode` in tag 0 (the tagged field is written only while it is not 0), so
+  `-ok` and `-error` have an empty tag buffer where it would be. v5, v6 and v7 requests are one
+  body.
+- `deleteTopicsRequest-v6-byName`: each name travels with the zero uuid; the builder takes names at
+  every version.
+- `createPartitionsRequest-v{2,3}-noAssignments` / `-explicitEmptyAssignments`: `Assignments` null
+  (`00`) against an empty list (`01`). The 4.3 controller reads a null list as "choose the
+  replicas" and an empty one as an explicit assignment, so a client writes `-noAssignments` for an
+  absent **or empty** list. The `-explicitEmptyAssignments` `fields` are therefore not builder
+  input: the vector exists to be told apart from the first.
+- `describeAcls/createAcls/deleteAcls` `-v3-userResource`: resource type 7 where `-basic` has 2.
+  v3's body is v2's, so every `-v3-basic` is its `-v2-basic` byte for byte.
+- `describeTopicPartitionsRequest-v0-noCursor` / `-cursor`: `Cursor` is a nullable struct, so it
+  carries a presence byte the schema does not show, `ff` for null and `01` before a present struct;
+  `NextCursor` does the same (`-nextCursor`, `-noNextCursor`). `-elrNull` / `-elrEmpty` /
+  `-elrPopulated`: the nullable ELR arrays are `00`, `01` or a list.
 
 ## Assignor vectors
 

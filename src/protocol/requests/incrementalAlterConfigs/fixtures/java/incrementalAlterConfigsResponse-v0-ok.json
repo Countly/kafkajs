@@ -1,0 +1,7 @@
+{
+  "message": "IncrementalAlterConfigsResponse",
+  "version": 0,
+  "case": "ok",
+  "hex": "00000019000000010000ffff02000a746573742d746f706963",
+  "fields": { "throttleTime": 25, "resources": [{ "errorCode": 0, "errorMessage": null, "resourceType": 2, "resourceName": "test-topic" }] }
+}

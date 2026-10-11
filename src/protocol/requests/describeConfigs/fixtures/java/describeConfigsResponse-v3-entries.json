@@ -1,0 +1,7 @@
+{
+  "message": "DescribeConfigsResponse",
+  "version": 3,
+  "case": "entries",
+  "hex": "00000019000000010000ffff02000a746573742d746f70696300000002000c726574656e74696f6e2e6d730005363030303000010000000002000c726574656e74696f6e2e6d73000536303030300100106c6f672e726574656e74696f6e2e6d73ffff0505001254686520726574656e74696f6e2074696d65000e636c65616e75702e706f6c696379000664656c6574650005000000000007ffff",
+  "fields": { "throttleTime": 25, "resources": [{ "errorCode": 0, "errorMessage": null, "resourceType": 2, "resourceName": "test-topic", "configEntries": [{ "configName": "retention.ms", "configValue": "60000", "readOnly": false, "configSource": 1, "isSensitive": false, "configSynonyms": [{ "configName": "retention.ms", "configValue": "60000", "configSource": 1 }, { "configName": "log.retention.ms", "configValue": null, "configSource": 5 }], "configType": 5, "documentation": "The retention time" }, { "configName": "cleanup.policy", "configValue": "delete", "readOnly": false, "configSource": 5, "isSensitive": false, "configSynonyms": [], "configType": 7, "documentation": null }] }] }
+}

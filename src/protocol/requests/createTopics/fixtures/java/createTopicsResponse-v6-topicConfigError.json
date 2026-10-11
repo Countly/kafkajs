@@ -1,0 +1,7 @@
+{
+  "message": "CreateTopicsResponse",
+  "version": 6,
+  "case": "topicConfigError",
+  "hex": "00000019020b746573742d746f70696300000000000003000200010002001d00",
+  "fields": { "throttleTime": 25, "topicErrors": [{ "topic": "test-topic", "errorCode": 0, "errorMessage": null, "topicConfigErrorCode": 29, "numPartitions": 3, "replicationFactor": 2, "configs": null }] }
+}

@@ -1,0 +1,7 @@
+{
+  "message": "DeleteTopicsResponse",
+  "version": 5,
+  "case": "deletionDisabled",
+  "hex": "00000019020c6f746865722d746f70696300491c546f7069632064656c6574696f6e2069732064697361626c65642e0000",
+  "fields": { "throttleTime": 25, "topicErrors": [{ "topic": "other-topic", "errorCode": 73, "errorMessage": "Topic deletion is disabled." }] }
+}

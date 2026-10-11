@@ -1,0 +1,7 @@
+{
+  "message": "DescribeTopicPartitionsRequest",
+  "version": 0,
+  "case": "noCursor",
+  "hex": "030c6f746865722d746f706963000b746573742d746f70696300000007d0ff00",
+  "fields": { "topics": ["other-topic", "test-topic"], "responsePartitionLimit": 2000, "cursor": null }
+}

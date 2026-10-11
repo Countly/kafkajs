@@ -1,0 +1,7 @@
+{
+  "message": "DeleteGroupsResponse",
+  "version": 2,
+  "case": "ok",
+  "hex": "00000019030b746573742d67726f75700000000c6f746865722d67726f757000000000",
+  "fields": { "throttleTime": 25, "results": [{ "groupId": "test-group", "errorCode": 0 }, { "groupId": "other-group", "errorCode": 0 }] }
+}

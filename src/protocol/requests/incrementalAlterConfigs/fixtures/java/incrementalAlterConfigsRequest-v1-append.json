@@ -1,0 +1,7 @@
+{
+  "message": "IncrementalAlterConfigsRequest",
+  "version": 1,
+  "case": "append",
+  "hex": "02020b746573742d746f706963020f636c65616e75702e706f6c6963790208636f6d7061637400000000",
+  "fields": { "resources": [{ "type": 2, "name": "test-topic", "configEntries": [{ "name": "cleanup.policy", "operation": 2, "value": "compact" }] }], "validateOnly": false }
+}

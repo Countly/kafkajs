@@ -1,0 +1,7 @@
+{
+  "message": "DescribeAclsRequest",
+  "version": 3,
+  "case": "userResource",
+  "hex": "0709557365723a626f62030b557365723a616c696365022a030300",
+  "fields": { "resourceType": 7, "resourceName": "User:bob", "resourcePatternType": 3, "principal": "User:alice", "host": "*", "operation": 3, "permissionType": 3 }
+}

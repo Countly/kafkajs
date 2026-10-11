@@ -1,0 +1,7 @@
+{
+  "message": "CreatePartitionsRequest",
+  "version": 2,
+  "case": "assignments",
+  "hex": "020b746573742d746f7069630000000303030000000100000002000300000002000000030000000013880000",
+  "fields": { "topicPartitions": [{ "topic": "test-topic", "count": 3, "assignments": [[1, 2], [2, 3]] }], "timeout": 5000, "validateOnly": false }
+}

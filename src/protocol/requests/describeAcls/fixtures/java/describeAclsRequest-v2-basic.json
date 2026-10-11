@@ -1,0 +1,7 @@
+{
+  "message": "DescribeAclsRequest",
+  "version": 2,
+  "case": "basic",
+  "hex": "020b746573742d746f706963030b557365723a616c696365022a030300",
+  "fields": { "resourceType": 2, "resourceName": "test-topic", "resourcePatternType": 3, "principal": "User:alice", "host": "*", "operation": 3, "permissionType": 3 }
+}

@@ -1,0 +1,7 @@
+{
+  "message": "IncrementalAlterConfigsRequest",
+  "version": 0,
+  "case": "delete",
+  "hex": "0000000102000a746573742d746f70696300000001000c726574656e74696f6e2e6d7301ffff00",
+  "fields": { "resources": [{ "type": 2, "name": "test-topic", "configEntries": [{ "name": "retention.ms", "operation": 1, "value": null }] }], "validateOnly": false }
+}

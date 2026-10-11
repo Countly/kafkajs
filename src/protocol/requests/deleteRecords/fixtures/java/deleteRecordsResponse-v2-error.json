@@ -1,0 +1,7 @@
+{
+  "message": "DeleteRecordsResponse",
+  "version": 2,
+  "case": "error",
+  "hex": "00000019020b746573742d746f7069630300000000000000000000000500000000000002ffffffffffffffff0001000000",
+  "fields": { "throttleTime": 25, "topics": [{ "topic": "test-topic", "partitions": [{ "partition": 0, "lowWatermark": "5", "errorCode": 0 }, { "partition": 2, "lowWatermark": "-1", "errorCode": 1 }] }] }
+}

@@ -1,0 +1,7 @@
+{
+  "message": "DeleteRecordsRequest",
+  "version": 2,
+  "case": "basic",
+  "hex": "020b746573742d746f706963030000000000000000000000050000000002ffffffffffffffff00000000138800",
+  "fields": { "topics": [{ "topic": "test-topic", "partitions": [{ "partition": 0, "offset": "5" }, { "partition": 2, "offset": "-1" }] }], "timeout": 5000 }
+}

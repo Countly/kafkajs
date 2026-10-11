@@ -1,0 +1,7 @@
+{
+  "message": "AlterConfigsResponse",
+  "version": 2,
+  "case": "ok",
+  "hex": "0000001902000000020b746573742d746f7069630000",
+  "fields": { "throttleTime": 25, "resources": [{ "errorCode": 0, "errorMessage": null, "resourceType": 2, "resourceName": "test-topic" }] }
+}

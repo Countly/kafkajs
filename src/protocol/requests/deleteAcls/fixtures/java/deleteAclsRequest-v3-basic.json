@@ -1,0 +1,7 @@
+{
+  "message": "DeleteAclsRequest",
+  "version": 3,
+  "case": "basic",
+  "hex": "02020b746573742d746f706963030b557365723a616c696365022a03030000",
+  "fields": { "filters": [{ "resourceType": 2, "resourceName": "test-topic", "resourcePatternType": 3, "principal": "User:alice", "host": "*", "operation": 3, "permissionType": 3 }] }
+}

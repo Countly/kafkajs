@@ -1,0 +1,7 @@
+{
+  "message": "AlterConfigsResponse",
+  "version": 2,
+  "case": "error",
+  "hex": "0000001903000000020b746573742d746f70696300002a0f496e76616c696420636f6e6669670402310000",
+  "fields": { "throttleTime": 25, "resources": [{ "errorCode": 0, "errorMessage": null, "resourceType": 2, "resourceName": "test-topic" }, { "errorCode": 42, "errorMessage": "Invalid config", "resourceType": 4, "resourceName": "1" }] }
+}

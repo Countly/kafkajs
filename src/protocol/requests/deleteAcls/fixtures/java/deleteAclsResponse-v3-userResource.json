@@ -1,0 +1,7 @@
+{
+  "message": "DeleteAclsResponse",
+  "version": 3,
+  "case": "userResource",
+  "hex": "0000001902000000020000000709557365723a626f62030b557365723a616c696365022a0303000000",
+  "fields": { "throttleTime": 25, "filterResponses": [{ "errorCode": 0, "errorMessage": null, "matchingAcls": [{ "errorCode": 0, "errorMessage": null, "resourceType": 7, "resourceName": "User:bob", "resourcePatternType": 3, "principal": "User:alice", "host": "*", "operation": 3, "permissionType": 3 }] }] }
+}

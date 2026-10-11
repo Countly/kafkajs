@@ -1,0 +1,7 @@
+{
+  "message": "CreatePartitionsResponse",
+  "version": 2,
+  "case": "ok",
+  "hex": "00000019020b746573742d746f7069630000000000",
+  "fields": { "throttleTime": 25, "topicErrors": [{ "topic": "test-topic", "errorCode": 0, "errorMessage": null }] }
+}

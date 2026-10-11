@@ -1,0 +1,7 @@
+{
+  "message": "DeleteTopicsResponse",
+  "version": 3,
+  "case": "deletionDisabled",
+  "hex": "0000001900000001000b6f746865722d746f7069630049",
+  "fields": { "throttleTime": 25, "topicErrors": [{ "topic": "other-topic", "errorCode": 73 }] }
+}

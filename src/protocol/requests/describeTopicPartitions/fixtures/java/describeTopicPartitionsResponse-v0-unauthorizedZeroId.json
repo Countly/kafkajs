@@ -1,0 +1,7 @@
+{
+  "message": "DescribeTopicPartitionsResponse",
+  "version": 0,
+  "case": "unauthorizedZeroId",
+  "hex": "0000001902001d0b746573742d746f7069630000000000000000000000000000000000018000000000ff00",
+  "fields": { "throttleTime": 25, "topics": [{ "errorCode": 29, "name": "test-topic", "topicId": null, "isInternal": false, "partitions": [], "topicAuthorizedOperations": -2147483648 }], "nextCursor": null }
+}

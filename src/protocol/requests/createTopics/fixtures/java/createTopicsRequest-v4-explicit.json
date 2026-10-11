@@ -1,0 +1,7 @@
+{
+  "message": "CreateTopicsRequest",
+  "version": 4,
+  "case": "explicit",
+  "hex": "00000001000a746573742d746f7069630000000300020000000000000002000c726574656e74696f6e2e6d7300053630303030000e636c65616e75702e706f6c696379ffff0000138801",
+  "fields": { "topics": [{ "topic": "test-topic", "numPartitions": 3, "replicationFactor": 2, "replicaAssignment": [], "configEntries": [{ "name": "retention.ms", "value": "60000" }, { "name": "cleanup.policy", "value": null }] }], "timeout": 5000, "validateOnly": true }
+}

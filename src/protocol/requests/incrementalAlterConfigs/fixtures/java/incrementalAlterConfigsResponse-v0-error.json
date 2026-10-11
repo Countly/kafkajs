@@ -1,0 +1,7 @@
+{
+  "message": "IncrementalAlterConfigsResponse",
+  "version": 0,
+  "case": "error",
+  "hex": "00000019000000020000ffff02000a746573742d746f7069630028003a496e76616c69642076616c756520636f6d706163742c666f6f20666f7220636f6e66696775726174696f6e20636c65616e75702e706f6c69637902000b6f746865722d746f706963",
+  "fields": { "throttleTime": 25, "resources": [{ "errorCode": 0, "errorMessage": null, "resourceType": 2, "resourceName": "test-topic" }, { "errorCode": 40, "errorMessage": "Invalid value compact,foo for configuration cleanup.policy", "resourceType": 2, "resourceName": "other-topic" }] }
+}

@@ -1,0 +1,7 @@
+{
+  "message": "CreateAclsResponse",
+  "version": 2,
+  "case": "error",
+  "hex": "0000001902002a16496e76616c6964207265736f75726365206e616d650000",
+  "fields": { "throttleTime": 25, "creationResponses": [{ "errorCode": 42, "errorMessage": "Invalid resource name" }] }
+}

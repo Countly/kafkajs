@@ -1,0 +1,7 @@
+{
+  "message": "DeleteTopicsResponse",
+  "version": 6,
+  "case": "ok",
+  "hex": "00000019030b746573742d746f7069630102030405060708090a0b0c0d0e0f10000000000c6f746865722d746f7069631112131415161718191a1b1c1d1e1f200000000000",
+  "fields": { "throttleTime": 25, "topicErrors": [{ "topic": "test-topic", "topicId": "01020304-0506-0708-090a-0b0c0d0e0f10", "errorCode": 0, "errorMessage": null }, { "topic": "other-topic", "topicId": "11121314-1516-1718-191a-1b1c1d1e1f20", "errorCode": 0, "errorMessage": null }] }
+}

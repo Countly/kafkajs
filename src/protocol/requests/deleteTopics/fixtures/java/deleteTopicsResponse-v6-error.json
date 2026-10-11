@@ -1,0 +1,7 @@
+{
+  "message": "DeleteTopicsResponse",
+  "version": 6,
+  "case": "error",
+  "hex": "00000019020b746573742d746f70696300000000000000000000000000000000000330546869732073657276657220646f6573206e6f7420686f7374207468697320746f7069632d706172746974696f6e2e0000",
+  "fields": { "throttleTime": 25, "topicErrors": [{ "topic": "test-topic", "topicId": null, "errorCode": 3, "errorMessage": "This server does not host this topic-partition." }] }
+}

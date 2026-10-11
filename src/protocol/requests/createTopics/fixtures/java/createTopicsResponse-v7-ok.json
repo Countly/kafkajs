@@ -1,0 +1,7 @@
+{
+  "message": "CreateTopicsResponse",
+  "version": 7,
+  "case": "ok",
+  "hex": "00000019020b746573742d746f7069630102030405060708090a0b0c0d0e0f10000000000000030002030d726574656e74696f6e2e6d73063630303030000100000f636c65616e75702e706f6c6963790764656c657465000500000000",
+  "fields": { "throttleTime": 25, "topicErrors": [{ "topic": "test-topic", "topicId": "01020304-0506-0708-090a-0b0c0d0e0f10", "errorCode": 0, "errorMessage": null, "topicConfigErrorCode": 0, "numPartitions": 3, "replicationFactor": 2, "configs": [{ "name": "retention.ms", "value": "60000", "readOnly": false, "configSource": 1, "isSensitive": false }, { "name": "cleanup.policy", "value": "delete", "readOnly": false, "configSource": 5, "isSensitive": false }] }] }
+}

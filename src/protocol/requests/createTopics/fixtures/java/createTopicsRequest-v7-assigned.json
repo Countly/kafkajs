@@ -1,0 +1,7 @@
+{
+  "message": "CreateTopicsRequest",
+  "version": 7,
+  "case": "assigned",
+  "hex": "020b746573742d746f706963ffffffffffff03000000000300000001000000020000000001030000000200000003000100000013880000",
+  "fields": { "topics": [{ "topic": "test-topic", "numPartitions": -1, "replicationFactor": -1, "replicaAssignment": [{ "partition": 0, "replicas": [1, 2] }, { "partition": 1, "replicas": [2, 3] }], "configEntries": [] }], "timeout": 5000, "validateOnly": false }
+}

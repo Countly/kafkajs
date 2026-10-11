@@ -1,0 +1,7 @@
+{
+  "message": "DescribeAclsResponse",
+  "version": 2,
+  "case": "basic",
+  "hex": "0000001900000002020b746573742d746f70696303020b557365723a616c696365022a0303000000",
+  "fields": { "throttleTime": 25, "errorCode": 0, "errorMessage": null, "resources": [{ "resourceType": 2, "resourceName": "test-topic", "resourcePatternType": 3, "acls": [{ "principal": "User:alice", "host": "*", "operation": 3, "permissionType": 3 }] }] }
+}

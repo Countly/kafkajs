@@ -1,0 +1,7 @@
+{
+  "message": "DescribeAclsResponse",
+  "version": 3,
+  "case": "userResource",
+  "hex": "00000019000000020709557365723a626f6203020b557365723a616c696365022a0303000000",
+  "fields": { "throttleTime": 25, "errorCode": 0, "errorMessage": null, "resources": [{ "resourceType": 7, "resourceName": "User:bob", "resourcePatternType": 3, "acls": [{ "principal": "User:alice", "host": "*", "operation": 3, "permissionType": 3 }] }] }
+}

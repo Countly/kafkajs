@@ -1,0 +1,7 @@
+{
+  "message": "DeleteAclsRequest",
+  "version": 3,
+  "case": "anyFilter",
+  "hex": "02010001000001010000",
+  "fields": { "filters": [{ "resourceType": 1, "resourceName": null, "resourcePatternType": 1, "principal": null, "host": null, "operation": 1, "permissionType": 1 }] }
+}

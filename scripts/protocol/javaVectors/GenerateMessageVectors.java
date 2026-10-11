@@ -9,20 +9,45 @@ import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
 import java.util.UUID;
+import java.util.function.Function;
 
 import org.apache.kafka.common.Uuid;
 import org.apache.kafka.common.message.AddOffsetsToTxnRequestData;
 import org.apache.kafka.common.message.AddOffsetsToTxnResponseData;
 import org.apache.kafka.common.message.AddPartitionsToTxnRequestData;
 import org.apache.kafka.common.message.AddPartitionsToTxnResponseData;
+import org.apache.kafka.common.message.AlterConfigsRequestData;
+import org.apache.kafka.common.message.AlterConfigsResponseData;
 import org.apache.kafka.common.message.ConsumerGroupDescribeRequestData;
 import org.apache.kafka.common.message.ConsumerGroupDescribeResponseData;
 import org.apache.kafka.common.message.ConsumerGroupHeartbeatRequestData;
 import org.apache.kafka.common.message.ConsumerGroupHeartbeatResponseData;
+import org.apache.kafka.common.message.CreateAclsRequestData;
+import org.apache.kafka.common.message.CreateAclsResponseData;
+import org.apache.kafka.common.message.CreatePartitionsRequestData;
+import org.apache.kafka.common.message.CreatePartitionsResponseData;
+import org.apache.kafka.common.message.CreateTopicsRequestData;
+import org.apache.kafka.common.message.CreateTopicsResponseData;
+import org.apache.kafka.common.message.DeleteAclsRequestData;
+import org.apache.kafka.common.message.DeleteAclsResponseData;
+import org.apache.kafka.common.message.DeleteGroupsRequestData;
+import org.apache.kafka.common.message.DeleteGroupsResponseData;
+import org.apache.kafka.common.message.DeleteRecordsRequestData;
+import org.apache.kafka.common.message.DeleteRecordsResponseData;
+import org.apache.kafka.common.message.DeleteTopicsRequestData;
+import org.apache.kafka.common.message.DeleteTopicsResponseData;
+import org.apache.kafka.common.message.DescribeAclsRequestData;
+import org.apache.kafka.common.message.DescribeAclsResponseData;
+import org.apache.kafka.common.message.DescribeConfigsRequestData;
+import org.apache.kafka.common.message.DescribeConfigsResponseData;
 import org.apache.kafka.common.message.DescribeGroupsRequestData;
 import org.apache.kafka.common.message.DescribeGroupsResponseData;
+import org.apache.kafka.common.message.DescribeTopicPartitionsRequestData;
+import org.apache.kafka.common.message.DescribeTopicPartitionsResponseData;
 import org.apache.kafka.common.message.EndTxnRequestData;
 import org.apache.kafka.common.message.EndTxnResponseData;
+import org.apache.kafka.common.message.IncrementalAlterConfigsRequestData;
+import org.apache.kafka.common.message.IncrementalAlterConfigsResponseData;
 import org.apache.kafka.common.message.InitProducerIdRequestData;
 import org.apache.kafka.common.message.ListGroupsRequestData;
 import org.apache.kafka.common.message.ListGroupsResponseData;
@@ -37,8 +62,9 @@ import org.apache.kafka.common.protocol.Message;
 import org.apache.kafka.common.protocol.ObjectSerializationCache;
 
 /**
- * Generates golden byte vectors for the APIs the KIP-848 consumer protocol, its admin surface and
- * the transaction protocol need, by running Apache Kafka's own generated message codecs
+ * Generates golden byte vectors for the APIs the KIP-848 consumer protocol and its admin surface,
+ * the transaction protocol and the admin client (configs, topics, records, groups, ACLs and topic
+ * partitions) need, by running Apache Kafka's own generated message codecs
  * ({@code org.apache.kafka.common.message.*Data}) over pinned values.
  *
  * <p>Development-only: run via {@code scripts/protocol/javaVectors/runAssignors.sh messages}.
@@ -137,6 +163,48 @@ public final class GenerateMessageVectors {
   private static final short ILLEGAL_GENERATION = 22;
   private static final short PRODUCER_FENCED = 90;
 
+  /** ThrottleTimeMs on every admin and group response, so a decoder that skips it fails. */
+  private static final int THROTTLE_TIME_MS = 25;
+
+  /** The admin client's default request timeout, sent as the broker-side timeout. */
+  private static final int ADMIN_TIMEOUT_MS = 5000;
+
+  private static final String OTHER_TOPIC_NAME = "other-topic";
+  private static final String OTHER_TOPIC_ID = "11121314-1516-1718-191a-1b1c1d1e1f20";
+
+  /** ConfigResource and ACL resource types, AlterConfigOp types. */
+  private static final int RESOURCE_TOPIC = 2;
+  private static final int RESOURCE_BROKER = 4;
+  private static final int RESOURCE_USER = 7;
+  private static final int OP_SET = 0;
+  private static final int OP_DELETE = 1;
+  private static final int OP_APPEND = 2;
+  private static final int OP_SUBTRACT = 3;
+
+  /** ACL enum values: PatternType LITERAL, AclOperation READ, AclPermissionType ALLOW. */
+  private static final int PATTERN_LITERAL = 3;
+  private static final int ACL_READ = 3;
+  private static final int ACL_ALLOW = 3;
+  private static final int ANY = 1;
+
+  /** The error codes the admin error cases carry. */
+  private static final short UNKNOWN_TOPIC_OR_PARTITION = 3;
+  private static final short TOPIC_ALREADY_EXISTS = 36;
+  private static final short INVALID_PARTITIONS = 37;
+  private static final short INVALID_CONFIG = 40;
+  private static final short INVALID_REQUEST = 42;
+  private static final short NON_EMPTY_GROUP = 68;
+  private static final short TOPIC_DELETION_DISABLED = 73;
+
+  /** The ACL the {@code basic} cases carry, and the same on a {@code USER} resource (v3). */
+  private static final Acl TOPIC_ACL =
+      new Acl(RESOURCE_TOPIC, TOPIC_NAME, PATTERN_LITERAL, "User:alice", "*", ACL_READ, ACL_ALLOW);
+  private static final Acl USER_ACL =
+      new Acl(RESOURCE_USER, "User:bob", PATTERN_LITERAL, "User:alice", "*", ACL_READ, ACL_ALLOW);
+
+  /** A filter that matches anything: every enum ANY, every string null. */
+  private static final Acl ANY_FILTER = new Acl(ANY, null, ANY, null, null, ANY, ANY);
+
   private GenerateMessageVectors() {}
 
   /** One vector: a message, the version to serialize it at, and the fields it was built from. */
@@ -157,6 +225,7 @@ public final class GenerateMessageVectors {
       this.fields = fields;
     }
 
+    /** @return the fixture file name: lower-camel message, version and case, then .json */
     String fileName() {
       char[] name = message.toCharArray();
       name[0] = Character.toLowerCase(name[0]);
@@ -205,6 +274,16 @@ public final class GenerateMessageVectors {
     vectors.addAll(addOffsetsToTxn());
     vectors.addAll(endTxn());
     vectors.addAll(txnOffsetCommit());
+    vectors.addAll(incrementalAlterConfigs());
+    vectors.addAll(describeConfigs());
+    vectors.addAll(alterConfigs());
+    vectors.addAll(createTopics());
+    vectors.addAll(deleteTopics());
+    vectors.addAll(createPartitions());
+    vectors.addAll(deleteRecords());
+    vectors.addAll(deleteGroups());
+    vectors.addAll(acls());
+    vectors.addAll(describeTopicPartitions());
     return vectors;
   }
 
@@ -1639,6 +1718,1393 @@ public final class GenerateMessageVectors {
                                 obj(
                                     kv("partition", String.valueOf(PARTITION_INDEX)),
                                     kv("errorCode", String.valueOf(errorCode))))))))));
+  }
+
+  /** @param value any number @return its JSON literal */
+  private static String num(long value) {
+    return String.valueOf(value);
+  }
+
+  /** @param items the elements @param render how one element becomes JSON @return a JSON array */
+  private static <T> String list(List<T> items, Function<T, String> render) {
+    List<String> rendered = new ArrayList<>();
+    for (T item : items) {
+      rendered.add(render.apply(item));
+    }
+    return "[" + String.join(", ", rendered) + "]";
+  }
+
+  /** @param uuid canonical form, or null @return Kafka's {@link Uuid} for it, zero for null */
+  private static Uuid uuid(String uuid) {
+    if (uuid == null) {
+      return Uuid.ZERO_UUID;
+    }
+    UUID standard = UUID.fromString(uuid);
+    return new Uuid(standard.getMostSignificantBits(), standard.getLeastSignificantBits());
+  }
+
+  /** One IncrementalAlterConfigs entry: the Kafka data and the fixture fields it came from. */
+  private record Alter(String name, int operation, String value) {
+    /** @return the Kafka {@code AlterableConfig} for this entry */
+    IncrementalAlterConfigsRequestData.AlterableConfig data() {
+      return new IncrementalAlterConfigsRequestData.AlterableConfig()
+          .setName(name)
+          .setConfigOperation((byte) operation)
+          .setValue(value);
+    }
+
+    /** @return this entry as the JSON of a fixture's {@code fields} */
+    String json() {
+      return obj(
+          kv("name", str(name)), kv("operation", num(operation)), kv("value", str(value)));
+    }
+  }
+
+  /** One IncrementalAlterConfigs resource. */
+  private record AlterResource(int type, String name, List<Alter> alters) {
+    /** @return the Kafka {@code AlterConfigsResource} for this resource */
+    IncrementalAlterConfigsRequestData.AlterConfigsResource data() {
+      return new IncrementalAlterConfigsRequestData.AlterConfigsResource()
+          .setResourceType((byte) type)
+          .setResourceName(name)
+          .setConfigs(
+              new IncrementalAlterConfigsRequestData.AlterableConfigCollection(
+                  alters.stream().map(Alter::data).iterator()));
+    }
+
+    /** @return this resource as the JSON of a fixture's {@code fields} */
+    String json() {
+      return obj(
+          kv("type", num(type)),
+          kv("name", str(name)),
+          kv("configEntries", list(alters, Alter::json)));
+    }
+  }
+
+  /** One per-resource result of AlterConfigs and IncrementalAlterConfigs. */
+  private record ResourceResult(int errorCode, String errorMessage, int type, String name) {
+    /** @return the IncrementalAlterConfigs response row for this result */
+    IncrementalAlterConfigsResponseData.AlterConfigsResourceResponse incremental() {
+      return new IncrementalAlterConfigsResponseData.AlterConfigsResourceResponse()
+          .setErrorCode((short) errorCode)
+          .setErrorMessage(errorMessage)
+          .setResourceType((byte) type)
+          .setResourceName(name);
+    }
+
+    /** @return the AlterConfigs response row for this result */
+    AlterConfigsResponseData.AlterConfigsResourceResponse legacy() {
+      return new AlterConfigsResponseData.AlterConfigsResourceResponse()
+          .setErrorCode((short) errorCode)
+          .setErrorMessage(errorMessage)
+          .setResourceType((byte) type)
+          .setResourceName(name);
+    }
+
+    /** @return this result as the JSON of a fixture's {@code fields} */
+    String json() {
+      return obj(
+          kv("errorCode", num(errorCode)),
+          kv("errorMessage", str(errorMessage)),
+          kv("resourceType", num(type)),
+          kv("resourceName", str(name)));
+    }
+  }
+
+  /**
+   * IncrementalAlterConfigs (44) v0-v1, request and response (KIP-339).
+   *
+   * <p>The request cases isolate one byte each: the operation (SET, APPEND, SUBTRACT, DELETE), the
+   * DELETE's null Value (a classic null string is {@code ffff}, a compact one {@code 00}), a second
+   * resource, and ValidateOnly. v1 is v0's body in flexible framing.
+   *
+   * @see <a href="https://github.com/apache/kafka/blob/4.3.1/clients/src/main/resources/common/message/IncrementalAlterConfigsRequest.json">IncrementalAlterConfigsRequest.json</a>
+   * @return the key-44 vectors
+   */
+  private static List<Vector> incrementalAlterConfigs() {
+    List<Vector> vectors = new ArrayList<>();
+    AlterResource set =
+        new AlterResource(
+            RESOURCE_TOPIC, TOPIC_NAME, List.of(new Alter("retention.ms", OP_SET, "60000")));
+    ResourceResult ok = new ResourceResult(0, null, RESOURCE_TOPIC, TOPIC_NAME);
+
+    for (short version : new short[] {0, 1}) {
+      vectors.add(incrementalRequest(version, "set", false, set));
+      vectors.add(
+          incrementalRequest(version, "append", false,
+              new AlterResource(RESOURCE_TOPIC, TOPIC_NAME,
+                  List.of(new Alter("cleanup.policy", OP_APPEND, "compact")))));
+      vectors.add(
+          incrementalRequest(version, "subtract", false,
+              new AlterResource(RESOURCE_TOPIC, TOPIC_NAME,
+                  List.of(new Alter("cleanup.policy", OP_SUBTRACT, "delete")))));
+      vectors.add(
+          incrementalRequest(version, "delete", false,
+              new AlterResource(RESOURCE_TOPIC, TOPIC_NAME,
+                  List.of(new Alter("retention.ms", OP_DELETE, null)))));
+      vectors.add(
+          incrementalRequest(version, "twoResources", false, set,
+              new AlterResource(RESOURCE_BROKER, "1",
+                  List.of(new Alter("background.threads", OP_SET, "20"),
+                      new Alter("log.cleaner.threads", OP_DELETE, null)))));
+      vectors.add(incrementalRequest(version, "validateOnly", true, set));
+
+      vectors.add(incrementalResponse(version, "ok", ok));
+      vectors.add(
+          incrementalResponse(version, "error", ok,
+              new ResourceResult(INVALID_CONFIG,
+                  "Invalid value compact,foo for configuration cleanup.policy",
+                  RESOURCE_TOPIC, OTHER_TOPIC_NAME)));
+    }
+
+    return vectors;
+  }
+
+  /**
+   * @param version the request version
+   * @param caseId the case name
+   * @param validateOnly the {@code ValidateOnly} flag
+   * @param resources the resources to alter
+   * @return one IncrementalAlterConfigs request vector
+   */
+  private static Vector incrementalRequest(
+      short version, String caseId, boolean validateOnly, AlterResource... resources) {
+    IncrementalAlterConfigsRequestData data =
+        new IncrementalAlterConfigsRequestData()
+            .setResources(
+                new IncrementalAlterConfigsRequestData.AlterConfigsResourceCollection(
+                    Arrays.stream(resources).map(AlterResource::data).iterator()))
+            .setValidateOnly(validateOnly);
+    return new Vector("incrementalAlterConfigs", "IncrementalAlterConfigsRequest", version, caseId,
+        data,
+        obj(
+            kv("resources", list(Arrays.asList(resources), AlterResource::json)),
+            kv("validateOnly", String.valueOf(validateOnly))));
+  }
+
+  /**
+   * @param version the response version
+   * @param caseId the case name
+   * @param results one result per altered resource
+   * @return one IncrementalAlterConfigs response vector
+   */
+  private static Vector incrementalResponse(
+      short version, String caseId, ResourceResult... results) {
+    IncrementalAlterConfigsResponseData data =
+        new IncrementalAlterConfigsResponseData()
+            .setThrottleTimeMs(THROTTLE_TIME_MS)
+            .setResponses(
+                Arrays.stream(results).map(ResourceResult::incremental).toList());
+    return new Vector("incrementalAlterConfigs", "IncrementalAlterConfigsResponse", version, caseId,
+        data,
+        obj(
+            kv("throttleTime", num(THROTTLE_TIME_MS)),
+            kv("resources", list(Arrays.asList(results), ResourceResult::json))));
+  }
+
+  /** One DescribeConfigs resource in a request. */
+  private record DescribedResource(int type, String name, List<String> configNames) {
+    /** @return the Kafka {@code DescribeConfigsResource} for this resource */
+    DescribeConfigsRequestData.DescribeConfigsResource data() {
+      return new DescribeConfigsRequestData.DescribeConfigsResource()
+          .setResourceType((byte) type)
+          .setResourceName(name)
+          .setConfigurationKeys(configNames);
+    }
+
+    /** @return this resource as the JSON of a fixture's {@code fields} */
+    String json() {
+      return obj(
+          kv("type", num(type)), kv("name", str(name)), kv("configNames", strArray(configNames)));
+    }
+  }
+
+  /** One synonym of a DescribeConfigs entry. */
+  private record Synonym(String name, String value, int source) {
+    /** @return the Kafka {@code DescribeConfigsSynonym} for this synonym */
+    DescribeConfigsResponseData.DescribeConfigsSynonym data() {
+      return new DescribeConfigsResponseData.DescribeConfigsSynonym()
+          .setName(name)
+          .setValue(value)
+          .setSource((byte) source);
+    }
+
+    /** @return this synonym as the JSON of a fixture's {@code fields} */
+    String json() {
+      return obj(
+          kv("configName", str(name)),
+          kv("configValue", str(value)),
+          kv("configSource", num(source)));
+    }
+  }
+
+  /** One DescribeConfigs entry; {@code configType} and {@code documentation} are v3+. */
+  private record ConfigEntry(
+      String name, String value, boolean readOnly, int source, boolean sensitive,
+      List<Synonym> synonyms, int configType, String documentation) {
+    /** @return the Kafka {@code DescribeConfigsResourceResult} for this entry */
+    DescribeConfigsResponseData.DescribeConfigsResourceResult data() {
+      return new DescribeConfigsResponseData.DescribeConfigsResourceResult()
+          .setName(name)
+          .setValue(value)
+          .setReadOnly(readOnly)
+          .setConfigSource((byte) source)
+          .setIsSensitive(sensitive)
+          .setSynonyms(synonyms.stream().map(Synonym::data).toList())
+          .setConfigType((byte) configType)
+          .setDocumentation(documentation);
+    }
+
+    /** @return this entry as the JSON of a fixture's {@code fields} */
+    String json() {
+      return obj(
+          kv("configName", str(name)),
+          kv("configValue", str(value)),
+          kv("readOnly", String.valueOf(readOnly)),
+          kv("configSource", num(source)),
+          kv("isSensitive", String.valueOf(sensitive)),
+          kv("configSynonyms", list(synonyms, Synonym::json)),
+          kv("configType", num(configType)),
+          kv("documentation", str(documentation)));
+    }
+  }
+
+  /**
+   * DescribeConfigs (32) v3-v4, request and response (KIP-569).
+   *
+   * <p>Four request cases, each a single distinction: {@code keys} is a non-empty key list (the
+   * compact string array a generic array writer would silently empty), {@code allKeys} the null
+   * list (a classic null array is {@code ffffffff}, a compact one {@code 00}),
+   * {@code includeDocumentation} differs from {@code allKeys} in the last boolean alone, and
+   * {@code noSynonyms} in IncludeSynonyms alone. {@code isDefault} is derived by the client from
+   * {@code configSource} and is not a field.
+   *
+   * @see <a href="https://github.com/apache/kafka/blob/4.3.1/clients/src/main/resources/common/message/DescribeConfigsResponse.json">DescribeConfigsResponse.json</a>
+   * @return the key-32 vectors
+   */
+  private static List<Vector> describeConfigs() {
+    List<Vector> vectors = new ArrayList<>();
+    DescribedResource keys =
+        new DescribedResource(
+            RESOURCE_TOPIC, TOPIC_NAME, List.of("cleanup.policy", "retention.ms"));
+    DescribedResource all = new DescribedResource(RESOURCE_TOPIC, TOPIC_NAME, null);
+    List<ConfigEntry> entries =
+        List.of(
+            new ConfigEntry("retention.ms", "60000", false, 1, false,
+                List.of(new Synonym("retention.ms", "60000", 1),
+                    new Synonym("log.retention.ms", null, 5)),
+                5, "The retention time"),
+            new ConfigEntry("cleanup.policy", "delete", false, 5, false, List.of(), 7, null));
+
+    for (short version : new short[] {3, 4}) {
+      vectors.add(describeRequest(version, "keys", true, false, keys));
+      vectors.add(describeRequest(version, "allKeys", true, false, all));
+      vectors.add(describeRequest(version, "includeDocumentation", true, true, all));
+      vectors.add(describeRequest(version, "noSynonyms", false, false, all));
+
+      DescribeConfigsResponseData data =
+          new DescribeConfigsResponseData()
+              .setThrottleTimeMs(THROTTLE_TIME_MS)
+              .setResults(
+                  List.of(
+                      new DescribeConfigsResponseData.DescribeConfigsResult()
+                          .setErrorCode((short) 0)
+                          .setErrorMessage(null)
+                          .setResourceType((byte) RESOURCE_TOPIC)
+                          .setResourceName(TOPIC_NAME)
+                          .setConfigs(entries.stream().map(ConfigEntry::data).toList())));
+      vectors.add(
+          new Vector("describeConfigs", "DescribeConfigsResponse", version, "entries", data,
+              obj(
+                  kv("throttleTime", num(THROTTLE_TIME_MS)),
+                  kv("resources",
+                      array(
+                          obj(
+                              kv("errorCode", "0"),
+                              kv("errorMessage", "null"),
+                              kv("resourceType", num(RESOURCE_TOPIC)),
+                              kv("resourceName", str(TOPIC_NAME)),
+                              kv("configEntries", list(entries, ConfigEntry::json))))))));
+    }
+
+    return vectors;
+  }
+
+  /**
+   * @param version the request version
+   * @param caseId the case name
+   * @param synonyms the {@code IncludeSynonyms} flag
+   * @param documentation the {@code IncludeDocumentation} flag
+   * @param resource the resource to describe
+   * @return one DescribeConfigs request vector
+   */
+  private static Vector describeRequest(
+      short version, String caseId, boolean synonyms, boolean documentation,
+      DescribedResource resource) {
+    DescribeConfigsRequestData data =
+        new DescribeConfigsRequestData()
+            .setResources(List.of(resource.data()))
+            .setIncludeSynonyms(synonyms)
+            .setIncludeDocumentation(documentation);
+    return new Vector("describeConfigs", "DescribeConfigsRequest", version, caseId, data,
+        obj(
+            kv("resources", array(resource.json())),
+            kv("includeSynonyms", String.valueOf(synonyms)),
+            kv("includeDocumentation", String.valueOf(documentation))));
+  }
+
+  /**
+   * AlterConfigs (33) v2, request and response: v1's body in flexible framing. The request sets two
+   * keys of one topic ({@code basic}) or the same with ValidateOnly ({@code validateOnly}); the
+   * response is a per-resource {@code ok} or {@code error}.
+   *
+   * @return the key-33 vectors
+   */
+  private static List<Vector> alterConfigs() {
+    List<Vector> vectors = new ArrayList<>();
+    String api = "alterConfigs";
+
+    for (boolean validateOnly : new boolean[] {false, true}) {
+      AlterConfigsRequestData data =
+          new AlterConfigsRequestData()
+              .setResources(
+                  new AlterConfigsRequestData.AlterConfigsResourceCollection(
+                      List.of(
+                              new AlterConfigsRequestData.AlterConfigsResource()
+                                  .setResourceType((byte) RESOURCE_TOPIC)
+                                  .setResourceName(TOPIC_NAME)
+                                  .setConfigs(
+                                      new AlterConfigsRequestData.AlterableConfigCollection(
+                                          List.of(
+                                                  new AlterConfigsRequestData.AlterableConfig()
+                                                      .setName("retention.ms")
+                                                      .setValue("60000"),
+                                                  new AlterConfigsRequestData.AlterableConfig()
+                                                      .setName("cleanup.policy")
+                                                      .setValue("compact"))
+                                              .iterator())))
+                          .iterator()))
+              .setValidateOnly(validateOnly);
+      vectors.add(
+          new Vector(api, "AlterConfigsRequest", (short) 2, validateOnly ? "validateOnly" : "basic",
+              data,
+              obj(
+                  kv("resources",
+                      array(
+                          obj(
+                              kv("type", num(RESOURCE_TOPIC)),
+                              kv("name", str(TOPIC_NAME)),
+                              kv("configEntries",
+                                  array(
+                                      obj(kv("name", str("retention.ms")),
+                                          kv("value", str("60000"))),
+                                      obj(kv("name", str("cleanup.policy")),
+                                          kv("value", str("compact")))))))),
+                  kv("validateOnly", String.valueOf(validateOnly)))));
+    }
+
+    ResourceResult ok = new ResourceResult(0, null, RESOURCE_TOPIC, TOPIC_NAME);
+    ResourceResult bad =
+        new ResourceResult(INVALID_REQUEST, "Invalid config", RESOURCE_BROKER, "1");
+    for (ResourceResult[] results :
+        new ResourceResult[][] {new ResourceResult[] {ok}, new ResourceResult[] {ok, bad}}) {
+      AlterConfigsResponseData data =
+          new AlterConfigsResponseData()
+              .setThrottleTimeMs(THROTTLE_TIME_MS)
+              .setResponses(Arrays.stream(results).map(ResourceResult::legacy).toList());
+      vectors.add(
+          new Vector(api, "AlterConfigsResponse", (short) 2, results.length == 1 ? "ok" : "error",
+              data,
+              obj(
+                  kv("throttleTime", num(THROTTLE_TIME_MS)),
+                  kv("resources", list(Arrays.asList(results), ResourceResult::json)))));
+    }
+
+    return vectors;
+  }
+
+  /** A replica assignment of one new topic partition. */
+  private record Assignment(int partition, List<Integer> replicas) {
+    /** @return the Kafka {@code CreatableReplicaAssignment} for this assignment */
+    CreateTopicsRequestData.CreatableReplicaAssignment data() {
+      return new CreateTopicsRequestData.CreatableReplicaAssignment()
+          .setPartitionIndex(partition)
+          .setBrokerIds(replicas);
+    }
+
+    /** @return this assignment as the JSON of a fixture's {@code fields} */
+    String json() {
+      return obj(kv("partition", num(partition)), kv("replicas", intArray(replicas)));
+    }
+  }
+
+  /** A name and a nullable value: a CreateTopics config entry. */
+  private record Entry(String name, String value) {
+    /** @return the Kafka {@code CreatableTopicConfig} for this entry */
+    CreateTopicsRequestData.CreatableTopicConfig data() {
+      return new CreateTopicsRequestData.CreatableTopicConfig().setName(name).setValue(value);
+    }
+
+    /** @return this entry as the JSON of a fixture's {@code fields} */
+    String json() {
+      return obj(kv("name", str(name)), kv("value", str(value)));
+    }
+  }
+
+  /** One CreateTopics request topic. */
+  private record NewTopic(
+      String name, int numPartitions, int replicationFactor, List<Assignment> assignments,
+      List<Entry> configs) {
+    /** @return the Kafka {@code CreatableTopic} for this topic */
+    CreateTopicsRequestData.CreatableTopic data() {
+      return new CreateTopicsRequestData.CreatableTopic()
+          .setName(name)
+          .setNumPartitions(numPartitions)
+          .setReplicationFactor((short) replicationFactor)
+          .setAssignments(
+              new CreateTopicsRequestData.CreatableReplicaAssignmentCollection(
+                  assignments.stream().map(Assignment::data).iterator()))
+          .setConfigs(
+              new CreateTopicsRequestData.CreatableTopicConfigCollection(
+                  configs.stream().map(Entry::data).iterator()));
+    }
+
+    /** @return this topic as the JSON of a fixture's {@code fields} */
+    String json() {
+      return obj(
+          kv("topic", str(name)),
+          kv("numPartitions", num(numPartitions)),
+          kv("replicationFactor", num(replicationFactor)),
+          kv("replicaAssignment", list(assignments, Assignment::json)),
+          kv("configEntries", list(configs, Entry::json)));
+    }
+  }
+
+  /** One config the broker read back for a created topic (v5+). */
+  private record TopicConfig(
+      String name, String value, boolean readOnly, int source, boolean sensitive) {
+    /** @return the Kafka {@code CreatableTopicConfigs} for this config */
+    CreateTopicsResponseData.CreatableTopicConfigs data() {
+      return new CreateTopicsResponseData.CreatableTopicConfigs()
+          .setName(name)
+          .setValue(value)
+          .setReadOnly(readOnly)
+          .setConfigSource((byte) source)
+          .setIsSensitive(sensitive);
+    }
+
+    /** @return this config as the JSON of a fixture's {@code fields} */
+    String json() {
+      return obj(
+          kv("name", str(name)),
+          kv("value", str(value)),
+          kv("readOnly", String.valueOf(readOnly)),
+          kv("configSource", num(source)),
+          kv("isSensitive", String.valueOf(sensitive)));
+    }
+  }
+
+  /** One CreateTopics request case: the topic it creates and whether it only validates. */
+  private record CreateCase(String caseId, NewTopic topic, boolean validateOnly) {}
+
+  /** One CreateTopics result topic; the fields after {@code errorMessage} are v5+, topicId v7. */
+  private record CreatedTopic(
+      String name, String topicId, int errorCode, String errorMessage, int topicConfigErrorCode,
+      int numPartitions, int replicationFactor, List<TopicConfig> configs) {
+    /**
+     * @param version the response version, which decides the fields written
+     * @return the Kafka {@code CreatableTopicResult} for this topic
+     */
+    CreateTopicsResponseData.CreatableTopicResult data(short version) {
+      CreateTopicsResponseData.CreatableTopicResult data =
+          new CreateTopicsResponseData.CreatableTopicResult()
+              .setName(name)
+              .setErrorCode((short) errorCode)
+              .setErrorMessage(errorMessage);
+      if (version >= 5) {
+        data.setTopicConfigErrorCode((short) topicConfigErrorCode)
+            .setNumPartitions(numPartitions)
+            .setReplicationFactor((short) replicationFactor)
+            .setConfigs(configs == null ? null : configs.stream().map(TopicConfig::data).toList());
+      }
+      if (version >= 7) {
+        data.setTopicId(uuid(topicId));
+      }
+      return data;
+    }
+
+    /**
+     * @param version the response version, which decides the fields written
+     * @return this topic as the JSON of a fixture's {@code fields}
+     */
+    String json(short version) {
+      List<String> entries = new ArrayList<>();
+      entries.add(kv("topic", str(name)));
+      if (version >= 7) {
+        entries.add(kv("topicId", str(topicId)));
+      }
+      entries.add(kv("errorCode", num(errorCode)));
+      entries.add(kv("errorMessage", str(errorMessage)));
+      if (version >= 5) {
+        entries.add(kv("topicConfigErrorCode", num(topicConfigErrorCode)));
+        entries.add(kv("numPartitions", num(numPartitions)));
+        entries.add(kv("replicationFactor", num(replicationFactor)));
+        entries.add(kv("configs", configs == null ? "null" : list(configs, TopicConfig::json)));
+      }
+      return obj(entries.toArray(new String[0]));
+    }
+  }
+
+  /**
+   * CreateTopics (19) v4-v7, request and response (KIP-464, KIP-525, KIP-516).
+   *
+   * <p>v4 is v3's classic body; v5 is flexible and its response adds NumPartitions,
+   * ReplicationFactor, a nullable Configs list and, in tag 0, TopicConfigErrorCode, which the
+   * writer leaves out while it is 0 ({@code topicConfigError} is the case that sets it); v7 puts
+   * TopicId between Name and ErrorCode. The request is identical at v5, v6 and v7. A failed topic
+   * carries the zero TopicId, which the client decodes as null.
+   *
+   * @see <a href="https://github.com/apache/kafka/blob/4.3.1/clients/src/main/resources/common/message/CreateTopicsResponse.json">CreateTopicsResponse.json</a>
+   * @return the key-19 vectors
+   */
+  private static List<Vector> createTopics() {
+    List<Vector> vectors = new ArrayList<>();
+    String api = "createTopics";
+    NewTopic defaults = new NewTopic(TOPIC_NAME, -1, -1, List.of(), List.of());
+    NewTopic explicit =
+        new NewTopic(TOPIC_NAME, 3, 2, List.of(),
+            List.of(new Entry("retention.ms", "60000"), new Entry("cleanup.policy", null)));
+    NewTopic assigned =
+        new NewTopic(TOPIC_NAME, -1, -1,
+            List.of(new Assignment(0, List.of(1, 2)), new Assignment(1, List.of(2, 3))), List.of());
+    List<TopicConfig> read =
+        List.of(
+            new TopicConfig("retention.ms", "60000", false, 1, false),
+            new TopicConfig("cleanup.policy", "delete", false, 5, false));
+    CreatedTopic ok = new CreatedTopic(TOPIC_NAME, TOPIC_ID, 0, null, 0, 3, 2, read);
+    CreatedTopic exists =
+        new CreatedTopic(TOPIC_NAME, null, TOPIC_ALREADY_EXISTS,
+            "Topic 'test-topic' already exists.", 0, -1, -1, null);
+    CreatedTopic configError =
+        new CreatedTopic(TOPIC_NAME, TOPIC_ID, 0, null, TOPIC_AUTHORIZATION_FAILED, 3, 2, null);
+
+    List<CreateCase> cases =
+        List.of(
+            new CreateCase("defaults", defaults, false),
+            new CreateCase("explicit", explicit, true),
+            new CreateCase("assigned", assigned, false));
+
+    for (short version : new short[] {4, 5, 6, 7}) {
+      for (CreateCase c : cases) {
+        CreateTopicsRequestData data =
+            new CreateTopicsRequestData()
+                .setTopics(
+                    new CreateTopicsRequestData.CreatableTopicCollection(
+                        List.of(c.topic().data()).iterator()))
+                .setTimeoutMs(ADMIN_TIMEOUT_MS)
+                .setValidateOnly(c.validateOnly());
+        vectors.add(
+            new Vector(api, "CreateTopicsRequest", version, c.caseId(), data,
+                obj(
+                    kv("topics", array(c.topic().json())),
+                    kv("timeout", num(ADMIN_TIMEOUT_MS)),
+                    kv("validateOnly", String.valueOf(c.validateOnly())))));
+      }
+
+      vectors.add(createResponse(version, "ok", ok));
+      vectors.add(createResponse(version, "error", exists));
+      if (version >= 5) {
+        vectors.add(createResponse(version, "topicConfigError", configError));
+      }
+    }
+
+    return vectors;
+  }
+
+  /**
+   * @param version the response version
+   * @param caseId the case name
+   * @param topic the one topic result
+   * @return one CreateTopics response vector
+   */
+  private static Vector createResponse(short version, String caseId, CreatedTopic topic) {
+    CreateTopicsResponseData data =
+        new CreateTopicsResponseData()
+            .setThrottleTimeMs(THROTTLE_TIME_MS)
+            .setTopics(
+                new CreateTopicsResponseData.CreatableTopicResultCollection(
+                    List.of(topic.data(version)).iterator()));
+    return new Vector("createTopics", "CreateTopicsResponse", version, caseId, data,
+        obj(
+            kv("throttleTime", num(THROTTLE_TIME_MS)),
+            kv("topicErrors", array(topic.json(version)))));
+  }
+
+  /** One DeleteTopics result topic; topicId is v6, errorMessage v5. */
+  private record DeletedTopic(String name, String topicId, int errorCode, String errorMessage) {
+    /**
+     * @param version the response version, which decides the fields written
+     * @return the Kafka {@code DeletableTopicResult} for this topic
+     */
+    DeleteTopicsResponseData.DeletableTopicResult data(short version) {
+      DeleteTopicsResponseData.DeletableTopicResult data =
+          new DeleteTopicsResponseData.DeletableTopicResult()
+              .setName(name)
+              .setErrorCode((short) errorCode);
+      if (version >= 5) {
+        data.setErrorMessage(errorMessage);
+      }
+      if (version >= 6) {
+        data.setTopicId(uuid(topicId));
+      }
+      return data;
+    }
+
+    /**
+     * @param version the response version, which decides the fields written
+     * @return this topic as the JSON of a fixture's {@code fields}
+     */
+    String json(short version) {
+      List<String> entries = new ArrayList<>();
+      entries.add(kv("topic", str(name)));
+      if (version >= 6) {
+        entries.add(kv("topicId", str(topicId)));
+      }
+      entries.add(kv("errorCode", num(errorCode)));
+      if (version >= 5) {
+        entries.add(kv("errorMessage", str(errorMessage)));
+      }
+      return obj(entries.toArray(new String[0]));
+    }
+  }
+
+  /**
+   * DeleteTopics (20) v2-v6, request and response.
+   *
+   * <p>v2 is v1's body, v3 may answer TOPIC_DELETION_DISABLED, v4 is flexible, v5 adds ErrorMessage
+   * and v6 replaces TopicNames with Topics[{Name, TopicId}] and puts TopicId between Name and
+   * ErrorCode in the answer. The client deletes by name, so every request case names two topics
+   * and, from v6, sends each with the zero TopicId; the builder takes names at every version.
+   *
+   * @see <a href="https://github.com/apache/kafka/blob/4.3.1/clients/src/main/resources/common/message/DeleteTopicsRequest.json">DeleteTopicsRequest.json</a>
+   * @return the key-20 vectors
+   */
+  private static List<Vector> deleteTopics() {
+    List<Vector> vectors = new ArrayList<>();
+    String api = "deleteTopics";
+    DeletedTopic ok = new DeletedTopic(TOPIC_NAME, TOPIC_ID, 0, null);
+    DeletedTopic okOther = new DeletedTopic(OTHER_TOPIC_NAME, OTHER_TOPIC_ID, 0, null);
+    DeletedTopic unknown =
+        new DeletedTopic(TOPIC_NAME, null, UNKNOWN_TOPIC_OR_PARTITION,
+            "This server does not host this topic-partition.");
+    DeletedTopic disabled =
+        new DeletedTopic(
+            OTHER_TOPIC_NAME, null, TOPIC_DELETION_DISABLED, "Topic deletion is disabled.");
+
+    for (short version : new short[] {2, 3, 4, 5, 6}) {
+      DeleteTopicsRequestData request =
+          new DeleteTopicsRequestData().setTimeoutMs(ADMIN_TIMEOUT_MS);
+      if (version >= 6) {
+        request.setTopics(
+            List.of(
+                new DeleteTopicsRequestData.DeleteTopicState()
+                    .setName(TOPIC_NAME)
+                    .setTopicId(Uuid.ZERO_UUID),
+                new DeleteTopicsRequestData.DeleteTopicState()
+                    .setName(OTHER_TOPIC_NAME)
+                    .setTopicId(Uuid.ZERO_UUID)));
+      } else {
+        request.setTopicNames(List.of(TOPIC_NAME, OTHER_TOPIC_NAME));
+      }
+      vectors.add(
+          new Vector(api, "DeleteTopicsRequest", version, version >= 6 ? "byName" : "names",
+              request,
+              obj(
+                  kv("topics", strArray(List.of(TOPIC_NAME, OTHER_TOPIC_NAME))),
+                  kv("timeout", num(ADMIN_TIMEOUT_MS)))));
+
+      vectors.add(deleteResponse(version, "ok", ok, okOther));
+      vectors.add(deleteResponse(version, "error", unknown));
+      if (version >= 3) {
+        vectors.add(deleteResponse(version, "deletionDisabled", disabled));
+      }
+    }
+
+    return vectors;
+  }
+
+  /**
+   * @param version the response version
+   * @param caseId the case name
+   * @param topics one result per deleted topic
+   * @return one DeleteTopics response vector
+   */
+  private static Vector deleteResponse(short version, String caseId, DeletedTopic... topics) {
+    DeleteTopicsResponseData data =
+        new DeleteTopicsResponseData()
+            .setThrottleTimeMs(THROTTLE_TIME_MS)
+            .setResponses(
+                new DeleteTopicsResponseData.DeletableTopicResultCollection(
+                    Arrays.stream(topics).map(t -> t.data(version)).iterator()));
+    return new Vector("deleteTopics", "DeleteTopicsResponse", version, caseId, data,
+        obj(
+            kv("throttleTime", num(THROTTLE_TIME_MS)),
+            kv("topicErrors", list(Arrays.asList(topics), t -> t.json(version)))));
+  }
+
+  /**
+   * CreatePartitions (37) v2-v3, request and response.
+   *
+   * <p>Assignments is a nullable array: {@code noAssignments} writes it null (a compact null is
+   * {@code 00}, which the 4.3 controller reads as "choose the replicas") and
+   * {@code explicitEmptyAssignments} writes an empty list ({@code 01}, which it reads as an
+   * explicit and wrong assignment). The second exists to be told apart from the first: a client
+   * writes neither an absent nor an empty list as {@code 01}, so its {@code fields} are not builder
+   * input.
+   *
+   * @see <a href="https://github.com/apache/kafka/blob/4.3.1/clients/src/main/resources/common/message/CreatePartitionsRequest.json">CreatePartitionsRequest.json</a>
+   * @return the key-37 vectors
+   */
+  private static List<Vector> createPartitions() {
+    List<Vector> vectors = new ArrayList<>();
+    String api = "createPartitions";
+    List<Expansion> expansions =
+        List.of(
+            new Expansion("noAssignments", null, "null"),
+            new Expansion("explicitEmptyAssignments", List.of(), "[]"),
+            new Expansion(
+                "assignments", List.of(List.of(1, 2), List.of(2, 3)), "[[1, 2], [2, 3]]"));
+
+    for (short version : new short[] {2, 3}) {
+      for (Expansion e : expansions) {
+        CreatePartitionsRequestData data =
+            new CreatePartitionsRequestData()
+                .setTopics(
+                    new CreatePartitionsRequestData.CreatePartitionsTopicCollection(
+                        List.of(
+                                new CreatePartitionsRequestData.CreatePartitionsTopic()
+                                    .setName(TOPIC_NAME)
+                                    .setCount(3)
+                                    .setAssignments(
+                                        e.assignments() == null
+                                            ? null
+                                            : e.assignments().stream()
+                                                .map(
+                                                    brokerIds ->
+                                                        new CreatePartitionsRequestData
+                                                                .CreatePartitionsAssignment()
+                                                            .setBrokerIds(brokerIds))
+                                                .toList()))
+                            .iterator()))
+                .setTimeoutMs(ADMIN_TIMEOUT_MS)
+                .setValidateOnly(false);
+        vectors.add(
+            new Vector(api, "CreatePartitionsRequest", version, e.caseId(), data,
+                obj(
+                    kv("topicPartitions",
+                        array(
+                            obj(
+                                kv("topic", str(TOPIC_NAME)),
+                                kv("count", "3"),
+                                kv("assignments", e.json())))),
+                    kv("timeout", num(ADMIN_TIMEOUT_MS)),
+                    kv("validateOnly", "false"))));
+      }
+
+      vectors.add(createPartitionsResponse(version, "ok", (short) 0, null));
+      vectors.add(
+          createPartitionsResponse(
+              version, "error", INVALID_PARTITIONS, "Topic already has 3 partitions."));
+    }
+
+    return vectors;
+  }
+
+  /** One CreatePartitions request case: the Assignments it writes (null for none), and its JSON. */
+  private record Expansion(String caseId, List<List<Integer>> assignments, String json) {}
+
+  /**
+   * @param version the response version
+   * @param caseId the case name
+   * @param errorCode the topic's error code
+   * @param errorMessage the topic's error message, or null
+   * @return one CreatePartitions response vector
+   */
+  private static Vector createPartitionsResponse(
+      short version, String caseId, short errorCode, String errorMessage) {
+    return new Vector("createPartitions", "CreatePartitionsResponse", version, caseId,
+        new CreatePartitionsResponseData()
+            .setThrottleTimeMs(THROTTLE_TIME_MS)
+            .setResults(
+                List.of(
+                    new CreatePartitionsResponseData.CreatePartitionsTopicResult()
+                        .setName(TOPIC_NAME)
+                        .setErrorCode(errorCode)
+                        .setErrorMessage(errorMessage))),
+        obj(
+            kv("throttleTime", num(THROTTLE_TIME_MS)),
+            kv("topicErrors",
+                array(
+                    obj(
+                        kv("topic", str(TOPIC_NAME)),
+                        kv("errorCode", num(errorCode)),
+                        kv("errorMessage", str(errorMessage)))))));
+  }
+
+  /**
+   * DeleteRecords (21) v2, request and response: v1's body in flexible framing. Two partitions are
+   * truncated, one to an offset and one to -1 (the high watermark); the answer carries each
+   * partition's new low watermark, or OFFSET_OUT_OF_RANGE (1).
+   *
+   * @return the key-21 vectors
+   */
+  private static List<Vector> deleteRecords() {
+    List<Vector> vectors = new ArrayList<>();
+    String api = "deleteRecords";
+
+    DeleteRecordsRequestData request =
+        new DeleteRecordsRequestData()
+            .setTopics(
+                List.of(
+                    new DeleteRecordsRequestData.DeleteRecordsTopic()
+                        .setName(TOPIC_NAME)
+                        .setPartitions(List.of(truncation(0, 5L), truncation(2, -1L)))))
+            .setTimeoutMs(ADMIN_TIMEOUT_MS);
+    String requested =
+        array(
+            obj(kv("partition", "0"), kv("offset", str("5"))),
+            obj(kv("partition", "2"), kv("offset", str("-1"))));
+    vectors.add(
+        new Vector(api, "DeleteRecordsRequest", (short) 2, "basic", request,
+            obj(
+                kv("topics", array(obj(kv("topic", str(TOPIC_NAME)), kv("partitions", requested)))),
+                kv("timeout", num(ADMIN_TIMEOUT_MS)))));
+
+    for (short code : new short[] {0, 1}) {
+      long low = code == 0 ? 12L : -1L;
+      DeleteRecordsResponseData.DeleteRecordsPartitionResultCollection partitions =
+          new DeleteRecordsResponseData.DeleteRecordsPartitionResultCollection(
+              List.of(result(0, 5L, (short) 0), result(2, low, code)).iterator());
+      DeleteRecordsResponseData response =
+          new DeleteRecordsResponseData()
+              .setThrottleTimeMs(THROTTLE_TIME_MS)
+              .setTopics(
+                  new DeleteRecordsResponseData.DeleteRecordsTopicResultCollection(
+                      List.of(
+                              new DeleteRecordsResponseData.DeleteRecordsTopicResult()
+                                  .setName(TOPIC_NAME)
+                                  .setPartitions(partitions))
+                          .iterator()));
+      String answered =
+          array(
+              obj(kv("partition", "0"), kv("lowWatermark", str("5")), kv("errorCode", "0")),
+              obj(kv("partition", "2"), kv("lowWatermark", str(String.valueOf(low))),
+                  kv("errorCode", num(code))));
+      vectors.add(
+          new Vector(api, "DeleteRecordsResponse", (short) 2, code == 0 ? "ok" : "error", response,
+              obj(
+                  kv("throttleTime", num(THROTTLE_TIME_MS)),
+                  kv("topics",
+                      array(obj(kv("topic", str(TOPIC_NAME)), kv("partitions", answered)))))));
+    }
+
+    return vectors;
+  }
+
+  /**
+   * @param partition the partition index
+   * @param offset the offset to truncate before
+   * @return one DeleteRecords request partition
+   */
+  private static DeleteRecordsRequestData.DeleteRecordsPartition truncation(
+      int partition, long offset) {
+    return new DeleteRecordsRequestData.DeleteRecordsPartition()
+        .setPartitionIndex(partition)
+        .setOffset(offset);
+  }
+
+  /**
+   * @param partition the partition index
+   * @param lowWatermark the new low watermark
+   * @param errorCode the partition's error code
+   * @return one DeleteRecords response partition
+   */
+  private static DeleteRecordsResponseData.DeleteRecordsPartitionResult result(
+      int partition, long lowWatermark, short errorCode) {
+    return new DeleteRecordsResponseData.DeleteRecordsPartitionResult()
+        .setPartitionIndex(partition)
+        .setLowWatermark(lowWatermark)
+        .setErrorCode(errorCode);
+  }
+
+  /**
+   * DeleteGroups (42) v2, request and response: v1's body in flexible framing. Two groups are
+   * deleted; the answer is both deleted ({@code ok}) or one refused as non-empty and one unknown
+   * ({@code error}).
+   *
+   * @return the key-42 vectors
+   */
+  private static List<Vector> deleteGroups() {
+    List<Vector> vectors = new ArrayList<>();
+    String api = "deleteGroups";
+
+    vectors.add(
+        new Vector(api, "DeleteGroupsRequest", (short) 2, "basic",
+            new DeleteGroupsRequestData().setGroupsNames(List.of(GROUP_ID, OTHER_GROUP_ID)),
+            obj(kv("groupIds", strArray(List.of(GROUP_ID, OTHER_GROUP_ID))))));
+
+    for (short[] codes : new short[][] {{0, 0}, {NON_EMPTY_GROUP, GROUP_ID_NOT_FOUND}}) {
+      DeleteGroupsResponseData response =
+          new DeleteGroupsResponseData()
+              .setThrottleTimeMs(THROTTLE_TIME_MS)
+              .setResults(
+                  new DeleteGroupsResponseData.DeletableGroupResultCollection(
+                      List.of(deleted(GROUP_ID, codes[0]), deleted(OTHER_GROUP_ID, codes[1]))
+                          .iterator()));
+      String results =
+          array(
+              obj(kv("groupId", str(GROUP_ID)), kv("errorCode", num(codes[0]))),
+              obj(kv("groupId", str(OTHER_GROUP_ID)), kv("errorCode", num(codes[1]))));
+      vectors.add(
+          new Vector(api, "DeleteGroupsResponse", (short) 2, codes[0] == 0 ? "ok" : "error",
+              response,
+              obj(kv("throttleTime", num(THROTTLE_TIME_MS)), kv("results", results))));
+    }
+
+    return vectors;
+  }
+
+  /**
+   * @param groupId the group
+   * @param code its error code
+   * @return one DeleteGroups response result
+   */
+  private static DeleteGroupsResponseData.DeletableGroupResult deleted(
+      String groupId, short code) {
+    return new DeleteGroupsResponseData.DeletableGroupResult()
+        .setGroupId(groupId)
+        .setErrorCode(code);
+  }
+
+  /** One ACL (or ACL filter): the seven values the three ACL APIs share. */
+  private record Acl(
+      int resourceType, String resourceName, int patternType, String principal, String host,
+      int operation, int permissionType) {
+    /** @return this ACL as the JSON of a fixture's {@code fields} */
+    String json() {
+      return obj(
+          kv("resourceType", num(resourceType)),
+          kv("resourceName", str(resourceName)),
+          kv("resourcePatternType", num(patternType)),
+          kv("principal", str(principal)),
+          kv("host", str(host)),
+          kv("operation", num(operation)),
+          kv("permissionType", num(permissionType)));
+    }
+  }
+
+  /** One ACL case: its name and the ACL every API of the case carries. */
+  private record AclCase(String caseId, Acl acl) {}
+
+  /**
+   * A DescribeAcls response resource carrying one ACL description.
+   *
+   * @param acl the resource and the ACL bound to it
+   * @return the Kafka {@code DescribeAclsResource} holding one {@code AclDescription}
+   */
+  private static DescribeAclsResponseData.DescribeAclsResource describedResource(Acl acl) {
+    return new DescribeAclsResponseData.DescribeAclsResource()
+        .setResourceType((byte) acl.resourceType())
+        .setResourceName(acl.resourceName())
+        .setPatternType((byte) acl.patternType())
+        .setAcls(
+            List.of(
+                new DescribeAclsResponseData.AclDescription()
+                    .setPrincipal(acl.principal())
+                    .setHost(acl.host())
+                    .setOperation((byte) acl.operation())
+                    .setPermissionType((byte) acl.permissionType())));
+  }
+
+  /**
+   * Describe, Create and DeleteAcls (29, 30, 31) v2-v3: v2 is flexible and v3 is v2's body, which
+   * now accepts resource type 7 (USER). {@code basic} is a topic ACL; at v3 {@code userResource}
+   * is the same with a USER resource, so the pair differs in the resource type byte (and name)
+   * alone. The two filter APIs also carry {@code anyFilter}, whose nullable strings are null.
+   *
+   * @see <a href="https://github.com/apache/kafka/blob/4.3.1/clients/src/main/resources/common/message/CreateAclsRequest.json">CreateAclsRequest.json</a>
+   * @return the key-29, 30 and 31 vectors
+   */
+  private static List<Vector> acls() {
+    List<Vector> vectors = new ArrayList<>();
+
+    for (short version : new short[] {2, 3}) {
+      List<AclCase> aclCases = new ArrayList<>(List.of(new AclCase("basic", TOPIC_ACL)));
+      if (version >= 3) {
+        aclCases.add(new AclCase("userResource", USER_ACL));
+      }
+      for (AclCase c : aclCases) {
+        String caseId = c.caseId();
+        Acl acl = c.acl();
+        vectors.add(describeAclsRequest(version, caseId, acl));
+        vectors.add(describeAclsResponse(version, caseId, acl));
+        vectors.add(createAclsRequest(version, caseId, acl));
+        vectors.add(deleteAclsRequest(version, caseId, acl));
+        vectors.add(deleteAclsResponse(version, caseId, acl));
+      }
+
+      vectors.add(describeAclsRequest(version, "anyFilter", ANY_FILTER));
+      vectors.add(deleteAclsRequest(version, "anyFilter", ANY_FILTER));
+
+      for (String caseId : new String[] {"ok", "error"}) {
+        boolean ok = caseId.equals("ok");
+        short code = ok ? 0 : INVALID_REQUEST;
+        String message = ok ? null : "Invalid resource name";
+        vectors.add(
+            new Vector("createAcls", "CreateAclsResponse", version, caseId,
+                new CreateAclsResponseData()
+                    .setThrottleTimeMs(THROTTLE_TIME_MS)
+                    .setResults(
+                        List.of(
+                            new CreateAclsResponseData.AclCreationResult()
+                                .setErrorCode(code)
+                                .setErrorMessage(message))),
+                obj(
+                    kv("throttleTime", num(THROTTLE_TIME_MS)),
+                    kv("creationResponses",
+                        array(
+                            obj(kv("errorCode", num(code)), kv("errorMessage", str(message))))))));
+      }
+    }
+
+    return vectors;
+  }
+
+  /**
+   * @param version the response version
+   * @param caseId the case name
+   * @param acl the one ACL the matching resource carries
+   * @return one DescribeAcls response vector
+   */
+  private static Vector describeAclsResponse(short version, String caseId, Acl acl) {
+    String described =
+        obj(
+            kv("principal", str(acl.principal())),
+            kv("host", str(acl.host())),
+            kv("operation", num(acl.operation())),
+            kv("permissionType", num(acl.permissionType())));
+    return new Vector("describeAcls", "DescribeAclsResponse", version, caseId,
+        new DescribeAclsResponseData()
+            .setThrottleTimeMs(THROTTLE_TIME_MS)
+            .setErrorCode((short) 0)
+            .setErrorMessage(null)
+            .setResources(List.of(describedResource(acl))),
+        obj(
+            kv("throttleTime", num(THROTTLE_TIME_MS)),
+            kv("errorCode", "0"),
+            kv("errorMessage", "null"),
+            kv("resources",
+                array(
+                    obj(
+                        kv("resourceType", num(acl.resourceType())),
+                        kv("resourceName", str(acl.resourceName())),
+                        kv("resourcePatternType", num(acl.patternType())),
+                        kv("acls", array(described)))))));
+  }
+
+  /**
+   * @param version the request version
+   * @param caseId the case name
+   * @param acl the one ACL to create
+   * @return one CreateAcls request vector
+   */
+  private static Vector createAclsRequest(short version, String caseId, Acl acl) {
+    return new Vector("createAcls", "CreateAclsRequest", version, caseId,
+        new CreateAclsRequestData()
+            .setCreations(
+                List.of(
+                    new CreateAclsRequestData.AclCreation()
+                        .setResourceType((byte) acl.resourceType())
+                        .setResourceName(acl.resourceName())
+                        .setResourcePatternType((byte) acl.patternType())
+                        .setPrincipal(acl.principal())
+                        .setHost(acl.host())
+                        .setOperation((byte) acl.operation())
+                        .setPermissionType((byte) acl.permissionType()))),
+        obj(kv("creations", array(acl.json()))));
+  }
+
+  /**
+   * @param version the request version
+   * @param caseId the case name
+   * @param acl the filter to describe
+   * @return one DescribeAcls request vector
+   */
+  private static Vector describeAclsRequest(short version, String caseId, Acl acl) {
+    return new Vector("describeAcls", "DescribeAclsRequest", version, caseId,
+        new DescribeAclsRequestData()
+            .setResourceTypeFilter((byte) acl.resourceType())
+            .setResourceNameFilter(acl.resourceName())
+            .setPatternTypeFilter((byte) acl.patternType())
+            .setPrincipalFilter(acl.principal())
+            .setHostFilter(acl.host())
+            .setOperation((byte) acl.operation())
+            .setPermissionType((byte) acl.permissionType()),
+        acl.json());
+  }
+
+  /**
+   * @param version the request version
+   * @param caseId the case name
+   * @param acl the filter to delete by
+   * @return one DeleteAcls request vector
+   */
+  private static Vector deleteAclsRequest(short version, String caseId, Acl acl) {
+    return new Vector("deleteAcls", "DeleteAclsRequest", version, caseId,
+        new DeleteAclsRequestData()
+            .setFilters(
+                List.of(
+                    new DeleteAclsRequestData.DeleteAclsFilter()
+                        .setResourceTypeFilter((byte) acl.resourceType())
+                        .setResourceNameFilter(acl.resourceName())
+                        .setPatternTypeFilter((byte) acl.patternType())
+                        .setPrincipalFilter(acl.principal())
+                        .setHostFilter(acl.host())
+                        .setOperation((byte) acl.operation())
+                        .setPermissionType((byte) acl.permissionType()))),
+        obj(kv("filters", array(acl.json()))));
+  }
+
+  /**
+   * @param version the response version
+   * @param caseId the case name
+   * @param acl the one ACL the filter matched and deleted
+   * @return one DeleteAcls response vector
+   */
+  private static Vector deleteAclsResponse(short version, String caseId, Acl acl) {
+    return new Vector("deleteAcls", "DeleteAclsResponse", version, caseId,
+        new DeleteAclsResponseData()
+            .setThrottleTimeMs(THROTTLE_TIME_MS)
+            .setFilterResults(
+                List.of(
+                    new DeleteAclsResponseData.DeleteAclsFilterResult()
+                        .setErrorCode((short) 0)
+                        .setErrorMessage(null)
+                        .setMatchingAcls(
+                            List.of(
+                                new DeleteAclsResponseData.DeleteAclsMatchingAcl()
+                                    .setErrorCode((short) 0)
+                                    .setErrorMessage(null)
+                                    .setResourceType((byte) acl.resourceType())
+                                    .setResourceName(acl.resourceName())
+                                    .setPatternType((byte) acl.patternType())
+                                    .setPrincipal(acl.principal())
+                                    .setHost(acl.host())
+                                    .setOperation((byte) acl.operation())
+                                    .setPermissionType((byte) acl.permissionType()))))),
+        obj(
+            kv("throttleTime", num(THROTTLE_TIME_MS)),
+            kv("filterResponses",
+                array(
+                    obj(
+                        kv("errorCode", "0"),
+                        kv("errorMessage", "null"),
+                        kv("matchingAcls",
+                            array(
+                                obj(
+                                    kv("errorCode", "0"),
+                                    kv("errorMessage", "null"),
+                                    kv("resourceType", num(acl.resourceType())),
+                                    kv("resourceName", str(acl.resourceName())),
+                                    kv("resourcePatternType", num(acl.patternType())),
+                                    kv("principal", str(acl.principal())),
+                                    kv("host", str(acl.host())),
+                                    kv("operation", num(acl.operation())),
+                                    kv("permissionType", num(acl.permissionType()))))))))));
+  }
+
+  /**
+   * A DescribeTopicPartitions cursor: where the next page starts.
+   *
+   * @param topicName the topic the next page starts in
+   * @param partitionIndex the first partition of that topic the next page returns
+   * @return the cursor as the JSON of a fixture's {@code fields}
+   */
+  private static String cursorJson(String topicName, int partitionIndex) {
+    return obj(kv("topicName", str(topicName)), kv("partitionIndex", num(partitionIndex)));
+  }
+
+  /** One DescribeTopicPartitions partition row; the ELR lists are nullable. */
+  private record DtpPartition(
+      int partition, int leader, int leaderEpoch, List<Integer> replicas, List<Integer> isr,
+      List<Integer> eligibleLeaderReplicas, List<Integer> lastKnownElr, List<Integer> offline) {
+    /** @return the Kafka {@code DescribeTopicPartitionsResponsePartition} for this partition */
+    DescribeTopicPartitionsResponseData.DescribeTopicPartitionsResponsePartition data() {
+      return new DescribeTopicPartitionsResponseData.DescribeTopicPartitionsResponsePartition()
+          .setErrorCode((short) 0)
+          .setPartitionIndex(partition)
+          .setLeaderId(leader)
+          .setLeaderEpoch(leaderEpoch)
+          .setReplicaNodes(replicas)
+          .setIsrNodes(isr)
+          .setEligibleLeaderReplicas(eligibleLeaderReplicas)
+          .setLastKnownElr(lastKnownElr)
+          .setOfflineReplicas(offline);
+    }
+
+    /** @return this partition as the JSON of a fixture's {@code fields} */
+    String json() {
+      return obj(
+          kv("errorCode", "0"),
+          kv("partitionIndex", num(partition)),
+          kv("leaderId", num(leader)),
+          kv("leaderEpoch", num(leaderEpoch)),
+          kv("replicaNodes", intArray(replicas)),
+          kv("isrNodes", intArray(isr)),
+          kv("eligibleLeaderReplicas", intArray(eligibleLeaderReplicas)),
+          kv("lastKnownElr", intArray(lastKnownElr)),
+          kv("offlineReplicas", intArray(offline)));
+    }
+  }
+
+  /** One DescribeTopicPartitions topic. */
+  private record DtpTopic(
+      int errorCode, String name, String topicId, boolean internal, List<DtpPartition> partitions,
+      int authorizedOperations) {
+    /** @return the Kafka {@code DescribeTopicPartitionsResponseTopic} for this topic */
+    DescribeTopicPartitionsResponseData.DescribeTopicPartitionsResponseTopic data() {
+      return new DescribeTopicPartitionsResponseData.DescribeTopicPartitionsResponseTopic()
+          .setErrorCode((short) errorCode)
+          .setName(name)
+          .setTopicId(uuid(topicId))
+          .setIsInternal(internal)
+          .setPartitions(partitions.stream().map(DtpPartition::data).toList())
+          .setTopicAuthorizedOperations(authorizedOperations);
+    }
+
+    /** @return this topic as the JSON of a fixture's {@code fields} */
+    String json() {
+      return obj(
+          kv("errorCode", num(errorCode)),
+          kv("name", str(name)),
+          kv("topicId", str(topicId)),
+          kv("isInternal", String.valueOf(internal)),
+          kv("partitions", list(partitions, DtpPartition::json)),
+          kv("topicAuthorizedOperations", num(authorizedOperations)));
+    }
+  }
+
+  /**
+   * DescribeTopicPartitions (75) v0 (KIP-966), request and response. The message is flexible from
+   * v0.
+   *
+   * <p>Cursor and NextCursor are nullable structs, which carry a presence byte the schema does not
+   * show: {@code ff} for null, {@code 01} before a present struct. {@code noCursor} and
+   * {@code cursor} differ in it. The ELR lists are nullable arrays: {@code elrNull} writes
+   * {@code 00}, {@code elrEmpty} writes {@code 01}, {@code elrPopulated} a list. A topic the caller
+   * may not describe comes back with its name, the zero TopicId (read as null), no partitions and
+   * the unset authorized-operations value ({@code unauthorizedZeroId}).
+   *
+   * @see <a href="https://github.com/apache/kafka/blob/4.3.1/clients/src/main/resources/common/message/DescribeTopicPartitionsResponse.json">DescribeTopicPartitionsResponse.json</a>
+   * @return the key-75 vectors
+   */
+  private static List<Vector> describeTopicPartitions() {
+    List<Vector> vectors = new ArrayList<>();
+    String api = "describeTopicPartitions";
+    short v0 = 0;
+
+    vectors.add(
+        new Vector(api, "DescribeTopicPartitionsRequest", v0, "noCursor",
+            new DescribeTopicPartitionsRequestData()
+                .setTopics(
+                    List.of(
+                        new DescribeTopicPartitionsRequestData.TopicRequest()
+                            .setName(OTHER_TOPIC_NAME),
+                        new DescribeTopicPartitionsRequestData.TopicRequest()
+                            .setName(TOPIC_NAME)))
+                .setResponsePartitionLimit(2000)
+                .setCursor(null),
+            obj(
+                kv("topics", strArray(List.of(OTHER_TOPIC_NAME, TOPIC_NAME))),
+                kv("responsePartitionLimit", "2000"),
+                kv("cursor", "null"))));
+    vectors.add(
+        new Vector(api, "DescribeTopicPartitionsRequest", v0, "cursor",
+            new DescribeTopicPartitionsRequestData()
+                .setTopics(
+                    List.of(
+                        new DescribeTopicPartitionsRequestData.TopicRequest()
+                            .setName(TOPIC_NAME)))
+                .setResponsePartitionLimit(1)
+                .setCursor(
+                    new DescribeTopicPartitionsRequestData.Cursor()
+                        .setTopicName(TOPIC_NAME)
+                        .setPartitionIndex(2)),
+            obj(
+                kv("topics", strArray(List.of(TOPIC_NAME))),
+                kv("responsePartitionLimit", "1"),
+                kv("cursor", cursorJson(TOPIC_NAME, 2)))));
+
+    List<Integer> replicas = List.of(1, 2, 3);
+    List<Integer> isr = List.of(1, 2);
+    List<Integer> offline = List.of(3);
+    DtpTopic elrNull =
+        new DtpTopic(0, TOPIC_NAME, TOPIC_ID, false,
+            List.of(new DtpPartition(0, 1, 5, replicas, isr, null, null, offline)),
+            NO_AUTHORIZED_OPERATIONS);
+    DtpTopic elrEmpty =
+        new DtpTopic(0, TOPIC_NAME, TOPIC_ID, false,
+            List.of(new DtpPartition(0, 1, 5, replicas, isr, List.of(), List.of(), offline)),
+            NO_AUTHORIZED_OPERATIONS);
+    DtpTopic elrPopulated =
+        new DtpTopic(0, TOPIC_NAME, TOPIC_ID, false,
+            List.of(new DtpPartition(0, 1, 5, replicas, isr, List.of(1), List.of(2), offline)),
+            NO_AUTHORIZED_OPERATIONS);
+    DtpTopic unauthorized =
+        new DtpTopic(TOPIC_AUTHORIZATION_FAILED, TOPIC_NAME, null, false, List.of(),
+            NO_AUTHORIZED_OPERATIONS);
+    DtpTopic internal =
+        new DtpTopic(0, "__consumer_offsets", OTHER_TOPIC_ID, true,
+            List.of(new DtpPartition(0, 2, 7, replicas, isr, null, null, List.of())),
+            NO_AUTHORIZED_OPERATIONS);
+
+    vectors.add(dtpResponse("elrNull", null, elrNull));
+    vectors.add(dtpResponse("elrEmpty", null, elrEmpty));
+    vectors.add(dtpResponse("elrPopulated", null, elrPopulated));
+    vectors.add(dtpResponse("nextCursor", cursorJson(TOPIC_NAME, 1), elrNull));
+    vectors.add(dtpResponse("noNextCursor", null, elrNull, internal));
+    vectors.add(dtpResponse("unauthorizedZeroId", null, unauthorized));
+
+    return vectors;
+  }
+
+  /**
+   * @param caseId the case name
+   * @param nextCursorJson the {@code nextCursor} fields JSON, or null for no next cursor
+   * @param topics the described topics
+   * @return one DescribeTopicPartitions v0 response vector
+   */
+  private static Vector dtpResponse(String caseId, String nextCursorJson, DtpTopic... topics) {
+    DescribeTopicPartitionsResponseData data =
+        new DescribeTopicPartitionsResponseData()
+            .setThrottleTimeMs(THROTTLE_TIME_MS)
+            .setTopics(
+                new DescribeTopicPartitionsResponseData
+                    .DescribeTopicPartitionsResponseTopicCollection(
+                    Arrays.stream(topics).map(DtpTopic::data).iterator()))
+            .setNextCursor(
+                nextCursorJson == null
+                    ? null
+                    : new DescribeTopicPartitionsResponseData.Cursor()
+                        .setTopicName(TOPIC_NAME)
+                        .setPartitionIndex(1));
+    return new Vector(
+        "describeTopicPartitions", "DescribeTopicPartitionsResponse", (short) 0, caseId,
+        data,
+        obj(
+            kv("throttleTime", num(THROTTLE_TIME_MS)),
+            kv("topics", list(Arrays.asList(topics), DtpTopic::json)),
+            kv("nextCursor", nextCursorJson == null ? "null" : nextCursorJson)));
   }
 
   /**

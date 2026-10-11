@@ -1,0 +1,7 @@
+{
+  "message": "DeleteTopicsResponse",
+  "version": 3,
+  "case": "error",
+  "hex": "0000001900000001000a746573742d746f7069630003",
+  "fields": { "throttleTime": 25, "topicErrors": [{ "topic": "test-topic", "errorCode": 3 }] }
+}

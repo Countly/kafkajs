@@ -1,0 +1,7 @@
+{
+  "message": "AlterConfigsRequest",
+  "version": 2,
+  "case": "validateOnly",
+  "hex": "02020b746573742d746f706963030d726574656e74696f6e2e6d73063630303030000f636c65616e75702e706f6c69637908636f6d7061637400000100",
+  "fields": { "resources": [{ "type": 2, "name": "test-topic", "configEntries": [{ "name": "retention.ms", "value": "60000" }, { "name": "cleanup.policy", "value": "compact" }] }], "validateOnly": true }
+}

@@ -1,0 +1,7 @@
+{
+  "message": "DescribeTopicPartitionsResponse",
+  "version": 0,
+  "case": "nextCursor",
+  "hex": "000000190200000b746573742d746f7069630102030405060708090a0b0c0d0e0f10000200000000000000000001000000050400000001000000020000000303000000010000000200000200000003008000000000010b746573742d746f706963000000010000",
+  "fields": { "throttleTime": 25, "topics": [{ "errorCode": 0, "name": "test-topic", "topicId": "01020304-0506-0708-090a-0b0c0d0e0f10", "isInternal": false, "partitions": [{ "errorCode": 0, "partitionIndex": 0, "leaderId": 1, "leaderEpoch": 5, "replicaNodes": [1, 2, 3], "isrNodes": [1, 2], "eligibleLeaderReplicas": null, "lastKnownElr": null, "offlineReplicas": [3] }], "topicAuthorizedOperations": -2147483648 }], "nextCursor": { "topicName": "test-topic", "partitionIndex": 1 } }
+}

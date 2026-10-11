@@ -1,0 +1,7 @@
+{
+  "message": "DescribeAclsRequest",
+  "version": 3,
+  "case": "anyFilter",
+  "hex": "0100010000010100",
+  "fields": { "resourceType": 1, "resourceName": null, "resourcePatternType": 1, "principal": null, "host": null, "operation": 1, "permissionType": 1 }
+}

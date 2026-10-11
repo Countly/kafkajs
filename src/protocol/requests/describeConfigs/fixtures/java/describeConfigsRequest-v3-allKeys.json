@@ -1,0 +1,7 @@
+{
+  "message": "DescribeConfigsRequest",
+  "version": 3,
+  "case": "allKeys",
+  "hex": "0000000102000a746573742d746f706963ffffffff0100",
+  "fields": { "resources": [{ "type": 2, "name": "test-topic", "configNames": null }], "includeSynonyms": true, "includeDocumentation": false }
+}

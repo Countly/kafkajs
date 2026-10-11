@@ -1,0 +1,7 @@
+{
+  "message": "DeleteTopicsRequest",
+  "version": 5,
+  "case": "names",
+  "hex": "030b746573742d746f7069630c6f746865722d746f7069630000138800",
+  "fields": { "topics": ["test-topic", "other-topic"], "timeout": 5000 }
+}

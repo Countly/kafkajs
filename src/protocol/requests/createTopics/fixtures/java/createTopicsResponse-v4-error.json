@@ -1,0 +1,7 @@
+{
+  "message": "CreateTopicsResponse",
+  "version": 4,
+  "case": "error",
+  "hex": "0000001900000001000a746573742d746f70696300240022546f7069632027746573742d746f7069632720616c7265616479206578697374732e",
+  "fields": { "throttleTime": 25, "topicErrors": [{ "topic": "test-topic", "errorCode": 36, "errorMessage": "Topic 'test-topic' already exists." }] }
+}

@@ -1,0 +1,7 @@
+{
+  "message": "DescribeConfigsRequest",
+  "version": 3,
+  "case": "keys",
+  "hex": "0000000102000a746573742d746f70696300000002000e636c65616e75702e706f6c696379000c726574656e74696f6e2e6d730100",
+  "fields": { "resources": [{ "type": 2, "name": "test-topic", "configNames": ["cleanup.policy", "retention.ms"] }], "includeSynonyms": true, "includeDocumentation": false }
+}

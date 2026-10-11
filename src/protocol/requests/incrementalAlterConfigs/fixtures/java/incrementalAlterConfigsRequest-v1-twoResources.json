@@ -1,0 +1,7 @@
+{
+  "message": "IncrementalAlterConfigsRequest",
+  "version": 1,
+  "case": "twoResources",
+  "hex": "03020b746573742d746f706963020d726574656e74696f6e2e6d7300063630303030000004023103136261636b67726f756e642e746872656164730003323000146c6f672e636c65616e65722e74687265616473010000000000",
+  "fields": { "resources": [{ "type": 2, "name": "test-topic", "configEntries": [{ "name": "retention.ms", "operation": 0, "value": "60000" }] }, { "type": 4, "name": "1", "configEntries": [{ "name": "background.threads", "operation": 0, "value": "20" }, { "name": "log.cleaner.threads", "operation": 1, "value": null }] }], "validateOnly": false }
+}

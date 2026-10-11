@@ -1,0 +1,7 @@
+{
+  "message": "CreatePartitionsResponse",
+  "version": 3,
+  "case": "error",
+  "hex": "00000019020b746573742d746f706963002520546f70696320616c726561647920686173203320706172746974696f6e732e0000",
+  "fields": { "throttleTime": 25, "topicErrors": [{ "topic": "test-topic", "errorCode": 37, "errorMessage": "Topic already has 3 partitions." }] }
+}

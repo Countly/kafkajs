@@ -1,0 +1,7 @@
+{
+  "message": "DeleteAclsRequest",
+  "version": 3,
+  "case": "userResource",
+  "hex": "020709557365723a626f62030b557365723a616c696365022a03030000",
+  "fields": { "filters": [{ "resourceType": 7, "resourceName": "User:bob", "resourcePatternType": 3, "principal": "User:alice", "host": "*", "operation": 3, "permissionType": 3 }] }
+}
