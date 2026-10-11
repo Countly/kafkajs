@@ -16,7 +16,7 @@ const stems = (message, versions, caseIds) =>
 const ACL_BASIC = ['basic']
 const ACL_V3 = ['basic', 'userResource']
 
-/** Every vector the generator writes for the admin APIs, by fixtures directory. */
+/** Every vector the generator writes for the admin and classic group APIs, by fixtures directory. */
 const MANIFEST = {
   incrementalAlterConfigs: [
     ...stems(
@@ -82,6 +82,35 @@ const MANIFEST = {
     ...stems('deleteAclsResponse', [2], ACL_BASIC),
     ...stems('deleteAclsResponse', [3], ACL_V3),
   ],
+  joinGroup: [
+    ...stems('joinGroupRequest', [6, 7], ['basic', 'staticMember']),
+    ...stems('joinGroupRequest', [8], ['basic', 'staticMember', 'withReason']),
+    ...stems('joinGroupResponse', [6], ['ok']),
+    ...stems('joinGroupResponse', [7, 8], ['ok', 'protocolType', 'nullProtocolName']),
+  ],
+  syncGroup: [
+    ...stems('syncGroupRequest', [4], ['assignment']),
+    ...stems('syncGroupRequest', [5], ['assignment', 'withProtocol']),
+    ...stems('syncGroupResponse', [4], ['ok']),
+    ...stems('syncGroupResponse', [5], ['ok', 'protocol']),
+  ],
+  heartbeat: [
+    ...stems('heartbeatRequest', [4], ['basic']),
+    ...stems('heartbeatResponse', [4], ['ok', 'error']),
+  ],
+  leaveGroup: [
+    ...stems('leaveGroupRequest', [4], ['oneMember', 'twoMembers']),
+    ...stems('leaveGroupRequest', [5], ['oneMember', 'twoMembers', 'withReason']),
+    ...stems('leaveGroupResponse', [4, 5], ['ok', 'memberError']),
+  ],
+  offsetCommit: [
+    ...stems('offsetCommitRequest', [10], ['byTopicId']),
+    ...stems('offsetCommitResponse', [10], ['ok', 'unknownTopicId']),
+  ],
+  offsetFetch: [
+    ...stems('offsetFetchRequest', [10], ['byTopicId', 'allTopics']),
+    ...stems('offsetFetchResponse', [10], ['ok', 'unknownTopicId']),
+  ],
   describeTopicPartitions: [
     ...stems('describeTopicPartitionsRequest', [0], ['noCursor', 'cursor']),
     ...stems(
@@ -96,8 +125,14 @@ const ENTRIES = Object.entries(MANIFEST).flatMap(([api, names]) =>
   names.map((name) => ({ api, name }))
 )
 
+/** The older OffsetCommit and OffsetFetch vectors share their directories; only v10 is this manifest's. */
+const SHARED_DIRECTORIES = new Set(['offsetCommit', 'offsetFetch'])
+const V10 = /-v10-/
+
 /** `fields` carry these as decimal strings, which are not on the wire as text. */
 const INT64_KEYS = new Set(['offset', 'lowWatermark'])
+/** `fields` carry these as hex strings of the bytes themselves. */
+const BYTES_KEYS = new Set(['metadata', 'memberMetadata', 'memberAssignment'])
 const UUID = /^[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$/
 
 /**
@@ -128,12 +163,13 @@ const differences = (a, b) => {
 /**
  * @param {*} value a `fields` subtree
  * @param {string} [key] the key it sits under
- * @returns {string[]} every text value in it as the hex of its UTF-8 bytes, which must appear in
- *   the vector's bytes; integers and uuids are left out
+ * @returns {string[]} every string in it, as the hex it must appear as in the vector's bytes: a
+ *   text value as its UTF-8 bytes, a byte value as itself; integers and uuids are left out
  */
 const wireHex = (value, key = '') => {
   if (typeof value === 'string') {
-    return INT64_KEYS.has(key) || UUID.test(value) ? [] : [Buffer.from(value).toString('hex')]
+    if (INT64_KEYS.has(key) || UUID.test(value)) return []
+    return [BYTES_KEYS.has(key) ? value : Buffer.from(value).toString('hex')]
   }
   if (Array.isArray(value)) {
     return value.flatMap((item) => wireHex(item, key))
@@ -173,6 +209,15 @@ const NULL_CLASSIC_ARRAY = 'ffffffff'
 const ZERO_UUID = '00'.repeat(16)
 const TOPIC_UUID = '0102030405060708090a0b0c0d0e0f10'
 const NO_AUTHORIZED_OPERATIONS = '80000000' // -2147483648
+const GROUP = 'test-group'
+const MEMBER = 'test-member'
+const INSTANCE = 'test-instance'
+const OTHER_MEMBER = 'other-member'
+const ASSIGNOR = 'RoundRobinAssigner'
+const SUBSCRIPTION = '000300000001' // the six bytes every group vector uses as metadata
+
+/** @param {string} hex @returns {string} COMPACT_BYTES: UVARINT length + 1, then the bytes */
+const compactBytes = (hex) => int(hex.length / 2 + 1, 1) + hex
 
 /**
  * A CreateTopics response whose only error is TopicConfigErrorCode 29. It travels in tag 0 (tag,
@@ -547,6 +592,214 @@ const PINNED = [
     'describeTopicPartitionsResponse-v0-elrPopulated',
     describeTopicPartitionsResponse(count(1) + int(1, 4), count(1) + int(2, 4)),
   ],
+  // Heartbeat and the group APIs: flexible framing from v4 (v6 for JoinGroup).
+  [
+    'heartbeat',
+    'heartbeatRequest-v4-basic',
+    compact(GROUP) + int(5, 4) + compact(MEMBER) + compact(INSTANCE) + TAGS,
+  ],
+  ['heartbeat', 'heartbeatResponse-v4-error', THROTTLE + int(27, 2) + TAGS],
+  [
+    'joinGroup',
+    'joinGroupRequest-v6-basic',
+    compact(GROUP) +
+      int(30000, 4) +
+      int(60000, 4) +
+      compact('') +
+      NULL_COMPACT +
+      compact('consumer') +
+      (count(1) + (compact(ASSIGNOR) + compactBytes(SUBSCRIPTION) + TAGS)) +
+      TAGS,
+  ],
+  // v8 appends the nullable Reason after the protocols: absent in basic, set in withReason.
+  [
+    'joinGroup',
+    'joinGroupRequest-v8-withReason',
+    compact(GROUP) +
+      int(30000, 4) +
+      int(60000, 4) +
+      compact(MEMBER) +
+      compact(INSTANCE) +
+      compact('consumer') +
+      (count(1) + (compact(ASSIGNOR) + compactBytes(SUBSCRIPTION) + TAGS)) +
+      compact('the consumer is being closed') +
+      TAGS,
+  ],
+  // v7 puts ProtocolType after GenerationId and makes ProtocolName nullable.
+  [
+    'joinGroup',
+    'joinGroupResponse-v7-protocolType',
+    THROTTLE +
+      int(0, 2) +
+      int(5, 4) +
+      compact('consumer') +
+      compact(ASSIGNOR) +
+      compact(MEMBER) +
+      compact(MEMBER) +
+      (count(2) +
+        (compact(MEMBER) + NULL_COMPACT + compactBytes(SUBSCRIPTION) + TAGS) +
+        (compact(OTHER_MEMBER) + compact(INSTANCE) + compactBytes(SUBSCRIPTION) + TAGS)) +
+      TAGS,
+  ],
+  [
+    'joinGroup',
+    'joinGroupResponse-v7-nullProtocolName',
+    THROTTLE +
+      int(79, 2) +
+      'ffffffff' +
+      compact('consumer') +
+      NULL_COMPACT +
+      compact('') +
+      compact(MEMBER) +
+      count(0) +
+      TAGS,
+  ],
+  [
+    'syncGroup',
+    'syncGroupRequest-v5-assignment',
+    compact(GROUP) +
+      int(5, 4) +
+      compact(MEMBER) +
+      compact(INSTANCE) +
+      NULL_COMPACT +
+      NULL_COMPACT +
+      (count(1) + (compact(MEMBER) + compactBytes(SUBSCRIPTION) + TAGS)) +
+      TAGS,
+  ],
+  [
+    'syncGroup',
+    'syncGroupRequest-v5-withProtocol',
+    compact(GROUP) +
+      int(5, 4) +
+      compact(MEMBER) +
+      compact(INSTANCE) +
+      compact('consumer') +
+      compact(ASSIGNOR) +
+      (count(1) + (compact(MEMBER) + compactBytes(SUBSCRIPTION) + TAGS)) +
+      TAGS,
+  ],
+  [
+    'syncGroup',
+    'syncGroupResponse-v5-protocol',
+    THROTTLE +
+      int(0, 2) +
+      compact('consumer') +
+      compact(ASSIGNOR) +
+      compactBytes(SUBSCRIPTION) +
+      TAGS,
+  ],
+  [
+    'leaveGroup',
+    'leaveGroupRequest-v5-withReason',
+    compact(GROUP) +
+      (count(2) +
+        (compact(MEMBER) + NULL_COMPACT + compact('the consumer is being closed') + TAGS) +
+        (compact(OTHER_MEMBER) +
+          compact(INSTANCE) +
+          compact('member was removed by an admin') +
+          TAGS)) +
+      TAGS,
+  ],
+  [
+    'leaveGroup',
+    'leaveGroupResponse-v4-memberError',
+    THROTTLE +
+      int(0, 2) +
+      (count(2) +
+        (compact(MEMBER) + NULL_COMPACT + int(0, 2) + TAGS) +
+        (compact(OTHER_MEMBER) + compact(INSTANCE) + int(25, 2) + TAGS)) +
+      TAGS,
+  ],
+  // OffsetCommit and OffsetFetch v10: a 16-byte TopicId where v9 has the topic name.
+  [
+    'offsetCommit',
+    'offsetCommitRequest-v10-byTopicId',
+    compact(GROUP) +
+      int(5, 4) +
+      compact(MEMBER) +
+      compact(INSTANCE) +
+      (count(1) +
+        (TOPIC_UUID +
+          (count(1) + (int(0, 4) + int(10, 8) + 'ffffffff' + NULL_COMPACT + TAGS) + TAGS))) +
+      TAGS,
+  ],
+  [
+    'offsetCommit',
+    'offsetCommitResponse-v10-unknownTopicId',
+    THROTTLE +
+      (count(1) + (TOPIC_UUID + (count(1) + (int(0, 4) + int(100, 2) + TAGS) + TAGS))) +
+      TAGS,
+  ],
+  [
+    'offsetFetch',
+    'offsetFetchRequest-v10-byTopicId',
+    count(1) +
+      (compact(GROUP) +
+        compact(MEMBER) +
+        int(5, 4) +
+        (count(1) + (TOPIC_UUID + count(1) + int(0, 4) + TAGS)) +
+        TAGS) +
+      int(0, 1) +
+      TAGS,
+  ],
+  [
+    'offsetFetch',
+    'offsetFetchRequest-v10-allTopics',
+    count(1) +
+      (compact(GROUP) + NULL_COMPACT + 'ffffffff' + NULL_COMPACT + TAGS) +
+      int(0, 1) +
+      TAGS,
+  ],
+  [
+    'offsetFetch',
+    'offsetFetchResponse-v10-unknownTopicId',
+    THROTTLE +
+      (count(1) +
+        (compact(GROUP) +
+          (count(1) +
+            (TOPIC_UUID +
+              (count(1) +
+                (int(0, 4) + 'ffffffffffffffff' + 'ffffffff' + NULL_COMPACT + int(100, 2) + TAGS)) +
+              TAGS)) +
+          int(0, 2) +
+          TAGS)) +
+      TAGS,
+  ],
+  ['heartbeat', 'heartbeatResponse-v4-ok', THROTTLE + int(0, 2) + TAGS],
+  [
+    'syncGroup',
+    'syncGroupResponse-v4-ok',
+    THROTTLE + int(0, 2) + compactBytes(SUBSCRIPTION) + TAGS,
+  ],
+  // LeaveGroup: a dynamic member has a null instance id, and v5 adds a null Reason after it.
+  [
+    'leaveGroup',
+    'leaveGroupRequest-v4-oneMember',
+    compact(GROUP) + (count(1) + (compact(MEMBER) + NULL_COMPACT + TAGS)) + TAGS,
+  ],
+  [
+    'leaveGroup',
+    'leaveGroupRequest-v4-twoMembers',
+    compact(GROUP) +
+      (count(2) +
+        (compact(MEMBER) + NULL_COMPACT + TAGS) +
+        (compact(OTHER_MEMBER) + compact(INSTANCE) + TAGS)) +
+      TAGS,
+  ],
+  [
+    'leaveGroup',
+    'leaveGroupRequest-v5-oneMember',
+    compact(GROUP) + (count(1) + (compact(MEMBER) + NULL_COMPACT + NULL_COMPACT + TAGS)) + TAGS,
+  ],
+  [
+    'leaveGroup',
+    'leaveGroupRequest-v5-twoMembers',
+    compact(GROUP) +
+      (count(2) +
+        (compact(MEMBER) + NULL_COMPACT + NULL_COMPACT + TAGS) +
+        (compact(OTHER_MEMBER) + compact(INSTANCE) + NULL_COMPACT + TAGS)) +
+      TAGS,
+  ],
 ]
 
 /** The three DescribeTopicPartitions responses that differ in the ELR arrays, and what they write. */
@@ -555,9 +808,9 @@ const ELR_CASES = [
   ['elrEmpty', count(0)],
 ]
 
-describe('Java message vectors > admin APIs', () => {
-  test('the manifest names one hundred and nineteen vectors', () => {
-    expect(ENTRIES).toHaveLength(119)
+describe('Java message vectors > admin and classic group APIs', () => {
+  test('the manifest names one hundred and fifty-eight vectors', () => {
+    expect(ENTRIES).toHaveLength(158)
   })
 
   test.each(ENTRIES)('$name is on disk and is what its name says', ({ api, name }) => {
@@ -571,13 +824,16 @@ describe('Java message vectors > admin APIs', () => {
     expect(vector.fields).toEqual(expect.any(Object))
   })
 
-  test.each(ENTRIES)('$name: every text value in fields is on the wire', ({ api, name }) => {
-    const { hex, fields } = load(api, name)
+  test.each(ENTRIES)(
+    '$name: every text and byte value in fields is on the wire',
+    ({ api, name }) => {
+      const { hex, fields } = load(api, name)
 
-    for (const wire of wireHex(fields)) {
-      expect(hex).toContain(wire)
+      for (const wire of wireHex(fields)) {
+        expect(hex).toContain(wire)
+      }
     }
-  })
+  )
 
   test.each(ENTRIES.filter(({ name }) => /Response-/.test(name)))(
     '$name: ThrottleTimeMs is 25, so a decoder that does not split it fails',
@@ -590,7 +846,9 @@ describe('Java message vectors > admin APIs', () => {
   test.each(Object.keys(MANIFEST))(
     '%s: the fixtures directory holds exactly the manifest',
     (api) => {
-      const onDisk = fs.readdirSync(path.join(REQUESTS, api, 'fixtures', 'java'))
+      const onDisk = fs
+        .readdirSync(path.join(REQUESTS, api, 'fixtures', 'java'))
+        .filter((file) => !SHARED_DIRECTORIES.has(api) || V10.test(file))
 
       expect(onDisk.sort()).toEqual(MANIFEST[api].map((name) => `${name}.json`).sort())
     }
@@ -605,8 +863,13 @@ describe('Java message vectors > admin APIs', () => {
         line.split('|').length === 6
     )
     const [, , , listed, vectors] = row.split('|').map((cell) => cell.trim())
+    const shared = SHARED_DIRECTORIES.has(api)
+
     expect(listed.split(', ').map(Number)).toEqual(expect.arrayContaining(versions))
-    expect(Number(vectors)).toEqual(MANIFEST[api].length)
+    expect(Number(vectors)).toBeGreaterThanOrEqual(MANIFEST[api].length)
+    if (!shared) {
+      expect(Number(vectors)).toEqual(MANIFEST[api].length)
+    }
   })
 
   test.each(PINNED)('%s/%s: the bytes are the protocol', (api, name, expected) => {
@@ -782,4 +1045,94 @@ describe('Java message vectors > admin APIs', () => {
       '01' + struct.toString('hex')
     )
   })
+
+  test('JoinGroup v8 is v7 with a null Reason before the closing tag buffer', () => {
+    for (const caseId of ['basic', 'staticMember']) {
+      const v7 = load('joinGroup', `joinGroupRequest-v7-${caseId}`).hex
+      const v8 = load('joinGroup', `joinGroupRequest-v8-${caseId}`).hex
+
+      expect(v8).toEqual(v7.slice(0, -2) + NULL_COMPACT + TAGS)
+    }
+  })
+
+  test('JoinGroup v7 puts a ProtocolType after GenerationId, a null one in the ok response', () => {
+    const v6 = load('joinGroup', 'joinGroupResponse-v6-ok').hex
+    const v7 = load('joinGroup', 'joinGroupResponse-v7-ok').hex
+    const afterGenerationId = (4 + 2 + 4) * 2
+
+    expect(v7).toEqual(v6.slice(0, afterGenerationId) + NULL_COMPACT + v6.slice(afterGenerationId))
+    expect(load('joinGroup', 'joinGroupResponse-v8-ok').hex).toEqual(v7)
+  })
+
+  test('SyncGroup v5 is v4 with a null ProtocolType and ProtocolName before the assignments', () => {
+    const v4 = load('syncGroup', 'syncGroupRequest-v4-assignment').hex
+    const v5 = load('syncGroup', 'syncGroupRequest-v5-assignment').hex
+    const beforeAssignments = v4.indexOf(count(1) + compact(MEMBER) + compactBytes(SUBSCRIPTION))
+
+    expect(v5).toEqual(
+      v4.slice(0, beforeAssignments) + NULL_COMPACT + NULL_COMPACT + v4.slice(beforeAssignments)
+    )
+  })
+
+  test('LeaveGroup v5 is v4 with one null Reason before each member tag buffer', () => {
+    for (const [caseId, members] of [
+      ['oneMember', 1],
+      ['twoMembers', 2],
+    ]) {
+      const v4 = bytes('leaveGroup', `leaveGroupRequest-v4-${caseId}`)
+      const v5 = bytes('leaveGroup', `leaveGroupRequest-v5-${caseId}`)
+
+      expect(v5.length).toEqual(v4.length + members)
+    }
+  })
+
+  test('JoinGroup v8: a static member with no reason is the withReason request with a null Reason', () => {
+    const withReason = load('joinGroup', 'joinGroupRequest-v8-withReason').hex
+
+    expect(load('joinGroup', 'joinGroupRequest-v8-staticMember').hex).toEqual(
+      withReason.replace(compact('the consumer is being closed'), NULL_COMPACT)
+    )
+  })
+
+  test('SyncGroup v5 answers v4 with a null ProtocolType and ProtocolName after the error code', () => {
+    const v4 = load('syncGroup', 'syncGroupResponse-v4-ok').hex
+    const afterErrorCode = (4 + 2) * 2
+
+    expect(load('syncGroup', 'syncGroupResponse-v5-ok').hex).toEqual(
+      v4.slice(0, afterErrorCode) + NULL_COMPACT + NULL_COMPACT + v4.slice(afterErrorCode)
+    )
+  })
+
+  test.each([
+    ['joinGroup', 'joinGroupRequest-v6-basic', 'joinGroupRequest-v7-basic'],
+    ['joinGroup', 'joinGroupRequest-v6-staticMember', 'joinGroupRequest-v7-staticMember'],
+    ['joinGroup', 'joinGroupResponse-v7-protocolType', 'joinGroupResponse-v8-protocolType'],
+    ['joinGroup', 'joinGroupResponse-v7-nullProtocolName', 'joinGroupResponse-v8-nullProtocolName'],
+    ['leaveGroup', 'leaveGroupResponse-v4-ok', 'leaveGroupResponse-v5-ok'],
+    ['leaveGroup', 'leaveGroupResponse-v4-memberError', 'leaveGroupResponse-v5-memberError'],
+  ])(
+    '%s: the version adds nothing on the wire, so %s and %s are the same bytes',
+    (api, lower, higher) => {
+      expect(load(api, higher).hex).toEqual(load(api, lower).hex)
+    }
+  )
+
+  test.each([
+    ['offsetCommit', 'offsetCommitRequest-v9-basic', 'offsetCommitRequest-v10-byTopicId'],
+    ['offsetFetch', 'offsetFetchRequest-v9-memberFields', 'offsetFetchRequest-v10-byTopicId'],
+  ])('%s: v10 is the v9 vector with the topic name replaced by its id (%s, %s)', (api, v9, v10) => {
+    expect(load(api, v10).hex).toEqual(load(api, v9).hex.replace(compact(TOPIC), TOPIC_UUID))
+  })
+
+  test.each([
+    ['offsetCommit', 'offsetCommitResponse-v9-basic', 'offsetCommitResponse-v10-ok'],
+    ['offsetFetch', 'offsetFetchResponse-v9-basic', 'offsetFetchResponse-v10-ok'],
+  ])(
+    '%s: the v10 answer is the v9 one with the id for the name and a throttle of 25 (%s, %s)',
+    (api, v9, v10) => {
+      const expected = load(api, v9).hex.replace(compact(TOPIC), TOPIC_UUID)
+
+      expect(load(api, v10).hex).toEqual(THROTTLE + expected.slice(THROTTLE.length))
+    }
+  )
 })

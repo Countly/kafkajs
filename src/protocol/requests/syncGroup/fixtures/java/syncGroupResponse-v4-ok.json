@@ -1,0 +1,7 @@
+{
+  "message": "SyncGroupResponse",
+  "version": 4,
+  "case": "ok",
+  "hex": "0000001900000700030000000100",
+  "fields": { "throttleTime": 25, "errorCode": 0, "memberAssignment": "000300000001" }
+}

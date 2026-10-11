@@ -1,0 +1,7 @@
+{
+  "message": "LeaveGroupResponse",
+  "version": 4,
+  "case": "ok",
+  "hex": "000000190000030c746573742d6d656d626572000000000d6f746865722d6d656d6265720e746573742d696e7374616e636500000000",
+  "fields": { "throttleTime": 25, "errorCode": 0, "members": [{ "memberId": "test-member", "groupInstanceId": null, "errorCode": 0 }, { "memberId": "other-member", "groupInstanceId": "test-instance", "errorCode": 0 }] }
+}

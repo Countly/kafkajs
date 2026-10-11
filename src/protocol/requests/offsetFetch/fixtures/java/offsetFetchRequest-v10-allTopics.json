@@ -1,0 +1,7 @@
+{
+  "message": "OffsetFetchRequest",
+  "version": 10,
+  "case": "allTopics",
+  "hex": "020b746573742d67726f757000ffffffff00000000",
+  "fields": { "groupId": "test-group", "memberId": null, "memberEpoch": -1, "topics": null, "requireStable": false }
+}

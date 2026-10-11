@@ -1,0 +1,7 @@
+{
+  "message": "OffsetCommitResponse",
+  "version": 10,
+  "case": "unknownTopicId",
+  "hex": "00000019020102030405060708090a0b0c0d0e0f1002000000000064000000",
+  "fields": { "throttleTime": 25, "topics": [{ "topicId": "01020304-0506-0708-090a-0b0c0d0e0f10", "partitions": [{ "partition": 0, "errorCode": 100 }] }] }
+}

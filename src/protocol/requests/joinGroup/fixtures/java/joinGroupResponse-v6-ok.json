@@ -1,0 +1,7 @@
+{
+  "message": "JoinGroupResponse",
+  "version": 6,
+  "case": "ok",
+  "hex": "0000001900000000000513526f756e64526f62696e41737369676e65720c746573742d6d656d6265720c746573742d6d656d626572030c746573742d6d656d6265720007000300000001000d6f746865722d6d656d6265720e746573742d696e7374616e6365070003000000010000",
+  "fields": { "throttleTime": 25, "errorCode": 0, "generationId": 5, "groupProtocol": "RoundRobinAssigner", "leaderId": "test-member", "memberId": "test-member", "members": [{ "memberId": "test-member", "groupInstanceId": null, "memberMetadata": "000300000001" }, { "memberId": "other-member", "groupInstanceId": "test-instance", "memberMetadata": "000300000001" }] }
+}

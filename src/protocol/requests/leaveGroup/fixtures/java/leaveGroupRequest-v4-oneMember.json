@@ -1,0 +1,7 @@
+{
+  "message": "LeaveGroupRequest",
+  "version": 4,
+  "case": "oneMember",
+  "hex": "0b746573742d67726f7570020c746573742d6d656d626572000000",
+  "fields": { "groupId": "test-group", "members": [{ "memberId": "test-member", "groupInstanceId": null }] }
+}

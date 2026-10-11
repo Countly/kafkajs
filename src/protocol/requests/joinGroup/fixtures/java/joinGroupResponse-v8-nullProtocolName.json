@@ -1,0 +1,7 @@
+{
+  "message": "JoinGroupResponse",
+  "version": 8,
+  "case": "nullProtocolName",
+  "hex": "00000019004fffffffff09636f6e73756d657200010c746573742d6d656d6265720100",
+  "fields": { "throttleTime": 25, "errorCode": 79, "generationId": -1, "protocolType": "consumer", "groupProtocol": null, "leaderId": "", "memberId": "test-member", "members": [] }
+}

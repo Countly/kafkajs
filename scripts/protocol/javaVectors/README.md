@@ -36,7 +36,7 @@ The jar itself is downloaded into a temporary directory and is never committed t
 — only the emitted `*_java.json` fixtures are. Re-run the script whenever a codec's fixture values
 change, and commit the regenerated files alongside the codec change.
 
-## Message vectors for the consumer-protocol, group-visibility, transaction and admin APIs
+## Message vectors for the consumer-protocol, group-visibility, transaction, admin and classic group APIs
 
 `scripts/protocol/javaVectors/runAssignors.sh messages` is the third entry point. It compiles
 `GenerateMessageVectors.java` against the same two jars (it uses records, so it needs JDK 17 or
@@ -50,8 +50,8 @@ that is removed afterwards when the variable is unset and reused when it is set.
 | ConsumerGroupDescribe | 69 | 0, 1 | 6 |
 | ListGroups | 16 | 3, 4, 5 | 8 |
 | DescribeGroups | 15 | 3, 4, 5, 6 | 9 |
-| OffsetCommit | 8 | 9 | 2 |
-| OffsetFetch | 9 | 7, 8, 9 | 9 |
+| OffsetCommit | 8 | 9, 10 | 5 |
+| OffsetFetch | 9 | 7, 8, 9, 10 | 13 |
 | InitProducerId | 22 | 3, 4, 5 | 9 |
 | AddPartitionsToTxn | 24 | 2, 3 | 6 |
 | AddOffsetsToTxn | 25 | 2, 3, 4 | 9 |
@@ -69,6 +69,10 @@ that is removed afterwards when the variable is unset and reused when it is set.
 | CreateAcls | 30 | 2, 3 | 7 |
 | DeleteAcls | 31 | 2, 3 | 8 |
 | DescribeTopicPartitions | 75 | 0 | 8 |
+| JoinGroup | 11 | 6, 7, 8 | 14 |
+| SyncGroup | 14 | 4, 5 | 6 |
+| Heartbeat | 12 | 4 | 3 |
+| LeaveGroup | 13 | 4, 5 | 9 |
 
 `runAssignors.sh` with no subcommand, or with `assignors`, does exactly what it did before, and
 `run.sh`/`GenerateVectors.java` are unchanged and still own every vector the message generator
@@ -86,15 +90,16 @@ directly under `<api>/fixtures/`. Each holds one case:
 | `version` | the version the bytes were serialized at |
 | `case` | the case name, matching the file name |
 | `hex` | the message body Kafka's own codec produced, lower-case hex, no request header |
-| `fields` | the values the message was built from, in the **Java message field names** (lower-camel: `throttleTime`, `topics`, `leaderEpoch`, …) — **not** this client's decoded key names, which the shipped decoders choose per API (`responses`, `committedLeaderEpoch`, `clientSideThrottleTime`, …). A codec test compares the **hex** both ways and maps `fields` onto its own decoded shape explicitly; it must never assume the two key sets coincide. The admin vectors are the exception: their `fields` are the request builder's arguments and the decoder's keys (see "What the admin vectors pin") |
+| `fields` | the values the message was built from, in the **Java message field names** (lower-camel: `throttleTime`, `topics`, `leaderEpoch`, …) — **not** this client's decoded key names, which the shipped decoders choose per API (`responses`, `committedLeaderEpoch`, `clientSideThrottleTime`, …). A codec test compares the **hex** both ways and maps `fields` onto its own decoded shape explicitly; it must never assume the two key sets coincide. The admin and group vectors are the exception: their `fields` are the request builder's arguments and the decoder's keys (see "What the admin and group vectors pin") |
 
 `fields` speaks the decoder's vocabulary rather than the schema's — `topic` not `Name`,
 `state`/`protocol` not `GroupState`/`ProtocolData`, `groupGenerationId` not
 `GenerationIdOrMemberEpoch`, and an int64 offset as a string — so a spec can encode from `fields`
 and compare against `hex`, and decode `hex` and compare against `fields`, in one `toEqual` each. A
 field a version does not carry is rendered as the value the decoder reports for it (`""`,
-`null`), never omitted — except in the transaction-API and admin-API vectors, where it is left out
-of `fields` (see "What the transaction vectors pin" and "What the admin vectors pin").
+`null`), never omitted — except in the transaction-API, admin-API and group-API vectors, where it is
+left out of `fields` (see "What the transaction vectors pin" and "What the admin and group vectors
+pin").
 `memberMetadata`/`memberAssignment` travel as hex strings so they compare cleanly with a `Buffer`.
 
 The topic id constant is written in canonical 8-4-4-4-12 form and parsed through
@@ -153,9 +158,9 @@ v3 - makes the writer throw on a non-default value. The one field the vectors do
 version is that triple, at its defaults (`-1`, `""`, `null`): every `txnOffsetCommitRequest` has the same
 shape at v2 to v5.
 
-### What the admin vectors pin
+### What the admin and group vectors pin
 
-The admin vectors use the same fixture schema, with three rules of their own. A request's `fields`
+The admin and group vectors use the same fixture schema, with three rules of their own. A request's `fields`
 are the arguments the client's request builder takes (`topic`, `configEntries`, `topicPartitions`,
 `resourcePatternType`), and a response's are the keys its decoder returns (`topicErrors`,
 `creationResponses`, `filterResponses`, `configEntries`); a key the decoder derives rather than
@@ -163,7 +168,7 @@ reads (`isDefault`) or splits (`clientSideThrottleTime`) is not a field, and the
 `ThrottleTimeMs` is `throttleTime`. A field a version does not carry is left out of `fields`, as in
 the transaction vectors. A uuid is the canonical 8-4-4-4-12 string, and the zero uuid, which the
 client reads as `null`, is `null` in a response's `fields`. Every response carries
-`ThrottleTimeMs` 25.
+`ThrottleTimeMs` 25. Bytes travel as hex strings (`metadata`, `memberMetadata`, `memberAssignment`).
 
 Pairs that differ in one distinction, and the distinction:
 
@@ -186,6 +191,17 @@ Pairs that differ in one distinction, and the distinction:
   input: the vector exists to be told apart from the first.
 - `describeAcls/createAcls/deleteAcls` `-v3-userResource`: resource type 7 where `-basic` has 2.
   v3's body is v2's, so every `-v3-basic` is its `-v2-basic` byte for byte.
+- `joinGroupRequest-v8-basic` / `-withReason`: `Reason` is the request's last field, after the
+  protocols; the client sends it null, which is `-basic`. v6 is v5's body in flexible framing. v7
+  adds `ProtocolType` to the response, after `GenerationId`, and makes `ProtocolName` nullable:
+  `joinGroupResponse-v7-ok` carries a null `ProtocolType`, `-protocolType` a value and
+  `-nullProtocolName` a null name beside an error. No v9 vector exists: its `SkipAssignment` is not
+  used.
+- `syncGroupRequest-v5-assignment` / `-withProtocol` (and the responses): `ProtocolType` and
+  `ProtocolName` sit between the instance id and the assignments, null in `-assignment`.
+- `leaveGroupRequest-v5-*`: a nullable `Reason` after each member's instance id; v4 has none.
+- `offsetCommit` and `offsetFetch` `-v10-*`: the v9 vector with the 16-byte topic id where the topic
+  name was, and a throttle of 25. `unknownTopicId` answers code 100.
 - `describeTopicPartitionsRequest-v0-noCursor` / `-cursor`: `Cursor` is a nullable struct, so it
   carries a presence byte the schema does not show, `ff` for null and `01` before a present struct;
   `NextCursor` does the same (`-nextCursor`, `-noNextCursor`). `-elrNull` / `-elrEmpty` /

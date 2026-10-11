@@ -1,0 +1,7 @@
+{
+  "message": "OffsetFetchResponse",
+  "version": 10,
+  "case": "ok",
+  "hex": "00000019020b746573742d67726f7570020102030405060708090a0b0c0d0e0f100200000000000000000000000a00000003000000000000000000",
+  "fields": { "throttleTime": 25, "groupId": "test-group", "errorCode": 0, "topics": [{ "topicId": "01020304-0506-0708-090a-0b0c0d0e0f10", "partitions": [{ "partition": 0, "offset": "10", "leaderEpoch": 3, "metadata": null, "errorCode": 0 }] }] }
+}

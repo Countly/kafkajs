@@ -1,0 +1,7 @@
+{
+  "message": "SyncGroupResponse",
+  "version": 5,
+  "case": "protocol",
+  "hex": "00000019000009636f6e73756d657213526f756e64526f62696e41737369676e65720700030000000100",
+  "fields": { "throttleTime": 25, "errorCode": 0, "protocolType": "consumer", "protocolName": "RoundRobinAssigner", "memberAssignment": "000300000001" }
+}

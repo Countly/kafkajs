@@ -1,0 +1,7 @@
+{
+  "message": "HeartbeatResponse",
+  "version": 4,
+  "case": "error",
+  "hex": "00000019001b00",
+  "fields": { "throttleTime": 25, "errorCode": 27 }
+}

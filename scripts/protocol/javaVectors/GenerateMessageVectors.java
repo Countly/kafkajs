@@ -46,15 +46,23 @@ import org.apache.kafka.common.message.DescribeTopicPartitionsRequestData;
 import org.apache.kafka.common.message.DescribeTopicPartitionsResponseData;
 import org.apache.kafka.common.message.EndTxnRequestData;
 import org.apache.kafka.common.message.EndTxnResponseData;
+import org.apache.kafka.common.message.HeartbeatRequestData;
+import org.apache.kafka.common.message.HeartbeatResponseData;
 import org.apache.kafka.common.message.IncrementalAlterConfigsRequestData;
 import org.apache.kafka.common.message.IncrementalAlterConfigsResponseData;
 import org.apache.kafka.common.message.InitProducerIdRequestData;
+import org.apache.kafka.common.message.JoinGroupRequestData;
+import org.apache.kafka.common.message.JoinGroupResponseData;
+import org.apache.kafka.common.message.LeaveGroupRequestData;
+import org.apache.kafka.common.message.LeaveGroupResponseData;
 import org.apache.kafka.common.message.ListGroupsRequestData;
 import org.apache.kafka.common.message.ListGroupsResponseData;
 import org.apache.kafka.common.message.OffsetCommitRequestData;
 import org.apache.kafka.common.message.OffsetCommitResponseData;
 import org.apache.kafka.common.message.OffsetFetchRequestData;
 import org.apache.kafka.common.message.OffsetFetchResponseData;
+import org.apache.kafka.common.message.SyncGroupRequestData;
+import org.apache.kafka.common.message.SyncGroupResponseData;
 import org.apache.kafka.common.message.TxnOffsetCommitRequestData;
 import org.apache.kafka.common.message.TxnOffsetCommitResponseData;
 import org.apache.kafka.common.protocol.ByteBufferAccessor;
@@ -63,8 +71,9 @@ import org.apache.kafka.common.protocol.ObjectSerializationCache;
 
 /**
  * Generates golden byte vectors for the APIs the KIP-848 consumer protocol and its admin surface,
- * the transaction protocol and the admin client (configs, topics, records, groups, ACLs and topic
- * partitions) need, by running Apache Kafka's own generated message codecs
+ * the transaction protocol, the admin client (configs, topics, records, groups, ACLs and topic
+ * partitions) and the classic group protocol (JoinGroup, SyncGroup, Heartbeat, LeaveGroup) need,
+ * by running Apache Kafka's own generated message codecs
  * ({@code org.apache.kafka.common.message.*Data}) over pinned values.
  *
  * <p>Development-only: run via {@code scripts/protocol/javaVectors/runAssignors.sh messages}.
@@ -205,6 +214,12 @@ public final class GenerateMessageVectors {
   /** A filter that matches anything: every enum ANY, every string null. */
   private static final Acl ANY_FILTER = new Acl(ANY, null, ANY, null, null, ANY, ANY);
 
+  /** The group and offset error codes the cases carry. */
+  private static final short UNKNOWN_MEMBER_ID = 25;
+  private static final short REBALANCE_IN_PROGRESS = 27;
+  private static final short MEMBER_ID_REQUIRED = 79;
+  private static final short UNKNOWN_TOPIC_ID = 100;
+
   private GenerateMessageVectors() {}
 
   /** One vector: a message, the version to serialize it at, and the fields it was built from. */
@@ -284,6 +299,12 @@ public final class GenerateMessageVectors {
     vectors.addAll(deleteGroups());
     vectors.addAll(acls());
     vectors.addAll(describeTopicPartitions());
+    vectors.addAll(joinGroup());
+    vectors.addAll(syncGroup());
+    vectors.addAll(heartbeat());
+    vectors.addAll(leaveGroup());
+    vectors.addAll(offsetCommitByTopicId());
+    vectors.addAll(offsetFetchByTopicId());
     return vectors;
   }
 
@@ -3105,6 +3126,571 @@ public final class GenerateMessageVectors {
             kv("throttleTime", num(THROTTLE_TIME_MS)),
             kv("topics", list(Arrays.asList(topics), DtpTopic::json)),
             kv("nextCursor", nextCursorJson == null ? "null" : nextCursorJson)));
+  }
+
+  /** A JoinGroup protocol: a name and its subscription bytes. */
+  private record JoinProtocol(String name, byte[] metadata) {
+    /** @return the Kafka {@code JoinGroupRequestProtocol} for this protocol */
+    JoinGroupRequestData.JoinGroupRequestProtocol data() {
+      return new JoinGroupRequestData.JoinGroupRequestProtocol()
+          .setName(name)
+          .setMetadata(metadata);
+    }
+
+    /** @return this protocol as the JSON of a fixture's {@code fields} */
+    String json() {
+      return obj(kv("name", str(name)), kv("metadata", str(hex(metadata))));
+    }
+  }
+
+  /** @param bytes any bytes @return lower-case hex, the form {@code fields} carries bytes in */
+  private static String hex(byte[] bytes) {
+    StringBuilder hex = new StringBuilder();
+    for (byte b : bytes) {
+      hex.append(String.format("%02x", b));
+    }
+    return hex.toString();
+  }
+
+  /** One member of a JoinGroup response. */
+  private record JoinMember(String memberId, String groupInstanceId, byte[] metadata) {
+    /** @return the Kafka {@code JoinGroupResponseMember} for this member */
+    JoinGroupResponseData.JoinGroupResponseMember data() {
+      return new JoinGroupResponseData.JoinGroupResponseMember()
+          .setMemberId(memberId)
+          .setGroupInstanceId(groupInstanceId)
+          .setMetadata(metadata);
+    }
+
+    /** @return this member as the JSON of a fixture's {@code fields} */
+    String json() {
+      return obj(
+          kv("memberId", str(memberId)),
+          kv("groupInstanceId", str(groupInstanceId)),
+          kv("memberMetadata", str(hex(metadata))));
+    }
+  }
+
+  /**
+   * JoinGroup (11) v6-v8, request and response (KIP-345, KIP-800, KIP-814).
+   *
+   * <p>v6 is v5's body in flexible framing; v7 adds ProtocolType to the response and makes its
+   * ProtocolName nullable; v8 adds a nullable Reason as the request's last field. The client sends
+   * a null Reason, which is {@code basic}'s (a v8 default), so {@code withReason} is the case that
+   * shows where the field sits. v9 is not generated: its SkipAssignment is not used.
+   *
+   * @see <a href="https://github.com/apache/kafka/blob/4.3.1/clients/src/main/resources/common/message/JoinGroupResponse.json">JoinGroupResponse.json</a>
+   * @return the key-11 vectors
+   */
+  private static List<Vector> joinGroup() {
+    List<Vector> vectors = new ArrayList<>();
+    List<JoinProtocol> protocols = List.of(new JoinProtocol(ASSIGNOR_NAME, MEMBER_BYTES));
+    List<JoinMember> members =
+        List.of(
+            new JoinMember(MEMBER_ID, null, MEMBER_BYTES),
+            new JoinMember("other-member", GROUP_INSTANCE_ID, MEMBER_BYTES));
+
+    for (short version : new short[] {6, 7, 8}) {
+      vectors.add(joinRequest(version, "basic", "", null, null, protocols));
+      vectors.add(
+          joinRequest(version, "staticMember", MEMBER_ID, GROUP_INSTANCE_ID, null, protocols));
+      if (version >= 8) {
+        vectors.add(
+            joinRequest(version, "withReason", MEMBER_ID, GROUP_INSTANCE_ID,
+                "the consumer is being closed", protocols));
+      }
+
+      vectors.add(joinResponse(version, "ok", 0, 5, null, ASSIGNOR_NAME, MEMBER_ID, members));
+      if (version >= 7) {
+        vectors.add(
+            joinResponse(version, "protocolType", 0, 5, PROTOCOL_TYPE, ASSIGNOR_NAME, MEMBER_ID,
+                members));
+        vectors.add(
+            joinResponse(version, "nullProtocolName", MEMBER_ID_REQUIRED, -1, PROTOCOL_TYPE, null,
+                MEMBER_ID, List.of()));
+      }
+    }
+
+    return vectors;
+  }
+
+  /**
+   * @param version the request version
+   * @param caseId the case name
+   * @param memberId the member id, empty on a first join
+   * @param groupInstanceId the static membership id, or null
+   * @param reason the join reason (v8+), or null
+   * @param protocols the offered protocols
+   * @return one JoinGroup request vector
+   */
+  private static Vector joinRequest(
+      short version, String caseId, String memberId, String groupInstanceId, String reason,
+      List<JoinProtocol> protocols) {
+    JoinGroupRequestData data =
+        new JoinGroupRequestData()
+            .setGroupId(GROUP_ID)
+            .setSessionTimeoutMs(30000)
+            .setRebalanceTimeoutMs(60000)
+            .setMemberId(memberId)
+            .setGroupInstanceId(groupInstanceId)
+            .setProtocolType(PROTOCOL_TYPE)
+            .setProtocols(
+                new JoinGroupRequestData.JoinGroupRequestProtocolCollection(
+                    protocols.stream().map(JoinProtocol::data).iterator()));
+    List<String> entries =
+        new ArrayList<>(
+            List.of(
+                kv("groupId", str(GROUP_ID)),
+                kv("sessionTimeout", "30000"),
+                kv("rebalanceTimeout", "60000"),
+                kv("memberId", str(memberId)),
+                kv("groupInstanceId", str(groupInstanceId)),
+                kv("protocolType", str(PROTOCOL_TYPE)),
+                kv("groupProtocols", list(protocols, JoinProtocol::json))));
+    if (version >= 8) {
+      data.setReason(reason);
+      entries.add(kv("reason", str(reason)));
+    }
+    return new Vector("joinGroup", "JoinGroupRequest", version, caseId, data,
+        obj(entries.toArray(new String[0])));
+  }
+
+  /**
+   * @param version the response version
+   * @param caseId the case name
+   * @param errorCode the error code
+   * @param generationId the generation
+   * @param protocolType the chosen protocol type (v7+), or null
+   * @param protocolName the chosen protocol name, or null
+   * @param memberId the assigned member id
+   * @param members the members the response lists
+   * @return one JoinGroup response vector
+   */
+  private static Vector joinResponse(
+      short version, String caseId, int errorCode, int generationId, String protocolType,
+      String protocolName, String memberId, List<JoinMember> members) {
+    JoinGroupResponseData data =
+        new JoinGroupResponseData()
+            .setThrottleTimeMs(THROTTLE_TIME_MS)
+            .setErrorCode((short) errorCode)
+            .setGenerationId(generationId)
+            .setProtocolName(protocolName)
+            .setLeader(errorCode == 0 ? MEMBER_ID : "")
+            .setMemberId(memberId)
+            .setMembers(members.stream().map(JoinMember::data).toList());
+    List<String> entries =
+        new ArrayList<>(
+            List.of(
+                kv("throttleTime", num(THROTTLE_TIME_MS)),
+                kv("errorCode", num(errorCode)),
+                kv("generationId", num(generationId))));
+    if (version >= 7) {
+      data.setProtocolType(protocolType);
+      entries.add(kv("protocolType", str(protocolType)));
+    }
+    entries.add(kv("groupProtocol", str(protocolName)));
+    entries.add(kv("leaderId", str(errorCode == 0 ? MEMBER_ID : "")));
+    entries.add(kv("memberId", str(memberId)));
+    entries.add(kv("members", list(members, JoinMember::json)));
+    return new Vector("joinGroup", "JoinGroupResponse", version, caseId, data,
+        obj(entries.toArray(new String[0])));
+  }
+
+  /**
+   * SyncGroup (14) v4-v5, request and response. v4 is v3's body in flexible framing; v5 adds
+   * nullable ProtocolType and ProtocolName to both directions. {@code assignment} and {@code ok}
+   * carry them null at v5 (what the client sends); {@code withProtocol} and {@code protocol} set
+   * them.
+   *
+   * @see <a href="https://github.com/apache/kafka/blob/4.3.1/clients/src/main/resources/common/message/SyncGroupRequest.json">SyncGroupRequest.json</a>
+   * @return the key-14 vectors
+   */
+  private static List<Vector> syncGroup() {
+    List<Vector> vectors = new ArrayList<>();
+
+    for (short version : new short[] {4, 5}) {
+      vectors.add(syncRequest(version, "assignment", null, null));
+      vectors.add(syncResponse(version, "ok", null, null));
+      if (version >= 5) {
+        vectors.add(syncRequest(version, "withProtocol", PROTOCOL_TYPE, ASSIGNOR_NAME));
+        vectors.add(syncResponse(version, "protocol", PROTOCOL_TYPE, ASSIGNOR_NAME));
+      }
+    }
+
+    return vectors;
+  }
+
+  /**
+   * @param version the request version
+   * @param caseId the case name
+   * @param protocolType the protocol type (v5+), or null
+   * @param protocolName the protocol name (v5+), or null
+   * @return one SyncGroup request vector
+   */
+  private static Vector syncRequest(
+      short version, String caseId, String protocolType, String protocolName) {
+    SyncGroupRequestData data =
+        new SyncGroupRequestData()
+            .setGroupId(GROUP_ID)
+            .setGenerationId(GENERATION_ID)
+            .setMemberId(MEMBER_ID)
+            .setGroupInstanceId(GROUP_INSTANCE_ID)
+            .setAssignments(
+                List.of(
+                    new SyncGroupRequestData.SyncGroupRequestAssignment()
+                        .setMemberId(MEMBER_ID)
+                        .setAssignment(MEMBER_BYTES)));
+    List<String> entries =
+        new ArrayList<>(
+            List.of(
+                kv("groupId", str(GROUP_ID)),
+                kv("generationId", num(GENERATION_ID)),
+                kv("memberId", str(MEMBER_ID)),
+                kv("groupInstanceId", str(GROUP_INSTANCE_ID))));
+    if (version >= 5) {
+      data.setProtocolType(protocolType).setProtocolName(protocolName);
+      entries.add(kv("protocolType", str(protocolType)));
+      entries.add(kv("protocolName", str(protocolName)));
+    }
+    entries.add(
+        kv("groupAssignment",
+            array(
+                obj(kv("memberId", str(MEMBER_ID)),
+                    kv("memberAssignment", str(hex(MEMBER_BYTES)))))));
+    return new Vector("syncGroup", "SyncGroupRequest", version, caseId, data,
+        obj(entries.toArray(new String[0])));
+  }
+
+  /**
+   * @param version the response version
+   * @param caseId the case name
+   * @param protocolType the protocol type (v5+), or null
+   * @param protocolName the protocol name (v5+), or null
+   * @return one SyncGroup response vector
+   */
+  private static Vector syncResponse(
+      short version, String caseId, String protocolType, String protocolName) {
+    SyncGroupResponseData data =
+        new SyncGroupResponseData()
+            .setThrottleTimeMs(THROTTLE_TIME_MS)
+            .setErrorCode((short) 0)
+            .setAssignment(MEMBER_BYTES);
+    List<String> entries =
+        new ArrayList<>(
+            List.of(kv("throttleTime", num(THROTTLE_TIME_MS)), kv("errorCode", "0")));
+    if (version >= 5) {
+      data.setProtocolType(protocolType).setProtocolName(protocolName);
+      entries.add(kv("protocolType", str(protocolType)));
+      entries.add(kv("protocolName", str(protocolName)));
+    }
+    entries.add(kv("memberAssignment", str(hex(MEMBER_BYTES))));
+    return new Vector("syncGroup", "SyncGroupResponse", version, caseId, data,
+        obj(entries.toArray(new String[0])));
+  }
+
+  /**
+   * Heartbeat (12) v4, request and response: v3's body in flexible framing, from a static member.
+   *
+   * @return the key-12 vectors
+   */
+  private static List<Vector> heartbeat() {
+    List<Vector> vectors = new ArrayList<>();
+    String api = "heartbeat";
+
+    vectors.add(
+        new Vector(api, "HeartbeatRequest", (short) 4, "basic",
+            new HeartbeatRequestData()
+                .setGroupId(GROUP_ID)
+                .setGenerationId(GENERATION_ID)
+                .setMemberId(MEMBER_ID)
+                .setGroupInstanceId(GROUP_INSTANCE_ID),
+            obj(
+                kv("groupId", str(GROUP_ID)),
+                kv("groupGenerationId", num(GENERATION_ID)),
+                kv("memberId", str(MEMBER_ID)),
+                kv("groupInstanceId", str(GROUP_INSTANCE_ID)))));
+    for (short code : new short[] {0, REBALANCE_IN_PROGRESS}) {
+      vectors.add(
+          new Vector(api, "HeartbeatResponse", (short) 4, code == 0 ? "ok" : "error",
+              new HeartbeatResponseData().setThrottleTimeMs(THROTTLE_TIME_MS).setErrorCode(code),
+              obj(kv("throttleTime", num(THROTTLE_TIME_MS)), kv("errorCode", num(code)))));
+    }
+
+    return vectors;
+  }
+
+  /** One LeaveGroup member; the reason is v5. */
+  private record Leaver(String memberId, String groupInstanceId, String reason) {
+    /**
+     * @param version the request version; the reason is written from v5
+     * @return the Kafka {@code MemberIdentity} for this member
+     */
+    LeaveGroupRequestData.MemberIdentity data(short version) {
+      LeaveGroupRequestData.MemberIdentity data =
+          new LeaveGroupRequestData.MemberIdentity()
+              .setMemberId(memberId)
+              .setGroupInstanceId(groupInstanceId);
+      return version >= 5 ? data.setReason(reason) : data;
+    }
+
+    /**
+     * @param version the request version; the reason is carried from v5
+     * @return this member as the JSON of a fixture's {@code fields}
+     */
+    String json(short version) {
+      return version >= 5
+          ? obj(
+              kv("memberId", str(memberId)),
+              kv("groupInstanceId", str(groupInstanceId)),
+              kv("reason", str(reason)))
+          : obj(kv("memberId", str(memberId)), kv("groupInstanceId", str(groupInstanceId)));
+    }
+  }
+
+  /**
+   * LeaveGroup (13) v4-v5, request and response (KIP-345, KIP-800). v4 is v3's body in flexible
+   * framing; v5 adds a nullable Reason to each member. {@code oneMember} is a dynamic member and
+   * {@code twoMembers} adds a static one; at v5 their reasons are null and {@code withReason} sets
+   * them.
+   *
+   * @see <a href="https://github.com/apache/kafka/blob/4.3.1/clients/src/main/resources/common/message/LeaveGroupRequest.json">LeaveGroupRequest.json</a>
+   * @return the key-13 vectors
+   */
+  private static List<Vector> leaveGroup() {
+    List<Vector> vectors = new ArrayList<>();
+    Leaver dynamic = new Leaver(MEMBER_ID, null, null);
+    Leaver staticMember = new Leaver("other-member", GROUP_INSTANCE_ID, null);
+
+    for (short version : new short[] {4, 5}) {
+      vectors.add(leaveRequest(version, "oneMember", dynamic));
+      vectors.add(leaveRequest(version, "twoMembers", dynamic, staticMember));
+      if (version >= 5) {
+        vectors.add(
+            leaveRequest(version, "withReason",
+                new Leaver(MEMBER_ID, null, "the consumer is being closed"),
+                new Leaver("other-member", GROUP_INSTANCE_ID, "member was removed by an admin")));
+      }
+
+      vectors.add(leaveResponse(version, "ok", (short) 0));
+      vectors.add(leaveResponse(version, "memberError", UNKNOWN_MEMBER_ID));
+    }
+
+    return vectors;
+  }
+
+  /**
+   * @param version the request version
+   * @param caseId the case name
+   * @param members the members leaving
+   * @return one LeaveGroup request vector
+   */
+  private static Vector leaveRequest(short version, String caseId, Leaver... members) {
+    return new Vector("leaveGroup", "LeaveGroupRequest", version, caseId,
+        new LeaveGroupRequestData()
+            .setGroupId(GROUP_ID)
+            .setMembers(Arrays.stream(members).map(m -> m.data(version)).toList()),
+        obj(
+            kv("groupId", str(GROUP_ID)),
+            kv("members", list(Arrays.asList(members), m -> m.json(version)))));
+  }
+
+  /**
+   * @param version the response version
+   * @param caseId the case name
+   * @param memberCode the error code of the second member
+   * @return one LeaveGroup response vector
+   */
+  private static Vector leaveResponse(short version, String caseId, short memberCode) {
+    return new Vector("leaveGroup", "LeaveGroupResponse", version, caseId,
+        new LeaveGroupResponseData()
+            .setThrottleTimeMs(THROTTLE_TIME_MS)
+            .setErrorCode((short) 0)
+            .setMembers(
+                List.of(
+                    new LeaveGroupResponseData.MemberResponse()
+                        .setMemberId(MEMBER_ID)
+                        .setGroupInstanceId(null)
+                        .setErrorCode((short) 0),
+                    new LeaveGroupResponseData.MemberResponse()
+                        .setMemberId("other-member")
+                        .setGroupInstanceId(GROUP_INSTANCE_ID)
+                        .setErrorCode(memberCode))),
+        obj(
+            kv("throttleTime", num(THROTTLE_TIME_MS)),
+            kv("errorCode", "0"),
+            kv("members",
+                array(
+                    obj(kv("memberId", str(MEMBER_ID)), kv("groupInstanceId", "null"),
+                        kv("errorCode", "0")),
+                    obj(kv("memberId", str("other-member")),
+                        kv("groupInstanceId", str(GROUP_INSTANCE_ID)),
+                        kv("errorCode", num(memberCode)))))));
+  }
+
+  /**
+   * OffsetCommit (8) v10, request and response (KIP-848): {@code TopicId} replaces {@code Name}.
+   * The values are {@code offsetCommit()}'s v9 ones with the topic named by id, which is what a
+   * consumer-protocol member sends. {@code unknownTopicId} answers UNKNOWN_TOPIC_ID (100).
+   *
+   * @return the key-8 v10 vectors
+   */
+  private static List<Vector> offsetCommitByTopicId() {
+    List<Vector> vectors = new ArrayList<>();
+    String api = "offsetCommit";
+
+    OffsetCommitRequestData.OffsetCommitRequestPartition committed =
+        new OffsetCommitRequestData.OffsetCommitRequestPartition()
+            .setPartitionIndex(PARTITION_INDEX)
+            .setCommittedOffset(COMMITTED_OFFSET)
+            .setCommittedLeaderEpoch(-1)
+            .setCommittedMetadata(null);
+    String partition =
+        obj(
+            kv("partition", num(PARTITION_INDEX)),
+            kv("offset", str(String.valueOf(COMMITTED_OFFSET))),
+            kv("leaderEpoch", "-1"),
+            kv("metadata", "null"));
+    vectors.add(
+        new Vector(api, "OffsetCommitRequest", (short) 10, "byTopicId",
+            new OffsetCommitRequestData()
+                .setGroupId(GROUP_ID)
+                .setGenerationIdOrMemberEpoch(GENERATION_ID)
+                .setMemberId(MEMBER_ID)
+                .setGroupInstanceId(GROUP_INSTANCE_ID)
+                .setTopics(
+                    List.of(
+                        new OffsetCommitRequestData.OffsetCommitRequestTopic()
+                            .setTopicId(topicId())
+                            .setPartitions(List.of(committed)))),
+            obj(
+                kv("groupId", str(GROUP_ID)),
+                kv("groupGenerationId", num(GENERATION_ID)),
+                kv("memberId", str(MEMBER_ID)),
+                kv("groupInstanceId", str(GROUP_INSTANCE_ID)),
+                kv("topics",
+                    array(
+                        obj(kv("topicId", str(TOPIC_ID)), kv("partitions", array(partition))))))));
+
+    for (short code : new short[] {0, UNKNOWN_TOPIC_ID}) {
+      OffsetCommitResponseData.OffsetCommitResponsePartition answered =
+          new OffsetCommitResponseData.OffsetCommitResponsePartition()
+              .setPartitionIndex(PARTITION_INDEX)
+              .setErrorCode(code);
+      String partitionJson =
+          obj(kv("partition", num(PARTITION_INDEX)), kv("errorCode", num(code)));
+      vectors.add(
+          new Vector(api, "OffsetCommitResponse", (short) 10, code == 0 ? "ok" : "unknownTopicId",
+              new OffsetCommitResponseData()
+                  .setThrottleTimeMs(THROTTLE_TIME_MS)
+                  .setTopics(
+                      List.of(
+                          new OffsetCommitResponseData.OffsetCommitResponseTopic()
+                              .setTopicId(topicId())
+                              .setPartitions(List.of(answered)))),
+              obj(
+                  kv("throttleTime", num(THROTTLE_TIME_MS)),
+                  kv("topics",
+                      array(
+                          obj(kv("topicId", str(TOPIC_ID)),
+                              kv("partitions", array(partitionJson))))))));
+    }
+
+    return vectors;
+  }
+
+  /**
+   * OffsetFetch (9) v10, request and response (KIP-848): the {@code Groups[]} form of v9 with
+   * {@code TopicId} in place of {@code Name}. {@code byTopicId} asks for one partition of one topic
+   * as a member; {@code allTopics} is the null topic list of an admin client.
+   * {@code unknownTopicId} answers UNKNOWN_TOPIC_ID (100) for the partition.
+   *
+   * @return the key-9 v10 vectors
+   */
+  private static List<Vector> offsetFetchByTopicId() {
+    List<Vector> vectors = new ArrayList<>();
+    String api = "offsetFetch";
+
+    OffsetFetchRequestData.OffsetFetchRequestGroup member =
+        new OffsetFetchRequestData.OffsetFetchRequestGroup()
+            .setGroupId(GROUP_ID)
+            .setMemberId(MEMBER_ID)
+            .setMemberEpoch(MEMBER_EPOCH)
+            .setTopics(
+                List.of(
+                    new OffsetFetchRequestData.OffsetFetchRequestTopics()
+                        .setTopicId(topicId())
+                        .setPartitionIndexes(List.of(PARTITION_INDEX))));
+    vectors.add(
+        new Vector(api, "OffsetFetchRequest", (short) 10, "byTopicId",
+            new OffsetFetchRequestData().setGroups(List.of(member)).setRequireStable(false),
+            obj(
+                kv("groupId", str(GROUP_ID)),
+                kv("memberId", str(MEMBER_ID)),
+                kv("memberEpoch", num(MEMBER_EPOCH)),
+                kv("topics",
+                    array(
+                        obj(kv("topicId", str(TOPIC_ID)),
+                            kv("partitions", array(obj(kv("partition", num(PARTITION_INDEX)))))))),
+                kv("requireStable", "false"))));
+
+    OffsetFetchRequestData.OffsetFetchRequestGroup anyTopic =
+        new OffsetFetchRequestData.OffsetFetchRequestGroup()
+            .setGroupId(GROUP_ID)
+            .setMemberId(null)
+            .setMemberEpoch(-1)
+            .setTopics(null);
+    vectors.add(
+        new Vector(api, "OffsetFetchRequest", (short) 10, "allTopics",
+            new OffsetFetchRequestData().setGroups(List.of(anyTopic)).setRequireStable(false),
+            obj(
+                kv("groupId", str(GROUP_ID)),
+                kv("memberId", "null"),
+                kv("memberEpoch", "-1"),
+                kv("topics", "null"),
+                kv("requireStable", "false"))));
+
+    for (short code : new short[] {0, UNKNOWN_TOPIC_ID}) {
+      long offset = code == 0 ? COMMITTED_OFFSET : -1L;
+      int epoch = code == 0 ? COMMITTED_LEADER_EPOCH : -1;
+      OffsetFetchResponseData.OffsetFetchResponsePartitions answered =
+          new OffsetFetchResponseData.OffsetFetchResponsePartitions()
+              .setPartitionIndex(PARTITION_INDEX)
+              .setCommittedOffset(offset)
+              .setCommittedLeaderEpoch(epoch)
+              .setMetadata(null)
+              .setErrorCode(code);
+      OffsetFetchResponseData.OffsetFetchResponseGroup group =
+          new OffsetFetchResponseData.OffsetFetchResponseGroup()
+              .setGroupId(GROUP_ID)
+              .setErrorCode((short) 0)
+              .setTopics(
+                  List.of(
+                      new OffsetFetchResponseData.OffsetFetchResponseTopics()
+                          .setTopicId(topicId())
+                          .setPartitions(List.of(answered))));
+      String partition =
+          obj(
+              kv("partition", num(PARTITION_INDEX)),
+              kv("offset", str(String.valueOf(offset))),
+              kv("leaderEpoch", num(epoch)),
+              kv("metadata", "null"),
+              kv("errorCode", num(code)));
+      vectors.add(
+          new Vector(api, "OffsetFetchResponse", (short) 10, code == 0 ? "ok" : "unknownTopicId",
+              new OffsetFetchResponseData()
+                  .setThrottleTimeMs(THROTTLE_TIME_MS)
+                  .setGroups(List.of(group)),
+              obj(
+                  kv("throttleTime", num(THROTTLE_TIME_MS)),
+                  kv("groupId", str(GROUP_ID)),
+                  kv("errorCode", "0"),
+                  kv("topics",
+                      array(
+                          obj(kv("topicId", str(TOPIC_ID)),
+                              kv("partitions", array(partition))))))));
+    }
+
+    return vectors;
   }
 
   /**

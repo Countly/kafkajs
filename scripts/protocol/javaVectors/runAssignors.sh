@@ -2,7 +2,8 @@
 #
 # Generates golden vectors by running Apache Kafka's own code: `assignors` (the default) runs the
 # partition assignors, `messages` runs the generated message codecs for the consumer-protocol,
-# group-visibility, transaction, admin (config, topic, record, group, ACL) and topic-partition APIs.
+# group-visibility, transaction, admin (config, topic, record, group, ACL), topic-partition and
+# classic group APIs.
 # The kafka-clients jar is downloaded into a temporary directory and is never committed.
 #
 # Usage: scripts/protocol/javaVectors/runAssignors.sh [assignors|messages] [output-dir]

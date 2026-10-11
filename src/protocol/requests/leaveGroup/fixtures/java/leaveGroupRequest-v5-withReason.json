@@ -1,0 +1,7 @@
+{
+  "message": "LeaveGroupRequest",
+  "version": 5,
+  "case": "withReason",
+  "hex": "0b746573742d67726f7570030c746573742d6d656d626572001d74686520636f6e73756d6572206973206265696e6720636c6f736564000d6f746865722d6d656d6265720e746573742d696e7374616e63651f6d656d626572207761732072656d6f76656420627920616e2061646d696e0000",
+  "fields": { "groupId": "test-group", "members": [{ "memberId": "test-member", "groupInstanceId": null, "reason": "the consumer is being closed" }, { "memberId": "other-member", "groupInstanceId": "test-instance", "reason": "member was removed by an admin" }] }
+}

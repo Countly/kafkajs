@@ -1,0 +1,7 @@
+{
+  "message": "JoinGroupRequest",
+  "version": 7,
+  "case": "basic",
+  "hex": "0b746573742d67726f7570000075300000ea60010009636f6e73756d65720213526f756e64526f62696e41737369676e6572070003000000010000",
+  "fields": { "groupId": "test-group", "sessionTimeout": 30000, "rebalanceTimeout": 60000, "memberId": "", "groupInstanceId": null, "protocolType": "consumer", "groupProtocols": [{ "name": "RoundRobinAssigner", "metadata": "000300000001" }] }
+}

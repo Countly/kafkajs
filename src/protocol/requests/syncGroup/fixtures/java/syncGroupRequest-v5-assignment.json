@@ -1,0 +1,7 @@
+{
+  "message": "SyncGroupRequest",
+  "version": 5,
+  "case": "assignment",
+  "hex": "0b746573742d67726f7570000000050c746573742d6d656d6265720e746573742d696e7374616e63650000020c746573742d6d656d626572070003000000010000",
+  "fields": { "groupId": "test-group", "generationId": 5, "memberId": "test-member", "groupInstanceId": "test-instance", "protocolType": null, "protocolName": null, "groupAssignment": [{ "memberId": "test-member", "memberAssignment": "000300000001" }] }
+}

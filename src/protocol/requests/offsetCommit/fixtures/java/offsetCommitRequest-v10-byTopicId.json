@@ -1,0 +1,7 @@
+{
+  "message": "OffsetCommitRequest",
+  "version": 10,
+  "case": "byTopicId",
+  "hex": "0b746573742d67726f7570000000050c746573742d6d656d6265720e746573742d696e7374616e6365020102030405060708090a0b0c0d0e0f100200000000000000000000000affffffff00000000",
+  "fields": { "groupId": "test-group", "groupGenerationId": 5, "memberId": "test-member", "groupInstanceId": "test-instance", "topics": [{ "topicId": "01020304-0506-0708-090a-0b0c0d0e0f10", "partitions": [{ "partition": 0, "offset": "10", "leaderEpoch": -1, "metadata": null }] }] }
+}
