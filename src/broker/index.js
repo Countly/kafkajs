@@ -1211,11 +1211,15 @@ module.exports = class Broker {
    *                                   configNames: ['compression.type', 'retention.ms']
    *                                 }]
    * @param {boolean} [request.includeSynonyms=false]
+   * @param {boolean} [request.includeDocumentation=false] ask for each entry's documentation; sent
+   *                                 from DescribeConfigs v3, ignored by older versions
    * @returns {Promise}
    */
-  async describeConfigs({ resources, includeSynonyms = false }) {
+  async describeConfigs({ resources, includeSynonyms = false, includeDocumentation = false }) {
     const describeConfigs = this.lookupRequest(apiKeys.DescribeConfigs, requests.DescribeConfigs)
-    return await this[PRIVATE.SEND_REQUEST](describeConfigs({ resources, includeSynonyms }))
+    return await this[PRIVATE.SEND_REQUEST](
+      describeConfigs({ resources, includeSynonyms, includeDocumentation })
+    )
   }
 
   /**
@@ -1238,6 +1242,28 @@ module.exports = class Broker {
   async alterConfigs({ resources, validateOnly = false }) {
     const alterConfigs = this.lookupRequest(apiKeys.AlterConfigs, requests.AlterConfigs)
     return await this[PRIVATE.SEND_REQUEST](alterConfigs({ resources, validateOnly }))
+  }
+
+  /**
+   * Change individual config entries (KIP-339). Each entry names an operation, so the entries a
+   * request leaves out stay as they are, unlike `alterConfigs`, which replaces the whole config.
+   * The response carries one result per resource, and a failed resource is a result, not an error.
+   * @public
+   * @param {object} request
+   * @param {{ type: number, name: string,
+   *   configEntries: { name: string, operation: number, value?: string|null }[] }[]} request.resources
+   *   `operation` is an `AlterConfigOpTypes` value; a DELETE ignores `value`
+   * @param {boolean} [request.validateOnly=false]
+   * @returns {Promise<{ throttleTime: number, clientSideThrottleTime: number, resources:
+   *   { errorCode: number, errorMessage: string|null, resourceType: number,
+   *   resourceName: string }[] }>}
+   */
+  async incrementalAlterConfigs({ resources, validateOnly = false }) {
+    const incrementalAlterConfigs = this.lookupRequest(
+      apiKeys.IncrementalAlterConfigs,
+      requests.IncrementalAlterConfigs
+    )
+    return await this[PRIVATE.SEND_REQUEST](incrementalAlterConfigs({ resources, validateOnly }))
   }
 
   /**

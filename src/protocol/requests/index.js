@@ -71,7 +71,7 @@ const requests = {
   DescribeDelegationToken: noImplementedRequestDefinitions,
   DeleteGroups: require('./deleteGroups'),
   ElectLeaders: noImplementedRequestDefinitions,
-  IncrementalAlterConfigs: noImplementedRequestDefinitions,
+  IncrementalAlterConfigs: require('./incrementalAlterConfigs'),
   AlterPartitionReassignments: require('./alterPartitionReassignments'),
   ListPartitionReassignments: require('./listPartitionReassignments'),
   ConsumerGroupHeartbeat: require('./consumerGroupHeartbeat'),

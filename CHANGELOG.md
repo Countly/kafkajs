@@ -488,7 +488,12 @@ Adopted upstream PRs are credited here by number as they land (Phase 2 onward).
 
 #### Fixes
 
+- `describeConfigs` with a resource whose `configNames` is `null` no longer fails with a `TypeError` while the request is built: the admin check accepted `null` but the encoder of `DescribeConfigs` v1 and v2 did not. Against a 4.x broker the request is built at v4, where `null` and an empty list both ask for every config.
+
 #### Additions
+
+- The configuration APIs reach the versions Kafka 4.3 offers. `IncrementalAlterConfigs` (KIP-339) v0 and v1 are implemented and `Broker#incrementalAlterConfigs({ resources, validateOnly })` sends them: each config entry names an operation (`AlterConfigOpTypes` `SET`, `DELETE`, `APPEND` or `SUBTRACT`), so the entries a request leaves out are untouched, a DELETE is always written with a null value, an entry with an unknown operation or without a value (other than a DELETE) is refused before anything is sent, and a resource that fails comes back as a result carrying its `errorCode` instead of throwing. `DescribeConfigs` v3 (KIP-569) and v4 (the same fields in flexible framing, KIP-482) and `AlterConfigs` v2 are implemented and negotiated, so `describeConfigs` and `alterConfigs` use them against every 4.x broker: every `describeConfigs` entry keeps all its keys and gains `configType` (the raw byte of `ConfigTypes`) and `documentation`, which is `null` unless `Broker#describeConfigs` is given `includeDocumentation: true`. The compatibility matrix lists the three APIs as current.
+- Four enums for the new wire values, exported from `index.js` and `index.mjs`: `ConfigResourceTypes` gains `CLIENT_METRICS` (16) and `GROUP` (32), `ConfigSource` gains `CLIENT_METRICS_CONFIG` (7) and `GROUP_CONFIG` (8), and `AlterConfigOpTypes` (`SET` 0, `DELETE` 1, `APPEND` 2, `SUBTRACT` 3) and `ConfigTypes` (`UNKNOWN` 0 to `PASSWORD` 9) are new frozen objects.
 
 #### Tooling
 

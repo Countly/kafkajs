@@ -6,4 +6,6 @@ module.exports = {
   TOPIC: 2,
   BROKER: 4,
   BROKER_LOGGER: 8,
+  CLIENT_METRICS: 16,
+  GROUP: 32,
 }

@@ -11,6 +11,10 @@ const Broker = require('../index')
 
 const sortByConfigName = (array) => array.sort((a, b) => a.configName.localeCompare(b.configName))
 
+// From v3 an entry also reports the type of its value and, only when asked for, its documentation.
+const withTypeAndDocumentation = (entries) =>
+  entries.map((entry) => ({ ...entry, configType: expect.any(Number), documentation: null }))
+
 describe('Broker > describeConfigs', () => {
   let seedBroker, broker
 
@@ -62,7 +66,7 @@ describe('Broker > describeConfigs', () => {
     expect(response).toEqual({
       resources: [
         {
-          configEntries: [
+          configEntries: withTypeAndDocumentation([
             {
               configName: 'compression.type',
               configValue: 'producer',
@@ -87,7 +91,7 @@ describe('Broker > describeConfigs', () => {
               readOnly: false,
               configSynonyms: [],
             },
-          ],
+          ]),
           errorCode: 0,
           // Kafka 4.x returns an empty error message rather than a null one for these responses.
           errorMessage: '',
@@ -356,7 +360,7 @@ describe('Broker > describeConfigs', () => {
       )
 
       expect(sortByConfigName(response.resources[0].configEntries)).toEqual(
-        expect.arrayContaining(expectedConfigEntries)
+        expect.arrayContaining(withTypeAndDocumentation(expectedConfigEntries))
       )
     })
   })

@@ -14,6 +14,8 @@ export const {
   AclPermissionTypes,
   ResourcePatternTypes,
   ConfigSource,
+  AlterConfigOpTypes,
+  ConfigTypes,
   KafkaJSError,
   KafkaJSNonRetriableError,
   KafkaJSPartialMessageError,

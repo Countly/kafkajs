@@ -9,6 +9,16 @@ const versions = {
     const response = require('./v2/response')
     return { request: request({ resources, includeSynonyms }), response }
   },
+  3: ({ resources, includeSynonyms, includeDocumentation }) => {
+    const request = require('./v3/request')
+    const response = require('./v3/response')
+    return { request: request({ resources, includeSynonyms, includeDocumentation }), response }
+  },
+  4: ({ resources, includeSynonyms, includeDocumentation }) => {
+    const request = require('./v4/request')
+    const response = require('./v4/response')
+    return { request: request({ resources, includeSynonyms, includeDocumentation }), response }
+  },
 }
 
 module.exports = {

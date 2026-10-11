@@ -708,9 +708,11 @@
       "latestVersionUnstable": false,
       "forkVersions": [
         1,
-        2
+        2,
+        3,
+        4
       ],
-      "gap": "behind:2",
+      "gap": "current",
       "onFloor": false,
       "belowFloor": [],
       "notes": ""
@@ -730,12 +732,13 @@
       "latestVersionUnstable": false,
       "forkVersions": [
         0,
-        1
+        1,
+        2
       ],
-      "gap": "behind:1",
+      "gap": "current",
       "onFloor": false,
       "belowFloor": [],
-      "notes": "IncrementalAlterConfigs (key 44) is the modern replacement and is unimplemented, so config changes still overwrite rather than merge."
+      "notes": "Replaces the resource's whole dynamic config: an entry left out is deleted. IncrementalAlterConfigs (key 44) changes only the entries it names."
     },
     {
       "kafkaName": "SaslAuthenticate",
@@ -807,9 +810,9 @@
     {
       "kafkaName": "IncrementalAlterConfigs",
       "apiKey": 44,
-      "forkName": null,
+      "forkName": "incrementalAlterConfigs",
       "apiKeysName": "IncrementalAlterConfigs",
-      "planned": "phase-8",
+      "planned": "done",
       "validVersions": [
         0,
         1
@@ -817,11 +820,14 @@
       "flexibleFrom": 1,
       "deprecatedVersions": null,
       "latestVersionUnstable": false,
-      "forkVersions": null,
-      "gap": "stub",
+      "forkVersions": [
+        0,
+        1
+      ],
+      "gap": "current",
       "onFloor": false,
       "belowFloor": [],
-      "notes": "The replacement for AlterConfigs; needed before any admin config change can be merge-semantics rather than overwrite."
+      "notes": "The merge-semantics alternative to AlterConfigs: each config entry names a SET, DELETE, APPEND or SUBTRACT, so the entries a request leaves out are untouched."
     },
     {
       "kafkaName": "AlterPartitionReassignments",

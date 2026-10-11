@@ -35,12 +35,12 @@ Gap classes: `current` (fork max equals the Kafka max) · `behind:N` · `stub` (
 | DescribeAcls | 29 | 1-3 | v2+ | 1 | behind:2 (on-floor) | v1 is the 4.x floor and is also the fork's maximum. |
 | CreateAcls | 30 | 1-3 | v2+ | 1 | behind:2 (on-floor) | v1 is the 4.x floor and is also the fork's maximum. |
 | DeleteAcls | 31 | 1-3 | v2+ | 1 | behind:2 (on-floor) | v1 is the 4.x floor and is also the fork's maximum. |
-| DescribeConfigs | 32 | 1-4 | v4+ | 1-2 | behind:2 |  |
-| AlterConfigs | 33 | 0-2 | v2+ | 0-1 | behind:1 | IncrementalAlterConfigs (key 44) is the modern replacement and is unimplemented, so config changes still overwrite rather than merge. |
+| DescribeConfigs | 32 | 1-4 | v4+ | 1-4 | current |  |
+| AlterConfigs | 33 | 0-2 | v2+ | 0-2 | current | Replaces the resource's whole dynamic config: an entry left out is deleted. IncrementalAlterConfigs (key 44) changes only the entries it names. |
 | SaslAuthenticate | 36 | 0-2 | v2+ | 0-2 | current | v1 adds SessionLifetimeMs (KIP-368 re-authentication), v2 is flexible. The mechanism-provider contract is unchanged at every version: a provider returns INT32-length-prefixed bytes from request.encode() and receives them in response.decode() - v2 strips and re-wraps that prefix inside its own codec. |
 | CreatePartitions | 37 | 0-3 | v2+ | 0-1 | behind:2 |  |
 | DeleteGroups | 42 | 0-2 | v2+ | 0-1 | behind:1 |  |
-| IncrementalAlterConfigs | 44 | 0-1 | v1+ | — | stub | The replacement for AlterConfigs; needed before any admin config change can be merge-semantics rather than overwrite. |
+| IncrementalAlterConfigs | 44 | 0-1 | v1+ | 0-1 | current | The merge-semantics alternative to AlterConfigs: each config entry names a SET, DELETE, APPEND or SUBTRACT, so the entries a request leaves out are untouched. |
 | AlterPartitionReassignments | 45 | 0-1 | v0+ | 0 | behind:1 | One of the only two flexible-encoded codecs in the fork today: it hand-rolls the tag buffer inside the request body because the request header is still hardcoded to v1. It must migrate when real flexible header selection lands. v1 adds AllowReplicationFactorChange. |
 | ListPartitionReassignments | 46 | 0 | v0+ | 0 | current | The other hand-rolled flexible codec; same migration applies. Kafka defines only v0, so the fork is current by accident. |
 | ConsumerGroupHeartbeat | 68 | 0-1 | v0+ | 0-1 | current | Required for the KIP-848 consumer group protocol (groupProtocol: 'consumer'), GA since Kafka 4.0. |

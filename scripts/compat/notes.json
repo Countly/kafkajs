@@ -93,8 +93,8 @@
       "since": "2026-09-03"
     },
     "AlterConfigs": {
-      "note": "IncrementalAlterConfigs (key 44) is the modern replacement and is unimplemented, so config changes still overwrite rather than merge.",
-      "since": "2026-09-03"
+      "note": "Replaces the resource's whole dynamic config: an entry left out is deleted. IncrementalAlterConfigs (key 44) changes only the entries it names.",
+      "since": "2026-10-11"
     },
     "AlterPartitionReassignments": {
       "note": "One of the only two flexible-encoded codecs in the fork today: it hand-rolls the tag buffer inside the request body because the request header is still hardcoded to v1. It must migrate when real flexible header selection lands. v1 adds AllowReplicationFactorChange.",
@@ -109,8 +109,8 @@
       "since": "2026-09-06"
     },
     "IncrementalAlterConfigs": {
-      "note": "The replacement for AlterConfigs; needed before any admin config change can be merge-semantics rather than overwrite.",
-      "since": "2026-09-03"
+      "note": "The merge-semantics alternative to AlterConfigs: each config entry names a SET, DELETE, APPEND or SUBTRACT, so the entries a request leaves out are untouched.",
+      "since": "2026-10-11"
     },
     "ConsumerGroupHeartbeat": {
       "note": "Required for the KIP-848 consumer group protocol (groupProtocol: 'consumer'), GA since Kafka 4.0.",

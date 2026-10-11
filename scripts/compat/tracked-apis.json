@@ -227,9 +227,9 @@
     {
       "kafkaName": "IncrementalAlterConfigs",
       "apiKey": 44,
-      "forkName": null,
+      "forkName": "incrementalAlterConfigs",
       "apiKeysName": "IncrementalAlterConfigs",
-      "planned": "phase-8"
+      "planned": "done"
     },
     {
       "kafkaName": "AlterPartitionReassignments",
