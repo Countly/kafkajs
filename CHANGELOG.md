@@ -481,3 +481,15 @@ Adopted upstream PRs are credited here by number as they land (Phase 2 onward).
 - Two new benchmarks and a fixed one: `scripts/benchmarks/produceIdempotent.js` measures producer throughput with and without idempotence, inside transactions, with and without the accumulator's wait (`--linger`, `--batch-size`, each passed to the producer only when given), at a paced rate (`--rate`) or under a deep backlog (`--concurrency`), after one untimed record per partition, using only the public API so the same file runs in an older tree; `scripts/benchmarks/murmur2.js` times the keyed partitioner's hash against another tree's (`--baseline-tree`) in alternating rounds and checks the two hash random 16- and 256-byte keys, and keys of every length from 0 to 7, 15 and 17, alike; `scripts/benchmarks/produceLatency.js` creates its topic before the first measured send, so the first run of a session no longer pays for the topic's auto-creation, and takes `--linger` and `--idempotent` to measure the producer at another configuration. A bad argument to any of them exits 2.
 
 - The coverage floors are re-derived at this release. `src/producer/state/` now has its own floor in `jest.config.js`, 100 % on all four metrics, which removes its files from the global aggregate, so the global numbers were re-measured over the remaining files: 97.8 / 92.9 / 98.3 / 97.9 (statements / branches / functions / lines), each the lower of two full runs rounded down, branches and lines one step lower because some branches are decided by broker timing. Coverage did not drop; every floor rose or held.
+
+### Phase 8 — Admin expansion, observability, the OTel fork and 3.0.0 gate preparation
+
+#### Behavior changes
+
+#### Fixes
+
+#### Additions
+
+#### Tooling
+
+- Two development-only checks pin what a cluster offers and what the clients emit before the admin and group codecs move. `npm run probe:api-versions` prints one JSON line with the version range a broker offers for each of the nineteen APIs those codecs target, including DescribeTopicPartitions and IncrementalAlterConfigs (`KAFKA_VERSION=4.2.2` or `4.1.2` selects another supported cluster; an API the broker does not list is `null`), and `scripts/e2e/__tests__/e2eTooling.spec.js` covers its reader against responses captured from Kafka 4.3.1 and 4.1.2 brokers and against the committed 4.3.1 message definitions. A fifth captured baseline, `testHelpers/compatBaseline/instrumentationEvents.json`, records the forty-two public instrumentation event names, the internal names the network and cluster events are emitted under, and the shape of the event a listener receives; `src/instrumentation/__tests__/eventBaseline.spec.js` compares the tree against it, and `node testHelpers/compatBaseline/capture.js` regenerates all five baselines.

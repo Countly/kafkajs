@@ -1,8 +1,11 @@
 const fs = require('fs')
+const path = require('path')
 const { evidencePath, writeEvidence } = require('testHelpers')
 const { decode } = require('../../../src/protocol/requests/apiVersions/v4/response')
+const { readSpec } = require('../../compat/parse')
 const { transactionVersionOf } = require('../transactionVersionProbe')
 const { errorCodeOf } = require('../idempotentAuthzProbe')
+const { PROBED_APIS, versionsOf } = require('../apiVersionsProbe')
 
 describe('E2E tooling', () => {
   describe('evidence files', () => {
@@ -98,5 +101,94 @@ describe('E2E tooling', () => {
       expect(errorCodeOf(new Error('plain'))).toBeNull()
       expect(errorCodeOf(looping)).toBeNull()
     })
+  })
+
+  describe('api-versions probe', () => {
+    const SNAPSHOT = path.join(__dirname, '..', '..', 'compat', 'messages', '4.3.1')
+    const ON_4_3 = {
+      Metadata: [0, 13],
+      OffsetCommit: [2, 10],
+      OffsetFetch: [1, 10],
+      JoinGroup: [0, 9],
+      SyncGroup: [0, 5],
+      Heartbeat: [0, 4],
+      LeaveGroup: [0, 5],
+      CreateTopics: [2, 7],
+      DeleteTopics: [1, 6],
+      CreatePartitions: [0, 3],
+      DeleteRecords: [0, 2],
+      DeleteGroups: [0, 2],
+      DescribeAcls: [1, 3],
+      CreateAcls: [1, 3],
+      DeleteAcls: [1, 3],
+      DescribeConfigs: [1, 4],
+      AlterConfigs: [0, 2],
+      IncrementalAlterConfigs: [0, 1],
+      DescribeTopicPartitions: [0, 0],
+    }
+    // A 4.1 broker hides the unstable OffsetCommit and OffsetFetch v10 from ApiVersions.
+    const ON_4_1 = { ...ON_4_3, OffsetCommit: [2, 9], OffsetFetch: [1, 9] }
+
+    test.each([
+      [
+        '4.3.1',
+        require('../../../src/protocol/requests/apiVersions/fixtures/v4_response_kafka431.json'),
+        ON_4_3,
+      ],
+      [
+        '4.1.2',
+        require('../../../src/protocol/requests/apiVersions/fixtures/v4_response_kafka412.json'),
+        ON_4_1,
+      ],
+    ])(
+      'reads the probed ranges off a response captured from a Kafka %s broker',
+      async (_v, fixture, expected) => {
+        const { apiVersions } = await decode(Buffer.from(fixture))
+
+        expect(versionsOf(apiVersions)).toEqual(expected)
+      }
+    )
+
+    test('lists the nineteen probed APIs in the order the line prints them', () => {
+      expect(Object.keys(versionsOf([]))).toEqual([
+        'Metadata',
+        'OffsetCommit',
+        'OffsetFetch',
+        'JoinGroup',
+        'SyncGroup',
+        'Heartbeat',
+        'LeaveGroup',
+        'CreateTopics',
+        'DeleteTopics',
+        'CreatePartitions',
+        'DeleteRecords',
+        'DeleteGroups',
+        'DescribeAcls',
+        'CreateAcls',
+        'DeleteAcls',
+        'DescribeConfigs',
+        'AlterConfigs',
+        'IncrementalAlterConfigs',
+        'DescribeTopicPartitions',
+      ])
+    })
+
+    test('reports null for an API the broker does not list', () => {
+      const versions = versionsOf([{ apiKey: 3, minVersion: 0, maxVersion: 13 }])
+
+      expect(versions.Metadata).toEqual([0, 13])
+      expect(versions.DescribeTopicPartitions).toBeNull()
+      expect(Object.values(versions).filter((range) => range === null)).toHaveLength(18)
+    })
+
+    test.each(Object.entries(PROBED_APIS))(
+      '%s is key %i in the committed Kafka 4.3.1 message definition, whose newest version is what a 4.3.1 broker offers',
+      (name, apiKey) => {
+        const spec = readSpec(path.join(SNAPSHOT, `${name}Request.json`))
+
+        expect(spec.apiKey).toEqual(apiKey)
+        expect(spec.validVersions.max).toEqual(ON_4_3[name][1])
+      }
+    )
   })
 })

@@ -1,0 +1,556 @@
+{
+  "producer": [
+    {
+      "publicName": "producer.cluster.rebootstrap",
+      "internalName": "cluster.rebootstrap"
+    },
+    {
+      "publicName": "producer.cluster.topic_recreated",
+      "internalName": "cluster.topic_recreated"
+    },
+    {
+      "publicName": "producer.connect",
+      "internalName": "producer.connect"
+    },
+    {
+      "publicName": "producer.disconnect",
+      "internalName": "producer.disconnect"
+    },
+    {
+      "publicName": "producer.initialized",
+      "internalName": "producer.initialized"
+    },
+    {
+      "publicName": "producer.network.authentication_failure",
+      "internalName": "network.authentication_failure"
+    },
+    {
+      "publicName": "producer.network.lock_timeout",
+      "internalName": "network.lock_timeout"
+    },
+    {
+      "publicName": "producer.network.request",
+      "internalName": "network.request"
+    },
+    {
+      "publicName": "producer.network.request_queue_size",
+      "internalName": "network.request_queue_size"
+    },
+    {
+      "publicName": "producer.network.request_timeout",
+      "internalName": "network.request_timeout"
+    }
+  ],
+  "consumer": [
+    {
+      "publicName": "consumer.cluster.rebootstrap",
+      "internalName": "cluster.rebootstrap"
+    },
+    {
+      "publicName": "consumer.cluster.topic_recreated",
+      "internalName": "cluster.topic_recreated"
+    },
+    {
+      "publicName": "consumer.commit_offsets",
+      "internalName": "consumer.commit_offsets"
+    },
+    {
+      "publicName": "consumer.connect",
+      "internalName": "consumer.connect"
+    },
+    {
+      "publicName": "consumer.crash",
+      "internalName": "consumer.crash"
+    },
+    {
+      "publicName": "consumer.disconnect",
+      "internalName": "consumer.disconnect"
+    },
+    {
+      "publicName": "consumer.end_batch_process",
+      "internalName": "consumer.end_batch_process"
+    },
+    {
+      "publicName": "consumer.fetch",
+      "internalName": "consumer.fetch"
+    },
+    {
+      "publicName": "consumer.fetch_start",
+      "internalName": "consumer.fetch_start"
+    },
+    {
+      "publicName": "consumer.group_join",
+      "internalName": "consumer.group_join"
+    },
+    {
+      "publicName": "consumer.heartbeat",
+      "internalName": "consumer.heartbeat"
+    },
+    {
+      "publicName": "consumer.log_truncation",
+      "internalName": "consumer.log_truncation"
+    },
+    {
+      "publicName": "consumer.network.authentication_failure",
+      "internalName": "network.authentication_failure"
+    },
+    {
+      "publicName": "consumer.network.request",
+      "internalName": "network.request"
+    },
+    {
+      "publicName": "consumer.network.request_queue_size",
+      "internalName": "network.request_queue_size"
+    },
+    {
+      "publicName": "consumer.network.request_timeout",
+      "internalName": "network.request_timeout"
+    },
+    {
+      "publicName": "consumer.partitions_assigned",
+      "internalName": "consumer.partitions_assigned"
+    },
+    {
+      "publicName": "consumer.partitions_lost",
+      "internalName": "consumer.partitions_lost"
+    },
+    {
+      "publicName": "consumer.partitions_revoked",
+      "internalName": "consumer.partitions_revoked"
+    },
+    {
+      "publicName": "consumer.poll_interval_exceeded",
+      "internalName": "consumer.poll_interval_exceeded"
+    },
+    {
+      "publicName": "consumer.rebalancing",
+      "internalName": "consumer.rebalancing"
+    },
+    {
+      "publicName": "consumer.received_unsubscribed_topics",
+      "internalName": "consumer.received_unsubscribed_topics"
+    },
+    {
+      "publicName": "consumer.start_batch_process",
+      "internalName": "consumer.start_batch_process"
+    },
+    {
+      "publicName": "consumer.stop",
+      "internalName": "consumer.stop"
+    }
+  ],
+  "admin": [
+    {
+      "publicName": "admin.cluster.rebootstrap",
+      "internalName": "cluster.rebootstrap"
+    },
+    {
+      "publicName": "admin.cluster.topic_recreated",
+      "internalName": "cluster.topic_recreated"
+    },
+    {
+      "publicName": "admin.connect",
+      "internalName": "admin.connect"
+    },
+    {
+      "publicName": "admin.disconnect",
+      "internalName": "admin.disconnect"
+    },
+    {
+      "publicName": "admin.network.authentication_failure",
+      "internalName": "network.authentication_failure"
+    },
+    {
+      "publicName": "admin.network.request",
+      "internalName": "network.request"
+    },
+    {
+      "publicName": "admin.network.request_queue_size",
+      "internalName": "network.request_queue_size"
+    },
+    {
+      "publicName": "admin.network.request_timeout",
+      "internalName": "network.request_timeout"
+    }
+  ],
+  "listener": {
+    "producer.cluster.rebootstrap": {
+      "type": "producer.cluster.rebootstrap",
+      "keys": [
+        "id",
+        "payload",
+        "timestamp",
+        "type"
+      ]
+    },
+    "producer.cluster.topic_recreated": {
+      "type": "producer.cluster.topic_recreated",
+      "keys": [
+        "id",
+        "payload",
+        "timestamp",
+        "type"
+      ]
+    },
+    "producer.connect": {
+      "type": "producer.connect",
+      "keys": [
+        "id",
+        "payload",
+        "timestamp",
+        "type"
+      ]
+    },
+    "producer.disconnect": {
+      "type": "producer.disconnect",
+      "keys": [
+        "id",
+        "payload",
+        "timestamp",
+        "type"
+      ]
+    },
+    "producer.initialized": {
+      "type": "producer.initialized",
+      "keys": [
+        "id",
+        "payload",
+        "timestamp",
+        "type"
+      ]
+    },
+    "producer.network.authentication_failure": {
+      "type": "producer.network.authentication_failure",
+      "keys": [
+        "id",
+        "payload",
+        "timestamp",
+        "type"
+      ]
+    },
+    "producer.network.lock_timeout": {
+      "type": "producer.network.lock_timeout",
+      "keys": [
+        "id",
+        "payload",
+        "timestamp",
+        "type"
+      ]
+    },
+    "producer.network.request": {
+      "type": "producer.network.request",
+      "keys": [
+        "id",
+        "payload",
+        "timestamp",
+        "type"
+      ]
+    },
+    "producer.network.request_queue_size": {
+      "type": "producer.network.request_queue_size",
+      "keys": [
+        "id",
+        "payload",
+        "timestamp",
+        "type"
+      ]
+    },
+    "producer.network.request_timeout": {
+      "type": "producer.network.request_timeout",
+      "keys": [
+        "id",
+        "payload",
+        "timestamp",
+        "type"
+      ]
+    },
+    "consumer.cluster.rebootstrap": {
+      "type": "consumer.cluster.rebootstrap",
+      "keys": [
+        "id",
+        "payload",
+        "timestamp",
+        "type"
+      ]
+    },
+    "consumer.cluster.topic_recreated": {
+      "type": "consumer.cluster.topic_recreated",
+      "keys": [
+        "id",
+        "payload",
+        "timestamp",
+        "type"
+      ]
+    },
+    "consumer.commit_offsets": {
+      "type": "consumer.commit_offsets",
+      "keys": [
+        "id",
+        "payload",
+        "timestamp",
+        "type"
+      ]
+    },
+    "consumer.connect": {
+      "type": "consumer.connect",
+      "keys": [
+        "id",
+        "payload",
+        "timestamp",
+        "type"
+      ]
+    },
+    "consumer.crash": {
+      "type": "consumer.crash",
+      "keys": [
+        "id",
+        "payload",
+        "timestamp",
+        "type"
+      ]
+    },
+    "consumer.disconnect": {
+      "type": "consumer.disconnect",
+      "keys": [
+        "id",
+        "payload",
+        "timestamp",
+        "type"
+      ]
+    },
+    "consumer.end_batch_process": {
+      "type": "consumer.end_batch_process",
+      "keys": [
+        "id",
+        "payload",
+        "timestamp",
+        "type"
+      ]
+    },
+    "consumer.fetch": {
+      "type": "consumer.fetch",
+      "keys": [
+        "id",
+        "payload",
+        "timestamp",
+        "type"
+      ]
+    },
+    "consumer.fetch_start": {
+      "type": "consumer.fetch_start",
+      "keys": [
+        "id",
+        "payload",
+        "timestamp",
+        "type"
+      ]
+    },
+    "consumer.group_join": {
+      "type": "consumer.group_join",
+      "keys": [
+        "id",
+        "payload",
+        "timestamp",
+        "type"
+      ]
+    },
+    "consumer.heartbeat": {
+      "type": "consumer.heartbeat",
+      "keys": [
+        "id",
+        "payload",
+        "timestamp",
+        "type"
+      ]
+    },
+    "consumer.log_truncation": {
+      "type": "consumer.log_truncation",
+      "keys": [
+        "id",
+        "payload",
+        "timestamp",
+        "type"
+      ]
+    },
+    "consumer.network.authentication_failure": {
+      "type": "consumer.network.authentication_failure",
+      "keys": [
+        "id",
+        "payload",
+        "timestamp",
+        "type"
+      ]
+    },
+    "consumer.network.request": {
+      "type": "consumer.network.request",
+      "keys": [
+        "id",
+        "payload",
+        "timestamp",
+        "type"
+      ]
+    },
+    "consumer.network.request_queue_size": {
+      "type": "consumer.network.request_queue_size",
+      "keys": [
+        "id",
+        "payload",
+        "timestamp",
+        "type"
+      ]
+    },
+    "consumer.network.request_timeout": {
+      "type": "consumer.network.request_timeout",
+      "keys": [
+        "id",
+        "payload",
+        "timestamp",
+        "type"
+      ]
+    },
+    "consumer.partitions_assigned": {
+      "type": "consumer.partitions_assigned",
+      "keys": [
+        "id",
+        "payload",
+        "timestamp",
+        "type"
+      ]
+    },
+    "consumer.partitions_lost": {
+      "type": "consumer.partitions_lost",
+      "keys": [
+        "id",
+        "payload",
+        "timestamp",
+        "type"
+      ]
+    },
+    "consumer.partitions_revoked": {
+      "type": "consumer.partitions_revoked",
+      "keys": [
+        "id",
+        "payload",
+        "timestamp",
+        "type"
+      ]
+    },
+    "consumer.poll_interval_exceeded": {
+      "type": "consumer.poll_interval_exceeded",
+      "keys": [
+        "id",
+        "payload",
+        "timestamp",
+        "type"
+      ]
+    },
+    "consumer.rebalancing": {
+      "type": "consumer.rebalancing",
+      "keys": [
+        "id",
+        "payload",
+        "timestamp",
+        "type"
+      ]
+    },
+    "consumer.received_unsubscribed_topics": {
+      "type": "consumer.received_unsubscribed_topics",
+      "keys": [
+        "id",
+        "payload",
+        "timestamp",
+        "type"
+      ]
+    },
+    "consumer.start_batch_process": {
+      "type": "consumer.start_batch_process",
+      "keys": [
+        "id",
+        "payload",
+        "timestamp",
+        "type"
+      ]
+    },
+    "consumer.stop": {
+      "type": "consumer.stop",
+      "keys": [
+        "id",
+        "payload",
+        "timestamp",
+        "type"
+      ]
+    },
+    "admin.cluster.rebootstrap": {
+      "type": "admin.cluster.rebootstrap",
+      "keys": [
+        "id",
+        "payload",
+        "timestamp",
+        "type"
+      ]
+    },
+    "admin.cluster.topic_recreated": {
+      "type": "admin.cluster.topic_recreated",
+      "keys": [
+        "id",
+        "payload",
+        "timestamp",
+        "type"
+      ]
+    },
+    "admin.connect": {
+      "type": "admin.connect",
+      "keys": [
+        "id",
+        "payload",
+        "timestamp",
+        "type"
+      ]
+    },
+    "admin.disconnect": {
+      "type": "admin.disconnect",
+      "keys": [
+        "id",
+        "payload",
+        "timestamp",
+        "type"
+      ]
+    },
+    "admin.network.authentication_failure": {
+      "type": "admin.network.authentication_failure",
+      "keys": [
+        "id",
+        "payload",
+        "timestamp",
+        "type"
+      ]
+    },
+    "admin.network.request": {
+      "type": "admin.network.request",
+      "keys": [
+        "id",
+        "payload",
+        "timestamp",
+        "type"
+      ]
+    },
+    "admin.network.request_queue_size": {
+      "type": "admin.network.request_queue_size",
+      "keys": [
+        "id",
+        "payload",
+        "timestamp",
+        "type"
+      ]
+    },
+    "admin.network.request_timeout": {
+      "type": "admin.network.request_timeout",
+      "keys": [
+        "id",
+        "payload",
+        "timestamp",
+        "type"
+      ]
+    }
+  }
+}

@@ -75,6 +75,7 @@
     "probe:group-conversion": "npm run test:kafka -- \"node scripts/e2e/javaConsumer/groupConversionProbe.js\"",
     "probe:transaction-version": "node scripts/e2e/transactionVersionProbe.js",
     "probe:idempotent-authz": "COMPOSE_FILE=docker-compose.acl.yml npm run test:kafka -- \"node scripts/e2e/idempotentAuthzProbe.js\"",
+    "probe:api-versions": "npm run test:kafka -- \"node scripts/e2e/apiVersionsProbe.js\"",
     "test:debug": "node --inspect-brk node_modules/.bin/jest --runInBand --watch",
     "test:types": "tsc -p types/",
     "test:pack": "./scripts/packSmoke.sh",

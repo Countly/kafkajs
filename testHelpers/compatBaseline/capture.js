@@ -1,9 +1,10 @@
 /**
- * Baseline capture of four surfaces as they stand in the captured tree: the bytes of a
+ * Baseline capture of five surfaces as they stand in the captured tree: the bytes of a
  * non-idempotent Produce request, the order a non-idempotent send resolves its RecordMetadata in,
- * the retriable flag of every protocol error code, and the retrier's attempts and delays.
+ * the retriable flag of every protocol error code, the retrier's attempts and delays, and the
+ * public instrumentation events with what a listener receives.
  *
- * `node testHelpers/compatBaseline/capture.js` writes the four JSON files beside this module from
+ * `node testHelpers/compatBaseline/capture.js` writes the five JSON files beside this module from
  * the tree it runs on, the same bytes every time. The specs that guard those surfaces import the
  * drivers below and compare the live tree against the committed files, so each scenario has one
  * definition. The files record the tree they were captured from; regenerate them only to adopt a
@@ -20,6 +21,12 @@ const fs = require('fs')
 const path = require('path')
 const Broker = require('../../src/broker')
 const createProducer = require('../../src/producer')
+const createConsumer = require('../../src/consumer')
+const createAdmin = require('../../src/admin')
+const InstrumentationEventEmitter = require('../../src/instrumentation/emitter')
+const producerEvents = require('../../src/producer/instrumentationEvents')
+const consumerEvents = require('../../src/consumer/instrumentationEvents')
+const adminEvents = require('../../src/admin/instrumentationEvents')
 const createRetry = require('../../src/retry')
 const apiKeys = require('../../src/protocol/requests/apiKeys')
 const { errorCodes, createErrorFromCode } = require('../../src/protocol/error')
@@ -32,6 +39,7 @@ const FIXTURE_FILES = {
   nonIdempotentMetadataOrder: 'nonIdempotentMetadataOrder.json',
   errorRetriable: 'errorRetriable.json',
   retryTimeline: 'retryTimeline.json',
+  instrumentationEvents: 'instrumentationEvents.json',
 }
 
 const TOPIC_A = 'baseline-topic-a'
@@ -480,7 +488,74 @@ const captureRetryTimeline = async (testCase) => {
   }
 }
 
-/** @returns {Promise<object>} the four fixtures, keyed like `FIXTURE_FILES` */
+/**
+ * What each client kind exposes through `on()`: the module naming its public events, and a factory
+ * for a client over a stub cluster and the given emitter. Nothing connects, so the stub only
+ * answers the one call a consumer makes while it is built.
+ */
+const EVENT_SOURCES = {
+  producer: {
+    module: producerEvents,
+    create: (instrumentationEmitter) =>
+      createProducer({ cluster: {}, logger: silentLogger(), instrumentationEmitter }),
+  },
+  consumer: {
+    module: consumerEvents,
+    create: (instrumentationEmitter) =>
+      createConsumer({
+        cluster: { onTopicRecreated: () => () => {} },
+        groupId: 'baseline-group',
+        logger: silentLogger(),
+        instrumentationEmitter,
+      }),
+  },
+  admin: {
+    module: adminEvents,
+    create: (instrumentationEmitter) =>
+      createAdmin({ cluster: {}, logger: silentLogger(), instrumentationEmitter }),
+  },
+}
+
+/**
+ * Drives every public instrumentation event through the real `on()` of a client built over its own
+ * emitter, as `Kafka#producer`, `#consumer` and `#admin` build them (a shared emitter would let one
+ * client's listener rewrite the `type` another client's listener sees), and records what the
+ * listener received. Each event is emitted with the payload `{ probe: true }` under its internal
+ * name, which differs from the public one only for the network and cluster events.
+ * @returns {{ producer: object[], consumer: object[], admin: object[], listener: Record<string, { type: string, keys: string[] }> }}
+ *   per client kind the `{ publicName, internalName }` pairs sorted by public name; `listener` maps
+ *   each public name to the `type` and the sorted own keys of the event its listener received
+ */
+const captureInstrumentationEvents = () => {
+  const names = {}
+  const listener = {}
+
+  for (const [kind, { module: events, create }] of Object.entries(EVENT_SOURCES)) {
+    const emitter = new InstrumentationEventEmitter()
+    const client = create(emitter)
+    const received = {}
+    names[kind] = Object.values(events.events)
+      .sort()
+      .map((publicName) => ({ publicName, internalName: events.unwrap(publicName) }))
+
+    for (const { publicName } of names[kind]) {
+      client.on(publicName, (event) => {
+        received[publicName] = event
+      })
+    }
+    for (const { publicName, internalName } of names[kind]) {
+      emitter.emit(internalName, { probe: true })
+      listener[publicName] = {
+        type: received[publicName].type,
+        keys: Object.keys(received[publicName]).sort(),
+      }
+    }
+  }
+
+  return { ...names, listener }
+}
+
+/** @returns {Promise<object>} the five fixtures, keyed like `FIXTURE_FILES` */
 const captureAll = async () => {
   const nonIdempotentRequests = []
   for (const testCase of NON_IDEMPOTENT_CASES) {
@@ -497,6 +572,7 @@ const captureAll = async () => {
     nonIdempotentMetadataOrder: await captureMetadataOrder(METADATA_ORDER_CASE),
     errorRetriable: errorRetriableTable(),
     retryTimeline,
+    instrumentationEvents: captureInstrumentationEvents(),
   }
 }
 
@@ -516,6 +592,7 @@ module.exports = {
   captureMetadataOrder,
   errorRetriableTable,
   captureRetryTimeline,
+  captureInstrumentationEvents,
 }
 
 if (require.main === module) {
