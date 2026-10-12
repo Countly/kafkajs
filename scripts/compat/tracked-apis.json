@@ -276,9 +276,9 @@
     {
       "kafkaName": "DescribeTopicPartitions",
       "apiKey": 75,
-      "forkName": null,
-      "apiKeysName": null,
-      "planned": "phase-8"
+      "forkName": "describeTopicPartitions",
+      "apiKeysName": "DescribeTopicPartitions",
+      "planned": "done"
     }
   ],
   "untracked": [

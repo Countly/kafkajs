@@ -76,6 +76,7 @@ const requests = {
   ListPartitionReassignments: require('./listPartitionReassignments'),
   ConsumerGroupHeartbeat: require('./consumerGroupHeartbeat'),
   ConsumerGroupDescribe: require('./consumerGroupDescribe'),
+  DescribeTopicPartitions: require('./describeTopicPartitions'),
 }
 
 const names = Object.keys(apiKeys)

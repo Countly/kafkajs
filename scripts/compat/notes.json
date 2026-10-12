@@ -121,8 +121,8 @@
       "since": "2026-09-03"
     },
     "DescribeTopicPartitions": {
-      "note": "Admin describe at scale, and the only way to read eligible leader replicas. The API does not exist on brokers below 3.8, so the Metadata path must stay as a fallback; ELR arrays are null unless the cluster runs eligible.leader.replicas.version=1.",
-      "since": "2026-09-03"
+      "note": "Paginated describe of topics by name, with topic ids and eligible leader replicas; v0 is the only version and every 4.x broker offers it. The ELR arrays are null unless the cluster tracks them.",
+      "since": "2026-10-12"
     },
     "GetTelemetrySubscriptions": {
       "note": "Client telemetry (KIP-714); deferred.",

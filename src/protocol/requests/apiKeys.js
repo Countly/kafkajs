@@ -48,4 +48,5 @@ module.exports = {
   ListPartitionReassignments: 46,
   ConsumerGroupHeartbeat: 68, // KIP-848; the whole membership protocol is this one API
   ConsumerGroupDescribe: 69, // KIP-848 admin counterpart
+  DescribeTopicPartitions: 75, // KIP-966 admin describe, paginated
 }

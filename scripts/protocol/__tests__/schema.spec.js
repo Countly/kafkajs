@@ -252,6 +252,8 @@ describe('scripts/protocol > schema validation', () => {
       'src/protocol/requests/describeGroups/v5/response.js',
       'src/protocol/requests/describeGroups/v6/request.js',
       'src/protocol/requests/describeGroups/v6/response.js',
+      'src/protocol/requests/describeTopicPartitions/v0/request.js',
+      'src/protocol/requests/describeTopicPartitions/v0/response.js',
       'src/protocol/requests/endTxn/v2/request.js',
       'src/protocol/requests/endTxn/v2/response.js',
       'src/protocol/requests/endTxn/v3/request.js',

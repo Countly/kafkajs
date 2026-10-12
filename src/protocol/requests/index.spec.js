@@ -38,6 +38,25 @@ describe('Protocol > Requests', () => {
     })
   })
 
+  describe('apiKeys and requests', () => {
+    test.each(Object.keys(apiKeys))('%s has an entry in requests', (apiName) => {
+      expect(requests[apiName]).toBeDefined()
+    })
+
+    test('key 75 resolves to DescribeTopicPartitions at v0, the only version it has', () => {
+      const versions = { 75: { minVersion: 0, maxVersion: 0 } }
+      const build = lookup(versions)(75, requests.DescribeTopicPartitions)
+      const { request } = build({ topics: ['topic'] })
+
+      expect(apiKeys.DescribeTopicPartitions).toBe(75)
+      expect(request).toMatchObject({
+        apiKey: 75,
+        apiVersion: 0,
+        apiName: 'DescribeTopicPartitions',
+      })
+    })
+  })
+
   describe('lookup', () => {
     describe('when the client support more versions than the server', () => {
       it('returns the maximum version supported by the server', async () => {

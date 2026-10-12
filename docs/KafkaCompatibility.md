@@ -47,7 +47,7 @@ Gap classes: `current` (fork max equals the Kafka max) · `behind:N` · `stub` (
 | ConsumerGroupDescribe | 69 | 0-1 | v0+ | 0-1 | current | Admin-side counterpart of KIP-848; needed so group descriptions stop reporting consumer-protocol groups as Dead. |
 | GetTelemetrySubscriptions | 71 | 0 | v0+ | — | not-planned | Client telemetry (KIP-714); deferred. |
 | PushTelemetry | 72 | 0 | v0+ | — | not-planned | Client telemetry (KIP-714); deferred. |
-| DescribeTopicPartitions | 75 | 0 | v0+ | — | missing | Admin describe at scale, and the only way to read eligible leader replicas. The API does not exist on brokers below 3.8, so the Metadata path must stay as a fallback; ELR arrays are null unless the cluster runs eligible.leader.replicas.version=1. |
+| DescribeTopicPartitions | 75 | 0 | v0+ | 0 | current | Paginated describe of topics by name, with topic ids and eligible leader replicas; v0 is the only version and every 4.x broker offers it. The ELR arrays are null unless the cluster tracks them. |
 
 ## Floor watch
 

@@ -483,6 +483,35 @@ module.exports = class Broker {
   }
 
   /**
+   * Describes topics partition by partition, one page at a time (KIP-966). Any broker answers.
+   *
+   * The broker returns topics in name order, at most `responsePartitionLimit` partitions per page,
+   * and `nextCursor` names where the next page starts, or is `null` after the last one. A topic the
+   * broker cannot describe comes back as a row with its own `errorCode` and a `null` topic id, not
+   * as an error. An empty `topics` list asks for every topic.
+   * @public
+   * @see https://cwiki.apache.org/confluence/display/KAFKA/KIP-966%3A+Eligible+Leader+Replicas
+   * @param {object} request
+   * @param {string[]} request.topics the topic names to describe
+   * @param {number} [request.responsePartitionLimit=2000] the most partitions one page holds; the
+   *   broker clamps it to at least 1 and at most its own limit
+   * @param {{ topicName: string, partitionIndex: number }|null} [request.cursor=null] the topic and
+   *   partition to resume from; the topic must be in `topics`
+   * @returns {Promise<{ throttleTime: number, clientSideThrottleTime: number, topics: object[],
+   *   nextCursor: { topicName: string, partitionIndex: number }|null }>}
+   * @throws {KafkaJSServerDoesNotSupportApiKey} when the broker does not offer the API
+   */
+  async describeTopicPartitions({ topics, responsePartitionLimit = 2000, cursor = null }) {
+    const describeTopicPartitions = this.lookupRequest(
+      apiKeys.DescribeTopicPartitions,
+      requests.DescribeTopicPartitions
+    )
+    return await this[PRIVATE.SEND_REQUEST](
+      describeTopicPartitions({ topics, responsePartitionLimit, cursor })
+    )
+  }
+
+  /**
    * @public
    * @param {Object} request
    * @param {Array} request.topicData An array of messages per topic and per partition, example:
