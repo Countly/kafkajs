@@ -23,9 +23,9 @@ Gap classes: `current` (fork max equals the Kafka max) · `behind:N` · `stub` (
 | ListGroups | 16 | 0-5 | v3+ | 0-5 | current | v3 flexible, v4 StatesFilter/GroupState (KIP-518), v5 TypesFilter/GroupType (KIP-848). Java's downgrade rule applies to the filters on older brokers: a state filter needs v4, and a type filter needs v5 unless it asks only for classic (and consumer), which a broker without group types answers identically unfiltered. |
 | SaslHandshake | 17 | 0-1 | never | 0-1 | current | Never flexible, and the only API in the matrix that is fully current. |
 | ApiVersions | 18 | 0-4 | v3+ | 0-4 | current | v0-v3 omit every SupportedFeatures entry whose MinVersion is 0 (KAFKA-17011, fixed in v4 / Kafka 3.9), so a v3-only client sees a truncated feature list. The flexible-protocol pilot targets v4 and falls back to v3 only for brokers below 3.9. |
-| CreateTopics | 19 | 2-7 | v5+ | 2-3 | behind:4 | v5 flexible, v7 returns topic IDs. |
-| DeleteTopics | 20 | 1-6 | v4+ | 1 | behind:5 (on-floor) | v6 deletes by topic ID. The fork's v1 sits exactly on the 4.x floor. |
-| DeleteRecords | 21 | 0-2 | v2+ | 0-1 | behind:1 |  |
+| CreateTopics | 19 | 2-7 | v5+ | 2-7 | current | v5 flexible, v7 returns topic IDs. |
+| DeleteTopics | 20 | 1-6 | v4+ | 1-6 | current | v6 can delete by topic ID; the fork sends each topic name with the zero uuid, as the Java client does when it is given names. |
+| DeleteRecords | 21 | 0-2 | v2+ | 0-2 | current |  |
 | InitProducerId | 22 | 0-6 | v2+ | 0-5 | behind:1 | v2 flexible, v3 re-initialization with the producer's current id and epoch (KIP-360), v4 PRODUCER_FENCED, v5 TRANSACTION_ABORTABLE, v6 two-phase commit (KIP-939) and latestVersionUnstable, so brokers advertise 0-5 by default. |
 | OffsetForLeaderEpoch | 23 | 2-4 | v4+ | 3-4 | current | Leader-epoch fencing (KIP-320): v3 and v4 are implemented. v2 is a deliberate gap, not a waiver - versions below 3 require CLUSTER permission, which clients are not typically granted, and the Java consumer pins its own floor at v3 for that reason. |
 | AddPartitionsToTxn | 24 | 0-5 | v3+ | 0-3 | behind:2 | v2 PRODUCER_FENCED, v3 flexible. v3 is the client ceiling: the message definition keeps v4 (batched transactions, VerifyOnly) and v5 for broker-to-broker calls, so behind:2 is this API's steady state. Under transaction version 2 (KIP-890 part 2) a client does not send it: Produce v12 adds the partition implicitly. |
@@ -38,8 +38,8 @@ Gap classes: `current` (fork max equals the Kafka max) · `behind:N` · `stub` (
 | DescribeConfigs | 32 | 1-4 | v4+ | 1-4 | current |  |
 | AlterConfigs | 33 | 0-2 | v2+ | 0-2 | current | Replaces the resource's whole dynamic config: an entry left out is deleted. IncrementalAlterConfigs (key 44) changes only the entries it names. |
 | SaslAuthenticate | 36 | 0-2 | v2+ | 0-2 | current | v1 adds SessionLifetimeMs (KIP-368 re-authentication), v2 is flexible. The mechanism-provider contract is unchanged at every version: a provider returns INT32-length-prefixed bytes from request.encode() and receives them in response.decode() - v2 strips and re-wraps that prefix inside its own codec. |
-| CreatePartitions | 37 | 0-3 | v2+ | 0-1 | behind:2 |  |
-| DeleteGroups | 42 | 0-2 | v2+ | 0-1 | behind:1 |  |
+| CreatePartitions | 37 | 0-3 | v2+ | 0-3 | current |  |
+| DeleteGroups | 42 | 0-2 | v2+ | 0-2 | current |  |
 | IncrementalAlterConfigs | 44 | 0-1 | v1+ | 0-1 | current | The merge-semantics alternative to AlterConfigs: each config entry names a SET, DELETE, APPEND or SUBTRACT, so the entries a request leaves out are untouched. |
 | AlterPartitionReassignments | 45 | 0-1 | v0+ | 0 | behind:1 | One of the only two flexible-encoded codecs in the fork today: it hand-rolls the tag buffer inside the request body because the request header is still hardcoded to v1. It must migrate when real flexible header selection lands. v1 adds AllowReplicationFactorChange. |
 | ListPartitionReassignments | 46 | 0 | v0+ | 0 | current | The other hand-rolled flexible codec; same migration applies. Kafka defines only v0, so the fork is current by accident. |
@@ -55,7 +55,6 @@ These APIs implement exactly the minimum version the pinned broker still accepts
 
 | API | Key | Fork max | Kafka 4.3.1 minimum |
 |---|--:|--:|--:|
-| DeleteTopics | 20 | v1 | v1 |
 | DescribeAcls | 29 | v1 | v1 |
 | CreateAcls | 30 | v1 | v1 |
 | DeleteAcls | 31 | v1 | v1 |

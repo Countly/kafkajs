@@ -431,9 +431,13 @@
       "latestVersionUnstable": false,
       "forkVersions": [
         2,
-        3
+        3,
+        4,
+        5,
+        6,
+        7
       ],
-      "gap": "behind:4",
+      "gap": "current",
       "onFloor": false,
       "belowFloor": [],
       "notes": "v5 flexible, v7 returns topic IDs."
@@ -452,12 +456,17 @@
       "deprecatedVersions": null,
       "latestVersionUnstable": false,
       "forkVersions": [
-        1
+        1,
+        2,
+        3,
+        4,
+        5,
+        6
       ],
-      "gap": "behind:5",
-      "onFloor": true,
+      "gap": "current",
+      "onFloor": false,
       "belowFloor": [],
-      "notes": "v6 deletes by topic ID. The fork's v1 sits exactly on the 4.x floor."
+      "notes": "v6 can delete by topic ID; the fork sends each topic name with the zero uuid, as the Java client does when it is given names."
     },
     {
       "kafkaName": "DeleteRecords",
@@ -474,9 +483,10 @@
       "latestVersionUnstable": false,
       "forkVersions": [
         0,
-        1
+        1,
+        2
       ],
-      "gap": "behind:1",
+      "gap": "current",
       "onFloor": false,
       "belowFloor": [],
       "notes": ""
@@ -778,9 +788,11 @@
       "latestVersionUnstable": false,
       "forkVersions": [
         0,
-        1
+        1,
+        2,
+        3
       ],
-      "gap": "behind:2",
+      "gap": "current",
       "onFloor": false,
       "belowFloor": [],
       "notes": ""
@@ -800,9 +812,10 @@
       "latestVersionUnstable": false,
       "forkVersions": [
         0,
-        1
+        1,
+        2
       ],
-      "gap": "behind:1",
+      "gap": "current",
       "onFloor": false,
       "belowFloor": [],
       "notes": ""

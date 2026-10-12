@@ -43,10 +43,13 @@ describe('Broker > deleteTopics', () => {
     expect(response).toEqual({
       clientSideThrottleTime: expect.optional(0),
       throttleTime: 0,
+      // From v5 each topic result also carries an error message and, from v6, the topic id.
       topicErrors: [
         { topic: topicName1, errorCode: 0 },
         { topic: topicName2, errorCode: 0 },
-      ].sort(topicNameComparator),
+      ]
+        .sort(topicNameComparator)
+        .map((topicError) => expect.objectContaining(topicError)),
     })
   })
 })

@@ -9,6 +9,16 @@ const versions = {
     const response = require('./v1/response')
     return { request: request({ topicPartitions, validateOnly, timeout }), response }
   },
+  2: ({ topicPartitions, validateOnly, timeout }) => {
+    const request = require('./v2/request')
+    const response = require('./v2/response')
+    return { request: request({ topicPartitions, validateOnly, timeout }), response }
+  },
+  3: ({ topicPartitions, validateOnly, timeout }) => {
+    const request = require('./v3/request')
+    const response = require('./v3/response')
+    return { request: request({ topicPartitions, validateOnly, timeout }), response }
+  },
 }
 
 module.exports = {

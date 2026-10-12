@@ -785,6 +785,12 @@ Group visibility and the admin client.
   to fail with `UNKNOWN_TOPIC_OR_PARTITION` (code 3) in that window and now keeps waiting, within
   `timeout` (10 s when it is not set); a code 3 that never clears ends as a `KafkaJSTimeout`.
   *What to do:* nothing; a spurious failure is gone.
+- **`DeleteGroups` throttling is honoured.** Against a 4.x broker kafkajs 2.2.4 negotiated
+  `DeleteGroups` v1, whose decoder reported `clientSideThrottleTime` as `undefined` whatever the
+  broker sent, so a broker that throttled the request was never waited out on that connection. The
+  client now negotiates v2; v1 and v2 report the number (`0` when the broker did not throttle; v0
+  reports `throttleTimeMs` only) and the connection waits it out as it does for every other API
+  (KIP-219). `admin.deleteGroups()` results are unchanged. *What to do:* nothing.
 
 ### Errors and events
 

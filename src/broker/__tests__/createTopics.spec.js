@@ -51,6 +51,7 @@ describe('Broker > createTopics', () => {
     expect(response).toEqual({
       clientSideThrottleTime: expect.optional(0),
       throttleTime: 0,
+      // From v5 each topic result also reports the configs it was created with and, from v7, its id.
       topicErrors: [
         {
           topic: topicName1,
@@ -62,7 +63,9 @@ describe('Broker > createTopics', () => {
           errorCode: 0,
           errorMessage: null,
         },
-      ].sort(topicNameComparator),
+      ]
+        .sort(topicNameComparator)
+        .map((topicError) => expect.objectContaining(topicError)),
     })
   })
 
@@ -83,7 +86,9 @@ describe('Broker > createTopics', () => {
           errorCode: 0,
           errorMessage: null,
         },
-      ].sort(topicNameComparator),
+      ]
+        .sort(topicNameComparator)
+        .map((topicError) => expect.objectContaining(topicError)),
     })
   })
 

@@ -57,8 +57,8 @@
       "since": "2026-09-03"
     },
     "DeleteTopics": {
-      "note": "v6 deletes by topic ID. The fork's v1 sits exactly on the 4.x floor.",
-      "since": "2026-09-03"
+      "note": "v6 can delete by topic ID; the fork sends each topic name with the zero uuid, as the Java client does when it is given names.",
+      "since": "2026-10-11"
     },
     "InitProducerId": {
       "note": "v2 flexible, v3 re-initialization with the producer's current id and epoch (KIP-360), v4 PRODUCER_FENCED, v5 TRANSACTION_ABORTABLE, v6 two-phase commit (KIP-939) and latestVersionUnstable, so brokers advertise 0-5 by default.",
