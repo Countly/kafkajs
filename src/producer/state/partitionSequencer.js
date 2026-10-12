@@ -1,6 +1,7 @@
 const { INT_32_MAX_VALUE } = require('../../constants')
 const { RETRIABLE_CATEGORIES } = require('../../protocol/errorCategories')
 const { KafkaJSInvariantViolation } = require('../../errors')
+const Fifo = require('../../utils/fifo')
 
 /** @see https://github.com/apache/kafka/blob/4.3/clients/src/main/java/org/apache/kafka/common/protocol/Errors.java */
 const OUT_OF_ORDER_SEQUENCE_NUMBER = 45
@@ -100,7 +101,7 @@ const createEntry = (topic, partition) => ({
   stale: false,
   unresolvedNextSequence: null,
   inFlight: [],
-  queued: [],
+  queued: new Fifo(),
 })
 
 /**
@@ -156,7 +157,7 @@ const restartedSinceSent = (entry) =>
  * @property {number|null} unresolvedNextSequence
  * @property {PartitionBatch[]} inFlight numbered and not settled - on the wire or waiting for a
  *   re-send - in the order they were numbered, which the wrap keeps from being numeric order
- * @property {PartitionBatch[]} queued waiting to be drained: re-sends first, in the order they
+ * @property {Fifo<PartitionBatch>} queued waiting to be drained: re-sends first, in the order they
  *   were numbered, then batches never sent, by arrival
  */
 
@@ -244,11 +245,11 @@ class PartitionSequencer {
 
       for (const partition of partitions) {
         const entry = entries.get(Number(partition))
-        if (entry === undefined || entry.queued.length === 0) {
+        if (entry === undefined || entry.queued.size === 0) {
           continue
         }
 
-        const head = entry.queued[0]
+        const head = entry.queued.peek()
         if (
           head.backoffUntil > gate.now ||
           !gate.isPartitionInTransaction(topic, entry.partition)
@@ -356,14 +357,14 @@ class PartitionSequencer {
     const rank = inFlight.indexOf(batch)
     let index = 0
     while (
-      index < queued.length &&
-      queued[index].firstSequence !== null &&
-      inFlight.indexOf(queued[index]) < rank
+      index < queued.size &&
+      queued.at(index).firstSequence !== null &&
+      inFlight.indexOf(queued.at(index)) < rank
     ) {
       index += 1
     }
 
-    queued.splice(index, 0, batch)
+    queued.insertAt(index, batch)
   }
 
   /**
@@ -589,7 +590,7 @@ class PartitionSequencer {
         )
       }
 
-      if (entry.queued.length > 0) {
+      if (entry.queued.size > 0) {
         const fresh = createEntry(entry.topic, entry.partition)
         fresh.queued = entry.queued
         if (!kept.has(entry.topic)) {
@@ -719,7 +720,7 @@ class PartitionSequencer {
   abortQueued(error) {
     const aborted = []
     for (const entry of this.#entries()) {
-      if (entry.queued.length === 0) {
+      if (entry.queued.size === 0) {
         continue
       }
 
@@ -729,7 +730,7 @@ class PartitionSequencer {
         aborted.push(batch)
       }
 
-      entry.queued = []
+      entry.queued.clear()
       this.#dropIfIdle(entry)
     }
 
@@ -826,7 +827,7 @@ class PartitionSequencer {
    */
   #remove(entry, batch) {
     removeFrom(entry.inFlight, batch)
-    removeFrom(entry.queued, batch)
+    entry.queued.remove(batch)
     batch.sequenceReset = false
   }
 
@@ -847,7 +848,7 @@ class PartitionSequencer {
       entry.nextSequence !== 0 ||
       entry.lastAckedSequence !== NO_SEQUENCE ||
       entry.inFlight.length > 0 ||
-      entry.queued.length > 0 ||
+      entry.queued.size > 0 ||
       entry.unresolvedNextSequence !== null
     ) {
       return

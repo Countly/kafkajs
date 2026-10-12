@@ -14,6 +14,7 @@ const { CONNECTION_STATUS } = require('../network/connectionStatus')
 const { isArmed } = require('./eosManager/transactionStates')
 const { surfaceInTransaction } = require('./eosManager')
 const groupMessagesPerPartition = require('./groupMessagesPerPartition')
+const Fifo = require('../utils/fifo')
 
 const { keys } = Object
 
@@ -377,7 +378,7 @@ class DrainLoop {
   #getConnectionStatus
   /** @type {Set<Send>} */
   #sends = new Set()
-  /** @type {Map<string, Map<number, Delivery[]>>} every partition's live batches, by enqueue order */
+  /** @type {Map<string, Map<number, Fifo<Delivery>>>} every partition's live batches, by enqueue order */
   #queues = new Map()
   /** @type {Map<string, number>} Produce requests sent to a broker and not yet answered */
   #outstanding = new Map()
@@ -466,7 +467,7 @@ class DrainLoop {
    * A partition's live batches, by enqueue order - which is the order its queue drains in.
    * @param {string} topic
    * @param {number} partition
-   * @returns {Delivery[]}
+   * @returns {Fifo<Delivery>}
    */
   #queueOf(topic, partition) {
     let partitions = this.#queues.get(topic)
@@ -477,7 +478,7 @@ class DrainLoop {
 
     let queue = partitions.get(partition)
     if (queue === undefined) {
-      queue = []
+      queue = new Fifo()
       partitions.set(partition, queue)
     }
     return queue
@@ -635,7 +636,7 @@ class DrainLoop {
     for (const [topic, partitions] of this.#queues) {
       for (const [partition, queue] of partitions) {
         const head = this.#headOf(manager, queue, now)
-        if (queue.length === 0) {
+        if (queue.size === 0) {
           partitions.delete(partition)
           continue
         }
@@ -684,12 +685,12 @@ class DrainLoop {
    * batch still queued in time, as Java's own expiry does, so no batch expires before the one
    * queued ahead of it in its partition.
    * @param {import('./state')} manager
-   * @param {Delivery[]} queue
+   * @param {Fifo<Delivery>} queue
    * @param {number} now
    * @returns {Delivery|undefined} undefined when every batch left is on the wire
    */
   #headOf(manager, queue, now) {
-    while (queue.length > 0 && queue[0].settled) {
+    while (queue.size > 0 && queue.peek().settled) {
       queue.shift()
     }
 
@@ -775,7 +776,7 @@ class DrainLoop {
    * A ready partition with no leader: refresh the metadata and let its first batch wait a backoff;
    * once that batch has waited `retry.retries` times, reject every batch the partition has queued.
    * @param {import('./state')} manager
-   * @param {Delivery[]} queue the partition's live batches
+   * @param {Fifo<Delivery>} queue the partition's live batches
    * @param {Delivery} head its first queued batch
    * @param {number} now
    * @returns {void}
