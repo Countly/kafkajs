@@ -1,3 +1,5 @@
+const { namesById } = require('../topicIds')
+
 // This value signals to the broker that its default configuration should be used.
 const RETENTION_TIME = -1
 
@@ -112,6 +114,26 @@ const versions = {
         topics,
       }),
       response,
+    }
+  },
+  // Keyed by topic id: the request's own name-to-id map is bound onto the response codec, so the
+  // decoded answer still names its topics.
+  10: ({ groupId, groupGenerationId, memberId, groupInstanceId, topics, topicIds }) => {
+    const request = require('./v10/request')
+    const response = require('./v10/response')
+    return {
+      request: request({
+        groupId,
+        groupGenerationId,
+        memberId,
+        groupInstanceId,
+        topics,
+        topicIds,
+      }),
+      response: {
+        decode: (rawData) => response.decode(rawData, { topicNames: namesById(topicIds) }),
+        parse: response.parse,
+      },
     }
   },
 }

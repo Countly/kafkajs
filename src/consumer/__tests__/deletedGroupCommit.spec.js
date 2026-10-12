@@ -2,8 +2,8 @@ const createConsumer = require('../index')
 const createProducer = require('../../producer')
 const { KafkaJSProtocolError } = require('../../errors')
 const { createErrorFromCode } = require('../../protocol/error')
-const apiKeys = require('../../protocol/requests/apiKeys')
-const { requests } = require('../../protocol/requests')
+const InstrumentationEventEmitter = require('../../instrumentation/emitter')
+const { NETWORK_REQUEST } = require('../../network/instrumentationEvents')
 
 const {
   createCluster,
@@ -35,7 +35,7 @@ const GROUP_ID_NOT_FOUND = 69
  * @see https://github.com/apache/kafka/blob/4.3/group-coordinator/src/main/java/org/apache/kafka/coordinator/group/OffsetMetadataManager.java
  */
 describe('Consumer > a commit answered GROUP_ID_NOT_FOUND', () => {
-  let topicName, groupId, cluster, producer, consumer
+  let topicName, groupId, cluster, producer, consumer, requestEvents
 
   beforeEach(async () => {
     topicName = `test-topic-${secureRandom()}`
@@ -43,7 +43,13 @@ describe('Consumer > a commit answered GROUP_ID_NOT_FOUND', () => {
 
     await createTopic({ topic: topicName })
 
-    cluster = createCluster()
+    const instrumentationEmitter = new InstrumentationEventEmitter()
+    requestEvents = []
+    instrumentationEmitter.addListener(NETWORK_REQUEST, ({ payload }) =>
+      requestEvents.push({ apiName: payload.apiName, apiVersion: payload.apiVersion })
+    )
+
+    cluster = createCluster({ instrumentationEmitter })
     producer = createProducer({
       cluster,
       createPartitioner: createModPartitioner,
@@ -63,10 +69,6 @@ describe('Consumer > a commit answered GROUP_ID_NOT_FOUND', () => {
     const missingGroupId = `never-created-${secureRandom()}`
     const coordinator = await cluster.findGroupCoordinator({ groupId: missingGroupId })
 
-    // The fix rests on the version branch, so the negotiated version is asserted alongside the
-    // code: at v8 this same request is answered 22.
-    expect(coordinator.negotiatedVersion(apiKeys.OffsetCommit, requests.OffsetCommit)).toEqual(9)
-
     const caught = await coordinator
       .offsetCommit({
         groupId: missingGroupId,
@@ -78,6 +80,12 @@ describe('Consumer > a commit answered GROUP_ID_NOT_FOUND', () => {
 
     expect(caught.code).toEqual(GROUP_ID_NOT_FOUND)
     expect(caught.type).toEqual('GROUP_ID_NOT_FOUND')
+
+    // The answer rests on the version branch, so the version that went out is asserted alongside
+    // the code: at v8 this same request is answered 22.
+    expect(requestEvents.filter(({ apiName }) => apiName === 'OffsetCommit')).toEqual([
+      { apiName: 'OffsetCommit', apiVersion: 9 },
+    ])
 
     await cluster.disconnect()
   })

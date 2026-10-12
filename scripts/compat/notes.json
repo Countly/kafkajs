@@ -17,11 +17,11 @@
       "since": "2026-09-03"
     },
     "OffsetCommit": {
-      "note": "v6 committed leader epoch (KIP-320), v7 group instance id, v8 flexible, v9 member epoch (KIP-848), v10 topic IDs.",
+      "note": "v6 committed leader epoch (KIP-320), v7 group instance id, v8 flexible, v9 member epoch (KIP-848), v10 topic IDs (KIP-848; the codec binds the request's own id-to-name map, and every call is held at v9 until a request carries an id for each of its topics).",
       "since": "2026-09-03"
     },
     "OffsetFetch": {
-      "note": "v5 leader epoch, v6 flexible, v7 require-stable (KIP-447), v8 multi-group batching, v9 member epoch (KIP-848), v10 topic IDs. The fork has no v0 codec, which is correct: v0 read offsets from ZooKeeper.",
+      "note": "v5 leader epoch, v6 flexible, v7 require-stable (KIP-447), v8 multi-group batching, v9 member epoch (KIP-848), v10 topic IDs (KIP-848; the codec binds the request's own id-to-name map, and every call is held at v9 until a request carries an id for each of its topics). The fork has no v0 codec, which is correct: v0 read offsets from ZooKeeper.",
       "since": "2026-09-03"
     },
     "FindCoordinator": {

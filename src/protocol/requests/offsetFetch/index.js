@@ -1,3 +1,5 @@
+const { namesById } = require('../topicIds')
+
 const versions = {
   1: ({ groupId, topics }) => {
     const request = require('./v1/request')
@@ -43,6 +45,19 @@ const versions = {
     const request = require('./v9/request')
     const response = require('./v9/response')
     return { request: request({ groupId, topics, memberId, memberEpoch, requireStable }), response }
+  },
+  // Keyed by topic id: the request's own name-to-id map is bound onto the response codec, so the
+  // decoded answer still names its topics.
+  10: ({ groupId, topics, topicIds, memberId, memberEpoch, requireStable }) => {
+    const request = require('./v10/request')
+    const response = require('./v10/response')
+    return {
+      request: request({ groupId, topics, topicIds, memberId, memberEpoch, requireStable }),
+      response: {
+        decode: (rawData) => response.decode(rawData, { topicNames: namesById(topicIds) }),
+        parse: response.parse,
+      },
+    }
   },
 }
 

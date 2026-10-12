@@ -12,6 +12,11 @@ const shuffle = require('../utils/shuffle')
 // @see clients/src/main/resources/common/message/FetchRequest.json (Apache Kafka 4.3.1)
 const FETCH_TOPIC_NAMES_MAX_VERSION = 12
 
+// The last OffsetCommit and OffsetFetch version keyed by topic name. A request that carries no
+// topic ids cannot be sent above it, whatever the broker advertises.
+// @see clients/src/main/resources/common/message/OffsetCommitRequest.json (Apache Kafka 4.3.1)
+const OFFSETS_TOPIC_NAMES_MAX_VERSION = 9
+
 // The last Produce version keyed by topic name. A request that supplies no topic ids cannot be
 // sent above it, whatever the broker advertises.
 // @see clients/src/main/resources/common/message/ProduceRequest.json (Apache Kafka 4.3.1)
@@ -1078,7 +1083,11 @@ module.exports = class Broker {
     retentionTime,
     topics,
   }) {
-    const offsetCommit = this.lookupRequest(apiKeys.OffsetCommit, requests.OffsetCommit)
+    const offsetCommit = this.lookupRequestWithMax(
+      apiKeys.OffsetCommit,
+      requests.OffsetCommit,
+      OFFSETS_TOPIC_NAMES_MAX_VERSION
+    )
     return await this[PRIVATE.SEND_REQUEST](
       offsetCommit({
         groupId,
@@ -1116,7 +1125,11 @@ module.exports = class Broker {
    * @returns {Promise}
    */
   async offsetFetch({ groupId, topics, memberId = null, memberEpoch = -1, requireStable = false }) {
-    const offsetFetch = this.lookupRequest(apiKeys.OffsetFetch, requests.OffsetFetch)
+    const offsetFetch = this.lookupRequestWithMax(
+      apiKeys.OffsetFetch,
+      requests.OffsetFetch,
+      OFFSETS_TOPIC_NAMES_MAX_VERSION
+    )
     return await this[PRIVATE.SEND_REQUEST](
       offsetFetch({ groupId, topics, memberId, memberEpoch, requireStable })
     )
