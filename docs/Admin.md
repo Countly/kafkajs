@@ -747,6 +747,8 @@ const acl = [
 await admin.createAcls({ acl })
 ```
 
+`resourceType` takes `TOPIC`, `GROUP`, `CLUSTER`, `TRANSACTIONAL_ID`, `DELEGATION_TOKEN` or `USER` (a user principal) from `AclResourceTypes`; `ANY` is for filters only, and the broker refuses `ANY` and `UNKNOWN` on create. The same values work in the filters of [Delete ACL](#delete-acl) and [Describe ACL](#describe-acl). Every Kafka 4.x broker offers the ACL APIs at the version that carries it.
+
 Be aware that the security features might be disabled in your cluster. In that case, the operation will throw an error:
 
 ```sh
