@@ -39,4 +39,9 @@ module.exports = {
    * A token ID.
    */
   DELEGATION_TOKEN: 6,
+  /**
+   * A user principal. The ACL APIs send it from v3, which every Kafka 4.x broker offers.
+   * @see https://github.com/apache/kafka/blob/4.3.1/clients/src/main/java/org/apache/kafka/common/resource/ResourceType.java
+   */
+  USER: 7,
 }

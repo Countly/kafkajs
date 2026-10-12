@@ -32,9 +32,9 @@ Gap classes: `current` (fork max equals the Kafka max) · `behind:N` · `stub` (
 | AddOffsetsToTxn | 25 | 0-4 | v3+ | 0-4 | current | v2 PRODUCER_FENCED, v3 flexible, v4 TRANSACTION_ABORTABLE (KIP-890). Under transaction version 2 (KIP-890 part 2) a client does not send it: TxnOffsetCommit v5 adds the offsets implicitly. |
 | EndTxn | 26 | 0-5 | v3+ | 0-5 | current | v2 PRODUCER_FENCED, v3 flexible, v4 TRANSACTION_ABORTABLE, v5 returns the producer id and epoch the coordinator bumped to (KIP-890 part 2). A transaction stays at v4 or below unless its coordinator finalizes transaction.version at level 2 or above in ApiVersions v3+; v5 being advertised is not the signal. |
 | TxnOffsetCommit | 28 | 0-5 | v3+ | 0-5 | current | v2 committed leader epoch, v3 flexible with KIP-447 group metadata (generation, member id, group instance id), v4 TRANSACTION_ABORTABLE, v5 adds the offsets to the transaction itself under transaction version 2, so no AddOffsetsToTxn precedes it. A transaction stays at v4 or below unless its coordinator finalizes transaction.version at level 2 or above. |
-| DescribeAcls | 29 | 1-3 | v2+ | 1 | behind:2 (on-floor) | v1 is the 4.x floor and is also the fork's maximum. |
-| CreateAcls | 30 | 1-3 | v2+ | 1 | behind:2 (on-floor) | v1 is the 4.x floor and is also the fork's maximum. |
-| DeleteAcls | 31 | 1-3 | v2+ | 1 | behind:2 (on-floor) | v1 is the 4.x floor and is also the fork's maximum. |
+| DescribeAcls | 29 | 1-3 | v2+ | 1-3 | current | v1 is the 4.x floor; v3 adds the USER resource type, and every 4.x broker offers v1 to v3. |
+| CreateAcls | 30 | 1-3 | v2+ | 1-3 | current | v1 is the 4.x floor; v3 adds the USER resource type, and every 4.x broker offers v1 to v3. |
+| DeleteAcls | 31 | 1-3 | v2+ | 1-3 | current | v1 is the 4.x floor; v3 adds the USER resource type, and every 4.x broker offers v1 to v3. |
 | DescribeConfigs | 32 | 1-4 | v4+ | 1-4 | current |  |
 | AlterConfigs | 33 | 0-2 | v2+ | 0-2 | current | Replaces the resource's whole dynamic config: an entry left out is deleted. IncrementalAlterConfigs (key 44) changes only the entries it names. |
 | SaslAuthenticate | 36 | 0-2 | v2+ | 0-2 | current | v1 adds SessionLifetimeMs (KIP-368 re-authentication), v2 is flexible. The mechanism-provider contract is unchanged at every version: a provider returns INT32-length-prefixed bytes from request.encode() and receives them in response.decode() - v2 strips and re-wraps that prefix inside its own codec. |
@@ -53,11 +53,7 @@ Gap classes: `current` (fork max equals the Kafka max) · `behind:N` · `stub` (
 
 These APIs implement exactly the minimum version the pinned broker still accepts. The next KIP-896 floor raise breaks them with no warning.
 
-| API | Key | Fork max | Kafka 4.3.1 minimum |
-|---|--:|--:|--:|
-| DescribeAcls | 29 | v1 | v1 |
-| CreateAcls | 30 | v1 | v1 |
-| DeleteAcls | 31 | v1 | v1 |
+None.
 
 ## Below-floor waivers
 
@@ -110,4 +106,4 @@ Keys this client declares but deliberately does not track in the matrix: they ar
 | RenewDelegationToken | 39 | RenewDelegationToken | Delegation tokens (KIP-48); not planned. Stub in requests/index.js. |
 | ExpireDelegationToken | 40 | ExpireDelegationToken | Delegation tokens (KIP-48); not planned. Stub in requests/index.js. |
 | DescribeDelegationToken | 41 | DescribeDelegationToken | Delegation tokens (KIP-48); not planned. Stub in requests/index.js. |
-| ElectLeaders | 43 | ElectPreferredLeaders | Preferred-leader election; not planned. apiKeys.js still uses the pre-2.4 name ElectPreferredLeaders while requests/index.js registers the entry as ElectLeaders, so requests[apiKeys name] is undefined - reported by compat:check. |
+| ElectLeaders | 43 | ElectLeaders | Leader election; not planned. Stub in requests/index.js. |

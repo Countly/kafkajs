@@ -81,16 +81,16 @@
       "since": "2026-10-08"
     },
     "DescribeAcls": {
-      "note": "v1 is the 4.x floor and is also the fork's maximum.",
-      "since": "2026-09-03"
+      "note": "v1 is the 4.x floor; v3 adds the USER resource type, and every 4.x broker offers v1 to v3.",
+      "since": "2026-10-11"
     },
     "CreateAcls": {
-      "note": "v1 is the 4.x floor and is also the fork's maximum.",
-      "since": "2026-09-03"
+      "note": "v1 is the 4.x floor; v3 adds the USER resource type, and every 4.x broker offers v1 to v3.",
+      "since": "2026-10-11"
     },
     "DeleteAcls": {
-      "note": "v1 is the 4.x floor and is also the fork's maximum.",
-      "since": "2026-09-03"
+      "note": "v1 is the 4.x floor; v3 adds the USER resource type, and every 4.x broker offers v1 to v3.",
+      "since": "2026-10-11"
     },
     "AlterConfigs": {
       "note": "Replaces the resource's whole dynamic config: an entry left out is deleted. IncrementalAlterConfigs (key 44) changes only the entries it names.",

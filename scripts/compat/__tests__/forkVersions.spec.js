@@ -177,8 +177,8 @@ describe('scripts/compat/forkVersions', () => {
       expect(result.findings.filter((f) => f.level === 'error')).toEqual([])
     })
 
-    it('reports exactly the known ElectPreferredLeaders naming inconsistency', () => {
-      expect(result.findings.map((f) => f.code)).toEqual(['missing-requests-entry'])
+    it('reports nothing: every apiKeys.js name has an entry in requests/index.js', () => {
+      expect(result.findings).toEqual([])
     })
 
     it('reads the implemented version sets', () => {

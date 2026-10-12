@@ -363,8 +363,8 @@
       "kafkaName": "ElectLeaders",
       "apiKey": 43,
       "forkName": null,
-      "apiKeysName": "ElectPreferredLeaders",
-      "reason": "Preferred-leader election; not planned. apiKeys.js still uses the pre-2.4 name ElectPreferredLeaders while requests/index.js registers the entry as ElectLeaders, so requests[apiKeys name] is undefined - reported by compat:check."
+      "apiKeysName": "ElectLeaders",
+      "reason": "Leader election; not planned. Stub in requests/index.js."
     }
   ]
 }

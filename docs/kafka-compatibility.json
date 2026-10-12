@@ -654,12 +654,14 @@
       "deprecatedVersions": null,
       "latestVersionUnstable": false,
       "forkVersions": [
-        1
+        1,
+        2,
+        3
       ],
-      "gap": "behind:2",
-      "onFloor": true,
+      "gap": "current",
+      "onFloor": false,
       "belowFloor": [],
-      "notes": "v1 is the 4.x floor and is also the fork's maximum."
+      "notes": "v1 is the 4.x floor; v3 adds the USER resource type, and every 4.x broker offers v1 to v3."
     },
     {
       "kafkaName": "CreateAcls",
@@ -675,12 +677,14 @@
       "deprecatedVersions": null,
       "latestVersionUnstable": false,
       "forkVersions": [
-        1
+        1,
+        2,
+        3
       ],
-      "gap": "behind:2",
-      "onFloor": true,
+      "gap": "current",
+      "onFloor": false,
       "belowFloor": [],
-      "notes": "v1 is the 4.x floor and is also the fork's maximum."
+      "notes": "v1 is the 4.x floor; v3 adds the USER resource type, and every 4.x broker offers v1 to v3."
     },
     {
       "kafkaName": "DeleteAcls",
@@ -696,12 +700,14 @@
       "deprecatedVersions": null,
       "latestVersionUnstable": false,
       "forkVersions": [
-        1
+        1,
+        2,
+        3
       ],
-      "gap": "behind:2",
-      "onFloor": true,
+      "gap": "current",
+      "onFloor": false,
       "belowFloor": [],
-      "notes": "v1 is the 4.x floor and is also the fork's maximum."
+      "notes": "v1 is the 4.x floor; v3 adds the USER resource type, and every 4.x broker offers v1 to v3."
     },
     {
       "kafkaName": "DescribeConfigs",
@@ -1132,8 +1138,8 @@
       "kafkaName": "ElectLeaders",
       "apiKey": 43,
       "forkName": null,
-      "apiKeysName": "ElectPreferredLeaders",
-      "reason": "Preferred-leader election; not planned. apiKeys.js still uses the pre-2.4 name ElectPreferredLeaders while requests/index.js registers the entry as ElectLeaders, so requests[apiKeys name] is undefined - reported by compat:check."
+      "apiKeysName": "ElectLeaders",
+      "reason": "Leader election; not planned. Stub in requests/index.js."
     }
   ]
 }
