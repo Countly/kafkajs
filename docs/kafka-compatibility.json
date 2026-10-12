@@ -161,7 +161,7 @@
       "gap": "current",
       "onFloor": false,
       "belowFloor": [],
-      "notes": "v6 committed leader epoch (KIP-320), v7 group instance id, v8 flexible, v9 member epoch (KIP-848), v10 topic IDs (KIP-848; the codec binds the request's own id-to-name map, and every call is held at v9 until a request carries an id for each of its topics)."
+      "notes": "v6 committed leader epoch (KIP-320), v7 group instance id, v8 flexible, v9 member epoch (KIP-848), v10 topic IDs (KIP-848, stable from Kafka 4.2: a consumer on the consumer group protocol sends it when it knows the id of every topic in the request; the classic protocol, every admin call and a request with an unknown id stay at v9, and a 4.0 or 4.1 broker does not advertise v10)."
     },
     {
       "kafkaName": "OffsetFetch",
@@ -191,7 +191,7 @@
       "gap": "current",
       "onFloor": false,
       "belowFloor": [],
-      "notes": "v5 leader epoch, v6 flexible, v7 require-stable (KIP-447), v8 multi-group batching, v9 member epoch (KIP-848), v10 topic IDs (KIP-848; the codec binds the request's own id-to-name map, and every call is held at v9 until a request carries an id for each of its topics). The fork has no v0 codec, which is correct: v0 read offsets from ZooKeeper."
+      "notes": "v5 leader epoch, v6 flexible, v7 require-stable (KIP-447), v8 multi-group batching, v9 member epoch (KIP-848), v10 topic IDs (KIP-848, stable from Kafka 4.2: a consumer on the consumer group protocol sends it when it knows the id of every topic in the request; the classic protocol, every admin call and a request with an unknown id stay at v9, and a 4.0 or 4.1 broker does not advertise v10). The fork has no v0 codec, which is correct: v0 read offsets from ZooKeeper."
     },
     {
       "kafkaName": "FindCoordinator",

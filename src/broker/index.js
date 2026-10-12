@@ -2,6 +2,7 @@ const Lock = require('../utils/lock')
 const { Types: Compression } = require('../protocol/message/compression')
 const { requests, lookup, selectVersion } = require('../protocol/requests')
 const { partitionResults } = require('../protocol/requests/produce/partitionResults')
+const { NO_TOPIC_ID } = require('../protocol/requests/topicIds')
 const { KafkaJSNonRetriableError, KafkaJSServerDoesNotSupportApiKey } = require('../errors')
 const apiKeys = require('../protocol/requests/apiKeys')
 const { GROUP_STATES, GROUP_TYPES, toDisplayName } = require('../protocol/groupTypes')
@@ -16,6 +17,32 @@ const FETCH_TOPIC_NAMES_MAX_VERSION = 12
 // topic ids cannot be sent above it, whatever the broker advertises.
 // @see clients/src/main/resources/common/message/OffsetCommitRequest.json (Apache Kafka 4.3.1)
 const OFFSETS_TOPIC_NAMES_MAX_VERSION = 9
+
+/**
+ * The topic ids an OffsetCommit or OffsetFetch may be keyed by. All or nothing, as Java's consumer
+ * does: one topic without a usable id (or no named topic at all, which is how an OffsetFetch asks
+ * for every topic of the group) keeps the whole request keyed by name, because the answer to an
+ * all-topics request names topics this client may never have seen.
+ * @see https://github.com/apache/kafka/blob/4.3.1/clients/src/main/java/org/apache/kafka/clients/consumer/internals/CommitRequestManager.java
+ * @param {{ topic: string, topicId?: string|null }[]|null} [topics] the request's topic entries
+ * @returns {Map<string, string>|undefined} topic name to topic id, or undefined for a request by name
+ */
+const offsetsTopicIds = (topics) => {
+  if (topics == null || topics.length === 0) {
+    return undefined
+  }
+
+  const topicIds = new Map()
+  for (const { topic, topicId } of topics) {
+    if (topicId == null || topicId === NO_TOPIC_ID) {
+      return undefined
+    }
+
+    topicIds.set(topic, topicId)
+  }
+
+  return topicIds
+}
 
 // The last SyncGroup version that does not carry the group's protocol type and name. From v5 a
 // coordinator answers INCONSISTENT_GROUP_PROTOCOL to a request with either one null, so a request
@@ -1092,6 +1119,9 @@ module.exports = class Broker {
    *                  `leaderEpoch` is optional and requires OffsetCommit v6+: the leader epoch of
    *                  the record whose offset is being committed, or -1 (the default) when no
    *                  record backs the offset. Older versions ignore it.
+   *                  Each entry may also carry `topicId`. When every entry does, the request is
+   *                  negotiated up to v10 (stable from Kafka 4.2) and keyed by id; otherwise it
+   *                  stays at v9 or below, keyed by name. The answer names its topics either way.
    * @returns {Promise}
    */
   async offsetCommit({
@@ -1102,10 +1132,11 @@ module.exports = class Broker {
     retentionTime,
     topics,
   }) {
+    const topicIds = offsetsTopicIds(topics)
     const offsetCommit = this.lookupRequestWithMax(
       apiKeys.OffsetCommit,
       requests.OffsetCommit,
-      OFFSETS_TOPIC_NAMES_MAX_VERSION
+      topicIds === undefined ? OFFSETS_TOPIC_NAMES_MAX_VERSION : undefined
     )
     return await this[PRIVATE.SEND_REQUEST](
       offsetCommit({
@@ -1115,6 +1146,7 @@ module.exports = class Broker {
         groupInstanceId,
         retentionTime,
         topics,
+        topicIds,
       })
     )
   }
@@ -1132,6 +1164,9 @@ module.exports = class Broker {
    *                      ]
    *                    }
    *                  ]
+   *                  Each entry may also carry `topicId`. When every entry does, the request is
+   *                  negotiated up to v10 (stable from Kafka 4.2) and keyed by id; otherwise, and
+   *                  for a null or empty list, it stays at v9 or below, keyed by name.
    * @param {string|null} [request.memberId=null] the consumer-protocol member id; the coordinator
    *                  validates it together with the epoch from OffsetFetch v9 upward. A classic
    *                  member and an admin client pass nothing, which sends the field's own "no
@@ -1144,13 +1179,14 @@ module.exports = class Broker {
    * @returns {Promise}
    */
   async offsetFetch({ groupId, topics, memberId = null, memberEpoch = -1, requireStable = false }) {
+    const topicIds = offsetsTopicIds(topics)
     const offsetFetch = this.lookupRequestWithMax(
       apiKeys.OffsetFetch,
       requests.OffsetFetch,
-      OFFSETS_TOPIC_NAMES_MAX_VERSION
+      topicIds === undefined ? OFFSETS_TOPIC_NAMES_MAX_VERSION : undefined
     )
     return await this[PRIVATE.SEND_REQUEST](
-      offsetFetch({ groupId, topics, memberId, memberEpoch, requireStable })
+      offsetFetch({ groupId, topics, topicIds, memberId, memberEpoch, requireStable })
     )
   }
 

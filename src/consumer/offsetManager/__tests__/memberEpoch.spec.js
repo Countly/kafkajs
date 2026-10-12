@@ -172,7 +172,7 @@ describe('Consumer > OffsetManager > STALE_MEMBER_EPOCH per call site', () => {
       throw staleEpoch()
     })
     const manager = new OffsetManager({
-      cluster: { committedOffsets: () => ({}) },
+      cluster: { committedOffsets: () => ({}), topicId: () => undefined },
       coordinator: { isConnected: () => true, offsetCommit },
       memberAssignment: { [TOPIC]: [0] },
       autoCommit: true,

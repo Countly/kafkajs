@@ -86,6 +86,7 @@ const build = ({
     refreshMetadataForTopicIds: jest.fn(async () => {}),
     committedOffsets: () => ({}),
     topicName: (topicId) => (topicId === TOPIC_ID ? TOPIC : undefined),
+    topicId: () => undefined,
     // `leader` is what routes a partition to a node; without it the fetch path rejects the
     // metadata rather than fetching.
     findTopicPartitionMetadata: (topic) =>

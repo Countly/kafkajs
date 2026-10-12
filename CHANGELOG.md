@@ -486,6 +486,8 @@ Adopted upstream PRs are credited here by number as they land (Phase 2 onward).
 
 #### Behavior changes
 
+- A consumer with `groupProtocol: 'consumer'` commits and fetches offsets by topic id on Kafka 4.2 and later (`OffsetCommit` and `OffsetFetch` v10, topic ids, KIP-848), when it knows the id of every topic in the request; a request for any topic whose id is unknown, every classic consumer and every admin offset call keep sending topic names, and Kafka 4.0 and 4.1 do not advertise v10. `UNKNOWN_TOPIC_ID`, which a deleted and recreated topic answers, is retried after a metadata refresh. `Broker#offsetCommit` and `Broker#offsetFetch` accept an optional `topicId` on each topic entry. The `COMMIT_OFFSETS` payload is unchanged.
+
 #### Fixes
 
 - `describeConfigs` with a resource whose `configNames` is `null` no longer fails with a `TypeError` while the request is built: the admin check accepted `null` but the encoder of `DescribeConfigs` v1 and v2 did not. Against a 4.x broker the request is built at v4, where `null` and an empty list both ask for every config.

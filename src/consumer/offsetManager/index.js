@@ -14,6 +14,7 @@ const indexTopics = (topics) => topics.reduce((obj, topic) => assign(obj, { [top
 /** @see https://github.com/apache/kafka/blob/4.3/clients/src/main/java/org/apache/kafka/common/protocol/Errors.java */
 const STALE_MEMBER_EPOCH = 'STALE_MEMBER_EPOCH'
 const UNSTABLE_OFFSET_COMMIT = 'UNSTABLE_OFFSET_COMMIT'
+const UNKNOWN_TOPIC_ID = 'UNKNOWN_TOPIC_ID'
 
 /**
  * How long a retried offset fetch first waits before it is sent again, and the ceiling an
@@ -229,6 +230,10 @@ module.exports = class OffsetManager {
    * on the error however it later reaches the rebalance contract. It has to be recorded here
    * because the contract classifies a commit failure far from where it was raised: an
    * auto-commit's error surfaces out of the fetch round and is classified on the FETCH path.
+   *
+   * Under the consumer protocol each topic carries its id (see `withTopicIds`). A commit answered
+   * `UNKNOWN_TOPIC_ID` refreshes the metadata before the retriable error is rethrown, so the retry
+   * reads the topic's current id.
    * @private
    * @param {object} payload the `Broker#offsetCommit` payload
    * @returns {Promise<object>} the decoded response
@@ -238,9 +243,48 @@ module.exports = class OffsetManager {
     const coordinator = await this.getCoordinator()
 
     try {
-      return await coordinator.offsetCommit(payload)
+      return await coordinator.offsetCommit({
+        ...payload,
+        topics: this.withTopicIds(payload.topics),
+      })
     } catch (e) {
+      if (e.type === UNKNOWN_TOPIC_ID) {
+        await this.refreshAfterUnknownTopicId()
+      }
+
       throw stampOffsetCommit(e)
+    }
+  }
+
+  /**
+   * The topic entries of a request, each with its topic's id under the consumer group protocol, so
+   * the broker can key the request by id (OffsetCommit and OffsetFetch v10) when it knows every
+   * one. The classic protocol and every admin read send names, as they always did. Returns a new
+   * list and new entries: the originals are the `COMMIT_OFFSETS` payload a listener receives, which
+   * stays as it was. An id the metadata cache has not seen is `undefined`, which keeps the whole
+   * request by name.
+   * @private
+   * @param {{topic: string}[]} topics
+   * @returns {object[]}
+   */
+  withTopicIds(topics) {
+    return this.membershipProtocol === 'consumer'
+      ? topics.map((entry) => ({ ...entry, topicId: this.cluster.topicId(entry.topic) }))
+      : topics
+  }
+
+  /**
+   * Refreshes the metadata after a request keyed by id was refused, so that the next attempt reads
+   * the id the topic has now (or none, which sends by name). Best-effort: a refresh that fails must
+   * not replace the retriable error the caller is waiting for.
+   * @private
+   * @returns {Promise<void>}
+   */
+  async refreshAfterUnknownTopicId() {
+    try {
+      await this.cluster.refreshMetadata()
+    } catch (_) {
+      // see above
     }
   }
 
@@ -859,7 +903,7 @@ module.exports = class OffsetManager {
       try {
         return await coordinator.offsetFetch({
           groupId: this.groupId,
-          topics,
+          topics: this.withTopicIds(topics),
           ...memberFields,
           requireStable: true,
         })

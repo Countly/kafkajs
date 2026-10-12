@@ -745,6 +745,12 @@ says so, `groupProtocol: 'consumer'`.
   `-2147483648` sentinel when authorized operations were not requested, which is what
   `admin.describeGroups` has always reported and what the `GroupDescription` type declares. A
   deep-equality assertion against the whole row needs updating; reading individual fields does not.
+- **On the consumer group protocol, offsets are committed and fetched by topic id.** A consumer with
+  `groupProtocol: 'consumer'` against Kafka 4.2 or later sends OffsetCommit and OffsetFetch v10
+  (topic ids, KIP-848) when it knows the id of every topic in the request; `UNKNOWN_TOPIC_ID`,
+  which a deleted and recreated topic answers, is retried after a metadata refresh. Kafka 4.0 and
+  4.1 do not advertise v10, so nothing changes there, and the classic protocol and the admin client
+  keep sending topic names. *What to do:* nothing.
 
 ### Admin
 
