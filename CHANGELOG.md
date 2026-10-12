@@ -490,6 +490,7 @@ Adopted upstream PRs are credited here by number as they land (Phase 2 onward).
 
 - `describeConfigs` with a resource whose `configNames` is `null` no longer fails with a `TypeError` while the request is built: the admin check accepted `null` but the encoder of `DescribeConfigs` v1 and v2 did not. Against a 4.x broker the request is built at v4, where `null` and an empty list both ask for every config.
 - The idempotent producer's per-partition batch queues no longer use `Array#shift`, whose cost grows with the queue once it holds more than about 16 000 elements (a few microseconds per shift at 17 000 and about 30 µs at 128 000 on Node 26); a dependency-free O(1) queue replaces them with the same order and the same results.
+- `admin.createTopics({ waitForLeaders: true })` keeps waiting while the broker it asks still answers `UNKNOWN_TOPIC_OR_PARTITION` for a topic the controller has just created, within `timeout`, as Java's `Admin` documents a KRaft cluster needs a few seconds for; any other error still fails the call at once, and a `validateOnly` request, which creates nothing, does not wait. It removes a spurious code-3 failure on a freshly started cluster; a code 3 that never clears now ends as a `KafkaJSTimeout` (after `timeout`, or 10 s when it is not set) where it failed at once.
 
 #### Additions
 

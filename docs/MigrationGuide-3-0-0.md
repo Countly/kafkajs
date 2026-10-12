@@ -780,6 +780,11 @@ Group visibility and the admin client.
   members gain `groupInstanceId` (static membership). *What to do:* code that tested
   `state === 'Dead'` keeps working; code that reads `errorCode: 0` as "the group exists", or
   compares a whole row for deep equality, needs updating.
+- **`createTopics` with `waitForLeaders` no longer fails while a new topic propagates.** On KRaft
+  the broker that took the request can need a few seconds to know the topic; the leader wait used
+  to fail with `UNKNOWN_TOPIC_OR_PARTITION` (code 3) in that window and now keeps waiting, within
+  `timeout` (10 s when it is not set); a code 3 that never clears ends as a `KafkaJSTimeout`.
+  *What to do:* nothing; a spurious failure is gone.
 
 ### Errors and events
 

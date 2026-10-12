@@ -60,6 +60,8 @@ await admin.createTopics({
 | timeout        | The time in ms to wait for a topic to be completely created on the controller node                    | 5000    |
 | waitForLeaders | If this is `true` it will wait until metadata for the new topics doesn't throw `LEADER_NOT_AVAILABLE` | true    |
 
+With `waitForLeaders` the wait also continues while the broker answers `UNKNOWN_TOPIC_OR_PARTITION` for a topic the controller has just created: a KRaft broker can lag the controller by a few seconds. The wait gives up with a `KafkaJSTimeout` once `timeout` has passed (10 s when `timeout` is not set); any other error fails the call at once.
+
 ## <a name="delete-topics"></a> Delete topics
 
 ```javascript

@@ -35,14 +35,17 @@ const eventKeys = keys(events)
 
 /**
  * Runs `fn` until it resolves with a truthy value, retrying (via {@link waitFor}) on
- * `LEADER_NOT_AVAILABLE` and, when `opts.allowAutoTopicCreation` is set, also on
- * `UNKNOWN_TOPIC_OR_PARTITION` — KRaft answers the latter while a not-yet-created topic is still
- * being created asynchronously through the controller. Any other error, or the timeout expiring,
- * rejects.
+ * `LEADER_NOT_AVAILABLE` and, when `opts.allowAutoTopicCreation` or `opts.waitForTopicPropagation`
+ * is set, also on `UNKNOWN_TOPIC_OR_PARTITION` — KRaft answers the latter while a not-yet-created
+ * topic is still being created asynchronously through the controller, and while a topic the
+ * controller has just committed has not reached the broker that is asked.
+ * Any other error, or the timeout expiring, rejects.
  *
+ * @see https://github.com/apache/kafka/blob/4.3/clients/src/main/java/org/apache/kafka/clients/admin/Admin.java
  * @param {() => Promise<any>} fn
  * @param {Object} [opts]
  * @param {boolean} [opts.allowAutoTopicCreation=false]
+ * @param {boolean} [opts.waitForTopicPropagation=false] the topics were created by this call
  * @param {number} [opts.delay]
  * @param {number} [opts.maxWait]
  * @param {string} [opts.timeoutMessage]
@@ -50,14 +53,15 @@ const eventKeys = keys(events)
  * @throws {KafkaJSTimeout} if `fn` keeps failing/returning falsy past `opts.maxWait`
  */
 const retryOnLeaderNotAvailable = (fn, opts = {}) => {
-  const { allowAutoTopicCreation = false } = opts
+  const { allowAutoTopicCreation = false, waitForTopicPropagation = false } = opts
   const callback = async () => {
     try {
       return await fn()
     } catch (e) {
-      const isAutoCreationInFlight =
-        allowAutoTopicCreation && e.type === 'UNKNOWN_TOPIC_OR_PARTITION'
-      if (e.type !== 'LEADER_NOT_AVAILABLE' && !isAutoCreationInFlight) {
+      const isTopicStillAppearing =
+        (allowAutoTopicCreation || waitForTopicPropagation) &&
+        e.type === 'UNKNOWN_TOPIC_OR_PARTITION'
+      if (e.type !== 'LEADER_NOT_AVAILABLE' && !isTopicStillAppearing) {
         throw e
       }
       return false
@@ -228,6 +232,8 @@ module.exports = ({
             delay: 100,
             maxWait: timeout,
             timeoutMessage: 'Timed out while waiting for topic leaders',
+            // a validateOnly request creates nothing, so no topic is on its way to the broker
+            waitForTopicPropagation: !validateOnly,
           })
         }
 
