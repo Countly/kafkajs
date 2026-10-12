@@ -26,7 +26,7 @@ const {
 //   - anything that trips isRebalancing during the window makes ConsumerGroup rejoin, which also
 //     calls cluster.findGroupCoordinator({ groupId }) -- a byte-identical call that would satisfy
 //     the spy assertion without the offset manager ever recovering (false positive). Closed by
-//     recording REBALANCING events and asserting none fired.
+//     recording REBALANCING events and asserting none fired after the disconnect.
 //   - a heartbeat firing between disconnect() and commitOffsets() would transparently reconnect
 //     the coordinator's socket first, making getCoordinator() short-circuit and never call
 //     findGroupCoordinator (false negative). ConsumerGroup's shared heartbeat is gated purely by
@@ -119,6 +119,9 @@ describe('Consumer > coordinator recovery', () => {
     const cachedCoordinator = await cluster.findGroupCoordinator({ groupId })
     const findGroupCoordinatorSpy = jest.spyOn(cluster, 'findGroupCoordinator')
     const findBrokerSpy = jest.spyOn(cluster, 'findBroker')
+    // A topic created moments ago can still be propagating when the consumer joins, and the
+    // resync that causes is not what this spec measures: only a rebalance from here on counts.
+    rebalances.length = 0
     await cachedCoordinator.disconnect()
     expect(cachedCoordinator.isConnected()).toBe(false)
 

@@ -66,6 +66,16 @@ const versions = {
       requestTimeout: requestTimeout({ rebalanceTimeout, sessionTimeout }),
     }
   },
+  4: (options) => ({
+    request: require('./v4/request')(options),
+    response: require('./v4/response'),
+    requestTimeout: requestTimeout(options),
+  }),
+  5: (options) => ({
+    request: require('./v5/request')(options),
+    response: require('./v5/response'),
+    requestTimeout: requestTimeout(options),
+  }),
 }
 
 module.exports = {

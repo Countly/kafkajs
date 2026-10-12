@@ -17,6 +17,12 @@ const FETCH_TOPIC_NAMES_MAX_VERSION = 12
 // @see clients/src/main/resources/common/message/OffsetCommitRequest.json (Apache Kafka 4.3.1)
 const OFFSETS_TOPIC_NAMES_MAX_VERSION = 9
 
+// The last SyncGroup version that does not carry the group's protocol type and name. From v5 a
+// coordinator answers INCONSISTENT_GROUP_PROTOCOL to a request with either one null, so a request
+// that names only one of them, or neither, cannot be sent above it.
+// @see clients/src/main/java/org/apache/kafka/common/requests/SyncGroupRequest.java (Apache Kafka 4.3.1, areMandatoryProtocolTypeAndNamePresent)
+const SYNC_GROUP_NO_PROTOCOL_MAX_VERSION = 4
+
 // The last Produce version keyed by topic name. A request that supplies no topic ids cannot be
 // sent above it, whatever the broker advertises.
 // @see clients/src/main/resources/common/message/ProduceRequest.json (Apache Kafka 4.3.1)
@@ -966,9 +972,14 @@ module.exports = class Broker {
    * @param {string} [request.groupInstanceId=null] Static membership id (KIP-345); identifies this
    *                                member across restarts. Requires SyncGroup v3+.
    * @param {object} request.groupAssignment
+   * @param {string|null} [request.protocolType=null] The group's protocol type, `'consumer'`, as the
+   *                                JoinGroup answer reports it. Sent from SyncGroup v5.
+   * @param {string|null} [request.protocolName=null] The protocol name the JoinGroup selected. Sent
+   *                                from SyncGroup v5.
    * @param {number} [request.sessionTimeout] Used to derive the SyncGroup request timeout
    * @param {number} [request.rebalanceTimeout] Used to derive the SyncGroup request timeout
-   * @returns {Promise}
+   * @returns {Promise} The request goes out at v5 only when both `protocolType` and `protocolName`
+   *   are given (a coordinator refuses a v5 request with either null); otherwise it is capped at v4.
    */
   async syncGroup({
     groupId,
@@ -976,10 +987,16 @@ module.exports = class Broker {
     memberId,
     groupInstanceId,
     groupAssignment,
+    protocolType,
+    protocolName,
     sessionTimeout,
     rebalanceTimeout,
   }) {
-    const syncGroup = this.lookupRequest(apiKeys.SyncGroup, requests.SyncGroup)
+    const syncGroup = this.lookupRequestWithMax(
+      apiKeys.SyncGroup,
+      requests.SyncGroup,
+      protocolType != null && protocolName != null ? undefined : SYNC_GROUP_NO_PROTOCOL_MAX_VERSION
+    )
     return await this[PRIVATE.SEND_REQUEST](
       syncGroup({
         groupId,
@@ -987,6 +1004,8 @@ module.exports = class Broker {
         memberId,
         groupInstanceId,
         groupAssignment,
+        protocolType,
+        protocolName,
         sessionTimeout,
         rebalanceTimeout,
       })

@@ -239,12 +239,15 @@
         2,
         3,
         4,
-        5
+        5,
+        6,
+        7,
+        8
       ],
-      "gap": "behind:4",
+      "gap": "behind:1",
       "onFloor": false,
       "belowFloor": [],
-      "notes": "v5 encodes groupInstanceId but nothing plumbs it: Broker.joinGroup() has no such parameter, so static membership (KIP-345) is inert today."
+      "notes": "v5 group instance id (KIP-345, sent by a static member), v6 flexible, v7 response ProtocolType and a nullable ProtocolName, v8 Reason (sent null). v9 (SkipAssignment, KIP-814) is deliberately not implemented: a returning static leader would be told to skip the assignment, and this client keeps no leader-side metadata watch to use that for, so the cap at v8 keeps the classic leader path and the group_join payload unaffected."
     },
     {
       "kafkaName": "Heartbeat",
@@ -263,9 +266,10 @@
         0,
         1,
         2,
-        3
+        3,
+        4
       ],
-      "gap": "behind:1",
+      "gap": "current",
       "onFloor": false,
       "belowFloor": [],
       "notes": ""
@@ -287,9 +291,11 @@
         0,
         1,
         2,
-        3
+        3,
+        4,
+        5
       ],
-      "gap": "behind:2",
+      "gap": "current",
       "onFloor": false,
       "belowFloor": [],
       "notes": "v3 batch removal by group instance id (KIP-345): the codec exists, but there is no admin removeMembersFromConsumerGroup to drive it."
@@ -311,9 +317,11 @@
         0,
         1,
         2,
-        3
+        3,
+        4,
+        5
       ],
-      "gap": "behind:2",
+      "gap": "current",
       "onFloor": false,
       "belowFloor": [],
       "notes": ""

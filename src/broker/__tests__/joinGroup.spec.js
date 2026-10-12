@@ -51,6 +51,7 @@ describe('Broker > JoinGroup', () => {
       throttleTime: 0,
       errorCode: 0,
       generationId: expect.any(Number),
+      protocolType: 'consumer',
       groupProtocol: 'AssignerName',
       leaderId: expect.any(String),
       memberId: expect.any(String),

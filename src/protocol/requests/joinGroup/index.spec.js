@@ -1,3 +1,7 @@
+const fs = require('fs')
+const path = require('path')
+const apiKeys = require('../apiKeys')
+const { lookup, requests } = require('../index')
 const JoinGroupVersions = require('./index')
 const JoinGroupV0 = JoinGroupVersions.protocol({ version: 0 })
 const JoinGroupV1 = JoinGroupVersions.protocol({ version: 1 })
@@ -82,6 +86,45 @@ describe('Protocol > Requests > JoinGroup', () => {
       })
 
       expect(protocol.logResponseError).toEqual(true)
+    })
+  })
+
+  describe('v6 to v8', () => {
+    const parameters = {
+      groupId: 'test-group',
+      sessionTimeout: 1,
+      rebalanceTimeout: 30000,
+      memberId: 'member-id',
+      protocolType: 'consumer',
+      groupProtocols: [{ name: 'default' }],
+    }
+
+    test.each([6, 7, 8])(
+      'v%i keeps the request timeout and the response logging of v5',
+      (version) => {
+        const protocol = JoinGroupVersions.protocol({ version })
+
+        expect(protocol(parameters).requestTimeout).toBeGreaterThan(30000)
+        expect(protocol(parameters).logResponseError).toEqual(true)
+        expect(protocol({ ...parameters, memberId: '' }).logResponseError).toEqual(false)
+        expect(protocol(parameters).request).toMatchObject({ apiKey: 11, apiVersion: version })
+      }
+    )
+
+    test.each([
+      [9, 8],
+      [8, 8],
+      [7, 7],
+    ])('a broker offering v0-%i is asked at v%i: there is no v9', (brokerMax, expected) => {
+      const versions = { [apiKeys.JoinGroup]: { minVersion: 0, maxVersion: brokerMax } }
+      const { request } = lookup(versions)(apiKeys.JoinGroup, requests.JoinGroup)(parameters)
+
+      expect(request.apiVersion).toEqual(expected)
+    })
+
+    test('has no v9 codec directory and does not list v9', () => {
+      expect(fs.existsSync(path.join(__dirname, 'v9'))).toBe(false)
+      expect(JoinGroupVersions.versions).toEqual(['0', '1', '2', '3', '4', '5', '6', '7', '8'])
     })
   })
 })

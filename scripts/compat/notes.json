@@ -29,7 +29,7 @@
       "since": "2026-09-03"
     },
     "JoinGroup": {
-      "note": "v5 encodes groupInstanceId but nothing plumbs it: Broker.joinGroup() has no such parameter, so static membership (KIP-345) is inert today.",
+      "note": "v5 group instance id (KIP-345, sent by a static member), v6 flexible, v7 response ProtocolType and a nullable ProtocolName, v8 Reason (sent null). v9 (SkipAssignment, KIP-814) is deliberately not implemented: a returning static leader would be told to skip the assignment, and this client keeps no leader-side metadata watch to use that for, so the cap at v8 keeps the classic leader path and the group_join payload unaffected.",
       "since": "2026-09-03"
     },
     "LeaveGroup": {

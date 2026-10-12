@@ -127,6 +127,26 @@ const versions = {
       logResponseError: logResponseError(memberId),
     }
   },
+  // v6 is flexible and v7 sends v6's bytes; v8 adds `reason`. There is no v9: its `SkipAssignment`
+  // would change the classic leader path, so a broker offering v0-9 is asked at v8.
+  6: (options) => ({
+    request: require('./v6/request')(options),
+    response: require('./v6/response'),
+    requestTimeout: requestTimeout(options),
+    logResponseError: logResponseError(options.memberId),
+  }),
+  7: (options) => ({
+    request: require('./v7/request')(options),
+    response: require('./v7/response'),
+    requestTimeout: requestTimeout(options),
+    logResponseError: logResponseError(options.memberId),
+  }),
+  8: (options) => ({
+    request: require('./v8/request')(options),
+    response: require('./v8/response'),
+    requestTimeout: requestTimeout(options),
+    logResponseError: logResponseError(options.memberId),
+  }),
 }
 
 module.exports = {

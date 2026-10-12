@@ -31,6 +31,10 @@ const versions = {
       response,
     }
   },
+  4: (options) => ({
+    request: require('./v4/request')(options),
+    response: require('./v4/response'),
+  }),
 }
 
 module.exports = {

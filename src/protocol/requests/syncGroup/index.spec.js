@@ -1,3 +1,5 @@
+const apiKeys = require('../apiKeys')
+const { lookup, requests } = require('../index')
 const { versions, protocol } = require('./index')
 
 const NETWORK_DELAY = 5000
@@ -36,5 +38,18 @@ describe('Protocol > Requests > SyncGroup', () => {
         expect(build(version).requestTimeout).toBeUndefined()
       })
     })
+  })
+
+  it('offers v4 and v5, and a broker offering v0-5 is asked at v5', () => {
+    const brokerVersions = { [apiKeys.SyncGroup]: { minVersion: 0, maxVersion: 5 } }
+    const { request } = lookup(brokerVersions)(apiKeys.SyncGroup, requests.SyncGroup)({
+      groupId: 'test-group',
+      generationId: 1,
+      memberId: 'member-1',
+      groupAssignment: [],
+    })
+
+    expect(versions).toEqual(['0', '1', '2', '3', '4', '5'])
+    expect(request.apiVersion).toEqual(5)
   })
 })
