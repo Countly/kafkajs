@@ -12,7 +12,7 @@ const removeListener = consumer.on(HEARTBEAT, e => console.log(`heartbeat at ${e
 // Remove the listener by invoking removeListener()
 ```
 
-The listeners are always async, even when using regular functions. The consumer will never block when executing your listeners. Errors in the listeners won't affect the consumer.
+Listeners run synchronously, in the code that emits the event, so a slow listener slows the client down. A listener may be an `async` function: nobody awaits it, and a rejection is logged as `Failed to execute listener`. An error a listener throws synchronously is not caught by the client (only the cluster's and the lock's events are guarded), so a listener that can throw should catch its own errors.
 
 Instrumentation Event:
 
@@ -34,8 +34,8 @@ Instrumentation Event:
 | REQUEST             | {`broker`, `clientId`, `correlationId`, `size`, `createdAt`, `sentAt`, `pendingDuration`, `duration`, `apiName`, `apiKey`, `apiVersion`} | Emitted on every network request to a broker |
 | CONNECT             |                                                                                                                                                                                                               | Consumer connected to a broker. |
 | GROUP_JOIN          | {`groupId`, `memberId`, `leaderId`, `isLeader`, `memberAssignment`, `groupProtocol`, `membershipProtocol`, `rebalanceProtocol`, `duration`}                                                                                                                   | Consumer has joined the group. `rebalanceProtocol` is the protocol this consumer selected from its assigners, `'eager'` or `'cooperative'`. `groupProtocol` is unchanged — still the name of the assignor selected for the group; under the consumer protocol that is the server-side assignor's name once the coordinator has named one, and `''` before then. `membershipProtocol` is the membership protocol this member joined with, `'classic'` or `'consumer'` (the `groupProtocol` **option**). Under `'consumer'` the group has no leader, so `leaderId` is `null`, `isLeader` is `false`, and `rebalanceProtocol` is reported as `'cooperative'`. |
-| FETCH_START         | {}                                                                                                                                                                                                            | Starting to fetch messages from brokers. |
-| FETCH               | {`numberOfBatches`, `duration`}                                                                                                                                                                           | Finished fetching messages from the brokers. |
+| FETCH_START         | {`nodeId`}                                                                                                                                                                                                          | Starting to fetch messages from brokers. |
+| FETCH               | {`numberOfBatches`, `duration`, `nodeId`}                                                                                                                                                                           | Finished fetching messages from the brokers. |
 | START_BATCH_PROCESS | {`topic`, `partition`, `highWatermark`, `offsetLag`, `offsetLagLow`, `batchSize`, `firstOffset`, `lastOffset`}                                                                                | Starting user processing of a batch of messages. |
 | END_BATCH_PROCESS   | {`topic`, `partition`, `highWatermark`, `offsetLag`, `offsetLagLow`, `batchSize`, `firstOffset`, `lastOffset`, `duration`}                                                                  | Finished processing a batch. This includes user-land processing via `eachMessage`/`eachBatch`. |
 | COMMIT_OFFSETS      | {`groupId`, `memberId`, `groupGenerationId`, `groupInstanceId`, `topics`}                                                                                                                                                | Committed offsets. `groupInstanceId` (KIP-345 static membership) is `null` unless the consumer was created with a `groupInstanceId`. Each entry of `topics[].partitions` is `{partition, offset, leaderEpoch}` for an auto-commit or a `commitOffsets()` with no arguments — `leaderEpoch` is the leader epoch of the record at that offset, and `-1` when no record backs it. Offsets you pass to `commitOffsets(offsets)` are forwarded as given and carry no `leaderEpoch`. |
@@ -84,3 +84,86 @@ Instrumentation Event:
 | AUTHENTICATION_FAILURE | {`broker`, `mechanism`, `errorMessage`} | A broker rejected SASL authentication (`SASL_AUTHENTICATION_FAILED`), carrying its own error message. The broker is then blacked out for `max(authenticationTimeout, 1000ms)` — 10s out of the box, since `authenticationTimeout` defaults to 10000ms — so a (re)authentication attempt against it fails fast with `KafkaJSSASLAuthenticationError` instead of retrying immediately; an already-authenticated connection is unaffected. |
 | TOPIC_RECREATED     | {`topic`, `previousTopicId`, `topicId`}                                                    | A topic this client had metadata for came back from a metadata refresh with a different topic id — it was deleted and recreated. Observational: this client takes no action of its own. (A consumer additionally resets that topic's offsets once — see the consumer table.) |
 | REBOOTSTRAP         | {`reason`}                                                                                 | The client rebuilt its connections and metadata from the configured broker list (KIP-899/1102). `reason` is `'timeout'` (metadata failed continuously for `metadataRecoveryRebootstrapTriggerMs`), `'required'` (a broker returned `REBOOTSTRAP_REQUIRED`), or `'all-brokers-unavailable'` (every known broker became unreachable). Only fires when `metadataRecoveryStrategy` is `'rebootstrap'` (the default). |
+
+## <a name="channels"></a> Channels (`node:diagnostics_channel`)
+
+Every event above is also published on [`node:diagnostics_channel`](https://nodejs.org/api/diagnostics_channel.html), on the channel named `kafkajs.` plus the event's name: the consumer's `REQUEST` is on `kafkajs.consumer.network.request`. A library can then observe every client in the process (a metrics layer, a tracer) without holding a reference to any of them. The 42 channels exist from the moment the package is loaded, and while a channel has no subscriber and the event has no `on()` listener nothing is allocated and nothing is published.
+
+```javascript
+const diagnosticsChannel = require('node:diagnostics_channel')
+
+diagnosticsChannel.subscribe('kafkajs.consumer.end_batch_process', (event) => {
+  const { topic, batchSize, duration } = event.payload
+  console.log(`${topic}: ${batchSize} messages handled in ${duration} ms`)
+})
+```
+
+The message is the instrumentation event an `on()` listener receives, the same object: `{ id, type, timestamp, payload }` with `type` set to the event's name, `consumer.end_batch_process` here. When an event has both a subscriber and an `on()` listener, the channel's subscribers run first. Use `diagnosticsChannel.subscribe(name, fn)` to subscribe and `diagnosticsChannel.unsubscribe(name, fn)` to stop.
+
+A subscriber:
+
+- runs synchronously, inside the code that emits the event (the fetch loop, the request queue), so it must return quickly and must not wait on anything;
+- must not throw: Node reports an error thrown by a subscriber as an `'uncaughtException'`, which ends the process unless the application handles it;
+- must treat the message as read-only: the payload is the object the client built, and some payloads (the offset commit's, the group join's) are objects the client goes on using;
+- must not retain the message or its payload after it returns: copy what it needs.
+
+A subscriber is process-wide and receives the events of every client in the process. The request events (`network.request`, `network.request_timeout` and `network.request_queue_size`) carry `clientId` and `broker`, and the consumer's group events (`group_join`, `heartbeat`, `commit_offsets`, `rebalancing`, `crash`, the partition events and `poll_interval_exceeded`) carry `groupId`; an event such as `consumer.fetch` or `consumer.start_batch_process` carries neither, so two clients in one process cannot be told apart by it.
+
+The payloads are those in the tables above.
+
+### Consumer channels
+
+| channel | event |
+|---------|-------|
+| `kafkajs.consumer.heartbeat` | `consumer.events.HEARTBEAT` |
+| `kafkajs.consumer.log_truncation` | `consumer.events.LOG_TRUNCATION` |
+| `kafkajs.consumer.commit_offsets` | `consumer.events.COMMIT_OFFSETS` |
+| `kafkajs.consumer.group_join` | `consumer.events.GROUP_JOIN` |
+| `kafkajs.consumer.fetch` | `consumer.events.FETCH` |
+| `kafkajs.consumer.fetch_start` | `consumer.events.FETCH_START` |
+| `kafkajs.consumer.start_batch_process` | `consumer.events.START_BATCH_PROCESS` |
+| `kafkajs.consumer.end_batch_process` | `consumer.events.END_BATCH_PROCESS` |
+| `kafkajs.consumer.connect` | `consumer.events.CONNECT` |
+| `kafkajs.consumer.disconnect` | `consumer.events.DISCONNECT` |
+| `kafkajs.consumer.stop` | `consumer.events.STOP` |
+| `kafkajs.consumer.crash` | `consumer.events.CRASH` |
+| `kafkajs.consumer.rebalancing` | `consumer.events.REBALANCING` |
+| `kafkajs.consumer.partitions_assigned` | `consumer.events.PARTITIONS_ASSIGNED` |
+| `kafkajs.consumer.partitions_revoked` | `consumer.events.PARTITIONS_REVOKED` |
+| `kafkajs.consumer.partitions_lost` | `consumer.events.PARTITIONS_LOST` |
+| `kafkajs.consumer.poll_interval_exceeded` | `consumer.events.POLL_INTERVAL_EXCEEDED` |
+| `kafkajs.consumer.received_unsubscribed_topics` | `consumer.events.RECEIVED_UNSUBSCRIBED_TOPICS` |
+| `kafkajs.consumer.network.request` | `consumer.events.REQUEST` |
+| `kafkajs.consumer.network.request_timeout` | `consumer.events.REQUEST_TIMEOUT` |
+| `kafkajs.consumer.network.request_queue_size` | `consumer.events.REQUEST_QUEUE_SIZE` |
+| `kafkajs.consumer.network.authentication_failure` | `consumer.events.AUTHENTICATION_FAILURE` |
+| `kafkajs.consumer.cluster.topic_recreated` | `consumer.events.TOPIC_RECREATED` |
+| `kafkajs.consumer.cluster.rebootstrap` | `consumer.events.REBOOTSTRAP` |
+
+### Producer channels
+
+| channel | event |
+|---------|-------|
+| `kafkajs.producer.connect` | `producer.events.CONNECT` |
+| `kafkajs.producer.initialized` | `producer.events.INITIALIZED` |
+| `kafkajs.producer.disconnect` | `producer.events.DISCONNECT` |
+| `kafkajs.producer.network.request` | `producer.events.REQUEST` |
+| `kafkajs.producer.network.request_timeout` | `producer.events.REQUEST_TIMEOUT` |
+| `kafkajs.producer.network.request_queue_size` | `producer.events.REQUEST_QUEUE_SIZE` |
+| `kafkajs.producer.network.authentication_failure` | `producer.events.AUTHENTICATION_FAILURE` |
+| `kafkajs.producer.network.lock_timeout` | `producer.events.LOCK_TIMEOUT` |
+| `kafkajs.producer.cluster.topic_recreated` | `producer.events.TOPIC_RECREATED` |
+| `kafkajs.producer.cluster.rebootstrap` | `producer.events.REBOOTSTRAP` |
+
+### Admin channels
+
+| channel | event |
+|---------|-------|
+| `kafkajs.admin.connect` | `admin.events.CONNECT` |
+| `kafkajs.admin.disconnect` | `admin.events.DISCONNECT` |
+| `kafkajs.admin.network.request` | `admin.events.REQUEST` |
+| `kafkajs.admin.network.request_timeout` | `admin.events.REQUEST_TIMEOUT` |
+| `kafkajs.admin.network.request_queue_size` | `admin.events.REQUEST_QUEUE_SIZE` |
+| `kafkajs.admin.network.authentication_failure` | `admin.events.AUTHENTICATION_FAILURE` |
+| `kafkajs.admin.cluster.topic_recreated` | `admin.events.TOPIC_RECREATED` |
+| `kafkajs.admin.cluster.rebootstrap` | `admin.events.REBOOTSTRAP` |

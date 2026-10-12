@@ -894,6 +894,11 @@ now logged.
   matched 47 should match `error.category` or both codes. Outside a transaction,
   `KafkaJSNumberOfRetriesExceeded` means the send ran out of its retry budget; the producer remains
   usable, and retrying the send is safe on an idempotent producer.
+- **Instrumentation events are also published on `node:diagnostics_channel`.** Each of the 42
+  events is on the channel `kafkajs.<event name>`, with the same event object an `on()` listener
+  receives; when an event has both, channel subscribers run first. Subscribers run synchronously and
+  must not throw (Node turns a throw into an `'uncaughtException'`). *What to do:* nothing; to use
+  it, subscribe with `diagnostics_channel.subscribe('kafkajs.consumer.fetch', fn)`.
 
 ### Protocol
 

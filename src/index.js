@@ -5,6 +5,7 @@ const {
 const { KafkaJSNonRetriableError, KafkaJSInvalidConfigurationError } = require('./errors')
 
 const InstrumentationEventEmitter = require('./instrumentation/emitter')
+const channels = require('./instrumentation/channels')
 const LoggerConsole = require('./loggers/console')
 const Cluster = require('./cluster')
 const createProducer = require('./producer')
@@ -322,7 +323,7 @@ module.exports = class Client {
       maxInFlightRequests: inFlight,
       logger: this[PRIVATE.LOGGER].namespace('Producer'),
     })
-    const instrumentationEmitter = new InstrumentationEventEmitter()
+    const instrumentationEmitter = new InstrumentationEventEmitter({ channels: channels.producer })
     const cluster = this[PRIVATE.CREATE_CLUSTER]({
       metadataMaxAge,
       allowAutoTopicCreation,
@@ -389,7 +390,7 @@ module.exports = class Client {
       ? ISOLATION_LEVEL.READ_UNCOMMITTED
       : ISOLATION_LEVEL.READ_COMMITTED
 
-    const instrumentationEmitter = new InstrumentationEventEmitter()
+    const instrumentationEmitter = new InstrumentationEventEmitter({ channels: channels.consumer })
     const cluster = this[PRIVATE.CREATE_CLUSTER]({
       metadataMaxAge,
       allowAutoTopicCreation,
@@ -428,7 +429,7 @@ module.exports = class Client {
    * @public
    */
   admin({ retry } = {}) {
-    const instrumentationEmitter = new InstrumentationEventEmitter()
+    const instrumentationEmitter = new InstrumentationEventEmitter({ channels: channels.admin })
     const cluster = this[PRIVATE.CREATE_CLUSTER]({
       allowAutoTopicCreation: false,
       instrumentationEmitter,
