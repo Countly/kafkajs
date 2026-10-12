@@ -803,6 +803,15 @@ Group visibility and the admin client.
   the `retry` budget, so a call that succeeded under 2.2.4 still succeeds, a little later; one that
   outlives the budget rejects with `KafkaJSNumberOfRetriesExceeded`, whose `cause` is the quota
   error. *What to do:* nothing.
+- **Admin and broker results gain keys.** Nothing was renamed or removed; code that compares whole
+  objects sees more keys. `admin.fetchTopicMetadata()` topics gain `topicId` (`null` when the broker
+  sends none) and `isInternal`, on the Metadata path and on the new `useDescribeTopicPartitions`
+  path (the item "Metadata results gain fields", under *Protocol*, covers `cluster.metadata()`).
+  `admin.describeConfigs()` entries gain `configType` and `documentation`. At broker level
+  `createTopics` results gain `numPartitions`, `replicationFactor`, `configs`,
+  `topicConfigErrorCode` and `topicId`, and `deleteTopics` results gain `topicId` and
+  `errorMessage`. `admin.createTopics()` still resolves a boolean: read the id with
+  `fetchTopicMetadata`. *What to do:* snapshot tests over these objects need the new keys.
 
 ### Errors and events
 

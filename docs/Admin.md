@@ -60,6 +60,8 @@ await admin.createTopics({
 | timeout        | The time in ms to wait for a topic to be completely created on the controller node                    | 5000    |
 | waitForLeaders | If this is `true` it will wait until metadata for the new topics doesn't throw `LEADER_NOT_AVAILABLE` | true    |
 
+`createTopics` resolves a boolean and does not return topic ids: read them with [`fetchTopicMetadata`](#fetch-topic-metadata), which returns the `topicId` of every topic.
+
 With `waitForLeaders` the wait also continues while the broker answers `UNKNOWN_TOPIC_OR_PARTITION` for a topic the controller has just created: a KRaft broker can lag the controller by a few seconds. The wait gives up with a `KafkaJSTimeout` once `timeout` has passed (10 s when `timeout` is not set); any other error fails the call at once.
 
 ## <a name="delete-topics"></a> Delete topics
@@ -114,7 +116,10 @@ When a controller-mutation quota throttles `createTopics`, `deleteTopics` or `cr
 ## <a name="fetch-topic-metadata"></a> Fetch topic metadata
 
 ```javascript
-await admin.fetchTopicMetadata({ topics: <Array<String>> })
+await admin.fetchTopicMetadata({
+    topics: <Array<String>>,
+    useDescribeTopicPartitions: <boolean> // default: false
+})
 ```
 
 `TopicsMetadata` structure:
@@ -130,7 +135,9 @@ await admin.fetchTopicMetadata({ topics: <Array<String>> })
 ```javascript
 {
     name: <String>,
-    partitions: <Array<PartitionMetadata>> // default: 1
+    partitions: <Array<PartitionMetadata>>, // default: 1
+    topicId: <String|null>,                 // the topic's uuid, null when the broker sends none
+    isInternal: <Boolean>
 }
 ```
 
@@ -143,6 +150,11 @@ await admin.fetchTopicMetadata({ topics: <Array<String>> })
     leader: <Number>,
     replicas: <Array<Number>>,
     isr: <Array<Number>>,
+    offlineReplicas: <Array<Number>>,
+    leaderEpoch: <Number>,
+    // only with useDescribeTopicPartitions:
+    eligibleLeaderReplicas: <Array<Number>|null>,
+    lastKnownElr: <Array<Number>|null>
 }
 ```
 
@@ -152,6 +164,23 @@ If you omit the `topics` argument the admin client will fetch metadata for all t
 
 ```javascript
 await admin.fetchTopicMetadata()
+```
+
+### Describing topics partition by partition
+
+With `useDescribeTopicPartitions: true` and at least one topic name, the topics are read with DescribeTopicPartitions (KIP-966) instead of Metadata:
+
+- Any broker answers. The client follows the broker's pages to the end (up to 2000 partitions a page, fewer if the broker's `max.request.partition.size.limit` is lower), so a topic with many partitions is not cut off; a broker whose pages repeat, or that does not answer for a topic, fails the call with `KafkaJSNonRetriableError` instead of returning a partial answer. A request that fails in a way that can pass (a dropped connection, a timeout) is asked again on the `retry` budget after a metadata refresh, as the other admin calls are. The topics come back in name order.
+- Each partition also carries `eligibleLeaderReplicas` and `lastKnownElr`. They are `null` when the cluster does not track eligible leader replicas, `[]` when it does and none are eligible, and broker ids otherwise; accept all three. (Eligible leader replicas are off by default on Kafka 4.0 and on by default for new clusters from Kafka 4.1.)
+- A partition without a leader is returned with its `partitionErrorCode` and `leader: -1`. Unlike a Metadata request for named topics, this path does not wait for leaders.
+- A topic that does not exist, or that you may not describe, fails the call with that topic's error once every page has been read; when several fail, the first in name order is thrown. DescribeTopicPartitions never creates a topic. A Metadata request may, when the cluster allows automatic topic creation and `allowAutoTopicCreation` is on.
+- The option is ignored when `topics` is empty or omitted, because the API cannot list every topic: the call goes through Metadata and `eligibleLeaderReplicas` and `lastKnownElr` are then absent. The same happens when the broker does not offer the API.
+
+```javascript
+const { topics } = await admin.fetchTopicMetadata({
+    topics: ['topic-name'],
+    useDescribeTopicPartitions: true
+})
 ```
 
 ## <a name="fetch-topic-offsets"></a> Fetch topic offsets

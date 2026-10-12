@@ -17,6 +17,7 @@ const {
 const { staleMetadata, staleLeaderEpoch, createErrorFromCode } = require('../protocol/error')
 const { GROUP_TYPES } = require('../protocol/groupTypes')
 const { createGroupDescriptions } = require('./groupDescriptions')
+const { readTopicPages, toTopicsMetadata } = require('./describeTopicsByPartition')
 const CONFIG_RESOURCE_TYPES = require('../protocol/configResourceTypes')
 const ALTER_CONFIG_OP_TYPES = require('../protocol/alterConfigOpTypes')
 const ACL_RESOURCE_TYPES = require('../protocol/aclResourceTypes')
@@ -1099,6 +1100,42 @@ module.exports = ({
   }
 
   /**
+   * Reads `names` through DescribeTopicPartitions inside the admin retrier. The first attempt
+   * loads the metadata only if none is loaded or it has expired, because `findControllerBroker`
+   * needs it. A failure of the request itself that is marked retriable (a connection that dropped,
+   * a request that timed out) refreshes the metadata and asks again, on the broker
+   * `findControllerBroker` then returns, as `cluster.metadata` does with each broker in turn; a
+   * topic's own error is never retried: it rejects once every page is in.
+   * @param {string[]} names
+   * @returns {Promise<TopicsMetadata>}
+   * @throws {KafkaJSServerDoesNotSupportApiKey} when the broker does not offer the API
+   * @throws {KafkaJSNumberOfRetriesExceeded} when a retriable failure outlives the retry budget
+   */
+  const describeByPartitions = async (names) => {
+    const retrier = createRetry(retry)
+    const rows = await retrier(async (bail, retryCount, retryTime) => {
+      try {
+        if (retryCount > 0) {
+          await cluster.refreshMetadata()
+        } else {
+          await cluster.refreshMetadataIfNecessary()
+        }
+
+        return await readTopicPages(await cluster.findControllerBroker(), names)
+      } catch (e) {
+        if (e.retriable === true) {
+          logger.warn('Could not describe topics', { error: e.message, retryCount, retryTime })
+          throw e
+        }
+
+        bail(e)
+      }
+    })
+
+    return toTopicsMetadata(rows)
+  }
+
+  /**
    * Fetch metadata for provided topics.
    *
    * If no topics are provided fetch metadata for all topics.
@@ -1109,8 +1146,20 @@ module.exports = ({
    *
    * @see https://kafka.apache.org/protocol#The_Messages_Metadata
    *
+   * With `useDescribeTopicPartitions` and at least one topic, the topics are read through
+   * DescribeTopicPartitions (KIP-966) instead: any broker answers, pages are followed to the end
+   * (a broker whose pages repeat, or that leaves a topic unanswered, fails the call), each
+   * partition also reports `eligibleLeaderReplicas` and `lastKnownElr`, a partition without a
+   * leader is returned with its error code instead of being waited for, and a topic that does not
+   * exist fails the call rather than being created. A failed request is retried on the `retry`
+   * budget, as the other admin calls are. A broker that does not offer the API is asked through
+   * Metadata after all. Without topics the option is ignored: the API cannot list every topic.
+   *
+   * @see https://cwiki.apache.org/confluence/display/KAFKA/KIP-966%3A+Eligible+Leader+Replicas
+   *
    * @param {Object} [options]
    * @param {string[]} [options.topics]
+   * @param {boolean} [options.useDescribeTopicPartitions=false]
    * @return {Promise<TopicsMetadata>}
    * @throws {KafkaJSNonRetriableError} if a topic name is not a valid string
    *
@@ -1120,6 +1169,8 @@ module.exports = ({
    * @typedef {Object} TopicMetadata
    * @property {String} name
    * @property {Array<PartitionMetadata>} partitions
+   * @property {String|null} topicId The topic's uuid; null when the broker sends none
+   * @property {boolean} isInternal
    *
    * @typedef {Object} PartitionMetadata
    * @property {number} partitionErrorCode Response error code
@@ -1127,14 +1178,27 @@ module.exports = ({
    * @property {number} leader  The id of the broker acting as leader for this partition.
    * @property {Array<number>} replicas The set of all nodes that host this partition.
    * @property {Array<number>} isr The set of nodes that are in sync with the leader for this partition.
+   * @property {number} [leaderEpoch]
+   * @property {Array<number>|null} [eligibleLeaderReplicas] only with `useDescribeTopicPartitions`
+   * @property {Array<number>|null} [lastKnownElr] only with `useDescribeTopicPartitions`
    */
-  const fetchTopicMetadata = async ({ topics = [] } = {}) => {
+  const fetchTopicMetadata = async ({ topics = [], useDescribeTopicPartitions = false } = {}) => {
     if (topics) {
       topics.forEach((topic) => {
         if (!topic || typeof topic !== 'string') {
           throw new KafkaJSNonRetriableError(`Invalid topic ${topic}`)
         }
       })
+    }
+
+    if (useDescribeTopicPartitions && topics?.length > 0) {
+      try {
+        return await describeByPartitions(topics)
+      } catch (e) {
+        if (e.name !== 'KafkaJSServerDoesNotSupportApiKey') {
+          throw e
+        }
+      }
     }
 
     const metadata = await retryOnLeaderNotAvailable(() => cluster.metadata({ topics }), {
@@ -1145,6 +1209,8 @@ module.exports = ({
       topics: metadata.topicMetadata.map((topicMetadata) => ({
         name: topicMetadata.topic,
         partitions: topicMetadata.partitionMetadata,
+        topicId: topicMetadata.topicId,
+        isInternal: topicMetadata.isInternal,
       })),
     }
   }
