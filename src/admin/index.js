@@ -1,3 +1,4 @@
+const { inspect } = require('util')
 const createRetry = require('../retry')
 const waitFor = require('../utils/waitFor')
 const groupBy = require('../utils/groupBy')
@@ -13,10 +14,11 @@ const {
   KafkaJSAggregateError,
   isStaleCoordinator,
 } = require('../errors')
-const { staleMetadata, staleLeaderEpoch } = require('../protocol/error')
+const { staleMetadata, staleLeaderEpoch, createErrorFromCode } = require('../protocol/error')
 const { GROUP_TYPES } = require('../protocol/groupTypes')
 const { createGroupDescriptions } = require('./groupDescriptions')
 const CONFIG_RESOURCE_TYPES = require('../protocol/configResourceTypes')
+const ALTER_CONFIG_OP_TYPES = require('../protocol/alterConfigOpTypes')
 const ACL_RESOURCE_TYPES = require('../protocol/aclResourceTypes')
 const ACL_OPERATION_TYPES = require('../protocol/aclOperationTypes')
 const ACL_PERMISSION_TYPES = require('../protocol/aclPermissionTypes')
@@ -26,6 +28,8 @@ const { EARLIEST_OFFSET, LATEST_OFFSET } = require('../constants')
 const { CONNECT, DISCONNECT } = events
 
 const NO_CONTROLLER_ID = -1
+const NOT_CONTROLLER_CODE = 41
+const THROTTLING_QUOTA_EXCEEDED_CODE = 89
 
 const { values, keys, entries } = Object
 const eventNames = values(events)
@@ -92,6 +96,188 @@ const assertStringArray = (name, value) => {
   if (!Array.isArray(value) || value.some((entry) => typeof entry !== 'string')) {
     throw new KafkaJSNonRetriableError(`Expected ${name} to be an array of strings`)
   }
+}
+
+/**
+ * The topics a call that changes topics must send again after the broker's quota refused them.
+ * @see https://cwiki.apache.org/confluence/display/KAFKA/KIP-599%3A+Throttle+Create+Topic%2C+Create+Partition+and+Delete+Topic+Operations
+ * @param {Error} error what `Broker#createTopics`, `#deleteTopics` or `#createPartitions` rejected
+ *   with: the aggregate of `createTopics`, or the first failed topic's error carrying its
+ *   `topicErrors`
+ * @returns {Set<string>|null} the refused topics, or null unless every topic that failed was
+ *   refused with `THROTTLING_QUOTA_EXCEEDED`
+ */
+const throttledTopics = (error) => {
+  const failed = error.errors
+    ? error.errors.map(({ topic, code }) => ({ topic, errorCode: code }))
+    : error.topicErrors
+
+  return failed?.length > 0 &&
+    failed.every(({ errorCode }) => errorCode === THROTTLING_QUOTA_EXCEEDED_CODE)
+    ? new Set(failed.map(({ topic }) => topic))
+    : null
+}
+
+/**
+ * Whether a config resource names something: a non-empty string, except for BROKER, whose empty
+ * name stands for the cluster-wide default broker config.
+ * @param {{ type: number, name: unknown }} resource
+ * @returns {boolean}
+ */
+const hasValidResourceName = ({ type, name }) =>
+  typeof name === 'string' && (name !== '' || type === CONFIG_RESOURCE_TYPES.BROKER)
+
+/**
+ * The first check `describeConfigs`, `alterConfigs` and `incrementalAlterConfigs` make on their
+ * `resources`.
+ * @param {unknown} resources
+ * @returns {void}
+ * @throws {KafkaJSNonRetriableError} unless `resources` is an array with an entry
+ */
+const assertResourcesArray = (resources) => {
+  if (!resources || !Array.isArray(resources)) {
+    throw new KafkaJSNonRetriableError(`Invalid resources array ${resources}`)
+  }
+
+  if (resources.length === 0) {
+    throw new KafkaJSNonRetriableError('Resources array cannot be empty')
+  }
+}
+
+/**
+ * The second check the three config methods share: every resource has a known type and a name
+ * {@link hasValidResourceName} accepts.
+ * @param {{ type: number, name: unknown }[]} resources
+ * @returns {void}
+ * @throws {KafkaJSNonRetriableError} for the first resource that fails, naming it
+ */
+const assertResourceTypesAndNames = (resources) => {
+  const validResourceTypes = Object.values(CONFIG_RESOURCE_TYPES)
+  const invalidType = resources.find((r) => !validResourceTypes.includes(r.type))
+
+  if (invalidType) {
+    throw new KafkaJSNonRetriableError(
+      `Invalid resource type ${invalidType.type}: ${JSON.stringify(invalidType)}`
+    )
+  }
+
+  const invalidName = resources.find((r) => !hasValidResourceName(r))
+
+  if (invalidName) {
+    throw new KafkaJSNonRetriableError(
+      `Invalid resource name ${invalidName.name}: ${JSON.stringify(invalidName)}`
+    )
+  }
+}
+
+/**
+ * Checks one config entry of an `incrementalAlterConfigs` request.
+ * @param {unknown} entry
+ * @param {string} resourceKey `<type>/<name>` of the resource that holds it, for the message
+ * @returns {void}
+ * @throws {KafkaJSNonRetriableError} unless `entry` is an object with a string `name`, an
+ *   `operation` that is an `AlterConfigOpTypes` value, and a string `value` unless it is a DELETE,
+ *   whose `value` is not looked at
+ */
+const assertIncrementalEntry = (entry, resourceKey) => {
+  if (entry == null || typeof entry !== 'object') {
+    throw new KafkaJSNonRetriableError(
+      `Invalid config entry ${inspect(entry)} of resource ${resourceKey}: it must be an object`
+    )
+  }
+
+  const { name, operation, value } = entry
+
+  if (typeof name !== 'string') {
+    throw new KafkaJSNonRetriableError(
+      `Invalid config entry name ${inspect(name)} of resource ${resourceKey}`
+    )
+  }
+
+  if (!Object.values(ALTER_CONFIG_OP_TYPES).includes(operation)) {
+    throw new KafkaJSNonRetriableError(
+      `Invalid config operation ${inspect(operation)} for ${name}: use a value of AlterConfigOpTypes`
+    )
+  }
+
+  if (operation !== ALTER_CONFIG_OP_TYPES.DELETE && typeof value !== 'string') {
+    const operationName = Object.keys(ALTER_CONFIG_OP_TYPES).find(
+      (key) => ALTER_CONFIG_OP_TYPES[key] === operation
+    )
+    throw new KafkaJSNonRetriableError(
+      `Invalid config value for ${name}: ${operationName} needs a string, got ${inspect(value)}`
+    )
+  }
+}
+
+/**
+ * Checks the config entries of an `incrementalAlterConfigs` request, so that a mistake costs no
+ * round trip and names the config: the broker rejects a repeated resource or config name with less
+ * context, and the 4.3 controller applies a SET without a value as the removal of the config.
+ * @param {{ type: number, name: string, configEntries: unknown }[]} resources already past
+ *   {@link assertResourceTypesAndNames}
+ * @returns {void}
+ * @throws {KafkaJSNonRetriableError} when a resource repeats, `configEntries` is not an array, an
+ *   entry fails {@link assertIncrementalEntry}, or a config name repeats in one resource whatever
+ *   its operation
+ */
+const assertIncrementalEntries = (resources) => {
+  const seenResources = new Set()
+
+  for (const { type, name, configEntries } of resources) {
+    const resourceKey = `${type}/${name}`
+
+    if (seenResources.has(resourceKey)) {
+      throw new KafkaJSNonRetriableError(
+        `Invalid resources array, it cannot have multiple entries for the same resource: ${JSON.stringify({ type, name })}`
+      )
+    }
+    seenResources.add(resourceKey)
+
+    if (!Array.isArray(configEntries)) {
+      throw new KafkaJSNonRetriableError(
+        `Invalid resource configEntries ${inspect(configEntries)}: ${JSON.stringify({ type, name })}`
+      )
+    }
+
+    const seenNames = new Set()
+
+    for (const entry of configEntries) {
+      assertIncrementalEntry(entry, resourceKey)
+
+      if (seenNames.has(entry.name)) {
+        throw new KafkaJSNonRetriableError(
+          `Invalid resource configEntries, it cannot have multiple entries for the config ${entry.name} of resource ${resourceKey}`
+        )
+      }
+      seenNames.add(entry.name)
+    }
+  }
+}
+
+/**
+ * Puts per-broker `incrementalAlterConfigs` results back in the order the caller gave the
+ * resources. A resource the brokers did not answer gets an `UNKNOWN` result, never a success.
+ * @param {{ type: number, name: string }[]} resources the request, in the caller's order
+ * @param {{ errorCode: number, errorMessage: string|null, resourceType: number,
+ *   resourceName: string }[]} results every broker's results, in any order
+ * @returns {{ errorCode: number, errorMessage: string|null, resourceType: number,
+ *   resourceName: string }[]} one result per resource
+ */
+const inRequestOrder = (resources, results) => {
+  const answered = new Map(
+    results.map((result) => [`${result.resourceType}/${result.resourceName}`, result])
+  )
+
+  return resources.map(
+    ({ type, name }) =>
+      answered.get(`${type}/${name}`) ?? {
+        errorCode: -1,
+        errorMessage: 'The broker did not answer for this resource',
+        resourceType: type,
+        resourceName: name,
+      }
+  )
 }
 
 /**
@@ -219,12 +405,13 @@ module.exports = ({
     }
 
     const retrier = createRetry(retry)
+    let pending = topics
 
     return retrier(async (bail, retryCount, retryTime) => {
       try {
         await cluster.refreshMetadata()
         const broker = await cluster.findControllerBroker()
-        await broker.createTopics({ topics, validateOnly, timeout })
+        await broker.createTopics({ topics: pending, validateOnly, timeout })
 
         if (waitForLeaders) {
           const topicNamesArray = Array.from(topicNames.values())
@@ -241,6 +428,14 @@ module.exports = ({
       } catch (e) {
         if (e.type === 'NOT_CONTROLLER') {
           logger.warn('Could not create topics', { error: e.message, retryCount, retryTime })
+          throw e
+        }
+
+        const refused = throttledTopics(e)
+
+        if (refused) {
+          pending = pending.filter(({ topic }) => refused.has(topic))
+          logger.warn('A quota refused topics', { topics: [...refused], retryCount, retryTime })
           throw e
         }
 
@@ -282,15 +477,24 @@ module.exports = ({
     }
 
     const retrier = createRetry(retry)
+    let pending = topicPartitions
 
     return retrier(async (bail, retryCount, retryTime) => {
       try {
         await cluster.refreshMetadata()
         const broker = await cluster.findControllerBroker()
-        await broker.createPartitions({ topicPartitions, validateOnly, timeout })
+        await broker.createPartitions({ topicPartitions: pending, validateOnly, timeout })
       } catch (e) {
         if (e.type === 'NOT_CONTROLLER') {
           logger.warn('Could not create topics', { error: e.message, retryCount, retryTime })
+          throw e
+        }
+
+        const refused = throttledTopics(e)
+
+        if (refused) {
+          pending = pending.filter(({ topic }) => refused.has(topic))
+          logger.warn('A quota refused partitions', { topics: [...refused], retryCount, retryTime })
           throw e
         }
 
@@ -314,12 +518,13 @@ module.exports = ({
     }
 
     const retrier = createRetry(retry)
+    let pending = topics
 
     return retrier(async (bail, retryCount, retryTime) => {
       try {
         await cluster.refreshMetadata()
         const broker = await cluster.findControllerBroker()
-        await broker.deleteTopics({ topics, timeout })
+        await broker.deleteTopics({ topics: pending, timeout })
 
         // Remove deleted topics
         for (const topic of topics) {
@@ -328,6 +533,18 @@ module.exports = ({
 
         await cluster.refreshMetadata()
       } catch (e) {
+        const refused = throttledTopics(e)
+
+        if (refused) {
+          pending = pending.filter((topic) => refused.has(topic))
+          logger.warn('A quota refused topic deletions', {
+            topics: [...refused],
+            retryCount,
+            retryTime,
+          })
+          throw e
+        }
+
         if (['NOT_CONTROLLER', 'UNKNOWN_TOPIC_OR_PARTITION'].includes(e.type)) {
           logger.warn('Could not delete topics', { error: e.message, retryCount, retryTime })
           throw e
@@ -620,11 +837,20 @@ module.exports = ({
     })
   }
 
-  const isBrokerConfig = (type) =>
-    [CONFIG_RESOURCE_TYPES.BROKER, CONFIG_RESOURCE_TYPES.BROKER_LOGGER].includes(type)
+  /**
+   * A BROKER_LOGGER resource and a BROKER resource with a name belong to the one broker named by
+   * the resource; a BROKER resource with the empty name is the cluster-wide default, which any
+   * broker answers.
+   * @param {{ type: number, name: string }} resource
+   * @returns {boolean}
+   */
+  const isBrokerConfig = ({ type, name }) =>
+    type === CONFIG_RESOURCE_TYPES.BROKER_LOGGER ||
+    (type === CONFIG_RESOURCE_TYPES.BROKER && name !== '')
 
   /**
-   * Broker configs can only be returned by the target broker
+   * Broker configs can only be returned by the target broker; every other resource, the
+   * cluster-default broker config included, goes to `defaultBroker`
    *
    * @see
    * https://github.com/apache/kafka/blob/821c1ac6641845aeca96a43bc2b946ecec5cba4f/clients/src/main/java/org/apache/kafka/clients/admin/KafkaAdminClient.java#L3783
@@ -633,15 +859,20 @@ module.exports = ({
    * @param {Broker} defaultBroker. Broker used in case the configuration is not a broker config
    */
   const groupResourcesByBroker = ({ resources, defaultBroker }) =>
-    groupBy(resources, async ({ type, name: nodeId }) => {
-      return isBrokerConfig(type)
-        ? await cluster.findBroker({ nodeId: String(nodeId) })
+    groupBy(resources, async (resource) => {
+      return isBrokerConfig(resource)
+        ? await cluster.findBroker({ nodeId: String(resource.name) })
         : defaultBroker
     })
 
   /**
+   * A BROKER resource with the empty name is the cluster-wide default broker config; every other
+   * type needs a non-empty name.
+   *
    * @param {Array<ResourceConfigQuery>} resources
    * @param {boolean} [includeSynonyms=false]
+   * @param {boolean} [includeDocumentation=false] ask for each entry's documentation, which the
+   *   broker leaves out unless asked; sent from DescribeConfigs v3
    * @return {Promise}
    *
    * @typedef {Object} ResourceConfigQuery
@@ -649,31 +880,9 @@ module.exports = ({
    * @property {string} name
    * @property {Array<String>} [configNames=[]]
    */
-  const describeConfigs = async ({ resources, includeSynonyms }) => {
-    if (!resources || !Array.isArray(resources)) {
-      throw new KafkaJSNonRetriableError(`Invalid resources array ${resources}`)
-    }
-
-    if (resources.length === 0) {
-      throw new KafkaJSNonRetriableError('Resources array cannot be empty')
-    }
-
-    const validResourceTypes = Object.values(CONFIG_RESOURCE_TYPES)
-    const invalidType = resources.find((r) => !validResourceTypes.includes(r.type))
-
-    if (invalidType) {
-      throw new KafkaJSNonRetriableError(
-        `Invalid resource type ${invalidType.type}: ${JSON.stringify(invalidType)}`
-      )
-    }
-
-    const invalidName = resources.find((r) => !r.name || typeof r.name !== 'string')
-
-    if (invalidName) {
-      throw new KafkaJSNonRetriableError(
-        `Invalid resource name ${invalidName.name}: ${JSON.stringify(invalidName)}`
-      )
-    }
+  const describeConfigs = async ({ resources, includeSynonyms, includeDocumentation }) => {
+    assertResourcesArray(resources)
+    assertResourceTypesAndNames(resources)
 
     const invalidConfigs = resources.find(
       (r) => !Array.isArray(r.configNames) && r.configNames != null
@@ -702,6 +911,7 @@ module.exports = ({
           return targetBroker.describeConfigs({
             resources: resourcerByBroker.get(targetBroker),
             includeSynonyms,
+            includeDocumentation,
           })
         }
 
@@ -725,6 +935,11 @@ module.exports = ({
   }
 
   /**
+   * Replaces the whole dynamic config of each resource: an entry left out is deleted.
+   * {@link incrementalAlterConfigs} changes only the entries it names and is preferred. A BROKER
+   * resource with the empty name is the cluster-wide default broker config; every other type needs
+   * a non-empty name.
+   *
    * @param {Array<ResourceConfig>} resources
    * @param {boolean} [validateOnly=false]
    * @return {Promise}
@@ -739,30 +954,8 @@ module.exports = ({
    * @property {string} value
    */
   const alterConfigs = async ({ resources, validateOnly }) => {
-    if (!resources || !Array.isArray(resources)) {
-      throw new KafkaJSNonRetriableError(`Invalid resources array ${resources}`)
-    }
-
-    if (resources.length === 0) {
-      throw new KafkaJSNonRetriableError('Resources array cannot be empty')
-    }
-
-    const validResourceTypes = Object.values(CONFIG_RESOURCE_TYPES)
-    const invalidType = resources.find((r) => !validResourceTypes.includes(r.type))
-
-    if (invalidType) {
-      throw new KafkaJSNonRetriableError(
-        `Invalid resource type ${invalidType.type}: ${JSON.stringify(invalidType)}`
-      )
-    }
-
-    const invalidName = resources.find((r) => !r.name || typeof r.name !== 'string')
-
-    if (invalidName) {
-      throw new KafkaJSNonRetriableError(
-        `Invalid resource name ${invalidName.name}: ${JSON.stringify(invalidName)}`
-      )
-    }
+    assertResourcesArray(resources)
+    assertResourceTypesAndNames(resources)
 
     const invalidConfigs = resources.find((r) => !Array.isArray(r.configEntries))
 
@@ -810,6 +1003,90 @@ module.exports = ({
         )
 
         return { resources: responseResources }
+      } catch (e) {
+        if (e.type === 'NOT_CONTROLLER') {
+          logger.warn('Could not alter configs', { error: e.message, retryCount, retryTime })
+          throw e
+        }
+
+        bail(e)
+      }
+    })
+  }
+
+  /**
+   * Changes individual config entries (KIP-339): each entry names an operation, so the entries a
+   * request leaves out stay as they are, unlike {@link alterConfigs}, which replaces the whole
+   * config.
+   *
+   * A resource that fails does not fail the call: every resource gets a result in the order it was
+   * given, and the caller reads its `errorCode`. Changes are atomic per resource and not across
+   * resources. APPEND and SUBTRACT take a comma-separated list and apply to list configs only (any
+   * other answers `INVALID_CONFIG`); SUBTRACT of every value leaves an empty list, not the default,
+   * and DELETE restores the default. The `value` of a DELETE is ignored.
+   *
+   * Resources are routed as {@link groupResourcesByBroker} does, one request per broker. Only a
+   * result of `NOT_CONTROLLER` is retried, by sending the whole call again, which is safe because
+   * every operation can be repeated; any other code is a result and is never retried. A transport
+   * failure rejects as it is.
+   *
+   * @see https://cwiki.apache.org/confluence/display/KAFKA/KIP-339%3A+Create+a+new+IncrementalAlterConfigs+API
+   * @see https://github.com/apache/kafka/blob/4.3.1/clients/src/main/java/org/apache/kafka/clients/admin/KafkaAdminClient.java
+   *
+   * @param {Object} options
+   * @param {Array<IncrementalResourceConfig>} options.resources
+   * @param {boolean} [options.validateOnly=false] validate the change without applying it
+   * @returns {Promise<{ resources: Array<IncrementalAlterResult> }>} one result per resource
+   * @throws {KafkaJSNonRetriableError} before anything is sent, for an invalid argument
+   * @throws {KafkaJSNumberOfRetriesExceeded} when `NOT_CONTROLLER` persists
+   *
+   * @typedef {Object} IncrementalResourceConfig
+   * @property {ConfigResourceType} type
+   * @property {string} name the empty string names the cluster-default BROKER config
+   * @property {Array<{ name: string, operation: AlterConfigOpTypes, value?: string|null }>} configEntries
+   *
+   * @typedef {Object} IncrementalAlterResult
+   * @property {number} errorCode 0 on success
+   * @property {string|null} errorMessage
+   * @property {ConfigResourceType} resourceType
+   * @property {string} resourceName
+   */
+  const incrementalAlterConfigs = async ({ resources, validateOnly = false }) => {
+    assertResourcesArray(resources)
+
+    const emptyAt = resources.findIndex((resource) => resource == null)
+
+    if (emptyAt !== -1) {
+      throw new KafkaJSNonRetriableError(
+        `Invalid resources array, the entry at index ${emptyAt} is ${resources[emptyAt]}`
+      )
+    }
+
+    assertResourceTypesAndNames(resources)
+    assertIncrementalEntries(resources)
+
+    const retrier = createRetry(retry)
+
+    return retrier(async (bail, retryCount, retryTime) => {
+      try {
+        await cluster.refreshMetadata()
+        const controller = await cluster.findControllerBroker()
+        const resourcesByBroker = await groupResourcesByBroker({
+          resources,
+          defaultBroker: controller,
+        })
+        const responses = await Promise.all(
+          Array.from(resourcesByBroker, ([broker, group]) =>
+            broker.incrementalAlterConfigs({ resources: group, validateOnly: !!validateOnly })
+          )
+        )
+        const results = responses.flatMap((response) => response.resources)
+
+        if (results.some(({ errorCode }) => errorCode === NOT_CONTROLLER_CODE)) {
+          throw createErrorFromCode(NOT_CONTROLLER_CODE)
+        }
+
+        return { resources: inRequestOrder(resources, results) }
       } catch (e) {
         if (e.type === 'NOT_CONTROLLER') {
           logger.warn('Could not alter configs', { error: e.message, retryCount, retryTime })
@@ -1654,6 +1931,7 @@ module.exports = ({
     resetOffsets,
     describeConfigs,
     alterConfigs,
+    incrementalAlterConfigs,
     on,
     logger: getLogger,
     listGroups,

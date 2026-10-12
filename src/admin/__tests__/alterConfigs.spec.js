@@ -2,7 +2,7 @@ const createAdmin = require('../index')
 const { KafkaJSProtocolError } = require('../../errors')
 const { createErrorFromCode } = require('../../protocol/error')
 
-const { secureRandom, createCluster, newLogger, createTopic } = require('testHelpers')
+const { secureRandom, createCluster, newLogger, createTopic, waitFor } = require('testHelpers')
 const CONFIG_RESOURCE_TYPES = require('../../protocol/configResourceTypes')
 const NOT_CONTROLLER = 41
 
@@ -111,7 +111,7 @@ describe('Admin', () => {
 
       await admin.connect()
 
-      let describeResponse = await admin.describeConfigs({
+      const describeResponse = await admin.describeConfigs({
         resources: [
           {
             type: CONFIG_RESOURCE_TYPES.TOPIC,
@@ -134,17 +134,30 @@ describe('Admin', () => {
         ],
       })
 
-      describeResponse = await admin.describeConfigs({
-        resources: [
-          {
-            type: CONFIG_RESOURCE_TYPES.TOPIC,
-            name: topicName,
-            configNames: ['cleanup.policy'],
-          },
-        ],
-      })
+      // KRaft applies AlterConfigs through the controller, and the broker that answers
+      // DescribeConfigs catches up when it replays the metadata log, so the read is polled.
+      cleanupPolicy = await waitFor(
+        async () => {
+          const response = await admin.describeConfigs({
+            resources: [
+              {
+                type: CONFIG_RESOURCE_TYPES.TOPIC,
+                name: topicName,
+                configNames: ['cleanup.policy'],
+              },
+            ],
+          })
 
-      cleanupPolicy = getConfigValue(getConfigEntries(describeResponse), 'cleanup.policy')
+          const value = getConfigValue(getConfigEntries(response), 'cleanup.policy')
+          return value === 'compact' ? value : false
+        },
+        {
+          ignoreTimeout: false,
+          maxWait: 10000,
+          timeoutMessage: 'Timed out waiting for cleanup.policy',
+        }
+      )
+
       expect(cleanupPolicy).toEqual('compact')
     })
 

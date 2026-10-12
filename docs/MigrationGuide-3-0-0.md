@@ -791,6 +791,18 @@ Group visibility and the admin client.
   client now negotiates v2; v1 and v2 report the number (`0` when the broker did not throttle; v0
   reports `throttleTimeMs` only) and the connection waits it out as it does for every other API
   (KIP-219). `admin.deleteGroups()` results are unchanged. *What to do:* nothing.
+- **Cluster-default broker configs can be described and altered.** `admin.describeConfigs` and
+  `admin.alterConfigs` threw `KafkaJSNonRetriableError` (invalid resource name) for a `BROKER`
+  resource whose name is the empty string. That name now stands for the cluster-wide default broker
+  config, and all three config methods send it to any broker. Every other resource type still needs
+  a non-empty name. *What to do:* nothing.
+- **`createTopics`, `deleteTopics` and `createPartitions` retry a quota refusal.** On a cluster with
+  controller-mutation quotas (KIP-599) a broker now refuses with `THROTTLING_QUOTA_EXCEEDED` a
+  request it used to slow down, because the client negotiates newer versions of these APIs. The
+  client waits the throttle time the broker reports and sends only the refused topics again within
+  the `retry` budget, so a call that succeeded under 2.2.4 still succeeds, a little later; one that
+  outlives the budget rejects with `KafkaJSNumberOfRetriesExceeded`, whose `cause` is the quota
+  error. *What to do:* nothing.
 
 ### Errors and events
 

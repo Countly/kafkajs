@@ -107,6 +107,10 @@ await admin.createPartitions({
 | count          | New partition count, mandatory                                                                                   |         |
 | assignments    | Assigned brokers for each new partition                                                               | null    |
 
+### Throttled requests
+
+When a controller-mutation quota throttles `createTopics`, `deleteTopics` or `createPartitions` (KIP-599), the broker refuses the topics it did not process with `THROTTLING_QUOTA_EXCEEDED` (89) and reports how long to wait. The admin client sends only those topics again, within the `retry` budget, and the connection holds the next request back for the throttle time the answer carried, so a call that a quota only slows still succeeds, a little later. The topics the broker did process are not sent again. Once the `retries` are spent the call rejects with `KafkaJSNumberOfRetriesExceeded`, whose `cause` is the quota error (for `createTopics`, the `KafkaJSAggregateError` that lists the refused topics). When another topic failed in the same answer, nothing is sent again for the quota and that failure is handled as it always has been. Java's `Admin` retries these refusals until its timeout (`retryOnQuotaViolation`). The throttle wait comes on top of the retry backoff: `retry.maxRetryTime` only caps one backoff delay, so by default nothing bounds the call as a whole, and the worst case is about `retries` throttle times plus the backoff delays, where Java bounds the whole call at its default 60 s (`default.api.timeout.ms`). To bound it, set `retry.maxTotalTime`: it counts the time already spent, throttle waits included, and the call then rejects with `KafkaJSDeliveryTimeout`, whose `cause` is the quota error; the attempt it lets start can still wait out one more throttle time.
+
 ## <a name="fetch-topic-metadata"></a> Fetch topic metadata
 
 ```javascript
@@ -302,6 +306,7 @@ Get the configuration for the specified resources.
 ```javascript
 await admin.describeConfigs({
   includeSynonyms: <boolean>,
+  includeDocumentation: <boolean>, // default: false
   resources: <ResourceConfigQuery[]>
 })
 ```
@@ -351,6 +356,10 @@ await admin.describeConfigs({
 
 Take a look at [configResourceTypes](../src/protocol/configResourceTypes.js) for a complete list of resources.
 
+The `name` of a resource is a topic name, a group id, a client-metrics subscription name or a broker id, by `type`. A `BROKER` resource may also have the empty name `''`, which is the cluster-wide default broker config: its entries are the ones set as cluster defaults, so it is empty on a cluster that has none. Every other type needs a non-empty name. A broker config for one broker id, and a `BROKER_LOGGER`, are answered by that broker only; everything else is asked of any broker.
+
+`includeDocumentation: true` asks the broker for the documentation of each entry, which it leaves out otherwise (`documentation` is `null`). Every entry also carries `configType`, the type of its value: a number, see `ConfigTypes` (`BOOLEAN`, `STRING`, `INT`, `SHORT`, `LONG`, `DOUBLE`, `LIST`, `CLASS` or `PASSWORD`). Both keys need DescribeConfigs v3, which every Kafka 4.x broker offers. The documentation makes the response large, so ask for it only when you show it.
+
 Example response:
 
 ```javascript
@@ -363,7 +372,9 @@ Example response:
                 isDefault: true,
                 configSource: 5,
                 isSensitive: false,
-                readOnly: false
+                readOnly: false,
+                configType: 7,
+                documentation: null
             }],
             errorCode: 0,
             errorMessage: null,
@@ -378,6 +389,8 @@ Example response:
 ## <a name="alter-configs"></a> Alter configs
 
 Update the configuration for the specified resources.
+
+`alterConfigs` **replaces** the whole dynamic config of each resource: every entry you leave out is deleted. [`incrementalAlterConfigs`](#incremental-alter-configs) changes only the entries it names and is the better choice for almost every change. A `BROKER` resource with the empty name `''` is the cluster-wide default broker config, and `alterConfigs` on it deletes every cluster-wide dynamic default you do not list (use `incrementalAlterConfigs` to change one); every other type needs a non-empty name. With eligible leader replicas enabled, the controller refuses to delete the cluster-level `min.insync.replicas`, so a replacement that leaves it out fails with `INVALID_CONFIG`: read what the default holds with `describeConfigs` and send it back.
 
 ```javascript
 await admin.alterConfigs({
@@ -434,6 +447,85 @@ Example response:
     throttleTime: 0,
 }
 ```
+
+## <a name="incremental-alter-configs"></a> Incremental alter configs
+
+Change individual config entries (KIP-339). Each entry names an operation, so the entries a request leaves out stay as they are, unlike [`alterConfigs`](#alter-configs), which replaces the whole config of the resource.
+
+```javascript
+await admin.incrementalAlterConfigs({
+    validateOnly: <boolean>, // default: false
+    resources: <IncrementalResourceConfig[]>
+})
+```
+
+`IncrementalResourceConfig` structure:
+
+```javascript
+{
+    type: <ConfigResourceType>,
+    name: <String>,
+    configEntries: <IncrementalConfigEntry[]>
+}
+```
+
+`IncrementalConfigEntry` structure:
+
+```javascript
+{
+    name: <String>,
+    operation: <AlterConfigOpTypes>, // required
+    value: <String>                  // required, except for DELETE
+}
+```
+
+| operation  | what it does                                                                                           |
+| ---------- | ------------------------------------------------------------------------------------------------------ |
+| `SET`      | Sets the entry to `value`.                                                                             |
+| `DELETE`   | Reverts the entry to its default. `value` is ignored.                                                  |
+| `APPEND`   | List configs only: adds the comma-separated `value` items that the list does not hold yet.             |
+| `SUBTRACT` | List configs only: removes the comma-separated `value` items. Removing all of them leaves an empty list, not the default: use `DELETE` for that. |
+
+`operation` has no default, so a forgotten field can never turn into an overwrite. An `APPEND` or `SUBTRACT` on an entry that is not a list is answered with `INVALID_CONFIG` (40). On an entry that has not been set, they start from its default.
+
+Example:
+
+```javascript
+const { ConfigResourceTypes, AlterConfigOpTypes } = require('@countly/kafkajs')
+
+const { resources } = await admin.incrementalAlterConfigs({
+    resources: [{
+        type: ConfigResourceTypes.TOPIC,
+        name: 'topic-name',
+        configEntries: [
+            { name: 'retention.ms', operation: AlterConfigOpTypes.SET, value: '86400000' },
+            { name: 'cleanup.policy', operation: AlterConfigOpTypes.APPEND, value: 'compact' },
+            { name: 'segment.ms', operation: AlterConfigOpTypes.DELETE },
+        ]
+    }]
+})
+```
+
+The call resolves with one result for each resource, in the order you gave them. **It does not reject when a resource fails**, so check each `errorCode`:
+
+```javascript
+{
+    resources: [{
+        errorCode: 0,
+        errorMessage: null,
+        resourceType: 2,
+        resourceName: 'topic-name',
+    }],
+}
+```
+
+A resource is changed as a whole or not at all, but the resources of one call are independent: some can succeed while others fail, and each broker gets its own request, so a call that rejects (a connection failure to one broker, say) may have applied the resources that went to the others. Repeating the whole call is safe, because every operation can be repeated. A result is never retried, whatever its code, with one exception: `NOT_CONTROLLER` means the request reached the wrong broker, and the client then sends the whole call again, which is safe because every operation can be repeated. The call rejects for an invalid argument (`KafkaJSNonRetriableError`, before anything is sent), for a connection failure, and with `KafkaJSNumberOfRetriesExceeded` when `NOT_CONTROLLER` does not go away.
+
+Where the resources go: a `BROKER` resource with a name and a `BROKER_LOGGER` go to the broker with that id, one request for each broker; every other resource goes to one broker, whichever the client picks. A `BROKER` resource with the empty name `''` is the cluster-wide default broker config and takes the same path as a topic. The empty name is refused for every other type.
+
+The client refuses these before sending anything, naming the resource or config: a `resources` array that is empty, a resource or a config name that appears twice (a config name counts once whatever its operation), a missing or unknown `operation`, and a `SET`, `APPEND` or `SUBTRACT` without a string `value`. The empty string is a value.
+
+`GROUP` resources take a group id and its group configs, such as `consumer.session.timeout.ms`; `CLIENT_METRICS` resources take a subscription name and its `metrics`, `interval.ms` and `match` entries.
 
 ## <a name="list-groups"></a> List groups
 

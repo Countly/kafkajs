@@ -27,10 +27,18 @@ const decode = async (rawData) => {
   }
 }
 
+/**
+ * @param {{ topicErrors: { topic: string, errorCode: number }[] }} data the decoded response
+ * @returns {Promise<object>} `data` unchanged when no topic failed
+ * @throws {KafkaJSProtocolError} for the first failed topic; the error carries every failed row as
+ *   `topicErrors`, so a caller can tell which topics a refusal left undone
+ */
 const parse = async (data) => {
   const topicsWithError = data.topicErrors.filter(({ errorCode }) => failure(errorCode))
   if (topicsWithError.length > 0) {
-    throw createErrorFromCode(topicsWithError[0].errorCode)
+    throw Object.assign(createErrorFromCode(topicsWithError[0].errorCode), {
+      topicErrors: topicsWithError,
+    })
   }
 
   return data
