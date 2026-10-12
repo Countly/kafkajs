@@ -167,3 +167,86 @@ The payloads are those in the tables above.
 | `kafkajs.admin.network.authentication_failure` | `admin.events.AUTHENTICATION_FAILURE` |
 | `kafkajs.admin.cluster.topic_recreated` | `admin.events.TOPIC_RECREATED` |
 | `kafkajs.admin.cluster.rebootstrap` | `admin.events.REBOOTSTRAP` |
+
+## <a name="metrics"></a> Metrics with prom-client
+
+The channels above are all a metrics layer needs; the package has no metrics API of its own. This recipe feeds [prom-client](https://www.npmjs.com/package/prom-client) from them: request count and duration per API, consumed messages and handler time per topic, offset commits, group joins and their duration, and consumer crashes. Install `prom-client`, run it once at start-up and expose `await client.register.metrics()` the way the rest of your application does. The recipe also runs unchanged on `@prometheus-io/client`, the package that replaces `prom-client`: only the `require` differs.
+
+```javascript
+const diagnosticsChannel = require('node:diagnostics_channel')
+const client = require('prom-client')
+
+const requests = new client.Counter({
+  name: 'kafkajs_requests_total',
+  help: 'Requests sent to brokers',
+  labelNames: ['kind', 'client_id', 'api'],
+})
+const requestSeconds = new client.Histogram({
+  name: 'kafkajs_request_duration_seconds',
+  help: 'Seconds from sending a request to its answer',
+  labelNames: ['kind', 'client_id', 'api'],
+})
+const consumedMessages = new client.Counter({
+  name: 'kafkajs_consumer_messages_total',
+  help: 'Messages the consumer handed to its handler',
+  labelNames: ['topic'],
+})
+const batchSeconds = new client.Histogram({
+  name: 'kafkajs_consumer_batch_duration_seconds',
+  help: 'Seconds the handler took for one batch',
+  labelNames: ['topic'],
+})
+const commits = new client.Counter({
+  name: 'kafkajs_consumer_commits_total',
+  help: 'Offset commits the consumer sent',
+})
+const groupJoins = new client.Counter({
+  name: 'kafkajs_consumer_group_joins_total',
+  help: 'Rounds in which the consumer joined its group, the first one included',
+  labelNames: ['protocol'],
+})
+const groupJoinSeconds = new client.Histogram({
+  name: 'kafkajs_consumer_group_join_duration_seconds',
+  help: 'Seconds one group join round took',
+  labelNames: ['protocol'],
+})
+const crashes = new client.Counter({
+  name: 'kafkajs_consumer_crashes_total',
+  help: 'Times the consumer crashed',
+  labelNames: ['restart'],
+})
+
+// The events carry integer milliseconds; Prometheus counts in seconds.
+const seconds = (milliseconds) => milliseconds / 1000
+const subscribe = (event, onPayload) =>
+  diagnosticsChannel.subscribe(`kafkajs.${event}`, ({ payload }) => onPayload(payload))
+
+for (const kind of ['producer', 'consumer', 'admin']) {
+  subscribe(`${kind}.network.request`, ({ clientId, apiName, duration }) => {
+    const labels = { kind, client_id: clientId, api: apiName }
+    requests.inc(labels)
+    requestSeconds.observe(labels, seconds(duration))
+  })
+}
+
+subscribe('consumer.end_batch_process', ({ topic, batchSize, duration }) => {
+  consumedMessages.inc({ topic }, batchSize)
+  batchSeconds.observe({ topic }, seconds(duration))
+})
+subscribe('consumer.commit_offsets', () => commits.inc())
+subscribe('consumer.group_join', ({ membershipProtocol, duration }) => {
+  groupJoins.inc({ protocol: membershipProtocol })
+  groupJoinSeconds.observe({ protocol: membershipProtocol }, seconds(duration))
+})
+subscribe('consumer.crash', ({ restart }) => crashes.inc({ restart: String(restart) }))
+```
+
+What to know before relying on the numbers:
+
+- **Units.** Every duration in a payload is an integer number of milliseconds, taken from `Date.now()` differences, so the recipe divides by 1000. Sub-millisecond requests read as `0`.
+- **`acks: 0`.** A Produce request with `acks: 0` has no response: its `network.request` event fires right after the request is written, with `size: 0` and a duration of about `0`. It counts as a request and says nothing about the broker's speed.
+- **Answered requests only.** `network.request` fires when a request completes, so a request that timed out or whose socket failed is in neither `kafkajs_requests_total` nor the duration histogram; watch `kafkajs.<kind>.network.request_timeout` for timeouts.
+- **`consumer.end_batch_process`** fires once per batch the handler finished, with the number of messages in it as `batchSize`, so the counter is messages handed to `eachMessage` or `eachBatch`, not messages committed. It also fires with `batchSize: 0`, and no handler call, for a batch emptied by control records or aborted transactions; such a batch adds nothing to the message counter and a near-zero observation to the handler-time histogram.
+- **Label cardinality.** The labels are the client kind, the `clientId`, the API name, the topic, the membership protocol and whether the consumer restarts. `kind`, `api`, `protocol` and `restart` take a handful of values; `topic` and `clientId` stay bounded only if your application keeps them so, and a regex subscription over a cluster with many topics, or a `clientId` built per process or per request, breaks that. Each new `topic`, and each new `kind`, `clientId` and API combination, adds 15 time series (1 on the counter and 14 on its histogram with the default buckets) that live until the process ends: drop the `topic` label, or map topics onto a fixed set, when you do not control them, and keep `clientId`s stable. Never label by `correlationId`, `memberId`, `broker` or a partition, which are unbounded or churn.
+- **One process, one set of counters.** A channel is process-wide, so two `Kafka` instances (or a producer and a consumer) feed the same metrics. `kind` and `client_id` keep their request metrics apart as long as the instances use different `clientId`s; the consumer's own metrics (`consumer.end_batch_process`, `consumer.group_join`) carry no `clientId`, so two consumers in one process add up.
+- **A subscriber must not throw.** The recipe's handlers only read documented payload fields; if you add one that can throw, catch inside it.

@@ -74,6 +74,7 @@
     "test:e2e:admin-group-visibility": "npm run test:kafka -- \"ADMIN_GROUP_VISIBILITY_E2E=1 npx jest --forceExit --runInBand --testPathPatterns 'src/admin/__tests__/adminGroupVisibilityLive\\.spec\\.js'\"",
     "test:e2e:create-topics-cold": "npm run test:kafka -- \"CREATE_TOPICS_COLD_E2E=1 npx jest --forceExit --runInBand --testPathPatterns 'src/admin/__tests__/createTopicsColdLive\\\\.spec\\\\.js'\"",
     "test:e2e:config-admin": "npm run test:kafka -- \"CONFIG_ADMIN_E2E=1 npx jest --forceExit --runInBand --testPathPatterns 'src/admin/__tests__/incrementalAlterConfigsLive\\\\.spec\\\\.js'\"",
+    "test:e2e:diagnostics-channel": "npm run test:kafka -- \"DIAGNOSTICS_CHANNEL_E2E=1 npx jest --forceExit --runInBand --testPathPatterns 'src/instrumentation/__tests__/diagnosticsChannelLive\\\\.spec\\\\.js'\"",
     "probe:group-conversion": "npm run test:kafka -- \"node scripts/e2e/javaConsumer/groupConversionProbe.js\"",
     "probe:transaction-version": "node scripts/e2e/transactionVersionProbe.js",
     "probe:idempotent-authz": "COMPOSE_FILE=docker-compose.acl.yml npm run test:kafka -- \"node scripts/e2e/idempotentAuthzProbe.js\"",
