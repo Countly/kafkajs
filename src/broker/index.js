@@ -3,6 +3,7 @@ const { Types: Compression } = require('../protocol/message/compression')
 const { requests, lookup, selectVersion } = require('../protocol/requests')
 const { partitionResults } = require('../protocol/requests/produce/partitionResults')
 const { NO_TOPIC_ID } = require('../protocol/requests/topicIds')
+const { assertSameProtocol } = require('../protocol/requests/groupProtocolCheck')
 const { KafkaJSNonRetriableError, KafkaJSServerDoesNotSupportApiKey } = require('../errors')
 const apiKeys = require('../protocol/requests/apiKeys')
 const { GROUP_STATES, GROUP_TYPES, toDisplayName } = require('../protocol/groupTypes')
@@ -940,6 +941,8 @@ module.exports = class Broker {
    * @param {Array} request.groupProtocols List of protocols that the member supports (assignment strategy)
    *                                [{ name: 'AssignerName', metadata: '{"version": 1, "topics": []}' }]
    * @returns {Promise}
+   * @throws {KafkaJSProtocolError} INCONSISTENT_GROUP_PROTOCOL when the coordinator reports a
+   *   protocol type (JoinGroup v7 and later) other than `protocolType`; a null report is accepted
    */
   async joinGroup({
     groupId,
@@ -964,30 +967,51 @@ module.exports = class Broker {
         })
       )
 
+    let response
     try {
-      return await makeRequest()
+      response = await makeRequest()
     } catch (error) {
-      if (error.name === 'KafkaJSMemberIdRequired') {
-        return makeRequest(error.memberId)
+      if (error.name !== 'KafkaJSMemberIdRequired') {
+        throw error
       }
 
-      throw error
+      response = await makeRequest(error.memberId)
     }
+
+    assertSameProtocol(response.protocolType, protocolType)
+    return response
   }
 
   /**
+   * Removes members from a group. Two forms:
+   *
+   * - one member, `{ groupId, memberId, groupInstanceId, reason }`, which throws the first
+   *   member's error (the consumer's own leave relies on it), and
+   * - several, `{ groupId, members: [{ memberId, groupInstanceId, reason }] }`, which resolves
+   *   every member's own code and throws only for a top-level error. A static member can be named
+   *   by its instance id alone, with `memberId: ''`.
+   *
+   * `reason` is sent from LeaveGroup v5 (KIP-800) and dropped below it; the coordinator only logs it.
    * @public
    * @param {object} request
    * @param {string} request.groupId
-   * @param {string} request.memberId
-   * @param {string} [request.groupInstanceId=null] Static membership id (KIP-345). A static member
-   *                                does not send LeaveGroup on a normal shutdown (see
-   *                                `Runner#stop`); this is only reached for an explicit leave.
-   * @returns {Promise}
+   * @param {string} [request.memberId]
+   * @param {string} [request.groupInstanceId=null] Static membership id (KIP-345). A classic static
+   *                                member sends no LeaveGroup on a normal shutdown (see
+   *                                `Runner#stop`); this is reached for an explicit leave.
+   * @param {string} [request.reason] why the member leaves
+   * @param {{ memberId: string, groupInstanceId?: string|null, reason?: string|null }[]} [request.members]
+   *   the batch form; when given, the single-member fields are ignored
+   * @returns {Promise<{ throttleTime: number, clientSideThrottleTime: number, errorCode: number,
+   *   members: { memberId: string, groupInstanceId: string|null, errorCode: number }[] }>} the
+   *   decoded answer at v3 and later (v0 to v2 answer `{ throttleTime, errorCode }`)
+   * @throws {KafkaJSProtocolError} the first member's error (single form), or any top-level error
    */
-  async leaveGroup({ groupId, memberId, groupInstanceId }) {
+  async leaveGroup({ groupId, memberId, groupInstanceId, reason, members }) {
     const leaveGroup = this.lookupRequest(apiKeys.LeaveGroup, requests.LeaveGroup)
-    return await this[PRIVATE.SEND_REQUEST](leaveGroup({ groupId, memberId, groupInstanceId }))
+    return await this[PRIVATE.SEND_REQUEST](
+      leaveGroup({ groupId, memberId, groupInstanceId, reason, members })
+    )
   }
 
   /**
@@ -1007,6 +1031,8 @@ module.exports = class Broker {
    * @param {number} [request.rebalanceTimeout] Used to derive the SyncGroup request timeout
    * @returns {Promise} The request goes out at v5 only when both `protocolType` and `protocolName`
    *   are given (a coordinator refuses a v5 request with either null); otherwise it is capped at v4.
+   * @throws {KafkaJSProtocolError} INCONSISTENT_GROUP_PROTOCOL when the coordinator reports a
+   *   protocol type or name other than the one sent; a null report is accepted
    */
   async syncGroup({
     groupId,
@@ -1024,7 +1050,7 @@ module.exports = class Broker {
       requests.SyncGroup,
       protocolType != null && protocolName != null ? undefined : SYNC_GROUP_NO_PROTOCOL_MAX_VERSION
     )
-    return await this[PRIVATE.SEND_REQUEST](
+    const response = await this[PRIVATE.SEND_REQUEST](
       syncGroup({
         groupId,
         generationId,
@@ -1037,6 +1063,10 @@ module.exports = class Broker {
         rebalanceTimeout,
       })
     )
+
+    assertSameProtocol(response.protocolType, protocolType)
+    assertSameProtocol(response.protocolName, protocolName)
+    return response
   }
 
   /**

@@ -9,6 +9,15 @@ const {
 const { EAGER, COOPERATIVE } = require('./interface')
 const { stampGeneration } = require('../rebalanceErrorContract')
 
+/** The protocol type of every consumer group, sent on JoinGroup. */
+const PROTOCOL_TYPE = 'consumer'
+
+/**
+ * What the coordinator logs when the consumer leaves; the Java client sends the same text.
+ * @see https://github.com/apache/kafka/blob/4.3.1/clients/src/main/java/org/apache/kafka/clients/consumer/internals/AbstractCoordinator.java
+ */
+const LEAVE_REASON = 'the consumer is being closed'
+
 /**
  * Membership over the classic JoinGroup/SyncGroup protocol.
  *
@@ -70,6 +79,7 @@ module.exports = class ClassicGroupProtocol {
     this.memberId = null
     this.members = null
     this.groupProtocol = null
+    this.protocolType = null
     this.lastRequest = Date.now()
     this.staticMembershipInactiveWarned = false
 
@@ -221,6 +231,7 @@ module.exports = class ClassicGroupProtocol {
         rebalanceTimeout,
         memberId: this.memberId || '',
         groupInstanceId,
+        protocolType: PROTOCOL_TYPE,
         groupProtocols: this.assigners.map((assigner) =>
           this.subscriptionFor(assigner, topicsSubscribed)
         ),
@@ -238,6 +249,7 @@ module.exports = class ClassicGroupProtocol {
     this.memberId = groupData.memberId
     this.members = groupData.members
     this.groupProtocol = groupData.groupProtocol
+    this.protocolType = groupData.protocolType
     // JoinGroup v5's response carries no group_instance_id for this member: it only appears
     // per-entry in `members`, populated for the leader. `this.groupInstanceId` is the value the
     // caller configured and must not be overwritten with undefined here.
@@ -288,6 +300,7 @@ module.exports = class ClassicGroupProtocol {
       memberId,
       members,
       groupProtocol,
+      protocolType,
       coordinator,
       sessionTimeout,
       rebalanceTimeout,
@@ -332,6 +345,8 @@ module.exports = class ClassicGroupProtocol {
       generationId,
       memberId,
       groupInstanceId,
+      protocolType,
+      protocolName: groupProtocol,
       groupAssignment: assignment,
       sessionTimeout,
       rebalanceTimeout,
@@ -439,11 +454,21 @@ module.exports = class ClassicGroupProtocol {
     }
   }
 
-  /** @returns {Promise<void>} */
+  /**
+   * Leaves the group with the reason `the consumer is being closed` (sent from LeaveGroup v5),
+   * then forgets the member id and the assigners' retained state. Sends nothing without a member id.
+   * @returns {Promise<void>}
+   * @throws {import('../../errors').KafkaJSProtocolError} the coordinator's error for this member
+   */
   async leave() {
     const { groupId, memberId, groupInstanceId } = this
     if (memberId) {
-      await this.coordinator.leaveGroup({ groupId, memberId, groupInstanceId })
+      await this.coordinator.leaveGroup({
+        groupId,
+        memberId,
+        groupInstanceId,
+        reason: LEAVE_REASON,
+      })
       this.memberId = null
     }
 
@@ -462,6 +487,7 @@ module.exports = class ClassicGroupProtocol {
     this.leaderId = null
     this.members = null
     this.groupProtocol = null
+    this.protocolType = null
     this.ownedPartitions = []
 
     if (clearMemberId) {

@@ -751,6 +751,11 @@ says so, `groupProtocol: 'consumer'`.
   which a deleted and recreated topic answers, is retried after a metadata refresh. Kafka 4.0 and
   4.1 do not advertise v10, so nothing changes there, and the classic protocol and the admin client
   keep sending topic names. *What to do:* nothing.
+- **JoinGroup v7 and SyncGroup v5 check the protocol the coordinator reports.** A coordinator that
+  answers a join with a protocol type other than the one the consumer sent (`consumer`), or a sync
+  with a protocol type or name other than the join's, now fails the rebalance with
+  `INCONSISTENT_GROUP_PROTOCOL` (23, not retriable). A correct broker never does. *What to do:*
+  nothing.
 
 ### Admin
 
