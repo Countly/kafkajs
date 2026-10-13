@@ -12,6 +12,7 @@ const {
   KafkaJSTransactionAbortableError,
 } = require('../errors')
 const { IN_TRANSACTION, isArmed } = require('./eosManager/transactionStates')
+const TransactionState = require('./state/transactionState')
 
 const { values, keys } = Object
 const eventNames = values(events)
@@ -36,6 +37,14 @@ const ongoingTransactionError = () =>
  */
 const endedTransactionError = () =>
   new KafkaJSNonRetriableError('Cannot continue to use transaction once ended')
+
+/**
+ * The code a warning names for a failed commit: the error's own, or else its cause's, which is the
+ * Kafka error code of the answer an armed error wraps.
+ * @param {Error} error
+ * @returns {number|string|undefined}
+ */
+const codeOf = (error) => error.code ?? error.cause?.code
 
 /**
  * The accumulator's defaults: the Java client's 4.x `linger.ms` and `batch.size`.
@@ -153,6 +162,31 @@ const createProducer = ({
 
   let transactionalEosManager
   let transactionalMessageProducer
+  /**
+   * @type {Promise<void>|null} the commit under way - a transaction's `commit()`, or the one
+   *   `disconnect()` sends again - which a further `commit()` and `disconnect()` join; only one
+   *   transaction can be committing at a time
+   */
+  let committing = null
+  /**
+   * @type {() => void} ends the last transaction object; called when the next transaction begins,
+   *   because a commit `disconnect()` settled never ran through that object
+   */
+  let endPrevious = () => {}
+
+  /**
+   * Makes `commit` the commit under way until it settles.
+   * @param {Promise<void>} commit
+   * @returns {Promise<void>} commit
+   */
+  const joinable = (commit) => {
+    committing = commit
+    const settled = () => {
+      committing = null
+    }
+    commit.then(settled, settled)
+    return commit
+  }
 
   /** @type {import("../../types").Producer["on"]} */
   const on = (eventName, listener) => {
@@ -186,11 +220,20 @@ const createProducer = ({
    * `producer.transaction()` rejects with it until the transaction is aborted. `commit()` and
    * `abort()` first wait for every send and `sendOffsets` of the transaction to settle, as the Java
    * producer flushes before it commits; `abort()` rejects the batches still queued first.
+   *
+   * A `commit()` whose outcome is unknown rejects with the last retriable error and leaves the
+   * commit pending: calling `commit()` again sends it again, and meanwhile `send`, `sendBatch`,
+   * `sendOffsets`, `abort()` and `producer.transaction()` throw a `KafkaJSNonRetriableError` saying
+   * so. A `commit()` called while another is under way joins it, as the Java producer hands a
+   * repeated `commitTransaction()` the result already pending.
    * @see https://cwiki.apache.org/confluence/display/KAFKA/KIP-1050%3A+Consistent+error+handling+for+Transactions
+   * @see https://github.com/apache/kafka/blob/4.3/clients/src/main/java/org/apache/kafka/clients/producer/internals/TransactionManager.java
    * @returns {Promise<Transaction>}
    * @throws {import('../errors').KafkaJSTransactionAbortableError} while the previous transaction
    *   is abort-only
    * @throws {import('../errors').KafkaJSApplicationRecoverableError} once the producer is unusable
+   * @throws {import('../errors').KafkaJSNonRetriableError} while the previous transaction's commit
+   *   is pending
    *
    * @typedef {Object} Transaction
    * @property {Function} send  Identical to the producer "send" method
@@ -256,6 +299,10 @@ const createProducer = ({
     const { send: sendTxn, sendBatch: sendBatchTxn } = transactionalMessageProducer
 
     let transactionDidEnd = false
+    endPrevious()
+    endPrevious = () => {
+      transactionDidEnd = true
+    }
     /** @type {Promise<void>|null} the last `commit()` or `abort()` called; the next one waits for it */
     let ending = null
     /** @type {Set<Promise<unknown>>} the sends and `sendOffsets` not settled yet */
@@ -276,12 +323,14 @@ const createProducer = ({
 
     /**
      * Wraps `send`, `sendBatch` or `sendOffsets`: refused once the transaction has ended, with the
-     * armed error while it can only be aborted or the producer is unusable, and once it is ending.
+     * armed error while it can only be aborted or the producer is unusable, while its commit is
+     * pending, and once it is ending.
+     * @param {string} method the name the pending-commit error gives the call
      * @param {Function} fn
      * @returns {Function}
      */
     const transactionGuard =
-      (fn) =>
+      (method, fn) =>
       (...args) => {
         if (transactionDidEnd) {
           return Promise.reject(endedTransactionError())
@@ -289,6 +338,9 @@ const createProducer = ({
         const state = stateManager.state()
         if (isArmed(state)) {
           return Promise.reject(stateManager.transaction.armedError())
+        }
+        if (stateManager.transaction.commitPending()) {
+          return Promise.reject(TransactionState.pendingCommitError(method))
         }
         if (ending !== null || state !== IN_TRANSACTION) {
           return Promise.reject(endedTransactionError())
@@ -321,8 +373,8 @@ const createProducer = ({
     const isActive = () => transactionalEosManager.isInTransaction() && !transactionDidEnd
 
     return {
-      sendBatch: transactionGuard(sendBatchTxn),
-      send: transactionGuard(sendTxn),
+      sendBatch: transactionGuard('sendBatch', sendBatchTxn),
+      send: transactionGuard('send', sendTxn),
       /**
        * Abort the ongoing transaction: rejects the batches still queued - accumulated ones
        * included - waits for the rest of the transaction's operations, then aborts it. It ends the
@@ -355,16 +407,29 @@ const createProducer = ({
       /**
        * Commit the ongoing transaction, once every send and `sendOffsets` of it has settled. The
        * transaction's accumulated batches are sent at once rather than after their `linger`, and so
-       * is every batch its sends form until the commit ends.
+       * is every batch its sends form until the commit ends. A call made while the commit is under
+       * way joins it: one EndTxn, and the same outcome for both.
        *
        * @throws {KafkaJSNonRetriableError} If transaction has ended
        * @throws {import('../errors').KafkaJSTransactionAbortableError} the armed error, when an
        *   operation of the transaction failed; nothing is sent to the broker then
+       * @throws {Error} the last retriable error itself (`retriable: true`) when the commit's
+       *   outcome is unknown: call `commit()` again, which sends it again
+       * @throws {import('../errors').KafkaJSApplicationRecoverableError} when the commit sent again
+       *   finds the transaction aborted by the coordinator on its timeout: `INVALID_TXN_STATE` (48)
+       *   or `PRODUCER_FENCED` (90), depending on the transaction version and on whether the broker
+       *   has KAFKA-20785 (fixed in 4.3.2 and 4.5.0); replace the producer
        */
       commit: () => {
-        const ended = endWith(() => transactionalEosManager.commit())
-        transactionalMessageProducer.flush(ended)
-        return ended
+        if (transactionDidEnd) {
+          return Promise.reject(endedTransactionError())
+        }
+        if (committing === null) {
+          transactionalMessageProducer.flush(
+            joinable(endWith(() => transactionalEosManager.commit()))
+          )
+        }
+        return committing
       },
       /**
        * Sends a list of specified offsets to the consumer group coordinator, and also marks those
@@ -376,26 +441,29 @@ const createProducer = ({
        * @throws {KafkaJSNonRetriableError} If transaction has ended, or when both or neither of
        *   `consumerGroupMetadata` and `consumerGroupId` are given
        */
-      sendOffsets: transactionGuard(async ({ consumerGroupMetadata, consumerGroupId, topics }) => {
-        await transactionalEosManager.sendOffsets({
-          consumerGroupMetadata,
-          consumerGroupId,
-          topics,
-        })
-        const groupId = consumerGroupId ?? consumerGroupMetadata.groupId
+      sendOffsets: transactionGuard(
+        'sendOffsets',
+        async ({ consumerGroupMetadata, consumerGroupId, topics }) => {
+          await transactionalEosManager.sendOffsets({
+            consumerGroupMetadata,
+            consumerGroupId,
+            topics,
+          })
+          const groupId = consumerGroupId ?? consumerGroupMetadata.groupId
 
-        for (const topicOffsets of topics) {
-          const { topic, partitions } = topicOffsets
-          for (const { partition, offset } of partitions) {
-            cluster.markOffsetAsCommitted({
-              groupId,
-              topic,
-              partition,
-              offset,
-            })
+          for (const topicOffsets of topics) {
+            const { topic, partitions } = topicOffsets
+            for (const { partition, offset } of partitions) {
+              cluster.markOffsetAsCommitted({
+                groupId,
+                topic,
+                partition,
+                offset,
+              })
+            }
           }
         }
-      }),
+      ),
       isActive,
     }
   }
@@ -404,6 +472,42 @@ const createProducer = ({
    * @returns {Object} logger
    */
   const getLogger = () => logger
+
+  /**
+   * Settles the transaction's commit before the connections close, as the Java producer's close
+   * lets a transaction that is completing finish. It waits, in order, for the commit `disconnect()`
+   * found under way when it began (one that ended pending is not sent again), else for the commit
+   * under way now (a concurrent `disconnect()`'s resend), else sends a pending commit once more,
+   * through one more retry budget; with none of them it sends nothing. An outcome still unknown, or
+   * an answer that fails the commit, is logged as a warning naming the transactional id and the
+   * error's code; the coordinator decides an unknown outcome, and an answer that makes the producer
+   * unusable leaves it so.
+   * @see https://github.com/apache/kafka/blob/4.3/clients/src/main/java/org/apache/kafka/clients/producer/internals/Sender.java
+   * @param {Promise<void>|null} joined the commit under way when `disconnect()` began
+   * @returns {Promise<void>} never rejects
+   */
+  const settleCommit = async (joined) => {
+    const commit =
+      joined ??
+      committing ??
+      (transactionalEosManager?.stateManager.transaction.commitPending()
+        ? joinable(transactionalEosManager.commit())
+        : null)
+    if (commit === null) {
+      return
+    }
+
+    try {
+      await commit
+    } catch (error) {
+      logger.warn(
+        error.retriable
+          ? 'Disconnecting with the commit unconfirmed; the transaction coordinator completes or aborts the transaction'
+          : 'The commit failed while the producer was disconnecting',
+        { transactionalId, code: codeOf(error), error: error.message }
+      )
+    }
+  }
 
   /**
    * Delivers every accumulated batch, the producer's own and its transaction's, while every send
@@ -437,11 +541,21 @@ const createProducer = ({
     /**
      * Disconnects the producer. It first delivers every batch still lingering, its own and its
      * transaction's, and the sends begun before it, refusing new sends meanwhile; nothing
-     * accumulated is lost.
+     * accumulated is lost. A transaction's commit under way when it begins is waited for, and not
+     * sent again if it ends pending; a pending one that is not under way is sent once more first.
+     * It then waits for any commit another `disconnect()` sends, and for every commit the
+     * application starts while it waits, so the connections never close while a commit is under
+     * way; each such commit extends the wait. The call resolves whatever they answer.
      * @return {Promise}
      */
     disconnect: async () => {
+      const joined = committing
       await deliverAccumulated()
+      await settleCommit(joined)
+      // eslint-disable-next-line no-unmodified-loop-condition -- joinable() clears it while the loop awaits
+      while (committing !== null) {
+        await committing.catch(() => {})
+      }
       await cluster.disconnect()
       connectionStatus = CONNECTION_STATUS.DISCONNECTED
       instrumentationEmitter.emit(DISCONNECT)

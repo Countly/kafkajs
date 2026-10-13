@@ -1,5 +1,6 @@
 const createRetry = require('../../retry')
 const {
+  KafkaJSDeliveryTimeout,
   KafkaJSError,
   KafkaJSInvariantViolation,
   KafkaJSNonRetriableError,
@@ -53,6 +54,22 @@ const surfaceInTransaction = (error) => {
 
   return error
 }
+
+/**
+ * The error a commit whose `EndTxn` outcome is unknown rejects with: the last retriable error of a
+ * request whose retries ran out, or whose `retry.maxTotalTime` passed, unwrapped from the retrier's
+ * error - a timed-out request, a lost connection, a retriable answer. The coordinator may have
+ * committed, so the commit is to be sent again, as the Java producer's `commitTransaction()` is
+ * retried after a timeout.
+ * @see https://github.com/apache/kafka/blob/4.3/clients/src/main/java/org/apache/kafka/clients/producer/KafkaProducer.java
+ * @param {Error} error what the `EndTxn` retrier rejected with
+ * @returns {Error|null} null for an error that settles the commit
+ */
+const unknownOutcome = (error) =>
+  (error instanceof KafkaJSNumberOfRetriesExceeded || error instanceof KafkaJSDeliveryTimeout) &&
+  error.cause?.retriable === true
+    ? error.cause
+    : null
 
 /**
  * The consumer group a transactional offset commit is for: the membership `consumerGroupMetadata`
@@ -131,9 +148,8 @@ const createEosManager = ({
     transactionalId,
     transactionTimeout,
     retry,
-    // Asks for no metadata first: a Metadata request for every topic fails on any leaderless
-    // partition in the cluster. As in the Java producer, a non-transactional InitProducerId goes
-    // to any connected broker, and a transactional one to its coordinator.
+    // Asks for no metadata first, as the Java producer: a non-transactional InitProducerId goes to
+    // any connected broker, and a transactional one to its coordinator.
     findBroker: () =>
       transactional ? findTransactionCoordinator() : cluster.findConnectedBroker(),
     addPartitionsToTxn: async (topics) => {
@@ -248,7 +264,9 @@ const createEosManager = ({
    * epoch it returns (KIP-890), which restarts every sequence. A transaction that never produced
    * and never sent offsets ends locally with no EndTxn, under either version. No EndTxn goes out
    * while a batch is in flight, as the Java producer holds it until every batch completed: the
-   * caller waited for the transaction's sends, so only a fault in the send loop leaves one.
+   * caller waited for the transaction's sends, so only a fault in the send loop leaves one. The
+   * coordinator is looked up again on every attempt, and a lookup whose own retries ran out ends
+   * the attempts with that error as it is.
    * @see https://github.com/apache/kafka/blob/4.3/clients/src/main/java/org/apache/kafka/clients/producer/internals/TransactionManager.java
    * @param {boolean} committed
    * @returns {Promise<boolean>} whether a new producer id and epoch were adopted
@@ -268,8 +286,8 @@ const createEosManager = ({
 
     const transactionVersion = stateManager.transactionVersion()
     const ended = await retrier(async (bail) => {
-      const coordinator = await findTransactionCoordinator()
       try {
+        const coordinator = await findTransactionCoordinator()
         return await coordinator.endTxn({
           producerId: stateManager.producerId,
           producerEpoch: stateManager.producerEpoch,
@@ -440,9 +458,22 @@ const createEosManager = ({
      * caller waits for the transaction's own sends first: nothing of it may still be in flight. A
      * partition whose sequence is still unresolved - a batch the broker may or may not hold - makes
      * the transaction abort-only first, so no EndTxn commits over it.
+     *
+     * An EndTxn whose outcome is unknown - its retries ran out on a retriable answer, a timeout or
+     * a lost connection - leaves the commit pending: the transaction stays `COMMITTING` and the
+     * next `commit()` sends the same EndTxn again, with the same producer id and epoch. A commit
+     * that had landed is answered with success then (under transaction version 2 with the epoch to
+     * adopt); one the coordinator aborted on its timeout meanwhile is refused with
+     * `INVALID_TXN_STATE` (48) or `PRODUCER_FENCED` (90), depending on the transaction version and
+     * on whether the broker has KAFKA-20785 (fixed in 4.3.2 and 4.5.0), which makes the producer
+     * unusable.
+     * @see https://github.com/apache/kafka/blob/4.3/core/src/main/scala/kafka/coordinator/transaction/TransactionCoordinator.scala
      * @returns {Promise<void>}
+     * @throws {Error} the last retriable error itself (`retriable: true`) when the outcome is
+     *   unknown; the commit is pending
      * @throws {import('../../errors').KafkaJSTransactionAbortableError} the armed error when the
-     *   transaction can only be aborted; a failed EndTxn arms `ABORTABLE_ERROR` and rejects with it
+     *   transaction can only be aborted; an abortable EndTxn answer arms `ABORTABLE_ERROR` and
+     *   rejects with it
      * @throws {import('../../errors').KafkaJSApplicationRecoverableError} the armed error once the
      *   producer is unusable, a fatal EndTxn answer included
      */
@@ -457,6 +488,11 @@ const createEosManager = ({
       try {
         await endTransaction(true)
       } catch (error) {
+        const unknown = unknownOutcome(error)
+        if (unknown !== null) {
+          stateManager.transaction.holdCommit()
+          throw unknown
+        }
         throw armWith(error)
       }
 

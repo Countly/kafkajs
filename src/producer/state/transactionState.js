@@ -25,7 +25,10 @@ const TRANSITIONS = {
   [FATAL_ERROR]: [],
 }
 
-/** Where each guarded call is legal; in an error state `guard()` decides first. */
+/**
+ * Where each guarded call is legal; in an error state `guard()` decides first, and while a commit
+ * is pending, `commit` alone is legal, in `COMMITTING`.
+ */
 const LEGAL_STATES = {
   initProducerId: [UNINITIALIZED, READY],
   beginTransaction: [READY],
@@ -42,12 +45,30 @@ const LEGAL_STATES = {
  * `ABORTABLE_ERROR` admits `abort()` alone; every other call throws the armed error, a
  * `KafkaJSTransactionAbortableError`. `FATAL_ERROR` is terminal: every call throws the armed
  * `KafkaJSApplicationRecoverableError`, which tells the caller to create a new producer.
+ *
+ * A commit whose outcome is unknown stays `COMMITTING` with its commit pending: `commit()` alone is
+ * legal, and sends it again along the one edge that exists only then, `COMMITTING` to `COMMITTING`;
+ * every other call throws an error saying so, as the Java producer refuses any other operation until
+ * a timed-out `commitTransaction()` is retried. Leaving `COMMITTING`, or arming an error state,
+ * settles it.
  * @see https://github.com/apache/kafka/blob/4.3/clients/src/main/java/org/apache/kafka/clients/producer/internals/TransactionManager.java
  * @see https://cwiki.apache.org/confluence/display/KAFKA/KIP-1050%3A+Consistent+error+handling+for+Transactions
  */
 class TransactionState {
   #state = UNINITIALIZED
   #armed = null
+  #commitPending = false
+
+  /**
+   * The error every call but `commit()` throws while a commit is pending.
+   * @param {string} method the call refused
+   * @returns {KafkaJSNonRetriableError}
+   */
+  static pendingCommitError(method) {
+    return new KafkaJSNonRetriableError(
+      `Transaction state exception: Cannot call "${method}" while a commit is pending: commit() did not complete; call commit() again`
+    )
+  }
 
   /**
    * @returns {import('../eosManager/transactionStates').State}
@@ -57,14 +78,26 @@ class TransactionState {
   }
 
   /**
-   * Moves along one of the machine's edges, and forgets any armed error.
+   * Whether a commit whose outcome is unknown waits to be sent again; until it settles only
+   * `commit()` is legal.
+   * @returns {boolean}
+   */
+  commitPending() {
+    return this.#commitPending
+  }
+
+  /**
+   * Moves along one of the machine's edges, and forgets any armed error. `COMMITTING` to
+   * `COMMITTING`, the resend of a pending commit, is an edge only while the commit is pending, and
+   * keeps it pending; any other edge settles it.
    * @param {import('../eosManager/transactionStates').State} state
    * @returns {void}
    * @throws {KafkaJSNonRetriableError} for any other edge, naming both states; the error states
    *   are reached through `armAbortable()` and `armFatal()`, never here
    */
   transitionTo(state) {
-    if (!TRANSITIONS[this.#state].includes(state)) {
+    const resend = this.#commitPending && state === COMMITTING
+    if (!resend && !TRANSITIONS[this.#state].includes(state)) {
       throw new KafkaJSNonRetriableError(
         `Transaction state exception: Invalid transition ${this.#state} --> ${state}`
       )
@@ -72,6 +105,21 @@ class TransactionState {
 
     this.#state = state
     this.#armed = null
+    this.#commitPending = resend
+  }
+
+  /**
+   * Leaves the commit under way pending: its `EndTxn` outcome is unknown, so it may have landed,
+   * and only `commit()`, which sends it again, may follow.
+   * @returns {void}
+   * @throws {KafkaJSInvariantViolation} outside `COMMITTING`
+   */
+  holdCommit() {
+    if (this.#state !== COMMITTING) {
+      throw new KafkaJSInvariantViolation(`No commit to hold in state "${this.#state}"`)
+    }
+
+    this.#commitPending = true
   }
 
   /**
@@ -81,7 +129,8 @@ class TransactionState {
    * @throws {KafkaJSApplicationRecoverableError} the armed error, in `FATAL_ERROR`
    * @throws {KafkaJSTransactionAbortableError} the armed error, for anything but `abort` in
    *   `ABORTABLE_ERROR`
-   * @throws {KafkaJSNonRetriableError} when the call is not legal in the current state, naming it
+   * @throws {KafkaJSNonRetriableError} for anything but `commit` while a commit is pending, saying
+   *   so; when the call is not legal in the current state, naming it
    * @throws {KafkaJSInvariantViolation} for a method the machine does not guard
    */
   guard(method) {
@@ -91,6 +140,14 @@ class TransactionState {
 
     if (this.#state === FATAL_ERROR || (this.#state === ABORTABLE_ERROR && method !== 'abort')) {
       throw this.#armed
+    }
+
+    if (this.#commitPending) {
+      if (method === 'commit') {
+        return
+      }
+
+      throw TransactionState.pendingCommitError(method)
     }
 
     if (!LEGAL_STATES[method].includes(this.#state)) {
@@ -134,6 +191,7 @@ class TransactionState {
             { cause: error }
           )
     this.#state = ABORTABLE_ERROR
+    this.#commitPending = false
   }
 
   /**
@@ -156,6 +214,7 @@ class TransactionState {
             { cause: error }
           )
     this.#state = FATAL_ERROR
+    this.#commitPending = false
   }
 
   /**

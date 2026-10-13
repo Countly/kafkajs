@@ -2,6 +2,7 @@ const Broker = require('../../broker')
 const { Kafka, logLevel } = require('../../../index')
 const {
   KafkaJSApplicationRecoverableError,
+  KafkaJSNonRetriableError,
   KafkaJSNumberOfRetriesExceeded,
   KafkaJSProtocolError,
   KafkaJSTransactionAbortableError,
@@ -72,8 +73,13 @@ const PRODUCTION_RETRY = {
   maxRetryTime: 30000,
   factor: 0.2,
 }
+// Short enough for the coordinator to abort an open transaction within the scenario: it checks for
+// timed-out transactions every 10 s (`transaction.abort.timed.out.transaction.cleanup.interval.ms`).
+const SHORT_TRANSACTION_TIMEOUT_MS = 2000
+const COORDINATOR_ABORT_BUDGET = { attempts: 120, delay: 250 } // 30 s
 const REQUEST_TIMED_OUT = 7
 const INVALID_TXN_STATE = 48
+const PRODUCER_FENCED = 90
 // The broker the abortable-send scenario stops, and its node id; kafka1 stays up as the bootstrap.
 const STOPPED_SERVICE = 'kafka3'
 const STOPPED_NODE = 3
@@ -82,21 +88,30 @@ const STOPPED_NODE = 3
  * Live proof of transaction recovery: a producer killed between a resolved Produce and its EndTxn
  * leaves a transaction the next owner's InitProducerId aborts, so its records never become
  * visible; a send that fails for good inside a transaction makes it abort-only and the same
- * producer carries on after `abort()`; a commit whose EndTxn answers were lost is ambiguous; and a
- * takeover of an abandoned transaction under the production retry defaults, against both a short
- * and the default transaction timeout. The coordinator writes its own state with the
- * transaction's timeout as the write timeout, so a very short one can leave an abort pending.
+ * producer carries on after `abort()`; a commit whose EndTxn answers were lost is pending, refuses
+ * `abort()`, and completes when it is sent again, and one that never reached the coordinator before
+ * it aborted the transaction on its timeout is refused when it is sent again; and a takeover of an
+ * abandoned transaction under the production retry defaults, against both a short and the default
+ * transaction timeout. The coordinator writes its own state with the transaction's timeout as the
+ * write timeout, so a very short one can leave an abort pending.
  * @see https://cwiki.apache.org/confluence/display/KAFKA/KIP-98+-+Exactly+Once+Delivery+and+Transactional+Messaging
  * @see https://github.com/apache/kafka/blob/4.3.1/core/src/main/scala/kafka/coordinator/transaction/TransactionStateManager.scala
+ * @see https://github.com/apache/kafka/blob/4.3/core/src/main/scala/kafka/coordinator/transaction/TransactionCoordinator.scala
+ * @see https://issues.apache.org/jira/browse/KAFKA-20785
  * @see https://issues.apache.org/jira/browse/KAFKA-16047
  */
 describeRestart('Producer > transaction recovery (live)', () => {
   /** @type {{ transactionalId: string, error: string|null }[]} every InitProducerId answered */
   const initializations = []
-  /** @type {{ transactionResult: boolean }[]} every EndTxn sent */
+  /**
+   * @type {{ transactionalId: string, transactionResult: boolean, producerEpoch: number,
+   *   answeredEpoch?: number }[]} every EndTxn sent, and the epoch its answer carried
+   */
   const ends = []
   /** When set, an EndTxn commit that the coordinator accepted is reported as timed out instead. */
   let loseCommitAnswers = false
+  /** When set, an EndTxn commit is reported as timed out without reaching the coordinator. */
+  let dropCommits = false
   /** The cluster's finalized transaction version, recorded with the evidence. */
   let cluster
   let kafka
@@ -117,9 +132,15 @@ describeRestart('Producer > transaction recovery (live)', () => {
       }
     })
     jest.spyOn(Broker.prototype, 'endTxn').mockImplementation(async function (request) {
-      ends.push({ transactionResult: request.transactionResult })
+      const { transactionalId, transactionResult, producerEpoch } = request
+      const record = { transactionalId, transactionResult, producerEpoch }
+      ends.push(record)
+      if (dropCommits && transactionResult) {
+        throw new KafkaJSProtocolError(createErrorFromCode(REQUEST_TIMED_OUT))
+      }
       const response = await endTxn.call(this, request)
-      if (loseCommitAnswers && request.transactionResult) {
+      record.answeredEpoch = response.producerEpoch
+      if (loseCommitAnswers && transactionResult) {
         throw new KafkaJSProtocolError(createErrorFromCode(REQUEST_TIMED_OUT))
       }
       return response
@@ -134,6 +155,7 @@ describeRestart('Producer > transaction recovery (live)', () => {
     initializations.length = 0
     ends.length = 0
     loseCommitAnswers = false
+    dropCommits = false
     child = null
     kafka = new Kafka({
       clientId: `e2e-p7-transaction-restart-${secureRandom()}`,
@@ -195,10 +217,7 @@ describeRestart('Producer > transaction recovery (live)', () => {
     return client
   }
 
-  /**
-   * How many brokers `admin` sees in the cluster's metadata; 0 while it cannot be read. It asks
-   * about every topic, so it also reads 0 while any partition has no leader.
-   */
+  /** How many brokers `admin` sees in the cluster's metadata; 0 while it cannot be read. */
   const brokersUp = async (admin) => {
     try {
       return (await admin.describeCluster()).brokers.length
@@ -209,8 +228,8 @@ describeRestart('Producer > transaction recovery (live)', () => {
 
   /**
    * How many brokers `broker` names in a metadata answer for `topics` alone; 0 while it cannot be
-   * read. Used while a partition has no leader: an answer naming its topic - an all-topics one
-   * included - fails as a whole with LEADER_NOT_AVAILABLE.
+   * read. Used while a partition has no leader: an answer naming its topic fails as a whole with
+   * LEADER_NOT_AVAILABLE.
    * @param {Broker} broker
    * @param {string[]} topics
    * @returns {Promise<number>}
@@ -366,38 +385,127 @@ describeRestart('Producer > transaction recovery (live)', () => {
     SCENARIO_BUDGET_MS
   )
 
-  test(
-    'a commit whose EndTxn answers were lost rejects as abort-only although it committed, and the abort that follows is refused',
-    async () => {
-      const topic = `e2e-p7-transaction-restart-ambiguous-${secureRandom()}`
-      const transactionalId = `e2e-p7-transaction-restart-${secureRandom()}`
-      await createTopic({ topic })
-      const producer = await connected(kafka.producer({ transactionalId, retry: RETRY }))
-
-      const transaction = await producer.transaction()
-      await transaction.send({ topic, messages: records('committed') })
-      loseCommitAnswers = true
-      const commit = await outcomeOf(transaction.commit())
-      loseCommitAnswers = false
-      const abort = await outcomeOf(transaction.abort())
-      const values = await readCommitted(topic, RECORDS)
-
+  describe.each([
+    ['tv2', 2],
+    ['tv1', 1],
+  ])('a commit whose outcome is unknown, under transaction version %s', (arm, level) => {
+    /** Whether the cluster finalizes this arm's version; when not, records why the case did not run. */
+    const runsHere = (scenario) => {
+      if (cluster.level === level) {
+        return true
+      }
       writeEvidence(EVIDENCE, {
-        scenario: 'ambiguous-commit',
-        cluster,
-        commit: commit.error && { name: commit.error.name, cause: commit.error.cause?.name },
-        abort: abort.error && { name: abort.error.name, code: errorCodeOf(abort.error) },
-        ends,
-        values,
+        scenario,
+        arm,
+        skipped: `the cluster finalizes transaction.version ${cluster.level}`,
       })
-      expect(commit.error).toBeInstanceOf(KafkaJSTransactionAbortableError)
-      expect(commit.error.cause).toBeInstanceOf(KafkaJSNumberOfRetriesExceeded)
-      expect(values).toEqual(valuesOf('committed'))
-      expect(abort.error).toBeInstanceOf(KafkaJSApplicationRecoverableError)
-      expect(errorCodeOf(abort.error)).toBe(INVALID_TXN_STATE)
-    },
-    SCENARIO_BUDGET_MS
-  )
+      return false
+    }
+
+    test(
+      'with the EndTxn answers lost: commit() rejects retriable, abort() is refused, and commit() sent again completes it once',
+      async () => {
+        if (!runsHere('pending-commit')) return
+        const topic = `e2e-p8-pending-commit-${secureRandom()}`
+        const transactionalId = `e2e-p8-pending-commit-${secureRandom()}`
+        await createTopic({ topic })
+        const producer = await connected(kafka.producer({ transactionalId, retry: RETRY }))
+        const endsOf = () => ends.filter((end) => end.transactionalId === transactionalId)
+
+        const transaction = await producer.transaction()
+        await transaction.send({ topic, messages: records('committed') })
+        loseCommitAnswers = true
+        const commit = await outcomeOf(transaction.commit())
+        const abort = await outcomeOf(transaction.abort())
+        loseCommitAnswers = false
+        const retried = await outcomeOf(transaction.commit())
+        const [resent] = endsOf().slice(-1)
+        const next = await producer.transaction()
+        await next.send({ topic, messages: records('next', 1) })
+        await next.commit()
+        const [nextEnd] = endsOf().slice(-1)
+        const values = await readCommitted(topic, RECORDS + 1)
+
+        writeEvidence(EVIDENCE, {
+          scenario: 'pending-commit',
+          arm,
+          cluster,
+          commit: commit.error && {
+            name: commit.error.name,
+            retriable: commit.error.retriable,
+            code: errorCodeOf(commit.error),
+          },
+          abort: abort.error && { name: abort.error.name, message: abort.error.message },
+          retried: retried.error && retried.error.name,
+          ends: endsOf(),
+          values,
+        })
+        expect(commit.error.retriable).toBe(true)
+        expect(commit.error.type).toBe('REQUEST_TIMED_OUT')
+        expect(abort.error).toBeInstanceOf(KafkaJSNonRetriableError)
+        expect(abort.error.message).toMatch(/commit\(\) did not complete; call commit\(\) again/)
+        expect(retried.error).toBeNull()
+        expect(endsOf().every(({ transactionResult }) => transactionResult)).toBe(true)
+        expect(values).toEqual([...valuesOf('committed'), ...valuesOf('next', 1)].sort())
+        expect(nextEnd.producerEpoch).toBe(
+          level === 2 ? resent.answeredEpoch : resent.producerEpoch
+        )
+      },
+      SCENARIO_BUDGET_MS
+    )
+
+    test(
+      'with the EndTxn requests lost until the coordinator aborted the transaction on its timeout: commit() sent again is refused with 48 or 90, depending on the transaction version and on whether the broker has KAFKA-20785 (fixed in 4.3.2 and 4.5.0), and the producer is unusable',
+      async () => {
+        if (!runsHere('pending-commit-timed-out')) return
+        const topic = `e2e-p8-pending-commit-${secureRandom()}`
+        await createTopic({ topic })
+        const admin = await connected(kafka.admin())
+        const producer = await connected(
+          kafka.producer({
+            transactionalId: `e2e-p8-pending-commit-${secureRandom()}`,
+            transactionTimeout: SHORT_TRANSACTION_TIMEOUT_MS,
+            retry: RETRY,
+          })
+        )
+
+        const transaction = await producer.transaction()
+        const [{ baseOffset }] = await transaction.send({ topic, messages: records('expired', 1) })
+        dropCommits = true
+        const commit = await outcomeOf(transaction.commit())
+        // The abort marker moves the end offset ListOffsets reads under read_committed past the record.
+        const timedOut = await waitForCondition(async () => {
+          const [{ high }] = await admin.fetchTopicOffsets(topic)
+          return Number(high) > Number(baseOffset)
+        }, COORDINATOR_ABORT_BUDGET)
+        dropCommits = false
+        const retried = await outcomeOf(transaction.commit())
+        const next = await outcomeOf(producer.transaction())
+
+        writeEvidence(EVIDENCE, {
+          scenario: 'pending-commit-timed-out',
+          arm,
+          cluster,
+          commit: commit.error && { name: commit.error.name, retriable: commit.error.retriable },
+          timedOut,
+          retried: retried.error && {
+            name: retried.error.name,
+            code: errorCodeOf(retried.error),
+          },
+        })
+        expect(commit.error.retriable).toBe(true)
+        expect(timedOut).toBe(true)
+        expect(retried.error).toBeInstanceOf(KafkaJSApplicationRecoverableError)
+        // Version 1 checks the epoch first, which the coordinator's abort bumped: 90. Version 2
+        // answers 48, or 90 on a broker with KAFKA-20785.
+        expect(level === 1 ? [PRODUCER_FENCED] : [INVALID_TXN_STATE, PRODUCER_FENCED]).toContain(
+          errorCodeOf(retried.error)
+        )
+        expect(next.error).toBe(retried.error)
+      },
+      SCENARIO_BUDGET_MS
+    )
+  })
 
   describe.each([
     ['100 ms', 100],

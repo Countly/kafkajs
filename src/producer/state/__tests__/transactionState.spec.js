@@ -150,6 +150,84 @@ describe('TransactionState', () => {
     }
   )
 
+  describe('a pending commit', () => {
+    /** A machine whose commit's outcome is unknown. */
+    const pending = () => {
+      const machine = reach(COMMITTING)
+      machine.holdCommit()
+      return machine
+    }
+
+    test('stays COMMITTING and admits commit() alone', () => {
+      const machine = pending()
+
+      expect(machine.state()).toEqual(COMMITTING)
+      expect(machine.commitPending()).toBe(true)
+      expect(() => machine.guard('commit')).not.toThrow()
+    })
+
+    test.each(METHODS.filter((method) => method !== 'commit'))(
+      '%s throws a KafkaJSNonRetriableError naming the pending commit',
+      (method) => {
+        const machine = pending()
+
+        expect(() => machine.guard(method)).toThrow(TransactionState.pendingCommitError(method))
+        expect(() => machine.guard(method)).toThrow(KafkaJSNonRetriableError)
+      }
+    )
+
+    test('says commit() did not complete and is to be called again', () => {
+      expect(TransactionState.pendingCommitError('abort').message).toEqual(
+        'Transaction state exception: Cannot call "abort" while a commit is pending: commit() did not complete; call commit() again'
+      )
+    })
+
+    test('COMMITTING --> COMMITTING sends it again, and keeps it pending', () => {
+      const machine = pending()
+
+      machine.transitionTo(COMMITTING)
+
+      expect(machine.state()).toEqual(COMMITTING)
+      expect(machine.commitPending()).toBe(true)
+    })
+
+    test('COMMITTING --> READY settles it, and the edge back to COMMITTING is gone', () => {
+      const machine = pending()
+
+      machine.transitionTo(READY)
+
+      expect(machine.commitPending()).toBe(false)
+      machine.transitionTo(IN_TRANSACTION)
+      machine.transitionTo(COMMITTING)
+      expect(() => machine.transitionTo(COMMITTING)).toThrow(
+        `Transaction state exception: Invalid transition ${COMMITTING} --> ${COMMITTING}`
+      )
+    })
+
+    test.each([
+      ['armAbortable', ABORTABLE_ERROR, TRANSACTION_ABORTABLE],
+      ['armFatal', FATAL_ERROR, PRODUCER_FENCED],
+    ])('%s settles it in %s', (arm, state, code) => {
+      const machine = pending()
+
+      machine[arm](createErrorFromCode(code))
+
+      expect(machine.state()).toEqual(state)
+      expect(machine.commitPending()).toBe(false)
+      expect(() => machine.guard('commit')).toThrow(machine.armedError())
+    })
+
+    test.each(ALL_STATES.filter((state) => state !== COMMITTING))(
+      'cannot be held in %s: a programming error',
+      (state) => {
+        const machine = reach(state)
+
+        expect(() => machine.holdCommit()).toThrow(KafkaJSInvariantViolation)
+        expect(machine.commitPending()).toBe(false)
+      }
+    )
+  })
+
   describe('ABORTABLE_ERROR', () => {
     test('admits abort() alone; every other call throws the armed abortable error', () => {
       const machine = reach(ABORTABLE_ERROR)

@@ -26,14 +26,24 @@ const transaction = await producer.transaction()
 
 try {
   await transaction.send({ topic, messages })
-
-  await transaction.commit()
 } catch (e) {
   await transaction.abort()
+  throw e
+}
+
+try {
+  await transaction.commit()
+} catch (e) {
+  if (!e.retriable) {
+    await transaction.abort()
+    throw e
+  }
+  // The commit's outcome is unknown and it may have landed: never abort it, commit again.
+  await transaction.commit()
 }
 ```
 
-`commit()` and `abort()` first wait for every `send`, `sendBatch` and `sendOffsets` of the transaction to settle, so a send you did not await is never left out of a commit; `abort()` rejects the sends still waiting to go out before it waits for the rest. Once `commit()` or `abort()` has been called, the transaction accepts no new sends; an `abort()` called while a `commit()` is under way waits for it, and ends the transaction only if the commit failed.
+`commit()` and `abort()` first wait for every `send`, `sendBatch` and `sendOffsets` of the transaction to settle, so a send you did not await is never left out of a commit; `abort()` rejects the sends still waiting to go out before it waits for the rest. Once `commit()` or `abort()` has been called, the transaction accepts no new sends. A `commit()` called while another is under way joins it: one `EndTxn`, and the same outcome for both. An `abort()` called while a `commit()` is under way waits for it: it ends the transaction if the commit failed with an `abortable` error, and is refused if the commit ended the transaction, left it [pending](#errors) or left the producer unusable (it then rejects with the same `KafkaJSApplicationRecoverableError` and sends no abort).
 
 ### Choosing a `transactionalId`
 
@@ -47,7 +57,7 @@ The simplest way to achieve this is to encode the topic and partition in the `tr
 
 `transactionTimeout` defaults to 60000 ms, as in the Java `KafkaProducer`. The 10 s often quoted for exactly-once processing is a Kafka Streams override, not a producer default. A consume-transform-produce loop may still want a lower value: while a crashed instance's transaction stays open, the offsets it sent hold back the consumer that takes its partitions over, until the transaction times out.
 
-A transaction left open longer than `transactionTimeout` is aborted by the transaction coordinator, which checks for timed-out transactions every 10 s by default (`transaction.abort.timed.out.transaction.cleanup.interval.ms`), and none of its records become visible. A `commit()` of it then rejects with `KafkaJSApplicationRecoverableError`. Its `abort()` resolves under transaction version 2, and the producer carries on; under version 1 the coordinator has fenced the producer's epoch, so `abort()` rejects with `KafkaJSApplicationRecoverableError` as well, and the producer has to be replaced.
+A transaction left open longer than `transactionTimeout` is aborted by the transaction coordinator, which checks for timed-out transactions every 10 s by default (`transaction.abort.timed.out.transaction.cleanup.interval.ms`), and none of its records become visible. A `commit()` of it then rejects with `KafkaJSApplicationRecoverableError`. Its `abort()` resolves under transaction version 2, and the producer carries on; under version 1 the coordinator has fenced the producer's epoch, so `abort()` rejects with `KafkaJSApplicationRecoverableError` as well, and the producer has to be replaced. A commit that races that abort, or a pending one sent again after it, is refused with `INVALID_TXN_STATE` (48) or `PRODUCER_FENCED` (90), depending on the transaction version and on whether the broker has [KAFKA-20785](https://issues.apache.org/jira/browse/KAFKA-20785) (fixed in 4.3.2 and 4.5.0): both reject `commit()` with `KafkaJSApplicationRecoverableError`.
 
 The coordinator also uses `transactionTimeout` as the timeout of its own writes to its transaction log, so a value of a few hundred milliseconds or less can make those writes time out, and an abort the coordinator owes can then stay pending until it retries the write ([KAFKA-16047](https://issues.apache.org/jira/browse/KAFKA-16047)). A producer that takes over a `transactionalId` whose previous owner left a transaction open waits for that abort: `producer.transaction()` retries `CONCURRENT_TRANSACTIONS` within the producer's `retry` budget - about 9 s on the defaults, where the Java client's `initTransactions()` waits up to `max.block.ms`, 60 s by default. Raise `retry.retries` to wait longer (and `retry.maxRetryTime` once the delays reach it); `retry.maxTotalTime` only shortens the wait.
 
@@ -89,25 +99,45 @@ Every error carries a `category` saying what to do about it:
 
 | `category`               | Meaning                                                                    | What to do                                                            |
 | ------------------------ | -------------------------------------------------------------------------- | --------------------------------------------------------------------- |
-| `retriable`              | A transient condition the client already retried.                          | Retry the operation, or abort the transaction.                        |
+| `retriable`              | A transient condition the client already retried.                          | Retry the operation; a send that failed inside a transaction still needs `abort()`. After `commit()`, call `commit()` again. |
 | `refreshRetriable`       | The client's view of the cluster was stale; it refreshed it and retried.   | As `retriable`.                                                       |
 | `abortable`              | The transaction cannot be committed, but the producer is fine.             | `abort()`, then start a new transaction on the same producer.         |
 | `applicationRecoverable` | The producer cannot continue — for instance another one took over its `transactionalId`. | Create a new producer.                                   |
 | `invalidConfiguration`   | A record, a setting or an ACL is wrong.                                    | Fix it. In a transaction, also `abort()`.                             |
 
-A send that fails inside a transaction ends that transaction's chance to commit, whatever its category — unless it was refused before any record was queued, for its own arguments, for a record that cannot be encoded, or by a custom partitioner that threw: the transaction is missing that send's records. From then on `commit()`, `send()`, `sendBatch()` and `sendOffsets()` reject with the error that ended it — a `KafkaJSTransactionAbortableError` when the transaction can be aborted, a `KafkaJSApplicationRecoverableError` when the producer cannot continue (an `applicationRecoverable` error, or a missing cluster or transactional-id ACL) — and `producer.transaction()` rejects with it too, until you abort. `abort()` always ends the transaction; it rejects only when the producer cannot continue. A retriable error that ran out of retries inside a transaction reaches you as a `KafkaJSTransactionAbortableError`, with the retries-exceeded error as its `cause`. A batch dropped because the producer was disconnecting or disconnected ends the transaction's chance to commit the same way; a fault in the client's own send loop makes the producer unusable. An error the client raised itself rather than the broker — a `TypeError` while encoding an offset, say — makes the transaction abort-only too, as a `KafkaJSTransactionAbortableError` whose `cause` is that error, and leaves the producer usable. A batch that was sent and then gave up may have been written all the same, so its partition's sequence stays unresolved: `commit()` and `abort()` check every partition's sequence before `EndTxn`, so such a gap makes the transaction abort-only if nothing did already ("The client hasn't received acknowledgment for some previously sent messages and can no longer retry them. It is safe to abort the transaction and continue."), and under transaction version 1 the abort then bumps the producer's epoch.
+A send that fails inside a transaction ends that transaction's chance to commit, whatever its category — unless it was refused before any record was queued, for its own arguments, for a record that cannot be encoded, or by a custom partitioner that threw: the transaction is missing that send's records. From then on `commit()`, `send()`, `sendBatch()` and `sendOffsets()` reject with the error that ended it — a `KafkaJSTransactionAbortableError` when the transaction can be aborted, a `KafkaJSApplicationRecoverableError` when the producer cannot continue (an `applicationRecoverable` error, or a missing cluster or transactional-id ACL) — and `producer.transaction()` rejects with it too, until you abort. `abort()` always ends the transaction; it rejects only when the producer cannot continue, and while a commit is pending (below), when it is refused. A retriable error that ran out of retries inside a send or `sendOffsets` reaches you as a `KafkaJSTransactionAbortableError`, with the retries-exceeded error as its `cause`. A batch dropped because the producer was disconnecting or disconnected ends the transaction's chance to commit the same way; a fault in the client's own send loop makes the producer unusable. An error the client raised itself rather than the broker — a `TypeError` while encoding an offset, say — makes the transaction abort-only too, as a `KafkaJSTransactionAbortableError` whose `cause` is that error, and leaves the producer usable. A batch that was sent and then gave up may have been written all the same, so its partition's sequence stays unresolved: `commit()` and `abort()` check every partition's sequence before `EndTxn`, so such a gap makes the transaction abort-only if nothing did already ("The client hasn't received acknowledgment for some previously sent messages and can no longer retry them. It is safe to abort the transaction and continue."), and under transaction version 1 the abort then bumps the producer's epoch.
 
-A `commit()` whose own `EndTxn` ran out of retries rejects with a `KafkaJSTransactionAbortableError` whose `cause` is the `KafkaJSNumberOfRetriesExceeded`, and it is ambiguous: the coordinator may have committed the transaction before the answers stopped arriving. `abort()` is still allowed, as in 2.2.4, but if the commit did land, the abort is refused by the coordinator and the producer becomes unusable — while the transaction's records stay committed. Before you reprocess the input of such a transaction, check whether its output was written, or make the processing idempotent.
+A `commit()` whose `EndTxn` outcome is unknown — its retries ran out on a retriable answer, a request timed out, or a connection failed — leaves the commit pending and rejects with the last retriable error itself: `error.retriable` is `true` and its `category` is `retriable` or `refreshRetriable` (it is not a `KafkaJSNumberOfRetriesExceeded`, so code that caught that class from `commit()` in 2.2.4 does not match). The coordinator may have committed the transaction before the answers stopped arriving, so do not abort it: call `commit()` again. It sends the same `EndTxn`, and a coordinator that committed answers it with success (under transaction version 2 with the producer's next epoch, which the producer adopts); until then `abort()`, `send()`, `sendBatch()`, `sendOffsets()` and `producer.transaction()` throw a `KafkaJSNonRetriableError` saying the commit did not complete. If the coordinator aborted the transaction on its timeout before the commit landed, the commit sent again rejects with `KafkaJSApplicationRecoverableError` (see [Transaction timeout](#transaction-timeout)): replace the producer and process the input again. `producer.disconnect()` while a commit is pending sends it once more, through one more retry budget, and waits for a `commit()` still under way rather than sending its own; it then disconnects whatever the answer, logging a warning that names the transactional id when the commit did not succeed.
 
-These categories describe what this client does, on any Kafka 4.x broker. A send rejects with its own error — the broker's, such as a `KafkaJSProtocolError` with code 90 when another producer took over the `transactionalId` — and the wrapper classes come from `commit()`, `abort()` and every later call. So abort first: `abort()` rejects only when the producer cannot continue, with a `KafkaJSApplicationRecoverableError`, and that is when to replace the producer.
+How long that `disconnect()` takes depends on the commit. Sending a pending commit once more costs one retry budget: up to `retry.retries + 1` attempts of `EndTxn`, each as slow as `requestTimeout` (30 s by default), with the retry delays between them (about 9 s on the defaults) and the retries of each attempt's own transaction coordinator lookup. A connection that fails at once makes it far shorter. `deliveryTimeout` does not bound it. `retry.maxTotalTime` does, in part: once the wait before another attempt would end past it, the producer sends no more, but a request already in flight is not cancelled and runs up to `requestTimeout` past it. `disconnect()` also waits for every `commit()` your application starts while it waits, so each one extends the wait; stop committing once you begin shutting down. Size a container's shutdown grace period from `retry.maxTotalTime` (or from `retry.retries` and `requestTimeout` when it is not set) plus one attempt.
+
+These categories describe what this client does, on any Kafka 4.x broker. A send rejects with its own error — the broker's, such as a `KafkaJSProtocolError` with code 90 when another producer took over the `transactionalId` — and the wrapper classes come from `commit()`, `abort()` and every later call. So after a failed `commit()`, check `error.retriable` first and, while it is set, commit again a few times at most; otherwise abort: `abort()` rejects only when the producer cannot continue, with a `KafkaJSApplicationRecoverableError`, and that is when to replace the producer.
 
 ```javascript
 const { KafkaJSApplicationRecoverableError } = require('@countly/kafkajs')
 
+const COMMIT_ATTEMPTS = 3
+
+const replaceProducer = async () => {
+  await producer.disconnect() // sends a commit still pending once more
+  producer = client.producer({ transactionalId })
+  await producer.connect()
+}
+
 const transaction = await producer.transaction()
+let unknownOutcome = null
 try {
   await transaction.send({ topic, messages })
-  await transaction.commit()
+  let commitError = null
+  for (let attempt = 0; attempt < COMMIT_ATTEMPTS; attempt++) {
+    commitError = await transaction.commit().then(() => null, (e) => e)
+    if (commitError === null || !commitError.retriable) break
+  }
+  if (commitError?.retriable) {
+    unknownOutcome = commitError // never abort it: the commit may have landed
+  } else if (commitError !== null) {
+    throw commitError
+  }
 } catch (e) {
   try {
     await transaction.abort()
@@ -115,12 +145,16 @@ try {
     if (!(abortError instanceof KafkaJSApplicationRecoverableError)) {
       throw abortError
     }
-    await producer.disconnect()
-    producer = client.producer({ transactionalId })
-    await producer.connect()
+    await replaceProducer()
   }
 }
+if (unknownOutcome !== null) {
+  await replaceProducer() // sends the commit once more; the coordinator decides it
+  throw unknownOutcome
+}
 ```
+
+A commit that still fails retriably after a few attempts has an unknown outcome: the coordinator may have committed it. The example replaces the producer, whose `disconnect()` sends the commit once more and may complete it, and then throws the retriable error to stop: do not abort the transaction, and do not treat the batch as committed. A consume-transform-produce loop re-reads from its committed offsets, which belong to the last transaction that did commit. As the Java client advises, the only other option is to close the producer: the coordinator then completes the transaction or aborts it at its `transactionTimeout`.
 
 ## <a name="transaction-versions"></a> Transaction versions
 

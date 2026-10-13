@@ -314,7 +314,8 @@ transaction in a way its error decides.
   failed. A send refused before any record was queued — for its own arguments (an empty topic, a
   message without a value, a record that cannot be encoded) or by a custom partitioner that threw —
   leaves the transaction as it was.
-  *What to do:* wrap the transaction in `try` and, on any error, `abort()` first. A send rejects
+  *What to do:* wrap the transaction in `try` and, on any error but a retriable one from `commit()`
+  (see the item on a commit whose outcome is unknown), `abort()` first. A send rejects
   with its own error — the broker's, such as a `KafkaJSProtocolError` with code 90 when another
   producer took over the `transactionalId` — and the wrapper classes come from `commit()`, `abort()`
   and every later call: `abort()` rejects only when the producer cannot continue, with a
@@ -348,6 +349,25 @@ transaction in a way its error decides.
   `WRITE` on any topic from Kafka 2.8, and no longer suggests `idempotent: false`, which a producer
   with a `transactionalId` cannot use. *What to do:* nothing; match on the error class, not its
   text.
+- **A `commit()` whose outcome is unknown can be retried.** When `commit()`'s `EndTxn` runs out of
+  retries, times out or loses its connection, the coordinator may have committed, so the
+  transaction stays committing and `commit()` rejects with the last retriable error itself
+  (`error.retriable === true`, `category` `retriable` or `refreshRetriable`). 2.2.4 rejected with
+  `KafkaJSNumberOfRetriesExceeded`, which is not retriable, and then refused both `commit()` and
+  `abort()`; a catch keyed on that class no longer matches. Until the commit settles, `abort()`,
+  `send()`, `sendBatch()`, `sendOffsets()` and `producer.transaction()` throw, and
+  `producer.disconnect()` makes one more attempt first. A `commit()` called while another is under way now joins it and shares its outcome; 2.2.4
+  refused a second `commit()` with a state error at once. A `producer.disconnect()` called during a
+  commit waits for it, logs a warning when it did not succeed, and resolves. *What to do:* if
+  `commit()` rejects with a retriable error (`error.retriable`), call `commit()` again, a few times
+  at most, then replace the producer; do not `abort()`. A commit that is still rejected with a
+  retriable error after those attempts has an unknown outcome: `disconnect()` may already have
+  completed it, so do not abort it and do not treat the batch as committed; a
+  consume-transform-produce loop re-reads its committed offsets. If the retried commit rejects with
+  `KafkaJSApplicationRecoverableError`, the broker answering 48 or 90, depending on the transaction
+  version and on whether the broker has KAFKA-20785 (fixed in 4.3.2 and 4.5.0), the coordinator
+  aborted the transaction on its timeout before the commit landed: replace the producer and
+  reprocess the input.
 
 ### Consumer
 
