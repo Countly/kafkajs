@@ -1171,6 +1171,9 @@ describe('Producer > the accumulator', () => {
       ['an expired batch whose leader is unknown', { 0: null, 1: 1 }],
       ['two partitions with no leader, which is -1 for both', { 0: -1, 1: -1 }],
       ['a leader that is not a node id', { 0: '1', 1: '1' }],
+      ['a fractional leader', { 0: 1.5, 1: 1.5 }],
+      ['a NaN leader', { 0: NaN, 1: NaN }],
+      ['an infinite leader', { 0: Infinity, 1: Infinity }],
     ])('%s neither merges nor takes the other batch with it', async (_, leaders) => {
       const { accumulator, sent } = createAccumulator({
         linger: MERGE_LINGER,
@@ -2109,6 +2112,139 @@ describe('Producer > the accumulator', () => {
         expect(cluster.broker.produce).not.toHaveBeenCalled()
       })
 
+      describe('a hand-off whose batches are of different ages', () => {
+        const DEADLINE = 150
+
+        /**
+         * Puts `Date.now()` `ms` ahead of the fake timers' clock from now on, as an event loop that
+         * stalled for `ms` does: the timers armed before the stall fire late.
+         * @param {number} ms
+         */
+        const stallFor = (ms) => {
+          const fakeNow = Date.now
+          jest.spyOn(Date, 'now').mockImplementation(() => fakeNow() + ms)
+        }
+
+        /** A producer whose partitions are the ones the records name, led by `cachedLeader`. */
+        const agingProducer = ({ cachedLeader, ...options } = {}) => {
+          const made = createLingeringProducer({
+            idempotent: false,
+            linger: 50,
+            deliveryTimeout: DEADLINE,
+            createPartitioner:
+              () =>
+              ({ message }) =>
+                message.partition,
+            ...options,
+          })
+          if (cachedLeader !== undefined) {
+            made.cluster.cachedLeader = cachedLeader
+          }
+          return made
+        }
+
+        const sendTo = (producer, partition) =>
+          producer
+            .send({ topic: TOPIC, messages: [{ partition, value: `p${partition}` }] })
+            .catch((e) => e)
+
+        const partitionsSent = (produced) =>
+          produced().map(({ partitions }) => partitions.map(({ partition }) => partition))
+
+        const lateMessage = (partition) =>
+          `Gave up on ${TOPIC} partition ${partition} before sending it: its ${DEADLINE} ms delivery deadline passed`
+
+        test('a batch pulled in from another partition is sent when only the oldest batch is past its deadline', async () => {
+          const { producer, produced } = agingProducer()
+          await producer.connect()
+
+          const older = sendTo(producer, 0)
+          await jest.advanceTimersByTimeAsync(0)
+          stallFor(160)
+          await jest.advanceTimersByTimeAsync(1)
+          const younger = sendTo(producer, 1)
+          await jest.advanceTimersByTimeAsync(49)
+
+          const [late, sent] = await settledWithin(Promise.all([older, younger]))
+
+          expect(late).toBeInstanceOf(KafkaJSDeliveryTimeout)
+          expect(late.message).toEqual(lateMessage(0))
+          expect(sent).toEqual([expect.objectContaining({ partition: 1 })])
+          expect(partitionsSent(produced)).toEqual([[1]])
+        })
+
+        test('a batch for another broker is left to its own linger and is sent', async () => {
+          const { producer, produced } = agingProducer({
+            cachedLeader: (_, partition) => partition,
+          })
+          await producer.connect()
+
+          const older = sendTo(producer, 0)
+          await jest.advanceTimersByTimeAsync(0)
+          stallFor(160)
+          await jest.advanceTimersByTimeAsync(1)
+          const younger = sendTo(producer, 1)
+          const youngerSettled = settledFlag(younger)
+          await jest.advanceTimersByTimeAsync(49)
+
+          expect(await settledWithin(older)).toEqual(
+            expect.objectContaining({ message: lateMessage(0) })
+          )
+          expect(youngerSettled()).toBe(false)
+          expect(partitionsSent(produced)).toEqual([])
+
+          expect(await settledWithin(younger, 1)).toEqual([
+            expect.objectContaining({ partition: 1 }),
+          ])
+          expect(partitionsSent(produced)).toEqual([[1]])
+        })
+
+        test('two batches that are both due go out together when only the older is past its deadline', async () => {
+          const { producer, produced } = agingProducer({
+            cachedLeader: (_, partition) => partition,
+          })
+          await producer.connect()
+
+          const older = sendTo(producer, 0)
+          await jest.advanceTimersByTimeAsync(40)
+          const younger = sendTo(producer, 1)
+          await jest.advanceTimersByTimeAsync(0)
+          stallFor(120)
+          await jest.advanceTimersByTimeAsync(10)
+
+          const [late, sent] = await settledWithin(Promise.all([older, younger]))
+
+          expect(late).toBeInstanceOf(KafkaJSDeliveryTimeout)
+          expect(late.message).toEqual(lateMessage(0))
+          expect(sent).toEqual([expect.objectContaining({ partition: 1 })])
+          expect(partitionsSent(produced)).toEqual([[1]])
+        })
+
+        test('the batches that are sent retry only until the earliest of their own deadlines', async () => {
+          const { producer } = agingProducer({
+            linger: 200,
+            deliveryTimeout: 400,
+            retry: { retries: 100, initialRetryTime: 10, maxRetryTime: 10, factor: 0 },
+            produce: answering(() => REQUEST_TIMED_OUT),
+          })
+          await producer.connect()
+
+          const older = sendTo(producer, 0)
+          await jest.advanceTimersByTimeAsync(150)
+          const younger = sendTo(producer, 1)
+          const bothSettled = settledFlag(Promise.all([older, younger]))
+          await jest.advanceTimersByTimeAsync(230)
+          expect(bothSettled()).toBe(false)
+
+          const errors = await settledWithin(Promise.all([older, younger]), 30)
+
+          expect(errors).toEqual([
+            expect.any(KafkaJSDeliveryTimeout),
+            expect.any(KafkaJSDeliveryTimeout),
+          ])
+        })
+      })
+
       test('a partition the metadata does not list yet waits for it within its retries', async () => {
         const { cluster, producer, produced } = createLingeringProducer({
           idempotent: false,
@@ -2486,6 +2622,55 @@ describe('Producer > the accumulator', () => {
         expect(cluster.broker.produce).not.toHaveBeenCalled()
         expect(jest.getTimerCount()).toBe(0)
       })
+
+      test.each([
+        ['commit', true],
+        ['abort', false],
+      ])(
+        '%s() waits for the one request two partitions sent a millisecond apart share',
+        async (ending, transactionResult) => {
+          const answered = deferred()
+          const { cluster, producer, produced } = transactionalProducer({
+            linger: 50,
+            createPartitioner:
+              () =>
+              ({ message }) =>
+                message.partition,
+            produce: async (request) => {
+              await answered.promise
+              return accepted(request)
+            },
+          })
+          await producer.connect()
+          const transaction = await producer.transaction()
+
+          const sendTo = (partition) =>
+            transaction.send({ topic: TOPIC, messages: [{ partition, value: `p${partition}` }] })
+          const sends = [sendTo(0)]
+          await jest.advanceTimersByTimeAsync(1)
+          sends.push(sendTo(1))
+          await jest.advanceTimersByTimeAsync(49)
+          await microtasks()
+
+          expect(
+            produced().map(({ partitions }) => partitions.map(({ partition }) => partition))
+          ).toEqual([[0, 1]])
+          const ended = settledFlag(transaction[ending]())
+          await jest.advanceTimersByTimeAsync(0)
+          expect(ended()).toBe(false)
+          expect(cluster.broker.endTxn).not.toHaveBeenCalled()
+
+          answered.resolve()
+          await settledWithin(Promise.all(sends))
+          await jest.advanceTimersByTimeAsync(0)
+
+          expect(ended()).toBe(true)
+          expect(cluster.broker.endTxn).toHaveBeenCalledWith(
+            expect.objectContaining({ transactionResult })
+          )
+          expect(jest.getTimerCount()).toBe(0)
+        }
+      )
 
       test('a record the encoder cannot write fails its send and leaves the transaction committable', async () => {
         const { cluster, producer, produced } = transactionalProducer()

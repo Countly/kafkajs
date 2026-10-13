@@ -281,14 +281,18 @@ class Settler {
  * at its delivery deadline at the latest, so the send path expires it then, as the Java client
  * expires the head of a waiting partition's queue. While `lingers()` is false - a transaction is
  * ending, the producer is disconnecting - a batch goes out as soon as it forms. When a batch's
- * `linger` runs out, every other batch whose `linger` has run out by then goes out with it. So does
- * every other pending batch with the same `acks`, `timeout` and `compression` for a partition led
- * by the node that led the partition of one of those batches when its own timer was armed. This
- * follows the Java client, where a node is ready once any of its batches is, and everything the
- * node leads is drained. A held batch neither goes out that way nor makes its node ready: holding
- * a partition behind its batch in flight is this client's rule (one unacknowledged batch per
- * partition), stricter than the Java default. Each pending batch holds at most one timer, cleared
- * when it flushes.
+ * `linger` timer fires, every other batch whose `linger` has run out by then goes out with it. So
+ * does every other pending batch with the same `acks`, `timeout` and `compression` for a partition
+ * led by the node that led the partition of one of those batches when its own timer was armed.
+ * Only a firing timer pulls batches that are not yet due: a full batch leaves with the batches
+ * already due, `linger: 0` sends in the same tick, and `flush()` hands every batch on. The Java
+ * client readies a node on more triggers (a full batch, a flush, a transaction that is completing)
+ * and stops draining a node at `max.request.size`, 1 MB by default; this client has no such cap,
+ * so one hand-off can carry every batch a node leads. `linger` is when a batch becomes due, not a
+ * bound on when its send settles. A held batch neither goes out that way nor makes its node ready:
+ * holding a partition behind its batch in flight is this client's rule (one unacknowledged batch
+ * per partition), stricter than the Java default. Each pending batch holds at most one timer,
+ * cleared when it flushes.
  * `close()` hands everything on and waits until nothing is left to deliver.
  * One accumulator serves one transactional context: a producer's own sends, or its transactions'.
  * @see https://github.com/apache/kafka/blob/4.3/clients/src/main/java/org/apache/kafka/clients/producer/internals/RecordAccumulator.java

@@ -1407,23 +1407,31 @@ const createSendMessages = ({
   const deadlineMs = deliveryTimeout ?? retry.maxTotalTime
 
   /**
-   * The retrier of one non-idempotent hand-off: the producer's, with the delivery deadline that is
-   * left to its earliest batch, as an idempotent batch's deadline counts from its first send.
+   * Splits one non-idempotent hand-off by delivery deadline, which counts from each batch's own
+   * first send: a batch whose deadline has passed is late, and the rest share a retrier that
+   * ends at the earliest deadline among them.
    * @param {{ createdAt?: number }[]} batches
-   * @returns {import("../retry").Retrier|null} null once that deadline has passed
+   * @returns {{ late: object[], retrier: import("../retry").Retrier|null }} the late batches, and
+   *   the retrier of the others; null when every batch is late
    */
-  const retrierWithin = (batches) => {
+  const withinDeadline = (batches) => {
     if (deadlineMs == null) {
-      return retrier
+      return { late: [], retrier }
     }
 
     const now = Date.now()
-    const createdAt = batches.reduce(
-      (earliest, batch) => Math.min(earliest, batch.createdAt ?? now),
-      now
-    )
-    const remaining = createdAt + deadlineMs - now
-    return remaining < 1 ? null : createRetry({ ...retry, maxTotalTime: remaining })
+    const late = []
+    let budget = deadlineMs
+    for (const batch of batches) {
+      const remaining = (batch.createdAt ?? now) + deadlineMs - now
+      if (remaining < 1) {
+        late.push(batch)
+      } else {
+        budget = Math.min(budget, remaining)
+      }
+    }
+    const noneLeft = late.length > 0 && late.length === batches.length
+    return { late, retrier: noneLeft ? null : createRetry({ ...retry, maxTotalTime: budget }) }
   }
 
   /**
@@ -1453,10 +1461,10 @@ const createSendMessages = ({
    * within the call's retry budget. A request that fails as a whole, or a topic or broker that
    * cannot be looked up, leaves its own batches for the next attempt when the error is retriable
    * and rejects them otherwise; the other batches go out. Each attempt waits for every broker's
-   * answer, so the slowest broker paces the retries. The budget ends at the delivery deadline of
-   * the earliest batch, counted from its first send; a hand-off past it rejects without sending.
-   * Once the budget runs out, or the call fails before any request, the batches still unsettled
-   * reject with the retrier's error.
+   * answer, so the slowest broker paces the retries. A batch whose delivery deadline, counted from
+   * its own first send, has already passed rejects without being sent and the others go out; the
+   * budget ends at the earliest deadline among those sent. Once the budget runs out, or the call
+   * fails before any request, the batches still unsettled reject with the retrier's error.
    * @see https://github.com/apache/kafka/blob/4.3/clients/src/main/java/org/apache/kafka/clients/producer/internals/Sender.java
    * @param {object} request see `sendPartitioned`
    * @returns {Promise<object[]>} the `RecordMetadata` of every batch, once all have settled;
@@ -1543,17 +1551,17 @@ const createSendMessages = ({
       return retriable
     }
 
-    const handOffRetrier = retrierWithin(batches)
-    if (handOffRetrier === null) {
-      batches.forEach((batch) =>
-        reject(
-          batch,
-          new KafkaJSDeliveryTimeout(
-            `Gave up on ${batch.topic} partition ${batch.partition} before sending it: its ` +
-              `${deadlineMs} ms delivery deadline passed`
-          )
+    const { late, retrier: handOffRetrier } = withinDeadline(batches)
+    late.forEach((batch) =>
+      reject(
+        batch,
+        new KafkaJSDeliveryTimeout(
+          `Gave up on ${batch.topic} partition ${batch.partition} before sending it: its ` +
+            `${deadlineMs} ms delivery deadline passed`
         )
       )
+    )
+    if (handOffRetrier === null) {
       throw failure
     }
 
