@@ -81,7 +81,7 @@ const renderFloorWatch = (lines, model) => {
 const renderWaivers = (lines, model) => {
   section(lines, 'Below-floor waivers')
   lines.push(
-    'Versions implemented here that the pinned broker rejects outright: dead code, and dangerous while version negotiation ignores the broker minimum. Each is waived until the phase named below deletes it; an unwaived below-floor version fails `npm run compat:check`.'
+    'Versions implemented here that the pinned broker rejects outright: dead code, which version negotiation never selects. Each is waived until the exit named in the last column deletes it; an unwaived below-floor version fails `npm run compat:check`.'
   )
   lines.push('')
   if (model.waivers.length === 0) {
@@ -106,7 +106,7 @@ const renderWaivers = (lines, model) => {
 const renderCrossCutting = (lines, model) => {
   section(lines, 'Cross-cutting gaps')
   lines.push(
-    'Not per-API, and not derivable from the message definitions. Each row names the phase that closes it, so this table doubles as a burn-down.'
+    'Not per-API, and not derivable from the message definitions. Each row names who closes it (`backlog` when nothing is committed to it), so this table doubles as a burn-down.'
   )
   lines.push('')
   lines.push(row(['Gap', 'Where', 'Impact', 'Owner']))

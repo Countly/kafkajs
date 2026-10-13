@@ -156,6 +156,13 @@ describe('scripts/compat/render', () => {
       expect(render(empty)).toContain('None — the waiver list is empty.')
     })
 
+    it('describes the waivers and the cross-cutting rows as the tree is', () => {
+      const output = render(model())
+      expect(output).not.toContain('ignores the broker minimum')
+      expect(output).not.toContain('names the phase that closes it')
+      expect(output).toContain('Each row names who closes it')
+    })
+
     it('ends with exactly one trailing newline', () => {
       expect(render(model()).endsWith('\n')).toBe(true)
       expect(render(model()).endsWith('\n\n')).toBe(false)

@@ -45,12 +45,12 @@
       "since": "2026-09-08"
     },
     "SaslHandshake": {
-      "note": "Never flexible, and the only API in the matrix that is fully current.",
-      "since": "2026-09-03"
+      "note": "Never flexible: v0 and v1 are the whole API, and both are implemented.",
+      "since": "2026-10-13"
     },
     "ApiVersions": {
-      "note": "v0-v3 omit every SupportedFeatures entry whose MinVersion is 0 (KAFKA-17011, fixed in v4 / Kafka 3.9), so a v3-only client sees a truncated feature list. The flexible-protocol pilot targets v4 and falls back to v3 only for brokers below 3.9.",
-      "since": "2026-09-03"
+      "note": "v0-v3 omit every SupportedFeatures entry whose MinVersion is 0 (KAFKA-17011, fixed in v4 / Kafka 3.9), so a v3-only client sees a truncated feature list. The client asks for v4 first; a broker that does not support it answers UNSUPPORTED_VERSION with the versions it has, and the client asks again at the highest one both sides implement (only a broker below 3.9 does this, and the 4.0 floor excludes them).",
+      "since": "2026-10-13"
     },
     "CreateTopics": {
       "note": "v5 flexible, v7 returns topic IDs.",
@@ -97,12 +97,12 @@
       "since": "2026-10-11"
     },
     "AlterPartitionReassignments": {
-      "note": "One of the only two flexible-encoded codecs in the fork today: it hand-rolls the tag buffer inside the request body because the request header is still hardcoded to v1. It must migrate when real flexible header selection lands. v1 adds AllowReplicationFactorChange.",
-      "since": "2026-09-03"
+      "note": "v0 is flexible (KIP-455): the codec writes its own body tag buffer, like every flexible codec, and the request header is chosen by the flexible framing. v1 adds AllowReplicationFactorChange (KIP-860), which defaults to true, the behavior v0 has; it is not implemented because nothing here asks to forbid a replication-factor change, so behind:1 is this API's steady state until something does.",
+      "since": "2026-10-13"
     },
     "ListPartitionReassignments": {
-      "note": "The other hand-rolled flexible codec; same migration applies. Kafka defines only v0, so the fork is current by accident.",
-      "since": "2026-09-03"
+      "note": "Kafka defines only v0 (KIP-455), a flexible version, so the fork is current.",
+      "since": "2026-10-13"
     },
     "OffsetForLeaderEpoch": {
       "note": "Leader-epoch fencing (KIP-320): v3 and v4 are implemented. v2 is a deliberate gap, not a waiver - versions below 3 require CLUSTER permission, which clients are not typically granted, and the Java consumer pins its own floor at v3 for that reason.",
@@ -139,22 +139,16 @@
   },
   "crossCutting": [
     {
-      "gap": "Topic IDs (UUIDs) are not yet used by every API that accepts them",
-      "where": "offset-commit and offset-fetch paths, topic administration",
-      "impact": "Cluster metadata caches each topic's id, and Fetch and Produce are keyed by it (falling back to names for a request whose ids are not all known). What remains: OffsetCommit v10 and OffsetFetch v10, KIP-848 assignments (phase-6), and topic ids on CreateTopics v7 / DeleteTopics v6 (phase-8).",
-      "owner": "phase-6"
-    },
-    {
       "gap": "No fetch sessions (KIP-227)",
       "where": "fetch layer",
-      "impact": "Every fetch is a full request - sessionId 0, sessionEpoch -1, an empty forgotten-topics list - so a poll re-sends every assigned partition rather than only what changed. This is a decision, not an oversight: 3.0.0 ships sessionless (decision D31), and the three fetch-session error codes are mapped defensively so an unexpected one cannot crash a consumer. Incremental fetch is the prerequisite for reducing request size on a large assignment.",
+      "impact": "Every fetch is a full request - sessionId 0, sessionEpoch -1, an empty forgotten-topics list - so a poll re-sends every assigned partition rather than only what changed. This is a decision, not an oversight: 3.0.0 ships sessionless, and the three fetch-session error codes are mapped defensively so an unexpected one cannot crash a consumer. Incremental fetch is the prerequisite for reducing request size on a large assignment.",
       "owner": "backlog"
     },
     {
-      "gap": "Dead message-format v0/v1 write path (KIP-724)",
+      "gap": "Legacy message-format v0/v1 encoders are still in the tree (KIP-724)",
       "where": "src/protocol/message/v0, src/protocol/message/v1, src/protocol/messageSet encoders",
-      "impact": "Unreachable against a 4.x broker, which never negotiates Produce below v3 or Fetch below v4. The decoders must stay: old segments can still be returned inside a modern Fetch response.",
-      "owner": "phase-2"
+      "impact": "Nothing that runs uses them: a 4.x broker never negotiates Produce below v3 or Fetch below v4, and a spec fails if a file outside the specs requires `messageSet` or the sibling `message` module. They remain only to build the inputs of the decoders' specs; removing them means replacing those inputs with committed fixtures. The decoders must stay: old segments can still be returned inside a modern Fetch response.",
+      "owner": "backlog"
     }
   ],
   "errorAliases": {

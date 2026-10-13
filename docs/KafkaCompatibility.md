@@ -21,8 +21,8 @@ Gap classes: `current` (fork max equals the Kafka max) · `behind:N` · `stub` (
 | SyncGroup | 14 | 0-5 | v4+ | 0-5 | current |  |
 | DescribeGroups | 15 | 0-6 | v5+ | 0-6 | current | v3 IncludeAuthorizedOperations/AuthorizedOperations (KIP-430), v4 member GroupInstanceId (KIP-345), v5 flexible, v6 per-group ErrorMessage and GROUP_ID_NOT_FOUND for a group that does not exist (KIP-1043). Below v6 a broker reports a KIP-848 consumer-protocol group as Dead, so describing one also needs ConsumerGroupDescribe (key 69) routing. |
 | ListGroups | 16 | 0-5 | v3+ | 0-5 | current | v3 flexible, v4 StatesFilter/GroupState (KIP-518), v5 TypesFilter/GroupType (KIP-848). Java's downgrade rule applies to the filters on older brokers: a state filter needs v4, and a type filter needs v5 unless it asks only for classic (and consumer), which a broker without group types answers identically unfiltered. |
-| SaslHandshake | 17 | 0-1 | never | 0-1 | current | Never flexible, and the only API in the matrix that is fully current. |
-| ApiVersions | 18 | 0-4 | v3+ | 0-4 | current | v0-v3 omit every SupportedFeatures entry whose MinVersion is 0 (KAFKA-17011, fixed in v4 / Kafka 3.9), so a v3-only client sees a truncated feature list. The flexible-protocol pilot targets v4 and falls back to v3 only for brokers below 3.9. |
+| SaslHandshake | 17 | 0-1 | never | 0-1 | current | Never flexible: v0 and v1 are the whole API, and both are implemented. |
+| ApiVersions | 18 | 0-4 | v3+ | 0-4 | current | v0-v3 omit every SupportedFeatures entry whose MinVersion is 0 (KAFKA-17011, fixed in v4 / Kafka 3.9), so a v3-only client sees a truncated feature list. The client asks for v4 first; a broker that does not support it answers UNSUPPORTED_VERSION with the versions it has, and the client asks again at the highest one both sides implement (only a broker below 3.9 does this, and the 4.0 floor excludes them). |
 | CreateTopics | 19 | 2-7 | v5+ | 2-7 | current | v5 flexible, v7 returns topic IDs. |
 | DeleteTopics | 20 | 1-6 | v4+ | 1-6 | current | v6 can delete by topic ID; the fork sends each topic name with the zero uuid, as the Java client does when it is given names. |
 | DeleteRecords | 21 | 0-2 | v2+ | 0-2 | current |  |
@@ -41,8 +41,8 @@ Gap classes: `current` (fork max equals the Kafka max) · `behind:N` · `stub` (
 | CreatePartitions | 37 | 0-3 | v2+ | 0-3 | current |  |
 | DeleteGroups | 42 | 0-2 | v2+ | 0-2 | current |  |
 | IncrementalAlterConfigs | 44 | 0-1 | v1+ | 0-1 | current | The merge-semantics alternative to AlterConfigs: each config entry names a SET, DELETE, APPEND or SUBTRACT, so the entries a request leaves out are untouched. |
-| AlterPartitionReassignments | 45 | 0-1 | v0+ | 0 | behind:1 | One of the only two flexible-encoded codecs in the fork today: it hand-rolls the tag buffer inside the request body because the request header is still hardcoded to v1. It must migrate when real flexible header selection lands. v1 adds AllowReplicationFactorChange. |
-| ListPartitionReassignments | 46 | 0 | v0+ | 0 | current | The other hand-rolled flexible codec; same migration applies. Kafka defines only v0, so the fork is current by accident. |
+| AlterPartitionReassignments | 45 | 0-1 | v0+ | 0 | behind:1 | v0 is flexible (KIP-455): the codec writes its own body tag buffer, like every flexible codec, and the request header is chosen by the flexible framing. v1 adds AllowReplicationFactorChange (KIP-860), which defaults to true, the behavior v0 has; it is not implemented because nothing here asks to forbid a replication-factor change, so behind:1 is this API's steady state until something does. |
+| ListPartitionReassignments | 46 | 0 | v0+ | 0 | current | Kafka defines only v0 (KIP-455), a flexible version, so the fork is current. |
 | ConsumerGroupHeartbeat | 68 | 0-1 | v0+ | 0-1 | current | Required for the KIP-848 consumer group protocol (groupProtocol: 'consumer'), GA since Kafka 4.0. |
 | ConsumerGroupDescribe | 69 | 0-1 | v0+ | 0-1 | current | Admin-side counterpart of KIP-848; needed so group descriptions stop reporting consumer-protocol groups as Dead. |
 | GetTelemetrySubscriptions | 71 | 0 | v0+ | — | not-planned | Client telemetry (KIP-714); deferred. |
@@ -57,19 +57,18 @@ None.
 
 ## Below-floor waivers
 
-Versions implemented here that the pinned broker rejects outright: dead code, and dangerous while version negotiation ignores the broker minimum. Each is waived until the phase named below deletes it; an unwaived below-floor version fails `npm run compat:check`.
+Versions implemented here that the pinned broker rejects outright: dead code, which version negotiation never selects. Each is waived until the exit named in the last column deletes it; an unwaived below-floor version fails `npm run compat:check`.
 
 None — the waiver list is empty.
 
 ## Cross-cutting gaps
 
-Not per-API, and not derivable from the message definitions. Each row names the phase that closes it, so this table doubles as a burn-down.
+Not per-API, and not derivable from the message definitions. Each row names who closes it (`backlog` when nothing is committed to it), so this table doubles as a burn-down.
 
 | Gap | Where | Impact | Owner |
 |---|---|---|---|
-| Topic IDs (UUIDs) are not yet used by every API that accepts them | offset-commit and offset-fetch paths, topic administration | Cluster metadata caches each topic's id, and Fetch and Produce are keyed by it (falling back to names for a request whose ids are not all known). What remains: OffsetCommit v10 and OffsetFetch v10, KIP-848 assignments (phase-6), and topic ids on CreateTopics v7 / DeleteTopics v6 (phase-8). | phase-6 |
-| No fetch sessions (KIP-227) | fetch layer | Every fetch is a full request - sessionId 0, sessionEpoch -1, an empty forgotten-topics list - so a poll re-sends every assigned partition rather than only what changed. This is a decision, not an oversight: 3.0.0 ships sessionless (decision D31), and the three fetch-session error codes are mapped defensively so an unexpected one cannot crash a consumer. Incremental fetch is the prerequisite for reducing request size on a large assignment. | backlog |
-| Dead message-format v0/v1 write path (KIP-724) | src/protocol/message/v0, src/protocol/message/v1, src/protocol/messageSet encoders | Unreachable against a 4.x broker, which never negotiates Produce below v3 or Fetch below v4. The decoders must stay: old segments can still be returned inside a modern Fetch response. | phase-2 |
+| No fetch sessions (KIP-227) | fetch layer | Every fetch is a full request - sessionId 0, sessionEpoch -1, an empty forgotten-topics list - so a poll re-sends every assigned partition rather than only what changed. This is a decision, not an oversight: 3.0.0 ships sessionless, and the three fetch-session error codes are mapped defensively so an unexpected one cannot crash a consumer. Incremental fetch is the prerequisite for reducing request size on a large assignment. | backlog |
+| Legacy message-format v0/v1 encoders are still in the tree (KIP-724) | src/protocol/message/v0, src/protocol/message/v1, src/protocol/messageSet encoders | Nothing that runs uses them: a 4.x broker never negotiates Produce below v3 or Fetch below v4, and a spec fails if a file outside the specs requires `messageSet` or the sibling `message` module. They remain only to build the inputs of the decoders' specs; removing them means replacing those inputs with committed fixtures. The decoders must stay: old segments can still be returned inside a modern Fetch response. | backlog |
 
 ## Error table
 

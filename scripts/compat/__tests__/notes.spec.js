@@ -1,6 +1,15 @@
+const fs = require('fs')
+const path = require('path')
 const notes = require('../notes.json')
 const trackedApis = require('../tracked-apis.json')
 const { errorCodes } = require('../../../src/protocol/error')
+
+// A phase with a section in the changelog has started, so nothing may still be owed to it. Without
+// any phase heading, `lastStartedPhase` is -Infinity and the check passes vacuously.
+const changelog = fs.readFileSync(path.join(__dirname, '..', '..', '..', 'CHANGELOG.md'), 'utf8')
+const lastStartedPhase = Math.max(
+  ...[...changelog.matchAll(/^### Phase (\d+)/gm)].map((m) => +m[1])
+)
 
 describe('scripts/compat/notes.json', () => {
   const trackedNames = trackedApis.tracked.map((api) => api.kafkaName)
@@ -26,6 +35,25 @@ describe('scripts/compat/notes.json', () => {
       expect(row.where.length).toBeGreaterThan(0)
       expect(row.impact.length).toBeGreaterThan(0)
       expect(row.owner).toMatch(/^(phase-\d|backlog)$/)
+    }
+  })
+
+  it('owes no cross-cutting row, and plans no API, to a phase that has started', () => {
+    const named = [
+      ...notes.crossCutting.map(({ owner }) => owner),
+      ...trackedApis.tracked.map(({ planned }) => planned),
+    ].flatMap((value) => /^phase-(\d)$/.exec(value)?.slice(1) ?? [])
+
+    expect(named.filter((phase) => Number(phase) <= lastStartedPhase)).toEqual([])
+  })
+
+  it('names no phase, task or decision in any text it ships', () => {
+    const texts = [
+      ...Object.values(notes.apis).map(({ note }) => note),
+      ...notes.crossCutting.flatMap(({ gap, where, impact }) => [gap, where, impact]),
+    ]
+    for (const text of texts) {
+      expect(text).not.toMatch(/\b(?:phase|task|amendment)[- ]?\d|\bD\d{1,3}\b|\bP\d+-[A-Z]\d+|§/i)
     }
   })
 
