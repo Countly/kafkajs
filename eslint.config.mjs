@@ -160,6 +160,18 @@ export default [
     },
   },
   {
+    // otel/ has its own dependencies, installed only by scripts/otelTest.sh, and its tests import
+    // transitive ones (import-in-the-middle): lint runs without them, so no rule that resolves a
+    // module or asks for it to be declared can hold here.
+    files: ['otel/**/*.js', 'otel/**/*.mjs'],
+    rules: {
+      'n/no-missing-require': 'off',
+      'n/no-missing-import': 'off',
+      'n/no-extraneous-import': 'off',
+      'n/no-unpublished-import': 'off',
+    },
+  },
+  {
     files: ['src/producer/partitioners/legacy/randomBytes.js'],
     rules: {
       // This file feature-detects `global.crypto` (the WebCrypto global) with a fallback to

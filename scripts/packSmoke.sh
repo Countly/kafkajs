@@ -7,11 +7,8 @@ export PACK_DIR
 TARBALL="$(cd "$ROOT" && npm pack --silent --pack-destination "$PACK_DIR")"
 echo "tarball: $PACK_DIR/$TARBALL"
 
-# The tarball must not contain tests or fixtures.
-if tar -tzf "$PACK_DIR/$TARBALL" | grep -E '\.spec\.js$|__tests__/|__snapshots__/|types/tests|fixtures/'; then
-  echo "tarball contains test files" >&2
-  exit 1
-fi
+# The tarball must not contain tests, fixtures or the otel/ sub-package.
+"$ROOT/scripts/assertCleanTarball.sh" "$PACK_DIR/$TARBALL"
 
 cd "$PACK_DIR"
 [ -f package.json ] || echo '{ "name": "pack-smoke", "private": true, "type": "commonjs" }' > package.json
