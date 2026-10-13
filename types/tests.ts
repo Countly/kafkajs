@@ -8,6 +8,17 @@ import {
   CompressionTypes,
   CompressionCodecs,
   ConfigResourceTypes,
+  ConfigSource,
+  ConfigTypes,
+  AlterConfigOpTypes,
+  IncrementalAlterConfigEntry,
+  IncrementalAlterConfigsResult,
+  RemoveMembersResult,
+  ITopicMetadata,
+  ConfigEntries,
+  DescribeTopicPartitionsPartition,
+  DescribeTopicPartitionsTopic,
+  Consumer,
   AclResourceTypes,
   AclOperationTypes,
   AclPermissionTypes,
@@ -46,6 +57,7 @@ import {
   KafkaJSAggregateError,
   KafkaJSFetcherRebalanceError,
   KafkaJSLockTimeout,
+  KafkaJSProtocolError,
 } from './index'
 
 const { roundRobin } = PartitionAssigners
@@ -694,3 +706,318 @@ const useBroker = async (broker: Broker) => {
   await broker.endTxn({ transactionalId: 'tx', producerId, producerEpoch, transactionResult: false, transactionVersion: 3 })
 }
 void useBroker
+
+// Configuration administration: individual entries, the new resource types and sources.
+const useConfigAdmin = async () => {
+  const entries: IncrementalAlterConfigEntry[] = [
+    { name: 'retention.ms', operation: AlterConfigOpTypes.SET, value: '60000' },
+    { name: 'cleanup.policy', operation: AlterConfigOpTypes.APPEND, value: 'compact' },
+    { name: 'cleanup.policy', operation: AlterConfigOpTypes.SUBTRACT, value: 'delete' },
+    { name: 'retention.bytes', operation: AlterConfigOpTypes.DELETE },
+    { name: 'retention.bytes', operation: AlterConfigOpTypes.DELETE, value: null },
+  ]
+  const result = await admin.incrementalAlterConfigs({
+    validateOnly: true,
+    resources: [{ type: ConfigResourceTypes.TOPIC, name: topic, configEntries: entries }],
+  })
+  const failed = result.resources.filter(({ errorCode }) => errorCode !== 0)
+  const failure: string | null = failed[0].errorMessage
+  const failedType: ConfigResourceTypes = failed[0].resourceType
+  const failedName: string = failed[0].resourceName
+  void [failure, failedType, failedName]
+  // The cluster-wide default broker config is the BROKER resource with an empty name.
+  await admin.incrementalAlterConfigs({
+    resources: [{ type: ConfigResourceTypes.BROKER, name: '', configEntries: entries }],
+  })
+  // @ts-expect-error the resource type is a ConfigResourceTypes, not any number
+  await admin.incrementalAlterConfigs({ resources: [{ type: 99, name: topic, configEntries: entries }] })
+  // @ts-expect-error a SET needs a value
+  const setWithoutValue: IncrementalAlterConfigEntry = { name: 'a', operation: AlterConfigOpTypes.SET }
+  // A DELETE's value is ignored at run time.
+  const deleteWithValue: IncrementalAlterConfigEntry = { name: 'a', operation: AlterConfigOpTypes.DELETE, value: 'x' }
+  // @ts-expect-error the operation is an AlterConfigOpTypes
+  const unknownOperation: IncrementalAlterConfigEntry = { name: 'a', operation: 9, value: 'x' }
+  void [setWithoutValue, deleteWithValue, unknownOperation]
+  // Entries kept in a variable without an annotation, or built by a helper, carry the whole enum.
+  const stored = [
+    { name: 'retention.ms', operation: AlterConfigOpTypes.SET, value: '60000' },
+    { name: 'cleanup.policy', operation: AlterConfigOpTypes.APPEND, value: 'compact' },
+  ]
+  const entry = (name: string, operation: AlterConfigOpTypes, value: string) => ({ name, operation, value })
+  await admin.incrementalAlterConfigs({
+    resources: [
+      { type: ConfigResourceTypes.TOPIC, name: topic, configEntries: stored },
+      { type: ConfigResourceTypes.TOPIC, name: topic, configEntries: [entry('retention.ms', AlterConfigOpTypes.SET, '1')] },
+    ],
+  })
+  // @ts-expect-error a resource has a name, which is empty for the cluster-wide default broker config
+  await admin.incrementalAlterConfigs({ resources: [{ type: ConfigResourceTypes.BROKER, configEntries: entries }] })
+
+  const described = await admin.describeConfigs({
+    includeSynonyms: false,
+    includeDocumentation: true,
+    resources: [
+      { type: ConfigResourceTypes.GROUP, name: 'group-id' },
+      { type: ConfigResourceTypes.CLIENT_METRICS, name: 'metrics-subscription', configNames: ['interval.ms'] },
+    ],
+  })
+  const described0 = described.resources[0].configEntries[0]
+  const configType: ConfigTypes | undefined = described0.configType
+  const documentation: string | null | undefined = described0.documentation
+  const configSource: ConfigSource = ConfigSource.GROUP_CONFIG
+  const metricsSource: ConfigSource = ConfigSource.CLIENT_METRICS_CONFIG
+  const passwordType: ConfigTypes = ConfigTypes.PASSWORD
+  void [configType, documentation, configSource, metricsSource, passwordType]
+
+  await admin.createAcls({
+    acl: [
+      {
+        resourceType: AclResourceTypes.USER,
+        resourceName: 'User:bob',
+        resourcePatternType: ResourcePatternTypes.LITERAL,
+        principal: 'User:alice',
+        host: '*',
+        operation: AclOperationTypes.ALTER,
+        permissionType: AclPermissionTypes.ALLOW,
+      },
+    ],
+  })
+}
+void useConfigAdmin
+
+// What the new result types may hold: every nullable and optional field in its other state.
+const noTopicId: ITopicMetadata = { name: topic, partitions: [] }
+const nullTopicId: ITopicMetadata = { name: topic, partitions: [], topicId: null, isInternal: false }
+const trackedElr: PartitionMetadata = {
+  partitionErrorCode: 0,
+  partitionId: 0,
+  leader: 1,
+  replicas: [1],
+  isr: [1],
+  leaderEpoch: 3,
+  eligibleLeaderReplicas: [1],
+  lastKnownElr: [],
+}
+const untrackedElr: PartitionMetadata = { ...trackedElr, eligibleLeaderReplicas: null, lastKnownElr: null }
+const undocumented: ConfigEntries = {
+  configName: 'a',
+  configValue: 'b',
+  isDefault: true,
+  configSource: ConfigSource.DEFAULT_CONFIG,
+  isSensitive: false,
+  readOnly: false,
+  configSynonyms: [],
+  configType: ConfigTypes.STRING,
+  documentation: null,
+}
+const unmessaged: IncrementalAlterConfigsResult = {
+  resources: [{ errorCode: 0, errorMessage: null, resourceType: ConfigResourceTypes.TOPIC, resourceName: topic }],
+}
+const removed: RemoveMembersResult = [{ memberId: 'm', groupInstanceId: null, errorCode: 0, error: null }]
+const undescribed: DescribeTopicPartitionsPartition = {
+  errorCode: 0,
+  partitionIndex: 0,
+  leaderId: 1,
+  leaderEpoch: 0,
+  replicaNodes: [1],
+  isrNodes: [1],
+  eligibleLeaderReplicas: null,
+  lastKnownElr: null,
+  offlineReplicas: [],
+}
+// A topic the broker cannot describe comes back with the all-zero id, which reads as null; the schema also allows a null name.
+const unauthorized: DescribeTopicPartitionsTopic = {
+  errorCode: 29,
+  name: null,
+  topicId: null,
+  isInternal: false,
+  partitions: [],
+  topicAuthorizedOperations: 0,
+}
+const lastPage: Awaited<ReturnType<Broker['describeTopicPartitions']>> = {
+  throttleTime: 0,
+  clientSideThrottleTime: 0,
+  topics: [unauthorized],
+  nextCursor: null,
+}
+const staticLeft: Awaited<ReturnType<Broker['leaveGroup']>> = {
+  throttleTime: 0,
+  clientSideThrottleTime: 0,
+  errorCode: 0,
+  members: [{ memberId: '', groupInstanceId: null, errorCode: 0 }],
+}
+// The entry of a describeConfigs answer below DescribeConfigs v3 has neither new key.
+const bareEntry: ConfigEntries = {
+  configName: 'a',
+  configValue: 'b',
+  isDefault: true,
+  configSource: ConfigSource.DEFAULT_CONFIG,
+  isSensitive: false,
+  readOnly: false,
+  configSynonyms: [],
+}
+void [noTopicId, nullTopicId, trackedElr, untrackedElr, undocumented, unmessaged, removed, undescribed]
+void [unauthorized, lastPage, staticLeft, bareEntry]
+
+// Removing members of a group, and what a failed topic call reports.
+const useGroupAndTopicAdmin = async () => {
+  const everyone = await admin.removeMembersFromConsumerGroup({ groupId: 'g' })
+  const some = await admin.removeMembersFromConsumerGroup({
+    groupId: 'g',
+    members: [{ groupInstanceId: 'instance-1' }],
+    reason: 'the instance is gone',
+  })
+  await admin.removeMembersFromConsumerGroup({ groupId: 'g', reason: null })
+  // @ts-expect-error a member is named by its groupInstanceId
+  await admin.removeMembersFromConsumerGroup({ groupId: 'g', members: [{}] })
+  const refused = [...everyone, ...some].filter(({ error }) => error !== null)
+  const refusedType: string | undefined = refused[0].error?.type
+  const memberId: string = refused[0].memberId
+  const instance: string | null = refused[0].groupInstanceId
+  const code: number = refused[0].errorCode
+  void [refusedType, memberId, instance, code]
+
+  try {
+    await admin.deleteTopics({ topics: [topic] })
+  } catch (error) {
+    if (error instanceof KafkaJSProtocolError) {
+      const rows: Array<{ topic: string; errorCode: number }> | undefined = error.topicErrors
+      const message: string | null | undefined = error.topicErrors?.[0].errorMessage
+      const rowTopicId: string | null | undefined = error.topicErrors?.[0].topicId
+      void [rows, message, rowTopicId]
+      // @ts-expect-error a row names a topic, never a partition
+      void error.topicErrors?.[0].partition
+    }
+  }
+
+  const described = await admin.fetchTopicMetadata({ topics: [topic], useDescribeTopicPartitions: true })
+  const first = described.topics[0]
+  const topicId: string | null | undefined = first.topicId
+  const isInternal: boolean | undefined = first.isInternal
+  const partition = first.partitions[0]
+  const epoch: number | undefined = partition.leaderEpoch
+  const eligible: number[] | null | undefined = partition.eligibleLeaderReplicas
+  const lastKnown: number[] | null | undefined = partition.lastKnownElr
+  void [topicId, isInternal, epoch, eligible, lastKnown]
+  // Without topics the option takes the Metadata path, as it does without the option.
+  await admin.fetchTopicMetadata({ useDescribeTopicPartitions: true })
+  await admin.fetchTopicMetadata({ topics: [topic] })
+  await admin.fetchTopicMetadata()
+  // @ts-expect-error the option is a boolean
+  await admin.fetchTopicMetadata({ topics: [topic], useDescribeTopicPartitions: 'yes' })
+}
+void useGroupAndTopicAdmin
+
+// Leaving the group when the consumer disconnects.
+const useDisconnect = async () => {
+  await consumer.disconnect()
+  await consumer.disconnect({})
+  await consumer.disconnect({ leaveGroup: true })
+  await consumer.disconnect({ leaveGroup: false })
+  // The 2.2.4 pattern: disconnect is handed to a signal handler, which passes the signal name.
+  const onSignal: (signal: 'SIGTERM') => void = consumer.disconnect
+  void onSignal
+  // The parameters of an overloaded function come from its last signature: none, as in 2.2.4.
+  const noParameters: Parameters<Consumer['disconnect']> = []
+  // A wrapper that forwards an options argument it may not have.
+  const forwarded = (options?: { leaveGroup?: boolean }) => consumer.disconnect(options)
+  void [noParameters, forwarded]
+  // @ts-expect-error a boolean is not an options object (the runtime ignores it)
+  await consumer.disconnect(true)
+  // @ts-expect-error leaveGroup is a boolean
+  await consumer.disconnect({ leaveGroup: 'yes' })
+  await consumer.stop()
+}
+void useDisconnect
+
+// The broker methods behind the new admin calls and the group and offset additions.
+const useBrokerAdditions = async (broker: Broker) => {
+  const incremental = await broker.incrementalAlterConfigs({
+    validateOnly: false,
+    resources: [
+      {
+        type: ConfigResourceTypes.TOPIC,
+        name: topic,
+        configEntries: [{ name: 'retention.ms', operation: AlterConfigOpTypes.SET, value: '1' }],
+      },
+    ],
+  })
+  const incrementalCode: number = incremental.resources[0].errorCode
+  const incrementalThrottle: number = incremental.clientSideThrottleTime
+  void [incrementalCode, incrementalThrottle]
+  const bare = await broker.incrementalAlterConfigs({
+    resources: [{ type: ConfigResourceTypes.TOPIC, name: topic, configEntries: [] }],
+  })
+  const bareThrottle: number = bare.throttleTime
+  void bareThrottle
+  await broker.describeConfigs({ resources: [{ type: ConfigResourceTypes.TOPIC, name: topic }] })
+  await broker.describeConfigs({
+    resources: [{ type: ConfigResourceTypes.TOPIC, name: topic }],
+    includeSynonyms: true,
+    includeDocumentation: true,
+  })
+
+  const page = await broker.describeTopicPartitions({
+    topics: [topic],
+    responsePartitionLimit: 100,
+    cursor: { topicName: topic, partitionIndex: 3 },
+  })
+  await broker.describeTopicPartitions({ topics: [topic] })
+  await broker.describeTopicPartitions({ topics: [topic], cursor: null })
+  const next: { topicName: string; partitionIndex: number } | null = page.nextCursor
+  const described = page.topics[0]
+  const describedId: string | null = described.topicId
+  const describedName: string | null = described.name
+  const describedPartition = described.partitions[0]
+  const leaderId: number = describedPartition.leaderId
+  const eligible: number[] | null = describedPartition.eligibleLeaderReplicas
+  const authorized: number = described.topicAuthorizedOperations
+  void [next, describedId, describedName, leaderId, eligible, authorized]
+
+  // One member, which throws the first member's error; or several, which report each member.
+  await broker.leaveGroup({ groupId: 'g', memberId: 'm', groupInstanceId: null, reason: 'closing' })
+  await broker.leaveGroup({ groupId: 'g' })
+  const left = await broker.leaveGroup({
+    groupId: 'g',
+    members: [{ memberId: '', groupInstanceId: 'instance-1', reason: null }, { memberId: 'm2' }],
+  })
+  const memberCode: number = left.members[0].errorCode
+  const memberInstance: string | null = left.members[0].groupInstanceId
+  void [memberCode, memberInstance]
+  // @ts-expect-error a batch member has a memberId, which is empty to name a static member by instance id
+  await broker.leaveGroup({ groupId: 'g', members: [{ groupInstanceId: 'instance-1' }] })
+  // @ts-expect-error the batch form and the single-member fields exclude each other
+  await broker.leaveGroup({ groupId: 'g', memberId: 'm', members: [] })
+  await broker.syncGroup({
+    groupId: 'g',
+    generationId: 1,
+    memberId: 'm',
+    groupInstanceId: null,
+    groupAssignment: [{ memberId: 'm', memberAssignment: Buffer.alloc(0) }],
+    protocolType: 'consumer',
+    protocolName: 'RoundRobinAssigner',
+    sessionTimeout: 30000,
+    rebalanceTimeout: 60000,
+  })
+  await broker.syncGroup({ groupId: 'g', generationId: 1, memberId: 'm', groupAssignment: [] })
+
+  await broker.offsetCommit({
+    groupId: 'g',
+    groupGenerationId: 1,
+    memberId: 'm',
+    topics: [
+      {
+        topic,
+        topicId: '01020304-0506-0708-090a-0b0c0d0e0f10',
+        partitions: [{ partition: 0, offset: '5' }],
+      },
+      { topic, topicId: null, partitions: [{ partition: 0, offset: '5' }] },
+    ],
+  })
+  await broker.offsetFetch({
+    groupId: 'g',
+    topics: [{ topic, topicId: '01020304-0506-0708-090a-0b0c0d0e0f10', partitions: [{ partition: 0, offset: '0' }] }],
+  })
+  await broker.offsetFetch({ groupId: 'g', topics: [{ topic, topicId: null, partitions: [{ partition: 0, offset: '0' }] }] })
+}
+void useBrokerAdditions

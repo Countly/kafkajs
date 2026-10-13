@@ -185,6 +185,15 @@ export type PartitionMetadata = {
   replicas: number[]
   isr: number[]
   offlineReplicas?: number[]
+  /** The leader epoch (KIP-320); absent below Metadata v7. */
+  leaderEpoch?: number
+  /**
+   * The eligible leader replicas (KIP-966); only `admin.fetchTopicMetadata` with
+   * `useDescribeTopicPartitions` reports them, and `null` when the cluster does not track them.
+   */
+  eligibleLeaderReplicas?: number[] | null
+  /** The last known eligible leader replicas (KIP-966); reported and `null` as above. */
+  lastKnownElr?: number[] | null
 }
 
 export interface IHeaders {
@@ -375,6 +384,10 @@ export interface ITopicPartitionConfig {
 export interface ITopicMetadata {
   name: string
   partitions: PartitionMetadata[]
+  /** The topic's id (KIP-516); `null` when the broker sends none, absent below Metadata v10. */
+  topicId?: string | null
+  /** `true` for a Kafka internal topic; absent below Metadata v1. */
+  isInternal?: boolean
 }
 
 export interface ReplicaAssignment {
@@ -395,6 +408,7 @@ export enum AclResourceTypes {
   CLUSTER = 4,
   TRANSACTIONAL_ID = 5,
   DELEGATION_TOKEN = 6,
+  USER = 7,
 }
 
 export enum ConfigResourceTypes {
@@ -402,6 +416,8 @@ export enum ConfigResourceTypes {
   TOPIC = 2,
   BROKER = 4,
   BROKER_LOGGER = 8,
+  CLIENT_METRICS = 16,
+  GROUP = 32,
 }
 
 export enum ConfigSource {
@@ -412,6 +428,30 @@ export enum ConfigSource {
   STATIC_BROKER_CONFIG = 4,
   DEFAULT_CONFIG = 5,
   DYNAMIC_BROKER_LOGGER_CONFIG = 6,
+  CLIENT_METRICS_CONFIG = 7,
+  GROUP_CONFIG = 8,
+}
+
+/** The operation of one `incrementalAlterConfigs` entry. */
+export enum AlterConfigOpTypes {
+  SET = 0,
+  DELETE = 1,
+  APPEND = 2,
+  SUBTRACT = 3,
+}
+
+/** The value type DescribeConfigs reports for a config entry (v3 and later). */
+export enum ConfigTypes {
+  UNKNOWN = 0,
+  BOOLEAN = 1,
+  STRING = 2,
+  INT = 3,
+  SHORT = 4,
+  LONG = 5,
+  DOUBLE = 6,
+  LIST = 7,
+  CLASS = 8,
+  PASSWORD = 9,
 }
 
 export enum AclPermissionTypes {
@@ -459,6 +499,10 @@ export interface ConfigEntries {
   isSensitive: boolean
   readOnly: boolean
   configSynonyms: ConfigSynonyms[]
+  /** The value type the broker reports (DescribeConfigs v3 and later). */
+  configType?: ConfigTypes
+  /** The config's documentation; `null` unless `includeDocumentation` was asked for. */
+  documentation?: string | null
 }
 
 export interface ConfigSynonyms {
@@ -488,6 +532,45 @@ export interface IResourceConfig {
   name: string
   configEntries: IResourceConfigEntry[]
 }
+
+/** One change of `incrementalAlterConfigs`; the `value` of a DELETE is ignored. */
+export type IncrementalAlterConfigEntry =
+  | {
+      name: string
+      operation:
+        | AlterConfigOpTypes.SET
+        | AlterConfigOpTypes.APPEND
+        | AlterConfigOpTypes.SUBTRACT
+      value: string
+    }
+  | { name: string; operation: AlterConfigOpTypes.DELETE; value?: string | null }
+
+/** One resource of `incrementalAlterConfigs` and the changes to make to it. */
+export interface IncrementalResourceConfig {
+  type: ConfigResourceTypes
+  /** Empty for the cluster-wide default broker config (`type: ConfigResourceTypes.BROKER`). */
+  name: string
+  configEntries: IncrementalAlterConfigEntry[]
+}
+
+/** One result per resource, in the order given; a failed resource sets its own `errorCode`. */
+export type IncrementalAlterConfigsResult = {
+  resources: Array<{
+    errorCode: number
+    errorMessage: string | null
+    resourceType: ConfigResourceTypes
+    resourceName: string
+  }>
+}
+
+/** One result per member sent. */
+export type RemoveMembersResult = Array<{
+  memberId: string
+  groupInstanceId: string | null
+  errorCode: number
+  /** The protocol error of this member, or `null` when it was removed. */
+  error: KafkaJSProtocolError | null
+}>
 
 type ValueOf<T> = T[keyof T]
 
@@ -656,7 +739,15 @@ export type Admin = {
     timeout?: number
     topicPartitions: ITopicPartitionConfig[]
   }): Promise<boolean>
-  fetchTopicMetadata(options?: { topics: string[] }): Promise<{ topics: Array<ITopicMetadata> }>
+  /**
+   * With `useDescribeTopicPartitions` and at least one topic the topics are read through
+   * DescribeTopicPartitions (KIP-966); without topics, or on a broker that lacks the API, through
+   * Metadata, which lists every topic when none is named.
+   */
+  fetchTopicMetadata(options?: {
+    topics?: string[]
+    useDescribeTopicPartitions?: boolean
+  }): Promise<{ topics: Array<ITopicMetadata> }>
   fetchOffsets(options: {
     groupId: string
     topics?: string[]
@@ -674,10 +765,26 @@ export type Admin = {
   describeConfigs(configs: {
     resources: ResourceConfigQuery[]
     includeSynonyms: boolean
+    /** Ask for each entry's `documentation`; sent from DescribeConfigs v3. */
+    includeDocumentation?: boolean
   }): Promise<DescribeConfigResponse>
   alterConfigs(configs: { validateOnly: boolean; resources: IResourceConfig[] }): Promise<any>
+  /**
+   * A failed resource is a result with its own `errorCode`, not an error; `NOT_CONTROLLER` is
+   * retried. An invalid argument throws `KafkaJSNonRetriableError` before anything is sent.
+   */
+  incrementalAlterConfigs(configs: {
+    validateOnly?: boolean
+    resources: IncrementalResourceConfig[]
+  }): Promise<IncrementalAlterConfigsResult>
   listGroups(options?: ListGroupsOptions): Promise<{ groups: GroupOverview[] }>
   deleteGroups(groupIds: string[]): Promise<DeleteGroupsResult[]>
+  /** Without `members`, removes every member `describeGroups` reports. */
+  removeMembersFromConsumerGroup(options: {
+    groupId: string
+    members?: Array<{ groupInstanceId: string }>
+    reason?: string | null
+  }): Promise<RemoveMembersResult>
   describeGroups(groupIds: string[]): Promise<GroupDescriptions>
   describeAcls(options: AclFilter): Promise<DescribeAclResponse>
   deleteAcls(options: { filters: AclFilter[] }): Promise<DeleteAclResponse>
@@ -828,6 +935,42 @@ export interface ApiVersions {
   }
 }
 
+/** The topic and partition a page resumes from. */
+export type DescribeTopicPartitionsCursor = { topicName: string; partitionIndex: number }
+
+/** One partition of a DescribeTopicPartitions page. */
+export type DescribeTopicPartitionsPartition = {
+  errorCode: number
+  partitionIndex: number
+  leaderId: number
+  leaderEpoch: number
+  replicaNodes: number[]
+  isrNodes: number[]
+  /** `null` when the cluster does not track eligible leader replicas, `[]` when none is eligible. */
+  eligibleLeaderReplicas: number[] | null
+  lastKnownElr: number[] | null
+  offlineReplicas: number[]
+}
+
+/** One topic of a DescribeTopicPartitions page; one the broker cannot describe sets `errorCode`. */
+export type DescribeTopicPartitionsTopic = {
+  errorCode: number
+  name: string | null
+  /** `null` for a topic the broker cannot describe (the all-zero id). */
+  topicId: string | null
+  isInternal: boolean
+  partitions: DescribeTopicPartitionsPartition[]
+  topicAuthorizedOperations: number
+}
+
+/** One member of a batch `leaveGroup`. */
+export type LeaveGroupMember = {
+  /** Empty to name a static member by its instance id alone. */
+  memberId: string
+  groupInstanceId?: string | null
+  reason?: string | null
+}
+
 export type Broker = {
   /**
    * The finalized features of the ApiVersions response the broker's current versions came from;
@@ -849,12 +992,15 @@ export type Broker = {
     retentionTime?: number
     topics: Array<{
       topic: string
+      /** When every entry has one the request is keyed by id and may go out at OffsetCommit v10. */
+      topicId?: string | null
       partitions: Array<PartitionOffset & { leaderEpoch?: number }>
     }>
   }): Promise<any>
   offsetFetch(request: {
     groupId: string
-    topics: TopicOffsets[]
+    /** An entry may carry `topicId`; the request is keyed by id when every entry does. */
+    topics: Array<TopicOffsets & { topicId?: string | null }>
     memberId?: string | null
     memberEpoch?: number
     /** Hold back offsets with a transactional commit pending (KIP-447); default false. */
@@ -943,6 +1089,64 @@ export type Broker = {
     topics?: TopicPartitions[]
     timeout?: number
   }): Promise<ListPartitionReassignmentsResponse>
+  /** `includeDocumentation` is sent from DescribeConfigs v3 and ignored by older versions. */
+  describeConfigs(request: {
+    resources: ResourceConfigQuery[]
+    includeSynonyms?: boolean
+    includeDocumentation?: boolean
+  }): Promise<any>
+  /** A failed resource is a result with its own `errorCode`, not an error. */
+  incrementalAlterConfigs(request: {
+    resources: IncrementalResourceConfig[]
+    validateOnly?: boolean
+  }): Promise<
+    IncrementalAlterConfigsResult & { throttleTime: number; clientSideThrottleTime: number }
+  >
+  /** One page; resume from `nextCursor`, which is `null` after the last page. */
+  describeTopicPartitions(request: {
+    topics: string[]
+    responsePartitionLimit?: number
+    cursor?: DescribeTopicPartitionsCursor | null
+  }): Promise<{
+    throttleTime: number
+    clientSideThrottleTime: number
+    topics: DescribeTopicPartitionsTopic[]
+    nextCursor: DescribeTopicPartitionsCursor | null
+  }>
+  /**
+   * One member, which throws that member's error, or `members`, which reports each member's own
+   * `errorCode` and throws only for a top-level error. Kafka 4.x answers LeaveGroup v3 or later,
+   * which carries `members`.
+   */
+  leaveGroup(
+    request:
+      | {
+          groupId: string
+          memberId?: string
+          groupInstanceId?: string | null
+          reason?: string | null
+          members?: undefined
+        }
+      | { groupId: string; members: LeaveGroupMember[] }
+  ): Promise<{
+    throttleTime: number
+    clientSideThrottleTime: number
+    errorCode: number
+    members: Array<{ memberId: string; groupInstanceId: string | null; errorCode: number }>
+  }>
+  /** The leader sends every member's assignment; each member receives its own. */
+  syncGroup(request: {
+    groupId: string
+    generationId: number
+    memberId: string
+    groupInstanceId?: string | null
+    groupAssignment: Array<{ memberId: string; memberAssignment: Buffer }>
+    /** The request goes out at SyncGroup v5 only when both are given, and at v4 otherwise. */
+    protocolType?: string | null
+    protocolName?: string | null
+    sessionTimeout?: number
+    rebalanceTimeout?: number
+  }): Promise<any>
   offsetForLeaderEpoch(request: {
     topics: Array<{
       topic: string
@@ -1488,6 +1692,16 @@ export type ConsumerSubscribeRegex = {
 
 export type Consumer = {
   connect(): Promise<void>
+  /**
+   * `leaveGroup: true` makes the member leave the group, so its partitions are handed over at
+   * once, even a static member, which otherwise stays until its `sessionTimeout`; `false` skips
+   * the leave a dynamic member sends by default, and the group notices when the session or the
+   * heartbeat expires. An omitted `leaveGroup` keeps the default. An argument that is not an
+   * options object is ignored at run time, as in 2.2.4; the signature rejects it, but passing
+   * `consumer.disconnect` itself to a signal handler still compiles. The signature without
+   * parameters comes last so that `Parameters<Consumer['disconnect']>` is `[]`, as in 2.2.4.
+   */
+  disconnect(options?: { leaveGroup?: boolean }): Promise<void>
   disconnect(): Promise<void>
   subscribe(
     subscription: ConsumerSubscribeTopics | ConsumerSubscribeTopic | ConsumerSubscribeRegex
@@ -1664,6 +1878,16 @@ export class KafkaJSProtocolError extends KafkaJSError {
   readonly errorMessage?: string | null
   /** The records the broker rejected individually out of a failed produce batch (KIP-467) */
   readonly recordErrors?: ProduceRecordError[]
+  /**
+   * Set on what `admin.deleteTopics` and `admin.createPartitions` throw: every topic the broker
+   * failed, where the error itself names the first one's code.
+   */
+  readonly topicErrors?: Array<{
+    topic: string
+    errorCode: number
+    errorMessage?: string | null
+    topicId?: string | null
+  }>
   constructor(e: Error | string)
 }
 
