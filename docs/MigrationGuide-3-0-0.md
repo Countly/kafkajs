@@ -343,6 +343,11 @@ transaction in a way its error decides.
   *What to do:* abort, let the consumer rejoin, reprocess from the committed offsets. A
   classic-protocol member sees code 22 and a `groupProtocol: 'consumer'` member sees 113 for the
   same condition.
+- **A transactional producer refused `InitProducerId` is told which ACL to grant.** The message
+  for `CLUSTER_AUTHORIZATION_FAILED` (code 31) now names `IDEMPOTENT_WRITE` on the cluster, or
+  `WRITE` on any topic from Kafka 2.8, and no longer suggests `idempotent: false`, which a producer
+  with a `transactionalId` cannot use. *What to do:* nothing; match on the error class, not its
+  text.
 
 ### Consumer
 

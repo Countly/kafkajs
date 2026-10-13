@@ -503,4 +503,27 @@ describe('Producer > KIP-951 leader hint', () => {
     // is what recovers, exactly as it would with no hint at all.
     expect(produced.map(({ nodeId }) => nodeId)).toEqual([1, 1])
   })
+
+  test('a rejecting applyLeaderHint leaves the produce error as what the retries ran out on', async () => {
+    const { cluster } = createHintCluster({
+      answer: async () => {
+        throw await notLeaderWithHint({ leaderId: 2, leaderEpoch: 6 })
+      },
+    })
+    cluster.applyLeaderHint = jest.fn(async () => {
+      throw new Error('applyLeaderHint rejected')
+    })
+    // One attempt and no retry: whatever the first attempt throws is what the call ends with. A
+    // hint failure that replaced the produce error would end it with that failure instead.
+    const send = createSend({ cluster, retrier: createRetry({ retries: 0 }) })
+
+    const error = await send({ acks: -1, timeout: 30000, topicMessages }).catch((e) => e)
+
+    expect(error.name).toBe('KafkaJSNumberOfRetriesExceeded')
+    expect(error.cause).toMatchObject({
+      name: 'KafkaJSProtocolError',
+      type: 'NOT_LEADER_FOR_PARTITION',
+    })
+    expect(cluster.applyLeaderHint).toHaveBeenCalledTimes(1)
+  })
 })

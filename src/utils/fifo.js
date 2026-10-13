@@ -6,7 +6,10 @@
  * index instead: `shift()` reads the slot at the head and clears it, so a settled item is not
  * retained. When the head passes half of the array the live items are copied out once with
  * `Array#slice`, which is the only place the backing array is rebuilt, so the cost of a shift
- * stays amortised O(1) and the array never holds more than twice the live items.
+ * stays amortised O(1) and, under `push` and `shift` alone, the array never holds more than twice
+ * the live items. `remove` does not compact: it can leave cleared (`undefined`) slots in front of
+ * the live items, even with none left, until the next `shift` that returns an item or a `clear()`.
+ * Those slots hold no references.
  *
  * Not safe to change while it is being iterated. Items are compared by identity.
  * @template T

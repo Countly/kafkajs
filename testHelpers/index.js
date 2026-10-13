@@ -282,7 +282,12 @@ const waitForConsumerToJoinGroup = (consumer, { maxWait = 10000, label = '' } = 
 const CREATE_TOPIC_ATTEMPTS = 10
 const CREATE_TOPIC_RETRY_MS = 200
 const TOPIC_PROPAGATION_DELAY_MS = 100
-const TOPIC_PROPAGATION_MAX_WAIT_MS = 10000
+// Bounds both waits of createTopic(): the controller's leader wait inside admin.createTopics and
+// the all-brokers metadata wait after it. 10 s timed out in setup on a 3-node KRaft cluster under
+// host load (load average about 7 on 12 cores). A timeout is not retried, so a hook spends at most
+// two of these, 60 s, inside the 90 s test timeout. The same value is the CreateTopics request's
+// wire timeoutMs, a third bound that only a controller slower than 30 s to commit would reach.
+const TOPIC_PROPAGATION_MAX_WAIT_MS = 30000
 
 // One connection per broker per test file, not per createTopic() call: reconnecting on every
 // fixture topic floods the brokers with handshakes. `testHelpers/setup.js` closes them in afterAll.
@@ -359,6 +364,7 @@ const createTopic = async ({ topic, partitions = 1, replicas = 1, config = [] })
       try {
         await admin.createTopics({
           waitForLeaders: true,
+          timeout: TOPIC_PROPAGATION_MAX_WAIT_MS,
           topics: [
             {
               topic,

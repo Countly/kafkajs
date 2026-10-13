@@ -87,7 +87,8 @@ class ProducerStateManager {
    * @param {import('../../../types').Logger} options.logger
    * @param {boolean} [options.transactional=false]
    * @param {string|null} [options.transactionalId=null] sent on InitProducerId by a
-   *   transactional producer only
+   *   transactional manager only; a manager given one, whether or not it is transactional, belongs
+   *   to a transactional producer, which changes the advice a refused InitProducerId carries
    * @param {number} options.transactionTimeout
    * @param {import('../../../types').RetryOptions} [options.retry={}] the producer's retry
    *   options: `retries` bounds every batch's re-sends, and the requests this class makes on the
@@ -118,6 +119,7 @@ class ProducerStateManager {
     this.#identity = new ProducerIdAndEpoch({
       logger,
       transactionalId: transactional ? transactionalId : null,
+      transactionalProducer: Boolean(transactionalId),
       transactionTimeout,
       findBroker,
       onReset: () => this.#resetSequences(),

@@ -16,9 +16,11 @@ const MAX_PRODUCER_EPOCH = 32767
 const FIRST_EPOCH_BUMPING_VERSION = 3
 
 const CLUSTER_AUTHORIZATION_FAILED = 31
+/** @see https://cwiki.apache.org/confluence/display/KAFKA/KIP-679%3A+Producer+will+enable+the+strongest+delivery+guarantee+by+default */
 const CLUSTER_AUTHORIZATION_MESSAGE =
   'The broker refused InitProducerId: the principal needs IDEMPOTENT_WRITE on the cluster ' +
-  '(or WRITE on any topic, from Kafka 2.8), or create the producer with idempotent: false'
+  '(or WRITE on any topic, from Kafka 2.8)'
+const IDEMPOTENT_REMEDY = ', or create the producer with idempotent: false'
 
 /**
  * The producer's identity - its producer id and epoch - and the four ways it changes:
@@ -43,6 +45,7 @@ const CLUSTER_AUTHORIZATION_MESSAGE =
 class ProducerIdAndEpoch {
   #logger
   #transactionalId
+  #transactionalProducer
   #transactionTimeout
   #findBroker
   #onReset
@@ -54,15 +57,26 @@ class ProducerIdAndEpoch {
    * @param {object} options
    * @param {import('../../../types').Logger} options.logger
    * @param {string|null} [options.transactionalId=null] null for an idempotent-only producer
+   * @param {boolean} [options.transactionalProducer=false] whether the producer this identity
+   *   belongs to has a transactional id, though this identity may send none: such a producer is
+   *   idempotent by necessity, so a refusal is not answered with `idempotent: false`
    * @param {number} options.transactionTimeout sent as InitProducerId's TransactionTimeoutMs
    * @param {() => Promise<import('../../../types').Broker>} options.findBroker the broker every
    *   InitProducerId goes to - the transaction coordinator, or any broker for an idempotent-only
    *   producer - asked again for every request
    * @param {() => void} options.onReset restarts every partition's sequences
    */
-  constructor({ logger, transactionalId = null, transactionTimeout, findBroker, onReset }) {
+  constructor({
+    logger,
+    transactionalId = null,
+    transactionalProducer = false,
+    transactionTimeout,
+    findBroker,
+    onReset,
+  }) {
     this.#logger = logger
     this.#transactionalId = transactionalId
+    this.#transactionalProducer = transactionalProducer
     this.#transactionTimeout = transactionTimeout
     this.#findBroker = findBroker
     this.#onReset = onReset
@@ -216,7 +230,8 @@ class ProducerIdAndEpoch {
 
   /**
    * Sends one InitProducerId. CLUSTER_AUTHORIZATION_FAILED (31) becomes a configuration error
-   * naming both remedies, its `cause` the broker's error; every other error is rethrown as is.
+   * naming the ACL to grant - and, for a producer without a transactional id, the option that turns
+   * idempotence off - its `cause` the broker's error; every other error is rethrown as is.
    * @param {import('../../../types').Broker} broker
    * @param {{ producerId: string|number, producerEpoch: number }} pair
    * @returns {Promise<{ producerId: string, producerEpoch: number }>}
@@ -231,7 +246,12 @@ class ProducerIdAndEpoch {
       })
     } catch (e) {
       if (e.code === CLUSTER_AUTHORIZATION_FAILED) {
-        throw new KafkaJSInvalidConfigurationError(CLUSTER_AUTHORIZATION_MESSAGE, { cause: e })
+        throw new KafkaJSInvalidConfigurationError(
+          this.#transactionalProducer
+            ? CLUSTER_AUTHORIZATION_MESSAGE
+            : CLUSTER_AUTHORIZATION_MESSAGE + IDEMPOTENT_REMEDY,
+          { cause: e }
+        )
       }
 
       throw e

@@ -272,7 +272,6 @@ module.exports = class Connection {
       const isCurrentAttempt = () => this.connectAttempt === attempt
 
       const abort = (error) => {
-        if (!isCurrentAttempt()) return
         clearTimeout(timeoutId)
         this[PRIVATE.ABORT_CONNECT] = null
         reject(error)
@@ -463,10 +462,6 @@ module.exports = class Connection {
   [PRIVATE.SHOULD_REAUTHENTICATE]() {
     if (this.sessionLifetime.equals(Long.ZERO)) {
       return false
-    }
-
-    if (this.authenticatedAt == null) {
-      return true
     }
 
     const [secondsSince, remainingNanosSince] = process.hrtime(this.authenticatedAt)

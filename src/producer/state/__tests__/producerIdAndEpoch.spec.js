@@ -39,16 +39,17 @@ const createCoordinator = ({ maxVersion = 5, answers }) => ({
 })
 
 /**
- * @param {{ transactionalId?: string|null, coordinator: object }} options
+ * @param {{ transactionalId?: string|null, transactionalProducer?: boolean, coordinator: object }} options
  * @returns {{ identity: ProducerIdAndEpoch, onReset: jest.Mock, findBroker: jest.Mock, logger: object }}
  */
-const build = ({ transactionalId = TRANSACTIONAL_ID, coordinator }) => {
+const build = ({ transactionalId = TRANSACTIONAL_ID, transactionalProducer, coordinator }) => {
   const onReset = jest.fn()
   const findBroker = jest.fn(async () => coordinator)
   const logger = newLogger()
   const identity = new ProducerIdAndEpoch({
     logger,
     transactionalId,
+    transactionalProducer,
     transactionTimeout: TRANSACTION_TIMEOUT,
     findBroker,
     onReset,
@@ -123,6 +124,27 @@ describe('ProducerIdAndEpoch', () => {
       expect(identity.isValid()).toBe(false)
       expect(onReset).not.toHaveBeenCalled()
     })
+
+    test.each([
+      ['the idempotent identity of a producer that has a transactional id', null],
+      ['the transactional identity of a producer that has a transactional id', TRANSACTIONAL_ID],
+    ])(
+      'CLUSTER_AUTHORIZATION_FAILED for %s names the ACL to grant and nothing else',
+      async (_, transactionalId) => {
+        const refusal = createErrorFromCode(CLUSTER_AUTHORIZATION_FAILED)
+        const coordinator = createCoordinator({ answers: [refusal] })
+        const { identity } = build({ transactionalId, transactionalProducer: true, coordinator })
+
+        const error = await identity.initialize().catch((e) => e)
+
+        expect(error).toBeInstanceOf(KafkaJSInvalidConfigurationError)
+        expect(error.message).toEqual(
+          'The broker refused InitProducerId: the principal needs IDEMPOTENT_WRITE on the cluster ' +
+            '(or WRITE on any topic, from Kafka 2.8)'
+        )
+        expect(error.cause).toBe(refusal)
+      }
+    )
 
     test('after a refusal, the next initialize() - what a later send re-runs - acquires a pair', async () => {
       const coordinator = createCoordinator({

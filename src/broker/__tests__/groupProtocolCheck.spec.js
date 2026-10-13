@@ -204,18 +204,21 @@ describe('Broker > the protocol the coordinator reports', () => {
     const rebalance = (protocol) =>
       protocol.rebalance({ topics: [], topicsSubscribed: [], beforeSync: () => {} })
 
+    /** A coordinator whose join reports the consumer protocol type and the one assigner. */
+    const joinedCoordinator = () => ({
+      joinGroup: jest.fn(async () => ({
+        generationId: 5,
+        leaderId: 'someone-else',
+        memberId: 'm',
+        members: [],
+        protocolType: 'consumer',
+        groupProtocol: 'RoundRobinAssigner',
+      })),
+      syncGroup: jest.fn(async () => ({ memberAssignment: Buffer.alloc(0) })),
+    })
+
     test('names its protocol type on JoinGroup, and on SyncGroup the type and the protocol the join reported', async () => {
-      const coordinator = {
-        joinGroup: jest.fn(async () => ({
-          generationId: 5,
-          leaderId: 'someone-else',
-          memberId: 'm',
-          members: [],
-          protocolType: 'consumer',
-          groupProtocol: 'RoundRobinAssigner',
-        })),
-        syncGroup: jest.fn(async () => ({ memberAssignment: Buffer.alloc(0) })),
-      }
+      const coordinator = joinedCoordinator()
 
       await rebalance(protocolFor({ findGroupCoordinator: async () => coordinator }))
 
@@ -225,6 +228,16 @@ describe('Broker > the protocol the coordinator reports', () => {
       expect(coordinator.syncGroup).toHaveBeenCalledWith(
         expect.objectContaining({ protocolType: 'consumer', protocolName: 'RoundRobinAssigner' })
       )
+    })
+
+    test('forgets the protocol type the join reported when the generation is reset', async () => {
+      const protocol = protocolFor({ findGroupCoordinator: async () => joinedCoordinator() })
+      await rebalance(protocol)
+      expect(protocol.protocolType).toBe('consumer')
+
+      protocol.resetGeneration()
+
+      expect(protocol.protocolType).toBeNull()
     })
 
     describe('over a fake socket', () => {

@@ -587,6 +587,22 @@ describe('Producer > the idempotent drain loop', () => {
       expect(harness.sent()[2]).toEqual({ nodeId: 1, epoch: 0, partitions: ['topic-a/1@0'] })
     })
 
+    test('a send resolves with a RecordMetadata of exactly six keys, whatever else the broker answered with', async () => {
+      const harness = createHarness()
+      await harness.start()
+
+      const [metadata] = await harness.send([{ topic: TOPIC, messages: records(0) }])
+
+      expect(Object.keys(metadata).sort()).toEqual([
+        'baseOffset',
+        'errorCode',
+        'logAppendTime',
+        'logStartOffset',
+        'partition',
+        'topicName',
+      ])
+    })
+
     test('two concurrent sends over the same two partitions in opposite order both complete', async () => {
       const harness = createHarness()
       await harness.start()
