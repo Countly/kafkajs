@@ -34,6 +34,8 @@ await consumer.subscribe({ topics: [/topic-(eu|us)-.*/i] })
 
 When suppling a regular expression, the consumer will not match topics created after the subscription. If your broker has `topic-A` and `topic-B`, you subscribe to `/topic-.*/`, then `topic-C` is created, your consumer would not be automatically subscribed to `topic-C`.
 
+The regular expression is matched against the metadata of every topic, which a partition without a leader does not fail: `subscribe()` resolves while a topic the expression does not match has a partition without a leader. The topics it does match are then asked for by name, and a partition of theirs without a leader is retried within the `retry` budget, after which `subscribe()` rejects.
+
 KafkaJS offers you two ways to process your data: `eachMessage` and `eachBatch`
 
 ## <a name="each-message"></a> eachMessage

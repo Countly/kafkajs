@@ -783,6 +783,11 @@ says so, `groupProtocol: 'consumer'`.
   consumer that restarts as the same static member needs nothing. `stop()` takes no option, a
   crash restart keeps the default, and an options object whose `leaveGroup` is not a boolean throws
   `KafkaJSNonRetriableError` before anything is stopped.
+- **A regex `subscribe()` no longer fails while a partition elsewhere has no leader.**
+  `consumer.subscribe({ topics: [/re/] })` reads the metadata of every topic, which used to fail
+  with `LEADER_NOT_AVAILABLE`, once the cluster's retries ran out, whenever any partition had no
+  leader. A topic the expression matches still needs a leader for every partition before
+  `subscribe()` resolves. *What to do:* nothing; a spurious failure is gone.
 
 ### Admin
 
@@ -858,6 +863,22 @@ Group visibility and the admin client.
   resolve one result per item and do not throw for an item's own error, so check each result's
   `errorCode` (or its `error`). Prefer `incrementalAlterConfigs` over `alterConfigs`, which replaces
   a resource's whole dynamic config.
+- **`describeCluster`, `listTopics` and `fetchTopicMetadata()` no longer fail while a partition
+  has no leader.** Neither do the admin calls that refresh the metadata first, such as
+  `createTopics` and `describeConfigs`, unless one of the admin's target topics (a topic it has read
+  or reset offsets of, or deleted records from) has a partition without a leader. They used to fail
+  with `LEADER_NOT_AVAILABLE`, after retries, whenever any partition in the cluster had no leader.
+  `fetchTopicMetadata()` with no topics now returns such a partition with its `partitionErrorCode`
+  and `leader: -1` instead of waiting. *What to do:* code that used `fetchTopicMetadata()` to wait
+  for leaders should name the topics: a named request still waits.
+- **`deleteTopicRecords` retries connection errors.** A retriable error without per-partition
+  detail, such as `KafkaJSConnectionError`, used to hit a `TypeError` in the method's own error
+  handling, which the retrier reported at once as `KafkaJSNonRetriableError`; it is now retried, and
+  the call ends in success or in `KafkaJSNumberOfRetriesExceeded` whose `cause` is the connection
+  error. It also works as an admin's first call now, where 2.2.4 failed with
+  `KafkaJSTopicMetadataNotLoaded`. *What to do:* a transient connection failure no longer aborts
+  `deleteTopicRecords`; if you caught `KafkaJSNonRetriableError` from it, expect
+  `KafkaJSNumberOfRetriesExceeded` after the retry budget instead.
 
 ### Errors and events
 

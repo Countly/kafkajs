@@ -1215,8 +1215,9 @@ module.exports = ({
    * DescribeTopicPartitions (KIP-966) instead: any broker answers, pages are followed to the end
    * (a broker whose pages repeat, or that leaves a topic unanswered, fails the call), each
    * partition also reports `eligibleLeaderReplicas` and `lastKnownElr`, a partition without a
-   * leader is returned with its error code instead of being waited for, and a topic that does not
-   * exist fails the call rather than being created. A failed request is retried on the `retry`
+   * leader is returned with `leader: -1` instead of being waited for (Kafka 4.1.2 and 4.3 brokers
+   * leave its `partitionErrorCode` at 0; a non-zero code is passed through), and a topic that does
+   * not exist fails the call rather than being created. A failed request is retried on the `retry`
    * budget, as the other admin calls are. A broker that does not offer the API is asked through
    * Metadata after all. Without topics the option is ignored: the API cannot list every topic.
    *
@@ -1566,11 +1567,28 @@ module.exports = ({
   }
 
   /**
-   * Delete topic records up to the selected partition offsets
+   * Delete topic records up to the selected partition offsets.
+   *
+   * The topic's offsets are read first, through a refresh that names the topic, which waits for a
+   * partition without a leader within the `retry` budget and then fails. The partitions' leaders
+   * are looked up next, inside the retrier: a cached leader of -1 refreshes the metadata and goes
+   * round again, as the Java `Admin#deleteRecords` retries its leader lookup, and so does any
+   * retriable failure. The request to each leader is built on the first attempt that finds them all
+   * and kept: a broker that already answered is not asked again, and a retry goes to the node it
+   * was built for, after a stale-metadata answer too.
+   * @see https://github.com/apache/kafka/blob/4.3/clients/src/main/java/org/apache/kafka/clients/admin/internals/PartitionLeaderStrategy.java
    *
    * @param {string} topic
    * @param {Array<SeekEntry>} partitions
    * @return {Promise}
+   * @throws {KafkaJSDeleteTopicRecordsError} at once, not retried, when a requested partition is
+   *   not in the topic's metadata, once the offsets read has succeeded: a topic that stays
+   *   leaderless fails that read first, with the `KafkaJSNonRetriableError` below
+   * @throws {KafkaJSNumberOfRetriesExceeded} when a retriable failure outlives the `retry` budget;
+   *   its `cause` is the last failure
+   * @throws {KafkaJSNonRetriableError} when a broker refuses a partition for good (its `cause` is
+   *   the `KafkaJSDeleteTopicRecordsError` naming the partitions), or when the offsets read fails,
+   *   as for a partition that stays without a leader (`type` `LEADER_NOT_AVAILABLE`)
    *
    * @typedef {Object} SeekEntry
    * @property {number} partition
@@ -1585,62 +1603,67 @@ module.exports = ({
       throw new KafkaJSNonRetriableError(`Invalid partitions`)
     }
 
-    const partitionsByBroker = cluster.findLeaderForPartitions(
-      topic,
-      partitions.map((p) => p.partition)
-    )
-
-    const partitionsFound = values(partitionsByBroker).flat()
     const topicOffsets = await fetchTopicOffsets(topic)
-
-    const leaderNotFoundErrors = []
-    partitions.forEach(({ partition, offset }) => {
-      // throw if no leader found for partition
-      if (!partitionsFound.includes(partition)) {
-        leaderNotFoundErrors.push({
-          partition,
-          offset,
-          error: new KafkaJSBrokerNotFound('Could not find the leader for the partition', {
-            retriable: false,
-          }),
-        })
-        return
-      }
-      const { low } = topicOffsets.find((p) => p.partition === partition) || {
-        high: undefined,
-        low: undefined,
-      }
-      // warn in case of offset below low watermark
-      if (parseInt(offset) < parseInt(low) && parseInt(offset) !== -1) {
-        logger.warn(
-          'The requested offset is before the earliest offset maintained on the partition - no records will be deleted from this partition',
-          {
-            topic,
-            partition,
-            offset,
-          }
-        )
-      }
-    })
-
-    if (leaderNotFoundErrors.length > 0) {
-      throw new KafkaJSDeleteTopicRecordsError({ topic, partitions: leaderNotFoundErrors })
-    }
-
-    const seekEntriesByBroker = entries(partitionsByBroker).reduce(
-      (obj, [nodeId, nodePartitions]) => {
-        obj[nodeId] = {
-          topic,
-          partitions: partitions.filter((p) => nodePartitions.includes(p.partition)),
-        }
-        return obj
-      },
-      {}
-    )
+    /** @type {Object<string, { topic: string, partitions: SeekEntry[] }>|null} */
+    let seekEntriesByBroker = null
 
     const retrier = createRetry(retry)
     return retrier(async (bail) => {
       try {
+        if (seekEntriesByBroker === null) {
+          const partitionsByBroker = cluster.findLeaderForPartitions(
+            topic,
+            partitions.map((p) => p.partition)
+          )
+
+          const partitionsFound = values(partitionsByBroker).flat()
+          const leaderNotFoundErrors = []
+          partitions.forEach(({ partition, offset }) => {
+            if (!partitionsFound.includes(partition)) {
+              leaderNotFoundErrors.push({
+                partition,
+                offset,
+                error: new KafkaJSBrokerNotFound('Could not find the leader for the partition', {
+                  retriable: false,
+                }),
+              })
+              return
+            }
+            const { low } = topicOffsets.find((p) => p.partition === partition) || {
+              high: undefined,
+              low: undefined,
+            }
+            // warn in case of offset below low watermark
+            if (parseInt(offset) < parseInt(low) && parseInt(offset) !== -1) {
+              logger.warn(
+                'The requested offset is before the earliest offset maintained on the partition - no records will be deleted from this partition',
+                {
+                  topic,
+                  partition,
+                  offset,
+                }
+              )
+            }
+          })
+
+          if (leaderNotFoundErrors.length > 0) {
+            return bail(
+              new KafkaJSDeleteTopicRecordsError({ topic, partitions: leaderNotFoundErrors })
+            )
+          }
+
+          seekEntriesByBroker = entries(partitionsByBroker).reduce(
+            (obj, [nodeId, nodePartitions]) => {
+              obj[nodeId] = {
+                topic,
+                partitions: partitions.filter((p) => nodePartitions.includes(p.partition)),
+              }
+              return obj
+            },
+            {}
+          )
+        }
+
         const partitionErrors = []
 
         const brokerRequests = entries(seekEntriesByBroker).map(
@@ -1681,9 +1704,10 @@ module.exports = ({
       } catch (e) {
         if (
           e.retriable &&
-          e.partitions.some(
-            ({ error }) => staleMetadata(error) || error.name === 'KafkaJSMetadataNotLoaded'
-          )
+          (staleMetadata(e) ||
+            e.partitions?.some(
+              ({ error }) => staleMetadata(error) || error.name === 'KafkaJSMetadataNotLoaded'
+            ))
         ) {
           await cluster.refreshMetadata()
         }

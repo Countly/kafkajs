@@ -1,3 +1,5 @@
+const { failure, createErrorFromCode } = require('../../error')
+
 const versions = {
   0: ({ topics }) => {
     const request = require('./v0/request')
@@ -71,7 +73,44 @@ const versions = {
   },
 }
 
+/**
+ * Parses the answer to a request for every topic. Only the top-level error code, which v13 added
+ * (`REBOOTSTRAP_REQUIRED`, say), throws; a topic or partition error code stays in the data, so
+ * one leaderless partition anywhere in the cluster does not fail the whole answer. The Java
+ * `Admin#listTopics` reads such an answer the same way.
+ * @see https://github.com/apache/kafka/blob/4.3/clients/src/main/java/org/apache/kafka/clients/admin/KafkaAdminClient.java
+ * @param {object} data the decoded response
+ * @returns {Promise<object>} data, unchanged
+ * @throws {import('../../../errors').KafkaJSProtocolError} on a top-level error code
+ */
+const parseAllTopics = async (data) => {
+  if (data.errorCode != null && failure(data.errorCode)) {
+    throw createErrorFromCode(data.errorCode)
+  }
+
+  return data
+}
+
+/**
+ * Builds one request at `version`. A request for every topic, an empty `topics` list written as
+ * the null array, is parsed by `parseAllTopics`; a request that names topics keeps its version's
+ * own parse, which throws the first topic, then partition, error code.
+ * @param {number|string} version
+ * @param {{ topics?: Array<string|{ topicId: string }>, allowAutoTopicCreation?: boolean }} options
+ *   `topics` is absent only when a request is built for its api key and version alone
+ * @returns {{ request: object, response: { decode: Function, parse: Function } }}
+ */
+const build = (version, options) => {
+  const built = versions[version](options)
+  return options.topics?.length === 0
+    ? { ...built, response: { ...built.response, parse: parseAllTopics } }
+    : built
+}
+
 module.exports = {
   versions: Object.keys(versions),
-  protocol: ({ version }) => versions[version],
+  protocol:
+    ({ version }) =>
+    (options) =>
+      build(version, options),
 }

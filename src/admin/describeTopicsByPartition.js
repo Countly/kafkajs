@@ -141,8 +141,10 @@ const toPartitionMetadata = (partition) => ({
  *
  * A topic the broker failed (unknown, not authorized) did not stop the others from being read; the
  * call rejects with the error of the first failing topic in name order. A partition's own error
- * code, such as a missing leader, is data in `partitionErrorCode`: unlike a Metadata request for
- * named topics, this path never waits for leaders. DescribeTopicPartitions never creates a topic.
+ * code is data in `partitionErrorCode`, passed through as the broker sends it. A missing leader
+ * shows as `leader: -1`: Kafka 4.1.2 and 4.3 brokers leave the code at 0 for it, so check the
+ * leader to find a leaderless partition. Unlike a Metadata request for named topics, this path
+ * never waits for leaders. DescribeTopicPartitions never creates a topic.
  * @param {PageTopic[]} rows in name order
  * @returns {{ topics: object[] }}
  * @throws {KafkaJSProtocolError} for the first failing topic

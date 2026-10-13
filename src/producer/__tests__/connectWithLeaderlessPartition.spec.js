@@ -1,7 +1,9 @@
 const createProducer = require('../index')
 const Cluster = require('../../cluster')
 const COORDINATOR_TYPES = require('../../protocol/coordinatorTypes')
-const { parse: parseMetadata } = require('../../protocol/requests/metadata/v13/response')
+const {
+  requests: { Metadata },
+} = require('../../protocol/requests')
 const { KafkaJSConnectionError, KafkaJSRequestTimeoutError } = require('../../errors')
 const { createErrorFromCode } = require('../../protocol/error')
 const { newLogger, connectionOpts } = require('testHelpers')
@@ -38,12 +40,13 @@ const topicMetadata = (topic, partitionErrorCode = 0) => ({
 })
 
 /**
- * A Metadata answer through the real response parse: the topics asked for are healthy, and a
- * request for every topic also carries `unrelated`, whose only partition has no leader.
+ * A Metadata answer through the parse the request selects (`Metadata` at v13): the topics
+ * asked for are healthy, and a request for every topic also carries `unrelated`, whose only
+ * partition has no leader.
  * @param {string[]} topics
  */
 const answerMetadata = (topics) =>
-  parseMetadata({
+  Metadata.protocol({ version: 13 })({ topics }).response.parse({
     throttleTime: 0,
     errorCode: 0,
     clusterId: 'fake',
@@ -134,12 +137,13 @@ describe('Producer > connect while an unrelated partition has no leader', () => 
     await cluster.disconnect()
   })
 
-  test('the all-topics Metadata of this cluster fails, as a real one does', async () => {
+  test('the all-topics Metadata of this cluster carries the partition with no leader, as a real one does', async () => {
     await cluster.connect()
-    await expect(cluster.refreshMetadata()).rejects.toMatchObject({
-      name: 'KafkaJSNumberOfRetriesExceeded',
-      cause: expect.objectContaining({ type: 'LEADER_NOT_AVAILABLE' }),
-    })
+    await cluster.refreshMetadata()
+
+    expect(cluster.findTopicPartitionMetadata('unrelated')).toEqual([
+      expect.objectContaining({ partitionErrorCode: LEADER_NOT_AVAILABLE, leader: -1 }),
+    ])
   })
 
   test.each([

@@ -35,6 +35,9 @@ const { EAGER } = require('./groupProtocol/interface')
 /** @see https://github.com/apache/kafka/blob/4.3/clients/src/main/java/org/apache/kafka/common/protocol/Errors.java */
 const STALE_MEMBER_EPOCH = 'STALE_MEMBER_EPOCH'
 
+/** @see https://github.com/apache/kafka/blob/4.3/clients/src/main/java/org/apache/kafka/common/protocol/Errors.java */
+const LEADER_NOT_AVAILABLE = 5
+
 /** How often the pre-release commit re-checks whether the heartbeats have installed a new epoch. */
 const STALE_EPOCH_POLL_INTERVAL = 100
 
@@ -2093,12 +2096,19 @@ module.exports = class ConsumerGroup {
   }
 
   /**
-   * For each of the partitions find the best nodeId to read it from
+   * For each of the partitions find the best nodeId to read it from. A partition whose leader is
+   * negative (`-1`) has none and is read from nowhere, its preferred read replica included, as the
+   * Java consumer reads it from nowhere and asks for new metadata: this throws the retriable
+   * `LEADER_NOT_AVAILABLE`, which `recoverFromFetch` answers with a metadata refresh, so the fetch
+   * round it is part of sends nothing.
    *
    * @param {string} topic
    * @param {number[]} partitions
    * @returns {{[nodeId: number]: number[]}} per-node assignment of partitions
+   * @throws {import('../errors').KafkaJSProtocolError} `LEADER_NOT_AVAILABLE`, for a partition
+   *   whose leader is negative
    * @see Cluster~findLeaderForPartitions
+   * @see https://github.com/apache/kafka/blob/4.3/clients/src/main/java/org/apache/kafka/clients/consumer/internals/AbstractFetch.java
    */
   // Invariant: The resulting object has each partition referenced exactly once
   findReadReplicaForPartitions(topic, partitions) {
@@ -2113,6 +2123,10 @@ module.exports = class ConsumerGroup {
 
       if (metadata.leader == null) {
         throw new KafkaJSError('Invalid partition metadata', { topic, partitionId, metadata })
+      }
+
+      if (metadata.leader < 0) {
+        throw createErrorFromCode(LEADER_NOT_AVAILABLE)
       }
 
       // Pick the preferred replica if there is one, and it isn't known to be offline, otherwise the leader.

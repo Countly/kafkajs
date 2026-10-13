@@ -18,9 +18,12 @@ const {
 const COORDINATOR_TYPES = require('../protocol/coordinatorTypes')
 const apiKeys = require('../protocol/requests/apiKeys')
 const { requests } = require('../protocol/requests')
-const { staleLeaderEpoch } = require('../protocol/error')
+const { staleLeaderEpoch, createErrorFromCode } = require('../protocol/error')
 
 const { keys } = Object
+
+/** @see https://github.com/apache/kafka/blob/4.3/clients/src/main/java/org/apache/kafka/common/protocol/Errors.java */
+const LEADER_NOT_AVAILABLE = 5
 
 const mergeTopics = (obj, { topic, partitions }) => ({
   ...obj,
@@ -676,6 +679,12 @@ module.exports = class Cluster {
   }
 
   /**
+   * The leader of each partition, from the cached metadata; a partition the cache does not know is
+   * left out. A negative leader (`-1`) means the partition has none: an answer to a request for
+   * every topic keeps such a partition, so the cache can hold one. It is reported as the broker
+   * reports it, with the retriable `LEADER_NOT_AVAILABLE` every caller refreshes the metadata on,
+   * and never routed to a node that does not exist, as the Java client looks a partition with a
+   * negative leader up again.
    * @public
    * @param {string} topic
    * @param {(number|string)[]} partitions
@@ -684,6 +693,9 @@ module.exports = class Cluster {
    *                     { '0': [0], '2': [5] }
    *
    *                   where the key is the nodeId.
+   * @throws {import('../errors').KafkaJSProtocolError} `LEADER_NOT_AVAILABLE`, for a requested
+   *   partition whose leader is negative
+   * @see https://github.com/apache/kafka/blob/4.3/clients/src/main/java/org/apache/kafka/clients/admin/internals/PartitionLeaderStrategy.java
    */
   findLeaderForPartitions(topic, partitions) {
     const partitionMetadata = this.findTopicPartitionMetadata(topic)
@@ -697,6 +709,10 @@ module.exports = class Cluster {
 
       if (metadata.leader === null || metadata.leader === undefined) {
         throw new KafkaJSError('Invalid partition metadata', { topic, partitionId, metadata })
+      }
+
+      if (metadata.leader < 0) {
+        throw createErrorFromCode(LEADER_NOT_AVAILABLE)
       }
 
       const { leader } = metadata
