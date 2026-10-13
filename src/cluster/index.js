@@ -574,6 +574,18 @@ module.exports = class Cluster {
   }
 
   /**
+   * The cached leader of one partition, as of the last Metadata response or accepted leader hint:
+   * a map lookup, never a refresh. Internal seam for the producer's accumulator; not on the public
+   * Cluster surface.
+   * @param {string} topic
+   * @param {number} partition
+   * @returns {number} the node id, or -1 when the partition is unknown or has no leader
+   */
+  cachedLeader(topic, partition) {
+    return this.metadataCache.leader(topic, partition)
+  }
+
+  /**
    * Forgets one partition's cached leader epoch. Called when a broker reports the client is ahead
    * of it (`UNKNOWN_LEADER_EPOCH`), so the next request stops fencing on an epoch the broker does
    * not have and the next metadata response converges.

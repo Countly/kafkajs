@@ -11,7 +11,11 @@ const Broker = require('../../broker')
 const RequestQueue = require('../../network/requestQueue')
 const { Kafka, logLevel } = require('../../../index')
 const { createTopic, plainTextBrokers, secureRandom, writeEvidence } = require('testHelpers')
-const { waitForCondition, withTimeout } = require('../../consumer/__tests__/fixtures/liveScenario')
+const {
+  sleep,
+  waitForCondition,
+  withTimeout,
+} = require('../../consumer/__tests__/fixtures/liveScenario')
 
 /** Every stack a `Lock` was constructed from, in this process. */
 const mockLockConstructions = []
@@ -29,6 +33,10 @@ const SENDS = 2000
 // Seven, seven and six partitions per broker on the three-broker cluster: more than the five
 // requests the producer keeps unanswered to one broker, so that cap is what binds.
 const PARTITIONS = 20
+// The same-broker merge case: six partitions over three brokers, a window much longer than the
+// millisecond the sends are apart.
+const MERGE_PARTITIONS = 6
+const MERGE_LINGER_MS = 50
 // A partition's records carry their own request timeout, so the batches of different partitions
 // never share a Produce request and every partition's batch is a request of its own.
 const BASE_TIMEOUT = 30000
@@ -177,6 +185,23 @@ describePipelining('Producer > idempotent pipelining (live)', () => {
     return byPartition
   }
 
+  /** The values of the first `count` records of `topic`, in the order they arrive. */
+  const readAll = async (topic, count) => {
+    const consumer = await connected(
+      kafka.consumer({ groupId: `e2e-p8-same-broker-merge-reader-${secureRandom()}` })
+    )
+    const values = []
+    await consumer.subscribe({ topics: [topic], fromBeginning: true })
+    await consumer.run({
+      eachMessage: async ({ message }) => {
+        values.push(message.value.toString())
+      },
+    })
+    await waitForCondition(() => values.length >= count, WAIT_BUDGET)
+    await consumer.stop()
+    return values
+  }
+
   describe.each([5, 2])('maxInFlightRequests: %d', (maxInFlightRequests) => {
     test(
       'the producer keeps 5 requests unanswered per broker, the wire carries up to the in-flight limit, a partition has one batch in flight, and every record lands once, in order',
@@ -253,6 +278,64 @@ describePipelining('Producer > idempotent pipelining (live)', () => {
       SCENARIO_BUDGET_MS
     )
   })
+
+  test(
+    'sends to partitions of one broker that fall due a millisecond apart reach it in one Produce request',
+    async () => {
+      const topic = `e2e-p8-same-broker-merge-${secureRandom()}`
+      await createTopic({ topic, partitions: MERGE_PARTITIONS, replicas: 3 })
+      const admin = await connected(kafka.admin())
+      const {
+        topics: [{ partitions: layout }],
+      } = await admin.fetchTopicMetadata({ topics: [topic] })
+      const leaders = layout
+        .slice()
+        .sort((a, b) => a.partitionId - b.partitionId)
+        .map(({ leader }) => leader)
+      const producer = await connected(kafka.producer({ linger: MERGE_LINGER_MS }))
+      let produceRequests = 0
+      let measuring = false
+      producer.on(producer.events.REQUEST, ({ payload }) => {
+        if (measuring && payload.apiName === 'Produce') {
+          produceRequests += 1
+        }
+      })
+
+      // One awaited record per partition puts the metadata and the producer id in place, so the
+      // measured sends are the only ones whose timers run.
+      for (let partition = 0; partition < MERGE_PARTITIONS; partition += 1) {
+        await producer.send({ topic, messages: [{ partition, value: `warm-${partition}` }] })
+      }
+      measuring = true
+      const sends = []
+      for (let partition = 0; partition < MERGE_PARTITIONS; partition += 1) {
+        sends.push(producer.send({ topic, messages: [{ partition, value: `sent-${partition}` }] }))
+        await sleep(1)
+      }
+      await Promise.all(sends)
+      measuring = false
+      const written = await readAll(topic, 2 * MERGE_PARTITIONS)
+
+      writeEvidence(EVIDENCE, {
+        scenario: 'same-broker-merge',
+        leaders,
+        distinctLeaders: new Set(leaders).size,
+        produceRequests,
+        written,
+      })
+      expect(produceRequests).toBeGreaterThan(0)
+      expect(produceRequests).toBeLessThanOrEqual(new Set(leaders).size)
+      expect(written.sort()).toEqual(
+        Array.from({ length: MERGE_PARTITIONS }, (_, partition) => [
+          `sent-${partition}`,
+          `warm-${partition}`,
+        ])
+          .flat()
+          .sort()
+      )
+    },
+    SCENARIO_BUDGET_MS
+  )
 
   test(
     'neither an idempotent nor a transactional producer constructs a lock, and neither emits LOCK_TIMEOUT',

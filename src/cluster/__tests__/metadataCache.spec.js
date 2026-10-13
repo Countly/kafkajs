@@ -83,6 +83,58 @@ describe('Cluster > MetadataCache', () => {
     expect(cache.leaderEpoch('test-topic', 0)).toEqual(-1)
   })
 
+  describe('leader', () => {
+    test('is the cached leader, and -1 for anything it has not seen', () => {
+      cache.update(response({ leader: 1 }))
+      expect(cache.leader('test-topic', 0)).toEqual(1)
+      expect(cache.leader('test-topic', 9)).toEqual(-1)
+      expect(cache.leader('other', 0)).toEqual(-1)
+    })
+
+    test('is -1 for a partition that has no leader', () => {
+      cache.update(response({ leader: -1 }))
+      expect(cache.leader('test-topic', 0)).toEqual(-1)
+    })
+
+    test('never returns undefined, even for a decoded partition missing the field', () => {
+      const metadata = response()
+      delete metadata.topicMetadata[0].partitionMetadata[0].leader
+      cache.update(metadata)
+      expect(cache.leader('test-topic', 0)).toEqual(-1)
+    })
+
+    test('follows an accepted leader hint, and the refresh after it', () => {
+      cache.update(response({ leader: 1, leaderEpoch: 5 }))
+      cache.applyLeaderHint('test-topic', 0, { leaderId: 2, leaderEpoch: 6 })
+      expect(cache.leader('test-topic', 0)).toEqual(2)
+
+      cache.update(response({ leader: 3, leaderEpoch: 7 }))
+      expect(cache.leader('test-topic', 0)).toEqual(3)
+    })
+
+    test('keeps the last leader of a topic a scoped refresh did not carry', () => {
+      const other = response({ topicId: ID_B })
+      other.topicMetadata[0].topic = 'other-topic'
+      cache.update(response({ leader: 1 }))
+      cache.update(other)
+      expect(cache.leader('test-topic', 0)).toEqual(1)
+    })
+
+    test('Cluster#cachedLeader answers from the cluster’s cache', () => {
+      const cluster = new Cluster({
+        logger: newLogger(),
+        brokers: ['localhost:9092'],
+        socketFactory: () => {},
+        retry: { retries: 0 },
+      })
+      cluster.metadataCache = cache
+      cache.update(response({ leader: 2 }))
+
+      expect(cluster.cachedLeader('test-topic', 0)).toEqual(2)
+      expect(cluster.cachedLeader('nope', 0)).toEqual(-1)
+    })
+  })
+
   test('a known name arriving with a different id emits TOPIC_RECREATED', () => {
     cache.update(response({ topicId: ID_A }))
     cache.update(response({ topicId: ID_B }))

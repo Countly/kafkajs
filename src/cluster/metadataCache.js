@@ -430,6 +430,19 @@ module.exports = class MetadataCache {
     return cached && cached.leaderEpoch != null ? cached.leaderEpoch : UNKNOWN_EPOCH
   }
 
+  /**
+   * The cached leader of one partition, as of the last Metadata response or accepted leader hint.
+   * A map lookup that fetches nothing.
+   * @param {string} topic
+   * @param {number} partition
+   * @returns {number} the node id, or -1 when the partition is unknown or has no leader
+   */
+  leader(topic, partition) {
+    const entry = this.topics.get(topic)
+    const cached = entry && entry.partitions.get(partition)
+    return cached && cached.leader != null ? cached.leader : NO_LEADER_ID
+  }
+
   /** @param {string} name @returns {string|undefined} */
   topicId(name) {
     const entry = this.topics.get(name)

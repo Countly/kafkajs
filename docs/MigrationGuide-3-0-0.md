@@ -240,6 +240,11 @@ notice and what, if anything, to do.
 - **Three opt-ins, none of them on by default**: `Partitioners.UniformStickyPartitioner`;
   `deliveryTimeout`; and `leaderEpoch` on the partitions given to `sendOffsets`.
   *What to do:* nothing; leaving them unset changes nothing beyond what the other items describe.
+- **A broker's waiting batches leave together.** When one batch's `linger` runs out, the other
+  waiting batches for the same broker (same `acks`, `timeout` and `compression`) leave with it,
+  possibly before their own `linger`, so sends made a few milliseconds apart to partitions of one
+  broker are one request. `linger` is still an upper bound on how long a `send()` waits. *What to
+  do:* nothing.
 
 ### Transactions
 

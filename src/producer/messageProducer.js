@@ -110,6 +110,8 @@ module.exports = ({
     lingers: () =>
       !isClosing() && hurried === 0 && getConnectionStatus() === CONNECTION_STATUS.CONNECTED,
     holds: () => idempotence.isEnabled(),
+    // What the client already knows about the leader, never fetched
+    leaderOf: (topic, partition) => cluster.cachedLeader(topic, partition),
     deadline: deliveryTimeout ?? retry.maxTotalTime,
   })
 

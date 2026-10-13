@@ -53,6 +53,7 @@ const createFakeCluster = ({ partitions = 1, produce, options = {} } = {}) => {
     findTopicPartitionMetadata: () =>
       Array.from({ length: partitions }, (_, partitionId) => ({ partitionId, leader: 0 })),
     findLeaderForPartitions: (topic, ids) => ({ 0: ids.map(Number) }),
+    cachedLeader: () => 0,
     findBroker: jest.fn(async () => broker),
     findConnectedBroker: jest.fn(async () => broker),
     findGroupCoordinator: jest.fn(async () => broker),

@@ -135,6 +135,7 @@ const createAccumulator = ({
   sendPartitioned,
   lingers,
   holds,
+  leaderOf,
   deadline,
 } = {}) => {
   const calls = []
@@ -153,6 +154,7 @@ const createAccumulator = ({
     sendPartitioned: sendPartitioned || jest.fn(answer),
     lingers,
     holds,
+    leaderOf,
     deadline,
   })
   /** The values of each call's batches. */
@@ -803,6 +805,415 @@ describe('Producer > the accumulator', () => {
     })
   })
 
+  describe('merging the batches a broker has waiting', () => {
+    const MERGE_LINGER = 50
+
+    beforeEach(() => {
+      jest.useFakeTimers({ now: 0 })
+    })
+
+    /** A `leaderOf` over `leaders[topic][partition]`; a partition it does not list has no leader. */
+    const ledBy = (leaders) => jest.fn((topic, partition) => leaders[topic]?.[partition])
+
+    /** The same for the one topic most cases use. */
+    const ledByOne = (leaders) => ledBy({ [TOPIC]: leaders })
+
+    /** One batch of a send, as `sent()` shows it. */
+    const batchOf = (partition, value, topic = TOPIC) => ({ [`${topic}/${partition}`]: [value] })
+
+    /** A send of one record to a partition of any topic. */
+    const appendTo = (accumulator, topic, partition, value) =>
+      accumulator.append({
+        acks: -1,
+        timeout: 30000,
+        compression: 0,
+        topicMessages: [{ topic, messages: records(partition, value) }],
+      })
+
+    /** A send path whose first call is answered only when `answer` resolves. */
+    const heldFirstCall = () => {
+      const answer = deferred()
+      const calls = []
+      const sendPartitioned = jest.fn(async (request) => {
+        calls.push(request)
+        if (calls.length === 1) {
+          await answer.promise
+        }
+        request.batches.forEach(({ partition, settlers }) =>
+          settlers.forEach((settler) => settler.resolve({ partition, baseOffset: '0' }))
+        )
+      })
+      const values = () =>
+        calls.map(({ batches }) => batches.map(({ messages }) => messages[0].value))
+      return { answer, sendPartitioned, values }
+    }
+
+    test('batches of partitions one broker leads, made 1 ms apart, leave in one hand-off and leave no timer', async () => {
+      const { accumulator, sent } = createAccumulator({
+        linger: MERGE_LINGER,
+        leaderOf: ledByOne({ 0: 1, 1: 1 }),
+      })
+
+      append(accumulator, records(0, 'a'))
+      await jest.advanceTimersByTimeAsync(1)
+      append(accumulator, records(1, 'b'))
+      await jest.advanceTimersByTimeAsync(MERGE_LINGER - 2)
+      expect(sent()).toEqual([])
+
+      await jest.advanceTimersByTimeAsync(1)
+
+      expect(sent()).toEqual([[batchOf(0, 'a-0'), batchOf(1, 'b-0')]])
+      expect(jest.getTimerCount()).toBe(0)
+    })
+
+    test('a batch for another broker keeps its own timer', async () => {
+      const { accumulator, sent } = createAccumulator({
+        linger: MERGE_LINGER,
+        leaderOf: ledByOne({ 0: 1, 1: 2 }),
+      })
+
+      append(accumulator, records(0, 'a'))
+      await jest.advanceTimersByTimeAsync(1)
+      append(accumulator, records(1, 'b'))
+      await jest.advanceTimersByTimeAsync(MERGE_LINGER - 1)
+      expect(sent()).toEqual([[batchOf(0, 'a-0')]])
+      expect(jest.getTimerCount()).toBe(1)
+
+      await jest.advanceTimersByTimeAsync(1)
+
+      expect(sent()).toEqual([[batchOf(0, 'a-0')], [batchOf(1, 'b-0')]])
+    })
+
+    test.each([
+      ['acks', { acks: 1 }],
+      ['timeout', { timeout: 15000 }],
+      ['compression', { compression: GZIP }],
+    ])('batches that ask for a different %s never merge', async (_, options) => {
+      const { accumulator, sent } = createAccumulator({
+        linger: MERGE_LINGER,
+        leaderOf: ledByOne({ 0: 1, 1: 1 }),
+      })
+
+      append(accumulator, records(0, 'a'))
+      await jest.advanceTimersByTimeAsync(1)
+      append(accumulator, records(1, 'b'), options)
+      await jest.advanceTimersByTimeAsync(MERGE_LINGER - 1)
+      expect(sent()).toEqual([[batchOf(0, 'a-0')]])
+
+      await jest.advanceTimersByTimeAsync(1)
+
+      expect(sent()).toEqual([[batchOf(0, 'a-0')], [batchOf(1, 'b-0')]])
+    })
+
+    test('six partitions on three brokers, sent 1 ms apart, leave in three hand-offs', async () => {
+      const { accumulator, sent } = createAccumulator({
+        linger: MERGE_LINGER,
+        leaderOf: ledByOne({ 0: 1, 1: 2, 2: 3, 3: 1, 4: 2, 5: 3 }),
+      })
+
+      for (let partition = 0; partition < 6; partition += 1) {
+        append(accumulator, records(partition, `p${partition}`))
+        await jest.advanceTimersByTimeAsync(1)
+      }
+      await jest.advanceTimersByTimeAsync(MERGE_LINGER)
+
+      expect(sent()).toEqual([
+        [batchOf(0, 'p0-0'), batchOf(3, 'p3-0')],
+        [batchOf(1, 'p1-0'), batchOf(4, 'p4-0')],
+        [batchOf(2, 'p2-0'), batchOf(5, 'p5-0')],
+      ])
+      expect(jest.getTimerCount()).toBe(0)
+    })
+
+    test('a batch whose linger has run out when another expires takes its broker’s waiting batches too', async () => {
+      const { accumulator, sent } = createAccumulator({
+        linger: MERGE_LINGER,
+        leaderOf: ledByOne({ 0: 1, 1: 2, 2: 2 }),
+      })
+
+      // a and b fall due together, as timers that fire late make them: b's partition is the one
+      // c's broker leads, and c is a millisecond short of its own linger
+      append(accumulator, records(0, 'a'))
+      append(accumulator, records(1, 'b'))
+      await jest.advanceTimersByTimeAsync(1)
+      append(accumulator, records(2, 'c'))
+      await jest.advanceTimersByTimeAsync(MERGE_LINGER - 2)
+      expect(sent()).toEqual([])
+
+      await jest.advanceTimersByTimeAsync(1)
+
+      expect(sent()).toEqual([[batchOf(0, 'a-0'), batchOf(1, 'b-0'), batchOf(2, 'c-0')]])
+      expect(jest.getTimerCount()).toBe(0)
+    })
+
+    test('a batch whose linger has run out takes only the batches that ask for its own options', async () => {
+      const { accumulator, sent } = createAccumulator({
+        linger: MERGE_LINGER,
+        leaderOf: ledByOne({ 0: 1, 1: 2, 2: 2 }),
+      })
+
+      append(accumulator, records(0, 'a'))
+      append(accumulator, records(1, 'b'), { acks: 1 })
+      await jest.advanceTimersByTimeAsync(1)
+      append(accumulator, records(2, 'c'))
+      await jest.advanceTimersByTimeAsync(MERGE_LINGER - 1)
+      expect(sent()).toEqual([[batchOf(0, 'a-0')], [batchOf(1, 'b-0')]])
+
+      await jest.advanceTimersByTimeAsync(1)
+
+      expect(sent()).toEqual([[batchOf(0, 'a-0')], [batchOf(1, 'b-0')], [batchOf(2, 'c-0')]])
+    })
+
+    test('a held batch whose linger has run out when another expires takes no other batch with it', async () => {
+      const { answer, sendPartitioned, values } = heldFirstCall()
+      const { accumulator } = createAccumulator({
+        linger: MERGE_LINGER,
+        sendPartitioned,
+        holds: () => true,
+        leaderOf: ledByOne({ 0: 2, 1: 1, 2: 1 }),
+      })
+      append(accumulator, records(1, 'x'))
+      await jest.advanceTimersByTimeAsync(MERGE_LINGER)
+      expect(values()).toEqual([['x-0']])
+
+      // w and y fall due together; y is held behind x, and z, led by y's broker, is not due
+      append(accumulator, records(0, 'w'))
+      append(accumulator, records(1, 'y'))
+      await jest.advanceTimersByTimeAsync(1)
+      append(accumulator, records(2, 'z'))
+      await jest.advanceTimersByTimeAsync(MERGE_LINGER - 1)
+      expect(values()).toEqual([['x-0'], ['w-0']])
+
+      await jest.advanceTimersByTimeAsync(1)
+      expect(values()).toEqual([['x-0'], ['w-0'], ['z-0']])
+
+      answer.resolve()
+      await jest.advanceTimersByTimeAsync(0)
+      expect(values()).toEqual([['x-0'], ['w-0'], ['z-0'], ['y-0']])
+    })
+
+    test('a merged partition starts a fresh batch on its own linger', async () => {
+      const { accumulator, sent } = createAccumulator({
+        linger: MERGE_LINGER,
+        leaderOf: ledByOne({ 0: 1, 1: 1 }),
+      })
+      append(accumulator, records(0, 'a'))
+      await jest.advanceTimersByTimeAsync(1)
+      append(accumulator, records(1, 'b'))
+      await jest.advanceTimersByTimeAsync(MERGE_LINGER - 1)
+      expect(sent()).toHaveLength(1)
+
+      append(accumulator, records(1, 'c'))
+      await jest.advanceTimersByTimeAsync(MERGE_LINGER - 1)
+      expect(sent()).toHaveLength(1)
+      await jest.advanceTimersByTimeAsync(1)
+
+      expect(sent()).toEqual([[batchOf(0, 'a-0'), batchOf(1, 'b-0')], [batchOf(1, 'c-0')]])
+    })
+
+    test('without a leaderOf, batches never merge', async () => {
+      const { accumulator, sent } = createAccumulator({ linger: MERGE_LINGER })
+
+      append(accumulator, records(0, 'a'))
+      await jest.advanceTimersByTimeAsync(1)
+      append(accumulator, records(1, 'b'))
+      await jest.advanceTimersByTimeAsync(MERGE_LINGER)
+
+      expect(sent()).toEqual([[batchOf(0, 'a-0')], [batchOf(1, 'b-0')]])
+    })
+
+    test('batches of two topics one broker leads leave together, and a batch of another broker stays', async () => {
+      const leaderOf = ledBy({ [TOPIC]: { 0: 1, 1: 1 }, [OTHER_TOPIC]: { 0: 1, 1: 2 } })
+      const { accumulator, sent } = createAccumulator({ linger: MERGE_LINGER, leaderOf })
+
+      appendTo(accumulator, TOPIC, 0, 'a')
+      await jest.advanceTimersByTimeAsync(1)
+      appendTo(accumulator, OTHER_TOPIC, 0, 'b')
+      await jest.advanceTimersByTimeAsync(1)
+      appendTo(accumulator, OTHER_TOPIC, 1, 'c')
+      await jest.advanceTimersByTimeAsync(1)
+      appendTo(accumulator, TOPIC, 1, 'd')
+      await jest.advanceTimersByTimeAsync(MERGE_LINGER - 3)
+
+      expect(sent()).toEqual([
+        [batchOf(0, 'a-0'), batchOf(0, 'b-0', OTHER_TOPIC), batchOf(1, 'd-0')],
+      ])
+      expect(leaderOf.mock.calls).toEqual([
+        [TOPIC, 0],
+        [OTHER_TOPIC, 0],
+        [OTHER_TOPIC, 1],
+        [TOPIC, 1],
+      ])
+
+      await jest.advanceTimersByTimeAsync(2)
+
+      expect(sent()[1]).toEqual([batchOf(1, 'c-0', OTHER_TOPIC)])
+    })
+
+    test('the leader of a waiting batch is read once, when its timer is armed, and the merge goes by that answer', async () => {
+      const leaders = { 0: 1, 1: 1 }
+      const leaderOf = jest.fn((topic, partition) => leaders[partition])
+      const { accumulator, sent } = createAccumulator({ linger: MERGE_LINGER, leaderOf })
+
+      append(accumulator, records(0, 'a'))
+      await jest.advanceTimersByTimeAsync(1)
+      append(accumulator, records(1, 'b'))
+      append(accumulator, records(1, 'c'))
+      await microtasks()
+      leaders[1] = 2
+      await jest.advanceTimersByTimeAsync(MERGE_LINGER - 1)
+
+      expect(leaderOf.mock.calls).toEqual([
+        [TOPIC, 0],
+        [TOPIC, 1],
+      ])
+      expect(sent()).toEqual([[batchOf(0, 'a-0'), { [`${TOPIC}/1`]: ['b-0', 'c-0'] }]])
+    })
+
+    test.each([
+      ['linger is 0', { linger: 0 }],
+      ['the batch is full when it forms', { linger: MERGE_LINGER, batchSize: 1 }],
+      ['lingers() is false', { linger: MERGE_LINGER, lingers: () => false }],
+    ])('a batch that does not wait for its linger reads no leader when %s', async (_, options) => {
+      const leaderOf = ledByOne({ 0: 1 })
+      const { accumulator, sent } = createAccumulator({ ...options, leaderOf })
+
+      append(accumulator, records(0, 'a'))
+      await jest.advanceTimersByTimeAsync(MERGE_LINGER)
+
+      expect(sent()).toEqual([[batchOf(0, 'a-0')]])
+      expect(leaderOf).not.toHaveBeenCalled()
+    })
+
+    test('a batch held behind its partition’s batch in flight is neither handed on nor made due', async () => {
+      const { answer, sendPartitioned, values } = heldFirstCall()
+      const { accumulator } = createAccumulator({
+        linger: MERGE_LINGER,
+        sendPartitioned,
+        holds: () => true,
+        leaderOf: ledByOne({ 0: 1, 1: 1 }),
+      })
+      append(accumulator, records(1, 'x'))
+      await jest.advanceTimersByTimeAsync(MERGE_LINGER)
+      expect(values()).toEqual([['x-0']])
+
+      append(accumulator, records(0, 'a'))
+      await jest.advanceTimersByTimeAsync(1)
+      append(accumulator, records(1, 'y'))
+      await jest.advanceTimersByTimeAsync(MERGE_LINGER - 1)
+
+      // partition 0's linger ran out: partition 1 is led by the same broker but is held
+      expect(values()).toEqual([['x-0'], ['a-0']])
+      expect(jest.getTimerCount()).toBe(1)
+
+      answer.resolve()
+      await jest.advanceTimersByTimeAsync(1)
+
+      expect(values()).toEqual([['x-0'], ['a-0'], ['y-0']])
+    })
+
+    test('a held batch whose linger runs out does not send its broker’s other batches early', async () => {
+      const { answer, sendPartitioned, values } = heldFirstCall()
+      const { accumulator } = createAccumulator({
+        linger: MERGE_LINGER,
+        sendPartitioned,
+        holds: () => true,
+        leaderOf: ledByOne({ 0: 1, 1: 1 }),
+      })
+      append(accumulator, records(1, 'x'))
+      await jest.advanceTimersByTimeAsync(MERGE_LINGER)
+      append(accumulator, records(1, 'y'))
+      await jest.advanceTimersByTimeAsync(10)
+      append(accumulator, records(0, 'z'))
+
+      // y's linger runs out at 100 while x is still in flight: a muted partition makes nothing ready
+      await jest.advanceTimersByTimeAsync(MERGE_LINGER - 10 + 5)
+      expect(values()).toEqual([['x-0']])
+
+      await jest.advanceTimersByTimeAsync(MERGE_LINGER)
+      expect(values()).toEqual([['x-0'], ['z-0']])
+
+      answer.resolve()
+      await jest.advanceTimersByTimeAsync(0)
+      expect(values()).toEqual([['x-0'], ['z-0'], ['y-0']])
+    })
+
+    test.each([
+      ['the batch behind the one in flight is appended first', ['y', 'z']],
+      ['the batch behind the one in flight is appended second', ['z', 'y']],
+    ])(
+      'with holds() false, a batch behind one in flight is not held and merges when %s',
+      async (_, order) => {
+        const { answer, sendPartitioned, values } = heldFirstCall()
+        const { accumulator } = createAccumulator({
+          linger: MERGE_LINGER,
+          sendPartitioned,
+          holds: () => false,
+          leaderOf: ledByOne({ 0: 1, 1: 1 }),
+        })
+        append(accumulator, records(1, 'x'))
+        await jest.advanceTimersByTimeAsync(MERGE_LINGER)
+        for (const name of order) {
+          append(accumulator, records(name === 'y' ? 1 : 0, name))
+          await jest.advanceTimersByTimeAsync(1)
+        }
+
+        await jest.advanceTimersByTimeAsync(MERGE_LINGER - 2)
+
+        expect(values()).toEqual([['x-0'], order.map((name) => `${name}-0`)])
+        answer.resolve()
+      }
+    )
+
+    test.each([
+      ['a partition whose leader is unknown', { 0: 1, 1: null }],
+      ['a partition whose leader is not reported', { 0: 1 }],
+      ['an expired batch whose leader is unknown', { 0: null, 1: 1 }],
+      ['two partitions with no leader, which is -1 for both', { 0: -1, 1: -1 }],
+      ['a leader that is not a node id', { 0: '1', 1: '1' }],
+    ])('%s neither merges nor takes the other batch with it', async (_, leaders) => {
+      const { accumulator, sent } = createAccumulator({
+        linger: MERGE_LINGER,
+        leaderOf: ledByOne(leaders),
+      })
+
+      append(accumulator, records(0, 'a'))
+      await jest.advanceTimersByTimeAsync(1)
+      append(accumulator, records(1, 'b'))
+      await jest.advanceTimersByTimeAsync(MERGE_LINGER - 1)
+      expect(sent()).toEqual([[batchOf(0, 'a-0')]])
+
+      await jest.advanceTimersByTimeAsync(1)
+
+      expect(sent()).toEqual([[batchOf(0, 'a-0')], [batchOf(1, 'b-0')]])
+    })
+
+    test.each([
+      ['the first batch', (partition) => partition === 0],
+      ['the second batch', (partition) => partition === 1],
+      ['every batch', () => true],
+    ])(
+      'a leaderOf that throws for %s loses no send and leaves each batch on its own linger',
+      async (_, throwsFor) => {
+        const leaderOf = jest.fn((topic, partition) => {
+          if (throwsFor(partition)) {
+            throw new Error('metadata not loaded')
+          }
+          return 1
+        })
+        const { accumulator, sent } = createAccumulator({ linger: MERGE_LINGER, leaderOf })
+
+        const first = append(accumulator, records(0, 'a'))
+        await jest.advanceTimersByTimeAsync(1)
+        const second = append(accumulator, records(1, 'b'))
+        await jest.advanceTimersByTimeAsync(MERGE_LINGER)
+
+        expect(sent()).toEqual([[batchOf(0, 'a-0')], [batchOf(1, 'b-0')]])
+        await expect(Promise.all([first, second])).resolves.toHaveLength(2)
+      }
+    )
+  })
+
   describe('settling the sends', () => {
     beforeEach(() => {
       jest.useFakeTimers({ now: 0 })
@@ -1095,6 +1506,54 @@ describe('Producer > the accumulator', () => {
 
         expect(produced().map(({ partitions }) => partitions[0].values)).toEqual([['a', 'b', 'c']])
         expect(results.map(([{ baseOffset }]) => baseOffset)).toEqual(['0', '1', '2'])
+      })
+
+      test('sends to two partitions a millisecond apart reach the broker that leads both in one Produce request', async () => {
+        const { producer, produced } = createLingeringProducer({
+          idempotent,
+          partitions: 2,
+          createPartitioner:
+            () =>
+            ({ message }) =>
+              message.partition,
+        })
+        await producer.connect()
+
+        const first = producer.send({ topic: TOPIC, messages: [{ partition: 0, value: 'a' }] })
+        await jest.advanceTimersByTimeAsync(1)
+        const second = producer.send({ topic: TOPIC, messages: [{ partition: 1, value: 'b' }] })
+        await settledWithin(Promise.all([first, second]), LINGER)
+
+        expect(produced().map(({ partitions }) => partitions.map(({ values }) => values))).toEqual([
+          [['a'], ['b']],
+        ])
+      })
+
+      test('partitions led by different brokers go in separate requests, by what the cluster has cached', async () => {
+        const { cluster, producer, produced } = createLingeringProducer({
+          idempotent,
+          partitions: 2,
+          createPartitioner:
+            () =>
+            ({ message }) =>
+              message.partition,
+        })
+        cluster.cachedLeader = jest.fn((topic, partition) => partition)
+        await producer.connect()
+
+        const first = producer.send({ topic: TOPIC, messages: [{ partition: 0, value: 'a' }] })
+        await jest.advanceTimersByTimeAsync(1)
+        const second = producer.send({ topic: TOPIC, messages: [{ partition: 1, value: 'b' }] })
+        await settledWithin(Promise.all([first, second]), LINGER)
+
+        expect(produced().map(({ partitions }) => partitions.map(({ values }) => values))).toEqual([
+          [['a']],
+          [['b']],
+        ])
+        expect(cluster.cachedLeader.mock.calls).toEqual([
+          [TOPIC, 0],
+          [TOPIC, 1],
+        ])
       })
 
       test('batchSize reached sends the batch before linger elapses', async () => {
@@ -1687,7 +2146,7 @@ describe('Producer > the accumulator', () => {
       })
 
       test('a send whose records an older batch carries rejects once every partition it wrote to has settled', async () => {
-        const { producer, produced } = createLingeringProducer({
+        const { cluster, producer, produced } = createLingeringProducer({
           idempotent: false,
           createPartitioner:
             () =>
@@ -1695,6 +2154,8 @@ describe('Producer > the accumulator', () => {
               message.partition,
           produce: answering((partition) => (partition === 0 ? MESSAGE_TOO_LARGE : 0)),
         })
+        // each partition has a leader of its own, so the later batch keeps its own linger
+        cluster.cachedLeader = (topic, partition) => partition
         await producer.connect()
 
         const a = producer
@@ -1721,6 +2182,46 @@ describe('Producer > the accumulator', () => {
             partitions.map(({ partition, values }) => [partition, values])
           )
         ).toEqual([[[0, ['a', 'b0']]], [[1, ['b1']]]])
+      })
+
+      test('partitions one broker leads share one request, and a partition it rejects fails only the sends it carries', async () => {
+        const { producer, produced } = createLingeringProducer({
+          idempotent: false,
+          createPartitioner:
+            () =>
+            ({ message }) =>
+              message.partition,
+          produce: answering((partition) => (partition === 0 ? MESSAGE_TOO_LARGE : 0)),
+        })
+        await producer.connect()
+
+        const a = producer
+          .send({ topic: TOPIC, messages: [{ partition: 0, value: 'a' }] })
+          .catch((e) => e)
+        await jest.advanceTimersByTimeAsync(2)
+        const b = producer
+          .send({
+            topic: TOPIC,
+            messages: [
+              { partition: 0, value: 'b0' },
+              { partition: 1, value: 'b1' },
+            ],
+          })
+          .catch((e) => e)
+        await jest.advanceTimersByTimeAsync(4)
+
+        expect(await settledWithin(a)).toMatchObject({ code: MESSAGE_TOO_LARGE })
+        expect(await settledWithin(b)).toMatchObject({ code: MESSAGE_TOO_LARGE })
+        expect(
+          produced().map(({ partitions }) =>
+            partitions.map(({ partition, values }) => [partition, values])
+          )
+        ).toEqual([
+          [
+            [0, ['a', 'b0']],
+            [1, ['b1']],
+          ],
+        ])
       })
     })
 

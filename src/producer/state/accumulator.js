@@ -257,6 +257,9 @@ class Settler {
  * @property {number} createdAt when the earliest of those appends began: its delivery deadline
  *   counts from there
  * @property {number} dueAt when its `linger` runs out
+ * @property {string|null} mergeKey the node that led its partition when its `linger` timer was
+ *   armed, with its `options`, as one key; null when the node was not known. It only decides which
+ *   batches leave together
  * @property {ReturnType<typeof setTimeout>|null} timer
  * @property {boolean} due whether its `linger` has run out
  */
@@ -277,8 +280,15 @@ class Settler {
  * last batch open while the sender skips a partition with a batch in flight. A held batch goes out
  * at its delivery deadline at the latest, so the send path expires it then, as the Java client
  * expires the head of a waiting partition's queue. While `lingers()` is false - a transaction is
- * ending, the producer is disconnecting - a batch goes out as soon as it forms. Each pending batch
- * holds at most one timer, cleared when it flushes.
+ * ending, the producer is disconnecting - a batch goes out as soon as it forms. When a batch's
+ * `linger` runs out, every other batch whose `linger` has run out by then goes out with it. So does
+ * every other pending batch with the same `acks`, `timeout` and `compression` for a partition led
+ * by the node that led the partition of one of those batches when its own timer was armed. This
+ * follows the Java client, where a node is ready once any of its batches is, and everything the
+ * node leads is drained. A held batch neither goes out that way nor makes its node ready: holding
+ * a partition behind its batch in flight is this client's rule (one unacknowledged batch per
+ * partition), stricter than the Java default. Each pending batch holds at most one timer, cleared
+ * when it flushes.
  * `close()` hands everything on and waits until nothing is left to deliver.
  * One accumulator serves one transactional context: a producer's own sends, or its transactions'.
  * @see https://github.com/apache/kafka/blob/4.3/clients/src/main/java/org/apache/kafka/clients/producer/internals/RecordAccumulator.java
@@ -290,6 +300,7 @@ class Accumulator {
   #sendPartitioned
   #lingers
   #holds
+  #leaderOf
   #deadline
   /** @type {Map<string, PendingBatch>} */
   #pending = new Map()
@@ -316,6 +327,11 @@ class Accumulator {
    * @param {() => boolean} [options.lingers] whether a batch that forms now may wait for `linger`
    * @param {() => boolean} [options.holds] whether a due batch waits for its partition's batch in
    *   flight to settle
+   * @param {(topic: string, partition: number) => number|null|undefined} [options.leaderOf]
+   *   the node that leads a partition, read from what the client already knows and never fetched;
+   *   asked once for each batch that waits for its `linger`. A negative id, null, undefined or a
+   *   throw all mean the leader is not known, and a batch whose leader is not known is never
+   *   merged
    * @param {number} [options.deadline] ms from a batch's first send to its delivery deadline, the
    *   send path's own; a held batch goes out when it is reached
    */
@@ -326,6 +342,7 @@ class Accumulator {
     sendPartitioned,
     lingers = () => true,
     holds = () => false,
+    leaderOf = () => null,
     deadline,
   }) {
     this.#linger = linger
@@ -334,6 +351,7 @@ class Accumulator {
     this.#sendPartitioned = sendPartitioned
     this.#lingers = lingers
     this.#holds = holds
+    this.#leaderOf = leaderOf
     this.#deadline = deadline
   }
 
@@ -419,6 +437,7 @@ class Accumulator {
           bytes: 0,
           createdAt,
           dueAt,
+          mergeKey: null,
           timer: null,
           due: false,
         }
@@ -451,6 +470,7 @@ class Accumulator {
         batch.timer = null
         batch.due = true
       } else if (batch.timer === null) {
+        batch.mergeKey = this.#mergeKeyOf(batch)
         batch.timer = setTimeout(() => this.#expire(batch), this.#linger)
       }
     }
@@ -507,22 +527,71 @@ class Accumulator {
   }
 
   /**
-   * A batch's `linger` ran out: it goes out with every other batch due by now, whose timers are
-   * cleared.
+   * A batch's `linger` ran out: it goes out with every other batch due by now, and with every
+   * batch that merges with one of them - the same node led its partition when its own timer was
+   * armed, it asks for the same `acks`, `timeout` and `compression`, and it is not held. Their
+   * timers are cleared. A held batch makes no broker ready, so it merges nothing.
    * @param {PendingBatch} expired
    * @returns {void}
    */
   #expire(expired) {
     // Timers run on the event loop's cached clock, which can lag `Date.now()`.
     const now = Math.max(Date.now(), expired.dueAt)
+    /** @type {Set<string>} */
+    const ready = new Set()
     for (const batch of this.#pending.values()) {
       if (batch === expired || (!batch.due && batch.dueAt <= now)) {
-        clearTimeout(batch.timer)
-        batch.timer = null
-        batch.due = true
+        this.#makeDue(batch)
+        if (batch.mergeKey !== null && !this.#isHeld(batch)) {
+          ready.add(batch.mergeKey)
+        }
+      }
+    }
+    if (ready.size > 0) {
+      for (const batch of this.#pending.values()) {
+        if (!batch.due && ready.has(batch.mergeKey) && !this.#isHeld(batch)) {
+          this.#makeDue(batch)
+        }
       }
     }
     this.#handOnDue()
+  }
+
+  /**
+   * Marks a pending batch due and clears its timer.
+   * @param {PendingBatch} batch
+   * @returns {void}
+   */
+  #makeDue(batch) {
+    clearTimeout(batch.timer)
+    batch.timer = null
+    batch.due = true
+  }
+
+  /**
+   * The key a batch merges under: the node that leads its partition and the request options it
+   * asks for, the two things batches must share to leave in one request.
+   * @param {PendingBatch} batch
+   * @returns {string|null} null when the node is not known: `leaderOf` answered with anything but
+   *   a node id, or threw - this runs while a send is being appended, where a throw would lose the
+   *   send
+   */
+  #mergeKeyOf({ topic, partition, options }) {
+    try {
+      const leader = this.#leaderOf(topic, partition)
+      return Number.isInteger(leader) && leader >= 0 ? `${leader}:${options}` : null
+    } catch {
+      return null
+    }
+  }
+
+  /**
+   * Whether a batch waits for its partition's batch in flight to settle.
+   * @param {PendingBatch} batch
+   * @returns {boolean}
+   */
+  #isHeld(batch) {
+    return this.#holds() && this.#unsettled.has(batch.key)
   }
 
   /**
@@ -537,7 +606,7 @@ class Accumulator {
       if (!batch.due) {
         continue
       }
-      if (!(this.#holds() && this.#unsettled.has(batch.key))) {
+      if (!this.#isHeld(batch)) {
         ready.push(batch)
       } else if (this.#deadline !== undefined && batch.timer === null) {
         const remaining = batch.createdAt + this.#deadline - Date.now()
