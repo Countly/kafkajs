@@ -13,6 +13,7 @@ const {
   KafkaJSDeleteTopicRecordsError,
   KafkaJSAggregateError,
   isStaleCoordinator,
+  COORDINATOR_LOAD_IN_PROGRESS_CODE,
 } = require('../errors')
 const { staleMetadata, staleLeaderEpoch, createErrorFromCode } = require('../protocol/error')
 const { GROUP_TYPES } = require('../protocol/groupTypes')
@@ -30,7 +31,15 @@ const { CONNECT, DISCONNECT } = events
 
 const NO_CONTROLLER_ID = -1
 const NOT_CONTROLLER_CODE = 41
+const GROUP_ID_NOT_FOUND_CODE = 69
+const CONSUMER_PROTOCOL_TYPE = 'consumer'
+const UNANSWERED_MEMBER_CODE = -1
 const THROTTLING_QUOTA_EXCEEDED_CODE = 89
+
+/** What the coordinator logs as the reason a member was removed, when the caller gives none. */
+const DEFAULT_REMOVE_REASON = 'member was removed by an admin'
+/** The longest reason sent; Java's `JoinGroupRequest.maybeTruncateReason` cuts at the same length. */
+const MAX_REMOVE_REASON_LENGTH = 255
 
 const { values, keys, entries } = Object
 const eventNames = values(events)
@@ -77,6 +86,62 @@ const retryOnLeaderNotAvailable = (fn, opts = {}) => {
 }
 
 const isConsumerGroupRunning = (description) => ['Empty', 'Dead'].includes(description.state)
+
+/**
+ * The static members `removeMembersFromConsumerGroup` was asked to remove, once each, as LeaveGroup
+ * names them: an empty member id and the instance id.
+ * @param {{ groupInstanceId: string }[]} members
+ * @returns {{ memberId: string, groupInstanceId: string }[]}
+ * @throws {KafkaJSNonRetriableError} for an empty list or a blank instance id
+ */
+const staticMembers = (members) => {
+  if (!Array.isArray(members) || members.length === 0) {
+    throw new KafkaJSNonRetriableError(
+      'Invalid members, expected a non-empty array of { groupInstanceId }'
+    )
+  }
+
+  const instanceIds = new Set()
+  for (const member of members) {
+    const instanceId = member == null ? undefined : member.groupInstanceId
+
+    if (typeof instanceId !== 'string' || instanceId.trim() === '') {
+      throw new KafkaJSNonRetriableError(
+        `Invalid groupInstanceId ${JSON.stringify(instanceId)}, expected a non-blank string`
+      )
+    }
+
+    instanceIds.add(instanceId)
+  }
+
+  return [...instanceIds].map((groupInstanceId) => ({ memberId: '', groupInstanceId }))
+}
+
+/**
+ * One result per member sent. A member the answer leaves out, which a correct coordinator never
+ * does, is reported with the unknown-server-error code rather than as removed.
+ * @param {{ memberId: string, groupInstanceId?: string }} sent
+ * @param {{ memberId: string, groupInstanceId: string|null, errorCode: number }} [answered]
+ * @returns {{ memberId: string, groupInstanceId: string|null, errorCode: number, error: Error|null }}
+ */
+const toRemoveMemberResult = (sent, answered) => {
+  const {
+    memberId,
+    groupInstanceId = null,
+    errorCode,
+  } = answered || {
+    ...sent,
+    errorCode: UNANSWERED_MEMBER_CODE,
+  }
+
+  return {
+    memberId,
+    groupInstanceId,
+    errorCode,
+    error: errorCode === 0 ? null : createErrorFromCode(errorCode),
+  }
+}
+
 const findTopicPartitions = async (cluster, topic) => {
   await cluster.addTargetTopic(topic)
   await cluster.refreshMetadataIfNecessary()
@@ -1391,6 +1456,116 @@ module.exports = ({
   }
 
   /**
+   * The members of a group as LeaveGroup names them: a static member by its instance id alone (an
+   * empty member id), a dynamic one by its member id. Groups of both protocols are described.
+   * @param {string} groupId
+   * @returns {Promise<{ memberId: string, groupInstanceId?: string }[]>} empty for a group that does
+   *   not exist or has no member
+   * @throws {KafkaJSProtocolError} when the group's row carries an error other than "not found"
+   */
+  const describedMembers = async (groupId) => {
+    const {
+      groups: [group],
+    } = await describeGroups([groupId])
+
+    if (group === undefined) {
+      throw new KafkaJSNonRetriableError(`The coordinator described no group for ${groupId}`)
+    }
+
+    if (group.errorCode !== 0 && group.errorCode !== GROUP_ID_NOT_FOUND_CODE) {
+      throw createErrorFromCode(group.errorCode)
+    }
+
+    if (group.protocolType !== CONSUMER_PROTOCOL_TYPE && group.protocolType !== '') {
+      throw new KafkaJSNonRetriableError(
+        `Group ${groupId} is not a consumer group (its protocol type is "${group.protocolType}")`
+      )
+    }
+
+    return group.members.map(({ memberId, groupInstanceId }) =>
+      groupInstanceId == null ? { memberId } : { memberId: '', groupInstanceId }
+    )
+  }
+
+  /**
+   * Removes members from a consumer group, for instances that are already gone (KIP-345). A member
+   * that is still running rejoins on its next heartbeat, so this is not a way to stop a consumer.
+   *
+   * With `members` omitted, every member `describeGroups` reports is removed, static ones by
+   * instance id and dynamic ones by member id, and a group with no member resolves `[]` without a
+   * request; a group of another protocol type (a Connect group, say) is refused, as Java does.
+   * With `members` given, each `{ groupInstanceId }` names a static member; a repeated
+   * instance id is sent once. The request goes to the group coordinator, and a coordinator that is
+   * not the right one, not available or still loading the group is asked again on the `retry`
+   * budget; any other top-level error rejects. A member that could not be removed is a result, not
+   * an error: a group that does not exist answers every member `UNKNOWN_MEMBER_ID`.
+   *
+   * @param {Object} options
+   * @param {string} options.groupId
+   * @param {{ groupInstanceId: string }[]} [options.members]
+   * @param {string} [options.reason='member was removed by an admin'] logged by the coordinator,
+   *   cut to 255 characters and sent only to a broker that offers LeaveGroup v5; `null` and the
+   *   empty string mean the default, as in Java
+   * @returns {Promise<RemoveMemberResult[]>} one result per member sent
+   * @throws {KafkaJSNonRetriableError} for a `groupId` that is not a non-empty string, an empty
+   *   `members`, a `groupInstanceId` that is blank, a `reason` that is neither a string nor null,
+   *   or (without `members`) a group that is not a consumer group
+   * @throws {KafkaJSNumberOfRetriesExceeded} when the coordinator never settles
+   *
+   * @typedef {Object} RemoveMemberResult
+   * @property {string} memberId the member id sent, empty for a static member named by instance id
+   * @property {string|null} groupInstanceId
+   * @property {number} errorCode 0 when the member was removed
+   * @property {KafkaJSProtocolError|null} error the error for `errorCode`, or null
+   */
+  const removeMembersFromConsumerGroup = async ({ groupId, members, reason } = {}) => {
+    if (typeof groupId !== 'string' || groupId.length === 0) {
+      throw new KafkaJSNonRetriableError(`Invalid groupId ${groupId}`)
+    }
+
+    if (reason != null && typeof reason !== 'string') {
+      throw new KafkaJSNonRetriableError(
+        `Invalid reason ${JSON.stringify(reason)}, expected a string`
+      )
+    }
+
+    const leaving = members === undefined ? await describedMembers(groupId) : staticMembers(members)
+
+    if (leaving.length === 0) {
+      return []
+    }
+
+    const sentReason = (reason == null || reason === '' ? DEFAULT_REMOVE_REASON : reason).slice(
+      0,
+      MAX_REMOVE_REASON_LENGTH
+    )
+    const request = {
+      groupId,
+      members: leaving.map((member) => ({ ...member, reason: sentReason })),
+    }
+
+    return createRetry(retry)(async (bail, retryCount, retryTime) => {
+      try {
+        const coordinator = await cluster.findGroupCoordinator({ groupId })
+        const response = await coordinator.leaveGroup(request)
+
+        return leaving.map((member, index) => toRemoveMemberResult(member, response.members[index]))
+      } catch (e) {
+        if (isStaleCoordinator(e) || e.code === COORDINATOR_LOAD_IN_PROGRESS_CODE) {
+          logger.warn('Could not remove members from the group', {
+            error: e.message,
+            retryCount,
+            retryTime,
+          })
+          throw e
+        }
+
+        bail(e)
+      }
+    })
+  }
+
+  /**
    * Delete topic records up to the selected partition offsets
    *
    * @param {string} topic
@@ -2003,6 +2178,7 @@ module.exports = ({
     listGroups,
     describeGroups,
     deleteGroups,
+    removeMembersFromConsumerGroup,
     describeAcls,
     deleteAcls,
     createAcls,

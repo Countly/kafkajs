@@ -585,6 +585,7 @@ module.exports = {
   KafkaJSDeliveryTimeout,
   isRebalancing,
   isStaleCoordinator,
+  COORDINATOR_LOAD_IN_PROGRESS_CODE,
   isLostMember,
   isRevoked,
   isFencedInstance,

@@ -717,6 +717,35 @@ try {
 }
 ```
 
+## <a name="remove-members"></a> Remove members from a consumer group
+
+Remove members from a group that no longer has the instances behind them, for example a static member whose pod is gone and whose slot would otherwise hold its partitions until `sessionTimeout` passes. It is not a way to stop a consumer: a member that is still running rejoins on its next heartbeat.
+
+```javascript
+await admin.removeMembersFromConsumerGroup({
+    groupId: <String>,
+    members: <{ groupInstanceId: String }[]>, // optional
+    reason: <String> // optional
+})
+```
+
+- With `members`, each entry names a **static** member by its `groupInstanceId` (an entry repeated is sent once). An empty list, or a blank `groupInstanceId`, throws `KafkaJSNonRetriableError`.
+- Without `members`, every member `describeGroups` reports for the group is removed, static ones by instance id and dynamic ones by member id, under both group protocols. A group with no member, or that does not exist, resolves `[]` and sends nothing; a group of another protocol type (a Kafka Connect group, say) is refused with `KafkaJSNonRetriableError`.
+- `reason` is what the coordinator logs. It defaults to `"member was removed by an admin"`, which is also used for a `null` or empty `reason`, as in Java; it is cut to 255 characters and sent to brokers that offer LeaveGroup v5, which every Kafka 4.x broker does.
+
+A member that could not be removed is a result, not an error. The call resolves one result per member sent, and only a failure of the request itself rejects:
+
+```javascript
+const results = await admin.removeMembersFromConsumerGroup({ groupId: 'orders', members: [{ groupInstanceId: 'orders-pod-3' }] })
+// [{ memberId: '', groupInstanceId: 'orders-pod-3', errorCode: 0, error: null }]
+//
+// errorCode 25, error.type 'UNKNOWN_MEMBER_ID': the group has no such member (a group that does not exist answers this for every member)
+
+const failed = results.filter(({ error }) => error)
+```
+
+A coordinator that is not the right one, is not available or is still loading the group is asked again, on the admin's `retry` budget; any other error of the request rejects.
+
 ## <a name="delete-topic-records"></a> Delete Topic Records
 
 Delete records for a selected topic. This will delete all records from the earliest offset up to - but not including - the provided target offset for the given partition(s). To delete all records in a partition, use a target offset of `-1`.

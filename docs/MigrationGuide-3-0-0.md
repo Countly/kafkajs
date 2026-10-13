@@ -828,6 +828,14 @@ Group visibility and the admin client.
   `topicConfigErrorCode` and `topicId`, and `deleteTopics` results gain `topicId` and
   `errorMessage`. `admin.createTopics()` still resolves a boolean: read the id with
   `fetchTopicMetadata`. *What to do:* snapshot tests over these objects need the new keys.
+- **New admin methods and enum values.** `admin.incrementalAlterConfigs` and
+  `admin.removeMembersFromConsumerGroup` are new, with the enums `AlterConfigOpTypes` and
+  `ConfigTypes`, the values `ConfigResourceTypes.GROUP` and `CLIENT_METRICS`, `ConfigSource` 7 and 8
+  and `AclResourceTypes.USER`, and the options `includeDocumentation` on `describeConfigs` and
+  `useDescribeTopicPartitions` on `fetchTopicMetadata`; all of it is additive. Both new methods
+  resolve one result per item and do not throw for an item's own error, so check each result's
+  `errorCode` (or its `error`). Prefer `incrementalAlterConfigs` over `alterConfigs`, which replaces
+  a resource's whole dynamic config.
 
 ### Errors and events
 

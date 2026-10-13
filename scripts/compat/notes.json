@@ -33,7 +33,7 @@
       "since": "2026-09-03"
     },
     "LeaveGroup": {
-      "note": "v3 batch removal by group instance id (KIP-345): the codec exists, but there is no admin removeMembersFromConsumerGroup to drive it.",
+      "note": "v3 batch removal by group instance id (KIP-345), driven by admin.removeMembersFromConsumerGroup; v4 flexible; v5 a per-member reason (KIP-800), which the consumer's own leave and the admin removal both send.",
       "since": "2026-09-03"
     },
     "DescribeGroups": {

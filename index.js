@@ -22,6 +22,7 @@ const {
   isPollIntervalExceeded,
   isFatalMembership,
   CONSUMER_PROTOCOL_UNSUPPORTED,
+  COORDINATOR_LOAD_IN_PROGRESS_CODE,
   ...errors
 } = require('./src/errors')
 const { LEVELS } = require('./src/loggers')
