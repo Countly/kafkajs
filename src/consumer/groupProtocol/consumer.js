@@ -49,6 +49,18 @@ const LEAVE_EPOCH_DYNAMIC = -1
 const LEAVE_EPOCH_STATIC = -2
 
 /**
+ * The member epoch a leave carries. A static member says it is only going away for now (-2) unless
+ * the caller asked for it to leave (`leaveGroup: true`), which has to use -1: the coordinator
+ * removes a static member that leaves at -1 and keeps its slot for one that leaves at -2.
+ * @see https://github.com/apache/kafka/blob/4.3.1/clients/src/main/java/org/apache/kafka/clients/consumer/internals/ConsumerMembershipManager.java
+ * @param {boolean} isStatic whether the member has a `groupInstanceId`
+ * @param {boolean} [leaveGroup] the caller's choice, `undefined` for the default
+ * @returns {number}
+ */
+const leaveEpochFor = (isStatic, leaveGroup) =>
+  isStatic && leaveGroup !== true ? LEAVE_EPOCH_STATIC : LEAVE_EPOCH_DYNAMIC
+
+/**
  * How many refreshes may report the same topic id unresolved before it stops being asked for. An
  * id that is merely late is retried; one the cluster has now twice refused to name would otherwise
  * cost a Metadata request per metadata max age for the life of the membership.
@@ -390,7 +402,7 @@ module.exports = class ConsumerGroupProtocol {
       await this.sendHeartbeat({ sendAllFields: false })
     })
 
-    this.sharedLeave = sharedPromiseTo(() => this.performLeave())
+    this.sharedLeave = sharedPromiseTo((options) => this.performLeave(options))
   }
 
   /** @returns {'consumer'} */
@@ -1395,14 +1407,21 @@ module.exports = class ConsumerGroupProtocol {
    * epoch. Legal from every state - a member that is already out sends nothing rather than
    * throwing, which matters because a poll-interval overrun is the commonest way a consumer ends
    * up being stopped.
+   *
+   * `leaveGroup` picks the leave heartbeat's epoch and whether it is sent at all: `true` is -1 for
+   * every member, `undefined` is -1 for a dynamic member and -2 for a static one, and `false` is -2
+   * for a static member and nothing for a dynamic one, which is then left to expire. Everything
+   * else a leave does (the commit, the revocation, the clearing) happens whatever its value. A call
+   * that joins a leave already under way keeps that leave's choice.
+   * @param {{ leaveGroup?: boolean }} [options]
    * @returns {Promise<void>}
    */
-  async leave() {
+  async leave(options) {
     if (isLeavingGroup(this.state)) {
       return this.joinInFlightLeave()
     }
 
-    return this.trackLeave(this.sharedLeave())
+    return this.trackLeave(this.sharedLeave(options))
   }
 
   /**
@@ -1438,9 +1457,10 @@ module.exports = class ConsumerGroupProtocol {
    * The leave itself, run once however many callers asked for it: commit, report the partitions,
    * send the leave heartbeat, park the member out of the group.
    * @private
+   * @param {{ leaveGroup?: boolean }} [options] see `leave`
    * @returns {Promise<void>}
    */
-  async performLeave() {
+  async performLeave(options) {
     // Whatever join was in flight is abandoned by the leave, from every state, and it is FAILED
     // rather than quietly resolved: a leave runs only from a stop, and a round told the join
     // succeeded would go on to apply an assignment for a member that is on its way out. The
@@ -1470,7 +1490,7 @@ module.exports = class ConsumerGroupProtocol {
       this.emitPartitions(PARTITIONS_LOST, releasing)
     }
 
-    await this.sendLeaveHeartbeat()
+    await this.sendLeaveHeartbeat(options?.leaveGroup)
   }
 
   /**
@@ -1504,17 +1524,30 @@ module.exports = class ConsumerGroupProtocol {
 
   /**
    * Sends the one heartbeat that announces the leave, at the negative epoch the member's kind of
-   * membership calls for, and clears everything the membership held.
+   * membership calls for, and clears everything the membership held. A dynamic member that was told
+   * to remain in the group (`leaveGroup: false`) clears the same things and sends nothing, and the
+   * leave ends the way one does when no coordinator is known.
    * @private
+   * @param {boolean} [leaveGroup] the caller's choice, `undefined` for the default
    * @returns {Promise<void>}
    */
-  async sendLeaveHeartbeat() {
+  async sendLeaveHeartbeat(leaveGroup) {
     this.ownedPartitions = []
     this.clearTarget()
     this.sentFields.reset()
     this.localAssignment = { localEpoch: 0, byTopicId: new Map() }
-    this.memberEpoch = this.groupInstanceId ? LEAVE_EPOCH_STATIC : LEAVE_EPOCH_DYNAMIC
+    const isStatic = Boolean(this.groupInstanceId)
+    this.memberEpoch = leaveEpochFor(isStatic, leaveGroup)
     this.transitionTo(LEAVING)
+
+    if (leaveGroup === false && !isStatic) {
+      this.logger.debug('Leaving without a heartbeat: the member was told to remain in the group', {
+        groupId: this.groupId,
+      })
+      this.onRequestGenerated({ leaveEpoch: this.memberEpoch, stateAtRequest: LEAVING })
+      return
+    }
+
     this.immediatePending = true
 
     // Sent directly, never through the heartbeat manager: by the time a leave runs the chain has

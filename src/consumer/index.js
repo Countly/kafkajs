@@ -106,6 +106,31 @@ const validateGroupProtocolOptions = (params) => {
 }
 
 /**
+ * Reads a `disconnect()` argument: an options object, `{ leaveGroup?: boolean }`, or nothing.
+ *
+ * Anything that is not an object is ignored, exactly as kafkajs 2.2.4's `disconnect()` ignored
+ * every argument: `process.on('SIGTERM', consumer.disconnect)` passes the signal name, and
+ * rejecting it would surface as an unhandled rejection inside a signal handler.
+ * @param {*} [options]
+ * @returns {{ leaveGroup?: boolean }|undefined} what to hand to the stop: `undefined` when
+ *   `options` is absent (`null` included) or is not an object, so everything below sees an object
+ *   or nothing
+ * @throws {KafkaJSNonRetriableError} when `options` is an object whose `leaveGroup` is neither
+ *   `undefined` nor a boolean
+ */
+const parseDisconnectOptions = (options) => {
+  if (options == null || typeof options !== 'object') {
+    return undefined
+  }
+
+  if (options.leaveGroup !== undefined && typeof options.leaveGroup !== 'boolean') {
+    throw new KafkaJSNonRetriableError('Argument "leaveGroup" must be a boolean')
+  }
+
+  return options
+}
+
+/**
  * @param {Object} params
  * @param {import("../../types").Cluster} params.cluster
  * @param {String} params.groupId
@@ -206,9 +231,9 @@ module.exports = (params) => {
   /** @type {ConsumerGroup} */
   let consumerGroup = null
   let restartTimeout = null
-  // Bumped on every stop() invocation (including the one onCrash triggers internally as part
-  // of its own cleanup), so onCrash can tell whether a *separate* stop happened while it was
-  // still deciding whether to restart (e.g. a slow restartOnFailure callback).
+  // Bumped on every stop() and disconnect() invocation (including the disconnect onCrash triggers
+  // internally as part of its own cleanup), so onCrash can tell whether a *separate* stop happened
+  // while it was still deciding whether to restart (e.g. a slow restartOnFailure callback).
   let stopGeneration = 0
 
   /**
@@ -304,10 +329,25 @@ module.exports = (params) => {
     instrumentationEmitter.emit(CONNECT)
   }
 
-  /** @type {import("../../types").Consumer["disconnect"]} */
-  const disconnect = async () => {
+  /**
+   * Stops the consumer and disconnects the cluster. `leaveGroup` (KIP-1092) overrides whether the
+   * member leaves its group: `true` removes it at once, whatever its kind, `false` keeps it in the
+   * group until its session expires, and `undefined` is the default (a dynamic member leaves, a
+   * static one stays). A call that joins a stop already in flight keeps the first caller's choice.
+   * Crashes and restarts always use the default, and so does a call whose argument is not an
+   * options object.
+   *
+   * @type {import("../../types").Consumer["disconnect"]}
+   * @param {{ leaveGroup?: boolean }} [options]
+   * @throws {KafkaJSNonRetriableError} before anything is stopped, when `options` is an object
+   *   whose `leaveGroup` is neither `undefined` nor a boolean
+   */
+  const disconnect = async (options) => {
+    const stopOptions = parseDisconnectOptions(options)
+    stopGeneration++
+
     try {
-      await stop()
+      await stopShared(stopOptions)
       logger.debug('consumer has stopped, disconnecting', { groupId })
       await cluster.disconnect()
       instrumentationEmitter.emit(DISCONNECT)
@@ -323,10 +363,10 @@ module.exports = (params) => {
     }
   }
 
-  const stopShared = sharedPromiseTo(async () => {
+  const stopShared = sharedPromiseTo(async (options) => {
     try {
       if (runner) {
-        await runner.stop()
+        await runner.stop(options)
         runner = null
         consumerGroup = null
         instrumentationEmitter.emit(STOP)
@@ -346,12 +386,13 @@ module.exports = (params) => {
 
   /**
    * Every call bumps the stop generation, even when it joins an in-flight stop, so a crash
-   * handler deciding whether to restart can tell that the user asked for a stop meanwhile.
+   * handler deciding whether to restart can tell that the user asked for a stop meanwhile. It takes
+   * no options: only `disconnect()` can override how the member leaves its group.
    * @type {import("../../types").Consumer["stop"]}
    */
-  const stop = (...args) => {
+  const stop = () => {
     stopGeneration++
-    return stopShared(...args)
+    return stopShared()
   }
 
   /** @type {import("../../types").Consumer["subscribe"]} */

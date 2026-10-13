@@ -481,10 +481,12 @@ module.exports = class ConsumerGroup {
   /**
    * Leaves the group, so the coordinator rebalances immediately instead of waiting for the
    * session to expire.
+   * @param {{ leaveGroup?: boolean }} [options] `true` removes the member whatever its kind,
+   *   `false` keeps it in the group until its session expires, and `undefined` is the default
    * @returns {Promise<void>}
    */
-  async leave() {
-    return this.groupMembership.leave()
+  async leave(options) {
+    return this.groupMembership.leave(options)
   }
 
   /**

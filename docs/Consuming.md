@@ -303,10 +303,33 @@ const consumer = kafka.consumer({ groupId: 'my-group', groupInstanceId: 'my-grou
 
 Static membership changes two behaviors:
 
-- **`consumer.disconnect()` does not send LeaveGroup.** A static member keeps its slot in the group; the broker only reassigns its partitions once `sessionTimeout` elapses without a heartbeat. This means a rolling restart no longer triggers a rebalance for every replica, at the cost of the group holding those partitions idle until `sessionTimeout` elapses — unless the new instance rejoins under the same `groupInstanceId` first, which takes over immediately (see below). There is no way to force a LeaveGroup for a static member today (KIP-1092 adds an explicit override in a later phase); to bound or remove this delay, lower `sessionTimeout` for that consumer, or stop passing `groupInstanceId`.
+- **`consumer.disconnect()` does not send LeaveGroup.** A static member keeps its slot in the group; the broker only reassigns its partitions once `sessionTimeout` elapses without a heartbeat. This means a rolling restart no longer triggers a rebalance for every replica, at the cost of the group holding those partitions idle until `sessionTimeout` elapses — unless the new instance rejoins under the same `groupInstanceId` first, which takes over immediately (see below). To make a static member leave at once anyway, pass `{ leaveGroup: true }` to `disconnect()` (see [Leaving the group on disconnect](#leaving-the-group)); to bound the delay otherwise, lower `sessionTimeout` for that consumer, or stop passing `groupInstanceId`.
 - **A duplicate `groupInstanceId` fences the *existing* member, not the new one.** If a second consumer connects with a `groupInstanceId` already held by a live member, the broker immediately admits the new joiner — rebinding it to the existing assignment, no rebalance — and fences the *incumbent* on its next heartbeat with `FENCED_INSTANCE_ID` (error code 82). In practice: a restarted instance takes over right away, and it is the **old process** that crashes. That old consumer does **not** restart (`CRASH` event payload has `restart: false`, regardless of any `retry.restartOnFailure` callback) — restarting would immediately re-fence into the same loop, since another live member already holds that `groupInstanceId`. This is the expected, healthy path during a rolling restart that briefly runs two instances under the same id; outside of that, it means two processes were misconfigured with the same `groupInstanceId` and one of them needs a different one.
 
 Requires the broker to support JoinGroup v5 / SyncGroup v3 / Heartbeat v3 / LeaveGroup v3 (Kafka 2.4+); this fork's floor is Kafka 4.0+, so this is always available. If a broker somehow negotiates an older JoinGroup version, a one-time warning is logged and static membership is silently inactive (the consumer behaves as a dynamic member).
+
+## <a name="leaving-the-group"></a> Leaving the group on disconnect
+
+By default `consumer.disconnect()` decides for itself how the member leaves its group: a dynamic member leaves; a static member (`groupInstanceId`) keeps its slot, by sending nothing under `'classic'` and the leave-for-now heartbeat (epoch -2) under `'consumer'`. Pass `leaveGroup` to override that for one disconnect (KIP-1092):
+
+```javascript
+await consumer.disconnect({ leaveGroup: true }) // hand the partitions over now, even a static member
+await consumer.disconnect({ leaveGroup: false }) // do not tell the group, even a dynamic member
+```
+
+| `leaveGroup`      | `'classic'`, dynamic | `'classic'`, static                                          | `'consumer'`, dynamic | `'consumer'`, static                                 |
+| ----------------- | -------------------- | ------------------------------------------------------------ | --------------------- | ---------------------------------------------------- |
+| not set (default) | LeaveGroup           | nothing is sent                                              | leaves (epoch -1)     | leaves for now (epoch -2), the member keeps its slot |
+| `true`            | LeaveGroup           | **LeaveGroup**, with the member id and the `groupInstanceId` | leaves (epoch -1)     | **leaves for good (epoch -1)**, the slot is released |
+| `false`           | **nothing is sent**  | nothing is sent                                              | **nothing is sent**   | leaves for now (epoch -2), the member keeps its slot |
+
+- **`true` hands the partitions over at once.** The coordinator rebalances as soon as it learns the member is gone. A static member that leaves this way gives up its slot: a restart under the same `groupInstanceId` joins as a new member, so the group rebalances again.
+- **`false` is the consequence to know about.** A member that does not tell the group it is leaving is still a member: the group keeps assigning it its partitions, and nobody consumes them, until its session expires (`sessionTimeout` under the classic protocol, the broker's `group.consumer.session.timeout.ms` under the consumer protocol), and the group then rebalances. It suits a member that is about to come back as the same member, which is what a static member is; for a dynamic member it only moves the rebalance to the end of the session. For a static member `false` is what the default already does.
+- **Stopping itself does not change.** The consumer still stops fetching and waits for the handler that is running; under the consumer protocol it also still commits what it owns and emits `PARTITIONS_REVOKED`, whatever `leaveGroup` says.
+- **A second `disconnect()` that joins one already running keeps the first call's choice.** `consumer.stop()` takes no option, and a consumer that crashes and restarts always uses the default. `leaveGroup` applies to the stop that `disconnect()` itself performs: after a `stop()` there is nothing left to leave, so `disconnect({ leaveGroup: true })` sends nothing, and the same holds after the member has already been removed, for instance by a poll-interval overrun.
+- **Called without an argument, or with anything but an options object, `disconnect()` changes nothing.** An argument that is not an object is ignored, as it was in kafkajs 2.2.4, so `process.on('SIGTERM', consumer.disconnect)` (which passes the signal name) still works, and `disconnect(true)` does not mean "leave". An options object whose `leaveGroup` is anything but `true`, `false` or `undefined` throws `KafkaJSNonRetriableError` before anything is stopped.
+
+A classic static member that leaves with `true` sends its member id and its `groupInstanceId`, so the coordinator checks the pair and answers `FENCED_INSTANCE_ID` for a member id that is no longer the instance's current one instead of removing someone else's membership. The Java client sends the member id alone.
 
 ## <a name="pause-resume"></a> Pause & Resume
 

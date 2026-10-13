@@ -457,18 +457,22 @@ module.exports = class Runner extends EventEmitter {
   /**
    * Stop the runner: halt fetching, wait for in-flight processing, then leave the group.
    *
-   * Under the classic protocol a static member (`groupInstanceId` set) keeps its group slot
-   * across a normal shutdown instead (KIP-345 default: Java gates this the same way via
-   * `AbstractCoordinator.shouldSendLeaveGroupRequest = LEAVE_GROUP || isDynamicMember()`), so
-   * no LeaveGroup is sent for it. There is no override for this today (KIP-1092 adds an
-   * explicit one in a later phase) — lower `sessionTimeout`, or drop `groupInstanceId`, to bound
-   * or remove the delay before the group reassigns a static member's partitions. Under the
-   * consumer protocol a static member always leaves, with the static leave epoch (-2), so the
-   * coordinator can hand its partitions to a returning instance without waiting.
+   * By default, under the classic protocol, a static member (`groupInstanceId` set) keeps its
+   * group slot across a normal shutdown (KIP-345: Java gates this the same way via
+   * `AbstractCoordinator.shouldSendLeaveGroupRequest = LEAVE_GROUP || isDynamicMember()`), so no
+   * LeaveGroup is sent for it. Under the consumer protocol a static member leaves by default with
+   * the static leave epoch (-2), so the coordinator can hand its partitions to a returning
+   * instance without waiting.
    *
+   * `options.leaveGroup` overrides the default (KIP-1092): `true` removes the member from the
+   * group at once, `false` keeps it there until its session expires, `undefined` is the default.
+   * Every value but `undefined` goes to the group's own `leave`, which knows what it means for its
+   * protocol.
+   *
+   * @param {{ leaveGroup?: boolean }} [options]
    * @returns {Promise<void>}
    */
-  async stop() {
+  async stop(options) {
     if (!this.running) {
       return
     }
@@ -507,13 +511,18 @@ module.exports = class Runner extends EventEmitter {
 
       this.consumerGroup.clearAssignerState()
 
-      // KIP-345's "a static member sends no LeaveGroup" is a CLASSIC rule. A KIP-848 member always
-      // tells the coordinator it is gone; the protocol picks epoch -1 or -2 from `groupInstanceId`.
+      // KIP-345's "a static member sends no LeaveGroup" is a CLASSIC rule. A KIP-848 member tells
+      // the coordinator it is gone by default; the protocol picks epoch -1 or -2 from
+      // `groupInstanceId`.
       // @see https://cwiki.apache.org/confluence/display/KAFKA/KIP-848%3A+The+Next+Generation+of+the+Consumer+Rebalance+Protocol
-      if (this.consumerGroup.kind === 'classic' && this.consumerGroup.groupInstanceId) {
+      if (
+        options?.leaveGroup === undefined &&
+        this.consumerGroup.kind === 'classic' &&
+        this.consumerGroup.groupInstanceId
+      ) {
         this.consumerGroup.memberId = null
       } else {
-        await this.consumerGroup.leave()
+        await this.consumerGroup.leave(options)
       }
     } catch (e) {
       // The shutdown continues either way - the runner is already stopped by this point - but a

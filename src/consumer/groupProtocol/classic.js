@@ -457,18 +457,27 @@ module.exports = class ClassicGroupProtocol {
   /**
    * Leaves the group with the reason `the consumer is being closed` (sent from LeaveGroup v5),
    * then forgets the member id and the assigners' retained state. Sends nothing without a member id.
+   *
+   * A static member's request carries both ids, so the coordinator checks the pair and removes the
+   * instance's current member, or answers `FENCED_INSTANCE_ID` for a stale member id; Java's
+   * classic leave sends the member id alone.
+   * @param {{ leaveGroup?: boolean }} [options] `false` sends no request and only forgets the
+   *   member id; `true` and `undefined` send it (nothing calls this for a static member that
+   *   leaves by default)
    * @returns {Promise<void>}
    * @throws {import('../../errors').KafkaJSProtocolError} the coordinator's error for this member
    */
-  async leave() {
+  async leave({ leaveGroup } = {}) {
     const { groupId, memberId, groupInstanceId } = this
     if (memberId) {
-      await this.coordinator.leaveGroup({
-        groupId,
-        memberId,
-        groupInstanceId,
-        reason: LEAVE_REASON,
-      })
+      if (leaveGroup !== false) {
+        await this.coordinator.leaveGroup({
+          groupId,
+          memberId,
+          groupInstanceId,
+          reason: LEAVE_REASON,
+        })
+      }
       this.memberId = null
     }
 

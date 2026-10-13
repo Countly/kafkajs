@@ -375,7 +375,9 @@ says so, `groupProtocol: 'consumer'`.
   that disconnects and is not coming back holds its partitions until `sessionTimeout`; lower
   `sessionTimeout` for that consumer, or do not pass `groupInstanceId`.
   Under `groupProtocol: 'consumer'` a static member does send a leave (see "A static member under
-  `groupProtocol: 'consumer'` sends a leave on close and on poll expiry").
+  `groupProtocol: 'consumer'` sends a leave on close and on poll expiry"). To make a static member
+  leave at once, call `consumer.disconnect({ leaveGroup: true })`; see
+  "`consumer.disconnect({ leaveGroup })` overrides how a member leaves its group".
 
 - **CRC32C verification is on by default (`checkCrcs`)**. The consumer now checks every fetched
   record batch's CRC32C checksum before delivering it, instead of reading and discarding the
@@ -693,13 +695,15 @@ says so, `groupProtocol: 'consumer'`.
   notices at `sessionTimeout`. A static consumer-protocol member instead sends one heartbeat
   carrying member epoch −2, the protocol's "this static member is going away" signal, which tells
   the coordinator about the departure straight away while keeping the assignment reserved for that
-  `groupInstanceId` — the protocol has no way for a static member to leave permanently. Two things
+  `groupInstanceId` — epoch −2 never removes the member. Two things
   follow for you. The coordinator learns about a shutdown immediately instead of waiting out the
   session timeout. And because a member that still holds a live epoch gives its partitions up
   properly, closing one emits `PARTITIONS_REVOKED` and, with `autoCommit: true`, commits the
   offsets its handlers resolved first — where a static classic member emits neither. The same
   −2 heartbeat is sent when the poll deadline expires, which is the case `POLL_INTERVAL_EXCEEDED`'s
-  `isStatic: true` reports.
+  `isStatic: true` reports. To leave for good, call `consumer.disconnect({ leaveGroup: true })`: it
+  sends epoch −1 instead, which removes the member (see "`consumer.disconnect({ leaveGroup })`
+  overrides how a member leaves its group").
 
 - **A fatal membership error never restarts under `groupProtocol: 'consumer'`.** These conditions
   will be answered the same way by every rejoin, so the consumer stops instead of looping: the group
@@ -766,6 +770,19 @@ says so, `groupProtocol: 'consumer'`.
   with a protocol type or name other than the join's, now fails the rebalance with
   `INCONSISTENT_GROUP_PROTOCOL` (23, not retriable). A correct broker never does. *What to do:*
   nothing.
+- **`consumer.disconnect({ leaveGroup })` overrides how a member leaves its group.** Called
+  without an argument, or with anything but an options object, nothing changes: a dynamic member
+  leaves, and a static member (`groupInstanceId`) keeps its slot (under `groupProtocol: 'classic'`
+  it sends nothing, under `'consumer'` it sends the leave-for-now heartbeat, epoch −2). An argument
+  that is not an object is ignored, as in 2.2.4, so `process.on('SIGTERM', consumer.disconnect)`
+  still works. `{ leaveGroup: true }` makes any member leave at once, so a static member that is not
+  coming back hands its partitions over instead of holding them until its session expires;
+  `{ leaveGroup: false }` sends nothing for a dynamic member, so the member, and its partitions,
+  stay until its session expires (for a static member it does what the default does). *What
+  to do:* static members that should hand over at once: `disconnect({ leaveGroup: true })`. A
+  consumer that restarts as the same static member needs nothing. `stop()` takes no option, a
+  crash restart keeps the default, and an options object whose `leaveGroup` is not a boolean throws
+  `KafkaJSNonRetriableError` before anything is stopped.
 
 ### Admin
 

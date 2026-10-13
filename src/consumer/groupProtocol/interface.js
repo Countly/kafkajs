@@ -48,7 +48,9 @@ const COOPERATIVE = 'cooperative'
  *   error implies, wherever it was learned - the heartbeat, an offset commit or a fetch
  * @property {() => void} onStopRequested fails whatever the protocol is waiting on, because the
  *   consumer is stopping
- * @property {() => Promise<void>} leave
+ * @property {(options?: { leaveGroup?: boolean }) => Promise<void>} leave `leaveGroup` `true`
+ *   removes the member from the group at once, `false` keeps it there until its session expires,
+ *   and `undefined` is the default: a dynamic member leaves, a static one stays
  * @property {() => Promise<void>} leaveForPollExpiry the poll-overrun variant of `leave`: no
  *   commit, no partition events, the response ignored
  * @property {() => RebalanceProtocol} rebalanceProtocol
