@@ -1,6 +1,7 @@
 const InstrumentationEventEmitter = require('../../instrumentation/emitter')
 const createProducer = require('../../producer')
 const createConsumer = require('../index')
+const subscriptionBlindAssigner = require('./fixtures/subscriptionBlindAssigner')
 
 const {
   secureRandom,
@@ -629,13 +630,15 @@ describe('Consumer > Instrumentation Events', () => {
       await createTopic({ topic: topicName, partitions: 2 })
     }
 
-    // First consumer subscribes to topicNames
+    // First consumer subscribes to topicNames. This client's own assigners never hand a member a
+    // topic it does not subscribe to, so the leader runs one that does.
     consumer = createTestConsumer({
       groupId,
       cluster: createCluster({
         instrumentationEmitter: new InstrumentationEventEmitter(),
         metadataMaxAge: 50,
       }),
+      partitionAssigners: [subscriptionBlindAssigner],
     })
 
     await consumer.connect()
@@ -653,6 +656,7 @@ describe('Consumer > Instrumentation Events', () => {
         instrumentationEmitter: new InstrumentationEventEmitter(),
         metadataMaxAge: 50,
       }),
+      partitionAssigners: [subscriptionBlindAssigner],
     })
 
     const onReceivedUnsubscribedTopics = jest.fn()

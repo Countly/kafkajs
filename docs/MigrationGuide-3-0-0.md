@@ -808,6 +808,15 @@ says so, `groupProtocol: 'consumer'`.
   with `LEADER_NOT_AVAILABLE`, once the cluster's retries ran out, whenever any partition had no
   leader. A topic the expression matches still needs a leader for every partition before
   `subscribe()` resolves. *What to do:* nothing; a spurious failure is gone.
+- **`roundRobin` gives each partition only to a member that subscribes to its topic.** When the
+  members of a group subscribe to different topics, 2.2.4's `roundRobin` dealt every partition of
+  the leader's topics over all members; a member that did not subscribe to a topic dropped its
+  partitions with the `RECEIVED_UNSUBSCRIBED_TOPICS` warning, and nobody consumed them until the
+  next rebalance. It now hands each partition to the next member, in sorted member-id order, that
+  subscribes to its topic, as Java's `RoundRobinAssignor` does, and skips a topic no member
+  subscribes to. `sticky` and `cooperative-sticky` likewise no longer hand a partition back to a
+  previous owner that has left its topic. When every member subscribes to every topic, nothing
+  changes. *What to do:* nothing. The warning still appears when another client leads the group.
 
 ### Admin
 

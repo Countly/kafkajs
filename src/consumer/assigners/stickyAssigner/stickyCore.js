@@ -373,11 +373,15 @@ class GeneralAssignmentBuilder {
    * @param {StickyMember[]} input.members in member-info order
    * @param {Map<string, Set<string>>} input.owned conflict-resolved ownership
    * @param {number} input.maxGeneration highest generation any member reported
+   * @param {boolean} [input.handBackToSubscribersOnly] whether the balancing pass hands a partition
+   *   back to its previous owner only while that owner still subscribes to the partition's topic,
+   *   which Java's pass does not ask
    */
-  constructor({ partitionsPerTopic, members, owned, maxGeneration }) {
+  constructor({ partitionsPerTopic, members, owned, maxGeneration, handBackToSubscribersOnly }) {
     this.partitionsPerTopic = partitionsPerTopic
     this.members = members
     this.maxGeneration = maxGeneration
+    this.handBackToSubscribersOnly = handBackToSubscribersOnly === true
     this.revocationRequired = false
 
     /** topic to every member that could take one of its partitions, in member-info order */
@@ -449,6 +453,24 @@ class GeneralAssignmentBuilder {
     this.balance(previousOwner, unassigned)
 
     return this.assignment
+  }
+
+  /**
+   * @returns {boolean} whether every partition of the built assignment is held by a member that
+   *   subscribes to its topic
+   */
+  assignsOnlyToSubscribers() {
+    for (const [memberId, keys] of this.assignment) {
+      const subscribed = this.memberTopicSet.get(memberId)
+
+      for (const key of keys) {
+        if (!subscribed.has(topicOf(key))) {
+          return false
+        }
+      }
+    }
+
+    return true
   }
 
   /**
@@ -666,6 +688,20 @@ class GeneralAssignmentBuilder {
 
   /**
    * @private
+   * @param {string} memberId the previous owner of a partition
+   * @param {string} key
+   * @returns {boolean} whether the partition may go back to `memberId`
+   */
+  canHandBackTo(memberId, key) {
+    return !this.handBackToSubscribersOnly || this.memberTopicSet.get(memberId).has(topicOf(key))
+  }
+
+  /**
+   * Moves single partitions until a full pass changes nothing or the assignment is balanced. A
+   * partition whose owner holds at least two more than its previous owner goes back to that
+   * previous owner, when `canHandBackTo` allows it; otherwise it goes to the least loaded
+   * subscriber when some subscriber holds at least two fewer than its owner.
+   * @private
    * @param {string[]} reassignable
    * @param {Map<string, { memberId: string, generation: number }>} previousOwner
    * @returns {void}
@@ -687,7 +723,10 @@ class GeneralAssignmentBuilder {
         const memberId = this.partitionOwner.get(key)
         const held = this.assignment.get(memberId)
         const previous = previousOwner.get(key)
-        const previousHeld = previous && this.assignment.get(previous.memberId)
+        const previousHeld =
+          previous && this.canHandBackTo(previous.memberId, key)
+            ? this.assignment.get(previous.memberId)
+            : undefined
 
         if (previousHeld !== undefined && held.size > previousHeld.size + 1) {
           this.reassign(key, previous.memberId)
@@ -744,6 +783,35 @@ class GeneralAssignmentBuilder {
     this.byLoad.add(newMemberId)
     this.byLoad.add(from)
   }
+}
+
+/**
+ * Runs the general path so that its assignment is Java's wherever that assignment is valid, and a
+ * corrected one where it is not.
+ *
+ * Java's balancing pass hands a partition back to its previous owner without asking whether that
+ * owner still subscribes to the partition's topic, so its assignment can give a partition to a
+ * member that drops it. Asking changes which partition moves where, and with it every later move,
+ * even on a shape where Java's answer was valid. So the pass runs first as Java's does, and when
+ * every partition lands with a subscriber that assignment is returned as it is. Only otherwise
+ * does a second pass run with the subscription checked, so only an invalid shape pays for two.
+ *
+ * @param {object} input
+ * @param {{[topic: string]: number[]}} input.partitionsPerTopic
+ * @param {StickyMember[]} input.members in member-info order
+ * @param {Map<string, Set<string>>} input.owned conflict-resolved ownership, not changed
+ * @param {number} input.maxGeneration highest generation any member reported
+ * @returns {Map<string, Set<string>>} member id to the partition keys it was assigned
+ */
+const buildGeneral = (input) => {
+  const unchecked = new GeneralAssignmentBuilder(input)
+  const assigned = unchecked.build()
+
+  if (unchecked.assignsOnlyToSubscribers()) {
+    return assigned
+  }
+
+  return new GeneralAssignmentBuilder({ ...input, handBackToSubscribersOnly: true }).build()
 }
 
 /**
@@ -909,21 +977,14 @@ const assignSticky = ({ partitionsPerTopic, members, contested }) => {
     }
   }
 
-  const builder = subscriptionsEqual
+  const assigned = subscriptionsEqual
     ? new ConstrainedAssignmentBuilder({
         partitionsPerTopic: partitions,
         members: ordered,
         owned,
         doublyClaimed,
-      })
-    : new GeneralAssignmentBuilder({
-        partitionsPerTopic: partitions,
-        members: ordered,
-        owned,
-        maxGeneration,
-      })
-
-  const assigned = builder.build()
+      }).build()
+    : buildGeneral({ partitionsPerTopic: partitions, members: ordered, owned, maxGeneration })
 
   return new Map(ordered.map(({ memberId }) => [memberId, groupByTopic(assigned.get(memberId))]))
 }

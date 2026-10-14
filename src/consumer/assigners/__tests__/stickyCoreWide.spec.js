@@ -9,6 +9,7 @@ const {
   groupMembers,
   assign,
   checkInvariants,
+  nonSubscriberGrants,
 } = require('../../../../scripts/benchmarks/stickyAssign')
 
 /**
@@ -16,11 +17,12 @@ const {
  * @param {string[]} topics
  * @param {{[topic: string]: number[]}} owned
  * @param {number} generationId
+ * @param {string|null} [groupInstanceId]
  * @returns {object} a member in the shape `assignSticky` consumes
  */
-const member = (memberId, topics, owned, generationId) => ({
+const member = (memberId, topics, owned, generationId, groupInstanceId = null) => ({
   memberId,
-  groupInstanceId: null,
+  groupInstanceId,
   topics,
   ownedPartitions: Object.keys(owned).map((topic) => ({ topic, partitions: owned[topic] })),
   generationId,
@@ -80,21 +82,89 @@ describe('Consumer > assigners > stickyCore general path at scale', () => {
     })
   })
 
+  test('keeps the partitions where they went before when a hand-back to a member that left the topic would still give every partition to a subscriber', () => {
+    const assignment = assignSticky({
+      partitionsPerTopic: { A: partitions(2), B: partitions(2), C: partitions(1) },
+      members: [
+        member('e', ['A'], {}, 1),
+        // It left topic A, which it owned in an older generation than the newest.
+        member('d', ['B'], { A: [0] }, -1),
+        member('c', ['A'], {}, 0),
+        member('b', ['B'], {}, 1, 'i'),
+        member('a', ['A', 'C'], { A: [0, 1] }, 2),
+      ],
+    })
+
+    expect(Object.fromEntries(assignment)).toEqual({
+      a: { C: [0] },
+      b: { B: [0] },
+      c: { A: [1] },
+      d: { B: [1] },
+      e: { A: [0] },
+    })
+  })
+
   test.each([
-    ['sticky', sticky],
-    ['cooperative-sticky', cooperativeSticky],
+    [
+      'sticky',
+      sticky,
+      'capacity-3',
+      {
+        'member-0001': { 'topic-B': [0, 1] },
+        'member-0002': { 'topic-A': [0, 1, 2, 3, 4] },
+        'member-0003': { 'topic-A': [5, 6, 7, 8, 9] },
+      },
+    ],
+    [
+      'cooperative-sticky',
+      cooperativeSticky,
+      'capacity-3',
+      {
+        'member-0001': {},
+        'member-0002': { 'topic-A': [0, 1, 2, 3, 4] },
+        'member-0003': { 'topic-A': [5, 6, 7, 8, 9] },
+      },
+    ],
+    [
+      'sticky',
+      sticky,
+      'hand-back-3',
+      {
+        'member-0001': { 'topic-B': [0] },
+        'member-0002': { 'topic-A': [1, 2] },
+        'member-0003': { 'topic-A': [0] },
+      },
+    ],
+    [
+      'cooperative-sticky',
+      cooperativeSticky,
+      'hand-back-3',
+      {
+        'member-0001': { 'topic-B': [0] },
+        'member-0002': { 'topic-A': [1, 2] },
+        'member-0003': {},
+      },
+    ],
   ])(
-    '%s gives no further partition to a member that holds as many as its subscription has, whatever its previous round named',
-    async (_name, factory) => {
-      const shape = CHECK_ONLY['capacity-3']()
+    '%s on %s gives the partitions of a topic a member left to the members subscribed to it',
+    async (_name, factory, shapeName, expected) => {
+      const shape = CHECK_ONLY[shapeName]()
 
       const result = await assign(factory, shape, groupMembers(shape))
 
-      expect(decoded(result)).toEqual({
-        'member-0001': { 'topic-A': [0, 1] },
-        'member-0002': { 'topic-A': [2, 3, 4], 'topic-B': [0, 1] },
-        'member-0003': { 'topic-A': [5, 6, 7, 8, 9] },
-      })
+      expect(nonSubscriberGrants(shape, result)).toEqual([])
+      expect(decoded(result)).toEqual(expected)
+    }
+  )
+
+  test.each(Object.keys(CHECK_ONLY))(
+    'sticky keeps every invariant on %s, whose previous round names a topic its member left',
+    async (name) => {
+      const shape = CHECK_ONLY[name]()
+
+      const result = await assign(sticky, shape, groupMembers(shape))
+
+      expect(checkInvariants(shape, result)).toEqual([])
     }
   )
 

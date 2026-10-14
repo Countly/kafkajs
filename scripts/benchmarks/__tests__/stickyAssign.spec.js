@@ -67,6 +67,56 @@ module.exports = { ...real, sticky: wrap(real.sticky, (original, group) => {
 }) }`)
 }
 
+/**
+ * Both assigners also give the first member they answer for partition 0 of `topic-stranger`, a
+ * topic no member subscribes to, the way an older tree handed a partition back to a member that
+ * had left its topic.
+ * @param {string} [memberIds] a pattern: only a group with a member id it matches is affected
+ * @returns {string} the tree's directory
+ */
+const strangerTree = (memberIds = '') =>
+  fakeTree(`const stranger = (original) => async (group) => {
+  if (!group.members.some(({ memberId }) => new RegExp(${JSON.stringify(memberIds)}).test(memberId))) {
+    return original(group)
+  }
+  const [first, ...rest] = await original(group)
+  const { assignment } = MemberAssignment.decode(first.memberAssignment)
+  const memberAssignment = MemberAssignment.encode({ version: 3, assignment: { ...assignment, 'topic-stranger': [0] } })
+  return [{ ...first, memberAssignment }, ...rest]
+}
+const { MemberAssignment } = require(${JSON.stringify(path.join(REPO, 'src/consumer/assignerProtocol'))})
+module.exports = { ...real, sticky: wrap(real.sticky, (original, group) => stranger(original)(group)),
+  cooperativeSticky: wrap(real.cooperativeSticky, (original, group) => stranger(original)(group)) }`)
+
+/**
+ * A copy of this tree's `src/` whose sticky general path always returns the assignment of the
+ * unchecked balancing pass, which hands a partition back to its previous owner without asking
+ * whether the owner still subscribes to its topic, as older trees did.
+ * @returns {string} the tree's directory
+ */
+const olderTree = () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'sticky-older-'))
+  trees.push(dir)
+  for (const file of fs.readdirSync(path.join(REPO, 'src'), { recursive: true })) {
+    const from = path.join(REPO, 'src', file)
+    if (!/__tests__|fixtures|\.spec\.js$/.test(file) && fs.statSync(from).isFile()) {
+      fs.mkdirSync(path.dirname(path.join(dir, 'src', file)), { recursive: true })
+      fs.copyFileSync(from, path.join(dir, 'src', file))
+    }
+  }
+  fs.copyFileSync(path.join(REPO, 'package.json'), path.join(dir, 'package.json'))
+
+  const core = path.join(dir, 'src/consumer/assigners/stickyAssigner/stickyCore.js')
+  const text = fs.readFileSync(core, 'utf8')
+  const second =
+    'return new GeneralAssignmentBuilder({ ...input, handBackToSubscribersOnly: true }).build()'
+  if (!text.includes(second)) {
+    throw new Error('the checked pass has moved; update olderTree')
+  }
+  fs.writeFileSync(core, text.replace(second, 'return assigned'))
+  return dir
+}
+
 /** `sticky` never returns. */
 const hangingTree = () =>
   fakeTree(`module.exports = { ...real, sticky: wrap(real.sticky, () => { for (;;) {} }) }`)
@@ -108,10 +158,11 @@ describe('scripts > benchmarks > stickyAssign', () => {
       Object.entries(bench.FIXED).forEach(([name, build]) => expect(build().name).toEqual(name))
     })
 
-    test('names the check-only shape, and only `--check` takes it by default', () => {
+    test('names the check-only shapes, and only `--check` takes them by default', () => {
       const shape = bench.CHECK_ONLY['capacity-3']()
+      const handBack = bench.CHECK_ONLY['hand-back-3']()
 
-      expect(Object.keys(bench.CHECK_ONLY)).toEqual(['capacity-3'])
+      expect(Object.keys(bench.CHECK_ONLY)).toEqual(['capacity-3', 'hand-back-3'])
       expect(shape.name).toEqual('capacity-3')
       expect(shape.members.map(({ memberId, topics }) => [memberId, topics])).toEqual([
         ['member-0001', ['topic-B']],
@@ -119,8 +170,26 @@ describe('scripts > benchmarks > stickyAssign', () => {
         ['member-0003', ['topic-A']],
       ])
       expect(shape.members[0].owned).toEqual([{ topic: 'topic-A', partitions: [0, 1] }])
+      expect(handBack.name).toEqual('hand-back-3')
+      expect(handBack.partitionsPerTopic).toEqual({ 'topic-A': [0, 1, 2], 'topic-B': [0] })
+      expect(
+        handBack.members.map(({ memberId, topics, owned, generationId }) => [
+          memberId,
+          topics,
+          owned,
+          generationId,
+        ])
+      ).toEqual([
+        ['member-0001', ['topic-B'], [{ topic: 'topic-A', partitions: [0] }], 0],
+        ['member-0002', ['topic-A', 'topic-B'], [{ topic: 'topic-A', partitions: [0, 1, 2] }], 1],
+        ['member-0003', ['topic-A'], [], -1],
+      ])
       expect(bench.defaultShapes(false)).toEqual(Object.keys(bench.FIXED))
-      expect(bench.defaultShapes(true)).toEqual([...Object.keys(bench.FIXED), 'capacity-3'])
+      expect(bench.defaultShapes(true)).toEqual([
+        ...Object.keys(bench.FIXED),
+        'capacity-3',
+        'hand-back-3',
+      ])
     })
 
     test('stag: ten topics, staggered windows of five to seven, owners at generation 1', () => {
@@ -341,6 +410,192 @@ describe('scripts > benchmarks > stickyAssign', () => {
     })
   })
 
+  describe('nonSubscriberGrants', () => {
+    const shape = {
+      partitionsPerTopic: { a: [0, 1], b: [0, 1] },
+      members: [
+        { memberId: 'm1', topics: ['a'] },
+        { memberId: 'm2', topics: ['a', 'b'] },
+      ],
+    }
+
+    test('names each partition given to a member that does not subscribe to its topic', () => {
+      const assigned = result([
+        ['m1', { a: [0], b: [0, 1] }],
+        ['m2', { a: [1], c: [] }],
+        ['m9', { b: [0] }],
+      ])
+
+      expect(bench.nonSubscriberGrants(shape, assigned)).toEqual([
+        'b-0 assigned to m1, which does not subscribe to b',
+        'b-1 assigned to m1, which does not subscribe to b',
+        'b-0 assigned to m9, which does not subscribe to b',
+      ])
+    })
+
+    test('names nothing when every partition goes to a subscriber', () => {
+      const assigned = result([
+        ['m1', { a: [0] }],
+        ['m2', { a: [1], b: [0, 1] }],
+      ])
+
+      expect(bench.nonSubscriberGrants(shape, assigned)).toEqual([])
+    })
+  })
+
+  describe('compareResults', () => {
+    const shape = {
+      partitionsPerTopic: { a: [0, 1], b: [0] },
+      members: [
+        { memberId: 'm1', topics: ['a'], owned: [] },
+        { memberId: 'm2', topics: ['a', 'b'], owned: [] },
+      ],
+    }
+    const valid = result([
+      ['m1', { a: [0] }],
+      ['m2', { a: [1], b: [0] }],
+    ])
+    const other = result([
+      ['m1', { a: [1] }],
+      ['m2', { a: [0], b: [0] }],
+    ])
+    const handedBack = result([
+      ['m1', { a: [0], b: [0] }],
+      ['m2', { a: [1] }],
+    ])
+    const withheld = result([
+      ['m1', { a: [0] }],
+      ['m2', { a: [1] }],
+    ])
+    const trees = (sticky, cooperative, cooperativeCore = cooperative) => ({
+      sticky,
+      cooperative,
+      cooperativeCore,
+    })
+
+    test('holds a valid baseline to identical buffers', () => {
+      expect(bench.compareResults(shape, trees(valid, valid), trees(valid, valid))).toEqual({
+        baselineValid: true,
+        identical: true,
+        violations: [],
+      })
+      expect(bench.compareResults(shape, trees(valid, valid), trees(valid, other))).toEqual({
+        baselineValid: true,
+        identical: false,
+        violations: [],
+      })
+    })
+
+    test('finds a baseline invalid when its sticky result gives a partition to a non-subscriber', () => {
+      expect(
+        bench.compareResults(shape, trees(valid, valid), trees(handedBack, valid))
+      ).toMatchObject({ baselineValid: false, identical: false, violations: [] })
+    })
+
+    test('finds a baseline invalid when cooperative-sticky withheld the partition it gave a non-subscriber', () => {
+      expect(
+        bench.compareResults(shape, trees(valid, valid), trees(valid, withheld, handedBack))
+      ).toMatchObject({ baselineValid: false, violations: [] })
+    })
+
+    test('names a partition the tree under test loses before cooperative-sticky withholds', () => {
+      const emptied = result([
+        ['m1', {}],
+        ['m2', {}],
+      ])
+
+      expect(
+        bench.compareResults(shape, trees(valid, valid, emptied), trees(valid, valid))
+      ).toMatchObject({
+        baselineValid: true,
+        identical: true,
+        violations: ['a-0 assigned to nobody', 'a-1 assigned to nobody', 'b-0 assigned to nobody'],
+      })
+    })
+
+    test('names a partition the tree under test gives away while another member still claims it', () => {
+      const claiming = {
+        ...shape,
+        members: [
+          { memberId: 'm1', topics: ['a'], owned: [{ topic: 'a', partitions: [0] }] },
+          { memberId: 'm2', topics: ['a', 'b'], owned: [] },
+        ],
+      }
+
+      expect(
+        bench.compareResults(claiming, trees(valid, other, valid), trees(valid, other))
+      ).toMatchObject({
+        violations: ['a-0 assigned to m2 while it is still claimed by m1'],
+      })
+    })
+
+    test('names the invariants the tree under test breaks, whatever the baseline', () => {
+      expect(
+        bench.compareResults(shape, trees(handedBack, valid, handedBack), trees(valid, valid))
+      ).toEqual({
+        baselineValid: true,
+        identical: false,
+        violations: [
+          'b-0 assigned to m1, which does not subscribe to b',
+          'b-0 assigned to m1, which does not subscribe to b',
+        ],
+      })
+    })
+  })
+
+  describe('handoverViolations', () => {
+    const shape = {
+      partitionsPerTopic: { a: [0, 1, 2] },
+      members: [
+        { memberId: 'm1', topics: ['a'], owned: [{ topic: 'a', partitions: [0, 1] }] },
+        { memberId: 'm2', topics: ['a'], owned: [{ topic: 'a', partitions: [1] }] },
+        { memberId: 'm3', topics: ['a'], owned: [] },
+      ],
+    }
+
+    test('names a partition given to a member that does not claim it while others do', () => {
+      const assigned = result([
+        ['m1', { a: [1] }],
+        ['m2', {}],
+        ['m3', { a: [0] }],
+      ])
+
+      expect(bench.handoverViolations(shape, assigned)).toEqual([
+        'a-0 assigned to m3 while it is still claimed by m1',
+      ])
+    })
+
+    test('accepts a partition kept by a member that claims it, even beside another claimant', () => {
+      const assigned = result([
+        ['m1', { a: [0, 1] }],
+        ['m2', {}],
+        ['m3', {}],
+      ])
+
+      expect(bench.handoverViolations(shape, assigned)).toEqual([])
+      expect(
+        bench.handoverViolations(
+          shape,
+          result([
+            ['m1', {}],
+            ['m2', { a: [1] }],
+            ['m3', {}],
+          ])
+        )
+      ).toEqual([])
+    })
+
+    test('accepts a partition nobody claims given to any member, and a withheld one given to nobody', () => {
+      const assigned = result([
+        ['m1', {}],
+        ['m2', {}],
+        ['m3', { a: [2] }],
+      ])
+
+      expect(bench.handoverViolations(shape, assigned)).toEqual([])
+    })
+  })
+
   describe('the differential check', () => {
     test('finds every random shape identical when the baseline is this tree', async () => {
       const summary = await bench.checkRandomShapes({ baselineTree: REPO, count: 25, seed: 3 })
@@ -349,8 +604,64 @@ describe('scripts > benchmarks > stickyAssign', () => {
         random: 25,
         seed: 3,
         identical: 25,
+        invalidBaseline: 0,
         redrawn: 0,
         differences: [],
+        violations: [],
+      })
+    })
+
+    test('counts a shape whose baseline gives a partition to a non-subscriber as an invalid baseline', async () => {
+      const summary = await bench.checkRandomShapes({
+        baselineTree: strangerTree(),
+        count: 3,
+        seed: 3,
+      })
+
+      expect(summary).toEqual({
+        random: 3,
+        seed: 3,
+        identical: 0,
+        invalidBaseline: 3,
+        redrawn: 0,
+        differences: [],
+        violations: [],
+      })
+    })
+
+    test('holds an older tree to identical buffers wherever it gives every partition to a subscriber', async () => {
+      // random-182 at seed 1 is a shape whose older cooperative-sticky result looks valid only
+      // because it withholds the partition it handed back to a member that left its topic.
+      const summary = await bench.checkRandomShapes({
+        baselineTree: olderTree(),
+        count: 200,
+        seed: 1,
+      })
+
+      expect(summary).toEqual({
+        random: 200,
+        seed: 1,
+        identical: 178,
+        invalidBaseline: 22,
+        redrawn: 0,
+        differences: [],
+        violations: [],
+      })
+    })
+
+    test('names a shape on which the tree under test breaks an invariant', async () => {
+      const summary = await bench.checkRandomShapes({
+        baselineTree: REPO,
+        tree: strangerTree(),
+        count: 2,
+        seed: 3,
+      })
+
+      expect(summary).toMatchObject({
+        identical: 0,
+        invalidBaseline: 0,
+        differences: ['random-0', 'random-1'],
+        violations: ['random-0', 'random-1'],
       })
     })
 
@@ -380,6 +691,7 @@ describe('scripts > benchmarks > stickyAssign', () => {
       await expect(bench.checkFixedShape('stag-25+25x1k', REPO)).resolves.toEqual({
         shape: 'stag-25+25x1k',
         compared: true,
+        baselineValid: true,
         identical: true,
         violations: [],
       })
@@ -388,30 +700,38 @@ describe('scripts > benchmarks > stickyAssign', () => {
       ).resolves.toMatchObject({ compared: true, identical: false })
     })
 
-    test('compares the check-only shape without the invariants its previous round breaks', async () => {
-      const shape = bench.CHECK_ONLY['capacity-3']()
-      const assigned = await bench.assign(sticky, shape, bench.groupMembers(shape))
-
-      expect(bench.checkInvariants(shape, assigned)).toEqual([
-        'topic-A-0 assigned to member-0001, which does not subscribe to topic-A',
-        'topic-A-1 assigned to member-0001, which does not subscribe to topic-A',
-      ])
+    test('checks the invariants on a check-only shape, and accepts a different result where the baseline is invalid', async () => {
       await expect(bench.checkFixedShape('capacity-3', REPO)).resolves.toEqual({
         shape: 'capacity-3',
         compared: true,
+        baselineValid: true,
         identical: true,
         violations: [],
       })
+      await expect(bench.checkFixedShape('hand-back-3', strangerTree())).resolves.toEqual({
+        shape: 'hand-back-3',
+        compared: true,
+        baselineValid: false,
+        identical: false,
+        violations: [],
+      })
       await expect(
-        bench.checkFixedShape('capacity-3', differentCooperative())
-      ).resolves.toMatchObject({ compared: true, identical: false })
+        bench.checkFixedShape('capacity-3', REPO, undefined, strangerTree())
+      ).resolves.toMatchObject({
+        identical: false,
+        violations: [
+          'topic-stranger-0 assigned to member-0001, but topic-stranger has no partition 0',
+          'topic-stranger-0 assigned to member-0001, which does not subscribe to topic-stranger',
+        ],
+      })
     })
 
     test('checks only the invariants of a fixed shape the baseline does not finish', async () => {
       await expect(bench.checkFixedShape('stag-25+25x1k', hangingTree(), 2000)).resolves.toEqual({
         shape: 'stag-25+25x1k',
         compared: false,
-        identical: true,
+        baselineValid: null,
+        identical: null,
         violations: [],
       })
     })
@@ -478,7 +798,7 @@ module.exports = { ...real, sticky: wrap(real.sticky, (original, group) => {
   })
 
   describe('the child side', () => {
-    test('prints the time of a run, or both assigners buffers', async () => {
+    test('prints the time of a run, or both assigners buffers and the withheld-free cooperative one', async () => {
       const printed = []
       const log = jest.spyOn(console, 'log').mockImplementation((line) => printed.push(line))
 
@@ -490,9 +810,10 @@ module.exports = { ...real, sticky: wrap(real.sticky, (original, group) => {
       }
 
       expect(Object.keys(JSON.parse(printed[0]))).toEqual(['ms'])
-      const { sticky: stickyHex, cooperative } = JSON.parse(printed[1])
+      const { sticky: stickyHex, cooperative, cooperativeCore } = JSON.parse(printed[1])
       expect(stickyHex).toHaveLength(50)
       expect(cooperative).toHaveLength(50)
+      expect(cooperativeCore).toHaveLength(50)
       expect(stickyHex[0]).toMatch(/^member-0000:0003/)
     })
   })
@@ -555,9 +876,79 @@ module.exports = { ...real, sticky: wrap(real.sticky, (original, group) => {
 
       expect(code).toEqual(0)
       expect(lines).toEqual([
-        { shape: 'capacity-3', compared: true, identical: true, violations: [] },
-        { random: 0, seed: 1, identical: 0, redrawn: 0, differences: [] },
+        {
+          shape: 'capacity-3',
+          compared: true,
+          baselineValid: true,
+          identical: true,
+          violations: [],
+        },
+        {
+          random: 0,
+          seed: 1,
+          identical: 0,
+          invalidBaseline: 0,
+          redrawn: 0,
+          differences: [],
+          violations: [],
+        },
       ])
+    })
+
+    test('passes a check whose baseline is invalid where the tree under test keeps the invariants', async () => {
+      const { code, lines } = await run([
+        '--check',
+        '--baseline-tree',
+        strangerTree(),
+        '--shapes',
+        'hand-back-3',
+        '--random',
+        '2',
+      ])
+
+      expect(code).toEqual(0)
+      expect(lines[0]).toMatchObject({ baselineValid: false, identical: false, violations: [] })
+      expect(lines[1]).toMatchObject({ identical: 0, invalidBaseline: 2, differences: [] })
+    })
+
+    test.each([
+      ['a fixed shape', '^member-\\d{4}$', ['--shapes', 'hand-back-3', '--random', '0'], 0],
+      ['a random shape', '^member-\\d+-\\d+$', ['--shapes', 'hand-back-3', '--random', '1'], 1],
+    ])(
+      'fails a check when the tree under test breaks an invariant on %s alone',
+      async (_name, memberIds, argv, broken) => {
+        const stranger = strangerTree(memberIds)
+        const { code, lines } = await run([
+          '--check',
+          '--baseline-tree',
+          stranger,
+          '--tree',
+          stranger,
+          ...argv,
+        ])
+
+        expect(code).toEqual(1)
+        expect(lines.every((line) => line.identical !== false)).toBe(true)
+        expect(lines.every((line) => (line.differences || []).length === 0)).toBe(true)
+        expect(lines.map(({ violations }) => violations.length > 0)).toEqual(
+          lines.map((_, i) => i === broken)
+        )
+      }
+    )
+
+    test('times the tree named by --tree', async () => {
+      const log = path.join(os.tmpdir(), `sticky-tree-flag-${process.pid}`)
+      trees.push(log)
+      const logging = fakeTree(`const fs = require('fs')
+module.exports = { ...real, sticky: wrap(real.sticky, (original, group) => {
+  fs.appendFileSync(${JSON.stringify(log)}, 't')
+  return original(group)
+}) }`)
+
+      const { code } = await run(['--runs', '1', '--shapes', 'stag-25+25x1k', '--tree', logging])
+
+      expect(code).toEqual(0)
+      expect(fs.readFileSync(log, 'utf8')).toEqual('tt')
     })
 
     test('passes a check against this tree and fails one against a different tree', async () => {
@@ -582,8 +973,22 @@ module.exports = { ...real, sticky: wrap(real.sticky, (original, group) => {
 
       expect(same.code).toEqual(0)
       expect(same.lines).toEqual([
-        { shape: 'stag-25+25x1k', compared: true, identical: true, violations: [] },
-        { random: 5, seed: 1, identical: 5, redrawn: 0, differences: [] },
+        {
+          shape: 'stag-25+25x1k',
+          compared: true,
+          baselineValid: true,
+          identical: true,
+          violations: [],
+        },
+        {
+          random: 5,
+          seed: 1,
+          identical: 5,
+          invalidBaseline: 0,
+          redrawn: 0,
+          differences: [],
+          violations: [],
+        },
       ])
       expect(other.code).toEqual(1)
       expect(other.lines[0].identical).toBe(false)

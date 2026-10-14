@@ -1,7 +1,14 @@
 const { MemberMetadata, MemberAssignment } = require('../../assignerProtocol')
 
 /**
- * RoundRobinAssigner
+ * RoundRobinAssigner: deals the partitions of `topics`, one topic after another in metadata order,
+ * over the members sorted by id. A partition goes to the next member in that circular order that
+ * subscribes to its topic, as Java's `RoundRobinAssignor` does; the deal carries on after the
+ * member that took it. When every member subscribes to every topic, this is the plain deal by
+ * position. A topic no member subscribes to is skipped. A member that sent no metadata is taken to
+ * subscribe to every topic.
+ *
+ * @see https://github.com/apache/kafka/blob/4.3/clients/src/main/java/org/apache/kafka/clients/consumer/RoundRobinAssignor.java
  * @type {import('types').PartitionAssigner}
  */
 module.exports = ({ cluster }) => ({
@@ -35,30 +42,47 @@ module.exports = ({ cluster }) => ({
    *                       },
    *                     }
    *                   ]
+   *   A member that is dealt nothing is left out.
    */
   async assign({ members, topics }) {
     const membersCount = members.length
     const sortedMembers = members.map(({ memberId }) => memberId).sort()
+    const subscriptions = new Map(
+      members.map(({ memberId, memberMetadata }) => [
+        memberId,
+        memberMetadata == null ? null : new Set(MemberMetadata.decode(memberMetadata).topics),
+      ])
+    )
+    /** @param {string} memberId @param {string} topic @returns {boolean} */
+    const subscribes = (memberId, topic) => {
+      const subscribed = subscriptions.get(memberId)
+      return subscribed === null || subscribed.has(topic)
+    }
     const assignment = {}
+    let cursor = 0
 
-    const topicsPartitions = topics.flatMap((topic) => {
-      const partitionMetadata = cluster.findTopicPartitionMetadata(topic)
-      return partitionMetadata.map((m) => ({ topic, partitionId: m.partitionId }))
-    })
-
-    topicsPartitions.forEach((topicPartition, i) => {
-      const assignee = sortedMembers[i % membersCount]
-
-      if (!assignment[assignee]) {
-        assignment[assignee] = Object.create(null)
+    for (const topic of topics) {
+      if (!sortedMembers.some((memberId) => subscribes(memberId, topic))) {
+        continue
       }
 
-      if (!assignment[assignee][topicPartition.topic]) {
-        assignment[assignee][topicPartition.topic] = []
-      }
+      for (const { partitionId } of cluster.findTopicPartitionMetadata(topic)) {
+        while (!subscribes(sortedMembers[cursor % membersCount], topic)) {
+          cursor++
+        }
+        const assignee = sortedMembers[cursor++ % membersCount]
 
-      assignment[assignee][topicPartition.topic].push(topicPartition.partitionId)
-    })
+        if (!assignment[assignee]) {
+          assignment[assignee] = Object.create(null)
+        }
+
+        if (!assignment[assignee][topic]) {
+          assignment[assignee][topic] = []
+        }
+
+        assignment[assignee][topic].push(partitionId)
+      }
+    }
 
     return Object.keys(assignment).map((memberId) => ({
       memberId,

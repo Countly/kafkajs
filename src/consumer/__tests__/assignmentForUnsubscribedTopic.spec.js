@@ -1,4 +1,5 @@
 const createConsumer = require('../index')
+const subscriptionBlindAssigner = require('./fixtures/subscriptionBlindAssigner')
 
 const {
   secureRandom,
@@ -27,6 +28,7 @@ describe('Consumer', () => {
       maxWaitTimeInMs: 100,
       rebalanceTimeout: 1000,
       logger: newLogger(),
+      partitionAssigners: [subscriptionBlindAssigner],
     })
   })
 
@@ -52,6 +54,7 @@ describe('Consumer', () => {
       maxWaitTimeInMs: 1000,
       rebalanceTimeout: 1000,
       logger: newLogger(),
+      partitionAssigners: [subscriptionBlindAssigner],
     })
 
     await consumer2.connect()
@@ -72,6 +75,7 @@ describe('Consumer', () => {
       maxWaitTimeInMs: 100,
       rebalanceTimeout: 1000,
       logger: newLogger(),
+      partitionAssigners: [subscriptionBlindAssigner],
     })
 
     // Both consumers receive assignments for one topic
@@ -97,6 +101,7 @@ describe('Consumer', () => {
       maxWaitTimeInMs: 100,
       rebalanceTimeout: 1000,
       logger: newLogger(),
+      partitionAssigners: [subscriptionBlindAssigner],
     })
 
     await consumer1.connect()
@@ -111,6 +116,7 @@ describe('Consumer', () => {
       maxWaitTimeInMs: 100,
       rebalanceTimeout: 1000,
       logger: newLogger(),
+      partitionAssigners: [subscriptionBlindAssigner],
     })
 
     await consumer2.connect()

@@ -1,12 +1,12 @@
 /**
  * Sticky assigner benchmark and differential check, pure (no broker). It times the classic
- * `sticky` assigner's general path on fixed shapes, this tree against a baseline tree, and with
- * `--check` proves that both trees hand out byte-identical `MemberAssignment` buffers.
+ * `sticky` assigner's general path on fixed shapes, a tree (this one by default) against a
+ * baseline tree, and with `--check` compares the `MemberAssignment` buffers both trees hand out.
  *
  * Shapes (`a+b`: `a` members own a previous round at generation 1, `b` members join empty):
  * - `stag`: 10 topics; member i subscribes to `topics.slice(i % 5, i % 5 + 5 + i % 3)`.
- * - `capacity`: three members on which a balance check that ignores a member's capacity gives a
- *   different assignment; it is run by `--check` only (see `CHECK_ONLY`).
+ * - `capacity-3` and `hand-back-3`: three members, one of which names in its previous round a
+ *   topic it has left; they are run by `--check` only (see `CHECK_ONLY`).
  *
  * Timing: every run is its own process, so an arm that passes the 10-minute limit is stopped and
  * recorded as `did not finish` (and not run again). Arms alternate, their order swapping each
@@ -14,17 +14,19 @@
  * of the measured runs is reported, and `runs` lists every run, the warm-up first.
  *
  * `--check`: every fixed shape and `--random` seeded random shapes (at most 8 members and 12
- * topics) go through both trees' `sticky` and `cooperative-sticky` assigners and the buffers are
- * compared. A fixed shape the baseline does not finish within the limit is not compared; a random
- * shape whose baseline takes over 5 s is drawn again instead. This tree's `sticky` result on every
- * timed fixed shape is also checked for the invariants: each partition of a subscribed topic
- * assigned exactly once, only to a member subscribed to its topic, and at most one partition apart
- * among members with identical subscriptions. Random shapes and the check-only shapes are compared
- * only: their previous rounds may name topics a member no longer subscribes to, and the general
- * path can hand such a partition back to that member, as Java's does. Exits 1 on any difference
- * or violation; a bad argument exits 2.
+ * topics) go through both trees' `sticky` and `cooperative-sticky` assigners (see
+ * `compareResults`). Where the baseline gives every partition to a member subscribed to its topic,
+ * the buffers must be identical; where it does not (an older general path handed a partition back
+ * to a previous owner that had left its topic, as Java's does), they may differ. On every shape the
+ * tree under test must keep the invariants: each partition of a subscribed topic assigned exactly
+ * once, only to a member subscribed to its topic, and at most one partition apart among members
+ * with identical subscriptions; this holds for the `cooperative-sticky` assignment before it
+ * withholds transferring partitions, and after it withholds, no partition goes to a member that
+ * does not claim it while another does. A fixed shape the baseline does not finish within the
+ * limit is not compared; a random shape whose baseline takes over 5 s is drawn again instead.
+ * Exits 1 on a difference from a valid baseline or on a violation; a bad argument exits 2.
  *
- * Usage: node scripts/benchmarks/stickyAssign.js [--runs 7] [--baseline-tree <dir>]
+ * Usage: node scripts/benchmarks/stickyAssign.js [--runs 7] [--tree <dir>] [--baseline-tree <dir>]
  *   [--shapes <name,...>] [--check [--random 1000] [--seed 1]]
  * Prints one JSON line per shape as it finishes, then one summary line.
  */
@@ -154,11 +156,10 @@ const FIXED = {
 }
 
 /**
- * Three members and two topics on which a balance check that ignores a member's capacity gives a
- * different assignment. `member-0001` subscribes to `topic-B` alone, yet its previous round
- * (generation 0) names the first two partitions of `topic-A`, which the general path hands back to
- * it, as Java's does; it then holds as many partitions as `topic-B` has, and the balance check
- * must not count it among the members that could still take one.
+ * Three members and two topics. `member-0001` subscribes to `topic-B` alone, yet its previous
+ * round (generation 0) names the first two partitions of `topic-A`. An older general path handed
+ * them back to it, as Java's does, and then held it to the partitions `topic-B` has, so a balance
+ * check that ignored a member's capacity gave a different assignment.
  * @returns {Shape} the `capacity-3` shape
  */
 const capacity = () => ({
@@ -193,10 +194,44 @@ const capacity = () => ({
 })
 
 /**
- * Shapes only `--check` runs. They pin an assignment, so their time says nothing, and their
- * previous round names a topic its member left, so the invariants do not hold for them.
+ * The smallest shape found on which the general path once handed a partition back to a previous
+ * owner that had left its topic: `member-0001` subscribes to `topic-B` alone, yet its previous
+ * round (generation 0) names `topic-A` 0, which a newer round gave to `member-0002`.
+ * @returns {Shape} the `hand-back-3` shape
  */
-const CHECK_ONLY = { 'capacity-3': capacity }
+const handBack = () => ({
+  name: 'hand-back-3',
+  partitionsPerTopic: { 'topic-A': range(3), 'topic-B': range(1) },
+  members: [
+    {
+      memberId: 'member-0001',
+      groupInstanceId: null,
+      topics: ['topic-B'],
+      owned: [{ topic: 'topic-A', partitions: [0] }],
+      generationId: 0,
+    },
+    {
+      memberId: 'member-0002',
+      groupInstanceId: null,
+      topics: ['topic-A', 'topic-B'],
+      owned: [{ topic: 'topic-A', partitions: range(3) }],
+      generationId: 1,
+    },
+    {
+      memberId: 'member-0003',
+      groupInstanceId: null,
+      topics: ['topic-A'],
+      owned: [],
+      generationId: -1,
+    },
+  ],
+})
+
+/**
+ * Shapes only `--check` runs. They pin an assignment, so their time says nothing; their previous
+ * round names a topic its member left.
+ */
+const CHECK_ONLY = { 'capacity-3': capacity, 'hand-back-3': handBack }
 
 /** Every shape a name can select. */
 const SHAPES = { ...FIXED, ...CHECK_ONLY }
@@ -400,11 +435,156 @@ const checkInvariants = (shape, result) => {
 }
 
 /**
+ * Names each partition a result gives to a member that does not subscribe to its topic.
+ * @param {Shape} shape
+ * @param {Array<{ memberId: string, memberAssignment: Buffer }>} result
+ * @returns {string[]} one line per such partition, in the result's order
+ */
+const nonSubscriberGrants = (shape, result) => {
+  const subscriptions = new Map(shape.members.map((m) => [m.memberId, m.topics]))
+  const grants = []
+
+  for (const { memberId, memberAssignment } of result) {
+    const subscribed = subscriptions.get(memberId) || []
+
+    for (const [topic, partitions] of Object.entries(
+      MemberAssignment.decode(memberAssignment).assignment
+    )) {
+      if (!subscribed.includes(topic)) {
+        partitions.forEach((partition) =>
+          grants.push(
+            `${topic}-${partition} assigned to ${memberId}, which does not subscribe to ${topic}`
+          )
+        )
+      }
+    }
+  }
+
+  return grants
+}
+
+/**
+ * @typedef {Object} TreeResults
+ * @property {Array<{ memberId: string, memberAssignment: Buffer }>} sticky
+ * @property {Array<{ memberId: string, memberAssignment: Buffer }>} cooperative
+ * @property {Array<{ memberId: string, memberAssignment: Buffer }>} cooperativeCore the
+ *   `cooperative-sticky` assignment before it withholds transferring partitions: a withheld
+ *   partition goes to that member in the next round, so a hand-back to a member that left the
+ *   topic shows only here
+ */
+
+/**
+ * Checks a `cooperative-sticky` result after it withholds partitions, for what that step exists
+ * to guarantee: a partition is given only to a member that already claims it in its previous
+ * round, or to any member when nobody claims it, so that no two members fetch it at once. It does
+ * not ask for completeness or balance, which withholding gives up on purpose for a round; the
+ * assignment before withholding is held to them by `checkInvariants`.
+ * @param {Shape} shape
+ * @param {Array<{ memberId: string, memberAssignment: Buffer }>} result a `cooperative-sticky`
+ *   assignment
+ * @returns {string[]} one line per partition given to a member that does not claim it while
+ *   another member does
+ */
+const handoverViolations = (shape, result) => {
+  const claimants = new Map()
+
+  for (const { memberId, owned } of shape.members) {
+    for (const { topic, partitions } of owned) {
+      for (const partition of partitions) {
+        const key = `${topic}-${partition}`
+        claimants.set(key, (claimants.get(key) || []).concat(memberId))
+      }
+    }
+  }
+
+  const violations = []
+
+  for (const { memberId, memberAssignment } of result) {
+    for (const [topic, partitions] of Object.entries(
+      MemberAssignment.decode(memberAssignment).assignment
+    )) {
+      for (const partition of partitions) {
+        const key = `${topic}-${partition}`
+        const holders = claimants.get(key) || []
+
+        if (holders.length > 0 && !holders.includes(memberId)) {
+          violations.push(
+            `${key} assigned to ${memberId} while it is still claimed by ${holders.join(', ')}`
+          )
+        }
+      }
+    }
+  }
+
+  return violations
+}
+
+/**
+ * @param {Shape} shape
+ * @param {TreeResults} ours
+ * @returns {string[]} the invariants the tree under test breaks: every one of `checkInvariants`
+ *   on the `sticky` result and on the `cooperative-sticky` result before it withholds, and
+ *   `handoverViolations` on the result it hands out
+ */
+const violationsOf = (shape, ours) => [
+  ...checkInvariants(shape, ours.sticky),
+  ...checkInvariants(shape, ours.cooperativeCore),
+  ...handoverViolations(shape, ours.cooperative),
+]
+
+/**
+ * The differential check's contract for one shape. The baseline is valid when its `sticky` and
+ * `cooperativeCore` results give every partition to a subscriber of its topic; only then must both
+ * buffers be identical. The tree under test must pass `checkInvariants` on its `sticky` and
+ * `cooperativeCore` results, and `handoverViolations` on its withheld cooperative result,
+ * whatever the baseline did.
+ * @param {Shape} shape
+ * @param {TreeResults} ours the tree under test
+ * @param {TreeResults} theirs the baseline
+ * @returns {{ baselineValid: boolean, identical: boolean, violations: string[] }}
+ */
+const compareResults = (shape, ours, theirs) => ({
+  baselineValid:
+    nonSubscriberGrants(shape, theirs.sticky).length === 0 &&
+    nonSubscriberGrants(shape, theirs.cooperativeCore).length === 0,
+  identical:
+    JSON.stringify(toHex(ours.sticky)) === JSON.stringify(toHex(theirs.sticky)) &&
+    JSON.stringify(toHex(ours.cooperative)) === JSON.stringify(toHex(theirs.cooperative)),
+  violations: violationsOf(shape, ours),
+})
+
+/**
+ * Runs one tree's `cooperative-sticky` assigner over a shape, keeping its assignment from just
+ * before it withholds transferring partitions: the assigner's `withholdTransferringPartitions`,
+ * which the compared trees share, is wrapped to encode what it is handed first.
+ * @param {Function} factory
+ * @param {Shape} shape
+ * @param {ReturnType<typeof groupMembers>} members the shape, encoded
+ * @returns {Promise<Pick<TreeResults, 'cooperative'|'cooperativeCore'>>}
+ */
+const assignCooperative = async (factory, shape, members) => {
+  let cooperativeCore
+  const capturing = (deps) => {
+    const assigner = factory(deps)
+    const withhold = assigner.withholdTransferringPartitions
+    assigner.withholdTransferringPartitions = function (group, assignment, contested) {
+      cooperativeCore = [...assignment].map(([memberId, byTopic]) => ({
+        memberId,
+        memberAssignment: MemberAssignment.encode({ version: this.version, assignment: byTopic }),
+      }))
+      return withhold.call(this, group, assignment, contested)
+    }
+    return assigner
+  }
+  const cooperative = await assign(capturing, shape, members)
+  return { cooperative, cooperativeCore }
+}
+
+/**
  * Runs both assigners of one tree over a shape.
  * @param {string} dir
  * @param {Shape} shape
- * @returns {Promise<{ ms: number, sticky: Array, cooperative: Array }>} `ms` is the `sticky`
- *   assignment's own time
+ * @returns {Promise<{ ms: number } & TreeResults>} `ms` is the `sticky` assignment's own time
  */
 const assignBoth = async (dir, shape) => {
   const assigners = loadAssigners(dir)
@@ -412,9 +592,18 @@ const assignBoth = async (dir, shape) => {
   const started = performance.now()
   const sticky = await assign(assigners.sticky, shape, members)
   const ms = performance.now() - started
-  const cooperative = await assign(assigners.cooperativeSticky, shape, members)
-  return { ms, sticky, cooperative }
+  return { ms, sticky, ...(await assignCooperative(assigners.cooperativeSticky, shape, members)) }
 }
+
+/**
+ * @param {string[]} lines `memberId:hex` per member, as `toHex` writes them
+ * @returns {Array<{ memberId: string, memberAssignment: Buffer }>}
+ */
+const fromHex = (lines) =>
+  lines.map((line) => {
+    const at = line.lastIndexOf(':')
+    return { memberId: line.slice(0, at), memberAssignment: Buffer.from(line.slice(at + 1), 'hex') }
+  })
 
 /**
  * Runs a fixed shape in a child process of this script, stopped at `limitMs`.
@@ -459,8 +648,14 @@ const worker = async (mode, shapeName, dir) => {
     return
   }
 
-  const { sticky, cooperative } = await assignBoth(dir, shape)
-  console.log(JSON.stringify({ sticky: toHex(sticky), cooperative: toHex(cooperative) }))
+  const { sticky, cooperative, cooperativeCore } = await assignBoth(dir, shape)
+  console.log(
+    JSON.stringify({
+      sticky: toHex(sticky),
+      cooperative: toHex(cooperative),
+      cooperativeCore: toHex(cooperativeCore),
+    })
+  )
 }
 
 /**
@@ -508,46 +703,74 @@ const timeShape = (shapeName, { runs, arms, limitMs = ARM_LIMIT_MS }) => {
 }
 
 /**
- * Compares one fixed shape across the trees and checks this tree's invariants, except on a
- * check-only shape, which is compared alone.
+ * Checks one fixed shape: the tree under test in this process, the baseline in a child process.
  * @param {string} shapeName
  * @param {string} baselineTree
  * @param {number} [limitMs]
- * @returns {Promise<{ shape: string, compared: boolean, identical: boolean, violations: string[] }>}
- *   `compared` is false when the baseline did not finish; `identical` is then vacuously true
+ * @param {string} [tree] the tree under test
+ * @returns {Promise<{ shape: string, compared: boolean, baselineValid: boolean|null,
+ *   identical: boolean|null, violations: string[] }>} `compared` is false when the baseline did
+ *   not finish, and `baselineValid` and `identical` are then `null`
  */
-const checkFixedShape = async (shapeName, baselineTree, limitMs = ARM_LIMIT_MS) => {
+const checkFixedShape = async (shapeName, baselineTree, limitMs = ARM_LIMIT_MS, tree = REPO) => {
   const shape = SHAPES[shapeName]()
-  const ours = await assignBoth(REPO, shape)
+  const ours = await assignBoth(tree, shape)
   const theirs = runChild('bytes', shapeName, baselineTree, limitMs)
-  const identical =
-    theirs === null ||
-    (JSON.stringify(toHex(ours.sticky)) === JSON.stringify(theirs.sticky) &&
-      JSON.stringify(toHex(ours.cooperative)) === JSON.stringify(theirs.cooperative))
 
-  return {
-    shape: shapeName,
-    compared: theirs !== null,
-    identical,
-    violations: CHECK_ONLY[shapeName] ? [] : checkInvariants(shape, ours.sticky),
+  if (theirs === null) {
+    return {
+      shape: shapeName,
+      compared: false,
+      baselineValid: null,
+      identical: null,
+      violations: violationsOf(shape, ours),
+    }
   }
+
+  const decoded = {
+    sticky: fromHex(theirs.sticky),
+    cooperative: fromHex(theirs.cooperative),
+    cooperativeCore: fromHex(theirs.cooperativeCore),
+  }
+  return { shape: shapeName, compared: true, ...compareResults(shape, ours, decoded) }
 }
 
 /**
- * Compares `count` seeded random shapes across the trees, in this process.
+ * Checks `count` seeded random shapes across the trees, in this process. Each shape counts once:
+ * as `identical`, as a difference from a valid baseline, or as an `invalidBaseline`; `violations`
+ * names the shapes on which the tree under test breaks an invariant, whatever their class.
  * @param {object} options
  * @param {string} options.baselineTree
+ * @param {string} [options.tree] the tree under test
  * @param {number} options.count
  * @param {number} options.seed
  * @param {number} [options.redrawMs] a shape whose baseline arm takes longer is drawn again
- * @returns {Promise<{ random: number, seed: number, identical: number, redrawn: number,
- *   differences: string[] }>} `differences` names the shapes whose buffers differ
+ * @returns {Promise<{ random: number, seed: number, identical: number, invalidBaseline: number,
+ *   redrawn: number, differences: string[], violations: string[] }>}
  */
-const checkRandomShapes = async ({ baselineTree, count, seed, redrawMs = REDRAW_MS }) => {
+const checkRandomShapes = async ({
+  baselineTree,
+  tree = REPO,
+  count,
+  seed,
+  redrawMs = REDRAW_MS,
+}) => {
   const next = seeded(seed)
-  const summary = { random: count, seed, identical: 0, redrawn: 0, differences: [] }
+  const summary = {
+    random: count,
+    seed,
+    identical: 0,
+    invalidBaseline: 0,
+    redrawn: 0,
+    differences: [],
+    violations: [],
+  }
 
-  for (let index = 0; summary.identical + summary.differences.length < count; index++) {
+  for (
+    let index = 0;
+    summary.identical + summary.invalidBaseline + summary.differences.length < count;
+    index++
+  ) {
     const shape = randomShape(next, index)
     const theirs = await assignBoth(baselineTree, shape)
 
@@ -556,15 +779,21 @@ const checkRandomShapes = async ({ baselineTree, count, seed, redrawMs = REDRAW_
       continue
     }
 
-    const ours = await assignBoth(REPO, shape)
-    const same =
-      JSON.stringify(toHex(ours.sticky)) === JSON.stringify(toHex(theirs.sticky)) &&
-      JSON.stringify(toHex(ours.cooperative)) === JSON.stringify(toHex(theirs.cooperative))
+    const { baselineValid, identical, violations } = compareResults(
+      shape,
+      await assignBoth(tree, shape),
+      theirs
+    )
 
-    if (same) {
+    if (!baselineValid) {
+      summary.invalidBaseline++
+    } else if (identical) {
       summary.identical++
     } else {
       summary.differences.push(shape.name)
+    }
+    if (violations.length > 0) {
+      summary.violations.push(shape.name)
     }
   }
 
@@ -595,6 +824,7 @@ const main = async (argv, print = console.log) => {
   const random = Number(arg(argv, 'random', '1000'))
   const seed = Number(arg(argv, 'seed', '1'))
   const baselineTree = arg(argv, 'baseline-tree', null)
+  const tree = arg(argv, 'tree', REPO)
   const check = argv.includes('--check')
   const shapes = (arg(argv, 'shapes', null) || defaultShapes(check).join(',')).split(',')
 
@@ -611,7 +841,7 @@ const main = async (argv, print = console.log) => {
         error: 'bad arguments',
         unknownShapes: unknown,
         usage:
-          '[--runs >=1] [--baseline-tree <dir>] [--shapes <name,...>] [--check [--random n] [--seed n]]; --check needs --baseline-tree',
+          '[--runs >=1] [--tree <dir>] [--baseline-tree <dir>] [--shapes <name,...>] [--check [--random n] [--seed n]]; --check needs --baseline-tree',
         shapes: Object.keys(SHAPES),
       })
     )
@@ -620,7 +850,7 @@ const main = async (argv, print = console.log) => {
 
   if (!check) {
     for (const shape of shapes) {
-      const arms = [{ key: 'tree', dir: REPO }]
+      const arms = [{ key: 'tree', dir: tree }]
       if (baselineTree) {
         arms.push({ key: 'baseline', dir: baselineTree })
       }
@@ -631,12 +861,12 @@ const main = async (argv, print = console.log) => {
 
   let failed = false
   for (const shape of shapes) {
-    const line = await checkFixedShape(shape, baselineTree)
-    failed = failed || !line.identical || line.violations.length > 0
+    const line = await checkFixedShape(shape, baselineTree, ARM_LIMIT_MS, tree)
+    failed = failed || (line.baselineValid && !line.identical) || line.violations.length > 0
     print(JSON.stringify(line))
   }
-  const summary = await checkRandomShapes({ baselineTree, count: random, seed })
-  failed = failed || summary.differences.length > 0
+  const summary = await checkRandomShapes({ baselineTree, tree, count: random, seed })
+  failed = failed || summary.differences.length > 0 || summary.violations.length > 0
   print(JSON.stringify(summary))
   return failed ? 1 : 0
 }
@@ -669,6 +899,9 @@ module.exports = {
   groupMembers,
   assign,
   checkInvariants,
+  nonSubscriberGrants,
+  handoverViolations,
+  compareResults,
   checkFixedShape,
   checkRandomShapes,
   timeShape,

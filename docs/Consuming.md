@@ -460,6 +460,8 @@ consumer.seek({ topic: 'example', partition: 0, offset: "12384" })
 
 `range`, `sticky` and `cooperativeSticky` use the same names and the same algorithms as the Java client, so a group can mix this client with Java consumers. Rack-aware assignment is not implemented: your `rackId` is sent to the leader and ignored when partitions are assigned.
 
+When members subscribe to different topics, none of the four gives a member a partition of a topic it does not subscribe to: `roundRobin` skips such members as Java's `RoundRobinAssignor` does, and `sticky` and `cooperativeSticky` never hand a partition back to a previous owner that has left its topic.
+
 ```javascript
 const { PartitionAssigners: { sticky } } = require('@countly/kafkajs')
 
