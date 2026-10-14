@@ -756,15 +756,19 @@ module.exports = class OffsetManager {
    * Resolves the partitions of the assignment that hold no valid offset: the group's committed
    * offset, else the topic's own `fromBeginning` choice through ListOffsets.
    *
-   * A reply that outlives a topic recreation is not applied. Each topic's cached id is read before
-   * the OffsetFetch, and the reply is checked against it again after the OffsetFetch and after the
-   * ListOffsets (see `dropRecreatedTopics`). A dropped topic keeps its invalid offsets, so the next
-   * resolution, which every fetch round runs, resolves it afresh.
+   * A reply that outlives a topic recreation is not applied. Two snapshots fence each await (see
+   * `dropRecreatedTopics`): the topic's cached id, and its pending-reset token. The recreation
+   * event sets the token, so a token that is no longer the one snapshotted means a recreation
+   * happened during the await, even when the id was unknown at the start and proves nothing.
+   * - Before the OffsetFetch: fences the OffsetFetch answer.
+   * - After `drainPendingTopicResets`: fences the ListOffsets answer. The drain's own deletions
+   *   are taken in, so only a change made during the await drops it.
    *
-   * A pending topic-recreation reset is consumed only once its topic's offsets are written (see
-   * `drainPendingTopicResets`). A dropped topic, or a ListOffsets that throws, keeps the token, so
-   * the next resolution applies the reset again; a token a newer recreation replaced meanwhile is
-   * kept for that recreation.
+   * A dropped topic keeps its invalid offsets and is resolved again by the next resolution, which
+   * every fetch round runs. A recreation that dropped it left its newer token for that pass,
+   * unless a concurrent resolution has consumed the token and applies the reset itself. The drain
+   * is the only place a token is consumed, so a ListOffsets that throws after it loses that reset,
+   * and only the first of two overlapping resolutions of one incarnation applies it.
    *
    * @param {Set<string>} [seekedPartitions] Keys (`OffsetManager.seekedPartitionKey(topic,
    *                                partition)`) of partitions a `seek()` was just applied to,
@@ -799,12 +803,14 @@ module.exports = class OffsetManager {
     const requestedIds = new Map(
       pendingPartitions.map(({ topic }) => [topic, this.cluster.topicId(topic)])
     )
+    const requestedTokens = this.resetTokens(pendingPartitions)
     const { responses } = await this.fetchCommittedOffsets(pendingPartitions)
 
     // Before the drain: a stale reply must not take the reset the new incarnation is owed.
-    const consumerOffsets = this.dropRecreatedTopics(responses, requestedIds)
+    const consumerOffsets = this.dropRecreatedTopics(responses, requestedIds, requestedTokens)
 
-    const appliedResets = this.drainPendingTopicResets(consumerOffsets, seekedPartitions)
+    this.drainPendingTopicResets(consumerOffsets, seekedPartitions)
+    const drainedTokens = this.resetTokens(consumerOffsets)
 
     // Seed the tracked epoch from what the coordinator has committed, before
     // initializeConsumerOffsets rebuilds these entries as { partition, offset } and drops every
@@ -863,7 +869,8 @@ module.exports = class OffsetManager {
       const topicOffsets = await this.cluster.fetchTopicsOffset(unresolvedPartitions)
       offsets = this.dropRecreatedTopics(
         initializeConsumerOffsets(consumerOffsets, topicOffsets),
-        requestedIds
+        requestedIds,
+        drainedTokens
       )
     }
 
@@ -871,14 +878,6 @@ module.exports = class OffsetManager {
       this.committedOffsets()[topic] = partitions.reduce(indexPartitions, {
         ...this.committedOffsets()[topic],
       })
-
-      // Only the token that was applied is consumed: a newer one is owed its own reset.
-      if (
-        appliedResets.has(topic) &&
-        this.pendingTopicResets.get(topic) === appliedResets.get(topic)
-      ) {
-        this.pendingTopicResets.delete(topic)
-      }
     })
   }
 
@@ -979,25 +978,44 @@ module.exports = class OffsetManager {
   }
 
   /**
-   * Drops the entries of topics whose cached id is no longer the one they were requested under.
-   * An answer that outlived a delete and recreate describes the old topic: applying it would write
-   * the old offset over the new topic's position and, ahead of `drainPendingTopicResets`, would
-   * apply a reset the new one is owed. Only a proven recreation drops: an id known both when the
-   * request went out and now, and different. An id that was merely learned (unknown before) or
-   * lost (unknown now, a cleared cache) is not a recreation, and its entry is kept - a recreation
-   * announces itself by setting a reset token.
+   * Each topic's pending-reset token as it is now: the snapshot `dropRecreatedTopics` compares
+   * against after an await.
+   *
+   * @private
+   * @param {{topic: string}[]} entries
+   * @returns {Map<string, string|undefined>} topic to its token, `undefined` when it has none
+   */
+  resetTokens(entries) {
+    return new Map(entries.map(({ topic }) => [topic, this.pendingTopicResets.get(topic)]))
+  }
+
+  /**
+   * Drops the entries of topics that were recreated while the request was in flight. An answer
+   * that outlived a delete and recreate describes the old topic: applying it would write the old
+   * offset over the new topic's position, or take a reset the new one is owed. A topic is dropped
+   * when either holds:
+   * - its id was known when the request went out and is known now, and the two differ. An id that
+   *   was merely learned (unknown before) or lost (unknown now, a cleared cache) is not a
+   *   recreation;
+   * - its token is not the one snapshotted. The recreation event sets the token, so this catches
+   *   a recreation that the ids cannot prove, and a reset another resolution consumed meanwhile.
    *
    * @private
    * @param {{topic: string}[]} entries
    * @param {Map<string, string|undefined>} requestedIds each requested topic's cached id when the
    *   request went out
+   * @param {Map<string, string|undefined>} tokens each topic's token (see `resetTokens`) when the
+   *   await began
    * @returns {{topic: string}[]} the entries still current, as a new array
    */
-  dropRecreatedTopics(entries, requestedIds) {
+  dropRecreatedTopics(entries, requestedIds, tokens) {
     return entries.filter(({ topic }) => {
       const requestedId = requestedIds.get(topic)
       const currentId = this.cluster.topicId(topic)
-      return requestedId === undefined || currentId === undefined || requestedId === currentId
+      const recreated =
+        requestedId !== undefined && currentId !== undefined && requestedId !== currentId
+
+      return !recreated && this.pendingTopicResets.get(topic) === tokens.get(topic)
     })
   }
 
@@ -1012,10 +1030,8 @@ module.exports = class OffsetManager {
    * a *known* cached id differs - treating unknown as "changed" would let a rebootstrap silently
    * discard the reset, which is the stale-offset skip this mechanism exists to prevent.
    *
-   * An applied entry is not removed here: the caller removes it once the resolved offsets of its
-   * topic are written, and only if it still holds the id that was applied. Until then a concurrent
-   * resolution under the same incarnation applies the reset too, and a resolution that is dropped
-   * or throws leaves the entry for the next one.
+   * Every entry read here is removed, applied or not: this is the only place a token is consumed,
+   * so a reset happens at most once per recreation and no token is left to rewind a later commit.
    *
    * A partition in `seekedPartitions` is left untouched even when its topic is being reset: a
    * `seek()` applied after the recreation targets the *current* incarnation and is newer, more
@@ -1027,11 +1043,9 @@ module.exports = class OffsetManager {
    *   mutated in place: a reset topic's partition offsets become the invalid sentinel
    * @param {Set<string>} seekedPartitions `OffsetManager.seekedPartitionKey(topic, partition)`
    *   entries to exempt from the reset
-   * @returns {Map<string, string|undefined>} each reset applied, as topic to the stamped id
+   * @returns {void}
    */
   drainPendingTopicResets(consumerOffsets, seekedPartitions) {
-    const applied = new Map()
-
     for (const { topic, partitions } of consumerOffsets) {
       if (!this.pendingTopicResets.has(topic)) {
         continue
@@ -1039,13 +1053,11 @@ module.exports = class OffsetManager {
 
       const stampedTopicId = this.pendingTopicResets.get(topic)
       const currentTopicId = this.cluster.topicId(topic)
+      this.pendingTopicResets.delete(topic)
 
       if (currentTopicId !== undefined && currentTopicId !== stampedTopicId) {
-        this.pendingTopicResets.delete(topic)
         continue
       }
-
-      applied.set(topic, stampedTopicId)
 
       for (const partition of partitions) {
         if (seekedPartitions.has(OffsetManager.seekedPartitionKey(topic, partition.partition))) {
@@ -1055,8 +1067,6 @@ module.exports = class OffsetManager {
         partition.offset = '-1'
       }
     }
-
-    return applied
   }
 
   /**
