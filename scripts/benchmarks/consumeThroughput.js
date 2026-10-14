@@ -3,7 +3,9 @@
  * p50/p90/p99 handling latency.
  * Usage: node scripts/benchmarks/consumeThroughput.js [--messages 200000] [--size 200]
  *          [--partitions 6] [--timeout <ms>] [--handler eachBatch|eachMessage]
- * Prints one JSON line: { messages, size, partitions, handler, messagesPerSecond, p50, p90, p99 }
+ *          [--subscribe-channels 0|1]
+ * Prints one JSON line: { messages, size, partitions, handler, subscribeChannels,
+ *   messagesPerSecond, p50, p90, p99 }
  *
  * The corpus is fixed on purpose: 200000 messages of 200 B across one topic of 6 partitions, no
  * compression, `autoCommit: false`, one discarded warm-up run, and a fresh consumer group per run.
@@ -14,8 +16,12 @@
  *
  * A run that never receives the whole corpus fails on the deadline instead of hanging, so a lost
  * partition or a wrong `--messages` costs one error line rather than a cluster slot.
+ *
+ * `--subscribe-channels 1` (this tree only) subscribes a function that does nothing to the
+ * diagnostics channel of every public event, so the run measures what subscribing costs.
  */
 const { Kafka, logLevel } = require('../../index')
+const subscribeChannels = require('./subscribeChannels')
 
 const arg = (name, fallback) => {
   const i = process.argv.indexOf(`--${name}`)
@@ -28,6 +34,7 @@ const stringArg = (name, fallback) => {
 }
 
 const HANDLER = stringArg('handler', 'eachBatch')
+const SUBSCRIBE_CHANNELS = arg('subscribe-channels', 0)
 const MESSAGES = arg('messages', 200000)
 const SIZE = arg('size', 200)
 const PARTITIONS = arg('partitions', 6)
@@ -39,6 +46,10 @@ const TOPIC = process.env.BENCH_TOPIC || GENERATED_TOPIC
 
 if (HANDLER !== 'eachBatch' && HANDLER !== 'eachMessage') {
   console.error(`--handler must be eachBatch or eachMessage, got ${HANDLER}`)
+  process.exit(1)
+}
+if (SUBSCRIBE_CHANNELS !== 0 && SUBSCRIBE_CHANNELS !== 1) {
+  console.error(`--subscribe-channels must be 0 or 1, got ${SUBSCRIBE_CHANNELS}`)
   process.exit(1)
 }
 
@@ -212,6 +223,9 @@ const consumeOnce = async (kafka, run) => {
     brokers: ['localhost:9092', 'localhost:9095', 'localhost:9098'],
     logLevel: logLevel.NOTHING,
   })
+  if (SUBSCRIBE_CHANNELS === 1) {
+    subscribeChannels(kafka)
+  }
 
   await createTopic(kafka)
 
@@ -228,6 +242,7 @@ const consumeOnce = async (kafka, run) => {
         size: SIZE,
         partitions: PARTITIONS,
         handler: HANDLER,
+        subscribeChannels: SUBSCRIBE_CHANNELS === 1,
         ...measured,
       })
     )

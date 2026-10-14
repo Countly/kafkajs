@@ -7,15 +7,19 @@
  * the producer only when given, and the JSON reports exactly what the producer received: without
  * them the producer's own defaults are measured, and `--linger 0` hands every batch on without a
  * wait. One untimed record per partition is sent first, so metadata and the leader connections are
- * paid for outside the timed window. A bad argument exits 2.
+ * paid for outside the timed window. With `--subscribe-channels 1` a subscriber that does nothing
+ * listens on the diagnostics channel of every public event, so the run measures what subscribing
+ * costs; that flag exists only in this tree. A bad argument exits 2.
  * Usage: node scripts/benchmarks/produceIdempotent.js [--idempotent 1] [--transactional 0]
  *          [--linger <ms>] [--batch-size 16384] [--partitions 6] [--messages 20000] [--size 200]
- *          [--concurrency 200] [--rate 0]
+ *          [--concurrency 200] [--rate 0] [--subscribe-channels 0]
  * Prints one JSON line: { idempotent, transactional, linger, batchSize, partitions, messages,
- *   size, concurrency, rate, elapsedMs, messagesPerSecond, produceRequests, recordsPerRequest }
+ *   size, concurrency, rate, subscribeChannels, elapsedMs, messagesPerSecond, produceRequests,
+ *   recordsPerRequest }
  * `produceRequests` counts the Produce requests the producer sent, from its `REQUEST` events.
  */
 const { Kafka, logLevel } = require('../../index')
+const subscribeChannels = require('./subscribeChannels')
 
 /**
  * Prints `message` and exits 2, the code of a usage error.
@@ -62,6 +66,7 @@ const MESSAGES = arg('messages', 20000)
 const SIZE = arg('size', 200)
 const CONCURRENCY = arg('concurrency', 200)
 const RATE = arg('rate', 0)
+const SUBSCRIBE_CHANNELS = switchArg('subscribe-channels', 0)
 const TRANSACTION_RECORDS = 100
 if (TRANSACTIONAL && MESSAGES % TRANSACTION_RECORDS !== 0) {
   usageError(`--messages must be a multiple of ${TRANSACTION_RECORDS} with --transactional 1`)
@@ -170,6 +175,9 @@ const main = async () => {
     retry: RETRY,
     logLevel: logLevel.NOTHING,
   })
+  if (SUBSCRIBE_CHANNELS) {
+    subscribeChannels(kafka)
+  }
   await createTopic(kafka)
 
   const producer = kafka.producer({
@@ -205,6 +213,7 @@ const main = async () => {
       size: SIZE,
       concurrency: CONCURRENCY,
       rate: RATE,
+      subscribeChannels: SUBSCRIBE_CHANNELS,
       elapsedMs,
       messagesPerSecond: (MESSAGES / elapsedMs) * 1000,
       produceRequests,

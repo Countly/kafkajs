@@ -97,6 +97,9 @@ notice and what, if anything, to do.
   id and the sequence numbers; it does not restore 2.2.4's send path, which every producer shares
   (the accumulator and per-partition retry items below). If you check `producer.isIdempotent()`,
   read it after `connect()`.
+  At `linger: 0`, an awaited single `send()` of an idempotent producer takes about 2 % longer
+  (about 30 µs on a 1.5 ms send) than with `idempotent: false`, which removes that cost and gives
+  up the protection against duplicates and reordering on retry.
 
 - **`idempotent: true` plus `acks` 0 or 1 still throws, with a new class.** The error is now
   `KafkaJSInvalidConfigurationError`, still a `KafkaJSNonRetriableError`, with the same message.
