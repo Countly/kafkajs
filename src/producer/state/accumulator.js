@@ -79,6 +79,21 @@ const assertEncodable = (topic, messages) => {
 }
 
 /**
+ * Reads the list by index, at the length it had when the check began and with an absent entry
+ * skipped, as `some` reads it: a record array's accessors may change the list meanwhile.
+ * @param {{ messages: object[] }[]} topicMessages
+ * @returns {boolean} whether any topic carries a record, as the arrays stand now
+ */
+const hasRecords = (topicMessages) => {
+  for (let i = 0, count = topicMessages.length; i < count; i++) {
+    if (i in topicMessages && topicMessages[i].messages.length > 0) {
+      return true
+    }
+  }
+  return false
+}
+
+/**
  * @param {object[]} messages
  * @returns {number} the bytes of their keys and values, the accumulator's estimate of a batch
  */
@@ -378,7 +393,7 @@ class Accumulator {
     for (const { topic, messages } of topicMessages) {
       assertEncodable(topic, messages)
     }
-    if (!topicMessages.some(({ messages }) => messages.length > 0)) {
+    if (!hasRecords(topicMessages)) {
       return []
     }
 
@@ -621,7 +636,7 @@ class Accumulator {
       clearTimeout(batch.timer)
       this.#pending.delete(batch.key)
     }
-    this.#sendGrouped([...full, ...ready])
+    this.#sendGrouped(full.length === 0 ? ready : [...full, ...ready])
   }
 
   /**
@@ -660,22 +675,39 @@ class Accumulator {
   }
 
   /**
-   * Sends batches in one call per `acks`, `timeout` and `compression`.
+   * Sends batches in one call per `acks`, `timeout` and `compression`. Batches that share their
+   * options - every hand-off of a send that asked for one set of them - go to the send path as
+   * they are, with no grouping.
    * @param {PendingBatch[]} batches
-   * @returns {Promise<void>} settles once they all have; never rejects
+   * @returns {Promise<unknown>} settles once they all have; never rejects, unless the send path
+   *   throws before it answers, which rejects the promise the hand-off sites leave unawaited
    */
-  async #sendGrouped(batches) {
-    /** @type {Map<string, PendingBatch[]>} */
-    const groups = new Map()
-    for (const batch of batches) {
-      const group = groups.get(batch.options)
-      if (group === undefined) {
-        groups.set(batch.options, [batch])
-      } else {
-        group.push(batch)
+  #sendGrouped(batches) {
+    try {
+      if (batches.length === 0) {
+        return Promise.resolve()
       }
+      let shared = true
+      for (let i = 1; i < batches.length && shared; i++) {
+        shared = batches[i].options === batches[0].options
+      }
+      if (shared) {
+        return this.#send(batches)
+      }
+      /** @type {Map<string, PendingBatch[]>} */
+      const groups = new Map()
+      for (const batch of batches) {
+        const group = groups.get(batch.options)
+        if (group === undefined) {
+          groups.set(batch.options, [batch])
+        } else {
+          group.push(batch)
+        }
+      }
+      return Promise.all(Array.from(groups.values(), (group) => this.#send(group)))
+    } catch (error) {
+      return Promise.reject(error)
     }
-    await Promise.all(Array.from(groups.values(), (group) => this.#send(group)))
   }
 
   /**

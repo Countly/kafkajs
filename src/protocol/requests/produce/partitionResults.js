@@ -75,15 +75,21 @@ const parse = async (data) => {
 }
 
 /**
- * Every partition's outcome in a decoded Produce response of any version, in response order, with
- * no throw: what a caller that settles each partition on its own needs, including the
- * `logStartOffset` the idempotent producer reads an UNKNOWN_PRODUCER_ID by.
- * @param {{ topics: { topicName: string|null, partitions: object[] }[] }} data decoded response
- * @returns {PartitionResult[]}
+ * Appends one topic's partition outcomes to `results`, reading `partitions` by index at the length
+ * it had when the read began and with an absent entry skipped, as `map` reads it. The topic comes
+ * in destructured, so a malformed entry fails with the message the callback of `flatMap` gave.
+ * @param {PartitionResult[]} results
+ * @param {object} data decoded response
+ * @param {{ topicName: string|null, partitions: object[] }} topic
+ * @returns {void}
  */
-const partitionResults = (data) =>
-  data.topics.flatMap(({ topicName, partitions }) =>
-    partitions.map((partition) => ({
+const appendTopicResults = (results, data, { topicName, partitions }) => {
+  for (let p = 0, count = partitions.length; p < count; p++) {
+    if (!(p in partitions)) {
+      continue
+    }
+    const partition = partitions[p]
+    results.push({
       topicName,
       partition: partition.partition,
       errorCode: partition.errorCode,
@@ -91,7 +97,30 @@ const partitionResults = (data) =>
       logAppendTime: partition.logAppendTime,
       logStartOffset: partition.logStartOffset === undefined ? '-1' : partition.logStartOffset,
       error: failure(partition.errorCode) ? partitionError(data, topicName, partition) : null,
-    }))
-  )
+    })
+  }
+}
+
+/**
+ * Every partition's outcome in a decoded Produce response of any version, in response order, with
+ * no throw: what a caller that settles each partition on its own needs, including the
+ * `logStartOffset` the idempotent producer reads an UNKNOWN_PRODUCER_ID by.
+ *
+ * Each list is read by index, at the length it had when the read began and with an absent entry
+ * skipped, as `flatMap` and `map` read it: no intermediate array is built, and a sparse list gives
+ * what they gave.
+ * @param {{ topics: { topicName: string|null, partitions: object[] }[] }} data decoded response
+ * @returns {PartitionResult[]}
+ */
+const partitionResults = (data) => {
+  const results = []
+  const { topics } = data
+  for (let t = 0, count = topics.length; t < count; t++) {
+    if (t in topics) {
+      appendTopicResults(results, data, topics[t])
+    }
+  }
+  return results
+}
 
 module.exports = { parse, partitionResults }

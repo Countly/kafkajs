@@ -135,6 +135,17 @@ describe('Protocol > Requests > Produce > partition results', () => {
         partition: 1,
       })
     })
+
+    test('the results are built in one pass over the answer, with no intermediate array', () => {
+      // Every acknowledged send reads its answer through this function.
+      const flatMap = jest.spyOn(Array.prototype, 'flatMap')
+      const results = partitionResults(data)
+      const calls = flatMap.mock.calls.length
+      flatMap.mockRestore()
+
+      expect(calls).toBe(0)
+      expect(results).toHaveLength(3)
+    })
   })
 
   test('a result carries exactly its seven keys, never the decoded failure detail', async () => {
@@ -218,5 +229,130 @@ describe('Protocol > Requests > Produce > partition results', () => {
     expect(error).not.toHaveProperty('errorMessage')
     expect(error).not.toHaveProperty('recordErrors')
     expect(error).not.toHaveProperty('currentLeader')
+  })
+
+  describe('an answer read entry by entry', () => {
+    const accepted = (partition, fields = {}) => ({
+      partition,
+      errorCode: 0,
+      baseOffset: String(partition),
+      logAppendTime: '-1',
+      logStartOffset: '0',
+      ...fields,
+    })
+
+    test('keeps every entry, a partition id repeated within a topic and across topics too', () => {
+      const results = partitionResults({
+        topics: [
+          { topicName: 'a', partitions: [accepted(1), accepted(1), accepted(2), accepted(1)] },
+          { topicName: 'b', partitions: [accepted(1)] },
+          { topicName: 'a', partitions: [accepted(1)] },
+        ],
+      })
+
+      expect(results.map(({ topicName, partition }) => `${topicName}/${partition}`)).toEqual([
+        'a/1',
+        'a/1',
+        'a/2',
+        'a/1',
+        'b/1',
+        'a/1',
+      ])
+    })
+
+    test('defaults only an undefined log start offset, and passes every other field through as it is', () => {
+      const withOffset = (logStartOffset) =>
+        partitionResults({
+          topics: [{ topicName: null, partitions: [accepted(0, { logStartOffset })] }],
+        })[0].logStartOffset
+
+      expect(withOffset(undefined)).toBe('-1')
+      for (const kept of [null, 0, '', '0', '250', false]) {
+        expect(withOffset(kept)).toBe(kept)
+      }
+      expect(
+        partitionResults({
+          topics: [
+            {
+              topicName: null,
+              partitions: [{ partition: 3, errorCode: 0, baseOffset: null, logAppendTime: null }],
+            },
+          ],
+        })
+      ).toStrictEqual([
+        {
+          topicName: null,
+          partition: 3,
+          errorCode: 0,
+          baseOffset: null,
+          logAppendTime: null,
+          logStartOffset: '-1',
+          error: null,
+        },
+      ])
+    })
+
+    test('skips the absent entries of a sparse topic list and of a sparse partition list', () => {
+      const topics = new Array(3)
+      topics[1] = { topicName: 'a', partitions: Object.assign(new Array(3), { 2: accepted(2) }) }
+      topics[2] = { topicName: 'b', partitions: [accepted(0)] }
+
+      const results = partitionResults({ topics })
+
+      expect(results.map(({ topicName, partition }) => `${topicName}/${partition}`)).toEqual([
+        'a/2',
+        'b/0',
+      ])
+      expect(results[0]).toStrictEqual({
+        topicName: 'a',
+        partition: 2,
+        errorCode: 0,
+        baseOffset: '2',
+        logAppendTime: '-1',
+        logStartOffset: '0',
+        error: null,
+      })
+    })
+
+    test.each([
+      ['a topic', { topics: [undefined] }],
+      ['a partition', { topics: [{ topicName: 'a', partitions: [accepted(0), undefined] }] }],
+    ])('still throws for %s that is present but undefined', (_, data) => {
+      expect(() => partitionResults(data)).toThrow(TypeError)
+    })
+
+    test.each([
+      [
+        'undefined',
+        undefined,
+        "Cannot destructure property 'topicName' of 'undefined' as it is undefined.",
+      ],
+      ['null', null, "Cannot destructure property 'topicName' of 'object null' as it is null."],
+    ])(
+      'the TypeError for the topic entry %s is the one destructuring it gives',
+      (_, entry, message) => {
+        expect(() => partitionResults({ topics: [entry] })).toThrow(new TypeError(message))
+      }
+    )
+
+    test('reads the entries that were there when it began, whatever the lists become meanwhile', () => {
+      const partitions = [accepted(0), accepted(1), accepted(2)]
+      const topics = [{ topicName: 'a', partitions }]
+      Object.defineProperty(partitions[0], 'logAppendTime', {
+        get() {
+          partitions.push(accepted(9))
+          topics.push({ topicName: 'late', partitions: [accepted(9)] })
+          delete partitions[1]
+          return '-1'
+        },
+      })
+
+      const results = partitionResults({ topics })
+
+      expect(results.map(({ topicName, partition }) => `${topicName}/${partition}`)).toEqual([
+        'a/0',
+        'a/2',
+      ])
+    })
   })
 })

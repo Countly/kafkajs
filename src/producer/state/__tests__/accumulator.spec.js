@@ -1,3 +1,5 @@
+const path = require('path')
+const { spawnSync } = require('child_process')
 const Accumulator = require('../accumulator')
 const createProducer = require('../../index')
 const Decoder = require('../../../protocol/decoder')
@@ -170,6 +172,41 @@ const createAccumulator = ({
 /** A send of `messages` with the request-level options a `send()` passes. */
 const append = (accumulator, messages, { acks = -1, timeout = 30000, compression = 0 } = {}) =>
   accumulator.append({ acks, timeout, compression, topicMessages: [{ topic: TOPIC, messages }] })
+
+/**
+ * Runs an accumulator whose send path throws synchronously, in a child process, and reports where
+ * the failure went: a rejection nobody awaits, an uncaught exception, or the append itself.
+ * @param {{ linger: number, batchSize: number }} options
+ * @returns {string[]} one line per event, in the order they happened
+ */
+const whereASendPathFailureGoes = ({ linger, batchSize }) => {
+  const script = `
+    const Accumulator = require(${JSON.stringify(path.join(__dirname, '..', 'accumulator.js'))})
+    process.on('unhandledRejection', (e) => console.log('unhandledRejection: ' + e.message))
+    process.on('uncaughtException', (e) => console.log('uncaughtException: ' + e.message))
+    const accumulator = new Accumulator({
+      linger: ${linger},
+      batchSize: ${batchSize},
+      partition: async (topicMessages) =>
+        topicMessages.map(({ topic, messages }) => ({ topic, partition: 0, messages })),
+      sendPartitioned: () => {
+        throw new Error('send path failure')
+      },
+    })
+    accumulator
+      .append({ acks: -1, topicMessages: [{ topic: 't', messages: [{ value: 'v' }] }] })
+      .then(
+        () => console.log('append resolved'),
+        (e) => console.log('append rejected: ' + e.message)
+      )
+    setTimeout(() => {}, 20)
+  `
+  const child = spawnSync(process.execPath, ['-e', script], { encoding: 'utf8', timeout: 20000 })
+
+  expect(child.stderr).toBe('')
+  expect(child.status).toBe(0)
+  return child.stdout.trim().split('\n')
+}
 
 /**
  * A producer over the fake cluster - one broker leading every partition, InitProducerId answered
@@ -391,6 +428,24 @@ describe('Producer > the accumulator', () => {
       expect(jest.getTimerCount()).toBe(0)
     })
 
+    test('a hand-off whose batches share their options is checked without a callback allocated per hand-off', async () => {
+      const { accumulator, calls } = createAccumulator()
+      for (let partition = 0; partition < 3; partition++) {
+        append(accumulator, records(partition, `p${partition}`))
+      }
+      const every = jest.spyOn(Array.prototype, 'every')
+
+      try {
+        await jest.advanceTimersByTimeAsync(LINGER)
+
+        expect(every).not.toHaveBeenCalled()
+      } finally {
+        every.mockRestore()
+      }
+      expect(calls).toHaveLength(1)
+      expect(calls[0].batches).toHaveLength(3)
+    })
+
     test('the batches one send creates fall due together, though the clock moves while it joins them', async () => {
       const { accumulator, calls } = createAccumulator()
       const now = Date.now
@@ -479,6 +534,34 @@ describe('Producer > the accumulator', () => {
 
         expect(sent()).toEqual([[{ [`${TOPIC}/0`]: ['a-0'] }, { [`${TOPIC}/1`]: ['b-0'] }]])
         expect(jest.getTimerCount()).toBe(0)
+      })
+
+      test('a hand-off whose batches share their options reaches the send path as one call, with no grouping', async () => {
+        const { accumulator, calls, sent } = createAccumulator({ linger: 0 })
+        // The single-send path is the one whose latency counts: it awaits no Promise.all.
+        const all = jest.spyOn(Promise, 'all')
+
+        try {
+          const first = append(accumulator, records(0, 'a'))
+          const second = append(accumulator, records(1, 'b'))
+          await microtasks()
+
+          expect(all).not.toHaveBeenCalled()
+          await expect(first).resolves.toEqual([expect.objectContaining({ partition: 0 })])
+          await expect(second).resolves.toEqual([expect.objectContaining({ partition: 1 })])
+        } finally {
+          all.mockRestore()
+        }
+        expect(calls).toHaveLength(1)
+        expect(sent()).toEqual([[{ [`${TOPIC}/0`]: ['a-0'] }, { [`${TOPIC}/1`]: ['b-0'] }]])
+      })
+
+      test('flush() with nothing pending settles at once and calls the send path never', async () => {
+        const { accumulator, calls } = createAccumulator({ linger: 0 })
+
+        await expect(settledWithin(accumulator.flush())).resolves.toBeUndefined()
+
+        expect(calls).toEqual([])
       })
     })
 
@@ -746,6 +829,36 @@ describe('Producer > the accumulator', () => {
 
       expect(sent()).toEqual([[{ [`${TOPIC}/1`]: ['b-0'] }]])
       expect(jest.getTimerCount()).toBe(1)
+    })
+
+    test('flush() settles only once the call of every set of options has settled', async () => {
+      const gzipAnswered = deferred()
+      const sendPartitioned = jest.fn(async ({ compression, batches }) => {
+        if (compression === GZIP) {
+          await gzipAnswered.promise
+        }
+        batches.forEach(({ partition, settlers }) =>
+          settlers.forEach((settler) => settler.resolve({ partition, baseOffset: '0' }))
+        )
+      })
+      const { accumulator } = createAccumulator({ sendPartitioned })
+      append(accumulator, records(0, 'a'))
+      accumulator.append({
+        acks: -1,
+        timeout: 30000,
+        compression: GZIP,
+        topicMessages: [{ topic: OTHER_TOPIC, messages: records(0, 'c') }],
+      })
+      await jest.advanceTimersByTimeAsync(0)
+
+      const flushed = settledFlag(accumulator.flush())
+      await jest.advanceTimersByTimeAsync(0)
+
+      expect(sendPartitioned).toHaveBeenCalledTimes(2)
+      expect(flushed()).toBe(false)
+      gzipAnswered.resolve()
+      await jest.advanceTimersByTimeAsync(0)
+      expect(flushed()).toBe(true)
     })
 
     test('flush() sends every pending batch now, one call per options, and clears every timer', async () => {
@@ -1355,6 +1468,24 @@ describe('Producer > the accumulator', () => {
       expect(partition).not.toHaveBeenCalled()
       expect(jest.getTimerCount()).toBe(0)
     })
+
+    test('a send whose last topic carries no record still sends the records of the others', async () => {
+      const { accumulator, sent } = createAccumulator()
+
+      const sending = accumulator.append({
+        acks: -1,
+        timeout: 30000,
+        compression: 0,
+        topicMessages: [
+          { topic: TOPIC, messages: records(0, 'a') },
+          { topic: OTHER_TOPIC, messages: [] },
+        ],
+      })
+      await jest.advanceTimersByTimeAsync(LINGER)
+
+      expect(sent()).toEqual([[{ [`${TOPIC}/0`]: ['a-0'] }]])
+      await expect(sending).resolves.toEqual([expect.objectContaining({ topicName: TOPIC })])
+    })
   })
 
   describe('a record the encoder cannot write', () => {
@@ -1400,6 +1531,74 @@ describe('Producer > the accumulator', () => {
       expect(sent()).toEqual([[{ [`${TOPIC}/0`]: ['a-0'] }]])
     })
 
+    test('a send whose records are gone by the end of the check resolves [] at once, queueing nothing', async () => {
+      jest.useFakeTimers({ now: 0 })
+      const { accumulator, calls, partition } = createAccumulator()
+      const first = [{ partition: 0, value: 'a' }]
+      const last = [
+        {
+          partition: 0,
+          get value() {
+            first.length = 0
+            last.length = 0
+            return 'b'
+          },
+        },
+      ]
+
+      const sending = accumulator.append({
+        acks: -1,
+        topicMessages: [
+          { topic: TOPIC, messages: first },
+          { topic: OTHER_TOPIC, messages: last },
+        ],
+      })
+
+      await expect(settledWithin(sending)).resolves.toEqual([])
+      expect(partition).not.toHaveBeenCalled()
+      expect(calls).toEqual([])
+    })
+
+    test.each([
+      [
+        'a topic deleted by the read of the one before it is skipped',
+        (topicMessages) => {
+          delete topicMessages[1]
+        },
+      ],
+      [
+        'a topic appended by the read of the one before it is not read',
+        (topicMessages) => {
+          topicMessages.push({ topic: OTHER_TOPIC, messages: records(0, 'late') })
+        },
+      ],
+    ])(
+      'the check for records: %s, so the send resolves [] at once, queueing nothing',
+      async (_, change) => {
+        jest.useFakeTimers({ now: 0 })
+        const { accumulator, calls, partition } = createAccumulator()
+        let reads = 0
+        const topicMessages = [
+          {
+            topic: TOPIC,
+            get messages() {
+              if (++reads === 2) {
+                change(topicMessages)
+              }
+              return []
+            },
+          },
+          { topic: OTHER_TOPIC, messages: [] },
+        ]
+
+        const sending = accumulator.append({ acks: -1, topicMessages })
+
+        await expect(settledWithin(sending)).resolves.toEqual([])
+        expect(partition).not.toHaveBeenCalled()
+        expect(calls).toEqual([])
+      }
+    )
+
     test.each([
       [
         'strings and Buffers',
@@ -1420,9 +1619,74 @@ describe('Producer > the accumulator', () => {
     })
   })
 
+  describe('a send path that throws before it answers', () => {
+    test.each([
+      ['a linger of 0 hands the batch on from a queued microtask', { linger: 0, batchSize: 16384 }],
+      ['a send that fills its batch hands it on from its own call', { linger: 5, batchSize: 1 }],
+    ])(
+      '%s: the failure is an unhandled rejection, never an uncaught exception or a rejected append',
+      (_, options) => {
+        expect(whereASendPathFailureGoes(options)).toEqual([
+          'unhandledRejection: send path failure',
+        ])
+      }
+    )
+
+    test.each([
+      ['batches that share their options', [{}, {}]],
+      ['batches of different options', [{ timeout: 1 }, { timeout: 2 }]],
+    ])('flush() rejects with that failure, for %s', async (_, optionSets) => {
+      jest.useFakeTimers({ now: 0 })
+      const failure = new Error('send path failure')
+      const { accumulator } = createAccumulator({
+        sendPartitioned: () => {
+          throw failure
+        },
+      })
+      optionSets.forEach((options, partition) =>
+        append(accumulator, records(partition, 'a'), options)
+      )
+      await jest.advanceTimersByTimeAsync(0)
+
+      await expect(settledWithin(accumulator.flush())).rejects.toBe(failure)
+    })
+  })
+
   describe('a producer', () => {
     beforeEach(() => {
       jest.useFakeTimers({ now: 0 })
+    })
+
+    test('sendBatch resolves [] when its records are gone by the end of the check, and never stays pending', async () => {
+      jest.useFakeTimers({ now: 0, doNotFake: ['queueMicrotask'] })
+      const { producer } = createLingeringProducer({ linger: 0 })
+      await producer.connect()
+      const first = [{ value: 'a' }]
+      let reads = 0
+      const last = [
+        {
+          get value() {
+            if (++reads === 2) {
+              first.length = 0
+              last.length = 0
+            }
+            return 'b'
+          },
+        },
+      ]
+
+      try {
+        const sending = producer.sendBatch({
+          topicMessages: [
+            { topic: 'a', messages: first },
+            { topic: 'b', messages: last },
+          ],
+        })
+
+        await expect(settledWithin(sending)).resolves.toEqual([])
+      } finally {
+        await withinRealTime(producer.disconnect())
+      }
     })
 
     describe.each([
