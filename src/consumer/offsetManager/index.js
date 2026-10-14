@@ -761,6 +761,11 @@ module.exports = class OffsetManager {
    * ListOffsets (see `dropRecreatedTopics`). A dropped topic keeps its invalid offsets, so the next
    * resolution, which every fetch round runs, resolves it afresh.
    *
+   * A pending topic-recreation reset is consumed only once its topic's offsets are written (see
+   * `drainPendingTopicResets`). A dropped topic, or a ListOffsets that throws, keeps the token, so
+   * the next resolution applies the reset again; a token a newer recreation replaced meanwhile is
+   * kept for that recreation.
+   *
    * @param {Set<string>} [seekedPartitions] Keys (`OffsetManager.seekedPartitionKey(topic,
    *                                partition)`) of partitions a `seek()` was just applied to,
    *                                in this same `ConsumerGroup#seekOffsets()` call. A seeked
@@ -796,10 +801,10 @@ module.exports = class OffsetManager {
     )
     const { responses } = await this.fetchCommittedOffsets(pendingPartitions)
 
-    // Before the drain: a stale reply must not consume the reset the new incarnation is owed.
+    // Before the drain: a stale reply must not take the reset the new incarnation is owed.
     const consumerOffsets = this.dropRecreatedTopics(responses, requestedIds)
 
-    this.drainPendingTopicResets(consumerOffsets, seekedPartitions)
+    const appliedResets = this.drainPendingTopicResets(consumerOffsets, seekedPartitions)
 
     // Seed the tracked epoch from what the coordinator has committed, before
     // initializeConsumerOffsets rebuilds these entries as { partition, offset } and drops every
@@ -866,6 +871,14 @@ module.exports = class OffsetManager {
       this.committedOffsets()[topic] = partitions.reduce(indexPartitions, {
         ...this.committedOffsets()[topic],
       })
+
+      // Only the token that was applied is consumed: a newer one is owed its own reset.
+      if (
+        appliedResets.has(topic) &&
+        this.pendingTopicResets.get(topic) === appliedResets.get(topic)
+      ) {
+        this.pendingTopicResets.delete(topic)
+      }
     })
   }
 
@@ -969,7 +982,10 @@ module.exports = class OffsetManager {
    * Drops the entries of topics whose cached id is no longer the one they were requested under.
    * An answer that outlived a delete and recreate describes the old topic: applying it would write
    * the old offset over the new topic's position and, ahead of `drainPendingTopicResets`, would
-   * consume the reset the new one is owed. A topic with no known id before and after is kept.
+   * apply a reset the new one is owed. Only a proven recreation drops: an id known both when the
+   * request went out and now, and different. An id that was merely learned (unknown before) or
+   * lost (unknown now, a cleared cache) is not a recreation, and its entry is kept - a recreation
+   * announces itself by setting a reset token.
    *
    * @private
    * @param {{topic: string}[]} entries
@@ -978,7 +994,11 @@ module.exports = class OffsetManager {
    * @returns {{topic: string}[]} the entries still current, as a new array
    */
   dropRecreatedTopics(entries, requestedIds) {
-    return entries.filter(({ topic }) => this.cluster.topicId(topic) === requestedIds.get(topic))
+    return entries.filter(({ topic }) => {
+      const requestedId = requestedIds.get(topic)
+      const currentId = this.cluster.topicId(topic)
+      return requestedId === undefined || currentId === undefined || requestedId === currentId
+    })
   }
 
   /**
@@ -988,10 +1008,14 @@ module.exports = class OffsetManager {
    *
    * A pending entry is stamped with the topic id the recreation produced. It applies when the
    * cluster's cached id is unknown (the cache was cleared, or the topic has not appeared in a
-   * metadata response yet) **or** equal to the stamp, and is dropped without resetting only when
+   * metadata response yet) **or** equal to the stamp, and is removed without resetting only when
    * a *known* cached id differs - treating unknown as "changed" would let a rebootstrap silently
-   * discard the reset, which is the stale-offset skip this mechanism exists to prevent. Either
-   * way the entry is consumed at the first resolution that covers the topic.
+   * discard the reset, which is the stale-offset skip this mechanism exists to prevent.
+   *
+   * An applied entry is not removed here: the caller removes it once the resolved offsets of its
+   * topic are written, and only if it still holds the id that was applied. Until then a concurrent
+   * resolution under the same incarnation applies the reset too, and a resolution that is dropped
+   * or throws leaves the entry for the next one.
    *
    * A partition in `seekedPartitions` is left untouched even when its topic is being reset: a
    * `seek()` applied after the recreation targets the *current* incarnation and is newer, more
@@ -1003,9 +1027,11 @@ module.exports = class OffsetManager {
    *   mutated in place: a reset topic's partition offsets become the invalid sentinel
    * @param {Set<string>} seekedPartitions `OffsetManager.seekedPartitionKey(topic, partition)`
    *   entries to exempt from the reset
-   * @returns {void}
+   * @returns {Map<string, string|undefined>} each reset applied, as topic to the stamped id
    */
   drainPendingTopicResets(consumerOffsets, seekedPartitions) {
+    const applied = new Map()
+
     for (const { topic, partitions } of consumerOffsets) {
       if (!this.pendingTopicResets.has(topic)) {
         continue
@@ -1013,11 +1039,13 @@ module.exports = class OffsetManager {
 
       const stampedTopicId = this.pendingTopicResets.get(topic)
       const currentTopicId = this.cluster.topicId(topic)
-      this.pendingTopicResets.delete(topic)
 
       if (currentTopicId !== undefined && currentTopicId !== stampedTopicId) {
+        this.pendingTopicResets.delete(topic)
         continue
       }
+
+      applied.set(topic, stampedTopicId)
 
       for (const partition of partitions) {
         if (seekedPartitions.has(OffsetManager.seekedPartitionKey(topic, partition.partition))) {
@@ -1027,6 +1055,8 @@ module.exports = class OffsetManager {
         partition.offset = '-1'
       }
     }
+
+    return applied
   }
 
   /**

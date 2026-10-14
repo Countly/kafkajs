@@ -1,4 +1,5 @@
 const OffsetManager = require('../index')
+const ConsumerGroup = require('../../consumerGroup')
 const createAdmin = require('../../../admin')
 const InstrumentationEventEmitter = require('../../../instrumentation/emitter')
 const Encoder = require('../../../protocol/encoder')
@@ -402,7 +403,40 @@ describe('Consumer > OffsetManager > resolveOffsets across a topic recreation', 
       manager.resetOffsetsForTopic(TOPIC)
     }
 
-    return { manager, requests, pending, committed, cluster, recreate }
+    const setId = (id) => {
+      state.id = id
+    }
+
+    return { manager, requests, pending, committed, cluster, recreate, setId }
+  }
+
+  /**
+   * Holds every ListOffsets call until `release(offset)` answers them, and answers the calls that
+   * come after that at once.
+   */
+  const holdListOffsets = (cluster) => {
+    const held = []
+    let released
+    cluster.fetchTopicsOffset.mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          const answer = (offset) =>
+            resolve([{ topic: TOPIC, partitions: [{ partition: 0, offset }] }])
+          if (released === undefined) {
+            held.push(answer)
+          } else {
+            answer(released)
+          }
+        })
+    )
+
+    return {
+      count: () => held.length,
+      release: (offset) => {
+        released = offset
+        held.forEach((answer) => answer(offset))
+      },
+    }
   }
 
   test('an OffsetFetch answer for the old incarnation, landing after the new one resolved, does not move its position', async () => {
@@ -479,6 +513,119 @@ describe('Consumer > OffsetManager > resolveOffsets across a topic recreation', 
     expect(pending.size).toBe(0)
   })
 
+  describe('a reset token is consumed only when its reset is written', () => {
+    /** Resolves again and answers any OffsetFetch it sends with the old committed offset. */
+    const resolveAgain = async (manager, requests) => {
+      const sent = requests.length
+      const round = manager.resolveOffsets()
+      await flush()
+      requests.slice(sent).forEach(({ answer }) => answer('99'))
+      await round
+    }
+
+    test('an id learned while ListOffsets is in flight does not discard the reset', async () => {
+      const { manager, requests, pending, committed, cluster, setId } = build(undefined)
+      pending.set(TOPIC, NEW_ID)
+      const held = holdListOffsets(cluster)
+      const round = manager.resolveOffsets()
+      await flush()
+      requests[0].answer('99')
+      await flush()
+      expect(held.count()).toBe(1)
+
+      setId(NEW_ID)
+      held.release('0')
+      await round
+      expect(committed[TOPIC]).toEqual({ 0: '0' })
+      await resolveAgain(manager, requests)
+
+      expect(manager.nextOffset(TOPIC, 0).toString()).toEqual('0')
+      expect(pending.size).toBe(0)
+    })
+
+    test('a cache cleared during ListOffsets and repopulated with the same id does not discard the reset', async () => {
+      const { manager, requests, pending, committed, cluster, setId } = build(NEW_ID)
+      pending.set(TOPIC, NEW_ID)
+      const held = holdListOffsets(cluster)
+      const round = manager.resolveOffsets()
+      await flush()
+      requests[0].answer('99')
+      await flush()
+      expect(held.count()).toBe(1)
+
+      setId(undefined)
+      held.release('0')
+      await round
+      expect(committed[TOPIC]).toEqual({ 0: '0' })
+      setId(NEW_ID)
+      await resolveAgain(manager, requests)
+
+      expect(manager.nextOffset(TOPIC, 0).toString()).toEqual('0')
+      expect(pending.size).toBe(0)
+    })
+
+    test('two resolvers under one id both apply a reset the first has not yet written', async () => {
+      const { manager, requests, pending, cluster, recreate } = build(OLD_ID)
+      recreate(NEW_ID)
+      const held = holdListOffsets(cluster)
+      const first = manager.resolveOffsets()
+      await flush()
+      requests[0].answer('99')
+      await flush()
+      const second = manager.resolveOffsets()
+      await flush()
+      requests[1].answer('99')
+      await flush()
+      expect(held.count()).toBe(2)
+
+      held.release('0')
+      await Promise.all([first, second])
+
+      expect(manager.nextOffset(TOPIC, 0).toString()).toEqual('0')
+      expect(pending.size).toBe(0)
+    })
+
+    test('a ListOffsets that fails keeps the token, so the next resolution resets again', async () => {
+      const { manager, requests, pending, committed, cluster, recreate } = build(OLD_ID)
+      recreate(NEW_ID)
+      cluster.fetchTopicsOffset.mockRejectedValueOnce(new Error('list offsets unavailable'))
+      const failed = manager.resolveOffsets()
+      await flush()
+      requests[0].answer('99')
+      await expect(failed).rejects.toThrow('list offsets unavailable')
+      expect(pending.get(TOPIC)).toEqual(NEW_ID)
+
+      await resolveAgain(manager, requests)
+
+      expect(committed[TOPIC]).toEqual({ 0: '0' })
+      expect(pending.size).toBe(0)
+    })
+
+    test('a newer token set while an older reset is written is kept, and applied next', async () => {
+      const { manager, requests, pending, committed, cluster, setId } = build(undefined)
+      pending.set(TOPIC, OLD_ID)
+      const held = holdListOffsets(cluster)
+      const round = manager.resolveOffsets()
+      await flush()
+      requests[0].answer('99')
+      await flush()
+
+      setId(NEW_ID)
+      pending.set(TOPIC, NEW_ID)
+      held.release('0')
+      await round
+
+      expect(committed[TOPIC]).toEqual({ 0: '0' })
+      expect(pending.get(TOPIC)).toEqual(NEW_ID)
+
+      manager.resetOffsetsForTopic(TOPIC)
+      await resolveAgain(manager, requests)
+
+      expect(committed[TOPIC]).toEqual({ 0: '0' })
+      expect(pending.size).toBe(0)
+    })
+  })
+
   describe.each([
     ['a known topic id', OLD_ID],
     ['no topic id', undefined],
@@ -518,5 +665,101 @@ describe('Consumer > OffsetManager > resolveOffsets across a topic recreation', 
       expect(committed[TOPIC]).toEqual({ 0: '5' })
       expect(pending.size).toBe(0)
     })
+  })
+})
+
+describe('ConsumerGroup#fetch > a topic id learned during the first OffsetFetch', () => {
+  afterEach(() => {
+    jest.useRealTimers()
+  })
+
+  test('the first assignment is resolved and fetched at once, with no empty-fetch wait', async () => {
+    jest.useFakeTimers()
+    const state = { id: undefined }
+    const brokerFetch = jest.fn(async () => ({ errorCode: 0, responses: [] }))
+    const cluster = {
+      refreshMetadataIfNecessary: async () => {},
+      committedOffsets: () => committed,
+      topicId: () => state.id,
+      leaderEpoch: () => -1,
+      hasNode: () => true,
+      findTopicPartitionMetadata: () => [{ partitionId: 0, leader: 0 }],
+      findBroker: async () => ({ fetch: brokerFetch }),
+      fetchTopicsOffset: async () => [
+        { topic: TOPIC, partitions: [{ partition: 0, offset: '5' }] },
+      ],
+    }
+    const committed = {}
+    const topicConfigurations = { [TOPIC]: {} }
+    const instrumentationEmitter = new InstrumentationEventEmitter()
+    const group = new ConsumerGroup({
+      retry: { retries: 0 },
+      cluster,
+      groupId: 'test-group',
+      topics: [TOPIC],
+      topicConfigurations,
+      logger: newLogger(),
+      instrumentationEmitter,
+      assigners: [],
+      sessionTimeout: 30000,
+      rebalanceTimeout: 60000,
+      maxBytesPerPartition: 1048576,
+      minBytes: 1,
+      maxBytes: 1048576,
+      maxWaitTimeInMs: 5000,
+      autoCommit: false,
+      autoCommitInterval: null,
+      autoCommitThreshold: null,
+      isolationLevel: 0,
+      rackId: '',
+      checkCrcs: true,
+      metadataMaxAge: 300000,
+    })
+    group.subscriptionState.assign([{ topic: TOPIC, partitions: [0] }])
+    group.offsetManager = new OffsetManager({
+      cluster,
+      coordinator: {
+        isConnected: () => true,
+        offsetFetch: async () => {
+          state.id = TOPIC_ID
+          return {
+            responses: [
+              {
+                topic: TOPIC,
+                partitions: [
+                  {
+                    partition: 0,
+                    offset: '-1',
+                    committedLeaderEpoch: -1,
+                    metadata: null,
+                    errorCode: 0,
+                  },
+                ],
+              },
+            ],
+          }
+        },
+      },
+      memberAssignment: { [TOPIC]: [0] },
+      autoCommit: false,
+      topicConfigurations,
+      instrumentationEmitter,
+      groupId: 'test-group',
+      generationId: 1,
+      memberId: 'member-a',
+      logger: newLogger(),
+    })
+
+    const round = group.fetch(0)
+    await jest.advanceTimersByTimeAsync(0)
+
+    expect(brokerFetch).toHaveBeenCalledTimes(1)
+    expect(brokerFetch.mock.calls[0][0].topics).toEqual([
+      expect.objectContaining({
+        topic: TOPIC,
+        partitions: [expect.objectContaining({ fetchOffset: '5' })],
+      }),
+    ])
+    await expect(round).resolves.toEqual([])
   })
 })
