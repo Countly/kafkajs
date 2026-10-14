@@ -131,7 +131,7 @@ module.exports = class MetadataCache {
           continue
         }
 
-        // Step 2 - never defend a leader the cluster no longer advertises.
+        // Step 2 - never defend a positive leader the cluster no longer advertises.
         // Step 3 - compare only when both sides know their epoch.
         if (this.isStale(cached, partition, liveBrokerIds)) {
           this.logger.debug('Ignoring stale metadata for partition, keeping the cached leader', {
@@ -285,8 +285,10 @@ module.exports = class MetadataCache {
 
   /**
    * Whether a response's partition is provably behind what the cache already accepted: the cached
-   * leader is still advertised, both sides know their epoch, and the response's is older. Shared
-   * by `update()` and `updateTopicsById()` so the monotonic rule cannot drift between them.
+   * leader is still advertised or is `-1` (an election the cache has seen, which a lagging
+   * response must not undo), both sides know their epoch, and the response's is older. A cached
+   * positive leader the response no longer advertises is not defended. Shared by `update()` and
+   * `updateTopicsById()` so the monotonic rule cannot drift between them.
    *
    * @private
    * @param {{ leader: number, leaderEpoch: number }} cached
@@ -296,7 +298,7 @@ module.exports = class MetadataCache {
    */
   isStale(cached, partition, liveBrokerIds) {
     return (
-      liveBrokerIds.has(cached.leader) &&
+      (cached.leader === NO_LEADER_ID || liveBrokerIds.has(cached.leader)) &&
       cached.leaderEpoch > UNKNOWN_EPOCH &&
       partition.leaderEpoch > UNKNOWN_EPOCH &&
       partition.leaderEpoch < cached.leaderEpoch

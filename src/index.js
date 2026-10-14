@@ -290,8 +290,9 @@ module.exports = class Client {
    * @param {object} [options]
    * @param {number} [options.linger=5] ms a batch waits for more records; 0 sends it at once
    * @param {number} [options.batchSize=16384] bytes of keys and values at which a batch is sent
-   * @param {number} [options.deliveryTimeout] ms one send may take, retries included; at least
-   *   `linger + requestTimeout`
+   * @param {number} [options.deliveryTimeout] ms bounding the waiting and the retries of one send,
+   *   at least `linger + requestTimeout`. A request already sent settles on its answer or on
+   *   `requestTimeout`, so a send can end up to `requestTimeout` after `deliveryTimeout`
    * @throws {KafkaJSInvalidConfigurationError} for a setting idempotence asked for explicitly
    *   does not allow, and for an invalid `linger`, `batchSize` or `deliveryTimeout`
    */

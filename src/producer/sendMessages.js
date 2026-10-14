@@ -23,6 +23,8 @@ const { keys } = Object
 // @see clients/src/main/resources/common/message/ProduceRequest.json (Apache Kafka 4.3.1)
 const PRODUCE_TOPIC_NAMES_MAX_VERSION = 11
 
+const NO_PARTITION_METADATA = 'Producing to a partition without metadata'
+
 /**
  * The error a send rejects with while the producer is not connected: the one `send()` raises up
  * front for that status.
@@ -113,7 +115,8 @@ const topicIdsOf = (cluster, topics) => {
  * The leaders of a topic's partitions: one cluster lookup answers for them all. That lookup
  * throws for the whole call when any partition has no leader, so after a throw each partition
  * is looked up on its own: the ones with a leader still route, and the others come back with
- * the error of their own lookup.
+ * the error of their own lookup. A partition the cache does not hold answers without throwing;
+ * it comes back with the error a send gives it when no lookup throws.
  * @param {import("../../types").Cluster} cluster
  * @param {string} topic
  * @param {(string|number)[]} partitions
@@ -129,7 +132,11 @@ const leadersOfPartitions = (cluster, topic, partitions) => {
     for (const partition of partitions) {
       try {
         const own = cluster.findLeaderForPartitions(topic, [partition])
-        for (const nodeId of keys(own)) {
+        const nodeIds = keys(own)
+        if (nodeIds.length === 0) {
+          failed.push({ partition, error: new KafkaJSMetadataNotLoaded(NO_PARTITION_METADATA) })
+        }
+        for (const nodeId of nodeIds) {
           leaders[nodeId] = [...(leaders[nodeId] ?? []), ...own[nodeId]]
         }
       } catch (error) {
@@ -1671,7 +1678,7 @@ const createSendMessages = ({
             throw retriable
           }
           if (unsettled.size > 0) {
-            throw new KafkaJSMetadataNotLoaded('Producing to a partition without metadata')
+            throw new KafkaJSMetadataNotLoaded(NO_PARTITION_METADATA)
           }
         } catch (e) {
           await recover(e, bail, retryCount, retryTime)

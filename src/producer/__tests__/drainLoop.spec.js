@@ -1512,14 +1512,17 @@ describe('Producer > the idempotent drain loop', () => {
       /**
        * One send of a batch per partition, each settling on its own settler, to a topic whose
        * partition `n` has leader `leaders[n]`.
-       * @param {number[]} leaders
+       * @param {(number|null)[]} leaders `null` is a partition the cache does not hold, which
+       *   still gets a batch
        */
       const sendTo = async (leaders) => {
         const harness = createHarness()
         useClusterLookups(
           harness.cluster,
           TOPIC,
-          leaders.map((leader, partitionId) => ({ partitionId, leader }))
+          leaders.flatMap((leader, partitionId) =>
+            leader === null ? [] : [{ partitionId, leader }]
+          )
         )
         await harness.start()
         jest.useFakeTimers({ now: 0 })
@@ -1557,6 +1560,20 @@ describe('Producer > the idempotent drain loop', () => {
         expect(error).toBeInstanceOf(KafkaJSNumberOfRetriesExceeded)
         expect(error.cause.message).toEqual('No leader for topic-a partition 1')
         expect(error.retryCount).toBe(RETRY.retries)
+      })
+
+      test('a partition the cache does not hold is rejected beside the one without a leader, each naming itself', async () => {
+        const { harness, settlers } = await sendTo([1, -1, null])
+
+        expect(harness.sent()).toEqual([{ nodeId: 1, epoch: 0, partitions: ['topic-a/0@0'] }])
+        expect(settlers[0].resolve).toHaveBeenCalledTimes(1)
+        for (const partition of [1, 2]) {
+          expect(settlers[partition].resolve).not.toHaveBeenCalled()
+          expect(settlers[partition].reject).toHaveBeenCalledTimes(1)
+          expect(settlers[partition].reject.mock.calls[0][0].cause.message).toEqual(
+            `No leader for topic-a partition ${partition}`
+          )
+        }
       })
 
       test('every partition of the topic without a leader is rejected, each naming itself', async () => {

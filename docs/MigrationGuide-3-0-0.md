@@ -175,7 +175,8 @@ notice and what, if anything, to do.
   the others twice; one refused with an error that is not retriable rejects alone; and only the
   partitions whose answer was retriable go out again, within one `retry.retries` budget shared by
   the partitions that went out together; a topic or broker that cannot be looked up holds back
-  only its own partitions, and the slowest broker of an attempt paces the next one. Sends to
+  only its own partitions, a single partition without a leader is looked up alone so its
+  siblings are produced, and the slowest broker of an attempt paces the next one. Sends to
   different partitions that shared a request no longer share each other's failure, and a rejected
   `send()` may have written its other partitions. Records are assigned to partitions once, before they are sent, under a retry budget
   of their own, so waiting for a topic's metadata no longer spends the send's retries.
@@ -226,11 +227,13 @@ notice and what, if anything, to do.
 
 - **`producer.disconnect()` delivers before it disconnects.** It sends every waiting batch, its
   own and its transaction's, and waits for every send begun before it — retries included, up to
-  `deliveryTimeout` or the retry budget — refusing new sends meanwhile. 2.2.4 disconnected at once,
-  failing the sends still under way.
+  `deliveryTimeout` or the retry budget — refusing new sends meanwhile. A request already sent
+  settles on its answer or on `requestTimeout`, so a send can end up to `requestTimeout` after
+  `deliveryTimeout`. 2.2.4 disconnected at once, failing the sends still under way.
   *What to do:* nothing for a clean shutdown. A shutdown with a hard time limit, such as a
   container's grace period, can wait out the retry budget while the cluster is unreachable: set
-  `deliveryTimeout` to bound each send, or race `disconnect()` against a timer.
+  `deliveryTimeout` to bound each send, and allow `deliveryTimeout + requestTimeout` for a hard
+  limit, or race `disconnect()` against a timer.
 
 - **`deliveryTimeout` counts the wait for `linger` and for the producer id.** A send's deadline
   starts when the send is made, as the Java client's does, so the `linger` wait - and on an
@@ -955,10 +958,12 @@ now logged.
   deep-equality-compares the whole payload is affected.
 
 - **The `COMMIT_OFFSETS` event's payload gains `leaderEpoch`.** Each entry of
-  `topics[].partitions[]` now carries `leaderEpoch` (a number, `-1` when the epoch is unknown)
-  alongside `partition` and `offset`, and the entries returned by `consumer.uncommittedOffsets()`
-  gain the same key. Every key those payloads already had is unchanged, so only code that
-  deep-equality-compares a whole payload is affected — the same kind of additive change
+  `topics[].partitions[]` of an auto-commit, or of a `commitOffsets()` with no arguments, now
+  carries `leaderEpoch` (a number, `-1` when the epoch is unknown) alongside `partition` and
+  `offset`, and the entries returned by `consumer.uncommittedOffsets()` gain the same key. Offsets
+  you pass to `commitOffsets(offsets)` are forwarded as given and carry no `leaderEpoch`. Every key
+  those payloads already had is unchanged, so only code that deep-equality-compares a whole payload
+  is affected — the same kind of additive change
   `groupInstanceId` was ("The `COMMIT_OFFSETS` event's payload gains `groupInstanceId`.").
 
 - **New instrumentation events, and two payloads gain a field.** `consumer.partitions_assigned`,

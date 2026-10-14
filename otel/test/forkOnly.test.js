@@ -11,6 +11,7 @@ const early = require('@countly/kafkajs')
 
 const { SpanStatusCode } = require('@opentelemetry/api')
 const { isWrapped } = require('@opentelemetry/instrumentation')
+const { ATTR_ERROR_TYPE } = require('@opentelemetry/semantic-conventions')
 const {
   getTestSpans,
   initMeterProvider,
@@ -361,4 +362,132 @@ describe('fork-only: a handler that returns a plain value, not a promise', () =>
       ],
     })
   })
+})
+
+describe('fork-only: a handler that fails', () => {
+  const failureAttributes = (partition, errorType) => ({
+    [ATTR_MESSAGING_SYSTEM]: MESSAGING_SYSTEM_VALUE_KAFKA,
+    [ATTR_MESSAGING_DESTINATION_NAME]: 'topic-name-1',
+    [ATTR_MESSAGING_DESTINATION_PARTITION_ID]: partition,
+    [ATTR_MESSAGING_OPERATION_NAME]: 'process',
+    [ATTR_ERROR_TYPE]: errorType,
+  })
+
+  /**
+   * @param {Promise<unknown>} pending
+   * @returns {Promise<unknown>} the reason `pending` rejects with; fails the test when it resolves
+   */
+  const rejection = (pending) =>
+    pending.then(
+      () => assert.fail('the call resolved'),
+      (reason) => reason
+    )
+
+  /**
+   * Asserts that exactly the named spans ended, each in ERROR status with the same message and
+   * error type.
+   * @param {string[]} names
+   * @param {string | undefined} message
+   * @param {string} errorType
+   */
+  const assertSpansFailed = (names, message, errorType) => {
+    const spans = getTestSpans()
+    assert.deepStrictEqual(
+      spans.map(({ name }) => name),
+      names
+    )
+    for (const span of spans) {
+      assert.strictEqual(span.status.code, SpanStatusCode.ERROR)
+      assert.strictEqual(span.status.message, message)
+      assert.strictEqual(span.attributes[ATTR_ERROR_TYPE], errorType)
+    }
+  }
+
+  it('ends the process span and records the failure when eachMessage throws synchronously', async () => {
+    const metricReader = initMeterProvider(instrumentation)
+    const { Kafka } = install('@countly/kafkajs', '3.0.0-alpha.7')
+    const error = new Error('thrown synchronously')
+    let called = false
+    const config = {
+      eachMessage: () => {
+        called = true
+        throw error
+      },
+    }
+    await new Kafka().consumer().run(config)
+
+    const pending = config.eachMessage(eachMessagePayload())
+
+    assert.ok(called, 'the handler was not called synchronously')
+    assert.strictEqual(await rejection(pending), error)
+    assertSpansFailed(['process topic-name-1'], 'thrown synchronously', 'Error')
+    assertMetricCollection(await metricReader.collect(), {
+      [METRIC_MESSAGING_PROCESS_DURATION]: [
+        { count: 1, attributes: failureAttributes('1', 'Error') },
+      ],
+      [METRIC_MESSAGING_CLIENT_CONSUMED_MESSAGES]: [
+        { value: 1, attributes: failureAttributes('1', 'Error') },
+      ],
+    })
+  })
+
+  it('ends the poll and process spans and records the failure when eachBatch throws synchronously', async () => {
+    const metricReader = initMeterProvider(instrumentation)
+    const { Kafka } = install('@countly/kafkajs', '3.0.0-alpha.7')
+    const error = new Error('thrown synchronously')
+    let called = false
+    const config = {
+      eachBatch: () => {
+        called = true
+        throw error
+      },
+    }
+    await new Kafka().consumer().run(config)
+
+    const pending = config.eachBatch(eachBatchPayload())
+
+    assert.ok(called, 'the handler was not called synchronously')
+    assert.strictEqual(await rejection(pending), error)
+    assertSpansFailed(
+      ['poll topic-name-1', 'process topic-name-1', 'process topic-name-1'],
+      'thrown synchronously',
+      'Error'
+    )
+    assertMetricCollection(await metricReader.collect(), {
+      [METRIC_MESSAGING_PROCESS_DURATION]: [
+        { count: 2, attributes: failureAttributes('1234', 'Error') },
+      ],
+      [METRIC_MESSAGING_CLIENT_CONSUMED_MESSAGES]: [
+        { value: 2, attributes: failureAttributes('1234', 'Error') },
+      ],
+    })
+  })
+
+  for (const [title, reason, message, errorType] of [
+    ['null', null, undefined, '_OTHER'],
+    [
+      'an object with a message and no prototype',
+      Object.assign(Object.create(null), { message: 'no prototype' }),
+      'no prototype',
+      '_OTHER',
+    ],
+  ]) {
+    it(`passes on ${title} that eachMessage rejects with, and records the failure`, async () => {
+      const metricReader = initMeterProvider(instrumentation)
+      const { Kafka } = install('@countly/kafkajs', '3.0.0-alpha.7')
+      const config = { eachMessage: () => Promise.reject(reason) }
+      await new Kafka().consumer().run(config)
+
+      assert.strictEqual(await rejection(config.eachMessage(eachMessagePayload())), reason)
+      assertSpansFailed(['process topic-name-1'], message, errorType)
+      assertMetricCollection(await metricReader.collect(), {
+        [METRIC_MESSAGING_PROCESS_DURATION]: [
+          { count: 1, attributes: failureAttributes('1', errorType) },
+        ],
+        [METRIC_MESSAGING_CLIENT_CONSUMED_MESSAGES]: [
+          { value: 1, attributes: failureAttributes('1', errorType) },
+        ],
+      })
+    })
+  }
 })

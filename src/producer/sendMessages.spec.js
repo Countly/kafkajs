@@ -494,7 +494,9 @@ describe('Producer > sendMessages', () => {
     /**
      * One send of a batch per partition, each settling on its own settler, through the real
      * `Cluster` lookups, which throw for a negative leader.
-     * @param {(number|undefined)[]} leaders the leader of partition `n` is `leaders[n]`
+     * @param {(number|undefined|null)[]} leaders the leader of partition `n` is `leaders[n]`;
+     *   `undefined` is metadata with no leader field, and `null` is a partition the cache does not
+     *   hold at all, which still gets a batch
      */
     const sendTo = async (leaders) => {
       const metadataCache = {
@@ -503,7 +505,9 @@ describe('Producer > sendMessages', () => {
             topicMetadata: [
               {
                 topic,
-                partitionMetadata: leaders.map((leader, partitionId) => ({ partitionId, leader })),
+                partitionMetadata: leaders.flatMap((leader, partitionId) =>
+                  leader === null ? [] : [{ partitionId, leader }]
+                ),
               },
             ],
           },
@@ -568,13 +572,55 @@ describe('Producer > sendMessages', () => {
       })
     })
 
-    test('a partition whose metadata is invalid is rejected alone, as non-retriable', async () => {
+    test('a partition whose metadata is invalid is retried within the budget, then rejected alone', async () => {
       const { settlers, error } = await sendTo([1, undefined])
 
       expect(producedTo(1)).toEqual([[0]])
       expect(settlers[0].resolve).toHaveBeenCalledTimes(1)
       expect(settlers[1].reject).toHaveBeenCalledWith(error)
+      expect(error.name).toEqual('KafkaJSNumberOfRetriesExceeded')
+      expect(error.cause.retriable).toBe(true)
       expect(error.message).toEqual('Invalid partition metadata')
+    })
+
+    test('a partition the cache does not hold is retried with the others and rejected beside the one without a leader', async () => {
+      const { settlers, error } = await sendTo([1, -1, null])
+
+      expect(producedTo(1)).toEqual([[0]])
+      expect(settlers[0].resolve).toHaveBeenCalledTimes(1)
+      for (const partition of [1, 2]) {
+        expect(settlers[partition].resolve).not.toHaveBeenCalled()
+        expect(settlers[partition].reject).toHaveBeenCalledTimes(1)
+        expect(settlers[partition].reject).toHaveBeenCalledWith(error)
+      }
+      expect(error.name).toEqual('KafkaJSNumberOfRetriesExceeded')
+      expect(error.cause.retriable).toBe(true)
+    })
+
+    test('a partition the cache does not hold gets the error it gets when no lookup fails, even beside one without a leader', async () => {
+      const { settlers, error } = await sendTo([null, -1, 1])
+
+      expect(producedTo(1)).toEqual([[2]])
+      expect(settlers[2].resolve).toHaveBeenCalledTimes(1)
+      for (const partition of [0, 1]) {
+        expect(settlers[partition].reject).toHaveBeenCalledWith(error)
+      }
+      expect(error.cause).toMatchObject({
+        name: 'KafkaJSMetadataNotLoaded',
+        message: 'Producing to a partition without metadata',
+        retriable: true,
+      })
+    })
+
+    test('a partition the cache does not hold is rejected with that error when no lookup fails', async () => {
+      const { settlers, error } = await sendTo([1, 1, null])
+
+      expect(producedTo(1)).toEqual([[0, 1]])
+      expect(settlers[2].reject).toHaveBeenCalledWith(error)
+      expect(error.cause).toMatchObject({
+        name: 'KafkaJSMetadataNotLoaded',
+        message: 'Producing to a partition without metadata',
+      })
     })
   })
 })

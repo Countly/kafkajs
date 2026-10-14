@@ -223,6 +223,33 @@ describe('Instrumentation > where the events are emitted', () => {
         },
       ])
     })
+
+    it('emits the offsets a caller commits as given, with no leaderEpoch added', async () => {
+      const recorder = createRecorder()
+      const offsetManager = new OffsetManager({
+        cluster: {
+          committedOffsets: jest.fn(() => ({})),
+          refreshMetadata: jest.fn(() => ({})),
+          findGroupCoordinator: jest.fn(async () => ({ isConnected: () => true, nodeId: 2 })),
+        },
+        memberAssignment: { 'committed-topic': [0] },
+        groupId: 'commit-group',
+        generationId: 3,
+        memberId: 'member-1',
+        groupInstanceId: null,
+        instrumentationEmitter: recorder,
+      })
+      offsetManager.getCoordinator = jest.fn(() => ({ offsetCommit: jest.fn() }))
+      const topics = [{ topic: 'committed-topic', partitions: [{ partition: 0, offset: '5' }] }]
+
+      await offsetManager.commitOffsets({ topics })
+
+      const [commit] = named(recorder, 'consumer.commit_offsets')
+      expect(commit.payload.topics).toStrictEqual([
+        { topic: 'committed-topic', partitions: [{ partition: 0, offset: '5' }] },
+      ])
+      expect(commit.payload.topics[0].partitions[0]).not.toHaveProperty('leaderEpoch')
+    })
   })
   describe('the runner', () => {
     const TOPIC = 'runner-topic'

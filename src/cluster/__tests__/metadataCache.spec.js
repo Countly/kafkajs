@@ -218,6 +218,37 @@ describe('Cluster > MetadataCache', () => {
     expect(cache.leaderEpoch('test-topic', 0)).toEqual(9)
   })
 
+  describe('a leaderless partition', () => {
+    test('defends its epoch: an older response does not give it the previous leader back', () => {
+      cache.update(response({ leader: -1, leaderEpoch: 10 }))
+      const stale = response({ leader: 1, leaderEpoch: 4 })
+      cache.update(stale)
+
+      expect(partition0(stale).leader).toEqual(-1)
+      expect(partition0(stale).leaderEpoch).toEqual(10)
+      expect(cache.leader('test-topic', 0)).toEqual(-1)
+      expect(cache.leaderEpoch('test-topic', 0)).toEqual(10)
+    })
+
+    test('takes a response with a newer epoch', () => {
+      cache.update(response({ leader: -1, leaderEpoch: 10 }))
+      const elected = response({ leader: 1, leaderEpoch: 11 })
+      cache.update(elected)
+
+      expect(partition0(elected).leader).toEqual(1)
+      expect(cache.leader('test-topic', 0)).toEqual(1)
+      expect(cache.leaderEpoch('test-topic', 0)).toEqual(11)
+    })
+
+    test('does not defend an epoch it does not know', () => {
+      cache.update(response({ leader: -1, leaderEpoch: -1 }))
+      cache.update(response({ leader: 1, leaderEpoch: 4 }))
+
+      expect(cache.leader('test-topic', 0)).toEqual(1)
+      expect(cache.leaderEpoch('test-topic', 0)).toEqual(4)
+    })
+  })
+
   test('an equal epoch takes the decoded value', () => {
     cache.update(response({ leader: 1, leaderEpoch: 9 }))
     const same = response({ leader: 2, leaderEpoch: 9 })

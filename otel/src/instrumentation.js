@@ -97,6 +97,21 @@ function prepareDurationHistogram(meter, value, attributes) {
 }
 
 /**
+ * Calls `call` and turns a synchronous throw into a rejected promise, so a caller that ends its
+ * spans on the outcome treats a handler that throws like one that rejects.
+ * @template T
+ * @param {() => T} call
+ * @returns {T | Promise<never>} what `call` returns, or a promise rejected with the original error
+ */
+function rejectOnThrow(call) {
+  try {
+    return call()
+  } catch (error) {
+    return Promise.reject(error)
+  }
+}
+
+/**
  * OpenTelemetry instrumentation for `@countly/kafkajs`: a span per produced message, a span per
  * consumed message (and one per batch), a span per transaction, context propagation through the
  * message headers, and the messaging metrics.
@@ -296,7 +311,9 @@ class KafkaJsInstrumentation extends InstrumentationBase {
   /**
    * @private
    * @returns {(original: Function) => Function} wraps `eachMessage`: a `process <topic>` span in
-   *   the context the message headers carry, active while the handler runs
+   *   the context the message headers carry, active while the handler runs. A handler that throws
+   *   synchronously ends the span and records its failure like a rejection, and the wrapper
+   *   returns the rejected promise
    */
   _getConsumerEachMessagePatch() {
     const instrumentation = this
@@ -333,9 +350,9 @@ class KafkaJsInstrumentation extends InstrumentationBase {
           }),
         ]
 
-        const eachMessagePromise = context.with(trace.setSpan(propagatedContext, span), () => {
-          return original.apply(this, args)
-        })
+        const eachMessagePromise = rejectOnThrow(() =>
+          context.with(trace.setSpan(propagatedContext, span), () => original.apply(this, args))
+        )
         return instrumentation._endSpansOnPromise([span], pendingMetrics, eachMessagePromise)
       }
     }
@@ -345,7 +362,8 @@ class KafkaJsInstrumentation extends InstrumentationBase {
    * @private
    * @returns {(original: Function) => Function} wraps `eachBatch`: a `poll <topic>` span that
    *   starts a new trace, with one `process <topic>` span per message under it, each linked to the
-   *   producer span its headers carry
+   *   producer span its headers carry. A handler that throws synchronously ends every span and
+   *   records its failure like a rejection, and the wrapper returns the rejected promise
    */
   _getConsumerEachBatchPatch() {
     return (original) => {
@@ -365,7 +383,7 @@ class KafkaJsInstrumentation extends InstrumentationBase {
         })
         return context.with(trace.setSpan(context.active(), receivingSpan), () => {
           const startTime = Date.now()
-          const spans = []
+          const spans = [receivingSpan]
           const pendingMetrics = [
             prepareCounter(instrumentation._consumedMessages, payload.batch.messages.length, {
               [ATTR_MESSAGING_SYSTEM]: MESSAGING_SYSTEM_VALUE_KAFKA,
@@ -407,8 +425,7 @@ class KafkaJsInstrumentation extends InstrumentationBase {
               })
             )
           })
-          const batchMessagePromise = original.apply(this, args)
-          spans.unshift(receivingSpan)
+          const batchMessagePromise = rejectOnThrow(() => original.apply(this, args))
           return instrumentation._endSpansOnPromise(spans, pendingMetrics, batchMessagePromise)
         })
       }
@@ -571,7 +588,8 @@ class KafkaJsInstrumentation extends InstrumentationBase {
   /**
    * Ends the spans and records the metrics once the operation settles. A rejection sets every
    * span's status to ERROR with the reason's message and `error.type` to the reason's class name
-   * (`_OTHER` for a reason that is not an object with a `message`), and is passed on unchanged.
+   * (`_OTHER` for a reason that is `null`, has no `message` or has no constructor name), and is
+   * passed on unchanged.
    * @private
    * @template T
    * @param {import('@opentelemetry/api').Span[]} spans
@@ -592,10 +610,11 @@ class KafkaJsInstrumentation extends InstrumentationBase {
           errorMessage = reason
         } else if (
           typeof reason === 'object' &&
+          reason !== null &&
           Object.prototype.hasOwnProperty.call(reason, 'message')
         ) {
           errorMessage = reason.message
-          errorType = reason.constructor.name
+          errorType = reason.constructor?.name || errorType
         }
         pendingMetrics.forEach((m) => m(errorType))
 

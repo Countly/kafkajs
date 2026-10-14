@@ -305,6 +305,137 @@ describe('Producer > KIP-951 leader hint', () => {
     expect(pool.createBroker).not.toHaveBeenCalled()
   })
 
+  describe('a broker that moves while requests are outstanding on it', () => {
+    const MOVED = [{ nodeId: 2, host: '127.0.0.2', port: 9095, rack: null }]
+    const MOVED_SEED = [{ nodeId: 1, host: '127.0.0.5', port: 9199, rack: 'rack-c' }]
+    const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
+    /** Whether `promise` settles within a short wait. */
+    const settlesSoon = (promise) =>
+      Promise.race([
+        promise.then(
+          () => true,
+          () => true
+        ),
+        wait(30).then(() => false),
+      ])
+    /** A promise that stays pending until `release()`, standing for a request still on the wire. */
+    const outstandingRequest = () => {
+      let release
+      const settled = new Promise((resolve) => (release = resolve))
+      return { settled, release }
+    }
+
+    test('the hint is applied without waiting for them, and the old broker closes once they settle', async () => {
+      const { cluster, brokers } = createHintCluster({ answer: acceptAll })
+      const pool = cluster.brokerPool
+      const old = brokers[2]
+      const { settled, release } = outstandingRequest()
+      let closed = false
+      old.disconnect.mockImplementation(async () => {
+        await settled
+        closed = true
+      })
+
+      const applying = pool.applyNodeEndpoints(MOVED)
+
+      await expect(settlesSoon(applying)).resolves.toBe(true)
+      expect(pool.brokers[2]).not.toBe(old)
+      expect(old.disconnect).toHaveBeenCalledTimes(1)
+      expect(closed).toBe(false)
+
+      release()
+      await wait(10)
+      expect(closed).toBe(true)
+    })
+
+    test('a moved seed swaps its pool without waiting for the old pool to drain', async () => {
+      const { cluster, brokers } = createHintCluster({ answer: acceptAll })
+      const pool = cluster.brokerPool
+      const seed = brokers[1]
+      pool.seedBroker = seed
+      const oldConnectionPool = seed.connectionPool
+      const { settled, release } = outstandingRequest()
+      oldConnectionPool.destroy.mockImplementation(() => settled)
+
+      const applying = pool.applyNodeEndpoints(MOVED_SEED)
+
+      await expect(settlesSoon(applying)).resolves.toBe(true)
+      expect(seed.connectionPool).toMatchObject({ host: '127.0.0.5', port: 9199 })
+      expect(oldConnectionPool.destroy).toHaveBeenCalledTimes(1)
+      release()
+    })
+
+    test.each([
+      ['broker', MOVED, (brokers) => brokers[2].disconnect],
+      ['seed pool', MOVED_SEED, (brokers) => brokers[1].connectionPool.destroy],
+    ])(
+      'a %s whose close rejects is logged and does not fail the hint',
+      async (_, endpoints, closer) => {
+        const { cluster, brokers } = createHintCluster({ answer: acceptAll })
+        const pool = cluster.brokerPool
+        pool.seedBroker = brokers[1]
+        const warn = jest.spyOn(pool.logger, 'warn')
+        closer(brokers).mockRejectedValue(new Error('close failed'))
+
+        await expect(pool.applyNodeEndpoints(endpoints)).resolves.toBeUndefined()
+        await wait(10)
+
+        expect(warn).toHaveBeenCalledTimes(1)
+        expect(warn).toHaveBeenCalledWith(expect.any(String), { error: 'close failed' })
+      }
+    )
+  })
+
+  describe('a seed broker whose address moves while its new pool is being built', () => {
+    /**
+     * Starts a hint that moves the seed and holds it at the pool build; `finish()` lets the build
+     * return.
+     */
+    const startMovingSeed = () => {
+      const { cluster, brokers } = createHintCluster({ answer: acceptAll })
+      const pool = cluster.brokerPool
+      const seed = brokers[1]
+      pool.seedBroker = seed
+      const oldConnectionPool = seed.connectionPool
+      const built = { host: '127.0.0.5', port: 9199, rack: null, destroy: jest.fn(async () => {}) }
+      let finish
+      pool.buildConnectionPool = jest.fn(
+        () => new Promise((resolve) => (finish = () => resolve(built)))
+      )
+      const applying = pool.applyNodeEndpoints([
+        { nodeId: 1, host: '127.0.0.5', port: 9199, rack: null },
+      ])
+      return { pool, seed, oldConnectionPool, built, applying, finish: () => finish() }
+    }
+
+    test.each([
+      ['another seed broker takes its place', (pool, other) => (pool.seedBroker = other)],
+      ['its node id now holds another broker', (pool, other) => (pool.brokers[1] = other)],
+    ])('the new pool is destroyed and nothing is replaced when %s', async (_, replace) => {
+      const { pool, seed, oldConnectionPool, built, applying, finish } = startMovingSeed()
+      const other = { nodeId: 1, connectionPool: { host: '10.1.1.1', port: 9099 } }
+      replace(pool, other)
+
+      finish()
+      await applying
+
+      expect(built.destroy).toHaveBeenCalledTimes(1)
+      expect(seed.connectionPool).toBe(oldConnectionPool)
+      expect(oldConnectionPool.destroy).not.toHaveBeenCalled()
+      expect(other.connectionPool).toEqual({ host: '10.1.1.1', port: 9099 })
+    })
+
+    test('the new pool is installed when nothing changed meanwhile', async () => {
+      const { seed, built, applying, finish } = startMovingSeed()
+
+      finish()
+      await applying
+
+      expect(seed.connectionPool).toBe(built)
+      expect(built.destroy).not.toHaveBeenCalled()
+    })
+  })
+
   test('applyNodeEndpoints runs before the cache write - no window where routing names a node with no Broker', async () => {
     const { cluster } = createHintCluster({ answer: acceptAll })
     const order = []

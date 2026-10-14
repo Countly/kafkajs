@@ -221,6 +221,13 @@ module.exports = class BrokerPool {
    * metadata refresh path uses, `versions` included, so the request the hint is trying to make
    * fast does not pay a fresh ApiVersions round trip. A new rack alone is written in place.
    *
+   * The old broker is disconnected **in the background**: closing it waits for the requests still
+   * on its socket (up to `requestTimeout`, unbounded with `enforceRequestTimeout: false`), and a
+   * send awaits every hint before it drains any broker, so one moved broker would hold back all
+   * the others. Those requests still finish or time out on the old socket; nothing is written
+   * twice. Nothing else reaches the old broker once it is out of the table, so a failed close is
+   * only logged.
+   *
    * An unknown node id at the seed broker's address adopts the seed, as `refreshMetadata`'s reduce
    * does, so the seed's address is not connected twice; a seed the table already holds under
    * another id is never adopted again. `Cluster#findGroupCoordinator` adds a coordinator it
@@ -241,9 +248,10 @@ module.exports = class BrokerPool {
    *   endpoint is skipped.
    * - **A world that moved on underneath one `await`.** Between reading the current broker and the
    *   built replacement pool becoming ready, a concurrent rebootstrap/disconnect can empty
-   *   `this.brokers`, or a second hint for the same node id can already have written its own
-   *   replacement. The table is re-checked before writing; on a mismatch the freshly built pool -
-   *   never handed to a `Broker` - is closed instead of overwriting whatever is there now.
+   *   `this.brokers` or install another seed, or a second hint for the same node id can already
+   *   have written its own replacement. The table (and, for the seed, `this.seedBroker`) is
+   *   re-checked before writing; on a mismatch the freshly built pool - never handed to a
+   *   `Broker` - is closed instead of overwriting whatever is there now.
    *
    * Adding an unknown node id is allowed; removing one is not - only a metadata response may
    * shrink the broker table.
@@ -257,8 +265,6 @@ module.exports = class BrokerPool {
     if (!nodeEndpoints || nodeEndpoints.length === 0) {
       return
     }
-
-    const replaced = []
 
     for (const { nodeId, host, port, rack } of nodeEndpoints) {
       if (!host || !Number.isInteger(port) || port <= 0) {
@@ -284,30 +290,43 @@ module.exports = class BrokerPool {
         continue
       }
 
-      if (broker && broker === this.seedBroker) {
-        const oldConnectionPool = broker.connectionPool
-        broker.replaceConnectionPool(await this.buildConnectionPool({ host, port, rack }))
-        await oldConnectionPool.destroy()
-        continue
-      }
-
+      const isSeed = broker !== undefined && broker === this.seedBroker
       const connectionPool = await this.buildConnectionPool({ host, port, rack })
 
-      if (this.brokers[nodeId] !== broker) {
+      if (this.brokers[nodeId] !== broker || (isSeed && this.seedBroker !== broker)) {
         await connectionPool.destroy()
         continue
       }
 
-      broker && replaced.push(broker)
+      if (isSeed) {
+        const oldConnectionPool = broker.connectionPool
+        broker.replaceConnectionPool(connectionPool)
+        this.closeInBackground(oldConnectionPool.destroy())
+        continue
+      }
+
       this.brokers[nodeId] = this.createBroker({
         logger: this.rootLogger,
         versions: this.versions,
         connectionPool,
         nodeId,
       })
+      broker && this.closeInBackground(broker.disconnect())
     }
+  }
 
-    await Promise.all(replaced.map((broker) => broker.disconnect()))
+  /**
+   * Lets a replaced broker, or the pool it replaced, finish closing without holding the caller
+   * back. A failed close is logged: the closed object is no longer in the table.
+   *
+   * @private
+   * @param {Promise<void>} closing
+   * @returns {void}
+   */
+  closeInBackground(closing) {
+    closing.catch((error) =>
+      this.logger.warn('Closing a replaced broker connection failed', { error: error.message })
+    )
   }
 
   /**
