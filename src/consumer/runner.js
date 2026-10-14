@@ -66,8 +66,10 @@ module.exports = class Runner extends EventEmitter {
     this.eachMessage = eachMessage
     this.heartbeatInterval = heartbeatInterval
     // The fetch loop is one retrier call for as long as the consumer runs, so a total-time
-    // deadline would crash it on the first failure after that time.
-    this.retrier = createRetry(Object.assign({}, retry, { maxTotalTime: undefined }))
+    // deadline would crash it on the first failure after that time. Every other retried
+    // operation of the runner keeps the deadline.
+    this.fetchRetrier = createRetry(Object.assign({}, retry, { maxTotalTime: undefined }))
+    this.commitRetrier = createRetry(Object.assign({}, retry))
     this.onCrash = onCrash
     this.autoCommit = autoCommit
     this.maxPrefetchBatches = maxPrefetchBatches
@@ -222,7 +224,7 @@ module.exports = class Runner extends EventEmitter {
 
     this.consuming = true
 
-    this.retrier(async (bail, retryCount, retryTime) => {
+    this.fetchRetrier(async (bail, retryCount, retryTime) => {
       if (!this.running) {
         return
       }
@@ -1057,6 +1059,14 @@ module.exports = class Runner extends EventEmitter {
     }
   }
 
+  /**
+   * Commits the given offsets for `consumer.commitOffsets()`, retrying through the commit retrier:
+   * unlike the fetch loop's, it keeps the client's `retry.maxTotalTime`, so it rejects with
+   * `KafkaJSDeliveryTimeout` once the deadline passes.
+   * @param {Object} offsets the offsets to commit
+   * @returns {Promise<void>} resolves at once, committing nothing, when the runner is not running
+   * @throws {import('../errors').KafkaJSDeliveryTimeout|import('../errors').KafkaJSNumberOfRetriesExceeded|Error}
+   */
   commitOffsets(offsets) {
     if (!this.running) {
       this.logger.debug('consumer not running, exiting', {
@@ -1067,7 +1077,7 @@ module.exports = class Runner extends EventEmitter {
       return
     }
 
-    return this.retrier(async (bail, retryCount, retryTime) => {
+    return this.commitRetrier(async (bail, retryCount, retryTime) => {
       try {
         await this.consumerGroup.commitOffsets(offsets)
       } catch (e) {

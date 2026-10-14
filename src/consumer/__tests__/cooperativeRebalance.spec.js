@@ -37,6 +37,7 @@ const createGroup = ({
     refreshMetadata: jest.fn(async () => {}),
     refreshMetadataIfNecessary: jest.fn(async () => {}),
     committedOffsets: () => committedOffsets,
+    topicId: () => undefined,
     findTopicPartitionMetadata: (topic) => (topics.includes(topic) ? partitionMetadata(4) : []),
     findGroupCoordinator: jest.fn(async () => ({ isConnected: () => true })),
   }

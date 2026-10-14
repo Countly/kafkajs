@@ -10,6 +10,7 @@ const { newLogger } = require('testHelpers')
 const UNSTABLE_OFFSET_COMMIT = 88
 const STALE_MEMBER_EPOCH = 113
 const COORDINATOR_LOAD_IN_PROGRESS = 14
+const REBALANCE_IN_PROGRESS = 27
 const TOPIC = 'topic-a'
 const GROUP_ID = 'group-a'
 
@@ -410,6 +411,13 @@ describe('Consumer > ConsumerGroup > the stable-offset wait wiring', () => {
     expect(offsetManager.isRebalancePending()).toBe(false)
 
     group.rebalanceCoordinator.verdict = { kind: 'lost' }
+    expect(offsetManager.isRebalancePending()).toBe(true)
+
+    group.rebalanceCoordinator.verdict = {
+      kind: 'revoked',
+      reason: 'rebalance-in-progress',
+      error: protocolError(REBALANCE_IN_PROGRESS),
+    }
     expect(offsetManager.isRebalancePending()).toBe(true)
     expect(offsetManager.isStopping()).toBe(false)
     expect(group.isStopping()).toBe(false)

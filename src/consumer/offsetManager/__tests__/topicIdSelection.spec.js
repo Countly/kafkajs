@@ -1,6 +1,8 @@
 const OffsetManager = require('../index')
 const createAdmin = require('../../../admin')
 const InstrumentationEventEmitter = require('../../../instrumentation/emitter')
+const Encoder = require('../../../protocol/encoder')
+const OffsetFetch = require('../../../protocol/requests/offsetFetch')
 const { createGroupApiBroker } = require('../../../broker/__tests__/fixtures/groupApiHarness')
 const { createErrorFromCode } = require('../../../protocol/error')
 const apiKeys = require('../../../protocol/requests/apiKeys')
@@ -293,5 +295,228 @@ describe('Admin > offset reads', () => {
       [{ topic: TOPIC, partitions: [{ partition: 0 }] }],
       [],
     ])
+  })
+})
+
+describe('Consumer > OffsetManager > resolveOffsets across a topic recreation', () => {
+  const OLD_ID = TOPIC_ID
+  const NEW_ID = OTHER_ID
+  const flush = () => new Promise(setImmediate)
+
+  /** The OffsetFetch v10 answer for partition 0 of one topic id, as the broker puts it on the wire. */
+  const wireAnswer = (topicId, offset) =>
+    new Encoder()
+      .writeInt32(0)
+      .writeUVarIntArray([
+        new Encoder()
+          .writeUVarIntString('test-group')
+          .writeUVarIntArray([
+            new Encoder()
+              .writeUuid(topicId)
+              .writeUVarIntArray([
+                new Encoder()
+                  .writeInt32(0)
+                  .writeInt64(offset)
+                  .writeInt32(-1)
+                  .writeUVarIntString(null)
+                  .writeInt16(0)
+                  .writeTaggedFields(),
+              ])
+              .writeTaggedFields(),
+          ])
+          .writeInt16(0)
+          .writeTaggedFields(),
+      ])
+      .writeTaggedFields().buffer
+
+  /** The OffsetFetch answer for partition 0 of a request sent by topic name, already decoded. */
+  const namedAnswer = (offset) => ({
+    responses: [
+      {
+        topic: TOPIC,
+        partitions: [
+          { partition: 0, offset, committedLeaderEpoch: -1, metadata: null, errorCode: 0 },
+        ],
+      },
+    ],
+  })
+
+  /**
+   * A consumer-protocol manager over one partition. Its coordinator holds every OffsetFetch until a
+   * case answers it with `requests[i].answer(offset)`: through the real v10 codec when the request
+   * carried a topic id, as an answer by name when it did not.
+   * @param {string|undefined} initialId the topic id the metadata cache holds, or none
+   * @param {string} [listOffset] what ListOffsets answers
+   */
+  const build = (initialId, listOffset = '0') => {
+    const state = { id: initialId }
+    const requests = []
+    const pending = new Map()
+    const committed = {}
+    const cluster = {
+      committedOffsets: () => committed,
+      topicId: () => state.id,
+      fetchTopicsOffset: jest.fn(async () => [
+        { topic: TOPIC, partitions: [{ partition: 0, offset: listOffset }] },
+      ]),
+    }
+    const coordinator = {
+      isConnected: () => true,
+      offsetFetch: (request) =>
+        new Promise((resolve, reject) => {
+          const { topicId } = request.topics[0]
+          const answer = (offset) => {
+            if (topicId === undefined) {
+              return resolve(namedAnswer(offset))
+            }
+
+            const { response } = OffsetFetch.protocol({ version: 10 })({
+              ...request,
+              topicIds: new Map([[TOPIC, topicId]]),
+            })
+            response.decode(wireAnswer(topicId, offset)).then(response.parse).then(resolve, reject)
+          }
+
+          requests.push({ topicId, answer })
+        }),
+    }
+    const manager = new OffsetManager({
+      cluster,
+      coordinator,
+      memberAssignment: { [TOPIC]: [0] },
+      autoCommit: false,
+      autoCommitInterval: null,
+      autoCommitThreshold: null,
+      topicConfigurations: { [TOPIC]: { fromBeginning: true } },
+      instrumentationEmitter: new InstrumentationEventEmitter(),
+      groupId: 'test-group',
+      generationId: 1,
+      memberId: 'member-a',
+      membershipProtocol: 'consumer',
+      pendingTopicResets: pending,
+      logger: newLogger(),
+    })
+    const recreate = (id) => {
+      state.id = id
+      pending.set(TOPIC, id)
+      manager.resetOffsetsForTopic(TOPIC)
+    }
+
+    return { manager, requests, pending, committed, cluster, recreate }
+  }
+
+  test('an OffsetFetch answer for the old incarnation, landing after the new one resolved, does not move its position', async () => {
+    const { manager, requests, pending, committed, recreate } = build(OLD_ID)
+    const stale = manager.resolveOffsets()
+    await flush()
+
+    recreate(NEW_ID)
+    const fresh = manager.resolveOffsets()
+    await flush()
+    expect(requests.map(({ topicId }) => topicId)).toEqual([OLD_ID, NEW_ID])
+    requests[1].answer('77')
+    await fresh
+    expect(committed[TOPIC]).toEqual({ 0: '0' })
+    expect(pending.size).toBe(0)
+
+    requests[0].answer('99')
+    await stale
+
+    expect(committed[TOPIC]).toEqual({ 0: '0' })
+    expect(manager.nextOffset(TOPIC, 0).toString()).toEqual('0')
+  })
+
+  test('an OffsetFetch answer for the old incarnation does not consume the reset of the new one, which the next resolution applies', async () => {
+    const { manager, requests, pending, committed, cluster, recreate } = build(OLD_ID)
+    const stale = manager.resolveOffsets()
+    await flush()
+    recreate(NEW_ID)
+    requests[0].answer('99')
+    await stale
+
+    expect(committed[TOPIC]).toEqual({})
+    expect(pending.get(TOPIC)).toEqual(NEW_ID)
+    expect(cluster.fetchTopicsOffset).not.toHaveBeenCalled()
+
+    const next = manager.resolveOffsets()
+    await flush()
+    requests[1].answer('99')
+    await next
+
+    expect(committed[TOPIC]).toEqual({ 0: '0' })
+    expect(pending.size).toBe(0)
+  })
+
+  test('a ListOffsets answer for the old incarnation, landing after the recreation, is not applied', async () => {
+    const { manager, requests, pending, committed, cluster, recreate } = build(OLD_ID)
+    let releaseListOffsets
+    cluster.fetchTopicsOffset.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          releaseListOffsets = () =>
+            resolve([{ topic: TOPIC, partitions: [{ partition: 0, offset: '500' }] }])
+        })
+    )
+    const stale = manager.resolveOffsets()
+    await flush()
+    requests[0].answer('-1')
+    await flush()
+    expect(cluster.fetchTopicsOffset).toHaveBeenCalledTimes(1)
+
+    recreate(NEW_ID)
+    releaseListOffsets()
+    await stale
+
+    expect(committed[TOPIC]).toEqual({})
+    expect(pending.get(TOPIC)).toEqual(NEW_ID)
+
+    const next = manager.resolveOffsets()
+    await flush()
+    requests[1].answer('99')
+    await next
+
+    expect(committed[TOPIC]).toEqual({ 0: '0' })
+    expect(pending.size).toBe(0)
+  })
+
+  describe.each([
+    ['a known topic id', OLD_ID],
+    ['no topic id', undefined],
+  ])('with %s, unchanged across the awaits', (_, id) => {
+    test('applies the committed offset', async () => {
+      const { manager, requests, committed } = build(id)
+      const round = manager.resolveOffsets()
+      await flush()
+
+      requests[0].answer('99')
+      await round
+
+      expect(committed[TOPIC]).toEqual({ 0: '99' })
+    })
+
+    test('applies the ListOffsets answer when nothing is committed', async () => {
+      const { manager, requests, committed, cluster } = build(id, '5')
+      const round = manager.resolveOffsets()
+      await flush()
+
+      requests[0].answer('-1')
+      await round
+
+      expect(cluster.fetchTopicsOffset).toHaveBeenCalledTimes(1)
+      expect(committed[TOPIC]).toEqual({ 0: '5' })
+    })
+
+    test('still applies a pending reset', async () => {
+      const { manager, requests, pending, committed } = build(id, '5')
+      pending.set(TOPIC, OLD_ID)
+      const round = manager.resolveOffsets()
+      await flush()
+
+      requests[0].answer('99')
+      await round
+
+      expect(committed[TOPIC]).toEqual({ 0: '5' })
+      expect(pending.size).toBe(0)
+    })
   })
 })

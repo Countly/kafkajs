@@ -753,6 +753,14 @@ module.exports = class OffsetManager {
   }
 
   /**
+   * Resolves the partitions of the assignment that hold no valid offset: the group's committed
+   * offset, else the topic's own `fromBeginning` choice through ListOffsets.
+   *
+   * A reply that outlives a topic recreation is not applied. Each topic's cached id is read before
+   * the OffsetFetch, and the reply is checked against it again after the OffsetFetch and after the
+   * ListOffsets (see `dropRecreatedTopics`). A dropped topic keeps its invalid offsets, so the next
+   * resolution, which every fetch round runs, resolves it afresh.
+   *
    * @param {Set<string>} [seekedPartitions] Keys (`OffsetManager.seekedPartitionKey(topic,
    *                                partition)`) of partitions a `seek()` was just applied to,
    *                                in this same `ConsumerGroup#seekOffsets()` call. A seeked
@@ -783,7 +791,13 @@ module.exports = class OffsetManager {
       return
     }
 
-    const { responses: consumerOffsets } = await this.fetchCommittedOffsets(pendingPartitions)
+    const requestedIds = new Map(
+      pendingPartitions.map(({ topic }) => [topic, this.cluster.topicId(topic)])
+    )
+    const { responses } = await this.fetchCommittedOffsets(pendingPartitions)
+
+    // Before the drain: a stale reply must not consume the reset the new incarnation is owed.
+    const consumerOffsets = this.dropRecreatedTopics(responses, requestedIds)
 
     this.drainPendingTopicResets(consumerOffsets, seekedPartitions)
 
@@ -842,7 +856,10 @@ module.exports = class OffsetManager {
     let offsets = consumerOffsets
     if (hasUnresolvedPartitions()) {
       const topicOffsets = await this.cluster.fetchTopicsOffset(unresolvedPartitions)
-      offsets = initializeConsumerOffsets(consumerOffsets, topicOffsets)
+      offsets = this.dropRecreatedTopics(
+        initializeConsumerOffsets(consumerOffsets, topicOffsets),
+        requestedIds
+      )
     }
 
     offsets.forEach(({ topic, partitions }) => {
@@ -946,6 +963,22 @@ module.exports = class OffsetManager {
         }
       }
     }
+  }
+
+  /**
+   * Drops the entries of topics whose cached id is no longer the one they were requested under.
+   * An answer that outlived a delete and recreate describes the old topic: applying it would write
+   * the old offset over the new topic's position and, ahead of `drainPendingTopicResets`, would
+   * consume the reset the new one is owed. A topic with no known id before and after is kept.
+   *
+   * @private
+   * @param {{topic: string}[]} entries
+   * @param {Map<string, string|undefined>} requestedIds each requested topic's cached id when the
+   *   request went out
+   * @returns {{topic: string}[]} the entries still current, as a new array
+   */
+  dropRecreatedTopics(entries, requestedIds) {
+    return entries.filter(({ topic }) => this.cluster.topicId(topic) === requestedIds.get(topic))
   }
 
   /**

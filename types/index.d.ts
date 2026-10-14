@@ -359,7 +359,8 @@ export interface RetryOptions {
   /**
    * Deadline in ms for one retried operation, from its first attempt: when the wait before the
    * next attempt would end past it, the operation rejects with `KafkaJSDeliveryTimeout`. An
-   * integer from 1 to 2147483647.
+   * integer from 1 to 2147483647. The consumer's fetch loop ignores it, because the loop runs as
+   * one operation for as long as `run()` lasts; every other retried operation honours it.
    */
   maxTotalTime?: number
   restartOnFailure?: (e: Error) => Promise<boolean>

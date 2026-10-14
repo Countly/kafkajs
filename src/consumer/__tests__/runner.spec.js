@@ -7,6 +7,7 @@ const {
   KafkaJSProtocolError,
   KafkaJSNotImplemented,
   KafkaJSNumberOfRetriesExceeded,
+  KafkaJSDeliveryTimeout,
 } = require('../../errors')
 const { createErrorFromCode } = require('../../protocol/error')
 const { stampOffsetCommit } = require('../rebalanceErrorContract')
@@ -309,6 +310,22 @@ describe('Consumer > Runner', () => {
       expect(consumerGroup.commitOffsetsIfNecessary).toHaveBeenCalledTimes(0)
       expect(consumerGroup.commitOffsets.mock.calls.length).toBeGreaterThanOrEqual(1)
       expect(consumerGroup.commitOffsets).toHaveBeenCalledWith(offsets)
+    })
+
+    it('gives up with KafkaJSDeliveryTimeout once the client retry.maxTotalTime has passed', async () => {
+      const error = new Error('commit failed')
+      runner = createTestRunner({ retry: { maxTotalTime: 1, retries: 3, initialRetryTime: 5 } })
+      runner.running = true
+      consumerGroup.commitOffsets.mockImplementation(async () => {
+        await sleep(10)
+        throw error
+      })
+
+      const rejection = await runner.commitOffsets(offsets).catch((e) => e)
+
+      expect(rejection).toBeInstanceOf(KafkaJSDeliveryTimeout)
+      expect(rejection.cause).toBe(error)
+      expect(consumerGroup.commitOffsets).toHaveBeenCalledTimes(1)
     })
 
     it('should throw when group is rebalancing', async () => {

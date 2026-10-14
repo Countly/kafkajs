@@ -399,7 +399,7 @@ __Available options:__
 | factor              | Randomization factor                                                                                                    | `0.2`               |
 | multiplier          | Exponential factor                                                                                                      | `2`                 |
 | retries             | Max number of retries per call                                                                                          | `5`                 |
-| maxTotalTime        | Deadline in ms for one call, from its first attempt: when the wait before the next attempt would end past it, the call rejects with `KafkaJSDeliveryTimeout`, whose `cause` is the last attempt's error. Running out of `retries` first still rejects with `KafkaJSNumberOfRetriesExceeded`. An integer from 1 to 2147483647. A producer's `deliveryTimeout` sets it for that producer's sends | none (no deadline) |
+| maxTotalTime        | Deadline in ms for one call, from its first attempt: when the wait before the next attempt would end past it, the call rejects with `KafkaJSDeliveryTimeout`, whose `cause` is the last attempt's error. Running out of `retries` first still rejects with `KafkaJSNumberOfRetriesExceeded`. An integer from 1 to 2147483647. A producer's `deliveryTimeout` sets it for that producer's sends. The consumer's fetch loop ignores it, because the loop runs as one operation for as long as `run()` lasts; every other retried operation honours it | none (no deadline) |
 | restartOnFailure    | Only used in consumer. See [`restartOnFailure`](#restartonfailure)                                                      | none (restart on retriable errors only) |
 
 Example:
