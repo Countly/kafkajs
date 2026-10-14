@@ -221,6 +221,16 @@ describe('Producer > a commit whose outcome is unknown', () => {
     expect(broker.produce).toHaveBeenCalledTimes(1)
   })
 
+  test('then isActive() is false, yet the transaction has not ended: commit() sends its EndTxn once more', async () => {
+    const { broker, transaction } = await pendingCommit()
+
+    expect(transaction.isActive()).toBe(false)
+    await transaction.commit()
+
+    expect(broker.endTxn).toHaveBeenCalledTimes(1)
+    expect(broker.endTxn).toHaveBeenCalledWith(expect.objectContaining({ transactionResult: true }))
+  })
+
   test('the next commit() sends the same EndTxn again and, under transaction version 2, adopts the epoch it returns', async () => {
     const { broker, producer, transaction } = await pendingCommit()
     const sent = broker.endTxn.mock.calls

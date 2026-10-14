@@ -110,6 +110,37 @@ const topicIdsOf = (cluster, topics) => {
 }
 
 /**
+ * The leaders of a topic's partitions: one cluster lookup answers for them all. That lookup
+ * throws for the whole call when any partition has no leader, so after a throw each partition
+ * is looked up on its own: the ones with a leader still route, and the others come back with
+ * the error of their own lookup.
+ * @param {import("../../types").Cluster} cluster
+ * @param {string} topic
+ * @param {(string|number)[]} partitions
+ * @returns {{ leaders: { [nodeId: string]: number[] },
+ *   failed: { partition: string|number, error: Error }[] }}
+ */
+const leadersOfPartitions = (cluster, topic, partitions) => {
+  try {
+    return { leaders: cluster.findLeaderForPartitions(topic, partitions), failed: [] }
+  } catch {
+    const leaders = {}
+    const failed = []
+    for (const partition of partitions) {
+      try {
+        const own = cluster.findLeaderForPartitions(topic, [partition])
+        for (const nodeId of keys(own)) {
+          leaders[nodeId] = [...(leaders[nodeId] ?? []), ...own[nodeId]]
+        }
+      } catch (error) {
+        failed.push({ partition, error })
+      }
+    }
+    return { leaders, failed }
+  }
+}
+
+/**
  * The topic data of one Produce request: the drained batches by topic, each partition carrying
  * the sequence its batch was numbered with.
  * @param {import('./state/partitionSequencer').PartitionBatch[]} batches
@@ -751,11 +782,11 @@ class DrainLoop {
   #leadersOf(manager, ready, now) {
     const leaders = Object.create(null)
     for (const [topic, heads] of ready) {
-      let routed = {}
-      try {
-        routed = this.#cluster.findLeaderForPartitions(topic, [...heads.keys()])
-      } catch (e) {
-        this.#logger.debug(`No leaders for ${topic}: ${e.message}`)
+      const { leaders: routed, failed } = leadersOfPartitions(this.#cluster, topic, [
+        ...heads.keys(),
+      ])
+      for (const { partition, error } of failed) {
+        this.#logger.debug(`No leader for ${topic} partition ${partition}: ${error.message}`)
       }
 
       leaders[topic] = routed
@@ -1436,10 +1467,10 @@ const createSendMessages = ({
   }
 
   /**
-   * The leaders of a topic's partitions, once its metadata is loaded.
+   * The leaders of a topic's partitions, once its metadata is loaded; see `leadersOfPartitions`.
    * @param {string} topic
    * @param {string[]} partitions
-   * @returns {{ [nodeId: string]: number[] }}
+   * @returns {ReturnType<typeof leadersOfPartitions>}
    * @throws {KafkaJSMetadataNotLoaded} while the topic has no metadata
    */
   const leadersOf = (topic, partitions) => {
@@ -1450,7 +1481,7 @@ const createSendMessages = ({
       })
       throw new KafkaJSMetadataNotLoaded('Producing to topic without metadata')
     }
-    return cluster.findLeaderForPartitions(topic, partitions)
+    return leadersOfPartitions(cluster, topic, partitions)
   }
 
   /**
@@ -1602,14 +1633,18 @@ const createSendMessages = ({
           /** @type {Map<object, { topic: string, partitions: number[], batches: object }[]>} */
           const perBroker = new Map()
           for (const topic of topics) {
-            let partitionsPerLeader
+            let lookup
             try {
-              partitionsPerLeader = leadersOf(topic, keys(byTopic[topic]))
+              lookup = leadersOf(topic, keys(byTopic[topic]))
             } catch (e) {
               leave(Object.values(byTopic[topic]), e)
               continue
             }
 
+            const { leaders: partitionsPerLeader, failed } = lookup
+            for (const { partition, error } of failed) {
+              leave([byTopic[topic][partition]], error)
+            }
             for (const nodeId of keys(partitionsPerLeader)) {
               const partitions = partitionsPerLeader[nodeId]
               let broker

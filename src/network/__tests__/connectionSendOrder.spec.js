@@ -65,6 +65,10 @@ const produceRequest = (partitions) =>
   })
 
 describe('Network > Connection > send order', () => {
+  beforeEach(() => {
+    SASLAuthenticator.mockReset()
+  })
+
   test('requests reach the socket in the order send() was called, whatever they take to encode', async () => {
     const { connection, state } = await connectedConnection()
     const larger = produceRequest([0, 1, 2, 3])

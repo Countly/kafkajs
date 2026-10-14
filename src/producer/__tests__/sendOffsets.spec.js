@@ -233,6 +233,10 @@ describe('Producer > transaction.sendOffsets', () => {
     expect(error).toBeInstanceOf(KafkaJSTransactionAbortableError)
     expect(error.cause).toBeInstanceOf(KafkaJSNumberOfRetriesExceeded)
     await expect(transaction.commit()).rejects.toBe(error)
+    await expect(transaction.abort()).resolves.toBeUndefined()
+    expect(broker.endTxn).toHaveBeenCalledWith(
+      expect.objectContaining({ transactionResult: false })
+    )
   })
 
   test('an offset the client cannot encode makes the transaction abort-only, and abort() recovers the producer', async () => {

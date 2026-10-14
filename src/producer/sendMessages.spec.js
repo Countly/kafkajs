@@ -1,9 +1,10 @@
 jest.mock('./groupMessagesPerPartition')
 const { newLogger } = require('testHelpers')
 const { errorCodes, createErrorFromCode } = require('../protocol/error')
-const { KafkaJSConnectionClosedError } = require('../errors')
+const { KafkaJSConnectionClosedError, KafkaJSNumberOfRetriesExceeded } = require('../errors')
 const { partitionResults } = require('../protocol/requests/produce/partitionResults')
 const retry = require('../retry')
+const Cluster = require('../cluster')
 const createSendMessages = require('./sendMessages')
 
 /**
@@ -479,5 +480,101 @@ describe('Producer > sendMessages', () => {
     const error = await send({ topicMessages: [{ topic, messages }] }).catch((e) => e)
 
     expect(error.recordErrors).toEqual([{ batchIndex: 0, errorMessage: 'record too large' }])
+  })
+
+  describe('a partition without a leader among partitions that have one', () => {
+    const FAST_RETRY = {
+      retries: 1,
+      initialRetryTime: 1,
+      maxRetryTime: 1,
+      factor: 0,
+      multiplier: 1,
+    }
+
+    /**
+     * One send of a batch per partition, each settling on its own settler, through the real
+     * `Cluster` lookups, which throw for a negative leader.
+     * @param {(number|undefined)[]} leaders the leader of partition `n` is `leaders[n]`
+     */
+    const sendTo = async (leaders) => {
+      const metadataCache = {
+        brokerPool: {
+          metadata: {
+            topicMetadata: [
+              {
+                topic,
+                partitionMetadata: leaders.map((leader, partitionId) => ({ partitionId, leader })),
+              },
+            ],
+          },
+        },
+      }
+      metadataCache.findTopicPartitionMetadata =
+        Cluster.prototype.findTopicPartitionMetadata.bind(metadataCache)
+      cluster.findTopicPartitionMetadata = metadataCache.findTopicPartitionMetadata
+      cluster.findLeaderForPartitions =
+        Cluster.prototype.findLeaderForPartitions.bind(metadataCache)
+      const settlers = leaders.map(() => ({ resolve: jest.fn(), reject: jest.fn() }))
+
+      const error = await createSendMessages({
+        retrier: retry(FAST_RETRY),
+        logger: newLogger(),
+        cluster,
+        partitioner,
+        eosManager,
+      })
+        .sendPartitioned({
+          acks: -1,
+          timeout: 30000,
+          batches: settlers.map((settler, partition) => ({
+            topic,
+            partition,
+            messages: [{ value: `v-${partition}` }],
+            settlers: [settler],
+          })),
+        })
+        .catch((e) => e)
+      return { settlers, error }
+    }
+
+    /** The partitions each Produce request to `nodeId` carried. */
+    const producedTo = (nodeId) =>
+      brokers[nodeId].produce.mock.calls.map(([{ topicData }]) =>
+        topicData.flatMap(({ partitions }) => partitions.map(({ partition }) => partition))
+      )
+
+    test('the partitions with a leader are produced once and the one without is rejected alone', async () => {
+      const { settlers, error } = await sendTo([1, -1, 1])
+
+      expect(producedTo(1)).toEqual([[0, 2]])
+      for (const partition of [0, 2]) {
+        expect(settlers[partition].resolve).toHaveBeenCalledWith(okMetadata(topic, partition))
+        expect(settlers[partition].reject).not.toHaveBeenCalled()
+      }
+      expect(settlers[1].resolve).not.toHaveBeenCalled()
+      expect(settlers[1].reject).toHaveBeenCalledTimes(1)
+      expect(error).toBeInstanceOf(KafkaJSNumberOfRetriesExceeded)
+      expect(error.cause).toMatchObject({ type: 'LEADER_NOT_AVAILABLE' })
+    })
+
+    test('every partition of the topic without a leader is rejected and none is produced', async () => {
+      const { settlers } = await sendTo([-1, -1])
+
+      expect(brokers[1].produce).not.toHaveBeenCalled()
+      settlers.forEach(({ resolve, reject }) => {
+        expect(resolve).not.toHaveBeenCalled()
+        expect(reject).toHaveBeenCalledTimes(1)
+        expect(reject.mock.calls[0][0].cause).toMatchObject({ type: 'LEADER_NOT_AVAILABLE' })
+      })
+    })
+
+    test('a partition whose metadata is invalid is rejected alone, as non-retriable', async () => {
+      const { settlers, error } = await sendTo([1, undefined])
+
+      expect(producedTo(1)).toEqual([[0]])
+      expect(settlers[0].resolve).toHaveBeenCalledTimes(1)
+      expect(settlers[1].reject).toHaveBeenCalledWith(error)
+      expect(error.message).toEqual('Invalid partition metadata')
+    })
   })
 })

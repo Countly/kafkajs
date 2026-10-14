@@ -1,5 +1,5 @@
 const createFetchManager = require('../fetchManager')
-const { newLogger } = require('testHelpers')
+const { newLogger, waitFor } = require('testHelpers')
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
 
@@ -50,11 +50,15 @@ describe('Consumer > FetchManager stop', () => {
     })
 
     const started = manager.start()
-    // Long enough for the KafkaJSFetcherRebalanceError to fire and the loop to re-create.
-    await sleep(80)
-
+    // Wait for the KafkaJSFetcherRebalanceError to fire and the loop to re-create. The deadline
+    // only bounds a regression: a manager that never re-creates times out instead of hanging.
     // The negative control a single shared latch would fail: fetching continued after the
     // internal teardown, with a fetcher per node of the NEW pool.
+    await waitFor(() => manager.getFetchers().length === 3, {
+      ignoreTimeout: false,
+      maxWait: 5000,
+      timeoutMessage: 'fetchers were not re-created for the new broker pool',
+    })
     expect(manager.getFetchers()).toHaveLength(3)
     expect(seen.length).toBeGreaterThan(1)
 

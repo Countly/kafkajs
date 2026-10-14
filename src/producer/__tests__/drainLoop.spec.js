@@ -4,6 +4,7 @@ const createProducer = require('../index')
 const Idempotence = require('../idempotence')
 const createRetry = require('../../retry')
 const Broker = require('../../broker')
+const Cluster = require('../../cluster')
 const Connection = require('../../network/connection')
 const { lookup } = require('../../protocol/requests')
 const { responseHeaderVersion } = require('../../protocol/headers')
@@ -524,6 +525,23 @@ const createHarness = ({
       status = next
     },
   }
+}
+
+/**
+ * Points `cluster` at the real `Cluster` lookups over one topic's metadata, so a partition whose
+ * leader is negative makes the lookup throw as it does in production.
+ * @param {object} cluster the harness's cluster
+ * @param {string} topic
+ * @param {{ partitionId: number, leader: number }[]} partitionMetadata
+ */
+const useClusterLookups = (cluster, topic, partitionMetadata) => {
+  const metadataCache = {
+    brokerPool: { metadata: { topicMetadata: [{ topic, partitionMetadata }] } },
+  }
+  metadataCache.findTopicPartitionMetadata =
+    Cluster.prototype.findTopicPartitionMetadata.bind(metadataCache)
+  cluster.findTopicPartitionMetadata = metadataCache.findTopicPartitionMetadata
+  cluster.findLeaderForPartitions = Cluster.prototype.findLeaderForPartitions.bind(metadataCache)
 }
 
 describe('Producer > the idempotent drain loop', () => {
@@ -1488,6 +1506,71 @@ describe('Producer > the idempotent drain loop', () => {
       expect(harness.manager.sequencer.entry(TOPIC, 0)).toBeNull()
       expect(harness.manager.sequencer.entry(OTHER_TOPIC, 0)).toBeNull()
       expect(jest.getTimerCount()).toBe(0)
+    })
+
+    describe('a partition without a leader among partitions that have one', () => {
+      /**
+       * One send of a batch per partition, each settling on its own settler, to a topic whose
+       * partition `n` has leader `leaders[n]`.
+       * @param {number[]} leaders
+       */
+      const sendTo = async (leaders) => {
+        const harness = createHarness()
+        useClusterLookups(
+          harness.cluster,
+          TOPIC,
+          leaders.map((leader, partitionId) => ({ partitionId, leader }))
+        )
+        await harness.start()
+        jest.useFakeTimers({ now: 0 })
+        const settlers = leaders.map(() => ({ resolve: jest.fn(), reject: jest.fn() }))
+
+        const sending = harness.sendMessages
+          .sendPartitioned({
+            acks: -1,
+            timeout: 30000,
+            compression: 0,
+            batches: settlers.map((settler, partition) => ({
+              topic: TOPIC,
+              partition,
+              messages: records(partition),
+              settlers: [settler],
+            })),
+          })
+          .catch((e) => e)
+        await jest.advanceTimersByTimeAsync(1000)
+        return { harness, settlers, error: await sending }
+      }
+
+      test('the partitions with a leader are produced and the one without is rejected alone, naming itself', async () => {
+        const { harness, settlers, error } = await sendTo([1, -1, 1])
+
+        expect(harness.sent()).toEqual([
+          { nodeId: 1, epoch: 0, partitions: ['topic-a/0@0', 'topic-a/2@0'] },
+        ])
+        for (const partition of [0, 2]) {
+          expect(settlers[partition].resolve).toHaveBeenCalledTimes(1)
+          expect(settlers[partition].reject).not.toHaveBeenCalled()
+        }
+        expect(settlers[1].resolve).not.toHaveBeenCalled()
+        expect(settlers[1].reject).toHaveBeenCalledTimes(1)
+        expect(error).toBeInstanceOf(KafkaJSNumberOfRetriesExceeded)
+        expect(error.cause.message).toEqual('No leader for topic-a partition 1')
+        expect(error.retryCount).toBe(RETRY.retries)
+      })
+
+      test('every partition of the topic without a leader is rejected, each naming itself', async () => {
+        const { harness, settlers } = await sendTo([-1, -1])
+
+        expect(harness.produced).toEqual([])
+        settlers.forEach(({ resolve }) => expect(resolve).not.toHaveBeenCalled())
+        settlers.forEach(({ reject }, partition) => {
+          expect(reject).toHaveBeenCalledTimes(1)
+          expect(reject.mock.calls[0][0].cause.message).toEqual(
+            `No leader for topic-a partition ${partition}`
+          )
+        })
+      })
     })
   })
 

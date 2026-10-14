@@ -176,7 +176,7 @@ With `useDescribeTopicPartitions: true` and at least one topic name, the topics 
 - Each partition also carries `eligibleLeaderReplicas` and `lastKnownElr`. They are `null` when the cluster does not track eligible leader replicas, `[]` when it does and none are eligible, and broker ids otherwise; accept all three. (Eligible leader replicas are off by default on Kafka 4.0 and on by default for new clusters from Kafka 4.1.)
 - A partition without a leader is returned with `leader: -1`. Kafka 4.1.2 and 4.3 brokers leave its `partitionErrorCode` at 0 (a Metadata answer sets `LEADER_NOT_AVAILABLE`, 5), so check `leader` to find it; a non-zero `partitionErrorCode` is passed through when a broker sends one. Unlike a Metadata request for named topics, this path does not wait for leaders.
 - A topic that does not exist, or that you may not describe, fails the call with that topic's error once every page has been read; when several fail, the first in name order is thrown. DescribeTopicPartitions never creates a topic. A Metadata request may, when the cluster allows automatic topic creation and `allowAutoTopicCreation` is on.
-- The option is ignored when `topics` is empty or omitted, because the API cannot list every topic: the call goes through Metadata and `eligibleLeaderReplicas` and `lastKnownElr` are then absent. The same happens when the broker does not offer the API.
+- The option applies only to topics named explicitly. When `topics` is empty or omitted, the call goes through Metadata and `eligibleLeaderReplicas` and `lastKnownElr` are then absent. The same happens when the broker does not offer the API.
 
 ```javascript
 const { topics } = await admin.fetchTopicMetadata({

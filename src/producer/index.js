@@ -212,7 +212,9 @@ const createProducer = ({
    * Only messages sent on the transaction object will participate in the transaction.
    *
    * Calling any of the transactional methods after the transaction has ended
-   * will raise an exception (use `isActive` to ascertain if ended).
+   * will raise an exception. `isActive()` is false once the transaction has ended, and also while a
+   * commit whose outcome is unknown is pending. A pending commit has not ended: call `commit()`
+   * again while `error.retriable` is set.
    *
    * A send or `sendOffsets` that fails inside the transaction leaves it abort-only, or the producer
    * unusable, as the error's category decides: from then on `send`, `sendBatch`, `sendOffsets` and
@@ -241,7 +243,8 @@ const createProducer = ({
    * @property {Function} sendOffsets Add consumed offsets to the transaction
    * @property {Function} abort Abort the transaction
    * @property {Function} commit  Commit the transaction
-   * @property {Function} isActive  Whether the transaction is active
+   * @property {Function} isActive  Whether the transaction is active: false once it has ended and
+   *   while a commit of unknown outcome is pending
    */
   const transaction = async () => {
     if (!transactionalId) {

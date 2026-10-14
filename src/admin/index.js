@@ -1219,7 +1219,7 @@ module.exports = ({
    * leave its `partitionErrorCode` at 0; a non-zero code is passed through), and a topic that does
    * not exist fails the call rather than being created. A failed request is retried on the `retry`
    * budget, as the other admin calls are. A broker that does not offer the API is asked through
-   * Metadata after all. Without topics the option is ignored: the API cannot list every topic.
+   * Metadata after all. The option applies only to topics named explicitly: empty or omitted `topics` go through Metadata.
    *
    * @see https://cwiki.apache.org/confluence/display/KAFKA/KIP-966%3A+Eligible+Leader+Replicas
    *

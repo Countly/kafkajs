@@ -10,6 +10,10 @@ const SEND_TIME = 1800000000000
 const MONDAY = new Date('2024-01-01T00:00:00.000Z')
 const WEDNESDAY = new Date('2024-01-03T00:00:00.000Z')
 const FRIDAY = new Date('2024-01-05T00:00:00.000Z')
+const SAFE_TIMESTAMPS_BATCH =
+  '00000000000000000000006600000000020f22abfb0000000000050000018bcfe56800000001a3185c5000ffffffffffffffff' +
+  '000000000000000000060e000400010261000e000202010262000e000604010263000e000006010264000e00080801026500' +
+  '180080a0b787e9050a01026600'
 
 /**
  * Encodes `messages` as one record batch and reads it back: the header's first and max timestamps
@@ -144,5 +148,125 @@ describe('Protocol > Requests > Produce > buildRecordBatch > timestamps', () => 
 
     expect(buffer.readBigInt64BE(FIRST_TIMESTAMP_OFFSET)).toEqual(BigInt(SEND_TIME))
     expect(buffer.readBigInt64BE(MAX_TIMESTAMP_OFFSET)).toEqual(BigInt(SEND_TIME))
+  })
+})
+
+describe('Protocol > Requests > Produce > buildRecordBatch > timestamps beyond 2^53', () => {
+  beforeEach(() => {
+    jest.spyOn(Date, 'now').mockReturnValue(SEND_TIME)
+  })
+
+  afterEach(() => {
+    jest.restoreAllMocks()
+  })
+
+  test.each([['9007199254740993'], ['9223372036854775807']])(
+    'the numeric string %s is written exactly, in the header and in the record',
+    async (timestamp) => {
+      expect(await encode([{ value: 'v', timestamp }])).toEqual({
+        first: BigInt(timestamp),
+        max: BigInt(timestamp),
+        timestamps: [BigInt(timestamp)],
+      })
+    }
+  )
+
+  test.each([
+    ['a BigInt', 2n ** 53n + 1n, 2n ** 53n + 1n],
+    ['a Long', Long.fromValue('9007199254740993'), 2n ** 53n + 1n],
+    ['a number', 2 ** 60, 2n ** 60n],
+    ['a BigInt of the int64 maximum', 2n ** 63n - 1n, 2n ** 63n - 1n],
+    ['a numeric string in exponent form', '1e16', 10n ** 16n],
+  ])('%s is written exactly', async (_, timestamp, expected) => {
+    expect(await encode([{ value: 'v', timestamp }])).toEqual({
+      first: expected,
+      max: expected,
+      timestamps: [expected],
+    })
+  })
+
+  test('a mixed batch with the largest record first keeps the header and every delta exact', async () => {
+    const batch = await encode([
+      { value: 'v', timestamp: '9007199254740995' },
+      { value: 'v', timestamp: '9007199254740993' },
+      { value: 'v', timestamp: '9007199254740994' },
+    ])
+
+    expect(batch).toEqual({
+      first: 9007199254740993n,
+      max: 9007199254740995n,
+      timestamps: [9007199254740995n, 9007199254740993n, 9007199254740994n],
+    })
+  })
+
+  test('every accepted form can share one batch above 2^53', async () => {
+    const base = 2n ** 60n
+    const batch = await encode([
+      { value: 'v', timestamp: (base + 3n).toString() },
+      { value: 'v', timestamp: base + 1n },
+      { value: 'v', timestamp: Long.fromValue(base + 2n) },
+      { value: 'v', timestamp: 2 ** 60 },
+    ])
+
+    expect(batch).toEqual({
+      first: base,
+      max: base + 3n,
+      timestamps: [base + 3n, base + 1n, base + 2n, base],
+    })
+  })
+
+  test('safe and unsafe timestamps share one batch, the send time among them', async () => {
+    const batch = await encode([
+      { value: 'v', timestamp: '9007199254740993' },
+      { value: 'v', timestamp: new Date(MONDAY) },
+      { value: 'v', timestamp: 1700000000000 },
+      { value: 'v' },
+    ])
+
+    expect(batch).toEqual({
+      first: 1700000000000n,
+      max: 9007199254740993n,
+      timestamps: [9007199254740993n, BigInt(MONDAY.getTime()), 1700000000000n, BigInt(SEND_TIME)],
+    })
+  })
+
+  test('the widest int64 delta between two records is written exactly', async () => {
+    const batch = await encode([
+      { value: 'v', timestamp: '9223372036854775807' },
+      { value: 'v', timestamp: 1 },
+    ])
+
+    expect(batch).toEqual({
+      first: 1n,
+      max: 2n ** 63n - 1n,
+      timestamps: [2n ** 63n - 1n, 1n],
+    })
+  })
+
+  test('a timestamp that is not a number stays encodable beside one above 2^53', async () => {
+    const { timestamps } = await encode([
+      { value: 'v', timestamp: '9007199254740993' },
+      { value: 'v', timestamp: 'abc' },
+    ])
+
+    expect(timestamps[0]).toEqual(9007199254740993n)
+  })
+
+  test('a batch of safe timestamps is encoded to the same bytes as before', async () => {
+    const { buffer } = await buildRecordBatch({
+      compression: Compression.None,
+      messages: [
+        { value: 'a', timestamp: '1700000000002' },
+        { value: 'b', timestamp: new Date(1700000000001) },
+        { value: 'c', timestamp: 1700000000003n },
+        { value: 'd', timestamp: Long.fromNumber(1700000000000) },
+        { value: 'e', timestamp: 1700000000004 },
+        { value: 'f' },
+      ],
+      producerId: Long.fromValue(-1),
+      producerEpoch: 0,
+    })
+
+    expect(buffer.toString('hex')).toEqual(SAFE_TIMESTAMPS_BATCH)
   })
 })

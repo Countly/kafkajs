@@ -31,7 +31,7 @@ const producer = kafka.producer({
 | maxInFlightRequests | Max number of requests in progress per broker connection; `null` means no limit. Above 5, or `null`, is more than an idempotent producer allows — see [Idempotence](#idempotence). | `5` |
 | linger | ms a batch of one partition waits in the [accumulator](#accumulator) for records from further sends before it goes out; `0` sends it at once. An integer from 0 to 2147483647 | `5` |
 | batchSize | Bytes of message keys and values at which a batch of the [accumulator](#accumulator) goes out without waiting for `linger`. An integer of at least 1 | `16384` |
-| deliveryTimeout | Upper bound, in ms, on one `send()`/`sendBatch()`, retries included. Past it the send rejects with `KafkaJSDeliveryTimeout`, its `cause` the last error; running out of `retry.retries` first still rejects with `KafkaJSNumberOfRetriesExceeded`. An integer of at least `linger + requestTimeout` - 30005 with both defaults - and at most 2147483647. On every producer the bound runs from the moment the send is made, so it includes waiting for `linger` and, on an idempotent producer, for the producer id, as in the Java client. | unset (no deadline) |
+| deliveryTimeout | Bound, in ms, on the waiting and the retries of one `send()`/`sendBatch()`. Past it the send rejects with `KafkaJSDeliveryTimeout`, its `cause` the last error; running out of `retry.retries` first still rejects with `KafkaJSNumberOfRetriesExceeded`. A request already sent settles on its answer or on `requestTimeout`, so a send can end up to `requestTimeout` after `deliveryTimeout`; the Java client fails such a batch at the deadline. An integer of at least `linger + requestTimeout` - 30005 with both defaults - and at most 2147483647. On every producer the bound runs from the moment the send is made, so it includes waiting for `linger` and, on an idempotent producer, for the producer id, as in the Java client. | unset (no deadline) |
 
 ## <a name="idempotence"></a> Idempotence
 
@@ -49,7 +49,7 @@ Idempotence costs a little when each send is awaited before the next is made, at
 
 ### <a name="delivery-timeout"></a> Delivery timeout
 
-`deliveryTimeout` bounds how long one `send()` or `sendBatch()` may take, retries included (KIP-91). It has no default; when it is set it must be at least `linger + requestTimeout` (30005 ms with both defaults), so that one request can complete after the accumulator's wait, and at most 2147483647, the longest delay a Node.js timer takes.
+`deliveryTimeout` bounds the waiting and the retries of one `send()` or `sendBatch()` (KIP-91). A request already sent settles on its answer or on `requestTimeout`, so a send can end up to `requestTimeout` after `deliveryTimeout`; the Java client fails such a batch at the deadline. It has no default; when it is set it must be at least `linger + requestTimeout` (30005 ms with both defaults), so that one request can complete after the accumulator's wait, and at most 2147483647, the longest delay a Node.js timer takes.
 
 ```javascript
 const producer = kafka.producer({ deliveryTimeout: 120000 })
@@ -291,7 +291,7 @@ kafka.producer({ createPartitioner: Partitioners.UniformStickyPartitioner({ stic
 
 | Option | Description | Default |
 |---|---|---|
-| stickyBytes | Bytes of key and value assigned to one partition before the next record without a key picks another | `16384` |
+| stickyBytes | Bytes of key and value assigned to one partition before the next record without a key picks another; a string counts in its UTF-8 bytes, as a `Buffer` of the same text does | `16384` |
 | ignoreKeys | Partition keyed records by the sticky rule too, instead of by key | `false` |
 
 A record without a key goes to its topic's sticky partition until `stickyBytes` of key and value
