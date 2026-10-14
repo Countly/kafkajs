@@ -159,6 +159,17 @@ describe('Consumer > topic recreation', () => {
       expect(invalidateTopic).toHaveBeenCalledWith(TOPIC)
     })
 
+    test('each recorded recreation advances the topic recreation count, and an ignored topic does not', async () => {
+      const cluster = createCluster()
+      const { consumerGroup } = await runConsumer(cluster)
+
+      cluster.emitRecreated({ topic: TOPIC, previousTopicId: ID_A, topicId: ID_B })
+      cluster.emitRecreated({ topic: TOPIC, previousTopicId: ID_B, topicId: ID_A })
+      cluster.emitRecreated({ topic: 'someone-elses-topic', previousTopicId: ID_A, topicId: ID_B })
+
+      expect(consumerGroup.topicRecreations).toEqual(new Map([[TOPIC, 2]]))
+    })
+
     test('a topic outside the current subscription is ignored: no key in the shared committed-offsets map and the pending map stays empty', async () => {
       const cluster = createCluster()
       const { pendingTopicResets, invalidateTopic } = await runConsumer(cluster)

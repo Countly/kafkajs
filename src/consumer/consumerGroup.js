@@ -104,6 +104,9 @@ module.exports = class ConsumerGroup {
    *                                id (owned by the long-lived `Consumer`; passed through to every
    *                                `OffsetManager` this group builds, since the group itself is
    *                                rebuilt on every crash restart).
+   * @param {Map<string, number>} [options.topicRecreations] How many times each subscribed topic
+   *                                was recreated (owned by the long-lived `Consumer`; passed
+   *                                through to every `OffsetManager` this group builds).
    * @param {'classic'|'consumer'} [options.groupProtocol='classic'] which group membership protocol
    *                                to run. `'consumer'` is the broker-driven KIP-848 protocol.
    * @param {string|null} [options.groupRemoteAssignor=null] the server-side assignor name to ask
@@ -146,6 +149,7 @@ module.exports = class ConsumerGroup {
     rebalanceProtocol = EAGER,
     metadataMaxAge,
     pendingTopicResets = new Map(),
+    topicRecreations = new Map(),
     groupProtocol = 'classic',
     groupRemoteAssignor = null,
     subscribedTopicRegex = null,
@@ -174,6 +178,7 @@ module.exports = class ConsumerGroup {
     this.checkCrcs = checkCrcs
     this.metadataMaxAge = metadataMaxAge
     this.pendingTopicResets = pendingTopicResets
+    this.topicRecreations = topicRecreations
 
     this.rebalanceTimeout = rebalanceTimeout
     this.subscribedTopicRegex = subscribedTopicRegex
@@ -639,6 +644,7 @@ module.exports = class ConsumerGroup {
         memberId,
         groupInstanceId: this.groupInstanceId,
         pendingTopicResets: this.pendingTopicResets,
+        topicRecreations: this.topicRecreations,
         membershipProtocol: this.kind,
         staleEpochTimeout: this.rebalanceTimeout,
         // Live reads, not the snapshot above: the offset-fetch retry inside the manager needs the

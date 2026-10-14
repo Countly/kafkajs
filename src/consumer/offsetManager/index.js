@@ -77,6 +77,10 @@ module.exports = class OffsetManager {
    *                                subscribed, each keyed by topic and stamped with its new topic
    *                                id (owned by the long-lived `Consumer`; shared by reference
    *                                across every `OffsetManager` a session builds).
+   * @param {Map<string, number>} [options.topicRecreations] How many times each topic was
+   *                                recreated, from the same owner and shared the same way. It only
+   *                                grows and `drainPendingTopicResets` never touches it, so it
+   *                                outlives every manager (see `resetMarks`).
    * @param {'classic'|'consumer'} [options.membershipProtocol='classic'] which group protocol this
    *                                member runs. Under `'consumer'` the offset fetch carries the
    *                                member id and epoch, which is how the coordinator validates a
@@ -125,6 +129,7 @@ module.exports = class OffsetManager {
     memberId,
     groupInstanceId = null,
     pendingTopicResets = new Map(),
+    topicRecreations = new Map(),
     membershipProtocol = 'classic',
     staleEpochTimeout = 300000,
     membership = null,
@@ -157,13 +162,7 @@ module.exports = class OffsetManager {
     this.memberId = memberId
     this.groupInstanceId = groupInstanceId
     this.pendingTopicResets = pendingTopicResets
-
-    /**
-     * How many pending resets this manager's drain has consumed, per topic. A token alone cannot
-     * tell "absent, then set, then consumed" from "absent" (see `resetMarks`).
-     * @type {Map<string, number>}
-     */
-    this.consumedResets = new Map()
+    this.topicRecreations = topicRecreations
     this.membershipProtocol = membershipProtocol
     this.staleEpochTimeout = staleEpochTimeout
     this.membership =
@@ -764,11 +763,12 @@ module.exports = class OffsetManager {
    * offset, else the topic's own `fromBeginning` choice through ListOffsets.
    *
    * A reply that outlives a topic recreation is not applied. Two snapshots fence each await (see
-   * `dropRecreatedTopics`): the topic's cached id, and its reset mark (pending token and consumed
-   * count). The recreation event sets the token, so a token that is no longer the one snapshotted
-   * means a recreation happened during the await, even when the id was unknown at the start and
-   * proves nothing. The count covers the one case the token cannot: a recreation set and a
-   * sibling's drain consumed within the await leaves the token absent, as it was.
+   * `dropRecreatedTopics`): the topic's cached id, and its reset mark (pending token and recreation
+   * generation). The recreation event sets the token, so a token that is no longer the one
+   * snapshotted means a sibling consumed it or a recreation replaced it, even when the id was
+   * unknown at the start and proves nothing. The generation covers the one case the token cannot:
+   * a recreation set and a sibling's drain consumed within the await leaves the token absent, as
+   * it was.
    * - Before the OffsetFetch: fences the OffsetFetch answer.
    * - After `drainPendingTopicResets`: fences the ListOffsets answer. The drain's own deletions
    *   are taken in, so only a change made during the await drops it.
@@ -988,14 +988,23 @@ module.exports = class OffsetManager {
 
   /**
    * Each topic's reset mark as it is now: the snapshot `dropRecreatedTopics` compares against after
-   * an await. The mark is the pending token plus the count of resets this manager's drain has
-   * consumed for the topic. The token alone is not enough: "absent, then set by a recreation, then
-   * consumed by a sibling's drain" is token-absent again, the same as "absent". The count only
-   * grows, so it tells the two apart.
+   * an await. A mark holds two fences, and neither is enough alone:
+   * - `token`, the pending reset. A sibling resolution consuming it while this request is in
+   *   flight changes it, which catches an answer that landed after the reset was applied. It
+   *   cannot catch a recreation whose token a sibling consumed meanwhile: "absent, then set, then
+   *   consumed" is absent again, the same as before.
+   * - `generation`, the recreations recorded for the topic. It moves on every recreation, so it
+   *   catches exactly that case. It does not move when a sibling consumes a token, so it cannot
+   *   catch the first one.
+   *
+   * The generation lives with the consumer rather than the manager: a manager built after a
+   * rebalance shares it, so a recreation that a rebuilt manager's drain consumed is still seen
+   * here. It is monotonic and a drain never touches it, so it cannot return to a snapshotted value
+   * (no ABA).
    *
    * @private
    * @param {{topic: string}[]} entries
-   * @returns {Map<string, {token: string|undefined, consumed: number}>} topic to its mark
+   * @returns {Map<string, {token: string|undefined, generation: number}>} topic to its mark
    */
   resetMarks(entries) {
     return new Map(
@@ -1003,7 +1012,7 @@ module.exports = class OffsetManager {
         topic,
         {
           token: this.pendingTopicResets.get(topic),
-          consumed: this.consumedResets.get(topic) || 0,
+          generation: this.topicRecreations.get(topic) || 0,
         },
       ])
     )
@@ -1013,19 +1022,20 @@ module.exports = class OffsetManager {
    * Drops the entries of topics that were recreated while the request was in flight. An answer
    * that outlived a delete and recreate describes the old topic: applying it would write the old
    * offset over the new topic's position, or take a reset the new one is owed. A topic is dropped
-   * when either holds:
+   * when any of these holds:
    * - its id was known when the request went out and is known now, and the two differ. An id that
    *   was merely learned (unknown before) or lost (unknown now, a cleared cache) is not a
    *   recreation;
-   * - its reset mark is not the one snapshotted: the token moved, or the drain consumed a reset
-   *   (see `resetMarks`). The recreation event sets the token, so this catches a recreation that
-   *   the ids cannot prove, and a reset another resolution consumed meanwhile.
+   * - its pending token is not the one snapshotted: a sibling's drain consumed it, or a newer
+   *   recreation replaced it;
+   * - its recreation generation moved: a recreation happened during the await, whatever became of
+   *   its token (see `resetMarks`).
    *
    * @private
    * @param {{topic: string}[]} entries
    * @param {Map<string, string|undefined>} requestedIds each requested topic's cached id when the
    *   request went out
-   * @param {Map<string, {token: string|undefined, consumed: number}>} marks each topic's reset
+   * @param {Map<string, {token: string|undefined, generation: number}>} marks each topic's reset
    *   mark (see `resetMarks`) when the await began
    * @returns {{topic: string}[]} the entries still current, as a new array
    */
@@ -1035,12 +1045,12 @@ module.exports = class OffsetManager {
       const currentId = this.cluster.topicId(topic)
       const recreated =
         requestedId !== undefined && currentId !== undefined && requestedId !== currentId
-      const { token, consumed = 0 } = marks.get(topic) || {}
+      const { token, generation = 0 } = marks.get(topic) || {}
 
       return (
         !recreated &&
         this.pendingTopicResets.get(topic) === token &&
-        (this.consumedResets.get(topic) || 0) === consumed
+        (this.topicRecreations.get(topic) || 0) === generation
       )
     })
   }
@@ -1056,9 +1066,8 @@ module.exports = class OffsetManager {
    * a *known* cached id differs - treating unknown as "changed" would let a rebootstrap silently
    * discard the reset, which is the stale-offset skip this mechanism exists to prevent.
    *
-   * Every entry read here is removed, applied or not, and counted in `consumedResets`: this is the
-   * only place a token is consumed, so a reset happens at most once per recreation and no token is
-   * left to rewind a later commit.
+   * Every entry read here is removed, applied or not: this is the only place a token is consumed,
+   * so a reset happens at most once per recreation and no token is left to rewind a later commit.
    *
    * A partition in `seekedPartitions` is left untouched even when its topic is being reset: a
    * `seek()` applied after the recreation targets the *current* incarnation and is newer, more
@@ -1081,7 +1090,6 @@ module.exports = class OffsetManager {
       const stampedTopicId = this.pendingTopicResets.get(topic)
       const currentTopicId = this.cluster.topicId(topic)
       this.pendingTopicResets.delete(topic)
-      this.consumedResets.set(topic, (this.consumedResets.get(topic) || 0) + 1)
 
       if (currentTopicId !== undefined && currentTopicId !== stampedTopicId) {
         continue

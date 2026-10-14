@@ -288,6 +288,15 @@ module.exports = (params) => {
    * @type {Map<string, string>}
    */
   const pendingTopicResets = new Map()
+
+  /**
+   * How many recreations of each subscribed topic this consumer has recorded. Owned here for the
+   * same reason as `pendingTopicResets`. It only grows and a reset never erases it, so an
+   * `OffsetManager` that snapshots it before an await can tell, after the await, that a topic
+   * was recreated in between even when the token is back to what it was.
+   * @type {Map<string, number>}
+   */
+  const topicRecreations = new Map()
   let removeTopicRecreatedListener = null
 
   /**
@@ -316,6 +325,7 @@ module.exports = (params) => {
         }
 
         pendingTopicResets.set(topic, topicId)
+        topicRecreations.set(topic, (topicRecreations.get(topic) || 0) + 1)
         consumerGroup && consumerGroup.invalidateTopic(topic)
       } catch (e) {
         logger.error(`Failed to handle topic recreation: ${e.message}`, {
@@ -546,6 +556,7 @@ module.exports = (params) => {
         autoCommitInterval,
         autoCommitThreshold,
         pendingTopicResets,
+        topicRecreations,
       })
 
       runner = new Runner({

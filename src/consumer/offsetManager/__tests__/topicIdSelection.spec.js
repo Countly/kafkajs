@@ -299,6 +299,23 @@ describe('Admin > offset reads', () => {
   })
 })
 
+/**
+ * A pending-reset map that counts every write as a recreation of the topic, as the Consumer's
+ * listener does when it records one.
+ */
+class RecreationSignalMap extends Map {
+  /** @param {Map<string, number>} recreations the shared per-topic recreation counts */
+  constructor(recreations) {
+    super()
+    this.recreations = recreations
+  }
+
+  set(topic, topicId) {
+    this.recreations.set(topic, (this.recreations.get(topic) || 0) + 1)
+    return super.set(topic, topicId)
+  }
+}
+
 describe('Consumer > OffsetManager > resolveOffsets across a topic recreation', () => {
   const OLD_ID = TOPIC_ID
   const NEW_ID = OTHER_ID
@@ -355,7 +372,8 @@ describe('Consumer > OffsetManager > resolveOffsets across a topic recreation', 
   const build = (initialId, listOffset = '0', { autoCommit = false } = {}) => {
     const state = { id: initialId }
     const requests = []
-    const pending = new Map()
+    const recreations = new Map()
+    const pending = new RecreationSignalMap(recreations)
     const committed = {}
     const cluster = {
       committedOffsets: () => committed,
@@ -399,6 +417,7 @@ describe('Consumer > OffsetManager > resolveOffsets across a topic recreation', 
       memberId: 'member-a',
       membershipProtocol: 'consumer',
       pendingTopicResets: pending,
+      topicRecreations: recreations,
       logger: newLogger(),
     }
     const manager = new OffsetManager(options)
@@ -795,6 +814,78 @@ describe('Consumer > OffsetManager > resolveOffsets across a topic recreation', 
 
       expect(committed[TOPIC]).toEqual({ 0: '0' })
       expect(pending.size).toBe(0)
+    })
+  })
+
+  describe('a recreation the pending token cannot show: the token is absent before and after it', () => {
+    /**
+     * `stale` sends while the id is unknown and no token is pending. The topic is then recreated, and
+     * a sibling resolver on `siblingManager` consumes the token and resets to 0 before `stale`'s
+     * answer for the old incarnation lands: the token is absent again, as it was when `stale` sent.
+     * @param {object} context what `build` returned
+     * @param {object} siblingManager the manager the second resolver runs on
+     * @param {object} [held] `holdListOffsets` over the cluster: the race is then at ListOffsets
+     *   rather than at OffsetFetch
+     */
+    const raceHiddenRecreation = async (context, siblingManager, held) => {
+      const { manager, requests, committed, setId, recreate } = context
+      const stale = manager.resolveOffsets()
+      await flush()
+      if (held) {
+        requests[0].answer('-1')
+        await flush()
+        expect(held.count()).toBe(1)
+      }
+
+      setId(OLD_ID)
+      recreate(NEW_ID)
+      const sibling = siblingManager.resolveOffsets()
+      await flush()
+      requests[1].answer('99')
+      await flush()
+      if (held) {
+        held.answerAt(1, '0')
+      }
+      await sibling
+      expect(committed[TOPIC]).toEqual({ 0: '0' })
+      expect(context.pending.size).toBe(0)
+
+      if (held) {
+        held.answerAt(0, '500')
+      } else {
+        requests[0].answer('99')
+      }
+      await stale
+    }
+
+    test('an OffsetFetch answer sent without an id does not overwrite the reset a sibling resolver made', async () => {
+      const context = build(undefined)
+
+      await raceHiddenRecreation(context, context.manager)
+
+      expect(context.committed[TOPIC]).toEqual({ 0: '0' })
+      expect(context.manager.nextOffset(TOPIC, 0).toString()).toEqual('0')
+    })
+
+    test('a ListOffsets answer sent without an id does not overwrite the reset a sibling resolver made', async () => {
+      const context = build(undefined)
+      const held = holdListOffsets(context.cluster)
+
+      await raceHiddenRecreation(context, context.manager, held)
+
+      expect(context.committed[TOPIC]).toEqual({ 0: '0' })
+      expect(context.manager.nextOffset(TOPIC, 0).toString()).toEqual('0')
+    })
+
+    test('a ListOffsets answer is dropped when the sibling that consumed the token ran on a rebuilt manager', async () => {
+      const context = build(undefined)
+      const held = holdListOffsets(context.cluster)
+      const rebuilt = context.rebuild()
+
+      await raceHiddenRecreation(context, rebuilt, held)
+
+      expect(context.committed[TOPIC]).toEqual({ 0: '0' })
+      expect(rebuilt.nextOffset(TOPIC, 0).toString()).toEqual('0')
     })
   })
 
