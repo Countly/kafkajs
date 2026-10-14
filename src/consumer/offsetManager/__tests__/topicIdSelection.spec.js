@@ -302,6 +302,7 @@ describe('Admin > offset reads', () => {
 describe('Consumer > OffsetManager > resolveOffsets across a topic recreation', () => {
   const OLD_ID = TOPIC_ID
   const NEW_ID = OTHER_ID
+  const THIRD_ID = '21222324-2526-2728-292a-2b2c2d2e2f30'
   const flush = () => new Promise(setImmediate)
 
   /** The OffsetFetch v10 answer for partition 0 of one topic id, as the broker puts it on the wire. */
@@ -679,6 +680,120 @@ describe('Consumer > OffsetManager > resolveOffsets across a topic recreation', 
       await round
 
       expect(rejoined.nextOffset(TOPIC, 0).toString()).toEqual('50')
+      expect(pending.size).toBe(0)
+    })
+  })
+
+  describe('a resolution that consumed the reset fences the answers still in flight', () => {
+    /**
+     * Resolution `slow` is held in OffsetFetch while the topic is recreated and a sibling resolution
+     * runs to the end, consuming the reset, before `slow`'s answer for the old incarnation lands.
+     * @param {string|undefined} initialId the topic id the cache holds when `slow` starts
+     * @param {(context: object) => void} [afterSibling] runs once the sibling is done
+     */
+    const raceSibling = async (initialId, afterSibling = () => {}) => {
+      const context = build(initialId)
+      const { manager, requests, recreate } = context
+      const slow = manager.resolveOffsets()
+      await flush()
+
+      recreate(NEW_ID)
+      const fast = manager.resolveOffsets()
+      await flush()
+      requests[1].answer('99')
+      await fast
+      afterSibling(context)
+
+      requests[0].answer('99')
+      await slow
+      return context
+    }
+
+    test('an answer sent while the id was unknown does not overwrite the position the sibling reset', async () => {
+      const { manager, committed, pending } = await raceSibling(undefined)
+
+      expect(pending.size).toBe(0)
+      expect(committed[TOPIC]).toEqual({ 0: '0' })
+      expect(manager.nextOffset(TOPIC, 0).toString()).toEqual('0')
+    })
+
+    test('a later resolution has nothing left to repair, and the position stays at the reset', async () => {
+      const { manager, requests, committed } = await raceSibling(undefined)
+
+      await resolveAgain(manager, requests)
+
+      expect(committed[TOPIC]).toEqual({ 0: '0' })
+      expect(manager.nextOffset(TOPIC, 0).toString()).toEqual('0')
+    })
+
+    test('an answer sent under a known id does not overwrite it either, once the cache is cleared', async () => {
+      const { manager, committed } = await raceSibling(OLD_ID, ({ setId }) => setId(undefined))
+
+      expect(committed[TOPIC]).toEqual({ 0: '0' })
+      expect(manager.nextOffset(TOPIC, 0).toString()).toEqual('0')
+    })
+
+    test('a slow answer sent after both resolutions saw the new id and its token is dropped once the token is consumed', async () => {
+      const { manager, requests, committed, recreate } = build(OLD_ID)
+      recreate(NEW_ID)
+      const slow = manager.resolveOffsets()
+      await flush()
+      const fast = manager.resolveOffsets()
+      await flush()
+      requests[1].answer('99')
+      await fast
+
+      requests[0].answer('99')
+      await slow
+
+      expect(committed[TOPIC]).toEqual({ 0: '0' })
+      expect(manager.nextOffset(TOPIC, 0).toString()).toEqual('0')
+    })
+
+    test('a token the sibling consumed without a reset, because the cached id is another one, still fences', async () => {
+      const { manager, requests, pending, committed, setId } = build(undefined)
+      const slow = manager.resolveOffsets()
+      await flush()
+
+      pending.set(TOPIC, NEW_ID)
+      setId(THIRD_ID)
+      manager.resetOffsetsForTopic(TOPIC)
+      const fast = manager.resolveOffsets()
+      await flush()
+      requests[1].answer('99')
+      await fast
+      expect(pending.size).toBe(0)
+
+      requests[0].answer('77')
+      await slow
+
+      expect(committed[TOPIC]).toEqual({ 0: '99' })
+    })
+
+    test('a ListOffsets answer is dropped when a sibling consumed a newer reset while it was in flight', async () => {
+      const { manager, requests, pending, committed, cluster } = build(undefined)
+      const held = holdListOffsets(cluster)
+      pending.set(TOPIC, OLD_ID)
+      const slow = manager.resolveOffsets()
+      await flush()
+      requests[0].answer('99')
+      await flush()
+      expect(held.count()).toBe(1)
+
+      pending.set(TOPIC, NEW_ID)
+      manager.resetOffsetsForTopic(TOPIC)
+      const fast = manager.resolveOffsets()
+      await flush()
+      requests[1].answer('99')
+      await flush()
+      held.answerAt(1, '0')
+      await fast
+      expect(committed[TOPIC]).toEqual({ 0: '0' })
+
+      held.answerAt(0, '500')
+      await slow
+
+      expect(committed[TOPIC]).toEqual({ 0: '0' })
       expect(pending.size).toBe(0)
     })
   })
