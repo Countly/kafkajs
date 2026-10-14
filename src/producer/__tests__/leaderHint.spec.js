@@ -384,6 +384,48 @@ describe('Producer > KIP-951 leader hint', () => {
         expect(warn).toHaveBeenCalledWith(expect.any(String), { error: 'close failed' })
       }
     )
+
+    /**
+     * Lets a few macrotasks pass so a stray rejection surfaces while the test is still running.
+     * Jest's runner fails the running test on an unhandled rejection; a `process.on` listener in
+     * the sandbox never sees one, so no listener is used.
+     */
+    const flushTicks = async () => {
+      for (let tick = 0; tick < 5; tick++) {
+        await new Promise(setImmediate)
+      }
+    }
+
+    describe.each([
+      ['broker', MOVED, (brokers) => brokers[2].disconnect],
+      ['seed pool', MOVED_SEED, (brokers) => brokers[1].connectionPool.destroy],
+    ])('a %s close that cannot be reported cleanly', (_, endpoints, closer) => {
+      const applyWithFailingClose = async (rejectWith, warnImpl) => {
+        const { cluster, brokers } = createHintCluster({ answer: acceptAll })
+        const pool = cluster.brokerPool
+        pool.seedBroker = brokers[1]
+        const warn = jest.spyOn(pool.logger, 'warn').mockImplementation(warnImpl)
+        closer(brokers).mockRejectedValue(rejectWith)
+
+        await expect(pool.applyNodeEndpoints(endpoints)).resolves.toBeUndefined()
+        await flushTicks()
+        return warn
+      }
+
+      test('a close that rejects with null is logged and nothing is left unhandled', async () => {
+        const warn = await applyWithFailingClose(null)
+
+        expect(warn).toHaveBeenCalledWith(expect.any(String), { error: 'null' })
+      })
+
+      test('a logger that throws leaves nothing unhandled', async () => {
+        const warn = await applyWithFailingClose(new Error('close failed'), () => {
+          throw new Error('logger down')
+        })
+
+        expect(warn).toHaveBeenCalledTimes(1)
+      })
+    })
   })
 
   describe('a seed broker whose address moves while its new pool is being built', () => {

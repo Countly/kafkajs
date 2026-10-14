@@ -387,7 +387,7 @@ await admin.describeConfigs({
 
 Take a look at [configResourceTypes](../src/protocol/configResourceTypes.js) for a complete list of resources.
 
-The `name` of a resource is a topic name, a group id, a client-metrics subscription name or a broker id, by `type`. A `BROKER` resource may also have the empty name `''`, which is the cluster-wide default broker config: its entries are the ones set as cluster defaults, so it is empty on a cluster that has none. Every other type needs a non-empty name. A broker config for one broker id, and a `BROKER_LOGGER`, are answered by that broker only; everything else is asked of any broker.
+The `name` of a resource is a topic name, a group id, a client-metrics subscription name or a broker id, by `type`. A `BROKER` resource may also have the empty name `''`, which is the cluster-wide default broker config: its entries are the ones set as cluster defaults, so it is empty on a cluster that has none. Every other type needs a non-empty name. A broker config for one broker id, and a `BROKER_LOGGER`, are answered by that broker only; everything else, a `BROKER` resource with the empty name included, is asked of the controller.
 
 `includeDocumentation: true` asks the broker for the documentation of each entry, which it leaves out otherwise (`documentation` is `null`). Every entry also carries `configType`, the type of its value: a number, see `ConfigTypes` (`BOOLEAN`, `STRING`, `INT`, `SHORT`, `LONG`, `DOUBLE`, `LIST`, `CLASS` or `PASSWORD`). Both keys need DescribeConfigs v3, which every Kafka 4.x broker offers. The documentation makes the response large, so ask for it only when you show it.
 

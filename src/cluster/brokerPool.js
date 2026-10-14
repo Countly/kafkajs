@@ -317,16 +317,22 @@ module.exports = class BrokerPool {
 
   /**
    * Lets a replaced broker, or the pool it replaced, finish closing without holding the caller
-   * back. A failed close is logged: the closed object is no longer in the table.
+   * back. A failed close is logged when the logger can log it, and never surfaces: not as an
+   * unhandled rejection, whatever the rejection reason is and even if the logger throws. The
+   * closed object is no longer in the table, so there is nothing to retry.
    *
    * @private
    * @param {Promise<void>} closing
    * @returns {void}
    */
   closeInBackground(closing) {
-    closing.catch((error) =>
-      this.logger.warn('Closing a replaced broker connection failed', { error: error.message })
-    )
+    closing
+      .catch((error) =>
+        this.logger.warn('Closing a replaced broker connection failed', {
+          error: error?.message ?? String(error),
+        })
+      )
+      .catch(() => {})
   }
 
   /**

@@ -599,6 +599,16 @@ module.exports = ({
 
         await cluster.refreshMetadata()
       } catch (e) {
+        if (e.topicErrors) {
+          // a name the broker did not list as failed was deleted: the next refresh must not ask for it
+          const failed = new Set(e.topicErrors.map(({ topic }) => topic))
+          for (const topic of pending) {
+            if (!failed.has(topic)) {
+              cluster.targetTopics.delete(topic)
+            }
+          }
+        }
+
         const refused = throttledTopics(e)
 
         if (refused) {
@@ -905,8 +915,8 @@ module.exports = ({
 
   /**
    * A BROKER_LOGGER resource and a BROKER resource with a name belong to the one broker named by
-   * the resource; a BROKER resource with the empty name is the cluster-wide default, which any
-   * broker answers.
+   * the resource; a BROKER resource with the empty name is the cluster-wide default, which goes to
+   * the controller like every other resource.
    * @param {{ type: number, name: string }} resource
    * @returns {boolean}
    */
@@ -1165,12 +1175,13 @@ module.exports = ({
   }
 
   /**
-   * Reads `names` through DescribeTopicPartitions inside the admin retrier. The first attempt
-   * loads the metadata only if none is loaded or it has expired, because `findControllerBroker`
-   * needs it. A failure of the request itself that is marked retriable (a connection that dropped,
-   * a request that timed out) refreshes the metadata and asks again, on the broker
-   * `findControllerBroker` then returns, as `cluster.metadata` does with each broker in turn; a
-   * topic's own error is never retried: it rejects once every page is in.
+   * Reads `names` through DescribeTopicPartitions inside the admin retrier, from any connected
+   * broker (`findConnectedBroker`): every broker answers it, so a dead controller does not fail the
+   * call. The first attempt refreshes the metadata only if none is loaded or it has expired. A
+   * failure of the request itself that is marked retriable (a connection that dropped, a request
+   * that timed out) refreshes the metadata and asks again, on whichever connected broker the
+   * cluster then returns, as `cluster.metadata` does with each broker in turn; a topic's own error
+   * is never retried: it rejects once every page is in.
    * @param {string[]} names
    * @returns {Promise<TopicsMetadata>}
    * @throws {KafkaJSServerDoesNotSupportApiKey} when the broker does not offer the API
@@ -1186,7 +1197,7 @@ module.exports = ({
           await cluster.refreshMetadataIfNecessary()
         }
 
-        return await readTopicPages(await cluster.findControllerBroker(), names)
+        return await readTopicPages(await cluster.findConnectedBroker(), names)
       } catch (e) {
         if (e.retriable === true) {
           logger.warn('Could not describe topics', { error: e.message, retryCount, retryTime })

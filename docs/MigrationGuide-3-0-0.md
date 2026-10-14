@@ -871,8 +871,8 @@ Group visibility and the admin client.
 - **Cluster-default broker configs can be described and altered.** `admin.describeConfigs` and
   `admin.alterConfigs` threw `KafkaJSNonRetriableError` (invalid resource name) for a `BROKER`
   resource whose name is the empty string. That name now stands for the cluster-wide default broker
-  config, and all three config methods send it to any broker. Every other resource type still needs
-  a non-empty name. *What to do:* nothing.
+  config, and all three config methods send it to the controller. Every other resource type still
+  needs a non-empty name. *What to do:* nothing.
 - **`createTopics`, `deleteTopics` and `createPartitions` retry a quota refusal.** On a cluster with
   controller-mutation quotas (KIP-599) a broker now refuses with `THROTTLING_QUOTA_EXCEEDED` a
   request it used to slow down, because the client negotiates newer versions of these APIs. The
@@ -958,10 +958,11 @@ now logged.
   deep-equality-compares the whole payload is affected.
 
 - **The `COMMIT_OFFSETS` event's payload gains `leaderEpoch`.** Each entry of
-  `topics[].partitions[]` of an auto-commit, or of a `commitOffsets()` with no arguments, now
-  carries `leaderEpoch` (a number, `-1` when the epoch is unknown) alongside `partition` and
-  `offset`, and the entries returned by `consumer.uncommittedOffsets()` gain the same key. Offsets
-  you pass to `commitOffsets(offsets)` are forwarded as given and carry no `leaderEpoch`. Every key
+  `topics[].partitions[]` of an auto-commit, or of a commit of resolved offsets
+  (`commitOffsetsIfNecessary()` in `eachBatch`), now carries `leaderEpoch` (a number, `-1` when the
+  epoch is unknown) alongside `partition` and `offset`, and the entries returned by
+  `consumer.uncommittedOffsets()` gain the same key. Offsets you pass to `commitOffsets(offsets)`
+  are forwarded as given and carry no `leaderEpoch`. Every key
   those payloads already had is unchanged, so only code that deep-equality-compares a whole payload
   is affected — the same kind of additive change
   `groupInstanceId` was ("The `COMMIT_OFFSETS` event's payload gains `groupInstanceId`.").

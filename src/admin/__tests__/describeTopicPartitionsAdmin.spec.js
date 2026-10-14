@@ -3,7 +3,6 @@ const apiKeys = require('../../protocol/requests/apiKeys')
 const { createErrorFromCode } = require('../../protocol/error')
 const {
   KafkaJSConnectionError,
-  KafkaJSMetadataNotLoaded,
   KafkaJSNonRetriableError,
   KafkaJSServerDoesNotSupportApiKey,
 } = require('../../errors')
@@ -50,12 +49,10 @@ const page = (topics, nextCursor = null) => ({
 })
 
 /**
- * An admin over a stub controller that answers DescribeTopicPartitions with `pages` in turn, and
+ * An admin over a stub broker that answers DescribeTopicPartitions with `pages` in turn, and
  * Metadata with `metadata`. `failFirst` lists errors the stub throws before it answers, `failWith`
- * one it throws every time. Every request the stub received is kept, copied, in `requests`.
- *
- * Like a cluster that has only just connected, the stub holds no metadata until one of the two
- * refresh calls runs, and `findControllerBroker` then throws `KafkaJSMetadataNotLoaded`.
+ * one it throws every time. Every request the stub received is kept, copied, in `requests`. The
+ * cluster hands the stub out from `findConnectedBroker`, and has no controller lookup at all.
  */
 const adminOver = ({
   pages = [],
@@ -79,21 +76,11 @@ const adminOver = ({
       return queue.shift()
     }),
   }
-  let loaded = false
   const cluster = {
     allowAutoTopicCreation: false,
-    refreshMetadata: jest.fn(async () => {
-      loaded = true
-    }),
-    refreshMetadataIfNecessary: jest.fn(async () => {
-      loaded = true
-    }),
-    findControllerBroker: jest.fn(async () => {
-      if (!loaded) {
-        throw new KafkaJSMetadataNotLoaded('Topic metadata not loaded')
-      }
-      return broker
-    }),
+    refreshMetadata: jest.fn(async () => {}),
+    refreshMetadataIfNecessary: jest.fn(async () => {}),
+    findConnectedBroker: jest.fn(async () => broker),
     metadata: jest.fn(async () => metadata),
   }
   const admin = createAdmin({ logger: newLogger(), retry, cluster })
@@ -423,14 +410,13 @@ describe('Admin > fetchTopicMetadata > DescribeTopicPartitions', () => {
       expect(topics[0].partitions[0]).toMatchObject({ partitionErrorCode: 5, leader: -1 })
     })
 
-    test('loads the metadata only if needed before the first attempt, then asks the controller lookup broker', async () => {
-      // with no retry, a first attempt on a cluster that holds no metadata would otherwise fail
+    test('refreshes the metadata only if needed before the first attempt, then asks a connected broker', async () => {
       const { admin, cluster, broker } = adminOver({ pages: [page([topic('a', [partition(0)])])] })
 
       await fetchWithDtp(admin, ['a'])
 
       expect(cluster.refreshMetadataIfNecessary).toHaveBeenCalledTimes(1)
-      expect(cluster.findControllerBroker).toHaveBeenCalledTimes(1)
+      expect(cluster.findConnectedBroker).toHaveBeenCalledTimes(1)
       expect(broker.describeTopicPartitions).toHaveBeenCalledTimes(1)
       expect(cluster.refreshMetadata).not.toHaveBeenCalled()
       expect(cluster.metadata).not.toHaveBeenCalled()
@@ -519,8 +505,29 @@ describe('Admin > fetchTopicMetadata > DescribeTopicPartitions', () => {
       expect(topics.map(({ name }) => name)).toEqual(['m'])
       expect(broker.describeTopicPartitions).toHaveBeenCalledTimes(2)
       expect(cluster.refreshMetadata).toHaveBeenCalledTimes(1)
-      expect(cluster.findControllerBroker).toHaveBeenCalledTimes(2)
+      expect(cluster.findConnectedBroker).toHaveBeenCalledTimes(2)
       expect(cluster.metadata).not.toHaveBeenCalled()
+    })
+
+    test('asks another connected broker when the first one fails with a connection error', async () => {
+      const { admin, broker, cluster } = adminOver({
+        metadata,
+        retry: RETRY,
+        pages: [page([topic('m', [partition(0)])])],
+      })
+      const dead = {
+        describeTopicPartitions: jest.fn(async () => {
+          throw new KafkaJSConnectionError('Connection error: ECONNRESET')
+        }),
+      }
+      cluster.findConnectedBroker.mockResolvedValueOnce(dead)
+
+      const { topics } = await fetchWithDtp(admin, ['m'])
+
+      expect(topics.map(({ name }) => name)).toEqual(['m'])
+      expect(dead.describeTopicPartitions).toHaveBeenCalledTimes(1)
+      expect(broker.describeTopicPartitions).toHaveBeenCalledTimes(1)
+      expect(cluster.refreshMetadata).toHaveBeenCalledTimes(1)
     })
 
     test('rejects, and does not fall back, when a retriable failure outlives the retry budget', async () => {
@@ -590,7 +597,7 @@ describe('Admin > fetchTopicMetadata > DescribeTopicPartitions', () => {
         retry: { retries: 0 },
         cluster: {
           refreshMetadataIfNecessary: async () => {},
-          findControllerBroker: async () => harness.broker,
+          findConnectedBroker: async () => harness.broker,
         },
       })
 
