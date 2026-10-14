@@ -995,6 +995,21 @@ now logged.
   receives; when an event has both, channel subscribers run first. Subscribers run synchronously and
   must not throw (Node turns a throw into an `'uncaughtException'`). *What to do:* nothing; to use
   it, subscribe with `diagnostics_channel.subscribe('kafkajs.consumer.fetch', fn)`.
+- **`@opentelemetry/instrumentation-kafkajs` does not instrument this package.** It hooks the
+  package `kafkajs` below version 3 only. `@countly/opentelemetry-instrumentation-kafkajs` does,
+  whether the library is installed as `@countly/kafkajs` or as `kafkajs` through an npm alias,
+  with the same span names, metric names and attributes, except `messaging.kafka.cluster.id`,
+  which it never sets. *What to do:* replace the instrumentation package and construct
+  `KafkaJsInstrumentation` from it as before; dashboards keyed on span or metric names keep
+  working, and one attribute is gone. ESM applications start Node.js with
+  `--experimental-loader=@opentelemetry/instrumentation/hook.mjs`, as with the upstream package.
+  A `transaction` span ends at the first `commit()` or `abort()` that settles: if it ends in an
+  error that is retriable, the outcome of the commit is unknown, not aborted, and a later
+  `commit()` or `producer.disconnect()` that completes the transaction is not recorded on it.
+  `retriable: true` is on the error `commit()` rejects with, not on the span, which records only
+  that error's message and its class name as `error.type`. The instrumented `commit()` returns
+  its own promise to each caller, so two `commit()` calls made while one is under way no longer
+  return the same promise, although the client's do.
 
 ### Protocol
 
