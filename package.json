@@ -81,6 +81,7 @@
     "test:e2e:leave-group": "npm run test:kafka -- \"LEAVE_GROUP_E2E=1 npx jest --forceExit --runInBand --testPathPatterns 'src/consumer/__tests__/disconnectLeaveGroupLive\\\\.spec\\\\.js'\"",
     "test:e2e:diagnostics-channel": "npm run test:kafka -- \"DIAGNOSTICS_CHANNEL_E2E=1 npx jest --forceExit --runInBand --testPathPatterns 'src/instrumentation/__tests__/diagnosticsChannelLive\\\\.spec\\\\.js'\"",
     "test:e2e:leaderless": "npm run test:kafka -- \"LEADERLESS_E2E=1 npx jest --forceExit --runInBand --testPathPatterns 'src/admin/__tests__/leaderlessPartitionLive\\\\.spec\\\\.js'\"",
+    "test:e2e:otel": "OTEL_E2E=1 npm run test:kafka -- \"npm run test:otel\"",
     "probe:group-conversion": "npm run test:kafka -- \"node scripts/e2e/javaConsumer/groupConversionProbe.js\"",
     "probe:transaction-version": "node scripts/e2e/transactionVersionProbe.js",
     "probe:idempotent-authz": "COMPOSE_FILE=docker-compose.acl.yml npm run test:kafka -- \"node scripts/e2e/idempotentAuthzProbe.js\"",
