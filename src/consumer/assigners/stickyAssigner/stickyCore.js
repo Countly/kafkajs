@@ -63,22 +63,30 @@ class MembersByLoad {
     this.members = []
   }
 
-  /** @param {string} memberId @returns {void} */
+  /**
+   * Inserts a member at its place in the order. A binary search finds the first member that sorts
+   * after it, the index a front-to-back scan stops at, since the array is kept sorted.
+   * @param {string} memberId
+   * @returns {void}
+   */
   add(memberId) {
     const size = this.assignment.get(memberId).size
-    let index = 0
+    let low = 0
+    let high = this.members.length
 
-    while (index < this.members.length) {
-      const otherSize = this.assignment.get(this.members[index]).size
+    while (low < high) {
+      const middle = (low + high) >>> 1
+      const other = this.members[middle]
+      const otherSize = this.assignment.get(other).size
 
-      if (otherSize > size || (otherSize === size && this.members[index] > memberId)) {
-        break
+      if (otherSize > size || (otherSize === size && other > memberId)) {
+        high = middle
+      } else {
+        low = middle + 1
       }
-
-      index++
     }
 
-    this.members.splice(index, 0, memberId)
+    this.members.splice(low, 0, memberId)
   }
 
   /** @param {string} memberId @returns {void} */
@@ -383,6 +391,18 @@ class GeneralAssignmentBuilder {
     this.assignment = new Map()
     /** @type {Map<string, string>} partition key to the member holding it */
     this.partitionOwner = new Map()
+    /** topic to the flat keys of its partitions, built once so the hot loops allocate none */
+    this.topicKeys = new Map(
+      Object.keys(partitionsPerTopic).map((topic) => [
+        topic,
+        partitionsPerTopic[topic].map((partition) => keyOf(topic, partition)),
+      ])
+    )
+    /**
+     * The last move a full scan found possible, with its member's capacity.
+     * @type {{ memberId: string, key: string, capacity: number }|null}
+     */
+    this.witness = null
 
     for (const { memberId, topics } of members) {
       const subscribed = topics.filter((topic) => this.topicMembers.has(topic))
@@ -415,9 +435,7 @@ class GeneralAssignmentBuilder {
         (a < b ? -1 : a > b ? 1 : 0)
     )
 
-    return topics.flatMap((topic) =>
-      this.partitionsPerTopic[topic].map((partition) => keyOf(topic, partition))
-    )
+    return topics.flatMap((topic) => this.topicKeys.get(topic))
   }
 
   /** @returns {Map<string, Set<string>>} member id to the partition keys it was assigned */
@@ -516,8 +534,17 @@ class GeneralAssignmentBuilder {
   }
 
   /**
+   * Whether no single move would improve the balance: no member could take a partition of one of
+   * its topics from a member holding at least two more.
+   *
+   * A move found by the last full scan is kept as a witness and checked first: while it is still
+   * possible the answer is still false, so the scan, which costs every member's partitions, runs
+   * only once the witness has gone. The scan skips a member that holds as many partitions as it
+   * could hold, so the witness is no longer possible once its member does: such a member can hold
+   * partitions of a topic it left, and the scan never offers it one more. The answer is the same
+   * either way.
    * @private
-   * @returns {boolean} true when no single move would improve the balance
+   * @returns {boolean}
    */
   isBalanced() {
     const min = this.assignment.get(this.byLoad.first()).size
@@ -527,19 +554,28 @@ class GeneralAssignmentBuilder {
       return true
     }
 
+    const witness = this.witness
+
+    if (
+      witness !== null &&
+      this.assignment.get(witness.memberId).size !== witness.capacity &&
+      this.canMove(witness.memberId, witness.key)
+    ) {
+      return false
+    }
+
     for (const memberId of this.byLoad.members) {
       const held = this.assignment.get(memberId)
+      const capacity = this.maxAssignmentSize(memberId)
 
-      if (held.size === this.maxAssignmentSize(memberId)) {
+      if (held.size === capacity) {
         continue
       }
 
       for (const topic of this.memberTopics.get(memberId)) {
-        for (const partition of this.partitionsPerTopic[topic]) {
-          const key = keyOf(topic, partition)
-          const other = this.assignment.get(this.partitionOwner.get(key))
-
-          if (!held.has(key) && other !== undefined && held.size + 1 < other.size) {
+        for (const key of this.topicKeys.get(topic)) {
+          if (this.canMove(memberId, key)) {
+            this.witness = { memberId, key, capacity }
             return false
           }
         }
@@ -547,6 +583,20 @@ class GeneralAssignmentBuilder {
     }
 
     return true
+  }
+
+  /**
+   * @private
+   * @param {string} memberId a member subscribed to the partition's topic
+   * @param {string} key
+   * @returns {boolean} whether the member could take the partition from an owner holding at least
+   *   two more partitions than it does
+   */
+  canMove(memberId, key) {
+    const held = this.assignment.get(memberId)
+    const other = this.assignment.get(this.partitionOwner.get(key))
+
+    return !held.has(key) && other !== undefined && held.size + 1 < other.size
   }
 
   /**
@@ -622,6 +672,7 @@ class GeneralAssignmentBuilder {
    */
   performReassignments(reassignable, previousOwner) {
     let modified
+    this.witness = null
 
     do {
       modified = false
