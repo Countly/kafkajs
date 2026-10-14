@@ -190,7 +190,11 @@ module.exports = class Connection {
     this.authenticatedAt = null
     this.sessionLifetime = Long.ZERO
 
-    /** Settles once the latest request has reached the request queue, whatever its outcome. */
+    /**
+     * Settles once the latest request of the current attempt has reached the request queue,
+     * whatever its outcome. Each `connect()` attempt starts a fresh one, so a request of an
+     * ended attempt never holds up the next.
+     */
     this[PRIVATE.QUEUED] = Promise.resolve()
 
     /**
@@ -269,6 +273,7 @@ module.exports = class Connection {
 
       let timeoutId
       const attempt = ++this.connectAttempt
+      this[PRIVATE.QUEUED] = Promise.resolve()
       const isCurrentAttempt = () => this.connectAttempt === attempt
 
       const abort = (error) => {
@@ -392,7 +397,8 @@ module.exports = class Connection {
    * install a new socket (and move the status past DISCONNECTING) while this call is still
    * draining, and this call's continuation must act on the socket and epoch it actually owns, not
    * on whatever `this.socket`/`this.connectAttempt` happen to hold once it resumes. A socket the
-   * broker already destroyed is left alone, so repeated calls add no listeners to it.
+   * broker already destroyed is left alone, so repeated calls add no listeners to it. Ending the
+   * epoch also ends the attempt's request order: see `send()`.
    *
    * @public
    * @returns {Promise}
@@ -510,6 +516,11 @@ module.exports = class Connection {
    * the batches of one partition must reach the broker in the order they were numbered. The SASL
    * handshake and the ApiVersions exchange that authentication itself sends are not ordered, or the
    * first request would wait for itself.
+   *
+   * The order belongs to one connection attempt. A request still encoding when `disconnect()` or
+   * a closed socket ends its attempt is rejected with a `KafkaJSConnectionError`, once its encoder
+   * returns, and is never written - not even to the socket of a later attempt - and it never
+   * delays a request sent after the next `connect()`.
    * @public
    * @param {object} protocol
    * @param {object} protocol.request It is defined by the protocol and consists of an object with "apiKey",
@@ -524,9 +535,10 @@ module.exports = class Connection {
    * @returns {Promise<data>} where data is the return of "response#parse"
    */
   async send({ request, response, requestTimeout = null, logResponseError = true }) {
+    const attempt = this.connectAttempt
     const expectResponse = !request.expectResponse || request.expectResponse()
     const prepared = this[PRIVATE.PREPARE]({ request, expectResponse })
-    const enqueue = (encoded) => this[PRIVATE.ENQUEUE](encoded, requestTimeout)
+    const enqueue = (encoded) => this[PRIVATE.ENQUEUE](encoded, requestTimeout, attempt)
 
     let queued
     if (isAuthenticatedRequest(request)) {
@@ -619,15 +631,21 @@ module.exports = class Connection {
    * @param {{ request: object, expectResponse: boolean, correlationId: number,
    *   requestPayload: object }} encoded what `PREPARE` resolved with
    * @param {number|null} requestTimeout
+   * @param {number} attempt the `connectAttempt` the request was sent under; a request of an older
+   *   attempt is refused
    * @returns {{ answered: Promise<{ correlationId: number, size: number, entry: object,
    *   payload: Buffer }> }} `answered` settles with the response frame; wrapped so that waiting
    *   for the push does not wait for the response
    */
-  [PRIVATE.ENQUEUE]({ request, expectResponse, correlationId, requestPayload }, requestTimeout) {
+  [PRIVATE.ENQUEUE](
+    { request, expectResponse, correlationId, requestPayload },
+    requestTimeout,
+    attempt
+  ) {
     const { apiKey, apiName, apiVersion } = request
     const answered = new Promise((resolve, reject) => {
       try {
-        this.failIfNotConnected()
+        this.failIfNotConnected(attempt)
         const entry = { apiKey, apiName, apiVersion, correlationId, resolve, reject }
 
         this.requestQueue.push({
@@ -660,9 +678,12 @@ module.exports = class Connection {
    * through this check.
    *
    * @private
+   * @param {number} [attempt] the `connectAttempt` a request was sent under; it is refused once
+   *   the connection has moved on to another attempt, even if it is connected again
+   * @throws {KafkaJSConnectionError} when the connection is not connected, or `attempt` is over
    */
-  failIfNotConnected() {
-    if (this.connectionStatus !== CONNECTION_STATUS.CONNECTED) {
+  failIfNotConnected(attempt = this.connectAttempt) {
+    if (this.connectionStatus !== CONNECTION_STATUS.CONNECTED || attempt !== this.connectAttempt) {
       throw new KafkaJSConnectionError('Not connected', {
         broker: `${this.host}:${this.port}`,
       })

@@ -198,24 +198,35 @@ describe('Producer > Partitioner > UniformSticky', () => {
     expect(send(metadata(0, 0, 0))).toEqual(0)
   })
 
-  test('counts a Buffer in bytes, not in decoded characters', () => {
+  test.each([
+    ['a string', (text) => text],
+    ['the same text in a Buffer', (text) => Buffer.from(text)],
+  ])('counts %s in the bytes it encodes to, not in characters', (_, toValue) => {
     jest.spyOn(Math, 'random').mockReturnValueOnce(0).mockReturnValueOnce(0.99)
     const partitioner = UniformStickyPartitioner({ stickyBytes: 6 })()
     const send = (value) =>
       partitioner({ topic: 'topic', partitionMetadata: metadata(0, 1, 2), message: { value } })
 
-    // '€€' is 6 bytes but 2 characters, so as a Buffer it reaches stickyBytes on its own.
-    expect([send(Buffer.from('€€')), send(Buffer.from('x'))]).toEqual([0, 2])
+    // '€€' is 6 bytes but 2 characters, so it reaches stickyBytes on its own.
+    expect([send(toValue('€€')), send(toValue('x'))]).toEqual([0, 2])
   })
 
-  test('counts a string in characters, not in encoded bytes', () => {
+  test('counts an astral character in its four bytes, in a string and in a Buffer alike', () => {
+    jest.spyOn(Math, 'random').mockReturnValueOnce(0).mockReturnValueOnce(0.99)
+    const partitioner = UniformStickyPartitioner({ stickyBytes: 8 })()
+    const send = (value) =>
+      partitioner({ topic: 'topic', partitionMetadata: metadata(0, 1, 2), message: { value } })
+
+    expect([send('\u{1F600}'), send(Buffer.from('\u{1F600}')), send('x')]).toEqual([0, 0, 2])
+  })
+
+  test('counts any other value in the bytes of its string form', () => {
     jest.spyOn(Math, 'random').mockReturnValueOnce(0).mockReturnValueOnce(0.99)
     const partitioner = UniformStickyPartitioner({ stickyBytes: 6 })()
     const send = (value) =>
       partitioner({ topic: 'topic', partitionMetadata: metadata(0, 1, 2), message: { value } })
 
-    // 2, 4 and 6 characters: the third record reaches stickyBytes and the fourth picks again.
-    expect([send('€€'), send('€€'), send('€€'), send('€€')]).toEqual([0, 0, 0, 2])
+    expect([send(123456), send('x')]).toEqual([0, 2])
   })
 
   test('keeps separate state for each partitioner a factory builds', () => {

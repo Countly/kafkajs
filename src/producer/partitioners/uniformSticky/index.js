@@ -6,14 +6,15 @@ const toPositive = (x) => x & 0x7fffffff
 
 /**
  * @param {Buffer|string|null|undefined} field a message key or value
- * @returns {number} its length — bytes for a Buffer, characters otherwise — or 0 when absent
+ * @returns {number} its size in bytes - a string as UTF-8, any other value as its string form - or
+ *   0 when absent
  */
 const sizeOf = (field) => {
   if (field == null) {
     return 0
   }
 
-  return Buffer.isBuffer(field) ? field.length : String(field).length
+  return Buffer.isBuffer(field) ? field.length : Buffer.byteLength(String(field))
 }
 
 /**

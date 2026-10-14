@@ -275,4 +275,73 @@ describe('Producer > transaction.sendOffsets', () => {
 
     expect(broker.endTxn).toHaveBeenCalledTimes(1)
   })
+
+  describe('an offset collection with no partition', () => {
+    test.each([
+      ['no topic', []],
+      ['a topic with no partition', [{ topic: 'topic-a', partitions: [] }]],
+    ])(
+      'under transaction version 2 %s starts nothing: no TxnOffsetCommit, and commit() sends no EndTxn',
+      async (_, topics) => {
+        const { broker, transaction } = await openTransaction({ level: 2 })
+        broker.endTxn.mockRejectedValue(protocolError(48))
+
+        await transaction.sendOffsets({ consumerGroupId: GROUP_ID, topics })
+
+        await expect(transaction.commit()).resolves.toBeUndefined()
+        expect(broker.addOffsetsToTxn).not.toHaveBeenCalled()
+        expect(broker.txnOffsetCommit).not.toHaveBeenCalled()
+        expect(broker.endTxn).not.toHaveBeenCalled()
+      }
+    )
+
+    test.each([
+      ['offsets', TOPICS],
+      [
+        'offsets next to a topic with no partition',
+        [{ topic: 'topic-b', partitions: [] }, ...TOPICS],
+      ],
+    ])(
+      'under transaction version 2 %s still start the transaction: TxnOffsetCommit, then EndTxn',
+      async (_, topics) => {
+        const { broker, transaction } = await openTransaction({ level: 2 })
+
+        await transaction.sendOffsets({ consumerGroupId: GROUP_ID, topics })
+        await transaction.commit()
+
+        expect(broker.txnOffsetCommit).toHaveBeenCalledTimes(1)
+        expect(broker.endTxn).toHaveBeenCalledTimes(1)
+        expect(broker.endTxn).toHaveBeenCalledWith(
+          expect.objectContaining({ transactionResult: true })
+        )
+      }
+    )
+
+    test('under transaction version 2 it leaves a transaction that sent records to commit them', async () => {
+      const { broker, transaction } = await openTransaction({ level: 2 })
+
+      await transaction.send({ topic: 'topic-a', messages: [{ value: 'v' }] })
+      await transaction.sendOffsets({ consumerGroupId: GROUP_ID, topics: [] })
+      await transaction.commit()
+
+      expect(broker.txnOffsetCommit).not.toHaveBeenCalled()
+      expect(broker.endTxn).toHaveBeenCalledTimes(1)
+      expect(broker.endTxn).toHaveBeenCalledWith(
+        expect.objectContaining({ transactionResult: true })
+      )
+    })
+
+    test('under transaction version 1 it still sends AddOffsetsToTxn, which starts the transaction', async () => {
+      const { broker, transaction } = await openTransaction({ level: 1 })
+
+      await transaction.sendOffsets({ consumerGroupId: GROUP_ID, topics: [] })
+      await transaction.commit()
+
+      expect(broker.addOffsetsToTxn).toHaveBeenCalledTimes(1)
+      expect(broker.endTxn).toHaveBeenCalledTimes(1)
+      expect(broker.endTxn).toHaveBeenCalledWith(
+        expect.objectContaining({ transactionResult: true })
+      )
+    })
+  })
 })

@@ -15,7 +15,7 @@ const ISOLATION_LEVEL = require('../protocol/isolationLevel')
 const sharedPromiseTo = require('../utils/sharedPromiseTo')
 
 const { keys, values } = Object
-const { CONNECT, DISCONNECT, STOP, CRASH, GROUP_JOIN } = events
+const { CONNECT, DISCONNECT, STOP, CRASH } = events
 
 const eventNames = values(events)
 const eventKeys = keys(events)
@@ -248,11 +248,18 @@ module.exports = (params) => {
    * @type {{ generationId: number, memberId: string }|null}
    */
   let lastJoin = null
-  instrumentationEmitter.addListener(GROUP_JOIN, () => {
+
+  /**
+   * Records the pair of the join that just completed. The runner calls it before `GROUP_JOIN`
+   * is delivered, so a `kafkajs.consumer.group_join` subscriber and an `on()` listener both read
+   * the new pair from `groupMetadata()`.
+   * @returns {void}
+   */
+  const recordJoin = () => {
     if (consumerGroup) {
       lastJoin = { generationId: consumerGroup.generationId, memberId: consumerGroup.memberId }
     }
-  })
+  }
 
   const groupTimeouts = resolveGroupTimeouts({
     maxPollInterval,
@@ -553,6 +560,7 @@ module.exports = (params) => {
         eachBatch,
         eachMessage,
         onCrash,
+        onJoinComplete: recordJoin,
         concurrency,
         maxPrefetchBatches,
       })
@@ -869,7 +877,8 @@ module.exports = (params) => {
    * `groupProtocol: 'consumer'` `generationId` is the live member epoch and `memberId` the live
    * member id, the same pair OffsetCommit v9 carries. The last joined pair is kept across
    * `stop()`/`run()` and a crash restart until the next join; under `groupProtocol: 'consumer'`
-   * the new membership is read live.
+   * the new membership is read live. A `GROUP_JOIN` observer, on its channel or through `on()`,
+   * reads the pair of the join that event reports.
    * @see https://cwiki.apache.org/confluence/display/KAFKA/KIP-447%3A+Producer+scalability+for+exactly+once+semantics
    * @returns {{ groupId: string, generationId: number, memberId: string, groupInstanceId: string|null }}
    * @throws {KafkaJSNonRetriableError} before `run()` and after `stop()`

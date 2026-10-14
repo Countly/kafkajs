@@ -56,6 +56,12 @@ const surfaceInTransaction = (error) => {
 }
 
 /**
+ * @param {{ partitions: unknown[] }[]} topics offsets as given to `sendOffsets`
+ * @returns {boolean} whether any topic holds a partition
+ */
+const hasPartitions = (topics) => topics.some(({ partitions }) => partitions.length > 0)
+
+/**
  * The error a commit whose `EndTxn` outcome is unknown rejects with: the last retriable error of a
  * request whose retries ran out, or whose `retry.maxTotalTime` passed, unwrapped from the retrier's
  * error - a timed-out request, a lost connection, a retriable answer. The coordinator may have
@@ -586,6 +592,11 @@ const createEosManager = ({
      * arms the state its category calls for - a stale generation or member (ILLEGAL_GENERATION,
      * UNKNOWN_MEMBER_ID, FENCED_INSTANCE_ID, STALE_MEMBER_EPOCH) arms `ABORTABLE_ERROR`: abort, let
      * the consumer rejoin, reprocess - and rejects with it.
+     *
+     * Under version 2 offsets holding no partition are skipped, as the Java producer skips them:
+     * nothing is sent and the transaction is not marked started, since the broker starts none for
+     * them and an `EndTxn` on an empty transaction fails. Under version 1 the AddOffsetsToTxn is
+     * still sent, as in 2.2.4.
      * @see https://cwiki.apache.org/confluence/display/KAFKA/KIP-447%3A+Producer+scalability+for+exactly+once+semantics
      * @param {object} options
      * @param {import('../../../types').ConsumerGroupMetadata} [options.consumerGroupMetadata]
@@ -615,6 +626,10 @@ const createEosManager = ({
       const transactionVersion = stateManager.transactionVersion()
 
       try {
+        if (transactionVersion === 2 && !hasPartitions(topics)) {
+          return
+        }
+
         if (transactionVersion === 1) {
           await retrier(async (bail, retryCount, retryTime) => {
             const transactionCoordinator = await findTransactionCoordinator()

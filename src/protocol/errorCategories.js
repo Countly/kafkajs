@@ -47,6 +47,9 @@ const ANY = null
  * producer. UNKNOWN_PRODUCER_ID is abortable on Produce and on the transaction requests for a
  * transactional producer (the Java client's `abortableErrorIfPossible`); the idempotent kind never
  * sends those requests, and its row keeps the Produce row's shape.
+ * MESSAGE_TOO_LARGE and INVALID_TIMESTAMP, like INVALID_RECORD, reject the records of one send: they
+ * are configuration errors on Produce, so a transaction that met one can be aborted and the producer
+ * carries on once the record is fixed.
  * @see https://cwiki.apache.org/confluence/display/KAFKA/KIP-1050:+Consistent+error+handling+for+Transactions
  * @see https://github.com/apache/kafka/blob/4.3/clients/src/main/java/org/apache/kafka/clients/producer/internals/TransactionManager.java
  * @see https://github.com/apache/kafka/blob/4.3/clients/src/main/java/org/apache/kafka/common/errors/RefreshRetriableException.java
@@ -76,7 +79,7 @@ const ROWS = [
   { codes: [48], surfaces: ['txn', 'offsets'], category: 'applicationRecoverable' },
   { codes: [22, 25, 82], surfaces: ['produce', 'txn'], category: 'applicationRecoverable' },
   { codes: [17, 29, 30, 31, 35, 53, 58], surfaces: ANY, category: 'invalidConfiguration' },
-  { codes: [18, 21, 43, 87], surfaces: ['produce'], category: 'invalidConfiguration' },
+  { codes: [10, 18, 21, 32, 43, 87], surfaces: ['produce'], category: 'invalidConfiguration' },
   { codes: [50], surfaces: ['txn'], category: 'invalidConfiguration' },
 ]
 

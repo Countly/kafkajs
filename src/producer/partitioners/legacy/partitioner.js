@@ -18,7 +18,8 @@ const toPositive = (x) => x & 0x7fffffff
  *  - If no partition or key is present choose a partition in a round-robin fashion
  */
 module.exports = (murmur2) => () => {
-  const counters = {}
+  // no prototype: a topic may be named `toString` or `__proto__`
+  const counters = Object.create(null)
 
   return ({ topic, partitionMetadata, message }) => {
     if (!(topic in counters)) {

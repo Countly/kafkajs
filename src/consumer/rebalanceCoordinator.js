@@ -88,6 +88,9 @@ module.exports = class RebalanceCoordinator {
    * @param {import('../instrumentation/emitter')} options.instrumentationEmitter
    * @param {import('../../types').Logger} options.logger
    * @param {string} options.groupId
+   * @param {() => void} [options.onJoinComplete] called once per completed round, immediately
+   *   before `GROUP_JOIN` is delivered, so state it records is visible to every observer of that
+   *   event whatever the order public instrumentation reaches them in
    */
   constructor({
     runner,
@@ -98,6 +101,7 @@ module.exports = class RebalanceCoordinator {
     instrumentationEmitter,
     logger,
     groupId,
+    onJoinComplete = () => {},
   }) {
     this.runner = runner
     this.consumerGroup = consumerGroup
@@ -107,6 +111,7 @@ module.exports = class RebalanceCoordinator {
     this.instrumentationEmitter = instrumentationEmitter
     this.logger = logger.namespace('RebalanceCoordinator')
     this.groupId = groupId
+    this.onJoinComplete = onJoinComplete
 
     /** @type {Promise<void>|null} the running chain; also the single-flight marker */
     this.inFlight = null
@@ -333,6 +338,7 @@ module.exports = class RebalanceCoordinator {
         rebalanceProtocol: this.consumerGroup.rebalanceProtocol(),
       }
 
+      this.onJoinComplete()
       this.instrumentationEmitter.emit(GROUP_JOIN, payload)
       this.logger.info('Consumer has joined the group', payload)
 

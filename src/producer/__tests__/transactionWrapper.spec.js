@@ -24,6 +24,8 @@ const RETRY = { retries: 2, initialRetryTime: 1, maxRetryTime: 2 }
 const UNKNOWN_TOPIC_OR_PARTITION = 3
 const NOT_LEADER_OR_FOLLOWER = 6
 const REQUEST_TIMED_OUT = 7
+const MESSAGE_TOO_LARGE = 10
+const INVALID_TIMESTAMP = 32
 const CONCURRENT_TRANSACTIONS = 51
 const CLUSTER_AUTHORIZATION_FAILED = 31
 const OUT_OF_ORDER_SEQUENCE_NUMBER = 45
@@ -163,6 +165,43 @@ describe('Producer > the transaction wrapper', () => {
         await expect(producer.transaction()).resolves.toBeDefined()
       }
     })
+
+    test.each([
+      ['MESSAGE_TOO_LARGE', MESSAGE_TOO_LARGE],
+      ['INVALID_TIMESTAMP', INVALID_TIMESTAMP],
+    ])(
+      '%s fails the send, abort() ends the transaction, and a corrected send in the next one commits',
+      async (type, code) => {
+        let rejected = false
+        const { broker, producer } = createTransactionalProducer({
+          produce: async (request) => {
+            const errorCode = rejected ? 0 : code
+            rejected = true
+            return answer(request, errorCode)
+          },
+        })
+        await producer.connect()
+        const first = await producer.transaction()
+
+        const sendError = await first.send({ topic: TOPIC, messages: ONE }).catch((e) => e)
+
+        await expect(first.abort()).resolves.toBeUndefined()
+        expect(sendError).toBeInstanceOf(KafkaJSProtocolError)
+        expect(sendError).toMatchObject({
+          type,
+          code,
+          retriable: false,
+          category: 'invalidConfiguration',
+        })
+
+        const second = await producer.transaction()
+        await second.send({ topic: TOPIC, messages: ONE })
+        await expect(second.commit()).resolves.toBeUndefined()
+        expect(
+          broker.endTxn.mock.calls.map(([{ transactionResult }]) => transactionResult)
+        ).toEqual([false, true])
+      }
+    )
 
     test('a retriable error that ran out of retries surfaces as KafkaJSTransactionAbortableError, and outside a transaction as it is', async () => {
       const { producer } = createTransactionalProducer({

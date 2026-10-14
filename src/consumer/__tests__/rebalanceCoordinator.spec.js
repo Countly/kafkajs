@@ -4,6 +4,7 @@ const PollTimer = require('../pollTimer')
 const HeartbeatManager = require('../heartbeatManager')
 const ConsumerGroup = require('../consumerGroup')
 const InstrumentationEventEmitter = require('../../instrumentation/emitter')
+const channels = require('../../instrumentation/channels')
 const { events } = require('../instrumentationEvents')
 const { COOPERATIVE, EAGER } = require('../groupProtocol/interface')
 const {
@@ -36,7 +37,14 @@ const deferred = () => {
 const payloadsOf = (emitted, type) =>
   emitted.filter((event) => event.type === type).map(({ payload }) => payload)
 
-const build = ({ mode = EAGER, assignment = [], deltas = [], heartbeatInterval = 3000 } = {}) => {
+const build = ({
+  mode = EAGER,
+  assignment = [],
+  deltas = [],
+  heartbeatInterval = 3000,
+  onJoinComplete,
+  channels,
+} = {}) => {
   const calls = []
 
   const consumerGroup = {
@@ -89,7 +97,7 @@ const build = ({ mode = EAGER, assignment = [], deltas = [], heartbeatInterval =
   }
 
   const runner = { stopRequested: false, onCrash: jest.fn() }
-  const instrumentationEmitter = new InstrumentationEventEmitter()
+  const instrumentationEmitter = new InstrumentationEventEmitter({ channels })
   const emitted = []
   for (const name of [
     events.REBALANCING,
@@ -114,6 +122,7 @@ const build = ({ mode = EAGER, assignment = [], deltas = [], heartbeatInterval =
     instrumentationEmitter,
     logger: newLogger(),
     groupId: 'coordinator-group',
+    onJoinComplete,
   })
 
   return {
@@ -163,6 +172,7 @@ const createRealRunner = (options = {}) => {
     maxPollInterval: 300000,
     eachBatch: async () => {},
     onCrash: jest.fn(),
+    onJoinComplete: options.onJoinComplete,
   })
 
   // Replacing a collaborator field on an instance is stubbing, not a production accessor added
@@ -1293,6 +1303,50 @@ describe('Consumer > RebalanceCoordinator', () => {
       }
 
       expect(manager.isRunning()).toBe(false)
+    })
+  })
+
+  describe('the completed join is recorded before GROUP_JOIN is delivered', () => {
+    it('runs once per completed round, ahead of the channel subscribers and the listeners', async () => {
+      const order = []
+      const subscriber = () => order.push('channel subscriber')
+      const channel = channels.consumer[events.GROUP_JOIN]
+      channel.subscribe(subscriber)
+      try {
+        const { coordinator, instrumentationEmitter } = build({
+          channels: channels.consumer,
+          onJoinComplete: () => order.push('onJoinComplete'),
+        })
+        instrumentationEmitter.addListener(events.GROUP_JOIN, () => order.push('listener'))
+
+        await coordinator.runRound('rebalance-in-progress', 'revoked')
+
+        expect(order).toEqual(['onJoinComplete', 'channel subscriber', 'listener'])
+      } finally {
+        channel.unsubscribe(subscriber)
+      }
+    })
+
+    it('does not run when the round fails before it completes', async () => {
+      const onJoinComplete = jest.fn()
+      const { coordinator, consumerGroup } = build({ onJoinComplete })
+      consumerGroup.joinAndSync.mockRejectedValueOnce(new Error('join failed'))
+
+      await coordinator.runRound('rebalance-in-progress', 'revoked').catch(() => {})
+
+      expect(onJoinComplete).not.toHaveBeenCalled()
+    })
+
+    it('is handed to the coordinator a real Runner builds', async () => {
+      const onJoinComplete = jest.fn()
+      const { runner, calls } = createRealRunner({ onJoinComplete })
+      onJoinComplete.mockImplementation(() => calls.push('onJoinComplete'))
+      runner.scheduleFetchManager = jest.fn()
+
+      await runner.start()
+
+      expect(onJoinComplete).toHaveBeenCalledTimes(1)
+      expect(calls.indexOf('onJoinComplete')).toBeLessThan(calls.indexOf(events.GROUP_JOIN))
     })
   })
 

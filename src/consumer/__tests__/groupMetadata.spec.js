@@ -5,6 +5,7 @@ const ConsumerGroup = require('../consumerGroup')
 const Runner = require('../runner')
 const createConsumer = require('../index')
 const InstrumentationEventEmitter = require('../../instrumentation/emitter')
+const channels = require('../../instrumentation/channels')
 const { events } = require('../instrumentationEvents')
 const { KafkaJSNonRetriableError } = require('../../errors')
 const { newLogger, waitFor } = require('testHelpers')
@@ -16,9 +17,10 @@ const eachMessage = async () => {}
 /**
  * A consumer whose `ConsumerGroup` is a plain object carrying the five accessors `groupMetadata()`
  * reads, and whose `Runner` does nothing. `join` does what a completed rebalance round does: it
- * moves the membership, then emits `GROUP_JOIN` on the consumer's instrumentation emitter, as the
- * rebalance coordinator does right after it applies a round. `crash` hands the runner's `onCrash`
- * a retriable error, as a dying runner does, so the consumer restarts after 1 ms.
+ * moves the membership, calls the runner's `onJoinComplete`, then emits `GROUP_JOIN` on the
+ * consumer's instrumentation emitter, in the order the rebalance coordinator does. `crash` hands
+ * the runner's `onCrash` a retriable error, as a dying runner does, so the consumer restarts
+ * after 1 ms.
  * @param {{ groupProtocol?: 'classic'|'consumer', groupInstanceId?: string|null }} [options]
  * @returns {{ consumer: object, membership: object, join: (fields: object) => void, crash: () => Promise<void> }}
  */
@@ -31,14 +33,14 @@ const build = ({ groupProtocol = 'classic', groupInstanceId = null } = {}) => {
     memberEpoch: consumerProtocol ? 0 : null,
     groupInstanceId,
   }
-  let onCrash
+  let runnerOptions
   ConsumerGroup.mockImplementation(() => membership)
   Runner.mockImplementation((options) => {
-    onCrash = options.onCrash
+    runnerOptions = options
     return { start: async () => {}, stop: async () => {} }
   })
 
-  const instrumentationEmitter = new InstrumentationEventEmitter()
+  const instrumentationEmitter = new InstrumentationEventEmitter({ channels: channels.consumer })
   const consumer = createConsumer({
     cluster: { onTopicRecreated: () => () => {}, disconnect: async () => {} },
     groupId: GROUP_ID,
@@ -50,6 +52,7 @@ const build = ({ groupProtocol = 'classic', groupInstanceId = null } = {}) => {
 
   const join = (fields) => {
     Object.assign(membership, fields)
+    runnerOptions.onJoinComplete()
     instrumentationEmitter.emit(events.GROUP_JOIN, {
       groupId: GROUP_ID,
       memberId: membership.memberId,
@@ -57,7 +60,7 @@ const build = ({ groupProtocol = 'classic', groupInstanceId = null } = {}) => {
   }
 
   const crash = () =>
-    onCrash(Object.assign(new Error('crashed'), { retriable: true, retryTime: 1 }))
+    runnerOptions.onCrash(Object.assign(new Error('crashed'), { retriable: true, retryTime: 1 }))
 
   return { consumer, membership, join, crash }
 }
@@ -247,6 +250,74 @@ describe('Consumer > groupMetadata', () => {
     join({ generationId: 5, memberId: 'member-a' })
 
     expect(payloads).toEqual([{ groupId: GROUP_ID, memberId: 'member-a' }])
+  })
+
+  describe('observers of GROUP_JOIN', () => {
+    const channel = channels.consumer[events.GROUP_JOIN]
+    let unsubscribe
+
+    /**
+     * Records what `groupMetadata()` returns inside each `GROUP_JOIN` delivery, once through the
+     * `kafkajs.consumer.group_join` channel and once through an `on()` listener.
+     * @param {object} consumer
+     * @returns {{ channel: object[], listener: object[] }}
+     */
+    const observe = (consumer) => {
+      const seen = { channel: [], listener: [] }
+      const subscriber = () => seen.channel.push(consumer.groupMetadata())
+      channel.subscribe(subscriber)
+      unsubscribe = () => channel.unsubscribe(subscriber)
+      consumer.on(consumer.events.GROUP_JOIN, () => seen.listener.push(consumer.groupMetadata()))
+      return seen
+    }
+
+    afterEach(() => unsubscribe && unsubscribe())
+
+    test('classic: a first join and a rejoin give both kinds of observer the new pair', async () => {
+      const { consumer, join } = build()
+      const seen = observe(consumer)
+      await consumer.run({ eachMessage })
+
+      join({ generationId: 5, memberId: 'member-a' })
+      join({ generationId: 6 })
+
+      const pairs = (snapshots) =>
+        snapshots.map(({ generationId, memberId }) => ({ generationId, memberId }))
+      const expected = [
+        { generationId: 5, memberId: 'member-a' },
+        { generationId: 6, memberId: 'member-a' },
+      ]
+      expect(pairs(seen.channel)).toEqual(expected)
+      expect(pairs(seen.listener)).toEqual(expected)
+    })
+
+    test('classic: a lost membership keeps the observed pair until the next join replaces it', async () => {
+      const { consumer, membership, join } = build()
+      const seen = observe(consumer)
+      await consumer.run({ eachMessage })
+      join({ generationId: 5, memberId: 'member-a' })
+
+      Object.assign(membership, { generationId: null, memberId: null })
+      expect(consumer.groupMetadata()).toMatchObject({ generationId: 5, memberId: 'member-a' })
+
+      join({ generationId: 7, memberId: 'member-b' })
+
+      expect(seen.channel[1]).toMatchObject({ generationId: 7, memberId: 'member-b' })
+      expect(seen.listener[1]).toMatchObject({ generationId: 7, memberId: 'member-b' })
+      expect(consumer.groupMetadata()).toMatchObject({ generationId: 7, memberId: 'member-b' })
+    })
+
+    test('consumer protocol: a first join gives both kinds of observer the live member epoch', async () => {
+      const { consumer, join } = build({ groupProtocol: 'consumer' })
+      const seen = observe(consumer)
+      await consumer.run({ eachMessage })
+
+      join({ memberEpoch: 3 })
+
+      for (const snapshot of [seen.channel[0], seen.listener[0]]) {
+        expect(snapshot).toMatchObject({ generationId: 3, memberId: 'generated-member-id' })
+      }
+    })
   })
 
   test.each(['classic', 'consumer'])('throws again after stop() (%s)', async (groupProtocol) => {

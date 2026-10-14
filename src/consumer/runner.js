@@ -35,6 +35,7 @@ module.exports = class Runner extends EventEmitter {
    * @param {number} [options.heartbeatInterval]
    * @param {number} options.maxPollInterval the resolved poll deadline, in milliseconds
    * @param {(reason: Error) => void} options.onCrash
+   * @param {() => void} [options.onJoinComplete] forwarded to the rebalance coordinator
    * @param {import("../../types").RetryOptions} [options.retry]
    * @param {boolean} [options.autoCommit=true]
    * @param {0|1} [options.maxPrefetchBatches=0] reserved for a fetch layer that runs one Fetch
@@ -51,6 +52,7 @@ module.exports = class Runner extends EventEmitter {
     heartbeatInterval,
     maxPollInterval,
     onCrash,
+    onJoinComplete,
     retry,
     autoCommit = true,
     maxPrefetchBatches = 0,
@@ -109,6 +111,7 @@ module.exports = class Runner extends EventEmitter {
       instrumentationEmitter,
       logger: this.logger,
       groupId: consumerGroup.groupId,
+      onJoinComplete,
     })
 
     consumerGroup.attach({

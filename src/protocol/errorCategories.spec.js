@@ -22,6 +22,22 @@ describe('categoryOf', () => {
     expect(categoryOf(87, { retriable: false, surface: 'txn' })).toEqual('applicationRecoverable')
   })
 
+  test.each([10, 32])(
+    'a rejected record, code %i, is invalidConfiguration on Produce only',
+    (code) => {
+      expect(categoryOf(code, { retriable: false, surface: 'produce' })).toEqual(
+        'invalidConfiguration'
+      )
+      expect(
+        categoryOf(code, { retriable: false, surface: 'produce', transactional: true })
+      ).toEqual('invalidConfiguration')
+      expect(categoryOf(code, { retriable: false })).toEqual('applicationRecoverable')
+      expect(categoryOf(code, { retriable: false, surface: 'txn' })).toEqual(
+        'applicationRecoverable'
+      )
+    }
+  )
+
   test('rows are tried in order, so one code can answer differently on each surface', () => {
     expect(categoryOf(48, { retriable: false, surface: 'produce' })).toEqual('abortable')
     expect(categoryOf(48, { retriable: false, surface: 'txn' })).toEqual('applicationRecoverable')

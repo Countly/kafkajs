@@ -76,14 +76,13 @@ notice and what, if anything, to do.
 
 - **The producer follows leader hints.** When a produce request fails with a leadership error, a
   Kafka 4.x broker also names the node that now leads the partition and, where the client may not
-  know it, that node's address. The producer now applies both immediately, so its next retry
-  attempt goes straight to the new leader instead of routing to the old one until the metadata
-  refresh finishes. Retry timing, the retry unit (the whole per-broker request) and the idempotent
-  producer's sequence bookkeeping are all unchanged. The one consequence to know about: if a hint
-  replaces the connection to a broker that had *already succeeded* within the current `send()`,
-  that broker's partitions are produced again on the next attempt. This slightly widens the
-  duplicate-on-retry window that already existed, and the array `send()` resolves with can then
-  contain two `RecordMetadata` entries for the same partition instead of one.
+  know it, that node's address. The producer now applies both before its next attempt, so the retry
+  goes straight to the new leader instead of routing to the old one until the metadata refresh
+  finishes. Each partition's batch settles on its own answer: a batch that succeeded is resolved
+  and never sent again, so a hint cannot make records that were already acknowledged go out twice,
+  and only a batch that failed with a retriable error is retried (a request that failed as a whole
+  retries every batch it carried). The hint changes where the retry goes, not when: the backoff and
+  each batch's sequence number are unchanged.
 
 - **`kafka.producer()` is idempotent by default.** Every send requires `acks: -1` and the
   producer allocates a producer id at `connect()`. The size of the retry budget is unchanged:
@@ -1001,7 +1000,9 @@ now logged.
   epoch now arrives as `PRODUCER_FENCED` (90) rather than `INVALID_PRODUCER_EPOCH` (47); code that
   matched 47 should match `error.category` or both codes. Outside a transaction,
   `KafkaJSNumberOfRetriesExceeded` means the send ran out of its retry budget; the producer remains
-  usable, and retrying the send is safe on an idempotent producer.
+  usable. The client's own retries keep the batch's producer id, epoch and sequence, so the broker
+  drops a duplicate. After this error the outcome is unknown, and a new `send()` may write the
+  records again: deduplicate in the application, or use a transaction where that matters.
 - **Instrumentation events are also published on `node:diagnostics_channel`.** Each of the 42
   events is on the channel `kafkajs.<event name>`, with the same event object an `on()` listener
   receives; when an event has both, channel subscribers run first. Subscribers run synchronously and

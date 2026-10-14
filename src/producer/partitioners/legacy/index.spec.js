@@ -75,6 +75,22 @@ describe('Producer > Partitioner > Legacy', () => {
     expect(topics[1].partitionCount[2]).toEqual(15)
   })
 
+  test.each(['toString', 'constructor', '__proto__'])(
+    'round-robins a topic named %s like any other and leaves Object.prototype alone',
+    (name) => {
+      const before = Reflect.ownKeys(Object.prototype)
+      const partitionCount = {}
+
+      for (let i = 0; i < 30; ++i) {
+        const partition = partitioner({ topic: name, partitionMetadata, message: {} })
+        partitionCount[partition] = (partitionCount[partition] || 0) + 1
+      }
+
+      expect(partitionCount).toEqual({ 0: 10, 1: 10, 2: 10 })
+      expect(Reflect.ownKeys(Object.prototype)).toEqual(before)
+    }
+  )
+
   test('returns the configured partition if it exists', () => {
     const partition = partitioner({
       topic,

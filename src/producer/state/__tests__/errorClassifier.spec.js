@@ -155,6 +155,18 @@ const TABLE = [
     category: 'invalidConfiguration',
   },
   {
+    type: 'MESSAGE_TOO_LARGE',
+    code: 10,
+    surfaces: ['produce'],
+    category: 'invalidConfiguration',
+  },
+  {
+    type: 'INVALID_TIMESTAMP',
+    code: 32,
+    surfaces: ['produce'],
+    category: 'invalidConfiguration',
+  },
+  {
     type: 'INVALID_TOPIC_EXCEPTION',
     code: 17,
     surfaces: SURFACES,

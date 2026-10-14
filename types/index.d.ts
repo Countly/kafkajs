@@ -1041,7 +1041,11 @@ export type Broker = {
     acks?: number
     timeout?: number
     compression?: CompressionTypes
-    /** With a `transactionalId`: 2 sends Produce v12, which adds the partition itself (KIP-890). */
+    /**
+     * With a `transactionalId`: 2 sends Produce v12, which adds the partition itself (KIP-890). A
+     * request that would go out below v12, for want of a broker offer or under a lower
+     * `maxVersion`, rejects with `KafkaJSServerDoesNotSupportApiKey` and sends nothing.
+     */
     transactionVersion?: 1 | 2
   }): Promise<any>
   /**

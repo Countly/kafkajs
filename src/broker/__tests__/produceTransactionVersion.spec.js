@@ -101,10 +101,52 @@ describe('Broker > produce > the transaction-version gate', () => {
     expect(harness.requests).toHaveLength(0)
   })
 
-  test('a lower maxVersion from the caller still wins under transaction version 2', async () => {
+  test('a caller maxVersion of 12 or more still sends a transaction under transaction version 2 at v12', async () => {
+    for (const maxVersion of [12, 13, 99]) {
+      expect(await versionSentFor({ ...TRANSACTIONAL, transactionVersion: 2, maxVersion })).toEqual(
+        12
+      )
+    }
+  })
+
+  test('a lower maxVersion from the caller still wins under transaction version 1', async () => {
     expect(
-      await versionSentFor({ ...TRANSACTIONAL, transactionVersion: 2, maxVersion: 10 })
+      await versionSentFor({ ...TRANSACTIONAL, transactionVersion: 1, maxVersion: 10 })
     ).toEqual(10)
+  })
+
+  test.each([10, 11])(
+    'transaction version 2 refuses a maxVersion of %p, naming it and the broker versions, and sends nothing',
+    async (maxVersion) => {
+      const harness = createGroupApiBroker({
+        versions: { [apiKeys.Produce]: { minVersion: 3, maxVersion: 13 } },
+        respond: () => EMPTY_FLEXIBLE_RESPONSE,
+      })
+      harnesses.push(harness)
+
+      const error = await harness.broker
+        .produce({
+          acks: -1,
+          timeout: 30000,
+          topicData,
+          ...TRANSACTIONAL,
+          transactionVersion: 2,
+          maxVersion,
+        })
+        .catch((e) => e)
+
+      expect(error).toBeInstanceOf(KafkaJSServerDoesNotSupportApiKey)
+      expect(error).toMatchObject({ apiKey: apiKeys.Produce, apiName: 'Produce', retriable: false })
+      expect(error.message).toEqual(
+        `Broker 127.0.0.1:9092 offers Produce v3-v13, but maxVersion ${maxVersion} leaves a ` +
+          'transaction under transaction version 2 below the v12 it needs'
+      )
+      expect(harness.requests).toHaveLength(0)
+    }
+  )
+
+  test('the maxVersion refusal does not touch a produce that carries no transaction', async () => {
+    expect(await versionSentFor({ transactionVersion: 2, maxVersion: 10 })).toEqual(10)
   })
 
   test('the transaction version does not move a produce without a transactional id', async () => {

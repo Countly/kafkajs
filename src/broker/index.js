@@ -613,8 +613,9 @@ module.exports = class Broker {
    * @returns {Promise<object|import('../protocol/requests/produce/partitionResults').PartitionResult[]|undefined>}
    *   the decoded response, or with `perPartitionResults` one `PartitionResult` per partition;
    *   `undefined` with `acks: 0`
-   * @throws {KafkaJSServerDoesNotSupportApiKey} under transaction version 2, when this broker
-   *   offers no Produce v12: a lower version would not add the partition to the transaction
+   * @throws {KafkaJSServerDoesNotSupportApiKey} under transaction version 2, when the version the
+   *   request would negotiate is below Produce v12 - this broker offers no v12, or `maxVersion` is
+   *   under 12 - because a lower version would not add the partition to the transaction
    * @see https://cwiki.apache.org/confluence/display/KAFKA/KIP-890%3A+Transactions+Server-Side+Defense
    */
   async produce({
@@ -639,16 +640,6 @@ module.exports = class Broker {
         : Math.min(ceiling, maxVersion === undefined ? Infinity : maxVersion)
 
     const produce = this.lookupRequestWithMax(apiKeys.Produce, requests.Produce, cap)
-    if (ceiling === TRANSACTION_V2_PRODUCE_VERSION) {
-      const offered = this.versions[apiKeys.Produce]
-      if (offered.maxVersion < TRANSACTION_V2_PRODUCE_VERSION) {
-        throw new KafkaJSServerDoesNotSupportApiKey(
-          `Broker ${this.brokerAddress} offers Produce v${offered.minVersion}-v${offered.maxVersion}, ` +
-            `but a transaction under transaction version 2 needs v${TRANSACTION_V2_PRODUCE_VERSION}`,
-          { apiKey: apiKeys.Produce, apiName: 'Produce' }
-        )
-      }
-    }
     // Asked rather than read off the built request, unlike `fetch`: the id -> name map below has
     // to exist before the builder runs, because the response codec is bound to it.
     // `negotiatedVersion` with no cap map is the uncapped question; passing a sentinel through the
@@ -657,6 +648,18 @@ module.exports = class Broker {
       cap === undefined
         ? this.negotiatedVersion(apiKeys.Produce, requests.Produce)
         : this.negotiatedVersion(apiKeys.Produce, requests.Produce, { [apiKeys.Produce]: cap })
+
+    if (ceiling === TRANSACTION_V2_PRODUCE_VERSION && version < TRANSACTION_V2_PRODUCE_VERSION) {
+      const { minVersion, maxVersion: offeredMax } = this.versions[apiKeys.Produce]
+      const offers = `Broker ${this.brokerAddress} offers Produce v${minVersion}-v${offeredMax}`
+      throw new KafkaJSServerDoesNotSupportApiKey(
+        offeredMax < TRANSACTION_V2_PRODUCE_VERSION
+          ? `${offers}, but a transaction under transaction version 2 needs v${TRANSACTION_V2_PRODUCE_VERSION}`
+          : `${offers}, but maxVersion ${maxVersion} leaves a transaction under transaction version 2 ` +
+              `below the v${TRANSACTION_V2_PRODUCE_VERSION} it needs`,
+        { apiKey: apiKeys.Produce, apiName: 'Produce' }
+      )
+    }
 
     // Built only at v13, the only version that needs it: below that nothing extra is allocated.
     let topicNames

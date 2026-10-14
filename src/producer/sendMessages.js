@@ -745,10 +745,11 @@ class DrainLoop {
    * @param {import('./state')} manager
    * @param {Map<string, Map<number, Delivery>>} ready
    * @param {number} now
-   * @returns {import('./state/partitionSequencer').LeaderMap}
+   * @returns {import('./state/partitionSequencer').LeaderMap} keyed by topic, without a
+   *   prototype: a topic may be named `toString` or `__proto__`
    */
   #leadersOf(manager, ready, now) {
-    const leaders = {}
+    const leaders = Object.create(null)
     for (const [topic, heads] of ready) {
       let routed = {}
       try {
@@ -1568,10 +1569,11 @@ const createSendMessages = ({
     try {
       await handOffRetrier(async (bail, retryCount, retryTime) => {
         const topics = []
-        const byTopic = {}
+        // no prototype: a topic may be named `toString` or `__proto__`
+        const byTopic = Object.create(null)
         for (const batch of unsettled) {
           if (byTopic[batch.topic] === undefined) {
-            byTopic[batch.topic] = {}
+            byTopic[batch.topic] = Object.create(null)
             topics.push(batch.topic)
           }
           byTopic[batch.topic][batch.partition] = batch
