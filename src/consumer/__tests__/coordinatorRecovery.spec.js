@@ -5,6 +5,7 @@ const {
   createCluster,
   createTopic,
   newLogger,
+  waitFor,
   waitForConsumerToJoinGroup,
 } = require('testHelpers')
 
@@ -107,7 +108,12 @@ describe('Consumer > coordinator recovery', () => {
     await producer.connect()
     await producer.send({ topic: topicName, messages: [{ key: 'k', value: 'v' }] })
 
-    await new Promise((resolve) => setTimeout(resolve, 1000))
+    // Wait for the consumed message itself: a producer ack says nothing about the consumer's fetch
+    await waitFor(() => received.length > 0, {
+      ignoreTimeout: false,
+      maxWait: 10000,
+      timeoutMessage: 'consumer did not receive the produced message',
+    })
     expect(received.length).toBeGreaterThan(0)
 
     // Quiet the fetch loop so the only remaining network activity is the commit itself.

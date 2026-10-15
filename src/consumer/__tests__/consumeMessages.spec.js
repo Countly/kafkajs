@@ -373,8 +373,8 @@ describe('Consumer', () => {
 
     // stop the consumer right after processing the batch, the offsets should be
     // committed in the end
-    consumer.on(consumer.events.END_BATCH_PROCESS, async () => {
-      await consumer.stop()
+    const stopped = new Promise((resolve) => {
+      consumer.on(consumer.events.END_BATCH_PROCESS, () => resolve(consumer.stop()))
     })
 
     const messages = Array(100)
@@ -415,6 +415,8 @@ describe('Consumer', () => {
 
     // check if all offsets are present
     expect(messagesConsumed.map((m) => m.message.offset)).toEqual(messages.map((_, i) => `${i}`))
+    // The stop finishes the commit, so fetch the offsets only after it settles
+    await stopped
     const response = await admin.fetchOffsets({ groupId, topics: [topicName] })
     const { partitions } = response.find(({ topic }) => topic === topicName)
     const partition = partitions.find(({ partition }) => partition === 0)
@@ -636,11 +638,16 @@ describe('Consumer', () => {
     await consumer.subscribe({ topic: topicName, fromBeginning: true })
 
     let calls = 0
+    let releaseHandler
+    const handlerBlocked = new Promise((resolve) => {
+      releaseHandler = resolve
+    })
 
     consumer.run({
       eachMessage: async (event) => {
         calls++
-        await sleep(100)
+        // Holds the first handler until the disconnect has started, so the 2nd cannot run first
+        await handlerBlocked
       },
     })
 
@@ -653,7 +660,10 @@ describe('Consumer', () => {
 
     await producer.send({ acks: 1, topic: topicName, messages: [message1, message2] })
     await waitFor(() => calls > 0, {})
-    await consumer.disconnect() // don't give the consumer the chance to consume the 2nd message
+    // don't give the consumer the chance to consume the 2nd message
+    const disconnected = consumer.disconnect()
+    releaseHandler()
+    await disconnected
 
     expect(calls).toEqual(1)
   })
@@ -1077,10 +1087,8 @@ describe('Consumer', () => {
         })
         await abortedTxn1.abort()
 
-        const number = 1
-        await waitForMessages(messagesConsumed, {
-          number,
-        })
+        // Wait for every message the assertions below read, not just the first
+        await waitForMessages(messagesConsumed, { number: abortedMessages.length })
 
         expect(messagesConsumed).toHaveLength(abortedMessages.length)
         expect(messagesConsumed[0].message.value.toString()).toMatch(/value-aborted-txn1-0/)

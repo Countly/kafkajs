@@ -10,8 +10,37 @@ const {
   waitForConsumerToJoinGroup,
 } = require('testHelpers')
 
+/**
+ * Polls the group's committed offset for partition 0 until it equals `offset`, because the runner
+ * commits after the handler has thrown.
+ * @param {() => Promise<any>} fetchOffsets Reads the group's OffsetFetch response.
+ * @param {string} offset The committed offset to wait for.
+ * @returns {Promise<any>} The OffsetFetch response that carried `offset`.
+ * @throws {import('../../errors').KafkaJSTimeout} When the offset is not committed in time.
+ */
+const waitForCommittedOffset = (fetchOffsets, offset) =>
+  waitFor(
+    async () => {
+      const response = await fetchOffsets()
+      return response.responses[0].partitions[0].offset === offset && response
+    },
+    {
+      ignoreTimeout: false,
+      maxWait: 10000,
+      timeoutMessage: `committed offset did not reach ${offset}`,
+    }
+  )
+
 describe('Consumer', () => {
   let topicName, groupId, cluster, producer, consumer
+
+  const fetchOffsets = async () => {
+    const coordinator = await cluster.findGroupCoordinator({ groupId })
+    return coordinator.offsetFetch({
+      groupId,
+      topics: [{ topic: topicName, partitions: [{ partition: 0 }] }],
+    })
+  }
 
   beforeEach(async () => {
     topicName = `test-topic-${secureRandom()}`
@@ -94,16 +123,8 @@ describe('Consumer', () => {
 
       await waitForConsumerToJoinGroup(consumer)
       await expect(waitFor(() => raisedError)).resolves.toBeTruthy()
-      const coordinator = await cluster.findGroupCoordinator({ groupId })
-      const offsets = await coordinator.offsetFetch({
-        groupId,
-        topics: [
-          {
-            topic: topicName,
-            partitions: [{ partition: 0 }],
-          },
-        ],
-      })
+      // The runner commits after the throw, so wait for the offset instead of reading it once
+      const offsets = await waitForCommittedOffset(fetchOffsets, '2')
 
       expect(offsets).toEqual({
         clientSideThrottleTime: expect.optional(0),
@@ -235,16 +256,8 @@ describe('Consumer', () => {
 
       await waitForConsumerToJoinGroup(consumer)
       await expect(waitFor(() => raisedError)).resolves.toBeTruthy()
-      const coordinator = await cluster.findGroupCoordinator({ groupId })
-      const offsets = await coordinator.offsetFetch({
-        groupId,
-        topics: [
-          {
-            topic: topicName,
-            partitions: [{ partition: 0 }],
-          },
-        ],
-      })
+      // The runner commits after the throw, so wait for the offset instead of reading it once
+      const offsets = await waitForCommittedOffset(fetchOffsets, '2')
 
       expect(offsets).toEqual({
         clientSideThrottleTime: expect.optional(0),

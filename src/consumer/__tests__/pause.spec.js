@@ -1,5 +1,6 @@
 const createProducer = require('../../producer')
 const createConsumer = require('../index')
+const { isDeepStrictEqual } = require('util')
 const { KafkaJSNonRetriableError } = require('../../errors')
 
 const {
@@ -7,9 +8,28 @@ const {
   createCluster,
   createTopic,
   newLogger,
+  waitFor,
   waitForMessages,
   waitForConsumerToJoinGroup,
 } = require('testHelpers')
+
+/**
+ * Resolves once `consumer.paused()` holds every expected entry. Fails after 5 s, so a pause
+ * that never happens fails the case instead of hanging it.
+ * @param {import('../../../types').Consumer} consumer
+ * @param {Array<{ topic: string, partitions: number[] }>} expected
+ * @returns {Promise<boolean>}
+ * @throws {import('../../errors').KafkaJSTimeout} When the entries are not all paused in time.
+ */
+const waitForPaused = (consumer, expected) =>
+  waitFor(
+    () => expected.every((entry) => consumer.paused().some((p) => isDeepStrictEqual(p, entry))),
+    {
+      ignoreTimeout: false,
+      maxWait: 5000,
+      timeoutMessage: `consumer did not pause ${JSON.stringify(expected)}`,
+    }
+  )
 
 describe('Consumer', () => {
   /**
@@ -104,6 +124,8 @@ describe('Consumer', () => {
       await waitForConsumerToJoinGroup(consumer)
       await waitForMessages(messagesConsumed, { number: 3 })
       const [pausedTopic] = topics
+      // The pausing message adds no consumed message, so the count can be met before it runs
+      await waitForPaused(consumer, [{ topic: pausedTopic, partitions: [0] }])
       expect(consumer.paused()).toEqual([{ topic: pausedTopic, partitions: [0] }])
 
       for (const topic of topics) {
@@ -245,6 +267,11 @@ describe('Consumer', () => {
       })
       await waitForConsumerToJoinGroup(consumer)
       await waitForMessages(messagesConsumed, { number: 5 })
+      // The pausing batches add no consumed message, so the count can be met before they run
+      await waitForPaused(consumer, [
+        { topic: topics[0], partitions: [0] },
+        { topic: topics[1], partitions: [1] },
+      ])
       expect(consumer.paused()).toContainEqual({ topic: topics[0], partitions: [0] })
       expect(consumer.paused()).toContainEqual({ topic: topics[1], partitions: [1] })
       shouldPause = false
