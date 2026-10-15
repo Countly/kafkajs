@@ -28,6 +28,9 @@ const COOPERATIVE = 'cooperative'
  *   round loop, the poll-expiry path and the error contract, none of which can reach the protocol
  *   except through `ConsumerGroup`
  * @property {number} memberEpoch the current member epoch, or null for a protocol that has none
+ * @property {number} joinCount how many joins the coordinator has accepted, counted before the
+ *   round's sync or apply; only ever goes up, so it tells a membership that replaced another even
+ *   when the generation, the epoch and the member id came back the same
  * @property {() => Promise<void>} connect resolves the group coordinator
  * @property {(context: { topics: string[], topicsSubscribed: string[],
  *   beforeSync: () => void, growSubscription?: (names: string[]) => Promise<void> }) => Promise<Object>} rebalance

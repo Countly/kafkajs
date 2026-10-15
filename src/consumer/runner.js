@@ -210,6 +210,17 @@ module.exports = class Runner extends EventEmitter {
     this.scheduleFetchManager()
   }
 
+  /**
+   * Runs the fetch manager under the fetch retrier, one call per fetch loop, and chains the next
+   * call when the retrier settles.
+   *
+   * Each attempt first takes a verdict that is already waiting in the slot and runs its round
+   * instead of starting the fetch manager. A verdict can land while the loop sits between two
+   * `start()` calls - in the retrier's backoff after a heartbeat failure that carried no verdict,
+   * say - and nothing else reads the slot then: `start()` clears the stop latch the verdict set, so
+   * a loop that started anyway would keep fetching for a member that has already left its group.
+   * @returns {void}
+   */
   scheduleFetchManager() {
     if (!this.running) {
       this.consuming = false
@@ -226,6 +237,13 @@ module.exports = class Runner extends EventEmitter {
 
     this.fetchRetrier(async (bail, retryCount, retryTime) => {
       if (!this.running) {
+        return
+      }
+
+      const waiting = this.rebalanceCoordinator.takeVerdict()
+
+      if (waiting) {
+        await this.handleRebalanceError(waiting)
         return
       }
 

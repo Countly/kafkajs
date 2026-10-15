@@ -320,6 +320,12 @@ module.exports = class ConsumerGroupProtocol {
 
     this.state = UNSUBSCRIBED
     this.memberEpoch = 0
+    /**
+     * How many joins the coordinator has accepted. Only ever goes up: a rejoin can come back at the
+     * epoch the member left, and the member id never changes, so the count is the only thing that
+     * tells a replacing membership from the one it replaced.
+     */
+    this.joinCount = 0
     this.coordinator = null
     this.heartbeatIntervalMs = INITIAL_HEARTBEAT_INTERVAL_MS
     this.generatedMemberId = generateMemberId()
@@ -611,8 +617,8 @@ module.exports = class ConsumerGroupProtocol {
   }
 
   /**
-   * Reports the join, once. Clearing the deferred is what keeps a later attempt from awaiting a
-   * settled promise.
+   * Reports the join, once, and counts it. Clearing the deferred is what keeps a later attempt from
+   * awaiting a settled promise.
    * @private
    * @returns {void}
    */
@@ -620,6 +626,7 @@ module.exports = class ConsumerGroupProtocol {
     const record = this.#firstMembership
     if (!record) return
 
+    this.joinCount += 1
     this.#firstMembership = null
     clearTimeout(record.deadline)
     record.resolve()

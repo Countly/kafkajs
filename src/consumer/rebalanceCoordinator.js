@@ -542,6 +542,13 @@ module.exports = class RebalanceCoordinator {
    * layer waits for the running handler to return, and on a poll expiry that handler is by
    * definition overrunning. A protocol action must never queue behind it.
    *
+   * The leave is awaited, so a rebalance round can start, join and install a new membership while
+   * it is in flight. The count of accepted joins is read before the leave for that reason: the leave
+   * answers for the membership it was sent for, so once a round has joined there is nothing left to
+   * reset and no verdict to raise, and resetting would void the new membership. The count, not the
+   * generation, because a rejoin can come back at the same generation or epoch. Otherwise the
+   * generation is reset, and a round still in flight owns the rejoin, so no LOST verdict is raised.
+   *
    * @param {{ elapsedMs: number, isStatic: boolean }} details
    * @returns {Promise<void>}
    */
@@ -570,6 +577,8 @@ module.exports = class RebalanceCoordinator {
 
     this.heartbeatManager.stop()
 
+    const joinsBefore = this.consumerGroup.joinCount
+
     // KIP-848 members always tell the coordinator they are gone, static or not - the protocol picks
     // epoch -1 or -2 from `groupInstanceId`. KIP-345's "a static member sends nothing" rule is the
     // CLASSIC rule, and staying silent here would leave a static consumer-protocol member out of
@@ -589,7 +598,17 @@ module.exports = class RebalanceCoordinator {
       })
     }
 
+    if (this.consumerGroup.joinCount !== joinsBefore) {
+      return
+    }
+
     this.consumerGroup.resetGenerationLocally()
+
+    // A round that started during the leave above already rejoins this member. A second LOST would
+    // stay in the slot after that round ends, and an orphan there reads as a rebalance still owed.
+    if (this.isRebalancing()) {
+      return
+    }
 
     this.requestRejoin({
       kind: 'lost',
@@ -607,6 +626,14 @@ module.exports = class RebalanceCoordinator {
    * LOST beats REVOKED. The two differ on whether uncommitted offsets may be committed, so a
    * REVOKED must never overwrite a LOST. Two verdicts of the same kind collapse to the first.
    *
+   * A pending verdict that is already stale is replaced, whatever its kind. It would only be dropped
+   * when acted on, and keeping it would drop the fresh verdict with it: a heartbeat failure from
+   * the generation before a poll-interval overrun parks a LOST first, the overrun then resets the
+   * generation, and the overrun's own LOST - the only one that still has to run a round - would
+   * collapse into the stale one. A stale LOST still says the generation the offsets were processed
+   * under is gone, so a REVOKED replacing it is turned into a LOST that keeps the REVOKED's reason
+   * and error: the round still runs, and the offsets are discarded instead of committed.
+   *
    * Public, not private: the `Runner`'s retrier calls it to merge a thrown error with whatever
    * is already in the slot, which is what keeps one rebalance to one round.
    * @param {Verdict|null} pending
@@ -616,6 +643,10 @@ module.exports = class RebalanceCoordinator {
   mergeVerdict(pending, incoming) {
     if (!pending) {
       return incoming
+    }
+
+    if (this.isStaleGenerationVerdict(pending)) {
+      return incoming.kind === 'revoked' ? { ...incoming, kind: 'lost' } : incoming
     }
 
     if (pending.kind === 'lost') {

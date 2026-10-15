@@ -403,6 +403,16 @@ module.exports = class ConsumerGroup {
     return this.groupMembership.kind
   }
 
+  /**
+   * How many joins the coordinator has accepted: a count that only goes up, so two reads differ
+   * exactly when a join was accepted in between, whatever generation, epoch or member id it
+   * returned.
+   * @returns {number}
+   */
+  get joinCount() {
+    return this.groupMembership.joinCount
+  }
+
   /** @returns {number|null} the current member epoch, null under the classic protocol */
   get memberEpoch() {
     return this.groupMembership.memberEpoch ?? null

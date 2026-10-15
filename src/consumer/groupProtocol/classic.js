@@ -75,6 +75,12 @@ module.exports = class ClassicGroupProtocol {
 
     this.coordinator = null
     this.generationId = null
+    /**
+     * How many JoinGroups the coordinator has accepted. Only ever goes up: the generation and the
+     * member id can come back unchanged on a rejoin, so a membership that replaced another can be
+     * told apart only by this count.
+     */
+    this.joinCount = 0
     this.leaderId = null
     this.memberId = null
     this.members = null
@@ -244,6 +250,7 @@ module.exports = class ClassicGroupProtocol {
       }
     }
 
+    this.joinCount += 1
     this.generationId = groupData.generationId
     this.leaderId = groupData.leaderId
     this.memberId = groupData.memberId
@@ -455,8 +462,15 @@ module.exports = class ClassicGroupProtocol {
   }
 
   /**
-   * Leaves the group with the reason `the consumer is being closed` (sent from LeaveGroup v5),
-   * then forgets the member id and the assigners' retained state. Sends nothing without a member id.
+   * Leaves the group with the reason `the consumer is being closed`, then forgets the member id and
+   * the assigners' retained state. Sends nothing without a member id.
+   *
+   * The forgetting is skipped when a join was accepted meanwhile. The request is awaited, so a
+   * rebalance round can join during it - after a poll-interval overrun, the heartbeat failure that
+   * follows starts one - and the answer is about the old membership: clearing then would strip the
+   * new one of its member id, which silences every heartbeat, and of its assigners' state. The
+   * count of accepted joins decides, not the ids: a rejoin can return the same member id and the
+   * same generation.
    *
    * A static member's request carries both ids, so the coordinator checks the pair and removes the
    * instance's current member, or answers `FENCED_INSTANCE_ID` for a stale member id; Java's
@@ -468,20 +482,21 @@ module.exports = class ClassicGroupProtocol {
    * @throws {import('../../errors').KafkaJSProtocolError} the coordinator's error for this member
    */
   async leave({ leaveGroup } = {}) {
-    const { groupId, memberId, groupInstanceId } = this
-    if (memberId) {
-      if (leaveGroup !== false) {
-        await this.coordinator.leaveGroup({
-          groupId,
-          memberId,
-          groupInstanceId,
-          reason: LEAVE_REASON,
-        })
-      }
-      this.memberId = null
+    const { groupId, memberId, groupInstanceId, joinCount } = this
+
+    if (memberId && leaveGroup !== false) {
+      await this.coordinator.leaveGroup({
+        groupId,
+        memberId,
+        groupInstanceId,
+        reason: LEAVE_REASON,
+      })
     }
 
-    this.clearAssignerState()
+    if (this.joinCount === joinCount) {
+      this.memberId = null
+      this.clearAssignerState()
+    }
   }
 
   /**
