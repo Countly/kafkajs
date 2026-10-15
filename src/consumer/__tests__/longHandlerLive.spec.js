@@ -16,6 +16,8 @@ const COORDINATOR_SESSION_TIMEOUT_MS = 6000
 const GENEROUS_POLL_INTERVAL_MS = 120000
 const TIGHT_POLL_INTERVAL_MS = 15000
 const HANDLER_MS = 40000
+// A timer and Date.now() both have millisecond granularity, so a handler can measure 1 ms short.
+const CLOCK_TOLERANCE_MS = 5
 const MAX_WAIT_TIME_MS = 1000
 // The timer schedules the next tick from the completion of the last one, so a gap is one interval
 // plus one round trip. Anything below the session timeout keeps the member alive.
@@ -228,7 +230,9 @@ describeLongHandler('Consumer > long handler (live)', () => {
         const rebalancingsBefore = observed.rebalancings.length
 
         expect(await waitForCondition(() => observed.finishedAt != null, HANDLER_BUDGET)).toBe(true)
-        expect(observed.finishedAt - observed.startedAt).toBeGreaterThanOrEqual(HANDLER_MS)
+        expect(observed.finishedAt - observed.startedAt).toBeGreaterThanOrEqual(
+          HANDLER_MS - CLOCK_TOLERANCE_MS
+        )
 
         const duringHandler = observed.heartbeats.filter(
           (at) => at >= observed.startedAt && at <= observed.finishedAt
@@ -290,7 +294,9 @@ describeLongHandler('Consumer > long handler (live)', () => {
         const memberIdBefore = observed.groupJoins.at(-1).payload.memberId
 
         expect(await waitForCondition(() => observed.finishedAt != null, HANDLER_BUDGET)).toBe(true)
-        expect(observed.finishedAt - observed.startedAt).toBeGreaterThanOrEqual(HANDLER_MS)
+        expect(observed.finishedAt - observed.startedAt).toBeGreaterThanOrEqual(
+          HANDLER_MS - CLOCK_TOLERANCE_MS
+        )
 
         // Nothing at all ran while the loop held the thread: no heartbeat went out, and the poll
         // guard - a timer like every other - could not fire either, though its deadline had passed.

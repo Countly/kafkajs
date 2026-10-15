@@ -1,4 +1,4 @@
-const { describe, it, before, beforeEach, after } = require('node:test')
+const { describe, it, before, beforeEach, after, afterEach } = require('node:test')
 const assert = require('node:assert')
 const fs = require('node:fs')
 const os = require('node:os')
@@ -9,9 +9,13 @@ const { createRequire } = require('node:module')
 // OpenTelemetry too late does.
 const early = require('@countly/kafkajs')
 
-const { SpanStatusCode } = require('@opentelemetry/api')
+const { SpanStatusCode, diag, DiagLogLevel, propagation } = require('@opentelemetry/api')
 const { isWrapped } = require('@opentelemetry/instrumentation')
-const { ATTR_ERROR_TYPE } = require('@opentelemetry/semantic-conventions')
+const {
+  ATTR_ERROR_TYPE,
+  ATTR_SERVER_ADDRESS,
+  ATTR_SERVER_PORT,
+} = require('@opentelemetry/semantic-conventions')
 const {
   getTestSpans,
   initMeterProvider,
@@ -29,6 +33,7 @@ const {
   METRIC_MESSAGING_PROCESS_DURATION,
   MESSAGING_SYSTEM_VALUE_KAFKA,
 } = require('../src/semconv')
+const { DummyPropagation } = require('./DummyPropagation')
 const { assertMetricCollection } = require('./utils')
 
 const instrumentation = registerInstrumentationTesting(new KafkaJsInstrumentation())
@@ -40,11 +45,13 @@ const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kafkajs-otel-'))
  * @param {string} name the directory the package is installed under
  * @param {string} version
  * @returns {{ Kafka: Function, send: Function, sendOffsets: Function, listened: string[],
- *   listeners: Function[], calls: { commit: Function, disconnect: Function } }} the stand-in's
- *   exports: `send` and `sendOffsets` are the methods of the transaction its producers resolve,
- *   `listened` the events and `listeners` the listeners its clients' `on` was called with, and
- *   `calls` what the transaction's `commit` and the producer's `disconnect` do, which a test
- *   replaces
+ *   listeners: Function[], calls: { commit: Function, disconnect: Function, send: Function,
+ *   sendBatch: Function } }} the stand-in's exports: `send` and `sendOffsets` are the methods of the
+ *   transaction its producers resolve, `listened` the events and `listeners` the listeners its
+ *   clients' `on` was called with, and `calls` what the transaction's `commit` and the producer's
+ *   `disconnect`, `send` and `sendBatch` do, which a test replaces. The producer's `send` and
+ *   `sendBatch` resolve with the number of messages or topic entries they were given, and reject
+ *   when given none
  */
 const install = (name, version) => {
   const project = fs.mkdtempSync(path.join(root, 'project-'))
@@ -58,14 +65,14 @@ const install = (name, version) => {
     path.join(dir, 'index.js'),
     `const send = async () => []
 const sendOffsets = async () => {}
-const calls = { commit: async () => {}, disconnect: async () => {} }
+const calls = { commit: async () => {}, disconnect: async () => {}, send: async ({ messages }) => messages.length, sendBatch: async ({ topicMessages }) => topicMessages.length }
 const transaction = { send, sendBatch: async () => [], commit: () => calls.commit(), abort: async () => {}, sendOffsets }
 const listened = []
 const listeners = []
 const events = { REQUEST: 'request' }
 const on = (event, listener) => { listened.push(event); listeners.push(listener) }
 class Kafka {
-  producer() { return { send: async () => [], sendBatch: async () => [], transaction: async () => transaction, disconnect: () => calls.disconnect(), events, on } }
+  producer() { return { send: (record) => calls.send(record), sendBatch: (batch) => calls.sendBatch(batch), transaction: async () => transaction, disconnect: () => calls.disconnect(), events, on } }
   consumer() { return { run: async () => {}, events, on } }
 }
 module.exports = { Kafka, send, sendOffsets, listened, listeners, calls }`
@@ -488,6 +495,268 @@ describe('fork-only: a handler that fails', () => {
           { value: 1, attributes: failureAttributes('1', errorType) },
         ],
       })
+    })
+  }
+})
+
+/**
+ * @param {() => Promise<unknown>} call
+ * @returns {Promise<{ value?: unknown, error?: string }>} how the call settled; fails the test when
+ *   the call throws synchronously
+ */
+const settled = (call) => {
+  let pending
+  assert.doesNotThrow(() => {
+    pending = call()
+  }, 'the call threw synchronously')
+  return Promise.resolve(pending).then(
+    (value) => ({ value }),
+    (error) => ({ error: `${error.name}: ${error.message}` })
+  )
+}
+
+/**
+ * @returns {{ control: object, instrumented: object }} two producers of the same stand-in client,
+ *   one a version the instrumentation leaves alone
+ */
+const producerPair = () => {
+  const control = install('@countly/kafkajs', '2.2.4')
+  const instrumented = install('@countly/kafkajs', '3.0.0-alpha.7')
+  assert.strictEqual(isWrapped(control.Kafka.prototype.producer), false)
+  return {
+    control: new control.Kafka().producer(),
+    instrumented: new instrumented.Kafka().producer(),
+  }
+}
+
+describe('fork-only: a produce the instrumentation cannot decorate', () => {
+  before(() => {
+    propagation.disable()
+    propagation.setGlobalPropagator(new DummyPropagation())
+  })
+  after(() => propagation.disable())
+
+  const traceKey = DummyPropagation.TRACE_CONTEXT_KEY
+  const sentSpans = (count) => Array(count).fill('send t')
+
+  /**
+   * Sends the same records through the producer the instrumentation leaves alone and through the
+   * instrumented one, and asserts that the two settle alike and that every span ended.
+   * @param {'send' | 'sendBatch'} method
+   * @param {() => Array<unknown>} makeArgs the arguments of one call
+   * @param {number} spans how many spans must have ended
+   * @returns {Promise<Array<unknown>>} the arguments the instrumented call received
+   */
+  const assertSameOutcome = async (method, makeArgs, spans) => {
+    const { control, instrumented } = producerPair()
+    const expected = await settled(() => control[method](...makeArgs()))
+    const args = makeArgs()
+
+    assert.deepStrictEqual(await settled(() => instrumented[method](...args)), expected)
+    assert.deepStrictEqual(
+      getTestSpans().map(({ name }) => name),
+      sentSpans(spans)
+    )
+    return args
+  }
+
+  const send = (messages) => () => [{ topic: 't', messages }]
+  const sendBatch = (messages) => () => [{ topicMessages: [{ topic: 't', messages }] }]
+
+  for (const [title, bad] of [
+    ['a frozen message', () => Object.freeze({ value: 'a' })],
+    ['a sealed message', () => Object.seal({ value: 'a' })],
+    ['frozen headers', () => ({ value: 'a', headers: Object.freeze({ k: 'v' }) })],
+    ['sealed headers', () => ({ value: 'a', headers: Object.seal({ k: 'v' }) })],
+  ]) {
+    for (const [method, wrap] of [
+      ['send', send],
+      ['sendBatch', sendBatch],
+    ]) {
+      it(`${method} produces ${title} as it is, and still decorates and spans the other messages`, async () => {
+        const snapshot = JSON.stringify(bad())
+
+        const [record] = await assertSameOutcome(method, wrap([bad(), { value: 'b' }]), 2)
+
+        const [kept, decorated] = record.messages ?? record.topicMessages[0].messages
+        assert.strictEqual(JSON.stringify(kept), snapshot)
+        assert.ok(decorated.headers[traceKey])
+      })
+    }
+  }
+
+  for (const [title, messages, spans] of [
+    [
+      'a message whose headers cannot be assigned',
+      () => [{ value: 'a' }, Object.defineProperty({ value: 'b' }, 'headers', { value: null })],
+      2,
+    ],
+    ['a message that is null', () => [{ value: 'a' }, null], 1],
+  ]) {
+    for (const [method, wrap] of [
+      ['send', send],
+      ['sendBatch', sendBatch],
+    ]) {
+      it(`${method} still produces, and ends the spans it started, with ${title}`, async () => {
+        await assertSameOutcome(method, wrap(messages()), spans)
+      })
+    }
+  }
+
+  for (const [title, makeArgs] of [
+    ['no argument', () => []],
+    ['no messages array', () => [{ topic: 't' }]],
+    ['messages that are not an array', () => [{ topic: 't', messages: 'abc' }]],
+  ]) {
+    it(`send passes ${title} to the client, which settles as it would uninstrumented`, async () => {
+      await assertSameOutcome('send', makeArgs, 0)
+    })
+  }
+
+  for (const [title, makeArgs] of [
+    ['no argument', () => []],
+    ['no topic messages', () => [{}]],
+    ['topic messages that are not an array', () => [{ topicMessages: 'abc' }]],
+  ]) {
+    it(`sendBatch passes ${title} to the client, which settles as it would uninstrumented`, async () => {
+      await assertSameOutcome('sendBatch', makeArgs, 0)
+    })
+  }
+
+  for (const method of ['send', 'sendBatch']) {
+    it(`returns the very promise the client returned from a ${method} it has nothing to trace in`, () => {
+      const { Kafka, calls } = install('@countly/kafkajs', '3.0.0-alpha.7')
+      const pending = Promise.resolve('sent')
+      calls[method] = () => pending
+
+      assert.strictEqual(new Kafka().producer()[method]({}), pending)
+    })
+  }
+
+  it('rejects a send called with no argument, as the uninstrumented client does', async () => {
+    const { instrumented } = producerPair()
+
+    const { error } = await settled(() => instrumented.send())
+
+    assert.match(error, /^TypeError: /)
+  })
+})
+
+describe('fork-only: telemetry that fails while an operation settles', () => {
+  const failure = new Error('telemetry failed')
+  const brokerError = new RangeError('the broker refused')
+  const record = { topic: 't', messages: [{ value: 'a' }, { value: 'b' }] }
+
+  const meterProvider = {
+    getMeter: () => ({
+      createCounter: () => ({
+        add() {
+          throw failure
+        },
+      }),
+      createHistogram: () => ({
+        record() {
+          throw failure
+        },
+      }),
+    }),
+  }
+
+  /** Makes every span a producer hook sees throw from `end`, after it has really ended. */
+  const throwOnEnd = () =>
+    instrumentation.setConfig({
+      producerHook: (span) => {
+        const end = span.end.bind(span)
+        span.end = () => {
+          end()
+          throw failure
+        }
+      },
+    })
+
+  const logged = []
+
+  beforeEach(() => {
+    logged.length = 0
+    diag.setLogger({ error: (...args) => logged.push(args) }, DiagLogLevel.ERROR)
+  })
+
+  afterEach(() => {
+    diag.disable()
+    instrumentation.setConfig({})
+    initMeterProvider(instrumentation)
+  })
+
+  for (const [title, arrange] of [
+    ['a counter that throws', () => instrumentation.setMeterProvider(meterProvider)],
+    ['a span that throws from end()', throwOnEnd],
+  ]) {
+    it(`settles a send with the client's value despite ${title}`, async () => {
+      arrange()
+      const { Kafka } = install('@countly/kafkajs', '3.0.0-alpha.7')
+
+      const result = await new Kafka().producer().send(record)
+
+      assert.strictEqual(result, 2)
+      assert.deepStrictEqual(
+        getTestSpans().map(({ name }) => name),
+        ['send t', 'send t']
+      )
+      assert.ok(logged.some((args) => args.includes(failure)))
+    })
+
+    it(`settles a failed send with the client's reason despite ${title}`, async () => {
+      arrange()
+      const { Kafka, calls } = install('@countly/kafkajs', '3.0.0-alpha.7')
+      calls.send = async () => {
+        throw brokerError
+      }
+
+      await assert.rejects(new Kafka().producer().send(record), (reason) => reason === brokerError)
+
+      assert.deepStrictEqual(
+        getTestSpans().map(({ name }) => name),
+        ['send t', 'send t']
+      )
+      assert.ok(logged.some((args) => args.includes(failure)))
+    })
+  }
+
+  it('settles an eachMessage with the handler value despite a histogram that throws', async () => {
+    instrumentation.setMeterProvider(meterProvider)
+    const { Kafka } = install('@countly/kafkajs', '3.0.0-alpha.7')
+    const config = { eachMessage: async () => 7 }
+    await new Kafka().consumer().run(config)
+
+    assert.strictEqual(await config.eachMessage(eachMessagePayload()), 7)
+    assert.deepStrictEqual(
+      getTestSpans().map(({ name }) => name),
+      ['process topic-name-1']
+    )
+    assert.ok(logged.some((args) => args.includes(failure)))
+  })
+})
+
+describe('fork-only: the server labels of a client request', () => {
+  for (const [broker, address, port] of [
+    ['127.0.0.1:9092', '127.0.0.1', 9092],
+    ['::1:9092', '::1', 9092],
+    ['2001:db8::1:9092', '2001:db8::1', 9092],
+  ]) {
+    it(`gives ${broker} the address ${address} and the port ${port}`, async () => {
+      const metricReader = initMeterProvider(instrumentation)
+      const { Kafka, listeners } = install('@countly/kafkajs', '3.0.0-alpha.7')
+      new Kafka().producer()
+
+      listeners[0]({ payload: { broker, duration: 250, apiName: 'Produce' } })
+
+      const { resourceMetrics } = await metricReader.collect()
+      const { dataPoints } = resourceMetrics.scopeMetrics[0].metrics.find(
+        ({ descriptor }) => descriptor.name === METRIC_MESSAGING_CLIENT_OPERATION_DURATION
+      )
+      assert.strictEqual(dataPoints.length, 1)
+      assert.strictEqual(dataPoints[0].attributes[ATTR_SERVER_ADDRESS], address)
+      assert.strictEqual(dataPoints[0].attributes[ATTR_SERVER_PORT], port)
     })
   }
 })

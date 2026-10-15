@@ -227,16 +227,18 @@ class KafkaJsInstrumentation extends InstrumentationBase {
   /**
    * @private
    * @param {{ payload: { broker: string, duration: number, apiName: string } }} event a `REQUEST`
-   *   instrumentation event
+   *   instrumentation event; its `broker` is `host:port`, split at the last colon so that an IPv6
+   *   host keeps its own
    * @returns {void}
    */
   _recordClientDurationMetric(event) {
-    const [address, port] = event.payload.broker.split(':')
+    const { broker } = event.payload
+    const portStart = broker.lastIndexOf(':') + 1
     this._clientDuration.record(event.payload.duration / 1000, {
       [ATTR_MESSAGING_SYSTEM]: MESSAGING_SYSTEM_VALUE_KAFKA,
       [ATTR_MESSAGING_OPERATION_NAME]: `${event.payload.apiName}`,
-      [ATTR_SERVER_ADDRESS]: address,
-      [ATTR_SERVER_PORT]: Number.parseInt(port, 10),
+      [ATTR_SERVER_ADDRESS]: broker.slice(0, portStart - 1),
+      [ATTR_SERVER_PORT]: Number.parseInt(broker.slice(portStart), 10),
     })
   }
 
@@ -517,36 +519,19 @@ class KafkaJsInstrumentation extends InstrumentationBase {
   /**
    * @private
    * @returns {(original: Function) => Function} wraps a producer's or a transaction's
-   *   `sendBatch`: one `send <topic>` span per message, its context injected into the message's
-   *   headers (the caller's message object is changed, as upstream does)
+   *   `sendBatch`: one `send <topic>` span per message, its context added to the message's headers
+   *   (the caller's message object is changed, as upstream does, unless it or its headers cannot be
+   *   changed). The instrumentation never decides whether the produce runs: `original` is always
+   *   called, and with no `topicMessages` array it is called with nothing else done
    */
   _getSendBatchPatch() {
     const instrumentation = this
     return (original) => {
       return function sendBatch(...args) {
-        const batch = args[0]
-        const messages = batch.topicMessages || []
+        const topicMessages = args[0]?.topicMessages
+        if (!Array.isArray(topicMessages)) return original.apply(this, args)
 
-        const spans = []
-        const pendingMetrics = []
-
-        messages.forEach((topicMessage) => {
-          topicMessage.messages.forEach((message) => {
-            spans.push(instrumentation._startProducerSpan(topicMessage.topic, message))
-            pendingMetrics.push(
-              prepareCounter(instrumentation._sentMessages, 1, {
-                [ATTR_MESSAGING_SYSTEM]: MESSAGING_SYSTEM_VALUE_KAFKA,
-                [ATTR_MESSAGING_OPERATION_NAME]: 'send',
-                [ATTR_MESSAGING_DESTINATION_NAME]: topicMessage.topic,
-                ...(message.partition !== undefined
-                  ? {
-                      [ATTR_MESSAGING_DESTINATION_PARTITION_ID]: String(message.partition),
-                    }
-                  : {}),
-              })
-            )
-          })
-        })
+        const { spans, pendingMetrics } = instrumentation._startProducerSpans(topicMessages)
         const origSendResult = original.apply(this, args)
         return instrumentation._endSpansOnPromise(spans, pendingMetrics, origSendResult)
       }
@@ -556,29 +541,17 @@ class KafkaJsInstrumentation extends InstrumentationBase {
   /**
    * @private
    * @returns {(original: Function) => Function} wraps a producer's or a transaction's `send`, as
-   *   `_getSendBatchPatch` does for one topic
+   *   `_getSendBatchPatch` does for one topic; with no `messages` array `original` is called with
+   *   nothing else done
    */
   _getSendPatch() {
     const instrumentation = this
     return (original) => {
       return function send(...args) {
         const record = args[0]
-        const spans = record.messages.map((message) => {
-          return instrumentation._startProducerSpan(record.topic, message)
-        })
+        if (!Array.isArray(record?.messages)) return original.apply(this, args)
 
-        const pendingMetrics = record.messages.map((m) =>
-          prepareCounter(instrumentation._sentMessages, 1, {
-            [ATTR_MESSAGING_SYSTEM]: MESSAGING_SYSTEM_VALUE_KAFKA,
-            [ATTR_MESSAGING_OPERATION_NAME]: 'send',
-            [ATTR_MESSAGING_DESTINATION_NAME]: record.topic,
-            ...(m.partition !== undefined
-              ? {
-                  [ATTR_MESSAGING_DESTINATION_PARTITION_ID]: String(m.partition),
-                }
-              : {}),
-          })
-        )
+        const { spans, pendingMetrics } = instrumentation._startProducerSpans([record])
         const origSendResult = original.apply(this, args)
         return instrumentation._endSpansOnPromise(spans, pendingMetrics, origSendResult)
       }
@@ -586,10 +559,46 @@ class KafkaJsInstrumentation extends InstrumentationBase {
   }
 
   /**
+   * Starts a `send <topic>` span and prepares the sent-messages metric for every message. When any
+   * of them fails, the spans already started are ended and none are returned, so the produce goes
+   * on untraced.
+   * @private
+   * @param {Array<{ topic: string, messages: object[] }>} topicMessages
+   * @returns {{ spans: import('@opentelemetry/api').Span[], pendingMetrics: RecordPendingMetric[] }}
+   */
+  _startProducerSpans(topicMessages) {
+    const spans = []
+    const pendingMetrics = []
+    try {
+      topicMessages.forEach(({ topic, messages }) => {
+        messages.forEach((message) => {
+          spans.push(this._startProducerSpan(topic, message))
+          pendingMetrics.push(
+            prepareCounter(this._sentMessages, 1, {
+              [ATTR_MESSAGING_SYSTEM]: MESSAGING_SYSTEM_VALUE_KAFKA,
+              [ATTR_MESSAGING_OPERATION_NAME]: 'send',
+              [ATTR_MESSAGING_DESTINATION_NAME]: topic,
+              ...(message.partition !== undefined
+                ? { [ATTR_MESSAGING_DESTINATION_PARTITION_ID]: String(message.partition) }
+                : {}),
+            })
+          )
+        })
+      })
+    } catch (error) {
+      this._diag.error('producer span error', error)
+      this._recordAndEnd(spans, [])
+      return { spans: [], pendingMetrics: [] }
+    }
+    return { spans, pendingMetrics }
+  }
+
+  /**
    * Ends the spans and records the metrics once the operation settles. A rejection sets every
    * span's status to ERROR with the reason's message and `error.type` to the reason's class name
-   * (`_OTHER` for a reason that is `null`, has no `message` or has no constructor name), and is
-   * passed on unchanged.
+   * (`_OTHER` for a reason that is `null`, has no `message` or has no constructor name). The
+   * returned promise settles with the operation's own result or reason: a meter, a span or a span
+   * processor that throws is logged, never passed on.
    * @private
    * @template T
    * @param {import('@opentelemetry/api').Span[]} spans
@@ -598,12 +607,12 @@ class KafkaJsInstrumentation extends InstrumentationBase {
    * @returns {Promise<T>}
    */
   _endSpansOnPromise(spans, pendingMetrics, sendPromise) {
-    return Promise.resolve(sendPromise)
-      .then((result) => {
-        pendingMetrics.forEach((m) => m())
+    return Promise.resolve(sendPromise).then(
+      (result) => {
+        this._recordAndEnd(spans, pendingMetrics)
         return result
-      })
-      .catch((reason) => {
+      },
+      (reason) => {
         let errorMessage
         let errorType = ERROR_TYPE_VALUE_OTHER
         if (typeof reason === 'string' || reason === undefined) {
@@ -616,21 +625,41 @@ class KafkaJsInstrumentation extends InstrumentationBase {
           errorMessage = reason.message
           errorType = reason.constructor?.name || errorType
         }
-        pendingMetrics.forEach((m) => m(errorType))
-
-        spans.forEach((span) => {
-          span.setAttribute(ATTR_ERROR_TYPE, errorType)
-          span.setStatus({
-            code: SpanStatusCode.ERROR,
-            message: errorMessage,
-          })
-        })
-
+        this._recordAndEnd(spans, pendingMetrics, { message: errorMessage, errorType })
         throw reason
-      })
-      .finally(() => {
-        spans.forEach((span) => span.end())
-      })
+      }
+    )
+  }
+
+  /**
+   * Records the metrics, then marks and ends every span. Each step is guarded on its own, so a
+   * failure is logged and the steps after it still run.
+   * @private
+   * @param {import('@opentelemetry/api').Span[]} spans
+   * @param {RecordPendingMetric[]} pendingMetrics
+   * @param {{ message: string | undefined, errorType: string }} [failure] set when the operation
+   *   failed
+   * @returns {void}
+   */
+  _recordAndEnd(spans, pendingMetrics, failure) {
+    const guard = (what, work) => {
+      try {
+        work()
+      } catch (error) {
+        this._diag.error(`${what} error`, error)
+      }
+    }
+
+    pendingMetrics.forEach((record) => guard('metric', () => record(failure?.errorType)))
+    spans.forEach((span) => {
+      if (failure) {
+        guard('span status', () => {
+          span.setAttribute(ATTR_ERROR_TYPE, failure.errorType)
+          span.setStatus({ code: SpanStatusCode.ERROR, message: failure.message })
+        })
+      }
+      guard('span end', () => span.end())
+    })
   }
 
   /**
@@ -692,9 +721,11 @@ class KafkaJsInstrumentation extends InstrumentationBase {
   /**
    * @private
    * @param {string} topic
-   * @param {object} message the caller's message; its `headers` gain the span's context
+   * @param {object} message the caller's message; its `headers` gain the span's context when the
+   *   message and its headers can take it, and are left as they are when not
    * @returns {import('@opentelemetry/api').Span} a `send <topic>` PRODUCER span; the producer hook
    *   runs on it, and its errors are logged, never thrown
+   * @throws when the span's context cannot be added for another reason; the span is ended first
    */
   _startProducerSpan(topic, message) {
     const span = this.tracer.startSpan(`send ${topic}`, {
@@ -712,8 +743,12 @@ class KafkaJsInstrumentation extends InstrumentationBase {
       },
     })
 
-    message.headers = message.headers ?? {}
-    propagation.inject(trace.setSpan(context.active(), span), message.headers)
+    try {
+      this._addContextHeaders(span, message)
+    } catch (error) {
+      span.end()
+      throw error
+    }
 
     const { producerHook } = this.getConfig()
     if (producerHook) {
@@ -727,6 +762,26 @@ class KafkaJsInstrumentation extends InstrumentationBase {
     }
 
     return span
+  }
+
+  /**
+   * Injects the span's context into a fresh carrier, so a propagator never touches the caller's
+   * object, and merges the carrier into the message's headers, creating them when absent. Nothing
+   * is written to a message that is not extensible, or to headers that are not.
+   * @private
+   * @param {import('@opentelemetry/api').Span} span
+   * @param {{ headers?: Record<string, unknown> | null }} message
+   * @returns {void}
+   */
+  _addContextHeaders(span, message) {
+    const carrier = {}
+    propagation.inject(trace.setSpan(context.active(), span), carrier)
+
+    if (message.headers == null) {
+      if (Object.isExtensible(message)) message.headers = carrier
+    } else if (Object.isExtensible(message.headers)) {
+      Object.assign(message.headers, carrier)
+    }
   }
 }
 
