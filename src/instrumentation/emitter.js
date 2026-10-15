@@ -23,8 +23,9 @@ module.exports = class InstrumentationEventEmitter {
   /**
    * Delivers an event to the `diagnostics_channel` subscribers of its channel, then to the
    * listeners added with `addListener`, as one `InstrumentationEvent` whose `type` is the public
-   * event name. Allocates nothing when neither has anybody listening. A subscriber that throws
-   * does not throw out of here: Node reports its error as an uncaught exception.
+   * event name. Allocates nothing when neither has anybody listening. A channel subscriber that
+   * throws does not throw out of here: Node reports its error as an uncaught exception. A listener
+   * added with `addListener` that throws does throw out of here, as in KafkaJS 2.2.4.
    * @param {string} eventName the internal event name
    * @param {Object} payload
    * @throws {KafkaJSError} when `eventName` is empty

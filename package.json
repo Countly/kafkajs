@@ -1,6 +1,6 @@
 {
   "name": "@countly/kafkajs",
-  "version": "3.0.0-alpha.7",
+  "version": "3.0.0-alpha.8",
   "description": "KafkaJS-compatible, pure-JS Apache Kafka client for Kafka 4.0+ and Node.js 22+ (Countly-maintained fork of kafkajs)",
   "author": "Tulio Ornelas <ornelas.tulio@gmail.com>",
   "main": "index.js",

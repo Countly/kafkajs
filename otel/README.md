@@ -100,6 +100,16 @@ message's `headers` (the caller's message object), and the consumer reads it bac
   which has already ended. A `commit()` made while another is under way settles with it on the
   client, but the instrumented `commit()` returns its own promise to each caller, so the two
   promises are not `===`, although the client's are.
+- **A handler that throws synchronously still ends its spans and records its failure metrics**,
+  like one that rejects. A rejection reason of `null`, or an object with a `message` but no
+  constructor, is passed on unchanged and recorded with `error.type` `_OTHER`. A broker address that
+  is IPv6, such as `::1:9092`, gives `server.address` `::1` and `server.port` `9092`.
+- **Telemetry is guarded on the send path it wraps.** A meter, span or span processor that throws
+  while the send span is prepared or ended or the sent-message metrics are recorded, a frozen or
+  sealed message or headers, and a missing `messages` array neither skip the produce nor change its
+  result, though some messages may then be sent without trace context. Other telemetry calls are not
+  guarded: for example, a throwing `REQUEST` duration metric escapes into the client's event emit,
+  and a throwing transaction span replaces a transactional send's own error.
 
 ## Tests
 

@@ -822,6 +822,33 @@ says so, `groupProtocol: 'consumer'`.
   subscribes to. `sticky` and `cooperative-sticky` likewise no longer hand a partition back to a
   previous owner that has left its topic. When every member subscribes to every topic, nothing
   changes. *What to do:* nothing. The warning still appears when another client leads the group.
+- **`groupProtocol` is opt-in and defaults to `'classic'`.** Setting `groupProtocol: 'consumer'`
+  moves a consumer to the KIP-848 protocol, where the coordinator computes the assignment and the
+  member reconciles it over its heartbeats. It requires Kafka 4.0 or newer.
+
+  ```javascript
+  const consumer = kafka.consumer({ groupId: 'my-group', groupProtocol: 'consumer' })
+  ```
+
+  Options the broker owns under that protocol are rejected at construction rather than ignored:
+  setting `partitionAssigners`, `heartbeatInterval` or `sessionTimeout` throws
+  `partitionAssigners, heartbeatInterval, sessionTimeout cannot be set when groupProtocol=consumer`
+  (naming only the ones you actually set), and setting `groupRemoteAssignor` under the classic
+  protocol throws `groupRemoteAssignor cannot be set when groupProtocol=classic`.
+  `rebalanceTimeout` and `maxPollInterval` are legal under both. `groupRemoteAssignor` names the
+  server-side assignor to ask for (`'uniform'` and `'range'` on a stock 4.x broker); left `null`,
+  the coordinator picks. See [Consumer group protocols](Consuming.md#group-protocols).
+- **`subscribe({ regex })` is a new subscription form**, available only under
+  `groupProtocol: 'consumer'`. The pattern is **RE2, evaluated by the broker**, not a JavaScript
+  `RegExp`, so topics created later join the subscription without a client-side metadata poll. A
+  consumer subscribes to names or to a regex, never both. A JavaScript `RegExp` inside `topics`
+  keeps its 2.2.4 behaviour under both protocols: matched client-side, once, at `subscribe()` time.
+- **`maxPrefetchBatches` is accepted but inert.** `0` (the default) and `1` behave identically:
+  the fetch loop is exactly what it was. The one-deep prefetch the option was to control measured
+  +2.45 % throughput against the ≥ +10 % the design required of it, and was withdrawn on that
+  number; the option is reserved so a later release can turn the prefetch on without a
+  configuration change. A value of `2` or more is rejected at construction rather than clamped.
+  See [Prefetching](Consuming.md#prefetching).
 
 ### Admin
 
@@ -913,6 +940,13 @@ Group visibility and the admin client.
   `KafkaJSTopicMetadataNotLoaded`. *What to do:* a transient connection failure no longer aborts
   `deleteTopicRecords`; if you caught `KafkaJSNonRetriableError` from it, expect
   `KafkaJSNumberOfRetriesExceeded` after the retry budget instead.
+- **`admin.listGroups` takes filters, and `admin.describeGroups` reports errors per group id.**
+  `admin.listGroups({ states, types })` filters server-side with lower-case values, and every row
+  now carries `groupState` and `groupType`. `admin.describeGroups` describes classic and consumer
+  groups in one shape; `errorCode` is retained on every row, as it always has been, and a group id
+  that does not exist comes back as a `Dead` row carrying `errorCode: 69` instead of failing the
+  call. Rows are not returned in the order the ids were passed. See
+  [List groups](Admin.md#list-groups) and [Describe groups](Admin.md#describe-groups).
 
 ### Errors and events
 
@@ -1209,40 +1243,3 @@ The runtime is unchanged by these; they can fail `tsc` on an existing codebase.
   `initProducerId`, `endTxn` and `txnOffsetCommit`; `Partitioners.UniformStickyPartitioner`; and
   every error's `category`. Code that *constructs* these types by hand — test fixtures, mocks, an
   object typed `Consumer` — must supply them. Code that only reads or calls them is unaffected.
-
-The rest of this section is additive — nothing here changes unless you opt in.
-
-- **`groupProtocol` is opt-in and defaults to `'classic'`.** Setting `groupProtocol: 'consumer'`
-  moves a consumer to the KIP-848 protocol, where the coordinator computes the assignment and the
-  member reconciles it over its heartbeats. It requires Kafka 4.0 or newer.
-
-  ```javascript
-  const consumer = kafka.consumer({ groupId: 'my-group', groupProtocol: 'consumer' })
-  ```
-
-  Options the broker owns under that protocol are rejected at construction rather than ignored:
-  setting `partitionAssigners`, `heartbeatInterval` or `sessionTimeout` throws
-  `partitionAssigners, heartbeatInterval, sessionTimeout cannot be set when groupProtocol=consumer`
-  (naming only the ones you actually set), and setting `groupRemoteAssignor` under the classic
-  protocol throws `groupRemoteAssignor cannot be set when groupProtocol=classic`.
-  `rebalanceTimeout` and `maxPollInterval` are legal under both. `groupRemoteAssignor` names the
-  server-side assignor to ask for (`'uniform'` and `'range'` on a stock 4.x broker); left `null`,
-  the coordinator picks. See [Consumer group protocols](Consuming.md#group-protocols).
-- **`subscribe({ regex })` is a new subscription form**, available only under
-  `groupProtocol: 'consumer'`. The pattern is **RE2, evaluated by the broker**, not a JavaScript
-  `RegExp`, so topics created later join the subscription without a client-side metadata poll. A
-  consumer subscribes to names or to a regex, never both. A JavaScript `RegExp` inside `topics`
-  keeps its 2.2.4 behaviour under both protocols: matched client-side, once, at `subscribe()` time.
-- **`admin.listGroups` takes filters, and `admin.describeGroups` reports errors per group id.**
-  `admin.listGroups({ states, types })` filters server-side with lower-case values, and every row
-  now carries `groupState` and `groupType`. `admin.describeGroups` describes classic and consumer
-  groups in one shape; `errorCode` is retained on every row, as it always has been, and a group id
-  that does not exist comes back as a `Dead` row carrying `errorCode: 69` instead of failing the
-  call. Rows are not returned in the order the ids were passed. See
-  [List groups](Admin.md#list-groups) and [Describe groups](Admin.md#describe-groups).
-- **`maxPrefetchBatches` is accepted but inert.** `0` (the default) and `1` behave identically:
-  the fetch loop is exactly what it was. The one-deep prefetch the option was to control measured
-  +2.45 % throughput against the ≥ +10 % the design required of it, and was withdrawn on that
-  number; the option is reserved so a later release can turn the prefetch on without a
-  configuration change. A value of `2` or more is rejected at construction rather than clamped.
-  See [Prefetching](Consuming.md#prefetching).

@@ -154,6 +154,8 @@ describe('docs/Testing.md', () => {
       expect(canary).toContain('@opentelemetry/instrumentation-kafkajs')
       expect(canary).toContain('@countly/opentelemetry-instrumentation-kafkajs')
       expect(canary).toContain(`node -e "require('./observability/otel.js')"`)
+      expect(canary).toContain(`OTEL_ENABLED=true node -e "require('./observability/otel.js')"`)
+      expect(canary).toContain('[OTEL] failed to start')
     })
   })
 })
