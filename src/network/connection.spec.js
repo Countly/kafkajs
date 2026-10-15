@@ -30,6 +30,8 @@ describe('Network > Connection', () => {
 
       test('rejects the Promise in case of errors', async () => {
         connection.host = invalidHost
+        // Looking up a nonexistent name can be slow on some resolvers; keep the connect timeout out of the way.
+        connection.connectionTimeout = 15000
         const messagePattern = /Connection error: getaddrinfo ENOTFOUND kafkajs.test/
         await expect(connection.connect()).rejects.toThrow(messagePattern)
         expect(connection.isConnected()).toEqual(false)
