@@ -359,8 +359,10 @@ export interface RetryOptions {
   /**
    * Deadline in ms for one retried operation, from its first attempt: when the wait before the
    * next attempt would end past it, the operation rejects with `KafkaJSDeliveryTimeout`. An
-   * integer from 1 to 2147483647. The consumer's fetch loop ignores it, because the loop runs as
-   * one operation for as long as `run()` lasts; every other retried operation honours it.
+   * integer from 1 to 2147483647. Producer sends and transaction retries, `commitOffsets()`, the
+   * consumer group's join and sync, admin calls, and the client's connect, metadata and coordinator
+   * lookups honour it. The consumer's fetch loop (with its auto-commits), the consumer-protocol
+   * heartbeat backoff and position validation, which has its own fixed budget, ignore it.
    */
   maxTotalTime?: number
   restartOnFailure?: (e: Error) => Promise<boolean>
