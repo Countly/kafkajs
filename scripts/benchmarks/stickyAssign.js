@@ -5,8 +5,8 @@
  *
  * Shapes (`a+b`: `a` members own a previous round at generation 1, `b` members join empty):
  * - `stag`: 10 topics; member i subscribes to `topics.slice(i % 5, i % 5 + 5 + i % 3)`.
- * - `capacity-3` and `hand-back-3`: three members, one of which names in its previous round a
- *   topic it has left; they are run by `--check` only (see `CHECK_ONLY`).
+ * - `capacity-3`, `hand-back-3` and `fixed-owner-3`: three members, one of which names in its
+ *   previous round a topic it has left; they are run by `--check` only (see `CHECK_ONLY`).
  *
  * Timing: every run is its own process, so an arm that passes the 10-minute limit is stopped and
  * recorded as `did not finish` (and not run again). Arms alternate, their order swapping each
@@ -228,10 +228,53 @@ const handBack = () => ({
 })
 
 /**
+ * Three members and two topics. `member-0001` subscribes to `topic-B` alone, yet its previous
+ * round (generation 0) names `topic-A` 0 and 1 as well as both partitions of `topic-B`. Only it
+ * subscribes to `topic-B`, so it can take nothing else and leaves the balancing early; balancing
+ * `topic-A` must then not look up its load to hand `topic-A` 0 or 1 back to it. Java's general
+ * path does, and throws a `NullPointerException`.
+ * @returns {Shape} the `fixed-owner-3` shape
+ */
+const fixedOwner = () => ({
+  name: 'fixed-owner-3',
+  partitionsPerTopic: { 'topic-A': range(10), 'topic-B': range(2) },
+  members: [
+    {
+      memberId: 'member-0001',
+      groupInstanceId: null,
+      topics: ['topic-B'],
+      owned: [
+        { topic: 'topic-A', partitions: [0, 1] },
+        { topic: 'topic-B', partitions: [0, 1] },
+      ],
+      generationId: 0,
+    },
+    {
+      memberId: 'member-0002',
+      groupInstanceId: null,
+      topics: ['topic-A'],
+      owned: [{ topic: 'topic-A', partitions: range(6) }],
+      generationId: 1,
+    },
+    {
+      memberId: 'member-0003',
+      groupInstanceId: null,
+      topics: ['topic-A'],
+      owned: [{ topic: 'topic-A', partitions: [6, 7, 8, 9] }],
+      generationId: 1,
+    },
+  ],
+})
+
+/**
  * Shapes only `--check` runs. They pin an assignment, so their time says nothing; their previous
  * round names a topic its member left.
  */
-const CHECK_ONLY = { 'capacity-3': capacity, 'hand-back-3': handBack }
+const CHECK_ONLY = {
+  'capacity-3': capacity,
+  'hand-back-3': handBack,
+  'fixed-owner-3': fixedOwner,
+}
 
 /** Every shape a name can select. */
 const SHAPES = { ...FIXED, ...CHECK_ONLY }

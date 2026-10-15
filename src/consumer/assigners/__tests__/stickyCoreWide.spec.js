@@ -107,8 +107,8 @@ describe('Consumer > assigners > stickyCore general path at scale', () => {
   test.each([
     [
       'sticky',
-      sticky,
       'capacity-3',
+      sticky,
       {
         'member-0001': { 'topic-B': [0, 1] },
         'member-0002': { 'topic-A': [0, 1, 2, 3, 4] },
@@ -117,8 +117,8 @@ describe('Consumer > assigners > stickyCore general path at scale', () => {
     ],
     [
       'cooperative-sticky',
-      cooperativeSticky,
       'capacity-3',
+      cooperativeSticky,
       {
         'member-0001': {},
         'member-0002': { 'topic-A': [0, 1, 2, 3, 4] },
@@ -127,8 +127,8 @@ describe('Consumer > assigners > stickyCore general path at scale', () => {
     ],
     [
       'sticky',
-      sticky,
       'hand-back-3',
+      sticky,
       {
         'member-0001': { 'topic-B': [0] },
         'member-0002': { 'topic-A': [1, 2] },
@@ -137,8 +137,8 @@ describe('Consumer > assigners > stickyCore general path at scale', () => {
     ],
     [
       'cooperative-sticky',
-      cooperativeSticky,
       'hand-back-3',
+      cooperativeSticky,
       {
         'member-0001': { 'topic-B': [0] },
         'member-0002': { 'topic-A': [1, 2] },
@@ -147,11 +147,45 @@ describe('Consumer > assigners > stickyCore general path at scale', () => {
     ],
   ])(
     '%s on %s gives the partitions of a topic a member left to the members subscribed to it',
-    async (_name, factory, shapeName, expected) => {
+    async (_name, shapeName, factory, expected) => {
       const shape = CHECK_ONLY[shapeName]()
 
       const result = await assign(factory, shape, groupMembers(shape))
 
+      expect(nonSubscriberGrants(shape, result)).toEqual([])
+      expect(decoded(result)).toEqual(expected)
+    }
+  )
+
+  // Java's sticky assignor throws a NullPointerException on this shape.
+  test.each([
+    [
+      'sticky',
+      sticky,
+      {
+        'member-0001': { 'topic-B': [0, 1] },
+        'member-0002': { 'topic-A': [1, 2, 3, 4, 5] },
+        'member-0003': { 'topic-A': [0, 6, 7, 8, 9] },
+      },
+    ],
+    [
+      'cooperative-sticky',
+      cooperativeSticky,
+      {
+        'member-0001': { 'topic-B': [0, 1] },
+        'member-0002': { 'topic-A': [1, 2, 3, 4, 5] },
+        'member-0003': { 'topic-A': [6, 7, 8, 9] },
+      },
+    ],
+  ])(
+    '%s does not look up a previous owner that can take nothing else when it balances the topic that owner left',
+    async (_name, factory, expected) => {
+      const shape = CHECK_ONLY['fixed-owner-3']()
+
+      const assigning = assign(factory, shape, groupMembers(shape))
+
+      await expect(assigning).resolves.toHaveLength(3)
+      const result = await assigning
       expect(nonSubscriberGrants(shape, result)).toEqual([])
       expect(decoded(result)).toEqual(expected)
     }

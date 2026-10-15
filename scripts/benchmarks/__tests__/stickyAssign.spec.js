@@ -162,7 +162,7 @@ describe('scripts > benchmarks > stickyAssign', () => {
       const shape = bench.CHECK_ONLY['capacity-3']()
       const handBack = bench.CHECK_ONLY['hand-back-3']()
 
-      expect(Object.keys(bench.CHECK_ONLY)).toEqual(['capacity-3', 'hand-back-3'])
+      expect(Object.keys(bench.CHECK_ONLY)).toEqual(['capacity-3', 'hand-back-3', 'fixed-owner-3'])
       expect(shape.name).toEqual('capacity-3')
       expect(shape.members.map(({ memberId, topics }) => [memberId, topics])).toEqual([
         ['member-0001', ['topic-B']],
@@ -189,6 +189,7 @@ describe('scripts > benchmarks > stickyAssign', () => {
         ...Object.keys(bench.FIXED),
         'capacity-3',
         'hand-back-3',
+        'fixed-owner-3',
       ])
     })
 
