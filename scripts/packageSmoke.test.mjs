@@ -21,6 +21,21 @@ test('the ESM wrapper re-exports every named export of index.js', async () => {
   assert.deepEqual(esmNames, Object.keys(cjs).sort())
 })
 
+test('the frame, record and commit error classes are exported by both entry points', async () => {
+  const cjs = require(PKG)
+  const esm = await import(PKG)
+  for (const name of ['KafkaJSInvalidFrameError', 'KafkaJSCorruptRecordError', 'KafkaJSCommitFailedError']) {
+    assert.equal(typeof cjs[name], 'function')
+    assert.equal(esm[name], cjs[name])
+  }
+})
+
+test('the packed client validates maxResponseSize', () => {
+  const { Kafka, KafkaJSInvalidConfigurationError } = require(PKG)
+  assert.doesNotThrow(() => new Kafka({ brokers: ['localhost:9092'], maxResponseSize: 4 }))
+  assert.throws(() => new Kafka({ brokers: ['localhost:9092'], maxResponseSize: 3 }), KafkaJSInvalidConfigurationError)
+})
+
 test('internal error-classification helpers stay private', () => {
   const cjs = require(PKG)
   // isRebalancing/isKafkaJSError are deliberately stripped in index.js before re-export; a helper

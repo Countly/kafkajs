@@ -333,6 +333,23 @@ kafka.producer({
 
 An idempotent producer - the default - allows at most 5. A producer that did not ask for idempotence and passes more, or `null`, runs without it and logs one warning; with `idempotent: true` or a `transactionalId` the combination throws `KafkaJSInvalidConfigurationError`. See [Idempotence](Producing.md#idempotence).
 
+## Max Response Size
+
+`maxResponseSize` is the response-size limit passed to every connection, in bytes, not counting
+the four-byte length prefix. It is an integer from 4 to 2147483647 and defaults to 104857600
+(100 MiB). It is not the consumer's `maxBytes`.
+
+```javascript
+new Kafka({
+  clientId: 'my-app',
+  brokers: ['kafka1:9092'],
+  maxResponseSize: 104857600,
+})
+```
+
+A value outside that range, or one that is not an integer, makes the constructor throw
+`KafkaJSInvalidConfigurationError`.
+
 ## Metadata recovery
 
 `metadataRecoveryStrategy` and `metadataRecoveryRebootstrapTriggerMs`, available on the `Kafka`

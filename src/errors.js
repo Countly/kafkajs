@@ -332,19 +332,41 @@ class KafkaJSAlterPartitionReassignmentsError extends KafkaJSProtocolError {
 }
 
 /**
+ * The category an aggregate of `errors` has.
+ * @param {Array<Error|string>} errors the aggregate's children
+ * @param {boolean} retriable whether every child is retriable (and there is at least one)
+ * @returns {'refreshRetriable'|'retriable'|'applicationRecoverable'}
+ */
+const aggregateCategory = (errors, retriable) => {
+  if (!retriable) return 'applicationRecoverable'
+  return errors.every((child) => child.category === 'refreshRetriable')
+    ? 'refreshRetriable'
+    : 'retriable'
+}
+
+/**
  * Several errors from one request, reported together (one per failed topic or partition). It
- * extends `Error` directly, so it sets `category` itself: the caller has to inspect `errors`.
+ * extends `Error` directly, so it sets `retriable` and `category` itself, both derived from its
+ * children: it is retriable only when it has children and every one is, so a caller's own retrier
+ * never repeats an aggregate that holds a terminal failure. A string child, a missing child and a
+ * missing list are not retriable, and constructing never throws, as in 2.2.4. `category` is
+ * `refreshRetriable` when every child is, else `retriable` when every child is retriable, else
+ * `applicationRecoverable`: the caller has to inspect `errors`.
  */
 class KafkaJSAggregateError extends Error {
   /**
    * @param {string} message
-   * @param {Error[]} errors
+   * @param {Array<Error|string>} [errors]
    */
   constructor(message, errors) {
     super(message)
     this.errors = errors
     this.name = 'KafkaJSAggregateError'
-    this.category = 'applicationRecoverable'
+    this.retriable =
+      Array.isArray(errors) &&
+      errors.length > 0 &&
+      errors.every((child) => child?.retriable === true)
+    this.category = aggregateCategory(errors, this.retriable)
   }
 }
 
@@ -450,6 +472,87 @@ class KafkaJSDeliveryTimeout extends KafkaJSNonRetriableError {
     super(e, { cause })
     this.name = 'KafkaJSDeliveryTimeout'
     this.category = 'abortable'
+  }
+}
+
+/**
+ * A response frame was negative, shorter than a correlation id, or larger than `maxResponseSize`:
+ * the connection is closed and the request retried on a new one. Retriable, like every connection
+ * error. `reason` says which rule the frame broke; `size` is the length the prefix declared, or
+ * `null` when fewer than four bytes arrived before the connection ended.
+ */
+class KafkaJSInvalidFrameError extends KafkaJSConnectionError {
+  /**
+   * @param {Error|string} e
+   * @param {object} options
+   * @param {string} [options.broker]
+   * @param {number|null} [options.size]
+   * @param {'negative'|'too-short'|'too-large'|'unreadable'} options.reason
+   * @param {Error} [options.cause]
+   */
+  constructor(e, { broker, size = null, reason, cause } = {}) {
+    super(e, { broker })
+    this.name = 'KafkaJSInvalidFrameError'
+    this.size = size
+    this.reason = reason
+    this.cause = cause
+  }
+}
+
+/**
+ * A Fetch record batch is structurally corrupt: its length, magic byte, record count or control
+ * record is impossible. Non-retriable; repeating the fetch returns the same bytes.
+ * `offset` is the first offset of the batch as a decimal string, when it could be read.
+ */
+class KafkaJSCorruptRecordError extends KafkaJSNonRetriableError {
+  /**
+   * @param {Error|string} e
+   * @param {object} options
+   * @param {'length'|'magic'|'count'|'control'} options.reason
+   * @param {string} [options.offset]
+   * @param {Error} [options.cause]
+   */
+  constructor(e, { reason, offset, cause } = {}) {
+    super(e, { cause })
+    this.name = 'KafkaJSCorruptRecordError'
+    this.reason = reason
+    this.offset = offset
+  }
+}
+
+/**
+ * An offset commit was refused because the consumer lost its group membership, or because a
+ * handler or a retry outlived a rejoin. `cause` is the loss. For a loss the broker reported,
+ * `type`, `code` and `helpUrl` are the cause's; a synthetic loss carries no code, a poll-interval
+ * loss keeps the type `POLL_INTERVAL_EXCEEDED`, and a stale handler has the type
+ * `STALE_ASSIGNMENT` and no `code` or `helpUrl`, whatever its cause carries. `isLostMember` checks
+ * only the broker codes; it does not recognize every reason of this class: test `instanceof` and
+ * `reason`.
+ */
+class KafkaJSCommitFailedError extends KafkaJSNonRetriableError {
+  /**
+   * @param {Error|string} e
+   * @param {object} options
+   * @param {'membership-lost'|'poll-interval-exceeded'|'stale-assignment'} options.reason
+   * @param {Error} options.cause
+   */
+  constructor(e, { reason, cause } = {}) {
+    super(e, { cause })
+    this.name = 'KafkaJSCommitFailedError'
+    this.reason = reason
+    this.category = 'applicationRecoverable'
+
+    if (reason === 'stale-assignment') {
+      this.type = 'STALE_ASSIGNMENT'
+      this.code = undefined
+      this.helpUrl = undefined
+    } else {
+      for (const key of ['type', 'code', 'helpUrl']) {
+        if (this[key] === undefined && cause != null && cause[key] !== undefined) {
+          this[key] = cause[key]
+        }
+      }
+    }
   }
 }
 
@@ -583,6 +686,9 @@ module.exports = {
   KafkaJSApplicationRecoverableError,
   KafkaJSInvalidConfigurationError,
   KafkaJSDeliveryTimeout,
+  KafkaJSInvalidFrameError,
+  KafkaJSCorruptRecordError,
+  KafkaJSCommitFailedError,
   isRebalancing,
   isStaleCoordinator,
   COORDINATOR_LOAD_IN_PROGRESS_CODE,

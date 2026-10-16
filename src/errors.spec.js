@@ -19,7 +19,13 @@ const {
   KafkaJSDeliveryTimeout,
   KafkaJSAggregateError,
   KafkaJSFetcherRebalanceError,
+  KafkaJSConnectionError,
+  KafkaJSInvalidFrameError,
+  KafkaJSCorruptRecordError,
+  KafkaJSCommitFailedError,
+  isPollIntervalExceeded,
 } = errors
+const createRetry = require('./retry')
 const { createErrorFromCode, errorCodes } = require('./protocol/error')
 const { classify } = require('./producer/state/errorClassifier')
 const packageEntry = require('../index')
@@ -426,4 +432,296 @@ describe('a wrap keeps the wrapped error category when it keeps its retriable fl
       expect(createErrorFromCode(row.code)).toBeInstanceOf(KafkaJSProtocolError)
     }
   })
+})
+
+describe('KafkaJSAggregateError derives retriable and category from its children', () => {
+  const refresh = () => new KafkaJSRefreshRetriableError('moved')
+  const retriable = () => new KafkaJSError('timed out')
+  const terminal = () => new KafkaJSNonRetriableError('exists')
+
+  const inner = (children) => new KafkaJSAggregateError('inner', children)
+
+  test.each([
+    ['no children', [], false, 'applicationRecoverable'],
+    ['no list', undefined, false, 'applicationRecoverable'],
+    ['a null list', null, false, 'applicationRecoverable'],
+    ['a null child', [null], false, 'applicationRecoverable'],
+    ['an undefined child', [undefined], false, 'applicationRecoverable'],
+    ['a null child among retriable ones', [retriable(), null], false, 'applicationRecoverable'],
+    ['one string child', ['plain text'], false, 'applicationRecoverable'],
+    ['a plain Error child', [new Error('plain')], false, 'applicationRecoverable'],
+    ['every child refreshRetriable', [refresh(), refresh()], true, 'refreshRetriable'],
+    ['every child retriable', [retriable(), retriable()], true, 'retriable'],
+    ['retriable and refreshRetriable children', [retriable(), refresh()], true, 'retriable'],
+    [
+      'one terminal child among retriable ones',
+      [retriable(), terminal()],
+      false,
+      'applicationRecoverable',
+    ],
+    ['only terminal children', [terminal()], false, 'applicationRecoverable'],
+    ['a retriable nested aggregate', [inner([retriable()]), refresh()], true, 'retriable'],
+    [
+      'a nested aggregate whose children are all refreshRetriable',
+      [inner([refresh()]), refresh()],
+      true,
+      'refreshRetriable',
+    ],
+    ['an empty nested aggregate', [inner([]), retriable()], false, 'applicationRecoverable'],
+    [
+      'a nested aggregate with a terminal child',
+      [inner([terminal()]), retriable()],
+      false,
+      'applicationRecoverable',
+    ],
+  ])('%s', (_name, children, retriableValue, category) => {
+    const error = new KafkaJSAggregateError('two topics failed', children)
+
+    expect(error.retriable).toBe(retriableValue)
+    expect(error.category).toEqual(category)
+    expect(error.errors).toBe(children)
+    expect(JSON.parse(JSON.stringify(error))).toMatchObject({
+      retriable: retriableValue,
+      category,
+    })
+  })
+
+  test('a custom retrier sees a retriable flag it can act on', () => {
+    expect(new KafkaJSAggregateError('x', [retriable()]).retriable).toBe(true)
+    expect(new KafkaJSAggregateError('x', [terminal()]).retriable).toBe(false)
+  })
+})
+
+describe('a retrier around a KafkaJSAggregateError', () => {
+  const retrier = () => createRetry({ retries: 3, initialRetryTime: 1, maxRetryTime: 1 })
+
+  test('stops after one attempt when a child is not retriable, whatever the others are', async () => {
+    const attempt = jest.fn(async () => {
+      throw new KafkaJSAggregateError('two topics failed', [
+        new KafkaJSError('timed out'),
+        new KafkaJSNonRetriableError('already exists'),
+      ])
+    })
+
+    const error = await retrier()(attempt).catch((e) => e)
+
+    expect(error).toBeInstanceOf(KafkaJSNonRetriableError)
+    expect(error.cause).toBeInstanceOf(KafkaJSAggregateError)
+    expect(attempt).toHaveBeenCalledTimes(1)
+  })
+
+  test('retries an aggregate whose children are all retriable, until the budget is spent', async () => {
+    const attempt = jest.fn(async () => {
+      throw new KafkaJSAggregateError('two topics failed', [
+        new KafkaJSError('timed out'),
+        new KafkaJSRefreshRetriableError('moved'),
+      ])
+    })
+
+    const error = await retrier()(attempt).catch((e) => e)
+
+    expect(error).toBeInstanceOf(KafkaJSNumberOfRetriesExceeded)
+    expect(attempt).toHaveBeenCalledTimes(4)
+  })
+})
+
+describe('KafkaJSInvalidFrameError', () => {
+  test('is a retriable connection error that names the rule the frame broke', () => {
+    const cause = new Error('socket data listener')
+    const error = new KafkaJSInvalidFrameError('frame of -5 bytes', {
+      broker: 'localhost:9092',
+      size: -5,
+      reason: 'negative',
+      cause,
+    })
+
+    expect(error).toBeInstanceOf(KafkaJSConnectionError)
+    expect(error).toBeInstanceOf(KafkaJSError)
+    expect(error).toMatchObject({
+      name: 'KafkaJSInvalidFrameError',
+      message: 'frame of -5 bytes',
+      broker: 'localhost:9092',
+      size: -5,
+      reason: 'negative',
+      retriable: true,
+      category: 'retriable',
+    })
+    expect(error.cause).toBe(cause)
+  })
+
+  test('has a null size and no cause unless given them', () => {
+    const error = new KafkaJSInvalidFrameError('cut short', { reason: 'unreadable' })
+
+    expect(error.size).toBeNull()
+    expect(error.cause).toBeUndefined()
+  })
+})
+
+describe('KafkaJSCorruptRecordError', () => {
+  test('is non-retriable and carries the rule the batch broke and where it starts', () => {
+    const cause = new Error('while decoding')
+    const error = new KafkaJSCorruptRecordError('batch length 5 is below the minimum', {
+      reason: 'length',
+      offset: '1234567890123',
+      cause,
+    })
+
+    expect(error).toBeInstanceOf(KafkaJSNonRetriableError)
+    expect(error).toMatchObject({
+      name: 'KafkaJSCorruptRecordError',
+      reason: 'length',
+      offset: '1234567890123',
+      retriable: false,
+      category: 'applicationRecoverable',
+    })
+    expect(error.cause).toBe(cause)
+  })
+
+  test('offset is optional', () => {
+    expect(new KafkaJSCorruptRecordError('bad magic', { reason: 'magic' }).offset).toBeUndefined()
+  })
+})
+
+describe('KafkaJSCommitFailedError', () => {
+  const brokerLoss = () =>
+    Object.assign(createErrorFromCode(25), { helpUrl: 'https://example.test/unknown-member' })
+
+  test('is non-retriable and applicationRecoverable, and keeps the loss as its cause', () => {
+    const cause = brokerLoss()
+    const error = new KafkaJSCommitFailedError('commit refused', {
+      reason: 'membership-lost',
+      cause,
+    })
+
+    expect(error).toBeInstanceOf(KafkaJSNonRetriableError)
+    expect(error).toMatchObject({
+      name: 'KafkaJSCommitFailedError',
+      reason: 'membership-lost',
+      retriable: false,
+      category: 'applicationRecoverable',
+    })
+    expect(error.cause).toBe(cause)
+  })
+
+  test('stays applicationRecoverable when the loss it wraps carries another category', () => {
+    const cause = Object.assign(new KafkaJSNonRetriableError('fenced'), { category: 'abortable' })
+
+    const error = new KafkaJSCommitFailedError('commit refused', {
+      reason: 'membership-lost',
+      cause,
+    })
+
+    expect(cause.category).toEqual('abortable')
+    expect(error.category).toEqual('applicationRecoverable')
+  })
+
+  test('copies type, code and helpUrl from a loss the broker reported', () => {
+    const error = new KafkaJSCommitFailedError('commit refused', {
+      reason: 'membership-lost',
+      cause: brokerLoss(),
+    })
+
+    expect(error).toMatchObject({
+      type: 'UNKNOWN_MEMBER_ID',
+      code: 25,
+      helpUrl: 'https://example.test/unknown-member',
+    })
+  })
+
+  test('a synthetic loss carries no code, and a poll-interval loss keeps its existing type', () => {
+    const synthetic = new KafkaJSCommitFailedError('commit refused', {
+      reason: 'membership-lost',
+      cause: new KafkaJSError('left the group'),
+    })
+    const pollExpiry = new KafkaJSCommitFailedError('commit refused', {
+      reason: 'poll-interval-exceeded',
+      cause: new KafkaJSError({
+        message: 'poll interval exceeded',
+        type: 'POLL_INTERVAL_EXCEEDED',
+      }),
+    })
+
+    expect(synthetic.code).toBeUndefined()
+    expect(synthetic.type).toBeUndefined()
+    expect(pollExpiry.type).toEqual('POLL_INTERVAL_EXCEEDED')
+    expect(pollExpiry.code).toBeUndefined()
+    expect(isPollIntervalExceeded(pollExpiry)).toBe(true)
+  })
+
+  test('a stale handler has the type STALE_ASSIGNMENT and no code', () => {
+    const error = new KafkaJSCommitFailedError('commit refused', {
+      reason: 'stale-assignment',
+      cause: new KafkaJSError('the assignment was replaced'),
+    })
+
+    expect(error.type).toEqual('STALE_ASSIGNMENT')
+    expect(error.code).toBeUndefined()
+    expect(isLostMember(error)).toBe(false)
+  })
+
+  test('a stale handler copies neither the code nor the helpUrl of a coded cause', () => {
+    const error = new KafkaJSCommitFailedError('commit refused', {
+      reason: 'stale-assignment',
+      cause: brokerLoss(),
+    })
+
+    expect(error.type).toEqual('STALE_ASSIGNMENT')
+    expect(error.code).toBeUndefined()
+    expect(error.helpUrl).toBeUndefined()
+    expect(isLostMember(error)).toBe(false)
+  })
+
+  test('a stale handler has no code or helpUrl even when it is built from a coded error', () => {
+    const error = new KafkaJSCommitFailedError(brokerLoss(), {
+      reason: 'stale-assignment',
+      cause: brokerLoss(),
+    })
+
+    expect(error.type).toEqual('STALE_ASSIGNMENT')
+    expect(error.code).toBeUndefined()
+    expect(error.helpUrl).toBeUndefined()
+  })
+
+  test('the error it is built from keeps its own type, code and helpUrl over the cause', () => {
+    const source = Object.assign(createErrorFromCode(82), {
+      helpUrl: 'https://example.test/fenced-instance',
+    })
+
+    const error = new KafkaJSCommitFailedError(source, {
+      reason: 'membership-lost',
+      cause: brokerLoss(),
+    })
+
+    expect(error).toMatchObject({
+      type: 'FENCED_INSTANCE_ID',
+      code: 82,
+      helpUrl: 'https://example.test/fenced-instance',
+    })
+  })
+
+  test('isLostMember is unchanged: it is false for code 69 and for a synthetic loss', () => {
+    const code69 = createErrorFromCode(69)
+
+    expect(code69.code).toEqual(69)
+    expect(isLostMember(code69)).toBe(false)
+    expect(isLostMember({ code: 110 })).toBe(true)
+    expect(
+      isLostMember(
+        new KafkaJSCommitFailedError('commit refused', {
+          reason: 'membership-lost',
+          cause: new KafkaJSError('left the group'),
+        })
+      )
+    ).toBe(false)
+  })
+})
+
+describe('the new error classes are exported from the package entry', () => {
+  test.each(['KafkaJSInvalidFrameError', 'KafkaJSCorruptRecordError', 'KafkaJSCommitFailedError'])(
+    '%s',
+    (name) => {
+      expect(typeof errors[name]).toEqual('function')
+      expect(packageEntry[name]).toBe(errors[name])
+    }
+  )
 })

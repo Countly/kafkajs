@@ -947,6 +947,18 @@ Group visibility and the admin client.
   that does not exist comes back as a `Dead` row carrying `errorCode: 69` instead of failing the
   call. Rows are not returned in the order the ids were passed. See
   [List groups](Admin.md#list-groups) and [Describe groups](Admin.md#describe-groups).
+- **A `KafkaJSAggregateError` says whether it can be retried.** `admin.createTopics()` and
+  `admin.alterPartitionReassignments()` reject with it when topics fail, one child in `errors`
+  per failed topic. It now has `retriable` (`true` only when every child is retriable and there is
+  at least one) and a `category` derived from its children. A retrier of your own around either
+  call used to repeat every aggregate until its budget was spent, because the aggregate carried
+  no flag; it now stops at once, with `KafkaJSNonRetriableError` and the aggregate as `cause`,
+  when one child cannot succeed, and keeps retrying an aggregate whose children are all
+  retriable. Code that tests `if (e.retriable)` by truthiness saw `undefined` before, so it
+  treated every aggregate as not retriable; it now sees `true` for an aggregate whose children
+  are all retriable, and may start retrying it. Inspect `error.cause.errors` (or `error.errors`
+  when you catch the aggregate yourself) to see which topics failed. Setting
+  `retry: { retries: 0 }` on the admin client turns the client's own retries off.
 
 ### Errors and events
 
@@ -1243,3 +1255,7 @@ The runtime is unchanged by these; they can fail `tsc` on an existing codebase.
   `initProducerId`, `endTxn` and `txnOffsetCommit`; `Partitioners.UniformStickyPartitioner`; and
   every error's `category`. Code that *constructs* these types by hand — test fixtures, mocks, an
   object typed `Consumer` — must supply them. Code that only reads or calls them is unaffected.
+- **`Cluster#getNodeIds()` is typed `string[]`.** It has always returned the keys of the broker
+  table, which are strings; the declaration said `number[]`. Under `strict` a comparison such as
+  `ids[0] === 1` is `TS2367` and `ids.includes(1)` is `TS2345`. Compare with `String(id)` or
+  convert the element with `Number(id)`. The runtime is unchanged.

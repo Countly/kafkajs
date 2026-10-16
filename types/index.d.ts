@@ -57,6 +57,12 @@ export interface KafkaConfig {
   reauthenticationThreshold?: number
   requestTimeout?: number
   enforceRequestTimeout?: boolean
+  /**
+   * The response-size limit, in bytes, the 4-byte length prefix excluded, handed to every broker
+   * connection. Default 104857600 (100 MiB); an integer from 4 to 2147483647, else the
+   * constructor throws `KafkaJSInvalidConfigurationError`. It is not `maxBytes`.
+   */
+  maxResponseSize?: number
   retry?: RetryOptions
   socketFactory?: ISocketFactory
   logLevel?: logLevel
@@ -285,7 +291,7 @@ export interface CoordinatorMetadata {
 }
 
 export type Cluster = {
-  getNodeIds(): number[]
+  getNodeIds(): string[]
   metadata(): Promise<BrokerMetadata>
   removeBroker(options: { host: string; port: number }): void
   addMultipleTargetTopics(topics: string[]): Promise<void>
@@ -1915,6 +1921,8 @@ export type ProduceRecordError = {
 export class KafkaJSAggregateError extends Error {
   readonly errors: (Error | string)[]
   readonly category: KafkaJSErrorCategory
+  /** True when there is at least one child and every child is retriable. */
+  readonly retriable: boolean
   constructor(message: Error | string, errors: (Error | string)[])
 }
 
@@ -1950,6 +1958,45 @@ export class KafkaJSInvalidConfigurationError extends KafkaJSNonRetriableError {
  */
 export class KafkaJSDeliveryTimeout extends KafkaJSNonRetriableError {
   constructor(e: Error | string, options?: { cause?: Error })
+}
+
+/** A response frame was negative, too short, or larger than `maxResponseSize`; the connection was closed. */
+export class KafkaJSInvalidFrameError extends KafkaJSConnectionError {
+  readonly size: number | null
+  readonly reason: 'negative' | 'too-short' | 'too-large' | 'unreadable'
+  constructor(
+    e: Error | string,
+    options: {
+      broker?: string
+      size?: number | null
+      reason: KafkaJSInvalidFrameError['reason']
+      cause?: Error
+    }
+  )
+}
+
+/** A Fetch record batch is structurally corrupt; non-retriable. */
+export class KafkaJSCorruptRecordError extends KafkaJSNonRetriableError {
+  readonly reason: 'length' | 'magic' | 'count' | 'control'
+  /** The first offset of the batch as a decimal string, when it could be read. */
+  readonly offset?: string
+  constructor(
+    e: Error | string,
+    options: { reason: KafkaJSCorruptRecordError['reason']; offset?: string; cause?: Error }
+  )
+}
+
+/**
+ * An offset commit was refused because the consumer lost its group membership, or a handler or
+ * retry outlived a rejoin. For a loss the broker reported, `type`, `code` and `helpUrl` are those
+ * of the loss; a synthetic loss carries no `code`, and a stale handler has the `type`
+ * `STALE_ASSIGNMENT` and no `code`. Test `instanceof KafkaJSCommitFailedError` and `reason`.
+ * `cause` is the loss.
+ */
+export class KafkaJSCommitFailedError extends KafkaJSNonRetriableError {
+  readonly reason: 'membership-lost' | 'poll-interval-exceeded' | 'stale-assignment'
+  readonly cause: Error
+  constructor(e: Error | string, options: { reason: KafkaJSCommitFailedError['reason']; cause: Error })
 }
 
 export class KafkaJSOffsetOutOfRange extends KafkaJSProtocolError {

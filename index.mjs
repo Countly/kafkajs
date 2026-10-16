@@ -52,6 +52,9 @@ export const {
   KafkaJSApplicationRecoverableError,
   KafkaJSInvalidConfigurationError,
   KafkaJSDeliveryTimeout,
+  KafkaJSInvalidFrameError,
+  KafkaJSCorruptRecordError,
+  KafkaJSCommitFailedError,
 } = cjs
 
 export default cjs

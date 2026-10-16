@@ -82,6 +82,11 @@ module.exports = class Cluster {
    * @param {import("../../types").Logger} options.logger
    * @param {import("../../types").ISocketFactory} options.socketFactory
    * @param {Map} [options.offsets]
+   * @param {Map} [options.operations] the per-group store of offset operations the `Kafka`
+   *   instance shares between its clusters; kept as `operationsByGroup`, the way `offsets` is kept
+   *   as `committedOffsetsByGroup`.
+   * @param {number} [options.maxResponseSize] the response-size limit handed to every connection
+   *   pool unchanged.
    * @param {'rebootstrap'|'none'} [options.metadataRecoveryStrategy] forwarded to `BrokerPool`
    *   unchanged; `Cluster` stores neither this nor the trigger window.
    * @param {number} [options.metadataRecoveryRebootstrapTriggerMs] forwarded to `BrokerPool`
@@ -110,6 +115,8 @@ module.exports = class Cluster {
     isolationLevel,
     instrumentationEmitter = null,
     offsets = new Map(),
+    operations = new Map(),
+    maxResponseSize,
     metadataRecoveryStrategy,
     metadataRecoveryRebootstrapTriggerMs,
   }) {
@@ -128,6 +135,7 @@ module.exports = class Cluster {
       requestTimeout,
       enforceRequestTimeout,
       maxInFlightRequests,
+      maxResponseSize,
       reauthenticationThreshold,
     })
 
@@ -156,6 +164,7 @@ module.exports = class Cluster {
       metadataRecoveryRebootstrapTriggerMs,
     })
     this.committedOffsetsByGroup = offsets
+    this.operationsByGroup = operations
 
     this[PRIVATE.CONNECT] = sharedPromiseTo(async () => {
       return await this.brokerPool.connect()

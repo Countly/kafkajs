@@ -1,3 +1,4 @@
+const { inspect } = require('util')
 const {
   createLogger,
   LEVELS: { INFO },
@@ -14,6 +15,7 @@ const createAdmin = require('./admin')
 const ISOLATION_LEVEL = require('./protocol/isolationLevel')
 const defaultSocketFactory = require('./network/socketFactory')
 const once = require('./utils/once')
+const { INT_32_MAX_VALUE } = require('./constants')
 const websiteUrl = require('./utils/websiteUrl')
 
 const PRIVATE = {
@@ -21,6 +23,7 @@ const PRIVATE = {
   CLUSTER_RETRY: Symbol('private:Kafka:clusterRetry'),
   LOGGER: Symbol('private:Kafka:logger'),
   OFFSETS: Symbol('private:Kafka:offsets'),
+  OPERATIONS: Symbol('private:Kafka:operations'),
   REQUEST_TIMEOUT: Symbol('private:Kafka:requestTimeout'),
 }
 
@@ -34,6 +37,11 @@ const MAX_IN_FLIGHT_REQUESTS_FOR_IDEMPOTENCE = 5
 // The longest delay Node's `setTimeout` honours; a longer one runs after 1 ms.
 // @see https://nodejs.org/api/timers.html
 const MAX_TIMER_DELAY = 2147483647
+// The default response-size limit: 100 MiB, franz-go's `BrokerMaxReadBytes`.
+// @see https://github.com/twmb/franz-go/blob/v1.22.2/pkg/kgo/config.go
+const DEFAULT_MAX_RESPONSE_SIZE = 104857600
+// A response body holds at least its 4-byte correlation id.
+const MIN_MAX_RESPONSE_SIZE = 4
 const DEFAULT_METADATA_RECOVERY_STRATEGY = 'rebootstrap'
 const DEFAULT_METADATA_RECOVERY_REBOOTSTRAP_TRIGGER_MS = 300000
 const METADATA_RECOVERY_STRATEGIES = ['rebootstrap', 'none']
@@ -50,6 +58,23 @@ const validateMaxInFlightRequests = (value) => {
   if (Number.isInteger(value) && value >= 1) return value
   throw new KafkaJSNonRetriableError(
     `maxInFlightRequests must be null (unbounded) or an integer >= 1, got ${value}`
+  )
+}
+
+/**
+ * Accept the documented values for maxResponseSize: an integer from 4 (a correlation id) to
+ * 2147483647 (the largest size a frame's signed length prefix can hold).
+ * @param {number} value
+ * @returns {number}
+ * @throws {KafkaJSInvalidConfigurationError} on anything else, naming the option
+ */
+const validateMaxResponseSize = (value) => {
+  if (Number.isInteger(value) && value >= MIN_MAX_RESPONSE_SIZE && value <= INT_32_MAX_VALUE) {
+    return value
+  }
+
+  throw new KafkaJSInvalidConfigurationError(
+    `maxResponseSize must be an integer from ${MIN_MAX_RESPONSE_SIZE} to ${INT_32_MAX_VALUE}, got ${inspect(value)}`
   )
 }
 
@@ -213,6 +238,9 @@ module.exports = class Client {
    * @param {number} options.reauthenticationThreshold - in milliseconds
    * @param {number} [options.requestTimeout=30000] - in milliseconds
    * @param {boolean} [options.enforceRequestTimeout]
+   * @param {number} [options.maxResponseSize=104857600] the response-size limit handed to every
+   *   connection, in bytes, the 4-byte length prefix excluded: an integer from 4 to 2147483647.
+   *   It is not the consumer's `maxBytes`.
    * @param {import("../types").RetryOptions} [options.retry]
    * @param {import("../types").ISocketFactory} [options.socketFactory]
    * @param {'rebootstrap'|'none'} [options.metadataRecoveryStrategy='rebootstrap'] KIP-899/1102:
@@ -220,6 +248,7 @@ module.exports = class Client {
    *   list when metadata is unreachable; `'none'` restores pre-3.0 behavior.
    * @param {number} [options.metadataRecoveryRebootstrapTriggerMs=300000] how long metadata must
    *   fail *continuously* before a rebootstrap is triggered. Must be an integer >= 1.
+   * @throws {KafkaJSInvalidConfigurationError} for an invalid `maxResponseSize`
    */
   constructor({
     brokers,
@@ -231,6 +260,7 @@ module.exports = class Client {
     reauthenticationThreshold,
     requestTimeout,
     enforceRequestTimeout = true,
+    maxResponseSize = DEFAULT_MAX_RESPONSE_SIZE,
     retry,
     socketFactory = defaultSocketFactory(),
     logLevel = INFO,
@@ -239,10 +269,12 @@ module.exports = class Client {
     metadataRecoveryRebootstrapTriggerMs = DEFAULT_METADATA_RECOVERY_REBOOTSTRAP_TRIGGER_MS,
   }) {
     this[PRIVATE.OFFSETS] = new Map()
+    this[PRIVATE.OPERATIONS] = new Map()
     this[PRIVATE.LOGGER] = createLogger({ level: logLevel, logCreator })
     this[PRIVATE.CLUSTER_RETRY] = retry
     this[PRIVATE.REQUEST_TIMEOUT] = requestTimeout ?? DEFAULT_REQUEST_TIMEOUT
 
+    const validatedMaxResponseSize = validateMaxResponseSize(maxResponseSize)
     const validatedMetadataRecoveryStrategy =
       validateMetadataRecoveryStrategy(metadataRecoveryStrategy)
     const validatedMetadataRecoveryRebootstrapTriggerMs =
@@ -262,6 +294,8 @@ module.exports = class Client {
         logger: this[PRIVATE.LOGGER],
         retry: this[PRIVATE.CLUSTER_RETRY],
         offsets: this[PRIVATE.OFFSETS],
+        operations: this[PRIVATE.OPERATIONS],
+        maxResponseSize: validatedMaxResponseSize,
         socketFactory,
         brokers,
         ssl,

@@ -32,6 +32,14 @@ await admin.listTopics()
 
 `createTopics` will resolve to `true` if the topic was created successfully or `false` if it already exists. The method will throw exceptions in case of errors.
 
+When a topic cannot be created the rejection is a `KafkaJSAggregateError`: `errors` lists one
+error per failed topic. The aggregate is `retriable` only when it has at least one child and every
+child is retriable, and its `category` is `refreshRetriable`, `retriable` or
+`applicationRecoverable` to match, so a retrier of your own around `createTopics` (or
+`alterPartitionReassignments`) stops at once on an aggregate that holds a failure that cannot
+succeed, with a `KafkaJSNonRetriableError` whose `cause` is the aggregate, and retries one whose
+failures are all retriable.
+
 ```javascript
 await admin.createTopics({
     validateOnly: <boolean>,

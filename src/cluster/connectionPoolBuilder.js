@@ -17,6 +17,7 @@ const ConnectionPool = require('../network/connectionPool')
  * @param {boolean} [options.enforceRequestTimeout]
  * @param {number} [options.connectionTimeout]
  * @param {number|null} [options.maxInFlightRequests]
+ * @param {number} [options.maxResponseSize] the response-size limit handed to every connection
  * @param {import("../../types").RetryOptions} [options.retry]
  * @param {import("../../types").Logger} options.logger
  * @param {import("../instrumentation/emitter")} [options.instrumentationEmitter]
@@ -33,6 +34,7 @@ module.exports = ({
   enforceRequestTimeout,
   connectionTimeout,
   maxInFlightRequests,
+  maxResponseSize,
   logger,
   instrumentationEmitter = null,
   reauthenticationThreshold,
@@ -108,6 +110,7 @@ module.exports = ({
         requestTimeout,
         enforceRequestTimeout,
         maxInFlightRequests,
+        maxResponseSize,
         instrumentationEmitter,
         logger,
         reauthenticationThreshold,

@@ -58,6 +58,10 @@ import {
   KafkaJSFetcherRebalanceError,
   KafkaJSLockTimeout,
   KafkaJSProtocolError,
+  KafkaJSInvalidFrameError,
+  KafkaJSCorruptRecordError,
+  KafkaJSCommitFailedError,
+  Cluster,
 } from './index'
 
 const { roundRobin } = PartitionAssigners
@@ -633,6 +637,46 @@ void rebalanceCategory
 // @ts-expect-error not a category
 const notACategory: KafkaJSErrorCategory = 'fatal'
 void notACategory
+
+// The error classes of a refused frame, a corrupt record batch and a refused commit.
+const frameError = new KafkaJSInvalidFrameError('x', {
+  broker: 'localhost:9092',
+  size: -1,
+  reason: 'negative',
+})
+const frameIsConnectionError: KafkaJSConnectionError = frameError
+const frameReason: 'negative' | 'too-short' | 'too-large' | 'unreadable' = frameError.reason
+const frameSize: number | null = frameError.size
+const corruptError = new KafkaJSCorruptRecordError('x', { reason: 'length', offset: '42', cause })
+const corruptIsNonRetriable: KafkaJSNonRetriableError = corruptError
+const corruptReason: 'length' | 'magic' | 'count' | 'control' = corruptError.reason
+const commitError = new KafkaJSCommitFailedError('x', { reason: 'membership-lost', cause })
+const commitIsNonRetriable: KafkaJSNonRetriableError = commitError
+const commitReason: 'membership-lost' | 'poll-interval-exceeded' | 'stale-assignment' =
+  commitError.reason
+const commitCause: Error = commitError.cause
+const commitType: string | undefined = commitError.type
+const commitCode: number | undefined = commitError.code
+// @ts-expect-error `cause` is required: a refused commit always names the loss
+new KafkaJSCommitFailedError('x', { reason: 'membership-lost' })
+// @ts-expect-error not a reason
+new KafkaJSInvalidFrameError('x', { reason: 'too-big' })
+void [frameIsConnectionError, frameReason, frameSize, corruptIsNonRetriable, corruptReason]
+void [commitIsNonRetriable, commitReason, commitCause, commitType, commitCode]
+
+// The aggregate says whether its children can be retried.
+const aggregateRetriable: boolean = new KafkaJSAggregateError('x', ['y']).retriable
+void aggregateRetriable
+
+// A node id is a string, as `Object.keys` of the broker table makes it.
+declare const cluster: Cluster
+const nodeIds: string[] = cluster.getNodeIds()
+// @ts-expect-error a node id never equals a number
+void (nodeIds[0] === 1)
+
+// The client option for the response-size limit.
+new Kafka({ brokers: ['localhost:9092'], maxResponseSize: 1048576 })
+
 // KafkaJSLockTimeout stays exported.
 new KafkaJSLockTimeout()
 

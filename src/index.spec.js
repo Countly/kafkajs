@@ -9,8 +9,12 @@ const createConsumer = require('./consumer')
 const createAdmin = require('./admin')
 const Cluster = require('./cluster')
 const ISOLATION_LEVEL = require('./protocol/isolationLevel')
+const { KafkaJSInvalidConfigurationError } = require('./errors')
 
 describe('Client', () => {
+  // The factories are automocks shared by every case: calls must not leak from one to the next.
+  beforeEach(() => jest.clearAllMocks())
+
   it('gives access to its logger', () => {
     expect(new Client({ brokers: [] }).logger()).toMatchSnapshot()
   })
@@ -29,6 +33,73 @@ describe('Client', () => {
 
     expect(createProducer.mock.calls[0][0].cluster).toBe(Cluster.mock.instances[0])
     expect(createConsumer.mock.calls[0][0].cluster).toBe(Cluster.mock.instances[1])
+  })
+
+  it('shares one store of offset operations between the clusters of one client, and none between clients', () => {
+    const client = new Client({ brokers: [] })
+    client.producer({})
+    client.consumer({})
+    client.admin({})
+    new Client({ brokers: [] }).consumer({})
+
+    const [producer, consumer, admin, other] = Cluster.mock.calls.map(
+      ([options]) => options.operations
+    )
+    expect(producer).toBeInstanceOf(Map)
+    expect(consumer).toBe(producer)
+    expect(admin).toBe(producer)
+    expect(other).toBeInstanceOf(Map)
+    expect(other).not.toBe(producer)
+  })
+
+  describe('maxResponseSize', () => {
+    it('defaults to 100 MiB and reaches every cluster', () => {
+      const client = new Client({ brokers: [] })
+
+      client.producer({})
+      client.consumer({})
+
+      expect(Cluster.mock.calls.map(([options]) => options.maxResponseSize)).toEqual([
+        104857600, 104857600,
+      ])
+    })
+
+    it('passes the configured size to the cluster', () => {
+      new Client({ brokers: [], maxResponseSize: 4096 }).consumer({})
+
+      expect(Cluster).toHaveBeenCalledWith(expect.objectContaining({ maxResponseSize: 4096 }))
+    })
+
+    it.each([4, 1048576, 2147483647])('accepts %d', (maxResponseSize) => {
+      expect(() => new Client({ brokers: [], maxResponseSize })).not.toThrow()
+    })
+
+    it.each([
+      3,
+      0,
+      -1,
+      2147483648,
+      1.5,
+      1048576.5,
+      '1048576',
+      null,
+      NaN,
+      Infinity,
+      4n,
+      Symbol('size'),
+      Object.create(null),
+    ])('rejects %p, naming the option', (maxResponseSize) => {
+      expect(() => new Client({ brokers: [], maxResponseSize })).toThrow(
+        KafkaJSInvalidConfigurationError
+      )
+      expect(() => new Client({ brokers: [], maxResponseSize })).toThrow(/maxResponseSize/)
+    })
+
+    it('quotes a string value, so it is not mistaken for a number', () => {
+      expect(() => new Client({ brokers: [], maxResponseSize: '104857600' })).toThrow(
+        /got '104857600'/
+      )
+    })
   })
 
   it('passes options to the producer', () => {
