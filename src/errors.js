@@ -332,6 +332,20 @@ class KafkaJSAlterPartitionReassignmentsError extends KafkaJSProtocolError {
 }
 
 /**
+ * Whether every child of an aggregate is retriable, a missing one (a hole) counting as not.
+ * Reads by index and returns at the first child that is not, so a long sparse list is neither
+ * copied nor walked past that point.
+ * @param {Array<Error|string>} errors a non-empty array
+ * @returns {boolean}
+ */
+const everyChildRetriable = (errors) => {
+  for (let index = 0; index < errors.length; index++) {
+    if (errors[index]?.retriable !== true) return false
+  }
+  return true
+}
+
+/**
  * The category an aggregate of `errors` has.
  * @param {Array<Error|string>} errors the aggregate's children
  * @param {boolean} retriable whether every child is retriable (and there is at least one)
@@ -348,9 +362,10 @@ const aggregateCategory = (errors, retriable) => {
  * Several errors from one request, reported together (one per failed topic or partition). It
  * extends `Error` directly, so it sets `retriable` and `category` itself, both derived from its
  * children: it is retriable only when it has children and every one is, so a caller's own retrier
- * never repeats an aggregate that holds a terminal failure. A string child, a missing child and a
- * missing list are not retriable, and constructing never throws, as in 2.2.4. `category` is
- * `refreshRetriable` when every child is, else `retriable` when every child is retriable, else
+ * never repeats an aggregate that holds a terminal failure. A string child, a missing child (a
+ * hole in a sparse list counts), a missing list and a list that is not an array are not retriable.
+ * Constructing never throws, as in 2.2.4, however long the list. `category` is `refreshRetriable`
+ * when every child is, else `retriable` when every child is retriable, else
  * `applicationRecoverable`: the caller has to inspect `errors`.
  */
 class KafkaJSAggregateError extends Error {
@@ -362,10 +377,7 @@ class KafkaJSAggregateError extends Error {
     super(message)
     this.errors = errors
     this.name = 'KafkaJSAggregateError'
-    this.retriable =
-      Array.isArray(errors) &&
-      errors.length > 0 &&
-      errors.every((child) => child?.retriable === true)
+    this.retriable = Array.isArray(errors) && errors.length > 0 && everyChildRetriable(errors)
     this.category = aggregateCategory(errors, this.retriable)
   }
 }

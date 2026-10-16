@@ -58,6 +58,17 @@ describe('Producer > deliveryTimeout', () => {
       expect(() => createKafka().producer(options)).toThrow(message)
     })
 
+    test.each(['linger', 'batchSize', 'deliveryTimeout'])(
+      '%s: a Symbol is refused as a configuration error, and a string value is quoted',
+      (option) => {
+        const create = (value) => createKafka().producer({ [option]: value })
+
+        expect(() => create(Symbol('x'))).toThrow(KafkaJSInvalidConfigurationError)
+        expect(() => create(Symbol('x'))).toThrow(/got Symbol\(x\)/)
+        expect(() => create('x')).toThrow(/got 'x'/)
+      }
+    )
+
     test.each([
       ['linger', /linger must be an integer >= 0 and <= 2147483647, got 2147483648/],
       [

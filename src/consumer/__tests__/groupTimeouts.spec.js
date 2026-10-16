@@ -1,5 +1,6 @@
 const resolveGroupTimeouts = require('../groupTimeouts')
 const { newLogger } = require('testHelpers')
+const { KafkaJSNonRetriableError } = require('../../errors')
 
 const resolve = (options) => {
   const logger = newLogger()
@@ -73,6 +74,17 @@ describe('Consumer > group timeouts', () => {
         )
       }
     )
+
+    it.each([
+      ['a Symbol', Symbol('poll'), 'Symbol(poll)'],
+      ['a string', '300000', "'300000'"],
+    ])('refuses %s as KafkaJSNonRetriableError, showing the value', (_name, value, shown) => {
+      const resolveWith = () =>
+        resolveGroupTimeouts({ logger: newLogger(), maxPollInterval: value })
+
+      expect(resolveWith).toThrow(KafkaJSNonRetriableError)
+      expect(resolveWith).toThrow(`got ${shown}`)
+    })
 
     it.each([0, 1.5])('grandfathers a rebalanceTimeout of %p', (value) => {
       expect(() =>

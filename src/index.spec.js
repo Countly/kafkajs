@@ -9,7 +9,7 @@ const createConsumer = require('./consumer')
 const createAdmin = require('./admin')
 const Cluster = require('./cluster')
 const ISOLATION_LEVEL = require('./protocol/isolationLevel')
-const { KafkaJSInvalidConfigurationError } = require('./errors')
+const { KafkaJSInvalidConfigurationError, KafkaJSNonRetriableError } = require('./errors')
 
 describe('Client', () => {
   // The factories are automocks shared by every case: calls must not leak from one to the next.
@@ -50,6 +50,24 @@ describe('Client', () => {
     expect(admin).toBe(producer)
     expect(other).toBeInstanceOf(Map)
     expect(other).not.toBe(producer)
+  })
+
+  describe('maxInFlightRequests', () => {
+    it.each([
+      ['producer', (client, maxInFlightRequests) => client.producer({ maxInFlightRequests })],
+      ['consumer', (client, maxInFlightRequests) => client.consumer({ maxInFlightRequests })],
+    ])('%s: rejects a Symbol with KafkaJSNonRetriableError, not a TypeError', (_name, create) => {
+      const client = new Client({ brokers: [] })
+
+      expect(() => create(client, Symbol('in-flight'))).toThrow(KafkaJSNonRetriableError)
+      expect(() => create(client, Symbol('in-flight'))).toThrow(/maxInFlightRequests.*Symbol/)
+    })
+
+    it('quotes a string value, so it is not mistaken for a number', () => {
+      expect(() => new Client({ brokers: [] }).consumer({ maxInFlightRequests: '5' })).toThrow(
+        /got '5'/
+      )
+    })
   })
 
   describe('maxResponseSize', () => {

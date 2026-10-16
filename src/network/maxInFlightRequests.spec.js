@@ -1,5 +1,6 @@
 const RequestQueue = require('./requestQueue')
 const { newLogger } = require('testHelpers')
+const { KafkaJSNonRetriableError } = require('../errors')
 
 const createQueue = (maxInFlightRequests) =>
   new RequestQueue({
@@ -124,4 +125,13 @@ describe('Kafka > client option validation', () => {
       /metadataRecoveryStrategy must be one of/
     )
   })
+
+  it.each(['metadataRecoveryStrategy', 'metadataRecoveryRebootstrapTriggerMs'])(
+    '%s: refuses a Symbol with KafkaJSNonRetriableError, and quotes a string value',
+    (option) => {
+      expect(() => createKafka({ [option]: Symbol('x') })).toThrow(KafkaJSNonRetriableError)
+      expect(() => createKafka({ [option]: Symbol('x') })).toThrow(/got Symbol\(x\)/)
+      expect(() => createKafka({ [option]: 'x' })).toThrow(/got 'x'/)
+    }
+  )
 })

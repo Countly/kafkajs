@@ -441,11 +441,32 @@ describe('KafkaJSAggregateError derives retriable and category from its children
 
   const inner = (children) => new KafkaJSAggregateError('inner', children)
 
+  // A literal hole is rejected by eslint and prettier, so the sparse lists are built by assignment.
+  const onlyHoles = new Array(2)
+  const holeAmongRetriable = new Array(3)
+  holeAmongRetriable[0] = retriable()
+  holeAmongRetriable[2] = retriable()
+
   test.each([
     ['no children', [], false, 'applicationRecoverable'],
     ['no list', undefined, false, 'applicationRecoverable'],
     ['a null list', null, false, 'applicationRecoverable'],
+    ['a list that is not an array', 'plain text', false, 'applicationRecoverable'],
+    [
+      'an array-like list of retriable children',
+      { length: 1, 0: retriable() },
+      false,
+      'applicationRecoverable',
+    ],
+    ['a list made only of holes', onlyHoles, false, 'applicationRecoverable'],
+    ['a hole among retriable children', holeAmongRetriable, false, 'applicationRecoverable'],
     ['a null child', [null], false, 'applicationRecoverable'],
+    [
+      'a child whose retriable is truthy but not true',
+      [{ retriable: 1 }],
+      false,
+      'applicationRecoverable',
+    ],
     ['an undefined child', [undefined], false, 'applicationRecoverable'],
     ['a null child among retriable ones', [retriable(), null], false, 'applicationRecoverable'],
     ['one string child', ['plain text'], false, 'applicationRecoverable'],
@@ -484,6 +505,17 @@ describe('KafkaJSAggregateError derives retriable and category from its children
       retriable: retriableValue,
       category,
     })
+  })
+
+  test('a huge sparse list is read without being copied, so construction never throws', () => {
+    const huge = new Array(2e8)
+    let error
+
+    expect(() => {
+      error = new KafkaJSAggregateError('x', huge)
+    }).not.toThrow()
+    expect(error.retriable).toBe(false)
+    expect(error.category).toEqual('applicationRecoverable')
   })
 
   test('a custom retrier sees a retriable flag it can act on', () => {

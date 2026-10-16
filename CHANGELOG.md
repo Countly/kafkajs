@@ -627,6 +627,8 @@ Adopted upstream PRs are credited here by number as they land (Phase 2 onward).
 
 #### Fixes
 
+- Eight option checks no longer throw a `TypeError` while building their message when the value is a `Symbol` or another value with no string form. `maxInFlightRequests`, `metadataRecoveryStrategy`, `metadataRecoveryRebootstrapTriggerMs`, `maxPollInterval` and the `stickyBytes` of `Partitioners.UniformStickyPartitioner` now refuse it with `KafkaJSNonRetriableError`, and `linger`, `batchSize` and `deliveryTimeout` with `KafkaJSInvalidConfigurationError`: the class the same check already throws for every other value it refuses. Each message shows the rejected value as the `maxResponseSize` message does, so the string `'5'` appears as `got '5'`.
+
 #### Additions
 
 - `KafkaJSInvalidFrameError`, `KafkaJSCorruptRecordError` and `KafkaJSCommitFailedError` are exported from the package and its ES module entry, with their types: a refused response frame (a retriable connection error), a structurally corrupt Fetch batch (non-retriable) and a refused offset commit (non-retriable, with the loss as its `cause`). `KafkaJSAggregateError` gains `retriable`. The `Kafka` constructor accepts and validates `maxResponseSize`, the response-size limit passed to every connection, an integer from 4 to 2147483647 that defaults to 104857600 (100 MiB); it takes effect with the response-frame bound.

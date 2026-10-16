@@ -1,3 +1,4 @@
+const { inspect } = require('util')
 const murmur2 = require('../default/murmur2')
 const { KafkaJSNonRetriableError } = require('../../../errors')
 
@@ -59,7 +60,7 @@ const pickPartition = (partitionMetadata) => {
 const UniformStickyPartitioner = ({ stickyBytes = 16384, ignoreKeys = false } = {}) => {
   if (!Number.isInteger(stickyBytes) || stickyBytes < 1) {
     throw new KafkaJSNonRetriableError(
-      `stickyBytes must be an integer of at least 1, got ${stickyBytes}`
+      `stickyBytes must be an integer of at least 1, got ${inspect(stickyBytes)}`
     )
   }
 

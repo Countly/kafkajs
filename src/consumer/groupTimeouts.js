@@ -1,3 +1,4 @@
+const { inspect } = require('util')
 const { KafkaJSNonRetriableError } = require('../errors')
 
 /**
@@ -66,7 +67,7 @@ const resolveGroupTimeouts = ({
 
   if (hasMaxPollInterval && (!Number.isInteger(maxPollInterval) || maxPollInterval < 1)) {
     throw new KafkaJSNonRetriableError(
-      `Consumer maxPollInterval must be an integer of at least 1, got ${maxPollInterval}`
+      `Consumer maxPollInterval must be an integer of at least 1, got ${inspect(maxPollInterval)}`
     )
   }
 

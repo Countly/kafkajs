@@ -253,6 +253,14 @@ describe('Producer > Partitioner > UniformSticky', () => {
     )
   })
 
+  test.each([
+    ['a Symbol', Symbol('sticky'), 'Symbol(sticky)'],
+    ['a string', '16384', "'16384'"],
+  ])('refuses %s as KafkaJSNonRetriableError, showing the value', (_name, stickyBytes, shown) => {
+    expect(() => UniformStickyPartitioner({ stickyBytes })).toThrow(KafkaJSNonRetriableError)
+    expect(() => UniformStickyPartitioner({ stickyBytes })).toThrow(`got ${shown}`)
+  })
+
   test.each([0, -1, 1.5, NaN, '16384'])('rejects stickyBytes %p', (stickyBytes) => {
     expect(() => UniformStickyPartitioner({ stickyBytes })).toThrow(KafkaJSNonRetriableError)
     expect(() => UniformStickyPartitioner({ stickyBytes })).toThrow(

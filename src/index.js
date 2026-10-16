@@ -57,7 +57,7 @@ const validateMaxInFlightRequests = (value) => {
   if (value === null) return null
   if (Number.isInteger(value) && value >= 1) return value
   throw new KafkaJSNonRetriableError(
-    `maxInFlightRequests must be null (unbounded) or an integer >= 1, got ${value}`
+    `maxInFlightRequests must be null (unbounded) or an integer >= 1, got ${inspect(value)}`
   )
 }
 
@@ -88,7 +88,7 @@ const validateMaxResponseSize = (value) => {
 const validateMetadataRecoveryStrategy = (value) => {
   if (METADATA_RECOVERY_STRATEGIES.includes(value)) return value
   throw new KafkaJSNonRetriableError(
-    `metadataRecoveryStrategy must be one of ${METADATA_RECOVERY_STRATEGIES.join(', ')}, got ${value}`
+    `metadataRecoveryStrategy must be one of ${METADATA_RECOVERY_STRATEGIES.join(', ')}, got ${inspect(value)}`
   )
 }
 
@@ -104,7 +104,7 @@ const validateMetadataRecoveryStrategy = (value) => {
 const validateMetadataRecoveryRebootstrapTriggerMs = (value) => {
   if (Number.isInteger(value) && value >= 1) return value
   throw new KafkaJSNonRetriableError(
-    `metadataRecoveryRebootstrapTriggerMs must be an integer >= 1, got ${value}`
+    `metadataRecoveryRebootstrapTriggerMs must be an integer >= 1, got ${inspect(value)}`
   )
 }
 
@@ -178,13 +178,13 @@ const resolveDelivery = ({ linger, batchSize, deliveryTimeout, requestTimeout })
     !(Number.isInteger(linger) && linger >= 0 && linger <= MAX_TIMER_DELAY)
   ) {
     throw new KafkaJSInvalidConfigurationError(
-      `linger must be an integer >= 0 and <= ${MAX_TIMER_DELAY}, got ${linger}`
+      `linger must be an integer >= 0 and <= ${MAX_TIMER_DELAY}, got ${inspect(linger)}`
     )
   }
 
   if (batchSize !== undefined && !(Number.isInteger(batchSize) && batchSize >= 1)) {
     throw new KafkaJSInvalidConfigurationError(
-      `batchSize must be an integer >= 1, got ${batchSize}`
+      `batchSize must be an integer >= 1, got ${inspect(batchSize)}`
     )
   }
 
@@ -200,7 +200,7 @@ const resolveDelivery = ({ linger, batchSize, deliveryTimeout, requestTimeout })
       deliveryTimeout <= MAX_TIMER_DELAY
     )) {
       throw new KafkaJSInvalidConfigurationError(
-        `deliveryTimeout must be an integer >= 1 and <= ${MAX_TIMER_DELAY}, got ${deliveryTimeout}`
+        `deliveryTimeout must be an integer >= 1 and <= ${MAX_TIMER_DELAY}, got ${inspect(deliveryTimeout)}`
       )
     }
 
