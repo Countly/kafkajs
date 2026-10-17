@@ -244,6 +244,10 @@ When the consumer notices a subscribed topic has come back under a new id, it re
 
 If you call [`seek`](#seek) around the time of a recreation, the newer intent wins: a seek issued *after* the consumer has noticed the recreation targets the current topic and is honored instead of the reset for that partition, while a seek issued *before* it is dropped, since its target offset belonged to the topic's previous incarnation.
 
+## <a name="topic-metadata"></a> Topic metadata
+
+The consumer routes fetches and offset requests from the metadata it caches for the topics it uses. When a broker's answer to a produce or fetch request names a new leader for a partition (a leader hint, KIP-951), only that partition's `leader` and `leaderEpoch` are updated in place. The other fields of the cached partition, `replicas`, `isr` and `offlineReplicas`, stay as the last metadata response said and may lag until the next metadata refresh. Produce and fetch routing read `leader` and `leaderEpoch`; the only other field it reads is `offlineReplicas`, when a consumer with `rackId` chooses between a preferred read replica and the leader. A read that needs the current replica set, such as `admin.fetchTopicMetadata()`, asks a broker directly and returns that answer as it is, without writing it into the cache.
+
 ## <a name="options"></a> Options
 
 ```javascript

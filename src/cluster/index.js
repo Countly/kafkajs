@@ -385,21 +385,67 @@ module.exports = class Cluster {
   }
 
   /**
+   * The cluster's metadata for `topics` (every topic when empty), as a broker answers it now. In
+   * three stages:
+   * 1. The refresh pre-step, `refreshMetadataIfNecessary`, which writes the metadata cache and
+   *    emits `TOPIC_RECREATED` as any other route does, but only when the cache is missing,
+   *    expired or lacks a named topic. The refresh retries `LEADER_NOT_AVAILABLE` on its own
+   *    `retry` budget; once that is spent it throws a non-retriable `KafkaJSNumberOfRetriesExceeded`
+   *    (`type` `LEADER_NOT_AVAILABLE`), which this method does not retry: it rejects at once with a
+   *    `KafkaJSNonRetriableError` whose `cause` is the broker's error. A raw `LEADER_NOT_AVAILABLE`
+   *    that escapes the refresh would be retried here. Any other refresh error is thrown as it is.
+   * 2. Broker selection, `withBroker`: a broker that cannot be found or connected to raises a
+   *    retriable error, which this method retries within the `retry` budget, ending in
+   *    `KafkaJSNumberOfRetriesExceeded`, or `KafkaJSDeliveryTimeout` when `retry.maxTotalTime`
+   *    passes first. A selection or connection error that cannot succeed, a SASL authentication
+   *    failure for example, rejects at once with a `KafkaJSNonRetriableError`.
+   * 3. The call on each broker in turn: a failure moves on to the next broker, and the first
+   *    answer is returned. When every broker is connected to and every call fails, the last
+   *    broker's error is thrown as it is (class and cause kept) after that one pass, never retried
+   *    here. When some calls fail and a later broker cannot be connected to, the attempt ends as
+   *    in stage 2 (`KafkaJSNumberOfRetriesExceeded` after the budget) and the call errors are lost.
+   *
+   * The answer is a snapshot: it is never merged into the metadata cache, never emits
+   * `TOPIC_RECREATED` and never changes the target topics.
    * @public
+   * @param {{ topics?: string[] }} [options]
    * @returns {Promise<import("../../types").BrokerMetadata>}
+   * @throws {Error} the last broker error, once every broker is connected to and has failed; or a
+   *   refresh error other than `LEADER_NOT_AVAILABLE`, as it is
+   * @throws {import("../errors").KafkaJSNumberOfRetriesExceeded} when brokers cannot be found or
+   *   connected to for the whole `retry` budget
+   * @throws {import("../errors").KafkaJSDeliveryTimeout} when `retry.maxTotalTime` passes before
+   *   that budget is spent
+   * @throws {import("../errors").KafkaJSNonRetriableError} when the refresh spent its budget on
+   *   `LEADER_NOT_AVAILABLE`, or broker selection fails in a way that cannot succeed
    */
   async metadata({ topics = [] } = {}) {
     return this.retrier(async (bail, retryCount, retryTime) => {
       try {
         await this.brokerPool.refreshMetadataIfNecessary(topics)
-        return this.brokerPool.withBroker(async ({ broker }) => broker.metadata(topics))
       } catch (e) {
         if (e.type === 'LEADER_NOT_AVAILABLE') {
           throw e
         }
 
-        bail(e)
+        return bail(e)
       }
+
+      let lastError
+      const metadata = await this.brokerPool.withBroker(async ({ broker }) => {
+        try {
+          return await broker.metadata(topics)
+        } catch (e) {
+          lastError = e
+          throw e
+        }
+      })
+
+      if (metadata === null) {
+        return bail(lastError)
+      }
+
+      return metadata
     })
   }
 

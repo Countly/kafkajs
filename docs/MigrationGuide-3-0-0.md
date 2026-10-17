@@ -379,6 +379,10 @@ transaction in a way its error decides.
 Rebalancing, fetching, committing and group membership, for the classic protocol and, where an item
 says so, `groupProtocol: 'consumer'`.
 
+- **A regex `subscribe()` and a custom assigner's `cluster.metadata()` reject with the broker's own
+  error when every broker fails.** 2.2.4 failed with a `TypeError`, or returned `null`. See the
+  Admin item "`listTopics()`, `describeCluster()`, `fetchTopicMetadata()`, a regex subscription and
+  `cluster.metadata()` reject with the broker's own error when every broker fails".
 - **`retry.restartOnFailure` is consulted for every terminal consumer crash.** It used to be
   invoked only for errors KafkaJS considered retriable, so a callback that returned `true` or
   `false` for a non-retriable error was silently ignored. If you never set it, nothing changes: the
@@ -959,6 +963,22 @@ Group visibility and the admin client.
   are all retriable, and may start retrying it. Inspect `error.cause.errors` (or `error.errors`
   when you catch the aggregate yourself) to see which topics failed. Setting
   `retry: { retries: 0 }` on the admin client turns the client's own retries off.
+- **`listTopics()`, `describeCluster()`, `fetchTopicMetadata()`, a regex subscription and
+  `cluster.metadata()` reject with the broker's own error when every broker fails.** In 2.2.4,
+  `cluster.metadata()` resolved `null` when every broker's Metadata request failed. The four
+  callers then failed with a `TypeError` (`Cannot destructure property 'topicMetadata' …`,
+  `Cannot destructure property 'brokers' …` or `Cannot read properties of null (reading
+  'topicMetadata')`), and a custom partition assigner that called `cluster.metadata()` got `null`.
+  They now reject, after one pass over the brokers, with the last broker's error, unwrapped, with
+  its class, `type`, `code` and `cause`. A broker that cannot be found or connected to is still
+  retried within the client's `retry` budget and ends in `KafkaJSNumberOfRetriesExceeded`
+  (`KafkaJSDeliveryTimeout` when `retry.maxTotalTime` ends it first). Two behaviors are new for
+  `fetchTopicMetadata()`. While the broker it asks last answers `LEADER_NOT_AVAILABLE`, it asks
+  again every 50 ms. If the Metadata path is still unsettled 10 s after it is entered, the call
+  rejects with `KafkaJSTimeout`, whether no leader appeared or no broker could be reached within
+  the `retry` budget; `useDescribeTopicPartitions` has no such cap. *What to do:* replace a
+  `TypeError` catch with a check of the error's class or `type`. Read `KafkaJSTimeout` from
+  `fetchTopicMetadata()` as "no usable Metadata answer within 10 s", not only as "no leader yet".
 
 ### Errors and events
 
