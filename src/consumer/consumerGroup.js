@@ -4,6 +4,8 @@ const arrayDiff = require('../utils/arrayDiff')
 const createRetry = require('../retry')
 
 const OffsetManager = require('./offsetManager')
+const OffsetOperations = require('./offsetManager/offsetOperations')
+const ResetObligations = require('./offsetManager/resetObligations')
 const Batch = require('./batch')
 const SeekOffsets = require('./seekOffsets')
 const SubscriptionState = require('./subscriptionState')
@@ -68,6 +70,12 @@ const STALE_METADATA_ERRORS = [
 // @see clients/src/main/resources/common/message/FetchRequest.json (Apache Kafka 4.3.1)
 const FETCH_TOPIC_NAMES_MAX_VERSION = 12
 
+/**
+ * How many times one `seekOffsets()` call resolves offsets again after a resolution dropped an
+ * answer because a competing seek, commit or recreation reached the cell meanwhile.
+ */
+const MAX_RESOLUTION_PASSES = 3
+
 module.exports = class ConsumerGroup {
   /**
    * @param {object} options
@@ -99,14 +107,14 @@ module.exports = class ConsumerGroup {
    *                                JoinGroup/SyncGroup/Heartbeat/LeaveGroup so the coordinator
    *                                recognizes this member across restarts.
    * @param {number} options.metadataMaxAge
-   * @param {Map<string, string>} [options.pendingTopicResets] Topics deleted and recreated while
-   *                                subscribed, each keyed by topic and stamped with its new topic
-   *                                id (owned by the long-lived `Consumer`; passed through to every
-   *                                `OffsetManager` this group builds, since the group itself is
-   *                                rebuilt on every crash restart).
-   * @param {Map<string, number>} [options.topicRecreations] How many times each subscribed topic
-   *                                was recreated (owned by the long-lived `Consumer`; passed
-   *                                through to every `OffsetManager` this group builds).
+   * @param {OffsetOperations} [options.operations] The ledger that orders this group's writes to
+   *                                the committed-offset cache (owned by the `Kafka` instance and
+   *                                shared by every participant in the group; a private one by
+   *                                default). Passed to every `OffsetManager` this group builds.
+   * @param {ResetObligations} [options.obligations] The resets the consumer owes recreated topics
+   *                                (owned by the long-lived `Consumer`, which survives the crash
+   *                                restarts that rebuild this group). Linked to the ledger here and
+   *                                passed to every `OffsetManager` this group builds.
    * @param {'classic'|'consumer'} [options.groupProtocol='classic'] which group membership protocol
    *                                to run. `'consumer'` is the broker-driven KIP-848 protocol.
    * @param {string|null} [options.groupRemoteAssignor=null] the server-side assignor name to ask
@@ -148,8 +156,8 @@ module.exports = class ConsumerGroup {
     groupInstanceId = null,
     rebalanceProtocol = EAGER,
     metadataMaxAge,
-    pendingTopicResets = new Map(),
-    topicRecreations = new Map(),
+    operations = new OffsetOperations(),
+    obligations = new ResetObligations(),
     groupProtocol = 'classic',
     groupRemoteAssignor = null,
     subscribedTopicRegex = null,
@@ -177,8 +185,9 @@ module.exports = class ConsumerGroup {
     this.rackId = rackId
     this.checkCrcs = checkCrcs
     this.metadataMaxAge = metadataMaxAge
-    this.pendingTopicResets = pendingTopicResets
-    this.topicRecreations = topicRecreations
+    this.operations = operations
+    this.obligations = obligations
+    this.obligations.attachTo(this.operations)
 
     this.rebalanceTimeout = rebalanceTimeout
     this.subscribedTopicRegex = subscribedTopicRegex
@@ -653,8 +662,8 @@ module.exports = class ConsumerGroup {
         generationId,
         memberId,
         groupInstanceId: this.groupInstanceId,
-        pendingTopicResets: this.pendingTopicResets,
-        topicRecreations: this.topicRecreations,
+        operations: this.operations,
+        obligations: this.obligations,
         membershipProtocol: this.kind,
         staleEpochTimeout: this.rebalanceTimeout,
         // Live reads, not the snapshot above: the offset-fetch retry inside the manager needs the
@@ -831,7 +840,7 @@ module.exports = class ConsumerGroup {
   /**
    * Drops every piece of state this member holds for one topic, because that topic was deleted
    * and recreated: its offsets, its preferred read replicas, and any pending seek. The
-   * corresponding one-shot reset is applied at the next offset resolution.
+   * corresponding reset is owed (`ResetObligations`) and applied at the next offset resolution.
    *
    * A no-op before the first sync (`offsetManager` is null until then) and for a topic outside
    * the current member assignment - the second guard keeps this member from writing a key it
@@ -841,8 +850,8 @@ module.exports = class ConsumerGroup {
    * Precedence with `seek()`: a seek pending here (queued but not yet applied) targets the
    * *old* incarnation and is dropped along with everything else, via `seekOffset.deleteTopic()`.
    * A seek issued *after* this call returns, applied in the same `seekOffsets()` cycle, targets
-   * the current incarnation and wins over the reset for that partition - see
-   * `ConsumerGroup#seekOffsets()` and `OffsetManager#drainPendingTopicResets()`.
+   * the current incarnation and wins over the reset for that partition: an applied seek settles
+   * the partition's obligation (`OffsetOperations#apply`).
    *
    * @param {string} topic
    * @returns {void}
@@ -1657,13 +1666,17 @@ module.exports = class ConsumerGroup {
    * Applies every pending `seek()` for the given topic/partitions, then resolves offsets for the
    * rest. A seek applied here that lands on a topic with a pending recreation reset (set by
    * `invalidateTopic()` earlier in this same fetch cycle) wins over that reset for its own
-   * partition: `resolveOffsets()` is told which partitions were just seeked and leaves them
-   * alone. No `Set` is allocated when nothing was seeked.
+   * partition: an applied seek settles the partition's reset obligation.
+   *
+   * A resolution that dropped an answer (a seek, commit or recreation reached the cell while the
+   * request was in flight) is repeated at once, after a yield to the event loop, at most
+   * `MAX_RESOLUTION_PASSES` times, instead of leaving the broker's round to wait out an empty
+   * fetch. No pass can spin: each needs a fresh competing operation to drop again. After the last
+   * pass the round proceeds as it always did.
    * @param {import("../../types").TopicPartitions[]} topicPartitions
    * @returns {Promise<void>}
    */
   async seekOffsets(topicPartitions) {
-    let seekedPartitions
     for (const { topic, partitions } of topicPartitions) {
       for (const partition of partitions) {
         const seekEntry = this.seekOffset.pop(topic, partition)
@@ -1677,17 +1690,17 @@ module.exports = class ConsumerGroup {
           seek: seekEntry,
         })
 
-        const applied = await this.offsetManager.seek(seekEntry)
-        if (applied) {
-          seekedPartitions = seekedPartitions || new Set()
-          seekedPartitions.add(
-            OffsetManager.seekedPartitionKey(seekEntry.topic, seekEntry.partition)
-          )
-        }
+        await this.offsetManager.seek(seekEntry)
       }
     }
 
-    await this.offsetManager.resolveOffsets(seekedPartitions)
+    for (let pass = 1; pass <= MAX_RESOLUTION_PASSES; pass++) {
+      if ((await this.offsetManager.resolveOffsets()) || pass === MAX_RESOLUTION_PASSES) {
+        break
+      }
+
+      await new Promise((resolve) => setImmediate(resolve))
+    }
 
     // Guarded, not just level-checked: this runs once per fetch round, and most rounds resolve
     // nothing, so the per-topic payload must not be built to be thrown away.

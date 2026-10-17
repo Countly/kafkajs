@@ -5,6 +5,7 @@ const ConsumerGroup = require('../consumerGroup')
 const Runner = require('../runner')
 const createConsumer = require('../index')
 const InstrumentationEventEmitter = require('../../instrumentation/emitter')
+const OffsetOperations = require('../offsetManager/offsetOperations')
 const channels = require('../../instrumentation/channels')
 const { events } = require('../instrumentationEvents')
 const { KafkaJSNonRetriableError } = require('../../errors')
@@ -42,7 +43,11 @@ const build = ({ groupProtocol = 'classic', groupInstanceId = null } = {}) => {
 
   const instrumentationEmitter = new InstrumentationEventEmitter({ channels: channels.consumer })
   const consumer = createConsumer({
-    cluster: { onTopicRecreated: () => () => {}, disconnect: async () => {} },
+    cluster: {
+      onTopicRecreated: () => () => {},
+      offsetOperations: () => new OffsetOperations(),
+      disconnect: async () => {},
+    },
     groupId: GROUP_ID,
     logger: newLogger(),
     instrumentationEmitter,

@@ -284,7 +284,7 @@ describe('Consumer > OffsetManager > STALE_MEMBER_EPOCH per call site', () => {
     const { manager, coordinator } = build({ membershipProtocol: 'consumer' })
     manager.membership = () => ({ generationId: 5, memberId: 'member-b', coordinator: null })
 
-    await expect(manager.resolveOffsets()).resolves.toBeUndefined()
+    await expect(manager.resolveOffsets()).resolves.toBe(true)
 
     expect(manager.coordinator).toBe(coordinator)
     expect(manager.generationId).toEqual(5)

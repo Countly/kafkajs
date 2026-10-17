@@ -7,6 +7,7 @@ const {
   KafkaJSNumberOfRetriesExceeded,
 } = require('../../errors')
 const InstrumentationEventEmitter = require('../../instrumentation/emitter')
+const OffsetOperations = require('../offsetManager/offsetOperations')
 const { createErrorFromCode } = require('../../protocol/error')
 const { newLogger, waitFor } = require('testHelpers')
 
@@ -30,6 +31,7 @@ const fakeCluster = () => ({
   addMultipleTargetTopics: jest.fn(async () => {}),
   metadata: jest.fn(async () => ({ topicMetadata: [{ topic: 'events-a' }, { topic: 'other' }] })),
   onTopicRecreated: () => () => {},
+  offsetOperations: () => new OffsetOperations(),
   retry: {},
 })
 

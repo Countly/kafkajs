@@ -305,7 +305,6 @@ class Rig {
       rackId: '',
       checkCrcs: true,
       metadataMaxAge: 300000,
-      pendingTopicResets: new Map(),
     })
 
     this.group.coordinator = this.wire

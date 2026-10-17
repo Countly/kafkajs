@@ -57,7 +57,6 @@ const createGroup = ({ topics = [TOPIC_A], ...options } = {}) => {
     rackId: '',
     checkCrcs: true,
     metadataMaxAge: 300000,
-    pendingTopicResets: new Map(),
     ...options,
   })
 

@@ -5,6 +5,7 @@ const Runner = require('../../consumer/runner')
 const ClassicGroupProtocol = require('../../consumer/groupProtocol/classic')
 const Batch = require('../../consumer/batch')
 const OffsetManager = require('../../consumer/offsetManager')
+const OffsetOperations = require('../../consumer/offsetManager/offsetOperations')
 const MetadataCache = require('../../cluster/metadataCache')
 const Lock = require('../../utils/lock')
 const { createFakeCluster } = require('../../producer/__tests__/fixtures/fakeCluster')
@@ -79,6 +80,7 @@ describe('Instrumentation > where the events are emitted', () => {
       isConnected: () => true,
       addMultipleTargetTopics: async () => {},
       onTopicRecreated: () => () => {},
+      offsetOperations: () => new OffsetOperations(),
       retry: {},
     })
 
@@ -297,7 +299,6 @@ describe('Instrumentation > where the events are emitted', () => {
         leaveForPollExpiry: jest.fn(async () => {}),
         needsReconciliation: jest.fn(() => false),
         resolvedOffsetAt: jest.fn(() => undefined),
-        pendingTopicResets: new Map(),
       }
       runner = new Runner({
         consumerGroup,

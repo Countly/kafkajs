@@ -5,6 +5,7 @@ const Lock = require('../utils/lock')
 const sharedPromiseTo = require('../utils/sharedPromiseTo')
 const createRetry = require('../retry')
 const connectionPoolBuilder = require('./connectionPoolBuilder')
+const OffsetOperations = require('../consumer/offsetManager/offsetOperations')
 const { EARLIEST_OFFSET, LATEST_OFFSET } = require('../constants')
 const {
   KafkaJSError,
@@ -1027,6 +1028,22 @@ module.exports = class Cluster {
     }
 
     return this.committedOffsetsByGroup.get(groupId)
+  }
+
+  /**
+   * Retrieve the ledger that orders every write to a consumer group's committed offsets. It is
+   * shared by every cluster the same `Kafka` instance creates, so a producer's transaction and a
+   * consumer's seek or commit for one group see each other.
+   * @param {object} options
+   * @param {string} options.groupId
+   * @returns {OffsetOperations}
+   */
+  offsetOperations({ groupId }) {
+    if (!this.operationsByGroup.has(groupId)) {
+      this.operationsByGroup.set(groupId, new OffsetOperations())
+    }
+
+    return this.operationsByGroup.get(groupId)
   }
 
   /**

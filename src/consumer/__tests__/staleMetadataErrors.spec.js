@@ -40,7 +40,6 @@ const buildGroup = () => {
     rackId: '',
     checkCrcs: true,
     metadataMaxAge: 300000,
-    pendingTopicResets: new Map(),
   })
 
   const requestRejoin = jest.fn()

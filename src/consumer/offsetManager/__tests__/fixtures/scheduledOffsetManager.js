@@ -1,92 +1,30 @@
 const OffsetManager = require('../../index')
+const ConsumerGroup = require('../../../consumerGroup')
+const OffsetOperations = require('../../offsetOperations')
+const ResetObligations = require('../../resetObligations')
 const InstrumentationEventEmitter = require('../../../../instrumentation/emitter')
-const { Schedule } = require('testHelpers')
+const { Schedule } = require('../../../../../testHelpers/schedule')
+const { newLogger } = require('testHelpers')
 
 const TOPIC = 'test-topic'
+const OLD_ID = '01020304-0506-0708-090a-0b0c0d0e0f10'
+const NEW_ID = '11121314-1516-1718-191a-1b1c1d1e1f20'
+const GROUP_ID = 'test-group'
 
 /**
- * @param {string} topic
- * @param {number} partition
- * @returns {string} the key a partition has in the broker's committed offsets
- */
-const keyOf = (topic, partition) => `${topic}:${partition}`
-
-/**
- * What a case reads of an offset manager's state, each read apart from the others.
- * @typedef {object} OffsetReads
- * @property {(topic: string, partition: number) => string} position where the next fetch of the
- *   partition starts, as a decimal string
- * @property {(topic: string) => boolean} resetOwed whether the topic's recreation still owes its
- *   reset
- */
-
-/**
- * The answers of a coordinator and a cluster whose OffsetFetch, OffsetCommit and ListOffsets calls
- * go through a `Schedule`, so a case can hold any of them and release it when it chooses.
- *
- * The coordinator keeps one committed offset per partition, which an OffsetCommit changes and an
- * OffsetFetch reads (`-1` when none): enough for a case to see what a later resolution reads back,
- * and nothing more than that.
- * @param {Schedule} schedule
- * @param {object} [options]
- * @param {string} [options.committed='99'] what the coordinator holds for a partition nobody
- *   committed to
- * @param {string} [options.earliest='0'] what ListOffsets answers for every partition
- * @returns {{ offsetFetch: Function, offsetCommit: Function, fetchTopicsOffset: Function,
- *   brokerOffsets: Map<string, string> }}
- */
-const createOffsetStubs = (schedule, { committed = '99', earliest = '0' } = {}) => {
-  const brokerOffsets = new Map()
-
-  return {
-    brokerOffsets,
-    offsetFetch: (request) =>
-      schedule.run({ api: 'OffsetFetch', request }, () => ({
-        responses: request.topics.map(({ topic, partitions }) => ({
-          topic,
-          partitions: partitions.map(({ partition }) => ({
-            partition,
-            offset: brokerOffsets.get(keyOf(topic, partition)) ?? committed,
-            committedLeaderEpoch: -1,
-            metadata: null,
-            errorCode: 0,
-          })),
-        })),
-      })),
-    offsetCommit: (payload) =>
-      schedule.run({ api: 'OffsetCommit', payload }, () => {
-        for (const { topic, partitions } of payload.topics) {
-          for (const { partition, offset } of partitions) {
-            brokerOffsets.set(keyOf(topic, partition), offset)
-          }
-        }
-
-        return { topics: [] }
-      }),
-    fetchTopicsOffset: (topics) =>
-      schedule.run({ api: 'ListOffsets', topics }, () =>
-        topics.map(({ topic, partitions }) => ({
-          topic,
-          partitions: partitions.map(({ partition }) => ({ partition, offset: earliest })),
-        }))
-      ),
-  }
-}
-
-/**
- * The answer an OffsetFetch gives, for releasing a held one by hand.
- * @param {Record<number, string>} offsets committed offset by partition (`'-1'` for none)
- * @param {string} [topic]
+ * The decoded OffsetFetch answer of a coordinator that holds `offsets`.
+ * @param {Record<number, string>} offsets committed offset by partition; '-1' is "none"
+ * @param {number} [committedLeaderEpoch] the epoch each commit carried, -1 for none
  * @returns {object}
  */
-const offsetFetchAnswer = (offsets, topic = TOPIC) => ({
+const offsetFetchAnswer = (offsets, committedLeaderEpoch = -1) => ({
   responses: [
     {
-      topic,
+      topic: TOPIC,
       partitions: Object.entries(offsets).map(([partition, offset]) => ({
         partition: Number(partition),
         offset,
-        committedLeaderEpoch: -1,
+        committedLeaderEpoch,
         metadata: null,
         errorCode: 0,
       })),
@@ -95,14 +33,13 @@ const offsetFetchAnswer = (offsets, topic = TOPIC) => ({
 })
 
 /**
- * The answer a ListOffsets gives, for releasing a held one by hand.
- * @param {Record<number, string>} offsets offset by partition
- * @param {string} [topic]
+ * The decoded ListOffsets answer for `offsets`.
+ * @param {Record<number, string>} offsets log offset by partition
  * @returns {object[]}
  */
-const listOffsetsAnswer = (offsets, topic = TOPIC) => [
+const listOffsetsAnswer = (offsets) => [
   {
-    topic,
+    topic: TOPIC,
     partitions: Object.entries(offsets).map(([partition, offset]) => ({
       partition: Number(partition),
       offset,
@@ -111,123 +48,168 @@ const listOffsetsAnswer = (offsets, topic = TOPIC) => [
 ]
 
 /**
- * A real `OffsetManager` over a stub cluster and coordinator whose calls a `Schedule` can hold,
- * with the state a recreation leaves behind exposed through four reads: `position` (where the next
- * fetch starts), `committed` (the cached committed offset), `resetOwed` (a reset the topic still
- * owes) and `retainedEntries` (what the consumer keeps to tell a recreation apart).
+ * A real `OffsetManager` over a stub cluster and coordinator whose OffsetFetch, ListOffsets and
+ * OffsetCommit are holdable through a `Schedule`. The coordinator behaves like a broker: a commit
+ * is stored when it arrives, and OffsetFetch answers what is stored.
+ *
  * @param {object} [options]
- * @param {string[]} [options.topics] assigned topics, each with `partitions` partitions
- * @param {number} [options.partitions=1]
- * @param {boolean} [options.autoCommit=false]
- * @param {string} [options.committed='99'] see `createOffsetStubs`
- * @param {string} [options.earliest='0'] see `createOffsetStubs`
- * @returns {OffsetReads & { manager: OffsetManager, coordinator: object, schedule: Schedule,
- *   brokerOffsets: Map<string, string>,
- *   recreate: (topic: string, newId: string) => void,
- *   committed: (topic: string, partition: number) => string|undefined,
- *   retainedEntries: () => number }} `committed` is the cached committed offset, absent until the
- *   group resolves or commits one; `retainedEntries` counts the recreations the consumer still
- *   remembers; `recreate` deletes the topic and creates it again under `newId`
+ * @param {number[]} [options.partitions] the assigned partitions of the one topic
+ * @param {string} [options.topicId] the topic id the metadata cache holds, none by default
+ * @param {string} [options.committed] what the coordinator holds for every partition, '-1' for none
+ * @param {string} [options.listOffset] what ListOffsets answers for every partition
+ * @param {boolean} [options.autoCommit] whether a seek commits
+ * @param {OffsetOperations} [options.operations] the group's ledger
+ * @param {ResetObligations} [options.obligations] the consumer's reset obligations
+ * @returns {object} the manager, `rebuild()` for a manager built as a rebalance would, the
+ *   schedule, the stubs, the shared cache, the ledger and obligations, and helpers that read the
+ *   state a case asserts: `next` (the offset the next fetch starts from), `committedAt` (the
+ *   committed cache), `owed` (the reset obligation)
  */
-const createScheduledManager = ({
-  topics = [TOPIC],
-  partitions = 1,
-  autoCommit = false,
+const createScheduledOffsetManager = ({
+  partitions = [0],
+  topicId,
   committed = '99',
-  earliest = '0',
+  listOffset = '0',
+  autoCommit = false,
+  operations = new OffsetOperations(),
+  obligations = new ResetObligations(),
 } = {}) => {
+  obligations.attachTo(operations)
   const schedule = new Schedule()
-  const stubs = createOffsetStubs(schedule, { committed, earliest })
-  const ids = new Map(topics.map((topic) => [topic, 'id-0']))
-  const pendingTopicResets = new Map()
-  const topicRecreations = new Map()
-  const store = {}
+  const state = { topicId }
+  const stored = Object.fromEntries(partitions.map((partition) => [partition, committed]))
+  const cache = {}
+
+  const cluster = {
+    committedOffsets: () => cache,
+    topicId: () => state.topicId,
+    fetchTopicsOffset: jest.fn((topics) =>
+      schedule.run({ api: 'ListOffsets', topics }, () =>
+        listOffsetsAnswer(
+          Object.fromEntries(
+            topics.flatMap(({ partitions: asked }) =>
+              asked.map(({ partition }) => [partition, listOffset])
+            )
+          )
+        )
+      )
+    ),
+  }
+
   const coordinator = {
     isConnected: () => true,
-    offsetFetch: stubs.offsetFetch,
-    offsetCommit: stubs.offsetCommit,
+    offsetFetch: jest.fn(({ topics }) =>
+      schedule.run({ api: 'OffsetFetch', topics }, () =>
+        offsetFetchAnswer(
+          Object.fromEntries(
+            topics.flatMap(({ partitions: asked }) =>
+              asked.map(({ partition }) => [partition, stored[partition]])
+            )
+          )
+        )
+      )
+    ),
+    offsetCommit: jest.fn(({ topics }) => {
+      topics.forEach(({ partitions: sent }) =>
+        sent.forEach(({ partition, offset }) => {
+          stored[partition] = offset
+        })
+      )
+      return schedule.run({ api: 'OffsetCommit', topics }, () => ({}))
+    }),
   }
-  const cluster = {
-    committedOffsets: () => store,
-    topicId: (topic) => ids.get(topic),
-    fetchTopicsOffset: stubs.fetchTopicsOffset,
-    refreshMetadata: async () => {},
-    findGroupCoordinator: async () => coordinator,
-  }
-  const assigned = Array.from({ length: partitions }, (_, partition) => partition)
 
-  const manager = new OffsetManager({
+  const options = {
     cluster,
     coordinator,
-    memberAssignment: Object.fromEntries(topics.map((topic) => [topic, assigned])),
+    memberAssignment: { [TOPIC]: partitions },
     autoCommit,
     autoCommitInterval: null,
     autoCommitThreshold: null,
-    topicConfigurations: Object.fromEntries(
-      topics.map((topic) => [topic, { fromBeginning: true }])
-    ),
+    topicConfigurations: { [TOPIC]: { fromBeginning: true } },
     instrumentationEmitter: new InstrumentationEventEmitter(),
-    groupId: 'test-group',
+    groupId: GROUP_ID,
     generationId: 1,
-    memberId: 'member-1',
-    pendingTopicResets,
-    topicRecreations,
-  })
+    memberId: 'member-a',
+    operations,
+    obligations,
+    logger: newLogger(),
+  }
+  const manager = new OffsetManager(options)
 
   return {
     manager,
-    coordinator,
+    /** A manager built as a rebalance builds one, optionally for another consumer of the group. */
+    build: (overrides) => new OffsetManager({ ...options, ...overrides }),
+    rebuild: () => new OffsetManager(options),
     schedule,
-    brokerOffsets: stubs.brokerOffsets,
-    /** The topic is deleted and created again under `newId`, as the consumer records it. */
-    recreate: (topic, newId) => {
-      ids.set(topic, newId)
-      pendingTopicResets.set(topic, newId)
-      topicRecreations.set(topic, (topicRecreations.get(topic) || 0) + 1)
+    cluster,
+    coordinator,
+    cache,
+    stored,
+    operations,
+    obligations,
+    setTopicId: (id) => {
+      state.topicId = id
     },
-    position: (topic, partition) => manager.nextOffset(topic, partition).toString(),
-    committed: (topic, partition) => store[topic]?.[partition],
-    resetOwed: (topic) => pendingTopicResets.has(topic),
-    retainedEntries: () => topicRecreations.size,
+    /** What the Consumer's listener and `ConsumerGroup#invalidateTopic` do for a recreation. */
+    recreate: (id) => {
+      state.topicId = id
+      obligations.owe(TOPIC, id)
+      operations.touchTopic(TOPIC)
+      manager.resetOffsetsForTopic(TOPIC)
+    },
+    next: (partition = 0) => manager.nextOffset(TOPIC, partition).toString(),
+    committedAt: (partition = 0) => cache[TOPIC][partition],
+    owed: (partition = 0) => obligations.isOwed(TOPIC, partition),
   }
 }
 
 /**
- * Puts a `Schedule` in front of the calls a consumer group built by `createFetchGroup` makes to
- * the coordinator and the cluster for offsets, and empties the committed offsets the harness primed.
- * @param {object} fetchGroup what `createFetchGroup` resolved with
- * @param {object} [options] see `createOffsetStubs`
- * @returns {OffsetReads & { schedule: Schedule, brokerOffsets: Map<string, string> }}
+ * A real `ConsumerGroup` over a fixture's manager, ledger and obligations, with the assignment
+ * already applied to its subscription state.
+ * @param {object} ctx a fixture from `createScheduledOffsetManager` or `createOffsetsOnTheWire`
+ * @param {{topic: string, partitions: number[]}[]} [assignment]
+ * @returns {ConsumerGroup}
  */
-const scheduleOffsets = (fetchGroup, options) => {
-  const schedule = new Schedule()
-  const stubs = createOffsetStubs(schedule, options)
-  const { broker, cluster, offsetManager, offsetCommit } = fetchGroup
+const groupOver = (ctx, assignment = [{ topic: TOPIC, partitions: [0] }]) => {
+  const group = new ConsumerGroup({
+    retry: { retries: 0 },
+    cluster: ctx.cluster,
+    groupId: GROUP_ID,
+    topics: [TOPIC],
+    topicConfigurations: { [TOPIC]: { fromBeginning: true } },
+    logger: newLogger(),
+    instrumentationEmitter: new InstrumentationEventEmitter(),
+    assigners: [],
+    sessionTimeout: 30000,
+    rebalanceTimeout: 60000,
+    maxBytesPerPartition: 1048576,
+    minBytes: 1,
+    maxBytes: 1048576,
+    maxWaitTimeInMs: 100,
+    autoCommit: true,
+    autoCommitInterval: null,
+    autoCommitThreshold: null,
+    isolationLevel: 0,
+    rackId: '',
+    checkCrcs: true,
+    metadataMaxAge: 300000,
+    operations: ctx.operations,
+    obligations: ctx.obligations,
+  })
+  group.subscriptionState.assign(assignment)
+  group.offsetManager = ctx.manager
 
-  // A group that has resolved nothing holds no committed offset at all (an absent cell is what the
-  // fetch loop leaves out), not the primed one `createFetchGroup` starts from.
-  for (const [topic, partitions] of Object.entries(offsetManager.memberAssignment)) {
-    for (const partition of partitions) {
-      delete offsetManager.committedOffsets()[topic][partition]
-    }
-  }
-
-  jest.spyOn(broker, 'offsetFetch').mockImplementation(stubs.offsetFetch)
-  offsetCommit.mockImplementation(stubs.offsetCommit)
-  cluster.fetchTopicsOffset = stubs.fetchTopicsOffset
-
-  return {
-    schedule,
-    brokerOffsets: stubs.brokerOffsets,
-    resetOwed: (topic) => offsetManager.pendingTopicResets.has(topic),
-    position: (topic, partition) => offsetManager.nextOffset(topic, partition).toString(),
-  }
+  return group
 }
-
 module.exports = {
   TOPIC,
-  createScheduledManager,
-  scheduleOffsets,
+  OLD_ID,
+  NEW_ID,
+  GROUP_ID,
   offsetFetchAnswer,
   listOffsetsAnswer,
+  createScheduledOffsetManager,
+  groupOver,
 }

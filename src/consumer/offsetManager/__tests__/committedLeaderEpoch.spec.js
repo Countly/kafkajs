@@ -1,4 +1,5 @@
 const OffsetManager = require('../index')
+const ResetObligations = require('../resetObligations')
 const Batch = require('../../batch')
 const InstrumentationEventEmitter = require('../../../instrumentation/emitter')
 const RequestV8Protocol = require('../../../protocol/requests/offsetCommit/v8/request')
@@ -255,6 +256,9 @@ describe('Consumer > committed leader epoch', () => {
         }),
       }
 
+      const obligations = new ResetObligations()
+      obligations.owe(TOPIC, 'new-id')
+
       const manager = new OffsetManager({
         cluster: {
           committedOffsets: () => ({}),
@@ -273,13 +277,13 @@ describe('Consumer > committed leader epoch', () => {
         groupId: 'test-group',
         generationId: 1,
         memberId: 'member-1',
-        pendingTopicResets: new Map([[TOPIC, 'new-id']]),
+        obligations,
       })
 
       await manager.resolveOffsets()
 
-      // drainPendingTopicResets rewrote the offset to the invalid sentinel but left the epoch
-      // alone; seeding it would attach the previous incarnation's epoch to a fresh position.
+      // The owed reset rewrote the offset to the invalid sentinel but left the epoch alone;
+      // seeding it would attach the previous incarnation's epoch to a fresh position.
       expect(manager.lastConsumedEpoch(TOPIC, 0)).toEqual(-1)
     })
 
@@ -332,7 +336,7 @@ describe('Consumer > committed leader epoch', () => {
         memberId: 'member-1',
       })
 
-      await expect(manager.resolveOffsets()).resolves.toBeUndefined()
+      await expect(manager.resolveOffsets()).resolves.toBe(true)
       expect(manager.lastConsumedEpoch(TOPIC, 0)).toEqual(4)
       expect(manager.resolvedEpochs['not-assigned-to-this-member']).toBeUndefined()
     })

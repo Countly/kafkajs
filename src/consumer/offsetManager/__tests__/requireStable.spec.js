@@ -357,7 +357,7 @@ describe('Consumer > OffsetManager > stable offsets', () => {
     jest.setSystemTime(Date.now() + 3600000)
     await jest.advanceTimersByTimeAsync(300)
 
-    await expect(resolving).resolves.toBeUndefined()
+    await expect(resolving).resolves.toBe(true)
     expect(offsetFetch).toHaveBeenCalledTimes(3)
   })
 
@@ -392,7 +392,6 @@ describe('Consumer > ConsumerGroup > the stable-offset wait wiring', () => {
       rebalanceTimeout: 60000,
       heartbeatInterval: 3000,
       autoCommit: false,
-      pendingTopicResets: new Map(),
     })
     group.partitionsPerSubscribedTopic = group.generatePartitionsPerSubscribedTopic()
     await group.applyRebalanceResult({ assignment: { [TOPIC]: [0] } }, { rebuildOffsets: true })

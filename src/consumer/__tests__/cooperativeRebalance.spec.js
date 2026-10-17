@@ -71,7 +71,6 @@ const createGroup = ({
     checkCrcs: true,
     rebalanceProtocol: mode,
     metadataMaxAge: 300000,
-    pendingTopicResets: new Map(),
   })
 
   group.memberId = 'member-1'

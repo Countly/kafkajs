@@ -2,10 +2,15 @@ const createConsumer = require('../index')
 const ConsumerGroup = require('../consumerGroup')
 const Runner = require('../runner')
 const OffsetManager = require('../offsetManager')
+const OffsetOperations = require('../offsetManager/offsetOperations')
+const ResetObligations = require('../offsetManager/resetObligations')
 const SeekOffsets = require('../seekOffsets')
 const InstrumentationEventEmitter = require('../../instrumentation/emitter')
 const { CLUSTER_TOPIC_RECREATED } = require('../../cluster/instrumentationEvents')
 const { newLogger, waitFor } = require('testHelpers')
+const {
+  createScheduledOffsetManager,
+} = require('../offsetManager/__tests__/fixtures/scheduledOffsetManager')
 
 const TOPIC = 'test-topic'
 const ID_A = '01020304-0506-0708-090a-0b0c0d0e0f10'
@@ -32,6 +37,7 @@ const createCluster = ({ topicIds = {} } = {}) => {
   return {
     instrumentationEmitter,
     committedOffsetsByGroup: new Map(),
+    operationsByGroup: new Map(),
     connect: async () => {},
     disconnect: async () => {},
     metadata: async () => ({ topicMetadata: [] }),
@@ -46,6 +52,13 @@ const createCluster = ({ topicIds = {} } = {}) => {
       }
       return this.committedOffsetsByGroup.get(groupId)
     },
+    // Backed by the map, exactly as Cluster#offsetOperations is.
+    offsetOperations({ groupId }) {
+      if (!this.operationsByGroup.has(groupId)) {
+        this.operationsByGroup.set(groupId, new OffsetOperations())
+      }
+      return this.operationsByGroup.get(groupId)
+    },
     defaultOffset: ({ fromBeginning }) => (fromBeginning ? -2 : -1),
     topicId: (topic) => topicIds[topic],
     onTopicRecreated: (handler) =>
@@ -53,6 +66,13 @@ const createCluster = ({ topicIds = {} } = {}) => {
     listenerCount: () => instrumentationEmitter.emitter.listenerCount(CLUSTER_TOPIC_RECREATED),
     emitRecreated: (payload) => instrumentationEmitter.emit(CLUSTER_TOPIC_RECREATED, payload),
   }
+}
+
+/** A table that owes `topic` a reset for the incarnation `topicId`. */
+const owing = (topic, topicId) => {
+  const obligations = new ResetObligations()
+  obligations.owe(topic, topicId)
+  return obligations
 }
 
 const build = (cluster, options = {}) =>
@@ -123,8 +143,8 @@ describe('Consumer > topic recreation', () => {
      * `Runner#start` is the only thing stubbed, and `Runner` stores the group it was constructed
      * with (`runner.js:52`), so the test can reach both observable handles without production
      * growing a single accessor for it - a spy on `ConsumerGroup#invalidateTopic`, and the
-     * `pendingTopicResets` Map the consumer passes into the `ConsumerGroup` constructor and the
-     * group stores as `this.pendingTopicResets`.
+     * `ResetObligations` the consumer passes into the `ConsumerGroup` constructor and the group
+     * stores as `this.obligations`.
      */
     const runConsumer = async (cluster) => {
       const start = jest.spyOn(Runner.prototype, 'start').mockResolvedValue()
@@ -141,7 +161,7 @@ describe('Consumer > topic recreation', () => {
         consumer,
         consumerGroup,
         invalidateTopic,
-        pendingTopicResets: consumerGroup.pendingTopicResets,
+        obligations: consumerGroup.obligations,
       }
     }
 
@@ -151,36 +171,65 @@ describe('Consumer > topic recreation', () => {
 
     test('a subscribed topic is recorded, stamped with the new topic id', async () => {
       const cluster = createCluster()
-      const { pendingTopicResets, invalidateTopic } = await runConsumer(cluster)
+      const { obligations, invalidateTopic } = await runConsumer(cluster)
 
       cluster.emitRecreated({ topic: TOPIC, previousTopicId: ID_A, topicId: ID_B })
 
-      expect(pendingTopicResets).toEqual(new Map([[TOPIC, ID_B]]))
+      expect(obligations.current(TOPIC)).toEqual(ID_B)
       expect(invalidateTopic).toHaveBeenCalledWith(TOPIC)
     })
 
-    test('each recorded recreation advances the topic recreation count, and an ignored topic does not', async () => {
+    test('each recorded recreation fences the open operations of the topic in the group ledger, and an ignored topic does not', async () => {
       const cluster = createCluster()
-      const { consumerGroup } = await runConsumer(cluster)
+      await runConsumer(cluster)
+      const operations = cluster.offsetOperations({ groupId: 'test-group' })
+      const subscribed = operations.begin([{ topic: TOPIC, partition: 0 }])
+      const other = operations.begin([{ topic: 'someone-elses-topic', partition: 0 }])
 
       cluster.emitRecreated({ topic: TOPIC, previousTopicId: ID_A, topicId: ID_B })
+      const afterFirst = operations.begin([{ topic: TOPIC, partition: 0 }])
       cluster.emitRecreated({ topic: TOPIC, previousTopicId: ID_B, topicId: ID_A })
+      expect(operations.isSuperseded(afterFirst, TOPIC, 0)).toBe(true)
       cluster.emitRecreated({ topic: 'someone-elses-topic', previousTopicId: ID_A, topicId: ID_B })
 
-      expect(consumerGroup.topicRecreations).toEqual(new Map([[TOPIC, 2]]))
+      expect(operations.isSuperseded(subscribed, TOPIC, 0)).toBe(true)
+      expect(operations.isSuperseded(other, 'someone-elses-topic', 0)).toBe(false)
+      operations.end(subscribed)
+      operations.end(afterFirst)
+      operations.end(other)
     })
 
-    test('a topic outside the current subscription is ignored: no key in the shared committed-offsets map and the pending map stays empty', async () => {
+    test('a topic outside the current subscription is ignored: no key in the shared committed-offsets map and no reset is owed', async () => {
       const cluster = createCluster()
-      const { pendingTopicResets, invalidateTopic } = await runConsumer(cluster)
+      const { obligations, invalidateTopic } = await runConsumer(cluster)
 
       cluster.emitRecreated({ topic: 'someone-elses-topic', previousTopicId: ID_A, topicId: ID_B })
 
-      expect(pendingTopicResets.size).toEqual(0)
+      expect(obligations.size()).toEqual(0)
       expect(invalidateTopic).not.toHaveBeenCalled()
       expect(cluster.committedOffsetsByGroup.get('test-group') || {}).not.toHaveProperty(
         'someone-elses-topic'
       )
+    })
+
+    test('disconnect() empties the obligations and unlinks them, and the next run links them again', async () => {
+      const cluster = createCluster()
+      const { consumer, obligations } = await runConsumer(cluster)
+      const operations = cluster.offsetOperations({ groupId: 'test-group' })
+      cluster.emitRecreated({ topic: TOPIC, previousTopicId: ID_A, topicId: ID_B })
+      expect(obligations.size()).toEqual(1)
+
+      await consumer.disconnect()
+
+      expect(obligations.size()).toEqual(0)
+      obligations.owe(TOPIC, ID_B)
+      const ticket = operations.begin([{ topic: TOPIC, partition: 0 }], { mutation: true })
+      operations.apply(ticket, TOPIC, 0)
+      expect(obligations.isOwed(TOPIC, 0)).toBe(true)
+
+      await consumer.run({ eachMessage: async () => {} })
+      operations.apply(ticket, TOPIC, 0)
+      expect(obligations.isOwed(TOPIC, 0)).toBe(false)
     })
 
     test('an event before the first sync (offsetManager === null) is a no-op, not a throw', async () => {
@@ -196,14 +245,14 @@ describe('Consumer > topic recreation', () => {
       // The headline case: connect() is optional, so a connect()-time subscription would leave
       // this shape with zero listeners and the reset silently inert.
       const cluster = createCluster({ topicIds: { [TOPIC]: ID_B } })
-      const { pendingTopicResets } = await runConsumer(cluster)
+      const { obligations } = await runConsumer(cluster)
       expect(cluster.listenerCount()).toEqual(1)
 
       cluster.emitRecreated({ topic: TOPIC, previousTopicId: ID_A, topicId: ID_B })
-      expect(pendingTopicResets).toEqual(new Map([[TOPIC, ID_B]]))
+      expect(obligations.current(TOPIC)).toEqual(ID_B)
 
-      // …and the entry really is consumed: a sync's OffsetManager, built with that same Map,
-      // ignores the coordinator's committed offset once and resolves per fromBeginning.
+      // …and the obligation is really settled: a sync's OffsetManager, built with that same
+      // table, ignores the coordinator's committed offset once and resolves per fromBeginning.
       const fetched = []
       cluster.fetchTopicsOffset = async (topics) => {
         fetched.push(topics)
@@ -233,7 +282,7 @@ describe('Consumer > topic recreation', () => {
         groupId: 'test-group',
         generationId: 0,
         memberId: 'm',
-        pendingTopicResets,
+        obligations,
       })
 
       await offsetManager.resolveOffsets()
@@ -241,7 +290,7 @@ describe('Consumer > topic recreation', () => {
       expect(fetched).toHaveLength(1)
       expect(fetched[0][0]).toMatchObject({ topic: TOPIC, fromBeginning: true })
       expect(offsetManager.committedOffsets()[TOPIC][0]).toEqual('0')
-      expect(pendingTopicResets.size).toEqual(0)
+      expect(obligations.size()).toEqual(0)
     })
   })
 
@@ -270,7 +319,6 @@ describe('Consumer > topic recreation', () => {
         rackId: '',
         checkCrcs: true,
         metadataMaxAge: 300000,
-        pendingTopicResets: new Map(),
       })
 
       if (memberAssignment) {
@@ -284,7 +332,6 @@ describe('Consumer > topic recreation', () => {
           groupId: 'test-group',
           generationId: 0,
           memberId: 'm',
-          pendingTopicResets: new Map(),
         })
       }
 
@@ -343,7 +390,7 @@ describe('Consumer > topic recreation', () => {
   })
 
   describe('OffsetManager#resolveOffsets drain', () => {
-    const manager = ({ pendingTopicResets, topicIds = {}, committed = '99' }) => {
+    const manager = ({ obligations, topicIds = {}, committed = '99' }) => {
       const cluster = createCluster({ topicIds })
       const fetched = []
       cluster.fetchTopicsOffset = async (topics) => {
@@ -374,23 +421,23 @@ describe('Consumer > topic recreation', () => {
         groupId: 'test-group',
         generationId: 0,
         memberId: 'm',
-        pendingTopicResets,
+        obligations,
       })
 
       return { offsetManager, fetched }
     }
 
     test('without a pending reset the coordinator offset is used', async () => {
-      const { offsetManager, fetched } = manager({ pendingTopicResets: new Map() })
+      const { offsetManager, fetched } = manager({ obligations: new ResetObligations() })
       await offsetManager.resolveOffsets()
       expect(fetched).toEqual([])
       expect(offsetManager.committedOffsets()[TOPIC][0]).toEqual('99')
     })
 
     test('resolveOffsets after a reset ignores the coordinator committed offset once and resolves per fromBeginning', async () => {
-      const pendingTopicResets = new Map([[TOPIC, ID_B]])
+      const obligations = owing(TOPIC, ID_B)
       const { offsetManager, fetched } = manager({
-        pendingTopicResets,
+        obligations,
         topicIds: { [TOPIC]: ID_B },
       })
 
@@ -399,18 +446,18 @@ describe('Consumer > topic recreation', () => {
       expect(fetched).toHaveLength(1)
       expect(fetched[0][0]).toMatchObject({ topic: TOPIC, fromBeginning: true })
       expect(offsetManager.committedOffsets()[TOPIC][0]).toEqual('0')
-      expect(pendingTopicResets.size).toEqual(0)
+      expect(obligations.size()).toEqual(0)
 
-      // one-shot: the next resolution is normal again
+      // settled: the next resolution is normal again
       offsetManager.committedOffsets()[TOPIC] = {}
       await offsetManager.resolveOffsets()
       expect(offsetManager.committedOffsets()[TOPIC][0]).toEqual('99')
     })
 
     test('a pending entry whose stamped topic id differs from a known cached id is dropped without resetting', async () => {
-      const pendingTopicResets = new Map([[TOPIC, ID_A]])
+      const obligations = owing(TOPIC, ID_A)
       const { offsetManager, fetched } = manager({
-        pendingTopicResets,
+        obligations,
         topicIds: { [TOPIC]: ID_B },
       })
 
@@ -418,13 +465,13 @@ describe('Consumer > topic recreation', () => {
 
       expect(fetched).toEqual([])
       expect(offsetManager.committedOffsets()[TOPIC][0]).toEqual('99')
-      expect(pendingTopicResets.size).toEqual(0)
+      expect(obligations.size()).toEqual(0)
     })
 
     test('a rebootstrap between the recreation and the next resolveOffsets does not discard the pending reset', async () => {
       // The cache was cleared, so topicId(TOPIC) is undefined - unknown, not "changed".
-      const pendingTopicResets = new Map([[TOPIC, ID_B]])
-      const { offsetManager, fetched } = manager({ pendingTopicResets, topicIds: {} })
+      const obligations = owing(TOPIC, ID_B)
+      const { offsetManager, fetched } = manager({ obligations, topicIds: {} })
 
       await offsetManager.resolveOffsets()
 
@@ -433,15 +480,15 @@ describe('Consumer > topic recreation', () => {
     })
 
     test('a subscribed-but-unassigned topic keeps its pending entry until a sync assigns it', async () => {
-      const pendingTopicResets = new Map([['not-assigned', ID_B]])
-      const { offsetManager } = manager({ pendingTopicResets, topicIds: { 'not-assigned': ID_B } })
+      const obligations = owing('not-assigned', ID_B)
+      const { offsetManager } = manager({ obligations, topicIds: { 'not-assigned': ID_B } })
 
       await offsetManager.resolveOffsets()
 
-      expect(pendingTopicResets.get('not-assigned')).toEqual(ID_B)
+      expect(obligations.current('not-assigned')).toEqual(ID_B)
 
-      // …and is drained at the first resolveOffsets() after a sync assigns it - a fresh
-      // OffsetManager, as a sync would build, sharing the same pendingTopicResets by reference.
+      // …and is settled at the first resolveOffsets() after a sync assigns it - a fresh
+      // OffsetManager, as a sync would build, sharing the same table by reference.
       const cluster = createCluster({ topicIds: { 'not-assigned': ID_B } })
       const fetched = []
       cluster.fetchTopicsOffset = async (topics) => {
@@ -472,21 +519,21 @@ describe('Consumer > topic recreation', () => {
         groupId: 'test-group',
         generationId: 0,
         memberId: 'm',
-        pendingTopicResets,
+        obligations,
       })
 
       await assignedManager.resolveOffsets()
 
       expect(fetched).toHaveLength(1)
       expect(assignedManager.committedOffsets()['not-assigned'][0]).toEqual('0')
-      expect(pendingTopicResets.size).toEqual(0)
+      expect(obligations.size()).toEqual(0)
     })
   })
 
   test('a rejoin between invalidateTopic and the next fetch still resolves per fromBeginning', async () => {
-    // pendingTopicResets is passed by reference into each ConsumerGroup and each OffsetManager,
-    // so a rebuild of either cannot lose it.
-    const pendingTopicResets = new Map([[TOPIC, ID_B]])
+    // The obligations are passed by reference into each ConsumerGroup and each OffsetManager, so a
+    // rebuild of either cannot lose them.
+    const obligations = owing(TOPIC, ID_B)
     const cluster = createCluster({ topicIds: { [TOPIC]: ID_B } })
     let fetchedFromBeginning = false
     cluster.fetchTopicsOffset = async (topics) => {
@@ -518,7 +565,7 @@ describe('Consumer > topic recreation', () => {
       groupId: 'test-group',
       generationId: 0,
       memberId: 'm',
-      pendingTopicResets,
+      obligations,
     })
 
     await offsetManager.resolveOffsets()
@@ -545,10 +592,10 @@ describe('Consumer > topic recreation', () => {
     })
 
     test('after N crash-restarts the emitter still has exactly one cluster.topic_recreated listener, and a TOPIC_RECREATED after a restart still performs the one-shot reset', async () => {
-      // onCrash calls disconnect() unconditionally, which removes the listener, then restarts
-      // through start() alone - reaching neither run() nor connect(). Without the ensure call at
-      // the top of start(), the listener the first crash removed never comes back and every
-      // post-crash lifetime runs with the reset inert.
+      // onCrash runs the disconnect cleanup unconditionally, which removes the listener, then
+      // restarts through start() alone - reaching neither run() nor connect(). Without the ensure
+      // call at the top of start(), the listener the first crash removed never comes back and
+      // every post-crash lifetime runs with the reset inert.
       const cluster = createCluster({ topicIds: { [TOPIC]: ID_B } })
       let starts = 0
       jest.spyOn(Runner.prototype, 'start').mockImplementation(async function () {
@@ -569,9 +616,120 @@ describe('Consumer > topic recreation', () => {
 
       cluster.emitRecreated({ topic: TOPIC, previousTopicId: ID_A, topicId: ID_B })
       expect(invalidateTopic).toHaveBeenCalledWith(TOPIC)
-      expect(Runner.prototype.start.mock.instances.at(-1).consumerGroup.pendingTopicResets).toEqual(
-        new Map([[TOPIC, ID_B]])
-      )
+      expect(
+        Runner.prototype.start.mock.instances.at(-1).consumerGroup.obligations.current(TOPIC)
+      ).toEqual(ID_B)
+    })
+
+    describe('a reset the topic still owes when the consumer crashes', () => {
+      const crashError = () =>
+        Object.assign(new Error('ListOffsets unavailable'), { retriable: true, retryTime: 1 })
+
+      /** A started consumer whose recreated topic owes a reset that a failed ListOffsets left unpaid. */
+      const crashWithOwedReset = async (retry) => {
+        const start = jest.spyOn(Runner.prototype, 'start').mockResolvedValue()
+        jest.spyOn(Runner.prototype, 'stop').mockResolvedValue()
+        const cluster = createCluster({ topicIds: { [TOPIC]: ID_B } })
+        const consumer = build(cluster, { retry: { retries: 0, initialRetryTime: 1, ...retry } })
+        await consumer.subscribe({ topic: TOPIC, fromBeginning: true })
+        await consumer.run({ eachMessage: async () => {}, autoCommit: false })
+
+        const runner = start.mock.instances[0]
+        const { obligations, operations } = runner.consumerGroup
+        const resolving = createScheduledOffsetManager({
+          obligations,
+          operations,
+          topicId: ID_B,
+          committed: '99',
+          listOffset: '0',
+        })
+        cluster.emitRecreated({ topic: TOPIC, previousTopicId: ID_A, topicId: ID_B })
+        resolving.schedule.once({ api: 'ListOffsets' }, crashError())
+        await expect(resolving.manager.resolveOffsets()).rejects.toThrow('ListOffsets unavailable')
+        expect(obligations.isOwed(TOPIC, 0)).toBe(true)
+
+        return { cluster, consumer, start, runner, obligations, operations }
+      }
+
+      test('the restarted consumer still owes it and resumes from the reset position, not the stale committed offset', async () => {
+        const { consumer, start, runner, obligations } = await crashWithOwedReset({
+          restartOnFailure: async () => true,
+        })
+
+        try {
+          await runner.onCrash(crashError())
+          await waitFor(() => start.mock.calls.length === 2, { delay: 5, maxWait: 2000 })
+
+          expect(start).toHaveBeenCalledTimes(2)
+          const restarted = start.mock.instances[1].consumerGroup
+          expect(restarted.obligations).toBe(obligations)
+          const after = createScheduledOffsetManager({
+            obligations: restarted.obligations,
+            operations: restarted.operations,
+            topicId: ID_B,
+            committed: '99',
+            listOffset: '0',
+          })
+          await after.manager.resolveOffsets()
+          expect(after.next()).toEqual('0')
+        } finally {
+          await consumer.disconnect()
+        }
+      })
+
+      test('an explicit disconnect() while restartOnFailure is deciding clears it, and no restart follows', async () => {
+        let ask
+        const asked = new Promise((resolve) => {
+          ask = resolve
+        })
+        let decide
+        const decision = new Promise((resolve) => {
+          decide = resolve
+        })
+        const { cluster, consumer, start, runner, obligations } = await crashWithOwedReset({
+          restartOnFailure: () => {
+            ask()
+            return decision
+          },
+        })
+        const crashes = []
+        consumer.on(consumer.events.CRASH, (event) => crashes.push(event.payload))
+
+        try {
+          const crashed = runner.onCrash(crashError())
+          await asked
+          expect(obligations.isOwed(TOPIC, 0)).toBe(true)
+          await consumer.disconnect()
+          decide(true)
+          await crashed
+
+          expect(crashes).toEqual([expect.objectContaining({ restart: false })])
+          expect(start).toHaveBeenCalledTimes(1)
+          expect(obligations.size()).toEqual(0)
+          expect(cluster.listenerCount()).toEqual(0)
+        } finally {
+          await consumer.disconnect()
+        }
+      })
+
+      test('a crash that is not restarted keeps the reset unlinked from the ledger, and a disconnect() then clears it', async () => {
+        const { consumer, runner, obligations, operations } = await crashWithOwedReset({
+          restartOnFailure: async () => false,
+        })
+
+        try {
+          await runner.onCrash(crashError())
+          const peer = operations.begin([{ topic: TOPIC, partition: 0 }], { mutation: true })
+          operations.apply(peer, TOPIC, 0)
+          operations.end(peer)
+          expect(obligations.isOwed(TOPIC, 0)).toBe(true)
+
+          await consumer.disconnect()
+          expect(obligations.size()).toEqual(0)
+        } finally {
+          await consumer.disconnect()
+        }
+      })
     })
   })
 
@@ -594,7 +752,7 @@ describe('Consumer > topic recreation', () => {
       cluster.emitRecreated({ topic: 'constructor', previousTopicId: ID_A, topicId: ID_B })
 
       const runner = start.mock.instances[0]
-      expect(runner.consumerGroup.pendingTopicResets.size).toEqual(0)
+      expect(runner.consumerGroup.obligations.size()).toEqual(0)
       expect(invalidateTopic).not.toHaveBeenCalled()
       // `constructor` is inherited on every plain object, so `toHaveProperty` would report a
       // false positive here - `Object.hasOwn` is what actually proves nothing was written.
@@ -627,7 +785,6 @@ describe('Consumer > topic recreation', () => {
         rackId: '',
         checkCrcs: true,
         metadataMaxAge: 300000,
-        pendingTopicResets: new Map(),
       })
       consumerGroup.offsetManager = new OffsetManager({
         cluster,
@@ -639,7 +796,6 @@ describe('Consumer > topic recreation', () => {
         groupId: 'test-group',
         generationId: 0,
         memberId: 'm',
-        pendingTopicResets: new Map(),
       })
 
       expect(() => consumerGroup.invalidateTopic('constructor')).not.toThrow()
@@ -677,17 +833,17 @@ describe('Consumer > topic recreation', () => {
         expect.stringContaining('Failed to handle topic recreation'),
         expect.objectContaining({ groupId: 'test-group' })
       )
-      // The refresh "completes": the listener is still armed and the map was still updated
+      // The refresh "completes": the listener is still armed and the reset was still recorded
       // before the throw, so the reset itself is not lost even though invalidateTopic failed.
       expect(cluster.listenerCount()).toEqual(1)
       const runner = start.mock.instances[0]
-      expect(runner.consumerGroup.pendingTopicResets).toEqual(new Map([[TOPIC, ID_B]]))
+      expect(runner.consumerGroup.obligations.current(TOPIC)).toEqual(ID_B)
     })
   })
 
   describe('seek precedence around a topic recreation', () => {
     /**
-     * A real ConsumerGroup + OffsetManager pair sharing one pendingTopicResets Map, so
+     * A real ConsumerGroup + OffsetManager pair sharing one ResetObligations table, so
      * consumerGroup.seek()/.invalidateTopic()/.seekOffsets() drive the actual precedence logic
      * under test rather than a re-implementation of it. The fake coordinator tracks the offset
      * it was last committed, exactly like a real broker: `offsetFetch` echoes back whatever
@@ -756,7 +912,8 @@ describe('Consumer > topic recreation', () => {
         groupId: 'test-group',
         generationId: 0,
         memberId: 'm',
-        pendingTopicResets: consumerGroup.pendingTopicResets,
+        operations: consumerGroup.operations,
+        obligations: consumerGroup.obligations,
       })
 
       return { consumerGroup, fetched, offsetCommit }
@@ -770,8 +927,8 @@ describe('Consumer > topic recreation', () => {
         consumerGroup.seek({ topic: TOPIC, partition: 0, offset: '500' })
         expect(consumerGroup.hasSeekOffset({ topic: TOPIC, partition: 0 })).toBe(true)
 
-        // The recreation: the Consumer listener stamps the map, then calls invalidateTopic().
-        consumerGroup.pendingTopicResets.set(TOPIC, ID_B)
+        // The recreation: the Consumer listener records the obligation, then calls invalidateTopic().
+        consumerGroup.obligations.owe(TOPIC, ID_B)
         consumerGroup.invalidateTopic(TOPIC)
         expect(consumerGroup.hasSeekOffset({ topic: TOPIC, partition: 0 })).toBe(false)
 
@@ -790,7 +947,7 @@ describe('Consumer > topic recreation', () => {
           coordinatorOffset: '99',
         })
 
-        consumerGroup.pendingTopicResets.set(TOPIC, ID_B)
+        consumerGroup.obligations.owe(TOPIC, ID_B)
         consumerGroup.invalidateTopic(TOPIC)
         consumerGroup.seek({ topic: TOPIC, partition: 0, offset: '500' })
 

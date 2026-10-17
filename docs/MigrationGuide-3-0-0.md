@@ -853,6 +853,7 @@ says so, `groupProtocol: 'consumer'`.
   number; the option is reserved so a later release can turn the prefetch on without a
   configuration change. A value of `2` or more is rejected at construction rather than clamped.
   See [Prefetching](Consuming.md#prefetching).
+- **A seek or commit made while the consumer is still resolving its initial offsets now wins.** It is no longer overwritten by the older answer. Nothing to change in code; the documented guarantees of `docs/Consuming.md` now hold. If you relied on the older answer overwriting your seek or commit, do the seek or commit again.
 
 ### Admin
 

@@ -1,4 +1,6 @@
 const OffsetManager = require('../index')
+const OffsetOperations = require('../offsetOperations')
+const ResetObligations = require('../resetObligations')
 const ConsumerGroup = require('../../consumerGroup')
 const createAdmin = require('../../../admin')
 const InstrumentationEventEmitter = require('../../../instrumentation/emitter')
@@ -300,19 +302,31 @@ describe('Admin > offset reads', () => {
 })
 
 /**
- * A pending-reset map that counts every write as a recreation of the topic, as the Consumer's
- * listener does when it records one.
+ * The resets a topic owes, under the names the cases below were written with. A write records a
+ * recreation of the topic as the Consumer's listener does: the reset becomes owed and the
+ * topic's cells in the offset ledger are fenced.
  */
-class RecreationSignalMap extends Map {
-  /** @param {Map<string, number>} recreations the shared per-topic recreation counts */
-  constructor(recreations) {
-    super()
-    this.recreations = recreations
+class PendingResets {
+  /**
+   * @param {ResetObligations} obligations
+   * @param {OffsetOperations} operations
+   */
+  constructor(obligations, operations) {
+    this.obligations = obligations
+    this.operations = operations
   }
 
   set(topic, topicId) {
-    this.recreations.set(topic, (this.recreations.get(topic) || 0) + 1)
-    return super.set(topic, topicId)
+    this.obligations.owe(topic, topicId)
+    this.operations.touchTopic(topic)
+  }
+
+  get(topic) {
+    return this.obligations.current(topic)
+  }
+
+  get size() {
+    return this.obligations.size()
   }
 }
 
@@ -372,8 +386,10 @@ describe('Consumer > OffsetManager > resolveOffsets across a topic recreation', 
   const build = (initialId, listOffset = '0', { autoCommit = false } = {}) => {
     const state = { id: initialId }
     const requests = []
-    const recreations = new Map()
-    const pending = new RecreationSignalMap(recreations)
+    const obligations = new ResetObligations()
+    const operations = new OffsetOperations()
+    obligations.attachTo(operations)
+    const pending = new PendingResets(obligations, operations)
     const committed = {}
     const cluster = {
       committedOffsets: () => committed,
@@ -416,8 +432,8 @@ describe('Consumer > OffsetManager > resolveOffsets across a topic recreation', 
       generationId: 1,
       memberId: 'member-a',
       membershipProtocol: 'consumer',
-      pendingTopicResets: pending,
-      topicRecreations: recreations,
+      operations,
+      obligations,
       logger: newLogger(),
     }
     const manager = new OffsetManager(options)
@@ -664,15 +680,15 @@ describe('Consumer > OffsetManager > resolveOffsets across a topic recreation', 
       await second
 
       const sent = requests.length
-      const seeked = new Set([OffsetManager.seekedPartitionKey(TOPIC, 0)])
-      const resolving = manager.resolveOffsets(seeked)
+      const resolving = manager.resolveOffsets()
       await flush()
       requests.slice(sent).forEach(({ answer }) => answer('500'))
       await resolving
 
       expect(committed[TOPIC]).toEqual({ 0: '500' })
       expect(manager.nextOffset(TOPIC, 0).toString()).toEqual('500')
-      expect(cluster.fetchTopicsOffset).toHaveBeenCalledTimes(1)
+      // Both resolvers asked, the second one's answer was dropped, and nothing asked again.
+      expect(cluster.fetchTopicsOffset).toHaveBeenCalledTimes(2)
       expect(pending.size).toBe(0)
     })
 

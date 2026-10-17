@@ -1,6 +1,7 @@
 const Long = require('../utils/long')
 const { initialRetryTime } = require('../retry/defaults')
 const ConsumerGroup = require('./consumerGroup')
+const ResetObligations = require('./offsetManager/resetObligations')
 const { createGroupDescriptions } = require('../admin/groupDescriptions')
 const resolveGroupTimeouts = require('./groupTimeouts')
 const { selectRebalanceProtocol } = require('./groupProtocol/interface')
@@ -281,22 +282,14 @@ module.exports = (params) => {
   }
 
   /**
-   * Topics deleted and recreated while this consumer was subscribed, each stamped with the new
-   * topic id. Owned here rather than on the ConsumerGroup or the OffsetManager because both of
-   * those are rebuilt - the group on every crash restart, the manager on every sync - and a
-   * rebalance is exactly what a recreation provokes.
-   * @type {Map<string, string>}
+   * The resets this consumer owes the topics deleted and recreated while it was subscribed. Owned
+   * here rather than on the ConsumerGroup or the OffsetManager because both of those are rebuilt -
+   * the group on every crash restart, the manager on every sync - and a rebalance is exactly what
+   * a recreation provokes. A crash restart unlinks them from the group's ledger and keeps them; a
+   * user disconnect empties them.
+   * @type {ResetObligations}
    */
-  const pendingTopicResets = new Map()
-
-  /**
-   * How many recreations of each subscribed topic this consumer has recorded. Owned here for the
-   * same reason as `pendingTopicResets`. It only grows and a reset never erases it, so an
-   * `OffsetManager` that snapshots it before an await can tell, after the await, that a topic
-   * was recreated in between even when the token is back to what it was.
-   * @type {Map<string, number>}
-   */
-  const topicRecreations = new Map()
+  const obligations = new ResetObligations()
   let removeTopicRecreatedListener = null
 
   /**
@@ -324,8 +317,8 @@ module.exports = (params) => {
           return
         }
 
-        pendingTopicResets.set(topic, topicId)
-        topicRecreations.set(topic, (topicRecreations.get(topic) || 0) + 1)
+        obligations.owe(topic, topicId)
+        cluster.offsetOperations({ groupId }).touchTopic(topic)
         consumerGroup && consumerGroup.invalidateTopic(topic)
       } catch (e) {
         logger.error(`Failed to handle topic recreation: ${e.message}`, {
@@ -347,20 +340,14 @@ module.exports = (params) => {
   }
 
   /**
-   * Stops the consumer and disconnects the cluster. `leaveGroup` (KIP-1092) overrides whether the
-   * member leaves its group: `true` removes it at once, whatever its kind, `false` keeps it in the
-   * group until its session expires, and `undefined` is the default (a dynamic member leaves, a
-   * static one stays). A call that joins a stop already in flight keeps the first caller's choice.
-   * Crashes and restarts always use the default, and so does a call whose argument is not an
-   * options object.
-   *
-   * @type {import("../../types").Consumer["disconnect"]}
-   * @param {{ leaveGroup?: boolean }} [options]
-   * @throws {KafkaJSNonRetriableError} before anything is stopped, when `options` is an object
-   *   whose `leaveGroup` is neither `undefined` nor a boolean
+   * Stops the runner and disconnects the cluster, for `disconnect()` and for the crash handler.
+   * A user disconnect ends the consumer, so its reset obligations are emptied. A crash restart
+   * unlinks them and keeps them: the topics still owe those resets to the group it builds next.
+   * @param {{ leaveGroup?: boolean }} [stopOptions]
+   * @param {{ keepResets?: boolean }} [shutDownOptions] `true` for the crash handler
+   * @returns {Promise<void>}
    */
-  const disconnect = async (options) => {
-    const stopOptions = parseDisconnectOptions(options)
+  const shutDown = async (stopOptions, { keepResets = false } = {}) => {
     stopGeneration++
 
     try {
@@ -377,8 +364,28 @@ module.exports = (params) => {
     } finally {
       removeTopicRecreatedListener && removeTopicRecreatedListener()
       removeTopicRecreatedListener = null
+      if (keepResets) {
+        obligations.unlink()
+      } else {
+        obligations.clear()
+      }
     }
   }
+
+  /**
+   * Stops the consumer and disconnects the cluster. `leaveGroup` (KIP-1092) overrides whether the
+   * member leaves its group: `true` removes it at once, whatever its kind, `false` keeps it in the
+   * group until its session expires, and `undefined` is the default (a dynamic member leaves, a
+   * static one stays). A call that joins a stop already in flight keeps the first caller's choice.
+   * Crashes and restarts always use the default, and so does a call whose argument is not an
+   * options object.
+   *
+   * @type {import("../../types").Consumer["disconnect"]}
+   * @param {{ leaveGroup?: boolean }} [options]
+   * @throws {KafkaJSNonRetriableError} before anything is stopped, when `options` is an object
+   *   whose `leaveGroup` is neither `undefined` nor a boolean
+   */
+  const disconnect = async (options) => shutDown(parseDisconnectOptions(options))
 
   const stopShared = sharedPromiseTo(async (options) => {
     try {
@@ -555,8 +562,8 @@ module.exports = (params) => {
         autoCommit,
         autoCommitInterval,
         autoCommitThreshold,
-        pendingTopicResets,
-        topicRecreations,
+        operations: cluster.offsetOperations({ groupId }),
+        obligations,
       })
 
       runner = new Runner({
@@ -592,10 +599,10 @@ module.exports = (params) => {
 
       // Cleaning up must never suppress the CRASH event: it is the only supervision signal a
       // user gets, because consumer.run() has already resolved by the time the runner dies.
-      // disconnect() already logs this failure itself (and rethrows), so there is nothing
+      // shutDown() already logs this failure itself (and rethrows), so there is nothing
       // further to log here; just make sure it cannot stop the CRASH event from firing.
       try {
-        await disconnect()
+        await shutDown(undefined, { keepResets: true })
       } catch {}
 
       // A separate stop() in between (a user disconnect()) means the consumer is no longer

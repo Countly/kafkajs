@@ -242,6 +242,8 @@ If a subscribed topic is deleted and recreated, the new topic is a different ent
 
 When the consumer notices a subscribed topic has come back under a new id, it resets that topic's offsets once: it ignores the coordinator's committed offset for it and resolves the next offset from the configured boundary instead, per that subscription's [`fromBeginning`](#from-beginning) setting. This happens automatically and needs no configuration. Paused partitions stay paused across a recreation, since pausing is your intent, not offset state, and offsets committed against the *new* topic afterwards are never touched by *that consumer's* reset — each member of a group resets once, independently, the first time it notices the recreation.
 
+A reset still owed survives the consumer's automatic restart after a crash; `consumer.disconnect()` drops it.
+
 If you call [`seek`](#seek) around the time of a recreation, the newer intent wins: a seek issued *after* the consumer has noticed the recreation targets the current topic and is honored instead of the reset for that partition, while a seek issued *before* it is dropped, since its target offset belonged to the topic's previous incarnation.
 
 ## <a name="topic-metadata"></a> Topic metadata

@@ -92,7 +92,6 @@ describe('Consumer > Runner', () => {
       leaveForPollExpiry: jest.fn(async () => {}),
       needsReconciliation: jest.fn(() => false),
       resolvedOffsetAt: jest.fn(() => undefined),
-      pendingTopicResets: new Map(),
     }
     instrumentationEmitter = new InstrumentationEventEmitter()
 

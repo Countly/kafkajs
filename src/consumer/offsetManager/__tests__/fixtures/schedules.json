@@ -1,0 +1,26 @@
+[
+  {
+    "name": "commit and commit, the newer answered first",
+    "shape": [
+      "commit",
+      "commit"
+    ],
+    "partitions": 1,
+    "order": [
+      1,
+      0
+    ]
+  },
+  {
+    "name": "seek and seek, the newer answered first",
+    "shape": [
+      "seekUp",
+      "seekUp"
+    ],
+    "partitions": 1,
+    "order": [
+      1,
+      0
+    ]
+  }
+]

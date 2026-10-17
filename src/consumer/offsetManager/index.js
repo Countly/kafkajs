@@ -2,6 +2,8 @@ const Long = require('../../utils/long')
 const sleep = require('../../utils/sleep')
 const isInvalidOffset = require('./isInvalidOffset')
 const initializeConsumerOffsets = require('./initializeConsumerOffsets')
+const OffsetOperations = require('./offsetOperations')
+const ResetObligations = require('./resetObligations')
 const { KafkaJSError, isStaleCoordinator } = require('../../errors')
 const { stampGeneration, stampOffsetCommit } = require('../rebalanceErrorContract')
 const {
@@ -32,22 +34,7 @@ const PRIVATE = {
   COMMITTED_OFFSETS: Symbol('private:OffsetManager:committedOffsets'),
 }
 
-// Shared, never mutated: the default for resolveOffsets()'s seekedPartitions parameter, so the
-// overwhelmingly common no-seek call allocates nothing.
-const EMPTY_SEEKED_PARTITIONS = new Set()
 module.exports = class OffsetManager {
-  /**
-   * Key format `resolveOffsets()`'s `seekedPartitions` set uses to identify a topic/partition,
-   * shared with `ConsumerGroup#seekOffsets()` so both sides agree on it without either owning
-   * the other's internals.
-   * @param {string} topic
-   * @param {number} partition
-   * @returns {string}
-   */
-  static seekedPartitionKey(topic, partition) {
-    return `${topic}\u0000${partition}`
-  }
-
   /**
    * @private
    * @param {import("../../../types").IMemberAssignment} memberAssignment
@@ -73,14 +60,13 @@ module.exports = class OffsetManager {
    * @param {string} [options.groupInstanceId=null] Static membership id (KIP-345); carried on
    *                                every offset commit so the coordinator can identify this
    *                                member across restarts.
-   * @param {Map<string, string>} [options.pendingTopicResets] Topics deleted and recreated while
-   *                                subscribed, each keyed by topic and stamped with its new topic
-   *                                id (owned by the long-lived `Consumer`; shared by reference
-   *                                across every `OffsetManager` a session builds).
-   * @param {Map<string, number>} [options.topicRecreations] How many times each topic was
-   *                                recreated, from the same owner and shared the same way. It only
-   *                                grows and `drainPendingTopicResets` never touches it, so it
-   *                                outlives every manager (see `resetMarks`).
+   * @param {OffsetOperations} [options.operations] The ledger that orders this group's writes to
+   *                                the committed-offset cache (owned by the `Kafka` instance and
+   *                                shared by every participant in the group; a private one by
+   *                                default).
+   * @param {ResetObligations} [options.obligations] The resets this consumer owes recreated topics
+   *                                (owned by the long-lived `Consumer`; shared by reference across
+   *                                every `OffsetManager` a session builds).
    * @param {'classic'|'consumer'} [options.membershipProtocol='classic'] which group protocol this
    *                                member runs. Under `'consumer'` the offset fetch carries the
    *                                member id and epoch, which is how the coordinator validates a
@@ -128,8 +114,8 @@ module.exports = class OffsetManager {
     generationId,
     memberId,
     groupInstanceId = null,
-    pendingTopicResets = new Map(),
-    topicRecreations = new Map(),
+    operations = new OffsetOperations(),
+    obligations = new ResetObligations(),
     membershipProtocol = 'classic',
     staleEpochTimeout = 300000,
     membership = null,
@@ -161,8 +147,8 @@ module.exports = class OffsetManager {
     this.generationId = generationId
     this.memberId = memberId
     this.groupInstanceId = groupInstanceId
-    this.pendingTopicResets = pendingTopicResets
-    this.topicRecreations = topicRecreations
+    this.operations = operations
+    this.obligations = obligations
     this.membershipProtocol = membershipProtocol
     this.staleEpochTimeout = staleEpochTimeout
     this.membership =
@@ -327,6 +313,7 @@ module.exports = class OffsetManager {
    * @returns {void}
    */
   resetOffsetsForTopic(topic) {
+    this.operations.touchTopic(topic)
     this.committedOffsets()[topic] = {}
     this.resolvedOffsets[topic] = {}
     this.resolvedEpochs[topic] = {}
@@ -399,6 +386,7 @@ module.exports = class OffsetManager {
     for (const { topic, partitions } of revoked) {
       for (const partition of partitions) {
         this.clearOffsets({ topic, partition })
+        this.operations.touch(topic, partition)
       }
     }
   }
@@ -507,37 +495,31 @@ module.exports = class OffsetManager {
   }
 
   /**
+   * Commits the topic's default offset for one partition, then forgets what this member holds for
+   * it, so the next resolution reads the committed offset back. The forgetting is skipped when a
+   * newer operation or a barrier (a revoke, a recreation) reached the partition while the commit
+   * was in flight.
    * @param {import("../../../types").TopicPartition} topicPartition
+   * @returns {Promise<void>}
    */
   async setDefaultOffset({ topic, partition }) {
-    const { groupId, generationId, memberId, groupInstanceId } = this
     const defaultOffset = this.cluster.defaultOffset(this.topicConfigurations[topic])
-    await this.sendOffsetCommit({
-      groupId,
-      memberId,
-      groupGenerationId: generationId,
-      groupInstanceId,
-      topics: [
-        {
-          topic,
-          partitions: [{ partition, offset: defaultOffset }],
-        },
-      ],
-    })
-
-    this.clearOffsets({ topic, partition })
+    await this.commitAndClear({ topic, partition, offset: defaultOffset })
   }
 
   /**
    * Commit the given offset to the topic/partition. If the consumer isn't assigned to the given
    * topic/partition this method will be a NO-OP.
    *
+   * A seek is a mutation of the offset ledger: it is applied unless a seek or commit that began
+   * after it was applied first, or a barrier reached the partition while its commit was in
+   * flight. An applied seek settles the topic's reset obligation for the partition.
+   *
    * @param {import("../../../types").TopicPartitionOffset} topicPartitionOffset
-   * @returns {Promise<boolean>} whether the seek was applied (`false` only when the partition is
-   *                              not currently assigned to this member). The caller uses this to
-   *                              tell `resolveOffsets()` which partitions were just seeked, so a
-   *                              seek applied after a topic recreation can win over that
-   *                              recreation's one-shot reset for the same partition.
+   * @returns {Promise<boolean>} whether the seek was applied: `false` when the partition is not
+   *                              currently assigned to this member, or when a newer operation or
+   *                              barrier superseded it while its commit was in flight
+   * @throws {Error} whatever the offset conversion or the commit raised; the ticket ends either way
    */
   async seek({ topic, partition, offset }) {
     if (!this.memberAssignment[topic] || !this.memberAssignment[topic].includes(partition)) {
@@ -545,33 +527,59 @@ module.exports = class OffsetManager {
     }
 
     if (!this.autoCommit) {
-      this.resolveOffset({
-        topic,
-        partition,
-        offset: Long.fromValue(offset).subtract(1).toString(),
-        // A seek names a position, not a record: nothing has been consumed at it yet.
-        leaderEpoch: -1,
-      })
+      const ticket = this.operations.begin([{ topic, partition }], { mutation: true })
+
+      try {
+        this.resolveOffset({
+          topic,
+          partition,
+          offset: Long.fromValue(offset).subtract(1).toString(),
+          // A seek names a position, not a record: nothing has been consumed at it yet.
+          leaderEpoch: -1,
+        })
+        this.operations.apply(ticket, topic, partition)
+      } finally {
+        this.operations.end(ticket)
+      }
+
       return true
     }
 
+    return this.commitAndClear({ topic, partition, offset })
+  }
+
+  /**
+   * One OffsetCommit for a single partition followed by the clear of its cached offset, position
+   * and epoch, under a mutation ticket: the clear is a post-await write, so it is applied only
+   * while the ticket is still current. A failed commit applies nothing and supersedes nothing.
+   * @private
+   * @param {import("../../../types").TopicPartitionOffset} topicPartitionOffset
+   * @returns {Promise<boolean>} whether the clear was applied
+   * @throws {Error} whatever the commit raised
+   */
+  async commitAndClear({ topic, partition, offset }) {
     const { groupId, generationId, memberId, groupInstanceId } = this
+    const ticket = this.operations.begin([{ topic, partition }], { mutation: true })
 
-    await this.sendOffsetCommit({
-      groupId,
-      memberId,
-      groupGenerationId: generationId,
-      groupInstanceId,
-      topics: [
-        {
-          topic,
-          partitions: [{ partition, offset }],
-        },
-      ],
-    })
+    try {
+      await this.sendOffsetCommit({
+        groupId,
+        memberId,
+        groupGenerationId: generationId,
+        groupInstanceId,
+        topics: [{ topic, partitions: [{ partition, offset }] }],
+      })
 
-    this.clearOffsets({ topic, partition })
-    return true
+      if (this.operations.isSuperseded(ticket, topic, partition)) {
+        return false
+      }
+
+      this.clearOffsets({ topic, partition })
+      this.operations.apply(ticket, topic, partition)
+      return true
+    } finally {
+      this.operations.end(ticket)
+    }
   }
 
   async commitOffsetsIfNecessary() {
@@ -686,23 +694,7 @@ module.exports = class OffsetManager {
     }
 
     try {
-      await this.sendOffsetCommit(payload)
-      this.instrumentationEmitter.emit(COMMIT_OFFSETS, payload)
-
-      // Update local reference of committed offsets
-      topics.forEach(({ topic, partitions }) => {
-        const updatedOffsets = partitions.reduce(
-          (obj, { partition, offset }) => assign(obj, { [partition]: offset }),
-          {}
-        )
-
-        this[PRIVATE.COMMITTED_OFFSETS][topic] = assign(
-          {},
-          this.committedOffsets()[topic],
-          updatedOffsets
-        )
-      })
-
+      await this.sendAndRecordCommit(payload, topics)
       this.lastCommit = Date.now()
     } catch (e) {
       // The coordinator has changed due to a restart or broker reassignment; refresh the
@@ -759,39 +751,94 @@ module.exports = class OffsetManager {
   }
 
   /**
+   * Sends one OffsetCommit and records what the coordinator accepted in the committed cache, cell
+   * by cell, under a mutation ticket. A cell that a newer commit or seek, or a barrier, reached
+   * while the request was in flight keeps its newer value, whichever answer arrived first. The
+   * cache write never moves a resolved position. Emits `COMMIT_OFFSETS` once the request succeeds.
+   * @private
+   * @param {object} payload the `Broker#offsetCommit` payload
+   * @param {{topic: string, partitions: {partition: number|string, offset: string}[]}[]} topics
+   * @returns {Promise<void>}
+   * @throws {Error} whatever the commit raised; nothing is recorded then
+   */
+  async sendAndRecordCommit(payload, topics) {
+    const ticket = this.operations.begin(this.coveredCells(topics), { mutation: true })
+
+    try {
+      await this.sendOffsetCommit(payload)
+      this.instrumentationEmitter.emit(COMMIT_OFFSETS, payload)
+      this.recordCommitted(ticket, topics)
+    } finally {
+      this.operations.end(ticket)
+    }
+  }
+
+  /**
+   * Writes the accepted offsets of a commit into the committed cache and applies the ticket to
+   * each written cell, which settles the cell's reset obligation for every consumer of the group.
+   * @private
+   * @param {object} ticket
+   * @param {{topic: string, partitions: {partition: number|string, offset: string}[]}[]} topics
+   * @returns {void}
+   */
+  recordCommitted(ticket, topics) {
+    const committedOffsets = this.committedOffsets()
+
+    for (const { topic, partitions } of topics) {
+      const accepted = {}
+      const written = []
+
+      for (const { partition, offset } of partitions) {
+        if (!this.operations.isSuperseded(ticket, topic, partition)) {
+          accepted[partition] = offset
+          written.push(partition)
+        }
+      }
+
+      if (written.length > 0) {
+        committedOffsets[topic] = assign({}, committedOffsets[topic], accepted)
+        written.forEach((partition) => this.operations.apply(ticket, topic, partition))
+      }
+    }
+  }
+
+  /**
+   * @private
+   * @param {{topic: string, partitions: {partition: number|string}[]}[]} topics
+   * @returns {{topic: string, partition: number|string}[]} the ledger cells these entries cover
+   */
+  coveredCells(topics) {
+    return topics.flatMap(({ topic, partitions }) =>
+      partitions.map(({ partition }) => ({ topic, partition }))
+    )
+  }
+
+  /**
    * Resolves the partitions of the assignment that hold no valid offset: the group's committed
    * offset, else the topic's own `fromBeginning` choice through ListOffsets.
    *
-   * A reply that outlives a topic recreation is not applied. Two snapshots fence each await (see
-   * `dropRecreatedTopics`): the topic's cached id, and its reset mark (pending token and recreation
-   * generation). The recreation event sets the token, so a token that is no longer the one
-   * snapshotted means a sibling consumed it or a recreation replaced it, even when the id was
-   * unknown at the start and proves nothing. The generation covers the one case the token cannot:
-   * a recreation set and a sibling's drain consumed within the await leaves the token absent, as
-   * it was.
-   * - Before the OffsetFetch: fences the OffsetFetch answer.
-   * - After `drainPendingTopicResets`: fences the ListOffsets answer. The drain's own deletions
-   *   are taken in, so only a change made during the await drops it.
+   * A resolution is a read of the offset ledger: it takes a ticket over the cells it resolves and
+   * fills them in one synchronous final step after both awaits. It never supersedes anything. An
+   * answer is written only for a cell that no seek, commit or barrier (a revoke, a reset, a
+   * recreation) reached since the ticket began and that is still unresolved, so a newer
+   * operation's value is never overwritten and a resolver never replaces a sibling's. The leader
+   * epochs the coordinator committed are seeded in the same step, under the same check.
    *
-   * A dropped topic keeps its invalid offsets and is resolved again by the next resolution, which
-   * every fetch round runs. A recreation that dropped it left its newer token for that pass,
-   * unless a concurrent resolution has consumed the token and applies the reset itself. The drain
-   * is the only place a token is consumed, so a ListOffsets that throws after it loses that reset,
-   * and only the first of two overlapping resolutions of one incarnation applies it.
+   * A topic recreated while this member is subscribed owes a reset on every partition (see
+   * `ResetObligations`). The reset is applied here, after the OffsetFetch answer, to the owed
+   * partitions: their offset becomes the invalid sentinel, so they resolve through ListOffsets per
+   * the topic's `fromBeginning`. Reading an obligation does not consume it: a partition settles
+   * only when an offset is written for it or a seek or commit is applied, so a ListOffsets that
+   * throws leaves the reset owed.
    *
-   * @param {Set<string>} [seekedPartitions] Keys (`OffsetManager.seekedPartitionKey(topic,
-   *                                partition)`) of partitions a `seek()` was just applied to,
-   *                                in this same `ConsumerGroup#seekOffsets()` call. A seeked
-   *                                partition wins over a pending topic-recreation reset for that
-   *                                partition only - it is newer, explicit user intent, and its
-   *                                offset targets the current topic incarnation. A seek issued
-   *                                *before* the recreation never reaches here: the recreation's
-   *                                `ConsumerGroup#invalidateTopic` already dropped it from the
-   *                                pending-seek queue, since its target belonged to the old
-   *                                incarnation.
-   * @returns {Promise<void>}
+   * A cell whose answer was dropped keeps its invalid offset and is resolved again, at once by the
+   * caller (`ConsumerGroup#seekOffsets`) and at the latest by the next fetch round.
+   *
+   * @returns {Promise<boolean>} `false` when an answer was dropped because the cell was superseded
+   *                              or the topic was recreated while a request was in flight, `true`
+   *                              otherwise (a cell a sibling had already resolved is not a drop)
    */
-  async resolveOffsets(seekedPartitions = EMPTY_SEEKED_PARTITIONS) {
+  async resolveOffsets() {
     const invalidOffset = (topic) => (partition) => {
       return isInvalidOffset(this.committedOffsets()[topic][partition])
     }
@@ -806,88 +853,223 @@ module.exports = class OffsetManager {
       .filter((t) => t.partitions.length > 0)
 
     if (pendingPartitions.length === 0) {
-      return
+      this.settleObligations()
+      return true
     }
 
-    const requestedIds = new Map(
-      pendingPartitions.map(({ topic }) => [topic, this.cluster.topicId(topic)])
-    )
-    const requestedMarks = this.resetMarks(pendingPartitions)
-    const { responses } = await this.fetchCommittedOffsets(pendingPartitions)
+    const ticket = this.operations.begin(this.coveredCells(pendingPartitions))
 
-    // Before the drain: a stale reply must not take the reset the new incarnation is owed.
-    const consumerOffsets = this.dropRecreatedTopics(responses, requestedIds, requestedMarks)
+    try {
+      const requestedIds = new Map(
+        pendingPartitions.map(({ topic }) => [topic, this.cluster.topicId(topic)])
+      )
+      const { responses } = await this.fetchCommittedOffsets(pendingPartitions)
 
-    this.drainPendingTopicResets(consumerOffsets, seekedPartitions)
-    const drainedMarks = this.resetMarks(consumerOffsets)
+      let complete = true
+      const consumerOffsets = []
+      for (const { topic, partitions } of responses) {
+        const current = partitions.filter(
+          ({ partition }) => !this.isStale(ticket, topic, partition, requestedIds)
+        )
+        complete = complete && current.length === partitions.length
+        if (current.length > 0) {
+          consumerOffsets.push({ topic, partitions: current })
+        }
+      }
 
-    // Seed the tracked epoch from what the coordinator has committed, before
-    // initializeConsumerOffsets rebuilds these entries as { partition, offset } and drops every
-    // other field - for every partition, not only the ones it resolved. An invalid offset here is
-    // the "this partition is being reset" signal drainPendingTopicResets just wrote, so its stale
-    // epoch is deliberately not seeded. Nor is a position that has moved off the committed offset
-    // since this request was sent: one fetcher per broker runs this over the whole assignment, so
-    // a reply can land after a record was consumed or a seek applied, and that position owns its
-    // epoch. An unknown committed epoch (-1, a commit that carried no epoch) never replaces a
-    // known one, even at the committed offset.
-    for (const { topic, partitions } of consumerOffsets) {
-      const epochs = this.resolvedEpochs[topic]
-      if (!epochs) {
+      this.markOwedResets(consumerOffsets)
+      const epochSeeds = this.collectEpochSeeds(consumerOffsets)
+
+      const unresolvedPartitions = consumerOffsets.map(({ topic, partitions }) =>
+        assign(
+          {
+            topic,
+            partitions: partitions
+              .filter(({ offset }) => isInvalidOffset(offset))
+              .map(({ partition }) => assign({ partition })),
+          },
+          this.topicConfigurations[topic]
+        )
+      )
+
+      let offsets = consumerOffsets
+      if (unresolvedPartitions.some((t) => t.partitions.length > 0)) {
+        const topicOffsets = await this.cluster.fetchTopicsOffset(unresolvedPartitions)
+        offsets = initializeConsumerOffsets(consumerOffsets, topicOffsets)
+      }
+
+      return this.applyResolution(ticket, offsets, epochSeeds, requestedIds) && complete
+    } finally {
+      this.operations.end(ticket)
+    }
+  }
+
+  /**
+   * Whether an answer for a cell no longer describes it: the topic was recreated (its id was known
+   * when the request went out and is known now, and the two differ, or a barrier reached the
+   * cell) or a newer operation was applied since the ticket began. An id that was merely learned
+   * or lost (a cleared cache) is not a recreation.
+   * @private
+   * @param {object} ticket the resolution's read ticket
+   * @param {string} topic
+   * @param {number} partition
+   * @param {Map<string, string|undefined>} requestedIds each requested topic's cached id when the
+   *   request went out
+   * @returns {boolean}
+   */
+  isStale(ticket, topic, partition, requestedIds) {
+    const requestedId = requestedIds.get(topic)
+    const currentId = this.cluster.topicId(topic)
+    const recreated =
+      requestedId !== undefined && currentId !== undefined && requestedId !== currentId
+
+    return recreated || this.operations.isSuperseded(ticket, topic, partition)
+  }
+
+  /**
+   * Turns every owed partition of the answered topics into "no committed offset", so it falls
+   * through to ListOffsets. Runs after the OffsetFetch answer, so a reset a sibling settled while
+   * the request was in flight is respected. A reset that the cached topic id contradicts is
+   * disposed of and never applied (`ResetObligations#current`).
+   * @private
+   * @param {{topic: string, partitions: {partition: number, offset: string}[]}[]} entries mutated
+   *   in place: an owed partition's offset becomes `'-1'`
+   * @returns {void}
+   */
+  markOwedResets(entries) {
+    for (const { topic, partitions } of entries) {
+      if (this.obligations.current(topic, this.cluster.topicId(topic)) === undefined) {
         continue
       }
 
-      const positions = this.resolvedOffsets[topic]
       for (const entry of partitions) {
-        if (isInvalidOffset(entry.offset) || typeof entry.committedLeaderEpoch !== 'number') {
-          continue
+        if (this.obligations.isOwed(topic, entry.partition)) {
+          entry.offset = '-1'
         }
+      }
+    }
+  }
 
-        const position = positions && positions[entry.partition]
-        if (position != null && position !== entry.offset) {
-          continue
+  /**
+   * The leader epochs the coordinator committed with the valid offsets an answer carries. An
+   * offset marked for reset is invalid here, so its stale epoch is deliberately not collected.
+   * @private
+   * @param {{topic: string, partitions: {partition: number, offset: string,
+   *   committedLeaderEpoch?: number}[]}[]} entries
+   * @returns {{topic: string, partition: number, offset: string, epoch: number}[]}
+   */
+  collectEpochSeeds(entries) {
+    const seeds = []
+
+    for (const { topic, partitions } of entries) {
+      for (const { partition, offset, committedLeaderEpoch } of partitions) {
+        if (!isInvalidOffset(offset) && typeof committedLeaderEpoch === 'number') {
+          seeds.push({ topic, partition, offset, epoch: committedLeaderEpoch })
         }
-
-        if (entry.committedLeaderEpoch < 0 && epochs[entry.partition] >= 0) {
-          continue
-        }
-
-        epochs[entry.partition] = entry.committedLeaderEpoch
       }
     }
 
-    const unresolvedPartitions = consumerOffsets.map(({ topic, partitions }) =>
-      assign(
-        {
-          topic,
-          partitions: partitions
-            .filter(({ offset }) => isInvalidOffset(offset))
-            .map(({ partition }) => assign({ partition })),
-        },
-        this.topicConfigurations[topic]
-      )
-    )
+    return seeds
+  }
 
-    const indexPartitions = (obj, { partition, offset }) => {
-      return assign(obj, { [partition]: offset })
+  /**
+   * The resolution's single final step, synchronous after both awaits: writes each answered cell
+   * that is still current and unresolved, discharges the reset it settles, deletes the obligations
+   * every assigned partition has discharged, and seeds the consumed leader epochs.
+   * @private
+   * @param {object} ticket the resolution's read ticket
+   * @param {{topic: string, partitions: {partition: number, offset: string}[]}[]} offsets
+   * @param {{topic: string, partition: number, offset: string, epoch: number}[]} epochSeeds
+   * @param {Map<string, string|undefined>} requestedIds
+   * @returns {boolean} `false` when a cell was dropped as stale
+   */
+  applyResolution(ticket, offsets, epochSeeds, requestedIds) {
+    const committedOffsets = this.committedOffsets()
+    let complete = true
+
+    for (const { topic, partitions } of offsets) {
+      const resolved = {}
+      const written = []
+
+      for (const { partition, offset } of partitions) {
+        if (this.isStale(ticket, topic, partition, requestedIds)) {
+          complete = false
+        } else if (isInvalidOffset(committedOffsets[topic] && committedOffsets[topic][partition])) {
+          resolved[partition] = offset
+          written.push(partition)
+        }
+      }
+
+      committedOffsets[topic] = assign({}, committedOffsets[topic], resolved)
+
+      for (const partition of written) {
+        this.obligations.discharge(topic, partition, this.cluster.topicId(topic))
+      }
+
+      const assigned = this.assignedPartitions.get(topic)
+      if (assigned) {
+        this.obligations.settle(topic, assigned)
+      }
     }
 
-    const hasUnresolvedPartitions = () => unresolvedPartitions.some((t) => t.partitions.length > 0)
+    this.seedConsumedEpochs(ticket, epochSeeds, requestedIds)
+    return complete
+  }
 
-    let offsets = consumerOffsets
-    if (hasUnresolvedPartitions()) {
-      const topicOffsets = await this.cluster.fetchTopicsOffset(unresolvedPartitions)
-      offsets = this.dropRecreatedTopics(
-        initializeConsumerOffsets(consumerOffsets, topicOffsets),
-        requestedIds,
-        drainedMarks
-      )
+  /**
+   * Seeds the tracked epoch from what the coordinator committed, for every answered partition and
+   * not only the ones this resolution wrote, because `initializeConsumerOffsets` rebuilds the
+   * entries as `{ partition, offset }` and drops every other field. The epoch belongs to the
+   * offset it was committed with, so it is skipped for a cell that was superseded (the newer
+   * operation owns its epoch), for a position that has moved off that offset since the request
+   * was sent (one fetcher per broker runs this over the whole assignment, so a reply can land
+   * after a record was consumed), for an unset position when the cell holds another offset (a
+   * sibling's reset or a commit got there first), and when an unknown committed epoch (-1) would
+   * replace a known one.
+   * @private
+   * @param {object} ticket
+   * @param {{topic: string, partition: number, offset: string, epoch: number}[]} seeds
+   * @param {Map<string, string|undefined>} requestedIds
+   * @returns {void}
+   */
+  seedConsumedEpochs(ticket, seeds, requestedIds) {
+    const committedOffsets = this.committedOffsets()
+
+    for (const { topic, partition, offset, epoch } of seeds) {
+      const epochs = this.resolvedEpochs[topic]
+      if (!epochs || this.isStale(ticket, topic, partition, requestedIds)) {
+        continue
+      }
+
+      const position = this.resolvedOffsets[topic] && this.resolvedOffsets[topic][partition]
+      const held = committedOffsets[topic] && committedOffsets[topic][partition]
+      if (position != null ? position !== offset : held !== offset) {
+        continue
+      }
+
+      if (epoch < 0 && epochs[partition] >= 0) {
+        continue
+      }
+
+      epochs[partition] = epoch
+    }
+  }
+
+  /**
+   * Deletes the reset obligations that every partition this member holds has discharged, so a
+   * reset another consumer or a confirmed transaction settled leaves no entry behind. A no-op
+   * when nothing is owed, which is the steady state.
+   * @private
+   * @returns {void}
+   */
+  settleObligations() {
+    if (this.obligations.size() === 0) {
+      return
     }
 
-    offsets.forEach(({ topic, partitions }) => {
-      this.committedOffsets()[topic] = partitions.reduce(indexPartitions, {
-        ...this.committedOffsets()[topic],
-      })
-    })
+    for (const topic of this.topics) {
+      this.obligations.settle(topic, this.assignedPartitions.get(topic))
+    }
   }
 
   /**
@@ -987,125 +1169,6 @@ module.exports = class OffsetManager {
   }
 
   /**
-   * Each topic's reset mark as it is now: the snapshot `dropRecreatedTopics` compares against after
-   * an await. A mark holds two fences, and neither is enough alone:
-   * - `token`, the pending reset. A sibling resolution consuming it while this request is in
-   *   flight changes it, which catches an answer that landed after the reset was applied. It
-   *   cannot catch a recreation whose token a sibling consumed meanwhile: "absent, then set, then
-   *   consumed" is absent again, the same as before.
-   * - `generation`, the recreations recorded for the topic. It moves on every recreation, so it
-   *   catches exactly that case. It does not move when a sibling consumes a token, so it cannot
-   *   catch the first one.
-   *
-   * The generation lives with the consumer rather than the manager: a manager built after a
-   * rebalance shares it, so a recreation that a rebuilt manager's drain consumed is still seen
-   * here. It is monotonic and a drain never touches it, so it cannot return to a snapshotted value
-   * (no ABA).
-   *
-   * @private
-   * @param {{topic: string}[]} entries
-   * @returns {Map<string, {token: string|undefined, generation: number}>} topic to its mark
-   */
-  resetMarks(entries) {
-    return new Map(
-      entries.map(({ topic }) => [
-        topic,
-        {
-          token: this.pendingTopicResets.get(topic),
-          generation: this.topicRecreations.get(topic) || 0,
-        },
-      ])
-    )
-  }
-
-  /**
-   * Drops the entries of topics that were recreated while the request was in flight. An answer
-   * that outlived a delete and recreate describes the old topic: applying it would write the old
-   * offset over the new topic's position, or take a reset the new one is owed. A topic is dropped
-   * when any of these holds:
-   * - its id was known when the request went out and is known now, and the two differ. An id that
-   *   was merely learned (unknown before) or lost (unknown now, a cleared cache) is not a
-   *   recreation;
-   * - its pending token is not the one snapshotted: a sibling's drain consumed it, or a newer
-   *   recreation replaced it;
-   * - its recreation generation moved: a recreation happened during the await, whatever became of
-   *   its token (see `resetMarks`).
-   *
-   * @private
-   * @param {{topic: string}[]} entries
-   * @param {Map<string, string|undefined>} requestedIds each requested topic's cached id when the
-   *   request went out
-   * @param {Map<string, {token: string|undefined, generation: number}>} marks each topic's reset
-   *   mark (see `resetMarks`) when the await began
-   * @returns {{topic: string}[]} the entries still current, as a new array
-   */
-  dropRecreatedTopics(entries, requestedIds, marks) {
-    return entries.filter(({ topic }) => {
-      const requestedId = requestedIds.get(topic)
-      const currentId = this.cluster.topicId(topic)
-      const recreated =
-        requestedId !== undefined && currentId !== undefined && requestedId !== currentId
-      const { token, generation = 0 } = marks.get(topic) || {}
-
-      return (
-        !recreated &&
-        this.pendingTopicResets.get(topic) === token &&
-        (this.topicRecreations.get(topic) || 0) === generation
-      )
-    })
-  }
-
-  /**
-   * Applies any one-shot reset scheduled for the topics this response covers, by replacing their
-   * committed offsets with the invalid sentinel so every partition falls through to the normal
-   * "unresolved" path and is resolved per the topic's own `fromBeginning`.
-   *
-   * A pending entry is stamped with the topic id the recreation produced. It applies when the
-   * cluster's cached id is unknown (the cache was cleared, or the topic has not appeared in a
-   * metadata response yet) **or** equal to the stamp, and is removed without resetting only when
-   * a *known* cached id differs - treating unknown as "changed" would let a rebootstrap silently
-   * discard the reset, which is the stale-offset skip this mechanism exists to prevent.
-   *
-   * Every entry read here is removed, applied or not: this is the only place a token is consumed,
-   * so a reset happens at most once per recreation and no token is left to rewind a later commit.
-   *
-   * A partition in `seekedPartitions` is left untouched even when its topic is being reset: a
-   * `seek()` applied after the recreation targets the *current* incarnation and is newer, more
-   * specific user intent than the reset, so it wins for that partition while the rest of the
-   * topic still resets normally.
-   *
-   * @private
-   * @param {{topic: string, partitions: {partition: number, offset: string}[]}[]} consumerOffsets
-   *   mutated in place: a reset topic's partition offsets become the invalid sentinel
-   * @param {Set<string>} seekedPartitions `OffsetManager.seekedPartitionKey(topic, partition)`
-   *   entries to exempt from the reset
-   * @returns {void}
-   */
-  drainPendingTopicResets(consumerOffsets, seekedPartitions) {
-    for (const { topic, partitions } of consumerOffsets) {
-      if (!this.pendingTopicResets.has(topic)) {
-        continue
-      }
-
-      const stampedTopicId = this.pendingTopicResets.get(topic)
-      const currentTopicId = this.cluster.topicId(topic)
-      this.pendingTopicResets.delete(topic)
-
-      if (currentTopicId !== undefined && currentTopicId !== stampedTopicId) {
-        continue
-      }
-
-      for (const partition of partitions) {
-        if (seekedPartitions.has(OffsetManager.seekedPartitionKey(topic, partition.partition))) {
-          continue
-        }
-
-        partition.offset = '-1'
-      }
-    }
-  }
-
-  /**
    * @private
    * @param {import("../../../types").TopicPartition} topicPartition
    */
@@ -1139,11 +1202,14 @@ module.exports = class OffsetManager {
 
       if (!partitions) {
         committedOffsets[topic] = {}
-        continue
       }
 
       for (const partition of this.memberAssignment[topic]) {
-        delete partitions[partition]
+        if (partitions) {
+          delete partitions[partition]
+        }
+
+        this.operations.touch(topic, partition)
       }
     }
 

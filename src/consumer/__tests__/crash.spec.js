@@ -2,6 +2,7 @@ const createConsumer = require('../index')
 const Runner = require('../runner')
 const { newLogger, waitFor } = require('testHelpers')
 const InstrumentationEventEmitter = require('../../instrumentation/emitter')
+const OffsetOperations = require('../offsetManager/offsetOperations')
 const { KafkaJSNumberOfRetriesExceeded, KafkaJSNonRetriableError } = require('../../errors')
 
 const createFakeCluster = ({ connect = async () => {} } = {}) => ({
@@ -12,6 +13,7 @@ const createFakeCluster = ({ connect = async () => {} } = {}) => ({
   isConnected: () => true,
   addMultipleTargetTopics: jest.fn(async () => {}),
   onTopicRecreated: () => () => {},
+  offsetOperations: () => new OffsetOperations(),
   retry: {},
 })
 

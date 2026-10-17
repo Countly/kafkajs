@@ -134,7 +134,6 @@ const build = ({
     rackId: '',
     checkCrcs: true,
     metadataMaxAge: 300000,
-    pendingTopicResets: new Map(),
   })
 
   group.coordinator = coordinator

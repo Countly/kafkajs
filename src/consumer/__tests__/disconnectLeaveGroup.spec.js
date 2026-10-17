@@ -3,6 +3,7 @@ const Runner = require('../runner')
 const ConsumerGroup = require('../consumerGroup')
 const ClassicGroupProtocol = require('../groupProtocol/classic')
 const InstrumentationEventEmitter = require('../../instrumentation/emitter')
+const OffsetOperations = require('../offsetManager/offsetOperations')
 const leaveGroupV5 = require('../../protocol/requests/leaveGroup/v5/request')
 const apiKeys = require('../../protocol/requests/apiKeys')
 const { createGroupApiBroker } = require('../../broker/__tests__/fixtures/groupApiHarness')
@@ -91,6 +92,7 @@ const build = (protocol, groupInstanceId, { restartOnFailure } = {}) => {
     refreshMetadataIfNecessary: jest.fn(async () => {}),
     refreshMetadataForTopicIds: jest.fn(async () => {}),
     committedOffsets: () => ({}),
+    offsetOperations: () => new OffsetOperations(),
     topicName: (topicId) => (topicId === TOPIC_ID ? TOPIC : undefined),
     topicId: () => undefined,
     getNodeIds: () => [0],

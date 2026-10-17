@@ -230,7 +230,6 @@ const createRealGroup = ({ mode = COOPERATIVE, topics = ['test-topic'], partitio
     checkCrcs: true,
     rebalanceProtocol: mode,
     metadataMaxAge: 300000,
-    pendingTopicResets: new Map(),
   })
 
   return { group, cluster }
