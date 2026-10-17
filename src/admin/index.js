@@ -11,13 +11,13 @@ const {
   KafkaJSDeleteGroupsError,
   KafkaJSBrokerNotFound,
   KafkaJSDeleteTopicRecordsError,
-  KafkaJSAggregateError,
   isStaleCoordinator,
   COORDINATOR_LOAD_IN_PROGRESS_CODE,
 } = require('../errors')
 const { staleMetadata, staleLeaderEpoch, createErrorFromCode } = require('../protocol/error')
 const { GROUP_TYPES } = require('../protocol/groupTypes')
 const { createGroupDescriptions } = require('./groupDescriptions')
+const { AggregateOutcome, isPerItemFailure } = require('./aggregateOutcome')
 const { readTopicPages, toTopicsMetadata } = require('./describeTopicsByPartition')
 const CONFIG_RESOURCE_TYPES = require('../protocol/configResourceTypes')
 const ALTER_CONFIG_OP_TYPES = require('../protocol/alterConfigOpTypes')
@@ -167,22 +167,24 @@ const assertStringArray = (name, value) => {
 /**
  * The topics a call that changes topics must send again after the broker's quota refused them.
  * @see https://cwiki.apache.org/confluence/display/KAFKA/KIP-599%3A+Throttle+Create+Topic%2C+Create+Partition+and+Delete+Topic+Operations
- * @param {Error} error what `Broker#createTopics`, `#deleteTopics` or `#createPartitions` rejected
- *   with: the aggregate of `createTopics`, or the first failed topic's error carrying its
- *   `topicErrors`
+ * @param {Error} error what `Broker#deleteTopics` or `#createPartitions` rejected with: the first
+ *   failed topic's error, carrying its `topicErrors`
  * @returns {Set<string>|null} the refused topics, or null unless every topic that failed was
  *   refused with `THROTTLING_QUOTA_EXCEEDED`
  */
-const throttledTopics = (error) => {
-  const failed = error.errors
-    ? error.errors.map(({ topic, code }) => ({ topic, errorCode: code }))
-    : error.topicErrors
-
-  return failed?.length > 0 &&
-    failed.every(({ errorCode }) => errorCode === THROTTLING_QUOTA_EXCEEDED_CODE)
-    ? new Set(failed.map(({ topic }) => topic))
+const throttledTopics = ({ topicErrors }) =>
+  topicErrors?.length > 0 &&
+  topicErrors.every(({ errorCode }) => errorCode === THROTTLING_QUOTA_EXCEEDED_CODE)
+    ? new Set(topicErrors.map(({ topic }) => topic))
     : null
-}
+
+/**
+ * The key of one partition of one topic, for the calls that answer per partition.
+ * @param {string} topic
+ * @param {number} partition
+ * @returns {string}
+ */
+const partitionKey = (topic, partition) => `${topic}|${partition}`
 
 /**
  * Whether a config resource names something: a non-empty string, except for BROKER, whose empty
@@ -414,12 +416,27 @@ module.exports = ({
   }
 
   /**
+   * Creates topics. A failure that names only some topics does not repeat the others: each retry
+   * sends just the topics the broker said could still go through (`retriable`), a topic it
+   * confirmed is never sent again, and a topic it refused for good is remembered across the
+   * retries.
    * @param {Object} request
    * @param {array} request.topics
    * @param {boolean} [request.validateOnly=false]
    * @param {number} [request.timeout=5000]
-   * @param {boolean} [request.waitForLeaders=true]
-   * @return {Promise}
+   * @param {boolean} [request.waitForLeaders=true] after the last attempt, waits for the leaders of
+   *   the topics this call created (not for one that already existed or was refused)
+   * @returns {Promise<boolean>} true when every topic was created; false when every topic that did
+   *   not go through already existed (also when others were created)
+   * @throws {KafkaJSAggregateError} when the attempts end with a topic refused for good: one error
+   *   per such topic, not retriable, followed by the failures of an attempt that ran out of
+   *   retries. `TOPIC_ALREADY_EXISTS` is benign: when it is the only refusal and nothing else
+   *   failed, the call resolves `false` instead
+   * @throws {KafkaJSNumberOfRetriesExceeded|Error} what ended the retries, unchanged, when no topic
+   *   was refused for good
+   * @throws {KafkaJSTimeout|Error} with `waitForLeaders`, a metadata error or a leader-wait timeout
+   *   rejects the call directly, not as an aggregate; a call whose attempts fail never enters
+   *   that wait
    */
   const createTopics = async ({ topics, validateOnly, timeout, waitForLeaders = true }) => {
     if (!topics || !Array.isArray(topics)) {
@@ -470,50 +487,63 @@ module.exports = ({
       })
     }
 
-    const retrier = createRetry(retry)
-    let pending = topics
-
-    return retrier(async (bail, retryCount, retryTime) => {
-      try {
-        await cluster.refreshMetadata()
-        const broker = await cluster.findControllerBroker()
-        await broker.createTopics({ topics: pending, validateOnly, timeout })
-
-        if (waitForLeaders) {
-          const topicNamesArray = Array.from(topicNames.values())
-          await retryOnLeaderNotAvailable(async () => await broker.metadata(topicNamesArray), {
-            delay: 100,
-            maxWait: timeout,
-            timeoutMessage: 'Timed out while waiting for topic leaders',
-            // a validateOnly request creates nothing, so no topic is on its way to the broker
-            waitForTopicPropagation: !validateOnly,
-          })
-        }
-
-        return true
-      } catch (e) {
-        if (e.type === 'NOT_CONTROLLER') {
-          logger.warn('Could not create topics', { error: e.message, retryCount, retryTime })
-          throw e
-        }
-
-        const refused = throttledTopics(e)
-
-        if (refused) {
-          pending = pending.filter(({ topic }) => refused.has(topic))
-          logger.warn('A quota refused topics', { topics: [...refused], retryCount, retryTime })
-          throw e
-        }
-
-        if (e instanceof KafkaJSAggregateError) {
-          if (e.errors.every((error) => error.type === 'TOPIC_ALREADY_EXISTS')) {
-            return false
-          }
-        }
-
-        bail(e)
-      }
+    const outcome = new AggregateOutcome({
+      keys: topics.map(({ topic }) => topic),
+      keyOf: ({ topic }) => topic,
+      select: (names) => topics.filter(({ topic }) => names.has(topic)),
+      message: 'Topic creation errors',
+      isBenign: (child) => child?.type === 'TOPIC_ALREADY_EXISTS',
     })
+    const retrier = createRetry(retry)
+    let broker
+    let outstanding
+
+    try {
+      await retrier(async (bail, retryCount, retryTime) => {
+        try {
+          await cluster.refreshMetadata()
+          broker = await cluster.findControllerBroker()
+          await broker.createTopics({ topics: outcome.pending, validateOnly, timeout })
+          outcome.succeeded()
+        } catch (e) {
+          if (e.type === 'NOT_CONTROLLER') {
+            logger.warn('Could not create topics', { error: e.message, retryCount, retryTime })
+            throw e
+          }
+
+          if (isPerItemFailure(e)) {
+            const retryable = outcome.settle(e)
+            if (retryable) {
+              logger.warn('Could not create some topics yet', {
+                topics: retryable.errors.map(({ topic }) => topic),
+                retryCount,
+                retryTime,
+              })
+              throw retryable
+            }
+            return
+          }
+
+          bail(e)
+        }
+      })
+    } catch (e) {
+      outstanding = e
+    }
+
+    const everyTopicCreated = outcome.finish(outstanding)
+
+    if (waitForLeaders && outcome.created.size > 0) {
+      await retryOnLeaderNotAvailable(async () => await broker.metadata([...outcome.created]), {
+        delay: 100,
+        maxWait: timeout,
+        timeoutMessage: 'Timed out while waiting for topic leaders',
+        // a validateOnly request creates nothing, so no topic is on its way to the broker
+        waitForTopicPropagation: !validateOnly,
+      })
+    }
+
+    return everyTopicCreated
   }
   /**
    * @param {array} topicPartitions
@@ -2027,11 +2057,18 @@ module.exports = ({
   }
 
   /**
-   * Alter the replicas partitions are assigned to for a topic
+   * Alter the replicas partitions are assigned to for a topic. A failure that names only some
+   * partitions does not repeat the others: each retry sends just the partitions the broker said
+   * could still go through (`retriable`), with their original replicas, and a partition it refused
+   * for good is remembered across the retries.
    * @param {Object} request
    * @param {import("../../types").IPartitionReassignment[]} request.topics topics and the paritions to be reassigned
    * @param {number} [request.timeout]
-   * @returns {Promise}
+   * @returns {Promise<void>}
+   * @throws {KafkaJSAggregateError} when a partition was refused for good: one error per such
+   *   partition, not retriable, followed by the failures of an attempt that ran out of retries
+   * @throws {KafkaJSNumberOfRetriesExceeded|Error} what ended the retries, unchanged, when no
+   *   partition was refused for good
    */
   const alterPartitionReassignments = async ({ topics, timeout }) => {
     if (!topics || !Array.isArray(topics)) {
@@ -2084,22 +2121,65 @@ module.exports = ({
       }
     }
 
-    const retrier = createRetry(retry)
-
-    return retrier(async (bail, retryCount, retryTime) => {
-      try {
-        await cluster.refreshMetadata()
-        const broker = await cluster.findControllerBroker()
-        await broker.alterPartitionReassignments({ topics, timeout })
-      } catch (e) {
-        if (e.type === 'NOT_CONTROLLER') {
-          logger.warn('Could not reassign partitions', { error: e.message, retryCount, retryTime })
-          throw e
-        }
-
-        bail(e)
-      }
+    const outcome = new AggregateOutcome({
+      keys: topics.flatMap(({ topic, partitionAssignment }) =>
+        partitionAssignment.map(({ partition }) => partitionKey(topic, partition))
+      ),
+      keyOf: ({ topic, partition }) => partitionKey(topic, partition),
+      select: (keys) =>
+        topics
+          .map((entry) => ({
+            ...entry,
+            partitionAssignment: entry.partitionAssignment.filter(({ partition }) =>
+              keys.has(partitionKey(entry.topic, partition))
+            ),
+          }))
+          .filter(({ partitionAssignment }) => partitionAssignment.length > 0),
+      message: 'Errors altering partition reassignments',
     })
+    const retrier = createRetry(retry)
+    let outstanding
+
+    try {
+      await retrier(async (bail, retryCount, retryTime) => {
+        try {
+          await cluster.refreshMetadata()
+          const broker = await cluster.findControllerBroker()
+          await broker.alterPartitionReassignments({ topics: outcome.pending, timeout })
+          outcome.succeeded()
+        } catch (e) {
+          if (e.type === 'NOT_CONTROLLER') {
+            logger.warn('Could not reassign partitions', {
+              error: e.message,
+              retryCount,
+              retryTime,
+            })
+            throw e
+          }
+
+          if (isPerItemFailure(e)) {
+            const retryable = outcome.settle(e)
+            if (retryable) {
+              logger.warn('Could not reassign some partitions yet', {
+                partitions: retryable.errors.map(({ topic, partition }) =>
+                  partitionKey(topic, partition)
+                ),
+                retryCount,
+                retryTime,
+              })
+              throw retryable
+            }
+            return
+          }
+
+          bail(e)
+        }
+      })
+    } catch (e) {
+      outstanding = e
+    }
+
+    outcome.finish(outstanding)
   }
 
   /**

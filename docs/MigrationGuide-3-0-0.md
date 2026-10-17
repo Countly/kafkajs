@@ -979,6 +979,24 @@ Group visibility and the admin client.
   the `retry` budget; `useDescribeTopicPartitions` has no such cap. *What to do:* replace a
   `TypeError` catch with a check of the error's class or `type`. Read `KafkaJSTimeout` from
   `fetchTopicMetadata()` as "no usable Metadata answer within 10 s", not only as "no leader yet".
+- **`createTopics` and `alterPartitionReassignments` retry only what can still succeed.**
+  KafkaJS 2.2.4 retried these calls only on a top-level `NOT_CONTROLLER`; an answer that named any
+  failed topic or partition ended the call at once, so a retriable failure such as
+  `REQUEST_TIMED_OUT` on one topic failed the call and the topics that had been created were not
+  reported (`createTopics` resolved `false` when every failed topic already existed). Now each
+  retry sends only the items the broker marked retriable, never an item it confirmed, and the call
+  ends with one result over the whole request: it resolves (`createTopics` resolves `false` only
+  when every topic that did not go through already exists), or rejects with a
+  `KafkaJSAggregateError` of the items refused for good (followed by the failures that ended the
+  retries), or, when nothing was refused for good, with what ended the retries, unchanged.
+  `waitForLeaders` waits once, after the last attempt, for the topics the call created; a call
+  whose attempts fail does not enter that wait, and a metadata error or timeout from the wait
+  itself rejects the call directly, not as an aggregate.
+  `alterPartitionReassignments` no longer sends a topic whose `partitionAssignment` is empty.
+  *What to do:* a retrier of your own around these calls that only existed to repeat a retriable
+  topic can go; code that reads `error.errors` finds the items refused for good first (when
+  nothing was refused for good and the retries ran out on failed items, `error.cause.errors` lists
+  them); `retry: { retries: 0 }` makes a single attempt.
 
 ### Errors and events
 

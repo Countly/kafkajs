@@ -128,20 +128,27 @@ describe.each(APIS)('Admin > $name > a quota refuses topics', (api) => {
 
     expect(broker[api.method]).toHaveBeenCalledTimes(1)
   })
-
-  test('does not send again when another topic failed in the same answer', async () => {
-    const { admin, broker } = adminAnswering(api, [
-      [
-        ['a', THROTTLING_QUOTA_EXCEEDED],
-        ['b', UNKNOWN_TOPIC_OR_PARTITION],
-      ],
-    ])
-
-    await expect(api.call(admin, ['a', 'b'])).rejects.toBeDefined()
-
-    expect(broker[api.method]).toHaveBeenCalledTimes(1)
-  })
 })
+
+// createTopics sends the retriable topics again whatever else failed in the answer
+// (aggregateOutcome.spec.js), so only the two calls that do not are held to one attempt here.
+describe.each(APIS.filter(({ name }) => name !== 'createTopics'))(
+  'Admin > $name > a quota refuses topics, and another topic fails in the same answer',
+  (api) => {
+    test('does not send again', async () => {
+      const { admin, broker } = adminAnswering(api, [
+        [
+          ['a', THROTTLING_QUOTA_EXCEEDED],
+          ['b', UNKNOWN_TOPIC_OR_PARTITION],
+        ],
+      ])
+
+      await expect(api.call(admin, ['a', 'b'])).rejects.toBeDefined()
+
+      expect(broker[api.method]).toHaveBeenCalledTimes(1)
+    })
+  }
+)
 
 describe('Admin > createTopics > a quota refuses a topic another client created meanwhile', () => {
   test('resolves false when the repeat finds only topics that exist', async () => {
