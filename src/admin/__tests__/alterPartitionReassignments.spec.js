@@ -1,5 +1,10 @@
 const createAdmin = require('../index')
-const { KafkaJSProtocolError } = require('../../errors')
+const Broker = require('../../broker')
+const {
+  KafkaJSAggregateError,
+  KafkaJSNumberOfRetriesExceeded,
+  KafkaJSProtocolError,
+} = require('../../errors')
 const { createErrorFromCode } = require('../../protocol/error')
 
 const { secureRandom, createCluster, newLogger } = require('testHelpers')
@@ -105,19 +110,28 @@ describe('Admin', () => {
       )
     })
 
-    test('throws an error if the if trying to reassign partitions for a topic that does not exist', async () => {
-      admin = createAdmin({ cluster: createCluster(), logger: newLogger() })
+    test('retries a topic that does not exist, then rejects with the retries exhausted and the topic’s error as the cause', async () => {
+      admin = createAdmin({
+        cluster: createCluster(),
+        logger: newLogger(),
+        retry: { retries: 1, initialRetryTime: 100 },
+      })
 
       await admin.connect()
 
-      await expect(
-        admin.alterPartitionReassignments({
-          topics: [
-            { topic: topicName + 'x', partitionAssignment: [{ partition: 0, replicas: [2, 1] }] },
-          ],
-        })
-      ).rejects.toThrow(
-        expect.objectContaining({
+      const asked = jest.spyOn(Broker.prototype, 'alterPartitionReassignments')
+      try {
+        const error = await admin
+          .alterPartitionReassignments({
+            topics: [
+              { topic: topicName + 'x', partitionAssignment: [{ partition: 0, replicas: [2, 1] }] },
+            ],
+          })
+          .catch((e) => e)
+
+        expect(error).toBeInstanceOf(KafkaJSNumberOfRetriesExceeded)
+        expect(error.cause).toBeInstanceOf(KafkaJSAggregateError)
+        expect(error.cause).toMatchObject({
           message: 'Errors altering partition reassignments',
           errors: expect.arrayContaining([
             expect.objectContaining({
@@ -127,7 +141,10 @@ describe('Admin', () => {
             }),
           ]),
         })
-      )
+        expect(asked).toHaveBeenCalledTimes(2)
+      } finally {
+        asked.mockRestore()
+      }
     })
 
     test('throws an error trying to assign invalid broker', async () => {

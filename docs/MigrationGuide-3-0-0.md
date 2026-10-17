@@ -988,7 +988,10 @@ Group visibility and the admin client.
   ends with one result over the whole request: it resolves (`createTopics` resolves `false` only
   when every topic that did not go through already exists), or rejects with a
   `KafkaJSAggregateError` of the items refused for good (followed by the failures that ended the
-  retries), or, when nothing was refused for good, with what ended the retries, unchanged.
+  retries), or, when nothing was refused for good, with what ended the retries, unchanged. For example, reassigning a partition of a topic that
+  does not exist (`UNKNOWN_TOPIC_OR_PARTITION`, which Kafka marks retriable) is now retried until
+  the budget is spent and rejects with `KafkaJSNumberOfRetriesExceeded`, whose `cause.errors` lists
+  it; 2.2.4 rejected at once with the aggregate.
   `waitForLeaders` waits once, after the last attempt, for the topics the call created; a call
   whose attempts fail does not enter that wait, and a metadata error or timeout from the wait
   itself rejects the call directly, not as an aggregate.

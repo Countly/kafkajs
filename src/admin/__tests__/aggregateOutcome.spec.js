@@ -686,6 +686,22 @@ describe('Admin > alterPartitionReassignments > an answer that names only some p
     expect(broker.alterPartitionReassignments).toHaveBeenCalledTimes(1)
   })
 
+  test('ends with the retrier’s own error, the aggregate as its cause, when a retriable partition never clears', async () => {
+    const { admin, broker } = adminAnswering('alterPartitionReassignments', [
+      partitionsAnswer(['t1', 0, UNKNOWN_TOPIC_OR_PARTITION], ['t1', 1, OK], ['t2', 0, OK]),
+    ])
+
+    const error = await alter(admin).catch((e) => e)
+
+    expect(error).toBeInstanceOf(KafkaJSNumberOfRetriesExceeded)
+    expect(error.cause).toBeInstanceOf(KafkaJSAggregateError)
+    expect(error.cause.message).toBe('Errors altering partition reassignments')
+    expect(
+      error.cause.errors.map(({ topic, partition, type }) => [topic, partition, type])
+    ).toEqual([['t1', 0, 'UNKNOWN_TOPIC_OR_PARTITION']])
+    expect(broker.alterPartitionReassignments).toHaveBeenCalledTimes(RETRY.retries + 1)
+  })
+
   test('ends at once, unchanged, with an aggregate that lists no failure', async () => {
     const unlisted = aggregate()
     const { admin, broker } = adminAnswering('alterPartitionReassignments', [unlisted])
