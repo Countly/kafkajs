@@ -1,0 +1,1146 @@
+{
+  "4.0.2": {
+    "Produce": [
+      0,
+      12
+    ],
+    "Fetch": [
+      4,
+      17
+    ],
+    "ListOffsets": [
+      1,
+      10
+    ],
+    "Metadata": [
+      0,
+      13
+    ],
+    "OffsetCommit": [
+      2,
+      9
+    ],
+    "OffsetFetch": [
+      1,
+      9
+    ],
+    "GroupCoordinator": [
+      0,
+      6
+    ],
+    "JoinGroup": [
+      0,
+      9
+    ],
+    "Heartbeat": [
+      0,
+      4
+    ],
+    "LeaveGroup": [
+      0,
+      5
+    ],
+    "SyncGroup": [
+      0,
+      5
+    ],
+    "DescribeGroups": [
+      0,
+      6
+    ],
+    "ListGroups": [
+      0,
+      5
+    ],
+    "SaslHandshake": [
+      0,
+      1
+    ],
+    "ApiVersions": [
+      0,
+      4
+    ],
+    "CreateTopics": [
+      2,
+      7
+    ],
+    "DeleteTopics": [
+      1,
+      6
+    ],
+    "DeleteRecords": [
+      0,
+      2
+    ],
+    "InitProducerId": [
+      0,
+      5
+    ],
+    "OffsetForLeaderEpoch": [
+      2,
+      4
+    ],
+    "AddPartitionsToTxn": [
+      0,
+      5
+    ],
+    "AddOffsetsToTxn": [
+      0,
+      4
+    ],
+    "EndTxn": [
+      0,
+      5
+    ],
+    "WriteTxnMarkers": [
+      1,
+      1
+    ],
+    "TxnOffsetCommit": [
+      0,
+      5
+    ],
+    "DescribeAcls": [
+      1,
+      3
+    ],
+    "CreateAcls": [
+      1,
+      3
+    ],
+    "DeleteAcls": [
+      1,
+      3
+    ],
+    "DescribeConfigs": [
+      1,
+      4
+    ],
+    "AlterConfigs": [
+      0,
+      2
+    ],
+    "AlterReplicaLogDirs": [
+      1,
+      2
+    ],
+    "DescribeLogDirs": [
+      1,
+      4
+    ],
+    "SaslAuthenticate": [
+      0,
+      2
+    ],
+    "CreatePartitions": [
+      0,
+      3
+    ],
+    "CreateDelegationToken": [
+      1,
+      3
+    ],
+    "RenewDelegationToken": [
+      1,
+      2
+    ],
+    "ExpireDelegationToken": [
+      1,
+      2
+    ],
+    "DescribeDelegationToken": [
+      1,
+      3
+    ],
+    "DeleteGroups": [
+      0,
+      2
+    ],
+    "ElectLeaders": [
+      0,
+      2
+    ],
+    "IncrementalAlterConfigs": [
+      0,
+      1
+    ],
+    "AlterPartitionReassignments": [
+      0,
+      0
+    ],
+    "ListPartitionReassignments": [
+      0,
+      0
+    ],
+    "ApiKey47": [
+      0,
+      0
+    ],
+    "ApiKey48": [
+      0,
+      1
+    ],
+    "ApiKey49": [
+      0,
+      1
+    ],
+    "ApiKey50": [
+      0,
+      0
+    ],
+    "ApiKey51": [
+      0,
+      0
+    ],
+    "ApiKey55": [
+      0,
+      2
+    ],
+    "ApiKey57": [
+      0,
+      2
+    ],
+    "ApiKey60": [
+      0,
+      2
+    ],
+    "ApiKey61": [
+      0,
+      0
+    ],
+    "ApiKey64": [
+      0,
+      0
+    ],
+    "ApiKey65": [
+      0,
+      0
+    ],
+    "ApiKey66": [
+      0,
+      1
+    ],
+    "ConsumerGroupHeartbeat": [
+      0,
+      1
+    ],
+    "ConsumerGroupDescribe": [
+      0,
+      1
+    ],
+    "ApiKey74": [
+      0,
+      0
+    ],
+    "DescribeTopicPartitions": [
+      0,
+      0
+    ],
+    "ApiKey80": [
+      0,
+      0
+    ],
+    "ApiKey81": [
+      0,
+      0
+    ]
+  },
+  "4.1.2": {
+    "Produce": [
+      0,
+      13
+    ],
+    "Fetch": [
+      4,
+      18
+    ],
+    "ListOffsets": [
+      1,
+      10
+    ],
+    "Metadata": [
+      0,
+      13
+    ],
+    "OffsetCommit": [
+      2,
+      9
+    ],
+    "OffsetFetch": [
+      1,
+      9
+    ],
+    "GroupCoordinator": [
+      0,
+      6
+    ],
+    "JoinGroup": [
+      0,
+      9
+    ],
+    "Heartbeat": [
+      0,
+      4
+    ],
+    "LeaveGroup": [
+      0,
+      5
+    ],
+    "SyncGroup": [
+      0,
+      5
+    ],
+    "DescribeGroups": [
+      0,
+      6
+    ],
+    "ListGroups": [
+      0,
+      5
+    ],
+    "SaslHandshake": [
+      0,
+      1
+    ],
+    "ApiVersions": [
+      0,
+      4
+    ],
+    "CreateTopics": [
+      2,
+      7
+    ],
+    "DeleteTopics": [
+      1,
+      6
+    ],
+    "DeleteRecords": [
+      0,
+      2
+    ],
+    "InitProducerId": [
+      0,
+      5
+    ],
+    "OffsetForLeaderEpoch": [
+      2,
+      4
+    ],
+    "AddPartitionsToTxn": [
+      0,
+      5
+    ],
+    "AddOffsetsToTxn": [
+      0,
+      4
+    ],
+    "EndTxn": [
+      0,
+      5
+    ],
+    "WriteTxnMarkers": [
+      1,
+      1
+    ],
+    "TxnOffsetCommit": [
+      0,
+      5
+    ],
+    "DescribeAcls": [
+      1,
+      3
+    ],
+    "CreateAcls": [
+      1,
+      3
+    ],
+    "DeleteAcls": [
+      1,
+      3
+    ],
+    "DescribeConfigs": [
+      1,
+      4
+    ],
+    "AlterConfigs": [
+      0,
+      2
+    ],
+    "AlterReplicaLogDirs": [
+      1,
+      2
+    ],
+    "DescribeLogDirs": [
+      1,
+      4
+    ],
+    "SaslAuthenticate": [
+      0,
+      2
+    ],
+    "CreatePartitions": [
+      0,
+      3
+    ],
+    "CreateDelegationToken": [
+      1,
+      3
+    ],
+    "RenewDelegationToken": [
+      1,
+      2
+    ],
+    "ExpireDelegationToken": [
+      1,
+      2
+    ],
+    "DescribeDelegationToken": [
+      1,
+      3
+    ],
+    "DeleteGroups": [
+      0,
+      2
+    ],
+    "ElectLeaders": [
+      0,
+      2
+    ],
+    "IncrementalAlterConfigs": [
+      0,
+      1
+    ],
+    "AlterPartitionReassignments": [
+      0,
+      1
+    ],
+    "ListPartitionReassignments": [
+      0,
+      0
+    ],
+    "ApiKey47": [
+      0,
+      0
+    ],
+    "ApiKey48": [
+      0,
+      1
+    ],
+    "ApiKey49": [
+      0,
+      1
+    ],
+    "ApiKey50": [
+      0,
+      0
+    ],
+    "ApiKey51": [
+      0,
+      0
+    ],
+    "ApiKey55": [
+      0,
+      2
+    ],
+    "ApiKey57": [
+      0,
+      2
+    ],
+    "ApiKey60": [
+      0,
+      2
+    ],
+    "ApiKey61": [
+      0,
+      0
+    ],
+    "ApiKey64": [
+      0,
+      0
+    ],
+    "ApiKey65": [
+      0,
+      0
+    ],
+    "ApiKey66": [
+      0,
+      2
+    ],
+    "ConsumerGroupHeartbeat": [
+      0,
+      1
+    ],
+    "ConsumerGroupDescribe": [
+      0,
+      1
+    ],
+    "ApiKey74": [
+      0,
+      1
+    ],
+    "DescribeTopicPartitions": [
+      0,
+      0
+    ],
+    "ApiKey76": [
+      1,
+      1
+    ],
+    "ApiKey77": [
+      1,
+      1
+    ],
+    "ApiKey78": [
+      1,
+      1
+    ],
+    "ApiKey79": [
+      1,
+      1
+    ],
+    "ApiKey80": [
+      0,
+      0
+    ],
+    "ApiKey81": [
+      0,
+      0
+    ],
+    "ApiKey83": [
+      0,
+      0
+    ],
+    "ApiKey84": [
+      0,
+      0
+    ],
+    "ApiKey85": [
+      0,
+      0
+    ],
+    "ApiKey86": [
+      0,
+      0
+    ],
+    "ApiKey87": [
+      0,
+      0
+    ],
+    "ApiKey90": [
+      0,
+      0
+    ],
+    "ApiKey91": [
+      0,
+      0
+    ],
+    "ApiKey92": [
+      0,
+      0
+    ]
+  },
+  "4.2.2": {
+    "Produce": [
+      0,
+      13
+    ],
+    "Fetch": [
+      4,
+      18
+    ],
+    "ListOffsets": [
+      1,
+      11
+    ],
+    "Metadata": [
+      0,
+      13
+    ],
+    "OffsetCommit": [
+      2,
+      10
+    ],
+    "OffsetFetch": [
+      1,
+      10
+    ],
+    "GroupCoordinator": [
+      0,
+      6
+    ],
+    "JoinGroup": [
+      0,
+      9
+    ],
+    "Heartbeat": [
+      0,
+      4
+    ],
+    "LeaveGroup": [
+      0,
+      5
+    ],
+    "SyncGroup": [
+      0,
+      5
+    ],
+    "DescribeGroups": [
+      0,
+      6
+    ],
+    "ListGroups": [
+      0,
+      5
+    ],
+    "SaslHandshake": [
+      0,
+      1
+    ],
+    "ApiVersions": [
+      0,
+      4
+    ],
+    "CreateTopics": [
+      2,
+      7
+    ],
+    "DeleteTopics": [
+      1,
+      6
+    ],
+    "DeleteRecords": [
+      0,
+      2
+    ],
+    "InitProducerId": [
+      0,
+      5
+    ],
+    "OffsetForLeaderEpoch": [
+      2,
+      4
+    ],
+    "AddPartitionsToTxn": [
+      0,
+      5
+    ],
+    "AddOffsetsToTxn": [
+      0,
+      4
+    ],
+    "EndTxn": [
+      0,
+      5
+    ],
+    "WriteTxnMarkers": [
+      1,
+      2
+    ],
+    "TxnOffsetCommit": [
+      0,
+      5
+    ],
+    "DescribeAcls": [
+      1,
+      3
+    ],
+    "CreateAcls": [
+      1,
+      3
+    ],
+    "DeleteAcls": [
+      1,
+      3
+    ],
+    "DescribeConfigs": [
+      1,
+      4
+    ],
+    "AlterConfigs": [
+      0,
+      2
+    ],
+    "AlterReplicaLogDirs": [
+      1,
+      2
+    ],
+    "DescribeLogDirs": [
+      1,
+      4
+    ],
+    "SaslAuthenticate": [
+      0,
+      2
+    ],
+    "CreatePartitions": [
+      0,
+      3
+    ],
+    "CreateDelegationToken": [
+      1,
+      3
+    ],
+    "RenewDelegationToken": [
+      1,
+      2
+    ],
+    "ExpireDelegationToken": [
+      1,
+      2
+    ],
+    "DescribeDelegationToken": [
+      1,
+      3
+    ],
+    "DeleteGroups": [
+      0,
+      2
+    ],
+    "ElectLeaders": [
+      0,
+      2
+    ],
+    "IncrementalAlterConfigs": [
+      0,
+      1
+    ],
+    "AlterPartitionReassignments": [
+      0,
+      1
+    ],
+    "ListPartitionReassignments": [
+      0,
+      0
+    ],
+    "ApiKey47": [
+      0,
+      0
+    ],
+    "ApiKey48": [
+      0,
+      1
+    ],
+    "ApiKey49": [
+      0,
+      1
+    ],
+    "ApiKey50": [
+      0,
+      0
+    ],
+    "ApiKey51": [
+      0,
+      0
+    ],
+    "ApiKey55": [
+      0,
+      2
+    ],
+    "ApiKey57": [
+      0,
+      2
+    ],
+    "ApiKey60": [
+      0,
+      2
+    ],
+    "ApiKey61": [
+      0,
+      0
+    ],
+    "ApiKey64": [
+      0,
+      0
+    ],
+    "ApiKey65": [
+      0,
+      0
+    ],
+    "ApiKey66": [
+      0,
+      2
+    ],
+    "ConsumerGroupHeartbeat": [
+      0,
+      1
+    ],
+    "ConsumerGroupDescribe": [
+      0,
+      1
+    ],
+    "ApiKey74": [
+      0,
+      1
+    ],
+    "DescribeTopicPartitions": [
+      0,
+      0
+    ],
+    "ApiKey76": [
+      1,
+      1
+    ],
+    "ApiKey77": [
+      1,
+      1
+    ],
+    "ApiKey78": [
+      1,
+      2
+    ],
+    "ApiKey79": [
+      1,
+      2
+    ],
+    "ApiKey80": [
+      0,
+      1
+    ],
+    "ApiKey81": [
+      0,
+      0
+    ],
+    "ApiKey83": [
+      0,
+      0
+    ],
+    "ApiKey84": [
+      0,
+      0
+    ],
+    "ApiKey85": [
+      0,
+      1
+    ],
+    "ApiKey86": [
+      0,
+      0
+    ],
+    "ApiKey87": [
+      0,
+      1
+    ],
+    "ApiKey88": [
+      0,
+      0
+    ],
+    "ApiKey89": [
+      0,
+      0
+    ],
+    "ApiKey90": [
+      0,
+      1
+    ],
+    "ApiKey91": [
+      0,
+      0
+    ],
+    "ApiKey92": [
+      0,
+      0
+    ]
+  },
+  "4.3.1": {
+    "Produce": [
+      0,
+      13
+    ],
+    "Fetch": [
+      4,
+      18
+    ],
+    "ListOffsets": [
+      1,
+      11
+    ],
+    "Metadata": [
+      0,
+      13
+    ],
+    "OffsetCommit": [
+      2,
+      10
+    ],
+    "OffsetFetch": [
+      1,
+      10
+    ],
+    "GroupCoordinator": [
+      0,
+      6
+    ],
+    "JoinGroup": [
+      0,
+      9
+    ],
+    "Heartbeat": [
+      0,
+      4
+    ],
+    "LeaveGroup": [
+      0,
+      5
+    ],
+    "SyncGroup": [
+      0,
+      5
+    ],
+    "DescribeGroups": [
+      0,
+      6
+    ],
+    "ListGroups": [
+      0,
+      5
+    ],
+    "SaslHandshake": [
+      0,
+      1
+    ],
+    "ApiVersions": [
+      0,
+      4
+    ],
+    "CreateTopics": [
+      2,
+      7
+    ],
+    "DeleteTopics": [
+      1,
+      6
+    ],
+    "DeleteRecords": [
+      0,
+      2
+    ],
+    "InitProducerId": [
+      0,
+      5
+    ],
+    "OffsetForLeaderEpoch": [
+      2,
+      4
+    ],
+    "AddPartitionsToTxn": [
+      0,
+      5
+    ],
+    "AddOffsetsToTxn": [
+      0,
+      4
+    ],
+    "EndTxn": [
+      0,
+      5
+    ],
+    "WriteTxnMarkers": [
+      1,
+      2
+    ],
+    "TxnOffsetCommit": [
+      0,
+      5
+    ],
+    "DescribeAcls": [
+      1,
+      3
+    ],
+    "CreateAcls": [
+      1,
+      3
+    ],
+    "DeleteAcls": [
+      1,
+      3
+    ],
+    "DescribeConfigs": [
+      1,
+      4
+    ],
+    "AlterConfigs": [
+      0,
+      2
+    ],
+    "AlterReplicaLogDirs": [
+      1,
+      2
+    ],
+    "DescribeLogDirs": [
+      1,
+      5
+    ],
+    "SaslAuthenticate": [
+      0,
+      2
+    ],
+    "CreatePartitions": [
+      0,
+      3
+    ],
+    "CreateDelegationToken": [
+      1,
+      3
+    ],
+    "RenewDelegationToken": [
+      1,
+      2
+    ],
+    "ExpireDelegationToken": [
+      1,
+      2
+    ],
+    "DescribeDelegationToken": [
+      1,
+      3
+    ],
+    "DeleteGroups": [
+      0,
+      2
+    ],
+    "ElectLeaders": [
+      0,
+      2
+    ],
+    "IncrementalAlterConfigs": [
+      0,
+      1
+    ],
+    "AlterPartitionReassignments": [
+      0,
+      1
+    ],
+    "ListPartitionReassignments": [
+      0,
+      0
+    ],
+    "ApiKey47": [
+      0,
+      0
+    ],
+    "ApiKey48": [
+      0,
+      1
+    ],
+    "ApiKey49": [
+      0,
+      1
+    ],
+    "ApiKey50": [
+      0,
+      0
+    ],
+    "ApiKey51": [
+      0,
+      0
+    ],
+    "ApiKey55": [
+      0,
+      2
+    ],
+    "ApiKey57": [
+      0,
+      2
+    ],
+    "ApiKey60": [
+      0,
+      2
+    ],
+    "ApiKey61": [
+      0,
+      0
+    ],
+    "ApiKey64": [
+      0,
+      0
+    ],
+    "ApiKey65": [
+      0,
+      0
+    ],
+    "ApiKey66": [
+      0,
+      2
+    ],
+    "ConsumerGroupHeartbeat": [
+      0,
+      1
+    ],
+    "ConsumerGroupDescribe": [
+      0,
+      1
+    ],
+    "ApiKey74": [
+      0,
+      1
+    ],
+    "DescribeTopicPartitions": [
+      0,
+      0
+    ],
+    "ApiKey76": [
+      1,
+      1
+    ],
+    "ApiKey77": [
+      1,
+      1
+    ],
+    "ApiKey78": [
+      1,
+      2
+    ],
+    "ApiKey79": [
+      1,
+      2
+    ],
+    "ApiKey80": [
+      0,
+      1
+    ],
+    "ApiKey81": [
+      0,
+      0
+    ],
+    "ApiKey83": [
+      0,
+      0
+    ],
+    "ApiKey84": [
+      0,
+      0
+    ],
+    "ApiKey85": [
+      0,
+      1
+    ],
+    "ApiKey86": [
+      0,
+      0
+    ],
+    "ApiKey87": [
+      0,
+      1
+    ],
+    "ApiKey88": [
+      0,
+      0
+    ],
+    "ApiKey89": [
+      0,
+      0
+    ],
+    "ApiKey90": [
+      0,
+      1
+    ],
+    "ApiKey91": [
+      0,
+      0
+    ],
+    "ApiKey92": [
+      0,
+      0
+    ]
+  }
+}

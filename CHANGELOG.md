@@ -634,3 +634,5 @@ Adopted upstream PRs are credited here by number as they land (Phase 2 onward).
 - `KafkaJSInvalidFrameError`, `KafkaJSCorruptRecordError` and `KafkaJSCommitFailedError` are exported from the package and its ES module entry, with their types: a refused response frame (a retriable connection error), a structurally corrupt Fetch batch (non-retriable) and a refused offset commit (non-retriable, with the loss as its `cause`). `KafkaJSAggregateError` gains `retriable`. The `Kafka` constructor accepts and validates `maxResponseSize`, the response-size limit passed to every connection, an integer from 4 to 2147483647 that defaults to 104857600 (100 MiB); it takes effect with the response-frame bound.
 
 #### Tooling
+
+- `scripts/protocol/brokerRanges.json` records the full table of API version ranges that Kafka 4.0.2, 4.1.2, 4.2.2 and 4.3.1 offer, written by `npm run probe:api-versions -- --record=scripts/protocol/brokerRanges.json` (`--all` prints every offered API; the probe takes the broker's version from the running broker and stops when it differs from `KAFKA_VERSION`). The 4.0 floor image is `apache/kafka:4.0.2`.
