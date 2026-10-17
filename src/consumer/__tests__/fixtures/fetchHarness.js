@@ -821,6 +821,7 @@ module.exports = {
   prepareRecordBatches,
   apiVersionsBody,
   decodeFetchRequest,
+  decodeOffsetForLeaderEpochRequests,
   createFakeBroker,
   createFakeCoordinator,
   fetchResponse,
