@@ -7,7 +7,7 @@ module.exports = {
   },
   setupFilesAfterEnv: ['<rootDir>/testHelpers/setup.js'],
   // Only these trees hold specs; keeps stray local directories out of test discovery.
-  roots: ['<rootDir>/src', '<rootDir>/scripts'],
+  roots: ['<rootDir>/src', '<rootDir>/scripts', '<rootDir>/testHelpers'],
   testPathIgnorePatterns: ['/node_modules/'],
   testEnvironment: 'node',
   testRegex: '(/__tests__/.*\\.spec\\.js|(\\.|/)spec)\\.jsx?$',

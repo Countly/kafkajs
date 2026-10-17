@@ -1,15 +1,19 @@
 const { execFileSync } = require('child_process')
+const path = require('path')
 
 const BOOTSTRAP_SERVER = 'kafka1:29092'
 // Suffixed with this process's pid so two overlapping runs (there should never be one, but the
 // file is otherwise never cleaned up) cannot clobber each other's reassignment plan.
 const REASSIGNMENT_FILE = `/tmp/leader-move-reassignment-${process.pid}.json`
 const KAFKA_BIN = '/opt/kafka/bin'
-const COMPOSE_FILE = process.env.COMPOSE_FILE || 'docker-compose.yml'
+// Resolved against the repository root, not the working directory, so a script run from another
+// directory (the OpenTelemetry package's tests run from `otel/`) reaches the same cluster.
+const COMPOSE_FILE = path.resolve(__dirname, '..', process.env.COMPOSE_FILE || 'docker-compose.yml')
 
 /**
  * Runs `docker compose` against the cluster the tests are using. Defaults to the root compose
- * file; `COMPOSE_FILE` overrides it, which is how a scenario targets its own.
+ * file; `COMPOSE_FILE` (relative to the repository root) overrides it, which is how a scenario
+ * targets its own.
  *
  * Synchronous on purpose, so a test never races the container it just told to stop or start.
  *

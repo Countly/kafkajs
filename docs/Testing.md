@@ -53,6 +53,16 @@ That repeat hides a race: on a freshly started cluster the broker that `admin.cr
 
 A scenario that needs a cluster in a particular state, or a long time, is a separate spec gated by an environment variable: it skips itself without the variable, so the groups above only skip it, and it has an `npm run test:e2e:<name>` script that starts the cluster through `test:kafka` and sets the variable, for example `npm run test:e2e:create-topics-cold`. Most scenarios write what they observed to `.tmp/e2e/<name>.jsonl` (through `writeEvidence` in `testHelpers`), which Git ignores. `npm run probe:api-versions` prints, as one JSON line, the version range the broker at `localhost:9092` offers for each API the admin and group codecs use (`KAFKA_VERSION` selects another supported cluster).
 
+### Scenario lanes
+
+A scenario that holds with no fault injected runs on two lanes from one file: `describe.each(lanes())` from `testHelpers` gives it `fake` (the unit lane, in process) or `docker` (under `npm run test:kafka`, which exports `KAFKAJS_LANE=docker`), and `KAFKAJS_SCENARIO_LANES=fake,docker` asks for both. A scenario that injects a fault (a held answer, a dropped frame) runs on the fake lane unless the fault can be injected on a live cluster too.
+
+`Gate`, `Schedule` and `interleavings` in `testHelpers` hold a call until a test releases it and list the orders in which several held calls can be released (every order up to six calls, a seeded sample above): that is how a spec puts two operations in a chosen order. `createResourceProbe` reports listeners, sockets, queue depth, ledger and obligation sizes, event-loop resources and the settled heap, for specs that compare what a client holds before it is built and after it is torn down.
+
+### Evidence stamps
+
+`writeEvidence` stamps every line with `at`, `brokerVersion` (the version the running broker reports through `docker compose exec`, checked against `KAFKA_VERSION`: a mismatch refuses the line), `wireVersions` (the version each API was sent at, when the scenario states them), `node`, `config` (the client options; the value of any option named like a credential, such as a password, secret, token, key, certificate or AWS access key id, is replaced by `[redacted]`), `tree` (`KAFKAJS_TREE`, `unfrozen` when unset) and `lane`. The stamps always come from the run: a record cannot claim another one, and a `toJSON` on the record is ignored. A unit spec supplies them with `useEvidenceRun({ … })` instead of Docker. `node scripts/evidence/verify.js --broker <version> <files>`, run from a clean checkout while the cluster that produced the files is still up, recomputes the checked-out commit itself and exits 0 only when every line carries every stamp and its `tree`, `node` and `brokerVersion` equal the verified values on the docker lane.
+
 ### Skipped tests
 
 Some tests are intentionally skipped against certain broker versions or environments. The reasons are tracked in `QUARANTINE.md` at the repository root — check there before assuming a skip is accidental.

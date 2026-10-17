@@ -637,3 +637,5 @@ Adopted upstream PRs are credited here by number as they land (Phase 2 onward).
 #### Tooling
 
 - `scripts/protocol/brokerRanges.json` records the full table of API version ranges that Kafka 4.0.2, 4.1.2, 4.2.2 and 4.3.1 offer, written by `npm run probe:api-versions -- --record=scripts/protocol/brokerRanges.json` (`--all` prints every offered API; the probe takes the broker's version from the running broker and stops when it differs from `KAFKA_VERSION`). The 4.0 floor image is `apache/kafka:4.0.2`.
+
+- Live evidence lines now carry `brokerVersion` (read from the running broker and checked against the lane's `KAFKA_VERSION`), `wireVersions`, `node`, `config` (the value of any credential-named option replaced by `[redacted]`), `tree` (`KAFKAJS_TREE`) and `lane`, and `scripts/evidence/verify.js` checks them against the tested tree; the test helpers gain `Gate`, `Schedule` and `interleavings` for holding calls and ordering them, a resource probe and scenario lanes (`lanes()`), the fake socket can be destroyed, Jest discovers `testHelpers/__tests__`, and the helpers find their compose file from the repository root whatever the working directory.

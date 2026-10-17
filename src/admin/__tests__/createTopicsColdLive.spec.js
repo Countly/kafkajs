@@ -1,6 +1,7 @@
 const { Kafka, logLevel } = require('../../../index')
 const Broker = require('../../broker')
-const { plainTextBrokers, writeEvidence } = require('testHelpers')
+const { plainTextBrokers, writeEvidence, evidenceLines, wireVersionsOf } = require('testHelpers')
+const { problemsOf } = require('../../../scripts/evidence/verify')
 
 // Gated: it needs a cluster that has only just started, so it is run alone through
 // `npm run test:e2e:create-topics-cold`, which starts a fresh cluster for the run.
@@ -8,6 +9,8 @@ const describeCreateTopicsCold =
   process.env.CREATE_TOPICS_COLD_E2E === '1' ? describe : describe.skip
 
 const EVIDENCE = 'create-topics-cold'
+// The lines earlier runs left behind, so the last case judges only this run's.
+const linesBefore = evidenceLines(EVIDENCE).length
 const CALLS = 30
 // Concurrent callers load the controller the way a busy test run does, which is what makes the
 // propagation lag likely; one caller on an idle cluster rarely sees it.
@@ -35,9 +38,12 @@ describeCreateTopicsCold('Admin > createTopics on a cold cluster (live)', () => 
   let metadata
   /** @type {string[][]} the topic names of every Metadata request answered with code 3 */
   let unknownTopicAnswers
+  /** @type {{ apiName: string, apiVersion: number }[]} every request the admin sent */
+  let requests
 
   beforeAll(async () => {
     unknownTopicAnswers = []
+    requests = []
     const original = Broker.prototype.metadata
     metadata = jest.spyOn(Broker.prototype, 'metadata').mockImplementation(async function (topics) {
       try {
@@ -55,6 +61,9 @@ describeCreateTopicsCold('Admin > createTopics on a cold cluster (live)', () => 
       brokers: plainTextBrokers(),
       logLevel: logLevel.NOTHING,
     }).admin()
+    admin.on(admin.events.REQUEST, ({ payload }) =>
+      requests.push({ apiName: payload.apiName, apiVersion: payload.apiVersion })
+    )
     await admin.connect()
   }, HOOK_BUDGET_MS)
 
@@ -107,6 +116,7 @@ describeCreateTopicsCold('Admin > createTopics on a cold cluster (live)', () => 
         code3Answers,
         exercised: code3Answers > 0,
         outcomes,
+        wireVersions: wireVersionsOf(requests),
       })
 
       expect(failures).toEqual([])
@@ -114,4 +124,18 @@ describeCreateTopicsCold('Admin > createTopics on a cold cluster (live)', () => 
     },
     SCENARIO_BUDGET_MS
   )
+
+  test('its evidence line carries the stamps a verifier checks', () => {
+    const lines = evidenceLines(EVIDENCE).slice(linesBefore)
+    const verified = {
+      tree: process.env.KAFKAJS_TREE || 'unfrozen',
+      node: process.version,
+      brokerVersion: process.env.KAFKA_VERSION,
+    }
+
+    expect(lines).toHaveLength(1)
+    expect(problemsOf(lines[0], verified)).toEqual([])
+    expect(lines[0].wireVersions).toMatchObject({ CreateTopics: 7 })
+    expect(Object.keys(lines[0].wireVersions)).toEqual(expect.arrayContaining(['Metadata']))
+  })
 })

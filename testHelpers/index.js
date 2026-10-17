@@ -21,8 +21,19 @@ const {
 
 const LoggerConsole = require('../src/loggers/console')
 const { Kafka } = require('../index')
-const { createFakeSocketFactory, respondWithFrame, readRequestHeader } = require('./fakeSocket')
-const { evidencePath, writeEvidence } = require('./e2eEvidence')
+const {
+  createFakeSocketFactory,
+  socketCounts,
+  respondWithFrame,
+  readRequestHeader,
+} = require('./fakeSocket')
+const {
+  evidencePath,
+  evidenceLines,
+  writeEvidence,
+  useEvidenceRun,
+  wireVersionsOf,
+} = require('./e2eEvidence')
 const {
   execInKafka1,
   compose,
@@ -507,10 +518,14 @@ module.exports = {
   generateMessages,
   unsupportedVersionResponseWithTimeout,
   createFakeSocketFactory,
+  socketCounts,
   respondWithFrame,
   readRequestHeader,
   evidencePath,
+  evidenceLines,
   writeEvidence,
+  useEvidenceRun,
+  wireVersionsOf,
   execInKafka1,
   compose,
   stopBroker,
@@ -520,4 +535,18 @@ module.exports = {
   waitForReassignmentToComplete,
   triggerPreferredElection,
   triggerUncleanElection,
+}
+
+// Loaded on first use, so a spec that never schedules or probes does not pay for requiring them.
+const LAZY = {
+  Gate: './schedule',
+  Schedule: './schedule',
+  interleavings: './schedule',
+  mulberry32: './schedule',
+  createResourceProbe: './resourceProbe',
+  lanes: './lane',
+  currentLane: './lane',
+}
+for (const [name, file] of Object.entries(LAZY)) {
+  Object.defineProperty(module.exports, name, { enumerable: true, get: () => require(file)[name] })
 }

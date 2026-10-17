@@ -2,7 +2,8 @@ const { spawnSync } = require('child_process')
 const fs = require('fs')
 const os = require('os')
 const path = require('path')
-const { evidencePath, writeEvidence } = require('testHelpers')
+const { evidencePath, writeEvidence, useEvidenceRun } = require('testHelpers')
+const { STAMP_FIELDS } = require('../../../testHelpers/e2eEvidence')
 const { decode } = require('../../../src/protocol/requests/apiVersions/v4/response')
 const { readSpec } = require('../../compat/parse')
 const leaderElection = require('../../../testHelpers/leaderElection')
@@ -27,8 +28,21 @@ const {
 describe('E2E tooling', () => {
   describe('evidence files', () => {
     const name = `e2e-tooling-spec-${process.pid}`
+    // Supplied here, so the unit lane needs no Docker, no Git and no environment.
+    const run = {
+      brokerVersion: '4.3.1',
+      node: 'v26.7.0',
+      tree: '0123456789abcdef0123456789abcdef01234567',
+      lane: 'docker',
+    }
+    const stamps = { ...run, wireVersions: {}, config: {} }
 
-    afterEach(() => fs.rmSync(evidencePath(name), { force: true }))
+    beforeEach(() => useEvidenceRun(run))
+
+    afterEach(() => {
+      useEvidenceRun()
+      fs.rmSync(evidencePath(name), { force: true })
+    })
 
     test('appends one JSON line per record under .tmp/e2e', () => {
       writeEvidence(name, { arm: 'tv2', overlap: 5 })
@@ -41,10 +55,32 @@ describe('E2E tooling', () => {
         .map((line) => JSON.parse(line))
 
       expect(lines).toEqual([
-        { at: expect.any(String), arm: 'tv2', overlap: 5 },
-        { at: expect.any(String), arm: 'tv1', overlap: 2 },
+        { at: expect.any(String), arm: 'tv2', overlap: 5, ...stamps },
+        { at: expect.any(String), arm: 'tv1', overlap: 2, ...stamps },
       ])
       expect(evidencePath(name)).toMatch(/\/\.tmp\/e2e\/e2e-tooling-spec-\d+\.jsonl$/)
+    })
+
+    test('stamps every line with each mandatory field, the run’s identity winning over the record’s', () => {
+      writeEvidence(name, { arm: 'tv2', tree: 'forged', lane: 'fake' })
+
+      const [line] = fs
+        .readFileSync(evidencePath(name), 'utf8')
+        .trim()
+        .split('\n')
+        .map((row) => JSON.parse(row))
+
+      expect(Object.keys(line)).toEqual(expect.arrayContaining(STAMP_FIELDS))
+      expect(line).toMatchObject({ arm: 'tv2', ...stamps })
+    })
+
+    test.each([
+      ['brokerVersion', ''],
+      ['node', undefined],
+      ['tree', ''],
+      ['lane', 'chaos'],
+    ])('refuses a run whose %s is %p, so no line is stamped with a guess', (field, value) => {
+      expect(() => useEvidenceRun({ ...run, [field]: value })).toThrow(`no valid ${field}`)
     })
 
     test.each(['../escape', 'Upper', '', 'a/b'])(

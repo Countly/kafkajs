@@ -6,7 +6,14 @@ const {
   ConfigTypes,
   AlterConfigOpTypes,
 } = require('../../../index')
-const { createTopic, plainTextBrokers, writeEvidence } = require('testHelpers')
+const {
+  createTopic,
+  plainTextBrokers,
+  writeEvidence,
+  evidenceLines,
+  wireVersionsOf,
+} = require('testHelpers')
+const { problemsOf } = require('../../../scripts/evidence/verify')
 const { waitForCondition } = require('../../consumer/__tests__/fixtures/liveScenario')
 
 // Gated: it changes cluster-wide configuration (the cluster-default broker config), so it runs
@@ -14,6 +21,8 @@ const { waitForCondition } = require('../../consumer/__tests__/fixtures/liveScen
 const describeConfigAdmin = process.env.CONFIG_ADMIN_E2E === '1' ? describe : describe.skip
 
 const EVIDENCE = 'config-admin'
+// The lines earlier runs left behind, so the last case judges only this run's.
+const linesBefore = evidenceLines(EVIDENCE).length
 // Named so each wait says how long it is prepared to be wrong for. The scenario budget is the
 // whole file, from the first case to the last; a case has its own, shorter one.
 const SCENARIO_BUDGET_MS = 90000
@@ -426,11 +435,38 @@ describeConfigAdmin('Admin > incrementalAlterConfigs and the config routing (liv
         AlterConfigs: versionsOf('AlterConfigs'),
       }
 
-      writeEvidence(EVIDENCE, { step: 'versions', negotiated })
+      writeEvidence(EVIDENCE, {
+        step: 'versions',
+        negotiated,
+        wireVersions: wireVersionsOf(requests),
+      })
       expect(negotiated).toEqual({
         IncrementalAlterConfigs: [1],
         DescribeConfigs: [4],
         AlterConfigs: [2],
+      })
+    },
+    CASE_BUDGET_MS
+  )
+
+  test(
+    'every evidence line of this run carries the stamps a verifier checks',
+    () => {
+      const lines = evidenceLines(EVIDENCE).slice(linesBefore)
+      const verified = {
+        tree: process.env.KAFKAJS_TREE || 'unfrozen',
+        node: process.version,
+        brokerVersion: process.env.KAFKA_VERSION,
+      }
+
+      expect(lines.length).toBeGreaterThan(0)
+      for (const line of lines) {
+        expect(problemsOf(line, verified)).toEqual([])
+      }
+      expect(lines.find(({ step }) => step === 'versions').wireVersions).toMatchObject({
+        IncrementalAlterConfigs: 1,
+        DescribeConfigs: 4,
+        AlterConfigs: 2,
       })
     },
     CASE_BUDGET_MS

@@ -7,7 +7,8 @@ const {
   AclPermissionTypes,
   ResourcePatternTypes,
 } = require('../../../index')
-const { plainTextBrokers, writeEvidence } = require('testHelpers')
+const { plainTextBrokers, writeEvidence, evidenceLines, wireVersionsOf } = require('testHelpers')
+const { problemsOf } = require('../../../scripts/evidence/verify')
 const { waitForCondition, withTimeout } = require('../../consumer/__tests__/fixtures/liveScenario')
 
 // Gated: it creates and deletes topics, groups and ACLs on a live cluster. Run alone:
@@ -15,6 +16,8 @@ const { waitForCondition, withTimeout } = require('../../consumer/__tests__/fixt
 const describeAdminVersions = process.env.ADMIN_VERSIONS_E2E === '1' ? describe : describe.skip
 
 const EVIDENCE = 'admin-versions'
+// The lines earlier runs left behind, so the last case judges only this run's.
+const linesBefore = evidenceLines(EVIDENCE).length
 // Named so each wait says how long it is prepared to be wrong for. The scenario budget is the
 // whole file, from the first case to the last; a case has its own, shorter one.
 const SCENARIO_BUDGET_MS = 90000
@@ -288,7 +291,11 @@ describeAdminVersions(
           ].map((apiName) => [apiName, versionsOf(apiName)])
         )
 
-        writeEvidence(EVIDENCE, { step: 'versions', negotiated })
+        writeEvidence(EVIDENCE, {
+          step: 'versions',
+          negotiated,
+          wireVersions: wireVersionsOf(requests),
+        })
         expect(negotiated).toEqual({
           CreateTopics: [7],
           DeleteTopics: [6],
@@ -298,6 +305,34 @@ describeAdminVersions(
           DescribeAcls: [3],
           CreateAcls: [3],
           DeleteAcls: [3],
+        })
+      },
+      CASE_BUDGET_MS
+    )
+
+    test(
+      'every evidence line of this run carries the stamps a verifier checks',
+      () => {
+        const lines = evidenceLines(EVIDENCE).slice(linesBefore)
+        const verified = {
+          tree: process.env.KAFKAJS_TREE || 'unfrozen',
+          node: process.version,
+          brokerVersion: process.env.KAFKA_VERSION,
+        }
+
+        expect(lines.length).toBeGreaterThan(0)
+        for (const line of lines) {
+          expect(problemsOf(line, verified)).toEqual([])
+        }
+        expect(lines.find(({ step }) => step === 'versions').wireVersions).toMatchObject({
+          CreateTopics: 7,
+          DeleteTopics: 6,
+          CreatePartitions: 3,
+          DeleteRecords: 2,
+          DeleteGroups: 2,
+          DescribeAcls: 3,
+          CreateAcls: 3,
+          DeleteAcls: 3,
         })
       },
       CASE_BUDGET_MS

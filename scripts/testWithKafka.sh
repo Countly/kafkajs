@@ -5,6 +5,7 @@ extraArgs="$2"
 
 export COMPOSE_FILE=${COMPOSE_FILE:="docker-compose.yml"}
 export KAFKAJS_DEBUG_PROTOCOL_BUFFERS=${KAFKAJS_DEBUG_PROTOCOL_BUFFERS:=1}
+export KAFKAJS_LANE=${KAFKAJS_LANE:=docker}
 
 find_container_id() {
   echo $(docker ps \
