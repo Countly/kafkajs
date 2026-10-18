@@ -236,4 +236,250 @@ module.exports = {
       partitions: [{ partition: 0, errorCode: 0, leaderEpoch: 5, endOffset: '120' }],
     },
   },
+
+  initProducerIdV5: {
+    source: 'buildInitProducerIdResponse l.750; the request is the structured vectors',
+    response: { throttleTime: 0, errorCode: 0, producerId: '1000', producerEpoch: 0 },
+    capture: {
+      source:
+        'scripts/protocol/capture.js CAPTURE_TRANSACTIONAL_ID and driveProducers (the default transaction timeout, 60000 ms); v5_*_kafka431.json, hand-transcribed using clients/src/main/resources/common/message/InitProducerId{Request,Response}.json at Kafka 4.3.1',
+      request: {
+        transactionalId: 'kafkajs-capture-txn',
+        transactionTimeout: 60000,
+        producerId: '-1',
+        producerEpoch: -1,
+      },
+      response: { throttleTime: 0, errorCode: 0, producerId: '1000', producerEpoch: 0 },
+    },
+  },
+
+  produceV11: {
+    source: 'buildProduceRequest l.414, buildProduceResponse l.449',
+    request: {
+      transactionalId: null,
+      acks: -1,
+      timeoutMs: 30000,
+      topics: [{ topic: 'test-topic', partitions: [{ partition: 0, batches: null }] }],
+    },
+    response: {
+      responses: [
+        {
+          topic: 'test-topic',
+          partitions: [
+            {
+              partition: 0,
+              errorCode: 0,
+              baseOffset: '100',
+              logAppendTime: '-1',
+              logStartOffset: '0',
+              leader: { leaderId: 2, leaderEpoch: 7 },
+            },
+          ],
+        },
+      ],
+      throttleTime: 0,
+      nodeEndpoints: [{ nodeId: 2, host: '127.0.0.1', port: 9092, rack: null }],
+    },
+    capture: {
+      source:
+        'scripts/protocol/capture.js CAPTURE_TOPIC, TOPIC_ID_SENTINEL and driveProducers (the request is not captured: it carries a record batch); v11_response_kafka431.json, hand-transcribed using clients/src/main/resources/common/message/ProduceResponse.json at Kafka 4.3.1; the broker sends no KIP-951 tagged field while leadership has not moved',
+      response: {
+        responses: [
+          {
+            topic: 'kafkajs-capture-topic',
+            partitions: [
+              {
+                partition: 0,
+                errorCode: 0,
+                baseOffset: '0',
+                logAppendTime: '-1',
+                logStartOffset: '0',
+                leader: null,
+              },
+            ],
+          },
+        ],
+        throttleTime: 0,
+        nodeEndpoints: [],
+      },
+    },
+  },
+
+  produceV12: {
+    source: 'buildProduceRequest l.414, buildProduceResponse l.449',
+    request: {
+      transactionalId: null,
+      acks: -1,
+      timeoutMs: 30000,
+      topics: [{ topic: 'test-topic', partitions: [{ partition: 0, batches: null }] }],
+    },
+    response: {
+      responses: [
+        {
+          topic: 'test-topic',
+          partitions: [
+            {
+              partition: 0,
+              errorCode: 0,
+              baseOffset: '100',
+              logAppendTime: '-1',
+              logStartOffset: '0',
+              leader: { leaderId: 2, leaderEpoch: 7 },
+            },
+          ],
+        },
+      ],
+      throttleTime: 0,
+      nodeEndpoints: [{ nodeId: 2, host: '127.0.0.1', port: 9092, rack: null }],
+    },
+  },
+
+  produceV13: {
+    source: 'buildProduceRequest l.414, buildProduceResponse l.449',
+    request: {
+      transactionalId: null,
+      acks: -1,
+      timeoutMs: 30000,
+      topics: [
+        {
+          topicId: '01020304-0506-0708-090a-0b0c0d0e0f10',
+          partitions: [{ partition: 0, batches: null }],
+        },
+      ],
+    },
+    response: {
+      responses: [
+        {
+          topicId: '01020304-0506-0708-090a-0b0c0d0e0f10',
+          partitions: [
+            {
+              partition: 0,
+              errorCode: 0,
+              baseOffset: '100',
+              logAppendTime: '-1',
+              logStartOffset: '0',
+              leader: { leaderId: 2, leaderEpoch: 7 },
+            },
+          ],
+        },
+      ],
+      throttleTime: 0,
+      nodeEndpoints: [{ nodeId: 2, host: '127.0.0.1', port: 9092, rack: null }],
+    },
+    capture: {
+      source:
+        'scripts/protocol/capture.js CAPTURE_TOPIC, TOPIC_ID_SENTINEL and driveProducers (the request is not captured: it carries a record batch); v13_response_kafka431.json, hand-transcribed using clients/src/main/resources/common/message/ProduceResponse.json at Kafka 4.3.1; the broker sends no KIP-951 tagged field while leadership has not moved',
+      response: {
+        responses: [
+          {
+            topicId: '01020304-0506-0708-090a-0b0c0d0e0f10',
+            partitions: [
+              {
+                partition: 0,
+                errorCode: 0,
+                baseOffset: '0',
+                logAppendTime: '-1',
+                logStartOffset: '0',
+                leader: null,
+              },
+            ],
+          },
+        ],
+        throttleTime: 0,
+        nodeEndpoints: [],
+      },
+    },
+  },
+
+  /**
+   * Hand-computed goldens: the Java Produce vectors carry a null `Records` field and a null
+   * `TransactionalId`, so the batch header and a populated transactional id have no Java bytes.
+   * Each hex literal below was assembled from the documented layout with plain `Buffer` calls
+   * (never with a codec of this repository) and is written out here; the fields beside it are the
+   * same values tabulated by hand.
+   * @see https://kafka.apache.org/documentation/#recordbatch
+   */
+  recordBatchHeaderV2: {
+    source: 'the RecordBatch v2 layout, 61 header bytes, no records',
+    hex:
+      '0000000000000000' + // base offset 0
+      '00000031' + // batch length 49: the bytes after this field
+      'ffffffff' + // partition leader epoch -1
+      '02' + // magic 2
+      '00000000' + // crc, not computed
+      '0010' + // attributes: transactional
+      '00000001' + // last offset delta 1
+      '0000018bcfe56800' + // base timestamp
+      '0000018bcfe56801' + // max timestamp
+      '00000000000003e8' + // producer id 1000
+      '0003' + // producer epoch 3
+      '00000007' + // base sequence 7
+      '00000002', // record count 2
+    fields: {
+      producerId: '1000',
+      producerEpoch: 3,
+      baseSequence: 7,
+      recordCount: 2,
+      transactional: true,
+      control: false,
+      digest: '6a5c2f88f9c1afc1f66e6a138b97faa92363d895',
+    },
+  },
+
+  produceRequestTransactionalV11: {
+    source: 'the Produce v11 request layout around recordBatchHeaderV2, transactional id "tx-1"',
+    hex:
+      '05' +
+      '74782d31' + // transactional id "tx-1"
+      'ffff' + // acks -1
+      '00007530' + // timeout 30000
+      '02' + // one topic
+      '0b' +
+      '746573742d746f706963' + // "test-topic"
+      '02' + // one partition
+      '00000000' + // partition index 0
+      '3e' + // records: 61 bytes
+      '0000000000000000' +
+      '00000031' +
+      'ffffffff' +
+      '02' +
+      '00000000' +
+      '0010' +
+      '00000001' +
+      '0000018bcfe56800' +
+      '0000018bcfe56801' +
+      '00000000000003e8' +
+      '0003' +
+      '00000007' +
+      '00000002' +
+      '00' +
+      '00' +
+      '00', // partition, topic and request tags
+    fields: {
+      transactionalId: 'tx-1',
+      acks: -1,
+      timeoutMs: 30000,
+      topics: [
+        {
+          topic: 'test-topic',
+          partitions: [
+            {
+              partition: 0,
+              batches: [
+                {
+                  producerId: '1000',
+                  producerEpoch: 3,
+                  baseSequence: 7,
+                  recordCount: 2,
+                  transactional: true,
+                  control: false,
+                  digest: '6a5c2f88f9c1afc1f66e6a138b97faa92363d895',
+                },
+              ],
+            },
+          ],
+        },
+      ],
+    },
+  },
 }

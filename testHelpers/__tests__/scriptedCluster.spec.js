@@ -1,10 +1,16 @@
 const { Kafka } = require('../../index')
 const Encoder = require('../../src/protocol/encoder')
 const apiKeys = require('../../src/protocol/requests/apiKeys')
-const { createScriptedCluster, groupScript, PROFILES } = require('../scriptedCluster')
+const {
+  createScriptedCluster,
+  groupScript,
+  producerScript,
+  PROFILES,
+} = require('../scriptedCluster')
 const { Schedule } = require('../schedule')
 const metadataV13 = require('../wire/metadataV13')
 const { metadataV13: literal } = require('../wire/expected')
+const apiVersionsV4 = require('../wire/apiVersionsV4')
 const {
   prepareRecordBatches,
   TOPIC,
@@ -931,6 +937,350 @@ describe('ScriptedCluster', () => {
       await settle()
 
       expect(frames).toHaveLength(0)
+      cluster.assertClean()
+    })
+  })
+
+  describe('a producer through the real client', () => {
+    const TRANSACTION_APIS = ['AddPartitionsToTxn', 'AddOffsetsToTxn', 'TxnOffsetCommit', 'EndTxn']
+    const versionsOf = (cluster, apis) =>
+      Object.fromEntries(
+        cluster
+          .requests()
+          .filter(({ api }) => apis.includes(api))
+          .map(({ api, version }) => [api, version])
+      )
+
+    /** One transaction with a record, the offsets of a group, and a commit. */
+    const runTransaction = async (cluster, { commit = true } = {}) => {
+      const producer = track(
+        clientOf(cluster, {
+          retry: { retries: 1, initialRetryTime: 10, maxRetryTime: 20 },
+        }).producer({
+          transactionalId: 'tx-1',
+          maxInFlightRequests: 1,
+        })
+      )
+      await producer.connect()
+      const transaction = await producer.transaction()
+      await transaction.send({ topic: TOPIC, messages: [{ value: 'a' }, { value: 'b' }] })
+      await transaction.sendOffsets({
+        consumerGroupId: 'g',
+        topics: [{ topic: TOPIC, partitions: [{ partition: 0, offset: '5' }] }],
+      })
+      if (commit) {
+        await transaction.commit()
+      }
+    }
+
+    test('an idempotent producer sends InitProducerId v5 and Produce v13 in the default profile', async () => {
+      const cluster = producerScript(createScriptedCluster({ nodes: NODES }))
+      const producer = track(clientOf(cluster).producer())
+
+      await producer.connect()
+      await producer.send({ topic: TOPIC, messages: [{ value: 'a' }, { value: 'b' }] })
+
+      const init = cluster.requests().find(({ api }) => api === 'InitProducerId')
+      const produced = cluster.requests().find(({ api }) => api === 'Produce')
+      expect(init).toMatchObject({
+        version: 5,
+        fields: { transactionalId: null, producerId: '-1' },
+      })
+      expect(produced).toMatchObject({ version: 13 })
+      expect(produced.fields).toMatchObject({
+        transactionalId: null,
+        acks: -1,
+        topics: [
+          {
+            topicId: TOPIC_ID,
+            partitions: [
+              {
+                partition: 0,
+                batches: [
+                  {
+                    producerId: '1000',
+                    producerEpoch: 0,
+                    baseSequence: 0,
+                    recordCount: 2,
+                    transactional: false,
+                  },
+                ],
+              },
+            ],
+          },
+        ],
+      })
+      cluster.assertClean()
+    })
+
+    test('a transaction under tv1 sends InitProducerId v5, AddPartitionsToTxn v3, AddOffsetsToTxn v4, Produce v11, TxnOffsetCommit v4 and EndTxn v4', async () => {
+      const cluster = producerScript(createScriptedCluster({ nodes: NODES, profile: 'tv1' }))
+
+      await runTransaction(cluster)
+
+      expect(versionsOf(cluster, ['InitProducerId', 'Produce', ...TRANSACTION_APIS])).toEqual({
+        InitProducerId: 5,
+        AddPartitionsToTxn: 3,
+        AddOffsetsToTxn: 4,
+        Produce: 11,
+        TxnOffsetCommit: 4,
+        EndTxn: 4,
+      })
+      cluster.assertClean()
+    })
+
+    test('a transaction under tv2 sends InitProducerId v5, Produce v12, TxnOffsetCommit v5 and EndTxn v5 and neither AddPartitionsToTxn nor AddOffsetsToTxn', async () => {
+      const cluster = producerScript(createScriptedCluster({ nodes: NODES, profile: 'tv2' }))
+
+      await runTransaction(cluster)
+
+      expect(versionsOf(cluster, ['InitProducerId', 'Produce', ...TRANSACTION_APIS])).toEqual({
+        InitProducerId: 5,
+        Produce: 12,
+        TxnOffsetCommit: 5,
+        EndTxn: 5,
+      })
+      expect(names(cluster)).not.toContain('AddPartitionsToTxn')
+      expect(names(cluster)).not.toContain('AddOffsetsToTxn')
+      cluster.assertClean()
+    })
+
+    test.each(['tv1', 'tv2'])(
+      'every request is at the one version its %s pair advertises',
+      async (profile) => {
+        const cluster = producerScript(createScriptedCluster({ nodes: NODES, profile }))
+
+        await runTransaction(cluster)
+
+        const advertised = Object.fromEntries(PROFILES[profile])
+        for (const { api, version } of cluster.requests()) {
+          expect([api, version]).toEqual([api, advertised[api]])
+        }
+        cluster.assertClean()
+      }
+    )
+
+    test.each(['tv1', 'tv2'])(
+      'the transaction requests of %s carry the producer identity and the transaction fields the client chose',
+      async (profile) => {
+        const cluster = producerScript(createScriptedCluster({ nodes: NODES, profile }))
+
+        await runTransaction(cluster)
+
+        const identity = { transactionalId: 'tx-1', producerId: '1000', producerEpoch: 0 }
+        const of = (api) => cluster.requests().find((request) => request.api === api).fields
+        expect(of('Produce')).toMatchObject({
+          transactionalId: 'tx-1',
+          topics: [
+            {
+              topic: TOPIC,
+              partitions: [
+                {
+                  partition: 0,
+                  batches: [
+                    {
+                      producerId: '1000',
+                      producerEpoch: 0,
+                      baseSequence: 0,
+                      recordCount: 2,
+                      transactional: true,
+                    },
+                  ],
+                },
+              ],
+            },
+          ],
+        })
+        expect(of('TxnOffsetCommit')).toMatchObject({
+          ...identity,
+          groupId: 'g',
+          topics: [{ topic: TOPIC, partitions: [{ partition: 0, offset: '5' }] }],
+        })
+        expect(of('EndTxn')).toMatchObject({ ...identity, transactionResult: true })
+        if (profile === 'tv1') {
+          expect(of('AddPartitionsToTxn')).toMatchObject({
+            ...identity,
+            topics: [{ topic: TOPIC, partitions: [0] }],
+          })
+          expect(of('AddOffsetsToTxn')).toMatchObject({ ...identity, groupId: 'g' })
+        }
+        cluster.assertClean()
+      }
+    )
+
+    test.each([
+      ['tv1', 'Produce', { Produce: [13, 13] }],
+      ['tv1', 'EndTxn', { EndTxn: [5, 5] }],
+      ['tv1', 'TxnOffsetCommit', { TxnOffsetCommit: [5, 5] }],
+      ['tv2', 'Produce', { Produce: [13, 13] }],
+    ])(
+      'under %s the client keeps its own %s cap: nothing is sent to a broker that offers only %j',
+      async (profile, api, advertise) => {
+        const cluster = producerScript(createScriptedCluster({ nodes: NODES, profile, advertise }))
+
+        await expect(runTransaction(cluster)).rejects.toThrow(
+          `does not support any version of ${api}`
+        )
+
+        expect(names(cluster)).not.toContain(api)
+        expect(cluster.failures()).toEqual([])
+      }
+    )
+
+    test('tv2 finalizes transaction.version at level 2 in its ApiVersions answer, and tv1 does not', () => {
+      const answerOf = (profile) =>
+        apiVersionsV4.buildResponse(
+          createScriptedCluster({ nodes: NODES, profile }).apiVersionsAnswer()
+        )
+      const level2 = Buffer.from('transaction.version').toString('hex') + '0002' + '0002'
+
+      expect(answerOf('tv2').toString('hex')).toContain(level2)
+      expect(answerOf('tv1').toString('hex')).not.toContain(
+        Buffer.from('transaction.version').toString('hex')
+      )
+      expect(answerOf('default').toString('hex')).not.toContain(
+        Buffer.from('transaction.version').toString('hex')
+      )
+    })
+
+    test('the transaction profiles advertise exactly the pairs the client’s caps allow under each transaction version', () => {
+      const classic = PROFILES.default.filter(
+        ([api]) => api !== 'InitProducerId' && api !== 'Produce'
+      )
+      const transactional = (profile) =>
+        PROFILES[profile].filter(([api]) => !classic.some(([name]) => name === api))
+
+      expect(transactional('tv1')).toEqual([
+        ['InitProducerId', 5],
+        ['AddPartitionsToTxn', 3],
+        ['AddOffsetsToTxn', 4],
+        ['Produce', 11],
+        ['TxnOffsetCommit', 4],
+        ['EndTxn', 4],
+      ])
+      expect(transactional('tv2')).toEqual([
+        ['InitProducerId', 5],
+        ['Produce', 12],
+        ['TxnOffsetCommit', 5],
+        ['EndTxn', 5],
+      ])
+      expect(PROFILES.default).toEqual(
+        expect.arrayContaining([
+          ['InitProducerId', 5],
+          ['Produce', 13],
+        ])
+      )
+      for (const profile of ['tv1', 'tv2']) {
+        expect(PROFILES[profile].filter(([api]) => classic.some(([name]) => name === api))).toEqual(
+          classic
+        )
+      }
+    })
+
+    describe('what producerScript answers, from the request that asks', () => {
+      const answerOf = (api, fields) =>
+        producerScript(createScriptedCluster({ nodes: NODES })).answerers.get(api)(fields)
+
+      test('answers a Produce for the topic names and partitions it carries, with no leader or endpoint', () => {
+        expect(
+          answerOf('Produce', {
+            topics: [{ topic: 'a', partitions: [{ partition: 3 }, { partition: 4 }] }],
+          })
+        ).toEqual({
+          responses: [
+            {
+              topic: 'a',
+              partitions: [3, 4].map((partition) => ({
+                partition,
+                errorCode: 0,
+                baseOffset: '0',
+                logAppendTime: '-1',
+                logStartOffset: '0',
+                leader: null,
+              })),
+            },
+          ],
+          nodeEndpoints: [],
+        })
+      })
+
+      test('answers a Produce keyed by topic id with the id, not a name', () => {
+        const { responses } = answerOf('Produce', {
+          topics: [{ topicId: 'id-1', partitions: [{ partition: 0 }] }],
+        })
+
+        expect(responses).toEqual([
+          { topicId: 'id-1', partitions: [expect.objectContaining({ partition: 0 })] },
+        ])
+      })
+
+      test('answers AddPartitionsToTxn and TxnOffsetCommit for the partitions they carry', () => {
+        expect(
+          answerOf('AddPartitionsToTxn', { topics: [{ topic: 'a', partitions: [2, 5] }] })
+        ).toEqual({
+          errors: [
+            {
+              topic: 'a',
+              partitionErrors: [
+                { partition: 2, errorCode: 0 },
+                { partition: 5, errorCode: 0 },
+              ],
+            },
+          ],
+        })
+        expect(
+          answerOf('TxnOffsetCommit', { topics: [{ topic: 'a', partitions: [{ partition: 7 }] }] })
+        ).toEqual({ topics: [{ topic: 'a', partitions: [{ partition: 7, errorCode: 0 }] }] })
+      })
+    })
+
+    test('marks the order of an event that is not a request among the requests and answers', async () => {
+      const cluster = createScriptedCluster({ nodes: NODES })
+      const admin = track(clientOf(cluster).admin())
+      await admin.connect()
+
+      cluster.mark('between')
+      await admin.listTopics()
+
+      const kinds = cluster.timeline().map(({ kind, api, label }) => [kind, api ?? label])
+      expect(kinds.slice(0, 3)).toEqual([
+        ['request', 'ApiVersions'],
+        ['response', 'ApiVersions'],
+        ['mark', 'between'],
+      ])
+      expect(cluster.timeline().map(({ order }) => order)).toEqual(
+        [...cluster.timeline().map(({ order }) => order)].sort((a, b) => a - b)
+      )
+      expect(cluster.requests().every(({ order, answeredOrder }) => answeredOrder > order)).toBe(
+        true
+      )
+      cluster.assertClean()
+    })
+
+    test('lists a request that is held as a request with no response yet, and its response once released', async () => {
+      const cluster = createScriptedCluster({ nodes: NODES })
+      const gate = cluster.schedule.hold({ api: 'ApiVersions' })
+      const admin = track(clientOf(cluster).admin())
+      const connecting = admin.connect()
+      await within(gate.arrived(), 5000, 'the ApiVersions request')
+
+      expect(cluster.timeline().map(({ kind, api }) => [kind, api])).toEqual([
+        ['request', 'ApiVersions'],
+      ])
+      expect(cluster.requests()[0].answeredOrder).toBeUndefined()
+
+      gate.release()
+      await connecting
+
+      expect(
+        cluster
+          .timeline()
+          .map(({ kind, api }) => [kind, api])
+          .slice(0, 2)
+      ).toEqual([
+        ['request', 'ApiVersions'],
+        ['response', 'ApiVersions'],
+      ])
       cluster.assertClean()
     })
   })

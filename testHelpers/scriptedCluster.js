@@ -26,21 +26,53 @@ const CLASSIC = [
   ['OffsetCommit', 9],
 ]
 
+/** The pairs an idempotent or non-transactional producer adds to the classic base. */
+const PRODUCER = [
+  ['InitProducerId', 5],
+  ['Produce', 13],
+]
+
+const DEFAULT = [...CLASSIC, ...PRODUCER]
+
 /**
  * What each scenario profile advertises. A pair whose wire file does not exist yet is still
- * advertised, and the request for it is refused by name.
- * @type {Record<'default'|'sasl'|'consumer', Array<[string, number]>>}
+ * advertised, and the request for it is refused by name. The two transaction profiles carry the
+ * classic base beside their transaction pairs, and each advertises exactly the versions the
+ * client's own caps allow under that transaction version: a transactional Produce, EndTxn and
+ * TxnOffsetCommit at v11, v4 and v4 under transaction version 1, and at v12, v5 and v5 under 2,
+ * which also sends no AddPartitionsToTxn and no AddOffsetsToTxn.
+ * @type {Record<'default'|'sasl'|'consumer'|'tv1'|'tv2', Array<[string, number]>>}
  */
 const PROFILES = {
-  default: CLASSIC,
-  sasl: [...CLASSIC, ['SaslHandshake', 1], ['SaslAuthenticate', 2]],
+  default: DEFAULT,
+  sasl: [...DEFAULT, ['SaslHandshake', 1], ['SaslAuthenticate', 2]],
   consumer: [
-    ...CLASSIC.filter(([api]) => api !== 'OffsetFetch' && api !== 'OffsetCommit'),
+    ...DEFAULT.filter(([api]) => api !== 'OffsetFetch' && api !== 'OffsetCommit'),
     ['OffsetFetch', 10],
     ['OffsetCommit', 10],
     ['ConsumerGroupHeartbeat', 1],
   ],
+  tv1: [
+    ...CLASSIC,
+    ['InitProducerId', 5],
+    ['AddPartitionsToTxn', 3],
+    ['AddOffsetsToTxn', 4],
+    ['Produce', 11],
+    ['TxnOffsetCommit', 4],
+    ['EndTxn', 4],
+  ],
+  tv2: [...CLASSIC, ['InitProducerId', 5], ['Produce', 12], ['TxnOffsetCommit', 5], ['EndTxn', 5]],
 }
+
+/**
+ * The finalized features a transaction coordinator on transaction version 2 reports: it finalizes
+ * `transaction.version` at level 2, which a broker writes with equal minimum and maximum, beside
+ * the `metadata.version` every answer carries.
+ */
+const TRANSACTION_V2_FEATURES = [
+  { name: 'metadata.version', minVersionLevel: 1, maxVersionLevel: 25 },
+  { name: 'transaction.version', minVersionLevel: 2, maxVersionLevel: 2 },
+]
 
 /**
  * One request the client wrote, as `requests()` logs it and a `Schedule` sees it.
@@ -52,6 +84,8 @@ const PROFILES = {
  * @property {number} correlationId
  * @property {number} generation which connection of the node it came in on, counting from 1
  * @property {object|null} fields what the wire pair read from it; null when it could not be read
+ * @property {number} order where it was written among the requests, answers and marks of the cluster
+ * @property {number} [answeredOrder] where its answer was written, once it was
  */
 
 /**
@@ -186,6 +220,8 @@ class ScriptedCluster {
     this.profile = profile
     this.fake = createFakeSocketFactory()
     this.log = []
+    this.marks = []
+    this.clock = 0
     this.errors = []
     this.answerers = new Map()
     this.downNodes = new Set()
@@ -251,6 +287,18 @@ class ScriptedCluster {
     }))
   }
 
+  /**
+   * @returns {{ apiKeys: Array<{ apiKey: number, minVersion: number, maxVersion: number }>,
+   *   finalizedFeatures?: Array<{ name: string, minVersionLevel: number, maxVersionLevel: number }> }}
+   *   the fields the ApiVersions answer is built from: the table, and under `tv2` the finalized
+   *   `transaction.version` at level 2, which is what makes a client choose transaction version 2
+   */
+  apiVersionsAnswer() {
+    return this.profile === 'tv2'
+      ? { apiKeys: this.apiVersionsTable(), finalizedFeatures: TRANSACTION_V2_FEATURES }
+      : { apiKeys: this.apiVersionsTable() }
+  }
+
   /** @returns {import('events').EventEmitter[]} every socket the client opened, oldest first */
   sockets() {
     return [...this.fake.state.sockets]
@@ -259,6 +307,42 @@ class ScriptedCluster {
   /** @returns {RequestRecord[]} every request the client wrote, oldest first */
   requests() {
     return [...this.log]
+  }
+
+  /**
+   * Notes that something outside the wire happened now, so a test can place it among the requests
+   * and answers (the shared offset cache being written, for one).
+   * @param {string} label
+   * @returns {void}
+   */
+  mark(label) {
+    this.marks.push({ order: this.clock++, label })
+  }
+
+  /**
+   * Every request written, every answer given and every mark, in the order they happened.
+   * @returns {Array<{ order: number, kind: 'request'|'response'|'mark', api?: string, version?:
+   *   number, node?: number, correlationId?: number, generation?: number, label?: string }>}
+   */
+  timeline() {
+    const events = this.marks.map(({ order, label }) => ({ order, kind: 'mark', label }))
+    for (const { order, answeredOrder, api, version, node, correlationId, generation } of this
+      .log) {
+      events.push({ order, kind: 'request', api, version, node, correlationId, generation })
+      if (answeredOrder !== undefined) {
+        events.push({
+          order: answeredOrder,
+          kind: 'response',
+          api,
+          version,
+          node,
+          correlationId,
+          generation,
+        })
+      }
+    }
+
+    return events.sort((a, b) => a.order - b.order)
   }
 
   /** @returns {Error[]} what went wrong in the cluster itself, such as a request with no wire pair */
@@ -355,6 +439,7 @@ class ScriptedCluster {
       correlationId: header.correlationId,
       generation,
       fields: null,
+      order: this.clock++,
     }
     this.log.push(record)
 
@@ -421,6 +506,7 @@ class ScriptedCluster {
           setImmediate(() => {
             if (!socket.destroyed) {
               const body = Buffer.isBuffer(answer) ? answer : pair.buildResponse(answer)
+              record.answeredOrder = this.clock++
               respondWithFrame(
                 { socket },
                 record.correlationId,
@@ -451,7 +537,7 @@ class ScriptedCluster {
 
     switch (pair.api) {
       case 'ApiVersions':
-        return { apiKeys: this.apiVersionsTable() }
+        return this.apiVersionsAnswer()
       case 'Metadata':
         return {
           brokers: this.nodes.map(({ id, host, port }) => ({ nodeId: id, host, port, rack: null })),
@@ -485,6 +571,40 @@ class ScriptedCluster {
     this.errors.push(error)
     socket.destroy(error)
   }
+}
+
+/**
+ * Answers Metadata with one topic led by the first node, the way every script of this file does.
+ * @param {ScriptedCluster} cluster
+ * @param {{ topic: string, partitions: number }} options
+ * @returns {ScriptedCluster} the cluster
+ */
+const answerMetadata = (cluster, { topic, partitions }) => {
+  const [leader] = cluster.nodes
+  const partitionIds = Array.from({ length: partitions }, (_, partition) => partition)
+
+  return cluster.answer('Metadata', () => ({
+    brokers: cluster.nodes.map(({ id, host, port }) => ({ nodeId: id, host, port, rack: null })),
+    controllerId: leader.id,
+    topics: [
+      {
+        errorCode: 0,
+        name: topic,
+        topicId: TOPIC_ID,
+        isInternal: false,
+        topicAuthorizedOperations: -2147483648,
+        partitions: partitionIds.map((partitionIndex) => ({
+          errorCode: 0,
+          partitionIndex,
+          leaderId: leader.id,
+          leaderEpoch: 5,
+          replicas: [leader.id],
+          isr: [leader.id],
+          offlineReplicas: [],
+        })),
+      },
+    ],
+  }))
 }
 
 /**
@@ -530,29 +650,7 @@ const groupScript = (
   const partitionIds = Array.from({ length: partitions }, (_, partition) => partition)
   let fetches = 0
 
-  return cluster
-    .answer('Metadata', () => ({
-      brokers: cluster.nodes.map(({ id, host, port }) => ({ nodeId: id, host, port, rack: null })),
-      controllerId: leader.id,
-      topics: [
-        {
-          errorCode: 0,
-          name: topic,
-          topicId: TOPIC_ID,
-          isInternal: false,
-          topicAuthorizedOperations: -2147483648,
-          partitions: partitionIds.map((partitionIndex) => ({
-            errorCode: 0,
-            partitionIndex,
-            leaderId: leader.id,
-            leaderEpoch: 5,
-            replicas: [leader.id],
-            isr: [leader.id],
-            offlineReplicas: [],
-          })),
-        },
-      ],
-    }))
+  return answerMetadata(cluster, { topic, partitions })
     .answer('FindCoordinator', ({ coordinatorKeys }) => ({
       coordinators: coordinatorKeys.map((key) => ({
         key,
@@ -629,9 +727,52 @@ const groupScript = (
 }
 
 /**
+ * Scripts the answers one producer needs, all fixed, so that an idempotent producer (the `default`
+ * profile) and a transactional one (`tv1`, `tv2`) can run their whole path: Metadata lists the
+ * topic, a Produce, an AddPartitionsToTxn and a TxnOffsetCommit answer for exactly the partitions
+ * the request names with no error, and InitProducerId, AddOffsetsToTxn and EndTxn answer as the
+ * wire pair's defaults do. The Produce answers carry no log state: every base offset is `0`, and no
+ * leader or node endpoint is sent, as a broker sends none while leadership has not moved.
+ * A test that needs another outcome overrides one answer with `answer` or the schedule.
+ * @param {ScriptedCluster} cluster
+ * @param {object} [options]
+ * @param {string} [options.topic] the fetch harness's `test-topic`
+ * @param {number} [options.partitions=1]
+ * @returns {ScriptedCluster} the cluster
+ */
+const producerScript = (cluster, { topic = TOPIC, partitions = 1 } = {}) =>
+  answerMetadata(cluster, { topic, partitions })
+    .answer('Produce', ({ topics }) => ({
+      responses: topics.map(({ partitions: entries, ...key }) => ({
+        ...key,
+        partitions: entries.map(({ partition }) => ({
+          partition,
+          errorCode: 0,
+          baseOffset: '0',
+          logAppendTime: '-1',
+          logStartOffset: '0',
+          leader: null,
+        })),
+      })),
+      nodeEndpoints: [],
+    }))
+    .answer('AddPartitionsToTxn', ({ topics }) => ({
+      errors: topics.map((entry) => ({
+        topic: entry.topic,
+        partitionErrors: entry.partitions.map((partition) => ({ partition, errorCode: 0 })),
+      })),
+    }))
+    .answer('TxnOffsetCommit', ({ topics }) => ({
+      topics: topics.map((entry) => ({
+        topic: entry.topic,
+        partitions: entry.partitions.map(({ partition }) => ({ partition, errorCode: 0 })),
+      })),
+    }))
+
+/**
  * @param {ConstructorParameters<typeof ScriptedCluster>[0]} options
  * @returns {ScriptedCluster}
  */
 const createScriptedCluster = (options) => new ScriptedCluster(options)
 
-module.exports = { createScriptedCluster, ScriptedCluster, groupScript, PROFILES }
+module.exports = { createScriptedCluster, ScriptedCluster, groupScript, producerScript, PROFILES }

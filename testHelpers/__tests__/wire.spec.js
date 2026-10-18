@@ -37,6 +37,12 @@ const STRUCTURED = [
   ['leaveGroupV5', 'leaveGroup', 'LeaveGroup', 5],
   ['offsetFetchV9', 'offsetFetch', 'OffsetFetch', 9],
   ['offsetCommitV9', 'offsetCommit', 'OffsetCommit', 9],
+  ['addPartitionsToTxnV3', 'addPartitionsToTxn', 'AddPartitionsToTxn', 3],
+  ['addOffsetsToTxnV4', 'addOffsetsToTxn', 'AddOffsetsToTxn', 4],
+  ['txnOffsetCommitV4', 'txnOffsetCommit', 'TxnOffsetCommit', 4],
+  ['txnOffsetCommitV5', 'txnOffsetCommit', 'TxnOffsetCommit', 5],
+  ['endTxnV4', 'endTxn', 'EndTxn', 4],
+  ['endTxnV5', 'endTxn', 'EndTxn', 5],
 ]
 
 const BYTES_ONLY = [
@@ -46,6 +52,9 @@ const BYTES_ONLY = [
   ['listOffsetsV9', 'listOffsets', 'v9'],
   ['fetchV18', 'fetch', 'v18'],
   ['offsetForLeaderEpochV4', 'offsetForLeaderEpoch', 'v4'],
+  ['produceV11', 'produce', 'v11'],
+  ['produceV12', 'produce', 'v12'],
+  ['produceV13', 'produce', 'v13'],
 ]
 
 describe('wire pairs checked against structured Java vectors', () => {
@@ -70,7 +79,7 @@ describe('wire pairs checked against structured Java vectors', () => {
 
     test('builds the bytes of the first response vector, unvaried', () => {
       expect(pair.buildResponse().toString('hex')).toBe(
-        responses.find(([caseName]) => caseName === 'ok' || caseName === 'basic')[1].hex
+        responses.find(([caseName]) => ['ok', 'basic', 'defaults'].includes(caseName))[1].hex
       )
     })
 
@@ -346,6 +355,146 @@ const VARIED = [
     { topics: [{ topic: 't3', partitions: [{ partition: 5, errorCode: 22 }] }] },
     { responses: [{ topic: 't3', partitions: [{ partition: 5, errorCode: 22 }] }] },
   ],
+  [
+    'initProducerIdV5',
+    'initProducerId/v5/response',
+    { errorCode: 53, producerId: '77', producerEpoch: 4, throttleTime: 3 },
+    { errorCode: 53, producerId: '77', producerEpoch: 4, clientSideThrottleTime: 3 },
+  ],
+  [
+    'produceV11',
+    'produce/v11/response',
+    {
+      responses: [
+        {
+          topic: 't4',
+          partitions: [
+            {
+              partition: 2,
+              errorCode: 6,
+              baseOffset: '9',
+              logAppendTime: '-1',
+              logStartOffset: '1',
+              leader: { leaderId: 4, leaderEpoch: 8 },
+            },
+          ],
+        },
+      ],
+    },
+    {
+      topics: [
+        {
+          topicName: 't4',
+          partitions: [
+            {
+              partition: 2,
+              errorCode: 6,
+              baseOffset: '9',
+              currentLeader: { leaderId: 4, leaderEpoch: 8 },
+            },
+          ],
+        },
+      ],
+    },
+  ],
+  [
+    'produceV12',
+    'produce/v12/response',
+    {
+      responses: [
+        {
+          topic: 't4',
+          partitions: [
+            {
+              partition: 2,
+              errorCode: 6,
+              baseOffset: '9',
+              logAppendTime: '-1',
+              logStartOffset: '1',
+              leader: { leaderId: 4, leaderEpoch: 8 },
+            },
+          ],
+        },
+      ],
+    },
+    {
+      topics: [
+        {
+          topicName: 't4',
+          partitions: [
+            {
+              partition: 2,
+              errorCode: 6,
+              baseOffset: '9',
+              currentLeader: { leaderId: 4, leaderEpoch: 8 },
+            },
+          ],
+        },
+      ],
+    },
+  ],
+  [
+    'produceV13',
+    'produce/v13/response',
+    {
+      responses: [
+        {
+          topicId: '0a0b0c0d-0e0f-1011-1213-141516171819',
+          partitions: [
+            {
+              partition: 2,
+              errorCode: 6,
+              baseOffset: '9',
+              logAppendTime: '-1',
+              logStartOffset: '1',
+              leader: { leaderId: 4, leaderEpoch: 8 },
+            },
+          ],
+        },
+      ],
+    },
+    {
+      topics: [
+        {
+          topicId: '0a0b0c0d-0e0f-1011-1213-141516171819',
+          partitions: [
+            {
+              partition: 2,
+              errorCode: 6,
+              baseOffset: '9',
+              currentLeader: { leaderId: 4, leaderEpoch: 8 },
+            },
+          ],
+        },
+      ],
+    },
+  ],
+  [
+    'addPartitionsToTxnV3',
+    'addPartitionsToTxn/v3/response',
+    { errors: [{ topic: 't5', partitionErrors: [{ partition: 4, errorCode: 48 }] }] },
+    { errors: [{ topic: 't5', partitionErrors: [{ partition: 4, errorCode: 48 }] }] },
+  ],
+  ['addOffsetsToTxnV4', 'addOffsetsToTxn/v4/response', { errorCode: 49 }, { errorCode: 49 }],
+  [
+    'txnOffsetCommitV4',
+    'txnOffsetCommit/v4/response',
+    { topics: [{ topic: 't6', partitions: [{ partition: 7, errorCode: 22 }] }] },
+    { topics: [{ topic: 't6', partitions: [{ partition: 7, errorCode: 22 }] }] },
+  ],
+  [
+    'txnOffsetCommitV5',
+    'txnOffsetCommit/v5/response',
+    { topics: [{ topic: 't6', partitions: [{ partition: 7, errorCode: 22 }] }] },
+    { topics: [{ topic: 't6', partitions: [{ partition: 7, errorCode: 22 }] }] },
+  ],
+  ['endTxnV4', 'endTxn/v4/response', { errorCode: 48 }, { errorCode: 48 }],
+  [
+    'endTxnV5',
+    'endTxn/v5/response',
+    { errorCode: 0, producerId: '2000', producerEpoch: 6 },
+    { errorCode: 0, producerId: '2000', producerEpoch: 6 },
+  ],
 ]
 
 describe('builders agree with the client’s decoder on fields the vectors do not hold', () => {
@@ -354,6 +503,141 @@ describe('builders agree with the client’s decoder on fields the vectors do no
 
     expect(await decode(require(`../wire/${name}`).buildResponse(fields))).toMatchObject(decoded)
   })
+})
+
+describe('InitProducerId v5: a bytes-only response and structured requests', () => {
+  const pair = require('../wire/initProducerIdV5')
+  const response = bytesOf(load('initProducerId/fixtures/v5_response_java.json'))
+  const requests = structured('initProducerId', 5, 'Request')
+
+  test('names its API, its version and the generator constructor its fields come from', () => {
+    expect(pair).toMatchObject({ api: 'InitProducerId', version: 5 })
+    expect(expected.initProducerIdV5.source).toMatch(/^buildInitProducerIdResponse l\.\d+/)
+    expect(requests.map(([caseName]) => caseName)).toEqual([
+      'firstInit',
+      'nullTransactionalId',
+      'reinit',
+    ])
+  })
+
+  test('builds the bytes of Java’s response, unvaried and from the literal fields', () => {
+    expect(pair.buildResponse().toString('hex')).toBe(response.toString('hex'))
+    expect(pair.buildResponse(expected.initProducerIdV5.response).toString('hex')).toBe(
+      response.toString('hex')
+    )
+  })
+
+  test.each(requests)('reads the fields of Java’s %s request', (_case, vector) => {
+    expect(pair.readRequest(bytesOf(vector))).toMatchObject(vector.fields)
+  })
+
+  test.each(requests)(
+    'refuses Java’s %s request with a byte after its tag buffer',
+    (_case, vector) => {
+      const bytes = Buffer.concat([bytesOf(vector), Buffer.from([0xff])])
+
+      expect(() => pair.readRequest(bytes)).toThrow('its tag buffer')
+    }
+  )
+
+  test.each(requests)('refuses Java’s %s request cut short by a byte', (_case, vector) => {
+    expect(() => pair.readRequest(bytesOf(vector).subarray(0, -1))).toThrow()
+  })
+})
+
+/**
+ * The Produce request framing around record batches. Java's vectors have a null `Records` field,
+ * so the batch header and a populated transactional id are read from the hand-computed goldens of
+ * `expected`, whose fields were tabulated by hand, never decoded.
+ */
+describe('Produce readers against the hand-computed goldens', () => {
+  const { readBatches } = require('../wire/produceLayout')
+  const header = Buffer.from(expected.recordBatchHeaderV2.hex, 'hex')
+  const withAttributes = (attributes) => {
+    const copy = Buffer.from(header)
+    copy.writeInt16BE(attributes, 21)
+    return copy
+  }
+
+  test('the header golden is the 61 bytes of the layout, with the length field naming the rest', () => {
+    expect(header.length).toBe(61)
+    expect(header.readInt32BE(8)).toBe(header.length - 12)
+  })
+
+  test('reads the producer id, epoch, base sequence, count and flags of the header golden', () => {
+    expect(readBatches(header)).toEqual([expected.recordBatchHeaderV2.fields])
+  })
+
+  test('tells an idempotent batch, a transactional one and a control batch apart by the attributes', () => {
+    expect(readBatches(withAttributes(0x0000))[0]).toMatchObject({
+      transactional: false,
+      control: false,
+    })
+    expect(readBatches(withAttributes(0x0030))[0]).toMatchObject({
+      transactional: true,
+      control: true,
+    })
+  })
+
+  test('walks two batches in one Records field', () => {
+    expect(
+      readBatches(Buffer.concat([header, withAttributes(0)])).map((b) => b.transactional)
+    ).toEqual([true, false])
+  })
+
+  test('digests the whole batch, so two batches that differ only in their records differ', () => {
+    const body = (record) => {
+      const batch = Buffer.concat([header, Buffer.from([record])])
+      batch.writeInt32BE(batch.length - 12, 8)
+      return batch
+    }
+
+    expect(readBatches(body(1))[0].digest).not.toBe(readBatches(body(2))[0].digest)
+    expect(readBatches(body(1))[0].digest).toBe(readBatches(body(1))[0].digest)
+  })
+
+  test('gives the digest of the batch bytes, so a resend of the same bytes is told from a rewrite', () => {
+    const other = Buffer.from(header)
+    other.writeInt32BE(8, 53)
+    expect(readBatches(header)[0].digest).toBe(readBatches(Buffer.from(header))[0].digest)
+    expect(readBatches(other)[0].digest).not.toBe(readBatches(header)[0].digest)
+  })
+
+  test('refuses Records that are not whole batches', () => {
+    expect(() => readBatches(header.subarray(0, 60))).toThrow(
+      '60 bytes that are not a batch header'
+    )
+    expect(() => readBatches(Buffer.concat([header, Buffer.from([1, 2])]))).toThrow(
+      '2 bytes that are not a batch header'
+    )
+
+    const tooLong = Buffer.from(header)
+    tooLong.writeInt32BE(500, 8)
+    expect(() => readBatches(tooLong)).toThrow('a batch says it is 500 bytes long, 49 follow')
+
+    const tooShort = Buffer.from(header)
+    tooShort.writeInt32BE(10, 8)
+    expect(() => readBatches(tooShort)).toThrow('a batch says it is 10 bytes long')
+  })
+
+  test.each(['produceV11', 'produceV12'])(
+    '%s refuses the golden request with a byte after its tag buffer',
+    (name) => {
+      const bytes = Buffer.from(expected.produceRequestTransactionalV11.hex + 'ff', 'hex')
+
+      expect(() => require(`../wire/${name}`).readRequest(bytes)).toThrow('its tag buffer')
+    }
+  )
+
+  test.each(['produceV11', 'produceV12'])(
+    '%s reads a request with a transactional id and a transactional batch',
+    (name) => {
+      const golden = expected.produceRequestTransactionalV11
+      const pair = require(`../wire/${name}`)
+
+      expect(pair.readRequest(Buffer.from(golden.hex, 'hex'))).toEqual(golden.fields)
+    }
+  )
 })
 
 /**
@@ -463,6 +747,7 @@ describe('pairs agree with what a Kafka 4.3.1 broker sent', () => {
     ['findCoordinatorV6', 'findCoordinator', 'v6', 'findCoordinator/v6/response'],
     ['listOffsetsV9', 'listOffsets', 'v9', 'listOffsets/v9/response'],
     ['fetchV18', 'fetch', 'v18', 'fetch/v18/response'],
+    ['initProducerIdV5', 'initProducerId', 'v5', 'initProducerId/v5/response'],
   ])('%s builds a response shaped like the broker’s', async (name, folder, version, decoder) => {
     const { decode } = require(`../../src/protocol/requests/${decoder}`)
     const built = await decode(require(`../wire/${name}`).buildResponse())
@@ -477,6 +762,7 @@ describe('pairs agree with what a Kafka 4.3.1 broker sent', () => {
     ['findCoordinatorV6', 'findCoordinator', 'v6'],
     ['listOffsetsV9', 'listOffsets', 'v9'],
     ['fetchV18', 'fetch', 'v18'],
+    ['initProducerIdV5', 'initProducerId', 'v5'],
   ])(
     '%s reads the independently documented fields of the captured request',
     (name, folder, version) => {
@@ -490,6 +776,9 @@ describe('pairs agree with what a Kafka 4.3.1 broker sent', () => {
   test.each([
     ['findCoordinatorV6', 'findCoordinator', 'v6'],
     ['listOffsetsV9', 'listOffsets', 'v9'],
+    ['initProducerIdV5', 'initProducerId', 'v5'],
+    ['produceV11', 'produce', 'v11'],
+    ['produceV13', 'produce', 'v13'],
   ])(
     '%s builds the captured response from its documented literal fields',
     (name, folder, version) => {
