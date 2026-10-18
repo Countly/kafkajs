@@ -630,6 +630,10 @@ Adopted upstream PRs are credited here by number as they land (Phase 2 onward).
 
 - Seeking to offset `-2` or `-1` now resolves that partition's earliest or latest offset independently of `fromBeginning` and `autoCommit`. Sentinel seeks are local position requests and no longer send negative offsets through OffsetCommit; concrete-offset seeks retain their existing commit behavior.
 
+- OpenTelemetry instrumentation failures are contained: a meter, tracer, span, context manager or logger that throws no longer changes an operation's result or rejection, and the wrapped operation runs exactly once.
+
+- With the OpenTelemetry package enabled, a traced `producer.transaction()` returns a derived promise, wrapped transaction operations turn synchronous throws into rejections with the same reason, and wrapped `commit()` preserves the client's fulfillment value.
+
 #### Fixes
 
 - Eight option checks no longer throw a `TypeError` while building their message when the value is a `Symbol` or another value with no string form. `maxInFlightRequests`, `metadataRecoveryStrategy`, `metadataRecoveryRebootstrapTriggerMs`, `maxPollInterval` and the `stickyBytes` of `Partitioners.UniformStickyPartitioner` now refuse it with `KafkaJSNonRetriableError`, and `linger`, `batchSize` and `deliveryTimeout` with `KafkaJSInvalidConfigurationError`: the class the same check already throws for every other value it refuses. Each message shows the rejected value as the `maxResponseSize` message does, so the string `'5'` appears as `got '5'`.

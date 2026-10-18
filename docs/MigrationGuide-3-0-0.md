@@ -1118,6 +1118,8 @@ now logged.
   that error's message and its class name as `error.type`. The instrumented `commit()` returns
   its own promise to each caller, so two `commit()` calls made while one is under way no longer
   return the same promise, although the client's do.
+- **Telemetry errors no longer reach the application.** Telemetry errors are logged through the OpenTelemetry diagnostic logger instead of failing your handler, your send or your transaction. If the diagnostic logger also throws, that failure is contained. A context-manager failure does not invoke the wrapped operation again.
+- **OpenTelemetry transaction wrappers preserve settled outcomes.** A traced `producer.transaction()` now returns a derived promise that resolves to the same transaction object. Synchronous throws from wrapped transaction operations become rejected promises with the same reason; handle them with `await` and `catch`, or a promise rejection handler. An instrumented `commit()` now preserves its client's fulfillment value instead of discarding it; the client's declared `commit(): Promise<void>` contract is unchanged.
 
 ### Protocol
 
