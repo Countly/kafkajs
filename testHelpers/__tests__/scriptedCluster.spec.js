@@ -1,12 +1,15 @@
-const { Kafka } = require('../../index')
+const { Kafka, logLevel } = require('../../index')
+const { KafkaJSSASLAuthenticationError } = require('../../src/errors')
 const Encoder = require('../../src/protocol/encoder')
 const apiKeys = require('../../src/protocol/requests/apiKeys')
 const {
   createScriptedCluster,
+  consumerProtocolScript,
   groupScript,
   producerScript,
   PROFILES,
 } = require('../scriptedCluster')
+const { lanes } = require('../lane')
 const { Schedule } = require('../schedule')
 const metadataV13 = require('../wire/metadataV13')
 const { metadataV13: literal } = require('../wire/expected')
@@ -456,19 +459,14 @@ describe('ScriptedCluster', () => {
       expect(cluster.sockets().every((socket) => socket.destroyed)).toBe(true)
     })
 
-    test.each([
-      ['sasl', 'SaslHandshake v1', { sasl: { mechanism: 'plain', username: 'u', password: 'p' } }],
-    ])(
-      'refuses the declared but unbuilt pair of the %s profile by name',
-      async (profile, pair, extra) => {
-        const cluster = createScriptedCluster({ nodes: NODES, profile })
-        const admin = track(clientOf(cluster, { retry: { retries: 0 }, ...extra }).admin())
+    test.each(Object.keys(PROFILES))(
+      'every pair the %s profile advertises has a wire pair, so no request of it is refused for want of one',
+      (profile) => {
+        for (const [api, version] of PROFILES[profile]) {
+          const file = `../wire/${api[0].toLowerCase()}${api.slice(1)}V${version}`
 
-        await expect(admin.connect()).rejects.toThrow()
-
-        expect(cluster.failures().map(({ message }) => message)).toEqual([
-          `ScriptedCluster: no response builder for ${pair}`,
-        ])
+          expect(() => require.resolve(file)).not.toThrow()
+        }
       }
     )
   })
@@ -1283,5 +1281,403 @@ describe('ScriptedCluster', () => {
       ])
       cluster.assertClean()
     })
+  })
+
+  describe('a consumer of the consumer group protocol through the real client', () => {
+    const open = async (options = {}) => {
+      const cluster = consumerProtocolScript(
+        createScriptedCluster({ nodes: NODES, profile: 'consumer' }),
+        options
+      )
+      const consumer = track(
+        clientOf(cluster).consumer({
+          groupId: 'scripted-group',
+          groupProtocol: 'consumer',
+          maxWaitTimeInMs: 20,
+        })
+      )
+      const seen = []
+      const delivered = new Promise((resolve) => {
+        consumer.connect().then(async () => {
+          await consumer.subscribe({ topic: TOPIC, fromBeginning: true })
+          await consumer.run({
+            eachMessage: async ({ topic, partition, message }) => {
+              seen.push([topic, partition, message.offset, message.value.toString()])
+              resolve()
+            },
+          })
+        })
+      })
+      await within(delivered, 5000, 'the first record')
+      await consumer.commitOffsets([{ topic: TOPIC, partition: 0, offset: '1' }])
+      await consumer.disconnect()
+
+      return { cluster, seen }
+    }
+    const requestsOf = (cluster, api) => cluster.requests().filter((record) => record.api === api)
+
+    test('joins, is assigned, resolves its position by topic id, fetches a record, commits and leaves', async () => {
+      const { cluster, seen } = await open()
+
+      expect(seen).toEqual([[TOPIC, 0, '0', 'value']])
+      const [join, ...heartbeats] = requestsOf(cluster, 'ConsumerGroupHeartbeat')
+      expect(join.fields).toMatchObject({
+        groupId: 'scripted-group',
+        memberEpoch: 0,
+        subscribedTopicNames: [TOPIC],
+        serverAssignor: null,
+      })
+      expect(join.fields.memberId).toEqual(expect.any(String))
+      expect(heartbeats.length).toBeGreaterThanOrEqual(1)
+      expect(heartbeats.at(-1).fields).toMatchObject({
+        memberId: join.fields.memberId,
+        memberEpoch: expect.any(Number),
+      })
+      expect(heartbeats.at(-1).fields.memberEpoch).toBeLessThan(0)
+      expect(requestsOf(cluster, 'OffsetFetch')[0].fields).toMatchObject({
+        groupId: 'scripted-group',
+        memberEpoch: 1,
+        topics: [{ topicId: TOPIC_ID, partitions: [{ partition: 0 }] }],
+      })
+      expect(requestsOf(cluster, 'OffsetCommit')[0].fields).toMatchObject({
+        groupId: 'scripted-group',
+        groupGenerationId: 1,
+        memberId: join.fields.memberId,
+        topics: [{ topicId: TOPIC_ID, partitions: [{ partition: 0, offset: '1' }] }],
+      })
+      cluster.assertClean()
+    })
+
+    test('every request is at the one version its consumer pair advertises', async () => {
+      const { cluster } = await open()
+
+      const advertised = Object.fromEntries(PROFILES.consumer)
+      for (const { api, version } of cluster.requests()) {
+        expect([api, version]).toEqual([api, advertised[api]])
+      }
+      expect(names(cluster)).not.toContain('JoinGroup')
+      cluster.assertClean()
+    })
+
+    test('resumes from the offset the coordinator holds for the group it asked about', async () => {
+      const cluster = consumerProtocolScript(
+        createScriptedCluster({ nodes: NODES, profile: 'consumer' }),
+        { committed: { 0: '1' } }
+      )
+      const consumer = track(
+        clientOf(cluster).consumer({
+          groupId: 'scripted-group',
+          groupProtocol: 'consumer',
+          maxWaitTimeInMs: 20,
+        })
+      )
+      await consumer.connect()
+      await consumer.subscribe({ topic: TOPIC, fromBeginning: true })
+      await consumer.run({ eachMessage: async () => {} })
+
+      await until(() => requestsOf(cluster, 'Fetch').length > 0, 'the first Fetch')
+
+      expect(requestsOf(cluster, 'OffsetFetch')[0].fields.groupId).toBe('scripted-group')
+      expect(names(cluster)).not.toContain('ListOffsets')
+      expect(requestsOf(cluster, 'Fetch')[0].fields.topics[0].partitions[0].fetchOffset).toBe('1')
+      cluster.assertClean()
+    })
+  })
+
+  describe('what consumerProtocolScript answers, from the request that asks', () => {
+    const answerOf = (cluster, api, fields) => cluster.answerers.get(api)(fields)
+    const scripted = (options) =>
+      consumerProtocolScript(createScriptedCluster({ nodes: NODES, profile: 'consumer' }), options)
+
+    test('answers a join with epoch 1, the interval it was given and every partition of the topic', () => {
+      const cluster = scripted({ partitions: 2, heartbeatIntervalMs: 250 })
+
+      expect(
+        answerOf(cluster, 'ConsumerGroupHeartbeat', { memberId: 'm', memberEpoch: 0 })
+      ).toEqual({
+        memberId: 'm',
+        memberEpoch: 1,
+        heartbeatIntervalMs: 250,
+        assignment: { topicPartitions: [{ topicId: TOPIC_ID, partitions: [0, 1] }] },
+      })
+    })
+
+    test.each([
+      ['a steady heartbeat', 4],
+      ['a leave', -1],
+      ['a static leave', -2],
+    ])('answers %s with the epoch it carried and no assignment', (_what, epoch) => {
+      const cluster = scripted()
+
+      expect(
+        answerOf(cluster, 'ConsumerGroupHeartbeat', { memberId: 'm', memberEpoch: epoch })
+      ).toMatchObject({ memberId: 'm', memberEpoch: epoch, assignment: null })
+    })
+
+    test('answers an offset fetch for the group it names and the topic ids it names', () => {
+      const cluster = scripted({ committed: { 0: '7' } })
+
+      expect(
+        answerOf(cluster, 'OffsetFetch', {
+          groupId: 'other-group',
+          topics: [{ topicId: 'id-1', partitions: [{ partition: 0 }, { partition: 3 }] }],
+        })
+      ).toEqual({
+        groupId: 'other-group',
+        topics: [
+          {
+            topicId: 'id-1',
+            partitions: [
+              { partition: 0, offset: '7', leaderEpoch: -1, metadata: null, errorCode: 0 },
+              { partition: 3, offset: '-1', leaderEpoch: -1, metadata: null, errorCode: 0 },
+            ],
+          },
+        ],
+      })
+    })
+
+    test('answers an offset fetch of every topic with the partitions of its own topic', () => {
+      const cluster = scripted({ partitions: 2 })
+
+      const { topics } = answerOf(cluster, 'OffsetFetch', { groupId: 'g', topics: null })
+
+      expect(topics).toEqual([
+        {
+          topicId: TOPIC_ID,
+          partitions: [
+            expect.objectContaining({ partition: 0 }),
+            expect.objectContaining({ partition: 1 }),
+          ],
+        },
+      ])
+    })
+
+    test('answers an offset commit for the topic ids and partitions it carries, without error', () => {
+      const cluster = scripted()
+
+      expect(
+        answerOf(cluster, 'OffsetCommit', {
+          topics: [{ topicId: 'id-2', partitions: [{ partition: 5 }] }],
+        })
+      ).toEqual({ topics: [{ topicId: 'id-2', partitions: [{ partition: 5, errorCode: 0 }] }] })
+    })
+  })
+
+  describe('SASL PLAIN through the real client', () => {
+    const sasl = { mechanism: 'plain', username: 'u', password: 'p' }
+
+    test('negotiates the mechanism and sends the payload RFC 4616 gives for the credentials', async () => {
+      const cluster = createScriptedCluster({ nodes: NODES, profile: 'sasl' })
+      const admin = track(clientOf(cluster, { sasl }).admin())
+
+      await admin.connect()
+
+      const [versions, handshake, authenticate] = cluster.requests()
+      expect([versions.api, handshake.api, authenticate.api]).toEqual([
+        'ApiVersions',
+        'SaslHandshake',
+        'SaslAuthenticate',
+      ])
+      expect(handshake).toMatchObject({ version: 1, fields: { mechanism: 'PLAIN' } })
+      expect(authenticate).toMatchObject({ version: 2 })
+      expect(authenticate.fields.authBytes).toEqual(Buffer.from('\u0000u\u0000p'))
+      cluster.assertClean()
+    })
+
+    test('raises an authentication error, and tells the pool to hold off, when the broker refuses', async () => {
+      const cluster = createScriptedCluster({ nodes: NODES, profile: 'sasl' })
+      cluster.answer('SaslAuthenticate', () => ({
+        errorCode: 58,
+        errorMessage: 'Authentication failed: bad credentials',
+        authBytes: null,
+      }))
+      const admin = track(clientOf(cluster, { sasl, retry: { retries: 0 } }).admin())
+
+      await expect(admin.connect()).rejects.toThrow(KafkaJSSASLAuthenticationError)
+      await expect(admin.connect()).rejects.toThrow('recently failed')
+
+      expect(requestsOf(cluster, 'SaslAuthenticate')).toHaveLength(1)
+      cluster.assertClean()
+    })
+
+    const requestsOf = (cluster, api) => cluster.requests().filter((record) => record.api === api)
+  })
+
+  describe('the admin APIs the seam carries beyond the bootstrap', () => {
+    const advertise = { DescribeTopicPartitions: [0, 0], ListPartitionReassignments: [0, 0] }
+
+    test('pages a DescribeTopicPartitions read, each page asking where the last stopped', async () => {
+      const cluster = groupScript(createScriptedCluster({ nodes: NODES, advertise }))
+      const topic = (name, partitionIndexes) => ({
+        errorCode: 0,
+        name,
+        topicId: TOPIC_ID,
+        isInternal: false,
+        partitions: partitionIndexes.map((partitionIndex) => ({
+          errorCode: 0,
+          partitionIndex,
+          leaderId: 0,
+          leaderEpoch: 5,
+          replicaNodes: [0],
+          isrNodes: [0],
+          eligibleLeaderReplicas: null,
+          lastKnownElr: null,
+          offlineReplicas: [],
+        })),
+        topicAuthorizedOperations: -2147483648,
+      })
+      cluster.answer('DescribeTopicPartitions', ({ topics, cursor }) => ({
+        throttleTime: 0,
+        topics: [topic(topics[0], cursor === null ? [0] : [1])],
+        nextCursor: cursor === null ? { topicName: topics[0], partitionIndex: 1 } : null,
+      }))
+      const admin = track(clientOf(cluster).admin())
+
+      const metadata = await admin.fetchTopicMetadata({
+        topics: [TOPIC],
+        useDescribeTopicPartitions: true,
+      })
+
+      const reads = requestsOf(cluster, 'DescribeTopicPartitions')
+      expect(reads.map(({ fields }) => fields.cursor)).toEqual([
+        null,
+        { topicName: TOPIC, partitionIndex: 1 },
+      ])
+      expect(reads[0].fields.topics).toEqual([TOPIC])
+      expect(metadata.topics[0].partitions.map(({ partitionId }) => partitionId)).toEqual([0, 1])
+      cluster.assertClean()
+    })
+
+    test('asks for every reassignment in flight and reads the answer the broker gives while none is', async () => {
+      const cluster = createScriptedCluster({ nodes: NODES, advertise })
+      const admin = track(clientOf(cluster).admin())
+
+      const reassignments = await admin.listPartitionReassignments({ topics: null })
+
+      expect(requestsOf(cluster, 'ListPartitionReassignments')[0]).toMatchObject({
+        version: 0,
+        fields: { timeoutMs: 5000, topics: null },
+      })
+      expect(reassignments.topics).toEqual([])
+      cluster.assertClean()
+    })
+
+    test('reads a reassignment in flight as the golden of its bytes holds it', async () => {
+      const cluster = createScriptedCluster({ nodes: NODES, advertise })
+      cluster.answer('ListPartitionReassignments', () => golden.inFlight.fields)
+      const admin = track(clientOf(cluster).admin())
+
+      const reassignments = await admin.listPartitionReassignments({ topics: null })
+
+      expect(reassignments.topics).toEqual([
+        {
+          name: 't',
+          partitions: [
+            { partition: 0, replicas: [1, 2], addingReplicas: [3], removingReplicas: [] },
+          ],
+        },
+      ])
+      cluster.assertClean()
+    })
+
+    const requestsOf = (cluster, api) => cluster.requests().filter((record) => record.api === api)
+    const golden = require('../wire/expected').listPartitionReassignmentsV0
+  })
+})
+
+/**
+ * A producer and a consumer, fault-free, on the seam and on a real broker. The scenario holds
+ * whether or not anything fails nowhere, so it runs on both lanes from this one file: the seam
+ * agreeing with the broker is the drift check. Allowed replay: the durable log none; committed
+ * offsets move back only to the last commit; handler delivery at least once after it. A lane
+ * sends the fixed key and value of the Fetch fixture and asserts the received payload and offset
+ * against the send's acknowledgement. The fake replays that fixed fixture and keeps no broker log.
+ */
+describe.each(lanes())('A producer and a consumer round trip (%s lane)', (lane) => {
+  const closers = []
+
+  /** The client, topic and `done` of the lane. */
+  const scenario = async () => {
+    if (lane === 'fake') {
+      await prepareRecordBatches()
+      const cluster = groupScript(producerScript(createScriptedCluster({ nodes: NODES })), {
+        batches: 1,
+      })
+      return {
+        kafka: new Kafka(cluster.kafkaOptions()),
+        topic: TOPIC,
+        done: () => cluster.assertClean(),
+      }
+    }
+
+    const { plainTextBrokers, createTopic, secureRandom } = require('testHelpers')
+    const topic = `seam-round-trip-${secureRandom()}`
+    await createTopic({ topic })
+    return {
+      kafka: new Kafka({
+        clientId: 'seam-round-trip',
+        brokers: plainTextBrokers(),
+        logLevel: logLevel.NOTHING,
+      }),
+      topic,
+      done: () => {},
+    }
+  }
+
+  afterEach(async () => {
+    await Promise.all(closers.splice(0).map((close) => close()))
+  })
+
+  test('a send is acknowledged and a consumer from the beginning reads a record and commits', async () => {
+    const { kafka, topic, done } = await scenario()
+    const producer = kafka.producer()
+    closers.push(() => producer.disconnect().catch(() => {}))
+    await producer.connect()
+
+    const sent = await producer.send({ topic, messages: [{ key: 'key', value: 'value' }] })
+
+    expect(sent).toEqual([
+      expect.objectContaining({
+        topicName: topic,
+        partition: 0,
+        errorCode: 0,
+        baseOffset: expect.any(String),
+      }),
+    ])
+
+    const consumer = kafka.consumer({
+      groupId: `seam-round-trip-${Date.now()}`,
+      maxWaitTimeInMs: 50,
+    })
+    closers.push(() => consumer.disconnect().catch(() => {}))
+    const received = new Promise((resolve) => {
+      consumer.connect().then(async () => {
+        await consumer.subscribe({ topic, fromBeginning: true })
+        await consumer.run({
+          eachMessage: async ({ topic: from, partition, message }) =>
+            resolve({
+              from,
+              partition,
+              offset: message.offset,
+              key: message.key,
+              value: message.value,
+            }),
+        })
+      })
+    })
+
+    const record = await within(received, 15000, 'a record')
+
+    expect(record).toEqual({
+      from: topic,
+      partition: 0,
+      offset: sent[0].baseOffset,
+      key: Buffer.from('key'),
+      value: Buffer.from('value'),
+    })
+    await expect(
+      consumer.commitOffsets([{ topic, partition: 0, offset: String(Number(record.offset) + 1) }])
+    ).resolves.toBeUndefined()
+    done()
   })
 })

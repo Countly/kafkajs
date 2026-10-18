@@ -727,6 +727,61 @@ const groupScript = (
 }
 
 /**
+ * Scripts the answers one consumer of the consumer group protocol needs, over the `consumer`
+ * profile: everything `groupScript` scripts (the metadata, the coordinator, the position, the
+ * fetches), and then the heartbeat as the group coordinator answers it. A join (epoch 0) is
+ * answered with epoch 1, the heartbeat interval and the assignment of every partition of the topic;
+ * a later heartbeat with the same epoch and a leave (a negative epoch) are answered with the
+ * epoch they carried and no assignment. OffsetFetch and OffsetCommit answer for the topic ids the
+ * request names, and OffsetFetch for the group it names, `committed` (`-1` for none) by partition.
+ * A test that needs another outcome overrides one answer with `answer` or the schedule.
+ * @param {ScriptedCluster} cluster
+ * @param {object} [options] those of `groupScript`, and
+ * @param {number} [options.heartbeatIntervalMs=100] the interval the coordinator sets
+ * @returns {ScriptedCluster} the cluster
+ */
+const consumerProtocolScript = (cluster, options = {}) => {
+  const { partitions = 1, committed = {}, heartbeatIntervalMs = 100 } = options
+  const partitionIds = Array.from({ length: partitions }, (_, partition) => partition)
+  const positions = (entries) =>
+    entries.map(({ topicId, partitions: asked }) => ({
+      topicId,
+      partitions: asked.map(({ partition }) => ({
+        partition,
+        offset: committed[partition] ?? '-1',
+        leaderEpoch: -1,
+        metadata: null,
+        errorCode: 0,
+      })),
+    }))
+
+  return groupScript(cluster, options)
+    .answer('ConsumerGroupHeartbeat', ({ memberId, memberEpoch }) => ({
+      memberId,
+      memberEpoch: memberEpoch === 0 ? 1 : memberEpoch,
+      heartbeatIntervalMs,
+      assignment:
+        memberEpoch === 0
+          ? { topicPartitions: [{ topicId: TOPIC_ID, partitions: partitionIds }] }
+          : null,
+    }))
+    .answer('OffsetFetch', ({ groupId, topics }) => ({
+      groupId,
+      topics: positions(
+        topics ?? [
+          { topicId: TOPIC_ID, partitions: partitionIds.map((partition) => ({ partition })) },
+        ]
+      ),
+    }))
+    .answer('OffsetCommit', ({ topics }) => ({
+      topics: topics.map(({ topicId, partitions: sent }) => ({
+        topicId,
+        partitions: sent.map(({ partition }) => ({ partition, errorCode: 0 })),
+      })),
+    }))
+}
+
+/**
  * Scripts the answers one producer needs, all fixed, so that an idempotent producer (the `default`
  * profile) and a transactional one (`tv1`, `tv2`) can run their whole path: Metadata lists the
  * topic, a Produce, an AddPartitionsToTxn and a TxnOffsetCommit answer for exactly the partitions
@@ -775,4 +830,11 @@ const producerScript = (cluster, { topic = TOPIC, partitions = 1 } = {}) =>
  */
 const createScriptedCluster = (options) => new ScriptedCluster(options)
 
-module.exports = { createScriptedCluster, ScriptedCluster, groupScript, producerScript, PROFILES }
+module.exports = {
+  createScriptedCluster,
+  ScriptedCluster,
+  groupScript,
+  consumerProtocolScript,
+  producerScript,
+  PROFILES,
+}

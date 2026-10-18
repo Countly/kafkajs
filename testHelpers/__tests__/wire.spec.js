@@ -43,6 +43,16 @@ const STRUCTURED = [
   ['txnOffsetCommitV5', 'txnOffsetCommit', 'TxnOffsetCommit', 5],
   ['endTxnV4', 'endTxn', 'EndTxn', 4],
   ['endTxnV5', 'endTxn', 'EndTxn', 5],
+  [
+    'describeTopicPartitionsV0',
+    'describeTopicPartitions',
+    'DescribeTopicPartitions',
+    0,
+    'noNextCursor',
+  ],
+  ['consumerGroupHeartbeatV1', 'consumerGroupHeartbeat', 'ConsumerGroupHeartbeat', 1, 'assignment'],
+  ['offsetFetchV10', 'offsetFetch', 'OffsetFetch', 10],
+  ['offsetCommitV10', 'offsetCommit', 'OffsetCommit', 10],
 ]
 
 const BYTES_ONLY = [
@@ -55,10 +65,11 @@ const BYTES_ONLY = [
   ['produceV11', 'produce', 'v11'],
   ['produceV12', 'produce', 'v12'],
   ['produceV13', 'produce', 'v13'],
+  ['saslAuthenticateV2', 'saslAuthenticate', 'v2'],
 ]
 
 describe('wire pairs checked against structured Java vectors', () => {
-  describe.each(STRUCTURED)('%s', (name, folder, message, version) => {
+  describe.each(STRUCTURED)('%s', (name, folder, message, version, defaultCase) => {
     const pair = require(`../wire/${name}`)
     const responses = structured(folder, version, 'Response')
     const requests = structured(folder, version, 'Request')
@@ -79,7 +90,9 @@ describe('wire pairs checked against structured Java vectors', () => {
 
     test('builds the bytes of the first response vector, unvaried', () => {
       expect(pair.buildResponse().toString('hex')).toBe(
-        responses.find(([caseName]) => ['ok', 'basic', 'defaults'].includes(caseName))[1].hex
+        responses.find(([caseName]) =>
+          defaultCase ? caseName === defaultCase : ['ok', 'basic', 'defaults'].includes(caseName)
+        )[1].hex
       )
     })
 
@@ -495,6 +508,150 @@ const VARIED = [
     { errorCode: 0, producerId: '2000', producerEpoch: 6 },
     { errorCode: 0, producerId: '2000', producerEpoch: 6 },
   ],
+  [
+    'describeTopicPartitionsV0',
+    'describeTopicPartitions/v0/response',
+    {
+      throttleTime: 3,
+      topics: [
+        {
+          errorCode: 0,
+          name: 't7',
+          topicId: '0a0b0c0d-0e0f-1011-1213-141516171819',
+          isInternal: false,
+          partitions: [
+            {
+              errorCode: 0,
+              partitionIndex: 4,
+              leaderId: 2,
+              leaderEpoch: 9,
+              replicaNodes: [2, 3],
+              isrNodes: [2],
+              eligibleLeaderReplicas: [3],
+              lastKnownElr: null,
+              offlineReplicas: [],
+            },
+          ],
+          topicAuthorizedOperations: 7,
+        },
+      ],
+      nextCursor: { topicName: 't7', partitionIndex: 5 },
+    },
+    {
+      clientSideThrottleTime: 3,
+      topics: [
+        {
+          name: 't7',
+          topicId: '0a0b0c0d-0e0f-1011-1213-141516171819',
+          partitions: [
+            { partitionIndex: 4, leaderId: 2, eligibleLeaderReplicas: [3], lastKnownElr: null },
+          ],
+          topicAuthorizedOperations: 7,
+        },
+      ],
+      nextCursor: { topicName: 't7', partitionIndex: 5 },
+    },
+  ],
+  [
+    'consumerGroupHeartbeatV1',
+    'consumerGroupHeartbeat/v1/response',
+    {
+      errorCode: 0,
+      memberId: 'm9',
+      memberEpoch: 9,
+      heartbeatIntervalMs: 700,
+      assignment: {
+        topicPartitions: [{ topicId: '0a0b0c0d-0e0f-1011-1213-141516171819', partitions: [3, 4] }],
+      },
+    },
+    {
+      memberId: 'm9',
+      memberEpoch: 9,
+      heartbeatIntervalMs: 700,
+      assignment: {
+        topicPartitions: [{ topicId: '0a0b0c0d-0e0f-1011-1213-141516171819', partitions: [3, 4] }],
+      },
+    },
+  ],
+  [
+    'offsetFetchV10',
+    'offsetFetch/v10/response',
+    {
+      groupId: 'g2',
+      topics: [
+        {
+          topicId: '0a0b0c0d-0e0f-1011-1213-141516171819',
+          partitions: [{ partition: 3, offset: '77', leaderEpoch: 4, metadata: 'm', errorCode: 0 }],
+        },
+      ],
+    },
+    {
+      responses: [
+        {
+          topicId: '0a0b0c0d-0e0f-1011-1213-141516171819',
+          partitions: [
+            { partition: 3, offset: '77', committedLeaderEpoch: 4, metadata: 'm', errorCode: 0 },
+          ],
+        },
+      ],
+    },
+  ],
+  [
+    'offsetCommitV10',
+    'offsetCommit/v10/response',
+    {
+      topics: [
+        {
+          topicId: '0a0b0c0d-0e0f-1011-1213-141516171819',
+          partitions: [{ partition: 5, errorCode: 100 }],
+        },
+      ],
+    },
+    {
+      responses: [
+        {
+          topicId: '0a0b0c0d-0e0f-1011-1213-141516171819',
+          partitions: [{ partition: 5, errorCode: 100 }],
+        },
+      ],
+    },
+  ],
+  [
+    'listPartitionReassignmentsV0',
+    'listPartitionReassignments/v0/response',
+    {
+      topics: [
+        {
+          name: 't8',
+          partitions: [
+            { partitionIndex: 2, replicas: [1, 2], addingReplicas: [3], removingReplicas: [4] },
+          ],
+        },
+      ],
+    },
+    {
+      topics: [
+        {
+          name: 't8',
+          partitions: [
+            { partition: 2, replicas: [1, 2], addingReplicas: [3], removingReplicas: [4] },
+          ],
+        },
+      ],
+    },
+  ],
+  [
+    'saslHandshakeV1',
+    'saslHandshake/v1/response',
+    { errorCode: 33, enabledMechanisms: ['PLAIN', 'SCRAM-SHA-512'] },
+    { errorCode: 33, enabledMechanisms: ['PLAIN', 'SCRAM-SHA-512'] },
+  ],
+  [
+    'saslAuthenticateV2',
+    'saslAuthenticate/v2/response',
+    { errorCode: 58, errorMessage: 'bad', authBytes: Buffer.from('xy'), sessionLifetimeMs: '7' },
+    { errorCode: 58, errorMessage: 'bad', sessionLifetimeMs: '7' },
+  ],
 ]
 
 describe('builders agree with the client’s decoder on fields the vectors do not hold', () => {
@@ -638,6 +795,101 @@ describe('Produce readers against the hand-computed goldens', () => {
       expect(pair.readRequest(Buffer.from(golden.hex, 'hex'))).toEqual(golden.fields)
     }
   )
+})
+
+/**
+ * SaslHandshake v1 has no vector, so its pair is checked against the hand-computed goldens of
+ * `expected`, each assembled from the message layout and never decoded.
+ */
+describe('SaslHandshake v1 against its hand-computed goldens', () => {
+  const pair = require('../wire/saslHandshakeV1')
+  const golden = expected.saslHandshakeV1
+
+  test('names its API and version', () => {
+    expect(pair).toMatchObject({ api: 'SaslHandshake', version: 1 })
+    expect(Number.isInteger(pair.apiKey)).toBe(true)
+  })
+
+  test.each(golden.responses.map((entry, index) => [index, entry]))(
+    'builds golden response %i from its fields',
+    (_index, { hex, fields }) => {
+      expect(pair.buildResponse(fields).toString('hex')).toBe(hex)
+    }
+  )
+
+  test('builds, unvaried, the answer of a broker that enables PLAIN', () => {
+    expect(pair.buildResponse().toString('hex')).toBe('0000' + '00000001' + '0005' + '504c41494e')
+  })
+
+  test('the smallest answer is the six bytes of an error code and an empty list', () => {
+    expect(golden.responses[2].hex).toHaveLength(12)
+    expect(pair.buildResponse({ enabledMechanisms: [] })).toEqual(
+      Buffer.from('000000000000', 'hex')
+    )
+  })
+
+  test.each(golden.requests.map((entry, index) => [index, entry]))(
+    'reads the fields of golden request %i',
+    (_index, { hex, fields }) => {
+      expect(pair.readRequest(Buffer.from(hex, 'hex'))).toEqual(fields)
+    }
+  )
+
+  test.each(golden.requests.map((entry, index) => [index, entry]))(
+    'refuses golden request %i with a byte after its mechanism, and cut short by a byte',
+    (_index, { hex }) => {
+      const bytes = Buffer.from(hex, 'hex')
+
+      expect(() => pair.readRequest(Buffer.concat([bytes, Buffer.from([0xff])]))).toThrow(
+        'a byte after its mechanism'
+      )
+      expect(() => pair.readRequest(bytes.subarray(0, -1))).toThrow()
+    }
+  )
+})
+
+/**
+ * ListPartitionReassignments has no Java vector: the capture of a Kafka 4.3.1 broker holds the
+ * request and the answer while nothing is in flight, and the two goldens of `expected` hold a
+ * reassignment under way and a request for named partitions.
+ */
+describe('ListPartitionReassignments v0 against the broker capture and its goldens', () => {
+  const pair = require('../wire/listPartitionReassignmentsV0')
+  const golden = expected.listPartitionReassignmentsV0
+  const request = bytesOf(load('listPartitionReassignments/fixtures/v0_request_kafka431.json'))
+  const response = bytesOf(load('listPartitionReassignments/fixtures/v0_response_kafka431.json'))
+
+  test('names its API and version', () => {
+    expect(pair).toMatchObject({ api: 'ListPartitionReassignments', version: 0 })
+    expect(Number.isInteger(pair.apiKey)).toBe(true)
+  })
+
+  test('reads the documented fields of the captured request', () => {
+    expect(pair.readRequest(request)).toEqual(golden.capture.request)
+  })
+
+  test('builds the captured response, unvaried and from the documented fields', () => {
+    expect(pair.buildResponse()).toEqual(response)
+    expect(pair.buildResponse(golden.capture.response)).toEqual(response)
+  })
+
+  test('builds the golden of a reassignment in flight from its fields', () => {
+    expect(pair.buildResponse(golden.inFlight.fields).toString('hex')).toBe(golden.inFlight.hex)
+  })
+
+  test('reads the golden of a request for named partitions', () => {
+    expect(pair.readRequest(Buffer.from(golden.named.hex, 'hex'))).toEqual(golden.named.fields)
+  })
+
+  test.each([
+    ['the captured request', request],
+    ['the golden request', Buffer.from(golden.named.hex, 'hex')],
+  ])('refuses %s with a byte after its tag buffer, and cut short by a byte', (_name, bytes) => {
+    expect(() => pair.readRequest(Buffer.concat([bytes, Buffer.from([0xff])]))).toThrow(
+      'its tag buffer'
+    )
+    expect(() => pair.readRequest(bytes.subarray(0, -1))).toThrow()
+  })
 })
 
 /**

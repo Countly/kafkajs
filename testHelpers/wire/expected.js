@@ -482,4 +482,93 @@ module.exports = {
       ],
     },
   },
+
+  /**
+   * SaslHandshake v1 has no vector: the goldens below are assembled by hand from the message
+   * layout (an INT16-prefixed string; an INT16 error code and an INT32-counted array of
+   * INT16-prefixed strings), never by a codec of this repository.
+   */
+  saslHandshakeV1: {
+    source: 'the SaslHandshake v1 layout; no Java vector exists',
+    requests: [
+      { hex: '0005' + '504c41494e', fields: { mechanism: 'PLAIN' } },
+      { hex: '000b' + '4f41555448424541524552', fields: { mechanism: 'OAUTHBEARER' } },
+    ],
+    responses: [
+      {
+        hex: '0000' + '00000002' + '0005' + '504c41494e' + '000d' + '534352414d2d5348412d323536',
+        fields: { errorCode: 0, enabledMechanisms: ['PLAIN', 'SCRAM-SHA-256'] },
+      },
+      {
+        hex: '0021' + '00000001' + '0005' + '504c41494e',
+        fields: { errorCode: 33, enabledMechanisms: ['PLAIN'] },
+      },
+      { hex: '0000' + '00000000', fields: { errorCode: 0, enabledMechanisms: [] } },
+    ],
+  },
+
+  saslAuthenticateV2: {
+    source:
+      'buildSaslAuthenticateRequest l.956 (SASL_AUTH_BYTES l.102), buildSaslAuthenticateResponse l.966 (SASL_SESSION_LIFETIME_MS l.103)',
+    request: { authBytes: Buffer.from('server-final-message') },
+    response: {
+      errorCode: 0,
+      errorMessage: null,
+      authBytes: Buffer.from('server-final-message'),
+      sessionLifetimeMs: '3600000',
+    },
+  },
+
+  /**
+   * ListPartitionReassignments has no Java vector. `capture` is what the Kafka 4.3.1 broker's own
+   * bytes hold: the request is the capture script's call (`listPartitionReassignments({ topics:
+   * null })` with the client's default timeout, 5000 ms), the response the documented answer while
+   * no reassignment is in flight. `inFlight` and `named` are hand-computed goldens for a
+   * reassignment under way and a request for named partitions.
+   */
+  listPartitionReassignmentsV0: {
+    source:
+      'scripts/protocol/capture.js (admin.listPartitionReassignments({ topics: null })); v0_*_kafka431.json, hand-transcribed using clients/src/main/resources/common/message/ListPartitionReassignments{Request,Response}.json at Kafka 4.3.1',
+    capture: {
+      request: { timeoutMs: 5000, topics: null },
+      response: { throttleTime: 0, errorCode: 0, errorMessage: null, topics: [] },
+    },
+    named: {
+      hex: '00001388' + '02' + '02' + '74' + '03' + '00000000' + '00000001' + '00' + '00',
+      fields: { timeoutMs: 5000, topics: [{ name: 't', partitionIndexes: [0, 1] }] },
+    },
+    inFlight: {
+      hex:
+        '00000000' + // throttle time
+        '0000' + // error code
+        '00' + // error message: null
+        '02' + // one topic
+        '02' +
+        '74' + // name "t"
+        '02' + // one partition
+        '00000000' + // partition index 0
+        '03' +
+        '00000001' +
+        '00000002' + // replicas 1, 2
+        '02' +
+        '00000003' + // adding replicas 3
+        '01' + // removing replicas: none
+        '00' +
+        '00' +
+        '00', // partition, topic and response tags
+      fields: {
+        throttleTime: 0,
+        errorCode: 0,
+        errorMessage: null,
+        topics: [
+          {
+            name: 't',
+            partitions: [
+              { partitionIndex: 0, replicas: [1, 2], addingReplicas: [3], removingReplicas: [] },
+            ],
+          },
+        ],
+      },
+    },
+  },
 }
