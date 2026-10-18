@@ -168,6 +168,8 @@ module.exports = class OffsetManager {
     this.autoCommitThreshold = autoCommitThreshold
     this.lastCommit = Date.now()
 
+    /** @type {Map<string, Map<number, {timestamp: number, ticket: object}>>} */
+    this.pendingSeeks = new Map()
     this.topics = keys(memberAssignment)
     this.clearAllOffsets()
   }
@@ -314,6 +316,9 @@ module.exports = class OffsetManager {
    */
   resetOffsetsForTopic(topic) {
     this.operations.touchTopic(topic)
+    for (const partition of this.pendingSeeks.get(topic)?.keys() || []) {
+      this.clearPendingSeek(topic, partition)
+    }
     this.committedOffsets()[topic] = {}
     this.resolvedOffsets[topic] = {}
     this.resolvedEpochs[topic] = {}
@@ -508,8 +513,10 @@ module.exports = class OffsetManager {
   }
 
   /**
-   * Commit the given offset to the topic/partition. If the consumer isn't assigned to the given
-   * topic/partition this method will be a NO-OP.
+   * Seeks an assigned partition. A concrete offset retains the existing auto-commit behavior.
+   * A -2 or -1 sentinel is a local intent for the next ListOffsets resolution, independent of
+   * subscription defaults and auto-commit; it is never sent as a committed offset. An unassigned
+   * partition is a no-op. Pending intent ends on concrete publication, cancellation or stop.
    *
    * A seek is a mutation of the offset ledger: it is applied unless a seek or commit that began
    * after it was applied first, or a barrier reached the partition while its commit was in
@@ -526,10 +533,24 @@ module.exports = class OffsetManager {
       return false
     }
 
+    if (offset === '-2' || offset === '-1') {
+      const ticket = this.operations.begin([{ topic, partition }], { mutation: true })
+      this.clearOffsets({ topic, partition })
+      this.operations.apply(ticket, topic, partition)
+      let partitions = this.pendingSeeks.get(topic)
+      if (!partitions) {
+        partitions = new Map()
+        this.pendingSeeks.set(topic, partitions)
+      }
+      partitions.set(partition, { timestamp: Number(offset), ticket })
+      return true
+    }
+
     if (!this.autoCommit) {
       const ticket = this.operations.begin([{ topic, partition }], { mutation: true })
 
       try {
+        this.clearPendingSeek(topic, partition)
         this.resolveOffset({
           topic,
           partition,
@@ -815,7 +836,8 @@ module.exports = class OffsetManager {
 
   /**
    * Resolves the partitions of the assignment that hold no valid offset: the group's committed
-   * offset, else the topic's own `fromBeginning` choice through ListOffsets.
+   * offset, else the topic's own `fromBeginning` choice through ListOffsets. A current explicit
+   * sentinel seek overrides the committed answer and supplies a per-partition timestamp.
    *
    * A resolution is a read of the offset ledger: it takes a ticket over the cells it resolves and
    * fills them in one synchronous final step after both awaits. It never supersedes anything. An
@@ -840,7 +862,10 @@ module.exports = class OffsetManager {
    */
   async resolveOffsets() {
     const invalidOffset = (topic) => (partition) => {
-      return isInvalidOffset(this.committedOffsets()[topic][partition])
+      return (
+        this.pendingSeekTimestamp(topic, partition) !== undefined ||
+        isInvalidOffset(this.committedOffsets()[topic][partition])
+      )
     }
 
     const pendingPartitions = this.topics
@@ -878,6 +903,7 @@ module.exports = class OffsetManager {
       }
 
       this.markOwedResets(consumerOffsets)
+      this.markPendingSeeks(consumerOffsets)
       const epochSeeds = this.collectEpochSeeds(consumerOffsets)
 
       const unresolvedPartitions = consumerOffsets.map(({ topic, partitions }) =>
@@ -886,7 +912,10 @@ module.exports = class OffsetManager {
             topic,
             partitions: partitions
               .filter(({ offset }) => isInvalidOffset(offset))
-              .map(({ partition }) => assign({ partition })),
+              .map(({ partition }) => {
+                const timestamp = this.pendingSeekTimestamp(topic, partition)
+                return timestamp === undefined ? { partition } : { partition, timestamp }
+              }),
           },
           this.topicConfigurations[topic]
         )
@@ -902,6 +931,86 @@ module.exports = class OffsetManager {
     } finally {
       this.operations.end(ticket)
     }
+  }
+
+  /**
+   * The timestamp of a still-current explicit sentinel seek. A retained mutation ticket lets
+   * a newer commit, seek or barrier cancel the intent even between resolution attempts.
+   * @private
+   * @param {string} topic
+   * @param {number} partition
+   * @returns {number|undefined} -2 or -1, or undefined when no current seek remains
+   * @throws Never.
+   */
+  pendingSeekTimestamp(topic, partition) {
+    const pending = this.pendingSeeks.get(topic)?.get(partition)
+    if (!pending) {
+      return undefined
+    }
+    if (
+      !this.owns(topic, partition) ||
+      this.isStopping() ||
+      this.operations.isSuperseded(pending.ticket, topic, partition)
+    ) {
+      this.clearPendingSeek(topic, partition)
+      return undefined
+    }
+    return pending.timestamp
+  }
+
+  /**
+   * Makes an explicit sentinel override a coordinator's committed offset for this partition.
+   * The concrete ListOffsets result is published under the resolution's existing read ticket.
+   * @private
+   * @param {{topic: string, partitions: {partition: number, offset: string}[]}[]} entries mutated
+   * @returns {void}
+   * @throws Never.
+   */
+  markPendingSeeks(entries) {
+    for (const { topic, partitions } of entries) {
+      for (const entry of partitions) {
+        if (this.pendingSeekTimestamp(topic, entry.partition) !== undefined) {
+          entry.offset = '-1'
+        }
+      }
+    }
+  }
+
+  /**
+   * Releases one sentinel intent and its ledger ticket. Idempotent; does not fence a resolver.
+   * @private
+   * @param {string} topic
+   * @param {number} partition
+   * @returns {void}
+   * @throws Never.
+   */
+  clearPendingSeek(topic, partition) {
+    const partitions = this.pendingSeeks.get(topic)
+    const pending = partitions?.get(partition)
+    if (!pending) {
+      return
+    }
+    this.operations.end(pending.ticket)
+    partitions.delete(partition)
+    if (partitions.size === 0) {
+      this.pendingSeeks.delete(topic)
+    }
+  }
+
+  /**
+   * Cancels all explicit sentinel seeks and fences their in-flight answers on stop or rebuild.
+   * Retains no ledger ticket, topic or partition after returning.
+   * @returns {void}
+   * @throws Never.
+   */
+  clearPendingSeeks() {
+    for (const [topic, partitions] of this.pendingSeeks) {
+      for (const [partition, pending] of partitions) {
+        this.operations.touch(topic, partition)
+        this.operations.end(pending.ticket)
+      }
+    }
+    this.pendingSeeks.clear()
   }
 
   /**
@@ -994,7 +1103,10 @@ module.exports = class OffsetManager {
       for (const { partition, offset } of partitions) {
         if (this.isStale(ticket, topic, partition, requestedIds)) {
           complete = false
-        } else if (isInvalidOffset(committedOffsets[topic] && committedOffsets[topic][partition])) {
+        } else if (
+          isInvalidOffset(committedOffsets[topic] && committedOffsets[topic][partition]) ||
+          this.pendingSeekTimestamp(topic, partition) !== undefined
+        ) {
           resolved[partition] = offset
           written.push(partition)
         }
@@ -1003,6 +1115,9 @@ module.exports = class OffsetManager {
       committedOffsets[topic] = assign({}, committedOffsets[topic], resolved)
 
       for (const partition of written) {
+        if (!isInvalidOffset(resolved[partition])) {
+          this.clearPendingSeek(topic, partition)
+        }
         this.obligations.discharge(topic, partition, this.cluster.topicId(topic))
       }
 
@@ -1173,6 +1288,7 @@ module.exports = class OffsetManager {
    * @param {import("../../../types").TopicPartition} topicPartition
    */
   clearOffsets({ topic, partition }) {
+    this.clearPendingSeek(topic, partition)
     // Each key is guarded: the committed-offsets object is shared with every other consumer of
     // this group on the same client, so a topic this manager once held can be absent by the time
     // it prunes it.
@@ -1195,6 +1311,7 @@ module.exports = class OffsetManager {
    * @private
    */
   clearAllOffsets() {
+    this.clearPendingSeeks()
     const committedOffsets = this.committedOffsets()
 
     for (const topic of this.topics) {

@@ -854,6 +854,7 @@ says so, `groupProtocol: 'consumer'`.
   configuration change. A value of `2` or more is rejected at construction rather than clamped.
   See [Prefetching](Consuming.md#prefetching).
 - **A seek or commit made while the consumer is still resolving its initial offsets now wins.** It is no longer overwritten by the older answer. Nothing to change in code; the documented guarantees of `docs/Consuming.md` now hold. If you relied on the older answer overwriting your seek or commit, do the seek or commit again.
+- **Sentinel seeks select an explicit boundary.** `consumer.seek({ topic, partition, offset: '-2' })` selects earliest and `offset: '-1'` selects latest on the next resolution, regardless of the subscription's `fromBeginning` setting or `autoCommit`. The following fetch uses the concrete offset returned by ListOffsets. Sentinel seeks change the local position and do not commit a negative sentinel. Concrete-offset seeks retain their existing commit behavior. *What to do:* choose the sentinel for the boundary you intend; do not rely on the subscription default to reinterpret it. If you need a durable group offset change, commit the intended concrete offset explicitly.
 
 ### Admin
 

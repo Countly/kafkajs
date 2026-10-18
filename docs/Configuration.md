@@ -436,6 +436,8 @@ new Kafka({
 
 An async function that will be invoked after the consumer exhausts all retries, to decide whether or not to restart the consumer (essentially resetting `consumer.run`). This can be used to, for example, cleanly shut down resources before crashing, if that is preferred. The function will be passed the error, which allows it to decide based on the type of error whether or not to exit the application or allow it to restart.
 
+A fenced static instance and a fatal membership error under the consumer protocol never restart, even if `restartOnFailure` returns `true`. A duplicate `groupInstanceId` must be removed, or the rejected membership configuration, authorization or broker capability must be corrected first. Other terminal errors retain the callback policy.
+
 The function has the following signature: `(error: Error) => Promise<boolean>`
 
 * If the promise resolves to `true`: the consumer will restart

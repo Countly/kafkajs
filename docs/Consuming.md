@@ -54,7 +54,7 @@ await consumer.run({
 })
 ```
 
-Be aware that the `eachMessage` handler should not block for longer than the configured [session timeout](#options) or else the consumer will be removed from the group. If your workload involves very slow processing times for individual messages then you should either increase the session timeout or make periodic use of the `heartbeat` function exposed in the handler payload.
+Yielding asynchronous work is kept alive by the background heartbeat while it waits, up to `maxPollInterval`. Increasing `sessionTimeout` or manually calling `heartbeat()` does not extend that processing deadline. An event-loop-blocking handler prevents background heartbeats and the poll guard from running, and can lose membership after `sessionTimeout`. The poll guard is global across all partitions: another partition making progress can refresh it, so it is not a separate deadline for each concurrently running handler.
 The `pause` function is a convenience for `consumer.pause({ topic, partitions: [partition] })`. It will pause the current topic-partition and returns a function that allows you to resume consuming later.
 
 ## <a name="each-batch"></a> eachBatch
@@ -293,7 +293,7 @@ kafka.consumer({
 | checkCrcs              | Verify the CRC32C checksum of every record batch received. Default `true` (Java's `check.crcs`). A mismatch is treated as a **non-retriable** error: no message from that batch is delivered, the consumer crashes with `KafkaJSPartialMessageError` (marked with `crcMismatch: true`, distinguishing it from an ordinary truncated fetch tail; the `CRASH` event's `restart` follows `retry.restartOnFailure` as for any other non-retriable error), and the committed offset is **not** advanced past the corrupt batch — so a restart re-reads it. Set to `false` to skip the check and restore the pre-3.0 behaviour, where a corrupt batch was delivered to the application as if it were valid. | `true` |
 | retry                  | See [retry](Configuration.md#retry) for more information                                                                                                                                                                                                                                                                                           | `{ retries: 5 }`                 |
 | readUncommitted        | Configures the consumer isolation level. If `false` (default), the consumer will not return any transactional messages which were not committed.                                                                                                                                                                                                   | `false`                           |
-| maxInFlightRequests | Max number of requests that may be in progress at any time. If falsey then no limit.                                    | `null` _(no limit)_ |
+| maxInFlightRequests | Maximum requests in progress per connection. `null` means unbounded; `0` is rejected. | `5` |
 | rackId                 | Configure the "rack" in which the consumer resides to enable [follower fetching](#follower-fetching)                 | `null` _(fetch from the leader always)_ |
 | groupInstanceId        | Static membership id (KIP-345). See [Static membership](#static-membership)                                          | `null` _(dynamic membership)_ |
 | groupProtocol          | The group membership protocol: `'classic'` or `'consumer'` (KIP-848, Kafka 4.0+). See [Consumer group protocols](#group-protocols) | `'classic'` |
@@ -442,7 +442,7 @@ consumer.seek({ topic: 'example', partition: 0, offset: 12384 })
 
 Upon seeking to an offset, any messages in active batches are marked as stale and discarded, making sure the next message read for the partition is from the offset sought to. Make sure to check `isStale()` before processing a message using [the `eachBatch` interface](#each-batch) of `consumer.run`.
 
-By default, the consumer will commit the offset seeked. To disable this, set the [`autoCommit`](#auto-commit) option to `false` on the consumer.
+For a concrete offset, the consumer commits the sought offset by default; set [`autoCommit`](#auto-commit) to `false` to disable that commit. A sentinel seek to `'-2'` (earliest) or `'-1'` (latest) instead requests that partition's exact boundary through ListOffsets on the next resolution, independently of `fromBeginning` and `autoCommit`. The following fetch starts at the returned concrete offset. A sentinel seek never commits the negative sentinel. Pending sentinel intent is discarded if ownership is lost or the consumer stops.
 
 ```javascript
 consumer.run({

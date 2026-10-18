@@ -2,7 +2,7 @@
 
 A pure-JavaScript [Apache Kafka](https://kafka.apache.org/) client for Node.js, maintained by [Countly](https://github.com/Countly) as a standalone continuation of [KafkaJS](https://github.com/tulios/kafkajs) 2.2.4.
 
-- **Drop-in for KafkaJS users**: same public API, same runtime semantics (`eachMessage`/`eachBatch`, pause/resume, instrumentation events, error classes).
+- **Drop-in for KafkaJS users**: preserved API plus documented semantic differences. `eachMessage`/`eachBatch`, pause/resume, instrumentation events and error classes remain available; see the [migration guide](./docs/MigrationGuide-3-0-0.md).
 - **Targets current infrastructure**: Apache Kafka **4.0+** (KRaft) and Node.js **22+**. Older brokers and runtimes are not supported.
 - **Zero required runtime dependencies** (one optional native dependency, `lz4-napi`, enables LZ4 compression), CommonJS entry point plus an ES module entry.
 
@@ -59,9 +59,11 @@ run().catch(console.error)
 Documentation lives in the [`docs/`](./docs) folder of this repository:
 [Getting Started](./docs/GettingStarted.md) · [Configuration](./docs/Configuration.md) · [Producing](./docs/Producing.md) · [Consuming](./docs/Consuming.md) · [Admin](./docs/Admin.md) · [Instrumentation events](./docs/InstrumentationEvents.md) · [Transactions](./docs/Transactions.md).
 
+Compression is selected per `send()` or `sendBatch()` call; there is no producer-level default. An omitted codec sends uncompressed, and setting a codec on one send does not change later sends. See [compression](./docs/Producing.md#compression).
+
 ## Migrating from `kafkajs`
 
-Replace the package name; the API is unchanged. Behavior differences introduced by this fork (Kafka 4.0+ only, defaults that follow the Java client) are listed in the [CHANGELOG](./CHANGELOG.md) and, from 3.0.0, in a migration guide.
+Replace the package name for the preserved API plus documented semantic differences. Read the [migration guide](./docs/MigrationGuide-3-0-0.md) for the changed defaults and behavior, and the [CHANGELOG](./CHANGELOG.md) for release details.
 
 ## Contributing
 

@@ -5,20 +5,11 @@ title: Retry Mechanism Explained
 
 The retry mechanism uses a randomization function that grows exponentially. This formula and how the default values affect it is best described by the example below:
 
-- 1st retry:
-  - Always a flat `initialRetryTime` ms
-  - Default: `300ms`
-- Nth retry:
-  - Formula: `Random(previousRetryTime * (1 - factor), previousRetryTime * (1 + factor)) * multiplier`
-  - N = 1:
-    - Since `previousRetryTime == initialRetryTime` just plug the values in the formula:
-    - Random(300 * (1 - 0.2), 300 * (1 + 0.2)) * 2 => Random(240, 360) * 2 => (480, 720) ms
-    - Hence, somewhere between `480ms` to `720ms`
-  - N = 2:
-    - Since `previousRetryTime` from N = 1 was in a range between 480ms and 720ms, the retry for this step will be in the range of:
-    - `previousRetryTime = 480ms` => Random(480 * (1 - 0.2), 480 * (1 + 0.2)) * 2 => Random(384, 576) * 2 => (768, 1152) ms
-    - `previousRetryTime = 720ms` => Random(720 * (1 - 0.2), 720 * (1 + 0.2)) * 2 => Random(576, 864) * 2 => (1152, 1728) ms
-    - Hence, somewhere between `768ms` to `1728ms`
-  - And so on...
+- First retry: `ceil(Random(initialRetryTime * (1 - factor), initialRetryTime * (1 + factor)))`, clamped to zero or above.
+  With the shared defaults (`initialRetryTime = 300`, `factor = 0.2`), the delay is 240–360 ms.
+- Second retry: `min(maxRetryTime, ceil(Random(previous * (1 - factor), previous * (1 + factor))) * multiplier)`, clamped to zero or above.
+  With `multiplier = 2`, the possible delay is 384–864 ms.
+- Third retry: the same recurrence gives 616–2074 ms. The ceilings are applied before multiplication, so the lower bound is 616 ms, rather than 614.4 ms.
+- Later delays use the same recurrence and the shared `maxRetryTime = 30000` ms cap. These are ranges across all random draws, not a promise that every run visits each endpoint.
 
-![Plot with default configuration](assets/retry-plot.svg)
+These values describe the shared retry defaults. Explicit retry options override them. Producer-specific defaults must be checked separately when they change.

@@ -159,3 +159,93 @@ describe('docs/Testing.md', () => {
     })
   })
 })
+
+describe('documented consumer and retry behavior', () => {
+  const { Kafka } = require('../../index')
+  const resolveTimeouts = require('../../src/consumer/groupTimeouts')
+  const retry = require('../../src/retry')
+  const defaults = require('../../src/retry/defaults')
+  const consuming = read('docs', 'Consuming.md')
+  const faq = read('docs', 'FAQ.md')
+  const config = read('docs', 'Configuration.md')
+  const detailed = read('docs', 'RetryDetailed.md')
+  const intro = read('docs', 'KafkaIntro.md')
+  const readme = read('README.md')
+  it('documents the validated in-flight limit', () => {
+    expect(read('src', 'index.js')).toContain('const DEFAULT_MAX_IN_FLIGHT_REQUESTS = 5')
+    const kafka = new Kafka({ brokers: ['localhost:1'] })
+    expect(() => kafka.consumer({ groupId: 'docs', maxInFlightRequests: 0 })).toThrow(
+      /maxInFlightRequests/
+    )
+    expect(() => kafka.consumer({ groupId: 'docs', maxInFlightRequests: null })).not.toThrow()
+    const row = consuming.split('\n').find((line) => line.startsWith('| maxInFlightRequests'))
+    expect(row).toContain('`5`')
+    expect(row).toContain('`null` means unbounded')
+    expect(row).toContain('`0` is rejected')
+    expect(row).not.toMatch(/falsey|falsy/)
+  })
+  it('separates yielding work, event-loop blocking and the global poll guard', () => {
+    const resolved = resolveTimeouts({ rebalanceTimeout: 20000, logger: { warn() {} } })
+    expect(resolved.rebalanceTimeout).toBe(20000)
+    expect(resolved.pollDeadline).toBe(300000)
+    for (const doc of [consuming, faq]) {
+      expect(doc).toContain('background heartbeat')
+      expect(doc).toContain('event-loop-blocking')
+      expect(doc).toContain('maxPollInterval')
+      expect(doc).toContain('all partitions')
+    }
+  })
+  it('names the permanent restart exceptions', () => {
+    const consumer = read('src', 'consumer', 'index.js')
+    expect(consumer).toContain(
+      'isFencedInstance(e) || (isConsumerProtocol && isConsumerProtocolFatal(e))'
+    )
+    expect(config).toContain('fenced static instance')
+    expect(config).toContain('fatal membership')
+    expect(config).toContain('even if `restartOnFailure` returns `true`')
+  })
+  it('derives the jittered ranges from the production retry defaults', () => {
+    expect(defaults).toMatchObject({ initialRetryTime: 300, factor: 0.2, multiplier: 2 })
+    const random = jest.spyOn(Math, 'random')
+    try {
+      const backoff = retry.backoff(defaults)
+      random.mockReturnValue(0)
+      expect(backoff.initial()).toBe(240)
+      expect(backoff.next(240)).toBe(384)
+      expect(backoff.next(384)).toBe(616)
+      random.mockReturnValue(1 - Number.EPSILON)
+      expect(backoff.initial()).toBe(360)
+      expect(backoff.next(360)).toBe(864)
+      expect(backoff.next(864)).toBe(2074)
+    } finally {
+      random.mockRestore()
+    }
+    for (const range of ['240–360 ms', '384–864 ms', '616–2074 ms'])
+      expect(detailed).toContain(range)
+    expect(detailed).not.toContain('Always a flat')
+  })
+  it('describes partition leaders, group coordinators and both membership protocols', () => {
+    for (const text of [
+      'follower fetching',
+      'broker that coordinates',
+      'group leader',
+      'classic',
+      'consumer protocol',
+    ])
+      expect(intro).toContain(text)
+  })
+  it('links the preserved API and its documented semantic differences', () => {
+    expect(readme).toContain('preserved API plus documented semantic differences')
+    expect(readme).toContain('./docs/MigrationGuide-3-0-0.md')
+    expect(readme).not.toContain('same runtime semantics')
+    expect(readme).toContain('there is no producer-level default')
+    expect(readme).toContain('An omitted codec sends uncompressed')
+  })
+  it('compares both canary reports and requires the span outcome proof', () => {
+    expect(page).toContain('node scripts/canary/compare.js')
+    expect(page).toContain('previous.json current.json')
+    expect(page).toContain('--reporter json')
+    expect(page).toContain('send canary-spans')
+    expect(page).toContain('Exit 0 from the load command alone is insufficient')
+  })
+})

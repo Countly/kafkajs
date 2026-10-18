@@ -459,11 +459,17 @@ module.exports = class ConsumerGroup {
 
   /**
    * Tells the membership the consumer is shutting down, so a join waiting on the coordinator is
-   * rejected rather than waiting for a heartbeat chain that is about to be cancelled. A no-op
-   * under classic.
+   * rejected rather than waiting for a heartbeat chain that is about to be cancelled. Cancels
+   * queued sentinel seeks and pending sentinel resolutions for either group protocol.
    * @returns {void}
    */
   onStopRequested() {
+    for (const [key, offset] of this.seekOffset) {
+      if (offset === '-2' || offset === '-1') {
+        this.seekOffset.delete(key)
+      }
+    }
+    this.offsetManager?.clearPendingSeeks()
     return this.groupMembership.onStopRequested()
   }
 
@@ -649,6 +655,7 @@ module.exports = class ConsumerGroup {
     )
 
     if (rebuildOffsets || !this.offsetManager) {
+      this.offsetManager?.clearPendingSeeks()
       this.offsetManager = new OffsetManager({
         cluster: this.cluster,
         topicConfigurations: this.topicConfigurations,

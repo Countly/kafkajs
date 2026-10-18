@@ -908,7 +908,7 @@ module.exports = class Cluster {
    *                          [
    *                            {
    *                              topic: 'my-topic-name',
-   *                              partitions: [{ partition: 0 }],
+   *                              partitions: [{ partition: 0, timestamp: -2 }],
    *                              fromBeginning: false
    *                            }
    *                          ]
@@ -924,6 +924,8 @@ module.exports = class Cluster {
    *                            },
    *                          ]
    *
+   * An optional per-partition `timestamp` overrides the topic's timestamp/default, so one request
+   * can resolve explicit earliest and latest seeks independently. Zero remains a valid timestamp.
    * Each requested partition carries `currentLeaderEpoch`, the client's current view of that
    * partition's leader epoch from `MetadataCache#leaderEpoch` (-1 when the cache has not seen
    * the partition), letting the broker fence a request built on metadata that has since moved.
@@ -941,7 +943,7 @@ module.exports = class Cluster {
       const { timestamp } = topicConfigurations[topic]
       return {
         ...partition,
-        timestamp,
+        timestamp: partition.timestamp ?? timestamp,
         currentLeaderEpoch: this.metadataCache.leaderEpoch(topic, partition.partition),
       }
     }

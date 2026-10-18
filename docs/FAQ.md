@@ -29,7 +29,7 @@ A rebalance will happen in a number of scenarios:
 
 * A new member joins the consumer group
 * A member leaves the consumer group (for example when shutting down)
-* A member is considered dead by the group coordinator. This happens when there have been no heartbeats sent within the configured session timeout. This would indicate that the consumer has crashed or is busy with some long-running processing, such as for example if the execution of `eachMessage` takes longer than the session timeout.
+* A member is considered dead by the group coordinator after no heartbeat arrives within `sessionTimeout`. Yielding asynchronous work is kept alive by the background heartbeat, while an event-loop-blocking handler can starve it. Processing is also bounded by `maxPollInterval`; increasing `sessionTimeout` or manually calling `heartbeat()` does not extend that deadline. The poll guard is global across all partitions, so progress on another partition can refresh it while one handler is stuck.
 * Partitions have been added or removed from the topic
 
 The rebalancing state is enforced on the broker side. When a consumer tries to commit offsets, the broker will respond with `REBALANCE_IN_PROGRESS`. Upon receiving that, the consumer group leader will receive a list of currently active members of the consumer group. Using the [partition assigner](Consuming.md#a-name-custom-partition-assigner-a-custom-partition-assigner) configured on the client, the consumer group leader will assign each partition to a consumer within the group and submit the assignment back to the group coordinator, which distributes the relevant assignments to the members of the consumer group. When this is done, the group is considered in-sync again and processing can continue.

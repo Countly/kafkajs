@@ -92,6 +92,8 @@ kafka.logger().error('Instantiated KafkaJS')
 
 // CONSUMER
 const consumer = kafka.consumer({ groupId: 'test-group' })
+// @ts-expect-error message delivery uses run; there is no poll method
+consumer.poll()
 consumer.logger().info('Instantiated logger', { groupId: 'test-group' })
 
 let removeListener = consumer.on(consumer.events.HEARTBEAT, e =>
