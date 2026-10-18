@@ -406,13 +406,15 @@ class Soak {
   }
 
   /**
-   * Runs every phase, reads the quiet points and judges the run.
+   * Runs every phase, reads the quiet points and judges the run. The baseline is read once the
+   * sockets the setup closed are gone, so it counts only what the clients will leave behind.
    * @returns {Promise<ReturnType<typeof evaluate>>} the verdict; the lines were recorded as they
    *   were taken
    * @throws {Error} the failure of a workload, after its sampler is stopped
    */
   async run() {
     const startedAt = Date.now()
+    await this.settle()
     const baseline = await this.probe.snapshot()
     this.record({ kind: 'baseline', snapshot: baseline })
 

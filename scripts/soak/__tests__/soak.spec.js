@@ -833,6 +833,44 @@ describe('Soak > a run on the scripted cluster', () => {
     }
   })
 
+  test('reads the baseline only after the sockets closed by the setup are gone', async () => {
+    let closed = false
+    const closing = setTimeout(() => {
+      closed = true
+    }, 150)
+    const probe = {
+      snapshot: async () =>
+        quiet({
+          listeners: { requestQueues: 0, sockets: closed ? 0 : 1 },
+          sockets: { created: 1, destroyed: closed ? 1 : 0, open: closed ? 0 : 1 },
+        }),
+    }
+    const lines = []
+    const soak = new Soak({
+      kafka: {},
+      probe,
+      phases: [{ name: 'idle', workload: 'idle', ms: 0 }],
+      context: {},
+      sampleMs: 60000,
+      warmupMs: 0,
+      settleMs: 2000,
+      record: (line) => lines.push(line),
+      workloads: { idle: async () => {} },
+    })
+
+    try {
+      const verdict = await soak.run()
+
+      expect(lines[0]).toMatchObject({
+        kind: 'baseline',
+        snapshot: { listeners: { sockets: 0 }, sockets: { open: 0 } },
+      })
+      expect(verdict.violations).toEqual(['0 heap samples after warm-up, 6 are needed'])
+    } finally {
+      clearTimeout(closing)
+    }
+  })
+
   test('reads the private members of a client by name, and says when one is gone', () => {
     const stand = { [Symbol('private:Kafka:operations')]: new Map() }
 
