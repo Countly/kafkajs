@@ -1,3 +1,4 @@
+const describeThrown = require('../network/describeThrown')
 const createRetry = require('../retry')
 const {
   KafkaJSError,
@@ -11,6 +12,7 @@ const {
 const { staleMetadata } = require('../protocol/error')
 const { RETRIABLE_CATEGORIES } = require('../protocol/errorCategories')
 const { CONNECTION_STATUS } = require('../network/connectionStatus')
+const { isConnectionFailure } = require('../network/connectionFailure')
 const { isArmed } = require('./eosManager/transactionStates')
 const { surfaceInTransaction } = require('./eosManager')
 const groupMessagesPerPartition = require('./groupMessagesPerPartition')
@@ -86,11 +88,12 @@ const attachFailingRecords = (e, topicData) => {
  * @returns {boolean}
  */
 const refreshesMetadata = (e) =>
-  staleMetadata(e) ||
-  e.name === 'KafkaJSMetadataNotLoaded' ||
-  e.name === 'KafkaJSConnectionError' ||
-  e.name === 'KafkaJSConnectionClosedError' ||
-  (e.name === 'KafkaJSProtocolError' && e.retriable)
+  staleMetadata({ type: describeThrown(e, 'type') }) ||
+  describeThrown(e, 'name') === 'KafkaJSMetadataNotLoaded' ||
+  isConnectionFailure(e) ||
+  describeThrown(e, 'name') === 'KafkaJSConnectionClosedError' ||
+  (describeThrown(e, 'name') === 'KafkaJSProtocolError' &&
+    describeThrown(e, 'retriable') === 'true')
 
 /**
  * The topic ids of a produce request, when every topic in it has one: the request can then be

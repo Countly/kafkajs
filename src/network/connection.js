@@ -1,9 +1,17 @@
+const { isNativeError } = require('util').types
+const describeThrown = require('./describeThrown')
 const createSocket = require('./socket')
 const createRequest = require('../protocol/request')
 const Decoder = require('../protocol/decoder')
 const { NETWORK_AUTHENTICATION_FAILURE } = require('./instrumentationEvents')
-const { KafkaJSConnectionError, KafkaJSConnectionClosedError } = require('../errors')
-const { INT_32_MAX_VALUE } = require('../constants')
+const {
+  KafkaJSConnectionError,
+  KafkaJSNonRetriableError,
+  KafkaJSConnectionClosedError,
+  KafkaJSInvalidFrameError,
+} = require('../errors')
+const { INT_32_MAX_VALUE, DEFAULT_MAX_RESPONSE_SIZE } = require('../constants')
+const FrameBuffer = require('./frameBuffer')
 const getEnv = require('../env')
 const RequestQueue = require('./requestQueue')
 const { CONNECTION_STATUS, CONNECTED_STATUS } = require('./connectionStatus')
@@ -83,6 +91,10 @@ module.exports = class Connection {
    * @param {number} [options.reauthenticationThreshold=10000]
    * @param {number} options.connectionTimeout The connection timeout, in milliseconds
    * @param {boolean} [options.enforceRequestTimeout]
+   * @param {number} [options.maxResponseSize=104857600] The largest response body accepted, in bytes,
+   *                                            the 4-byte length prefix excluded. A larger, negative or
+   *                                            impossibly short frame closes the connection with
+   *                                            `KafkaJSInvalidFrameError`.
    * @param {number|null} [options.maxInFlightRequests=5] The maximum number of unacknowledged requests on a
    *                                            connection before enqueuing (Java's
    *                                            max.in.flight.requests.per.connection default).
@@ -107,6 +119,7 @@ module.exports = class Connection {
     clientId = 'kafkajs',
     connectionTimeout,
     enforceRequestTimeout = true,
+    maxResponseSize = DEFAULT_MAX_RESPONSE_SIZE,
     maxInFlightRequests = 5,
     instrumentationEmitter = null,
     onAuthenticationFailure = null,
@@ -128,9 +141,16 @@ module.exports = class Connection {
     this.instrumentationEmitter = instrumentationEmitter
     this.onAuthenticationFailure = onAuthenticationFailure
 
-    this.bytesBuffered = 0
-    this.bytesNeeded = Decoder.int32Size()
-    this.chunks = []
+    /**
+     * Splits what the socket delivers into response frames; reset on every connect and every close.
+     * @type {FrameBuffer}
+     */
+    this.frames = new FrameBuffer({
+      maxBodySize: maxResponseSize,
+      broker: this.broker,
+      onFrame: (body) => this.fulfillFrame(body),
+      minBodyOf: (correlationId) => this.minBodyOf(correlationId),
+    })
 
     this.connectionStatus = CONNECTION_STATUS.DISCONNECTED
     this.correlationId = 0
@@ -168,6 +188,13 @@ module.exports = class Connection {
       broker: this.broker,
       logger: logger.namespace('RequestQueue'),
       isConnected: () => this.isConnected(),
+      onRequestTimeout: () =>
+        this.closeGeneration(
+          new KafkaJSConnectionClosedError('Closed connection', {
+            host: this.host,
+            port: this.port,
+          })
+        ),
     })
 
     this.versions = null
@@ -287,6 +314,7 @@ module.exports = class Connection {
         if (!isCurrentAttempt()) return
         clearTimeout(timeoutId)
         this[PRIVATE.ABORT_CONNECT] = null
+        this.frames.reset()
         this.connectionStatus = CONNECTION_STATUS.CONNECTED
         this.requestQueue.scheduleRequestTimeoutCheck()
         this.generation += 1
@@ -295,66 +323,72 @@ module.exports = class Connection {
 
       const onData = (data) => {
         if (!isCurrentAttempt()) return
-        this.processData(data)
+        try {
+          this.processData(data)
+        } catch (error) {
+          let framed = false
+          try {
+            framed = isNativeError(error) && error instanceof KafkaJSInvalidFrameError
+          } catch {}
+          this.failGeneration(
+            framed
+              ? error
+              : new KafkaJSInvalidFrameError('Unreadable response frame', {
+                  broker: this.broker,
+                  reason: 'unreadable',
+                  cause: error,
+                }),
+            framed ? null : 'Unreadable response frame: '
+          )
+        }
       }
 
-      const onEnd = async () => {
+      const onEnd = () => {
         if (!isCurrentAttempt()) return
-        clearTimeout(timeoutId)
-
-        const wasConnected = this.isConnected()
-
-        if (wasConnected) {
-          this.logDebug('Kafka server has closed connection')
-          this.rejectRequests(
-            new KafkaJSConnectionClosedError('Closed connection', {
+        const error = this.isConnected()
+          ? new KafkaJSConnectionClosedError('Closed connection', {
               host: this.host,
               port: this.port,
             })
-          )
-        }
-
-        // Deliberately does not clear ABORT_CONNECT: if this fires before the socket ever
-        // connected, the disconnect() below finds it still set and rejects this attempt's
-        // promise instead of leaving it to hang past its own timeout (already cleared above).
-        await this.disconnect()
+          : new KafkaJSConnectionError('Connection closed while connecting', {
+              broker: this.broker,
+            })
+        this.failGeneration(error)
       }
 
-      const onError = async (e) => {
+      const onError = (e) => {
         if (!isCurrentAttempt()) return
-        clearTimeout(timeoutId)
-        this[PRIVATE.ABORT_CONNECT] = null
-
         const error = new KafkaJSConnectionError(`Connection error: ${e.message}`, {
-          broker: `${this.host}:${this.port}`,
+          broker: this.broker,
           code: e.code,
         })
-
-        this.logError(error.message, { stack: e.stack })
-        this.rejectRequests(error)
-        await this.disconnect()
-
-        reject(error)
+        this.failGeneration(error)
+        try {
+          this.logError(error.message, { stack: e.stack })
+        } catch {}
       }
 
-      const onTimeout = async () => {
+      const onTimeout = () => {
         if (!isCurrentAttempt()) return
-        this[PRIVATE.ABORT_CONNECT] = null
-
         const error = new KafkaJSConnectionError('Connection timeout', {
-          broker: `${this.host}:${this.port}`,
+          broker: this.broker,
         })
-
-        this.logError(error.message)
-        this.rejectRequests(error)
-        await this.disconnect()
-        reject(error)
+        this.failGeneration(error)
+        try {
+          this.logError(error.message)
+        } catch {}
       }
 
-      this.logDebug(`Connecting`, {
-        ssl: !!this.ssl,
-        sasl: !!this.sasl,
-      })
+      try {
+        this.logDebug('Connecting', { ssl: !!this.ssl, sasl: !!this.sasl })
+      } catch (error) {
+        const native = isNativeError(error)
+        this.failGeneration(
+          native ? error : new KafkaJSNonRetriableError('Failed to connect', { cause: error }),
+          native ? null : 'Failed to connect: '
+        )
+        return
+      }
 
       try {
         timeoutId = setTimeout(onTimeout, this.connectionTimeout)
@@ -370,44 +404,42 @@ module.exports = class Connection {
           onTimeout,
         })
       } catch (e) {
-        clearTimeout(timeoutId)
-        this[PRIVATE.ABORT_CONNECT] = null
-        reject(
-          new KafkaJSConnectionError(`Failed to connect: ${e.message}`, {
-            broker: `${this.host}:${this.port}`,
-          })
+        this.failGeneration(
+          new KafkaJSConnectionError('Failed to connect', {
+            broker: this.broker,
+            cause: e,
+          }),
+          'Failed to connect: '
         )
       }
     })
   }
 
   /**
-   * Tears down the current socket, rejecting any in-flight `connect()` attempt it supersedes
-   * (KIP-35 rule 7 depends on a reconnect never leaving a caller hanging past its timeout) with a
-   * plain, retriable `KafkaJSConnectionError` — not `KafkaJSConnectionClosedError`, which several
-   * `src/cluster/` branches don't recognise by name, since it would otherwise skip seed-broker
-   * rotation and metadata refresh on a connect that was merely superseded, not actually refused.
-   * `data`/`end`/`timeout` are detached from the socket before it is closed: those events are
-   * only ever meaningful to the attempt that owned the socket, and the peer's own FIN can be
-   * delivered asynchronously, possibly after a new socket has already replaced this one. `error`
-   * stays attached — inert once this attempt is no longer current — so a post-close error on the
-   * old socket (e.g. `ECONNRESET`) cannot become an uncaught exception. The socket to tear down
-   * and the epoch to downgrade to DISCONNECTED are both captured up front, before
-   * `waitForPendingRequests()` yields: a concurrent `disconnect()`/`connect()` pair can otherwise
-   * install a new socket (and move the status past DISCONNECTING) while this call is still
-   * draining, and this call's continuation must act on the socket and epoch it actually owns, not
-   * on whatever `this.socket`/`this.connectAttempt` happen to hold once it resumes. A socket the
-   * broker already destroyed is left alone, so repeated calls add no listeners to it. Ending the
-   * epoch also ends the attempt's request order: see `send()`.
+   * Closes this connection: waits for the pending and in-flight requests, for at most
+   * `drainTimeout` when given, then ends the generation with the teardown `failGeneration` shares.
+   * It rejects any in-flight `connect()` attempt it supersedes (KIP-35 rule 7 depends on a
+   * reconnect never leaving a caller hanging past its timeout) with a plain, retriable
+   * `KafkaJSConnectionError` — not `KafkaJSConnectionClosedError`, which several `src/cluster/`
+   * branches do not recognise by name, since it would otherwise skip seed-broker rotation and
+   * metadata refresh on a connect that was merely superseded, not actually refused.
+   *
+   * The socket to tear down and the epoch to end are captured up front, before the drain yields: a
+   * concurrent `disconnect()`/`connect()` pair can otherwise install a new socket while this call is
+   * still draining, and its continuation must act on the socket and epoch it owns. A drain that
+   * outlives `drainTimeout` ends with the requests still pending rejected with
+   * `KafkaJSConnectionClosedError`; `drainTimeout: 0` closes at once. The socket is destroyed, not
+   * ended, so a half-open one cannot linger. The connection stays reusable: the next `connect()`
+   * opens a new socket.
    *
    * @public
-   * @returns {Promise}
+   * @param {object} [options]
+   * @param {number} [options.drainTimeout] ms to wait for requests to finish; unbounded when omitted
+   * @returns {Promise<true>}
    */
-  async disconnect() {
+  async disconnect({ drainTimeout } = {}) {
     this.authenticatedAt = null
     this.connectionStatus = CONNECTION_STATUS.DISCONNECTING
-    this.logDebug('disconnecting...')
-
     const abortConnect = this[PRIVATE.ABORT_CONNECT]
     this[PRIVATE.ABORT_CONNECT] = null
     if (abortConnect) {
@@ -422,7 +454,14 @@ module.exports = class Connection {
 
     // In-flight requests still need this socket's data handler, so the drain runs on the
     // current epoch; the epoch ends only afterwards.
-    await this.requestQueue.waitForPendingRequests()
+    let drainFailed = false
+    let drainFailure
+    try {
+      await this.drain(drainTimeout)
+    } catch (error) {
+      drainFailed = true
+      drainFailure = error
+    }
 
     // A newer connect()/disconnect() pair that ran while the drain was yielding already owns
     // this connection's socket and status; this disconnect() has nothing left to do.
@@ -430,28 +469,125 @@ module.exports = class Connection {
       return true
     }
 
-    // Ends the attempt's epoch: every handler still attached to the socket torn down below
-    // (possibly mid-connect, possibly long since connected) recognises itself as stale from here.
-    this.connectAttempt += 1
-    this.requestQueue.destroy()
+    this.closeGeneration(
+      new KafkaJSConnectionClosedError('Closed connection', { host: this.host, port: this.port }),
+      socket || this.socket
+    )
+    if (drainFailed) {
+      try {
+        this.logError('Failed to drain connection', {
+          error: describeThrown(drainFailure),
+          cause: drainFailure,
+        })
+      } catch {}
+    }
+    this.requestQueue.emitQueueState()
+    try {
+      this.logDebug('disconnected')
+    } catch {}
+    return true
+  }
 
-    // A socket already closed is left alone: unref() on it queues a 'connect' listener that never
-    // fires, one per disconnect() call.
+  /**
+   * Ends the current generation at once, synchronously and idempotently: a call on a connection
+   * with no live generation does nothing. The order matters, so that no observer and no promise
+   * reaction can see a half-failed connection: the attempt ends and the connection is marked
+   * disconnected, the socket is destroyed, the framing state is reset, every other in-flight and
+   * pending request is rejected with `error`, and only then do the queue's observers run, each
+   * contained. A request still encoding is rejected when its encoder returns, and a late reply on
+   * the destroyed socket is dropped. The next request reconnects.
+   *
+   * @public
+   * @param {Error} error what every request left on this connection is rejected with
+   * @param {string|null} [messagePrefix=null] describe the original cause after close and settlement,
+   *   before observers run; only freshly constructed wrappers supply a prefix
+   * @returns {void}
+   */
+  failGeneration(error, messagePrefix = null) {
+    if (
+      !this.socket &&
+      !this[PRIVATE.ABORT_CONNECT] &&
+      this.connectionStatus === CONNECTION_STATUS.DISCONNECTED
+    ) {
+      return
+    }
+
+    this.closeGeneration(error)
+    if (messagePrefix !== null) {
+      error.message = messagePrefix + describeThrown(error.cause)
+    }
+    this.requestQueue.emitQueueState()
+    try {
+      this.logDebug('Generation failed', {
+        cause: describeThrown(error, 'name'),
+        ...this.frames.usage,
+      })
+    } catch {}
+  }
+
+  /**
+   * The teardown `failGeneration` and `disconnect()` share, with no observer run.
+   * @private
+   * @param {Error} error what the requests left on the connection are rejected with
+   * @param {object} [socket=this.socket] the socket of the generation being ended
+   * @returns {void}
+   */
+  closeGeneration(error, socket = this.socket) {
+    const abortConnect = this[PRIVATE.ABORT_CONNECT]
+    this[PRIVATE.ABORT_CONNECT] = null
+    this.connectAttempt += 1
+    this.authenticatedAt = null
+    this.connectionStatus = CONNECTION_STATUS.DISCONNECTED
+    if (abortConnect) {
+      abortConnect(error)
+    }
+
+    // `error` stays attached, inert once the attempt is over: a post-close error on the old socket
+    // (e.g. ECONNRESET) must not become an uncaught exception.
     if (socket && !socket.destroyed) {
-      // socketFactory's documented contract is a real net.Socket, which always has this; guarded
-      // anyway since nothing else here needs more than end()/unref() from the socket.
       if (typeof socket.removeAllListeners === 'function') {
         socket.removeAllListeners('data')
         socket.removeAllListeners('end')
         socket.removeAllListeners('timeout')
       }
-      socket.end()
-      socket.unref()
+      socket.destroy()
     }
 
-    this.connectionStatus = CONNECTION_STATUS.DISCONNECTED
-    this.logDebug('disconnected')
-    return true
+    if (this.socket === socket) {
+      this.socket = null
+    }
+
+    this.frames.reset()
+    this.requestQueue.settleAll(error)
+    this.requestQueue.destroy()
+  }
+
+  /**
+   * Waits for the requests of this connection to finish, for at most `drainTimeout` when given.
+   * The one timer is cleared whichever way the wait ends.
+   * @private
+   * @param {number} [drainTimeout] ms; unbounded when omitted, none when 0
+   * @returns {Promise<void>}
+   */
+  async drain(drainTimeout) {
+    if (drainTimeout === undefined) {
+      return this.requestQueue.waitForPendingRequests()
+    }
+
+    if (drainTimeout === 0) {
+      return
+    }
+
+    let timer
+    const bound = new Promise((resolve) => {
+      timer = setTimeout(resolve, drainTimeout)
+    })
+
+    try {
+      await Promise.race([this.requestQueue.waitForPendingRequests(), bound])
+    } finally {
+      clearTimeout(timer)
+    }
   }
 
   /**
@@ -532,13 +668,17 @@ module.exports = class Connection {
    *
    * @param {number} [protocol.requestTimeout=null] Override for the default requestTimeout
    * @param {boolean} [protocol.logResponseError=true] Whether to log errors
+   * @param {() => Error|null} [protocol.guard=null] A pre-write check. It runs once the request is
+   *                         encoded and again at the instant of transmission; an error it returns
+   *                         rejects this one request, which is then written nowhere, takes no
+   *                         in-flight slot and leaves the connection open.
    * @returns {Promise<data>} where data is the return of "response#parse"
    */
-  async send({ request, response, requestTimeout = null, logResponseError = true }) {
+  async send({ request, response, requestTimeout = null, logResponseError = true, guard = null }) {
     const attempt = this.connectAttempt
     const expectResponse = !request.expectResponse || request.expectResponse()
-    const prepared = this[PRIVATE.PREPARE]({ request, expectResponse })
-    const enqueue = (encoded) => this[PRIVATE.ENQUEUE](encoded, requestTimeout, attempt)
+    const prepared = this[PRIVATE.PREPARE]({ request, expectResponse, guard })
+    const enqueue = (encoded) => this[PRIVATE.ENQUEUE](encoded, requestTimeout, attempt, guard)
 
     let queued
     if (isAuthenticatedRequest(request)) {
@@ -602,11 +742,12 @@ module.exports = class Connection {
   /**
    * Authenticates when needed and encodes the request under the next correlation id.
    * @private
-   * @param {{ request: object, expectResponse: boolean }} options
+   * @param {{ request: object, expectResponse: boolean, guard: (() => Error|null)|null }} options
    * @returns {Promise<{ request: object, expectResponse: boolean, correlationId: number,
    *   requestPayload: object }>}
+   * @throws {Error} the error the guard returns, once the request is authenticated and encoded
    */
-  async [PRIVATE.PREPARE]({ request, expectResponse }) {
+  async [PRIVATE.PREPARE]({ request, expectResponse, guard }) {
     if (!this.isAuthenticated() && isAuthenticatedRequest(request)) {
       await this[PRIVATE.AUTHENTICATE]()
     }
@@ -622,6 +763,11 @@ module.exports = class Connection {
       size: Buffer.byteLength(requestPayload.buffer),
     })
 
+    const refusal = guard && guard()
+    if (refusal) {
+      throw refusal
+    }
+
     return { request, expectResponse, correlationId, requestPayload }
   }
 
@@ -633,6 +779,7 @@ module.exports = class Connection {
    * @param {number|null} requestTimeout
    * @param {number} attempt the `connectAttempt` the request was sent under; a request of an older
    *   attempt is refused
+   * @param {(() => Error|null)|null} guard checked again by the queue at transmission
    * @returns {{ answered: Promise<{ correlationId: number, size: number, entry: object,
    *   payload: Buffer }> }} `answered` settles with the response frame; wrapped so that waiting
    *   for the push does not wait for the response
@@ -640,7 +787,8 @@ module.exports = class Connection {
   [PRIVATE.ENQUEUE](
     { request, expectResponse, correlationId, requestPayload },
     requestTimeout,
-    attempt
+    attempt,
+    guard
   ) {
     const { apiKey, apiName, apiVersion } = request
     const answered = new Promise((resolve, reject) => {
@@ -652,6 +800,7 @@ module.exports = class Connection {
           entry,
           expectResponse,
           requestTimeout,
+          guard,
           sendRequest: () => {
             this.socket.write(requestPayload.buffer, 'binary')
           },
@@ -702,45 +851,45 @@ module.exports = class Connection {
   }
 
   /**
+   * Feeds what the socket delivered to the frame buffer, which hands every complete frame to
+   * `fulfillFrame` as it is found.
    * @private
+   * @param {Buffer} rawData
+   * @throws {KafkaJSInvalidFrameError} for a frame that is negative, too short or above the limit
    */
   processData(rawData) {
-    // Accumulate the new chunk
-    this.chunks.push(rawData)
-    this.bytesBuffered += Buffer.byteLength(rawData)
+    this.frames.push(rawData)
+  }
 
-    // Process data if there are enough bytes to read the expected response size,
-    // otherwise keep buffering
-    while (this.bytesNeeded <= this.bytesBuffered) {
-      const buffer = this.chunks.length > 1 ? Buffer.concat(this.chunks) : this.chunks[0]
-      const decoder = new Decoder(buffer)
-      const expectedResponseSize = decoder.readInt32()
+  /**
+   * Hands a response frame to the request queue: the correlation id first, then the rest.
+   * @private
+   * @param {Buffer} body
+   */
+  fulfillFrame(body) {
+    this.requestQueue.fulfillRequest({
+      size: body.length,
+      correlationId: body.readInt32BE(0),
+      payload: body.subarray(Decoder.int32Size()),
+    })
+  }
 
-      // Return early if not enough bytes to read the full response
-      if (!decoder.canReadBytes(expectedResponseSize)) {
-        this.chunks = [buffer]
-        this.bytesBuffered = Buffer.byteLength(buffer)
-        this.bytesNeeded = Decoder.int32Size() + expectedResponseSize
-        return
-      }
-
-      const response = new Decoder(decoder.readBytes(expectedResponseSize))
-
-      // Reset the buffered chunks as the rest of the bytes
-      const remainderBuffer = decoder.readAll()
-      this.chunks = [remainderBuffer]
-      this.bytesBuffered = Buffer.byteLength(remainderBuffer)
-      this.bytesNeeded = Decoder.int32Size()
-
-      const correlationId = response.readInt32()
-      const payload = response.readAll()
-
-      this.requestQueue.fulfillRequest({
-        size: expectedResponseSize,
-        correlationId,
-        payload,
-      })
+  /**
+   * @private
+   * @param {number} correlationId
+   * @returns {number} the smallest body the response to that request can have: 5 when its header is
+   *   flexible (a correlation id and a tag buffer), else 4, which is also what an unknown id gets
+   */
+  minBodyOf(correlationId) {
+    const request = this.requestQueue.inflight.get(correlationId)
+    if (!request) {
+      return Decoder.int32Size()
     }
+
+    const { apiKey, apiVersion } = request.entry
+    return responseHeaderVersion(apiKey, apiVersion) === RESPONSE_HEADER_V1
+      ? Decoder.int32Size() + 1
+      : Decoder.int32Size()
   }
 
   /**

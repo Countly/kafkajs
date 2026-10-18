@@ -1,7 +1,9 @@
+const describeThrown = require('../network/describeThrown')
 const BrokerPool = require('./brokerPool')
 const MetadataCache = require('./metadataCache')
 const { CLUSTER_TOPIC_RECREATED } = require('./instrumentationEvents')
 const Lock = require('../utils/lock')
+const { isConnectionFailure } = require('../network/connectionFailure')
 const sharedPromiseTo = require('../utils/sharedPromiseTo')
 const createRetry = require('../retry')
 const connectionPoolBuilder = require('./connectionPoolBuilder')
@@ -539,9 +541,9 @@ module.exports = class Cluster {
     } catch (e) {
       // The client probably has stale metadata
       if (
-        e.name === 'KafkaJSBrokerNotFound' ||
-        e.name === 'KafkaJSLockTimeout' ||
-        e.name === 'KafkaJSConnectionError'
+        describeThrown(e, 'name') === 'KafkaJSBrokerNotFound' ||
+        describeThrown(e, 'name') === 'KafkaJSLockTimeout' ||
+        isConnectionFailure(e)
       ) {
         await this.refreshMetadataBestEffort()
       }

@@ -1,6 +1,6 @@
 const apiKeys = require('../protocol/requests/apiKeys')
 const Connection = require('./connection')
-const { KafkaJSSASLAuthenticationError } = require('../errors')
+const { KafkaJSConnectionError, KafkaJSSASLAuthenticationError } = require('../errors')
 
 // Floor for the post-authentication-failure blackout, applied even when authenticationTimeout
 // is unset or shorter, so a misconfigured broker can't be hammered in a tight reconnect loop.
@@ -10,8 +10,12 @@ module.exports = class ConnectionPool {
   /**
    * @param {ConstructorParameters<typeof Connection>[0] & {
    *   authenticationTimeout?: number,
-   *   authenticationBlackout?: Map<string, { until: number, errorMessage: string }>
-   * }} options
+   *   authenticationBlackout?: Map<string, { until: number, errorMessage: string }>,
+   *   drainTimeout?: number,
+   *   generation?: number
+   * }} options `drainTimeout` is how long `destroy()` waits for the requests of each connection
+   *   (ms); unbounded when omitted. `generation` is the number the connections of the pool are
+   *   counted on from (0 when omitted), see `continueGenerationFrom`.
    */
   constructor(options) {
     this.logger = options.logger.namespace('ConnectionPool')
@@ -24,6 +28,9 @@ module.exports = class ConnectionPool {
     this.clientId = options.clientId
     this.socketFactory = options.socketFactory
     this.authenticationTimeout = options.authenticationTimeout
+    this.drainTimeout = options.drainTimeout
+    this.retired = false
+    this.generationBase = options.generation ?? 0
     this.brokerAddress = `${this.host}:${this.port}`
 
     // Broker address -> blackout entry. Defaults to a pool-local map, but a BrokerPool
@@ -81,13 +88,49 @@ module.exports = class ConnectionPool {
   }
 
   /**
+   * Marks this pool as replaced. From now on it opens no connection and sends nothing: a caller
+   * that held a reference across an await gets a retriable connection error and looks the broker
+   * up again. It stays retired; the connections it holds are closed by `destroy()`.
+   * @public
+   * @returns {void}
+   */
+  retire() {
+    this.retired = true
+  }
+
+  /**
+   * @private
+   * @throws {KafkaJSConnectionError} when the pool was retired
+   */
+  throwIfRetired() {
+    if (this.retired) {
+      throw new KafkaJSConnectionError('This broker connection was replaced', {
+        broker: this.brokerAddress,
+      })
+    }
+  }
+
+  /**
    * Changes whenever any socket in this pool is (re)established. Version information is only
    * valid for the connection it was learned on (KIP-35), so Broker keys its negotiated table on
-   * this value rather than on one connection.
+   * this value rather than on one connection. It counts on from `generationBase`, which a
+   * replacement pool is given so that it never repeats a number its predecessor reached.
    * @returns {number}
    */
   get generation() {
-    return this.pool[0].generation + this.pool[1].generation
+    return this.generationBase + this.pool[0].generation + this.pool[1].generation
+  }
+
+  /**
+   * Counts the generation on from at least `generation`; never lowers it. A pool that replaces
+   * another calls this when it is installed, so the numbers of the two pools never overlap
+   * however far the replaced one advanced while the replacement was being built.
+   * @public
+   * @param {number} generation the generation of the pool being replaced
+   * @returns {void}
+   */
+  continueGenerationFrom(generation) {
+    this.generationBase = Math.max(this.generationBase, generation)
   }
 
   isAuthenticated() {
@@ -114,16 +157,31 @@ module.exports = class ConnectionPool {
    *                                  it (e.g. via `getConnectionByRequest`) for its own purposes;
    *                                  resolving it again here would be redundant, since it is
    *                                  always the same connection this request would resolve to
+   * @param {object} [options]
+   * @param {() => Error|null} [options.guard] a pre-write check, see `Connection#send`
+   * @param {boolean} [established=false] private: the Broker already acquired the final connection
+   *   and captured its generation. With a supplied connection, this path has no await before send
+   *   and refuses a disconnected socket instead of reconnecting after that snapshot.
    * @returns {Promise} the broker's parsed response for `protocolRequest`
+   * @throws {KafkaJSConnectionError} when the pool was retired
    */
-  async send(protocolRequest, connection = null) {
+  async send(protocolRequest, connection = null, options = null, established = false) {
+    this.throwIfRetired()
     const resolvedConnection = connection || (await this.getConnectionByRequest(protocolRequest))
+    this.throwIfRetired()
 
-    if (!resolvedConnection.isConnected()) {
+    if (!established && !resolvedConnection.isConnected()) {
+      this.throwIfRetired()
       await resolvedConnection.connect()
+      this.throwIfRetired()
     }
 
-    return resolvedConnection.send(protocolRequest)
+    this.throwIfRetired()
+    if (established) {
+      resolvedConnection.failIfNotConnected()
+    }
+    const guard = options?.guard
+    return resolvedConnection.send(guard ? { ...protocolRequest, guard } : protocolRequest)
   }
 
   getConnectionByRequest({ request: { apiKey } }) {
@@ -135,8 +193,10 @@ module.exports = class ConnectionPool {
    * @public
    * @param {number} [index=0]
    * @returns {Promise<Connection>}
+   * @throws {KafkaJSConnectionError} when the pool was retired
    */
   async getConnection(index = 0) {
+    this.throwIfRetired()
     const connection = this.pool[index]
 
     // The blackout only ever needs to gate a (re)authentication attempt: a connection that
@@ -157,10 +217,19 @@ module.exports = class ConnectionPool {
       await connection.connect()
     }
 
+    this.throwIfRetired()
     return connection
   }
 
-  async destroy() {
-    await Promise.all(this.map((c) => c.disconnect()))
+  /**
+   * Closes every connection, each after its requests finished or `drainTimeout` passed. The pool
+   * stays reusable unless it was retired.
+   * @public
+   * @param {object} [options]
+   * @param {number} [options.drainTimeout] ms to wait for requests; the pool's own when omitted
+   * @returns {Promise<void>}
+   */
+  async destroy({ drainTimeout = this.drainTimeout } = {}) {
+    await Promise.all(this.map((c) => c.disconnect({ drainTimeout })))
   }
 }

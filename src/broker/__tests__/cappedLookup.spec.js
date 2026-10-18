@@ -189,6 +189,7 @@ describe('Broker > capped lookup and negotiated version', () => {
         sasl: null,
         generation: 0,
         connectionTimeout: 1000,
+        continueGenerationFrom: () => {},
         isConnected: () => true,
         isAuthenticated: () => true,
         setVersions: () => {},
@@ -228,7 +229,7 @@ describe('Broker > capped lookup and negotiated version', () => {
         isAuthenticated: () => true,
         setVersions: () => {},
         destroy: async () => {},
-        getConnectionByRequest: async () => ({}),
+        getConnectionByRequest: async () => ({ isConnected: () => true }),
         send: async (protocolRequest) => {
           sentVersions[protocolRequest.request.apiKey] = protocolRequest.request.apiVersion
           // Nothing decodes here: the assertion is about the version that was selected, and a real

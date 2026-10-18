@@ -1,3 +1,5 @@
+const { isNativeError } = require('util').types
+const describeThrown = require('../network/describeThrown')
 const Broker = require('../broker')
 const MetadataCache = require('./metadataCache')
 const createRetry = require('../retry')
@@ -5,7 +7,13 @@ const shuffle = require('../utils/shuffle')
 const arrayDiff = require('../utils/arrayDiff')
 const sharedPromiseTo = require('../utils/sharedPromiseTo')
 const { CLUSTER_REBOOTSTRAP } = require('./instrumentationEvents')
-const { KafkaJSBrokerNotFound, KafkaJSConnectionError, KafkaJSProtocolError } = require('../errors')
+const {
+  KafkaJSBrokerNotFound,
+  KafkaJSConnectionError,
+  KafkaJSProtocolError,
+  KafkaJSNonRetriableError,
+} = require('../errors')
+const { isConnectionFailure } = require('../network/connectionFailure')
 
 const { keys, assign, values } = Object
 /**
@@ -401,19 +409,26 @@ module.exports = class BrokerPool {
       try {
         await seedBroker.connect()
         this.versions = seedBroker.versions
-      } catch (e) {
-        if (e.name === 'KafkaJSConnectionError' || e.type === 'ILLEGAL_SASL_STATE') {
+      } catch (caught) {
+        const e = isNativeError(caught)
+          ? caught
+          : new KafkaJSNonRetriableError(describeThrown(caught), { cause: caught })
+        if (isConnectionFailure(e) || describeThrown(e, 'type') === 'ILLEGAL_SASL_STATE') {
           // Connection builder will always rotate the seed broker
           await this.createSeedBroker()
-          this.logger.error(
-            `Failed to connect to seed broker, trying another broker from the list: ${e.message}`,
-            { retryCount, retryTime }
-          )
+          try {
+            this.logger.error(
+              `Failed to connect to seed broker, trying another broker from the list: ${describeThrown(e)}`,
+              { retryCount, retryTime }
+            )
+          } catch {}
         } else {
-          this.logger.error(e.message, { retryCount, retryTime })
+          try {
+            this.logger.error(describeThrown(e), { retryCount, retryTime })
+          } catch {}
         }
 
-        if (e.retriable) throw e
+        if (describeThrown(e, 'retriable') === 'true') throw e
         bail(e)
       }
     })
@@ -803,18 +818,21 @@ module.exports = class BrokerPool {
     return this.retrier(async (bail, retryCount, retryTime) => {
       try {
         await broker.connect()
-      } catch (e) {
-        if (e.name === 'KafkaJSConnectionError' || e.type === 'ILLEGAL_SASL_STATE') {
+      } catch (caught) {
+        const e = isNativeError(caught)
+          ? caught
+          : new KafkaJSNonRetriableError(describeThrown(caught), { cause: caught })
+        if (isConnectionFailure(e) || describeThrown(e, 'type') === 'ILLEGAL_SASL_STATE') {
           await broker.disconnect()
         }
 
         // To avoid reconnecting to an unavailable host, we bail on connection errors
         // and refresh metadata on a higher level before reconnecting
-        if (e.name === 'KafkaJSConnectionError') {
+        if (isConnectionFailure(e)) {
           return bail(e)
         }
 
-        if (e.type === 'ILLEGAL_SASL_STATE') {
+        if (describeThrown(e, 'type') === 'ILLEGAL_SASL_STATE') {
           // Rebuild the connection pool since it can't recover from illegal SASL state.
           // replaceConnectionPool also resets versionsGeneration, so the next connect() always
           // re-negotiates against the replacement pool (KIP-35 rule 7) rather than comparing
@@ -827,12 +845,26 @@ module.exports = class BrokerPool {
             })
           )
 
-          this.logger.error(`Failed to connect to broker, reconnecting`, { retryCount, retryTime })
-          throw new KafkaJSProtocolError(e, { retriable: true })
+          try {
+            this.logger.error(`Failed to connect to broker, reconnecting`, {
+              retryCount,
+              retryTime,
+            })
+          } catch {}
+          const failure = new KafkaJSProtocolError({
+            type: 'ILLEGAL_SASL_STATE',
+            code: 34,
+            message: describeThrown(e),
+            retriable: true,
+          })
+          failure.cause = e
+          throw failure
         }
 
-        if (e.retriable) throw e
-        this.logger.error(e, { retryCount, retryTime, stack: e.stack })
+        if (describeThrown(e, 'retriable') === 'true') throw e
+        try {
+          this.logger.error(e, { retryCount, retryTime, stack: describeThrown(e, 'stack') })
+        } catch {}
         bail(e)
       }
     })

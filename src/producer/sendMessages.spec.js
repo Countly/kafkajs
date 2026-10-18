@@ -1,7 +1,13 @@
 jest.mock('./groupMessagesPerPartition')
 const { newLogger } = require('testHelpers')
 const { errorCodes, createErrorFromCode } = require('../protocol/error')
-const { KafkaJSConnectionClosedError, KafkaJSNumberOfRetriesExceeded } = require('../errors')
+const {
+  KafkaJSConnectionClosedError,
+  KafkaJSConnectionError,
+  KafkaJSInvalidFrameError,
+  KafkaJSNumberOfRetriesExceeded,
+  KafkaJSRequestTimeoutError,
+} = require('../errors')
 const { partitionResults } = require('../protocol/requests/produce/partitionResults')
 const retry = require('../retry')
 const Cluster = require('../cluster')
@@ -278,6 +284,55 @@ describe('Producer > sendMessages', () => {
     })
     expect(cluster.connect).toHaveBeenCalled()
     expect(cluster.refreshMetadata).toHaveBeenCalled()
+  })
+
+  test.each([
+    ['a connection error', () => new KafkaJSConnectionError('refused', { broker: 'a:1' })],
+    [
+      'an invalid response frame',
+      () => new KafkaJSInvalidFrameError('bad frame', { reason: 'negative', size: -1 }),
+    ],
+    [
+      'a connection closed under the request',
+      () => new KafkaJSConnectionClosedError('closed', { host: 'a', port: 1 }),
+    ],
+  ])('refreshes the metadata before it sends again after %s', async (_name, build) => {
+    const send = sendThrough(
+      createSendMessages({
+        retrier: retry({ retries: 1, initialRetryTime: 1, maxRetryTime: 2 }),
+        logger: newLogger(),
+        cluster,
+        partitioner,
+        eosManager,
+      })
+    )
+    brokers[1].produce.mockImplementationOnce(() => {
+      throw build()
+    })
+    cluster.removeBroker = jest.fn()
+
+    await send({ topicMessages: [{ topic, messages }] })
+
+    expect(cluster.refreshMetadata).toHaveBeenCalledTimes(1)
+  })
+
+  test('sends again without a refresh after a request timeout, which says nothing about the metadata', async () => {
+    const send = sendThrough(
+      createSendMessages({
+        retrier: retry({ retries: 1, initialRetryTime: 1, maxRetryTime: 2 }),
+        logger: newLogger(),
+        cluster,
+        partitioner,
+        eosManager,
+      })
+    )
+    brokers[1].produce.mockImplementationOnce(() => {
+      throw new KafkaJSRequestTimeoutError('timed out')
+    })
+
+    await send({ topicMessages: [{ topic, messages }] })
+
+    expect(cluster.refreshMetadata).not.toHaveBeenCalled()
   })
 
   test('a failing best-effort refresh after a stale-metadata error does not replace the original error', async () => {

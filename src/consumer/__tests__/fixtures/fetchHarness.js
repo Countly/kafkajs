@@ -399,6 +399,7 @@ const createFakeBroker = (answer) => {
     generation: 0,
     connectionTimeout: 1000,
     isConnected: () => connection.isConnected(),
+    throwIfRetired: () => {},
     isAuthenticated: () => true,
     getConnection: async () => {
       await connection.connect()

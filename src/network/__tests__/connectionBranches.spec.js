@@ -14,6 +14,7 @@ const createFactory = () => {
     const socket = new EventEmitter()
     socket.write = () => true
     socket.end = () => {}
+    socket.destroy = () => {}
     socket.unref = () => {}
     socket.onConnect = onConnect
     sockets.push(socket)

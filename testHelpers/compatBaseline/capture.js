@@ -218,6 +218,9 @@ class RecordingConnectionPool {
     this.topicData = null
   }
 
+  /** Refuses nothing: this recording pool is never retired. */
+  throwIfRetired() {}
+
   /** @returns {boolean} always connected: there is no socket to open */
   isConnected() {
     return true
@@ -233,9 +236,9 @@ class RecordingConnectionPool {
     return { authenticate: async () => {} }
   }
 
-  /** @returns {Promise<object>} an empty connection; requests are answered by `send` */
+  /** @returns {Promise<object>} an established connection; requests are answered by `send` */
   async getConnectionByRequest() {
-    return {}
+    return { isConnected: () => true }
   }
 
   /** Accepts the negotiated versions and ignores them: the table is pinned in `API_VERSIONS_RESPONSE`. */

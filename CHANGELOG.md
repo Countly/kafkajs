@@ -634,6 +634,8 @@ Adopted upstream PRs are credited here by number as they land (Phase 2 onward).
 
 - With the OpenTelemetry package enabled, a traced `producer.transaction()` returns a derived promise, wrapped transaction operations turn synchronous throws into rejections with the same reason, and wrapped `commit()` preserves the client's fulfillment value.
 
+- **A response frame that is negative, shorter than a correlation id, or larger than `maxResponseSize` (default 100 MiB, the length prefix excluded) now closes the connection with `KafkaJSInvalidFrameError` (retriable).** It used to be buffered without bound or to throw from the socket listener; the partial frame of a dead socket is also no longer carried into the next connection. The size is the response-frame bound that the `maxResponseSize` option sets, and a consumer whose `maxBytes` is above it logs one warning.
+- **A request that exceeds its `requestTimeout` now closes the connection and fails every request in flight or queued on it**: `KafkaJSRequestTimeoutError` for the one that timed out, a retriable `KafkaJSConnectionClosedError` for the others. Queued requests are never written to the stalled socket; the next request reconnects. A closed connection no longer makes its broker wait behind a healthy long Fetch: the sibling connection retires in the background.
 #### Fixes
 
 - Eight option checks no longer throw a `TypeError` while building their message when the value is a `Symbol` or another value with no string form. `maxInFlightRequests`, `metadataRecoveryStrategy`, `metadataRecoveryRebootstrapTriggerMs`, `maxPollInterval` and the `stickyBytes` of `Partitioners.UniformStickyPartitioner` now refuse it with `KafkaJSNonRetriableError`, and `linger`, `batchSize` and `deliveryTimeout` with `KafkaJSInvalidConfigurationError`: the class the same check already throws for every other value it refuses. Each message shows the rejected value as the `maxResponseSize` message does, so the string `'5'` appears as `got '5'`.
@@ -645,6 +647,8 @@ Adopted upstream PRs are credited here by number as they land (Phase 2 onward).
 #### Additions
 
 - `KafkaJSInvalidFrameError`, `KafkaJSCorruptRecordError` and `KafkaJSCommitFailedError` are exported from the package and its ES module entry, with their types: a refused response frame (a retriable connection error), a structurally corrupt Fetch batch (non-retriable) and a refused offset commit (non-retriable, with the loss as its `cause`). `KafkaJSAggregateError` gains `retriable`. The `Kafka` constructor accepts and validates `maxResponseSize`, the response-size limit passed to every connection, an integer from 4 to 2147483647 that defaults to 104857600 (100 MiB); it takes effect with the response-frame bound.
+
+- `KafkaJSConnectionError` accepts an optional `cause`, preserving the original failure by identity.
 
 #### Tooling
 

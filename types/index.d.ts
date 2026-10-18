@@ -1960,7 +1960,11 @@ export class KafkaJSDeliveryTimeout extends KafkaJSNonRetriableError {
   constructor(e: Error | string, options?: { cause?: Error })
 }
 
-/** A response frame was negative, too short, or larger than `maxResponseSize`; the connection was closed. */
+/**
+ * A response frame was negative, too short, or larger than `maxResponseSize`, or could not be
+ * processed (`reason: 'unreadable'`, with `size` null and the failure as `cause`). The connection
+ * it arrived on is closed and every request on it fails with this error, which is retriable.
+ */
 export class KafkaJSInvalidFrameError extends KafkaJSConnectionError {
   readonly size: number | null
   readonly reason: 'negative' | 'too-short' | 'too-large' | 'unreadable'
@@ -2133,6 +2137,8 @@ export interface KafkaJSNumberOfRetriesExceededMetadata {
 export interface KafkaJSConnectionErrorMetadata {
   broker?: string
   code?: string
+  /** Original failure, retained by identity. */
+  cause?: Error
 }
 
 export interface KafkaJSRequestTimeoutErrorMetadata {

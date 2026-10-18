@@ -44,6 +44,7 @@ const createAutoAnsweringSocketFactory = () => {
       return true
     }
     socket.end = () => {}
+    socket.destroy = () => {}
     socket.unref = () => {}
     setImmediate(onConnect)
     return socket

@@ -1,10 +1,16 @@
 const Lock = require('../utils/lock')
+const describeThrown = require('../network/describeThrown')
 const { Types: Compression } = require('../protocol/message/compression')
 const { requests, lookup, selectVersion } = require('../protocol/requests')
 const { partitionResults } = require('../protocol/requests/produce/partitionResults')
 const { NO_TOPIC_ID } = require('../protocol/requests/topicIds')
 const { assertSameProtocol } = require('../protocol/requests/groupProtocolCheck')
-const { KafkaJSNonRetriableError, KafkaJSServerDoesNotSupportApiKey } = require('../errors')
+const {
+  KafkaJSConnectionClosedError,
+  KafkaJSNonRetriableError,
+  KafkaJSServerDoesNotSupportApiKey,
+} = require('../errors')
+const { attachFailureSource } = require('./failureSource')
 const apiKeys = require('../protocol/requests/apiKeys')
 const { GROUP_STATES, GROUP_TYPES, toDisplayName } = require('../protocol/groupTypes')
 const shuffle = require('../utils/shuffle')
@@ -189,6 +195,13 @@ module.exports = class Broker {
     allowAutoTopicCreation = true,
   }) {
     this.connectionPool = connectionPool
+
+    /**
+     * Whether this broker was replaced (`retire()`). It never goes back: a pool offered later is
+     * refused, so the pool attached to a retired broker is itself retired.
+     * @type {boolean}
+     */
+    this.retired = false
     this.nodeId = nodeId
     this.rootLogger = logger
     this.logger = logger.namespace('Broker')
@@ -240,19 +253,34 @@ module.exports = class Broker {
 
   /**
    * Swaps in a whole new connection pool (e.g. after `ILLEGAL_SASL_STATE`, which the old pool
-   * can't recover from). The new pool restarts its generation count at 0, which can coincide
-   * with the value `versionsGeneration` already holds — resetting it here, rather than leaving
-   * that to the caller, guarantees the next `connect()` always re-negotiates against the
-   * replacement pool instead of comparing across two unrelated pools' generations.
+   * can't recover from). The replacement is numbered on from the generation of the pool it
+   * replaces, so a `(broker, generation)` pair never repeats while the broker lives and a failure
+   * of the old pool cannot be mistaken for one of the new. It must be unconnected. Resetting
+   * `versionsGeneration` here, rather than leaving that to the caller, guarantees the next
+   * `connect()` always re-negotiates against the replacement pool.
+   *
+   * A retired broker stays retired: the pool offered is retired and closed in the background,
+   * having opened nothing, and the broker keeps its own. This does not throw, so a caller that
+   * built the pool before the broker was retired (the illegal-SASL recovery, an endpoint hint)
+   * finds the broker retired at its next `connect()`, which refuses.
    *
    * @public
    * @param {import("../network/connectionPool")} connectionPool
+   * @returns {boolean} whether the pool was installed; false for a retired broker
    */
   replaceConnectionPool(connectionPool) {
+    if (this.retired) {
+      connectionPool.retire()
+      this.closeInBackground(connectionPool, 'Failed to close the pool of a retired broker')
+      return false
+    }
+
+    connectionPool.continueGenerationFrom(this.connectionPool.generation)
     this.connectionPool = connectionPool
     this.connectionPool.authenticationTimeout = this.authenticationTimeout
     this.versionsGeneration = null
     this[PRIVATE.CAPPED_LOOKUPS].clear()
+    return true
   }
 
   /**
@@ -305,10 +333,13 @@ module.exports = class Broker {
    *
    * @public
    * @returns {Promise}
+   * @throws {KafkaJSConnectionError} when this broker was retired
    */
   async connect() {
+    this.throwIfRetired()
     await this.lock.acquire()
     try {
+      this.throwIfRetired()
       if (this.isConnected()) {
         return
       }
@@ -328,22 +359,56 @@ module.exports = class Broker {
         this.versionsGeneration = generation
       }
 
+      this.throwIfRetired()
       this.connectionPool.setVersions(this.versions)
       this.lookupRequest = lookup(this.versions)
       this[PRIVATE.CAPPED_LOOKUPS].clear()
 
       await connection.authenticate()
+      this.throwIfRetired()
     } finally {
       await this.lock.release()
     }
   }
 
   /**
+   * Closes the connections of this broker. It stays reusable: a later `connect()` works.
    * @public
+   * @param {object} [options]
+   * @param {number} [options.drainTimeout] ms to wait for the requests of each connection; the
+   *   pool's own bound when omitted, which is none unless the cluster set one
    * @returns {Promise}
    */
-  async disconnect() {
-    await this.connectionPool.destroy()
+  async disconnect(options) {
+    await this.connectionPool.destroy(options)
+  }
+
+  /**
+   * Retires a broker that was replaced: its pool opens nothing again, so an operation that held a
+   * reference across an await fails with a retriable `KafkaJSConnectionError` (from `connect()`,
+   * `getConnection()` or `send()`) and looks the broker up again, and its connections drain for at
+   * most `drainTimeout`. A retired broker stays retired.
+   * @private
+   * @param {object} [options]
+   * @param {number} [options.drainTimeout] ms to wait for requests; the pool's own when omitted
+   * @returns {Promise} settles when the connections are closed; callers do not wait for it
+   */
+  retire(options) {
+    this.retired = true
+    this.connectionPool.retire()
+    return this.disconnect(options)
+  }
+
+  /**
+   * @private
+   * @throws {KafkaJSConnectionError} when this broker was retired, whichever pool is attached
+   */
+  throwIfRetired() {
+    if (this.retired) {
+      this.connectionPool.retire()
+    }
+
+    this.connectionPool.throwIfRetired()
   }
 
   /**
@@ -1155,16 +1220,19 @@ module.exports = class Broker {
    *                  Each entry may also carry `topicId`. When every entry does, the request is
    *                  negotiated up to v10 (stable from Kafka 4.2) and keyed by id; otherwise it
    *                  stays at v9 or below, keyed by name. The answer names its topics either way.
+   * @param {object} [options] private, for the consumer's own commits
+   * @param {() => Error|null} [options.guard] a pre-write check. It runs at entry, after the
+   *   connection was acquired and connected, after the request was authenticated and encoded, and
+   *   at the instant of transmission; an error it returns rejects this one request, which is then
+   *   written nowhere, takes no in-flight slot and leaves the connection open.
    * @returns {Promise}
    */
-  async offsetCommit({
-    groupId,
-    groupGenerationId,
-    memberId,
-    groupInstanceId,
-    retentionTime,
-    topics,
-  }) {
+  async offsetCommit(
+    { groupId, groupGenerationId, memberId, groupInstanceId, retentionTime, topics },
+    options = null
+  ) {
+    const guard = options?.guard
+    this.throwIfRefused(guard)
     const topicIds = offsetsTopicIds(topics)
     const offsetCommit = this.lookupRequestWithMax(
       apiKeys.OffsetCommit,
@@ -1180,7 +1248,8 @@ module.exports = class Broker {
         retentionTime,
         topics,
         topicIds,
-      })
+      }),
+      guard
     )
   }
 
@@ -1776,39 +1845,130 @@ module.exports = class Broker {
    * negotiated, `connect()` runs first. The check is skipped for `ApiVersions`, which *is* the
    * negotiation request and would otherwise re-enter `connect()`'s non-reentrant lock.
    *
-   * The connection resolved for the generation check is passed on to `connectionPool.send()`,
-   * which sends on it directly instead of resolving it a second time; `connect()` only ever
-   * (re)establishes pool index 0, so a connection already resolved at another index (e.g.
-   * Fetch's index 1) stays valid across the `connect()` call above and is safe to reuse.
+   * The selected connection is acquired again if negotiation let it close. Only then is the
+   * generation captured and the request handed to the pool's established-send path, which has no
+   * await or reconnect before Connection#send. ApiVersions uses the same acquisition and snapshot
+   * without re-entering the negotiation lock. A late reconnect leaves the negotiated table stale
+   * so the next request negotiates again; this already-built request keeps its chosen version.
+   *
+   * The request is bound to the pool it started on: every acquisition and the send go through that
+   * one pool, and after each await the pool is checked to still be the broker's. If it was
+   * replaced meanwhile, the request is refused before any write with a retriable
+   * `KafkaJSConnectionClosedError`, so a connection of the old pool is never sent through the
+   * new one, and its failure is attributed to the old pool.
    *
    * It never re-versions a request that has already been built: the caller chose its version
    * before the socket was re-established, and the honest outcome for the rare case where that
    * version is no longer supported is the broker's own `UNSUPPORTED_VERSION`, exactly as before.
    *
+   * A failure notes on the error which broker sent the request and the pool generation it went out
+   * on (`attachFailureSource`), so the code that drops a failed broker from a table can tell a
+   * stale failure from a current one. When the failure is a connection closed under the request,
+   * the pool's other connection is closed in the background (`retireSibling`).
+   *
    * @private
    * @param {{ request: { apiKey: number } }} protocolRequest a built request, as produced by
    *                                          `lookup()`/`lookupRequestWithMax()`'s returned builder
+   * @param {(() => Error|null)|undefined} guard a pre-write check, see `offsetCommit`
    * @returns {Promise} the broker's parsed response for `protocolRequest`
+   * @throws {Error} the error of the failed request, or the one the guard returned
    */
-  async [PRIVATE.SEND_REQUEST](protocolRequest) {
+  async [PRIVATE.SEND_REQUEST](protocolRequest, guard) {
+    const pool = this.connectionPool
+    let generation = pool.generation
     try {
-      if (protocolRequest.request.apiKey === apiKeys.ApiVersions) {
-        return await this.connectionPool.send(protocolRequest)
-      }
+      const connection = await pool.getConnectionByRequest(protocolRequest)
+      this.throwIfReplaced(pool)
 
-      const connection = await this.connectionPool.getConnectionByRequest(protocolRequest)
-
-      if (this.versionsGeneration !== this.connectionPool.generation) {
+      if (
+        protocolRequest.request.apiKey !== apiKeys.ApiVersions &&
+        this.versionsGeneration !== pool.generation
+      ) {
         await this.connect()
+        this.throwIfReplaced(pool)
       }
 
-      return await this.connectionPool.send(protocolRequest, connection)
-    } catch (e) {
-      if (e.name === 'KafkaJSConnectionClosedError') {
-        await this.disconnect()
+      if (!connection.isConnected()) {
+        await pool.getConnectionByRequest(protocolRequest)
+        this.throwIfReplaced(pool)
       }
+
+      this.throwIfRefused(guard)
+      generation = pool.generation
+      return await pool.send(protocolRequest, connection, guard ? { guard } : null, true)
+    } catch (e) {
+      attachFailureSource(e, { broker: this, generation })
+      this.retireSibling(e, generation, pool)
 
       throw e
     }
+  }
+
+  /**
+   * Refuses a request whose pool was replaced while it waited, before anything is written: the
+   * connection it holds belongs to the old pool, which is not where the broker sends any more.
+   * @private
+   * @param {import("../network/connectionPool")} pool the pool the request started on
+   * @throws {KafkaJSConnectionClosedError} (retriable) when `pool` is no longer the broker's pool;
+   *   the caller's retrier sends the request again on the current one
+   */
+  throwIfReplaced(pool) {
+    if (this.connectionPool !== pool) {
+      throw new KafkaJSConnectionClosedError(
+        "The broker's connection pool was replaced before the request was sent",
+        { host: pool.host, port: pool.port }
+      )
+    }
+  }
+
+  /**
+   * @private
+   * @param {(() => Error|null)|undefined} guard
+   * @throws {Error} the error the guard returns
+   */
+  throwIfRefused(guard) {
+    const refusal = guard && guard()
+    if (refusal) {
+      throw refusal
+    }
+  }
+
+  /**
+   * After a request failed because its connection was closed under it, closes the other
+   * connection of the pool gracefully, in the background: no new work, requests in flight finish
+   * up to the pool's `drainTimeout`, then the socket closes. It acts only on the pool the request
+   * was sent on, and only if no connection of that pool was established since (a reconnect that
+   * already happened, or a pool that replaced it, is not touched), and nothing waits for it, so
+   * the failing request is rejected at once and never waits behind a healthy long Fetch.
+   * @private
+   * @param {*} error what the request failed with, which need not be an Error
+   * @param {number} generation the pool's generation when the request was sent
+   * @param {import("../network/connectionPool")} [pool] the pool the request was sent on; the
+   *   current one when omitted
+   */
+  retireSibling(error, generation, pool = this.connectionPool) {
+    if (
+      describeThrown(error, 'name') !== 'KafkaJSConnectionClosedError' ||
+      this.connectionPool !== pool ||
+      pool.generation !== generation
+    ) {
+      return
+    }
+
+    this.closeInBackground(pool, 'Failed to close the sibling connection')
+  }
+
+  /**
+   * Closes a pool without holding the caller back; a failed close is logged and never surfaces.
+   * @private
+   * @param {import("../network/connectionPool")} pool
+   * @param {string} message what the log entry says when the close fails
+   */
+  closeInBackground(pool, message) {
+    pool.destroy().catch((e) => {
+      try {
+        this.logger.error(message, { error: describeThrown(e), cause: e })
+      } catch {}
+    })
   }
 }

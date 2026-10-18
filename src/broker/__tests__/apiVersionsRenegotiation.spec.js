@@ -6,6 +6,10 @@ const { newLogger } = require('testHelpers')
 const createFakeConnection = (onApiVersions) => ({
   connected: false,
   generation: 0,
+  /** Returns whether this fake socket is established. @returns {boolean} */
+  isConnected() {
+    return this.connected
+  },
   authenticate: jest.fn(),
   send: jest.fn(async ({ request }) => {
     if (request.apiName !== 'ApiVersions') throw new Error(`unexpected ${request.apiName}`)
@@ -23,6 +27,8 @@ const createFakePool = (connections) => ({
   get generation() {
     return connections.reduce((sum, connection) => sum + connection.generation, 0)
   },
+  throwIfRetired: () => {},
+  continueGenerationFrom: () => {},
   isConnected: () => connections.some((connection) => connection.connected),
   isAuthenticated: () => true,
   getConnection: async (index = 0) => {
@@ -32,6 +38,14 @@ const createFakePool = (connections) => ({
       connection.generation += 1
     }
     return connection
+  },
+  /**
+   * Acquires the connection selected for this request, preserving the pool's generation rules.
+   * @param {{ request: { apiKey: number } }} protocolRequest
+   * @returns {Promise<object>} the established fake connection
+   */
+  async getConnectionByRequest({ request: { apiKey } }) {
+    return this.getConnection(apiKey === apiKeys.Fetch ? 1 : 0)
   },
   send: (protocolRequest) => connections[0].send(protocolRequest),
   setVersions: jest.fn(),
@@ -137,9 +151,9 @@ describe('Broker > connect (KIP-35 rule 7)', () => {
     expect(apiVersionsCalls).toEqual(1)
     expect(broker.versionsGeneration).toEqual(1)
 
-    // A fresh pool restarts its generation count at 0, so after one connect it reaches 1 —
-    // the exact number `versionsGeneration` already holds. Without resetting it on
-    // replacement, connect() would wrongly treat the new pool's table as already negotiated.
+    // This fake pool counts from 0, so after one connect it reaches 1 — the exact number
+    // `versionsGeneration` already holds. Without resetting it on replacement, connect() would
+    // wrongly treat the new pool's table as already negotiated.
     const replacementConnections = [
       createFakeConnection(onApiVersions),
       createFakeConnection(onApiVersions),

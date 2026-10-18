@@ -1,5 +1,7 @@
 const { KafkaJSRequestTimeoutError, KafkaJSNonRetriableError } = require('../../errors')
 const events = require('../instrumentationEvents')
+const { isNativeError } = require('util').types
+const describeThrown = require('../describeThrown')
 
 const PRIVATE = {
   STATE: Symbol('private:SocketRequest:state'),
@@ -29,6 +31,8 @@ const REQUEST_STATE = {
  * @property {boolean} expectResponse
  * @property {Function} send
  * @property {Function} timeout
+ * @property {Function} afterTimeout
+ * @property {() => Error|null} guard
  *
  * @typedef {Object} RequestEntry
  * @property {string} apiKey
@@ -47,8 +51,12 @@ module.exports = class SocketRequest {
    * @param {RequestEntry} options.entry
    * @param {boolean} options.expectResponse
    * @param {Function} options.send
-   * @param {() => void} options.timeout
+   * @param {() => void} options.timeout bookkeeping the queue does when this request times out
+   * @param {(socketRequest: SocketRequest) => void} [options.afterTimeout] called once the request was rejected with its own
+   *   timeout error, before the `NETWORK_REQUEST_TIMEOUT` event
+   * @param {() => Error|null} [options.guard] checked by `refusal()` before the request is written
    * @param {import("../../instrumentation/emitter")} [options.instrumentationEmitter=null]
+   * @param {import("../../../types").Logger} [options.logger] where a failing event listener is logged
    */
   constructor({
     requestTimeout,
@@ -58,7 +66,10 @@ module.exports = class SocketRequest {
     expectResponse,
     send,
     timeout,
+    afterTimeout = null,
+    guard = null,
     instrumentationEmitter = null,
+    logger = null,
   }) {
     this.createdAt = Date.now()
     this.requestTimeout = requestTimeout
@@ -69,6 +80,9 @@ module.exports = class SocketRequest {
     this.expectResponse = expectResponse
     this.sendRequest = send
     this.timeoutHandler = timeout
+    this.afterTimeout = afterTimeout
+    this.guard = guard
+    this.logger = logger
 
     this.sentAt = null
     this.duration = null
@@ -77,6 +91,27 @@ module.exports = class SocketRequest {
     this[PRIVATE.STATE] = REQUEST_STATE.PENDING
     this[PRIVATE.EMIT_EVENT] = (eventName, payload) =>
       instrumentationEmitter && instrumentationEmitter.emit(eventName, payload)
+  }
+
+  /**
+   * @returns {Error|null} why this request must not be written, from its guard; null when it may be.
+   *   A guard that throws refuses with the Error it threw, or, for another value, with a
+   *   `KafkaJSNonRetriableError` it caused.
+   */
+  refusal() {
+    if (!this.guard) {
+      return null
+    }
+
+    try {
+      return this.guard()
+    } catch (error) {
+      return isNativeError(error)
+        ? error
+        : new KafkaJSNonRetriableError('The pre-write guard threw a value that is not an error', {
+            cause: error,
+          })
+    }
   }
 
   send() {
@@ -91,6 +126,10 @@ module.exports = class SocketRequest {
     this[PRIVATE.STATE] = REQUEST_STATE.SENT
   }
 
+  /**
+   * Rejects the request with its own `KafkaJSRequestTimeoutError` first, with no observer run, then
+   * lets the owner act (`afterTimeout`), and only then emits `NETWORK_REQUEST_TIMEOUT`, contained.
+   */
   timeoutRequest() {
     const { apiName, apiKey, apiVersion } = this.entry
     const requestInfo = `${apiName}(key: ${apiKey}, version: ${apiVersion})`
@@ -105,12 +144,25 @@ module.exports = class SocketRequest {
 
     this.timeoutHandler()
     this.rejected(new KafkaJSRequestTimeoutError(`Request ${requestInfo} timed out`, eventData))
-    this[PRIVATE.EMIT_EVENT](events.NETWORK_REQUEST_TIMEOUT, {
-      ...eventData,
-      apiName,
-      apiKey,
-      apiVersion,
-    })
+    this.afterTimeout?.(this)
+
+    try {
+      this[PRIVATE.EMIT_EVENT](events.NETWORK_REQUEST_TIMEOUT, {
+        ...eventData,
+        apiName,
+        apiKey,
+        apiVersion,
+      })
+    } catch (error) {
+      try {
+        this.logger?.error('A request timeout listener failed', {
+          broker: this.broker,
+          correlationId: this.correlationId,
+          error: describeThrown(error),
+          cause: error,
+        })
+      } catch {}
+    }
   }
 
   completed({ size, payload }) {

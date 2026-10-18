@@ -748,7 +748,18 @@ describe('Soak > a run on the scripted cluster', () => {
         batches: 0,
       }
     )
-    const { kafka, probe } = instrument(cluster.kafkaOptions(), { activeResources: false })
+    const options = cluster.kafkaOptions()
+    const { kafka, probe } = instrument(
+      {
+        ...options,
+        socketFactory: (args) => {
+          const socket = options.socketFactory(args)
+          socket.destroy = () => socket
+          return socket
+        },
+      },
+      { activeResources: false }
+    )
     const lines = []
     const soak = new Soak({
       kafka,

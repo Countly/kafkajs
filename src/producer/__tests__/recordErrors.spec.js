@@ -63,6 +63,7 @@ const createFakeBroker = (answer) => {
     port: 9092,
     sasl: null,
     generation: 0,
+    throwIfRetired: () => {},
     connectionTimeout: 1000,
     isConnected: () => connection.isConnected(),
     isAuthenticated: () => true,

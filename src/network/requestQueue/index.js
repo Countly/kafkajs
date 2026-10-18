@@ -1,5 +1,6 @@
 const { EventEmitter } = require('events')
 const SocketRequest = require('./socketRequest')
+const describeThrown = require('../describeThrown')
 const events = require('../instrumentationEvents')
 const { KafkaJSInvariantViolation } = require('../../errors')
 
@@ -22,6 +23,10 @@ module.exports = class RequestQueue extends EventEmitter {
    * @param {import("../../../types").Logger} options.logger
    * @param {import("../../instrumentation/emitter")} [options.instrumentationEmitter=null]
    * @param {() => boolean} [options.isConnected]
+   * @param {(socketRequest: SocketRequest) => void} [options.onRequestTimeout] Called when a request
+   *   exceeds its timeout, after that request was rejected with its own timeout error and before
+   *   the `NETWORK_REQUEST_TIMEOUT` event. The queue does nothing else about the timeout: the owner
+   *   decides what happens to the requests that remain (the connection fails its generation).
    */
   constructor({
     instrumentationEmitter = null,
@@ -32,6 +37,7 @@ module.exports = class RequestQueue extends EventEmitter {
     broker,
     logger,
     isConnected = () => true,
+    onRequestTimeout = () => {},
   }) {
     super()
     this.instrumentationEmitter = instrumentationEmitter
@@ -42,6 +48,11 @@ module.exports = class RequestQueue extends EventEmitter {
     this.broker = broker
     this.logger = logger
     this.isConnected = isConnected
+    this.onRequestTimeout = onRequestTimeout
+    this.afterTimeout = (socketRequest) => {
+      this.onRequestTimeout(socketRequest)
+      this.emitQueueState()
+    }
 
     this.inflight = new Map()
     this.pending = []
@@ -65,7 +76,16 @@ module.exports = class RequestQueue extends EventEmitter {
 
     this[PRIVATE.EMIT_REQUEST_QUEUE_EMPTY] = () => {
       if (this.pending.length === 0 && this.inflight.size === 0) {
-        this.emit(REQUEST_QUEUE_EMPTY)
+        if (this.listenerCount(REQUEST_QUEUE_EMPTY) === 0) {
+          return
+        }
+        for (const listener of this.rawListeners(REQUEST_QUEUE_EMPTY)) {
+          try {
+            listener.call(this)
+          } catch (error) {
+            this.reportObserverFailure(error)
+          }
+        }
       }
     }
 
@@ -128,6 +148,8 @@ module.exports = class RequestQueue extends EventEmitter {
       broker: this.broker,
       clientId: this.clientId,
       instrumentationEmitter: this.instrumentationEmitter,
+      logger: this.logger,
+      guard: pushedRequest.guard,
       requestTimeout,
       send: () => {
         if (this.inflight.has(correlationId)) {
@@ -138,10 +160,8 @@ module.exports = class RequestQueue extends EventEmitter {
       },
       timeout: () => {
         this.inflight.delete(correlationId)
-        this.checkPendingRequests()
-        // Try to emit REQUEST_QUEUE_EMPTY. Otherwise, waitForPendingRequests may stuck forever
-        this[PRIVATE.EMIT_REQUEST_QUEUE_EMPTY]()
       },
+      afterTimeout: this.afterTimeout,
     })
 
     return socketRequest
@@ -153,6 +173,8 @@ module.exports = class RequestQueue extends EventEmitter {
    * @property {boolean} expectResponse
    * @property {Function} sendRequest
    * @property {number} [requestTimeout]
+   * @property {() => Error|null} [guard] checked just before the request is written; an error it
+   *   returns rejects the request, which is then written nowhere and takes no in-flight slot
    *
    * @public
    * @param {PushedRequest} pushedRequest
@@ -182,6 +204,12 @@ module.exports = class RequestQueue extends EventEmitter {
    * @param {SocketRequest} socketRequest
    */
   sendSocketRequest(socketRequest) {
+    const refusal = socketRequest.refusal()
+    if (refusal) {
+      socketRequest.rejected(refusal)
+      return
+    }
+
     socketRequest.send()
 
     if (!socketRequest.expectResponse) {
@@ -197,25 +225,33 @@ module.exports = class RequestQueue extends EventEmitter {
   }
 
   /**
+   * Completes the request the response belongs to, after sending the pending requests the freed
+   * slot admits. The request has left the in-flight set by then and no teardown can reach it, so
+   * it is completed even when sending a pending request, or an observer of that, throws: the
+   * valid response is delivered and the exception then propagates to the caller.
    * @public
    * @param {object} response
    * @param {number} response.correlationId
    * @param {Buffer} response.payload
    * @param {number} response.size
+   * @throws {Error} what sending a pending request, or an observer of that, threw
    */
   fulfillRequest({ correlationId, payload, size }) {
     const socketRequest = this.inflight.get(correlationId)
     this.inflight.delete(correlationId)
-    this.checkPendingRequests()
 
-    if (socketRequest) {
-      socketRequest.completed({ size, payload })
-    } else {
-      this.logger.warn(`Response without match`, {
-        clientId: this.clientId,
-        broker: this.broker,
-        correlationId,
-      })
+    try {
+      this.checkPendingRequests()
+    } finally {
+      if (socketRequest) {
+        socketRequest.completed({ size, payload })
+      } else {
+        this.logger.warn(`Response without match`, {
+          clientId: this.clientId,
+          broker: this.broker,
+          correlationId,
+        })
+      }
     }
 
     this[PRIVATE.EMIT_REQUEST_QUEUE_EMPTY]()
@@ -226,16 +262,59 @@ module.exports = class RequestQueue extends EventEmitter {
    * @param {Error} error
    */
   rejectAll(error) {
+    this.settleAll(error)
+    this.emitQueueState()
+  }
+
+  /**
+   * Rejects every in-flight and pending request, in send order, with `error`, after the queue was
+   * emptied. A rejection runs no observer, so the queue is settled before anything else can run.
+   * @public
+   * @param {Error} error
+   */
+  settleAll(error) {
     const requests = [...this.inflight.values(), ...this.pending]
+    this.pending = []
+    this.inflight.clear()
 
     for (const socketRequest of requests) {
       socketRequest.rejected(error)
-      this.inflight.delete(socketRequest.correlationId)
     }
+  }
 
-    this.pending = []
-    this.inflight.clear()
-    this[PRIVATE.EMIT_QUEUE_SIZE_EVENT]()
+  /**
+   * Tells the observers the queue changed: the queue-size event, then the queue-empty event that
+   * releases `waitForPendingRequests`. Each runs in its own `try`, so a listener that throws
+   * stops neither the other nor its caller; the failure is logged.
+   * @public
+   */
+  emitQueueState() {
+    for (const emit of [
+      this[PRIVATE.EMIT_QUEUE_SIZE_EVENT],
+      this[PRIVATE.EMIT_REQUEST_QUEUE_EMPTY],
+    ]) {
+      try {
+        emit()
+      } catch (error) {
+        this.reportObserverFailure(error)
+      }
+    }
+  }
+
+  /**
+   * Reports an observer failure without allowing a diagnostic to interrupt settlement.
+   * @private
+   * @param {*} error whatever the observer threw
+   * @returns {void}
+   */
+  reportObserverFailure(error) {
+    try {
+      this.logger.error('A queue observer failed', {
+        broker: this.broker,
+        error: describeThrown(error),
+        cause: error,
+      })
+    } catch {}
   }
 
   /**

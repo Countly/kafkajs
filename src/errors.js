@@ -1,3 +1,4 @@
+const { isNativeError } = require('util').types
 const pkgJson = require('../package.json')
 const { bugs } = pkgJson
 
@@ -8,10 +9,15 @@ const { categoryOf } = require('./protocol/errorCategories')
  * @param {boolean} retriable the `retriable` flag of the error being built
  * @returns {string|undefined} the source's category, when it carries one and the same flag
  */
-const keptCategory = (source, retriable) =>
-  source != null && typeof source.category === 'string' && source.retriable === retriable
-    ? source.category
-    : undefined
+const keptCategory = (source, retriable) => {
+  try {
+    return source != null && typeof source.category === 'string' && source.retriable === retriable
+      ? source.category
+      : undefined
+  } catch {
+    return undefined
+  }
+}
 
 /**
  * The category a new error starts with (KIP-1050): the one it keeps from the error it wraps — the
@@ -25,7 +31,7 @@ const keptCategory = (source, retriable) =>
  */
 const initialCategory = (e, cause, retriable) =>
   keptCategory(e, retriable) ??
-  keptCategory(cause, retriable) ??
+  (isNativeError(cause) ? keptCategory(cause, retriable) : undefined) ??
   (retriable === true ? 'retriable' : 'applicationRecoverable')
 
 /**
@@ -129,13 +135,15 @@ class KafkaJSNumberOfRetriesExceeded extends KafkaJSNonRetriableError {
     // The wrapped error may itself be a wrapper (KafkaJSError around a protocol error), so
     // walk the chain for the first typed link.
     let source = e
-    while (source && source.type === undefined && source.cause) {
-      source = source.cause
-    }
-    if (source && source.type !== undefined) {
-      this.type = source.type
-      this.code = source.code
-    }
+    try {
+      while (source && source.type === undefined && source.cause) {
+        source = source.cause
+      }
+      if (source && source.type !== undefined) {
+        this.type = source.type
+        this.code = source.code
+      }
+    } catch {}
   }
 }
 
@@ -145,9 +153,10 @@ class KafkaJSConnectionError extends KafkaJSError {
    * @param {object} options
    * @param {string} [options.broker]
    * @param {string} [options.code]
+   * @param {*} [options.cause] the original failure, retained by identity
    */
-  constructor(e, { broker, code } = {}) {
-    super(e)
+  constructor(e, { broker, code, cause } = {}) {
+    super(e, { cause })
     this.broker = broker
     this.code = code
     this.name = 'KafkaJSConnectionError'
@@ -488,10 +497,12 @@ class KafkaJSDeliveryTimeout extends KafkaJSNonRetriableError {
 }
 
 /**
- * A response frame was negative, shorter than a correlation id, or larger than `maxResponseSize`:
- * the connection is closed and the request retried on a new one. Retriable, like every connection
- * error. `reason` says which rule the frame broke; `size` is the length the prefix declared, or
- * `null` when fewer than four bytes arrived before the connection ended.
+ * A response frame was negative, shorter than a correlation id, or larger than `maxResponseSize`,
+ * or could not be processed: the connection it arrived on is closed and every request on it fails
+ * with this error. Retriable, like every connection error: a caller whose retrier retries it sends
+ * the request again on a new connection. `reason` says which rule the frame broke, and `size` is
+ * the length its prefix declared; `size` is `null` for `reason: 'unreadable'`, a frame whose
+ * handling failed with `cause`. The message names `maxResponseSize` for a frame that was too large.
  */
 class KafkaJSInvalidFrameError extends KafkaJSConnectionError {
   /**

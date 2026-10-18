@@ -58,6 +58,181 @@ describe('Network > maxInFlightRequests', () => {
   })
 })
 
+describe('Network > the request queue and a request timeout', () => {
+  afterEach(() => jest.clearAllTimers())
+
+  const createTimingQueue = (options = {}) =>
+    new RequestQueue({
+      maxInFlightRequests: 1,
+      requestTimeout: 30000,
+      enforceRequestTimeout: false,
+      clientId: 'KafkaJS',
+      broker: 'localhost:9092',
+      logger: newLogger(),
+      ...options,
+    })
+
+  it('writes no pending request when the request in flight times out', () => {
+    const queue = createTimingQueue()
+    const first = pushRequest(queue, 1)
+    const second = pushRequest(queue, 2)
+
+    queue.inflight.get(1).timeoutRequest()
+
+    expect(first).toHaveBeenCalledTimes(1)
+    expect(second).not.toHaveBeenCalled()
+    expect(queue.pending).toHaveLength(1)
+    expect(queue.inflight.size).toBe(0)
+    queue.destroy()
+  })
+
+  it('tells its owner after the request was rejected with its own timeout error, and before the event', () => {
+    const order = []
+    const instrumentationEmitter = { emit: jest.fn((name) => order.push(name)) }
+    const request = jest.fn()
+    const onRequestTimeout = jest.fn((socketRequest) => {
+      order.push(['owner', socketRequest.correlationId, request.mock.calls.length])
+    })
+    const queue = createTimingQueue({ onRequestTimeout, instrumentationEmitter })
+    const reject = jest.fn(() => order.push('rejected'))
+    queue.push({
+      entry: {
+        correlationId: 7,
+        apiKey: 0,
+        apiName: 'Produce',
+        apiVersion: 7,
+        resolve: jest.fn(),
+        reject,
+      },
+      expectResponse: true,
+      sendRequest: request,
+    })
+
+    queue.inflight.get(7).timeoutRequest()
+
+    expect(reject).toHaveBeenCalledWith(
+      expect.objectContaining({ name: 'KafkaJSRequestTimeoutError' })
+    )
+    expect(order).toEqual([
+      'rejected',
+      ['owner', 7, 1],
+      'network.request_queue_size',
+      'network.request_timeout',
+    ])
+    queue.destroy()
+  })
+
+  it('rejects every in-flight and pending request without telling observers, then tells them once', () => {
+    const instrumentationEmitter = { emit: jest.fn() }
+    const queue = createTimingQueue({ maxInFlightRequests: 1, instrumentationEmitter })
+    pushRequest(queue, 1)
+    pushRequest(queue, 2)
+    instrumentationEmitter.emit.mockClear()
+    const error = new Error('closed')
+
+    queue.settleAll(error)
+
+    expect(queue.inflight.size).toBe(0)
+    expect(queue.pending).toHaveLength(0)
+    expect(instrumentationEmitter.emit).not.toHaveBeenCalled()
+
+    queue.emitQueueState()
+
+    expect(instrumentationEmitter.emit).toHaveBeenCalledWith('network.request_queue_size', {
+      broker: 'localhost:9092',
+      clientId: 'KafkaJS',
+      queueSize: 0,
+    })
+    queue.destroy()
+  })
+
+  it('refuses a request whose guard returns an error, writing nothing and taking no slot', () => {
+    const queue = createTimingQueue()
+    const refusal = new Error('lost')
+    const reject = jest.fn()
+    const sendRequest = jest.fn()
+    queue.push({
+      entry: {
+        correlationId: 1,
+        apiKey: 0,
+        apiName: 'Produce',
+        apiVersion: 7,
+        resolve: jest.fn(),
+        reject,
+      },
+      expectResponse: true,
+      guard: () => refusal,
+      sendRequest,
+    })
+
+    expect(reject).toHaveBeenCalledWith(refusal)
+    expect(sendRequest).not.toHaveBeenCalled()
+    expect(queue.inflight.size).toBe(0)
+
+    const next = pushRequest(queue, 2)
+    expect(next).toHaveBeenCalledTimes(1)
+    queue.destroy()
+  })
+
+  it('refuses a pending request whose guard throws with what it threw, without breaking the answer that freed its place', () => {
+    const queue = createTimingQueue()
+    pushRequest(queue, 1)
+    const thrown = new Error('guard failed')
+    const reject = jest.fn()
+    queue.push({
+      entry: {
+        correlationId: 2,
+        apiKey: 0,
+        apiName: 'Produce',
+        apiVersion: 7,
+        resolve: jest.fn(),
+        reject,
+      },
+      expectResponse: true,
+      guard: () => {
+        throw thrown
+      },
+      sendRequest: jest.fn(),
+    })
+    const third = pushRequest(queue, 3)
+
+    expect(() => queue.fulfillRequest({ correlationId: 1, payload: null, size: 0 })).not.toThrow()
+
+    expect(reject).toHaveBeenCalledWith(thrown)
+    expect(third).toHaveBeenCalledTimes(1)
+    queue.destroy()
+  })
+
+  it('passes over a pending request its guard refuses, and writes the one behind it', () => {
+    const queue = createTimingQueue()
+    pushRequest(queue, 1)
+    const refusal = new Error('lost')
+    const reject = jest.fn()
+    queue.push({
+      entry: {
+        correlationId: 2,
+        apiKey: 0,
+        apiName: 'Produce',
+        apiVersion: 7,
+        resolve: jest.fn(),
+        reject,
+      },
+      expectResponse: true,
+      guard: () => refusal,
+      sendRequest: jest.fn(),
+    })
+    const third = pushRequest(queue, 3)
+    expect(queue.pending).toHaveLength(2)
+
+    queue.fulfillRequest({ correlationId: 1, payload: null, size: 0 })
+
+    expect(reject).toHaveBeenCalledWith(refusal)
+    expect(third).toHaveBeenCalledTimes(1)
+    expect(queue.pending).toHaveLength(0)
+    queue.destroy()
+  })
+})
+
 describe('Network > Connection > maxInFlightRequests default', () => {
   const Connection = require('./connection')
 

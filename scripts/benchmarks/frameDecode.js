@@ -88,6 +88,10 @@ const createFakeSocket = () => {
     }
     current.end = () => {}
     current.unref = () => {}
+    current.destroyed = false
+    current.destroy = () => {
+      current.destroyed = true
+    }
     setImmediate(onConnect)
     return current
   }

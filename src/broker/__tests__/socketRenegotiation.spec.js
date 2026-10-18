@@ -82,6 +82,7 @@ const createPool = () => {
       generations[1] += 1
     },
     isConnected: () => connections.some((c) => c.isConnected()),
+    throwIfRetired: () => {},
     isAuthenticated: () => true,
     getConnection: async (index = 0) => {
       if (!connections[index].isConnected()) {

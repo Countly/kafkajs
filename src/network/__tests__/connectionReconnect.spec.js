@@ -20,6 +20,7 @@ const createTrackingSocketFactory = (mode = 'async') => {
     const socket = new EventEmitter()
     socket.write = () => true
     socket.end = () => {}
+    socket.destroy = () => {}
     socket.unref = () => {}
     sockets.push(socket)
     if (mode === 'sync') {
@@ -157,6 +158,7 @@ describe('Connection > reconnect safety', () => {
       const socket = new EventEmitter()
       socket.write = () => true
       socket.end = () => {}
+      socket.destroy = () => {}
       socket.unref = () => {}
       pendingSockets.push(socket)
       // onConnect is deliberately never called: the attempt stays in flight until disconnect()

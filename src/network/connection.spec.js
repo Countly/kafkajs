@@ -91,15 +91,18 @@ describe('Network > Connection', () => {
       expect(connection.isConnected()).toEqual(false)
     })
 
-    test('trigger "end" and "unref" function on not active connection', async () => {
+    test('destroys the socket of a connection that is not active, and clears it', async () => {
       expect(connection.isConnected()).toEqual(false)
-      connection.socket = {
+      const socket = {
         end: jest.fn(),
+        destroy: jest.fn(),
         unref: jest.fn(),
       }
+      connection.socket = socket
       await expect(connection.disconnect()).resolves.toEqual(true)
-      expect(connection.socket.end).toHaveBeenCalled()
-      expect(connection.socket.unref).toHaveBeenCalled()
+      expect(socket.destroy).toHaveBeenCalledTimes(1)
+      expect(socket.end).not.toHaveBeenCalled()
+      expect(connection.socket).toBeNull()
     })
   })
 
@@ -351,7 +354,7 @@ describe('Network > Connection', () => {
     test('buffer data while it is not complete', () => {
       const correlationId = 1
       const resolve = jest.fn()
-      const entry = { correlationId, resolve }
+      const entry = { correlationId, resolve, apiKey: apiKeys.ApiVersions, apiVersion: 0 }
 
       connection.requestQueue.push({
         entry,

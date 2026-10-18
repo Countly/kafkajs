@@ -15,7 +15,7 @@ const createAdmin = require('./admin')
 const ISOLATION_LEVEL = require('./protocol/isolationLevel')
 const defaultSocketFactory = require('./network/socketFactory')
 const once = require('./utils/once')
-const { INT_32_MAX_VALUE } = require('./constants')
+const { INT_32_MAX_VALUE, DEFAULT_MAX_RESPONSE_SIZE } = require('./constants')
 const websiteUrl = require('./utils/websiteUrl')
 
 const PRIVATE = {
@@ -24,6 +24,7 @@ const PRIVATE = {
   LOGGER: Symbol('private:Kafka:logger'),
   OFFSETS: Symbol('private:Kafka:offsets'),
   OPERATIONS: Symbol('private:Kafka:operations'),
+  MAX_RESPONSE_SIZE: Symbol('private:Kafka:maxResponseSize'),
   REQUEST_TIMEOUT: Symbol('private:Kafka:requestTimeout'),
 }
 
@@ -37,9 +38,6 @@ const MAX_IN_FLIGHT_REQUESTS_FOR_IDEMPOTENCE = 5
 // The longest delay Node's `setTimeout` honours; a longer one runs after 1 ms.
 // @see https://nodejs.org/api/timers.html
 const MAX_TIMER_DELAY = 2147483647
-// The default response-size limit: 100 MiB, franz-go's `BrokerMaxReadBytes`.
-// @see https://github.com/twmb/franz-go/blob/v1.22.2/pkg/kgo/config.go
-const DEFAULT_MAX_RESPONSE_SIZE = 104857600
 // A response body holds at least its 4-byte correlation id.
 const MIN_MAX_RESPONSE_SIZE = 4
 const DEFAULT_METADATA_RECOVERY_STRATEGY = 'rebootstrap'
@@ -275,6 +273,7 @@ module.exports = class Client {
     this[PRIVATE.REQUEST_TIMEOUT] = requestTimeout ?? DEFAULT_REQUEST_TIMEOUT
 
     const validatedMaxResponseSize = validateMaxResponseSize(maxResponseSize)
+    this[PRIVATE.MAX_RESPONSE_SIZE] = validatedMaxResponseSize
     const validatedMetadataRecoveryStrategy =
       validateMetadataRecoveryStrategy(metadataRecoveryStrategy)
     const validatedMetadataRecoveryRebootstrapTriggerMs =
@@ -396,6 +395,9 @@ module.exports = class Client {
    * `'consumer'` (KIP-848, broker-driven assignment). Under `'consumer'`, `groupRemoteAssignor`
    * names the server-side assignor to ask for. `maxPrefetchBatches` (`0` or `1`, default `0`) is
    * accepted and inert in this release.
+   *
+   * A `maxBytes` above the client's `maxResponseSize` logs one warning: a Fetch response of that
+   * size would be refused with `KafkaJSInvalidFrameError`.
    * @public
    */
   consumer({
@@ -408,7 +410,7 @@ module.exports = class Client {
     heartbeatInterval,
     maxBytesPerPartition,
     minBytes,
-    maxBytes,
+    maxBytes = 10485760,
     maxWaitTimeInMs,
     retry = { retries: 5 },
     allowAutoTopicCreation,
@@ -424,6 +426,15 @@ module.exports = class Client {
     const isolationLevel = readUncommitted
       ? ISOLATION_LEVEL.READ_UNCOMMITTED
       : ISOLATION_LEVEL.READ_COMMITTED
+
+    if (maxBytes > this[PRIVATE.MAX_RESPONSE_SIZE]) {
+      this[PRIVATE.LOGGER]
+        .namespace('Consumer')
+        .warn(
+          `maxBytes (${maxBytes}) is above maxResponseSize (${this[PRIVATE.MAX_RESPONSE_SIZE]}): a Fetch response that large would be refused with KafkaJSInvalidFrameError. Raise maxResponseSize in the Kafka options, or lower maxBytes.`,
+          { groupId }
+        )
+    }
 
     const instrumentationEmitter = new InstrumentationEventEmitter({ channels: channels.consumer })
     const cluster = this[PRIVATE.CREATE_CLUSTER]({

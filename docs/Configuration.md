@@ -350,6 +350,14 @@ new Kafka({
 A value outside that range, or one that is not an integer, makes the constructor throw
 `KafkaJSInvalidConfigurationError`.
 
+A response frame that is negative, shorter than a correlation id or larger than the limit closes
+its connection with `KafkaJSInvalidFrameError` (retriable; its `reason` is `negative`, `too-short`
+or `too-large`) and fails every request on that connection; the next request opens a new one. Raise
+`maxResponseSize` only for deliberately larger responses, such as a consumer `maxBytes` near the
+limit or a very large metadata response. A consumer whose `maxBytes` is above the limit logs one
+warning. Each connection can buffer up to this much, so the limit is not a memory ceiling for the
+process.
+
 ## Metadata recovery
 
 `metadataRecoveryStrategy` and `metadataRecoveryRebootstrapTriggerMs`, available on the `Kafka`

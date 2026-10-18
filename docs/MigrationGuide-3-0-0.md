@@ -1121,6 +1121,9 @@ now logged.
 - **Telemetry errors no longer reach the application.** Telemetry errors are logged through the OpenTelemetry diagnostic logger instead of failing your handler, your send or your transaction. If the diagnostic logger also throws, that failure is contained. A context-manager failure does not invoke the wrapped operation again.
 - **OpenTelemetry transaction wrappers preserve settled outcomes.** A traced `producer.transaction()` now returns a derived promise that resolves to the same transaction object. Synchronous throws from wrapped transaction operations become rejected promises with the same reason; handle them with `await` and `catch`, or a promise rejection handler. An instrumented `commit()` now preserves its client's fulfillment value instead of discarding it; the client's declared `commit(): Promise<void>` contract is unchanged.
 
+- **A response that is too large is refused with reason `too-large`.** If a deliberately large response (a consumer `maxBytes` near 100 MiB, a very large metadata response) is refused with reason `too-large`, raise `maxResponseSize` in the `Kafka` options (up to 2147483647). `KafkaJSInvalidFrameError` names the four size bytes when they read `HTTP` or look like a TLS alert: check the broker port and the `ssl` setting.
+- **A request timeout now closes its connection.** Code that retries `KafkaJSRequestTimeoutError` also sees `KafkaJSConnectionClosedError` for requests that were healthy on the same connection; both are retriable. A mutation written before the close has an unknown outcome, exactly as after any timeout (an idempotent producer resends it in order, a transaction commit stays unknown). There is no setting that keeps a connection open after a timeout; `enforceRequestTimeout: false` removes the timeout and with it the close.
+
 ### Protocol
 
 Wire and connection behavior: negotiated versions, version floors, authentication and rebootstrap.
