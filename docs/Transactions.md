@@ -91,7 +91,11 @@ await transaction.sendOffsets({
 
 If the offset commit is refused because the consumer is no longer the member it was — `ILLEGAL_GENERATION` or `UNKNOWN_MEMBER_ID` under the classic protocol, `STALE_MEMBER_EPOCH` under `groupProtocol: 'consumer'`, or `FENCED_INSTANCE_ID` — `sendOffsets` rejects and the transaction can only be aborted: abort it, let the consumer rejoin, and process the records again from the committed offsets.
 
-As before, `sendOffsets` marks the offsets committed in the client's own cache as soon as they are sent, not when the transaction commits.
+`sendOffsets` snapshots its topics, partitions, offsets, leader epochs and metadata when called. Calls on one transaction run one at a time in call order, including retries. The last successful call for a partition selects its value, even when offsets move backward.
+
+Offsets enter the committed-offset cache shared by clients from one `Kafka` instance only after a confirmed transaction commit, once. A newer seek, reset, commit or topic recreation fences an older transaction publication per partition. An abort or fatal transaction state publishes nothing. Exactly-once applications must disable consumer auto-commit: before the transaction commits, a consumer can still attempt to commit the same offsets itself.
+
+An unconfirmed commit keeps its offsets staged for a confirmed retry. `producer.disconnect()` lets a pending commit finish; a commit it confirms publishes before closing. If the outcome remains unknown at disconnect, publication is permanently forfeited. A retry confirmed after reconnect publishes nothing, and does not clear a consumer's newer value. That cache keeps its value until its cell is rebuilt or cleared; an independent fresh read, such as `admin.fetchOffsets`, shows the broker's committed offsets. The transaction remains unknown until the coordinator answers; disconnect does not turn it into an abort.
 
 ## <a name="errors"></a> When something fails
 

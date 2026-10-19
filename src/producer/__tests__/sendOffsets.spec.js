@@ -91,6 +91,8 @@ describe('Producer > transaction.sendOffsets', () => {
       groupInstanceId: 'instance-a',
       transactionVersion: 2,
     })
+    expect(cluster.markOffsetAsCommitted).not.toHaveBeenCalled()
+    await transaction.commit()
     expect(cluster.markOffsetAsCommitted.mock.calls.map(([call]) => call)).toEqual([
       { groupId: GROUP_ID, topic: 'topic-a', partition: '0', offset: '11' },
       { groupId: GROUP_ID, topic: 'topic-a', partition: '1', offset: '7' },
@@ -110,6 +112,8 @@ describe('Producer > transaction.sendOffsets', () => {
         groupInstanceId: null,
       })
     )
+    expect(cluster.markOffsetAsCommitted).not.toHaveBeenCalled()
+    await transaction.commit()
     expect(cluster.markOffsetAsCommitted).toHaveBeenCalledWith(
       expect.objectContaining({ groupId: GROUP_ID })
     )

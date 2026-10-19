@@ -10,6 +10,7 @@ const ProducerIdAndEpoch = require('./producerIdAndEpoch')
 const PartitionSequencer = require('./partitionSequencer')
 const TransactionState = require('./transactionState')
 const TransactionVersion = require('./transactionVersion')
+const TransactionOffsets = require('./transactionOffsets')
 const {
   READY,
   IN_TRANSACTION,
@@ -81,6 +82,7 @@ class ProducerStateManager {
   #sequencer
   #transaction
   #version
+  #offsets
 
   /**
    * @param {object} options
@@ -116,6 +118,7 @@ class ProducerStateManager {
     this.#sequencer = new PartitionSequencer({ logger })
     this.#transaction = new TransactionState()
     this.#version = new TransactionVersion()
+    this.#offsets = new TransactionOffsets(logger)
     this.#identity = new ProducerIdAndEpoch({
       logger,
       transactionalId: transactional ? transactionalId : null,
@@ -139,6 +142,11 @@ class ProducerStateManager {
   /** @returns {TransactionVersion} the transaction version reader, read-only */
   get version() {
     return this.#version
+  }
+
+  /** @returns {TransactionOffsets} offsets owned by this transaction, never the send path */
+  get offsets() {
+    return this.#offsets
   }
 
   /** @returns {string|number} the producer id, -1 while none is held */
@@ -282,6 +290,7 @@ class ProducerStateManager {
       return
     }
 
+    if (this.transaction.state() === FATAL_ERROR) this.offsets.release()
     const armed = this.transaction.armedError()
     this.#logger.error(`Transaction state ${state} --> ${this.transaction.state()}`, {
       error: armed.message,
@@ -303,6 +312,7 @@ class ProducerStateManager {
     this.transaction.transitionTo(state)
     this.#logger.debug(`Transaction state transition ${from} --> ${state}`)
     if (state === READY) {
+      this.offsets.release()
       this.#adding.clear()
       this.#nextAdd = null
       this.#partitions.clear()

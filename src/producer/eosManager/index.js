@@ -502,6 +502,7 @@ const createEosManager = ({
         throw armWith(error)
       }
 
+      stateManager.offsets.publish(cluster)
       stateManager.transitionTo(STATES.READY)
     },
 
@@ -623,81 +624,92 @@ const createEosManager = ({
         consumerGroupMetadata,
       })
       assert(topics, 'Missing offset topics')
-      const transactionVersion = stateManager.transactionVersion()
+      const snapshot = stateManager.offsets.snapshot(
+        cluster.offsetOperations({ groupId }),
+        groupId,
+        topics
+      )
+      return stateManager.offsets.enqueue(snapshot, async () => {
+        const transactionVersion = stateManager.transactionVersion()
 
-      try {
-        if (transactionVersion === 2 && !hasPartitions(topics)) {
-          return
-        }
+        try {
+          stateManager.transaction.guard('sendOffsets')
+          if (transactionVersion === 2 && !hasPartitions(snapshot.topics)) {
+            stateManager.offsets.stage(snapshot)
+            return
+          }
 
-        if (transactionVersion === 1) {
+          if (transactionVersion === 1) {
+            await retrier(async (bail, retryCount, retryTime) => {
+              const transactionCoordinator = await findTransactionCoordinator()
+              try {
+                await transactionCoordinator.addOffsetsToTxn({
+                  transactionalId,
+                  producerId: stateManager.producerId,
+                  producerEpoch: stateManager.producerEpoch,
+                  groupId,
+                })
+              } catch (e) {
+                stateManager.classify(e, 'txn')
+                if (e.retriable) {
+                  logger.debug('AddOffsetsToTxn failed retriably, retrying', {
+                    error: e.message,
+                    transactionalId,
+                    retryCount,
+                    retryTime,
+                  })
+                  throw e
+                }
+                bail(e)
+              }
+            })
+          }
+
+          stateManager.markOffsetsAdded()
+
+          let groupCoordinator = await cluster.findGroupCoordinator({
+            groupId,
+            coordinatorType: COORDINATOR_TYPES.GROUP,
+          })
           await retrier(async (bail, retryCount, retryTime) => {
-            const transactionCoordinator = await findTransactionCoordinator()
             try {
-              await transactionCoordinator.addOffsetsToTxn({
+              await groupCoordinator.txnOffsetCommit({
                 transactionalId,
                 producerId: stateManager.producerId,
                 producerEpoch: stateManager.producerEpoch,
                 groupId,
+                topics: snapshot.topics,
+                generationId,
+                memberId,
+                groupInstanceId,
+                transactionVersion,
               })
             } catch (e) {
-              stateManager.classify(e, 'txn')
+              const { category } = stateManager.classify(e, 'offsets')
               if (e.retriable) {
-                logger.debug('AddOffsetsToTxn failed retriably, retrying', {
+                logger.debug('TxnOffsetCommit failed retriably, retrying', {
                   error: e.message,
                   transactionalId,
                   retryCount,
                   retryTime,
                 })
+                if (category === 'refreshRetriable' || e.code === 'ECONNREFUSED') {
+                  groupCoordinator = await cluster.findGroupCoordinator({
+                    groupId,
+                    coordinatorType: COORDINATOR_TYPES.GROUP,
+                  })
+                }
                 throw e
               }
               bail(e)
             }
           })
+          stateManager.offsets.stage(snapshot)
+        } catch (error) {
+          stateManager.offsets.abandon(snapshot)
+          throw armWith(error)
         }
-
-        stateManager.markOffsetsAdded()
-
-        let groupCoordinator = await cluster.findGroupCoordinator({
-          groupId,
-          coordinatorType: COORDINATOR_TYPES.GROUP,
-        })
-        await retrier(async (bail, retryCount, retryTime) => {
-          try {
-            await groupCoordinator.txnOffsetCommit({
-              transactionalId,
-              producerId: stateManager.producerId,
-              producerEpoch: stateManager.producerEpoch,
-              groupId,
-              topics,
-              generationId,
-              memberId,
-              groupInstanceId,
-              transactionVersion,
-            })
-          } catch (e) {
-            const { category } = stateManager.classify(e, 'offsets')
-            if (e.retriable) {
-              logger.debug('TxnOffsetCommit failed retriably, retrying', {
-                error: e.message,
-                transactionalId,
-                retryCount,
-                retryTime,
-              })
-              if (category === 'refreshRetriable' || e.code === 'ECONNREFUSED') {
-                groupCoordinator = await cluster.findGroupCoordinator({
-                  groupId,
-                  coordinatorType: COORDINATOR_TYPES.GROUP,
-                })
-              }
-              throw e
-            }
-            bail(e)
-          }
-        })
-      } catch (error) {
-        throw armWith(error)
-      }
+      })
     },
   }
 

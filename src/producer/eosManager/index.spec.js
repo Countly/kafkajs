@@ -1,3 +1,4 @@
+const OffsetOperations = require('../../consumer/offsetManager/offsetOperations')
 const { newLogger } = require('testHelpers')
 const createEosManager = require('.')
 const ProducerStateManager = require('../state')
@@ -33,6 +34,8 @@ describe('Producer > eosManager', () => {
       txnOffsetCommit: jest.fn(),
     }
     cluster = {
+      offsetOperations: () => new OffsetOperations(),
+      markOffsetAsCommitted: jest.fn(),
       refreshMetadataIfNecessary: jest.fn(),
       findGroupCoordinator: jest.fn().mockReturnValue(broker),
       findControllerBroker: jest.fn().mockReturnValue(broker),

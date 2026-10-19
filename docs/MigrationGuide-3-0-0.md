@@ -336,10 +336,8 @@ transaction in a way its error decides.
   fencing. Passing both, or neither, throws `KafkaJSNonRetriableError`.
   *What to do:* switch consume-transform-produce loops to
   `sendOffsets({ consumerGroupMetadata: consumer.groupMetadata(), topics })` and re-read the
-  metadata after every rebalance. Unchanged from 2.2.4: `sendOffsets` marks the offsets committed in
-  the client's own cluster cache as soon as they are sent, not after `commit()` succeeds, so an
-  aborted transaction leaves that cache optimistic — the same behaviour, and the same work-around,
-  as in 2.2.4.
+  metadata after every rebalance. The offsets no longer enter the client's committed-offset cache until
+  the transaction's commit is confirmed; see the cache item below.
 
 - **`ILLEGAL_GENERATION`, `UNKNOWN_MEMBER_ID`, `FENCED_INSTANCE_ID` and `STALE_MEMBER_EPOCH` from a
   transactional offset commit are abortable**, not a bare failure: `sendOffsets` rejects with a
@@ -373,6 +371,23 @@ transaction in a way its error decides.
   version and on whether the broker has KAFKA-20785 (fixed in 4.3.2 and 4.5.0), the coordinator
   aborted the transaction on its timeout before the commit landed: replace the producer and
   reprocess the input.
+
+- **Transaction offsets reach the client's cache only after the commit is confirmed.** Consumers of
+  the same group in the same `Kafka` instance no longer see transaction offsets as committed between
+  `sendOffsets` and the confirmed commit. An application that runs an auto-committing consumer with
+  `sendOffsets` for the same group in one process used to see the consumer skip those offsets and
+  will now commit them itself, with the same values, until the transaction commits; disable consumer
+  auto-commit, as exactly-once processing requires. After a forfeited publication the cache keeps
+  its value until the consumer's cell is rebuilt or cleared, while a fresh read
+  (`admin.fetchOffsets`, a new consumer) shows the broker's. Calls to `sendOffsets` on one
+  transaction now run in call order instead of overlapping. Whether a plain commit for a partition
+  with a pending transactional commit is accepted or answered `UNSTABLE_OFFSET_COMMIT` is the
+  coordinator's.
+
+- **A newer applied seek, reset, commit or recreation takes precedence over an older transaction
+  publication.** Nothing needs changing in application code; there is no option to restore the
+  stale overwrite. The value can move backward, so choosing the largest offset is not a substitute
+  for operation order.
 
 ### Consumer
 

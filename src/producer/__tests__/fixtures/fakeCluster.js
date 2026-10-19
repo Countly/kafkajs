@@ -1,3 +1,4 @@
+const OffsetOperations = require('../../../consumer/offsetManager/offsetOperations')
 const { partitionResults } = require('../../../protocol/requests/produce/partitionResults')
 
 /**
@@ -38,6 +39,7 @@ const createFakeCluster = ({ partitions = 1, produce, options = {} } = {}) => {
     endTxn: jest.fn(async () => ({})),
   }
   const targetTopics = new Set()
+  const operations = new Map()
 
   return {
     options,
@@ -59,6 +61,10 @@ const createFakeCluster = ({ partitions = 1, produce, options = {} } = {}) => {
     findGroupCoordinator: jest.fn(async () => broker),
     topicId: () => undefined,
     removeBroker: jest.fn(),
+    offsetOperations: ({ groupId }) => {
+      if (!operations.has(groupId)) operations.set(groupId, new OffsetOperations())
+      return operations.get(groupId)
+    },
     markOffsetAsCommitted: jest.fn(),
   }
 }

@@ -938,6 +938,10 @@ describe('Producer', () => {
         consumerGroupId,
         topics,
       })
+      expect(markOffsetAsCommittedSpy).not.toHaveBeenCalled()
+
+      await txn.commit()
+
       expect(markOffsetAsCommittedSpy).toHaveBeenCalledTimes(2)
       expect(markOffsetAsCommittedSpy.mock.calls[0][0]).toEqual({
         groupId: consumerGroupId,
@@ -951,8 +955,6 @@ describe('Producer', () => {
         partition: 1,
         offset: '10',
       })
-
-      await txn.commit()
 
       const coordinator = await cluster.findGroupCoordinator({ groupId: consumerGroupId })
       const retry = createRetrier({ retries: 5 })

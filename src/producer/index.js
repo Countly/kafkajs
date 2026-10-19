@@ -439,7 +439,7 @@ const createProducer = ({
        * offsets as part of the current transaction. Takes the consumer's `consumerGroupMetadata`
        * (`consumer.groupMetadata()`), so a stale or zombie member is fenced (KIP-447), or a
        * `consumerGroupId`, which commits with no member to fence; exactly one of them. The offsets
-       * are marked committed in this client's cache, for that group, once they are sent.
+       * enter the shared committed cache only after this transaction's commit is confirmed.
        *
        * @throws {KafkaJSNonRetriableError} If transaction has ended, or when both or neither of
        *   `consumerGroupMetadata` and `consumerGroupId` are given
@@ -452,19 +452,6 @@ const createProducer = ({
             consumerGroupId,
             topics,
           })
-          const groupId = consumerGroupId ?? consumerGroupMetadata.groupId
-
-          for (const topicOffsets of topics) {
-            const { topic, partitions } = topicOffsets
-            for (const { partition, offset } of partitions) {
-              cluster.markOffsetAsCommitted({
-                groupId,
-                topic,
-                partition,
-                offset,
-              })
-            }
-          }
         }
       ),
       isActive,
@@ -559,6 +546,7 @@ const createProducer = ({
       while (committing !== null) {
         await committing.catch(() => {})
       }
+      transactionalEosManager?.stateManager.offsets.release()
       await cluster.disconnect()
       connectionStatus = CONNECTION_STATUS.DISCONNECTED
       instrumentationEmitter.emit(DISCONNECT)
