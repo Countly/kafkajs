@@ -90,7 +90,7 @@ module.exports = (decoder, batchContext = {}, firstOffsetNumber) => {
   // two-element array, later ones push onto it.
   const headers = {}
   for (const { key: headerKey, value: headerValue } of decoder.readVarIntArray(HeaderDecoder)) {
-    const existing = headers[headerKey]
+    const existing = Object.hasOwn(headers, headerKey) ? headers[headerKey] : undefined
 
     if (existing === undefined) {
       setHeader(headers, headerKey, headerValue)

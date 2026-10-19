@@ -251,6 +251,10 @@ notice and what, if anything, to do.
   broker are one request. Pulling a batch forward adds no batching delay, but `linger` sets when a
   batch becomes due, not when its `send()` settles. *What to do:* nothing.
 
+- **A negative timestamp, which Java also refuses, now fails at `send()`.** Omit it or use
+  `0`/absent for the send time (numeric `0`, `0n` and absent still mean the send time; the string
+  `'0'` and `new Date(0)` are the literal epoch).
+
 ### Transactions
 
 Transactions move to the transaction protocol Kafka 4.x brokers speak, and a failed send now ends a
@@ -870,6 +874,10 @@ says so, `groupProtocol: 'consumer'`.
   See [Prefetching](Consuming.md#prefetching).
 - **A seek or commit made while the consumer is still resolving its initial offsets now wins.** It is no longer overwritten by the older answer. Nothing to change in code; the documented guarantees of `docs/Consuming.md` now hold. If you relied on the older answer overwriting your seek or commit, do the seek or commit again.
 - **Sentinel seeks select an explicit boundary.** `consumer.seek({ topic, partition, offset: '-2' })` selects earliest and `offset: '-1'` selects latest on the next resolution, regardless of the subscription's `fromBeginning` setting or `autoCommit`. The following fetch uses the concrete offset returned by ListOffsets. Sentinel seeks change the local position and do not commit a negative sentinel. Concrete-offset seeks retain their existing commit behavior. *What to do:* choose the sentinel for the boundary you intend; do not rely on the subscription default to reinterpret it. If you need a durable group offset change, commit the intended concrete offset explicitly.
+
+- **A `read_committed` consumer no longer receives records of an aborted transaction whose producer
+  also wrote a data record keyed with four zero bytes.** A corrupt batch is a typed
+  `KafkaJSCorruptRecordError` inside the decoder.
 
 ### Admin
 

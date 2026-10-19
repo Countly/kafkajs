@@ -6,7 +6,8 @@ const ENCODABLE = {
   key: 'a string, a Buffer or null',
   value: 'a string, a Buffer or null',
   headers: 'an object whose values are strings, Buffers or arrays of them',
-  timestamp: 'an integer: a number, a numeric string, a Date, a BigInt or a Long',
+  timestamp:
+    'an integer from 0 to 2^63 - 1: a number, a numeric string, a Date, a BigInt or a Long',
 }
 
 /**
@@ -22,15 +23,20 @@ const isBytes = (value) => typeof value === 'string' || Buffer.isBuffer(value)
  */
 const isHeaders = (headers) => headers !== null && Object.values(headers).flat().every(isBytes)
 
+/** The largest int64, the upper bound of a timestamp. */
+const MAX_TIMESTAMP = 2n ** 63n - 1n
+
 /**
  * @param {*} timestamp
  * @returns {boolean} whether the record encoder can write `timestamp` as an int64: it converts it
- *   with `Long.fromValue` and subtracts it as a number
+ *   with `Long.fromValue` and subtracts it as a number. Its exact value, taken before anything can
+ *   wrap it, must lie in `[0, 2^63 - 1]`; Java refuses a negative timestamp, and the bound keeps
+ *   the spread of any batch inside an int64.
  */
 const isTimestamp = (timestamp) => {
   try {
-    Long.fromValue(timestamp)
-    return Number.isInteger(Number(timestamp))
+    const { value } = Long.fromValue(timestamp)
+    return Number.isInteger(Number(timestamp)) && value >= 0n && value <= MAX_TIMESTAMP
   } catch {
     return false
   }

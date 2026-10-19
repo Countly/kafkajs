@@ -1,6 +1,7 @@
 const Decoder = require('../../../decoder')
 const recordDecoder = require('./decoder')
 const TimestampTypes = require('../../../timestampTypes')
+const { record } = require('../../../requests/fetch/__tests__/fixtures/recordBatchBytes')
 
 describe('Protocol > RecordBatch > Record > v0', () => {
   test('decodes', async () => {
@@ -77,5 +78,34 @@ describe('Protocol > RecordBatch > Record > v0', () => {
       value: Buffer.from('some-value-0'),
       isControlRecord: true,
     })
+  })
+
+  test('a header named like a property of every object is kept as data, and a repeated one makes an array', () => {
+    const bytes = record({
+      key: 'k',
+      value: 'v',
+      headers: [
+        ['__proto__', 'a'],
+        ['constructor', 'b'],
+        ['toString', 'c'],
+        ['constructor', 'd'],
+      ],
+    })
+    const body = new Decoder(bytes).readVarIntBytes()
+
+    const { headers } = recordDecoder(new Decoder(body), {
+      firstOffset: '0',
+      firstTimestamp: '0',
+      magicByte: 2,
+    })
+
+    expect(Object.getOwnPropertyNames(headers)).toEqual(['__proto__', 'constructor', 'toString'])
+    expect(Object.getOwnPropertyDescriptor(headers, '__proto__').value).toEqual(Buffer.from('a'))
+    expect(Object.getOwnPropertyDescriptor(headers, 'constructor').value).toEqual([
+      Buffer.from('b'),
+      Buffer.from('d'),
+    ])
+    expect(Object.getOwnPropertyDescriptor(headers, 'toString').value).toEqual(Buffer.from('c'))
+    expect(Object.getPrototypeOf(headers)).toBe(Object.prototype)
   })
 })

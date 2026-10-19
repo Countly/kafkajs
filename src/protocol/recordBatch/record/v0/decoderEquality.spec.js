@@ -40,8 +40,11 @@ const withAttributeFlag = (buffer, mask) => {
   return patched
 }
 
-/** Three records with non-zero offset and timestamp deltas, a null key and one header. */
-const threeRecords = () => [
+/**
+ * Three records with non-zero offset and timestamp deltas and one header.
+ * @param {Buffer|null} [lastKey=null] the key of the third record
+ */
+const threeRecords = (lastKey = null) => [
   RecordEncoder({
     key: Buffer.from('key-a'),
     value: Buffer.from('a'),
@@ -55,7 +58,7 @@ const threeRecords = () => [
     offsetDelta: 1,
     timestampDelta: 250,
   }),
-  RecordEncoder({ key: null, value: Buffer.from('c'), offsetDelta: 2, timestampDelta: 500 }),
+  RecordEncoder({ key: lastKey, value: Buffer.from('c'), offsetDelta: 2, timestampDelta: 500 }),
 ]
 
 /**
@@ -88,7 +91,9 @@ const CORPUS = {
         firstOffset: '1000',
         firstTimestamp: FIRST_TIMESTAMP,
         maxTimestamp: MAX_TIMESTAMP,
-        records: threeRecords(),
+        // A control record always has a key of at least 4 bytes, a version and a type: the
+        // decoder refuses one that has none, as the Kafka reader does.
+        records: threeRecords(Buffer.from('key-c')),
       }),
       CONTROL_FLAG_MASK
     ),

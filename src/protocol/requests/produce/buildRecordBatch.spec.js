@@ -270,3 +270,52 @@ describe('Protocol > Requests > Produce > buildRecordBatch > timestamps beyond 2
     expect(buffer.toString('hex')).toEqual(SAFE_TIMESTAMPS_BATCH)
   })
 })
+
+describe('Protocol > Requests > Produce > buildRecordBatch > timestamps at the int64 bounds', () => {
+  const INT64_MAX = 2n ** 63n - 1n
+
+  beforeEach(() => {
+    jest.spyOn(Date, 'now').mockReturnValue(SEND_TIME)
+  })
+
+  afterEach(() => {
+    jest.restoreAllMocks()
+  })
+
+  test.each([
+    ['a numeric string', INT64_MAX.toString(), INT64_MAX],
+    ['a BigInt', INT64_MAX, INT64_MAX],
+    ['a Long', Long.fromValue(INT64_MAX), INT64_MAX],
+    ['the largest number below 2^63', 2 ** 63 - 1024, 2n ** 63n - 1024n],
+  ])(
+    '%s at the upper bound is written exactly, in the header and in the record',
+    async (_, timestamp, expected) => {
+      expect(await encode([{ value: 'v', timestamp }])).toEqual({
+        first: expected,
+        max: expected,
+        timestamps: [expected],
+      })
+    }
+  )
+
+  test.each([
+    ['the string 0', '0'],
+    ['a Long of 0', Long.fromNumber(0)],
+    ['the Date of the epoch', new Date(0)],
+  ])('%s is the literal epoch, not the send time', async (_, timestamp) => {
+    expect(await encode([{ value: 'v', timestamp }])).toEqual({
+      first: 0n,
+      max: 0n,
+      timestamps: [0n],
+    })
+  })
+
+  test('a batch from the epoch to the int64 maximum writes its widest delta exactly', async () => {
+    const batch = await encode([
+      { value: 'high', timestamp: INT64_MAX.toString() },
+      { value: 'low', timestamp: '0' },
+    ])
+
+    expect(batch).toEqual({ first: 0n, max: INT64_MAX, timestamps: [INT64_MAX, 0n] })
+  })
+})

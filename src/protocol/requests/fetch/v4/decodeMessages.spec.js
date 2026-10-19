@@ -5,7 +5,7 @@ const decodeMessages = require('./decodeMessages')
 describe('Protocol > Requests > Fetch > v4 > decodeMessages', () => {
   test('a compact null records block decodes as no messages', async () => {
     const decoder = new Decoder(new Encoder().writeUVarInt(0).buffer)
-    await expect(decodeMessages(decoder, { compact: true })).resolves.toEqual([])
+    await expect(decodeMessages(decoder, { compact: true })).resolves.toEqual({ messages: [] })
   })
 
   test('the compact size read is the only difference: the same batch decodes either way', async () => {

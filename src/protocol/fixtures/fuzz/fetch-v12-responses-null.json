@@ -1,0 +1,10 @@
+{
+  "seed": 20261017,
+  "hex": "000000000000000000000000",
+  "api": "Fetch",
+  "version": 12,
+  "direction": "response",
+  "expect": {
+    "decoded": true
+  }
+}

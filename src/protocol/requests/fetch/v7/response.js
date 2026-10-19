@@ -41,7 +41,7 @@ const buildDecode = (options) => {
     lastStableOffset: decoder.readInt64().toString(),
     lastStartOffset: decoder.readInt64().toString(),
     abortedTransactions: decoder.readArray(decodeAbortedTransactions),
-    messages: await decodeMessages(decoder, options),
+    ...(await decodeMessages(decoder, options)),
   })
 
   const decodeResponse = async (decoder) => ({

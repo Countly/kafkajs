@@ -388,7 +388,16 @@
           "attributes": 0,
           "timestamp": "1700000000500",
           "offset": "1002",
-          "key": null,
+          "key": {
+            "type": "Buffer",
+            "data": [
+              107,
+              101,
+              121,
+              45,
+              99
+            ]
+          },
           "value": {
             "type": "Buffer",
             "data": [
@@ -652,22 +661,19 @@
             ]
           },
           "headers": {
-            "__proto__": [
-              {},
-              {
-                "type": "Buffer",
-                "data": [
-                  112,
-                  111,
-                  108,
-                  108,
-                  117,
-                  116,
-                  101,
-                  100
-                ]
-              }
-            ],
+            "__proto__": {
+              "type": "Buffer",
+              "data": [
+                112,
+                111,
+                108,
+                108,
+                117,
+                116,
+                101,
+                100
+              ]
+            },
             "safe": {
               "type": "Buffer",
               "data": [

@@ -23,7 +23,10 @@ module.exports = async (primaryDecoder, size = null) => {
 
       if (codec) {
         const buffer = await codec.decompress(message.value)
-        messages.push(...EntriesDecoder(new Decoder(buffer), message))
+        // push(...entries) throws a RangeError above about 125 000 entries
+        for (const entry of EntriesDecoder(new Decoder(buffer), message)) {
+          messages.push(entry)
+        }
       } else {
         messages.push(message)
       }

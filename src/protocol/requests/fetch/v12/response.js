@@ -59,7 +59,7 @@ const buildDecodePartition = (options) => {
     const lastStartOffset = decoder.readInt64().toString()
     const abortedTransactions = decoder.readUVarIntArray(decodeAbortedTransactions) || []
     const preferredReadReplica = decoder.readInt32()
-    const messages = await decodeMessages(decoder, messageOptions)
+    const records = await decodeMessages(decoder, messageOptions)
     const tags = decoder.readTaggedFields()
 
     return {
@@ -73,7 +73,7 @@ const buildDecodePartition = (options) => {
       divergingEpoch: decodeDivergingEpoch(tags),
       currentLeader: decodeCurrentLeader(tags),
       snapshotId: decodeSnapshotId(tags),
-      messages,
+      ...records,
     }
   }
 }
@@ -89,7 +89,8 @@ const buildDecode = (options) => {
 
   const decodeResponse = async (decoder) => {
     const topicName = decoder.readUVarIntString()
-    const partitions = await decoder.readUVarIntArrayAsync(decodePartition)
+    // a compact array of length 0 reads as null, and these two are not nullable
+    const partitions = (await decoder.readUVarIntArrayAsync(decodePartition)) || []
     decoder.readTaggedFields()
     return { topicName, partitions }
   }
@@ -99,7 +100,7 @@ const buildDecode = (options) => {
     const clientSideThrottleTime = decoder.readInt32()
     const errorCode = decoder.readInt16()
     const sessionId = decoder.readInt32()
-    const responses = await decoder.readUVarIntArrayAsync(decodeResponse)
+    const responses = (await decoder.readUVarIntArrayAsync(decodeResponse)) || []
     decoder.readTaggedFields()
 
     return { throttleTime: 0, clientSideThrottleTime, errorCode, sessionId, responses }

@@ -1,9 +1,17 @@
 const Long = require('../utils/long')
 const ABORTED_MESSAGE_KEY = Buffer.from([0, 0, 0, 0])
 
-const isAbortMarker = ({ key }) => {
+/**
+ * Whether a record is the control record that ends an aborted transaction. The key alone does not
+ * say so: four zero bytes are legal data in the key of an ordinary record, and a producer's abort
+ * filter must not end there. Only a control record, as the batch's control attribute marks it, is
+ * a marker (as in Java).
+ * @param {{ key: Buffer|null, isControlRecord: boolean }} message
+ * @returns {boolean}
+ */
+const isAbortMarker = ({ key, isControlRecord }) => {
   // Handle null/undefined keys.
-  if (!key) return false
+  if (!isControlRecord || !key) return false
   // Cast key to buffer defensively
   return Buffer.from(key).equals(ABORTED_MESSAGE_KEY)
 }
@@ -19,6 +27,7 @@ const isAbortMarker = ({ key }) => {
  *
  * @typedef {object} Message
  * @param {Buffer} key
+ * @param {boolean} isControlRecord
  * @param {lastOffset} key  Int64
  * @param {RecordBatch}  batchContext
  *
