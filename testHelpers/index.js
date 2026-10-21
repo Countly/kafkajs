@@ -12,7 +12,12 @@ const waitFor = require('../src/utils/waitFor')
 const connectionBuilder = require('../src/cluster/connectionPoolBuilder')
 const ConnectionPool = require('../src/network/connectionPool')
 const defaultSocketFactory = require('../src/network/socketFactory')
-const socketFactory = defaultSocketFactory()
+// Under KAFKAJS_TEST_CHAOS=1 every helper connection goes through the unarmed chaos wrapper; a
+// scenario arms its sockets through `connectionOpts().socketFactory.sockets`.
+const socketFactory =
+  process.env.KAFKAJS_TEST_CHAOS === '1'
+    ? require('./chaosSocket').createChaosSocketFactory(defaultSocketFactory())
+    : defaultSocketFactory()
 
 const {
   createLogger,
