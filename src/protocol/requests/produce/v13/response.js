@@ -14,7 +14,7 @@ const { parse, decodePartition, decodeNodeEndpoints } = require('../v10/response
  */
 const decodeTopic = (topicNames) => (decoder) => {
   const topicId = decoder.readUuid()
-  const partitions = decoder.readUVarIntArray(decodePartition)
+  const partitions = decoder.readUVarIntArray(decodePartition) || []
   decoder.readTaggedFields()
 
   // An id with no mapping cannot happen without a broker bug - the client can only ask for ids it
@@ -31,7 +31,7 @@ const decodeTopic = (topicNames) => (decoder) => {
 const decode = async (rawData, options = {}) => {
   const topicNames = options.topicNames || new Map()
   const decoder = new Decoder(rawData)
-  const topics = decoder.readUVarIntArray(decodeTopic(topicNames))
+  const topics = decoder.readUVarIntArray(decodeTopic(topicNames)) || []
   const throttleTime = decoder.readInt32()
   const tags = decoder.readTaggedFields()
 

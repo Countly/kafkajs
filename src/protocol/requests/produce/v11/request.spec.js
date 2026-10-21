@@ -1,5 +1,7 @@
 const Decoder = require('../../../decoder')
 const RequestV11Protocol = require('./request')
+const Long = require('../../../../utils/long')
+const golden = require('../fixtures/v11_request_golden.json')
 
 describe('Protocol > Requests > Produce > v11', () => {
   const topicData = [
@@ -48,5 +50,30 @@ describe('Protocol > Requests > Produce > v11', () => {
     expect(topics).toEqual([{ name: 'test-topic', partitions: [{ index: 0, records: null }] }])
     expect(decoder.readTaggedFields().size).toEqual(0)
     expect(decoder.canReadBytes(1)).toBe(false)
+  })
+})
+
+describe('Protocol > Requests > Produce > v11 > a hand-computed request', () => {
+  test('encodes the hand-computed golden byte for byte', async () => {
+    const { buffer } = await require('./request')({
+      acks: -1,
+      timeout: 30000,
+      producerId: Long.fromInt(1000),
+      producerEpoch: 3,
+      topicData: [
+        {
+          topic: 'test-topic',
+          partitions: [
+            {
+              partition: 0,
+              firstSequence: 7,
+              messages: [{ key: 'k', value: 'v', timestamp: 1700000000000 }],
+            },
+          ],
+        },
+      ],
+    }).encode()
+
+    expect(buffer.toString('hex')).toEqual(golden.hex)
   })
 })

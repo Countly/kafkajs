@@ -612,6 +612,7 @@ if (require.main === module) {
 }
 
 module.exports = {
+  CAPTURE_LIST,
   splitFrames,
   stripHeader,
   normalise,

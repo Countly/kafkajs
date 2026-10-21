@@ -12,7 +12,7 @@ const { failure, createErrorFromCode } = require('../../../error')
  *     error_code => INT16
  */
 
-const topicNameComparator = (a, b) => a.topic.localeCompare(b.topic)
+const topicNameComparator = (a, b) => (a.topic ?? '').localeCompare(b.topic ?? '')
 
 const topicErrors = (decoder) => ({
   topic: decoder.readString(),

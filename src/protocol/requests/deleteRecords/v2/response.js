@@ -21,7 +21,7 @@ const responseV0 = require('../v0/response')
  * @see clients/src/main/resources/common/message/DeleteRecordsResponse.json (Apache Kafka 4.3.1)
  */
 
-const topicNameComparator = (a, b) => a.topic.localeCompare(b.topic)
+const topicNameComparator = (a, b) => (a.topic ?? '').localeCompare(b.topic ?? '')
 
 const decodePartition = (decoder) => {
   const partition = {
@@ -37,7 +37,7 @@ const decodePartition = (decoder) => {
 const decodeTopic = (decoder) => {
   const topic = {
     topic: decoder.readUVarIntString(),
-    partitions: decoder.readUVarIntArray(decodePartition),
+    partitions: decoder.readUVarIntArray(decodePartition) || [],
   }
 
   decoder.readTaggedFields()

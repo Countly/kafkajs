@@ -20,6 +20,7 @@ const path = require('path')
 const { execFileSync } = require('child_process')
 const { readSpec, parseVersionRange } = require('../compat/parse')
 const { kafkaTag } = require('./table')
+const { keyOfMessage } = require('./apiNames')
 
 const COMPAT_ROOT = path.join(__dirname, '..', 'compat')
 const REPO_ROOT = path.join(__dirname, '..', '..')
@@ -398,7 +399,7 @@ class CodecScaffolder {
       `module.exports = (${paramsExpr}) => ({`,
       '  apiKey,',
       `  apiVersion: ${this.version},`,
-      `  apiName: '${this.apiName}',`,
+      `  apiName: '${keyOfMessage(this.apiName)}',`,
       '  encode: async () => {',
       ...bodyLines,
       '  },',
@@ -443,7 +444,7 @@ class CodecScaffolder {
   renderRequest() {
     const header = [
       "const Encoder = require('../../../encoder')",
-      `const { ${this.apiName}: apiKey } = require('../../apiKeys')`,
+      `const { ${keyOfMessage(this.apiName)}: apiKey } = require('../../apiKeys')`,
     ].join('\n')
 
     const doc = this.renderDoc()

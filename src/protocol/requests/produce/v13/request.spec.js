@@ -2,6 +2,8 @@ const RequestV13Protocol = require('./request')
 const Decoder = require('../../../decoder')
 const { Types } = require('../../../message/compression')
 const { KafkaJSInvariantViolation } = require('../../../../errors')
+const Long = require('../../../../utils/long')
+const golden = require('../fixtures/v13_request_golden.json')
 
 const TOPIC_ID = '01020304-0506-0708-090a-0b0c0d0e0f10'
 
@@ -95,5 +97,31 @@ describe('Protocol > Requests > Produce > v13', () => {
     expect(topics).toEqual([{ topicId: TOPIC_ID, partitions: [{ index: 0, records: null }] }])
     expect(decoder.readTaggedFields().size).toEqual(0)
     expect(decoder.canReadBytes(1)).toBe(false)
+  })
+})
+
+describe('Protocol > Requests > Produce > v13 > a hand-computed request', () => {
+  test('encodes the hand-computed golden byte for byte', async () => {
+    const { buffer } = await require('./request')({
+      acks: -1,
+      timeout: 30000,
+      producerId: Long.fromInt(1000),
+      producerEpoch: 3,
+      topicIds: new Map([['test-topic', '01020304-0506-0708-090a-0b0c0d0e0f10']]),
+      topicData: [
+        {
+          topic: 'test-topic',
+          partitions: [
+            {
+              partition: 0,
+              firstSequence: 7,
+              messages: [{ key: 'k', value: 'v', timestamp: 1700000000000 }],
+            },
+          ],
+        },
+      ],
+    }).encode()
+
+    expect(buffer.toString('hex')).toEqual(golden.hex)
   })
 })

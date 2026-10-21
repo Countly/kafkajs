@@ -16,18 +16,20 @@ const path = require('path')
 const { readSpec, parseVersionRange } = require('../compat/parse')
 const { kafkaTag } = require('./table')
 const { isFlexible } = require('../../src/protocol/headers')
+const { messageOfDirectory } = require('./apiNames')
+const { walkBody } = require('./walk')
 
 const COMPAT_ROOT = path.join(__dirname, '..', 'compat')
 const REPO_ROOT = path.join(__dirname, '..', '..')
-const REQUESTS_ROOT = path.join(REPO_ROOT, 'src', 'protocol', 'requests')
 const VERSION_DIR = /^v\d+$/
 
 /**
  * @param {string} absolutePath
+ * @param {string} [root] the repository root
  * @returns {string} `absolutePath` relative to the repo root, with POSIX separators
  */
-const toRepoRelative = (absolutePath) =>
-  path.relative(REPO_ROOT, absolutePath).split(path.sep).join('/')
+const toRepoRelative = (absolutePath, root = REPO_ROOT) =>
+  path.relative(root, absolutePath).split(path.sep).join('/')
 
 /**
  * @param {{min: number, max: number|null}|null} range
@@ -54,14 +56,16 @@ const specFile = (api, direction) =>
  * Walks `src/protocol/requests/*<code>/v*</code>/`, requiring `request.js` and `response.js`
  * where present. Requiring a codec must be side-effect free; a module whose `require` throws
  * is still reported, with `requireError` set instead of `schema`.
+ * @param {string} [root] the repository root
  * @returns {{file: string, dir: string, direction: 'request'|'response', module: object|null, schema: object|null, requireError: Error|null}[]}
  *          sorted by `file`, so the report is stable
  */
-const discover = () => {
+const discover = (root = REPO_ROOT) => {
   const codecs = []
+  const requestsRoot = path.join(root, 'src', 'protocol', 'requests')
 
-  for (const apiName of fs.readdirSync(REQUESTS_ROOT).sort()) {
-    const apiDir = path.join(REQUESTS_ROOT, apiName)
+  for (const apiName of fs.readdirSync(requestsRoot).sort()) {
+    const apiDir = path.join(requestsRoot, apiName)
     if (!fs.statSync(apiDir).isDirectory()) continue
 
     for (const versionName of fs.readdirSync(apiDir).sort()) {
@@ -83,8 +87,8 @@ const discover = () => {
         }
 
         codecs.push({
-          file: toRepoRelative(file),
-          dir: toRepoRelative(versionDir),
+          file: toRepoRelative(file, root),
+          dir: toRepoRelative(versionDir, root),
           direction,
           module: mod,
           schema,
@@ -194,11 +198,21 @@ const compare = (codec, expected) => {
 }
 
 /**
+ * @param {{ dir: string }} codec a discovered codec
+ * @returns {{ directory: string, version: number }} the API directory and `vN` directory it sits in
+ */
+const locationOf = (codec) => {
+  const parts = codec.dir.split('/')
+  return { directory: parts[parts.length - 2], version: Number(parts[parts.length - 1].slice(1)) }
+}
+
+/**
  * Validates one discovered codec against the message-definition snapshot: that its declared
- * `api`/`version` exist and agree with `direction`, that its field list matches (`compare`),
- * and that its implied flexibility (compact encodings, tagged-field sections) matches the
- * message JSON's `flexibleVersions` as seen through `isFlexible`.
- * @param {{file: string, direction: 'request'|'response', schema: object}} codec a codec whose `schema` is not null
+ * `api`/`version` exist and agree with `direction` and with the directory it sits in (`S5`: the
+ * `vN` directory is the schema's version; `S6`: the API directory is the schema's API), that its
+ * field list matches (`compare`), and that its implied flexibility (compact encodings, tagged-field
+ * sections) matches the message JSON's `flexibleVersions` as seen through `isFlexible`.
+ * @param {{file: string, dir: string, direction: 'request'|'response', schema: object}} codec a codec whose `schema` is not null
  * @param {string[]} failures accumulator
  */
 const checkCodec = (codec, failures) => {
@@ -223,6 +237,18 @@ const checkCodec = (codec, failures) => {
     return
   }
 
+  const location = locationOf(codec)
+  if (schema.version !== location.version) {
+    failures.push(
+      `S5 ${codec.file} sits in v${location.version} but its schema declares v${schema.version}`
+    )
+  }
+  if (schema.api !== messageOfDirectory(location.directory)) {
+    failures.push(
+      `S6 ${codec.file} sits in the ${location.directory} directory but its schema declares api '${schema.api}'`
+    )
+  }
+
   if (schema.direction !== codec.direction) {
     failures.push(
       `S3 ${codec.file} declares direction '${schema.direction}' but the file is ${codec.direction}.js`
@@ -241,6 +267,32 @@ const checkCodec = (codec, failures) => {
       } v${schema.version} flexible=${specFlexible} per the message JSON, ` +
         `but isFlexible(${spec.apiKey}, ${schema.version})=${codecFlexible}`
     )
+  }
+}
+
+/**
+ * Walks golden message bodies against the message definition the codec declares, as the wire is
+ * written at the codec's version: compact lengths and a tag buffer after every structure from the
+ * first flexible version, classic lengths and no tags below it. A codec whose golden bytes or
+ * whose encoder's output (the bytes its request spec asserts equal to the golden) disagree with
+ * `flexibleVersions` fails here, where comparing two declaration tables would pass it.
+ * @param {{ file: string, schema: { api: string, direction: 'request'|'response', version: number } }} codec
+ *   a codec whose `schema` is not null
+ * @param {{ name: string, bytes: Buffer }[]} vectors message bodies that are evidence for the codec
+ * @param {string[]} failures accumulator, appended to in place
+ */
+const checkEncoding = (codec, vectors, failures) => {
+  const { api, direction, version } = codec.schema
+  if (!fs.existsSync(specFile(api, direction))) return
+
+  const spec = readSpec(specFile(api, direction))
+  for (const { name, bytes } of vectors) {
+    const walked = walkBody(spec, version, bytes)
+    if (!walked.ok) {
+      failures.push(
+        `S8 ${codec.file} ${name} does not read as a v${version} ${api} ${direction}: ${walked.reason}`
+      )
+    }
   }
 }
 
@@ -278,4 +330,12 @@ const checkSchemas = (failures, reports) => {
   )
 }
 
-module.exports = { discover, expectedFields, compare, checkSchemas, fieldsFromSpec }
+module.exports = {
+  discover,
+  expectedFields,
+  compare,
+  checkCodec,
+  checkEncoding,
+  checkSchemas,
+  fieldsFromSpec,
+}

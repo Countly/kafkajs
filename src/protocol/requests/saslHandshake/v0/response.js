@@ -31,3 +31,13 @@ module.exports = {
   decode,
   parse,
 }
+
+module.exports.schema = {
+  api: 'SaslHandshake',
+  version: 0,
+  direction: 'response',
+  fields: [
+    { name: 'ErrorCode', type: 'int16', versions: '0+' },
+    { name: 'Mechanisms', type: '[]string', versions: '0+' },
+  ],
+}

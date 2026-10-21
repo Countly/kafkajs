@@ -33,7 +33,7 @@ const { parse } = require('../v2/response')
 
 const TOPIC_CONFIG_ERROR_CODE_TAG = 0
 
-const topicNameComparator = (a, b) => a.topic.localeCompare(b.topic)
+const topicNameComparator = (a, b) => (a.topic ?? '').localeCompare(b.topic ?? '')
 
 const decodeConfig = (decoder) => {
   const config = {

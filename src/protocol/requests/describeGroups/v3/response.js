@@ -13,7 +13,7 @@ const readersFor = (version) =>
     ? {
         string: (decoder) => decoder.readUVarIntString(),
         bytes: (decoder) => decoder.readUVarIntBytes(),
-        array: (decoder, reader) => decoder.readUVarIntArray(reader),
+        array: (decoder, reader) => decoder.readUVarIntArray(reader) || [],
         taggedFields: (decoder) => decoder.readTaggedFields(),
       }
     : {

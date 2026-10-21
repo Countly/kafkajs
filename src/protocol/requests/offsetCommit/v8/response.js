@@ -22,7 +22,7 @@ const { parse } = require('../v2/response')
 const decode = async (rawData) => {
   const decoder = new Decoder(rawData)
   const throttleTime = decoder.readInt32()
-  const responses = decoder.readUVarIntArray(decodeResponses)
+  const responses = decoder.readUVarIntArray(decodeResponses) || []
 
   decoder.readTaggedFields()
 
@@ -36,7 +36,7 @@ const decode = async (rawData) => {
 const decodeResponses = (decoder) => {
   const response = {
     topic: decoder.readUVarIntString(),
-    partitions: decoder.readUVarIntArray(decodePartitions),
+    partitions: decoder.readUVarIntArray(decodePartitions) || [],
   }
 
   decoder.readTaggedFields()

@@ -5,6 +5,8 @@ const os = require('os')
 const path = require('path')
 const { execFileSync } = require('child_process')
 const { scaffold, write } = require('../scaffold')
+const apiKeys = require('../../../src/protocol/requests/apiKeys')
+const { messageOfKey } = require('../apiNames')
 
 // prettier's own JS API loads plugins via a dynamic `import()`, which Jest's CJS test
 // environment cannot satisfy without `--experimental-vm-modules`; the CLI (a separate Node
@@ -62,6 +64,23 @@ describe('scripts/protocol > scaffold', () => {
         encoding: 'utf8',
       })
     ).not.toThrow()
+  })
+
+  // The Apache message is FindCoordinator; this client's key and the name its codecs report are
+  // GroupCoordinator. A scaffolded request that imported the message name would get undefined.
+  test.each([
+    ['GroupCoordinator', 'FindCoordinator'],
+    ['Produce', 'Produce'],
+    ['OffsetFetch', 'OffsetFetch'],
+  ])('the request of %s takes its name from apiKeys.js', (key, message) => {
+    expect(messageOfKey(key)).toEqual(message)
+    expect(apiKeys[key]).toEqual(expect.any(Number))
+
+    const source = scaffold(message, 4, 'request')
+
+    expect(source).toContain(`const { ${key}: apiKey } = require('../../apiKeys')`)
+    expect(source).toContain(`apiName: '${key}',`)
+    expect(source).toContain(`api: '${message}',`)
   })
 
   describe('write()', () => {

@@ -1,7 +1,15 @@
 'use strict'
 
 const { parseSpec } = require('../../compat/parse')
-const { expectedFields, compare, discover, fieldsFromSpec } = require('../schema')
+const {
+  expectedFields,
+  compare,
+  discover,
+  fieldsFromSpec,
+  checkCodec,
+  checkEncoding,
+} = require('../schema')
+const classicInFlexible = require('./fixtures/classicInFlexible')
 
 describe('scripts/protocol > schema validation', () => {
   test('resolves the expected fields of ApiVersionsResponse v0', () => {
@@ -383,6 +391,10 @@ describe('scripts/protocol > schema validation', () => {
       'src/protocol/requests/produce/v9/response.js',
       'src/protocol/requests/saslAuthenticate/v2/request.js',
       'src/protocol/requests/saslAuthenticate/v2/response.js',
+      'src/protocol/requests/saslHandshake/v0/request.js',
+      'src/protocol/requests/saslHandshake/v0/response.js',
+      'src/protocol/requests/saslHandshake/v1/request.js',
+      'src/protocol/requests/saslHandshake/v1/response.js',
       'src/protocol/requests/syncGroup/v4/request.js',
       'src/protocol/requests/syncGroup/v4/response.js',
       'src/protocol/requests/syncGroup/v5/request.js',
@@ -396,5 +408,110 @@ describe('scripts/protocol > schema validation', () => {
       'src/protocol/requests/txnOffsetCommit/v5/request.js',
       'src/protocol/requests/txnOffsetCommit/v5/response.js',
     ])
+  })
+
+  describe('a schema agrees with the place its codec sits in', () => {
+    const heartbeat = () => discover().find(({ file }) => file.endsWith('heartbeat/v4/request.js'))
+    const failuresOf = (codec) => {
+      const failures = []
+      checkCodec(codec, failures)
+      return failures
+    }
+
+    test('a codec in the right directory, file and version has none', () => {
+      expect(failuresOf(heartbeat())).toEqual([])
+    })
+
+    test('a schema of another version than its vN directory fails S5', () => {
+      const codec = heartbeat()
+      const schema = {
+        ...codec.schema,
+        version: 3,
+        fields: expectedFields('Heartbeat', 'request', 3),
+      }
+
+      expect(failuresOf({ ...codec, schema })).toEqual([
+        expect.stringMatching(
+          /^S5 .*heartbeat\/v4\/request\.js sits in v4 but its schema declares v3$/
+        ),
+      ])
+    })
+
+    test('a schema of another API than its directory fails S6', () => {
+      const codec = heartbeat()
+      const dir = 'src/protocol/requests/metadata/v4'
+
+      expect(failuresOf({ ...codec, dir })).toEqual([
+        expect.stringMatching(
+          /^S6 .*sits in the metadata directory but its schema declares api 'Heartbeat'$/
+        ),
+      ])
+    })
+
+    test('a schema of another direction than its file fails S3', () => {
+      expect(failuresOf({ ...heartbeat(), direction: 'response' })).toEqual([
+        expect.stringMatching(/^S3 .*declares direction 'request' but the file is response\.js$/),
+      ])
+    })
+
+    test('a schema of a version the message never had fails S3', () => {
+      const codec = heartbeat()
+
+      expect(failuresOf({ ...codec, schema: { ...codec.schema, version: 99 } })).toEqual([
+        expect.stringMatching(/^S3 .*v99 is outside Heartbeat's validVersions 0-4$/),
+      ])
+    })
+
+    test('every committed schema agrees with its directory, API, direction and version', () => {
+      const failures = []
+
+      for (const codec of discover().filter(({ schema }) => schema != null)) {
+        checkCodec(codec, failures)
+      }
+
+      expect(failures).toEqual([])
+    })
+  })
+
+  describe('a codec writes the encoding its version is declared to have', () => {
+    const options = { groupId: 'g', generationId: 3, memberId: 'm', groupInstanceId: null }
+    const realRequest = () =>
+      discover().find(({ file }) => file.endsWith('heartbeat/v4/request.js'))
+    const bytesOf = async (request) => ({ name: 'encoded', bytes: (await request.encode()).buffer })
+
+    test('a request whose strings are compact and whose structures end in a tag buffer has no failure', async () => {
+      const failures = []
+      const codec = realRequest()
+
+      checkEncoding(codec, [await bytesOf(codec.module(options))], failures)
+
+      expect(failures).toEqual([])
+    })
+
+    test('a codec that declares the right schema and writes classic strings fails S8 through its encoder', async () => {
+      const failures = []
+      const codec = { file: 'fixtures/classicInFlexible.js', schema: classicInFlexible.schema }
+
+      const declared = []
+      checkCodec({ ...realRequest(), schema: classicInFlexible.schema }, declared)
+      checkEncoding(codec, [await bytesOf(classicInFlexible(options))], failures)
+
+      expect(declared).toEqual([])
+      expect(failures).toEqual([
+        expect.stringMatching(
+          /^S8 fixtures\/classicInFlexible\.js encoded does not read as a v4 Heartbeat request: /
+        ),
+      ])
+    })
+
+    test('a classic encoding of a flexible version is caught even when its length happens to be plausible', async () => {
+      const failures = []
+      const codec = realRequest()
+      const compact = (await bytesOf(codec.module(options))).bytes
+
+      checkEncoding(codec, [{ name: 'a byte short', bytes: compact.subarray(0, -1) }], failures)
+
+      expect(failures).toEqual([expect.stringContaining('S8 ')])
+    })
   })
 })

@@ -7,11 +7,11 @@ const { Types: Compression } = require('../../message/compression')
 
 // The committed fixture `src/protocol/recordBatch/fixtures/v0_recordbatch.json` carries a valid
 // CRC32C over the covered region and is exactly `12 + length` bytes long -- but despite its name
-// it is itself GZIP-compressed (attributes = 9: GZIP codec + LOG_APPEND_TIME). The other committed
-// fixture, `v0_recordbatch_zstd.json`, decodes with `attributes: 0` (no compression codec set) and
-// fails record decoding even with `checkCrcs: false`; it predates this task, nothing else in the
-// tree references it, and it is not usable here. A second, freshly-built compressed batch below
-// (via the production encoder) gives a control alongside the committed one.
+// it is itself GZIP-compressed (attributes = 9: GZIP codec + LOG_APPEND_TIME). A second,
+// freshly-built compressed batch below (via the production encoder) gives a control alongside the
+// committed one. A ZSTD fixture that decoded with `attributes: 0` and that nothing referenced was
+// removed; ZSTD batches are covered by `src/producer/compression.spec.js` and the live ZSTD case
+// of `src/broker/__tests__/produce.spec.js`.
 const committedFixture = () => Buffer.from(require('../fixtures/v0_recordbatch.json'))
 
 // Fixed inputs (rather than the encoder's `Date.now()` defaults) so this batch, and the sign of

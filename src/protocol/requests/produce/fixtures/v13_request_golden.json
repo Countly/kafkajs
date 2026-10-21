@@ -1,0 +1,5 @@
+{
+  "construction": "Hand-assembled from the documented layouts with struct packing and a bitwise CRC-32C (check value 0xe3069283 for 123456789), with no codec of this repository. The partition leader epoch is outside the CRC and is assigned by the broker; 0 is what this client sends.",
+  "hex": "00ffff00007530020102030405060708090a0b0c0d0e0f1002000000004700000000000000000000003a0000000002e78af8340000000000000000018bcfe568000000018bcfe5680000000000000003e80003000000070000000110000000026b027600000000",
+  "fields": {"transactionalId":null,"acks":-1,"timeoutMs":30000,"topics":[{"topicId":"01020304-0506-0708-090a-0b0c0d0e0f10","partitions":[{"partition":0,"batch":{"baseOffset":0,"partitionLeaderEpoch":0,"magic":2,"crc":"0xe78af834","attributes":0,"lastOffsetDelta":0,"baseTimestamp":1700000000000,"maxTimestamp":1700000000000,"producerId":1000,"producerEpoch":3,"baseSequence":7,"records":[{"timestampDelta":0,"offsetDelta":0,"key":"k","value":"v","headers":[]}]}}]}]}
+}

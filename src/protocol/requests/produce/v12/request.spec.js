@@ -2,6 +2,8 @@ const RequestV12Protocol = require('./request')
 const Decoder = require('../../../decoder')
 const RequestV11Protocol = require('../v11/request')
 const { Types } = require('../../../message/compression')
+const Long = require('../../../../utils/long')
+const golden = require('../fixtures/v12_request_golden.json')
 
 // An explicit timestamp keeps the two record batches - and therefore their CRCs - reproducible;
 // without it Date.now() makes a byte-equality comparison flaky.
@@ -58,5 +60,30 @@ describe('Protocol > Requests > Produce > v12', () => {
     expect(topics).toEqual([{ name: 'test-topic', partitions: [{ index: 0, records: null }] }])
     expect(decoder.readTaggedFields().size).toEqual(0)
     expect(decoder.canReadBytes(1)).toBe(false)
+  })
+})
+
+describe('Protocol > Requests > Produce > v12 > a hand-computed request', () => {
+  test('encodes the hand-computed golden byte for byte', async () => {
+    const { buffer } = await require('./request')({
+      acks: -1,
+      timeout: 30000,
+      producerId: Long.fromInt(1000),
+      producerEpoch: 3,
+      topicData: [
+        {
+          topic: 'test-topic',
+          partitions: [
+            {
+              partition: 0,
+              firstSequence: 7,
+              messages: [{ key: 'k', value: 'v', timestamp: 1700000000000 }],
+            },
+          ],
+        },
+      ],
+    }).encode()
+
+    expect(buffer.toString('hex')).toEqual(golden.hex)
   })
 })

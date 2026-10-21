@@ -1,0 +1,11 @@
+{
+  "construction": "Hand-assembled from the SaslHandshake definition (not flexible, so classic lengths) with struct packing, with no codec of this repository.",
+  "hex": "0000000000020005504c41494e000d534352414d2d5348412d323536",
+  "fields": {
+    "errorCode": 0,
+    "enabledMechanisms": [
+      "PLAIN",
+      "SCRAM-SHA-256"
+    ]
+  }
+}

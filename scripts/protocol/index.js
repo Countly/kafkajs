@@ -4,9 +4,13 @@
 /**
  * Protocol codec tooling.
  *
- *   npm run protocol:generate   rewrite src/protocol/flexibleVersions.js from the snapshot
- *   npm run protocol:check      regenerate in memory, diff against the committed file,
- *                               report and exit 1 on any failure (--json for machine output)
+ *   npm run protocol:generate   rewrite src/protocol/flexibleVersions.js from the snapshot and
+ *                               scripts/protocol/provenance.json from the snapshot, the fixtures
+ *                               and the Java generators
+ *   npm run protocol:check      regenerate in memory, diff against the committed files, check the
+ *                               codec census, the agreement of every schema with its place, the
+ *                               goldens, the fixture records and the provenance; report and exit 1
+ *                               on any failure (--json for machine output)
  *   node scripts/protocol/index.js scaffold <ApiName> <version>
  *                               emit a hand-finishable codec skeleton for one API version
  *
@@ -21,6 +25,7 @@ const generate = () => {
   const tag = kafkaTag()
   fs.writeFileSync(OUTPUT, render(tag, collect(tag)))
   console.log(`wrote ${OUTPUT_RELATIVE}`)
+  console.log(`wrote ${require('./provenance').writeProvenance()}`)
   return 0
 }
 
@@ -45,6 +50,8 @@ const check = (options) => {
   const reports = []
   require('./schema').checkSchemas(failures, reports)
   checkTable(failures)
+  require('./inventory').checkInventory(failures, reports)
+  require('./provenance').checkProvenance(failures)
   return finish(failures, reports, options)
 }
 

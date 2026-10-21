@@ -19,7 +19,7 @@ const { parse } = require('../v0/response')
  * @see clients/src/main/resources/common/message/CreatePartitionsResponse.json (Apache Kafka 4.3.1)
  */
 
-const topicNameComparator = (a, b) => a.topic.localeCompare(b.topic)
+const topicNameComparator = (a, b) => (a.topic ?? '').localeCompare(b.topic ?? '')
 
 const decodeTopicError = (decoder) => {
   const topicError = {

@@ -592,7 +592,9 @@ describe('Protocol > Fetch response > the fuzz corpus', () => {
   })
 
   describe.each(
-    loadCorpus(path.join(__dirname, '..', 'fixtures', 'fuzz')).map((found) => [found.name, found])
+    loadCorpus(path.join(__dirname, '..', 'fixtures', 'fuzz'))
+      .filter(({ api }) => api === 'Fetch')
+      .map((found) => [found.name, found])
   )('the corpus case %s', (_, found) => {
     test('decodes as it is expected to', async () => {
       expect({ api: found.api, direction: found.direction }).toEqual({

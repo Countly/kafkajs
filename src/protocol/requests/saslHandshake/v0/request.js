@@ -15,3 +15,10 @@ module.exports = ({ mechanism }) => ({
   apiName: 'SaslHandshake',
   encode: async () => new Encoder().writeString(mechanism),
 })
+
+module.exports.schema = {
+  api: 'SaslHandshake',
+  version: 0,
+  direction: 'request',
+  fields: [{ name: 'Mechanism', type: 'string', versions: '0+' }],
+}

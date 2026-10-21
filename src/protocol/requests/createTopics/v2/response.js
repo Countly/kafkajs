@@ -11,7 +11,7 @@ const { KafkaJSAggregateError, KafkaJSCreateTopicError } = require('../../../../
  *     error_message => NULLABLE_STRING
  */
 
-const topicNameComparator = (a, b) => a.topic.localeCompare(b.topic)
+const topicNameComparator = (a, b) => (a.topic ?? '').localeCompare(b.topic ?? '')
 
 const topicErrors = (decoder) => ({
   topic: decoder.readString(),

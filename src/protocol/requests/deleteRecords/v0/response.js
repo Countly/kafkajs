@@ -13,7 +13,7 @@ const { failure, createErrorFromCode } = require('../../../error')
  *      error_code => INT16
  */
 
-const topicNameComparator = (a, b) => a.topic.localeCompare(b.topic)
+const topicNameComparator = (a, b) => (a.topic ?? '').localeCompare(b.topic ?? '')
 
 const decode = async (rawData) => {
   const decoder = new Decoder(rawData)
@@ -51,7 +51,7 @@ const parse = (requestTopics) => async (data) => {
         partition,
         error: createErrorFromCode(errorCode),
         // attach the original offset from the request, onto the error response
-        offset: requestPartitions.find((p) => p.partition === partition).offset,
+        offset: (requestPartitions.find((p) => p.partition === partition) || {}).offset,
       })),
     })
   }
