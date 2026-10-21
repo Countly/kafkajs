@@ -594,6 +594,8 @@ says so, `groupProtocol: 'consumer'`.
   dropped, so that work is redelivered after the rejoin.
   In kafkajs 2.2.4 a long handler was never evicted as long as it called `heartbeat()`. If you have
   handlers that legitimately run for a long time, set `maxPollInterval` to cover them.
+- An error thrown by your `POLL_INTERVAL_EXCEEDED` listener is logged and no longer stops cleanup or the rejoin. There is no option to restore a listener’s ability to strand the consumer.
+- Late accepted consumer-protocol joins are counted and obsolete stored loss notifications are compared with the ownership that sent them, including when the broker reuses a numeric generation. A consumer-protocol rejoin waits for the leave of its current membership to settle. No application change is required; current rejoin obligations remain honored.
 
 - **Commits cannot outlive membership or their calling handler's assignment.** Code that committed
   after a rebalance error to save progress now gets `KafkaJSCommitFailedError`: let the consumer

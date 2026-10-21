@@ -1,0 +1,1958 @@
+[
+  {
+    "event": "stop",
+    "boundary": "before-handler",
+    "protocol": "classic-eager",
+    "membership": "dynamic"
+  },
+  {
+    "event": "stop",
+    "boundary": "before-handler",
+    "protocol": "classic-eager",
+    "membership": "static"
+  },
+  {
+    "event": "stop",
+    "boundary": "before-handler",
+    "protocol": "classic-cooperative",
+    "membership": "dynamic"
+  },
+  {
+    "event": "stop",
+    "boundary": "before-handler",
+    "protocol": "classic-cooperative",
+    "membership": "static"
+  },
+  {
+    "event": "stop",
+    "boundary": "before-handler",
+    "protocol": "consumer",
+    "membership": "dynamic"
+  },
+  {
+    "event": "stop",
+    "boundary": "before-handler",
+    "protocol": "consumer",
+    "membership": "static"
+  },
+  {
+    "event": "stop",
+    "boundary": "in-handler",
+    "protocol": "classic-eager",
+    "membership": "dynamic"
+  },
+  {
+    "event": "stop",
+    "boundary": "in-handler",
+    "protocol": "classic-eager",
+    "membership": "static"
+  },
+  {
+    "event": "stop",
+    "boundary": "in-handler",
+    "protocol": "classic-cooperative",
+    "membership": "dynamic"
+  },
+  {
+    "event": "stop",
+    "boundary": "in-handler",
+    "protocol": "classic-cooperative",
+    "membership": "static"
+  },
+  {
+    "event": "stop",
+    "boundary": "in-handler",
+    "protocol": "consumer",
+    "membership": "dynamic"
+  },
+  {
+    "event": "stop",
+    "boundary": "in-handler",
+    "protocol": "consumer",
+    "membership": "static"
+  },
+  {
+    "event": "stop",
+    "boundary": "in-heartbeat",
+    "protocol": "classic-eager",
+    "membership": "dynamic"
+  },
+  {
+    "event": "stop",
+    "boundary": "in-heartbeat",
+    "protocol": "classic-eager",
+    "membership": "static"
+  },
+  {
+    "event": "stop",
+    "boundary": "in-heartbeat",
+    "protocol": "classic-cooperative",
+    "membership": "dynamic"
+  },
+  {
+    "event": "stop",
+    "boundary": "in-heartbeat",
+    "protocol": "classic-cooperative",
+    "membership": "static"
+  },
+  {
+    "event": "stop",
+    "boundary": "in-heartbeat",
+    "protocol": "consumer",
+    "membership": "dynamic"
+  },
+  {
+    "event": "stop",
+    "boundary": "in-heartbeat",
+    "protocol": "consumer",
+    "membership": "static"
+  },
+  {
+    "event": "stop",
+    "boundary": "commit:coordinator-lookup",
+    "protocol": "classic-eager",
+    "membership": "dynamic"
+  },
+  {
+    "event": "stop",
+    "boundary": "commit:coordinator-lookup",
+    "protocol": "classic-eager",
+    "membership": "static"
+  },
+  {
+    "event": "stop",
+    "boundary": "commit:coordinator-lookup",
+    "protocol": "classic-cooperative",
+    "membership": "dynamic"
+  },
+  {
+    "event": "stop",
+    "boundary": "commit:coordinator-lookup",
+    "protocol": "classic-cooperative",
+    "membership": "static"
+  },
+  {
+    "event": "stop",
+    "boundary": "commit:coordinator-lookup",
+    "protocol": "consumer",
+    "membership": "dynamic"
+  },
+  {
+    "event": "stop",
+    "boundary": "commit:coordinator-lookup",
+    "protocol": "consumer",
+    "membership": "static"
+  },
+  {
+    "event": "stop",
+    "boundary": "commit:pool-connect",
+    "protocol": "classic-eager",
+    "membership": "dynamic"
+  },
+  {
+    "event": "stop",
+    "boundary": "commit:pool-connect",
+    "protocol": "classic-eager",
+    "membership": "static"
+  },
+  {
+    "event": "stop",
+    "boundary": "commit:pool-connect",
+    "protocol": "classic-cooperative",
+    "membership": "dynamic"
+  },
+  {
+    "event": "stop",
+    "boundary": "commit:pool-connect",
+    "protocol": "classic-cooperative",
+    "membership": "static"
+  },
+  {
+    "event": "stop",
+    "boundary": "commit:pool-connect",
+    "protocol": "consumer",
+    "membership": "dynamic"
+  },
+  {
+    "event": "stop",
+    "boundary": "commit:pool-connect",
+    "protocol": "consumer",
+    "membership": "static"
+  },
+  {
+    "event": "stop",
+    "boundary": "commit:auth-encode",
+    "protocol": "classic-eager",
+    "membership": "dynamic"
+  },
+  {
+    "event": "stop",
+    "boundary": "commit:auth-encode",
+    "protocol": "classic-eager",
+    "membership": "static"
+  },
+  {
+    "event": "stop",
+    "boundary": "commit:auth-encode",
+    "protocol": "classic-cooperative",
+    "membership": "dynamic"
+  },
+  {
+    "event": "stop",
+    "boundary": "commit:auth-encode",
+    "protocol": "classic-cooperative",
+    "membership": "static"
+  },
+  {
+    "event": "stop",
+    "boundary": "commit:auth-encode",
+    "protocol": "consumer",
+    "membership": "dynamic"
+  },
+  {
+    "event": "stop",
+    "boundary": "commit:auth-encode",
+    "protocol": "consumer",
+    "membership": "static"
+  },
+  {
+    "event": "stop",
+    "boundary": "commit:pending-queue",
+    "protocol": "classic-eager",
+    "membership": "dynamic"
+  },
+  {
+    "event": "stop",
+    "boundary": "commit:pending-queue",
+    "protocol": "classic-eager",
+    "membership": "static"
+  },
+  {
+    "event": "stop",
+    "boundary": "commit:pending-queue",
+    "protocol": "classic-cooperative",
+    "membership": "dynamic"
+  },
+  {
+    "event": "stop",
+    "boundary": "commit:pending-queue",
+    "protocol": "classic-cooperative",
+    "membership": "static"
+  },
+  {
+    "event": "stop",
+    "boundary": "commit:pending-queue",
+    "protocol": "consumer",
+    "membership": "dynamic"
+  },
+  {
+    "event": "stop",
+    "boundary": "commit:pending-queue",
+    "protocol": "consumer",
+    "membership": "static"
+  },
+  {
+    "event": "stop",
+    "boundary": "commit:retry-backoff",
+    "protocol": "classic-eager",
+    "membership": "dynamic"
+  },
+  {
+    "event": "stop",
+    "boundary": "commit:retry-backoff",
+    "protocol": "classic-eager",
+    "membership": "static"
+  },
+  {
+    "event": "stop",
+    "boundary": "commit:retry-backoff",
+    "protocol": "classic-cooperative",
+    "membership": "dynamic"
+  },
+  {
+    "event": "stop",
+    "boundary": "commit:retry-backoff",
+    "protocol": "classic-cooperative",
+    "membership": "static"
+  },
+  {
+    "event": "stop",
+    "boundary": "commit:retry-backoff",
+    "protocol": "consumer",
+    "membership": "dynamic"
+  },
+  {
+    "event": "stop",
+    "boundary": "commit:retry-backoff",
+    "protocol": "consumer",
+    "membership": "static"
+  },
+  {
+    "event": "stop",
+    "boundary": "commit:answer-held",
+    "protocol": "classic-eager",
+    "membership": "dynamic"
+  },
+  {
+    "event": "stop",
+    "boundary": "commit:answer-held",
+    "protocol": "classic-eager",
+    "membership": "static"
+  },
+  {
+    "event": "stop",
+    "boundary": "commit:answer-held",
+    "protocol": "classic-cooperative",
+    "membership": "dynamic"
+  },
+  {
+    "event": "stop",
+    "boundary": "commit:answer-held",
+    "protocol": "classic-cooperative",
+    "membership": "static"
+  },
+  {
+    "event": "stop",
+    "boundary": "commit:answer-held",
+    "protocol": "consumer",
+    "membership": "dynamic"
+  },
+  {
+    "event": "stop",
+    "boundary": "commit:answer-held",
+    "protocol": "consumer",
+    "membership": "static"
+  },
+  {
+    "event": "stop",
+    "boundary": "in-leave",
+    "protocol": "classic-eager",
+    "membership": "dynamic"
+  },
+  {
+    "event": "stop",
+    "boundary": "in-leave",
+    "protocol": "classic-cooperative",
+    "membership": "dynamic"
+  },
+  {
+    "event": "stop",
+    "boundary": "in-leave",
+    "protocol": "consumer",
+    "membership": "dynamic"
+  },
+  {
+    "event": "stop",
+    "boundary": "in-leave",
+    "protocol": "consumer",
+    "membership": "static"
+  },
+  {
+    "event": "disconnect",
+    "boundary": "before-handler",
+    "protocol": "classic-eager",
+    "membership": "dynamic"
+  },
+  {
+    "event": "disconnect",
+    "boundary": "before-handler",
+    "protocol": "classic-eager",
+    "membership": "static"
+  },
+  {
+    "event": "disconnect",
+    "boundary": "before-handler",
+    "protocol": "classic-cooperative",
+    "membership": "dynamic"
+  },
+  {
+    "event": "disconnect",
+    "boundary": "before-handler",
+    "protocol": "classic-cooperative",
+    "membership": "static"
+  },
+  {
+    "event": "disconnect",
+    "boundary": "before-handler",
+    "protocol": "consumer",
+    "membership": "dynamic"
+  },
+  {
+    "event": "disconnect",
+    "boundary": "before-handler",
+    "protocol": "consumer",
+    "membership": "static"
+  },
+  {
+    "event": "disconnect",
+    "boundary": "in-handler",
+    "protocol": "classic-eager",
+    "membership": "dynamic"
+  },
+  {
+    "event": "disconnect",
+    "boundary": "in-handler",
+    "protocol": "classic-eager",
+    "membership": "static"
+  },
+  {
+    "event": "disconnect",
+    "boundary": "in-handler",
+    "protocol": "classic-cooperative",
+    "membership": "dynamic"
+  },
+  {
+    "event": "disconnect",
+    "boundary": "in-handler",
+    "protocol": "classic-cooperative",
+    "membership": "static"
+  },
+  {
+    "event": "disconnect",
+    "boundary": "in-handler",
+    "protocol": "consumer",
+    "membership": "dynamic"
+  },
+  {
+    "event": "disconnect",
+    "boundary": "in-handler",
+    "protocol": "consumer",
+    "membership": "static"
+  },
+  {
+    "event": "disconnect",
+    "boundary": "in-heartbeat",
+    "protocol": "classic-eager",
+    "membership": "dynamic"
+  },
+  {
+    "event": "disconnect",
+    "boundary": "in-heartbeat",
+    "protocol": "classic-eager",
+    "membership": "static"
+  },
+  {
+    "event": "disconnect",
+    "boundary": "in-heartbeat",
+    "protocol": "classic-cooperative",
+    "membership": "dynamic"
+  },
+  {
+    "event": "disconnect",
+    "boundary": "in-heartbeat",
+    "protocol": "classic-cooperative",
+    "membership": "static"
+  },
+  {
+    "event": "disconnect",
+    "boundary": "in-heartbeat",
+    "protocol": "consumer",
+    "membership": "dynamic"
+  },
+  {
+    "event": "disconnect",
+    "boundary": "in-heartbeat",
+    "protocol": "consumer",
+    "membership": "static"
+  },
+  {
+    "event": "disconnect",
+    "boundary": "commit:coordinator-lookup",
+    "protocol": "classic-eager",
+    "membership": "dynamic"
+  },
+  {
+    "event": "disconnect",
+    "boundary": "commit:coordinator-lookup",
+    "protocol": "classic-eager",
+    "membership": "static"
+  },
+  {
+    "event": "disconnect",
+    "boundary": "commit:coordinator-lookup",
+    "protocol": "classic-cooperative",
+    "membership": "dynamic"
+  },
+  {
+    "event": "disconnect",
+    "boundary": "commit:coordinator-lookup",
+    "protocol": "classic-cooperative",
+    "membership": "static"
+  },
+  {
+    "event": "disconnect",
+    "boundary": "commit:coordinator-lookup",
+    "protocol": "consumer",
+    "membership": "dynamic"
+  },
+  {
+    "event": "disconnect",
+    "boundary": "commit:coordinator-lookup",
+    "protocol": "consumer",
+    "membership": "static"
+  },
+  {
+    "event": "disconnect",
+    "boundary": "commit:pool-connect",
+    "protocol": "classic-eager",
+    "membership": "dynamic"
+  },
+  {
+    "event": "disconnect",
+    "boundary": "commit:pool-connect",
+    "protocol": "classic-eager",
+    "membership": "static"
+  },
+  {
+    "event": "disconnect",
+    "boundary": "commit:pool-connect",
+    "protocol": "classic-cooperative",
+    "membership": "dynamic"
+  },
+  {
+    "event": "disconnect",
+    "boundary": "commit:pool-connect",
+    "protocol": "classic-cooperative",
+    "membership": "static"
+  },
+  {
+    "event": "disconnect",
+    "boundary": "commit:pool-connect",
+    "protocol": "consumer",
+    "membership": "dynamic"
+  },
+  {
+    "event": "disconnect",
+    "boundary": "commit:pool-connect",
+    "protocol": "consumer",
+    "membership": "static"
+  },
+  {
+    "event": "disconnect",
+    "boundary": "commit:auth-encode",
+    "protocol": "classic-eager",
+    "membership": "dynamic"
+  },
+  {
+    "event": "disconnect",
+    "boundary": "commit:auth-encode",
+    "protocol": "classic-eager",
+    "membership": "static"
+  },
+  {
+    "event": "disconnect",
+    "boundary": "commit:auth-encode",
+    "protocol": "classic-cooperative",
+    "membership": "dynamic"
+  },
+  {
+    "event": "disconnect",
+    "boundary": "commit:auth-encode",
+    "protocol": "classic-cooperative",
+    "membership": "static"
+  },
+  {
+    "event": "disconnect",
+    "boundary": "commit:auth-encode",
+    "protocol": "consumer",
+    "membership": "dynamic"
+  },
+  {
+    "event": "disconnect",
+    "boundary": "commit:auth-encode",
+    "protocol": "consumer",
+    "membership": "static"
+  },
+  {
+    "event": "disconnect",
+    "boundary": "commit:pending-queue",
+    "protocol": "classic-eager",
+    "membership": "dynamic"
+  },
+  {
+    "event": "disconnect",
+    "boundary": "commit:pending-queue",
+    "protocol": "classic-eager",
+    "membership": "static"
+  },
+  {
+    "event": "disconnect",
+    "boundary": "commit:pending-queue",
+    "protocol": "classic-cooperative",
+    "membership": "dynamic"
+  },
+  {
+    "event": "disconnect",
+    "boundary": "commit:pending-queue",
+    "protocol": "classic-cooperative",
+    "membership": "static"
+  },
+  {
+    "event": "disconnect",
+    "boundary": "commit:pending-queue",
+    "protocol": "consumer",
+    "membership": "dynamic"
+  },
+  {
+    "event": "disconnect",
+    "boundary": "commit:pending-queue",
+    "protocol": "consumer",
+    "membership": "static"
+  },
+  {
+    "event": "disconnect",
+    "boundary": "commit:retry-backoff",
+    "protocol": "classic-eager",
+    "membership": "dynamic"
+  },
+  {
+    "event": "disconnect",
+    "boundary": "commit:retry-backoff",
+    "protocol": "classic-eager",
+    "membership": "static"
+  },
+  {
+    "event": "disconnect",
+    "boundary": "commit:retry-backoff",
+    "protocol": "classic-cooperative",
+    "membership": "dynamic"
+  },
+  {
+    "event": "disconnect",
+    "boundary": "commit:retry-backoff",
+    "protocol": "classic-cooperative",
+    "membership": "static"
+  },
+  {
+    "event": "disconnect",
+    "boundary": "commit:retry-backoff",
+    "protocol": "consumer",
+    "membership": "dynamic"
+  },
+  {
+    "event": "disconnect",
+    "boundary": "commit:retry-backoff",
+    "protocol": "consumer",
+    "membership": "static"
+  },
+  {
+    "event": "disconnect",
+    "boundary": "commit:answer-held",
+    "protocol": "classic-eager",
+    "membership": "dynamic"
+  },
+  {
+    "event": "disconnect",
+    "boundary": "commit:answer-held",
+    "protocol": "classic-eager",
+    "membership": "static"
+  },
+  {
+    "event": "disconnect",
+    "boundary": "commit:answer-held",
+    "protocol": "classic-cooperative",
+    "membership": "dynamic"
+  },
+  {
+    "event": "disconnect",
+    "boundary": "commit:answer-held",
+    "protocol": "classic-cooperative",
+    "membership": "static"
+  },
+  {
+    "event": "disconnect",
+    "boundary": "commit:answer-held",
+    "protocol": "consumer",
+    "membership": "dynamic"
+  },
+  {
+    "event": "disconnect",
+    "boundary": "commit:answer-held",
+    "protocol": "consumer",
+    "membership": "static"
+  },
+  {
+    "event": "disconnect",
+    "boundary": "in-leave",
+    "protocol": "classic-eager",
+    "membership": "dynamic"
+  },
+  {
+    "event": "disconnect",
+    "boundary": "in-leave",
+    "protocol": "classic-cooperative",
+    "membership": "dynamic"
+  },
+  {
+    "event": "disconnect",
+    "boundary": "in-leave",
+    "protocol": "consumer",
+    "membership": "dynamic"
+  },
+  {
+    "event": "disconnect",
+    "boundary": "in-leave",
+    "protocol": "consumer",
+    "membership": "static"
+  },
+  {
+    "event": "crash",
+    "boundary": "before-handler",
+    "protocol": "classic-eager",
+    "membership": "dynamic"
+  },
+  {
+    "event": "crash",
+    "boundary": "before-handler",
+    "protocol": "classic-eager",
+    "membership": "static"
+  },
+  {
+    "event": "crash",
+    "boundary": "before-handler",
+    "protocol": "classic-cooperative",
+    "membership": "dynamic"
+  },
+  {
+    "event": "crash",
+    "boundary": "before-handler",
+    "protocol": "classic-cooperative",
+    "membership": "static"
+  },
+  {
+    "event": "crash",
+    "boundary": "before-handler",
+    "protocol": "consumer",
+    "membership": "dynamic"
+  },
+  {
+    "event": "crash",
+    "boundary": "before-handler",
+    "protocol": "consumer",
+    "membership": "static"
+  },
+  {
+    "event": "crash",
+    "boundary": "in-handler",
+    "protocol": "classic-eager",
+    "membership": "dynamic"
+  },
+  {
+    "event": "crash",
+    "boundary": "in-handler",
+    "protocol": "classic-eager",
+    "membership": "static"
+  },
+  {
+    "event": "crash",
+    "boundary": "in-handler",
+    "protocol": "classic-cooperative",
+    "membership": "dynamic"
+  },
+  {
+    "event": "crash",
+    "boundary": "in-handler",
+    "protocol": "classic-cooperative",
+    "membership": "static"
+  },
+  {
+    "event": "crash",
+    "boundary": "in-handler",
+    "protocol": "consumer",
+    "membership": "dynamic"
+  },
+  {
+    "event": "crash",
+    "boundary": "in-handler",
+    "protocol": "consumer",
+    "membership": "static"
+  },
+  {
+    "event": "crash",
+    "boundary": "in-heartbeat",
+    "protocol": "classic-eager",
+    "membership": "dynamic"
+  },
+  {
+    "event": "crash",
+    "boundary": "in-heartbeat",
+    "protocol": "classic-eager",
+    "membership": "static"
+  },
+  {
+    "event": "crash",
+    "boundary": "in-heartbeat",
+    "protocol": "classic-cooperative",
+    "membership": "dynamic"
+  },
+  {
+    "event": "crash",
+    "boundary": "in-heartbeat",
+    "protocol": "classic-cooperative",
+    "membership": "static"
+  },
+  {
+    "event": "crash",
+    "boundary": "in-heartbeat",
+    "protocol": "consumer",
+    "membership": "dynamic"
+  },
+  {
+    "event": "crash",
+    "boundary": "in-heartbeat",
+    "protocol": "consumer",
+    "membership": "static"
+  },
+  {
+    "event": "crash",
+    "boundary": "commit:coordinator-lookup",
+    "protocol": "classic-eager",
+    "membership": "dynamic"
+  },
+  {
+    "event": "crash",
+    "boundary": "commit:coordinator-lookup",
+    "protocol": "classic-eager",
+    "membership": "static"
+  },
+  {
+    "event": "crash",
+    "boundary": "commit:coordinator-lookup",
+    "protocol": "classic-cooperative",
+    "membership": "dynamic"
+  },
+  {
+    "event": "crash",
+    "boundary": "commit:coordinator-lookup",
+    "protocol": "classic-cooperative",
+    "membership": "static"
+  },
+  {
+    "event": "crash",
+    "boundary": "commit:coordinator-lookup",
+    "protocol": "consumer",
+    "membership": "dynamic"
+  },
+  {
+    "event": "crash",
+    "boundary": "commit:coordinator-lookup",
+    "protocol": "consumer",
+    "membership": "static"
+  },
+  {
+    "event": "crash",
+    "boundary": "commit:pool-connect",
+    "protocol": "classic-eager",
+    "membership": "dynamic"
+  },
+  {
+    "event": "crash",
+    "boundary": "commit:pool-connect",
+    "protocol": "classic-eager",
+    "membership": "static"
+  },
+  {
+    "event": "crash",
+    "boundary": "commit:pool-connect",
+    "protocol": "classic-cooperative",
+    "membership": "dynamic"
+  },
+  {
+    "event": "crash",
+    "boundary": "commit:pool-connect",
+    "protocol": "classic-cooperative",
+    "membership": "static"
+  },
+  {
+    "event": "crash",
+    "boundary": "commit:pool-connect",
+    "protocol": "consumer",
+    "membership": "dynamic"
+  },
+  {
+    "event": "crash",
+    "boundary": "commit:pool-connect",
+    "protocol": "consumer",
+    "membership": "static"
+  },
+  {
+    "event": "crash",
+    "boundary": "commit:auth-encode",
+    "protocol": "classic-eager",
+    "membership": "dynamic"
+  },
+  {
+    "event": "crash",
+    "boundary": "commit:auth-encode",
+    "protocol": "classic-eager",
+    "membership": "static"
+  },
+  {
+    "event": "crash",
+    "boundary": "commit:auth-encode",
+    "protocol": "classic-cooperative",
+    "membership": "dynamic"
+  },
+  {
+    "event": "crash",
+    "boundary": "commit:auth-encode",
+    "protocol": "classic-cooperative",
+    "membership": "static"
+  },
+  {
+    "event": "crash",
+    "boundary": "commit:auth-encode",
+    "protocol": "consumer",
+    "membership": "dynamic"
+  },
+  {
+    "event": "crash",
+    "boundary": "commit:auth-encode",
+    "protocol": "consumer",
+    "membership": "static"
+  },
+  {
+    "event": "crash",
+    "boundary": "commit:pending-queue",
+    "protocol": "classic-eager",
+    "membership": "dynamic"
+  },
+  {
+    "event": "crash",
+    "boundary": "commit:pending-queue",
+    "protocol": "classic-eager",
+    "membership": "static"
+  },
+  {
+    "event": "crash",
+    "boundary": "commit:pending-queue",
+    "protocol": "classic-cooperative",
+    "membership": "dynamic"
+  },
+  {
+    "event": "crash",
+    "boundary": "commit:pending-queue",
+    "protocol": "classic-cooperative",
+    "membership": "static"
+  },
+  {
+    "event": "crash",
+    "boundary": "commit:pending-queue",
+    "protocol": "consumer",
+    "membership": "dynamic"
+  },
+  {
+    "event": "crash",
+    "boundary": "commit:pending-queue",
+    "protocol": "consumer",
+    "membership": "static"
+  },
+  {
+    "event": "crash",
+    "boundary": "commit:retry-backoff",
+    "protocol": "classic-eager",
+    "membership": "dynamic"
+  },
+  {
+    "event": "crash",
+    "boundary": "commit:retry-backoff",
+    "protocol": "classic-eager",
+    "membership": "static"
+  },
+  {
+    "event": "crash",
+    "boundary": "commit:retry-backoff",
+    "protocol": "classic-cooperative",
+    "membership": "dynamic"
+  },
+  {
+    "event": "crash",
+    "boundary": "commit:retry-backoff",
+    "protocol": "classic-cooperative",
+    "membership": "static"
+  },
+  {
+    "event": "crash",
+    "boundary": "commit:retry-backoff",
+    "protocol": "consumer",
+    "membership": "dynamic"
+  },
+  {
+    "event": "crash",
+    "boundary": "commit:retry-backoff",
+    "protocol": "consumer",
+    "membership": "static"
+  },
+  {
+    "event": "crash",
+    "boundary": "commit:answer-held",
+    "protocol": "classic-eager",
+    "membership": "dynamic"
+  },
+  {
+    "event": "crash",
+    "boundary": "commit:answer-held",
+    "protocol": "classic-eager",
+    "membership": "static"
+  },
+  {
+    "event": "crash",
+    "boundary": "commit:answer-held",
+    "protocol": "classic-cooperative",
+    "membership": "dynamic"
+  },
+  {
+    "event": "crash",
+    "boundary": "commit:answer-held",
+    "protocol": "classic-cooperative",
+    "membership": "static"
+  },
+  {
+    "event": "crash",
+    "boundary": "commit:answer-held",
+    "protocol": "consumer",
+    "membership": "dynamic"
+  },
+  {
+    "event": "crash",
+    "boundary": "commit:answer-held",
+    "protocol": "consumer",
+    "membership": "static"
+  },
+  {
+    "event": "crash",
+    "boundary": "in-join",
+    "protocol": "classic-eager",
+    "membership": "dynamic"
+  },
+  {
+    "event": "crash",
+    "boundary": "in-join",
+    "protocol": "classic-eager",
+    "membership": "static"
+  },
+  {
+    "event": "crash",
+    "boundary": "in-join",
+    "protocol": "classic-cooperative",
+    "membership": "dynamic"
+  },
+  {
+    "event": "crash",
+    "boundary": "in-join",
+    "protocol": "classic-cooperative",
+    "membership": "static"
+  },
+  {
+    "event": "crash",
+    "boundary": "in-sync",
+    "protocol": "classic-eager",
+    "membership": "dynamic"
+  },
+  {
+    "event": "crash",
+    "boundary": "in-sync",
+    "protocol": "classic-eager",
+    "membership": "static"
+  },
+  {
+    "event": "crash",
+    "boundary": "in-sync",
+    "protocol": "classic-cooperative",
+    "membership": "dynamic"
+  },
+  {
+    "event": "crash",
+    "boundary": "in-sync",
+    "protocol": "classic-cooperative",
+    "membership": "static"
+  },
+  {
+    "event": "crash",
+    "boundary": "in-leave",
+    "protocol": "classic-eager",
+    "membership": "dynamic"
+  },
+  {
+    "event": "crash",
+    "boundary": "in-leave",
+    "protocol": "classic-cooperative",
+    "membership": "dynamic"
+  },
+  {
+    "event": "crash",
+    "boundary": "in-leave",
+    "protocol": "consumer",
+    "membership": "dynamic"
+  },
+  {
+    "event": "crash",
+    "boundary": "in-leave",
+    "protocol": "consumer",
+    "membership": "static"
+  },
+  {
+    "event": "rejoin",
+    "boundary": "before-handler",
+    "protocol": "classic-eager",
+    "membership": "dynamic"
+  },
+  {
+    "event": "rejoin",
+    "boundary": "before-handler",
+    "protocol": "classic-eager",
+    "membership": "static"
+  },
+  {
+    "event": "rejoin",
+    "boundary": "before-handler",
+    "protocol": "classic-cooperative",
+    "membership": "dynamic"
+  },
+  {
+    "event": "rejoin",
+    "boundary": "before-handler",
+    "protocol": "classic-cooperative",
+    "membership": "static"
+  },
+  {
+    "event": "rejoin",
+    "boundary": "before-handler",
+    "protocol": "consumer",
+    "membership": "dynamic"
+  },
+  {
+    "event": "rejoin",
+    "boundary": "before-handler",
+    "protocol": "consumer",
+    "membership": "static"
+  },
+  {
+    "event": "rejoin",
+    "boundary": "in-handler",
+    "protocol": "classic-eager",
+    "membership": "dynamic"
+  },
+  {
+    "event": "rejoin",
+    "boundary": "in-handler",
+    "protocol": "classic-eager",
+    "membership": "static"
+  },
+  {
+    "event": "rejoin",
+    "boundary": "in-handler",
+    "protocol": "classic-cooperative",
+    "membership": "dynamic"
+  },
+  {
+    "event": "rejoin",
+    "boundary": "in-handler",
+    "protocol": "classic-cooperative",
+    "membership": "static"
+  },
+  {
+    "event": "rejoin",
+    "boundary": "in-handler",
+    "protocol": "consumer",
+    "membership": "dynamic"
+  },
+  {
+    "event": "rejoin",
+    "boundary": "in-handler",
+    "protocol": "consumer",
+    "membership": "static"
+  },
+  {
+    "event": "rejoin",
+    "boundary": "in-heartbeat",
+    "protocol": "classic-eager",
+    "membership": "dynamic"
+  },
+  {
+    "event": "rejoin",
+    "boundary": "in-heartbeat",
+    "protocol": "classic-eager",
+    "membership": "static"
+  },
+  {
+    "event": "rejoin",
+    "boundary": "in-heartbeat",
+    "protocol": "classic-cooperative",
+    "membership": "dynamic"
+  },
+  {
+    "event": "rejoin",
+    "boundary": "in-heartbeat",
+    "protocol": "classic-cooperative",
+    "membership": "static"
+  },
+  {
+    "event": "rejoin",
+    "boundary": "in-heartbeat",
+    "protocol": "consumer",
+    "membership": "dynamic"
+  },
+  {
+    "event": "rejoin",
+    "boundary": "in-heartbeat",
+    "protocol": "consumer",
+    "membership": "static"
+  },
+  {
+    "event": "rejoin",
+    "boundary": "commit:coordinator-lookup",
+    "protocol": "classic-eager",
+    "membership": "dynamic"
+  },
+  {
+    "event": "rejoin",
+    "boundary": "commit:coordinator-lookup",
+    "protocol": "classic-eager",
+    "membership": "static"
+  },
+  {
+    "event": "rejoin",
+    "boundary": "commit:coordinator-lookup",
+    "protocol": "classic-cooperative",
+    "membership": "dynamic"
+  },
+  {
+    "event": "rejoin",
+    "boundary": "commit:coordinator-lookup",
+    "protocol": "classic-cooperative",
+    "membership": "static"
+  },
+  {
+    "event": "rejoin",
+    "boundary": "commit:coordinator-lookup",
+    "protocol": "consumer",
+    "membership": "dynamic"
+  },
+  {
+    "event": "rejoin",
+    "boundary": "commit:coordinator-lookup",
+    "protocol": "consumer",
+    "membership": "static"
+  },
+  {
+    "event": "rejoin",
+    "boundary": "commit:pool-connect",
+    "protocol": "classic-eager",
+    "membership": "dynamic"
+  },
+  {
+    "event": "rejoin",
+    "boundary": "commit:pool-connect",
+    "protocol": "classic-eager",
+    "membership": "static"
+  },
+  {
+    "event": "rejoin",
+    "boundary": "commit:pool-connect",
+    "protocol": "classic-cooperative",
+    "membership": "dynamic"
+  },
+  {
+    "event": "rejoin",
+    "boundary": "commit:pool-connect",
+    "protocol": "classic-cooperative",
+    "membership": "static"
+  },
+  {
+    "event": "rejoin",
+    "boundary": "commit:pool-connect",
+    "protocol": "consumer",
+    "membership": "dynamic"
+  },
+  {
+    "event": "rejoin",
+    "boundary": "commit:pool-connect",
+    "protocol": "consumer",
+    "membership": "static"
+  },
+  {
+    "event": "rejoin",
+    "boundary": "commit:auth-encode",
+    "protocol": "classic-eager",
+    "membership": "dynamic"
+  },
+  {
+    "event": "rejoin",
+    "boundary": "commit:auth-encode",
+    "protocol": "classic-eager",
+    "membership": "static"
+  },
+  {
+    "event": "rejoin",
+    "boundary": "commit:auth-encode",
+    "protocol": "classic-cooperative",
+    "membership": "dynamic"
+  },
+  {
+    "event": "rejoin",
+    "boundary": "commit:auth-encode",
+    "protocol": "classic-cooperative",
+    "membership": "static"
+  },
+  {
+    "event": "rejoin",
+    "boundary": "commit:auth-encode",
+    "protocol": "consumer",
+    "membership": "dynamic"
+  },
+  {
+    "event": "rejoin",
+    "boundary": "commit:auth-encode",
+    "protocol": "consumer",
+    "membership": "static"
+  },
+  {
+    "event": "rejoin",
+    "boundary": "commit:pending-queue",
+    "protocol": "classic-eager",
+    "membership": "dynamic"
+  },
+  {
+    "event": "rejoin",
+    "boundary": "commit:pending-queue",
+    "protocol": "classic-eager",
+    "membership": "static"
+  },
+  {
+    "event": "rejoin",
+    "boundary": "commit:pending-queue",
+    "protocol": "classic-cooperative",
+    "membership": "dynamic"
+  },
+  {
+    "event": "rejoin",
+    "boundary": "commit:pending-queue",
+    "protocol": "classic-cooperative",
+    "membership": "static"
+  },
+  {
+    "event": "rejoin",
+    "boundary": "commit:pending-queue",
+    "protocol": "consumer",
+    "membership": "dynamic"
+  },
+  {
+    "event": "rejoin",
+    "boundary": "commit:pending-queue",
+    "protocol": "consumer",
+    "membership": "static"
+  },
+  {
+    "event": "rejoin",
+    "boundary": "commit:retry-backoff",
+    "protocol": "classic-eager",
+    "membership": "dynamic"
+  },
+  {
+    "event": "rejoin",
+    "boundary": "commit:retry-backoff",
+    "protocol": "classic-eager",
+    "membership": "static"
+  },
+  {
+    "event": "rejoin",
+    "boundary": "commit:retry-backoff",
+    "protocol": "classic-cooperative",
+    "membership": "dynamic"
+  },
+  {
+    "event": "rejoin",
+    "boundary": "commit:retry-backoff",
+    "protocol": "classic-cooperative",
+    "membership": "static"
+  },
+  {
+    "event": "rejoin",
+    "boundary": "commit:retry-backoff",
+    "protocol": "consumer",
+    "membership": "dynamic"
+  },
+  {
+    "event": "rejoin",
+    "boundary": "commit:retry-backoff",
+    "protocol": "consumer",
+    "membership": "static"
+  },
+  {
+    "event": "rejoin",
+    "boundary": "commit:answer-held",
+    "protocol": "classic-eager",
+    "membership": "dynamic"
+  },
+  {
+    "event": "rejoin",
+    "boundary": "commit:answer-held",
+    "protocol": "classic-eager",
+    "membership": "static"
+  },
+  {
+    "event": "rejoin",
+    "boundary": "commit:answer-held",
+    "protocol": "classic-cooperative",
+    "membership": "dynamic"
+  },
+  {
+    "event": "rejoin",
+    "boundary": "commit:answer-held",
+    "protocol": "classic-cooperative",
+    "membership": "static"
+  },
+  {
+    "event": "rejoin",
+    "boundary": "commit:answer-held",
+    "protocol": "consumer",
+    "membership": "dynamic"
+  },
+  {
+    "event": "rejoin",
+    "boundary": "commit:answer-held",
+    "protocol": "consumer",
+    "membership": "static"
+  },
+  {
+    "event": "rejoin",
+    "boundary": "in-join",
+    "protocol": "classic-eager",
+    "membership": "dynamic"
+  },
+  {
+    "event": "rejoin",
+    "boundary": "in-join",
+    "protocol": "classic-eager",
+    "membership": "static"
+  },
+  {
+    "event": "rejoin",
+    "boundary": "in-join",
+    "protocol": "classic-cooperative",
+    "membership": "dynamic"
+  },
+  {
+    "event": "rejoin",
+    "boundary": "in-join",
+    "protocol": "classic-cooperative",
+    "membership": "static"
+  },
+  {
+    "event": "rejoin",
+    "boundary": "in-sync",
+    "protocol": "classic-eager",
+    "membership": "dynamic"
+  },
+  {
+    "event": "rejoin",
+    "boundary": "in-sync",
+    "protocol": "classic-eager",
+    "membership": "static"
+  },
+  {
+    "event": "rejoin",
+    "boundary": "in-sync",
+    "protocol": "classic-cooperative",
+    "membership": "dynamic"
+  },
+  {
+    "event": "rejoin",
+    "boundary": "in-sync",
+    "protocol": "classic-cooperative",
+    "membership": "static"
+  },
+  {
+    "event": "rejoin",
+    "boundary": "in-leave",
+    "protocol": "classic-eager",
+    "membership": "dynamic"
+  },
+  {
+    "event": "rejoin",
+    "boundary": "in-leave",
+    "protocol": "classic-cooperative",
+    "membership": "dynamic"
+  },
+  {
+    "event": "rejoin",
+    "boundary": "in-leave",
+    "protocol": "consumer",
+    "membership": "dynamic"
+  },
+  {
+    "event": "rejoin",
+    "boundary": "in-leave",
+    "protocol": "consumer",
+    "membership": "static"
+  },
+  {
+    "event": "rejoin",
+    "boundary": "pre-release-commit",
+    "protocol": "classic-eager",
+    "membership": "dynamic"
+  },
+  {
+    "event": "rejoin",
+    "boundary": "pre-release-commit",
+    "protocol": "classic-eager",
+    "membership": "static"
+  },
+  {
+    "event": "rejoin",
+    "boundary": "pre-release-commit",
+    "protocol": "classic-cooperative",
+    "membership": "dynamic"
+  },
+  {
+    "event": "rejoin",
+    "boundary": "pre-release-commit",
+    "protocol": "classic-cooperative",
+    "membership": "static"
+  },
+  {
+    "event": "rejoin",
+    "boundary": "pre-release-commit",
+    "protocol": "consumer",
+    "membership": "dynamic"
+  },
+  {
+    "event": "rejoin",
+    "boundary": "pre-release-commit",
+    "protocol": "consumer",
+    "membership": "static"
+  },
+  {
+    "event": "poll-expiry",
+    "boundary": "before-handler",
+    "protocol": "classic-eager",
+    "membership": "dynamic"
+  },
+  {
+    "event": "poll-expiry",
+    "boundary": "before-handler",
+    "protocol": "classic-eager",
+    "membership": "static"
+  },
+  {
+    "event": "poll-expiry",
+    "boundary": "before-handler",
+    "protocol": "classic-cooperative",
+    "membership": "dynamic"
+  },
+  {
+    "event": "poll-expiry",
+    "boundary": "before-handler",
+    "protocol": "classic-cooperative",
+    "membership": "static"
+  },
+  {
+    "event": "poll-expiry",
+    "boundary": "before-handler",
+    "protocol": "consumer",
+    "membership": "dynamic"
+  },
+  {
+    "event": "poll-expiry",
+    "boundary": "before-handler",
+    "protocol": "consumer",
+    "membership": "static"
+  },
+  {
+    "event": "poll-expiry",
+    "boundary": "in-handler",
+    "protocol": "classic-eager",
+    "membership": "dynamic"
+  },
+  {
+    "event": "poll-expiry",
+    "boundary": "in-handler",
+    "protocol": "classic-eager",
+    "membership": "static"
+  },
+  {
+    "event": "poll-expiry",
+    "boundary": "in-handler",
+    "protocol": "classic-cooperative",
+    "membership": "dynamic"
+  },
+  {
+    "event": "poll-expiry",
+    "boundary": "in-handler",
+    "protocol": "classic-cooperative",
+    "membership": "static"
+  },
+  {
+    "event": "poll-expiry",
+    "boundary": "in-handler",
+    "protocol": "consumer",
+    "membership": "dynamic"
+  },
+  {
+    "event": "poll-expiry",
+    "boundary": "in-handler",
+    "protocol": "consumer",
+    "membership": "static"
+  },
+  {
+    "event": "poll-expiry",
+    "boundary": "in-heartbeat",
+    "protocol": "classic-eager",
+    "membership": "dynamic"
+  },
+  {
+    "event": "poll-expiry",
+    "boundary": "in-heartbeat",
+    "protocol": "classic-eager",
+    "membership": "static"
+  },
+  {
+    "event": "poll-expiry",
+    "boundary": "in-heartbeat",
+    "protocol": "classic-cooperative",
+    "membership": "dynamic"
+  },
+  {
+    "event": "poll-expiry",
+    "boundary": "in-heartbeat",
+    "protocol": "classic-cooperative",
+    "membership": "static"
+  },
+  {
+    "event": "poll-expiry",
+    "boundary": "in-heartbeat",
+    "protocol": "consumer",
+    "membership": "dynamic"
+  },
+  {
+    "event": "poll-expiry",
+    "boundary": "in-heartbeat",
+    "protocol": "consumer",
+    "membership": "static"
+  },
+  {
+    "event": "poll-expiry",
+    "boundary": "commit:coordinator-lookup",
+    "protocol": "classic-eager",
+    "membership": "dynamic"
+  },
+  {
+    "event": "poll-expiry",
+    "boundary": "commit:coordinator-lookup",
+    "protocol": "classic-eager",
+    "membership": "static"
+  },
+  {
+    "event": "poll-expiry",
+    "boundary": "commit:coordinator-lookup",
+    "protocol": "classic-cooperative",
+    "membership": "dynamic"
+  },
+  {
+    "event": "poll-expiry",
+    "boundary": "commit:coordinator-lookup",
+    "protocol": "classic-cooperative",
+    "membership": "static"
+  },
+  {
+    "event": "poll-expiry",
+    "boundary": "commit:coordinator-lookup",
+    "protocol": "consumer",
+    "membership": "dynamic"
+  },
+  {
+    "event": "poll-expiry",
+    "boundary": "commit:coordinator-lookup",
+    "protocol": "consumer",
+    "membership": "static"
+  },
+  {
+    "event": "poll-expiry",
+    "boundary": "commit:pool-connect",
+    "protocol": "classic-eager",
+    "membership": "dynamic"
+  },
+  {
+    "event": "poll-expiry",
+    "boundary": "commit:pool-connect",
+    "protocol": "classic-eager",
+    "membership": "static"
+  },
+  {
+    "event": "poll-expiry",
+    "boundary": "commit:pool-connect",
+    "protocol": "classic-cooperative",
+    "membership": "dynamic"
+  },
+  {
+    "event": "poll-expiry",
+    "boundary": "commit:pool-connect",
+    "protocol": "classic-cooperative",
+    "membership": "static"
+  },
+  {
+    "event": "poll-expiry",
+    "boundary": "commit:pool-connect",
+    "protocol": "consumer",
+    "membership": "dynamic"
+  },
+  {
+    "event": "poll-expiry",
+    "boundary": "commit:pool-connect",
+    "protocol": "consumer",
+    "membership": "static"
+  },
+  {
+    "event": "poll-expiry",
+    "boundary": "commit:auth-encode",
+    "protocol": "classic-eager",
+    "membership": "dynamic"
+  },
+  {
+    "event": "poll-expiry",
+    "boundary": "commit:auth-encode",
+    "protocol": "classic-eager",
+    "membership": "static"
+  },
+  {
+    "event": "poll-expiry",
+    "boundary": "commit:auth-encode",
+    "protocol": "classic-cooperative",
+    "membership": "dynamic"
+  },
+  {
+    "event": "poll-expiry",
+    "boundary": "commit:auth-encode",
+    "protocol": "classic-cooperative",
+    "membership": "static"
+  },
+  {
+    "event": "poll-expiry",
+    "boundary": "commit:auth-encode",
+    "protocol": "consumer",
+    "membership": "dynamic"
+  },
+  {
+    "event": "poll-expiry",
+    "boundary": "commit:auth-encode",
+    "protocol": "consumer",
+    "membership": "static"
+  },
+  {
+    "event": "poll-expiry",
+    "boundary": "commit:pending-queue",
+    "protocol": "classic-eager",
+    "membership": "dynamic"
+  },
+  {
+    "event": "poll-expiry",
+    "boundary": "commit:pending-queue",
+    "protocol": "classic-eager",
+    "membership": "static"
+  },
+  {
+    "event": "poll-expiry",
+    "boundary": "commit:pending-queue",
+    "protocol": "classic-cooperative",
+    "membership": "dynamic"
+  },
+  {
+    "event": "poll-expiry",
+    "boundary": "commit:pending-queue",
+    "protocol": "classic-cooperative",
+    "membership": "static"
+  },
+  {
+    "event": "poll-expiry",
+    "boundary": "commit:pending-queue",
+    "protocol": "consumer",
+    "membership": "dynamic"
+  },
+  {
+    "event": "poll-expiry",
+    "boundary": "commit:pending-queue",
+    "protocol": "consumer",
+    "membership": "static"
+  },
+  {
+    "event": "poll-expiry",
+    "boundary": "commit:retry-backoff",
+    "protocol": "classic-eager",
+    "membership": "dynamic"
+  },
+  {
+    "event": "poll-expiry",
+    "boundary": "commit:retry-backoff",
+    "protocol": "classic-eager",
+    "membership": "static"
+  },
+  {
+    "event": "poll-expiry",
+    "boundary": "commit:retry-backoff",
+    "protocol": "classic-cooperative",
+    "membership": "dynamic"
+  },
+  {
+    "event": "poll-expiry",
+    "boundary": "commit:retry-backoff",
+    "protocol": "classic-cooperative",
+    "membership": "static"
+  },
+  {
+    "event": "poll-expiry",
+    "boundary": "commit:retry-backoff",
+    "protocol": "consumer",
+    "membership": "dynamic"
+  },
+  {
+    "event": "poll-expiry",
+    "boundary": "commit:retry-backoff",
+    "protocol": "consumer",
+    "membership": "static"
+  },
+  {
+    "event": "poll-expiry",
+    "boundary": "commit:answer-held",
+    "protocol": "classic-eager",
+    "membership": "dynamic"
+  },
+  {
+    "event": "poll-expiry",
+    "boundary": "commit:answer-held",
+    "protocol": "classic-eager",
+    "membership": "static"
+  },
+  {
+    "event": "poll-expiry",
+    "boundary": "commit:answer-held",
+    "protocol": "classic-cooperative",
+    "membership": "dynamic"
+  },
+  {
+    "event": "poll-expiry",
+    "boundary": "commit:answer-held",
+    "protocol": "classic-cooperative",
+    "membership": "static"
+  },
+  {
+    "event": "poll-expiry",
+    "boundary": "commit:answer-held",
+    "protocol": "consumer",
+    "membership": "dynamic"
+  },
+  {
+    "event": "poll-expiry",
+    "boundary": "commit:answer-held",
+    "protocol": "consumer",
+    "membership": "static"
+  },
+  {
+    "event": "poll-expiry",
+    "boundary": "in-join",
+    "protocol": "classic-eager",
+    "membership": "dynamic"
+  },
+  {
+    "event": "poll-expiry",
+    "boundary": "in-join",
+    "protocol": "classic-eager",
+    "membership": "static"
+  },
+  {
+    "event": "poll-expiry",
+    "boundary": "in-join",
+    "protocol": "classic-cooperative",
+    "membership": "dynamic"
+  },
+  {
+    "event": "poll-expiry",
+    "boundary": "in-join",
+    "protocol": "classic-cooperative",
+    "membership": "static"
+  },
+  {
+    "event": "poll-expiry",
+    "boundary": "in-sync",
+    "protocol": "classic-eager",
+    "membership": "dynamic"
+  },
+  {
+    "event": "poll-expiry",
+    "boundary": "in-sync",
+    "protocol": "classic-eager",
+    "membership": "static"
+  },
+  {
+    "event": "poll-expiry",
+    "boundary": "in-sync",
+    "protocol": "classic-cooperative",
+    "membership": "dynamic"
+  },
+  {
+    "event": "poll-expiry",
+    "boundary": "in-sync",
+    "protocol": "classic-cooperative",
+    "membership": "static"
+  },
+  {
+    "event": "poll-expiry",
+    "boundary": "in-leave",
+    "protocol": "classic-eager",
+    "membership": "dynamic"
+  },
+  {
+    "event": "poll-expiry",
+    "boundary": "in-leave",
+    "protocol": "classic-cooperative",
+    "membership": "dynamic"
+  },
+  {
+    "event": "poll-expiry",
+    "boundary": "in-leave",
+    "protocol": "consumer",
+    "membership": "dynamic"
+  },
+  {
+    "event": "poll-expiry",
+    "boundary": "in-leave",
+    "protocol": "consumer",
+    "membership": "static"
+  },
+  {
+    "event": "poll-expiry",
+    "boundary": "poll-expiry:leave",
+    "protocol": "classic-eager",
+    "membership": "dynamic"
+  },
+  {
+    "event": "poll-expiry",
+    "boundary": "poll-expiry:leave",
+    "protocol": "classic-eager",
+    "membership": "static"
+  },
+  {
+    "event": "poll-expiry",
+    "boundary": "poll-expiry:leave",
+    "protocol": "classic-cooperative",
+    "membership": "dynamic"
+  },
+  {
+    "event": "poll-expiry",
+    "boundary": "poll-expiry:leave",
+    "protocol": "classic-cooperative",
+    "membership": "static"
+  },
+  {
+    "event": "poll-expiry",
+    "boundary": "poll-expiry:leave",
+    "protocol": "consumer",
+    "membership": "dynamic"
+  },
+  {
+    "event": "poll-expiry",
+    "boundary": "poll-expiry:leave",
+    "protocol": "consumer",
+    "membership": "static"
+  }
+]

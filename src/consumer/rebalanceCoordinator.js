@@ -1,3 +1,4 @@
+const describeThrown = require('../network/describeThrown')
 const { KafkaJSNonRetriableError, isFencedInstance, isUnknownMemberId } = require('../errors')
 const {
   rebalanceAction,
@@ -123,6 +124,8 @@ module.exports = class RebalanceCoordinator {
     this.rejoinRequested = null
     /** @type {'lost'|null} set when the trigger left behind was a LOST */
     this.pendingKind = null
+    /** @type {number|null} the group's `joinCount` when that LOST was left behind */
+    this.pendingJoinCount = null
     /** @type {Verdict|null} the aborting-path slot */
     this.verdict = null
     /** Consecutive rounds in the current chain. */
@@ -200,6 +203,7 @@ module.exports = class RebalanceCoordinator {
     if (this.inFlight) {
       if (kind === 'lost') {
         this.pendingKind = 'lost'
+        this.pendingJoinCount = this.consumerGroup.joinCount
         this.rejoinRequested = reason
       } else {
         this.rejoinRequested = this.mergeReason(this.rejoinRequested, reason)
@@ -212,6 +216,7 @@ module.exports = class RebalanceCoordinator {
       this.inFlight = null
       this.rounds = 0
       this.pendingKind = null
+      this.pendingJoinCount = null
       // A chain that threw must not hand its pending reason to the next one: the trigger belonged
       // to the membership that chain was replacing, and the next chain would run a round for it.
       this.rejoinRequested = null
@@ -447,6 +452,13 @@ module.exports = class RebalanceCoordinator {
       return
     }
 
+    if (
+      this.verdict &&
+      (obsoleteOwnership(this.consumerGroup.ownership, this.verdict.error) ||
+        this.isStaleGenerationVerdict(this.verdict))
+    )
+      this.verdict = null
+
     // Cooperative revocation: nothing stops the fetch manager, so nothing would ever settle
     // `start()` - the round has to be driven from here, in the background.
     this.runRound(verdict.reason, verdict.kind).catch(async (error) => {
@@ -573,27 +585,31 @@ module.exports = class RebalanceCoordinator {
     )
     ownership?.lose(expiryError, ownership.token())
 
-    this.logger.warn(POLL_TIMEOUT_WARNING, {
-      groupId: this.groupId,
-      memberId: this.consumerGroup.memberId,
-      maxPollInterval,
-      elapsedMs,
-    })
+    await this.contain('poll warning', () =>
+      this.logger.warn(POLL_TIMEOUT_WARNING, {
+        groupId: this.groupId,
+        memberId: this.consumerGroup.memberId,
+        maxPollInterval,
+        elapsedMs,
+      })
+    )
 
-    this.instrumentationEmitter.emit(POLL_INTERVAL_EXCEEDED, {
-      groupId: this.groupId,
-      memberId: this.consumerGroup.memberId,
-      generationId: this.consumerGroup.generationId,
-      maxPollInterval,
-      elapsedMs,
-      isStatic,
-    })
+    await this.contain('poll event', () =>
+      this.instrumentationEmitter.emit(POLL_INTERVAL_EXCEEDED, {
+        groupId: this.groupId,
+        memberId: this.consumerGroup.memberId,
+        generationId: this.consumerGroup.generationId,
+        maxPollInterval,
+        elapsedMs,
+        isStatic,
+      })
+    )
 
     if (this.runner.stopRequested) {
       return
     }
 
-    this.heartbeatManager.stop()
+    await this.contain('heartbeat stop', () => this.heartbeatManager.stop())
 
     const joinsBefore = this.consumerGroup.joinCount
 
@@ -603,24 +619,16 @@ module.exports = class RebalanceCoordinator {
     // `STALE`, so it would never rejoin.
     // @see https://cwiki.apache.org/confluence/display/KAFKA/KIP-848%3A+The+Next+Generation+of+the+Consumer+Rebalance+Protocol
     if (this.consumerGroup.kind === 'consumer') {
-      await this.consumerGroup.leaveForPollExpiry().catch((error) => {
-        this.logger.debug('The poll-expiry leave failed; the member is treated as lost anyway', {
-          error: error.message,
-        })
-      })
+      await this.contain('poll leave', () => this.consumerGroup.leaveForPollExpiry())
     } else if (!isStatic) {
-      await this.consumerGroup.leave().catch((error) => {
-        this.logger.debug('LeaveGroup failed after a poll-interval overrun', {
-          error: error.message,
-        })
-      })
+      await this.contain('poll leave', () => this.consumerGroup.leave())
     }
 
     if (this.consumerGroup.joinCount !== joinsBefore) {
       return
     }
 
-    this.consumerGroup.resetGenerationLocally()
+    await this.contain('generation reset', () => this.consumerGroup.resetGenerationLocally())
 
     // A round that started during the leave above already rejoins this member. A second LOST would
     // stay in the slot after that round ends, and an orphan there reads as a rebalance still owed.
@@ -628,11 +636,31 @@ module.exports = class RebalanceCoordinator {
       return
     }
 
-    this.requestRejoin({
-      kind: 'lost',
-      reason: 'poll-interval-exceeded',
-      error: expiryError,
-    })
+    await this.contain('rejoin', () =>
+      this.requestRejoin({
+        kind: 'lost',
+        reason: 'poll-interval-exceeded',
+        error: expiryError,
+      })
+    )
+  }
+
+  /**
+   * Runs one cleanup step without letting it suppress subsequent steps, even if logging fails.
+   * @param {string} label
+   * @param {() => unknown} work
+   * @returns {Promise<unknown>} undefined after failure
+   */
+  async contain(label, work) {
+    try {
+      return await work()
+    } catch (error) {
+      try {
+        this.logger.error(`Poll expiry ${label} failed`, {
+          error: describeThrown(error, 'message'),
+        })
+      } catch {}
+    }
   }
 
   /** @returns {Promise<void>} resolves when no chain is running */
@@ -697,7 +725,13 @@ module.exports = class RebalanceCoordinator {
   /** @private @returns {'lost'|null} the pending kind, cleared */
   takePendingKind() {
     const kind = this.pendingKind
+    const stale = kind === 'lost' && this.pendingJoinCount < this.consumerGroup.joinCount
     this.pendingKind = null
+    this.pendingJoinCount = null
+    if (stale) {
+      this.rejoinRequested = null
+      return null
+    }
     return kind
   }
 

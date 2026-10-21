@@ -279,6 +279,8 @@ class HeartbeatBackoff {
 module.exports = class ConsumerGroupProtocol {
   /** The join deferred, private so nothing outside this class can settle it. */
   #firstMembership = null
+  /** Whether this attempt's first positive-epoch answer was counted; reset when membership drops. */
+  #membershipAccepted = false
 
   /**
    * @param {object} options
@@ -543,6 +545,7 @@ module.exports = class ConsumerGroupProtocol {
    *   failed with otherwise
    */
   async rebalance(context) {
+    if (isLeavingGroup(this.state) && this.inFlightLeave) await this.inFlightLeave
     const { beforeSync, growSubscription } = context
 
     if (this.state === FATAL) {
@@ -608,6 +611,7 @@ module.exports = class ConsumerGroupProtocol {
    * @returns {{ promise: Promise<void>, resolve: Function, reject: Function }}
    */
   armFirstMembership() {
+    this.#membershipAccepted = false
     const record = deferred()
     record.deadline = setTimeout(
       () =>
@@ -625,8 +629,8 @@ module.exports = class ConsumerGroupProtocol {
   }
 
   /**
-   * Reports the join, once, and counts it. Clearing the deferred is what keeps a later attempt from
-   * awaiting a settled promise.
+   * Settles the waiting join once. Acceptance is counted in onSuccess, including late answers.
+   * Clearing the deferred keeps a later attempt from awaiting a settled promise.
    * @private
    * @returns {void}
    */
@@ -634,7 +638,6 @@ module.exports = class ConsumerGroupProtocol {
     const record = this.#firstMembership
     if (!record) return
 
-    this.joinCount += 1
     this.#firstMembership = null
     clearTimeout(record.deadline)
     record.resolve()
@@ -886,6 +889,7 @@ module.exports = class ConsumerGroupProtocol {
    * @returns {void}
    */
   clearTarget() {
+    this.#membershipAccepted = false
     this.target = null
     this.pendingResolved = null
     this.unresolvedTopicIds.clear()
@@ -1084,6 +1088,10 @@ module.exports = class ConsumerGroupProtocol {
     }
 
     this.memberEpoch = response.memberEpoch
+    if (!this.#membershipAccepted) {
+      this.#membershipAccepted = true
+      this.joinCount += 1
+    }
 
     if (this.memberEpoch > 0) {
       this.resolveFirstMembership()
@@ -1562,6 +1570,7 @@ module.exports = class ConsumerGroupProtocol {
    * @returns {Promise<void>}
    */
   async sendLeaveHeartbeat(leaveGroup) {
+    this.#membershipAccepted = false
     this.ownedPartitions = []
     this.clearTarget()
     this.sentFields.reset()
