@@ -60,6 +60,7 @@ const BYTES_ONLY = [
   ['metadataV13', 'metadata', 'v13'],
   ['findCoordinatorV6', 'findCoordinator', 'v6'],
   ['listOffsetsV9', 'listOffsets', 'v9'],
+  ['fetchV12', 'fetch', 'v12'],
   ['fetchV18', 'fetch', 'v18'],
   ['offsetForLeaderEpochV4', 'offsetForLeaderEpoch', 'v4'],
   ['produceV11', 'produce', 'v11'],

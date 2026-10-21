@@ -3,7 +3,7 @@ const baseline = require('../../../testHelpers/compatBaseline/instrumentationEve
 const { captureInstrumentationEvents } = require('../../../testHelpers/compatBaseline/capture')
 
 const KINDS = ['producer', 'consumer', 'admin']
-const COUNTS = { producer: 10, consumer: 24, admin: 8 }
+const COUNTS = { producer: 10, consumer: 25, admin: 8 }
 
 describe('Instrumentation > public event baseline', () => {
   test('the committed baseline is what the tree emits and delivers to a listener', () => {
@@ -18,10 +18,10 @@ describe('Instrumentation > public event baseline', () => {
     expect(names.every((name) => name.startsWith(`${kind}.`))).toBe(true)
   })
 
-  test('forty-two distinct public names across the three clients', () => {
+  test('forty-three distinct public names across the three clients', () => {
     const names = KINDS.flatMap((kind) => baseline[kind].map(({ publicName }) => publicName))
 
-    expect(new Set(names).size).toEqual(42)
+    expect(new Set(names).size).toEqual(43)
     expect(Object.keys(baseline.listener).sort()).toEqual([...names].sort())
   })
 

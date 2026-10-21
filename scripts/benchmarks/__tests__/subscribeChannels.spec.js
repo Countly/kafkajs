@@ -9,8 +9,8 @@ describe('Benchmarks > subscribeChannels', () => {
     const { channels, unsubscribe } = subscribeChannels(kafka)
 
     try {
-      expect(channels).toHaveLength(42)
-      expect(new Set(channels).size).toBe(42)
+      expect(channels).toHaveLength(43)
+      expect(new Set(channels).size).toBe(43)
       expect(channels).toEqual(
         expect.arrayContaining(['kafkajs.producer.connect', 'kafkajs.consumer.fetch'])
       )

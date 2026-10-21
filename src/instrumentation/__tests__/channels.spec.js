@@ -16,11 +16,11 @@ describe('Instrumentation > channels', () => {
     }
   })
 
-  test('forty-two channels, each with a distinct name', () => {
+  test('forty-three channels, each with a distinct name', () => {
     const names = KINDS.flatMap((kind) => Object.values(channels[kind]).map(({ name }) => name))
 
-    expect(names).toHaveLength(42)
-    expect(new Set(names).size).toBe(42)
+    expect(names).toHaveLength(43)
+    expect(new Set(names).size).toBe(43)
   })
 
   test('the channel of a public name is the one Node hands to anybody who asks for it by name', () => {

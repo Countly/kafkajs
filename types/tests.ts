@@ -434,6 +434,16 @@ consumer.on(consumer.events.PARTITIONS_LOST, e => {
   void memberId
   void generationId
 })
+consumer.on(consumer.events.PARTITION_HALTED, e => {
+  const offset: string = e.payload.offset
+  const reason: 'length' | 'magic' | 'count' | 'control' = e.payload.reason
+  const error: KafkaJSCorruptRecordError = e.payload.error
+  const partition: number = e.payload.partition
+  void offset
+  void reason
+  void error
+  void partition
+})
 consumer.on(consumer.events.POLL_INTERVAL_EXCEEDED, e => {
   const elapsed: number = e.payload.elapsedMs
   const isStatic: boolean = e.payload.isStatic

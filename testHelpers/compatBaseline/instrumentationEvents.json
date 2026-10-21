@@ -107,6 +107,10 @@
       "internalName": "network.request_timeout"
     },
     {
+      "publicName": "consumer.partition_halted",
+      "internalName": "consumer.partition_halted"
+    },
+    {
       "publicName": "consumer.partitions_assigned",
       "internalName": "consumer.partitions_assigned"
     },
@@ -401,6 +405,15 @@
     },
     "consumer.network.request_timeout": {
       "type": "consumer.network.request_timeout",
+      "keys": [
+        "id",
+        "payload",
+        "timestamp",
+        "type"
+      ]
+    },
+    "consumer.partition_halted": {
+      "type": "consumer.partition_halted",
       "keys": [
         "id",
         "payload",

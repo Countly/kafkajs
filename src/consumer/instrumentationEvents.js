@@ -19,6 +19,7 @@ const events = {
   STOP: consumerType('stop'),
   CRASH: consumerType('crash'),
   REBALANCING: consumerType('rebalancing'),
+  PARTITION_HALTED: consumerType('partition_halted'),
   PARTITIONS_ASSIGNED: consumerType('partitions_assigned'),
   PARTITIONS_REVOKED: consumerType('partitions_revoked'),
   PARTITIONS_LOST: consumerType('partitions_lost'),

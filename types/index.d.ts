@@ -1500,6 +1500,7 @@ export type ConsumerEvents = {
   STOP: 'consumer.stop'
   CRASH: 'consumer.crash'
   REBALANCING: 'consumer.rebalancing'
+  PARTITION_HALTED: 'consumer.partition_halted'
   PARTITIONS_ASSIGNED: 'consumer.partitions_assigned'
   PARTITIONS_REVOKED: 'consumer.partitions_revoked'
   PARTITIONS_LOST: 'consumer.partitions_lost'
@@ -1606,6 +1607,18 @@ export type ConsumerPartitionsEvent = InstrumentationEvent<{
 export type ConsumerPartitionsAssignedEvent = ConsumerPartitionsEvent
 export type ConsumerPartitionsRevokedEvent = ConsumerPartitionsEvent
 export type ConsumerPartitionsLostEvent = ConsumerPartitionsEvent
+/** A structurally corrupt Fetch batch halted one partition; a seek past the batch resumes it. */
+export interface ConsumerPartitionHaltedEventPayload {
+  groupId: string
+  memberId: string
+  topic: string
+  partition: number
+  /** The first offset of the unreadable batch, as a decimal string. */
+  offset: string
+  reason: KafkaJSCorruptRecordError['reason']
+  error: KafkaJSCorruptRecordError
+}
+export type ConsumerPartitionHaltedEvent = InstrumentationEvent<ConsumerPartitionHaltedEventPayload>
 export type ConsumerPollIntervalExceededEvent = InstrumentationEvent<{
   groupId: string
   /** `null` while this member has no id: before its first successful join, or after one was lost. */
@@ -1800,6 +1813,10 @@ export type Consumer = {
     listener: (event: ConsumerPartitionsLostEvent) => void
   ): RemoveInstrumentationEventListener<typeof eventName>
   on(
+    eventName: ConsumerEvents['PARTITION_HALTED'],
+    listener: (event: ConsumerPartitionHaltedEvent) => void
+  ): RemoveInstrumentationEventListener<typeof eventName>
+  on(
     eventName: ConsumerEvents['POLL_INTERVAL_EXCEEDED'],
     listener: (event: ConsumerPollIntervalExceededEvent) => void
   ): RemoveInstrumentationEventListener<typeof eventName>
@@ -1979,7 +1996,10 @@ export class KafkaJSInvalidFrameError extends KafkaJSConnectionError {
   )
 }
 
-/** A Fetch record batch is structurally corrupt; non-retriable. */
+/**
+ * A Fetch record batch is structurally corrupt; non-retriable. The partition is halted
+ * (`consumer.partition_halted`).
+ */
 export class KafkaJSCorruptRecordError extends KafkaJSNonRetriableError {
   readonly reason: 'length' | 'magic' | 'count' | 'control'
   /** The first offset of the batch as a decimal string, when it could be read. */

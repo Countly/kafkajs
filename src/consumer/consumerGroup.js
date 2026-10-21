@@ -13,7 +13,7 @@ const SeekOffsets = require('./seekOffsets')
 const SubscriptionState = require('./subscriptionState')
 const PositionValidator = require('./positionValidator')
 const {
-  events: { CONNECT, RECEIVED_UNSUBSCRIBED_TOPICS, LOG_TRUNCATION },
+  events: { CONNECT, RECEIVED_UNSUBSCRIBED_TOPICS, LOG_TRUNCATION, PARTITION_HALTED },
 } = require('./instrumentationEvents')
 const {
   KafkaJSError,
@@ -40,6 +40,7 @@ const {
   REBALANCE_PATHS,
 } = require('./rebalanceErrorContract')
 const { EAGER } = require('./groupProtocol/interface')
+const describeThrown = require('../network/describeThrown')
 
 /** @see https://github.com/apache/kafka/blob/4.3/clients/src/main/java/org/apache/kafka/common/protocol/Errors.java */
 const STALE_MEMBER_EPOCH = 'STALE_MEMBER_EPOCH'
@@ -205,6 +206,14 @@ module.exports = class ConsumerGroup {
     })
     this.acquired = new Map()
     this.acquireClock = 0
+    /**
+     * The partitions a structurally corrupt Fetch batch halted, keyed by `topic|partition`: the
+     * first offset of that batch, its reason and the error. A halted partition is left out of every
+     * Fetch request until an applied seek, a revoke, a recreation of its topic or a wholesale
+     * rebuild of the assignment removes its entry; nothing skips the batch on its own.
+     * @type {Map<string, { offset: string, reason: string, error: Error }>}
+     */
+    this.haltedPartitions = new Map()
     this.obligations = obligations
     this.obligations.attachTo(this.operations)
 
@@ -739,9 +748,15 @@ module.exports = class ConsumerGroup {
     // Wholesale in both branches: its members are broker node ids, not partitions.
     this.validationUnusableLogged.clear()
 
-    if (rebuildOffsets) this.acquired.clear()
+    if (rebuildOffsets) {
+      this.acquired.clear()
+      this.haltedPartitions.clear()
+    }
     for (const { topic, partitions } of revoked) {
-      for (const partition of partitions) this.acquired.delete(`${topic}|${partition}`)
+      for (const partition of partitions) {
+        this.acquired.delete(`${topic}|${partition}`)
+        this.haltedPartitions.delete(`${topic}|${partition}`)
+      }
     }
     for (const { topic, partitions } of currentMemberAssignment) {
       for (const partition of partitions) {
@@ -884,8 +899,9 @@ module.exports = class ConsumerGroup {
 
   /**
    * Drops every piece of state this member holds for one topic, because that topic was deleted
-   * and recreated: its offsets, its preferred read replicas, and any pending seek. The
-   * corresponding reset is owed (`ResetObligations`) and applied at the next offset resolution.
+   * and recreated: its offsets, its preferred read replicas, any pending seek and any halt of its
+   * partitions, which belonged to the old incarnation. The corresponding reset is owed
+   * (`ResetObligations`) and applied at the next offset resolution.
    *
    * A no-op before the first sync (`offsetManager` is null until then) and for a topic outside
    * the current member assignment - the second guard keeps this member from writing a key it
@@ -910,6 +926,24 @@ module.exports = class ConsumerGroup {
     this.seekOffset.deleteTopic(topic)
     this.positionValidator.forgetTopic(topic, this.offsetManager.memberAssignment[topic])
     this.offsetManager.resetOffsetsForTopic(topic)
+    for (const partition of this.offsetManager.memberAssignment[topic]) {
+      this.markChanged(topic, partition)
+      this.haltedPartitions.delete(`${topic}|${partition}`)
+    }
+  }
+
+  /**
+   * Records that a seek, a reset or a topic recreation was applied to an owned partition, by
+   * stamping it with the next value of the acquisition clock. A corruption marker fetched by a
+   * request built before that stamp is then refused, even when the position came back to the same
+   * offset. A partition this member does not own is left alone.
+   * @param {string} topic
+   * @param {number} partition
+   * @returns {void}
+   */
+  markChanged(topic, partition) {
+    const acquired = this.acquired.get(`${topic}|${partition}`)
+    if (acquired) acquired.changedAt = ++this.acquireClock
   }
 
   pause(topicPartitions) {
@@ -1127,6 +1161,9 @@ module.exports = class ConsumerGroup {
       await this.seekOffsets(topicPartitions)
       await this.validatePositions(topicPartitions)
 
+      // The request is built from the positions as they stand now; a corruption marker in its
+      // answer is refused if a seek, a reset or a recreation reaches the partition after this.
+      const requestClock = this.acquireClock
       const requests = this.buildFetchRequests(topicPartitions)
 
       if (!requests.length) {
@@ -1207,11 +1244,14 @@ module.exports = class ConsumerGroup {
         // Built once per topic, not once per partition: the loop below is the consume hot path.
         const context = {
           topicName,
+          topicId: topicId ?? topicIds?.get(topicName),
           topicRequestData,
           preferredReadReplicas,
           nodeEndpoints,
           batches,
           debug,
+          assignmentEpoch,
+          requestClock,
         }
 
         for (const partitionData of partitions) {
@@ -1249,7 +1289,8 @@ module.exports = class ConsumerGroup {
    * that exposed it and https://github.com/tulios/kafkajs/pull/578 for the filter. A paused
    * partition is left out, and so is one whose position another fetcher is validating: its
    * position is the thing being checked, so fetching from it would read from an offset this
-   * client is not yet sure still exists.
+   * client is not yet sure still exists. A halted partition is left out until its halt is cleared;
+   * the check is skipped while nothing is halted, which is the steady state.
    *
    * @private
    * @param {import("../../types").TopicPartitions[]} topicPartitions the node-filtered assignment
@@ -1269,7 +1310,9 @@ module.exports = class ConsumerGroup {
             (partition) =>
               committedOffsets[topic][partition] != null &&
               activeTopicPartitions[topic].has(partition) &&
-              !this.positionValidator.isAwaiting(topic, partition)
+              !this.positionValidator.isAwaiting(topic, partition) &&
+              (this.haltedPartitions.size === 0 ||
+                !this.haltedPartitions.has(`${topic}|${partition}`))
           )
           .map((partition) => ({
             partition,
@@ -1351,15 +1394,22 @@ module.exports = class ConsumerGroup {
    * The batch is appended to `context.batches` rather than returned, so that the success path of
    * the consume hot path allocates nothing but the batch itself.
    *
+   * A partition whose answer carries a corruption marker is halted when the marker is accepted
+   * ({@link ConsumerGroup#acceptHalt}): the halt is stored first, the records before the corrupt
+   * batch still go on as an ordinary batch, and then the halt is reported once.
+   *
    * @private
    * @param {object} partitionData one decoded partition of the response
    * @param {object} context this topic's state for the round
    * @param {string} context.topicName
+   * @param {string} [context.topicId] the id the answer or the request keyed the topic with
    * @param {object} context.topicRequestData the request entry this topic was fetched with
    * @param {object} context.preferredReadReplicas this topic's preferred-replica map, written here
    * @param {object[]} [context.nodeEndpoints] the response's KIP-951 endpoints, if any
    * @param {import('./batch')[]} context.batches the round's batches, appended to
    * @param {boolean} context.debug whether debug logging is on for this round
+   * @param {number} context.assignmentEpoch the assignment the round began under
+   * @param {number} context.requestClock the acquisition clock when the request was built
    * @returns {Promise<boolean>} whether this partition asks for a metadata refresh
    * @throws {Error} the error an unclassified partition code maps to
    */
@@ -1456,12 +1506,101 @@ module.exports = class ConsumerGroup {
       }
     }
 
+    if (
+      this.haltedPartitions.size !== 0 &&
+      this.haltedPartitions.has(`${topicName}|${partition}`)
+    ) {
+      return false
+    }
+
+    const { corruption } = partitionData
+    const halted = corruption != null && this.acceptHalt(topicName, partition, corruption, context)
+
     const partitionRequestData = topicRequestData.partitions.find(
       (requested) => requested.partition === partition
     )
 
     batches.push(new Batch(topicName, partitionRequestData.fetchOffset, partitionData))
+    if (halted) this.reportHalt(topicName, partition, corruption)
     return false
+  }
+
+  /**
+   * Halts a partition on a corruption marker, unless the answer is stale. The answer is stale when
+   * the partition is already halted (a second marker for one episode), when the assignment the
+   * round began under was replaced, when the partition is no longer this member's, when it was
+   * acquired again, sought, reset or recreated after the request was built (its `changedAt`, set
+   * on each of those, is later than the request's clock, so a seek back to the same offset still
+   * counts), or when the topic id the answer is keyed by is not the one the cluster knows now. A
+   * stale marker is dropped and changes nothing.
+   * @private
+   * @param {string} topic
+   * @param {number} partition
+   * @param {{ offset: string, reason: string, error: Error }} corruption the decoder's marker
+   * @param {object} context the round's state, see {@link ConsumerGroup#handleFetchedPartition}
+   * @returns {boolean} whether the partition is now halted by this marker
+   */
+  acceptHalt(topic, partition, { offset, reason, error }, context) {
+    const key = `${topic}|${partition}`
+    const acquired = this.acquired.get(key)
+    const knownTopicId = this.cluster.topicId(topic)
+
+    if (
+      this.haltedPartitions.has(key) ||
+      this.assignmentEpoch !== context.assignmentEpoch ||
+      !acquired ||
+      acquired.changedAt > context.requestClock ||
+      (context.topicId !== undefined &&
+        knownTopicId !== undefined &&
+        context.topicId !== knownTopicId)
+    ) {
+      return false
+    }
+
+    this.haltedPartitions.set(key, { offset, reason, error })
+    return true
+  }
+
+  /**
+   * Reports an accepted halt: one `consumer.partition_halted` event and one error log. Both are
+   * contained, so a listener or a logger that throws neither undoes the halt nor reaches the other
+   * partitions of the round; a listener's error is named in the log.
+   * @private
+   * @param {string} topic
+   * @param {number} partition
+   * @param {{ offset: string, reason: string, error: Error }} corruption
+   * @returns {void}
+   */
+  reportHalt(topic, partition, { offset, reason, error }) {
+    const { groupId, memberId } = this
+    let listenerError
+
+    try {
+      this.instrumentationEmitter.emit(PARTITION_HALTED, {
+        groupId,
+        memberId,
+        topic,
+        partition,
+        offset,
+        reason,
+        error,
+      })
+    } catch (e) {
+      listenerError = e
+    }
+
+    try {
+      this.logger.error('Halted a partition at a corrupt record batch; seek past it to resume', {
+        groupId,
+        memberId,
+        topic,
+        partition,
+        offset,
+        reason,
+        error: error.message,
+        ...(listenerError !== undefined && { listenerError: describeThrown(listenerError) }),
+      })
+    } catch {}
   }
 
   /**
@@ -1662,6 +1801,7 @@ module.exports = class ConsumerGroup {
         topic: e.topic,
         partition: e.partition,
       })
+      this.markChanged(e.topic, e.partition)
     }
   }
 
@@ -1717,7 +1857,8 @@ module.exports = class ConsumerGroup {
    * Applies every pending `seek()` for the given topic/partitions, then resolves offsets for the
    * rest. A seek applied here that lands on a topic with a pending recreation reset (set by
    * `invalidateTopic()` earlier in this same fetch cycle) wins over that reset for its own
-   * partition: an applied seek settles the partition's reset obligation.
+   * partition: an applied seek settles the partition's reset obligation. An applied seek also
+   * clears the partition's halt, which is how an application resumes a halted partition.
    *
    * A resolution that dropped an answer (a seek, commit or recreation reached the cell while the
    * request was in flight) is repeated at once, after a yield to the event loop, at most
@@ -1741,7 +1882,10 @@ module.exports = class ConsumerGroup {
           seek: seekEntry,
         })
 
-        await this.offsetManager.seek(seekEntry)
+        if (await this.offsetManager.seek(seekEntry)) {
+          this.markChanged(topic, partition)
+          this.haltedPartitions.delete(`${topic}|${partition}`)
+        }
       }
     }
 
@@ -2154,6 +2298,7 @@ module.exports = class ConsumerGroup {
       // a queued seek would land one round late - and would overwrite a user seek queued in the
       // same window, since the queue is last-writer-wins per key.
       await this.offsetManager.seek({ topic, partition, offset: outcome.divergingOffset })
+      this.markChanged(topic, partition)
     } else if (outcome.action === 'reset') {
       this.logger.warn('Log truncation detected but the divergence point is unknown, resetting', {
         groupId: this.groupId,
@@ -2162,6 +2307,7 @@ module.exports = class ConsumerGroup {
         offset,
       })
       await this.offsetManager.setDefaultOffset({ topic, partition })
+      this.markChanged(topic, partition)
     } else {
       return
     }

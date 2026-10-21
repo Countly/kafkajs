@@ -155,6 +155,40 @@ module.exports = {
     },
   },
 
+  fetchV12: {
+    source: 'buildFetchRequest l.815, buildFetchResponse l.860',
+    request: {
+      apiVersion: 12,
+      replicaId: -1,
+      maxWaitMs: 5000,
+      minBytes: 1,
+      maxBytes: 10485760,
+      isolationLevel: 1,
+      sessionId: 0,
+      sessionEpoch: -1,
+      topics: [
+        {
+          topic: 'test-topic',
+          topicId: null,
+          partitions: [
+            {
+              partition: 0,
+              currentLeaderEpoch: 5,
+              fetchOffset: '42',
+              lastFetchedEpoch: -1,
+              logStartOffset: '-1',
+              maxBytes: 1048576,
+            },
+          ],
+        },
+      ],
+      rackId: '',
+    },
+    response: {
+      partitions: [{ partition: 0, errorCode: 0 }],
+    },
+  },
+
   fetchV18: {
     source: 'buildFetchRequest l.815, buildFetchResponse l.860',
     request: {

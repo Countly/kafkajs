@@ -25,7 +25,7 @@ const channelsOf = ({ events, unwrap }) =>
   )
 
 /**
- * One channel per public instrumentation event, `kafkajs.<event name>` - 42 in all - created once
+ * One channel per public instrumentation event, `kafkajs.<event name>` - 43 in all - created once
  * when this module loads: Node advises against acquiring channels at runtime, and an emit never
  * does. Each client kind has its own table, because the network and cluster events share their
  * internal names across kinds.
