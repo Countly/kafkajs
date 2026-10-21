@@ -7,7 +7,7 @@ const {
   events: { HEARTBEAT },
 } = require('../instrumentationEvents')
 const { EAGER, COOPERATIVE } = require('./interface')
-const { stampGeneration } = require('../rebalanceErrorContract')
+const { stampGeneration, stampOwnership } = require('../rebalanceErrorContract')
 
 /** The protocol type of every consumer group, sent on JoinGroup. */
 const PROTOCOL_TYPE = 'consumer'
@@ -32,6 +32,7 @@ const LEAVE_REASON = 'the consumer is being closed'
 module.exports = class ClassicGroupProtocol {
   /**
    * @param {object} options
+   * @param {import('../groupOwnership')} [options.ownership=null] fences obsolete answers before membership changes
    * @param {import('../../../types').Cluster} options.cluster
    * @param {string} options.groupId
    * @param {string|null} options.groupInstanceId static membership id (KIP-345)
@@ -52,6 +53,7 @@ module.exports = class ClassicGroupProtocol {
     sessionTimeout,
     rebalanceTimeout,
     heartbeatInterval = null,
+    ownership = null,
     assigners,
     mode = EAGER,
     rackId = '',
@@ -59,6 +61,7 @@ module.exports = class ClassicGroupProtocol {
     logger,
   }) {
     this.cluster = cluster
+    this.ownership = ownership
     this.groupId = groupId
     this.groupInstanceId = groupInstanceId
     this.sessionTimeout = sessionTimeout
@@ -99,6 +102,7 @@ module.exports = class ClassicGroupProtocol {
 
     this.sharedHeartbeat = sharedPromiseTo(async ({ interval }) => {
       const { groupId, generationId, memberId } = this
+      const token = this.ownership?.token()
       const now = Date.now()
 
       if (memberId && now >= this.lastRequest + interval) {
@@ -114,7 +118,7 @@ module.exports = class ClassicGroupProtocol {
         } catch (e) {
           // A heartbeat sent before a rebalance and answered after it is answered about the
           // generation it was sent under, not the one this member holds by then.
-          throw stampGeneration(e, generationId)
+          throw stampOwnership(stampGeneration(e, generationId), token)
         }
 
         this.instrumentationEmitter.emit(HEARTBEAT, payload)

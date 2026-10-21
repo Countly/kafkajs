@@ -4,6 +4,10 @@ const {
   rebalanceReason,
   pollIntervalExceededError,
   sentGeneration,
+  sentOwnership,
+  stampOwnership,
+  obsoleteOwnership,
+  learnOwnershipLoss,
 } = require('./rebalanceErrorContract')
 const { COOPERATIVE } = require('./groupProtocol/interface')
 const {
@@ -338,6 +342,7 @@ module.exports = class RebalanceCoordinator {
         rebalanceProtocol: this.consumerGroup.rebalanceProtocol(),
       }
 
+      this.consumerGroup.ownership?.renew()
       this.onJoinComplete()
       this.instrumentationEmitter.emit(GROUP_JOIN, payload)
       this.logger.info('Consumer has joined the group', payload)
@@ -402,6 +407,11 @@ module.exports = class RebalanceCoordinator {
    * @returns {void}
    */
   requestRejoin(verdict) {
+    if (obsoleteOwnership(this.consumerGroup.ownership, verdict.error)) return
+    if (verdict.kind === 'lost') {
+      const ownership = this.consumerGroup.ownership
+      ownership?.lose(verdict.error, sentOwnership(verdict.error) ?? ownership.token())
+    }
     if (this.runner.stopRequested) {
       return
     }
@@ -512,6 +522,8 @@ module.exports = class RebalanceCoordinator {
    * @returns {Verdict|null}
    */
   classify(error, path) {
+    if (obsoleteOwnership(this.consumerGroup.ownership, error)) return null
+    learnOwnershipLoss(this.consumerGroup.ownership, error, path, this.consumerGroup.kind)
     const kind = this.consumerGroup.kind
     const { action } = rebalanceAction(error, path, { kind })
 
@@ -554,6 +566,12 @@ module.exports = class RebalanceCoordinator {
    */
   async onPollExpired({ elapsedMs, isStatic }) {
     const maxPollInterval = this.pollTimer.deadline()
+    const ownership = this.consumerGroup.ownership
+    const expiryError = stampOwnership(
+      pollIntervalExceededError({ elapsedMs, maxPollInterval }),
+      ownership?.token()
+    )
+    ownership?.lose(expiryError, ownership.token())
 
     this.logger.warn(POLL_TIMEOUT_WARNING, {
       groupId: this.groupId,
@@ -613,7 +631,7 @@ module.exports = class RebalanceCoordinator {
     this.requestRejoin({
       kind: 'lost',
       reason: 'poll-interval-exceeded',
-      error: pollIntervalExceededError({ elapsedMs, maxPollInterval }),
+      error: expiryError,
     })
   }
 

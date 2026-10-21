@@ -1,7 +1,13 @@
 const { EventEmitter } = require('events')
 const Long = require('../utils/long')
 const createRetry = require('../retry')
-const { isKafkaJSError, isFencedInstance, isUnknownMemberId } = require('../errors')
+const {
+  isKafkaJSError,
+  isFencedInstance,
+  isUnknownMemberId,
+  KafkaJSCommitFailedError,
+} = require('../errors')
+const handlerContext = require('./handlerContext')
 
 const {
   events: { FETCH, FETCH_START, START_BATCH_PROCESS, END_BATCH_PROCESS },
@@ -14,6 +20,8 @@ const {
   REBALANCE_PATHS,
   rebalanceReason,
   isConsumerProtocolFatal,
+  sentOwnership,
+  obsoleteOwnership,
 } = require('./rebalanceErrorContract')
 const { COOPERATIVE } = require('./groupProtocol/interface')
 
@@ -347,7 +355,10 @@ module.exports = class Runner extends EventEmitter {
   async handleRebalanceError(verdictOrError) {
     const verdict = this.toVerdict(verdictOrError)
 
-    if (this.rebalanceCoordinator.isStaleGenerationVerdict(verdict)) {
+    if (
+      obsoleteOwnership(this.consumerGroup.ownership, verdict.error) ||
+      this.rebalanceCoordinator.isStaleGenerationVerdict(verdict)
+    ) {
       this.logger.debug('Ignoring a lost-membership answer for a generation already left', {
         groupId: this.consumerGroup.groupId,
         memberId: this.consumerGroup.memberId,
@@ -358,6 +369,10 @@ module.exports = class Runner extends EventEmitter {
     }
 
     const lost = verdict.kind === 'lost'
+    if (lost) {
+      const ownership = this.consumerGroup.ownership
+      ownership?.lose(verdict.error, sentOwnership(verdict.error) ?? ownership.token())
+    }
 
     if (lost) {
       // The heartbeat response handler is the only thing that moves the membership state machine
@@ -387,7 +402,7 @@ module.exports = class Runner extends EventEmitter {
       await this.fetchManager.stop()
       await this.waitForHandlers()
 
-      return await this.resolveRebalanceVerdict(verdict)
+      return await this.resolveRebalanceVerdict({ ...verdict, membershipNotified: lost })
     } finally {
       this.quiescing = false
     }
@@ -428,8 +443,12 @@ module.exports = class Runner extends EventEmitter {
    * @throws {Error} the verdict's error for a fenced member, and for anything that is not a
    *   rebalance
    */
-  async resolveRebalanceVerdict({ kind, reason, error: e }) {
+  async resolveRebalanceVerdict({ kind, reason, error: e, membershipNotified = false }) {
+    const ownership = this.consumerGroup.ownership
+    if (obsoleteOwnership(ownership, e)) return
     if (kind === 'lost') {
+      ownership?.lose(e, sentOwnership(e) ?? ownership.token())
+      if (!membershipNotified) this.consumerGroup.onMembershipError(e)
       this.logger.error('Membership lost, discarding uncommitted offsets and re-joining', {
         groupId: this.consumerGroup.groupId,
         memberId: this.consumerGroup.memberId,
@@ -447,6 +466,7 @@ module.exports = class Runner extends EventEmitter {
         isFencedInstance(e) ||
         (this.consumerGroup.kind === 'consumer' && isConsumerProtocolFatal(e))
       ) {
+        ownership?.abandon(e, sentOwnership(e) ?? ownership.token())
         this.rebalanceCoordinator.abandon('lost')
         throw e
       }
@@ -469,7 +489,22 @@ module.exports = class Runner extends EventEmitter {
         error: e.message,
       })
 
-      await this.autoCommitOffsets()
+      try {
+        await this.autoCommitOffsets(null)
+      } catch (error) {
+        const failure = this.rebalanceCoordinator.classify(error, REBALANCE_PATHS.OFFSET_COMMIT)
+        if (failure?.kind === 'lost') return this.resolveRebalanceVerdict(failure)
+        this.logger.warn('Pre-rebalance offset commit failed; rejoining anyway', {
+          error: error.message,
+        })
+      }
+      if (ownership?.refusal(ownership.token())) {
+        return this.resolveRebalanceVerdict({
+          kind: 'lost',
+          reason: 'lost',
+          error: ownership.refusal(ownership.token()),
+        })
+      }
       await this.rebalanceCoordinator.runRound(reason, 'revoked')
       return
     }
@@ -641,7 +676,7 @@ module.exports = class Runner extends EventEmitter {
         }
 
         // In case of errors, commit the previously consumed offsets unless autoCommit is disabled
-        await this.autoCommitOffsets()
+        await this.commitAfterHandlerError(batch)
         throw e
       }
 
@@ -719,13 +754,16 @@ module.exports = class Runner extends EventEmitter {
          */
         commitOffsetsIfNecessary: async (offsets) => {
           if (offsets) {
-            return this.commitOwnedOffsets(offsets)
+            return this.commitOwnedOffsets(offsets, batch)
           }
 
           // The no-argument form commits on this batch's behalf, so it follows this batch's
           // partition: a handler still running for one a rebalance revoked must not move an
           // offset the new owner controls.
-          if (!this.consumerGroup.isAssigned(topic, partition)) {
+          if (
+            this.isBatchStale(batch) ||
+            this.consumerGroup.ownership?.refusal(this.consumerGroup.ownership.token())
+          ) {
             this.logger.debug('Skipping a commit for a partition this member no longer holds', {
               groupId: this.consumerGroup.groupId,
               memberId: this.consumerGroup.memberId,
@@ -736,7 +774,9 @@ module.exports = class Runner extends EventEmitter {
             return
           }
 
-          return this.consumerGroup.commitOffsetsIfNecessary()
+          return this.consumerGroup.commitOffsetsIfNecessary({
+            guard: () => this.commitRefusal(undefined, batch),
+          })
         },
         uncommittedOffsets: () => this.consumerGroup.uncommittedOffsets(),
         isRunning: () => this.running,
@@ -755,7 +795,7 @@ module.exports = class Runner extends EventEmitter {
 
       // eachBatch has a special resolveOffset which can be used
       // to keep track of the messages
-      await this.autoCommitOffsets()
+      await this.commitAfterHandlerError(batch)
       throw e
     }
 
@@ -784,12 +824,21 @@ module.exports = class Runner extends EventEmitter {
    * A payload with no `topics` list means "commit what is resolved", which the offset manager
    * already keeps free of revoked partitions, so it passes through untouched.
    *
+   * One attempt, with the broker's own error, and without the `running` skip of
+   * `Runner#commitOffsets`: the final commit of a graceful shutdown still lands. The calling
+   * batch fences it through the guard.
+   *
    * @param {import('../../types').OffsetsByTopicPartition} offsets
+   * @param {object} batch the calling handler's batch
    * @returns {Promise<void>}
+   * @throws {KafkaJSCommitFailedError} when the batch or the membership no longer owns the commit
    */
-  async commitOwnedOffsets(offsets) {
+  async commitOwnedOffsets(offsets, batch) {
+    const guard = () => this.commitRefusal(undefined, batch)
+    const refusal = guard()
+    if (refusal) throw refusal
     if (!Array.isArray(offsets.topics)) {
-      return this.consumerGroup.commitOffsets(offsets)
+      return this.consumerGroup.commitOffsets(offsets, { guard })
     }
 
     const topics = offsets.topics
@@ -811,7 +860,7 @@ module.exports = class Runner extends EventEmitter {
       return
     }
 
-    return this.consumerGroup.commitOffsets({ ...offsets, topics })
+    return this.consumerGroup.commitOffsets({ ...offsets, topics }, { guard })
   }
 
   /**
@@ -888,6 +937,11 @@ module.exports = class Runner extends EventEmitter {
       return true
     }
 
+    const acquired = this.consumerGroup.acquired?.get(
+      batch.ownershipKey || `${batch.topic}|${batch.partition}`
+    )
+    if (batch.acquireClock != null && acquired && acquired.acquiredAt > batch.acquireClock)
+      return true
     return !this.consumerGroup.isAssigned(batch.topic, batch.partition)
   }
 
@@ -979,7 +1033,7 @@ module.exports = class Runner extends EventEmitter {
           offset: lastOffset,
           leaderEpoch: batch.leaderEpochAt(lastOffset),
         })
-        await this.autoCommitOffsetsIfNecessary()
+        await this.autoCommitOffsetsIfNecessary(null)
 
         this.instrumentationEmitter.emit(END_BATCH_PROCESS, {
           ...payload,
@@ -997,10 +1051,12 @@ module.exports = class Runner extends EventEmitter {
 
       this.instrumentationEmitter.emit(START_BATCH_PROCESS, payload)
 
+      const { topic, partition, assignmentEpoch, acquireClock, ownershipKey } = batch
+      const identity = { topic, partition, assignmentEpoch, acquireClock, ownershipKey }
       if (this.eachMessage) {
-        await this.processEachMessage(batch)
+        await handlerContext.run(identity, () => this.processEachMessage(batch))
       } else if (this.eachBatch) {
-        await this.processEachBatch(batch)
+        await handlerContext.run(identity, () => this.processEachBatch(batch))
       }
 
       this.instrumentationEmitter.emit(END_BATCH_PROCESS, {
@@ -1024,7 +1080,7 @@ module.exports = class Runner extends EventEmitter {
         return
       }
 
-      await this.autoCommitOffsets()
+      await this.autoCommitOffsets(batch)
       await this.heartbeat()
     }
 
@@ -1065,15 +1121,62 @@ module.exports = class Runner extends EventEmitter {
     return new Promise((resolve) => this.once(HANDLERS_IDLE, () => resolve()))
   }
 
-  autoCommitOffsets() {
-    if (this.autoCommit) {
-      return this.consumerGroup.commitOffsets({}, { auto: true })
+  /**
+   * Checks the immutable operation identity and the calling handler's original batch.
+   * @param {number} [token] the captured token; automatic calls default to current
+   * @param {object} [batch] the captured batch; detached callers have no batch
+   * @returns {KafkaJSCommitFailedError|null} a refusal without writing or changing membership
+   */
+  commitRefusal(token = this.consumerGroup.ownership?.token(), batch = handlerContext.current()) {
+    const refusal = this.consumerGroup.ownership?.refusal(token)
+    if (refusal) return refusal
+    return batch && this.isBatchStale(batch)
+      ? new KafkaJSCommitFailedError('The handler outlived its assignment', {
+          reason: 'stale-assignment',
+        })
+      : null
+  }
+
+  /**
+   * Best-effort automatic progress on a handler failure; preserves the handler's own error.
+   * @param {object} batch the batch whose handler failed
+   * @returns {Promise<void>}
+   */
+  async commitAfterHandlerError(batch) {
+    if (this.isBatchStale(batch) || this.commitRefusal()) return
+    try {
+      await this.autoCommitOffsets()
+    } catch (error) {
+      this.logger.warn('Offset commit after a handler failure failed', { error: error.message })
     }
   }
 
-  autoCommitOffsetsIfNecessary() {
-    if (this.autoCommit) {
-      return this.consumerGroup.commitOffsetsIfNecessary()
+  /**
+   * Commits the resolved offsets unless autoCommit is off or the batch no longer owns the commit.
+   * @param {object|null} [batch] the batch committing; defaults to the calling handler's, `null`
+   *   for none, as a commit outside any handler passes
+   * @returns {Promise<void>|undefined} undefined when nothing is attempted
+   */
+  autoCommitOffsets(batch = handlerContext.current() ?? null) {
+    if (this.autoCommit && !this.commitRefusal(undefined, batch)) {
+      const guard = () => this.commitRefusal(undefined, batch)
+      return this.consumerGroup.commitOffsets({}, { auto: true, guard })
+    }
+  }
+
+  /**
+   * Commits the resolved offsets when the interval or threshold is due, unless autoCommit is off
+   * or the batch no longer owns the commit. The guard keeps the batch it was created for, so a
+   * transport that evaluates it later, in another async context, still checks the same batch.
+   * @param {object|null} [batch] the batch committing; defaults to the calling handler's, `null`
+   *   for none
+   * @returns {Promise<void>|undefined} undefined when nothing is attempted
+   */
+  autoCommitOffsetsIfNecessary(batch = handlerContext.current() ?? null) {
+    if (this.autoCommit && !this.commitRefusal(undefined, batch)) {
+      return this.consumerGroup.commitOffsetsIfNecessary({
+        guard: () => this.commitRefusal(undefined, batch),
+      })
     }
   }
 
@@ -1082,23 +1185,32 @@ module.exports = class Runner extends EventEmitter {
    * unlike the fetch loop's, it keeps the client's `retry.maxTotalTime`, so it rejects with
    * `KafkaJSDeliveryTimeout` once the deadline passes.
    * @param {Object} offsets the offsets to commit
+   * @param {object} [batch] the original handler batch, absent for detached calls
    * @returns {Promise<void>} resolves at once, committing nothing, when the runner is not running
    * @throws {import('../errors').KafkaJSDeliveryTimeout|import('../errors').KafkaJSNumberOfRetriesExceeded|Error}
    */
-  commitOffsets(offsets) {
+  commitOffsets(offsets, batch = handlerContext.current() ?? null) {
+    const ownership = this.consumerGroup.ownership
+    const token = ownership?.token()
+    const release = ownership?.retain(token)
+    const guard = () => this.commitRefusal(token, batch)
     if (!this.running) {
       this.logger.debug('consumer not running, exiting', {
         groupId: this.consumerGroup.groupId,
         memberId: this.consumerGroup.memberId,
         offsets,
       })
+      release?.()
       return
     }
 
     return this.commitRetrier(async (bail, retryCount, retryTime) => {
       try {
-        await this.consumerGroup.commitOffsets(offsets)
+        const refusal = guard()
+        if (refusal) return bail(refusal)
+        await this.consumerGroup.commitOffsets(offsets, { guard })
       } catch (e) {
+        if (e instanceof KafkaJSCommitFailedError) return bail(e)
         if (!this.running) {
           this.logger.debug('consumer not running, exiting', {
             error: e.message,
@@ -1125,6 +1237,6 @@ module.exports = class Runner extends EventEmitter {
 
         throw e
       }
-    })
+    }).finally(() => release?.())
   }
 }

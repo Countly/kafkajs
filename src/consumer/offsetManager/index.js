@@ -4,8 +4,14 @@ const isInvalidOffset = require('./isInvalidOffset')
 const initializeConsumerOffsets = require('./initializeConsumerOffsets')
 const OffsetOperations = require('./offsetOperations')
 const ResetObligations = require('./resetObligations')
-const { KafkaJSError, isStaleCoordinator } = require('../../errors')
-const { stampGeneration, stampOffsetCommit } = require('../rebalanceErrorContract')
+const { KafkaJSError, KafkaJSCommitFailedError, isStaleCoordinator } = require('../../errors')
+const {
+  stampGeneration,
+  stampOffsetCommit,
+  stampOwnership,
+  learnOwnershipLoss,
+  REBALANCE_PATHS,
+} = require('../rebalanceErrorContract')
 const {
   events: { COMMIT_OFFSETS },
 } = require('../instrumentationEvents')
@@ -60,6 +66,8 @@ module.exports = class OffsetManager {
    * @param {string} [options.groupInstanceId=null] Static membership id (KIP-345); carried on
    *                                every offset commit so the coordinator can identify this
    *                                member across restarts.
+   * @param {(error: Error) => void} [options.onCommitError=null] raises a current lost commit's rejoin obligation before rejecting its caller
+   * @param {import('../groupOwnership')} [options.ownership=null] membership fence for this run; absent in isolated managers
    * @param {OffsetOperations} [options.operations] The ledger that orders this group's writes to
    *                                the committed-offset cache (owned by the `Kafka` instance and
    *                                shared by every participant in the group; a private one by
@@ -115,6 +123,8 @@ module.exports = class OffsetManager {
     memberId,
     groupInstanceId = null,
     operations = new OffsetOperations(),
+    ownership = null,
+    onCommitError = null,
     obligations = new ResetObligations(),
     membershipProtocol = 'classic',
     staleEpochTimeout = 300000,
@@ -148,6 +158,8 @@ module.exports = class OffsetManager {
     this.memberId = memberId
     this.groupInstanceId = groupInstanceId
     this.operations = operations
+    this.ownership = ownership
+    this.onCommitError = onCommitError
     this.obligations = obligations
     this.membershipProtocol = membershipProtocol
     this.staleEpochTimeout = staleEpochTimeout
@@ -230,23 +242,51 @@ module.exports = class OffsetManager {
    * reads the topic's current id.
    * @private
    * @param {object} payload the `Broker#offsetCommit` payload
+   * @param {{guard?: Function}} [options] an immutable caller identity, checked through transmission and settlement
    * @returns {Promise<object>} the decoded response
    * @throws {Error} whatever the coordinator answered, stamped
    */
-  async sendOffsetCommit(payload) {
-    const coordinator = await this.getCoordinator()
+  async sendOffsetCommit(payload, { guard = null } = {}) {
+    const token = this.ownership?.token()
+    const release = this.ownership?.retain(token)
+    const check = () => this.ownership?.refusal(token) || guard?.() || null
 
     try {
-      return await coordinator.offsetCommit({
-        ...payload,
-        topics: this.withTopicIds(payload.topics),
-      })
-    } catch (e) {
-      if (e.type === UNKNOWN_TOPIC_ID) {
-        await this.refreshAfterUnknownTopicId()
-      }
-
-      throw stampOffsetCommit(e)
+      let refusal = check()
+      if (refusal) throw refusal
+      const coordinator = await this.getCoordinator()
+      refusal = check()
+      if (refusal) throw refusal
+      const request = { ...payload, topics: this.withTopicIds(payload.topics) }
+      const result =
+        this.ownership || guard
+          ? await coordinator.offsetCommit(request, { guard: check })
+          : await coordinator.offsetCommit(request)
+      refusal = check()
+      if (refusal) throw refusal
+      return result
+    } catch (error) {
+      const stamped = stampOwnership(
+        stampGeneration(stampOffsetCommit(error), payload.groupGenerationId),
+        token
+      )
+      const lost = learnOwnershipLoss(
+        this.ownership,
+        stamped,
+        REBALANCE_PATHS.OFFSET_COMMIT,
+        this.membershipProtocol
+      )
+      if (lost) this.onCommitError?.(stamped)
+      const refusal = check()
+      if (refusal)
+        throw stampOwnership(
+          stampGeneration(stampOffsetCommit(refusal), payload.groupGenerationId),
+          token
+        )
+      if (error.type === UNKNOWN_TOPIC_ID) await this.refreshAfterUnknownTopicId()
+      throw stamped
+    } finally {
+      release?.()
     }
   }
 
@@ -524,11 +564,13 @@ module.exports = class OffsetManager {
    *
    * @param {import("../../../types").TopicPartitionOffset} topicPartitionOffset
    * @returns {Promise<boolean>} whether the seek was applied: `false` when the partition is not
-   *                              currently assigned to this member, or when a newer operation or
-   *                              barrier superseded it while its commit was in flight
+   *                              currently assigned to this member, when this member lost its
+   *                              membership, or when a newer operation or barrier superseded it
+   *                              while its commit was in flight
    * @throws {Error} whatever the offset conversion or the commit raised; the ticket ends either way
    */
   async seek({ topic, partition, offset }) {
+    if (this.ownership?.refusal(this.ownership.token())) return false
     if (!this.memberAssignment[topic] || !this.memberAssignment[topic].includes(partition)) {
       return false
     }
@@ -581,29 +623,39 @@ module.exports = class OffsetManager {
   async commitAndClear({ topic, partition, offset }) {
     const { groupId, generationId, memberId, groupInstanceId } = this
     const ticket = this.operations.begin([{ topic, partition }], { mutation: true })
+    const token = this.ownership?.token()
+    const release = this.ownership?.retain(token)
+    const guard = this.ownership ? () => this.ownership.refusal(token) : null
 
     try {
-      await this.sendOffsetCommit({
-        groupId,
-        memberId,
-        groupGenerationId: generationId,
-        groupInstanceId,
-        topics: [{ topic, partitions: [{ partition, offset }] }],
-      })
+      await this.sendOffsetCommit(
+        {
+          groupId,
+          memberId,
+          groupGenerationId: generationId,
+          groupInstanceId,
+          topics: [{ topic, partitions: [{ partition, offset }] }],
+        },
+        { guard }
+      )
 
-      if (this.operations.isSuperseded(ticket, topic, partition)) {
+      if (guard?.() || this.operations.isSuperseded(ticket, topic, partition)) {
         return false
       }
 
       this.clearOffsets({ topic, partition })
       this.operations.apply(ticket, topic, partition)
       return true
+    } catch (error) {
+      if (error instanceof KafkaJSCommitFailedError) return false
+      throw error
     } finally {
+      release?.()
       this.operations.end(ticket)
     }
   }
 
-  async commitOffsetsIfNecessary() {
+  async commitOffsetsIfNecessary(options) {
     const now = Date.now()
 
     const timeoutReached =
@@ -614,7 +666,7 @@ module.exports = class OffsetManager {
       this.countResolvedOffsets().gte(Long.fromValue(this.autoCommitThreshold))
 
     if (timeoutReached || thresholdReached) {
-      return this.commitOffsets({}, { auto: true })
+      return this.commitOffsets({}, { ...options, auto: true })
     }
   }
 
@@ -691,13 +743,42 @@ module.exports = class OffsetManager {
    *   restrict the default (uncommitted) selection to these topic-partitions. Applied HERE rather
    *   than by the caller, so a retry re-reads what is uncommitted now instead of replaying a list
    *   built before the last batch resolved. Ignored when `offsets.topics` is given.
+   * @param {() => Error|null} [options.guard] immutable caller identity retained across retries
    * @param {boolean} [options.auto=false] this is the interval/threshold auto-commit rather than a
    *   deliberate one. A stale member epoch is logged and swallowed for it, because the next
    *   interval carries whatever epoch the heartbeats have installed by then; every other caller
    *   sees the error.
    * @returns {Promise<void>}
    */
-  async commitOffsets(offsets = {}, { partitions = null, auto = false } = {}) {
+  async commitOffsets(offsets = {}, options = {}) {
+    if (!this.ownership && !options.guard) return this.commitWithOwnership(offsets, options)
+    const token = this.ownership?.token()
+    const release = this.ownership?.retain(token)
+    const guard = () => this.ownership?.refusal(token) || options.guard?.() || null
+    try {
+      return await this.commitWithOwnership(offsets, { ...options, guard })
+    } finally {
+      release?.()
+    }
+  }
+
+  /**
+   * Completes a commit while its outer operation retains the original membership identity.
+   * @private
+   * @param {object} offsets the selected offsets
+   * @param {{partitions?: object[], auto?: boolean, guard: Function}} options the immutable guard
+   * @returns {Promise<void>} automatic refusals resolve without publishing
+   * @throws {Error} explicit refusals or the original broker error
+   */
+  async commitWithOwnership(offsets, { partitions = null, auto = false, guard } = {}) {
+    const refusal = this.ownership?.refusal(this.ownership.token()) || guard?.()
+    if (refusal) {
+      if (auto) {
+        this.logger.debug('Skipping a commit without membership ownership')
+        return
+      }
+      throw refusal
+    }
     const { groupId, generationId, memberId, groupInstanceId } = this
     const { topics = this.selectUncommitted(partitions) } = offsets
 
@@ -715,9 +796,18 @@ module.exports = class OffsetManager {
     }
 
     try {
-      await this.sendAndRecordCommit(payload, topics)
+      await this.sendAndRecordCommit(payload, topics, { guard })
+      const refusal = guard?.()
+      if (refusal) throw refusal
       this.lastCommit = Date.now()
     } catch (e) {
+      if (e instanceof KafkaJSCommitFailedError) {
+        if (auto) {
+          this.logger.debug('Skipping a commit without membership ownership')
+          return
+        }
+        throw e
+      }
       // The coordinator has changed due to a restart or broker reassignment; refresh the
       // metadata *and* re-discover the coordinator so the next attempt targets the right broker.
       // Best-effort: if the retrier behind findGroupCoordinator exhausts, it rejects with a
@@ -779,15 +869,18 @@ module.exports = class OffsetManager {
    * @private
    * @param {object} payload the `Broker#offsetCommit` payload
    * @param {{topic: string, partitions: {partition: number|string, offset: string}[]}[]} topics
+   * @param {{guard?: Function}} [options] checked again before local publication
    * @returns {Promise<void>}
    * @throws {Error} whatever the commit raised; nothing is recorded then
    */
-  async sendAndRecordCommit(payload, topics) {
+  async sendAndRecordCommit(payload, topics, options) {
     const ticket = this.operations.begin(this.coveredCells(topics), { mutation: true })
 
     try {
-      await this.sendOffsetCommit(payload)
+      await this.sendOffsetCommit(payload, options)
       this.instrumentationEmitter.emit(COMMIT_OFFSETS, payload)
+      const refusal = options?.guard?.()
+      if (refusal) throw refusal
       this.recordCommitted(ticket, topics)
     } finally {
       this.operations.end(ticket)

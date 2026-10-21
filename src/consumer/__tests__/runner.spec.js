@@ -184,7 +184,9 @@ describe('Consumer > Runner', () => {
       await commitOffsetsIfNecessary(offsets)
       expect(consumerGroup.commitOffsetsIfNecessary).toHaveBeenCalledTimes(0)
       expect(consumerGroup.commitOffsets).toHaveBeenCalledTimes(1)
-      expect(consumerGroup.commitOffsets).toHaveBeenCalledWith(offsets)
+      expect(consumerGroup.commitOffsets).toHaveBeenCalledWith(offsets, {
+        guard: expect.any(Function),
+      })
     })
   })
 
@@ -308,7 +310,9 @@ describe('Consumer > Runner', () => {
 
       expect(consumerGroup.commitOffsetsIfNecessary).toHaveBeenCalledTimes(0)
       expect(consumerGroup.commitOffsets.mock.calls.length).toBeGreaterThanOrEqual(1)
-      expect(consumerGroup.commitOffsets).toHaveBeenCalledWith(offsets)
+      expect(consumerGroup.commitOffsets).toHaveBeenCalledWith(offsets, {
+        guard: expect.any(Function),
+      })
     })
 
     it('gives up with KafkaJSDeliveryTimeout once the client retry.maxTotalTime has passed', async () => {

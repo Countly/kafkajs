@@ -695,7 +695,7 @@ describe('Consumer > cooperative rebalance apply', () => {
       expect(autoCommitOffsets).not.toHaveBeenCalled()
     })
 
-    it('makes resolveOffset and commitOffsetsIfNecessary no-ops for a revoked partition mid-handler', async () => {
+    it('skips automatic progress and refuses explicit commits for a revoked partition mid-handler', async () => {
       const { group } = createGroup()
       await applyCooperative(group, { [TOPIC_A]: [0, 1] })
       jest.spyOn(group, 'heartbeat').mockImplementation(async () => {})
@@ -709,7 +709,10 @@ describe('Consumer > cooperative rebalance apply', () => {
         await applyCooperative(group, { [TOPIC_A]: [0] })
         resolveOffset(batch.messages[0].offset)
         await commitOffsetsIfNecessary()
-        await commitOffsetsIfNecessary({ topics: [] })
+        await expect(commitOffsetsIfNecessary({ topics: [] })).rejects.toMatchObject({
+          name: 'KafkaJSCommitFailedError',
+          reason: 'stale-assignment',
+        })
       })
 
       const runner = buildRunner({ group, eachBatch })
@@ -825,7 +828,7 @@ describe('Consumer > cooperative rebalance apply', () => {
       expect(commitOffsets.mock.calls.filter(([offsets]) => offsets && offsets.topics)).toEqual([])
     })
 
-    it('commits a caller-supplied payload for partitions this member kept, from a revoked batch', async () => {
+    it('refuses an explicit payload from a revoked batch even when it names a retained partition', async () => {
       const { group } = createGroup()
       await applyCooperative(group, { [TOPIC_A]: [0, 1] })
       jest.spyOn(group, 'heartbeat').mockImplementation(async () => {})
@@ -834,18 +837,18 @@ describe('Consumer > cooperative rebalance apply', () => {
       const eachBatch = jest.fn(async ({ commitOffsetsIfNecessary }) => {
         // This batch's own partition is the one that goes away; the payload names another.
         await applyCooperative(group, { [TOPIC_A]: [0] })
-        await commitOffsetsIfNecessary({
-          topics: [{ topic: TOPIC_A, partitions: [{ partition: 0, offset: '5' }] }],
-        })
+        await expect(
+          commitOffsetsIfNecessary({
+            topics: [{ topic: TOPIC_A, partitions: [{ partition: 0, offset: '5' }] }],
+          })
+        ).rejects.toMatchObject({ name: 'KafkaJSCommitFailedError', reason: 'stale-assignment' })
       })
 
       const runner = buildRunner({ group, eachBatch })
       await runner.handleBatch(messageBatch(TOPIC_A, 1))
 
       const committed = commitOffsets.mock.calls.find(([offsets]) => offsets && offsets.topics)
-      expect(committed[0].topics).toEqual([
-        { topic: TOPIC_A, partitions: [{ partition: 0, offset: '5' }] },
-      ])
+      expect(committed).toBeUndefined()
     })
 
     it('does not resolve or auto-commit from the control-batch fast-forward of a revoked partition', async () => {
@@ -1266,7 +1269,8 @@ describe('Consumer > cooperative rebalance > commit before release', () => {
     await group.applyRebalanceResult({ assignment: { [TOPIC_A]: [0] } }, { rebuildOffsets: false })
 
     expect(offsetCommit).toHaveBeenCalledWith(
-      expect.objectContaining({ groupGenerationId: 7, memberId: 'member-7' })
+      expect.objectContaining({ groupGenerationId: 7, memberId: 'member-7' }),
+      { guard: expect.any(Function) }
     )
   })
 

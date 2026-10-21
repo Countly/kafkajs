@@ -303,6 +303,7 @@ const unsupportedConsumerProtocolError = (cause) => {
  * so a lost-membership answer can be matched against the generation the member holds now.
  */
 const SENT_GENERATION = Symbol('rebalance:sentGenerationId')
+const SENT_OWNERSHIP = Symbol('rebalance:sentOwnership')
 
 /**
  * Records the generation a failing group request was sent under.
@@ -324,6 +325,48 @@ const stampGeneration = (error, generationId) => {
  */
 const sentGeneration = (error) => error && error[SENT_GENERATION]
 
+/**
+ * Records the membership identity captured before a group operation awaited anything.
+ * @param {Error} error the operation's error
+ * @param {number} token its membership identity
+ * @returns {Error} the same error, with a private stamp
+ */
+const stampOwnership = (error, token) => {
+  if (error && token != null && error[SENT_OWNERSHIP] == null) error[SENT_OWNERSHIP] = token
+  return error
+}
+
+/** @param {Error} error @returns {number|undefined} its original membership identity */
+const sentOwnership = (error) => error && error[SENT_OWNERSHIP]
+
+/**
+ * Whether an answer belongs to a membership already replaced. Unstamped local errors use current.
+ * @param {object|null} ownership the run's GroupOwnership, absent on isolated collaborators
+ * @param {Error} error the answer to inspect before any state change
+ * @returns {boolean} true only for a stamped obsolete answer
+ */
+const obsoleteOwnership = (ownership, error) => {
+  const token = sentOwnership(error)
+  return Boolean(ownership && token != null && token !== ownership.token())
+}
+
+/**
+ * Learns a path-aware loss before cleanup or a retry can await anything.
+ * @param {object|null} ownership the consumer's membership fence
+ * @param {Error} error the original, stamped operation error
+ * @param {string} path one of REBALANCE_PATHS
+ * @param {'classic'|'consumer'} kind the group protocol
+ * @returns {boolean} whether this current operation learned a path-aware loss
+ */
+const learnOwnershipLoss = (ownership, error, path, kind) => {
+  if (!ownership || obsoleteOwnership(ownership, error)) return false
+  if (rebalanceAction(error, path, { kind }).action === 'lost') {
+    ownership.lose(error, sentOwnership(error) ?? ownership.token())
+    return true
+  }
+  return false
+}
+
 module.exports = {
   REBALANCE_PATHS,
   rebalanceAction,
@@ -338,4 +381,8 @@ module.exports = {
   unsupportedConsumerProtocolError,
   stampGeneration,
   sentGeneration,
+  stampOwnership,
+  sentOwnership,
+  obsoleteOwnership,
+  learnOwnershipLoss,
 }

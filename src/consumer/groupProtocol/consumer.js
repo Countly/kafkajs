@@ -15,11 +15,16 @@ const {
 } = require('./memberState')
 const {
   stampGeneration,
+  stampOwnership,
+  obsoleteOwnership,
+  learnOwnershipLoss,
+  rebalanceAction,
   assignmentChangedError,
   consumerStoppingError,
   joinDeadlineError,
   unsupportedConsumerProtocolError,
   isConsumerProtocolFatal,
+  REBALANCE_PATHS,
 } = require('../rebalanceErrorContract')
 const {
   events: { HEARTBEAT, PARTITIONS_REVOKED, PARTITIONS_LOST },
@@ -277,6 +282,7 @@ module.exports = class ConsumerGroupProtocol {
 
   /**
    * @param {object} options
+   * @param {import('../groupOwnership')} [options.ownership=null] fences obsolete answers before membership changes
    * @param {import('../../../types').Cluster} options.cluster
    * @param {string} options.groupId
    * @param {string|null} [options.groupInstanceId] static membership id
@@ -301,11 +307,13 @@ module.exports = class ConsumerGroupProtocol {
     topics = [],
     subscribedTopicRegex = null,
     metadataMaxAge = 300000,
+    ownership = null,
     retry = {},
     instrumentationEmitter,
     logger,
   }) {
     this.cluster = cluster
+    this.ownership = ownership
     this.groupId = groupId
     this.groupInstanceId = groupInstanceId
     this.rebalanceTimeoutMs = rebalanceTimeout
@@ -946,6 +954,7 @@ module.exports = class ConsumerGroupProtocol {
    * @throws {Error} the classified error, for every path except a leave, whose errors are swallowed
    */
   async sendHeartbeat({ sendAllFields = false, leaveEpoch = null }) {
+    const ownershipToken = this.ownership?.token()
     if (!this.coordinator) {
       // A leave never LOOKS for a coordinator. `connect()` goes through the cluster's retrier, so
       // waiting for it here would hold `stop()` open for tens of seconds whenever the coordinator
@@ -978,6 +987,7 @@ module.exports = class ConsumerGroupProtocol {
     try {
       const response = await this.coordinator.consumerGroupHeartbeat(toBrokerPayload(request))
 
+      if (this.ownership && ownershipToken !== this.ownership.token()) return
       this.sentFields.remember(request)
       if (request.SubscribedTopicRegex !== undefined) {
         this.regexUpdated = false
@@ -993,6 +1003,8 @@ module.exports = class ConsumerGroupProtocol {
 
       this.onSuccess(response)
     } catch (error) {
+      stampOwnership(error, ownershipToken)
+      if (obsoleteOwnership(this.ownership, error)) throw error
       this.sentFields.reset()
 
       if (leaveEpoch != null) {
@@ -1007,9 +1019,14 @@ module.exports = class ConsumerGroupProtocol {
         return
       }
 
-      throw this.classifyHeartbeatError(stampGeneration(error, sentUnderEpoch))
+      throw stampOwnership(
+        this.classifyHeartbeatError(stampGeneration(error, sentUnderEpoch)),
+        ownershipToken
+      )
     } finally {
-      this.onRequestGenerated({ leaveEpoch, stateAtRequest })
+      if (!this.ownership || ownershipToken === this.ownership.token()) {
+        this.onRequestGenerated({ leaveEpoch, stateAtRequest })
+      }
     }
   }
 
@@ -1263,6 +1280,8 @@ module.exports = class ConsumerGroupProtocol {
    * @returns {Error} the error to raise
    */
   classifyHeartbeatError(error) {
+    if (obsoleteOwnership(this.ownership, error)) return error
+    learnOwnershipLoss(this.ownership, error, REBALANCE_PATHS.HEARTBEAT, 'consumer')
     const { code } = error
 
     if (code === NOT_COORDINATOR || code === COORDINATOR_NOT_AVAILABLE) {
@@ -1353,9 +1372,13 @@ module.exports = class ConsumerGroupProtocol {
    * @returns {void}
    */
   onMembershipError(error) {
-    const { code } = error
+    if (obsoleteOwnership(this.ownership, error)) return
+    learnOwnershipLoss(this.ownership, error, REBALANCE_PATHS.MEMBERSHIP, 'consumer')
 
-    if (code === UNKNOWN_MEMBER_ID || code === FENCED_MEMBER_EPOCH) {
+    if (
+      rebalanceAction(error, REBALANCE_PATHS.MEMBERSHIP, { kind: 'consumer' }).action === 'lost' &&
+      !isConsumerProtocolFatal(error)
+    ) {
       this.transitionToFenced(error)
       return
     }

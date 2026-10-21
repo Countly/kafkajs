@@ -595,6 +595,16 @@ says so, `groupProtocol: 'consumer'`.
   In kafkajs 2.2.4 a long handler was never evicted as long as it called `heartbeat()`. If you have
   handlers that legitimately run for a long time, set `maxPollInterval` to cover them.
 
+- **Commits cannot outlive membership or their calling handler's assignment.** Code that committed
+  after a rebalance error to save progress now gets `KafkaJSCommitFailedError`: let the consumer
+  rejoin and reprocess from the last committed offset. `isLostMember(e)` is unchanged: it matches
+  only broker codes 22, 25, 82 and 110, so it is false for code 69, the consumer protocol's other
+  fatal codes and every synthetic reason; test `instanceof KafkaJSCommitFailedError` and `reason`. A
+  commit already on the wire when the loss is learned cannot be recalled: the coordinator may have
+  applied it or rejected it, and the client cannot tell which; the new owner resumes from what the
+  coordinator holds. Transactional `sendOffsets` and the admin offset APIs are separate contracts
+  and are not refused by this rule. There is no option restoring a lost member's commit.
+
 - **`rebalanceTimeout` is deprecated, and it does not become your eviction deadline.** It still
   works, it still goes on the wire when it is the only one of the two you set, and
   `rebalanceTimeout: 0` is unchanged — including its request timeouts, which still fall back to
@@ -693,10 +703,12 @@ says so, `groupProtocol: 'consumer'`.
   handler that is already running when its partition is revoked still runs to completion — it is
   never interrupted — but its position updates and commits for that partition are dropped, because
   another member owns it by then and committing would roll that member's position back. Batches
-  fetched for a revoked partition are dropped before the handler for the same reason. When you pass
-  your own offsets to `commitOffsetsIfNecessary(offsets)` from `eachBatch`, the payload is filtered
-  per partition rather than rejected as a whole: the partitions you still hold are committed and the
-  rest are dropped, so one revoked partition in a payload does not cost you the others.
+  fetched for a revoked partition are dropped before the handler for the same reason. When the
+  calling batch is still valid, supplied offsets to `commitOffsetsIfNecessary(offsets)` are filtered
+  per partition: retained partitions are committed and revoked partitions are dropped. If that
+  calling batch itself has outlived its assignment, the explicit call rejects with
+  `KafkaJSCommitFailedError`, even when its payload names a retained partition. The no-argument
+  automatic form is skipped for a stale batch.
 
 - **Two ordering details around a rebalance.** The auto-commit a revocation triggers is now always
   sent before `consumer.rebalancing` is emitted; which came first used to depend on which path

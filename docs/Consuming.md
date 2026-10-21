@@ -98,7 +98,7 @@ await consumer.run({
 
 * `eachBatchAutoResolve` configures auto-resolve of batch processing. If set to true, KafkaJS will automatically commit the last offset of the batch if `eachBatch` doesn't throw an error. Default: true.
 * `batch.highWatermark` is the last committed offset within the topic partition. It can be useful for calculating lag.
-* `resolveOffset()` is used to mark a message in the batch as processed. In case of errors, the consumer will automatically commit the resolved offsets.
+* `resolveOffset()` is used to mark a message in the batch as processed. On a handler error, the consumer attempts to commit resolved progress only while membership and the batch remain usable; a failed progress commit does not replace the handler's own error.
 * `heartbeat(): Promise<void>` can be used to send heartbeat to the broker according to the set `heartbeatInterval` value in consumer [configuration](#options), which means if you invoke `heartbeat()` sooner than `heartbeatInterval` it will be ignored.
 * `commitOffsetsIfNecessary(offsets?): Promise<void>` is used to commit offsets based on the autoCommit configurations (`autoCommitInterval` and `autoCommitThreshold`). Note that auto commit won't happen in `eachBatch` if `commitOffsetsIfNecessary` is not invoked. Take a look at [autoCommit](#auto-commit) for more information.
 * `uncommittedOffsets()` returns all offsets by topic-partition which have not yet been committed.
@@ -214,6 +214,12 @@ consumer.commitOffsets([
   { topic: 'topic-B', partition: 0, offset: '2' }
 ])
 ```
+
+A consumer cannot commit after it has learned that its membership was lost. `consumer.commitOffsets()` and `eachBatch`'s explicit `commitOffsetsIfNecessary(offsets)` reject with `KafkaJSCommitFailedError`. Its `reason` is `membership-lost`, `poll-interval-exceeded`, or `stale-assignment`. A broker-reported loss keeps its original `type`, `code` and `cause`; synthetic poll expiry has type `POLL_INTERVAL_EXCEEDED` and no broker code, while a stale assignment has type `STALE_ASSIGNMENT` and no broker code. Test the error class and `reason` to recognize every refusal: `isLostMember` continues to match only broker codes 22, 25, 82 and 110.
+
+A commit called from a handler keeps that handler's batch identity across asynchronous work. Rejoining, or revoking and reacquiring the same partition, does not make an old handler's commit valid. A partition retained through a cooperative round can continue its work. A call from a context that never ran inside a handler, such as a queue created at startup, has no handler batch and is checked against membership alone. Automatic commits are skipped while ownership is lost. A handler's own error is preserved when its catch cannot commit progress.
+
+A commit transmitted before the loss was learned cannot be recalled. It may have been applied before the member left or rejected by the coordinator; the client cannot tell which. Its late completion does not update the client's cache or last-commit time or start another retry. An automatic commit carries processed offsets; an explicit commit carries the caller's offsets, so this guarantee makes no claim about application progress. Let the consumer rejoin and reprocess from the coordinator's committed offsets. Transactional `sendOffsets` and the admin offset APIs are separate contracts: `sendOffsets` carries the supplied consumer group metadata when given, while admin `setOffsets` and `resetOffsets` act on a group id.
 
 Note that you don't *have* to store consumed offsets in Kafka, but instead store it in a storage mechanism of your own choosing. That's an especially useful approach when the results of consuming a message are written to a datastore that allows atomically writing the consumed offset with it, like for example a SQL database. When possible it can make the consumption fully atomic and give "exactly once" semantics that are stronger than the default "at-least once" semantics you get with Kafka's offset commit functionality.
 

@@ -102,13 +102,13 @@ describe('Consumer > a commit answered GROUP_ID_NOT_FOUND', () => {
       if (!coordinator.offsetCommitPatched) {
         coordinator.offsetCommitPatched = true
         const offsetCommit = coordinator.offsetCommit.bind(coordinator)
-        coordinator.offsetCommit = async (payload) => {
+        coordinator.offsetCommit = async (payload, options) => {
           if (!injected && payload.groupId === groupId) {
             injected = true
             throw new KafkaJSProtocolError(createErrorFromCode(GROUP_ID_NOT_FOUND))
           }
 
-          return offsetCommit(payload)
+          return offsetCommit(payload, options)
         }
       }
 

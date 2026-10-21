@@ -5,6 +5,7 @@ const createRetry = require('../retry')
 
 const OffsetManager = require('./offsetManager')
 const OffsetOperations = require('./offsetManager/offsetOperations')
+const GroupOwnership = require('./groupOwnership')
 const ResetObligations = require('./offsetManager/resetObligations')
 const Batch = require('./batch')
 const SeekOffsets = require('./seekOffsets')
@@ -31,7 +32,12 @@ const apiKeys = require('../protocol/requests/apiKeys')
 const { requests } = require('../protocol/requests')
 const ClassicGroupProtocol = require('./groupProtocol/classic')
 const ConsumerGroupProtocol = require('./groupProtocol/consumer')
-const { sentGeneration } = require('./rebalanceErrorContract')
+const {
+  sentGeneration,
+  stampOwnership,
+  obsoleteOwnership,
+  REBALANCE_PATHS,
+} = require('./rebalanceErrorContract')
 const { EAGER } = require('./groupProtocol/interface')
 
 /** @see https://github.com/apache/kafka/blob/4.3/clients/src/main/java/org/apache/kafka/common/protocol/Errors.java */
@@ -186,6 +192,9 @@ module.exports = class ConsumerGroup {
     this.checkCrcs = checkCrcs
     this.metadataMaxAge = metadataMaxAge
     this.operations = operations
+    this.ownership = new GroupOwnership()
+    this.acquired = new Map()
+    this.acquireClock = 0
     this.obligations = obligations
     this.obligations.attachTo(this.operations)
 
@@ -195,6 +204,7 @@ module.exports = class ConsumerGroup {
     this.maxPrefetchBatches = maxPrefetchBatches
 
     const membershipOptions = {
+      ownership: this.ownership,
       cluster,
       groupId,
       groupInstanceId,
@@ -670,6 +680,11 @@ module.exports = class ConsumerGroup {
         memberId,
         groupInstanceId: this.groupInstanceId,
         operations: this.operations,
+        ownership: this.ownership,
+        onCommitError: (error) => {
+          const verdict = this.rebalanceCoordinator?.classify(error, REBALANCE_PATHS.OFFSET_COMMIT)
+          if (verdict?.kind === 'lost') this.rebalanceCoordinator.requestRejoin(verdict)
+        },
         obligations: this.obligations,
         membershipProtocol: this.kind,
         staleEpochTimeout: this.rebalanceTimeout,
@@ -714,6 +729,19 @@ module.exports = class ConsumerGroup {
     // Wholesale in both branches: its members are broker node ids, not partitions.
     this.validationUnusableLogged.clear()
 
+    if (rebuildOffsets) this.acquired.clear()
+    for (const { topic, partitions } of revoked) {
+      for (const partition of partitions) this.acquired.delete(`${topic}|${partition}`)
+    }
+    for (const { topic, partitions } of currentMemberAssignment) {
+      for (const partition of partitions) {
+        const key = `${topic}|${partition}`
+        if (!this.acquired.has(key)) {
+          const acquiredAt = ++this.acquireClock
+          this.acquired.set(key, { acquiredAt, changedAt: acquiredAt })
+        }
+      }
+    }
     this.subscriptionState.update(currentMemberAssignment)
 
     // A copy: the assignment reaches third-party assigners here, and one that sorts or splices
@@ -918,8 +946,8 @@ module.exports = class ConsumerGroup {
     return this.subscriptionState.isPaused(topic, partition)
   }
 
-  async commitOffsetsIfNecessary() {
-    await this.offsetManager.commitOffsetsIfNecessary()
+  async commitOffsetsIfNecessary(options) {
+    await this.offsetManager.commitOffsetsIfNecessary(options)
   }
 
   /**
@@ -1074,6 +1102,7 @@ module.exports = class ConsumerGroup {
    *   when the round was recovered from an error, or when every response entry was dropped
    */
   async fetch(nodeId) {
+    const ownershipToken = this.ownership.token()
     try {
       await this.cluster.refreshMetadataIfNecessary()
       this.checkForStaleAssignment()
@@ -1083,6 +1112,7 @@ module.exports = class ConsumerGroup {
       // Captured before anything is awaited: this is the assignment the request below is built
       // from, and it is what every batch this round produces is stamped with.
       const assignmentEpoch = this.assignmentEpoch
+      const acquireClock = this.acquireClock
 
       await this.seekOffsets(topicPartitions)
       await this.validatePositions(topicPartitions)
@@ -1186,10 +1216,14 @@ module.exports = class ConsumerGroup {
 
       for (const batch of batches) {
         batch.assignmentEpoch = assignmentEpoch
+        batch.acquireClock = acquireClock
+        batch.ownershipKey = `${batch.topic}|${batch.partition}`
       }
 
       return batches
     } catch (e) {
+      stampOwnership(e, ownershipToken)
+      if (obsoleteOwnership(this.ownership, e)) throw e
       await this.recoverFromFetch(e)
       return []
     }
