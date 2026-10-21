@@ -12,7 +12,12 @@ const InstrumentationEventEmitter = require('../../instrumentation/emitter')
 const { events } = require('../instrumentationEvents')
 const { KafkaJSProtocolError } = require('../../errors')
 const { createErrorFromCode } = require('../../protocol/error')
-const { stampGeneration, sentGeneration } = require('../rebalanceErrorContract')
+const {
+  REBALANCE_PATHS,
+  stampGeneration,
+  stampOwnership,
+  sentGeneration,
+} = require('../rebalanceErrorContract')
 const { newLogger } = require('testHelpers')
 
 const ILLEGAL_GENERATION = 22
@@ -580,6 +585,149 @@ describe('Consumer > cooperative rebalance apply', () => {
       expect(consumerGroup.discardUncommittedOffsets).not.toHaveBeenCalled()
       expect(runner.quiescing).toBe(false)
       expect(consumerGroup.joinAndSync).not.toHaveBeenCalled()
+    })
+
+    describe('and what it does to the membership', () => {
+      /** A member holding partitions 0 and 1 of generation 1, with a real coordinator attached. */
+      const createMember = async () => {
+        const { group } = createGroup({ topics: [TOPIC_A] })
+        group.autoCommit = true
+        const coordinator = new RebalanceCoordinator({
+          runner: { stopRequested: false, onCrash: jest.fn() },
+          consumerGroup: group,
+          fetchManager: {
+            start: jest.fn(async () => {}),
+            stop: jest.fn(async () => {}),
+            getFetchers: () => [],
+          },
+          heartbeatManager: { ensureStarted: jest.fn(), stop: jest.fn() },
+          pollTimer: new PollTimer({ pollDeadline: 8000 }),
+          instrumentationEmitter: new InstrumentationEventEmitter(),
+          logger: newLogger(),
+          groupId: 'cooperative-group',
+        })
+        group.attach({
+          rebalanceCoordinator: coordinator,
+          heartbeatManager: { ensureStarted: jest.fn(), stop: jest.fn() },
+        })
+        await group.applyRebalanceResult({ assignment: { [TOPIC_A]: [0, 1] } })
+        group.resolveOffset({ topic: TOPIC_A, partition: 1, offset: '4' })
+        group.coordinator.offsetCommit.mockClear()
+        return { group, coordinator }
+      }
+
+      /** An answer to a request sent under `generationId` and the membership held now. */
+      const answeredOnMembership = (group, code, generationId) =>
+        stampOwnership(answeredUnder(code, generationId), group.ownership.token())
+
+      /** The cooperative sync revokes partition 1; returns the OffsetCommits that apply sent. */
+      const revokePartitionOne = async (group) => {
+        await applyCooperative(group, { [TOPIC_A]: [0] })
+        return group.coordinator.offsetCommit.mock.calls.map(([request]) => request)
+      }
+
+      it('keeps the pre-release commit alive after an auto-commit sent under the old generation is refused', async () => {
+        const { group } = await createMember()
+        group.generationId = 2
+        group.coordinator.offsetCommit.mockRejectedValueOnce(
+          createErrorFromCode(ILLEGAL_GENERATION)
+        )
+
+        await group.offsetManager.commitOffsets({}, { auto: true }).catch(() => {})
+
+        expect(group.coordinator.offsetCommit).toHaveBeenCalledTimes(1)
+        expect(group.coordinator.offsetCommit.mock.calls[0][0].groupGenerationId).toBe(1)
+        expect(group.ownership.refusal(group.ownership.token())).toBeNull()
+        group.coordinator.offsetCommit.mockClear()
+        const sent = await revokePartitionOne(group)
+        expect(sent).toHaveLength(1)
+        expect(sent[0]).toMatchObject({ groupGenerationId: 2, topics: [{ topic: TOPIC_A }] })
+        expect(sent[0].topics[0].partitions.map(({ partition }) => Number(partition))).toEqual([1])
+      })
+
+      it('keeps the pre-release commit alive after a heartbeat sent under the old generation is answered', async () => {
+        const { group, coordinator } = await createMember()
+        group.generationId = 2
+
+        const verdict = coordinator.classify(
+          answeredOnMembership(group, ILLEGAL_GENERATION, 1),
+          REBALANCE_PATHS.HEARTBEAT
+        )
+        coordinator.requestRejoin(verdict)
+
+        expect(group.ownership.refusal(group.ownership.token())).toBeNull()
+        const sent = await revokePartitionOne(group)
+        expect(sent).toHaveLength(1)
+        expect(sent[0]).toMatchObject({ groupGenerationId: 2 })
+      })
+
+      it('keeps the pre-release commit alive when the stale verdict reaches requestRejoin alone', async () => {
+        const { group, coordinator } = await createMember()
+        group.generationId = 2
+
+        coordinator.requestRejoin({
+          kind: 'lost',
+          reason: 'lost',
+          error: answeredOnMembership(group, ILLEGAL_GENERATION, 1),
+        })
+
+        expect(group.ownership.refusal(group.ownership.token())).toBeNull()
+        expect(await revokePartitionOne(group)).toHaveLength(1)
+      })
+
+      it('refuses the pre-release commit after a heartbeat answered about the generation held now', async () => {
+        const { group, coordinator } = await createMember()
+        group.generationId = 2
+
+        const verdict = coordinator.classify(
+          answeredOnMembership(group, ILLEGAL_GENERATION, 2),
+          REBALANCE_PATHS.HEARTBEAT
+        )
+        coordinator.requestRejoin(verdict)
+
+        expect(group.ownership.refusal(group.ownership.token())).not.toBeNull()
+        expect(await revokePartitionOne(group)).toHaveLength(0)
+      })
+
+      it('refuses the pre-release commit after an auto-commit answered about the generation held now', async () => {
+        const { group } = await createMember()
+        group.coordinator.offsetCommit.mockRejectedValueOnce(
+          createErrorFromCode(ILLEGAL_GENERATION)
+        )
+
+        await group.offsetManager.commitOffsets({}, { auto: true }).catch(() => {})
+
+        expect(group.coordinator.offsetCommit).toHaveBeenCalledTimes(1)
+        expect(group.ownership.refusal(group.ownership.token())).not.toBeNull()
+        group.coordinator.offsetCommit.mockClear()
+        expect(await revokePartitionOne(group)).toHaveLength(0)
+      })
+
+      it('refuses the pre-release commit after a fenced static member, whatever generation the answer names', async () => {
+        const { group, coordinator } = await createMember()
+        group.generationId = 2
+
+        coordinator.classify(
+          answeredOnMembership(group, FENCED_INSTANCE_ID, 1),
+          REBALANCE_PATHS.HEARTBEAT
+        )
+
+        expect(group.ownership.refusal(group.ownership.token())).not.toBeNull()
+        expect(await revokePartitionOne(group)).toHaveLength(0)
+      })
+
+      it('learns a loss under the consumer protocol, where the epoch an answer names carries no staleness', async () => {
+        const { group } = await createMember()
+        Object.defineProperty(group, 'kind', { value: 'consumer' })
+        group.generationId = 5
+
+        group.ownership.lose(
+          answeredOnMembership(group, ILLEGAL_GENERATION, 3),
+          group.ownership.token()
+        )
+
+        expect(group.ownership.refusal(group.ownership.token())).not.toBeNull()
+      })
     })
   })
 

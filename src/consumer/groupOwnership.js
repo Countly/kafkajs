@@ -5,7 +5,13 @@ const { KafkaJSCommitFailedError } = require('../errors')
  * retained by outstanding operations are stored; renewing an idle member retains no history.
  */
 class GroupOwnership {
-  constructor() {
+  /**
+   * @param {Object} [options]
+   * @param {(cause: Error) => boolean} [options.isStale] whether a loss answers about a generation
+   *   the member no longer holds
+   */
+  constructor({ isStale = () => false } = {}) {
+    this.isStale = isStale
     this.current = 0
     this.permanent = null
     this.states = new Map([[0, { cause: null, holders: 0 }]])
@@ -36,13 +42,14 @@ class GroupOwnership {
   }
 
   /**
-   * Invalidates exactly the current identity. An obsolete answer changes nothing.
+   * Invalidates exactly the current identity. An obsolete answer changes nothing, and neither does
+   * an answer about a generation the member no longer holds (Java's `generationUnchanged()`).
    * @param {Error} cause the loss, including a synthetic poll-expiry error
    * @param {number} token the failing operation's identity
    * @returns {void}
    */
   lose(cause, token) {
-    if (token !== this.current) return
+    if (token !== this.current || this.isStale(cause)) return
     const state = this.states.get(token)
     if (!state.cause) state.cause = cause
   }

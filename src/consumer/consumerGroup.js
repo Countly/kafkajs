@@ -193,7 +193,16 @@ module.exports = class ConsumerGroup {
     this.checkCrcs = checkCrcs
     this.metadataMaxAge = metadataMaxAge
     this.operations = operations
-    this.ownership = new GroupOwnership()
+    // Classic only: a consumer-protocol epoch says nothing about staleness, and a member that
+    // holds no generation has none to be stale against.
+    this.ownership = new GroupOwnership({
+      isStale: (cause) =>
+        this.kind !== 'consumer' &&
+        this.generationId != null &&
+        Boolean(
+          this.rebalanceCoordinator?.isStaleGenerationVerdict({ kind: 'lost', error: cause })
+        ),
+    })
     this.acquired = new Map()
     this.acquireClock = 0
     this.obligations = obligations
