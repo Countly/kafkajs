@@ -1,5 +1,6 @@
 const Long = require('../../utils/long')
 const sleep = require('../../utils/sleep')
+const dictionary = require('../../utils/dictionary')
 const isInvalidOffset = require('./isInvalidOffset')
 const initializeConsumerOffsets = require('./initializeConsumerOffsets')
 const OffsetOperations = require('./offsetOperations')
@@ -17,7 +18,7 @@ const {
 } = require('../instrumentationEvents')
 
 const { keys, assign } = Object
-const indexTopics = (topics) => topics.reduce((obj, topic) => assign(obj, { [topic]: {} }), {})
+const indexTopics = (topics) => dictionary(topics.map((topic) => [topic, {}]))
 
 /** @see https://github.com/apache/kafka/blob/4.3/clients/src/main/java/org/apache/kafka/common/protocol/Errors.java */
 const STALE_MEMBER_EPOCH = 'STALE_MEMBER_EPOCH'

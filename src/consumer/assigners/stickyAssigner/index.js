@@ -1,6 +1,7 @@
 const { MemberMetadata, MemberAssignment } = require('../../assignerProtocol')
 const { assignSticky, DEFAULT_GENERATION } = require('./stickyCore')
 const { stickyUserData } = require('./stickyUserData')
+const dictionary = require('../../../utils/dictionary')
 
 /**
  * Java's `StickyAssignor`, under its wire name.
@@ -47,7 +48,7 @@ module.exports = ({ cluster }) => ({
       }
     })
 
-    const partitionsPerTopic = {}
+    const partitionsPerTopic = dictionary()
     for (const topic of topics) {
       partitionsPerTopic[topic] = cluster
         .findTopicPartitionMetadata(topic)

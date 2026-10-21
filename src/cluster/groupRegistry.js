@@ -1,4 +1,5 @@
 const OffsetOperations = require('../consumer/offsetManager/offsetOperations')
+const dictionary = require('../utils/dictionary')
 
 const registries = new WeakMap()
 
@@ -44,7 +45,7 @@ class GroupRegistry {
     let entry = this.entries.get(groupId)
     if (!entry) {
       const ledger = this.operations.get(groupId) || new OffsetOperations()
-      const offsets = this.offsets.get(groupId) || {}
+      const offsets = this.offsets.get(groupId) || dictionary()
       entry = { ledger, offsets, holders: new Set() }
       this.entries.set(groupId, entry)
       this.operations.set(groupId, ledger)

@@ -897,6 +897,7 @@ says so, `groupProtocol: 'consumer'`.
   also wrote a data record keyed with four zero bytes.** A corrupt batch is a typed
   `KafkaJSCorruptRecordError` inside the decoder.
 - **A partition stops at a corrupt record batch instead of stalling silently.** The consumer delivers the records before the batch, reports `consumer.partition_halted` once (`offset` is the batch's first offset) and keeps the other partitions running; it never commits past the batch on its own. *What to do:* to skip the batch, `consumer.seek` the partition to a later offset (a seek from the `consumer.partition_halted` listener works, but the event fires before the records ahead of the batch are processed, and the seek also drops them); a rebalance that revokes the partition, a recreation of its topic or a restart also clears the halt, and a recreated topic does not inherit it. A CRC mismatch still crashes the consumer, as before.
+- **Topics named after `Object.prototype` members work.** If you renamed topics to avoid `__proto__`, `constructor`, `toString`, `hasOwnProperty` or `valueOf`, you can stop: they work with every built-in partition assigner, and nothing else changes. A custom assigner that decodes a `MemberAssignment` gets every topic as an own entry of `assignment`.
 
 ### Admin
 

@@ -8,6 +8,7 @@ const {
   topicOf,
   partitionOf,
 } = require('../stickyAssigner/stickyCore')
+const dictionary = require('../../../utils/dictionary')
 
 /**
  * @param {Buffer|null} userData
@@ -96,7 +97,7 @@ module.exports = ({ cluster }) => ({
       }
     })
 
-    const partitionsPerTopic = {}
+    const partitionsPerTopic = dictionary()
     for (const topic of topics) {
       partitionsPerTopic[topic] = cluster
         .findTopicPartitionMetadata(topic)

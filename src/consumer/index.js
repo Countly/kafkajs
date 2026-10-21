@@ -1,5 +1,6 @@
 const { failureSourceOf } = require('../broker/failureSource')
 const Long = require('../utils/long')
+const dictionary = require('../utils/dictionary')
 const { initialRetryTime } = require('../retry/defaults')
 const ConsumerGroup = require('./consumerGroup')
 const ResetObligations = require('./offsetManager/resetObligations')
@@ -224,7 +225,7 @@ module.exports = (params) => {
     : partitionAssigners.map((createAssigner) => createAssigner({ groupId, logger, cluster }))
 
   /** @type {Record<string, { fromBeginning?: boolean }>} */
-  const topics = {}
+  const topics = dictionary()
   /** @type {string|null} the RE2 pattern a regex subscription sent, verbatim */
   let subscribedTopicRegex = null
   /** @type {{ fromBeginning: boolean }|null} the options that subscription was made with */
@@ -734,9 +735,9 @@ module.exports = (params) => {
 
         topicCommits.push({ partition, offset: commitOffset, metadata })
 
-        return { ...payload, [topic]: topicCommits }
+        return Object.assign(dictionary(), payload, { [topic]: topicCommits })
       },
-      {}
+      dictionary()
     )
 
     if (!consumerGroup) {

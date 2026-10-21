@@ -1,4 +1,5 @@
 const { compareMembers } = require('../memberInfo')
+const dictionary = require('../../../utils/dictionary')
 
 /** What a member reports when it has never held a generation. */
 const DEFAULT_GENERATION = -1
@@ -24,7 +25,8 @@ const partitionOf = (key) => Number(key.slice(key.indexOf(SEP) + 1))
  * with topics and partitions both in ascending order so the result is reproducible.
  *
  * @param {Iterable<string>} keys
- * @returns {{[topic: string]: number[]}}
+ * @returns {{[topic: string]: number[]}} a table without a prototype, so that every topic name,
+ *   `__proto__` included, is an entry of its own
  */
 const groupByTopic = (keys) => {
   const byTopic = new Map()
@@ -40,7 +42,7 @@ const groupByTopic = (keys) => {
     }
   }
 
-  const result = {}
+  const result = dictionary()
   for (const topic of [...byTopic.keys()].sort()) {
     result[topic] = byTopic.get(topic).sort((a, b) => a - b)
   }
@@ -955,7 +957,7 @@ class PartitionMovements {
 const assignSticky = ({ partitionsPerTopic, members, contested }) => {
   const ordered = [...members].sort(compareMembers)
   const subscribed = new Set(ordered.flatMap(({ topics }) => topics))
-  const partitions = {}
+  const partitions = dictionary()
 
   // A topic nobody subscribes to is dropped rather than divided up. Java is never handed one -
   // its caller passes the group's subscription - and its quota-driven path would otherwise hand

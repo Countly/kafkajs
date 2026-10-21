@@ -1,4 +1,5 @@
 const sharedPromiseTo = require('../../utils/sharedPromiseTo')
+const dictionary = require('../../utils/dictionary')
 const retryDefaults = require('../../retry/defaults')
 const apiKeys = require('../../protocol/requests/apiKeys')
 const { COOPERATIVE } = require('./interface')
@@ -719,7 +720,7 @@ module.exports = class ConsumerGroupProtocol {
    * @returns {{ assignment: Object, byTopicId: Map<string, number[]>, names: string[], unresolved: string[] }}
    */
   resolveFromCache(target) {
-    const assignment = {}
+    const assignment = dictionary()
     const byTopicId = new Map()
     const names = []
     const unresolved = []

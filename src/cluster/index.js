@@ -23,15 +23,15 @@ const apiKeys = require('../protocol/requests/apiKeys')
 const { requests } = require('../protocol/requests')
 const { staleLeaderEpoch, createErrorFromCode } = require('../protocol/error')
 
+const dictionary = require('../utils/dictionary')
+
 const { keys } = Object
 
 /** @see https://github.com/apache/kafka/blob/4.3/clients/src/main/java/org/apache/kafka/common/protocol/Errors.java */
 const LEADER_NOT_AVAILABLE = 5
 
-const mergeTopics = (obj, { topic, partitions }) => ({
-  ...obj,
-  [topic]: [...(obj[topic] || []), ...partitions],
-})
+const mergeTopics = (obj, { topic, partitions }) =>
+  Object.assign(dictionary(), obj, { [topic]: [...(obj[topic] || []), ...partitions] })
 
 /**
  * Metadata error codes that describe ONE topic rather than the request: the response carries them
@@ -952,7 +952,7 @@ module.exports = class Cluster {
    */
   async fetchTopicsOffset(topics) {
     const partitionsPerBroker = {}
-    const topicConfigurations = {}
+    const topicConfigurations = dictionary()
 
     const addDefaultOffset = (topic) => (partition) => {
       const { timestamp } = topicConfigurations[topic]
@@ -976,7 +976,7 @@ module.exports = class Cluster {
       topicConfigurations[topic] = { timestamp }
 
       keys(partitionsPerLeader).forEach((nodeId) => {
-        partitionsPerBroker[nodeId] = partitionsPerBroker[nodeId] || {}
+        partitionsPerBroker[nodeId] = partitionsPerBroker[nodeId] || dictionary()
         partitionsPerBroker[nodeId][topic] = partitions.filter((p) =>
           partitionsPerLeader[nodeId].includes(p.partition)
         )
@@ -1022,7 +1022,7 @@ module.exports = class Cluster {
 
       throw e
     })
-    const partitionsPerTopic = responses.flat().reduce(mergeTopics, {})
+    const partitionsPerTopic = responses.flat().reduce(mergeTopics, dictionary())
 
     return keys(partitionsPerTopic).map((topic) => ({
       topic,

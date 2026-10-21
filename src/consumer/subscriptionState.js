@@ -1,3 +1,5 @@
+const dictionary = require('../utils/dictionary')
+
 const createState = (topic) => ({
   topic,
   paused: new Set(),
@@ -7,7 +9,7 @@ const createState = (topic) => ({
 
 module.exports = class SubscriptionState {
   constructor() {
-    this.assignedPartitionsByTopic = {}
+    this.assignedPartitionsByTopic = dictionary()
     /**
      * The same assignment as a membership index. Rebuilt in `assign()`, which runs once per
      * apply, so the per-message ownership check is a hash lookup instead of a scan of the whole
@@ -15,7 +17,7 @@ module.exports = class SubscriptionState {
      * @type {Map<string, Set<number>>}
      */
     this.assignedPartitionSetsByTopic = new Map()
-    this.subscriptionStatesByTopic = {}
+    this.subscriptionStatesByTopic = dictionary()
   }
 
   /**
@@ -26,9 +28,9 @@ module.exports = class SubscriptionState {
   assign(topicPartitions = []) {
     this.assignedPartitionsByTopic = topicPartitions.reduce(
       (assigned, { topic, partitions = [] }) => {
-        return { ...assigned, [topic]: { topic, partitions } }
+        return Object.assign(dictionary(), assigned, { [topic]: { topic, partitions } })
       },
-      {}
+      dictionary()
     )
 
     this.assignedPartitionSetsByTopic = new Map(

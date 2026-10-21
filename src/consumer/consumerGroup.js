@@ -41,6 +41,7 @@ const {
 } = require('./rebalanceErrorContract')
 const { EAGER } = require('./groupProtocol/interface')
 const describeThrown = require('../network/describeThrown')
+const dictionary = require('../utils/dictionary')
 
 /** @see https://github.com/apache/kafka/blob/4.3/clients/src/main/java/org/apache/kafka/common/protocol/Errors.java */
 const STALE_MEMBER_EPOCH = 'STALE_MEMBER_EPOCH'
@@ -267,7 +268,7 @@ module.exports = class ConsumerGroup {
      *
      * @type {{[topicName: string]: {[partition: number]: {nodeId: number, expireAt: number}}}}
      */
-    this.preferredReadReplicasPerTopicPartition = {}
+    this.preferredReadReplicasPerTopicPartition = dictionary()
     /**
      * Consecutive fetch rounds in which a partition produced an error instead of a batch, keyed by
      * `topic|partition`. Reset on that partition's next delivered batch, and wholesale at sync -
@@ -676,11 +677,9 @@ module.exports = class ConsumerGroup {
     this.groupMembership.narrowOwned(currentMemberAssignment)
 
     const memberAssignment = currentMemberAssignment.reduce(
-      (partitionsByTopic, { topic, partitions }) => ({
-        ...partitionsByTopic,
-        [topic]: partitions,
-      }),
-      {}
+      (partitionsByTopic, { topic, partitions }) =>
+        Object.assign(dictionary(), partitionsByTopic, { [topic]: partitions }),
+      dictionary()
     )
 
     if (rebuildOffsets || !this.offsetManager) {
@@ -2403,7 +2402,7 @@ module.exports = class ConsumerGroup {
   getActiveTopicPartitions() {
     const activeSubscriptionState = this.subscriptionState.active()
 
-    const activeTopicPartitions = {}
+    const activeTopicPartitions = dictionary()
     activeSubscriptionState.forEach(({ topic, partitions }) => {
       activeTopicPartitions[topic] = new Set(partitions)
     })

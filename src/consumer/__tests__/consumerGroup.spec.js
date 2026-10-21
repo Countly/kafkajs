@@ -511,3 +511,19 @@ describe('Consumer > ConsumerGroup > buildFetchRequests', () => {
     ])
   })
 })
+
+describe('Consumer > ConsumerGroup > unassigned prototype topic seeks', () => {
+  it.each(['__proto__', 'constructor', 'toString', 'hasOwnProperty', 'valueOf'])(
+    'ignores a seek for an unassigned topic named %s',
+    async (topic) => {
+      const before = Object.getOwnPropertyDescriptors(Object.prototype)
+      const group = createGroup()
+      await group.applyRebalanceResult({ assignment: { [TOPIC_A]: [0] } })
+
+      await expect(group.offsetManager.seek({ topic, partition: 0, offset: '100' })).resolves.toBe(
+        false
+      )
+      expect(Object.getOwnPropertyDescriptors(Object.prototype)).toEqual(before)
+    }
+  )
+})

@@ -21,6 +21,12 @@ const {
 const { problemsOf } = require('../../../scripts/evidence/verify')
 const { CALLS, LIMIT, overload } = require('../../network/__tests__/fixtures/inFlightOverload')
 const {
+  NAMES,
+  GROUP: PROTOTYPE_GROUP,
+  PrototypeCase,
+  prototypeDescriptors,
+} = require('../../consumer/__tests__/fixtures/prototypeCase')
+const {
   sleep,
   waitForCondition,
   withTimeout,
@@ -598,6 +604,36 @@ describeFloor('Kafka floor core (live)', () => {
         expect(outcome.resolved).toBe(CALLS)
         expect(outcome.maxInFlight).toBeLessThanOrEqual(LIMIT)
         expect(outcome.maxInFlight).toBeGreaterThan(1)
+      }
+    )
+
+    member(
+      'topics named like Object.prototype members round-trip through a producer and a consumer',
+      async () => {
+        const before = prototypeDescriptors()
+        const outcomes = []
+        for (const name of NAMES) {
+          const run = new PrototypeCase(name, 'docker')
+          try {
+            const consumer = await run.consume(await run.kafka())
+            await consumer.commitOffsets([{ topic: name, partition: 0, offset: '1' }])
+            const [offsets] = await run.admin.fetchOffsets({
+              groupId: PROTOTYPE_GROUP,
+              topics: [name],
+            })
+            outcomes.push({
+              name,
+              delivered: run.delivered.length,
+              committed: offsets.partitions[0].offset,
+            })
+          } finally {
+            await run.close()
+          }
+        }
+        writeEvidence(EVIDENCE, { case: 'F08', member: 'prototype-topics', outcomes })
+
+        expect(outcomes).toEqual(NAMES.map((name) => ({ name, delivered: 1, committed: '1' })))
+        expect(prototypeDescriptors()).toEqual(before)
       }
     )
   })

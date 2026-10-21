@@ -1,5 +1,6 @@
 const { MemberMetadata, MemberAssignment } = require('../../assignerProtocol')
 const { compareMembers } = require('../memberInfo')
+const dictionary = require('../../../utils/dictionary')
 
 /**
  * Java's `RangeAssignor`, under its wire name.
@@ -37,7 +38,7 @@ module.exports = ({ cluster }) => ({
       }))
       .sort(compareMembers)
 
-    const assignment = new Map(decoded.map(({ memberId }) => [memberId, {}]))
+    const assignment = new Map(decoded.map(({ memberId }) => [memberId, dictionary()]))
 
     for (const topic of topics) {
       const subscribed = decoded.filter(({ metadata }) => metadata.topics.includes(topic))

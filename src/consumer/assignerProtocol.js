@@ -134,16 +134,15 @@ const MemberAssignment = {
       topic: d.readString(),
       partitions: d.readArray(decodePartitions),
     })
-    const indexAssignment = (obj, { topic, partitions }) =>
-      Object.assign(obj, { [topic]: partitions })
-
     if (!decoder.canReadInt16()) {
       return null
     }
 
     return {
       version: decoder.readInt16(),
-      assignment: decoder.readArray(decodeAssignment).reduce(indexAssignment, {}),
+      assignment: Object.fromEntries(
+        decoder.readArray(decodeAssignment).map(({ topic, partitions }) => [topic, partitions])
+      ),
       userData: decoder.readBytes(),
     }
   },
