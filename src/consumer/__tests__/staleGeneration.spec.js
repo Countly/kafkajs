@@ -1,13 +1,17 @@
 const Runner = require('../runner')
+const GroupOwnership = require('../groupOwnership')
 const { newLogger } = require('testHelpers')
+const waitFor = require('../../utils/waitFor')
 const InstrumentationEventEmitter = require('../../instrumentation/emitter')
 const {
   events: { REBALANCING },
 } = require('../instrumentationEvents')
 const { createErrorFromCode } = require('../../protocol/error')
+const { stampGeneration, stampOwnership } = require('../rebalanceErrorContract')
 
 const ILLEGAL_GENERATION = 22
 const UNKNOWN_MEMBER_ID = 25
+const GROUP_AUTHORIZATION_FAILED = 30
 const REBALANCE_IN_PROGRESS = 27
 const NOT_COORDINATOR_FOR_GROUP = 16
 const FENCED_INSTANCE_ID = 82
@@ -203,5 +207,104 @@ describe('Consumer > Runner > stale generation', () => {
     // the error rethrows all the way to the crash handler instead (restart-on-fenced is a later
     // task's concern, not implemented here).
     expect(runner.onCrash).toHaveBeenCalled()
+  })
+})
+
+describe('Consumer > Runner > answer from a replaced membership', () => {
+  /**
+   * An answer sent under the current membership, which a completed round then replaces.
+   * @param {GroupOwnership} ownership
+   * @param {number} code the broker error code
+   * @returns {Error}
+   */
+  const obsoleteAnswer = (ownership, code) => {
+    const answer = stampOwnership(stampGeneration(createErrorFromCode(code), 1), ownership.token())
+    ownership.renew()
+    return answer
+  }
+
+  /**
+   * Runs the fetch loop until it ends: the first `fetchManager.start` runs `beforeThrow` and throws
+   * `error`, the second ends the loop. A crash ends it too, through the runner's own cleanup.
+   * @param {Runner} runner
+   * @param {Error} error
+   * @param {() => void} [beforeThrow]
+   * @returns {Promise<void>}
+   */
+  const runFetchLoop = async (runner, error, beforeThrow = () => {}) => {
+    let starts = 0
+    runner.running = true
+    runner.fetchManager = {
+      start: jest.fn(async () => {
+        if (++starts === 1) {
+          beforeThrow()
+          throw error
+        }
+        runner.running = false
+      }),
+      stop: jest.fn(async () => {}),
+    }
+
+    runner.scheduleFetchManager()
+    await waitFor(() => !runner.running)
+  }
+
+  it.each([
+    ['ILLEGAL_GENERATION', ILLEGAL_GENERATION],
+    ['GROUP_AUTHORIZATION_FAILED, which is not a rebalance code', GROUP_AUTHORIZATION_FAILED],
+  ])('restarts the fetch loop instead of crashing on an obsolete %s', async (_name, code) => {
+    const ownership = new GroupOwnership()
+    const { runner, consumerGroup, instrumentationEmitter } = createRunner({ ownership })
+    const rebalancing = jest.fn()
+    instrumentationEmitter.addListener(REBALANCING, rebalancing)
+
+    await runFetchLoop(runner, obsoleteAnswer(ownership, code))
+
+    expect(runner.onCrash).not.toHaveBeenCalled()
+    expect(runner.fetchManager.start).toHaveBeenCalledTimes(2)
+    expect(rebalancing).not.toHaveBeenCalled()
+    expect(consumerGroup.joinAndSync).not.toHaveBeenCalled()
+  })
+
+  it.each([
+    ['unstamped', () => createErrorFromCode(GROUP_AUTHORIZATION_FAILED)],
+    [
+      'sent under the current membership',
+      (ownership) =>
+        stampOwnership(createErrorFromCode(GROUP_AUTHORIZATION_FAILED), ownership.token()),
+    ],
+  ])('still crashes on a non-retriable error that is %s', async (_name, build) => {
+    const ownership = new GroupOwnership()
+    const { runner } = createRunner({ ownership })
+
+    await runFetchLoop(runner, build(ownership))
+
+    expect(runner.onCrash).toHaveBeenCalledTimes(1)
+    expect(runner.onCrash).toHaveBeenCalledWith(
+      expect.objectContaining({ name: 'KafkaJSNonRetriableError' })
+    )
+    expect(runner.fetchManager.start).toHaveBeenCalledTimes(1)
+  })
+
+  it('still handles the verdict waiting in the slot when the thrown answer is obsolete', async () => {
+    const ownership = new GroupOwnership()
+    const { runner, consumerGroup, instrumentationEmitter } = createRunner({ ownership })
+    const rebalancing = jest.fn()
+    instrumentationEmitter.addListener(REBALANCING, rebalancing)
+    const waiting = {
+      kind: 'lost',
+      reason: 'lost',
+      error: createErrorFromCode(UNKNOWN_MEMBER_ID),
+    }
+
+    await runFetchLoop(runner, obsoleteAnswer(ownership, ILLEGAL_GENERATION), () =>
+      runner.rebalanceCoordinator.requestRejoin(waiting)
+    )
+
+    expect(runner.onCrash).not.toHaveBeenCalled()
+    expect(consumerGroup.discardUncommittedOffsets).toHaveBeenCalledTimes(1)
+    expect(consumerGroup.joinAndSync).toHaveBeenCalledTimes(1)
+    expect(rebalancing).toHaveBeenCalledTimes(1)
+    expect(runner.fetchManager.start).toHaveBeenCalledTimes(2)
   })
 })

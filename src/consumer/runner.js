@@ -227,6 +227,9 @@ module.exports = class Runner extends EventEmitter {
    * `start()` calls - in the retrier's backoff after a heartbeat failure that carried no verdict,
    * say - and nothing else reads the slot then: `start()` clears the stop latch the verdict set, so
    * a loop that started anyway would keep fetching for a member that has already left its group.
+   *
+   * An error from a membership a completed round already replaced is dropped after any waiting
+   * verdict is handled, and the loop restarts instead of crashing the consumer.
    * @returns {void}
    */
   scheduleFetchManager() {
@@ -271,6 +274,16 @@ module.exports = class Runner extends EventEmitter {
 
         if (merged) {
           await this.handleRebalanceError(merged)
+          return
+        }
+
+        // An answer for a membership a completed round already replaced changes nothing.
+        if (obsoleteOwnership(this.consumerGroup.ownership, e)) {
+          this.logger.debug('Ignoring an error from a membership already replaced', {
+            groupId: this.consumerGroup.groupId,
+            memberId: this.consumerGroup.memberId,
+            error: e.message,
+          })
           return
         }
 
