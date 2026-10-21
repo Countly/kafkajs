@@ -7,7 +7,7 @@ const { isConnectionFailure } = require('../network/connectionFailure')
 const sharedPromiseTo = require('../utils/sharedPromiseTo')
 const createRetry = require('../retry')
 const connectionPoolBuilder = require('./connectionPoolBuilder')
-const OffsetOperations = require('../consumer/offsetManager/offsetOperations')
+const GroupRegistry = require('./groupRegistry')
 const { EARLIEST_OFFSET, LATEST_OFFSET } = require('../constants')
 const {
   KafkaJSError,
@@ -136,6 +136,7 @@ module.exports = class Cluster {
       clientId,
       connectionTimeout,
       requestTimeout,
+      drainTimeout: requestTimeout,
       enforceRequestTimeout,
       maxInFlightRequests,
       maxResponseSize,
@@ -165,9 +166,12 @@ module.exports = class Cluster {
       metadataMaxAge,
       metadataRecoveryStrategy,
       metadataRecoveryRebootstrapTriggerMs,
+      drainTimeout: requestTimeout,
     })
     this.committedOffsetsByGroup = offsets
     this.operationsByGroup = operations
+    this.groupRegistry = GroupRegistry.forStores(offsets, operations)
+    this.groupEntries = new Map()
 
     this[PRIVATE.CONNECT] = sharedPromiseTo(async () => {
       return await this.brokerPool.connect()
@@ -217,17 +221,26 @@ module.exports = class Cluster {
    * @returns {Promise<void>}
    */
   async disconnect() {
-    await this.brokerPool.disconnect()
+    try {
+      await this.brokerPool.disconnect()
+    } finally {
+      for (const groupId of this.groupEntries.keys()) this.groupRegistry.release(groupId, this)
+      this.groupEntries.clear()
+    }
   }
 
   /**
+   * Forwards a failed broker's private provenance unchanged. A sourced stale failure never
+   * falls back to address matching; the pool controller owns the current-generation fence.
    * @public
-   * @param {object} destination
-   * @param {String} destination.host
-   * @param {Number} destination.port
+   * @param {object} destination failed endpoint and optional private source
+   * @param {string} destination.host endpoint host
+   * @param {number} destination.port endpoint port
+   * @param {{broker: object, generation: number}} [destination.source] captured failure source
+   * @returns {void}
    */
-  removeBroker({ host, port }) {
-    this.brokerPool.removeBroker({ host, port })
+  removeBroker({ host, port, source }) {
+    this.brokerPool.removeBroker({ host, port, source })
   }
 
   /**
@@ -1027,11 +1040,7 @@ module.exports = class Cluster {
    * @returns {Object}
    */
   committedOffsets({ groupId }) {
-    if (!this.committedOffsetsByGroup.has(groupId)) {
-      this.committedOffsetsByGroup.set(groupId, {})
-    }
-
-    return this.committedOffsetsByGroup.get(groupId)
+    return this.groupEntry(groupId).offsets
   }
 
   /**
@@ -1043,11 +1052,21 @@ module.exports = class Cluster {
    * @returns {OffsetOperations}
    */
   offsetOperations({ groupId }) {
-    if (!this.operationsByGroup.has(groupId)) {
-      this.operationsByGroup.set(groupId, new OffsetOperations())
-    }
+    return this.groupEntry(groupId).ledger
+  }
 
-    return this.operationsByGroup.get(groupId)
+  /**
+   * Acquires the cache/ledger pair once for this Cluster and group lifetime.
+   * @param {string} groupId consumer group
+   * @returns {object} the shared pair
+   */
+  groupEntry(groupId) {
+    let entry = this.groupEntries.get(groupId)
+    if (!entry) {
+      entry = this.groupRegistry.acquire(groupId, this)
+      this.groupEntries.set(groupId, entry)
+    }
+    return entry
   }
 
   /**

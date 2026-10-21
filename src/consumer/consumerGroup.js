@@ -1,3 +1,4 @@
+const { failureSourceOf } = require('../broker/failureSource')
 const sleep = require('../utils/sleep')
 const websiteUrl = require('../utils/websiteUrl')
 const arrayDiff = require('../utils/arrayDiff')
@@ -1492,7 +1493,7 @@ module.exports = class ConsumerGroup {
     }
 
     if (e.name === 'KafkaJSConnectionClosedError') {
-      this.cluster.removeBroker({ host: e.host, port: e.port })
+      this.cluster.removeBroker({ host: e.host, port: e.port, source: failureSourceOf(e) })
       return
     }
 

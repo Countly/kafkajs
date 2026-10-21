@@ -13,6 +13,7 @@ const ConnectionPool = require('../network/connectionPool')
  * @param {Object} [options.ssl]
  * @param {Object} [options.sasl]
  * @param {string} options.clientId
+ * @param {number} [options.drainTimeout] obsolete-resource drain bound
  * @param {number} options.requestTimeout
  * @param {boolean} [options.enforceRequestTimeout]
  * @param {number} [options.connectionTimeout]
@@ -31,6 +32,7 @@ module.exports = ({
   sasl,
   clientId,
   requestTimeout,
+  drainTimeout,
   enforceRequestTimeout,
   connectionTimeout,
   maxInFlightRequests,
@@ -108,6 +110,7 @@ module.exports = ({
         socketFactory,
         connectionTimeout,
         requestTimeout,
+        drainTimeout,
         enforceRequestTimeout,
         maxInFlightRequests,
         maxResponseSize,

@@ -114,7 +114,8 @@ module.exports = class ClassicGroupProtocol {
         }
 
         try {
-          await this.coordinator.heartbeat(payload)
+          const coordinator = await this.liveCoordinator()
+          await coordinator.heartbeat(payload)
         } catch (e) {
           // A heartbeat sent before a rebalance and answered after it is answered about the
           // generation it was sent under, not the one this member holds by then.
@@ -188,6 +189,21 @@ module.exports = class ClassicGroupProtocol {
    */
   async connect() {
     this.coordinator = await this.cluster.findGroupCoordinator({ groupId: this.groupId })
+  }
+
+  /**
+   * The cached coordinator, found again first when it was retired since: a retired broker refuses
+   * every request, and between joins nothing else looks the coordinator up. A coordinator that is
+   * not retired is returned untouched.
+   * @private
+   * @returns {Promise<import('../../../types').Broker>}
+   */
+  async liveCoordinator() {
+    if (this.coordinator.retired === true) {
+      await this.connect()
+    }
+
+    return this.coordinator
   }
 
   /**
@@ -426,6 +442,8 @@ module.exports = class ClassicGroupProtocol {
   }
 
   /**
+   * Sends a heartbeat when the interval has passed, on a coordinator found again if the cached one
+   * was retired. Concurrent calls share one request.
    * @param {{ interval: number }} options
    * @returns {Promise<void>}
    */
@@ -479,6 +497,8 @@ module.exports = class ClassicGroupProtocol {
    * A static member's request carries both ids, so the coordinator checks the pair and removes the
    * instance's current member, or answers `FENCED_INSTANCE_ID` for a stale member id; Java's
    * classic leave sends the member id alone.
+   *
+   * The request goes to a coordinator found again if the cached one was retired.
    * @param {{ leaveGroup?: boolean }} [options] `false` sends no request and only forgets the
    *   member id; `true` and `undefined` send it (nothing calls this for a static member that
    *   leaves by default)
@@ -489,7 +509,8 @@ module.exports = class ClassicGroupProtocol {
     const { groupId, memberId, groupInstanceId, joinCount } = this
 
     if (memberId && leaveGroup !== false) {
-      await this.coordinator.leaveGroup({
+      const coordinator = await this.liveCoordinator()
+      await coordinator.leaveGroup({
         groupId,
         memberId,
         groupInstanceId,

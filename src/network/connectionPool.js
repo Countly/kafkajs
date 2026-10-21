@@ -1,5 +1,8 @@
 const apiKeys = require('../protocol/requests/apiKeys')
 const Connection = require('./connection')
+
+/** Number of slots: Fetch uses the second; every other API uses the first. @type {number} */
+const POOL_SIZE = 2
 const { KafkaJSConnectionError, KafkaJSSASLAuthenticationError } = require('../errors')
 
 // Floor for the post-authentication-failure blackout, applied even when authenticationTimeout
@@ -38,7 +41,7 @@ module.exports = class ConnectionPool {
     // (see BrokerPool#buildConnectionPool), so the blackout survives the rebuild.
     this.authenticationBlackout = options.authenticationBlackout || new Map()
 
-    this.pool = new Array(2).fill().map(
+    this.pool = new Array(POOL_SIZE).fill().map(
       () =>
         new Connection({
           ...options,
@@ -114,11 +117,16 @@ module.exports = class ConnectionPool {
    * Changes whenever any socket in this pool is (re)established. Version information is only
    * valid for the connection it was learned on (KIP-35), so Broker keys its negotiated table on
    * this value rather than on one connection. It counts on from `generationBase`, which a
-   * replacement pool is given so that it never repeats a number its predecessor reached.
+   * replacement pool inherits. Before its first connection it can equal the old baseline;
+   * an established sending generation advances beyond that baseline.
    * @returns {number}
    */
   get generation() {
-    return this.generationBase + this.pool[0].generation + this.pool[1].generation
+    let generation = this.generationBase
+    for (let index = 0; index < this.pool.length; index += 1) {
+      generation += this.pool[index].generation
+    }
+    return generation
   }
 
   /**
@@ -185,7 +193,7 @@ module.exports = class ConnectionPool {
   }
 
   getConnectionByRequest({ request: { apiKey } }) {
-    const index = { [apiKeys.Fetch]: 1 }[apiKey] || 0
+    const index = apiKey === apiKeys.Fetch && POOL_SIZE > 1 ? 1 : 0
     return this.getConnection(index)
   }
 

@@ -1,3 +1,4 @@
+const ConnectionPool = require('../../network/connectionPool')
 const Cluster = require('../../cluster')
 const createSendMessages = require('../sendMessages')
 const createRetry = require('../../retry')
@@ -92,6 +93,17 @@ const topicMessagesTwoLeaders = [
 ]
 
 /**
+ * Builds an unused real pool with recorded cleanup and the production generation shape.
+ * @param {object} options endpoint options
+ * @returns {ConnectionPool} the replacement fixture
+ */
+const createPool = (options) => {
+  const pool = new ConnectionPool({ ...connectionOpts(), ...options })
+  pool.destroy = jest.fn(async () => {})
+  return pool
+}
+
+/**
  * A real `Cluster` with a real `MetadataCache`, primed with the given metadata, with only broker
  * discovery stubbed. `answer` decides what each produce request gets back; it is called with the
  * responding node id, the raw request and a running count of every produce call made so far.
@@ -121,14 +133,33 @@ const createHintCluster = ({
       isConnected: () => true,
       connect: async () => {},
       disconnect: jest.fn(async () => {}),
+      /**
+       * Forwards retirement to this fake's existing disconnect observer.
+       * @param {{drainTimeout?: number}} options close bound supplied by the pool
+       * @returns {Promise<*>} the unchanged disconnect result or rejection
+       */
+      retire(options) {
+        return this.disconnect(options)
+      },
       connectionPool: {
         host: '127.0.0.1',
         port: 9090 + nodeId,
         rack: null,
+        generation: 0,
         destroy: jest.fn(async () => {}),
+        retire() {
+          this.retired = true
+        },
       },
+      /**
+       * Installs an unused pool on this active fixture, continuing its generation baseline.
+       * @param {ConnectionPool} connectionPool replacement pool
+       * @returns {boolean} true for the installed pool; this fixture is never retired
+       */
       replaceConnectionPool(connectionPool) {
+        connectionPool.continueGenerationFrom(this.connectionPool.generation)
         this.connectionPool = connectionPool
+        return true
       },
       metadata: async () => metadataResponse.last,
       produce: async (request) => {
@@ -145,10 +176,7 @@ const createHintCluster = ({
   // feeds the same response back through MetadataCache#update, exercising the stale-refresh
   // guard end to end rather than working around it.
   cluster.brokerPool.metadataExpireAt = Date.now() + 60000
-  cluster.brokerPool.buildConnectionPool = jest.fn(async (destination) => ({
-    ...destination,
-    destroy: jest.fn(async () => {}),
-  }))
+  cluster.brokerPool.buildConnectionPool = jest.fn(async (destination) => createPool(destination))
   cluster.brokerPool.createBroker = jest.fn(({ nodeId, connectionPool, versions }) => ({
     nodeId,
     versions,
@@ -157,6 +185,14 @@ const createHintCluster = ({
     isConnected: () => true,
     connect: async () => {},
     disconnect: async () => {},
+    /**
+     * Forwards retirement to this fake's existing disconnect observer.
+     * @param {{drainTimeout?: number}} options close bound supplied by the pool
+     * @returns {Promise<*>} the unchanged disconnect result or rejection
+     */
+    retire(options) {
+      return this.disconnect(options)
+    },
     metadata: async () => metadataResponse.last,
     produce: async (request) => {
       produced.push({ nodeId, request })
@@ -285,8 +321,8 @@ describe('Producer > KIP-951 leader hint', () => {
   })
 
   test('a hint that moves the seed node updates its connection pool in place, keeping the Broker identity', async () => {
-    // refreshMetadata can adopt the seed Broker into `this.brokers` under a real node id
-    // (brokerPool.js's reduce: `assign(result, { [nodeId]: seedBroker })`); this reproduces that
+    // refreshMetadata can adopt the seed Broker into `this.brokers` under a real node id; this
+    // reproduces that
     // state directly, since the harness's stub brokers never go through a real refresh.
     const { cluster, brokers } = createHintCluster({ answer: acceptAll })
     const pool = cluster.brokerPool
@@ -439,7 +475,7 @@ describe('Producer > KIP-951 leader hint', () => {
       const seed = brokers[1]
       pool.seedBroker = seed
       const oldConnectionPool = seed.connectionPool
-      const built = { host: '127.0.0.5', port: 9199, rack: null, destroy: jest.fn(async () => {}) }
+      const built = createPool({ host: '127.0.0.5', port: 9199, rack: null })
       let finish
       pool.buildConnectionPool = jest.fn(
         () => new Promise((resolve) => (finish = () => resolve(built)))

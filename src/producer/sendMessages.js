@@ -1,3 +1,4 @@
+const { failureSourceOf } = require('../broker/failureSource')
 const describeThrown = require('../network/describeThrown')
 const createRetry = require('../retry')
 const {
@@ -991,7 +992,7 @@ class DrainLoop {
    */
   #sideChannels(e) {
     if (e.name === 'KafkaJSConnectionClosedError') {
-      this.#cluster.removeBroker({ host: e.host, port: e.port })
+      this.#cluster.removeBroker({ host: e.host, port: e.port, source: failureSourceOf(e) })
     }
 
     if (e.currentLeader) {
@@ -1263,7 +1264,7 @@ const createSendMessages = ({
    */
   const recover = async (e, bail, retryCount, retryTime) => {
     if (e.name === 'KafkaJSConnectionClosedError') {
-      cluster.removeBroker({ host: e.host, port: e.port })
+      cluster.removeBroker({ host: e.host, port: e.port, source: failureSourceOf(e) })
     }
 
     // KIP-951: the broker told us which node now leads this partition. Applying it updates

@@ -78,6 +78,14 @@ const stubSeed = (pool, metadata) => {
     isConnected: () => true,
     connect: async () => {},
     disconnect: async () => {},
+    /**
+     * Forwards retirement to this fake's existing disconnect observer.
+     * @param {{drainTimeout?: number}} options close bound supplied by the pool
+     * @returns {Promise<*>} the unchanged disconnect result or rejection
+     */
+    retire(options) {
+      return this.disconnect(options)
+    },
     metadata,
     connectionPool: { host: '127.0.0.1', port: 9092, rack: null },
   }
@@ -87,7 +95,13 @@ const stubSeed = (pool, metadata) => {
     seed = { ...seed }
     pool.seedBroker = seed
   }
-  pool.buildConnectionPool = async (d) => ({ ...d })
+  pool.buildConnectionPool = async (d) => ({
+    ...d,
+    destroy: async () => {},
+    retire() {
+      this.retired = true
+    },
+  })
   return () => pool.seedBroker
 }
 
@@ -430,6 +444,14 @@ describe('BrokerPool > rebootstrap', () => {
             throw new Error('down')
           },
           disconnect: async () => {},
+          /**
+           * Forwards retirement to this fake's existing disconnect observer.
+           * @param {{drainTimeout?: number}} options close bound supplied by the pool
+           * @returns {Promise<*>} the unchanged disconnect result or rejection
+           */
+          retire(options) {
+            return this.disconnect(options)
+          },
         },
       }
       pool.findBroker = async () => {
@@ -457,6 +479,14 @@ describe('BrokerPool > rebootstrap', () => {
             throw new Error('down')
           },
           disconnect: async () => {},
+          /**
+           * Forwards retirement to this fake's existing disconnect observer.
+           * @param {{drainTimeout?: number}} options close bound supplied by the pool
+           * @returns {Promise<*>} the unchanged disconnect result or rejection
+           */
+          retire(options) {
+            return this.disconnect(options)
+          },
         },
       }
       pool.findBroker = async () => {
@@ -487,6 +517,14 @@ describe('BrokerPool > rebootstrap', () => {
             })
           },
           disconnect: async () => {},
+          /**
+           * Forwards retirement to this fake's existing disconnect observer.
+           * @param {{drainTimeout?: number}} options close bound supplied by the pool
+           * @returns {Promise<*>} the unchanged disconnect result or rejection
+           */
+          retire(options) {
+            return this.disconnect(options)
+          },
         },
       }
       pool.findBroker = async () => {
@@ -539,6 +577,14 @@ describe('BrokerPool > rebootstrap', () => {
             throw new Error('down')
           },
           disconnect: async () => {},
+          /**
+           * Forwards retirement to this fake's existing disconnect observer.
+           * @param {{drainTimeout?: number}} options close bound supplied by the pool
+           * @returns {Promise<*>} the unchanged disconnect result or rejection
+           */
+          retire(options) {
+            return this.disconnect(options)
+          },
         },
       }
       pool.findBroker = async () => {
@@ -630,6 +676,14 @@ describe('BrokerPool > rebootstrap', () => {
         isConnected: () => true,
         connect: async () => {},
         disconnect: async () => samples.push(pool.seedBroker),
+        /**
+         * Forwards retirement to this fake's existing disconnect observer.
+         * @param {{drainTimeout?: number}} options close bound supplied by the pool
+         * @returns {Promise<*>} the unchanged disconnect result or rejection
+         */
+        retire(options) {
+          return this.disconnect(options)
+        },
         metadata: async () => ok,
         connectionPool: { host: '127.0.0.1', port: 9092, rack: null },
       }
@@ -640,6 +694,14 @@ describe('BrokerPool > rebootstrap', () => {
           isConnected: () => true,
           connect: async () => {},
           disconnect: async () => samples.push(pool.seedBroker),
+          /**
+           * Forwards retirement to this fake's existing disconnect observer.
+           * @param {{drainTimeout?: number}} options close bound supplied by the pool
+           * @returns {Promise<*>} the unchanged disconnect result or rejection
+           */
+          retire(options) {
+            return this.disconnect(options)
+          },
         },
       }
       pool.buildConnectionPool = async (destination) => {
@@ -721,7 +783,7 @@ describe('BrokerPool > rebootstrap', () => {
       const pool = cluster.brokerPool
       stubSeed(pool, async () => ok)
       const disconnect = jest.fn(async () => {})
-      pool.brokers = { 1: { nodeId: 1, isConnected: () => true, disconnect } }
+      pool.brokers = { 1: { nodeId: 1, isConnected: () => true, disconnect, retire: disconnect } }
       pool.createSeedBroker = async () => {
         throw new Error('bad broker list')
       }
@@ -802,6 +864,14 @@ describe('BrokerPool > rebootstrap', () => {
           disconnect: async () => {
             disconnectStarted = true
             await new Promise((resolve) => setTimeout(resolve, 5))
+          },
+          /**
+           * Forwards retirement to this fake's existing disconnect observer.
+           * @param {{drainTimeout?: number}} options close bound supplied by the pool
+           * @returns {Promise<*>} the unchanged disconnect result or rejection
+           */
+          retire(options) {
+            return this.disconnect(options)
           },
         },
       }

@@ -100,6 +100,13 @@ const createCluster = () => {
       disconnect: jest.fn(async () => {
         connected = false
       }),
+      /**
+       * Retires this fake broker and records the same close as disconnect.
+       * @returns {Promise<void>} when the fake connection is closed
+       */
+      retire() {
+        return this.disconnect()
+      },
       metadata: (topics = []) => answer('Metadata', { topics }, () => answerMetadata(topics)),
       findGroupCoordinator: ({ groupId, coordinatorType }) =>
         answer('FindCoordinator', { groupId, coordinatorType }, () => {

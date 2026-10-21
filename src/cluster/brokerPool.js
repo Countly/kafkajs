@@ -4,7 +4,6 @@ const Broker = require('../broker')
 const MetadataCache = require('./metadataCache')
 const createRetry = require('../retry')
 const shuffle = require('../utils/shuffle')
-const arrayDiff = require('../utils/arrayDiff')
 const sharedPromiseTo = require('../utils/sharedPromiseTo')
 const { CLUSTER_REBOOTSTRAP } = require('./instrumentationEvents')
 const {
@@ -64,6 +63,7 @@ module.exports = class BrokerPool {
    *   single instance every route reads.
    * @param {import("../instrumentation/emitter")|null} [options.instrumentationEmitter]
    * @param {import("../../types").RetryOptions} [options.retry]
+   * @param {number} [options.drainTimeout] obsolete-resource drain bound in milliseconds
    * @param {boolean} [options.allowAutoTopicCreation]
    * @param {number} [options.authenticationTimeout]
    * @param {number} [options.metadataMaxAge]
@@ -84,7 +84,10 @@ module.exports = class BrokerPool {
     metadataMaxAge,
     metadataRecoveryStrategy,
     metadataRecoveryRebootstrapTriggerMs,
+    drainTimeout,
   }) {
+    this.drainTimeout = drainTimeout
+    this.retiredBrokers = new WeakSet()
     this.rootLogger = logger
     this.connectionPoolBuilder = connectionPoolBuilder
     this.metadataMaxAge = metadataMaxAge || 0
@@ -132,9 +135,7 @@ module.exports = class BrokerPool {
     this.rebootstrapArmed = false
 
     this[PRIVATE.REBOOTSTRAP] = sharedPromiseTo(async (reason) => {
-      const brokers = values(this.brokers)
-
-      this.brokers = {}
+      const brokers = new Set([this.seedBroker, ...values(this.brokers)])
       this.metadata = null
       this.metadataExpireAt = null
       this.metadataCache.clear()
@@ -146,7 +147,7 @@ module.exports = class BrokerPool {
       try {
         await this.createSeedBroker()
       } finally {
-        await Promise.all(brokers.map((broker) => broker.disconnect()))
+        for (const broker of brokers) this.closeObsolete(broker)
       }
 
       this.lastRebootstrapAt = Date.now()
@@ -172,15 +173,9 @@ module.exports = class BrokerPool {
    * authentication attempt. The negotiated `versions` table is kept for the same reason it is
    * kept across a reconnect - it belongs to the broker software, not to the metadata.
    *
-   * `this.brokers` is emptied *before* the disconnects are awaited, so a concurrent `findBroker`
-   * or `findConnectedBroker` cannot be handed a broker that is mid-teardown, and the replacement
-   * seed is installed before any of them is torn down, so a concurrent `connect()` never finds
-   * `this.seedBroker` unset. Each disconnect
-   * itself first *drains* that broker's pending requests (`Connection#disconnect` awaits
-   * `requestQueue.waitForPendingRequests()`) before closing the socket, so an in-flight request
-   * normally completes rather than being rejected - the wait is bounded only by
-   * `enforceRequestTimeout`'s interval; with it disabled, a half-open socket can stall this
-   * teardown, and every later caller (`sharedPromiseTo`-joined) stalls with it.
+   * A replacement seed is installed before the captured old identities are detached and
+   * retired. Aliases are deduplicated and replacements installed during the build survive.
+   * Draining proceeds in the background under the configured obsolete-resource bound.
    *
    * Concurrent callers join one in-flight rebootstrap.
    *
@@ -225,16 +220,13 @@ module.exports = class BrokerPool {
    * A `Broker` wraps a connection pool whose address is fixed at construction, so an endpoint
    * whose host or port differs from the cached one is a *replacement*, not an update: a new pool
    * is built (through `buildConnectionPool`, which carries the shared authentication blackout)
-   * and the old broker is disconnected. The replacement is built with the same fields the
+   * and the old broker is retired. The replacement is built with the same fields the
    * metadata refresh path uses, `versions` included, so the request the hint is trying to make
    * fast does not pay a fresh ApiVersions round trip. A new rack alone is written in place.
    *
-   * The old broker is disconnected **in the background**: closing it waits for the requests still
-   * on its socket (up to `requestTimeout`, unbounded with `enforceRequestTimeout: false`), and a
-   * send awaits every hint before it drains any broker, so one moved broker would hold back all
-   * the others. Those requests still finish or time out on the old socket; nothing is written
-   * twice. Nothing else reaches the old broker once it is out of the table, so a failed close is
-   * only logged.
+   * The old broker is retired in the background. It refuses new work while requests already
+   * in flight can finish up to drainTimeout, then its sockets close and queued work rejects.
+   * Recovery never waits for that drain.
    *
    * An unknown node id at the seed broker's address adopts the seed, as `refreshMetadata`'s reduce
    * does, so the seed's address is not connected twice; a seed the table already holds under
@@ -259,7 +251,7 @@ module.exports = class BrokerPool {
    *   `this.brokers` or install another seed, or a second hint for the same node id can already
    *   have written its own replacement. The table (and, for the seed, `this.seedBroker`) is
    *   re-checked before writing; on a mismatch the freshly built pool - never handed to a
-   *   `Broker` - is closed instead of overwriting whatever is there now.
+   *   `Broker` - is retired instead of overwriting whatever is there now.
    *
    * Adding an unknown node id is allowed; removing one is not - only a metadata response may
    * shrink the broker table.
@@ -302,14 +294,12 @@ module.exports = class BrokerPool {
       const connectionPool = await this.buildConnectionPool({ host, port, rack })
 
       if (this.brokers[nodeId] !== broker || (isSeed && this.seedBroker !== broker)) {
-        await connectionPool.destroy()
+        this.closePool(connectionPool)
         continue
       }
 
       if (isSeed) {
-        const oldConnectionPool = broker.connectionPool
-        broker.replaceConnectionPool(connectionPool)
-        this.closeInBackground(oldConnectionPool.destroy())
+        this.replacePool(broker, connectionPool)
         continue
       }
 
@@ -319,8 +309,50 @@ module.exports = class BrokerPool {
         connectionPool,
         nodeId,
       })
-      broker && this.closeInBackground(broker.disconnect())
+      this.closeObsolete(broker)
     }
+  }
+
+  /**
+   * Detaches only aliases of this obsolete identity and retires it once. The active seed is
+   * shared with direct seed users and must be replaced before it can be retired.
+   * @private
+   * @param {import('../broker')|undefined} broker replaced broker
+   * @returns {void} never waits for a drain
+   */
+  closeObsolete(broker) {
+    if (!broker || broker === this.seedBroker) return
+    for (const nodeId of keys(this.brokers)) {
+      if (this.brokers[nodeId] === broker) delete this.brokers[nodeId]
+    }
+    if (this.retiredBrokers.has(broker)) return
+    this.retiredBrokers.add(broker)
+    this.closeInBackground(broker.retire({ drainTimeout: this.drainTimeout }))
+  }
+
+  /**
+   * Installs an unused pool through the Broker's generation and retirement guards, then
+   * retires the replaced pool without awaiting its drain. A retired Broker rejects the
+   * offered pool itself and keeps its current pool attached.
+   * @private
+   * @param {import('../broker')} broker owner whose identity stays current
+   * @param {import('../network/connectionPool')} pool unused replacement pool
+   * @returns {void}
+   */
+  replacePool(broker, pool) {
+    const previous = broker.connectionPool
+    if (broker.replaceConnectionPool(pool)) this.closePool(previous)
+  }
+
+  /**
+   * Fences a replaced or never-installed pool, then drains it in the background.
+   * @private
+   * @param {import('../network/connectionPool')} pool obsolete pool
+   * @returns {void}
+   */
+  closePool(pool) {
+    pool.retire()
+    this.closeInBackground(pool.destroy({ drainTimeout: this.drainTimeout }))
   }
 
   /**
@@ -357,7 +389,7 @@ module.exports = class BrokerPool {
 
   /**
    * Builds a replacement seed broker from the next address the connection-pool builder offers,
-   * installs it, and only then disconnects the one it replaced.
+   * installs it, and only then retires the one it replaced.
    *
    * The order matters: `this.seedBroker` is read without a lock by `connect()`'s retry callback,
    * `hasConnectedBrokers()` and `findConnectedBroker()`'s fallback, so it must never be unset -
@@ -367,15 +399,15 @@ module.exports = class BrokerPool {
    * @returns {Promise<void>}
    */
   async createSeedBroker() {
-    const previousSeedBroker = this.seedBroker
     const connectionPool = await this.buildConnectionPool()
+    const previousSeedBroker = this.seedBroker
 
     this.seedBroker = this.createBroker({
       connectionPool,
       logger: this.rootLogger,
     })
 
-    previousSeedBroker && (await previousSeedBroker.disconnect())
+    this.closeObsolete(previousSeedBroker)
   }
 
   /**
@@ -449,24 +481,33 @@ module.exports = class BrokerPool {
   }
 
   /**
+   * Removes a failed broker only when its identity and established pool generation are current.
+   * An inherited baseline can name an old pre-write refusal, so it cannot authorize removal.
+   * A sourced stale failure never falls back to address matching. Unsourced callers retain it.
    * @public
-   * @param {Object} destination
-   * @param {string} destination.host
-   * @param {number} destination.port
+   * @param {{host: string, port: number, source?: {broker: object, generation: number}}} destination
+   * @returns {void}
    */
-  removeBroker({ host, port }) {
-    const removedBroker = values(this.brokers).find(
-      (broker) => broker.connectionPool.host === host && broker.connectionPool.port === port
+  removeBroker({ host, port, source }) {
+    const broker = source
+      ? source.broker
+      : values(this.brokers).find(
+          (candidate) =>
+            candidate.connectionPool.host === host && candidate.connectionPool.port === port
+        )
+    if (
+      !broker ||
+      !values(this.brokers).includes(broker) ||
+      (source &&
+        (broker.connectionPool.generation !== source.generation ||
+          source.generation <= broker.connectionPool.generationBase))
     )
-
-    if (removedBroker) {
-      delete this.brokers[removedBroker.nodeId]
-      this.metadataExpireAt = null
-
-      if (this.seedBroker.nodeId === removedBroker.nodeId) {
-        this.seedBroker = shuffle(values(this.brokers))[0]
-      }
+      return
+    if (this.seedBroker === broker) {
+      this.seedBroker = shuffle(values(this.brokers).filter((candidate) => candidate !== broker))[0]
     }
+    this.metadataExpireAt = null
+    this.closeObsolete(broker)
   }
 
   /**
@@ -484,7 +525,7 @@ module.exports = class BrokerPool {
    *
    * A cached broker whose host and port the response repeats keeps its object, and with it every
    * reference a caller holds; a new rack is written onto it in place. Only a moved broker is
-   * rebuilt and the old one disconnected.
+   * rebuilt and the old one retired.
    *
    * `findConnectedBroker()` and the seed host/port read happen **inside** the retry callback:
    * a rebootstrap partway through this method (trigger (c), fired from inside
@@ -542,59 +583,48 @@ module.exports = class BrokerPool {
           this.metadataCache.update(metadata, { full: !topics || topics.length === 0 })
           this.metadataExpireAt = Date.now() + this.metadataMaxAge
 
-          const replacedBrokers = []
-
-          // `this.brokers` here is read once, synchronously, as the reduce's starting value - a
-          // rebootstrap that empties it while this reduce is still running is overwritten by the
-          // reduce's own result below. Harmless rather than wrong: `onMetadataSuccess()` still
-          // declines to arm, because by then `this.metadata` is back to whatever the rebootstrap
-          // left it as, not this response.
-          this.brokers = await metadata.brokers.reduce(
-            async (resultPromise, { nodeId, host, port, rack }) => {
-              const result = await resultPromise
-
-              if (result[nodeId]) {
-                if (!hasBrokerMoved(result[nodeId], { host, port })) {
-                  result[nodeId].connectionPool.rack = rack
-                  return result
-                }
-
-                replacedBrokers.push(result[nodeId])
-              }
-
-              if (seedBroker && host === seedHost && port === seedPort) {
-                seedBroker.nodeId = nodeId
-                seedBroker.connectionPool.rack = rack
-                return assign(result, {
-                  [nodeId]: seedBroker,
-                })
-              }
-
-              return assign(result, {
-                [nodeId]: this.createBroker({
-                  logger: this.rootLogger,
-                  versions: this.versions,
-                  connectionPool: await this.buildConnectionPool({ host, port, rack }),
-                  nodeId,
-                }),
-              })
-            },
-            this.brokers
+          const previousBrokers = { ...this.brokers }
+          const freshBrokerIds = new Set(metadata.brokers.map(({ nodeId }) => String(nodeId)))
+          const seedAddressAdvertised = metadata.brokers.some(
+            ({ host, port }) => host === seedHost && port === seedPort
           )
-
-          const freshBrokerIds = metadata.brokers.map(({ nodeId }) => `${nodeId}`).sort()
-          const currentBrokerIds = keys(this.brokers).sort()
-          const unusedBrokerIds = arrayDiff(currentBrokerIds, freshBrokerIds)
-
-          const brokerDisconnects = unusedBrokerIds.map((nodeId) => {
-            const broker = this.brokers[nodeId]
-            return broker.disconnect().then(() => {
-              delete this.brokers[nodeId]
-            })
-          })
-
-          const replacedBrokersDisconnects = replacedBrokers.map((broker) => broker.disconnect())
-          await Promise.all([...brokerDisconnects, ...replacedBrokersDisconnects])
+          for (const { nodeId, host, port, rack } of metadata.brokers) {
+            const previous = previousBrokers[nodeId]
+            if (this.brokers[nodeId] !== previous || this.seedBroker !== seedBroker) continue
+            if (previous && !hasBrokerMoved(previous, { host, port })) {
+              previous.connectionPool.rack = rack
+              continue
+            }
+            if (seedBroker && host === seedHost && port === seedPort) {
+              seedBroker.nodeId = nodeId
+              seedBroker.connectionPool.rack = rack
+              this.brokers[nodeId] = seedBroker
+              this.closeObsolete(previous)
+              continue
+            }
+            const connectionPool = await this.buildConnectionPool({ host, port, rack })
+            if (this.brokers[nodeId] !== previous || this.seedBroker !== seedBroker) {
+              this.closePool(connectionPool)
+              continue
+            }
+            if (previous && previous === seedBroker && !seedAddressAdvertised) {
+              this.replacePool(previous, connectionPool)
+            } else {
+              this.brokers[nodeId] = this.createBroker({
+                logger: this.rootLogger,
+                versions: this.versions,
+                connectionPool,
+                nodeId,
+              })
+              this.closeObsolete(previous)
+            }
+          }
+          for (const [nodeId, previous] of Object.entries(previousBrokers)) {
+            if (!freshBrokerIds.has(nodeId) && this.brokers[nodeId] === previous) {
+              if (previous === this.seedBroker) delete this.brokers[nodeId]
+              else this.closeObsolete(previous)
+            }
+          }
         } catch (e) {
           if (
             e.type === 'LEADER_NOT_AVAILABLE' ||
@@ -837,7 +867,8 @@ module.exports = class BrokerPool {
           // replaceConnectionPool also resets versionsGeneration, so the next connect() always
           // re-negotiates against the replacement pool (KIP-35 rule 7) rather than comparing
           // against the generation the old, discarded pool had reached.
-          broker.replaceConnectionPool(
+          this.replacePool(
+            broker,
             await this.buildConnectionPool({
               host: broker.connectionPool.host,
               port: broker.connectionPool.port,

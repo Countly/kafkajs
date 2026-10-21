@@ -411,6 +411,7 @@ says so, `groupProtocol: 'consumer'`.
   membership error never restart, whatever the callback returns (see "A fatal membership error
   never restarts under `groupProtocol: 'consumer'`"). *What to do:* check that a
   `restartOnFailure` you already pass returns what you want for non-retriable errors too.
+  A public disconnect that completes during crash cleanup also cancels the pending restart. The crash event reports `restart: false`; a later explicit connect/run can reuse the consumer.
 
 - **`groupInstanceId` makes a static member that does not leave the group on
   `consumer.disconnect()`.**
@@ -457,6 +458,7 @@ says so, `groupProtocol: 'consumer'`.
   reset. Partitions you paused stay paused across a recreation, because pausing is user intent
   rather than offset state. There is no opt-out. An application that relied on offsets surviving a
   topic recreation must stop relying on it; it was never a guarantee the broker made.
+  A reset observed while crash cleanup or `restartOnFailure` is pending is kept for the next run. A public disconnect clears the pending resets and removes the listener. The group's shared cache and ledger remain while another participant, attached reset table or open operation still needs them; after the last lifetime ends, both entries are released.
 
 - **A fetch error on one partition no longer discards the whole response or rejoins the group.** A
   leader move, an unknown topic id, or an offset not yet available on a follower used to fail the
@@ -1160,6 +1162,7 @@ now logged.
 
 - **A response that is too large is refused with reason `too-large`.** If a deliberately large response (a consumer `maxBytes` near 100 MiB, a very large metadata response) is refused with reason `too-large`, raise `maxResponseSize` in the `Kafka` options (up to 2147483647). `KafkaJSInvalidFrameError` names the four size bytes when they read `HTTP` or look like a TLS alert: check the broker port and the `ssl` setting.
 - **A request timeout now closes its connection.** Code that retries `KafkaJSRequestTimeoutError` also sees `KafkaJSConnectionClosedError` for requests that were healthy on the same connection; both are retriable. A mutation written before the close has an unknown outcome, exactly as after any timeout (an idempotent producer resends it in order, a transaction commit stays unknown). There is no setting that keeps a connection open after a timeout; `enforceRequestTimeout: false` removes the timeout and with it the close.
+- **Obsolete connections drain for at most `requestTimeout`.** Nothing to do. With `enforceRequestTimeout: false` a request that never answered used to stall recovery indefinitely. A JoinGroup or long-poll Fetch with a per-API allowance above `requestTimeout` fails at the bound on an obsolete connection and is retried. Public `disconnect()` remains reusable and now also waits at most `requestTimeout` for requests in flight (the rest fail with a retriable `KafkaJSConnectionClosedError`); a retired broker object cannot reconnect. A mutation already transmitted before the connection closes still has an unknown outcome.
 
 ### Protocol
 

@@ -18,6 +18,8 @@ class OffsetOperations {
     this.cells = 0
     this.clock = 0
     this.intent = 0
+    this.openTickets = 0
+    this.onIdle = null
     /** @type {Set<{discharge: (topic: string, partition: number) => void}>} */
     this.attached = new Set()
   }
@@ -30,6 +32,7 @@ class OffsetOperations {
    * @returns {object} a ticket, open until `end`
    */
   begin(cells, { mutation = false } = {}) {
+    this.openTickets += 1
     const ticket = {
       began: ++this.clock,
       intent: mutation ? ++this.intent : 0,
@@ -71,6 +74,7 @@ class OffsetOperations {
     }
 
     ticket.ended = true
+    this.openTickets -= 1
     for (const { topic, partition } of ticket.cells) {
       const partitions = this.topics.get(topic)
       const state = partitions.get(partition)
@@ -84,6 +88,7 @@ class OffsetOperations {
         }
       }
     }
+    this.notifyIdle()
   }
 
   /**
@@ -171,7 +176,24 @@ class OffsetOperations {
     this.attached.add(obligations)
     return () => {
       this.attached.delete(obligations)
+      this.notifyIdle()
     }
+  }
+
+  /**
+   * Whether no ticket (including an empty ticket) or attached table still owns this ledger.
+   * @returns {boolean} true only after every lifetime has ended
+   */
+  isIdle() {
+    return this.openTickets === 0 && this.attached.size === 0
+  }
+
+  /**
+   * Notifies the registry at settlement boundaries; standalone ledgers have no callback.
+   * @returns {void}
+   */
+  notifyIdle() {
+    if (this.isIdle()) this.onIdle?.()
   }
 
   /**

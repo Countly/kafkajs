@@ -644,6 +644,7 @@ Adopted upstream PRs are credited here by number as they land (Phase 2 onward).
 - **A throwing `POLL_INTERVAL_EXCEEDED` listener no longer prevents the consumer from leaving and rejoining; its error is logged.** Cleanup continues even if another cleanup step or its logger throws.
 - **A late accepted join under the consumer protocol is counted, and no redundant rebalance round follows a fenced join or a stale loss.** Stored loss notifications are also compared with their ownership token when the numeric generation is reused.
 - **A consumer-protocol rejoin waits for the leave of its current membership to settle.** Overlapping reconciliation no longer attempts an illegal member-state transition.
+- Connections replaced by a rebootstrap, a metadata refresh or a leader hint, and a broker removed after a connection failure, are retired: they drain in the background for at most `requestTimeout`, the rest of their requests fail with a retriable `KafkaJSConnectionClosedError`, the socket is destroyed, and a retired broker object can no longer reconnect. Recovery no longer waits for the drain, and a public `disconnect()` waits at most `requestTimeout` for requests in flight.
 
 #### Fixes
 
@@ -655,6 +656,8 @@ Adopted upstream PRs are credited here by number as they land (Phase 2 onward).
 - A Fetch record batch of more than about 125 000 records (a highly compressed batch can hold that many) no longer fails with `RangeError: Maximum call stack size exceeded` while it is decoded: its records are appended one at a time, not passed to `push` as call arguments; a legacy compressed message set (magic 0 or 1) of that many messages, which a 4.x broker can still return from data written before an upgrade, is decoded the same way.
 - A record header named `__proto__`, `constructor`, `toString` or `hasOwnProperty` no longer decodes to an array that holds the inherited property of that name: it is the header's value, and a repeated key still makes an array. The Fetch response decoders from v12 return an empty list, not `null`, for a list of topics or partitions that a response sent as a null compact array.
 - Forty-three places in the response decoders no longer fail with a `TypeError` on a body the definition does not allow. Thirty-five compact list reads in the AddPartitionsToTxn, AlterConfigs, AlterPartitionReassignments, CreateAcls, DeleteAcls, DeleteRecords, DescribeConfigs, DescribeGroups, ListOffsets, OffsetCommit, OffsetFetch, Produce and TxnOffsetCommit codecs now read a list of length zero as empty, as the classic codecs read −1; an OffsetFetch answer with no group raises the invariant violation it always raised. A topic-name sort in the CreateTopics, CreatePartitions, DeleteRecords and DeleteTopics answers no longer fails on a topic without a name, and a DeleteRecords failure for a partition the request did not name no longer fails reading the requested offset.
+- Consumers keep topic-recreation resets observed during crash cleanup and do not restart after a public disconnect that completes during cleanup or while `restartOnFailure` is deciding.
+- Group offset-cache and operation-ledger entries are released after the last participant, attached reset table and open ticket finish. Disconnecting one participant preserves active peers and unfinished transaction fences.
 
 #### Additions
 

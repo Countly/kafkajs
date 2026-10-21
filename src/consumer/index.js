@@ -1,3 +1,4 @@
+const { failureSourceOf } = require('../broker/failureSource')
 const Long = require('../utils/long')
 const { initialRetryTime } = require('../retry/defaults')
 const ConsumerGroup = require('./consumerGroup')
@@ -362,11 +363,11 @@ module.exports = (params) => {
       })
       throw e
     } finally {
-      removeTopicRecreatedListener && removeTopicRecreatedListener()
-      removeTopicRecreatedListener = null
       if (keepResets) {
         obligations.unlink()
       } else {
+        removeTopicRecreatedListener && removeTopicRecreatedListener()
+        removeTopicRecreatedListener = null
         obligations.clear()
       }
     }
@@ -594,20 +595,17 @@ module.exports = (params) => {
       })
 
       if (e.name === 'KafkaJSConnectionClosedError') {
-        cluster.removeBroker({ host: e.host, port: e.port })
+        cluster.removeBroker({ host: e.host, port: e.port, source: failureSourceOf(e) })
       }
 
       // Cleaning up must never suppress the CRASH event: it is the only supervision signal a
       // user gets, because consumer.run() has already resolved by the time the runner dies.
       // shutDown() already logs this failure itself (and rethrows), so there is nothing
       // further to log here; just make sure it cannot stop the CRASH event from firing.
+      const crashStopGeneration = stopGeneration + 1
       try {
         await shutDown(undefined, { keepResets: true })
       } catch {}
-
-      // A separate stop() in between (a user disconnect()) means the consumer is no longer
-      // meant to run, however long restartOnFailure below takes to decide.
-      const stopGenerationAfterCleanup = stopGeneration
 
       const getOriginalCause = (error) => {
         if (error.cause) {
@@ -649,9 +647,9 @@ module.exports = (params) => {
         shouldRestart = false
       }
 
-      if (shouldRestart && stopGeneration !== stopGenerationAfterCleanup) {
-        // The user called disconnect()/stop() while restartOnFailure was still deciding: do
-        // not resurrect a consumer they believe is gone.
+      if (shouldRestart && stopGeneration !== crashStopGeneration) {
+        // The user called disconnect()/stop() during the crash cleanup or while restartOnFailure
+        // was deciding: do not resurrect a consumer they believe is gone.
         logger.warn(
           'Consumer was stopped while deciding whether to restart after a crash; not restarting',
           { groupId }
