@@ -52,6 +52,7 @@ What to change to install the package and run it on a Kafka 4.x cluster.
 - **The client now identifies itself to brokers as `countly-kafkajs`** (KIP-511), carrying this
   package's version. Operators watching a broker's `clientSoftwareName`/`clientSoftwareVersion`
   metrics or request logs will see this name where kafkajs 2.2.4 previously showed `unknown`.
+- **A closed connection's socket is destroyed, not ended.** A connection that closes (a timeout, a replaced or retired broker, `disconnect()`) now calls `socket.destroy()` where 2.2.4 called `socket.end()`. The default socket factory is unaffected. *What to do:* if you pass a custom `socketFactory` that returns a partial `net.Socket`, give it a `destroy()` method.
 
 ### Producer
 

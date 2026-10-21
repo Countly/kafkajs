@@ -52,6 +52,7 @@ describe('Network > Connection', () => {
         const socketFactory = () => {
           const socket = new EventEmitter()
           socket.end = () => {}
+          socket.destroy = () => {}
           socket.unref = () => {}
           return socket
         }
@@ -216,6 +217,7 @@ describe('Network > Connection', () => {
           })
         },
         end() {},
+        destroy() {},
         unref() {},
       }
       const before = Date.now()
