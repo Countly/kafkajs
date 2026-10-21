@@ -1,6 +1,32 @@
 const { KafkaJSConnectionError, KafkaJSNonRetriableError } = require('../errors')
 const ConnectionPool = require('../network/connectionPool')
 
+/** `[host]:port` or `host:port`, the host holding no colon and no bracket in the second form. */
+const BROKER_ADDRESS = /^(?:\[([^\]]+)\]|([^:[\]]+)):(\d+)$/
+
+/**
+ * Splits a bootstrap address into its host and port. An IPv6 literal must be bracketed
+ * (`[::1]:9092`); the brackets are not part of the host handed to the socket factory.
+ * @param {string} text the address as configured
+ * @returns {{ host: string, port: number }}
+ * @throws {KafkaJSNonRetriableError} for an unbracketed IPv6 literal, or a port that is missing,
+ *   not an integer, or outside 1 to 65535
+ */
+const parseBroker = (text) => {
+  const match = BROKER_ADDRESS.exec(text)
+  const port = match ? Number(match[3]) : NaN
+
+  if (!match || port < 1 || port > 65535) {
+    const reason =
+      !text.startsWith('[') && text.split(':').length > 2
+        ? 'an IPv6 host must be written [::1]:9092'
+        : 'expected host:port with a port from 1 to 65535'
+    throw new KafkaJSNonRetriableError(`Failed to connect: invalid broker "${text}", ${reason}`)
+  }
+
+  return { host: match[1] ?? match[2], port }
+}
+
 /**
  * @typedef {Object} ConnectionPoolBuilder
  * @property {(destination?: { host?: string, port?: number, rack?: string }) => Promise<ConnectionPool>} build
@@ -63,6 +89,7 @@ module.exports = ({
             `Failed to connect: broker at index ${index} is invalid "${typeof broker}"`
           )
         }
+        parseBroker(broker)
       })
     }
   }
@@ -94,10 +121,9 @@ module.exports = ({
       if (!host) {
         const list = await getBrokers()
 
-        const randomBroker = list[index++ % list.length]
-
-        host = randomBroker.split(':')[0]
-        port = Number(randomBroker.split(':')[1])
+        const seed = parseBroker(list[index++ % list.length])
+        host = seed.host
+        port = seed.port
       }
 
       return new ConnectionPool({

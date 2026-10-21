@@ -13,6 +13,8 @@ const {
   waitForConsumerToJoinGroup,
   testIfKafkaAtLeast_0_11,
 } = require('testHelpers')
+const { createScriptedCluster } = require('../../../testHelpers/scriptedCluster')
+const { KafkaJSRequestTimeoutError } = require('../../errors')
 
 describe('Consumer > Instrumentation Events', () => {
   let topicName, groupId, cluster, producer, consumer, consumer2, message, emitter
@@ -529,98 +531,6 @@ describe('Consumer > Instrumentation Events', () => {
     })
   })
 
-  // Quarantined (flaky): requestTimeout of 1ms races a sub-millisecond loopback round trip, so on a
-  // fast host every request can complete before the timeout fires. See QUARANTINE.md.
-  it.skip('emits request timeout events', async () => {
-    cluster = createCluster({
-      instrumentationEmitter: emitter,
-      requestTimeout: 1,
-      enforceRequestTimeout: true,
-    })
-    const requestListener = jest.fn().mockName('request_timeout')
-
-    consumer = createTestConsumer({ cluster })
-    consumer.on(consumer.events.REQUEST_TIMEOUT, requestListener)
-
-    await consumer
-      .connect()
-      .then(() => consumer.run({ eachMessage: () => true }))
-      .catch((e) => e)
-
-    expect(requestListener).toHaveBeenCalledWith({
-      id: expect.any(Number),
-      timestamp: expect.any(Number),
-      type: 'consumer.network.request_timeout',
-      payload: {
-        apiKey: expect.any(Number),
-        apiName: expect.any(String),
-        apiVersion: expect.any(Number),
-        broker: expect.any(String),
-        clientId: expect.any(String),
-        correlationId: expect.any(Number),
-        createdAt: expect.any(Number),
-        pendingDuration: expect.any(Number),
-        sentAt: expect.any(Number),
-      },
-    })
-  })
-
-  /**
-   * This test is too flaky, we need to think about a better way of testing this.
-   * Skipping until we have a better plan
-   */
-  it.skip('emits request queue size events', async () => {
-    const cluster = createCluster({
-      instrumentationEmitter: emitter,
-      maxInFlightRequests: 1,
-    })
-
-    const requestListener = jest.fn().mockName('request_queue_size')
-
-    consumer = createTestConsumer({ cluster })
-    consumer.on(consumer.events.REQUEST_QUEUE_SIZE, requestListener)
-
-    consumer2 = createTestConsumer({ cluster })
-    consumer2.on(consumer2.events.REQUEST_QUEUE_SIZE, requestListener)
-
-    await Promise.all([
-      consumer
-        .connect()
-        .then(() => consumer.run({ eachMessage: () => true }))
-        .catch((e) => e),
-      consumer2
-        .connect()
-        .then(() => consumer.run({ eachMessage: () => true }))
-        .catch((e) => e),
-    ])
-
-    // add more concurrent requests to make we increate the requests
-    // on the queue
-    await Promise.all([
-      consumer.describeGroup(),
-      consumer.describeGroup(),
-      consumer.describeGroup(),
-      consumer.describeGroup(),
-      consumer2.describeGroup(),
-      consumer2.describeGroup(),
-      consumer2.describeGroup(),
-      consumer2.describeGroup(),
-    ])
-
-    await consumer2.disconnect()
-
-    expect(requestListener).toHaveBeenCalledWith({
-      id: expect.any(Number),
-      timestamp: expect.any(Number),
-      type: 'consumer.network.request_queue_size',
-      payload: {
-        broker: expect.any(String),
-        clientId: expect.any(String),
-        queueSize: expect.any(Number),
-      },
-    })
-  })
-
   it('emits received unsubscribed topics events', async () => {
     const topicNames = [`test-topic-${secureRandom()}`, `test-topic-${secureRandom()}`]
     const otherTopic = `test-topic-${secureRandom()}`
@@ -697,5 +607,103 @@ describe('Consumer > Instrumentation Events', () => {
         topicsNotSubscribed: [topicNames[0]],
       },
     })
+  })
+})
+
+describe('Consumer > Instrumentation Events > on the scripted cluster', () => {
+  const NODE = { id: 0, host: 'node', port: 9092 }
+  let scripted, cluster, consumer
+
+  /**
+   * A consumer on a cluster that answers in process: every connection is to `NODE`, so the
+   * request of a test is the only one on its connection.
+   * @param {object} [options] over the cluster's options
+   * @returns {Promise<{ emitter: InstrumentationEventEmitter, broker: object }>}
+   */
+  const connect = async (options = {}) => {
+    const emitter = new InstrumentationEventEmitter()
+    scripted = createScriptedCluster({ nodes: [NODE] })
+    cluster = createCluster(
+      { socketFactory: scripted.socketFactory, instrumentationEmitter: emitter, ...options },
+      [`${NODE.host}:${NODE.port}`]
+    )
+    consumer = createConsumer({
+      cluster,
+      groupId: `consumer-group-id-${secureRandom()}`,
+      logger: newLogger(),
+      instrumentationEmitter: emitter,
+    })
+    await cluster.connect()
+    return { emitter, broker: cluster.brokerPool.seedBroker }
+  }
+
+  afterEach(async () => {
+    jest.useRealTimers()
+    await cluster.disconnect()
+    scripted.assertClean()
+  })
+
+  it('emits request timeout events', async () => {
+    jest.useFakeTimers({ doNotFake: ['setImmediate', 'nextTick', 'queueMicrotask'] })
+    const { broker } = await connect({ requestTimeout: 100, enforceRequestTimeout: true })
+    const requestListener = jest.fn().mockName('request_timeout')
+    consumer.on(consumer.events.REQUEST_TIMEOUT, requestListener)
+    const [socket] = scripted.sockets()
+    const held = scripted.schedule.hold({ api: 'Metadata' })
+
+    const metadata = broker.metadata([]).catch((error) => error)
+    await held.arrived()
+    await jest.advanceTimersByTimeAsync(200)
+
+    expect(await metadata).toBeInstanceOf(KafkaJSRequestTimeoutError)
+    expect(requestListener).toHaveBeenCalledTimes(1)
+    expect(requestListener).toHaveBeenCalledWith({
+      id: expect.any(Number),
+      timestamp: expect.any(Number),
+      type: 'consumer.network.request_timeout',
+      payload: {
+        apiKey: 3,
+        apiName: 'Metadata',
+        apiVersion: 13,
+        broker: 'node:9092',
+        clientId: expect.any(String),
+        correlationId: held.call.correlationId,
+        createdAt: expect.any(Number),
+        pendingDuration: expect.any(Number),
+        sentAt: expect.any(Number),
+      },
+    })
+    expect(socket.destroyed).toBe(true)
+    expect(broker.connectionPool.pool[0].isConnected()).toBe(false)
+    held.release()
+  })
+
+  it('emits request queue size events', async () => {
+    const { broker } = await connect({ maxInFlightRequests: 1 })
+    const events = []
+    consumer.on(consumer.events.REQUEST_QUEUE_SIZE, (event) => events.push(event))
+    const held = scripted.schedule.hold({ api: 'Metadata' })
+
+    const calls = Array.from({ length: 4 }, () => broker.metadata([]))
+    const settled = Promise.allSettled(calls)
+    await held.arrived()
+    for (let turn = 0; turn < 100 && events.length < 3; turn++) {
+      await new Promise(setImmediate)
+    }
+    const queued = events.map(({ payload }) => payload.queueSize)
+    held.release()
+    const outcomes = await settled
+
+    expect(queued).toEqual([1, 2, 3])
+    expect(outcomes.map(({ status }) => status)).toEqual(Array(4).fill('fulfilled'))
+    expect(events.map(({ payload }) => payload.queueSize)).toEqual([1, 2, 3, 2, 1, 0])
+    for (const { type, payload } of events) {
+      expect(type).toBe('consumer.network.request_queue_size')
+      expect(payload).toEqual({
+        broker: 'node:9092',
+        clientId: expect.any(String),
+        queueSize: expect.any(Number),
+      })
+    }
   })
 })

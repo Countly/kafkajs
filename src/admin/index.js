@@ -18,7 +18,12 @@ const { staleMetadata, staleLeaderEpoch, createErrorFromCode } = require('../pro
 const { GROUP_TYPES } = require('../protocol/groupTypes')
 const { createGroupDescriptions } = require('./groupDescriptions')
 const { AggregateOutcome, isPerItemFailure } = require('./aggregateOutcome')
-const { readTopicPages, toTopicsMetadata } = require('./describeTopicsByPartition')
+const {
+  readTopicPages,
+  toTopicsMetadata,
+  withReadDeadline,
+  checkDeadline,
+} = require('./describeTopicsByPartition')
 const CONFIG_RESOURCE_TYPES = require('../protocol/configResourceTypes')
 const ALTER_CONFIG_OP_TYPES = require('../protocol/alterConfigOpTypes')
 const ACL_RESOURCE_TYPES = require('../protocol/aclResourceTypes')
@@ -1211,32 +1216,43 @@ module.exports = ({
    * failure of the request itself that is marked retriable (a connection that dropped, a request
    * that timed out) refreshes the metadata and asks again, on whichever connected broker the
    * cluster then returns, as `cluster.metadata` does with each broker in turn; a topic's own error
-   * is never retried: it rejects once every page is in.
+   * is never retried: it rejects once every page is in. A topic recreated between pages is read
+   * again from the start the same way.
+   *
+   * The whole read, the metadata refresh and every attempt included, runs under one deadline of
+   * 60 s taken here: at the deadline the call rejects with `KafkaJSTimeout` whatever is stalled,
+   * also with `enforceRequestTimeout: false`, no later attempt or page starts and a late page
+   * changes nothing. The supported escape is the Metadata path, `useDescribeTopicPartitions: false`.
    * @param {string[]} names
    * @returns {Promise<TopicsMetadata>}
    * @throws {KafkaJSServerDoesNotSupportApiKey} when the broker does not offer the API
    * @throws {KafkaJSNumberOfRetriesExceeded} when a retriable failure outlives the retry budget
+   * @throws {KafkaJSTimeout} when the read is not done at its deadline
    */
   const describeByPartitions = async (names) => {
     const retrier = createRetry(retry)
-    const rows = await retrier(async (bail, retryCount, retryTime) => {
-      try {
-        if (retryCount > 0) {
-          await cluster.refreshMetadata()
-        } else {
-          await cluster.refreshMetadataIfNecessary()
-        }
+    const rows = await withReadDeadline((deadline) =>
+      retrier(async (bail, retryCount, retryTime) => {
+        try {
+          checkDeadline(deadline)
 
-        return await readTopicPages(await cluster.findConnectedBroker(), names)
-      } catch (e) {
-        if (e.retriable === true) {
-          logger.warn('Could not describe topics', { error: e.message, retryCount, retryTime })
-          throw e
-        }
+          if (retryCount > 0) {
+            await cluster.refreshMetadata()
+          } else {
+            await cluster.refreshMetadataIfNecessary()
+          }
 
-        bail(e)
-      }
-    })
+          return await readTopicPages(await cluster.findConnectedBroker(), names, deadline)
+        } catch (e) {
+          if (e.retriable === true) {
+            logger.warn('Could not describe topics', { error: e.message, retryCount, retryTime })
+            throw e
+          }
+
+          bail(e)
+        }
+      })
+    )
 
     return toTopicsMetadata(rows)
   }
@@ -1259,7 +1275,8 @@ module.exports = ({
    * leader is returned with `leader: -1` instead of being waited for (Kafka 4.1.2 and 4.3 brokers
    * leave its `partitionErrorCode` at 0; a non-zero code is passed through), and a topic that does
    * not exist fails the call rather than being created. A failed request is retried on the `retry`
-   * budget, as the other admin calls are. A broker that does not offer the API is asked through
+   * budget, as the other admin calls are, and the whole read has one deadline of 60 s, after which
+   * it rejects with `KafkaJSTimeout`. A broker that does not offer the API is asked through
    * Metadata after all. The option applies only to topics named explicitly: empty or omitted `topics` go through Metadata.
    *
    * @see https://cwiki.apache.org/confluence/display/KAFKA/KIP-966%3A+Eligible+Leader+Replicas

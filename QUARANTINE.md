@@ -1,17 +1,19 @@
 # Quarantined tests
 
-Tests skipped while bringing the fork up on Apache Kafka 4.x (Phase 1, Task 9). Every row is a
-`test.skip` / `it.skip` in the named spec, marked in-file with a comment pointing here. No file
-under `src/` other than `*.spec.js` and `__snapshots__/*.snap` was changed to make the suite green.
+Tests skipped while bringing the fork up on Apache Kafka 4.x. A quarantined test is a
+`test.skip` / `it.skip` in its spec, marked in-file with a comment pointing here, and is listed
+below until it is rewritten. No file under `src/` other than `*.spec.js` and
+`__snapshots__/*.snap` was changed to make the suite green.
 
-| Spec | Test | Reason | Class | Owner phase |
-|---|---|---|---|---|
-| `src/consumer/__tests__/instrumentationEvents.spec.js` | Consumer > Instrumentation Events &gt; emits request timeout events | flaky: `requestTimeout: 1` races a sub-millisecond loopback round trip, so the timeout often never fires (`Number of calls: 0`); observed once in ~12 group runs | (c) | Phase 2 (rewrite: drive the timeout from a stubbed socket instead of a 1 ms budget) |
-| `src/broker/__tests__/listPartitionReassignments.spec.js` | Broker > alterPartitionReassignments &gt; request | flaky: the assertion requires the reassignment to still be *in flight* (`addingReplicas: [2], removingReplicas: [1]`), but the partition is empty and the controller completes the reassignment in milliseconds, so under load the list request arrives afterwards and `response.topics` is `[]` (`TypeError: Cannot read properties of undefined (reading 'partitions')`). Observed once in ~7 broker-group runs; 8/8 green when the spec runs alone, i.e. it fails exactly when the group is slow — which is the CI condition. Cannot be stabilised from test infra: replication throttles do not hold an empty partition. The v0 response decoder is still covered by `src/protocol/requests/listPartitionReassignments/v0/response.spec.js` | (c) | Phase 2 (rewrite: produce data into the partition and apply a follower replication throttle so the reassignment stays pending, or assert the completed shape instead) |
+No test is quarantined. The last three skipped specs were rewritten with controlled timing and
+run again: the request timeout event and the request queue size events
+(`src/consumer/__tests__/instrumentationEvents.spec.js`) on the in-process scripted cluster, and
+the partition reassignment listing (`src/broker/__tests__/listPartitionReassignments.spec.js`)
+as its completed shape on the live cluster and its in-flight shape on the scripted cluster.
 
 ## Root causes
 
-- **R1 — auto topic creation / metadata propagation (retired Phase 2, task 25).** In KRaft the
+- **R1 — auto topic creation / metadata propagation (retired).** In KRaft the
   broker answers a `Metadata` request for a not-yet-created topic with `UNKNOWN_TOPIC_OR_PARTITION`
   and creates the topic asynchronously through the controller; ZooKeeper-era brokers created it
   inline and answered `LEADER_NOT_AVAILABLE`. `BrokerPool#refreshMetadata` (`src/cluster/brokerPool.js`)
@@ -37,9 +39,4 @@ under `src/` other than `*.spec.js` and `__snapshots__/*.snap` was changed to ma
 `describeIfOauthbearerDisabled`), which select tests by `KAFKA_VERSION` and `OAUTHBEARER_ENABLED`.
 Those are pre-existing and unrelated to this task.
 
-There is also one pre-existing upstream skip that this task did not add and does not own:
-`src/consumer/__tests__/instrumentationEvents.spec.js` — `emits request queue size events`
-(commented "This test is too flaky, we need to think about a better way of testing this").
-
-Counting check: `grep -rn '\.skip(' --include='*.spec.js' src/` returns 3 — the 2 rows above plus
-that one pre-existing skip.
+Counting check: `grep -rn '\.skip(' --include='*.spec.js' src/` returns 0.

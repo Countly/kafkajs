@@ -8,6 +8,7 @@ const brokerRanges = require('../../../scripts/protocol/brokerRanges.json')
 const { rangeOf } = require('../../../scripts/e2e/apiVersionsProbe')
 const { readLog, committedRecords } = require('../../../testHelpers/rawLog')
 const {
+  connectionOpts,
   createConnectionPool,
   createTopic,
   newLogger,
@@ -18,6 +19,7 @@ const {
   wireVersionsOf,
 } = require('testHelpers')
 const { problemsOf } = require('../../../scripts/evidence/verify')
+const { CALLS, LIMIT, overload } = require('../../network/__tests__/fixtures/inFlightOverload')
 const {
   sleep,
   waitForCondition,
@@ -578,6 +580,26 @@ describeFloor('Kafka floor core (live)', () => {
       expect(cause).toMatchObject({ type: 'UNKNOWN_TOPIC_OR_PARTITION' })
       expect(absent.every(Boolean)).toBe(true)
     })
+
+    member(
+      `${CALLS} concurrent Metadata calls keep at most ${LIMIT} in flight and all resolve`,
+      async () => {
+        const topic = await freshTopic('max-in-flight')
+        const { host, port, socketFactory } = connectionOpts()
+        const outcome = await overload({ host, port, socketFactory, topics: [topic] })
+        writeEvidence(EVIDENCE, {
+          case: 'F08',
+          member: 'max-in-flight',
+          calls: CALLS,
+          maxInFlightRequests: LIMIT,
+          ...outcome,
+        })
+
+        expect(outcome.resolved).toBe(CALLS)
+        expect(outcome.maxInFlight).toBeLessThanOrEqual(LIMIT)
+        expect(outcome.maxInFlight).toBeGreaterThan(1)
+      }
+    )
   })
 
   test('every evidence line of this run carries the stamps a verifier checks', () => {

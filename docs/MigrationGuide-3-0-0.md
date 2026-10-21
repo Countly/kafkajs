@@ -53,6 +53,7 @@ What to change to install the package and run it on a Kafka 4.x cluster.
   package's version. Operators watching a broker's `clientSoftwareName`/`clientSoftwareVersion`
   metrics or request logs will see this name where kafkajs 2.2.4 previously showed `unknown`.
 - **A closed connection's socket is destroyed, not ended.** A connection that closes (a timeout, a replaced or retired broker, `disconnect()`) now calls `socket.destroy()` where 2.2.4 called `socket.end()`. The default socket factory is unaffected. *What to do:* if you pass a custom `socketFactory` that returns a partial `net.Socket`, give it a `destroy()` method.
+- **Write IPv6 bootstrap hosts in brackets.** `brokers: ['[::1]:9092']` now works; `'::1:9092'` and an address without a valid port (1 to 65535) fail the first connect with `KafkaJSNonRetriableError` naming the address. *What to do:* bracket IPv6 literals and check the port of every entry of `brokers`, because every entry is now checked, not only the one in use.
 
 ### Producer
 
@@ -1043,6 +1044,7 @@ Group visibility and the admin client.
   topic can go; code that reads `error.errors` finds the items refused for good first (when
   nothing was refused for good and the retries ran out on failed items, `error.cause.errors` lists
   them); `retry: { retries: 0 }` makes a single attempt.
+- **A DescribeTopicPartitions read has one 60 s deadline.** `fetchTopicMetadata({ topics, useDescribeTopicPartitions: true })` rejects with `KafkaJSTimeout` when the read, every page and retry included, is not done within 60 s, and a topic recreated between two pages is read again from the start. *What to do:* nothing, unless your cluster pages that slowly; then use the default Metadata path (`useDescribeTopicPartitions: false`).
 
 ### Errors and events
 
