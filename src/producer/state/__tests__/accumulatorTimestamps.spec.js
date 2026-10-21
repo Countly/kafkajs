@@ -1,5 +1,9 @@
 const Accumulator = require('../accumulator')
 const Long = require('../../../utils/long')
+const Decoder = require('../../../protocol/decoder')
+const recordBatchDecoder = require('../../../protocol/recordBatch/v0/decoder')
+const buildRecordBatch = require('../../../protocol/requests/produce/buildRecordBatch')
+const { Types: Compression } = require('../../../protocol/message/compression')
 const { KafkaJSInvalidConfigurationError } = require('../../../errors')
 
 const TOPIC = 'topic-a'
@@ -8,6 +12,8 @@ const INT64_MAX = 2n ** 63n - 1n
 const LARGEST_DOUBLE_BELOW_INT64 = 2 ** 63 - 1024
 /** The largest instant a Date can hold, in milliseconds. */
 const LATEST_DATE_MS = 8.64e15
+/** The fixed clock of the encoding tests, in milliseconds. */
+const SEND_TIME = 1800000000000
 
 /**
  * An accumulator that sends at once over a send path that settles every batch and records the
@@ -142,4 +148,69 @@ describe('Producer > the accumulator > timestamp range', () => {
       expect(handedOn()).toEqual(['v'])
     }
   )
+
+  describe('the timestamp a record is encoded with', () => {
+    beforeEach(() => {
+      jest.spyOn(Date, 'now').mockReturnValue(SEND_TIME)
+    })
+
+    afterEach(() => {
+      jest.restoreAllMocks()
+    })
+
+    /**
+     * Sends `timestamps` through the accumulator, encodes the one batch it hands on and reads the
+     * record timestamps back with the batch decoder.
+     * @param {Array} timestamps
+     * @returns {Promise<bigint[]>}
+     */
+    const encodedTimestamps = async (timestamps) => {
+      const { accumulator, sendPartitioned } = createAccumulator()
+      await append(
+        accumulator,
+        timestamps.map((timestamp) => ({ value: 'v', timestamp }))
+      )
+      const [{ batches }] = sendPartitioned.mock.calls[0]
+      const { buffer } = await buildRecordBatch({
+        compression: Compression.None,
+        messages: batches[0].messages,
+        producerId: Long.fromValue(-1),
+        producerEpoch: 0,
+      })
+      const { records } = await recordBatchDecoder(new Decoder(buffer))
+      return records.map(({ timestamp }) => BigInt(timestamp))
+    }
+
+    test.each([
+      ['the BigInt 0', 0n],
+      ['the number 0', 0],
+      ['null', null],
+      ['an absent timestamp', undefined],
+    ])('%s is the send time', async (_, timestamp) => {
+      expect(await encodedTimestamps([timestamp])).toEqual([BigInt(SEND_TIME)])
+    })
+
+    test.each([
+      ['the string 0', '0'],
+      ['the Date of the epoch', new Date(0)],
+      ['a Long of 0', Long.fromNumber(0)],
+    ])('%s is the literal epoch', async (_, timestamp) => {
+      expect(await encodedTimestamps([timestamp])).toEqual([0n])
+    })
+
+    test.each([
+      ['the BigInt 1', 1n],
+      ['the BigInt int64 maximum', INT64_MAX],
+    ])('%s is written as it is', async (_, timestamp) => {
+      expect(await encodedTimestamps([timestamp])).toEqual([timestamp])
+    })
+
+    test('a BigInt 0 beside a BigInt and a number is the send time, the others unchanged', async () => {
+      expect(await encodedTimestamps([0n, 1700000000000n, 1700000000001])).toEqual([
+        BigInt(SEND_TIME),
+        1700000000000n,
+        1700000000001n,
+      ])
+    })
+  })
 })

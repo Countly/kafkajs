@@ -119,12 +119,13 @@ const sizeOf = (messages) => {
 /**
  * A record as its batch carries it: one with a `BigInt` timestamp is copied with that timestamp as
  * a `Long`. The record encoder subtracts a batch's timestamps from each other, and a `BigInt`
- * cannot be mixed with the numbers of the other sends' records.
+ * cannot be mixed with the numbers of the other sends' records. A `0n` stays as it is: like `0` it
+ * is falsy and means the send time, which a `Long` of 0 would not.
  * @param {object} message
  * @returns {object}
  */
 const withEncodableTimestamp = (message) =>
-  typeof message.timestamp === 'bigint'
+  typeof message.timestamp === 'bigint' && message.timestamp !== 0n
     ? { ...message, timestamp: Long.fromValue(message.timestamp) }
     : message
 
