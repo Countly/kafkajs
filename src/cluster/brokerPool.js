@@ -470,8 +470,10 @@ module.exports = class BrokerPool {
 
   /**
    * Disconnects the seed and every broker in the table once, starting all drains concurrently.
-   * Pool state is cleared only after every disconnect succeeds. If one fails, this call rejects
-   * while the other disconnects continue.
+   * Detaches the captured table before draining, and retires its non-seed brokers so a stale
+   * lookup cannot reconnect an orphan. The seed stays reusable and owned. Work resumed during
+   * the drain builds a new table, which this call leaves intact. If one drain fails, this call
+   * rejects while the other drains continue; the captured table stays detached.
    * @public
    * @returns {Promise<void>} resolves when every broker has disconnected
    * @throws {Error} when a broker's disconnect fails
@@ -479,12 +481,16 @@ module.exports = class BrokerPool {
   async disconnect() {
     const brokers = new Set(values(this.brokers))
     if (this.seedBroker) brokers.add(this.seedBroker)
-    await Promise.all([...brokers].map((broker) => broker.disconnect()))
-
     this.brokers = {}
     this.metadata = null
     this.versions = null
     this.authenticationBlackout.clear()
+
+    await Promise.all(
+      [...brokers].map((broker) =>
+        broker === this.seedBroker ? broker.disconnect() : broker.retire()
+      )
+    )
   }
 
   /**

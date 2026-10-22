@@ -6,7 +6,7 @@ const { KafkaJSConnectionClosedError } = require('../../errors')
 const { responseHeaderVersion } = require('../../protocol/headers')
 const apiKeys = require('../../protocol/requests/apiKeys')
 const { respondWithFrame } = require('../../../testHelpers/fakeSocket')
-const { createScriptedCluster } = require('../../../testHelpers/scriptedCluster')
+const { createScriptedCluster, groupScript } = require('../../../testHelpers/scriptedCluster')
 const metadataPair = require('../../../testHelpers/wire/metadataV13')
 const { newLogger } = require('testHelpers')
 
@@ -620,7 +620,98 @@ describe('Public disconnect', () => {
     pool.brokers = { 0: seed, 5: seed, 1: peer }
     await pool.disconnect()
     expect(seed.disconnect).toHaveBeenCalledTimes(1)
-    expect(peer.disconnect).toHaveBeenCalledTimes(1)
+    expect(peer.retire).toHaveBeenCalledTimes(1)
     expect(pool.brokers).toEqual({})
   })
 })
+
+const deferred = () => {
+  let resolve
+  const promise = new Promise((done) => {
+    resolve = done
+  })
+  return { promise, resolve }
+}
+
+it.each(['coordinator lookup', 'cached broker', 'late endpoint'])(
+  'leaves no orphan when %s overlaps another broker drain',
+  async (kind) => {
+    const seam = groupScript(
+      createScriptedCluster({
+        nodes: [
+          { id: 0, host: 'node0', port: 9092 },
+          { id: 1, host: 'node1', port: 9092 },
+          { id: 2, host: 'node2', port: 9092 },
+        ],
+      }),
+      { coordinator: 1 }
+    )
+    seam.answer('Metadata', () => ({
+      brokers: seam.nodes
+        .slice(0, 2)
+        .map(({ id, ...node }) => ({ nodeId: id, ...node, rack: null })),
+      topicMetadata: [],
+    }))
+    const cluster = new Cluster({
+      ...seam.kafkaOptions({ requestTimeout: 1000 }),
+      logger: newLogger(),
+      retry: { retries: 0 },
+    })
+    let peer, newcomer, gate, heldRequest, closing
+    try {
+      await cluster.connect()
+      await cluster.refreshMetadata()
+      peer = await cluster.findBroker({ nodeId: 1 })
+      const seed = cluster.brokerPool.seedBroker
+      gate = seam.schedule.hold({ api: 'Metadata', node: 0 })
+      heldRequest = seed.metadata([]).catch((error) => error)
+      await gate.arrived()
+      const disconnected = deferred()
+      const disconnectPeer = peer.disconnect.bind(peer)
+      peer.disconnect = async (...args) => {
+        await disconnectPeer(...args)
+        disconnected.resolve()
+      }
+      closing = cluster.disconnect()
+      await disconnected.promise
+      // Current code reconnects the captured peer through withBroker/findBroker here.
+      // Refusing work while the seed drains is also a valid outcome.
+      if (kind === 'coordinator lookup') {
+        // Select the drained peer first; ordering must not depend on shuffle().
+        const random = jest.spyOn(Math, 'random').mockReturnValue(0)
+        try {
+          await cluster.findGroupCoordinator({ groupId: 'probe-group' }).catch((error) => {
+            expect(['KafkaJSBrokerNotFound', 'KafkaJSConnectionError']).toContain(
+              (error.cause ?? error).name
+            )
+          })
+        } finally {
+          random.mockRestore()
+        }
+      } else if (kind === 'cached broker') {
+        await peer.connect().catch((error) => {
+          expect(error.name).toBe('KafkaJSConnectionError')
+        })
+      } else {
+        await cluster.brokerPool.applyNodeEndpoints([
+          { nodeId: 2, host: 'node2', port: 9092, rack: null },
+        ])
+        newcomer = await cluster.findBroker({ nodeId: 2 })
+      }
+      gate.release()
+      gate = undefined
+      await heldRequest
+      await closing
+      await cluster.disconnect()
+      expect(seam.sockets().filter((socket) => !socket.destroyed)).toEqual([])
+    } finally {
+      gate?.release()
+      await heldRequest
+      await closing
+      await cluster.disconnect()
+      // Cleanup follows the assertion, so it cannot conceal an orphan.
+      await peer?.disconnect()
+      await newcomer?.disconnect()
+    }
+  }
+)
