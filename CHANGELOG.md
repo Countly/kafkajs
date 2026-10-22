@@ -630,7 +630,7 @@ Adopted upstream PRs are credited here by number as they land (Phase 2 onward).
 
 - Seeking to offset `-2` or `-1` now resolves that partition's earliest or latest offset independently of `fromBeginning` and `autoCommit`. Sentinel seeks are local position requests and no longer send negative offsets through OffsetCommit; concrete-offset seeks retain their existing commit behavior. `admin.setOffsets()` and `admin.resetOffsets()` still store `-1` and `-2` as the group offset.
 
-- OpenTelemetry instrumentation failures are contained: a meter, tracer, span, context manager or logger that throws no longer changes an operation's result or rejection, and the wrapped operation runs exactly once.
+- OpenTelemetry instrumentation failures are contained: a meter, tracer, span, context manager or logger that throws no longer changes an operation's result or rejection, and the wrapped operation runs exactly once. `otel/README.md` is widened accordingly.
 
 - With the OpenTelemetry package enabled, a traced `producer.transaction()` returns a derived promise, wrapped transaction operations turn synchronous throws into rejections with the same reason, and wrapped `commit()` preserves the client's fulfillment value.
 

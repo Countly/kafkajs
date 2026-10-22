@@ -104,12 +104,26 @@ message's `headers` (the caller's message object), and the consumer reads it bac
   like one that rejects. A rejection reason of `null`, or an object with a `message` but no
   constructor, is passed on unchanged and recorded with `error.type` `_OTHER`. A broker address that
   is IPv6, such as `::1:9092`, gives `server.address` `::1` and `server.port` `9092`.
-- **Telemetry is guarded on the send path it wraps.** A meter, span or span processor that throws
-  while the send span is prepared or ended or the sent-message metrics are recorded, a frozen or
-  sealed message or headers, and a missing `messages` array neither skip the produce nor change its
-  result, though some messages may then be sent without trace context. Other telemetry calls are not
-  guarded: for example, a throwing `REQUEST` duration metric escapes into the client's event emit,
-  and a throwing transaction span replaces a transactional send's own error.
+- **A telemetry failure never changes what your application sees.** When a meter, tracer, span,
+  span processor, propagator, context manager, instrumentation hook or configuration getter throws,
+  the failure is logged through the OpenTelemetry diagnostic logger as an `… error` line, and a
+  diagnostic logger that throws as well is ignored. The wrapped call (`send`, `sendBatch`,
+  `eachMessage`, `eachBatch`, `producer.transaction()`, or a transaction's `send`, `sendBatch`,
+  `commit` or `abort`) runs exactly once, with your receiver and arguments, and settles with its
+  own value or its own rejection, the same object. It then runs with less tracing: a message can be
+  sent without trace context, a handler can run without its span, and every span already started
+  still gets its `end()` call, even when another span's cleanup fails. A frozen or sealed message
+  is still sent; its existing headers can receive trace context if they are extensible. Frozen or
+  sealed headers are kept as they are.
+- **A context manager cannot run your code twice.** If it throws before it calls the wrapped
+  handler or transactional send, that call runs once without the context; if it throws after,
+  calls it again or returns something else, you get the call's own result or error, and the call
+  is not run again.
+- **The transaction wrappers keep outcomes, not promise identity.** With the instrumentation on, a
+  traced `producer.transaction()` returns a derived promise that resolves to the same transaction
+  object; the transaction's `send`, `sendBatch`, `commit` and `abort` turn a synchronous throw into
+  a rejection with the same reason; and `commit()` resolves with whatever the client's `commit()`
+  resolved with.
 
 ## Tests
 
@@ -134,3 +148,7 @@ set:
 
 Run them from the repository root with `npm run test:otel`, which installs the packed client into
 this directory the way an application does.
+
+`test/failureContainment.test.js` throws from one telemetry component at a time, at every
+observation point and for each way the wrapped call can settle, and checks the containment
+described under "Differences"; `npm run test:otel` runs it with the rest.

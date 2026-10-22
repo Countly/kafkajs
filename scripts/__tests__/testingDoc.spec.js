@@ -249,3 +249,50 @@ describe('documented consumer and retry behavior', () => {
     expect(page).toContain('Exit 0 from the load command alone is insufficient')
   })
 })
+
+describe('documented offset ordering, shared state and telemetry containment', () => {
+  const consuming = read('docs', 'Consuming.md')
+  const recreation = consuming.slice(
+    consuming.indexOf('<a name="topic-recreation"></a>'),
+    consuming.indexOf('<a name="topic-metadata"></a>')
+  )
+  const otelReadme = read('otel', 'README.md')
+  it('keeps a recreation reset owed until an offset for the new topic is applied', () => {
+    expect(recreation).toContain(
+      'The reset stays owed for a partition until an offset for the new topic is applied to it'
+    )
+    expect(recreation).toContain('A `ListOffsets` request that fails')
+    expect(recreation).toContain("the consumer's automatic restart after a crash all leave it owed")
+    expect(recreation).toContain('`consumer.disconnect()` drops it')
+    expect(recreation).toContain('a seek or commit for the new topic is never undone by it')
+  })
+  it('orders offset operations by when they began', () => {
+    expect(recreation).toContain('ordered by when they began, not by when their answers arrive')
+    expect(recreation).toContain('even when its offset is lower and whichever answer arrives first')
+    expect(recreation).toContain('A commit already sent cannot be recalled')
+  })
+  it('documents the cache and ledger one Kafka instance shares, with the publication rule', () => {
+    const index = read('src', 'index.js')
+    expect(index).toContain('this[PRIVATE.OFFSETS] = new Map()')
+    expect(index).toContain('this[PRIVATE.OPERATIONS] = new Map()')
+    expect(recreation).toContain('two `Kafka` instances share neither')
+    expect(recreation).toContain(
+      "only after the transaction's commit is confirmed, once, and a newer seek, reset, commit or recreation"
+    )
+    expect(recreation).toContain('(Transactions.md#offsets)')
+  })
+  it('compares the one-shot reset with the Java client', () => {
+    expect(recreation).toContain("resets only a partition's last-seen leader epoch")
+    expect(recreation).toContain('This client is stricter on purpose')
+  })
+  it('states the telemetry containment the instrumentation implements', () => {
+    const source = read('otel', 'src', 'instrumentation.js')
+    expect(source).toContain('function contained(diag, what, work, fallback)')
+    expect(source).toContain('function withContext(diag, ctx, call)')
+    expect(otelReadme).not.toMatch(/Other telemetry calls are not\s+guarded/)
+    expect(otelReadme).toContain('runs exactly once, with your receiver and arguments')
+    expect(otelReadme).toContain('A context manager cannot run your code twice')
+    expect(otelReadme).toContain('a derived promise that resolves to the same transaction')
+    expect(otelReadme).toContain('a rejection with the same reason')
+  })
+})
