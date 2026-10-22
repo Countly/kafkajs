@@ -2,7 +2,7 @@ const Cluster = require('../../cluster')
 const { PartitionAssigners } = require('../../../index')
 const { lanes } = require('../../../testHelpers/lane')
 const { TOPIC_ID } = require('./fixtures/fetchHarness')
-const { writeEvidence } = require('testHelpers')
+const { writeEvidence, waitFor } = require('testHelpers')
 const {
   NAMES,
   GROUP,
@@ -156,8 +156,17 @@ describe.each(lanes())('Consumer > topics named like Object.prototype members on
       expect(caches[0][name]).toEqual({ 0: '5' })
       expect(consumer.paused()).toEqual([])
       if (lane === 'docker') {
-        const [offsets] = await run.admin.fetchOffsets({ groupId: GROUP, topics: [name] })
-        expect(offsets.partitions[0].offset).toBe('5')
+        await waitFor(
+          async () => {
+            const [offsets] = await run.admin.fetchOffsets({ groupId: GROUP, topics: [name] })
+            return offsets.partitions[0].offset === '5'
+          },
+          {
+            maxWait: 10000,
+            ignoreTimeout: false,
+            timeoutMessage: `Transactional offset for ${name} did not reach 5`,
+          }
+        )
         writeEvidence('prototype-topics', { topic: name, sendOffsets: '5' })
       }
       expectPrototypeUntouched(before)
