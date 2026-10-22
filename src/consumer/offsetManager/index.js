@@ -41,6 +41,25 @@ const PRIVATE = {
   COMMITTED_OFFSETS: Symbol('private:OffsetManager:committedOffsets'),
 }
 
+/**
+ * One member's view of a consumer group's offsets for one assignment: the position each assigned
+ * partition fetches from next, its tracked leader epochs, the sentinel seeks still waiting for a
+ * boundary, and every write to them and to the group's committed-offset cache.
+ *
+ * A `ConsumerGroup` builds a manager when it rebuilds the whole assignment and moves the existing
+ * one with `updateAssignment` for an incremental (cooperative) change; a stop or a full rebuild
+ * retires it (`clearPendingSeeks`). It owns only consumer-local state. The committed-offset cache
+ * and the operation ledger are shared by every participant of the group on one `Kafka` instance,
+ * and the reset obligations belong to the long-lived `Consumer`; all three are injected.
+ *
+ * Writes are ordered through the ledger, not by arrival: `resolveOffsets` is a read that fills
+ * unresolved cells from the coordinator or ListOffsets, while `seek`, `setDefaultOffset` and the
+ * commits are mutations, and a stale answer never overwrites a newer operation. Every OffsetCommit
+ * leaves through one sender that checks the membership before it writes. The kafkajs 2.2.4
+ * contract of `seek`, `resolveOffset` and `commitOffsets` is kept apart from the documented
+ * behavior changes: explicit sentinel boundaries, ordered offset writes and the refusal of
+ * commits after a lost membership.
+ */
 module.exports = class OffsetManager {
   /**
    * @private
@@ -561,7 +580,10 @@ module.exports = class OffsetManager {
    *
    * A seek is a mutation of the offset ledger: it is applied unless a seek or commit that began
    * after it was applied first, or a barrier reached the partition while its commit was in
-   * flight. An applied seek settles the topic's reset obligation for the partition.
+   * flight. An applied concrete seek settles the topic's reset obligation for the partition. A
+   * sentinel seek fences older answers at once but settles the reset only when its boundary is
+   * published. Cancellation before publication (stop or rebuild) leaves the reset owed; a failed
+   * ListOffsets leaves both the reset and the pending sentinel for the next resolution.
    *
    * @param {import("../../../types").TopicPartitionOffset} topicPartitionOffset
    * @returns {Promise<boolean>} whether the seek was applied: `false` when the partition is not
@@ -579,7 +601,7 @@ module.exports = class OffsetManager {
     if (offset === '-2' || offset === '-1') {
       const ticket = this.operations.begin([{ topic, partition }], { mutation: true })
       this.clearOffsets({ topic, partition })
-      this.operations.apply(ticket, topic, partition)
+      this.operations.fence(ticket, topic, partition)
       let partitions = this.pendingSeeks.get(topic)
       if (!partitions) {
         partitions = new Map()
@@ -656,6 +678,22 @@ module.exports = class OffsetManager {
     }
   }
 
+  /**
+   * Auto-commits the resolved offsets when the interval has elapsed or the offsets resolved beyond
+   * the committed ones add up to the threshold, and does nothing otherwise. Either trigger is
+   * optional (a null or undefined interval or threshold never fires) and one is enough.
+   *
+   * The commit is automatic (`auto: true`): a lost ownership and a stale member epoch are logged
+   * and skipped, not thrown. `lastCommit` restarts the interval when the commit succeeded, when
+   * there was nothing to commit and when a stale member epoch was skipped, but not when an
+   * ownership refusal was.
+   * @param {{partitions?: import('../groupProtocol/interface').TopicPartitions[]|null,
+   *   guard?: () => Error|null}} [options] forwarded to `commitOffsets`: the topic-partitions to
+   *   narrow the selection to, and the caller's identity guard
+   * @returns {Promise<void>} settles once the commit did; at once when neither trigger fired
+   * @throws {Error} what an automatic commit still raises: a broker error that is neither an
+   *   ownership refusal nor a stale member epoch
+   */
   async commitOffsetsIfNecessary(options) {
     const now = Date.now()
 
@@ -934,11 +972,13 @@ module.exports = class OffsetManager {
    * sentinel seek overrides the committed answer and supplies a per-partition timestamp.
    *
    * A resolution is a read of the offset ledger: it takes a ticket over the cells it resolves and
-   * fills them in one synchronous final step after both awaits. It never supersedes anything. An
-   * answer is written only for a cell that no seek, commit or barrier (a revoke, a reset, a
-   * recreation) reached since the ticket began and that is still unresolved, so a newer
-   * operation's value is never overwritten and a resolver never replaces a sibling's. The leader
-   * epochs the coordinator committed are seeded in the same step, under the same check.
+   * fills them in one synchronous final step after both awaits. It never supersedes anything. Its
+   * ticket is owned by this manager, so cancelling this manager's sentinel seeks can fence it
+   * without fencing any other participant's. An answer is written only for a cell that no seek,
+   * commit or barrier (a revoke, a reset, a recreation) reached since the ticket began and that
+   * is still unresolved, so a newer operation's value is never overwritten and a resolver never
+   * replaces a sibling's. The leader epochs the coordinator committed are seeded in the same
+   * step, under the same check.
    *
    * A topic recreated while this member is subscribed owes a reset on every partition (see
    * `ResetObligations`). The reset is applied here, after the OffsetFetch answer, to the owed
@@ -976,7 +1016,7 @@ module.exports = class OffsetManager {
       return true
     }
 
-    const ticket = this.operations.begin(this.coveredCells(pendingPartitions))
+    const ticket = this.operations.begin(this.coveredCells(pendingPartitions), { owner: this })
 
     try {
       const requestedIds = new Map(
@@ -1092,15 +1132,36 @@ module.exports = class OffsetManager {
   }
 
   /**
-   * Cancels all explicit sentinel seeks and fences their in-flight answers on stop or rebuild.
-   * Retains no ledger ticket, topic or partition after returning.
+   * Ends a pending sentinel whose concrete boundary was just published, and settles the reset
+   * obligation its seek left owed in every attached consumer. A no-op for a cell without a pending
+   * sentinel. Only the resolution's final step calls it, after it checked the cell is current, so
+   * the boundary never belongs to an earlier incarnation.
+   * @private
+   * @param {string} topic
+   * @param {number} partition
+   * @returns {void}
+   * @throws Never.
+   */
+  settleSentinel(topic, partition) {
+    if (!this.pendingSeeks.get(topic)?.has(partition)) {
+      return
+    }
+    this.clearPendingSeek(topic, partition)
+    this.operations.discharge(topic, partition)
+  }
+
+  /**
+   * Cancels all explicit sentinel seeks on stop or rebuild and fences this manager's own in-flight
+   * resolutions of their cells, so a held boundary is never published for a cancelled intent. The
+   * fence is an owner barrier: no other participant's ticket is affected. A cancelled sentinel
+   * settles no reset. Retains no ledger ticket, topic or partition after returning.
    * @returns {void}
    * @throws Never.
    */
   clearPendingSeeks() {
     for (const [topic, partitions] of this.pendingSeeks) {
       for (const [partition, pending] of partitions) {
-        this.operations.touch(topic, partition)
+        this.operations.touchOwned(this, topic, partition)
         this.operations.end(pending.ticket)
       }
     }
@@ -1210,7 +1271,7 @@ module.exports = class OffsetManager {
 
       for (const partition of written) {
         if (!isInvalidOffset(resolved[partition])) {
-          this.clearPendingSeek(topic, partition)
+          this.settleSentinel(topic, partition)
         }
         this.obligations.discharge(topic, partition, this.cluster.topicId(topic))
       }
@@ -1435,6 +1496,15 @@ module.exports = class OffsetManager {
     this.resolvedEpochs = indexTopics(this.topics)
   }
 
+  /**
+   * The group's committed-offset cache: a topic to partition to offset-string dictionary.
+   *
+   * Looked up from the cluster on first use and kept by reference, so every participant of the
+   * group on one `Kafka` instance (other consumers, a producer's transactional publication) reads
+   * and writes the same object, with its writes ordered through the operation ledger. A manager
+   * without a `groupId` has a private empty one.
+   * @returns {{[topic: string]: {[partition: number|string]: string}}}
+   */
   committedOffsets() {
     if (!this[PRIVATE.COMMITTED_OFFSETS]) {
       this[PRIVATE.COMMITTED_OFFSETS] = this.groupId

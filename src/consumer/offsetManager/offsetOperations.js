@@ -10,10 +10,13 @@
  * rebuild, reset, topic recreation) fence every operation of the covered cells that began before
  * they were applied. State shared across consumers of one group stays here; assignment epochs,
  * ownership tokens and resolved positions stay with the consumer.
+ *
+ * A ticket may name an owner, and an owner barrier fences only the tickets of that owner, so one
+ * participant can cancel its own pending work without invalidating anybody else's.
  */
 class OffsetOperations {
   constructor() {
-    /** @type {Map<string, Map<number, {open: number, appliedAt: number, barrierAt: number, appliedIntent: number}>>} */
+    /** @type {Map<string, Map<number, {open: number, appliedAt: number, barrierAt: number, appliedIntent: number, ownerBarriers: WeakMap<object, number>|null}>>} */
     this.topics = new Map()
     this.cells = 0
     this.clock = 0
@@ -28,15 +31,17 @@ class OffsetOperations {
    * Opens a ticket over the given cells.
    * @param {{topic: string, partition: number|string}[]} cells the cells the operation will write;
    *   a partition given as a string (an object key) is the same cell as its number
-   * @param {{ mutation?: boolean }} [options] a mutation ticket also takes the next intent number
+   * @param {{ mutation?: boolean, owner?: object|null }} [options] a mutation ticket also takes the
+   *   next intent number; an `owner` makes the ticket fenceable by `touchOwned` of that owner
    * @returns {object} a ticket, open until `end`
    */
-  begin(cells, { mutation = false } = {}) {
+  begin(cells, { mutation = false, owner = null } = {}) {
     this.openTickets += 1
     const ticket = {
       began: ++this.clock,
       intent: mutation ? ++this.intent : 0,
       mutation,
+      owner,
       cells: [],
       ended: false,
     }
@@ -51,7 +56,7 @@ class OffsetOperations {
 
       let state = partitions.get(number)
       if (!state) {
-        state = { open: 0, appliedAt: 0, barrierAt: 0, appliedIntent: 0 }
+        state = { open: 0, appliedAt: 0, barrierAt: 0, appliedIntent: 0, ownerBarriers: null }
         partitions.set(number, state)
         this.cells += 1
       }
@@ -96,6 +101,7 @@ class OffsetOperations {
    * barrier was applied to the cell after the ticket began. A mutation is stale when a mutation
    * that began later was already applied to the cell, or a barrier was applied after it began;
    * so the outcome depends on the order the operations began, not on which answer arrived first.
+   * Either kind is also stale when a barrier of its own owner was applied after it began.
    * @param {object} ticket
    * @param {string} topic
    * @param {number} partition
@@ -107,7 +113,8 @@ class OffsetOperations {
       return false
     }
 
-    if (state.barrierAt > ticket.began) {
+    const ownerBarrierAt = ticket.owner === null ? 0 : (state.ownerBarriers?.get(ticket.owner) ?? 0)
+    if (state.barrierAt > ticket.began || ownerBarrierAt > ticket.began) {
       return true
     }
 
@@ -125,12 +132,37 @@ class OffsetOperations {
    * @returns {void}
    */
   apply(ticket, topic, partition) {
+    this.fence(ticket, topic, partition)
+    this.discharge(topic, partition)
+  }
+
+  /**
+   * Records a mutation's intent on a cell without settling any reset obligation, for a mutation
+   * whose effect on the cell is immediate but whose settlement waits for a later step (a sentinel
+   * seek, settled when its boundary is published). Reads that began earlier and mutations with a
+   * lower intent become stale, exactly as for `apply`. Retains nothing for a cell no open ticket
+   * covers.
+   * @param {object} ticket a mutation ticket
+   * @param {string} topic
+   * @param {number} partition
+   * @returns {void}
+   */
+  fence(ticket, topic, partition) {
     const state = this.state(topic, partition)
     if (state) {
       state.appliedAt = ++this.clock
       state.appliedIntent = Math.max(state.appliedIntent, ticket.intent)
     }
+  }
 
+  /**
+   * Settles the matching reset obligation of every attached consumer, without recording anything
+   * on the cell: the settlement half of `apply`, for a mutation already fenced by `fence`.
+   * @param {string} topic
+   * @param {number} partition
+   * @returns {void}
+   */
+  discharge(topic, partition) {
     for (const obligations of this.attached) {
       obligations.discharge(topic, Number(partition))
     }
@@ -147,6 +179,24 @@ class OffsetOperations {
     const state = this.state(topic, partition)
     if (state) {
       state.barrierAt = ++this.clock
+    }
+  }
+
+  /**
+   * A barrier over the tickets of one owner on one cell: the owner cancelled its own pending work
+   * there. Fences only tickets begun with that owner, never another participant's. Retains nothing
+   * for a cell no open ticket covers, and the owner's mark leaves with the cell; it never keeps a
+   * retired owner alive. A null owner is ignored.
+   * @param {object|null} owner the `owner` its tickets were begun with
+   * @param {string} topic
+   * @param {number} partition
+   * @returns {void}
+   */
+  touchOwned(owner, topic, partition) {
+    const state = this.state(topic, partition)
+    if (state && owner !== null) {
+      state.ownerBarriers ??= new WeakMap()
+      state.ownerBarriers.set(owner, ++this.clock)
     }
   }
 

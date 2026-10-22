@@ -981,6 +981,42 @@ describe('Consumer > OffsetManager > reset schedules', () => {
       expect(ctx.owed()).toBe(false)
     })
 
+    test("C14 a consumer that stops with a pending sentinel leaves another participant's open publication fence alone", async () => {
+      const ctx = owingConsumer()
+      await ctx.manager.seek({ topic: TOPIC, partition: 0, offset: '-2' })
+      const publication = ctx.operations.begin([{ topic: TOPIC, partition: 0 }], { mutation: true })
+
+      groupOver(ctx).onStopRequested()
+
+      expect(ctx.manager.pendingSeeks.size).toBe(0)
+      expect(ctx.operations.isSuperseded(publication, TOPIC, 0)).toBe(false)
+
+      ctx.cache[TOPIC][0] = '70'
+      ctx.operations.apply(publication, TOPIC, 0)
+      ctx.operations.end(publication)
+
+      expect(ctx.operations.size()).toBe(0)
+      expect(ctx.committedAt()).toEqual('70')
+      expect(ctx.owed()).toBe(false)
+    })
+
+    test("C14 a consumer that stops with a pending sentinel leaves another consumer's open commit alone", async () => {
+      const ctx = owingConsumer()
+      const sibling = ctx.build({ obligations: new ResetObligations() })
+      await ctx.manager.seek({ topic: TOPIC, partition: 0, offset: '-2' })
+      const answer = ctx.schedule.hold({ api: 'OffsetCommit' })
+      const committing = sibling.commitOffsets(commitOf(0, '70'))
+      await answer.arrived()
+
+      groupOver(ctx).onStopRequested()
+      answer.release({})
+      await committing
+
+      expect(ctx.committedAt()).toEqual('70')
+      expect(ctx.owed()).toBe(false)
+      expect(ctx.operations.size()).toBe(0)
+    })
+
     test('AR1 an aborted transaction publishes nothing, so the resolver in flight applies its answer', async () => {
       const ctx = createScheduledOffsetManager({ topicId: NEW_ID })
       const offsetFetch = ctx.schedule.hold({ api: 'OffsetFetch' })

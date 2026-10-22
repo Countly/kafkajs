@@ -1905,14 +1905,17 @@ module.exports = class ConsumerGroup {
    * Applies every pending `seek()` for the given topic/partitions, then resolves offsets for the
    * rest. A seek applied here that lands on a topic with a pending recreation reset (set by
    * `invalidateTopic()` earlier in this same fetch cycle) wins over that reset for its own
-   * partition: an applied seek settles the partition's reset obligation. An applied seek also
-   * clears the partition's halt, which is how an application resumes a halted partition.
+   * partition: an applied seek settles the partition's reset obligation (a sentinel seek once its
+   * boundary is published). An applied seek also clears the partition's halt, which is how an
+   * application resumes a halted partition.
    *
    * A resolution that dropped an answer (a seek, commit or recreation reached the cell while the
    * request was in flight) is repeated at once, after a yield to the event loop, at most
    * `MAX_RESOLUTION_PASSES` times, instead of leaving the broker's round to wait out an empty
    * fetch. No pass can spin: each needs a fresh competing operation to drop again. After the last
-   * pass the round proceeds as it always did.
+   * pass the round proceeds as it always did. A stop request ends the passes: stopping is checked
+   * before each pass and after a pass returns, so no further pass starts once the round is about to
+   * be discarded. A pass already in flight is not cancelled.
    * @param {import("../../types").TopicPartitions[]} topicPartitions
    * @returns {Promise<void>}
    */
@@ -1937,8 +1940,12 @@ module.exports = class ConsumerGroup {
       }
     }
 
-    for (let pass = 1; pass <= MAX_RESOLUTION_PASSES; pass++) {
-      if ((await this.offsetManager.resolveOffsets()) || pass === MAX_RESOLUTION_PASSES) {
+    for (let pass = 1; pass <= MAX_RESOLUTION_PASSES && !this.isStopping(); pass++) {
+      if (
+        (await this.offsetManager.resolveOffsets()) ||
+        pass === MAX_RESOLUTION_PASSES ||
+        this.isStopping()
+      ) {
         break
       }
 

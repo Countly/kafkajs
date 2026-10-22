@@ -6,6 +6,7 @@ const {
   createScheduledOffsetManager,
   groupOver,
 } = require('./fixtures/scheduledOffsetManager')
+const ResetObligations = require('../resetObligations')
 
 let contexts
 beforeEach(() => {
@@ -222,6 +223,52 @@ test('stop clears queued and applied sentinel seeks and fences their answers', a
   expect(ctx.operations.size()).toBe(0)
 })
 
+test('a stop during the OffsetFetch of a sentinel resolution drops its answer', async () => {
+  const ctx = fixture()
+  const group = groupOver(ctx)
+  await seek(ctx, '-1')
+  const held = ctx.schedule.hold({ api: 'OffsetFetch' })
+  const resolving = ctx.manager.resolveOffsets()
+  await held.arrived()
+  group.onStopRequested()
+  held.release(offsetFetchAnswer({ 0: '99' }))
+  await expect(resolving).resolves.toBe(false)
+  expect(ctx.committedAt()).toBeUndefined()
+  expect(ctx.cluster.fetchTopicsOffset).not.toHaveBeenCalled()
+  expect(ctx.operations.size()).toBe(0)
+})
+
+test("a stop leaves another consumer's resolution of the same cell alone", async () => {
+  const ctx = fixture()
+  const group = groupOver(ctx)
+  const sibling = ctx.build({ obligations: new ResetObligations() })
+  await seek(ctx, '-1')
+  const held = ctx.schedule.hold({ api: 'OffsetFetch' })
+  const resolving = sibling.resolveOffsets()
+  await held.arrived()
+  group.onStopRequested()
+  held.release(offsetFetchAnswer({ 0: '99' }))
+  await expect(resolving).resolves.toBe(true)
+  expect(ctx.committedAt()).toBe('99')
+  expect(ctx.operations.size()).toBe(0)
+})
+
+test('a stop during a sentinel resolution ends the repeated passes of the seek cycle', async () => {
+  const ctx = fixture()
+  const group = groupOver(ctx)
+  group.seek({ topic: TOPIC, partition: 0, offset: '-2' })
+  const held = ctx.schedule.hold({ api: 'ListOffsets' })
+  const seeking = group.seekOffsets([{ topic: TOPIC, partitions: [0] }])
+  await held.arrived()
+  group.rebalanceCoordinator = { runner: { stopRequested: true } }
+  group.onStopRequested()
+  held.release(listOffsetsAnswer({ 0: '11' }))
+  await seeking
+  expect(ctx.coordinator.offsetFetch).toHaveBeenCalledTimes(1)
+  expect(ctx.cluster.fetchTopicsOffset).toHaveBeenCalledTimes(1)
+  expect(ctx.committedAt()).toBeUndefined()
+})
+
 test('a full assignment rebuild releases the retired manager sentinel ticket', async () => {
   const ctx = fixture()
   const group = groupOver(ctx)
@@ -246,10 +293,186 @@ test('successful sentinel publication discharges the recreation obligation', asy
   const ctx = fixture({ topicId: NEW_ID })
   ctx.obligations.owe(TOPIC, NEW_ID)
   await seek(ctx, '-1')
+  expect(ctx.owed()).toBe(true)
   await ctx.manager.resolveOffsets()
   expect(ctx.owed()).toBe(false)
   expect(ctx.obligations.size()).toBe(0)
   expect(ctx.manager.pendingSeeks.size).toBe(0)
+})
+
+test('a sentinel publication settles the reset of another consumer of the group too', async () => {
+  const ctx = fixture({ topicId: NEW_ID })
+  const other = new ResetObligations()
+  other.attachTo(ctx.operations)
+  ctx.obligations.owe(TOPIC, NEW_ID)
+  other.owe(TOPIC, NEW_ID)
+  await seek(ctx, '-1')
+  expect(other.isOwed(TOPIC, 0)).toBe(true)
+  await ctx.manager.resolveOffsets()
+  expect(other.isOwed(TOPIC, 0)).toBe(false)
+  other.clear()
+})
+
+test('a sentinel seek fences an answer held from before it and settles nothing', async () => {
+  const ctx = fixture({ topicId: NEW_ID })
+  ctx.recreate(NEW_ID)
+  const held = ctx.schedule.hold({ api: 'OffsetFetch' })
+  const resolving = ctx.manager.resolveOffsets()
+  await held.arrived()
+  await seek(ctx, '-1')
+  held.release(offsetFetchAnswer({ 0: '99' }))
+  await expect(resolving).resolves.toBe(false)
+  expect(ctx.committedAt()).toBeUndefined()
+  expect(ctx.owed()).toBe(true)
+})
+
+/**
+ * What `consumer.run()` does after `consumer.stop()`: a manager built afresh resolves from the
+ * broker. Returns the three things a recreation reset is judged by, apart: the position the next
+ * fetch starts from, the committed cache, and the obligation as the stop left it.
+ */
+const runAgain = async (ctx) => {
+  const owedAtStop = ctx.owed()
+  const next = ctx.rebuild()
+  await next.resolveOffsets()
+  return { position: next.nextOffset(TOPIC, 0).toString(), cache: ctx.committedAt(), owedAtStop }
+}
+
+/** The reset ran: ListOffsets by the topic's own default, position and cache at its boundary. */
+const expectReset = (ctx, { position, cache, owedAtStop }) => {
+  expect(position).toBe('0')
+  expect(cache).toBe('0')
+  expect(owedAtStop).toBe(true)
+  expect(ctx.owed()).toBe(false)
+  expect(ctx.obligations.size()).toBe(0)
+  expect(ctx.cluster.fetchTopicsOffset.mock.calls.at(-1)[0]).toEqual([
+    { topic: TOPIC, fromBeginning: true, partitions: [{ partition: 0 }] },
+  ])
+}
+
+for (const boundary of ['held', 'failed']) {
+  test(`a stop with the ${boundary} boundary of a sentinel leaves the recreation reset owed, and the next run resets`, async () => {
+    const ctx = fixture({ topicId: NEW_ID })
+    const group = groupOver(ctx)
+    ctx.recreate(NEW_ID)
+    await seek(ctx, '-2')
+
+    if (boundary === 'held') {
+      const held = ctx.schedule.hold({ api: 'ListOffsets' })
+      const resolving = ctx.manager.resolveOffsets()
+      await held.arrived()
+      group.onStopRequested()
+      held.release(listOffsetsAnswer({ 0: '11' }))
+      await expect(resolving).resolves.toBe(false)
+    } else {
+      const error = new Error('list rejected')
+      ctx.schedule.once({ api: 'ListOffsets' }, error)
+      await expect(ctx.manager.resolveOffsets()).rejects.toBe(error)
+      group.onStopRequested()
+    }
+
+    expect(ctx.manager.pendingSeeks.size).toBe(0)
+    expect(ctx.committedAt()).toBeUndefined()
+    expect(ctx.manager.resolvedOffsetAt(TOPIC, 0)).toBeUndefined()
+    expectReset(ctx, await runAgain(ctx))
+  })
+}
+
+test('a stop during the yield between resolution passes leaves the recreation reset owed, and the next run resets', async () => {
+  const ctx = fixture({ topicId: NEW_ID })
+  const group = groupOver(ctx)
+  group.rebalanceCoordinator = { runner: { stopRequested: false } }
+  ctx.recreate(NEW_ID)
+  group.seek({ topic: TOPIC, partition: 0, offset: '-2' })
+  const held = ctx.schedule.hold({ api: 'ListOffsets' })
+  const seeking = group.seekOffsets([{ topic: TOPIC, partitions: [0] }])
+  await held.arrived()
+  // A sibling assignment manager over the shared cache and ledger supersedes the held answer.
+  ctx.build({ obligations: new ResetObligations() })
+  expect(ctx.owed()).toBe(true)
+
+  // Queued before the answer is released, so it runs inside the loop's own setImmediate yield.
+  const stopping = new Promise((resolve) =>
+    setImmediate(() => {
+      group.rebalanceCoordinator.runner.stopRequested = true
+      group.onStopRequested()
+      resolve()
+    })
+  )
+  held.release(listOffsetsAnswer({ 0: '11' }))
+  await seeking
+  await stopping
+
+  expect(ctx.owed()).toBe(true)
+  expect(ctx.committedAt()).toBeUndefined()
+  expect(ctx.cluster.fetchTopicsOffset).toHaveBeenCalledTimes(1)
+  expectReset(ctx, await runAgain(ctx))
+  expect(ctx.cluster.fetchTopicsOffset).toHaveBeenCalledTimes(2)
+})
+
+test('control: a stop without a sentinel leaves the recreation reset owed, and the next run resets', async () => {
+  const ctx = fixture({ topicId: NEW_ID })
+  const group = groupOver(ctx)
+  ctx.recreate(NEW_ID)
+  group.onStopRequested()
+  expect(ctx.committedAt()).toBeUndefined()
+  expectReset(ctx, await runAgain(ctx))
+})
+
+test('a full rebuild with a pending sentinel leaves the recreation reset owed', async () => {
+  const ctx = fixture({ topicId: NEW_ID })
+  const group = groupOver(ctx)
+  ctx.recreate(NEW_ID)
+  await seek(ctx, '-1')
+  group.partitionsPerSubscribedTopic = new Map([[TOPIC, [0]]])
+  await group.applyRebalanceResult({ assignment: { [TOPIC]: [0] } }, { rebuildOffsets: true })
+  expect(ctx.manager.pendingSeeks.size).toBe(0)
+  expectReset(ctx, await runAgain(ctx))
+})
+
+test('a revocation with a pending sentinel leaves the recreation reset owed', async () => {
+  const ctx = fixture({ topicId: NEW_ID })
+  ctx.recreate(NEW_ID)
+  await seek(ctx, '-1')
+  ctx.manager.updateAssignment({
+    revoked: [{ topic: TOPIC, partitions: [0] }],
+    memberAssignment: {},
+    generationId: 2,
+    memberId: 'next',
+    coordinator: ctx.coordinator,
+  })
+  expect(ctx.manager.pendingSeeks.size).toBe(0)
+  expect(ctx.owed()).toBe(true)
+})
+
+test('a concrete seek after a sentinel settles the recreation reset', async () => {
+  const ctx = fixture({ topicId: NEW_ID })
+  ctx.recreate(NEW_ID)
+  await seek(ctx, '-1')
+  expect(ctx.owed()).toBe(true)
+  await seek(ctx, '44')
+  expect(ctx.owed()).toBe(false)
+  expect(ctx.next()).toBe('44')
+  expect(ctx.manager.pendingSeeks.size).toBe(0)
+})
+
+test('a stop does not restore a reset that a newer commit already settled', async () => {
+  const ctx = fixture({ topicId: NEW_ID })
+  const group = groupOver(ctx)
+  const sibling = ctx.build({ obligations: new ResetObligations() })
+  ctx.recreate(NEW_ID)
+  await seek(ctx, '-2')
+  expect(ctx.owed()).toBe(true)
+  await sibling.commitOffsets({
+    topics: [{ topic: TOPIC, partitions: [{ partition: 0, offset: '70' }] }],
+  })
+  expect(ctx.owed()).toBe(false)
+  group.onStopRequested()
+  expect(ctx.owed()).toBe(false)
+  const { position, cache } = await runAgain(ctx)
+  expect(position).toBe('70')
+  expect(cache).toBe('70')
+  expect(ctx.cluster.fetchTopicsOffset).not.toHaveBeenCalled()
 })
 
 test('many replacements and uses retain no historical sentinel or ledger cells', async () => {

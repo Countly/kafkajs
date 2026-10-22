@@ -170,6 +170,134 @@ describe('Consumer > OffsetOperations', () => {
     })
   })
 
+  describe('owner barriers fence only their owner', () => {
+    const owner = { name: 'owner' }
+    const other = { name: 'other' }
+
+    test.each([
+      ['a read', {}],
+      ['a mutation', { mutation: true }],
+    ])('%s of the owner begun before the touch is superseded', (_, options) => {
+      const ticket = operations.begin([cell()], { ...options, owner })
+
+      operations.touchOwned(owner, T, 0)
+
+      expect(operations.isSuperseded(ticket, T, 0)).toBe(true)
+    })
+
+    test('the touch leaves another owner, an ownerless ticket and other cells of the owner alone', () => {
+      const mine = operations.begin([cell(0), cell(1)], { owner })
+      const theirs = operations.begin([cell(0)], { owner: other })
+      const commit = operations.begin([cell(0)], { mutation: true })
+      const read = operations.begin([cell(0)])
+
+      operations.touchOwned(owner, T, 0)
+
+      expect(operations.isSuperseded(mine, T, 0)).toBe(true)
+      expect(operations.isSuperseded(mine, T, 1)).toBe(false)
+      expect(operations.isSuperseded(theirs, T, 0)).toBe(false)
+      expect(operations.isSuperseded(commit, T, 0)).toBe(false)
+      expect(operations.isSuperseded(read, T, 0)).toBe(false)
+    })
+
+    test('a ticket of the owner that began after the touch is not superseded by it', () => {
+      const earlier = operations.begin([cell()], { owner })
+      operations.touchOwned(owner, T, 0)
+
+      const later = operations.begin([cell()], { owner })
+
+      expect(operations.isSuperseded(earlier, T, 0)).toBe(true)
+      expect(operations.isSuperseded(later, T, 0)).toBe(false)
+    })
+
+    test('a shared touch still fences the tickets of every owner', () => {
+      const ticket = operations.begin([cell()], { owner })
+
+      operations.touch(T, 0)
+
+      expect(operations.isSuperseded(ticket, T, 0)).toBe(true)
+    })
+
+    test('a null owner never fences the ownerless tickets of the other participants', () => {
+      const ticket = operations.begin([cell()])
+
+      operations.touchOwned(null, T, 0)
+
+      expect(operations.isSuperseded(ticket, T, 0)).toBe(false)
+    })
+
+    test('the mark retains nothing for a cell nobody covers and leaves with the cell', () => {
+      operations.touchOwned(owner, T, 0)
+      expect(operations.size()).toBe(0)
+
+      const first = operations.begin([cell()], { owner })
+      operations.touchOwned(owner, T, 0)
+      operations.end(first)
+      expect(operations.size()).toBe(0)
+
+      const second = operations.begin([cell()], { owner })
+      expect(operations.isSuperseded(second, T, 0)).toBe(false)
+    })
+  })
+
+  describe('fence and discharge are the two halves of apply', () => {
+    const attachedTable = () => {
+      const obligations = new ResetObligations()
+      obligations.attachTo(operations)
+      obligations.owe(T, 'id-b')
+      return obligations
+    }
+
+    test('a fence supersedes what an apply would and settles no obligation', () => {
+      const obligations = attachedTable()
+      const read = operations.begin([cell()])
+      const older = operations.begin([cell()], { mutation: true })
+      const mutation = operations.begin([cell()], { mutation: true })
+
+      operations.fence(mutation, T, 0)
+
+      expect(operations.isSuperseded(read, T, 0)).toBe(true)
+      expect(operations.isSuperseded(older, T, 0)).toBe(true)
+      expect(operations.isSuperseded(mutation, T, 0)).toBe(false)
+      expect(obligations.isOwed(T, 0)).toBe(true)
+    })
+
+    test('a fence retains nothing for a cell nobody covers', () => {
+      const mutation = operations.begin([cell()], { mutation: true })
+      operations.end(mutation)
+
+      operations.fence(mutation, T, 0)
+
+      expect(operations.size()).toBe(0)
+    })
+
+    test('a discharge settles every attached table and supersedes nothing', () => {
+      const first = attachedTable()
+      const second = attachedTable()
+      const read = operations.begin([cell()])
+      const mutation = operations.begin([cell()], { mutation: true })
+
+      operations.discharge(T, '0')
+
+      expect(first.isOwed(T, 0)).toBe(false)
+      expect(second.isOwed(T, 0)).toBe(false)
+      expect(operations.isSuperseded(read, T, 0)).toBe(false)
+      expect(operations.isSuperseded(mutation, T, 0)).toBe(false)
+    })
+
+    test('a fence then a discharge leave the cell as an apply does', () => {
+      const obligations = attachedTable()
+      const read = operations.begin([cell()])
+      const mutation = operations.begin([cell()], { mutation: true })
+
+      operations.fence(mutation, T, 0)
+      operations.discharge(T, 0)
+
+      expect(operations.isSuperseded(read, T, 0)).toBe(true)
+      expect(obligations.isOwed(T, 0)).toBe(false)
+    })
+  })
+
   describe('partitions given as strings', () => {
     test('a string partition is the same cell as its number', () => {
       const read = operations.begin([cell('0')])

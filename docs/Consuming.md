@@ -456,7 +456,7 @@ consumer.seek({ topic: 'example', partition: 0, offset: 12384 })
 
 Upon seeking to an offset, any messages in active batches are marked as stale and discarded, making sure the next message read for the partition is from the offset sought to. Make sure to check `isStale()` before processing a message using [the `eachBatch` interface](#each-batch) of `consumer.run`.
 
-For a concrete offset, the consumer commits the sought offset by default; set [`autoCommit`](#auto-commit) to `false` to disable that commit. A sentinel seek to `'-2'` (earliest) or `'-1'` (latest) instead requests that partition's exact boundary through ListOffsets on the next resolution, independently of `fromBeginning` and `autoCommit`. The following fetch starts at the returned concrete offset. A sentinel seek never commits the negative sentinel. Pending sentinel intent is discarded if ownership is lost or the consumer stops.
+For a concrete offset, the consumer commits the sought offset by default; set [`autoCommit`](#auto-commit) to `false` to disable that commit. A sentinel seek to `'-2'` (earliest) or `'-1'` (latest) instead requests that partition's exact boundary through ListOffsets on the next resolution, independently of `fromBeginning` and `autoCommit`. The following fetch starts at the returned concrete offset. A sentinel seek never commits the negative sentinel. Pending sentinel intent is discarded if ownership is lost or the consumer stops. If the consumer stops before a sentinel's boundary arrives, a pending topic-recreation reset stays owed and the next run applies it.
 
 ```javascript
 consumer.run({
