@@ -115,6 +115,8 @@ module.exports = class BrokerPool {
     /** @type {import("../../types").BrokerMetadata | null} */
     this.metadata = null
     this.metadataExpireAt = null
+    /** Counts the responses published to `this.metadata`, so a refresh can tell it was superseded. */
+    this.metadataPublications = 0
     this.versions = null
 
     this.metadataRecoveryStrategy = metadataRecoveryStrategy ?? 'rebootstrap'
@@ -467,12 +469,17 @@ module.exports = class BrokerPool {
   }
 
   /**
+   * Disconnects the seed and every broker in the table once, starting all drains concurrently.
+   * Pool state is cleared only after every disconnect succeeds. If one fails, this call rejects
+   * while the other disconnects continue.
    * @public
-   * @returns {Promise}
+   * @returns {Promise<void>} resolves when every broker has disconnected
+   * @throws {Error} when a broker's disconnect fails
    */
   async disconnect() {
-    this.seedBroker && (await this.seedBroker.disconnect())
-    await Promise.all(values(this.brokers).map((broker) => broker.disconnect()))
+    const brokers = new Set(values(this.brokers))
+    if (this.seedBroker) brokers.add(this.seedBroker)
+    await Promise.all([...brokers].map((broker) => broker.disconnect()))
 
     this.brokers = {}
     this.metadata = null
@@ -527,6 +534,11 @@ module.exports = class BrokerPool {
    * reference a caller holds; a new rack is written onto it in place. Only a moved broker is
    * rebuilt and the old one retired.
    *
+   * Refreshes may overlap, and their replies may arrive in one read. Each response takes a
+   * publication number when it is assigned to `this.metadata`, and a refresh stops reconciling the
+   * broker table as soon as a newer response has been published: the topology last published is
+   * the one installed, and a pool built for an older one is closed unused.
+   *
    * `findConnectedBroker()` and the seed host/port read happen **inside** the retry callback:
    * a rebootstrap partway through this method (trigger (c), fired from inside
    * `findConnectedBroker()`, or a concurrent direct `rebootstrap()` call) disconnects the broker
@@ -576,6 +588,8 @@ module.exports = class BrokerPool {
           // start trigger (a)'s clock over an internal race rather than real broker
           // unavailability. Everything below reads this local instead.
           const metadata = this.metadata
+          const publication = ++this.metadataPublications
+          const isLatest = () => this.metadataPublications === publication
           // Applied here, on the statement after the assignment and before any await, so no
           // reader can observe the fresh response with the monotonic leader guard not yet
           // applied. An empty topic list is encoded as the null array, which asks for every topic
@@ -590,7 +604,13 @@ module.exports = class BrokerPool {
           )
           for (const { nodeId, host, port, rack } of metadata.brokers) {
             const previous = previousBrokers[nodeId]
-            if (this.brokers[nodeId] !== previous || this.seedBroker !== seedBroker) continue
+            if (
+              !isLatest() ||
+              this.brokers[nodeId] !== previous ||
+              this.seedBroker !== seedBroker
+            ) {
+              continue
+            }
             if (previous && !hasBrokerMoved(previous, { host, port })) {
               previous.connectionPool.rack = rack
               continue
@@ -603,7 +623,11 @@ module.exports = class BrokerPool {
               continue
             }
             const connectionPool = await this.buildConnectionPool({ host, port, rack })
-            if (this.brokers[nodeId] !== previous || this.seedBroker !== seedBroker) {
+            if (
+              !isLatest() ||
+              this.brokers[nodeId] !== previous ||
+              this.seedBroker !== seedBroker
+            ) {
               this.closePool(connectionPool)
               continue
             }
@@ -620,7 +644,7 @@ module.exports = class BrokerPool {
             }
           }
           for (const [nodeId, previous] of Object.entries(previousBrokers)) {
-            if (!freshBrokerIds.has(nodeId) && this.brokers[nodeId] === previous) {
+            if (isLatest() && !freshBrokerIds.has(nodeId) && this.brokers[nodeId] === previous) {
               if (previous === this.seedBroker) delete this.brokers[nodeId]
               else this.closeObsolete(previous)
             }
