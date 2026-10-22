@@ -228,6 +228,33 @@ const rebalanceVerdict = (journal, outages) =>
   })
 
 /**
+ * The groups whose rebalance verdict fails a run. The consumer-protocol group's verdict is only
+ * recorded in the evidence: its membership outcome is left to that protocol's own outage handling.
+ */
+const REBALANCE_ASSERTED = ['classic']
+
+/**
+ * The first short-arm violation of an asserted group, which stops the run.
+ * @param {Record<string, { kind: string, violation: boolean }>} verdicts one arm's verdict per group
+ * @returns {[string, object]|undefined} the group and its verdict
+ */
+const shortArmStop = (verdicts) =>
+  Object.entries(verdicts).find(
+    ([group, { kind, violation }]) =>
+      REBALANCE_ASSERTED.includes(group) && kind === 'short' && violation
+  )
+
+/**
+ * Every rebalance violation of the asserted groups over the whole run.
+ * @param {Record<string, { rebalances: { violation: boolean }[] }>} verdict the run's verdict per group
+ * @returns {object[]}
+ */
+const assertedRebalanceViolations = (verdict) =>
+  REBALANCE_ASSERTED.flatMap((group) =>
+    verdict[group].rebalances.filter(({ violation }) => violation)
+  )
+
+/**
  * Oracle part 4, position: at quiescence each partition's committed offset is the highest
  * delivered offset plus one, and no commit ever named more than what was delivered by then plus
  * one.
@@ -538,6 +565,46 @@ describe('Broker bounce oracle', () => {
     })
   })
 
+  test('only the classic group stops a run or fails it on a rebalance; the consumer group is recorded', () => {
+    const short = { arm: 'short', tDown: 1000, tRestored: 2000, outageMs: 1000 }
+    const long = { arm: 'long', tDown: 100000, tRestored: 130000, outageMs: 30000 }
+    const outages = [short, long]
+    const churn = [
+      { kind: 'PARTITIONS_LOST', member: 'a', at: 101000 },
+      { kind: 'PARTITIONS_ASSIGNED', member: 'a', at: 105000 },
+      { kind: 'PARTITIONS_LOST', member: 'a', at: 105100 },
+    ]
+    const judge = (classic, consumer) => {
+      const journals = { classic: journalOf(classic, 30000), consumer: journalOf(consumer, 6000) }
+      const verdict = Object.fromEntries(
+        Object.entries(journals).map(([group, journal]) => [
+          group,
+          { rebalances: rebalanceVerdict(journal, outages) },
+        ])
+      )
+      const stops = outages.map((_, arm) =>
+        shortArmStop(
+          Object.fromEntries(Object.entries(verdict).map(([g, v]) => [g, v.rebalances[arm]]))
+        )
+      )
+      return { verdict, stops, failures: assertedRebalanceViolations(verdict) }
+    }
+    const consumerOnly = judge([], [{ kind: 'REBALANCING', member: 'a', at: 1500 }, ...churn])
+    const classicShort = judge([{ kind: 'REBALANCING', member: 'a', at: 1500 }], [])
+    const classicLong = judge(churn, [])
+
+    expect(consumerOnly.verdict.consumer.rebalances.map(({ violation }) => violation)).toEqual([
+      true,
+      true,
+    ])
+    expect(consumerOnly.stops).toEqual([undefined, undefined])
+    expect(consumerOnly.failures).toEqual([])
+    expect(classicShort.stops[0]).toEqual(['classic', classicShort.verdict.classic.rebalances[0]])
+    expect(classicShort.failures).toHaveLength(1)
+    expect(classicLong.stops).toEqual([undefined, undefined])
+    expect(classicLong.failures).toEqual([classicLong.verdict.classic.rebalances[1]])
+  })
+
   test('the position verdict finds a committed offset behind, and a commit ahead of delivery', () => {
     const journal = journalOf([{ kind: 'START', member: 'a', partition: 0, offset: '4' }])
     journal.committed('a', {
@@ -813,7 +880,7 @@ describeBounce('Broker bounce: durable log, delivery and rebalances across outag
       verdicts,
     })
     // The oracle's part 3: a violation in a short arm fails and stops the run.
-    const stopped = Object.entries(verdicts).find(([, v]) => v.kind === 'short' && v.violation)
+    const stopped = shortArmStop(verdicts)
     if (stopped) {
       const [group, verdict] = stopped
       throw new Error(`A ${group} rebalance in a short arm: ${JSON.stringify(verdict)}`)
@@ -1042,9 +1109,9 @@ describeBounce('Broker bounce: durable log, delivery and rebalances across outag
       })
 
       expect(logResult).toEqual({ missing: [], twice: [] })
+      expect(assertedRebalanceViolations(verdict)).toEqual([])
       for (const group of Object.keys(journals)) {
         expect(verdict[group].delivery).toEqual({ missing: [], unexplained: [] })
-        expect(verdict[group].rebalances.filter(({ violation }) => violation)).toEqual([])
         expect(verdict[group].position).toEqual({ behind: [], ahead: [] })
         expect(verdict[group].ownership).toEqual({ overlaps: [], staleCommits: [] })
       }
