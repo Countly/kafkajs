@@ -24,18 +24,23 @@ const identities = (report) => {
   if (tests.length === 0 || new Set(tests).size !== tests.length)
     throw new Error('tests must be nonempty and unique')
   const result = new Map()
+  let hooks = 0
   for (const [key, status] of [
     ['passes', 'passed'],
     ['failures', 'failed'],
     ['pending', 'pending'],
   ]) {
     for (const name of names(report[key])) {
-      if (!tests.includes(name) || result.has(name))
+      // Mocha reports a failed hook as a failure that is not one of `tests`.
+      const hook = !tests.includes(name)
+      if ((hook && key !== 'failures') || result.has(name))
         throw new Error(`inconsistent status for ${name}`)
+      hooks += hook ? 1 : 0
       result.set(name, status)
     }
   }
-  if (result.size !== tests.length) throw new Error('every test needs exactly one final status')
+  if (result.size !== tests.length + hooks)
+    throw new Error('every test needs exactly one final status')
   return result
 }
 

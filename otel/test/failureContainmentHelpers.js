@@ -1199,7 +1199,7 @@ const compareOutcome = async (h) => {
  * @returns {void}
  */
 const assertDiagnostics = (h) => {
-  const allowed = [h.observerError, h.diagnosticError, h.reason]
+  const allowed = [h.observerError, h.diagnosticError]
   for (const entry of h.logged) {
     assert.ok(
       entry.some((part) => allowed.includes(part)),

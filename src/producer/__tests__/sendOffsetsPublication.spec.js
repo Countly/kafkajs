@@ -79,10 +79,9 @@ describe.each(['tv1', 'tv2'])('Producer > transactional offsets on the wire (%s)
 
   /**
    * The cache is the shared per-instance record of what a group has committed, so it may be
-   * written only once the commit that carries the offsets is confirmed. Today the producer writes
-   * it as soon as the TxnOffsetCommit is answered, before the EndTxn is even sent, so an abort or
-   * an unknown outcome has already published them. The run happens in `beforeEach`, so only the
-   * ordering check can make this case fail as expected; the mark stays until that is fixed.
+   * written only once the commit that carries the offsets is confirmed: after the EndTxn response,
+   * never when the TxnOffsetCommit is answered. The run happens in `beforeEach`, which records any
+   * ordering violation for this case to report.
    */
   it('writes the cache only after the EndTxn response', () => {
     expect(publicationOrder).toBeNull()
@@ -262,6 +261,21 @@ describe.each(['tv1', 'tv2'])('Producer > transactional offsets on the wire (%s)
         await fixture.transaction.commit()
         expect(fixture.cache.get(`${topic}:0`)).toBe(mutate ? '2' : '4')
         expect(fixture.cluster.markOffsetAsCommitted).not.toHaveBeenCalled()
+      }
+    )
+
+    test.each([1, 2])(
+      'version %s forfeits the offsets an open transaction sent before disconnect, even when its commit after reconnect is confirmed',
+      async (level) => {
+        fixture = await open(level)
+        await fixture.send(topics('9'))
+        await fixture.producer.disconnect()
+        expect(fixture.ledger.size()).toBe(0)
+        await fixture.producer.connect()
+        await fixture.transaction.commit()
+        expect(fixture.broker.endTxn).toHaveBeenCalledTimes(1)
+        expect(fixture.cluster.markOffsetAsCommitted).not.toHaveBeenCalled()
+        expect(fixture.ledger.size()).toBe(0)
       }
     )
 

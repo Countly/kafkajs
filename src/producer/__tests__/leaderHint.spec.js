@@ -322,8 +322,7 @@ describe('Producer > KIP-951 leader hint', () => {
 
   test('a hint that moves the seed node updates its connection pool in place, keeping the Broker identity', async () => {
     // refreshMetadata can adopt the seed Broker into `this.brokers` under a real node id; this
-    // reproduces that
-    // state directly, since the harness's stub brokers never go through a real refresh.
+    // reproduces that state directly, since the harness's stub brokers never go through a real refresh.
     const { cluster, brokers } = createHintCluster({ answer: acceptAll })
     const pool = cluster.brokerPool
     const seed = brokers[1]

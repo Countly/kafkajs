@@ -535,7 +535,9 @@ const createProducer = ({
      * sent again if it ends pending; a pending one that is not under way is sent once more first.
      * It then waits for any commit another `disconnect()` sends, and for every commit the
      * application starts while it waits, so the connections never close while a commit is under
-     * way; each such commit extends the wait. The call resolves whatever they answer.
+     * way; each such commit extends the wait. The call resolves whatever they answer. Offsets
+     * staged by a transaction's `sendOffsets` that no confirmed commit has published by then are
+     * forfeited.
      * @return {Promise}
      */
     disconnect: async () => {

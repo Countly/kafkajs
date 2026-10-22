@@ -47,6 +47,13 @@ describe('canary test identities', () => {
       '- ["suite pending","pending"]',
     ])
   })
+  it('keeps a failed hook as its own failed identity', () => {
+    const hooked = { ...report(), failures: [test('suite "before all" hook for "x"')] }
+    expect(compare(hooked, hooked)).toEqual([])
+    expect(compare(report(), hooked)).toEqual([
+      '+ ["suite \\"before all\\" hook for \\"x\\"","failed"]',
+    ])
+  })
   it.each([
     ['missing array', {}],
     ['empty run', report([])],

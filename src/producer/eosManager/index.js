@@ -463,7 +463,10 @@ const createEosManager = ({
      * Commit the ongoing transaction, once every AddPartitionsToTxn it started has settled. The
      * caller waits for the transaction's own sends first: nothing of it may still be in flight. A
      * partition whose sequence is still unresolved - a batch the broker may or may not hold - makes
-     * the transaction abort-only first, so no EndTxn commits over it.
+     * the transaction abort-only first, so no EndTxn commits over it. Once the EndTxn is confirmed,
+     * the offsets this transaction's `sendOffsets` calls staged are published to the shared
+     * committed-offset cache, each partition once unless a newer offset operation fenced it; an
+     * unknown outcome keeps them staged for the next `commit()`.
      *
      * An EndTxn whose outcome is unknown - its retries ran out on a retriable answer, a timeout or
      * a lost connection - leaves the commit pending: the transaction stays `COMMITTING` and the
@@ -598,6 +601,12 @@ const createEosManager = ({
      * nothing is sent and the transaction is not marked started, since the broker starts none for
      * them and an `EndTxn` on an empty transaction fails. Under version 1 the AddOffsetsToTxn is
      * still sent, as in 2.2.4.
+     *
+     * The offsets are copied, and their ledger fence taken, when the method is called, before any
+     * await; the calls of one transaction then run one at a time in call order, each with its
+     * retries. Accepted offsets are staged, the last call winning for a partition, and reach the
+     * shared committed-offset cache only when `commit()` is confirmed; a failed call releases its
+     * own fence.
      * @see https://cwiki.apache.org/confluence/display/KAFKA/KIP-447%3A+Producer+scalability+for+exactly+once+semantics
      * @param {object} options
      * @param {import('../../../types').ConsumerGroupMetadata} [options.consumerGroupMetadata]
@@ -606,6 +615,8 @@ const createEosManager = ({
      * @returns {Promise<void>}
      * @throws {KafkaJSNonRetriableError} when both `consumerGroupMetadata` and `consumerGroupId`
      *   are given, or neither; nothing is armed then
+     * @throws {TypeError} when `topics`, or the `partitions` of one, is not an array; nothing is
+     *   sent and nothing is armed
      *
      * @typedef {Object} OffsetCommitTopic
      * @property {string} topic

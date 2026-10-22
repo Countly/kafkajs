@@ -136,8 +136,9 @@ function contained(diag, what, work, fallback) {
  * Runs `call` inside `ctx` exactly once, whatever the context manager does. A manager that throws
  * before it runs the callback has the callback run once without the context; one that throws after,
  * runs it twice or returns something else changes nothing: the callback's own result or throw is
- * what comes back, and the manager's failure is logged. A throw is captured with a flag, since
- * `undefined` can be thrown.
+ * what comes back, and the manager's failure is logged; the callback's own throw never passes
+ * through the manager, so it is never logged as the manager's failure. A throw is captured with a
+ * flag, since `undefined` can be thrown.
  * @template T
  * @param {import('@opentelemetry/api').DiagLogger} diag
  * @param {import('@opentelemetry/api').Context} ctx
@@ -160,11 +161,10 @@ function withContext(diag, ctx, call) {
         reason = error
       }
     }
-    if (failed) throw reason
     return result
   }
   contained(diag, 'context', () => context.with(ctx, once))
-  if (!called) return once()
+  if (!called) once()
   if (failed) throw reason
   return result
 }
