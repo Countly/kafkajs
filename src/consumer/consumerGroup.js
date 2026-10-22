@@ -23,6 +23,7 @@ const {
   isLostMember,
   isFatalMembership,
   isFencedInstance,
+  isStaleCoordinator,
 } = require('../errors')
 const { failure, createErrorFromCode } = require('../protocol/error')
 const {
@@ -43,6 +44,7 @@ const {
 } = require('./rebalanceErrorContract')
 const { EAGER } = require('./groupProtocol/interface')
 const describeThrown = require('../network/describeThrown')
+const { isConnectionLoss } = require('../network/connectionFailure')
 const dictionary = require('../utils/dictionary')
 
 /** @see https://github.com/apache/kafka/blob/4.3/clients/src/main/java/org/apache/kafka/common/protocol/Errors.java */
@@ -798,8 +800,10 @@ module.exports = class ConsumerGroup {
    * that moved (15, 16) ends the retrier's attempt; the sequence then starts again after the
    * retrier's first delay, looking the coordinator up anew, for as long as that outage is shorter
    * than the session timeout, counted on a monotonic clock from its first failure. A longer outage
-   * fails the call with its error as before; a stop requested meanwhile fails it as a stop, which
-   * the round treats as no crash. A consumer-protocol member keeps the retrier's counted attempts.
+   * fails the call with its error as before. A stop requested meanwhile fails it as a stop, which
+   * the round treats as no crash, whether it is seen when such an attempt fails (even past the
+   * session timeout) or after the pause. A consumer-protocol member keeps the retrier's counted
+   * attempts.
    *
    * Applying the result and reporting the round belong to the caller: this method performs one
    * exchange and returns what it decoded.
@@ -815,6 +819,9 @@ module.exports = class ConsumerGroup {
       try {
         return await this.joinAndSyncAttempt()
       } catch (e) {
+        if (this.isStopping() && (isConnectionLoss(e) || (e != null && isStaleCoordinator(e)))) {
+          throw consumerStoppingError()
+        }
         if (!outage.absorbs(e)) throw e
 
         const delay = this.backoff.initial()

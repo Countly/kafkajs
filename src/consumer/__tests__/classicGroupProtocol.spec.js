@@ -12,6 +12,7 @@ const {
 } = require('../instrumentationEvents')
 const { newLogger } = require('testHelpers')
 const { KafkaJSConnectionError } = require('../../errors')
+const sleep = require('../../utils/sleep')
 
 const FIXTURES = path.join(__dirname, 'fixtures', 'classicGroupProtocol')
 
@@ -299,6 +300,27 @@ describe('Consumer > classic group protocol > joinAndSync contract', () => {
       .mockResolvedValueOnce({ assignment: {} })
 
     await expect(group.joinAndSync()).resolves.toEqual({ assignment: {} })
+    expect(rebalance).toHaveBeenCalledTimes(2)
+  })
+
+  it('ends the join as a stop when a stop arrives during an attempt that fails after the outage bound', async () => {
+    const group = buildGroup(0)
+    group.sessionTimeout = 10
+    group.backoff = { initial: () => 0 }
+    const lost = () =>
+      new KafkaJSConnectionError('Connection error: connect ECONNREFUSED', {
+        code: 'ECONNREFUSED',
+      })
+    const rebalance = jest
+      .spyOn(group.groupMembership, 'rebalance')
+      .mockRejectedValueOnce(lost())
+      .mockImplementationOnce(async () => {
+        group.rebalanceCoordinator = { runner: { stopRequested: true } }
+        await sleep(30)
+        throw lost()
+      })
+
+    await expect(group.joinAndSync()).rejects.toMatchObject({ type: 'CONSUMER_STOPPING' })
     expect(rebalance).toHaveBeenCalledTimes(2)
   })
 

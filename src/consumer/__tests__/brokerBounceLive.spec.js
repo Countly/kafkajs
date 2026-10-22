@@ -178,9 +178,12 @@ const deliveryVerdict = (journal, outages) => {
 }
 
 /**
- * Oracle part 3, unexpected rebalances: none in a short arm between the outage and the end of its
- * stabilisation, and in a long arm at most one membership change, where the events of one change
- * are those less than the stabilisation window apart.
+ * Oracle part 3, unexpected rebalances: none in a short arm through its stabilisation, and at most
+ * one membership change in a long arm. Events less than the stabilisation window apart belong
+ * to one change. A member's PARTITIONS_LOST or CRASH keeps its loss pending until it is assigned
+ * again, so its delayed rejoin stays in that change. A new loss after assignment during the
+ * current change starts another change even if another member's loss is still pending. A crash
+ * counts even when no membership event follows it. The events count excludes standalone crashes.
  * @param {GroupJournal} journal
  * @param {object[]} outages each with `before`/`after` samples of the members' `groupMetadata()`
  * @returns {{ arm: string, kind: string, events: number, changes: number, violation: boolean }[]}
@@ -188,14 +191,33 @@ const deliveryVerdict = (journal, outages) => {
 const rebalanceVerdict = (journal, outages) =>
   outages.map((outage) => {
     const kind = armKind(outage.outageMs, journal.windowMs)
-    const events = journal.entries.filter(
-      (entry) =>
-        MEMBERSHIP.includes(entry.kind) && entry.at >= outage.tDown && entry.at <= windowEnd(outage)
+    const inWindow = journal.entries.filter(
+      (entry) => entry.at >= outage.tDown && entry.at <= windowEnd(outage)
     )
+    const events = inWindow.filter((entry) => MEMBERSHIP.includes(entry.kind))
     let changes = 0
-    events.forEach((event, index) => {
-      if (index === 0 || event.at - events[index - 1].at >= STABLE_MS) changes++
-    })
+    let last = -Infinity
+    const unsettled = new Set()
+    const assigned = new Set()
+    for (const entry of inWindow) {
+      const loss = entry.kind === 'PARTITIONS_LOST' || entry.kind === 'CRASH'
+      if (MEMBERSHIP.includes(entry.kind) || loss) {
+        if (
+          last === -Infinity ||
+          (loss && assigned.has(entry.member)) ||
+          (unsettled.size === 0 && entry.at - last >= STABLE_MS)
+        ) {
+          changes++
+          assigned.clear()
+        }
+        last = entry.at
+      }
+      if (loss) unsettled.add(entry.member)
+      if (entry.kind === 'PARTITIONS_ASSIGNED') {
+        unsettled.delete(entry.member)
+        assigned.add(entry.member)
+      }
+    }
     const identity = ({ memberId, generationId }) => `${memberId}|${generationId}`
     const sampled =
       (outage.before?.[journal.name] || []).map(identity).join(',') !==
@@ -398,6 +420,106 @@ describe('Broker bounce oracle', () => {
       changes: 2,
       violation: true,
     })
+  })
+
+  test('a loss and its late rejoin are one change; a new loss after the rejoin settled is another', () => {
+    const outage = { arm: 'x', tDown: 1000, tRestored: 30000, outageMs: 29000 }
+    const crashed = [
+      { kind: 'PARTITIONS_REVOKED', member: 'a', at: 2000 },
+      { kind: 'CRASH', member: 'a', at: 2001 },
+      { kind: 'GROUP_JOIN', member: 'a', at: 2001 + STABLE_MS + 4000 },
+      { kind: 'PARTITIONS_REVOKED', member: 'b', at: 2001 + 2 * STABLE_MS + 5000 },
+      { kind: 'PARTITIONS_ASSIGNED', member: 'a', at: 2001 + 2 * STABLE_MS + 5100 },
+    ]
+    const fenced = [
+      { kind: 'PARTITIONS_ASSIGNED', member: 'b', at: 2000 },
+      { kind: 'REBALANCING', member: 'a', at: 4000 },
+      { kind: 'PARTITIONS_LOST', member: 'a', at: 4000 },
+      { kind: 'GROUP_JOIN', member: 'a', at: 4000 + STABLE_MS + 400 },
+      { kind: 'PARTITIONS_ASSIGNED', member: 'a', at: 4000 + STABLE_MS + 900 },
+    ]
+    const again = [
+      ...crashed,
+      { kind: 'PARTITIONS_LOST', member: 'b', at: 2001 + 3 * STABLE_MS + 5100 },
+    ]
+
+    expect(rebalanceVerdict(journalOf(crashed), [outage])[0]).toMatchObject({
+      events: 4,
+      changes: 1,
+      violation: false,
+    })
+    expect(rebalanceVerdict(journalOf(fenced), [outage])[0]).toMatchObject({
+      changes: 1,
+      violation: false,
+    })
+    expect(rebalanceVerdict(journalOf(again), [outage])[0]).toMatchObject({
+      changes: 2,
+      violation: true,
+    })
+  })
+
+  test('a crash before the first event still opens a change in a short arm', () => {
+    const outage = { arm: 'x', tDown: 1000, tRestored: 2000, outageMs: 1000 }
+    const journal = journalOf([
+      { kind: 'CRASH', member: 'a', at: 1100 },
+      { kind: 'GROUP_JOIN', member: 'a', at: 1500 },
+    ])
+
+    expect(rebalanceVerdict(journal, [outage])[0]).toMatchObject({ changes: 1, violation: true })
+  })
+
+  test('a crash alone opens a change in a short arm, whatever the sampled identity', () => {
+    const members = [{ memberId: 'm', generationId: 1 }]
+    const outage = {
+      arm: 'x',
+      tDown: 1000,
+      tRestored: 2000,
+      outageMs: 1000,
+      before: { g: members },
+      after: { g: members },
+    }
+    const journal = journalOf([{ kind: 'CRASH', member: 'a', at: 1100 }])
+
+    expect(rebalanceVerdict(journal, [outage])[0]).toMatchObject({ changes: 1, violation: true })
+  })
+
+  test('a member assigned again that loses at once starts another change', () => {
+    const outage = { arm: 'x', tDown: 1000, tRestored: 30000, outageMs: 29000 }
+    const journal = journalOf([
+      { kind: 'PARTITIONS_LOST', member: 'a', at: 2000 },
+      { kind: 'PARTITIONS_ASSIGNED', member: 'a', at: 5000 },
+      { kind: 'PARTITIONS_LOST', member: 'a', at: 5100 },
+    ])
+
+    expect(rebalanceVerdict(journal, [outage])[0]).toMatchObject({ changes: 2, violation: true })
+  })
+
+  test('one member pending loss cannot hide the later loss of a recovered member', () => {
+    const outage = { arm: 'x', tDown: 1000, tRestored: 30000, outageMs: 29000 }
+    const owned = { partitions: [{ topic: 't', partitions: [0] }] }
+    const journal = journalOf([
+      { kind: 'PARTITIONS_REVOKED', member: 'a', at: 2000, payload: owned },
+      { kind: 'CRASH', member: 'a', at: 2001 },
+      { kind: 'PARTITIONS_ASSIGNED', member: 'b', at: 3000, payload: owned },
+      { kind: 'GROUP_JOIN', member: 'b', at: 3001 },
+      { kind: 'REBALANCING', member: 'b', at: 10000 },
+      { kind: 'PARTITIONS_LOST', member: 'b', at: 10000, payload: owned },
+      { kind: 'GROUP_JOIN', member: 'b', at: 15000 },
+      { kind: 'PARTITIONS_ASSIGNED', member: 'b', at: 16000, payload: owned },
+      { kind: 'CRASH', member: 'a', at: 20000 },
+      { kind: 'CRASH', member: 'a', at: 30000 },
+      { kind: 'START', member: 'b', partition: 0, offset: '0', at: 31000 },
+    ])
+    journal.committed('b', {
+      topics: [{ topic: 't', partitions: [{ partition: 0, offset: '1' }] }],
+    })
+    journal.ledger.produced({ topic: 't', partition: 0, offset: '0' })
+
+    expect(logVerdict([1], [1])).toEqual({ missing: [], twice: [] })
+    expect(deliveryVerdict(journal, [outage])).toEqual({ missing: [], unexplained: [] })
+    expect(positionVerdict(journal, 't', new Map([[0, '1']]))).toEqual({ behind: [], ahead: [] })
+    expect(ownershipVerdict(journal, 't')).toEqual({ overlaps: [], staleCommits: [] })
+    expect(rebalanceVerdict(journal, [outage])[0]).toMatchObject({ violation: true })
   })
 
   test('a changed member identity counts as a change even without an event', () => {

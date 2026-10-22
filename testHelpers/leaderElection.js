@@ -1,4 +1,5 @@
-const { execFileSync } = require('child_process')
+const { execFile, execFileSync } = require('child_process')
+const { promisify } = require('util')
 const path = require('path')
 
 const BOOTSTRAP_SERVER = 'kafka1:29092'
@@ -23,6 +24,18 @@ const COMPOSE_FILE = path.resolve(__dirname, '..', process.env.COMPOSE_FILE || '
  */
 const compose = (...args) =>
   execFileSync('docker', ['compose', '-f', COMPOSE_FILE, ...args], { stdio: 'pipe' })
+
+/**
+ * `docker compose -f <compose file> <args>` without blocking the event loop: a bounce step awaits it,
+ * so it still never races its container, while the clients under test in the same process keep
+ * heartbeating through a stop that takes seconds.
+ *
+ * @param {...string} args
+ * @returns {Promise<{ stdout: string, stderr: string }>}
+ * @throws {Error} if the `docker` CLI exits non-zero
+ */
+const composeAsync = (...args) =>
+  promisify(execFile)('docker', ['compose', '-f', COMPOSE_FILE, ...args])
 
 /**
  * Runs a command inside the kafka1 container, piping `input` to its stdin when given.
@@ -199,7 +212,7 @@ class BrokerBouncer {
    * @param {Record<string, { host: string, port: number }>} [boundary.nodes]
    */
   constructor({
-    run = compose,
+    run = composeAsync,
     answers: probe = answers,
     waitForFullIsr: isr = waitForFullIsr,
     now = Date.now,
@@ -265,14 +278,14 @@ class BrokerBouncer {
     let tRestored = null
     this.down.add(service)
     try {
-      this.run(kind, service)
+      await this.run(kind, service)
       tDown = this.now()
       await this.wait(holdMs)
     } catch (error) {
       failures.push(error)
     } finally {
       try {
-        this.run(kind === 'pause' ? 'unpause' : 'start', service)
+        await this.run(kind === 'pause' ? 'unpause' : 'start', service)
         tRestored = await this.waitForReachable(service)
         if (kind !== 'pause') {
           await this.isr(admin, topics)

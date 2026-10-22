@@ -425,6 +425,27 @@ describe('Consumer > broker outages', () => {
     expect(events.joins).toEqual([])
   })
 
+  it('a stop during a join attempt that outlasts the session timeout ends the join without a crash', async () => {
+    const { cluster, events } = scenario({
+      sessionTimeout: 1000,
+      retry: { ...RETRY, restartOnFailure: async () => false },
+    })
+    cluster.schedule.once({ api: 'JoinGroup' }, { errorCode: 15 })
+    const held = cluster.schedule.hold({ api: 'JoinGroup' })
+    const running = start(events)
+    await held.arrived()
+
+    const disconnecting = consumer.disconnect()
+    await sleep(1200)
+    held.release({ errorCode: 15 })
+    await disconnecting
+    await running
+
+    expect(events.crashes).toEqual([])
+    expect(events.joins).toEqual([])
+    expect(cluster.sockets().filter((socket) => !socket.destroyed)).toEqual([])
+  })
+
   describe('an outage that outlasts the session timeout', () => {
     const SHORT = { sessionTimeout: 1000, heartbeatInterval: 100 }
 
