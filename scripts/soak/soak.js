@@ -41,7 +41,12 @@ const PARTITIONS = 6
 const MEMBER_CHURN_MS = 15000
 const OUTAGE_SERVICE = 'kafka3'
 const TOPIC_NAMES = 50
-const SETTLE_MS = 5000
+/**
+ * How long a quiet point waits for the sockets the clients closed to go. An obsolete connection
+ * drains in the background for up to the client's `requestTimeout` (30 s by default) after a
+ * disconnect, so the wait outlasts that before a socket counts as left behind.
+ */
+const SETTLE_MS = 31000
 const PHASE_MS = 300000
 /** A profile of one phase: the warm-up, then six readings and a margin for their collection. */
 const STANDALONE_MS = 420000

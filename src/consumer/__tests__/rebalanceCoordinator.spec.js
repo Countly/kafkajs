@@ -1418,14 +1418,20 @@ describe('Consumer > RebalanceCoordinator', () => {
       return batch
     }
 
-    /** Fails loudly instead of hanging when a wait never settles. */
-    const settlesWithin = (promise, ms = 2000) =>
-      Promise.race([
-        promise,
-        new Promise((_, reject) =>
-          setTimeout(() => reject(new Error(`did not settle within ${ms}ms`)), ms)
-        ),
-      ])
+    /** Fails loudly instead of hanging when a wait never settles, and leaves no timer behind. */
+    const settlesWithin = async (promise, ms = 2000) => {
+      let timer
+      try {
+        return await Promise.race([
+          promise,
+          new Promise((_, reject) => {
+            timer = setTimeout(() => reject(new Error(`did not settle within ${ms}ms`)), ms)
+          }),
+        ])
+      } finally {
+        clearTimeout(timer)
+      }
+    }
 
     it('holds the round until the handler returns, and commits what it resolved', async () => {
       const { runner, consumerGroup, calls } = createRealRunner()

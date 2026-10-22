@@ -4,9 +4,12 @@ const path = require('path')
 const { introspect, versionDirs, requestDirectories, readFork } = require('../forkVersions')
 const trackedApis = require('../tracked-apis.json')
 
+const builtTrees = []
+
 /** Builds a throwaway src/protocol/requests-shaped tree: { produce: [3, 4], ... }. */
 const buildTree = (layout) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'compat-fork-'))
+  builtTrees.push(root)
   for (const name of Object.keys(layout)) {
     const dir = path.join(root, name)
     fs.mkdirSync(dir)
@@ -25,6 +28,10 @@ const entry = (kafkaName, apiKey, forkName, apiKeysName) => ({
 })
 
 describe('scripts/compat/forkVersions', () => {
+  afterAll(() => {
+    for (const root of builtTrees) fs.rmSync(root, { recursive: true, force: true })
+  })
+
   describe('filesystem readers', () => {
     const root = buildTree({ produce: [0, 1, 10, 2], fetch: [], notAnApi: [] })
 

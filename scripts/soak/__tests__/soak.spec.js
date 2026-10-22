@@ -882,6 +882,39 @@ describe('Soak > a run on the scripted cluster', () => {
     }
   })
 
+  test('waits out an obsolete connection that drains for up to the default request timeout before a quiet reading', async () => {
+    jest.useFakeTimers()
+    let closed = false
+    setTimeout(() => {
+      closed = true
+    }, 30000)
+    const probe = {
+      snapshot: async () =>
+        quiet({ sockets: { created: 1, destroyed: closed ? 1 : 0, open: closed ? 0 : 1 } }),
+    }
+    const lines = []
+    const soak = new Soak({
+      kafka: {},
+      probe,
+      phases: [{ name: 'idle', workload: 'idle', ms: 0 }],
+      context: {},
+      sampleMs: 60000,
+      warmupMs: 0,
+      record: (line) => lines.push(line),
+      workloads: { idle: async () => {} },
+    })
+
+    try {
+      const running = soak.run()
+      await jest.advanceTimersByTimeAsync(31000)
+      await running
+
+      expect(lines[0]).toMatchObject({ kind: 'baseline', snapshot: { sockets: { open: 0 } } })
+    } finally {
+      jest.useRealTimers()
+    }
+  })
+
   test('reads the private members of a client by name, and says when one is gone', () => {
     const stand = { [Symbol('private:Kafka:operations')]: new Map() }
 
