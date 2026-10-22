@@ -7,6 +7,7 @@ const {
   isFencedInstance,
   isUnknownMemberId,
   KafkaJSCommitFailedError,
+  COORDINATOR_LOAD_IN_PROGRESS_CODE,
 } = require('../errors')
 const handlerContext = require('./handlerContext')
 
@@ -723,14 +724,22 @@ module.exports = class Runner extends EventEmitter {
 
   /**
    * Which class of the fetch loop's own requests raised `error`.
+   *
+   * An OffsetCommit loading error propagated by a handler keeps its request provenance, so a
+   * classic member retries a commit helper's failure within the commit outage. Other handler
+   * errors keep their counted retries; consumer-protocol members do not ride outages.
    * @private
    * @param {unknown} error
-   * @returns {'fetch'|'heartbeat'|'commit'|undefined} undefined for a handler's error and for any
-   *   error the loop's own requests did not raise
+   * @returns {'fetch'|'heartbeat'|'commit'|undefined} undefined for other handler errors and for
+   *   errors the loop's own requests did not raise
    */
   requestClassOf(error) {
     const requestClass = this.requestClasses.get(error)
-    if (requestClass === 'handler') return undefined
+    if (requestClass === 'handler') {
+      return error.code === COORDINATOR_LOAD_IN_PROGRESS_CODE && isOffsetCommitError(error)
+        ? 'commit'
+        : undefined
+    }
     return requestClass ?? (isOffsetCommitError(error) ? 'commit' : undefined)
   }
 

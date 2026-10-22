@@ -1,4 +1,4 @@
-const { isStaleCoordinator } = require('../errors')
+const { isStaleCoordinator, COORDINATOR_LOAD_IN_PROGRESS_CODE } = require('../errors')
 const { isConnectionLoss } = require('../network/connectionFailure')
 
 /**
@@ -21,15 +21,19 @@ module.exports = class Outage {
   }
 
   /**
-   * Whether the path should ride `error` out: retry it after a pause, without counting it. The
-   * first such error starts the outage.
+   * Whether the path should ride `error` out: retry it after a pause, without counting it. It rides
+   * a lost connection and a coordinator that moved, is unavailable or is still loading the group
+   * (16, 15, 14). The first such error starts the outage.
    * @param {*} error what the path's attempt threw
    * @param {number} [now=performance.now()] a monotonic time, in milliseconds
    * @returns {boolean} false for any other error, and for every error once the outage has lasted
    *   the limit
    */
   absorbs(error, now = performance.now()) {
-    if (!isConnectionLoss(error) && !(error != null && isStaleCoordinator(error))) return false
+    const coordinator =
+      error != null &&
+      (isStaleCoordinator(error) || error.code === COORDINATOR_LOAD_IN_PROGRESS_CODE)
+    if (!isConnectionLoss(error) && !coordinator) return false
     if (this.since === null) this.since = now
     return now - this.since < this.limitMs
   }

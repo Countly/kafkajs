@@ -26,7 +26,7 @@ describe('Consumer > rebalance error contract', () => {
       [25, 'lost', false, true],
       [82, 'lost', true, false],
       [27, 'revoked', false, false],
-      [14, 'revoked', false, false],
+      [14, null, false, false],
       [16, 'retry-coordinator', false, false],
       [15, 'retry-coordinator', false, false],
     ]
@@ -157,7 +157,7 @@ describe('Consumer > rebalance error contract', () => {
             ? 'lost'
             : isStaleCoordinator(error)
               ? 'retry-coordinator'
-              : isRevoked(error)
+              : isRevoked(error) && error.code !== 14
                 ? 'revoked'
                 : null
 
@@ -246,7 +246,7 @@ describe('Consumer > rebalance error contract', () => {
     const ROWS = [
       [
         14,
-        { action: 'revoked', fatal: false, clearsMemberId: false },
+        { action: null, fatal: false, clearsMemberId: false },
         { action: null, fatal: false, clearsMemberId: false },
       ],
       [

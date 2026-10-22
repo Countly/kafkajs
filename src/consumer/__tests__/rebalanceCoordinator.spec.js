@@ -1800,12 +1800,6 @@ describe('Consumer > RebalanceCoordinator', () => {
         'rebalance-in-progress',
       ],
       [
-        'COORDINATOR_LOAD_IN_PROGRESS',
-        createErrorFromCode(COORDINATOR_LOAD_IN_PROGRESS),
-        'revoked',
-        'coordinator-changed',
-      ],
-      [
         'a bare NOT_COORDINATOR_FOR_GROUP type',
         { type: 'NOT_COORDINATOR_FOR_GROUP' },
         'revoked',
@@ -1828,6 +1822,9 @@ describe('Consumer > RebalanceCoordinator', () => {
       ).toBeNull()
       expect(
         coordinator.classify(createErrorFromCode(NOT_COORDINATOR_FOR_GROUP), 'heartbeat')
+      ).toBeNull()
+      expect(
+        coordinator.classify(createErrorFromCode(COORDINATOR_LOAD_IN_PROGRESS), 'heartbeat')
       ).toBeNull()
       expect(coordinator.classify(new Error('unrelated'), 'fetch')).toBeNull()
     })
@@ -1882,7 +1879,6 @@ describe('Consumer > RebalanceCoordinator', () => {
         { type: 'REBALANCE_IN_PROGRESS' },
         createErrorFromCode(ILLEGAL_GENERATION),
         createErrorFromCode(UNKNOWN_MEMBER_ID),
-        createErrorFromCode(COORDINATOR_LOAD_IN_PROGRESS),
         { type: 'NOT_COORDINATOR_FOR_GROUP' },
       ]) {
         const built = build()

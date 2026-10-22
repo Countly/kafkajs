@@ -61,6 +61,10 @@ describe('Consumer > Outage', () => {
     }
   })
 
+  it('rides out a coordinator that is still loading the group', () => {
+    expect(new Outage(1000).absorbs(createErrorFromCode(14), 0)).toBe(true)
+  })
+
   it('does not ride out any other error, and starts no outage for one', () => {
     const outage = new Outage(1000)
 

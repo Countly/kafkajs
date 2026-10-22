@@ -176,6 +176,13 @@ const rebalanceAction = (error, path, { kind = 'classic' } = {}) => {
     return { action: 'retry-coordinator', fatal: false, clearsMemberId: false }
   }
 
+  // Also before the revoked row: a coordinator still loading the group (14) is retried, not
+  // rejoined, as the consumer row answers it and as the Java client's classic commit retries it.
+  // @see https://github.com/apache/kafka/blob/4.3.1/clients/src/main/java/org/apache/kafka/clients/consumer/internals/ConsumerCoordinator.java
+  if (error.code === COORDINATOR_LOAD_IN_PROGRESS) {
+    return { action: null, fatal: false, clearsMemberId: false }
+  }
+
   if (isRevoked(error)) {
     return { action: 'revoked', fatal: false, clearsMemberId: false }
   }
