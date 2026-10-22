@@ -1,6 +1,6 @@
 {
   "name": "@countly/opentelemetry-instrumentation-kafkajs",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "OpenTelemetry instrumentation for @countly/kafkajs, the Countly fork of KafkaJS",
   "main": "src/index.js",
   "types": "src/index.d.ts",

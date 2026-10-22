@@ -15,9 +15,9 @@ const manifest = JSON.parse(read('package.json'))
 const lock = JSON.parse(read('package-lock.json'))
 
 describe('otel package manifest', () => {
-  it('names the package, its first version and its licence', () => {
+  it('names the package, its version and its licence', () => {
     assert.equal(manifest.name, '@countly/opentelemetry-instrumentation-kafkajs')
-    assert.equal(manifest.version, '0.1.0')
+    assert.equal(manifest.version, '0.1.1')
     assert.equal(manifest.license, 'Apache-2.0')
   })
 
