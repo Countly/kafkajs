@@ -578,6 +578,8 @@ Under `'consumer'` the two ways a member can be separated from its partitions st
 - **Fenced, or the poll deadline expired.** The coordinator rejected this member's epoch or id, or your handler took longer than `maxPollInterval`. The member emits [`PARTITIONS_LOST`](InstrumentationEvents.md#consumer) for its **whole** owned set and commits nothing for it: the epoch those offsets were resolved under is gone, so a commit would be rejected anyway. It then rejoins from scratch.
 - **Reconciled away.** The coordinator moved some partitions to another member. With `autoCommit: true` the offsets your handlers resolved on those partitions are committed **first**, and then [`PARTITIONS_REVOKED`](InstrumentationEvents.md#consumer) reports them. The partitions you keep are never interrupted.
 
+From the moment a member learns it was fenced, or that its poll deadline expired, it delivers no further record: `eachMessage` stops before the next message and batches already fetched are dropped. An `eachBatch` handler that is already running keeps its batch, but its commits are refused. Whoever owns the partition next, this member included after it rejoins, gets those records again from the last commit. A heartbeat that fails is retried with the client's `retry` backoff, held to at most 1 000 ms as in the Java client, so `retry.maxRetryTime` does not slow the member's return to a moved coordinator.
+
 A poll-interval overrun is detected on a heartbeat tick and never while a reconciliation is in flight, so under `'consumer'` detection is bounded by the heartbeat interval the coordinator asked for rather than by one you configured.
 
 ### Migrating in either direction

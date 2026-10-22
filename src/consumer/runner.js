@@ -1052,11 +1052,16 @@ module.exports = class Runner extends EventEmitter {
   /**
    * Whether a batch has outlived the assignment it was fetched under.
    *
-   * Two ways it can: the partition moved to another member, or it stayed but the offsets were
-   * replaced and the new assignment is already re-fetching the same records. Either way,
+   * Three ways it can: the partition moved to another member, it stayed but the offsets were
+   * replaced and the new assignment is already re-fetching the same records, or the membership
+   * itself was lost (a fence, an unknown member id, a poll-interval overrun). Either way,
    * delivering it duplicates records and committing for it moves an offset this member no longer
    * controls. Checked when a batch is picked up AND between messages, because a rebalance can
-   * land in the middle of a batch a handler is already working through.
+   * land in the middle of a batch a handler is already working through. A lost membership stops
+   * delivery the moment the loss is learned, before its round emits `PARTITIONS_LOST`, as the
+   * Java client marks a fenced member's partitions pending revocation so that no buffered record
+   * of theirs is returned.
+   * @see https://github.com/apache/kafka/blob/4.3.1/clients/src/main/java/org/apache/kafka/clients/consumer/internals/ConsumerMembershipManager.java
    *
    * @param {import('./batch')} batch
    * @returns {boolean}
@@ -1067,6 +1072,11 @@ module.exports = class Runner extends EventEmitter {
     // handlers to go idle is not enough on its own: the queue hands the worker the next batch the
     // instant the current one returns.
     if (this.quiescing) {
+      return true
+    }
+
+    const ownership = this.consumerGroup.ownership
+    if (ownership?.refusal(ownership.token())) {
       return true
     }
 

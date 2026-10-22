@@ -51,6 +51,13 @@ const {
  */
 const INITIAL_HEARTBEAT_INTERVAL_MS = 1000
 
+/**
+ * Java's `retry.backoff.max.ms` default: a heartbeat retry never waits longer than this, so a
+ * member reaches a moved coordinator well within the session the coordinator restarts on load.
+ * @see https://github.com/apache/kafka/blob/4.3.1/clients/src/main/java/org/apache/kafka/clients/CommonClientConfigs.java
+ */
+const HEARTBEAT_BACKOFF_MAX_MS = 1000
+
 const LEAVE_EPOCH_DYNAMIC = -1
 const LEAVE_EPOCH_STATIC = -2
 
@@ -189,16 +196,17 @@ const toBrokerPayload = (request) => {
 
 /**
  * The exponential backoff a heartbeat error arms, with the same shape the client's retrier uses:
- * `initialRetryTime * multiplier ** attempts`, jittered by `factor` and capped at `maxRetryTime`.
- * Its remaining delay is what the membership reports as its heartbeat interval while it is armed,
- * because the heartbeat manager reads only that.
+ * `initialRetryTime * multiplier ** attempts`, jittered by `factor` and capped at `maxRetryTime`,
+ * which is itself held to `HEARTBEAT_BACKOFF_MAX_MS`. Its remaining delay is what the membership
+ * reports as its heartbeat interval while it is armed, because the heartbeat manager reads only
+ * that.
  */
 class HeartbeatBackoff {
   /** @param {{ initialRetryTime?: number, maxRetryTime?: number, multiplier?: number, factor?: number }} [retry] */
   constructor(retry = {}) {
     const { initialRetryTime, maxRetryTime, multiplier, factor } = { ...retryDefaults, ...retry }
     this.initialRetryTime = initialRetryTime
-    this.maxRetryTime = maxRetryTime
+    this.maxRetryTime = Math.min(maxRetryTime, HEARTBEAT_BACKOFF_MAX_MS)
     this.multiplier = multiplier
     this.factor = factor
     this.reset()
@@ -229,7 +237,8 @@ class HeartbeatBackoff {
       this.initialRetryTime * this.multiplier ** this.attempts
     )
     this.attempts += 1
-    this.until = now + Math.round(base * (1 + this.factor * (Math.random() * 2 - 1)))
+    const jittered = Math.round(base * (1 + this.factor * (Math.random() * 2 - 1)))
+    this.until = now + Math.min(this.maxRetryTime, jittered)
     this.due = true
   }
 

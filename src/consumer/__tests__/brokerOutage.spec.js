@@ -759,6 +759,189 @@ describe('Consumer > broker outages', () => {
     expect(lostConnection(error)).toBe(true)
   })
 
+  describe('a consumer-protocol member and its fencing', () => {
+    // The client's default retry shape, so the heartbeat backoff is the one a user gets; enough
+    // retries that the empty fetch rounds' heartbeat errors cannot crash the loop in the window.
+    const SLOW_RETRY = { retries: 10, initialRetryTime: 300, maxRetryTime: 30000 }
+
+    /**
+     * @param {(request: { memberId: string, memberEpoch: number }) => object|null} [override]
+     *   answers a heartbeat itself when it returns an answer
+     * @returns {{ cluster: object, breaker: ReturnType<typeof outages>, heartbeats: number[] }}
+     */
+    const fencingScenario = (override = () => null) => {
+      const cluster = consumerProtocolScript(
+        createScriptedCluster({ nodes: NODES, profile: 'consumer' }),
+        { coordinator: COORDINATOR, batches: 1 }
+      )
+      const heartbeats = []
+      let epoch = 0
+      cluster.answer('ConsumerGroupHeartbeat', (request) => {
+        heartbeats.push(Date.now())
+        const { memberId, memberEpoch } = request
+        return (
+          override(request) || {
+            memberId,
+            memberEpoch: memberEpoch === 0 ? ++epoch : memberEpoch,
+            heartbeatIntervalMs: 100,
+            assignment:
+              memberEpoch === 0
+                ? { topicPartitions: [{ topicId: TOPIC_ID, partitions: [0] }] }
+                : null,
+          }
+        )
+      })
+      return { cluster, breaker: outages(cluster), heartbeats }
+    }
+
+    it("reaches its coordinator again within about a second of its return, as Java's retry.backoff.max.ms caps the heartbeat backoff", async () => {
+      const { cluster, breaker, heartbeats } = fencingScenario()
+      consumer = new Kafka(cluster.kafkaOptions({ retry: SLOW_RETRY })).consumer({
+        groupId: 'outage-group',
+        groupProtocol: 'consumer',
+        maxWaitTimeInMs: 20,
+        retry: SLOW_RETRY,
+      })
+      const events = { crashes: [], records: [] }
+      consumer.on(consumer.events.CRASH, ({ payload }) => events.crashes.push(payload))
+      await start(events, { autoCommit: false })
+      await until(() => events.records.length === 1, 'the first record')
+
+      breaker.take(COORDINATOR, 'reset')
+      await sleep(5000)
+      const before = heartbeats.length
+      const restoredAt = Date.now()
+      breaker.restore(COORDINATOR)
+      await until(() => heartbeats.length > before, 'a heartbeat after the restore', 2000)
+
+      // Uncapped, the attempts are 0.3, 0.6, 1.2, 2.4 and 4.8 s apart, so the first one after a
+      // 5 s outage comes 2.4 to 6.2 s after the coordinator is back.
+      expect(heartbeats[before] - restoredAt).toBeLessThan(1500)
+      expect(events.crashes).toEqual([])
+    })
+
+    it('delivers nothing more from a batch once a background heartbeat answers that it is fenced', async () => {
+      const entered = []
+      let inHandler = false
+      let enteredAtFence = null
+      // Only a heartbeat that arrives while a record is in the handler is fenced: that one is the
+      // 100 ms timer's, never the runner's own per-message call, which runs after the handler.
+      const { cluster } = fencingScenario(({ memberId, memberEpoch }) => {
+        if (memberEpoch <= 0 || enteredAtFence !== null || !inHandler) return null
+        enteredAtFence = entered.length
+        return {
+          errorCode: 110,
+          memberId,
+          memberEpoch,
+          heartbeatIntervalMs: 100,
+          assignment: null,
+        }
+      })
+      cluster.answer('Fetch', async ({ maxWaitMs, topics }) => {
+        const [{ partition, fetchOffset }] = topics[0].partitions
+        if (fetchOffset !== '0' || entered.length > 0) {
+          await sleep(maxWaitMs)
+          return { partitions: [{ partition, errorCode: 0, records: false }] }
+        }
+        const batch = await RecordBatch({
+          firstOffset: fetchOffset,
+          firstTimestamp: 1700000000000,
+          maxTimestamp: 1700000000000,
+          records: [0, 1, 2].map((offsetDelta) =>
+            RecordEncoder({ offsetDelta, key: Buffer.from('key'), value: Buffer.from('value') })
+          ),
+        })
+        return { partitions: [{ partition, errorCode: 0, records: Buffer.from(batch.buffer) }] }
+      })
+      consumer = new Kafka(cluster.kafkaOptions({ retry: RETRY })).consumer({
+        groupId: 'outage-group',
+        groupProtocol: 'consumer',
+        maxWaitTimeInMs: 20,
+        retry: RETRY,
+      })
+      let enteredAtLoss = null
+      consumer.on(consumer.events.PARTITIONS_LOST, () => {
+        enteredAtLoss ??= entered.length
+      })
+      await consumer.connect()
+      await consumer.subscribe({ topic: TOPIC, fromBeginning: true })
+      await consumer.run({
+        autoCommit: false,
+        eachMessage: async ({ message }) => {
+          entered.push(message.offset)
+          inHandler = true
+          await sleep(300)
+          inHandler = false
+        },
+      })
+      await until(() => enteredAtLoss !== null, 'the lost partitions', 2000)
+
+      expect(enteredAtFence).toBe(1)
+      expect(entered.slice(0, enteredAtLoss)).toEqual(['0'])
+    })
+  })
+
+  it('a classic member delivers nothing more once a background heartbeat answers that it is unknown, and gets every record again after its rejoin', async () => {
+    const records = ['0', '1', '2', '3', '4', '5']
+    const cluster = groupScript(createScriptedCluster({ nodes: NODES }), {
+      coordinator: COORDINATOR,
+    })
+    const entered = []
+    let inHandler = false
+    let enteredAtFence = null
+    cluster.answer('Heartbeat', () => {
+      if (!inHandler || enteredAtFence !== null) return { errorCode: 0 }
+      enteredAtFence = entered.length
+      return { errorCode: 25 }
+    })
+    // A long poll keeps the fetch loop from settling for seconds after the loss, the window in
+    // which the member used to go on delivering.
+    cluster.answer('Fetch', async ({ maxWaitMs, topics }) => {
+      const [{ partition, fetchOffset }] = topics[0].partitions
+      const first = Number(fetchOffset)
+      if (first >= records.length) {
+        await sleep(maxWaitMs)
+        return { partitions: [{ partition, errorCode: 0, records: false }] }
+      }
+      const batch = await RecordBatch({
+        firstOffset: fetchOffset,
+        firstTimestamp: 1700000000000,
+        maxTimestamp: 1700000000000,
+        records: records
+          .slice(first)
+          .map((_, offsetDelta) =>
+            RecordEncoder({ offsetDelta, key: Buffer.from('key'), value: Buffer.from('value') })
+          ),
+      })
+      return { partitions: [{ partition, errorCode: 0, records: Buffer.from(batch.buffer) }] }
+    })
+    consumer = new Kafka(cluster.kafkaOptions({ retry: RETRY })).consumer({
+      groupId: 'outage-group',
+      heartbeatInterval: 100,
+      maxWaitTimeInMs: 3000,
+      retry: RETRY,
+    })
+    let enteredAtLoss = null
+    consumer.on(consumer.events.PARTITIONS_LOST, () => {
+      enteredAtLoss ??= entered.length
+    })
+    await consumer.connect()
+    await consumer.subscribe({ topic: TOPIC, fromBeginning: true })
+    await consumer.run({
+      eachMessage: async ({ message }) => {
+        entered.push(message.offset)
+        inHandler = true
+        await sleep(200)
+        inHandler = false
+      },
+    })
+    await until(() => enteredAtLoss !== null, 'the lost partitions', 2000)
+    await until(() => entered.length >= enteredAtLoss + records.length, 'the redelivery', 2000)
+
+    expect(entered.slice(0, enteredAtLoss)).toEqual(records.slice(0, enteredAtFence))
+    expect(entered.slice(enteredAtLoss)).toEqual(records)
+  })
+
   it('a cluster another consumer disconnected under a running one leaves no connection behind', async () => {
     const scripted = groupScript(createScriptedCluster({ nodes: NODES }), {
       coordinator: COORDINATOR,

@@ -869,6 +869,32 @@ describe('Consumer > groupProtocol > ConsumerGroupProtocol', () => {
       Math.random.mockRestore()
     })
 
+    it.each([
+      [0.5, [300, 600, 1000, 1000, 1000, 1000]],
+      [1, [360, 720, 1000, 1000, 1000, 1000]],
+    ])(
+      'caps the heartbeat backoff at 1 s after the jitter, as the Java client caps it at retry.backoff.max.ms (random %s)',
+      async (random, expected) => {
+        jest.spyOn(Math, 'random').mockReturnValue(random)
+        const h = build({
+          answers: [heartbeatResponse({ memberEpoch: 3 }), createErrorFromCode(14)],
+          retry: { initialRetryTime: 300, maxRetryTime: 30000, multiplier: 2, factor: 0.2 },
+        })
+        await await startStep(h)
+
+        jest.advanceTimersByTime(5000)
+        const intervals = []
+        for (let i = 0; i < 6; i++) {
+          await h.manager.tick()
+          intervals.push(h.protocol.heartbeatInterval())
+          jest.advanceTimersByTime(intervals[i])
+        }
+
+        expect(intervals).toEqual(expected)
+        Math.random.mockRestore()
+      }
+    )
+
     it('keeps the backoff inside its jitter band and under the cap', async () => {
       for (const [random, expected] of [
         [0, 240],
