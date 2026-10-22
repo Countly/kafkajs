@@ -26,7 +26,10 @@ const { failure, createErrorFromCode } = require('../../../error')
 const decode = async (rawData) => {
   const decoder = new Decoder(rawData)
   const throttleTime = decoder.readInt32()
-  const responses = decoder.readUVarIntArray(decodeResponses) || []
+  const responses = Decoder.requireArray(
+    decoder.readUVarIntArray(decodeResponses),
+    'ListOffsetsResponse.Topics'
+  )
   decoder.readTaggedFields()
 
   return {
@@ -39,7 +42,10 @@ const decode = async (rawData) => {
 const decodeResponses = (decoder) => {
   const response = {
     topic: decoder.readUVarIntString(),
-    partitions: decoder.readUVarIntArray(decodePartitions) || [],
+    partitions: Decoder.requireArray(
+      decoder.readUVarIntArray(decodePartitions),
+      'ListOffsetsResponse.Topics.Partitions'
+    ),
   }
 
   decoder.readTaggedFields()

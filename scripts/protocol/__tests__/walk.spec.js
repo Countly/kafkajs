@@ -160,4 +160,70 @@ describe('scripts/protocol > walkBody', () => {
       }
     })
   })
+
+  describe('a length the definition does not allow at that version', () => {
+    test.each([
+      ['a classic string', 'SaslHandshakeRequest', 1, 'ffff'],
+      ['classic bytes', 'SaslAuthenticateRequest', 1, 'ffffffff'],
+      ['a classic array', 'CreateAclsResponse', 1, '00000000' + 'ffffffff'],
+      ['a compact string', 'HeartbeatRequest', 4, '00' + '00000001' + '0261' + '00' + '00'],
+      ['compact bytes', 'SaslAuthenticateRequest', 2, '00' + '00'],
+      ['a compact array', 'CreateAclsResponse', 3, '00000000' + '00' + '00'],
+      [
+        'an element of a nullable classic array',
+        'DescribeConfigsRequest',
+        1,
+        '00000001' + '02' + '000161' + '00000001' + 'ffff' + '00',
+      ],
+    ])('refuses a null in %s that is not nullable', (_, message, version, hex) => {
+      expect(walkBody(spec(message), version, Buffer.from(hex, 'hex'))).toEqual({
+        ok: false,
+        reason: expect.stringMatching(/is null, but is not nullable at version/),
+      })
+    })
+
+    test.each([
+      ['a classic string', 'SaslHandshakeRequest', 1, 'fffe'],
+      ['classic bytes', 'SaslAuthenticateRequest', 1, 'fffffffe'],
+      ['a classic array', 'CreateAclsResponse', 1, '00000000' + 'fffffffe'],
+      [
+        'a nullable classic string',
+        'CreateAclsResponse',
+        1,
+        '00000000' + '00000001' + '0000' + 'fffe',
+      ],
+      ['a nullable classic array', 'MetadataRequest', 1, 'fffffffe'],
+    ])('refuses a length below -1 in %s, null allowed or not', (_, message, version, hex) => {
+      expect(walkBody(spec(message), version, Buffer.from(hex, 'hex'))).toEqual({
+        ok: false,
+        reason: expect.stringMatching(/has the length -\d+/),
+      })
+    })
+
+    test.each([
+      ['a classic string', 'SaslHandshakeRequest', 1, '0000'],
+      ['classic bytes', 'SaslAuthenticateRequest', 1, '00000000'],
+      ['a classic array', 'CreateAclsResponse', 1, '00000000' + '00000000'],
+      ['a compact string', 'HeartbeatRequest', 4, '0267' + '00000001' + '0261' + '00' + '00'],
+      ['compact bytes', 'SaslAuthenticateRequest', 2, '01' + '00'],
+      ['a compact array', 'CreateAclsResponse', 3, '00000000' + '01' + '00'],
+    ])('accepts an empty value in %s', (_, message, version, hex) => {
+      expect(walkBody(spec(message), version, Buffer.from(hex, 'hex'))).toEqual({ ok: true })
+    })
+
+    test.each([
+      ['a classic string', 'CreateAclsResponse', 1, '00000000' + '00000001' + '0000' + 'ffff'],
+      ['a classic array', 'MetadataRequest', 1, 'ffffffff'],
+      [
+        'an array of strings',
+        'DescribeConfigsRequest',
+        1,
+        '00000001' + '02' + '000161' + 'ffffffff' + '00',
+      ],
+      ['a compact string', 'HeartbeatRequest', 4, '0267' + '00000001' + '0261' + '00' + '00'],
+      ['a compact array', 'MetadataRequest', 9, '00' + '01' + '00' + '00' + '00'],
+    ])('accepts a null in %s that is nullable', (_, message, version, hex) => {
+      expect(walkBody(spec(message), version, Buffer.from(hex, 'hex'))).toEqual({ ok: true })
+    })
+  })
 })

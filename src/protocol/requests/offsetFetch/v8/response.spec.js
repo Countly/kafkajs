@@ -36,12 +36,12 @@ describe('Protocol > Requests > OffsetFetch > v8', () => {
       .writeUVarIntArray([
         new Encoder()
           .writeUVarIntString('group-1')
-          .writeUVarIntArray(null)
+          .writeUVarIntArray([])
           .writeInt16(0)
           .writeTaggedFields(),
         new Encoder()
           .writeUVarIntString('group-2')
-          .writeUVarIntArray(null)
+          .writeUVarIntArray([])
           .writeInt16(0)
           .writeTaggedFields(),
       ])

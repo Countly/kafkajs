@@ -33,7 +33,10 @@ const { topicIdSchema } = require('../../topicIds')
 const decodeGroup = (topicNames) => (decoder) => {
   const group = {
     groupId: decoder.readUVarIntString(),
-    topics: decoder.readUVarIntArray(decodeTopic(topicNames)) || [],
+    topics: Decoder.requireArray(
+      decoder.readUVarIntArray(decodeTopic(topicNames)),
+      'OffsetFetchResponse.Groups.Topics'
+    ),
     errorCode: decoder.readInt16(),
   }
 
@@ -43,7 +46,10 @@ const decodeGroup = (topicNames) => (decoder) => {
 
 const decodeTopic = (topicNames) => (decoder) => {
   const topicId = decoder.readUuid()
-  const partitions = decoder.readUVarIntArray(decodePartition) || []
+  const partitions = Decoder.requireArray(
+    decoder.readUVarIntArray(decodePartition),
+    'OffsetFetchResponse.Groups.Topics.Partitions'
+  )
   decoder.readTaggedFields()
 
   const topic = topicNames.get(topicId)
@@ -73,7 +79,10 @@ const decodePartition = (decoder) => {
 const decode = async (rawData, { topicNames = new Map() } = {}) => {
   const decoder = new Decoder(rawData)
   const throttleTime = decoder.readInt32()
-  const groups = decoder.readUVarIntArray(decodeGroup(topicNames)) || []
+  const groups = Decoder.requireArray(
+    decoder.readUVarIntArray(decodeGroup(topicNames)),
+    'OffsetFetchResponse.Groups'
+  )
   decoder.readTaggedFields()
 
   if (groups.length !== 1) {

@@ -99,14 +99,30 @@ class BodyWalker {
   /**
    * The length of a string, bytes or records field and of an array: classic is an int16 (string)
    * or int32 (the rest) with -1 for null; compact is a varint of the length plus one with 0 for
-   * null.
-   * @returns {number} the length, or -1 for null
+   * null. Judged before any content is read: below -1 is never valid, and -1 only where the field
+   * is nullable at this version.
+   * @param {string} type `string`, `bytes`, `records` or `array`
+   * @param {boolean} nullable whether the field is nullable at this version
+   * @param {string} what the field, for the error
+   * @returns {number} the length, or -1 for an allowed null
+   * @throws {Error} on a length below -1, a null that is not allowed, or too few bytes
    */
-  length(type, what) {
-    if (this.flexible) return this.uvarint(what) - 1
-    const size = type === 'string' ? 2 : 4
-    this.take(size, what)
-    return size === 2 ? this.bytes.readInt16BE(this.at - 2) : this.bytes.readInt32BE(this.at - 4)
+  length(type, nullable, what) {
+    let length
+    if (this.flexible) {
+      length = this.uvarint(what) - 1
+    } else {
+      const size = type === 'string' ? 2 : 4
+      this.take(size, what)
+      length =
+        size === 2 ? this.bytes.readInt16BE(this.at - 2) : this.bytes.readInt32BE(this.at - 4)
+    }
+
+    if (length < -1) throw new Error(`${what} has the length ${length} at ${this.at}`)
+    if (length === -1 && !nullable) {
+      throw new Error(`${what} is null, but is not nullable at version ${this.version}`)
+    }
+    return length
   }
 
   /** Reads a tag buffer: ascending tags, each with a size that fits. */
@@ -133,6 +149,17 @@ class BodyWalker {
     if (this.flexible) this.tags(what)
   }
 
+  /**
+   * Walks one field: a fixed-size value, a string, bytes or records, a structure, or an array of
+   * any of these. A structure with fields of its own is preceded by a presence byte when it is
+   * nullable at this version.
+   * @param {object} row the field's row from `scripts/compat/parse#flattenFields`
+   * @param {{ row: object, children: object[] }[]} children the fields of its structure, if any
+   * @param {string} what the field, for the error
+   * @returns {void}
+   * @throws {Error} when the bytes stop agreeing with the field, including a length below -1 and a
+   *   null where the field is not nullable at this version
+   */
   field(row, children, what) {
     const isArray = row.type.startsWith('[]')
     const type = isArray ? row.type.slice(2) : row.type
@@ -140,14 +167,15 @@ class BodyWalker {
     const scalar = (name) => {
       if (name in FIXED_BYTES) return () => this.take(FIXED_BYTES[name], what)
       if (name === 'string' || name === 'bytes' || name === 'records') {
-        return () => this.take(Math.max(this.length(name, what), 0), what)
+        // nullableVersions of an array field is the array's; its elements are never null
+        return () => this.take(Math.max(this.length(name, nullable && !isArray, what), 0), what)
       }
       return () => this.fields(children, what)
     }
     const one = scalar(type)
 
     if (isArray) {
-      const count = this.length('array', what)
+      const count = this.length('array', nullable, what)
       for (let i = 0; i < count; i++) one()
     } else if (children.length > 0 && nullable) {
       this.take(1, what)

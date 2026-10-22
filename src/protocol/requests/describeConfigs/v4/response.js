@@ -89,7 +89,10 @@ const decodeResources = (decoder) => {
 const decode = async (rawData) => {
   const decoder = new Decoder(rawData)
   const throttleTime = decoder.readInt32()
-  const resources = decoder.readUVarIntArray(decodeResources) || []
+  const resources = Decoder.requireArray(
+    decoder.readUVarIntArray(decodeResources),
+    'DescribeConfigsResponse.Results'
+  )
 
   decoder.readTaggedFields()
   return { throttleTime: 0, clientSideThrottleTime: throttleTime, resources }

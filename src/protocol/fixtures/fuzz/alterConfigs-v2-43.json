@@ -1,1 +1,1 @@
-{"seed":20261017,"hex":"000000000000","api":"AlterConfigs","version":2,"direction":"response","expect":{"decoded":true}}
+{"seed":20261017,"hex":"000000000000","api":"AlterConfigs","version":2,"direction":"response","expect":{"error":"KafkaJSPartialMessageError"}}

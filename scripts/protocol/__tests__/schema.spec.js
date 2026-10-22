@@ -504,6 +504,26 @@ describe('scripts/protocol > schema validation', () => {
       ])
     })
 
+    test.each([
+      ['a null', 'ffff', /is null, but is not nullable/],
+      ['an impossible length of -2', 'fffe', /has the length -2/],
+    ])('a SaslHandshake v1 body with %s for its mechanism fails S8', (_, hex, reason) => {
+      const failures = []
+      const codec = {
+        file: 'src/protocol/requests/saslHandshake/v1/request.js',
+        schema: {
+          api: 'SaslHandshake',
+          version: 1,
+          direction: 'request',
+          fields: expectedFields('SaslHandshake', 'request', 1),
+        },
+      }
+
+      checkEncoding(codec, [{ name: 'encoded', bytes: Buffer.from(hex, 'hex') }], failures)
+
+      expect(failures).toEqual([expect.stringMatching(reason)])
+    })
+
     test('a classic encoding of a flexible version is caught even when its length happens to be plausible', async () => {
       const failures = []
       const codec = realRequest()

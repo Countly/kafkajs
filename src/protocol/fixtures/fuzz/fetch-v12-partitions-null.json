@@ -5,6 +5,6 @@
   "version": 12,
   "direction": "response",
   "expect": {
-    "decoded": true
+    "error": "KafkaJSPartialMessageError"
   }
 }

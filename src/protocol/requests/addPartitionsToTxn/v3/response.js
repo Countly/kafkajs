@@ -25,7 +25,10 @@ const { parse } = require('../v0/response')
 const decode = async (rawData) => {
   const decoder = new Decoder(rawData)
   const throttleTime = decoder.readInt32()
-  const errors = decoder.readUVarIntArray(decodeTopicResult) || []
+  const errors = Decoder.requireArray(
+    decoder.readUVarIntArray(decodeTopicResult),
+    'AddPartitionsToTxnResponse.ResultsByTopicV3AndBelow'
+  )
   decoder.readTaggedFields()
 
   return { throttleTime: 0, clientSideThrottleTime: throttleTime, errors }
@@ -34,7 +37,10 @@ const decode = async (rawData) => {
 const decodeTopicResult = (decoder) => {
   const result = {
     topic: decoder.readUVarIntString(),
-    partitionErrors: decoder.readUVarIntArray(decodePartitionResult) || [],
+    partitionErrors: Decoder.requireArray(
+      decoder.readUVarIntArray(decodePartitionResult),
+      'AddPartitionsToTxnResponse.ResultsByTopicV3AndBelow.ResultsByPartition'
+    ),
   }
   decoder.readTaggedFields()
   return result

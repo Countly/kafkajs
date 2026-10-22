@@ -48,6 +48,28 @@ module.exports = class Decoder {
     return longValue.shiftRightUnsigned(1).xor(longValue.and(Long.fromInt(1)).negate())
   }
 
+  /**
+   * Refuses a null array that the message definition does not allow to be null at the version
+   * being read. `readUVarIntArray` and `readUVarIntArrayAsync` return null for a compact length
+   * of 0, and reading that as an empty list would let a malformed answer stand for "nothing to
+   * report", such as an ACL creation that confirms no ACL.
+   * @template T
+   * @param {T[]|null} array what a compact array reader returned
+   * @param {string} field the response field, as `<Message>.<Path>` in the Apache message
+   *   definition, for the error
+   * @returns {T[]} `array`
+   * @throws {KafkaJSPartialMessageError} when `array` is null
+   */
+  static requireArray(array, field) {
+    if (array === null) {
+      throw new KafkaJSPartialMessageError(
+        `${field} is a null array, but the message definition does not allow null there`
+      )
+    }
+
+    return array
+  }
+
   constructor(buffer) {
     this.buffer = buffer
     this.offset = 0

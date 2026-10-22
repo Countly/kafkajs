@@ -33,7 +33,10 @@ const { KafkaJSInvariantViolation } = require('../../../../errors')
 const decode = async (rawData) => {
   const decoder = new Decoder(rawData)
   const throttleTime = decoder.readInt32()
-  const groups = decoder.readUVarIntArray(decodeGroup) || []
+  const groups = Decoder.requireArray(
+    decoder.readUVarIntArray(decodeGroup),
+    'OffsetFetchResponse.Groups'
+  )
   decoder.readTaggedFields()
 
   if (groups.length !== 1) {
@@ -54,7 +57,10 @@ const decode = async (rawData) => {
 const decodeGroup = (decoder) => {
   const group = {
     groupId: decoder.readUVarIntString(),
-    topics: decoder.readUVarIntArray(decodeTopic) || [],
+    topics: Decoder.requireArray(
+      decoder.readUVarIntArray(decodeTopic),
+      'OffsetFetchResponse.Groups.Topics'
+    ),
     errorCode: decoder.readInt16(),
   }
 
@@ -65,7 +71,10 @@ const decodeGroup = (decoder) => {
 const decodeTopic = (decoder) => {
   const topic = {
     topic: decoder.readUVarIntString(),
-    partitions: decoder.readUVarIntArray(decodePartition) || [],
+    partitions: Decoder.requireArray(
+      decoder.readUVarIntArray(decodePartition),
+      'OffsetFetchResponse.Groups.Topics.Partitions'
+    ),
   }
 
   decoder.readTaggedFields()

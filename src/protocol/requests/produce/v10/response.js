@@ -98,7 +98,10 @@ const decodePartition = (decoder) => {
   const baseOffset = decoder.readInt64().toString()
   const logAppendTime = decoder.readInt64().toString()
   const logStartOffset = decoder.readInt64().toString()
-  const recordErrors = decoder.readUVarIntArray(decodeRecordError) || []
+  const recordErrors = Decoder.requireArray(
+    decoder.readUVarIntArray(decodeRecordError),
+    'ProduceResponse.Responses.PartitionResponses.RecordErrors'
+  )
   const errorMessage = decoder.readUVarIntString()
   const currentLeader = decodeCurrentLeader(decoder.readTaggedFields())
 
@@ -117,7 +120,10 @@ const decodePartition = (decoder) => {
 const decodeTopic = (decoder) => {
   const topic = {
     topicName: decoder.readUVarIntString(),
-    partitions: decoder.readUVarIntArray(decodePartition) || [],
+    partitions: Decoder.requireArray(
+      decoder.readUVarIntArray(decodePartition),
+      'ProduceResponse.Responses.PartitionResponses'
+    ),
   }
 
   decoder.readTaggedFields()
@@ -132,7 +138,10 @@ const decodeTopic = (decoder) => {
  */
 const decode = async (rawData) => {
   const decoder = new Decoder(rawData)
-  const topics = decoder.readUVarIntArray(decodeTopic) || []
+  const topics = Decoder.requireArray(
+    decoder.readUVarIntArray(decodeTopic),
+    'ProduceResponse.Responses'
+  )
   const throttleTime = decoder.readInt32()
   const tags = decoder.readTaggedFields()
 

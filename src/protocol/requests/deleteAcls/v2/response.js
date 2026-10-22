@@ -50,7 +50,10 @@ const decodeFilterResponse = (decoder) => {
   const filterResponse = {
     errorCode: decoder.readInt16(),
     errorMessage: decoder.readUVarIntString(),
-    matchingAcls: decoder.readUVarIntArray(decodeMatchingAcls) || [],
+    matchingAcls: Decoder.requireArray(
+      decoder.readUVarIntArray(decodeMatchingAcls),
+      'DeleteAclsResponse.FilterResults.MatchingAcls'
+    ),
   }
 
   decoder.readTaggedFields()
@@ -65,7 +68,10 @@ const decodeFilterResponse = (decoder) => {
 const decode = async (rawData) => {
   const decoder = new Decoder(rawData)
   const throttleTime = decoder.readInt32()
-  const filterResponses = decoder.readUVarIntArray(decodeFilterResponse) || []
+  const filterResponses = Decoder.requireArray(
+    decoder.readUVarIntArray(decodeFilterResponse),
+    'DeleteAclsResponse.FilterResults'
+  )
 
   decoder.readTaggedFields()
   return { throttleTime: 0, clientSideThrottleTime: throttleTime, filterResponses }

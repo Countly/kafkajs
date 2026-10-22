@@ -45,7 +45,10 @@ const decodePartition = (decoder) => {
     baseOffset: decoder.readInt64().toString(),
     logAppendTime: decoder.readInt64().toString(),
     logStartOffset: decoder.readInt64().toString(),
-    recordErrors: decoder.readUVarIntArray(decodeRecordError) || [],
+    recordErrors: Decoder.requireArray(
+      decoder.readUVarIntArray(decodeRecordError),
+      'ProduceResponse.Responses.PartitionResponses.RecordErrors'
+    ),
     errorMessage: decoder.readUVarIntString(),
   }
 
@@ -56,7 +59,10 @@ const decodePartition = (decoder) => {
 const decodeTopic = (decoder) => {
   const topic = {
     topicName: decoder.readUVarIntString(),
-    partitions: decoder.readUVarIntArray(decodePartition) || [],
+    partitions: Decoder.requireArray(
+      decoder.readUVarIntArray(decodePartition),
+      'ProduceResponse.Responses.PartitionResponses'
+    ),
   }
 
   decoder.readTaggedFields()
@@ -69,7 +75,10 @@ const decodeTopic = (decoder) => {
  */
 const decode = async (rawData) => {
   const decoder = new Decoder(rawData)
-  const topics = decoder.readUVarIntArray(decodeTopic) || []
+  const topics = Decoder.requireArray(
+    decoder.readUVarIntArray(decodeTopic),
+    'ProduceResponse.Responses'
+  )
   const throttleTime = decoder.readInt32()
   decoder.readTaggedFields()
 

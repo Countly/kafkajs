@@ -48,8 +48,10 @@ const buildDecode = (options) => {
 
   const decodeResponse = async (decoder) => {
     const topicId = decoder.readUuid()
-    // a compact array of length 0 reads as null, and these two are not nullable
-    const partitions = (await decoder.readUVarIntArrayAsync(decodePartition)) || []
+    const partitions = Decoder.requireArray(
+      await decoder.readUVarIntArrayAsync(decodePartition),
+      'FetchResponse.Responses.Partitions'
+    )
     decoder.readTaggedFields()
     return { topicId, partitions }
   }
@@ -59,7 +61,10 @@ const buildDecode = (options) => {
     const clientSideThrottleTime = decoder.readInt32()
     const errorCode = decoder.readInt16()
     const sessionId = decoder.readInt32()
-    const responses = (await decoder.readUVarIntArrayAsync(decodeResponse)) || []
+    const responses = Decoder.requireArray(
+      await decoder.readUVarIntArrayAsync(decodeResponse),
+      'FetchResponse.Responses'
+    )
     const tags = decoder.readTaggedFields()
 
     return {

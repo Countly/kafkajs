@@ -79,6 +79,31 @@ describe('Protocol > Decoder', () => {
       await expect(decoder.readArrayAsync(async (d) => d.readInt8())).resolves.toEqual([])
     })
   })
+  describe('requireArray', () => {
+    it('returns an empty array and a filled one as they are', () => {
+      const empty = new Decoder(Buffer.from([0x01])).readUVarIntArray((d) => d.readInt8())
+      const filled = new Decoder(Buffer.from([0x02, 0x07])).readUVarIntArray((d) => d.readInt8())
+
+      expect(Decoder.requireArray(empty, 'Message.Field')).toBe(empty)
+      expect(Decoder.requireArray(filled, 'Message.Field')).toBe(filled)
+    })
+
+    it('refuses what a compact length of 0 read as, naming the field', () => {
+      const array = new Decoder(Buffer.from([0x00])).readUVarIntArray((d) => d.readInt8())
+
+      expect(() => Decoder.requireArray(array, 'Message.Field')).toThrow(KafkaJSPartialMessageError)
+      expect(() => Decoder.requireArray(array, 'Message.Field')).toThrow(/Message\.Field/)
+    })
+
+    it('refuses what an async compact read of length 0 returned', async () => {
+      const array = await new Decoder(Buffer.from([0x00])).readUVarIntArrayAsync(async (d) =>
+        d.readInt8()
+      )
+
+      expect(() => Decoder.requireArray(array, 'Message.Field')).toThrow(KafkaJSPartialMessageError)
+    })
+  })
+
   describe('exact-fit reads do not throw', () => {
     it.each([
       ['readInt8', [0x01], 1],

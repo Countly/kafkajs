@@ -1,1 +1,1 @@
-{"seed":20261017,"hex":"00000000020b000000000000000000000200000000000000000000000000000000000000000000","api":"OffsetFetch","version":10,"direction":"response","expect":{"decoded":true}}
+{"seed":20261017,"hex":"00000000020b000000000000000000000200000000000000000000000000000000000000000000","api":"OffsetFetch","version":10,"direction":"response","expect":{"error":"KafkaJSPartialMessageError"}}

@@ -36,7 +36,10 @@ const decodeCreationResponse = (decoder) => {
 const decode = async (rawData) => {
   const decoder = new Decoder(rawData)
   const throttleTime = decoder.readInt32()
-  const creationResponses = decoder.readUVarIntArray(decodeCreationResponse) || []
+  const creationResponses = Decoder.requireArray(
+    decoder.readUVarIntArray(decodeCreationResponse),
+    'CreateAclsResponse.Results'
+  )
 
   decoder.readTaggedFields()
   return { throttleTime: 0, clientSideThrottleTime: throttleTime, creationResponses }

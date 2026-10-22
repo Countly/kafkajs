@@ -37,7 +37,10 @@ const decodePartition = (decoder) => {
 const decodeTopic = (decoder) => {
   const topic = {
     topic: decoder.readUVarIntString(),
-    partitions: decoder.readUVarIntArray(decodePartition) || [],
+    partitions: Decoder.requireArray(
+      decoder.readUVarIntArray(decodePartition),
+      'DeleteRecordsResponse.Topics.Partitions'
+    ),
   }
 
   decoder.readTaggedFields()

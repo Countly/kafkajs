@@ -1,1 +1,1 @@
-{"seed":20261017,"hex":"0000000000000000","api":"AlterPartitionReassignments","version":0,"direction":"response","expect":{"decoded":true}}
+{"seed":20261017,"hex":"0000000000000000","api":"AlterPartitionReassignments","version":0,"direction":"response","expect":{"error":"KafkaJSPartialMessageError"}}

@@ -6,14 +6,16 @@ const { parse } = require('../v0/response')
  * tag buffer per struct from v5 (KIP-482). Choosing them once per version keeps the readers free
  * of per-field version branches.
  * @param {number} version 3, 4, 5 or 6
- * @returns {{ string: Function, bytes: Function, array: Function, taggedFields: Function }}
+ * @returns {{ string: Function, bytes: Function, array: Function, taggedFields: Function }} `array`
+ *   reads `(decoder, reader, field)`, and from v5 refuses a null array, naming `field`
  */
 const readersFor = (version) =>
   version >= 5
     ? {
         string: (decoder) => decoder.readUVarIntString(),
         bytes: (decoder) => decoder.readUVarIntBytes(),
-        array: (decoder, reader) => decoder.readUVarIntArray(reader) || [],
+        array: (decoder, reader, field) =>
+          Decoder.requireArray(decoder.readUVarIntArray(reader), field),
         taggedFields: (decoder) => decoder.readTaggedFields(),
       }
     : {
@@ -61,7 +63,11 @@ const decodeGroup = (version, read) => (decoder) => {
     state: read.string(decoder),
     protocolType: read.string(decoder),
     protocol: read.string(decoder),
-    members: read.array(decoder, decodeMember(version, read)),
+    members: read.array(
+      decoder,
+      decodeMember(version, read),
+      'DescribeGroupsResponse.Groups.Members'
+    ),
     authorizedOperations: decoder.readInt32(),
   }
 
@@ -105,7 +111,7 @@ const buildDecode = (version) => async (rawData) => {
   const read = readersFor(version)
   const decoder = new Decoder(rawData)
   const throttleTime = decoder.readInt32()
-  const groups = read.array(decoder, decodeGroup(version, read))
+  const groups = read.array(decoder, decodeGroup(version, read), 'DescribeGroupsResponse.Groups')
 
   read.taggedFields(decoder)
 

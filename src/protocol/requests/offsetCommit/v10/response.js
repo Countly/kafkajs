@@ -25,7 +25,10 @@ const { topicIdSchema } = require('../../topicIds')
  */
 const decodeTopic = (topicNames) => (decoder) => {
   const topicId = decoder.readUuid()
-  const partitions = decoder.readUVarIntArray(decodePartition) || []
+  const partitions = Decoder.requireArray(
+    decoder.readUVarIntArray(decodePartition),
+    'OffsetCommitResponse.Topics.Partitions'
+  )
   decoder.readTaggedFields()
 
   const topic = topicNames.get(topicId)
@@ -51,7 +54,10 @@ const decodePartition = (decoder) => {
 const decode = async (rawData, { topicNames = new Map() } = {}) => {
   const decoder = new Decoder(rawData)
   const throttleTime = decoder.readInt32()
-  const responses = decoder.readUVarIntArray(decodeTopic(topicNames)) || []
+  const responses = Decoder.requireArray(
+    decoder.readUVarIntArray(decodeTopic(topicNames)),
+    'OffsetCommitResponse.Topics'
+  )
 
   decoder.readTaggedFields()
 

@@ -21,7 +21,10 @@ const { failure, createErrorFromCode } = require('../../../error')
 const decodeResponses = (decoder) => {
   const response = {
     topic: decoder.readUVarIntString(),
-    partitions: decoder.readUVarIntArray(decodePartitions) || [],
+    partitions: Decoder.requireArray(
+      decoder.readUVarIntArray(decodePartitions),
+      'AlterPartitionReassignmentsResponse.Responses.Partitions'
+    ),
   }
 
   decoder.readTaggedFields()
@@ -46,7 +49,10 @@ const decode = async (rawData) => {
   return {
     throttleTime,
     errorCode,
-    responses: decoder.readUVarIntArray(decodeResponses) || [],
+    responses: Decoder.requireArray(
+      decoder.readUVarIntArray(decodeResponses),
+      'AlterPartitionReassignmentsResponse.Responses'
+    ),
   }
 }
 
