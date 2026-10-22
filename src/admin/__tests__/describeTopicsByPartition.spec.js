@@ -6,6 +6,8 @@ const { createScriptedCluster } = require('../../../testHelpers/scriptedCluster'
 const { KafkaJSConnectionClosedError, KafkaJSTimeout } = require('../../errors')
 
 const NODES = [{ id: 0, host: 'node', port: 9092 }]
+/** A broker the bootstrap node does not know, one a late Metadata answer can advertise. */
+const ADVERTISED = { id: 1, host: 'advertised', port: 9092 }
 const TOPIC = 'paged-topic'
 const TOPIC_ID = '01020304-0506-0708-090a-0b0c0d0e0f10'
 const RECREATED_ID = 'f1f2f3f4-f5f6-f7f8-f9fa-fbfcfdfeff00'
@@ -72,11 +74,12 @@ describe('Admin > fetchTopicMetadata through DescribeTopicPartitions > one deadl
 
   /**
    * @param {object} [options] over the Kafka options of the scripted cluster
+   * @param {Array<{ id: number, host: string, port: number }>} [nodes] the endpoints the cluster serves
    * @returns {Promise<void>}
    */
-  const connect = async (options = {}) => {
+  const connect = async (options = {}, nodes = NODES) => {
     cluster = createScriptedCluster({
-      nodes: NODES,
+      nodes,
       advertise: { DescribeTopicPartitions: [0, 0] },
     })
     gates = []
@@ -163,6 +166,30 @@ describe('Admin > fetchTopicMetadata through DescribeTopicPartitions > one deadl
     discovery.release()
     for (let step = 0; step < 20; step++) await turn(10)
     expect(pages()).toEqual([])
+  })
+
+  test('a held discovery released after the deadline opens no connection and sends no request', async () => {
+    await connect({ metadataMaxAge: 0, brokers: ['node:9092'] }, [...NODES, ADVERTISED])
+    const discovery = cluster.schedule.hold({ api: 'Metadata' })
+
+    const result = read()
+    await discovery.arrived()
+    await turn(DEADLINE_MS)
+    expect(result.error).toBeInstanceOf(KafkaJSTimeout)
+    const written = cluster.requests().length
+
+    discovery.release({
+      brokers: [
+        { nodeId: ADVERTISED.id, host: ADVERTISED.host, port: ADVERTISED.port, rack: null },
+      ],
+      controllerId: ADVERTISED.id,
+      topics: [],
+    })
+    for (let step = 0; step < 20; step++) await turn(10)
+
+    expect(cluster.sockets().map(({ endpoint }) => endpoint.host)).toEqual([NODES[0].host])
+    expect(cluster.requests()).toHaveLength(written)
+    expect(jest.getTimerCount()).toBeLessThanOrEqual(baseline)
   })
 
   test('a held last page rejects at the deadline, and its late answer changes nothing', async () => {

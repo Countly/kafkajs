@@ -61,6 +61,13 @@ import {
   KafkaJSInvalidFrameError,
   KafkaJSCorruptRecordError,
   KafkaJSCommitFailedError,
+  KafkaJSConnectionClosedError,
+  KafkaJSMemberIdRequired,
+  KafkaJSInvariantViolation,
+  KafkaJSInvalidVarIntError,
+  KafkaJSInvalidLongError,
+  KafkaJSCreateTopicError,
+  KafkaJSNoBrokerAvailableError,
   Cluster,
 } from './index'
 
@@ -675,6 +682,33 @@ new KafkaJSCommitFailedError('x', { reason: 'membership-lost' })
 new KafkaJSInvalidFrameError('x', { reason: 'too-big' })
 void [frameIsConnectionError, frameReason, frameSize, corruptIsNonRetriable, corruptReason]
 void [commitIsNonRetriable, commitReason, commitCause, commitType, commitCode]
+
+// The error classes of a closed connection, a join that needs its member id, a broken invariant,
+// an undecodable number, a refused topic creation and a consumer with no broker to fetch from.
+const closedError = new KafkaJSConnectionClosedError('x', { host: 'localhost', port: 9092 })
+const closedIsConnectionError: KafkaJSConnectionError = closedError
+const closedBroker: string = closedError.broker
+const closedHost: string | undefined = closedError.host
+const closedPort: number | undefined = closedError.port
+new KafkaJSConnectionClosedError('x')
+const memberIdError = new KafkaJSMemberIdRequired(new Error('x'), { memberId: 'member-1' })
+const memberIdIsProtocolError: KafkaJSProtocolError = memberIdError
+const requiredMemberId: string = memberIdError.memberId
+// @ts-expect-error the assigned member id is required
+new KafkaJSMemberIdRequired(new Error('x'))
+const invariantError: KafkaJSNonRetriableError = new KafkaJSInvariantViolation('x')
+const invariantHelpUrl: string | undefined = new KafkaJSInvariantViolation(new Error('x')).helpUrl
+const varIntError: KafkaJSNonRetriableError = new KafkaJSInvalidVarIntError('x', { cause })
+const longError: KafkaJSNonRetriableError = new KafkaJSInvalidLongError('x')
+const createTopicError = new KafkaJSCreateTopicError(new Error('x'), topic)
+const createTopicIsProtocolError: KafkaJSProtocolError = createTopicError
+const createTopicName: string | undefined = createTopicError.topic
+const noBrokerError: KafkaJSError = new KafkaJSNoBrokerAvailableError()
+// @ts-expect-error it takes no arguments
+new KafkaJSNoBrokerAvailableError('x')
+void [closedIsConnectionError, closedBroker, closedHost, closedPort]
+void [memberIdIsProtocolError, requiredMemberId, invariantError, invariantHelpUrl]
+void [varIntError, longError, createTopicIsProtocolError, createTopicName, noBrokerError]
 
 // The aggregate says whether its children can be retried.
 const aggregateRetriable: boolean = new KafkaJSAggregateError('x', ['y']).retriable

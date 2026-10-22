@@ -928,14 +928,30 @@ module.exports = ({
   }
 
   /**
-   * @param {string} groupId
-   * @param {string} topic
-   * @param {Array<SeekEntry>} partitions
-   * @return {Promise}
-   *
    * @typedef {Object} SeekEntry
    * @property {number} partition
    * @property {string} offset
+   */
+
+  /**
+   * Sets the committed offsets of a consumer group that has no running members, through a
+   * temporary member of the group. The last entry for a partition wins, and an entry for a
+   * partition the topic does not have is ignored. An offset of `-1` (latest) or `-2` (earliest) is
+   * committed as given and stays that marker until it is resolved (`fetchOffsets` with
+   * `resolveOffsets` does so); any other offset is committed by a seek of the member. On every
+   * exit the call awaits disposal of the member, which releases its cluster subscriptions even if
+   * stopping fails. A disposal failure does not replace the call's outcome. Disposal itself does
+   * not disconnect the admin's shared cluster.
+   * @param {object} request
+   * @param {string} request.groupId
+   * @param {string} request.topic
+   * @param {Array<SeekEntry>} request.partitions at least one entry
+   * @returns {Promise<void>}
+   * @throws {KafkaJSNonRetriableError} for a missing `groupId` or `topic`, no `partitions`, an
+   *   entry with an invalid partition or offset, or a group whose state is not `Empty` or `Dead`
+   * @throws {Error} what subscribing, describing the group, starting the member, committing a
+   *   sentinel offset or stopping the member raised; a stop failure can replace a sentinel-commit
+   *   failure
    */
   const setOffsets = async ({ groupId, topic, partitions }) => {
     if (!groupId) {
@@ -1271,10 +1287,15 @@ module.exports = ({
    * is never retried: it rejects once every page is in. A topic recreated between pages is read
    * again from the start the same way.
    *
-   * The whole read, the metadata refresh and every attempt included, runs under one deadline of
-   * 60 s taken here: at the deadline the call rejects with `KafkaJSTimeout` whatever is stalled,
-   * also with `enforceRequestTimeout: false`, no later attempt or page starts and a late page
-   * changes nothing. The supported escape is the Metadata path, `useDescribeTopicPartitions: false`.
+   * The whole read, the metadata refresh and every attempt included, has one deadline of 60 s
+   * taken here: at the deadline the call rejects with `KafkaJSTimeout` whatever is stalled, also
+   * with `enforceRequestTimeout: false`, and a late page changes nothing. After the deadline the
+   * call starts no new attempt and creates no new page request. Work already in progress when the
+   * deadline passes is not cancelled, and its result is ignored: a metadata refresh may finish its
+   * own retries (`retry` bounds them, and other callers of the cluster share them), a broker
+   * selection may go on to connect to the next broker, and a page already queued (for example
+   * behind a broker's client-side throttle) may still be sent. The supported escape is the
+   * Metadata path, `useDescribeTopicPartitions: false`.
    * @param {string[]} names
    * @returns {Promise<TopicsMetadata>}
    * @throws {KafkaJSServerDoesNotSupportApiKey} when the broker does not offer the API
@@ -1294,6 +1315,7 @@ module.exports = ({
             await cluster.refreshMetadataIfNecessary()
           }
 
+          checkDeadline(deadline)
           return await readTopicPages(await cluster.findConnectedBroker(), names, deadline)
         } catch (e) {
           if (e.retriable === true) {

@@ -2029,10 +2029,28 @@ export class KafkaJSOffsetOutOfRange extends KafkaJSProtocolError {
   constructor(e: Error | string, metadata?: KafkaJSOffsetOutOfRangeMetadata)
 }
 
+/**
+ * JoinGroup answered `MEMBER_ID_REQUIRED`: `memberId` is the id the coordinator assigned. The
+ * client joins again with it by itself.
+ */
+export class KafkaJSMemberIdRequired extends KafkaJSProtocolError {
+  readonly memberId: string
+  constructor(e: Error | string, options: { memberId: string })
+}
+
 export class KafkaJSAlterPartitionReassignmentsError extends KafkaJSProtocolError {
   readonly topic?: string
   readonly partition?: number
   constructor(e: Error | string, topic?: string, partition?: number)
+}
+
+/**
+ * The broker refused to create `topic`. `admin.createTopics` throws one of these per refused topic
+ * among the `errors` of a `KafkaJSAggregateError`.
+ */
+export class KafkaJSCreateTopicError extends KafkaJSProtocolError {
+  readonly topic?: string
+  constructor(e: Error | string, topicName?: string)
 }
 
 export class KafkaJSNumberOfRetriesExceeded extends KafkaJSNonRetriableError {
@@ -2042,9 +2060,44 @@ export class KafkaJSNumberOfRetriesExceeded extends KafkaJSNonRetriableError {
   constructor(e: Error | string, metadata?: KafkaJSNumberOfRetriesExceededMetadata)
 }
 
+/**
+ * A condition the client's own logic rules out: a bug in the client, to report. The message starts
+ * with `Invariant violated:`, and `helpUrl` links a prefilled issue report.
+ */
+export class KafkaJSInvariantViolation extends KafkaJSNonRetriableError {
+  constructor(e: Error | string)
+}
+
+/**
+ * A variable-length integer ran past its 5 bytes while a response or record was decoded. Its
+ * `name` is `'KafkaJSNonRetriableError'`.
+ */
+export class KafkaJSInvalidVarIntError extends KafkaJSNonRetriableError {
+  constructor(e: Error | string, options?: { cause?: Error })
+}
+
+/**
+ * A variable-length long ran past its 9 bytes while a response or record was decoded. Its `name`
+ * is `'KafkaJSNonRetriableError'`.
+ */
+export class KafkaJSInvalidLongError extends KafkaJSNonRetriableError {
+  constructor(e: Error | string, options?: { cause?: Error })
+}
+
 export class KafkaJSConnectionError extends KafkaJSError {
   readonly broker: string
   constructor(e: Error | string, metadata?: KafkaJSConnectionErrorMetadata)
+}
+
+/**
+ * A connection was closed under a request: the broker ended it, a request on it timed out, the
+ * client disconnected it, or its pool was replaced before the request was sent. Retriable.
+ * `broker` is `host:port`.
+ */
+export class KafkaJSConnectionClosedError extends KafkaJSConnectionError {
+  readonly host?: string
+  readonly port?: number
+  constructor(e: Error | string, options?: { host?: string; port?: number })
 }
 
 export class KafkaJSRequestTimeoutError extends KafkaJSError {
@@ -2078,6 +2131,11 @@ export class KafkaJSServerDoesNotSupportApiKey extends KafkaJSNonRetriableError 
 }
 
 export class KafkaJSBrokerNotFound extends KafkaJSError {
+  constructor()
+}
+
+/** The consumer's fetch manager found no broker to fetch from. Retriable. */
+export class KafkaJSNoBrokerAvailableError extends KafkaJSError {
   constructor()
 }
 
