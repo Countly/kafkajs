@@ -16,6 +16,7 @@ const { roundRobin } = require('./assigners')
 const { EARLIEST_OFFSET, LATEST_OFFSET } = require('../constants')
 const ISOLATION_LEVEL = require('../protocol/isolationLevel')
 const sharedPromiseTo = require('../utils/sharedPromiseTo')
+const { registerDisposer } = require('./disposal')
 
 const { keys, values } = Object
 const { CONNECT, DISCONNECT, STOP, CRASH } = events
@@ -293,6 +294,7 @@ module.exports = (params) => {
    */
   const obligations = new ResetObligations()
   let removeTopicRecreatedListener = null
+  let pendingStart = Promise.resolve()
 
   /**
    * Subscribes to the cluster's topic-recreation event, at most once. Called at construction and
@@ -419,6 +421,29 @@ module.exports = (params) => {
   const stop = () => {
     stopGeneration++
     return stopShared()
+  }
+
+  /**
+   * Ends a consumer that borrows its creator's cluster (see `disposeConsumer`): waits for a start
+   * that is still in flight, since a `stop()` that lands before the runner is running does
+   * nothing and the member would join and stay; stops it as `stop()` does; then gives up what it
+   * registered on the cluster, the topic-recreation listener and its reset obligations. Unlike
+   * `disconnect()` it leaves the cluster connected, because the cluster is shared with the
+   * operations around it. The consumer is not reused. Idempotent. The listener is released even
+   * when the stop fails, and the failure is rethrown.
+   * @returns {Promise<void>}
+   */
+  const dispose = async () => {
+    stopGeneration++
+
+    try {
+      await pendingStart
+      await stopShared()
+    } finally {
+      removeTopicRecreatedListener && removeTopicRecreatedListener()
+      removeTopicRecreatedListener = null
+      obligations.clear()
+    }
   }
 
   /** @type {import("../../types").Consumer["subscribe"]} */
@@ -585,7 +610,9 @@ module.exports = (params) => {
         maxPrefetchBatches,
       })
 
-      await runner.start()
+      const started = runner.start()
+      pendingStart = started.catch(() => {})
+      await started
     }
 
     const onCrash = async (e) => {
@@ -929,7 +956,7 @@ module.exports = (params) => {
    */
   const getLogger = () => logger
 
-  return {
+  const consumer = {
     connect,
     disconnect,
     subscribe,
@@ -946,4 +973,7 @@ module.exports = (params) => {
     events,
     logger: getLogger,
   }
+
+  registerDisposer(consumer, dispose)
+  return consumer
 }

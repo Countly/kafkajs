@@ -3,6 +3,7 @@ const createRetry = require('../retry')
 const waitFor = require('../utils/waitFor')
 const groupBy = require('../utils/groupBy')
 const createConsumer = require('../consumer')
+const { disposeConsumer } = require('../consumer/disposal')
 const InstrumentationEventEmitter = require('../instrumentation/emitter')
 const { events, wrap: wrapEvent, unwrap: unwrapEvent } = require('./instrumentationEvents')
 const { LEVELS } = require('../loggers')
@@ -892,6 +893,41 @@ module.exports = ({
   }
 
   /**
+   * Commits the `-1` (latest) and `-2` (earliest) entries of a `setOffsets` call as the group's
+   * offsets, as the admin's joined member. A consumer seek to a sentinel only moves that consumer's
+   * position and commits nothing, so `setOffsets` commits the sentinels itself; the seeks commit the
+   * concrete offsets. The last entry for a partition wins, as it does for the seeks, and an entry
+   * for a partition the topic does not have is dropped, as a seek to one is.
+   * @param {import('../../types').Consumer} consumer the admin's member of the group, joined
+   * @param {{ groupId: string, topic: string, partitions: Array<SeekEntry> }} request
+   * @returns {Promise<void>}
+   * @throws {KafkaJSProtocolError} the coordinator's answer when it rejects the commit
+   */
+  const commitSentinels = async (consumer, { groupId, topic, partitions }) => {
+    const last = new Map(partitions.map(({ partition, offset }) => [partition, Number(offset)]))
+    const existing = new Set(
+      cluster.findTopicPartitionMetadata(topic).map(({ partitionId }) => partitionId)
+    )
+    const sentinels = [...last]
+      .filter(
+        ([partition, offset]) =>
+          existing.has(partition) && (offset === EARLIEST_OFFSET || offset === LATEST_OFFSET)
+      )
+      .map(([partition, offset]) => ({ partition, offset: String(offset) }))
+    if (sentinels.length === 0) return
+
+    const { generationId, memberId, groupInstanceId } = consumer.groupMetadata()
+    const coordinator = await cluster.findGroupCoordinator({ groupId })
+    await coordinator.offsetCommit({
+      groupId,
+      groupGenerationId: generationId,
+      memberId,
+      groupInstanceId,
+      topics: [{ topic, partitions: sentinels }],
+    })
+  }
+
+  /**
    * @param {string} groupId
    * @param {string} topic
    * @param {Array<SeekEntry>} partitions
@@ -920,32 +956,48 @@ module.exports = ({
       groupId,
     })
 
-    await consumer.subscribe({ topic, fromBeginning: true })
-    const description = await consumer.describeGroup()
+    try {
+      await consumer.subscribe({ topic, fromBeginning: true })
+      const description = await consumer.describeGroup()
 
-    if (!isConsumerGroupRunning(description)) {
-      throw new KafkaJSNonRetriableError(
-        `The consumer group must have no running instances, current state: ${description.state}`
-      )
-    }
-
-    return new Promise((resolve, reject) => {
-      consumer.on(consumer.events.FETCH, async () => consumer.stop().then(resolve).catch(reject))
-
-      consumer
-        .run({
-          eachBatchAutoResolve: false,
-          eachBatch: async () => true,
-        })
-        .catch(reject)
-
-      // This consumer doesn't need to consume any data
-      consumer.pause([{ topic }])
-
-      for (const seekData of partitions) {
-        consumer.seek({ topic, ...seekData })
+      if (!isConsumerGroupRunning(description)) {
+        throw new KafkaJSNonRetriableError(
+          `The consumer group must have no running instances, current state: ${description.state}`
+        )
       }
-    })
+
+      await new Promise((resolve, reject) => {
+        let committed = null
+        consumer.on(consumer.events.GROUP_JOIN, () => {
+          committed ??= commitSentinels(consumer, { groupId, topic, partitions })
+          committed.catch(() => {})
+        })
+        consumer.on(consumer.events.FETCH, () => {
+          committed
+            .finally(() => consumer.stop())
+            .then(resolve)
+            .catch(reject)
+        })
+
+        consumer
+          .run({
+            eachBatchAutoResolve: false,
+            eachBatch: async () => true,
+          })
+          .catch(reject)
+
+        // This consumer doesn't need to consume any data
+        consumer.pause([{ topic }])
+
+        for (const seekData of partitions) {
+          consumer.seek({ topic, ...seekData })
+        }
+      })
+    } finally {
+      // The consumer shares this admin's cluster, so it is disposed, not disconnected. A failed
+      // stop is already logged by the consumer and must not replace the call's own outcome.
+      await disposeConsumer(consumer).catch(() => {})
+    }
   }
 
   /**

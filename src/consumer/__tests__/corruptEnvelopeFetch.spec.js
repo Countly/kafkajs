@@ -653,6 +653,7 @@ describe('Consumer > a corrupt Fetch batch halts only its partition', () => {
     )
 
     await halt.until(() => halt.offsets(0).includes('3'), 'the records after the batch')
+    await halt.until(() => halt.commits(0).includes('4'), 'the commit past the last record')
 
     // The prefix answer was fetched before the seek, so the seek wins over it as over any record.
     expect(halt.offsets(0)).toEqual(['2', '3'])
@@ -671,6 +672,7 @@ describe('Consumer > a corrupt Fetch batch halts only its partition', () => {
       await halt.appendCorrupt(0, 2)
       await halt.start()
       await halt.until(() => halt.halts.length === 1, 'the first halt')
+      await halt.until(() => halt.offsets(0).length === 2, 'the records before the first halt')
 
       halt.consumer.pause([{ topic: TOPIC, partitions: [0] }])
       halt.consumer.resume([{ topic: TOPIC, partitions: [0] }])
@@ -679,6 +681,7 @@ describe('Consumer > a corrupt Fetch batch halts only its partition', () => {
       const before = halt.fetched(0).length
       halt.consumer.seek({ topic: TOPIC, partition: 0, offset: '1' })
       await halt.until(() => halt.halts.length === 2, 'the second halt')
+      await halt.until(() => halt.offsets(0).length === 3, 'the record read again before the halt')
       const after = halt.fetched(0).length
       expect(await halt.laterRounds()).not.toContain(0)
 
@@ -921,6 +924,7 @@ describe('Consumer > a corrupt Fetch batch halts only its partition', () => {
       await halt.append(0, 0, 1, 2)
       await halt.start()
       await halt.until(() => halt.offsets(0).length === 3, 'the first records')
+      await halt.until(() => halt.commits(0).includes('3'), 'the commit of the first records')
       const commits = halt.commits(0).length
       await heldAcross(halt, async () => {
         reset(halt)
@@ -931,6 +935,7 @@ describe('Consumer > a corrupt Fetch batch halts only its partition', () => {
         )
         await halt.until(() => halt.offsets(0).length > 3, 'the records read again after the reset')
       })
+      await halt.until(() => halt.commits(0).length > commits, 'a commit after the reset')
       await halt.laterRounds(1)
 
       expect(halt.halts).toHaveLength(0)

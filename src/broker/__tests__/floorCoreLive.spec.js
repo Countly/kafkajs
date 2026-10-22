@@ -6,7 +6,7 @@ const ISOLATION_LEVEL = require('../../protocol/isolationLevel')
 const { Kafka, logLevel, PartitionAssigners } = require('../../../index')
 const brokerRanges = require('../../../scripts/protocol/brokerRanges.json')
 const { rangeOf } = require('../../../scripts/e2e/apiVersionsProbe')
-const { readLog, committedRecords } = require('../../../testHelpers/rawLog')
+const { readLog, endOffsets, committedRecords } = require('../../../testHelpers/rawLog')
 const {
   connectionOpts,
   createConnectionPool,
@@ -354,6 +354,20 @@ describeFloor('Kafka floor core (live)', () => {
         coordinatorBroker.finalizedFeatures,
         coordinatorBroker.finalizedFeaturesEpoch
       )
+      // EndTxn answers before the coordinator writes the markers: the commit is readable once the
+      // last stable offset reaches the high watermark, and its offsets once the group holds them.
+      await waitForCondition(async () => {
+        const [high, stable, [{ partitions: held }]] = await Promise.all([
+          endOffsets({ brokers: plainTextBrokers(), topic }),
+          endOffsets({
+            brokers: plainTextBrokers(),
+            topic,
+            isolationLevel: ISOLATION_LEVEL.READ_COMMITTED,
+          }),
+          admin.fetchOffsets({ groupId, topics: [topic] }),
+        ])
+        return stable.get(0) === high.get(0) && held[0]?.offset === '4'
+      }, WAIT_BUDGET)
       const [log] = (
         await readLog({
           brokers: plainTextBrokers(),
@@ -560,10 +574,22 @@ describeFloor('Kafka floor core (live)', () => {
         })
       )
       await consumer.subscribe({ topic })
+      // Asked of every broker: each drops a deleted topic from its Metadata answers on its own
+      // schedule, so one broker's absence still leaves the others listing the old topic.
+      const seeds = await Promise.all(
+        plainTextBrokers().map((address) => {
+          const [host, port] = address.split(':')
+          return rawBroker({ host, port: Number(port) })
+        })
+      )
+      const listedAnywhere = async () =>
+        (await Promise.all(seeds.map((broker) => broker.metadata([])))).some(({ topicMetadata }) =>
+          topicMetadata.some(({ topic: name }) => name === topic)
+        )
       await admin.deleteTopics({ topics: [topic] })
-      expect(
-        await waitForCondition(async () => !(await admin.listTopics()).includes(topic), WAIT_BUDGET)
-      ).toBe(true)
+      // Deleted here, so the cleanup must not retry UNKNOWN_TOPIC_OR_PARTITION on it.
+      topics.splice(topics.indexOf(topic), 1)
+      expect(await waitForCondition(async () => !(await listedAnywhere()), WAIT_BUDGET)).toBe(true)
       const crashed = new Promise((resolve) => consumer.on(consumer.events.CRASH, resolve))
       await consumer.run({ eachMessage: async () => {} })
       const { payload } = await crashed
@@ -571,7 +597,7 @@ describeFloor('Kafka floor core (live)', () => {
       while (cause.cause) cause = cause.cause
       const absent = []
       for (let attempt = 0; attempt < 20; attempt++) {
-        absent.push(!(await admin.listTopics()).includes(topic))
+        absent.push(!(await listedAnywhere()))
         await sleep(50)
       }
       writeEvidence(EVIDENCE, {

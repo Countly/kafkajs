@@ -4,6 +4,7 @@ const {
   secureRandom,
   newLogger,
   waitFor,
+  waitForTopicPropagation,
 } = require('testHelpers')
 const { createScriptedCluster } = require('../../../testHelpers/scriptedCluster')
 
@@ -50,6 +51,9 @@ describe('Broker > alterPartitionReassignments', () => {
         },
       ],
     })
+    // CreateTopics answers once the controller committed the topic; this broker's own Metadata
+    // answers UNKNOWN_TOPIC_OR_PARTITION until it has replayed the record.
+    await waitForTopicPropagation(topicName, 1)
 
     await broker.alterPartitionReassignments({
       topics: [
