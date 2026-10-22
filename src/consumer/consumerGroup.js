@@ -24,6 +24,7 @@ const {
   isFatalMembership,
   isFencedInstance,
   isStaleCoordinator,
+  COORDINATOR_LOAD_IN_PROGRESS_CODE,
 } = require('../errors')
 const { failure, createErrorFromCode } = require('../protocol/error')
 const {
@@ -797,13 +798,13 @@ module.exports = class ConsumerGroup {
    * `KafkaJSError` to restart the sequence through the retrier.
    *
    * For a classic member, a lost connection (refused, reset, closed, timed out) or a coordinator
-   * that moved (15, 16) ends the retrier's attempt; the sequence then starts again after the
-   * retrier's first delay, looking the coordinator up anew, for as long as that outage is shorter
-   * than the session timeout, counted on a monotonic clock from its first failure. A longer outage
-   * fails the call with its error as before. A stop requested meanwhile fails it as a stop, which
-   * the round treats as no crash, whether it is seen when such an attempt fails (even past the
-   * session timeout) or after the pause. A consumer-protocol member keeps the retrier's counted
-   * attempts.
+   * that moved, is unavailable or is still loading the group (14, 15, 16) ends the retrier's
+   * attempt; the sequence then starts again after the retrier's first delay, looking the
+   * coordinator up anew, for as long as that outage is shorter than the session timeout, counted
+   * on a monotonic clock from its first failure. A longer outage fails the call with its error as
+   * before. A stop requested meanwhile fails it as a stop, which the round treats as no crash,
+   * whether it is seen when such an attempt fails (even past the session timeout) or after the
+   * pause. A consumer-protocol member keeps the retrier's counted attempts.
    *
    * Applying the result and reporting the round belong to the caller: this method performs one
    * exchange and returns what it decoded.
@@ -819,7 +820,11 @@ module.exports = class ConsumerGroup {
       try {
         return await this.joinAndSyncAttempt()
       } catch (e) {
-        if (this.isStopping() && (isConnectionLoss(e) || (e != null && isStaleCoordinator(e)))) {
+        if (
+          this.isStopping() &&
+          (isConnectionLoss(e) ||
+            (e != null && (isStaleCoordinator(e) || e.code === COORDINATOR_LOAD_IN_PROGRESS_CODE)))
+        ) {
           throw consumerStoppingError()
         }
         if (!outage.absorbs(e)) throw e

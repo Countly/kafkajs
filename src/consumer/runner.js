@@ -680,10 +680,12 @@ module.exports = class Runner extends EventEmitter {
   /**
    * The user-facing heartbeat, shared with the timer through the group's own promise.
    *
-   * It classifies and routes, and does nothing else: the offset work belongs to
-   * `handleRebalanceError`, which is reached once per rebalance. Under cooperative rebalancing a
-   * revocation RESOLVES instead of throwing, so the error never reaches the worker, the fetcher
-   * or the fetch manager's own teardown - which is the whole point of not stopping the world.
+   * It classifies and routes, and does no offset work: that belongs to `handleRebalanceError`,
+   * which is reached once per rebalance. Under cooperative rebalancing a revocation RESOLVES
+   * instead of throwing, so the error never reaches the worker, the fetcher or the fetch manager's
+   * own teardown - which is the whole point of not stopping the world. It also ends the heartbeat
+   * outage on a success, marks the error's request class as `heartbeat`, and resolves a cooperative
+   * classic member's `NOT_COORDINATOR` while that outage is absorbed.
    * @returns {Promise<void>}
    */
   async heartbeat() {
@@ -726,8 +728,10 @@ module.exports = class Runner extends EventEmitter {
    * Which class of the fetch loop's own requests raised `error`.
    *
    * An OffsetCommit loading error propagated by a handler keeps its request provenance, so a
-   * classic member retries a commit helper's failure within the commit outage. Other handler
-   * errors keep their counted retries; consumer-protocol members do not ride outages.
+   * classic member retries a commit helper's failure within the commit outage. A handler-propagated
+   * `NOT_COORDINATOR` (16) keeps it too: an OffsetCommit 16 rides in the commit class, any other 16
+   * in the heartbeat class. Other handler errors keep their counted retries; consumer-protocol
+   * members do not ride outages.
    * @private
    * @param {unknown} error
    * @returns {'fetch'|'heartbeat'|'commit'|undefined} undefined for other handler errors and for
@@ -736,6 +740,7 @@ module.exports = class Runner extends EventEmitter {
   requestClassOf(error) {
     const requestClass = this.requestClasses.get(error)
     if (requestClass === 'handler') {
+      if (error.code === NOT_COORDINATOR) return isOffsetCommitError(error) ? 'commit' : 'heartbeat'
       return error.code === COORDINATOR_LOAD_IN_PROGRESS_CODE && isOffsetCommitError(error)
         ? 'commit'
         : undefined

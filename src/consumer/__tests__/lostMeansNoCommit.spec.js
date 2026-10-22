@@ -94,8 +94,8 @@ const holdNextCommitLookup = () => {
  * OffsetCommit it sends could write over the new owner's progress. These cases run the real
  * consumer over the scripted cluster and hold the request a commit waits on.
  *
- * The invariant case is marked `it.failing` until the membership fence prevents the late commit;
- * setup and settlement are checked by ordinary hooks and a guard case.
+ * The invariant case asserts that the membership fence prevents the late commit; setup and
+ * settlement are checked by ordinary hooks and a guard case.
  */
 describe('Consumer > commits under a lost membership', () => {
   let consumer

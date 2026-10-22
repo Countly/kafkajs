@@ -12,6 +12,7 @@ const {
 } = require('../instrumentationEvents')
 const { newLogger } = require('testHelpers')
 const { KafkaJSConnectionError } = require('../../errors')
+const { createErrorFromCode } = require('../../protocol/error')
 const sleep = require('../../utils/sleep')
 
 const FIXTURES = path.join(__dirname, 'fixtures', 'classicGroupProtocol')
@@ -303,26 +304,35 @@ describe('Consumer > classic group protocol > joinAndSync contract', () => {
     expect(rebalance).toHaveBeenCalledTimes(2)
   })
 
-  it('ends the join as a stop when a stop arrives during an attempt that fails after the outage bound', async () => {
-    const group = buildGroup(0)
-    group.sessionTimeout = 10
-    group.backoff = { initial: () => 0 }
-    const lost = () =>
-      new KafkaJSConnectionError('Connection error: connect ECONNREFUSED', {
-        code: 'ECONNREFUSED',
-      })
-    const rebalance = jest
-      .spyOn(group.groupMembership, 'rebalance')
-      .mockRejectedValueOnce(lost())
-      .mockImplementationOnce(async () => {
-        group.rebalanceCoordinator = { runner: { stopRequested: true } }
-        await sleep(30)
-        throw lost()
-      })
+  it.each([
+    [
+      'a lost connection',
+      () =>
+        new KafkaJSConnectionError('Connection error: connect ECONNREFUSED', {
+          code: 'ECONNREFUSED',
+        }),
+    ],
+    ['COORDINATOR_NOT_AVAILABLE (15)', () => createErrorFromCode(15)],
+    ['COORDINATOR_LOAD_IN_PROGRESS (14)', () => createErrorFromCode(14)],
+  ])(
+    'ends the join as a stop when a stop arrives during an attempt that fails with %s after the outage bound',
+    async (_name, failed) => {
+      const group = buildGroup(0)
+      group.sessionTimeout = 10
+      group.backoff = { initial: () => 0 }
+      const rebalance = jest
+        .spyOn(group.groupMembership, 'rebalance')
+        .mockRejectedValueOnce(failed())
+        .mockImplementationOnce(async () => {
+          group.rebalanceCoordinator = { runner: { stopRequested: true } }
+          await sleep(30)
+          throw failed()
+        })
 
-    await expect(group.joinAndSync()).rejects.toMatchObject({ type: 'CONSUMER_STOPPING' })
-    expect(rebalance).toHaveBeenCalledTimes(2)
-  })
+      await expect(group.joinAndSync()).rejects.toMatchObject({ type: 'CONSUMER_STOPPING' })
+      expect(rebalance).toHaveBeenCalledTimes(2)
+    }
+  )
 
   it("leaves a consumer-protocol member's lost connection to the counted retries", async () => {
     const group = buildGroup(0)
@@ -462,6 +472,39 @@ describe('Consumer > classic group protocol > a heartbeat that loses its coordin
     expect(cluster.findGroupCoordinator).toHaveBeenCalledTimes(2)
     expect(old.heartbeat).toHaveBeenCalledTimes(1)
     expect(current.heartbeat).toHaveBeenCalledTimes(1)
+  })
+
+  it('sends no leave, and looks for no coordinator, while its last heartbeat left the coordinator unknown', async () => {
+    const { protocol, cluster, old } = await movedCoordinator(() => createErrorFromCode(15))
+    old.leaveGroup = jest.fn(async () => {})
+    const debug = jest.spyOn(protocol.logger, 'debug')
+    await expect(protocol.heartbeat({ interval: 0 })).rejects.toThrow()
+
+    await protocol.leave()
+
+    expect(cluster.findGroupCoordinator).toHaveBeenCalledTimes(1)
+    expect(old.leaveGroup).not.toHaveBeenCalled()
+    expect(debug).toHaveBeenCalledWith(
+      'Leaving without a LeaveGroup: no coordinator is known',
+      expect.any(Object)
+    )
+    expect(protocol.memberId).toBeNull()
+  })
+
+  it('sends its leave to a coordinator it looks up again when the cached one was retired', async () => {
+    const old = { retired: true, leaveGroup: jest.fn(async () => {}), isConnected: () => true }
+    const current = { leaveGroup: jest.fn(async () => {}), isConnected: () => true }
+    const found = [old, current]
+    const cluster = { findGroupCoordinator: jest.fn(async () => found.shift()) }
+    const protocol = buildProtocol({ cluster })
+    await protocol.connect()
+    protocol.memberId = 'seam-member'
+
+    await protocol.leave()
+
+    expect(cluster.findGroupCoordinator).toHaveBeenCalledTimes(2)
+    expect(old.leaveGroup).not.toHaveBeenCalled()
+    expect(current.leaveGroup).toHaveBeenCalledTimes(1)
   })
 
   it('keeps its coordinator after a heartbeat the coordinator answered as a member error', async () => {

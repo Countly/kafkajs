@@ -1,4 +1,4 @@
-const { Kafka, PartitionAssigners } = require('../../../index')
+const { Kafka, PartitionAssigners, logLevel } = require('../../../index')
 const { KafkaJSConnectionError } = require('../../errors')
 const createConsumer = require('../index')
 const { createCluster, newLogger } = require('testHelpers')
@@ -320,54 +320,60 @@ describe('Consumer > broker outages', () => {
     }
   )
 
-  describe('a commit helper that eachBatch calls while the coordinator is still loading', () => {
-    const SESSION = 1000
+  const HELPER_SESSION = 1000
 
-    /**
-     * Runs a classic member whose handler commits through `commitOffsetsIfNecessary`, over a
-     * coordinator that answers its first `loadingAnswers` commits COORDINATOR_LOAD_IN_PROGRESS.
-     * @param {number} loadingAnswers
-     * @returns {Promise<{ events: object, cluster: object, helper: { loading: number, completed: number, firstLoadingAt?: number, crashedAt?: number } }>}
-     */
-    const startHelper = async (loadingAnswers) => {
-      const { cluster, events } = scenario({
-        sessionTimeout: SESSION,
-        retry: { ...RETRY, restartOnFailure: async () => false },
-      })
-      endlessRecords(cluster)
-      const helper = { loading: 0, completed: 0 }
-      consumer.on(consumer.events.CRASH, () => {
-        helper.crashedAt ??= performance.now()
-      })
-      cluster.answer('OffsetCommit', ({ topics }) => {
-        const loading = helper.loading < loadingAnswers
-        if (loading) {
-          helper.loading++
-          helper.firstLoadingAt ??= performance.now()
-        }
-        return {
-          topics: topics.map((entry) => ({
-            topic: entry.topic,
-            partitions: entry.partitions.map(({ partition }) => ({
-              partition,
-              errorCode: loading ? COORDINATOR_LOAD_IN_PROGRESS : 0,
-            })),
+  /**
+   * Runs a classic member whose handler commits through `commitOffsetsIfNecessary`, over a
+   * coordinator that answers its first `failedAnswers` commits with `code`.
+   * @param {number} failedAnswers
+   * @param {{ code?: number, assigners?: object }} [options] the answer's error code (loading by
+   *   default) and the member's assigner option
+   * @returns {Promise<{ events: object, cluster: object, helper: { failed: number, completed: number, firstFailedAt?: number, crashedAt?: number } }>}
+   */
+  const startHelper = async (
+    failedAnswers,
+    { code = COORDINATOR_LOAD_IN_PROGRESS, assigners = {} } = {}
+  ) => {
+    const { cluster, events } = scenario({
+      ...assigners,
+      sessionTimeout: HELPER_SESSION,
+      retry: { ...RETRY, restartOnFailure: async () => false },
+    })
+    endlessRecords(cluster)
+    const helper = { failed: 0, completed: 0 }
+    consumer.on(consumer.events.CRASH, () => {
+      helper.crashedAt ??= performance.now()
+    })
+    cluster.answer('OffsetCommit', ({ topics }) => {
+      const failing = helper.failed < failedAnswers
+      if (failing) {
+        helper.failed++
+        helper.firstFailedAt ??= performance.now()
+      }
+      return {
+        topics: topics.map((entry) => ({
+          topic: entry.topic,
+          partitions: entry.partitions.map(({ partition }) => ({
+            partition,
+            errorCode: failing ? code : 0,
           })),
-        }
-      })
-      await start(events, {
-        autoCommit: false,
-        autoCommitThreshold: 1,
-        eachMessage: undefined,
-        eachBatch: async ({ batch, resolveOffset, commitOffsetsIfNecessary }) => {
-          resolveOffset(batch.lastOffset())
-          await commitOffsetsIfNecessary()
-          helper.completed++
-        },
-      })
-      return { events, cluster, helper }
-    }
+        })),
+      }
+    })
+    await start(events, {
+      autoCommit: false,
+      autoCommitThreshold: 1,
+      eachMessage: undefined,
+      eachBatch: async ({ batch, resolveOffset, commitOffsetsIfNecessary }) => {
+        resolveOffset(batch.lastOffset())
+        await commitOffsetsIfNecessary()
+        helper.completed++
+      },
+    })
+    return { events, cluster, helper }
+  }
 
+  describe('a commit helper that eachBatch calls while the coordinator is still loading', () => {
     it('retries a loading answer that is short, with no crash and no rejoin', async () => {
       const { events, cluster, helper } = await startHelper(6)
       await until(
@@ -376,7 +382,7 @@ describe('Consumer > broker outages', () => {
       )
 
       expect(events.crashes).toEqual([])
-      expect(helper.loading).toBe(6)
+      expect(helper.failed).toBe(6)
       expect(events.rebalancing).toEqual([])
       expect(wire(cluster, 'JoinGroup')).toHaveLength(1)
     })
@@ -390,10 +396,98 @@ describe('Consumer > broker outages', () => {
       expect(error.name).toBe('KafkaJSNumberOfRetriesExceeded')
       expect(error.cause.code).toBe(COORDINATOR_LOAD_IN_PROGRESS)
       expect(restart).toBe(false)
-      expect(helper.crashedAt - helper.firstLoadingAt).toBeGreaterThanOrEqual(SESSION)
+      expect(helper.crashedAt - helper.firstFailedAt).toBeGreaterThanOrEqual(HELPER_SESSION)
       expect(events.rebalancing).toEqual([])
       expect(wire(cluster, 'JoinGroup')).toHaveLength(1)
     })
+  })
+
+  describe('a handler that propagates a NOT_COORDINATOR from its own client call', () => {
+    const ASSIGNERS = [
+      ['an eager', {}],
+      ['a cooperative', { partitionAssigners: [PartitionAssigners.cooperativeSticky] }],
+    ]
+
+    it('rides out the heartbeat() answers of an eager member, with no crash and no rejoin', async () => {
+      const { cluster, events } = scenario({
+        retry: { ...RETRY, restartOnFailure: async () => false },
+      })
+      endlessRecords(cluster)
+      // Only a heartbeat the handler awaits is answered, so the error always reaches the handler.
+      let handlerHeartbeating = false
+      let answered = 0
+      let rethrown = 0
+      cluster.answer('Heartbeat', () => {
+        const moved = handlerHeartbeating && answered < 2
+        if (moved) answered++
+        return { errorCode: moved ? NOT_COORDINATOR : 0 }
+      })
+      await start(events, {
+        eachMessage: async ({ message, heartbeat }) => {
+          events.records.push(message.offset)
+          handlerHeartbeating = true
+          try {
+            await heartbeat()
+          } catch (e) {
+            rethrown++
+            throw e
+          } finally {
+            handlerHeartbeating = false
+          }
+        },
+      })
+      await until(() => rethrown === 2 || events.crashes.length > 0, 'two rethrown answers', 2000)
+      const recordsAfter = events.records.length
+      await until(
+        () => events.records.length > recordsAfter + 3 || events.crashes.length > 0,
+        'more records or a crash',
+        2000
+      )
+
+      expect(events.crashes).toEqual([])
+      expect(rethrown).toBe(2)
+      expect(events.rebalancing).toEqual([])
+      expect(wire(cluster, 'JoinGroup')).toHaveLength(1)
+    })
+
+    it.each(ASSIGNERS)(
+      'rides out the commit answers %s member propagates from eachBatch, with no crash and no rejoin',
+      async (_mode, assigners) => {
+        const { events, cluster, helper } = await startHelper(2, {
+          code: NOT_COORDINATOR,
+          assigners,
+        })
+        await until(
+          () => helper.completed > 0 || events.crashes.length > 0,
+          'the helper to commit or the consumer to crash'
+        )
+
+        expect(events.crashes).toEqual([])
+        expect(helper.failed).toBe(2)
+        expect(events.rebalancing).toEqual([])
+        expect(wire(cluster, 'JoinGroup')).toHaveLength(1)
+      }
+    )
+
+    it.each(ASSIGNERS)(
+      'crashes %s member with the commit error once the answer outlasts the session timeout, with no rejoin',
+      async (_mode, assigners) => {
+        const { events, cluster, helper } = await startHelper(Infinity, {
+          code: NOT_COORDINATOR,
+          assigners,
+        })
+        await until(() => events.crashes.length > 0, 'a crash', 2000)
+
+        expect(events.crashes).toHaveLength(1)
+        const [{ error, restart }] = events.crashes
+        expect(error.name).toBe('KafkaJSNumberOfRetriesExceeded')
+        expect(error.cause.code).toBe(NOT_COORDINATOR)
+        expect(restart).toBe(false)
+        expect(helper.crashedAt - helper.firstFailedAt).toBeGreaterThanOrEqual(HELPER_SESSION)
+        expect(events.rebalancing).toEqual([])
+        expect(wire(cluster, 'JoinGroup')).toHaveLength(1)
+      }
+    )
   })
 
   it('a disconnect while the fetch loop rides out a leader outage reports no crash', async () => {
@@ -533,6 +627,33 @@ describe('Consumer > broker outages', () => {
     expect(restart).toBe(true)
   })
 
+  it('a disconnect after a heartbeat lost the coordinator sends no leave and looks for no coordinator', async () => {
+    const retry = { retries: 5, initialRetryTime: 300, maxRetryTime: 2000 }
+    const lines = []
+    const { cluster, breaker, events } = scenario(
+      { heartbeatInterval: 1000, sessionTimeout: 6000, retry },
+      { retry, logLevel: logLevel.DEBUG, logCreator: () => (entry) => lines.push(entry) },
+      { batches: 0 }
+    )
+    const held = cluster.schedule.hold({ api: 'Heartbeat' })
+    await start(events)
+    await held.arrived()
+    breaker.take(COORDINATOR, 'refused')
+    await until(
+      () => lines.some(({ log }) => /Background heartbeat failed/.test(log.message)),
+      'the heartbeat that lost the coordinator'
+    )
+
+    const lostAt = cluster.requests().length
+    const disconnectedAt = performance.now()
+    await consumer.disconnect()
+
+    expect(wire(cluster, 'FindCoordinator', lostAt)).toEqual([])
+    expect(wire(cluster, 'LeaveGroup', lostAt)).toEqual([])
+    expect(performance.now() - disconnectedAt).toBeLessThan(1000)
+    expect(events.crashes).toEqual([])
+  }, 20000)
+
   it('a stop while the first join rides out an outage ends the join without a crash', async () => {
     const { breaker, events } = scenario()
     breaker.take(COORDINATOR, 'refused')
@@ -546,26 +667,30 @@ describe('Consumer > broker outages', () => {
     expect(events.joins).toEqual([])
   })
 
-  it('a stop during a join attempt that outlasts the session timeout ends the join without a crash', async () => {
-    const { cluster, events } = scenario({
-      sessionTimeout: 1000,
-      retry: { ...RETRY, restartOnFailure: async () => false },
-    })
-    cluster.schedule.once({ api: 'JoinGroup' }, { errorCode: 15 })
-    const held = cluster.schedule.hold({ api: 'JoinGroup' })
-    const running = start(events)
-    await held.arrived()
+  it.each([[15], [COORDINATOR_LOAD_IN_PROGRESS]])(
+    'a stop during a join attempt answered %i that outlasts the session timeout ends the join without a crash',
+    async (errorCode) => {
+      // No retries: the first answer must reach the outage bound, not the join retrier.
+      const { cluster, events } = scenario({
+        sessionTimeout: 1000,
+        retry: { ...RETRY, retries: 0, restartOnFailure: async () => false },
+      })
+      cluster.schedule.once({ api: 'JoinGroup' }, { errorCode })
+      const held = cluster.schedule.hold({ api: 'JoinGroup' })
+      const running = start(events)
+      await held.arrived()
 
-    const disconnecting = consumer.disconnect()
-    await sleep(1200)
-    held.release({ errorCode: 15 })
-    await disconnecting
-    await running
+      const disconnecting = consumer.disconnect()
+      await sleep(1200)
+      held.release({ errorCode })
+      await disconnecting
+      await running
 
-    expect(events.crashes).toEqual([])
-    expect(events.joins).toEqual([])
-    expect(cluster.sockets().filter((socket) => !socket.destroyed)).toEqual([])
-  })
+      expect(events.crashes).toEqual([])
+      expect(events.joins).toEqual([])
+      expect(cluster.sockets().filter((socket) => !socket.destroyed)).toEqual([])
+    }
+  )
 
   describe('an outage that outlasts the session timeout', () => {
     const SHORT = { sessionTimeout: 1000, heartbeatInterval: 100 }

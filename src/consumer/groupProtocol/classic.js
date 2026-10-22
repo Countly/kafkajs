@@ -530,7 +530,10 @@ module.exports = class ClassicGroupProtocol {
    * instance's current member, or answers `FENCED_INSTANCE_ID` for a stale member id; Java's
    * classic leave sends the member id alone.
    *
-   * The request goes to a coordinator found again if the cached one was retired.
+   * The request is skipped while the last heartbeat left the coordinator unknown, as in the Java
+   * client: looking for one would hold up a stop, and an unsent leave costs only the session
+   * timeout. Otherwise it goes to the cached coordinator, found again first if it was retired or
+   * its connection is closed.
    * @param {{ leaveGroup?: boolean }} [options] `false` sends no request and only forgets the
    *   member id; `true` and `undefined` send it (nothing calls this for a static member that
    *   leaves by default)
@@ -541,13 +544,17 @@ module.exports = class ClassicGroupProtocol {
     const { groupId, memberId, groupInstanceId, joinCount } = this
 
     if (memberId && leaveGroup !== false) {
-      const coordinator = await this.liveCoordinator()
-      await coordinator.leaveGroup({
-        groupId,
-        memberId,
-        groupInstanceId,
-        reason: LEAVE_REASON,
-      })
+      if (this.coordinatorUnknown) {
+        this.logger.debug('Leaving without a LeaveGroup: no coordinator is known', { groupId })
+      } else {
+        const coordinator = await this.liveCoordinator()
+        await coordinator.leaveGroup({
+          groupId,
+          memberId,
+          groupInstanceId,
+          reason: LEAVE_REASON,
+        })
+      }
     }
 
     if (this.joinCount === joinCount) {
