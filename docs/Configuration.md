@@ -446,6 +446,8 @@ An async function that will be invoked after the consumer exhausts all retries, 
 
 A fenced static instance and a fatal membership error under the consumer protocol never restart, even if `restartOnFailure` returns `true`. A duplicate `groupInstanceId` must be removed, or the rejected membership configuration, authorization or broker capability must be corrected first. Other terminal errors retain the callback policy.
 
+For a classic consumer, a lost broker connection or a moved group coordinator on its own requests is not a terminal death while it lasts less than `sessionTimeout`: the consumer retries it without crashing and without calling this function (see [Membership errors during rebalance](Consuming.md#membership-errors)). An error from your handler, and a consumer with `groupProtocol: 'consumer'`, still count against `retry.retries`.
+
 The function has the following signature: `(error: Error) => Promise<boolean>`
 
 * If the promise resolves to `true`: the consumer will restart

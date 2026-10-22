@@ -1,6 +1,7 @@
 const { EventEmitter } = require('events')
 const Long = require('../utils/long')
 const createRetry = require('../retry')
+const sleep = require('../utils/sleep')
 const {
   isKafkaJSError,
   isFencedInstance,
@@ -15,15 +16,20 @@ const {
 const createFetchManager = require('./fetchManager')
 const RebalanceCoordinator = require('./rebalanceCoordinator')
 const PollTimer = require('./pollTimer')
+const Outage = require('./outage')
 const HeartbeatManager = require('./heartbeatManager')
 const {
   REBALANCE_PATHS,
+  isOffsetCommitError,
   rebalanceReason,
   isConsumerProtocolFatal,
   sentOwnership,
   obsoleteOwnership,
 } = require('./rebalanceErrorContract')
 const { COOPERATIVE } = require('./groupProtocol/interface')
+
+/** A coordinator that is not, or no longer, the group's (Kafka error code 16). */
+const NOT_COORDINATOR = 16
 
 const isSameOffset = (offsetA, offsetB) => Long.fromValue(offsetA).equals(Long.fromValue(offsetB))
 const CONSUMING_START = 'consuming-start'
@@ -42,6 +48,8 @@ module.exports = class Runner extends EventEmitter {
    * @param {(payload: import("../../types").EachMessagePayload) => Promise<void>} [options.eachMessage]
    * @param {number} [options.heartbeatInterval]
    * @param {number} options.maxPollInterval the resolved poll deadline, in milliseconds
+   * @param {number} [options.sessionTimeout=30000] how long a classic member's fetch loop rides
+   *   out lost connections and coordinator moves before they count against `retry.retries`
    * @param {(reason: Error) => void} options.onCrash
    * @param {() => void} [options.onJoinComplete] forwarded to the rebalance coordinator
    * @param {import("../../types").RetryOptions} [options.retry]
@@ -59,6 +67,7 @@ module.exports = class Runner extends EventEmitter {
     eachMessage,
     heartbeatInterval,
     maxPollInterval,
+    sessionTimeout = 30000,
     onCrash,
     onJoinComplete,
     retry,
@@ -78,6 +87,18 @@ module.exports = class Runner extends EventEmitter {
     // operation of the runner keeps the deadline.
     this.fetchRetrier = createRetry(Object.assign({}, retry, { maxTotalTime: undefined }))
     this.commitRetrier = createRetry(Object.assign({}, retry))
+    this.backoff = createRetry.backoff(retry)
+    /**
+     * The outages a classic member's fetch loop rides out, one per class of the client's own
+     * requests in it: each ends only when a request of its own class succeeds.
+     */
+    this.outages = {
+      fetch: new Outage(sessionTimeout),
+      heartbeat: new Outage(sessionTimeout),
+      commit: new Outage(sessionTimeout),
+    }
+    /** @type {WeakMap<object, 'fetch'|'heartbeat'|'handler'>} where an error left the loop's work */
+    this.requestClasses = new WeakMap()
     this.onCrash = onCrash
     this.autoCommit = autoCommit
     this.maxPrefetchBatches = maxPrefetchBatches
@@ -229,7 +250,14 @@ module.exports = class Runner extends EventEmitter {
    * a loop that started anyway would keep fetching for a member that has already left its group.
    *
    * An error from a membership a completed round already replaced is dropped after any waiting
-   * verdict is handled, and the loop restarts instead of crashing the consumer.
+   * verdict is handled, and the loop restarts instead of crashing the consumer. So does, for a
+   * classic member, a lost connection or a moved coordinator raised by one of the loop's own
+   * requests (a Fetch round, a heartbeat, an automatic commit), after the retrier's first delay and
+   * without spending a retry, until that class of request has failed for a session timeout with no
+   * success (see `Outage`): the next round reconnects, and the heartbeat and the commit look the
+   * coordinator up again. The ride runs the attempt again inside the same retrier attempt, so it
+   * does not refill the retries that other errors have spent. A handler's errors, whatever they
+   * are, count as before.
    * @returns {void}
    */
   scheduleFetchManager() {
@@ -246,7 +274,15 @@ module.exports = class Runner extends EventEmitter {
 
     this.consuming = true
 
-    this.fetchRetrier(async (bail, retryCount, retryTime) => {
+    /**
+     * One attempt of the fetch loop under the fetch retrier.
+     * @param {(error: Error) => void} bail
+     * @param {number} retryCount
+     * @param {number} retryTime
+     * @returns {Promise<true|undefined>} true when it rode out a lost connection: the retrier's
+     *   attempt then runs it again, so a ride never refills the retries other errors have spent
+     */
+    const attempt = async (bail, retryCount, retryTime) => {
       if (!this.running) {
         return
       }
@@ -287,6 +323,20 @@ module.exports = class Runner extends EventEmitter {
           return
         }
 
+        const requestClass = this.requestClassOf(e)
+        if (requestClass && this.ridesOutages() && this.outages[requestClass].absorbs(e)) {
+          const delay = this.backoff.initial()
+          this.logger.warn('Lost a connection while fetching, trying again', {
+            groupId: this.consumerGroup.groupId,
+            memberId: this.consumerGroup.memberId,
+            error: e.message,
+            requestClass,
+            delay,
+          })
+          await sleep(delay)
+          return true
+        }
+
         if (e.name === 'KafkaJSNotImplemented' || e.name === 'KafkaJSNoBrokerAvailableError') {
           return bail(e)
         }
@@ -307,6 +357,10 @@ module.exports = class Runner extends EventEmitter {
       if (verdict) {
         await this.handleRebalanceError(verdict)
       }
+    }
+
+    this.fetchRetrier(async (bail, retryCount, retryTime) => {
+      while (await attempt(bail, retryCount, retryTime));
     })
       .then(() => {
         this.scheduleFetchManager()
@@ -634,6 +688,7 @@ module.exports = class Runner extends EventEmitter {
   async heartbeat() {
     try {
       await this.consumerGroup.heartbeat({ interval: this.consumerGroup.heartbeatInterval() })
+      this.outages.heartbeat.end()
     } catch (e) {
       const verdict = this.rebalanceCoordinator.classify(e, REBALANCE_PATHS.HEARTBEAT)
 
@@ -642,15 +697,68 @@ module.exports = class Runner extends EventEmitter {
       }
 
       if (
-        verdict &&
-        verdict.kind === 'revoked' &&
-        this.consumerGroup.rebalanceProtocol() === COOPERATIVE
+        this.consumerGroup.rebalanceProtocol() === COOPERATIVE &&
+        ((verdict && verdict.kind === 'revoked') ||
+          (this.isClassicNotCoordinator(e) && this.outages.heartbeat.absorbs(e)))
       ) {
         return
       }
 
-      throw e
+      throw this.markOwnRequest(e, 'heartbeat')
     }
+  }
+
+  /**
+   * Whether a classic member's heartbeat was answered `NOT_COORDINATOR`. A cooperative classic
+   * member's callback resolved on it when it was a revocation, and still does now that the member
+   * looks the coordinator up again instead of rejoining, while its heartbeat outage lasts less than
+   * the session timeout.
+   * @private
+   * @param {Error} error
+   * @returns {boolean}
+   */
+  isClassicNotCoordinator(error) {
+    return (this.consumerGroup.kind || 'classic') === 'classic' && error.code === NOT_COORDINATOR
+  }
+
+  /**
+   * Which class of the fetch loop's own requests raised `error`.
+   * @private
+   * @param {unknown} error
+   * @returns {'fetch'|'heartbeat'|'commit'|undefined} undefined for a handler's error and for any
+   *   error the loop's own requests did not raise
+   */
+  requestClassOf(error) {
+    const requestClass = this.requestClasses.get(error)
+    if (requestClass === 'handler') return undefined
+    return requestClass ?? (isOffsetCommitError(error) ? 'commit' : undefined)
+  }
+
+  /**
+   * Whether this member's fetch loop rides out lost connections: a classic member's does. A
+   * consumer-protocol member keeps its counted retries.
+   * @private
+   * @returns {boolean}
+   */
+  ridesOutages() {
+    return (this.consumerGroup.kind || 'classic') === 'classic'
+  }
+
+  /**
+   * Remembers which class of the fetch loop's own requests raised `error` (`fetch`, `heartbeat`),
+   * or that it left through a handler (`handler`), so the loop rides out a lost connection only
+   * where the client itself made the request. An OffsetCommit's error needs no mark: it carries
+   * its own (`isOffsetCommitError`).
+   * @private
+   * @param {unknown} error
+   * @param {'fetch'|'heartbeat'|'handler'} requestClass
+   * @returns {unknown} the same error
+   */
+  markOwnRequest(error, requestClass) {
+    if (error !== null && (typeof error === 'object' || typeof error === 'function')) {
+      this.requestClasses.set(error, requestClass)
+    }
+    return error
   }
 
   async processEachMessage(batch) {
@@ -678,6 +786,7 @@ module.exports = class Runner extends EventEmitter {
           pause,
         })
       } catch (e) {
+        this.markOwnRequest(e, 'handler')
         if (!isKafkaJSError(e)) {
           this.logger.error(`Error when calling eachMessage`, {
             topic,
@@ -796,6 +905,7 @@ module.exports = class Runner extends EventEmitter {
         isStale: () => this.consumerGroup.hasSeekOffset({ topic, partition }),
       })
     } catch (e) {
+      this.markOwnRequest(e, 'handler')
       if (!isKafkaJSError(e)) {
         this.logger.error(`Error when calling eachBatch`, {
           topic,
@@ -896,7 +1006,12 @@ module.exports = class Runner extends EventEmitter {
 
     this.instrumentationEmitter.emit(FETCH_START, { nodeId })
 
-    const batches = await this.consumerGroup.fetch(nodeId)
+    let batches
+    try {
+      batches = await this.consumerGroup.fetch(nodeId)
+    } catch (e) {
+      throw this.markOwnRequest(e, 'fetch')
+    }
 
     this.instrumentationEmitter.emit(FETCH, {
       /**
@@ -917,6 +1032,9 @@ module.exports = class Runner extends EventEmitter {
       // not having handed a handler anything.
       this.pollTimer.poll()
       await this.heartbeat()
+    } else {
+      // A leader answered: the fetch outage the loop was riding out, if any, is over.
+      this.outages.fetch.end()
     }
 
     return batches
@@ -1094,6 +1212,7 @@ module.exports = class Runner extends EventEmitter {
       }
 
       await this.autoCommitOffsets(batch)
+      this.outages.commit.end()
       await this.heartbeat()
     }
 

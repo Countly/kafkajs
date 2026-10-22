@@ -98,7 +98,9 @@ module.exports = class Lock {
   }
 
   /**
-   * Release the lock, immediately handing it to the longest-waiting caller, if any.
+   * Release the lock, immediately handing it to the longest-waiting caller, if any. It does not
+   * wait for that caller, so the releasing caller resumes before the next holder whether or not
+   * one was waiting: callers leave the lock in the order they acquired it.
    * @returns {Promise<void>}
    */
   async release() {
@@ -106,7 +108,7 @@ module.exports = class Lock {
     const waitingLock = this[PRIVATE.WAITING].values().next().value
 
     if (waitingLock) {
-      return waitingLock()
+      waitingLock()
     }
   }
 }

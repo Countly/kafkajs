@@ -402,7 +402,7 @@ describe('Instrumentation > where the events are emitted', () => {
       })
       protocol.memberId = 'member-1'
       protocol.generationId = 3
-      protocol.coordinator = { heartbeat: jest.fn(async () => ({})) }
+      protocol.coordinator = { heartbeat: jest.fn(async () => ({})), isConnected: () => true }
       const payload = {
         groupId: 'heartbeat-group',
         memberId: 'member-1',

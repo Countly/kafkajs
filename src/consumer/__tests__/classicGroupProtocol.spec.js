@@ -11,6 +11,7 @@ const {
   events: { GROUP_JOIN },
 } = require('../instrumentationEvents')
 const { newLogger } = require('testHelpers')
+const { KafkaJSConnectionError } = require('../../errors')
 
 const FIXTURES = path.join(__dirname, 'fixtures', 'classicGroupProtocol')
 
@@ -287,6 +288,32 @@ describe('Consumer > classic group protocol > joinAndSync contract', () => {
     expect(group.groupMembership.rebalance).toHaveBeenCalledTimes(2)
   })
 
+  it('retries a lost connection without spending a retry while the outage is shorter than the session timeout', async () => {
+    const group = buildGroup(0)
+    const lost = new KafkaJSConnectionError('Connection error: connect ECONNREFUSED', {
+      code: 'ECONNREFUSED',
+    })
+    const rebalance = jest
+      .spyOn(group.groupMembership, 'rebalance')
+      .mockRejectedValueOnce(lost)
+      .mockResolvedValueOnce({ assignment: {} })
+
+    await expect(group.joinAndSync()).resolves.toEqual({ assignment: {} })
+    expect(rebalance).toHaveBeenCalledTimes(2)
+  })
+
+  it("leaves a consumer-protocol member's lost connection to the counted retries", async () => {
+    const group = buildGroup(0)
+    Object.defineProperty(group, 'kind', { value: 'consumer' })
+    const lost = new KafkaJSConnectionError('Connection error: connect ECONNREFUSED', {
+      code: 'ECONNREFUSED',
+    })
+    jest.spyOn(group.groupMembership, 'rebalance').mockRejectedValue(lost)
+
+    await expect(group.joinAndSync()).rejects.toBe(lost)
+    expect(group.groupMembership.rebalance).toHaveBeenCalledTimes(1)
+  })
+
   it('bails without retrying on any other error', async () => {
     const group = buildGroup(5)
     jest
@@ -332,5 +359,96 @@ describe('Consumer > groupProtocol > ClassicGroupProtocol > the seam members the
     expect(protocol.onMembershipError(new Error('boom'))).toBeUndefined()
     expect(protocol.onStopRequested()).toBeUndefined()
     await expect(protocol.leaveForPollExpiry()).resolves.toBeUndefined()
+  })
+})
+
+describe('Consumer > classic group protocol > a heartbeat that loses its coordinator', () => {
+  const {
+    KafkaJSConnectionError,
+    KafkaJSConnectionClosedError,
+    KafkaJSRequestTimeoutError,
+  } = require('../../errors')
+  const { createErrorFromCode } = require('../../protocol/error')
+
+  /**
+   * A protocol whose first coordinator fails every heartbeat with `failure` and whose next lookup
+   * finds a healthy one.
+   * @param {() => Error} failure
+   */
+  const movedCoordinator = async (failure) => {
+    const old = {
+      heartbeat: jest.fn(async () => Promise.reject(failure())),
+      isConnected: () => true,
+    }
+    const current = { heartbeat: jest.fn(async () => {}), isConnected: () => true }
+    const found = [old, current]
+    const cluster = { findGroupCoordinator: jest.fn(async () => found.shift() ?? current) }
+    const protocol = buildProtocol({ cluster })
+    await protocol.connect()
+    Object.assign(protocol, { memberId: 'seam-member', generationId: 1 })
+    return { protocol, cluster, old, current }
+  }
+
+  it.each([
+    [
+      'its connection closed',
+      () => new KafkaJSConnectionClosedError('Closed connection', { host: 'old', port: 9092 }),
+    ],
+    [
+      'it could not be reached',
+      () =>
+        new KafkaJSConnectionError('Connection error: connect ECONNREFUSED', {
+          broker: 'old:9092',
+          code: 'ECONNREFUSED',
+        }),
+    ],
+    [
+      'it timed out',
+      () =>
+        new KafkaJSRequestTimeoutError('Request Heartbeat(key: 12, version: 4) timed out', {
+          broker: 'old:9092',
+        }),
+    ],
+    ['it answered COORDINATOR_NOT_AVAILABLE', () => createErrorFromCode(15)],
+    ['it answered NOT_COORDINATOR', () => createErrorFromCode(16)],
+  ])('looks the coordinator up again before the next heartbeat when %s', async (_name, failure) => {
+    const { protocol, cluster, old, current } = await movedCoordinator(failure)
+
+    await expect(protocol.heartbeat({ interval: 0 })).rejects.toThrow()
+    await protocol.heartbeat({ interval: 0 })
+    await protocol.heartbeat({ interval: 0 })
+
+    expect(cluster.findGroupCoordinator).toHaveBeenCalledTimes(2)
+    expect(old.heartbeat).toHaveBeenCalledTimes(1)
+    expect(current.heartbeat).toHaveBeenCalledTimes(2)
+  })
+
+  it('looks the coordinator up again before a heartbeat when its connection is no longer open', async () => {
+    let connected = true
+    const old = { heartbeat: jest.fn(async () => {}), isConnected: () => connected }
+    const current = { heartbeat: jest.fn(async () => {}), isConnected: () => true }
+    const found = [old, current]
+    const cluster = { findGroupCoordinator: jest.fn(async () => found.shift() ?? current) }
+    const protocol = buildProtocol({ cluster })
+    await protocol.connect()
+    Object.assign(protocol, { memberId: 'seam-member', generationId: 1 })
+
+    await protocol.heartbeat({ interval: 0 })
+    connected = false
+    await protocol.heartbeat({ interval: 0 })
+
+    expect(cluster.findGroupCoordinator).toHaveBeenCalledTimes(2)
+    expect(old.heartbeat).toHaveBeenCalledTimes(1)
+    expect(current.heartbeat).toHaveBeenCalledTimes(1)
+  })
+
+  it('keeps its coordinator after a heartbeat the coordinator answered as a member error', async () => {
+    const { protocol, cluster, old } = await movedCoordinator(() => createErrorFromCode(27))
+
+    await expect(protocol.heartbeat({ interval: 0 })).rejects.toThrow()
+    await expect(protocol.heartbeat({ interval: 0 })).rejects.toThrow()
+
+    expect(cluster.findGroupCoordinator).toHaveBeenCalledTimes(1)
+    expect(old.heartbeat).toHaveBeenCalledTimes(2)
   })
 })

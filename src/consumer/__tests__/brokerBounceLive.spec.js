@@ -131,13 +131,20 @@ const logVerdict = (acked, logged) => {
 }
 
 /**
+ * When an outage's window closes: its stabilisation, `STABLE_MS` after the node is restored.
+ * @param {{ tRestored: number }} outage
+ * @returns {number} ms since the epoch
+ */
+const windowEnd = ({ tRestored }) => tRestored + STABLE_MS
+
+/**
  * The outage whose window, stabilisation included, holds `at`.
  * @param {object[]} outages
  * @param {number} at
  * @returns {object|undefined}
  */
 const outageAt = (outages, at) =>
-  outages.find(({ tDown, tRestored }) => at >= tDown && at <= tRestored + STABLE_MS)
+  outages.find((outage) => at >= outage.tDown && at <= windowEnd(outage))
 
 /**
  * Oracle part 2, delivery: every acked record delivered to the group, and a duplicate only with a
@@ -183,9 +190,7 @@ const rebalanceVerdict = (journal, outages) =>
     const kind = armKind(outage.outageMs, journal.windowMs)
     const events = journal.entries.filter(
       (entry) =>
-        MEMBERSHIP.includes(entry.kind) &&
-        entry.at >= outage.tDown &&
-        entry.at <= outage.tRestored + STABLE_MS
+        MEMBERSHIP.includes(entry.kind) && entry.at >= outage.tDown && entry.at <= windowEnd(outage)
     )
     let changes = 0
     events.forEach((event, index) => {
@@ -358,6 +363,17 @@ describe('Broker bounce oracle', () => {
     journal.ledger.produced({ topic: 't', partition: 0, offset: '2' })
 
     expect(deliveryVerdict(journal, []).missing).toEqual(['t|0|2'])
+  })
+
+  test('an event at the close of an arm window belongs to that arm, one after it does not', () => {
+    const outage = { arm: 'x', tDown: 1000, tRestored: 2000, outageMs: 1000 }
+    const at = (time) => journalOf([{ kind: 'REBALANCING', member: 'a', at: time }])
+
+    expect(windowEnd(outage)).toBe(2000 + STABLE_MS)
+    expect(rebalanceVerdict(at(windowEnd(outage)), [outage])[0]).toMatchObject({ events: 1 })
+    expect(rebalanceVerdict(at(windowEnd(outage) + 1), [outage])[0]).toMatchObject({ events: 0 })
+    expect(outageAt([outage], windowEnd(outage))).toBe(outage)
+    expect(outageAt([outage], windowEnd(outage) + 1)).toBeUndefined()
   })
 
   test('a short arm allows no membership event; a long arm allows one change', () => {
@@ -641,6 +657,8 @@ describeBounce('Broker bounce: durable log, delivery and rebalances across outag
     const outage = await bouncer.step({ service, ...step }, { admin, topics: [topic] })
     await waitForFullIsr(admin, [topic])
     const stabilisedMs = await waitForStable()
+    // The verdict below reads the whole window: an event late in it belongs to this arm.
+    await sleep(Math.max(0, windowEnd(outage) - Date.now()))
     const record = {
       ...outage,
       arm: `${arm}:${role}`,

@@ -599,6 +599,7 @@ module.exports = (params) => {
         instrumentationEmitter,
         heartbeatInterval: groupTimeouts.heartbeatInterval,
         maxPollInterval: groupTimeouts.pollDeadline,
+        sessionTimeout: groupTimeouts.sessionTimeout,
         retry,
         autoCommit,
         eachBatchAutoResolve,

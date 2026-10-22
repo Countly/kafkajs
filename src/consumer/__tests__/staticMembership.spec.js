@@ -22,6 +22,7 @@ describe('Consumer > static membership (KIP-345)', () => {
       syncGroup: jest.fn(async () => ({ memberAssignment: Buffer.alloc(0) })),
       heartbeat: jest.fn(async () => {}),
       leaveGroup: jest.fn(async () => {}),
+      isConnected: () => true,
       // No usable JoinGroup version advertised: warnIfStaticMembershipInactive returns quietly,
       // matching this suite's focus on the groupInstanceId plumbing rather than the warning itself.
       negotiatedVersion: jest.fn(() => null),

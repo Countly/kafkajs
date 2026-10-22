@@ -225,7 +225,7 @@ describe('Consumer > disconnect({ leaveGroup })', () => {
         respond: () => Buffer.from(LEAVE_GROUP_OK.hex, 'hex'),
       })
       const protocol = new ClassicGroupProtocol({
-        cluster: {},
+        cluster: { findGroupCoordinator: async () => harness.broker },
         groupId: GROUP_ID,
         groupInstanceId: INSTANCE_ID,
         sessionTimeout: 30000,

@@ -12,6 +12,7 @@ const Batch = require('./batch')
 const SeekOffsets = require('./seekOffsets')
 const SubscriptionState = require('./subscriptionState')
 const PositionValidator = require('./positionValidator')
+const Outage = require('./outage')
 const {
   events: { CONNECT, RECEIVED_UNSUBSCRIBED_TOPICS, LOG_TRUNCATION, PARTITION_HALTED },
 } = require('./instrumentationEvents')
@@ -37,6 +38,7 @@ const {
   sentGeneration,
   stampOwnership,
   obsoleteOwnership,
+  consumerStoppingError,
   REBALANCE_PATHS,
 } = require('./rebalanceErrorContract')
 const { EAGER } = require('./groupProtocol/interface')
@@ -183,6 +185,8 @@ module.exports = class ConsumerGroup {
     this.logger = logger.namespace('ConsumerGroup')
     this.instrumentationEmitter = instrumentationEmitter
     this.retrier = createRetry(Object.assign({}, retry))
+    this.backoff = createRetry.backoff(retry)
+    this.sessionTimeout = sessionTimeout
     this.maxBytesPerPartition = maxBytesPerPartition
     this.minBytes = minBytes
     this.maxBytes = maxBytes
@@ -790,11 +794,49 @@ module.exports = class ConsumerGroup {
    * back through FindCoordinator and JoinGroup - so it is re-thrown as a retriable
    * `KafkaJSError` to restart the sequence through the retrier.
    *
+   * For a classic member, a lost connection (refused, reset, closed, timed out) or a coordinator
+   * that moved (15, 16) ends the retrier's attempt; the sequence then starts again after the
+   * retrier's first delay, looking the coordinator up anew, for as long as that outage is shorter
+   * than the session timeout, counted on a monotonic clock from its first failure. A longer outage
+   * fails the call with its error as before; a stop requested meanwhile fails it as a stop, which
+   * the round treats as no crash. A consumer-protocol member keeps the retrier's counted attempts.
+   *
    * Applying the result and reporting the round belong to the caller: this method performs one
    * exchange and returns what it decoded.
    * @returns {Promise<{ assignment: Object, userData: Buffer|null }>} the decoded sync result
+   * @throws {Error} what the join retrier gave up with, when it is not a loss this method rides out
+   *   or the outage has lasted the session timeout; `CONSUMER_STOPPING` when a stop came during one
    */
-  joinAndSync() {
+  async joinAndSync() {
+    if (this.kind === 'consumer') return this.joinAndSyncAttempt()
+    const outage = new Outage(this.sessionTimeout)
+
+    while (true) {
+      try {
+        return await this.joinAndSyncAttempt()
+      } catch (e) {
+        if (!outage.absorbs(e)) throw e
+
+        const delay = this.backoff.initial()
+        this.logger.warn('Lost the group coordinator while joining, trying again', {
+          groupId: this.groupId,
+          memberId: this.memberId,
+          error: describeThrown(e),
+          delay,
+        })
+        await sleep(delay)
+        if (this.isStopping()) throw consumerStoppingError()
+      }
+    }
+  }
+
+  /**
+   * One run of the join retrier: JoinGroup and SyncGroup, retried on a rebalance-class error.
+   * @private
+   * @returns {Promise<{ assignment: Object, userData: Buffer|null }>} the decoded sync result
+   * @throws {Error} what the retrier gave up with
+   */
+  joinAndSyncAttempt() {
     return this.retrier(async (bail) => {
       try {
         return await this.groupMembership.rebalance({

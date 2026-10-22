@@ -1,6 +1,7 @@
 const { Kafka } = require('../../../index')
 const { KafkaJSCommitFailedError } = require('../../errors')
 const RebalanceCoordinator = require('../rebalanceCoordinator')
+const OffsetManager = require('../offsetManager')
 const { createScriptedCluster, groupScript } = require('../../../testHelpers/scriptedCluster')
 const { prepareRecordBatches, TOPIC } = require('./fixtures/fetchHarness')
 const { waitForCondition } = require('./fixtures/liveScenario')
@@ -65,6 +66,30 @@ const releasableOnce = (gate) => {
 }
 
 /**
+ * Holds the next coordinator lookup of an offset commit in the client, before it reaches the wire,
+ * until `release`: a heartbeat that lost its coordinator looks it up on the wire too, so holding
+ * the next FindCoordinator there could hold the heartbeat's instead.
+ * @returns {{ arrived: () => Promise<void>, release: () => void }} a gate `releasableOnce` takes
+ */
+const holdNextCommitLookup = () => {
+  let arrive
+  let release
+  const arrival = new Promise((resolve) => {
+    arrive = resolve
+  })
+  const released = new Promise((resolve) => {
+    release = resolve
+  })
+  const getCoordinator = OffsetManager.prototype.getCoordinator
+  jest.spyOn(OffsetManager.prototype, 'getCoordinator').mockImplementationOnce(async function () {
+    arrive()
+    await released
+    return getCoordinator.call(this)
+  })
+  return { arrived: () => arrival, release: () => release() }
+}
+
+/**
  * A member that is lost may not commit: the coordinator has handed its partitions on, so an
  * OffsetCommit it sends could write over the new owner's progress. These cases run the real
  * consumer over the scripted cluster and hold the request a commit waits on.
@@ -105,6 +130,11 @@ describe('Consumer > commits under a lost membership', () => {
     })
     drains.push(finishHandler)
     let commit
+    let lookup
+    let armed
+    const lookupArmed = new Promise((resolve) => {
+      armed = resolve
+    })
     await consumer.connect()
     await consumer.subscribe({ topic: TOPIC, fromBeginning: true })
     await consumer.run({
@@ -119,15 +149,17 @@ describe('Consumer > commits under a lost membership', () => {
           .filter(({ endpoint }) => endpoint.host === 'node1')
           .forEach((socket) => socket.emit('error', new Error('connection reset')))
         await flush()
+        lookup = releasableOnce(holdNextCommitLookup())
+        drains.push(lookup.release)
+        armed()
         commit = consumer.commitOffsets([{ topic: TOPIC, partition: 0, offset: '1' }])
         await commit.catch(() => {})
       },
     })
     await until(() => inHandler.mock.calls.length > 0, 'the handler starting')
 
-    const lookup = releasableOnce(cluster.schedule.hold({ api: 'FindCoordinator' }))
-    drains.push(lookup.release)
     finishHandler()
+    await within(lookupArmed, 5000, 'the commit starting')
     await within(lookup.arrived(), 5000, 'the held coordinator lookup')
     cluster.up(1)
 
@@ -154,12 +186,11 @@ describe('Consumer > commits under a lost membership', () => {
     const { cluster, lookup, commitOf } = scenario
     beforeRelease = {
       commits: cluster.requests().filter(({ api }) => api === 'OffsetCommit'),
-      lookups: cluster.requests().filter(({ api }) => api === 'FindCoordinator').length,
       lost: rejoin.mock.calls.some(
         ([verdict]) => verdict.kind === 'lost' && verdict.error?.code === UNKNOWN_MEMBER_ID
       ),
     }
-    expect(beforeRelease).toEqual({ commits: [], lookups: 2, lost: true })
+    expect(beforeRelease).toEqual({ commits: [], lost: true })
     lookup.release()
     outcome = await within(
       commitOf().then(
@@ -182,13 +213,13 @@ describe('Consumer > commits under a lost membership', () => {
       drains.splice(0).forEach((drain) => drain())
       await within(consumer?.disconnect(), 5000, 'consumer disconnect')
     } finally {
-      rejoin?.mockRestore()
+      jest.restoreAllMocks()
       consumer = rejoin = scenario = beforeRelease = outcome = undefined
     }
   })
 
   it('reaches the held lookup and the loss before it releases the lookup', () => {
-    expect(beforeRelease).toEqual({ commits: [], lookups: 2, lost: true })
+    expect(beforeRelease).toEqual({ commits: [], lost: true })
   })
 
   it('sends no OffsetCommit for a commit that was waiting for the coordinator lookup when the member was lost', () => {

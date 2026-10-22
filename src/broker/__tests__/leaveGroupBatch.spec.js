@@ -87,7 +87,7 @@ describe('Broker > leaveGroup', () => {
     const leave = async (maxVersion) => {
       const broker = brokerAt(maxVersion, answer(`v${maxVersion}-ok`))
       const protocol = new ClassicGroupProtocol({
-        cluster: {},
+        cluster: { findGroupCoordinator: async () => broker },
         groupId: 'test-group',
         sessionTimeout: 30000,
         rebalanceTimeout: 60000,

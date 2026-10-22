@@ -240,7 +240,7 @@ describe('Consumer > onAssignment', () => {
     protocol.generationId = 4
     protocol.groupProtocol = 'with'
     protocol.memberId = 'm1'
-    protocol.coordinator = { leaveGroup: async () => {} }
+    protocol.coordinator = { leaveGroup: async () => {}, isConnected: () => true }
 
     protocol.notifyAssignment({
       partitions: [{ topic: 't', partitions: [0] }],
@@ -310,7 +310,7 @@ describe('Consumer > applying a sync result', () => {
     group.generationId = 7
     group.groupProtocol = 'with'
     group.memberId = 'm1'
-    group.coordinator = { leaveGroup: async () => {} }
+    group.coordinator = { leaveGroup: async () => {}, isConnected: () => true }
     group.groupMembership.setOwned([{ topic: 'topic-a', partitions: [1] }])
     group.partitionsPerSubscribedTopic = group.generatePartitionsPerSubscribedTopic()
     return group

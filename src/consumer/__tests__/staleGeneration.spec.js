@@ -109,10 +109,36 @@ describe('Consumer > Runner > stale generation', () => {
     }
   )
 
-  it.each([
-    ['REBALANCE_IN_PROGRESS', REBALANCE_IN_PROGRESS],
-    ['NOT_COORDINATOR_FOR_GROUP', NOT_COORDINATOR_FOR_GROUP],
-  ])('still commits on %s (partitions are REVOKED / coordinator moved)', async (_name, code) => {
+  it('a moved coordinator (NOT_COORDINATOR_FOR_GROUP) is looked up again: no rejoin, no commit', async () => {
+    const { runner, consumerGroup } = createRunner({
+      heartbeat: jest.fn(async () => {
+        throw createErrorFromCode(NOT_COORDINATOR_FOR_GROUP)
+      }),
+    })
+    const requestRejoin = jest.spyOn(runner.rebalanceCoordinator, 'requestRejoin')
+
+    await expect(runner.heartbeat()).rejects.toThrow()
+    expect(requestRejoin).not.toHaveBeenCalled()
+    expect(consumerGroup.commitOffsets).not.toHaveBeenCalled()
+    expect(consumerGroup.discardUncommittedOffsets).not.toHaveBeenCalled()
+  })
+
+  it("a moved coordinator (NOT_COORDINATOR_FOR_GROUP) still resolves a cooperative member's heartbeat callback", async () => {
+    const { runner, consumerGroup } = createRunner({
+      rebalanceProtocol: () => 'cooperative',
+      heartbeat: jest.fn(async () => {
+        throw createErrorFromCode(NOT_COORDINATOR_FOR_GROUP)
+      }),
+    })
+    const requestRejoin = jest.spyOn(runner.rebalanceCoordinator, 'requestRejoin')
+
+    await expect(runner.heartbeat()).resolves.toBeUndefined()
+    expect(requestRejoin).not.toHaveBeenCalled()
+    expect(consumerGroup.commitOffsets).not.toHaveBeenCalled()
+  })
+
+  it('still commits on REBALANCE_IN_PROGRESS (partitions are REVOKED)', async () => {
+    const code = REBALANCE_IN_PROGRESS
     const { runner, consumerGroup } = createRunner({
       heartbeat: jest.fn(async () => {
         throw createErrorFromCode(code)

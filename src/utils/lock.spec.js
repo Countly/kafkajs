@@ -28,6 +28,20 @@ describe('Utils > Lock', () => {
     expect(calls[2] - calls[1]).toBeGreaterThanOrEqual(minGap)
   })
 
+  it('lets its callers leave in the order they acquired it', async () => {
+    const lock = new Lock({ timeout: 1000 })
+    const left = []
+    const hold = async (id) => {
+      await lock.acquire()
+      await lock.release()
+      left.push(id)
+    }
+
+    await Promise.all([1, 2, 3, 4, 5].map(hold))
+
+    expect(left).toEqual([1, 2, 3, 4, 5])
+  })
+
   it('throws an error if the lock cannot be acquired within a period', async () => {
     const lock = new Lock({ timeout: 60 })
     const resource = jest.fn()

@@ -2,7 +2,12 @@ const sharedPromiseTo = require('../../utils/sharedPromiseTo')
 const apiKeys = require('../../protocol/requests/apiKeys')
 const { requests } = require('../../protocol/requests')
 const { MemberAssignment, MemberMetadata } = require('../assignerProtocol')
-const { KafkaJSNonRetriableError } = require('../../errors')
+const {
+  KafkaJSNonRetriableError,
+  KafkaJSConnectionError,
+  KafkaJSRequestTimeoutError,
+  isStaleCoordinator,
+} = require('../../errors')
 const {
   events: { HEARTBEAT },
 } = require('../instrumentationEvents')
@@ -17,6 +22,19 @@ const PROTOCOL_TYPE = 'consumer'
  * @see https://github.com/apache/kafka/blob/4.3.1/clients/src/main/java/org/apache/kafka/clients/consumer/internals/AbstractCoordinator.java
  */
 const LEAVE_REASON = 'the consumer is being closed'
+
+/**
+ * Whether a heartbeat error leaves the cached coordinator unusable: the connection to it failed,
+ * closed or timed out, or it answered that it is not, or not yet, the coordinator. The Java client
+ * marks its coordinator unknown on the same errors and looks it up before the next heartbeat.
+ * @see https://github.com/apache/kafka/blob/4.3.1/clients/src/main/java/org/apache/kafka/clients/consumer/internals/AbstractCoordinator.java
+ * @param {Error} error
+ * @returns {boolean}
+ */
+const losesCoordinator = (error) =>
+  error instanceof KafkaJSConnectionError ||
+  error instanceof KafkaJSRequestTimeoutError ||
+  isStaleCoordinator(error)
 
 /**
  * Membership over the classic JoinGroup/SyncGroup protocol.
@@ -77,6 +95,8 @@ module.exports = class ClassicGroupProtocol {
     this.logger = logger
 
     this.coordinator = null
+    /** Whether the last heartbeat lost the coordinator, so the next one looks it up first. */
+    this.coordinatorUnknown = false
     this.generationId = null
     /**
      * How many JoinGroups the coordinator has accepted. Only ever goes up: the generation and the
@@ -117,6 +137,9 @@ module.exports = class ClassicGroupProtocol {
           const coordinator = await this.liveCoordinator()
           await coordinator.heartbeat(payload)
         } catch (e) {
+          if (losesCoordinator(e)) {
+            this.coordinatorUnknown = true
+          }
           // A heartbeat sent before a rebalance and answered after it is answered about the
           // generation it was sent under, not the one this member holds by then.
           throw stampOwnership(stampGeneration(e, generationId), token)
@@ -189,17 +212,26 @@ module.exports = class ClassicGroupProtocol {
    */
   async connect() {
     this.coordinator = await this.cluster.findGroupCoordinator({ groupId: this.groupId })
+    this.coordinatorUnknown = false
   }
 
   /**
-   * The cached coordinator, found again first when it was retired since: a retired broker refuses
-   * every request, and between joins nothing else looks the coordinator up. A coordinator that is
-   * not retired is returned untouched.
+   * The cached coordinator, found again first when it was retired since, the last heartbeat lost
+   * it, or its connection is no longer open: a retired broker refuses every request, a dead or
+   * moved coordinator answers nothing useful, and a broker another user of the cluster disconnected
+   * would reconnect outside the cluster's broker pool, where no later disconnect closes it. Between
+   * joins nothing else looks the coordinator up. Otherwise it is returned untouched. The Java
+   * client checks the coordinator's connection the same way (`checkAndGetCoordinator`).
+   * @see https://github.com/apache/kafka/blob/4.3.1/clients/src/main/java/org/apache/kafka/clients/consumer/internals/AbstractCoordinator.java
    * @private
    * @returns {Promise<import('../../../types').Broker>}
    */
   async liveCoordinator() {
-    if (this.coordinator.retired === true) {
+    if (
+      this.coordinatorUnknown ||
+      this.coordinator.retired === true ||
+      !this.coordinator.isConnected()
+    ) {
       await this.connect()
     }
 

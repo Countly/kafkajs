@@ -73,6 +73,15 @@ const stampOffsetCommit = (error) => {
 const isDeletedGroupCommit = (error) =>
   error.code === GROUP_ID_NOT_FOUND && Boolean(error[OFFSET_COMMIT_ORIGIN])
 
+/**
+ * Whether an error came from an OffsetCommit this client sent: its coordinator lookup, the request
+ * or its answer.
+ * @param {unknown} error
+ * @returns {boolean}
+ */
+const isOffsetCommitError = (error) =>
+  error !== null && typeof error === 'object' && Boolean(error[OFFSET_COMMIT_ORIGIN])
+
 /** The message the Java client gives when the cluster cannot speak the new group protocol. */
 const CONSUMER_PROTOCOL_UNSUPPORTED_MESSAGE =
   "The cluster does not support the new CONSUMER group protocol. Set groupProtocol: 'classic' on the consumer until the cluster is upgraded."
@@ -160,12 +169,15 @@ const rebalanceAction = (error, path, { kind = 'classic' } = {}) => {
     }
   }
 
-  if (isRevoked(error)) {
-    return { action: 'revoked', fatal: false, clearsMemberId: false }
-  }
-
+  // Before the revoked row: a coordinator that moved or is unavailable (15, 16) is looked up again
+  // and the member keeps its membership, as the Java client marks it unknown and rejoins nothing.
+  // @see https://github.com/apache/kafka/blob/4.3.1/clients/src/main/java/org/apache/kafka/clients/consumer/internals/AbstractCoordinator.java
   if (isStaleCoordinator(error)) {
     return { action: 'retry-coordinator', fatal: false, clearsMemberId: false }
+  }
+
+  if (isRevoked(error)) {
+    return { action: 'revoked', fatal: false, clearsMemberId: false }
   }
 
   return { action: null, fatal: false, clearsMemberId: false }
@@ -374,6 +386,7 @@ module.exports = {
   isConsumerProtocolFatal,
   stampOffsetCommit,
   isDeletedGroupCommit,
+  isOffsetCommitError,
   pollIntervalExceededError,
   assignmentChangedError,
   consumerStoppingError,

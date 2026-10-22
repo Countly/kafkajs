@@ -532,6 +532,7 @@ describe('Consumer > HeartbeatManager > the HEARTBEAT event', () => {
           }),
           heartbeat,
           negotiatedVersion: () => 5,
+          isConnected: () => true,
         }),
       },
       groupId: 'heartbeat-group',
