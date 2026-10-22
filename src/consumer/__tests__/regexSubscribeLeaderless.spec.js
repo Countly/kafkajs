@@ -41,6 +41,9 @@ const createCluster = () => {
       disconnect: async () => {
         connected = false
       },
+      retire: async () => {
+        connected = false
+      },
       metadata: async (topics = []) => {
         asked.push(topics)
         const { response } = requests.Metadata.protocol({ version: 13 })({ topics })

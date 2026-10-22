@@ -75,6 +75,9 @@ const createLeaderlessCluster = ({ keepsMetadata = true } = {}) => {
       disconnect: async () => {
         connected = false
       },
+      retire: async () => {
+        connected = false
+      },
       metadata: async (topics = []) => {
         record('Metadata', { topics })
         const named = topics.length > 0 ? topics : Object.keys(leaders)
