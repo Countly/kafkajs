@@ -17,9 +17,13 @@ module.exports = {
 
   /**
    * @param {Buffer} buffer
-   * @returns {Promise}
+   * @param {{ maxOutputLength?: number }} [options] the most bytes to produce; Node refuses the
+   *   output with `ERR_BUFFER_TOO_LARGE` while it is made, not after
+   * @returns {Promise<Buffer>}
+   * @throws {RangeError} `ERR_BUFFER_TOO_LARGE` past `maxOutputLength`
+   * @throws {Error} for a corrupt or truncated stream (a zlib error with a `Z_` code)
    */
-  async decompress(buffer) {
-    return await unzip(buffer)
+  async decompress(buffer, { maxOutputLength } = {}) {
+    return await unzip(buffer, { maxOutputLength })
   },
 }

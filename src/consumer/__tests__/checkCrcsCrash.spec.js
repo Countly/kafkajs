@@ -186,6 +186,11 @@ const createConsumerGroup = (broker, { checkCrcs }) => {
   })
 
   consumerGroup.subscriptionState.assign([{ topic: TOPIC, partitions: [0] }])
+  consumerGroup.assignmentEpoch += 1
+  for (const partition of [0]) {
+    const acquiredAt = ++consumerGroup.acquireClock
+    consumerGroup.acquired.set(`${TOPIC}|${partition}`, { acquiredAt, changedAt: acquiredAt })
+  }
   consumerGroup.offsetManager = new OffsetManager({
     cluster,
     coordinator: broker,
@@ -208,26 +213,36 @@ const answerWith = (batch) => (header) =>
   header.apiKey === apiKeys.ApiVersions ? apiVersionsBody() : fetchResponseBody(batch)
 
 describe('Consumer > checkCrcs (consumer group + real Fetch codec over a fake broker)', () => {
-  test('a corrupt batch is a non-retriable error and does not advance the offset', async () => {
+  test('a corrupt batch halts its partition, delivers nothing from it and does not advance the offset', async () => {
     const corruptBatch = await buildBatch(true)
     const { broker, state } = createFakeBroker(answerWith(corruptBatch))
     await broker.connect()
     const consumerGroup = createConsumerGroup(broker, { checkCrcs: true })
+    const halted = []
+    consumerGroup.instrumentationEmitter.addListener('consumer.partition_halted', (event) =>
+      halted.push(event)
+    )
 
-    const batches = await consumerGroup.fetch(NODE_ID).catch((e) => e)
+    // The fetch resolves: a checksum mismatch no longer crashes the consumer.
+    const batches = await consumerGroup.fetch(NODE_ID)
 
-    // 1. No batch was ever handed to a message handler: `fetch` rejects before any `Batch` is
-    // built, so there is no handler call to assert against here -- confirmed by `batches` below
-    // being the rejection itself, not a decoded result.
-    expect(batches).toBeInstanceOf(Error)
+    // 1. No message of the corrupt batch reaches a handler.
+    expect(batches.flatMap(({ messages }) => messages)).toEqual([])
 
-    // recoverFromFetch matches no recovery branch for a marked KafkaJSPartialMessageError, so it
-    // re-throws (consumerGroup.fetch's own try/catch does not swallow that re-throw).
-    expect(batches.name).toEqual('KafkaJSPartialMessageError')
-    expect(batches.crcMismatch).toBe(true)
-    expect(batches.retriable).toBe(false)
+    // 2. The partition is halted at the batch, once, with the reason and no offset to skip to.
+    expect(consumerGroup.haltedPartitions.get(`${TOPIC}|0`)).toMatchObject({
+      reason: 'checksum',
+      offset: '0',
+    })
+    expect(halted).toHaveLength(1)
+    expect(halted[0].payload.error).toMatchObject({
+      name: 'KafkaJSCorruptRecordError',
+      reason: 'checksum',
+      retriable: false,
+    })
+    expect(halted[0].payload.nextOffset).toBeUndefined()
 
-    // 4. No OffsetCommit was ever written: the offset is not advanced past the corrupt batch.
+    // 3. No OffsetCommit was ever written: the offset is not advanced past the corrupt batch.
     const offsetCommits = state.writes.filter(
       (frame) => readRequestHeader(frame).apiKey === apiKeys.OffsetCommit
     )

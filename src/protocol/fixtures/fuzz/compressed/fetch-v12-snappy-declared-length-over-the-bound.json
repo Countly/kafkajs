@@ -1,0 +1,17 @@
+{
+  "seed": 20261019,
+  "hex": "00000000000000000000020b746573742d746f7069630200000000000000000000000000640000000000000064000000000000000001ffffffff450000000000000000000000380000000002e716695e00020000000200000000000000000000000000000000ffffffffffffffffffffffffffff0000000380808080080061000000",
+  "api": "Fetch",
+  "version": 12,
+  "direction": "response",
+  "options": {
+    "checkCrcs": false,
+    "maxDecompressedBatchBytes": 4194304
+  },
+  "expect": {
+    "outcome": "corrupt:decompressed-size",
+    "codec": "snappy",
+    "limit": 4194304,
+    "violation": null
+  }
+}

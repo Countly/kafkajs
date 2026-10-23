@@ -11,6 +11,8 @@ Versions before 3.0.0 are internal alpha tags and are not published.
 
 - **Snappy is built in** (decode and encode, Kafka's xerial framing) instead of throwing `KafkaJSNotImplemented`. A codec you register at `CompressionCodecs[CompressionTypes.Snappy]` still takes precedence
 - **A queued or on-wire send now rejects at its delivery deadline, even while the operation it awaits has not returned.** A late answer cannot settle the send again. Expiry fences later writes and reconciles the batch's sequence state; it does not cancel a request already written. A timeout is `outcome: 'unsent'` only when no attempt carrying the records could have been written, and `outcome: 'unknown'` otherwise, including an earlier write followed by a retriable answer. Resending an unknown delivery may duplicate records. There is no escape to the old late-settlement behavior.
+- **Decompression is bounded for every codec (`maxDecompressedBatchBytes`, default 1 GiB), and a batch past the bound, a corrupt compressed stream, an impossible record count, or a record count past the derived ceiling halts only that partition**: the records before it are delivered, `consumer.partition_halted` fires with the reason, `codec`, `limit` and (when a validated batch boundary exists) `nextOffset`, and the partition is not fetched again until `consumer.seek`. Before, **a record-level decode error after decompression** (for example valid decompressed bytes that did not parse as records) was swallowed as a truncated tail and the partition silently made no progress; other decompressor errors were not swallowed there
+- **A record batch whose CRC32C does not match (`checkCrcs`, on by default) now halts its partition like any corrupt batch, instead of crashing the consumer.** Other partitions keep delivering
 
 #### Fixes
 
@@ -18,11 +20,13 @@ Versions before 3.0.0 are internal alpha tags and are not published.
 
 - Producers accept optional `compressionLevels: { gzip, zstd }` and direct broker Produce requests accept `compressionLevel`. Codec defaults are unchanged. LZ4 levels are unavailable in `lz4-napi` and are rejected.
 - `KafkaJSDeliveryTimeout` accepts optional `outcome: 'unsent' | 'unknown'` and copies its cause's `type` and `code` when present. An absent `outcome` says nothing about delivery; retry exhaustion, connection errors, configuration errors and broker answers do not receive it.
+- **`maxDecompressedBatchBytes`**, a new `Kafka#consumer` option (an integer from 1 to 2 147 483 647, default 1 073 741 824): the most one record batch may decompress to, in bytes, for every codec, and the source of the derived ceiling of `max(1, floor(value / 512))` records per batch. `KafkaJSCorruptRecordError` gains the reasons `checksum`, `decompressed-size` and `decompression` and the optional `codec`, `limit` and `nextOffset`; `consumer.partition_halted` carries `codec`, `limit` and `nextOffset` when the error has them; `Broker#fetch` accepts the option; a codec registered in `CompressionCodecs` now receives the bound as `decompress(buffer, { maxOutputLength })`. These optional event fields are copied from the `KafkaJSCorruptRecordError`; the existing groupId, memberId, topic, partition, offset, reason and error fields are retained.
 
 #### Tooling
 
 - Add independent Java Snappy vectors, Java read-back artifacts and a codec throughput, memory and event-loop benchmark.
 - Add independent record-containing Produce wire vectors and held-answer regressions for idempotent and non-idempotent delivery expiry.
+- `lz4-napi` is pinned to exactly `2.10.0` (it was `^2.10.0`). The LZ4 frame preflight reads a frame the way that release's decoder does and its pinning cases fail on any other release; move the pin only with a re-run of `lz4.spec.js`.
 
 
 ### Phase 1 — foundation

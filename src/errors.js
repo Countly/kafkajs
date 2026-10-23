@@ -530,23 +530,36 @@ class KafkaJSInvalidFrameError extends KafkaJSConnectionError {
 }
 
 /**
- * A Fetch record batch is structurally corrupt: its length, magic byte, record count or control
- * record is impossible. Non-retriable; repeating the fetch returns the same bytes.
- * `offset` is the first offset of the batch as a decimal string, when it could be read.
+ * A Fetch record batch is corrupt or breaks a decoding bound: its length, magic byte, record count
+ * or control record is impossible, its checksum does not match, its compressed body is malformed,
+ * or it decompresses past `maxDecompressedBatchBytes`. Non-retriable; repeating the fetch returns
+ * the same bytes. `offset` is the first offset of the batch as a decimal string, when it could be
+ * read. `nextOffset`, present only when the batch boundary was validated (a readable, non-negative
+ * `lastOffsetDelta` and, with `checkCrcs`, a matching checksum), is where `consumer.seek` goes to
+ * skip the batch. `codec` names the compression codec of a compressed batch, and `limit` the bound
+ * in force: bytes for `decompressed-size` and `decompression`, records for a `count` over the
+ * derived record ceiling.
  */
 class KafkaJSCorruptRecordError extends KafkaJSNonRetriableError {
   /**
    * @param {Error|string} e
    * @param {object} options
-   * @param {'length'|'magic'|'count'|'control'} options.reason
+   * @param {'length'|'magic'|'count'|'control'|'checksum'|'decompressed-size'|'decompression'} options.reason
    * @param {string} [options.offset]
+   * @param {string} [options.nextOffset]
+   * @param {'gzip'|'snappy'|'lz4'|'zstd'} [options.codec]
+   * @param {number} [options.limit]
    * @param {Error} [options.cause]
    */
-  constructor(e, { reason, offset, cause } = {}) {
+  constructor(e, { reason, offset, nextOffset, codec, limit, cause } = {}) {
     super(e, { cause })
     this.name = 'KafkaJSCorruptRecordError'
     this.reason = reason
     this.offset = offset
+
+    if (nextOffset !== undefined) this.nextOffset = nextOffset
+    if (codec !== undefined) this.codec = codec
+    if (limit !== undefined) this.limit = limit
   }
 }
 

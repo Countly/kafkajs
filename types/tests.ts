@@ -443,13 +443,22 @@ consumer.on(consumer.events.PARTITIONS_LOST, e => {
 })
 consumer.on(consumer.events.PARTITION_HALTED, e => {
   const offset: string = e.payload.offset
-  const reason: 'length' | 'magic' | 'count' | 'control' = e.payload.reason
+  const reason: 'length' | 'magic' | 'count' | 'control' | 'checksum' | 'decompressed-size' | 'decompression' = e.payload.reason
   const error: KafkaJSCorruptRecordError = e.payload.error
   const partition: number = e.payload.partition
+  const nextOffset: string | undefined = e.payload.nextOffset
+  const codec: 'gzip' | 'snappy' | 'lz4' | 'zstd' | undefined = e.payload.codec
+  const limit: number | undefined = e.payload.limit
+  // @ts-expect-error an unknown halt reason is not part of the event contract
+  const unknownReason: 'unknown' = e.payload.reason
   void offset
   void reason
   void error
   void partition
+  void nextOffset
+  void codec
+  void limit
+  void unknownReason
 })
 consumer.on(consumer.events.POLL_INTERVAL_EXCEEDED, e => {
   const elapsed: number = e.payload.elapsedMs
@@ -484,6 +493,9 @@ void member
 kafka.consumer({ groupId: 'g', groupProtocol: 'consumer' })
 kafka.consumer({ groupId: 'g', groupProtocol: 'consumer', groupRemoteAssignor: 'uniform' })
 kafka.consumer({ groupId: 'g', groupProtocol: 'classic' })
+kafka.consumer({ groupId: 'g', maxDecompressedBatchBytes: 4194304 })
+// @ts-expect-error a number of bytes
+kafka.consumer({ groupId: 'g', maxDecompressedBatchBytes: '4 MiB' })
 kafka.consumer({ groupId: 'g', maxPrefetchBatches: 0 })
 kafka.consumer({ groupId: 'g', maxPrefetchBatches: 1 })
 // @ts-expect-error deeper prefetch is rejected at runtime, so it is a type error too
@@ -668,7 +680,26 @@ const frameReason: 'negative' | 'too-short' | 'too-large' | 'unreadable' = frame
 const frameSize: number | null = frameError.size
 const corruptError = new KafkaJSCorruptRecordError('x', { reason: 'length', offset: '42', cause })
 const corruptIsNonRetriable: KafkaJSNonRetriableError = corruptError
-const corruptReason: 'length' | 'magic' | 'count' | 'control' = corruptError.reason
+const corruptReason:
+  | 'length'
+  | 'magic'
+  | 'count'
+  | 'control'
+  | 'checksum'
+  | 'decompressed-size'
+  | 'decompression' = corruptError.reason
+const boundError = new KafkaJSCorruptRecordError('x', {
+  reason: 'decompressed-size',
+  offset: '42',
+  nextOffset: '50',
+  codec: 'lz4',
+  limit: 4194304,
+})
+const boundNext: string | undefined = boundError.nextOffset
+const boundCodec: 'gzip' | 'snappy' | 'lz4' | 'zstd' | undefined = boundError.codec
+const boundLimit: number | undefined = boundError.limit
+// @ts-expect-error not a reason
+new KafkaJSCorruptRecordError('x', { reason: 'bomb' })
 const commitError = new KafkaJSCommitFailedError('x', { reason: 'membership-lost', cause })
 const commitIsNonRetriable: KafkaJSNonRetriableError = commitError
 const commitReason: 'membership-lost' | 'poll-interval-exceeded' | 'stale-assignment' =
@@ -681,6 +712,7 @@ new KafkaJSCommitFailedError('x', { reason: 'membership-lost' })
 // @ts-expect-error not a reason
 new KafkaJSInvalidFrameError('x', { reason: 'too-big' })
 void [frameIsConnectionError, frameReason, frameSize, corruptIsNonRetriable, corruptReason]
+void [boundNext, boundCodec, boundLimit]
 void [commitIsNonRetriable, commitReason, commitCause, commitType, commitCode]
 
 // The error classes of a closed connection, a join that needs its member id, a broken invariant,
@@ -728,6 +760,11 @@ new KafkaJSLockTimeout()
 
 // The broker surface transactions use.
 const useBroker = async (broker: Broker) => {
+  await broker.fetch({
+    topics: [{ topic, partitions: [{ partition: 0, fetchOffset: '0', maxBytes: 1048576 }] }],
+    checkCrcs: true,
+    maxDecompressedBatchBytes: 4194304,
+  })
   const offsets: TransactionOffsets['topics'] = [
     { topic, partitions: [{ partition: 0, offset: '5' }] },
   ]

@@ -494,7 +494,7 @@ const createFakeCoordinator = async (answer) => {
  * Builds a `ConsumerGroup` whose join/sync dance is skipped: `subscriptionState` and
  * `offsetManager` are primed directly, mirroring what a real join would have produced.
  * @param {{ cluster: object, broker: Broker, partitions: number[], checkCrcs: boolean,
- *   autoCommit: boolean, retry: object, position: string }} options
+ *   maxDecompressedBatchBytes?: number, autoCommit: boolean, retry: object, position: string }} options
  * @returns {ConsumerGroup}
  */
 const buildConsumerGroup = ({
@@ -502,6 +502,7 @@ const buildConsumerGroup = ({
   broker,
   partitions,
   checkCrcs,
+  maxDecompressedBatchBytes,
   autoCommit,
   retry,
   position,
@@ -527,10 +528,16 @@ const buildConsumerGroup = ({
     isolationLevel: 0,
     rackId: '',
     checkCrcs,
+    maxDecompressedBatchBytes,
     metadataMaxAge: 300000,
   })
 
   group.subscriptionState.assign([{ topic: TOPIC, partitions }])
+  group.assignmentEpoch += 1
+  for (const partition of partitions) {
+    const acquiredAt = ++group.acquireClock
+    group.acquired.set(`${TOPIC}|${partition}`, { acquiredAt, changedAt: acquiredAt })
+  }
   group.offsetManager = new OffsetManager({
     cluster,
     coordinator: broker,
@@ -570,6 +577,7 @@ const buildConsumerGroup = ({
  * @param {number[]} [options.partitions] the assigned partitions, all led by `NODE_ID` initially
  * @param {number[]} [options.knownNodes] node ids `cluster.hasNode` answers `true` for
  * @param {boolean} [options.checkCrcs]
+ * @param {number} [options.maxDecompressedBatchBytes] the group's decompression bound
  * @param {number} [options.fetchMaxVersion] the highest Fetch version the fake broker advertises,
  *   which is the version the client then negotiates
  * @param {boolean} [options.applyLeaderHintResolves] what `cluster.applyLeaderHint` resolves to;
@@ -607,6 +615,7 @@ const createFetchGroup = async ({
   partitions = [0],
   knownNodes = [NODE_ID],
   checkCrcs = true,
+  maxDecompressedBatchBytes,
   fetchMaxVersion = 18,
   applyLeaderHintResolves = true,
   applyLeaderHintMovesLeaderTo,
@@ -724,6 +733,7 @@ const createFetchGroup = async ({
     broker,
     partitions,
     checkCrcs,
+    maxDecompressedBatchBytes,
     autoCommit,
     retry,
     position,

@@ -1,6 +1,7 @@
 const Decoder = require('../../../decoder')
 const { parse: parseV4 } = require('../v4/response')
 const decodeMessages = require('../v4/decodeMessages')
+const decoderCache = require('../decoderCache')
 
 /**
  * Fetch Response (Version: 11) => throttle_time_ms error_code session_id [responses]
@@ -29,9 +30,9 @@ const decodeAbortedTransactions = (decoder) => ({
 })
 
 /**
- * Builds the reader chain for one value of `checkCrcs`. Called twice at module load so a fetch
- * response allocates no closures.
- * @param {{ checkCrcs: boolean }} options
+ * Builds the reader chain for one pair of decode options. `decoderCache` keeps one per pair, so a
+ * fetch response allocates no closures.
+ * @param {{ checkCrcs: boolean, maxDecompressedBatchBytes: number }} options
  * @returns {(rawData: Buffer) => Promise<object>}
  */
 const buildDecode = (options) => {
@@ -71,17 +72,14 @@ const buildDecode = (options) => {
   }
 }
 
-const decoders = {
-  true: buildDecode({ checkCrcs: true }),
-  false: buildDecode({ checkCrcs: false }),
-}
+const decoderFor = decoderCache(buildDecode)
 
 /**
  * @param {Buffer} rawData
- * @param {{ checkCrcs?: boolean }} [options]
+ * @param {{ checkCrcs?: boolean, maxDecompressedBatchBytes?: number }} [options]
  * @returns {Promise<object>}
  */
-const decode = (rawData, options = {}) => decoders[options.checkCrcs !== false](rawData)
+const decode = (rawData, options = {}) => decoderFor(options)(rawData)
 
 module.exports = {
   decode,

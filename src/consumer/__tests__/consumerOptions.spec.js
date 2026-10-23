@@ -479,6 +479,14 @@ describe('Consumer > configuration > pass-through', () => {
     expect(runner.maxPrefetchBatches).toEqual(1)
   })
 
+  it('hands the group the decompression bound, 1 GiB unless the consumer sets one', async () => {
+    const defaults = await capturedOptions()
+    const lowered = await capturedOptions({ maxDecompressedBatchBytes: 4194304 })
+
+    expect(defaults.group.maxDecompressedBatchBytes).toEqual(1073741824)
+    expect(lowered.group.maxDecompressedBatchBytes).toEqual(4194304)
+  })
+
   it('builds no client assigner under the consumer protocol', async () => {
     const { group } = await capturedOptions({ groupProtocol: 'consumer' })
 

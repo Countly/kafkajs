@@ -15,7 +15,11 @@ const createAdmin = require('./admin')
 const ISOLATION_LEVEL = require('./protocol/isolationLevel')
 const defaultSocketFactory = require('./network/socketFactory')
 const once = require('./utils/once')
-const { INT_32_MAX_VALUE, DEFAULT_MAX_RESPONSE_SIZE } = require('./constants')
+const {
+  INT_32_MAX_VALUE,
+  DEFAULT_MAX_RESPONSE_SIZE,
+  DEFAULT_MAX_DECOMPRESSED_BATCH_BYTES,
+} = require('./constants')
 const websiteUrl = require('./utils/websiteUrl')
 
 const PRIVATE = {
@@ -73,6 +77,22 @@ const validateMaxResponseSize = (value) => {
 
   throw new KafkaJSInvalidConfigurationError(
     `maxResponseSize must be an integer from ${MIN_MAX_RESPONSE_SIZE} to ${INT_32_MAX_VALUE}, got ${inspect(value)}`
+  )
+}
+
+/**
+ * Accept the documented values for maxDecompressedBatchBytes: an integer from 1 to 2147483647.
+ * @param {number} value
+ * @returns {number}
+ * @throws {KafkaJSInvalidConfigurationError} on anything else, naming the option
+ */
+const validateMaxDecompressedBatchBytes = (value) => {
+  if (Number.isInteger(value) && value >= 1 && value <= INT_32_MAX_VALUE) {
+    return value
+  }
+
+  throw new KafkaJSInvalidConfigurationError(
+    `maxDecompressedBatchBytes must be an integer from 1 to ${INT_32_MAX_VALUE}, got ${inspect(value)}`
   )
 }
 
@@ -436,6 +456,11 @@ module.exports = class Client {
    *
    * A `maxBytes` above the client's `maxResponseSize` logs one warning: a Fetch response of that
    * size would be refused with `KafkaJSInvalidFrameError`.
+   *
+   * `maxDecompressedBatchBytes` (default 1 GiB, an integer from 1 to 2147483647) is the most a
+   * record batch may decompress to, for every codec; it also sets a ceiling of
+   * `max(1, floor(bytes / 512))` records per batch. A batch past either halts its partition.
+   * @throws {KafkaJSInvalidConfigurationError} for an invalid `maxDecompressedBatchBytes`
    * @public
    */
   consumer({
@@ -456,11 +481,14 @@ module.exports = class Client {
     readUncommitted = false,
     rackId = '',
     checkCrcs = true,
+    maxDecompressedBatchBytes = DEFAULT_MAX_DECOMPRESSED_BATCH_BYTES,
     groupInstanceId = null,
     groupProtocol,
     groupRemoteAssignor,
     maxPrefetchBatches,
   } = {}) {
+    validateMaxDecompressedBatchBytes(maxDecompressedBatchBytes)
+
     const isolationLevel = readUncommitted
       ? ISOLATION_LEVEL.READ_UNCOMMITTED
       : ISOLATION_LEVEL.READ_COMMITTED
@@ -501,6 +529,7 @@ module.exports = class Client {
       instrumentationEmitter,
       rackId,
       checkCrcs,
+      maxDecompressedBatchBytes,
       groupInstanceId,
       metadataMaxAge,
       groupProtocol,

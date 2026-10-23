@@ -111,7 +111,7 @@ const forgedFields = (vector) =>
           { offsets: before, corruption: 'count' },
           true
         ),
-        forged('count', value, { checkCrcs: true }, { error: 'KafkaJSPartialMessageError' }),
+        forged('count', value, { checkCrcs: true }, { offsets: before, corruption: 'checksum' }),
       ]),
     ]
   })
@@ -572,12 +572,13 @@ describe('Protocol > Fetch response > the fuzz corpus', () => {
       expect(response.responses[0].partitions[0].messages).toEqual([])
     })
 
-    test('a CRC mismatch rejects the response when checkCrcs is on, as it did', async () => {
+    test('a CRC mismatch is carried as a checksum corruption when checkCrcs is on', async () => {
       const wrongCrc = batch({ crc: 0xdeadbeef, records: [record()] })
 
-      const { error } = await fetched([{ partition: 0, errorCode: 0, records: wrongCrc }])
+      const { response, error } = await fetched([{ partition: 0, errorCode: 0, records: wrongCrc }])
 
-      expect(error).toMatchObject({ name: 'KafkaJSPartialMessageError', crcMismatch: true })
+      expect(error).toBeUndefined()
+      expect(response.responses[0].partitions[0].corruption).toMatchObject({ reason: 'checksum' })
     })
 
     test('and is decoded when it is off', async () => {

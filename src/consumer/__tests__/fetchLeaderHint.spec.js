@@ -3,6 +3,7 @@ const { newLogger } = require('testHelpers')
 const {
   NODE_ID,
   TOPIC,
+  TOPIC_ID,
   prepareRecordBatches,
   fetchResponse,
   createFetchGroup,
@@ -327,16 +328,20 @@ describe('Consumer > v11 behaviour is unchanged at v18', () => {
     expect(lastFetchHeaderFields()).toMatchObject({ rackId: 'eu-west-1a', isolationLevel: 1 })
   })
 
-  test('checkCrcs still throws KafkaJSPartialMessageError with crcMismatch on a corrupted batch', async () => {
-    const { group, setResponse } = await createFetchGroup({ partitions: [0], checkCrcs: true })
+  test('checkCrcs reports a corrupted batch as a checksum corruption, not as a rejected fetch', async () => {
+    const { broker, setResponse } = await createFetchGroup({ partitions: [0], checkCrcs: true })
 
     setResponse(fetchResponse([{ partition: 0, errorCode: 0, records: CORRUPTED_RECORD_BATCH }]))
 
-    await expect(group.fetch(NODE_ID)).rejects.toMatchObject({
-      name: 'KafkaJSPartialMessageError',
-      crcMismatch: true,
-      retriable: false,
+    const { responses } = await broker.fetch({
+      topics: [
+        { topic: TOPIC, partitions: [{ partition: 0, fetchOffset: '0', maxBytes: 1048576 }] },
+      ],
+      topicIds: new Map([[TOPIC, TOPIC_ID]]),
+      checkCrcs: true,
     })
+
+    expect(responses[0].partitions[0].corruption).toMatchObject({ reason: 'checksum' })
   })
 
   test('checkCrcs: false delivers the same corrupted batch instead of crashing', async () => {

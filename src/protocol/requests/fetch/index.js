@@ -12,10 +12,11 @@ const requestTimeout = (timeout) =>
   Number.isSafeInteger(timeout + NETWORK_DELAY) ? timeout + NETWORK_DELAY : timeout
 
 /**
- * The Fetch response modules are stateless singletons, so the per-request `checkCrcs` option is
+ * The Fetch response modules are stateless singletons, so the per-request decode options are
  * bound here rather than threaded through `Connection#send`.
  * @param {{ decode: Function, parse: Function }} response
- * @param {{ checkCrcs: boolean }} options
+ * @param {{ checkCrcs: boolean, maxDecompressedBatchBytes?: number }} options an omitted
+ *   `maxDecompressedBatchBytes` is the default bound
  * @returns {{ decode: Function, parse: Function }}
  */
 const withOptions = (response, options) => ({
@@ -32,12 +33,13 @@ const versions = {
     maxBytes,
     topics,
     checkCrcs = true,
+    maxDecompressedBatchBytes,
   }) => {
     const request = require('./v4/request')
     const response = require('./v4/response')
     return {
       request: request({ replicaId, isolationLevel, maxWaitTime, minBytes, maxBytes, topics }),
-      response: withOptions(response, { checkCrcs }),
+      response: withOptions(response, { checkCrcs, maxDecompressedBatchBytes }),
       requestTimeout: requestTimeout(maxWaitTime),
     }
   },
@@ -49,12 +51,13 @@ const versions = {
     maxBytes,
     topics,
     checkCrcs = true,
+    maxDecompressedBatchBytes,
   }) => {
     const request = require('./v5/request')
     const response = require('./v5/response')
     return {
       request: request({ replicaId, isolationLevel, maxWaitTime, minBytes, maxBytes, topics }),
-      response: withOptions(response, { checkCrcs }),
+      response: withOptions(response, { checkCrcs, maxDecompressedBatchBytes }),
       requestTimeout: requestTimeout(maxWaitTime),
     }
   },
@@ -66,12 +69,13 @@ const versions = {
     maxBytes,
     topics,
     checkCrcs = true,
+    maxDecompressedBatchBytes,
   }) => {
     const request = require('./v6/request')
     const response = require('./v6/response')
     return {
       request: request({ replicaId, isolationLevel, maxWaitTime, minBytes, maxBytes, topics }),
-      response: withOptions(response, { checkCrcs }),
+      response: withOptions(response, { checkCrcs, maxDecompressedBatchBytes }),
       requestTimeout: requestTimeout(maxWaitTime),
     }
   },
@@ -86,6 +90,7 @@ const versions = {
     maxBytes,
     topics,
     checkCrcs = true,
+    maxDecompressedBatchBytes,
   }) => {
     const request = require('./v7/request')
     const response = require('./v7/response')
@@ -101,7 +106,7 @@ const versions = {
         maxBytes,
         topics,
       }),
-      response: withOptions(response, { checkCrcs }),
+      response: withOptions(response, { checkCrcs, maxDecompressedBatchBytes }),
       requestTimeout: requestTimeout(maxWaitTime),
     }
   },
@@ -116,6 +121,7 @@ const versions = {
     maxBytes,
     topics,
     checkCrcs = true,
+    maxDecompressedBatchBytes,
   }) => {
     const request = require('./v8/request')
     const response = require('./v8/response')
@@ -131,7 +137,7 @@ const versions = {
         maxBytes,
         topics,
       }),
-      response: withOptions(response, { checkCrcs }),
+      response: withOptions(response, { checkCrcs, maxDecompressedBatchBytes }),
       requestTimeout: requestTimeout(maxWaitTime),
     }
   },
@@ -146,6 +152,7 @@ const versions = {
     maxBytes,
     topics,
     checkCrcs = true,
+    maxDecompressedBatchBytes,
   }) => {
     const request = require('./v9/request')
     const response = require('./v9/response')
@@ -161,7 +168,7 @@ const versions = {
         maxBytes,
         topics,
       }),
-      response: withOptions(response, { checkCrcs }),
+      response: withOptions(response, { checkCrcs, maxDecompressedBatchBytes }),
       requestTimeout: requestTimeout(maxWaitTime),
     }
   },
@@ -176,6 +183,7 @@ const versions = {
     maxBytes,
     topics,
     checkCrcs = true,
+    maxDecompressedBatchBytes,
   }) => {
     const request = require('./v10/request')
     const response = require('./v10/response')
@@ -191,7 +199,7 @@ const versions = {
         maxBytes,
         topics,
       }),
-      response: withOptions(response, { checkCrcs }),
+      response: withOptions(response, { checkCrcs, maxDecompressedBatchBytes }),
       requestTimeout: requestTimeout(maxWaitTime),
     }
   },
@@ -207,6 +215,7 @@ const versions = {
     topics,
     rackId,
     checkCrcs = true,
+    maxDecompressedBatchBytes,
   }) => {
     const request = require('./v11/request')
     const response = require('./v11/response')
@@ -223,7 +232,7 @@ const versions = {
         topics,
         rackId,
       }),
-      response: withOptions(response, { checkCrcs }),
+      response: withOptions(response, { checkCrcs, maxDecompressedBatchBytes }),
       requestTimeout: requestTimeout(maxWaitTime),
     }
   },
@@ -239,6 +248,7 @@ const versions = {
     topics,
     rackId,
     checkCrcs = true,
+    maxDecompressedBatchBytes,
   }) => {
     const request = require('./v12/request')
     const response = require('./v12/response')
@@ -255,7 +265,7 @@ const versions = {
         topics,
         rackId,
       }),
-      response: withOptions(response, { checkCrcs }),
+      response: withOptions(response, { checkCrcs, maxDecompressedBatchBytes }),
       requestTimeout: requestTimeout(maxWaitTime),
     }
   },
@@ -272,6 +282,7 @@ const versions = {
     topicIds,
     rackId,
     checkCrcs = true,
+    maxDecompressedBatchBytes,
   }) => {
     const request = require('./v13/request')
     const response = require('./v13/response')
@@ -289,7 +300,7 @@ const versions = {
         topicIds,
         rackId,
       }),
-      response: withOptions(response, { checkCrcs }),
+      response: withOptions(response, { checkCrcs, maxDecompressedBatchBytes }),
       requestTimeout: requestTimeout(maxWaitTime),
     }
   },
@@ -306,6 +317,7 @@ const versions = {
     topicIds,
     rackId,
     checkCrcs = true,
+    maxDecompressedBatchBytes,
   }) => {
     const request = require('./v14/request')
     const response = require('./v14/response')
@@ -323,7 +335,7 @@ const versions = {
         topicIds,
         rackId,
       }),
-      response: withOptions(response, { checkCrcs }),
+      response: withOptions(response, { checkCrcs, maxDecompressedBatchBytes }),
       requestTimeout: requestTimeout(maxWaitTime),
     }
   },
@@ -343,6 +355,7 @@ const versions = {
     topicIds,
     rackId,
     checkCrcs = true,
+    maxDecompressedBatchBytes,
   }) => {
     const request = require('./v15/request')
     const response = require('./v15/response')
@@ -359,7 +372,7 @@ const versions = {
         topicIds,
         rackId,
       }),
-      response: withOptions(response, { checkCrcs }),
+      response: withOptions(response, { checkCrcs, maxDecompressedBatchBytes }),
       requestTimeout: requestTimeout(maxWaitTime),
     }
   },
@@ -376,6 +389,7 @@ const versions = {
     topicIds,
     rackId,
     checkCrcs = true,
+    maxDecompressedBatchBytes,
   }) => {
     const request = require('./v16/request')
     const response = require('./v16/response')
@@ -392,7 +406,7 @@ const versions = {
         topicIds,
         rackId,
       }),
-      response: withOptions(response, { checkCrcs }),
+      response: withOptions(response, { checkCrcs, maxDecompressedBatchBytes }),
       requestTimeout: requestTimeout(maxWaitTime),
     }
   },
@@ -409,6 +423,7 @@ const versions = {
     topicIds,
     rackId,
     checkCrcs = true,
+    maxDecompressedBatchBytes,
   }) => {
     const request = require('./v17/request')
     const response = require('./v17/response')
@@ -425,7 +440,7 @@ const versions = {
         topicIds,
         rackId,
       }),
-      response: withOptions(response, { checkCrcs }),
+      response: withOptions(response, { checkCrcs, maxDecompressedBatchBytes }),
       requestTimeout: requestTimeout(maxWaitTime),
     }
   },
@@ -442,6 +457,7 @@ const versions = {
     topicIds,
     rackId,
     checkCrcs = true,
+    maxDecompressedBatchBytes,
   }) => {
     const request = require('./v18/request')
     const response = require('./v18/response')
@@ -458,7 +474,7 @@ const versions = {
         topicIds,
         rackId,
       }),
-      response: withOptions(response, { checkCrcs }),
+      response: withOptions(response, { checkCrcs, maxDecompressedBatchBytes }),
       requestTimeout: requestTimeout(maxWaitTime),
     }
   },

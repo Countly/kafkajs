@@ -1,6 +1,7 @@
 const Decoder = require('../../../decoder')
 const { buildDecodePartition } = require('../v12/response')
 const { parse } = require('../v12/parse')
+const decoderCache = require('../decoderCache')
 
 /**
  * FetchResponse (Version: 13) — flexible, response header v1
@@ -39,17 +40,14 @@ const buildDecode = (options) => {
 }
 
 // Module-local, as in v12: nothing outside this file reads them.
-const decoders = {
-  true: buildDecode({ checkCrcs: true }),
-  false: buildDecode({ checkCrcs: false }),
-}
+const decoderFor = decoderCache(buildDecode)
 
 /**
  * @param {Buffer} rawData
- * @param {{ checkCrcs?: boolean }} [options]
+ * @param {{ checkCrcs?: boolean, maxDecompressedBatchBytes?: number }} [options]
  * @returns {Promise<object>}
  */
-const decode = (rawData, options = {}) => decoders[options.checkCrcs !== false](rawData)
+const decode = (rawData, options = {}) => decoderFor(options)(rawData)
 
 module.exports = {
   decode,

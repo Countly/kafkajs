@@ -1,6 +1,7 @@
 const Decoder = require('../../../decoder')
 const { parse: parseV12 } = require('./parse')
 const decodeMessages = require('../v4/decodeMessages')
+const decoderCache = require('../decoderCache')
 
 // The three KIP-320/KIP-951/Raft tagged fields on a partition response. They share a struct, so
 // these are three distinct tags, not three namespaces.
@@ -45,7 +46,7 @@ const decodeAbortedTransactions = (decoder) => {
  * The per-partition reader, lifted out of `buildDecode` so v13 can build its own decoder pair
  * from it: v13 differs from v12 only in the topic key, and copying this reader into it would be a
  * second body for one function.
- * @param {{ checkCrcs: boolean }} options
+ * @param {{ checkCrcs: boolean, maxDecompressedBatchBytes: number }} options
  * @returns {(decoder: Decoder) => Promise<object>}
  */
 const buildDecodePartition = (options) => {
@@ -79,9 +80,9 @@ const buildDecodePartition = (options) => {
 }
 
 /**
- * Builds the reader chain for one value of `checkCrcs`. Called twice at module load so a fetch
- * response allocates no closures.
- * @param {{ checkCrcs: boolean }} options
+ * Builds the reader chain for one pair of decode options. `decoderCache` keeps one per pair, so a
+ * fetch response allocates no closures.
+ * @param {{ checkCrcs: boolean, maxDecompressedBatchBytes: number }} options
  * @returns {(rawData: Buffer) => Promise<object>}
  */
 const buildDecode = (options) => {
@@ -115,17 +116,14 @@ const buildDecode = (options) => {
 // Built twice, at import, exactly as `v11/response.js` does, so a fetch response allocates no
 // closure. They are module-local: nothing outside this file reads them, and exporting them so a
 // test could would be a test-only export.
-const decoders = {
-  true: buildDecode({ checkCrcs: true }),
-  false: buildDecode({ checkCrcs: false }),
-}
+const decoderFor = decoderCache(buildDecode)
 
 /**
  * @param {Buffer} rawData
- * @param {{ checkCrcs?: boolean }} [options]
+ * @param {{ checkCrcs?: boolean, maxDecompressedBatchBytes?: number }} [options]
  * @returns {Promise<object>}
  */
-const decode = (rawData, options = {}) => decoders[options.checkCrcs !== false](rawData)
+const decode = (rawData, options = {}) => decoderFor(options)(rawData)
 
 module.exports = {
   decode,

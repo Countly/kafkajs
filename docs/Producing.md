@@ -409,6 +409,8 @@ const MyCustomSnappyCodec = {
 }
 ```
 
+`decompress` also receives the decompression bound of the consumer that reads the batch, as `decompress(buffer, { maxOutputLength })`: the most bytes one record batch may decompress to (the consumer's `maxDecompressedBatchBytes`, 1 GiB by default). Return at most that many bytes, or throw. A longer result is rejected afterwards, and a thrown error, a `RangeError` included, ends the batch as a corrupt one (`KafkaJSCorruptRecordError`, reason `decompressed-size` or `decompression`) instead of reaching the retrier as an unrecoverable error. The bound is a request, not a guarantee: a codec that ignores the argument, as codecs written before it existed do, has already allocated its whole output when the result is checked, so it keeps working but is not protected.
+
 Now that we have the codec object, we can wrap it in a function and add it to the implementation:
 
 ```javascript

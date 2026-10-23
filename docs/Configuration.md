@@ -358,6 +358,11 @@ limit or a very large metadata response. A consumer whose `maxBytes` is above th
 warning. Each connection can buffer up to this much, so the limit is not a memory ceiling for the
 process.
 
+A Fetch frame is at most `maxResponseSize` bytes, but a compressed record batch inside it may
+decompress to far more. The consumer's `maxDecompressedBatchBytes` (1 GiB by default) bounds one
+batch after decompression, for every codec; see
+[Decompression bound](Consuming.md#decompression-bound).
+
 ## Metadata recovery
 
 `metadataRecoveryStrategy` and `metadataRecoveryRebootstrapTriggerMs`, available on the `Kafka`

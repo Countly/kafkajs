@@ -34,6 +34,8 @@ const isLegacy = (buffer, offset) => {
  * @param {import('../../../decoder')} decoder
  * @param {object} [options]
  * @param {boolean} [options.checkCrcs=true] forwarded to {@link RecordBatchDecoder}; see its JSDoc
+ * @param {number} [options.maxDecompressedBatchBytes] forwarded to {@link RecordBatchDecoder} and
+ *        to the legacy message set decoder
  * @param {boolean} [options.compact=false] read the records block as COMPACT_RECORDS (a UVarInt of
  *        length + 1, 0 meaning null) rather than as an INT32 length. Fetch v12+ is flexible; every
  *        earlier version keeps the INT32. Only the size read changes — the record-batch loop, the
@@ -42,7 +44,9 @@ const isLegacy = (buffer, offset) => {
  *          error: KafkaJSCorruptRecordError } }>} the decoded records, and `corruption` naming the
  *          first corrupt complete batch when there was one; the property is absent otherwise, so a
  *          codec can spread the result into a partition without changing its shape
- * @throws {KafkaJSPartialMessageError} on a CRC32C mismatch (`crcMismatch: true`)
+ * @throws {KafkaJSCorruptRecordError} for a legacy (magic 0 or 1) message set whose compressed
+ *         message is corrupt or decompresses past `maxDecompressedBatchBytes`: a legacy set carries
+ *         no marker, so the response is rejected
  */
 const decodeMessages = async (decoder, options = {}) => {
   const messagesSize = options.compact ? decoder.readUVarInt() - 1 : decoder.readInt32()
@@ -55,7 +59,7 @@ const decodeMessages = async (decoder, options = {}) => {
   const messagesDecoder = new Decoder(messagesBuffer)
 
   if (isLegacy(messagesBuffer, 0)) {
-    return { messages: await MessageSetDecoder(messagesDecoder, messagesSize) }
+    return { messages: await MessageSetDecoder(messagesDecoder, messagesSize, options) }
   }
 
   const messages = []
@@ -69,9 +73,9 @@ const decodeMessages = async (decoder, options = {}) => {
       }
     } catch (e) {
       // The tail of the record batches can be an incomplete record because of how maxBytes
-      // works, which is not an error. A CRC mismatch is.
+      // works, which is not an error.
       // See https://cwiki.apache.org/confluence/display/KAFKA/A+Guide+To+The+Kafka+Protocol#AGuideToTheKafkaProtocol-FetchAPI
-      if (e.name === 'KafkaJSPartialMessageError' && e.crcMismatch !== true) {
+      if (e.name === 'KafkaJSPartialMessageError') {
         break
       }
 

@@ -51,11 +51,15 @@ module.exports = {
 
   /**
    * @param {Buffer} buffer
+   * @param {{ maxOutputLength?: number }} [options] the most bytes to produce; Node refuses the
+   *   output with `ERR_BUFFER_TOO_LARGE` while it is made, not after
    * @returns {Promise<Buffer>}
    * @throws {KafkaJSNotImplemented} when this Node build has no zstd support in `node:zlib`
+   * @throws {RangeError} `ERR_BUFFER_TOO_LARGE` past `maxOutputLength`
+   * @throws {Error} for a corrupt or truncated stream
    */
-  async decompress(buffer) {
+  async decompress(buffer, { maxOutputLength } = {}) {
     if (!isSupported) unavailable()
-    return await zstdDecompress(buffer)
+    return await zstdDecompress(buffer, { maxOutputLength })
   },
 }

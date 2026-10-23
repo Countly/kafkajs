@@ -113,7 +113,9 @@ module.exports = class ConsumerGroup {
    * @param {number} options.isolationLevel
    * @param {string} options.rackId
    * @param {boolean} options.checkCrcs verify the CRC32C checksum of every record batch received
-   *                                (Java's `check.crcs`); a mismatch is a non-retriable error
+   *                                (Java's `check.crcs`); a mismatch halts the partition
+   * @param {number} [options.maxDecompressedBatchBytes] the most a record batch may decompress
+   *                                to; a batch past it halts the partition
    * @param {import('./groupProtocol/interface').RebalanceProtocol} [options.rebalanceProtocol]
    *                                the mode chosen from the configured assigners; defaults to
    *                                eager, the protocol every assigner supports.
@@ -167,6 +169,7 @@ module.exports = class ConsumerGroup {
     isolationLevel,
     rackId,
     checkCrcs,
+    maxDecompressedBatchBytes,
     groupInstanceId = null,
     rebalanceProtocol = EAGER,
     metadataMaxAge,
@@ -200,6 +203,7 @@ module.exports = class ConsumerGroup {
     this.isolationLevel = isolationLevel
     this.rackId = rackId
     this.checkCrcs = checkCrcs
+    this.maxDecompressedBatchBytes = maxDecompressedBatchBytes
     this.metadataMaxAge = metadataMaxAge
     this.operations = operations
     // Classic only: a consumer-protocol epoch says nothing about staleness, and a member that
@@ -1258,6 +1262,7 @@ module.exports = class ConsumerGroup {
         maxVersion,
         rackId: this.rackId,
         checkCrcs: this.checkCrcs,
+        maxDecompressedBatchBytes: this.maxDecompressedBatchBytes,
       })
 
       // The top-level code is only decoded from Fetch v7 up, so an older response carries none -
@@ -1615,7 +1620,8 @@ module.exports = class ConsumerGroup {
   }
 
   /**
-   * Reports an accepted halt: one `consumer.partition_halted` event and one error log. Both are
+   * Reports an accepted halt with optional nextOffset, codec and limit copied from its error.
+   * Emits one `consumer.partition_halted` event and one error log. Both are
    * contained, so a listener or a logger that throws neither undoes the halt nor reaches the other
    * partitions of the round; a listener's error is named in the log.
    * @private
@@ -1626,18 +1632,15 @@ module.exports = class ConsumerGroup {
    */
   reportHalt(topic, partition, { offset, reason, error }) {
     const { groupId, memberId } = this
+    const { nextOffset, codec, limit } = error
+    const payload = { groupId, memberId, topic, partition, offset, reason, error }
+    if (nextOffset !== undefined) payload.nextOffset = nextOffset
+    if (codec !== undefined) payload.codec = codec
+    if (limit !== undefined) payload.limit = limit
     let listenerError
 
     try {
-      this.instrumentationEmitter.emit(PARTITION_HALTED, {
-        groupId,
-        memberId,
-        topic,
-        partition,
-        offset,
-        reason,
-        error,
-      })
+      this.instrumentationEmitter.emit(PARTITION_HALTED, payload)
     } catch (e) {
       listenerError = e
     }

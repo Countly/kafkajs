@@ -1,6 +1,7 @@
 const Decoder = require('../../../decoder')
 const { buildDecodePartition } = require('../v12/response')
 const { parse } = require('../v12/parse')
+const decoderCache = require('../decoderCache')
 
 // NodeEndpoints is tag 0 on the response body; Produce uses tag 0 for its own body field too —
 // the two APIs share a number, not a namespace.
@@ -40,7 +41,7 @@ const decodeNodeEndpoints = (tags) => {
  * discards the response's tag map before returning, so there is nowhere to read tag 0 from.
  * @see https://cwiki.apache.org/confluence/display/KAFKA/KIP-951%3A+Leader+discovery+optimisations+for+the+client
  * @see clients/src/main/resources/common/message/FetchResponse.json (Apache Kafka 4.3.1)
- * @param {{ checkCrcs: boolean }} options
+ * @param {{ checkCrcs: boolean, maxDecompressedBatchBytes: number }} options
  * @returns {(rawData: Buffer) => Promise<object>}
  */
 const buildDecode = (options) => {
@@ -79,17 +80,14 @@ const buildDecode = (options) => {
 }
 
 // Built twice, at import, as v12/v13's decoder pairs are: nothing outside this file reads them.
-const decoders = {
-  true: buildDecode({ checkCrcs: true }),
-  false: buildDecode({ checkCrcs: false }),
-}
+const decoderFor = decoderCache(buildDecode)
 
 /**
  * @param {Buffer} rawData
- * @param {{ checkCrcs?: boolean }} [options]
+ * @param {{ checkCrcs?: boolean, maxDecompressedBatchBytes?: number }} [options]
  * @returns {Promise<object>}
  */
-const decode = (rawData, options = {}) => decoders[options.checkCrcs !== false](rawData)
+const decode = (rawData, options = {}) => decoderFor(options)(rawData)
 
 module.exports = {
   decode,

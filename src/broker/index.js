@@ -794,8 +794,12 @@ module.exports = class Broker {
    * @param {string} [request.rackId=''] A rack identifier for this client. This can be any string value which indicates where this
    *                           client is physically located. It corresponds with the broker config `broker.rack`.
    * @param {boolean} [request.checkCrcs=true] Verify the CRC32C checksum of every record batch in the response
-   *                           (Java's `check.crcs`). A mismatch throws `KafkaJSPartialMessageError` with
-   *                           `crcMismatch: true` instead of silently accepting the batch.
+   *                           (Java's `check.crcs`). A mismatch is a corrupt batch (`KafkaJSCorruptRecordError`,
+   *                           reason `checksum`) that ends its partition's records in the response.
+   * @param {number} [request.maxDecompressedBatchBytes=1073741824] The most a record batch may decompress
+   *                           to, in bytes, for every codec. It also sets the record ceiling,
+   *                           `max(1, floor(bytes / 512))` records per batch. A batch past either is a corrupt
+   *                           batch (`KafkaJSCorruptRecordError`) that ends its partition's records in the response.
    * @param {Map<string, string>} [request.topicIds] topic name -> topic id, for every topic in
    *   this request. A request that supplies none is capped at the last version keyed by name, so a
    *   caller that knows nothing about topic ids keeps working unchanged.
@@ -816,6 +820,7 @@ module.exports = class Broker {
     maxVersion,
     rackId = '',
     checkCrcs = true,
+    maxDecompressedBatchBytes,
   }) {
     // TODO: validate topics not null/empty
     // Ids are what v13+ is keyed by, so a request without them cannot be sent above v12. A caller
@@ -863,6 +868,7 @@ module.exports = class Broker {
       topicIds,
       rackId,
       checkCrcs,
+      maxDecompressedBatchBytes,
     })
 
     const response = await this[PRIVATE.SEND_REQUEST](built)

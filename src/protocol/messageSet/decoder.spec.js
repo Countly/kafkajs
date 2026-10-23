@@ -59,6 +59,29 @@ describe('Protocol > MessageSet > decoder', () => {
     })
   })
 
+  describe('a compressed message under a decompression bound', () => {
+    const gzipped = () => new Decoder(Buffer.from(Fixtures.v0.gzip.data))
+    // the three inner messages: an offset (8), a size (4) and a message of 31 bytes each
+    const decompressed = messages.length * (8 + 4 + 31)
+
+    test('is decoded when its output is exactly the bound', async () => {
+      await expect(
+        MessageSetDecoder(gzipped(), null, { maxDecompressedBatchBytes: decompressed })
+      ).resolves.toEqual(messages)
+    })
+
+    test('is refused as a corrupt record when its output is one byte over the bound', async () => {
+      await expect(
+        MessageSetDecoder(gzipped(), null, { maxDecompressedBatchBytes: decompressed - 1 })
+      ).rejects.toMatchObject({
+        name: 'KafkaJSCorruptRecordError',
+        reason: 'decompressed-size',
+        codec: 'gzip',
+        limit: decompressed - 1,
+      })
+    })
+  })
+
   test('skip partial messages', async () => {
     const messageSet = MessageSet({
       messageVersion: 0,

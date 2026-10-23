@@ -101,5 +101,18 @@ describe('Protocol > Compression > ZSTD', () => {
       const explicitLevel3 = await codec.compress({ buffer: payload }, { level: 3 })
       expect(defaultLevel).toEqual(explicitLevel3)
     })
+
+    it('takes its output bound from node:zlib: exactly at it passes, one byte over is refused while it decompresses', async () => {
+      const codec = lookupCodec(Types.ZSTD)
+      const compressed = await codec.compress({ buffer: Buffer.alloc(100000, 7) })
+
+      await expect(codec.decompress(compressed, { maxOutputLength: 100000 })).resolves.toHaveLength(
+        100000
+      )
+      await expect(codec.decompress(compressed, { maxOutputLength: 99999 })).rejects.toMatchObject({
+        name: 'RangeError',
+        code: 'ERR_BUFFER_TOO_LARGE',
+      })
+    })
   })
 })

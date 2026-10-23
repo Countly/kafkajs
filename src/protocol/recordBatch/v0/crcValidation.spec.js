@@ -2,7 +2,7 @@ const RecordBatchDecoder = require('./decoder')
 const { RecordBatch } = require('./index')
 const RecordEncoder = require('../record/v0')
 const Decoder = require('../../decoder')
-const { KafkaJSPartialMessageError } = require('../../../errors')
+const { KafkaJSCorruptRecordError } = require('../../../errors')
 const { Types: Compression } = require('../../message/compression')
 
 // The committed fixture `src/protocol/recordBatch/fixtures/v0_recordbatch.json` carries a valid
@@ -89,20 +89,24 @@ describe.each(Object.entries(fixtures))(
       await expect(RecordBatchDecoder(decoder, { checkCrcs: true })).resolves.toBeTruthy()
     })
 
-    test('throws a marked KafkaJSPartialMessageError on a corrupt batch', async () => {
+    test('throws a KafkaJSCorruptRecordError with reason checksum, and no next offset, on a corrupt batch', async () => {
       const decoder = new Decoder(corrupt(await validBatch()))
       const promise = RecordBatchDecoder(decoder, { checkCrcs: true })
 
-      await expect(promise).rejects.toThrow(KafkaJSPartialMessageError)
-      await expect(promise).rejects.toHaveProperty('crcMismatch', true)
+      await expect(promise).rejects.toThrow(KafkaJSCorruptRecordError)
+      await expect(promise).rejects.toMatchObject({
+        reason: 'checksum',
+        offset: expect.any(String),
+      })
+      await expect(promise).rejects.not.toHaveProperty('nextOffset')
     })
 
-    test('throws a marked KafkaJSPartialMessageError when the CRC field itself is corrupted', async () => {
+    test('throws the same when the CRC field itself is corrupted', async () => {
       const decoder = new Decoder(corruptCrcField(await validBatch()))
       const promise = RecordBatchDecoder(decoder, { checkCrcs: true })
 
-      await expect(promise).rejects.toThrow(KafkaJSPartialMessageError)
-      await expect(promise).rejects.toHaveProperty('crcMismatch', true)
+      await expect(promise).rejects.toThrow(KafkaJSCorruptRecordError)
+      await expect(promise).rejects.toMatchObject({ reason: 'checksum' })
     })
 
     test('does not throw when checkCrcs is off', async () => {
@@ -112,7 +116,7 @@ describe.each(Object.entries(fixtures))(
 
     test('defaults to checking', async () => {
       const decoder = new Decoder(corrupt(await validBatch()))
-      await expect(RecordBatchDecoder(decoder)).rejects.toHaveProperty('crcMismatch', true)
+      await expect(RecordBatchDecoder(decoder)).rejects.toMatchObject({ reason: 'checksum' })
     })
   }
 )

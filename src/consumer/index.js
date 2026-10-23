@@ -13,7 +13,11 @@ const InstrumentationEventEmitter = require('../instrumentation/emitter')
 const { KafkaJSNonRetriableError, isFencedInstance } = require('../errors')
 const { isConsumerProtocolFatal } = require('./rebalanceErrorContract')
 const { roundRobin } = require('./assigners')
-const { EARLIEST_OFFSET, LATEST_OFFSET } = require('../constants')
+const {
+  EARLIEST_OFFSET,
+  LATEST_OFFSET,
+  DEFAULT_MAX_DECOMPRESSED_BATCH_BYTES,
+} = require('../constants')
 const ISOLATION_LEVEL = require('../protocol/isolationLevel')
 const sharedPromiseTo = require('../utils/sharedPromiseTo')
 const { registerDisposer } = require('./disposal')
@@ -157,9 +161,13 @@ const parseDisconnectOptions = (options) => {
  * @param {number} [params.isolationLevel]
  * @param {string} [params.rackId]
  * @param {boolean} [params.checkCrcs=true] Verify the CRC32C checksum of every record batch
- *                                received (Java's `check.crcs`). A mismatch is a non-retriable
- *                                error: no message from that batch is delivered, the consumer
- *                                crashes, and the offset is not advanced past it.
+ *                                received (Java's `check.crcs`). A mismatch halts the partition
+ *                                like any corrupt batch (`consumer.partition_halted`, reason
+ *                                `checksum`); its other partitions keep delivering.
+ * @param {number} [params.maxDecompressedBatchBytes=1073741824] The most a record batch may
+ *                                decompress to, in bytes, for every codec; it also sets a ceiling of
+ *                                `max(1, floor(bytes / 512))` records per batch. A batch past
+ *                                either halts the partition.
  * @param {String} [params.groupInstanceId=null] Static membership id (KIP-345). When set, this
  *                                consumer keeps its group slot across a `disconnect()`/reconnect
  *                                within `sessionTimeout` instead of triggering a rebalance, and
@@ -203,6 +211,7 @@ module.exports = (params) => {
     isolationLevel = ISOLATION_LEVEL.READ_COMMITTED,
     rackId = '',
     checkCrcs = true,
+    maxDecompressedBatchBytes = DEFAULT_MAX_DECOMPRESSED_BATCH_BYTES,
     groupInstanceId = null,
     instrumentationEmitter: rootInstrumentationEmitter,
     metadataMaxAge,
@@ -578,6 +587,7 @@ module.exports = (params) => {
         isolationLevel,
         rackId,
         checkCrcs,
+        maxDecompressedBatchBytes,
         groupInstanceId,
         rebalanceProtocol,
         groupProtocol,

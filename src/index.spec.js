@@ -120,6 +120,43 @@ describe('Client', () => {
     })
   })
 
+  describe('maxDecompressedBatchBytes', () => {
+    it('defaults to 1 GiB and reaches the consumer', () => {
+      new Client({ brokers: [] }).consumer({ groupId: 'g' })
+
+      expect(createConsumer).toHaveBeenCalledWith(
+        expect.objectContaining({ maxDecompressedBatchBytes: 1073741824 })
+      )
+    })
+
+    it('passes the configured size to the consumer', () => {
+      new Client({ brokers: [] }).consumer({ groupId: 'g', maxDecompressedBatchBytes: 4194304 })
+
+      expect(createConsumer).toHaveBeenCalledWith(
+        expect.objectContaining({ maxDecompressedBatchBytes: 4194304 })
+      )
+    })
+
+    it.each([1, 511, 1073741824, 2147483647])('accepts %d', (maxDecompressedBatchBytes) => {
+      expect(() =>
+        new Client({ brokers: [] }).consumer({ groupId: 'g', maxDecompressedBatchBytes })
+      ).not.toThrow()
+    })
+
+    it.each([0, -1, 2147483648, 1.5, '4194304', null, NaN, Infinity, 4n, Object.create(null)])(
+      'rejects %p, naming the option, before a consumer is built',
+      (maxDecompressedBatchBytes) => {
+        const consumer = () =>
+          new Client({ brokers: [] }).consumer({ groupId: 'g', maxDecompressedBatchBytes })
+
+        expect(consumer).toThrow(KafkaJSInvalidConfigurationError)
+        expect(consumer).toThrow(/maxDecompressedBatchBytes/)
+        expect(createConsumer).not.toHaveBeenCalled()
+        expect(Cluster).not.toHaveBeenCalled()
+      }
+    )
+  })
+
   it('passes options to the producer', () => {
     const client = new Client({ brokers: [] })
     const options = {

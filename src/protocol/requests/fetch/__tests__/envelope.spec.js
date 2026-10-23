@@ -258,9 +258,8 @@ describe('Protocol > Requests > Fetch > record envelope', () => {
         const forged = batch({ baseOffset: 2n, count: 0x7fffffff, crc: 1, records: [record()] })
 
         if (checkCrcs) {
-          await expect(decode(records(first, forged), options)).rejects.toMatchObject({
-            name: 'KafkaJSPartialMessageError',
-            crcMismatch: true,
+          await expect(decode(records(first, forged), options)).resolves.toMatchObject({
+            corruption: { reason: 'checksum', offset: '2' },
           })
         } else {
           await expect(decode(records(first, forged), options)).resolves.toMatchObject({
@@ -311,14 +310,15 @@ describe('Protocol > Requests > Fetch > record envelope', () => {
         expect(corruption).toMatchObject({ reason: 'length', offset: '2' })
       })
 
-      test('a CRC mismatch is still thrown, not carried', async () => {
+      test('a CRC mismatch is carried like any other corrupt batch, with the batches before it', async () => {
         const wrongCrc = batch({ baseOffset: 2n, crc: 0xdeadbeef, records: [record()] })
 
         if (checkCrcs) {
-          await expect(decode(records(first, wrongCrc), options)).rejects.toMatchObject({
-            name: 'KafkaJSPartialMessageError',
-            crcMismatch: true,
-          })
+          const { messages, corruption } = await decode(records(first, wrongCrc), options)
+
+          expect(messages.map(asLiteral)).toEqual(firstMessages)
+          expect(corruption).toMatchObject({ reason: 'checksum', offset: '2' })
+          expect(corruption.error).not.toHaveProperty('nextOffset')
         } else {
           expect(await decode(records(first, wrongCrc), options)).not.toHaveProperty('corruption')
         }

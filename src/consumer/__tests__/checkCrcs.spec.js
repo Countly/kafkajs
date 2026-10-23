@@ -3,6 +3,7 @@ const Decoder = require('../../protocol/decoder')
 const { requests } = require('../../protocol/requests')
 const { RecordBatch } = require('../../protocol/recordBatch/v0')
 const RecordEncoder = require('../../protocol/recordBatch/record/v0')
+const { KafkaJSCorruptRecordError } = require('../../errors')
 
 /**
  * Builds a real record batch (via the production encoder, one record) and flips a byte inside
@@ -89,7 +90,7 @@ describe('Consumer > checkCrcs (codec level)', () => {
     expect(decoded.responses[0].partitions[0].messages).toHaveLength(1)
   })
 
-  test('rejects with a marked KafkaJSPartialMessageError when checkCrcs is on', async () => {
+  test('carries a checksum corruption instead of rejecting the response when checkCrcs is on', async () => {
     const body = buildFetchResponseBody(await buildCorruptBatch())
     const { response } = requests.Fetch.protocol({ version: 11 })({
       replicaId: -1,
@@ -100,7 +101,36 @@ describe('Consumer > checkCrcs (codec level)', () => {
       checkCrcs: true,
     })
 
-    await expect(response.decode(body)).rejects.toHaveProperty('crcMismatch', true)
+    const { messages, corruption } = (await response.decode(body)).responses[0].partitions[0]
+
+    expect(messages).toEqual([])
+    expect(corruption).toMatchObject({ reason: 'checksum', offset: '0' })
+    expect(corruption.error).toBeInstanceOf(KafkaJSCorruptRecordError)
+    expect(corruption.error).not.toHaveProperty('nextOffset')
+  })
+
+  test('keeps the batches before a corrupt one and reads nothing after it', async () => {
+    const valid = Buffer.from(
+      (
+        await RecordBatch({
+          records: [RecordEncoder({ key: Buffer.from('key'), value: Buffer.from('value') })],
+        })
+      ).buffer
+    )
+    const body = buildFetchResponseBody(Buffer.concat([valid, await buildCorruptBatch(), valid]))
+    const { response } = requests.Fetch.protocol({ version: 11 })({
+      replicaId: -1,
+      maxWaitTime: 5000,
+      minBytes: 1,
+      maxBytes: 1048576,
+      topics: [],
+      checkCrcs: true,
+    })
+
+    const { messages, corruption } = (await response.decode(body)).responses[0].partitions[0]
+
+    expect(messages).toHaveLength(1)
+    expect(corruption).toMatchObject({ reason: 'checksum' })
   })
 
   test('resolves with the (garbage but parseable) records when checkCrcs is off', async () => {
@@ -128,7 +158,9 @@ describe('Consumer > checkCrcs (codec level)', () => {
       topics: [],
     })
 
-    await expect(response.decode(body)).rejects.toHaveProperty('crcMismatch', true)
+    const { corruption } = (await response.decode(body)).responses[0].partitions[0]
+
+    expect(corruption).toMatchObject({ reason: 'checksum' })
   })
 
   test('a valid batch decodes cleanly regardless of checkCrcs', async () => {

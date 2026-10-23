@@ -4,7 +4,12 @@ const {
   KafkaJSInvalidLongError,
   KafkaJSPartialMessageError,
 } = require('../../../errors')
-const { lookupCodecByAttributes } = require('../../message/compression')
+const {
+  codecName,
+  decompressBounded,
+  lookupCodecByAttributes,
+} = require('../../message/compression')
+const { DEFAULT_MAX_DECOMPRESSED_BATCH_BYTES } = require('../../../constants')
 const RecordDecoder = require('../record/v0/decoder')
 const TimestampTypes = require('../../timestampTypes')
 const crc32C = require('../crc32C')
@@ -27,6 +32,9 @@ const V2_MIN_LENGTH = 49
 // A record is at least its length, attributes, timestamp delta, offset delta, key length, value
 // length and header count, one byte each.
 const MIN_RECORD_BYTES = 7
+// The bytes of `maxDecompressedBatchBytes` that pay for one record object: the heap a decoded
+// record costs (208 to 321 bytes, measured) rounded up to a power of two.
+const RECORD_CEILING_BYTES = 512
 
 const CONTROL_KEY_BYTES = 4
 const END_TRANSACTION_MARKER_TYPES = [0, 1]
@@ -51,13 +59,40 @@ const END_TRANSACTION_MARKER_TYPES = [0, 1]
 
 /**
  * @param {string} message
- * @param {'length'|'magic'|'count'|'control'} reason
+ * @param {'length'|'magic'|'count'|'control'|'checksum'} reason
  * @param {string} offset the first offset of the batch, a decimal string
  * @param {Error} [cause]
+ * @param {{ limit?: number }} [extra]
  * @returns {KafkaJSCorruptRecordError}
  */
-const corrupt = (message, reason, offset, cause) =>
-  new KafkaJSCorruptRecordError(message, { reason, offset, cause })
+const corrupt = (message, reason, offset, cause, extra) =>
+  new KafkaJSCorruptRecordError(message, { reason, offset, cause, ...extra })
+
+/**
+ * @param {string} firstOffset the batch's first offset, a decimal string
+ * @param {number} lastOffsetDelta the batch header's last offset delta
+ * @returns {string|undefined} the first offset after the batch, where `consumer.seek` goes to skip
+ *   it; `undefined` for a negative delta, which no batch boundary can have
+ */
+const nextOffsetOf = (firstOffset, lastOffsetDelta) =>
+  lastOffsetDelta < 0 ? undefined : (BigInt(firstOffset) + BigInt(lastOffsetDelta) + 1n).toString()
+
+/**
+ * Adds what only the batch decoder knows to a corrupt-record error raised below it: the batch's
+ * first offset, the offset after it once the header has been accepted, and its codec.
+ * @param {KafkaJSCorruptRecordError} error
+ * @param {string} firstOffset
+ * @param {number} lastOffsetDelta
+ * @param {string} [codec] the name of the batch's codec, when it is compressed
+ * @returns {KafkaJSCorruptRecordError} `error`
+ */
+const locate = (error, firstOffset, lastOffsetDelta, codec) => {
+  const nextOffset = nextOffsetOf(firstOffset, lastOffsetDelta)
+  error.offset = error.offset ?? firstOffset
+  if (nextOffset !== undefined) error.nextOffset = error.nextOffset ?? nextOffset
+  if (codec !== undefined) error.codec = error.codec ?? codec
+  return error
+}
 
 /**
  * @param {Buffer} buffer
@@ -166,17 +201,22 @@ const assertControlRecord = ({ key, value }, firstOffset) => {
  * Decodes a v0 record batch.
  * @param {Decoder} fetchDecoder positioned at the start of the record batch
  * @param {object} [options]
- * @param {boolean} [options.checkCrcs=true] verify the batch CRC32C (Java's `check.crcs`);
- *        a mismatch throws {@link KafkaJSPartialMessageError} with `crcMismatch: true`, which
- *        `src/protocol/requests/fetch/v4/decodeMessages.js` re-throws instead of treating as a
- *        truncated tail
+ * @param {boolean} [options.checkCrcs=true] verify the batch CRC32C (Java's `check.crcs`)
+ * @param {number} [options.maxDecompressedBatchBytes] the most the batch may decompress to; it also
+ *        sets the record ceiling, `max(1, floor(bytes / 512))` records
  * @returns {Promise<object>} the decoded record batch, including its records
- * @throws {KafkaJSPartialMessageError} on a truncated batch, or (when `checkCrcs`) a CRC32C mismatch
- * @throws {KafkaJSCorruptRecordError} when the batch is all here and impossible: its length or magic
- *         (judged before the CRC), its record count (judged after it, so it also guards
- *         `checkCrcs: false`), a record that runs past the batch, or a malformed control record
+ * @throws {KafkaJSPartialMessageError} on a truncated batch
+ * @throws {KafkaJSCorruptRecordError} when the batch is all here and impossible or over a bound:
+ *         its length or magic and its CRC (judged first, so a forged length cannot pass for a
+ *         mismatch), its record count (judged after the CRC, so it also guards `checkCrcs: false`),
+ *         a compressed body that is malformed or decompresses past the bound, a record that runs
+ *         past the batch, or a malformed control record. `nextOffset` is set once the header and,
+ *         with `checkCrcs`, the CRC have been accepted
  */
-module.exports = async (fetchDecoder, { checkCrcs = true } = {}) => {
+module.exports = async (
+  fetchDecoder,
+  { checkCrcs = true, maxDecompressedBatchBytes = DEFAULT_MAX_DECOMPRESSED_BATCH_BYTES } = {}
+) => {
   assertEnvelope(fetchDecoder)
 
   const firstOffset = fetchDecoder.readInt64().toString()
@@ -200,11 +240,11 @@ module.exports = async (fetchDecoder, { checkCrcs = true } = {}) => {
     const computed = crc32C(covered) | 0
 
     if (computed !== crc) {
-      const error = new KafkaJSPartialMessageError(
-        `Record batch CRC32C mismatch: expected ${crc}, computed ${computed}`
+      throw corrupt(
+        `Record batch CRC32C mismatch: expected ${crc}, computed ${computed}`,
+        'checksum',
+        firstOffset
       )
-      error.crcMismatch = true
-      throw error
     }
   }
 
@@ -247,8 +287,7 @@ module.exports = async (fetchDecoder, { checkCrcs = true } = {}) => {
 
   try {
     const records = await decodeRecords(
-      codec,
-      count,
+      { codec, attributes, count, limit: maxDecompressedBatchBytes },
       decoder,
       { ...recordContext, magicByte },
       firstOffsetNumber
@@ -267,34 +306,41 @@ module.exports = async (fetchDecoder, { checkCrcs = true } = {}) => {
   } catch (error) {
     // The batch is all here, so a read that runs out of bytes inside it is a length that lies, not
     // a tail that was cut.
-    if (error instanceof KafkaJSPartialMessageError || error instanceof KafkaJSInvalidLongError) {
-      throw corrupt(
-        `Record batch body is malformed: ${error.message}`,
-        'length',
-        firstOffset,
-        error
-      )
-    }
+    const failure =
+      error instanceof KafkaJSPartialMessageError || error instanceof KafkaJSInvalidLongError
+        ? corrupt(`Record batch body is malformed: ${error.message}`, 'length', firstOffset, error)
+        : error
 
-    throw error
+    throw failure instanceof KafkaJSCorruptRecordError
+      ? locate(failure, firstOffset, lastOffsetDelta, codec ? codecName(attributes) : undefined)
+      : failure
   }
 }
 
 /**
  * Decodes the records section of a batch, decompressing it first when the batch is compressed.
- * The count is checked before an array is made for it: a batch cannot hold more records than its
- * bytes allow at `MIN_RECORD_BYTES` each, and for a compressed one the bytes are the decompressed
- * ones.
- * @param {object|null} codec the compression codec for this batch, or null when uncompressed
- * @param {number} count the batch's record count
+ * The count is checked before anything is allocated for it, twice: against the record ceiling the
+ * byte bound implies, before the body is decompressed, and against the bytes the records have,
+ * `MIN_RECORD_BYTES` each, once they are known. The body is decompressed within the byte bound.
+ * @param {object} batch
+ * @param {object|null} batch.codec the compression codec for this batch, or null when uncompressed
+ * @param {number} batch.attributes the batch attributes
+ * @param {number} batch.count the batch's record count
+ * @param {number} batch.limit `maxDecompressedBatchBytes`
  * @param {Decoder} recordsDecoder positioned at the start of the records section
  * @param {object} recordContext the batch-level values shared by every record in the batch
  * @param {number} firstOffsetNumber `Number(firstOffset)`, computed once per batch
  * @returns {Promise<object[]>} the decoded records, in wire order
- * @throws {KafkaJSCorruptRecordError} with reason `count` for a negative count or one the bytes
- *         cannot hold
+ * @throws {KafkaJSCorruptRecordError} with reason `count` for a negative count, one above the
+ *         record ceiling or one the bytes cannot hold, and for a compressed body `decompressed-size`
+ *         or `decompression`
  */
-const decodeRecords = async (codec, count, recordsDecoder, recordContext, firstOffsetNumber) => {
+const decodeRecords = async (
+  { codec, attributes, count, limit },
+  recordsDecoder,
+  recordContext,
+  firstOffsetNumber
+) => {
   if (count < 0) {
     throw corrupt(`Record count ${count} is negative`, 'count', recordContext.firstOffset)
   }
@@ -303,8 +349,20 @@ const decodeRecords = async (codec, count, recordsDecoder, recordContext, firstO
     return []
   }
 
+  const recordLimit = Math.max(1, Math.floor(limit / RECORD_CEILING_BYTES))
+
+  if (count > recordLimit) {
+    throw corrupt(
+      `Record count ${count} is above the ${recordLimit} records that maxDecompressedBatchBytes ${limit} allows`,
+      'count',
+      recordContext.firstOffset,
+      undefined,
+      { limit: recordLimit }
+    )
+  }
+
   const decoder = codec
-    ? new Decoder(await codec.decompress(recordsDecoder.readAll()))
+    ? new Decoder(await decompressBounded(codec, attributes, recordsDecoder.readAll(), limit))
     : recordsDecoder
   const room = decoder.buffer.length - decoder.offset
 

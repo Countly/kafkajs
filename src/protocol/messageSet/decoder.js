@@ -1,17 +1,35 @@
 const Long = require('../../utils/long')
 const Decoder = require('../decoder')
 const MessageDecoder = require('../message/decoder')
-const { lookupCodecByAttributes } = require('../message/compression')
+const { decompressBounded, lookupCodecByAttributes } = require('../message/compression')
+const { DEFAULT_MAX_DECOMPRESSED_BATCH_BYTES } = require('../../constants')
 const { KafkaJSPartialMessageError } = require('../../errors')
 
 /**
+ * Decodes a legacy message set in wire order, bounding each compressed message before decoding
+ * its entries. A partial tail returns the preceding complete messages. On return, the primary
+ * decoder advances past the set; a corrupt or oversized compressed stream rejects the response.
+ *
  * MessageSet => [Offset MessageSize Message]
  *  Offset => int64
  *  MessageSize => int32
  *  Message => Bytes
+ *
+ * @param {Decoder} primaryDecoder positioned at the set, or its size prefix when size is omitted
+ * @param {?number} [size=null] the set's byte length; omission reads its int32 size prefix
+ * @param {object} [options]
+ * @param {number} [options.maxDecompressedBatchBytes=1073741824] the output bound for each
+ *   compressed message, forwarded as maxOutputLength to the codec
+ * @returns {Promise<object[]>} complete messages before any partial tail, in wire order
+ * @throws {KafkaJSCorruptRecordError} for a corrupt compressed stream or output above the bound
+ * @throws {KafkaJSNotImplemented} when the selected optional codec is unavailable
  */
 
-module.exports = async (primaryDecoder, size = null) => {
+module.exports = async (
+  primaryDecoder,
+  size = null,
+  { maxDecompressedBatchBytes = DEFAULT_MAX_DECOMPRESSED_BATCH_BYTES } = {}
+) => {
   const messages = []
   const messageSetSize = size || primaryDecoder.readInt32()
   const messageSetDecoder = primaryDecoder.slice(messageSetSize)
@@ -22,7 +40,12 @@ module.exports = async (primaryDecoder, size = null) => {
       const codec = lookupCodecByAttributes(message.attributes)
 
       if (codec) {
-        const buffer = await codec.decompress(message.value)
+        const buffer = await decompressBounded(
+          codec,
+          message.attributes,
+          message.value,
+          maxDecompressedBatchBytes
+        )
         // push(...entries) throws a RangeError above about 125 000 entries
         for (const entry of EntriesDecoder(new Decoder(buffer), message)) {
           messages.push(entry)

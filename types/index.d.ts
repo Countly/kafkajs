@@ -237,11 +237,23 @@ export interface ConsumerConfig {
   maxWaitTimeInMs?: number
   /**
    * Verify the CRC32C checksum of every record batch received (Java's `check.crcs`). Default
-   * `true`. A mismatch is a non-retriable error: no message from that batch is delivered, the
-   * consumer crashes, and the committed offset is not advanced past it. Set to `false` to skip
-   * the check and restore the pre-3.0 behavior.
+   * `true`. A mismatch halts the partition like any corrupt batch (`consumer.partition_halted`,
+   * reason `checksum`): the records before the batch are delivered, the other partitions keep
+   * delivering, and the partition is not fetched again until `consumer.seek`. A checksum halt has
+   * no `nextOffset`. Set to `false` to skip the check and restore the pre-3.0 behavior.
    */
   checkCrcs?: boolean
+  /**
+   * The most a record batch may decompress to, in bytes, for every codec. Default 1073741824
+   * (1 GiB); an integer from 1 to 2147483647. A batch past it halts its partition
+   * (`consumer.partition_halted`) until `consumer.seek` moves past it. Not a limit on the
+   * process's memory: each concurrent fetch may hold up to this much. The same value also sets a
+   * derived ceiling of `max(1, floor(value / 512))` records per batch, checked before any record
+   * is allocated; a batch can pass the byte limit and still exceed the record ceiling (it then
+   * halts the partition the same way), and raising this option raises both. Decoded records
+   * measure 208 to 321 bytes of heap each; header objects and concurrent fetches are extra.
+   */
+  maxDecompressedBatchBytes?: number
   retry?: RetryOptions & { restartOnFailure?: (err: Error) => Promise<boolean> }
   allowAutoTopicCreation?: boolean
   /**
@@ -1042,6 +1054,7 @@ export type Broker = {
     maxVersion?: number
     rackId?: string
     checkCrcs?: boolean
+    maxDecompressedBatchBytes?: number
   }): Promise<any>
   produce(request: {
     topicData: Array<{
@@ -1623,6 +1636,12 @@ export interface ConsumerPartitionHaltedEventPayload {
   offset: string
   reason: KafkaJSCorruptRecordError['reason']
   error: KafkaJSCorruptRecordError
+  /** Where `consumer.seek` goes to skip the batch; only for a validated batch boundary. */
+  nextOffset?: string
+  /** The codec of a compressed batch, when present on the error. */
+  codec?: 'gzip' | 'snappy' | 'lz4' | 'zstd'
+  /** The bound in force: bytes, or records for a `count` over the record ceiling. */
+  limit?: number
 }
 export type ConsumerPartitionHaltedEvent = InstrumentationEvent<ConsumerPartitionHaltedEventPayload>
 export type ConsumerPollIntervalExceededEvent = InstrumentationEvent<{
@@ -2005,16 +2024,36 @@ export class KafkaJSInvalidFrameError extends KafkaJSConnectionError {
 }
 
 /**
- * A Fetch record batch is structurally corrupt; non-retriable. The partition is halted
+ * A Fetch record batch is corrupt or breaks a decoding bound; non-retriable. The partition is halted
  * (`consumer.partition_halted`).
  */
 export class KafkaJSCorruptRecordError extends KafkaJSNonRetriableError {
-  readonly reason: 'length' | 'magic' | 'count' | 'control'
+  readonly reason:
+    | 'length'
+    | 'magic'
+    | 'count'
+    | 'control'
+    | 'checksum'
+    | 'decompressed-size'
+    | 'decompression'
   /** The first offset of the batch as a decimal string, when it could be read. */
   readonly offset?: string
+  /** Where `consumer.seek` goes to skip the batch; present only when a validated batch boundary exists. */
+  readonly nextOffset?: string
+  /** The codec of a compressed batch. */
+  readonly codec?: 'gzip' | 'snappy' | 'lz4' | 'zstd'
+  /** The bound in force: bytes for `decompressed-size` and `decompression`, records for a `count` over the record ceiling. */
+  readonly limit?: number
   constructor(
     e: Error | string,
-    options: { reason: KafkaJSCorruptRecordError['reason']; offset?: string; cause?: Error }
+    options: {
+      reason: KafkaJSCorruptRecordError['reason']
+      offset?: string
+      nextOffset?: string
+      codec?: KafkaJSCorruptRecordError['codec']
+      limit?: number
+      cause?: Error
+    }
   )
 }
 
@@ -2149,7 +2188,10 @@ export class KafkaJSNoBrokerAvailableError extends KafkaJSError {
 
 export class KafkaJSPartialMessageError extends KafkaJSError {
   constructor()
-  /** Set when this error is a record-batch CRC32C mismatch (see `checkCrcs`), rather than a truncated fetch tail. */
+  /**
+   * @deprecated The Fetch decoder no longer sets it: a record-batch CRC32C mismatch (see
+   * `checkCrcs`) is a `KafkaJSCorruptRecordError` with reason `checksum`.
+   */
   crcMismatch?: boolean
 }
 

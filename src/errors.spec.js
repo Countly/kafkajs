@@ -612,6 +612,30 @@ describe('KafkaJSCorruptRecordError', () => {
   test('offset is optional', () => {
     expect(new KafkaJSCorruptRecordError('bad magic', { reason: 'magic' }).offset).toBeUndefined()
   })
+
+  test.each(['checksum', 'decompressed-size', 'decompression'])('takes the reason %s', (reason) => {
+    expect(new KafkaJSCorruptRecordError('x', { reason }).reason).toBe(reason)
+  })
+
+  test('carries the offset after the batch, the codec and the bound when it has them', () => {
+    const error = new KafkaJSCorruptRecordError('x', {
+      reason: 'decompressed-size',
+      offset: '10',
+      nextOffset: '15',
+      codec: 'lz4',
+      limit: 4194304,
+    })
+
+    expect(error).toMatchObject({ offset: '10', nextOffset: '15', codec: 'lz4', limit: 4194304 })
+  })
+
+  test('has no nextOffset, codec or limit property when it has none, not even an undefined one', () => {
+    const error = new KafkaJSCorruptRecordError('x', { reason: 'checksum', offset: '10' })
+
+    for (const key of ['nextOffset', 'codec', 'limit']) {
+      expect(Object.keys(error)).not.toContain(key)
+    }
+  })
 })
 
 describe('KafkaJSCommitFailedError', () => {
