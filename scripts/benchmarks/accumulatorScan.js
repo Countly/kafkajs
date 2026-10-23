@@ -109,8 +109,9 @@ const run = async ({ tree, topics, partitions, brokers, linger, records, yieldEv
   const accumulator = new Accumulator({
     linger,
     batchSize: 16384,
-    partition: async (topicMessages) =>
-      topicMessages.map(({ topic, messages }) => ({
+    // An older tree hands the records themselves, this one the holder that carries them.
+    partition: async (source) =>
+      (Array.isArray(source) ? source : source.records).map(({ topic, messages }) => ({
         topic,
         partition: messages[0].partition,
         messages,

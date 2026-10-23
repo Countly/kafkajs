@@ -1,4 +1,5 @@
 const createRetry = require('../retry')
+const { MAX_DELAY } = require('./deadline')
 const { CONNECTION_STATUS } = require('../network/connectionStatus')
 const { DefaultPartitioner } = require('./partitioners/')
 const InstrumentationEventEmitter = require('../instrumentation/emitter')
@@ -47,10 +48,30 @@ const endedTransactionError = () =>
 const codeOf = (error) => error.code ?? error.cause?.code
 
 /**
- * The accumulator's defaults: the Java client's 4.x `linger.ms` and `batch.size`.
+ * The accumulator's and the delivery deadline's defaults: the Java client's 4.x `linger.ms`,
+ * `batch.size` and `delivery.timeout.ms`.
  * @see https://github.com/apache/kafka/blob/4.3/clients/src/main/java/org/apache/kafka/clients/producer/ProducerConfig.java
  */
-const DEFAULTS = Object.freeze({ linger: 5, batchSize: 16384 })
+const DEFAULTS = Object.freeze({ linger: 5, batchSize: 16384, deliveryTimeout: 120000 })
+
+/**
+ * The retry options of a send's delivery: the Java client's `retry.backoff.ms` and
+ * `retry.backoff.max.ms`, and a count that never ends a send before its delivery deadline does.
+ * @see https://github.com/apache/kafka/blob/4.3/clients/src/main/java/org/apache/kafka/clients/producer/ProducerConfig.java
+ */
+const DELIVERY_RETRY = Object.freeze({
+  initialRetryTime: 100,
+  maxRetryTime: 1000,
+  retries: 2147483647,
+})
+
+/**
+ * @param {object} options
+ * @returns {object} a copy without the keys whose value is `undefined`, which a retrier would take
+ *   for a setting and not for an absent one
+ */
+const definedKeys = (options) =>
+  Object.fromEntries(Object.entries(options).filter(([, value]) => value !== undefined))
 
 /**
  *
@@ -130,11 +151,17 @@ const createProducer = ({
   }
 
   const partitioner = createPartitioner()
-  const retryOptions = Object.assign({}, cluster.retry, retry)
-  const retrier = createRetry({
-    ...retryOptions,
-    maxTotalTime: deliveryTimeout ?? retryOptions.maxTotalTime,
-  })
+  // The retry options the producer was given, and no others: the requests of the transaction
+  // protocol retry with these and the retrier's defaults.
+  const retryOptions = definedKeys(Object.assign({}, cluster.retry, retry))
+  // The retry options of a send's delivery: the delivery defaults under each key given.
+  const deliveryRetry = { ...DELIVERY_RETRY, ...retryOptions }
+  const budget = deliveryTimeout ?? deliveryRetry.maxTotalTime
+  const retrier = createRetry(
+    budget === undefined
+      ? deliveryRetry
+      : { ...deliveryRetry, maxTotalTime: Math.min(MAX_DELAY, Math.max(1, budget)) }
+  )
   const instrumentationEmitter = rootInstrumentationEmitter || new InstrumentationEventEmitter()
   const idempotentEosManager = createEosManager({
     logger,
@@ -143,6 +170,7 @@ const createProducer = ({
     transactional: false,
     transactionalId,
     retry: retryOptions,
+    deliveryRetries: deliveryRetry.retries,
   })
 
   const { send, sendBatch, ensureInitialized, close } = createMessageProducer({
@@ -152,7 +180,7 @@ const createProducer = ({
     eosManager: idempotentEosManager,
     idempotence,
     retrier,
-    retry: retryOptions,
+    retry: deliveryRetry,
     deliveryTimeout,
     compressionLevels,
     linger,
@@ -263,6 +291,7 @@ const createProducer = ({
         transactional: true,
         transactionalId,
         retry: retryOptions,
+        deliveryRetries: deliveryRetry.retries,
       })
     transactionalMessageProducer =
       transactionalMessageProducer ||
@@ -271,7 +300,7 @@ const createProducer = ({
         cluster,
         partitioner,
         retrier,
-        retry: retryOptions,
+        retry: deliveryRetry,
         deliveryTimeout,
         compressionLevels,
         linger,

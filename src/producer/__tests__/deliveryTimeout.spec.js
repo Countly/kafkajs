@@ -88,8 +88,34 @@ describe('Producer > deliveryTimeout', () => {
       }
     )
 
-    test('unset, nothing is checked and no deadline applies', () => {
-      expect(() => createKafka({ requestTimeout: 1000 }).producer()).not.toThrow()
+    describe('unset', () => {
+      const warnings = (kafkaOptions, producerOptions) => {
+        const logs = []
+        const kafka = createKafka({
+          ...kafkaOptions,
+          logLevel: LEVELS.WARN,
+          logCreator: () => (entry) => logs.push(entry),
+        })
+
+        expect(() => kafka.producer(producerOptions)).not.toThrow()
+        return logs.filter(({ log }) => /deliveryTimeout was not set/.test(log.message))
+      }
+
+      test('nothing is checked, and the default holds with no warning', () => {
+        expect(warnings({ requestTimeout: 1000 }, {})).toEqual([])
+      })
+
+      test('a default below linger + requestTimeout is raised to it, with one warning', () => {
+        expect(warnings({ requestTimeout: 100000 }, { linger: 40000 })).toHaveLength(1)
+      })
+
+      test('an explicit retry.maxTotalTime is the deadline and is not held to the floor', () => {
+        expect(warnings({ requestTimeout: 1000 }, { retry: { maxTotalTime: 5 } })).toEqual([])
+      })
+
+      test('a deadline beyond one timer delay is accepted when implicit', () => {
+        expect(warnings({ requestTimeout: 2147483647 }, { linger: 2147483647 })).toHaveLength(1)
+      })
     })
   })
 

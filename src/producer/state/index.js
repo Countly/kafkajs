@@ -93,9 +93,9 @@ class ProducerStateManager {
    *   to a transactional producer, which changes the advice a refused InitProducerId carries
    * @param {number} options.transactionTimeout
    * @param {import('../../../types').RetryOptions} [options.retry={}] the producer's retry
-   *   options: `retries` bounds every batch's re-sends, and the requests this class makes on the
-   *   send path - AddPartitionsToTxn, and a producer id lost to the epoch ceiling - are retried
-   *   with them
+   *   options for the requests this class makes on the send path - AddPartitionsToTxn, and a
+   *   producer id lost to the epoch ceiling
+   * @param {number} [options.deliveryRetries=retry.retries] how many times a batch is sent again
    * @param {() => Promise<import('../../../types').Broker>} options.findBroker the broker an
    *   InitProducerId goes to, asked again for every request
    * @param {(topics: { topic: string, partitions: number[] }[]) => Promise<void>} options.addPartitionsToTxn
@@ -107,12 +107,13 @@ class ProducerStateManager {
     transactionalId = null,
     transactionTimeout,
     retry = {},
+    deliveryRetries = retry.retries,
     findBroker,
     addPartitionsToTxn,
   }) {
     this.#logger = logger
     this.#transactional = transactional
-    this.#retries = retry.retries ?? createRetry.defaults.retries
+    this.#retries = deliveryRetries ?? createRetry.defaults.retries
     this.#retrier = createRetry(retry)
     this.#addPartitionsToTxn = addPartitionsToTxn
     this.#sequencer = new PartitionSequencer({ logger })

@@ -1,4 +1,5 @@
 const { inspect } = require('util')
+const { MAX_DELAY } = require('../producer/deadline')
 const {
   KafkaJSNumberOfRetriesExceeded,
   KafkaJSNonRetriableError,
@@ -45,10 +46,6 @@ const backoffOf = ({ initialRetryTime, factor, multiplier, maxRetryTime }) => ({
  */
 const createBackoff = (opts = {}) => backoffOf(Object.assign({}, RETRY_DEFAULT, opts))
 
-// The longest delay Node's `setTimeout` honours; a longer one runs after 1 ms.
-// @see https://nodejs.org/api/timers.html
-const MAX_TIMER_DELAY = 2147483647
-
 /**
  * Refuses a `maxTotalTime` that is set but is not an integer from 1 to 2147483647: `0` or a
  * negative number would reject at the first failure, a fraction or a numeric string is not a
@@ -70,9 +67,9 @@ const assertMaxTotalTime = (maxTotalTime) => {
     )
   }
 
-  if (maxTotalTime > MAX_TIMER_DELAY) {
+  if (maxTotalTime > MAX_DELAY) {
     throw new KafkaJSInvalidConfigurationError(
-      `retry.maxTotalTime must be an integer of at least 1 and at most ${MAX_TIMER_DELAY}, got ${maxTotalTime}`
+      `retry.maxTotalTime must be an integer of at least 1 and at most ${MAX_DELAY}, got ${maxTotalTime}`
     )
   }
 }

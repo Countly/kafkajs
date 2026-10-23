@@ -171,7 +171,12 @@ describe('Client', () => {
     }
     client.producer(options)
 
-    expect(createProducer).toHaveBeenCalledWith({ ...options, linger: 5, batchSize: 16384 })
+    expect(createProducer).toHaveBeenCalledWith({
+      ...options,
+      linger: 5,
+      batchSize: 16384,
+      deliveryTimeout: 120000,
+    })
   })
 
   describe('consumer', () => {

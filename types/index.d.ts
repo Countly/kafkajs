@@ -141,12 +141,13 @@ export interface ProducerConfig {
    */
   batchSize?: number
   /**
-   * Opt-in bound, in ms, on the waiting and the retries of one send (KIP-91); past it the send
-   * rejects with `KafkaJSDeliveryTimeout`. An integer of at least `linger + requestTimeout` (5 ms
-   * more than `requestTimeout` at the default `linger`) and at most 2147483647. The bound runs
-   * from the send and includes the wait for `linger` and, on an idempotent producer, for the
-   * producer id. A queued or on-wire request settles at the deadline; a late answer cannot settle
-   * the send again.
+   * Bound, in ms, on the waiting and the retries of one send (KIP-91); past it the send rejects
+   * with `KafkaJSDeliveryTimeout`. Defaults to `retry.maxTotalTime` when that is set, else to
+   * 120000 (Java parity), raised to `linger + requestTimeout` when that is larger. An explicit
+   * value is an integer of at least `linger + requestTimeout` (5 ms more than `requestTimeout` at
+   * the default `linger`) and at most 2147483647. The bound runs from the send and includes the
+   * wait for `linger` and, on an idempotent producer, for the producer id. A queued or on-wire
+   * request settles at the deadline; a late answer cannot settle the send again.
    */
   deliveryTimeout?: number
 }

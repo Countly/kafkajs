@@ -116,9 +116,12 @@ const microtasks = async () => {
 const records = (partition, prefix, count = 1) =>
   Array.from({ length: count }, (_, index) => ({ partition, value: `${prefix}-${index}` }))
 
-/** Every record goes to the partition it names, as `sendMessages.partition` would assign it. */
-const byMessage = async (topicMessages) =>
-  topicMessages.flatMap(({ topic, messages }) =>
+/**
+ * Every record goes to the partition it names, as `sendMessages.partition` would assign it. The
+ * accumulator hands the send that holds the records.
+ */
+const byMessage = async ({ records }) =>
+  records.flatMap(({ topic, messages }) =>
     [...new Set(messages.map(({ partition }) => partition))].map((partition) => ({
       topic,
       partition,
@@ -187,8 +190,8 @@ const whereASendPathFailureGoes = ({ linger, batchSize }) => {
     const accumulator = new Accumulator({
       linger: ${linger},
       batchSize: ${batchSize},
-      partition: async (topicMessages) =>
-        topicMessages.map(({ topic, messages }) => ({ topic, partition: 0, messages })),
+      partition: async ({ records }) =>
+        records.map(({ topic, messages }) => ({ topic, partition: 0, messages })),
       sendPartitioned: () => {
         throw new Error('send path failure')
       },
@@ -688,6 +691,36 @@ describe('Producer > the accumulator', () => {
         expect(jest.getTimerCount()).toBe(0)
       })
 
+      test('a held batch an older send joins goes on at that send’s deadline', async () => {
+        const { sendPartitioned, values } = heldFirstCall()
+        const gate = deferred()
+        const partition = jest.fn(async (send) => {
+          if (send.records[0].messages[0].value === 'c-0') {
+            await gate.promise
+          }
+          return byMessage(send)
+        })
+        const { accumulator } = createAccumulator({
+          sendPartitioned,
+          partition,
+          holds: () => true,
+          deadline: 50,
+        })
+
+        append(accumulator, records(0, 'c'))
+        append(accumulator, records(0, 'a'))
+        await jest.advanceTimersByTimeAsync(LINGER + 1)
+        append(accumulator, records(0, 'b'))
+        await jest.advanceTimersByTimeAsync(LINGER + 1)
+        gate.resolve()
+        await jest.advanceTimersByTimeAsync(37)
+        expect(values()).toEqual([['a-0']])
+        await jest.advanceTimersByTimeAsync(1)
+
+        expect(values()).toEqual([['a-0'], ['b-0', 'c-0']])
+        expect(jest.getTimerCount()).toBe(0)
+      })
+
       test('a hand-off that fails after its batches settled does not release a held batch early', async () => {
         const answer = deferred()
         const calls = []
@@ -897,11 +930,11 @@ describe('Producer > the accumulator', () => {
 
     test('a batch’s delivery deadline counts from the earliest send in it', async () => {
       const held = deferred()
-      const partition = jest.fn(async (topicMessages) => {
-        if (topicMessages[0].messages[0].value === 'a-0') {
+      const partition = jest.fn(async (send) => {
+        if (send.records[0].messages[0].value === 'a-0') {
           await held.promise
         }
-        return byMessage(topicMessages)
+        return byMessage(send)
       })
       const { accumulator, calls } = createAccumulator({ linger: 10, partition })
 
@@ -922,6 +955,59 @@ describe('Producer > the accumulator', () => {
           createdAt: 0,
         })
       )
+    })
+
+    describe('an older send that joins a lingering batch late', () => {
+      /** A partition callback that waits for `held` before assigning the records of `a-0`. */
+      const lateFirst = (held) =>
+        jest.fn(async (send) => {
+          if (send.records[0].messages[0].value === 'a-0') {
+            await held.promise
+          }
+          return byMessage(send)
+        })
+
+      test('brings the batch’s timer forward to its own delivery deadline', async () => {
+        const held = deferred()
+        const { accumulator, calls } = createAccumulator({
+          linger: 100,
+          deadline: 80,
+          partition: lateFirst(held),
+        })
+
+        append(accumulator, records(0, 'a'))
+        await jest.advanceTimersByTimeAsync(20)
+        append(accumulator, records(0, 'b'))
+        await jest.advanceTimersByTimeAsync(30)
+        held.resolve()
+        await jest.advanceTimersByTimeAsync(29)
+        expect(calls).toHaveLength(0)
+        await jest.advanceTimersByTimeAsync(1)
+
+        expect(calls).toHaveLength(1)
+        expect(calls[0].batches[0].createdAt).toBe(0)
+      })
+
+      test('does not restart the batch’s linger', async () => {
+        const held = deferred()
+        const { accumulator, calls } = createAccumulator({
+          linger: 50,
+          deadline: 1000,
+          partition: lateFirst(held),
+        })
+
+        append(accumulator, records(0, 'a'))
+        await jest.advanceTimersByTimeAsync(20)
+        append(accumulator, records(0, 'b'))
+        await jest.advanceTimersByTimeAsync(10)
+        held.resolve()
+        await jest.advanceTimersByTimeAsync(39)
+        expect(calls).toHaveLength(0)
+        await jest.advanceTimersByTimeAsync(1)
+
+        expect(calls).toHaveLength(1)
+        expect(jest.getTimerCount()).toBe(0)
+      })
     })
   })
 
@@ -2361,7 +2447,7 @@ describe('Producer > the accumulator', () => {
         expect(cluster.broker.produce.mock.calls.length).toBeGreaterThan(0)
       })
 
-      test('a hand-off that comes after the delivery deadline rejects without sending', async () => {
+      test('a send whose partitions come after the delivery deadline rejects without sending', async () => {
         const { cluster, producer } = createLingeringProducer({
           idempotent: false,
           deliveryTimeout: 300,
@@ -2378,8 +2464,9 @@ describe('Producer > the accumulator', () => {
 
         expect(error).toBeInstanceOf(KafkaJSDeliveryTimeout)
         expect(error.message).toEqual(
-          `Gave up on ${TOPIC} partition 0 before sending it: its 300 ms delivery deadline passed`
+          'Gave up before the send reached a broker: its 300 ms delivery deadline passed'
         )
+        expect(error.outcome).toBe('unsent')
         expect(cluster.broker.produce).not.toHaveBeenCalled()
       })
 

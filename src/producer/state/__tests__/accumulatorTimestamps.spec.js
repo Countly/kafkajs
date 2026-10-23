@@ -20,8 +20,8 @@ const SEND_TIME = 1800000000000
  * records it was handed.
  */
 const createAccumulator = () => {
-  const partition = jest.fn(async (topicMessages) =>
-    topicMessages.map(({ topic, messages }) => ({ topic, partition: 0, messages }))
+  const partition = jest.fn(async ({ records }) =>
+    records.map(({ topic, messages }) => ({ topic, partition: 0, messages }))
   )
   const sendPartitioned = jest.fn(async ({ batches }) =>
     batches.map(({ topic, partition: id, settlers }) => {

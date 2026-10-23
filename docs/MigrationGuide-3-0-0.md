@@ -59,6 +59,7 @@ What to change to install the package and run it on a Kafka 4.x cluster.
 
 - Remove the `kafkajs-snappy` registration to use the built-in codec, or keep it: yours wins. The built-in codec runs on the main thread (no native module), in short slices that yield to the event loop: about 100 MiB/s to decode, 40 MiB/s to encode
 - **Delivery deadlines also settle requests that are already on the wire.** `send()` and `sendBatch()` reject at the deadline instead of waiting for a late broker answer. Later work is fenced, and a late answer cannot resolve that send. There is no configuration escape. If the error says `outcome: 'unknown'`, the broker may already have the records and an application resend may duplicate them; `outcome: 'unsent'` is the positive evidence that no attempt carrying those records could have been written. With `enforceRequestTimeout: false`, an outstanding request can still retain its records until its answer or connection failure after the send has rejected.
+- If you relied on a send failing soon after a broker problem (the five default attempts nominally accumulate about 9 seconds of backoff, request time on top), set `deliveryTimeout` (at least `linger + requestTimeout`) or `retry: { retries: n }`. Code that matched `KafkaJSNumberOfRetriesExceeded` on a send now also sees `KafkaJSDeliveryTimeout`: match `e.type` or `e.cause`. Admin and consumer retries, and the retries of a transaction's own requests (`commit`, `abort`, `initTransactions`), are unchanged
 
 
 Producers are idempotent by default and gather sends into batches; each item says what you may
@@ -91,9 +92,9 @@ notice and what, if anything, to do.
   each batch's sequence number are unchanged.
 
 - **`kafka.producer()` is idempotent by default.** Every send requires `acks: -1` and the
-  producer allocates a producer id at `connect()`. The size of the retry budget is unchanged:
-  every producer keeps its `retry.retries` (5 unless set), as in 2.2.4; what it counts is per
-  partition now (the retry items below). `producer.isIdempotent()` reports
+  producer allocates a producer id at `connect()`. Delivery retries default to 2147483647,
+  bounded by the delivery deadline (120000 ms unless configured). An explicit `retry.retries`
+  is honoured per partition (the retry items below). `producer.isIdempotent()` reports
   `false` after a configuration turned idempotence off (the `maxInFlightRequests` and `retries`
   items below).
   *What to do:* producers are idempotent unless you pass `idempotent: false`. If you relied on
@@ -243,13 +244,14 @@ notice and what, if anything, to do.
 
 - **`deliveryTimeout` counts the wait for `linger` and for the producer id.** A send's deadline
   starts when the send is made, as the Java client's does, so the `linger` wait - and on an
-  idempotent producer the `InitProducerId` wait - count against it, and its floor is
-  `linger + requestTimeout`: 30005 ms with both defaults.
+  idempotent producer the `InitProducerId` wait - count against it. An explicit
+  `deliveryTimeout` must be at least `linger + requestTimeout`: 30005 ms with both defaults.
+  When `deliveryTimeout` is unset, an explicit `retry.maxTotalTime` may be below that sum.
   *What to do:* nothing unless you set `deliveryTimeout`, new in 3.0.0: give it at least
   `linger + requestTimeout`.
 
-- **Three opt-ins, none of them on by default**: `Partitioners.UniformStickyPartitioner`;
-  `deliveryTimeout`; and `leaderEpoch` on the partitions given to `sendOffsets`.
+- **Two opt-ins, neither on by default**: `Partitioners.UniformStickyPartitioner`;
+  and `leaderEpoch` on the partitions given to `sendOffsets`.
   *What to do:* nothing; leaving them unset changes nothing beyond what the other items describe.
 - **A broker's waiting batches leave together.** When one batch's `linger` runs out, the other
   waiting batches for the same broker (same `acks`, `timeout` and `compression`) leave with it,

@@ -1,5 +1,7 @@
 const Long = require('../../utils/long')
-const { KafkaJSInvalidConfigurationError } = require('../../errors')
+const Fifo = require('../../utils/fifo')
+const { KafkaJSDeliveryTimeout, KafkaJSInvalidConfigurationError } = require('../../errors')
+const { Deadline, ExpiryTimer } = require('../deadline')
 
 /** What each field of a record must be for the record encoder to write it. */
 const ENCODABLE = {
@@ -265,6 +267,39 @@ class Settler {
 }
 
 /**
+ * One send between the public call and the batches that take its records over. The records live
+ * here, and nowhere else, until the send has been assigned its partitions: a continuation that
+ * waits for the producer id or for metadata holds this object, reads `records` after its await and
+ * stops when it is `null`, so a send that expired while it waited keeps none of its records alive.
+ * The object itself is retained until the last continuation that holds it ends; `pins` counts them.
+ */
+class PendingSend {
+  /**
+   * @param {{ topic: string, messages: object[] }[]} records
+   * @param {Deadline} deadline the send's delivery deadline, counted from the public call
+   */
+  constructor(records, deadline) {
+    /** @type {?{ topic: string, messages: object[] }[]} `null` once the send has settled or joined */
+    this.records = records
+    this.deadline = deadline
+    this.settled = false
+    this.pins = 0
+    /** @type {?(error: Error) => void} rejects the send; set while it is held */
+    this.reject = null
+  }
+
+  /** Counts one continuation that holds this send. @returns {void} */
+  pin() {
+    this.pins += 1
+  }
+
+  /** Counts that continuation's end. @returns {void} */
+  unpin() {
+    this.pins -= 1
+  }
+}
+
+/**
  * @typedef {object} PendingBatch
  * @property {string} key the batch's topic and partition
  * @property {string} options its `acks`, `timeout` and `compression`, as one key
@@ -328,6 +363,10 @@ class Accumulator {
   #holds
   #leaderOf
   #deadline
+  #expired
+  /** @type {Fifo<PendingSend>} the sends waiting for their partitions, in the order of their deadlines */
+  #holders = new Fifo()
+  #expiry = new ExpiryTimer((now) => this.#expireHolders(now))
   /** @type {Map<string, PendingBatch>} */
   #pending = new Map()
   /** @type {Map<string, number>} by key, the batches handed on and not settled yet */
@@ -343,9 +382,10 @@ class Accumulator {
    * @param {object} options
    * @param {number} options.linger ms a batch waits for more records; 0 for none
    * @param {number} options.batchSize bytes of keys and values at which a batch is sent
-   * @param {(topicMessages: { topic: string, messages: object[] }[]) =>
+   * @param {(send: PendingSend) =>
    *   Promise<{ topic: string, partition: number, messages: object[] }[]>} options.partition
-   *   assigns every record its partition once
+   *   assigns every record its partition once; it reads the records from `send.records` after each
+   *   await and stops when that is `null`
    * @param {(request: { acks: number, timeout?: number, compression?: number,
    *   batches: PendingBatch[] }) => Promise<object[]>} options.sendPartitioned sends the batches
    *   and settles each one's `settlers` as it settles; it must enqueue them before it returns, so
@@ -358,8 +398,11 @@ class Accumulator {
    *   asked once for each batch that waits for its `linger`. A negative id, null, undefined or a
    *   throw all mean the leader is not known, and a batch whose leader is not known is never
    *   merged
-   * @param {number} [options.deadline] ms from a batch's first send to its delivery deadline, the
-   *   send path's own; a held batch goes out when it is reached
+   * @param {number} [options.deadline] ms from a send's public call to its delivery deadline, the
+   *   send path's own: a send still waiting for its partitions settles with `KafkaJSDeliveryTimeout`
+   *   when it is reached, and a held batch goes out then
+   * @param {(error: Error) => Error} [options.expired] called with the error of a send that
+   *   expired before it joined a batch, to arm a transaction; returns the error to reject with
    */
   constructor({
     linger,
@@ -370,6 +413,7 @@ class Accumulator {
     holds = () => false,
     leaderOf = () => null,
     deadline,
+    expired = (error) => error,
   }) {
     this.#linger = linger
     this.#batchSize = batchSize
@@ -379,6 +423,7 @@ class Accumulator {
     this.#holds = holds
     this.#leaderOf = leaderOf
     this.#deadline = deadline
+    this.#expired = expired
   }
 
   /**
@@ -386,17 +431,19 @@ class Accumulator {
    * carrying them has been acknowledged, with one `RecordMetadata` per partition, by topic and then
    * partition, whose `baseOffset` is that of the send's own first record there; rejects with the
    * first error such a batch failed with, after all of them have settled. A send with no record
-   * resolves `[]` at once.
+   * resolves `[]` at once. A send still waiting for its partitions at its delivery deadline rejects
+   * with `KafkaJSDeliveryTimeout`, `outcome: 'unsent'`, whatever it waits for.
    * @param {object} request
    * @param {number} request.acks
    * @param {number} [request.timeout]
    * @param {number} [request.compression]
    * @param {{ topic: string, messages: object[] }[]} request.topicMessages
+   * @param {number} [request.startedAt] when the public call began, in epoch ms; now when absent
    * @returns {Promise<object[]>}
    * @throws {KafkaJSInvalidConfigurationError} for a record the encoder cannot write; nothing is
    *   queued
    */
-  async append({ acks, timeout, compression, topicMessages }) {
+  async append({ acks, timeout, compression, topicMessages, startedAt = Date.now() }) {
     for (const { topic, messages } of topicMessages) {
       assertEncodable(topic, messages)
     }
@@ -404,19 +451,149 @@ class Accumulator {
       return []
     }
 
-    const createdAt = Date.now()
-    this.#appending += 1
-    try {
-      return this.#join(await this.#partition(topicMessages), {
-        acks,
-        timeout,
-        compression,
-        createdAt,
-      })
-    } finally {
-      this.#appending -= 1
-      this.#checkIdle()
+    return this.#hold(new PendingSend(topicMessages, new Deadline(startedAt, this.#deadline)), {
+      acks,
+      timeout,
+      compression,
+    })
+  }
+
+  /**
+   * Holds a send while its records are assigned their partitions, then joins them to batches. The
+   * send settles at its deadline even while the assignment never returns: its records are dropped,
+   * and what the assignment does afterwards is ignored.
+   * @param {PendingSend} send
+   * @param {{ acks: number, timeout?: number, compression?: number }} options
+   * @returns {Promise<object[]>} the send's outcome, as `append()` describes it
+   */
+  #hold(send, options) {
+    if (send.deadline.remaining() === 0) {
+      return Promise.reject(this.#expired(this.#timedOut(send)))
     }
+
+    this.#appending += 1
+    return new Promise((resolve, reject) => {
+      send.reject = reject
+      this.#register(send)
+
+      send.pin()
+      let assigned
+      try {
+        assigned = this.#partition(send)
+      } catch (error) {
+        assigned = Promise.reject(error)
+      }
+      assigned.then(
+        (entries) => {
+          send.unpin()
+          if (this.#leave(send)) {
+            try {
+              resolve(this.#join(entries, { ...options, createdAt: send.deadline.startedAt }))
+            } catch (error) {
+              reject(error)
+            } finally {
+              this.#end()
+            }
+          }
+        },
+        (error) => {
+          send.unpin()
+          if (this.#leave(send)) {
+            reject(error)
+            this.#end()
+          }
+        }
+      )
+    })
+  }
+
+  /**
+   * Puts a send in the deadline registry, behind every send due no later than it - which is the
+   * back of the queue unless the clock stepped back - and arms the timer for it if it is the
+   * earliest.
+   * @param {PendingSend} send
+   * @returns {void}
+   */
+  #register(send) {
+    const { dueAt } = send.deadline
+    if (dueAt === Infinity) {
+      return
+    }
+
+    let index = this.#holders.size
+    while (index > 0 && this.#holders.at(index - 1).deadline.dueAt > dueAt) {
+      index -= 1
+    }
+    this.#holders.insertAt(index, send)
+    this.#expiry.arm(dueAt)
+  }
+
+  /**
+   * Ends a send's wait: it stops holding its records and its place in the deadline registry. The
+   * caller then gives the outcome and calls `#end`.
+   * @param {PendingSend} send
+   * @returns {boolean} whether this call ended it, false when it had already ended
+   */
+  #leave(send) {
+    if (send.settled) {
+      return false
+    }
+
+    send.settled = true
+    send.records = null
+    send.reject = null
+    if (this.#holders.peek() === send) {
+      this.#holders.shift()
+    } else {
+      this.#holders.remove(send)
+    }
+    if (this.#holders.size === 0) {
+      this.#expiry.clear()
+    }
+    return true
+  }
+
+  /**
+   * Ends the append of a send that has left the registry, after its records have joined a batch or
+   * its rejection has been given, so that the accumulator is never idle between the two.
+   * @returns {void}
+   */
+  #end() {
+    this.#appending -= 1
+    this.#checkIdle()
+  }
+
+  /**
+   * The timer of the deadline registry: every send due now is rejected and dropped.
+   * @param {number} now epoch ms
+   * @returns {number} the deadline of the next send still waiting, or Infinity
+   */
+  #expireHolders(now) {
+    for (
+      let send = this.#holders.peek();
+      send !== undefined && send.deadline.dueAt <= now;
+      send = this.#holders.peek()
+    ) {
+      const { reject } = send
+      this.#leave(send)
+      reject(this.#expired(this.#timedOut(send)))
+      this.#end()
+    }
+
+    const next = this.#holders.peek()
+    return next === undefined ? Infinity : next.deadline.dueAt
+  }
+
+  /**
+   * @param {PendingSend} send
+   * @returns {KafkaJSDeliveryTimeout} the error of a send whose deadline passed before any request
+   *   carried its records
+   */
+  #timedOut({ deadline }) {
+    return new KafkaJSDeliveryTimeout(
+      `Gave up before the send reached a broker: its ${deadline.budgetMs} ms delivery deadline passed`,
+      { outcome: 'unsent' }
+    )
   }
 
   /**
@@ -470,7 +647,10 @@ class Accumulator {
         this.#pending.set(key, batch)
       }
 
-      batch.createdAt = Math.min(batch.createdAt, createdAt)
+      if (createdAt < batch.createdAt) {
+        batch.createdAt = createdAt
+        this.#rearm(batch)
+      }
       batch.settlers.push(new Settler(send, batch.messages.length))
       for (const message of messages) {
         batch.messages.push(withEncodableTimestamp(message))
@@ -497,7 +677,7 @@ class Accumulator {
         batch.due = true
       } else if (batch.timer === null) {
         batch.mergeKey = this.#mergeKeyOf(batch)
-        batch.timer = setTimeout(() => this.#expire(batch), this.#linger)
+        batch.timer = setTimeout(() => this.#expire(batch), this.#lingerOf(batch))
       }
     }
     if (full.length > 0) {
@@ -506,6 +686,41 @@ class Accumulator {
       this.#queueHandOff()
     }
     return send.promise
+  }
+
+  /**
+   * How long a batch waits for more records: its `linger`, or less when its delivery deadline
+   * comes first, so the send path sees it by then.
+   * @param {PendingBatch} batch
+   * @returns {number} ms
+   */
+  #lingerOf(batch) {
+    return this.#deadline === undefined
+      ? this.#linger
+      : Math.max(0, Math.min(this.#linger, batch.createdAt + this.#deadline - Date.now()))
+  }
+
+  /**
+   * Moves a batch's timer to its delivery deadline after an older send joined it and brought that
+   * deadline forward. A lingering batch still waits no longer than its original `linger` limit,
+   * which is not restarted; a held batch goes out at the deadline. A batch with no timer is left
+   * to the code that arms one.
+   * @param {PendingBatch} batch
+   * @returns {void}
+   */
+  #rearm(batch) {
+    if (batch.timer === null || this.#deadline === undefined) {
+      return
+    }
+
+    clearTimeout(batch.timer)
+    const deadlineAt = batch.createdAt + this.#deadline
+    batch.timer = batch.due
+      ? setTimeout(() => this.#flushBatch(batch), Math.max(0, deadlineAt - Date.now()))
+      : setTimeout(
+          () => this.#expire(batch),
+          Math.max(0, Math.min(batch.dueAt, deadlineAt) - Date.now())
+        )
   }
 
   /**

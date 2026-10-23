@@ -306,7 +306,7 @@ new Kafka({
 })
 ```
 
-A producer's `deliveryTimeout` must be at least its `linger` (5 ms unless the producer sets another, see the [accumulator](Producing.md#accumulator)) plus this value - 30005 ms with both defaults - see [Delivery timeout](Producing.md#delivery-timeout).
+A producer's explicit `deliveryTimeout` must be at least its `linger` (5 ms unless the producer sets another, see the [accumulator](Producing.md#accumulator)) plus this value - 30005 ms with both defaults - see [Delivery timeout](Producing.md#delivery-timeout).
 
 The request timeout can be disabled by setting `enforceRequestTimeout` to `false`.
 
@@ -422,6 +422,11 @@ If the max number of retries is exceeded the retrier will throw `KafkaJSNumberOf
 
 __Available options:__
 
+The defaults below apply to the general retrier, including transaction control requests,
+admin and consumer calls. Producer delivery retries instead default to 2147483647 retries,
+with a 100 ms initial backoff and a 1000 ms cap, bounded by the delivery deadline.
+Explicit retry settings override these defaults key by key; see [Producer retry](Producing.md#retry).
+
 | option              | description                                                                                                             | default             |
 | ------------------- | ----------------------------------------------------------------------------------------------------------------------- | ------------------- |
 | maxRetryTime        | Maximum wait time for a retry in milliseconds                                                                           | `30000`             |
@@ -429,7 +434,7 @@ __Available options:__
 | factor              | Randomization factor                                                                                                    | `0.2`               |
 | multiplier          | Exponential factor                                                                                                      | `2`                 |
 | retries             | Max number of retries per call                                                                                          | `5`                 |
-| maxTotalTime        | Deadline in ms for one call, from its first attempt: when the wait before the next attempt would end past it, the call rejects with `KafkaJSDeliveryTimeout`, whose `cause` is the last attempt's error. Running out of `retries` first still rejects with `KafkaJSNumberOfRetriesExceeded`. An integer from 1 to 2147483647. A producer's `deliveryTimeout` sets it for that producer's sends. Producer sends and transaction retries, `consumer.commitOffsets()`, the consumer group's join and sync, admin calls, and the client's connect, metadata and coordinator lookups honour it. The consumer's fetch loop (with the auto-commits made inside it) ignores it, because the loop runs as one operation for as long as `run()` lasts; so do the consumer-protocol heartbeat backoff and position validation, which uses its own fixed retry budget | none (no deadline) |
+| maxTotalTime        | Deadline in ms for one call, from its first attempt: when the wait before the next attempt would end past it, the call rejects with `KafkaJSDeliveryTimeout`, whose `cause` is the last attempt's error. Running out of `retries` first still rejects with `KafkaJSNumberOfRetriesExceeded`. An integer from 1 to 2147483647. A producer's `deliveryTimeout` (120000 ms unless set) sets it for that producer's sends; the producer's own `maxTotalTime`, if you set one, is used when it sets no `deliveryTimeout`. Producer sends and transaction retries, `consumer.commitOffsets()`, the consumer group's join and sync, admin calls, and the client's connect, metadata and coordinator lookups honour it. The consumer's fetch loop (with the auto-commits made inside it) ignores it, because the loop runs as one operation for as long as `run()` lasts; so do the consumer-protocol heartbeat backoff and position validation, which uses its own fixed retry budget | none (no deadline) |
 | restartOnFailure    | Only used in consumer. See [`restartOnFailure`](#restartonfailure)                                                      | none (restart on retriable errors only) |
 
 Example:

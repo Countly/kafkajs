@@ -10,6 +10,7 @@ const channels = require('./instrumentation/channels')
 const LoggerConsole = require('./loggers/console')
 const Cluster = require('./cluster')
 const createProducer = require('./producer')
+const { MAX_DELAY } = require('./producer/deadline')
 const createConsumer = require('./consumer')
 const createAdmin = require('./admin')
 const ISOLATION_LEVEL = require('./protocol/isolationLevel')
@@ -39,9 +40,6 @@ const DEFAULT_REQUEST_TIMEOUT = 30000
 // Java's MAX_IN_FLIGHT_REQUESTS_PER_CONNECTION_FOR_IDEMPOTENCE.
 // @see clients/src/main/java/org/apache/kafka/clients/producer/ProducerConfig.java (Apache Kafka 4.3)
 const MAX_IN_FLIGHT_REQUESTS_FOR_IDEMPOTENCE = 5
-// The longest delay Node's `setTimeout` honours; a longer one runs after 1 ms.
-// @see https://nodejs.org/api/timers.html
-const MAX_TIMER_DELAY = 2147483647
 // A response body holds at least its 4-byte correlation id.
 const MIN_MAX_RESPONSE_SIZE = 4
 const DEFAULT_METADATA_RECOVERY_STRATEGY = 'rebootstrap'
@@ -178,25 +176,27 @@ const resolveIdempotent = ({
 
 /**
  * Checks the producer's accumulator options and its delivery deadline, and resolves the
- * accumulator's defaults, `createProducer.defaults`, for the options not passed. The deadline must
- * leave room for one request after the linger, `deliveryTimeout >= linger + requestTimeout`
- * (Java's `KafkaProducer.configureDeliveryTimeout`). `linger` and `deliveryTimeout` are at most
- * 2147483647 ms, the longest timer delay.
+ * accumulator's defaults, `createProducer.defaults`, for the options not passed. An explicit
+ * deadline must leave room for one request after the linger, `deliveryTimeout >= linger +
+ * requestTimeout` (Java's `KafkaProducer.configureDeliveryTimeout`). Without one, the deadline is
+ * `retry.maxTotalTime` when that is set, and not held to that sum, so no configuration that
+ * worked before is refused; otherwise it is the default, raised to the sum when the sum is larger.
+ * `linger` and `deliveryTimeout` are at most 2147483647 ms, the longest timer delay; a default
+ * raised above it is kept, as the timers of a longer deadline fire in steps.
  * @param {object} options
  * @param {number} [options.linger]
  * @param {number} [options.batchSize]
  * @param {number} [options.deliveryTimeout]
+ * @param {number} [options.maxTotalTime] the producer's `retry.maxTotalTime`
  * @param {number} options.requestTimeout
- * @returns {{ linger: number, batchSize: number }}
+ * @returns {{ linger: number, batchSize: number, deliveryTimeout: number, raised: boolean }}
+ *   `raised` says that the default was raised to `linger + requestTimeout`
  * @throws {KafkaJSInvalidConfigurationError} naming the option at fault
  */
-const resolveDelivery = ({ linger, batchSize, deliveryTimeout, requestTimeout }) => {
-  if (
-    linger !== undefined &&
-    !(Number.isInteger(linger) && linger >= 0 && linger <= MAX_TIMER_DELAY)
-  ) {
+const resolveDelivery = ({ linger, batchSize, deliveryTimeout, maxTotalTime, requestTimeout }) => {
+  if (linger !== undefined && !(Number.isInteger(linger) && linger >= 0 && linger <= MAX_DELAY)) {
     throw new KafkaJSInvalidConfigurationError(
-      `linger must be an integer >= 0 and <= ${MAX_TIMER_DELAY}, got ${inspect(linger)}`
+      `linger must be an integer >= 0 and <= ${MAX_DELAY}, got ${inspect(linger)}`
     )
   }
 
@@ -209,16 +209,18 @@ const resolveDelivery = ({ linger, batchSize, deliveryTimeout, requestTimeout })
   const resolved = {
     linger: linger ?? createProducer.defaults.linger,
     batchSize: batchSize ?? createProducer.defaults.batchSize,
+    deliveryTimeout,
+    raised: false,
   }
 
   if (deliveryTimeout != null) {
     if (!(
       Number.isInteger(deliveryTimeout) &&
       deliveryTimeout >= 1 &&
-      deliveryTimeout <= MAX_TIMER_DELAY
+      deliveryTimeout <= MAX_DELAY
     )) {
       throw new KafkaJSInvalidConfigurationError(
-        `deliveryTimeout must be an integer >= 1 and <= ${MAX_TIMER_DELAY}, got ${inspect(deliveryTimeout)}`
+        `deliveryTimeout must be an integer >= 1 and <= ${MAX_DELAY}, got ${inspect(deliveryTimeout)}`
       )
     }
 
@@ -228,6 +230,12 @@ const resolveDelivery = ({ linger, batchSize, deliveryTimeout, requestTimeout })
         `deliveryTimeout must be at least linger + requestTimeout (${floor} ms), got ${deliveryTimeout}`
       )
     }
+  } else if (maxTotalTime != null) {
+    resolved.deliveryTimeout = maxTotalTime
+  } else {
+    const floor = resolved.linger + requestTimeout
+    resolved.deliveryTimeout = Math.max(createProducer.defaults.deliveryTimeout, floor)
+    resolved.raised = floor > createProducer.defaults.deliveryTimeout
   }
 
   return resolved
@@ -399,10 +407,12 @@ module.exports = class Client {
     compressionLevels,
   } = {}) {
     const levels = resolveCompressionLevels(compressionLevels)
+    const producerRetry = { ...this[PRIVATE.CLUSTER_RETRY], ...retry }
     const delivery = resolveDelivery({
       linger,
       batchSize,
       deliveryTimeout,
+      maxTotalTime: producerRetry.maxTotalTime,
       requestTimeout: this[PRIVATE.REQUEST_TIMEOUT],
     })
     const inFlight = validateMaxInFlightRequests(
@@ -426,8 +436,19 @@ module.exports = class Client {
       warnOfDefaultPartitioner(this[PRIVATE.LOGGER])
     }
 
+    if (delivery.raised) {
+      this[PRIVATE.LOGGER]
+        .namespace('Producer')
+        .warn(
+          `deliveryTimeout was not set and defaults to ${createProducer.defaults.deliveryTimeout} ms, ` +
+            `which is below linger + requestTimeout: it is raised to ${delivery.deliveryTimeout} ms. ` +
+            'Set deliveryTimeout to choose it.',
+          { rule: 'deliveryTimeout' }
+        )
+    }
+
     return createProducer({
-      retry: { ...this[PRIVATE.CLUSTER_RETRY], ...retry },
+      retry: producerRetry,
       logger: this[PRIVATE.LOGGER],
       cluster,
       createPartitioner,
@@ -436,7 +457,7 @@ module.exports = class Client {
       transactionTimeout,
       linger: delivery.linger,
       batchSize: delivery.batchSize,
-      deliveryTimeout,
+      deliveryTimeout: delivery.deliveryTimeout,
       compressionLevels: levels,
       instrumentationEmitter,
     })

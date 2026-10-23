@@ -1408,7 +1408,8 @@ class DrainLoop {
  * @param {{ gzip?: number, zstd?: number }} [options.compressionLevels] validated producer
  *   snapshot, selected by codec on both send paths and retained for retries
  * @param {() => string} [options.getConnectionStatus] the producer's connection status
- * @returns {{ sendPartitioned: Function, partition: Function }}
+ * @returns {{ sendPartitioned: Function, partition: Function, inTransaction: Function }} the
+ *   `inTransaction` of a send that settled before it reached the send path arms the transaction
  */
 const createSendMessages = ({
   logger,
@@ -1556,21 +1557,72 @@ const createSendMessages = ({
   }
 
   /**
+   * The retrier for a send's wait for its partitions. A finite remaining budget within one timer
+   * interval becomes `maxTotalTime`; above it, `null` leaves the absolute deadline to the holder's
+   * stepped expiry timer. A capped segment must not end the send early. With no deadline, the
+   * producer's own retrier is used.
+   * @param {{ deadline?: import('./deadline').Deadline }} send
+   * @returns {import('../retry').Retrier}
+   * @throws {KafkaJSDeliveryTimeout} when no time is left: a retrier is never built for zero
+   */
+  const retrierOf = ({ deadline }) => {
+    if (deadline === undefined || deadline.dueAt === Infinity) {
+      return retrier
+    }
+
+    const remaining = deadline.remaining()
+    if (remaining === 0) {
+      throw new KafkaJSDeliveryTimeout(
+        `Gave up before the send reached a broker: its ${deadline.budgetMs} ms delivery deadline passed`,
+        { outcome: 'unsent' }
+      )
+    }
+
+    return createRetry({
+      ...retry,
+      maxTotalTime: remaining > MAX_DELAY ? null : remaining,
+    })
+  }
+
+  /**
+   * The records of a send that is still waiting.
+   * @param {{ records: ?object[] }} send
+   * @returns {{ topic: string, messages: object[] }[]}
+   * @throws {Error} once the send has settled and dropped its records: whatever waits for it
+   *   stops, and nothing is enqueued
+   */
+  const recordsOf = (send) => {
+    if (send.records === null) {
+      throw Object.assign(new Error('The send settled before its records were assigned'), {
+        retriable: false,
+      })
+    }
+    return send.records
+  }
+
+  /**
    * Assigns each record to a partition once, after making sure the topics' metadata is loaded:
-   * the partitioner never runs again for these records. Retried by `retrier` while the metadata
-   * cannot be loaded. A transactional producer's failure arms the transaction as `inTransaction`
-   * says.
-   * @param {{ topic: string, messages: object[] }[]} topicMessages
+   * the partitioner never runs again for these records. Retried while the metadata cannot be
+   * loaded, within the send's delivery budget. The records are read from `send` after each await:
+   * a send that settled meanwhile has none, and the wait ends without enqueuing anything. A
+   * failure that arrives after the send settled is ignored: it refreshes no metadata, is not
+   * retried and arms no transaction. Otherwise a transactional producer's failure arms the
+   * transaction as `inTransaction` says.
+   * @param {{ records: ?object[], deadline?: import('./deadline').Deadline }|object[]} source a
+   *   send waiting to be partitioned (see the accumulator's `PendingSend`), or a plain list of
+   *   `{ topic, messages }` for a caller with no deadline
    * @returns {Promise<{ topic: string, partition: number, messages: object[] }[]>}
    */
-  const partition = (topicMessages) =>
-    retrier(async (bail) => {
+  const partition = (source) => {
+    const send = Array.isArray(source) ? { records: source } : source
+    return retrierOf(send)(async (bail) => {
       try {
-        await cluster.addMultipleTargetTopics(topicMessages.map(({ topic }) => topic))
+        await cluster.addMultipleTargetTopics(recordsOf(send).map(({ topic }) => topic))
+        recordsOf(send)
         await cluster.refreshMetadataIfNecessary()
 
         const entries = []
-        for (const { topic, messages } of topicMessages) {
+        for (const { topic, messages } of recordsOf(send)) {
           const partitionMetadata = cluster.findTopicPartitionMetadata(topic)
           if (partitionMetadata.length === 0) {
             throw new KafkaJSMetadataNotLoaded('Producing to topic without metadata')
@@ -1588,17 +1640,20 @@ const createSendMessages = ({
         }
         return entries
       } catch (e) {
+        if (send.settled) return bail(e)
         if (refreshesMetadata(e)) {
           await Promise.resolve(cluster.refreshMetadata()).catch((refreshError) => {
             logger.debug(`Best-effort metadata refresh failed: ${refreshError.message}`)
           })
         }
+        if (send.settled) return bail(e)
         if (e.retriable) throw e
         bail(e)
       }
     }).catch((error) => {
-      throw inTransaction(error)
+      throw send.settled ? error : inTransaction(error)
     })
+  }
 
   /**
    * Sends records already assigned to partitions, one batch per entry, and settles each entry's
@@ -1980,7 +2035,7 @@ const createSendMessages = ({
     return done
   }
 
-  return { sendPartitioned, partition }
+  return { sendPartitioned, partition, inTransaction }
 }
 
 createSendMessages.connectionStatusError = connectionStatusError

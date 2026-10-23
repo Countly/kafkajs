@@ -99,9 +99,9 @@ module.exports = ({
   const accumulator = new Accumulator({
     linger,
     batchSize,
-    partition: async (topicMessages) => {
+    partition: async (send) => {
       await ensureInitialized()
-      return idempotentSend.partition(topicMessages)
+      return idempotentSend.partition(send)
     },
     sendPartitioned: (request) => {
       // The idempotent path refuses the batches of a producer that is not connected itself, and
@@ -117,6 +117,7 @@ module.exports = ({
     // What the client already knows about the leader, never fetched
     leaderOf: (topic, partition) => cluster.cachedLeader(topic, partition),
     deadline: deliveryTimeout ?? retry.maxTotalTime,
+    expired: (error) => idempotentSend.inTransaction(error),
   })
 
   /**
@@ -181,6 +182,9 @@ module.exports = ({
    * @returns {Promise}
    */
   const sendBatch = async ({ acks = -1, timeout, compression, topicMessages = [] }) => {
+    // The delivery deadline counts from here, validation included.
+    const startedAt = Date.now()
+
     if (topicMessages.some(({ topic }) => !topic)) {
       throw new KafkaJSNonRetriableError(`Invalid topic`)
     }
@@ -239,6 +243,7 @@ module.exports = ({
       timeout,
       compression,
       topicMessages: mergedTopicMessages,
+      startedAt,
     })
   }
 

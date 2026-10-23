@@ -307,8 +307,15 @@ describe('Producer > options: the idempotent default and the settings that confl
     test.each([
       ['by default', {}],
       ['with idempotent: true', { idempotent: true }],
-    ])('is 5 retries %s, as in 2.2.4', (_, options) => {
+    ])('is bounded by the delivery deadline and not by a count %s', (_, options) => {
       createKafka().producer(options)
+
+      const resolved = Object.assign({}, PRODUCTION_RETRY_DEFAULTS, producerRetryOptions())
+      expect(resolved.retries).toEqual(2147483647)
+    })
+
+    test('an explicit retries is kept', () => {
+      createKafka().producer({ retry: { retries: 5 } })
 
       const resolved = Object.assign({}, PRODUCTION_RETRY_DEFAULTS, producerRetryOptions())
       expect(resolved.retries).toEqual(5)

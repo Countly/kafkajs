@@ -122,9 +122,10 @@ const consumerGroupOf = ({ consumerGroupId, consumerGroupMetadata }) => {
  *   idempotent) producer; gates the transactional methods (`beginTransaction`, `commit`, ...).
  * @param {string} [options.transactionalId] Required when `transactional` is true.
  * @param {import('../../../types').RetryOptions} [options.retry=cluster.retry] the producer's
- *   retry options: they bound every batch's re-sends, the requests the state manager makes on
- *   the send path, and this facade's own retries (InitProducerId, EndTxn, AddOffsetsToTxn,
- *   TxnOffsetCommit)
+ *   retry options for the requests of the transaction protocol: the state manager's on the send
+ *   path and this facade's own retries (InitProducerId, EndTxn, AddOffsetsToTxn, TxnOffsetCommit)
+ * @param {number} [options.deliveryRetries] how many times a batch is sent again; `retry.retries`
+ *   when absent
  * @returns {EosManager}
  */
 const createEosManager = ({
@@ -134,6 +135,7 @@ const createEosManager = ({
   transactional,
   transactionalId,
   retry = cluster.retry,
+  deliveryRetries,
 }) => {
   if (transactional && !transactionalId) {
     throw new KafkaJSNonRetriableError('Cannot manage transactions without a transactionalId')
@@ -154,6 +156,7 @@ const createEosManager = ({
     transactionalId,
     transactionTimeout,
     retry,
+    deliveryRetries,
     // Asks for no metadata first, as the Java producer: a non-transactional InitProducerId goes to
     // any connected broker, and a transactional one to its coordinator.
     findBroker: () =>
