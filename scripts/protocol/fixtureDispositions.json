@@ -181,6 +181,7 @@
     {"direction":"response","versions":[4],"test":"decodes the vector Apache own codec produced"}
   ]},
   {"family":"produce/capture","route":"capture.js","evidenceKind":"capture","disposition":"retain","reason":"broker captures v11, v13; no golden stands on it"},
+  {"family":"produce/java","route":"javaVectors/GenerateMessageVectors.java produce","evidenceKind":"java-vector","disposition":"retain","reason":"fixed-record Produce v11/v12 request bodies; independent builder and reader assertions in testHelpers/__tests__/wire.spec.js"},
   {"family":"produce/hand","route":"hand","evidenceKind":"hand","disposition":"retain","reason":"hand-kept bytes v3, v4, v5, v6, v7, v8, v9, v10, v11, v12, v13; goldens stand on it","goldens":[
     {"direction":"request","versions":[11],"test":"encodes the hand-computed golden byte for byte"},
     {"direction":"request","versions":[12],"test":"encodes the hand-computed golden byte for byte"},

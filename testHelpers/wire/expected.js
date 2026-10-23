@@ -605,4 +605,23 @@ module.exports = {
       },
     },
   },
+  /**
+   * Hand-computed ApiVersions v4 response body: error 0, empty API table, throttle 0; tags 0
+   * (empty supported array, one byte), 1 (eight-byte epoch 7), and 2 (one finalized feature,
+   * 26 bytes: array count 2, compact name length 20, 19 UTF-8 name bytes, max/min 2, empty tags).
+   * @see https://github.com/apache/kafka/blob/4.3.1/clients/src/main/resources/common/message/ApiVersionsResponse.json
+   */
+  apiVersionsTransactionV2: {
+    source:
+      'ApiVersionsResponse v4 schema; integer widths and compact-array/tag lengths computed by hand',
+    hex: '000001000000000300010101080000000000000007021a02147472616e73616374696f6e2e76657273696f6e0002000200',
+    fields: {
+      errorCode: 0,
+      apiKeys: [],
+      throttleTime: 0,
+      supportedFeatures: [],
+      finalizedFeaturesEpoch: 7,
+      finalizedFeatures: [{ name: 'transaction.version', minVersionLevel: 2, maxVersionLevel: 2 }],
+    },
+  },
 }

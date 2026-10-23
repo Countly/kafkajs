@@ -20,6 +20,7 @@ Versions before 3.0.0 are internal alpha tags and are not published.
 #### Tooling
 
 - Add independent Java Snappy vectors, Java read-back artifacts and a codec throughput, memory and event-loop benchmark.
+- Add independent record-containing Produce wire vectors and held-answer regressions for idempotent and non-idempotent delivery expiry.
 
 
 ### Phase 1 — foundation

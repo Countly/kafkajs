@@ -249,8 +249,8 @@ public final class GenerateMessageVectors {
   }
 
   /**
-   * @param args {@code args[0]} is the repository root the fixtures are written under, matching
-   *     the layout of {@code src/protocol/requests/<api>/fixtures/java/}.
+   * @param args the repository root, or {@code produce} followed by the root for fixed-record
+   *     Produce vectors; output follows {@code src/protocol/requests/<api>/fixtures/java/}.
    * @throws IOException if a fixture file cannot be written
    */
   public static void main(String[] args) throws IOException {
@@ -259,6 +259,10 @@ public final class GenerateMessageVectors {
       System.exit(1);
     }
 
+    if (args[0].equals("produce")) {
+      writeProduceRecords(Paths.get(args[1]));
+      return;
+    }
     Path outputDir = Paths.get(args[0]);
     int written = 0;
 
@@ -272,6 +276,57 @@ public final class GenerateMessageVectors {
     }
 
     System.out.println("vectors: " + written);
+  }
+
+  /**
+   * Generates two independent, record-containing Produce bodies from fixed Java inputs.
+   * @param root repository root receiving the structured fixtures
+   * @throws IOException when writing a vector fails
+   */
+  private static void writeProduceRecords(Path root) throws IOException {
+    var headers = new org.apache.kafka.common.header.Header[] {
+        new org.apache.kafka.common.header.internals.RecordHeader("trace", "first".getBytes(StandardCharsets.UTF_8))};
+    var records = org.apache.kafka.common.record.internal.MemoryRecords.withTransactionalRecords(
+        (byte) 2, 0L, org.apache.kafka.common.compress.Compression.NONE, 1000L, (short) 3, 7, 0,
+        new org.apache.kafka.common.record.internal.SimpleRecord(1700000000000L,
+            "key-0".getBytes(StandardCharsets.UTF_8), "value-0".getBytes(StandardCharsets.UTF_8), headers),
+        new org.apache.kafka.common.record.internal.SimpleRecord(1700000000001L,
+            "key-1".getBytes(StandardCharsets.UTF_8), "value-1".getBytes(StandardCharsets.UTF_8)));
+    byte[] batchBytes = new byte[records.buffer().remaining()];
+    records.buffer().duplicate().get(batchBytes);
+    String batchHex = java.util.HexFormat.of().formatHex(batchBytes);
+    String digest;
+    try {
+      digest = java.util.HexFormat.of().formatHex(java.security.MessageDigest.getInstance("SHA-1")
+          .digest(java.util.HexFormat.of().parseHex(batchHex)));
+    } catch (java.security.NoSuchAlgorithmException error) { throw new IllegalStateException(error); }
+    String fields = "{\"transactionalId\":\"tx-1\",\"acks\":-1,\"timeoutMs\":1000,"
+        + "\"topics\":[{\"topic\":\"test-topic\",\"partitions\":[{\"partition\":0,\"batches\":[{"
+        + "\"producerId\":\"1000\",\"producerEpoch\":3,\"baseSequence\":7,\"recordCount\":2,"
+        + "\"transactional\":true,\"control\":false,\"digest\":\"" + digest + "\"}]}]}]}";
+    for (short version : new short[] {11, 12}) {
+      var partition = new org.apache.kafka.common.message.ProduceRequestData.PartitionProduceData()
+          .setIndex(0).setRecords(records);
+      var topic = new org.apache.kafka.common.message.ProduceRequestData.TopicProduceData()
+          .setName("test-topic").setPartitionData(List.of(partition));
+      var topics = new org.apache.kafka.common.message.ProduceRequestData.TopicProduceDataCollection();
+      topics.add(topic);
+      var request = new org.apache.kafka.common.message.ProduceRequestData().setTransactionalId("tx-1")
+          .setAcks((short) -1).setTimeoutMs(1000).setTopicData(topics);
+      var cache = new ObjectSerializationCache();
+      var buffer = ByteBuffer.allocate(request.size(cache, version));
+      request.write(new ByteBufferAccessor(buffer), cache, version);
+      String json = "{\n  \"source\": {\"generator\":\"GenerateMessageVectors.java produce\","
+          + "\"library\":\"kafka-clients 4.3.1\",\"representation\":\"Produce request body, flexible header excluded\","
+          + "\"timestamps\":[1700000000000,1700000000001],\"keys\":[\"key-0\",\"key-1\"],"
+          + "\"values\":[\"value-0\",\"value-1\"],\"headers\":[{\"trace\":\"first\"},{}],"
+          + "\"baseOffset\":0,\"leaderEpoch\":0,\"producerId\":1000,\"producerEpoch\":3,\"baseSequence\":7},\n"
+          + "  \"hex\":\"" + java.util.HexFormat.of().formatHex(buffer.array()) + "\",\n"
+          + "  \"batchHex\":\"" + batchHex + "\",\n  \"fields\":" + fields + "\n}\n";
+      Path directory = root.resolve("src/protocol/requests/produce/fixtures/java");
+      Files.createDirectories(directory);
+      Files.writeString(directory.resolve("produceRequest-v" + version + "-records.json"), json);
+    }
   }
 
   /** @return every vector this generator emits, in file order per API */

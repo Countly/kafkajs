@@ -1,0 +1,6 @@
+{
+  "source": {"generator":"GenerateMessageVectors.java produce","library":"kafka-clients 4.3.1","representation":"Produce request body, flexible header excluded","timestamps":[1700000000000,1700000000001],"keys":["key-0","key-1"],"values":["value-0","value-1"],"headers":[{"trace":"first"},{}],"baseOffset":0,"leaderEpoch":0,"producerId":1000,"producerEpoch":3,"baseSequence":7},
+  "hex":"0574782d31ffff000003e8020b746573742d746f7069630200000000700000000000000000000000630000000002d45eae870010000000010000018bcfe568000000018bcfe5680100000000000003e8000300000007000000023c0000000a6b65792d300e76616c75652d30020a74726163650a6669727374240002020a6b65792d310e76616c75652d3100000000",
+  "batchHex":"0000000000000000000000630000000002d45eae870010000000010000018bcfe568000000018bcfe5680100000000000003e8000300000007000000023c0000000a6b65792d300e76616c75652d30020a74726163650a6669727374240002020a6b65792d310e76616c75652d3100",
+  "fields":{"transactionalId":"tx-1","acks":-1,"timeoutMs":1000,"topics":[{"topic":"test-topic","partitions":[{"partition":0,"batches":[{"producerId":"1000","producerEpoch":3,"baseSequence":7,"recordCount":2,"transactional":true,"control":false,"digest":"5a5f2588066c86430d097abf41421c7bd81912b1"}]}]}]}
+}

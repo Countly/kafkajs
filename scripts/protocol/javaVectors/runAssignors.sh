@@ -6,7 +6,7 @@
 # classic group APIs.
 # The kafka-clients jar is downloaded into a temporary directory and is never committed.
 #
-# Usage: scripts/protocol/javaVectors/runAssignors.sh [assignors|messages|snappy] [output-dir] [--read-back]
+# Usage: scripts/protocol/javaVectors/runAssignors.sh [assignors|messages|snappy|produce] [output-dir] [--read-back]
 # Requires: a JDK on PATH (javac + java), 17 or newer for `messages` (it uses records), and network
 # access to Maven Central on first run, when the jars are downloaded.
 # Snappy writes fixtures to output-dir; --read-back checks encoder artifacts in that directory.
@@ -23,7 +23,7 @@ SRC_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 # Subcommand: `assignors` (the default, and what this script did before) or `messages`.
 MODE="assignors"
-if [ "${1:-}" = "assignors" ] || [ "${1:-}" = "messages" ] || [ "${1:-}" = "snappy" ]; then
+if [ "${1:-}" = "assignors" ] || [ "${1:-}" = "messages" ] || [ "${1:-}" = "snappy" ] || [ "${1:-}" = "produce" ]; then
   MODE="$1"
   shift
 fi
@@ -63,9 +63,22 @@ SLF4J_JAR="${WORK_DIR}/slf4j-api-${SLF4J_VERSION}.jar"
   -o "${SLF4J_JAR}"
 
 CP="${CLIENTS_JAR}:${SLF4J_JAR}"
-if [ "${MODE}" = "messages" ]; then
+if [ "${MODE}" = "messages" ] || [ "${MODE}" = "produce" ]; then
   javac -cp "${CP}" -d "${WORK_DIR}" "${SRC_DIR}/GenerateMessageVectors.java"
-  java -cp "${CP}:${WORK_DIR}" GenerateMessageVectors "${OUT_DIR}"
+  if [ "${MODE}" = "produce" ]; then
+    for JAR in "${CLIENTS_JAR}" "${SLF4J_JAR}"; do
+      if [ "${JAR}" = "${CLIENTS_JAR}" ]; then
+        JAR_URL="https://repo.maven.apache.org/maven2/org/apache/kafka/kafka-clients/${KAFKA_CLIENTS_VERSION}/kafka-clients-${KAFKA_CLIENTS_VERSION}.jar"
+      else
+        JAR_URL="https://repo.maven.apache.org/maven2/org/slf4j/slf4j-api/${SLF4J_VERSION}/slf4j-api-${SLF4J_VERSION}.jar"
+      fi
+      JAR_SHA1="$(curl -fsSL --max-time 90 "${JAR_URL}.sha1")"
+      [ "$(sha1sum "${JAR}" | cut -d ' ' -f 1)" = "${JAR_SHA1}" ]
+    done
+    java -cp "${CP}:${WORK_DIR}" GenerateMessageVectors produce "${OUT_DIR}"
+  else
+    java -cp "${CP}:${WORK_DIR}" GenerateMessageVectors "${OUT_DIR}"
+  fi
 else
   javac -cp "${CP}" -d "${WORK_DIR}" "${SRC_DIR}/GenerateAssignorVectors.java"
   java -cp "${CP}:${WORK_DIR}" GenerateAssignorVectors "${OUT_DIR}"

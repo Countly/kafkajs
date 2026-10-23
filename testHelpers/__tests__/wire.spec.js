@@ -1049,3 +1049,73 @@ describe('pairs agree with what a Kafka 4.3.1 broker sent', () => {
     expect(shapesAgree(shapeOf({ a: 1 }), shapeOf({ a: 1, b: 2 }))).toBe(false)
   })
 })
+
+describe('independent record-containing Produce requests', () => {
+  test.each([11, 12])(
+    'reads the Java-generated v%i batch header and reproduces its request bytes',
+    async (version) => {
+      const vector = require(
+        `../../src/protocol/requests/produce/fixtures/java/produceRequest-v${version}-records.json`
+      )
+      const pair = require(`../wire/produceV${version}`)
+      expect(pair.readRequest(Buffer.from(vector.hex, 'hex'))).toEqual(vector.fields)
+      expect(vector.fields.topics[0].partitions[0].batches[0]).toMatchObject({
+        producerId: '1000',
+        producerEpoch: 3,
+        baseSequence: 7,
+        recordCount: 2,
+        transactional: true,
+        control: false,
+      })
+      const request = require(`../../src/protocol/requests/produce/v${version}/request`)({
+        transactionalId: 'tx-1',
+        acks: -1,
+        timeout: 1000,
+        producerId: require('../../src/utils/long').fromInt(1000),
+        producerEpoch: 3,
+        topicData: [
+          {
+            topic: 'test-topic',
+            partitions: [
+              {
+                partition: 0,
+                firstSequence: 7,
+                messages: vector.source.timestamps.map((timestamp, i) => ({
+                  timestamp,
+                  key: vector.source.keys[i],
+                  value: vector.source.values[i],
+                  headers: vector.source.headers[i],
+                })),
+              },
+            ],
+          },
+        ],
+      })
+      expect((await request.encode()).buffer.toString('hex')).toBe(vector.hex)
+      expect(() =>
+        pair.readRequest(Buffer.concat([Buffer.from(vector.hex, 'hex'), Buffer.from([0])]))
+      ).toThrow(/after/)
+      expect(() => pair.readRequest(Buffer.from(vector.hex, 'hex').subarray(0, -1))).toThrow()
+    }
+  )
+
+  test('the hand-computed ApiVersions feature golden selects transaction version two', async () => {
+    const golden = expected.apiVersionsTransactionV2
+    const pair = require('../wire/apiVersionsV4')
+    expect(pair.buildResponse(golden.fields).toString('hex')).toBe(golden.hex)
+    const { decode } = require('../../src/protocol/requests/apiVersions/v4/response')
+    const decoded = await decode(Buffer.from(golden.hex, 'hex'))
+    expect(decoded.finalizedFeatures).toEqual(golden.fields.finalizedFeatures)
+    expect(Number(decoded.finalizedFeaturesEpoch)).toBe(7)
+    const TransactionVersion = require('../../src/producer/state/transactionVersion')
+    const version = new TransactionVersion()
+    expect(
+      version.begin({
+        finalizedFeaturesEpoch: Number(decoded.finalizedFeaturesEpoch),
+        finalizedFeatures: Object.fromEntries(
+          decoded.finalizedFeatures.map(({ name, ...levels }) => [name, levels])
+        ),
+      })
+    ).toEqual({ version: 2, bumpRequired: false })
+  })
+})
