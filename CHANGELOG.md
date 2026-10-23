@@ -10,12 +10,14 @@ Versions before 3.0.0 are internal alpha tags and are not published.
 #### Behavior changes
 
 - **Snappy is built in** (decode and encode, Kafka's xerial framing) instead of throwing `KafkaJSNotImplemented`. A codec you register at `CompressionCodecs[CompressionTypes.Snappy]` still takes precedence
+- **A queued or on-wire send now rejects at its delivery deadline, even while the operation it awaits has not returned.** A late answer cannot settle the send again. Expiry fences later writes and reconciles the batch's sequence state; it does not cancel a request already written. A timeout is `outcome: 'unsent'` only when no attempt carrying the records could have been written, and `outcome: 'unknown'` otherwise, including an earlier write followed by a retriable answer. Resending an unknown delivery may duplicate records. There is no escape to the old late-settlement behavior.
 
 #### Fixes
 
 #### Additions
 
 - Producers accept optional `compressionLevels: { gzip, zstd }` and direct broker Produce requests accept `compressionLevel`. Codec defaults are unchanged. LZ4 levels are unavailable in `lz4-napi` and are rejected.
+- `KafkaJSDeliveryTimeout` accepts optional `outcome: 'unsent' | 'unknown'` and copies its cause's `type` and `code` when present. An absent `outcome` says nothing about delivery; retry exhaustion, connection errors, configuration errors and broker answers do not receive it.
 
 #### Tooling
 

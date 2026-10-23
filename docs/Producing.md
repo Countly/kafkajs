@@ -32,7 +32,7 @@ const producer = kafka.producer({
 | linger | ms a batch of one partition waits in the [accumulator](#accumulator) for records from further sends before it goes out; `0` sends it at once. An integer from 0 to 2147483647 | `5` |
 | batchSize | Bytes of message keys and values at which a batch of the [accumulator](#accumulator) goes out without waiting for `linger`. An integer of at least 1 | `16384` |
 | compressionLevels | Optional `{ gzip, zstd }` levels. Gzip: -1 or 1–9; zstd: -131072–22. LZ4 and Snappy levels are rejected. | codec defaults |
-| deliveryTimeout | Bound, in ms, on the waiting and the retries of one `send()`/`sendBatch()`. Past it the send rejects with `KafkaJSDeliveryTimeout`, its `cause` the last error; running out of `retry.retries` first still rejects with `KafkaJSNumberOfRetriesExceeded`. A request already sent settles on its answer or on `requestTimeout`, so a send can end up to `requestTimeout` after `deliveryTimeout`; the Java client fails such a batch at the deadline. An integer of at least `linger + requestTimeout` - 30005 with both defaults - and at most 2147483647. On every producer the bound runs from the moment the send is made, so it includes waiting for `linger` and, on an idempotent producer, for the producer id, as in the Java client. | unset (no deadline) |
+| deliveryTimeout | Bound, in ms, on the waiting and the retries of one `send()`/`sendBatch()`. Past it the send rejects with `KafkaJSDeliveryTimeout`, its `cause` the last error; running out of `retry.retries` first still rejects with `KafkaJSNumberOfRetriesExceeded`. A queued or on-wire send settles at its delivery deadline, even while the operation it awaits has not returned. A late answer does not settle it again. An integer of at least `linger + requestTimeout` - 30005 with both defaults - and at most 2147483647. On every producer the bound runs from the moment the send is made, so it includes waiting for `linger` and, on an idempotent producer, for the producer id, as in the Java client. | unset (no deadline) |
 
 ## <a name="idempotence"></a> Idempotence
 
@@ -50,7 +50,11 @@ Idempotence costs a little when each send is awaited before the next is made, at
 
 ### <a name="delivery-timeout"></a> Delivery timeout
 
-`deliveryTimeout` bounds the waiting and the retries of one `send()` or `sendBatch()` (KIP-91). A request already sent settles on its answer or on `requestTimeout`, so a send can end up to `requestTimeout` after `deliveryTimeout`; the Java client fails such a batch at the deadline. It has no default; when it is set it must be at least `linger + requestTimeout` (30005 ms with both defaults), so that one request can complete after the accumulator's wait, and at most 2147483647, the longest delay a Node.js timer takes.
+`deliveryTimeout` bounds the waiting and the retries of one `send()` or `sendBatch()` (KIP-91). A queued or on-wire send settles at its delivery deadline, even while the operation it awaits has not returned. A late answer does not settle it again. It has no default; when it is set it must be at least `linger + requestTimeout` (30005 ms with both defaults), so that one request can complete after the accumulator's wait, and at most 2147483647, the longest delay a Node.js timer takes.
+
+`KafkaJSDeliveryTimeout.outcome` is `'unsent'` only when no attempt carrying the records could have been written; otherwise it is `'unknown'`. An earlier written attempt keeps the result unknown even if a later answer was retriable. Its absence says nothing about delivery: retry exhaustion, connection errors and broker answers do not carry this annotation. A timeout copies the last cause's `type` and `code` when present. Resending an unknown delivery may duplicate records.
+
+With `enforceRequestTimeout: false`, an outstanding request can retain its records until its answer or connection failure even though the send has already rejected. The deadline fences later work; it does not cancel the socket request.
 
 ```javascript
 const producer = kafka.producer({ deliveryTimeout: 120000 })

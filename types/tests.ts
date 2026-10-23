@@ -1121,3 +1121,12 @@ declare const compressionLevelBroker: import('./index').Broker
 compressionLevelBroker.produce({
   topicData: [], compression: CompressionTypes.GZIP, compressionLevel: 1,
 })
+
+const deliveryEvidence = new KafkaJSDeliveryTimeout('delivery deadline passed', {
+  cause: new Error('last failure'),
+  outcome: 'unknown',
+})
+const maybeDelivered: 'unsent' | 'unknown' | undefined = deliveryEvidence.outcome
+new KafkaJSDeliveryTimeout('retry deadline passed')
+// @ts-expect-error an outcome is a transmission classification
+new KafkaJSDeliveryTimeout('delivery deadline passed', { outcome: 'sent' })

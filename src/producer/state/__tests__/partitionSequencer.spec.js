@@ -727,7 +727,7 @@ describe('PartitionSequencer', () => {
     })
 
     test('an earlier batch completing late with its own offset leaves the higher offset', () => {
-      const sequencer = build()
+      const sequencer = build(PIPELINED)
       const batches = [createBatch(), createBatch()]
       sequencer.enqueue(batches)
       drain(sequencer)
@@ -1077,15 +1077,17 @@ describe('PartitionSequencer', () => {
   })
 
   describe('the unresolved sequence', () => {
-    test('is never set by a batch that expired before any re-send', () => {
+    test('marks the sequence of a first written attempt that expires', () => {
       const sequencer = build()
       const [batch] = send(sequencer, createBatch())
 
       sequencer.markUnresolved(batch)
       sequencer.fail(batch)
 
-      expect(sequencer.entry(TOPIC, 0).unresolvedNextSequence).toBeNull()
-      expect(sequencer.resolveUnresolved()).toEqual([])
+      expect(sequencer.entry(TOPIC, 0).unresolvedNextSequence).toBe(5)
+      expect(sequencer.resolveUnresolved()).toEqual([
+        { topic: TOPIC, partition: 0, outcome: 'gap' },
+      ])
     })
 
     test('is set past an expired re-send, and stops new batches but not re-sends', () => {
@@ -1552,5 +1554,183 @@ describe('PartitionSequencer', () => {
       expect(sequencer.advance(TOPIC, 0, -7)).toEqual(0)
       expect(sequencer.nextSequence(TOPIC, 0)).toEqual(0)
     })
+  })
+})
+
+describe('PartitionSequencer delivery incarnations', () => {
+  it('disposes from the captured entry without recreating a removed partition', () => {
+    const sequencer = build()
+    const [old] = send(sequencer, createBatch())
+    sequencer.rebase(old)
+    expect(sequencer.entry(TOPIC, 0)).toBeNull()
+    sequencer.complete(old, { baseOffset: '80' })
+    expect(old.entry.inFlight).toEqual([])
+    expect(sequencer.entry(TOPIC, 0)).toBeNull()
+  })
+
+  it.each([false, true])(
+    'does not acknowledge a superseded incarnation, duplicate %s',
+    (duplicate) => {
+      const sequencer = build()
+      const [old] = send(sequencer, createBatch())
+      const incarnation = old.incarnation
+      sequencer.restartPartition(TOPIC, 0)
+      expect(old.entry.incarnation).toBeGreaterThan(incarnation)
+      sequencer.complete(old, duplicate ? { duplicate: true } : { baseOffset: '80' })
+      expect(old.entry.inFlight).toEqual([])
+      expect(sequencer.entry(TOPIC, 0)).toMatchObject({
+        lastAckedSequence: -1,
+        lastAckedOffset: -1,
+      })
+    }
+  )
+
+  it('keeps a recreated partition unchanged when its old entry is disposed', () => {
+    const sequencer = build()
+    const [old] = send(sequencer, createBatch())
+    sequencer.rebase(old)
+    const [fresh] = send(sequencer, createBatch())
+    const before = sequencer.entry(TOPIC, 0)
+    expect(fresh.entry).not.toBe(old.entry)
+    expect(fresh.incarnation).toBeGreaterThan(old.incarnation)
+    sequencer.complete(old, { baseOffset: '80' })
+    expect(sequencer.entry(TOPIC, 0)).toEqual(before)
+  })
+
+  it('acknowledges another partition across two epoch bumps without skipping disposal', () => {
+    const sequencer = build()
+    const old = createBatch({ partition: 1 })
+    const trigger = createBatch({ partition: 0 })
+    send(sequencer, trigger, old)
+    const incarnation = old.incarnation
+    sequencer.restartPartition(TOPIC, 0)
+    sequencer.markStaleExcept(TOPIC, 0)
+    sequencer.restartPartition(TOPIC, 0)
+    sequencer.markStaleExcept(TOPIC, 0)
+    expect(old.entry.incarnation).toBe(incarnation)
+    sequencer.complete(old, { baseOffset: '80' })
+    expect(sequencer.entry(TOPIC, 1)).toMatchObject({
+      lastAckedSequence: 4,
+      lastAckedOffset: 84,
+      inFlight: [],
+    })
+    expect(drain(sequencer, BUMPED)).toEqual([])
+  })
+
+  it('returns an unwritten refused attempt to its original order without retry or backoff', () => {
+    const sequencer = build()
+    const [batch] = send(sequencer, createBatch())
+    sequencer.requeue(batch, 0, { counted: false })
+    expect(batch.attempt).toBe(0)
+    expect(batch.backoffUntil).toBe(0)
+    expect(drain(sequencer)).toEqual([batch])
+    expect(batch.firstSequence).toBe(0)
+  })
+})
+
+describe('sequence reset boundaries', () => {
+  test('resetPartition invalidates a late acknowledgement before restart', () => {
+    const sequencer = build()
+    const [old] = send(sequencer, createBatch())
+    const incarnation = old.incarnation
+    sequencer.resetPartition(TOPIC, 0)
+    expect(old.entry.incarnation).toBeGreaterThan(incarnation)
+    sequencer.complete(old, { baseOffset: '80' })
+    expect(old.entry.inFlight).toEqual([])
+    expect(sequencer.entry(TOPIC, 0)).toMatchObject({ lastAckedSequence: -1, lastAckedOffset: -1 })
+  })
+
+  test('resetAll assigns fresh incarnations to kept queued entries', () => {
+    const sequencer = build()
+    const [old] = send(sequencer, createBatch())
+    sequencer.complete(old, { baseOffset: '0' })
+    const queued = createBatch()
+    sequencer.enqueue([queued])
+    sequencer.resetAll()
+    expect(drain(sequencer)).toEqual([queued])
+    expect(queued.entry).not.toBe(old.entry)
+    expect(queued.incarnation).toBeGreaterThan(old.incarnation)
+    const before = sequencer.entry(TOPIC, 0)
+    sequencer.complete(old, { baseOffset: '80' })
+    expect(sequencer.entry(TOPIC, 0)).toEqual(before)
+  })
+})
+
+describe('settlement without a live numbered range', () => {
+  test('ignores completion, failure, rebase and gap marking for an unregistered batch', () => {
+    const sequencer = build()
+    const batch = createBatch()
+    sequencer.complete(batch, { baseOffset: '80' })
+    sequencer.fail(batch)
+    sequencer.rebase(batch)
+    sequencer.markUnresolved(batch)
+    expect(sequencer.entry(TOPIC, 0)).toBeNull()
+    expect(sequencer.resolveUnresolved()).toEqual([])
+  })
+
+  test('does not mark an unnumbered queued batch unresolved', () => {
+    const sequencer = build()
+    const queued = createBatch()
+    sequencer.enqueue([queued])
+    const before = sequencer.entry(TOPIC, 0)
+    sequencer.markUnresolved(queued)
+    expect(sequencer.entry(TOPIC, 0)).toEqual(before)
+    expect(sequencer.resolveUnresolved()).toEqual([])
+    expect(drain(sequencer)).toEqual([queued])
+    expect(queued.firstSequence).toBe(0)
+  })
+
+  test('does not rebase a numbered response snapshot absent from the in-flight list', () => {
+    const sequencer = build()
+    const [batch] = send(sequencer, createBatch())
+    const snapshot = { ...batch }
+    delete snapshot.entry
+    const before = sequencer.entry(TOPIC, 0)
+    sequencer.rebase(snapshot)
+    expect(sequencer.entry(TOPIC, 0)).toEqual(before)
+    expect(batch.entry.inFlight).toEqual([batch])
+  })
+
+  test('does not rebase an unstamped retry before its restart is drained', () => {
+    const sequencer = build()
+    const [batch] = send(sequencer, createBatch())
+    sequencer.restartPartition(TOPIC, 0)
+    const before = sequencer.entry(TOPIC, 0)
+    sequencer.rebase(batch)
+    expect(sequencer.entry(TOPIC, 0)).toEqual(before)
+    expect(batch.entry.inFlight).toEqual([batch])
+  })
+
+  test('does not mark or rebase a captured entry after its replacement is created', () => {
+    const sequencer = build()
+    const [old] = send(sequencer, createBatch())
+    sequencer.rebase(old)
+    const [fresh] = send(sequencer, createBatch())
+    const before = sequencer.entry(TOPIC, 0)
+    sequencer.markUnresolved(old)
+    sequencer.rebase(old)
+    expect(sequencer.entry(TOPIC, 0)).toEqual(before)
+    expect(fresh.entry.inFlight).toEqual([fresh])
+    expect(sequencer.resolveUnresolved()).toEqual([])
+  })
+
+  test('rejects a stamped obsolete attempt but retains its unstamped pending retry gap', () => {
+    const sequencer = build()
+    const [batch] = send(sequencer, createBatch({ records: 1 }))
+    const obsolete = { ...batch }
+    const incarnation = batch.incarnation
+    sequencer.restartPartition(TOPIC, 0)
+    expect(batch.incarnation).toBe(incarnation)
+    expect(batch.producerEpoch).toBeNull()
+    sequencer.markUnresolved(obsolete)
+    expect(sequencer.entry(TOPIC, 0).unresolvedNextSequence).toBeNull()
+    sequencer.markUnresolved(batch)
+    expect(sequencer.entry(TOPIC, 0)).toMatchObject({
+      unresolvedNextSequence: 1,
+      lastAckedSequence: -1,
+      lastAckedOffset: -1,
+    })
+    sequencer.fail(batch)
+    expect(sequencer.resolveUnresolved()).toEqual([{ topic: TOPIC, partition: 0, outcome: 'gap' }])
   })
 })

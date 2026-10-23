@@ -214,7 +214,14 @@ const whereASendPathFailureGoes = ({ linger, batchSize }) => {
  * `linger` or `batchSize` is given.
  */
 const createLingeringProducer = ({ produce, partitions = 2, ...options } = {}) => {
-  const cluster = createFakeCluster({ partitions, produce })
+  const cluster = createFakeCluster({
+    partitions,
+    produce: (request) => {
+      const refusal = request.guard?.(100)
+      if (refusal) throw refusal
+      return produce ? produce(request) : accepted(request)
+    },
+  })
   Object.assign(cluster.broker, {
     finalizedFeatures: { 'transaction.version': { minVersionLevel: 0, maxVersionLevel: 2 } },
     finalizedFeaturesEpoch: 1,
@@ -2484,7 +2491,7 @@ describe('Producer > the accumulator', () => {
           expect(partitionsSent(produced)).toEqual([[1]])
         })
 
-        test('the batches that are sent retry only until the earliest of their own deadlines', async () => {
+        test('the batches that are sent each retry until their own delivery deadline', async () => {
           const { producer } = agingProducer({
             linger: 200,
             deliveryTimeout: 400,
@@ -2496,16 +2503,23 @@ describe('Producer > the accumulator', () => {
           const older = sendTo(producer, 0)
           await jest.advanceTimersByTimeAsync(150)
           const younger = sendTo(producer, 1)
-          const bothSettled = settledFlag(Promise.all([older, younger]))
+          const olderSettled = settledFlag(older)
+          const youngerSettled = settledFlag(younger)
           await jest.advanceTimersByTimeAsync(230)
-          expect(bothSettled()).toBe(false)
-
-          const errors = await settledWithin(Promise.all([older, younger]), 30)
-
-          expect(errors).toEqual([
-            expect.any(KafkaJSDeliveryTimeout),
-            expect.any(KafkaJSDeliveryTimeout),
-          ])
+          expect(olderSettled()).toBe(false)
+          expect(youngerSettled()).toBe(false)
+          await jest.advanceTimersByTimeAsync(20)
+          expect(olderSettled()).toBe(true)
+          expect(youngerSettled()).toBe(false)
+          expect(await older).toMatchObject({ name: 'KafkaJSDeliveryTimeout', outcome: 'unknown' })
+          await jest.advanceTimersByTimeAsync(149)
+          expect(youngerSettled()).toBe(false)
+          await jest.advanceTimersByTimeAsync(1)
+          expect(youngerSettled()).toBe(true)
+          expect(await younger).toMatchObject({
+            name: 'KafkaJSDeliveryTimeout',
+            outcome: 'unknown',
+          })
         })
       })
 
@@ -2770,7 +2784,7 @@ describe('Producer > the accumulator', () => {
         },
       ],
     ])(
-      'a held send rejects at its delivery deadline, set by %s, while the batch before it is unanswered',
+      'an on-wire expiry, set by %s, releases a queued batch before its own deadline',
       async (_, deadline) => {
         const answer = deferred()
         const { producer, produced } = createLingeringProducer({
@@ -2784,19 +2798,28 @@ describe('Producer > the accumulator', () => {
         })
         await producer.connect()
 
-        const first = producer.send({ topic: TOPIC, messages: [{ value: 'a' }] })
-        await jest.advanceTimersByTimeAsync(20)
-        const held = producer.send({ topic: TOPIC, messages: [{ value: 'b' }] }).catch((e) => e)
-        const settled = settledFlag(held)
-        await jest.advanceTimersByTimeAsync(299)
-        expect(settled()).toBe(false)
-
-        const error = await settledWithin(held, 1)
-
-        expect(error).toBeInstanceOf(KafkaJSDeliveryTimeout)
-        expect(produced().map(({ partitions }) => partitions[0].values)).toEqual([['a']])
-        answer.resolve()
-        await settledWithin(first)
+        const first = producer.send({ topic: TOPIC, messages: [{ value: 'a' }] }).catch((e) => e)
+        let held
+        try {
+          await jest.advanceTimersByTimeAsync(20)
+          held = producer.send({ topic: TOPIC, messages: [{ value: 'b' }] }).catch((e) => e)
+          const firstSettled = settledFlag(first)
+          const heldSettled = settledFlag(held)
+          await jest.advanceTimersByTimeAsync(279)
+          expect(firstSettled()).toBe(false)
+          expect(heldSettled()).toBe(false)
+          await jest.advanceTimersByTimeAsync(1)
+          expect(firstSettled()).toBe(true)
+          expect(await first).toMatchObject({ name: 'KafkaJSDeliveryTimeout', outcome: 'unknown' })
+          await jest.advanceTimersByTimeAsync(10)
+          expect(Date.now()).toBeLessThan(320)
+          expect(await settledWithin(held)).toEqual([expect.objectContaining({ partition: 0 })])
+          expect(produced().map(({ partitions }) => partitions[0].values)).toEqual([['a'], ['b']])
+        } finally {
+          answer.resolve()
+          await jest.advanceTimersByTimeAsync(1000)
+          await Promise.all([first, held])
+        }
       }
     )
 

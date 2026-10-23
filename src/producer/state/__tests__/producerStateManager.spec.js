@@ -1477,3 +1477,86 @@ describe('Producer > state > ProducerStateManager', () => {
     })
   })
 })
+
+describe('the sequence consequence of a deadline', () => {
+  test('returns a never-written numbered range without marking it unresolved', async () => {
+    const manager = await idempotentManager()
+    const [batch] = send(manager, createBatch())
+    const error = new KafkaJSDeliveryTimeout('deadline', { outcome: 'unsent' })
+    expect(manager.fail(batch, error, { transmitted: false })).toBe('FAIL_BATCH')
+    expect(manager.sequencer.entry(TOPIC, 0)).toBeNull()
+    const [next] = send(manager, createBatch())
+    expect(next).toMatchObject({ firstSequence: 0, producerEpoch: 0 })
+  })
+})
+
+describe('a timeout retains its own state consequence', () => {
+  test('a duplicate cause code cannot turn expiry into a duplicate acknowledgement', async () => {
+    const manager = await idempotentManager()
+    const [batch] = send(manager, createBatch())
+    const error = new KafkaJSDeliveryTimeout('deadline', { cause: failure(46), outcome: 'unknown' })
+    expect(error.code).toBe(46)
+    expect(manager.fail(batch, error, { transmitted: true })).toBe('FAIL_BATCH')
+    expect(manager.sequencer.entry(TOPIC, 0)).toMatchObject({
+      unresolvedNextSequence: 5,
+      lastAckedSequence: -1,
+    })
+  })
+})
+
+describe('a written retry waiting after restart', () => {
+  test('retains the unresolved range before its new producer stamp is assigned', async () => {
+    const manager = await idempotentManager({
+      retry: { retries: 10, initialRetryTime: 2000, maxRetryTime: 2000, factor: 0 },
+    })
+    const batch = createBatch({ records: 1 })
+    send(manager, batch)
+    const incarnation = batch.incarnation
+    expect(manager.fail(batch, failure(45))).toBe('BUMP_EPOCH')
+    manager.sequencer.requeue(batch, Date.now() + 2000)
+    expect(batch).toMatchObject({ producerEpoch: null, incarnation, firstSequence: 0, attempt: 1 })
+    expect(batch.entry.incarnation).toBeGreaterThan(incarnation)
+    expect(
+      manager.fail(batch, new KafkaJSDeliveryTimeout('deadline', { outcome: 'unknown' }), {
+        transmitted: true,
+      })
+    ).toBe('FAIL_BATCH')
+    expect(manager.sequencer.entry(TOPIC, 0)).toMatchObject({
+      unresolvedNextSequence: 1,
+      lastAckedSequence: -1,
+      lastAckedOffset: -1,
+      inFlight: [],
+      queued: [],
+    })
+    const next = createBatch({ records: 1 })
+    expect(send(manager, next)).toEqual([next])
+    expect([next.producerEpoch, next.firstSequence]).toEqual([2, 0])
+  })
+})
+
+describe('a never-written expiry before or after numbering', () => {
+  test.each([
+    ['idempotent queued', idempotentManager, false, READY],
+    ['transactional queued', transactionalManager, false, ABORTABLE_ERROR],
+    ['transactional numbered', transactionalManager, true, ABORTABLE_ERROR],
+  ])(
+    '%s releases the batch and preserves its transaction consequence',
+    async (_, factory, numbered, state) => {
+      const manager = await factory()
+      const batch = createBatch({ records: 1 })
+      manager.enqueue([batch])
+      if (numbered) expect(manager.drain(NODE, LEADERS)).toEqual([batch])
+      else expect(batch.firstSequence).toBeNull()
+      const error = new KafkaJSDeliveryTimeout('deadline', { outcome: 'unsent' })
+      expect(manager.fail(batch, error, { transmitted: false })).toBe('FAIL_BATCH')
+      expect(manager.state()).toBe(state)
+      expect(manager.sequencer.entry(TOPIC, 0)).toBeNull()
+      expect(manager.sequencer.resolveUnresolved()).toEqual([])
+      if (state === ABORTABLE_ERROR) expect(manager.transaction.armedError().cause).toBe(error)
+      else {
+        const [next] = send(manager, createBatch({ records: 1 }))
+        expect([next.producerEpoch, next.firstSequence]).toEqual([0, 0])
+      }
+    }
+  )
+})

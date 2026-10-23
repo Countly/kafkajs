@@ -62,6 +62,7 @@ describe('Retry > maxTotalTime, the delay clamp and the shared backoff', () => {
     // 0, +100, +200, +400; the next wait, 800 ms from 700, would end at 1500.
     expect(attempts.map(({ at }) => at)).toEqual([0, 100, 300, 700])
     expect(outcome.error).toBeInstanceOf(KafkaJSDeliveryTimeout)
+    expect(outcome.error).not.toHaveProperty('outcome')
     expect(outcome.error).toMatchObject({
       name: 'KafkaJSDeliveryTimeout',
       retriable: false,

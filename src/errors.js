@@ -487,12 +487,19 @@ class KafkaJSInvalidConfigurationError extends KafkaJSNonRetriableError {
 class KafkaJSDeliveryTimeout extends KafkaJSNonRetriableError {
   /**
    * @param {Error|string} e
-   * @param {{ cause?: Error }} [options]
+   * @param {{ cause?: Error, outcome?: 'unsent'|'unknown' }} [options]
    */
-  constructor(e, { cause } = {}) {
+  constructor(e, { cause, outcome } = {}) {
     super(e, { cause })
     this.name = 'KafkaJSDeliveryTimeout'
     this.category = 'abortable'
+    if (outcome !== undefined) this.outcome = outcome
+    for (const key of ['type', 'code']) {
+      try {
+        const value = cause?.[key]
+        if (value !== undefined) this[key] = value
+      } catch {}
+    }
   }
 }
 

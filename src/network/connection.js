@@ -668,7 +668,7 @@ module.exports = class Connection {
    *
    * @param {number} [protocol.requestTimeout=null] Override for the default requestTimeout
    * @param {boolean} [protocol.logResponseError=true] Whether to log errors
-   * @param {() => Error|null} [protocol.guard=null] A pre-write check. It runs once the request is
+   * @param {(frameLength?: number) => Error|null} [protocol.guard=null] A pre-write check. It runs once the request is
    *                         encoded and again at the instant of transmission; an error it returns
    *                         rejects this one request, which is then written nowhere, takes no
    *                         in-flight slot and leaves the connection open.
@@ -742,7 +742,7 @@ module.exports = class Connection {
   /**
    * Authenticates when needed and encodes the request under the next correlation id.
    * @private
-   * @param {{ request: object, expectResponse: boolean, guard: (() => Error|null)|null }} options
+   * @param {{ request: object, expectResponse: boolean, guard: ((frameLength?: number) => Error|null)|null }} options
    * @returns {Promise<{ request: object, expectResponse: boolean, correlationId: number,
    *   requestPayload: object }>}
    * @throws {Error} the error the guard returns, once the request is authenticated and encoded
@@ -779,7 +779,7 @@ module.exports = class Connection {
    * @param {number|null} requestTimeout
    * @param {number} attempt the `connectAttempt` the request was sent under; a request of an older
    *   attempt is refused
-   * @param {(() => Error|null)|null} guard checked again by the queue at transmission
+   * @param {((frameLength?: number) => Error|null)|null} guard checked again by the queue at transmission
    * @returns {{ answered: Promise<{ correlationId: number, size: number, entry: object,
    *   payload: Buffer }> }} `answered` settles with the response frame; wrapped so that waiting
    *   for the push does not wait for the response
@@ -801,6 +801,7 @@ module.exports = class Connection {
           expectResponse,
           requestTimeout,
           guard,
+          frameLength: requestPayload.buffer.length,
           sendRequest: () => {
             this.socket.write(requestPayload.buffer, 'binary')
           },

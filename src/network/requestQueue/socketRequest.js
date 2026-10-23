@@ -32,7 +32,7 @@ const REQUEST_STATE = {
  * @property {Function} send
  * @property {Function} timeout
  * @property {Function} afterTimeout
- * @property {() => Error|null} guard
+ * @property {(frameLength?: number) => Error|null} guard
  *
  * @typedef {Object} RequestEntry
  * @property {string} apiKey
@@ -50,11 +50,12 @@ module.exports = class SocketRequest {
    * @param {string} options.clientId
    * @param {RequestEntry} options.entry
    * @param {boolean} options.expectResponse
+   * @param {number} [options.frameLength] complete frame bytes, supplied to the transmission guard
    * @param {Function} options.send
    * @param {() => void} options.timeout bookkeeping the queue does when this request times out
    * @param {(socketRequest: SocketRequest) => void} [options.afterTimeout] called once the request was rejected with its own
    *   timeout error, before the `NETWORK_REQUEST_TIMEOUT` event
-   * @param {() => Error|null} [options.guard] checked by `refusal()` before the request is written
+   * @param {(frameLength?: number) => Error|null} [options.guard] checked by `refusal()` before the request is written
    * @param {import("../../instrumentation/emitter")} [options.instrumentationEmitter=null]
    * @param {import("../../../types").Logger} [options.logger] where a failing event listener is logged
    */
@@ -68,6 +69,7 @@ module.exports = class SocketRequest {
     timeout,
     afterTimeout = null,
     guard = null,
+    frameLength,
     instrumentationEmitter = null,
     logger = null,
   }) {
@@ -82,6 +84,7 @@ module.exports = class SocketRequest {
     this.timeoutHandler = timeout
     this.afterTimeout = afterTimeout
     this.guard = guard
+    this.frameLength = frameLength
     this.logger = logger
 
     this.sentAt = null
@@ -104,7 +107,7 @@ module.exports = class SocketRequest {
     }
 
     try {
-      return this.guard()
+      return this.guard(this.frameLength)
     } catch (error) {
       return isNativeError(error)
         ? error

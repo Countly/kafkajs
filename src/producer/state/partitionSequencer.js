@@ -90,9 +90,11 @@ const offsetOf = (offset) => (offset == null ? NO_OFFSET : Number(offset))
  * Creates the state of a partition that has never been used.
  * @param {string} topic
  * @param {number} partition
+ * @param {number} incarnation sequencer-wide creation or reset stamp
  * @returns {PartitionEntry}
  */
-const createEntry = (topic, partition) => ({
+const createEntry = (topic, partition, incarnation) => ({
+  incarnation,
   topic,
   partition,
   nextSequence: 0,
@@ -129,6 +131,8 @@ const restartedSinceSent = (entry) =>
  * @property {string|number|null} producerId the producer id the batch's sequence belongs to;
  *   stamped when the batch is drained without one, cleared by a restart
  * @property {number|null} producerEpoch the epoch that goes with `producerId`
+ * @property {PartitionEntry} [entry] captured when numbered; disposal never creates a replacement
+ * @property {number} [incarnation] entry stamp captured when numbered
  * @property {number} attempt 0 before the first re-send; one more per `requeue()`
  * @property {Array<{ resolve: Function, reject: Function }>} settlers
  * @property {number} backoffUntil 0, or the time before which the batch may not be re-sent
@@ -175,6 +179,7 @@ const restartedSinceSent = (entry) =>
  */
 class PartitionSequencer {
   #logger
+  #incarnation = 0
   #maxInFlightPerPartition
   /** @type {Map<string, Map<number, PartitionEntry>>} */
   #topics = new Map()
@@ -279,6 +284,8 @@ class PartitionSequencer {
         }
 
         if (head.producerEpoch == null) {
+          head.entry = entry
+          head.incarnation = entry.incarnation
           head.producerId = gate.producerId
           head.producerEpoch = gate.producerEpoch
         }
@@ -305,22 +312,24 @@ class PartitionSequencer {
    * @returns {void}
    */
   complete(batch, result) {
-    const entry = this.#entryFor(batch.topic, batch.partition)
-    removeFrom(entry.inFlight, batch)
-    batch.sequenceReset = false
-    const lastSequence = lastSequenceOf(batch)
-    if (isForward(lastSequence, entry.lastAckedSequence)) {
-      entry.lastAckedSequence = lastSequence
+    const entry = batch.entry
+    if (entry === undefined) return
+    this.#remove(entry, batch)
+    if (
+      this.#lookup(batch.topic, batch.partition) !== entry ||
+      batch.incarnation !== entry.incarnation
+    ) {
+      this.#dropIfIdle(entry)
+      return
     }
-
+    const lastSequence = lastSequenceOf(batch)
+    if (isForward(lastSequence, entry.lastAckedSequence)) entry.lastAckedSequence = lastSequence
     const baseOffset = result.duplicate ? NO_OFFSET : offsetOf(result.baseOffset)
-    if (baseOffset >= 0) {
+    if (baseOffset >= 0)
       entry.lastAckedOffset = Math.max(
         entry.lastAckedOffset,
         baseOffset + batch.messages.length - 1
       )
-    }
-
     this.#dropIfIdle(entry)
   }
 
@@ -332,7 +341,8 @@ class PartitionSequencer {
    * @returns {void}
    */
   fail(batch) {
-    const entry = this.#entryFor(batch.topic, batch.partition)
+    const entry = batch.entry || this.#lookup(batch.topic, batch.partition)
+    if (entry === undefined) return
     this.#remove(entry, batch)
     this.#dropIfIdle(entry)
   }
@@ -347,11 +357,12 @@ class PartitionSequencer {
    * @see https://github.com/apache/kafka/blob/4.3/clients/src/main/java/org/apache/kafka/clients/producer/internals/RecordAccumulator.java
    * @param {PartitionBatch} batch a batch in flight
    * @param {number} backoffUntil the time before which it may not be drained
+   * @param {{ counted?: boolean }} [options] false only for an unwritten private refusal
    * @returns {void}
    */
-  requeue(batch, backoffUntil) {
+  requeue(batch, backoffUntil, { counted = true } = {}) {
     const { queued, inFlight } = this.#entryFor(batch.topic, batch.partition)
-    batch.attempt += 1
+    if (counted) batch.attempt += 1
     batch.backoffUntil = backoffUntil
 
     const rank = inFlight.indexOf(batch)
@@ -460,9 +471,16 @@ class PartitionSequencer {
    * @returns {void}
    */
   rebase(batch) {
-    const entry = this.#entryFor(batch.topic, batch.partition)
+    const entry = batch.entry || this.#lookup(batch.topic, batch.partition)
+    if (
+      entry === undefined ||
+      this.#lookup(batch.topic, batch.partition) !== entry ||
+      batch.incarnation !== entry.incarnation
+    )
+      return
     const count = batch.messages.length
     const position = entry.inFlight.indexOf(batch)
+    if (position < 0) return
     this.#remove(entry, batch)
     entry.nextSequence = subtractSequence(entry.nextSequence, count)
     for (let index = position; index < entry.inFlight.length; index += 1) {
@@ -567,6 +585,7 @@ class PartitionSequencer {
     entry.lastAckedOffset = NO_OFFSET
     this.#clearUnresolved(entry)
     if (entry.inFlight.length > 0) {
+      entry.incarnation = ++this.#incarnation
       entry.stale = true
       return
     }
@@ -591,7 +610,7 @@ class PartitionSequencer {
       }
 
       if (entry.queued.size > 0) {
-        const fresh = createEntry(entry.topic, entry.partition)
+        const fresh = createEntry(entry.topic, entry.partition, ++this.#incarnation)
         fresh.queued = entry.queued
         if (!kept.has(entry.topic)) {
           kept.set(entry.topic, new Map())
@@ -605,22 +624,23 @@ class PartitionSequencer {
   }
 
   /**
-   * Records that a batch which had already been re-sent (`attempt > 0`) expired without a
-   * definitive answer, so the broker may hold sequences the client cannot account for. Until the
+   * Records that a numbered batch with transmission history expired without a definitive answer, so the broker may hold sequences the client cannot account for. Until the
    * partition has nothing in flight and `resolveUnresolved()` settles it, the drain numbers
    * nothing new there, and a 45 for the batch at the unresolved sequence counts as the next one.
-   * The mark only moves forward, across the wrap too. A batch never re-sent leaves nothing
-   * unresolved.
+   * The caller establishes transmission history; an unstamped pending restart can mark its live entry despite its old incarnation, but a stamped obsolete attempt cannot.
+   * The mark only moves forward, across the wrap too.
    * @see https://github.com/apache/kafka/blob/4.3/clients/src/main/java/org/apache/kafka/clients/producer/internals/Sender.java
    * @param {PartitionBatch} batch
    * @returns {void}
    */
   markUnresolved(batch) {
-    if (batch.attempt === 0) {
+    const entry = batch.entry || this.#lookup(batch.topic, batch.partition)
+    if (entry === undefined || batch.firstSequence === null) return
+    if (
+      this.#lookup(batch.topic, batch.partition) !== entry ||
+      (batch.incarnation !== entry.incarnation && batch.producerEpoch != null)
+    )
       return
-    }
-
-    const entry = this.#entryFor(batch.topic, batch.partition)
     const next = addSequence(batch.firstSequence, batch.messages.length)
     const current = entry.unresolvedNextSequence
     entry.unresolvedNextSequence = current === null || isForward(next, current) ? next : current
@@ -780,6 +800,8 @@ class PartitionSequencer {
       this.#restart(entry)
     }
 
+    batch.entry = entry
+    batch.incarnation = entry.incarnation
     batch.firstSequence = entry.nextSequence
     entry.nextSequence = addSequence(entry.nextSequence, batch.messages.length)
     entry.inFlight.push(batch)
@@ -792,6 +814,7 @@ class PartitionSequencer {
    * @returns {void}
    */
   #restart(entry) {
+    entry.incarnation = ++this.#incarnation
     let sequence = 0
     for (const batch of entry.inFlight) {
       batch.firstSequence = sequence
@@ -855,6 +878,7 @@ class PartitionSequencer {
     }
 
     const partitions = this.#topics.get(entry.topic)
+    if (partitions?.get(entry.partition) !== entry) return
     partitions.delete(entry.partition)
     if (partitions.size === 0) {
       this.#topics.delete(entry.topic)
@@ -899,7 +923,7 @@ class PartitionSequencer {
 
     let entry = partitions.get(id)
     if (entry === undefined) {
-      entry = createEntry(topic, id)
+      entry = createEntry(topic, id, ++this.#incarnation)
       partitions.set(id, entry)
     }
 

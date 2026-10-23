@@ -672,6 +672,8 @@ module.exports = class Broker {
    *   carrying a `transactionalId`: 1 keeps it at v11 or below; 2 sends it at v12, whose broker
    *   adds the partitions to the transaction itself (KIP-890). A transactional request never uses
    *   v13. Ignored without a `transactionalId`.
+   * @param {(frameLength?: number) => Error|null} [request.guard] private pre-write check;
+   *   the complete encoded frame length is supplied only at transmission
    * @param {boolean} [request.perPartitionResults=false] resolve every partition's outcome, a
    *   failing one included, instead of throwing the first failing partition's error. With
    *   `acks: 0` the broker sends no response, so the call resolves `undefined` either way.
@@ -697,7 +699,9 @@ module.exports = class Broker {
     maxVersion,
     transactionVersion = 1,
     perPartitionResults = false,
+    guard,
   }) {
+    this.throwIfRefused(guard)
     // The ceiling is permanent, not scaffolding: `Broker` is a public type and
     // `broker.produce({ topicData })` must keep working forever. A caller may still ask for less.
     const ceiling = produceCeiling({ transactionalId, transactionVersion, topicIds })
@@ -751,13 +755,16 @@ module.exports = class Broker {
     })
 
     if (!perPartitionResults) {
-      return await this[PRIVATE.SEND_REQUEST](protocolRequest)
+      return await this[PRIVATE.SEND_REQUEST](protocolRequest, guard)
     }
 
-    return await this[PRIVATE.SEND_REQUEST]({
-      ...protocolRequest,
-      response: { decode: protocolRequest.response.decode, parse: partitionResults },
-    })
+    return await this[PRIVATE.SEND_REQUEST](
+      {
+        ...protocolRequest,
+        response: { decode: protocolRequest.response.decode, parse: partitionResults },
+      },
+      guard
+    )
   }
 
   /**
@@ -1224,7 +1231,7 @@ module.exports = class Broker {
    *                  negotiated up to v10 (stable from Kafka 4.2) and keyed by id; otherwise it
    *                  stays at v9 or below, keyed by name. The answer names its topics either way.
    * @param {object} [options] private, for the consumer's own commits
-   * @param {() => Error|null} [options.guard] a pre-write check. It runs at entry, after the
+   * @param {(frameLength?: number) => Error|null} [options.guard] a pre-write check. It runs at entry, after the
    *   connection was acquired and connected, after the request was authenticated and encoded, and
    *   at the instant of transmission; an error it returns rejects this one request, which is then
    *   written nowhere, takes no in-flight slot and leaves the connection open.
@@ -1872,7 +1879,7 @@ module.exports = class Broker {
    * @private
    * @param {{ request: { apiKey: number } }} protocolRequest a built request, as produced by
    *                                          `lookup()`/`lookupRequestWithMax()`'s returned builder
-   * @param {(() => Error|null)|undefined} guard a pre-write check, see `offsetCommit`
+   * @param {((frameLength?: number) => Error|null)|undefined} guard a pre-write check, see `offsetCommit`
    * @returns {Promise} the broker's parsed response for `protocolRequest`
    * @throws {Error} the error of the failed request, or the one the guard returned
    */
@@ -1926,7 +1933,7 @@ module.exports = class Broker {
 
   /**
    * @private
-   * @param {(() => Error|null)|undefined} guard
+   * @param {((frameLength?: number) => Error|null)|undefined} guard
    * @throws {Error} the error the guard returns
    */
   throwIfRefused(guard) {

@@ -415,14 +415,20 @@ class ProducerStateManager {
    * @see https://github.com/apache/kafka/blob/4.3/clients/src/main/java/org/apache/kafka/clients/producer/internals/TransactionManager.java
    * @param {PartitionBatch} batch a batch that was drained and not yet settled
    * @param {Error} error the partition's error, or a `KafkaJSDeliveryTimeout` for an expired batch
-   * @param {{ logStartOffset?: string|number }} [partitionResponse={}] the partition's Produce
+   * @param {{ logStartOffset?: string|number, transmitted?: boolean }} [partitionResponse={}] the partition's Produce
    *   response, for `UNKNOWN_PRODUCER_ID`
    * @returns {Verdict}
    */
-  fail(batch, error, { logStartOffset } = {}) {
+  fail(batch, error, { logStartOffset, transmitted } = {}) {
     const expired = error instanceof KafkaJSDeliveryTimeout
+    if (expired && transmitted === false) {
+      if (batch.firstSequence !== null) this.sequencer.rebase(batch)
+      else this.sequencer.fail(batch)
+      if (this.#transactional) this.arm(error)
+      return 'FAIL_BATCH'
+    }
     const { category } = this.classify(error, 'produce')
-    const code = typeof error.code === 'number' ? error.code : undefined
+    const code = !expired && typeof error.code === 'number' ? error.code : undefined
     const verdict = this.sequencer.verdict(batch, {
       category,
       code,
@@ -453,7 +459,7 @@ class ProducerStateManager {
         }
         return verdict
       case 'FAIL_BATCH':
-        if (expired || this.#outOfRetries(batch, category)) {
+        if (expired || (batch.attempt > 0 && this.#outOfRetries(batch, category))) {
           this.sequencer.markUnresolved(batch)
         }
         this.sequencer.fail(batch)

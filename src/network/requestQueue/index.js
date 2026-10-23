@@ -150,6 +150,7 @@ module.exports = class RequestQueue extends EventEmitter {
       instrumentationEmitter: this.instrumentationEmitter,
       logger: this.logger,
       guard: pushedRequest.guard,
+      frameLength: pushedRequest.frameLength,
       requestTimeout,
       send: () => {
         if (this.inflight.has(correlationId)) {
@@ -171,9 +172,10 @@ module.exports = class RequestQueue extends EventEmitter {
    * @typedef {Object} PushedRequest
    * @property {import("./socketRequest").RequestEntry} entry
    * @property {boolean} expectResponse
+   * @property {number} [frameLength] complete encoded frame bytes, including the length prefix
    * @property {Function} sendRequest
    * @property {number} [requestTimeout]
-   * @property {() => Error|null} [guard] checked just before the request is written; an error it
+   * @property {(frameLength?: number) => Error|null} [guard] checked just before the request is written; an error it
    *   returns rejects the request, which is then written nowhere and takes no in-flight slot
    *
    * @public

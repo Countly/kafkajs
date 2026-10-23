@@ -18,6 +18,7 @@ const { isArmed } = require('./eosManager/transactionStates')
 const { surfaceInTransaction } = require('./eosManager')
 const groupMessagesPerPartition = require('./groupMessagesPerPartition')
 const Fifo = require('../utils/fifo')
+const { Deadline, ExpiryTimer, MAX_DELAY } = require('./deadline')
 const { Types: Compression } = require('../protocol/message/compression')
 
 const { keys } = Object
@@ -166,7 +167,9 @@ const topicDataOf = (batches) => {
       entry = { topic, partitions: [] }
       topicData.push(entry)
     }
-    entry.partitions.push({ partition, firstSequence, messages })
+    const data = { partition, messages }
+    if (firstSequence !== undefined) data.firstSequence = firstSequence
+    entry.partitions.push(data)
   }
   return topicData
 }
@@ -260,6 +263,54 @@ const rejectBatch = (batch, error) => {
   }
 }
 
+/** An internal, uncounted refusal of one request that has never been written. */
+class ProduceAttemptRefused extends Error {}
+
+/** One immutable request membership and the right to transmit it once. */
+class ProduceAttempt {
+  /**
+   * @param {Delivery[]} deliveries fixed constituent delivery objects
+   * @param {() => string} getConnectionStatus producer connection status
+   * @param {(delivery: Delivery) => void} expire settles a due delivery synchronously; the drain
+   *   loop's also settles every other due delivery
+   */
+  constructor(deliveries, getConnectionStatus, expire) {
+    this.deliveries = deliveries.slice()
+    this.getConnectionStatus = getConnectionStatus
+    this.expire = expire
+    this.written = false
+    this.revoked = false
+    for (const delivery of this.deliveries) delivery.currentAttempt = this
+  }
+
+  /** Revokes only this attempt, even after an older attempt wrote. @returns {void} */
+  revoke() {
+    if (!this.written) this.revoked = true
+  }
+
+  /**
+   * @param {number} [frameLength] supplied only at transmission; includes the prefix and header
+   * @returns {Error|null} refusal before any write, or null
+   */
+  guard = (frameLength) => {
+    if (this.revoked) return new ProduceAttemptRefused('The Produce attempt was revoked')
+    const statusError = connectionStatusError(this.getConnectionStatus())
+    if (statusError) return statusError
+    if (frameLength === undefined) return null
+    const now = Date.now()
+    for (const delivery of this.deliveries) {
+      if (!delivery.settled && now >= delivery.deadline) this.expire(delivery)
+    }
+    if (this.revoked || this.deliveries.some((delivery) => delivery.settled)) {
+      this.revoke()
+      return new ProduceAttemptRefused('A delivery in this Produce attempt has settled')
+    }
+    this.written = true
+    for (const delivery of this.deliveries) delivery.everWritten = true
+    return null
+  }
+}
+
 /**
  * One `sendPartitioned()` call: it settles once every batch it created has settled, resolving
  * with their `RecordMetadata` by topic, then partition, or rejecting with the first error any of
@@ -332,14 +383,22 @@ class Delivery {
   /**
    * @param {Send} send
    * @param {number} deadline when the batch's delivery timeout runs out; Infinity without one
+   * @param {(delivery: Delivery) => void} detachDeadline removes this delivery's deadline ownership
    */
-  constructor(send, deadline) {
+  constructor(send, deadline, detachDeadline) {
     this.send = send
     this.deadline = deadline
+    this.detachDeadline = detachDeadline
+    this.expiryPrevious = null
+    this.expiryNext = null
+    this.expiryLinked = false
     /** @type {import('./state/partitionSequencer').PartitionBatch} */
     this.batch = null
     this.settled = false
-    this.onWire = false
+    this.dispatched = false
+    this.everWritten = false
+    this.expired = false
+    this.currentAttempt = null
     /** @type {Error|undefined} */
     this.lastError = undefined
     /** @type {number|undefined} the last backoff, in ms */
@@ -348,23 +407,29 @@ class Delivery {
   }
 
   /**
-   * Settles the batch for its send. Called once: `resolveBatch`/`rejectBatch` settle a batch
-   * only while it is unsettled, and `abortQueued` only reaches batches still queued.
+   * Settles the batch for its send, once; a later call does nothing. The batch's other callers are
+   * dropped when its deadline settles it, but this delivery stays in `batch.settlers`, so a loop
+   * over them - `abortQueued` when a transaction arms - can reach it again.
    * @param {object} metadata
    * @returns {void}
    */
   resolve(metadata) {
+    if (this.settled) return
     this.settled = true
+    this.detachDeadline(this)
     this.send.delivered(metadata)
   }
 
   /**
-   * Settles the batch for its send, once (see `resolve`).
+   * Settles the batch for its send, once; a later call does nothing (see `resolve`). A repeat
+   * would count the batch twice against its send and release a live delivery's deadline.
    * @param {Error} error
    * @returns {void}
    */
   reject(error) {
+    if (this.settled) return
     this.settled = true
+    this.detachDeadline(this)
     this.send.failed(error)
   }
 }
@@ -438,6 +503,11 @@ class DrainLoop {
   #wake = null
   #timer = null
   #watched = null
+  #expiry
+  #expiryHead = null
+  #expiryTail = null
+  /** @type {{ batch: object, error: Error, transmitted: boolean }[]} settled, state not yet applied */
+  #expired = []
 
   /**
    * @param {object} options
@@ -466,6 +536,7 @@ class DrainLoop {
     this.#compressionLevels = compressionLevels
     this.#deadlineMs = deliveryTimeout ?? retry.maxTotalTime
     this.#getConnectionStatus = getConnectionStatus
+    this.#expiry = new ExpiryTimer(this.#expireDue)
   }
 
   /**
@@ -482,30 +553,39 @@ class DrainLoop {
     const manager = this.#eosManager.stateManager
     const send = new Send(batches.length, this.#settled)
     const now = Date.now()
-    const queued = batches.map(({ topic, partition, messages, settlers = [], createdAt = now }) => {
-      const queue = this.#queueOf(topic, Number(partition))
-      const delivery = new Delivery(send, createdAt + (this.#deadlineMs ?? Infinity))
-      delivery.batch = {
-        id: this.#nextId++,
-        topic,
-        partition: Number(partition),
-        messages,
-        acks,
-        timeout,
-        compression,
-        firstSequence: null,
-        producerId: null,
-        producerEpoch: null,
-        attempt: 0,
-        settlers: [...settlers, delivery],
-        backoffUntil: 0,
-        createdAt,
-        sequenceReset: false,
+    const queued = batches.map(
+      ({ topic, partition, messages, settlers = [], createdAt = now, heldBytes, debt, retire }) => {
+        const queue = this.#queueOf(topic, Number(partition))
+        const delivery = new Delivery(
+          send,
+          new Deadline(createdAt, this.#deadlineMs).dueAt,
+          this.#detachDeadline
+        )
+        delivery.batch = {
+          id: this.#nextId++,
+          topic,
+          partition: Number(partition),
+          messages,
+          acks,
+          timeout,
+          compression,
+          firstSequence: null,
+          producerId: null,
+          producerEpoch: null,
+          attempt: 0,
+          settlers: [...settlers, delivery],
+          backoffUntil: 0,
+          createdAt,
+          heldBytes,
+          debt,
+          retire,
+          sequenceReset: false,
+        }
+        send.deliveries.push(delivery)
+        queue.push(delivery)
+        return delivery.batch
       }
-      send.deliveries.push(delivery)
-      queue.push(delivery)
-      return delivery.batch
-    })
+    )
 
     if (this.#eosManager.isTransactional()) {
       this.#register(manager, queued)
@@ -513,7 +593,12 @@ class DrainLoop {
 
     this.#sends.add(send)
     manager.enqueue(queued)
-    this.#kick()
+    for (const delivery of send.deliveries) {
+      if (delivery.settled) continue
+      if (now >= delivery.deadline) this.#expire(delivery)
+      else this.#attachDeadline(delivery)
+    }
+    this.#expireDue(now)
     return send.promise
   }
 
@@ -564,6 +649,7 @@ class DrainLoop {
   /** Forgets a send once its last batch has settled; the last one lets the loop end. */
   #settled = (send) => {
     this.#sends.delete(send)
+    if (this.#sends.size === 0) this.#expiry.clear()
     if (this.#sends.size === 0) {
       this.#kick()
     }
@@ -625,7 +711,7 @@ class DrainLoop {
         if (delivery.settled) {
           continue
         }
-        if (delivery.onWire) {
+        if (delivery.dispatched) {
           rejectBatch(delivery.batch, error)
         } else {
           this.#abandon(manager, delivery, error)
@@ -639,12 +725,16 @@ class DrainLoop {
   }
 
   /**
-   * Waits for a kick, or for the earliest backoff or deadline of a queued batch.
+   * Waits for a kick, or for the earliest backoff or deadline of a queued batch. A wake further
+   * away than a timer can hold arrives early, and the next pass sleeps toward it again.
    * @returns {Promise<void>}
    */
   #sleep() {
     if (this.#wakeAt !== Infinity) {
-      this.#timer = setTimeout(this.#kick, Math.max(0, this.#wakeAt - Date.now()))
+      this.#timer = setTimeout(
+        this.#kick,
+        Math.min(MAX_DELAY, Math.max(0, this.#wakeAt - Date.now()))
+      )
     }
     return new Promise((resolve) => {
       this.#wake = resolve
@@ -685,11 +775,12 @@ class DrainLoop {
     }
 
     const now = Date.now()
+    this.#settleDue(now)
     /** @type {Map<string, Map<number, Delivery>>} the first queued batch of each ready partition */
     const ready = new Map()
     for (const [topic, partitions] of this.#queues) {
       for (const [partition, queue] of partitions) {
-        const head = this.#headOf(manager, queue, now)
+        const head = this.#headOf(queue)
         if (queue.size === 0) {
           partitions.delete(partition)
           continue
@@ -735,29 +826,79 @@ class DrainLoop {
 
   /**
    * A partition's first queued batch: the batches it has settled are dropped from the front of its
-   * queue, and those whose deadline passed are expired on the way. The scan stops at the first
-   * batch still queued in time, as Java's own expiry does, so no batch expires before the one
-   * queued ahead of it in its partition.
-   * @param {import('./state')} manager
+   * queue, and the first one neither settled nor on the wire is returned. Expiry has already run.
    * @param {Fifo<Delivery>} queue
-   * @param {number} now
    * @returns {Delivery|undefined} undefined when every batch left is on the wire
    */
-  #headOf(manager, queue, now) {
-    while (queue.size > 0 && queue.peek().settled) {
-      queue.shift()
-    }
-
+  #headOf(queue) {
+    while (queue.size > 0 && queue.peek().settled) queue.shift()
     for (const delivery of queue) {
-      if (delivery.settled || delivery.onWire) {
-        continue
-      }
-      if (now < delivery.deadline) {
-        return delivery
-      }
-      this.#expire(manager, delivery)
+      if (!delivery.settled && !delivery.dispatched) return delivery
     }
     return undefined
+  }
+
+  /**
+   * Links a finite deadline into the owner's sorted delivery list; arrivals normally append.
+   * @param {Delivery} delivery
+   * @returns {void}
+   */
+  #attachDeadline(delivery) {
+    if (delivery.deadline === Infinity) return
+    let previous = this.#expiryTail
+    while (previous && previous.deadline > delivery.deadline) previous = previous.expiryPrevious
+    delivery.expiryPrevious = previous
+    delivery.expiryNext = previous ? previous.expiryNext : this.#expiryHead
+    if (delivery.expiryNext) delivery.expiryNext.expiryPrevious = delivery
+    else this.#expiryTail = delivery
+    if (previous) previous.expiryNext = delivery
+    else this.#expiryHead = delivery
+    delivery.expiryLinked = true
+    this.#expiry.arm(this.#expiryHead.deadline)
+  }
+
+  /** Unlinks settlement in constant time and re-arms only when the head changes. @param {Delivery} delivery @returns {void} */
+  #detachDeadline = (delivery) => {
+    if (!delivery.expiryLinked) return
+    const wasHead = this.#expiryHead === delivery
+    if (delivery.expiryPrevious) delivery.expiryPrevious.expiryNext = delivery.expiryNext
+    else this.#expiryHead = delivery.expiryNext
+    if (delivery.expiryNext) delivery.expiryNext.expiryPrevious = delivery.expiryPrevious
+    else this.#expiryTail = delivery.expiryPrevious
+    delivery.expiryPrevious = delivery.expiryNext = null
+    delivery.expiryLinked = false
+    if (wasHead) {
+      this.#expiry.clear()
+      this.#expiry.arm(this.#expiryHead?.deadline ?? Infinity)
+    }
+  }
+
+  /**
+   * Settles all due deliveries even while the drain pass awaits work, and runs a pass. The owner
+   * timer's callback, and the entry a send and the write-boundary guard take.
+   * @param {number} now epoch milliseconds
+   * @returns {number} the next deadline, or Infinity
+   */
+  #expireDue = (now) => {
+    this.#settleDue(now)
+    this.#kick()
+    return this.#expiryHead?.deadline ?? Infinity
+  }
+
+  /**
+   * Settles every due delivery with its own `KafkaJSDeliveryTimeout`, then applies the state
+   * consequences of all of them: the one path every synchronous expiry takes. Arming a transaction
+   * rejects the other queued batches, so no consequence may run while a due delivery still waits
+   * for its own timeout.
+   * @param {number} now epoch milliseconds
+   * @returns {void}
+   */
+  #settleDue(now) {
+    while (this.#expiryHead && now >= this.#expiryHead.deadline) this.#expire(this.#expiryHead)
+    const manager = this.#eosManager.stateManager
+    for (const { batch, error, transmitted } of this.#expired.splice(0)) {
+      manager.fail(batch, error, { transmitted })
+    }
   }
 
   /**
@@ -774,7 +915,7 @@ class DrainLoop {
     for (const partitions of this.#queues.values()) {
       for (const queue of partitions.values()) {
         for (const delivery of queue) {
-          if (!delivery.settled && !delivery.onWire) {
+          if (!delivery.settled && !delivery.dispatched) {
             this.#abandon(manager, delivery, error)
             dropped = true
           }
@@ -850,7 +991,7 @@ class DrainLoop {
         })
       )
       for (const delivery of queue) {
-        if (!delivery.settled && !delivery.onWire) {
+        if (!delivery.settled && !delivery.dispatched) {
           this.#abandon(manager, delivery, exhausted)
         }
       }
@@ -872,13 +1013,16 @@ class DrainLoop {
    * @returns {void}
    */
   #dispatch(nodeId, batches) {
+    const attempt = new ProduceAttempt(batches.map(deliveryOf), this.#getConnectionStatus, () =>
+      this.#expireDue(Date.now())
+    )
     for (const batch of batches) {
-      deliveryOf(batch).onWire = true
+      deliveryOf(batch).dispatched = true
     }
     this.#outstanding.set(nodeId, (this.#outstanding.get(nodeId) ?? 0) + 1)
 
     const handed = (this.#handoffs.get(nodeId) ?? RESOLVED).then(() =>
-      this.#handOff(nodeId, batches)
+      this.#handOff(nodeId, batches, attempt)
     )
     this.#handoffs.set(nodeId, handed.then(ignore, ignore))
     handed
@@ -895,12 +1039,17 @@ class DrainLoop {
    * the options triple they share.
    * @param {string} nodeId
    * @param {import('./state/partitionSequencer').PartitionBatch[]} batches
+   * @param {ProduceAttempt} attempt fixed request membership and transmission right
    * @returns {Promise<{ answer: Promise<import('../protocol/requests/produce/partitionResults').PartitionResult[]|undefined> }>}
    *   once the request is handed to the broker; `answer` settles with its answer, and is wrapped so
    *   that waiting for the hand-off does not wait for the answer
    */
-  async #handOff(nodeId, batches) {
+  async #handOff(nodeId, batches, attempt) {
+    const refusal = attempt.guard()
+    if (refusal) throw refusal
     const broker = await this.#cluster.findBroker({ nodeId })
+    const refused = attempt.guard()
+    if (refused) throw refused
     const [{ acks, timeout, compression, producerId, producerEpoch }] = batches
     const topicData = topicDataOf(batches)
     const transactional = this.#eosManager.isTransactional()
@@ -927,6 +1076,7 @@ class DrainLoop {
           ),
       transactionVersion: this.#eosManager.stateManager.transactionVersion(),
       perPartitionResults: true,
+      guard: attempt.guard,
     })
     return { answer }
   }
@@ -960,11 +1110,19 @@ class DrainLoop {
     const manager = this.#eosManager.stateManager
     const results = Array.isArray(answer) ? answer : []
     for (const batch of batches) {
-      deliveryOf(batch).onWire = false
+      deliveryOf(batch).dispatched = false
     }
 
     batches.forEach((batch, index) => {
       const result = resultFor(results, index, batch)
+      if (deliveryOf(batch).settled) {
+        if (result?.error === null) manager.complete(batch, result)
+        else if (result?.error?.code === 46) manager.complete(batch, { duplicate: true })
+        if (result?.error) this.#sideChannels(result.error)
+        if (!deliveryOf(batch).expired) manager.sequencer.fail(batch)
+        batch.retire?.()
+        return
+      }
       if (result === undefined) {
         this.#failed(
           manager,
@@ -993,12 +1151,20 @@ class DrainLoop {
     this.#answeredBy(nodeId)
     const manager = this.#eosManager.stateManager
     for (const batch of batches) {
-      deliveryOf(batch).onWire = false
+      deliveryOf(batch).dispatched = false
     }
 
-    this.#sideChannels(error)
+    if (!(error instanceof ProduceAttemptRefused)) this.#sideChannels(error)
     for (const batch of batches) {
-      this.#failed(manager, batch, error)
+      const delivery = deliveryOf(batch)
+      if (delivery.settled) {
+        if (!delivery.expired) manager.sequencer.fail(batch)
+        batch.retire?.()
+        continue
+      }
+      if (error instanceof ProduceAttemptRefused) {
+        manager.sequencer.requeue(batch, 0, { counted: false })
+      } else this.#failed(manager, batch, error)
     }
   }
 
@@ -1030,7 +1196,8 @@ class DrainLoop {
     }
 
     if (refreshesMetadata(e)) {
-      this.#refresh = true
+      if (this.#sends.size === 0) this.#refreshMetadata().catch(ignore)
+      else this.#refresh = true
     }
   }
 
@@ -1092,15 +1259,22 @@ class DrainLoop {
   }
 
   /**
-   * Settles a queued batch whose deadline passed, through the manager, with `KafkaJSDeliveryTimeout`.
-   * @param {import('./state')} manager
+   * Settles a batch whose deadline passed with `KafkaJSDeliveryTimeout` for each of its callers,
+   * queued or on the wire. Its state consequence waits in `#expired` for `#settleDue`, and its
+   * other callers are dropped so that arming a transaction cannot reject them a second time; the
+   * delivery stays, and ignores that second call (see `Delivery#reject`). An attempt of the batch
+   * that has not written is revoked; one on the wire keeps its request until its terminal callback.
    * @param {Delivery} delivery
    * @returns {void}
    */
-  #expire(manager, delivery) {
+  #expire(delivery) {
+    if (delivery.settled) return
+    delivery.currentAttempt?.revoke()
     const error = this.#timedOut(delivery.batch, delivery.lastError)
-    manager.fail(delivery.batch, error)
+    this.#expired.push({ batch: delivery.batch, error, transmitted: delivery.everWritten })
+    delivery.expired = true
     rejectBatch(delivery.batch, error)
+    delivery.batch.settlers = [delivery]
   }
 
   /**
@@ -1128,7 +1302,7 @@ class DrainLoop {
     return new KafkaJSDeliveryTimeout(
       `Gave up on ${batch.topic} partition ${batch.partition} after ${batch.attempt + 1} attempts: ` +
         `its ${this.#deadlineMs} ms delivery deadline passed`,
-      { cause }
+      { cause, outcome: deliveryOf(batch).everWritten ? 'unknown' : 'unsent' }
     )
   }
 
@@ -1479,34 +1653,6 @@ const createSendMessages = ({
   const deadlineMs = deliveryTimeout ?? retry.maxTotalTime
 
   /**
-   * Splits one non-idempotent hand-off by delivery deadline, which counts from each batch's own
-   * first send: a batch whose deadline has passed is late, and the rest share a retrier that
-   * ends at the earliest deadline among them.
-   * @param {{ createdAt?: number }[]} batches
-   * @returns {{ late: object[], retrier: import("../retry").Retrier|null }} the late batches, and
-   *   the retrier of the others; null when every batch is late
-   */
-  const withinDeadline = (batches) => {
-    if (deadlineMs == null) {
-      return { late: [], retrier }
-    }
-
-    const now = Date.now()
-    const late = []
-    let budget = deadlineMs
-    for (const batch of batches) {
-      const remaining = (batch.createdAt ?? now) + deadlineMs - now
-      if (remaining < 1) {
-        late.push(batch)
-      } else {
-        budget = Math.min(budget, remaining)
-      }
-    }
-    const noneLeft = late.length > 0 && late.length === batches.length
-    return { late, retrier: noneLeft ? null : createRetry({ ...retry, maxTotalTime: budget }) }
-  }
-
-  /**
    * The leaders of a topic's partitions, once its metadata is loaded; see `leadersOfPartitions`.
    * @param {string} topic
    * @param {string[]} partitions
@@ -1542,47 +1688,122 @@ const createSendMessages = ({
    * @returns {Promise<object[]>} the `RecordMetadata` of every batch, once all have settled;
    *   rejects with the first error a batch failed with
    */
-  const sendPartitionedPlain = async ({ acks, timeout, compression, batches }) => {
+  const sendPartitionedPlain = ({ acks, timeout, compression, batches }) => {
     const unsettled = new Set(batches)
     const metadata = []
+    const deliveries = new Map()
     let failure = null
-
-    const resolve = (batch, value) => {
-      unsettled.delete(batch)
-      if (value !== undefined) {
-        metadata.push(value)
-      }
-      batch.settlers?.forEach((settler) => settler.resolve(value))
+    let resolveDone, rejectDone
+    const done = new Promise((resolve, reject) => {
+      resolveDone = resolve
+      rejectDone = reject
+    })
+    /** Settles the public promise once no delivery remains. @returns {void} */
+    const finish = () => {
+      if (unsettled.size !== 0) return
+      timer.clear()
+      if (failure !== null) rejectDone(failure)
+      else resolveDone(metadata)
     }
-    const reject = (batch, error) => {
-      unsettled.delete(batch)
-      failure = failure || error
-      batch.settlers?.forEach((settler) => settler.reject(error))
+    /**
+     * Settles one live batch exactly once and revokes its current unwritten attempt.
+     * @param {object} batch
+     * @param {object|undefined} value acknowledgement metadata
+     * @param {Error} [error] a terminal failure
+     * @returns {void}
+     */
+    const settle = (batch, value, error) => {
+      if (!unsettled.delete(batch)) return
+      const delivery = deliveries.get(batch)
+      delivery.settled = true
+      delivery.currentAttempt?.revoke()
+      if (error !== undefined) failure = failure || error
+      else if (value !== undefined) metadata.push(value)
+      batch.settlers?.forEach((settler) =>
+        error === undefined ? settler.resolve(value) : settler.reject(error)
+      )
+      finish()
+    }
+    /** @param {object} delivery the due batch's state @returns {void} */
+    const expire = (delivery) => {
+      if (delivery.settled) return
+      delivery.currentAttempt?.revoke()
+      delivery.expired = true
+      settle(
+        delivery.batch,
+        undefined,
+        new KafkaJSDeliveryTimeout(
+          delivery.everWritten
+            ? `Gave up on ${delivery.batch.topic} partition ${delivery.batch.partition}: its delivery deadline passed`
+            : `Gave up on ${delivery.batch.topic} partition ${delivery.batch.partition} before sending it: its ${deadlineMs} ms delivery deadline passed`,
+          { cause: delivery.lastError, outcome: delivery.everWritten ? 'unknown' : 'unsent' }
+        )
+      )
+    }
+    const timer = new ExpiryTimer((now) => {
+      let next = Infinity
+      for (const batch of [...unsettled]) {
+        const delivery = deliveries.get(batch)
+        if (now >= delivery.deadline) expire(delivery)
+        else next = Math.min(next, delivery.deadline)
+      }
+      return next
+    })
+    const now = Date.now()
+    for (const batch of batches) {
+      const delivery = {
+        batch,
+        deadline: new Deadline(batch.createdAt ?? now, deadlineMs).dueAt,
+        settled: false,
+        everWritten: false,
+        expired: false,
+        currentAttempt: null,
+        lastError: undefined,
+      }
+      deliveries.set(batch, delivery)
+    }
+    for (const delivery of deliveries.values()) {
+      if (now >= delivery.deadline) expire(delivery)
+      else timer.arm(delivery.deadline)
+    }
+
+    /** Routing side effects also apply to late errors. @param {Error} error @returns {Promise<void>} */
+    const sideChannels = async (error) => {
+      if (error.name === 'KafkaJSConnectionClosedError')
+        cluster.removeBroker({ host: error.host, port: error.port, source: failureSourceOf(error) })
+      if (error.currentLeader) {
+        await Promise.resolve(
+          cluster.applyLeaderHint({
+            topic: error.topic,
+            partition: error.partition,
+            leaderId: error.currentLeader.leaderId,
+            leaderEpoch: error.currentLeader.leaderEpoch,
+            nodeEndpoints: error.nodeEndpoints,
+          })
+        ).catch(() => {})
+      }
+      if (refreshesMetadata(error)) await Promise.resolve(cluster.refreshMetadata()).catch(() => {})
     }
 
     /**
-     * Sends `broker` the batches it leads and settles those its answer settles.
-     * @param {object} broker
-     * @param {{ topic: string, partitions: number[], batches: object }[]} owned the batches by
-     *   topic, `batches` keyed by partition
-     * @returns {Promise<Error|null>} the retriable error that leaves a batch for the next attempt
+     * Builds one request with fixed membership after filtering all prior awaits.
+     * @param {object} broker the broker already looked up
+     * @param {object[]} candidates batches proposed for this broker
+     * @returns {Promise<Error|null>} a genuine retriable failure, a private refusal, or no failure
      */
-    const produceTo = async (broker, owned) => {
-      const sent = owned.flatMap(({ partitions, batches }) =>
-        partitions.map((partition) => batches[partition])
+    const produceTo = async (broker, candidates) => {
+      const sent = candidates.filter((batch) => unsettled.has(batch))
+      if (sent.length === 0) return null
+      const attempt = new ProduceAttempt(
+        sent.map((batch) => deliveries.get(batch)),
+        getConnectionStatus || (() => CONNECTION_STATUS.CONNECTED),
+        expire
       )
-      const topicData = owned.map(({ topic, partitions, batches }) => ({
-        topic,
-        partitions: partitions.map((partition) => ({
-          partition,
-          messages: batches[partition].messages,
-        })),
-      }))
-
+      const topicData = topicDataOf(sent)
       let results
       try {
         results = await broker.produce({
-          ...plainRequestOf(owned.map(({ topic }) => topic)),
+          ...plainRequestOf(topicData.map(({ topic }) => topic)),
           acks,
           timeout,
           compression,
@@ -1594,143 +1815,169 @@ const createSendMessages = ({
                 : undefined,
           topicData,
           perPartitionResults: true,
+          guard: attempt.guard,
         })
-      } catch (e) {
-        attachFailingRecords(e, topicData)
-        if (e.retriable) {
-          return e
+      } catch (error) {
+        if (error instanceof ProduceAttemptRefused) return error
+        attachFailingRecords(error, topicData)
+        for (const batch of sent) deliveries.get(batch).lastError = error
+        if (sent.every((batch) => !unsettled.has(batch))) {
+          await sideChannels(error)
+          return null
         }
-        sent.forEach((batch) => reject(batch, e))
+        if (error.retriable) return error
+        sent.forEach((batch) => settle(batch, undefined, error))
         return null
       }
-
       if (acks === 0) {
-        sent.forEach((batch) => resolve(batch, undefined))
+        sent.forEach((batch) => settle(batch, undefined))
         return null
       }
-
       let retriable = null
-      sent.forEach((batch, index) => {
+      for (let index = 0; index < sent.length; index += 1) {
+        const batch = sent[index]
         const result = resultFor(results, index, batch)
         const error =
           result === undefined
             ? new KafkaJSError(`No result for ${batch.topic} partition ${batch.partition}`)
             : result.error
-        if (error === null) {
-          resolve(batch, metadataOf(result))
-        } else if (error.retriable) {
-          resolveFailingRecords(error, batch.messages)
-          retriable = retriable || error
-        } else {
-          resolveFailingRecords(error, batch.messages)
-          reject(batch, error)
+        if (!unsettled.has(batch)) {
+          if (error) await sideChannels(error)
+          continue
         }
-      })
+        if (error === null) settle(batch, metadataOf(result))
+        else {
+          deliveries.get(batch).lastError = error
+          resolveFailingRecords(error, batch.messages)
+          if (error.retriable) retriable = retriable || error
+          else settle(batch, undefined, error)
+        }
+      }
       return retriable
     }
 
-    const { late, retrier: handOffRetrier } = withinDeadline(batches)
-    late.forEach((batch) =>
-      reject(
-        batch,
-        new KafkaJSDeliveryTimeout(
-          `Gave up on ${batch.topic} partition ${batch.partition} before sending it: its ` +
-            `${deadlineMs} ms delivery deadline passed`
-        )
-      )
-    )
-    if (handOffRetrier === null) {
-      throw failure
-    }
-
-    try {
-      await handOffRetrier(async (bail, retryCount, retryTime) => {
-        const topics = []
-        // no prototype: a topic may be named `toString` or `__proto__`
-        const byTopic = Object.create(null)
-        for (const batch of unsettled) {
-          if (byTopic[batch.topic] === undefined) {
-            byTopic[batch.topic] = Object.create(null)
-            topics.push(batch.topic)
-          }
-          byTopic[batch.topic][batch.partition] = batch
-        }
-        await cluster.addMultipleTargetTopics(topics)
-
-        try {
-          await cluster.refreshMetadataIfNecessary()
-
-          /** @type {Error[]} the retriable lookup failures that leave batches for the next attempt */
-          const left = []
-          /**
-           * A topic's or a broker's lookup failed: a retriable error leaves its batches for the next
-           * attempt, any other rejects them.
-           * @param {object[]} lost
-           * @param {Error} e
-           */
-          const leave = (lost, e) => {
-            if (e.retriable) {
-              left.push(e)
-            } else {
-              lost.forEach((batch) => reject(batch, e))
-            }
-          }
-
-          /** @type {Map<object, { topic: string, partitions: number[], batches: object }[]>} */
-          const perBroker = new Map()
-          for (const topic of topics) {
-            let lookup
+    /**
+     * Runs delivery retries; every continuation rechecks membership after its await.
+     * Work may outlive the public settlement until the uncancellable request ends.
+     * @returns {Promise<void>}
+     */
+    const work = async () => {
+      if (unsettled.size === 0) return
+      let latest = -Infinity
+      for (const batch of unsettled) latest = Math.max(latest, deliveries.get(batch).deadline)
+      const remaining = latest - Date.now()
+      if (remaining <= 0) {
+        for (const batch of [...unsettled]) expire(deliveries.get(batch))
+        return
+      }
+      // Past one timer interval no retrier can hold the budget: the owner timer and the write
+      // guard enforce the absolute deadline, and a capped budget would end the delivery early.
+      const handOffRetrier =
+        remaining === Infinity
+          ? retrier
+          : createRetry({
+              ...retry,
+              maxTotalTime: remaining > MAX_DELAY ? null : Math.max(1, remaining),
+            })
+      try {
+        await handOffRetrier(async (bail, retryCount, retryTime) => {
+          while (unsettled.size > 0) {
+            const topics = [...new Set([...unsettled].map(({ topic }) => topic))]
+            await cluster.addMultipleTargetTopics(topics)
+            if (unsettled.size === 0) return
             try {
-              lookup = leadersOf(topic, keys(byTopic[topic]))
-            } catch (e) {
-              leave(Object.values(byTopic[topic]), e)
-              continue
-            }
-
-            const { leaders: partitionsPerLeader, failed } = lookup
-            for (const { partition, error } of failed) {
-              leave([byTopic[topic][partition]], error)
-            }
-            for (const nodeId of keys(partitionsPerLeader)) {
-              const partitions = partitionsPerLeader[nodeId]
-              let broker
-              try {
-                broker = await cluster.findBroker({ nodeId })
-              } catch (e) {
-                leave(
-                  partitions.map((partition) => byTopic[topic][partition]),
-                  e
-                )
-                continue
+              await cluster.refreshMetadataIfNecessary()
+              if (unsettled.size === 0) return
+              const left = []
+              const perBroker = new Map()
+              const leave = (lost, error) => {
+                const live = lost.filter((batch) => unsettled.has(batch))
+                if (live.length === 0) return
+                live.forEach((batch) => {
+                  deliveries.get(batch).lastError = error
+                })
+                if (error.retriable) left.push(error)
+                else live.forEach((batch) => settle(batch, undefined, error))
               }
-              const owned = perBroker.get(broker) || []
-              owned.push({ topic, partitions, batches: byTopic[topic] })
-              perBroker.set(broker, owned)
+              for (const topic of topics) {
+                const own = [...unsettled].filter((batch) => batch.topic === topic)
+                if (own.length === 0) continue
+                let lookup
+                try {
+                  lookup = leadersOf(
+                    topic,
+                    own.map(({ partition }) => partition)
+                  )
+                } catch (error) {
+                  leave(own, error)
+                  continue
+                }
+                for (const { partition, error } of lookup.failed)
+                  leave(
+                    own.filter((batch) => Number(batch.partition) === Number(partition)),
+                    error
+                  )
+                for (const nodeId of keys(lookup.leaders)) {
+                  const candidates = own.filter((batch) =>
+                    lookup.leaders[nodeId].some(
+                      (partition) => Number(partition) === Number(batch.partition)
+                    )
+                  )
+                  let broker
+                  try {
+                    broker = await cluster.findBroker({ nodeId })
+                  } catch (error) {
+                    leave(candidates, error)
+                    continue
+                  }
+                  const live = candidates.filter((batch) => unsettled.has(batch))
+                  if (live.length > 0)
+                    perBroker.set(broker, [...(perBroker.get(broker) || []), ...live])
+                }
+              }
+              const errors = await Promise.all(
+                [...perBroker].map(([broker, owned]) => produceTo(broker, owned))
+              )
+              const genuine = [...left, ...errors].find(
+                (error) => error !== null && !(error instanceof ProduceAttemptRefused)
+              )
+              if (genuine !== undefined) throw genuine
+              if (errors.some((error) => error instanceof ProduceAttemptRefused)) continue
+              if (unsettled.size > 0) throw new KafkaJSMetadataNotLoaded(NO_PARTITION_METADATA)
+              return
+            } catch (error) {
+              if (unsettled.size === 0) {
+                await sideChannels(error)
+                return
+              }
+              await recover(error, bail, retryCount, retryTime)
             }
           }
-
-          const errors = await Promise.all(
-            Array.from(perBroker, ([broker, owned]) => produceTo(broker, owned))
+        })
+      } catch (error) {
+        for (const batch of [...unsettled]) {
+          const delivery = deliveries.get(batch)
+          settle(
+            batch,
+            undefined,
+            error instanceof KafkaJSDeliveryTimeout
+              ? new KafkaJSDeliveryTimeout(error.message, {
+                  cause: error.cause,
+                  outcome: delivery.everWritten ? 'unknown' : 'unsent',
+                })
+              : error
           )
-          const retriable = [...left, ...errors].find((error) => error !== null)
-          if (retriable !== undefined) {
-            throw retriable
-          }
-          if (unsettled.size > 0) {
-            throw new KafkaJSMetadataNotLoaded(NO_PARTITION_METADATA)
-          }
-        } catch (e) {
-          await recover(e, bail, retryCount, retryTime)
         }
+      } finally {
+        timer.clear()
+      }
+    }
+    if (unsettled.size > 0)
+      work().catch((error) => {
+        for (const batch of [...unsettled]) settle(batch, undefined, error)
       })
-    } catch (error) {
-      unsettled.forEach((batch) => reject(batch, error))
-    }
-
-    if (failure !== null) {
-      throw failure
-    }
-    return metadata
+    else finish()
+    return done
   }
 
   return { sendPartitioned, partition }

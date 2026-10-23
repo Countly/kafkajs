@@ -81,7 +81,9 @@ describe('Producer > options: the idempotent default and the settings that confl
       expect(lastCluster().broker.initProducerId).not.toHaveBeenCalled()
       const [[downgraded]] = clusters[0].broker.produce.mock.calls
       const [[nonIdempotent]] = lastCluster().broker.produce.mock.calls
-      expect(downgraded).toEqual(nonIdempotent)
+      expect(nonIdempotent.guard).toEqual(expect.any(Function))
+      expect(downgraded.guard).not.toBe(nonIdempotent.guard)
+      expect(downgraded).toEqual({ ...nonIdempotent, guard: expect.any(Function) })
       expect(downgraded).toMatchObject({ producerId: -1, producerEpoch: 0 })
     })
 

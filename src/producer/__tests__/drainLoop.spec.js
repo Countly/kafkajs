@@ -2,6 +2,7 @@ const createSendMessages = require('../sendMessages')
 const createEosManager = require('../eosManager')
 const createProducer = require('../index')
 const Idempotence = require('../idempotence')
+const Accumulator = require('../state/accumulator')
 const createRetry = require('../../retry')
 const Broker = require('../../broker')
 const Cluster = require('../../cluster')
@@ -58,6 +59,9 @@ const REQUEST_TIMED_OUT = 7
 const OUT_OF_ORDER_SEQUENCE_NUMBER = 45
 const DUPLICATE_SEQUENCE_NUMBER = 46
 const INVALID_RECORD = 87
+
+/** The longest delay `setTimeout` honours, in ms. */
+const MAX_TIMER_DELAY = 2147483647
 
 /** Routes every record to the partition it names. */
 const byMessage = ({ message }) => message.partition
@@ -260,6 +264,7 @@ const createDroppingBroker = (log) => {
     send: async (protocolRequest) => (await pool.getConnection()).send(protocolRequest),
     setVersions: () => {},
     destroy: async () => connection.disconnect(),
+    retire: () => {},
   }
   const broker = new Broker({ connectionPool: pool, logger: newLogger(), versions })
   broker.lookupRequest = lookup(versions)
@@ -423,6 +428,8 @@ const createHarness = ({
       brokers.set(id, {
         nodeId: id,
         produce: jest.fn(async (request) => {
+          const refusal = request.guard?.(100)
+          if (refusal) throw refusal
           produced.push({ nodeId: id, request })
           return answer(request, id)
         }),
@@ -1612,12 +1619,8 @@ describe('Producer > the idempotent drain loop', () => {
     })
 
     test.each([
-      [
-        'a retriable answer expires the batch, with the answer as its cause',
-        REQUEST_TIMED_OUT,
-        true,
-      ],
-      ['any other answer still rejects with its own error', INVALID_RECORD, false],
+      ['a retriable answer cannot change the earlier timeout', REQUEST_TIMED_OUT, true],
+      ['a terminal answer cannot change the earlier timeout', INVALID_RECORD, false],
     ])('after the deadline, %s', async (_, code, expires) => {
       const harness = createHarness({
         layout: { [TOPIC]: { 0: 1 } },
@@ -1634,13 +1637,10 @@ describe('Producer > the idempotent drain loop', () => {
       await jest.advanceTimersByTimeAsync(60)
       const error = await sending
 
-      if (expires) {
-        expect(error).toBeInstanceOf(KafkaJSDeliveryTimeout)
-        expect(error.cause).toMatchObject({ code })
-      } else {
-        expect(error).toBeInstanceOf(KafkaJSProtocolError)
-        expect(error).toMatchObject({ code })
-      }
+      expect(expires).toBe(code === REQUEST_TIMED_OUT)
+      expect(error).toBeInstanceOf(KafkaJSDeliveryTimeout)
+      expect(error.outcome).toBe('unknown')
+      expect(error.cause).toBeUndefined()
       expect(harness.produced).toHaveLength(1)
     })
 
@@ -1712,6 +1712,371 @@ describe('Producer > the idempotent drain loop', () => {
       await expect(Promise.all([first, second])).resolves.toHaveLength(2)
       expect(harness.coordinator.initProducerId).toHaveBeenCalledTimes(1)
       expect(harness.produced.map(({ request }) => request.producerId)).toEqual(['2000'])
+    })
+  })
+
+  describe('deadlines found without the owner timer', () => {
+    /**
+     * Starts one send per entry of `partitions`, a turn apart.
+     * @param {ReturnType<typeof createHarness>} harness
+     * @param {number[]} partitions
+     * @returns {Promise<Promise<Error|object[]>[]>} each send's outcome, errors caught
+     */
+    const sendEach = async (harness, partitions) => {
+      const outcomes = []
+      for (const partition of partitions) {
+        outcomes.push(
+          harness.send([{ topic: TOPIC, messages: records(partition) }]).catch((e) => e)
+        )
+        await jest.advanceTimersByTimeAsync(0)
+      }
+      return outcomes
+    }
+
+    /**
+     * Expects `errors` to be distinct, unsent `KafkaJSDeliveryTimeout`s, and the transaction armed.
+     * @param {ReturnType<typeof createHarness>} harness
+     * @param {Error[]} errors
+     */
+    const expectOwnTimeouts = (harness, errors) => {
+      expect(errors).toEqual([
+        expect.any(KafkaJSDeliveryTimeout),
+        expect.any(KafkaJSDeliveryTimeout),
+      ])
+      expect(errors[1]).not.toBe(errors[0])
+      expect(errors.map(({ outcome }) => outcome)).toEqual(['unsent', 'unsent'])
+      expect(harness.manager.state()).toEqual(ABORTABLE_ERROR)
+      expect(jest.getTimerCount()).toBe(0)
+    }
+
+    /**
+     * A transactional harness with a 2000 ms deadline and three brokers, each leading one
+     * partition. Partition 0's request waits for `encoder` before its write guard, partition 1's
+     * is written and answered with a retriable code once `retryAnswer` resolves, and partition
+     * 2's is written and waits for `response`.
+     * @returns {Promise<{ harness: ReturnType<typeof createHarness>, encoder: object,
+     *   retryAnswer: object, response: object }>}
+     */
+    const startMixedDeadlines = async () => {
+      const encoder = deferred()
+      const retryAnswer = deferred()
+      const response = deferred()
+      const harness = createHarness({
+        transactional: true,
+        deliveryTimeout: 2000,
+        layout: { [TOPIC]: { 0: 1, 1: 2, 2: 3 } },
+      })
+      await harness.start()
+      harness.broker(1).produce.mockImplementationOnce(async (request) => {
+        await encoder.promise
+        const refusal = request.guard(100)
+        if (refusal) throw refusal
+        return respond(request, 1)
+      })
+      harness.broker(2).produce.mockImplementationOnce(async (request) => {
+        const refusal = request.guard(100)
+        if (refusal) throw refusal
+        await retryAnswer.promise
+        return respond(request, 2, { [`${TOPIC}/1`]: NOT_LEADER_OR_FOLLOWER })
+      })
+      harness.broker(3).produce.mockImplementationOnce(async (request) => {
+        const refusal = request.guard(100)
+        if (refusal) throw refusal
+        await response.promise
+        return respond(request, 3)
+      })
+      return { harness, encoder, retryAnswer, response }
+    }
+
+    /**
+     * From a send of partitions 0 and 1 created at 0 and partition 2 created at 1000, brought to
+     * the write guard of partition 0: partitions 1 and 2 are on the wire, partition 1 is answered
+     * retriably and queued for its retry, and the clock reaches the deadline of partitions 0 and 1
+     * without the owner timer running. Partition 2's deadline is 1000 ms later.
+     * @param {Awaited<ReturnType<typeof startMixedDeadlines>>} held
+     * @returns {Promise<void>}
+     */
+    const expireAtTheGuard = async ({ harness, encoder, retryAnswer }) => {
+      await jest.advanceTimersByTimeAsync(0)
+      for (const nodeId of [1, 2, 3]) {
+        expect(harness.broker(nodeId).produce).toHaveBeenCalledTimes(1)
+      }
+      jest.setSystemTime(1995)
+      retryAnswer.resolve()
+      await jest.advanceTimersByTimeAsync(0)
+      expect(harness.manager.sequencer.entry(TOPIC, 1).queued).toHaveLength(1)
+      jest.setSystemTime(2000)
+      encoder.resolve()
+      await jest.advanceTimersByTimeAsync(0)
+    }
+
+    /**
+     * Releases every held continuation and runs the clock past the last deadline.
+     * @param {Awaited<ReturnType<typeof startMixedDeadlines>>} held
+     * @returns {Promise<void>}
+     */
+    const releaseMixedDeadlines = async ({ encoder, retryAnswer, response }) => {
+      encoder.resolve()
+      retryAnswer.resolve()
+      response.resolve()
+      await jest.advanceTimersByTimeAsync(1000)
+    }
+
+    test('the write-boundary guard settles every due caller with its own timeout before arming the transaction', async () => {
+      const held = deferred()
+      const harness = createHarness({
+        transactional: true,
+        deliveryTimeout: 1000,
+        layout: { [TOPIC]: { 0: 1 } },
+      })
+      await harness.start()
+      harness.broker(1).produce.mockImplementationOnce(async (request) => {
+        await held.promise
+        const refusal = request.guard(100)
+        if (refusal) throw refusal
+        return respond(request, 1)
+      })
+      jest.useFakeTimers({ now: 0 })
+
+      const sending = await sendEach(harness, [0, 0])
+      const settled = settledFlag(Promise.all(sending))
+      jest.setSystemTime(1000)
+      held.resolve()
+      await jest.advanceTimersByTimeAsync(0)
+
+      expect(settled()).toBe(true)
+      expect(harness.broker(1).produce).toHaveBeenCalledTimes(1)
+      expectOwnTimeouts(harness, await Promise.all(sending))
+    })
+
+    test('a pass that finds several deliveries due settles each with its own timeout before arming the transaction', async () => {
+      const added = deferred()
+      const harness = createHarness({
+        transactional: true,
+        deliveryTimeout: 1000,
+        layout: { [TOPIC]: { 0: 1, 1: 1 } },
+      })
+      await harness.start()
+      harness.coordinator.addPartitionsToTxn.mockImplementation(() => added.promise)
+      jest.useFakeTimers({ now: 0 })
+
+      const sending = await sendEach(harness, [0, 1])
+      const settled = settledFlag(Promise.all(sending))
+      jest.setSystemTime(1000)
+      added.resolve({})
+      await jest.advanceTimersByTimeAsync(0)
+
+      expect(settled()).toBe(true)
+      expect(harness.broker(1).produce).not.toHaveBeenCalled()
+      expectOwnTimeouts(harness, await Promise.all(sending))
+    })
+
+    test('a send that is due on arrival settles the callers already due with their own timeouts before arming the transaction', async () => {
+      const added = deferred()
+      const harness = createHarness({
+        transactional: true,
+        deliveryTimeout: 1000,
+        layout: { [TOPIC]: { 0: 1, 1: 1 } },
+      })
+      await harness.start()
+      harness.coordinator.addPartitionsToTxn.mockImplementation(() => added.promise)
+      jest.useFakeTimers({ now: 0 })
+
+      const [queued] = await sendEach(harness, [0])
+      jest.setSystemTime(1000)
+      const arriving = harness.sendMessages
+        .sendPartitioned({
+          acks: -1,
+          timeout: 30000,
+          compression: 0,
+          batches: [{ topic: TOPIC, partition: 1, messages: records(1), createdAt: 0 }],
+        })
+        .catch((e) => e)
+      const settled = settledFlag(Promise.all([queued, arriving]))
+      await jest.advanceTimersByTimeAsync(0)
+      added.resolve({})
+      await jest.advanceTimersByTimeAsync(0)
+
+      expect(settled()).toBe(true)
+      expectOwnTimeouts(harness, await Promise.all([queued, arriving]))
+    })
+
+    test('the loop never asks a timer to wait longer than it can, and wakes in steps to the deadline', async () => {
+      const initialized = deferred()
+      const harness = createHarness({ deliveryTimeout: MAX_TIMER_DELAY })
+      harness.coordinator.initProducerId.mockImplementationOnce(() => initialized.promise)
+      jest.useFakeTimers({ now: 0 })
+      const schedule = jest.spyOn(global, 'setTimeout')
+      const delays = () => schedule.mock.calls.map(([, delay]) => delay)
+
+      const sending = harness.sendMessages
+        .sendPartitioned({
+          acks: -1,
+          timeout: 30000,
+          compression: 0,
+          batches: [{ topic: TOPIC, partition: 0, messages: records(0), createdAt: 1000 }],
+        })
+        .catch((e) => e)
+      await jest.advanceTimersByTimeAsync(0)
+      expect(Math.max(...delays())).toBeLessThanOrEqual(MAX_TIMER_DELAY)
+
+      schedule.mockClear()
+      await jest.advanceTimersByTimeAsync(MAX_TIMER_DELAY)
+      expect(delays()).toEqual(expect.arrayContaining([1000]))
+      expect(Math.max(...delays())).toBeLessThanOrEqual(MAX_TIMER_DELAY)
+      await jest.advanceTimersByTimeAsync(999)
+      expect(jest.getTimerCount()).toBeGreaterThan(0)
+      await jest.advanceTimersByTimeAsync(1)
+
+      const error = await sending
+      initialized.resolve({ producerId: '1000', producerEpoch: 0 })
+      await jest.advanceTimersByTimeAsync(0)
+      expect(error).toBeInstanceOf(KafkaJSDeliveryTimeout)
+      expect(error.outcome).toBe('unsent')
+      expect(jest.getTimerCount()).toBe(0)
+    })
+
+    test('a delivery deadline beyond one timer interval ends at its absolute time, not with a capped retrier', async () => {
+      const harness = createHarness({ layout: { [TOPIC]: { 0: 1 } } })
+      const plain = createSendMessages({
+        logger: newLogger(),
+        cluster: harness.cluster,
+        retrier: createRetry(RETRY),
+        partitioner: jest.fn(),
+        eosManager: harness.eosManager,
+        idempotence: new Idempotence({ enabled: false, explicit: false, logger: newLogger() }),
+        retry: RETRY,
+        deliveryTimeout: MAX_TIMER_DELAY,
+      })
+      const answers = [deferred(), deferred()]
+      const answerOf = ({ topicData }, errorCode) =>
+        partitionResults({
+          topics: topicData.map(({ topic, partitions }) => ({
+            topicName: topic,
+            partitions: partitions.map(({ partition }) => ({ partition, errorCode })),
+          })),
+        })
+      const produce = harness.broker(1).produce
+      for (const answer of answers) {
+        produce.mockImplementationOnce(async (request) => {
+          const refusal = request.guard(100)
+          if (refusal) throw refusal
+          return answerOf(request, await answer.promise)
+        })
+      }
+      jest.useFakeTimers({ now: 0 })
+
+      const sending = plain
+        .sendPartitioned({
+          acks: -1,
+          timeout: 30000,
+          compression: 0,
+          batches: [{ topic: TOPIC, partition: 0, messages: records(0), createdAt: 1000 }],
+        })
+        .catch((e) => e)
+      const isSettled = settledFlag(sending)
+      await jest.advanceTimersByTimeAsync(MAX_TIMER_DELAY - 5)
+      expect(produce).toHaveBeenCalledTimes(1)
+      answers[0].resolve(NOT_LEADER_OR_FOLLOWER)
+      await jest.advanceTimersByTimeAsync(0)
+      expect(isSettled()).toBe(false)
+
+      await jest.advanceTimersByTimeAsync(1004)
+      expect(produce).toHaveBeenCalledTimes(2)
+      expect(Date.now()).toBe(MAX_TIMER_DELAY + 999)
+      expect(isSettled()).toBe(false)
+      await jest.advanceTimersByTimeAsync(1)
+
+      const error = await sending
+      answers[1].resolve(0)
+      await jest.advanceTimersByTimeAsync(0)
+      expect(error).toBeInstanceOf(KafkaJSDeliveryTimeout)
+      expect(error.outcome).toBe('unknown')
+      expect(jest.getTimerCount()).toBe(0)
+    })
+
+    test('a delivery already settled by its timeout is not settled again when the transaction arms, so a later one on the wire keeps its deadline', async () => {
+      const held = await startMixedDeadlines()
+      const { harness } = held
+      jest.useFakeTimers({ now: 1000 })
+      const settlers = [0, 1, 2].map(() => ({ resolve: jest.fn(), reject: jest.fn() }))
+      const sending = harness.sendMessages
+        .sendPartitioned({
+          acks: -1,
+          timeout: 30000,
+          compression: 0,
+          batches: settlers.map((settler, partition) => ({
+            topic: TOPIC,
+            partition,
+            messages: records(partition),
+            createdAt: partition === 2 ? 1000 : 0,
+            settlers: [settler],
+          })),
+        })
+        .catch((e) => e)
+      const isSettled = settledFlag(sending)
+
+      try {
+        await expireAtTheGuard(held)
+        expect(isSettled()).toBe(false)
+        expect(jest.getTimerCount()).toBeGreaterThan(0)
+
+        await jest.advanceTimersByTimeAsync(1000)
+        const rejections = settlers.map(({ reject }) => reject.mock.calls.map(([error]) => error))
+        expect(rejections.map((errors) => errors.length)).toEqual([1, 1, 1])
+        for (const [error] of rejections) expect(error).toBeInstanceOf(KafkaJSDeliveryTimeout)
+        expect(rejections[0][0]).not.toBe(rejections[1][0])
+        expect(rejections[2][0].outcome).toBe('unknown')
+        expect(await sending).toBeInstanceOf(KafkaJSDeliveryTimeout)
+        expect(jest.getTimerCount()).toBe(0)
+      } finally {
+        await releaseMixedDeadlines(held)
+        await sending
+      }
+    })
+
+    test('a record already written is not reported unsent because a batch beside it expired', async () => {
+      const held = await startMixedDeadlines()
+      const { harness } = held
+      jest.useFakeTimers({ now: 0 })
+      const accumulator = new Accumulator({
+        linger: 1000,
+        batchSize: 16384,
+        partition: harness.sendMessages.partition,
+        sendPartitioned: harness.sendMessages.sendPartitioned,
+      })
+      const append = (partition) =>
+        accumulator
+          .append({
+            acks: -1,
+            timeout: 30000,
+            compression: 0,
+            topicMessages: [{ topic: TOPIC, messages: records(partition) }],
+          })
+          .catch((e) => e)
+      const appends = [append(0), append(1)]
+      await jest.advanceTimersByTimeAsync(0)
+      jest.setSystemTime(1000)
+      appends.push(append(2))
+      await jest.advanceTimersByTimeAsync(0)
+      const flushing = accumulator.flush()
+      const isSettled = settledFlag(appends[2])
+
+      try {
+        await expireAtTheGuard(held)
+        expect(isSettled()).toBe(false)
+
+        await jest.advanceTimersByTimeAsync(1000)
+        const [first, second, third] = await Promise.all(appends)
+        expect(first).toBeInstanceOf(KafkaJSDeliveryTimeout)
+        expect(second).toBeInstanceOf(KafkaJSDeliveryTimeout)
+        expect(third).toBeInstanceOf(KafkaJSDeliveryTimeout)
+        expect(third.outcome).toBe('unknown')
+        expect(jest.getTimerCount()).toBe(0)
+      } finally {
+        await releaseMixedDeadlines(held)
+        await Promise.all([...appends, flushing])
+      }
     })
   })
 

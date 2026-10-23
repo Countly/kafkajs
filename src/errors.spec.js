@@ -757,3 +757,38 @@ describe('the new error classes are exported from the package entry', () => {
     }
   )
 })
+
+describe('delivery transmission evidence', () => {
+  test('keeps cause fields and independent outcomes on distinct timeout instances', () => {
+    const cause = new KafkaJSProtocolError({
+      type: 'NOT_LEADER_OR_FOLLOWER',
+      code: 6,
+      message: 'leader moved',
+      retriable: true,
+    })
+    const unsent = new KafkaJSDeliveryTimeout('deadline', { cause, outcome: 'unsent' })
+    const unknown = new KafkaJSDeliveryTimeout('deadline', { cause, outcome: 'unknown' })
+    expect(unsent).toMatchObject({ type: 'NOT_LEADER_OR_FOLLOWER', code: 6, outcome: 'unsent' })
+    expect(unknown).toMatchObject({ type: 'NOT_LEADER_OR_FOLLOWER', code: 6, outcome: 'unknown' })
+    expect(unsent).not.toBe(unknown)
+    expect(cause).not.toHaveProperty('outcome')
+    expect(new KafkaJSDeliveryTimeout('retry budget')).not.toHaveProperty('outcome')
+    expect(new KafkaJSConnectionError('connection')).not.toHaveProperty('outcome')
+    expect(new KafkaJSInvalidConfigurationError('configuration')).not.toHaveProperty('outcome')
+    expect(
+      new KafkaJSNumberOfRetriesExceeded(cause, { retryCount: 1, retryTime: 1 })
+    ).not.toHaveProperty('outcome')
+  })
+
+  test('contains a cause whose diagnostic field access throws', () => {
+    const cause = new Error('failure')
+    Object.defineProperty(cause, 'code', {
+      get() {
+        throw new Error('diagnostic access')
+      },
+    })
+    expect(
+      () => new KafkaJSDeliveryTimeout('deadline', { cause, outcome: 'unknown' })
+    ).not.toThrow()
+  })
+})

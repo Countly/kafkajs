@@ -145,8 +145,8 @@ export interface ProducerConfig {
    * rejects with `KafkaJSDeliveryTimeout`. An integer of at least `linger + requestTimeout` (5 ms
    * more than `requestTimeout` at the default `linger`) and at most 2147483647. The bound runs
    * from the send and includes the wait for `linger` and, on an idempotent producer, for the
-   * producer id. A request already sent settles on its answer or on `requestTimeout`, so a send
-   * can end up to `requestTimeout` after this deadline.
+   * producer id. A queued or on-wire request settles at the deadline; a late answer cannot settle
+   * the send again.
    */
   deliveryTimeout?: number
 }
@@ -1980,7 +1980,9 @@ export class KafkaJSInvalidConfigurationError extends KafkaJSNonRetriableError {
  * transaction has to be aborted, outside one the producer stays usable.
  */
 export class KafkaJSDeliveryTimeout extends KafkaJSNonRetriableError {
-  constructor(e: Error | string, options?: { cause?: Error })
+  /** Transmission evidence for this delivery; absence makes no claim about delivery. */
+  readonly outcome?: 'unsent' | 'unknown' 
+  constructor(e: Error | string, options?: { cause?: Error; outcome?: 'unsent' | 'unknown' })
 }
 
 /**
