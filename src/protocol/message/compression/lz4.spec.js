@@ -482,6 +482,47 @@ describe('Protocol > Compression > LZ4', () => {
         )
       })
     })
+
+    describe('the preflight work slicing', () => {
+      test('extension work respects a partly consumed slice', async () => {
+        const data = Buffer.alloc(3 * 87380 + 1 + 16450, 255)
+        for (let i = 0; i < 87380; i++) {
+          data[i * 3] = 0
+          data[i * 3 + 1] = 0
+          data[i * 3 + 2] = 1
+        }
+        data[3 * 87380] = 0xf0
+        const header = Buffer.from([0x04, 0x22, 0x4d, 0x18, 0x40, 0x70, 0])
+        const length = Buffer.alloc(4)
+        length.writeUInt32LE(data.length)
+        const input = Buffer.concat([header, length, data, Buffer.alloc(4)])
+        let reads = 0
+        let widest = 0
+        const proxy = new Proxy(input, {
+          get(target, key) {
+            if (typeof key === 'string' && Number.isInteger(Number(key))) reads++
+            return Reflect.get(target, key, target)
+          },
+        })
+        const immediate = global.setImmediate
+        const turns = jest.spyOn(global, 'setImmediate').mockImplementation((cb) => {
+          widest = Math.max(widest, reads)
+          reads = 0
+          return immediate(cb)
+        })
+        try {
+          await expect(
+            lz4Codec.decompress(proxy, { maxOutputLength: 64 * 1048576 })
+          ).rejects.toMatchObject({
+            reason: 'decompression',
+          })
+          widest = Math.max(widest, reads)
+          expect(widest).toBeLessThanOrEqual(262144)
+        } finally {
+          turns.mockRestore()
+        }
+      })
+    })
   })
 
   describe('the audited release', () => {

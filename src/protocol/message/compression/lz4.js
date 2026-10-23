@@ -70,99 +70,125 @@ const readHeader = (input) => {
 }
 
 /**
- * Walks the sequences of one compressed block and adds up what they decode to, yielding to the
- * event loop every `SLICE` bytes. The last sequence holds literals only.
+ * Accounts for input skipped without reading it, taking a turn before crossing a slice boundary.
+ * @param {{ work: number }} slice input bytes consumed since the last yield
+ * @param {number} bytes input bytes to skip
+ * @returns {Generator<void, void>}
+ */
+function* consume(slice, bytes) {
+  while (bytes > 0) {
+    if (slice.work === SLICE) {
+      slice.work = 0
+      yield
+    }
+    const taken = Math.min(bytes, SLICE - slice.work)
+    slice.work += taken
+    bytes -= taken
+  }
+}
+
+/**
+ * Walks one compressed block, including length extensions and final literals, within the shared
+ * input slice budget. The last sequence holds literals only.
  * @param {Buffer} input
  * @param {number} start first byte of the block
  * @param {number} end exclusive end of the block
- * @param {{ work: number }} slice bytes walked since the last yield
+ * @param {{ work: number }} slice input bytes consumed since the last yield
  * @returns {Generator<void, number>} the block's decoded length
- * @throws {Lz4FrameError} for a length, literal run or offset field that leaves the block, or a
- *   length extension above the largest block
+ * @throws {Lz4FrameError} for a malformed sequence or a length above the largest block
  */
 function* decodedLength(input, start, end, slice) {
   let at = start
   let total = 0
   /**
-   * Reads the extension of a length nibble of 15. No length above the largest block is valid, for
-   * literals or for a match, so a longer run is refused where it is read: a scan stays within
-   * about 16 KiB, however long the run in the input.
-   * @returns {number} the length
+   * Takes a turn before reading a byte that would cross the input slice boundary.
+   * @returns {Generator<void, number>} the next input byte
    */
-  const extended = () => {
+  const read = function* () {
+    if (slice.work === SLICE) {
+      slice.work = 0
+      yield
+    }
+    slice.work += 1
+    return input[at++]
+  }
+  /**
+   * Reads a length extension within the shared slice budget and the largest valid block length.
+   * @returns {Generator<void, number>} the length
+   * @throws {Lz4FrameError} for a truncated or oversized extension
+   */
+  const extended = function* () {
     let length = 15
     let next = 255
     while (next === 255) {
       if (at >= end) throw new Lz4FrameError('LZ4 block ends inside a length')
-      next = input[at++]
+      next = yield* read()
       length += next
       if (length > LARGEST_BLOCK) throw new Lz4FrameError('LZ4 length is above the largest block')
     }
     return length
   }
   while (at < end) {
-    const token = input[at++]
-    const literals = token >> 4 === 15 ? extended() : token >> 4
+    const token = yield* read()
+    const literals = token >> 4 === 15 ? yield* extended() : token >> 4
     if (at + literals > end) throw new Lz4FrameError('LZ4 literals run past the block')
+    yield* consume(slice, literals)
     at += literals
     total += literals
     if (at === end) break
-    if (at + 2 > end || (input[at] === 0 && input[at + 1] === 0)) {
-      throw new Lz4FrameError('LZ4 block has no valid match offset')
-    }
-    at += 2
-    total += 4 + ((token & 15) === 15 ? extended() : token & 15)
-    slice.work += at - start
-    start = at
-    if (slice.work >= SLICE) {
-      slice.work = 0
-      yield
-    }
+    if (at + 2 > end) throw new Lz4FrameError('LZ4 block has no valid match offset')
+    const low = yield* read()
+    const high = yield* read()
+    if (low === 0 && high === 0) throw new Lz4FrameError('LZ4 block has no valid match offset')
+    total += 4 + ((token & 15) === 15 ? yield* extended() : token & 15)
   }
   return total
 }
 
 /**
- * Adds up what the first frame decodes to: stored blocks by their size and compressed blocks by
- * their exact decoded length (`exact`) or, for the fast bound of an independent frame, by the most
- * 255 to 1 expansion allows within the frame's block maximum.
+ * Measures the first frame, retaining one input budget across blocks and both measuring passes.
+ * Stored blocks use their size; compressed blocks use their exact length or the independent
+ * frame's fast expansion bound.
  * @param {Buffer} input
- * @param {object} header from `readHeader`
- * @param {boolean} exact whether to walk the tokens of compressed blocks
- * @returns {Generator<void, number>} the total
- * @throws {Lz4FrameError} for a block above the frame's maximum, a block that runs past the input
- *   or a decoded block above the maximum
+ * @param {object} header the validated frame descriptor
+ * @param {boolean} exact whether to walk compressed sequences
+ * @param {{ work: number }} slice input bytes consumed since the last yield
+ * @returns {Generator<void, number>} the total decoded length or its fast upper bound
+ * @throws {Lz4FrameError} for a truncated or oversized block
  */
-function* measure(input, header, exact) {
-  const slice = { work: 0 }
+function* measure(input, header, exact, slice) {
   let at = header.first
   let total = 0
   while (at + 4 <= input.length) {
+    if (slice.work > SLICE - 4) {
+      slice.work = 0
+      yield
+    }
     const word = input.readUInt32LE(at)
+    slice.work += 4
     const size = word & 0x7fffffff
     at += 4
     if (word === 0) break
     if (size > header.max)
       throw new Lz4FrameError(`LZ4 block of ${size} bytes is above its maximum`)
+    const checksum = header.blockChecksum ? 4 : 0
     const end = at + size
-    if (end + (header.blockChecksum ? 4 : 0) > input.length) {
+    if (end + checksum > input.length) {
       throw new Lz4FrameError('LZ4 block runs past the input')
     }
     if (word >= 0x80000000) {
       total += size
+      yield* consume(slice, size)
     } else if (exact) {
       const decoded = yield* decodedLength(input, at, end, slice)
       if (decoded > header.max) throw new Lz4FrameError('LZ4 block decodes above its maximum')
       total += decoded
     } else {
       total += Math.min(header.max, size * 255)
+      yield* consume(slice, size)
     }
-    at = end + (header.blockChecksum ? 4 : 0)
-    slice.work += size + 4
-    if (slice.work >= SLICE) {
-      slice.work = 0
-      yield
-    }
+    yield* consume(slice, checksum)
+    at = end + checksum
   }
   return total
 }
@@ -198,8 +224,9 @@ const drive = async (steps) => {
 const preflight = async (input, limit) => {
   const header = readHeader(input)
   if (header === null) return
-  if (header.independent && (await drive(measure(input, header, false))) <= limit) return
-  const total = await drive(measure(input, header, true))
+  const slice = { work: header.first }
+  if (header.independent && (await drive(measure(input, header, false, slice))) <= limit) return
+  const total = await drive(measure(input, header, true, slice))
   if (header.claim !== null && header.claim !== BigInt(total)) {
     throw new Lz4FrameError(
       `LZ4 content size ${header.claim} disagrees with ${total} decoded bytes`
