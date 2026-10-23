@@ -23,11 +23,13 @@ const {
   KafkaJSInvalidFrameError,
   KafkaJSCorruptRecordError,
   KafkaJSCommitFailedError,
+  KafkaJSBufferExhaustedError,
+  KafkaJSRecordTooLargeError,
   isPollIntervalExceeded,
 } = errors
 const createRetry = require('./retry')
 const { createErrorFromCode, errorCodes } = require('./protocol/error')
-const { classify } = require('./producer/state/errorClassifier')
+const { classify, transactionStateFor } = require('./producer/state/errorClassifier')
 const packageEntry = require('../index')
 
 describe('isRebalancing', () => {
@@ -815,4 +817,82 @@ describe('delivery transmission evidence', () => {
       () => new KafkaJSDeliveryTimeout('deadline', { cause, outcome: 'unknown' })
     ).not.toThrow()
   })
+})
+
+describe('the errors of a send the producer buffer refuses', () => {
+  test('KafkaJSBufferExhaustedError is retriable and names its reason and the buffer that refused it', () => {
+    const cause = new Error('cause')
+    const error = new KafkaJSBufferExhaustedError('no room', {
+      reason: 'timeout',
+      requested: 600,
+      available: 10,
+      capacity: 1024,
+      waitedMs: 60000,
+      cause,
+    })
+
+    expect(error).toBeInstanceOf(KafkaJSError)
+    expect(error).not.toBeInstanceOf(KafkaJSNonRetriableError)
+    expect(error).toMatchObject({
+      name: 'KafkaJSBufferExhaustedError',
+      message: 'no room',
+      retriable: true,
+      category: 'retriable',
+      reason: 'timeout',
+      requested: 600,
+      available: 10,
+      capacity: 1024,
+      waitedMs: 60000,
+    })
+    expect(error.cause).toBe(cause)
+  })
+
+  test("KafkaJSRecordTooLargeError is non-retriable, with MESSAGE_TOO_LARGE's type, code and Produce category", () => {
+    const error = new KafkaJSRecordTooLargeError('never fits', {
+      reason: 'bufferMemory',
+      scope: 'record',
+      size: 2048,
+      limit: 1024,
+      topic: 'topic-a',
+    })
+
+    expect(error).toBeInstanceOf(KafkaJSNonRetriableError)
+    expect(error).toMatchObject({
+      name: 'KafkaJSRecordTooLargeError',
+      retriable: false,
+      type: 'MESSAGE_TOO_LARGE',
+      code: 10,
+      category: 'invalidConfiguration',
+      reason: 'bufferMemory',
+      scope: 'record',
+      size: 2048,
+      limit: 1024,
+      topic: 'topic-a',
+    })
+    expect(
+      new KafkaJSRecordTooLargeError('x', {
+        reason: 'bufferMemory',
+        scope: 'send',
+        size: 2,
+        limit: 1,
+      })
+    ).not.toHaveProperty('topic')
+  })
+
+  test('inside a transaction each leaves it abortable, never fatal, after the classifier saw it', () => {
+    const exhausted = new KafkaJSBufferExhaustedError('x', { reason: 'queue-full' })
+    const tooLarge = new KafkaJSRecordTooLargeError('x', { reason: 'bufferMemory', scope: 'send' })
+    classify(exhausted, 'produce', { transactional: true })
+    classify(tooLarge, 'produce', { transactional: true })
+
+    expect(transactionStateFor(exhausted)).toEqual('ABORTABLE_ERROR')
+    expect(transactionStateFor(tooLarge)).toEqual('ABORTABLE_ERROR')
+  })
+
+  test.each(['KafkaJSBufferExhaustedError', 'KafkaJSRecordTooLargeError'])(
+    '%s is exported from the package entry as the same class',
+    (name) => {
+      expect(packageEntry[name]).toBe(errors[name])
+    }
+  )
 })

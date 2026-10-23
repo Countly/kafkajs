@@ -6,6 +6,7 @@ const InstrumentationEventEmitter = require('../instrumentation/emitter')
 const createEosManager = require('./eosManager')
 const createMessageProducer = require('./messageProducer')
 const Idempotence = require('./idempotence')
+const { Admission } = require('./state/admission')
 const { events, wrap: wrapEvent, unwrap: unwrapEvent } = require('./instrumentationEvents')
 const {
   KafkaJSNonRetriableError,
@@ -48,11 +49,17 @@ const endedTransactionError = () =>
 const codeOf = (error) => error.code ?? error.cause?.code
 
 /**
- * The accumulator's and the delivery deadline's defaults: the Java client's 4.x `linger.ms`,
- * `batch.size` and `delivery.timeout.ms`.
+ * The accumulator's, the delivery deadline's and the buffer's defaults: the Java client's 4.x
+ * `linger.ms`, `batch.size`, `delivery.timeout.ms`, `buffer.memory` and `max.block.ms`.
  * @see https://github.com/apache/kafka/blob/4.3/clients/src/main/java/org/apache/kafka/clients/producer/ProducerConfig.java
  */
-const DEFAULTS = Object.freeze({ linger: 5, batchSize: 16384, deliveryTimeout: 120000 })
+const DEFAULTS = Object.freeze({
+  linger: 5,
+  batchSize: 16384,
+  deliveryTimeout: 120000,
+  bufferMemory: 33554432,
+  maxBlockMs: 60000,
+})
 
 /**
  * The retry options of a send's delivery: the Java client's `retry.backoff.ms` and
@@ -91,6 +98,11 @@ const definedKeys = (options) =>
  * @param {{ gzip?: number, zstd?: number }} [params.compressionLevels] per-codec levels
  * @param {number} [params.deliveryTimeout] ms one send may take, retries included; past it the
  *   send rejects with `KafkaJSDeliveryTimeout`
+ * @param {number} [params.bufferMemory=33554432] bytes the producer's sends may hold at once (see
+ *   `Admission`), its own and its transactions' together
+ * @param {number} [params.maxBlockMs=60000] ms a send waits for room in the buffer
+ * @param {Admission} [params.admission] the buffer itself, built from `bufferMemory` and
+ *   `maxBlockMs` when absent
  * @param {InstrumentationEventEmitter} [params.instrumentationEmitter]
  *
  * @returns {import('../../types').Producer}
@@ -109,6 +121,9 @@ const createProducer = ({
   batchSize = DEFAULTS.batchSize,
   deliveryTimeout,
   compressionLevels,
+  bufferMemory = DEFAULTS.bufferMemory,
+  maxBlockMs = DEFAULTS.maxBlockMs,
+  admission = new Admission({ capacity: bufferMemory, maxBlockMs }),
   instrumentationEmitter: rootInstrumentationEmitter,
 }) => {
   let connectionStatus = CONNECTION_STATUS.DISCONNECTED
@@ -185,6 +200,7 @@ const createProducer = ({
     compressionLevels,
     linger,
     batchSize,
+    admission,
     getConnectionStatus: () => connectionStatus,
     isClosing,
     instrumentationEmitter,
@@ -305,6 +321,7 @@ const createProducer = ({
         compressionLevels,
         linger,
         batchSize,
+        admission,
         eosManager: transactionalEosManager,
         idempotence,
         getConnectionStatus: () => connectionStatus,

@@ -377,7 +377,10 @@ class Send {
 
 /**
  * The drain loop's own settler of one batch, and what the loop knows about it: whether it is
- * settled or on the wire, its deadline, its last error and its last backoff.
+ * settled or on the wire, its deadline, its last error and its last backoff. A batch is resolved
+ * only by its request's answer and then retires (see the accumulator's `retire`); one rejected while
+ * no request carries it retires at once, and one rejected on the wire when its request's answer or
+ * failure arrives.
  */
 class Delivery {
   /**
@@ -407,6 +410,15 @@ class Delivery {
   }
 
   /**
+   * Drops the drain copy's payload and retires its accumulator owner once the attempt ends.
+   * @returns {void}
+   */
+  retire() {
+    this.batch.messages = null
+    this.batch.retire?.()
+  }
+
+  /**
    * Settles the batch for its send, once; a later call does nothing. The batch's other callers are
    * dropped when its deadline settles it, but this delivery stays in `batch.settlers`, so a loop
    * over them - `abortQueued` when a transaction arms - can reach it again.
@@ -417,6 +429,7 @@ class Delivery {
     if (this.settled) return
     this.settled = true
     this.detachDeadline(this)
+    this.retire()
     this.send.delivered(metadata)
   }
 
@@ -430,6 +443,10 @@ class Delivery {
     if (this.settled) return
     this.settled = true
     this.detachDeadline(this)
+    if (!this.dispatched) {
+      if (this.expired) this.batch.retire?.()
+      else this.retire()
+    }
     this.send.failed(error)
   }
 }
@@ -898,6 +915,8 @@ class DrainLoop {
     const manager = this.#eosManager.stateManager
     for (const { batch, error, transmitted } of this.#expired.splice(0)) {
       manager.fail(batch, error, { transmitted })
+      const delivery = deliveryOf(batch)
+      if (!delivery.dispatched) delivery.retire()
     }
   }
 
@@ -1120,7 +1139,7 @@ class DrainLoop {
         else if (result?.error?.code === 46) manager.complete(batch, { duplicate: true })
         if (result?.error) this.#sideChannels(result.error)
         if (!deliveryOf(batch).expired) manager.sequencer.fail(batch)
-        batch.retire?.()
+        deliveryOf(batch).retire()
         return
       }
       if (result === undefined) {
@@ -1159,7 +1178,7 @@ class DrainLoop {
       const delivery = deliveryOf(batch)
       if (delivery.settled) {
         if (!delivery.expired) manager.sequencer.fail(batch)
-        batch.retire?.()
+        delivery.retire()
         continue
       }
       if (error instanceof ProduceAttemptRefused) {
@@ -1687,6 +1706,7 @@ const createSendMessages = ({
     }
 
     if (acks !== -1) {
+      batches.forEach((batch) => batch.retire?.())
       throw new KafkaJSInvariantViolation(`An idempotent send must use acks -1, not ${acks}`)
     }
 
@@ -1738,6 +1758,13 @@ const createSendMessages = ({
    * its own first send, has already passed rejects without being sent and the others go out; the
    * budget ends at the earliest deadline among those sent. Once the budget runs out, or the call
    * fails before any request, the batches still unsettled reject with the retrier's error.
+   *
+   * Every await of the call (the metadata, the broker lookups, the requests, the recovery and the
+   * side channels of a late error) can hold the batches it routes. So a batch that has settled
+   * while no request carries it, or whose request has ended since, detaches at once (see the
+   * accumulator's `detach`): it drops its records and gives back their shares, and whatever still
+   * holds the batch holds no record. Its sends' shells and its debit stay charged until the call's
+   * work has ended, when every batch of the call retires.
    * @see https://github.com/apache/kafka/blob/4.3/clients/src/main/java/org/apache/kafka/clients/producer/internals/Sender.java
    * @param {object} request see `sendPartitioned`
    * @returns {Promise<object[]>} the `RecordMetadata` of every batch, once all have settled;
@@ -1760,6 +1787,10 @@ const createSendMessages = ({
       if (failure !== null) rejectDone(failure)
       else resolveDone(metadata)
     }
+    /** Retires every batch of the call, once nothing of the call holds them. @returns {void} */
+    const retireAll = () => {
+      for (const batch of deliveries.keys()) batch.retire?.()
+    }
     /**
      * Settles one live batch exactly once and revokes its current unwritten attempt.
      * @param {object} batch
@@ -1772,6 +1803,7 @@ const createSendMessages = ({
       const delivery = deliveries.get(batch)
       delivery.settled = true
       delivery.currentAttempt?.revoke()
+      if (!delivery.carried) batch.detach?.()
       if (error !== undefined) failure = failure || error
       else if (value !== undefined) metadata.push(value)
       batch.settlers?.forEach((settler) =>
@@ -1813,6 +1845,7 @@ const createSendMessages = ({
         everWritten: false,
         expired: false,
         currentAttempt: null,
+        carried: false,
         lastError: undefined,
       }
       deliveries.set(batch, delivery)
@@ -1841,6 +1874,32 @@ const createSendMessages = ({
     }
 
     /**
+     * The Produce request of `sent`, built in a frame of its own, so that once the request has
+     * ended nothing of this call holds its topic data, which lists the batches' records.
+     * @param {object[]} sent
+     * @param {ProduceAttempt} attempt
+     * @returns {object}
+     */
+    const requestOf = (sent, attempt) => {
+      const topicData = topicDataOf(sent)
+      return {
+        ...plainRequestOf(topicData.map(({ topic }) => topic)),
+        acks,
+        timeout,
+        compression,
+        compressionLevel:
+          compression === Compression.GZIP
+            ? compressionLevels?.gzip
+            : compression === Compression.ZSTD
+              ? compressionLevels?.zstd
+              : undefined,
+        topicData,
+        perPartitionResults: true,
+        guard: attempt.guard,
+      }
+    }
+
+    /**
      * Builds one request with fixed membership after filtering all prior awaits.
      * @param {object} broker the broker already looked up
      * @param {object[]} candidates batches proposed for this broker
@@ -1849,33 +1908,31 @@ const createSendMessages = ({
     const produceTo = async (broker, candidates) => {
       const sent = candidates.filter((batch) => unsettled.has(batch))
       if (sent.length === 0) return null
+      const carried = sent.map((batch) => deliveries.get(batch))
       const attempt = new ProduceAttempt(
-        sent.map((batch) => deliveries.get(batch)),
+        carried,
         getConnectionStatus || (() => CONNECTION_STATUS.CONNECTED),
         expire
       )
-      const topicData = topicDataOf(sent)
+      /** The request ended: a batch that settled meanwhile detaches now. @returns {void} */
+      const ended = () => {
+        for (const delivery of carried) {
+          delivery.carried = false
+          if (delivery.settled) delivery.batch.detach?.()
+        }
+      }
+      carried.forEach((delivery) => {
+        delivery.carried = true
+      })
       let results
       try {
-        results = await broker.produce({
-          ...plainRequestOf(topicData.map(({ topic }) => topic)),
-          acks,
-          timeout,
-          compression,
-          compressionLevel:
-            compression === Compression.GZIP
-              ? compressionLevels?.gzip
-              : compression === Compression.ZSTD
-                ? compressionLevels?.zstd
-                : undefined,
-          topicData,
-          perPartitionResults: true,
-          guard: attempt.guard,
-        })
+        results = await broker.produce(requestOf(sent, attempt))
       } catch (error) {
-        if (error instanceof ProduceAttemptRefused) return error
-        attachFailingRecords(error, topicData)
-        for (const batch of sent) deliveries.get(batch).lastError = error
+        const refused = error instanceof ProduceAttemptRefused
+        if (!refused) attachFailingRecords(error, topicDataOf(sent))
+        ended()
+        if (refused) return error
+        for (const delivery of carried) delivery.lastError = error
         if (sent.every((batch) => !unsettled.has(batch))) {
           await sideChannels(error)
           return null
@@ -1884,6 +1941,7 @@ const createSendMessages = ({
         sent.forEach((batch) => settle(batch, undefined, error))
         return null
       }
+      ended()
       if (acks === 0) {
         sent.forEach((batch) => settle(batch, undefined))
         return null
@@ -2028,10 +2086,15 @@ const createSendMessages = ({
       }
     }
     if (unsettled.size > 0)
-      work().catch((error) => {
-        for (const batch of [...unsettled]) settle(batch, undefined, error)
-      })
-    else finish()
+      work()
+        .catch((error) => {
+          for (const batch of [...unsettled]) settle(batch, undefined, error)
+        })
+        .finally(retireAll)
+    else {
+      finish()
+      retireAll()
+    }
     return done
   }
 

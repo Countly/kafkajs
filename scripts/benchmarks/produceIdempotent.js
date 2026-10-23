@@ -16,8 +16,14 @@
  * Prints one JSON line: { idempotent, transactional, linger, batchSize, partitions, messages,
  *   size, concurrency, rate, subscribeChannels, elapsedMs, messagesPerSecond, produceRequests,
  *   recordsPerRequest }
- * `produceRequests` counts the Produce requests the producer sent, from its `REQUEST` events.
+ * `produceRequests` counts the Produce requests the producer sent, from its `REQUEST` events, and
+ * `appendCalls`, `acquireCalls` and `deadlines` the timed sends that went through the accumulator,
+ * the buffer and the delivery deadline (`sendPathCounters`): each equals `messages` in a tree that
+ * has the code it counts. Under `node --expose-gc`, `retainedHeapBytes` is the heap the timed sends
+ * left behind, read after a full collection before and after them.
  */
+const sendPathCounters = require('./sendPathCounters')
+const counters = sendPathCounters()
 const { Kafka, logLevel } = require('../../index')
 const subscribeChannels = require('./subscribeChannels')
 
@@ -197,10 +203,13 @@ const main = async () => {
   const message = { topic: TOPIC, messages: [{ value: Buffer.alloc(SIZE, 'x') }] }
   await warmUp(producer, message)
   produceRequests = 0
+  counters.reset()
 
+  const heapBefore = sendPathCounters.heapAfterGc()
   const started = process.hrtime.bigint()
   await sendAll(producer, message)
   const elapsedMs = Number(process.hrtime.bigint() - started) / 1e6
+  const heapAfter = sendPathCounters.heapAfterGc()
 
   console.log(
     JSON.stringify({
@@ -218,6 +227,8 @@ const main = async () => {
       messagesPerSecond: (MESSAGES / elapsedMs) * 1000,
       produceRequests,
       recordsPerRequest: MESSAGES / produceRequests,
+      retainedHeapBytes: heapBefore === null ? null : heapAfter - heapBefore,
+      ...counters.read(),
     })
   )
 

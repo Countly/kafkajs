@@ -600,6 +600,70 @@ class KafkaJSCommitFailedError extends KafkaJSNonRetriableError {
 }
 
 /**
+ * A send could not be admitted to the producer's buffer (`bufferMemory`): `reason` is `'timeout'`
+ * when no room came within `maxBlockMs`, and `'queue-full'` when the sends already waiting for room
+ * hold so many bytes between them that this one would take them past `bufferMemory`. Nothing of the
+ * send was queued. Retriable: back off and send again. Inside a transaction the refusal leaves the
+ * transaction able only to abort. `requested` is the send's charge, `available` and `capacity` the
+ * buffer's free bytes and size when it was refused, and `waitedMs` how long it waited.
+ */
+class KafkaJSBufferExhaustedError extends KafkaJSError {
+  /**
+   * @param {Error|string} e
+   * @param {object} options
+   * @param {'timeout'|'queue-full'} options.reason
+   * @param {number} options.requested
+   * @param {number} options.available
+   * @param {number} options.capacity
+   * @param {number} options.waitedMs
+   * @param {Error} [options.cause]
+   */
+  constructor(e, { reason, requested, available, capacity, waitedMs, cause } = {}) {
+    super(e, { cause })
+    this.name = 'KafkaJSBufferExhaustedError'
+    this.reason = reason
+    this.requested = requested
+    this.available = available
+    this.capacity = capacity
+    this.waitedMs = waitedMs
+  }
+}
+
+/**
+ * A record, or a whole send, can never fit: its charge is above `bufferMemory`. Raised by the
+ * client before anything of the send is queued. Non-retriable. It carries the `type` and `code` of
+ * the broker's own MESSAGE_TOO_LARGE (10), so a check on either catches both, and that error's
+ * category on a Produce request, `invalidConfiguration`: inside a transaction the refusal leaves
+ * the transaction able only to abort. `scope` says whether one record (`topic` names its topic) or
+ * the send as a whole is too large; `size` is the charge found above `limit`, the record's own or
+ * that of the send up to the record that took it past `limit`.
+ */
+class KafkaJSRecordTooLargeError extends KafkaJSNonRetriableError {
+  /**
+   * @param {Error|string} e
+   * @param {object} options
+   * @param {'bufferMemory'} options.reason
+   * @param {'record'|'send'} options.scope
+   * @param {number} options.size
+   * @param {number} options.limit
+   * @param {string} [options.topic]
+   * @param {Error} [options.cause]
+   */
+  constructor(e, { reason, scope, size, limit, topic, cause } = {}) {
+    super(e, { cause })
+    this.name = 'KafkaJSRecordTooLargeError'
+    this.type = 'MESSAGE_TOO_LARGE'
+    this.code = 10
+    this.category = 'invalidConfiguration'
+    this.reason = reason
+    this.scope = scope
+    this.size = size
+    this.limit = limit
+    if (topic !== undefined) this.topic = topic
+  }
+}
+
+/**
  * Group-coordinator error codes. The error table still emits the legacy type names for
  * 14/15/16 (GROUP_LOAD_IN_PROGRESS / GROUP_COORDINATOR_NOT_AVAILABLE / NOT_COORDINATOR_FOR_GROUP)
  * for compatibility, so callers must match on the code, not the type string.
@@ -732,6 +796,8 @@ module.exports = {
   KafkaJSInvalidFrameError,
   KafkaJSCorruptRecordError,
   KafkaJSCommitFailedError,
+  KafkaJSBufferExhaustedError,
+  KafkaJSRecordTooLargeError,
   isRebalancing,
   isStaleCoordinator,
   COORDINATOR_LOAD_IN_PROGRESS_CODE,

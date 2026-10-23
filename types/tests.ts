@@ -61,6 +61,8 @@ import {
   KafkaJSInvalidFrameError,
   KafkaJSCorruptRecordError,
   KafkaJSCommitFailedError,
+  KafkaJSBufferExhaustedError,
+  KafkaJSRecordTooLargeError,
   KafkaJSConnectionClosedError,
   KafkaJSMemberIdRequired,
   KafkaJSInvariantViolation,
@@ -1167,3 +1169,48 @@ const maybeDelivered: 'unsent' | 'unknown' | undefined = deliveryEvidence.outcom
 new KafkaJSDeliveryTimeout('retry deadline passed')
 // @ts-expect-error an outcome is a transmission classification
 new KafkaJSDeliveryTimeout('delivery deadline passed', { outcome: 'sent' })
+
+// The producer's buffer: its two options and the two errors its refusals reject with.
+kafka.producer({ bufferMemory: 33554432, maxBlockMs: 60000 })
+kafka.producer({ bufferMemory: Number.MAX_SAFE_INTEGER, maxBlockMs: 0 })
+// @ts-expect-error bufferMemory is a number of bytes
+kafka.producer({ bufferMemory: '32m' })
+const exhausted = new KafkaJSBufferExhaustedError('no room', {
+  reason: 'queue-full',
+  requested: 600,
+  available: 0,
+  capacity: 1024,
+  waitedMs: 0,
+})
+const exhaustedIsRetriableClass: KafkaJSError = exhausted
+const exhaustedReason: 'timeout' | 'queue-full' = exhausted.reason
+const exhaustedFields: number[] = [
+  exhausted.requested,
+  exhausted.available,
+  exhausted.capacity,
+  exhausted.waitedMs,
+]
+// @ts-expect-error not a reason
+new KafkaJSBufferExhaustedError('x', { reason: 'full', requested: 1, available: 0, capacity: 1, waitedMs: 0 })
+const tooLarge = new KafkaJSRecordTooLargeError('never fits', {
+  reason: 'bufferMemory',
+  scope: 'record',
+  size: 2048,
+  limit: 1024,
+  topic: 'topic-a',
+})
+const tooLargeIsNonRetriable: KafkaJSNonRetriableError = tooLarge
+const tooLargeType: 'MESSAGE_TOO_LARGE' = tooLarge.type
+const tooLargeCode: 10 = tooLarge.code
+const tooLargeScope: 'record' | 'send' = tooLarge.scope
+const tooLargeTopic: string | undefined = tooLarge.topic
+new KafkaJSRecordTooLargeError('never fits', { reason: 'bufferMemory', scope: 'send', size: 2048, limit: 1024 })
+// @ts-expect-error not a scope
+new KafkaJSRecordTooLargeError('x', { reason: 'bufferMemory', scope: 'batch', size: 1, limit: 0 })
+const narrowed = (error: KafkaJSError) => {
+  if (error.name === 'KafkaJSBufferExhaustedError') return (error as KafkaJSBufferExhaustedError).waitedMs
+  if (error instanceof KafkaJSRecordTooLargeError) return error.size
+  return 0
+}
+void [exhaustedIsRetriableClass, exhaustedReason, exhaustedFields]
+void [tooLargeIsNonRetriable, tooLargeType, tooLargeCode, tooLargeScope, tooLargeTopic, narrowed]

@@ -30,6 +30,15 @@ test('the frame, record and commit error classes are exported by both entry poin
   }
 })
 
+test('the producer buffer error classes are exported by both entry points', async () => {
+  const cjs = require(PKG)
+  const esm = await import(PKG)
+  for (const name of ['KafkaJSBufferExhaustedError', 'KafkaJSRecordTooLargeError']) {
+    assert.equal(typeof cjs[name], 'function')
+    assert.equal(esm[name], cjs[name])
+  }
+})
+
 test('the packed client validates maxResponseSize', () => {
   const { Kafka, KafkaJSInvalidConfigurationError } = require(PKG)
   assert.doesNotThrow(() => new Kafka({ brokers: ['localhost:9092'], maxResponseSize: 4 }))

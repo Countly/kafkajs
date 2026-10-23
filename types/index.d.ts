@@ -150,6 +150,23 @@ export interface ProducerConfig {
    * request settles at the deadline; a late answer cannot settle the send again.
    */
   deliveryTimeout?: number
+  /**
+   * Bytes of sends the producer holds, charged as each record's wire size plus 64 (and 16 per
+   * header), each send 1536 plus the backing stores its Buffer views keep alive, and each batch
+   * 1024. Default 33554432 (32 MiB); an integer from 1 to Number.MAX_SAFE_INTEGER. With C this
+   * value: admitted sends hold at most C and waiting sends, which keep their records, at most
+   * another C; batch charges (1024 per live batch, taken without waiting) come on top, so the
+   * total charge is at most about 13.6 C in the worst case (one empty record per batch) and about
+   * 3 C for records of 1 KiB or more. A charge, not a limit on the process's memory. It also
+   * bounds the records held at once (at most 2C / 88); there is no separate record count option.
+   */
+  bufferMemory?: number
+  /**
+   * How long, in ms, a send waits for buffer memory before rejecting with
+   * KafkaJSBufferExhaustedError, capped by the delivery deadline. Default 60000; an integer from
+   * 0 to 2147483647 (0 rejects at once when the buffer is full).
+   */
+  maxBlockMs?: number
 }
 
 export interface Message {
@@ -2065,6 +2082,54 @@ export class KafkaJSCorruptRecordError extends KafkaJSNonRetriableError {
  * `STALE_ASSIGNMENT` and no `code`. Test `instanceof KafkaJSCommitFailedError` and `reason`.
  * `cause` is the loss.
  */
+/**
+ * A record or a send cannot ever fit: its charge is above `bufferMemory`. Non-retriable. Carries
+ * the type and code of the broker's own MESSAGE_TOO_LARGE so a check on either catches both;
+ * unlike a real broker answer, this error is raised by the client. A refusal at admission writes
+ * none of the send.
+ */
+export class KafkaJSRecordTooLargeError extends KafkaJSNonRetriableError {
+  readonly type: 'MESSAGE_TOO_LARGE'
+  readonly code: 10
+  readonly reason: 'bufferMemory'
+  readonly scope: 'record' | 'send'
+  readonly size: number
+  readonly limit: number
+  /** The record's topic; for a send that spans several topics, absent unless one topic caused it. */
+  readonly topic?: string
+  constructor(
+    e: Error | string,
+    options: {
+      reason: KafkaJSRecordTooLargeError['reason']
+      scope: KafkaJSRecordTooLargeError['scope']
+      size: number
+      limit: number
+      topic?: string
+      cause?: Error
+    }
+  )
+}
+
+/** No buffer memory became available within `maxBlockMs`, or too many sends were already waiting. Retriable. */
+export class KafkaJSBufferExhaustedError extends KafkaJSError {
+  readonly reason: 'timeout' | 'queue-full'
+  readonly requested: number
+  readonly available: number
+  readonly capacity: number
+  readonly waitedMs: number
+  constructor(
+    e: Error | string,
+    options: {
+      reason: KafkaJSBufferExhaustedError['reason']
+      requested: number
+      available: number
+      capacity: number
+      waitedMs: number
+      cause?: Error
+    }
+  )
+}
+
 export class KafkaJSCommitFailedError extends KafkaJSNonRetriableError {
   readonly reason: 'membership-lost' | 'poll-interval-exceeded' | 'stale-assignment'
   readonly cause: Error

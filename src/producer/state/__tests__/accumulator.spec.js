@@ -1750,7 +1750,7 @@ describe('Producer > the accumulator', () => {
       jest.useFakeTimers({ now: 0 })
     })
 
-    test('sendBatch resolves [] when its records are gone by the end of the check, and never stays pending', async () => {
+    test('sendBatch sends its records as they were at the call, though an accessor would empty them on a second read, and never stays pending', async () => {
       jest.useFakeTimers({ now: 0, doNotFake: ['queueMicrotask'] })
       const { producer } = createLingeringProducer({ linger: 0 })
       await producer.connect()
@@ -1776,7 +1776,9 @@ describe('Producer > the accumulator', () => {
           ],
         })
 
-        await expect(settledWithin(sending)).resolves.toEqual([])
+        await expect(settledWithin(sending)).resolves.toHaveLength(2)
+        expect(reads).toBe(1)
+        expect([first.length, last.length]).toEqual([1, 1])
       } finally {
         await withinRealTime(producer.disconnect())
       }

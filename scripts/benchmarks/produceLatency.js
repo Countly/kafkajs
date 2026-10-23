@@ -2,11 +2,19 @@
  * Produce-latency/throughput probe: one message per send (no batching), the
  * case Nagle's algorithm can delay by coalescing small frames.
  * Usage: node scripts/benchmarks/produceLatency.js [--messages 20000] [--size 200] [--acks -1]
- *          [--linger <ms>] [--idempotent 0|1]
+ *          [--linger <ms>] [--idempotent 0|1] [--record plain|headers|bigint]
  * `--linger` and `--idempotent` are passed to the producer only when given, so the default
  * producer is measured unless a flag says otherwise; a tree that has no `linger` ignores it.
- * Prints p50/p90/p99 per-send latency in ms and messages/sec as one JSON line.
+ * `--record` picks the record each send carries: its value alone (`plain`, the default), with two
+ * string headers (`headers`), or with a `BigInt` timestamp (`bigint`), which the accumulator
+ * copies.
+ * Prints p50/p90/p99 per-send latency in ms, messages/sec and the timed run's `elapsedMs` as one
+ * JSON line, with the counts of `sendPathCounters` (each equals `messages` in a tree that has the
+ * code it counts) and, under `node --expose-gc`, `retainedHeapBytes`: the heap the timed sends
+ * left behind, read after a full collection before and after them.
  */
+const sendPathCounters = require('./sendPathCounters')
+const counters = sendPathCounters()
 const { Kafka, logLevel } = require('../../index')
 
 /**
@@ -37,7 +45,25 @@ if (IDEMPOTENT !== undefined && IDEMPOTENT !== 0 && IDEMPOTENT !== 1) {
   console.error('--idempotent must be 0 or 1')
   process.exit(2)
 }
+const RECORD = process.argv.includes('--record')
+  ? process.argv[process.argv.indexOf('--record') + 1]
+  : 'plain'
+if (!['plain', 'headers', 'bigint'].includes(RECORD)) {
+  console.error('--record must be plain, headers or bigint')
+  process.exit(2)
+}
 const TOPIC = process.env.BENCH_TOPIC || 'bench-produce-latency'
+
+/**
+ * @param {Buffer} value
+ * @returns {object} the record of one send, as `--record` says
+ */
+const recordOf = (value) =>
+  RECORD === 'headers'
+    ? { value, headers: { trace: 'bench', origin: 'produce-latency' } }
+    : RECORD === 'bigint'
+      ? { value, timestamp: BigInt(Date.now()) }
+      : { value }
 
 /**
  * @param {number[]} sorted values in ascending order
@@ -72,14 +98,16 @@ const main = async () => {
   const value = Buffer.alloc(SIZE, 'x')
   const latencies = new Array(MESSAGES)
 
+  const heapBefore = sendPathCounters.heapAfterGc()
   const startedAll = process.hrtime.bigint()
   for (let i = 0; i < MESSAGES; i++) {
     const started = process.hrtime.bigint()
     // one message per send: this is the case Nagle can delay
-    await producer.send({ topic: TOPIC, acks: ACKS, messages: [{ value }] })
+    await producer.send({ topic: TOPIC, acks: ACKS, messages: [recordOf(value)] })
     latencies[i] = Number(process.hrtime.bigint() - started) / 1e6
   }
   const elapsedMs = Number(process.hrtime.bigint() - startedAll) / 1e6
+  const heapAfter = sendPathCounters.heapAfterGc()
 
   latencies.sort((a, b) => a - b)
   console.log(
@@ -89,10 +117,14 @@ const main = async () => {
       acks: ACKS,
       linger: LINGER ?? null,
       idempotent: IDEMPOTENT ?? null,
+      record: RECORD,
       p50: percentile(latencies, 0.5),
       p90: percentile(latencies, 0.9),
       p99: percentile(latencies, 0.99),
       messagesPerSecond: (MESSAGES / elapsedMs) * 1000,
+      elapsedMs,
+      retainedHeapBytes: heapBefore === null ? null : heapAfter - heapBefore,
+      ...counters.read(),
     })
   )
 

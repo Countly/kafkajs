@@ -22,6 +22,8 @@ const sharedPromiseTo = require('../utils/sharedPromiseTo')
  * @param {number} [options.deliveryTimeout] the producer's delivery deadline in ms
  * @param {number} options.linger ms a batch waits for more records; 0 sends it at once
  * @param {number} options.batchSize bytes of keys and values at which a batch is sent
+ * @param {import('./state/admission').Admission} options.admission the producer's buffer, shared
+ *   by its own sends and its transactions'
  * @param {() => string} options.getConnectionStatus
  * @param {() => boolean} options.isClosing whether the producer's `disconnect()` is delivering
  *   the accumulated batches: sends are refused and batches no longer linger
@@ -40,6 +42,7 @@ module.exports = ({
   compressionLevels,
   linger,
   batchSize,
+  admission,
   getConnectionStatus,
   isClosing,
   instrumentationEmitter,
@@ -109,7 +112,11 @@ module.exports = ({
       const error = idempotence.isEnabled()
         ? null
         : createSendMessages.connectionStatusError(getConnectionStatus())
-      return error === null ? sendPath().sendPartitioned(request) : Promise.reject(error)
+      if (error === null) {
+        return sendPath().sendPartitioned(request)
+      }
+      request.batches.forEach((batch) => batch.retire())
+      return Promise.reject(error)
     },
     lingers: () =>
       !isClosing() && hurried === 0 && getConnectionStatus() === CONNECTION_STATUS.CONNECTED,
@@ -118,6 +125,7 @@ module.exports = ({
     leaderOf: (topic, partition) => cluster.cachedLeader(topic, partition),
     deadline: deliveryTimeout ?? retry.maxTotalTime,
     expired: (error) => idempotentSend.inTransaction(error),
+    admission,
   })
 
   /**
@@ -178,12 +186,17 @@ module.exports = ({
    * @property {number} [timeout=30000] The time to await a response in ms
    * @property {Compression.Types} [compression=Compression.Types.None] Compression codec
    *
+   * The records are read once, at this call (`Accumulator.snapshot`): changing a record, its
+   * headers or a `Date` or `Long` timestamp afterwards changes neither what is sent nor what is
+   * charged against `bufferMemory`; the bytes of a Buffer are not copied.
    * @param {SendBatchRequest}
    * @returns {Promise}
    */
-  const sendBatch = async ({ acks = -1, timeout, compression, topicMessages = [] }) => {
+  const sendBatch = async ({ acks = -1, timeout, compression, topicMessages: given = [] }) => {
     // The delivery deadline counts from here, validation included.
     const startedAt = Date.now()
+    // Every check below, the charge and the encoder read this copy, never the caller's records.
+    const topicMessages = Accumulator.snapshot(given)
 
     if (topicMessages.some(({ topic }) => !topic)) {
       throw new KafkaJSNonRetriableError(`Invalid topic`)
@@ -238,7 +251,7 @@ module.exports = ({
     }, [])
 
     // The accumulator acquires the producer id itself, so `close()` waits for this send from here.
-    return await accumulator.append({
+    return accumulator.append({
       acks,
       timeout,
       compression,

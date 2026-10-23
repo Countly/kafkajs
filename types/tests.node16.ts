@@ -5,6 +5,8 @@ import {
   CompressionTypes,
   KafkaJSError,
   KafkaJSCommitFailedError,
+  KafkaJSBufferExhaustedError,
+  KafkaJSRecordTooLargeError,
   KafkaJSConnectionClosedError,
   KafkaJSMemberIdRequired,
   KafkaJSInvariantViolation,
@@ -28,6 +30,14 @@ const producerWithCompressionLevels = new Kafka({ brokers: ['localhost:9092'] })
   compressionLevels: { gzip: 9, zstd: 7 },
 })
 void producerWithCompressionLevels
+
+// The producer's buffer options and the two errors its refusals reject with.
+const buffered = kafka.producer({ bufferMemory: 33554432, maxBlockMs: 60000 })
+const tooLarge: KafkaJSRecordTooLargeError = new KafkaJSRecordTooLargeError('x', { reason: 'bufferMemory', scope: 'send', size: 2, limit: 1 })
+const exhausted: KafkaJSBufferExhaustedError = new KafkaJSBufferExhaustedError('x', { reason: 'timeout', requested: 1, available: 0, capacity: 1, waitedMs: 1 })
+void buffered
+void tooLarge
+void exhausted
 const closed: KafkaJSError = new KafkaJSConnectionClosedError('x', { host: 'localhost', port: 9092 })
 const memberIdRequired: KafkaJSError = new KafkaJSMemberIdRequired(new Error('x'), { memberId: 'm' })
 const invariant: KafkaJSError = new KafkaJSInvariantViolation('x')

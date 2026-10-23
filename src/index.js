@@ -242,6 +242,31 @@ const resolveDelivery = ({ linger, batchSize, deliveryTimeout, maxTotalTime, req
 }
 
 /**
+ * Checks the producer's buffer options (`Admission`): `bufferMemory` an integer from 1 to
+ * `Number.MAX_SAFE_INTEGER` bytes, `maxBlockMs` an integer from 0 to 2147483647 ms, the longest
+ * timer delay. An option not passed keeps its default.
+ * @param {{ bufferMemory?: number, maxBlockMs?: number }} options
+ * @returns {void}
+ * @throws {KafkaJSInvalidConfigurationError} naming the option at fault
+ */
+const validateBuffer = ({ bufferMemory, maxBlockMs }) => {
+  if (bufferMemory !== undefined && !(Number.isSafeInteger(bufferMemory) && bufferMemory >= 1)) {
+    throw new KafkaJSInvalidConfigurationError(
+      `bufferMemory must be an integer >= 1 and <= ${Number.MAX_SAFE_INTEGER}, got ${inspect(bufferMemory)}`
+    )
+  }
+
+  if (
+    maxBlockMs !== undefined &&
+    !(Number.isInteger(maxBlockMs) && maxBlockMs >= 0 && maxBlockMs <= MAX_DELAY)
+  ) {
+    throw new KafkaJSInvalidConfigurationError(
+      `maxBlockMs must be an integer >= 0 and <= ${MAX_DELAY}, got ${inspect(maxBlockMs)}`
+    )
+  }
+}
+
+/**
  * Validates and snapshots the supported per-codec producer levels.
  * @param {{ gzip?: number, zstd?: number }|undefined} levels requested levels
  * @returns {{ gzip?: number, zstd?: number }|undefined} owned options
@@ -388,9 +413,11 @@ module.exports = class Client {
    *   `requestTimeout`, so a send can end up to `requestTimeout` after `deliveryTimeout`
    * @param {{ gzip?: number, zstd?: number }} [options.compressionLevels] gzip (-1 or 1..9)
    *   and zstd (-131072..22) levels, copied at construction; omission keeps codec defaults
+   * @param {number} [options.bufferMemory=33554432] bytes the producer's sends may hold at once
+   * @param {number} [options.maxBlockMs=60000] ms a send waits for room in that buffer
    * @returns {import("../types").Producer} the producer and its transaction factory
    * @throws {KafkaJSInvalidConfigurationError} for a setting idempotence asked for explicitly
-   *   does not allow, and for invalid delivery or compression-level options
+   *   does not allow, and for invalid delivery, buffer or compression-level options
    */
   producer({
     createPartitioner,
@@ -405,8 +432,11 @@ module.exports = class Client {
     batchSize,
     deliveryTimeout,
     compressionLevels,
+    bufferMemory,
+    maxBlockMs,
   } = {}) {
     const levels = resolveCompressionLevels(compressionLevels)
+    validateBuffer({ bufferMemory, maxBlockMs })
     const producerRetry = { ...this[PRIVATE.CLUSTER_RETRY], ...retry }
     const delivery = resolveDelivery({
       linger,
@@ -459,6 +489,8 @@ module.exports = class Client {
       batchSize: delivery.batchSize,
       deliveryTimeout: delivery.deliveryTimeout,
       compressionLevels: levels,
+      bufferMemory,
+      maxBlockMs,
       instrumentationEmitter,
     })
   }

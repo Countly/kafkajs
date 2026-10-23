@@ -2,6 +2,8 @@ const Long = require('../../utils/long')
 const Fifo = require('../../utils/fifo')
 const { KafkaJSDeliveryTimeout, KafkaJSInvalidConfigurationError } = require('../../errors')
 const { Deadline, ExpiryTimer } = require('../deadline')
+const { Admission } = require('./admission')
+const { chargeOf, share, ownedBuffer, BATCH_DEBIT } = require('./recordSize')
 
 /** What each field of a record must be for the record encoder to write it. */
 const ENCODABLE = {
@@ -116,6 +118,98 @@ const sizeOf = (messages) => {
     }
   }
   return bytes
+}
+
+/**
+ * The `retire` or `detach` of one batch: a function the send path can keep and call on its own
+ * copy of the batch, made outside the accumulator's methods so that it captures nothing else.
+ * @param {(batch: object) => void} release
+ * @param {object} batch
+ * @returns {() => void}
+ */
+const releaseOf = (release, batch) => () => release(batch)
+
+/** The fields of a record the producer reads, beside its own enumerable ones. */
+const RECORD_FIELDS = ['key', 'value', 'headers', 'timestamp', 'partition']
+
+/**
+ * A timestamp the producer keeps: a `Date` or a `Long` is mutable and the encoder reads it again
+ * when it builds the batch, so it is read once now and kept as its exact decimal string, which the
+ * encoder and the range check read as the same instant (`Date(0)` and a `Long` of 0 stay the
+ * literal epoch). A reading that throws (a `Date` whose time cannot be read, a `value` getter that
+ * throws) gives `NaN`, which the encodability check refuses with the typed error it always gave,
+ * without reading the caller's object again. Every other form is immutable, or is left to the
+ * encodability check, and is kept.
+ * @param {*} timestamp
+ * @returns {*}
+ */
+const ownedTimestamp = (timestamp) => {
+  if (timestamp === null || typeof timestamp !== 'object') {
+    return timestamp
+  }
+  try {
+    if (timestamp instanceof Date) {
+      return String(timestamp.getTime())
+    }
+    const { value } = timestamp
+    return typeof value === 'bigint' ? String(value) : timestamp
+  } catch {
+    return NaN
+  }
+}
+
+/**
+ * A copy of a record's headers, each own key read once: an array value is copied too, and every
+ * Buffer is kept as `ownedBuffer` keeps it.
+ * @param {*} headers
+ * @returns {object}
+ */
+const ownedHeaders = (headers) => {
+  const copy = { ...headers }
+  for (const name of Object.keys(copy)) {
+    const header = copy[name]
+    copy[name] = Array.isArray(header) ? header.map(ownedBuffer) : ownedBuffer(header)
+  }
+  return copy
+}
+
+/**
+ * The producer's own copy of a record, each field read once: its own enumerable fields, so a
+ * custom partitioner still sees them, and the fields the producer reads, also when they come from
+ * a prototype. A header container, a header-value array, a `Date` and a `Long` are copied, so
+ * changing them after the call changes nothing; the bytes of a Buffer are shared, unless it is a
+ * small view of a large backing store (`ownedBuffer`). Anything that is not an object is kept, so
+ * validation fails it as before.
+ * @param {*} message
+ * @returns {*}
+ */
+const ownedRecord = (message) => {
+  if (message === null || typeof message !== 'object') {
+    return message
+  }
+
+  const record = { ...message }
+  for (const field of RECORD_FIELDS) {
+    if (record[field] === undefined && !Object.hasOwn(record, field)) {
+      const value = message[field]
+      if (value !== undefined) {
+        record[field] = value
+      }
+    }
+  }
+  if (Buffer.isBuffer(record.key)) {
+    record.key = ownedBuffer(record.key)
+  }
+  if (Buffer.isBuffer(record.value)) {
+    record.value = ownedBuffer(record.value)
+  }
+  if (record.headers != null) {
+    record.headers = ownedHeaders(record.headers)
+  }
+  if (record.timestamp != null) {
+    record.timestamp = ownedTimestamp(record.timestamp)
+  }
+  return record
 }
 
 /**
@@ -272,6 +366,12 @@ class Settler {
  * waits for the producer id or for metadata holds this object, reads `records` after its await and
  * stops when it is `null`, so a send that expired while it waited keeps none of its records alive.
  * The object itself is retained until the last continuation that holds it ends; `pins` counts them.
+ *
+ * It also owns the send's reservation in the producer's buffer. When its records join batches,
+ * each batch takes its records' shares, released when that batch retires; what no batch took is
+ * released when the send leaves the registry, at once when it fails or expires. The shell (1536
+ * bytes, the backing stores of its Buffers and their bytes) is released last, once the send has
+ * left the registry, no batch carries a share of it and no continuation holds it.
  */
 class PendingSend {
   /**
@@ -286,6 +386,23 @@ class PendingSend {
     this.pins = 0
     /** @type {?(error: Error) => void} rejects the send; set while it is held */
     this.reject = null
+    /** @type {?import('./admission').Reservation} the send's bytes in the buffer, once admitted */
+    this.reservation = null
+    /** the bytes of its records' shares that no batch has taken yet */
+    this.payload = 0
+    /** how many batches carry a share of its records and have not retired */
+    this.shares = 0
+  }
+
+  /**
+   * Keeps the send's reservation: all of it but `shell` is its records' shares.
+   * @param {import('./admission').Reservation} reservation
+   * @param {{ total: number, shell: number }} charge
+   * @returns {void}
+   */
+  admit(reservation, { total, shell }) {
+    this.reservation = reservation
+    this.payload = total - shell
   }
 
   /** Counts one continuation that holds this send. @returns {void} */
@@ -296,6 +413,56 @@ class PendingSend {
   /** Counts that continuation's end. @returns {void} */
   unpin() {
     this.pins -= 1
+    this.release()
+  }
+
+  /**
+   * A batch takes `bytes` of the send's records: they are released when it retires.
+   * @param {number} bytes
+   * @returns {void}
+   */
+  share(bytes) {
+    this.payload -= bytes
+    this.shares += 1
+  }
+
+  /**
+   * A batch carrying `bytes` of the send's records dropped them; it still holds the send, so its
+   * share stays counted until it retires.
+   * @param {number} bytes
+   * @returns {void}
+   */
+  give(bytes) {
+    this.reservation.release(bytes)
+  }
+
+  /**
+   * A batch carrying `bytes` of the send's records retired.
+   * @param {number} bytes
+   * @returns {void}
+   */
+  unshare(bytes) {
+    this.reservation.release(bytes)
+    this.shares -= 1
+    this.release()
+  }
+
+  /**
+   * Once the send has left the registry: releases what no batch took and, when no batch carries a
+   * share of it and no continuation holds it, the rest. Nothing is released twice.
+   * @returns {void}
+   */
+  release() {
+    if (!this.settled) {
+      return
+    }
+    if (this.payload > 0) {
+      this.reservation.release(this.payload)
+      this.payload = 0
+    }
+    if (this.shares === 0 && this.pins === 0) {
+      this.reservation.releaseAll()
+    }
   }
 }
 
@@ -308,7 +475,7 @@ class PendingSend {
  * @property {number} acks
  * @property {number} [timeout]
  * @property {number} [compression]
- * @property {object[]} messages
+ * @property {object[]|null} messages null once the batch has detached
  * @property {Settler[]} settlers one per append whose records it carries, in arrival order
  * @property {number} bytes its keys' and values' bytes
  * @property {number} createdAt when the earliest of those appends began: its delivery deadline
@@ -319,6 +486,16 @@ class PendingSend {
  *   batches leave together
  * @property {ReturnType<typeof setTimeout>|null} timer
  * @property {boolean} due whether its `linger` has run out
+ * @property {number} heldBytes the shares of the records it carries in the producer's buffer
+ * @property {number} debt its own charge, debited when it was created
+ * @property {(PendingSend|number)[]|null} owners each send whose records it carries, followed by
+ *   the bytes of their shares still charged; null once it has retired
+ * @property {() => void} retire releases its shares and repays its debt, once; the send path calls
+ *   it when nothing holds the batch any more
+ * @property {() => void} detach drops its records and gives back the bytes of their shares, once;
+ *   until `retire`, its sends keep their shells and it keeps its debt. The send path calls it when
+ *   the batch has settled and no request carries it, while a continuation of its own may still hold
+ *   the batch
  */
 
 /**
@@ -364,6 +541,7 @@ class Accumulator {
   #leaderOf
   #deadline
   #expired
+  #admission
   /** @type {Fifo<PendingSend>} the sends waiting for their partitions, in the order of their deadlines */
   #holders = new Fifo()
   #expiry = new ExpiryTimer((now) => this.#expireHolders(now))
@@ -402,7 +580,9 @@ class Accumulator {
    *   send path's own: a send still waiting for its partitions settles with `KafkaJSDeliveryTimeout`
    *   when it is reached, and a held batch goes out then
    * @param {(error: Error) => Error} [options.expired] called with the error of a send that
-   *   expired before it joined a batch, to arm a transaction; returns the error to reject with
+   *   expired before it joined a batch, or that the buffer refused, to arm a transaction; returns
+   *   the error to reject with
+   * @param {Admission} [options.admission] the producer's buffer; without one, every send fits
    */
   constructor({
     linger,
@@ -414,6 +594,7 @@ class Accumulator {
     leaderOf = () => null,
     deadline,
     expired = (error) => error,
+    admission = new Admission({ capacity: Number.MAX_SAFE_INTEGER, maxBlockMs: 0 }),
   }) {
     this.#linger = linger
     this.#batchSize = batchSize
@@ -424,6 +605,28 @@ class Accumulator {
     this.#leaderOf = leaderOf
     this.#deadline = deadline
     this.#expired = expired
+    this.#admission = admission
+  }
+
+  /**
+   * The producer's own copy of a send's records, taken at the public call before anything reads
+   * them: every validation, the charge, the partitioner and the encoder see this copy, so changing
+   * a record, its headers, a header-value array or a `Date` or `Long` timestamp after the call
+   * changes nothing. A record's own enumerable fields are kept beside the fields the producer
+   * reads; the bytes of its Buffers are shared, as in 2.2.4, except a small view of a large backing
+   * store, which is copied. Entries and records that are not objects are kept as they are, and so
+   * is a `messages` that is not an array, so validation refuses them as before.
+   * @param {{ topic: string, messages: object[] }[]} topicMessages
+   * @returns {{ topic: string, messages: object[] }[]}
+   */
+  static snapshot(topicMessages) {
+    return topicMessages.map((entry) => {
+      if (entry === null || typeof entry !== 'object') {
+        return entry
+      }
+      const { topic, messages } = entry
+      return { topic, messages: Array.isArray(messages) ? messages.map(ownedRecord) : messages }
+    })
   }
 
   /**
@@ -431,17 +634,29 @@ class Accumulator {
    * carrying them has been acknowledged, with one `RecordMetadata` per partition, by topic and then
    * partition, whose `baseOffset` is that of the send's own first record there; rejects with the
    * first error such a batch failed with, after all of them have settled. A send with no record
-   * resolves `[]` at once. A send still waiting for its partitions at its delivery deadline rejects
-   * with `KafkaJSDeliveryTimeout`, `outcome: 'unsent'`, whatever it waits for.
+   * resolves `[]` at once and charges nothing. A send still waiting for its partitions at its
+   * delivery deadline rejects with `KafkaJSDeliveryTimeout`, `outcome: 'unsent'`, whatever it
+   * waits for.
+   *
+   * Before its first await the send is charged against the producer's buffer (see `chargeOf`) and
+   * admitted: at once when it fits and no send waits, else after the sends ahead of it, within
+   * `maxBlockMs` and its deadline. Its records are the caller's owned copy (`Accumulator.snapshot`),
+   * held by the send while it waits; a refusal drops them. A refusal goes through `expired`, so it
+   * arms a transaction and the send rejects with the refusal itself.
    * @param {object} request
    * @param {number} request.acks
    * @param {number} [request.timeout]
    * @param {number} [request.compression]
-   * @param {{ topic: string, messages: object[] }[]} request.topicMessages
+   * @param {{ topic: string, messages: object[] }[]} request.topicMessages the producer's own
+   *   copy, which nothing changes afterwards
    * @param {number} [request.startedAt] when the public call began, in epoch ms; now when absent
    * @returns {Promise<object[]>}
    * @throws {KafkaJSInvalidConfigurationError} for a record the encoder cannot write; nothing is
    *   queued
+   * @throws {import('../../errors').KafkaJSRecordTooLargeError} a record, or the send, can never
+   *   fit in the buffer; nothing waits
+   * @throws {import('../../errors').KafkaJSBufferExhaustedError} no room within `maxBlockMs`, or
+   *   too many bytes already waiting
    */
   async append({ acks, timeout, compression, topicMessages, startedAt = Date.now() }) {
     for (const { topic, messages } of topicMessages) {
@@ -451,11 +666,22 @@ class Accumulator {
       return []
     }
 
-    return this.#hold(new PendingSend(topicMessages, new Deadline(startedAt, this.#deadline)), {
-      acks,
-      timeout,
-      compression,
-    })
+    const send = new PendingSend(topicMessages, new Deadline(startedAt, this.#deadline))
+    if (send.deadline.remaining() === 0) {
+      throw this.#expired(this.#timedOut(send))
+    }
+
+    this.#appending += 1
+    try {
+      const charge = chargeOf(topicMessages, this.#admission.capacity)
+      const granted = this.#admission.acquire(charge.total, send.deadline)
+      send.admit(granted instanceof Promise ? await granted : granted, charge)
+    } catch (error) {
+      send.records = null
+      this.#end()
+      throw this.#expired(error)
+    }
+    return this.#hold(send, { acks, timeout, compression })
   }
 
   /**
@@ -467,11 +693,6 @@ class Accumulator {
    * @returns {Promise<object[]>} the send's outcome, as `append()` describes it
    */
   #hold(send, options) {
-    if (send.deadline.remaining() === 0) {
-      return Promise.reject(this.#expired(this.#timedOut(send)))
-    }
-
-    this.#appending += 1
     return new Promise((resolve, reject) => {
       send.reject = reject
       this.#register(send)
@@ -488,10 +709,11 @@ class Accumulator {
           send.unpin()
           if (this.#leave(send)) {
             try {
-              resolve(this.#join(entries, { ...options, createdAt: send.deadline.startedAt }))
+              resolve(this.#join(entries, { ...options, createdAt: send.deadline.startedAt }, send))
             } catch (error) {
               reject(error)
             } finally {
+              send.release()
               this.#end()
             }
           }
@@ -499,6 +721,7 @@ class Accumulator {
         (error) => {
           send.unpin()
           if (this.#leave(send)) {
+            send.release()
             reject(error)
             this.#end()
           }
@@ -576,6 +799,7 @@ class Accumulator {
     ) {
       const { reject } = send
       this.#leave(send)
+      send.release()
       reject(this.#expired(this.#timedOut(send)))
       this.#end()
     }
@@ -602,11 +826,14 @@ class Accumulator {
    * partition that had to go first, in its own call - so one send usually makes one request per
    * broker. When none fills, its records that join a batch an earlier append began leave with
    * that batch, on its timer, so one send can still reach a broker in two requests.
+   * Each batch takes the shares of the send's records it carries (see `PendingSend#share`), and a
+   * batch created here debits its own charge from the buffer, without waiting.
    * @param {{ topic: string, partition: number, messages: object[] }[]} entries
    * @param {{ acks: number, timeout?: number, compression?: number, createdAt: number }} options
+   * @param {PendingSend} holder the send whose records these are
    * @returns {Promise<object[]>} the append's outcome, as `append()` describes it
    */
-  #join(entries, { acks, timeout, compression, createdAt }) {
+  #join(entries, { acks, timeout, compression, createdAt }, holder) {
     const send = new AppendedSend(entries.length)
     const options = `${acks}/${timeout}/${compression}`
     // One due time for every batch this append creates, so they fall due together.
@@ -643,7 +870,15 @@ class Accumulator {
           mergeKey: null,
           timer: null,
           due: false,
+          heldBytes: 0,
+          debt: BATCH_DEBIT,
+          owners: [],
+          retire: null,
+          detach: null,
         }
+        batch.retire = releaseOf(this.#retire, batch)
+        batch.detach = releaseOf(this.#detach, batch)
+        this.#admission.debit(BATCH_DEBIT)
         this.#pending.set(key, batch)
       }
 
@@ -652,10 +887,15 @@ class Accumulator {
         this.#rearm(batch)
       }
       batch.settlers.push(new Settler(send, batch.messages.length))
+      let shares = 0
       for (const message of messages) {
         batch.messages.push(withEncodableTimestamp(message))
+        shares += share(message)
       }
       batch.bytes += bytes
+      batch.heldBytes += shares
+      batch.owners.push(holder, shares)
+      holder.share(shares)
 
       if (batch.bytes >= this.#batchSize || !this.#lingers()) {
         clearTimeout(batch.timer)
@@ -686,6 +926,44 @@ class Accumulator {
       this.#queueHandOff()
     }
     return send.promise
+  }
+
+  /**
+   * Releases a batch's shares of its sends' reservations and repays its debt, once: the send path
+   * calls it when no request, queue, encoder or continuation holds the batch any more.
+   * @param {PendingBatch} batch
+   * @returns {void}
+   */
+  #retire = (batch) => {
+    const { owners } = batch
+    if (owners === null) {
+      return
+    }
+    batch.owners = null
+    batch.messages = null
+    for (let i = 0; i < owners.length; i += 2) {
+      owners[i].unshare(owners[i + 1])
+    }
+    this.#admission.repay(batch.debt)
+  }
+
+  /**
+   * Drops a batch's records (`messages` becomes `null`) and gives back the bytes of their shares,
+   * once; the shares stay counted, so the sends keep their shells, and the batch its debt, until
+   * `#retire`.
+   * @param {PendingBatch} batch
+   * @returns {void}
+   */
+  #detach = (batch) => {
+    const { owners } = batch
+    if (owners === null) {
+      return
+    }
+    batch.messages = null
+    for (let i = 0; i < owners.length; i += 2) {
+      owners[i].give(owners[i + 1])
+      owners[i + 1] = 0
+    }
   }
 
   /**
