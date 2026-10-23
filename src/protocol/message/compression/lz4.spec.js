@@ -484,6 +484,34 @@ describe('Protocol > Compression > LZ4', () => {
     })
 
     describe('the preflight work slicing', () => {
+      test('walks the input without a generator step for each byte, sequence or skip', async () => {
+        // two blocks of 20000 sequences with a literal and a match extension each, then a stored
+        // block, all with a block checksum: about 1.2 MB for the fast pass to skip and the exact
+        // pass to walk to its end
+        const long = sequence({ literals: Buffer.alloc(20, 1), offset: 1, match: 30 })
+        const compressed = block(
+          Buffer.concat([...Array(20000).fill(long), sequence({ literals: Buffer.alloc(5) })])
+        )
+        const input = frame({
+          maxSizeCode: 6,
+          blockChecksums: true,
+          blocks: [compressed, compressed, stored(200000)],
+        })
+        const next = jest.spyOn(Object.getPrototypeOf(function* () {}).prototype, 'next')
+        const turns = jest.spyOn(global, 'setImmediate')
+
+        try {
+          await expect(refused(input, 100)).resolves.toMatchObject({ reason: 'decompressed-size' })
+
+          // each turn resumes the measuring generator and the one block walker it delegates to
+          expect(next.mock.calls.length).toBeLessThanOrEqual(3 * (turns.mock.calls.length + 2))
+          expect(turns.mock.calls.length).toBeGreaterThanOrEqual(8)
+        } finally {
+          next.mockRestore()
+          turns.mockRestore()
+        }
+      })
+
       test('extension work respects a partly consumed slice', async () => {
         const data = Buffer.alloc(3 * 87380 + 1 + 16450, 255)
         for (let i = 0; i < 87380; i++) {

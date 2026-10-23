@@ -70,77 +70,89 @@ const readHeader = (input) => {
 }
 
 /**
- * Accounts for input skipped without reading it, taking a turn before crossing a slice boundary.
- * @param {{ work: number }} slice input bytes consumed since the last yield
+ * Accounts for input skipped without reading it. The walkers take the turns it returns, so a
+ * skip costs arithmetic and no generator.
+ * @param {{ work: number }} slice input bytes consumed since the last turn
  * @param {number} bytes input bytes to skip
- * @returns {Generator<void, void>}
+ * @returns {number} the turns owed, one per slice boundary the skip crosses
  */
-function* consume(slice, bytes) {
-  while (bytes > 0) {
-    if (slice.work === SLICE) {
-      slice.work = 0
-      yield
-    }
-    const taken = Math.min(bytes, SLICE - slice.work)
-    slice.work += taken
-    bytes -= taken
+const skip = (slice, bytes) => {
+  const used = slice.work + bytes
+  if (used <= SLICE) {
+    slice.work = used
+    return 0
   }
+  slice.work = ((used - 1) % SLICE) + 1
+  return Math.floor((used - 1) / SLICE)
 }
 
 /**
  * Walks one compressed block, including length extensions and final literals, within the shared
- * input slice budget. The last sequence holds literals only.
+ * input slice budget. Every byte is read inline, behind a check that takes a turn at the slice
+ * boundary. The last sequence holds literals only.
  * @param {Buffer} input
  * @param {number} start first byte of the block
  * @param {number} end exclusive end of the block
- * @param {{ work: number }} slice input bytes consumed since the last yield
+ * @param {{ work: number }} slice input bytes consumed since the last turn
  * @returns {Generator<void, number>} the block's decoded length
  * @throws {Lz4FrameError} for a malformed sequence or a length above the largest block
  */
 function* decodedLength(input, start, end, slice) {
   let at = start
   let total = 0
-  /**
-   * Takes a turn before reading a byte that would cross the input slice boundary.
-   * @returns {Generator<void, number>} the next input byte
-   */
-  const read = function* () {
+  while (at < end) {
     if (slice.work === SLICE) {
       slice.work = 0
       yield
     }
-    slice.work += 1
-    return input[at++]
-  }
-  /**
-   * Reads a length extension within the shared slice budget and the largest valid block length.
-   * @returns {Generator<void, number>} the length
-   * @throws {Lz4FrameError} for a truncated or oversized extension
-   */
-  const extended = function* () {
-    let length = 15
-    let next = 255
-    while (next === 255) {
-      if (at >= end) throw new Lz4FrameError('LZ4 block ends inside a length')
-      next = yield* read()
-      length += next
-      if (length > LARGEST_BLOCK) throw new Lz4FrameError('LZ4 length is above the largest block')
+    const token = input[at++]
+    slice.work++
+    let literals = token >> 4
+    if (literals === 15) {
+      let next
+      do {
+        if (at >= end) throw new Lz4FrameError('LZ4 block ends inside a length')
+        if (slice.work === SLICE) {
+          slice.work = 0
+          yield
+        }
+        next = input[at++]
+        slice.work++
+        literals += next
+        if (literals > LARGEST_BLOCK)
+          throw new Lz4FrameError('LZ4 length is above the largest block')
+      } while (next === 255)
     }
-    return length
-  }
-  while (at < end) {
-    const token = yield* read()
-    const literals = token >> 4 === 15 ? yield* extended() : token >> 4
     if (at + literals > end) throw new Lz4FrameError('LZ4 literals run past the block')
-    yield* consume(slice, literals)
     at += literals
     total += literals
+    for (let turns = skip(slice, literals); turns > 0; turns--) yield
     if (at === end) break
     if (at + 2 > end) throw new Lz4FrameError('LZ4 block has no valid match offset')
-    const low = yield* read()
-    const high = yield* read()
+    if (slice.work > SLICE - 2) {
+      slice.work = 0
+      yield
+    }
+    const low = input[at++]
+    const high = input[at++]
+    slice.work += 2
     if (low === 0 && high === 0) throw new Lz4FrameError('LZ4 block has no valid match offset')
-    total += 4 + ((token & 15) === 15 ? yield* extended() : token & 15)
+    let match = token & 15
+    if (match === 15) {
+      let next
+      do {
+        if (at >= end) throw new Lz4FrameError('LZ4 block ends inside a length')
+        if (slice.work === SLICE) {
+          slice.work = 0
+          yield
+        }
+        next = input[at++]
+        slice.work++
+        match += next
+        if (match > LARGEST_BLOCK) throw new Lz4FrameError('LZ4 length is above the largest block')
+      } while (next === 255)
+    }
+    total += 4 + match
   }
   return total
 }
@@ -152,7 +164,7 @@ function* decodedLength(input, start, end, slice) {
  * @param {Buffer} input
  * @param {object} header the validated frame descriptor
  * @param {boolean} exact whether to walk compressed sequences
- * @param {{ work: number }} slice input bytes consumed since the last yield
+ * @param {{ work: number }} slice input bytes consumed since the last turn
  * @returns {Generator<void, number>} the total decoded length or its fast upper bound
  * @throws {Lz4FrameError} for a truncated or oversized block
  */
@@ -171,24 +183,24 @@ function* measure(input, header, exact, slice) {
     if (word === 0) break
     if (size > header.max)
       throw new Lz4FrameError(`LZ4 block of ${size} bytes is above its maximum`)
-    const checksum = header.blockChecksum ? 4 : 0
+    let unread = header.blockChecksum ? 4 : 0
     const end = at + size
-    if (end + checksum > input.length) {
+    if (end + unread > input.length) {
       throw new Lz4FrameError('LZ4 block runs past the input')
     }
     if (word >= 0x80000000) {
       total += size
-      yield* consume(slice, size)
+      unread += size
     } else if (exact) {
       const decoded = yield* decodedLength(input, at, end, slice)
       if (decoded > header.max) throw new Lz4FrameError('LZ4 block decodes above its maximum')
       total += decoded
     } else {
       total += Math.min(header.max, size * 255)
-      yield* consume(slice, size)
+      unread += size
     }
-    yield* consume(slice, checksum)
-    at = end + checksum
+    for (let turns = skip(slice, unread); turns > 0; turns--) yield
+    at = end + (header.blockChecksum ? 4 : 0)
   }
   return total
 }
