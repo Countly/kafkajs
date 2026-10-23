@@ -10,6 +10,7 @@ const channels = require('./instrumentation/channels')
 const LoggerConsole = require('./loggers/console')
 const Cluster = require('./cluster')
 const createProducer = require('./producer')
+const { minimumRequestSize } = require('./producer/state/recordSize')
 const { MAX_DELAY } = require('./producer/deadline')
 const createConsumer = require('./consumer')
 const createAdmin = require('./admin')
@@ -31,6 +32,7 @@ const PRIVATE = {
   OPERATIONS: Symbol('private:Kafka:operations'),
   MAX_RESPONSE_SIZE: Symbol('private:Kafka:maxResponseSize'),
   REQUEST_TIMEOUT: Symbol('private:Kafka:requestTimeout'),
+  CLIENT_ID: Symbol('private:Kafka:clientId'),
 }
 
 const DEFAULT_METADATA_MAX_AGE = 300000
@@ -267,6 +269,26 @@ const validateBuffer = ({ bufferMemory, maxBlockMs }) => {
 }
 
 /**
+ * Checks a producer's `maxRequestSize`: an integer from the smallest Produce request this
+ * producer's identifiers allow (its framing, one batch header and one empty record) to 2147483647.
+ * @param {number|undefined} maxRequestSize absent keeps the default
+ * @param {string|null|undefined} clientId
+ * @param {string|null|undefined} transactionalId
+ * @returns {void}
+ * @throws {KafkaJSInvalidConfigurationError} naming the minimum
+ */
+const validateMaxRequestSize = (maxRequestSize, clientId, transactionalId) => {
+  const value = maxRequestSize ?? createProducer.defaults.maxRequestSize
+  const minimum = minimumRequestSize(clientId, transactionalId)
+  if (!(Number.isInteger(value) && value >= minimum && value <= INT_32_MAX_VALUE)) {
+    throw new KafkaJSInvalidConfigurationError(
+      `maxRequestSize must be an integer from ${minimum} (the smallest request this producer's ` +
+        `clientId and transactionalId allow) to ${INT_32_MAX_VALUE}, got ${inspect(maxRequestSize)}`
+    )
+  }
+}
+
+/**
  * Validates and snapshots the supported per-codec producer levels.
  * @param {{ gzip?: number, zstd?: number }|undefined} levels requested levels
  * @returns {{ gzip?: number, zstd?: number }|undefined} owned options
@@ -356,6 +378,7 @@ module.exports = class Client {
     this[PRIVATE.LOGGER] = createLogger({ level: logLevel, logCreator })
     this[PRIVATE.CLUSTER_RETRY] = retry
     this[PRIVATE.REQUEST_TIMEOUT] = requestTimeout ?? DEFAULT_REQUEST_TIMEOUT
+    this[PRIVATE.CLIENT_ID] = clientId
 
     const validatedMaxResponseSize = validateMaxResponseSize(maxResponseSize)
     this[PRIVATE.MAX_RESPONSE_SIZE] = validatedMaxResponseSize
@@ -411,13 +434,15 @@ module.exports = class Client {
    * @param {number} [options.deliveryTimeout] ms bounding the waiting and the retries of one send,
    *   at least `linger + requestTimeout`. A request already sent settles on its answer or on
    *   `requestTimeout`, so a send can end up to `requestTimeout` after `deliveryTimeout`
+   * @param {number} [options.maxRequestSize=1048576] maximum encoded Produce frame bytes,
+   *   from the minimum for this client and transaction id to 2147483647
    * @param {{ gzip?: number, zstd?: number }} [options.compressionLevels] gzip (-1 or 1..9)
    *   and zstd (-131072..22) levels, copied at construction; omission keeps codec defaults
    * @param {number} [options.bufferMemory=33554432] bytes the producer's sends may hold at once
    * @param {number} [options.maxBlockMs=60000] ms a send waits for room in that buffer
    * @returns {import("../types").Producer} the producer and its transaction factory
    * @throws {KafkaJSInvalidConfigurationError} for a setting idempotence asked for explicitly
-   *   does not allow, and for invalid delivery, buffer or compression-level options
+   *   does not allow, and for invalid delivery, buffer, request-size or compression-level options
    */
   producer({
     createPartitioner,
@@ -434,9 +459,11 @@ module.exports = class Client {
     compressionLevels,
     bufferMemory,
     maxBlockMs,
+    maxRequestSize,
   } = {}) {
     const levels = resolveCompressionLevels(compressionLevels)
     validateBuffer({ bufferMemory, maxBlockMs })
+    validateMaxRequestSize(maxRequestSize, this[PRIVATE.CLIENT_ID], transactionalId)
     const producerRetry = { ...this[PRIVATE.CLUSTER_RETRY], ...retry }
     const delivery = resolveDelivery({
       linger,
@@ -491,6 +518,8 @@ module.exports = class Client {
       compressionLevels: levels,
       bufferMemory,
       maxBlockMs,
+      clientId: this[PRIVATE.CLIENT_ID],
+      maxRequestSize,
       instrumentationEmitter,
     })
   }

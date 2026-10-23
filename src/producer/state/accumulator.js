@@ -1,9 +1,21 @@
 const Long = require('../../utils/long')
 const Fifo = require('../../utils/fifo')
-const { KafkaJSDeliveryTimeout, KafkaJSInvalidConfigurationError } = require('../../errors')
+const {
+  KafkaJSDeliveryTimeout,
+  KafkaJSInvalidConfigurationError,
+  KafkaJSRecordTooLargeError,
+} = require('../../errors')
 const { Deadline, ExpiryTimer } = require('../deadline')
 const { Admission } = require('./admission')
-const { chargeOf, share, ownedBuffer, BATCH_DEBIT } = require('./recordSize')
+const {
+  chargeOf,
+  share,
+  ownedBuffer,
+  wire,
+  recordsBytes,
+  RequestBudget,
+  BATCH_DEBIT,
+} = require('./recordSize')
 
 /** What each field of a record must be for the record encoder to write it. */
 const ENCODABLE = {
@@ -121,13 +133,153 @@ const sizeOf = (messages) => {
 }
 
 /**
- * The `retire` or `detach` of one batch: a function the send path can keep and call on its own
- * copy of the batch, made outside the accumulator's methods so that it captures nothing else.
- * @param {(batch: object) => void} release
- * @param {object} batch
- * @returns {() => void}
+ * Two functions that call `release` once both of them have been called, each counted once.
+ * @param {(() => void)|null|undefined} release
+ * @returns {Array<(() => void)|null|undefined>} `release` itself, twice, when it is not a function
  */
-const releaseOf = (release, batch) => () => release(batch)
+const bothOf = (release) => {
+  if (typeof release !== 'function') {
+    return [release, release]
+  }
+  let pending = 2
+  const half = () => {
+    let done = false
+    return () => {
+      if (done) return
+      done = true
+      pending -= 1
+      if (pending === 0) release()
+    }
+  }
+  return [half(), half()]
+}
+
+/**
+ * Owns one live batch's actual record array, reservation shares and batch debit. Subdivision
+ * transfers the existing debit to the tail and charges a new head. Shared send shells and backing
+ * stores remain reserved until every child share and every pre-admission pin ends.
+ */
+class BatchOwnership {
+  #done = false
+  /**
+   * @param {Admission} admission the producer's buffer
+   * @param {PendingBatch} batch the payload holder; copies share its record array
+   * @param {boolean} [child=true] clear aliases allocated by subdivision on retirement
+   */
+  constructor(admission, batch, child = true) {
+    this.admission = admission
+    this.batch = batch
+    this.child = child
+  }
+
+  /**
+   * Clears every alias of this batch's array before returning its payload bytes, once.
+   * @returns {void}
+   */
+  detach = () => {
+    const batch = this.batch
+    if (this.#done || batch.owners === null) return
+    if (this.child && batch.messages !== null) batch.messages.length = 0
+    batch.messages = null
+    for (let i = 0; i < batch.owners.length; i += 2) {
+      batch.owners[i].give(batch.owners[i + 1])
+      batch.owners[i + 1] = 0
+    }
+  }
+
+  /**
+   * Drops payload, ends this owner's shares and repays its debit exactly once. A retired or
+   * subdivided owner's late callback cannot release a child's charge.
+   * @returns {void}
+   */
+  retire = () => {
+    const batch = this.batch
+    if (this.#done || batch.owners === null) return
+    if (this.child) this.detach()
+    this.#done = true
+    const owners = batch.owners
+    batch.owners = null
+    batch.messages = null
+    for (let i = 0; i < owners.length; i += 2) owners[i].unshare(owners[i + 1])
+    this.admission.repay(batch.debt)
+  }
+
+  /**
+   * Transfers the payload and shares into two independent holders before clearing the old array.
+   * A straddling reservation gains one share, with no extra payload reservation. Each child can
+   * detach, retire or split again independently; the parent becomes inert.
+   * @param {number} at first record of the tail, strictly inside the array
+   * @returns {object[]} head and tail fields for the send-path batch objects
+   */
+  cut(at) {
+    const batch = this.batch
+    const arrays = [batch.messages.slice(0, at), batch.messages.slice(at)]
+    const owners = [[], []]
+    let headBytes = arrays[0].reduce((sum, message) => sum + share(message), 0)
+    for (let i = 0; i < batch.owners.length; i += 2) {
+      const holder = batch.owners[i]
+      const bytes = batch.owners[i + 1]
+      const head = Math.min(bytes, headBytes)
+      const tail = bytes - head
+      if (head > 0) owners[0].push(holder, head)
+      if (tail > 0) owners[1].push(holder, tail)
+      if (head > 0 && tail > 0) holder.share(0)
+      headBytes -= head
+    }
+    this.admission.debit(BATCH_DEBIT)
+    const children = arrays.map((messages, index) => {
+      const child = {
+        messages,
+        owners: owners[index],
+        heldBytes: messages.reduce((sum, message) => sum + share(message), 0),
+        debt: index === 0 ? BATCH_DEBIT : batch.debt,
+      }
+      child.ownership = new BatchOwnership(this.admission, child)
+      child.detach = child.ownership.detach
+      child.retire = child.ownership.retire
+      return child
+    })
+    batch.messages.length = 0
+    batch.messages = null
+    batch.owners = null
+    this.#done = true
+    return children
+  }
+}
+
+/** Tracks each unsettled leaf independently, including a leaf created after the hand-off. */
+class BatchTracker {
+  #done = false
+
+  /**
+   * @param {() => void} added increments this partition's handed-on batch count
+   * @param {() => void} settled decrements that count
+   */
+  constructor(added, settled) {
+    this.added = added
+    this.settled = settled
+  }
+
+  /**
+   * Transfers this count to two leaves, adding exactly one. The old tracker becomes inert.
+   * @returns {BatchTracker[]} head and tail trackers
+   */
+  cut() {
+    this.#done = true
+    this.added()
+    return [new BatchTracker(this.added, this.settled), new BatchTracker(this.added, this.settled)]
+  }
+
+  /** Ends the live count once, whatever its outcome. @returns {void} */
+  resolve = () => {
+    if (this.#done) return
+    this.#done = true
+    this.settled()
+  }
+
+  /** Ends the live count after failure. @returns {void} */
+  reject = () => this.resolve()
+}
 
 /** The fields of a record the producer reads, beside its own enumerable ones. */
 const RECORD_FIELDS = ['key', 'value', 'headers', 'timestamp', 'partition']
@@ -237,61 +389,119 @@ const offsetBy = (metadata, index) =>
     ? metadata
     : { ...metadata, baseOffset: String(BigInt(metadata.baseOffset) + BigInt(index)) }
 
-/**
- * A settler that calls `settle` once, however its batch ends.
- * @param {() => void} settle
- * @returns {{ resolve: () => void, reject: () => void }}
- */
-const settleOnce = (settle) => {
-  let settled = false
-  const once = () => {
-    if (!settled) {
-      settled = true
-      settle()
-    }
-  }
-  return { resolve: once, reject: once }
-}
-
 /** Sorts `RecordMetadata` by topic name, then partition. */
 const byTopicThenPartition = (a, b) =>
   a.topicName < b.topicName ? -1 : a.topicName > b.topicName ? 1 : a.partition - b.partition
 
 /**
- * One `append()`: settles once every partition its records went to has settled, resolving with
- * their `RecordMetadata` by topic, then partition, or rejecting with the first error any of them
- * failed with.
+ * Cuts one partition's records of a send at record boundaries into runs that each fit a batch of
+ * `capacity` wire bytes, greedily, in order; no record is above `capacity` (`append` refused it).
+ * @param {object[]} messages
+ * @param {number} capacity
+ * @returns {{ messages: object[], wire: number, origin: number }[]} `origin` is the position of
+ *   a run's first record among `messages`
+ */
+const chunksOf = (messages, capacity) => {
+  const chunks = []
+  let start = 0
+  let bytes = 0
+  for (let index = 0; index < messages.length; index++) {
+    const size = wire(messages[index])
+    if (index > start && bytes + size > capacity) {
+      chunks.push({ messages: messages.slice(start, index), wire: bytes, origin: start })
+      start = index
+      bytes = 0
+    }
+    bytes += size
+  }
+  chunks.push({ messages: messages.slice(start), wire: bytes, origin: start })
+  return chunks
+}
+
+/**
+ * Two settlers that settle `settler` once both have: with the first one's value, or with the
+ * first error either was given.
+ * @param {{ resolve: Function, reject: Function }} settler
+ * @returns {[{ resolve: Function, reject: Function }, { resolve: Function, reject: Function }]}
+ */
+const halvesOf = (settler) => {
+  let pending = 2
+  let value
+  let error
+  const end = () => {
+    pending -= 1
+    if (pending === 0) {
+      if (error !== undefined) settler.reject(error)
+      else settler.resolve(value)
+    }
+  }
+  const half = (first) => {
+    let done = false
+    return {
+      resolve: (metadata) => {
+        if (done) return
+        done = true
+        if (first) value = metadata
+        end()
+      },
+      reject: (failure) => {
+        if (done) return
+        done = true
+        error = error ?? failure
+        end()
+      },
+    }
+  }
+  return [half(true), half(false)]
+}
+
+/**
+ * One `append()`: settles once every share of its records - one per batch carrying some of them -
+ * has settled, resolving with one `RecordMetadata` per partition, by topic, then partition, or
+ * rejecting with the first error any share failed with. A partition's metadata is that of the
+ * share holding its first record, whatever order the answers came in. The send counts as one
+ * more share until `joined()`, so no share can settle it while its records are still joining.
  */
 class AppendedSend {
-  #pending
+  #pending = 1
   #metadata = []
   #error = null
   #resolve
   #reject
 
-  /** @param {number} count the partitions its records went to */
-  constructor(count) {
-    this.#pending = count
+  constructor() {
     this.promise = new Promise((resolve, reject) => {
       this.#resolve = resolve
       this.#reject = reject
     })
   }
 
+  /** One more batch carries some of its records. @returns {void} */
+  share() {
+    this.#pending += 1
+  }
+
+  /** Its records have all joined batches. @returns {void} */
+  joined() {
+    this.#settleOne()
+  }
+
   /**
-   * One partition delivered.
+   * One share delivered.
    * @param {object|undefined} metadata undefined for an `acks: 0` send, which gets no answer
+   * @param {number} origin the position of the share's first record among the send's records for
+   *   its partition: 0 for the share whose metadata the send resolves with
    * @returns {void}
    */
-  delivered(metadata) {
-    if (metadata !== undefined) {
+  delivered(metadata, origin) {
+    if (metadata !== undefined && origin === 0) {
       this.#metadata.push(metadata)
     }
     this.#settleOne()
   }
 
   /**
-   * One partition failed.
+   * One share failed.
    * @param {Error} error
    * @returns {void}
    */
@@ -324,15 +534,69 @@ class AppendedSend {
 class Settler {
   #send
   #index
+  #origin
   #settled = false
 
   /**
+   * Counts itself as one share of `send`.
    * @param {AppendedSend} send
-   * @param {number} index the position of the append's first record in the batch
+   * @param {number} index the position of the share's first record in the batch
+   * @param {number} [origin=0] the position of that record among the send's records for the
+   *   partition
    */
-  constructor(send, index) {
+  constructor(send, index, origin = 0) {
     this.#send = send
     this.#index = index
+    this.#origin = origin
+    send.share()
+  }
+
+  /** @returns {number} the position of its first record in its batch */
+  get index() {
+    return this.#index
+  }
+
+  /**
+   * The settlers of a batch cut in two before anything of it was written: those of records before
+   * `at` stay, those after move to the second batch, and a share the cut divides becomes two, the
+   * second one counted as one more share of its send. Any other settler - one the accumulator did
+   * not make - is settled once both batches have settled it (see `halvesOf`). A BatchTracker
+   * transfers its count to two independent leaves rather than waiting on a parent latch.
+   * @param {object[]} settlers the batch's settlers, in its order, the send path's own left out
+   * @param {number} length the batch's record count
+   * @param {number} at the first record of the second batch, from 1 to `length - 1`
+   * @returns {[object[], object[]]} the settlers of the first batch and of the second
+   */
+  static cut(settlers, length, at) {
+    const first = []
+    const second = []
+    const own = settlers.filter((settler) => settler instanceof Settler)
+    for (const settler of settlers) {
+      if (settler instanceof BatchTracker) {
+        const [head, tail] = settler.cut()
+        first.push(head)
+        second.push(tail)
+        continue
+      }
+      if (!(settler instanceof Settler)) {
+        const [head, tail] = halvesOf(settler)
+        first.push(head)
+        second.push(tail)
+        continue
+      }
+      const next = own[own.indexOf(settler) + 1]
+      const end = next === undefined ? length : next.#index
+      if (end <= at) {
+        first.push(settler)
+      } else if (settler.#index >= at) {
+        settler.#index -= at
+        second.push(settler)
+      } else {
+        first.push(settler)
+        second.push(new Settler(settler.#send, 0, settler.#origin + at - settler.#index))
+      }
+    }
+    return [first, second]
   }
 
   /**
@@ -344,7 +608,10 @@ class Settler {
       return
     }
     this.#settled = true
-    this.#send.delivered(metadata === undefined ? undefined : offsetBy(metadata, this.#index))
+    this.#send.delivered(
+      metadata === undefined ? undefined : offsetBy(metadata, this.#index),
+      this.#origin
+    )
   }
 
   /**
@@ -478,6 +745,7 @@ class PendingSend {
  * @property {object[]|null} messages null once the batch has detached
  * @property {Settler[]} settlers one per append whose records it carries, in arrival order
  * @property {number} bytes its keys' and values' bytes
+ * @property {number} wire its records' wire bytes, which `maxRequestSize` plans on
  * @property {number} createdAt when the earliest of those appends began: its delivery deadline
  *   counts from there
  * @property {number} dueAt when its `linger` runs out
@@ -490,6 +758,7 @@ class PendingSend {
  * @property {number} debt its own charge, debited when it was created
  * @property {(PendingSend|number)[]|null} owners each send whose records it carries, followed by
  *   the bytes of their shares still charged; null once it has retired
+ * @property {BatchOwnership} ownership transfers the payload and debit when a guard subdivides it
  * @property {() => void} retire releases its shares and repays its debt, once; the send path calls
  *   it when nothing holds the batch any more
  * @property {() => void} detach drops its records and gives back the bytes of their shares, once;
@@ -542,6 +811,7 @@ class Accumulator {
   #deadline
   #expired
   #admission
+  #budget
   /** @type {Fifo<PendingSend>} the sends waiting for their partitions, in the order of their deadlines */
   #holders = new Fifo()
   #expiry = new ExpiryTimer((now) => this.#expireHolders(now))
@@ -583,6 +853,9 @@ class Accumulator {
    *   expired before it joined a batch, or that the buffer refused, to arm a transaction; returns
    *   the error to reject with
    * @param {Admission} [options.admission] the producer's buffer; without one, every send fits
+   * @param {RequestBudget} [options.budget] the producer's request-size plan: a record no request
+   *   can carry is refused, a partition's records that one request cannot carry are cut into
+   *   batches that each fit, and no batch grows past what fits; without one, nothing is limited
    */
   constructor({
     linger,
@@ -595,6 +868,7 @@ class Accumulator {
     deadline,
     expired = (error) => error,
     admission = new Admission({ capacity: Number.MAX_SAFE_INTEGER, maxBlockMs: 0 }),
+    budget = new RequestBudget(),
   }) {
     this.#linger = linger
     this.#batchSize = batchSize
@@ -606,6 +880,7 @@ class Accumulator {
     this.#deadline = deadline
     this.#expired = expired
     this.#admission = admission
+    this.#budget = budget
   }
 
   /**
@@ -630,13 +905,62 @@ class Accumulator {
   }
 
   /**
+   * The batches that cut a send at record boundaries, and the settlers they carry, when the send
+   * path must cut one of its batches in two at record `at` before anything of it was written:
+   * the settlers of the records before `at` stay with the first batch and those after move to the
+   * second, and a send whose records straddle the cut gains one share. Product ownership
+   * transfers into independent child holders: each clears its actual array before returning
+   * payload and repays its own debit once. BatchTracker counts both leaves independently.
+   * Only unknown external settlers and callbacks of unowned direct callers use a shared latch.
+   * @param {{ messages: object[], settlers: object[], ownership?: BatchOwnership,
+   *   retire?: Function, detach?: Function }} batch
+   *   `settlers` without the send path's own
+   * @param {number} at from 1 to the record count less 1
+   * @returns {Array<{ messages: object[], recordCount: number, wire: number, settlers: object[],
+   *   ownership?: BatchOwnership, retire?: Function, detach?: Function }>} head then tail fields
+   */
+  static cut(batch, at) {
+    const { messages, settlers, retire, detach, ownership } = batch
+    const length = messages.length
+    const [first, second] = Settler.cut(settlers, length, at)
+    if (ownership) {
+      return ownership.cut(at).map((child, index) => ({
+        ...child,
+        recordCount: child.messages.length,
+        wire: recordsBytes(child.messages),
+        settlers: index === 0 ? first : second,
+      }))
+    }
+    const retires = bothOf(retire)
+    const detaches = bothOf(detach)
+    const arrays = [messages.slice(0, at), messages.slice(at)]
+    messages.length = 0
+    return arrays.map((payload, index) => ({
+      messages: payload,
+      recordCount: payload.length,
+      wire: recordsBytes(payload),
+      settlers: index === 0 ? first : second,
+      retire: () => {
+        payload.length = 0
+        retires[index]?.()
+      },
+      detach: () => {
+        payload.length = 0
+        detaches[index]?.()
+      },
+    }))
+  }
+
+  /**
    * Adds a send's records to the pending batches of their partitions. Resolves once every batch
    * carrying them has been acknowledged, with one `RecordMetadata` per partition, by topic and then
    * partition, whose `baseOffset` is that of the send's own first record there; rejects with the
    * first error such a batch failed with, after all of them have settled. A send with no record
    * resolves `[]` at once and charges nothing. A send still waiting for its partitions at its
    * delivery deadline rejects with `KafkaJSDeliveryTimeout`, `outcome: 'unsent'`, whatever it
-   * waits for.
+   * waits for. A partition's records that one request cannot carry go out in several batches, in
+   * order, each delivered on its own; the send then rejects with the first error any of them
+   * failed with, while the others may have been written.
    *
    * Before its first await the send is charged against the producer's buffer (see `chargeOf`) and
    * admitted: at once when it fits and no send waits, else after the sends ahead of it, within
@@ -653,8 +977,9 @@ class Accumulator {
    * @returns {Promise<object[]>}
    * @throws {KafkaJSInvalidConfigurationError} for a record the encoder cannot write; nothing is
    *   queued
-   * @throws {import('../../errors').KafkaJSRecordTooLargeError} a record, or the send, can never
-   *   fit in the buffer; nothing waits
+   * @throws {KafkaJSRecordTooLargeError} a record no request under `maxRequestSize` can carry
+   *   (`reason: 'maxRequestSize'`), or a record or the send that can never fit in the buffer;
+   *   nothing waits
    * @throws {import('../../errors').KafkaJSBufferExhaustedError} no room within `maxBlockMs`, or
    *   too many bytes already waiting
    */
@@ -673,6 +998,7 @@ class Accumulator {
 
     this.#appending += 1
     try {
+      this.#assertFits(topicMessages, compression)
       const charge = chargeOf(topicMessages, this.#admission.capacity)
       const granted = this.#admission.acquire(charge.total, send.deadline)
       send.admit(granted instanceof Promise ? await granted : granted, charge)
@@ -682,6 +1008,36 @@ class Accumulator {
       throw this.#expired(error)
     }
     return this.#hold(send, { acks, timeout, compression })
+  }
+
+  /**
+   * Refuses a send with a record that no Produce request under `maxRequestSize` can carry: its
+   * wire size is above the chunk capacity of its topic and codec (see `RequestBudget`), before
+   * anything of the send is charged, queued or written, as the Java producer's
+   * `ensureValidRecordSize` refuses it before `buffer.memory`.
+   * @see https://github.com/apache/kafka/blob/4.3.1/clients/src/main/java/org/apache/kafka/clients/producer/KafkaProducer.java
+   * @param {{ topic: string, messages: object[] }[]} topicMessages
+   * @param {number} [compression]
+   * @returns {void}
+   * @throws {KafkaJSRecordTooLargeError} `reason: 'maxRequestSize'`, `scope: 'record'`
+   */
+  #assertFits(topicMessages, compression) {
+    for (const { topic, messages } of topicMessages) {
+      const limit = this.#budget.chunkCapacity(topic, compression)
+      if (limit === Infinity) {
+        continue
+      }
+      for (const message of messages) {
+        const size = wire(message)
+        if (size > limit) {
+          throw new KafkaJSRecordTooLargeError(
+            `A record of ${size} bytes for topic "${topic}" can never fit in a Produce request of ` +
+              `maxRequestSize (${this.#budget.maxRequestSize} bytes), which carries at most ${limit} bytes of records`,
+            { reason: 'maxRequestSize', scope: 'record', size, limit, topic }
+          )
+        }
+      }
+    }
   }
 
   /**
@@ -826,6 +1182,9 @@ class Accumulator {
    * partition that had to go first, in its own call - so one send usually makes one request per
    * broker. When none fills, its records that join a batch an earlier append began leave with
    * that batch, on its timer, so one send can still reach a broker in two requests.
+   * A partition's records that one batch cannot carry under `maxRequestSize` (its chunk capacity)
+   * are cut at record boundaries into chunks that each can, in order; every chunk but the last is
+   * full and goes out in this hand-off, and no batch grows past `batchSize` or the chunk capacity.
    * Each batch takes the shares of the send's records it carries (see `PendingSend#share`), and a
    * batch created here debits its own charge from the buffer, without waiting.
    * @param {{ topic: string, partition: number, messages: object[] }[]} entries
@@ -834,7 +1193,7 @@ class Accumulator {
    * @returns {Promise<object[]>} the append's outcome, as `append()` describes it
    */
   #join(entries, { acks, timeout, compression, createdAt }, holder) {
-    const send = new AppendedSend(entries.length)
+    const send = new AppendedSend()
     const options = `${acks}/${timeout}/${compression}`
     // One due time for every batch this append creates, so they fall due together.
     const dueAt = Date.now() + this.#linger
@@ -843,67 +1202,27 @@ class Accumulator {
     /** @type {PendingBatch[]} the other batches carrying its records, still pending */
     const joined = []
     for (const { topic, partition, messages } of entries) {
-      const key = `${topic}/${partition}`
-      const bytes = sizeOf(messages)
-      let batch = this.#pending.get(key)
-      if (
-        batch !== undefined &&
-        (batch.options !== options || batch.bytes + bytes > this.#batchSize)
-      ) {
-        this.#flushBatch(batch)
-        batch = undefined
-      }
-      if (batch === undefined) {
-        batch = {
-          key,
+      const capacity = this.#budget.chunkCapacity(topic, compression)
+      const bytes = recordsBytes(messages)
+      const chunks =
+        bytes <= capacity ? [{ messages, wire: bytes, origin: 0 }] : chunksOf(messages, capacity)
+      chunks.forEach((chunk, index) => {
+        const batch = this.#add(topic, partition, chunk, capacity, holder, send, {
           options,
-          topic,
-          partition,
           acks,
           timeout,
           compression,
-          messages: [],
-          settlers: [],
-          bytes: 0,
           createdAt,
           dueAt,
-          mergeKey: null,
-          timer: null,
-          due: false,
-          heldBytes: 0,
-          debt: BATCH_DEBIT,
-          owners: [],
-          retire: null,
-          detach: null,
+        })
+        if (index < chunks.length - 1 || batch.bytes >= this.#batchSize || !this.#lingers()) {
+          clearTimeout(batch.timer)
+          this.#pending.delete(batch.key)
+          full.push(batch)
+        } else {
+          joined.push(batch)
         }
-        batch.retire = releaseOf(this.#retire, batch)
-        batch.detach = releaseOf(this.#detach, batch)
-        this.#admission.debit(BATCH_DEBIT)
-        this.#pending.set(key, batch)
-      }
-
-      if (createdAt < batch.createdAt) {
-        batch.createdAt = createdAt
-        this.#rearm(batch)
-      }
-      batch.settlers.push(new Settler(send, batch.messages.length))
-      let shares = 0
-      for (const message of messages) {
-        batch.messages.push(withEncodableTimestamp(message))
-        shares += share(message)
-      }
-      batch.bytes += bytes
-      batch.heldBytes += shares
-      batch.owners.push(holder, shares)
-      holder.share(shares)
-
-      if (batch.bytes >= this.#batchSize || !this.#lingers()) {
-        clearTimeout(batch.timer)
-        this.#pending.delete(key)
-        full.push(batch)
-      } else {
-        joined.push(batch)
-      }
+      })
     }
 
     const due = full.length > 0 || this.#linger === 0
@@ -925,45 +1244,85 @@ class Accumulator {
     } else if (this.#linger === 0) {
       this.#queueHandOff()
     }
+    send.joined()
     return send.promise
   }
 
   /**
-   * Releases a batch's shares of its sends' reservations and repays its debt, once: the send path
-   * calls it when no request, queue, encoder or continuation holds the batch any more.
-   * @param {PendingBatch} batch
-   * @returns {void}
+   * Adds one chunk of a send's records to its partition's pending batch, or to a new one when the
+   * pending batch has other options or would pass `batchSize` or `capacity`, which hands that one
+   * on first.
+   * @param {string} topic
+   * @param {number} partition
+   * @param {{ messages: object[], wire: number, origin: number }} chunk
+   * @param {number} capacity the chunk capacity of the topic and codec
+   * @param {PendingSend} holder
+   * @param {AppendedSend} send
+   * @param {{ options: string, acks: number, timeout?: number, compression?: number,
+   *   createdAt: number, dueAt: number }} shape
+   * @returns {PendingBatch} the batch now carrying the chunk, still pending
    */
-  #retire = (batch) => {
-    const { owners } = batch
-    if (owners === null) {
-      return
+  #add(topic, partition, { messages, wire: wireBytes, origin }, capacity, holder, send, shape) {
+    const { options, acks, timeout, compression, createdAt, dueAt } = shape
+    const key = `${topic}/${partition}`
+    const bytes = sizeOf(messages)
+    let batch = this.#pending.get(key)
+    if (
+      batch !== undefined &&
+      (batch.options !== options ||
+        batch.bytes + bytes > this.#batchSize ||
+        batch.wire + wireBytes > capacity)
+    ) {
+      this.#flushBatch(batch)
+      batch = undefined
     }
-    batch.owners = null
-    batch.messages = null
-    for (let i = 0; i < owners.length; i += 2) {
-      owners[i].unshare(owners[i + 1])
+    if (batch === undefined) {
+      batch = {
+        key,
+        options,
+        topic,
+        partition,
+        acks,
+        timeout,
+        compression,
+        messages: [],
+        settlers: [],
+        bytes: 0,
+        wire: 0,
+        createdAt,
+        dueAt,
+        mergeKey: null,
+        timer: null,
+        due: false,
+        heldBytes: 0,
+        debt: BATCH_DEBIT,
+        owners: [],
+        retire: null,
+        detach: null,
+      }
+      batch.ownership = new BatchOwnership(this.#admission, batch, false)
+      batch.retire = batch.ownership.retire
+      batch.detach = batch.ownership.detach
+      this.#admission.debit(BATCH_DEBIT)
+      this.#pending.set(key, batch)
     }
-    this.#admission.repay(batch.debt)
-  }
 
-  /**
-   * Drops a batch's records (`messages` becomes `null`) and gives back the bytes of their shares,
-   * once; the shares stay counted, so the sends keep their shells, and the batch its debt, until
-   * `#retire`.
-   * @param {PendingBatch} batch
-   * @returns {void}
-   */
-  #detach = (batch) => {
-    const { owners } = batch
-    if (owners === null) {
-      return
+    if (createdAt < batch.createdAt) {
+      batch.createdAt = createdAt
+      this.#rearm(batch)
     }
-    batch.messages = null
-    for (let i = 0; i < owners.length; i += 2) {
-      owners[i].give(owners[i + 1])
-      owners[i + 1] = 0
+    batch.settlers.push(new Settler(send, batch.messages.length, origin))
+    let shares = 0
+    for (const message of messages) {
+      batch.messages.push(withEncodableTimestamp(message))
+      shares += share(message)
     }
+    batch.bytes += bytes
+    batch.wire += wireBytes
+    batch.heldBytes += shares
+    batch.owners.push(holder, shares)
+    holder.share(shares)
+    return batch
   }
 
   /**
@@ -1231,7 +1590,12 @@ class Accumulator {
     for (const batch of batches) {
       const { key } = batch
       this.#unsettled.set(key, (this.#unsettled.get(key) ?? 0) + 1)
-      batch.settlers.push(settleOnce(() => this.#settled(key)))
+      batch.settlers.push(
+        new BatchTracker(
+          () => this.#unsettled.set(key, (this.#unsettled.get(key) ?? 0) + 1),
+          () => this.#settled(key)
+        )
+      )
     }
     const [{ acks, timeout, compression }] = batches
     return this.#sendPartitioned({ acks, timeout, compression, batches }).then(

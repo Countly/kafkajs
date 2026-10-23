@@ -1,17 +1,25 @@
 /**
- * The accumulator's cost on many partitions, topics or brokers, with no broker. One real
- * `Accumulator` of a tree is fed one record per send, round-robin over every topic-partition,
- * over a send path that answers at once; the event loop turns every `--yield-every` sends. The
- * leaders come from the tree's own metadata cache, as the producer reads them; a tree whose cache
- * has no `leader()` is fed none, which is how it ran. Counts the hand-offs and the Produce
- * requests (one per leader in a hand-off), and records the payload bytes of the largest request:
- * the keys and values of its batches, not the encoded request, which also holds headers and
- * framing.
+ * The accumulator's cost on many partitions, topics or brokers, with no broker: an internal-API
+ * microbenchmark of the accumulator, not of the requests a producer writes. One real
+ * `Accumulator` of a tree is fed `--per-send` records of `--value-bytes` per send for one
+ * topic-partition, round-robin over every topic-partition, over a send path that answers at once;
+ * the event loop turns every `--yield-every` sends. The leaders come from the tree's own metadata
+ * cache, as the producer reads them; a tree whose cache has no `leader()` is fed none, which is
+ * how it ran. A tree with a request-size plan (`RequestBudget`) gets one of `--max-request-size`
+ * bytes, as its producer would, and its modelled requests take one batch per partition within
+ * that plan; a tree without one models one request per leader in a hand-off, as it sent them.
+ * Counts the hand-offs and the modelled Produce requests, and records two columns of the
+ * largest modelled request: `largestPayloadBytes`, the keys and values of its batches (a payload,
+ * not a frame), and `largestRequestEstimate`, the request-size plan of this script's tree for it
+ * (framing, topics, batch headers and records' wire sizes): a model, not the frame a producer
+ * writes - `produceFrameSize.js` measures that.
  * Usage: node scripts/benchmarks/accumulatorScan.js [--topics 1] [--partitions 1000]
  *          [--brokers 3] [--linger 5] [--records 100000] [--yield-every 20] [--tree <dir>]
+ *          [--max-request-size 1048576] [--value-bytes 200] [--per-send 1]
  *          [--baseline-tree <dir> --raw <file>] [--runs 9]
  * Without `--baseline-tree` it runs once and prints one JSON line: { tree, topics, partitions,
- * brokers, linger, records, wallMs, cpuMs, handOffs, produceRequests, largestPayloadBytes }. With
+ * brokers, linger, records, wallMs, cpuMs, handOffs, produceRequests, largestPayloadBytes,
+ * largestRequestEstimate }. With
  * it, it runs a session: `--runs` measured runs of each of the two trees, and of a second copy of
  * the baseline (the A/A control), after one discarded warm-up run, every arm in every position,
  * each run in its own process. Every observation goes to `--raw`; the summary printed is a median
@@ -26,6 +34,13 @@ const fs = require('fs')
 const path = require('path')
 const { spawnSync } = require('child_process')
 const { runSession, summarize, format, exitCode } = require('./session')
+const {
+  framing,
+  topicFraming,
+  recordsBytes,
+  BATCH_OVERHEAD,
+  PARTITION_FRAMING,
+} = require('../../src/producer/state/recordSize')
 
 /** The flags and their defaults; `tree` defaults to this repository. */
 const DEFAULTS = {
@@ -35,6 +50,9 @@ const DEFAULTS = {
   linger: 5,
   records: 100000,
   yieldEvery: 20,
+  maxRequestSize: 1048576,
+  valueBytes: 200,
+  perSend: 1,
   runs: 9,
   tree: path.join(__dirname, '../..'),
   baselineTree: null,
@@ -42,7 +60,14 @@ const DEFAULTS = {
 }
 
 /** What a session reports; the A/A rule judges the two timings only, the counts depend on timers. */
-const METRICS = ['wallMs', 'cpuMs', 'handOffs', 'produceRequests', 'largestPayloadBytes']
+const METRICS = [
+  'wallMs',
+  'cpuMs',
+  'handOffs',
+  'produceRequests',
+  'largestPayloadBytes',
+  'largestRequestEstimate',
+]
 const TIMINGS = ['wallMs', 'cpuMs']
 
 /**
@@ -80,13 +105,86 @@ const parseArgs = (argv) => {
 }
 
 /**
+ * The request-size plan a tree's producer would build, when the tree has one.
+ * @param {string} tree
+ * @param {number} maxRequestSize
+ * @returns {object|null} the tree's own `RequestBudget`, or null for a tree without one
+ */
+const budgetOf = (tree, maxRequestSize) => {
+  try {
+    const { RequestBudget } = require(path.join(tree, 'src/producer/state/recordSize'))
+    return RequestBudget === undefined ? null : new RequestBudget({ maxRequestSize })
+  } catch {
+    return null
+  }
+}
+
+/**
+ * The request-size plan of a modelled request, on this script's tree: its framing, each topic's,
+ * and per batch its partition's, its header and its records' wire sizes.
+ * @param {{ topic: string, messages: object[] }[]} batches
+ * @returns {number}
+ */
+const estimateOf = (batches) => {
+  let bytes = framing()
+  const topics = new Set()
+  for (const { topic, messages } of batches) {
+    if (!topics.has(topic)) bytes += topicFraming(topic)
+    topics.add(topic)
+    bytes += PARTITION_FRAMING + BATCH_OVERHEAD + recordsBytes(messages)
+  }
+  return bytes
+}
+
+/**
+ * One leader's batches of a hand-off as the modelled requests that carry them: with a plan, one
+ * batch per partition per request and each request within it; without one, one request.
+ * @param {object[]} batches
+ * @param {object|null} budget
+ * @returns {object[][]}
+ */
+const requestsOf = (batches, budget) => {
+  if (budget === null) return [batches]
+  const requests = []
+  let request = []
+  let planned = 0
+  let partitions = new Set()
+  for (const batch of batches) {
+    const bytes = budget.topicBytes(batch.topic) + budget.batchBytes(batch)
+    const slot = `${batch.topic}/${batch.partition}`
+    if (request.length > 0 && (partitions.has(slot) || planned + bytes > budget.maxRequestBytes)) {
+      requests.push(request)
+      request = []
+      planned = 0
+      partitions = new Set()
+    }
+    request.push(batch)
+    planned += bytes
+    partitions.add(slot)
+  }
+  requests.push(request)
+  return requests
+}
+
+/**
  * Runs one arm in this process.
  * @param {typeof DEFAULTS} options
  * @returns {Promise<{ tree: string, topics: number, partitions: number, brokers: number,
  *   linger: number, records: number, wallMs: number, cpuMs: number, handOffs: number,
- *   produceRequests: number, largestPayloadBytes: number }>}
+ *   produceRequests: number, largestPayloadBytes: number, largestRequestEstimate: number }>}
  */
-const run = async ({ tree, topics, partitions, brokers, linger, records, yieldEvery }) => {
+const run = async ({
+  tree,
+  topics,
+  partitions,
+  brokers,
+  linger,
+  records,
+  yieldEvery,
+  maxRequestSize,
+  valueBytes,
+  perSend,
+}) => {
   const Accumulator = require(path.join(tree, 'src/producer/state/accumulator'))
   const MetadataCache = require(path.join(tree, 'src/cluster/metadataCache'))
   const nodeOf = (topicIndex, partition) => (topicIndex * partitions + partition) % brokers
@@ -106,6 +204,8 @@ const run = async ({ tree, topics, partitions, brokers, linger, records, yieldEv
   let handOffs = 0
   let produceRequests = 0
   let largestPayloadBytes = 0
+  let largestRequestEstimate = 0
+  const budget = budgetOf(tree, maxRequestSize)
   const accumulator = new Accumulator({
     linger,
     batchSize: 16384,
@@ -118,26 +218,39 @@ const run = async ({ tree, topics, partitions, brokers, linger, records, yieldEv
       })),
     sendPartitioned: async ({ batches }) => {
       handOffs += 1
-      const bytesByNode = new Map()
+      const byNode = new Map()
       for (const batch of batches) {
         const node = nodeOf(Number(batch.topic.slice(1)), batch.partition)
-        bytesByNode.set(node, (bytesByNode.get(node) ?? 0) + batch.bytes)
-        batch.settlers.forEach((settler) => settler.resolve({ baseOffset: '0' }))
+        byNode.set(node, [...(byNode.get(node) ?? []), batch])
       }
-      produceRequests += bytesByNode.size
-      largestPayloadBytes = Math.max(largestPayloadBytes, ...bytesByNode.values())
+      for (const own of byNode.values()) {
+        for (const request of requestsOf(own, budget)) {
+          produceRequests += 1
+          const payload = request.reduce((sum, batch) => sum + batch.bytes, 0)
+          largestPayloadBytes = Math.max(largestPayloadBytes, payload)
+          largestRequestEstimate = Math.max(largestRequestEstimate, estimateOf(request))
+        }
+      }
+      for (const batch of batches) {
+        batch.settlers.forEach((settler) =>
+          settler.resolve({ topicName: batch.topic, partition: batch.partition, baseOffset: '0' })
+        )
+        batch.retire?.()
+      }
     },
+    ...(budget === null ? {} : { budget }),
     ...(typeof cache.leader === 'function'
       ? { leaderOf: (topic, partition) => cache.leader(topic, partition) }
       : {}),
   })
 
-  const value = Buffer.alloc(200, 'x')
+  const value = Buffer.alloc(valueBytes, 'x')
   const sends = []
   const cpu = process.cpuUsage()
   const started = process.hrtime.bigint()
-  for (let sent = 0; sent < records; sent += 1) {
+  for (let sent = 0; sent * perSend < records; sent += 1) {
     const pair = sent % (topics * partitions)
+    const count = Math.min(perSend, records - sent * perSend)
     sends.push(
       accumulator.append({
         acks: -1,
@@ -146,7 +259,10 @@ const run = async ({ tree, topics, partitions, brokers, linger, records, yieldEv
         topicMessages: [
           {
             topic: `t${Math.floor(pair / partitions)}`,
-            messages: [{ partition: pair % partitions, value }],
+            messages: Array.from({ length: count }, () => ({
+              partition: pair % partitions,
+              value,
+            })),
           },
         ],
       })
@@ -169,6 +285,7 @@ const run = async ({ tree, topics, partitions, brokers, linger, records, yieldEv
     handOffs,
     produceRequests,
     largestPayloadBytes,
+    largestRequestEstimate,
   }
 }
 
@@ -181,9 +298,20 @@ const run = async ({ tree, topics, partitions, brokers, linger, records, yieldEv
  * @throws {Error} when a run exits with an error
  */
 const compare = (options) => {
-  const shape = ['topics', 'partitions', 'brokers', 'linger', 'records', 'yieldEvery'].flatMap(
-    (name) => [`--${name.replace(/[A-Z]/g, (c) => `-${c.toLowerCase()}`)}`, String(options[name])]
-  )
+  const shape = [
+    'topics',
+    'partitions',
+    'brokers',
+    'linger',
+    'records',
+    'yieldEvery',
+    'maxRequestSize',
+    'valueBytes',
+    'perSend',
+  ].flatMap((name) => [
+    `--${name.replace(/[A-Z]/g, (c) => `-${c.toLowerCase()}`)}`,
+    String(options[name]),
+  ])
   const arm = (label, tree) => ({
     label,
     run: () => {

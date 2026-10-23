@@ -344,9 +344,11 @@ class ProducerStateManager {
    * @see https://github.com/apache/kafka/blob/4.3/clients/src/main/java/org/apache/kafka/clients/producer/internals/Sender.java
    * @param {{ nodeId: number|string }} broker
    * @param {LeaderMap} leaders
+   * @param {import('./recordSize').RequestBudget} [budget] the request-size plan the drain keeps
+   *   one request within
    * @returns {PartitionBatch[]}
    */
-  drain(broker, leaders) {
+  drain(broker, leaders, budget) {
     this.resolveSequences()
     if (this.#armed()) {
       this.sequencer.abortQueued(this.transaction.armedError())
@@ -359,6 +361,7 @@ class ProducerStateManager {
       producerId: this.#identity.producerId,
       producerEpoch: this.#identity.producerEpoch,
       isPartitionInTransaction: this.#isPartitionInTransaction,
+      budget,
     })
   }
 

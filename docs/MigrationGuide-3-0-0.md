@@ -62,6 +62,7 @@ What to change to install the package and run it on a Kafka 4.x cluster.
 - If you relied on a send failing soon after a broker problem (the five default attempts nominally accumulate about 9 seconds of backoff, request time on top), set `deliveryTimeout` (at least `linger + requestTimeout`) or `retry: { retries: n }`. Code that matched `KafkaJSNumberOfRetriesExceeded` on a send now also sees `KafkaJSDeliveryTimeout`: match `e.type` or `e.cause`. Admin and consumer retries, and the retries of a transaction's own requests (`commit`, `abort`, `initTransactions`), are unchanged
 - A producer that sends faster than the cluster accepts used to grow without bound; it now rejects with a retriable error you can back off on. Raise `bufferMemory` (up to `Number.MAX_SAFE_INTEGER`) or `maxBlockMs` if your bursts are larger. A single `send()` holding more than `bufferMemory` is rejected: split it. Admitted sends are charged at most `bufferMemory`, waiting sends (which keep their records) at most the same again, and each live batch a further 1 024 bytes on top (about 13.6× in the worst case of one empty record per batch, about 3× for records of 1 KiB or more); the bound is a charge, not RSS. **In a transaction, a refused `send()` means the transaction can no longer commit: catch it, `abort()`, and start a new transaction**
 - Do not rely on mutating a record you already passed to `send()`. Mutating the bytes of an uncopied `Buffer` still affects what is sent, as in 2.2.4. A view over a backing store larger than 16 KiB and more than 16 times the view's length is copied at the call. Treat records and Buffer bytes as immutable after passing them; pass a separate Buffer containing the same bytes if you need to change your original Buffer.
+- A `send()` over about 1 MiB used to travel as one request and fail at the broker or close the connection; it is now split. A rejected split send may have written some of its records: resending it whole can duplicate those. Raise `maxRequestSize` to match the broker's `message.max.bytes` if you raised that. **Inside a transaction a size rejection now makes the transaction abort-only** (as Java's producer does for an `ApiException` from `send`): abort and begin a new one
 
 
 Producers are idempotent by default and gather sends into batches; each item says what you may
@@ -405,6 +406,7 @@ transaction in a way its error decides.
   for operation order.
 - **Sends made together to one partition keep their call order.** Two or more `send()` calls to one partition in the same tick are written in call order, as `docs/Producing.md` already said they normally are. Before, the last two of such a burst were written swapped. *What to do:* nothing. Order is still not guaranteed across a send that had to retry its partitioning, or across topics: await each send when the order matters.
 - **In a transaction, a refused `send()` means the transaction can no longer commit: catch it, `abort()`, and start a new transaction**
+- **Inside a transaction a size rejection now makes the transaction abort-only** (as Java's producer does for an `ApiException` from `send`): abort and begin a new one
 
 ### Consumer
 

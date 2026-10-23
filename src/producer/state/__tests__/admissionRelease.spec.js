@@ -500,7 +500,11 @@ describe('Producer > the buffer > release at the terminal owner', () => {
   })
 
   test('sends that expire behind a held producer id request keep only their shells charged, and none of their records', async () => {
-    const { producer, cluster, admission } = bufferedProducer({ capacity: 64 * 1048576 })
+    // Each send's 1 MiB record needs a request above the default maxRequestSize.
+    const { producer, cluster, admission } = bufferedProducer({
+      capacity: 64 * 1048576,
+      maxRequestSize: 2097152,
+    })
     const initialized = deferred()
     cluster.broker.initProducerId.mockImplementation(() => initialized.promise)
     const connecting = producer.connect()
@@ -564,6 +568,36 @@ describe('Producer > the buffer > release at the terminal owner', () => {
     await flushAll()
 
     expect(sent.state).toBe('fulfilled')
+    expect(countersOf(admission)).toEqual(quiescent(admission))
+    await producer.disconnect()
+  })
+
+  test("a split send's chunks release their own shares at their answers, and its shell with the last one", async () => {
+    const { producer, cluster, admission } = bufferedProducer({
+      maxRequestSize: 2000,
+      deliveryTimeout: 60000,
+    })
+    const calls = holdProduce(cluster)
+    await producer.connect()
+    // 2000 less the framing of the request (39), the topic (39), the partition (16) and the batch
+    // header (61) leaves 1845 bytes of records: three records of 525 wire bytes a chunk
+    const messages = Array.from({ length: 6 }, () => ({ value: 'x'.repeat(500) }))
+    const share = 3 * (525 + 64)
+    const sent = watch(producer.send({ topic: TOPIC, messages }))
+    await flushAll()
+
+    expect(calls).toHaveLength(1)
+    expect(calls[0].request.topicData[0].partitions[0].messages).toHaveLength(3)
+    expect([admission.reserved, admission.debts]).toEqual([1536 + 2 * share, 2 * 1024])
+    calls[0].answer()
+    await flushAll()
+    expect(calls).toHaveLength(2)
+    expect([admission.reserved, admission.debts]).toEqual([1536 + share, 1024])
+    calls[1].answer()
+    await flushAll()
+
+    expect(sent.state).toBe('fulfilled')
+    expect(sent.value).toEqual([expect.objectContaining({ partition: 0, baseOffset: '0' })])
     expect(countersOf(admission)).toEqual(quiescent(admission))
     await producer.disconnect()
   })
@@ -694,4 +728,124 @@ describe('Producer > the buffer > every order of answer, expiry, abort and disco
       await producer.disconnect()
     }
   )
+  test('post-guard children each clear their actual payload, debit a batch and keep the backing-store shell until the final owner retires', async () => {
+    const Accumulator = require('../accumulator')
+    const { Admission } = require('../admission')
+    const admission = new Admission({ capacity: 1048576, maxBlockMs: 0 })
+    const handed = []
+    const accumulator = new Accumulator({
+      linger: 0,
+      batchSize: 16384,
+      admission,
+      partition: async ({ records }) =>
+        records.map(({ topic, messages }) => ({ topic, partition: 0, messages })),
+      sendPartitioned: async ({ batches }) => {
+        handed.push(...batches)
+      },
+    })
+    const sent = watch(
+      accumulator.append({
+        acks: -1,
+        topicMessages: [
+          {
+            topic: TOPIC,
+            messages: Array.from({ length: 4 }, () => ({ value: Buffer.alloc(8192) })),
+          },
+        ],
+      })
+    )
+    await flushAll()
+    const [parent] = handed
+    const original = parent.messages
+    const lateRetire = parent.retire
+    const lateDetach = parent.detach
+    const [head, tail] = Accumulator.cut(parent, 2)
+    expect(original).toHaveLength(0)
+    Object.assign(parent, tail)
+    lateDetach()
+    lateRetire()
+    lateRetire()
+    expect(tail.messages).toHaveLength(2)
+    expect(admission.debts).toBe(2048)
+    const [left, right] = Accumulator.cut(head, 1)
+    expect(head.messages).toHaveLength(0)
+    expect(admission.debts).toBe(3072)
+    const before = admission.reserved
+    left.detach()
+    left.detach()
+    expect(left.messages).toHaveLength(0)
+    expect(admission.reserved).toBe(before - 90)
+    left.settlers.forEach((settler) =>
+      settler.resolve({ topicName: TOPIC, partition: 0, baseOffset: '0' })
+    )
+    left.retire()
+    left.retire()
+    head.retire()
+    lateRetire()
+    expect(admission.debts).toBe(2048)
+    const failure = new Error('expired or aborted')
+    for (const child of [right, tail]) {
+      child.settlers.forEach((settler) => settler.reject(failure))
+      child.settlers.forEach((settler) => settler.reject(failure))
+      child.detach()
+      child.detach()
+    }
+    await flushAll()
+    expect(sent.value).toBe(failure)
+    expect(right.messages).toHaveLength(0)
+    expect(tail.messages).toHaveLength(0)
+    expect(admission.reserved).toBe(1536 + 4 * 8192)
+    right.retire()
+    right.retire()
+    expect(admission.reserved).toBe(1536 + 4 * 8192)
+    expect(admission.debts).toBe(1024)
+    tail.retire()
+    tail.retire()
+    expect(countersOf(admission)).toEqual(quiescent(admission))
+  })
+
+  test('plain post-guard child settlement behind held recovery clears every child array while shells and debits stay charged', async () => {
+    const Accumulator = require('../accumulator')
+    const cuts = []
+    const cut = Accumulator.cut
+    jest.spyOn(Accumulator, 'cut').mockImplementation((batch, at) => {
+      const children = cut(batch, at)
+      cuts.push(...children)
+      return children
+    })
+    const { producer, cluster, admission } = bufferedProducer({
+      idempotent: false,
+      maxRequestSize: 4096,
+    })
+    const recovery = deferred()
+    cluster.refreshMetadata.mockImplementation(() => recovery.promise)
+    cluster.broker.produce.mockImplementation(async (request) => {
+      const count = request.topicData
+        .flatMap(({ partitions }) => partitions)
+        .reduce((sum, { messages }) => sum + messages.length, 0)
+      const refusal = request.guard(count > 1 ? 4097 : 64)
+      if (refusal) throw refusal
+      return [failedResult(6)]
+    })
+    await producer.connect()
+    const sent = watch(
+      producer.send({
+        topic: TOPIC,
+        messages: Array.from({ length: 4 }, () => ({ value: 'x'.repeat(500) })),
+      })
+    )
+    await flushAll()
+    expect(cuts).toHaveLength(4)
+    expect(admission.debts).toBe(3072)
+    await jest.advanceTimersByTimeAsync(1000)
+    await flushAll()
+    expect(sent.value).toBeInstanceOf(KafkaJSDeliveryTimeout)
+    expect(cuts.every(({ messages }) => messages.length === 0)).toBe(true)
+    expect(admission.reserved).toBe(1536)
+    expect(admission.debts).toBe(3072)
+    recovery.resolve()
+    await flushAll()
+    expect(countersOf(admission)).toEqual(quiescent(admission))
+    await producer.disconnect()
+  })
 })

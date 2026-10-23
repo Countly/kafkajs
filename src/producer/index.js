@@ -7,6 +7,7 @@ const createEosManager = require('./eosManager')
 const createMessageProducer = require('./messageProducer')
 const Idempotence = require('./idempotence')
 const { Admission } = require('./state/admission')
+const { RequestBudget } = require('./state/recordSize')
 const { events, wrap: wrapEvent, unwrap: unwrapEvent } = require('./instrumentationEvents')
 const {
   KafkaJSNonRetriableError,
@@ -59,6 +60,7 @@ const DEFAULTS = Object.freeze({
   deliveryTimeout: 120000,
   bufferMemory: 33554432,
   maxBlockMs: 60000,
+  maxRequestSize: 1048576,
 })
 
 /**
@@ -103,6 +105,9 @@ const definedKeys = (options) =>
  * @param {number} [params.maxBlockMs=60000] ms a send waits for room in the buffer
  * @param {Admission} [params.admission] the buffer itself, built from `bufferMemory` and
  *   `maxBlockMs` when absent
+ * @param {string|null} [params.clientId] the client's id, which every request carries
+ * @param {number} [params.maxRequestSize=1048576] the largest Produce request in bytes, its whole
+ *   frame counted, for its own sends and its transactions' (see `RequestBudget`)
  * @param {InstrumentationEventEmitter} [params.instrumentationEmitter]
  *
  * @returns {import('../../types').Producer}
@@ -124,6 +129,8 @@ const createProducer = ({
   bufferMemory = DEFAULTS.bufferMemory,
   maxBlockMs = DEFAULTS.maxBlockMs,
   admission = new Admission({ capacity: bufferMemory, maxBlockMs }),
+  clientId,
+  maxRequestSize = DEFAULTS.maxRequestSize,
   instrumentationEmitter: rootInstrumentationEmitter,
 }) => {
   let connectionStatus = CONNECTION_STATUS.DISCONNECTED
@@ -166,6 +173,7 @@ const createProducer = ({
   }
 
   const partitioner = createPartitioner()
+  const requestBudget = new RequestBudget({ maxRequestSize, clientId, transactionalId })
   // The retry options the producer was given, and no others: the requests of the transaction
   // protocol retry with these and the retrier's defaults.
   const retryOptions = definedKeys(Object.assign({}, cluster.retry, retry))
@@ -201,6 +209,7 @@ const createProducer = ({
     linger,
     batchSize,
     admission,
+    budget: requestBudget,
     getConnectionStatus: () => connectionStatus,
     isClosing,
     instrumentationEmitter,
@@ -322,6 +331,7 @@ const createProducer = ({
         linger,
         batchSize,
         admission,
+        budget: requestBudget,
         eosManager: transactionalEosManager,
         idempotence,
         getConnectionStatus: () => connectionStatus,

@@ -1,4 +1,6 @@
 const { KafkaJSRecordTooLargeError } = require('../../errors')
+const { Codecs, Types } = require('../../protocol/message/compression')
+const snappy = require('../../protocol/message/compression/snappy')
 
 /**
  * The sizes the producer charges against `bufferMemory`. A record's wire size is the Java client's
@@ -278,6 +280,176 @@ const ownedBuffer = (field) => {
   return copy
 }
 
+/** `DefaultRecordBatch.RECORD_BATCH_OVERHEAD`: the header of a v2 record batch. */
+const BATCH_OVERHEAD = 61
+/** What one partition adds to a Produce request beside its batches: its index and lengths. */
+const PARTITION_FRAMING = 16
+/** The wire size of a record with no key, an empty value and no header. */
+const EMPTY_RECORD = 24
+/** The codecs this client registers itself; a factory assigned later is the caller's plugin. */
+const BUILT_IN = { ...Codecs }
+
+/**
+ * @param {*} text a client id, transactional id or topic name; null and absent count 0
+ * @returns {number} its UTF-8 bytes
+ */
+const textBytes = (text) => (text == null ? 0 : Buffer.byteLength(String(text)))
+
+/**
+ * What a Produce request costs beside its topics: the length prefix, the request header and the
+ * body's own fields, at most 32 bytes in every version, plus the client id and transactional id.
+ * @param {string|null} [clientId='kafkajs'] the connection's client id, its default when absent
+ * @param {string|null} [transactionalId]
+ * @returns {number}
+ */
+const framing = (clientId = 'kafkajs', transactionalId) =>
+  32 + textBytes(clientId) + textBytes(transactionalId)
+
+/**
+ * What a topic costs in a Produce request beside its partitions: its name or id, its partition
+ * array's length and tags, at most 32 bytes plus the name.
+ * @param {string} name
+ * @returns {number}
+ */
+const topicFraming = (name) => 32 + textBytes(name)
+
+/**
+ * The bytes of records as a batch carries them, uncompressed: their wire sizes.
+ * @param {object[]} records
+ * @returns {number}
+ */
+const recordsBytes = (records) => {
+  let bytes = 0
+  for (const record of records) {
+    bytes += wire(record)
+  }
+  return bytes
+}
+
+/**
+ * A v2 batch of `records`, uncompressed, at most: its header and every record's wire size.
+ * @param {object[]} records
+ * @returns {number}
+ */
+const batchBytes = (records) => BATCH_OVERHEAD + recordsBytes(records)
+
+/**
+ * The most `n` bytes of records can take once a built-in codec compressed them, from each codec's
+ * own worst case; `n` for no compression, and for a codec the caller registered, whose bound is
+ * unknown (the write-boundary guard catches what it adds).
+ * @see https://github.com/madler/zlib/blob/v1.3.1/deflate.c (`deflateBound`, gzip wrapper)
+ * @see https://github.com/facebook/zstd/blob/dev/lib/zstd.h (`ZSTD_COMPRESSBOUND`)
+ * @see https://github.com/lz4/lz4/blob/dev/doc/lz4_Frame_format.md
+ * @param {number} codec the request's `compression`, one of `Types`
+ * @param {number} n uncompressed bytes
+ * @returns {number}
+ */
+const encodedBound = (codec, n) => {
+  if (Codecs[codec] === undefined || Codecs[codec] !== BUILT_IN[codec]) {
+    return n
+  }
+  switch (codec) {
+    case Types.GZIP:
+      return n + Math.floor(n / 4096) + Math.floor(n / 16384) + Math.floor(n / 33554432) + 25
+    case Types.ZSTD:
+      return n + Math.floor(n / 256) + (n < 131072 ? Math.floor((131072 - n) / 2048) : 0)
+    case Types.LZ4:
+      return n + 8 * Math.ceil(n / 65536) + 27
+    default:
+      return snappy.encodedBound(n)
+  }
+}
+
+/**
+ * The smallest `maxRequestSize` a producer with these identifiers takes: its request framing, one
+ * batch header and one empty record.
+ * @param {string|null} [clientId]
+ * @param {string|null} [transactionalId]
+ * @returns {number}
+ */
+const minimumRequestSize = (clientId, transactionalId) =>
+  framing(clientId, transactionalId) + BATCH_OVERHEAD + EMPTY_RECORD
+
+/**
+ * One producer's plan of its Produce requests under `maxRequestSize`, on the raw sizes of the
+ * records plus each built-in codec's worst case (`encodedBound`): a request is planned as its
+ * framing, each topic's framing, and per batch its partition's framing, its header and its
+ * records' bound. The plan only ever overestimates a request the encoder builds from the same
+ * batches, so a batch planned alone always fits; the write-boundary guard compares the real frame.
+ * Without `maxRequestSize` nothing is limited.
+ */
+class RequestBudget {
+  #framing
+  /** @type {Map<string, number>} by codec, whether it is built in, and topic name bytes */
+  #capacities = new Map()
+
+  /**
+   * @param {object} [options]
+   * @param {number} [options.maxRequestSize=Infinity] the largest frame, its length prefix included
+   * @param {string|null} [options.clientId] absent means the connection's default, `kafkajs`
+   * @param {string|null} [options.transactionalId]
+   */
+  constructor({ maxRequestSize = Infinity, clientId, transactionalId } = {}) {
+    this.maxRequestSize = maxRequestSize
+    this.#framing = framing(clientId, transactionalId)
+  }
+
+  /** @returns {number} the bytes the topics and batches of one request may plan */
+  get maxRequestBytes() {
+    return this.maxRequestSize - this.#framing
+  }
+
+  /**
+   * @param {string} topic
+   * @returns {number} the planned bytes of the topic's framing in one request
+   */
+  topicBytes(topic) {
+    return topicFraming(topic)
+  }
+
+  /**
+   * @param {{ compression?: number, messages: object[], wire?: number }} batch `wire` is its
+   *   records' wire bytes, computed from `messages` when absent
+   * @returns {number} the planned bytes of the batch in a request, its topic's framing apart
+   */
+  batchBytes({ compression, messages, wire: bytes = recordsBytes(messages) }) {
+    return PARTITION_FRAMING + BATCH_OVERHEAD + encodedBound(compression, bytes)
+  }
+
+  /**
+   * The most wire bytes of records one batch of `topic` may carry for a request of that batch
+   * alone to fit: the largest `R` whose plan, `framing + topicFraming + 16 + 61 +
+   * encodedBound(codec, R)`, is at most `maxRequestSize`. Found by bisection over the monotone
+   * bound, and kept per codec and topic name length.
+   * @param {string} topic
+   * @param {number} [codec]
+   * @returns {number} Infinity without a limit; -1 when not even an empty batch fits
+   */
+  chunkCapacity(topic, codec) {
+    if (this.maxRequestSize === Infinity) {
+      return Infinity
+    }
+    const fixed = this.#framing + topicFraming(topic) + PARTITION_FRAMING + BATCH_OVERHEAD
+    const key = `${codec}/${Codecs[codec] === BUILT_IN[codec]}/${fixed}`
+    let capacity = this.#capacities.get(key)
+    if (capacity === undefined) {
+      let low = -1
+      let high = Math.max(-1, this.maxRequestSize - fixed)
+      while (low < high) {
+        const middle = Math.ceil((low + high) / 2)
+        if (fixed + encodedBound(codec, middle) <= this.maxRequestSize) {
+          low = middle
+        } else {
+          high = middle - 1
+        }
+      }
+      capacity = low
+      this.#capacities.set(key, capacity)
+    }
+    return capacity
+  }
+}
+
 module.exports = {
   wire,
   held,
@@ -285,7 +457,16 @@ module.exports = {
   chargeOf,
   ownedBuffer,
   varintSize,
+  framing,
+  topicFraming,
+  recordsBytes,
+  batchBytes,
+  encodedBound,
+  minimumRequestSize,
+  RequestBudget,
   RECORD_OVERHEAD,
   SEND_CHARGE,
   BATCH_DEBIT,
+  BATCH_OVERHEAD,
+  PARTITION_FRAMING,
 }

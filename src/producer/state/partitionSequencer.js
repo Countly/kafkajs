@@ -60,11 +60,17 @@ const isForward = (sequence, current) =>
   (sequence - current + SEQUENCE_SPACE) % SEQUENCE_SPACE < SEQUENCE_SPACE / 2
 
 /**
- * Works out the sequence of a numbered batch's last record.
- * @param {PartitionBatch} batch a batch that has a sequence
- * @returns {number} the sequence of its last record
+ * Reads the immutable child membership even after its payload has been released.
+ * @param {PartitionBatch} batch
+ * @returns {number} its record count, or the live array's count for an older direct caller
  */
-const lastSequenceOf = (batch) => addSequence(batch.firstSequence, batch.messages.length - 1)
+const recordCountOf = (batch) => batch.recordCount ?? batch.messages.length
+
+/**
+ * @param {PartitionBatch} batch
+ * @returns {number} last sequence of its immutable record membership
+ */
+const lastSequenceOf = (batch) => addSequence(batch.firstSequence, recordCountOf(batch) - 1)
 
 /**
  * Removes `item` from `list` when it is there.
@@ -139,6 +145,9 @@ const restartedSinceSent = (entry) =>
  * @property {number} createdAt
  * @property {boolean} sequenceReset whether the batch was renumbered since it was last sent
  *   (Java's `ProducerBatch.sequenceHasBeenReset`)
+ * @property {number} [recordCount] immutable count for state changes after payload detachment
+ * @property {object|null} [child] the part of a refused request this batch belongs to until a
+ *   request carrying it is written: the drain puts it only with the other batches of that part
  */
 
 /**
@@ -151,6 +160,9 @@ const restartedSinceSent = (entry) =>
  * @property {number} producerEpoch
  * @property {(topic: string, partition: number) => boolean} isPartitionInTransaction always true
  *   for a producer that is not transactional
+ * @property {import('./recordSize').RequestBudget} [budget] the producer's request-size plan: a
+ *   request takes batches while their planned bytes stay within its `maxRequestBytes`
+ *   (`maxRequestSize` less the request's framing); none means no limit
  * @typedef {Object} PartitionEntry
  * @property {string} topic
  * @property {number} partition
@@ -225,8 +237,11 @@ class PartitionSequencer {
    *   stale partition with nothing in flight restarts at 0 first;
    * - the head batch is a re-send that is not the partition's first batch in flight, the
    *   earliest numbered.
-   * Java breaks out of the node's pass at a blocked partition; skipping lets unrelated partitions
-   * go out on the same request.
+   * A request also skips a head batch that would take its planned size past the gate's budget,
+   * once it holds a batch, so it always holds one; and one whose `child` differs from its first
+   * batch's, so a part of a refused request goes out alone until it is written.
+   * Java breaks out of the node's pass at a blocked partition, and at `max.request.size`;
+   * skipping lets unrelated partitions go out on the same request.
    * @see https://github.com/apache/kafka/blob/4.3/clients/src/main/java/org/apache/kafka/clients/producer/internals/RecordAccumulator.java
    * @param {number|string} nodeId the broker the request is for
    * @param {LeaderMap} leaders the partitions each broker leads, for the topics being sent
@@ -240,13 +255,16 @@ class PartitionSequencer {
     }
 
     const node = String(nodeId)
+    const { budget } = gate
     let first = null
+    let planned = 0
     for (const topic of Object.keys(leaders)) {
       const partitions = leaders[topic][node]
       const entries = this.#topics.get(topic)
       if (partitions === undefined || entries === undefined) {
         continue
       }
+      let topicBytes = budget === undefined ? 0 : budget.topicBytes(topic)
 
       for (const partition of partitions) {
         const entry = entries.get(Number(partition))
@@ -276,6 +294,14 @@ class PartitionSequencer {
 
         if (first !== null && !fitsRequest(first, head, gate)) {
           continue
+        }
+        if (budget !== undefined) {
+          const bytes = topicBytes + budget.batchBytes(head)
+          if (first !== null && planned + bytes > budget.maxRequestBytes) {
+            continue
+          }
+          planned += bytes
+          topicBytes = 0
         }
 
         entry.queued.shift()
@@ -326,10 +352,7 @@ class PartitionSequencer {
     if (isForward(lastSequence, entry.lastAckedSequence)) entry.lastAckedSequence = lastSequence
     const baseOffset = result.duplicate ? NO_OFFSET : offsetOf(result.baseOffset)
     if (baseOffset >= 0)
-      entry.lastAckedOffset = Math.max(
-        entry.lastAckedOffset,
-        baseOffset + batch.messages.length - 1
-      )
+      entry.lastAckedOffset = Math.max(entry.lastAckedOffset, baseOffset + recordCountOf(batch) - 1)
     this.#dropIfIdle(entry)
   }
 
@@ -478,9 +501,30 @@ class PartitionSequencer {
       batch.incarnation !== entry.incarnation
     )
       return
-    const count = batch.messages.length
     const position = entry.inFlight.indexOf(batch)
     if (position < 0) return
+    this.#giveBack(entry, batch, position)
+
+    this.#logger.debug('Sequences given back after a failed batch', {
+      topic: entry.topic,
+      partition: entry.partition,
+      firstSequence: batch.firstSequence,
+      recordCount: recordCountOf(batch),
+      nextSequence: entry.nextSequence,
+    })
+    this.#dropIfIdle(entry)
+  }
+
+  /**
+   * Takes a batch out of its partition and gives its sequences back: `nextSequence` drops by its
+   * record count, and every batch numbered after it moves down by as much and counts as renumbered.
+   * @param {PartitionEntry} entry
+   * @param {PartitionBatch} batch
+   * @param {number} position its place in the partition's in-flight list
+   * @returns {void}
+   */
+  #giveBack(entry, batch, position) {
+    const count = recordCountOf(batch)
     this.#remove(entry, batch)
     entry.nextSequence = subtractSequence(entry.nextSequence, count)
     for (let index = position; index < entry.inFlight.length; index += 1) {
@@ -488,15 +532,31 @@ class PartitionSequencer {
       later.firstSequence = subtractSequence(later.firstSequence, count)
       later.sequenceReset = true
     }
+  }
 
-    this.#logger.debug('Sequences given back after a failed batch', {
-      topic: entry.topic,
-      partition: entry.partition,
-      firstSequence: batch.firstSequence,
-      recordCount: count,
-      nextSequence: entry.nextSequence,
-    })
-    this.#dropIfIdle(entry)
+  /**
+   * Puts a batch whose current attempt was refused before anything of it was written back at the
+   * head of its partition's queue, unnumbered, for the drain to number afresh: a numbered batch
+   * gives its range back first, as `rebase` does (one batch in flight per partition leaves none
+   * numbered after it), so no sequence is skipped or used twice. A batch the sequencer does not
+   * hold yet - the second half of a cut batch - is only queued.
+   * @param {PartitionBatch} batch a batch never written
+   * @returns {void}
+   */
+  restoreUnsent(batch) {
+    const entry = this.#entryFor(batch.topic, batch.partition)
+    const position = entry.inFlight.indexOf(batch)
+    if (position >= 0) {
+      this.#giveBack(entry, batch, position)
+    } else {
+      this.#remove(entry, batch)
+    }
+    batch.firstSequence = null
+    batch.producerId = null
+    batch.producerEpoch = null
+    batch.entry = undefined
+    batch.incarnation = undefined
+    entry.queued.insertAt(0, batch)
   }
 
   /**
@@ -641,7 +701,7 @@ class PartitionSequencer {
       (batch.incarnation !== entry.incarnation && batch.producerEpoch != null)
     )
       return
-    const next = addSequence(batch.firstSequence, batch.messages.length)
+    const next = addSequence(batch.firstSequence, recordCountOf(batch))
     const current = entry.unresolvedNextSequence
     entry.unresolvedNextSequence = current === null || isForward(next, current) ? next : current
     this.#unresolved.add(entry)
@@ -803,7 +863,7 @@ class PartitionSequencer {
     batch.entry = entry
     batch.incarnation = entry.incarnation
     batch.firstSequence = entry.nextSequence
-    entry.nextSequence = addSequence(entry.nextSequence, batch.messages.length)
+    entry.nextSequence = addSequence(entry.nextSequence, recordCountOf(batch))
     entry.inFlight.push(batch)
   }
 
@@ -821,7 +881,7 @@ class PartitionSequencer {
       batch.producerId = null
       batch.producerEpoch = null
       batch.sequenceReset = true
-      sequence = addSequence(sequence, batch.messages.length)
+      sequence = addSequence(sequence, recordCountOf(batch))
     }
 
     entry.nextSequence = sequence
@@ -986,7 +1046,8 @@ class PartitionSequencer {
 
 /**
  * Whether a batch can join a Produce request whose first batch is `first`: the same request-level
- * options and the same producer id and epoch (a batch never sent takes the gate's).
+ * options, the same producer id and epoch (a batch never sent takes the gate's), and the same
+ * part of a refused request, or none.
  * @param {PartitionBatch} first
  * @param {PartitionBatch} batch
  * @param {DrainGate} gate
@@ -999,7 +1060,8 @@ const fitsRequest = (first, batch, gate) => {
     batch.timeout === first.timeout &&
     batch.compression === first.compression &&
     stamp.producerId === first.producerId &&
-    stamp.producerEpoch === first.producerEpoch
+    stamp.producerEpoch === first.producerEpoch &&
+    (batch.child ?? null) === (first.child ?? null)
   )
 }
 

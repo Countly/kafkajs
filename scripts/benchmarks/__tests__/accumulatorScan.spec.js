@@ -16,6 +16,9 @@ describe('Benchmarks > accumulatorScan', () => {
       linger: 5,
       records: 100000,
       yieldEvery: 20,
+      maxRequestSize: 1048576,
+      valueBytes: 200,
+      perSend: 1,
       runs: 9,
       tree: ROOT,
       baselineTree: null,
@@ -35,6 +38,7 @@ describe('Benchmarks > accumulatorScan', () => {
   test.each([
     [['--partitions', '0'], '--partitions needs a positive integer'],
     [['--records', '1.5'], '--records needs a positive integer'],
+    [['--max-request-size', '0'], '--max-request-size needs a positive integer'],
     [['--pace', '1'], 'unknown or incomplete flag --pace'],
     [['--topics'], 'unknown or incomplete flag --topics'],
     [['--baseline-tree', '.'], '--raw is needed with --baseline-tree'],
@@ -73,6 +77,31 @@ describe('Benchmarks > accumulatorScan', () => {
     expect(result.produceRequests).toBeLessThanOrEqual(result.handOffs * 3)
     expect(result.largestPayloadBytes).toBeGreaterThanOrEqual(200)
     expect(result.largestPayloadBytes % 200).toBe(0)
+    expect(result.largestRequestEstimate).toBeGreaterThan(result.largestPayloadBytes)
+  })
+
+  /** Three partitions of 52 records of 100 KiB, each send one partition's 5.2 MiB. */
+  const CORPUS = [
+    '--partitions',
+    '3',
+    '--records',
+    '156',
+    '--per-send',
+    '52',
+    '--value-bytes',
+    '102400',
+    '--linger',
+    '1',
+  ]
+
+  test('on 5 MiB per partition the modelled requests of this tree stay within --max-request-size', async () => {
+    const result = await run(parseArgs(CORPUS))
+
+    // five full chunks of ten records and one of two, per partition
+    expect(result.produceRequests).toBe(18)
+    expect(result.largestPayloadBytes).toBe(10 * 102400)
+    expect(result.largestRequestEstimate).toBeLessThanOrEqual(1048576)
+    expect(result.largestRequestEstimate).toBeGreaterThan(1048576 - 2 * 102432)
   })
 
   describe('the leaders of a run', () => {
@@ -178,6 +207,16 @@ module.exports = class Recording extends Accumulator {
       expect(result.handOffs).toBeGreaterThan(0)
       expect(options()).not.toHaveProperty('leaderOf')
       expect(lookups()).toEqual([])
+    })
+
+    test('a tree without a request-size plan sends each partition unsplit, past --max-request-size', async () => {
+      const { tree, options } = recordingTree(true)
+
+      const result = await run(parseArgs([...CORPUS, '--tree', tree]))
+
+      expect(options()).not.toHaveProperty('budget')
+      expect(result.produceRequests).toBe(3)
+      expect(result.largestRequestEstimate).toBeGreaterThan(5 * 1048576)
     })
 
     test('a cache with leader() hands the accumulator a leaderOf that reads it', async () => {

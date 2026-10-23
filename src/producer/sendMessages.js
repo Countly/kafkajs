@@ -9,6 +9,7 @@ const {
   KafkaJSDeliveryTimeout,
   KafkaJSNumberOfRetriesExceeded,
   KafkaJSTransactionAbortableError,
+  KafkaJSRecordTooLargeError,
 } = require('../errors')
 const { staleMetadata } = require('../protocol/error')
 const { RETRIABLE_CATEGORIES } = require('../protocol/errorCategories')
@@ -20,6 +21,8 @@ const groupMessagesPerPartition = require('./groupMessagesPerPartition')
 const Fifo = require('../utils/fifo')
 const { Deadline, ExpiryTimer, MAX_DELAY } = require('./deadline')
 const { Types: Compression } = require('../protocol/message/compression')
+const Accumulator = require('./state/accumulator')
+const { RequestBudget, recordsBytes } = require('./state/recordSize')
 
 const { keys } = Object
 
@@ -266,6 +269,39 @@ const rejectBatch = (batch, error) => {
 /** An internal, uncounted refusal of one request that has never been written. */
 class ProduceAttemptRefused extends Error {}
 
+/** The refusal of a request whose encoded frame is above `maxRequestSize`; nothing was written. */
+class ProduceAttemptTooLarge extends ProduceAttemptRefused {
+  /**
+   * @param {number} frameLength the frame's bytes, its length prefix included
+   * @param {number} limit `maxRequestSize`
+   */
+  constructor(frameLength, limit) {
+    super(`A ${frameLength}-byte Produce request is above maxRequestSize (${limit} bytes)`)
+    this.frameLength = frameLength
+    this.limit = limit
+  }
+}
+
+/**
+ * The error a batch fails with when no request under `maxRequestSize` can carry it: one record,
+ * or a batch whose earlier attempt was written and so keeps its records together.
+ * @param {{ topic: string, partition: number, messages: object[] }} batch
+ * @param {ProduceAttemptTooLarge} refusal
+ * @returns {KafkaJSRecordTooLargeError}
+ */
+const tooLarge = ({ topic, partition, messages }, { frameLength, limit }) =>
+  new KafkaJSRecordTooLargeError(
+    `${topic} partition ${partition} needs a ${frameLength}-byte Produce request, above ` +
+      `maxRequestSize (${limit} bytes)`,
+    {
+      reason: 'maxRequestSize',
+      scope: messages.length === 1 ? 'record' : 'send',
+      size: frameLength,
+      limit,
+      topic,
+    }
+  )
+
 /** One immutable request membership and the right to transmit it once. */
 class ProduceAttempt {
   /**
@@ -274,10 +310,11 @@ class ProduceAttempt {
    * @param {(delivery: Delivery) => void} expire settles a due delivery synchronously; the drain
    *   loop's also settles every other due delivery
    */
-  constructor(deliveries, getConnectionStatus, expire) {
+  constructor(deliveries, getConnectionStatus, expire, maxRequestSize = Infinity) {
     this.deliveries = deliveries.slice()
     this.getConnectionStatus = getConnectionStatus
     this.expire = expire
+    this.maxRequestSize = maxRequestSize
     this.written = false
     this.revoked = false
     for (const delivery of this.deliveries) delivery.currentAttempt = this
@@ -289,6 +326,8 @@ class ProduceAttempt {
   }
 
   /**
+   * At transmission a frame above `maxRequestSize` is refused, unwritten; a written attempt ends
+   * the size subdivision (`child`) of the batches it carries.
    * @param {number} [frameLength] supplied only at transmission; includes the prefix and header
    * @returns {Error|null} refusal before any write, or null
    */
@@ -305,8 +344,15 @@ class ProduceAttempt {
       this.revoke()
       return new ProduceAttemptRefused('A delivery in this Produce attempt has settled')
     }
+    if (frameLength > this.maxRequestSize) {
+      this.revoke()
+      return new ProduceAttemptTooLarge(frameLength, this.maxRequestSize)
+    }
     this.written = true
-    for (const delivery of this.deliveries) delivery.everWritten = true
+    for (const delivery of this.deliveries) {
+      delivery.everWritten = true
+      delivery.batch.child = null
+    }
     return null
   }
 }
@@ -337,6 +383,16 @@ class Send {
     this.#onSettled = onSettled
     /** @type {Delivery[]} */
     this.deliveries = []
+  }
+
+  /**
+   * One batch more, cut from one of its own.
+   * @param {Delivery} delivery
+   * @returns {void}
+   */
+  add(delivery) {
+    this.#pending += 1
+    this.deliveries.push(delivery)
   }
 
   /**
@@ -502,6 +558,7 @@ class DrainLoop {
   #deadlineMs
   #compressionLevels
   #getConnectionStatus
+  #budget
   /** @type {Set<Send>} */
   #sends = new Set()
   /** @type {Map<string, Map<number, Fifo<Delivery>>>} every partition's live batches, by enqueue order */
@@ -535,6 +592,8 @@ class DrainLoop {
    * @param {number} [options.deliveryTimeout] ms from `send()` to a batch's last answer
    * @param {{ gzip?: number, zstd?: number }} [options.compressionLevels] per-codec levels
    * @param {() => string} options.getConnectionStatus
+   * @param {RequestBudget} [options.budget] the request-size plan of each request it drains, and
+   *   the `maxRequestSize` its frames are refused above
    */
   constructor({
     logger,
@@ -544,6 +603,7 @@ class DrainLoop {
     deliveryTimeout,
     compressionLevels,
     getConnectionStatus,
+    budget = new RequestBudget(),
   }) {
     this.#logger = logger
     this.#cluster = cluster
@@ -553,6 +613,7 @@ class DrainLoop {
     this.#compressionLevels = compressionLevels
     this.#deadlineMs = deliveryTimeout ?? retry.maxTotalTime
     this.#getConnectionStatus = getConnectionStatus
+    this.#budget = budget
     this.#expiry = new ExpiryTimer(this.#expireDue)
   }
 
@@ -571,7 +632,18 @@ class DrainLoop {
     const send = new Send(batches.length, this.#settled)
     const now = Date.now()
     const queued = batches.map(
-      ({ topic, partition, messages, settlers = [], createdAt = now, heldBytes, debt, retire }) => {
+      ({
+        topic,
+        partition,
+        messages,
+        settlers = [],
+        createdAt = now,
+        heldBytes,
+        debt,
+        retire,
+        ownership,
+        wire = recordsBytes(messages),
+      }) => {
         const queue = this.#queueOf(topic, Number(partition))
         const delivery = new Delivery(
           send,
@@ -583,6 +655,7 @@ class DrainLoop {
           topic,
           partition: Number(partition),
           messages,
+          recordCount: messages.length,
           acks,
           timeout,
           compression,
@@ -596,6 +669,9 @@ class DrainLoop {
           heldBytes,
           debt,
           retire,
+          ownership,
+          wire,
+          child: null,
           sequenceReset: false,
         }
         send.deliveries.push(delivery)
@@ -832,7 +908,7 @@ class DrainLoop {
     for (const nodeId of nodes) {
       const broker = { nodeId }
       while ((this.#outstanding.get(nodeId) ?? 0) < MAX_REQUESTS_PER_BROKER) {
-        const drained = manager.drain(broker, leaders)
+        const drained = manager.drain(broker, leaders, this.#budget)
         if (drained.length === 0) {
           break
         }
@@ -1032,8 +1108,11 @@ class DrainLoop {
    * @returns {void}
    */
   #dispatch(nodeId, batches) {
-    const attempt = new ProduceAttempt(batches.map(deliveryOf), this.#getConnectionStatus, () =>
-      this.#expireDue(Date.now())
+    const attempt = new ProduceAttempt(
+      batches.map(deliveryOf),
+      this.#getConnectionStatus,
+      () => this.#expireDue(Date.now()),
+      this.#budget.maxRequestSize
     )
     for (const batch of batches) {
       deliveryOf(batch).dispatched = true
@@ -1174,6 +1253,7 @@ class DrainLoop {
     }
 
     if (!(error instanceof ProduceAttemptRefused)) this.#sideChannels(error)
+    const refused = []
     for (const batch of batches) {
       const delivery = deliveryOf(batch)
       if (delivery.settled) {
@@ -1181,10 +1261,96 @@ class DrainLoop {
         delivery.retire()
         continue
       }
-      if (error instanceof ProduceAttemptRefused) {
+      if (error instanceof ProduceAttemptTooLarge) {
+        refused.push(batch)
+      } else if (error instanceof ProduceAttemptRefused) {
         manager.sequencer.requeue(batch, 0, { counted: false })
       } else this.#failed(manager, batch, error)
     }
+    if (refused.length > 0) this.#repartition(manager, refused, error)
+  }
+
+  /**
+   * The live batches of a request the size guard refused, unwritten. Several batches become two
+   * parts, in order, each retained until a request carrying it is written: a batch with a written
+   * attempt in its history goes back with its records and sequences, any other unnumbered at the
+   * head of its partition's queue. A batch refused alone fails when it has a written attempt in
+   * its history, with no further write and its partition's sequence left unresolved (the earlier
+   * attempt may have reached the broker), or when it is one record; one never written with several
+   * records is cut in two. So N records make at most 2N - 1 size attempts.
+   * @param {import('./state')} manager
+   * @param {import('./state/partitionSequencer').PartitionBatch[]} batches
+   * @param {ProduceAttemptTooLarge} refusal
+   * @returns {void}
+   */
+  #repartition(manager, batches, refusal) {
+    if (batches.length > 1) {
+      const parts = [{}, {}]
+      const half = Math.floor(batches.length / 2)
+      batches.forEach((batch, index) => {
+        batch.child = parts[index < half ? 0 : 1]
+        if (deliveryOf(batch).everWritten) manager.sequencer.requeue(batch, 0, { counted: false })
+        else manager.sequencer.restoreUnsent(batch)
+      })
+    } else if (!deliveryOf(batches[0]).everWritten && batches[0].messages.length > 1) {
+      this.#cut(manager, batches[0])
+    } else {
+      this.#tooLarge(manager, batches[0], refusal)
+    }
+  }
+
+  /**
+   * Cuts a batch never written in two at its middle record: the batch keeps the second half and
+   * its delivery, and a new batch with a delivery of its own, in the same send, takes the first
+   * and goes ahead of it in its partition's queues. Each half is a part of its own.
+   * @param {import('./state')} manager
+   * @param {import('./state/partitionSequencer').PartitionBatch} batch
+   * @returns {void}
+   */
+  #cut(manager, batch) {
+    manager.sequencer.restoreUnsent(batch)
+    const own = deliveryOf(batch)
+    const [first, second] = Accumulator.cut(
+      { ...batch, settlers: batch.settlers.slice(0, -1) },
+      Math.floor(batch.messages.length / 2)
+    )
+    const delivery = new Delivery(own.send, own.deadline, this.#detachDeadline)
+    delivery.lastError = own.lastError
+    delivery.retryTime = own.retryTime
+    delivery.batch = { ...batch, ...first, id: this.#nextId++, child: {} }
+    delivery.batch.settlers.push(delivery)
+    Object.assign(batch, second, { child: {} })
+    batch.settlers.push(own)
+    own.send.add(delivery)
+
+    const queue = this.#queueOf(batch.topic, batch.partition)
+    let index = 0
+    for (const queued of queue) {
+      if (queued === own) break
+      index += 1
+    }
+    queue.insertAt(index, delivery)
+    manager.sequencer.restoreUnsent(delivery.batch)
+    this.#attachDeadline(delivery)
+  }
+
+  /**
+   * Fails a batch no request under `maxRequestSize` can carry. A batch never written gives its
+   * sequences back; one with a written attempt leaves its partition's sequence unresolved before it
+   * leaves, its range never given back. The error carries no `outcome`. Inside a transaction it
+   * arms the abortable state, and the batch's sends keep the error.
+   * @param {import('./state')} manager
+   * @param {import('./state/partitionSequencer').PartitionBatch} batch
+   * @param {ProduceAttemptTooLarge} refusal
+   * @returns {void}
+   */
+  #tooLarge(manager, batch, refusal) {
+    if (deliveryOf(batch).everWritten) manager.sequencer.markUnresolved(batch)
+    else if (batch.firstSequence !== null) manager.sequencer.rebase(batch)
+    manager.sequencer.fail(batch)
+    const error = tooLarge(batch, refusal)
+    rejectBatch(batch, error)
+    this.#inTransaction(manager, error)
   }
 
   /**
@@ -1427,6 +1593,8 @@ class DrainLoop {
  * @param {{ gzip?: number, zstd?: number }} [options.compressionLevels] validated producer
  *   snapshot, selected by codec on both send paths and retained for retries
  * @param {() => string} [options.getConnectionStatus] the producer's connection status
+ * @param {RequestBudget} [options.budget] the producer's request-size plan: both send paths keep
+ *   each request within it, and refuse a frame above its `maxRequestSize` before writing it
  * @returns {{ sendPartitioned: Function, partition: Function, inTransaction: Function }} the
  *   `inTransaction` of a send that settled before it reached the send path arms the transaction
  */
@@ -1441,6 +1609,7 @@ const createSendMessages = ({
   deliveryTimeout,
   compressionLevels,
   getConnectionStatus,
+  budget = new RequestBudget(),
 }) => {
   const isIdempotent = () => idempotence !== undefined && idempotence.isEnabled()
   let loop = null
@@ -1720,6 +1889,7 @@ const createSendMessages = ({
         deliveryTimeout,
         compressionLevels,
         getConnectionStatus,
+        budget,
       })
     return loop.send({ acks, timeout, compression, batches })
   }
@@ -1759,6 +1929,12 @@ const createSendMessages = ({
    * budget ends at the earliest deadline among those sent. Once the budget runs out, or the call
    * fails before any request, the batches still unsettled reject with the retrier's error.
    *
+   * A partition's batches go out in order, one per request: the first one not settled, so a batch
+   * that waits for a retry stays ahead of the later ones and one that failed for good lets the next
+   * go. A broker's batches go out in as many requests as the plan of `maxRequestSize` needs, each
+   * within it; a request refused at its write as too large is divided as the idempotent path
+   * divides one (see `DrainLoop#repartition`), and the attempt costs no retry.
+   *
    * Every await of the call (the metadata, the broker lookups, the requests, the recovery and the
    * side channels of a late error) can hold the batches it routes. So a batch that has settled
    * while no request carries it, or whose request has ended since, detaches at once (see the
@@ -1772,6 +1948,8 @@ const createSendMessages = ({
    */
   const sendPartitionedPlain = ({ acks, timeout, compression, batches }) => {
     const unsettled = new Set(batches)
+    /** Every batch of the call in partition order: a cut batch's first half goes before it. */
+    const order = [...batches]
     const metadata = []
     const deliveries = new Map()
     let failure = null
@@ -1900,6 +2078,109 @@ const createSendMessages = ({
     }
 
     /**
+     * The first batch of each of a topic's partitions that is not settled yet, in partition order.
+     * @param {string} topic
+     * @returns {object[]}
+     */
+    const headsOf = (topic) => {
+      const heads = []
+      const partitions = new Set()
+      for (const batch of order) {
+        const partition = Number(batch.partition)
+        if (batch.topic === topic && unsettled.has(batch) && !partitions.has(partition)) {
+          partitions.add(partition)
+          heads.push(batch)
+        }
+      }
+      return heads
+    }
+
+    /**
+     * The requests one broker's batches go out in, in order: a part of a refused request alone,
+     * every other batch together, each request within the plan of `maxRequestSize` and holding at
+     * least one batch.
+     * @param {object[]} owned
+     * @returns {object[][]}
+     */
+    const requestsOf = (owned) => {
+      const parts = new Map()
+      for (const batch of owned) {
+        const part = batch.child ?? null
+        if (parts.has(part)) parts.get(part).push(batch)
+        else parts.set(part, [batch])
+      }
+      const requests = []
+      for (const members of parts.values()) {
+        let request = []
+        let planned = 0
+        let topics = new Set()
+        for (const batch of members) {
+          const bytesOf = () =>
+            budget.batchBytes(batch) +
+            (topics.has(batch.topic) ? 0 : budget.topicBytes(batch.topic))
+          if (request.length > 0 && planned + bytesOf() > budget.maxRequestBytes) {
+            requests.push(request)
+            request = []
+            planned = 0
+            topics = new Set()
+          }
+          planned += bytesOf()
+          topics.add(batch.topic)
+          request.push(batch)
+        }
+        requests.push(request)
+      }
+      return requests
+    }
+
+    /**
+     * Cuts a batch never written in two at its middle record (see `Accumulator.cut`): the batch
+     * keeps the second half, and the first goes before it with a delivery of its own.
+     * @param {object} batch
+     * @returns {void}
+     */
+    const cut = (batch) => {
+      const [first, second] = Accumulator.cut(batch, Math.floor(batch.messages.length / 2))
+      const head = { ...batch, ...first, child: {} }
+      Object.assign(batch, second, { child: {} })
+      order.splice(order.indexOf(batch), 0, head)
+      unsettled.add(head)
+      deliveries.set(head, {
+        ...deliveries.get(batch),
+        batch: head,
+        currentAttempt: null,
+        carried: false,
+      })
+    }
+
+    /**
+     * The live batches of a request refused at its write as too large, divided as
+     * `DrainLoop#repartition` divides them: several become two parts; one refused alone fails when
+     * it has a written attempt or is one record, and is cut otherwise.
+     * @param {object[]} sent
+     * @param {ProduceAttemptTooLarge} refusal
+     * @returns {void}
+     */
+    const repartition = (sent, refusal) => {
+      const live = sent.filter((candidate) => unsettled.has(candidate))
+      if (live.length > 1) {
+        const parts = [{}, {}]
+        const half = Math.floor(live.length / 2)
+        live.forEach((batch, index) => {
+          batch.child = parts[index < half ? 0 : 1]
+        })
+      } else if (
+        live.length === 1 &&
+        !deliveries.get(live[0]).everWritten &&
+        live[0].messages.length > 1
+      ) {
+        cut(live[0])
+      } else if (live.length === 1) {
+        settle(live[0], undefined, tooLarge(live[0], refusal))
+      }
+    }
+
+    /**
      * Builds one request with fixed membership after filtering all prior awaits.
      * @param {object} broker the broker already looked up
      * @param {object[]} candidates batches proposed for this broker
@@ -1912,7 +2193,8 @@ const createSendMessages = ({
       const attempt = new ProduceAttempt(
         carried,
         getConnectionStatus || (() => CONNECTION_STATUS.CONNECTED),
-        expire
+        expire,
+        budget.maxRequestSize
       )
       /** The request ended: a batch that settled meanwhile detaches now. @returns {void} */
       const ended = () => {
@@ -1931,6 +2213,7 @@ const createSendMessages = ({
         const refused = error instanceof ProduceAttemptRefused
         if (!refused) attachFailingRecords(error, topicDataOf(sent))
         ended()
+        if (error instanceof ProduceAttemptTooLarge) repartition(sent, error)
         if (refused) return error
         for (const delivery of carried) delivery.lastError = error
         if (sent.every((batch) => !unsettled.has(batch))) {
@@ -2013,7 +2296,7 @@ const createSendMessages = ({
                 else live.forEach((batch) => settle(batch, undefined, error))
               }
               for (const topic of topics) {
-                const own = [...unsettled].filter((batch) => batch.topic === topic)
+                const own = headsOf(topic)
                 if (own.length === 0) continue
                 let lookup
                 try {
@@ -2048,14 +2331,18 @@ const createSendMessages = ({
                     perBroker.set(broker, [...(perBroker.get(broker) || []), ...live])
                 }
               }
+              const waiting = unsettled.size
               const errors = await Promise.all(
-                [...perBroker].map(([broker, owned]) => produceTo(broker, owned))
+                [...perBroker].flatMap(([broker, owned]) =>
+                  requestsOf(owned).map((request) => produceTo(broker, request))
+                )
               )
               const genuine = [...left, ...errors].find(
                 (error) => error !== null && !(error instanceof ProduceAttemptRefused)
               )
               if (genuine !== undefined) throw genuine
               if (errors.some((error) => error instanceof ProduceAttemptRefused)) continue
+              if (unsettled.size < waiting) continue
               if (unsettled.size > 0) throw new KafkaJSMetadataNotLoaded(NO_PARTITION_METADATA)
               return
             } catch (error) {

@@ -630,19 +630,23 @@ class KafkaJSBufferExhaustedError extends KafkaJSError {
 }
 
 /**
- * A record, or a whole send, can never fit: its charge is above `bufferMemory`. Raised by the
- * client before anything of the send is queued. Non-retriable. It carries the `type` and `code` of
- * the broker's own MESSAGE_TOO_LARGE (10), so a check on either catches both, and that error's
- * category on a Produce request, `invalidConfiguration`: inside a transaction the refusal leaves
- * the transaction able only to abort. `scope` says whether one record (`topic` names its topic) or
- * the send as a whole is too large; `size` is the charge found above `limit`, the record's own or
- * that of the send up to the record that took it past `limit`.
+ * A record, or a whole send, can never fit: with `reason: 'bufferMemory'` its charge is above
+ * `bufferMemory`; with `reason: 'maxRequestSize'` no Produce request under `maxRequestSize` can
+ * carry it. Raised by the client: at admission, before anything of the send is queued; or when a
+ * request is refused at its write, for that write only - and for a batch that was already
+ * transmitted, which keeps its records together and is not sent again, it does not establish that
+ * the earlier attempts were unsent (it carries no `outcome`). Non-retriable. It carries the `type`
+ * and `code` of the broker's own MESSAGE_TOO_LARGE (10), so a check on either catches both, and
+ * that error's category on a Produce request, `invalidConfiguration`: inside a transaction the
+ * refusal leaves the transaction able only to abort. `scope` says whether one record (`topic`
+ * names its topic) or more is too large; `size` is what was found above `limit`: a charge, a
+ * record's wire size against the bytes of records one request carries, or a request's frame.
  */
 class KafkaJSRecordTooLargeError extends KafkaJSNonRetriableError {
   /**
    * @param {Error|string} e
    * @param {object} options
-   * @param {'bufferMemory'} options.reason
+   * @param {'bufferMemory'|'maxRequestSize'} options.reason
    * @param {'record'|'send'} options.scope
    * @param {number} options.size
    * @param {number} options.limit

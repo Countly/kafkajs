@@ -1214,3 +1214,20 @@ const narrowed = (error: KafkaJSError) => {
 }
 void [exhaustedIsRetriableClass, exhaustedReason, exhaustedFields]
 void [tooLargeIsNonRetriable, tooLargeType, tooLargeCode, tooLargeScope, tooLargeTopic, narrowed]
+
+// The request-size bound and its refusal.
+kafka.producer({ maxRequestSize: 1048576 })
+kafka.producer({ maxRequestSize: 2147483647, transactionalId: 'tx' })
+// @ts-expect-error maxRequestSize is a number of bytes
+kafka.producer({ maxRequestSize: '1m' })
+const requestTooLarge = new KafkaJSRecordTooLargeError('never fits a request', {
+  reason: 'maxRequestSize',
+  scope: 'record',
+  size: 1048577,
+  limit: 1048409,
+  topic: 'topic-a',
+})
+const tooLargeReason: 'maxRequestSize' | 'bufferMemory' = requestTooLarge.reason
+// @ts-expect-error not a reason
+new KafkaJSRecordTooLargeError('x', { reason: 'frame', scope: 'record', size: 1, limit: 0 })
+void [tooLargeReason]

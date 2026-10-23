@@ -24,6 +24,8 @@ const sharedPromiseTo = require('../utils/sharedPromiseTo')
  * @param {number} options.batchSize bytes of keys and values at which a batch is sent
  * @param {import('./state/admission').Admission} options.admission the producer's buffer, shared
  *   by its own sends and its transactions'
+ * @param {import('./state/recordSize').RequestBudget} options.budget the producer's request-size
+ *   plan (`maxRequestSize`), shared the same way
  * @param {() => string} options.getConnectionStatus
  * @param {() => boolean} options.isClosing whether the producer's `disconnect()` is delivering
  *   the accumulated batches: sends are refused and batches no longer linger
@@ -43,6 +45,7 @@ module.exports = ({
   linger,
   batchSize,
   admission,
+  budget,
   getConnectionStatus,
   isClosing,
   instrumentationEmitter,
@@ -59,6 +62,7 @@ module.exports = ({
     deliveryTimeout,
     compressionLevels,
     getConnectionStatus,
+    budget,
   })
   let plainSend = null
   /** How many `flush(until)` calls are waiting for their `until`: batches linger only at 0. */
@@ -86,6 +90,7 @@ module.exports = ({
         deliveryTimeout,
         compressionLevels,
         partitioner,
+        budget,
         eosManager: createEosManager({ logger, cluster, transactional: false }),
       })
     return plainSend
@@ -126,6 +131,7 @@ module.exports = ({
     deadline: deliveryTimeout ?? retry.maxTotalTime,
     expired: (error) => idempotentSend.inTransaction(error),
     admission,
+    budget,
   })
 
   /**

@@ -471,7 +471,8 @@ describe('Producer > the delivery deadline through the public call', () => {
     const schedule = new Schedule()
     const gate = schedule.hold({ api: 'InitProducerId' })
     gates.push(gate)
-    start(schedule)
+    // Each send's 1 MiB record needs a request above the default maxRequestSize.
+    start(schedule, { producerOptions: { maxRequestSize: 2097152 } })
     const connecting = producer.connect()
     await gate.arrived()
 

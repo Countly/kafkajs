@@ -167,6 +167,14 @@ export interface ProducerConfig {
    * 0 to 2147483647 (0 rejects at once when the buffer is full).
    */
   maxBlockMs?: number
+  /**
+   * The largest Produce request, in bytes, counting the whole frame: its length prefix, framing,
+   * batch headers and records after compression. Default 1048576 (Java's `max.request.size`); an
+   * integer from the minimum for this producer's identifiers (named in the error) to 2147483647. A
+   * record that cannot fit rejects with KafkaJSRecordTooLargeError; a send of several records that
+   * does not fit one request is split at record boundaries.
+   */
+  maxRequestSize?: number
 }
 
 export interface Message {
@@ -2083,15 +2091,17 @@ export class KafkaJSCorruptRecordError extends KafkaJSNonRetriableError {
  * `cause` is the loss.
  */
 /**
- * A record or a send cannot ever fit: its charge is above `bufferMemory`. Non-retriable. Carries
- * the type and code of the broker's own MESSAGE_TOO_LARGE so a check on either catches both;
- * unlike a real broker answer, this error is raised by the client. A refusal at admission writes
- * none of the send.
+ * A record or a send cannot ever fit: its size is above `maxRequestSize` (checked on the encoded
+ * frame where compression applies) or `bufferMemory`. Non-retriable. Carries the type and code of
+ * the broker's own MESSAGE_TOO_LARGE so a check on either catches both; unlike a real broker
+ * answer, this error is raised by the client. A refusal at admission writes none of the send; a
+ * later refusal concerns only the particular refused write and, for a chunk that was already
+ * transmitted, does not establish that the earlier attempts were unsent.
  */
 export class KafkaJSRecordTooLargeError extends KafkaJSNonRetriableError {
   readonly type: 'MESSAGE_TOO_LARGE'
   readonly code: 10
-  readonly reason: 'bufferMemory'
+  readonly reason: 'maxRequestSize' | 'bufferMemory'
   readonly scope: 'record' | 'send'
   readonly size: number
   readonly limit: number

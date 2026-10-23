@@ -1,6 +1,6 @@
 const Accumulator = require('../accumulator')
 const { Admission } = require('../admission')
-const { chargeOf } = require('../recordSize')
+const { chargeOf, RequestBudget } = require('../recordSize')
 const {
   collect,
   countersOf,
@@ -164,6 +164,57 @@ describe('Producer > the buffer > the bound on held records', () => {
     })
   })
 
+  test('a split send whose final chunk is held keeps every bound, and its shell until that chunk retires', async () => {
+    // 2000 bytes of request carry 1845 bytes of records: chunks of three 525-byte records
+    const budget = new RequestBudget({ maxRequestSize: 2000 })
+    const split = Array.from({ length: 10 }, () => ({ value: 'x'.repeat(500) }))
+    const charge = chargeOf([{ topic: TOPIC, messages: split }], Number.MAX_SAFE_INTEGER).total
+    const capacity = charge + 1000
+    const admission = new Admission({ capacity, maxBlockMs: 60000 })
+    const batches = []
+    const accumulator = new Accumulator({
+      linger: 0,
+      batchSize: 16384,
+      admission,
+      budget,
+      partition: async ({ records }) =>
+        records.map(({ topic, messages }) => ({ topic, partition: 0, messages })),
+      sendPartitioned: async ({ batches: handed }) => {
+        batches.push(...handed)
+      },
+    })
+    const sent = accumulator.append({
+      acks: -1,
+      topicMessages: [{ topic: TOPIC, messages: split }],
+    })
+    const waiting = accumulator.append({
+      acks: -1,
+      topicMessages: [
+        { topic: TOPIC, messages: Array.from({ length: 8 }, () => ({ value: 'w'.repeat(600) })) },
+      ],
+    })
+    await flushAll()
+
+    expect(batches.map(({ messages }) => messages.length)).toEqual([3, 3, 3, 1])
+    const last = batches.pop()
+    await drain({ batches, sends: [] })
+    expect(admission.reserved).toBe(1536 + 525 + 64)
+    expect(admission.debts).toBe(1024)
+    expect(admission.reserved).toBeLessThanOrEqual(capacity)
+    expect(admission.waitingBytes).toBeGreaterThan(0)
+    expect(admission.waitingBytes).toBeLessThanOrEqual(capacity)
+
+    last.settlers.forEach((settler) =>
+      settler.resolve({ topicName: TOPIC, partition: 0, baseOffset: '9' })
+    )
+    last.retire()
+    await flushAll()
+    expect(admission.waitingBytes).toBe(0)
+    await drain({ batches, sends: [sent, waiting] })
+    expect(await sent).toEqual([{ topicName: TOPIC, partition: 0, baseOffset: '0' }])
+    expect(countersOf(admission)).toEqual(quiescent(admission))
+  })
+
   test('the storage the held records retain is within what they are charged, over 0.9', async () => {
     await populations(async (capacity, records) => {
       const before = await retained()
@@ -218,6 +269,7 @@ describe('Producer > the buffer > the bound on held records', () => {
       cluster,
       logger: createLogger({ level: LEVELS.NOTHING, logCreator: () => () => {} }),
       linger: 0,
+      maxRequestSize: 2147483647,
     })
     try {
       await producer.connect()
