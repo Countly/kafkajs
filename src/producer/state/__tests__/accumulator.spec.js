@@ -1,6 +1,7 @@
 const path = require('path')
 const { spawnSync } = require('child_process')
 const Accumulator = require('../accumulator')
+const { Admission } = require('../admission')
 const createProducer = require('../../index')
 const Decoder = require('../../../protocol/decoder')
 const Encoder = require('../../../protocol/encoder')
@@ -3237,5 +3238,112 @@ describe('Producer > the accumulator', () => {
         await wire.pool.destroy()
       }
     })
+  })
+})
+
+describe('Producer > the accumulator > the topics a send holds', () => {
+  beforeEach(() => {
+    jest.useFakeTimers({ now: 0 })
+  })
+  afterEach(() => {
+    jest.useRealTimers()
+  })
+
+  /**
+   * An accumulator that counts the topics held and released, keeps each send its partitioner is
+   * given, and keeps every batch it is handed until the case settles and retires it.
+   */
+  const holdingTopics = (admission = new Admission({ capacity: 1048576, maxBlockMs: 0 })) => {
+    const held = []
+    const released = []
+    const batches = []
+    const sends = []
+    const accumulator = new Accumulator({
+      linger: LINGER,
+      batchSize: BATCH_SIZE,
+      admission,
+      partition: async (send) => {
+        sends.push(send)
+        return send.records.flatMap(({ topic, messages }) =>
+          messages.map((message) => ({ topic, partition: 0, messages: [message] }))
+        )
+      },
+      sendPartitioned: async ({ batches: handed }) => {
+        batches.push(...handed)
+      },
+      pinner: {
+        holdTopic: (topic) => held.push(topic),
+        releaseTopic: (topic) => released.push(topic),
+      },
+    })
+    return { accumulator, admission, held, released, batches, sends }
+  }
+
+  test('a send holds each topic that carries records and releases it once, at its last retirement', async () => {
+    const { accumulator, held, released, batches, sends } = holdingTopics()
+
+    const sent = accumulator.append({
+      acks: -1,
+      topicMessages: [
+        { topic: TOPIC, messages: records(0, 'a') },
+        { topic: 'empty-topic', messages: [] },
+        { topic: OTHER_TOPIC, messages: records(0, 'b') },
+        { topic: 'third-topic', messages: records(0, 'c') },
+      ],
+    })
+    expect(held).toEqual([TOPIC, OTHER_TOPIC, 'third-topic'])
+
+    await jest.advanceTimersByTimeAsync(LINGER)
+    expect(batches).toHaveLength(3)
+    for (const batch of batches) {
+      batch.settlers.forEach((settler) => settler.resolve({ partition: 0, baseOffset: '0' }))
+    }
+    await settledWithin(sent)
+    expect(released).toEqual([])
+
+    batches[0].retire()
+    batches[1].retire()
+    expect(released).toEqual([])
+    batches[2].retire()
+    expect(released).toEqual([TOPIC, OTHER_TOPIC, 'third-topic'])
+    batches.forEach((batch) => batch.retire())
+    sends[0].release()
+    expect(released).toHaveLength(3)
+  })
+
+  test('a send the buffer refuses releases what it held, once', async () => {
+    const { accumulator, held, released, admission } = holdingTopics(
+      new Admission({ capacity: 2048, maxBlockMs: 0 })
+    )
+
+    await expect(
+      accumulator.append({
+        acks: -1,
+        topicMessages: [{ topic: TOPIC, messages: [{ value: 'v'.repeat(4096) }] }],
+      })
+    ).rejects.toMatchObject({ name: 'KafkaJSRecordTooLargeError' })
+
+    expect(held).toEqual([TOPIC])
+    expect(released).toEqual([TOPIC])
+    expect(admission.reserved).toBe(0)
+  })
+
+  test('a send holds nothing when no holder is given', async () => {
+    const accumulator = new Accumulator({
+      linger: LINGER,
+      batchSize: BATCH_SIZE,
+      partition: byMessage,
+      sendPartitioned: async ({ batches }) =>
+        batches.map(({ topic, partition, settlers }) => {
+          const metadata = { topicName: topic, partition, errorCode: 0, baseOffset: '0' }
+          settlers.forEach((settler) => settler.resolve(metadata))
+          batches.forEach((batch) => batch.retire())
+          return metadata
+        }),
+    })
+
+    const sent = append(accumulator, records(0, 'a'))
+
+    await expect(settledWithin(sent, LINGER)).resolves.toHaveLength(1)
   })
 })

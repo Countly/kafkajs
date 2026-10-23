@@ -1234,3 +1234,6 @@ const tooLargeReason: 'maxRequestSize' | 'bufferMemory' = requestTooLarge.reason
 // @ts-expect-error not a reason
 new KafkaJSRecordTooLargeError('x', { reason: 'frame', scope: 'record', size: 1, limit: 0 })
 void [tooLargeReason]
+
+new Kafka({ brokers: ['localhost:9092'] }).producer({ metadataMaxIdle: 5000 })
+new Kafka({ brokers: ['localhost:9092'] }).producer({ metadataMaxIdle: 2147483647 })

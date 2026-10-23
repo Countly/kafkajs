@@ -46,3 +46,6 @@ const invalidLong: KafkaJSError = new KafkaJSInvalidLongError('x')
 const createTopic: KafkaJSError = new KafkaJSCreateTopicError(new Error('x'), 't')
 const noBroker: KafkaJSError = new KafkaJSNoBrokerAvailableError()
 void [closed, memberIdRequired, invariant, invalidVarInt, invalidLong, createTopic, noBroker]
+
+new Kafka({ brokers: ['localhost:9092'] }).producer({ metadataMaxIdle: 5000 })
+new Kafka({ brokers: ['localhost:9092'] }).producer({ metadataMaxIdle: 2147483647 })

@@ -64,6 +64,7 @@ What to change to install the package and run it on a Kafka 4.x cluster.
 - Do not rely on mutating a record you already passed to `send()`. Mutating the bytes of an uncopied `Buffer` still affects what is sent, as in 2.2.4. A view over a backing store larger than 16 KiB and more than 16 times the view's length is copied at the call. Treat records and Buffer bytes as immutable after passing them; pass a separate Buffer containing the same bytes if you need to change your original Buffer.
 - A `send()` over about 1 MiB used to travel as one request and fail at the broker or close the connection; it is now split. A rejected split send may have written some of its records: resending it whole can duplicate those. Raise `maxRequestSize` to match the broker's `message.max.bytes` if you raised that. **Inside a transaction a size rejection now makes the transaction abort-only** (as Java's producer does for an `ApiException` from `send`): abort and begin a new one
 - Keyless records now stay on one partition until about `batchSize` bytes have gone to it, then move on, so batches are larger and fewer; the per-partition spread is even over time, not per record. To keep the previous placement use `createPartitioner: Partitioners.DefaultPartitioner`
+- **A producer forgets the metadata of topics it has not produced to, and has no work for, for `metadataMaxIdle` (300 000 ms).** Nothing to change; the first send to a forgotten topic loads its metadata again.
 
 
 Producers are idempotent by default and gather sends into batches; each item says what you may

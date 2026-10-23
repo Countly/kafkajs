@@ -164,6 +164,18 @@ module.exports = class MetadataCache {
   }
 
   /**
+   * Removes a topic and the reverse mapping for its remembered id.
+   * Repeated removal is harmless; no entry is retained for a forgotten name.
+   * @param {string} topic name to forget
+   * @returns {void}
+   */
+  forget(topic) {
+    const entry = this.topics.get(topic)
+    if (entry?.topicId != null) this.topicIds.delete(entry.topicId)
+    this.topics.delete(topic)
+  }
+
+  /**
    * Second pass of `update()`: every cached topic the response did not carry either loses its
    * `decoded` references (a scoped response says nothing about it) or is dropped entirely (a
    * full-cluster response says it no longer exists). Bounded by the number of cached topics, and

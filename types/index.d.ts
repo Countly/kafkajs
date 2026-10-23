@@ -175,6 +175,11 @@ export interface ProducerConfig {
    * does not fit one request is split at record boundaries.
    */
   maxRequestSize?: number
+  /**
+   * Milliseconds an unpinned producer topic may remain unused before its metadata is forgotten.
+   * Default 300000; an integer from 5000 through 2147483647.
+   */
+  metadataMaxIdle?: number
 }
 
 export interface Message {

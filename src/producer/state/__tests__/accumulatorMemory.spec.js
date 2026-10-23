@@ -1,5 +1,7 @@
 const Accumulator = require('../accumulator')
 const { Admission } = require('../admission')
+const Cluster = require('../../../cluster')
+const { newLogger, connectionOpts } = require('testHelpers')
 const { chargeOf, RequestBudget } = require('../recordSize')
 const {
   collect,
@@ -52,9 +54,9 @@ const SHAPES = [
 
 /**
  * An accumulator over a buffer whose send path never answers: every batch it is handed is kept in
- * `batches` until `drain()` settles and retires it.
+ * `batches` until `drain()` settles and retires it. `pinner`, when given, pins the sends' topics.
  */
-const holding = (capacity) => {
+const holding = (capacity, pinner) => {
   const admission = new Admission({ capacity, maxBlockMs: 60000 })
   const batches = []
   const accumulator = new Accumulator({
@@ -72,6 +74,7 @@ const holding = (capacity) => {
     sendPartitioned: async ({ batches: handed }) => {
       batches.push(...handed)
     },
+    pinner,
   })
   return { accumulator, admission, batches }
 }
@@ -82,8 +85,8 @@ const holding = (capacity) => {
  * @returns {Promise<object>} the population: its buffer, its batches, its sends' outcomes, and the
  *   counters when the first send had to wait
  */
-const fill = async (capacity, records) => {
-  const population = holding(capacity)
+const fill = async (capacity, records, pinner) => {
+  const population = holding(capacity, pinner)
   const { accumulator, admission } = population
   let shared = Buffer.alloc(1024)
   const sends = []
@@ -227,6 +230,31 @@ describe('Producer > the buffer > the bound on held records', () => {
       } finally {
         await drain(population)
       }
+    })
+  })
+
+  test('pinned on the producer cluster, the storage the held records retain is within what they are charged, over 0.9, and the pins end with the charge', async () => {
+    const cluster = new Cluster({
+      ...connectionOpts(),
+      logger: newLogger(),
+      metadataMaxIdle: 300000,
+      retry: { retries: 0 },
+    })
+    await populations(async (capacity, records) => {
+      const before = await retained()
+      const population = await fill(capacity, records, cluster)
+      const { admission, sends } = population
+      try {
+        const after = await retained()
+        const counted = admission.reserved + admission.waitingBytes + admission.debts
+        expect(after - before).toBeLessThanOrEqual(counted / 0.9)
+        // every send but the refused last one pins its topic while it is charged
+        expect(cluster.topicPins.get(TOPIC)).toBe(sends.length - 1)
+      } finally {
+        await drain(population)
+      }
+      expect(cluster.topicPins.size).toBe(0)
+      expect(countersOf(admission)).toEqual(quiescent(admission))
     })
   })
 

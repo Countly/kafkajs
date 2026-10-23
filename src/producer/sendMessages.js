@@ -872,6 +872,7 @@ class DrainLoop {
     /** @type {Map<string, Map<number, Delivery>>} the first queued batch of each ready partition */
     const ready = new Map()
     for (const [topic, partitions] of this.#queues) {
+      this.#cluster.touchTargetTopic?.(topic)
       for (const [partition, queue] of partitions) {
         const head = this.#headOf(queue)
         if (queue.size === 0) {

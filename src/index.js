@@ -376,6 +376,7 @@ module.exports = class Client {
 
     this[PRIVATE.CREATE_CLUSTER] = ({
       metadataMaxAge,
+      metadataMaxIdle,
       allowAutoTopicCreation = true,
       // Java's max.in.flight.requests.per.connection default. Pass null for the pre-3.0
       // unbounded behavior.
@@ -401,6 +402,7 @@ module.exports = class Client {
         requestTimeout,
         enforceRequestTimeout,
         metadataMaxAge,
+        metadataMaxIdle,
         instrumentationEmitter,
         allowAutoTopicCreation,
         isolationLevel,
@@ -427,6 +429,7 @@ module.exports = class Client {
    *   and zstd (-131072..22) levels, copied at construction; omission keeps codec defaults
    * @param {number} [options.bufferMemory=33554432] bytes the producer's sends may hold at once
    * @param {number} [options.maxBlockMs=60000] ms a send waits for room in that buffer
+   * @param {number} [options.metadataMaxIdle=300000] idle unpinned topic lifetime, 5000..2147483647 ms
    * @returns {import("../types").Producer} the producer and its transaction factory
    * @throws {KafkaJSInvalidConfigurationError} for a setting idempotence asked for explicitly
    *   does not allow, and for invalid delivery, buffer, request-size or compression-level options
@@ -435,6 +438,7 @@ module.exports = class Client {
     createPartitioner,
     retry,
     metadataMaxAge = DEFAULT_METADATA_MAX_AGE,
+    metadataMaxIdle = 300000,
     allowAutoTopicCreation,
     idempotent,
     transactionalId,
@@ -448,6 +452,15 @@ module.exports = class Client {
     maxBlockMs,
     maxRequestSize,
   } = {}) {
+    if (!(
+      Number.isInteger(metadataMaxIdle) &&
+      metadataMaxIdle >= 5000 &&
+      metadataMaxIdle <= MAX_DELAY
+    )) {
+      throw new KafkaJSInvalidConfigurationError(
+        `metadataMaxIdle must be an integer >= 5000 and <= ${MAX_DELAY}, got ${inspect(metadataMaxIdle)}`
+      )
+    }
     const levels = resolveCompressionLevels(compressionLevels)
     validateBuffer({ bufferMemory, maxBlockMs })
     validateMaxRequestSize(maxRequestSize, this[PRIVATE.CLIENT_ID], transactionalId)
@@ -471,6 +484,7 @@ module.exports = class Client {
     const instrumentationEmitter = new InstrumentationEventEmitter({ channels: channels.producer })
     const cluster = this[PRIVATE.CREATE_CLUSTER]({
       metadataMaxAge,
+      metadataMaxIdle,
       allowAutoTopicCreation,
       maxInFlightRequests: inFlight,
       instrumentationEmitter,

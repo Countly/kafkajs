@@ -36,6 +36,7 @@ const producer = kafka.producer({
 | bufferMemory | Bytes the producer's sends may hold at once, its own and its transactions' together, charged as [Memory](#memory) describes. A charge, not a limit on the process's memory. An integer from 1 to `Number.MAX_SAFE_INTEGER` | `33554432` (32 MiB) |
 | maxBlockMs | How long, in ms, a send waits for room in `bufferMemory` before it rejects with `KafkaJSBufferExhaustedError`, and never past its delivery deadline. An integer from 0 to 2147483647; 0 rejects a send that does not fit at once. See [Memory](#memory) | `60000` |
 | maxRequestSize | The largest Produce request, in bytes, counting its whole frame after compression. A record that no request can carry rejects with `KafkaJSRecordTooLargeError`; a send larger than one request is split at record boundaries. An integer from the smallest request this producer's `clientId` and `transactionalId` allow (named in the error) to 2147483647. See [Request size](#request-size) | `1048576` (1 MiB) |
+| metadataMaxIdle | Milliseconds an idle topic with no pending work is retained. An integer from 5000 to 2147483647; the next send reloads forgotten metadata. | `300000` |
 
 ## <a name="idempotence"></a> Idempotence
 

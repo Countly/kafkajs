@@ -135,6 +135,7 @@ module.exports = ({
     expired: (error) => idempotentSend.inTransaction(error),
     admission,
     budget,
+    pinner: cluster.releaseTopic ? cluster : undefined,
   })
 
   /**

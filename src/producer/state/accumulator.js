@@ -627,6 +627,9 @@ class Settler {
   }
 }
 
+/** The pinner of an accumulator with no producer cluster: it protects no topic. */
+const NO_PINNER = { holdTopic() {}, releaseTopic() {} }
+
 /**
  * One send between the public call and the batches that take its records over. The records live
  * here, and nowhere else, until the send has been assigned its partitions: a continuation that
@@ -638,14 +641,17 @@ class Settler {
  * each batch takes its records' shares, released when that batch retires; what no batch took is
  * released when the send leaves the registry, at once when it fails or expires. The shell (1536
  * bytes, the backing stores of its Buffers and their bytes) is released last, once the send has
- * left the registry, no batch carries a share of it and no continuation holds it.
+ * left the registry, no batch carries a share of it and no continuation holds it. Its topics stay
+ * pinned on the producer cluster for exactly as long as that shell (`holdTopics`, `releaseTopics`).
  */
 class PendingSend {
   /**
    * @param {{ topic: string, messages: object[] }[]} records
    * @param {Deadline} deadline the send's delivery deadline, counted from the public call
+   * @param {{ holdTopic(topic: string): void, releaseTopic(topic: string): void }} [pinner] the
+   *   producer cluster's topic pins, which keep its topics' metadata while the shell is charged
    */
-  constructor(records, deadline) {
+  constructor(records, deadline, pinner = NO_PINNER) {
     /** @type {?{ topic: string, messages: object[] }[]} `null` once the send has settled or joined */
     this.records = records
     this.deadline = deadline
@@ -659,6 +665,44 @@ class PendingSend {
     this.payload = 0
     /** how many batches carry a share of its records and have not retired */
     this.shares = 0
+    this.pinner = pinner
+    /** @type {?(string|string[])} the topic, or topics, it pins until its shell is released */
+    this.topics = null
+  }
+
+  /**
+   * Pins each topic that carries records, before admission can wait. A send of one topic keeps
+   * the name itself, so the common send adds no array or closure to what its shell is charged.
+   * @returns {void}
+   */
+  holdTopics() {
+    const topics = this.records
+      .filter(({ messages }) => messages.length > 0)
+      .map(({ topic }) => topic)
+    for (const topic of topics) {
+      this.pinner.holdTopic(topic)
+    }
+    this.topics = topics.length === 1 ? topics[0] : topics
+  }
+
+  /**
+   * Releases the topics `holdTopics` pinned, once: with the shell, or on a refusal before
+   * admission.
+   * @returns {void}
+   */
+  releaseTopics() {
+    const topics = this.topics
+    if (topics === null) {
+      return
+    }
+    this.topics = null
+    if (typeof topics === 'string') {
+      this.pinner.releaseTopic(topics)
+      return
+    }
+    for (const topic of topics) {
+      this.pinner.releaseTopic(topic)
+    }
   }
 
   /**
@@ -729,6 +773,7 @@ class PendingSend {
     }
     if (this.shares === 0 && this.pins === 0) {
       this.reservation.releaseAll()
+      this.releaseTopics()
     }
   }
 }
@@ -811,6 +856,7 @@ class Accumulator {
   #deadline
   #expired
   #admission
+  #pinner
   #budget
   /** @type {Fifo<PendingSend>} the sends waiting for their partitions, in the order of their deadlines */
   #holders = new Fifo()
@@ -852,6 +898,8 @@ class Accumulator {
    * @param {(error: Error) => Error} [options.expired] called with the error of a send that
    *   expired before it joined a batch, or that the buffer refused, to arm a transaction; returns
    *   the error to reject with
+   * @param {{ holdTopic(topic: string): void, releaseTopic(topic: string): void }} [options.pinner]
+   *   the producer cluster's topic pins: each send pins its topics until its shell is released
    * @param {Admission} [options.admission] the producer's buffer; without one, every send fits
    * @param {RequestBudget} [options.budget] the producer's request-size plan: a record no request
    *   can carry is refused, a partition's records that one request cannot carry are cut into
@@ -869,6 +917,7 @@ class Accumulator {
     expired = (error) => error,
     admission = new Admission({ capacity: Number.MAX_SAFE_INTEGER, maxBlockMs: 0 }),
     budget = new RequestBudget(),
+    pinner = NO_PINNER,
   }) {
     this.#linger = linger
     this.#batchSize = batchSize
@@ -880,6 +929,7 @@ class Accumulator {
     this.#deadline = deadline
     this.#expired = expired
     this.#admission = admission
+    this.#pinner = pinner
     this.#budget = budget
   }
 
@@ -991,12 +1041,17 @@ class Accumulator {
       return []
     }
 
-    const send = new PendingSend(topicMessages, new Deadline(startedAt, this.#deadline))
+    const send = new PendingSend(
+      topicMessages,
+      new Deadline(startedAt, this.#deadline),
+      this.#pinner
+    )
     if (send.deadline.remaining() === 0) {
       throw this.#expired(this.#timedOut(send))
     }
 
     this.#appending += 1
+    send.holdTopics()
     try {
       this.#assertFits(topicMessages, compression)
       const charge = chargeOf(topicMessages, this.#admission.capacity)
@@ -1004,6 +1059,7 @@ class Accumulator {
       send.admit(granted instanceof Promise ? await granted : granted, charge)
     } catch (error) {
       send.records = null
+      send.releaseTopics()
       this.#end()
       throw this.#expired(error)
     }

@@ -54,6 +54,7 @@ const PRIVATE = {
 
 module.exports = class BrokerPool {
   /**
+   * Owns broker readiness and retained routing responses; optional producer captures fence topic merges.
    * @param {object} options
    * @param {import("./connectionPoolBuilder").ConnectionPoolBuilder} options.connectionPoolBuilder
    * @param {import("../../types").Logger} options.logger
@@ -61,6 +62,7 @@ module.exports = class BrokerPool {
    *   metadata and is usable standalone, so it defaults to a private cache rather than requiring
    *   a collaborator it can build itself. `Cluster` always injects its own, which is then the
    *   single instance every route reads.
+   * @param {(topics: string[]) => ((topic: string) => boolean)} [options.captureTopics] scoped producer publication predicate
    * @param {import("../instrumentation/emitter")|null} [options.instrumentationEmitter]
    * @param {import("../../types").RetryOptions} [options.retry]
    * @param {number} [options.drainTimeout] obsolete-resource drain bound in milliseconds
@@ -77,6 +79,7 @@ module.exports = class BrokerPool {
     connectionPoolBuilder,
     logger,
     metadataCache,
+    captureTopics,
     instrumentationEmitter,
     retry,
     allowAutoTopicCreation,
@@ -86,6 +89,7 @@ module.exports = class BrokerPool {
     metadataRecoveryRebootstrapTriggerMs,
     drainTimeout,
   }) {
+    this.captureTopics = captureTopics
     this.drainTimeout = drainTimeout
     this.retiredBrokers = new WeakSet()
     this.rootLogger = logger
@@ -566,6 +570,7 @@ module.exports = class BrokerPool {
    * @returns {Promise<void>}
    */
   async refreshMetadata(topics) {
+    const accept = this.captureTopics?.(topics || [])
     try {
       await this.retrier(async (bail, retryCount, retryTime) => {
         let broker
@@ -584,7 +589,17 @@ module.exports = class BrokerPool {
         const { host: seedHost, port: seedPort } = seedBroker ? seedBroker.connectionPool : {}
 
         try {
-          this.metadata = await broker.metadata(topics)
+          if (accept) {
+            const response = await broker.metadata(topics)
+            const incoming = response.topicMetadata.filter(({ topic }) => accept(topic))
+            const replaced = new Set(incoming.map(({ topic }) => topic))
+            const retained = (this.metadata?.topicMetadata || []).filter(
+              ({ topic }) => !replaced.has(topic)
+            )
+            this.metadata = { ...response, topicMetadata: [...retained, ...incoming] }
+          } else {
+            this.metadata = await broker.metadata(topics)
+          }
           // Captured synchronously, in the same statement-tick as the assignment above and
           // before anything below can `await` - a concurrent rebootstrap nulls `this.metadata`
           // as soon as it starts (see the `seedBroker` capture above for why this concurrency is
@@ -600,7 +615,7 @@ module.exports = class BrokerPool {
           // reader can observe the fresh response with the monotonic leader guard not yet
           // applied. An empty topic list is encoded as the null array, which asks for every topic
           // in the cluster - the cache prunes what such a response does not carry.
-          this.metadataCache.update(metadata, { full: !topics || topics.length === 0 })
+          this.metadataCache.update(metadata, { full: !accept && (!topics || topics.length === 0) })
           this.metadataExpireAt = Date.now() + this.metadataMaxAge
 
           const previousBrokers = { ...this.brokers }
@@ -671,6 +686,19 @@ module.exports = class BrokerPool {
     } catch (e) {
       await this.onMetadataFailure(e)
       throw e
+    }
+  }
+
+  /**
+   * Drops one producer target from the retained decoded response, preserving broker discovery.
+   * @param {string} topic forgotten name
+   * @returns {void}
+   */
+  forgetTopic(topic) {
+    if (this.metadata) {
+      this.metadata.topicMetadata = this.metadata.topicMetadata.filter(
+        (entry) => entry.topic !== topic
+      )
     }
   }
 

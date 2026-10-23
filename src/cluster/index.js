@@ -67,6 +67,7 @@ const PRIVATE = {
 
 module.exports = class Cluster {
   /**
+   * Owns broker discovery and routing, with producer-only pins protecting live topic work.
    * @param {Object} options
    * @param {Array<string>} options.brokers example: ['127.0.0.1:9092', '127.0.0.1:9094']
    * @param {Object} options.ssl
@@ -78,6 +79,7 @@ module.exports = class Cluster {
    * @param {number} [options.requestTimeout=30000] - in milliseconds
    * @param {boolean} [options.enforceRequestTimeout]
    * @param {number} options.metadataMaxAge - in milliseconds
+   * @param {number} [options.metadataMaxIdle] producer-only idle expiry; undefined disables tracking
    * @param {boolean} options.allowAutoTopicCreation
    * @param {number|null} options.maxInFlightRequests
    * @param {number} options.isolationLevel
@@ -112,6 +114,7 @@ module.exports = class Cluster {
     requestTimeout = 30000,
     enforceRequestTimeout,
     metadataMaxAge,
+    metadataMaxIdle,
     retry,
     allowAutoTopicCreation,
     maxInFlightRequests,
@@ -144,6 +147,10 @@ module.exports = class Cluster {
     })
 
     this.targetTopics = new Set()
+    this.metadataMaxIdle = metadataMaxIdle
+    this.targetTopicState = metadataMaxIdle === undefined ? null : new Map()
+    this.topicPins = metadataMaxIdle === undefined ? null : new Map()
+    this.nextTopicIncarnation = 0
     this.mutatingTargetTopics = new Lock({
       description: `updating target topics`,
       timeout: requestTimeout,
@@ -159,6 +166,8 @@ module.exports = class Cluster {
       connectionPoolBuilder: this.connectionPoolBuilder,
       logger: this.rootLogger,
       metadataCache: this.metadataCache,
+      captureTopics:
+        this.targetTopicState === null ? undefined : (topics) => this.captureTopics(topics),
       instrumentationEmitter,
       retry,
       allowAutoTopicCreation,
@@ -178,10 +187,14 @@ module.exports = class Cluster {
     })
 
     this[PRIVATE.REFRESH_METADATA] = sharedPromiseTo(async () => {
+      this.pruneTargetTopics()
+      if (this.targetTopicState !== null && this.targetTopics.size === 0) return
       return await this.brokerPool.refreshMetadata(Array.from(this.targetTopics))
     })
 
     this[PRIVATE.REFRESH_METADATA_IF_NECESSARY] = sharedPromiseTo(async () => {
+      this.pruneTargetTopics()
+      if (this.targetTopicState !== null && this.targetTopics.size === 0) return
       return await this.brokerPool.refreshMetadataIfNecessary(Array.from(this.targetTopics))
     })
 
@@ -487,6 +500,7 @@ module.exports = class Cluster {
       const previousTopics = new Set(this.targetTopics)
       for (const topic of topics) {
         this.targetTopics.add(topic)
+        this.touchTargetTopic(topic)
       }
 
       const hasChanged = previousSize !== this.targetTopics.size || !this.brokerPool.metadata
@@ -500,7 +514,17 @@ module.exports = class Cluster {
             e.type === 'UNKNOWN_TOPIC_OR_PARTITION' ||
             e.type === 'TOPIC_AUTHORIZATION_FAILED'
           ) {
-            this.targetTopics = previousTopics
+            if (this.targetTopicState === null) {
+              this.targetTopics = previousTopics
+            } else {
+              for (const topic of this.targetTopics) {
+                if (previousTopics.has(topic)) continue
+                this.targetTopics.delete(topic)
+                this.targetTopicState.delete(topic)
+                this.metadataCache.forget(topic)
+                this.brokerPool.forgetTopic(topic)
+              }
+            }
           }
 
           throw e
@@ -508,6 +532,79 @@ module.exports = class Cluster {
       }
     } finally {
       await this.mutatingTargetTopics.release()
+    }
+  }
+
+  /**
+   * Stamps an active producer target, allocating an incarnation only on its first use.
+   * Other client kinds keep no tracking state.
+   * @param {string} topic active target name
+   * @returns {void}
+   */
+  touchTargetTopic(topic) {
+    if (this.targetTopicState === null || !this.targetTopics.has(topic)) return
+    const previous = this.targetTopicState.get(topic)
+    this.targetTopicState.set(topic, {
+      lastUsed: Date.now(),
+      incarnation: previous?.incarnation ?? ++this.nextTopicIncarnation,
+    })
+  }
+
+  /**
+   * Protects a producer topic while an owner holds charged storage or awaits admission: one
+   * count per call, ended by one `releaseTopic`. Other client kinds keep no pins.
+   * @param {string} topic name owned by the send
+   * @returns {void}
+   */
+  holdTopic(topic) {
+    if (this.topicPins === null) return
+    this.topicPins.set(topic, (this.topicPins.get(topic) ?? 0) + 1)
+  }
+
+  /**
+   * Ends one `holdTopic` count; the owner calls it once per hold. Issues no metadata request.
+   * @param {string} topic name the owner held
+   * @returns {void}
+   */
+  releaseTopic(topic) {
+    const pins = this.topicPins?.get(topic)
+    if (pins === undefined) return
+    if (pins === 1) this.topicPins.delete(topic)
+    else this.topicPins.set(topic, pins - 1)
+  }
+
+  /**
+   * Forgets only idle, unpinned producer targets and both cached representations.
+   * Runs once before a refresh; no timer or retired-name history is kept.
+   * @returns {void}
+   */
+  pruneTargetTopics() {
+    if (this.targetTopicState === null) return
+    const now = Date.now()
+    for (const [topic, { lastUsed }] of this.targetTopicState) {
+      if (this.topicPins.has(topic) || now - lastUsed < this.metadataMaxIdle) continue
+      this.targetTopics.delete(topic)
+      this.targetTopicState.delete(topic)
+      this.metadataCache.forget(topic)
+      this.brokerPool.forgetTopic(topic)
+    }
+  }
+
+  /**
+   * Captures the active incarnations requested by one scoped refresh before it awaits.
+   * A late answer cannot publish a forgotten topic or overwrite its replacement.
+   * @param {string[]} topics requested names
+   * @returns {(topic: string) => boolean} synchronous publication predicate
+   */
+  captureTopics(topics) {
+    const captured = new Map(
+      topics.map((topic) => [topic, this.targetTopicState.get(topic)?.incarnation])
+    )
+    return (topic) => {
+      const incarnation = captured.get(topic)
+      return (
+        incarnation !== undefined && this.targetTopicState.get(topic)?.incarnation === incarnation
+      )
     }
   }
 
