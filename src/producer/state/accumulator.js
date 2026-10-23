@@ -1361,6 +1361,19 @@ class Accumulator {
   }
 
   /**
+   * How many batches wait for a partition: its pending batch and the batches handed on and not
+   * settled yet - the queue an adaptive partitioner weighs. Reads two maps by one `topic/partition`
+   * key, only when an adaptive partitioner picks.
+   * @param {string} topic
+   * @param {number} partition
+   * @returns {number}
+   */
+  depthOf(topic, partition) {
+    const key = `${topic}/${partition}`
+    return (this.#pending.has(key) ? 1 : 0) + (this.#unsettled.get(key) ?? 0)
+  }
+
+  /**
    * Hands every pending batch to the send path now - in one call per `acks`, `timeout` and
    * `compression` - and clears their timers.
    * @returns {Promise<void>} settles once every batch it handed on has settled; never rejects

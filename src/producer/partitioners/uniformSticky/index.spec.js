@@ -1,6 +1,6 @@
 const UniformStickyPartitioner = require('./index')
 const Partitioners = require('../index')
-const { KafkaJSNonRetriableError } = require('../../../errors')
+const { KafkaJSNonRetriableError, KafkaJSInvalidConfigurationError } = require('../../../errors')
 
 /**
  * The keys `default/murmur2.spec.js` pins against the Java client, plus binary, non-ASCII and
@@ -73,7 +73,7 @@ describe('Producer > Partitioner > UniformSticky', () => {
 
   test('sticks to one partition until stickyBytes are reached, then picks again', () => {
     const random = jest.spyOn(Math, 'random').mockReturnValueOnce(0).mockReturnValueOnce(0.5)
-    const partitioner = UniformStickyPartitioner({ stickyBytes: 90 })()
+    const partitioner = UniformStickyPartitioner({ stickyBytes: 162 })()
     const send = () =>
       partitioner({
         topic: 'topic',
@@ -81,7 +81,8 @@ describe('Producer > Partitioner > UniformSticky', () => {
         message: { key: null, value: 'x'.repeat(30) },
       })
 
-    // 30, 60, 90 bytes: the record that reaches stickyBytes still goes to the sticky partition.
+    // 54 wire bytes a record (21, 1 for the null key, 31 for the value, 1 for no header): 54, 108,
+    // 162 - the record that reaches stickyBytes still goes to the sticky partition.
     expect([send(), send(), send()]).toEqual([0, 0, 0])
     expect(random).toHaveBeenCalledTimes(1)
     expect(send()).toEqual(1)
@@ -90,7 +91,7 @@ describe('Producer > Partitioner > UniformSticky', () => {
 
   test('one byte short of stickyBytes does not switch', () => {
     jest.spyOn(Math, 'random').mockReturnValueOnce(0).mockReturnValueOnce(0.99)
-    const partitioner = UniformStickyPartitioner({ stickyBytes: 91 })()
+    const partitioner = UniformStickyPartitioner({ stickyBytes: 163 })()
     const send = () =>
       partitioner({
         topic: 'topic',
@@ -101,14 +102,16 @@ describe('Producer > Partitioner > UniformSticky', () => {
     expect([send(), send(), send(), send(), send()]).toEqual([0, 0, 0, 0, 2])
   })
 
-  test('counts the bytes of a Buffer value and of a key, and nothing for an absent one', () => {
+  test('counts each record in its wire size: key, value and their lengths, a null or absent one as 1 byte', () => {
     jest.spyOn(Math, 'random').mockReturnValueOnce(0).mockReturnValueOnce(0.99)
-    const partitioner = UniformStickyPartitioner({ stickyBytes: 10, ignoreKeys: true })()
+    const partitioner = UniformStickyPartitioner({ stickyBytes: 83, ignoreKeys: true })()
     const send = (message) =>
       partitioner({ topic: 'topic', partitionMetadata: metadata(0, 1, 2), message })
 
+    // 24, then 33 (57), then 25 (82): one byte short; the next 25 reach 83 and stay.
     expect(send({ key: null, value: null })).toEqual(0)
     expect(send({ key: Buffer.alloc(4), value: Buffer.alloc(5) })).toEqual(0)
+    expect(send({ value: Buffer.alloc(1) })).toEqual(0)
     expect(send({ value: Buffer.alloc(1) })).toEqual(0)
     expect(send({ value: Buffer.alloc(1) })).toEqual(2)
   })
@@ -119,7 +122,8 @@ describe('Producer > Partitioner > UniformSticky', () => {
     const send = (value) =>
       partitioner({ topic: 'topic', partitionMetadata: metadata(0, 1, 2), message: { value } })
 
-    expect(send('x'.repeat(16383))).toEqual(0)
+    // 21 + 1 + 3 + 16357 + 1 = 16383 wire bytes, one short; the next record's 25 reach it.
+    expect(send('x'.repeat(16357))).toEqual(0)
     expect(send('x')).toEqual(0)
     expect(send('x')).toEqual(2)
   })
@@ -160,7 +164,7 @@ describe('Producer > Partitioner > UniformSticky', () => {
 
   test('with ignoreKeys, a keyed record follows the sticky rule and its key counts', () => {
     jest.spyOn(Math, 'random').mockReturnValueOnce(0.99).mockReturnValueOnce(0)
-    const partitioner = UniformStickyPartitioner({ stickyBytes: 10, ignoreKeys: true })()
+    const partitioner = UniformStickyPartitioner({ stickyBytes: 58, ignoreKeys: true })()
     const send = () =>
       partitioner({
         topic: 'topic',
@@ -168,18 +172,18 @@ describe('Producer > Partitioner > UniformSticky', () => {
         message: { key: 'abcd', value: 'x' },
       })
 
-    // 5 bytes per record: the second reaches 10, the third picks again.
+    // 29 wire bytes per record, the key's 5 included: the second reaches 58, the third picks again.
     expect([send(), send(), send()]).toEqual([2, 2, 0])
   })
 
   test('honours an explicit partition, partition 0 included, and leaves the sticky count alone', () => {
     jest.spyOn(Math, 'random').mockReturnValueOnce(0.5).mockReturnValueOnce(0.99)
-    const partitioner = UniformStickyPartitioner({ stickyBytes: 3 })()
+    const partitioner = UniformStickyPartitioner({ stickyBytes: 75 })()
     const send = (message) =>
       partitioner({ topic: 'topic', partitionMetadata: metadata(0, 1, 2), message })
 
-    // 1 byte sticks to partition 1; the explicit records go where they say, keyed or not, and
-    // their 50 bytes are not counted: the sticky partition is left only at the third sticky byte.
+    // 25 wire bytes stick to partition 1; the explicit records go where they say, keyed or not, and
+    // are not counted: the sticky partition is left only after the third sticky record.
     expect(send({ value: 'x' })).toEqual(1)
     expect(send({ partition: 0, value: 'x'.repeat(50) })).toEqual(0)
     expect(send({ partition: 2, key: 'k', value: 'x'.repeat(50) })).toEqual(2)
@@ -203,35 +207,37 @@ describe('Producer > Partitioner > UniformSticky', () => {
     ['the same text in a Buffer', (text) => Buffer.from(text)],
   ])('counts %s in the bytes it encodes to, not in characters', (_, toValue) => {
     jest.spyOn(Math, 'random').mockReturnValueOnce(0).mockReturnValueOnce(0.99)
-    const partitioner = UniformStickyPartitioner({ stickyBytes: 6 })()
+    const partitioner = UniformStickyPartitioner({ stickyBytes: 30 })()
     const send = (value) =>
       partitioner({ topic: 'topic', partitionMetadata: metadata(0, 1, 2), message: { value } })
 
-    // '€€' is 6 bytes but 2 characters, so it reaches stickyBytes on its own.
+    // '€€' is 6 bytes but 2 characters: 30 wire bytes, so it reaches stickyBytes on its own.
     expect([send(toValue('€€')), send(toValue('x'))]).toEqual([0, 2])
   })
 
   test('counts an astral character in its four bytes, in a string and in a Buffer alike', () => {
     jest.spyOn(Math, 'random').mockReturnValueOnce(0).mockReturnValueOnce(0.99)
-    const partitioner = UniformStickyPartitioner({ stickyBytes: 8 })()
+    const partitioner = UniformStickyPartitioner({ stickyBytes: 56 })()
     const send = (value) =>
       partitioner({ topic: 'topic', partitionMetadata: metadata(0, 1, 2), message: { value } })
 
+    // 28 wire bytes each: the second reaches 56.
     expect([send('\u{1F600}'), send(Buffer.from('\u{1F600}')), send('x')]).toEqual([0, 0, 2])
   })
 
-  test('counts any other value in the bytes of its string form', () => {
+  test('counts a record’s headers in its wire size', () => {
     jest.spyOn(Math, 'random').mockReturnValueOnce(0).mockReturnValueOnce(0.99)
-    const partitioner = UniformStickyPartitioner({ stickyBytes: 6 })()
-    const send = (value) =>
-      partitioner({ topic: 'topic', partitionMetadata: metadata(0, 1, 2), message: { value } })
+    const partitioner = UniformStickyPartitioner({ stickyBytes: 29 })()
+    const send = (message) =>
+      partitioner({ topic: 'topic', partitionMetadata: metadata(0, 1, 2), message })
 
-    expect([send(123456), send('x')]).toEqual([0, 2])
+    // 21 + 1 + 2 + the header's 2 + 2 + its count's 1 = 29
+    expect([send({ value: 'x', headers: { h: 'v' } }), send({ value: 'x' })]).toEqual([0, 2])
   })
 
   test('keeps separate state for each partitioner a factory builds', () => {
     jest.spyOn(Math, 'random').mockReturnValueOnce(0).mockReturnValueOnce(0.99)
-    const createPartitioner = UniformStickyPartitioner({ stickyBytes: 3 })
+    const createPartitioner = UniformStickyPartitioner({ stickyBytes: 75 })
     const [first, second] = [createPartitioner(), createPartitioner()]
     const send = (partitioner) =>
       partitioner({ topic: 'topic', partitionMetadata: metadata(0, 1, 2), message: { value: 'x' } })
@@ -266,5 +272,87 @@ describe('Producer > Partitioner > UniformSticky', () => {
     expect(() => UniformStickyPartitioner({ stickyBytes })).toThrow(
       'stickyBytes must be an integer of at least 1'
     )
+  })
+
+  test('records with no bytes move on too: one record of 24 wire bytes at a time, stickyBytes / 24 of them', () => {
+    let draws = 0
+    jest.spyOn(Math, 'random').mockImplementation(() => (draws++ % 3) / 3)
+    const partitioner = UniformStickyPartitioner({ stickyBytes: 240 })()
+    const partitionMetadata = metadata(0, 1, 2)
+
+    const chosen = Array.from({ length: 1000 }, () =>
+      partitioner({ topic: 'topic', partitionMetadata, message: { value: null } })
+    )
+
+    const runs = []
+    for (const partition of chosen) {
+      if (runs.length > 0 && runs.at(-1).partition === partition) runs.at(-1).length += 1
+      else runs.push({ partition, length: 1 })
+    }
+    expect(runs).toHaveLength(100)
+    expect(runs.every(({ length }) => length === 10)).toBe(true)
+  })
+
+  test('a sticky partition that lost its leader is left at the next record while another has one, checked once for each partition list', () => {
+    const random = jest.spyOn(Math, 'random').mockReturnValueOnce(0).mockReturnValueOnce(0.99)
+    const partitioner = UniformStickyPartitioner()()
+    const send = (partitionMetadata) =>
+      partitioner({ topic: 'topic', partitionMetadata, message: { value: 'x' } })
+    const lost = metadata(-1, 1, 2)
+
+    expect(send(metadata(0, 1, 2))).toBe(0)
+    expect(send(metadata(0, 1, 2))).toBe(0)
+    expect(send(lost)).toBe(2)
+    expect(send(lost)).toBe(2)
+    expect(random).toHaveBeenCalledTimes(2)
+  })
+
+  test('a topic none of whose partitions has a leader gets one partition until stickyBytes, with no throw and no spin', () => {
+    const random = jest.spyOn(Math, 'random').mockReturnValue(0.5)
+    for (const adaptive of [false, true]) {
+      random.mockClear()
+      const partitioner = UniformStickyPartitioner({ stickyBytes: 100, adaptive })()
+      partitioner.attach({ loadOf: () => 0, rackOf: () => undefined })
+      const partitionMetadata = metadata(-1, -1, -1, -1)
+      const send = () => partitioner({ topic: 'topic', partitionMetadata, message: { value: 'x' } })
+
+      expect([send(), send(), send(), send(), send()]).toEqual([2, 2, 2, 2, 2])
+      expect(random).toHaveBeenCalledTimes(2)
+    }
+  })
+
+  test('the state of topics idle for longer than 300000 ms is dropped when another topic’s is made while 64 are held', () => {
+    let now = 0
+    jest.spyOn(Date, 'now').mockImplementation(() => now)
+    const random = jest.spyOn(Math, 'random').mockReturnValue(0)
+    const partitioner = UniformStickyPartitioner()()
+    const partitionMetadata = metadata(0, 1, 2)
+    const send = (topic) => partitioner({ topic, partitionMetadata, message: { value: 'x' } })
+
+    for (let i = 0; i < 1000; i += 1) {
+      now = i * 5000
+      expect(send(`topic-${i}`)).toBe(0)
+    }
+    random.mockReturnValue(0.99)
+    const kept = Array.from({ length: 1000 }, (_, i) => send(`topic-${i}`) === 0)
+
+    expect(kept.filter(Boolean).length).toBeLessThanOrEqual(64)
+    expect(kept.filter(Boolean).length).toBeGreaterThan(0)
+    expect([kept[0], kept[998], kept[999]]).toEqual([false, true, true])
+  })
+
+  test.each([['yes'], [1], [null]])(
+    'refuses adaptive %p as KafkaJSInvalidConfigurationError',
+    (adaptive) => {
+      expect(() => UniformStickyPartitioner({ adaptive })).toThrow(KafkaJSInvalidConfigurationError)
+      expect(() => UniformStickyPartitioner({ adaptive })).toThrow('adaptive must be a boolean')
+    }
+  )
+
+  test('each built instance and the supported uncalled wrapper can be attached', () => {
+    const createPartitioner = UniformStickyPartitioner()
+
+    expect(typeof createPartitioner().attach).toBe('function')
+    expect(typeof createPartitioner.attach).toBe('function')
   })
 })

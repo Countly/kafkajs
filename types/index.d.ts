@@ -206,13 +206,20 @@ export const Partitioners: {
    */
   JavaCompatiblePartitioner: DefaultPartitioner
   /**
-   * KIP-794 uniform sticky partitioner (opt-in): keyless records stick to a partition for
-   * `stickyBytes` of keys and values, keyed ones keep `DefaultPartitioner`'s mapping unless
-   * `ignoreKeys`.
+   * KIP-794 uniform sticky partitioner, the producer's default when `createPartitioner` is
+   * omitted (sticking for `batchSize` bytes): keyless records stick to a partition for
+   * `stickyBytes`, each record counting its wire size, keyed ones keep `DefaultPartitioner`'s
+   * mapping unless `ignoreKeys`.
    */
   UniformStickyPartitioner: (options?: {
     stickyBytes?: number
     ignoreKeys?: boolean
+    /**
+     * Weight the choice of the next partition by queue depth (KIP-794). A boolean (a non-boolean
+     * throws KafkaJSInvalidConfigurationError); default false for a partitioner you construct. The
+     * producer's built-in default uses it when the measured gate of the release passed.
+     */
+    adaptive?: boolean
   }) => ICustomPartitioner
 }
 

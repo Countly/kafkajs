@@ -590,6 +590,9 @@ kafka.producer({
   createPartitioner: Partitioners.UniformStickyPartitioner({ stickyBytes: 8192, ignoreKeys: true }),
 })
 kafka.producer({ createPartitioner: Partitioners.UniformStickyPartitioner() })
+kafka.producer({ createPartitioner: Partitioners.UniformStickyPartitioner({ adaptive: true }) })
+// @ts-expect-error adaptive is a boolean
+Partitioners.UniformStickyPartitioner({ adaptive: 'yes' })
 kafka.producer({ createPartitioner: Partitioners.DefaultPartitioner })
 
 // groupMetadata() and the two sendOffsets shapes.

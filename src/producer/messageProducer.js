@@ -31,6 +31,9 @@ const sharedPromiseTo = require('../utils/sharedPromiseTo')
  *   the accumulated batches: sends are refused and batches no longer linger
  * @param {object} options.instrumentationEmitter
  * @param {string} options.INITIALIZED
+ * @returns {{ send: Function, sendBatch: Function, ensureInitialized: Function, flush: Function,
+ *   close: Function, depthOf: (topic: string, partition: number) => number }} `depthOf` counts
+ *   the batches waiting for a partition (see `Accumulator#depthOf`)
  */
 module.exports = ({
   logger,
@@ -297,5 +300,6 @@ module.exports = ({
     ensureInitialized,
     flush,
     close,
+    depthOf: (topic, partition) => accumulator.depthOf(topic, partition),
   }
 }

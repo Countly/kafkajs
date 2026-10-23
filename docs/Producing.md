@@ -297,9 +297,11 @@ KafkaJS ships with 3 partitioners: `DefaultPartitioner`, `UniformStickyPartition
 
 | Partitioner | Keyed records | Records without a key | Choose it when |
 |---|---|---|---|
-| `DefaultPartitioner` (the default) | `murmur2(key)`, as the Java client | round-robin over the partitions that have a leader | you need Java-compatible keyed placement and an even spread of every keyless record |
-| `UniformStickyPartitioner()` | the same as `DefaultPartitioner` | one partition per topic until `stickyBytes` have gone to it, then a new one picked at random (it may be the same partition again) | most records have no key and you want fewer, larger batches per partition (see below) |
+| `UniformStickyPartitioner()` (the default) | the same as `DefaultPartitioner` | one partition per topic until `stickyBytes` have gone to it, then a new one picked at random (it may be the same partition again) | most records have no key and you want fewer, larger batches per partition (see below) |
+| `DefaultPartitioner` | `murmur2(key)`, as the Java client | round-robin over the partitions that have a leader | you need Java-compatible keyed placement and an even spread of every keyless record |
 | `LegacyPartitioner` | the hash KafkaJS used before v2.0.0 | round-robin | you need the partitioning of KafkaJS before v2.0.0 |
+
+When `createPartitioner` is omitted the producer uses the uniform sticky partitioner, sticking for its `batchSize` bytes (KIP-794, the Java client's built-in behaviour). Keyed records and records with an explicit `partition` go exactly where `DefaultPartitioner` sends them; only records without a key are placed differently. To keep the placement of earlier versions, record by record, pass `createPartitioner: Partitioners.DefaultPartitioner` (or its alias `JavaCompatiblePartitioner`). `LegacyPartitioner` is not the way back: it hashes keys differently.
 
 The `DefaultPartitioner` should be compatible with the default partitioner that ships with the Java Kafka client. This can be important to meet the [co-partitioning requirement](https://docs.confluent.io/current/ksql/docs/developer-guide/partition-data.html#co-partitioning-requirements) when joining multiple topics.
 
@@ -316,9 +318,10 @@ by importing it and providing it to the Producer constructor:**
 
 #### Uniform sticky partitioner
 
-`UniformStickyPartitioner` is the strictly uniform sticky partitioner of KIP-794. It is opt-in, and
-unlike the other two you call it: pass `Partitioners.UniformStickyPartitioner()` for the defaults, or
-call it with options:
+`UniformStickyPartitioner` is the strictly uniform sticky partitioner of KIP-794, and the producer's
+default, with `stickyBytes` the producer's `batchSize`. To choose its options, unlike the other two
+you call it: pass `Partitioners.UniformStickyPartitioner()` for its own defaults, or call it with
+options:
 
 ```javascript
 const { Partitioners } = require('@countly/kafkajs')
@@ -327,11 +330,12 @@ kafka.producer({ createPartitioner: Partitioners.UniformStickyPartitioner({ stic
 
 | Option | Description | Default |
 |---|---|---|
-| stickyBytes | Bytes of key and value assigned to one partition before the next record without a key picks another; a string counts in its UTF-8 bytes, as a `Buffer` of the same text does | `16384` |
+| stickyBytes | Bytes assigned to one partition before the next record without a key picks another; each record counts its wire size - 21 bytes plus its key, value and headers with their lengths, a string in its UTF-8 bytes, as a `Buffer` of the same text - so records with no bytes move on too | `16384` |
 | ignoreKeys | Partition keyed records by the sticky rule too, instead of by key | `false` |
+| adaptive | Pick the next partition weighted by the batches waiting for each one (KIP-794's adaptive partitioning), so partitions of a slow broker get fewer records. A boolean | `false` |
 
-A record without a key goes to its topic's sticky partition until `stickyBytes` of key and value
-have been assigned to it; the record that reaches the threshold still goes there, and the next one
+A record without a key goes to its topic's sticky partition until `stickyBytes` have been assigned
+to it; the record that reaches the threshold still goes there, and the next one
 goes to a partition picked uniformly at random among those with a leader (among all of them when
 none has a leader — the pick can land on the same partition again). The stickiness carries across
 `send()` calls: the keyless records of one `send()` with many messages fill a few batches instead
@@ -341,9 +345,15 @@ record with an explicit `partition` goes there. Keyed records keep
 `DefaultPartitioner`'s mapping, so topics co-partitioned with Java producers stay co-partitioned —
 unless you pass `ignoreKeys: true`.
 
-The Java client's adaptive partitioning (`partitioner.adaptive.partitioning.enable`,
-`partitioner.availability.timeout.ms`) is not implemented: it needs per-partition queue depths this
-client does not track.
+A sticky partition that lost its leader is left at the next record without a key while another
+partition has one, and a topic's state is dropped once it has had no record without a key for
+300000 ms (checked when another topic's state is made while 64 are held).
+
+With `adaptive: true` each pick weighs the partitions that have a leader by the batches waiting for
+them: a partition is picked with probability proportional to the deepest queue plus one, less its
+own, as the Java client's `partitioner.adaptive.partitioning.enable` does; equal queues pick
+uniformly. The producer's own default does not weigh. `partitioner.availability.timeout.ms` is not
+implemented.
 
 ## <a name="retry"></a> Retry
 

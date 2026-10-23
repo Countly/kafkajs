@@ -1,7 +1,8 @@
 const createRetry = require('../retry')
 const { MAX_DELAY } = require('./deadline')
 const { CONNECTION_STATUS } = require('../network/connectionStatus')
-const { DefaultPartitioner } = require('./partitioners/')
+const { UniformStickyPartitioner } = require('./partitioners/')
+const { attach: attachBuiltIn } = require('./partitioners/builtIn')
 const InstrumentationEventEmitter = require('../instrumentation/emitter')
 const createEosManager = require('./eosManager')
 const createMessageProducer = require('./messageProducer')
@@ -61,6 +62,8 @@ const DEFAULTS = Object.freeze({
   bufferMemory: 33554432,
   maxBlockMs: 60000,
   maxRequestSize: 1048576,
+  // KIP-794's adaptive weighting stays off by default until its measured gate passes.
+  adaptive: false,
 })
 
 /**
@@ -87,7 +90,9 @@ const definedKeys = (options) =>
  * @param {Object} params
  * @param {import('../../types').Cluster} params.cluster
  * @param {import('../../types').Logger} params.logger
- * @param {import('../../types').ICustomPartitioner} [params.createPartitioner]
+ * @param {import('../../types').ICustomPartitioner} [params.createPartitioner] the uniform sticky
+ *   partitioner, sticking for `batchSize` bytes, when absent; a built-in partitioner with an
+ *   `attach` method is attached once to the producer's queues and racks
  * @param {import('../../types').RetryOptions} [params.retry] merged over `cluster.retry`; a
  *   producer that sets neither keeps the retrier's default budget
  * @param {boolean} [params.idempotent] idempotent unless falsy (`undefined` and `null` mean not
@@ -117,7 +122,7 @@ const definedKeys = (options) =>
 const createProducer = ({
   cluster,
   logger: rootLogger,
-  createPartitioner = DefaultPartitioner,
+  createPartitioner,
   retry = {},
   idempotent,
   transactionalId,
@@ -172,7 +177,10 @@ const createProducer = ({
     })
   }
 
-  const partitioner = createPartitioner()
+  const partitioner = (
+    createPartitioner ??
+    UniformStickyPartitioner({ stickyBytes: batchSize, adaptive: DEFAULTS.adaptive })
+  )()
   const requestBudget = new RequestBudget({ maxRequestSize, clientId, transactionalId })
   // The retry options the producer was given, and no others: the requests of the transaction
   // protocol retry with these and the retrier's defaults.
@@ -196,7 +204,7 @@ const createProducer = ({
     deliveryRetries: deliveryRetry.retries,
   })
 
-  const { send, sendBatch, ensureInitialized, close } = createMessageProducer({
+  const { send, sendBatch, ensureInitialized, close, depthOf } = createMessageProducer({
     logger,
     cluster,
     partitioner,
@@ -218,6 +226,12 @@ const createProducer = ({
 
   let transactionalEosManager
   let transactionalMessageProducer
+
+  attachBuiltIn(partitioner, {
+    loadOf: (topic, partition) =>
+      depthOf(topic, partition) + (transactionalMessageProducer?.depthOf(topic, partition) ?? 0),
+    rackOf: (nodeId) => cluster.brokerPool?.brokers[nodeId]?.connectionPool.rack ?? undefined,
+  })
   /**
    * @type {Promise<void>|null} the commit under way - a transaction's `commit()`, or the one
    *   `disconnect()` sends again - which a further `commit()` and `disconnect()` join; only one
