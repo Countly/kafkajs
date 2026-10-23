@@ -6,9 +6,10 @@
 # classic group APIs.
 # The kafka-clients jar is downloaded into a temporary directory and is never committed.
 #
-# Usage: scripts/protocol/javaVectors/runAssignors.sh [assignors|messages] [output-dir]
+# Usage: scripts/protocol/javaVectors/runAssignors.sh [assignors|messages|snappy] [output-dir] [--read-back]
 # Requires: a JDK on PATH (javac + java), 17 or newer for `messages` (it uses records), and network
 # access to Maven Central on first run, when the jars are downloaded.
+# Snappy writes fixtures to output-dir; --read-back checks encoder artifacts in that directory.
 
 KAFKA_CLIENTS_VERSION="${KAFKA_CLIENTS_VERSION:-4.3.1}"
 SLF4J_VERSION="${SLF4J_VERSION:-1.7.36}"
@@ -22,11 +23,30 @@ SRC_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 # Subcommand: `assignors` (the default, and what this script did before) or `messages`.
 MODE="assignors"
-if [ "${1:-}" = "assignors" ] || [ "${1:-}" = "messages" ]; then
+if [ "${1:-}" = "assignors" ] || [ "${1:-}" = "messages" ] || [ "${1:-}" = "snappy" ]; then
   MODE="$1"
   shift
 fi
 OUT_DIR="${1:-$(cd "$(dirname "$0")/../../.." && pwd)}"
+
+# Snappy fixtures need only the audited Snappy jar, not kafka-clients or slf4j.
+if [ "${MODE}" = "snappy" ]; then
+  if [ -z "${1:-}" ]; then OUT_DIR="${OUT_DIR}/src/protocol/message/compression/fixtures"; fi
+  SNAPPY_VERSION="1.1.10.7"
+  SNAPPY_JAR="${WORK_DIR}/snappy-java-${SNAPPY_VERSION}.jar"
+  SNAPPY_URL="https://repo.maven.apache.org/maven2/org/xerial/snappy/snappy-java/${SNAPPY_VERSION}/snappy-java-${SNAPPY_VERSION}.jar"
+  [ -f "${SNAPPY_JAR}" ] || curl -fsSL --max-time 90 "${SNAPPY_URL}" -o "${SNAPPY_JAR}"
+  SNAPPY_SHA1="$(curl -fsSL --max-time 90 "${SNAPPY_URL}.sha1")"
+  [ "${SNAPPY_SHA1}" = "3049f95640f4625a945cfab85715f603fa4c8f80" ]
+  [ "$(sha1sum "${SNAPPY_JAR}" | cut -d ' ' -f 1)" = "${SNAPPY_SHA1}" ]
+  javac -cp "${SNAPPY_JAR}" -d "${WORK_DIR}" "${SRC_DIR}/GenerateSnappyVectors.java"
+  if [ "${2:-}" = "--read-back" ]; then
+    java -cp "${SNAPPY_JAR}:${WORK_DIR}" GenerateSnappyVectors --read-back "${OUT_DIR}"
+  else
+    java -cp "${SNAPPY_JAR}:${WORK_DIR}" GenerateSnappyVectors "${OUT_DIR}"
+  fi
+  exit 0
+fi
 
 CLIENTS_JAR="${WORK_DIR}/kafka-clients-${KAFKA_CLIENTS_VERSION}.jar"
 SLF4J_JAR="${WORK_DIR}/slf4j-api-${SLF4J_VERSION}.jar"

@@ -9,6 +9,11 @@ const requestV11 = require('../v11/request')
  * @see clients/src/main/resources/common/message/ProduceRequest.json (Apache Kafka 4.3.1)
  * @see https://cwiki.apache.org/confluence/display/KAFKA/KIP-890%3A+Transactions+Server-Side+Defense
  */
+/**
+ * Forwards all request options, including compressionLevel, to the v11 layout.
+ * @param {object} args Produce request fields
+ * @returns {object} encodable v12 request
+ */
 module.exports = (args) => Object.assign(requestV11(args), { apiVersion: 12 })
 
 module.exports.schema = {

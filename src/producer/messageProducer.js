@@ -18,6 +18,7 @@ const sharedPromiseTo = require('../utils/sharedPromiseTo')
  * @param {import('../retry').Retrier} options.retrier
  * @param {import('../../types').RetryOptions} options.retry the producer's retry options, merged
  *   over the client's
+ * @param {{ gzip?: number, zstd?: number }} [options.compressionLevels] per-codec levels
  * @param {number} [options.deliveryTimeout] the producer's delivery deadline in ms
  * @param {number} options.linger ms a batch waits for more records; 0 sends it at once
  * @param {number} options.batchSize bytes of keys and values at which a batch is sent
@@ -36,6 +37,7 @@ module.exports = ({
   retrier,
   retry,
   deliveryTimeout,
+  compressionLevels,
   linger,
   batchSize,
   getConnectionStatus,
@@ -52,6 +54,7 @@ module.exports = ({
     idempotence,
     retry,
     deliveryTimeout,
+    compressionLevels,
     getConnectionStatus,
   })
   let plainSend = null
@@ -78,6 +81,7 @@ module.exports = ({
         retrier,
         retry,
         deliveryTimeout,
+        compressionLevels,
         partitioner,
         eosManager: createEosManager({ logger, cluster, transactional: false }),
       })

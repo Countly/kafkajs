@@ -1,0 +1,5 @@
+{
+  "source": {"generator": "GenerateSnappyVectors.java", "library": "snappy-java 1.1.10.7", "input": "empty", "length": 0, "seed": 305419896, "blockSize": 32768},
+  "hex": "00",
+  "fields": {"size": 0, "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"}
+}

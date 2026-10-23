@@ -12,9 +12,7 @@ const Types = {
 
 const Codecs = {
   [Types.GZIP]: () => require('./gzip'),
-  [Types.Snappy]: () => {
-    throw new KafkaJSNotImplemented('Snappy compression not implemented')
-  },
+  [Types.Snappy]: () => require('./snappy'),
   [Types.LZ4]: () => {
     const lz4 = require('./lz4')
     if (!lz4.isSupported) {
@@ -34,7 +32,7 @@ const Codecs = {
 /**
  * @param {number} type one of `Types`
  * @returns {?object} the codec, or `null` for `Types.None`/an unregistered type
- * @throws {KafkaJSNotImplemented} for Snappy (never implemented), or for LZ4/ZSTD when their
+ * @throws {KafkaJSNotImplemented} for LZ4/ZSTD when their
  *   platform requirement isn't met (see each codec's `NOT_SUPPORTED_MESSAGE`)
  */
 const lookupCodec = (type) => (Codecs[type] ? Codecs[type]() : null)

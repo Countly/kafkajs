@@ -37,9 +37,7 @@ module.exports = {
   /**
    * @param {{ buffer: Buffer }} encoder
    * @param {{ level?: number }} [options] Compression level (default 3, Kafka's own default).
-   *   No supported caller reaches this today — the public producer API doesn't thread a level
-   *   through — but it's kept for a caller that constructs this codec directly, e.g. wrapping it
-   *   in a custom `CompressionCodecs` registration.
+   *   The producer forwards its configured level through every Produce request version.
    * @returns {Promise<Buffer>}
    * @throws {KafkaJSNotImplemented} when this Node build has no zstd support in `node:zlib`
    */

@@ -18,6 +18,7 @@ const { isArmed } = require('./eosManager/transactionStates')
 const { surfaceInTransaction } = require('./eosManager')
 const groupMessagesPerPartition = require('./groupMessagesPerPartition')
 const Fifo = require('../utils/fifo')
+const { Types: Compression } = require('../protocol/message/compression')
 
 const { keys } = Object
 
@@ -417,6 +418,7 @@ class DrainLoop {
   #retries
   #backoff
   #deadlineMs
+  #compressionLevels
   #getConnectionStatus
   /** @type {Set<Send>} */
   #sends = new Set()
@@ -444,14 +446,24 @@ class DrainLoop {
    * @param {object} options.eosManager the facade whose `stateManager` the loop drains
    * @param {import("../../types").RetryOptions} options.retry the producer's merged retry options
    * @param {number} [options.deliveryTimeout] ms from `send()` to a batch's last answer
+   * @param {{ gzip?: number, zstd?: number }} [options.compressionLevels] per-codec levels
    * @param {() => string} options.getConnectionStatus
    */
-  constructor({ logger, cluster, eosManager, retry, deliveryTimeout, getConnectionStatus }) {
+  constructor({
+    logger,
+    cluster,
+    eosManager,
+    retry,
+    deliveryTimeout,
+    compressionLevels,
+    getConnectionStatus,
+  }) {
     this.#logger = logger
     this.#cluster = cluster
     this.#eosManager = eosManager
     this.#retries = retry.retries ?? createRetry.defaults.retries
     this.#backoff = createRetry.backoff(retry)
+    this.#compressionLevels = compressionLevels
     this.#deadlineMs = deliveryTimeout ?? retry.maxTotalTime
     this.#getConnectionStatus = getConnectionStatus
   }
@@ -900,6 +912,12 @@ class DrainLoop {
       acks,
       timeout,
       compression,
+      compressionLevel:
+        compression === Compression.GZIP
+          ? this.#compressionLevels?.gzip
+          : compression === Compression.ZSTD
+            ? this.#compressionLevels?.zstd
+            : undefined,
       topicData,
       topicIds: transactional
         ? undefined
@@ -1213,6 +1231,8 @@ class DrainLoop {
  * @param {import("../../types").RetryOptions} [options.retry={}] the producer's merged retry
  *   options, for the idempotent path's per-batch budget and backoff
  * @param {number} [options.deliveryTimeout] ms from `send()` to each batch's last answer
+ * @param {{ gzip?: number, zstd?: number }} [options.compressionLevels] validated producer
+ *   snapshot, selected by codec on both send paths and retained for retries
  * @param {() => string} [options.getConnectionStatus] the producer's connection status
  * @returns {{ sendPartitioned: Function, partition: Function }}
  */
@@ -1225,6 +1245,7 @@ const createSendMessages = ({
   idempotence,
   retry = {},
   deliveryTimeout,
+  compressionLevels,
   getConnectionStatus,
 }) => {
   const isIdempotent = () => idempotence !== undefined && idempotence.isEnabled()
@@ -1442,7 +1463,15 @@ const createSendMessages = ({
 
     loop =
       loop ||
-      new DrainLoop({ logger, cluster, eosManager, retry, deliveryTimeout, getConnectionStatus })
+      new DrainLoop({
+        logger,
+        cluster,
+        eosManager,
+        retry,
+        deliveryTimeout,
+        compressionLevels,
+        getConnectionStatus,
+      })
     return loop.send({ acks, timeout, compression, batches })
   }
 
@@ -1557,6 +1586,12 @@ const createSendMessages = ({
           acks,
           timeout,
           compression,
+          compressionLevel:
+            compression === Compression.GZIP
+              ? compressionLevels?.gzip
+              : compression === Compression.ZSTD
+                ? compressionLevels?.zstd
+                : undefined,
           topicData,
           perPartitionResults: true,
         })

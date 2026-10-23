@@ -213,6 +213,38 @@ const resolveDelivery = ({ linger, batchSize, deliveryTimeout, requestTimeout })
   return resolved
 }
 
+/**
+ * Validates and snapshots the supported per-codec producer levels.
+ * @param {{ gzip?: number, zstd?: number }|undefined} levels requested levels
+ * @returns {{ gzip?: number, zstd?: number }|undefined} owned options
+ * @throws {KafkaJSInvalidConfigurationError} for unsupported keys or non-integer levels
+ */
+const resolveCompressionLevels = (levels) => {
+  if (levels === undefined) return undefined
+  if (levels === null || typeof levels !== 'object' || Array.isArray(levels)) {
+    throw new KafkaJSInvalidConfigurationError('compressionLevels must be an object')
+  }
+  const resolved = {}
+  for (const [key, level] of Object.entries(levels)) {
+    if (key === 'lz4') {
+      throw new KafkaJSInvalidConfigurationError(
+        'compressionLevels.lz4: lz4-napi exposes no compression level'
+      )
+    }
+    const valid =
+      Number.isInteger(level) &&
+      (key === 'gzip'
+        ? level === -1 || (level >= 1 && level <= 9)
+        : key === 'zstd' && level >= -131072 && level <= 22)
+    if (!valid)
+      throw new KafkaJSInvalidConfigurationError(
+        `Invalid compressionLevels.${key}: ${inspect(level)}`
+      )
+    resolved[key] = level
+  }
+  return resolved
+}
+
 const warnOfDefaultPartitioner = once((logger) => {
   if (process.env.KAFKAJS_NO_PARTITIONER_WARNING == null) {
     logger.warn(
@@ -326,8 +358,11 @@ module.exports = class Client {
    * @param {number} [options.deliveryTimeout] ms bounding the waiting and the retries of one send,
    *   at least `linger + requestTimeout`. A request already sent settles on its answer or on
    *   `requestTimeout`, so a send can end up to `requestTimeout` after `deliveryTimeout`
+   * @param {{ gzip?: number, zstd?: number }} [options.compressionLevels] gzip (-1 or 1..9)
+   *   and zstd (-131072..22) levels, copied at construction; omission keeps codec defaults
+   * @returns {import("../types").Producer} the producer and its transaction factory
    * @throws {KafkaJSInvalidConfigurationError} for a setting idempotence asked for explicitly
-   *   does not allow, and for an invalid `linger`, `batchSize` or `deliveryTimeout`
+   *   does not allow, and for invalid delivery or compression-level options
    */
   producer({
     createPartitioner,
@@ -341,7 +376,9 @@ module.exports = class Client {
     linger,
     batchSize,
     deliveryTimeout,
+    compressionLevels,
   } = {}) {
+    const levels = resolveCompressionLevels(compressionLevels)
     const delivery = resolveDelivery({
       linger,
       batchSize,
@@ -380,6 +417,7 @@ module.exports = class Client {
       linger: delivery.linger,
       batchSize: delivery.batchSize,
       deliveryTimeout,
+      compressionLevels: levels,
       instrumentationEmitter,
     })
   }

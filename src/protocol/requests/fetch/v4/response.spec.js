@@ -1,9 +1,5 @@
 const { decode, parse } = require('./response')
-const {
-  KafkaJSNotImplemented,
-  KafkaJSOffsetOutOfRange,
-  KafkaJSProtocolError,
-} = require('../../../../errors')
+const { KafkaJSOffsetOutOfRange, KafkaJSProtocolError } = require('../../../../errors')
 
 describe('Protocol > Requests > Fetch > v4', () => {
   const batchContext = {
@@ -314,11 +310,19 @@ describe('Protocol > Requests > Fetch > v4', () => {
     })
   })
 
-  describe('response with an unconfigured compression codec (snappy)', () => {
-    test('throws KafkaJSNotImplemented error', async () => {
-      await expect(
-        decode(Buffer.from(require('../fixtures/v4_response_snappy.json')))
-      ).rejects.toThrow(KafkaJSNotImplemented)
+  describe('response with built-in snappy compression', () => {
+    test('decodes the independently checked captured key and value without registration', async () => {
+      const data = await decode(Buffer.from(require('../fixtures/v4_response_snappy.json')))
+      const messages = data.responses[0].partitions.find(
+        ({ partition }) => partition === 3
+      ).messages
+      expect(messages).toHaveLength(1)
+      expect(messages[0]).toMatchObject({
+        key: Buffer.from('key-149'),
+        value: Buffer.from('value-149-2019-02-04T15:13:48.187Z'),
+        offset: '0',
+        timestamp: '1549293228209',
+      })
     })
   })
 

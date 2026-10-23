@@ -57,6 +57,9 @@ What to change to install the package and run it on a Kafka 4.x cluster.
 
 ### Producer
 
+- Remove the `kafkajs-snappy` registration to use the built-in codec, or keep it: yours wins. The built-in codec runs on the main thread (no native module), in short slices that yield to the event loop: about 100 MiB/s to decode, 40 MiB/s to encode
+
+
 Producers are idempotent by default and gather sends into batches; each item says what you may
 notice and what, if anything, to do.
 

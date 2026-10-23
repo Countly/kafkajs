@@ -7,10 +7,12 @@ const unzip = promisify(zlib.unzip)
 module.exports = {
   /**
    * @param {Encoder} encoder
-   * @returns {Promise}
+   * @param {{ level?: number }} [options] gzip level; omitted keeps the zlib default
+   * @returns {Promise<Buffer>} compressed bytes
+   * @throws {Error} for an invalid zlib option or compression failure
    */
-  async compress(encoder) {
-    return await gzip(encoder.buffer)
+  async compress(encoder, { level } = {}) {
+    return await gzip(encoder.buffer, { level })
   },
 
   /**

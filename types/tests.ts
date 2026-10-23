@@ -1111,3 +1111,13 @@ const useBrokerAdditions = async (broker: Broker) => {
   await broker.offsetFetch({ groupId: 'g', topics: [{ topic, topicId: null, partitions: [{ partition: 0, offset: '0' }] }] })
 }
 void useBrokerAdditions
+
+// Compression levels are optional and available on both the producer and direct broker API.
+const producerWithCompressionLevels = new Kafka({ brokers: ['localhost:9092'] }).producer({
+  compressionLevels: { gzip: 9, zstd: 7 },
+})
+void producerWithCompressionLevels
+declare const compressionLevelBroker: import('./index').Broker
+compressionLevelBroker.produce({
+  topicData: [], compression: CompressionTypes.GZIP, compressionLevel: 1,
+})

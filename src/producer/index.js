@@ -67,6 +67,7 @@ const DEFAULTS = Object.freeze({ linger: 5, batchSize: 16384 })
  * @param {number} [params.transactionTimeout]
  * @param {number} [params.linger=5] ms a batch waits for more records; 0 sends it at once
  * @param {number} [params.batchSize=16384] bytes of keys and values at which a batch is sent
+ * @param {{ gzip?: number, zstd?: number }} [params.compressionLevels] per-codec levels
  * @param {number} [params.deliveryTimeout] ms one send may take, retries included; past it the
  *   send rejects with `KafkaJSDeliveryTimeout`
  * @param {InstrumentationEventEmitter} [params.instrumentationEmitter]
@@ -86,6 +87,7 @@ const createProducer = ({
   linger = DEFAULTS.linger,
   batchSize = DEFAULTS.batchSize,
   deliveryTimeout,
+  compressionLevels,
   instrumentationEmitter: rootInstrumentationEmitter,
 }) => {
   let connectionStatus = CONNECTION_STATUS.DISCONNECTED
@@ -152,6 +154,7 @@ const createProducer = ({
     retrier,
     retry: retryOptions,
     deliveryTimeout,
+    compressionLevels,
     linger,
     batchSize,
     getConnectionStatus: () => connectionStatus,
@@ -270,6 +273,7 @@ const createProducer = ({
         retrier,
         retry: retryOptions,
         deliveryTimeout,
+        compressionLevels,
         linger,
         batchSize,
         eosManager: transactionalEosManager,

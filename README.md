@@ -13,7 +13,7 @@ A pure-JavaScript [Apache Kafka](https://kafka.apache.org/) client for Node.js, 
 - Producer, with idempotent and transactional modes
 - Consumer groups with pause, resume and seek
 - Message headers
-- GZIP, LZ4 and ZSTD compression built in (LZ4 needs the optional `lz4-napi` dependency); Snappy and any other codec through pluggable codecs
+- GZIP, Snappy, LZ4 and ZSTD compression built in (LZ4 needs the optional `lz4-napi` dependency); registered codecs take precedence
 - PLAINTEXT, SSL and SASL_SSL connections
 - SASL PLAIN, SCRAM-SHA-256, SCRAM-SHA-512, OAUTHBEARER and AWS IAM
 - Admin client

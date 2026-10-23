@@ -1,0 +1,13 @@
+{
+  "source": {
+    "generator": "built-in Snappy encoder; read back by GenerateSnappyVectors.java",
+    "input": "empty",
+    "length": 0
+  },
+  "hex": "82534e41505059000000000100000001",
+  "rawHex": "00",
+  "fields": {
+    "size": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  }
+}

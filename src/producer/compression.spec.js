@@ -41,22 +41,8 @@ describe('Producer', () => {
     hasLz4 = false
   }
 
-  // Snappy has no built-in codec and still requires user registration.
-  describe('snappy compression not configured', () => {
-    it('throws an error', async () => {
-      await expect(
-        producer.send({
-          topic: topicName,
-          compression: Compression.Types.Snappy,
-          messages: [{ key: secureRandom(), value: secureRandom() }],
-        })
-      ).rejects.toThrow(KafkaJSNotImplemented)
-    })
-  })
-
-  // LZ4 and ZSTD are built in — when available they must round-trip, and when the
-  // platform cannot provide them the error must still be the documented KafkaJSNotImplemented.
   const builtInCodecs = [
+    { name: 'snappy', codec: Compression.Types.Snappy, available: true },
     { name: 'lz4', codec: Compression.Types.LZ4, available: hasLz4 },
     { name: 'zstd', codec: Compression.Types.ZSTD, available: hasZstd },
   ]

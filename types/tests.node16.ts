@@ -22,6 +22,12 @@ const refused: KafkaJSCommitFailedError = new KafkaJSCommitFailedError('x', { re
 void send
 void err
 void refused
+
+// Compression levels are optional and available on both the producer and direct broker API.
+const producerWithCompressionLevels = new Kafka({ brokers: ['localhost:9092'] }).producer({
+  compressionLevels: { gzip: 9, zstd: 7 },
+})
+void producerWithCompressionLevels
 const closed: KafkaJSError = new KafkaJSConnectionClosedError('x', { host: 'localhost', port: 9092 })
 const memberIdRequired: KafkaJSError = new KafkaJSMemberIdRequired(new Error('x'), { memberId: 'm' })
 const invariant: KafkaJSError = new KafkaJSInvariantViolation('x')

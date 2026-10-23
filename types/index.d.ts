@@ -104,6 +104,10 @@ type SASLMechanismOptions<T> = T extends SASLMechanism
 export type SASLOptions = SASLMechanismOptions<SASLMechanism>
 
 export interface ProducerConfig {
+  /** Per-codec levels. Gzip: -1 or 1..9; zstd: -131072..22. Omission keeps codec defaults.
+   * LZ4 levels are unavailable in lz4-napi and are rejected, as are Snappy levels.
+   */
+  compressionLevels?: { gzip?: number; zstd?: number }
   createPartitioner?: ICustomPartitioner
   retry?: RetryOptions
   metadataMaxAge?: number
@@ -1052,6 +1056,8 @@ export type Broker = {
     acks?: number
     timeout?: number
     compression?: CompressionTypes
+    /** Optional codec level for this Produce request. */
+    compressionLevel?: number
     /**
      * With a `transactionalId`: 2 sends Produce v12, which adds the partition itself (KIP-890). A
      * request that would go out below v12, for want of a broker offer or under a lower

@@ -31,6 +31,7 @@ const producer = kafka.producer({
 | maxInFlightRequests | Max number of requests in progress per broker connection; `null` means no limit. Above 5, or `null`, is more than an idempotent producer allows — see [Idempotence](#idempotence). | `5` |
 | linger | ms a batch of one partition waits in the [accumulator](#accumulator) for records from further sends before it goes out; `0` sends it at once. An integer from 0 to 2147483647 | `5` |
 | batchSize | Bytes of message keys and values at which a batch of the [accumulator](#accumulator) goes out without waiting for `linger`. An integer of at least 1 | `16384` |
+| compressionLevels | Optional `{ gzip, zstd }` levels. Gzip: -1 or 1–9; zstd: -131072–22. LZ4 and Snappy levels are rejected. | codec defaults |
 | deliveryTimeout | Bound, in ms, on the waiting and the retries of one `send()`/`sendBatch()`. Past it the send rejects with `KafkaJSDeliveryTimeout`, its `cause` the last error; running out of `retry.retries` first still rejects with `KafkaJSNumberOfRetriesExceeded`. A request already sent settles on its answer or on `requestTimeout`, so a send can end up to `requestTimeout` after `deliveryTimeout`; the Java client fails such a batch at the deadline. An integer of at least `linger + requestTimeout` - 30005 with both defaults - and at most 2147483647. On every producer the bound runs from the moment the send is made, so it includes waiting for `linger` and, on an idempotent producer, for the producer id, as in the Java client. | unset (no deadline) |
 
 ## <a name="idempotence"></a> Idempotence
@@ -317,7 +318,9 @@ Take a look at [Retry](Configuration.md#retry) for more information.
 
 ## <a name="compression"></a> Compression
 
-GZIP, LZ4 and ZSTD are built in — no configuration needed to consume messages compressed with any of them, and producing with them only needs the codec to be available (see below). Snappy is not built in; use a codec package as described below. A codec you register yourself under `CompressionCodecs` always takes priority over a built-in one.
+GZIP, Snappy, LZ4 and ZSTD are built in — no configuration is needed to consume their compressed messages. LZ4 needs the optional `lz4-napi` dependency, and ZSTD needs support in `node:zlib`. A codec you register under `CompressionCodecs` always takes priority over a built-in one.
+
+Set optional producer levels with `kafka.producer({ compressionLevels: { gzip: 9, zstd: 7 } })`. Gzip accepts -1 (the zlib default) or 1–9; zstd accepts -131072–22. Values must be integers. Omitting a key retains the codec default. An `lz4` level is rejected because `lz4-napi` exposes no compression level; Snappy has no level. Direct broker callers may set `broker.produce({ ...request, compressionLevel: 9 })` for the selected codec.
 
 ### <a name="compression-gzip"></a> GZIP
 
@@ -340,20 +343,9 @@ The consumers know how to decompress GZIP, so no further work is necessary.
 
 ### <a name="compression-snappy"></a> Snappy
 
-Snappy support is provided by the package `kafkajs-snappy`
+Snappy is built in for both producing and consuming. It writes Kafka's xerial framing with independent 32 KiB blocks and reads both xerial streams and raw blocks. No native Snappy dependency is required.
 
-```sh
-npm install --save kafkajs-snappy
-```
-
-```javascript
-const {  CompressionTypes, CompressionCodecs } = require('@countly/kafkajs')
-const SnappyCodec = require('kafkajs-snappy')
-
-CompressionCodecs[CompressionTypes.Snappy] = SnappyCodec
-```
-
-Take a look at the official [readme](https://github.com/tulios/kafkajs-snappy) for more information
+Remove the `kafkajs-snappy` registration to use the built-in codec, or keep it: yours wins. The built-in codec runs on the main thread, yielding to the event loop after 256 KiB of work or 4,096 blocks and tokens. Reference throughput is about 100 MiB/s to decode and 40 MiB/s to encode; measure your payload and host.
 
 ### <a name="compression-lz4"></a> LZ4
 

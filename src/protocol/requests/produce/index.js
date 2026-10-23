@@ -1,5 +1,14 @@
 const versions = {
-  3: ({ acks, timeout, compression, topicData, transactionalId, producerId, producerEpoch }) => {
+  3: ({
+    acks,
+    timeout,
+    compression,
+    compressionLevel,
+    topicData,
+    transactionalId,
+    producerId,
+    producerEpoch,
+  }) => {
     const request = require('./v3/request')
     const response = require('./v3/response')
     return {
@@ -7,6 +16,7 @@ const versions = {
         acks,
         timeout,
         compression,
+        compressionLevel,
         topicData,
         transactionalId,
         producerId,
@@ -15,7 +25,16 @@ const versions = {
       response,
     }
   },
-  4: ({ acks, timeout, compression, topicData, transactionalId, producerId, producerEpoch }) => {
+  4: ({
+    acks,
+    timeout,
+    compression,
+    compressionLevel,
+    topicData,
+    transactionalId,
+    producerId,
+    producerEpoch,
+  }) => {
     const request = require('./v4/request')
     const response = require('./v4/response')
     return {
@@ -23,6 +42,7 @@ const versions = {
         acks,
         timeout,
         compression,
+        compressionLevel,
         topicData,
         transactionalId,
         producerId,
@@ -31,7 +51,16 @@ const versions = {
       response,
     }
   },
-  5: ({ acks, timeout, compression, topicData, transactionalId, producerId, producerEpoch }) => {
+  5: ({
+    acks,
+    timeout,
+    compression,
+    compressionLevel,
+    topicData,
+    transactionalId,
+    producerId,
+    producerEpoch,
+  }) => {
     const request = require('./v5/request')
     const response = require('./v5/response')
     return {
@@ -39,6 +68,7 @@ const versions = {
         acks,
         timeout,
         compression,
+        compressionLevel,
         topicData,
         transactionalId,
         producerId,
@@ -47,7 +77,16 @@ const versions = {
       response,
     }
   },
-  6: ({ acks, timeout, compression, topicData, transactionalId, producerId, producerEpoch }) => {
+  6: ({
+    acks,
+    timeout,
+    compression,
+    compressionLevel,
+    topicData,
+    transactionalId,
+    producerId,
+    producerEpoch,
+  }) => {
     const request = require('./v6/request')
     const response = require('./v6/response')
     return {
@@ -55,6 +94,7 @@ const versions = {
         acks,
         timeout,
         compression,
+        compressionLevel,
         topicData,
         transactionalId,
         producerId,
@@ -63,7 +103,16 @@ const versions = {
       response,
     }
   },
-  7: ({ acks, timeout, compression, topicData, transactionalId, producerId, producerEpoch }) => {
+  7: ({
+    acks,
+    timeout,
+    compression,
+    compressionLevel,
+    topicData,
+    transactionalId,
+    producerId,
+    producerEpoch,
+  }) => {
     const request = require('./v7/request')
     const response = require('./v7/response')
     return {
@@ -71,6 +120,7 @@ const versions = {
         acks,
         timeout,
         compression,
+        compressionLevel,
         topicData,
         transactionalId,
         producerId,
@@ -79,7 +129,16 @@ const versions = {
       response,
     }
   },
-  8: ({ acks, timeout, compression, topicData, transactionalId, producerId, producerEpoch }) => {
+  8: ({
+    acks,
+    timeout,
+    compression,
+    compressionLevel,
+    topicData,
+    transactionalId,
+    producerId,
+    producerEpoch,
+  }) => {
     const request = require('./v8/request')
     const response = require('./v8/response')
     return {
@@ -87,6 +146,7 @@ const versions = {
         acks,
         timeout,
         compression,
+        compressionLevel,
         topicData,
         transactionalId,
         producerId,
@@ -95,7 +155,16 @@ const versions = {
       response,
     }
   },
-  9: ({ acks, timeout, compression, topicData, transactionalId, producerId, producerEpoch }) => {
+  9: ({
+    acks,
+    timeout,
+    compression,
+    compressionLevel,
+    topicData,
+    transactionalId,
+    producerId,
+    producerEpoch,
+  }) => {
     const request = require('./v9/request')
     const response = require('./v9/response')
     return {
@@ -103,6 +172,7 @@ const versions = {
         acks,
         timeout,
         compression,
+        compressionLevel,
         topicData,
         transactionalId,
         producerId,
@@ -111,7 +181,16 @@ const versions = {
       response,
     }
   },
-  10: ({ acks, timeout, compression, topicData, transactionalId, producerId, producerEpoch }) => {
+  10: ({
+    acks,
+    timeout,
+    compression,
+    compressionLevel,
+    topicData,
+    transactionalId,
+    producerId,
+    producerEpoch,
+  }) => {
     const request = require('./v10/request')
     const response = require('./v10/response')
     return {
@@ -119,6 +198,7 @@ const versions = {
         acks,
         timeout,
         compression,
+        compressionLevel,
         topicData,
         transactionalId,
         producerId,
@@ -127,7 +207,16 @@ const versions = {
       response,
     }
   },
-  11: ({ acks, timeout, compression, topicData, transactionalId, producerId, producerEpoch }) => {
+  11: ({
+    acks,
+    timeout,
+    compression,
+    compressionLevel,
+    topicData,
+    transactionalId,
+    producerId,
+    producerEpoch,
+  }) => {
     const request = require('./v11/request')
     const response = require('./v11/response')
     return {
@@ -135,6 +224,7 @@ const versions = {
         acks,
         timeout,
         compression,
+        compressionLevel,
         topicData,
         transactionalId,
         producerId,
@@ -143,7 +233,16 @@ const versions = {
       response,
     }
   },
-  12: ({ acks, timeout, compression, topicData, transactionalId, producerId, producerEpoch }) => {
+  12: ({
+    acks,
+    timeout,
+    compression,
+    compressionLevel,
+    topicData,
+    transactionalId,
+    producerId,
+    producerEpoch,
+  }) => {
     const request = require('./v12/request')
     const response = require('./v12/response')
     return {
@@ -151,6 +250,7 @@ const versions = {
         acks,
         timeout,
         compression,
+        compressionLevel,
         topicData,
         transactionalId,
         producerId,
@@ -163,6 +263,7 @@ const versions = {
     acks,
     timeout,
     compression,
+    compressionLevel,
     topicData,
     topicIds,
     topicNames,
@@ -177,6 +278,7 @@ const versions = {
         acks,
         timeout,
         compression,
+        compressionLevel,
         topicData,
         topicIds,
         transactionalId,

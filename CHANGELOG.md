@@ -5,6 +5,23 @@ Versions before 3.0.0 are internal alpha tags and are not published.
 
 ## Unreleased — 3.0.0
 
+### Phase 9B — Producer parity: delivery deadline, memory bound, request size, partitioner, codecs, lifecycle
+
+#### Behavior changes
+
+- **Snappy is built in** (decode and encode, Kafka's xerial framing) instead of throwing `KafkaJSNotImplemented`. A codec you register at `CompressionCodecs[CompressionTypes.Snappy]` still takes precedence
+
+#### Fixes
+
+#### Additions
+
+- Producers accept optional `compressionLevels: { gzip, zstd }` and direct broker Produce requests accept `compressionLevel`. Codec defaults are unchanged. LZ4 levels are unavailable in `lz4-napi` and are rejected.
+
+#### Tooling
+
+- Add independent Java Snappy vectors, Java read-back artifacts and a codec throughput, memory and event-loop benchmark.
+
+
 ### Phase 1 — foundation
 - Package renamed to `@countly/kafkajs`; strict `exports` map (`src/**` no longer importable) and ESM entry `index.mjs`.
 - Node.js 22+ required; Jest 30; TypeScript 5 for the type tests.

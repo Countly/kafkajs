@@ -29,6 +29,7 @@ const buildRecordBatch = require('../buildRecordBatch')
  * @param acks {number} see producer request v0
  * @param timeout {number} see producer request v0
  * @param [compression=CompressionTypes.None] {CompressionTypes}
+ * @param [compressionLevel] {number} optional codec level
  * @param topicData {Array}
  */
 module.exports = ({
@@ -38,6 +39,7 @@ module.exports = ({
   producerId = Long.fromInt(-1),
   producerEpoch = 0,
   compression = Types.None,
+  compressionLevel,
   topicData,
 }) => ({
   apiKey,
@@ -45,7 +47,7 @@ module.exports = ({
   apiName: 'Produce',
   expectResponse: () => acks !== 0,
   encode: async () => {
-    const encodeTopic = topicEncoder(compression)
+    const encodeTopic = topicEncoder(compression, compressionLevel)
     const encodedTopicData = []
 
     for (const data of topicData) {
@@ -64,9 +66,9 @@ module.exports = ({
 })
 
 const topicEncoder =
-  (compression) =>
+  (compression, compressionLevel) =>
   async ({ topic, partitions, transactionalId, producerId, producerEpoch }) => {
-    const encodePartitions = partitionsEncoder(compression)
+    const encodePartitions = partitionsEncoder(compression, compressionLevel)
     const encodedPartitions = []
 
     for (const data of partitions) {
@@ -82,10 +84,11 @@ const topicEncoder =
   }
 
 const partitionsEncoder =
-  (compression) =>
+  (compression, compressionLevel) =>
   async ({ partition, messages, transactionalId, firstSequence, producerId, producerEpoch }) => {
     const recordBatch = await buildRecordBatch({
       compression,
+      compressionLevel,
       messages,
       transactionalId,
       firstSequence,
