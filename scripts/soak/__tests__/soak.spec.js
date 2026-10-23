@@ -673,6 +673,15 @@ describe('Soak > workloads disconnect every client they built', () => {
 })
 
 describe('Soak > a run on the scripted cluster', () => {
+  // Another spec in this Jest worker may have exposed gc process-wide; these runs read no heap.
+  const exposedGc = globalThis.gc
+  beforeEach(() => {
+    if (exposedGc) globalThis.gc = undefined
+  })
+  afterEach(() => {
+    if (exposedGc) globalThis.gc = exposedGc
+  })
+
   const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
 
   /** Closes a fake socket the way a real one ends: `end()` leads to its destruction. */
