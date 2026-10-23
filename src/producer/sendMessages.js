@@ -10,6 +10,7 @@ const {
   KafkaJSNumberOfRetriesExceeded,
   KafkaJSTransactionAbortableError,
   KafkaJSRecordTooLargeError,
+  KafkaJSProducerClosedError,
 } = require('../errors')
 const { staleMetadata } = require('../protocol/error')
 const { RETRIABLE_CATEGORIES } = require('../protocol/errorCategories')
@@ -309,12 +310,15 @@ class ProduceAttempt {
    * @param {() => string} getConnectionStatus producer connection status
    * @param {(delivery: Delivery) => void} expire settles a due delivery synchronously; the drain
    *   loop's also settles every other due delivery
+   * @param {number} [maxRequestSize=Infinity] cap checked at transmission
+   * @param {import('./generation')} [generation] captured lifecycle; never recaptured
    */
-  constructor(deliveries, getConnectionStatus, expire, maxRequestSize = Infinity) {
+  constructor(deliveries, getConnectionStatus, expire, maxRequestSize = Infinity, generation) {
     this.deliveries = deliveries.slice()
     this.getConnectionStatus = getConnectionStatus
     this.expire = expire
     this.maxRequestSize = maxRequestSize
+    this.generation = generation
     this.written = false
     this.revoked = false
     for (const delivery of this.deliveries) delivery.currentAttempt = this
@@ -333,6 +337,8 @@ class ProduceAttempt {
    */
   guard = (frameLength) => {
     if (this.revoked) return new ProduceAttemptRefused('The Produce attempt was revoked')
+    const closed = this.generation?.guard()
+    if (closed) return closed
     const statusError = connectionStatusError(this.getConnectionStatus())
     if (statusError) return statusError
     if (frameLength === undefined) return null
@@ -527,6 +533,14 @@ const RESOLVED = Promise.resolve()
 const ignore = () => {}
 
 /**
+ * A producer lifecycle as the trailing argument of a cluster call, or no argument at all: a call
+ * with no lifecycle keeps the shape it always had.
+ * @param {import('./generation')} [fence]
+ * @returns {[{ fence: import('./generation') }]|[]}
+ */
+const fenceArgs = (fence) => (fence ? [{ fence }] : [])
+
+/**
  * The idempotent send path: per-partition batches queued in the producer's `ProducerStateManager`
  * and drained to their leaders, a Produce request per broker and options triple, until every send
  * has settled.
@@ -559,6 +573,7 @@ class DrainLoop {
   #compressionLevels
   #getConnectionStatus
   #budget
+  #generation
   /** @type {Set<Send>} */
   #sends = new Set()
   /** @type {Map<string, Map<number, Fifo<Delivery>>>} every partition's live batches, by enqueue order */
@@ -594,6 +609,7 @@ class DrainLoop {
    * @param {() => string} options.getConnectionStatus
    * @param {RequestBudget} [options.budget] the request-size plan of each request it drains, and
    *   the `maxRequestSize` its frames are refused above
+   * @param {import('./generation')} [options.generation] this loop's captured lifecycle
    */
   constructor({
     logger,
@@ -604,6 +620,7 @@ class DrainLoop {
     compressionLevels,
     getConnectionStatus,
     budget = new RequestBudget(),
+    generation,
   }) {
     this.#logger = logger
     this.#cluster = cluster
@@ -614,7 +631,30 @@ class DrainLoop {
     this.#deadlineMs = deliveryTimeout ?? retry.maxTotalTime
     this.#getConnectionStatus = getConnectionStatus
     this.#budget = budget
+    this.#generation = generation
     this.#expiry = new ExpiryTimer(this.#expireDue)
+  }
+
+  /**
+   * Settles every retained child before applying any forced-close consequence.
+   * Outstanding requests keep their ownership until their terminal callbacks.
+   * @returns {void}
+   */
+  forceClose() {
+    for (const partitions of this.#queues.values()) {
+      for (const queue of partitions.values()) {
+        for (const delivery of queue) {
+          this.#expire(
+            delivery,
+            new KafkaJSProducerClosedError('The producer was closed', {
+              outcome: delivery.everWritten ? 'unknown' : 'unsent',
+            })
+          )
+        }
+      }
+    }
+    this.#settleDue(-Infinity)
+    this.#kick()
   }
 
   /**
@@ -847,6 +887,7 @@ class DrainLoop {
    */
   async #pass() {
     const manager = this.#eosManager.stateManager
+    if (this.#generation?.closed) return
     this.#wakeAt = Infinity
     if (this.#abandonIfNotConnected(manager)) {
       return
@@ -1113,7 +1154,8 @@ class DrainLoop {
       batches.map(deliveryOf),
       this.#getConnectionStatus,
       () => this.#expireDue(Date.now()),
-      this.#budget.maxRequestSize
+      this.#budget.maxRequestSize,
+      this.#generation
     )
     for (const batch of batches) {
       deliveryOf(batch).dispatched = true
@@ -1146,7 +1188,10 @@ class DrainLoop {
   async #handOff(nodeId, batches, attempt) {
     const refusal = attempt.guard()
     if (refusal) throw refusal
-    const broker = await this.#cluster.findBroker({ nodeId })
+    const broker = await this.#cluster.findBroker({
+      nodeId,
+      ...(this.#generation ? { fence: this.#generation } : {}),
+    })
     const refused = attempt.guard()
     if (refused) throw refused
     const [{ acks, timeout, compression, producerId, producerEpoch }] = batches
@@ -1206,6 +1251,14 @@ class DrainLoop {
    */
   #answered(nodeId, batches, answer) {
     this.#answeredBy(nodeId)
+    if (this.#generation?.closed) {
+      for (const batch of batches) {
+        const delivery = deliveryOf(batch)
+        delivery.dispatched = false
+        delivery.retire()
+      }
+      return
+    }
     const manager = this.#eosManager.stateManager
     const results = Array.isArray(answer) ? answer : []
     for (const batch of batches) {
@@ -1248,6 +1301,14 @@ class DrainLoop {
    */
   #rejected(nodeId, batches, error) {
     this.#answeredBy(nodeId)
+    if (this.#generation?.closed) {
+      for (const batch of batches) {
+        const delivery = deliveryOf(batch)
+        delivery.dispatched = false
+        delivery.retire()
+      }
+      return
+    }
     const manager = this.#eosManager.stateManager
     for (const batch of batches) {
       deliveryOf(batch).dispatched = false
@@ -1361,6 +1422,7 @@ class DrainLoop {
    * @returns {void}
    */
   #sideChannels(e) {
+    if (this.#generation?.closed) return
     if (e.name === 'KafkaJSConnectionClosedError') {
       this.#cluster.removeBroker({ host: e.host, port: e.port, source: failureSourceOf(e) })
     }
@@ -1368,13 +1430,16 @@ class DrainLoop {
     if (e.currentLeader) {
       this.#hints.push(
         Promise.resolve(
-          this.#cluster.applyLeaderHint({
-            topic: e.topic,
-            partition: e.partition,
-            leaderId: e.currentLeader.leaderId,
-            leaderEpoch: e.currentLeader.leaderEpoch,
-            nodeEndpoints: e.nodeEndpoints,
-          })
+          this.#cluster.applyLeaderHint(
+            {
+              topic: e.topic,
+              partition: e.partition,
+              leaderId: e.currentLeader.leaderId,
+              leaderEpoch: e.currentLeader.leaderEpoch,
+              nodeEndpoints: e.nodeEndpoints,
+            },
+            ...fenceArgs(this.#generation)
+          )
         ).catch((hintError) => {
           this.#logger.debug(`Best-effort leader hint application failed: ${hintError.message}`)
         })
@@ -1451,12 +1516,13 @@ class DrainLoop {
    * delivery stays, and ignores that second call (see `Delivery#reject`). An attempt of the batch
    * that has not written is revoked; one on the wire keeps its request until its terminal callback.
    * @param {Delivery} delivery
+   * @param {KafkaJSProducerClosedError} [closedError] this child's forced outcome
    * @returns {void}
    */
-  #expire(delivery) {
+  #expire(delivery, closedError) {
     if (delivery.settled) return
     delivery.currentAttempt?.revoke()
-    const error = this.#timedOut(delivery.batch, delivery.lastError)
+    const error = closedError || this.#timedOut(delivery.batch, delivery.lastError)
     this.#expired.push({ batch: delivery.batch, error, transmitted: delivery.everWritten })
     delivery.expired = true
     rejectBatch(delivery.batch, error)
@@ -1543,6 +1609,7 @@ class DrainLoop {
    * @returns {boolean} true when the producer is not connected
    */
   #abandonIfNotConnected(manager) {
+    if (this.#generation?.closed) return true
     const statusError = connectionStatusError(this.#getConnectionStatus())
     if (statusError !== null) {
       this.#abandonQueued(manager, statusError)
@@ -1557,16 +1624,17 @@ class DrainLoop {
    * @returns {Promise<void>}
    */
   async #refreshMetadata() {
-    const connected = () => connectionStatusError(this.#getConnectionStatus()) === null
+    const connected = () =>
+      !this.#generation?.closed && connectionStatusError(this.#getConnectionStatus()) === null
     try {
       if (!connected()) {
         return
       }
       if (!this.#cluster.isConnected()) {
-        await this.#cluster.connect()
+        await this.#cluster.connect(...fenceArgs(this.#generation))
       }
       if (connected()) {
-        await this.#cluster.refreshMetadata()
+        await this.#cluster.refreshMetadata(...fenceArgs(this.#generation))
       }
     } catch (e) {
       this.#logger.debug(`Best-effort metadata refresh failed: ${e.message}`)
@@ -1596,7 +1664,8 @@ class DrainLoop {
  * @param {() => string} [options.getConnectionStatus] the producer's connection status
  * @param {RequestBudget} [options.budget] the producer's request-size plan: both send paths keep
  *   each request within it, and refuse a frame above its `maxRequestSize` before writing it
- * @returns {{ sendPartitioned: Function, partition: Function, inTransaction: Function }} the
+ * @param {() => import('./generation')|undefined} [options.getGeneration] current lifecycle
+ * @returns {{ sendPartitioned: Function, partition: Function, forceClose: Function, inTransaction: Function }} the
  *   `inTransaction` of a send that settled before it reached the send path arms the transaction
  */
 const createSendMessages = ({
@@ -1611,9 +1680,12 @@ const createSendMessages = ({
   compressionLevels,
   getConnectionStatus,
   budget = new RequestBudget(),
+  getGeneration = () => undefined,
 }) => {
   const isIdempotent = () => idempotence !== undefined && idempotence.isEnabled()
   let loop = null
+  let loopGeneration
+  const plainForces = new Set()
 
   /**
    * The error a transactional send whose records could not be assigned to partitions rejects
@@ -1644,10 +1716,14 @@ const createSendMessages = ({
    * @param {(error: Error) => void} bail the retrier's bail
    * @param {number} retryCount
    * @param {number} retryTime
+   * @param {import('./generation')} [generation] the producer lifecycle the call began under:
+   *   once it closes nothing is dropped, reconnected or refreshed
    * @returns {Promise<never>} rethrows `e` for the retrier, or bails with it when it is not
    *   retriable
+   * @throws {Error} the lifecycle's close error
    */
-  const recover = async (e, bail, retryCount, retryTime) => {
+  const recover = async (e, bail, retryCount, retryTime, generation) => {
+    generation?.check()
     if (e.name === 'KafkaJSConnectionClosedError') {
       cluster.removeBroker({ host: e.host, port: e.port, source: failureSourceOf(e) })
     }
@@ -1661,18 +1737,22 @@ const createSendMessages = ({
     // below.
     if (e.name === 'KafkaJSProtocolError' && e.currentLeader) {
       await cluster
-        .applyLeaderHint({
-          topic: e.topic,
-          partition: e.partition,
-          leaderId: e.currentLeader.leaderId,
-          leaderEpoch: e.currentLeader.leaderEpoch,
-          nodeEndpoints: e.nodeEndpoints,
-        })
+        .applyLeaderHint(
+          {
+            topic: e.topic,
+            partition: e.partition,
+            leaderId: e.currentLeader.leaderId,
+            leaderEpoch: e.currentLeader.leaderEpoch,
+            nodeEndpoints: e.nodeEndpoints,
+          },
+          ...fenceArgs(generation)
+        )
         .catch((hintError) => {
           logger.debug(
             `Best-effort leader hint application failed, continuing with the original error: ${hintError.message}`
           )
         })
+      generation?.check()
     }
 
     if (!cluster.isConnected()) {
@@ -1685,16 +1765,20 @@ const createSendMessages = ({
       // step (e.g. still unreachable) must not turn `e` into a different error class and
       // strip its `retryCount`/`retryTime` on its way to the `throw` below. `Promise.resolve`
       // tolerates a test double that returns `undefined` instead of a promise.
-      await Promise.resolve(cluster.connect()).catch((connectError) => {
+      await Promise.resolve(cluster.connect(...fenceArgs(generation))).catch((connectError) => {
         logger.debug(
           `Best-effort reconnect failed, continuing with the original error: ${connectError.message}`
         )
       })
-      await Promise.resolve(cluster.refreshMetadata()).catch((refreshError) => {
-        logger.debug(
-          `Best-effort metadata refresh failed, continuing with the original error: ${refreshError.message}`
-        )
-      })
+      generation?.check()
+      await Promise.resolve(cluster.refreshMetadata(...fenceArgs(generation))).catch(
+        (refreshError) => {
+          logger.debug(
+            `Best-effort metadata refresh failed, continuing with the original error: ${refreshError.message}`
+          )
+        }
+      )
+      generation?.check()
       throw e
     }
 
@@ -1706,11 +1790,14 @@ const createSendMessages = ({
       // must not replace the retriable send error (e.g. NOT_LEADER_FOR_PARTITION) with a
       // non-retriable one and short-circuit the retry a leader election would otherwise let
       // through.
-      await Promise.resolve(cluster.refreshMetadata()).catch((refreshError) => {
-        logger.debug(
-          `Best-effort metadata refresh failed, continuing with the original error: ${refreshError.message}`
-        )
-      })
+      await Promise.resolve(cluster.refreshMetadata(...fenceArgs(generation))).catch(
+        (refreshError) => {
+          logger.debug(
+            `Best-effort metadata refresh failed, continuing with the original error: ${refreshError.message}`
+          )
+        }
+      )
+      generation?.check()
       throw e
     }
 
@@ -1751,12 +1838,14 @@ const createSendMessages = ({
    * stepped expiry timer. A capped segment must not end the send early. With no deadline, the
    * producer's own retrier is used.
    * @param {{ deadline?: import('./deadline').Deadline }} send
+   * @param {import('./generation')} [fence] the producer lifecycle the wait began under: its close
+   *   ends the retries at once, with its close error
    * @returns {import('../retry').Retrier}
    * @throws {KafkaJSDeliveryTimeout} when no time is left: a retrier is never built for zero
    */
-  const retrierOf = ({ deadline }) => {
+  const retrierOf = ({ deadline }, fence) => {
     if (deadline === undefined || deadline.dueAt === Infinity) {
-      return retrier
+      return fence ? createRetry({ ...retry, fence }) : retrier
     }
 
     const remaining = deadline.remaining()
@@ -1770,6 +1859,7 @@ const createSendMessages = ({
     return createRetry({
       ...retry,
       maxTotalTime: remaining > MAX_DELAY ? null : remaining,
+      ...(fence ? { fence } : {}),
     })
   }
 
@@ -1800,15 +1890,25 @@ const createSendMessages = ({
    * @param {{ records: ?object[], deadline?: import('./deadline').Deadline }|object[]} source a
    *   send waiting to be partitioned (see the accumulator's `PendingSend`), or a plain list of
    *   `{ topic, messages }` for a caller with no deadline
+   * @param {import('./generation')} [fence] the producer lifecycle the caller captured before its
+   *   first await; the current one when absent. Once it closes the retries stop and no metadata
+   *   is asked for. A send that is pinned stays pinned until the retry callback itself returns,
+   *   whether or not its caller was cancelled.
    * @returns {Promise<{ topic: string, partition: number, messages: object[] }[]>}
    */
-  const partition = (source) => {
+  const partition = (source, fence = getGeneration()) => {
     const send = Array.isArray(source) ? { records: source } : source
-    return retrierOf(send)(async (bail) => {
+    const attempt = async (bail) => {
       try {
-        await cluster.addMultipleTargetTopics(recordsOf(send).map(({ topic }) => topic))
+        fence?.check()
+        await cluster.addMultipleTargetTopics(
+          recordsOf(send).map(({ topic }) => topic),
+          ...fenceArgs(fence)
+        )
+        fence?.check()
         recordsOf(send)
-        await cluster.refreshMetadataIfNecessary()
+        await cluster.refreshMetadataIfNecessary(...fenceArgs(fence))
+        fence?.check()
 
         const entries = []
         for (const { topic, messages } of recordsOf(send)) {
@@ -1830,17 +1930,32 @@ const createSendMessages = ({
         return entries
       } catch (e) {
         if (send.settled) return bail(e)
+        fence?.check()
         if (refreshesMetadata(e)) {
-          await Promise.resolve(cluster.refreshMetadata()).catch((refreshError) => {
-            logger.debug(`Best-effort metadata refresh failed: ${refreshError.message}`)
-          })
+          await Promise.resolve(cluster.refreshMetadata(...fenceArgs(fence))).catch(
+            (refreshError) => {
+              logger.debug(`Best-effort metadata refresh failed: ${refreshError.message}`)
+            }
+          )
         }
         if (send.settled) return bail(e)
+        fence?.check()
         if (e.retriable) throw e
         bail(e)
       }
-    }).catch((error) => {
-      throw send.settled ? error : inTransaction(error)
+    }
+    const pinned =
+      fence && send.pin
+        ? (bail) => {
+            send.pin()
+            return attempt(bail).finally(() => send.unpin())
+          }
+        : attempt
+    return retrierOf(
+      send,
+      fence
+    )(pinned).catch((error) => {
+      throw send.settled || fence?.closed ? error : inTransaction(error)
     })
   }
 
@@ -1880,9 +1995,10 @@ const createSendMessages = ({
       throw new KafkaJSInvariantViolation(`An idempotent send must use acks -1, not ${acks}`)
     }
 
-    loop =
-      loop ||
-      new DrainLoop({
+    const generation = getGeneration()
+    if (loop === null || loopGeneration !== generation) {
+      loopGeneration = generation
+      loop = new DrainLoop({
         logger,
         cluster,
         eosManager,
@@ -1891,7 +2007,9 @@ const createSendMessages = ({
         compressionLevels,
         getConnectionStatus,
         budget,
+        generation,
       })
+    }
     return loop.send({ acks, timeout, compression, batches })
   }
 
@@ -1948,6 +2066,9 @@ const createSendMessages = ({
    *   rejects with the first error a batch failed with
    */
   const sendPartitionedPlain = ({ acks, timeout, compression, batches }) => {
+    const generation = getGeneration()
+    let callbacks = 0
+    let workEnded = false
     const unsettled = new Set(batches)
     /** Every batch of the call in partition order: a cut batch's first half goes before it. */
     const order = [...batches]
@@ -1968,6 +2089,7 @@ const createSendMessages = ({
     }
     /** Retires every batch of the call, once nothing of the call holds them. @returns {void} */
     const retireAll = () => {
+      if (!workEnded || callbacks !== 0) return
       for (const batch of deliveries.keys()) batch.retire?.()
     }
     /**
@@ -2034,22 +2156,44 @@ const createSendMessages = ({
       else timer.arm(delivery.deadline)
     }
 
+    /** Settles every live leaf, including children cut after hand-off. @returns {void} */
+    const force = () => {
+      for (const batch of order) {
+        const delivery = deliveries.get(batch)
+        settle(
+          batch,
+          undefined,
+          new KafkaJSProducerClosedError('The producer was closed', {
+            outcome: delivery.everWritten ? 'unknown' : 'unsent',
+          })
+        )
+      }
+    }
+    plainForces.add(force)
+    const forgetForce = () => plainForces.delete(force)
+    done.then(forgetForce, forgetForce)
+
     /** Routing side effects also apply to late errors. @param {Error} error @returns {Promise<void>} */
     const sideChannels = async (error) => {
+      if (generation?.closed) return
       if (error.name === 'KafkaJSConnectionClosedError')
         cluster.removeBroker({ host: error.host, port: error.port, source: failureSourceOf(error) })
       if (error.currentLeader) {
         await Promise.resolve(
-          cluster.applyLeaderHint({
-            topic: error.topic,
-            partition: error.partition,
-            leaderId: error.currentLeader.leaderId,
-            leaderEpoch: error.currentLeader.leaderEpoch,
-            nodeEndpoints: error.nodeEndpoints,
-          })
+          cluster.applyLeaderHint(
+            {
+              topic: error.topic,
+              partition: error.partition,
+              leaderId: error.currentLeader.leaderId,
+              leaderEpoch: error.currentLeader.leaderEpoch,
+              nodeEndpoints: error.nodeEndpoints,
+            },
+            ...fenceArgs(generation)
+          )
         ).catch(() => {})
       }
-      if (refreshesMetadata(error)) await Promise.resolve(cluster.refreshMetadata()).catch(() => {})
+      if (!generation?.closed && refreshesMetadata(error))
+        await Promise.resolve(cluster.refreshMetadata(...fenceArgs(generation))).catch(() => {})
     }
 
     /**
@@ -2195,7 +2339,8 @@ const createSendMessages = ({
         carried,
         getConnectionStatus || (() => CONNECTION_STATUS.CONNECTED),
         expire,
-        budget.maxRequestSize
+        budget.maxRequestSize,
+        generation
       )
       /** The request ended: a batch that settled meanwhile detaches now. @returns {void} */
       const ended = () => {
@@ -2214,6 +2359,7 @@ const createSendMessages = ({
         const refused = error instanceof ProduceAttemptRefused
         if (!refused) attachFailingRecords(error, topicDataOf(sent))
         ended()
+        if (generation?.closed) return null
         if (error instanceof ProduceAttemptTooLarge) repartition(sent, error)
         if (refused) return error
         for (const delivery of carried) delivery.lastError = error
@@ -2226,6 +2372,7 @@ const createSendMessages = ({
         return null
       }
       ended()
+      if (generation?.closed) return null
       if (acks === 0) {
         sent.forEach((batch) => settle(batch, undefined))
         return null
@@ -2271,19 +2418,26 @@ const createSendMessages = ({
       // guard enforce the absolute deadline, and a capped budget would end the delivery early.
       const handOffRetrier =
         remaining === Infinity
-          ? retrier
+          ? generation
+            ? createRetry({ ...retry, fence: generation })
+            : retrier
           : createRetry({
               ...retry,
               maxTotalTime: remaining > MAX_DELAY ? null : Math.max(1, remaining),
+              ...(generation ? { fence: generation } : {}),
             })
       try {
-        await handOffRetrier(async (bail, retryCount, retryTime) => {
+        const run = async (bail, retryCount, retryTime) => {
+          generation?.check()
           while (unsettled.size > 0) {
             const topics = [...new Set([...unsettled].map(({ topic }) => topic))]
-            await cluster.addMultipleTargetTopics(topics)
+            generation?.check()
+            await cluster.addMultipleTargetTopics(topics, ...fenceArgs(generation))
+            generation?.check()
             if (unsettled.size === 0) return
             try {
-              await cluster.refreshMetadataIfNecessary()
+              await cluster.refreshMetadataIfNecessary(...fenceArgs(generation))
+              generation?.check()
               if (unsettled.size === 0) return
               const left = []
               const perBroker = new Map()
@@ -2322,7 +2476,11 @@ const createSendMessages = ({
                   )
                   let broker
                   try {
-                    broker = await cluster.findBroker({ nodeId })
+                    broker = await cluster.findBroker({
+                      nodeId,
+                      ...(generation ? { fence: generation } : {}),
+                    })
+                    generation?.check()
                   } catch (error) {
                     leave(candidates, error)
                     continue
@@ -2351,11 +2509,24 @@ const createSendMessages = ({
                 await sideChannels(error)
                 return
               }
-              await recover(error, bail, retryCount, retryTime)
+              generation?.check()
+              await recover(error, bail, retryCount, retryTime, generation)
+              generation?.check()
             }
           }
+        }
+        await handOffRetrier((...args) => {
+          callbacks += 1
+          return run(...args).finally(() => {
+            callbacks -= 1
+            retireAll()
+          })
         })
       } catch (error) {
+        if (generation?.closed) {
+          force()
+          return
+        }
         for (const batch of [...unsettled]) {
           const delivery = deliveries.get(batch)
           settle(
@@ -2378,15 +2549,25 @@ const createSendMessages = ({
         .catch((error) => {
           for (const batch of [...unsettled]) settle(batch, undefined, error)
         })
-        .finally(retireAll)
+        .finally(() => {
+          workEnded = true
+          retireAll()
+        })
     else {
       finish()
+      workEnded = true
       retireAll()
     }
     return done
   }
 
-  return { sendPartitioned, partition, inTransaction }
+  /** Forces current deliveries; a later lifecycle gets its own loop. @returns {void} */
+  const forceClose = () => {
+    loop?.forceClose()
+    for (const force of [...plainForces]) force()
+  }
+
+  return { sendPartitioned, partition, inTransaction, forceClose }
 }
 
 createSendMessages.connectionStatusError = connectionStatusError

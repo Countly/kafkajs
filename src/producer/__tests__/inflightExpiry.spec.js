@@ -143,7 +143,19 @@ describe('Produce write-boundary expiry', () => {
     await jest.advanceTimersByTimeAsync(2000)
     if (completion) await completion
     await until(() => jest.getTimerCount() === 0)
-    if (producer) await producer.disconnect()
+    if (producer) {
+      // An open transaction is aborted at close, which waits for its retries.
+      let closed = false
+      const closing = producer.disconnect().finally(() => {
+        closed = true
+      })
+      // eslint-disable-next-line no-unmodified-loop-condition -- the close sets it while the loop awaits
+      for (let i = 0; i < 200 && !closed; i += 1) {
+        await jest.advanceTimersByTimeAsync(10)
+        await new Promise((resolve) => setImmediate(resolve))
+      }
+      await closing
+    }
     if (cluster) cluster.assertClean()
     CompressionCodecs[CompressionTypes.GZIP] = savedCodec
     jest.restoreAllMocks()

@@ -760,7 +760,25 @@ const isPollIntervalExceeded = (e) => e.type === 'POLL_INTERVAL_EXCEEDED'
 
 const isKafkaJSError = (e) => e instanceof KafkaJSError
 
+/** A producer operation ended locally at forced shutdown, without a remote outcome claim. */
+class KafkaJSProducerClosedError extends KafkaJSNonRetriableError {
+  /**
+   * @param {string|Error} message local shutdown reason
+   * @param {{outcome: 'unsent'|'unknown', cause?: Error}} options transmission evidence
+   * @throws {TypeError} when the required transmission outcome is invalid
+   */
+  constructor(message, { outcome, cause } = {}) {
+    super(message, { cause })
+    if (outcome !== 'unsent' && outcome !== 'unknown')
+      throw new TypeError('A producer close outcome is required')
+    this.name = 'KafkaJSProducerClosedError'
+    this.outcome = outcome
+    this.category = 'abortable'
+  }
+}
+
 module.exports = {
+  KafkaJSProducerClosedError,
   KafkaJSError,
   KafkaJSNonRetriableError,
   KafkaJSPartialMessageError,

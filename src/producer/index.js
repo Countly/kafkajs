@@ -1,4 +1,6 @@
+const { inspect } = require('util')
 const createRetry = require('../retry')
+const Generation = require('./generation')
 const { MAX_DELAY } = require('./deadline')
 const { CONNECTION_STATUS } = require('../network/connectionStatus')
 const { UniformStickyPartitioner } = require('./partitioners/')
@@ -13,9 +15,16 @@ const { events, wrap: wrapEvent, unwrap: unwrapEvent } = require('./instrumentat
 const {
   KafkaJSNonRetriableError,
   KafkaJSInvalidConfigurationError,
+  KafkaJSProducerClosedError,
+  KafkaJSTimeout,
   KafkaJSTransactionAbortableError,
 } = require('../errors')
-const { IN_TRANSACTION, isArmed } = require('./eosManager/transactionStates')
+const {
+  IN_TRANSACTION,
+  ABORTING,
+  ABORTABLE_ERROR,
+  isArmed,
+} = require('./eosManager/transactionStates')
 const TransactionState = require('./state/transactionState')
 
 const { values, keys } = Object
@@ -49,6 +58,40 @@ const endedTransactionError = () =>
  * @returns {number|string|undefined}
  */
 const codeOf = (error) => error.code ?? error.cause?.code
+
+/**
+ * The `timeout` of a `flush` or `disconnect` call, validated before the call changes anything.
+ * @param {unknown} options the call's argument
+ * @param {boolean} ignoreNonObject whether a non-object argument means no options, as for a signal
+ *   handler's argument (`disconnect`), instead of an error (`flush`)
+ * @returns {number|undefined} ms, an integer from 0 to 2147483647; undefined when omitted
+ * @throws {KafkaJSInvalidConfigurationError} an options object whose `timeout` is anything else,
+ *   or a non-object argument that is not ignored
+ */
+const timeoutOf = (options, ignoreNonObject) => {
+  if (
+    options === undefined ||
+    (ignoreNonObject && (typeof options !== 'object' || options === null))
+  ) {
+    return undefined
+  }
+  if (typeof options !== 'object' || options === null) {
+    throw new KafkaJSInvalidConfigurationError(
+      `The options must be an object with an optional timeout, got ${inspect(options)}`
+    )
+  }
+
+  const { timeout } = options
+  if (timeout === undefined) {
+    return undefined
+  }
+  if (!Number.isInteger(timeout) || timeout < 0 || timeout > MAX_DELAY) {
+    throw new KafkaJSInvalidConfigurationError(
+      `timeout must be an integer from 0 to ${MAX_DELAY}, got ${inspect(timeout)}`
+    )
+  }
+  return timeout
+}
 
 /**
  * The accumulator's, the delivery deadline's and the buffer's defaults: the Java client's 4.x
@@ -140,11 +183,20 @@ const createProducer = ({
 }) => {
   let connectionStatus = CONNECTION_STATUS.DISCONNECTED
   /**
-   * @type {Promise<void>|null} while `disconnect()` delivers the accumulated batches: every send,
-   *   the producer's own and its transactions', is refused, and concurrent calls share it
+   * @type {Promise<void>|null} while `disconnect()` cleans up, from its first step to its last:
+   *   every send, the producer's own and its transactions', is refused, and concurrent calls
+   *   share it
    */
   let closing = null
+  /** Whether a `disconnect()` has completed since the last `connect()`: later calls do nothing. */
+  let closed = false
   const isClosing = () => closing !== null
+  /**
+   * The lifecycle every operation of this producer captures when it starts and checks after each
+   * await; a forced close closes it, and a `connect()` after a close replaces it.
+   */
+  let generation = new Generation()
+  const getGeneration = () => generation
   const logger = rootLogger.namespace('Producer')
   const transactional = Boolean(transactionalId)
   const idempotence = new Idempotence({
@@ -202,9 +254,10 @@ const createProducer = ({
     transactionalId,
     retry: retryOptions,
     deliveryRetries: deliveryRetry.retries,
+    getGeneration,
   })
 
-  const { send, sendBatch, ensureInitialized, close, depthOf } = createMessageProducer({
+  const ownMessageProducer = createMessageProducer({
     logger,
     cluster,
     partitioner,
@@ -222,10 +275,18 @@ const createProducer = ({
     isClosing,
     instrumentationEmitter,
     INITIALIZED,
+    getGeneration,
   })
+  const { send, sendBatch, ensureInitialized, depthOf } = ownMessageProducer
 
   let transactionalEosManager
   let transactionalMessageProducer
+  /**
+   * @type {{ abort: () => Promise<void>, ending: () => (Promise<void>|null), ended: () => boolean }|null}
+   *   the abort of the last transaction object, with its end under way and whether it has ended:
+   *   `disconnect()` aborts a transaction left open through it
+   */
+  let lastTransaction = null
 
   attachBuiltIn(partitioner, {
     loadOf: (topic, partition) =>
@@ -252,7 +313,7 @@ const createProducer = ({
   const joinable = (commit) => {
     committing = commit
     const settled = () => {
-      committing = null
+      if (committing === commit) committing = null
     }
     commit.then(settled, settled)
     return commit
@@ -331,6 +392,7 @@ const createProducer = ({
         transactionalId,
         retry: retryOptions,
         deliveryRetries: deliveryRetry.retries,
+        getGeneration,
       })
     transactionalMessageProducer =
       transactionalMessageProducer ||
@@ -352,6 +414,7 @@ const createProducer = ({
         isClosing,
         instrumentationEmitter,
         INITIALIZED,
+        getGeneration,
       })
     const { stateManager } = transactionalEosManager
 
@@ -434,53 +497,61 @@ const createProducer = ({
      * @returns {Promise<void>}
      */
     const endWith = (end) => {
+      const lifecycle = getGeneration()
       const previous = ending === null ? Promise.resolve() : ending.catch(() => {})
       ending = previous.then(async () => {
         if (transactionDidEnd) {
           throw endedTransactionError()
         }
 
+        lifecycle.check()
         await Promise.allSettled(pending)
+        lifecycle.check()
         await end()
         transactionDidEnd = true
       })
       return ending
     }
 
+    /**
+     * Abort the ongoing transaction: rejects the batches still queued - accumulated ones
+     * included - waits for the rest of the transaction's operations, then aborts it. It ends the
+     * transaction even when the abort fails, unless the producer is unusable. A rejected batch
+     * that was already sent once leaves its sequence spent, so the abort then moves the producer
+     * to a new epoch (see `abort()` on the eosManager). Called while a `commit()` of the
+     * transaction is under way, it rejects no batch and waits for the commit: the commit keeps
+     * every record, and the abort is refused if the commit ended the transaction. `disconnect()`
+     * calls it for a transaction left open.
+     *
+     * @returns {Promise<void>}
+     * @throws {KafkaJSNonRetriableError} If transaction has ended
+     * @throws {import('../errors').KafkaJSApplicationRecoverableError} once the producer is
+     *   unusable
+     */
+    const abort = () => {
+      // The accumulated batches join the queue, so the abort rejects them with the rest.
+      transactionalMessageProducer.flush()
+      const dropped =
+        ending === null && stateManager.state() === IN_TRANSACTION
+          ? stateManager.sequencer.abortQueued(
+              new KafkaJSTransactionAbortableError(
+                'The transaction was aborted while this batch was waiting to be sent'
+              )
+            )
+          : []
+      const droppedSequences = dropped.some(({ firstSequence }) => firstSequence !== null)
+      const ended = endWith(() => transactionalEosManager.abort({ droppedSequences }))
+      transactionalMessageProducer.flush(ended)
+      return ended
+    }
+    lastTransaction = { abort, ending: () => ending, ended: () => transactionDidEnd }
+
     const isActive = () => transactionalEosManager.isInTransaction() && !transactionDidEnd
 
     return {
       sendBatch: transactionGuard('sendBatch', sendBatchTxn),
       send: transactionGuard('send', sendTxn),
-      /**
-       * Abort the ongoing transaction: rejects the batches still queued - accumulated ones
-       * included - waits for the rest of the transaction's operations, then aborts it. It ends the
-       * transaction even when the abort fails, unless the producer is unusable. A rejected batch
-       * that was already sent once leaves its sequence spent, so the abort then moves the producer
-       * to a new epoch (see `abort()` on the eosManager). Called while a `commit()` of the
-       * transaction is under way, it rejects no batch and waits for the commit: the commit keeps
-       * every record, and the abort is refused if the commit ended the transaction.
-       *
-       * @throws {KafkaJSNonRetriableError} If transaction has ended
-       * @throws {import('../errors').KafkaJSApplicationRecoverableError} once the producer is
-       *   unusable
-       */
-      abort: () => {
-        // The accumulated batches join the queue, so the abort rejects them with the rest.
-        transactionalMessageProducer.flush()
-        const dropped =
-          ending === null && stateManager.state() === IN_TRANSACTION
-            ? stateManager.sequencer.abortQueued(
-                new KafkaJSTransactionAbortableError(
-                  'The transaction was aborted while this batch was waiting to be sent'
-                )
-              )
-            : []
-        const droppedSequences = dropped.some(({ firstSequence }) => firstSequence !== null)
-        const ended = endWith(() => transactionalEosManager.abort({ droppedSequences }))
-        transactionalMessageProducer.flush(ended)
-        return ended
-      },
+      abort,
       /**
        * Commit the ongoing transaction, once every send and `sendOffsets` of it has settled. The
        * transaction's accumulated batches are sent at once rather than after their `linger`, and so
@@ -575,22 +646,154 @@ const createProducer = ({
 
   /**
    * Delivers every accumulated batch, the producer's own and its transaction's, while every send
-   * is refused, then leaves the producer `DISCONNECTING`. Concurrent calls share one delivery.
+   * is refused, then leaves the producer `DISCONNECTING`.
    * @returns {Promise<void>} never rejects
    */
   const deliverAccumulated = () =>
-    (closing ??= Promise.all([close(), transactionalMessageProducer?.close()]).then(() => {
-      // In one step, so no send passes between the gate and the status.
+    Promise.all([ownMessageProducer.close(), transactionalMessageProducer?.close()]).then(() => {
       connectionStatus = CONNECTION_STATUS.DISCONNECTING
+    })
+
+  /**
+   * Aborts a transaction left open - `IN_TRANSACTION` once its sends settled, or an armed
+   * `ABORTABLE_ERROR` - as the Java producer's shutdown does, or waits for the abort already under
+   * way. A transaction that is committing is never aborted. A failed abort is logged.
+   * @see https://github.com/apache/kafka/blob/4.3/clients/src/main/java/org/apache/kafka/clients/producer/internals/Sender.java
+   * @returns {Promise<void>} never rejects
+   */
+  const abortOpenTransaction = async () => {
+    const state = transactionalEosManager?.stateManager.state()
+    if (lastTransaction === null || lastTransaction.ended()) {
+      return
+    }
+
+    try {
+      if (state === IN_TRANSACTION || state === ABORTABLE_ERROR) {
+        await lastTransaction.abort()
+      } else if (state === ABORTING) {
+        await lastTransaction.ending()
+      }
+    } catch (error) {
+      logger.warn('Aborting the open transaction failed while the producer was disconnecting', {
+        transactionalId,
+        code: codeOf(error),
+        error: error.message,
+      })
+    }
+  }
+
+  /**
+   * The graceful half of a close: delivers what is accumulated, settles the commit and aborts an
+   * open transaction, each only while the lifecycle is open. Operational failures are logged.
+   * @param {Generation} lifecycle the lifecycle the close began under
+   * @returns {Promise<void>} never rejects
+   */
+  const closeGracefully = async (lifecycle) => {
+    try {
+      const joined = committing
+      await deliverAccumulated()
+      if (lifecycle.closed) return
+      await settleCommit(joined)
+      // eslint-disable-next-line no-unmodified-loop-condition -- joinable() clears it while the loop awaits
+      while (committing !== null && !lifecycle.closed) {
+        await committing.catch(() => {})
+      }
+      if (lifecycle.closed) return
+      await abortOpenTransaction()
+      transactionalEosManager?.stateManager.offsets.release()
+    } catch (error) {
+      logger.warn('The producer could not finish delivering while it was disconnecting', {
+        error: error.message,
+      })
+    }
+  }
+
+  /**
+   * One close episode. The `timeout` runs from `startedAt`; at its end, or at once for 0, the close
+   * is forced in one synchronous step: the lifecycle is closed, which cancels the retry timers and
+   * fences every continuation, the admission waiters, the sends not yet written and the ones on
+   * the wire are ended locally, the staged offsets are forfeited, and the connections close
+   * without draining. Nothing it settles claims a remote outcome. The episode ends when the
+   * connections have closed, whatever failed on the way.
+   * @param {number} startedAt epoch ms of the call that began it
+   * @param {number|undefined} timeout ms from `startedAt`; undefined waits for natural completion
+   * @returns {Promise<void>} never rejects
+   */
+  const close = async (startedAt, timeout) => {
+    const lifecycle = generation
+    const remaining = () => Math.max(0, startedAt + timeout - Date.now())
+    let cleanup = null
+    /** Starts the one cluster disconnect of the episode; later calls share it. */
+    const disconnectCluster = (drainTimeout) =>
+      (cleanup ??= (async () =>
+        cluster.disconnect(...(drainTimeout === undefined ? [] : [{ drainTimeout }])))().catch(
+        (error) => {
+          logger.warn('Disconnecting the cluster failed', { error: error.message })
+        }
+      ))
+    let forced = false
+    let forcedDone
+    const forcedSettled = new Promise((resolve) => {
+      forcedDone = resolve
+    })
+    const force = () => {
+      if (forced) return
+      forced = true
+      lifecycle.close(
+        new KafkaJSProducerClosedError('The producer was closed', { outcome: 'unknown' })
+      )
+      admission.cancel(
+        new KafkaJSProducerClosedError('The producer was closed before admission completed', {
+          outcome: 'unsent',
+        })
+      )
+      ownMessageProducer.forceClose()
+      transactionalMessageProducer?.forceClose()
+      transactionalEosManager?.stateManager.offsets.release()
+      disconnectCluster(0).then(forcedDone)
+    }
+
+    let timer = null
+    if (timeout === 0) {
+      force()
+    } else if (timeout !== undefined) {
+      timer = setTimeout(force, remaining())
+    }
+
+    try {
+      await Promise.race([forced ? forcedSettled : closeGracefully(lifecycle), forcedSettled])
+      await disconnectCluster(timeout === undefined ? undefined : remaining())
+    } finally {
+      clearTimeout(timer)
+      lifecycle.close(
+        new KafkaJSProducerClosedError('The producer was disconnected', { outcome: 'unknown' })
+      )
+      connectionStatus = CONNECTION_STATUS.DISCONNECTED
       closing = null
-    }))
+      closed = true
+      instrumentationEmitter.emit(DISCONNECT)
+    }
+  }
 
   return {
     /**
+     * Connects the producer, starting a new lifecycle after a close: it first joins a close still
+     * under way, and opens no connection while that close owns the cleanup. Operations of an
+     * earlier lifecycle stay fenced.
      * @returns {Promise}
      */
     connect: async () => {
-      await cluster.connect()
+      // eslint-disable-next-line no-unmodified-loop-condition -- the close clears it when it ends
+      while (closing !== null) {
+        await closing
+      }
+      if (closed || generation.closed) {
+        generation = new Generation()
+        closed = false
+      }
+      const lifecycle = generation
+      await cluster.connect({ fence: lifecycle })
+      lifecycle.check()
       connectionStatus = CONNECTION_STATUS.CONNECTED
       // CONNECT stays exactly where it is: it means "the cluster connection is up", and existing
       // listeners depend on that ordering. INITIALIZED is the new "safe to send()" signal.
@@ -600,32 +803,79 @@ const createProducer = ({
       // connect() racing a concurrent send() issues exactly one InitProducerId request instead
       // of two (which would otherwise allocate two producer ids and reset sequences underneath
       // in-flight sends).
-      await ensureInitialized()
+      await lifecycle.wait(ensureInitialized())
+    },
+    /**
+     * Resolves once every send made before the call, the producer's own and its transactions',
+     * has settled, after handing the accumulated batches on at once. A send that failed does not
+     * reject it: its own promise carries that. Sends made later are not waited for.
+     * @param {{ timeout?: number }} [options] `timeout` in ms, an integer from 0 to 2147483647: when
+     *   it passes first the call rejects, and every send keeps running; omitted, there is no limit
+     * @returns {Promise<void>}
+     * @throws {KafkaJSInvalidConfigurationError} as a rejection, before anything changes, for an
+     *   argument that is not an object or whose `timeout` is not valid
+     * @throws {KafkaJSTimeout} as a rejection, when `timeout` passes first
+     */
+    flush: (options) => {
+      let timeout
+      try {
+        timeout = timeoutOf(options, false)
+      } catch (error) {
+        return Promise.reject(error)
+      }
+
+      const snapshot = [
+        ...ownMessageProducer.unsettled(),
+        ...(transactionalMessageProducer?.unsettled() || []),
+      ]
+      if (snapshot.length === 0) return Promise.resolve()
+      const until = Promise.allSettled(snapshot)
+      ownMessageProducer.flush(until)
+      transactionalMessageProducer?.flush(until)
+      if (timeout === undefined) return until.then(() => {})
+      if (timeout === 0) return Promise.reject(new KafkaJSTimeout('Producer flush timed out'))
+
+      let timer
+      return new Promise((resolve, reject) => {
+        timer = setTimeout(() => reject(new KafkaJSTimeout('Producer flush timed out')), timeout)
+        until.then(() => resolve())
+      }).finally(() => clearTimeout(timer))
     },
     /**
      * Disconnects the producer. It first delivers every batch still lingering, its own and its
      * transaction's, and the sends begun before it, refusing new sends meanwhile; nothing
      * accumulated is lost. A transaction's commit under way when it begins is waited for, and not
      * sent again if it ends pending; a pending one that is not under way is sent once more first.
-     * It then waits for any commit another `disconnect()` sends, and for every commit the
-     * application starts while it waits, so the connections never close while a commit is under
-     * way; each such commit extends the wait. The call resolves whatever they answer. Offsets
-     * staged by a transaction's `sendOffsets` that no confirmed commit has published by then are
-     * forfeited.
-     * @return {Promise}
+     * It then waits for any commit the application starts while it waits, so the connections never
+     * close while a commit is under way, and aborts a transaction left open. Offsets staged by a
+     * transaction's `sendOffsets` that no confirmed commit has published by then are forfeited.
+     *
+     * With `timeout`, the close is forced when it passes (at once for 0): sends not yet written
+     * reject with `KafkaJSProducerClosedError` `outcome: 'unsent'`, sends written at least once
+     * with `'unknown'`, pending retries are cancelled, no old operation opens a connection or
+     * writes, an unknown commit stays unknown and is not aborted, and the connections close. The
+     * first call's `timeout` governs concurrent ones, which share its one cleanup; a call after
+     * the close completed does nothing until `connect()`. The call resolves whatever the
+     * cleanup answers.
+     * @param {{ timeout?: number }} [options] `timeout` in ms, an integer from 0 to 2147483647; an
+     *   argument that is not an object is ignored, so the method can be a signal handler
+     * @returns {Promise<void>}
+     * @throws {KafkaJSInvalidConfigurationError} as a rejection, before anything changes, for an
+     *   options object whose `timeout` is not valid
      */
-    disconnect: async () => {
-      const joined = committing
-      await deliverAccumulated()
-      await settleCommit(joined)
-      // eslint-disable-next-line no-unmodified-loop-condition -- joinable() clears it while the loop awaits
-      while (committing !== null) {
-        await committing.catch(() => {})
+    disconnect: (options) => {
+      const startedAt = Date.now()
+      let timeout
+      try {
+        timeout = timeoutOf(options, true)
+      } catch (error) {
+        return Promise.reject(error)
       }
-      transactionalEosManager?.stateManager.offsets.release()
-      await cluster.disconnect()
-      connectionStatus = CONNECTION_STATUS.DISCONNECTED
-      instrumentationEmitter.emit(DISCONNECT)
+
+      if (closing !== null) return closing
+      if (closed) return Promise.resolve()
+      closing = close(startedAt, timeout)
+      return closing
     },
     /**
      * @returns {boolean} whether the producer sends idempotently; false once a configuration

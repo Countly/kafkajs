@@ -47,5 +47,10 @@ const createTopic: KafkaJSError = new KafkaJSCreateTopicError(new Error('x'), 't
 const noBroker: KafkaJSError = new KafkaJSNoBrokerAvailableError()
 void [closed, memberIdRequired, invariant, invalidVarInt, invalidLong, createTopic, noBroker]
 
+const lifecycle = new Kafka({ brokers: ['localhost:9092'] }).producer({ metadataMaxIdle: 300000 })
+void lifecycle.flush({ timeout: 2147483647 })
+void lifecycle.disconnect({ timeout: 0 })
+process.on('SIGTERM', lifecycle.disconnect)
+
 new Kafka({ brokers: ['localhost:9092'] }).producer({ metadataMaxIdle: 5000 })
 new Kafka({ brokers: ['localhost:9092'] }).producer({ metadataMaxIdle: 2147483647 })

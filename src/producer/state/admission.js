@@ -170,6 +170,20 @@ class Admission {
   }
 
   /**
+   * Rejects and detaches all waiters at shutdown. Admitted reservations retain their owners.
+   * @param {Error} error local cancellation reason
+   * @returns {void}
+   */
+  cancel(error) {
+    while (this.#waiters.size > 0) {
+      const waiter = this.#waiters.shift()
+      clearTimeout(waiter.timer)
+      this.#waitingBytes -= waiter.bytes
+      waiter.reject(error)
+    }
+  }
+
+  /**
    * Charges a batch's debit, without waiting: `available` may reach 0, and admission waits until
    * the debit is repaid.
    * @param {number} bytes

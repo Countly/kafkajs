@@ -107,7 +107,7 @@ describe('Producer > idempotent init resilience', () => {
     // The recovered send must genuinely carry the producer id InitProducerId just handed back,
     // not merely prove initProducerId was called again.
     expect(produce).toHaveBeenCalledWith(expect.objectContaining({ producerId: '1' }))
-    expect(cluster.addMultipleTargetTopics).toHaveBeenCalledWith(['t'])
+    expect(cluster.addMultipleTargetTopics).toHaveBeenCalledWith(['t'], expect.any(Object))
   })
 
   it('emits INITIALIZED after InitProducerId succeeds, without moving CONNECT', async () => {

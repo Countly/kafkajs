@@ -9,6 +9,7 @@ const {
   KafkaJSInvariantViolation,
   KafkaJSNonRetriableError,
 } = require('../../../errors')
+const Generation = require('../../generation')
 const { newLogger } = require('testHelpers')
 
 const TRANSACTIONAL_ID = 'test-transactional-id'
@@ -475,5 +476,258 @@ describe('ProducerIdAndEpoch', () => {
       expect(onReset).toHaveBeenCalledTimes(2)
       expect(sent(coordinator)).toHaveLength(1)
     })
+  })
+})
+
+describe('ProducerIdAndEpoch under a producer lifecycle', () => {
+  const closed = new Error('producer closed')
+
+  /** An identity whose lifecycle `use(generation)` switches, over a coordinator that waits. */
+  const lifecycleBuild = (answers = []) => {
+    const gates = []
+    const coordinator = createCoordinator({ answers })
+    coordinator.initProducerId.mockImplementation(async () => {
+      const next = answers.shift()
+      const gate = {}
+      gate.promise = new Promise((resolve) => {
+        gate.release = resolve
+      })
+      gates.push(gate)
+      await gate.promise
+      if (next instanceof Error) {
+        throw next
+      }
+      return { throttleTime: 0, errorCode: 0, ...next }
+    })
+    let current = new Generation()
+    const onReset = jest.fn()
+    const findBroker = jest.fn(async () => coordinator)
+    const identity = new ProducerIdAndEpoch({
+      logger: newLogger(),
+      transactionalId: null,
+      transactionTimeout: TRANSACTION_TIMEOUT,
+      findBroker,
+      onReset,
+      getGeneration: () => current,
+    })
+    return {
+      identity,
+      coordinator,
+      onReset,
+      findBroker,
+      gates,
+      generation: () => current,
+      use: (next) => {
+        current = next
+      },
+    }
+  }
+
+  const tick = () => new Promise(setImmediate)
+
+  test('takes nothing and resets nothing when the lifecycle closes before the broker is found', async () => {
+    const { identity, coordinator, onReset, generation, findBroker } = lifecycleBuild()
+    findBroker.mockImplementationOnce(async () => {
+      generation().close(closed)
+      return coordinator
+    })
+
+    await expect(identity.initialize()).rejects.toBe(closed)
+
+    expect(coordinator.initProducerId).not.toHaveBeenCalled()
+    expect(identity.isValid()).toBe(false)
+    expect(onReset).not.toHaveBeenCalled()
+  })
+
+  test('forwards its guard to the request, and takes nothing from an answer that comes after the close', async () => {
+    const { identity, coordinator, onReset, generation, gates } = lifecycleBuild([
+      { producerId: '1000', producerEpoch: 99 },
+    ])
+    const initializing = identity.initialize()
+    await tick()
+    expect(coordinator.initProducerId.mock.calls[0][0].guard).toBe(generation().guard)
+
+    generation().close(closed)
+    gates[0].release()
+
+    await expect(initializing).rejects.toBe(closed)
+    expect(identity.isValid()).toBe(false)
+    expect(onReset).not.toHaveBeenCalled()
+  })
+
+  test('a late answer of a closed lifecycle never replaces the pair a later one took', async () => {
+    const { identity, onReset, generation, gates, use } = lifecycleBuild([
+      { producerId: '1000', producerEpoch: 99 },
+      { producerId: '2000', producerEpoch: 0 },
+    ])
+    const first = identity.initialize()
+    const held = first.catch((error) => error)
+    await tick()
+    generation().close(closed)
+    use(new Generation())
+
+    const second = identity.initialize()
+    await tick()
+    gates[1].release()
+    await second
+    gates[0].release()
+
+    expect(pairOf(identity)).toEqual({ producerId: '2000', producerEpoch: 0 })
+    expect(onReset).toHaveBeenCalledTimes(1)
+    expect(await held).toBe(closed)
+  })
+
+  test('a re-initialization takes nothing from a closed lifecycle, before the request or after its answer', async () => {
+    const { identity, coordinator, onReset, generation, gates, findBroker } = lifecycleBuild([
+      { producerId: '1000', producerEpoch: 3 },
+      { producerId: '1000', producerEpoch: 4 },
+    ])
+    const initializing = identity.initialize()
+    await tick()
+    gates[0].release()
+    await initializing
+    onReset.mockClear()
+
+    findBroker.mockImplementationOnce(async () => {
+      generation().close(closed)
+      return coordinator
+    })
+    await expect(identity.reinitialize()).rejects.toBe(closed)
+    expect(coordinator.initProducerId).toHaveBeenCalledTimes(1)
+
+    const reopened = lifecycleBuild([
+      { producerId: '1000', producerEpoch: 3 },
+      { producerId: '1000', producerEpoch: 4 },
+    ])
+    const again = reopened.identity.initialize()
+    await tick()
+    reopened.gates[0].release()
+    await again
+    reopened.onReset.mockClear()
+    const reinitializing = reopened.identity.reinitialize()
+    await tick()
+    reopened.generation().close(closed)
+    reopened.gates[1].release()
+
+    await expect(reinitializing).rejects.toBe(closed)
+    expect(pairOf(reopened.identity)).toEqual({ producerId: '1000', producerEpoch: 3 })
+    expect(reopened.onReset).not.toHaveBeenCalled()
+  })
+
+  test('the fallback of a coordinator below InitProducerId v3 is fenced too', async () => {
+    const coordinator = createCoordinator({
+      maxVersion: 2,
+      answers: [{ producerId: '1000', producerEpoch: 0 }],
+    })
+    const generation = new Generation()
+    const identity = new ProducerIdAndEpoch({
+      logger: newLogger(),
+      transactionalId: null,
+      transactionTimeout: TRANSACTION_TIMEOUT,
+      findBroker: async () => coordinator,
+      onReset: jest.fn(),
+      getGeneration: () => generation,
+    })
+    generation.close(closed)
+
+    await expect(identity.reinitialize()).rejects.toBe(closed)
+
+    expect(coordinator.initProducerId).not.toHaveBeenCalled()
+  })
+
+  test('an acquisition begun at the epoch ceiling belongs to its lifecycle, and its end clears only itself', async () => {
+    const { identity, onReset, generation, gates, use } = lifecycleBuild([
+      { producerId: '1000', producerEpoch: 32767 },
+      { producerId: '2000', producerEpoch: 0 },
+      { producerId: '3000', producerEpoch: 0 },
+    ])
+    const initializing = identity.initialize()
+    await tick()
+    gates[0].release()
+    await initializing
+    identity.bumpEpoch()
+    const older = identity.pendingInitialization()
+    expect(older).toBeInstanceOf(Promise)
+    await tick()
+
+    generation().close(closed)
+    use(new Generation())
+    expect(identity.pendingInitialization()).toBeNull()
+
+    identity.adopt({ producerId: '5000', producerEpoch: 32767 })
+    identity.bumpEpoch()
+    const newer = identity.pendingInitialization()
+    expect(newer).toBeInstanceOf(Promise)
+    expect(newer).not.toBe(older)
+
+    await tick()
+    gates[1].release()
+    await expect(older).rejects.toBe(closed)
+    await tick()
+    expect(identity.pendingInitialization()).toBe(newer)
+
+    gates[2].release()
+    await newer
+    expect(pairOf(identity)).toEqual({ producerId: '3000', producerEpoch: 0 })
+    expect(identity.pendingInitialization()).toBeNull()
+    expect(onReset).toHaveBeenCalledTimes(2)
+  })
+
+  test('a failed acquisition of an older lifecycle leaves the newer one pending', async () => {
+    const timedOut = createErrorFromCode(REQUEST_TIMED_OUT)
+    const { identity, generation, gates, use } = lifecycleBuild([
+      { producerId: '1000', producerEpoch: 32767 },
+      timedOut,
+      { producerId: '3000', producerEpoch: 0 },
+    ])
+    const initializing = identity.initialize()
+    await tick()
+    gates[0].release()
+    await initializing
+    identity.bumpEpoch()
+    const older = identity.pendingInitialization()
+    await tick()
+    generation().close(closed)
+    use(new Generation())
+    identity.adopt({ producerId: '5000', producerEpoch: 32767 })
+    identity.bumpEpoch()
+    const newer = identity.pendingInitialization()
+
+    await tick()
+    gates[1].release()
+    await older.catch(() => {})
+    await tick()
+
+    expect(identity.pendingInitialization()).toBe(newer)
+    gates[2].release()
+    await newer
+  })
+
+  test('a successful acquisition that another replaced in the same lifecycle leaves it pending', async () => {
+    const { identity, gates } = lifecycleBuild([
+      { producerId: '1000', producerEpoch: 32767 },
+      { producerId: '2000', producerEpoch: 0 },
+      { producerId: '3000', producerEpoch: 0 },
+    ])
+    const initializing = identity.initialize()
+    await tick()
+    gates[0].release()
+    await initializing
+    identity.bumpEpoch()
+    const older = identity.pendingInitialization()
+    await tick()
+    identity.adopt({ producerId: '5000', producerEpoch: 32767 })
+    identity.bumpEpoch()
+    const newer = identity.pendingInitialization()
+    await tick()
+
+    gates[1].release()
+    await older
+    await tick()
+
+    expect(identity.pendingInitialization()).toBe(newer)
+    gates[2].release()
+    await newer
+    expect(identity.pendingInitialization()).toBeNull()
   })
 })

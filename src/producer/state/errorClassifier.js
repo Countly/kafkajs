@@ -4,6 +4,7 @@ const {
   KafkaJSApplicationRecoverableError,
   KafkaJSInvalidConfigurationError,
   KafkaJSDeliveryTimeout,
+  KafkaJSProducerClosedError,
   KafkaJSNumberOfRetriesExceeded,
   KafkaJSInvariantViolation,
 } = require('../../errors')
@@ -30,6 +31,7 @@ const CATEGORY_CLASSES = [
   KafkaJSApplicationRecoverableError,
   KafkaJSInvalidConfigurationError,
   KafkaJSDeliveryTimeout,
+  KafkaJSProducerClosedError,
 ]
 
 /**

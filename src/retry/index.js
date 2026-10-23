@@ -1,4 +1,5 @@
 const { inspect } = require('util')
+const FencedRetry = require('./fenced')
 const { MAX_DELAY } = require('../producer/deadline')
 const {
   KafkaJSNumberOfRetriesExceeded,
@@ -148,7 +149,7 @@ const createRetriable = (configs, backoff, resolve, reject, fn) => {
  * the error the last attempt threw - instead of waiting. Running out of `retries` first still
  * rejects with `KafkaJSNumberOfRetriesExceeded`, and a non-retriable error is not affected. Unset,
  * `undefined` or `null`, the retrier behaves exactly as without it.
- * @param {import("../../types").RetryOptions & { maxTotalTime?: number }} [opts]
+ * @param {import("../../types").RetryOptions & { maxTotalTime?: number, fence?: { register: Function } }} [opts] optional producer cancellation; absent, the original retrier runs unchanged
  * @returns {Retrier}
  * @throws {KafkaJSInvalidConfigurationError} when `maxTotalTime` is set and is not an integer from
  *   1 to 2147483647; thrown here, before any retrier is returned
@@ -157,6 +158,15 @@ const createRetry = (opts = {}) => {
   assertMaxTotalTime(opts?.maxTotalTime)
 
   return (fn) => {
+    if (opts?.fence) {
+      const configs = Object.assign({}, RETRY_DEFAULT, opts)
+      return new FencedRetry({
+        configs,
+        backoff: backoffOf(configs),
+        fn,
+        isRetriable: isErrorRetriable,
+      }).promise
+    }
     return new Promise((resolve, reject) => {
       const configs = Object.assign({}, RETRY_DEFAULT, opts)
       const backoff = backoffOf(configs)

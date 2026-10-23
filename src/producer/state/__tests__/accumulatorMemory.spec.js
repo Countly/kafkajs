@@ -1,6 +1,7 @@
 const Accumulator = require('../accumulator')
 const { Admission } = require('../admission')
 const Cluster = require('../../../cluster')
+const Generation = require('../../generation')
 const { newLogger, connectionOpts } = require('testHelpers')
 const { chargeOf, RequestBudget } = require('../recordSize')
 const {
@@ -54,9 +55,10 @@ const SHAPES = [
 
 /**
  * An accumulator over a buffer whose send path never answers: every batch it is handed is kept in
- * `batches` until `drain()` settles and retires it. `pinner`, when given, pins the sends' topics.
+ * `batches` until `drain()` settles and retires it. `pinner`, when given, pins the sends' topics;
+ * `getGeneration`, when given, is the producer lifecycle each send checks.
  */
-const holding = (capacity, pinner) => {
+const holding = (capacity, pinner, getGeneration) => {
   const admission = new Admission({ capacity, maxBlockMs: 60000 })
   const batches = []
   const accumulator = new Accumulator({
@@ -75,6 +77,7 @@ const holding = (capacity, pinner) => {
       batches.push(...handed)
     },
     pinner,
+    getGeneration,
   })
   return { accumulator, admission, batches }
 }
@@ -85,8 +88,8 @@ const holding = (capacity, pinner) => {
  * @returns {Promise<object>} the population: its buffer, its batches, its sends' outcomes, and the
  *   counters when the first send had to wait
  */
-const fill = async (capacity, records, pinner) => {
-  const population = holding(capacity, pinner)
+const fill = async (capacity, records, pinner, getGeneration) => {
+  const population = holding(capacity, pinner, getGeneration)
   const { accumulator, admission } = population
   let shared = Buffer.alloc(1024)
   const sends = []
@@ -253,6 +256,35 @@ describe('Producer > the buffer > the bound on held records', () => {
       } finally {
         await drain(population)
       }
+      expect(cluster.topicPins.size).toBe(0)
+      expect(countersOf(admission)).toEqual(quiescent(admission))
+    })
+  })
+
+  test('tracked for a flush whose snapshot stays open, the storage the held records retain is within what they are charged, over 0.9, and the inventory empties with the sends', async () => {
+    const cluster = new Cluster({
+      ...connectionOpts(),
+      logger: newLogger(),
+      metadataMaxIdle: 300000,
+      retry: { retries: 0 },
+    })
+    const generation = new Generation()
+    await populations(async (capacity, records) => {
+      const before = await retained()
+      const population = await fill(capacity, records, cluster, () => generation)
+      const { accumulator, admission } = population
+      const flushed = watch(accumulator.unsettled()[0])
+      try {
+        const after = await retained()
+        const counted = admission.reserved + admission.waitingBytes + admission.debts
+        expect(after - before).toBeLessThanOrEqual(counted / 0.9)
+        expect(flushed.state).toBe('pending')
+      } finally {
+        await drain(population)
+      }
+      await flushAll()
+      expect(flushed.state).toBe('fulfilled')
+      expect(accumulator.unsettled()).toEqual([])
       expect(cluster.topicPins.size).toBe(0)
       expect(countersOf(admission)).toEqual(quiescent(admission))
     })

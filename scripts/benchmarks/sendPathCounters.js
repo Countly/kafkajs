@@ -21,14 +21,17 @@ const optional = (path, load = require) => {
  * calls that show each send went through the path being measured. `appendCalls` counts
  * `Accumulator#append`, in every tree that has the accumulator; `acquireCalls` counts
  * `Admission#acquire` and `deadlines` the `Deadline`s an append starts, in a tree that has them,
- * and are `null` in one that does not. Each equals the number of sends. Require it before the
- * client, so the accumulator takes the counted `Deadline`; the wrappers add one function call per
- * send, the same in every tree that has the code they wrap.
- * @returns {{ read: () => { appendCalls: number, acquireCalls: number|null, deadlines: number|null },
- *   reset: () => void }} `read` gives the counts so far, `reset` starts them again from 0
+ * and are `null` in one that does not. `flushTracked` counts `Accumulator#track`, the sends the
+ * flush inventory counts, in a tree that has it, and is `null` in one that does not. Each equals
+ * the number of sends. Require it before the client, so the accumulator takes the counted
+ * `Deadline`; the wrappers add one function call per send, the same in every tree that has the
+ * code they wrap.
+ * @returns {{ read: () => { appendCalls: number, acquireCalls: number|null, deadlines: number|null,
+ *   flushTracked: number|null }, reset: () => void }} `read` gives the counts so far, `reset` starts
+ *   them again from 0
  */
 const sendPathCounters = () => {
-  const counts = { appendCalls: 0, acquireCalls: null, deadlines: null }
+  const counts = { appendCalls: 0, acquireCalls: null, deadlines: null, flushTracked: null }
   let appending = 0
 
   const deadline = optional('../../src/producer/deadline')
@@ -62,6 +65,19 @@ const sendPathCounters = () => {
   }
 
   const Accumulator = require('../../src/producer/state/accumulator')
+  if (typeof Accumulator.prototype.track === 'function') {
+    counts.flushTracked = 0
+    const { track } = Accumulator.prototype
+    /**
+     * Counts the sends the flush inventory tracks.
+     * @param {...*} args the unchanged Accumulator.track arguments
+     * @returns {void}
+     */
+    Accumulator.prototype.track = function (...args) {
+      counts.flushTracked += 1
+      return track.apply(this, args)
+    }
+  }
   const { append } = Accumulator.prototype
   /**
    * Counts appends and marks their synchronous deadline-construction interval.
@@ -79,13 +95,14 @@ const sendPathCounters = () => {
     }
   }
   return {
-    /** @returns {{ appendCalls: number, acquireCalls: number|null, deadlines: number|null }} a counter snapshot */
+    /** @returns {{ appendCalls: number, acquireCalls: number|null, deadlines: number|null, flushTracked: number|null }} a counter snapshot */
     read: () => ({ ...counts }),
     /** Resets supported counters to zero, preserving null for absent modules. @returns {void} */
     reset: () => {
       counts.appendCalls = 0
       if (counts.acquireCalls !== null) counts.acquireCalls = 0
       if (counts.deadlines !== null) counts.deadlines = 0
+      if (counts.flushTracked !== null) counts.flushTracked = 0
     },
   }
 }

@@ -332,26 +332,37 @@ module.exports = class Broker {
    * finalized features (`finalizedFeatures`, `finalizedFeaturesEpoch`).
    *
    * @public
+   * @param {object} [options]
+   * @param {(frameLength?: number) => Error|null} [options.guard] a producer's private check of its
+   *   lifecycle, asked before the lock, the connection, the negotiation and the authentication, and
+   *   after each: an error it returns is thrown, so a closed producer goes no further
    * @returns {Promise}
    * @throws {KafkaJSConnectionError} when this broker was retired
+   * @throws {Error} the error the guard returned
    */
-  async connect() {
+  async connect({ guard } = {}) {
     this.throwIfRetired()
+    this.throwIfRefused(guard)
     await this.lock.acquire()
     try {
       this.throwIfRetired()
+      this.throwIfRefused(guard)
       if (this.isConnected()) {
         return
       }
 
-      const connection = await this.connectionPool.getConnection()
+      const connection = await (guard
+        ? this.connectionPool.getConnection(0, { guard })
+        : this.connectionPool.getConnection())
+      this.throwIfRefused(guard)
 
       // Read once: this is the generation the negotiated table below is learned at, not
       // whatever the pool happens to report after the round trip (a concurrent socket coming
       // up mid-negotiation must not be attributed to this table).
       const generation = this.connectionPool.generation
       if (this.versionsGeneration !== generation) {
-        const response = await this[PRIVATE.NEGOTIATE]()
+        const response = await this[PRIVATE.NEGOTIATE](guard)
+        this.throwIfRefused(guard)
         const { finalizedFeatures, finalizedFeaturesEpoch } = toFinalizedFeatures(response)
         this.versions = toVersionMap(response)
         this.finalizedFeatures = finalizedFeatures
@@ -364,8 +375,10 @@ module.exports = class Broker {
       this.lookupRequest = lookup(this.versions)
       this[PRIVATE.CAPPED_LOOKUPS].clear()
 
+      this.throwIfRefused(guard)
       await connection.authenticate()
       this.throwIfRetired()
+      this.throwIfRefused(guard)
     } finally {
       await this.lock.release()
     }
@@ -434,14 +447,15 @@ module.exports = class Broker {
    * The ApiVersions round trip behind `apiVersions()`, resolving the whole decoded response so
    * `connect()` can keep its finalized features as well as its version table.
    * @private
+   * @param {(frameLength?: number) => Error|null} [guard] a producer's private pre-write check
    * @returns {Promise<object>} the decoded ApiVersions response
    * @throws {KafkaJSNonRetriableError} when the broker rejects this client's software identity
    */
-  async [PRIVATE.NEGOTIATE]() {
+  async [PRIVATE.NEGOTIATE](guard) {
     const bestImplementedVersion = Math.max(...requests.ApiVersions.versions.map(Number))
 
     try {
-      return await this[PRIVATE.API_VERSIONS_AT](bestImplementedVersion)
+      return await this[PRIVATE.API_VERSIONS_AT](bestImplementedVersion, guard)
     } catch (e) {
       if (e.type === 'INVALID_REQUEST') {
         await this.disconnect()
@@ -464,7 +478,7 @@ module.exports = class Broker {
         bestImplementedVersion
       )
 
-      return await this[PRIVATE.API_VERSIONS_AT](retryVersion)
+      return await this[PRIVATE.API_VERSIONS_AT](retryVersion, guard)
     }
   }
 
@@ -540,13 +554,17 @@ module.exports = class Broker {
   /**
    * @private
    * @param {number} version
+   * @param {(frameLength?: number) => Error|null} [guard] a producer's private pre-write check
    */
-  async [PRIVATE.API_VERSIONS_AT](version) {
+  async [PRIVATE.API_VERSIONS_AT](version, guard) {
     const apiVersions = requests.ApiVersions.protocol({ version })
-    return await this[PRIVATE.SEND_REQUEST]({
-      ...apiVersions(),
-      requestTimeout: this.connectionPool.connectionTimeout,
-    })
+    return await this[PRIVATE.SEND_REQUEST](
+      {
+        ...apiVersions(),
+        requestTimeout: this.connectionPool.connectionTimeout,
+      },
+      guard
+    )
   }
 
   /**
@@ -577,12 +595,17 @@ module.exports = class Broker {
    * @type {import("../../types").Broker['metadata']}
    * @param {string[]} [topics=[]] An array of topics to fetch metadata for.
    *                            If no topics are specified fetch metadata for all topics
+   * @param {object} [options]
+   * @param {(frameLength?: number) => Error|null} [options.guard] a producer's private pre-write
+   *   check; it never reaches the request
    */
-  async metadata(topics = []) {
+  async metadata(topics = [], { guard } = {}) {
+    this.throwIfRefused(guard)
     const metadata = this.lookupRequest(apiKeys.Metadata, requests.Metadata)
     const shuffledTopics = shuffle(topics)
     return await this[PRIVATE.SEND_REQUEST](
-      metadata({ topics: shuffledTopics, allowAutoTopicCreation: this.allowAutoTopicCreation })
+      metadata({ topics: shuffledTopics, allowAutoTopicCreation: this.allowAutoTopicCreation }),
+      guard
     )
   }
 
@@ -1001,12 +1024,15 @@ module.exports = class Broker {
    * @param {object} request
    * @param {string} request.groupId The unique group id
    * @param {import("../protocol/coordinatorTypes").CoordinatorType} request.coordinatorType The type of coordinator to find
+   * @param {(frameLength?: number) => Error|null} [request.guard] a producer's private pre-write
+   *   check; it never reaches the request
    * @returns {Promise}
    */
-  async findGroupCoordinator({ groupId, coordinatorType }) {
+  async findGroupCoordinator({ groupId, coordinatorType, guard }) {
     // TODO: validate groupId, mandatory
+    this.throwIfRefused(guard)
     const findCoordinator = this.lookupRequest(apiKeys.GroupCoordinator, requests.GroupCoordinator)
-    return await this[PRIVATE.SEND_REQUEST](findCoordinator({ groupId, coordinatorType }))
+    return await this[PRIVATE.SEND_REQUEST](findCoordinator({ groupId, coordinatorType }), guard)
   }
 
   /**
@@ -1493,6 +1519,8 @@ module.exports = class Broker {
    *   re-initialization; -1 on a first initialization. Sent from v3, dropped below it
    * @param {number} [request.producerEpoch=-1] the epoch held, on a re-initialization; -1 on a
    *   first initialization
+   * @param {(frameLength?: number) => Error|null} [request.guard] a producer's private pre-write
+   *   check; it never reaches the request
    * @returns {Promise}
    * @see https://cwiki.apache.org/confluence/pages/viewpage.action?pageId=89068820
    */
@@ -1501,10 +1529,13 @@ module.exports = class Broker {
     transactionTimeout,
     producerId = -1,
     producerEpoch = -1,
+    guard,
   }) {
+    this.throwIfRefused(guard)
     const initProducerId = this.lookupRequest(apiKeys.InitProducerId, requests.InitProducerId)
     return await this[PRIVATE.SEND_REQUEST](
-      initProducerId({ transactionalId, transactionTimeout, producerId, producerEpoch })
+      initProducerId({ transactionalId, transactionTimeout, producerId, producerEpoch }),
+      guard
     )
   }
 
@@ -1524,15 +1555,19 @@ module.exports = class Broker {
    *                      partitions: [ 0, 1]
    *                    }
    *                  ]
+   * @param {(frameLength?: number) => Error|null} [request.guard] a producer's private pre-write
+   *   check; it never reaches the request
    * @returns {Promise}
    */
-  async addPartitionsToTxn({ transactionalId, producerId, producerEpoch, topics }) {
+  async addPartitionsToTxn({ transactionalId, producerId, producerEpoch, topics, guard }) {
+    this.throwIfRefused(guard)
     const addPartitionsToTxn = this.lookupRequest(
       apiKeys.AddPartitionsToTxn,
       requests.AddPartitionsToTxn
     )
     return await this[PRIVATE.SEND_REQUEST](
-      addPartitionsToTxn({ transactionalId, producerId, producerEpoch, topics })
+      addPartitionsToTxn({ transactionalId, producerId, producerEpoch, topics }),
+      guard
     )
   }
 
@@ -1546,12 +1581,16 @@ module.exports = class Broker {
    * @param {number} request.producerId Current producer id in use by the transactional id.
    * @param {number} request.producerEpoch Current epoch associated with the producer id.
    * @param {string} request.groupId The unique group identifier (for the consumer group)
+   * @param {(frameLength?: number) => Error|null} [request.guard] a producer's private pre-write
+   *   check; it never reaches the request
    * @returns {Promise}
    */
-  async addOffsetsToTxn({ transactionalId, producerId, producerEpoch, groupId }) {
+  async addOffsetsToTxn({ transactionalId, producerId, producerEpoch, groupId, guard }) {
+    this.throwIfRefused(guard)
     const addOffsetsToTxn = this.lookupRequest(apiKeys.AddOffsetsToTxn, requests.AddOffsetsToTxn)
     return await this[PRIVATE.SEND_REQUEST](
-      addOffsetsToTxn({ transactionalId, producerId, producerEpoch, groupId })
+      addOffsetsToTxn({ transactionalId, producerId, producerEpoch, groupId }),
+      guard
     )
   }
 
@@ -1574,6 +1613,8 @@ module.exports = class Broker {
    * @param {1|2} [request.transactionVersion=1] the transaction version in force for this
    *   transaction: 1 keeps the request at v4 or below; 2 allows v5, which also adds the offsets to
    *   the transaction (KIP-890)
+   * @param {(frameLength?: number) => Error|null} [request.guard] a producer's private pre-write
+   *   check; it never reaches the request
    *
    * @typedef {Object} OffsetCommitTopic
    * @property {string} topic
@@ -1599,7 +1640,9 @@ module.exports = class Broker {
     memberId = '',
     groupInstanceId = null,
     transactionVersion = 1,
+    guard,
   }) {
+    this.throwIfRefused(guard)
     const txnOffsetCommit = this.lookupRequestWithMax(
       apiKeys.TxnOffsetCommit,
       requests.TxnOffsetCommit,
@@ -1615,7 +1658,8 @@ module.exports = class Broker {
         generationId,
         memberId,
         groupInstanceId,
-      })
+      }),
+      guard
     )
   }
 
@@ -1632,6 +1676,8 @@ module.exports = class Broker {
    * @param {1|2} [request.transactionVersion=1] the transaction version in force for this
    *   transaction: 1 keeps the request at v4 or below; 2 allows v5, whose response carries the
    *   producer id and epoch the coordinator bumped to (KIP-890)
+   * @param {(frameLength?: number) => Error|null} [request.guard] a producer's private pre-write
+   *   check; it never reaches the request
    * @returns {Promise}
    * @see https://cwiki.apache.org/confluence/display/KAFKA/KIP-890%3A+Transactions+Server-Side+Defense
    */
@@ -1641,14 +1687,17 @@ module.exports = class Broker {
     producerEpoch,
     transactionResult,
     transactionVersion = 1,
+    guard,
   }) {
+    this.throwIfRefused(guard)
     const endTxn = this.lookupRequestWithMax(
       apiKeys.EndTxn,
       requests.EndTxn,
       transactionVersionCap(apiKeys.EndTxn, transactionVersion)
     )
     return await this[PRIVATE.SEND_REQUEST](
-      endTxn({ transactionalId, producerId, producerEpoch, transactionResult })
+      endTxn({ transactionalId, producerId, producerEpoch, transactionResult }),
+      guard
     )
   }
 
@@ -1893,19 +1942,23 @@ module.exports = class Broker {
     const pool = this.connectionPool
     let generation = pool.generation
     try {
-      const connection = await pool.getConnectionByRequest(protocolRequest)
+      const connection = await (guard
+        ? pool.getConnectionByRequest(protocolRequest, { guard })
+        : pool.getConnectionByRequest(protocolRequest))
       this.throwIfReplaced(pool)
 
       if (
         protocolRequest.request.apiKey !== apiKeys.ApiVersions &&
         this.versionsGeneration !== pool.generation
       ) {
-        await this.connect()
+        await (guard ? this.connect({ guard }) : this.connect())
         this.throwIfReplaced(pool)
       }
 
       if (!connection.isConnected()) {
-        await pool.getConnectionByRequest(protocolRequest)
+        await (guard
+          ? pool.getConnectionByRequest(protocolRequest, { guard })
+          : pool.getConnectionByRequest(protocolRequest))
         this.throwIfReplaced(pool)
       }
 

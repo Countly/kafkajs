@@ -66,3 +66,13 @@ test('deep paths under src are not exported', () => {
 test('package.json stays reachable', () => {
   assert.equal(require(`${PKG}/package.json`).name, PKG)
 })
+
+
+test('the producer close error is exported with transmission evidence', async () => {
+  const cjs = require(PKG)
+  const esm = await import(PKG)
+  assert.equal(esm.KafkaJSProducerClosedError, cjs.KafkaJSProducerClosedError)
+  for (const outcome of ['unsent', 'unknown']) {
+    assert.equal(new cjs.KafkaJSProducerClosedError('closed', { outcome }).outcome, outcome)
+  }
+})

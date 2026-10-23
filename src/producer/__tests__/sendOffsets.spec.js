@@ -90,6 +90,7 @@ describe('Producer > transaction.sendOffsets', () => {
       memberId: 'member-a',
       groupInstanceId: 'instance-a',
       transactionVersion: 2,
+      guard: expect.any(Function),
     })
     expect(cluster.markOffsetAsCommitted).not.toHaveBeenCalled()
     await transaction.commit()
@@ -163,6 +164,7 @@ describe('Producer > transaction.sendOffsets', () => {
       producerId: '1000',
       producerEpoch: 0,
       groupId: GROUP_ID,
+      guard: expect.any(Function),
     })
   })
 

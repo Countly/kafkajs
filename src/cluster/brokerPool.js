@@ -25,6 +25,14 @@ const { keys, assign, values } = Object
 const hasBrokerMoved = (broker, { host, port }) =>
   broker.connectionPool.host !== host || broker.connectionPool.port !== port
 
+/**
+ * The broker option of a producer lifecycle's private pre-write check, as an argument list: none
+ * without a lifecycle, so an unfenced call keeps the shape it always had.
+ * @param {import('../producer/generation')} [fence]
+ * @returns {[{ guard: () => Error|null }]|[]}
+ */
+const guardArgs = (fence) => (fence ? [{ guard: fence.guard }] : [])
+
 // Bounds the `.cause` walk below: no currently-reachable chain is anywhere near this deep, so it
 // only guards against a future, accidentally self-referential `cause` looping forever.
 const MAX_CAUSE_CHAIN_DEPTH = 10
@@ -96,7 +104,8 @@ module.exports = class BrokerPool {
     this.connectionPoolBuilder = connectionPoolBuilder
     this.metadataMaxAge = metadataMaxAge || 0
     this.logger = logger.namespace('BrokerPool')
-    this.retrier = createRetry(assign({}, retry))
+    this.retryOptions = assign({}, retry)
+    this.retrier = createRetry(this.retryOptions)
     this.authenticationTimeout = authenticationTimeout ?? 10000
     this.metadataCache = metadataCache ?? new MetadataCache({ logger })
     this.instrumentationEmitter = instrumentationEmitter ?? null
@@ -202,6 +211,17 @@ module.exports = class BrokerPool {
   }
 
   /**
+   * The retrier of work that belongs to one producer lifecycle: it stops at once, with the
+   * lifecycle's close error, when the lifecycle closes. Counts and delays are the pool's own.
+   * @public
+   * @param {import('../producer/generation')} [fence] the captured producer lifecycle
+   * @returns {import('../retry').Retrier} the pool's own retrier when there is no lifecycle
+   */
+  retryFor(fence) {
+    return fence ? createRetry({ ...this.retryOptions, fence }) : this.retrier
+  }
+
+  /**
    * Builds a connection pool via the injected builder and stamps it with this client's
    * authenticationTimeout and this BrokerPool's shared authenticationBlackout map. Every pool
    * this BrokerPool creates goes through here so a pool rebuilt after a connection error keeps
@@ -265,9 +285,14 @@ module.exports = class BrokerPool {
    * @see https://cwiki.apache.org/confluence/display/KAFKA/KIP-951%3A+Leader+discovery+optimisations+for+the+client
    * @public
    * @param {{ nodeId: number, host: string, port: number, rack: string|null }[]} [nodeEndpoints]
+   * @param {object} [options]
+   * @param {import('../producer/generation')} [options.fence] captured producer lifecycle; a pool
+   *   completed after its close is retired unused and changes no routing state
    * @returns {Promise<void>}
+   * @throws {Error} the lifecycle's close error
    */
-  async applyNodeEndpoints(nodeEndpoints) {
+  async applyNodeEndpoints(nodeEndpoints, { fence } = {}) {
+    fence?.check()
     if (!nodeEndpoints || nodeEndpoints.length === 0) {
       return
     }
@@ -298,6 +323,10 @@ module.exports = class BrokerPool {
 
       const isSeed = broker !== undefined && broker === this.seedBroker
       const connectionPool = await this.buildConnectionPool({ host, port, rack })
+      if (fence?.closed) {
+        this.closePool(connectionPool)
+        fence.check()
+      }
 
       if (this.brokers[nodeId] !== broker || (isSeed && this.seedBroker !== broker)) {
         this.closePool(connectionPool)
@@ -402,10 +431,18 @@ module.exports = class BrokerPool {
    * nor point at a broker that is already tearing down - across the awaits in here.
    *
    * @public
+   * @param {object} [options]
+   * @param {import('../producer/generation')} [options.fence] the producer lifecycle asking: once
+   *   it closed, a pool built meanwhile is retired unused instead of installed
    * @returns {Promise<void>}
+   * @throws {Error} the lifecycle's close error
    */
-  async createSeedBroker() {
+  async createSeedBroker({ fence } = {}) {
     const connectionPool = await this.buildConnectionPool()
+    if (fence?.closed) {
+      this.closePool(connectionPool)
+      fence.check()
+    }
     const previousSeedBroker = this.seedBroker
 
     this.seedBroker = this.createBroker({
@@ -426,18 +463,24 @@ module.exports = class BrokerPool {
    * treats a `TypeError` as unrecoverable and would turn a transient window into a crash.
    *
    * @public
+   * @param {object} [options]
+   * @param {import('../producer/generation')} [options.fence] the producer lifecycle asking: its
+   *   close ends the retries and opens no socket afterwards
    * @returns {Promise<void>}
+   * @throws {Error} the lifecycle's close error
    */
-  async connect() {
+  async connect({ fence } = {}) {
     if (this.hasConnectedBrokers()) {
       return
     }
 
+    fence?.check()
     if (!this.seedBroker) {
-      await this.createSeedBroker()
+      await this.createSeedBroker({ fence })
     }
 
-    return this.retrier(async (bail, retryCount, retryTime) => {
+    return this.retryFor(fence)(async (bail, retryCount, retryTime) => {
+      fence?.check()
       const seedBroker = this.seedBroker
 
       if (!seedBroker) {
@@ -445,15 +488,17 @@ module.exports = class BrokerPool {
       }
 
       try {
-        await seedBroker.connect()
+        await seedBroker.connect(...guardArgs(fence))
+        fence?.check()
         this.versions = seedBroker.versions
       } catch (caught) {
+        fence?.check()
         const e = isNativeError(caught)
           ? caught
           : new KafkaJSNonRetriableError(describeThrown(caught), { cause: caught })
         if (isConnectionFailure(e) || describeThrown(e, 'type') === 'ILLEGAL_SASL_STATE') {
           // Connection builder will always rotate the seed broker
-          await this.createSeedBroker()
+          await this.createSeedBroker({ fence })
           try {
             this.logger.error(
               `Failed to connect to seed broker, trying another broker from the list: ${describeThrown(e)}`,
@@ -479,10 +524,13 @@ module.exports = class BrokerPool {
    * the drain builds a new table, which this call leaves intact. If one drain fails, this call
    * rejects while the other drains continue; the captured table stays detached.
    * @public
+   * @param {object} [options]
+   * @param {number} [options.drainTimeout] ms each connection waits for its requests, 0 closing
+   *   at once; each pool's own bound when omitted
    * @returns {Promise<void>} resolves when every broker has disconnected
    * @throws {Error} when a broker's disconnect fails
    */
-  async disconnect() {
+  async disconnect(options) {
     const brokers = new Set(values(this.brokers))
     if (this.seedBroker) brokers.add(this.seedBroker)
     this.brokers = {}
@@ -492,7 +540,9 @@ module.exports = class BrokerPool {
 
     await Promise.all(
       [...brokers].map((broker) =>
-        broker === this.seedBroker ? broker.disconnect() : broker.retire()
+        broker === this.seedBroker
+          ? broker.disconnect(...(options ? [options] : []))
+          : broker.retire(...(options ? [options] : []))
       )
     )
   }
@@ -567,18 +617,23 @@ module.exports = class BrokerPool {
    *
    * @public
    * @param {Array<String>} topics
+   * @param {object} [options]
+   * @param {import('../producer/generation')} [options.fence] the producer lifecycle asking: once
+   *   it closed, the retries stop, no socket opens, and a response in flight publishes nothing
    * @returns {Promise<void>}
+   * @throws {Error} the lifecycle's close error
    */
-  async refreshMetadata(topics) {
+  async refreshMetadata(topics, { fence } = {}) {
     const accept = this.captureTopics?.(topics || [])
     try {
-      await this.retrier(async (bail, retryCount, retryTime) => {
+      await this.retryFor(fence)(async (bail, retryCount, retryTime) => {
         let broker
         try {
-          broker = await this.findConnectedBroker()
+          broker = await this.findConnectedBroker(...(fence ? [{ fence }] : []))
         } catch (err) {
           return bail(err)
         }
+        fence?.check()
 
         // Captured once, before any `await` in this callback: a concurrent rebootstrap (reachable
         // because `Cluster#metadata()` calls `refreshMetadataIfNecessary` directly, bypassing
@@ -590,13 +645,18 @@ module.exports = class BrokerPool {
 
         try {
           if (accept) {
-            const response = await broker.metadata(topics)
+            const response = await broker.metadata(topics, ...guardArgs(fence))
+            fence?.check()
             const incoming = response.topicMetadata.filter(({ topic }) => accept(topic))
             const replaced = new Set(incoming.map(({ topic }) => topic))
             const retained = (this.metadata?.topicMetadata || []).filter(
               ({ topic }) => !replaced.has(topic)
             )
             this.metadata = { ...response, topicMetadata: [...retained, ...incoming] }
+          } else if (fence) {
+            const response = await broker.metadata(topics, ...guardArgs(fence))
+            fence.check()
+            this.metadata = response
           } else {
             this.metadata = await broker.metadata(topics)
           }
@@ -610,7 +670,7 @@ module.exports = class BrokerPool {
           // unavailability. Everything below reads this local instead.
           const metadata = this.metadata
           const publication = ++this.metadataPublications
-          const isLatest = () => this.metadataPublications === publication
+          const isLatest = () => this.metadataPublications === publication && !fence?.closed
           // Applied here, on the statement after the assignment and before any await, so no
           // reader can observe the fresh response with the monotonic leader guard not yet
           // applied. An empty topic list is encoded as the null array, which asks for every topic
@@ -671,6 +731,7 @@ module.exports = class BrokerPool {
             }
           }
         } catch (e) {
+          fence?.check()
           if (
             e.type === 'LEADER_NOT_AVAILABLE' ||
             (broker.allowAutoTopicCreation && e.type === 'UNKNOWN_TOPIC_OR_PARTITION')
@@ -684,7 +745,7 @@ module.exports = class BrokerPool {
 
       this.onMetadataSuccess()
     } catch (e) {
-      await this.onMetadataFailure(e)
+      if (!fence?.closed) await this.onMetadataFailure(e)
       throw e
     }
   }
@@ -775,9 +836,11 @@ module.exports = class BrokerPool {
    *
    * @public
    * @param {Array<String>} topics
+   * @param {object} [options]
+   * @param {import('../producer/generation')} [options.fence] see `refreshMetadata`
    * @returns {Promise<null>}
    */
-  async refreshMetadataIfNecessary(topics) {
+  async refreshMetadataIfNecessary(topics, { fence } = {}) {
     const shouldRefresh =
       this.metadata == null ||
       this.metadataExpireAt == null ||
@@ -787,7 +850,7 @@ module.exports = class BrokerPool {
       )
 
     if (shouldRefresh) {
-      return this.refreshMetadata(topics)
+      return fence ? this.refreshMetadata(topics, { fence }) : this.refreshMetadata(topics)
     }
   }
 
@@ -815,36 +878,47 @@ module.exports = class BrokerPool {
    * @public
    * @param {object} options
    * @param {string} options.nodeId
+   * @param {import('../producer/generation')} [options.fence] the producer lifecycle asking: its
+   *   close ends the connection attempts, and a closed one is refused
    * @returns {Promise<Broker>}
+   * @throws {Error} the lifecycle's close error
    */
-  async findBroker({ nodeId }) {
+  async findBroker({ nodeId, fence }) {
+    fence?.check()
     const broker = this.brokers[nodeId]
 
     if (!broker) {
       throw new KafkaJSBrokerNotFound(`Broker ${nodeId} not found in the cached metadata`)
     }
 
-    await this.connectBroker(broker)
+    await this.connectBroker(broker, ...(fence ? [{ fence }] : []))
+    fence?.check()
     return broker
   }
 
   /**
    * @public
    * @param {(params: { nodeId: string, broker: Broker }) => Promise<T>} callback
+   * @param {object} [options]
+   * @param {import('../producer/generation')} [options.fence] the producer lifecycle asking: once
+   *   it closed, no further broker is tried
    * @returns {Promise<T>}
+   * @throws {Error} the lifecycle's close error
    * @template T
    */
-  async withBroker(callback) {
+  async withBroker(callback, { fence } = {}) {
     const brokers = shuffle(keys(this.brokers))
     if (brokers.length === 0) {
       throw new KafkaJSBrokerNotFound('No brokers in the broker pool')
     }
 
     for (const nodeId of brokers) {
-      const broker = await this.findBroker({ nodeId })
+      const broker = await this.findBroker({ nodeId, fence })
       try {
         return await callback({ nodeId, broker })
-      } catch (e) {}
+      } catch (e) {
+        fence?.check()
+      }
     }
 
     return null
@@ -852,14 +926,19 @@ module.exports = class BrokerPool {
 
   /**
    * @public
+   * @param {object} [options]
+   * @param {import('../producer/generation')} [options.fence] the producer lifecycle asking: once
+   *   it closed, no broker is tried and no socket opens
    * @returns {Promise<Broker>}
+   * @throws {Error} the lifecycle's close error
    */
-  async findConnectedBroker() {
+  async findConnectedBroker({ fence } = {}) {
+    fence?.check()
     const nodeIds = shuffle(keys(this.brokers))
     const connectedBrokerId = nodeIds.find((nodeId) => this.brokers[nodeId].isConnected())
 
     if (connectedBrokerId) {
-      return await this.findBroker({ nodeId: connectedBrokerId })
+      return await this.findBroker({ nodeId: connectedBrokerId, fence })
     }
 
     // Cycle through the nodes until one connects. Tracked alongside: whether every failure seen
@@ -868,9 +947,11 @@ module.exports = class BrokerPool {
     // bad), so a single non-auth failure is what allows it to fire at all.
     let allFailuresWereAuthentication = nodeIds.length > 0
     for (const nodeId of nodeIds) {
+      fence?.check()
       try {
-        return await this.findBroker({ nodeId })
+        return await this.findBroker({ nodeId, fence })
       } catch (e) {
+        fence?.check()
         if (!isAuthenticationFailure(e)) {
           allFailuresWereAuthentication = false
         }
@@ -884,29 +965,37 @@ module.exports = class BrokerPool {
     // exactly the state a rebootstrap leaves behind), a successful metadata response since the
     // last rebootstrap (which is what stops one unreachable cluster producing a teardown per
     // retrier iteration), and at least one failure that was not purely an authentication failure.
+    fence?.check()
     if (this.shouldRebootstrapOnAllBrokersUnavailable(nodeIds, allFailuresWereAuthentication)) {
       await this.rebootstrap('all-brokers-unavailable')
+      fence?.check()
     }
 
     // Failed to connect to all known brokers, metadata might be old
-    await this.connect()
+    await this.connect(...(fence ? [{ fence }] : []))
+    fence?.check()
     return this.seedBroker
   }
 
   /**
    * @private
    * @param {Broker} broker
+   * @param {object} [options]
+   * @param {import('../producer/generation')} [options.fence] see `findBroker`
    * @returns {Promise<null>}
    */
-  async connectBroker(broker) {
+  async connectBroker(broker, { fence } = {}) {
     if (broker.isConnected()) {
       return
     }
 
-    return this.retrier(async (bail, retryCount, retryTime) => {
+    return this.retryFor(fence)(async (bail, retryCount, retryTime) => {
       try {
-        await broker.connect()
+        fence?.check()
+        await broker.connect(...guardArgs(fence))
+        fence?.check()
       } catch (caught) {
+        fence?.check()
         const e = isNativeError(caught)
           ? caught
           : new KafkaJSNonRetriableError(describeThrown(caught), { cause: caught })
@@ -925,14 +1014,16 @@ module.exports = class BrokerPool {
           // replaceConnectionPool also resets versionsGeneration, so the next connect() always
           // re-negotiates against the replacement pool (KIP-35 rule 7) rather than comparing
           // against the generation the old, discarded pool had reached.
-          this.replacePool(
-            broker,
-            await this.buildConnectionPool({
-              host: broker.connectionPool.host,
-              port: broker.connectionPool.port,
-              rack: broker.connectionPool.rack,
-            })
-          )
+          const replacement = await this.buildConnectionPool({
+            host: broker.connectionPool.host,
+            port: broker.connectionPool.port,
+            rack: broker.connectionPool.rack,
+          })
+          if (fence?.closed) {
+            this.closePool(replacement)
+            fence.check()
+          }
+          this.replacePool(broker, replacement)
 
           try {
             this.logger.error(`Failed to connect to broker, reconnecting`, {

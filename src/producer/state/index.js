@@ -62,7 +62,9 @@ class ProducerStateManager {
   #logger
   #transactional
   #retries
+  #retry
   #retrier
+  #getGeneration
   #addPartitionsToTxn
   #identity
   /** @type {Map<string, Set<number>>} partitions in the current transaction */
@@ -77,7 +79,9 @@ class ProducerStateManager {
   #started = false
   /** Moves on every return to READY, so a late answer cannot touch the next transaction. */
   #generation = 0
+  /** @type {?{ lifecycle: ?import('../generation'), promise: Promise<void> }} */
   #acquisition = null
+  /** @type {?{ lifecycle: ?import('../generation'), promise: Promise<void> }} */
   #recovery = null
   #sequencer
   #transaction
@@ -96,10 +100,14 @@ class ProducerStateManager {
    *   options for the requests this class makes on the send path - AddPartitionsToTxn, and a
    *   producer id lost to the epoch ceiling
    * @param {number} [options.deliveryRetries=retry.retries] how many times a batch is sent again
-   * @param {() => Promise<import('../../../types').Broker>} options.findBroker the broker an
-   *   InitProducerId goes to, asked again for every request
-   * @param {(topics: { topic: string, partitions: number[] }[]) => Promise<void>} options.addPartitionsToTxn
+   * @param {(lifecycle?: import('../generation')) => Promise<import('../../../types').Broker>} options.findBroker
+   *   the broker an InitProducerId goes to, asked again for every request with the producer
+   *   lifecycle the operation captured
+   * @param {(topics: { topic: string, partitions: number[] }[], lifecycle?: import('../generation')) => Promise<void>} options.addPartitionsToTxn
    *   sends one AddPartitionsToTxn with the current producer id and epoch
+   * @param {() => (import('../generation')|undefined)} [options.getGeneration] the producer's
+   *   current lifecycle. Each operation reads it once when it starts - never after an await - and
+   *   its retries stop, and its answer changes nothing, once that lifecycle is closed.
    */
   constructor({
     logger,
@@ -110,11 +118,14 @@ class ProducerStateManager {
     deliveryRetries = retry.retries,
     findBroker,
     addPartitionsToTxn,
+    getGeneration = () => undefined,
   }) {
     this.#logger = logger
     this.#transactional = transactional
     this.#retries = deliveryRetries ?? createRetry.defaults.retries
+    this.#retry = retry
     this.#retrier = createRetry(retry)
+    this.#getGeneration = getGeneration
     this.#addPartitionsToTxn = addPartitionsToTxn
     this.#sequencer = new PartitionSequencer({ logger })
     this.#transaction = new TransactionState()
@@ -127,6 +138,7 @@ class ProducerStateManager {
       transactionTimeout,
       findBroker,
       onReset: () => this.#resetSequences(),
+      getGeneration,
     })
   }
 
@@ -195,17 +207,24 @@ class ProducerStateManager {
    * @returns {Promise<void>}
    * @throws {import('../../errors').KafkaJSInvalidConfigurationError} CLUSTER_AUTHORIZATION_FAILED
    * @throws {Error} any other error of the request, unchanged; nothing is armed
+   * @throws {Error} the close error of the producer lifecycle, when it closed meanwhile
    */
   initialize() {
-    const pending = this.#identity.pendingInitialization() ?? this.#acquisition
+    const lifecycle = this.#getGeneration()
+    const pending = this.#identity.pendingInitialization()
     if (pending !== null) {
       return pending
     }
+    if (this.#acquisition !== null && this.#acquisition.lifecycle === lifecycle) {
+      return this.#acquisition.promise
+    }
 
-    this.#acquisition = this.#identity.initialize().finally(() => {
-      this.#acquisition = null
+    const acquisition = { lifecycle, promise: null }
+    acquisition.promise = this.#identity.initialize().finally(() => {
+      if (this.#acquisition === acquisition) this.#acquisition = null
     })
-    return this.#acquisition
+    this.#acquisition = acquisition
+    return acquisition.promise
   }
 
   /**
@@ -246,12 +265,15 @@ class ProducerStateManager {
       return HELD
     }
 
-    if (this.#recovery === null) {
-      this.#recovery = this.#recover().finally(() => {
-        this.#recovery = null
+    const lifecycle = this.#getGeneration()
+    if (this.#recovery === null || this.#recovery.lifecycle !== lifecycle) {
+      const recovery = { lifecycle, promise: null }
+      recovery.promise = this.#recover(lifecycle).finally(() => {
+        if (this.#recovery === recovery) this.#recovery = null
       })
+      this.#recovery = recovery
     }
-    return this.#recovery
+    return this.#recovery.promise
   }
 
   /**
@@ -424,7 +446,7 @@ class ProducerStateManager {
    * @returns {Verdict}
    */
   fail(batch, error, { logStartOffset, transmitted } = {}) {
-    const expired = error instanceof KafkaJSDeliveryTimeout
+    const expired = error instanceof KafkaJSDeliveryTimeout || error.outcome !== undefined
     if (expired && transmitted === false) {
       if (batch.firstSequence !== null) this.sequencer.rebase(batch)
       else this.sequencer.fail(batch)
@@ -653,12 +675,15 @@ class ProducerStateManager {
    * Acquires the producer id `ensureProducerId()` found missing: retries a retriable error with
    * the producer's retry options and stops at once on any other. It also stops, without a request,
    * once any caller holds a producer id again, so one acquired during a backoff is kept. A fatal
-   * error arms `FATAL_ERROR`; any other final failure rejects the queued batches with it.
+   * error arms `FATAL_ERROR`; any other final failure rejects the queued batches with it. Once
+   * the producer lifecycle it began under closes, it stops and changes no state.
+   * @param {import('../generation')} [lifecycle] the producer lifecycle captured by the caller
    * @returns {Promise<void>} never rejects
    */
-  async #recover() {
+  async #recover(lifecycle) {
     try {
-      await this.#retrier(async (bail) => {
+      await this.#retrierFor(lifecycle)(async (bail) => {
+        lifecycle?.check()
         if (this.#identity.isValid()) {
           return
         }
@@ -666,6 +691,7 @@ class ProducerStateManager {
         try {
           await this.initialize()
         } catch (e) {
+          lifecycle?.check()
           this.classify(e, 'txn')
           if (e.retriable === true) {
             throw e
@@ -674,12 +700,24 @@ class ProducerStateManager {
         }
       })
     } catch (error) {
+      if (lifecycle?.closed) {
+        return
+      }
       if (transactionStateFor(error) === FATAL_ERROR) {
         this.arm(error)
       } else {
         this.sequencer.abortQueued(error)
       }
     }
+  }
+
+  /**
+   * @param {import('../generation')} [lifecycle] the producer lifecycle an operation captured
+   * @returns {import('../../retry').Retrier} a retrier that stops, with the lifecycle's close
+   *   error, when the lifecycle closes; the manager's own without one
+   */
+  #retrierFor(lifecycle) {
+    return lifecycle ? createRetry({ ...this.#retry, fence: lifecycle }) : this.#retrier
   }
 
   /**
@@ -703,7 +741,10 @@ class ProducerStateManager {
     const topics = new Map()
     this.#nextAdd = topics
     const generation = this.#generation
-    this.#nextAddPromise = Promise.resolve().then(() => this.#sendAdd(topics, generation))
+    const lifecycle = this.#getGeneration()
+    this.#nextAddPromise = Promise.resolve().then(() =>
+      this.#sendAdd(topics, generation, lifecycle)
+    )
     const settled = this.#nextAddPromise.then(ignore, ignore)
     this.#adds.add(settled)
     settled.then(() => this.#adds.delete(settled))
@@ -714,9 +755,11 @@ class ProducerStateManager {
    * they were registered in has ended; its answer only counts while that transaction lasts.
    * @param {Map<string, number[]>} topics
    * @param {number} generation the transaction the partitions were registered in
+   * @param {import('../generation')} [lifecycle] the producer lifecycle captured when they were
+   *   registered: once it closes the retries stop, and the answer joins nothing and arms nothing
    * @returns {Promise<void>}
    */
-  async #sendAdd(topics, generation) {
+  async #sendAdd(topics, generation, lifecycle) {
     if (this.#nextAdd === topics) {
       this.#nextAdd = null
     }
@@ -727,10 +770,12 @@ class ProducerStateManager {
     const request = [...topics].map(([topic, partitions]) => ({ topic, partitions }))
 
     try {
-      await this.#retrier(async (bail) => {
+      await this.#retrierFor(lifecycle)(async (bail) => {
+        lifecycle?.check()
         try {
-          await this.#addPartitionsToTxn(request)
+          await this.#addPartitionsToTxn(request, ...(lifecycle ? [lifecycle] : []))
         } catch (e) {
+          lifecycle?.check()
           this.classify(e, 'txn')
           if (e.retriable === true) {
             throw e
@@ -738,13 +783,14 @@ class ProducerStateManager {
           bail(e)
         }
       })
+      lifecycle?.check()
 
       if (generation === this.#generation) {
         request.forEach(({ topic, partitions }) => partitions.forEach((p) => this.#join(topic, p)))
         this.#started = true
       }
     } catch (error) {
-      if (generation === this.#generation) {
+      if (generation === this.#generation && !lifecycle?.closed) {
         this.arm(error)
       }
       throw error

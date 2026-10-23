@@ -23,6 +23,7 @@ const {
   KafkaJSTransactionAbortableError,
 } = require('../../../errors')
 const { newLogger } = require('testHelpers')
+const Generation = require('../../generation')
 
 const TOPIC = 'topic-a'
 const OTHER_TOPIC = 'topic-b'
@@ -2085,36 +2086,32 @@ describe('Producer > the accumulator', () => {
         expect(jest.getTimerCount()).toBe(0)
       })
 
-      test('sends accepted while an earlier disconnect() still tears down are refused once it ends, producing nothing and leaving no timer', async () => {
+      test('connect waits for active close and sends during it keep the disconnecting refusal', async () => {
         const torn = deferred()
-        const held = deferred()
         const { cluster, producer } = createLingeringProducer({ idempotent, linger: 60000 })
         await producer.connect()
         cluster.disconnect.mockImplementationOnce(() => torn.promise)
         const disconnected = producer.disconnect()
         await jest.advanceTimersByTimeAsync(0)
-        await producer.connect()
-        const lingering = producer
-          .send({ topic: TOPIC, messages: [{ value: 'x' }] })
-          .catch((e) => e)
-        await jest.advanceTimersByTimeAsync(0)
-        cluster.refreshMetadataIfNecessary.mockImplementationOnce(() => held.promise)
-        const partitioning = producer
-          .send({ topic: TOPIC, messages: [{ value: 'y' }] })
-          .catch((e) => e)
-        await jest.advanceTimersByTimeAsync(0)
-
-        torn.resolve()
-        await settledWithin(disconnected)
-        held.resolve()
-
-        const refused = new KafkaJSError('The producer is disconnected')
-        expect(await settledWithin(Promise.all([lingering, partitioning]))).toEqual([
-          refused,
-          refused,
-        ])
-        expect(cluster.broker.produce).not.toHaveBeenCalled()
-        expect(jest.getTimerCount()).toBe(0)
+        const connecting = producer.connect()
+        const connected = settledFlag(connecting)
+        try {
+          await jest.advanceTimersByTimeAsync(0)
+          expect(connected()).toBe(false)
+          expect(cluster.connect).toHaveBeenCalledTimes(1)
+          const refused = await producer
+            .send({ topic: TOPIC, messages: [{ value: 'x' }] })
+            .catch((error) => error)
+          expect(refused).toBeInstanceOf(KafkaJSNonRetriableError)
+          expect(refused.message).toMatch(/producer is disconnecting/)
+          expect(cluster.broker.produce).not.toHaveBeenCalled()
+          expect(jest.getTimerCount()).toBe(0)
+        } finally {
+          torn.resolve()
+          await disconnected
+          await connecting
+        }
+        expect(cluster.connect).toHaveBeenCalledTimes(2)
       })
 
       test('a send that joins a batch while disconnect() delivers the lingering ones goes out at once, arming no timer', async () => {
@@ -3345,5 +3342,205 @@ describe('Producer > the accumulator > the topics a send holds', () => {
     const sent = append(accumulator, records(0, 'a'))
 
     await expect(settledWithin(sent, LINGER)).resolves.toHaveLength(1)
+  })
+})
+
+describe('Producer > the accumulator > the flush inventory', () => {
+  beforeEach(() => {
+    jest.useFakeTimers({ now: 0 })
+  })
+  afterEach(() => {
+    jest.useRealTimers()
+  })
+
+  /**
+   * An accumulator over a buffer of `capacity` whose send path keeps every batch it is handed;
+   * `partition` assigns at once unless the case holds it.
+   */
+  const inventory = ({
+    capacity = 1048576,
+    linger = 0,
+    deadline,
+    partition = byMessage,
+    getGeneration,
+  } = {}) => {
+    const admission = new Admission({ capacity, maxBlockMs: 60000 })
+    const batches = []
+    const accumulator = new Accumulator({
+      linger,
+      batchSize: BATCH_SIZE,
+      deadline,
+      admission,
+      partition,
+      sendPartitioned: async ({ batches: handed }) => {
+        batches.push(...handed)
+      },
+      getGeneration,
+    })
+    return { accumulator, admission, batches }
+  }
+
+  /** Records when each promise settles, in the order the settlements are observed. */
+  const observe = (order, named) => {
+    for (const [name, promise] of Object.entries(named)) {
+      promise.then(
+        () => order.push(name),
+        () => order.push(name)
+      )
+    }
+  }
+
+  test('a snapshot settles after the promise of every send begun before it, whatever ends each one', async () => {
+    const assigned = deferred()
+    const { accumulator, admission, batches } = inventory({
+      capacity: 8192,
+      deadline: 1000,
+      partition: async (send) =>
+        send.records[0].topic === 'held' ? assigned.promise : byMessage(send),
+    })
+    const order = []
+    const sends = {
+      delivered: append(accumulator, records(0, 'a')),
+      failed: append(accumulator, records(1, 'b')),
+      expired: accumulator.append({
+        acks: -1,
+        topicMessages: [{ topic: 'held', messages: records(0, 'c') }],
+      }),
+      refused: accumulator.append({
+        acks: -1,
+        topicMessages: [{ topic: TOPIC, messages: [{ value: 'w'.repeat(2000) }] }],
+      }),
+    }
+    Object.values(sends).forEach((promise) => promise.catch(() => {}))
+    observe(order, sends)
+    await jest.advanceTimersByTimeAsync(0)
+    expect(admission.waitingBytes).toBeGreaterThan(0)
+    const [snapshot] = accumulator.unsettled()
+    snapshot.then(() => order.push('flush'))
+    await jest.advanceTimersByTimeAsync(500)
+    const later = append(accumulator, records(2, 'later'))
+    const laterSettled = settledFlag(later.catch(() => {}))
+
+    batches[0].settlers.forEach((settler) => settler.resolve({ partition: 0, baseOffset: '0' }))
+    batches[1].settlers.forEach((settler) => settler.reject(new KafkaJSError('failed')))
+    await jest.advanceTimersByTimeAsync(500)
+    expect(order).toEqual(['delivered', 'failed', 'expired', 'refused', 'flush'])
+    expect(laterSettled()).toBe(false)
+    expect(accumulator.unsettled()).toHaveLength(1)
+    await jest.advanceTimersByTimeAsync(500)
+    await expect(later).rejects.toMatchObject({ name: 'KafkaJSDeliveryTimeout' })
+    assigned.resolve([])
+    batches.splice(0).forEach((batch) => batch.retire())
+    await jest.advanceTimersByTimeAsync(0)
+    expect(accumulator.unsettled()).toEqual([])
+    expect(admission.reserved).toBe(0)
+  })
+
+  test('a send whose records cannot join a batch leaves the inventory with its rejection', async () => {
+    const { accumulator, admission } = inventory({
+      partition: async () => [{ topic: TOPIC, partition: 0, messages: null }],
+    })
+    const sent = append(accumulator, records(0, 'a'))
+    const [snapshot] = accumulator.unsettled()
+
+    await expect(sent).rejects.toBeInstanceOf(TypeError)
+    await snapshot
+    expect(accumulator.unsettled()).toEqual([])
+    expect(admission.reserved).toBe(0)
+  })
+
+  test('a later snapshot also waits for the sends an earlier one covers, and none is taken when nothing is unsettled', async () => {
+    const { accumulator, batches } = inventory()
+    expect(accumulator.unsettled()).toEqual([])
+    const first = append(accumulator, records(0, 'a'))
+    const [older] = accumulator.unsettled()
+    const second = append(accumulator, records(1, 'b'))
+    const [newer] = accumulator.unsettled()
+    const order = []
+    observe(order, { older, newer })
+    await jest.advanceTimersByTimeAsync(0)
+
+    batches[1].settlers.forEach((settler) => settler.resolve({ partition: 1, baseOffset: '0' }))
+    await second
+    await jest.advanceTimersByTimeAsync(0)
+    expect(order).toEqual([])
+    batches[0].settlers.forEach((settler) => settler.resolve({ partition: 0, baseOffset: '0' }))
+    await first
+    await jest.advanceTimersByTimeAsync(0)
+    expect(order).toEqual(['older', 'newer'])
+    expect(accumulator.unsettled()).toEqual([])
+    batches.splice(0).forEach((batch) => batch.retire())
+  })
+
+  test("a forced close rejects every send waiting for its partitions or lingering as unsent, with or without a deadline, and keeps a held assignment's shell until it returns", async () => {
+    const assigned = deferred()
+    const { accumulator, admission } = inventory({
+      linger: 60000,
+      partition: async (send) =>
+        send.records[0].topic === 'held' ? assigned.promise : byMessage(send),
+    })
+    const held = accumulator.append({
+      acks: -1,
+      topicMessages: [{ topic: 'held', messages: records(0, 'a') }],
+    })
+    const lingering = append(accumulator, records(0, 'b'))
+    const settled = settledFlag(Promise.allSettled([held, lingering]))
+    await jest.advanceTimersByTimeAsync(0)
+    expect(jest.getTimerCount()).toBe(1)
+    const [snapshot] = accumulator.unsettled()
+
+    accumulator.forceClose()
+    await jest.advanceTimersByTimeAsync(0)
+    expect(settled()).toBe(true)
+    for (const sent of [held, lingering]) {
+      await expect(sent).rejects.toMatchObject({
+        name: 'KafkaJSProducerClosedError',
+        outcome: 'unsent',
+      })
+    }
+    await snapshot
+    expect(jest.getTimerCount()).toBe(0)
+    expect(admission.reserved).toBe(1536)
+    assigned.resolve([{ topic: 'held', partition: 0, messages: [] }])
+    await jest.advanceTimersByTimeAsync(0)
+    expect(admission.reserved).toBe(0)
+    expect(accumulator.unsettled()).toEqual([])
+  })
+
+  test('a send granted room after a wait goes on, and one granted as the producer closes is refused unsent and gives the room back', async () => {
+    const generation = new Generation()
+    const { accumulator, admission, batches } = inventory({
+      capacity: 4096,
+      getGeneration: () => generation,
+    })
+    const value = (prefix) => [{ partition: 0, value: prefix.repeat(1500) }]
+    /** Answers and retires the batch handed on first. */
+    const answer = () => {
+      const batch = batches.shift()
+      batch.settlers.forEach((settler) => settler.resolve({ partition: 0, baseOffset: '0' }))
+      batch.retire()
+    }
+    const first = append(accumulator, value('a'))
+    const second = append(accumulator, value('b'))
+    await jest.advanceTimersByTimeAsync(0)
+    answer()
+    await first
+    await jest.advanceTimersByTimeAsync(0)
+    const third = append(accumulator, value('c'))
+    const settled = settledFlag(third.catch(() => {}))
+    expect(admission.waitingBytes).toBeGreaterThan(0)
+
+    answer()
+    expect(admission.waitingBytes).toBe(0)
+    generation.close(new KafkaJSError('closed'))
+    await jest.advanceTimersByTimeAsync(0)
+    expect(settled()).toBe(true)
+    await expect(third).rejects.toMatchObject({
+      name: 'KafkaJSProducerClosedError',
+      outcome: 'unsent',
+    })
+    await second
+    expect(admission.reserved).toBe(0)
+    expect(accumulator.unsettled()).toEqual([])
   })
 })

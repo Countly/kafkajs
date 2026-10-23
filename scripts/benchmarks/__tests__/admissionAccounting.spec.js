@@ -63,7 +63,7 @@ describe('the counts the send-path benchmarks print', () => {
   const missing = (path) =>
     Object.assign(new Error(`Cannot find module '${path}'`), { code: 'MODULE_NOT_FOUND' })
 
-  test('counts every append, every admission and the deadline each append starts, from zero again after a reset', () => {
+  test('counts every append, every admission, the deadline each append starts and each send the flush inventory tracks, from zero again after a reset', () => {
     jest.isolateModules(() => {
       const counters = require('../sendPathCounters')()
       const Isolated = require('../../../src/producer/state/accumulator')
@@ -79,11 +79,21 @@ describe('the counts the send-path benchmarks print', () => {
 
       send([{ value: 'v' }])
       send([{ value: 'w' }])
-      expect(counters.read()).toEqual({ appendCalls: 2, acquireCalls: 2, deadlines: 2 })
+      expect(counters.read()).toEqual({
+        appendCalls: 2,
+        acquireCalls: 2,
+        deadlines: 2,
+        flushTracked: 2,
+      })
 
       counters.reset()
       send([])
-      expect(counters.read()).toEqual({ appendCalls: 1, acquireCalls: 0, deadlines: 0 })
+      expect(counters.read()).toEqual({
+        appendCalls: 1,
+        acquireCalls: 0,
+        deadlines: 0,
+        flushTracked: 0,
+      })
     })
   })
 

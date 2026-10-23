@@ -1,6 +1,7 @@
 const BrokerPool = require('../brokerPool')
 const Broker = require('../../broker')
 const Cluster = require('../index')
+const Generation = require('../../producer/generation')
 const ConnectionPool = require('../../network/connectionPool')
 const { KafkaJSConnectionClosedError } = require('../../errors')
 const { responseHeaderVersion } = require('../../protocol/headers')
@@ -715,3 +716,148 @@ it.each(['coordinator lookup', 'cached broker', 'late endpoint'])(
     }
   }
 )
+
+describe('a closed producer lifecycle and an endpoint pool that finishes late', () => {
+  const closed = new Error('the producer was closed')
+  const HINT = {
+    topic: 't',
+    partition: 0,
+    leaderId: 42,
+    leaderEpoch: 2,
+    nodeEndpoints: [{ nodeId: 42, host: 'late', port: 9092, rack: null }],
+  }
+  /** @returns {object} a fresh Metadata response, as the cache keeps what it is given */
+  const metadata = () => ({
+    throttleTime: 0,
+    brokers: [],
+    clusterId: 'cluster',
+    controllerId: 0,
+    topicMetadata: [
+      {
+        topicErrorCode: 0,
+        topic: 't',
+        topicId: null,
+        isInternal: false,
+        partitionMetadata: [
+          {
+            partitionErrorCode: 0,
+            partitionId: 0,
+            leader: 0,
+            leaderEpoch: 1,
+            replicas: [0],
+            isr: [0],
+            offlineReplicas: [],
+          },
+        ],
+      },
+    ],
+  })
+
+  /**
+   * An offline cluster with its seed built and t-0 cached at epoch 1, whose next pool build waits
+   * for `release()`, and whose coordinator lookup answers node 42 at late:9092.
+   * @returns {Promise<{ cluster: Cluster, pool: ConnectionPool, generation: Generation,
+   *   release: () => void }>}
+   */
+  const lateCluster = async () => {
+    const cluster = new Cluster({
+      logger: newLogger(),
+      clientId: 'client',
+      brokers: ['seed:9092'],
+      requestTimeout: 1000,
+      retry: { retries: 0 },
+      allowAutoTopicCreation: false,
+      metadataMaxAge: 1000,
+    })
+    await cluster.brokerPool.createSeedBroker()
+    cluster.metadataCache.update(metadata())
+    cluster.findGroupCoordinatorMetadata = jest.fn(async () => ({
+      coordinator: { nodeId: 42, host: 'late', port: 9092 },
+    }))
+    const pool = new ConnectionPool({ logger: newLogger(), host: 'late', port: 9092 })
+    pool.retire = jest.fn()
+    pool.destroy = jest.fn(async () => {})
+    let release
+    cluster.brokerPool.buildConnectionPool = jest.fn(
+      () => new Promise((resolve) => (release = () => resolve(pool)))
+    )
+    return { cluster, pool, generation: new Generation(), release: () => release() }
+  }
+
+  it('a coordinator pool built after the close installs no broker and is retired unused', async () => {
+    const { cluster, pool, generation, release } = await lateCluster()
+    try {
+      const lookup = outcome(cluster.findGroupCoordinator({ groupId: 'group', fence: generation }))
+      await settled()
+      expect(cluster.brokerPool.buildConnectionPool).toHaveBeenCalledTimes(1)
+
+      generation.close(closed)
+      await cluster.disconnect({ drainTimeout: 0 })
+      release()
+
+      expect((await lookup).error).toBe(closed)
+      expect(cluster.brokerPool.brokers[42]).toBeUndefined()
+      expect(pool.retire).toHaveBeenCalledTimes(1)
+      expect(pool.destroy).toHaveBeenCalledTimes(1)
+    } finally {
+      await cluster.disconnect({ drainTimeout: 0 })
+    }
+  })
+
+  it('a hint pool built after the close changes neither the broker table nor the cached epoch', async () => {
+    const { cluster, pool, generation, release } = await lateCluster()
+    try {
+      const hint = outcome(cluster.applyLeaderHint(HINT, { fence: generation }))
+      await settled()
+      expect(cluster.brokerPool.buildConnectionPool).toHaveBeenCalledTimes(1)
+
+      generation.close(closed)
+      await cluster.disconnect({ drainTimeout: 0 })
+      release()
+      const { error } = await hint
+
+      expect(cluster.leaderEpoch('t', 0)).toBe(1)
+      expect(error).toBe(closed)
+      expect(cluster.brokerPool.brokers[42]).toBeUndefined()
+      expect(pool.retire).toHaveBeenCalledTimes(1)
+      expect(pool.destroy).toHaveBeenCalledTimes(1)
+    } finally {
+      await cluster.disconnect({ drainTimeout: 0 })
+    }
+  })
+
+  it('a hint whose lifecycle closes as the endpoint work ends does not update the cached epoch', async () => {
+    const { cluster, generation } = await lateCluster()
+    const apply = cluster.brokerPool.applyNodeEndpoints.bind(cluster.brokerPool)
+    cluster.brokerPool.applyNodeEndpoints = async (...args) => {
+      await apply(...args)
+      generation.close(closed)
+    }
+    try {
+      const hint = await outcome(
+        cluster.applyLeaderHint({ ...HINT, nodeEndpoints: [] }, { fence: generation })
+      )
+
+      expect(cluster.leaderEpoch('t', 0)).toBe(1)
+      expect(hint.error).toBe(closed)
+    } finally {
+      await cluster.disconnect({ drainTimeout: 0 })
+    }
+  })
+
+  it('a hint on an open lifecycle still installs its broker and advances the epoch', async () => {
+    const { cluster, pool, generation, release } = await lateCluster()
+    try {
+      const hint = outcome(cluster.applyLeaderHint(HINT, { fence: generation }))
+      await settled()
+      release()
+
+      expect(await hint).toEqual({ value: true })
+      expect(cluster.leaderEpoch('t', 0)).toBe(2)
+      expect(cluster.brokerPool.brokers[42].connectionPool).toBe(pool)
+      expect(pool.retire).not.toHaveBeenCalled()
+    } finally {
+      await cluster.disconnect({ drainTimeout: 0 })
+    }
+  })
+})

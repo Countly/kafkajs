@@ -618,3 +618,73 @@ describe('Producer > the buffer > through the producer', () => {
     }
   )
 })
+
+describe('Producer > the buffer > cancelling the waiters', () => {
+  beforeEach(() => {
+    jest.useFakeTimers({ now: 0, doNotFake: ['nextTick', 'setImmediate'] })
+  })
+
+  afterEach(() => {
+    jest.useRealTimers()
+  })
+
+  test('with nobody waiting changes nothing', () => {
+    const admission = new Admission({ capacity: 1000, maxBlockMs: 100 })
+    const held = admission.acquire(600, noDeadline())
+    const counters = countersOf(admission)
+
+    expect(() => admission.cancel(new Error('closed'))).not.toThrow()
+
+    expect(countersOf(admission)).toEqual(counters)
+    expect(held).toBeInstanceOf(Reservation)
+  })
+
+  test('rejects every waiter in arrival order with the one error, clears their timers and bytes, and keeps what is admitted', async () => {
+    const admission = new Admission({ capacity: 1000, maxBlockMs: 10000 })
+    const held = admission.acquire(800, noDeadline())
+    const timers = jest.getTimerCount()
+    const settled = []
+    const waiters = [300, 400].map((bytes, index) => {
+      const waiting = admission.acquire(bytes, noDeadline())
+      waiting.then(
+        () => settled.push(`granted ${index}`),
+        () => settled.push(`rejected ${index}`)
+      )
+      return watch(waiting)
+    })
+    expect(admission.waitingBytes).toBe(700)
+    expect(jest.getTimerCount()).toBe(timers + 2)
+    const closed = new Error('closed')
+
+    admission.cancel(closed)
+    await flushAll()
+
+    expect(waiters.map(({ state, value }) => [state, value])).toEqual([
+      ['rejected', closed],
+      ['rejected', closed],
+    ])
+    expect(settled).toEqual(['rejected 0', 'rejected 1'])
+    expect(admission.waitingBytes).toBe(0)
+    expect(jest.getTimerCount()).toBe(timers)
+    expect(admission.reserved).toBe(800)
+
+    held.releaseAll()
+    expect(countersOf(admission)).toEqual(quiescent(admission))
+  })
+
+  test('a release afterwards grants no cancelled waiter, and a later acquire is served', async () => {
+    const admission = new Admission({ capacity: 1000, maxBlockMs: 10000 })
+    const held = admission.acquire(800, noDeadline())
+    const waiting = watch(admission.acquire(500, noDeadline()))
+    admission.cancel(new Error('closed'))
+    await flushAll()
+
+    held.releaseAll()
+    await flushAll()
+    const later = admission.acquire(900, noDeadline())
+
+    expect(waiting.state).toBe('rejected')
+    expect(later).toBeInstanceOf(Reservation)
+    expect(admission.reserved).toBe(900)
+  })
+})

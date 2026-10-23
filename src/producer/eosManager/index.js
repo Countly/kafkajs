@@ -5,6 +5,7 @@ const {
   KafkaJSInvariantViolation,
   KafkaJSNonRetriableError,
   KafkaJSNumberOfRetriesExceeded,
+  KafkaJSProducerClosedError,
   KafkaJSTransactionAbortableError,
 } = require('../../errors')
 const COORDINATOR_TYPES = require('../../protocol/coordinatorTypes')
@@ -126,6 +127,9 @@ const consumerGroupOf = ({ consumerGroupId, consumerGroupMetadata }) => {
  *   path and this facade's own retries (InitProducerId, EndTxn, AddOffsetsToTxn, TxnOffsetCommit)
  * @param {number} [options.deliveryRetries] how many times a batch is sent again; `retry.retries`
  *   when absent
+ * @param {() => (import('../generation')|undefined)} [options.getGeneration] the producer's current
+ *   lifecycle. Each operation reads it once, when it starts, and never again after an await: its
+ *   retries stop, and it opens no socket and changes no state, once that lifecycle is closed.
  * @returns {EosManager}
  */
 const createEosManager = ({
@@ -136,6 +140,7 @@ const createEosManager = ({
   transactionalId,
   retry = cluster.retry,
   deliveryRetries,
+  getGeneration = () => undefined,
 }) => {
   if (transactional && !transactionalId) {
     throw new KafkaJSNonRetriableError('Cannot manage transactions without a transactionalId')
@@ -143,10 +148,22 @@ const createEosManager = ({
 
   const retrier = createRetry(retry)
 
-  const findTransactionCoordinator = () => {
+  /**
+   * @param {import('../generation')} [generation] the producer lifecycle an operation captured
+   * @returns {import('../../retry').Retrier} a retrier that stops, with the lifecycle's close
+   *   error, when the lifecycle closes; the facade's own without one
+   */
+  const retrierFor = (generation) =>
+    generation ? createRetry({ ...retry, fence: generation }) : retrier
+
+  /** The private options a broker request takes for a captured lifecycle; none without one. */
+  const guardOf = (generation) => (generation ? { guard: generation.guard } : {})
+
+  const findTransactionCoordinator = (generation) => {
     return cluster.findGroupCoordinator({
       groupId: transactionalId,
       coordinatorType: COORDINATOR_TYPES.TRANSACTION,
+      ...(generation ? { fence: generation } : {}),
     })
   }
 
@@ -159,17 +176,22 @@ const createEosManager = ({
     deliveryRetries,
     // Asks for no metadata first, as the Java producer: a non-transactional InitProducerId goes to
     // any connected broker, and a transactional one to its coordinator.
-    findBroker: () =>
-      transactional ? findTransactionCoordinator() : cluster.findConnectedBroker(),
-    addPartitionsToTxn: async (topics) => {
-      const broker = await findTransactionCoordinator()
+    findBroker: (generation) =>
+      transactional
+        ? findTransactionCoordinator(generation)
+        : cluster.findConnectedBroker(...(generation ? [{ fence: generation }] : [])),
+    addPartitionsToTxn: async (topics, generation) => {
+      const broker = await findTransactionCoordinator(generation)
+      generation?.check()
       await broker.addPartitionsToTxn({
         transactionalId,
         producerId: stateManager.producerId,
         producerEpoch: stateManager.producerEpoch,
         topics,
+        ...guardOf(generation),
       })
     },
+    getGeneration,
   })
 
   const transactionalGuard = () => {
@@ -183,10 +205,11 @@ const createEosManager = ({
    * retrier, retrying the coordinator answers that clear by themselves and handing every other
    * error to the caller unchanged.
    * @param {() => Promise<void>} request
+   * @param {import('../generation')} [generation] the lifecycle the caller captured
    * @returns {Promise<void>}
    */
-  const retryingInitProducerId = (request) =>
-    retrier(async (bail, retryCount, retryTime) => {
+  const retryingInitProducerId = (request, generation) =>
+    retrierFor(generation)(async (bail, retryCount, retryTime) => {
       try {
         await request()
       } catch (e) {
@@ -210,28 +233,33 @@ const createEosManager = ({
 
   /** Whether a KIP-360 epoch bump is owed before the next transaction; kept until one succeeds. */
   let bumpOwed = false
+  /** @type {?{ generation: ?import('../generation'), promise: Promise<void> }} */
   let bumping = null
 
   /**
-   * Performs the epoch bump owed, if any: one re-initialization shared by concurrent callers. A
-   * failure keeps the bump owed, so the next transaction tries it again.
+   * Performs the epoch bump owed, if any: one re-initialization shared by the concurrent callers
+   * of one producer lifecycle. A failure keeps the bump owed, so the next transaction tries it
+   * again, and so does a bump whose lifecycle closed before it answered.
+   * @param {import('../generation')} [generation] the lifecycle the caller captured
    * @returns {Promise<void>}
    */
-  const bumpIfOwed = () => {
+  const bumpIfOwed = (generation) => {
     if (!bumpOwed) {
       return Promise.resolve()
     }
 
-    bumping =
-      bumping ||
-      retryingInitProducerId(() => stateManager.reinitialize())
+    if (bumping === null || bumping.generation !== generation) {
+      const current = { generation, promise: null }
+      current.promise = retryingInitProducerId(() => stateManager.reinitialize(), generation)
         .then(() => {
-          bumpOwed = false
+          if (!generation?.closed) bumpOwed = false
         })
         .finally(() => {
-          bumping = null
+          if (bumping === current) bumping = null
         })
-    return bumping
+      bumping = current
+    }
+    return bumping.promise
   }
 
   /**
@@ -278,12 +306,14 @@ const createEosManager = ({
    * the attempts with that error as it is.
    * @see https://github.com/apache/kafka/blob/4.3/clients/src/main/java/org/apache/kafka/clients/producer/internals/TransactionManager.java
    * @param {boolean} committed
+   * @param {import('../generation')} [generation] the lifecycle the caller captured: its close
+   *   ends the retries, and an answer after it is not adopted
    * @returns {Promise<boolean>} whether a new producer id and epoch were adopted
    * @throws {KafkaJSInvariantViolation} while a batch is in flight; nothing is sent
    * @throws {Error} the EndTxn's error, classified; `KafkaJSNumberOfRetriesExceeded` once the
-   *   retries run out
+   *   retries run out; the lifecycle's close error once it closed
    */
-  const endTransaction = async (committed) => {
+  const endTransaction = async (committed, generation) => {
     if (!stateManager.transactionStarted()) {
       logger.debug('No partitions or offsets registered, not sending EndTxn')
       return false
@@ -294,17 +324,21 @@ const createEosManager = ({
     }
 
     const transactionVersion = stateManager.transactionVersion()
-    const ended = await retrier(async (bail) => {
+    const ended = await retrierFor(generation)(async (bail) => {
       try {
-        const coordinator = await findTransactionCoordinator()
+        generation?.check()
+        const coordinator = await findTransactionCoordinator(generation)
+        generation?.check()
         return await coordinator.endTxn({
           producerId: stateManager.producerId,
           producerEpoch: stateManager.producerEpoch,
           transactionalId,
           transactionResult: committed,
           transactionVersion,
+          ...guardOf(generation),
         })
       } catch (e) {
+        generation?.check()
         stateManager.classify(e, 'txn')
         if (e.retriable) {
           throw e
@@ -312,6 +346,7 @@ const createEosManager = ({
         bail(e)
       }
     })
+    generation?.check()
 
     if (transactionVersion === 2 && ended.producerId != null && String(ended.producerId) !== '-1') {
       stateManager.adopt({ producerId: ended.producerId, producerEpoch: ended.producerEpoch })
@@ -365,13 +400,15 @@ const createEosManager = ({
      *   naming both remedies
      */
     async initProducerId() {
+      const generation = getGeneration()
       stateManager.transaction.guard('initProducerId')
       const held = stateManager.isInitialized()
       await retryingInitProducerId(async () => {
         if (held || !stateManager.isInitialized()) {
           await stateManager.initialize()
         }
-      })
+      }, generation)
+      generation?.check()
       stateManager.transitionTo(STATES.READY)
 
       logger.debug('Initialized producer id & epoch', {
@@ -425,13 +462,16 @@ const createEosManager = ({
      *   stays `READY` (`FATAL_ERROR` when the re-initialization failed fatally)
      */
     async beginTransaction() {
+      const generation = getGeneration()
       stateManager.transaction.guard('beginTransaction')
       transactionalGuard()
-      const coordinator = await findTransactionCoordinator()
+      const coordinator = await findTransactionCoordinator(generation)
+      generation?.check()
       if (stateManager.version.begin(coordinator).bumpRequired) {
         bumpOwed = true
       }
-      await bumpIfOwed()
+      await bumpIfOwed(generation)
+      generation?.check()
       stateManager.transitionTo(STATES.IN_TRANSACTION)
     },
 
@@ -490,16 +530,28 @@ const createEosManager = ({
      *   producer is unusable, a fatal EndTxn answer included
      */
     async commit() {
+      const generation = getGeneration()
       stateManager.transaction.guard('commit')
       transactionalGuard()
       await stateManager.whenPartitionsAdded()
+      generation?.check()
       stateManager.resolveSequences()
       stateManager.transaction.guard('commit')
       stateManager.transitionTo(STATES.COMMITTING)
 
       try {
-        await endTransaction(true)
+        await endTransaction(true, generation)
+        generation?.check()
       } catch (error) {
+        if (generation?.closed) {
+          stateManager.transaction.holdCommit()
+          throw new KafkaJSProducerClosedError(
+            'The producer was closed with a commit unconfirmed',
+            {
+              outcome: 'unknown',
+            }
+          )
+        }
         const unknown = unknownOutcome(error)
         if (unknown !== null) {
           stateManager.transaction.holdCommit()
@@ -537,12 +589,14 @@ const createEosManager = ({
      *   failed fatally, or a fatal answer armed `FATAL_ERROR` while it waited
      */
     async abort({ droppedSequences = false } = {}) {
+      const generation = getGeneration()
       stateManager.transaction.guard('abort')
       transactionalGuard()
       stateManager.resolveSequences()
       const bump = droppedSequences || stateManager.state() === STATES.ABORTABLE_ERROR
       stateManager.transitionTo(STATES.ABORTING)
       await stateManager.whenPartitionsAdded()
+      generation?.check()
       if (stateManager.state() === STATES.FATAL_ERROR) {
         throw stateManager.transaction.armedError()
       }
@@ -550,17 +604,22 @@ const createEosManager = ({
       let ended = true
       let adopted = false
       try {
-        adopted = await endTransaction(false)
+        adopted = await endTransaction(false, generation)
       } catch (error) {
+        generation?.check()
         swallowUnlessFatal(error)
         ended = false
       }
 
+      generation?.check()
       stateManager.transitionTo(STATES.READY)
 
       if (!ended || (bump && !adopted)) {
         bumpOwed = true
-        await bumpIfOwed().catch(swallowUnlessFatal)
+        await bumpIfOwed(generation).catch((error) => {
+          generation?.check()
+          swallowUnlessFatal(error)
+        })
       }
     },
 
@@ -632,6 +691,7 @@ const createEosManager = ({
      * @property {string|null} [metadata]
      */
     async sendOffsets({ consumerGroupId, consumerGroupMetadata, topics } = {}) {
+      const generation = getGeneration()
       stateManager.transaction.guard('sendOffsets')
       const { groupId, generationId, memberId, groupInstanceId } = consumerGroupOf({
         consumerGroupId,
@@ -647,6 +707,7 @@ const createEosManager = ({
         const transactionVersion = stateManager.transactionVersion()
 
         try {
+          generation?.check()
           stateManager.transaction.guard('sendOffsets')
           if (transactionVersion === 2 && !hasPartitions(snapshot.topics)) {
             stateManager.offsets.stage(snapshot)
@@ -654,16 +715,20 @@ const createEosManager = ({
           }
 
           if (transactionVersion === 1) {
-            await retrier(async (bail, retryCount, retryTime) => {
-              const transactionCoordinator = await findTransactionCoordinator()
+            await retrierFor(generation)(async (bail, retryCount, retryTime) => {
+              generation?.check()
+              const transactionCoordinator = await findTransactionCoordinator(generation)
+              generation?.check()
               try {
                 await transactionCoordinator.addOffsetsToTxn({
                   transactionalId,
                   producerId: stateManager.producerId,
                   producerEpoch: stateManager.producerEpoch,
                   groupId,
+                  ...guardOf(generation),
                 })
               } catch (e) {
+                generation?.check()
                 stateManager.classify(e, 'txn')
                 if (e.retriable) {
                   logger.debug('AddOffsetsToTxn failed retriably, retrying', {
@@ -679,14 +744,18 @@ const createEosManager = ({
             })
           }
 
+          generation?.check()
           stateManager.markOffsetsAdded()
 
           let groupCoordinator = await cluster.findGroupCoordinator({
             groupId,
             coordinatorType: COORDINATOR_TYPES.GROUP,
+            ...(generation ? { fence: generation } : {}),
           })
-          await retrier(async (bail, retryCount, retryTime) => {
+          generation?.check()
+          await retrierFor(generation)(async (bail, retryCount, retryTime) => {
             try {
+              generation?.check()
               await groupCoordinator.txnOffsetCommit({
                 transactionalId,
                 producerId: stateManager.producerId,
@@ -697,8 +766,10 @@ const createEosManager = ({
                 memberId,
                 groupInstanceId,
                 transactionVersion,
+                ...guardOf(generation),
               })
             } catch (e) {
+              generation?.check()
               const { category } = stateManager.classify(e, 'offsets')
               if (e.retriable) {
                 logger.debug('TxnOffsetCommit failed retriably, retrying', {
@@ -711,6 +782,7 @@ const createEosManager = ({
                   groupCoordinator = await cluster.findGroupCoordinator({
                     groupId,
                     coordinatorType: COORDINATOR_TYPES.GROUP,
+                    ...(generation ? { fence: generation } : {}),
                   })
                 }
                 throw e
@@ -718,9 +790,13 @@ const createEosManager = ({
               bail(e)
             }
           })
+          generation?.check()
           stateManager.offsets.stage(snapshot)
         } catch (error) {
           stateManager.offsets.abandon(snapshot)
+          if (generation?.closed) {
+            throw error
+          }
           throw armWith(error)
         }
       })

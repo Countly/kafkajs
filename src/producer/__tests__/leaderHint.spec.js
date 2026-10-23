@@ -2,6 +2,7 @@ const ConnectionPool = require('../../network/connectionPool')
 const Cluster = require('../../cluster')
 const createSendMessages = require('../sendMessages')
 const createRetry = require('../../retry')
+const Generation = require('../generation')
 const createDefaultPartitioner = require('../partitioners/default')
 const {
   decode: decodeProduceV11,
@@ -246,13 +247,14 @@ const eosManagerStub = ({ updateSequence = jest.fn() } = {}) => ({
  * A non-idempotent send over `cluster`, as the producer makes it: the records assigned to
  * partitions once, then those batches sent.
  */
-const createSend = ({ cluster, eosManager = eosManagerStub(), retrier }) => {
+const createSend = ({ cluster, eosManager = eosManagerStub(), retrier, generation }) => {
   const sender = createSendMessages({
     logger: newLogger(),
     cluster,
     partitioner: createDefaultPartitioner(),
     eosManager,
     retrier: retrier ?? createRetry({ retries: 2, initialRetryTime: 1, maxRetryTime: 2 }),
+    ...(generation ? { getGeneration: () => generation } : {}),
   })
   return async ({ acks, timeout, topicMessages }) =>
     sender.sendPartitioned({ acks, timeout, batches: await sender.partition(topicMessages) })
@@ -272,6 +274,25 @@ describe('Producer > KIP-951 leader hint', () => {
 
     expect(produced.map(({ nodeId }) => nodeId)).toEqual([1, 2])
     expect(cluster.findLeaderForPartitions('test-topic', [0])).toEqual({ 2: [0] })
+  })
+
+  test('a hint carries the producer lifecycle that began the send', async () => {
+    const generation = new Generation()
+    const { cluster } = createHintCluster({
+      answer: async ({ request, attempt }) => {
+        if (attempt === 1) throw await notLeaderWithHint({ leaderId: 2, leaderEpoch: 6 })
+        return acceptAll({ request })
+      },
+    })
+    const applied = jest.spyOn(cluster, 'applyLeaderHint')
+
+    const send = createSend({ cluster, generation })
+    await send({ acks: -1, timeout: 30000, topicMessages })
+
+    expect(applied).toHaveBeenCalledWith(
+      expect.objectContaining({ topic: 'test-topic', partition: 0, leaderId: 2, leaderEpoch: 6 }),
+      { fence: generation }
+    )
   })
 
   test('a lower-epoch hint is ignored and the attempt routes unchanged', async () => {

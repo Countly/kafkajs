@@ -49,8 +49,10 @@ class ProducerIdAndEpoch {
   #transactionTimeout
   #findBroker
   #onReset
+  #getGeneration
   #producerId = NO_PRODUCER_ID
   #producerEpoch = NO_PRODUCER_EPOCH
+  /** @type {?{ generation: ?import('../generation'), promise: Promise<void> }} */
   #pending = null
 
   /**
@@ -61,10 +63,14 @@ class ProducerIdAndEpoch {
    *   belongs to has a transactional id, though this identity may send none: such a producer is
    *   idempotent by necessity, so a refusal is not answered with `idempotent: false`
    * @param {number} options.transactionTimeout sent as InitProducerId's TransactionTimeoutMs
-   * @param {() => Promise<import('../../../types').Broker>} options.findBroker the broker every
-   *   InitProducerId goes to - the transaction coordinator, or any broker for an idempotent-only
-   *   producer - asked again for every request
+   * @param {(generation?: import('../generation')) => Promise<import('../../../types').Broker>} options.findBroker
+   *   the broker every InitProducerId goes to - the transaction coordinator, or any broker for an
+   *   idempotent-only producer - asked again for every request, with the producer lifecycle the
+   *   call captured
    * @param {() => void} options.onReset restarts every partition's sequences
+   * @param {() => (import('../generation')|undefined)} [options.getGeneration] the producer's
+   *   current lifecycle, read once when each operation starts: a pair is taken, and `onReset`
+   *   runs, only while that lifecycle is open
    */
   constructor({
     logger,
@@ -73,6 +79,7 @@ class ProducerIdAndEpoch {
     transactionTimeout,
     findBroker,
     onReset,
+    getGeneration = () => undefined,
   }) {
     this.#logger = logger
     this.#transactionalId = transactionalId
@@ -80,6 +87,7 @@ class ProducerIdAndEpoch {
     this.#transactionTimeout = transactionTimeout
     this.#findBroker = findBroker
     this.#onReset = onReset
+    this.#getGeneration = getGeneration
   }
 
   /** @returns {string|number} the producer id - the decimal string a response carries - or -1 while none is held */
@@ -106,10 +114,12 @@ class ProducerIdAndEpoch {
    * producer id awaits it rather than starting another initialization; it rejects with the
    * request's error, which is never also reported as an unhandled rejection and is logged as a
    * warning. After a rejection no producer id is held: the caller re-initializes.
-   * @returns {Promise<void>|null}
+   * @returns {Promise<void>|null} null when there is none, or it began under a lifecycle that is
+   *   not the current one
    */
   pendingInitialization() {
-    return this.#pending
+    const pending = this.#pending
+    return pending !== null && pending.generation === this.#getGeneration() ? pending.promise : null
   }
 
   /**
@@ -119,9 +129,13 @@ class ProducerIdAndEpoch {
    * @throws {KafkaJSInvalidConfigurationError} on CLUSTER_AUTHORIZATION_FAILED (31), naming both
    *   remedies; its `cause` is the broker's error
    * @throws {import('../../errors').KafkaJSProtocolError} any other error of the request, unchanged
+   * @throws {Error} the close error of the producer lifecycle, when it closed meanwhile; nothing
+   *   is taken and nothing is reset
    */
   async initialize() {
-    await this.#acquire()
+    const generation = this.#getGeneration()
+    await this.#acquire(generation)
+    generation?.check()
     this.#onReset()
   }
 
@@ -136,17 +150,22 @@ class ProducerIdAndEpoch {
    * @throws {KafkaJSInvalidConfigurationError} on CLUSTER_AUTHORIZATION_FAILED (31)
    * @throws {import('../../errors').KafkaJSProtocolError} any other error, unchanged -
    *   PRODUCER_FENCED (90) included
+   * @throws {Error} the close error of the producer lifecycle, when it closed meanwhile; the pair
+   *   is kept and nothing is reset
    * @see https://github.com/apache/kafka/blob/4.3/clients/src/main/java/org/apache/kafka/clients/producer/internals/TransactionManager.java
    */
   async reinitialize() {
-    const broker = await this.#findBroker()
+    const generation = this.#getGeneration()
+    const broker = await this.#findBroker(generation)
+    generation?.check()
     const version = broker.negotiatedVersion(apiKeys.InitProducerId, requests.InitProducerId)
     if (!(version >= FIRST_EPOCH_BUMPING_VERSION)) {
       return this.initialize()
     }
 
     const sent = { producerId: this.#producerId, producerEpoch: this.#producerEpoch }
-    const received = await this.#request(broker, sent)
+    const received = await this.#request(broker, sent, generation)
+    generation?.check()
     if (
       String(received.producerId) === String(sent.producerId) &&
       received.producerEpoch === sent.producerEpoch
@@ -188,13 +207,14 @@ class ProducerIdAndEpoch {
 
     const exhaustedProducerId = this.#producerId
     this.#set({ producerId: NO_PRODUCER_ID, producerEpoch: NO_PRODUCER_EPOCH })
-    const pending = this.#acquire()
-    pending.then(
+    const generation = this.#getGeneration()
+    const pending = { generation, promise: this.#acquire(generation) }
+    pending.promise.then(
       () => {
-        this.#pending = null
+        if (this.#pending === pending) this.#pending = null
       },
       (e) => {
-        this.#pending = null
+        if (this.#pending === pending) this.#pending = null
         this.#logger.warn(
           `Could not acquire a producer id after producer ${exhaustedProducerId} reached the maximum epoch`,
           { producerId: exhaustedProducerId, error: e.message }
@@ -218,14 +238,25 @@ class ProducerIdAndEpoch {
   }
 
   /**
-   * One InitProducerId for a fresh pair, kept on success.
+   * One InitProducerId for a fresh pair, kept on success unless the producer lifecycle it began
+   * under closed meanwhile.
+   * @param {import('../generation')} [generation] the lifecycle captured when the operation began
    * @returns {Promise<void>}
+   * @throws {Error} the lifecycle's close error
    */
-  async #acquire() {
-    const broker = await this.#findBroker()
-    this.#set(
-      await this.#request(broker, { producerId: NO_PRODUCER_ID, producerEpoch: NO_PRODUCER_EPOCH })
+  async #acquire(generation) {
+    const broker = await this.#findBroker(generation)
+    generation?.check()
+    const pair = await this.#request(
+      broker,
+      {
+        producerId: NO_PRODUCER_ID,
+        producerEpoch: NO_PRODUCER_EPOCH,
+      },
+      generation
     )
+    generation?.check()
+    this.#set(pair)
   }
 
   /**
@@ -234,15 +265,17 @@ class ProducerIdAndEpoch {
    * idempotence off - its `cause` the broker's error; every other error is rethrown as is.
    * @param {import('../../../types').Broker} broker
    * @param {{ producerId: string|number, producerEpoch: number }} pair
+   * @param {import('../generation')} [generation] its `guard` refuses the write once it closed
    * @returns {Promise<{ producerId: string, producerEpoch: number }>}
    */
-  async #request(broker, { producerId, producerEpoch }) {
+  async #request(broker, { producerId, producerEpoch }, generation) {
     try {
       return await broker.initProducerId({
         transactionalId: this.#transactionalId,
         transactionTimeout: this.#transactionTimeout,
         producerId,
         producerEpoch,
+        ...(generation ? { guard: generation.guard } : {}),
       })
     } catch (e) {
       if (e.code === CLUSTER_AUTHORIZATION_FAILED) {

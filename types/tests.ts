@@ -2,6 +2,7 @@ import * as fs from 'fs'
 
 import * as kafkajs from './index'
 import {
+  Producer,
   Kafka,
   PartitionAssigners,
   logLevel,
@@ -54,6 +55,7 @@ import {
   KafkaJSApplicationRecoverableError,
   KafkaJSInvalidConfigurationError,
   KafkaJSDeliveryTimeout,
+  KafkaJSProducerClosedError,
   KafkaJSAggregateError,
   KafkaJSFetcherRebalanceError,
   KafkaJSLockTimeout,
@@ -1234,6 +1236,25 @@ const tooLargeReason: 'maxRequestSize' | 'bufferMemory' = requestTooLarge.reason
 // @ts-expect-error not a reason
 new KafkaJSRecordTooLargeError('x', { reason: 'frame', scope: 'record', size: 1, limit: 0 })
 void [tooLargeReason]
+
+
+// Producer lifecycle calls preserve the signal handler and no-argument parameter tuple.
+const lifecycleProducer = new Kafka({ brokers: ['localhost:9092'] }).producer({ metadataMaxIdle: 5000 })
+void lifecycleProducer.flush()
+void lifecycleProducer.flush({ timeout: 0 })
+void lifecycleProducer.flush({ timeout: 2147483647 })
+void lifecycleProducer.disconnect({ timeout: 0 })
+process.on('SIGTERM', lifecycleProducer.disconnect)
+const noCloseArguments: Parameters<Producer['disconnect']> = []
+void noCloseArguments
+const closeEvidence = new KafkaJSProducerClosedError('closed', { outcome: 'unknown' })
+const closeOutcome: 'unsent' | 'unknown' = closeEvidence.outcome
+void closeOutcome
+
+// @ts-expect-error the close outcome is required
+new KafkaJSProducerClosedError('closed', {})
+// @ts-expect-error transmission evidence is readonly
+closeEvidence.outcome = 'unsent'
 
 new Kafka({ brokers: ['localhost:9092'] }).producer({ metadataMaxIdle: 5000 })
 new Kafka({ brokers: ['localhost:9092'] }).producer({ metadataMaxIdle: 2147483647 })

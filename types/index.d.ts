@@ -1336,6 +1336,20 @@ export type ProducerEvents = {
 
 export type Producer = Sender & {
   connect(): Promise<void>
+  /**
+   * Flushes the call-time snapshot of both accumulators. Send failures remain on their own promises.
+   * A call timeout rejects with KafkaJSTimeout and leaves sends running. Invalid options reject
+   * before flushing; timeout is an integer from 0 through 2147483647.
+   */
+  flush(options?: { timeout?: number }): Promise<void>
+  /**
+   * Delivers accumulated sends and aborts an open transaction. With a timeout, closes at its
+   * deadline: never-written work ends unsent and previously written work ends unknown. An unknown
+   * commit stays pending and is never aborted. Without a timeout, request timeout enforcement
+   * disabled can make close unbounded. Non-object arguments are ignored at runtime; an invalid
+   * object timeout returns a rejected Promise before any lifecycle change.
+   */
+  disconnect(options?: { timeout?: number }): Promise<void>
   disconnect(): Promise<void>
   isIdempotent(): boolean
   readonly events: ProducerEvents
@@ -2040,6 +2054,12 @@ export class KafkaJSDeliveryTimeout extends KafkaJSNonRetriableError {
   /** Transmission evidence for this delivery; absence makes no claim about delivery. */
   readonly outcome?: 'unsent' | 'unknown' 
   constructor(e: Error | string, options?: { cause?: Error; outcome?: 'unsent' | 'unknown' })
+}
+
+/** Local forced shutdown; transmission evidence makes no claim that an unknown write failed. */
+export class KafkaJSProducerClosedError extends KafkaJSNonRetriableError {
+  readonly outcome: 'unsent' | 'unknown'
+  constructor(e: Error | string, options: { outcome: 'unsent' | 'unknown'; cause?: Error })
 }
 
 /**

@@ -466,32 +466,29 @@ describe('Producer > disconnect() and the commit of a transaction', () => {
 
     await Promise.all([first, second])
     expect(broker.endTxn).toHaveBeenCalledTimes(1)
-    expect(cluster.disconnect).toHaveBeenCalledTimes(2)
+    expect(cluster.disconnect).toHaveBeenCalledTimes(1)
   })
 
-  test('called twice, the first joining a commit() that ends pending and the second sending it again, closes nothing before that EndTxn is answered', async () => {
+  test('called twice, the first joining a commit() that ends pending, the second shares that close: the commit is not sent again and nothing closes before delivery ends', async () => {
     const { broker, cluster, producer, transaction, warnings } = await createCommittingProducer()
     const delivery = await holdDelivery(broker, producer)
     failEndTxn(broker, () => new KafkaJSConnectionError('Connection error'))
     const committing = transaction.commit().catch((e) => e)
     const joining = producer.disconnect()
     expect(await committing).toBeInstanceOf(KafkaJSConnectionError)
-    const resend = holdEndTxn(broker)
 
-    const resending = producer.disconnect()
-    delivery.release()
-    await resend.sent
+    const sharing = producer.disconnect()
     await settle()
 
     expect(cluster.disconnect).not.toHaveBeenCalled()
-    resend.answer()
-    await Promise.all([delivery.sending, joining, resending])
-    expect(broker.endTxn).toHaveBeenCalledTimes(ATTEMPTS + 1)
+    delivery.release()
+    await Promise.all([delivery.sending, joining, sharing])
+    expect(broker.endTxn).toHaveBeenCalledTimes(ATTEMPTS)
     expect(warnings()).toHaveLength(1)
-    expect(cluster.disconnect).toHaveBeenCalledTimes(2)
+    expect(cluster.disconnect).toHaveBeenCalledTimes(1)
   })
 
-  test('called twice, the first sending a pending commit again and the second joining a commit() called again that ends pending, closes nothing before that EndTxn is answered', async () => {
+  test('called twice, the first sending a pending commit again and the second sharing that close, closes nothing before that EndTxn is answered', async () => {
     const { broker, cluster, producer, transaction, warnings } = await pendingCommit()
     const delivery = await holdDelivery(broker, producer)
     const resending = producer.disconnect()
@@ -509,8 +506,8 @@ describe('Producer > disconnect() and the commit of a transaction', () => {
     resend.answer()
     await Promise.all([delivery.sending, resending, joining])
     expect(broker.endTxn).toHaveBeenCalledTimes(ATTEMPTS + 1)
-    expect(warnings()).toHaveLength(1)
-    expect(cluster.disconnect).toHaveBeenCalledTimes(2)
+    expect(warnings()).toEqual([])
+    expect(cluster.disconnect).toHaveBeenCalledTimes(1)
   })
 
   test('waits for every commit() the application starts again while it waits, and closes nothing before the last is answered', async () => {

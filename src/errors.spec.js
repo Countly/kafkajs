@@ -17,6 +17,7 @@ const {
   KafkaJSApplicationRecoverableError,
   KafkaJSInvalidConfigurationError,
   KafkaJSDeliveryTimeout,
+  KafkaJSProducerClosedError,
   KafkaJSAggregateError,
   KafkaJSFetcherRebalanceError,
   KafkaJSConnectionError,
@@ -318,6 +319,7 @@ describe('every error class this package exports carries an own, enumerable cate
       { retryCount: 5, retryTime: 100 },
     ],
     KafkaJSDeleteTopicRecordsError: () => [{ partitions: [] }],
+    KafkaJSProducerClosedError: () => ['closed', { outcome: 'unsent' }],
     KafkaJSAggregateError: () => ['two topics failed', []],
   }
   const CLASSES = Object.entries(errors).filter(
@@ -895,4 +897,36 @@ describe('the errors of a send the producer buffer refuses', () => {
       expect(packageEntry[name]).toBe(errors[name])
     }
   )
+})
+
+describe('KafkaJSProducerClosedError', () => {
+  test.each(['unsent', 'unknown'])(
+    'carries the %s outcome, its cause and the abortable category',
+    (outcome) => {
+      const cause = new KafkaJSError('the error underneath')
+      const error = new KafkaJSProducerClosedError('closed', { outcome, cause })
+
+      expect(error).toBeInstanceOf(KafkaJSNonRetriableError)
+      expect(error).toMatchObject({
+        name: 'KafkaJSProducerClosedError',
+        message: 'closed',
+        outcome,
+        category: 'abortable',
+        retriable: false,
+      })
+      expect(error.cause).toBe(cause)
+      expect(errors.isKafkaJSError(error)).toBe(true)
+    }
+  )
+
+  test.each([[undefined], [{}], [{ outcome: 'sent' }], [{ outcome: null }]])(
+    'is refused without a valid outcome: %p',
+    (options) => {
+      expect(() => new KafkaJSProducerClosedError('closed', options)).toThrow(TypeError)
+    }
+  )
+
+  test('is exported from the package entry as the same class', () => {
+    expect(packageEntry.KafkaJSProducerClosedError).toBe(KafkaJSProducerClosedError)
+  })
 })

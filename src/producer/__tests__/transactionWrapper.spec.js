@@ -5,7 +5,6 @@ const encodeProduce = require('../../protocol/requests/produce/v12/request')
 const { createErrorFromCode } = require('../../protocol/error')
 const {
   KafkaJSApplicationRecoverableError,
-  KafkaJSError,
   KafkaJSInvalidConfigurationError,
   KafkaJSInvariantViolation,
   KafkaJSNonRetriableError,
@@ -344,33 +343,35 @@ describe('Producer > the transaction wrapper', () => {
       return { broker, producer, transaction, sendError }
     }
 
-    test('a batch dropped because an earlier disconnect() ended after a reconnect makes the transaction abort-only, not the producer unusable', async () => {
+    test('connect() waits for an earlier disconnect() to end, which never touches the new lifecycle', async () => {
       const { cluster, broker, producer } = createTransactionalProducer({ level: 1 })
       await producer.connect()
       const torn = deferred()
       cluster.disconnect.mockImplementationOnce(() => torn.promise)
       const disconnected = producer.disconnect()
       await settle()
-      await producer.connect()
-      const transaction = await producer.transaction()
-
-      const sent = transaction.send({ topic: TOPIC, messages: ONE }).catch((e) => e)
+      let reconnected = false
+      const connected = producer.connect().then(() => {
+        reconnected = true
+      })
       await settle()
+
+      expect(reconnected).toBe(false)
+      expect(cluster.connect).toHaveBeenCalledTimes(1)
       torn.resolve()
       await disconnected
-      const sendError = await sent
-      const commitError = await transaction.commit().catch((e) => e)
+      await connected
+      const transaction = await producer.transaction()
+      await transaction.send({ topic: TOPIC, messages: ONE })
+      await transaction.commit()
 
-      expect(sendError).toEqual(new KafkaJSError('The producer is disconnected'))
-      expect(commitError).toBeInstanceOf(KafkaJSTransactionAbortableError)
-      expect(commitError.cause).toBe(sendError)
-      expect(broker.produce).not.toHaveBeenCalled()
-      expect(broker.endTxn).not.toHaveBeenCalled()
-      await producer.connect()
-      await expect(transaction.abort()).resolves.toBeUndefined()
+      expect(cluster.connect).toHaveBeenCalledTimes(2)
+      expect(cluster.disconnect).toHaveBeenCalledTimes(1)
+      expect(broker.produce).toHaveBeenCalledTimes(1)
+      expect(broker.endTxn).toHaveBeenCalledTimes(1)
     })
 
-    test('disconnect() waits for a failing re-send to run out of retries, which makes the transaction abort-only: commit() after reconnecting sends no EndTxn', async () => {
+    test('disconnect() waits for a failing re-send to run out of retries, which makes the transaction abort-only: it aborts it, and commit() after reconnecting is refused', async () => {
       const { broker, transaction, sendError } = await reSendFailingThroughDisconnect(2)
 
       const commitError = await transaction.commit().catch((e) => e)
@@ -378,16 +379,22 @@ describe('Producer > the transaction wrapper', () => {
       expect(sendError).toBeInstanceOf(KafkaJSTransactionAbortableError)
       expect(sendError.cause).toBeInstanceOf(KafkaJSNumberOfRetriesExceeded)
       expect(broker.produce).toHaveBeenCalledTimes(6)
-      expect(commitError).toBe(sendError)
-      expect(broker.endTxn).not.toHaveBeenCalled()
+      expect(commitError).toEqual(
+        new KafkaJSNonRetriableError('Cannot continue to use transaction once ended')
+      )
+      expect(broker.endTxn.mock.calls.map(([{ transactionResult }]) => transactionResult)).toEqual([
+        false,
+      ])
     })
 
     test.each([1, 2])(
-      'under transaction version %p, aborting after a re-send ran out of retries during disconnect() leaves the next transaction clean',
+      'under transaction version %p, the abort disconnect() made after a re-send ran out of retries leaves the next transaction clean',
       async (level) => {
         const { broker, producer, transaction } = await reSendFailingThroughDisconnect(level)
 
-        await expect(transaction.abort()).resolves.toBeUndefined()
+        await expect(transaction.abort()).rejects.toEqual(
+          new KafkaJSNonRetriableError('Cannot continue to use transaction once ended')
+        )
         const next = await producer.transaction()
         await next.send({ topic: TOPIC, messages: ONE })
         await next.commit()

@@ -237,15 +237,16 @@ notice and what, if anything, to do.
   *What to do:* code that caught a `TypeError` from `send()` catches
   `KafkaJSInvalidConfigurationError` instead, and fixes the record.
 
-- **`producer.disconnect()` delivers before it disconnects.** It sends every waiting batch, its
-  own and its transaction's, and waits for every send begun before it — retries included, up to
-  `deliveryTimeout` or the retry budget — refusing new sends meanwhile. A request already sent
-  settles on its answer or on `requestTimeout`, so a send can end up to `requestTimeout` after
-  `deliveryTimeout`. 2.2.4 disconnected at once, failing the sends still under way.
-  *What to do:* nothing for a clean shutdown. A shutdown with a hard time limit, such as a
-  container's grace period, can wait out the retry budget while the cluster is unreachable: set
-  `deliveryTimeout` to bound each send, and allow `deliveryTimeout + requestTimeout` for a hard
-  limit, or race `disconnect()` against a timer.
+- **`producer.disconnect({ timeout })` delivers earlier sends and aborts an open transaction.**
+  Call `commit()` first if you intend to commit. Without `timeout`, shutdown waits naturally for
+  delivery, transaction cleanup and connection draining; a blackholed request can leave it
+  unbounded when `enforceRequestTimeout` is false. For a hard shutdown limit, use
+  `await producer.disconnect({ timeout: 10000 })`. At the deadline, never-written sends reject
+  with `KafkaJSProducerClosedError` and `outcome: 'unsent'`; sends written at least once have
+  `outcome: 'unknown'`. An unknown commit stays pending and is never aborted by forced close.
+  Concurrent disconnects share the first call's timeout. A second call after close completed
+  does nothing until an explicit `connect()`: it no longer sends an unknown commit again.
+  After reconnect, resolve that commit explicitly with `commit()`, or replace the producer.
 
 - **`deliveryTimeout` counts the wait for `linger` and for the producer id.** A send's deadline
   starts when the send is made, as the Java client's does, so the `linger` wait - and on an
@@ -376,9 +377,11 @@ transaction in a way its error decides.
   `KafkaJSNumberOfRetriesExceeded`, which is not retriable, and then refused both `commit()` and
   `abort()`; a catch keyed on that class no longer matches. Until the commit settles, `abort()`,
   `send()`, `sendBatch()`, `sendOffsets()` and `producer.transaction()` throw, and
-  `producer.disconnect()` makes one more attempt first. A `commit()` called while another is under way now joins it and shares its outcome; 2.2.4
-  refused a second `commit()` with a state error at once. A `producer.disconnect()` called during a
-  commit waits for it, logs a warning when it did not succeed, and resolves. *What to do:* if
+  the first `producer.disconnect()` before a reconnect makes one more attempt if its timeout
+  permits. A completed close does nothing on later calls until `connect()`. A `commit()` called
+  while another is under way now joins it and shares its outcome; 2.2.4 refused a second `commit()`
+  with a state error at once. A disconnect called during a commit joins it until completion or
+  the close timeout, logs a warning when it did not succeed, and resolves. *What to do:* if
   `commit()` rejects with a retriable error (`error.retriable`), call `commit()` again, a few times
   at most, then replace the producer; do not `abort()`. A commit that is still rejected with a
   retriable error after those attempts has an unknown outcome: `disconnect()` may already have
@@ -395,8 +398,9 @@ transaction in a way its error decides.
   `sendOffsets` for the same group in one process used to see the consumer skip those offsets and
   will now commit them itself, with the same values, until the transaction commits; disable consumer
   auto-commit, as exactly-once processing requires. A transaction still open when `disconnect()`
-  runs forfeits the publication of the offsets sent so far, and a commit confirmed after a
-  reconnect does not publish them. After a forfeited publication the cache keeps its value until
+  runs is aborted, so the offsets sent so far are never published; a commit whose outcome is
+  unknown at a forced close forfeits their publication, and a commit confirmed after a reconnect
+  does not publish them. After a forfeited publication the cache keeps its value until
   the consumer's cell is rebuilt or cleared, while a fresh read (`admin.fetchOffsets`, a new
   consumer) shows the broker's. Calls to `sendOffsets` on one transaction now run in call order
   instead of overlapping. Whether a plain commit for a partition with a pending transactional
@@ -409,6 +413,7 @@ transaction in a way its error decides.
 - **Sends made together to one partition keep their call order.** Two or more `send()` calls to one partition in the same tick are written in call order, as `docs/Producing.md` already said they normally are. Before, the last two of such a burst were written swapped. *What to do:* nothing. Order is still not guaranteed across a send that had to retry its partitioning, or across topics: await each send when the order matters.
 - **In a transaction, a refused `send()` means the transaction can no longer commit: catch it, `abort()`, and start a new transaction**
 - **Inside a transaction a size rejection now makes the transaction abort-only** (as Java's producer does for an `ApiException` from `send`): abort and begin a new one
+- A transaction left open at `disconnect()` used to be left to the coordinator's timeout (60 s by default, holding back `read_committed` consumers); it is now aborted. Call `commit()` first if you meant to commit. Use `disconnect({ timeout })` to bound shutdown, for example inside a pod's grace period. Without `timeout` the wait is natural and can be unbounded when `enforceRequestTimeout` is false
 
 ### Consumer
 
@@ -1187,6 +1192,7 @@ now logged.
 - **Obsolete connections drain for at most `requestTimeout`.** Nothing to do. With `enforceRequestTimeout: false` a request that never answered used to stall recovery indefinitely. A JoinGroup or long-poll Fetch with a per-API allowance above `requestTimeout` fails at the bound on an obsolete connection and is retried. Public `disconnect()` remains reusable and now also waits at most `requestTimeout` for requests in flight (the rest fail with a retriable `KafkaJSConnectionClosedError`); a retired broker object cannot reconnect. A mutation already transmitted before the connection closes still has an unknown outcome.
 - **A producer delivery timeout can include transmission evidence.** `KafkaJSDeliveryTimeout.outcome` is optional and is `'unsent'` or `'unknown'`; its absence says nothing about delivery. Earlier written attempts keep the outcome unknown even if a later reply was retriable. The timeout copies the last cause's `type` and `code` when available, so existing protocol-type checks can inspect them. Other error classes do not acquire an outcome, and a `retry.maxTotalTime` timeout outside a producer still omits it.
 - `KafkaJSCorruptRecordError` has three new `reason` values, `checksum`, `decompressed-size` and `decompression`, and the optional `nextOffset` (where `consumer.seek` goes to skip the batch; present only for a validated batch boundary), `codec` and `limit`. `KafkaJSPartialMessageError#crcMismatch` is deprecated and no longer set: a checksum mismatch is a `KafkaJSCorruptRecordError`.
+- **A forced producer close reports `KafkaJSProducerClosedError` with transmission evidence.** `outcome` is `'unsent'` for work that was never written and `'unknown'` for anything written at least once, which may still have been applied by the broker. The error is non-retriable and its `category` is `abortable`. A class without an `outcome`, or the absence of an error, proves nothing about delivery.
 
 ### Protocol
 

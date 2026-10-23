@@ -4,6 +4,7 @@ const {
   KafkaJSDeliveryTimeout,
   KafkaJSInvalidConfigurationError,
   KafkaJSRecordTooLargeError,
+  KafkaJSProducerClosedError,
 } = require('../../errors')
 const { Deadline, ExpiryTimer } = require('../deadline')
 const { Admission } = require('./admission')
@@ -461,19 +462,26 @@ const halvesOf = (settler) => {
  * rejecting with the first error any share failed with. A partition's metadata is that of the
  * share holding its first record, whatever order the answers came in. The send counts as one
  * more share until `joined()`, so no share can settle it while its records are still joining.
+ * Settling it ends its holder's place in the flush inventory (`PendingSend#untrack`).
  */
 class AppendedSend {
   #pending = 1
-  #metadata = []
+  /** @type {?object[]} created by the first metadata, so a held send keeps no array */
+  #metadata = null
   #error = null
   #resolve
   #reject
+  #holder
 
-  constructor() {
-    this.promise = new Promise((resolve, reject) => {
-      this.#resolve = resolve
-      this.#reject = reject
-    })
+  /**
+   * @param {PendingSend} holder the send whose flush tracking ends when this settles
+   * @param {(metadata: object[]) => void} resolve settles the append's promise
+   * @param {(error: Error) => void} reject
+   */
+  constructor(holder, resolve, reject) {
+    this.#holder = holder
+    this.#resolve = resolve
+    this.#reject = reject
   }
 
   /** One more batch carries some of its records. @returns {void} */
@@ -495,6 +503,7 @@ class AppendedSend {
    */
   delivered(metadata, origin) {
     if (metadata !== undefined && origin === 0) {
+      this.#metadata ??= []
       this.#metadata.push(metadata)
     }
     this.#settleOne()
@@ -520,8 +529,10 @@ class AppendedSend {
     if (this.#error !== null) {
       this.#reject(this.#error)
     } else {
-      this.#resolve(this.#metadata.sort(byTopicThenPartition))
+      this.#resolve((this.#metadata ?? []).sort(byTopicThenPartition))
     }
+    this.#holder.untrack()
+    this.#holder = null
   }
 }
 
@@ -627,6 +638,62 @@ class Settler {
   }
 }
 
+/**
+ * A promise resolved with it settles two jobs later: after the promise of every send whose
+ * settlement emptied a flush epoch, which settles at most two jobs after that step.
+ */
+const SETTLED = Promise.resolve()
+
+/**
+ * The sends begun between two flush snapshots, counted while unsettled. A snapshot closes the
+ * current epoch; a closed epoch settles once it and every older epoch have no unsettled send.
+ */
+class FlushEpoch {
+  /** how many of its sends have not settled */
+  unsettled = 0
+  /** @type {?FlushEpoch} the epoch a snapshot opened when it closed this one */
+  newer = null
+  /** @type {?Promise<void>} the snapshot's promise, once a snapshot closed it */
+  promise = null
+  #resolve = null
+
+  /** @param {boolean} oldest whether no older epoch is still waiting */
+  constructor(oldest) {
+    this.oldest = oldest
+  }
+
+  /** One of its sends settled. @returns {void} */
+  settle() {
+    this.unsettled -= 1
+    this.#check()
+  }
+
+  /**
+   * Closes it for a snapshot.
+   * @returns {FlushEpoch} the epoch later sends join
+   */
+  close() {
+    this.promise = new Promise((resolve) => {
+      this.#resolve = resolve
+    })
+    this.newer = new FlushEpoch(false)
+    const newer = this.newer
+    this.#check()
+    return newer
+  }
+
+  /** Settles a drained closed epoch and hands the oldest place on. @returns {void} */
+  #check() {
+    for (let epoch = this; epoch.oldest && epoch.unsettled === 0 && epoch.promise !== null;) {
+      epoch.#resolve(SETTLED)
+      const newer = epoch.newer
+      epoch.newer = null
+      newer.oldest = true
+      epoch = newer
+    }
+  }
+}
+
 /** The pinner of an accumulator with no producer cluster: it protects no topic. */
 const NO_PINNER = { holdTopic() {}, releaseTopic() {} }
 
@@ -668,6 +735,19 @@ class PendingSend {
     this.pinner = pinner
     /** @type {?(string|string[])} the topic, or topics, it pins until its shell is released */
     this.topics = null
+    /** @type {?FlushEpoch} the flush epoch it counts in until it settles */
+    this.epoch = null
+  }
+
+  /**
+   * Ends its count in its flush epoch, at the step that settles its promise. Every tracked send
+   * reaches exactly one such step: a refusal, the end of its wait, or its `AppendedSend`.
+   * @returns {void}
+   */
+  untrack() {
+    const epoch = this.epoch
+    this.epoch = null
+    epoch.settle()
   }
 
   /**
@@ -858,6 +938,9 @@ class Accumulator {
   #admission
   #pinner
   #budget
+  #getGeneration
+  /** the flush epoch sends begun now count in */
+  #epoch = new FlushEpoch(true)
   /** @type {Fifo<PendingSend>} the sends waiting for their partitions, in the order of their deadlines */
   #holders = new Fifo()
   #expiry = new ExpiryTimer((now) => this.#expireHolders(now))
@@ -900,6 +983,8 @@ class Accumulator {
    *   the error to reject with
    * @param {{ holdTopic(topic: string): void, releaseTopic(topic: string): void }} [options.pinner]
    *   the producer cluster's topic pins: each send pins its topics until its shell is released
+   * @param {() => (import('../generation')|undefined)} [options.getGeneration] the producer's
+   *   current lifecycle: a closed one refuses new sends and a send admitted after a wait
    * @param {Admission} [options.admission] the producer's buffer; without one, every send fits
    * @param {RequestBudget} [options.budget] the producer's request-size plan: a record no request
    *   can carry is refused, a partition's records that one request cannot carry are cut into
@@ -918,6 +1003,7 @@ class Accumulator {
     admission = new Admission({ capacity: Number.MAX_SAFE_INTEGER, maxBlockMs: 0 }),
     budget = new RequestBudget(),
     pinner = NO_PINNER,
+    getGeneration = () => undefined,
   }) {
     this.#linger = linger
     this.#batchSize = batchSize
@@ -931,6 +1017,7 @@ class Accumulator {
     this.#admission = admission
     this.#pinner = pinner
     this.#budget = budget
+    this.#getGeneration = getGeneration
   }
 
   /**
@@ -1041,6 +1128,7 @@ class Accumulator {
       return []
     }
 
+    this.#getGeneration()?.check()
     const send = new PendingSend(
       topicMessages,
       new Deadline(startedAt, this.#deadline),
@@ -1052,18 +1140,89 @@ class Accumulator {
 
     this.#appending += 1
     send.holdTopics()
+    this.track(send)
     try {
       this.#assertFits(topicMessages, compression)
       const charge = chargeOf(topicMessages, this.#admission.capacity)
       const granted = this.#admission.acquire(charge.total, send.deadline)
-      send.admit(granted instanceof Promise ? await granted : granted, charge)
+      send.admit(granted instanceof Promise ? this.#granted(await granted) : granted, charge)
     } catch (error) {
       send.records = null
       send.releaseTopics()
+      send.untrack()
       this.#end()
       throw this.#expired(error)
     }
     return this.#hold(send, { acks, timeout, compression })
+  }
+
+  /**
+   * A reservation granted after a wait, unless the producer closed meanwhile: then it is given
+   * back and the send is refused as never sent.
+   * @param {import('./admission').Reservation} reservation
+   * @returns {import('./admission').Reservation}
+   * @throws {KafkaJSProducerClosedError} `outcome: 'unsent'`, when the lifecycle closed
+   */
+  #granted(reservation) {
+    if (this.#getGeneration()?.closed) {
+      reservation.releaseAll()
+      throw new KafkaJSProducerClosedError('The producer was closed before admission completed', {
+        outcome: 'unsent',
+      })
+    }
+    return reservation
+  }
+
+  /**
+   * Counts a send in the current flush epoch until its promise settles (`PendingSend#untrack`):
+   * one reference on the send, with no promise, closure or collection entry of its own.
+   * @param {PendingSend} send
+   * @returns {void}
+   */
+  track(send) {
+    send.epoch = this.#epoch
+    this.#epoch.unsettled += 1
+  }
+
+  /**
+   * The flush snapshot: a promise that settles once every send begun before this call has
+   * settled, after each such send's own promise; none when no earlier send is unsettled.
+   * @returns {Promise<void>[]}
+   */
+  unsettled() {
+    const epoch = this.#epoch
+    if (epoch.oldest && epoch.unsettled === 0) {
+      return []
+    }
+    this.#epoch = epoch.close()
+    return [epoch.promise]
+  }
+
+  /**
+   * Rejects every send still waiting for its partitions and every batch that has not left this
+   * accumulator, with `outcome: 'unsent'`, and clears their timers. Admission waiters are
+   * cancelled by their `Admission`; a held assignment keeps its send's shell until it returns.
+   * @returns {void}
+   */
+  forceClose() {
+    for (let send = this.#holders.peek(); send !== undefined; send = this.#holders.peek()) {
+      this.#settleHolder(
+        send,
+        new KafkaJSProducerClosedError('The producer was closed before the send was partitioned', {
+          outcome: 'unsent',
+        })
+      )
+    }
+    for (const batch of this.#pending.values()) {
+      clearTimeout(batch.timer)
+      const error = new KafkaJSProducerClosedError('The producer was closed before sending', {
+        outcome: 'unsent',
+      })
+      batch.settlers.forEach((settler) => settler.reject(error))
+      batch.retire()
+    }
+    this.#pending.clear()
+    this.#checkIdle()
   }
 
   /**
@@ -1124,6 +1283,7 @@ class Accumulator {
               resolve(this.#join(entries, { ...options, createdAt: send.deadline.startedAt }, send))
             } catch (error) {
               reject(error)
+              send.untrack()
             } finally {
               send.release()
               this.#end()
@@ -1135,6 +1295,7 @@ class Accumulator {
           if (this.#leave(send)) {
             send.release()
             reject(error)
+            send.untrack()
             this.#end()
           }
         }
@@ -1151,10 +1312,6 @@ class Accumulator {
    */
   #register(send) {
     const { dueAt } = send.deadline
-    if (dueAt === Infinity) {
-      return
-    }
-
     let index = this.#holders.size
     while (index > 0 && this.#holders.at(index - 1).deadline.dueAt > dueAt) {
       index -= 1
@@ -1209,15 +1366,27 @@ class Accumulator {
       send !== undefined && send.deadline.dueAt <= now;
       send = this.#holders.peek()
     ) {
-      const { reject } = send
-      this.#leave(send)
-      send.release()
-      reject(this.#expired(this.#timedOut(send)))
-      this.#end()
+      this.#settleHolder(send, this.#timedOut(send))
     }
 
     const next = this.#holders.peek()
     return next === undefined ? Infinity : next.deadline.dueAt
+  }
+
+  /**
+   * Ends a registered send's wait with `error`, through `expired`; its shell stays charged until
+   * its pins end.
+   * @param {PendingSend} send
+   * @param {Error} error
+   * @returns {void}
+   */
+  #settleHolder(send, error) {
+    const { reject } = send
+    this.#leave(send)
+    send.release()
+    reject(this.#expired(error))
+    send.untrack()
+    this.#end()
   }
 
   /**
@@ -1249,7 +1418,10 @@ class Accumulator {
    * @returns {Promise<object[]>} the append's outcome, as `append()` describes it
    */
   #join(entries, { acks, timeout, compression, createdAt }, holder) {
-    const send = new AppendedSend()
+    let send
+    const appended = new Promise((resolve, reject) => {
+      send = new AppendedSend(holder, resolve, reject)
+    })
     const options = `${acks}/${timeout}/${compression}`
     // One due time for every batch this append creates, so they fall due together.
     const dueAt = Date.now() + this.#linger
@@ -1301,7 +1473,7 @@ class Accumulator {
       this.#queueHandOff()
     }
     send.joined()
-    return send.promise
+    return appended
   }
 
   /**

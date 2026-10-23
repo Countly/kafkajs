@@ -31,9 +31,11 @@ const sharedPromiseTo = require('../utils/sharedPromiseTo')
  *   the accumulated batches: sends are refused and batches no longer linger
  * @param {object} options.instrumentationEmitter
  * @param {string} options.INITIALIZED
+ * @param {() => import('./generation')|undefined} [options.getGeneration] current producer lifecycle
  * @returns {{ send: Function, sendBatch: Function, ensureInitialized: Function, flush: Function,
- *   close: Function, depthOf: (topic: string, partition: number) => number }} `depthOf` counts
- *   the batches waiting for a partition (see `Accumulator#depthOf`)
+ *   close: Function, unsettled: () => Promise<void>[], forceClose: () => void,
+ *   depthOf: (topic: string, partition: number) => number }} `depthOf` counts the batches
+ *   waiting for a partition (see `Accumulator#depthOf`)
  */
 module.exports = ({
   logger,
@@ -53,6 +55,7 @@ module.exports = ({
   isClosing,
   instrumentationEmitter,
   INITIALIZED,
+  getGeneration = () => undefined,
 }) => {
   const idempotentSend = createSendMessages({
     logger,
@@ -66,6 +69,7 @@ module.exports = ({
     compressionLevels,
     getConnectionStatus,
     budget,
+    getGeneration,
   })
   let plainSend = null
   /** How many `flush(until)` calls are waiting for their `until`: batches linger only at 0. */
@@ -94,6 +98,7 @@ module.exports = ({
         compressionLevels,
         partitioner,
         budget,
+        getGeneration,
         eosManager: createEosManager({ logger, cluster, transactional: false }),
       })
     return plainSend
@@ -111,8 +116,9 @@ module.exports = ({
     linger,
     batchSize,
     partition: async (send) => {
+      const generation = getGeneration()
       await ensureInitialized()
-      return idempotentSend.partition(send)
+      return idempotentSend.partition(send, generation)
     },
     sendPartitioned: (request) => {
       // The idempotent path refuses the batches of a producer that is not connected itself, and
@@ -136,6 +142,7 @@ module.exports = ({
     admission,
     budget,
     pinner: cluster.releaseTopic ? cluster : undefined,
+    getGeneration,
   })
 
   /**
@@ -165,20 +172,47 @@ module.exports = ({
   const close = () => accumulator.close()
 
   /**
+   * The sends begun so far that have not settled, as the snapshot a `flush` waits for.
+   * @returns {Promise<void>[]} at most one promise, which settles after the promise of every send
+   *   it covers; none when no send is unsettled (see `Accumulator#unsettled`)
+   */
+  const unsettled = () => accumulator.unsettled()
+
+  /**
+   * Ends every send this producer still holds locally with `outcome: 'unsent'` or `'unknown'`
+   * (see `Accumulator#forceClose` and the send paths' `forceClose`), for a forced close. A request
+   * already on the wire keeps its memory until its terminal callback.
+   * @returns {void}
+   */
+  const forceClose = () => {
+    accumulator.forceClose()
+    idempotentSend.forceClose()
+    plainSend?.forceClose()
+  }
+
+  /**
    * A transient InitProducerId failure during connect() must not poison the producer for the
    * rest of the process lifetime: re-attempt it on the next send instead (Countly patch 2g).
    * Shared (via `sharedPromiseTo`) between connect() and send()/sendBatch(), so whichever one
    * gets there first is the only one to issue an InitProducerId request; the others await the
    * same in-flight promise instead of racing separate ones. Emits INITIALIZED once the request
    * that actually initialized the producer succeeds, regardless of which caller triggered it.
+   * The promise is shared only within one producer lifecycle: a closed lifecycle's request, still
+   * held, is never joined by the next one, and its answer emits nothing.
    */
-  const ensureInitialized = sharedPromiseTo(async () => {
-    if (idempotence.isEnabled() && !eosManager.isInitialized()) {
-      logger.debug('Idempotent producer is not initialized, requesting a producer id')
-      await eosManager.initProducerId()
-      instrumentationEmitter.emit(INITIALIZED)
-    }
-  })
+  const initialize = sharedPromiseTo(
+    async (generation) => {
+      generation?.check()
+      if (idempotence.isEnabled() && !eosManager.isInitialized()) {
+        logger.debug('Idempotent producer is not initialized, requesting a producer id')
+        await eosManager.initProducerId()
+        generation?.check()
+        instrumentationEmitter.emit(INITIALIZED)
+      }
+    },
+    (generation) => generation
+  )
+  const ensureInitialized = () => initialize(getGeneration())
 
   /**
    * @typedef {Object} TopicMessages
@@ -301,6 +335,8 @@ module.exports = ({
     ensureInitialized,
     flush,
     close,
+    unsettled,
+    forceClose,
     depthOf: (topic, partition) => accumulator.depthOf(topic, partition),
   }
 }

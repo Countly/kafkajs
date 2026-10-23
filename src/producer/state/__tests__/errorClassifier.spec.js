@@ -14,6 +14,7 @@ const {
   KafkaJSApplicationRecoverableError,
   KafkaJSInvalidConfigurationError,
   KafkaJSDeliveryTimeout,
+  KafkaJSProducerClosedError,
 } = require('../../../errors')
 
 const SURFACES = ['produce', 'txn', 'offsets']
@@ -680,6 +681,20 @@ describe('transactionStateFor after the retrier has wrapped an error', () => {
     expect(wrapped.category).toEqual('applicationRecoverable')
     expect(transactionStateFor(wrapped)).toEqual('FATAL_ERROR')
   })
+
+  test.each([7, 31, 90])(
+    'leaves a producer close as it is, abortable, whatever the numeric cause %i says',
+    (code) => {
+      const error = new KafkaJSProducerClosedError('The producer was closed', {
+        outcome: 'unknown',
+        cause: createErrorFromCode(code),
+      })
+
+      expect(classify(error, 'produce', { transactional: true })).toEqual({ category: 'abortable' })
+      expect(error.category).toEqual('abortable')
+      expect(transactionStateFor(error)).toEqual('ABORTABLE_ERROR')
+    }
+  )
 
   test('a delivery timeout is abortable as thrown, and answered from its cause once the retrier has wrapped it', async () => {
     const timeout = () =>

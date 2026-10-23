@@ -58,6 +58,14 @@ const TOO_OLD = 'too-old'
 /** The broker was asked, but nothing usable came back. */
 const FAILED = 'failed'
 
+/**
+ * A producer lifecycle as the trailing argument of a call, or no argument at all: an unfenced
+ * call keeps the shape it always had.
+ * @param {import('../producer/generation')} [fence]
+ * @returns {[{ fence: import('../producer/generation') }]|[]}
+ */
+const fenceArgs = (fence) => (fence ? [{ fence }] : [])
+
 const PRIVATE = {
   CONNECT: Symbol('private:Cluster:connect'),
   REFRESH_METADATA: Symbol('private:Cluster:refreshMetadata'),
@@ -128,7 +136,8 @@ module.exports = class Cluster {
   }) {
     this.rootLogger = rootLogger
     this.logger = rootLogger.namespace('Cluster')
-    this.retrier = createRetry(retry)
+    this.retryOptions = { ...retry }
+    this.retrier = createRetry(this.retryOptions)
     this.connectionPoolBuilder = connectionPoolBuilder({
       logger: rootLogger,
       instrumentationEmitter,
@@ -182,21 +191,32 @@ module.exports = class Cluster {
     this.groupRegistry = GroupRegistry.forStores(offsets, operations)
     this.groupEntries = new Map()
 
-    this[PRIVATE.CONNECT] = sharedPromiseTo(async () => {
-      return await this.brokerPool.connect()
-    })
+    // A producer lifecycle's call shares nothing with another lifecycle's: each is scoped by its fence.
+    const fenceOf = ({ fence } = {}) => fence
 
-    this[PRIVATE.REFRESH_METADATA] = sharedPromiseTo(async () => {
+    this[PRIVATE.CONNECT] = sharedPromiseTo(async ({ fence } = {}) => {
+      return await this.brokerPool.connect(...fenceArgs(fence))
+    }, fenceOf)
+
+    this[PRIVATE.REFRESH_METADATA] = sharedPromiseTo(async ({ fence } = {}) => {
+      fence?.check()
       this.pruneTargetTopics()
       if (this.targetTopicState !== null && this.targetTopics.size === 0) return
-      return await this.brokerPool.refreshMetadata(Array.from(this.targetTopics))
-    })
+      return await this.brokerPool.refreshMetadata(
+        Array.from(this.targetTopics),
+        ...fenceArgs(fence)
+      )
+    }, fenceOf)
 
-    this[PRIVATE.REFRESH_METADATA_IF_NECESSARY] = sharedPromiseTo(async () => {
+    this[PRIVATE.REFRESH_METADATA_IF_NECESSARY] = sharedPromiseTo(async ({ fence } = {}) => {
+      fence?.check()
       this.pruneTargetTopics()
       if (this.targetTopicState !== null && this.targetTopics.size === 0) return
-      return await this.brokerPool.refreshMetadataIfNecessary(Array.from(this.targetTopics))
-    })
+      return await this.brokerPool.refreshMetadataIfNecessary(
+        Array.from(this.targetTopics),
+        ...fenceArgs(fence)
+      )
+    }, fenceOf)
 
     this[PRIVATE.FIND_CONTROLLER_BROKER] = sharedPromiseTo(async () => {
       const { metadata } = this.brokerPool
@@ -222,20 +242,38 @@ module.exports = class Cluster {
   }
 
   /**
+   * The retrier of work that belongs to one producer lifecycle: it stops at once, with the
+   * lifecycle's close error, when the lifecycle closes. Counts and delays are the cluster's own.
    * @public
-   * @returns {Promise<void>}
+   * @param {import('../producer/generation')} [fence] the captured producer lifecycle
+   * @returns {import('../retry').Retrier} the cluster's own retrier when there is no lifecycle
    */
-  async connect() {
-    await this[PRIVATE.CONNECT]()
+  retryFor(fence) {
+    return fence ? createRetry({ ...this.retryOptions, fence }) : this.retrier
   }
 
   /**
    * @public
+   * @param {object} [options]
+   * @param {import('../producer/generation')} [options.fence] the producer lifecycle asking: its
+   *   close ends the retries and opens no socket afterwards
+   * @returns {Promise<void>}
+   * @throws {Error} the lifecycle's close error
+   */
+  async connect({ fence } = {}) {
+    await this[PRIVATE.CONNECT]({ fence })
+  }
+
+  /**
+   * @public
+   * @param {object} [options]
+   * @param {number} [options.drainTimeout] ms each connection waits for its requests, 0 closing
+   *   at once; the pools' own bound when omitted, which keeps a reusable client's close as it was
    * @returns {Promise<void>}
    */
-  async disconnect() {
+  async disconnect(options) {
     try {
-      await this.brokerPool.disconnect()
+      await this.brokerPool.disconnect(...(options ? [options] : []))
     } finally {
       for (const groupId of this.groupEntries.keys()) this.groupRegistry.release(groupId, this)
       this.groupEntries.clear()
@@ -258,18 +296,25 @@ module.exports = class Cluster {
 
   /**
    * @public
+   * @param {object} [options]
+   * @param {import('../producer/generation')} [options.fence] the producer lifecycle asking: once
+   *   it closed, the retries stop, no socket opens and a late response publishes nothing
    * @returns {Promise<void>}
+   * @throws {Error} the lifecycle's close error
    */
-  async refreshMetadata() {
-    await this[PRIVATE.REFRESH_METADATA]()
+  async refreshMetadata({ fence } = {}) {
+    await this[PRIVATE.REFRESH_METADATA]({ fence })
   }
 
   /**
    * @public
+   * @param {object} [options]
+   * @param {import('../producer/generation')} [options.fence] see `refreshMetadata`
    * @returns {Promise<void>}
+   * @throws {Error} the lifecycle's close error
    */
-  async refreshMetadataIfNecessary() {
-    await this[PRIVATE.REFRESH_METADATA_IF_NECESSARY]()
+  async refreshMetadataIfNecessary({ fence } = {}) {
+    await this[PRIVATE.REFRESH_METADATA_IF_NECESSARY]({ fence })
   }
 
   /**
@@ -490,12 +535,19 @@ module.exports = class Cluster {
   /**
    * @public
    * @param {string[]} topics
+   * @param {object} [options]
+   * @param {import('../producer/generation')} [options.fence] the producer lifecycle asking: once
+   *   it closed, nothing is added, and a failed add rolls nothing back, so it never touches the
+   *   state of a lifecycle that began after it; its own lock is released either way
    * @return {Promise}
+   * @throws {Error} the lifecycle's close error
    */
-  async addMultipleTargetTopics(topics) {
+  async addMultipleTargetTopics(topics, { fence } = {}) {
+    fence?.check()
     await this.mutatingTargetTopics.acquire()
 
     try {
+      fence?.check()
       const previousSize = this.targetTopics.size
       const previousTopics = new Set(this.targetTopics)
       for (const topic of topics) {
@@ -507,8 +559,9 @@ module.exports = class Cluster {
 
       if (hasChanged) {
         try {
-          await this.refreshMetadata()
+          await this.refreshMetadata(...fenceArgs(fence))
         } catch (e) {
+          fence?.check()
           if (
             e.type === 'INVALID_TOPIC_EXCEPTION' ||
             e.type === 'UNKNOWN_TOPIC_OR_PARTITION' ||
@@ -625,14 +678,15 @@ module.exports = class Cluster {
    * and any `instanceof`/name check downstream depends on.
    *
    * @private
+   * @param {import('../producer/generation')} [fence] the producer lifecycle asking
    * @returns {Promise<void>}
    */
-  async refreshMetadataBestEffort() {
+  async refreshMetadataBestEffort(fence) {
     // `Promise.resolve(...)` tolerates a test double that returns `undefined` instead of a
     // promise (several specs stub `refreshMetadata` with a bare `jest.fn()`); the real,
     // production `refreshMetadata()` is an `async` method and always returns a genuine promise,
     // so this changes nothing there.
-    await Promise.resolve(this.refreshMetadata()).catch((refreshError) => {
+    await Promise.resolve(this.refreshMetadata(...fenceArgs(fence))).catch((refreshError) => {
       this.logger.debug('Best-effort metadata refresh failed, continuing with the original error', {
         error: refreshError.message,
       })
@@ -643,19 +697,23 @@ module.exports = class Cluster {
    * @public
    * @param {object} options
    * @param {string} options.nodeId
+   * @param {import('../producer/generation')} [options.fence] the producer lifecycle asking: its
+   *   close ends the connection attempts and the refresh a failure would start
    * @returns {Promise<import("../../types").Broker>}
+   * @throws {Error} the lifecycle's close error
    */
-  async findBroker({ nodeId }) {
+  async findBroker({ nodeId, fence }) {
     try {
-      return await this.brokerPool.findBroker({ nodeId })
+      return await this.brokerPool.findBroker({ nodeId, fence })
     } catch (e) {
+      fence?.check()
       // The client probably has stale metadata
       if (
         describeThrown(e, 'name') === 'KafkaJSBrokerNotFound' ||
         describeThrown(e, 'name') === 'KafkaJSLockTimeout' ||
         isConnectionFailure(e)
       ) {
-        await this.refreshMetadataBestEffort()
+        await this.refreshMetadataBestEffort(fence)
       }
 
       throw e
@@ -677,11 +735,15 @@ module.exports = class Cluster {
    * node.
    * @see https://github.com/apache/kafka/blob/4.3/clients/src/main/java/org/apache/kafka/clients/producer/internals/Sender.java
    * @public
+   * @param {object} [options]
+   * @param {import('../producer/generation')} [options.fence] the producer lifecycle asking: once
+   *   it closed, no broker is tried and no socket opens
    * @returns {Promise<import("../../types").Broker>}
-   * @throws {Error} the seed broker's connection error, when no broker connects
+   * @throws {Error} the seed broker's connection error, when no broker connects, or the
+   *   lifecycle's close error
    */
-  async findConnectedBroker() {
-    return await this.brokerPool.findConnectedBroker()
+  async findConnectedBroker({ fence } = {}) {
+    return await this.brokerPool.findConnectedBroker(...fenceArgs(fence))
   }
 
   /**
@@ -808,11 +870,19 @@ module.exports = class Cluster {
    * @param {number} hint.leaderId
    * @param {number} hint.leaderEpoch
    * @param {{ nodeId: number, host: string, port: number, rack: string|null }[]} [hint.nodeEndpoints]
+   * @param {object} [options]
+   * @param {import('../producer/generation')} [options.fence] captured producer lifecycle; its
+   *   close prevents endpoint installation and a later cache update
    * @returns {Promise<boolean>} `false` when the hint was rejected - a non-advancing epoch, a
    *   `leaderId` of `-1` (no hint offered), or an unknown topic/partition - `true` when it was
    *   applied
+   * @throws {Error} the lifecycle's close error
    */
-  async applyLeaderHint({ topic, partition, leaderId, leaderEpoch, nodeEndpoints }) {
+  async applyLeaderHint(
+    { topic, partition, leaderId, leaderEpoch, nodeEndpoints },
+    { fence } = {}
+  ) {
+    fence?.check()
     // Mirrors MetadataCache#applyLeaderHint's own no-hint-offered guard, so this pre-check can
     // never itself pay for the endpoint work below on the broker's `{ -1, -1 }` default.
     if (leaderId === -1) {
@@ -825,7 +895,8 @@ module.exports = class Cluster {
       return false
     }
 
-    await this.brokerPool.applyNodeEndpoints(nodeEndpoints)
+    await this.brokerPool.applyNodeEndpoints(nodeEndpoints, ...fenceArgs(fence))
+    fence?.check()
     return this.metadataCache.applyLeaderHint(topic, partition, { leaderId, leaderEpoch })
   }
 
@@ -899,22 +970,32 @@ module.exports = class Cluster {
    * @param {object} params
    * @param {string} params.groupId
    * @param {import("../protocol/coordinatorTypes").CoordinatorType} [params.coordinatorType=0]
+   * @param {import('../producer/generation')} [params.fence] the producer lifecycle asking: its
+   *   close ends the retries, and an answer that arrives after it is neither installed nor used
    * @returns {Promise<import("../../types").Broker>}
+   * @throws {Error} the lifecycle's close error
    */
-  async findGroupCoordinator({ groupId, coordinatorType = COORDINATOR_TYPES.GROUP }) {
-    return this.retrier(async (bail, retryCount, retryTime) => {
+  async findGroupCoordinator({ groupId, coordinatorType = COORDINATOR_TYPES.GROUP, fence }) {
+    return this.retryFor(fence)(async (bail, retryCount, retryTime) => {
       try {
         const { coordinator } = await this.findGroupCoordinatorMetadata({
           groupId,
           coordinatorType,
+          fence,
         })
+        fence?.check()
 
         if (!this.brokerPool.hasNode(coordinator.nodeId)) {
-          await this.brokerPool.applyNodeEndpoints([{ ...coordinator, rack: null }])
+          await this.brokerPool.applyNodeEndpoints(
+            [{ ...coordinator, rack: null }],
+            ...fenceArgs(fence)
+          )
+          fence?.check()
         }
 
-        return await this.findBroker({ nodeId: coordinator.nodeId })
+        return await this.findBroker({ nodeId: coordinator.nodeId, fence })
       } catch (e) {
+        fence?.check()
         // A new broker can join the cluster before we have the chance
         // to refresh metadata
         if (e.name === 'KafkaJSBrokerNotFound' || e.type === 'GROUP_COORDINATOR_NOT_AVAILABLE') {
@@ -924,7 +1005,7 @@ module.exports = class Cluster {
             retryTime,
           })
 
-          await this.refreshMetadataBestEffort()
+          await this.refreshMetadataBestEffort(fence)
           throw e
         }
 
@@ -948,21 +1029,31 @@ module.exports = class Cluster {
    * @param {object} params
    * @param {string} params.groupId
    * @param {import("../protocol/coordinatorTypes").CoordinatorType} [params.coordinatorType=0]
+   * @param {import('../producer/generation')} [params.fence] the producer lifecycle asking: once
+   *   it closed, no broker is asked and no socket opens
    * @returns {Promise<Object>}
    * @throws {KafkaJSBrokerNotFound} when the seed broker's connection failed or timed out
    * @throws {KafkaJSGroupCoordinatorNotFound} when no broker answered
+   * @throws {Error} the lifecycle's close error
    */
-  async findGroupCoordinatorMetadata({ groupId, coordinatorType }) {
+  async findGroupCoordinatorMetadata({ groupId, coordinatorType, fence }) {
     const findCoordinator = async ({ nodeId, broker }) => {
-      return await this.retrier(async (bail, retryCount, retryTime) => {
+      return await this.retryFor(fence)(async (bail, retryCount, retryTime) => {
         try {
-          const brokerMetadata = await broker.findGroupCoordinator({ groupId, coordinatorType })
+          fence?.check()
+          const brokerMetadata = await broker.findGroupCoordinator({
+            groupId,
+            coordinatorType,
+            ...(fence ? { guard: fence.guard } : {}),
+          })
+          fence?.check()
           this.logger.debug('Found group coordinator', {
             broker: brokerMetadata.host,
             nodeId: brokerMetadata.coordinator.nodeId,
           })
           return brokerMetadata
         } catch (e) {
+          fence?.check()
           this.logger.debug('Tried to find group coordinator', {
             nodeId,
             groupId,
@@ -986,10 +1077,11 @@ module.exports = class Cluster {
 
     let brokerMetadata
     if (this.brokerPool.getNodeIds().length > 0) {
-      brokerMetadata = await this.brokerPool.withBroker(findCoordinator)
+      brokerMetadata = await this.brokerPool.withBroker(findCoordinator, ...fenceArgs(fence))
     } else {
-      const broker = await this.brokerPool.findConnectedBroker()
+      const broker = await this.brokerPool.findConnectedBroker(...fenceArgs(fence))
       brokerMetadata = await findCoordinator({ nodeId: broker.nodeId, broker }).catch((e) => {
+        fence?.check()
         if (e instanceof KafkaJSConnectionError || e instanceof KafkaJSRequestTimeoutError) {
           const message = `FindCoordinator failed on the seed broker: ${e.message}`
           throw new KafkaJSBrokerNotFound(message, { cause: e })

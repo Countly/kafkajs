@@ -21,6 +21,7 @@ const {
   KafkaJSError,
   KafkaJSInvalidConfigurationError,
   KafkaJSInvariantViolation,
+  KafkaJSProducerClosedError,
   KafkaJSTransactionAbortableError,
 } = require('../../../errors')
 const {
@@ -32,6 +33,7 @@ const {
   ABORTABLE_ERROR,
   FATAL_ERROR,
 } = require('../../eosManager/transactionStates')
+const Generation = require('../../generation')
 const { newLogger } = require('testHelpers')
 
 const TOPIC = 'topic-a'
@@ -99,7 +101,7 @@ const createCoordinator = () => ({
 })
 
 /**
- * @param {{ transactional?: boolean, retry?: object, coordinator?: object, addPartitionsToTxn?: Function, logger?: object }} [options]
+ * @param {{ transactional?: boolean, retry?: object, coordinator?: object, addPartitionsToTxn?: Function, findBroker?: Function, getGeneration?: Function, logger?: object }} [options]
  */
 const createManager = ({
   logger = newLogger(),
@@ -107,6 +109,8 @@ const createManager = ({
   retry = RETRY,
   coordinator = createCoordinator(),
   addPartitionsToTxn = jest.fn(async () => {}),
+  findBroker = async () => coordinator,
+  getGeneration,
 } = {}) =>
   new ProducerStateManager({
     logger,
@@ -114,8 +118,9 @@ const createManager = ({
     transactionalId: transactional ? 'test-transactional-id' : null,
     transactionTimeout: 30000,
     retry,
-    findBroker: async () => coordinator,
+    findBroker,
     addPartitionsToTxn,
+    ...(getGeneration ? { getGeneration } : {}),
   })
 
 /** Initializes the manager and, for a transactional one, begins a transaction. */
@@ -1559,4 +1564,150 @@ describe('a never-written expiry before or after numbering', () => {
       }
     }
   )
+})
+
+describe('Producer > state > ProducerStateManager under a producer lifecycle', () => {
+  const closed = new Error('producer closed')
+
+  /** A manager whose lifecycle `use(generation)` switches; its broker lookups wait for `release()`. */
+  const lifecycleManager = (options = {}) => {
+    let current = new Generation()
+    const lookups = []
+    const findBroker = jest.fn(
+      () =>
+        new Promise((resolve) => {
+          lookups.push(() => resolve(createCoordinator()))
+        })
+    )
+    const manager = createManager({ ...options, findBroker, getGeneration: () => current })
+    return {
+      manager,
+      lookups,
+      generation: () => current,
+      use: (next) => {
+        current = next
+      },
+    }
+  }
+
+  test('one acquisition is shared within a lifecycle, and the next lifecycle does not join the old one', async () => {
+    const { manager, lookups, generation, use } = lifecycleManager()
+    const first = manager.initialize()
+    expect(manager.initialize()).toBe(first)
+    await settle()
+    generation().close(closed)
+    use(new Generation())
+
+    const second = manager.initialize()
+    expect(second).not.toBe(first)
+    await settle()
+    lookups[1]()
+    await second
+    lookups[0]()
+
+    await expect(first).rejects.toBe(closed)
+    expect(manager.isInitialized()).toBe(true)
+    expect(manager.initialize()).not.toBe(second)
+  })
+
+  test('a recovery ended by the close arms nothing and rejects no queued batch of the next lifecycle', async () => {
+    const { manager, lookups, generation, use } = lifecycleManager({ retry: { retries: 0 } })
+    const recovering = manager.ensureProducerId()
+    expect(manager.ensureProducerId()).toBe(recovering)
+    await settle()
+    generation().close(closed)
+    use(new Generation())
+    const next = manager.ensureProducerId()
+    expect(next).not.toBe(recovering)
+    const batch = createBatch()
+    manager.enqueue([batch])
+
+    await recovering
+    await settle()
+
+    expect(manager.state()).toEqual(UNINITIALIZED)
+    expect(batch.settlers[0].reject).not.toHaveBeenCalled()
+    expect(manager.ensureProducerId()).toBe(next)
+    lookups[lookups.length - 1]()
+    await next
+    expect(manager.isInitialized()).toBe(true)
+  })
+
+  test('an AddPartitionsToTxn takes the lifecycle of its caller, and one the close ended joins and arms nothing', async () => {
+    const generation = new Generation()
+    let land
+    const addPartitionsToTxn = jest.fn(() => new Promise((resolve) => (land = resolve)))
+    const manager = await ready(
+      createManager({ transactional: true, addPartitionsToTxn, getGeneration: () => generation }),
+      { transactional: true }
+    )
+
+    const added = manager.addPartitionToTransaction(TOPIC, 0)
+    await settle()
+    expect(addPartitionsToTxn).toHaveBeenCalledWith([{ topic: TOPIC, partitions: [0] }], generation)
+    generation.close(closed)
+    land()
+
+    await expect(added).rejects.toBe(closed)
+    expect(manager.state()).toEqual(IN_TRANSACTION)
+    expect(manager.transactionStarted()).toBe(false)
+    expect(manager.drain(NODE, LEADERS)).toEqual([])
+  })
+
+  test('a failure of an AddPartitionsToTxn after the close arms nothing', async () => {
+    const generation = new Generation()
+    let fail
+    const addPartitionsToTxn = jest.fn(() => new Promise((_, reject) => (fail = reject)))
+    const manager = await ready(
+      createManager({ transactional: true, addPartitionsToTxn, getGeneration: () => generation }),
+      { transactional: true }
+    )
+    const added = manager.addPartitionToTransaction(TOPIC, 0)
+    await settle()
+    generation.close(closed)
+    fail(failure(PRODUCER_FENCED))
+
+    await expect(added).rejects.toBe(closed)
+    expect(manager.state()).toEqual(IN_TRANSACTION)
+  })
+})
+
+describe('Producer > state > ProducerStateManager > a forced close', () => {
+  const closedWith = (outcome) =>
+    new KafkaJSProducerClosedError('The producer was closed', { outcome })
+
+  test('a batch that was written ends unknown: its numbers stay unresolved and are not given back', async () => {
+    const manager = await idempotentManager()
+    const [batch] = send(manager, createBatch({ records: 5 }))
+    expect(batch.firstSequence).toBe(0)
+
+    expect(manager.fail(batch, closedWith('unknown'), { transmitted: true })).toEqual('FAIL_BATCH')
+
+    expect(manager.sequencer.entry(TOPIC, 0)).toMatchObject({
+      nextSequence: 5,
+      unresolvedNextSequence: 5,
+    })
+  })
+
+  test('a batch that was never written gives its numbers back and leaves nothing unresolved', async () => {
+    const manager = await idempotentManager()
+    const [batch] = send(manager, createBatch({ records: 5 }))
+
+    expect(manager.fail(batch, closedWith('unsent'), { transmitted: false })).toEqual('FAIL_BATCH')
+
+    expect(manager.nextSequence(TOPIC, 0)).toBe(0)
+    expect(manager.sequencer.entry(TOPIC, 0)?.unresolvedNextSequence ?? null).toBeNull()
+  })
+
+  test('inside a transaction the close arms it abortable, with a written batch or without one', async () => {
+    const written = await transactionalManager()
+    const [first] = send(written, createBatch())
+    written.fail(first, closedWith('unknown'), { transmitted: true })
+    expect(written.state()).toEqual(ABORTABLE_ERROR)
+
+    const unsent = await transactionalManager()
+    const [second] = send(unsent, createBatch())
+    unsent.fail(second, closedWith('unsent'), { transmitted: false })
+    expect(unsent.state()).toEqual(ABORTABLE_ERROR)
+  })
 })

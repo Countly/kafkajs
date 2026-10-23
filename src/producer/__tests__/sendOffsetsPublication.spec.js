@@ -265,14 +265,20 @@ describe.each(['tv1', 'tv2'])('Producer > transactional offsets on the wire (%s)
     )
 
     test.each([1, 2])(
-      'version %s forfeits the offsets an open transaction sent before disconnect, even when its commit after reconnect is confirmed',
+      'version %s forfeits the offsets an open transaction sent before disconnect, which aborts it, and its commit after reconnect is refused',
       async (level) => {
         fixture = await open(level)
         await fixture.send(topics('9'))
         await fixture.producer.disconnect()
         expect(fixture.ledger.size()).toBe(0)
+        expect(fixture.broker.endTxn).toHaveBeenCalledTimes(1)
+        expect(fixture.broker.endTxn).toHaveBeenCalledWith(
+          expect.objectContaining({ transactionResult: false })
+        )
         await fixture.producer.connect()
-        await fixture.transaction.commit()
+        await expect(fixture.transaction.commit()).rejects.toThrow(
+          'Cannot continue to use transaction once ended'
+        )
         expect(fixture.broker.endTxn).toHaveBeenCalledTimes(1)
         expect(fixture.cluster.markOffsetAsCommitted).not.toHaveBeenCalled()
         expect(fixture.ledger.size()).toBe(0)

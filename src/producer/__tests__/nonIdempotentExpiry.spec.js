@@ -1,5 +1,6 @@
 const { Kafka } = require('../../../index')
 const { KafkaJSDeliveryTimeout } = require('../../errors')
+const Generation = require('../generation')
 const { Schedule } = require('../../../testHelpers/schedule')
 const { createScriptedCluster, producerScript } = require('../../../testHelpers/scriptedCluster')
 const { WireOrder } = require('../../../testHelpers/wireOrder')
@@ -177,13 +178,16 @@ describe('Non-idempotent producer delivery expiry', () => {
           wire.timeline().filter(({ api, kind }) => api === 'Metadata' && kind === 'response')
             .length > responsesBefore
       )
-      expect(applied).toHaveBeenCalledWith({
-        topic: TOPIC,
-        partition: 0,
-        leaderId: 1,
-        leaderEpoch: 2,
-        nodeEndpoints: [{ nodeId: 1, host: 'node1', port: 9093, rack: null }],
-      })
+      expect(applied).toHaveBeenCalledWith(
+        {
+          topic: TOPIC,
+          partition: 0,
+          leaderId: 1,
+          leaderEpoch: 2,
+          nodeEndpoints: [{ nodeId: 1, host: 'node1', port: 9093, rack: null }],
+        },
+        { fence: expect.any(Generation) }
+      )
       expect(await applied.mock.results[0].value).toBe(true)
       await task
       await jest.advanceTimersByTimeAsync(1000)

@@ -4,6 +4,7 @@ const createProducer = require('../index')
 const Idempotence = require('../idempotence')
 const Accumulator = require('../state/accumulator')
 const createRetry = require('../../retry')
+const Generation = require('../generation')
 const Broker = require('../../broker')
 const Cluster = require('../../cluster')
 const Connection = require('../../network/connection')
@@ -404,6 +405,7 @@ const createUnreliableCluster = (random, log) => {
  * @param {object} [options.retry]
  * @param {number} [options.deliveryTimeout]
  * @param {Function} [options.partitioner]
+ * @param {Generation} [options.generation] the producer lifecycle every send runs under
  */
 const createHarness = ({
   layout = { [TOPIC]: { 0: 1, 1: 2 } },
@@ -412,6 +414,7 @@ const createHarness = ({
   retry = RETRY,
   deliveryTimeout,
   partitioner = byMessage,
+  generation,
 } = {}) => {
   const logger = newLogger()
   const produced = []
@@ -482,6 +485,7 @@ const createHarness = ({
     retry,
     deliveryTimeout,
     getConnectionStatus: () => status,
+    ...(generation ? { getGeneration: () => generation } : {}),
   })
 
   /** Initializes the producer id, and begins a transaction for a transactional producer. */
@@ -1404,6 +1408,32 @@ describe('Producer > the idempotent drain loop', () => {
       })
       expect(harness.cluster.refreshMetadata).toHaveBeenCalledTimes(1)
       expect(harness.sent().map(({ nodeId }) => nodeId)).toEqual([1, 2])
+    })
+
+    test('a leader hint carries the producer lifecycle that began the send', async () => {
+      const generation = new Generation()
+      let calls = 0
+      const harness = createHarness({
+        layout: { [TOPIC]: { 0: 1 } },
+        generation,
+        answer: (request, nodeId) => {
+          calls += 1
+          if (calls > 1) {
+            return respond(request, nodeId)
+          }
+          const results = respond(request, nodeId, { 'topic-a/0': NOT_LEADER_OR_FOLLOWER })
+          results[0].error.currentLeader = { leaderId: 2, leaderEpoch: 6 }
+          return results
+        },
+      })
+      await harness.start()
+
+      await harness.send([{ topic: TOPIC, messages: records(0) }])
+
+      expect(harness.cluster.applyLeaderHint).toHaveBeenCalledWith(
+        expect.objectContaining({ topic: TOPIC, partition: 0, leaderId: 2, leaderEpoch: 6 }),
+        { fence: generation }
+      )
     })
 
     test('a hint that fails to apply and a refresh that fails leave the re-send to the retry', async () => {

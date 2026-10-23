@@ -9,6 +9,18 @@ const { KafkaJSConnectionError, KafkaJSSASLAuthenticationError } = require('../e
 // is unset or shorter, so a misconfigured broker can't be hammered in a tight reconnect loop.
 const MIN_AUTHENTICATION_BLACKOUT_MS = 1000
 
+/**
+ * @param {(() => Error|null)|undefined} guard a producer's private pre-write check
+ * @returns {void}
+ * @throws {Error} the error the guard returned
+ */
+const throwIfRefused = (guard) => {
+  const refusal = guard && guard()
+  if (refusal) {
+    throw refusal
+  }
+}
+
 module.exports = class ConnectionPool {
   /**
    * @param {ConstructorParameters<typeof Connection>[0] & {
@@ -192,18 +204,30 @@ module.exports = class ConnectionPool {
     return resolvedConnection.send(guard ? { ...protocolRequest, guard } : protocolRequest)
   }
 
-  getConnectionByRequest({ request: { apiKey } }) {
+  /**
+   * @public
+   * @param {{ request: { apiKey: number } }} protocolRequest
+   * @param {{ guard?: () => Error|null }} [options] see `getConnection`
+   * @returns {Promise<Connection>}
+   * @throws {KafkaJSConnectionError} when the pool was retired
+   */
+  getConnectionByRequest({ request: { apiKey } }, options) {
     const index = apiKey === apiKeys.Fetch && POOL_SIZE > 1 ? 1 : 0
-    return this.getConnection(index)
+    return options ? this.getConnection(index, options) : this.getConnection(index)
   }
 
   /**
    * @public
    * @param {number} [index=0]
+   * @param {object} [options]
+   * @param {() => Error|null} [options.guard] a producer's private check of its lifecycle: asked
+   *   immediately before the connection is opened and again once it is, an error it returns is
+   *   thrown, so a closed producer opens no socket and goes on to no later stage
    * @returns {Promise<Connection>}
    * @throws {KafkaJSConnectionError} when the pool was retired
+   * @throws {Error} the error the guard returned
    */
-  async getConnection(index = 0) {
+  async getConnection(index = 0, { guard } = {}) {
     this.throwIfRetired()
     const connection = this.pool[index]
 
@@ -222,7 +246,9 @@ module.exports = class ConnectionPool {
     }
 
     if (!connection.isConnected()) {
+      throwIfRefused(guard)
       await connection.connect()
+      throwIfRefused(guard)
     }
 
     this.throwIfRetired()
