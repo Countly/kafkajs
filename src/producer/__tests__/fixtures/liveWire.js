@@ -196,15 +196,18 @@ class ResponseDrop {
   }
 
   /**
-   * Stops, closes the connection that dropped an answer, which ends the request nobody will
-   * answer: the client sees a closed connection, retires what the request held and reconnects on
-   * its next send. Every socket it armed gets its own decision back, whatever happened.
+   * Stops, then resets the connection whose answer was dropped with an `ECONNRESET` error, as a
+   * lost connection surfaces: the client listens for `error` and `end`, not `close`, so it fails
+   * what is in flight on that connection, retires what the request held and reconnects on its
+   * next send. Every socket it armed gets its own decision back, whatever happened.
    * @returns {void}
    */
   release() {
     this.stop()
     try {
-      this.consumer?.destroy()
+      this.consumer?.destroy(
+        Object.assign(new Error('Connection reset after a dropped answer'), { code: 'ECONNRESET' })
+      )
     } finally {
       for (const [socket, own] of this.armed) {
         if (own === null) delete socket.dropResponse

@@ -30,6 +30,10 @@ const BATCH_HEADER = 61
 const PROBE_TIMESTAMP = 1700000000000
 const ID_BYTES = 13
 const QUIET_BUDGET = { attempts: 100, delay: 100 } // 10 s
+/** How long a read waits for a log or a coordinator that the cluster is still settling. */
+const SETTLE_BUDGET = Object.freeze({ attempts: 120, delay: 250 }) // 30 s
+/** The protocol codes of a group coordinator that is loading, not available, or has moved. */
+const COORDINATOR_MOVING = new Set([14, 15, 16])
 /** What `ResourceLedger#facts` reports when the producer retains nothing. */
 const NO_RETAINED_RESOURCES = Object.freeze({
   pins: {},
@@ -584,6 +588,8 @@ class ProducerProbe {
    * @param {number} options.maxRequestSize
    * @param {string[]} [options.brokers]
    * @param {{ attempts: number, delay: number }} [options.quietBudget] how long a baseline waits
+   * @param {{ attempts: number, delay: number }} [options.readBackBudget] how long the closing
+   *   probe waits for the log to show its records
    */
   constructor({
     producer,
@@ -593,6 +599,7 @@ class ProducerProbe {
     maxRequestSize,
     brokers = plainTextBrokers(),
     quietBudget = QUIET_BUDGET,
+    readBackBudget = SETTLE_BUDGET,
   }) {
     Object.assign(this, {
       producer,
@@ -602,6 +609,7 @@ class ProducerProbe {
       maxRequestSize,
       brokers,
       quietBudget,
+      readBackBudget,
     })
     /** @type {Admission|null} */
     this.admission = null
@@ -865,15 +873,17 @@ class ProducerProbe {
    * @param {() => Promise<void>} [options.finish] ends a transaction the sender opened, after the
    *   send was delivered
    * @param {number} [options.isolationLevel] how the probe topic is read back; read_committed for
-   *   a transaction
+   *   a transaction, whose records show once the coordinator wrote its markers, after the commit
+   *   answered, so the read-back is repeated within `readBackBudget`
    * @param {number} options.budgetMs the producer's delivery budget
    * @param {AbortSignal} [options.signal] the owner's: every step goes through `bounded` under it,
    *   so once it aborts this method issues no topic, configuration read, send or log read itself; an
    *   operation it started that ignores the abort may still finish, which taints the run
    * @returns {Promise<object>} what was observed, for the scenario's evidence
    * @throws {Error} through a failed expectation when the send was not admitted in its own turn,
-   *   was not delivered once and in order, left the producer holding anything, or was never seen
-   *   as a partition chunk; the reason `signal` aborted with
+   *   was not delivered once and in order (the last read-back is what it reports), left the
+   *   producer holding anything, or was never seen as a partition chunk; the reason `signal`
+   *   aborted with
    */
   async closing({
     sender = this.producer,
@@ -947,13 +957,17 @@ class ProducerProbe {
     expect(outcome.error).toBeNull()
     await step(() => finish?.())
 
-    const [log] = (
-      await step(() => readLog({ brokers: this.brokers, topic, isolationLevel }))
-    ).values()
-    const data =
-      isolationLevel === ISOLATION_LEVEL.READ_COMMITTED
-        ? committedRecords(log)
-        : log.records.filter(({ batchContext }) => !batchContext.isControlBatch)
+    const data = await readUntilCovered(
+      signal,
+      async () => {
+        const [log] = (await readLog({ brokers: this.brokers, topic, isolationLevel })).values()
+        return isolationLevel === ISOLATION_LEVEL.READ_COMMITTED
+          ? committedRecords(log)
+          : log.records.filter(({ batchContext }) => !batchContext.isControlBatch)
+      },
+      (records) => records.length >= ids.length,
+      this.readBackBudget
+    )
     expect(data.map(({ value }) => value.toString('latin1', 0, ID_BYTES))).toEqual(ids)
     expect(data.map(({ value }) => value.length)).toEqual(layout.lengths)
     const produces = this.frames?.since(0, mark) ?? []
@@ -1171,6 +1185,53 @@ const readData = async (brokers, topic, { committed = false } = {}) => {
 }
 
 /**
+ * Reads until `covers` holds of the answer, for as many reads as `budget` allows, each under
+ * `bounded` and every pause under `delay`. A log read as read_committed shows a transaction's
+ * records only once the coordinator wrote its markers, which follows the commit's own answer, so
+ * the first read can be empty; this waits for that without weakening what the caller then asserts.
+ * @template T
+ * @param {AbortSignal} signal the owner's; no read starts once it aborted
+ * @param {() => Promise<T>} read
+ * @param {(answer: T) => boolean} covers whether an answer holds everything expected
+ * @param {{ attempts: number, delay: number }} [budget] the most reads and the pause between them
+ * @returns {Promise<T>} the first answer that covers, or the last one when the budget is spent, so
+ *   the caller's own assertion reports what was seen; a budget spent is not a failure here
+ * @throws {Error} what `read` threw, or the reason the owner aborted with
+ */
+const readUntilCovered = async (signal, read, covers, budget = SETTLE_BUDGET) => {
+  let answer = await bounded(signal, Infinity, read)
+  for (let attempt = 1; attempt < budget.attempts && !covers(answer); attempt++) {
+    await delay(signal, budget.delay)
+    answer = await bounded(signal, Infinity, read)
+  }
+  return answer
+}
+
+/**
+ * Runs `op` again while it fails with a group coordinator that is loading, not available or has
+ * moved (protocol codes 14, 15 and 16), as happens right after a cluster starts. The admin client
+ * does not retry these. Any other failure is thrown at once, and so is the coordinator error
+ * itself once the budget is spent.
+ * @template T
+ * @param {AbortSignal} signal the owner's; nothing is asked once it aborted
+ * @param {() => Promise<T>} op
+ * @param {{ attempts: number, delay: number }} [budget] the most calls and the pause between them
+ * @returns {Promise<T>} what `op` answered
+ * @throws {Error} `op`'s failure, unless it is a coordinator error with attempts left, or the
+ *   reason the owner aborted with
+ */
+const retryCoordinator = async (signal, op, budget = SETTLE_BUDGET) => {
+  for (let attempt = 1; ; attempt++) {
+    try {
+      return await bounded(signal, Infinity, op)
+    } catch (error) {
+      if (!COORDINATOR_MOVING.has(error?.code) || attempt >= budget.attempts) throw error
+      await delay(signal, budget.delay)
+    }
+  }
+}
+
+/**
  * @param {Error|null|undefined} error
  * @param {number} [depth=3] how many causes to follow
  * @returns {object|null} what evidence keeps of an error: no stack, no secrets
@@ -1202,6 +1263,8 @@ module.exports = {
   leaderOf,
   probeLayout,
   readData,
+  readUntilCovered,
+  retryCoordinator,
   sequenceGaps,
   settle,
   topicConfig,

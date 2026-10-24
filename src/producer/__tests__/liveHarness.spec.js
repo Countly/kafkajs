@@ -11,6 +11,8 @@ jest.mock('../../../index', () => ({ ...jest.requireActual('../../../index'), Ka
 
 const Broker = require('../../broker')
 const Cluster = require('../../cluster')
+const { createErrorFromCode } = require('../../protocol/error')
+const ISOLATION_LEVEL = require('../../protocol/isolationLevel')
 const apiKeys = require('../../protocol/requests/apiKeys')
 const { requests } = require('../../protocol/requests')
 const { compressedBatch } = require('../../protocol/message/compression/fixtures/compressedBatch')
@@ -34,6 +36,8 @@ const {
   dataRecords,
   describeError,
   probeLayout,
+  readUntilCovered,
+  retryCoordinator,
   sequenceGaps,
   settle,
   topicConfig,
@@ -366,6 +370,35 @@ describe('Producer > the live scenarios harness', () => {
       expect(idle.destroyed).toBe(false)
     })
 
+    test('release resets the connection with ECONNRESET, so the client fails what is in flight on it', () => {
+      class NetInner extends Inner {
+        destroy(error) {
+          super.destroy()
+          if (error) this.emit('error', error)
+          this.emit('close')
+        }
+      }
+      const chaos = createChaosSocketFactory(() => new NetInner())
+      const target = chaos({ host: 'localhost', port: 9092 })
+      const idle = chaos({ host: 'localhost', port: 9092 })
+      const events = { target: [], idle: [] }
+      for (const [name, socket] of [
+        ['target', target],
+        ['idle', idle],
+      ]) {
+        socket.on('error', (error) => events[name].push(error.code))
+        socket.on('close', () => events[name].push('close'))
+      }
+      const drop = new ResponseDrop(chaos, { port: 9092, apiKey: 0 }).arm()
+      request(target, 1, 0)
+      response(target, 1)
+
+      drop.release()
+
+      expect(events.target).toEqual(['ECONNRESET', 'close'])
+      expect(events.idle).toEqual([])
+    })
+
     /** Two sockets to one broker, each with its answers collected. */
     const pair = (chaos) => {
       const first = chaos({ host: 'localhost', port: 9092 })
@@ -633,7 +666,10 @@ describe('Producer > the live scenarios harness', () => {
      * Accumulator and Generation, and an object with the Cluster pin methods standing in for the
      * cluster. `begin` makes a send the way the producer does and `end` retires everything it took.
      */
-    const bound = async ({ quietBudget = { attempts: 20, delay: 10 } } = {}) => {
+    const bound = async ({
+      quietBudget = { attempts: 20, delay: 10 },
+      readBackBudget = { attempts: 5, delay: 1 },
+    } = {}) => {
       const BatchOwnership = await batchOwnership()
       const admission = new Admission({ capacity: CAPACITY, maxBlockMs: 0 })
       const cluster = { topicPins: new Map() }
@@ -654,6 +690,7 @@ describe('Producer > the live scenarios harness', () => {
         clientId: 'c',
         maxRequestSize: 1048576,
         quietBudget,
+        readBackBudget,
       }).install()
       const begin = (topic, bytes) => {
         const send = {
@@ -1358,6 +1395,70 @@ describe('Producer > the live scenarios harness', () => {
         expect(failure.message).toBe('The tail phase did not settle')
         expect(admin.describeConfigs).not.toHaveBeenCalled()
         expect(admin.disconnect).toHaveBeenCalledTimes(1)
+      })
+
+      describe('a committed read-back', () => {
+        /** A read_committed log that shows nothing for its first `empty` reads, then what was sent. */
+        const committedLog = (empty) => {
+          const reads = { count: 0 }
+          rawLog.committedRecords.mockImplementation(({ records }) => records)
+          rawLog.readLog.mockImplementation(async () => {
+            reads.count += 1
+            const visible = reads.count > empty ? stored : []
+            return new Map([
+              [
+                0,
+                {
+                  records: visible.map(({ value }) => ({
+                    value,
+                    batchContext: { isControlBatch: false },
+                  })),
+                  abortedTransactions: [],
+                },
+              ],
+            ])
+          })
+          return reads
+        }
+
+        const closeCommitted = (world, finish) =>
+          world.probe.closing({
+            sender: sender(world),
+            topic: PROBE_TOPIC,
+            finish,
+            isolationLevel: ISOLATION_LEVEL.READ_COMMITTED,
+            budgetMs: 1000,
+          })
+
+        test('is read again until it holds the probe records, the markers being written after the commit answers', async () => {
+          const world = await bound()
+          const reads = committedLog(2)
+          const finish = jest.fn(async () => {})
+
+          try {
+            const result = await closeCommitted(world, finish)
+
+            expect(result.records).toBe(result.layout.count)
+          } finally {
+            world.probe.restore()
+          }
+          expect(finish).toHaveBeenCalledTimes(1)
+          expect(reads.count).toBe(3)
+        })
+
+        test('that never fills ends at its budget with the ordinary assertion on what it saw', async () => {
+          const world = await bound({ readBackBudget: { attempts: 3, delay: 1 } })
+          const reads = committedLog(Infinity)
+
+          try {
+            await expect(closeCommitted(world, async () => {})).rejects.toThrow(
+              /toEqual[\s\S]*Received/
+            )
+          } finally {
+            world.probe.restore()
+          }
+          expect(reads.count).toBe(3)
+        })
       })
 
       test('refuses a probe that acquires a second time in a later turn', async () => {
@@ -3080,6 +3181,106 @@ describe('Producer > the live scenarios harness', () => {
         expect(prototype.initProducerId).not.toBe(initProducerId)
         expect(prototype.endTxn).not.toBe(endTxn)
         expect(liveRun.tainted).toBe(false)
+      })
+    })
+  })
+
+  describe('reads that wait for the cluster to settle', () => {
+    const budget = { attempts: 3, delay: 1 }
+
+    describe('readUntilCovered', () => {
+      test('reads again after an answer that does not cover and returns the first that does', async () => {
+        const answers = [[], [], ['a', 'b'], ['never read']]
+        const read = jest.fn(async () => answers.shift())
+
+        await expect(
+          readUntilCovered(NEVER, read, (records) => records.length === 2, {
+            attempts: 5,
+            delay: 1,
+          })
+        ).resolves.toEqual(['a', 'b'])
+        expect(read).toHaveBeenCalledTimes(3)
+      })
+
+      test('returns the last answer when its attempts are spent, without failing or tainting the run', async () => {
+        const read = jest.fn(async () => [])
+
+        await expect(
+          readUntilCovered(NEVER, read, (records) => records.length > 0, budget)
+        ).resolves.toEqual([])
+        expect(read).toHaveBeenCalledTimes(3)
+        expect(liveRun.tainted).toBe(false)
+      })
+
+      test('reads nothing more once its owner aborted', async () => {
+        const owner = new AbortController()
+        const read = jest.fn(async () => [])
+        const covers = () => {
+          owner.abort(new Error('case over'))
+          return false
+        }
+
+        await expect(readUntilCovered(owner.signal, read, covers, budget)).rejects.toThrow(
+          'case over'
+        )
+        expect(read).toHaveBeenCalledTimes(1)
+      })
+    })
+
+    describe('retryCoordinator', () => {
+      const offsets = { groupId: 'g', topics: ['t'] }
+
+      test.each([14, 15, 16])(
+        'asks again after the coordinator error %i and returns the answer',
+        async (code) => {
+          const answer = [{ partitions: [{ offset: '-1' }] }]
+          const admin = {
+            fetchOffsets: jest
+              .fn()
+              .mockRejectedValueOnce(createErrorFromCode(code))
+              .mockResolvedValue(answer),
+          }
+
+          await expect(
+            retryCoordinator(NEVER, () => admin.fetchOffsets(offsets), budget)
+          ).resolves.toBe(answer)
+          expect(admin.fetchOffsets).toHaveBeenCalledTimes(2)
+          expect(admin.fetchOffsets).toHaveBeenCalledWith(offsets)
+        }
+      )
+
+      test.each([
+        ['a retriable error of another kind', createErrorFromCode(13)],
+        ['a non-retriable protocol error', createErrorFromCode(29)],
+        ['a plain failure', new Error('boom')],
+      ])('fails at once with %s', async (_name, error) => {
+        const admin = { fetchOffsets: jest.fn().mockRejectedValue(error) }
+
+        await expect(
+          retryCoordinator(NEVER, () => admin.fetchOffsets(offsets), budget)
+        ).rejects.toBe(error)
+        expect(admin.fetchOffsets).toHaveBeenCalledTimes(1)
+      })
+
+      test('gives up with the last coordinator error when its attempts are spent', async () => {
+        const error = createErrorFromCode(16)
+        const admin = { fetchOffsets: jest.fn().mockRejectedValue(error) }
+
+        await expect(
+          retryCoordinator(NEVER, () => admin.fetchOffsets(offsets), budget)
+        ).rejects.toBe(error)
+        expect(admin.fetchOffsets).toHaveBeenCalledTimes(3)
+      })
+
+      test('asks nothing more once its owner aborted', async () => {
+        const owner = new AbortController()
+        const op = jest.fn(async () => {
+          owner.abort(new Error('case over'))
+          throw createErrorFromCode(16)
+        })
+
+        await expect(retryCoordinator(owner.signal, op, budget)).rejects.toThrow('case over')
+        expect(op).toHaveBeenCalledTimes(1)
       })
     })
   })

@@ -20,6 +20,8 @@ const {
   ProducerProbe,
   describeError,
   readData,
+  readUntilCovered,
+  retryCoordinator,
   settle,
   topicConfig,
 } = require('./fixtures/liveProbe')
@@ -224,9 +226,11 @@ class Scenario {
    * @param {object} transaction the armed transaction
    * @param {Error} refusal the error its send was refused with
    * @param {string} topic
+   * @param {AbortSignal} signal the case's scope; the offsets read waits for the group's
+   *   coordinator, which can still move on a fresh cluster, under it
    * @returns {Promise<{ armed: Error, offset: string }>}
    */
-  async expectArmed(transaction, refusal, topic) {
+  async expectArmed(transaction, refusal, topic, signal) {
     const groupId = `e2e-p9b-oversized-record-group-${this.id}`
     const later = []
     later.push(await settle(transaction.send({ topic, messages: [{ value: 'late' }], acks: -1 })))
@@ -252,7 +256,9 @@ class Scenario {
     expect(armed.cause).toBe(refusal)
     for (const { error } of later) expect(error).toBe(armed)
     await transaction.abort()
-    const [{ partitions }] = await this.admin.fetchOffsets({ groupId, topics: [topic] })
+    const [{ partitions }] = await retryCoordinator(signal, () =>
+      this.admin.fetchOffsets({ groupId, topics: [topic] })
+    )
     return { armed, offset: partitions[0].offset }
   }
 }
@@ -318,11 +324,17 @@ describeOversized('Producer > records above a size limit (live)', () => {
         let armedAfter = null
         let committed = null
         if (arm.kind === 'transactional') {
-          armedAfter = await scenario.expectArmed(sender, refusal.error, topic)
+          armedAfter = await scenario.expectArmed(sender, refusal.error, topic, scope)
           const next = await scenario.producer.transaction()
           await next.send({ topic, messages: [{ value: 'valid-after' }], acks: -1 })
           await next.commit()
-          committed = valuesOf(await readData(scenario.brokers, topic, { committed: true }))
+          committed = valuesOf(
+            await readUntilCovered(
+              scope,
+              () => readData(scenario.brokers, topic, { committed: true }),
+              (records) => records.length >= 1
+            )
+          )
         } else {
           await sender.send({ topic, messages: [{ value: 'valid-after' }], acks: arm.acks })
         }
@@ -464,7 +476,7 @@ describeOversized('Producer > records above a size limit (live)', () => {
         let armedAfter = null
         let active = sender
         if (arm.kind === 'transactional') {
-          armedAfter = await scenario.expectArmed(sender, refusal.error, topic)
+          armedAfter = await scenario.expectArmed(sender, refusal.error, topic, scope)
           active = await scenario.producer.transaction()
         }
         for (let index = 0; index < SMALL_SENDS; index++) {
