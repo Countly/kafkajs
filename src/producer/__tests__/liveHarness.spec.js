@@ -1315,6 +1315,22 @@ describe('Producer > the live scenarios harness', () => {
         expect(result.records).toBe(result.layout.count)
       })
 
+      test('creates its topic without time retention, so the fixed old timestamps are not deleted', async () => {
+        const world = await bound()
+
+        await world.probe.closing({
+          sender: sender(world),
+          topic: PROBE_TOPIC,
+          budgetMs: 1000,
+        })
+        world.probe.restore()
+
+        expect(createTopic).toHaveBeenCalledTimes(1)
+        expect(createTopic.mock.calls[0][0].config).toEqual(
+          expect.arrayContaining([{ name: 'retention.ms', value: '-1' }])
+        )
+      })
+
       test('a signal that already aborted cancels the probe before any step', async () => {
         const world = await bound()
         const send = jest.fn()
@@ -2856,6 +2872,20 @@ describe('Producer > the live scenarios harness', () => {
       )
 
       expect(total).toBeGreaterThanOrEqual(12)
+    })
+
+    test('the ack-lost spec creates the topic that receives a fixed old timestamp without time retention', () => {
+      const source = sourceOf('ackLostLive', '.')
+      const at = source.indexOf('timestamp: FIXED_TIMESTAMP')
+      const caseStart = source.lastIndexOf('liveCase(', at)
+      const create = source.indexOf('createTopic(', caseStart)
+
+      expect(at).toBeGreaterThan(-1)
+      expect(create).toBeGreaterThan(caseStart)
+      expect(create).toBeLessThan(at)
+      expect(callAt(source, create + 'createTopic'.length)).toMatch(
+        /config: \[\{ name: 'retention\.ms', value: '-1' \}\]/
+      )
     })
 
     test('the compression spec gates the setup that creates topics and sends', () => {

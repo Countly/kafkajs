@@ -38,6 +38,7 @@ const DRAIN_MS = 1500
 const QUIET_MS = 1500
 const DISCONNECT_BUDGET_MS = 15000
 const JOIN_BUDGET_MS = 30000
+/** An old fixed timestamp needs `retention.ms: -1` on its topic, or time retention deletes the record. */
 const FIXED_TIMESTAMP = 1700000000000
 const DUPLICATE_SEQUENCE_NUMBER = 46
 const WAIT_BUDGET = { attempts: 120, delay: 250 } // 30 s
@@ -174,7 +175,12 @@ describeAckLost('Producer and consumer > a lost answer is retried without loss (
       const maxRequestSize = 1048576
 
       await cleanup.run(async () => {
-        await createTopic({ topic, partitions: 1, replicas: 3 })
+        await createTopic({
+          topic,
+          partitions: 1,
+          replicas: 3,
+          config: [{ name: 'retention.ms', value: '-1' }],
+        })
         const producer = kafkaOf({
           clientId,
           socketFactory: sockets.socketFactory,

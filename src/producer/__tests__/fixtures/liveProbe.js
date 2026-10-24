@@ -26,7 +26,10 @@ const RECORD_FIXED = 87
 /** A request's per-partition framing and batch header, which the largest request carries once. */
 const PARTITION_FRAMING = 16
 const BATCH_HEADER = 61
-/** Every probe record carries this timestamp, so no clock reading changes a size. */
+/**
+ * Every probe record carries this timestamp, so no clock reading changes a size. An old fixed
+ * timestamp needs `retention.ms: -1` on its topic, or time retention deletes the records.
+ */
 const PROBE_TIMESTAMP = 1700000000000
 const ID_BYTES = 13
 const QUIET_BUDGET = { attempts: 100, delay: 100 } // 10 s
@@ -901,7 +904,10 @@ class ProducerProbe {
         topic,
         partitions: 1,
         replicas: 2,
-        config: [{ name: 'max.message.bytes', value: String(PROBE_TOPIC_LIMIT) }],
+        config: [
+          { name: 'max.message.bytes', value: String(PROBE_TOPIC_LIMIT) },
+          { name: 'retention.ms', value: '-1' },
+        ],
       })
     )
     const limit = await step((scope) =>
