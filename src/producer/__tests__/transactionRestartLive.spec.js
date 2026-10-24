@@ -1,14 +1,20 @@
 const Broker = require('../../broker')
+const Cluster = require('../../cluster')
 const { Kafka, logLevel } = require('../../../index')
 const {
   KafkaJSApplicationRecoverableError,
   KafkaJSNonRetriableError,
   KafkaJSNumberOfRetriesExceeded,
+  KafkaJSProducerClosedError,
   KafkaJSProtocolError,
   KafkaJSTransactionAbortableError,
 } = require('../../errors')
 const { createErrorFromCode } = require('../../protocol/error')
+const apiKeys = require('../../protocol/requests/apiKeys')
+const ProducerStateManager = require('../state')
+const TransactionOffsets = require('../state/transactionOffsets')
 const { errorCodeOf } = require('../../../scripts/e2e/idempotentAuthzProbe')
+const { readLog } = require('../../../testHelpers/rawLog')
 const {
   createConnectionPool,
   createTopic,
@@ -17,18 +23,32 @@ const {
   secureRandom,
   startBroker,
   stopBroker,
+  wireVersionsOf,
   writeEvidence,
 } = require('testHelpers')
-const {
-  sleep,
-  waitForCondition,
-  withTimeout,
-} = require('../../consumer/__tests__/fixtures/liveScenario')
+const { sleep, waitForCondition } = require('../../consumer/__tests__/fixtures/liveScenario')
 const {
   crashAfterProduce,
   outcomeOf,
   settledTransactionVersion,
 } = require('./fixtures/liveTransactions')
+const { ResponseDrop, createLiveSockets, repliesOf } = require('./fixtures/liveWire')
+const {
+  COORDINATOR_TYPES,
+  CleanupStack,
+  ProducerProbe,
+  coordinatorOf,
+  describeError,
+  readData,
+} = require('./fixtures/liveProbe')
+const {
+  CASE_JOIN_MS,
+  NEVER,
+  bounded,
+  caseTimeout,
+  liveCase,
+  liveRun,
+} = require('./fixtures/bounded')
 
 // Gated: it kills a producer process and stops a broker. Run alone:
 // `npm run test:e2e:transaction-restart`.
@@ -37,9 +57,10 @@ const describeRestart = process.env.TRANSACTION_RESTART_E2E === '1' ? describe :
 const EVIDENCE = 'transaction-restart'
 // Named so each wait says how long it is prepared to be wrong for.
 const SCENARIO_BUDGET_MS = 120000
-// The afterEach's worst case: 35 s for three brokers, 15 s for its own admin's disconnect and
-// 15 s for each client's, at most four (the abortable-send case's): 110 s.
+// The afterEach's budget; its teardown steps (three brokers back, the admin's disconnect, each
+// client's) share what Jest leaves after the join reserve.
 const HOOK_BUDGET_MS = 120000
+const TEARDOWN_BUDGET_MS = HOOK_BUDGET_MS - CASE_JOIN_MS
 // On the transaction version 1 arm the level is waited for, up to 120 s (the shared fixture).
 const FEATURE_HOOK_BUDGET_MS = 150000
 const DISCONNECT_BUDGET_MS = 15000
@@ -119,32 +140,39 @@ describeRestart('Producer > transaction recovery (live)', () => {
   let child
 
   beforeAll(async () => {
-    cluster = await settledTransactionVersion()
-    const { initProducerId, endTxn } = Broker.prototype
-    jest.spyOn(Broker.prototype, 'initProducerId').mockImplementation(async function (request) {
-      const record = { transactionalId: request.transactionalId, error: null }
-      initializations.push(record)
-      try {
-        return await initProducerId.call(this, request)
-      } catch (e) {
-        record.error = e.type
-        throw e
-      }
-    })
-    jest.spyOn(Broker.prototype, 'endTxn').mockImplementation(async function (request) {
-      const { transactionalId, transactionResult, producerEpoch } = request
-      const record = { transactionalId, transactionResult, producerEpoch }
-      ends.push(record)
-      if (dropCommits && transactionResult) {
-        throw new KafkaJSProtocolError(createErrorFromCode(REQUEST_TIMED_OUT))
-      }
-      const response = await endTxn.call(this, request)
-      record.answeredEpoch = response.producerEpoch
-      if (loseCommitAnswers && transactionResult) {
-        throw new KafkaJSProtocolError(createErrorFromCode(REQUEST_TIMED_OUT))
-      }
-      return response
-    })
+    return bounded(
+      NEVER,
+      FEATURE_HOOK_BUDGET_MS - CASE_JOIN_MS,
+      async () => {
+        cluster = await settledTransactionVersion()
+        const { initProducerId, endTxn } = Broker.prototype
+        jest.spyOn(Broker.prototype, 'initProducerId').mockImplementation(async function (request) {
+          const record = { transactionalId: request.transactionalId, error: null }
+          initializations.push(record)
+          try {
+            return await initProducerId.call(this, request)
+          } catch (e) {
+            record.error = e.type
+            throw e
+          }
+        })
+        jest.spyOn(Broker.prototype, 'endTxn').mockImplementation(async function (request) {
+          const { transactionalId, transactionResult, producerEpoch } = request
+          const record = { transactionalId, transactionResult, producerEpoch }
+          ends.push(record)
+          if (dropCommits && transactionResult) {
+            throw new KafkaJSProtocolError(createErrorFromCode(REQUEST_TIMED_OUT))
+          }
+          const response = await endTxn.call(this, request)
+          record.answeredEpoch = response.producerEpoch
+          if (loseCommitAnswers && transactionResult) {
+            throw new KafkaJSProtocolError(createErrorFromCode(REQUEST_TIMED_OUT))
+          }
+          return response
+        })
+      },
+      { label: 'The setup' }
+    )
   }, FEATURE_HOOK_BUDGET_MS)
 
   afterAll(() => {
@@ -168,46 +196,47 @@ describeRestart('Producer > transaction recovery (live)', () => {
 
   // The broker comes back first, and the case waits for it: every client below may hold requests to
   // it that only fail on their own timeout, and a stopped broker must never outlive the case or
-  // reach the next one.
+  // reach the next one. Only a case the gate admitted gets this: a refused one started nothing.
+  // Every step is bounded and a step that fails or runs out of time fails the hook and taints the
+  // run, so a teardown cannot pass while a disconnect may still be running.
   afterEach(async () => {
+    const admitted = liveRun.takeAdmission()
+    if (
+      !admitted ||
+      expect
+        .getState()
+        .currentTestName.endsWith(
+          ' forced close preserves an unknown commit without local publication'
+        )
+    ) {
+      return
+    }
     try {
       startBroker(STOPPED_SERVICE)
     } catch (e) {
-      // Already running, or compose is down.
+      // Already running, or compose is down: the readiness step below is the verdict.
     }
     child?.kill('SIGKILL')
     const admin = kafka.admin()
-    let restored = false
-    let error = null
-    await withTimeout(
-      admin
-        .connect()
-        .then(() => waitForCondition(async () => (await brokersUp(admin)) === 3, BROKER_BUDGET))
-        .then(
-          (up) => (restored = up),
-          (e) => (error = e.message)
-        ),
-      DISCONNECT_BUDGET_MS + 20000
-    )
-    if (!restored) {
+    const teardown = new CleanupStack()
+    for (const client of clients) teardown.add('client disconnect', () => client.disconnect())
+    teardown.add('admin disconnect', () => admin.disconnect())
+    teardown.add('three brokers back', async (signal) => {
+      await admin.connect()
+      const restored = await waitForCondition(async () => {
+        signal.throwIfAborted()
+        return (await brokersUp(admin)) === 3
+      }, BROKER_BUDGET)
+      if (restored) return
       // Recorded, so a next case failing on two brokers is traced back here.
       writeEvidence(EVIDENCE, {
         scenario: 'teardown',
         test: expect.getState().currentTestName,
         threeBrokers: false,
-        error,
       })
-    }
-    await withTimeout(
-      admin.disconnect().catch(() => {}),
-      DISCONNECT_BUDGET_MS
-    )
-    for (const client of clients.reverse()) {
-      await withTimeout(
-        client.disconnect().catch(() => {}),
-        DISCONNECT_BUDGET_MS
-      )
-    }
+      throw new Error('The cluster did not return to three brokers')
+    })
+    await teardown.run(async () => {}, { budgetMs: TEARDOWN_BUDGET_MS })
   }, HOOK_BUDGET_MS)
 
   /** A connected client of `kafka`, disconnected after the test. */
@@ -267,7 +296,7 @@ describeRestart('Producer > transaction recovery (live)', () => {
 
   test(
     'a producer killed between Produce and EndTxn leaves records no read_committed reader sees, and the next owner of its transactional id commits',
-    async () => {
+    liveCase(SCENARIO_BUDGET_MS, async () => {
       const topic = `e2e-p7-transaction-restart-crash-${secureRandom()}`
       const transactionalId = `e2e-p7-transaction-restart-${secureRandom()}`
       await createTopic({ topic })
@@ -291,15 +320,15 @@ describeRestart('Producer > transaction recovery (live)', () => {
       expect(crash.requests).not.toContain('EndTxn')
       expect(takeover.at(-1).error).toBeNull()
       expect(values).toEqual(valuesOf('next'))
-    },
-    SCENARIO_BUDGET_MS
+    }),
+    caseTimeout(SCENARIO_BUDGET_MS)
   )
 
   // Worst case, inside its 120 s budget: 20 s for the broker to leave, 7.5 s of send retries, 31 s
   // for its leader to return, 7.5 s for the abort and 30 s to read back.
   test(
     'a send to a partition with no leader makes the transaction abort-only: commit() rejects without EndTxn, abort() resolves, and the same producer commits the next one',
-    async () => {
+    liveCase(SCENARIO_BUDGET_MS, async () => {
       const healthy = `e2e-p7-transaction-restart-healthy-${secureRandom()}`
       const leaderless = `e2e-p7-transaction-restart-leaderless-${secureRandom()}`
       const admin = await connected(kafka.admin())
@@ -381,8 +410,8 @@ describeRestart('Producer > transaction recovery (live)', () => {
       expect(leaderBack).toBe(true)
       expect(abort.error).toBeNull()
       expect(values).toEqual(valuesOf('next'))
-    },
-    SCENARIO_BUDGET_MS
+    }),
+    caseTimeout(SCENARIO_BUDGET_MS)
   )
 
   describe.each([
@@ -404,7 +433,7 @@ describeRestart('Producer > transaction recovery (live)', () => {
 
     test(
       'with the EndTxn answers lost: commit() rejects retriable, abort() is refused, and commit() sent again completes it once',
-      async () => {
+      liveCase(SCENARIO_BUDGET_MS, async () => {
         if (!runsHere('pending-commit')) return
         const topic = `e2e-p8-pending-commit-${secureRandom()}`
         const transactionalId = `e2e-p8-pending-commit-${secureRandom()}`
@@ -450,13 +479,13 @@ describeRestart('Producer > transaction recovery (live)', () => {
         expect(nextEnd.producerEpoch).toBe(
           level === 2 ? resent.answeredEpoch : resent.producerEpoch
         )
-      },
-      SCENARIO_BUDGET_MS
+      }),
+      caseTimeout(SCENARIO_BUDGET_MS)
     )
 
     test(
       'with the EndTxn requests lost until the coordinator aborted the transaction on its timeout: commit() sent again is refused with 48 or 90, depending on the transaction version and on whether the broker has KAFKA-20785 (fixed in 4.3.2 and 4.5.0), and the producer is unusable',
-      async () => {
+      liveCase(SCENARIO_BUDGET_MS, async () => {
         if (!runsHere('pending-commit-timed-out')) return
         const topic = `e2e-p8-pending-commit-${secureRandom()}`
         await createTopic({ topic })
@@ -502,8 +531,8 @@ describeRestart('Producer > transaction recovery (live)', () => {
           errorCodeOf(retried.error)
         )
         expect(next.error).toBe(retried.error)
-      },
-      SCENARIO_BUDGET_MS
+      }),
+      caseTimeout(SCENARIO_BUDGET_MS)
     )
   })
 
@@ -515,7 +544,7 @@ describeRestart('Producer > transaction recovery (live)', () => {
     (label, transactionTimeout) => {
       test(
         'the new owner initializes within its retries or reports them exhausted, never hangs',
-        async () => {
+        liveCase(SCENARIO_BUDGET_MS, async () => {
           const topic = `e2e-p7-transaction-restart-takeover-${secureRandom()}`
           const transactionalId = `e2e-p7-transaction-restart-${secureRandom()}`
           await createTopic({ topic })
@@ -552,9 +581,280 @@ describeRestart('Producer > transaction recovery (live)', () => {
             expect(takeover.error).toBeInstanceOf(KafkaJSNumberOfRetriesExceeded)
           }
           expect(attempts.at(-1).error === null).toBe(takeover.error === null)
-        },
-        SCENARIO_BUDGET_MS
+        }),
+        caseTimeout(SCENARIO_BUDGET_MS)
       )
     }
+  )
+
+  // The commit's answer is dropped on the coordinator's connection after the broker applied it, and
+  // the close is forced at 1 s, so the outcome of the commit stays unknown to this producer while the
+  // broker has committed: the two truths are read apart. Replay sets: the physical log holds the
+  // transaction's two records and their commit marker; the committed offset is the broker's 2 while
+  // local publication stays 0; handler delivery does not apply.
+  test(
+    'forced close preserves an unknown commit without local publication',
+    liveCase(SCENARIO_BUDGET_MS, async (scope) => {
+      const id = secureRandom()
+      const topic = `e2e-p9b-transaction-close-${id}`
+      const inputTopic = `e2e-p9b-transaction-close-input-${id}`
+      const groupId = `e2e-p9b-transaction-close-group-${id}`
+      const transactionalId = `e2e-p9b-transaction-close-${id}`
+      const clientId = `e2e-p9b-transaction-close-${id}`
+      const brokers = plainTextBrokers()
+      const sockets = createLiveSockets()
+      const cleanup = new CleanupStack()
+      const requests = []
+      const stateManagers = new Set()
+      const releases = []
+      const publications = []
+      const localWrites = []
+      let capturing = false
+      let offsets = null
+
+      await cleanup.run(async () => {
+        const { enqueue } = ProducerStateManager.prototype
+        const { release, publish } = TransactionOffsets.prototype
+        const { markOffsetAsCommitted } = Cluster.prototype
+        const spies = [
+          jest
+            .spyOn(ProducerStateManager.prototype, 'enqueue')
+            .mockImplementation(function (batches) {
+              if (capturing) stateManagers.add(this)
+              return enqueue.call(this, batches)
+            }),
+          jest.spyOn(TransactionOffsets.prototype, 'release').mockImplementation(function () {
+            if (this === offsets) {
+              releases.push({ entries: this.entries.size, snapshots: this.snapshots.size })
+            }
+            return release.call(this)
+          }),
+          jest.spyOn(TransactionOffsets.prototype, 'publish').mockImplementation(function (target) {
+            if (this === offsets) publications.push(performance.now())
+            return publish.call(this, target)
+          }),
+          jest
+            .spyOn(Cluster.prototype, 'markOffsetAsCommitted')
+            .mockImplementation(function (value) {
+              if (value.groupId === groupId)
+                localWrites.push({ ...value, offset: String(value.offset) })
+              return markOffsetAsCommitted.call(this, value)
+            }),
+        ]
+        cleanup.add('state spies', () => spies.forEach((spy) => spy.mockRestore()))
+
+        await createTopic({ topic, partitions: 1, replicas: 3 })
+        await createTopic({ topic: inputTopic, partitions: 1, replicas: 3 })
+        const admin = new Kafka({ brokers, logLevel: logLevel.NOTHING }).admin()
+        await admin.connect()
+        cleanup.add('admin', () => admin.disconnect())
+        await admin.setOffsets({
+          groupId,
+          topic: inputTopic,
+          partitions: [{ partition: 0, offset: '0' }],
+        })
+        const committedOf = async () => {
+          const [{ partitions }] = await admin.fetchOffsets({ groupId, topics: [inputTopic] })
+          return String(partitions[0].offset)
+        }
+        const inputBefore = await committedOf()
+
+        const producer = new Kafka({
+          clientId,
+          brokers,
+          logLevel: logLevel.NOTHING,
+          socketFactory: sockets.socketFactory,
+          requestTimeout: 1000,
+          enforceRequestTimeout: false,
+        }).producer({ transactionalId, linger: 0, deliveryTimeout: 10000, retry: RETRY })
+        producer.on(producer.events.REQUEST, ({ payload }) => requests.push(payload))
+        const probe = new ProducerProbe({
+          producer,
+          frames: sockets.frames,
+          clientId,
+          transactionalId,
+          maxRequestSize: 1048576,
+        }).install()
+        cleanup.add('admission probe', () => probe.restore())
+        cleanup.add('resources after disconnect', () => probe.settled())
+        await producer.connect()
+        cleanup.add('producer', () => producer.disconnect({ timeout: DISCONNECT_BUDGET_MS }))
+
+        const transaction = await producer.transaction()
+        await probe.capture(
+          async () => {
+            capturing = true
+            try {
+              return await transaction.send({
+                topic,
+                messages: [{ value: 'close-0' }, { value: 'close-1' }],
+                acks: -1,
+              })
+            } finally {
+              capturing = false
+            }
+          },
+          { signal: scope }
+        )
+        expect(stateManagers.size).toBe(1)
+        const [state] = [...stateManagers]
+        offsets = state.offsets
+        expect(state.transaction.state()).toBe('IN_TRANSACTION')
+        await transaction.sendOffsets({
+          consumerGroupId: groupId,
+          topics: [{ topic: inputTopic, partitions: [{ partition: 0, offset: '2' }] }],
+        })
+        const staged = { entries: offsets.entries.size, snapshots: offsets.snapshots.size }
+
+        const coordinator = await coordinatorOf(transactionalId, COORDINATOR_TYPES.TRANSACTION)
+        const drop = new ResponseDrop(sockets.chaos, {
+          port: coordinator.port,
+          apiKey: apiKeys.EndTxn,
+        }).arm()
+        cleanup.add('response drop', () => drop.release())
+        const endsOf = () => ends.filter((end) => end.transactionalId === transactionalId)
+        const endFrames = () => sockets.frames.since(apiKeys.EndTxn).length
+
+        const commit = outcomeOf(transaction.commit())
+        const applied = await waitForCondition(async () => {
+          const [partition] = (await readLog({ brokers, topic })).values()
+          return drop.dropped === 1 && partition.records.some((r) => r.batchContext.isControlBatch)
+        }, WAIT_BUDGET)
+        const endsBeforeClose = endsOf().length
+
+        const closeStartedAt = performance.now()
+        await producer.disconnect({ timeout: 1000 })
+        const closeMs = performance.now() - closeStartedAt
+        const closed = await commit
+        const afterClose = {
+          state: state.transaction.state(),
+          commitPending: state.transaction.commitPending(),
+          entries: offsets.entries.size,
+          snapshots: offsets.snapshots.size,
+          publications: publications.length,
+          localWrites: localWrites.length,
+        }
+
+        const brokerOffset = await waitForCondition(
+          async () => (await committedOf()) === '2',
+          WAIT_BUDGET
+        )
+        const brokerCommitted = {
+          offset: await committedOf(),
+          values: (await readData(brokers, topic, { committed: true })).map(({ value }) =>
+            String(value)
+          ),
+        }
+        await sleep(QUIET_MS)
+        const afterQuiet = {
+          state: state.transaction.state(),
+          publications: publications.length,
+          localWrites: localWrites.length,
+        }
+        await producer.disconnect()
+        const endsAfterRepeat = { ends: endsOf().length, frames: endFrames() }
+
+        await producer.connect()
+        const ordinary = await outcomeOf(
+          producer.send({
+            topic: `e2e-p9b-transaction-close-ordinary-${id}`,
+            messages: [{ value: 'ordinary' }],
+            acks: -1,
+          })
+        )
+        const guarded = await outcomeOf(
+          transaction.send({ topic, messages: [{ value: 'late' }], acks: -1 })
+        )
+        const closing = await probe.closing({
+          topic: `e2e-p9b-transaction-close-probe-${id}`,
+          budgetMs: 10000,
+        })
+        const afterProbe = {
+          state: state.transaction.state(),
+          commitPending: state.transaction.commitPending(),
+          entries: offsets.entries.size,
+          publications: publications.length,
+          localWrites: localWrites.length,
+        }
+        await producer.disconnect({ timeout: DISCONNECT_BUDGET_MS })
+        const afterFinal = probe.counters()
+
+        writeEvidence(EVIDENCE, {
+          scenario: 'forced-close',
+          cluster,
+          config: {
+            requestTimeout: 1000,
+            enforceRequestTimeout: false,
+            linger: 0,
+            deliveryTimeout: 10000,
+            disconnectTimeout: 1000,
+            retry: RETRY,
+          },
+          replay: {
+            log: 'two records and their commit marker, applied by the broker',
+            offsets: 'broker committed position 2 while local publication stays 0',
+            handlers: 'n/a',
+          },
+          wireVersions: wireVersionsOf(requests),
+          wire: { frames: sockets.frames.trace(), replies: repliesOf(requests) },
+          transactionVersion: cluster.level,
+          inputBefore,
+          staged,
+          drops: drop.dropped,
+          applied,
+          endsBeforeClose,
+          closeMs,
+          commit: describeError(closed.error),
+          afterClose,
+          broker: { observed: brokerOffset, ...brokerCommitted },
+          afterQuiet,
+          endsAfterRepeat,
+          ordinary: describeError(ordinary.error),
+          guarded: describeError(guarded.error),
+          afterProbe,
+          releases,
+          ends: endsOf(),
+          closing,
+          afterFinal,
+        })
+
+        expect([1, 2]).toContain(cluster.level)
+        expect(inputBefore).toBe('0')
+        expect(staged).toEqual({ entries: 1, snapshots: 1 })
+        expect(applied).toBe(true)
+        expect(drop.dropped).toBe(1)
+        expect(endsBeforeClose).toBe(1)
+        expect(closeMs).toBeGreaterThanOrEqual(900)
+        expect(closeMs).toBeLessThan(10000)
+        expect(closed.error).toBeInstanceOf(KafkaJSProducerClosedError)
+        expect(closed.error).toMatchObject({ outcome: 'unknown' })
+        expect(afterClose).toEqual({
+          state: 'COMMITTING',
+          commitPending: true,
+          entries: 0,
+          snapshots: 0,
+          publications: 0,
+          localWrites: 0,
+        })
+        expect(releases.length).toBeGreaterThanOrEqual(1)
+        expect(brokerOffset).toBe(true)
+        expect(brokerCommitted).toEqual({ offset: '2', values: ['close-0', 'close-1'] })
+        expect(afterQuiet).toEqual({ state: 'COMMITTING', publications: 0, localWrites: 0 })
+        expect(endsOf().filter(({ transactionResult }) => !transactionResult)).toEqual([])
+        expect(endsAfterRepeat).toEqual({ ends: 1, frames: 1 })
+        expect(ordinary.error).toBeNull()
+        expect(guarded.error).toBeInstanceOf(KafkaJSNonRetriableError)
+        expect(guarded.error.message).toMatch(/while a commit is pending/)
+        expect(afterProbe).toEqual({
+          state: 'COMMITTING',
+          commitPending: true,
+          entries: 0,
+          publications: 0,
+          localWrites: 0,
+        })
+        expect(afterFinal).toMatchObject({ available: afterFinal.capacity, pins: 0 })
+      })
+    }),
+    caseTimeout(SCENARIO_BUDGET_MS)
   )
 })

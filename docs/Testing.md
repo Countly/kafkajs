@@ -53,6 +53,22 @@ That repeat hides a race: on a freshly started cluster the broker that `admin.cr
 
 A scenario that needs a cluster in a particular state, or a long time, is a separate spec gated by an environment variable: it skips itself without the variable, so the groups above only skip it, and it has an `npm run test:e2e:<name>` script that starts the cluster through `test:kafka` and sets the variable, for example `npm run test:e2e:create-topics-cold`. Most scenarios write what they observed to `.tmp/e2e/<name>.jsonl` (through `writeEvidence` in `testHelpers`), which Git ignores. `npm run probe:api-versions` prints, as one JSON line, the version range the broker at `localhost:9092` offers for each API the admin and group codecs use (`KAFKA_VERSION` selects another supported cluster).
 
+Producer delivery and compression scenarios have dedicated gated commands. These package scripts still use the legacy `test:kafka` wrapper; they do not invoke the guarded live entry. Controller acceptance runs must use the separately reviewed guarded entry. Adapting the package scripts to that entry remains a B14/P10 hand-off:
+
+| Command | Scenario |
+|---|---|
+| `test:e2e:delivery-timeout` | An applied Produce with a lost answer ends at the delivery deadline. |
+| `test:e2e:oversized-record` | Client request limits, ordered splitting, broker topic limits and valid acknowledgement configurations. |
+| `test:e2e:ack-lost` | Lost Produce, Fetch and OffsetCommit answers with separate replay oracles. |
+| `test:e2e:topic-lifecycle-produce` | Delete, grow and recreate topics while producing. |
+| `test:e2e:not-enough-replicas` | One follower down with minimum in-sync replicas of three or two. |
+| `test:e2e:compression` | JavaScript and Java interoperability for each installed built-in codec, plus authentic librdkafka Snappy replay. |
+| `test:e2e:decompression-bound` | A compressed batch above the configured output bound halts one partition and permits explicit recovery. |
+
+Each command records its broker, Node, wire versions, configuration, reviewed tree and lane in stamped JSONL evidence. Physical log contents, committed offsets and handler deliveries are separate checks. The transaction-restart scenario also verifies that a forced close with an unknown commit never publishes staged offsets locally, while the broker's commit may already have applied. The guarded live entry validates Compose ownership and cached images, prohibits pulls, and retains logs before removal; its admission probe must pass before final disconnect.
+
+The authentic librdkafka Snappy capture, its independent raw oracle and the required decoder/public-consumer validator are missing. The capture artifacts must be supplied in the directory that `src/protocol/message/compression/fixtures/librdkafkaCapture.js` reads, with the original producer name/version/configuration, independent expected records, acquisition provenance and SHA-256. Validation must compare the independent raw records, the Fetch decoder and a public consumer; live replay must preserve the original compressed record bytes. JavaScript or Java generated data is not a substitute. Acquisition, authentic validation, both baseline stages and live replay remain open; the capture-helper unit tests do not close R1-J-04.
+
 ### Scenario lanes
 
 A scenario that holds with no fault injected runs on two lanes from one file: `describe.each(lanes())` from `testHelpers` gives it `fake` (the unit lane, in process) or `docker` (under `npm run test:kafka`, which exports `KAFKAJS_LANE=docker`), and `KAFKAJS_SCENARIO_LANES=fake,docker` asks for both. A scenario that injects a fault (a held answer, a dropped frame) runs on the fake lane unless the fault can be injected on a live cluster too.

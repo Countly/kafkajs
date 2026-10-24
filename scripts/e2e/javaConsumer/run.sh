@@ -14,6 +14,8 @@
 #        scripts/e2e/javaConsumer/run.sh --role read-committed-consumer \
 #          <bootstrapServers> <groupId> <topic> <runForMs>
 #        scripts/e2e/javaConsumer/run.sh --role <either role> --probe
+# Compression role: --role compressed-producer --compression gzip|snappy|lz4|zstd
+#   <bootstrapServers> <source> <topic> <records>
 # Requires: a JDK on PATH (javac + java), network access to Maven Central on first run.
 
 KAFKA_CLIENTS_VERSION="${KAFKA_CLIENTS_VERSION:-4.3.1}"
@@ -29,6 +31,11 @@ SRC_DIR="$(cd "$(dirname "$0")" && pwd)"
 CLIENTS_JAR="${WORK_DIR}/kafka-clients-${KAFKA_CLIENTS_VERSION}.jar"
 SLF4J_JAR="${WORK_DIR}/slf4j-api-${SLF4J_VERSION}.jar"
 
+if [ "${JAVA_E2E_OFFLINE:-0}" = "1" ]; then
+  for jar in "${CLIENTS_JAR}" "${SLF4J_JAR}"; do
+    [ -s "${jar}" ] || { echo "Missing cached Java dependency: ${jar}" >&2; exit 2; }
+  done
+fi
 [ -f "${CLIENTS_JAR}" ] || curl -fsSL \
   "https://repo1.maven.org/maven2/org/apache/kafka/kafka-clients/${KAFKA_CLIENTS_VERSION}/kafka-clients-${KAFKA_CLIENTS_VERSION}.jar" \
   -o "${CLIENTS_JAR}"
@@ -39,7 +46,7 @@ SLF4J_JAR="${WORK_DIR}/slf4j-api-${SLF4J_VERSION}.jar"
   "https://repo1.maven.org/maven2/org/slf4j/slf4j-api/${SLF4J_VERSION}/slf4j-api-${SLF4J_VERSION}.jar" \
   -o "${SLF4J_JAR}"
 
-CP="${CLIENTS_JAR}:${SLF4J_JAR}"
+CP="${CLIENTS_JAR}:${SLF4J_JAR}${JAVA_CODEC_CLASSPATH:+:${JAVA_CODEC_CLASSPATH}}"
 javac -cp "${CP}" -d "${WORK_DIR}" "${SRC_DIR}/JavaGroupMember.java" "${SRC_DIR}/JavaTransactionalMember.java"
 
 # --role selects the transactional member; without it the group member runs exactly as before.

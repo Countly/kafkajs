@@ -61,6 +61,7 @@ public final class JavaTransactionalMember {
    */
   public static void main(String[] args) {
     String role = null;
+    String compression = "none";
     boolean probe = false;
     int abortEvery = 0;
     long holdOpenMs = 0;
@@ -71,6 +72,9 @@ public final class JavaTransactionalMember {
       switch (args[i]) {
         case "--role":
           role = args[++i];
+          break;
+        case "--compression":
+          compression = args[++i];
           break;
         case "--probe":
           probe = true;
@@ -104,10 +108,12 @@ public final class JavaTransactionalMember {
           abortEvery,
           holdOpenMs,
           crashAfterProduce);
+    } else if ("compressed-producer".equals(role)) {
+      compressedProduce(positional.get(0), positional.get(1), positional.get(2), Integer.parseInt(positional.get(3)), compression);
     } else if ("read-committed-consumer".equals(role)) {
       consume(positional.get(0), positional.get(1), positional.get(2), Long.parseLong(positional.get(3)));
     } else {
-      System.err.println("--role must be transactional-producer or read-committed-consumer, got " + role);
+      System.err.println("--role must be transactional-producer, compressed-producer or read-committed-consumer, got " + role);
       System.exit(2);
     }
   }
@@ -179,6 +185,47 @@ public final class JavaTransactionalMember {
 
     producer.close();
     print("{\"event\":\"done\"}");
+  }
+
+  /**
+   * Produces an ordered UTF-8 corpus with the requested broker codec. Each key and value is
+   * {@code source + "-" + index}; all records target partition zero. Flush confirms delivery
+   * before the done line. Existing transactional and consumer roles keep their own settings.
+   *
+   * @param bootstrapServers broker endpoints
+   * @param source corpus prefix
+   * @param topic target topic
+   * @param records corpus length
+   * @param compression gzip, snappy, lz4 or zstd
+   * @throws IllegalArgumentException for an unsupported codec or negative record count
+   */
+  private static void compressedProduce(String bootstrapServers, String source, String topic,
+      int records, String compression) {
+    if (!List.of("gzip", "snappy", "lz4", "zstd").contains(compression) || records < 0) {
+      throw new IllegalArgumentException("Unsupported compression or record count");
+    }
+    Properties properties = new Properties();
+    properties.put(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, bootstrapServers);
+    properties.put(ProducerConfig.KEY_SERIALIZER_CLASS_CONFIG, StringSerializer.class.getName());
+    properties.put(ProducerConfig.VALUE_SERIALIZER_CLASS_CONFIG, StringSerializer.class.getName());
+    properties.put(ProducerConfig.COMPRESSION_TYPE_CONFIG, compression);
+    properties.put(ProducerConfig.ENABLE_IDEMPOTENCE_CONFIG, "true");
+    properties.put(ProducerConfig.ACKS_CONFIG, "all");
+    properties.put(ProducerConfig.REQUEST_TIMEOUT_MS_CONFIG, "10000");
+    properties.put(ProducerConfig.LINGER_MS_CONFIG, "5");
+    properties.put(ProducerConfig.DELIVERY_TIMEOUT_MS_CONFIG, "30000");
+    try (KafkaProducer<String, String> producer = new KafkaProducer<>(properties)) {
+      List<java.util.concurrent.Future<?>> sends = new ArrayList<>();
+      for (int i = 0; i < records; i++) {
+        String value = source + "-" + i;
+        sends.add(producer.send(new ProducerRecord<>(topic, 0, value, value)));
+      }
+      producer.flush();
+      for (java.util.concurrent.Future<?> send : sends) send.get();
+      print("{\"event\":\"done\",\"records\":" + records + ",\"compression\":" + quote(compression) + "}");
+    } catch (Exception error) {
+      exitWithError(error);
+    }
   }
 
   /**

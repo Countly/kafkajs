@@ -48,6 +48,7 @@ Versions before 3.0.0 are internal alpha tags and are not published.
 - `scripts/benchmarks/stickyBalance.js` measures batching, balance and latency of round robin, sticky and adaptive sticky on a healthy cluster and with one slow broker, with its declared verdicts and positive controls.
 - `scripts/benchmarks/sendPathCounters.js` also counts the sends the flush inventory tracks (`flushTracked`: the calls of `Accumulator#track`), so `produceLatency.js` and `produceIdempotent.js` can show that each timed send was counted there; the field is `null` in a tree that has no flush inventory.
 - Pin producer transaction-boundary error dispositions, equivalent metadata and batching APIs, response reordering, lost-answer replay and producer wire schedules.
+- Add live producer scenarios for the delivery deadline, size limits, lost answers, topic lifecycle and replica availability, plus compression interoperability and decompression-bound recovery checks, and a broker-free test of their bounded harness.
 
 
 ### Phase 1 — foundation
