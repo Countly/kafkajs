@@ -1,6 +1,8 @@
 const OffsetOperations = require('../../consumer/offsetManager/offsetOperations')
 const { newLogger } = require('testHelpers')
 const createEosManager = require('.')
+const Generation = require('../generation')
+const FencedRetry = require('../../retry/fenced')
 const ProducerStateManager = require('../state')
 const {
   KafkaJSApplicationRecoverableError,
@@ -76,7 +78,7 @@ describe('Producer > eosManager', () => {
     ['PRODUCER_FENCED', 90],
     ['TRANSACTION_ABORTABLE', 120],
   ])(
-    '%s from initProducerId reaches the caller unchanged, with no retry loop',
+    '%s from initProducerId has its classified outcome, with no retry loop',
     async (type, code) => {
       const eosManager = createEosManager({
         logger: newLogger(),
@@ -88,16 +90,57 @@ describe('Producer > eosManager', () => {
         throw createErrorFromCode(code)
       })
 
-      await expect(eosManager.initProducerId()).rejects.toMatchObject({
-        name: 'KafkaJSProtocolError',
-        type,
-        code,
-        retriable: false,
-      })
+      await expect(eosManager.initProducerId()).rejects.toMatchObject(
+        code === 90
+          ? {
+              name: 'KafkaJSApplicationRecoverableError',
+              category: 'applicationRecoverable',
+              cause: { name: 'KafkaJSProtocolError', type, code, retriable: false },
+            }
+          : { name: 'KafkaJSProtocolError', type, code, retriable: false }
+      )
 
       expect(broker.initProducerId).toHaveBeenCalledTimes(1)
     }
   )
+
+  test.each([47, 90])(
+    'code %s from the first initProducerId is handed to onFenced',
+    async (code) => {
+      const onFenced = jest.fn()
+      const eosManager = createEosManager({ logger: newLogger(), cluster, onFenced })
+      broker.initProducerId.mockRejectedValue(createErrorFromCode(code))
+
+      const error = await eosManager.initProducerId().catch((failure) => failure)
+
+      expect(error.name).toBe('KafkaJSApplicationRecoverableError')
+      expect(onFenced).toHaveBeenCalledTimes(1)
+      expect(onFenced.mock.calls[0][0]).toBe(error)
+      expect(eosManager.stateManager.transaction.armedError()).toBe(error)
+    }
+  )
+
+  test('only a fenced first initProducerId reaches onFenced', async () => {
+    const onFenced = jest.fn()
+    const eosManager = createEosManager({
+      logger: newLogger(),
+      cluster,
+      transactional: true,
+      transactionalId: 'fence-notice',
+      retry: { retries: 0 },
+      onFenced,
+    })
+    broker.initProducerId.mockRejectedValueOnce(createErrorFromCode(120))
+    await expect(eosManager.initProducerId()).rejects.toMatchObject({ code: 120 })
+    await eosManager.initProducerId()
+    await eosManager.beginTransaction()
+    broker.initProducerId.mockRejectedValue(createErrorFromCode(47))
+    await expect(eosManager.abort({ droppedSequences: true })).rejects.toMatchObject({
+      name: 'KafkaJSApplicationRecoverableError',
+    })
+    expect(eosManager.stateManager.state()).toBe('FATAL_ERROR')
+    expect(onFenced).not.toHaveBeenCalled()
+  })
 
   test('getting & updating the sequence per topic-partition', async () => {
     const eosManager = createEosManager({ logger: newLogger(), cluster })
@@ -1089,5 +1132,105 @@ describe('Producer > eosManager', () => {
         expect(broker.txnOffsetCommit).toHaveBeenCalledTimes(1)
       })
     })
+  })
+})
+
+describe('Epoch bump failure at transaction boundaries', () => {
+  const { createFakeCluster } = require('../__tests__/fixtures/fakeCluster')
+  /** Builds a manager that can bump its identity. @returns {Promise<object>} manager and broker @throws {Error} on initialization. */
+  const fixture = async () => {
+    const cluster = createFakeCluster()
+    const broker = cluster.broker
+    broker.negotiatedVersion = () => 5
+    broker.initProducerId.mockImplementation(async ({ producerEpoch }) => ({
+      producerId: '1000',
+      producerEpoch: producerEpoch + 1,
+    }))
+    const manager = createEosManager({
+      cluster,
+      logger: newLogger(),
+      transactional: true,
+      transactionalId: 'bump',
+      retry: { retries: 0 },
+    })
+    await manager.initProducerId()
+    await manager.beginTransaction()
+    return { manager, broker }
+  }
+  test('abort resolves a nonfatal bump failure and the next begin retries the owed bump', async () => {
+    const { manager, broker } = await fixture()
+    const failure = createErrorFromCode(7)
+    broker.initProducerId.mockRejectedValueOnce(failure)
+    await expect(manager.abort({ droppedSequences: true })).resolves.toBeUndefined()
+    expect(manager.stateManager.state()).toBe('READY')
+    expect(broker.initProducerId).toHaveBeenCalledTimes(2)
+    await manager.beginTransaction()
+    expect(broker.initProducerId).toHaveBeenCalledTimes(3)
+    expect(manager.getProducerEpoch()).toBe(1)
+    await manager.abort()
+  })
+  test('begin reports the same nonfatal failure and keeps the bump owed', async () => {
+    const { manager, broker } = await fixture()
+    const failure = createErrorFromCode(7)
+    broker.initProducerId.mockRejectedValue(failure)
+    await manager.abort({ droppedSequences: true })
+    await expect(manager.beginTransaction()).rejects.toMatchObject({ code: 7 })
+    expect(manager.stateManager.state()).toBe('READY')
+    broker.initProducerId.mockImplementation(async () => ({ producerId: '1000', producerEpoch: 1 }))
+    await manager.beginTransaction()
+    expect(manager.getProducerEpoch()).toBe(1)
+    await manager.abort()
+  })
+  test.each(['abort', 'begin'])('a fatal bump failure rejects at %s', async (boundary) => {
+    const { manager, broker } = await fixture()
+    if (boundary === 'begin') {
+      broker.initProducerId.mockRejectedValueOnce(createErrorFromCode(7))
+      await manager.abort({ droppedSequences: true })
+    }
+    broker.initProducerId.mockRejectedValue(createErrorFromCode(47))
+    await expect(
+      boundary === 'abort' ? manager.abort({ droppedSequences: true }) : manager.beginTransaction()
+    ).rejects.toMatchObject({
+      name: boundary === 'abort' ? 'KafkaJSApplicationRecoverableError' : 'KafkaJSProtocolError',
+      category: 'applicationRecoverable',
+    })
+    expect(manager.stateManager.state()).toBe('FATAL_ERROR')
+    await expect(manager.beginTransaction()).rejects.toMatchObject({
+      name: 'KafkaJSApplicationRecoverableError',
+    })
+  })
+})
+
+describe('Initialization whose lifecycle closes after its retry succeeds', () => {
+  const { createFakeCluster } = require('../__tests__/fixtures/fakeCluster')
+
+  test('rejects with the fatal error and is not made ready', async () => {
+    const generation = new Generation()
+    const manager = createEosManager({
+      cluster: createFakeCluster(),
+      logger: newLogger(),
+      getGeneration: () => generation,
+    })
+    const fatal = new KafkaJSApplicationRecoverableError('boundary fence', {
+      cause: createErrorFromCode(47),
+    })
+    const finish = FencedRetry.prototype.finish
+    const spy = jest
+      .spyOn(FencedRetry.prototype, 'finish')
+      .mockImplementation(function (error, value) {
+        const succeeds = !this.done && !error && this.configs.fence === generation
+        const result = finish.call(this, error, value)
+        if (succeeds) {
+          manager.stateManager.arm(fatal)
+          generation.close(fatal)
+        }
+        return result
+      })
+    try {
+      await expect(manager.initProducerId()).rejects.toBe(fatal)
+      expect(manager.stateManager.state()).toBe('FATAL_ERROR')
+    } finally {
+      spy.mockRestore()
+    }
   })
 })

@@ -13,6 +13,7 @@ const { parse: parseProduce } = require('../../../protocol/requests/produce/part
 const { createFakeCluster } = require('../../__tests__/fixtures/fakeCluster')
 const { createGroupApiBroker } = require('../../../broker/__tests__/fixtures/groupApiHarness')
 const {
+  KafkaJSApplicationRecoverableError,
   KafkaJSConnectionError,
   KafkaJSDeliveryTimeout,
   KafkaJSError,
@@ -3540,6 +3541,44 @@ describe('Producer > the accumulator > the flush inventory', () => {
       outcome: 'unsent',
     })
     await second
+    expect(admission.reserved).toBe(0)
+    expect(accumulator.unsettled()).toEqual([])
+  })
+
+  test('a send granted room as the lifecycle closes with a fatal error rejects with that exact error and gives the room back', async () => {
+    const generation = new Generation()
+    const { accumulator, admission, batches } = inventory({
+      capacity: 4096,
+      getGeneration: () => generation,
+    })
+    const fatal = new KafkaJSApplicationRecoverableError('fenced', {
+      cause: createErrorFromCode(47),
+    })
+    const value = (prefix) => [{ partition: 0, value: prefix.repeat(1500) }]
+    /** Answers and retires the batch handed on first. */
+    const answer = () => {
+      const batch = batches.shift()
+      batch.settlers.forEach((settler) => settler.resolve({ partition: 0, baseOffset: '0' }))
+      batch.retire()
+    }
+    const first = append(accumulator, value('a'))
+    const second = append(accumulator, value('b'))
+    await jest.advanceTimersByTimeAsync(0)
+    answer()
+    await first
+    await jest.advanceTimersByTimeAsync(0)
+    const third = append(accumulator, value('c'))
+    const settled = settledFlag(third.catch(() => {}))
+    expect(admission.waitingBytes).toBeGreaterThan(0)
+
+    answer()
+    expect(admission.waitingBytes).toBe(0)
+    generation.close(fatal)
+    await jest.advanceTimersByTimeAsync(0)
+    expect(settled()).toBe(true)
+    await expect(third).rejects.toBe(fatal)
+    await second
+    expect(batches).toHaveLength(0)
     expect(admission.reserved).toBe(0)
     expect(accumulator.unsettled()).toEqual([])
   })

@@ -347,6 +347,17 @@ transaction in a way its error decides.
   transaction after its records were queued always ends that transaction, so `commit()` after one
   will not silently publish a partial transaction.
 
+- **An initial `InitProducerId` answered `INVALID_PRODUCER_EPOCH` (47) or `PRODUCER_FENCED` (90) now
+  makes the producer permanently unusable.** The call rejects with a
+  `KafkaJSApplicationRecoverableError` whose `cause` keeps the original protocol error; 2.2.4 returned
+  the raw error and could initialize successfully on a later call. Every later `connect()`, `send()`,
+  `sendBatch()`, `transaction()` and `flush()` rejects with that same error object, also after
+  `disconnect()`, which stays available for cleanup. A send, a transaction call or an initialization
+  that was already under way, on either of the producer's two internal identities (its ordinary one
+  and its transactional one), rejects with that same error object, and nothing is written for it
+  afterwards. *What to do:* replace the producer; retrying
+  `connect`, `transaction` or `send` on the same object cannot recover it.
+
 - **`consumer.groupMetadata()` is new, and `sendOffsets` accepts `consumerGroupMetadata`**
   (KIP-447). Passed through, the consumer's generation, member id and group instance id go on the
   `TxnOffsetCommit`, so the group coordinator rejects a commit from a member that a rebalance

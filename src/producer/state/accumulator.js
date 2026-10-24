@@ -1,6 +1,7 @@
 const Long = require('../../utils/long')
 const Fifo = require('../../utils/fifo')
 const {
+  KafkaJSApplicationRecoverableError,
   KafkaJSDeliveryTimeout,
   KafkaJSInvalidConfigurationError,
   KafkaJSRecordTooLargeError,
@@ -1162,10 +1163,14 @@ class Accumulator {
    * @param {import('./admission').Reservation} reservation
    * @returns {import('./admission').Reservation}
    * @throws {KafkaJSProducerClosedError} `outcome: 'unsent'`, when the lifecycle closed
+   * @throws {KafkaJSApplicationRecoverableError} the exact armed error when initial fencing
+   *   revoked the lifecycle before the admission continuation resumed
    */
   #granted(reservation) {
-    if (this.#getGeneration()?.closed) {
+    const lifecycle = this.#getGeneration()
+    if (lifecycle?.closed) {
       reservation.releaseAll()
+      if (lifecycle.error instanceof KafkaJSApplicationRecoverableError) throw lifecycle.error
       throw new KafkaJSProducerClosedError('The producer was closed before admission completed', {
         outcome: 'unsent',
       })
@@ -1202,22 +1207,29 @@ class Accumulator {
    * Rejects every send still waiting for its partitions and every batch that has not left this
    * accumulator, with `outcome: 'unsent'`, and clears their timers. Admission waiters are
    * cancelled by their `Admission`; a held assignment keeps its send's shell until it returns.
+   * @param {Error} [surfaced] what the sends reject with instead of that error
    * @returns {void}
    */
-  forceClose() {
+  forceClose(surfaced) {
     for (let send = this.#holders.peek(); send !== undefined; send = this.#holders.peek()) {
       this.#settleHolder(
         send,
-        new KafkaJSProducerClosedError('The producer was closed before the send was partitioned', {
-          outcome: 'unsent',
-        })
+        surfaced ??
+          new KafkaJSProducerClosedError(
+            'The producer was closed before the send was partitioned',
+            {
+              outcome: 'unsent',
+            }
+          )
       )
     }
     for (const batch of this.#pending.values()) {
       clearTimeout(batch.timer)
-      const error = new KafkaJSProducerClosedError('The producer was closed before sending', {
-        outcome: 'unsent',
-      })
+      const error =
+        surfaced ??
+        new KafkaJSProducerClosedError('The producer was closed before sending', {
+          outcome: 'unsent',
+        })
       batch.settlers.forEach((settler) => settler.reject(error))
       batch.retire()
     }

@@ -386,3 +386,156 @@ it('R1§A2:compression.type', async () => {
     })
   expect(attributes).toEqual([0, 1, 0])
 })
+
+/**
+ * Attempts every cleanup action and unconditionally restores global test state.
+ * @param {Error|undefined} primary original test failure
+ * @param {Function[]} actions independent resource cleanup attempts
+ * @param {Function} [restore] final synchronous restoration, even after cleanup failures
+ * @returns {Promise<void>} after all actions and restoration were attempted
+ * @throws {Error|AggregateError} original with cleanupErrors, or cleanup failures alone
+ */
+const finish = async (primary, actions, restore = () => {}) => {
+  const failures = []
+  try {
+    for (const action of actions) {
+      try {
+        await action()
+      } catch (error) {
+        failures.push(error)
+      }
+    }
+  } finally {
+    try {
+      restore()
+    } catch (error) {
+      failures.push(error)
+    }
+  }
+  if (primary) {
+    if (failures.length) primary.cleanupErrors = failures
+    throw primary
+  }
+  if (failures.length) throw new AggregateError(failures, 'Resource cleanup failed')
+}
+
+it('R1§A1:partitionsFor', async () => {
+  const cluster = producerScript(createScriptedCluster({ nodes }), { partitions: 2 })
+  const kafka = new Kafka(cluster.kafkaOptions({ retry }))
+  const admin = use(kafka.admin(), cluster)
+  await admin.connect()
+  const metadata = await admin.fetchTopicMetadata({ topics: [TOPIC] })
+  expect(metadata.topics).toEqual([
+    expect.objectContaining({
+      name: TOPIC,
+      partitions: [
+        expect.objectContaining({
+          partitionId: 0,
+          leader: 0,
+          replicas: [0],
+          isr: [0],
+          offlineReplicas: [],
+        }),
+        expect.objectContaining({
+          partitionId: 1,
+          leader: 0,
+          replicas: [0],
+          isr: [0],
+          offlineReplicas: [],
+        }),
+      ],
+    }),
+  ])
+  expect(cluster.requests().filter((r) => r.api === 'Produce')).toHaveLength(0)
+})
+
+it('R2§2:ManualFlushing', async () => {
+  const clients = []
+  const work = []
+  let primary
+  /** Watches pending work before any assertion can interrupt the case.
+   * @param {Promise<*>} promise operation
+   * @returns {object} settlement record
+   * @throws Never.
+   */
+  const watch = (promise) => {
+    const result = { status: 'pending' }
+    promise.then(
+      () => {
+        result.status = 'fulfilled'
+      },
+      () => {
+        result.status = 'rejected'
+      }
+    )
+    work.push({ promise, result })
+    return result
+  }
+  /** Pumps the fake clock without waiting on a held promise.
+   * @param {Function} ready settlement predicate
+   * @returns {Promise<void>} after a finite number of turns
+   * @throws {Error} when work cannot settle
+   */
+  const pump = async (ready) => {
+    for (let i = 0; i < 200 && !ready(); i++) {
+      await jest.advanceTimersByTimeAsync(0)
+      await tick()
+    }
+    expect(ready()).toBe(true)
+  }
+  try {
+    jest.useFakeTimers({ doNotFake: ['nextTick', 'setImmediate'] })
+    for (const batchSize of [1, 1048576]) {
+      const cluster = createFakeCluster()
+      const producer = createProducer({
+        cluster,
+        logger: logger(),
+        linger: 3600000,
+        deliveryTimeout: 3700000,
+        batchSize,
+        idempotent: true,
+      })
+      clients.push({ producer, cluster })
+      expect(typeof producer.flush).toBe('function')
+      await producer.connect()
+      const pending = producer.send({
+        topic: 'recipe',
+        messages: [{ value: 'v', timestamp: 1000 }],
+      })
+      watch(pending)
+      for (let i = 0; i < 20; i++) {
+        await jest.advanceTimersByTimeAsync(0)
+        await tick()
+      }
+      expect(cluster.broker.produce.mock.calls).toHaveLength(batchSize === 1 ? 1 : 0)
+      const flushed = producer.flush()
+      const done = watch(flushed)
+      await pump(() => done.status !== 'pending')
+      await flushed
+      await pending
+      expect(cluster.broker.produce.mock.calls).toHaveLength(1)
+    }
+  } catch (error) {
+    primary = error
+  } finally {
+    await finish(
+      primary,
+      [
+        ...clients.map(({ producer }) => async () => {
+          const close = producer.disconnect()
+          const closed = watch(close)
+          await pump(() => closed.status !== 'pending')
+          await close
+        }),
+        async () => {
+          await pump(() => work.every(({ result }) => result.status !== 'pending'))
+          await Promise.allSettled(work.map(({ promise }) => promise))
+        },
+        ...clients.map(({ cluster }) => () => {
+          if (cluster.assertClean) cluster.assertClean()
+        }),
+      ],
+      () => jest.useRealTimers()
+    )
+  }
+})

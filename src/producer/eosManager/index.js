@@ -130,6 +130,9 @@ const consumerGroupOf = ({ consumerGroupId, consumerGroupMetadata }) => {
  * @param {() => (import('../generation')|undefined)} [options.getGeneration] the producer's current
  *   lifecycle. Each operation reads it once, when it starts, and never again after an await: its
  *   retries stop, and it opens no socket and changes no state, once that lifecycle is closed.
+ * @param {(armed: Error) => void} [options.onFenced] private notice that an `InitProducerId` was
+ *   fenced (47 or 90), called with the armed error this manager is about to reject with, so the
+ *   producer can make its other identity and its lifecycle fatal too
  * @returns {EosManager}
  */
 const createEosManager = ({
@@ -141,6 +144,7 @@ const createEosManager = ({
   retry = cluster.retry,
   deliveryRetries,
   getGeneration = () => undefined,
+  onFenced,
 }) => {
   if (transactional && !transactionalId) {
     throw new KafkaJSNonRetriableError('Cannot manage transactions without a transactionalId')
@@ -398,16 +402,30 @@ const createEosManager = ({
      * @returns {Promise<void>}
      * @throws {import('../../errors').KafkaJSInvalidConfigurationError} CLUSTER_AUTHORIZATION_FAILED,
      *   naming both remedies
+     * @throws {import('../../errors').KafkaJSApplicationRecoverableError} initial fencing codes
+     *   47 or 90; the protocol error remains its cause and the producer stays fatal
      */
     async initProducerId() {
       const generation = getGeneration()
       stateManager.transaction.guard('initProducerId')
       const held = stateManager.isInitialized()
-      await retryingInitProducerId(async () => {
-        if (held || !stateManager.isInitialized()) {
-          await stateManager.initialize()
+      try {
+        await retryingInitProducerId(async () => {
+          if (held || !stateManager.isInitialized()) {
+            await stateManager.initialize()
+          }
+        }, generation)
+      } catch (error) {
+        if (error.code === 47 || error.code === 90) {
+          generation?.check()
+          stateManager.classify(error, 'txn')
+          stateManager.arm(error)
+          const armed = stateManager.transaction.armedError()
+          onFenced?.(armed)
+          throw armed
         }
-      }, generation)
+        throw error
+      }
       generation?.check()
       stateManager.transitionTo(STATES.READY)
 
@@ -527,7 +545,8 @@ const createEosManager = ({
      *   transaction can only be aborted; an abortable EndTxn answer arms `ABORTABLE_ERROR` and
      *   rejects with it
      * @throws {import('../../errors').KafkaJSApplicationRecoverableError} the armed error once the
-     *   producer is unusable, a fatal EndTxn answer included
+     *   producer is unusable, a fatal EndTxn answer included, and a fenced first `InitProducerId`
+     *   of the producer's other identity that landed while the EndTxn was outstanding
      */
     async commit() {
       const generation = getGeneration()
@@ -544,6 +563,9 @@ const createEosManager = ({
         generation?.check()
       } catch (error) {
         if (generation?.closed) {
+          if (stateManager.state() === STATES.FATAL_ERROR) {
+            throw stateManager.transaction.armedError()
+          }
           stateManager.transaction.holdCommit()
           throw new KafkaJSProducerClosedError(
             'The producer was closed with a commit unconfirmed',

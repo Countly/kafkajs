@@ -638,9 +638,11 @@ class DrainLoop {
   /**
    * Settles every retained child before applying any forced-close consequence.
    * Outstanding requests keep their ownership until their terminal callbacks.
+   * @param {Error} [surfaced] what the callers reject with instead of the close error, which the
+   *   state consequences still see
    * @returns {void}
    */
-  forceClose() {
+  forceClose(surfaced) {
     for (const partitions of this.#queues.values()) {
       for (const queue of partitions.values()) {
         for (const delivery of queue) {
@@ -648,7 +650,8 @@ class DrainLoop {
             delivery,
             new KafkaJSProducerClosedError('The producer was closed', {
               outcome: delivery.everWritten ? 'unknown' : 'unsent',
-            })
+            }),
+            surfaced
           )
         }
       }
@@ -1517,15 +1520,16 @@ class DrainLoop {
    * that has not written is revoked; one on the wire keeps its request until its terminal callback.
    * @param {Delivery} delivery
    * @param {KafkaJSProducerClosedError} [closedError] this child's forced outcome
+   * @param {Error} [surfaced] what the callers reject with instead of `closedError`
    * @returns {void}
    */
-  #expire(delivery, closedError) {
+  #expire(delivery, closedError, surfaced) {
     if (delivery.settled) return
     delivery.currentAttempt?.revoke()
     const error = closedError || this.#timedOut(delivery.batch, delivery.lastError)
     this.#expired.push({ batch: delivery.batch, error, transmitted: delivery.everWritten })
     delivery.expired = true
-    rejectBatch(delivery.batch, error)
+    rejectBatch(delivery.batch, surfaced ?? error)
     delivery.batch.settlers = [delivery]
   }
 
@@ -2156,16 +2160,21 @@ const createSendMessages = ({
       else timer.arm(delivery.deadline)
     }
 
-    /** Settles every live leaf, including children cut after hand-off. @returns {void} */
-    const force = () => {
+    /**
+     * Settles every live leaf, including children cut after hand-off.
+     * @param {Error} [surfaced] what they reject with instead of the close error
+     * @returns {void}
+     */
+    const force = (surfaced) => {
       for (const batch of order) {
         const delivery = deliveries.get(batch)
         settle(
           batch,
           undefined,
-          new KafkaJSProducerClosedError('The producer was closed', {
-            outcome: delivery.everWritten ? 'unknown' : 'unsent',
-          })
+          surfaced ??
+            new KafkaJSProducerClosedError('The producer was closed', {
+              outcome: delivery.everWritten ? 'unknown' : 'unsent',
+            })
         )
       }
     }
@@ -2561,10 +2570,14 @@ const createSendMessages = ({
     return done
   }
 
-  /** Forces current deliveries; a later lifecycle gets its own loop. @returns {void} */
-  const forceClose = () => {
-    loop?.forceClose()
-    for (const force of [...plainForces]) force()
+  /**
+   * Forces current deliveries; a later lifecycle gets its own loop.
+   * @param {Error} [surfaced] what the callers reject with instead of the close error
+   * @returns {void}
+   */
+  const forceClose = (surfaced) => {
+    loop?.forceClose(surfaced)
+    for (const force of [...plainForces]) force(surfaced)
   }
 
   return { sendPartitioned, partition, inTransaction, forceClose }

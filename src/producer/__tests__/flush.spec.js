@@ -9,7 +9,9 @@ const {
   KafkaJSTimeout,
   KafkaJSInvalidConfigurationError,
   KafkaJSNonRetriableError,
+  KafkaJSProtocolError,
 } = require('../../errors')
+const { createErrorFromCode } = require('../../protocol/error')
 
 describe('producer flush snapshot', () => {
   beforeEach(() => jest.useFakeTimers({ now: 0, doNotFake: ['setImmediate'] }))
@@ -96,6 +98,98 @@ describe('producer flush snapshot', () => {
       await producer.disconnect()
     }
   })
+
+  test('a failed earlier send does not reject flush and keeps its own error', async () => {
+    const { producer, cluster } = bufferedProducer({
+      idempotent: false,
+      linger: 60000,
+      deliveryTimeout: 120000,
+    })
+    const failure = new KafkaJSProtocolError(createErrorFromCode(10))
+    cluster.broker.produce.mockRejectedValue(failure)
+    await producer.connect()
+    const send = watch(producer.send({ topic: 'topic', messages: [{ value: 'earlier' }] }))
+    const flushed = producer.flush()
+    const flush = watch(flushed)
+    try {
+      await flushAll()
+      expect(send).toMatchObject({
+        state: 'rejected',
+        value: { name: 'KafkaJSProtocolError', code: 10 },
+      })
+      await expect(flushed).resolves.toBeUndefined()
+      expect(flush.state).toBe('fulfilled')
+      await expect(producer.flush({ timeout: 0 })).resolves.toBeUndefined()
+    } finally {
+      await producer.disconnect()
+    }
+  })
+
+  test.each([
+    ['in-transaction', 'ordinary'],
+    ['ordinary', 'in-transaction'],
+  ])(
+    'flush waits for the sends of the transaction and of the producer itself, %s first',
+    async (firstTopic, secondTopic) => {
+      const { producer, cluster } = bufferedProducer({
+        transactionalId: 'flush-both',
+        idempotent: true,
+        deliveryTimeout: 120000,
+        retry: { retries: 1, initialRetryTime: 1, maxRetryTime: 1, factor: 0 },
+      })
+      const { broker } = cluster
+      const held = []
+      broker.produce.mockImplementation(async (request) => {
+        const gate = deferred()
+        held.push({ topic: request.topicData[0].topic, gate })
+        await gate.promise
+        return succeeded(request)
+      })
+      Object.assign(broker, {
+        finalizedFeatures: { 'transaction.version': { minVersionLevel: 0, maxVersionLevel: 2 } },
+        finalizedFeaturesEpoch: 1,
+        negotiatedVersion: () => 5,
+      })
+      broker.initProducerId.mockImplementation(async ({ producerEpoch = -1 }) => ({
+        producerId: '1000',
+        producerEpoch: producerEpoch + 1,
+      }))
+      broker.endTxn.mockImplementation(async () => ({ producerId: '-1', producerEpoch: -1 }))
+      await producer.connect()
+      const transaction = await producer.transaction()
+      let flush
+      let later
+      try {
+        const inTransaction = watch(
+          transaction.send({ topic: 'in-transaction', messages: [{ value: 'one' }] })
+        )
+        const ordinary = watch(producer.send({ topic: 'ordinary', messages: [{ value: 'two' }] }))
+        await flushAll()
+        expect(held.map(({ topic }) => topic).sort()).toEqual(['in-transaction', 'ordinary'])
+
+        flush = watch(producer.flush())
+        later = watch(producer.send({ topic: 'later', messages: [{ value: 'three' }] }))
+        await flushAll()
+        const gateOf = (topic) => held.find((request) => request.topic === topic).gate
+        gateOf(firstTopic).resolve()
+        await flushAll()
+        expect(flush.state).toBe('pending')
+        gateOf(secondTopic).resolve()
+        await flushAll()
+        expect(inTransaction.state).toBe('fulfilled')
+        expect(ordinary.state).toBe('fulfilled')
+        expect(flush.state).toBe('fulfilled')
+        expect(later.state).toBe('pending')
+      } finally {
+        for (let i = 0; i < 5; i += 1) {
+          held.forEach(({ gate }) => gate.resolve())
+          await flushAll()
+        }
+        await transaction.abort().catch(() => {})
+        await producer.disconnect()
+      }
+    }
+  )
 })
 
 describe('producer flush semantics', () => {

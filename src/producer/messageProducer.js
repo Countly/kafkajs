@@ -33,7 +33,7 @@ const sharedPromiseTo = require('../utils/sharedPromiseTo')
  * @param {string} options.INITIALIZED
  * @param {() => import('./generation')|undefined} [options.getGeneration] current producer lifecycle
  * @returns {{ send: Function, sendBatch: Function, ensureInitialized: Function, flush: Function,
- *   close: Function, unsettled: () => Promise<void>[], forceClose: () => void,
+ *   close: Function, unsettled: () => Promise<void>[], forceClose: (surfaced?: Error) => void,
  *   depthOf: (topic: string, partition: number) => number }} `depthOf` counts the batches
  *   waiting for a partition (see `Accumulator#depthOf`)
  */
@@ -182,12 +182,13 @@ module.exports = ({
    * Ends every send this producer still holds locally with `outcome: 'unsent'` or `'unknown'`
    * (see `Accumulator#forceClose` and the send paths' `forceClose`), for a forced close. A request
    * already on the wire keeps its memory until its terminal callback.
+   * @param {Error} [surfaced] what the sends reject with instead, for a producer made unusable
    * @returns {void}
    */
-  const forceClose = () => {
-    accumulator.forceClose()
-    idempotentSend.forceClose()
-    plainSend?.forceClose()
+  const forceClose = (surfaced) => {
+    accumulator.forceClose(surfaced)
+    idempotentSend.forceClose(surfaced)
+    plainSend?.forceClose(surfaced)
   }
 
   /**

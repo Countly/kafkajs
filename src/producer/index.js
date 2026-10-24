@@ -246,6 +246,28 @@ const createProducer = ({
       : { ...deliveryRetry, maxTotalTime: Math.min(MAX_DELAY, Math.max(1, budget)) }
   )
   const instrumentationEmitter = rootInstrumentationEmitter || new InstrumentationEventEmitter()
+
+  /**
+   * Makes a fenced initial `InitProducerId` fatal for the whole producer, as Java's one
+   * `TransactionManager` is: both identities are armed with the same error, the lifecycle is
+   * revoked with it, so every retry, continuation and initialization waiting on it ends with that
+   * error and nothing is written again, and every send still held, written or not, rejects with it.
+   * The first fencing wins: later answers find the lifecycle closed. `disconnect()` stays usable.
+   * @see https://github.com/apache/kafka/blob/4.3/clients/src/main/java/org/apache/kafka/clients/producer/internals/TransactionManager.java
+   * @param {import('../errors').KafkaJSApplicationRecoverableError} armed the error the fenced
+   *   identity armed
+   * @returns {void}
+   */
+  const fence = (armed) => {
+    for (const manager of [idempotentEosManager, transactionalEosManager]) {
+      manager?.stateManager.arm(armed)
+    }
+    generation.close(armed)
+    admission.cancel(armed)
+    ownMessageProducer.forceClose(armed)
+    transactionalMessageProducer?.forceClose(armed)
+  }
+
   const idempotentEosManager = createEosManager({
     logger,
     cluster,
@@ -255,6 +277,7 @@ const createProducer = ({
     retry: retryOptions,
     deliveryRetries: deliveryRetry.retries,
     getGeneration,
+    onFenced: fence,
   })
 
   const ownMessageProducer = createMessageProducer({
@@ -287,6 +310,39 @@ const createProducer = ({
    *   `disconnect()` aborts a transaction left open through it
    */
   let lastTransaction = null
+
+  /**
+   * Refuses work if either identity is fatal, preserving the armed object and its cause.
+   * Cleanup and event observations remain usable; reconnect never resets fatal state.
+   * @returns {void} when neither identity is fatal
+   * @throws {import('../errors').KafkaJSApplicationRecoverableError} the armed fatal error
+   */
+  const throwIfFatal = () => {
+    for (const manager of [idempotentEosManager, transactionalEosManager]) {
+      if (manager?.stateManager.state() === 'FATAL_ERROR') {
+        throw manager.stateManager.transaction.armedError()
+      }
+    }
+  }
+
+  /**
+   * Checks fatal state and forwards synchronously, preserving admission and snapshot timing. The
+   * operation's own promise is returned, so a pending send holds no wrapper of its own.
+   * @param {(...args: any[]) => Promise<any>} operation public producer operation, which rejects
+   *   instead of throwing
+   * @returns {(...args: any[]) => Promise<any>} guarded operation, forwarding arguments and result
+   * @throws {Error} through the returned promise; the armed error or the operation's error
+   */
+  const guardFatal =
+    (operation) =>
+    (...args) => {
+      try {
+        throwIfFatal()
+      } catch (error) {
+        return Promise.reject(error)
+      }
+      return operation(...args)
+    }
 
   attachBuiltIn(partitioner, {
     loadOf: (topic, partition) =>
@@ -393,6 +449,7 @@ const createProducer = ({
         retry: retryOptions,
         deliveryRetries: deliveryRetry.retries,
         getGeneration,
+        onFenced: fence,
       })
     transactionalMessageProducer =
       transactionalMessageProducer ||
@@ -435,6 +492,7 @@ const createProducer = ({
       }
       throw error
     }
+    throwIfFatal()
 
     const { send: sendTxn, sendBatch: sendBatchTxn } = transactionalMessageProducer
 
@@ -781,8 +839,10 @@ const createProducer = ({
      * under way, and opens no connection while that close owns the cleanup. Operations of an
      * earlier lifecycle stay fenced.
      * @returns {Promise}
+     * @throws {import('../errors').KafkaJSApplicationRecoverableError} as a rejection, once the
+     *   producer is unusable: a connect never revives it
      */
-    connect: async () => {
+    connect: guardFatal(async () => {
       // eslint-disable-next-line no-unmodified-loop-condition -- the close clears it when it ends
       while (closing !== null) {
         await closing
@@ -804,7 +864,7 @@ const createProducer = ({
       // of two (which would otherwise allocate two producer ids and reset sequences underneath
       // in-flight sends).
       await lifecycle.wait(ensureInitialized())
-    },
+    }),
     /**
      * Resolves once every send made before the call, the producer's own and its transactions',
      * has settled, after handing the accumulated batches on at once. A send that failed does not
@@ -815,11 +875,14 @@ const createProducer = ({
      * @throws {KafkaJSInvalidConfigurationError} as a rejection, before anything changes, for an
      *   argument that is not an object or whose `timeout` is not valid
      * @throws {KafkaJSTimeout} as a rejection, when `timeout` passes first
+     * @throws {import('../errors').KafkaJSApplicationRecoverableError} as a rejection, once the
+     *   producer is unusable, for valid options and whatever is unsettled
      */
     flush: (options) => {
       let timeout
       try {
         timeout = timeoutOf(options, false)
+        throwIfFatal()
       } catch (error) {
         return Promise.reject(error)
       }
@@ -884,9 +947,23 @@ const createProducer = ({
     isIdempotent: () => idempotence.isEnabled(),
     events,
     on,
-    send,
-    sendBatch,
-    transaction,
+    /**
+     * @param {object} request send options
+     * @returns {Promise<*>} metadata
+     * @throws {Error} a delivery error or the producer's armed fatal error
+     */
+    send: guardFatal(send),
+    /**
+     * @param {object} request batch options
+     * @returns {Promise<*>} metadata
+     * @throws {Error} a delivery error or the producer's armed fatal error
+     */
+    sendBatch: guardFatal(sendBatch),
+    /**
+     * @returns {Promise<object>} new transaction
+     * @throws {Error} a transaction error or the producer's armed fatal error
+     */
+    transaction: guardFatal(transaction),
     logger: getLogger,
   }
 }

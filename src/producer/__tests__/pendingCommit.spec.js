@@ -390,9 +390,10 @@ describe('Producer > disconnect() and the commit of a transaction', () => {
       expect(warnings()).toEqual([
         expect.objectContaining({ transactionalId: TRANSACTIONAL_ID, code }),
       ])
-      await expect(producer.send({ topic: TOPIC, messages: ONE })).rejects.toThrow(
-        'The producer is disconnected'
-      )
+      await expect(producer.send({ topic: TOPIC, messages: ONE })).rejects.toMatchObject({
+        name: 'KafkaJSApplicationRecoverableError',
+        cause: { code },
+      })
       await expect(producer.transaction()).rejects.toBeInstanceOf(
         KafkaJSApplicationRecoverableError
       )
