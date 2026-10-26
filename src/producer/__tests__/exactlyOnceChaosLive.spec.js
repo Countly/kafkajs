@@ -414,7 +414,6 @@ class Copier {
     this.instance = { id: this.id, slot, bornAt: Date.now(), retiredAt: null, fencedAt: null }
     scenario.instances.push(this.instance)
     scenario.enlist(this.producerSockets.chaos)
-    scenario.enlist(this.consumerSockets.chaos)
     scenario.cleanup.add(this.id, () => this.close())
   }
 
@@ -451,7 +450,11 @@ class Copier {
   }
 
   /**
-   * Joins the group and starts copying.
+   * Joins the group and starts copying. The consumer's connections join the chaos only once it is a
+   * member: a new member whose parked JoinGroup is lost starts over without the id the coordinator
+   * assigned (as kafkajs 2.2.4 does), which leaves a member that never answers, and the group
+   * waits for each such member's session timeout before it can rebalance again. A member that
+   * holds an id keeps it, so every rejoin under the chaos is still exercised.
    * @param {AbortSignal} signal the phase's scope
    * @returns {Promise<void>}
    * @throws {Error} a step that did not settle in time, or the reason `signal` aborted with
@@ -502,6 +505,7 @@ class Copier {
         }),
       { label: 'The group join' }
     )
+    scenario.enlist(this.consumerSockets.chaos)
   }
 
   /**
@@ -694,11 +698,12 @@ class Copier {
 
 /**
  * A transactional copier group under a fault: 20000 input records over six partitions, copied to an
- * output topic by `SLOTS` copiers, while either every client connection is killed and copiers are
- * replaced (`socket`), or the brokers are rolled once clean and once hard (`brokers`). The three
- * readings are kept apart: the committed output and the physical log, the broker's committed
- * offsets with the position a restarted copier resumed from, and what the handlers were given.
- * Every resource it opens goes to the case's `CleanupStack`.
+ * output topic by `SLOTS` copiers, while either every client connection (a consumer's from the
+ * moment it is a member) is killed and copiers are replaced (`socket`), or the brokers are rolled
+ * once clean and once hard (`brokers`). The three readings are kept apart: the committed output
+ * and the physical log, the broker's committed offsets with the position a restarted copier
+ * resumed from, and what the handlers were given. Every resource it opens goes to the case's
+ * `CleanupStack`.
  */
 class CopierScenario {
   /**
@@ -1586,9 +1591,10 @@ class CopierScenario {
  * Live proof of exactly-once consume-transform-produce (KIP-98, KIP-447) under chaos. Two copiers
  * in one group copy 20000 input records over six partitions to an output topic with transactions
  * that carry the input offsets and are fenced by the group membership, each slot on a stable
- * transactional id. One arm kills every client connection after 0.5 to 1.5 s while copiers are
- * replaced; the other rolls the three brokers once clean and once hard. The committed output must
- * hold every input id once and in order per partition, aborted physical records counted apart;
+ * transactional id. One arm kills every client connection (a consumer's from the moment it is a
+ * member) after 0.5 to 1.5 s while copiers are replaced; the other rolls the three brokers once
+ * clean and once hard. The committed output must hold every input id once and in order per
+ * partition, aborted physical records counted apart;
  * the broker's committed offsets, read from the coordinator, must follow only committed
  * transactions and equal the position a restarted copier resumes from; a producer fenced by its
  * replacement must have its `sendOffsets` and `commit` rejected without moving an offset; and the
