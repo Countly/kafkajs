@@ -2090,6 +2090,144 @@ describe.each([
   })
 })
 
+describe('real ownership transport on consumer for a heartbeat coordinator lookup', () => {
+  let member
+  beforeAll(() => prepareRecordBatches())
+  beforeEach(async () => {
+    member = new TransportMember('consumer', false, 'eachMessage')
+    await member.open()
+  })
+  afterEach(async () => {
+    await member.close()
+  })
+
+  it('sends no heartbeat for the replaced membership when the lookup succeeds late', async () => {
+    const { group, runner } = member
+    const protocol = group.groupMembership
+    const gate = member.hold({ api: 'FindCoordinator' })
+    protocol.coordinator = null
+    const token = group.ownership.token()
+    const late = member.observe(protocol.sendHeartbeat({}))
+    await within(gate.arrived(), 5000, 'the old lookup')
+    await protocol.connect()
+    await within(
+      runner.rebalanceCoordinator.runRound('assignment-changed', 'revoked'),
+      5000,
+      'the cooperative replacement'
+    )
+    member.pauseTimers()
+    expect(group.ownership.token()).toBe(token + 1)
+    const frames = member.frames('ConsumerGroupHeartbeat').length
+    const { memberEpoch, state } = protocol
+    const backoff = jest.spyOn(protocol.backoff, 'onFailedAttempt')
+    gate.release()
+    expect((await within(late, 5000, 'the late lookup')).error).toBeUndefined()
+    expect(member.frames('ConsumerGroupHeartbeat')).toHaveLength(frames)
+    expect(protocol.memberEpoch).toBe(memberEpoch)
+    expect(protocol.state).toBe(state)
+    expect(backoff).not.toHaveBeenCalled()
+    expect(group.ownership.refusal(group.ownership.token())).toBeNull()
+    const commits = member.frames('OffsetCommit').length
+    expect((await member.observe(member.commit('7'))).error).toBeUndefined()
+    expect(member.frames('OffsetCommit')).toHaveLength(commits + 1)
+  })
+})
+
+describe('a heartbeat coordinator lookup held across a replacement', () => {
+  /**
+   * A member with no known coordinator whose heartbeat waits on the lookup, which the membership
+   * then outlives.
+   * @returns {{ protocol: ConsumerGroupProtocol, ownership: GroupOwnership, gate: object,
+   *   token: number, heartbeat: Promise<Error|null>, renew: () => void }}
+   */
+  const heldLookup = () => {
+    const ownership = new GroupOwnership()
+    const schedule = new Schedule()
+    const gate = schedule.hold({ api: 'FindCoordinator' })
+    const protocol = new ConsumerGroupProtocol({
+      cluster: {
+        findGroupCoordinator: () => schedule.run({ api: 'FindCoordinator' }, () => null),
+      },
+      groupId: 'group',
+      topics: ['topic'],
+      ownership,
+      rebalanceTimeout: 1000,
+      instrumentationEmitter: new InstrumentationEventEmitter(),
+      logger: newLogger(),
+    })
+    protocol.state = 'ACKNOWLEDGING'
+    protocol.memberEpoch = 8
+    const token = ownership.token()
+    const heartbeat = protocol.sendHeartbeat({}).then(
+      () => null,
+      (error) => error
+    )
+    return {
+      protocol,
+      ownership,
+      gate,
+      token,
+      heartbeat,
+      renew: () => {
+        ownership.renew()
+        protocol.memberEpoch = 9
+      },
+    }
+  }
+
+  it('publishes no coordinator and builds no request when the lookup succeeds late', async () => {
+    const { protocol, gate, heartbeat, renew } = heldLookup()
+    await gate.arrived()
+    renew()
+    const coordinator = { consumerGroupHeartbeat: jest.fn() }
+    const takeDue = jest.spyOn(protocol.backoff, 'takeDue')
+    const failed = jest.spyOn(protocol.backoff, 'onFailedAttempt')
+    gate.release(coordinator)
+    expect(await heartbeat).toBeNull()
+    expect(coordinator.consumerGroupHeartbeat).not.toHaveBeenCalled()
+    expect(protocol.coordinator).toBeNull()
+    expect(protocol.lastRequestAt).toBe(0)
+    expect(takeDue).not.toHaveBeenCalled()
+    expect(failed).not.toHaveBeenCalled()
+    expect(protocol.state).toBe('ACKNOWLEDGING')
+    expect(protocol.memberEpoch).toBe(9)
+  })
+
+  it('stamps a late lookup failure and records no backoff on the replacement', async () => {
+    const { protocol, ownership, gate, token, heartbeat, renew } = heldLookup()
+    await gate.arrived()
+    renew()
+    const failed = jest.spyOn(protocol.backoff, 'onFailedAttempt')
+    const lookupError = new Error('lookup failed')
+    gate.fail(lookupError)
+    expect(await heartbeat).toBe(lookupError)
+    expect(failed).not.toHaveBeenCalled()
+    expect(protocol.backoff.pending(Date.now())).toBe(false)
+    expect(sentOwnership(lookupError)).toBe(token)
+    expect(obsoleteOwnership(ownership, lookupError)).toBe(true)
+    expect(protocol.coordinator).toBeNull()
+    expect(protocol.state).toBe('ACKNOWLEDGING')
+  })
+
+  it('still publishes, sends and records a failure for a lookup of the current membership', async () => {
+    const { protocol, gate, heartbeat } = heldLookup()
+    await gate.arrived()
+    const coordinator = { consumerGroupHeartbeat: jest.fn(async () => ({ memberEpoch: 8 })) }
+    gate.release(coordinator)
+    expect(await heartbeat).toBeNull()
+    expect(protocol.coordinator).toBe(coordinator)
+    expect(coordinator.consumerGroupHeartbeat).toHaveBeenCalledTimes(1)
+
+    const failing = heldLookup()
+    await failing.gate.arrived()
+    const failed = jest.spyOn(failing.protocol.backoff, 'onFailedAttempt')
+    const lookupError = new Error('lookup failed')
+    failing.gate.fail(lookupError)
+    expect(await failing.heartbeat).toBe(lookupError)
+    expect(failed).toHaveBeenCalledTimes(1)
+  })
+})
+
 describe.each(['classic', 'consumer'])('commit edges on %s', (kind) => {
   const explicit = (partition, offset) => ({
     topics: [{ topic: SCHEDULED_TOPIC, partitions: [{ partition, offset }] }],

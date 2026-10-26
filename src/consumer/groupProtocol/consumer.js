@@ -512,9 +512,26 @@ module.exports = class ConsumerGroupProtocol {
     this.commitBeforeRelease = commitBeforeRelease
   }
 
-  /** Resolves the group coordinator. @returns {Promise<void>} */
-  async connect() {
-    this.coordinator = await this.cluster.findGroupCoordinator({ groupId: this.groupId })
+  /**
+   * Resolves the group coordinator. A lookup that finishes after its membership was replaced
+   * publishes nothing: the answer may be older than what the replacement already learned.
+   * @param {number} [ownershipToken] the membership the lookup serves, captured before the first
+   *   await; defaults to the current one
+   * @returns {Promise<void>}
+   * @throws {Error} the lookup's own failure; the caller stamps it with the membership
+   */
+  async connect(ownershipToken = this.ownership?.token()) {
+    const coordinator = await this.cluster.findGroupCoordinator({ groupId: this.groupId })
+    if (!this.ownershipReplaced(ownershipToken)) this.coordinator = coordinator
+  }
+
+  /**
+   * @private
+   * @param {number|undefined} ownershipToken the membership an operation began under
+   * @returns {boolean} whether that membership has since been replaced
+   */
+  ownershipReplaced(ownershipToken) {
+    return this.ownership != null && ownershipToken !== this.ownership.token()
   }
 
   /**
@@ -962,6 +979,10 @@ module.exports = class ConsumerGroupProtocol {
    * acknowledgement that failed has still moved the state, and a heartbeat already on the wire when
    * the acknowledgement was decided must not consume it.
    *
+   * The membership the call began under is fixed before the coordinator lookup. A lookup that
+   * finishes after the membership was replaced ends the call: nothing is published, built or sent,
+   * and a failure of it is stamped with that membership and not counted against the replacement.
+   *
    * @see https://github.com/apache/kafka/blob/4.3/clients/src/main/java/org/apache/kafka/clients/consumer/internals/AbstractHeartbeatRequestManager.java
    * @param {{ sendAllFields?: boolean, leaveEpoch?: number|null }} options
    * @returns {Promise<void>}
@@ -983,11 +1004,14 @@ module.exports = class ConsumerGroupProtocol {
       }
 
       try {
-        await this.connect()
+        await this.connect(ownershipToken)
       } catch (error) {
-        this.backoff.onFailedAttempt(Date.now())
+        stampOwnership(error, ownershipToken)
+        if (!obsoleteOwnership(this.ownership, error)) this.backoff.onFailedAttempt(Date.now())
         throw error
       }
+
+      if (this.ownershipReplaced(ownershipToken)) return
     }
 
     const request = buildRequest(this, { sendAllFields, leaveEpoch })
@@ -1001,7 +1025,7 @@ module.exports = class ConsumerGroupProtocol {
     try {
       const response = await this.coordinator.consumerGroupHeartbeat(toBrokerPayload(request))
 
-      if (this.ownership && ownershipToken !== this.ownership.token()) return
+      if (this.ownershipReplaced(ownershipToken)) return
       this.sentFields.remember(request)
       if (request.SubscribedTopicRegex !== undefined) {
         this.regexUpdated = false
@@ -1038,7 +1062,7 @@ module.exports = class ConsumerGroupProtocol {
         ownershipToken
       )
     } finally {
-      if (!this.ownership || ownershipToken === this.ownership.token()) {
+      if (!this.ownershipReplaced(ownershipToken)) {
         this.onRequestGenerated({ leaveEpoch, stateAtRequest })
       }
     }

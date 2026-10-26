@@ -24,6 +24,8 @@ Versions before 3.0.0 are internal alpha tags and are not published.
 
 #### Fixes
 
+- A KIP-848 consumer no longer sends a heartbeat for a membership that was replaced while its coordinator lookup was still running. The late lookup used to finish, publish its coordinator and send a heartbeat carrying the replacement's member epoch, and a failed late lookup recorded a heartbeat backoff on the replacement. A lookup that outlives its membership now does nothing more: it sends nothing, publishes no coordinator and records no backoff, and its error is dropped as obsolete.
+
 #### Additions
 
 - Producers accept optional `compressionLevels: { gzip, zstd }` and direct broker Produce requests accept `compressionLevel`. Codec defaults are unchanged. LZ4 levels are unavailable in `lz4-napi` and are rejected.
