@@ -1,9 +1,12 @@
 const {
   ENDPOINT_BYTES,
+  MIN_PHASE_SAMPLES,
+  PHASE_WARMUP_MS,
   SAMPLE_MS,
   SLOPE_BYTES_PER_MINUTE,
   WARMUP_MS,
   evaluate,
+  evaluatePhases,
   median,
   slope,
 } = require('../bounds')
@@ -282,6 +285,254 @@ describe('Soak > bounds', () => {
 
       expect(violations(clean({ phaseEnds, teardown }))).toHaveLength(3)
     })
+  })
+})
+
+/**
+ * What a producer-churn run measured when its heap failed the whole-run rule: the samples by phase as
+ * `[atMs, heapUsed]`, when each phase began on the run's clock, and the quiet points.
+ */
+const LIVE_RUN = {
+  phases: [
+    {
+      phase: 'steady',
+      beganMs: 0,
+      samples: [
+        [30343, 12913488],
+        [60462, 12835392],
+        [90580, 13094288],
+        [120697, 13116416],
+        [150814, 13071184],
+        [180931, 13155824],
+        [211047, 13115888],
+        [241169, 13166112],
+        [271285, 13109840],
+      ],
+      end: 12179872,
+    },
+    {
+      phase: 'outage',
+      beganMs: 301000,
+      samples: [
+        [331195, 13624080],
+        [361349, 31481016],
+        [391470, 14260560],
+        [421587, 14253184],
+        [451706, 14266248],
+        [481826, 14196464],
+        [511944, 14233552],
+        [542064, 14308552],
+        [572184, 14367752],
+      ],
+      end: 13258920,
+    },
+    {
+      phase: 'buffer-pressure',
+      beganMs: 601600,
+      samples: [
+        [631856, 20277656],
+        [661977, 20263304],
+        [692099, 20275504],
+        [722227, 20296872],
+        [752355, 20333792],
+        [782479, 20383088],
+        [812610, 20391560],
+        [842737, 20417552],
+        [872860, 20405016],
+        [902980, 15752344],
+      ],
+      end: 13281504,
+    },
+  ],
+  teardown: 13263984,
+}
+
+describe('Soak > bounds for the producer churn', () => {
+  /** `count` samples of one phase, `everyMs` apart from `everyMs` into it, each `heapAt(index)` bytes. */
+  const phaseSamples = (phase, count, heapAt, { beganMs = 0, everyMs = SAMPLE_MS } = {}) =>
+    Array.from({ length: count }, (_, index) => ({
+      phase,
+      atMs: beganMs + (index + 1) * everyMs,
+      phaseMs: (index + 1) * everyMs,
+      snapshot: quiet({ heapUsed: heapAt(index) }),
+    }))
+
+  /** A run of three phases with nine samples each; `heap` and `end` override a phase's bytes by name. */
+  const churnRun = ({
+    phases = ['steady', 'outage', 'pressure'],
+    heap = {},
+    end = {},
+    ...rest
+  } = {}) => ({
+    baseline: quiet(),
+    phaseEnds: phases.map((phase) => ({
+      phase,
+      snapshot: quiet({ heapUsed: end[phase] ?? 50 * MIB }),
+    })),
+    samples: phases.flatMap((phase, order) =>
+      phaseSamples(phase, 9, heap[phase] ?? (() => 50 * MIB), { beganMs: order * 300000 })
+    ),
+    teardown: quiet({ heapUsed: end.teardown ?? 50 * MIB }),
+    ...rest,
+  })
+
+  const violations = (run) => evaluatePhases(run).violations
+
+  test('a phase is warmed up for 60 s and keeps at least six samples', () => {
+    expect({ PHASE_WARMUP_MS, MIN_PHASE_SAMPLES }).toEqual({
+      PHASE_WARMUP_MS: 60000,
+      MIN_PHASE_SAMPLES: 6,
+    })
+  })
+
+  test('a run that holds every bound passes, and reports what each phase and quiet point measured', () => {
+    expect(evaluatePhases(churnRun())).toEqual({
+      ok: true,
+      violations: [],
+      measured: {
+        phases: ['steady', 'outage', 'pressure'].map((phase) => ({
+          phase,
+          heapSamples: 8,
+          endpointBytes: 0,
+          slopeBytesPerMinute: 0,
+        })),
+        quietPoints: [
+          { when: 'after outage', aboveFirstBytes: 0 },
+          { when: 'after pressure', aboveFirstBytes: 0 },
+          { when: 'after disconnect', aboveFirstBytes: 0 },
+        ],
+      },
+    })
+  })
+
+  test('a high but flat phase passes where the series of the whole run does not', () => {
+    const heap = { steady: () => 13 * MIB, outage: () => 14 * MIB, pressure: () => 20 * MIB }
+    const end = { steady: 13 * MIB, outage: 13 * MIB, pressure: 13 * MIB, teardown: 13 * MIB }
+    const run = churnRun({ heap, end })
+
+    expect(violations(run)).toEqual([])
+    expect(evaluate({ ...run, warmupMs: 0 }).violations).toEqual([
+      `the heap grew ${7 * MIB} bytes, more than ${2 * MIB}`,
+      expect.stringMatching(/^the heap slope is \d+ bytes a minute, more than 262144$/),
+    ])
+  })
+
+  test('the readings of the live run that failed the whole-run rule pass it phase by phase', () => {
+    const samples = LIVE_RUN.phases.flatMap(({ phase, beganMs, samples: readings }) =>
+      readings.map(([atMs, heapUsed]) => ({
+        phase,
+        atMs,
+        phaseMs: atMs - beganMs,
+        snapshot: quiet({ heapUsed }),
+      }))
+    )
+    const run = {
+      baseline: quiet(),
+      phaseEnds: LIVE_RUN.phases.map(({ phase, end }) => ({
+        phase,
+        snapshot: quiet({ heapUsed: end }),
+      })),
+      samples,
+      teardown: quiet({ heapUsed: LIVE_RUN.teardown }),
+    }
+
+    expect(evaluate({ ...run, warmupMs: WARMUP_MS }).violations).toEqual([
+      'the heap grew 7249192 bytes, more than 2097152',
+      'the heap slope is 539287 bytes a minute, more than 262144',
+    ])
+    const judged = evaluatePhases(run)
+    expect(judged.violations).toEqual([])
+    expect(judged.measured.phases.map(({ heapSamples }) => heapSamples)).toEqual([8, 8, 9])
+    expect(judged.measured.quietPoints.map(({ aboveFirstBytes }) => aboveFirstBytes)).toEqual([
+      1079048, 1101632, 1084112,
+    ])
+  })
+
+  test.each([0, 5000])(
+    'a 300 s phase sampled every 30 s, each collection taking %i ms, keeps six samples after the warm-up',
+    (collectionMs) => {
+      const everyMs = SAMPLE_MS + collectionMs
+      const samples = phaseSamples('steady', Math.floor(300000 / everyMs), () => 50 * MIB, {
+        everyMs,
+      })
+
+      const run = evaluatePhases(churnRun({ phases: ['steady'], samples }))
+
+      expect(run.violations).toEqual([])
+      expect(run.measured.phases[0].heapSamples).toBeGreaterThanOrEqual(6)
+    }
+  )
+
+  test('growth inside one phase fails and names it, though the heap is back at its quiet point', () => {
+    const heap = { outage: (index) => 50 * MIB + index * MIB }
+
+    expect(violations(churnRun({ heap }))).toEqual([
+      `outage: the heap grew ${5 * MIB} bytes, more than ${2 * MIB}`,
+      `outage: the heap slope is ${2 * MIB} bytes a minute, more than ${SLOPE_BYTES_PER_MINUTE}`,
+    ])
+  })
+
+  test('a slope above the bound fails though the growth stays under its own', () => {
+    const heap = { steady: (index) => 50 * MIB + index * 160 * 1024 }
+
+    expect(violations(churnRun({ heap }))).toEqual([
+      `steady: the heap slope is ${320 * 1024} bytes a minute, more than ${SLOPE_BYTES_PER_MINUTE}`,
+    ])
+  })
+
+  test('a phase with fewer samples than it needs after its warm-up fails and names it', () => {
+    const run = {
+      ...churnRun({ phases: ['steady'] }),
+      samples: phaseSamples('steady', 6, () => 50 * MIB),
+    }
+
+    expect(violations(run)).toEqual(['steady: 5 heap samples after warm-up, 6 are needed'])
+    expect(violations({ ...run, minSamples: 2 })).toEqual([])
+  })
+
+  test('only the samples after the phase warm-up count', () => {
+    const heap = { steady: (index) => (index < 2 ? 10 * MIB : 50 * MIB) }
+    const run = churnRun({ phases: ['steady'], heap })
+
+    expect(violations({ ...run, warmupMs: 90000 })).toEqual([])
+    expect(violations({ ...run, warmupMs: 0 })).toContain(
+      `steady: the heap grew ${40 * MIB} bytes, more than ${2 * MIB}`
+    )
+  })
+
+  test('growth that survives into the quiet points fails, at each one, though every phase is flat', () => {
+    const end = { steady: 50 * MIB, outage: 51 * MIB, pressure: 53 * MIB, teardown: 53 * MIB }
+
+    expect(violations(churnRun({ end }))).toEqual([
+      `after pressure: ${3 * MIB} bytes retained above after steady, more than ${2 * MIB}`,
+      `after disconnect: ${3 * MIB} bytes retained above after steady, more than ${2 * MIB}`,
+    ])
+  })
+
+  test('a quiet point with no heap reading fails, and a first one without it is named once', () => {
+    const run = churnRun()
+    const withoutHeap = (entry) => ({ ...entry, snapshot: quiet() })
+    const [steady, outage, pressure] = run.phaseEnds
+
+    expect(violations({ ...run, phaseEnds: [steady, withoutHeap(outage), pressure] })).toEqual([
+      'after outage: no heap reading',
+    ])
+    expect(violations({ ...run, phaseEnds: [withoutHeap(steady), outage, pressure] })).toEqual([
+      'after steady: no heap reading',
+    ])
+  })
+
+  test('the quiet-point bounds of every run hold here too, and are named', () => {
+    const run = churnRun()
+    const [steady, ...later] = run.phaseEnds
+    const open = {
+      ...steady,
+      snapshot: { ...steady.snapshot, sockets: { created: 1, destroyed: 0, open: 1 } },
+    }
+
+    expect(violations({ ...run, phaseEnds: [open, ...later] })).toEqual([
+      'after steady: 1 sockets still open',
+    ])
   })
 })
 
@@ -707,7 +958,7 @@ describe('Soak > a run on the scripted cluster', () => {
     await consumer.disconnect()
   }
 
-  const smoke = async () => {
+  const smoke = async (extra = {}) => {
     const cluster = groupScript(
       createScriptedCluster({ nodes: [{ id: 0, host: 'node0', port: 9092 }] }),
       {
@@ -730,6 +981,7 @@ describe('Soak > a run on the scripted cluster', () => {
       settleMs: 200,
       record: (line) => lines.push(line),
       workloads: { idle: consumerOnly },
+      ...extra,
     })
 
     return { cluster, lines, verdict: await soak.run() }
@@ -751,6 +1003,26 @@ describe('Soak > a run on the scripted cluster', () => {
     cluster.assertClean()
     // no `--expose-gc` here, so there is no heap series: the only bound that cannot hold
     expect(verdict.violations).toEqual(['0 heap samples after warm-up, 6 are needed'])
+  }, 30000)
+
+  test('hands its judge every sample with its phase and how long into it, and returns its verdict', async () => {
+    const judge = jest.fn(() => ({ ok: true, violations: [] }))
+    const { lines, verdict } = await smoke({ judge })
+
+    expect(verdict).toEqual({ ok: true, violations: [] })
+    expect(judge).toHaveBeenCalledTimes(1)
+    const { samples, phaseEnds, warmupMs } = judge.mock.calls[0][0]
+    expect(warmupMs).toBe(0)
+    expect(phaseEnds.map(({ phase }) => phase)).toEqual(['idle'])
+    expect(samples.length).toBeGreaterThanOrEqual(2)
+    expect(samples.every(({ phase }) => phase === 'idle')).toBe(true)
+    const phaseMs = samples.map((sample) => sample.phaseMs)
+    expect(phaseMs).toEqual([...phaseMs].sort((a, b) => a - b))
+    expect(phaseMs[0]).toBeGreaterThanOrEqual(200)
+    expect(lines.find(({ kind }) => kind === 'sample')).toMatchObject({
+      phase: 'idle',
+      phaseMs: phaseMs[0],
+    })
   }, 30000)
 
   test('reads a client that holds on to a socket as a violation', async () => {

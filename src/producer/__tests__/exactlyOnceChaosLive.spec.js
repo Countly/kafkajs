@@ -1,4 +1,5 @@
 const { isDeepStrictEqual } = require('util')
+const { setTimeout: sleep } = require('timers/promises')
 const { Kafka, logLevel } = require('../../../index')
 const ISOLATION_LEVEL = require('../../protocol/isolationLevel')
 const { errorCodeOf } = require('../../../scripts/e2e/idempotentAuthzProbe')
@@ -11,6 +12,7 @@ const {
   settledTransactionVersion,
 } = require('./fixtures/liveTransactions')
 const { createLiveSockets } = require('./fixtures/liveWire')
+const { heartbeatInBatch } = require('./fixtures/memberHeartbeat')
 const {
   CASE_JOIN_MS,
   NEVER,
@@ -400,6 +402,8 @@ class Copier {
     this.consumer = null
     this.retired = false
     this.draining = false
+    /** Aborts when this copier is retired or draining, to end its waits; never a harness scope. */
+    this.halted = new AbortController()
     this.failure = null
     /** @type {{ instance: string, error: object, retries: number, lastRetry: object|null }|null} */
     this.recovery = null
@@ -503,12 +507,15 @@ class Copier {
   /**
    * Handles one fetched batch: its records in chunks of `CHUNK`, each copied and committed in a
    * transaction before its offset is resolved. A chunk that did not commit is not resolved, so the
-   * next fetch repeats it; a retired, draining or failed copier does nothing. The consumer's own
-   * heartbeat keeps the membership alive meanwhile.
+   * next fetch repeats it; a retired, draining or failed copier does nothing. Once a chunk is
+   * resolved the handler heartbeats (`heartbeatInBatch`), so that a rebalance ends the batch and
+   * the consumer rejoins at once, not after every batch it has fetched; the next fetch repeats
+   * whatever was not resolved.
    * @param {object} payload the consumer's `eachBatch` payload
    * @returns {Promise<void>}
+   * @throws {Error} the rebalance or lost-membership error the heartbeat raised
    */
-  async process({ batch, resolveOffset, isRunning, isStale }) {
+  async process({ batch, resolveOffset, heartbeat, isRunning, isStale }) {
     const { partition, messages } = batch
     for (let at = 0; at < messages.length; at += CHUNK) {
       if (this.retired || this.draining || this.failure) return this.rest()
@@ -517,17 +524,19 @@ class Copier {
       if (!(await this.noteStart(partition, Number(chunk[0].offset)))) return this.rest()
       if (!(await this.copy(partition, chunk))) return this.rest()
       resolveOffset(chunk.at(-1).offset)
+      await heartbeatInBatch(heartbeat)
       if (this.scenario.paceMs > 0) await this.rest(this.scenario.paceMs)
     }
   }
 
   /**
-   * Pauses; never cancelled, so no wait of the harness is ever aborted to wake it.
+   * Pauses, and stops pausing once this copier is retired or draining. Woken by the copier's own
+   * signal, not a harness scope, so nothing of the harness is aborted and the run is not tainted.
    * @param {number} [ms]
    * @returns {Promise<void>}
    */
   rest(ms = IDLE_MS) {
-    return delay(NEVER, ms)
+    return sleep(ms, undefined, { signal: this.halted.signal }).catch(noop)
   }
 
   /**
@@ -643,6 +652,7 @@ class Copier {
   retire() {
     if (this.retired) return
     this.retired = true
+    this.halted.abort()
     this.instance.retiredAt = Date.now()
   }
 
@@ -655,6 +665,7 @@ class Copier {
    */
   async stop(signal) {
     this.draining = true
+    this.halted.abort()
     await bounded(signal, STEP_MS, () => this.working, { label: `The work of ${this.id}` })
     await bounded(signal, STEP_MS, () => this.consumer?.stop(), { label: `The stop of ${this.id}` })
   }

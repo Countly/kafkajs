@@ -49,7 +49,14 @@ const { assertProbe } = require('../../testHelpers/producerProbe')
 const { endOffsets, readLog } = require('../../testHelpers/rawLog')
 const { createResourceProbe } = require('../../testHelpers/resourceProbe')
 const { evidencePath, writeEvidence } = require('../../testHelpers/e2eEvidence')
-const { SAMPLE_MS, WARMUP_MS, evaluate } = require('./bounds')
+const {
+  MIN_PHASE_SAMPLES,
+  PHASE_WARMUP_MS,
+  SAMPLE_MS,
+  WARMUP_MS,
+  evaluate,
+  evaluatePhases,
+} = require('./bounds')
 const {
   LATENCY_SAMPLE_EVERY,
   STATUS,
@@ -100,6 +107,8 @@ const CHURN = Object.freeze({
   flushMs: 150000,
   pollMs: 20,
   minLatencySamples: 20000,
+  /** The fewest heap samples each phase keeps after its warm-up. */
+  minHeapSamples: MIN_PHASE_SAMPLES,
   /** One offered id in this many is timed from send to first sighting. */
   latencySampleEvery: LATENCY_SAMPLE_EVERY,
   producer: Object.freeze({
@@ -880,7 +889,9 @@ class WriteDelay {
  * Every phase ends the same way: the offering stops, every call is joined, the producer is
  * flushed, the closing admission probe runs, the reader catches up, and the producer, the admin and
  * the reader disconnect. The readings: the resource bounds of `Soak` (the sockets, listeners by
- * name, queues, timers and heap); the controls of each phase; the closing probe of each phase; and
+ * name, queues and timers, and the heap, which `evaluatePhases` judges inside each phase and across
+ * the quiet points, since the buffer-pressure phase holds a full buffer by design); the controls of
+ * each phase; the closing probe of each phase; and
  * the durability of the log, read once through the reader's own journal and once again from the
  * quiet log. Each acknowledged id must be in the log exactly once, an id of unknown outcome at most
  * once, an id refused before sending never, and no record may repeat a `(partition, pid, epoch,
@@ -911,7 +922,8 @@ class ProducerChurn {
    * @param {(ms: number, signal?: AbortSignal) => Promise<void>} [options.sleep]
    * @param {{ endOffsets: Function, readLog: Function }} [options.rawLog]
    * @param {Record<string, Function>} [options.workloads=WORKLOADS]
-   * @param {object} [options.soak] `sampleMs`, `warmupMs` and `settleMs` for `Soak`
+   * @param {object} [options.soak] `sampleMs`, `warmupMs` (how long into each phase its heap
+   *   samples start to count; `PHASE_WARMUP_MS` by default) and `settleMs` for `Soak`
    * @param {Partial<typeof CHURN> & { requiredKinds?: string[] }} [options.settings] overrides of
    *   `CHURN`, and which kinds of outage the outage phase must have made
    */
@@ -951,7 +963,7 @@ class ProducerChurn {
       pause,
       rawLog,
       workloads,
-      soak,
+      soak: { warmupMs: PHASE_WARMUP_MS, ...soak },
     })
     this.settings = { requiredKinds: ['clean', 'hard'], ...CHURN, ...settings }
     this.measure = {
@@ -1064,6 +1076,7 @@ class ProducerChurn {
         kafka: this.kafka,
         probe: this.measure,
         phases: this.phases,
+        judge: (run) => evaluatePhases({ ...run, minSamples: this.settings.minHeapSamples }),
         context: {
           kafka: this.kafka,
           topic: this.topic,
@@ -1823,7 +1836,11 @@ class Soak {
    * @param {Array<{ name: string, workload: keyof typeof WORKLOADS, ms: number }>} options.phases
    * @param {WorkloadContext} options.context handed to every workload
    * @param {number} [options.sampleMs=SAMPLE_MS]
-   * @param {number} [options.warmupMs=WARMUP_MS]
+   * @param {number} [options.warmupMs=WARMUP_MS] how long the heap series is left to settle; for a
+   *   `judge` that reads a phase on its own, how long into each phase
+   * @param {(run: object) => { ok: boolean, violations: string[] }} [options.judge=evaluate] holds
+   *   the readings to the bounds: it is given `baseline`, `phaseEnds`, `samples`, `teardown` and
+   *   `warmupMs`, and each sample names its phase and how long into it it was taken
    * @param {number} [options.settleMs=SETTLE_MS] how long a quiet point waits for closed sockets to go
    * @param {(record: object) => void} [options.record=writeEvidence('soak', ...)] where every line goes
    * @param {Record<string, Function>} [options.workloads=WORKLOADS]
@@ -1837,6 +1854,7 @@ class Soak {
     context,
     sampleMs = SAMPLE_MS,
     warmupMs = WARMUP_MS,
+    judge = evaluate,
     settleMs = SETTLE_MS,
     record = (line) => writeEvidence('soak', line),
     workloads = WORKLOADS,
@@ -1849,6 +1867,7 @@ class Soak {
       context,
       sampleMs,
       warmupMs,
+      judge,
       settleMs,
       record,
       workloads,
@@ -1863,8 +1882,8 @@ class Soak {
   /**
    * Runs every phase, reads the quiet points and judges the run. The baseline is read once the
    * sockets the setup closed are gone, so it counts only what the clients will leave behind.
-   * @returns {Promise<ReturnType<typeof evaluate>>} the verdict; the lines were recorded as they
-   *   were taken
+   * @returns {Promise<ReturnType<typeof evaluate>>} the verdict of `judge`; the lines were
+   *   recorded as they were taken
    * @throws {Error} the failure of a workload, after its sampler is stopped
    */
   async run() {
@@ -1882,7 +1901,7 @@ class Soak {
     const teardown = await this.probe.snapshot()
     this.record({ kind: 'teardown', snapshot: teardown })
 
-    const verdict = evaluate({
+    const verdict = this.judge({
       baseline,
       phaseEnds: this.phaseEnds,
       samples: this.samples,
@@ -1903,15 +1922,22 @@ class Soak {
    *   phase's workload has ended and its clients are disconnected
    */
   async runPhase({ name, workload, ms }, startedAt) {
+    const phaseStartedAt = Date.now()
     this.sampling = true
     const sampler = (async () => {
       while (this.sampling) {
         await this.nap()
         if (this.sampling) {
           const snapshot = await this.probe.snapshot()
-          const sample = { atMs: Date.now() - startedAt, snapshot }
+          const now = Date.now()
+          const sample = {
+            phase: name,
+            atMs: now - startedAt,
+            phaseMs: now - phaseStartedAt,
+            snapshot,
+          }
           this.samples.push(sample)
-          this.record({ kind: 'sample', phase: name, ...sample })
+          this.record({ kind: 'sample', ...sample })
         }
       }
     })()
@@ -2025,7 +2051,7 @@ const buildProducerChurn = ({ brokers, phaseSeconds, phases }) => {
       budgetMs: CHURN.producer.deliveryTimeout,
     }),
     soak: smoke ? { sampleMs: Math.max(1000, (phaseSeconds * 1000) / 6), warmupMs: 0 } : {},
-    settings: smoke ? { minLatencySamples: 1, requiredKinds: [] } : {},
+    settings: smoke ? { minLatencySamples: 1, minHeapSamples: 2, requiredKinds: [] } : {},
   })
 }
 

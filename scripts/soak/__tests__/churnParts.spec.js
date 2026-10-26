@@ -1172,9 +1172,19 @@ describe('Churn wiring', () => {
     [
       'a full run',
       null,
-      { sampleMs: undefined, minLatencySamples: undefined, requiredKinds: undefined },
+      {
+        sampleMs: undefined,
+        warmupMs: 60000,
+        minLatencySamples: undefined,
+        minHeapSamples: undefined,
+        requiredKinds: undefined,
+      },
     ],
-    ['a smoke run', 4, { sampleMs: 1000, minLatencySamples: 1, requiredKinds: [] }],
+    [
+      'a smoke run',
+      4,
+      { sampleMs: 1000, warmupMs: 0, minLatencySamples: 1, minHeapSamples: 2, requiredKinds: [] },
+    ],
   ])('builds the owner of %s from the real parts', (_, phaseSeconds, expected) => {
     const phases = PROFILES['producer-churn']
     const churn = buildProducerChurn({ brokers: ['localhost:1'], phaseSeconds, phases })
@@ -1195,8 +1205,10 @@ describe('Churn wiring', () => {
     expect(churn.settings.minLatencySamples).toBe(
       expected.minLatencySamples ?? CHURN.minLatencySamples
     )
+    expect(churn.settings.minHeapSamples).toBe(expected.minHeapSamples ?? CHURN.minHeapSamples)
     expect(churn.settings.requiredKinds).toEqual(expected.requiredKinds ?? ['clean', 'hard'])
     expect(churn.soak.sampleMs).toBe(expected.sampleMs)
+    expect(churn.soak.warmupMs).toBe(expected.warmupMs)
     expect(churn.phases).toBe(phases)
   })
 
@@ -1210,6 +1222,7 @@ describe('Churn wiring', () => {
       partitions: 6,
       minInsyncReplicas: 2,
       minLatencySamples: 20000,
+      minHeapSamples: 6,
       producer: {
         idempotent: true,
         bufferMemory: 4194304,

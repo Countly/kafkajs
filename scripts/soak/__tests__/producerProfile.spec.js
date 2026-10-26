@@ -4,7 +4,14 @@ const path = require('node:path')
 const { PROFILES, WORKLOADS, main, parseArgs } = require('../soak')
 const { ObservationJournal } = require('../churnLedger')
 const { ClosingProbe } = require('../closingProbe')
-const { CAPACITY, FakeProbe, FakeProducer, goodObservation, makeChurn } = require('./churnFakes')
+const {
+  CAPACITY,
+  FakeProbe,
+  FakeProducer,
+  goodObservation,
+  makeChurn,
+  quiet,
+} = require('./churnFakes')
 const { Admission } = require('../../../src/producer/state/admission')
 const Cluster = require('../../../src/cluster')
 const RequestQueue = require('../../../src/network/requestQueue')
@@ -303,7 +310,91 @@ describe('Producer churn > a run over fake ports', () => {
     })
 
     expect(verdict.ok).toBe(false)
-    expect(verdict.violations).toContain('resources: 0 heap samples after warm-up, 6 are needed')
+    expect(verdict.violations).toEqual([
+      'resources: steady: 0 heap samples after warm-up, 6 are needed',
+      'resources: outage: 0 heap samples after warm-up, 6 are needed',
+      'resources: buffer-pressure: 0 heap samples after warm-up, 6 are needed',
+    ])
+  })
+
+  describe('the heap, phase by phase', () => {
+    const MIB = 1024 * 1024
+
+    /**
+     * Runs the churn over a heap that depends on where the run is: `sampled(phase, n)` bytes for the
+     * nth sample taken in a phase, `atEnd(phase)` at its quiet point and after the disconnect.
+     * @param {{ sampled?: (phase: string, n: number) => number, atEnd?: (phase: string) => number }} heap
+     * @returns {Promise<string[]>} the violations of the verdict
+     */
+    const violationsOfHeap = async ({ sampled = () => 13 * MIB, atEnd = () => 13 * MIB }) => {
+      const taken = {}
+      const state = {}
+      const snapshot = async () => {
+        const { phase } = state.churn
+        if (!phase) return quiet()
+        if (phase.endedAt !== undefined) return quiet({ heapUsed: atEnd(phase.name) })
+        taken[phase.name] = (taken[phase.name] ?? 0) + 1
+        return quiet({ heapUsed: sampled(phase.name, taken[phase.name]) })
+      }
+      const harness = makeChurn({ snapshot })
+      state.churn = harness.churn
+      return (await harness.churn.run()).violations
+    }
+
+    test('the default warm-up of a phase is longer than a fake one, so it keeps no sample', async () => {
+      const harness = makeChurn({ soak: { sampleMs: 5, settleMs: 50 } })
+      const { violations } = await harness.churn.run()
+
+      expect(violations).toEqual([
+        'resources: steady: 0 heap samples after warm-up, 6 are needed',
+        'resources: outage: 0 heap samples after warm-up, 6 are needed',
+        'resources: buffer-pressure: 0 heap samples after warm-up, 6 are needed',
+      ])
+    })
+
+    test('the samples a phase must keep after its warm-up are a setting', async () => {
+      const harness = makeChurn({ settings: { minHeapSamples: 100000 } })
+      const { violations } = await harness.churn.run()
+
+      expect(violations).toEqual(
+        ['steady', 'outage', 'buffer-pressure'].map((phase) =>
+          expect.stringMatching(
+            new RegExp(`^resources: ${phase}: \\d+ heap samples after warm-up, 100000 are needed$`)
+          )
+        )
+      )
+    })
+
+    test('a pressure phase that holds more than the others but stays flat passes', async () => {
+      const violations = await violationsOfHeap({
+        sampled: (phase) => (phase === 'buffer-pressure' ? 20 * MIB : 13 * MIB),
+      })
+
+      expect(violations).toEqual([])
+    })
+
+    test('growth inside one phase fails and names it, though the heap is back at its quiet point', async () => {
+      const violations = await violationsOfHeap({
+        sampled: (phase, n) => (phase === 'outage' ? 13 * MIB + n * MIB : 13 * MIB),
+      })
+
+      expect(violations).toEqual([
+        expect.stringMatching(/^resources: outage: the heap grew \d+ bytes, more than 2097152$/),
+        expect.stringMatching(
+          /^resources: outage: the heap slope is \d+ bytes a minute, more than 262144$/
+        ),
+      ])
+    })
+
+    test('growth that survives into the quiet points fails, though no phase grows', async () => {
+      const retained = { steady: 12 * MIB, outage: 13 * MIB, 'buffer-pressure': 15 * MIB }
+      const violations = await violationsOfHeap({ atEnd: (phase) => retained[phase] })
+
+      expect(violations).toEqual([
+        `resources: after buffer-pressure: ${3 * MIB} bytes retained above after steady, more than ${2 * MIB}`,
+        `resources: after disconnect: ${3 * MIB} bytes retained above after steady, more than ${2 * MIB}`,
+      ])
+    })
   })
 
   test('too few latency samples fail the run', async () => {

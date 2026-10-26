@@ -11,6 +11,7 @@ jest.mock('../../../index', () => ({ ...jest.requireActual('../../../index'), Ka
 
 const Broker = require('../../broker')
 const Cluster = require('../../cluster')
+const { KafkaJSConnectionError, KafkaJSRequestTimeoutError } = require('../../errors')
 const { createErrorFromCode } = require('../../protocol/error')
 const ISOLATION_LEVEL = require('../../protocol/isolationLevel')
 const apiKeys = require('../../protocol/requests/apiKeys')
@@ -59,6 +60,7 @@ const {
 } = require('./fixtures/bounded')
 const { bufferedProducer, deferred, watch } = require('./fixtures/bufferHarness')
 const { createFakeCluster } = require('./fixtures/fakeCluster')
+const { heartbeatInBatch } = require('./fixtures/memberHeartbeat')
 const {
   FrameLog,
   ResponseDrop,
@@ -3406,6 +3408,47 @@ describe('Producer > the live scenarios harness', () => {
         'The wait did not settle within 10 ms'
       )
       await expect(within(1000, Promise.resolve(4), 'The wait')).resolves.toBe(4)
+    })
+  })
+
+  describe('heartbeatInBatch', () => {
+    test('returns when the heartbeat does', async () => {
+      const heartbeat = jest.fn(async () => {})
+
+      await expect(heartbeatInBatch(heartbeat)).resolves.toBeUndefined()
+      expect(heartbeat).toHaveBeenCalledTimes(1)
+    })
+
+    test.each([
+      ['ILLEGAL_GENERATION', 22],
+      ['UNKNOWN_MEMBER_ID', 25],
+      ['REBALANCE_IN_PROGRESS', 27],
+      ['FENCED_INSTANCE_ID', 82],
+      ['FENCED_MEMBER_EPOCH', 110],
+    ])('ends the batch with %s, the coordinator saying the group moved on', async (_name, code) => {
+      const error = createErrorFromCode(code)
+
+      await expect(
+        heartbeatInBatch(async () => {
+          throw error
+        })
+      ).rejects.toBe(error)
+    })
+
+    test.each([
+      ['a lost connection', new KafkaJSConnectionError('lost')],
+      ['a request timeout', new KafkaJSRequestTimeoutError('timed out')],
+      ['a loading coordinator', createErrorFromCode(14)],
+      ['an unavailable coordinator', createErrorFromCode(15)],
+      ['a moved coordinator', createErrorFromCode(16)],
+      ['an error that says nothing of the membership', createErrorFromCode(29)],
+      ['a plain failure', new Error('boom')],
+    ])('leaves %s to the consumer, which rides it out', async (_name, error) => {
+      await expect(
+        heartbeatInBatch(async () => {
+          throw error
+        })
+      ).resolves.toBeUndefined()
     })
   })
 })

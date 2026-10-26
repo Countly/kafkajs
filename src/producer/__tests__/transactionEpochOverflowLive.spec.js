@@ -29,7 +29,10 @@ const describeEpoch = process.env.TXN_EPOCH_OVERFLOW_E2E === '1' ? describe : de
 
 const EVIDENCE = 'txn-epoch-overflow'
 const TRANSACTIONS = 32768
-const LOOP_BUDGET_MS = 480000
+// Back-to-back transactions on transaction version 2 each wait at the broker for the previous one
+// (`add.partitions.to.txn.retry.backoff.ms`, 20 ms by default): 40 to 54 ms measured per
+// transaction on 4.3.1, so 32768 of them take up to about 1770 s.
+const LOOP_BUDGET_MS = 2100000
 const PHASE_BUDGET_MS = Object.freeze({
   setup: 90000,
   loop: LOOP_BUDGET_MS,
@@ -37,7 +40,9 @@ const PHASE_BUDGET_MS = Object.freeze({
   probe: 60000,
   cleanup: 30000,
 })
-const CASE_BUDGET_MS = 840000
+// The phases and the join reserve, and 6 s over, so that the case and the cluster's start end
+// inside the 2700 s of the guarded run.
+const CASE_BUDGET_MS = 2350000
 const HOOK_BUDGET_MS = 60000
 const CREATE_TOPIC_MS = 15000
 const CONNECT_MS = 20000
