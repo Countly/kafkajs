@@ -80,6 +80,20 @@ const outcomeOf = (promise) =>
   )
 
 /**
+ * What a producer that a fencing or identity outcome armed answers to more work: the same armed
+ * error object from `transaction()`, `flush()` and `connect()`, which never revive it.
+ * @param {object} producer a connected producer
+ * @returns {Promise<{ armed: Error|null, flush: Error|null, connect: Error|null }>} the error each
+ *   call rejected with; null for a call that resolved
+ */
+const armedPermanence = async (producer) => {
+  const { error: armed } = await outcomeOf(producer.transaction())
+  const { error: flush } = await outcomeOf(producer.flush())
+  const { error: connect } = await outcomeOf(producer.connect())
+  return { armed, flush, connect }
+}
+
+/**
  * Runs `scripts/e2e/transactionCrashMember.js` and kills it with SIGKILL the moment it reports its
  * records acknowledged, before it could send anything else, so its transaction stays open on the
  * coordinator. Its own request log is the proof no EndTxn left it.
@@ -151,4 +165,4 @@ const crashAfterProduce = ({ topic, transactionalId, records, deadlineMs, track 
     })
   })
 
-module.exports = { settledTransactionVersion, outcomeOf, crashAfterProduce }
+module.exports = { armedPermanence, settledTransactionVersion, outcomeOf, crashAfterProduce }

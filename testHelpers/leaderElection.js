@@ -11,10 +11,28 @@ const KAFKA_BIN = '/opt/kafka/bin'
 // directory (the OpenTelemetry package's tests run from `otel/`) reaches the same cluster.
 const COMPOSE_FILE = path.resolve(__dirname, '..', process.env.COMPOSE_FILE || 'docker-compose.yml')
 
+/** Builds a guarded controller call when the test harness supplies an ownership manifest.
+ * @param {string} operation control or exec
+ * @param {string[]} args exact service/action or container command operands
+ * @returns {string[]|null} timeout argv, or null for the ordinary standalone harness
+ * @throws {Error} incomplete ownership environment or invalid control shape
+ */
+const guardedCommand = (operation, args) => {
+  const guard = process.env.KAFKAJS_CLUSTER_GUARD
+  const manifest = process.env.KAFKAJS_CLUSTER_MANIFEST
+  if (!guard && !manifest) return null
+  if (!guard || !manifest) throw new Error('Incomplete cluster ownership environment')
+  if (operation === 'control') {
+    if (args.length !== 2) throw new Error('Guarded control requires one service')
+    args = [args[0] === 'kill' ? 'hard' : args[0], args[1]]
+  }
+  return ['--kill-after=10s', '120s', 'node', guard, operation, manifest, ...args]
+}
+
 /**
  * Runs `docker compose` against the cluster the tests are using. Defaults to the root compose
  * file; `COMPOSE_FILE` (relative to the repository root) overrides it, which is how a scenario
- * targets its own.
+ * targets its own. A controller ownership environment routes controls through its bounded guard.
  *
  * Synchronous on purpose, so a test never races the container it just told to stop or start.
  *
@@ -22,8 +40,12 @@ const COMPOSE_FILE = path.resolve(__dirname, '..', process.env.COMPOSE_FILE || '
  * @returns {Buffer} the command's stdout
  * @throws {Error} if the `docker` CLI exits non-zero
  */
-const compose = (...args) =>
-  execFileSync('docker', ['compose', '-f', COMPOSE_FILE, ...args], { stdio: 'pipe' })
+const compose = (...args) => {
+  const guarded = guardedCommand('control', args)
+  return guarded
+    ? execFileSync('timeout', guarded, { stdio: 'pipe' })
+    : execFileSync('docker', ['compose', '-f', COMPOSE_FILE, ...args], { stdio: 'pipe' })
+}
 
 /**
  * `docker compose -f <compose file> <args>` without blocking the event loop: a bounce step awaits it,
@@ -34,8 +56,12 @@ const compose = (...args) =>
  * @returns {Promise<{ stdout: string, stderr: string }>}
  * @throws {Error} if the `docker` CLI exits non-zero
  */
-const composeAsync = (...args) =>
-  promisify(execFile)('docker', ['compose', '-f', COMPOSE_FILE, ...args])
+const composeAsync = (...args) => {
+  const guarded = guardedCommand('control', args)
+  return guarded
+    ? promisify(execFile)('timeout', guarded)
+    : promisify(execFile)('docker', ['compose', '-f', COMPOSE_FILE, ...args])
+}
 
 /**
  * Runs a command inside the kafka1 container, piping `input` to its stdin when given.
@@ -50,11 +76,15 @@ const composeAsync = (...args) =>
  * @returns {Buffer} the command's stdout
  * @throws {Error} if `docker` or the command inside it exits non-zero
  */
-const execInKafka1 = (args, input) =>
-  execFileSync('docker', ['compose', '-f', COMPOSE_FILE, 'exec', '-T', 'kafka1', ...args], {
-    stdio: 'pipe',
-    input,
-  })
+const execInKafka1 = (args, input) => {
+  const guarded = guardedCommand('exec', ['kafka1', ...args])
+  return guarded
+    ? execFileSync('timeout', guarded, { stdio: 'pipe', input })
+    : execFileSync('docker', ['compose', '-f', COMPOSE_FILE, 'exec', '-T', 'kafka1', ...args], {
+        stdio: 'pipe',
+        input,
+      })
+}
 
 /**
  * Stops one broker container without removing it, so it can be started again with its log intact.
@@ -261,14 +291,18 @@ class BrokerBouncer {
    * One outage of one node.
    * @param {{ service: string, kind: 'pause'|'stop'|'kill', holdMs?: number }} step `pause` is
    *   restored by `unpause`, `stop` and `kill` by `start`; the node stays down at least `holdMs`
-   * @param {{ admin: object, topics: string[] }} cluster what a restart waits on
+   * @param {{ admin: object, topics: string[], signal?: AbortSignal }} cluster what a restart
+   *   waits on; once `signal` aborts no node is taken down, and a node already down is still
+   *   restored
    * @returns {Promise<{ service: string, kind: string, tDown: number, tRestored: number,
    *   outageMs: number }>}
-   * @throws {Error} refusing the step (nothing is run), or the step's first failure once the node
-   *   is restored; a node whose restore failed stays marked down, so the next step is refused
+   * @throws {Error} refusing the step (nothing is run), the reason `signal` aborted with before
+   *   the node was taken down, or the step's first failure once the node is restored; a node whose
+   *   restore failed stays marked down, so the next step is refused
    */
-  async step({ service, kind, holdMs = 0 }, { admin, topics }) {
+  async step({ service, kind, holdMs = 0 }, { admin, topics, signal }) {
     await this.assertAllUp()
+    signal?.throwIfAborted()
     // A concurrent step may have claimed its node while the probes were awaited.
     if (this.down.size > 0) {
       throw new Error(`Refusing a bounce step while ${[...this.down].join(', ')} is down`)
@@ -303,16 +337,20 @@ class BrokerBouncer {
   /**
    * Stops (or, `hard`, kills) and restarts every node in turn, `between` ms apart.
    * @param {{ hard?: boolean, between?: number, admin: object, topics: string[],
-   *   services?: string[] }} options
+   *   services?: string[], signal?: AbortSignal }} options `signal` is checked before every step,
+   *   so once it aborts the node under way is restored and no later one is taken down
    * @returns {Promise<object[]>} the outage of each step, in order
    * @throws {Error} the first failed step's error, after it restored its node; later nodes are
-   *   left alone
+   *   left alone; the reason `signal` aborted with
    */
-  async rollingBounce({ hard = false, between = 0, admin, topics, services }) {
+  async rollingBounce({ hard = false, between = 0, admin, topics, services, signal }) {
     const outages = []
     for (const service of services || Object.keys(this.nodes)) {
       if (outages.length && between) await this.wait(between)
-      outages.push(await this.step({ service, kind: hard ? 'kill' : 'stop' }, { admin, topics }))
+      signal?.throwIfAborted()
+      outages.push(
+        await this.step({ service, kind: hard ? 'kill' : 'stop' }, { admin, topics, signal })
+      )
     }
     return outages
   }

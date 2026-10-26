@@ -318,6 +318,89 @@ describe('broker bounce helpers', () => {
       ])
     })
 
+    describe('with a signal', () => {
+      const abortedWith = (reason) => {
+        const controller = new AbortController()
+        controller.abort(reason)
+        return controller.signal
+      }
+
+      test('an already aborted signal refuses a step after its preflight, before it issues anything', async () => {
+        const reason = new Error('the case ended')
+        const { bouncer, commands, probes } = harness()
+
+        await expect(
+          bouncer.step(
+            { service: 'kafka2', kind: 'stop' },
+            { ...cluster, signal: abortedWith(reason) }
+          )
+        ).rejects.toBe(reason)
+        expect(probes.size).toBe(3)
+        expect(commands).toEqual([])
+        expect(bouncer.down.size).toBe(0)
+      })
+
+      test('an already aborted signal issues no stop and probes no node in a rolling bounce', async () => {
+        const reason = new Error('the case ended')
+        const { bouncer, commands, probes } = harness()
+
+        await expect(
+          bouncer.rollingBounce({ hard: true, ...cluster, signal: abortedWith(reason) })
+        ).rejects.toBe(reason)
+        expect(commands).toEqual([])
+        expect(probes.size).toBe(0)
+      })
+
+      test('an abort during a hold still restores the node, and the next step is refused', async () => {
+        const reason = new Error('the case ended')
+        const controller = new AbortController()
+        const { bouncer, commands } = harness()
+        bouncer.wait = async (ms) => {
+          if (ms === 5) controller.abort(reason)
+        }
+
+        const outage = await bouncer.step(
+          { service: 'kafka1', kind: 'stop', holdMs: 5 },
+          { ...cluster, signal: controller.signal }
+        )
+        expect(outage.service).toBe('kafka1')
+        expect(commands).toEqual(['stop kafka1', 'start kafka1'])
+        await expect(
+          bouncer.step(
+            { service: 'kafka2', kind: 'stop' },
+            { ...cluster, signal: controller.signal }
+          )
+        ).rejects.toBe(reason)
+        expect(commands).toEqual(['stop kafka1', 'start kafka1'])
+        expect(bouncer.down.size).toBe(0)
+      })
+
+      test('an abort during a step restores that node and issues no further step', async () => {
+        const reason = new Error('the case ended')
+        const controller = new AbortController()
+        const { bouncer, commands } = harness()
+        bouncer.wait = async () => controller.abort(reason)
+
+        await expect(bouncer.rollingBounce({ ...cluster, signal: controller.signal })).rejects.toBe(
+          reason
+        )
+        expect(commands).toEqual(['stop kafka1', 'start kafka1'])
+        expect(bouncer.down.size).toBe(0)
+      })
+
+      test('a signal that never aborts changes nothing', async () => {
+        const { bouncer, commands } = harness()
+
+        const outages = await bouncer.rollingBounce({
+          ...cluster,
+          signal: new AbortController().signal,
+        })
+
+        expect(outages).toHaveLength(3)
+        expect(commands).toHaveLength(6)
+      })
+    })
+
     test('a rolling bounce stops at the first failed step, after restoring that node', async () => {
       const failure = new Error('stop failed')
       const { bouncer, commands } = harness({

@@ -369,6 +369,9 @@ describe('Soak > profiles', () => {
         expect(WORKLOADS[workload]).toEqual(expect.any(Function))
       }
     }
+    expect(Object.keys(WORKLOADS)).toEqual(
+      expect.arrayContaining(['producerSteady', 'producerOutage', 'producerPressure'])
+    )
   })
 })
 

@@ -52,6 +52,7 @@ Versions before 3.0.0 are internal alpha tags and are not published.
 - Pin producer transaction-boundary error dispositions, equivalent metadata and batching APIs, response reordering, lost-answer replay and producer wire schedules.
 - Add live producer scenarios for the delivery deadline, size limits, lost answers, topic lifecycle and replica availability, plus compression interoperability and decompression-bound recovery checks, and a broker-free test of their bounded harness.
 - Add an authentic librdkafka Snappy capture (one five-record batch that `kcat` 1.7.1 with librdkafka 2.8.0 wrote to Apache Kafka 4.3.1, with its independently decompressed record section and manifest) and a broker-free validator that holds the Fetch decoder and a public consumer to its records.
+- Live producer scenarios cover transactional copying under connection replacement and rolling broker restarts, transaction epoch overflow, idle transactional-id expiry, and transactions with one Produce request in flight. A producer churn soak combines steady sends, broker outages and buffer pressure with a raw-log durability oracle and resource checks.
 
 
 ### Phase 1 — foundation

@@ -15,8 +15,22 @@ const FRESH = ['localhost:9192']
  * @returns {Buffer} the command's stdout
  * @throws {Error} if the `docker` CLI exits non-zero
  */
-const compose = (...args) =>
-  execFileSync('docker', ['compose', '-f', COMPOSE_FILE, ...args], { stdio: 'pipe' })
+const compose = (...args) => {
+  const guard = process.env.KAFKAJS_CLUSTER_GUARD
+  const manifest = process.env.KAFKAJS_CLUSTER_MANIFEST
+  if (!guard && !manifest)
+    return execFileSync('docker', ['compose', '-f', COMPOSE_FILE, ...args], { stdio: 'pipe' })
+  if (!guard || !manifest || !['stop', 'start'].includes(args[0]))
+    throw new Error('Invalid guarded rebootstrap control')
+  // Keep both clusters for the owner's evidence verification before removal.
+  if (args[0] === 'stop' && args.length === 2 && args[1] === 'kafkaFresh') return Buffer.alloc(0)
+  for (const service of args.slice(1))
+    execFileSync(
+      'timeout',
+      ['--kill-after=10s', '120s', 'node', guard, 'control', manifest, args[0], service],
+      { stdio: 'pipe' }
+    )
+}
 
 // Needs this spec's own compose file and a cluster to itself: `npm run test:e2e:rebootstrap`.
 const enabled = process.env.REBOOTSTRAP_E2E === '1'
