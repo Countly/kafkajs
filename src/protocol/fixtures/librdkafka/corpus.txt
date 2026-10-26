@@ -1,0 +1,5 @@
+k1:hello librdkafka
+k2:
+:value without key
+k3:snappy snappy snappy snappy snappy snappy snappy snappy snappy snappy
+k4:{"id":4,"note":"utf-8 é ü 日本"}

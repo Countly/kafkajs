@@ -1,0 +1,8 @@
+Dumping /tmp/kafka-logs/librdkafka-snappy-capture-0/00000000000000000000.log
+Log starting offset: 0
+baseOffset: 0 lastOffset: 4 count: 5 baseSequence: -1 lastSequence: -1 producerId: -1 producerEpoch: -1 partitionLeaderEpoch: 0 isTransactional: false isControl: false deleteHorizonMs: OptionalLong.empty position: 0 CreateTime: 1793017856219 size: 229 magic: 2 compresscodec: snappy crc: 564937410 isvalid: true
+| offset: 0 CreateTime: 1793017856219 keySize: 2 valueSize: 16 sequence: -1 headerKeys: [dup,dup,solo] key: k1 payload: hello librdkafka
+| offset: 1 CreateTime: 1793017856219 keySize: 2 valueSize: 0 sequence: -1 headerKeys: [dup,dup,solo] key: k2 payload: 
+| offset: 2 CreateTime: 1793017856219 keySize: 0 valueSize: 17 sequence: -1 headerKeys: [dup,dup,solo] key:  payload: value without key
+| offset: 3 CreateTime: 1793017856219 keySize: 2 valueSize: 69 sequence: -1 headerKeys: [dup,dup,solo] key: k3 payload: snappy snappy snappy snappy snappy snappy snappy snappy snappy snappy
+| offset: 4 CreateTime: 1793017856219 keySize: 2 valueSize: 36 sequence: -1 headerKeys: [dup,dup,solo] key: k4 payload: {"id":4,"note":"utf-8 é ü 日本"}

@@ -49,6 +49,7 @@ Versions before 3.0.0 are internal alpha tags and are not published.
 - `scripts/benchmarks/sendPathCounters.js` also counts the sends the flush inventory tracks (`flushTracked`: the calls of `Accumulator#track`), so `produceLatency.js` and `produceIdempotent.js` can show that each timed send was counted there; the field is `null` in a tree that has no flush inventory.
 - Pin producer transaction-boundary error dispositions, equivalent metadata and batching APIs, response reordering, lost-answer replay and producer wire schedules.
 - Add live producer scenarios for the delivery deadline, size limits, lost answers, topic lifecycle and replica availability, plus compression interoperability and decompression-bound recovery checks, and a broker-free test of their bounded harness.
+- Add an authentic librdkafka Snappy capture (one five-record batch that `kcat` 1.7.1 with librdkafka 2.8.0 wrote to Apache Kafka 4.3.1, with its independently decompressed record section and manifest) and a broker-free validator that holds the Fetch decoder and a public consumer to its records.
 
 
 ### Phase 1 — foundation

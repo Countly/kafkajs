@@ -1,0 +1,279 @@
+{
+  "producer": {
+    "name": "librdkafka",
+    "version": "2.8.0",
+    "configuration": {
+      "driver": "kcat 1.7.1",
+      "compression.codec": "snappy",
+      "linger.ms": "500",
+      "batch.num.messages": "100",
+      "topic.metadata.refresh.interval.ms": "500",
+      "enable.idempotence": "false (librdkafka default)",
+      "acks": "all (librdkafka default)",
+      "partition": 0,
+      "keyDelimiter": ":",
+      "headers": [
+        "dup=first",
+        "dup=second",
+        "solo=one"
+      ]
+    }
+  },
+  "provenance": {
+    "source": "Written by a real librdkafka producer (kcat) to a throwaway single-node Apache Kafka 4.3.1 broker whose topic keeps compression.type=producer. The batch is that broker's stored log segment (exactly one batch), copied unmodified.",
+    "acquiredAt": "2026-10-26T12:30:56Z",
+    "releaseOrEnvironment": "Debian trixie: kcat 1.7.1-3, librdkafka1 2.8.0-1 (apt); broker apache/kafka:4.3.1 (sha256:77e3df9054047a88b520d0cc46e16696d3b22022e1d580aeccd2632df6532837, Kafka commit 26b251a451ce941d), topic librdkafka-snappy-capture: auto-created, 1 partition, broker defaults (compression.type=producer)",
+    "commands": [
+      "kcat -P -b localhost:39092 -t librdkafka-snappy-capture -p 0 -z snappy -K: -H dup=first -H dup=second -H solo=one -X linger.ms=500 -X batch.num.messages=100 -X topic.metadata.refresh.interval.ms=500 -l corpus.txt",
+      "docker cp kafkajs-capture:/tmp/kafka-logs/librdkafka-snappy-capture-0/00000000000000000000.log segment.log",
+      "kafka-dump-log.sh --files .../00000000000000000000.log --deep-iteration --print-data-log (Kafka 4.3.1, in the broker container)",
+      "kcat -C -b localhost:39092 -X broker.address.family=v4 -t librdkafka-snappy-capture -p 0 -o beginning -e -J",
+      "java -cp snappy-java-1.1.10.7.jar:. Unsnappy compressed-body.bin snappy-record-data.bin (org.xerial.snappy.Snappy.uncompress; framing detected from the bytes: raw, no xerial header)"
+    ],
+    "referenceDecoder": {
+      "recordSection": "snappy-java 1.1.10.7 (Maven Central, SHA-1 3049f95640f4625a945cfab85715f603fa4c8f80)",
+      "records": "kafka-dump-log.sh (Kafka 4.3.1) and kcat 1.7.1 -C -J (librdkafka 2.8.0)",
+      "outputs": {
+        "corpus.txt": "58563bd3e2ba4c29d30bd6baf878e1cb11cef83df2d04cadee0b994b7f3deaa4",
+        "kafka-dump-log.txt": "5e9d6ffc588f4c4b8e9cace8272fbef54866063c376327672fadc4d0ab37bf8c",
+        "kcat-consume.jsonl": "057c1aa483de29612972a450d7b762c2469fc3a46cd0098398fa3661b8897e1c"
+      }
+    }
+  },
+  "sha256": "7386ba9150ce3ff2e663e6b24e893ed5b89808907af36a0503be3cc3eae220ff",
+  "compressedSha256": "a9d41ccb34caa2ceb64a378888ce0415510183dcf575565db783979551a24734",
+  "recordDataSha256": "4b3e5ba89e28d199b978e55786e3a0ce6e4b957aadca0bebd62b6f542c903c71",
+  "batch": {
+    "magic": 2,
+    "attributes": 2,
+    "recordCount": 5,
+    "framing": "raw",
+    "baseOffset": "0",
+    "baseTimestamp": "1793017856219",
+    "lastOffsetDelta": "4"
+  },
+  "rawRecords": [
+    {
+      "offsetDelta": "0",
+      "timestampDelta": "0",
+      "keyHex": "6b31",
+      "valueHex": "68656c6c6f206c696272646b61666b61",
+      "headers": [
+        {
+          "keyHex": "647570",
+          "keyUtf8": "dup",
+          "valueHex": "6669727374"
+        },
+        {
+          "keyHex": "647570",
+          "keyUtf8": "dup",
+          "valueHex": "7365636f6e64"
+        },
+        {
+          "keyHex": "736f6c6f",
+          "keyUtf8": "solo",
+          "valueHex": "6f6e65"
+        }
+      ]
+    },
+    {
+      "offsetDelta": "1",
+      "timestampDelta": "0",
+      "keyHex": "6b32",
+      "valueHex": "",
+      "headers": [
+        {
+          "keyHex": "647570",
+          "keyUtf8": "dup",
+          "valueHex": "6669727374"
+        },
+        {
+          "keyHex": "647570",
+          "keyUtf8": "dup",
+          "valueHex": "7365636f6e64"
+        },
+        {
+          "keyHex": "736f6c6f",
+          "keyUtf8": "solo",
+          "valueHex": "6f6e65"
+        }
+      ]
+    },
+    {
+      "offsetDelta": "2",
+      "timestampDelta": "0",
+      "keyHex": "",
+      "valueHex": "76616c756520776974686f7574206b6579",
+      "headers": [
+        {
+          "keyHex": "647570",
+          "keyUtf8": "dup",
+          "valueHex": "6669727374"
+        },
+        {
+          "keyHex": "647570",
+          "keyUtf8": "dup",
+          "valueHex": "7365636f6e64"
+        },
+        {
+          "keyHex": "736f6c6f",
+          "keyUtf8": "solo",
+          "valueHex": "6f6e65"
+        }
+      ]
+    },
+    {
+      "offsetDelta": "3",
+      "timestampDelta": "0",
+      "keyHex": "6b33",
+      "valueHex": "736e6170707920736e6170707920736e6170707920736e6170707920736e6170707920736e6170707920736e6170707920736e6170707920736e6170707920736e61707079",
+      "headers": [
+        {
+          "keyHex": "647570",
+          "keyUtf8": "dup",
+          "valueHex": "6669727374"
+        },
+        {
+          "keyHex": "647570",
+          "keyUtf8": "dup",
+          "valueHex": "7365636f6e64"
+        },
+        {
+          "keyHex": "736f6c6f",
+          "keyUtf8": "solo",
+          "valueHex": "6f6e65"
+        }
+      ]
+    },
+    {
+      "offsetDelta": "4",
+      "timestampDelta": "0",
+      "keyHex": "6b34",
+      "valueHex": "7b226964223a342c226e6f7465223a227574662d3820c3a920c3bc20e697a5e69cac227d",
+      "headers": [
+        {
+          "keyHex": "647570",
+          "keyUtf8": "dup",
+          "valueHex": "6669727374"
+        },
+        {
+          "keyHex": "647570",
+          "keyUtf8": "dup",
+          "valueHex": "7365636f6e64"
+        },
+        {
+          "keyHex": "736f6c6f",
+          "keyUtf8": "solo",
+          "valueHex": "6f6e65"
+        }
+      ]
+    }
+  ],
+  "expectedPublicRecords": [
+    {
+      "offset": "0",
+      "timestamp": "1793017856219",
+      "keyHex": "6b31",
+      "valueHex": "68656c6c6f206c696272646b61666b61",
+      "headers": [
+        {
+          "key": "dup",
+          "values": [
+            "6669727374",
+            "7365636f6e64"
+          ]
+        },
+        {
+          "key": "solo",
+          "values": [
+            "6f6e65"
+          ]
+        }
+      ]
+    },
+    {
+      "offset": "1",
+      "timestamp": "1793017856219",
+      "keyHex": "6b32",
+      "valueHex": "",
+      "headers": [
+        {
+          "key": "dup",
+          "values": [
+            "6669727374",
+            "7365636f6e64"
+          ]
+        },
+        {
+          "key": "solo",
+          "values": [
+            "6f6e65"
+          ]
+        }
+      ]
+    },
+    {
+      "offset": "2",
+      "timestamp": "1793017856219",
+      "keyHex": "",
+      "valueHex": "76616c756520776974686f7574206b6579",
+      "headers": [
+        {
+          "key": "dup",
+          "values": [
+            "6669727374",
+            "7365636f6e64"
+          ]
+        },
+        {
+          "key": "solo",
+          "values": [
+            "6f6e65"
+          ]
+        }
+      ]
+    },
+    {
+      "offset": "3",
+      "timestamp": "1793017856219",
+      "keyHex": "6b33",
+      "valueHex": "736e6170707920736e6170707920736e6170707920736e6170707920736e6170707920736e6170707920736e6170707920736e6170707920736e6170707920736e61707079",
+      "headers": [
+        {
+          "key": "dup",
+          "values": [
+            "6669727374",
+            "7365636f6e64"
+          ]
+        },
+        {
+          "key": "solo",
+          "values": [
+            "6f6e65"
+          ]
+        }
+      ]
+    },
+    {
+      "offset": "4",
+      "timestamp": "1793017856219",
+      "keyHex": "6b34",
+      "valueHex": "7b226964223a342c226e6f7465223a227574662d3820c3a920c3bc20e697a5e69cac227d",
+      "headers": [
+        {
+          "key": "dup",
+          "values": [
+            "6669727374",
+            "7365636f6e64"
+          ]
+        },
+        {
+          "key": "solo",
+          "values": [
+            "6f6e65"
+          ]
+        }
+      ]
+    }
+  ]
+}
