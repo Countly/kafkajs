@@ -716,10 +716,10 @@ class PendingSend {
   /**
    * @param {{ topic: string, messages: object[] }[]} records
    * @param {Deadline} deadline the send's delivery deadline, counted from the public call
-   * @param {{ holdTopic(topic: string): void, releaseTopic(topic: string): void }} [pinner] the
+   * @param {{ holdTopic(topic: string): void, releaseTopic(topic: string): void }} pinner the
    *   producer cluster's topic pins, which keep its topics' metadata while the shell is charged
    */
-  constructor(records, deadline, pinner = NO_PINNER) {
+  constructor(records, deadline, pinner) {
     /** @type {?{ topic: string, messages: object[] }[]} `null` once the send has settled or joined */
     this.records = records
     this.deadline = deadline

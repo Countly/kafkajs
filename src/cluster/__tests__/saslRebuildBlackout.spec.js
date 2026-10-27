@@ -2,6 +2,7 @@ const BrokerPool = require('../brokerPool')
 const connectionPoolBuilder = require('../connectionPoolBuilder')
 const { createScriptedCluster } = require('../../../testHelpers/scriptedCluster')
 const { newLogger } = require('testHelpers')
+const Generation = require('../../producer/generation')
 const { KafkaJSSASLAuthenticationError } = require('../../errors')
 
 const NODES = [
@@ -71,6 +72,29 @@ describe('Cluster > BrokerPool > an ILLEGAL_SASL_STATE rebuild inside an authent
     expect(node.connectionPool).not.toBe(firstPool)
     expect(node.connectionPool.authenticationBlackout).toBe(brokerPool.authenticationBlackout)
     expect(handshakes()).toHaveLength(written)
+  })
+
+  test('a lifecycle that closes while the pool is rebuilt retires the new pool and keeps the old one', async () => {
+    const node = brokerPool.brokers[0]
+    const firstPool = node.connectionPool
+    const fence = new Generation()
+    const closed = new Error('closed')
+    const build = brokerPool.buildConnectionPool.bind(brokerPool)
+    const built = []
+    brokerPool.buildConnectionPool = async (options) => {
+      fence.close(closed)
+      built.push(await build(options))
+      return built.at(-1)
+    }
+    const retired = jest.spyOn(brokerPool, 'closePool')
+    cluster.schedule.once({ api: 'SaslHandshake' }, { errorCode: 34, enabledMechanisms: [] })
+
+    await expect(brokerPool.findBroker({ nodeId: 0, fence })).rejects.toBe(closed)
+
+    expect(built).toHaveLength(1)
+    expect(retired).toHaveBeenCalledTimes(1)
+    expect(retired).toHaveBeenCalledWith(built[0])
+    expect(node.connectionPool).toBe(firstPool)
   })
 
   test('without a blackout the rebuilt pool connects again', async () => {

@@ -62,6 +62,29 @@ describe('Protocol > Compression > LZ4', () => {
         expect(() => isolatedIndex.lookupCodec(isolatedIndex.Types.LZ4)).toThrow(/lz4-napi/)
       })
     })
+
+    it('refuses to compress and to decompress, with the same actionable error, when the codec is used directly', async () => {
+      jest.doMock('lz4-napi', () => {
+        throw Object.assign(new Error("Cannot find module 'lz4-napi'"), {
+          code: 'MODULE_NOT_FOUND',
+        })
+      })
+
+      await jest.isolateModulesAsync(async () => {
+        const isolatedLz4 = require('./lz4')
+        const { KafkaJSNotImplemented } = require('../../../errors')
+        const input = Buffer.from('payload')
+
+        for (const attempt of [
+          isolatedLz4.compress({ buffer: input }),
+          isolatedLz4.decompress(input),
+          isolatedLz4.decompress(input, { maxOutputLength: 1 }),
+        ]) {
+          await expect(attempt).rejects.toBeInstanceOf(KafkaJSNotImplemented)
+          await expect(attempt).rejects.toThrow(isolatedLz4.NOT_SUPPORTED_MESSAGE)
+        }
+      })
+    })
   })
 
   describeIfLz4('when lz4-napi is installed', () => {
@@ -563,6 +586,76 @@ describe('Protocol > Compression > LZ4', () => {
         } finally {
           turns.mockRestore()
         }
+      })
+
+      describe('input that fills a slice exactly', () => {
+        const SLICE = 262144
+        /** The bytes of a frame before its first block's data: header, check byte, size word. */
+        const HEAD = 7 + 4
+
+        /** The turns the codec takes, as setImmediate calls, to decode `buffer` at `limit`. */
+        const turnsFor = async (buffer, limit) => {
+          const turns = jest.spyOn(global, 'setImmediate')
+          try {
+            await decompressBounded(lz4Codec, 3, buffer, limit)
+            return turns.mock.calls.length
+          } finally {
+            turns.mockRestore()
+            native.mockClear()
+          }
+        }
+
+        /**
+         * A sequence of `length` bytes in all, the first of which is a token, with literals of
+         * `fill` and a match of four bytes at offset 1.
+         */
+        const sequenceOf = (length, fill) => {
+          const extensionBytes = (count) => (count >= 15 ? Math.floor((count - 15) / 255) + 1 : 0)
+          let literals = length
+          while (3 + extensionBytes(literals) + literals > length) literals--
+          const bytes = sequence({ literals: Buffer.alloc(literals, fill), offset: 1, match: 4 })
+          expect(bytes).toHaveLength(length)
+          return { bytes, decoded: Buffer.alloc(literals + 4, fill) }
+        }
+
+        const end = sequence({ literals: Buffer.alloc(5) })
+
+        it('takes one turn before a block word that would overrun the slice', async () => {
+          const filling = frame({ maxSizeCode: 5, blocks: [stored(SLICE - HEAD)] })
+          const short = frame({ maxSizeCode: 5, blocks: [stored(SLICE - HEAD - 5)] })
+
+          expect(await turnsFor(filling, SLICE)).toBe((await turnsFor(short, SLICE)) + 1)
+          await expect(decoded(filling, SLICE)).resolves.toEqual(Buffer.alloc(SLICE - HEAD, 1))
+        })
+
+        it('takes one turn, and decodes the block, when a sequence ends exactly on the slice boundary', async () => {
+          const first = sequenceOf(SLICE - HEAD, 1)
+          const input = frame({
+            independent: false,
+            maxSizeCode: 6,
+            blocks: [block(Buffer.concat([first.bytes, end]))],
+          })
+
+          expect(await turnsFor(input, SLICE)).toBe(1)
+          await expect(decoded(input, SLICE)).resolves.toEqual(
+            Buffer.concat([first.decoded, Buffer.alloc(5)])
+          )
+        })
+
+        it('takes one turn, and decodes the block, when a length extension begins on the slice boundary', async () => {
+          const first = sequenceOf(SLICE - HEAD - 1, 1)
+          const second = sequenceOf(40, 2)
+          const input = frame({
+            independent: false,
+            maxSizeCode: 6,
+            blocks: [block(Buffer.concat([first.bytes, second.bytes, end]))],
+          })
+
+          expect(await turnsFor(input, SLICE)).toBe(1)
+          await expect(decoded(input, SLICE)).resolves.toEqual(
+            Buffer.concat([first.decoded, second.decoded, Buffer.alloc(5)])
+          )
+        })
       })
     })
   })

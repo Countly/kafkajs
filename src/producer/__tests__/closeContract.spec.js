@@ -8,7 +8,11 @@ const {
   flushAll,
   watch,
 } = require('./fixtures/bufferHarness')
-const { KafkaJSConnectionError, KafkaJSInvalidConfigurationError } = require('../../errors')
+const {
+  KafkaJSConnectionError,
+  KafkaJSInvalidConfigurationError,
+  KafkaJSNonRetriableError,
+} = require('../../errors')
 const { Kafka } = require('../../../index')
 const { newLogger } = require('testHelpers')
 const { Schedule } = require('../../../testHelpers/schedule')
@@ -377,6 +381,22 @@ describe('Generation and the fenced retry', () => {
     generation.close(new Error('later'))
     expect(cancel).toBeInstanceOf(Function)
     await flushAll()
+    expect(jest.getTimerCount()).toBe(0)
+  })
+
+  test('a non-retriable failure ends a fenced retry after one attempt, wrapped with its cause', async () => {
+    const generation = new Generation()
+    const failure = Object.assign(new Error('rejected for good'), { retriable: false })
+    const fn = jest.fn(async () => {
+      throw failure
+    })
+
+    const error = await createRetry({ retries: 3, fence: generation })(fn).catch((thrown) => thrown)
+
+    expect(error).toBeInstanceOf(KafkaJSNonRetriableError)
+    expect(error.message).toBe('rejected for good')
+    expect(error.cause).toBe(failure)
+    expect(fn).toHaveBeenCalledTimes(1)
     expect(jest.getTimerCount()).toBe(0)
   })
 })

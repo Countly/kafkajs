@@ -225,7 +225,7 @@ describe('a plain request with different delivery deadlines', () => {
   })
 
   /** One plain owner with two independent creation timestamps; no helper supplies an expiry. */
-  const setup = (produce, retries = 3, createdAt = [0, 500]) => {
+  const setup = (produce, retries = 3, createdAt = [0, 500], prepare = () => {}) => {
     const cluster = createFakeCluster({
       partitions: 2,
       produce,
@@ -251,6 +251,7 @@ describe('a plain request with different delivery deadlines', () => {
       deliveryTimeout: 1000,
       getConnectionStatus: () => 'connected',
     })
+    prepare(cluster)
     const settlers = [0, 1].map(() => ({ resolve: jest.fn(), reject: jest.fn() }))
     const batches = [0, 1].map((partition) => ({
       topic: TOPIC,
@@ -374,6 +375,45 @@ describe('a plain request with different delivery deadlines', () => {
     await work
     expect(harness.cluster.broker.produce).toHaveBeenCalledTimes(1)
     for (const settler of harness.settlers) expect(settler.reject).toHaveBeenCalledTimes(1)
+  })
+
+  it('drops the broker of a connection that closes after the deliveries expired, and writes nothing', async () => {
+    const { KafkaJSConnectionClosedError } = require('../../errors')
+    const closed = new KafkaJSConnectionClosedError('Closed connection', {
+      host: 'node0',
+      port: 9092,
+    })
+    let fail
+    const harness = setup(
+      async (request) => success(request),
+      3,
+      [500, 500],
+      (cluster) => {
+        cluster.refreshMetadataIfNecessary.mockImplementationOnce(
+          () =>
+            new Promise((_, reject) => {
+              fail = () => reject(closed)
+            })
+        )
+      }
+    )
+    await jest.advanceTimersByTimeAsync(0)
+    expect(fail).toBeDefined()
+    await jest.advanceTimersByTimeAsync(1000)
+    for (const settler of harness.settlers) expect(settler.reject).toHaveBeenCalledTimes(1)
+    expect(harness.cluster.removeBroker).not.toHaveBeenCalled()
+
+    fail()
+    await jest.advanceTimersByTimeAsync(0)
+    await work
+
+    expect(harness.cluster.removeBroker).toHaveBeenCalledTimes(1)
+    expect(harness.cluster.removeBroker).toHaveBeenCalledWith(
+      expect.objectContaining({ host: 'node0', port: 9092 })
+    )
+    expect(harness.cluster.broker.produce).not.toHaveBeenCalled()
+    expect(harness.error()).toBeInstanceOf(KafkaJSDeliveryTimeout)
+    expect(jest.getTimerCount()).toBe(0)
   })
 })
 describe.each(['tv1', 'tv2'])('plain late failure identity profile %s', (profile) => {

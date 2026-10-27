@@ -306,6 +306,26 @@ describe('Obsolete broker dispatch', () => {
     expect(old.retire).toHaveBeenCalledTimes(1)
   })
 
+  it.each([
+    ['no host', { nodeId: 1, host: '', port: 9092 }],
+    ['no port', { nodeId: 1, host: 'next' }],
+    ['a fractional port', { nodeId: 1, host: 'next', port: 9092.5 }],
+    ['a zero port', { nodeId: 1, host: 'next', port: 0 }],
+    ['a negative port', { nodeId: 1, host: 'next', port: -1 }],
+  ])('an endpoint with %s is skipped and the rest of the hint still applies', async (_, bad) => {
+    const { pool, builder } = build()
+    const old = broker(1)
+    pool.brokers[1] = old
+
+    await pool.applyNodeEndpoints([bad, { nodeId: 2, host: 'valid', port: 9093 }])
+
+    expect(pool.brokers[1]).toBe(old)
+    expect(old.retire).not.toHaveBeenCalled()
+    expect(builder.build).toHaveBeenCalledTimes(1)
+    expect(builder.build).toHaveBeenCalledWith(expect.objectContaining({ host: 'valid' }))
+    expect(pool.brokers[2].connectionPool).toMatchObject({ host: 'valid', port: 9093 })
+  })
+
   it('a shared seed hint keeps the Broker and retires its previous pool with the bound', async () => {
     const { pool, seed } = build()
     const oldPool = seed.connectionPool

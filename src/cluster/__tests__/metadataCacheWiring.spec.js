@@ -311,6 +311,45 @@ describe('Cluster > metadata cache wiring', () => {
     expect(typeof unsubscribe).toBe('function')
     expect(() => unsubscribe()).not.toThrow()
   })
+
+  test('forgetLeaderEpoch drops the cached epoch of the partition and reports whether one was there', async () => {
+    stubBrokers(cluster, [metadata({ topicId: ID_A, leader: 1, leaderEpoch: 5 })])
+    await cluster.brokerPool.refreshMetadata(['test-topic'])
+
+    expect(cluster.forgetLeaderEpoch('test-topic', 0)).toBe(true)
+    expect(cluster.metadataCache.leaderEpoch('test-topic', 0)).toEqual(-1)
+    expect(cluster.forgetLeaderEpoch('other-topic', 0)).toBe(false)
+    expect(cluster.forgetLeaderEpoch('test-topic', 9)).toBe(false)
+  })
+
+  test('hasNode answers for the nodes of the broker table by their number or their string id', async () => {
+    stubBrokers(cluster, [metadata({ topicId: ID_A, leader: 1, leaderEpoch: 5 })])
+    await cluster.brokerPool.refreshMetadata(['test-topic'])
+
+    expect(cluster.hasNode(2)).toBe(true)
+    expect(cluster.hasNode('2')).toBe(true)
+    expect(cluster.hasNode(3)).toBe(false)
+  })
+
+  test('a leader hint that offers no leader is refused before any endpoint is installed', async () => {
+    stubBrokers(cluster, [metadata({ topicId: ID_A, leader: 1, leaderEpoch: 5 })])
+    await cluster.brokerPool.refreshMetadata(['test-topic'])
+    const endpoints = jest.spyOn(cluster.brokerPool, 'applyNodeEndpoints')
+
+    const applied = await cluster.applyLeaderHint({
+      topic: 'test-topic',
+      partition: 0,
+      leaderId: -1,
+      leaderEpoch: 9,
+      nodeEndpoints: [{ nodeId: 3, host: '127.0.0.1', port: 9096, rack: null }],
+    })
+
+    expect(applied).toBe(false)
+    expect(endpoints).not.toHaveBeenCalled()
+    expect(cluster.hasNode(3)).toBe(false)
+    expect(cluster.metadataCache.leaderEpoch('test-topic', 0)).toEqual(5)
+    expect(cluster.findLeaderForPartitions('test-topic', [0])).toEqual({ 1: [0] })
+  })
 })
 
 describe('TOPIC_RECREATED > client event mapping', () => {

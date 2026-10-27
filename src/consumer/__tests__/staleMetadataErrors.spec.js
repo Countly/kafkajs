@@ -1,4 +1,5 @@
 const { staleMetadata, createErrorFromCode } = require('../../protocol/error')
+const { KafkaJSBrokerNotFound, KafkaJSOffsetOutOfRange } = require('../../errors')
 const ConsumerGroup = require('../consumerGroup')
 const InstrumentationEventEmitter = require('../../instrumentation/emitter')
 const { newLogger } = require('testHelpers')
@@ -108,5 +109,36 @@ describe('stale-metadata error classification', () => {
       'No rebalance coordinator attached; refreshed metadata only',
       expect.objectContaining({ groupId: 'test-group' })
     )
+  })
+})
+
+describe('the fetch errors that are recovered without a rejoin', () => {
+  test('an offset out of range goes to the offset recovery, with no metadata refresh and no rejoin', async () => {
+    const { consumerGroup, cluster, requestRejoin } = buildGroup()
+    const recover = jest.spyOn(consumerGroup, 'recoverFromOffsetOutOfRange').mockResolvedValue()
+    const error = new KafkaJSOffsetOutOfRange(createErrorFromCode(1), {
+      topic: 'test-topic',
+      partition: 0,
+    })
+
+    await expect(consumerGroup.recoverFromFetch(error)).resolves.toBeUndefined()
+
+    expect(recover).toHaveBeenCalledTimes(1)
+    expect(recover).toHaveBeenCalledWith(error)
+    expect(cluster.refreshMetadata).not.toHaveBeenCalled()
+    expect(requestRejoin).not.toHaveBeenCalled()
+  })
+
+  test('a broker that is not in the cached metadata refreshes it and retries, with no rejoin', async () => {
+    const { consumerGroup, cluster, requestRejoin } = buildGroup()
+    const debug = jest.spyOn(consumerGroup.logger, 'debug')
+
+    await expect(
+      consumerGroup.recoverFromFetch(new KafkaJSBrokerNotFound('Broker 3 not found'))
+    ).resolves.toBeUndefined()
+
+    expect(cluster.refreshMetadata).toHaveBeenCalledTimes(1)
+    expect(debug).toHaveBeenCalledWith('Broker 3 not found, refreshing metadata and retrying...')
+    expect(requestRejoin).not.toHaveBeenCalled()
   })
 })

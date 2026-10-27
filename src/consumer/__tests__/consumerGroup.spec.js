@@ -9,6 +9,7 @@ const { joinDeadlineError, stampGeneration } = require('../rebalanceErrorContrac
 const { newLogger } = require('testHelpers')
 
 const TOPIC_A = 'events-a'
+const TOPIC_B = 'events-b'
 
 const partitionMetadata = (count) =>
   Array.from({ length: count }, (_, partitionId) => ({ partitionId }))
@@ -114,6 +115,20 @@ describe('ConsumerGroup', () => {
         clearMemberId: true,
       })
       expect(consumerGroup.assignmentEpoch).toBe(before + 1)
+    })
+  })
+
+  describe('resetOffset', () => {
+    it("calls the offset manager's resetOffset with the partition", () => {
+      consumerGroup.offsetManager = { resetOffset: jest.fn() }
+
+      consumerGroup.resetOffset({ topic: 'topic1', partition: 3 })
+
+      expect(consumerGroup.offsetManager.resetOffset).toHaveBeenCalledTimes(1)
+      expect(consumerGroup.offsetManager.resetOffset).toHaveBeenCalledWith({
+        topic: 'topic1',
+        partition: 3,
+      })
     })
   })
 
@@ -283,6 +298,63 @@ describe('Consumer > ConsumerGroup > growSubscription', () => {
 
     expect(assignment).toEqual([{ topic: 'events-a', partitions: [0] }])
     expect(unsubscribed).toEqual([])
+  })
+})
+
+describe('Consumer > ConsumerGroup > an assignment that names partitions the member has not heard of', () => {
+  it('refreshes the metadata once, relearns the partitions of every subscribed topic and keeps the assignment', async () => {
+    const group = createGroup({ topics: [TOPIC_A, TOPIC_B] })
+    let known = 2
+    group.cluster.findTopicPartitionMetadata = () => partitionMetadata(known)
+    group.cluster.refreshMetadata = jest.fn(async () => {
+      known = 4
+    })
+    group.partitionsPerSubscribedTopic = group.generatePartitionsPerSubscribedTopic()
+    const warn = jest.spyOn(group.logger, 'warn')
+
+    const { assignment } = await group.applyRebalanceResult({
+      assignment: { [TOPIC_A]: [0, 1, 2], [TOPIC_B]: [2, 3] },
+    })
+
+    expect(group.cluster.refreshMetadata).toHaveBeenCalledTimes(1)
+    expect(warn).toHaveBeenCalledTimes(1)
+    expect(warn).toHaveBeenCalledWith(
+      'Consumer is not aware of all assigned partitions, refreshing metadata',
+      expect.objectContaining({
+        topic: TOPIC_A,
+        knownPartitions: [0, 1],
+        assignedPartitions: [0, 1, 2],
+      })
+    )
+    expect(group.partitionsPerSubscribedTopic.get(TOPIC_A)).toEqual([0, 1, 2, 3])
+    expect(group.partitionsPerSubscribedTopic.get(TOPIC_B)).toEqual([0, 1, 2, 3])
+    expect(assignment).toEqual([
+      { topic: TOPIC_A, partitions: [0, 1, 2] },
+      { topic: TOPIC_B, partitions: [2, 3] },
+    ])
+  })
+
+  it('leaves the metadata alone when every assigned partition is known', async () => {
+    const group = createGroup()
+    const warn = jest.spyOn(group.logger, 'warn')
+
+    await group.applyRebalanceResult({ assignment: { [TOPIC_A]: [0, 1] } })
+
+    expect(group.cluster.refreshMetadata).not.toHaveBeenCalled()
+    expect(warn).not.toHaveBeenCalled()
+  })
+})
+
+describe('Consumer > ConsumerGroup > findReadReplicaForPartitions', () => {
+  it('leaves out a partition the cached metadata does not know and keeps the others with their leaders', () => {
+    const group = createGroup()
+    group.cluster.findTopicPartitionMetadata = () => [
+      { partitionId: 0, leader: 1 },
+      { partitionId: 1, leader: 2 },
+    ]
+
+    expect(group.findReadReplicaForPartitions(TOPIC_A, ['0', 7, 1])).toEqual({ 1: [0], 2: [1] })
+    expect(group.findReadReplicaForPartitions(TOPIC_A, [7])).toEqual({})
   })
 })
 

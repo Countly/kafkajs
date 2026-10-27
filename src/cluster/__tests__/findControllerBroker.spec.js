@@ -26,6 +26,15 @@ describe('Cluster > findControllerBroker', () => {
     await expect(cluster.findControllerBroker()).rejects.toThrow(KafkaJSMetadataNotLoaded)
   })
 
+  test('throws KafkaJSBrokerNotFound naming the controller when the broker table has no such broker', async () => {
+    cluster.findBroker.mockResolvedValueOnce(undefined)
+
+    const error = await cluster.findControllerBroker().catch((thrown) => thrown)
+
+    expect(error).toBeInstanceOf(KafkaJSBrokerNotFound)
+    expect(error.message).toBe('Controller broker with id 0 not found in the cached metadata')
+  })
+
   test('throws KafkaJSBrokerNotFound if the node is not in the cache', async () => {
     cluster.findBroker.mockImplementationOnce(() => {
       throw new KafkaJSBrokerNotFound('not found')
