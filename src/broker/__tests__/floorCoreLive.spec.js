@@ -3,7 +3,13 @@ const { requests } = require('../../protocol/requests')
 const apiKeys = require('../../protocol/requests/apiKeys')
 const COORDINATOR_TYPES = require('../../protocol/coordinatorTypes')
 const ISOLATION_LEVEL = require('../../protocol/isolationLevel')
-const { Kafka, logLevel, PartitionAssigners } = require('../../../index')
+const { Kafka, CompressionTypes, logLevel, PartitionAssigners } = require('../../../index')
+const { lookupCodec } = require('../../protocol/message/compression')
+const { KafkaJSNotImplemented } = require('../../errors')
+const {
+  decodeField,
+  recordsField,
+} = require('../../protocol/message/compression/fixtures/compressedBatch')
 const brokerRanges = require('../../../scripts/protocol/brokerRanges.json')
 const { rangeOf } = require('../../../scripts/e2e/apiVersionsProbe')
 const { readLog, endOffsets, committedRecords } = require('../../../testHelpers/rawLog')
@@ -19,6 +25,10 @@ const {
   wireVersionsOf,
 } = require('testHelpers')
 const { problemsOf } = require('../../../scripts/evidence/verify')
+const { lanes } = require('../../../testHelpers/lane')
+const { createScriptedCluster, producerScript } = require('../../../testHelpers/scriptedCluster')
+const { TOPIC } = require('../../consumer/__tests__/fixtures/fetchHarness')
+const { WireTap, scanBatches } = require('../../producer/__tests__/fixtures/liveWire')
 const { CALLS, LIMIT, overload } = require('../../network/__tests__/fixtures/inFlightOverload')
 const {
   NAMES,
@@ -47,6 +57,8 @@ const {
  * rebalance; handler delivery, at least once after the last commit.
  */
 const describeFloor = process.env.FLOOR_CORE_E2E === '1' ? describe : describe.skip
+// Fault-free cases also run on the fake lane, which a bare `jest` run is; the floor run is `docker`.
+const describeFakeLane = lanes().includes('fake') ? describe : describe.skip
 
 const EVIDENCE = 'floor-core'
 // The lines earlier runs left behind, so the last case judges only this run's.
@@ -87,6 +99,10 @@ const WAIT_BUDGET = { attempts: 240, delay: 250 } // 60 s
 const QUIET_MS = 1500
 const CASE_BUDGET_MS = 90000
 const DISCONNECT_BUDGET_MS = 15000
+const CODEC_CASE_BUDGET_MS = 180000 // five arms of setup, send, read and cleanup
+const CODEC_DELIVERY_MS = 30000
+const CODEC_READ = { maxWaitTime: 100, maxIdleFetches: 100 } // at most 10 s without progress
+const CODEC_FAKE_BUDGET_MS = 30000
 
 /**
  * The version a negotiation should pick: the highest implemented version inside the broker's
@@ -120,6 +136,136 @@ const transactionVersionOf = (features, epoch) =>
 const TRANSACTION_CAPS = {
   1: { Produce: 11, EndTxn: 4, TxnOffsetCommit: 4 },
   2: { Produce: 12, EndTxn: 5, TxnOffsetCommit: 5 },
+}
+
+/**
+ * The codecs of the round trip, by compression type. `None` is the control, run but not counted;
+ * the other four are the cells the case must record.
+ */
+const CODECS = [
+  { name: 'None', id: CompressionTypes.None, control: true },
+  { name: 'GZIP', id: CompressionTypes.GZIP },
+  { name: 'Snappy', id: CompressionTypes.Snappy },
+  { name: 'LZ4', id: CompressionTypes.LZ4 },
+  { name: 'ZSTD', id: CompressionTypes.ZSTD },
+]
+
+/**
+ * What every arm sends to partition 0. Replay sets: durable log, each arm's two records exactly
+ * once; committed offsets, none; handler delivery, none.
+ */
+const CODEC_RECORDS = [
+  { key: 'one', value: 'a' },
+  { key: 'two', value: 'b' },
+]
+
+/** @param {Buffer|null} bytes @returns {string|null} the bytes in hex, so an equal pair is byte for byte */
+const hex = (bytes) => bytes?.toString('hex') ?? null
+
+const EXPECTED_PAIRS = CODEC_RECORDS.map(({ key, value }) => [
+  hex(Buffer.from(key)),
+  hex(Buffer.from(value)),
+])
+
+/**
+ * @param {number} id a compression type
+ * @returns {boolean} whether the client can encode and decode it here
+ * @throws {Error} whatever a codec lookup throws other than "this codec is not available"
+ */
+const isInstalled = (id) => {
+  try {
+    lookupCodec(id)
+    return true
+  } catch (error) {
+    if (error instanceof KafkaJSNotImplemented) return false
+    throw error
+  }
+}
+
+/**
+ * The compressed codecs this run cannot exercise. Each is an unmet cell of the four-codec case,
+ * which fails on it instead of passing with fewer codecs.
+ * @param {(id: number) => boolean} [installed] whether a codec is usable; replaced by a test
+ * @returns {string[]} their names, in table order
+ */
+const unmetCodecs = (installed = isInstalled) =>
+  CODECS.filter(({ control, id }) => !control && !installed(id)).map(({ name }) => name)
+
+/**
+ * One codec's result, the same in both lanes.
+ * @param {{ name: string, id: number, control?: boolean }} codec
+ * @param {Array<{ codec: number, producerId: string }>} batches the batches that hold the records,
+ *   as the wire carried them
+ * @param {Array<{ key: Buffer|null, value: Buffer|null }>} records what a fault-free read of
+ *   partition 0 returned
+ * @returns {{ codec: string, id: number, control: boolean, stored: number[], idempotent: boolean,
+ *   pairs: Array<[string|null, string|null]> }}
+ */
+const armOf = (codec, batches, records) => ({
+  codec: codec.name,
+  id: codec.id,
+  control: Boolean(codec.control),
+  stored: batches.map(({ codec: id }) => id),
+  idempotent: batches.length > 0 && batches.every(({ producerId }) => producerId !== '-1'),
+  pairs: records.map(({ key, value }) => [hex(key), hex(value)]),
+})
+
+/**
+ * Runs `arm` once for each installed codec, one after another, in table order.
+ * @param {(codec: object) => Promise<object>} arm
+ * @returns {Promise<{ arms: object[], unmet: string[] }>} each arm's result, and the unmet cells
+ */
+const roundTrip = async (arm) => {
+  const unmet = unmetCodecs()
+  const arms = []
+  for (const codec of CODECS.filter(({ name }) => !unmet.includes(name))) {
+    arms.push(await arm(codec))
+  }
+  return { arms, unmet }
+}
+
+/**
+ * The case's verdict: no unmet cell, and in every arm the records are in one batch of the arm's
+ * own codec, written by an idempotent producer, and read back once in order, byte for byte.
+ * @param {object[]} arms
+ * @param {string[]} unmet
+ * @returns {void}
+ * @throws {Error} the failed expectation
+ */
+const expectRoundTrip = (arms, unmet) => {
+  expect(unmet).toEqual([])
+  for (const arm of arms) {
+    expect(arm).toMatchObject({ stored: [arm.id], idempotent: true, pairs: EXPECTED_PAIRS })
+  }
+}
+
+/**
+ * The fake lane's arm: a real idempotent producer sends to a scripted cluster, the batches it wrote
+ * are found on the wire, and the fetch path's own decoder reads them back.
+ * @param {{ name: string, id: number, control?: boolean }} codec
+ * @returns {Promise<object>} the arm's result
+ */
+const fakeArm = async (codec) => {
+  const cluster = producerScript(
+    createScriptedCluster({ nodes: [{ id: 0, host: 'node0', port: 9092 }] }),
+    { topic: TOPIC }
+  )
+  const producer = new Kafka(cluster.kafkaOptions()).producer({ idempotent: true, linger: 0 })
+  try {
+    await producer.connect()
+    await producer.send({
+      topic: TOPIC,
+      acks: -1,
+      compression: codec.id,
+      messages: CODEC_RECORDS.map((record) => ({ partition: 0, ...record })),
+    })
+  } finally {
+    await producer.disconnect()
+  }
+  cluster.assertClean()
+  const batches = scanBatches(Buffer.concat(cluster.sockets().flatMap(({ writes }) => writes)))
+  const { messages } = await decodeField(recordsField(...batches.map(({ bytes }) => bytes)))
+  return armOf(codec, batches, messages)
 }
 
 describe('Floor core expectations', () => {
@@ -176,6 +322,56 @@ describe('Floor core expectations', () => {
     expect(transactionVersionOf(level(1), 3)).toBe(1)
     expect(transactionVersionOf({}, 3)).toBe(1)
   })
+
+  test('a compressed codec that is not installed is an unmet cell, never a pass', () => {
+    const gzip = {
+      codec: 'GZIP',
+      id: CompressionTypes.GZIP,
+      stored: [CompressionTypes.GZIP],
+      idempotent: true,
+      pairs: EXPECTED_PAIRS,
+    }
+
+    expect(unmetCodecs(() => true)).toEqual([])
+    expect(unmetCodecs((id) => id !== CompressionTypes.LZ4)).toEqual(['LZ4'])
+    expect(unmetCodecs((id) => id === CompressionTypes.None)).toEqual([
+      'GZIP',
+      'Snappy',
+      'LZ4',
+      'ZSTD',
+    ])
+    expect(() => expectRoundTrip([gzip], [])).not.toThrow()
+    expect(() => expectRoundTrip([gzip], ['LZ4'])).toThrow()
+  })
+
+  test('a codec arm fails on another batch codec, a lost idempotence or a changed pair', () => {
+    const arm = {
+      codec: 'ZSTD',
+      id: CompressionTypes.ZSTD,
+      stored: [CompressionTypes.ZSTD],
+      idempotent: true,
+      pairs: EXPECTED_PAIRS,
+    }
+
+    expect(() => expectRoundTrip([{ ...arm, stored: [CompressionTypes.None] }], [])).toThrow()
+    expect(() => expectRoundTrip([{ ...arm, idempotent: false }], [])).toThrow()
+    expect(() => expectRoundTrip([{ ...arm, pairs: [...EXPECTED_PAIRS].reverse() }], [])).toThrow()
+    expect(() =>
+      expectRoundTrip([{ ...arm, pairs: [...EXPECTED_PAIRS, ...EXPECTED_PAIRS] }], [])
+    ).toThrow()
+  })
+})
+
+describeFakeLane('Floor core codec round trip (fake lane)', () => {
+  test(
+    'round trips every installed built-in codec without faults',
+    async () => {
+      const { arms, unmet } = await roundTrip(fakeArm)
+
+      expectRoundTrip(arms, unmet)
+    },
+    CODEC_FAKE_BUDGET_MS
+  )
 })
 
 describeFloor('Kafka floor core (live)', () => {
@@ -663,6 +859,48 @@ describeFloor('Kafka floor core (live)', () => {
       }
     )
   })
+
+  test(
+    'round trips every installed built-in codec without faults',
+    async () => {
+      const sent = []
+      const { arms, unmet } = await roundTrip(async (codec) => {
+        const topic = await freshTopic(`codec-${codec.name.toLowerCase()}`, { partitions: 2 })
+        const producer = await connected(
+          kafka.producer({ idempotent: true, deliveryTimeout: CODEC_DELIVERY_MS })
+        )
+        producer.on(producer.events.REQUEST, ({ payload }) => sent.push(payload))
+        await producer.send({
+          topic,
+          acks: -1,
+          compression: codec.id,
+          messages: CODEC_RECORDS.map((record) => ({ partition: 0, ...record })),
+        })
+        await withTimeout(
+          producer.disconnect().catch(() => {}),
+          DISCONNECT_BUDGET_MS
+        )
+        const tap = new WireTap()
+        const log = await readLog({
+          brokers: plainTextBrokers(),
+          topic,
+          open: tap.open,
+          ...CODEC_READ,
+        })
+        return armOf(codec, tap.batches(), log.get(0).records)
+      })
+      writeEvidence(EVIDENCE, {
+        case: 'F09',
+        required: CODECS.filter(({ control }) => !control).map(({ name }) => name),
+        unmet,
+        arms,
+        wireVersions: wireVersionsOf(sent),
+      })
+
+      expectRoundTrip(arms, unmet)
+    },
+    CODEC_CASE_BUDGET_MS
+  )
 
   test('every evidence line of this run carries the stamps a verifier checks', () => {
     const lines = evidenceLines(EVIDENCE).slice(linesBefore)
