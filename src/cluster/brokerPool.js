@@ -149,7 +149,11 @@ module.exports = class BrokerPool {
     /** A successful metadata response since the last rebootstrap arms triggers (a) and (c). */
     this.rebootstrapArmed = false
 
-    this[PRIVATE.REBOOTSTRAP] = sharedPromiseTo(async (reason) => {
+    // A producer lifecycle's rebootstrap shares nothing with another's: each is scoped by its fence.
+    const fenceOf = (_reason, { fence } = {}) => fence
+
+    this[PRIVATE.REBOOTSTRAP] = sharedPromiseTo(async (reason, { fence } = {}) => {
+      fence?.check()
       const brokers = new Set([this.seedBroker, ...values(this.brokers)])
       this.metadata = null
       this.metadataExpireAt = null
@@ -160,11 +164,12 @@ module.exports = class BrokerPool {
       // concurrent reader - `connect()`'s retry callback, `hasConnectedBrokers()` - landing in
       // this window must never find it unset.
       try {
-        await this.createSeedBroker()
+        await this.createSeedBroker({ fence })
       } finally {
         for (const broker of brokers) this.closeObsolete(broker)
       }
 
+      fence?.check()
       this.lastRebootstrapAt = Date.now()
       // Both clocks reset, and they are reset for different reasons. `metadataUnavailableSince`
       // is trigger (a)'s continuous-failure clock: clearing it means the next failure starts a
@@ -176,7 +181,7 @@ module.exports = class BrokerPool {
 
       this.logger.warn('Rebootstrapping the client from the configured broker list', { reason })
       this.emit(CLUSTER_REBOOTSTRAP, { reason })
-    })
+    }, fenceOf)
   }
 
   /**
@@ -192,7 +197,9 @@ module.exports = class BrokerPool {
    * retired. Aliases are deduplicated and replacements installed during the build survive.
    * Draining proceeds in the background under the configured obsolete-resource bound.
    *
-   * Concurrent callers join one in-flight rebootstrap.
+   * Concurrent callers join one in-flight rebootstrap, except that a producer lifecycle's call
+   * joins only calls of the same lifecycle. Once that lifecycle closed, its rebootstrap tears
+   * nothing down, retires a pool built meanwhile unused, and publishes no clock reset or event.
    *
    * **Re-entrancy invariant**: this is awaited from two places - the whole-body catch in
    * `refreshMetadata`, and `findConnectedBroker()` inside that method's retry callback - which
@@ -204,10 +211,13 @@ module.exports = class BrokerPool {
    * @see https://cwiki.apache.org/confluence/display/KAFKA/KIP-1102%3A+Enable+clients+to+rebootstrap+based+on+timeout+or+error+code
    * @public
    * @param {'timeout'|'required'|'all-brokers-unavailable'} reason
+   * @param {object} [options]
+   * @param {import('../producer/generation')} [options.fence] the producer lifecycle asking
    * @returns {Promise<void>}
+   * @throws {Error} the lifecycle's close error
    */
-  async rebootstrap(reason) {
-    return this[PRIVATE.REBOOTSTRAP](reason)
+  async rebootstrap(reason, { fence } = {}) {
+    return this[PRIVATE.REBOOTSTRAP](reason, { fence })
   }
 
   /**
@@ -745,7 +755,7 @@ module.exports = class BrokerPool {
 
       this.onMetadataSuccess()
     } catch (e) {
-      if (!fence?.closed) await this.onMetadataFailure(e)
+      if (!fence?.closed) await this.onMetadataFailure(e, { fence })
       throw e
     }
   }
@@ -787,9 +797,12 @@ module.exports = class BrokerPool {
    *
    * @private
    * @param {Error} e
+   * @param {object} [options]
+   * @param {import('../producer/generation')} [options.fence] the producer lifecycle whose refresh
+   *   failed, carried into any rebootstrap it starts
    * @returns {Promise<void>}
    */
-  async onMetadataFailure(e) {
+  async onMetadataFailure(e, { fence } = {}) {
     if (this.metadataRecoveryStrategy !== 'rebootstrap') {
       return
     }
@@ -801,7 +814,7 @@ module.exports = class BrokerPool {
     // REBOOTSTRAP event per caller iteration (e.g. per consumer fetch), throttled only by the
     // caller's own retry/backoff.
     if (e.type === 'REBOOTSTRAP_REQUIRED') {
-      await this.rebootstrap('required')
+      await this.rebootstrap('required', { fence })
       return
     }
 
@@ -827,7 +840,7 @@ module.exports = class BrokerPool {
     }
 
     if (now - this.metadataUnavailableSince >= this.metadataRecoveryRebootstrapTriggerMs) {
-      await this.rebootstrap('timeout')
+      await this.rebootstrap('timeout', { fence })
     }
   }
 
@@ -928,7 +941,7 @@ module.exports = class BrokerPool {
    * @public
    * @param {object} [options]
    * @param {import('../producer/generation')} [options.fence] the producer lifecycle asking: once
-   *   it closed, no broker is tried and no socket opens
+   *   it closed, no broker is tried, no socket opens, and a rebootstrap it started installs no pool
    * @returns {Promise<Broker>}
    * @throws {Error} the lifecycle's close error
    */
@@ -967,7 +980,7 @@ module.exports = class BrokerPool {
     // retrier iteration), and at least one failure that was not purely an authentication failure.
     fence?.check()
     if (this.shouldRebootstrapOnAllBrokersUnavailable(nodeIds, allFailuresWereAuthentication)) {
-      await this.rebootstrap('all-brokers-unavailable')
+      await this.rebootstrap('all-brokers-unavailable', { fence })
       fence?.check()
     }
 

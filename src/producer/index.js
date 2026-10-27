@@ -423,6 +423,7 @@ const createProducer = ({
    * @throws {import('../errors').KafkaJSApplicationRecoverableError} once the producer is unusable
    * @throws {import('../errors').KafkaJSNonRetriableError} while the previous transaction's commit
    *   is pending
+   * @throws {Error} the close error when the producer closed while the transaction was beginning
    *
    * @typedef {Object} Transaction
    * @property {Function} send  Identical to the producer "send" method
@@ -434,6 +435,7 @@ const createProducer = ({
    *   while a commit of unknown outcome is pending
    */
   const transaction = async () => {
+    const lifecycle = generation
     if (!transactionalId) {
       throw new KafkaJSNonRetriableError('Must provide transactional id for transactional producer')
     }
@@ -492,6 +494,7 @@ const createProducer = ({
       }
       throw error
     }
+    lifecycle.check()
     throwIfFatal()
 
     const { send: sendTxn, sendBatch: sendBatchTxn } = transactionalMessageProducer
