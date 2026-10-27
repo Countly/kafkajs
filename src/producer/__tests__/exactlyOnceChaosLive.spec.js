@@ -13,6 +13,7 @@ const {
 } = require('./fixtures/liveTransactions')
 const { createLiveSockets } = require('./fixtures/liveWire')
 const { heartbeatInBatch } = require('./fixtures/memberHeartbeat')
+const { recoveryFor } = require('./fixtures/copyRecovery')
 const {
   CASE_JOIN_MS,
   NEVER,
@@ -381,8 +382,10 @@ const accept = (kind, observation) => {
  * One incarnation of a copier slot: a consumer in the shared group and a transactional producer on
  * the slot's stable transactional id. It copies each fetched batch, in transactions of at most
  * `CHUNK` records, to the same partition of the output topic and commits the input offsets in the
- * same transaction, fenced by the consumer's group membership. It stops at the first failure it
- * cannot undo by aborting, which a replacement then recovers from the broker's own state; and a
+ * same transaction, fenced by the consumer's group membership. As in Java's exactly-once loop, a
+ * transaction that could not begin is begun again and one that failed abortably is aborted, both on
+ * the same producer; it stops only at a failure that is fatal to the producer or leaves a commit
+ * unconfirmed (`recoveryFor`), which a replacement then recovers from the broker's own state; and a
  * transaction whose commit outcome is unknown is committed again, never replayed.
  */
 class Copier {
@@ -405,7 +408,10 @@ class Copier {
     /** Aborts when this copier is retired or draining, to end its waits; never a harness scope. */
     this.halted = new AbortController()
     this.failure = null
-    /** @type {{ instance: string, error: object, retries: number, lastRetry: object|null }|null} */
+    /** The call that raised `failure`, for the recovery record. */
+    this.failedStep = null
+    /** @type {{ instance: string, step: string|null, error: object, retries: number,
+     *   lastRetry: object|null }|null} */
     this.recovery = null
     this.seen = new Set()
     this.working = Promise.resolve()
@@ -480,7 +486,7 @@ class Copier {
     }
     consumer.on(consumer.events.CRASH, ({ payload }) => {
       scenario.members.push({ instance: this.id, kind: 'CRASH', at: Date.now() })
-      if (!payload.restart) this.failure ??= payload.error
+      if (!payload.restart) this.fail(payload.error, 'consumer')
     })
     this.consumer = consumer
     await bounded(signal, STEP_MS, () => consumer.connect(), { label: 'The consumer connect' })
@@ -566,15 +572,30 @@ class Copier {
       this.seen.add(partition)
       return true
     } catch (error) {
-      this.failure ??= error
+      this.fail(error, 'noteStart')
       return false
     }
   }
 
   /**
-   * Copies one chunk in one transaction and commits it. The transaction is aborted when that is
-   * safe (an abortable error); any other failure, and a commit whose outcome stays unknown, stops
-   * this copier, because nothing says whether the chunk was committed.
+   * Stops this copier on `error`, which a replacement recovers from. The first failure is the one
+   * kept, with the call that raised it.
+   * @param {Error} error
+   * @param {string} step the call that raised it, named in the recovery record
+   * @returns {void}
+   */
+  fail(error, step) {
+    if (this.failure) return
+    this.failure = error
+    this.failedStep = step
+  }
+
+  /**
+   * Copies one chunk in one transaction and commits it, and answers a failure as `recoveryFor`
+   * says: a transaction that could not begin (the coordinator lookup `transaction()` makes met a
+   * reset connection) is begun again by the next fetch on the same producer, and an abortable
+   * error is aborted, the chunk repeated either way. Any other failure, and a commit whose outcome
+   * stays unknown, stops this copier, because nothing says whether the chunk was committed.
    * @param {number} partition
    * @param {Array<{ offset: string, value: Buffer }>} chunk
    * @returns {Promise<boolean>} whether the chunk committed
@@ -594,13 +615,16 @@ class Copier {
     }
     scenario.chunks.push(entry)
     let transaction = null
+    let step = 'transaction'
     try {
       transaction = await this.producer.transaction()
+      step = 'send'
       await transaction.send({
         topic: scenario.output,
         acks: -1,
         messages: chunk.map(({ value }) => ({ partition, value })),
       })
+      step = 'sendOffsets'
       await transaction.sendOffsets({
         consumerGroupMetadata: this.consumer.groupMetadata(),
         topics: [
@@ -611,13 +635,20 @@ class Copier {
         ],
       })
       entry.commitStartedAt = Date.now()
+      step = 'commit'
       await this.commit(transaction)
       entry.committedAt = Date.now()
       entry.outcome = 'committed'
       return true
     } catch (error) {
       entry.error = describeError(error)
-      if (transaction !== null && error.category === 'abortable') {
+      entry.step = step
+      const recovery = recoveryFor(error, { begun: transaction !== null })
+      if (recovery === 'retry') {
+        entry.outcome = 'not-begun'
+        return false
+      }
+      if (recovery === 'abort') {
         try {
           await transaction.abort()
           entry.outcome = 'aborted'
@@ -626,7 +657,7 @@ class Copier {
           entry.error = describeError(abortError)
         }
       }
-      this.failure ??= error
+      this.fail(error, step)
       return false
     }
   }
@@ -1023,7 +1054,7 @@ class CopierScenario {
       await next.startConsumer(signal)
     } catch (error) {
       if (this.copiers[slot] === next) {
-        next.failure ??= error
+        next.fail(error, 'replace')
       } else {
         next.retire()
         this.leaving.push(
@@ -1047,6 +1078,7 @@ class CopierScenario {
       if (!copier.recovery) {
         copier.recovery = {
           instance: copier.id,
+          step: copier.failedStep,
           error: describeError(copier.failure),
           retries: 0,
           lastRetry: null,
@@ -1493,6 +1525,16 @@ class CopierScenario {
   }
 
   /**
+   * @returns {Record<string, number>} how many chunk attempts ended each way: `committed`,
+   *   `aborted`, `not-begun` (retried on the same producer) or `failed`
+   */
+  chunkOutcomes() {
+    const counts = {}
+    for (const { outcome } of this.chunks) counts[outcome] = (counts[outcome] ?? 0) + 1
+    return counts
+  }
+
+  /**
    * The faults and the copying, the oracle readings, the stale-owner control and the closing
    * probes, each in its own phase of the case's timeline. What each part saw is stamped as it
    * completes.
@@ -1511,6 +1553,7 @@ class CopierScenario {
       replacements: this.replacements,
       plannedReplacementFailures: this.plannedFailures,
       recoveries: this.recoveries,
+      chunkOutcomes: this.chunkOutcomes(),
       outages: this.outages,
       closeFailures: this.closeFailures,
       durationMs: Date.now() - this.startedAt,
