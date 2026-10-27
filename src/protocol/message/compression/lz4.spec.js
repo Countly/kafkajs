@@ -480,6 +480,20 @@ describe('Protocol > Compression > LZ4', () => {
             expect(await widestRun(bad)).toBeLessThanOrEqual(SLICE)
           }
         )
+
+        it.each([
+          ['a terminated literal length', LITERALS, 0],
+          ['an unterminated literal length', LITERALS, 0xff],
+          ['a terminated match length', MATCH, 0],
+          ['an unterminated match length', MATCH, 0xff],
+        ])('%s is refused as above the largest block', async (_, head, last) => {
+          const error = await refused(hostile(head, last), 64 * 1048576)
+
+          expect(error.cause).toMatchObject({
+            name: 'Lz4FrameError',
+            message: 'LZ4 length is above the largest block',
+          })
+        })
       })
     })
 
