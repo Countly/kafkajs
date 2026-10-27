@@ -219,7 +219,9 @@ describeVisibility('Transactional offsets become visible after a confirmed commi
     }, HOOK_BUDGET_MS)
 
     afterEach(async () => {
-      chaos.sockets.forEach((socket) => socket.destroy())
+      chaos.sockets.forEach((socket) =>
+        socket.destroy(Object.assign(new Error('Connection killed'), { code: 'ECONNRESET' }))
+      )
       for (const client of [producer, consumer]) {
         await withTimeout(
           client?.disconnect().catch(() => {}),
