@@ -21,6 +21,7 @@ const {
 } = require('../errors')
 const {
   IN_TRANSACTION,
+  READY,
   ABORTING,
   ABORTABLE_ERROR,
   isArmed,
@@ -423,7 +424,9 @@ const createProducer = ({
    * @throws {import('../errors').KafkaJSApplicationRecoverableError} once the producer is unusable
    * @throws {import('../errors').KafkaJSNonRetriableError} while the previous transaction's commit
    *   is pending
-   * @throws {Error} the close error when the producer closed while the transaction was beginning
+   * @throws {Error} the close error when the producer closed while the transaction was beginning.
+   *   A begin that had reached `IN_TRANSACTION` locally is rolled back to `READY` without EndTxn,
+   *   so a later `transaction()` is not blocked by it
    *
    * @typedef {Object} Transaction
    * @property {Function} send  Identical to the producer "send" method
@@ -493,6 +496,12 @@ const createProducer = ({
         throw ongoingTransactionError()
       }
       throw error
+    }
+    // IN_TRANSACTION has no edge to READY. Begin sent no EndTxn and published no facade,
+    // so step ABORTING then READY before the close error. abort() would write.
+    if (lifecycle.closed && transactionalEosManager.isInTransaction()) {
+      stateManager.transitionTo(ABORTING)
+      stateManager.transitionTo(READY)
     }
     lifecycle.check()
     throwIfFatal()

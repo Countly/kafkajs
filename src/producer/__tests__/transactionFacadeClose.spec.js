@@ -60,6 +60,19 @@ describe('transaction facade after a forced close', () => {
         await closing
         expect(stateAtClose).toBe('IN_TRANSACTION')
         expect(outcome.error?.name).toBe('KafkaJSProducerClosedError')
+        const stateAfterReject = state
+        const endTxnCalls = cluster.broker.endTxn.mock.calls.length
+        await producer.connect()
+        const again = await producer.transaction().then(
+          (transaction) => ({ started: true, transaction }),
+          (error) => ({ started: false, name: error.name, message: error.message })
+        )
+        expect({ stateAfterReject, endTxnCalls, again }).toEqual({
+          stateAfterReject: 'READY',
+          endTxnCalls: 0,
+          again: { started: true, transaction: expect.any(Object) },
+        })
+        if (again.transaction) await again.transaction.abort()
       } finally {
         observation.mockRestore()
         await producer.disconnect({ timeout: 0 })
