@@ -2896,6 +2896,19 @@ describe('Producer > the live scenarios harness', () => {
       expect(source).toMatch(/beforeAll\(async \(\) => \{\n\s+liveRun\.assertClean\(\)/)
     })
 
+    test('the epoch spec reads the transaction version inside its setup phase and keeps no hook outside the case', () => {
+      const source = sourceOf('transactionEpochOverflowLive', '.')
+      const phase = /timeline\.run\(\s*'setup'/.exec(source)
+
+      expect(phase).not.toBeNull()
+      const setup = callAt(source, phase.index + 'timeline.run'.length)
+      const read = setup.indexOf('settledTransactionVersion(')
+      expect(source).not.toMatch(/\b(?:beforeAll|beforeEach|afterAll|afterEach)\(/)
+      expect(source.match(/settledTransactionVersion\(/g)).toHaveLength(1)
+      expect(read).toBeGreaterThan(-1)
+      expect(read).toBeLessThan(setup.indexOf('scenario.start('))
+    })
+
     describe('the transaction restart teardown', () => {
       beforeEach(() => jest.useFakeTimers())
       afterEach(() => jest.useRealTimers())

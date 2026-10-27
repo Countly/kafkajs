@@ -4,14 +4,7 @@ const { errorCodeOf } = require('../../../scripts/e2e/idempotentAuthzProbe')
 const { createTopic, plainTextBrokers, secureRandom, writeEvidence } = require('testHelpers')
 const { settledTransactionVersion } = require('./fixtures/liveTransactions')
 const { createLiveSockets } = require('./fixtures/liveWire')
-const {
-  CASE_JOIN_MS,
-  NEVER,
-  bounded,
-  caseTimeout,
-  liveCase,
-  liveRun,
-} = require('./fixtures/bounded')
+const { bounded, caseTimeout, liveCase } = require('./fixtures/bounded')
 const {
   CleanupStack,
   ProduceLedger,
@@ -33,6 +26,7 @@ const TRANSACTIONS = 32768
 // (`add.partitions.to.txn.retry.backoff.ms`, 20 ms by default): 40 to 54 ms measured per
 // transaction on 4.3.1, so 32768 of them take up to about 1770 s.
 const LOOP_BUDGET_MS = 2100000
+// The setup phase holds the transaction version read too, so no broker I/O runs outside the case.
 const PHASE_BUDGET_MS = Object.freeze({
   setup: 90000,
   loop: LOOP_BUDGET_MS,
@@ -43,7 +37,7 @@ const PHASE_BUDGET_MS = Object.freeze({
 // The phases and the join reserve, and 6 s over, so that the case and the cluster's start end
 // inside the 2700 s of the guarded run.
 const CASE_BUDGET_MS = 2350000
-const HOOK_BUDGET_MS = 60000
+const FEATURE_READ_MS = 15000
 const CREATE_TOPIC_MS = 15000
 const CONNECT_MS = 20000
 // A cold cluster spends up to the retry budget below on the first InitProducerId.
@@ -387,28 +381,14 @@ class EpochScenario {
  * epoch runs out (KIP-890): 32768 committed transactions of one record each, more than one epoch
  * space, with no epoch error reaching the application and every committed record in the log once,
  * in order. The ids the producer used are read from its Produce requests. The closing admission
- * probe then runs on the same producer.
+ * probe then runs on the same producer. The cluster's transaction version is read, and asserted to
+ * be 2, in the case's setup phase, so no broker I/O runs outside the case.
  *
  * Replay sets: the physical log holds the committed ids once and in order; committed offsets and
  * handler deliveries are not part of this scenario.
  * @see https://cwiki.apache.org/confluence/display/KAFKA/KIP-890%3A+Transactions+Server-Side+Defense
  */
 describeEpoch('Producer > transaction epoch overflow (live)', () => {
-  /** @type {{ level: number, epoch: number }} the cluster's finalized transaction version */
-  let cluster
-
-  beforeAll(async () => {
-    liveRun.assertClean()
-    cluster = await bounded(
-      NEVER,
-      HOOK_BUDGET_MS - CASE_JOIN_MS,
-      () => settledTransactionVersion(),
-      {
-        label: 'The setup',
-      }
-    )
-  }, HOOK_BUDGET_MS)
-
   test(
     'renews the producer identity across the transaction epoch boundary',
     liveCase(CASE_BUDGET_MS, async (scope) => {
@@ -422,16 +402,34 @@ describeEpoch('Producer > transaction epoch overflow (live)', () => {
       await cleanup.run(
         async () => {
           const scenario = new EpochScenario({ brokers: plainTextBrokers(), cleanup })
-          writeEvidence(EVIDENCE, {
-            step: 'setup',
-            transactionVersion: cluster.level,
-            topic: scenario.topic,
-            transactions: TRANSACTIONS,
-            loopBudgetMs: LOOP_BUDGET_MS,
-            config: { retry: RETRY, bufferMemory: BUFFER_MEMORY, maxRequestSize: MAX_REQUEST_SIZE },
-          })
-          expect(cluster.level).toBe(2)
-          await timeline.run('setup', (signal) => scenario.start(signal), scope)
+          await timeline.run(
+            'setup',
+            async (signal) => {
+              const cluster = await bounded(
+                signal,
+                FEATURE_READ_MS,
+                () => settledTransactionVersion(),
+                {
+                  label: 'The transaction version read',
+                }
+              )
+              writeEvidence(EVIDENCE, {
+                step: 'setup',
+                transactionVersion: cluster.level,
+                topic: scenario.topic,
+                transactions: TRANSACTIONS,
+                loopBudgetMs: LOOP_BUDGET_MS,
+                config: {
+                  retry: RETRY,
+                  bufferMemory: BUFFER_MEMORY,
+                  maxRequestSize: MAX_REQUEST_SIZE,
+                },
+              })
+              expect(cluster.level).toBe(2)
+              await scenario.start(signal)
+            },
+            scope
+          )
           accept(await scenario.run(timeline, scope))
         },
         { budgetMs: PHASE_BUDGET_MS.cleanup }
