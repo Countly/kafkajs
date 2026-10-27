@@ -4,6 +4,7 @@ const { Kafka } = require('../../../index')
 const {
   KafkaJSApplicationRecoverableError,
   KafkaJSConnectionError,
+  KafkaJSDeliveryTimeout,
   KafkaJSGroupCoordinatorNotFound,
   KafkaJSInvalidConfigurationError,
   KafkaJSNonRetriableError,
@@ -273,11 +274,15 @@ describe('Producer > the copier answers a failed chunk as the Java exactly-once 
       retryCount: 12,
       retryTime: 3000,
     })
+    const deadline = new KafkaJSDeliveryTimeout('gave up', {
+      cause: new KafkaJSConnectionError('lost'),
+    })
 
     it.each([
       ['a lost connection', new KafkaJSConnectionError('lost')],
       ['a request timeout', new KafkaJSRequestTimeoutError('timed out')],
       ['a spent retry budget over a retriable error', retried],
+      ['a delivery deadline over a retriable error', deadline],
       ['a coordinator that was not found', new KafkaJSGroupCoordinatorNotFound('none')],
     ])('begins again on the same producer after %s when nothing was begun', (_name, error) => {
       expect(recoveryFor(error, { begun: false })).toBe('retry')

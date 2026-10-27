@@ -533,8 +533,9 @@ const createEosManager = ({
      * @throws {import('../../errors').KafkaJSNonRetriableError} outside `READY`, or on a producer
      *   that is not transactional
      * @throws {Error} the coordinator lookup's error - `KafkaJSNumberOfRetriesExceeded` once its
-     *   retries ran out - or the re-initialization's; the producer stays `READY` (`FATAL_ERROR`
-     *   when the re-initialization failed fatally)
+     *   retries ran out, or `KafkaJSDeliveryTimeout` once `retry.maxTotalTime` did - or the
+     *   re-initialization's; the producer stays `READY` (`FATAL_ERROR` when the re-initialization
+     *   failed fatally)
      */
     async beginTransaction() {
       const generation = getGeneration()

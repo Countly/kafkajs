@@ -1,17 +1,19 @@
 const {
+  KafkaJSDeliveryTimeout,
   KafkaJSGroupCoordinatorNotFound,
   KafkaJSNumberOfRetriesExceeded,
 } = require('../../../errors')
 
 /**
  * Whether `error` is a failure of the request itself that clears with time: a retriable error, the
- * retriable one a spent retry budget gave up on, or a coordinator lookup that found no broker.
+ * retriable one a spent retry budget or a delivery deadline gave up on, or a coordinator lookup that found no broker.
  * @param {Error} error
  * @returns {boolean}
  */
 const isTransient = (error) =>
   error.retriable === true ||
-  (error instanceof KafkaJSNumberOfRetriesExceeded && error.cause?.retriable === true) ||
+  ((error instanceof KafkaJSNumberOfRetriesExceeded || error instanceof KafkaJSDeliveryTimeout) &&
+    error.cause?.retriable === true) ||
   error instanceof KafkaJSGroupCoordinatorNotFound
 
 /**
