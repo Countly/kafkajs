@@ -8,6 +8,7 @@ const {
   KafkaJSInvalidConfigurationError,
   KafkaJSNonRetriableError,
   KafkaJSNumberOfRetriesExceeded,
+  KafkaJSProducerClosedError,
   KafkaJSRequestTimeoutError,
   KafkaJSTransactionAbortableError,
 } = require('../../errors')
@@ -133,50 +134,107 @@ const askedSince = (cluster, since) =>
 
 describe('Producer > the copier answers a failed chunk as the Java exactly-once loop does', () => {
   describe('a transaction() whose coordinator connection is reset', () => {
-    it('rejects at once with the retriable error, without a retry, and the same producer begins the next one', async () => {
+    /** Makes the next `count` dials to a node fail at the ApiVersions the client opens with. */
+    const resetDials = (cluster, node, count) => {
+      for (let i = 0; i < count; i++) cluster.schedule.once({ api: 'ApiVersions', node }, reset())
+    }
+    const dialsOf = (asked, node) => asked.filter((request) => request === `ApiVersions@${node}`)
+    const initsOf = (cluster) =>
+      cluster
+        .requests()
+        .filter(
+          ({ api, fields }) => api === 'InitProducerId' && fields.transactionalId === 'copier'
+        )
+
+    it.each([1, 3])(
+      'rides %i resets inside the producer: the chunk commits at once, on one InitProducerId',
+      async (count) => {
+        const { cluster, producer } = await rig({ txn: 0 })
+        await loseConnections(cluster, 0)
+        resetDials(cluster, 0, count)
+        const since = cluster.requests().length
+
+        const { transaction, error } = await copyChunk(producer)
+
+        expect(error).toBeNull()
+        expect(transaction).not.toBeNull()
+        expect(dialsOf(askedSince(cluster, since), 0)).toHaveLength(count + 1)
+        expect(initsOf(cluster)).toHaveLength(1)
+        await producer.disconnect()
+      }
+    )
+
+    it('rejects with the spent budget over the retriable error when the resets outlast it, and the copier begins again', async () => {
       const { cluster, producer } = await rig({ txn: 0 })
       await loseConnections(cluster, 0)
-      cluster.schedule.once({ api: 'ApiVersions', node: 0 }, reset())
+      resetDials(cluster, 0, RETRY.retries + 1)
       const since = cluster.requests().length
 
       const failed = await copyChunk(producer)
 
       expect(failed.transaction).toBeNull()
-      expect(failed.error).toBeInstanceOf(KafkaJSConnectionError)
-      expect(failed.error).toMatchObject({
-        code: 'ECONNRESET',
-        retriable: true,
-        category: 'retriable',
-      })
-      expect(failed.error.cause).toBeUndefined()
-      expect(askedSince(cluster, since)).toEqual(['ApiVersions@0'])
+      expect(failed.error).toBeInstanceOf(KafkaJSNumberOfRetriesExceeded)
+      expect(failed.error.cause).toMatchObject({ code: 'ECONNRESET', retriable: true })
+      expect(dialsOf(askedSince(cluster, since), 0)).toHaveLength(RETRY.retries + 1)
       expect(recoveryFor(failed.error, { begun: false })).toBe('retry')
 
       const retried = await copyChunk(producer)
 
       expect(retried.error).toBeNull()
-      expect(
-        cluster
-          .requests()
-          .filter(
-            ({ api, fields }) => api === 'InitProducerId' && fields.transactionalId === 'copier'
-          )
-      ).toHaveLength(1)
+      expect(initsOf(cluster)).toHaveLength(1)
       await producer.disconnect()
     })
 
-    it('is the same for the takeover of a replacement, which the next call completes', async () => {
-      const { cluster, producer } = await rig({ txn: 1, takeover: false })
-      cluster.schedule.once({ api: 'ApiVersions', node: 1 }, reset())
+    it('rejects at once, without a retry, when the cluster refuses the lookup', async () => {
+      const { cluster, producer } = await rig({ txn: 0 })
+      cluster.answer('FindCoordinator', ({ coordinatorKeys }) => ({
+        coordinators: coordinatorKeys.map((key) => ({
+          key,
+          nodeId: -1,
+          host: '',
+          port: -1,
+          errorCode: 53,
+          errorMessage: null,
+        })),
+      }))
       const since = cluster.requests().length
 
       const failed = await copyChunk(producer)
 
-      expect(failed.error).toMatchObject({ code: 'ECONNRESET', retriable: true })
-      expect(askedSince(cluster, since)).toEqual(['FindCoordinator@0', 'ApiVersions@1'])
-
-      expect((await copyChunk(producer)).error).toBeNull()
+      expect(failed.transaction).toBeNull()
+      expect(failed.error).toBeInstanceOf(KafkaJSGroupCoordinatorNotFound)
+      expect(askedSince(cluster, since)).toEqual(['FindCoordinator@0'])
       await producer.disconnect()
+    })
+
+    it('rides a reset on the takeover of a replacement too, on one InitProducerId', async () => {
+      const { cluster, producer } = await rig({ txn: 1, takeover: false })
+      resetDials(cluster, 1, 1)
+      const since = cluster.requests().length
+
+      const { error } = await copyChunk(producer)
+
+      expect(error).toBeNull()
+      expect(dialsOf(askedSince(cluster, since), 1)).toHaveLength(2)
+      expect(initsOf(cluster)).toHaveLength(1)
+      await producer.disconnect()
+    })
+
+    it('stops retrying when the producer is disconnected meanwhile, and asks nothing more', async () => {
+      const { cluster, producer } = await rig({ txn: 0 })
+      await loseConnections(cluster, 0)
+      resetDials(cluster, 0, RETRY.retries + 1)
+
+      const beginning = copyChunk(producer)
+      await new Promise((resolve) => setTimeout(resolve, 12))
+      await producer.disconnect()
+      const { transaction, error } = await beginning
+      const asked = cluster.requests().length
+      await new Promise((resolve) => setTimeout(resolve, 100))
+
+      expect(transaction).toBeNull()
+      expect(error).toBeInstanceOf(KafkaJSProducerClosedError)
+      expect(cluster.requests()).toHaveLength(asked)
     })
   })
 

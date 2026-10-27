@@ -6,11 +6,14 @@ const FencedRetry = require('../../retry/fenced')
 const ProducerStateManager = require('../state')
 const {
   KafkaJSApplicationRecoverableError,
+  KafkaJSConnectionError,
   KafkaJSDeliveryTimeout,
+  KafkaJSGroupCoordinatorNotFound,
   KafkaJSInvalidConfigurationError,
   KafkaJSInvariantViolation,
   KafkaJSNonRetriableError,
   KafkaJSNumberOfRetriesExceeded,
+  KafkaJSProducerClosedError,
   KafkaJSTransactionAbortableError,
 } = require('../../errors')
 const COORDINATOR_TYPES = require('../../protocol/coordinatorTypes')
@@ -1232,5 +1235,188 @@ describe('Initialization whose lifecycle closes after its retry succeeds', () =>
     } finally {
       spy.mockRestore()
     }
+  })
+})
+
+describe('The transaction coordinator lookup of a begin and of InitProducerId', () => {
+  const { createFakeCluster } = require('../__tests__/fixtures/fakeCluster')
+  const RETRY = { retries: 4, initialRetryTime: 1, maxRetryTime: 1, factor: 0 }
+  const reset = () =>
+    new KafkaJSConnectionError('Connection error: read ECONNRESET', { code: 'ECONNRESET' })
+  const settle = () => new Promise((resolve) => setImmediate(resolve))
+  const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
+
+  /**
+   * A transactional manager over the fake cluster, its producer id acquired when `begun` is set,
+   * and its lookups counted from there.
+   * @param {object} [options] manager options laid over the test's
+   * @param {boolean} [options.begun=false] whether to initialize first
+   * @returns {Promise<{ manager: object, cluster: object, broker: object }>}
+   */
+  const build = async ({ begun = false, ...options } = {}) => {
+    const cluster = createFakeCluster()
+    const { broker } = cluster
+    const manager = createEosManager({
+      cluster,
+      logger: newLogger(),
+      transactional: true,
+      transactionalId: 'lookup',
+      retry: RETRY,
+      ...options,
+    })
+    if (begun) await manager.initProducerId()
+    cluster.findGroupCoordinator.mockClear()
+    broker.initProducerId.mockClear()
+    return { manager, cluster, broker }
+  }
+
+  /** @param {object} cluster @param {number} count @param {() => Error} [error] @returns {void} */
+  const failLookups = (cluster, count, error = reset) => {
+    for (let i = 0; i < count; i++) cluster.findGroupCoordinator.mockRejectedValueOnce(error())
+  }
+
+  const ENTRIES = [
+    ['beginTransaction', { begun: true }],
+    ['initProducerId', {}],
+  ]
+
+  describe.each(ENTRIES)('%s', (method, options) => {
+    test.each([1, 4])('rides %i connection resets within the retry budget', async (count) => {
+      const { manager, cluster, broker } = await build(options)
+      failLookups(cluster, count)
+
+      await expect(manager[method]()).resolves.toBeUndefined()
+
+      expect(cluster.findGroupCoordinator).toHaveBeenCalledTimes(count + 1)
+      expect(broker.initProducerId).toHaveBeenCalledTimes(method === 'initProducerId' ? 1 : 0)
+      expect(manager.stateManager.state()).toBe(
+        method === 'initProducerId' ? 'READY' : 'IN_TRANSACTION'
+      )
+    })
+
+    test('asks for the coordinator once when nothing fails', async () => {
+      const { manager, cluster } = await build(options)
+
+      await manager[method]()
+
+      expect(cluster.findGroupCoordinator).toHaveBeenCalledTimes(1)
+    })
+
+    test('rejects with the spent budget over the retriable error when the resets outlast it', async () => {
+      const { manager, cluster, broker } = await build({
+        ...options,
+        retry: { ...RETRY, retries: 2 },
+      })
+      cluster.findGroupCoordinator.mockImplementation(async () => {
+        throw reset()
+      })
+
+      const error = await manager[method]().catch((e) => e)
+
+      expect(error).toBeInstanceOf(KafkaJSNumberOfRetriesExceeded)
+      expect(error.cause).toMatchObject({ code: 'ECONNRESET', retriable: true })
+      expect(cluster.findGroupCoordinator).toHaveBeenCalledTimes(3)
+      expect(broker.initProducerId).not.toHaveBeenCalled()
+      expect(manager.stateManager.state()).toBe(options.begun ? 'READY' : 'UNINITIALIZED')
+    })
+
+    test.each([
+      ['TRANSACTIONAL_ID_AUTHORIZATION_FAILED', () => createErrorFromCode(53)],
+      ['a TypeError', () => new TypeError('boom')],
+      ['a coordinator that was not found', () => new KafkaJSGroupCoordinatorNotFound('none')],
+    ])('rejects at once, as before, on %s', async (_name, make) => {
+      const { manager, cluster, broker } = await build(options)
+      const error = make()
+      cluster.findGroupCoordinator.mockRejectedValueOnce(error)
+
+      await expect(manager[method]()).rejects.toBe(error)
+
+      expect(cluster.findGroupCoordinator).toHaveBeenCalledTimes(1)
+      expect(broker.initProducerId).not.toHaveBeenCalled()
+    })
+
+    test('rejects at once, as it is, on an error that is not retriable after a reset', async () => {
+      const { manager, cluster, broker } = await build(options)
+      const refused = createErrorFromCode(53)
+      cluster.findGroupCoordinator.mockRejectedValueOnce(reset()).mockRejectedValueOnce(refused)
+
+      await expect(manager[method]()).rejects.toBe(refused)
+
+      expect(cluster.findGroupCoordinator).toHaveBeenCalledTimes(2)
+      expect(broker.initProducerId).not.toHaveBeenCalled()
+    })
+
+    test('stops retrying when the producer lifecycle closes meanwhile, and writes nothing late', async () => {
+      const generation = new Generation()
+      const { manager, cluster, broker } = await build({
+        ...options,
+        getGeneration: () => generation,
+        retry: { ...RETRY, retries: 10, initialRetryTime: 40, maxRetryTime: 40 },
+      })
+      cluster.findGroupCoordinator.mockImplementation(async () => {
+        throw reset()
+      })
+
+      const outcome = manager[method]().catch((e) => e)
+      await settle()
+      expect(cluster.findGroupCoordinator).toHaveBeenCalledTimes(1)
+      const closed = new KafkaJSProducerClosedError('The producer was closed', {
+        outcome: 'unknown',
+      })
+      generation.close(closed)
+
+      expect(await outcome).toBe(closed)
+      await sleep(120)
+      expect(cluster.findGroupCoordinator).toHaveBeenCalledTimes(1)
+      expect(broker.initProducerId).not.toHaveBeenCalled()
+      expect(manager.stateManager.state()).toBe(options.begun ? 'READY' : 'UNINITIALIZED')
+    })
+  })
+
+  test('a begin does not outlive a producer made unusable while it retries', async () => {
+    const generation = new Generation()
+    const { manager, cluster } = await build({
+      begun: true,
+      getGeneration: () => generation,
+      retry: { ...RETRY, retries: 10, initialRetryTime: 40, maxRetryTime: 40 },
+    })
+    cluster.findGroupCoordinator.mockImplementation(async () => {
+      throw reset()
+    })
+    const fatal = new KafkaJSApplicationRecoverableError('fenced', {
+      cause: createErrorFromCode(90),
+    })
+
+    const outcome = manager.beginTransaction().catch((e) => e)
+    await settle()
+    manager.stateManager.arm(fatal)
+    generation.close(fatal)
+
+    expect(await outcome).toBe(fatal)
+    await sleep(120)
+    expect(cluster.findGroupCoordinator).toHaveBeenCalledTimes(1)
+    expect(manager.stateManager.state()).toBe('FATAL_ERROR')
+  })
+
+  test('the lookup of an owed epoch bump rides a reset too', async () => {
+    const { manager, cluster, broker } = await build({ begun: true })
+    broker.negotiatedVersion = () => 5
+    broker.initProducerId.mockImplementation(async ({ producerEpoch }) => ({
+      producerId: '1000',
+      producerEpoch: producerEpoch + 1,
+    }))
+    await manager.beginTransaction()
+    broker.initProducerId.mockRejectedValueOnce(createErrorFromCode(7))
+    await manager.abort({ droppedSequences: true })
+    cluster.findGroupCoordinator.mockClear()
+    cluster.findGroupCoordinator
+      .mockResolvedValueOnce(broker)
+      .mockRejectedValueOnce(reset())
+      .mockResolvedValueOnce(broker)
+
+    await expect(manager.beginTransaction()).resolves.toBeUndefined()
+
+    expect(cluster.findGroupCoordinator).toHaveBeenCalledTimes(3)
+    expect(manager.stateManager.state()).toBe('IN_TRANSACTION')
   })
 })

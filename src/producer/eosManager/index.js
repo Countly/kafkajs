@@ -124,7 +124,8 @@ const consumerGroupOf = ({ consumerGroupId, consumerGroupMetadata }) => {
  * @param {string} [options.transactionalId] Required when `transactional` is true.
  * @param {import('../../../types').RetryOptions} [options.retry=cluster.retry] the producer's
  *   retry options for the requests of the transaction protocol: the state manager's on the send
- *   path and this facade's own retries (InitProducerId, EndTxn, AddOffsetsToTxn, TxnOffsetCommit)
+ *   path and this facade's own retries (InitProducerId, EndTxn, AddOffsetsToTxn, TxnOffsetCommit,
+ *   and the transaction coordinator lookup of a begin and of InitProducerId)
  * @param {number} [options.deliveryRetries] how many times a batch is sent again; `retry.retries`
  *   when absent
  * @param {() => (import('../generation')|undefined)} [options.getGeneration] the producer's current
@@ -171,6 +172,56 @@ const createEosManager = ({
     })
   }
 
+  /**
+   * Carries on a transaction coordinator lookup of a begin or an InitProducerId whose first
+   * attempt, made by the caller, failed. A retriable failure, a connection reset in the lookup's
+   * own connect step above all, is retried under the producer's retry settings, as `endTransaction`
+   * retries its lookup; 2.2.4 retried this lookup inside `send()`. The caller makes the first
+   * attempt itself, so a lookup that succeeds allocates nothing for the retrier; that attempt's
+   * failure stands for the retrier's first, and the `maxTotalTime` clock starts here.
+   * @see https://github.com/apache/kafka/blob/4.3.1/clients/src/main/java/org/apache/kafka/clients/producer/internals/TransactionManager.java
+   * @param {Error} failure what the first attempt rejected with
+   * @param {import('../generation')} [generation] the lifecycle the caller captured: its close
+   *   ends the retries
+   * @returns {Promise<import('../../../types').Broker>} the coordinator
+   * @throws {Error} a failure that is not retriable, as it is - the lookup's own spent retries
+   *   and a coordinator that was not found included, so the budgets do not nest; the lifecycle's
+   *   close error once it closed; `KafkaJSNumberOfRetriesExceeded` (`cause`: the last error) or
+   *   `KafkaJSDeliveryTimeout` once this retrier gave up
+   */
+  const retryTransactionCoordinator = async (failure, generation) => {
+    generation?.check()
+    if (!failure.retriable) throw failure
+
+    let failed = failure
+    return retrierFor(generation)(async (bail) => {
+      try {
+        if (failed) throw failed
+        return await findTransactionCoordinator(generation)
+      } catch (e) {
+        failed = null
+        generation?.check()
+        if (e.retriable) throw e
+        bail(e)
+      }
+    })
+  }
+
+  /**
+   * The transaction coordinator for an InitProducerId, its lookup retried as
+   * `retryTransactionCoordinator` does.
+   * @param {import('../generation')} [generation] the lifecycle the caller captured
+   * @returns {Promise<import('../../../types').Broker>} the coordinator
+   * @throws {Error} as `retryTransactionCoordinator` does
+   */
+  const lookUpTransactionCoordinator = async (generation) => {
+    try {
+      return await findTransactionCoordinator(generation)
+    } catch (error) {
+      return retryTransactionCoordinator(error, generation)
+    }
+  }
+
   const stateManager = new ProducerStateManager({
     logger,
     transactional,
@@ -182,7 +233,7 @@ const createEosManager = ({
     // any connected broker, and a transactional one to its coordinator.
     findBroker: (generation) =>
       transactional
-        ? findTransactionCoordinator(generation)
+        ? lookUpTransactionCoordinator(generation)
         : cluster.findConnectedBroker(...(generation ? [{ fence: generation }] : [])),
     addPartitionsToTxn: async (topics, generation) => {
       const broker = await findTransactionCoordinator(generation)
@@ -397,7 +448,10 @@ const createEosManager = ({
      * Initialize the idempotent producer by making an `InitProducerId` request.
      * Overwrites any existing state in this transaction manager. A call made with no producer id
      * held keeps one that another call acquired while it was waiting to retry, instead of
-     * replacing it, as the Java producer shares one InitProducerId between its callers.
+     * replacing it, as the Java producer shares one InitProducerId between its callers. A
+     * transactional producer's lookup of its coordinator is retried while it fails retriably, a
+     * connection reset above all; the request itself is retried only on the codes that clear
+     * by themselves.
      * @see https://github.com/apache/kafka/blob/4.3/clients/src/main/java/org/apache/kafka/clients/producer/internals/TransactionManager.java
      * @returns {Promise<void>}
      * @throws {import('../../errors').KafkaJSInvalidConfigurationError} CLUSTER_AUTHORIZATION_FAILED,
@@ -471,19 +525,28 @@ const createEosManager = ({
      * it finalizes, fixed for this transaction. When that version moved from 1 to 2, or an epoch
      * bump is still owed from an earlier abort, the producer id is re-initialized first (KIP-360);
      * a failure there rejects the call, leaves the producer `READY` and keeps the bump owed for the
-     * next call. A failed lookup rejects the call the same way.
+     * next call. A lookup that fails retriably, a connection reset above all, is retried under the
+     * producer's `retry` settings; one that is not retriable, or whose retries ran out, rejects the
+     * call the same way.
      * @see https://cwiki.apache.org/confluence/display/KAFKA/KIP-890%3A+Transactions+Server-Side+Defense
      * @returns {Promise<void>}
      * @throws {import('../../errors').KafkaJSNonRetriableError} outside `READY`, or on a producer
      *   that is not transactional
-     * @throws {Error} the coordinator lookup's error, or the re-initialization's; the producer
-     *   stays `READY` (`FATAL_ERROR` when the re-initialization failed fatally)
+     * @throws {Error} the coordinator lookup's error - `KafkaJSNumberOfRetriesExceeded` once its
+     *   retries ran out - or the re-initialization's; the producer stays `READY` (`FATAL_ERROR`
+     *   when the re-initialization failed fatally)
      */
     async beginTransaction() {
       const generation = getGeneration()
       stateManager.transaction.guard('beginTransaction')
       transactionalGuard()
-      const coordinator = await findTransactionCoordinator(generation)
+      let coordinator
+      // The first attempt is inline, so a lookup that succeeds costs no wrapper promise.
+      try {
+        coordinator = await findTransactionCoordinator(generation)
+      } catch (error) {
+        coordinator = await retryTransactionCoordinator(error, generation)
+      }
       generation?.check()
       if (stateManager.version.begin(coordinator).bumpRequired) {
         bumpOwed = true
