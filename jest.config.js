@@ -25,17 +25,17 @@ module.exports = {
   // --coverageThreshold '{}' because it covers a strict subset of `src/`.
   // The three path keys below take their files OUT of the global aggregate, so the global numbers
   // are measured over the remaining files.
-  // Re-derived on 2026-10-22 from the 9A exit's cold coverage run on Kafka 4.3.1
-  // (global S 98.68 / B 95.60 / F 98.59 / L 98.73). The global floors keep a few items of slack,
+  // Re-derived on 2026-10-27 from the 9B exit's two cold coverage runs on Kafka 4.3.1, the lower of
+  // the two (global S 98.81 / B 95.90 / F 98.80 / L 98.97). The global floors keep a few items of slack,
   // because the live suite decides some branches by broker timing; the global branch floor keeps
   // ten. A path key whose rounded-down floor would leave no spare item keeps one instead. No floor
   // is lower than before.
   coverageThreshold: {
     global: {
-      statements: 98.6,
-      branches: 95.4,
-      functions: 98.5,
-      lines: 98.7,
+      statements: 98.8,
+      branches: 95.7,
+      functions: 98.7,
+      lines: 98.9,
     },
     // Measured 100.00 / 96.71 / 100.00 / 100.00. The sticky assigner's wide-shape case reaches
     // PartitionMovements' repeat-move bookkeeping; stickyCore.js keeps 7 of its 137 branches
@@ -46,10 +46,10 @@ module.exports = {
       functions: 99.1,
       lines: 99.8,
     },
-    // Measured 99.54 / 96.31 / 100.00 / 99.75.
+    // Measured 99.54 / 96.55 / 100.00 / 99.76.
     './src/consumer/groupProtocol/': {
       statements: 99.4,
-      branches: 96.1,
+      branches: 96.3,
       functions: 100.0,
       lines: 99.6,
     },
