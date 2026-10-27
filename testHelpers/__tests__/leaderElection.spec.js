@@ -54,10 +54,17 @@ const cluster = { admin: 'admin', topics: ['workload'] }
 
 describe('broker bounce helpers', () => {
   describe('the compose commands', () => {
+    const env = { ...process.env }
     let execFileSync
+
+    beforeEach(() => {
+      delete process.env.KAFKAJS_CLUSTER_GUARD
+      delete process.env.KAFKAJS_CLUSTER_MANIFEST
+    })
 
     afterEach(() => {
       jest.dontMock('child_process')
+      process.env = { ...env }
     })
 
     test.each([

@@ -17,6 +17,11 @@ describe('the compose file the test helpers drive', () => {
     return leaderElection
   }
 
+  beforeEach(() => {
+    delete process.env.KAFKAJS_CLUSTER_GUARD
+    delete process.env.KAFKAJS_CLUSTER_MANIFEST
+  })
+
   afterEach(() => {
     jest.dontMock('child_process')
     process.env = { ...env }
