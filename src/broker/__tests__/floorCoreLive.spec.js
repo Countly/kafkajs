@@ -867,7 +867,7 @@ describeFloor('Kafka floor core (live)', () => {
       const { arms, unmet } = await roundTrip(async (codec) => {
         const topic = await freshTopic(`codec-${codec.name.toLowerCase()}`, { partitions: 2 })
         const producer = await connected(
-          kafka.producer({ idempotent: true, deliveryTimeout: CODEC_DELIVERY_MS })
+          kafka.producer({ idempotent: true, linger: 0, deliveryTimeout: CODEC_DELIVERY_MS })
         )
         producer.on(producer.events.REQUEST, ({ payload }) => sent.push(payload))
         await producer.send({
