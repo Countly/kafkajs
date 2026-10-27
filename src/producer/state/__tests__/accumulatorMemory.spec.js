@@ -1,144 +1,66 @@
+const { spawnSync } = require('child_process')
+const path = require('path')
 const Accumulator = require('../accumulator')
 const { Admission } = require('../admission')
-const Cluster = require('../../../cluster')
 const Generation = require('../../generation')
-const { newLogger, connectionOpts } = require('testHelpers')
 const { chargeOf, RequestBudget } = require('../recordSize')
 const {
-  collect,
-  countersOf,
   deferred,
+  countersOf,
   succeeded,
   flushAll,
   quiescent,
   transactionalProducer,
   watch,
 } = require('../../__tests__/fixtures/bufferHarness')
+const {
+  POPULATION_COUNT,
+  TOPIC,
+  drain,
+  fill,
+  pinCluster,
+  populations,
+} = require('./fixtures/retainedStorage')
 
-const TOPIC = 'topic-a'
+const RETAINED_STORAGE = path.join(__dirname, 'fixtures', 'retainedStorage.js')
 
-/** The heap and the backing stores retained once the garbage is collected. */
-const retained = async () => {
-  await collect()
-  const { heapUsed, arrayBuffers } = process.memoryUsage()
-  return heapUsed + arrayBuffers
-}
-
-// Coverage instrumentation allocates inside the retained-memory window; the bounds hold without it.
-const measured = globalThis.__coverage__ ? test.skip : test
-
-/** The shapes of send the bound must hold for: `records(i, shared)` gives the records of send i. */
-const SHAPES = [
-  [
-    'varying records per send',
-    (i) =>
-      Array.from({ length: 1 + (i % 7) }, (_, j) => ({ key: `k${j}`, value: 'v'.repeat(20 + j) })),
-  ],
-  ['one record per partition', (i) => [{ value: `fan-${i}`, partition: i }]],
-  [
-    'many empty header values',
-    () => [
-      {
-        value: '',
-        headers: Object.fromEntries(Array.from({ length: 20 }, (_, j) => [`h${j}`, ''])),
-      },
-    ],
-  ],
-  ['independent 16 KiB slabs', (i) => [{ value: Buffer.alloc(16384, i % 256) }]],
-  [
-    'Buffer-valued headers and a shared store',
-    (i, shared) => [
-      {
-        value: shared.subarray((i % 64) * 16, (i % 64) * 16 + 16),
-        headers: { a: Buffer.alloc(32), b: [Buffer.alloc(8), shared.subarray(1000, 1008)] },
-      },
-    ],
-  ],
-]
+/** Well under the 90 s a test may take, so a measurement that hangs fails with its own message. */
+const MEASUREMENT_TIMEOUT_MS = 45000
 
 /**
- * An accumulator over a buffer whose send path never answers: every batch it is handed is kept in
- * `batches` until `drain()` settles and retires it. `pinner`, when given, pins the sends' topics;
- * `getGeneration`, when given, is the producer lifecycle each send checks.
+ * Measures a scenario's retained storage in a plain Node process, because Jest's own heap carries
+ * the coverage counters and the async-hook bookkeeping of `--detectOpenHandles`.
+ * @param {'held'|'pinned'|'tracked'} scenario
+ * @returns {{ shape: string, capacity: number, measured: number, counted: number }[]} one sample
+ *   per population, in bytes
+ * @throws {Error} naming the cause when the process fails, times out or prints anything but JSON
  */
-const holding = (capacity, pinner, getGeneration) => {
-  const admission = new Admission({ capacity, maxBlockMs: 60000 })
-  const batches = []
-  const accumulator = new Accumulator({
-    linger: 0,
-    batchSize: 16384,
-    admission,
-    partition: async (send) =>
-      send.records.flatMap(({ topic, messages }) =>
-        messages.map((message) => ({
-          topic,
-          partition: message.partition ?? 0,
-          messages: [message],
-        }))
-      ),
-    sendPartitioned: async ({ batches: handed }) => {
-      batches.push(...handed)
-    },
-    pinner,
-    getGeneration,
+const measuredInChild = (scenario) => {
+  const run = spawnSync(process.execPath, [RETAINED_STORAGE, scenario], {
+    encoding: 'utf8',
+    timeout: MEASUREMENT_TIMEOUT_MS,
+    killSignal: 'SIGKILL',
+    env: { ...process.env, NODE_OPTIONS: undefined, NODE_V8_COVERAGE: undefined },
   })
-  return { accumulator, admission, batches }
+  if (run.error || run.status !== 0) {
+    const cause = run.error?.code ?? `exit ${run.status ?? run.signal}`
+    throw new Error(`the ${scenario} measurement did not complete (${cause}): ${run.stderr}`)
+  }
+  try {
+    return JSON.parse(run.stdout)
+  } catch {
+    throw new Error(`the ${scenario} measurement printed non-JSON: ${run.stdout.slice(0, 200)}`)
+  }
 }
 
 /**
- * Sends a shape's sends, all in one turn, until the buffer refuses one as queue-full, and lets
- * their joins run.
- * @returns {Promise<object>} the population: its buffer, its batches, its sends' outcomes, and the
- *   counters when the first send had to wait
+ * Asserts that no population retained more than what it is charged, over 0.9.
+ * @param {{ shape: string, capacity: number, measured: number, counted: number }[]} samples
  */
-const fill = async (capacity, records, pinner, getGeneration) => {
-  const population = holding(capacity, pinner, getGeneration)
-  const { accumulator, admission } = population
-  let shared = Buffer.alloc(1024)
-  const sends = []
-  let wave = null
-  for (let i = 0; ; i += 1) {
-    const mark = admission.reserved + admission.waitingBytes
-    sends.push(
-      accumulator
-        .append({ acks: -1, topicMessages: [{ topic: TOPIC, messages: records(i, shared) }] })
-        .catch((error) => error)
-    )
-    if (admission.reserved + admission.waitingBytes === mark) break
-    if (admission.waitingBytes > 0 && wave === null) wave = countersOf(admission)
-  }
-  shared = null
-  await flushAll()
-  return { ...population, sends, wave }
-}
-
-/**
- * Answers and retires every batch of a population, the waiting sends' included once they are
- * admitted, until none is left.
- * @returns {Promise<object[]>} the outcome of every send
- */
-const drain = async ({ batches, sends }) => {
-  for (let round = 0; round < 1000; round += 1) {
-    await flushAll()
-    if (batches.length === 0) break
-    for (const batch of batches.splice(0)) {
-      batch.settlers.forEach((settler) =>
-        settler.resolve({ topicName: TOPIC, partition: batch.partition, baseOffset: '0' })
-      )
-      batch.retire?.()
-    }
-  }
-  return Promise.all(sends)
-}
-
-/** Each capacity with each shape, after one unmeasured population that also compiles the path. */
-const populations = async (each) => {
-  await drain(await fill(1048576, SHAPES[0][1]))
-  for (const capacity of [1048576, 4194304]) {
-    for (const [, records] of SHAPES) {
-      await each(capacity, records)
-    }
-  }
+const expectWithinCharge = (samples) => {
+  expect(samples).toHaveLength(POPULATION_COUNT)
+  samples.forEach(({ counted }) => expect(counted).toBeGreaterThan(0))
+  expect(samples.filter(({ measured, counted }) => measured > counted / 0.9)).toEqual([])
 }
 
 describe('Producer > the buffer > the bound on held records', () => {
@@ -224,83 +146,47 @@ describe('Producer > the buffer > the bound on held records', () => {
     expect(countersOf(admission)).toEqual(quiescent(admission))
   })
 
-  measured(
-    'the storage the held records retain is within what they are charged, over 0.9',
-    async () => {
-      await populations(async (capacity, records) => {
-        const before = await retained()
-        const population = await fill(capacity, records)
-        const { admission } = population
-        try {
-          const after = await retained()
-          const counted = admission.reserved + admission.waitingBytes + admission.debts
-          expect(after - before).toBeLessThanOrEqual(counted / 0.9)
-        } finally {
-          await drain(population)
-        }
-      })
-    }
-  )
+  test('the storage the held records retain is within what they are charged, over 0.9', () => {
+    expectWithinCharge(measuredInChild('held'))
+  })
 
-  measured(
-    'pinned on the producer cluster, the storage the held records retain is within what they are charged, over 0.9, and the pins end with the charge',
-    async () => {
-      const cluster = new Cluster({
-        ...connectionOpts(),
-        logger: newLogger(),
-        metadataMaxIdle: 300000,
-        retry: { retries: 0 },
-      })
-      await populations(async (capacity, records) => {
-        const before = await retained()
-        const population = await fill(capacity, records, cluster)
-        const { admission, sends } = population
-        try {
-          const after = await retained()
-          const counted = admission.reserved + admission.waitingBytes + admission.debts
-          expect(after - before).toBeLessThanOrEqual(counted / 0.9)
-          // every send but the refused last one pins its topic while it is charged
-          expect(cluster.topicPins.get(TOPIC)).toBe(sends.length - 1)
-        } finally {
-          await drain(population)
-        }
-        expect(cluster.topicPins.size).toBe(0)
-        expect(countersOf(admission)).toEqual(quiescent(admission))
-      })
-    }
-  )
+  test('pinned on the producer cluster, the storage the held records retain is within what they are charged, over 0.9, and the pins end with the charge', async () => {
+    expectWithinCharge(measuredInChild('pinned'))
+    const cluster = pinCluster()
+    await populations(async (capacity, records) => {
+      const population = await fill(capacity, records, cluster)
+      const { admission, sends } = population
+      try {
+        // every send but the refused last one pins its topic while it is charged
+        expect(cluster.topicPins.get(TOPIC)).toBe(sends.length - 1)
+      } finally {
+        await drain(population)
+      }
+      expect(cluster.topicPins.size).toBe(0)
+      expect(countersOf(admission)).toEqual(quiescent(admission))
+    })
+  })
 
-  measured(
-    'tracked for a flush whose snapshot stays open, the storage the held records retain is within what they are charged, over 0.9, and the inventory empties with the sends',
-    async () => {
-      const cluster = new Cluster({
-        ...connectionOpts(),
-        logger: newLogger(),
-        metadataMaxIdle: 300000,
-        retry: { retries: 0 },
-      })
-      const generation = new Generation()
-      await populations(async (capacity, records) => {
-        const before = await retained()
-        const population = await fill(capacity, records, cluster, () => generation)
-        const { accumulator, admission } = population
-        const flushed = watch(accumulator.unsettled()[0])
-        try {
-          const after = await retained()
-          const counted = admission.reserved + admission.waitingBytes + admission.debts
-          expect(after - before).toBeLessThanOrEqual(counted / 0.9)
-          expect(flushed.state).toBe('pending')
-        } finally {
-          await drain(population)
-        }
-        await flushAll()
-        expect(flushed.state).toBe('fulfilled')
-        expect(accumulator.unsettled()).toEqual([])
-        expect(cluster.topicPins.size).toBe(0)
-        expect(countersOf(admission)).toEqual(quiescent(admission))
-      })
-    }
-  )
+  test('tracked for a flush whose snapshot stays open, the storage the held records retain is within what they are charged, over 0.9, and the inventory empties with the sends', async () => {
+    expectWithinCharge(measuredInChild('tracked'))
+    const cluster = pinCluster()
+    const generation = new Generation()
+    await populations(async (capacity, records) => {
+      const population = await fill(capacity, records, cluster, () => generation)
+      const { accumulator, admission } = population
+      const flushed = watch(accumulator.unsettled()[0])
+      try {
+        expect(flushed.state).toBe('pending')
+      } finally {
+        await drain(population)
+      }
+      await flushAll()
+      expect(flushed.state).toBe('fulfilled')
+      expect(accumulator.unsettled()).toEqual([])
+      expect(cluster.topicPins.size).toBe(0)
+      expect(countersOf(admission)).toEqual(quiescent(admission))
+    })
+  })
 
   test('one buffer serves the producer and its transactions', async () => {
     const charge = (value) =>
