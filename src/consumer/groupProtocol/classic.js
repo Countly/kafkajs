@@ -259,6 +259,8 @@ module.exports = class ClassicGroupProtocol {
    *
    * @param {{ topicsSubscribed: string[] }} context
    * @returns {Promise<void>}
+   * @throws {KafkaJSNonRetriableError} for a session timeout refused by the broker, naming
+   *   the client option and broker settings; other failures retain their original identity.
    */
   async join({ topicsSubscribed }) {
     const { groupId, sessionTimeout, rebalanceTimeout, groupInstanceId } = this
@@ -294,6 +296,13 @@ module.exports = class ClassicGroupProtocol {
           this.subscriptionFor(assigner, topicsSubscribed)
         ),
       })
+    } catch (error) {
+      if (error.type === 'INVALID_SESSION_TIMEOUT' && error.code === 26) {
+        const refusal = new KafkaJSNonRetriableError(error, { cause: error })
+        refusal.message = `Consumer sessionTimeout (${sessionTimeout}) was refused by the broker; check the broker settings group.min.session.timeout.ms and group.max.session.timeout.ms.`
+        throw refusal
+      }
+      throw error
     } finally {
       // In the `finally`, so a join that threw, bailed or is about to be retried heartbeats
       // through its own backoff - which is precisely the window that needs them.

@@ -298,6 +298,8 @@ new Kafka({
 
 Time in milliseconds to wait for a successful request. The default value is: `30000`.
 
+Consumer group liveness uses separate options. The classic `sessionTimeout` defaults to 45000 ms and must be an integer from 1 to 2147483647; `heartbeatInterval` defaults to 3000 ms and must be a positive integer below the session. The consumer protocol keeps broker-controlled liveness and rejects explicit classic timeout options. See the [consumer options](Consuming.md#options) for the warning, broker bounds, kept defaults and the explicit 30000 ms compatibility setting.
+
 ```javascript
 new Kafka({
   clientId: 'my-app',

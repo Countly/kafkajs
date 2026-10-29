@@ -9,9 +9,13 @@ Versions before 3.0.0 are internal alpha tags and are not published.
 
 #### Behavior changes
 
+- **The classic `sessionTimeout` defaults to 45 000 ms** (was 30 000). `sessionTimeout` and `heartbeatInterval` are now validated: integers, `sessionTimeout` 1 to 2 147 483 647, `heartbeatInterval` lower than it; a JoinGroup the broker refuses as outside its session-timeout bounds fails with an actionable error
+
 #### Fixes
 
 #### Additions
+
+- Pin the kept consumer defaults: classic groups with round-robin assignment, a 5 000 ms Fetch wait, a 10 MiB response target and committed transactional reads; document their limits and existing configuration escapes.
 
 #### Tooling
 

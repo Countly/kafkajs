@@ -145,7 +145,7 @@ const parseDisconnectOptions = (options) => {
  * @param {import('../../types').RetryOptions} [params.retry]
  * @param {import('../../types').Logger} params.logger
  * @param {import('../../types').PartitionAssigner[]} [params.partitionAssigners]
- * @param {number} [params.sessionTimeout]
+ * @param {number} [params.sessionTimeout=45000] Integer from 1 to 2147483647; classic only.
  * @param {number} [params.maxPollInterval=300000] The maximum time between two batches handed to
  *                                your handler, and the rebalance timeout sent on the wire. A
  *                                handler that exceeds it loses its partitions and the consumer
@@ -153,7 +153,7 @@ const parseDisconnectOptions = (options) => {
  * @param {number} [params.rebalanceTimeout] Deprecated alias for the wire rebalance timeout only.
  *                                It is sent as configured, but never lowers the poll deadline,
  *                                which stays at least 300000 ms.
- * @param {number} [params.heartbeatInterval]
+ * @param {number} [params.heartbeatInterval=3000] Positive integer below sessionTimeout; classic only.
  * @param {number} [params.maxBytesPerPartition]
  * @param {number} [params.minBytes]
  * @param {number} [params.maxBytes]
@@ -200,7 +200,7 @@ module.exports = (params) => {
     retry,
     logger: rootLogger,
     partitionAssigners = [roundRobin],
-    sessionTimeout = 30000,
+    sessionTimeout = 45000,
     maxPollInterval,
     rebalanceTimeout,
     heartbeatInterval = 3000,

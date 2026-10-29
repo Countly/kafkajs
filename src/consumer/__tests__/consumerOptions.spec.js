@@ -63,7 +63,7 @@ describe('Consumer > configuration > groupProtocol', () => {
   })
 
   it.each([
-    ['sessionTimeout', { sessionTimeout: 30000 }, 'sessionTimeout'],
+    ['sessionTimeout', { sessionTimeout: 45000 }, 'sessionTimeout'],
     ['heartbeatInterval', { heartbeatInterval: 3000 }, 'heartbeatInterval'],
     ['partitionAssigners', { partitionAssigners: [] }, 'partitionAssigners'],
   ])('rejects an explicit %s under the consumer protocol', (_name, option, key) => {

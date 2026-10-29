@@ -66,7 +66,7 @@ describe('Consumer > Instrumentation Events', () => {
     const onHeartbeat = jest.fn()
     let heartbeats = 0
 
-    consumer = createTestConsumer({ heartbeatInterval: 0 })
+    consumer = createTestConsumer({ heartbeatInterval: 1 })
     consumer.on(consumer.events.HEARTBEAT, async (event) => {
       onHeartbeat(event)
       heartbeats++

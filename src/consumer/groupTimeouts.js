@@ -32,23 +32,36 @@ const NETWORK_DELAY = 5000
  * @param {number} [options.maxPollInterval] explicit; validated, and it wins over the alias
  * @param {number} [options.rebalanceTimeout] the deprecated alias; sent on the wire when it is
  *   the only one given, degenerate values (0, non-integers) grandfathered
- * @param {number} [options.sessionTimeout=30000]
+ * @param {number} [options.sessionTimeout=45000]
  * @param {number} [options.heartbeatInterval=3000]
  * @param {import('../../types').Logger} options.logger
  * @returns {{ rebalanceTimeout: number, pollDeadline: number, sessionTimeout: number,
  *   heartbeatInterval: number, syncGroupTimeout: number }} `rebalanceTimeout` is the wire value;
  *   `syncGroupTimeout` reports the capped SyncGroup request timeout the protocol layer derives
  *   from it — it is logged, never sent, and the codec remains the authority on that number
- * @throws {KafkaJSNonRetriableError} when `heartbeatInterval` is not lower than `sessionTimeout`,
+ * @throws {KafkaJSNonRetriableError} when either timeout is invalid or `heartbeatInterval`
+ *   is not lower than `sessionTimeout`,
  *   or when an explicit `maxPollInterval` is not an integer of at least 1
  */
 const resolveGroupTimeouts = ({
   maxPollInterval,
   rebalanceTimeout,
-  sessionTimeout = 30000,
+  sessionTimeout = 45000,
   heartbeatInterval = 3000,
   logger,
 }) => {
+  if (!Number.isInteger(sessionTimeout) || sessionTimeout < 1 || sessionTimeout > 2147483647) {
+    throw new KafkaJSNonRetriableError(
+      `Consumer sessionTimeout must be an integer from 1 to 2147483647, got ${inspect(sessionTimeout)}`
+    )
+  }
+
+  if (!Number.isInteger(heartbeatInterval) || heartbeatInterval < 1) {
+    throw new KafkaJSNonRetriableError(
+      `Consumer heartbeatInterval must be an integer of at least 1, got ${inspect(heartbeatInterval)}`
+    )
+  }
+
   if (heartbeatInterval >= sessionTimeout) {
     throw new KafkaJSNonRetriableError(
       `Consumer heartbeatInterval (${heartbeatInterval}) must be lower than sessionTimeout (${sessionTimeout}). It is recommended to set heartbeatInterval to approximately a third of the sessionTimeout.`

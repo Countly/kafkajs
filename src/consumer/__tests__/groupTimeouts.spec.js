@@ -14,7 +14,7 @@ describe('Consumer > group timeouts', () => {
       // [maxPollInterval, rebalanceTimeout, wire, joinGroupReq, syncGroupReq, deadline, warns]
       [undefined, undefined, 300000, 305000, 65000, 300000, false],
       [undefined, 20000, 20000, 25000, 25000, 300000, true],
-      [undefined, 0, 0, 35000, 35000, 300000, true],
+      [undefined, 0, 0, 50000, 50000, 300000, true],
       [30000, undefined, 30000, 35000, 35000, 30000, false],
       [45000, 45000, 45000, 50000, 50000, 45000, true],
       [45000, 20000, 45000, 50000, 50000, 45000, true],
@@ -115,5 +115,34 @@ describe('Consumer > group timeouts', () => {
 
     kafka.consumer({ groupId: 'g', rebalanceTimeout: 20000 })
     expect(deprecations()).toHaveLength(1)
+  })
+})
+
+describe('Consumer > timeout integer ranges', () => {
+  test.each([0, -1, 1.5, NaN, Infinity, '30000', 2147483648, null, Symbol('session')])(
+    'rejects invalid sessionTimeout %p before arithmetic',
+    (sessionTimeout) => {
+      expect(() => resolveGroupTimeouts({ logger: newLogger(), sessionTimeout })).toThrow(
+        KafkaJSNonRetriableError
+      )
+    }
+  )
+  test.each([0, -1, 2.5, NaN, Infinity, '3000', null, Symbol('heartbeat')])(
+    'rejects invalid heartbeatInterval %p before arithmetic',
+    (heartbeatInterval) => {
+      expect(() => resolveGroupTimeouts({ logger: newLogger(), heartbeatInterval })).toThrow(
+        KafkaJSNonRetriableError
+      )
+    }
+  )
+  test('keeps defaults and accepts the largest session integer', () => {
+    expect(resolveGroupTimeouts({ logger: newLogger() }).sessionTimeout).toBe(45000)
+    expect(
+      resolveGroupTimeouts({
+        logger: newLogger(),
+        sessionTimeout: 2147483647,
+        heartbeatInterval: 1,
+      }).sessionTimeout
+    ).toBe(2147483647)
   })
 })

@@ -254,6 +254,9 @@ export interface ConsumerConfig {
   groupId: string
   partitionAssigners?: PartitionAssigner[]
   metadataMaxAge?: number
+  /** Classic session timeout in milliseconds. Default 45000; integer 1..2147483647.
+   * Must exceed heartbeatInterval and satisfy the broker's configured session bounds.
+   * Cannot be set with groupProtocol: 'consumer'. */
   sessionTimeout?: number
   /**
    * The maximum time between two batches handed to your handler, in milliseconds, and the
@@ -268,6 +271,9 @@ export interface ConsumerConfig {
    * deadline: that stays at least 300000 ms.
    */
   rebalanceTimeout?: number
+  /** Classic heartbeat interval in milliseconds. Default 3000; positive integer below
+   * sessionTimeout. Values above a third of the session log a warning.
+   * Cannot be set with groupProtocol: 'consumer'. */
   heartbeatInterval?: number
   maxBytesPerPartition?: number
   minBytes?: number

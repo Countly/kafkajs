@@ -932,6 +932,8 @@ says so, `groupProtocol: 'consumer'`.
 - To skip a halted batch, `consumer.seek` the partition to the event's `nextOffset` (or later) when it has one; a rebalance that revokes the partition or a restart clears the halt. Offsets the client derives itself never cross the bad batch; a commit you make yourself keeps its ordinary meaning. Raise `maxDecompressedBatchBytes` if you legitimately produce larger batches. The bound is per batch and counts decompressed bytes; the same value also sets a **derived ceiling of `max(1, floor(value / 512))` records per batch**, so a batch can pass the byte limit and still halt the partition for its record count, and raising the option raises both. Size it against `maxBytes`, the number of brokers and the heap (decoded records cost 208 to 321 bytes each)
 - Code that handled the CRC crash through `restartOnFailure` or `consumer.on(CRASH)` should listen to `consumer.partition_halted` (reason `checksum`) and `seek` past the batch if it must skip it; a checksum halt has no `nextOffset`, so you choose the offset
 
+- A consumer that stops heartbeating is now detected up to 15 seconds later (45 s instead of 30 s), and a static member may restart within 45 s without a rebalance. Set `sessionTimeout: 30000` to keep the old value. The KIP-848 session is the broker's `group.consumer.session.timeout.ms` and is unchanged
+
 ### Admin
 
 Group visibility and the admin client.
