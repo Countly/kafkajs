@@ -401,3 +401,203 @@ describe('Benchmarks > consumeThroughput', () => {
     })
   })
 })
+
+const {
+  DeliveryAccounting,
+  verifyAccounting,
+  accountingControl,
+  consumeOnce,
+} = require('../consumeThroughput')
+
+/** @param {number[]} sizes records per batch @param {object} [options] teardown controls @returns {object} a public-API-shaped finite source */
+const countedSource = (sizes, { teardownTicks = 0n, failRun = false, failStop = false } = {}) => {
+  let clock = 0n
+  const consumer = {
+    connect: jest.fn(async () => {}),
+    subscribe: jest.fn(async () => {}),
+    run: jest.fn(async (options) => {
+      if (failRun) throw new Error('run failed')
+      let offset = 0
+      for (const size of sizes) {
+        const messages = Array.from({ length: size }, () => ({
+          value: Buffer.alloc(2),
+          offset: String(offset++),
+        }))
+        clock += 1000000n
+        if (options.eachBatch) await options.eachBatch({ batch: { partition: 0, messages } })
+        else
+          for (const message of messages) {
+            clock += 1000000n
+            await options.eachMessage({ partition: 0, message })
+          }
+      }
+    }),
+    stop: jest.fn(async () => {
+      clock += teardownTicks
+      if (failStop) throw new Error('stop failed')
+    }),
+    disconnect: jest.fn(async () => {}),
+  }
+  return {
+    kafka: { consumer: jest.fn(() => consumer) },
+    consumer,
+    now: () => {
+      clock += 1000n
+      return clock
+    },
+  }
+}
+
+describe('Benchmarks > counted consume controls', () => {
+  test('one multi-record batch is one entry and three messages', () => {
+    const counter = new DeliveryAccounting('eachBatch')
+    counter.enter(3, 1000000n)
+    expect(counter.result()).toEqual({
+      deliveredMessages: 3,
+      deliveredBatches: 1,
+      handlerEntries: 1,
+      gapSamples: 0,
+      deliveryGapP50: null,
+      deliveryGapP90: null,
+      deliveryGapP99: null,
+    })
+  })
+
+  test('gaps come from entry times even when record counts differ', () => {
+    const counter = new DeliveryAccounting('eachBatch')
+    counter.enter(5, 0n)
+    counter.enter(2, 1000000n)
+    counter.enter(5, 3500000n)
+    expect(counter.result()).toEqual({
+      deliveredMessages: 12,
+      deliveredBatches: 3,
+      handlerEntries: 3,
+      gapSamples: 2,
+      deliveryGapP50: 2.5,
+      deliveryGapP90: 2.5,
+      deliveryGapP99: 2.5,
+    })
+  })
+
+  test.each(['eachBatch', 'eachMessage'])(
+    '%s untimed controls preserve the same total across batch shapes',
+    async (handler) => {
+      const rows = await accountingControl(handler)
+      expect(rows.map(({ deliveredMessages }) => deliveredMessages)).toEqual([12, 12, 12])
+      expect(rows.map(({ deliveredBatches }) => deliveredBatches)).toEqual(
+        handler === 'eachBatch' ? [1, 4, 6] : [0, 0, 0]
+      )
+      expect(rows.map(({ handlerEntries }) => handlerEntries)).toEqual(
+        handler === 'eachBatch' ? [1, 4, 6] : [12, 12, 12]
+      )
+      expect(rows.map(({ gapSamples }) => gapSamples)).toEqual(
+        handler === 'eachBatch' ? [0, 3, 5] : [11, 11, 11]
+      )
+      expect(rows.map(({ deliveredBytes }) => deliveredBytes)).toEqual([24, 24, 24])
+    }
+  )
+
+  test.each([
+    ['deliveredMessages', 11],
+    ['deliveredBatches', 3],
+    ['handlerEntries', 3],
+    ['gapSamples', 11],
+    ['deliveredBytes', 22],
+  ])('rejects a false %s against independent source totals', (field, value) => {
+    const expected = {
+      deliveredMessages: 12,
+      deliveredBatches: 4,
+      handlerEntries: 4,
+      gapSamples: 3,
+      deliveredBytes: 24,
+    }
+    expect(() => verifyAccounting({ ...expected, [field]: value }, expected)).toThrow(
+      `consume accounting ${field}: expected ${expected[field]}, received ${value}`
+    )
+    expect(() => verifyAccounting(expected, expected)).not.toThrow()
+  })
+
+  test.each(['eachBatch', 'eachMessage'])(
+    '%s uses the real handler wiring and excludes teardown from the interval',
+    async (handler) => {
+      const fast = countedSource([3, 3, 3, 3])
+      const slow = countedSource([3, 3, 3, 3], { teardownTicks: 1000000000000n })
+      const run = (source) =>
+        consumeOnce(source.kafka, 1, undefined, {
+          handler,
+          messages: 12,
+          size: 2,
+          timeout: 50,
+          now: source.now,
+        })
+      const first = await run(fast)
+      const second = await run(slow)
+      expect(second).toEqual(first)
+      expect(first.deliveredMessages).toBe(12)
+      expect(first.handlerEntries).toBe(handler === 'eachBatch' ? 4 : 12)
+      expect(fast.consumer.stop).toHaveBeenCalledTimes(1)
+      expect(fast.consumer.disconnect).toHaveBeenCalledTimes(1)
+      expect(fast.consumer.run.mock.calls[0][0].autoCommit).toBe(false)
+      expect(fast.consumer.subscribe).toHaveBeenCalledWith(
+        expect.objectContaining({ fromBeginning: true })
+      )
+    }
+  )
+
+  test('a missing batch fails at the driver deadline with the actual delivered total', async () => {
+    const source = countedSource([3, 3, 3])
+    await expect(
+      consumeOnce(source.kafka, 1, undefined, {
+        handler: 'eachBatch',
+        messages: 12,
+        size: 2,
+        timeout: 20,
+        now: source.now,
+      })
+    ).rejects.toThrow('with 9 of 12 messages consumed')
+    expect(source.consumer.disconnect).toHaveBeenCalledTimes(1)
+  })
+
+  test('a dropped record fails at the driver deadline', async () => {
+    const source = countedSource([3, 3, 3, 2])
+    await expect(
+      consumeOnce(source.kafka, 1, undefined, {
+        handler: 'eachBatch',
+        messages: 12,
+        size: 2,
+        timeout: 20,
+        now: source.now,
+      })
+    ).rejects.toThrow('with 11 of 12 messages consumed')
+  })
+
+  test('duplicate delivery cannot satisfy the exact-total control', async () => {
+    const source = countedSource([3, 3, 3, 4])
+    await expect(
+      consumeOnce(source.kafka, 1, undefined, {
+        handler: 'eachBatch',
+        messages: 12,
+        size: 2,
+        timeout: 20,
+        now: source.now,
+      })
+    ).rejects.toThrow('consume accounting deliveredMessages: expected 12, received 13')
+  })
+
+  test.each([{ failRun: true }, { failStop: true }])(
+    'disconnects and clears the deadline after %j',
+    async (options) => {
+      const source = countedSource([12], options)
+      await expect(
+        consumeOnce(source.kafka, 1, undefined, {
+          handler: 'eachBatch',
+          messages: 12,
+          size: 2,
+          timeout: 50,
+          now: source.now,
+        })
+      ).rejects.toThrow(options.failRun ? 'run failed' : 'stop failed')
+      expect(source.consumer.disconnect).toHaveBeenCalledTimes(1)
+    }
+  )
+})

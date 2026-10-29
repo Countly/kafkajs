@@ -7,7 +7,8 @@
  *          [--autocommit-threshold <n>] [--otel 0|1] [--intern-offsets 0|1] [--control 0|1]
  * Prints one JSON line: { messages, size, partitions, handler, subscribeChannels,
  *   messagesPerSecond, p50, p90, p99, handlerP99, deliveryGapP50, deliveryGapP90, deliveryGapP99,
- *   batches, heapRetainedBytes }
+ *   batches, deliveredMessages, deliveredBatches, handlerEntries, gapSamples, deliveredBytes,
+ *   heapRetainedBytes }
  *
  * `deliveryGap*` is the time between consecutive handler entries, so decode, queue wait, runner
  * work and a commit between two entries are inside it. `p50`, `p90`, `p99` and `handlerP99` (the
@@ -24,20 +25,21 @@
  *
  * Declared before any run (session.js, medians of seven, the first run of each arm discarded, an
  * A/A arm, a quiet host): messages per second within -3 % of the previous tree's; `deliveryGapP99`
- * within +5 %, gated only with 200 000 entries (`eachMessage`) or at least 1 000 batches
- * (`eachBatch`), else inconclusive; `--otel 1` within +3 % of the previous tree's own `otel/`;
+ * within +5 %, gated only with 200 000 actual entry gaps (`eachMessage`) or at least 1 000
+ * actual entry gaps (`eachBatch`), else inconclusive; `--otel 1` within +3 % of the previous tree's own `otel/`;
  * `heapRetainedBytes` within +2 MiB, and `--intern-offsets 1` must exceed it: an arm that does not
  * fail means the measurement is blind and the session is invalid.
  *
- * `--control 1` is not a measurement. It runs the measured consume once with
+ * `--control 1` is not a measurement. It verifies finite record, callback and gap totals through
+ * the same handlers, then runs the measured consume once with
  * `OffsetOperations#begin` counted from the first delivered batch on and prints `{ control: true,
- * arm, beginCalls, expected, pass }`, exit code 1 unless the count is what the arm should give:
+ * accounting, observed, arm, beginCalls, expected, pass }`, exit code 1 unless the count is what the arm should give:
  * none without `--autocommit-threshold`, some with it. It loads this tree's own module, so it
  * refuses on a tree without it, and a timed run never loads it.
  *
  * The corpus is fixed on purpose: 200000 messages of 200 B across one topic of 6 partitions, no
  * compression, `autoCommit: false`, one discarded warm-up run, and a fresh consumer group per run.
- * `--handler eachBatch` (the default, so earlier numbers stay comparable) uses
+ * `--handler eachBatch` (the default) uses
  * `eachBatchAutoResolve` and times each batch; `eachMessage` times each record. A run that never
  * receives the whole corpus fails on the deadline instead of hanging: `--timeout` bounds the drain,
  * from `run` until the last message, and startup is bounded by the client's connection and request
@@ -129,6 +131,103 @@ const percentiles = (values) => {
  */
 const deliveryGaps = (entries) =>
   entries.slice(1).map((entered, index) => Number(entered - entries[index]) / 1e6)
+
+/**
+ * Counts records and actual callback timestamps for one handler arm. One instance belongs to one
+ * run; it adds no clocks or per-record objects to the inherited handler loop.
+ */
+class DeliveryAccounting {
+  /** @param {'eachBatch'|'eachMessage'} handler selected public callback */
+  constructor(handler) {
+    this.handler = handler
+    this.messages = 0
+    this.batches = 0
+    this.entries = []
+  }
+
+  /** @param {number} records actual batch length, or one message @param {bigint} at entry timestamp @returns {void} */
+  enter(records, at) {
+    this.entries.push(at)
+    this.messages += records
+    if (this.handler === 'eachBatch') this.batches += 1
+  }
+
+  /** @returns {object} independent message, batch, entry and actual-gap measurements */
+  result() {
+    const gaps = deliveryGaps(this.entries)
+    const latency = gaps.length ? percentiles(gaps) : { p50: null, p90: null, p99: null }
+    return {
+      deliveredMessages: this.messages,
+      deliveredBatches: this.batches,
+      handlerEntries: this.entries.length,
+      gapSamples: gaps.length,
+      deliveryGapP50: latency.p50,
+      deliveryGapP90: latency.p90,
+      deliveryGapP99: latency.p99,
+    }
+  }
+}
+
+/**
+ * Checks observed counts against a separately declared finite source transcript.
+ * @param {object} actual driver result
+ * @param {object} expected source totals, never derived from the observed handler counters
+ * @returns {void}
+ * @throws {Error} naming the first count that disagrees
+ */
+const verifyAccounting = (actual, expected) => {
+  for (const [key, value] of Object.entries(expected)) {
+    if (actual[key] !== value) {
+      throw new Error(`consume accounting ${key}: expected ${value}, received ${actual[key]}`)
+    }
+  }
+}
+
+/**
+ * Runs the real public-handler wiring over three fixed finite transcripts, outside any timed
+ * sample. Callback counts are declared from the source layout, separately from delivered records.
+ * @param {'eachBatch'|'eachMessage'} handler selected public callback
+ * @returns {Promise<object[]>} checked driver results
+ * @throws {Error} if a callback, record or actual-gap count is lost or fabricated
+ */
+const accountingControl = async (handler) => {
+  const rows = []
+  for (const sizes of [[12], [3, 3, 3, 3], [2, 2, 2, 2, 2, 2]]) {
+    const consumer = {
+      connect: async () => {},
+      subscribe: async () => {},
+      stop: async () => {},
+      disconnect: async () => {},
+      run: async (options) => {
+        let offset = 0
+        for (const count of sizes) {
+          const messages = Array.from({ length: count }, () => ({
+            offset: String(offset++),
+            value: Buffer.alloc(2),
+          }))
+          if (options.eachBatch) await options.eachBatch({ batch: { partition: 0, messages } })
+          else for (const message of messages) await options.eachMessage({ partition: 0, message })
+        }
+      },
+    }
+    const result = await consumeOnce({ consumer: () => consumer }, 1, undefined, {
+      handler,
+      messages: 12,
+      size: 2,
+      timeout: 1000,
+    })
+    const entries = handler === 'eachBatch' ? sizes.length : 12
+    verifyAccounting(result, {
+      deliveredMessages: 12,
+      deliveredBatches: handler === 'eachBatch' ? sizes.length : 0,
+      handlerEntries: entries,
+      gapSamples: entries - 1,
+      deliveredBytes: 24,
+    })
+    rows.push(result)
+  }
+  return rows
+}
 
 /**
  * Registers the OpenTelemetry instrumentation of this tree's `otel/` directory on this tree's
@@ -280,19 +379,36 @@ const produceCorpus = (kafka) =>
  * @param {import('../../index').Kafka} kafka the client to consume with
  * @param {number} run run number, used to keep each run on its own consumer group
  * @param {{ delivered: () => void }} [ledger] told when the first batch has been delivered
+ * @param {object} [options] finite source settings for untimed controls; CLI defaults otherwise
+ * @param {'eachBatch'|'eachMessage'} [options.handler] selected callback
+ * @param {number} [options.messages] independently declared delivered records
+ * @param {number} [options.size] corpus record bytes
+ * @param {number} [options.timeout] drain deadline in milliseconds, armed after run resolves
+ * @param {() => bigint} [options.now] monotonic measurement clock
  * @returns {Promise<{ messagesPerSecond: number, p50: number, p90: number, p99: number,
- *   handlerP99: number, deliveryGapP50: number, deliveryGapP90: number, deliveryGapP99: number,
- *   batches: number }>} throughput over the consume phase, handling latency in ms and the gaps
+ *   handlerP99: number, deliveryGapP50: number|null, deliveryGapP90: number|null, deliveryGapP99: number|null,
+ *   batches: number, deliveredMessages: number, deliveredBatches: number, handlerEntries: number,
+ *   gapSamples: number, deliveredBytes: number }>} throughput over the consume phase, handling latency in ms and the gaps
  *   between handler entries in ms
- * @throws {Error} the failure of the connect, subscribe or run, or the timeout of the deadline,
- *   after the consumer is disconnected and the deadline cleared; a run that received nothing
+ * @throws {Error} the failure of connect, subscribe, run or stop, or the drain deadline;
+ *   after owner cleanup and timer clearing; a run with no bytes or a mismatched record total
  */
-const consumeOnce = async (kafka, run, ledger) => {
+const consumeOnce = async (
+  kafka,
+  run,
+  ledger,
+  {
+    handler = HANDLER,
+    messages = MESSAGES,
+    size = SIZE,
+    timeout = TIMEOUT_MS,
+    now = () => process.hrtime.bigint(),
+  } = {}
+) => {
   const latencies = []
-  const entries = []
-  let batches = 0
-  let consumed = 0
+  const accounting = new DeliveryAccounting(handler)
   let bytes = 0
+  let finishedAt
   let startedAt
   let resolveWhenDrained
   const drained = new Promise((resolve) => {
@@ -308,9 +424,8 @@ const consumeOnce = async (kafka, run, ledger) => {
     eachBatchAutoResolve: true,
     ...commits,
     eachBatch: async ({ batch }) => {
-      const batchStartedAt = process.hrtime.bigint()
-      entries.push(batchStartedAt)
-      batches += 1
+      const batchStartedAt = now()
+      accounting.enter(batch.messages.length, batchStartedAt)
       if (startedAt === undefined) {
         startedAt = batchStartedAt
       }
@@ -321,12 +436,11 @@ const consumeOnce = async (kafka, run, ledger) => {
           interned.set(`${batch.partition}:${message.offset}`, message.offset)
         }
       }
-      consumed += batch.messages.length
 
-      latencies.push(Number(process.hrtime.bigint() - batchStartedAt) / 1e6)
+      latencies.push(Number(now() - batchStartedAt) / 1e6)
       ledger?.delivered()
 
-      if (consumed >= MESSAGES) {
+      if (accounting.messages >= messages) {
         resolveWhenDrained()
       }
     },
@@ -335,22 +449,21 @@ const consumeOnce = async (kafka, run, ledger) => {
   const eachMessageArm = {
     ...commits,
     eachMessage: async ({ partition, message }) => {
-      const messageStartedAt = process.hrtime.bigint()
-      entries.push(messageStartedAt)
+      const messageStartedAt = now()
+      accounting.enter(1, messageStartedAt)
       if (startedAt === undefined) {
         startedAt = messageStartedAt
       }
 
       bytes += message.value.length
-      consumed += 1
       if (INTERN_OFFSETS === 1) {
         interned.set(`${partition}:${message.offset}`, message.offset)
       }
 
-      latencies.push(Number(process.hrtime.bigint() - messageStartedAt) / 1e6)
+      latencies.push(Number(now() - messageStartedAt) / 1e6)
       ledger?.delivered()
 
-      if (consumed >= MESSAGES) {
+      if (accounting.messages >= messages) {
         resolveWhenDrained()
       }
     },
@@ -368,42 +481,44 @@ const consumeOnce = async (kafka, run, ledger) => {
     try {
       await consumer.connect()
       await consumer.subscribe({ topic: TOPIC, fromBeginning: true })
-      await consumer.run(HANDLER === 'eachMessage' ? eachMessageArm : eachBatchArm)
+      await consumer.run(handler === 'eachMessage' ? eachMessageArm : eachBatchArm)
       const deadline = new Promise((_, reject) => {
         deadlineTimer = setTimeout(
           () =>
             reject(
               new Error(
-                `run ${run} timed out after ${TIMEOUT_MS} ms with ${consumed} of ${MESSAGES} messages consumed`
+                `run ${run} timed out after ${timeout} ms with ${accounting.messages} of ${messages} messages consumed`
               )
             ),
-          TIMEOUT_MS
+          timeout
         )
       })
       await Promise.race([drained, deadline])
+      finishedAt = now()
     } finally {
       clearTimeout(deadlineTimer)
     }
+    await consumer.stop()
   })
 
-  if (startedAt === undefined || (SIZE > 0 && bytes === 0)) {
+  if (startedAt === undefined || (size > 0 && bytes === 0)) {
     throw new Error(
-      `run ${run} received nothing: ${consumed} of ${MESSAGES} messages, ${bytes} bytes`
+      `run ${run} received nothing: ${accounting.messages} of ${messages} messages, ${bytes} bytes`
     )
   }
 
-  const elapsedMs = Number(process.hrtime.bigint() - startedAt) / 1e6
+  verifyAccounting({ deliveredMessages: accounting.messages }, { deliveredMessages: messages })
+  const elapsedMs = Number(finishedAt - startedAt) / 1e6
 
-  const handler = percentiles(latencies)
-  const gaps = percentiles(deliveryGaps(entries))
+  const latency = percentiles(latencies)
+  const counts = accounting.result()
   return {
-    messagesPerSecond: (consumed / elapsedMs) * 1000,
-    ...handler,
-    handlerP99: handler.p99,
-    deliveryGapP50: gaps.p50,
-    deliveryGapP90: gaps.p90,
-    deliveryGapP99: gaps.p99,
-    batches,
+    messagesPerSecond: (accounting.messages / elapsedMs) * 1000,
+    ...latency,
+    handlerP99: latency.p99,
+    ...counts,
+    deliveredBytes: bytes,
+    batches: counts.deliveredBatches,
   }
 }
 
@@ -426,23 +541,21 @@ const consumeOnce = async (kafka, run, ledger) => {
   }
 
   const ledger = CONTROL === 1 ? countLedgerCalls() : undefined
-  await createTopic(kafka)
-
   try {
+    await createTopic(kafka)
     await produceCorpus(kafka)
 
     if (CONTROL === 1) {
-      try {
-        await consumeOnce(kafka, 1, ledger)
-      } finally {
-        ledger.restore()
-      }
+      const accounting = await accountingControl(HANDLER)
+      const observed = await consumeOnce(kafka, 1, ledger)
 
       const expected = AUTOCOMMIT_THRESHOLD === undefined ? 'none' : 'some'
       const pass = expected === 'some' ? ledger.count() > 0 : ledger.count() === 0
       console.log(
         JSON.stringify({
           control: true,
+          accounting,
+          observed,
           arm: { handler: HANDLER, autocommitThreshold: AUTOCOMMIT_THRESHOLD ?? null },
           beginCalls: ledger.count(),
           expected,
@@ -470,7 +583,11 @@ const consumeOnce = async (kafka, run, ledger) => {
       })
     )
   } finally {
-    await deleteTopic(kafka)
+    try {
+      await deleteTopic(kafka)
+    } finally {
+      ledger?.restore()
+    }
   }
 })().catch((e) => {
   console.error(e)
@@ -482,6 +599,9 @@ module.exports = {
   deliveryGaps,
   countLedgerCalls,
   registerOtel,
+  DeliveryAccounting,
+  verifyAccounting,
+  accountingControl,
   createTopic,
   deleteTopic,
   produceCorpus,

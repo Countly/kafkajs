@@ -23,6 +23,8 @@ Versions before 3.0.0 are internal alpha tags and are not published.
 
 - Add independent consumer-assignment/session vectors and dedicated rack, capacity and coordinator-state fixtures.
 
+- Count delivered records, batch entries and actual gap samples independently in consume measurements.
+
 ### Phase 9B — Producer parity: delivery deadline, memory bound, request size, partitioner, codecs, lifecycle
 
 #### Behavior changes
