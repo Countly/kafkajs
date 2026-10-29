@@ -162,54 +162,62 @@ const encodeAbortedTransactions = (aborted = []) =>
  * @param {{ partition: number, errorCode: number, records?: boolean|Buffer,
  *   preferredReadReplica?: number, abortedTransactions?: object[],
  *   currentLeader?: { leaderId: number, leaderEpoch: number } }[]} partitions
- * @param {{ topLevel?: number, nodeEndpoints?: object[], apiVersion?: number }} [options]
+ * @param {{ topLevel?: number, nodeEndpoints?: object[], apiVersion?: number,
+ *   sessionId?: number, includeTopic?: boolean }} [options]
  * @returns {Buffer}
  */
-const fetchResponse = (partitions, { topLevel = 0, nodeEndpoints, apiVersion = 18 } = {}) =>
+const fetchResponse = (
+  partitions,
+  { topLevel = 0, nodeEndpoints, apiVersion = 18, sessionId = 0, includeTopic = true } = {}
+) =>
   new Encoder()
     .writeInt32(0) // clientSideThrottleTime
     .writeInt16(topLevel)
-    .writeInt32(0) // sessionId
-    .writeUVarIntArray([
-      (apiVersion <= 12
-        ? new Encoder().writeUVarIntString(TOPIC)
-        : new Encoder().writeUuid(TOPIC_ID)
-      )
-        .writeUVarIntArray(
-          partitions.map(
-            ({
-              partition,
-              errorCode,
-              records = false,
-              preferredReadReplica = -1,
-              abortedTransactions,
-              currentLeader,
-            }) =>
-              encodeRecords(records)(
-                new Encoder()
-                  .writeInt32(partition)
-                  .writeInt16(errorCode)
-                  .writeInt64(100) // highWatermark
-                  .writeInt64(100) // lastStableOffset
-                  .writeInt64(0) // logStartOffset
-                  .writeUVarIntArray(encodeAbortedTransactions(abortedTransactions))
-                  .writeInt32(preferredReadReplica)
-              ).writeTaggedFields(
-                currentLeader
-                  ? [
-                      {
-                        tag: 1,
-                        value: new Encoder()
-                          .writeInt32(currentLeader.leaderId)
-                          .writeInt32(currentLeader.leaderEpoch).buffer,
-                      },
-                    ]
-                  : undefined
+    .writeInt32(sessionId)
+    .writeUVarIntArray(
+      includeTopic
+        ? [
+            (apiVersion <= 12
+              ? new Encoder().writeUVarIntString(TOPIC)
+              : new Encoder().writeUuid(TOPIC_ID)
+            )
+              .writeUVarIntArray(
+                partitions.map(
+                  ({
+                    partition,
+                    errorCode,
+                    records = false,
+                    preferredReadReplica = -1,
+                    abortedTransactions,
+                    currentLeader,
+                  }) =>
+                    encodeRecords(records)(
+                      new Encoder()
+                        .writeInt32(partition)
+                        .writeInt16(errorCode)
+                        .writeInt64(100) // highWatermark
+                        .writeInt64(100) // lastStableOffset
+                        .writeInt64(0) // logStartOffset
+                        .writeUVarIntArray(encodeAbortedTransactions(abortedTransactions))
+                        .writeInt32(preferredReadReplica)
+                    ).writeTaggedFields(
+                      currentLeader
+                        ? [
+                            {
+                              tag: 1,
+                              value: new Encoder()
+                                .writeInt32(currentLeader.leaderId)
+                                .writeInt32(currentLeader.leaderEpoch).buffer,
+                            },
+                          ]
+                        : undefined
+                    )
+                )
               )
-          )
-        )
-        .writeTaggedFields(),
-    ])
+              .writeTaggedFields(),
+          ]
+        : []
+    )
     .writeTaggedFields(
       nodeEndpoints ? [{ tag: 0, value: encodeNodeEndpoints(nodeEndpoints) }] : undefined
     ).buffer
@@ -224,13 +232,17 @@ const fetchResponse = (partitions, { topLevel = 0, nodeEndpoints, apiVersion = 1
  * @param {Buffer[]} writes `state.writes`
  * @returns {{ apiVersion: number, replicaId: number|null, maxWaitMs: number, minBytes: number,
  *   maxBytes: number, isolationLevel: number, sessionId: number, sessionEpoch: number,
- *   rackId: string|null, topics: {topic: string|null, topicId: string|null,
+ *   rackId: string|null, forgottenTopics: {topic: string|null, topicId: string|null,
+ *   partitions: number[]}[], topics: {topic: string|null, topicId: string|null,
  *   partitions: {partition: number, currentLeaderEpoch: number, fetchOffset: string,
  *   lastFetchedEpoch: number, logStartOffset: string, maxBytes: number}[]}[] }}
  */
 const decodeFetchRequest = (writes) => {
   const frame = [...writes].reverse().find((w) => readRequestHeader(w).apiKey === apiKeys.Fetch)
   const { apiVersion } = readRequestHeader(frame)
+  if (apiVersion < 12 || apiVersion > 18) {
+    throw new Error(`Fetch request reader does not support v${apiVersion}`)
+  }
 
   // size(4) apiKey(2) apiVersion(2) correlationId(4) clientId then a tag buffer - request header
   // v2, whose clientId stays an INT16-prefixed string (see src/protocol/request.js).
@@ -269,11 +281,18 @@ const decodeFetchRequest = (writes) => {
     return { topic, topicId, partitions }
   })
 
-  // forgottenTopicsData: this client always sends it empty, so the element reader is never called
-  // and the decode stays in step.
-  decoder.readUVarIntArray(() => {})
+  const forgottenTopics = decoder.readUVarIntArray((d) => {
+    const topic = apiVersion <= 12 ? d.readUVarIntString() : null
+    const topicId = apiVersion >= 13 ? d.readUuid() : null
+    const partitions = d.readUVarIntArray((p) => p.readInt32())
+    d.readTaggedFields()
+    return { topic, topicId, partitions }
+  })
   const rackId = decoder.readUVarIntString()
   decoder.readTaggedFields()
+  if (decoder.canReadBytes(1)) {
+    throw new Error(`Fetch v${apiVersion} request has a byte after its tag buffer`)
+  }
 
   return {
     apiVersion,
@@ -285,6 +304,7 @@ const decodeFetchRequest = (writes) => {
     sessionId,
     sessionEpoch,
     topics,
+    forgottenTopics,
     rackId,
   }
 }

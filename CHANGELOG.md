@@ -5,6 +5,18 @@ Versions before 3.0.0 are internal alpha tags and are not published.
 
 ## Unreleased — 3.0.0
 
+### Phase 9C — Consumer parity
+
+#### Behavior changes
+
+#### Fixes
+
+#### Additions
+
+#### Tooling
+
+- Extend transport fixtures with independently checked consumer error and Fetch-session variants.
+
 ### Phase 9B — Producer parity: delivery deadline, memory bound, request size, partitioner, codecs, lifecycle
 
 #### Behavior changes

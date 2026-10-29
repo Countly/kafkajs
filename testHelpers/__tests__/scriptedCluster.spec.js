@@ -1681,3 +1681,47 @@ describe.each(lanes())('A producer and a consumer round trip (%s lane)', (lane) 
     done()
   })
 })
+
+describe('ScriptedCluster Fetch session deltas', () => {
+  const body = Buffer.from(
+    '000013880000000100a0000001000000250000000201020102030405060708090a0b0c0d0e0f1003000000010000000300027200',
+    'hex'
+  )
+
+  test('records a forgotten UUID and replies with an empty session map', async () => {
+    const cluster = createScriptedCluster({ nodes: NODES })
+    cluster.answer('Fetch', () => ({
+      includeTopic: false,
+      sessionId: 37,
+      nodeEndpoints: undefined,
+    }))
+    const { socket, frames } = await exchange(cluster, frameOf(apiKeys.Fetch, 18, body))
+    try {
+      cluster.assertClean()
+      expect(cluster.requests()).toHaveLength(1)
+      expect(cluster.requests()[0].fields.forgottenTopics).toEqual([
+        { topic: null, topicId: '01020304-0506-0708-090a-0b0c0d0e0f10', partitions: [1, 3] },
+      ])
+      expect(frames).toHaveLength(1)
+      expect(frames[0].subarray(9)).toEqual(Buffer.from('000000000000000000250100', 'hex'))
+    } finally {
+      socket.destroy()
+      cluster.assertClean()
+    }
+  })
+
+  test('rejects a zero byte after the Fetch terminal tag buffer', async () => {
+    const cluster = createScriptedCluster({ nodes: NODES })
+    const { socket, frames } = await exchange(
+      cluster,
+      frameOf(apiKeys.Fetch, 18, Buffer.concat([body, Buffer.from([0])]))
+    )
+    try {
+      expect(frames).toEqual([])
+      expect(cluster.failures()).toHaveLength(1)
+      expect(() => cluster.assertClean()).toThrow('after its tag buffer')
+    } finally {
+      socket.destroy()
+    }
+  })
+})

@@ -1050,6 +1050,195 @@ describe('pairs agree with what a Kafka 4.3.1 broker sent', () => {
   })
 })
 
+describe('consumer response variants preserve independent templates', () => {
+  const responseVector = (folder, name) => load(`${folder}/fixtures/java/${name}`)
+
+  test.each([
+    ['joinGroupV8', 'joinGroup', 'joinGroupResponse-v8-ok.json', 26],
+    ['syncGroupV5', 'syncGroup', 'syncGroupResponse-v5-ok.json', 27],
+    ['heartbeatV4', 'heartbeat', 'heartbeatResponse-v4-ok.json', 27],
+    ['leaveGroupV5', 'leaveGroup', 'leaveGroupResponse-v5-ok.json', 30],
+    [
+      'consumerGroupHeartbeatV1',
+      'consumerGroupHeartbeat',
+      'consumerGroupHeartbeatResponse-v1-assignment.json',
+      110,
+    ],
+  ])('%s changes only the top-level error in the Java template', (name, folder, file, code) => {
+    const vector = responseVector(folder, file)
+    const bytes = bytesOf(vector)
+    expect(bytes.subarray(4, 6).toString('hex')).toBe('0000')
+    bytes.writeInt16BE(code, 4)
+    expect(require(`../wire/${name}`).buildResponse({ errorCode: code })).toEqual(bytes)
+  })
+
+  test('the commit partition error occupies its documented two bytes', () => {
+    const vector = responseVector('offsetCommit', 'offsetCommitResponse-v9-basic.json')
+    const bytes = bytesOf(vector)
+    expect(bytes.subarray(21, 23).toString('hex')).toBe('0000')
+    bytes.writeInt16BE(28, 21)
+    expect(
+      require('../wire/offsetCommitV9').buildResponse({
+        topics: [{ topic: 'test-topic', partitions: [{ partition: 0, errorCode: 28 }] }],
+      })
+    ).toEqual(bytes)
+  })
+
+  test('a leave member error changes only that member', () => {
+    const vector = responseVector('leaveGroup', 'leaveGroupResponse-v5-ok.json')
+    const bytes = bytesOf(vector)
+    expect(bytes.subarray(20, 22).toString('hex')).toBe('0000')
+    bytes.writeInt16BE(25, 20)
+    expect(
+      require('../wire/leaveGroupV5').buildResponse({
+        members: vector.fields.members.map((member, index) => ({
+          ...member,
+          errorCode: index === 0 ? 25 : 0,
+        })),
+      })
+    ).toEqual(bytes)
+  })
+
+  test.each([70, 71])('an empty session response carries error %s and session id', (topLevel) => {
+    const bytes = Buffer.from('000000000000000000250100', 'hex')
+    bytes.writeInt16BE(topLevel, 4)
+    expect(
+      require('../wire/fetchV18').buildResponse({
+        sessionId: 37,
+        topLevel,
+        includeTopic: false,
+        nodeEndpoints: undefined,
+      })
+    ).toEqual(bytes)
+  })
+
+  test('a successful empty session response contains no topic entry', () => {
+    expect(
+      require('../wire/fetchV18').buildResponse({
+        sessionId: 37,
+        includeTopic: false,
+        nodeEndpoints: undefined,
+      })
+    ).toEqual(Buffer.from('000000000000000000250100', 'hex'))
+  })
+
+  test('a session id patches only its four bytes in the Java response', () => {
+    const bytes = bytesOf(load('fetch/fixtures/v18_response_java.json'))
+    bytes.writeInt32BE(37, 6)
+    expect(require('../wire/fetchV18').buildResponse({ sessionId: 37 })).toEqual(bytes)
+  })
+
+  test('a metadata request error patches only its trailing error', () => {
+    const bytes = bytesOf(load('metadata/fixtures/v13_response_java.json'))
+    expect(bytes.subarray(-3, -1).toString('hex')).toBe('0000')
+    bytes.writeInt16BE(42, bytes.length - 3)
+    expect(require('../wire/metadataV13').buildResponse({ errorCode: 42 })).toEqual(bytes)
+  })
+
+  test('a metadata topic error preserves the other independent fields', () => {
+    const bytes = bytesOf(load('metadata/fixtures/v13_response_java.json'))
+    expect(bytes.subarray(46, 48).toString('hex')).toBe('0000')
+    bytes.writeInt16BE(3, 46)
+    expect(
+      require('../wire/metadataV13').buildResponse({
+        topics: expected.metadataV13.response.topics.map((topic) => ({ ...topic, errorCode: 3 })),
+      })
+    ).toEqual(bytes)
+  })
+})
+
+describe('Fetch forgotten topics use the recorded wire key', () => {
+  const { decodeFetchRequest } = require('../../src/consumer/__tests__/fixtures/fetchHarness')
+  const pair = require('../wire/fetchV18')
+  // Apache FetchRequest: empty topics, one forgotten key, partitions 1 and 3, rack and tags.
+  const body = Buffer.from(
+    '000013880000000100a0000001000000250000000201020102030405060708090a0b0c0d0e0f1003000000010000000300027200',
+    'hex'
+  )
+  const fields = {
+    apiVersion: 18,
+    replicaId: null,
+    maxWaitMs: 5000,
+    minBytes: 1,
+    maxBytes: 10485760,
+    isolationLevel: 1,
+    sessionId: 37,
+    sessionEpoch: 2,
+    topics: [],
+    forgottenTopics: [
+      { topic: null, topicId: '01020304-0506-0708-090a-0b0c0d0e0f10', partitions: [1, 3] },
+    ],
+    rackId: 'r',
+  }
+
+  test('reads a nonempty forgotten entry independently of current metadata', () => {
+    expect(pair.readRequest(body)).toEqual(fields)
+  })
+
+  test('reads the empty forgotten map in the unchanged Java request', () => {
+    expect(
+      pair.readRequest(bytesOf(load('fetch/fixtures/v18_request_java.json'))).forgottenTopics
+    ).toEqual([])
+  })
+
+  test('refuses bytes after a valid empty terminal tag buffer', () => {
+    expect(() => pair.readRequest(Buffer.concat([body, Buffer.from([0])]))).toThrow(
+      'after its tag buffer'
+    )
+  })
+
+  test.each([1, 2, 5, 10, 20])('refuses a forgotten map cut short by %s bytes', (removed) => {
+    expect(() => pair.readRequest(body.subarray(0, -removed))).toThrow()
+  })
+
+  test.each([12, 13, 14, 15, 16, 17, 18])(
+    'reads the supported v%s layer with its actual key',
+    (version) => {
+      const prefix = version <= 14 ? 'ffffffff' : ''
+      const key = version <= 12 ? '0274' : '0102030405060708090a0b0c0d0e0f10'
+      const bytes = Buffer.from(
+        `${prefix}000013880000000100a000000100000025000000020102${key}03000000010000000300027200`,
+        'hex'
+      )
+      const header = new Encoder()
+        .writeInt32(0)
+        .writeInt16(1)
+        .writeInt16(version)
+        .writeInt32(1)
+        .writeString('')
+        .writeTaggedFields().buffer
+      const read = (data) => decodeFetchRequest([Buffer.concat([header, data])])
+      expect(read(bytes)).toEqual({
+        ...fields,
+        apiVersion: version,
+        replicaId: version <= 14 ? -1 : null,
+        forgottenTopics: [
+          {
+            topic: version <= 12 ? 't' : null,
+            topicId: version >= 13 ? fields.forgottenTopics[0].topicId : null,
+            partitions: [1, 3],
+          },
+        ],
+      })
+      expect(() => read(Buffer.concat([bytes, Buffer.from([0])]))).toThrow('after its tag buffer')
+      expect(() => read(bytes.subarray(0, -1))).toThrow()
+    }
+  )
+
+  test.each([11, 19])('refuses unsupported Fetch version %s', (version) => {
+    const header = new Encoder()
+      .writeInt32(0)
+      .writeInt16(1)
+      .writeInt16(version)
+      .writeInt32(1)
+      .writeString('')
+      .writeTaggedFields().buffer
+    expect(() => decodeFetchRequest([Buffer.concat([header, body])])).toThrow(
+      `does not support v${version}`
+    )
+  })
+})
+
 describe('independent record-containing Produce requests', () => {
   test.each([11, 12])(
     'reads the Java-generated v%i batch header and reproduces its request bytes',

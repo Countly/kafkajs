@@ -24,23 +24,33 @@ module.exports = {
 
   /**
    * @param {object} [fields] over the vector's: `partitions` (see above), `nodeEndpoints` (`{
-   *   nodeId, host, port, rack }`) and `topLevel`, the top-level error code
+   *   nodeId, host, port, rack }`), `topLevel`, `sessionId` and `includeTopic` (false for
+   *   an empty incremental response)
    * @returns {Buffer} the response body
    */
   buildResponse(fields = {}) {
-    const { partitions, nodeEndpoints, topLevel } = { ...expected.response, ...fields }
+    const { partitions, nodeEndpoints, topLevel, sessionId, includeTopic } = {
+      ...expected.response,
+      ...fields,
+    }
 
-    return fetchResponse(partitions, { apiVersion: 18, nodeEndpoints, topLevel })
+    return fetchResponse(partitions, {
+      apiVersion: 18,
+      nodeEndpoints,
+      topLevel,
+      sessionId,
+      includeTopic,
+    })
   },
 
   /**
    * @param {Buffer} body the request body, after its header
    * @returns {object} what the harness's `decodeFetchRequest` returns: `replicaId` (null from v15),
-   *   `maxWaitMs`, `minBytes`, `maxBytes`, `isolationLevel`, `sessionId`, `sessionEpoch`, `topics`
-   *   and `rackId`
-   * @throws {Error} when the body is cut short or a byte follows its tag buffer, which the harness
-   *   cannot tell on its own: the body's last byte is the tag buffer it reads, so without it the
-   *   request must no longer read
+   *   `maxWaitMs`, `minBytes`, `maxBytes`, `isolationLevel`, `sessionId`, `sessionEpoch`, `topics`,
+   *   `forgottenTopics` and `rackId`
+   * @throws {Error} when the body is cut short or a byte follows its terminal tag buffer.
+   *   The shared reader consumes every forgotten-topic element and checks the exact remainder.
+   *   The adapter preserves that refusal without a second decoding pass.
    */
   readRequest(body) {
     const header = new Encoder()
@@ -50,15 +60,6 @@ module.exports = {
       .writeInt32(0)
       .writeString('')
       .writeTaggedFields().buffer
-    const read = (bytes) => decodeFetchRequest([Buffer.concat([header, bytes])])
-    const request = read(body)
-
-    try {
-      read(body.subarray(0, -1))
-    } catch {
-      return request
-    }
-
-    throw new Error('Fetch v18 request has a byte after its tag buffer')
+    return decodeFetchRequest([Buffer.concat([header, body])])
   },
 }

@@ -182,6 +182,7 @@ module.exports = {
           ],
         },
       ],
+      forgottenTopics: [],
       rackId: '',
     },
     response: {
@@ -216,6 +217,7 @@ module.exports = {
           ],
         },
       ],
+      forgottenTopics: [],
       rackId: '',
     },
     response: {
@@ -250,6 +252,7 @@ module.exports = {
             ],
           },
         ],
+        forgottenTopics: [],
         rackId: '',
       },
     },

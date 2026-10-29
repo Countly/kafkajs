@@ -41,9 +41,7 @@ module.exports = {
    * @returns {object} what the harness's `decodeFetchRequest` returns: `replicaId`, `maxWaitMs`,
    *   `minBytes`, `maxBytes`, `isolationLevel`, `sessionId`, `sessionEpoch`, `topics` (by name)
    *   and `rackId`
-   * @throws {Error} when the body is cut short or a byte follows its tag buffer, which the harness
-   *   cannot tell on its own: the body's last byte is the tag buffer it reads, so without it the
-   *   request must no longer read
+   * @throws {Error} when the body is cut short, malformed or has bytes after its tag buffer
    */
   readRequest(body) {
     const header = new Encoder()
@@ -53,15 +51,6 @@ module.exports = {
       .writeInt32(0)
       .writeString('')
       .writeTaggedFields().buffer
-    const read = (bytes) => decodeFetchRequest([Buffer.concat([header, bytes])])
-    const request = read(body)
-
-    try {
-      read(body.subarray(0, -1))
-    } catch {
-      return request
-    }
-
-    throw new Error('Fetch v12 request has a byte after its tag buffer')
+    return decodeFetchRequest([Buffer.concat([header, body])])
   },
 }

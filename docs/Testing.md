@@ -134,6 +134,8 @@ KAFKAJS_LOG_LEVEL=debug KAFKAJS_DEBUG_EXTENDED_PROTOCOL_BUFFERS=1 npx jest --wat
 
 [`testHelpers/index.js`](../testHelpers/index.js) provides several helpers for connecting to your cluster and asserting upon its state. Tests are typically co-located with the code that they are testing. See [`src/consumer/__tests__/consumeMessages.spec.js`](../src/consumer/__tests__/consumeMessages.spec.js) for an example that makes use of the helpers to implement an integration test.
 
+The scripted-cluster fixtures check consumer errors and Fetch-session fields against independent wire templates. Their request readers consume every forgotten-topic entry and reject trailing bytes. A successful scripted scenario checks assertClean() before teardown completes; deliberately malformed requests assert the precise refusal instead.
+
 ## Countly canary (manual until 3.0.0)
 
 The canary runs the unit tests of the Countly platform's Kafka plugin against the packed library. It is manual and not part of CI. Never run it in the Countly checkout you work in: it swaps a dependency and rewrites several of its files (the patch files and, in step 7, `observability/otel.js`). Use a separate checkout of Countly (a worktree or a copy) derived from its `main` branch, called `$COUNTLY_COPY` below. A worktree has no `node_modules`: run `npm ci` at its root first (a plain copy of a working checkout already has them).
