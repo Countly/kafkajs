@@ -1,0 +1,7 @@
+{
+  "message": "FetchResponse",
+  "version": 12,
+  "case": "sessionFull",
+  "hex": "00000000000000000025020b746573742d746f7069630200000000000000000000000000640000000000000064000000000000000001ffffffff00000000",
+  "fields": { "errorCode": 0, "sessionId": 37, "includeTopic": true, "partition": 0, "highWatermark": "100", "lastStableOffset": "100", "logStartOffset": "0", "preferredReadReplica": -1 }
+}

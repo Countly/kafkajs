@@ -12,21 +12,28 @@ const RUN_SH = path.join(__dirname, '..', '..', '..', 'scripts', 'e2e', 'javaCon
  * Compiles the Java component once, at collection time, so the three conditions that make this
  * scenario unrunnable - no JDK, no Maven Central, a missing class - are decided before jest builds
  * the suite. Inside a test they could only be a failure or a silent pass, and a silent pass is not
- * an acceptable outcome for a scenario whose whole point is interoperability.
- * @returns {{ ok: boolean, reason: string, workDir: string }}
+ * an acceptable outcome for a scenario whose whole point is interoperability. A supplied
+ * `JAVA_E2E_WORK_DIR` is a jar cache: it is used as it is and never removed, and with
+ * `JAVA_E2E_OFFLINE=1` the probe refuses to download into it.
+ * @returns {{ ok: boolean, reason: string, workDir: string|null, owned: boolean }} `owned` is
+ *   whether this spec created `workDir` and so removes it
  */
 const preflight = () => {
-  const workDir = fs.mkdtempSync(path.join(os.tmpdir(), 'kafkajs-java-interop-'))
+  const supplied = process.env.JAVA_E2E_WORK_DIR
+  const owned = !supplied
+  const workDir = supplied || fs.mkdtempSync(path.join(os.tmpdir(), 'kafkajs-java-interop-'))
   const probe = spawnSync(RUN_SH, ['--probe'], {
     env: { ...process.env, JAVA_E2E_WORK_DIR: workDir },
     encoding: 'utf8',
     timeout: 120000,
   })
 
-  /** The work dir only outlives a successful probe: a skipped `describe` runs no `afterAll`. */
+  /** An owned work dir only outlives a successful probe; a supplied cache always stays. */
   const failed = (reason) => {
-    fs.rmSync(workDir, { recursive: true, force: true })
-    return { ok: false, reason, workDir: null }
+    if (owned) {
+      fs.rmSync(workDir, { recursive: true, force: true })
+    }
+    return { ok: false, reason, workDir: null, owned }
   }
 
   if (probe.error && probe.error.code === 'ENOENT') {
@@ -39,18 +46,24 @@ const preflight = () => {
         ? 'a class was missing from the classpath'
         : /command not found|javac/.test(stderr)
           ? 'no JDK on PATH'
-          : 'the jars could not be downloaded'
+          : /Missing cached Java dependency/.test(stderr)
+            ? 'the cached jars are missing'
+            : 'the jars could not be downloaded'
     )
   }
 
-  return { ok: true, reason: '', workDir }
+  return { ok: true, reason: '', workDir, owned }
 }
 
 // Gated: the scenario spawns a JVM against the shared cluster. Run it alone:
 // `npm run test:e2e:java-interop`.
-const JAVA = process.env.JAVA_INTEROP_E2E === '1' ? preflight() : { ok: false, reason: 'gated' }
-if (process.env.JAVA_INTEROP_E2E === '1' && !JAVA.ok) {
-  console.warn(`Skipping the Java interop scenario: ${JAVA.reason}`)
+const GATED = process.env.JAVA_INTEROP_E2E === '1'
+const JAVA = GATED ? preflight() : { ok: false, reason: 'gated', workDir: null, owned: false }
+if (GATED && !JAVA.ok) {
+  // A gated run that cannot start must not read as a pass.
+  test('the Java member can be built and started', () => {
+    throw new Error(`The Java interop scenario cannot run: ${JAVA.reason}`)
+  })
 }
 
 const describeJavaInterop = JAVA.ok ? describe : describe.skip
@@ -147,7 +160,7 @@ describeJavaInterop('Consumer > mixed Java/JavaScript group (live)', () => {
   // Outside the arms on purpose: the work dir holds the jars and the compiled class both arms run,
   // so it may only be removed once every row has finished.
   afterAll(() => {
-    JAVA.workDir && fs.rmSync(JAVA.workDir, { recursive: true, force: true })
+    JAVA.owned && JAVA.workDir && fs.rmSync(JAVA.workDir, { recursive: true, force: true })
   })
 
   describe.each(['classic', 'consumer'])('%s protocol', (groupProtocol) => {

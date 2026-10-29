@@ -39,23 +39,31 @@ const evidence = (fields) =>
 /**
  * Downloads and compiles the Java member once, at collection time, so a missing JDK, an
  * unreachable Maven Central or a class missing from the classpath is decided before jest builds
- * the suite.
- * @returns {{ ok: boolean, reason: string, workDir: string|null }}
+ * the suite. A supplied `JAVA_E2E_WORK_DIR` is a jar cache: it is used as it is and never removed,
+ * and with `JAVA_E2E_OFFLINE=1` the probe refuses to download into it.
+ * @returns {{ ok: boolean, reason: string, workDir: string|null, owned: boolean }} `owned` is
+ *   whether this spec created `workDir` and so removes it
  */
 const preflight = () => {
+  const supplied = process.env.JAVA_E2E_WORK_DIR
+  const owned = !supplied
   // One fixed directory, cleared first: a run that ends before `afterAll` leaves at most this one.
-  const workDir = path.join(os.tmpdir(), 'kafkajs-java-transactions')
-  fs.rmSync(workDir, { recursive: true, force: true })
-  fs.mkdirSync(workDir)
+  const workDir = supplied || path.join(os.tmpdir(), 'kafkajs-java-transactions')
+  if (owned) {
+    fs.rmSync(workDir, { recursive: true, force: true })
+    fs.mkdirSync(workDir)
+  }
   const probe = spawnSync(RUN_SH, ['--role', 'transactional-producer', '--probe'], {
     env: { ...process.env, JAVA_E2E_WORK_DIR: workDir },
     encoding: 'utf8',
     timeout: 120000,
   })
   if (probe.status === 0) {
-    return { ok: true, reason: '', workDir }
+    return { ok: true, reason: '', workDir, owned }
   }
-  fs.rmSync(workDir, { recursive: true, force: true })
+  if (owned) {
+    fs.rmSync(workDir, { recursive: true, force: true })
+  }
   const stderr = probe.stderr || ''
   const reason =
     probe.error && probe.error.code === 'ENOENT'
@@ -64,18 +72,20 @@ const preflight = () => {
         ? 'a class was missing from the classpath'
         : /command not found|javac/.test(stderr)
           ? 'no JDK on PATH'
-          : 'the jars could not be downloaded'
-  return { ok: false, reason, workDir: null }
+          : /Missing cached Java dependency/.test(stderr)
+            ? 'the cached jars are missing'
+            : 'the jars could not be downloaded'
+  return { ok: false, reason, workDir: null, owned }
 }
 
 // Gated: it spawns JVMs against the shared cluster. Run alone:
 // `npm run test:e2e:java-transaction-interop`, then again on the transaction version 1 cluster arm
 // and on Kafka 4.1.2.
 const GATED = process.env.JAVA_TRANSACTION_INTEROP_E2E === '1'
-const JAVA = GATED ? preflight() : { ok: false, reason: 'gated', workDir: null }
+const JAVA = GATED ? preflight() : { ok: false, reason: 'gated', workDir: null, owned: false }
 if (GATED && !JAVA.ok) {
-  evidence({ scenario: 'preflight', failed: JAVA.reason })
-  // A gated run that cannot start must not read as a pass.
+  // A gated run that cannot start must not read as a pass. No evidence is written here: that
+  // discovers the broker, which a failed preflight may not have.
   test('the Java member can be built and started', () => {
     throw new Error(`The Java transaction interop scenario cannot run: ${JAVA.reason}`)
   })
@@ -157,7 +167,9 @@ describeJavaTransactions('Producer > transactions with the Java client (live)', 
 
   afterAll(() => {
     jest.restoreAllMocks()
-    fs.rmSync(JAVA.workDir, { recursive: true, force: true })
+    if (JAVA.owned) {
+      fs.rmSync(JAVA.workDir, { recursive: true, force: true })
+    }
   })
 
   beforeEach(() => {

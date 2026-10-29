@@ -12,6 +12,8 @@ import java.util.UUID;
 import java.util.function.Function;
 
 import org.apache.kafka.common.Uuid;
+import org.apache.kafka.common.message.FetchRequestData;
+import org.apache.kafka.common.message.FetchResponseData;
 import org.apache.kafka.common.message.AddOffsetsToTxnRequestData;
 import org.apache.kafka.common.message.AddOffsetsToTxnResponseData;
 import org.apache.kafka.common.message.AddPartitionsToTxnRequestData;
@@ -337,6 +339,7 @@ public final class GenerateMessageVectors {
     vectors.addAll(listGroups());
     vectors.addAll(describeGroups());
     vectors.addAll(offsetCommit());
+    vectors.addAll(fetchSessions());
     vectors.addAll(offsetFetch());
     vectors.addAll(offsetFetchRequireStable());
     vectors.addAll(initProducerId());
@@ -3749,12 +3752,80 @@ public final class GenerateMessageVectors {
   }
 
   /**
+   * Session requests and responses from independent, pinned inputs. Versions 12-18 cover the
+   * name/id boundary and the replica-id removal without advertising a new scripted wire pair.
+   * @return full, incremental, forgotten and close requests, and full, sparse and error responses
+   */
+  private static List<Vector> fetchSessions() {
+    List<Vector> vectors = new ArrayList<>();
+    for (short version = 12; version <= 18; version++) {
+      for (String name : List.of("sessionFull", "sessionIncremental", "sessionForgotten", "sessionClose")) {
+        boolean full = name.equals("sessionFull");
+        boolean forgotten = name.equals("sessionForgotten");
+        boolean close = name.equals("sessionClose");
+        int id = full ? 0 : 37;
+        int epoch = full ? 0 : forgotten ? 2 : close ? -1 : 1;
+        boolean topicPresent = full || name.equals("sessionIncremental");
+        long offset = full ? 42 : 43;
+        FetchRequestData request = new FetchRequestData()
+            .setMaxWaitMs(5000).setMinBytes(1).setMaxBytes(10485760)
+            .setIsolationLevel((byte) 1).setSessionId(id).setSessionEpoch(epoch).setRackId("rack-a");
+        if (version <= 14) request.setReplicaId(-1);
+        String topicFields = version == 12 ? kv("topic", str(TOPIC_NAME)) : kv("topicId", str(TOPIC_ID));
+        String partitionFields = obj(kv("partition", "0"), kv("currentLeaderEpoch", "5"),
+            kv("fetchOffset", str(Long.toString(offset))), kv("lastFetchedEpoch", "-1"),
+            kv("logStartOffset", str("-1")), kv("maxBytes", "32768"));
+        if (topicPresent) {
+          FetchRequestData.FetchTopic topic = new FetchRequestData.FetchTopic().setPartitions(List.of(
+              new FetchRequestData.FetchPartition().setPartition(0).setCurrentLeaderEpoch(5)
+                  .setFetchOffset(offset).setLastFetchedEpoch(-1).setLogStartOffset(-1).setPartitionMaxBytes(32768)));
+          if (version == 12) topic.setTopic(TOPIC_NAME); else topic.setTopicId(topicId());
+          request.setTopics(List.of(topic));
+        }
+        if (forgotten) {
+          FetchRequestData.ForgottenTopic topic = new FetchRequestData.ForgottenTopic().setPartitions(List.of(0));
+          if (version == 12) topic.setTopic(TOPIC_NAME); else topic.setTopicId(topicId());
+          request.setForgottenTopicsData(List.of(topic));
+        }
+        String topics = topicPresent ? array(obj(topicFields, kv("partitions", array(partitionFields)))) : array();
+        String forgottenTopics = forgotten ? array(obj(topicFields, kv("partitions", array("0")))) : array();
+        vectors.add(new Vector("fetch", "FetchRequest", version, name, request,
+            obj(kv("replicaId", version <= 14 ? "-1" : "null"), kv("maxWaitMs", "5000"),
+                kv("minBytes", "1"), kv("maxBytes", "10485760"), kv("isolationLevel", "1"),
+                kv("sessionId", Integer.toString(id)), kv("sessionEpoch", Integer.toString(epoch)),
+                kv("rackId", str("rack-a")), kv("topics", topics), kv("forgottenTopics", forgottenTopics))));
+      }
+      for (String name : List.of("sessionFull", "sessionSparse", "sessionError70", "sessionError71", "sessionError106")) {
+        boolean full = name.equals("sessionFull");
+        short code = name.startsWith("sessionError") ? Short.parseShort(name.substring(12)) : 0;
+        int id = code == 0 ? 37 : 0;
+        FetchResponseData response = new FetchResponseData().setThrottleTimeMs(0).setErrorCode(code).setSessionId(id);
+        if (full) {
+          FetchResponseData.FetchableTopicResponse topic = new FetchResponseData.FetchableTopicResponse()
+              .setPartitions(List.of(new FetchResponseData.PartitionData().setPartitionIndex(0)
+                  .setErrorCode((short) 0).setHighWatermark(100).setLastStableOffset(100)
+                  .setLogStartOffset(0).setPreferredReadReplica(-1)));
+          if (version == 12) topic.setTopic(TOPIC_NAME); else topic.setTopicId(topicId());
+          response.setResponses(List.of(topic));
+        }
+        vectors.add(new Vector("fetch", "FetchResponse", version, name, response,
+            obj(kv("errorCode", Short.toString(code)), kv("sessionId", Integer.toString(id)),
+                kv("includeTopic", Boolean.toString(full)), kv("partition", "0"),
+                kv("highWatermark", str("100")), kv("lastStableOffset", str("100")),
+                kv("logStartOffset", str("0")), kv("preferredReadReplica", "-1"))));
+      }
+    }
+    return vectors;
+  }
+
+  /**
    * {@code Uuid.fromString} decodes Kafka's base64 uuid form, not the canonical 8-4-4-4-12 hex
    * form {@link #TOPIC_ID} is written in, so the constant is parsed through {@link UUID} and its
    * two halves handed to {@link Uuid} directly.
    *
    * @return {@link #TOPIC_ID} as a Kafka {@link Uuid}
    */
+
   private static Uuid topicId() {
     UUID standard = UUID.fromString(TOPIC_ID);
     return new Uuid(standard.getMostSignificantBits(), standard.getLeastSignificantBits());

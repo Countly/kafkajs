@@ -21,6 +21,8 @@ Versions before 3.0.0 are internal alpha tags and are not published.
 
 - Extend transport fixtures with independently checked consumer error and Fetch-session variants.
 
+- Add independent consumer-assignment/session vectors and dedicated rack, capacity and coordinator-state fixtures.
+
 ### Phase 9B — Producer parity: delivery deadline, memory bound, request size, partitioner, codecs, lifecycle
 
 #### Behavior changes

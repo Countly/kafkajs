@@ -112,3 +112,19 @@ describe('Consumer', () => {
     )
   })
 })
+
+describe('Consumer > valid empty Java assignments', () => {
+  const vector = require('../assigners/fixtures/range/empty_range_java.json')
+
+  test.each(['m-1', 'm-2'])(
+    '%s has a valid empty assignment, distinct from an absent payload',
+    (memberId) => {
+      const bytes = Buffer.from(vector.expectedAssignmentBytesHex[memberId], 'hex')
+      expect(vector.expected[memberId]).toEqual({})
+      expect(bytes.toString('hex')).toBe('000300000000ffffffff')
+      expect(MemberAssignment.decode(bytes)).toEqual({ version: 3, assignment: {}, userData: null })
+      expect(MemberAssignment.encode({ version: 3, assignment: {}, userData: null })).toEqual(bytes)
+      expect(MemberAssignment.decode(Buffer.alloc(0))).toBeNull()
+    }
+  )
+})

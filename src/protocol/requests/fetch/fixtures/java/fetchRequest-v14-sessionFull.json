@@ -1,0 +1,7 @@
+{
+  "message": "FetchRequest",
+  "version": 14,
+  "case": "sessionFull",
+  "hex": "ffffffff000013880000000100a00000010000000000000000020102030405060708090a0b0c0d0e0f10020000000000000005000000000000002affffffffffffffffffffffff00008000000001077261636b2d6100",
+  "fields": { "replicaId": -1, "maxWaitMs": 5000, "minBytes": 1, "maxBytes": 10485760, "isolationLevel": 1, "sessionId": 0, "sessionEpoch": 0, "rackId": "rack-a", "topics": [{ "topicId": "01020304-0506-0708-090a-0b0c0d0e0f10", "partitions": [{ "partition": 0, "currentLeaderEpoch": 5, "fetchOffset": "42", "lastFetchedEpoch": -1, "logStartOffset": "-1", "maxBytes": 32768 }] }], "forgottenTopics": [] }
+}

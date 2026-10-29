@@ -95,6 +95,7 @@
   ]},
   {"family":"fetch/capture","route":"capture.js","evidenceKind":"capture","disposition":"retain","reason":"broker captures v18; no golden stands on it"},
   {"family":"fetch/hand","route":"hand","evidenceKind":"hand","disposition":"retain","reason":"hand-kept bytes v4, v5, v6, v7, v8, v9, v10, v11, v12, v13, v15, v16; no golden stands on it"},
+  {"family":"fetch/java","route":"javaVectors/GenerateMessageVectors.java","evidenceKind":"java-vector","disposition":"retain","reason":"Independent Fetch session, sparse, forgotten and close/error vectors v12-v18; literal fields and bytes are asserted in src/consumer/assigners/__tests__/javaVectors.spec.js; codec goldens remain with fetch/javaBuffer"},
   {"family":"fetch/javaBuffer","route":"javaVectors/GenerateVectors.java","evidenceKind":"java-vector","disposition":"retain","reason":"Java vector bytes v12, v13, v14, v15, v16, v17, v18; goldens stand on it","goldens":[
     {"direction":"request","versions":[12],"test":"encodes byte-identically to the vector Apache own codec produced"},
     {"direction":"response","versions":[12],"test":"decodes the vector Apache own codec produced"},

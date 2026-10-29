@@ -1,0 +1,7 @@
+{
+  "message": "FetchRequest",
+  "version": 14,
+  "case": "sessionClose",
+  "hex": "ffffffff000013880000000100a000000100000025ffffffff0101077261636b2d6100",
+  "fields": { "replicaId": -1, "maxWaitMs": 5000, "minBytes": 1, "maxBytes": 10485760, "isolationLevel": 1, "sessionId": 37, "sessionEpoch": -1, "rackId": "rack-a", "topics": [], "forgottenTopics": [] }
+}

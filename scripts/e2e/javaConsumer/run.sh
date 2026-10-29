@@ -5,8 +5,9 @@
 # are never committed.
 #
 # Usage: scripts/e2e/javaConsumer/run.sh [--group-protocol classic|consumer] [--report-group-type] \
-#          <bootstrapServers> <groupId> <topic> <assignor> <runForMs>
+#          <bootstrapServers> <groupId> <topicsCsv> <assignor> <runForMs>
 #        scripts/e2e/javaConsumer/run.sh --probe
+#        scripts/e2e/javaConsumer/run.sh --probe-topics <topicsCsv>
 #        scripts/e2e/javaConsumer/run.sh --describe-group <bootstrapServers> <groupId>
 #        scripts/e2e/javaConsumer/run.sh --role transactional-producer [--abort-every <n>] \
 #          [--hold-open-ms <ms>] [--crash-after-produce] \
@@ -58,8 +59,7 @@ for arg in "$@"; do
 done
 
 # --probe: download, compile and force-load only. The live spec runs this once at collection time
-# to decide whether the scenario can run at all - a missing JDK, an unreachable Maven Central or a
-# NoClassDefFoundError all fail here, before jest has built the suite, where a skip is still
-# expressible. Each member loads the classes it needs explicitly, because the JVM would otherwise
+# to require its prerequisites before joining; a missing JDK, unreachable Maven Central or
+# NoClassDefFoundError is a failed prerequisite. Each member loads the classes it needs explicitly, because the JVM would otherwise
 # resolve them lazily and a classpath hole would only surface mid-run.
-exec java -cp "${CP}:${WORK_DIR}" "${MEMBER_CLASS}" "$@"
+java -cp "${CP}:${WORK_DIR}" "${MEMBER_CLASS}" "$@"

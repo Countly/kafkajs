@@ -149,7 +149,7 @@ public final class GenerateAssignorVectors {
       Path dir = outDir.resolve("src/consumer/assigners/fixtures").resolve(spec.assignor);
       Files.createDirectories(dir);
       Files.writeString(
-          dir.resolve(spec.caseId + "_java.json"), run(spec) + "\n", StandardCharsets.UTF_8);
+          dir.resolve(spec.caseId + (spec.caseId.startsWith("rack_") ? "_java_rack.json" : "_java.json")), run(spec) + "\n", StandardCharsets.UTF_8);
       System.out.println("wrote " + spec.assignor + "/" + spec.caseId + "_java.json");
     }
   }
@@ -195,7 +195,13 @@ public final class GenerateAssignorVectors {
    * @return the fixture JSON for that case, without a trailing newline
    */
   private static String run(CaseSpec spec) {
-    Cluster cluster = clusterFor(spec.topics);
+    return run(spec, spec.caseId.startsWith("rack_") ? rackCluster(spec) : clusterFor(spec.topics));
+  }
+
+  /** @param spec case inputs @param cluster independent topology @return the fixture document */
+  private static String run(CaseSpec spec, Cluster cluster) {
+    List<Node> nodes = new ArrayList<>(cluster.nodes());
+    nodes.sort(java.util.Comparator.comparingInt(Node::id));
     Map<String, ConsumerPartitionAssignor.Subscription> subscriptions = new LinkedHashMap<>();
     Map<String, String> subscriptionBytes = new LinkedHashMap<>();
     Map<String, String> userDataBytes = new LinkedHashMap<>();
@@ -239,16 +245,18 @@ public final class GenerateAssignorVectors {
     json.append("  \"subscriptionVersion\": ").append(spec.subscriptionVersion).append(",\n");
     json.append("  \"assignmentVersion\": ").append(ASSIGNMENT_VERSION).append(",\n");
     json.append("  \"nodes\": [\n");
-    for (int i = 0; i < NODES.size(); i++) {
-      Node node = NODES.get(i);
+    for (int i = 0; i < nodes.size(); i++) {
+      Node node = nodes.get(i);
       json.append("    { \"id\": ")
           .append(node.id())
           .append(", \"host\": ")
           .append(quote(node.host()))
           .append(", \"port\": ")
           .append(node.port())
+          .append(spec.caseId.startsWith("rack_") ? ", \"rack\": " : "")
+          .append(spec.caseId.startsWith("rack_") ? quote(node.rack()) : "")
           .append(" }")
-          .append(i + 1 < NODES.size() ? ",\n" : "\n");
+          .append(i + 1 < nodes.size() ? ",\n" : "\n");
     }
     json.append("  ],\n");
 
@@ -260,7 +268,8 @@ public final class GenerateAssignorVectors {
         json.append("{ \"partition\": ")
             .append(partition)
             .append(", \"leader\": ")
-            .append(NODES.get(partition % NODES.size()).id())
+            .append(cluster.partition(new TopicPartition(entry.getKey(), partition)).leader().id())
+            .append(spec.caseId.startsWith("rack_") ? ", \"replicas\": " + intArray(java.util.Arrays.stream(cluster.partition(new TopicPartition(entry.getKey(), partition)).replicas()).map(Node::id).collect(java.util.stream.Collectors.toList())) : "")
             .append(" }")
             .append(partition + 1 < entry.getValue() ? ", " : "");
       }
@@ -787,6 +796,18 @@ public final class GenerateAssignorVectors {
     cases.add(vector("unassigned_topic", RANGE, twoEqualTopics, twoFresh));
     cases.add(vector("unassigned_topic", STICKY, twoEqualTopics, twoFresh));
 
+    cases.add(new CaseSpec("subscription_v0", RANGE, evenSplit, twoFresh, (short) 0, null));
+    cases.add(new CaseSpec("subscription_v2", RANGE, evenSplit, twoFresh, (short) 2, null));
+    cases.add(vector("empty_range", RANGE, topology("t-a", 0), twoFresh));
+    for (String shape : List.of("discriminating", "copartitioned", "missing", "nonintersecting", "all_replicas", "balance")) {
+      String rack1 = shape.equals("missing") ? null : shape.equals("nonintersecting") ? "rack-x" : "rack-a";
+      String rack2 = shape.equals("missing") ? null : shape.equals("nonintersecting") ? "rack-y" : "rack-b";
+      Map<String, Integer> topics = shape.equals("copartitioned") ? topology("t-a", 4, "t-b", 4) : topology("t-a", 4);
+      List<String> names = new ArrayList<>(topics.keySet());
+      cases.add(vector("rack_" + shape, RANGE, topics, List.of(
+          new MemberSpec("m-1", null, names, List.of(), -1, rack1, null),
+          new MemberSpec("m-2", null, names, List.of(), -1, rack2, null))));
+    }
     cases.add(largeHeterogeneous());
 
     return cases;
@@ -821,12 +842,30 @@ public final class GenerateAssignorVectors {
         userData);
   }
 
+  /** @param spec fixed rack case @return an RF2 topology, or the all-racks no-op control */
+  private static Cluster rackCluster(CaseSpec spec) {
+    List<Node> nodes = List.of(new Node(0, "broker-0", 9092, "rack-a"),
+        new Node(1, "broker-1", 9092, "rack-b"), new Node(2, "broker-2", 9092, "rack-c"));
+    List<PartitionInfo> partitions = new ArrayList<>();
+    for (String topic : spec.topics.keySet()) {
+      for (int partition = 0; partition < 4; partition++) {
+        int rack = partition < 2 ? 1 : 0;
+        if (spec.caseId.equals("rack_balance")) rack = partition == 3 ? 0 : 1;
+        Node[] replicas = spec.caseId.equals("rack_all_replicas") ? nodes.toArray(new Node[0])
+            : new Node[] {nodes.get(rack), nodes.get(2)};
+        partitions.add(new PartitionInfo(topic, partition, replicas[0], replicas, replicas));
+      }
+    }
+    return new Cluster(CLUSTER_ID, nodes, partitions, Collections.emptySet(), Collections.emptySet());
+  }
+
   /**
    * Ten topics of a hundred partitions each, fifty members, each subscribed to a rolling window of
    * five topics - the shape the general path's cost is argued on.
    *
    * @return the case
    */
+
   private static CaseSpec largeHeterogeneous() {
     Map<String, Integer> topics = new LinkedHashMap<>();
     for (int i = 0; i < 10; i++) {

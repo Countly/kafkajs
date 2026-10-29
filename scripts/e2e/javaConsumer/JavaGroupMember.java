@@ -28,7 +28,7 @@ import org.apache.kafka.common.TopicPartition;
  * cooperative callbacks report deltas, and the JavaScript side compares full sets.
  *
  * <p>Arguments: [--group-protocol classic|consumer] [--report-group-type] bootstrapServers
- * groupId topic assignor runForMs. Under {@code --group-protocol consumer} the assignor
+ * groupId topicsCsv assignor runForMs. Under {@code --group-protocol consumer} the assignor
  * argument is the SERVER assignor name. {@code --describe-group bootstrapServers groupId}
  * prints one group's type and state without joining.
  *
@@ -40,11 +40,12 @@ public final class JavaGroupMember {
    * Everything a real run resolves off the classpath. The JVM loads classes lazily, so a hole in
    * the classpath is invisible until the moment it is used; the pre-flight loads all of them,
    * static initializers included, so a missing dependency is reported where the caller can still
-   * turn it into a skip.
+   * report a failed prerequisite.
    */
   private static final String[] PROBE_CLASSES = {
     "org.apache.kafka.clients.consumer.KafkaConsumer",
     "org.apache.kafka.clients.consumer.RangeAssignor",
+    "org.apache.kafka.clients.consumer.RoundRobinAssignor",
     "org.apache.kafka.clients.consumer.StickyAssignor",
     "org.apache.kafka.clients.consumer.CooperativeStickyAssignor",
     "org.apache.kafka.clients.admin.Admin",
@@ -57,7 +58,7 @@ public final class JavaGroupMember {
    * group's type and exits.
    *
    * @param args {@code [--group-protocol classic|consumer] [--report-group-type]
-   *     bootstrapServers groupId topic assignor runForMs}, or {@code --probe}, or
+   *     bootstrapServers groupId topicsCsv assignor runForMs}, or {@code --probe}, or
    *     {@code --describe-group bootstrapServers groupId}
    */
   public static void main(String[] args) {
@@ -69,6 +70,10 @@ public final class JavaGroupMember {
       switch (args[i]) {
         case "--probe":
           probe();
+          return;
+        case "--probe-topics":
+          System.out.println("{\"event\":\"topics\",\"topics\":[\""
+              + String.join("\",\"", parseTopics(args[++i])) + "\"]}");
           return;
         case "--group-protocol":
           groupProtocol = args[++i];
@@ -95,7 +100,7 @@ public final class JavaGroupMember {
 
     String bootstrapServers = flagless.get(0);
     String groupId = flagless.get(1);
-    String topic = flagless.get(2);
+    List<String> topics = parseTopics(flagless.get(2));
     String assignor = flagless.get(3);
     long runForMs = Long.parseLong(flagless.get(4));
 
@@ -135,7 +140,7 @@ public final class JavaGroupMember {
 
     try (KafkaConsumer<byte[], byte[]> consumer = new KafkaConsumer<>(properties)) {
       consumer.subscribe(
-          Collections.singletonList(topic),
+          topics,
           new ConsumerRebalanceListener() {
             // Under cooperative-sticky these callbacks carry a DELTA, not the full set: only
             // the partitions gained or given up in that round. The JS side compares full
@@ -219,11 +224,30 @@ public final class JavaGroupMember {
   }
 
   /**
+   * Parses an ordered list of exact topic names without changing single-topic callers.
+   * @param csv comma-separated Kafka topic names
+   * @return distinct names in argument order
+   * @throws IllegalArgumentException for an empty, repeated or invalid topic name
+   */
+  private static List<String> parseTopics(String csv) {
+    Set<String> names = new LinkedHashSet<>();
+    for (String item : csv.split(",", -1)) {
+      String name = item.trim();
+      if (name.isEmpty() || name.length() > 249 || name.equals(".") || name.equals("..")
+          || !name.matches("[a-zA-Z0-9._-]+") || !names.add(name)) {
+        throw new IllegalArgumentException("topics must be distinct, nonempty Kafka topic names");
+      }
+    }
+    return new ArrayList<>(names);
+  }
+
+  /**
    * Loads every class a real run needs, running their static initializers, and exits non-zero
    * naming the first one that could not be resolved. The consumer and the three assignors all
    * hold static {@code LoggerFactory.getLogger(...)} fields, so a classpath missing slf4j fails
    * here rather than silently producing a member that never joins.
    */
+
   private static void probe() {
     for (String className : PROBE_CLASSES) {
       try {

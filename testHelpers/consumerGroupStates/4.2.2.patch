@@ -1,0 +1,10 @@
+--- a/group-coordinator/src/main/java/org/apache/kafka/coordinator/group/GroupMetadataManager.java
++++ b/group-coordinator/src/main/java/org/apache/kafka/coordinator/group/GroupMetadataManager.java
+@@ -2429,5 +2429,6 @@
+         final Assignment targetAssignment;
+ 
+-        if (groupEpoch > group.assignmentEpoch()) {
++        if (groupEpoch > group.assignmentEpoch()
++            && !AssignmentGate.shouldHold(groupId, groupEpoch, group.assignmentEpoch())) {
+             targetAssignment = updateTargetAssignment(
+                 group,

@@ -1,0 +1,7 @@
+{
+  "message": "FetchResponse",
+  "version": 12,
+  "case": "sessionError71",
+  "hex": "000000000047000000000100",
+  "fields": { "errorCode": 71, "sessionId": 0, "includeTopic": false, "partition": 0, "highWatermark": "100", "lastStableOffset": "100", "logStartOffset": "0", "preferredReadReplica": -1 }
+}

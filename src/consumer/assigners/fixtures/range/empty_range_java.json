@@ -1,0 +1,45 @@
+{
+  "assignor": "range",
+  "caseId": "empty_range",
+  "subscriptionVersion": 3,
+  "assignmentVersion": 3,
+  "nodes": [
+    { "id": 0, "host": "broker-0", "port": 9092 },
+    { "id": 1, "host": "broker-1", "port": 9092 }
+  ],
+  "topics": {
+    "t-a": []
+  },
+  "members": [
+    {
+      "memberId": "m-1",
+      "groupInstanceId": null,
+      "topics": ["t-a"],
+      "ownedPartitions": [],
+      "generationId": -1,
+      "rackId": null,
+      "userDataHex": null,
+      "subscriptionBytesHex": "0003000000010003742d61ffffffff00000000ffffffffffff"
+    },
+    {
+      "memberId": "m-2",
+      "groupInstanceId": null,
+      "topics": ["t-a"],
+      "ownedPartitions": [],
+      "generationId": -1,
+      "rackId": null,
+      "userDataHex": null,
+      "subscriptionBytesHex": "0003000000010003742d61ffffffff00000000ffffffffffff"
+    }
+  ],
+  "expected": {
+    "m-1": {
+    },
+    "m-2": {
+    }
+  },
+  "expectedAssignmentBytesHex": {
+    "m-1": "000300000000ffffffff",
+    "m-2": "000300000000ffffffff"
+  }
+}

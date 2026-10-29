@@ -1,0 +1,10 @@
+--- a/group-coordinator/src/main/java/org/apache/kafka/coordinator/group/GroupMetadataManager.java
++++ b/group-coordinator/src/main/java/org/apache/kafka/coordinator/group/GroupMetadataManager.java
+@@ -3864,5 +3864,6 @@
+         List<CoordinatorRecord> records
+     ) {
+-        if (group.assignmentEpoch() >= groupEpoch) {
++        if (group.assignmentEpoch() >= groupEpoch
++            || AssignmentGate.shouldHold(group.groupId(), groupEpoch, group.assignmentEpoch())) {
+             // The assignment is up to date.
+             return UpdateTargetAssignmentResult.fromLastTargetAssignment(group, updatedMember);
