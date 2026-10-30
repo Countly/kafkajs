@@ -491,7 +491,7 @@ class StateCapture {
     )
     const releasedAt = Date.now()
     const events = await this.gate('release')
-    await this.drive([A, B, C], () => false, TURN_MS, 'one heartbeat to retrigger').catch(() => {})
+    await this.drive([A, B, C], () => true, DESCRIBE_BUDGET_MS, 'one heartbeat to retrigger')
     const stable = await this.stabilise([A, B, C], 2)
     const final = await this.gate('read')
     return { arrived, samples, releasedAt, events: final.length ? final : events, stable }
