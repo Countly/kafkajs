@@ -342,6 +342,7 @@ public final class GenerateMessageVectors {
     vectors.addAll(fetchSessions());
     vectors.addAll(offsetFetch());
     vectors.addAll(offsetFetchRequireStable());
+    vectors.addAll(offsetFetchIdentity());
     vectors.addAll(initProducerId());
     vectors.addAll(addPartitionsToTxn());
     vectors.addAll(addOffsetsToTxn());
@@ -1328,6 +1329,118 @@ public final class GenerateMessageVectors {
                                         kv("errorCode", "0"))))))))));
 
     return vectors;
+  }
+
+  /**
+   * OffsetFetch (9) v8 and v9 responses that name a group: the identity the client compares with
+   * the group it asked about. v8 and v9 share one response layout, so each case is emitted at both.
+   *
+   * <p>{@code groupMatch} answers for {@code test-group} and {@code groupMismatch} for
+   * {@code other-group}; both carry one partition with a committed offset, a leader epoch and a
+   * non-null metadata string, and a throttle of 17 ms. {@code twoGroups} and {@code noGroups} are
+   * the cardinality controls: the client asks about one group, so neither is a valid answer.
+   *
+   * @return the key-9 identity vectors
+   */
+  private static List<Vector> offsetFetchIdentity() {
+    List<Vector> vectors = new ArrayList<>();
+    String api = "offsetFetch";
+    String response = "OffsetFetchResponse";
+    int throttleMs = 17;
+    String metadata = "read-check";
+
+    for (short version : new short[] {8, 9}) {
+      OffsetFetchResponseData.OffsetFetchResponseGroup match = identityGroup(GROUP_ID, metadata);
+      OffsetFetchResponseData.OffsetFetchResponseGroup other =
+          identityGroup(OTHER_GROUP_ID, metadata);
+
+      vectors.add(
+          new Vector(api, response, version, "groupMatch",
+              new OffsetFetchResponseData()
+                  .setThrottleTimeMs(throttleMs)
+                  .setGroups(Collections.singletonList(match)),
+              obj(
+                  kv("throttleTime", String.valueOf(throttleMs)),
+                  identityGroupFields(GROUP_ID, metadata))));
+      vectors.add(
+          new Vector(api, response, version, "groupMismatch",
+              new OffsetFetchResponseData()
+                  .setThrottleTimeMs(throttleMs)
+                  .setGroups(Collections.singletonList(other)),
+              obj(
+                  kv("throttleTime", String.valueOf(throttleMs)),
+                  identityGroupFields(OTHER_GROUP_ID, metadata))));
+      vectors.add(
+          new Vector(api, response, version, "twoGroups",
+              new OffsetFetchResponseData()
+                  .setThrottleTimeMs(throttleMs)
+                  .setGroups(Arrays.asList(match, other)),
+              obj(
+                  kv("throttleTime", String.valueOf(throttleMs)),
+                  kv("groups",
+                      array(
+                          obj(identityGroupFields(GROUP_ID, metadata)),
+                          obj(identityGroupFields(OTHER_GROUP_ID, metadata)))))));
+      vectors.add(
+          new Vector(api, response, version, "noGroups",
+              new OffsetFetchResponseData()
+                  .setThrottleTimeMs(throttleMs)
+                  .setGroups(Collections.emptyList()),
+              obj(kv("throttleTime", String.valueOf(throttleMs)), kv("groups", "[]"))));
+    }
+
+    return vectors;
+  }
+
+  /**
+   * One group of an OffsetFetch response: a single committed partition of the test topic.
+   *
+   * @param groupId the group the answer names
+   * @param metadata the committed metadata string
+   * @return the response group
+   */
+  private static OffsetFetchResponseData.OffsetFetchResponseGroup identityGroup(
+      String groupId, String metadata) {
+    return new OffsetFetchResponseData.OffsetFetchResponseGroup()
+        .setGroupId(groupId)
+        .setErrorCode((short) 0)
+        .setTopics(
+            Collections.singletonList(
+                new OffsetFetchResponseData.OffsetFetchResponseTopics()
+                    .setName(TOPIC_NAME)
+                    .setPartitions(
+                        Collections.singletonList(
+                            new OffsetFetchResponseData.OffsetFetchResponsePartitions()
+                                .setPartitionIndex(PARTITION_INDEX)
+                                .setCommittedOffset(COMMITTED_OFFSET)
+                                .setCommittedLeaderEpoch(COMMITTED_LEADER_EPOCH)
+                                .setMetadata(metadata)
+                                .setErrorCode((short) 0)))));
+  }
+
+  /**
+   * The expected fields of {@link #identityGroup}, written as literals independent of the builder.
+   *
+   * @param groupId the group the answer names
+   * @param metadata the committed metadata string
+   * @return the group's members as comma-separated key-value entries, without enclosing braces
+   */
+  private static String identityGroupFields(String groupId, String metadata) {
+    return String.join(", ",
+        kv("groupId", str(groupId)),
+        kv("errorCode", "0"),
+        kv("topics",
+            array(
+                obj(
+                    kv("topic", str(TOPIC_NAME)),
+                    kv("partitions",
+                        array(
+                            obj(
+                                kv("partition", String.valueOf(PARTITION_INDEX)),
+                                kv("offset", str(String.valueOf(COMMITTED_OFFSET))),
+                                kv("leaderEpoch", String.valueOf(COMMITTED_LEADER_EPOCH)),
+                                kv("metadata", str(metadata)),
+                                kv("errorCode", "0"))))))));
   }
 
   /**

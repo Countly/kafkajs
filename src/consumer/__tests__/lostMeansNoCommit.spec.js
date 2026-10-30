@@ -523,8 +523,12 @@ describe('handler context contents', () => {
           assignmentEpoch: fixture.group.assignmentEpoch,
           acquireClock: fixture.group.acquireClock,
           ownershipKey: `${SCHEDULED_TOPIC}|0`,
+          runIdentity: fixture.group.runIdentity,
         })
-        expect(Object.values(store).every((value) => Object(value) !== value)).toBe(true)
+        // Everything but the run's own identity is a primitive: no batch, message or buffer is kept.
+        const { runIdentity, ...rest } = store
+        expect(runIdentity).not.toBe(batch)
+        expect(Object.values(rest).every((value) => Object(value) !== value)).toBe(true)
       } finally {
         await fixture.close()
       }

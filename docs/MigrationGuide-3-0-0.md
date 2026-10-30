@@ -954,6 +954,9 @@ Connection or coordinator failures in the consumer protocol no longer spend the 
 
 - If you subscribed a RegExp and relied on a fixed set of topics, pass the names instead: a consumer of literal names behaves as before. Internal topics are excluded from regex matches only; subscribe to one by name to read it. A pattern consumer caches the metadata of every topic in the cluster; on a very large cluster prefer a narrower pattern or the broker-side `subscribe({ regex })` under `groupProtocol: 'consumer'`. Subscription matching ignores g and y flags (other flags/partial matching preserved). A post-initial-discovery addition without incarnation-continuity proof starts from its reset policy, including conservatively a newly discovered name; initial subscription and continuously observed incarnation preserve ordinary committed-offset behavior. A post-initial addition without a usable topic ID is withheld from Fetch and OffsetFetch until metadata establishes its incarnation. Narrower patterns reduce matching/assignment work, not all-topics metadata bytes. metadataMaxAge (default 5 minutes) permits refresh at opportunities; blocked application handlers can delay discovery beyond it
 
+- Pass a `groupId` for any consumer that subscribes. A consumer that only `assign`s partitions may omit it and reads without a group; null/empty/non-string groupId reject, groupMetadata also needs a group.
+- Treat a mismatching-group OffsetFetch refusal as an invalid broker response; do not use offsets from another group.
+
 ### Admin
 
 Group visibility and the admin client.
@@ -1226,6 +1229,8 @@ now logged.
 - **A producer delivery timeout can include transmission evidence.** `KafkaJSDeliveryTimeout.outcome` is optional and is `'unsent'` or `'unknown'`; its absence says nothing about delivery. Earlier written attempts keep the outcome unknown even if a later reply was retriable. The timeout copies the last cause's `type` and `code` when available, so existing protocol-type checks can inspect them. Other error classes do not acquire an outcome, and a `retry.maxTotalTime` timeout outside a producer still omits it.
 - `KafkaJSCorruptRecordError` has three new `reason` values, `checksum`, `decompressed-size` and `decompression`, and the optional `nextOffset` (where `consumer.seek` goes to skip the batch; present only for a validated batch boundary), `codec` and `limit`. `KafkaJSPartialMessageError#crcMismatch` is deprecated and no longer set: a checksum mismatch is a `KafkaJSCorruptRecordError`.
 - **A forced producer close reports `KafkaJSProducerClosedError` with transmission evidence.** `outcome` is `'unsent'` for work that was never written and `'unknown'` for anything written at least once, which may still have been applied by the broker. The error is non-retriable and its `category` is `abortable`. A class without an `outcome`, or the absence of an error, proves nothing about delivery.
+
+- Switches handling partition-halted reasons keep the two reset reasons added with offsetReset. No-group CRASH/halt groupId is null. Existing corrupt/decode offset stays decimal and decode metadata fields remain available. TypeScript ≥4.1 remains required for the duration template-literal type.
 
 ### Protocol
 

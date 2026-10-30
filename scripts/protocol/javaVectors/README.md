@@ -51,7 +51,7 @@ that is removed afterwards when the variable is unset and reused when it is set.
 | ListGroups | 16 | 3, 4, 5 | 8 |
 | DescribeGroups | 15 | 3, 4, 5, 6 | 9 |
 | OffsetCommit | 8 | 9, 10 | 5 |
-| OffsetFetch | 9 | 7, 8, 9, 10 | 13 |
+| OffsetFetch | 9 | 7, 8, 9, 10 | 21 |
 | InitProducerId | 22 | 3, 4, 5 | 9 |
 | AddPartitionsToTxn | 24 | 2, 3 | 6 |
 | AddOffsetsToTxn | 25 | 2, 3, 4 | 9 |
@@ -73,6 +73,32 @@ that is removed afterwards when the variable is unset and reused when it is set.
 | SyncGroup | 14 | 4, 5 | 6 |
 | Heartbeat | 12 | 4 | 3 |
 | LeaveGroup | 13 | 4, 5 | 9 |
+
+### OffsetFetch v8 and v9 identity vectors
+
+`offsetFetchResponse-v8-*` and `offsetFetchResponse-v9-*` (`groupMatch`, `groupMismatch`, `twoGroups`,
+`noGroups`) pin what the client compares with the group it asked about. v8 and v9 share one response
+layout, so each case has the same bytes at both versions. `groupMatch` answers for `test-group` and
+`groupMismatch` for `other-group`; both carry one partition (offset 10, leader epoch 3, metadata
+`read-check`) and a throttle of 17 ms. `twoGroups` and `noGroups` are the cardinality controls. The
+expected `fields` are literals of the generator, written independently of the builders, and
+`src/protocol/requests/offsetFetch/identityVectors.spec.js` decodes the bytes through the production
+codec and the Broker.
+
+Written offline with `JAVA_VECTORS_WORK_DIR` pointing at a directory that already holds the two jars,
+so the script downloads nothing:
+
+```sh
+JAVA_VECTORS_WORK_DIR=<dir with the jars> scripts/protocol/javaVectors/runAssignors.sh messages <output-dir>
+```
+
+| Jar | SHA-1 |
+|---|---|
+| `kafka-clients-4.3.1.jar` | `74209a28d36f819b2f7a9b599e468b5654cad514` |
+| `slf4j-api-1.7.36.jar` | `6c62681a2f655b49963a5983b8b0950a6120ae14` |
+
+Both match the checksums Maven Central publishes. The run regenerated every other vector of the script
+byte for byte, so only the eight new files differ from the committed set.
 
 `runAssignors.sh` with no subcommand, or with `assignors`, does exactly what it did before, and
 `run.sh`/`GenerateVectors.java` are unchanged and still own every vector the message generator

@@ -35,20 +35,24 @@ module.exports = {
   /**
    * @param {object} [fields] over the vector's: `throttleTime`, `groupId`, `errorCode` and
    *   `topics` (`{ topic, partitions }`, a partition being `{ partition, offset, leaderEpoch,
-   *   metadata, errorCode }`)
+   *   metadata, errorCode }`); or `groups`, a list of `{ groupId, errorCode, topics }`, which
+   *   replaces the three group fields and may hold none or several
    * @returns {Buffer} the response body
    */
   buildResponse(fields = {}) {
     const response = { ...vector.fields, ...fields }
-    const group = new Encoder()
-      .writeUVarIntString(response.groupId)
-      .writeUVarIntArray(response.topics.map(encodeTopic))
-      .writeInt16(response.errorCode)
-      .writeTaggedFields()
+    const groups = response.groups ?? [response]
+    const encoded = groups.map((entry) =>
+      new Encoder()
+        .writeUVarIntString(entry.groupId)
+        .writeUVarIntArray(entry.topics.map(encodeTopic))
+        .writeInt16(entry.errorCode)
+        .writeTaggedFields()
+    )
 
     return new Encoder()
       .writeInt32(response.throttleTime)
-      .writeUVarIntArray([group])
+      .writeUVarIntArray(encoded)
       .writeTaggedFields().buffer
   },
 

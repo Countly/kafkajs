@@ -9,7 +9,7 @@ type XOR<T, U> = T | U extends object ? (Without<T, U> & U) | (Without<U, T> & T
 export class Kafka {
   constructor(config: KafkaConfig)
   producer(config?: ProducerConfig): Producer
-  consumer(config: ConsumerConfig): Consumer
+  consumer(config: ConsumerConfig | DirectConsumerConfig): Consumer
   admin(config?: AdminConfig): Admin
   logger(): Logger
 }
@@ -248,6 +248,26 @@ export type PartitionMetadata = {
 
 export interface IHeaders {
   [key: string]: Buffer | string | (Buffer | string)[] | undefined
+}
+
+/** Manual consumers may omit their group; subscription and group offset APIs then reject. */
+export interface DirectConsumerConfig extends Omit<ConsumerConfig, 'groupId'> {
+  groupId?: string
+}
+
+/** Reset options for an entire replacement manual assignment. */
+export interface ConsumerAssignOptions {
+  fromBeginning?: boolean
+  offsetReset?: ConsumerOffsetReset
+}
+
+/** A live broker offset observation, independent of local ownership or resolved position. */
+export interface ConsumerCommittedOffset {
+  topic: string
+  partition: number
+  /** Decimal next offset, or null when no offset was committed. */
+  offset: string | null
+  metadata: string | null
 }
 
 export interface ConsumerConfig {
@@ -1666,7 +1686,7 @@ export type ConsumerEndBatchProcessEvent = InstrumentationEvent<
 >
 export type ConsumerCrashEvent = InstrumentationEvent<{
   error: Error
-  groupId: string
+  groupId: string | null
   restart: boolean
 }>
 export type ConsumerRebalancingEvent = InstrumentationEvent<{
@@ -1699,7 +1719,7 @@ export type ConsumerPartitionsAssignedEvent = ConsumerPartitionsEvent
 export type ConsumerPartitionsRevokedEvent = ConsumerPartitionsEvent
 export type ConsumerPartitionsLostEvent = ConsumerPartitionsEvent
 export interface ConsumerPartitionHaltedBase {
-  groupId: string
+  groupId: string | null
   memberId: string
   topic: string
   partition: number
@@ -1867,6 +1887,37 @@ export type Consumer = {
   pause(topics: Array<{ topic: string; partitions?: number[] }>): void
   paused(): TopicPartitions[]
   resume(topics: Array<{ topic: string; partitions?: number[] }>): void
+  /**
+   * Validates and replaces a manual assignment before run; exclusive with subscribe until unsubscribe.
+   * @param topicPartitions nonempty topic rows with unique valid partition IDs
+   * @param options reset policy for the replacement
+   * @returns completion after metadata validation and atomic selection
+   * @throws KafkaJSNonRetriableError for invalid input, unavailable partitions or incompatible mode
+   */
+  assign(topicPartitions: TopicPartitions[], options?: ConsumerAssignOptions): Promise<void>
+  /**
+   * Stops first, then clears subscription/manual intent while keeping the connection.
+   * @returns completion after stop and retirement; a failed stop propagates
+   */
+  unsubscribe(): Promise<void>
+  /** @returns sorted defensive acquired assignment; empty before join or after stop */
+  assignment(): TopicPartitions[]
+  /** @returns sorted defensive subscribed names; empty for manual consumers */
+  subscription(): string[]
+  /**
+   * Resolves pending seek/reset work and reads the latest position within the same acquisition.
+   * @param topicPartition currently acquired topic and partition
+   * @returns nonnegative decimal next position, including sparse/control offsets
+   * @throws Error for invalid input, acquisition retirement or reset refusal
+   */
+  position(topicPartition: TopicPartition): Promise<string>
+  /**
+   * Reads stable broker offsets without changing local position or borrowing membership identity.
+   * @param topicPartitions unique valid pairs, assigned or unassigned; empty needs no request
+   * @returns rows in input order with nullable offsets and commit metadata
+   * @throws Error without a group or for invalid input, broker failure or foreign-group response
+   */
+  committed(topicPartitions: TopicPartition[]): Promise<ConsumerCommittedOffset[]>
   on(
     eventName: ConsumerEvents['HEARTBEAT'],
     listener: (event: ConsumerHeartbeatEvent) => void

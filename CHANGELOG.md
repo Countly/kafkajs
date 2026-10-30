@@ -37,6 +37,14 @@ Versions before 3.0.0 are internal alpha tags and are not published.
 
 - **A `RegExp` subscription is re-evaluated at every metadata refresh**: topics created later that match join, topics deleted leave, internal topics (`__consumer_offsets`, …) are no longer matched by `/.*/`, and a `g` or `y` flag no longer drops matching topics. **A consumer that subscribes a pattern refreshes metadata for all topics** (as the Java client does); a literal topic subscribed beside a pattern is not auto-created by that consumer. A post-initial addition without a usable topic ID waits for metadata to establish its incarnation before Fetch or OffsetFetch
 
+- **A consumer built without a `groupId` no longer throws at construction**; the first call that needs a group (`subscribe`, `commitOffsets`, `committed`, `describeGroup`, `groupMetadata`) throws the same message. An empty-string or non-string `groupId` still throws at construction. Without a group, `autoCommit` defaults to false and `autoCommit: true` is rejected.
+
+- No-group CRASH and partition-halted event payloads use groupId null. Existing corrupt/decode payload fields and decimal offsets are preserved.
+
+- OffsetFetch v8/v9 answers for a different group are refused with KafkaJSInvariantViolation naming requested and returned groups; matching responses and older versions are unchanged.
+
+- The handler async context now carries the identity of the run that delivered the batch, and `seek`, `position`, `assign`, `unsubscribe`, `commitOffsets`, `subscribe`, `run`, `connect`, `pause`, `resume`, `stop` and `disconnect` called from a handler of a retired run reject with `CONSUMER_STOPPING` instead of acting on a replacement run.
+
 #### Fixes
 
 - Fence unknown-target metadata responses before cache installation and keep periodic naming attempts after the fast discovery budget.
@@ -56,6 +64,8 @@ Versions before 3.0.0 are internal alpha tags and are not published.
 - Add opt-in rackAwareAssignment for range assignment; other assigners ignore it.
 
 - Add per-subscription offsetReset policies and KafkaJSNoOffsetError, with partition halts for none and timestamp-based by_duration resets.
+
+- Manual assignment and unsubscribe; defensive assignment/subscription getters; next-position and broker-committed offset reads; a direct consumer constructor that may omit groupId. Assignment accepts the existing offsetReset policies. The lifecycle matrix gains 108 manual cells (434 in total).
 
 #### Tooling
 

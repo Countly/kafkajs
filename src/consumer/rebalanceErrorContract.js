@@ -113,7 +113,7 @@ const isConsumerProtocolFatal = (error) =>
  * @see https://github.com/apache/kafka/blob/4.3/clients/src/main/java/org/apache/kafka/clients/consumer/internals/AbstractHeartbeatRequestManager.java
  * @param {Error} error
  * @param {string} path one of `REBALANCE_PATHS`
- * @param {{ kind?: 'classic' | 'consumer' }} [membership] which membership protocol raised it. The
+ * @param {{ kind?: 'classic' | 'consumer' | 'manual' }} [membership] which membership protocol raised it. The
  *   default keeps every classic caller's answer identical; three codes classify differently under
  *   the consumer protocol, where a coordinator move is not a rebalance and the group's fatal errors
  *   must not be rejoined into
@@ -124,6 +124,10 @@ const isConsumerProtocolFatal = (error) =>
 const rebalanceAction = (error, path, { kind = 'classic' } = {}) => {
   if (!PATH_VALUES.has(path)) {
     throw new Error(`Unknown rebalance path "${path}"`)
+  }
+
+  if (kind === 'manual') {
+    return { action: null, fatal: false, clearsMemberId: false }
   }
 
   if (isPollIntervalExceeded(error)) {
@@ -200,12 +204,14 @@ const rebalanceAction = (error, path, { kind = 'classic' } = {}) => {
  * @see https://cwiki.apache.org/confluence/display/KAFKA/KIP-848%3A+The+Next+Generation+of+the+Consumer+Rebalance+Protocol
  * @see https://github.com/apache/kafka/blob/4.3/clients/src/main/java/org/apache/kafka/clients/consumer/internals/AbstractHeartbeatRequestManager.java
  * @param {Error} error
- * @param {{ kind?: 'classic' | 'consumer' }} [membership]
+ * @param {{ kind?: 'classic' | 'consumer' | 'manual' }} [membership]
  * @returns {'lost'|'fenced'|'poll-interval-exceeded'|'rebalance-in-progress'|'coordinator-changed'|null}
  *   null for an error that is not a rebalance at all. `assignment-changed` is never returned: it is
  *   supplied by whoever raises the verdict, because no error describes it
  */
 const rebalanceReason = (error, { kind = 'classic' } = {}) => {
+  if (kind === 'manual') return null
+
   if (isPollIntervalExceeded(error)) {
     return 'poll-interval-exceeded'
   }
@@ -390,7 +396,7 @@ const obsoleteOwnership = (ownership, error) => {
  * @param {object|null} ownership the consumer's membership fence
  * @param {Error} error the original, stamped operation error
  * @param {string} path one of REBALANCE_PATHS
- * @param {'classic'|'consumer'} kind the group protocol
+ * @param {'classic'|'consumer'|'manual'} kind the assignment protocol
  * @returns {boolean} whether this current operation learned a path-aware loss
  */
 const learnOwnershipLoss = (ownership, error, path, kind) => {
@@ -404,15 +410,16 @@ const learnOwnershipLoss = (ownership, error, path, kind) => {
 
 /**
  * Applies one generation-staleness rule at both ownership loss and verdict admission. Consumer
- * epochs may advance inside the same membership; only the ownership token can retire that work.
+ * epochs may advance inside the same membership; only the ownership token can retire that work. A
+ * manual run has no generation, so a sent generation is never a staleness signal for it.
  * @param {{ kind: string, error: Error }} verdict candidate membership verdict
  * @param {'classic'|'consumer'|'manual'} kind membership protocol
  * @param {number|null} generationId current generation or member epoch
  * @returns {boolean} true only for an old classic generation's non-static lost verdict
  */
 const isStaleMembershipVerdict = (verdict, kind, generationId) => {
-  if (verdict.kind !== 'lost' || isFencedInstance(verdict.error) || kind === 'consumer')
-    return false
+  if (verdict.kind !== 'lost' || isFencedInstance(verdict.error)) return false
+  if (kind === 'consumer' || kind === 'manual') return false
   const sentUnder = sentGeneration(verdict.error)
   return generationId != null && sentUnder != null && sentUnder !== generationId
 }

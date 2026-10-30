@@ -69,7 +69,7 @@ const COUNTS = {
   listPartitionReassignments: 2,
   metadata: 19,
   offsetCommit: 14,
-  offsetFetch: 15,
+  offsetFetch: 23,
   offsetForLeaderEpoch: 5,
   produce: 25,
   saslAuthenticate: 6,

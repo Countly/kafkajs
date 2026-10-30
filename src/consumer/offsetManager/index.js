@@ -83,7 +83,10 @@ module.exports = class OffsetManager {
    * @param {number | null} options.autoCommitThreshold
    * @param {{[topic: string]: { fromBeginning: boolean }}} options.topicConfigurations
    * @param {import("../../instrumentation/emitter")} options.instrumentationEmitter
-   * @param {string} options.groupId
+   * @param {string} [options.groupId] absent for a consumer without a group: no coordinator,
+   *                                OffsetFetch or OffsetCommit is ever used, and every position is local
+   * @param {Record<string, Record<number, string>>} [options.offsets] the private committed-offset
+   *                                cache of a consumer without a group; unused when a group is set
    * @param {number} options.generationId
    * @param {string} options.memberId
    * @param {string} [options.groupInstanceId=null] Static membership id (KIP-345); carried on
@@ -98,8 +101,9 @@ module.exports = class OffsetManager {
    * @param {ResetObligations} [options.obligations] The resets this consumer owes recreated topics
    *                                (owned by the long-lived `Consumer`; shared by reference across
    *                                every `OffsetManager` a session builds).
-   * @param {'classic'|'consumer'} [options.membershipProtocol='classic'] which group protocol this
-   *                                member runs. Under `'consumer'` the offset fetch carries the
+   * @param {'classic'|'consumer'|'manual'} [options.membershipProtocol='classic'] which group
+   *                                protocol this member runs; `'manual'` sends simple-consumer
+   *                                identity and never a member id or epoch. Under `'consumer'` the offset fetch carries the
    *                                member id and epoch, which is how the coordinator validates a
    *                                read against a live member (KIP-848).
    * @param {number} [options.staleEpochTimeout=300000] how long an offset fetch answered with
@@ -148,6 +152,7 @@ module.exports = class OffsetManager {
     topicConfigurations,
     instrumentationEmitter,
     groupId,
+    offsets,
     generationId,
     memberId,
     groupInstanceId = null,
@@ -184,6 +189,7 @@ module.exports = class OffsetManager {
     this.topicConfigurations = topicConfigurations
     this.instrumentationEmitter = instrumentationEmitter
     this.groupId = groupId
+    this.privateOffsets = offsets
     this.generationId = generationId
     this.memberId = memberId
     this.groupInstanceId = groupInstanceId
@@ -754,7 +760,7 @@ module.exports = class OffsetManager {
       return true
     }
 
-    if (!this.autoCommit) {
+    if (!this.autoCommit || this.groupId === undefined) {
       const ticket = this.operations.begin([{ topic, partition }], { mutation: true })
 
       try {
@@ -806,23 +812,29 @@ module.exports = class OffsetManager {
     const release = this.ownership?.retain(token)
 
     try {
-      await this.sendOffsetCommit(
-        {
-          groupId,
-          memberId,
-          groupGenerationId: generationId,
-          groupInstanceId,
-          topics: [{ topic, partitions: [{ partition, offset }] }],
-        },
-        { guard, ...(preparation && { fence: preparation.fence }) }
-      )
+      if (groupId !== undefined) {
+        await this.sendOffsetCommit(
+          {
+            groupId,
+            memberId,
+            groupGenerationId: generationId,
+            groupInstanceId,
+            topics: [{ topic, partitions: [{ partition, offset }] }],
+          },
+          { guard, ...(preparation && { fence: preparation.fence }) }
+        )
+      }
 
       if (guard?.() || this.operations.isSuperseded(ticket, topic, partition)) {
         return false
       }
 
       this.clearOffsets({ topic, partition })
-      if (!isInvalidOffset(offset) && this.isConfirmedIncarnation(topic, requestedId)) {
+      if (
+        groupId !== undefined &&
+        !isInvalidOffset(offset) &&
+        this.isConfirmedIncarnation(topic, requestedId)
+      ) {
         this.operations.apply(ticket, topic, partition)
       } else this.operations.fence(ticket, topic, partition)
       return true
@@ -947,6 +959,7 @@ module.exports = class OffsetManager {
    * @returns {Promise<void>}
    */
   async commitOffsets(offsets = {}, options = {}) {
+    if (this.groupId === undefined) return
     if (!this.ownership && !options.guard) return this.commitWithOwnership(offsets, options)
     const token = this.ownership?.token()
     const release = this.ownership?.retain(token)
@@ -1726,6 +1739,22 @@ module.exports = class OffsetManager {
    *   preparation's refusal
    */
   async fetchCommittedOffsets(topics, preparation) {
+    if (this.groupId === undefined) {
+      this.refuse(preparation)
+      return {
+        responses: topics.map(({ topic, partitions }) => ({
+          topic,
+          partitions: partitions.map(({ partition }) => ({
+            partition,
+            offset: '-1',
+            committedLeaderEpoch: -1,
+            metadata: null,
+            errorCode: 0,
+          })),
+        })),
+      }
+    }
+
     const deadline = performance.now() + this.staleEpochTimeout
     let unstableInterval = RETRY_INTERVAL
 
@@ -1858,14 +1887,15 @@ module.exports = class OffsetManager {
    * Looked up from the cluster on first use and kept by reference, so every participant of the
    * group on one `Kafka` instance (other consumers, a producer's transactional publication) reads
    * and writes the same object, with its writes ordered through the operation ledger. A manager
-   * without a `groupId` has a private empty one.
+   * without a `groupId` uses the private cache it was given, or an empty one.
    * @returns {{[topic: string]: {[partition: number|string]: string}}}
    */
   committedOffsets() {
     if (!this[PRIVATE.COMMITTED_OFFSETS]) {
-      this[PRIVATE.COMMITTED_OFFSETS] = this.groupId
-        ? this.cluster.committedOffsets({ groupId: this.groupId })
-        : {}
+      this[PRIVATE.COMMITTED_OFFSETS] =
+        this.groupId === undefined
+          ? this.privateOffsets || dictionary()
+          : this.cluster.committedOffsets({ groupId: this.groupId })
     }
 
     return this[PRIVATE.COMMITTED_OFFSETS]

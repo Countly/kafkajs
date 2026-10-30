@@ -350,7 +350,7 @@ describe('independent group offset identity', () => {
     if (cluster) await cluster.disconnect()
     if (seam) seam.assertClean()
   })
-  it.failing('refuses offsets returned for a different group', () => {
+  it('refuses offsets returned for a different group', () => {
     expect(observed).toEqual(
       expect.objectContaining({
         name: 'KafkaJSInvariantViolation',

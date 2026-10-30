@@ -1,0 +1,7 @@
+{
+  "message": "OffsetFetchResponse",
+  "version": 9,
+  "case": "noGroups",
+  "hex": "000000110100",
+  "fields": { "throttleTime": 17, "groups": [] }
+}

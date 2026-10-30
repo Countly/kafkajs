@@ -7,6 +7,7 @@ const { NO_TOPIC_ID } = require('../protocol/requests/topicIds')
 const { assertSameProtocol } = require('../protocol/requests/groupProtocolCheck')
 const {
   KafkaJSConnectionClosedError,
+  KafkaJSInvariantViolation,
   KafkaJSNonRetriableError,
   KafkaJSServerDoesNotSupportApiKey,
 } = require('../errors')
@@ -1385,17 +1386,37 @@ module.exports = class Broker {
       requests.OffsetFetch,
       topicIds === undefined ? OFFSETS_TOPIC_NAMES_MAX_VERSION : undefined
     )
-    return await this[PRIVATE.SEND_REQUEST](
-      offsetFetch({
-        groupId,
-        topics,
-        topicIds,
-        memberId,
-        memberEpoch,
-        requireStable,
-      }),
-      guard
-    )
+    const protocolRequest = offsetFetch({
+      groupId,
+      topics,
+      topicIds,
+      memberId,
+      memberEpoch,
+      requireStable,
+    })
+    const { apiVersion } = protocolRequest.request
+    if (apiVersion === 8 || apiVersion === 9) {
+      const response = protocolRequest.response
+      protocolRequest.response = {
+        ...response,
+        /**
+         * Refuses a foreign group's answer before ordinary protocol error parsing.
+         * @param {object} data decoded response retaining its single group identity
+         * @returns {Promise<object>} the ordinary parsed response
+         * @throws {KafkaJSInvariantViolation} when requested and returned identities differ
+         * @throws {Error} for an ordinary matching-group protocol failure
+         */
+        parse: async (data) => {
+          if (data.groupId !== groupId) {
+            throw new KafkaJSInvariantViolation(
+              `OffsetFetch requested group "${groupId}" but received group "${data.groupId}"`
+            )
+          }
+          return response.parse(data)
+        },
+      }
+    }
+    return await this[PRIVATE.SEND_REQUEST](protocolRequest, guard)
   }
 
   /**

@@ -433,6 +433,8 @@ module.exports = class RebalanceCoordinator {
    * @returns {void}
    */
   requestRejoin(verdict) {
+    // A manual run has no membership to rejoin: its offset refusals are returned to their caller.
+    if (this.consumerGroup.kind === 'manual') return
     if (obsoleteOwnership(this.consumerGroup.ownership, verdict.error)) return
     if (verdict.kind === 'lost') {
       const ownership = this.consumerGroup.ownership
@@ -591,6 +593,7 @@ module.exports = class RebalanceCoordinator {
    * @returns {Promise<void>}
    */
   async onPollExpired({ elapsedMs, isStatic }) {
+    if (this.consumerGroup.kind === 'manual') return
     const maxPollInterval = this.pollTimer.deadline()
     const ownership = this.consumerGroup.ownership
     const expiryError = stampOwnership(

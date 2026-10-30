@@ -23,6 +23,7 @@ const {
 } = require('./instrumentationEvents')
 const {
   KafkaJSError,
+  KafkaJSNonRetriableError,
   KafkaJSStaleTopicMetadataAssignment,
   KafkaJSNoOffsetError,
   isRebalancing,
@@ -42,6 +43,7 @@ const apiKeys = require('../protocol/requests/apiKeys')
 const { requests } = require('../protocol/requests')
 const ClassicGroupProtocol = require('./groupProtocol/classic')
 const ConsumerGroupProtocol = require('./groupProtocol/consumer')
+const ManualGroupProtocol = require('./groupProtocol/manual')
 const {
   sentGeneration,
   isStaleMembershipVerdict,
@@ -174,6 +176,14 @@ module.exports = class ConsumerGroup {
    * @param {number} [options.heartbeatInterval=3000] the configured heartbeat cadence. Forwarded to
    *                                the classic membership, which owns the interval; under the
    *                                consumer protocol the coordinator owns it and this is ignored.
+   * @param {{isCurrent: () => boolean}} [options.runIdentity] the unique identity of the run that
+   *                                built this group; carried by handlers so a retired run's caller
+   *                                is never mistaken for a replacement's.
+   * @param {{topic: string, partitions: number[]}[]} [options.manual] a validated manual selection;
+   *                                when present the group runs the local manual protocol and never
+   *                                joins a group, heartbeats or polls for membership.
+   * @param {Record<string, Record<number, string>>} [options.privateOffsets] the committed-offset
+   *                                cache of a consumer without a group, passed to every manager.
    */
   constructor({
     retry,
@@ -209,10 +219,15 @@ module.exports = class ConsumerGroup {
     subscription = null,
     maxPrefetchBatches = 0,
     heartbeatInterval = 3000,
+    runIdentity = null,
+    manual = null,
+    privateOffsets = undefined,
   }) {
     /** @type {import("../../types").Cluster} */
     this.cluster = cluster
     this.groupId = groupId
+    this.runIdentity = runIdentity
+    this.privateOffsets = privateOffsets
     this.topics = topics
     this.topicsSubscribed = topics
     this.topicConfigurations = topicConfigurations
@@ -274,8 +289,14 @@ module.exports = class ConsumerGroup {
     }
 
     /** @type {import('./groupProtocol/interface').GroupProtocol} */
-    this.groupMembership =
-      groupProtocol === 'consumer'
+    this.groupMembership = manual
+      ? new ManualGroupProtocol({
+          cluster,
+          groupId,
+          topicPartitions: manual,
+          runIdentity: runIdentity || { isCurrent: () => true },
+        })
+      : groupProtocol === 'consumer'
         ? new ConsumerGroupProtocol({
             ...membershipOptions,
             // The protocol calls it `serverAssignor` because that is the wire field's name; this
@@ -506,8 +527,8 @@ module.exports = class ConsumerGroup {
   /**
    * Which membership protocol is running. Read by the coordinator's follow-up condition and stale-
    * verdict guard, by the runner's stop and heartbeat paths, and by the error contract - none of
-   * which can reach the protocol object.
-   * @returns {'classic'|'consumer'}
+   * which can reach the protocol object. `'manual'` is the local assignment kind: it never joins.
+   * @returns {'classic'|'consumer'|'manual'}
    */
   get kind() {
     return this.groupMembership.kind
@@ -941,6 +962,7 @@ module.exports = class ConsumerGroup {
         memberId,
         groupInstanceId: this.groupInstanceId,
         operations: this.operations,
+        offsets: this.privateOffsets,
         ownership: this.ownership,
         onCommitError: (error) => {
           const verdict = this.rebalanceCoordinator?.classify(error, REBALANCE_PATHS.OFFSET_COMMIT)
@@ -1030,6 +1052,33 @@ module.exports = class ConsumerGroup {
     this.pruneAssignmentState()
 
     return { assignment: currentMemberAssignment, added, revoked }
+  }
+
+  /**
+   * Applies the manual selection locally: no join, no group round, no events and no deadline. The
+   * run's identity and idle state are checked before every side effect and after the awaited apply,
+   * so a stop or a replacement run changes nothing here.
+   * @returns {Promise<void>} resolves once the selection is acquired and visible
+   * @throws {Error} `CONSUMER_STOPPING` when the run was retired before or during the apply
+   */
+  async applyManualAssignment() {
+    const run = this.idleWait
+    const guard = () =>
+      this.idleWait !== run || run.disposed || this.isStopping() || !this.runIdentity?.isCurrent()
+        ? consumerStoppingError()
+        : null
+    const refuse = () => {
+      const error = guard()
+      if (error) throw error
+    }
+    refuse()
+    this.partitionsPerSubscribedTopic = this.generatePartitionsPerSubscribedTopic()
+    const result = await this.groupMembership.rebalance()
+    refuse()
+    await this.applyRebalanceResult(result, {
+      round: { guard, retire: () => {}, fence: run.fence },
+    })
+    refuse()
   }
 
   /**
@@ -2330,7 +2379,7 @@ module.exports = class ConsumerGroup {
   reportHalt(topic, partition, { offset, reason, error }) {
     const { groupId, memberId } = this
     const { nextOffset, codec, limit } = error
-    const payload = { groupId, memberId, topic, partition, offset, reason, error }
+    const payload = { groupId: groupId ?? null, memberId, topic, partition, offset, reason, error }
     if (nextOffset !== undefined) payload.nextOffset = nextOffset
     if (codec !== undefined) payload.codec = codec
     if (limit !== undefined) payload.limit = limit
@@ -2426,6 +2475,13 @@ module.exports = class ConsumerGroup {
    * @returns {void}
    */
   requestResync(error) {
+    if (this.kind === 'manual') {
+      this.logger.debug('A manual assignment is fixed; no resync was requested', {
+        error: error.message,
+      })
+      return
+    }
+
     if (!this.rebalanceCoordinator) {
       this.logger.debug('No rebalance coordinator attached; refreshed metadata only', {
         groupId: this.groupId,
@@ -2629,7 +2685,11 @@ module.exports = class ConsumerGroup {
    *   partitions
    */
   checkForStaleAssignment() {
-    if (!this.partitionsPerSubscribedTopic || this.staleAssignmentPending) {
+    if (
+      this.kind === 'manual' ||
+      !this.partitionsPerSubscribedTopic ||
+      this.staleAssignmentPending
+    ) {
       return
     }
 
@@ -2668,6 +2728,45 @@ module.exports = class ConsumerGroup {
   async pollLeaderUnion(fence) {
     if (!this.isLeader()) return this.leaderUnionWatch.clear()
     await this.leaderUnionWatch.poll(fence)
+  }
+
+  /**
+   * Resolves pending seek/reset work through the ordinary resolver, then reads the latest position.
+   * A seek changes position without changing acquisition; revoke/reacquire and rebuild retire it.
+   * @param {{topic: string, partition: number}} entry validated public partition
+   * @returns {Promise<string>} current nonnegative decimal next position, including sparse offsets
+   * @throws {Error} on ownership retirement, reset refusal or unresolved bounded resolution
+   */
+  async position(entry) {
+    ManualGroupProtocol.validateTopicPartition(entry)
+    const { topic, partition } = entry
+    const key = `${topic}|${partition}`
+    const acquiredAt = this.acquired.get(key)?.acquiredAt
+    const manager = this.offsetManager
+    const epoch = this.assignmentEpoch
+    const token = this.ownership.token()
+    const topicId = this.cluster.topicId(topic)
+    const current = () =>
+      acquiredAt !== undefined &&
+      manager &&
+      !this.isStopping() &&
+      this.offsetManager === manager &&
+      this.assignmentEpoch === epoch &&
+      this.acquired.get(key)?.acquiredAt === acquiredAt &&
+      this.cluster.topicId(topic) === topicId &&
+      !this.ownership.refusal(token)
+    if (!current()) throw consumerStoppingError()
+    for (let pass = 0; pass < MAX_RESOLUTION_PASSES; pass++) {
+      await this.seekOffsets([{ topic, partitions: [partition] }])
+      if (!current()) throw consumerStoppingError()
+      const halted = this.haltedPartitions.get(key)
+      if (halted && ['no-offset', 'offset-out-of-range'].includes(halted.reason)) throw halted.error
+      if (this.hasSeekOffset({ topic, partition })) continue
+      const offset =
+        manager.resolvedOffsetAt(topic, partition) ?? manager.committedOffsets()[topic]?.[partition]
+      if (typeof offset === 'string' && /^\d+$/.test(offset)) return offset
+    }
+    throw new KafkaJSNonRetriableError(`Position is not yet resolved for ${topic}[${partition}]`)
   }
 
   /**

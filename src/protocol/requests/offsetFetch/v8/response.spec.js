@@ -7,6 +7,7 @@ describe('Protocol > Requests > OffsetFetch > v8', () => {
     expect(data).toEqual({
       throttleTime: 0,
       clientSideThrottleTime: 0,
+      groupId: 'test-group',
       errorCode: 0,
       responses: [
         {
@@ -55,6 +56,7 @@ describe('Protocol > Requests > OffsetFetch > v8', () => {
     expect(data).toEqual({
       throttleTime: 0,
       clientSideThrottleTime: 0,
+      groupId: 'test-group',
       errorCode: 0,
       responses: [
         {

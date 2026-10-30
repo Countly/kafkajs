@@ -643,6 +643,39 @@ module.exports = class Cluster {
   }
 
   /**
+   * Reads the metadata of `topics` as a broker answers now, installing nothing: no cache write, no
+   * `TOPIC_RECREATED`, no target change. It skips `metadata()`'s refresh pre-step, so a candidate
+   * that is later rejected leaves no effect behind. Unknown topics follow the client's configured
+   * auto-creation setting, and a topic-level error rejects.
+   * @public
+   * @param {object} options
+   * @param {string[]} options.topics the names to describe
+   * @param {() => Error|null} [options.guard] a caller's currentness check, evaluated before the
+   *   request is written and after it answers; its refusal replaces the answer
+   * @returns {Promise<import("../../types").BrokerMetadata>} the decoded snapshot
+   * @throws {Error} the guard's refusal, or the last broker error once the retry budget is spent
+   */
+  async stageMetadata({ topics, guard }) {
+    return this.retrier(async (bail) => {
+      const before = guard?.()
+      if (before) return bail(before)
+
+      const brokers = Object.values(this.brokerPool.brokers)
+      const broker =
+        brokers.find((candidate) => candidate.isConnected()) ||
+        brokers[0] ||
+        this.brokerPool.seedBroker
+      if (!broker) throw new KafkaJSBrokerNotFound('No broker available for staged metadata')
+
+      await broker.connect()
+      const metadata = await broker.metadata(topics, { guard: guard && (() => guard()) })
+      const after = guard?.()
+      if (after) return bail(after)
+      return metadata
+    })
+  }
+
+  /**
    * @public
    * @param {string} topic
    * @return {Promise}
@@ -809,17 +842,20 @@ module.exports = class Cluster {
   /**
    * Replaces consumer targets and prunes removed decoded/id state without issuing a request.
    * Pattern callers pass an empty list. Captured guards are rechecked after the target lock.
+   * `publish` runs under that lock right after the replacement with no await between them, so a
+   * caller can make its own state and the targets change together or not at all.
    * @param {string[]} names accepted desired target names
-   * @param {{isCurrent?: () => boolean}} [options]
-   * @returns {Promise<void>}
+   * @param {{isCurrent?: () => boolean, publish?: () => void}} [options]
+   * @returns {Promise<boolean>} whether the replacement and `publish` ran; false when `isCurrent`
+   *   refused before or after the lock, in which case nothing changed
    * @throws {Error} when acquiring the existing target lock fails
    */
-  async resetTargetTopics(names, { isCurrent = () => true } = {}) {
+  async resetTargetTopics(names, { isCurrent = () => true, publish } = {}) {
     const next = new Set(names)
-    if (!isCurrent()) return
+    if (!isCurrent()) return false
     await this.mutatingTargetTopics.acquire()
     try {
-      if (!isCurrent()) return
+      if (!isCurrent()) return false
       for (const topic of this.targetTopics) {
         if (next.has(topic)) continue
         this.metadataCache.forget(topic)
@@ -827,6 +863,8 @@ module.exports = class Cluster {
       }
       this.targetTopics = next
       this.topicMetadataIndexes = new WeakMap()
+      publish?.()
+      return true
     } finally {
       await this.mutatingTargetTopics.release()
     }

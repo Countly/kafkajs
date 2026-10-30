@@ -19,14 +19,19 @@ describe('Consumer', () => {
     ).toThrowWithMessage(KafkaJSNonRetriableError, errorMessage)
   })
 
-  it('throws when groupId is missing', () => {
+  it.each([null, '', 1])('throws when groupId is %p', (groupId) => {
     const errorMessage = 'Consumer groupId must be a non-empty string.'
 
     expect(() =>
       createConsumer({
         cluster: createCluster(),
         logger: newLogger(),
+        groupId,
       })
     ).toThrowWithMessage(KafkaJSNonRetriableError, errorMessage)
+  })
+
+  it('accepts a missing groupId for a consumer that only assigns partitions', () => {
+    expect(() => createConsumer({ cluster: createCluster(), logger: newLogger() })).not.toThrow()
   })
 })

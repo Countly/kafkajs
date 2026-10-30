@@ -341,6 +341,126 @@ it('R1§B1:listTopics', async () => {
     [TOPIC, [0, 1]],
   ])
 })
+/**
+ * Builds one broker batch that carries several records.
+ * @param {number} count how many records the batch holds, at offsets 0 to count - 1
+ * @returns {Promise<Buffer>} the encoded batch; the key of each record is `k<offset>`
+ * @throws Never.
+ */
+const multiRecordBatch = async (count) =>
+  Buffer.from(
+    (
+      await RecordBatch.RecordBatch({
+        firstOffset: '0',
+        firstTimestamp: 1700000000000,
+        maxTimestamp: 1700000000000,
+        records: Array.from({ length: count }, (_, i) =>
+          Record({ offsetDelta: i, key: Buffer.from(`k${i}`), value: Buffer.from(`v${i}`) })
+        ),
+      })
+    ).buffer
+  )
+it('R1§B1:currentLag', async () => {
+  const highWatermark = 100 // the fetch harness's fixed high watermark
+  let confirmed = '-1'
+  const records = await multiRecordBatch(3)
+  let answered = false
+  const cluster = groupScript(createScriptedCluster({ nodes }))
+    .answer('Fetch', async ({ maxWaitMs }) => {
+      if (answered) await new Promise((resolve) => setTimeout(resolve, maxWaitMs))
+      const batch = answered ? false : records
+      answered = true
+      return {
+        partitions: [
+          { partition: 0, errorCode: 0, highWatermark: String(highWatermark), records: batch },
+        ],
+      }
+    })
+    .answer('OffsetCommit', ({ topics }) => {
+      confirmed = topics[0].partitions[0].offset
+      return {
+        topics: topics.map(({ topic, partitions }) => ({
+          topic,
+          partitions: partitions.map(({ partition }) => ({ partition, errorCode: 0 })),
+        })),
+      }
+    })
+    .answer('OffsetFetch', ({ groupId, topics }) => ({
+      groupId,
+      topics: topics.map(({ topic, partitions }) => ({
+        topic,
+        partitions: partitions.map(({ partition }) => ({
+          partition,
+          offset: confirmed,
+          leaderEpoch: -1,
+          metadata: null,
+          errorCode: 0,
+        })),
+      })),
+    }))
+    .answer('ListOffsets', ({ topics }) => ({
+      topics: topics.map(({ name, partitions }) => ({
+        name,
+        partitions: partitions.map(({ partitionIndex, timestamp }) => ({
+          partitionIndex,
+          errorCode: 0,
+          timestamp: '-1',
+          offset: timestamp === '-2' ? '0' : String(highWatermark),
+          leaderEpoch: 5,
+        })),
+      })),
+    }))
+  const consumer = makeConsumer(cluster)
+  const admin = use(new Kafka(cluster.kafkaOptions({ retry })).admin({ retry }), cluster)
+  const seen = []
+  await consumer.connect()
+  await consumer.subscribe({ topic: TOPIC, fromBeginning: true })
+  await consumer.run({
+    autoCommit: false,
+    eachBatch: async ({ batch, resolveOffset }) => {
+      seen.push({ lag: batch.offsetLag(), last: batch.lastOffset() })
+      for (const message of batch.messages) resolveOffset(message.offset)
+    },
+  })
+  await until(() => seen.length === 1)
+  const { lag, last } = seen[0]
+  const next = String(Number(last) + 1)
+  await consumer.commitOffsets([{ topic: TOPIC, partition: 0, offset: next }])
+  await admin.connect()
+  const [{ partitions }] = await admin.fetchOffsets({ groupId: 'equivalent', topics: [TOPIC] })
+  const [{ offset: committed }] = partitions
+  const [{ high }] = await admin.fetchTopicOffsets(TOPIC)
+  expect(committed).toBe(next)
+  expect(Number(high) - Number(committed)).toBe(Number(lag))
+  expect(Number(high) - Number(last)).not.toBe(Number(lag))
+})
+it('R1§B2:max.poll.records', async () => {
+  const records = await multiRecordBatch(4)
+  let answered = false
+  const cluster = groupScript(createScriptedCluster({ nodes })).answer(
+    'Fetch',
+    async ({ maxWaitMs }) => {
+      if (answered) await new Promise((resolve) => setTimeout(resolve, maxWaitMs))
+      const batch = answered ? false : records
+      answered = true
+      return { partitions: [{ partition: 0, errorCode: 0, highWatermark: '4', records: batch }] }
+    }
+  )
+  const consumer = makeConsumer(cluster)
+  const invocations = []
+  await start(consumer, async ({ message }) => {
+    invocations.push([message.key.toString(), message.offset])
+  })
+  await until(() => invocations.length === 4)
+  await tick()
+  expect(invocations).toEqual([
+    ['k0', '0'],
+    ['k1', '1'],
+    ['k2', '2'],
+    ['k3', '3'],
+  ])
+  expect(Object.keys(consumer)).not.toContain('maxPollRecords')
+})
 it('R1§A2:compression.type', async () => {
   const cluster = producerScript(createScriptedCluster({ nodes }))
   const producer = use(

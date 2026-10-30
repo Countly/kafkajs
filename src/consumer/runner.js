@@ -7,6 +7,7 @@ const {
   isFencedInstance,
   isUnknownMemberId,
   KafkaJSCommitFailedError,
+  KafkaJSNonRetriableError,
   COORDINATOR_LOAD_IN_PROGRESS_CODE,
 } = require('../errors')
 const handlerContext = require('./handlerContext')
@@ -193,6 +194,12 @@ module.exports = class Runner extends EventEmitter {
     }
   }
 
+  /**
+   * Starts the run: connects, joins the group (or applies the local manual selection) and starts
+   * fetching. A manual run sends no membership request and arms neither the heartbeat nor any
+   * membership timer.
+   * @returns {Promise<void>} settles once the first round's apply is done and fetching is scheduled
+   */
   async start() {
     if (this.running) {
       return
@@ -204,7 +211,7 @@ module.exports = class Runner extends EventEmitter {
       // `running` is set BEFORE the first round: the round guard is `stopRequested`, which only
       // `stop()` sets, and guarding on `running` would have made the initial round dead code.
       this.running = true
-      await this.rebalanceCoordinator.runRound(null, 'initial')
+      await this.runInitialRound()
     } catch (e) {
       this.running = false
 
@@ -238,8 +245,27 @@ module.exports = class Runner extends EventEmitter {
       return
     }
 
-    this.heartbeatManager.ensureStarted()
+    if (this.consumerGroup.kind !== 'manual') this.heartbeatManager.ensureStarted()
     this.scheduleFetchManager()
+  }
+
+  /**
+   * The first assignment: a group round, or for a manual run the local apply, whose abandonment by
+   * a stop is not a crash.
+   * @private
+   * @returns {Promise<void>}
+   * @throws {Error} what the round or the local apply failed with
+   */
+  async runInitialRound() {
+    if (this.consumerGroup.kind !== 'manual') {
+      return this.rebalanceCoordinator.runRound(null, 'initial')
+    }
+
+    try {
+      await this.consumerGroup.applyManualAssignment()
+    } catch (error) {
+      if (error?.type !== 'CONSUMER_STOPPING' || !this.stopRequested) throw error
+    }
   }
 
   /**
@@ -303,6 +329,10 @@ module.exports = class Runner extends EventEmitter {
         this.pollTimer.reset()
         await this.fetchManager.start()
       } catch (e) {
+        // A retired run's own work refusing to continue is the stop, not a crash: a crash here would
+        // disconnect whatever run the consumer started since.
+        if (e?.type === 'CONSUMER_STOPPING' && this.stopRequested) return
+
         // One rebalance must produce one REBALANCING and one join, even when the runner learns of
         // it twice - once as this throw, once as a slot entry. Merging and clearing first is what
         // guarantees that.
@@ -983,8 +1013,12 @@ module.exports = class Runner extends EventEmitter {
    * @param {object} batch the calling handler's batch
    * @returns {Promise<void>}
    * @throws {KafkaJSCommitFailedError} when the batch or the membership no longer owns the commit
+   * @throws {KafkaJSNonRetriableError} when this consumer has no group: an explicit payload is group-only
    */
   async commitOwnedOffsets(offsets, batch) {
+    if (this.consumerGroup.groupId === undefined) {
+      throw new KafkaJSNonRetriableError('Consumer groupId must be a non-empty string.')
+    }
     const guard = () => this.commitRefusal(undefined, batch)
     const refusal = guard()
     if (refusal) throw refusal
@@ -1114,6 +1148,14 @@ module.exports = class Runner extends EventEmitter {
     return !this.consumerGroup.isAssigned(batch.topic, batch.partition)
   }
 
+  /**
+   * Runs one fetched batch through the user's handler. The handler's async context carries the
+   * batch's ownership identity plus the identity of the run that delivered it, so a public API call
+   * made later by that handler can be refused once the run is retired, even when the replacement
+   * run's counters happen to equal the old ones.
+   * @param {object} batch the fetched batch
+   * @returns {Promise<void>}
+   */
   async handleBatch(batch) {
     if (!this.running) {
       this.logger.debug('consumer not running, exiting', {
@@ -1227,6 +1269,7 @@ module.exports = class Runner extends EventEmitter {
         assignmentEpoch,
         acquireClock,
         ownershipKey,
+        runIdentity: this.consumerGroup.runIdentity,
       }
       if (this.eachMessage) {
         await handlerContext.run(identity, () => this.processEachMessage(batch))

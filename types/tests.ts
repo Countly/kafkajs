@@ -1326,3 +1326,117 @@ const rackFactory: kafkajs.PartitionAssigner = ({ rackAware, ...config }) => {
   return PartitionAssigners.range({ ...config, rackAware })
 }
 kafka.consumer({ groupId: 'custom-rack-range', partitionAssigners: [rackFactory], rackAwareAssignment: true })
+
+{
+  const kafka = new Kafka({ brokers: ['unused:9092'] })
+  const direct: import('.').DirectConsumerConfig = {}
+  const grouped: import('.').ConsumerConfig = { groupId: 'typed-group' }
+  const configs: Parameters<Kafka['consumer']>[0][] = [direct, grouped, { groupId: undefined }]
+  for (const config of configs) kafka.consumer(config)
+  const consumer = kafka.consumer(direct)
+  consumer.assign([{ topic: '__proto__', partitions: [0, 2147483647] }], {
+    offsetReset: 'by_duration:PT0.000000001S',
+  })
+  consumer.assign([{ topic: 'records', partitions: [0] }], {
+    offsetReset: 'earliest',
+    fromBeginning: true,
+  })
+  consumer.unsubscribe()
+  const assignment: import('.').TopicPartitions[] = consumer.assignment()
+  const subscription: string[] = consumer.subscription()
+  const position: Promise<string> = consumer.position({ topic: 'records', partition: 0 })
+  const committed: Promise<import('.').ConsumerCommittedOffset[]> = consumer.committed([])
+  const group: import('.').ConsumerGroupMetadata = consumer.groupMetadata()
+  const noParameters: Parameters<typeof consumer.disconnect> = []
+  consumer.disconnect()
+  consumer.disconnect({ leaveGroup: true })
+  process.on('SIGTERM', consumer.disconnect)
+  // @ts-expect-error groupId is still required on the grouped configuration
+  const invalidGrouped: import('.').ConsumerConfig = {}
+  // @ts-expect-error runtime and declarations reject null group identity
+  kafka.consumer({ groupId: null })
+  // @ts-expect-error offsets are returned as decimal strings
+  const invalidPosition: Promise<number> = consumer.position({ topic: 'records', partition: 0 })
+  // @ts-expect-error reset policy must use a declared string form
+  consumer.assign([{ topic: 'records', partitions: [0] }], { offsetReset: 1 })
+  const corrupt = new KafkaJSCorruptRecordError('bad', {
+    reason: 'decompression',
+    offset: '12',
+    codec: 'gzip',
+    limit: 1024,
+    nextOffset: '18',
+  })
+  const none = new KafkaJSNoOffsetError('missing', {
+    topic: 'records',
+    partition: 0,
+    reason: 'no-offset',
+  })
+  const inherited: import('.').ConsumerPartitionHaltedEventPayload = {
+    groupId: 'typed-group',
+    memberId: 'member',
+    topic: 'records',
+    partition: 0,
+    reason: 'decompression',
+    offset: '12',
+    error: corrupt,
+    codec: 'gzip',
+    limit: 1024,
+    nextOffset: '18',
+  }
+  const missing: import('.').ConsumerPartitionHaltedEventPayload = {
+    groupId: null,
+    memberId: '',
+    topic: 'records',
+    partition: 0,
+    reason: 'no-offset',
+    offset: null,
+    error: none,
+  }
+  const outside: import('.').ConsumerPartitionHaltedEventPayload = {
+    groupId: null,
+    memberId: '',
+    topic: 'records',
+    partition: 0,
+    reason: 'offset-out-of-range',
+    offset: '99',
+    error: none,
+  }
+  /** @param {import('.').ConsumerPartitionHaltedEventPayload} payload actual event payload */
+  const narrow = (payload: import('.').ConsumerPartitionHaltedEventPayload): void => {
+    const id: string | null = payload.groupId
+    if (payload.reason === 'no-offset') {
+      const offset: null = payload.offset
+      const error: KafkaJSNoOffsetError = payload.error
+      void [offset, error, id]
+    } else if (payload.reason === 'offset-out-of-range') {
+      const offset: string | null = payload.offset
+      const error: KafkaJSNoOffsetError = payload.error
+      void [offset, error]
+    } else {
+      const offset: string = payload.offset
+      const codec: 'gzip' | 'snappy' | 'lz4' | 'zstd' | undefined = payload.codec
+      const error: KafkaJSCorruptRecordError = payload.error
+      const limit: number | undefined = payload.limit
+      const next: string | undefined = payload.nextOffset
+      void [offset, codec, error, limit, next]
+    }
+  }
+  narrow(inherited)
+  narrow(missing)
+  narrow(outside)
+  consumer.on(consumer.events.CRASH, (event) => {
+    const id: string | null = event.payload.groupId
+    void id
+  })
+  consumer.on(consumer.events.PARTITION_HALTED, (event) => narrow(event.payload))
+  void [
+    assignment,
+    subscription,
+    position,
+    committed,
+    group,
+    noParameters,
+    invalidGrouped,
+    invalidPosition,
+  ]
+}

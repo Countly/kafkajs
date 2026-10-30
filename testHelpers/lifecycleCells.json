@@ -1954,5 +1954,653 @@
     "boundary": "poll-expiry:leave",
     "protocol": "consumer",
     "membership": "static"
+  },
+  {
+    "event": "stop",
+    "boundary": "before-handler",
+    "protocol": "manual",
+    "membership": "grouped"
+  },
+  {
+    "event": "stop",
+    "boundary": "before-handler",
+    "protocol": "manual",
+    "membership": "no-group"
+  },
+  {
+    "event": "stop",
+    "boundary": "in-handler",
+    "protocol": "manual",
+    "membership": "grouped"
+  },
+  {
+    "event": "stop",
+    "boundary": "in-handler",
+    "protocol": "manual",
+    "membership": "no-group"
+  },
+  {
+    "event": "stop",
+    "boundary": "manual:apply",
+    "protocol": "manual",
+    "membership": "grouped"
+  },
+  {
+    "event": "stop",
+    "boundary": "manual:apply",
+    "protocol": "manual",
+    "membership": "no-group"
+  },
+  {
+    "event": "stop",
+    "boundary": "resolution:list-offsets",
+    "protocol": "manual",
+    "membership": "grouped"
+  },
+  {
+    "event": "stop",
+    "boundary": "resolution:list-offsets",
+    "protocol": "manual",
+    "membership": "no-group"
+  },
+  {
+    "event": "stop",
+    "boundary": "position:answer-held",
+    "protocol": "manual",
+    "membership": "grouped"
+  },
+  {
+    "event": "stop",
+    "boundary": "position:answer-held",
+    "protocol": "manual",
+    "membership": "no-group"
+  },
+  {
+    "event": "stop",
+    "boundary": "idle-wait",
+    "protocol": "manual",
+    "membership": "grouped"
+  },
+  {
+    "event": "stop",
+    "boundary": "idle-wait",
+    "protocol": "manual",
+    "membership": "no-group"
+  },
+  {
+    "event": "stop",
+    "boundary": "commit:coordinator-lookup",
+    "protocol": "manual",
+    "membership": "grouped"
+  },
+  {
+    "event": "stop",
+    "boundary": "commit:pool-connect",
+    "protocol": "manual",
+    "membership": "grouped"
+  },
+  {
+    "event": "stop",
+    "boundary": "commit:auth-encode",
+    "protocol": "manual",
+    "membership": "grouped"
+  },
+  {
+    "event": "stop",
+    "boundary": "commit:pending-queue",
+    "protocol": "manual",
+    "membership": "grouped"
+  },
+  {
+    "event": "stop",
+    "boundary": "commit:retry-backoff",
+    "protocol": "manual",
+    "membership": "grouped"
+  },
+  {
+    "event": "stop",
+    "boundary": "commit:answer-held",
+    "protocol": "manual",
+    "membership": "grouped"
+  },
+  {
+    "event": "disconnect",
+    "boundary": "before-handler",
+    "protocol": "manual",
+    "membership": "grouped"
+  },
+  {
+    "event": "disconnect",
+    "boundary": "before-handler",
+    "protocol": "manual",
+    "membership": "no-group"
+  },
+  {
+    "event": "disconnect",
+    "boundary": "in-handler",
+    "protocol": "manual",
+    "membership": "grouped"
+  },
+  {
+    "event": "disconnect",
+    "boundary": "in-handler",
+    "protocol": "manual",
+    "membership": "no-group"
+  },
+  {
+    "event": "disconnect",
+    "boundary": "manual:apply",
+    "protocol": "manual",
+    "membership": "grouped"
+  },
+  {
+    "event": "disconnect",
+    "boundary": "manual:apply",
+    "protocol": "manual",
+    "membership": "no-group"
+  },
+  {
+    "event": "disconnect",
+    "boundary": "resolution:list-offsets",
+    "protocol": "manual",
+    "membership": "grouped"
+  },
+  {
+    "event": "disconnect",
+    "boundary": "resolution:list-offsets",
+    "protocol": "manual",
+    "membership": "no-group"
+  },
+  {
+    "event": "disconnect",
+    "boundary": "position:answer-held",
+    "protocol": "manual",
+    "membership": "grouped"
+  },
+  {
+    "event": "disconnect",
+    "boundary": "position:answer-held",
+    "protocol": "manual",
+    "membership": "no-group"
+  },
+  {
+    "event": "disconnect",
+    "boundary": "idle-wait",
+    "protocol": "manual",
+    "membership": "grouped"
+  },
+  {
+    "event": "disconnect",
+    "boundary": "idle-wait",
+    "protocol": "manual",
+    "membership": "no-group"
+  },
+  {
+    "event": "disconnect",
+    "boundary": "commit:coordinator-lookup",
+    "protocol": "manual",
+    "membership": "grouped"
+  },
+  {
+    "event": "disconnect",
+    "boundary": "commit:pool-connect",
+    "protocol": "manual",
+    "membership": "grouped"
+  },
+  {
+    "event": "disconnect",
+    "boundary": "commit:auth-encode",
+    "protocol": "manual",
+    "membership": "grouped"
+  },
+  {
+    "event": "disconnect",
+    "boundary": "commit:pending-queue",
+    "protocol": "manual",
+    "membership": "grouped"
+  },
+  {
+    "event": "disconnect",
+    "boundary": "commit:retry-backoff",
+    "protocol": "manual",
+    "membership": "grouped"
+  },
+  {
+    "event": "disconnect",
+    "boundary": "commit:answer-held",
+    "protocol": "manual",
+    "membership": "grouped"
+  },
+  {
+    "event": "crash",
+    "boundary": "before-handler",
+    "protocol": "manual",
+    "membership": "grouped"
+  },
+  {
+    "event": "crash",
+    "boundary": "before-handler",
+    "protocol": "manual",
+    "membership": "no-group"
+  },
+  {
+    "event": "crash",
+    "boundary": "in-handler",
+    "protocol": "manual",
+    "membership": "grouped"
+  },
+  {
+    "event": "crash",
+    "boundary": "in-handler",
+    "protocol": "manual",
+    "membership": "no-group"
+  },
+  {
+    "event": "crash",
+    "boundary": "manual:apply",
+    "protocol": "manual",
+    "membership": "grouped"
+  },
+  {
+    "event": "crash",
+    "boundary": "manual:apply",
+    "protocol": "manual",
+    "membership": "no-group"
+  },
+  {
+    "event": "crash",
+    "boundary": "resolution:list-offsets",
+    "protocol": "manual",
+    "membership": "grouped"
+  },
+  {
+    "event": "crash",
+    "boundary": "resolution:list-offsets",
+    "protocol": "manual",
+    "membership": "no-group"
+  },
+  {
+    "event": "crash",
+    "boundary": "position:answer-held",
+    "protocol": "manual",
+    "membership": "grouped"
+  },
+  {
+    "event": "crash",
+    "boundary": "position:answer-held",
+    "protocol": "manual",
+    "membership": "no-group"
+  },
+  {
+    "event": "crash",
+    "boundary": "idle-wait",
+    "protocol": "manual",
+    "membership": "grouped"
+  },
+  {
+    "event": "crash",
+    "boundary": "idle-wait",
+    "protocol": "manual",
+    "membership": "no-group"
+  },
+  {
+    "event": "crash",
+    "boundary": "commit:coordinator-lookup",
+    "protocol": "manual",
+    "membership": "grouped"
+  },
+  {
+    "event": "crash",
+    "boundary": "commit:pool-connect",
+    "protocol": "manual",
+    "membership": "grouped"
+  },
+  {
+    "event": "crash",
+    "boundary": "commit:auth-encode",
+    "protocol": "manual",
+    "membership": "grouped"
+  },
+  {
+    "event": "crash",
+    "boundary": "commit:pending-queue",
+    "protocol": "manual",
+    "membership": "grouped"
+  },
+  {
+    "event": "crash",
+    "boundary": "commit:retry-backoff",
+    "protocol": "manual",
+    "membership": "grouped"
+  },
+  {
+    "event": "crash",
+    "boundary": "commit:answer-held",
+    "protocol": "manual",
+    "membership": "grouped"
+  },
+  {
+    "event": "reassign",
+    "boundary": "before-handler",
+    "protocol": "manual",
+    "membership": "grouped"
+  },
+  {
+    "event": "reassign",
+    "boundary": "before-handler",
+    "protocol": "manual",
+    "membership": "no-group"
+  },
+  {
+    "event": "reassign",
+    "boundary": "in-handler",
+    "protocol": "manual",
+    "membership": "grouped"
+  },
+  {
+    "event": "reassign",
+    "boundary": "in-handler",
+    "protocol": "manual",
+    "membership": "no-group"
+  },
+  {
+    "event": "reassign",
+    "boundary": "manual:apply",
+    "protocol": "manual",
+    "membership": "grouped"
+  },
+  {
+    "event": "reassign",
+    "boundary": "manual:apply",
+    "protocol": "manual",
+    "membership": "no-group"
+  },
+  {
+    "event": "reassign",
+    "boundary": "resolution:list-offsets",
+    "protocol": "manual",
+    "membership": "grouped"
+  },
+  {
+    "event": "reassign",
+    "boundary": "resolution:list-offsets",
+    "protocol": "manual",
+    "membership": "no-group"
+  },
+  {
+    "event": "reassign",
+    "boundary": "position:answer-held",
+    "protocol": "manual",
+    "membership": "grouped"
+  },
+  {
+    "event": "reassign",
+    "boundary": "position:answer-held",
+    "protocol": "manual",
+    "membership": "no-group"
+  },
+  {
+    "event": "reassign",
+    "boundary": "idle-wait",
+    "protocol": "manual",
+    "membership": "grouped"
+  },
+  {
+    "event": "reassign",
+    "boundary": "idle-wait",
+    "protocol": "manual",
+    "membership": "no-group"
+  },
+  {
+    "event": "reassign",
+    "boundary": "commit:coordinator-lookup",
+    "protocol": "manual",
+    "membership": "grouped"
+  },
+  {
+    "event": "reassign",
+    "boundary": "commit:pool-connect",
+    "protocol": "manual",
+    "membership": "grouped"
+  },
+  {
+    "event": "reassign",
+    "boundary": "commit:auth-encode",
+    "protocol": "manual",
+    "membership": "grouped"
+  },
+  {
+    "event": "reassign",
+    "boundary": "commit:pending-queue",
+    "protocol": "manual",
+    "membership": "grouped"
+  },
+  {
+    "event": "reassign",
+    "boundary": "commit:retry-backoff",
+    "protocol": "manual",
+    "membership": "grouped"
+  },
+  {
+    "event": "reassign",
+    "boundary": "commit:answer-held",
+    "protocol": "manual",
+    "membership": "grouped"
+  },
+  {
+    "event": "unsubscribe",
+    "boundary": "before-handler",
+    "protocol": "manual",
+    "membership": "grouped"
+  },
+  {
+    "event": "unsubscribe",
+    "boundary": "before-handler",
+    "protocol": "manual",
+    "membership": "no-group"
+  },
+  {
+    "event": "unsubscribe",
+    "boundary": "in-handler",
+    "protocol": "manual",
+    "membership": "grouped"
+  },
+  {
+    "event": "unsubscribe",
+    "boundary": "in-handler",
+    "protocol": "manual",
+    "membership": "no-group"
+  },
+  {
+    "event": "unsubscribe",
+    "boundary": "manual:apply",
+    "protocol": "manual",
+    "membership": "grouped"
+  },
+  {
+    "event": "unsubscribe",
+    "boundary": "manual:apply",
+    "protocol": "manual",
+    "membership": "no-group"
+  },
+  {
+    "event": "unsubscribe",
+    "boundary": "resolution:list-offsets",
+    "protocol": "manual",
+    "membership": "grouped"
+  },
+  {
+    "event": "unsubscribe",
+    "boundary": "resolution:list-offsets",
+    "protocol": "manual",
+    "membership": "no-group"
+  },
+  {
+    "event": "unsubscribe",
+    "boundary": "position:answer-held",
+    "protocol": "manual",
+    "membership": "grouped"
+  },
+  {
+    "event": "unsubscribe",
+    "boundary": "position:answer-held",
+    "protocol": "manual",
+    "membership": "no-group"
+  },
+  {
+    "event": "unsubscribe",
+    "boundary": "idle-wait",
+    "protocol": "manual",
+    "membership": "grouped"
+  },
+  {
+    "event": "unsubscribe",
+    "boundary": "idle-wait",
+    "protocol": "manual",
+    "membership": "no-group"
+  },
+  {
+    "event": "unsubscribe",
+    "boundary": "commit:coordinator-lookup",
+    "protocol": "manual",
+    "membership": "grouped"
+  },
+  {
+    "event": "unsubscribe",
+    "boundary": "commit:pool-connect",
+    "protocol": "manual",
+    "membership": "grouped"
+  },
+  {
+    "event": "unsubscribe",
+    "boundary": "commit:auth-encode",
+    "protocol": "manual",
+    "membership": "grouped"
+  },
+  {
+    "event": "unsubscribe",
+    "boundary": "commit:pending-queue",
+    "protocol": "manual",
+    "membership": "grouped"
+  },
+  {
+    "event": "unsubscribe",
+    "boundary": "commit:retry-backoff",
+    "protocol": "manual",
+    "membership": "grouped"
+  },
+  {
+    "event": "unsubscribe",
+    "boundary": "commit:answer-held",
+    "protocol": "manual",
+    "membership": "grouped"
+  },
+  {
+    "event": "rebuild",
+    "boundary": "before-handler",
+    "protocol": "manual",
+    "membership": "grouped"
+  },
+  {
+    "event": "rebuild",
+    "boundary": "before-handler",
+    "protocol": "manual",
+    "membership": "no-group"
+  },
+  {
+    "event": "rebuild",
+    "boundary": "in-handler",
+    "protocol": "manual",
+    "membership": "grouped"
+  },
+  {
+    "event": "rebuild",
+    "boundary": "in-handler",
+    "protocol": "manual",
+    "membership": "no-group"
+  },
+  {
+    "event": "rebuild",
+    "boundary": "manual:apply",
+    "protocol": "manual",
+    "membership": "grouped"
+  },
+  {
+    "event": "rebuild",
+    "boundary": "manual:apply",
+    "protocol": "manual",
+    "membership": "no-group"
+  },
+  {
+    "event": "rebuild",
+    "boundary": "resolution:list-offsets",
+    "protocol": "manual",
+    "membership": "grouped"
+  },
+  {
+    "event": "rebuild",
+    "boundary": "resolution:list-offsets",
+    "protocol": "manual",
+    "membership": "no-group"
+  },
+  {
+    "event": "rebuild",
+    "boundary": "position:answer-held",
+    "protocol": "manual",
+    "membership": "grouped"
+  },
+  {
+    "event": "rebuild",
+    "boundary": "position:answer-held",
+    "protocol": "manual",
+    "membership": "no-group"
+  },
+  {
+    "event": "rebuild",
+    "boundary": "idle-wait",
+    "protocol": "manual",
+    "membership": "grouped"
+  },
+  {
+    "event": "rebuild",
+    "boundary": "idle-wait",
+    "protocol": "manual",
+    "membership": "no-group"
+  },
+  {
+    "event": "rebuild",
+    "boundary": "commit:coordinator-lookup",
+    "protocol": "manual",
+    "membership": "grouped"
+  },
+  {
+    "event": "rebuild",
+    "boundary": "commit:pool-connect",
+    "protocol": "manual",
+    "membership": "grouped"
+  },
+  {
+    "event": "rebuild",
+    "boundary": "commit:auth-encode",
+    "protocol": "manual",
+    "membership": "grouped"
+  },
+  {
+    "event": "rebuild",
+    "boundary": "commit:pending-queue",
+    "protocol": "manual",
+    "membership": "grouped"
+  },
+  {
+    "event": "rebuild",
+    "boundary": "commit:retry-backoff",
+    "protocol": "manual",
+    "membership": "grouped"
+  },
+  {
+    "event": "rebuild",
+    "boundary": "commit:answer-held",
+    "protocol": "manual",
+    "membership": "grouped"
   }
 ]

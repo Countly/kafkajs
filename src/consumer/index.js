@@ -3,6 +3,10 @@ const Long = require('../utils/long')
 const dictionary = require('../utils/dictionary')
 const { initialRetryTime } = require('../retry/defaults')
 const ConsumerGroup = require('./consumerGroup')
+const ManualGroupProtocol = require('./groupProtocol/manual')
+const CommittedOffsetReader = require('./committedOffsets')
+const handlerContext = require('./handlerContext')
+const OffsetOperations = require('./offsetManager/offsetOperations')
 const Subscription = require('./subscription')
 const ResetObligations = require('./offsetManager/resetObligations')
 const { normalizeResetPolicy } = require('./offsetReset')
@@ -13,7 +17,7 @@ const Runner = require('./runner')
 const { events, wrap: wrapEvent, unwrap: unwrapEvent } = require('./instrumentationEvents')
 const InstrumentationEventEmitter = require('../instrumentation/emitter')
 const { KafkaJSNonRetriableError, isFencedInstance } = require('../errors')
-const { isConsumerProtocolFatal } = require('./rebalanceErrorContract')
+const { isConsumerProtocolFatal, consumerStoppingError } = require('./rebalanceErrorContract')
 const { roundRobin } = require('./assigners')
 const {
   EARLIEST_OFFSET,
@@ -31,6 +35,8 @@ const eventNames = values(events)
 const eventKeys = keys(events)
   .map((key) => `consumer.events.${key}`)
   .join(', ')
+
+const GROUP_REQUIRED = 'Consumer groupId must be a non-empty string.'
 
 const specialOffsets = [
   Long.fromValue(EARLIEST_OFFSET).toString(),
@@ -143,7 +149,10 @@ const parseDisconnectOptions = (options) => {
 /**
  * @param {Object} params
  * @param {import("../../types").Cluster} params.cluster
- * @param {String} params.groupId
+ * @param {String} [params.groupId] required to subscribe and for every group offset API; a
+ *                                consumer that only assigns partitions may omit it, and then keeps
+ *                                its offsets private, never contacts a coordinator and defaults
+ *                                `autoCommit` to false
  * @param {import('../../types').RetryOptions} [params.retry]
  * @param {import('../../types').Logger} params.logger
  * @param {import('../../types').PartitionAssigner[]} [params.partitionAssigners]
@@ -224,8 +233,8 @@ module.exports = (params) => {
     maxPrefetchBatches = 0,
   } = params
 
-  if (!groupId) {
-    throw new KafkaJSNonRetriableError('Consumer groupId must be a non-empty string.')
+  if (groupId !== undefined && (typeof groupId !== 'string' || groupId.length === 0)) {
+    throw new KafkaJSNonRetriableError(GROUP_REQUIRED)
   }
 
   const logger = rootLogger.namespace('Consumer')
@@ -260,6 +269,59 @@ module.exports = (params) => {
   // internally as part of its own cleanup), so onCrash can tell whether a *separate* stop happened
   // while it was still deciding whether to restart (e.g. a slow restartOnFailure callback).
   let stopGeneration = 0
+
+  const hasGroup = groupId !== undefined
+  /**
+   * The offsets and ledger of a consumer without a group, kept for the consumer's lifetime across
+   * restarts and never registered on the cluster, so two such consumers cannot see each other.
+   * @type {{ offsets: Record<string, object>, operations: OffsetOperations }|null}
+   */
+  const privateState = hasGroup
+    ? null
+    : { offsets: dictionary(), operations: new OffsetOperations() }
+  /** @returns {OffsetOperations} the private ledger, or the group's shared one */
+  const offsetOperations = () =>
+    privateState ? privateState.operations : cluster.offsetOperations({ groupId })
+
+  /**
+   * The manual selection, or null: its normalized partitions and per-topic reset configuration.
+   * Kept apart from `topics`, so `subscription()` stays empty for a manual consumer.
+   * @type {{ partitions: {topic: string, partitions: number[]}[], configurations: Record<string, object> }|null}
+   */
+  let manual = null
+  /** @type {Map<string, {topic: string, partition: number, offset: string}>} seeks queued before the first start */
+  const queuedSeeks = new Map()
+  /** The token of the current run, or null; each start, restart included, replaces it. */
+  let runSlot = null
+  /** Advances on every accepted selection change, so an older staged candidate cannot publish. */
+  let selectionRevision = 0
+
+  /**
+   * @throws {KafkaJSNonRetriableError} when this consumer was built without a group
+   * @returns {void}
+   */
+  const requireGroup = () => {
+    if (!hasGroup) throw new KafkaJSNonRetriableError(GROUP_REQUIRED)
+  }
+
+  /**
+   * Refuses a call made from a handler of a run that has since been retired, before it can read a
+   * replacement run's state. Detached callers and the current run's handlers pass.
+   * @throws {Error} `CONSUMER_STOPPING`
+   * @returns {void}
+   */
+  const refuseRetiredCaller = () => {
+    const identity = handlerContext.current()?.runIdentity
+    if (identity && !identity.isCurrent()) throw consumerStoppingError()
+  }
+
+  /**
+   * Subscribed mode exists from the declaration on: a client pattern counts whether or not it
+   * currently matches a topic, because matches are observations that come and go.
+   * @returns {boolean} whether any topic, broker regex or client pattern is subscribed
+   */
+  const isSubscribed = () =>
+    keys(topics).length > 0 || subscribedTopicRegex != null || declared.hasPatterns()
 
   /**
    * The generation and member id of this consumer's last completed join, or null before its
@@ -338,12 +400,16 @@ module.exports = (params) => {
       try {
         const { topic, topicId } = payload
 
-        if (!Object.hasOwn(topics, topic) && !declared.desired.topicConfigurations.has(topic)) {
+        if (
+          !Object.hasOwn(topics, topic) &&
+          !declared.desired.topicConfigurations.has(topic) &&
+          !(manual && Object.hasOwn(manual.configurations, topic))
+        ) {
           return
         }
 
         obligations.owe(topic, topicId)
-        cluster.offsetOperations({ groupId }).touchTopic(topic)
+        offsetOperations().touchTopic(topic)
         consumerGroup && consumerGroup.invalidateTopic(topic)
       } catch (e) {
         logger.error(`Failed to handle topic recreation: ${e.message}`, {
@@ -375,8 +441,12 @@ module.exports = (params) => {
     if (declared.hasPatterns()) cluster.releaseConsumerMetadataScope(declared)
   }
 
-  /** @type {import("../../types").Consumer["connect"]} */
+  /**
+   * @type {import("../../types").Consumer["connect"]}
+   * @throws {Error} `CONSUMER_STOPPING` from a handler of a retired run
+   */
   const connect = async () => {
+    refuseRetiredCaller()
     ensureTopicRecreatedSubscription()
     registerDiscoveryScope()
     await cluster.connect()
@@ -429,10 +499,15 @@ module.exports = (params) => {
    * @param {{ leaveGroup?: boolean }} [options]
    * @throws {KafkaJSNonRetriableError} before anything is stopped, when `options` is an object
    *   whose `leaveGroup` is neither `undefined` nor a boolean
+   * @throws {Error} `CONSUMER_STOPPING` from a handler of a retired run, before anything is stopped
    */
-  const disconnect = async (options) => shutDown(parseDisconnectOptions(options))
+  const disconnect = async (options) => {
+    refuseRetiredCaller()
+    return shutDown(parseDisconnectOptions(options))
+  }
 
   const stopShared = sharedPromiseTo(async (options) => {
+    runSlot = null
     try {
       if (runner) {
         await runner.stop(options)
@@ -457,10 +532,17 @@ module.exports = (params) => {
   /**
    * Every call bumps the stop generation, even when it joins an in-flight stop, so a crash
    * handler deciding whether to restart can tell that the user asked for a stop meanwhile. It takes
-   * no options: only `disconnect()` can override how the member leaves its group.
+   * no options: only `disconnect()` can override how the member leaves its group. A call from a
+   * handler of a retired run rejects with `CONSUMER_STOPPING` and changes nothing, so it cannot end
+   * the replacement run.
    * @type {import("../../types").Consumer["stop"]}
    */
   const stop = () => {
+    try {
+      refuseRetiredCaller()
+    } catch (error) {
+      return Promise.reject(error)
+    }
     stopGeneration++
     return stopShared()
   }
@@ -523,14 +605,25 @@ module.exports = (params) => {
     })
   }
 
-  /** @type {import("../../types").Consumer["subscribe"]} */
+  /**
+   * @type {import("../../types").Consumer["subscribe"]}
+   * @throws {Error} `CONSUMER_STOPPING` from a handler of a retired run
+   */
   const subscribe = async (subscription = {}) => {
+    refuseRetiredCaller()
+    requireGroup()
     const { topic, topics: subscriptionTopics, regex } = subscription
     const resetPolicy = normalizeResetPolicy(subscription)
     const fromBeginning = resetPolicy.kind === 'earliest'
 
     if (consumerGroup) {
       throw new KafkaJSNonRetriableError('Cannot subscribe to topic while consumer is running')
+    }
+
+    if (manual) {
+      throw new KafkaJSNonRetriableError(
+        'Cannot subscribe while a manual assignment is active; call unsubscribe() first'
+      )
     }
 
     const wantsRegex = isExplicit(subscription, 'regex')
@@ -594,16 +687,29 @@ module.exports = (params) => {
     await declarePatterns(subscriptions, resetPolicy)
   }
 
-  /** @type {import("../../types").Consumer["run"]} */
-  const run = async ({
-    autoCommit = true,
-    autoCommitInterval = null,
-    autoCommitThreshold = null,
-    eachBatchAutoResolve = true,
-    partitionsConsumedConcurrently: concurrency = 1,
-    eachBatch = null,
-    eachMessage = null,
-  } = {}) => {
+  /**
+   * @type {import("../../types").Consumer["run"]}
+   * @throws {Error} `CONSUMER_STOPPING` from a handler of a retired run
+   */
+  const run = async (runOptions = {}) => {
+    refuseRetiredCaller()
+    const {
+      autoCommitInterval = null,
+      autoCommitThreshold = null,
+      eachBatchAutoResolve = true,
+      partitionsConsumedConcurrently: concurrency = 1,
+      eachBatch = null,
+      eachMessage = null,
+    } = runOptions
+    // Presence, not truthiness: a consumer without a group commits nothing unless told otherwise,
+    // and is refused when it asks to.
+    const autoCommit = runOptions.autoCommit === undefined ? hasGroup : runOptions.autoCommit
+    if (!hasGroup && autoCommit) {
+      throw new KafkaJSNonRetriableError(
+        'autoCommit requires a groupId; a consumer without a group keeps its offsets private'
+      )
+    }
+
     ensureTopicRecreatedSubscription()
 
     if (consumerGroup) {
@@ -618,11 +724,30 @@ module.exports = (params) => {
       registerDiscoveryScope()
       const discovering = declared.hasPatterns()
 
+      const token = {}
+      runSlot = token
+      selectionRevision++
+      const runIdentity = { isCurrent: () => runSlot === token }
+      // Taken before the first await, so a crash restart cannot replay a queued seek.
+      const seeks = [...queuedSeeks.values()]
+      queuedSeeks.clear()
+
       consumerGroup = new ConsumerGroup({
         logger: rootLogger,
-        topics: discovering ? declared.desired.names : keys(topics),
-        topicConfigurations: discovering ? Subscription.configurationsOf(declared.desired) : topics,
+        topics: manual
+          ? manual.partitions.map(({ topic }) => topic)
+          : discovering
+            ? declared.desired.names
+            : keys(topics),
+        topicConfigurations: manual
+          ? manual.configurations
+          : discovering
+            ? Subscription.configurationsOf(declared.desired)
+            : topics,
         subscription: discovering ? declared : null,
+        manual: manual ? manual.partitions : null,
+        runIdentity,
+        privateOffsets: privateState?.offsets,
         retry,
         cluster,
         groupId,
@@ -653,9 +778,10 @@ module.exports = (params) => {
         autoCommit,
         autoCommitInterval,
         autoCommitThreshold,
-        operations: cluster.offsetOperations({ groupId }),
+        operations: offsetOperations(),
         obligations,
       })
+      for (const seekEntry of seeks) consumerGroup.seek(seekEntry)
 
       runner = new Runner({
         logger: rootLogger,
@@ -752,7 +878,7 @@ module.exports = (params) => {
 
       instrumentationEmitter.emit(CRASH, {
         error: e,
-        groupId,
+        groupId: groupId ?? null,
         restart: shouldRestart,
       })
 
@@ -794,6 +920,8 @@ module.exports = (params) => {
    *   Example: [{ topic: 'topic-name', partition: 0, offset: '1', metadata: 'event-id-3' }]
    */
   const commitOffsets = async (topicPartitions = []) => {
+    requireGroup()
+    refuseRetiredCaller()
     const commitsByTopic = topicPartitions.reduce(
       (payload, { topic, partition, offset, metadata = null }) => {
         if (!topic) {
@@ -873,10 +1001,29 @@ module.exports = (params) => {
       throw new KafkaJSNonRetriableError('Offset must not be a negative number')
     }
 
+    refuseRetiredCaller()
+
     if (!consumerGroup) {
-      throw new KafkaJSNonRetriableError(
-        'Consumer group was not initialized, consumer#run must be called first'
-      )
+      if (!manual) {
+        throw new KafkaJSNonRetriableError(
+          'Consumer group was not initialized, consumer#run must be called first'
+        )
+      }
+
+      if (
+        !manual.partitions.some((row) => row.topic === topic && row.partitions.includes(partition))
+      ) {
+        throw new KafkaJSNonRetriableError(
+          `Cannot seek ${topic}[${partition}]: it is not in the manual assignment`
+        )
+      }
+
+      queuedSeeks.set(JSON.stringify([topic, partition]), {
+        topic,
+        partition,
+        offset: seekOffset.toString(),
+      })
+      return
     }
 
     consumerGroup.seek({ topic, partition, offset: seekOffset.toString() })
@@ -893,6 +1040,7 @@ module.exports = (params) => {
    * @type {import("../../types").Consumer["describeGroup"]}
    */
   const describeGroup = async () => {
+    requireGroup()
     const { groups } = await createGroupDescriptions({
       cluster,
       retry,
@@ -904,10 +1052,12 @@ module.exports = (params) => {
 
   /**
    * @type {import("../../types").Consumer["pause"]}
+   * @throws {Error} `CONSUMER_STOPPING` from a handler of a retired run
    * @param topicPartitions
    *   Example: [{ topic: 'topic-name', partitions: [1, 2] }]
    */
   const pause = (topicPartitions = []) => {
+    refuseRetiredCaller()
     for (const topicPartition of topicPartitions) {
       if (!topicPartition || !topicPartition.topic) {
         throw new KafkaJSNonRetriableError(
@@ -947,10 +1097,12 @@ module.exports = (params) => {
 
   /**
    * @type {import("../../types").Consumer["resume"]}
+   * @throws {Error} `CONSUMER_STOPPING` from a handler of a retired run
    * @param topicPartitions
    *  Example: [{ topic: 'topic-name', partitions: [1, 2] }]
    */
   const resume = (topicPartitions = []) => {
+    refuseRetiredCaller()
     for (const topicPartition of topicPartitions) {
       if (!topicPartition || !topicPartition.topic) {
         throw new KafkaJSNonRetriableError(
@@ -993,10 +1145,15 @@ module.exports = (params) => {
    * @throws {KafkaJSNonRetriableError} before `run()` and after `stop()`
    */
   const groupMetadata = () => {
+    requireGroup()
     if (!consumerGroup) {
       throw new KafkaJSNonRetriableError(
         'Consumer group was not initialized, consumer#run must be called first'
       )
+    }
+
+    if (consumerGroup.kind === 'manual') {
+      return { groupId, generationId: -1, memberId: '', groupInstanceId: null }
     }
 
     const { groupInstanceId } = consumerGroup
@@ -1017,6 +1174,211 @@ module.exports = (params) => {
   }
 
   /**
+   * Replaces the manual selection before `run()`. The whole input is validated and snapshotted
+   * first. The topics' metadata is then read without installing anything, fenced by a metadata
+   * ticket of the lifetime subscription, and every named partition is checked against it. A
+   * candidate that is still current then publishes, under the cluster's target lock and with no
+   * await between the steps: the targets are replaced (the old ones pruned), the old metadata scope
+   * retired, and the manual selection, its reset policy dictionary and the revision change
+   * together. Topics that left the selection lose their recreation debt, queued seeks and private
+   * offsets; the selected ones keep them. A rejected or superseded candidate changes nothing, so
+   * the previous selection stays usable. Exclusive with a subscription until `unsubscribe()`.
+   * @type {import("../../types").Consumer["assign"]}
+   * @throws {KafkaJSNonRetriableError} for malformed input, a running consumer, an active
+   *   subscription, an unknown partition, or a candidate superseded while it was validated
+   */
+  const assign = async (topicPartitions, options) => {
+    refuseRetiredCaller()
+    if (
+      options !== undefined &&
+      (options === null || typeof options !== 'object' || Array.isArray(options))
+    ) {
+      throw new KafkaJSNonRetriableError('assign options must be an object')
+    }
+    if (options?.fromBeginning !== undefined && typeof options.fromBeginning !== 'boolean') {
+      throw new KafkaJSNonRetriableError('Argument "fromBeginning" must be a boolean')
+    }
+    ManualGroupProtocol.validateAssignment(topicPartitions)
+    const partitions = ManualGroupProtocol.snapshot(topicPartitions)
+    const resetPolicy = normalizeResetPolicy(options || {})
+    const fromBeginning = resetPolicy.kind === 'earliest'
+    const names = partitions.map(({ topic }) => topic)
+
+    const refusal = () => {
+      if (consumerGroup) {
+        return new KafkaJSNonRetriableError(
+          'Cannot assign while the consumer is running; call stop() first'
+        )
+      }
+      if (isSubscribed()) {
+        return new KafkaJSNonRetriableError(
+          'Cannot assign while subscribed; call unsubscribe() first'
+        )
+      }
+      return null
+    }
+    const first = refusal()
+    if (first) throw first
+
+    const revision = selectionRevision
+    const ticket = declared.captureMetadata()
+    const stale = () =>
+      refusal() ||
+      (revision !== selectionRevision || !ticket.isCurrent()
+        ? new KafkaJSNonRetriableError('The assignment was superseded while it was validated')
+        : null)
+
+    const metadata = await cluster.stageMetadata({ topics: names, guard: stale })
+    for (const { topic, partitions: wanted } of partitions) {
+      const known = new Set(
+        metadata.topicMetadata
+          .filter((entry) => entry.topic === topic)
+          .flatMap((entry) => entry.partitionMetadata.map(({ partitionId }) => partitionId))
+      )
+      const unknown = wanted.filter((partition) => !known.has(partition))
+      if (unknown.length > 0) {
+        throw new KafkaJSNonRetriableError(`Topic ${topic} has no partition ${unknown.join(', ')}`)
+      }
+    }
+
+    const published = await cluster.resetTargetTopics(names, {
+      isCurrent: () => stale() === null,
+      publish: () => {
+        declared.retireMetadata()
+        manual = {
+          partitions,
+          configurations: Subscription.configurationsOf({
+            topicConfigurations: new Map(
+              names.map((name) => [name, { fromBeginning, offsetReset: resetPolicy }])
+            ),
+          }),
+        }
+        for (const [key, { topic, partition }] of queuedSeeks) {
+          const selected = partitions.some(
+            (row) => row.topic === topic && row.partitions.includes(partition)
+          )
+          if (!selected) queuedSeeks.delete(key)
+        }
+        retainTopics(new Set(names))
+        lastJoin = null
+        selectionRevision++
+      },
+    })
+    if (published === false) throw stale() || consumerStoppingError()
+  }
+
+  /**
+   * Drops the recreation debt and the private offsets of every topic outside `keep`, the topic-local
+   * state a consumer holds while stopped. A name that returns owes anew, as after a subscription change.
+   * @param {Set<string>} keep the names that keep their state
+   * @returns {void}
+   */
+  const retainTopics = (keep) => {
+    obligations.retain(keep)
+    if (privateState) {
+      for (const topic of keys(privateState.offsets)) {
+        if (!keep.has(topic)) delete privateState.offsets[topic]
+      }
+    }
+  }
+
+  /**
+   * Stops the run first, then clears the subscription or manual selection with its targets, queued
+   * seeks, reset debts and metadata scope, keeping the connection. A failed stop propagates and
+   * leaves the selection as it was. Idempotent.
+   * @type {import("../../types").Consumer["unsubscribe"]}
+   * @throws {Error} what the stop failed with
+   */
+  const unsubscribe = async () => {
+    refuseRetiredCaller()
+    selectionRevision++
+    await stop()
+    await cluster.resetTargetTopics([], {
+      publish: () => {
+        releaseDiscoveryScope()
+        declared.clear()
+        manual = null
+        queuedSeeks.clear()
+        for (const name of keys(topics)) delete topics[name]
+        subscribedTopicRegex = null
+        regexSubscription = null
+        retainTopics(new Set())
+        lastJoin = null
+        selectionRevision++
+      },
+    })
+  }
+
+  /**
+   * The acquired assignment, sorted, as a defensive copy. Empty before the first acquisition and
+   * from the moment a stop begins.
+   * @type {import("../../types").Consumer["assignment"]}
+   */
+  const assignment = () => {
+    if (!runSlot || !consumerGroup) return []
+    return consumerGroup
+      .assigned()
+      .map(({ topic, partitions }) => ({
+        topic,
+        partitions: [...partitions].sort((a, b) => a - b),
+      }))
+      .sort((a, b) => (a.topic < b.topic ? -1 : a.topic > b.topic ? 1 : 0))
+  }
+
+  /**
+   * The subscribed topic names, sorted, as a defensive copy: the literals and the names a client
+   * pattern currently matches. Empty for a manual consumer.
+   * @type {import("../../types").Consumer["subscription"]}
+   */
+  const subscription = () =>
+    manual ? [] : [...new Set([...keys(topics), ...declared.desired.names])].sort()
+
+  /**
+   * The next position of one acquired partition after pending seek and reset work resolves.
+   * @type {import("../../types").Consumer["position"]}
+   * @throws {KafkaJSNonRetriableError} for an invalid argument or a consumer that is not running
+   * @throws {Error} `CONSUMER_STOPPING` when the acquisition is retired meanwhile, or the stored
+   *   reset refusal
+   */
+  const position = async (entry) => {
+    ManualGroupProtocol.validateTopicPartition(entry)
+    refuseRetiredCaller()
+    const group = consumerGroup
+    if (!group) {
+      throw new KafkaJSNonRetriableError(
+        'Consumer group was not initialized, consumer#run must be called first'
+      )
+    }
+    return group.position({ topic: entry.topic, partition: entry.partition })
+  }
+
+  /**
+   * Reads the group's stable committed offsets from the broker for any valid pairs, assigned or
+   * not. An observation only: it moves no local position and fills no cache.
+   * @type {import("../../types").Consumer["committed"]}
+   * @throws {KafkaJSNonRetriableError} without a group, or for invalid or duplicate pairs
+   */
+  const committed = async (topicPartitions) => {
+    requireGroup()
+    refuseRetiredCaller()
+    if (!Array.isArray(topicPartitions)) {
+      throw new KafkaJSNonRetriableError('committed requires an array of topic partitions')
+    }
+    const seen = new Set()
+    const entries = topicPartitions.map((entry) => {
+      ManualGroupProtocol.validateTopicPartition(entry)
+      const key = JSON.stringify([entry.topic, entry.partition])
+      if (seen.has(key)) {
+        throw new KafkaJSNonRetriableError('committed requires unique topic-partition pairs')
+      }
+      seen.add(key)
+      return { topic: entry.topic, partition: entry.partition }
+    })
+    if (entries.length === 0) return []
+    return new CommittedOffsetReader({ cluster, groupId, retry }).read(entries)
+  }
+
+  /**
    * @return {Object} logger
    */
   const getLogger = () => logger
@@ -1025,6 +1387,12 @@ module.exports = (params) => {
     connect,
     disconnect,
     subscribe,
+    assign,
+    unsubscribe,
+    assignment,
+    subscription,
+    position,
+    committed,
     stop,
     run,
     commitOffsets,

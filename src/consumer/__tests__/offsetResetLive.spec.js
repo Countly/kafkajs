@@ -7,6 +7,8 @@ const { RecordBatch } = require('../../protocol/recordBatch/v0')
 const RecordEncoder = require('../../protocol/recordBatch/record/v0')
 const { TOPIC, TOPIC_ID } = require('./fixtures/fetchHarness')
 const { runWithEvidence } = require('./fixtures/evidenceCase')
+const { FrameCounter } = require('./fixtures/frameCounter')
+const defaultSocketFactory = require('../../network/socketFactory')
 const { CleanupStack, describeError } = require('../../producer/__tests__/fixtures/liveProbe')
 const {
   bounded,
@@ -64,10 +66,12 @@ class Member {
    * @param {object} options
    * @param {import('../../../types').Consumer} options.consumer
    * @param {string} options.topic
-   * @param {object} options.subscribe the options of `subscribe` besides the topic
+   * @param {object} options.subscribe the options of `subscribe` or, with an assignment, of `assign`
    * @param {AbortSignal} options.scope the case's; each startup step runs under it
+   * @param {number[]} [options.assignment] the partitions to assign manually instead of subscribing
    */
-  constructor({ consumer, topic, subscribe, scope }) {
+  constructor({ consumer, topic, subscribe, scope, assignment }) {
+    this.assignment = assignment
     this.scope = scope
     this.consumer = consumer
     this.topic = topic
@@ -90,7 +94,12 @@ class Member {
     consumer.on(consumer.events.CRASH, ({ payload }) => this.crashes.push(payload.error))
     await bounded(this.scope, Infinity, () => consumer.connect())
     await bounded(this.scope, Infinity, () =>
-      consumer.subscribe({ topic: this.topic, ...this.subscribeOptions })
+      this.assignment
+        ? consumer.assign(
+            [{ topic: this.topic, partitions: this.assignment }],
+            this.subscribeOptions
+          )
+        : consumer.subscribe({ topic: this.topic, ...this.subscribeOptions })
     )
     await bounded(this.scope, Infinity, () => this.run())
   }
@@ -293,11 +302,16 @@ class FakeLane {
    * @param {CleanupStack} cleanup
    * @param {object} config extra consumer options
    * @param {object} subscribe the subscribe options besides the topic
+   * @param {number[]} [assignment] partitions to assign manually instead of subscribing
+   * @param {FrameCounter} [counter] counts the request frames of this consumer's own client
    * @returns {Member}
    */
-  member(cleanup, config, subscribe) {
+  member(cleanup, config, subscribe, assignment, counter) {
     this.scope.throwIfAborted()
-    const kafka = new Kafka(this.cluster.kafkaOptions({ logLevel: logLevel.NOTHING }))
+    const options = this.cluster.kafkaOptions({ logLevel: logLevel.NOTHING })
+    const kafka = new Kafka(
+      counter ? { ...options, socketFactory: counter.wrap(options.socketFactory) } : options
+    )
     const consumer = kafka.consumer({
       groupId: this.groupId,
       maxWaitTimeInMs: 50,
@@ -305,7 +319,7 @@ class FakeLane {
       ...config,
     })
     cleanup.add('consumer', () => consumer.disconnect())
-    return new Member({ consumer, topic: this.topic, subscribe, scope: this.scope })
+    return new Member({ consumer, topic: this.topic, subscribe, scope: this.scope, assignment })
   }
 
   /**
@@ -504,17 +518,27 @@ class DockerLane {
    * @param {CleanupStack} cleanup
    * @param {object} config extra consumer options
    * @param {object} subscribe the subscribe options besides the topic
+   * @param {number[]} [assignment] partitions to assign manually instead of subscribing
+   * @param {FrameCounter} [counter] counts the request frames of this consumer's own client
    * @returns {Member}
    */
-  member(cleanup, config, subscribe) {
+  member(cleanup, config, subscribe, assignment, counter) {
     this.scope.throwIfAborted()
-    const consumer = this.kafka.consumer({
+    const kafka = counter
+      ? new Kafka({
+          clientId: `${this.topic}-counted`,
+          brokers: this.brokers,
+          logLevel: logLevel.NOTHING,
+          socketFactory: counter.wrap(defaultSocketFactory()),
+        })
+      : this.kafka
+    const consumer = kafka.consumer({
       groupId: this.groupId,
       maxWaitTimeInMs: 500,
       ...config,
     })
     cleanup.add('consumer', () => consumer.disconnect())
-    return new Member({ consumer, topic: this.topic, subscribe, scope: this.scope })
+    return new Member({ consumer, topic: this.topic, subscribe, scope: this.scope, assignment })
   }
 
   /** @returns {null} the broker's own ListOffsets frames are not observable here */
@@ -1106,6 +1130,242 @@ describeReset.each(lanes())('Consumer > offset reset policies (live, %s lane)', 
         expect(confirmed[0]).toBe('1')
         expect(rebuilt).toMatchObject({ partition: 0, offset: '1', value: 'new-1' })
         if (listedBefore !== null) expect(listedAfter).toEqual(listedBefore)
+      })
+    ),
+    caseTimeout(CASE_BUDGET_MS)
+  )
+
+  test(
+    'assign resolves earliest, latest, none and duration like subscribe',
+    liveCase(CASE_BUDGET_MS, (scope) =>
+      runCase(laneName, 'assign-policies', scope, async ({ trace, cleanup }) => {
+        const lane = await trace.open(newLane(laneName, scope), cleanup)
+        const t0 = Date.now()
+        const old = [t0 - 5 * MINUTE, t0 - 4 * MINUTE, t0 - MINUTE]
+        trace.reach('produce')
+        for (const partition of [0, 1, 2]) {
+          await lane.append(
+            partition,
+            records(`p${partition}`, 3, (i) => old[i])
+          )
+        }
+        const members = {
+          earliest: trace.join(lane.member(cleanup, {}, { offsetReset: 'earliest' }, [0])),
+          latest: lane.member(cleanup, {}, { offsetReset: 'latest' }, [1]),
+          none: lane.member(cleanup, {}, { offsetReset: 'none' }, [2]),
+          duration: lane.member(cleanup, {}, { offsetReset: 'by_duration:PT3M' }, [0]),
+        }
+        trace.reach('start')
+        for (const member of Object.values(members)) {
+          await bounded(scope, Infinity, () => member.start())
+        }
+        trace.reach('wait for the policies')
+        await until(
+          members.earliest,
+          scope,
+          () =>
+            members.earliest.offsetsOf(0).length === 3 &&
+            members.duration.offsetsOf(0).length === 1 &&
+            members.none.halts.length === 1,
+          'The earliest records, the duration window and the none halt'
+        )
+        await delay(scope, 1500)
+        expect(members.latest.delivered).toEqual([])
+        trace.reach('produce the fresh record')
+        await lane.append(1, [{ value: 'p1-3', timestamp: Date.now() }])
+        await until(
+          members.latest,
+          scope,
+          () => members.latest.offsetsOf(1).length === 1,
+          'The record after latest'
+        )
+        const listed = lane.listed()
+        const committed = await lane.committed(lane.groupId)
+        trace.keep({ listed, committed })
+
+        trace.reach('assert')
+        expect(identitiesOf(members.earliest.delivered)).toEqual(
+          identitiesOf(acknowledgedOf(lane, 0))
+        )
+        expect(identitiesOf(members.duration.delivered)).toEqual(
+          identitiesOf(acknowledgedOf(lane, 0, 2))
+        )
+        expect(members.latest.offsetsOf(1)).toEqual(['3'])
+        expect(identitiesOf(members.latest.delivered)).toEqual(
+          identitiesOf(acknowledgedOf(lane, 1, 3))
+        )
+        expect(members.none.delivered).toEqual([])
+        expect(members.none.halts[0]).toMatchObject({ partition: 2, reason: 'no-offset' })
+        expect(members.none.halts[0].error).toBeInstanceOf(KafkaJSNoOffsetError)
+        if (listed !== null) {
+          expect(listed.filter(({ partition }) => partition === 2)).toEqual([])
+        }
+        expect(committed).toEqual({ 0: '-1', 1: '-1', 2: '-1' })
+      })
+    ),
+    caseTimeout(CASE_BUDGET_MS)
+  )
+
+  test(
+    'a group-free duration reset sends no group API and no automatic commit',
+    liveCase(CASE_BUDGET_MS, (scope) =>
+      runCase(laneName, 'group-free-duration', scope, async ({ trace, cleanup }) => {
+        const lane = await trace.open(newLane(laneName, scope), cleanup)
+        const t0 = Date.now()
+        const old = [t0 - 5 * MINUTE, t0 - 4 * MINUTE, t0 - MINUTE]
+        trace.reach('produce')
+        await lane.append(
+          0,
+          records('p0', 3, (i) => old[i])
+        )
+        const counter = new FrameCounter()
+        const member = trace.join(
+          lane.member(
+            cleanup,
+            { groupId: undefined },
+            { offsetReset: 'by_duration:PT3M' },
+            [0],
+            counter
+          )
+        )
+        trace.reach('start')
+        await bounded(scope, Infinity, () => member.start())
+        await until(member, scope, () => member.offsetsOf(0).length === 1, 'The in-window record')
+        await delay(scope, 1500)
+        trace.reach('seek')
+        await bounded(scope, Infinity, () =>
+          member.consumer.seek({ topic: lane.topic, partition: 0, offset: '1' })
+        )
+        await until(member, scope, () => member.offsetsOf(0).length === 3, 'The sought suffix')
+        const groupApis = ['FindCoordinator', 'OffsetFetch', 'OffsetCommit']
+        const counts = counter.of([...groupApis, 'JoinGroup', 'Heartbeat', 'ListOffsets'])
+        const committed = await lane.committed(lane.groupId)
+        trace.keep({ counts, committed })
+
+        trace.reach('assert')
+        expect(member.offsetsOf(0)).toEqual(['2', '1', '2'])
+        expect(identitiesOf(member.delivered.slice(0, 1))).toEqual(
+          identitiesOf(acknowledgedOf(lane, 0, 2))
+        )
+        for (const api of [...groupApis, 'JoinGroup', 'Heartbeat']) expect(counts[api]).toBe(0)
+        expect(counts.ListOffsets).toBeGreaterThan(0)
+        expect(committed).toEqual({ 0: '-1', 1: '-1', 2: '-1' })
+        expect(member.halts).toEqual([])
+      })
+    ),
+    caseTimeout(CASE_BUDGET_MS)
+  )
+
+  test(
+    'an explicit grouped commit after an assigned duration reset writes concrete next offsets',
+    liveCase(CASE_BUDGET_MS, (scope) =>
+      runCase(laneName, 'assigned-duration-commit', scope, async ({ trace, cleanup }) => {
+        const lane = await trace.open(newLane(laneName, scope), cleanup)
+        const t0 = Date.now()
+        const old = [t0 - 5 * MINUTE, t0 - 4 * MINUTE, t0 - MINUTE]
+        trace.reach('produce')
+        for (const partition of [0, 1]) {
+          await lane.append(
+            partition,
+            records(`p${partition}`, 3, (i) => old[i])
+          )
+        }
+        const member = trace.join(
+          lane.member(cleanup, {}, { offsetReset: 'by_duration:PT3M' }, [0, 1])
+        )
+        trace.reach('start')
+        await bounded(scope, Infinity, () => member.start())
+        await until(
+          member,
+          scope,
+          () => member.offsetsOf(0).length === 1 && member.offsetsOf(1).length === 1,
+          'The in-window records'
+        )
+        await delay(scope, 1500)
+        trace.reach('commit')
+        const before = await lane.committed(lane.groupId)
+        trace.keep({ committed: { before } })
+        await bounded(scope, Infinity, () =>
+          member.consumer.commitOffsets(
+            [0, 1].map((partition) => ({ topic: lane.topic, partition, offset: '3' }))
+          )
+        )
+        const committed = await lane.committed(lane.groupId)
+        trace.keep({ committed: { before, after: committed } })
+
+        trace.reach('assert')
+        expect(before).toEqual({ 0: '-1', 1: '-1', 2: '-1' })
+        expect(committed).toEqual({ 0: '3', 1: '3', 2: '-1' })
+        expect(identitiesOf(member.delivered)).toEqual(
+          identitiesOf([...acknowledgedOf(lane, 0, 2), ...acknowledgedOf(lane, 1, 2)])
+        )
+        expect(member.halts).toEqual([])
+      })
+    ),
+    caseTimeout(CASE_BUDGET_MS)
+  )
+
+  test(
+    'a none halt from assign stays until a seek while siblings continue',
+    liveCase(CASE_BUDGET_MS, (scope) =>
+      runCase(laneName, 'assign-none', scope, async ({ trace, cleanup }) => {
+        const lane = await trace.open(newLane(laneName, scope), cleanup)
+        const now = Date.now()
+        trace.reach('produce')
+        for (let partition = 0; partition < PARTITIONS; partition++) {
+          await lane.append(
+            partition,
+            records(`p${partition}`, 3, (i) => now - (3 - i) * 1000)
+          )
+        }
+        await lane.setCommitted(lane.groupId, { 1: '1' })
+        const before = await lane.committed(lane.groupId)
+        trace.keep({ committed: { before } })
+        const member = trace.join(lane.member(cleanup, {}, { offsetReset: 'none' }, [0, 1, 2]))
+        trace.reach('start')
+        await bounded(scope, Infinity, () => member.start())
+        await until(
+          member,
+          scope,
+          () => member.halts.length === 2 && member.offsetsOf(1).length === 2,
+          'The two halts and the committed sibling'
+        )
+        const listedBefore = lane.listed()
+        const deliveredBeforeSeek = [...member.delivered]
+        trace.keep({ deliveredBeforeSeek, listedBeforeSeek: listedBefore })
+
+        trace.reach('seek')
+        await bounded(scope, Infinity, async () => {
+          await member.consumer.seek({ topic: lane.topic, partition: 0, offset: '1' })
+          await member.consumer.seek({ topic: lane.topic, partition: 2, offset: '2' })
+        })
+        await until(
+          member,
+          scope,
+          () => member.offsetsOf(0).length === 2 && member.offsetsOf(2).length === 1,
+          'The sought suffixes'
+        )
+        const committed = await lane.committed(lane.groupId)
+        trace.keep({ committed: { before, after: committed } })
+
+        trace.reach('assert')
+        expect(member.halts.map(({ partition }) => partition).sort()).toEqual([0, 2])
+        for (const halt of member.halts) {
+          expect(halt).toMatchObject({ offset: null, reason: 'no-offset' })
+          expect(halt.error).toBeInstanceOf(KafkaJSNoOffsetError)
+        }
+        expect(identitiesOf(deliveredBeforeSeek)).toEqual(identitiesOf(acknowledgedOf(lane, 1, 1)))
+        if (listedBefore !== null) {
+          expect(listedBefore.filter(({ partition }) => partition !== 1)).toEqual([])
+        }
+        expect(identitiesOf(member.delivered)).toEqual(
+          identitiesOf([
+            ...acknowledgedOf(lane, 0, 1),
+            ...acknowledgedOf(lane, 1, 1),
+            ...acknowledgedOf(lane, 2, 2),
+          ])
+        )
+        expect(committed).toEqual({ 0: '-1', 1: '1', 2: '-1' })
       })
     ),
     caseTimeout(CASE_BUDGET_MS)

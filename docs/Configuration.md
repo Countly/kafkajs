@@ -282,6 +282,10 @@ mechanism can be introduced as a plugin:
 See [Custom Authentication Mechanisms](CustomAuthenticationMechanism.md) for more information on how to implement your own
 authentication mechanism.
 
+## Consumer group identity
+
+`groupId` is required for consumer subscription and group offset APIs. A consumer that only uses [manual assignment](Consuming.md#manual-assignment) may omit it or pass undefined; its offset state is private, automatic commits default to false and explicit autoCommit true rejects. Null, empty and non-string group IDs reject at construction. Configure this option on `kafka.consumer()`. Manual assignment uses no membership protocol, even when a group protocol option is configured.
+
 ## Connection Timeout
 
 Time in milliseconds to wait for a successful connection. The default value is: `1000`.

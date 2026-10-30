@@ -462,6 +462,34 @@ for (const topicPartitions of pausedTopicPartitions) {
 }
 ```
 
+## <a name="manual-assignment"></a> Manual assignment
+
+Use `await consumer.assign([{ topic, partitions }], options?)` before `run()` to select partitions yourself. A later call replaces the earlier selection. Topics must be nonempty strings and partition lists must be nonempty, contain unique integers from 0 to 2147483647, and exist in refreshed metadata. An invalid replacement leaves the earlier selection usable. Call `stop()` before replacing a running assignment. `assign([])` rejects; use `await consumer.unsubscribe()` to clear it.
+
+Manual assignment sends no group membership requests and starts no heartbeat or poll-membership timer. With a `groupId`, offset reads and commits use simple-consumer identity: generation -1, empty member ID and no instance ID. A broker refusal is returned without joining a group. Other members using that group may cause a simple offset commit to be refused. A lost fetch or commit connection takes the ordinary crash path: `retry.restartOnFailure` decides the restart, and the default restarts on a retriable error.
+
+A consumer that only assigns partitions may omit `groupId`:
+
+```js
+const consumer = kafka.consumer({})
+await consumer.connect()
+await consumer.assign([{ topic: 'events', partitions: [0] }], { offsetReset: 'earliest' })
+consumer.seek({ topic: 'events', partition: 0, offset: '12' })
+await consumer.run({ eachMessage: async ({ message }) => processEvent(message) })
+```
+
+Without a group, automatic commits default to false and explicit `autoCommit: true` rejects. No coordinator, OffsetFetch or OffsetCommit is used, and local offsets are private to this consumer. `subscribe`, `commitOffsets`, `committed`, `describeGroup`, `groupMetadata`, a rebalance listener and `enforceRebalance` require a group and reject with `Consumer groupId must be a non-empty string.` Only omitted or undefined group IDs enable this mode; null, empty and non-string IDs reject at construction.
+
+Subscription and manual assignment are exclusive until `await consumer.unsubscribe()`. Unsubscribe stops a running consumer, clears subscription and manual selection, and keeps its connection. You may then choose either mode again. Stop alone preserves the chosen mode. A manual seek queued before run applies once at the first start and is not replayed after a crash restart. The assignment options use the same `fromBeginning` and `offsetReset` rules as subscribe, including conflicts between explicitly supplied forms.
+
+## <a name="consumer-getters"></a> Assignment, subscription and offsets
+
+`consumer.assignment()` returns a sorted copy of the acquired topic-partitions. It is empty before the first assignment and after stop; a manual consumer acquires its selected partitions when run starts. `consumer.subscription()` returns a sorted copy of subscribed topic names, including current client-regex matches, before or during run and after stop. It is empty for a manual consumer. A broker-regex expression is not a topic name. Changing either returned array does not change the consumer.
+
+`await consumer.position({ topic, partition })` applies pending seek/reset work and returns the next processing or fetch position as a decimal string. It requires a currently acquired partition. A resolved handler offset advances this position by one; a sparse or control offset need not identify a deliverable record. A seek moves position within the same acquisition; a revoke/reacquire, stop, rebuild or topic recreation retires an in-flight position read.
+
+`await consumer.committed([{ topic, partition }])` reads stable committed offsets from the broker for this group, including unassigned partitions. It returns `{ topic, partition, offset, metadata }` rows; offset is a decimal string or null when no offset was committed, and metadata is a string or null. An empty array returns an empty array without a request. This observation is independent of local position and does not move it. OffsetFetch v8/v9 responses naming another group are refused with `KafkaJSInvariantViolation` naming the requested and returned groups.
+
 ## <a name="seek"></a> Seek
 
 To move the offset position in a topic/partition the `Consumer` provides the method `seek`. This method has to be called after the consumer is initialized and is running (after consumer#run).
@@ -487,6 +515,8 @@ consumer.run({
 // This will now only resolve the previous offset, not commit it
 consumer.seek({ topic: 'example', partition: 0, offset: "12384" })
 ```
+
+After a manual assignment, a seek before run is queued once for the first start. A grouped consumer still requires run before seek; an awaited assigned hook is the group equivalent.
 
 ## <a name="halted-partitions"></a> Halted partitions
 

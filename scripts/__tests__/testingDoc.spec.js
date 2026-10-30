@@ -396,6 +396,17 @@ describe('documented live scenario scripts', () => {
         'never through this package row',
       ],
     },
+    {
+      script: 'test:e2e:direct-consumer',
+      flag: 'DIRECT_CONSUMER_E2E',
+      spec: 'src/consumer/__tests__/directConsumerLive.spec.js',
+      compose: null,
+      budgetsMs: [90000],
+      wording: [
+        'manual assignment with and without a group',
+        'acceptance runs use the reviewed guarded live entry',
+      ],
+    },
   ]
 
   it.each(scenarios)('$script is one two-worker spec run through test:kafka', (row) => {

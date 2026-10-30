@@ -148,10 +148,27 @@ const PROJECTIONS = {
             })),
           }
         : value,
-    // the group id is in the body and not in what the decoder returns
+    // the group id is in the body and not in what the decoder returns, from v9; v8's decoder keeps
+    // it and flattens its one group. A body that names no group or several is refused.
     fields: (fields, version) => {
+      if (version >= 8 && fields.groups && fields.groups.length !== 1) {
+        return { error: 'KafkaJSInvariantViolation' }
+      }
       const { groupId, ...rest } = fields
-      return version >= 9 ? rest : fields
+      if (version >= 9) return rest
+      if (version < 8) return fields
+      return {
+        throttleTime: fields.throttleTime,
+        groupId,
+        errorCode: fields.errorCode,
+        responses: fields.topics.map(({ topic, partitions }) => ({
+          topic,
+          partitions: partitions.map(({ leaderEpoch, ...partition }) => ({
+            ...partition,
+            committedLeaderEpoch: leaderEpoch,
+          })),
+        })),
+      }
     },
   },
 }

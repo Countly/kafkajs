@@ -49,6 +49,7 @@ const decode = async (rawData) => {
   return {
     throttleTime: 0,
     clientSideThrottleTime: throttleTime,
+    groupId: group.groupId,
     errorCode: group.errorCode,
     responses: group.topics,
   }

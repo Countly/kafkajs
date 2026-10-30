@@ -26,7 +26,7 @@ const COOPERATIVE = 'cooperative'
  *   topics only other members subscribe to, from the sync; absent for any other member
  *
  * @typedef {Object} GroupProtocol
- * @property {'classic' | 'consumer'} kind which membership implementation this is; read by the
+ * @property {'classic' | 'consumer' | 'manual'} kind which membership implementation this is; read by the
  *   round loop, the poll-expiry path and the error contract, none of which can reach the protocol
  *   except through `ConsumerGroup`
  * @property {number} memberEpoch the current member epoch, or null for a protocol that has none
