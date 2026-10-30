@@ -71,3 +71,23 @@ describe('CommitEpisodeProbe held response', () => {
     expect(delivered).toHaveLength(1)
   })
 })
+
+describe('CommitEpisodeProbe correlation', () => {
+  it('matches a commit event whose partitions are string keys', () => {
+    let ordinal = 0
+    const socket = Object.assign(new EventEmitter(), { write: jest.fn(() => true) })
+    const probe = new CommitEpisodeProbe(
+      () => socket,
+      () => ++ordinal
+    )
+    probe.socketFactory({}).write(request(OFFSET_COMMIT, 9))
+    probe.recordCommit({
+      groupId: 'g',
+      memberId: 'm',
+      topics: [{ topic: 't', partitions: [{ partition: '0', offset: '50' }] }],
+    })
+    expect(
+      probe.correlate({ partition: 0, after: 0, before: Infinity, single: true })
+    ).toMatchObject({ partition: 0, offset: 50, apiKey: OFFSET_COMMIT, correlationId: 9 })
+  })
+})

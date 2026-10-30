@@ -150,7 +150,8 @@ class CommitEpisodeProbe {
   }
 
   /**
-   * Records the member's own commit event, which names the partitions a commit carried.
+   * Records the member's own commit event, which names the partitions a commit carried. The event
+   * gives partitions as the string keys of the offset table, so they are stored as numbers.
    * @param {object} payload a `commit_offsets` payload
    * @returns {void}
    */
@@ -158,7 +159,14 @@ class CommitEpisodeProbe {
     const ordinal = this.tick()
     for (const { topic, partitions } of topics) {
       for (const { partition, offset } of partitions) {
-        this.commits.push({ groupId, memberId, topic, partition, offset: Number(offset), ordinal })
+        this.commits.push({
+          groupId,
+          memberId,
+          topic,
+          partition: Number(partition),
+          offset: Number(offset),
+          ordinal,
+        })
       }
     }
   }
