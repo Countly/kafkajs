@@ -9,7 +9,7 @@ title: FAQ
 
 ## Why am I receiving messages for topics I'm not subscribed to?
 
-If you are seeing the warning `[ConsumerGroup] Consumer group received unsubscribed topics`, the group's leader gave this member partitions of a topic it does not subscribe to. The member drops them, so nobody consumes those partitions until the next rebalance. The leader is one member of the group, and its assigner decides for every member.
+If you are seeing the warning `[ConsumerGroup] Consumer group received unsubscribed topics`, the group's leader gave this member partitions of a topic it does not subscribe to. The member drops them, so nobody consumes those partitions until the next rebalance. The leader is one member of the group, and its assigner decides for every member. This warning and `RECEIVED_UNSUBSCRIBED_TOPICS` apply to the classic group protocol. Under the consumer protocol, names outside the round subscription are filtered with a debug message and no event or warning.
 
 The assigners of this client never do that: `roundRobin` skips the members that do not subscribe to a partition's topic, `range` divides each topic among its subscribers only, and `sticky` and `cooperativeSticky` never hand a partition back to a previous owner that has left its topic. So the warning means that the leader runs a custom assigner or another client: an older KafkaJS (2.2.4 or earlier), or a Java consumer whose `sticky` or `cooperative-sticky` assignor hands such a partition back (Kafka 4.3's `AbstractStickyAssignor` does not check the subscription).
 

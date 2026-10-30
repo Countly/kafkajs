@@ -846,7 +846,11 @@ module.exports = class ConsumerGroup {
    *
    * Filters out topics the member is not subscribed to, refreshes metadata once when the
    * assignment names a partition the member has never heard of, and replaces the assignment.
-   * Emits exactly one event, `RECEIVED_UNSUBSCRIBED_TOPICS`, which it already owned.
+   * Emits `RECEIVED_UNSUBSCRIBED_TOPICS` and warns for filtered names under classic only.
+   * Under the consumer protocol a target can lag the round subscription, so filtered names are
+   * logged at debug level. Java accepts resolved target assignments without the classic assignment
+   * check, but separately makes explicitly unsubscribed topics non-fetchable. Keep this filter:
+   * suppressing the event must not enable fetching outside the round subscription.
    *
    * Two ways to apply the offsets:
    *
@@ -907,14 +911,18 @@ module.exports = class ConsumerGroup {
         topicsNotSubscribed,
       }
 
-      this.instrumentationEmitter.emit(RECEIVED_UNSUBSCRIBED_TOPICS, payload)
-      this.logger.warn('Consumer group received unsubscribed topics', {
-        ...payload,
-        helpUrl: websiteUrl(
-          'docs/faq',
-          'why-am-i-receiving-messages-for-topics-im-not-subscribed-to'
-        ),
-      })
+      if (this.kind === 'consumer') {
+        this.logger.debug('Dropping assigned topics outside the round subscription', payload)
+      } else {
+        this.instrumentationEmitter.emit(RECEIVED_UNSUBSCRIBED_TOPICS, payload)
+        this.logger.warn('Consumer group received unsubscribed topics', {
+          ...payload,
+          helpUrl: websiteUrl(
+            'docs/faq',
+            'why-am-i-receiving-messages-for-topics-im-not-subscribed-to'
+          ),
+        })
+      }
     }
 
     // Remove unsubscribed topics from the list

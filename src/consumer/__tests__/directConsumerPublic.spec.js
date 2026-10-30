@@ -232,6 +232,37 @@ describe('A manual consumer over a scripted broker', () => {
     for (const api of MEMBERSHIP_APIS) expect(frames(cluster, api)).toEqual([])
   })
 
+  test('committed reports null metadata for a partition without a commit, as the broker answers it', async () => {
+    wire = await scripted()
+    const { cluster, kafka } = wire
+    const cells = {
+      0: { offset: '-1', metadata: '' },
+      1: { offset: '7', metadata: 'note' },
+      2: { offset: '3', metadata: '' },
+    }
+    cluster.answer('OffsetFetch', ({ groupId, topics }) => ({
+      groupId,
+      topics: topics.map((entry) => ({
+        topic: entry.topic,
+        partitions: entry.partitions.map(({ partition }) => ({
+          partition,
+          ...cells[partition],
+          leaderEpoch: -1,
+          errorCode: 0,
+        })),
+      })),
+    }))
+    const consumer = track(kafka.consumer({ groupId: 'observer-group' }))
+    await consumer.connect()
+    expect(
+      await consumer.committed([0, 1, 2].map((partition) => ({ topic: TOPIC, partition })))
+    ).toEqual([
+      { topic: TOPIC, partition: 0, offset: null, metadata: null },
+      { topic: TOPIC, partition: 1, offset: '7', metadata: 'note' },
+      { topic: TOPIC, partition: 2, offset: '3', metadata: '' },
+    ])
+  })
+
   test('committed reads broker truth of unassigned pairs without moving any position', async () => {
     wire = await scripted({ committed: { 1: '7' } })
     const { cluster, kafka } = wire

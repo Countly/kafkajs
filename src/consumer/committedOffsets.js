@@ -24,7 +24,8 @@ class CommittedOffsetReader {
    * Reads one offset per requested pair, in input order.
    * @param {{topic: string, partition: number}[]} entries validated, non-empty and unique pairs
    * @returns {Promise<{topic: string, partition: number, offset: string|null, metadata: string|null}[]>}
-   *   rows in input order; an offset the group never committed is `null`, not `'-1'`
+   *   rows in input order; an offset the group never committed is `null`, not `'-1'`, and its
+   *   metadata is `null` too (the broker answers `''` for it)
    * @throws {KafkaJSInvariantViolation} when the answer names another group or omits a requested cell
    * @throws {Error} a broker or partition error once the retry budget is spent
    */
@@ -69,12 +70,12 @@ class CommittedOffsetReader {
           `OffsetFetch for group "${this.groupId}" returned no answer for ${topic}[${partition}]`
         )
       }
-      const committed = cell.offset == null || String(cell.offset).startsWith('-')
+      const uncommitted = cell.offset == null || String(cell.offset).startsWith('-')
       return {
         topic,
         partition,
-        offset: committed ? null : String(cell.offset),
-        metadata: cell.metadata ?? null,
+        offset: uncommitted ? null : String(cell.offset),
+        metadata: uncommitted ? null : (cell.metadata ?? null),
       }
     })
   }

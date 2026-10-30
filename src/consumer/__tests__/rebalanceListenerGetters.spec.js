@@ -162,7 +162,7 @@ describe('position and committed inside awaited rebalance callbacks', () => {
       ...delivered.filter(({ partition }) => partition === 0).map(({ offset }) => offset)
     )
     expect(seen.position).toBe(String(last + 1))
-    expect(seen.committed).toEqual([{ ...PAIRS[0], offset: null, metadata: 'meta-0' }])
+    expect(seen.committed).toEqual([{ ...PAIRS[0], offset: null, metadata: null }])
   })
 
   test('a callback of a retired run cannot read through the getters, and sends nothing', async () => {
@@ -235,7 +235,7 @@ describe('position and committed inside awaited rebalance callbacks', () => {
     await stopping
 
     expect(seen.position).toBe('1')
-    expect(seen.committed).toEqual([{ ...from, offset: null, metadata: `meta-${from.partition}` }])
+    expect(seen.committed).toEqual([{ ...from, offset: null, metadata: null }])
   })
 
   describe('a position read that outlives its callback', () => {

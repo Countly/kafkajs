@@ -9,6 +9,10 @@ Versions before 3.0.0 are internal alpha tags and are not published.
 
 #### Behavior changes
 
+- Under `groupProtocol: 'consumer'`, assigned topics outside the round subscription are filtered without `RECEIVED_UNSUBSCRIBED_TOPICS` or its warning; a debug message records them. Classic behavior is unchanged.
+
+- `consumer.committed()` returns `metadata: null` whenever `offset` is null. A committed offset retains its stored metadata, including the empty string.
+
 - **The classic `sessionTimeout` defaults to 45 000 ms** (was 30 000). `sessionTimeout` and `heartbeatInterval` are now validated: integers, `sessionTimeout` 1 to 2 147 483 647, `heartbeatInterval` lower than it; a JoinGroup the broker refuses as outside its session-timeout bounds fails with an actionable error
 
 - **A paused consumer resumes at once and an idle consumer stops at once**: `resume()`, `seek()`, an assignment change and `stop()` end the idle wait instead of waiting out `maxWaitTimeInMs` (default 5 000 ms), which is unchanged

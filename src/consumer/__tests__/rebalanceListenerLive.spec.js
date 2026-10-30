@@ -1,5 +1,4 @@
 const { Kafka, logLevel } = require('../../../index')
-const Broker = require('../../broker')
 const defaultSocketFactory = require('../../network/socketFactory')
 const { roundRobin, cooperativeSticky } = require('../assigners')
 const { plainTextBrokers, secureRandom, writeEvidence, wireVersionsOf } = require('testHelpers')
@@ -15,6 +14,7 @@ const {
   pollUntil,
 } = require('../../producer/__tests__/fixtures/bounded')
 const { CommitEpisodeProbe } = require('./fixtures/commitEpisodeProbe')
+const { traceFetches } = require('./fixtures/fetchTrace')
 const { exampleTranscript, judge, verifyListenerEvidence } = require('./fixtures/listenerOracle')
 
 // Gated: it needs a real cluster. Run alone: `npm run test:e2e:rebalance-listener`.
@@ -169,20 +169,7 @@ class ListenerScenario {
       },
       { label: 'The topic leaders' }
     )
-    const original = Broker.prototype.fetch
-    const scenario = this
-    const spy = jest.spyOn(Broker.prototype, 'fetch').mockImplementation(function (
-      request,
-      ...rest
-    ) {
-      for (const entry of request.topics ?? []) {
-        if (entry.topic !== topic) continue
-        for (const { partition } of entry.partitions) {
-          scenario.fetches.push({ clientId: this.clientId, partition, ordinal: scenario.tick() })
-        }
-      }
-      return original.call(this, request, ...rest)
-    })
+    const spy = traceFetches({ topic, sink: this.fetches, tick: () => this.tick() })
     cleanup.add('fetch trace', () => spy.mockRestore())
 
     for (let partition = 0; partition < PARTITIONS; partition++) {

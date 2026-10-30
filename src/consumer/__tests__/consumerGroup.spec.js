@@ -301,6 +301,41 @@ describe('Consumer > ConsumerGroup > growSubscription', () => {
   })
 })
 
+describe('Consumer > ConsumerGroup > an assignment that names a topic outside the round subscription', () => {
+  const apply = (group) =>
+    group.applyRebalanceResult(
+      { assignment: { 'events-a': [0], 'events-gone': [0] }, userData: null },
+      { rebuildOffsets: true }
+    )
+
+  it('under the consumer protocol is a reconciliation transient: dropped, with no event and no warning', async () => {
+    const group = createGroup({ topics: ['events-a'], groupProtocol: 'consumer' })
+    const unsubscribed = collectUnsubscribedTopics(group)
+    const warn = jest.spyOn(group.logger, 'warn')
+
+    const { assignment } = await apply(group)
+
+    expect(assignment).toEqual([{ topic: 'events-a', partitions: [0] }])
+    expect(unsubscribed).toEqual([])
+    expect(warn).not.toHaveBeenCalled()
+  })
+
+  it('under the classic protocol is reported once and dropped', async () => {
+    const group = createGroup({ topics: ['events-a'] })
+    const unsubscribed = collectUnsubscribedTopics(group)
+
+    const { assignment } = await apply(group)
+
+    expect(assignment).toEqual([{ topic: 'events-a', partitions: [0] }])
+    expect(unsubscribed).toEqual([
+      expect.objectContaining({
+        assignedTopics: ['events-a', 'events-gone'],
+        topicsNotSubscribed: ['events-gone'],
+      }),
+    ])
+  })
+})
+
 describe('Consumer > ConsumerGroup > an assignment that names partitions the member has not heard of', () => {
   it('refreshes the metadata once, relearns the partitions of every subscribed topic and keeps the assignment', async () => {
     const group = createGroup({ topics: [TOPIC_A, TOPIC_B] })
