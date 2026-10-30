@@ -1284,3 +1284,16 @@ void unionAssignerContract.assign({
   groupTopics: ['orders'],
   groupTopicMetadata: new Map<string, PartitionMetadata[]>(),
 })
+
+// Range rack matching is opt-in and the factory sees a boolean.
+kafka.consumer({ groupId: 'rack-range', rackAwareAssignment: true })
+kafka.consumer({ groupId: 'rack-range', rackAwareAssignment: false })
+// @ts-expect-error the rack-aware option is a boolean
+kafka.consumer({ groupId: 'rack-range', rackAwareAssignment: 'true' })
+
+const rackFactory: kafkajs.PartitionAssigner = ({ rackAware, ...config }) => {
+  const enabled: boolean = rackAware ?? false
+  void enabled
+  return PartitionAssigners.range({ ...config, rackAware })
+}
+kafka.consumer({ groupId: 'custom-rack-range', partitionAssigners: [rackFactory], rackAwareAssignment: true })

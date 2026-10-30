@@ -1,3 +1,4 @@
+const partitionMetadata = require('../assigners/partitionMetadata')
 const sharedPromiseTo = require('../../utils/sharedPromiseTo')
 const apiKeys = require('../../protocol/requests/apiKeys')
 const { requests } = require('../../protocol/requests')
@@ -12,6 +13,7 @@ const {
   events: { HEARTBEAT },
 } = require('../instrumentationEvents')
 const { EAGER, COOPERATIVE } = require('./interface')
+const LeaderUnionWatch = require('../leaderUnionWatch')
 const {
   stampGeneration,
   stampOwnership,
@@ -511,7 +513,7 @@ module.exports = class ClassicGroupProtocol {
       const rows = this.cluster.findTopicPartitionMetadata(topic)
       groupTopicMetadata.set(
         topic,
-        rows.map((row) => ({ ...row }))
+        partitionMetadata.withReplicaRacks(rows, this.cluster.brokerPool?.metadata?.brokers || [])
       )
     }
     const missing = groupTopics.filter((topic) => !own.has(topic))
@@ -528,7 +530,11 @@ module.exports = class ClassicGroupProtocol {
         })
       )
       const wanted = new Set(missing)
-      for (const { topic, topicErrorCode, partitionMetadata } of snapshot.topicMetadata) {
+      for (const {
+        topic,
+        topicErrorCode,
+        partitionMetadata: partitions,
+      } of snapshot.topicMetadata) {
         if (!wanted.has(topic)) continue
         if (topicErrorCode) {
           this.logger.warn('Skipping unavailable group topic', {
@@ -539,7 +545,7 @@ module.exports = class ClassicGroupProtocol {
         }
         groupTopicMetadata.set(
           topic,
-          partitionMetadata.map((row) => ({ ...row }))
+          partitionMetadata.withReplicaRacks(partitions, snapshot.brokers || [])
         )
       }
     }
@@ -553,12 +559,16 @@ module.exports = class ClassicGroupProtocol {
    * own back. `beforeSync` runs between the leader's `assign()` and the request, which is where
    * the caller refreshes the partitions it knows about for its subscribed topics.
    * @param {{ topics: string[], topicsSubscribed: string[], beforeSync: () => void, round: object }} context
-   * @returns {Promise<{ assignment: Object, userData: Buffer|null }>}
+   * @returns {Promise<{ assignment: Object, userData: Buffer|null,
+   *   unionSnapshot: Map<string, number[]>|null }>} `unionSnapshot` is the leader's partition sets
+   *   of the topics only other members subscribe to, for `LeaderUnionWatch`; null for a follower
+   *   or when every member shares the leader's subscription
    * @throws {KafkaJSNonRetriableError} when the coordinator picked an assignor this member does
    *   not have
    */
   async sync({ topics, topicsSubscribed, beforeSync, round }) {
     let assignment = []
+    let unionSnapshot = null
     const {
       groupId,
       generationId,
@@ -592,6 +602,11 @@ module.exports = class ClassicGroupProtocol {
         members,
         topicsSubscribed,
         round
+      )
+      const own = new Set(topicsSubscribed)
+      unionSnapshot = LeaderUnionWatch.snapshotOf(
+        groupTopics.filter((topic) => !own.has(topic)),
+        groupTopicMetadata
       )
       assignment = await round.wait(() =>
         assigner.assign({
@@ -645,6 +660,7 @@ module.exports = class ClassicGroupProtocol {
     return {
       assignment: decoded != null ? decoded.assignment : {},
       userData: decoded != null ? decoded.userData : null,
+      unionSnapshot,
     }
   }
 

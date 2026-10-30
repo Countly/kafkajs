@@ -688,8 +688,9 @@ says so, `groupProtocol: 'consumer'`.
   the name on the wire are different things: the default assigner keeps the wire name
   `RoundRobinAssigner`, which no Java client understands — renaming it would split every existing
   group — and the default assigner list is unchanged at `[PartitionAssigners.roundRobin]`, so a
-  consumer you do not reconfigure behaves exactly as before. Rack-aware assignment is not
-  implemented: `rackId` is sent to the leader and ignored when partitions are assigned. One
+  consumer you do not reconfigure behaves exactly as before. Rack-aware assignment is opt-in and
+  `range`-only (`rackAwareAssignment: true`, below); otherwise `rackId` is sent to the leader and
+  ignored when partitions are assigned. One
   small caveat if you run a mixed group: on a shape where more than one balanced sticky assignment
   is equally correct — an incumbent tie-break during a scale-up — a Java leader and a leader running
   this client can pick different ones, so a leader change between the two may move one partition
@@ -949,6 +950,8 @@ Groups whose members subscribe to different topics now assign every subscribed p
 - **A named topic a KIP-848 member is assigned before its name is known is found promptly.** Nothing to do
 
 Connection or coordinator failures in the consumer protocol no longer spend the fetch loop's retry count while the client reconnects. Handler errors keep their existing retry treatment. Use stop/disconnect to end recovery, and keep handling membership loss and fatal errors. This does not change the three stale-member-epoch commit rules or add a background automatic-commit timer.
+
+- **Rack-aware range assignment is opt-in.** Set `rackAwareAssignment: true` with `partitionAssigners: [PartitionAssigners.range]`, member rack IDs and broker rack labels to use it. The default is false; sticky, cooperative-sticky and round-robin ignore it. A Java leader can still rack-match with the option off on JavaScript members, so mixed-leader assignments can differ.
 
 ### Admin
 

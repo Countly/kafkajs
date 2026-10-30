@@ -539,6 +539,7 @@ module.exports = class Client {
    * `maxDecompressedBatchBytes` (default 1 GiB, an integer from 1 to 2147483647) is the most a
    * record batch may decompress to, for every codec; it also sets a ceiling of
    * `max(1, floor(bytes / 512))` records per batch. A batch past either halts its partition.
+   * @throws {KafkaJSNonRetriableError} for a non-boolean `rackAwareAssignment`
    * @throws {KafkaJSInvalidConfigurationError} for an invalid `maxDecompressedBatchBytes`
    * @public
    */
@@ -559,6 +560,7 @@ module.exports = class Client {
     maxInFlightRequests,
     readUncommitted = false,
     rackId = '',
+    rackAwareAssignment = false,
     checkCrcs = true,
     maxDecompressedBatchBytes = DEFAULT_MAX_DECOMPRESSED_BATCH_BYTES,
     groupInstanceId = null,
@@ -566,6 +568,9 @@ module.exports = class Client {
     groupRemoteAssignor,
     maxPrefetchBatches,
   } = {}) {
+    if (typeof rackAwareAssignment !== 'boolean') {
+      throw new KafkaJSNonRetriableError('rackAwareAssignment must be a boolean')
+    }
     validateMaxDecompressedBatchBytes(maxDecompressedBatchBytes)
 
     const isolationLevel = readUncommitted
@@ -607,6 +612,7 @@ module.exports = class Client {
       isolationLevel,
       instrumentationEmitter,
       rackId,
+      rackAwareAssignment,
       checkCrcs,
       maxDecompressedBatchBytes,
       groupInstanceId,

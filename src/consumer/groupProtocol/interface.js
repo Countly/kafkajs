@@ -22,6 +22,8 @@ const COOPERATIVE = 'cooperative'
  * @property {TopicPartitions[]} assignment the full target assignment after this round
  * @property {TopicPartitions[]} added      assignment minus what was previously owned
  * @property {TopicPartitions[]} revoked    previously owned minus assignment
+ * @property {Map<string, number[]>|null} [unionSnapshot] a classic leader's partition sets of the
+ *   topics only other members subscribe to, from the sync; absent for any other member
  *
  * @typedef {Object} GroupProtocol
  * @property {'classic' | 'consumer'} kind which membership implementation this is; read by the

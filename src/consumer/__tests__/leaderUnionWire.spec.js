@@ -107,6 +107,7 @@ let encoding = null
  * @param {boolean} [options.enforceRequestTimeout]
  * @param {number|null} [options.maxInFlightRequests]
  * @param {boolean} [options.allowAutoTopicCreation]
+ * @param {number} [options.metadataMaxAge] how long the cluster trusts its metadata
  * @param {number} [options.coordinator] the id of the node that coordinates the group
  * @param {boolean} [options.redial] leaves every broker disconnected, so the next request dials
  * @param {object} [options.peer] another rig whose wire, schedule and topics this one shares
@@ -118,6 +119,7 @@ const rig = async ({
   enforceRequestTimeout = false,
   maxInFlightRequests = null,
   allowAutoTopicCreation = true,
+  metadataMaxAge,
   coordinator = 0,
   redial = false,
   peer = null,
@@ -172,6 +174,7 @@ const rig = async ({
     enforceRequestTimeout,
     maxInFlightRequests,
     allowAutoTopicCreation,
+    metadataMaxAge,
     sasl: sasl ? SASL : undefined,
     retry: { retries: 0 },
   })
@@ -357,6 +360,59 @@ const assignments = (frame) =>
     ])
   )
 
+/**
+ * A real `ConsumerGroup` over the rig's cluster, joined as the leader of a classic group whose
+ * members are `members`. The sync and the apply are the real ones; only the offset and position
+ * work of a fetch is left out.
+ * @param {object} env the rig, made with `metadataMaxAge`
+ * @param {Array<[string, Buffer]>} members `[memberId, subscription]`, the leader first
+ * @returns {Promise<{ group: ConsumerGroup, protocol: ClassicGroupProtocol, round: object }>}
+ *   the group after its first assignment was applied
+ */
+const assigned = async (env, members) => {
+  const group = new ConsumerGroup({
+    cluster: env.cluster,
+    groupId: 'group',
+    topics: ['A'],
+    topicConfigurations: { A: {} },
+    logger: newLogger(),
+    instrumentationEmitter: { emit() {} },
+    assigners: [RoundRobinAssigner({ cluster: env.cluster })],
+    sessionTimeout: 30000,
+    rebalanceTimeout: 1000,
+    maxWaitTimeInMs: 100,
+    metadataMaxAge: 5000,
+    retry: { retries: 0 },
+  })
+  group.seekOffsets = async () => {}
+  group.validatePositions = async () => {}
+  const protocol = group.groupMembership
+  Object.assign(protocol, {
+    memberId: 'a',
+    leaderId: 'a',
+    generationId: 1,
+    groupProtocol: protocol.assigners[0].name,
+    protocolType: 'consumer',
+    members: members.map(([memberId, memberMetadata]) => ({ memberId, memberMetadata })),
+    coordinator: await env.cluster.findGroupCoordinator({ groupId: 'group' }),
+  })
+  const round = group.beginRebalanceRound()
+  const result = await protocol.sync({
+    topics: group.topics,
+    topicsSubscribed: group.topicsSubscribed,
+    beforeSync: () => {
+      group.partitionsPerSubscribedTopic = group.generatePartitionsPerSubscribedTopic()
+    },
+    round: round.attempt(),
+  })
+  await group.applyRebalanceResult(result, { round })
+  round.retire()
+  return { group, protocol, round }
+}
+
+/** @param {ConsumerGroup} group @returns {Promise<void>} one fetch preparation on the current run */
+const prepare = (group) => group.prepareFetch(0, group.idleWait, group.ownership.token())
+
 describe('leader union over the real transport', () => {
   beforeEach(() => {
     expect(typeof Cluster.prototype.groupMetadata).toBe('function')
@@ -432,13 +488,14 @@ describe('leader union over the real transport', () => {
       const topics = ['A']
       const before = env.wire.requests().length
 
-      await protocol.sync({
+      const result = await protocol.sync({
         topics,
         topicsSubscribed: topics,
         beforeSync() {},
         round: round.attempt(),
       })
 
+      expect(result.unionSnapshot).toBeNull()
       expect(assign.mock.calls[0][0].topics).toBe(topics)
       expect(assign.mock.calls[0][0].groupTopics).toEqual(['A'])
       const metadata = env.wire
@@ -1004,6 +1061,257 @@ describe('leader union over the real transport', () => {
       second.retire()
       await subscriber.cluster.disconnect({ drainTimeout: 0 })
       await env.finish()
+    })
+  })
+  describe('the leader union watch', () => {
+    const STALE = { name: 'KafkaJSStaleTopicMetadataAssignment', topic: 'C' }
+    /** @param {object} env @returns {object[]} the Metadata requests that asked for C alone */
+    const readsOfC = (env) => env.frames('Metadata', 'C')
+
+    it.each([
+      ['a topic that did not exist at the assignment', null, [0, 1], [0, 1]],
+      ['a topic that gained partitions', [0], [0, 1, 2], [1, 2]],
+    ])('rejoins when %s and only a follower subscribes to it', async (_, before, after, gained) => {
+      const env = await rig({ metadataMaxAge: 5000 })
+      if (before) env.table.set('C', topic(before.map((id) => ({ id }))))
+      const targets = [...env.cluster.targetTopics]
+      const { group } = await assigned(env, [
+        ['a', sub('A')],
+        ['b', sub('C')],
+      ])
+      env.table.set('C', topic(after.map((id) => ({ id }))))
+      const asks = readsOfC(env).length
+
+      await elapse(4000)
+      await prepare(group)
+      expect(readsOfC(env)).toHaveLength(asks)
+
+      await elapse(1001)
+      await expect(prepare(group)).rejects.toMatchObject({
+        ...STALE,
+        unknownPartitions: gained,
+      })
+
+      expect(readsOfC(env)).toHaveLength(asks + 1)
+      expect(readsOfC(env)[asks].fields.allowAutoTopicCreation).toBe(false)
+      expect([...env.cluster.targetTopics]).toEqual(targets)
+      expect(env.cluster.findTopicPartitionMetadata('C')).toEqual([])
+      await elapse(10000)
+      await prepare(group)
+      expect(readsOfC(env)).toHaveLength(asks + 1)
+      group.onStopRequested()
+      await env.finish()
+    })
+
+    it('keeps watching after a failed read and reads again after the next interval', async () => {
+      const env = await rig({ metadataMaxAge: 5000 })
+      const { group } = await assigned(env, [
+        ['a', sub('A')],
+        ['b', sub('C')],
+      ])
+      const asks = readsOfC(env).length
+      env.schedule.once(
+        { api: 'Metadata', match: ({ fields }) => asked(fields) === 'C' },
+        new Error('reset by peer')
+      )
+      await elapse(5001)
+      const failing = watch(prepare(group))
+      await driven(failing)
+      expect(failing.state).toBe('fulfilled')
+      expect(readsOfC(env)).toHaveLength(asks + 1)
+
+      env.table.set('C', topic([{ id: 0 }]))
+      await elapse(4000)
+      await prepare(group)
+      expect(readsOfC(env)).toHaveLength(asks + 1)
+      await elapse(1001)
+      await expect(prepare(group)).rejects.toMatchObject(STALE)
+      group.onStopRequested()
+      await env.finish()
+    })
+
+    it('sends no Metadata for the union when every member shares the leader subscription', async () => {
+      const env = await rig({ metadataMaxAge: 5000 })
+      const { group } = await assigned(env, [
+        ['a', sub('A')],
+        ['b', sub('A')],
+      ])
+      const before = env.wire.requests().length
+
+      await elapse(60000)
+      await prepare(group)
+
+      const written = env.wire
+        .requests()
+        .slice(before)
+        .filter((r) => r.api === 'Metadata')
+      expect(written.map((r) => asked(r.fields))).toEqual(['A'])
+      group.onStopRequested()
+      await env.finish()
+    })
+
+    it('stops watching when leadership is lost', async () => {
+      const env = await rig({ metadataMaxAge: 5000 })
+      const { group, protocol } = await assigned(env, [
+        ['a', sub('A')],
+        ['b', sub('C')],
+      ])
+      const asks = readsOfC(env).length
+      env.table.set('C', topic([{ id: 0 }]))
+      protocol.leaderId = 'b'
+
+      await elapse(60000)
+      await prepare(group)
+      await elapse(60000)
+      await prepare(group)
+
+      expect(readsOfC(env)).toHaveLength(asks)
+      group.onStopRequested()
+      await env.finish()
+    })
+
+    it('stops watching when the next round starts', async () => {
+      const env = await rig({ metadataMaxAge: 5000 })
+      const { group } = await assigned(env, [
+        ['a', sub('A')],
+        ['b', sub('C')],
+      ])
+      const asks = readsOfC(env).length
+      env.table.set('C', topic([{ id: 0 }]))
+
+      const next = group.beginRebalanceRound()
+      await elapse(60000)
+      await prepare(group)
+
+      expect(readsOfC(env)).toHaveLength(asks)
+      next.retire()
+      group.onStopRequested()
+      await env.finish()
+    })
+
+    it('drops a read still in flight when the next round starts', async () => {
+      const env = await rig({ metadataMaxAge: 5000 })
+      const { group } = await assigned(env, [
+        ['a', sub('A')],
+        ['b', sub('C')],
+      ])
+      const held = env.schedule.hold({
+        api: 'Metadata',
+        match: ({ fields }) => asked(fields) === 'C',
+      })
+      env.table.set('C', topic([{ id: 0 }]))
+      await elapse(5001)
+      const preparing = watch(prepare(group))
+      const reached = watch(held.arrived())
+      await drain()
+      expect(reached.state).toBe('fulfilled')
+
+      const next = group.beginRebalanceRound()
+      held.release()
+      await drain()
+
+      expect(preparing.state).toBe('fulfilled')
+      next.retire()
+      group.onStopRequested()
+      await env.finish()
+    })
+
+    it('stops watching when the run stops, and drops a read still in flight', async () => {
+      const env = await rig({ metadataMaxAge: 5000 })
+      const { group } = await assigned(env, [
+        ['a', sub('A')],
+        ['b', sub('C')],
+      ])
+      const asks = readsOfC(env).length
+      const held = env.schedule.hold({
+        api: 'Metadata',
+        match: ({ fields }) => asked(fields) === 'C',
+      })
+      env.table.set('C', topic([{ id: 0 }]))
+      await elapse(5001)
+      const preparing = watch(prepare(group))
+      const reached = watch(held.arrived())
+      await drain()
+      expect(reached.state).toBe('fulfilled')
+
+      group.onStopRequested()
+      await drain()
+      expect(preparing.state).toBe('rejected')
+      expect(preparing.value).toMatchObject({ type: 'CONSUMER_STOPPING' })
+      held.release()
+      await drain()
+
+      group.startIdleWait()
+      await elapse(60000)
+      await prepare(group)
+      expect(readsOfC(env)).toHaveLength(asks + 1)
+      group.onStopRequested()
+      await env.finish()
+    })
+
+    describe('retirement of a read before it is transmitted', () => {
+      it.each(['round', 'leadership'])(
+        'writes no old read after %s retirement and settles without the held work',
+        async (how) => {
+          const env = await rig({ metadataMaxAge: 5000 })
+          const { group, protocol } = await assigned(env, [
+            ['a', sub('A')],
+            ['b', sub('C')],
+          ])
+          await elapse(5001)
+          await env.cluster.refreshMetadata()
+          const asks = readsOfC(env).length
+          expect(asks).toBe(1)
+          const held = env.hold('encoding')
+          const preparing = watch(prepare(group))
+          const reached = watch(held.arrived())
+          await drain()
+          expect(reached.state).toBe('fulfilled')
+
+          let next
+          if (how === 'round') next = group.beginRebalanceRound()
+          else protocol.leaderId = 'b'
+          await drain()
+          // Only a round start is an event the local wait can follow; a bare leadership change is
+          // seen at the next guard check.
+          if (how === 'round') expect(preparing.state).toBe('fulfilled')
+          held.release()
+          await drain()
+
+          expect(readsOfC(env)).toHaveLength(asks)
+          expect(preparing.state).toBe('fulfilled')
+          next?.retire()
+          group.onStopRequested()
+          await env.finish()
+        }
+      )
+
+      it('publishes no drift from an answer that arrives after leadership was lost', async () => {
+        const env = await rig({ metadataMaxAge: 5000 })
+        const { group, protocol } = await assigned(env, [
+          ['a', sub('A')],
+          ['b', sub('C')],
+        ])
+        const held = env.schedule.hold({
+          api: 'Metadata',
+          match: ({ fields }) => asked(fields) === 'C',
+        })
+        env.table.set('C', topic([{ id: 0 }]))
+        await elapse(5001)
+        const preparing = watch(prepare(group))
+        const reached = watch(held.arrived())
+        await drain()
+        expect(reached.state).toBe('fulfilled')
+
+        protocol.leaderId = 'b'
+        held.release()
+        await drain()
+
+        expect(preparing.state).toBe('fulfilled')
+        expect(group.leaderUnionWatch.drift).toBeNull()
+        group.onStopRequested()
+        await env.finish()
+      })
     })
   })
 })

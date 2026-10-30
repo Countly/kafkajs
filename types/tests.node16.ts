@@ -79,3 +79,9 @@ void unionNode16.assign({
   groupTopics: ['orders'],
   groupTopicMetadata: new Map<string, UnionPartitionMetadata[]>(),
 })
+
+// Range rack matching is opt-in and the factory sees a boolean.
+kafka.consumer({ groupId: 'rack-range', rackAwareAssignment: true })
+kafka.consumer({ groupId: 'rack-range', rackAwareAssignment: false })
+// @ts-expect-error the rack-aware option is a boolean
+kafka.consumer({ groupId: 'rack-range', rackAwareAssignment: 'true' })

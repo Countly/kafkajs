@@ -33,11 +33,15 @@ Versions before 3.0.0 are internal alpha tags and are not published.
 
 - Use one membership-staleness predicate for ownership loss and rebalance verdicts; a consumer epoch change does not retire a current ownership token.
 
+- **A classic leader now notices a partition added to a topic only other members subscribe to.** The union it assigned from was read once, during the sync, so a topic subscribed only by a follower could never make the leader rejoin (Java's leader compares its assignment snapshot with its metadata snapshot and rejoins on drift). The leader now rereads those topics with a bounded, non-installing Metadata request, at most once per `metadataMaxAge`, and asks for the ordinary stale-assignment rejoin when one gains partitions, including a topic that did not exist at assignment. The watch stops when leadership is lost, a new round starts or the consumer stops, never creates a topic, never adds to the leader's own targets, and costs a leader whose members share its subscription one property read per fetch round.
+
 #### Additions
 
 - Pin the kept consumer defaults: classic groups with round-robin assignment, a 5 000 ms Fetch wait, a 10 MiB response target and committed transactional reads; document their limits and existing configuration escapes.
 
 - Partition assigners receive optional groupTopics and groupTopicMetadata arguments. A supplied metadata map is authoritative, including missing names; built-in assigners use cluster metadata only when the entire map is absent.
+
+- Add opt-in rackAwareAssignment for range assignment; other assigners ignore it.
 
 #### Tooling
 
@@ -52,6 +56,8 @@ Versions before 3.0.0 are internal alpha tags and are not published.
 - `test:e2e:leader-union` checks unequal subscriptions, delayed topic creation and Java interoperability in both leader seats.
 
 - Add independent leave/default, consumer fault and transient-state capture checks; assert both group protocols in the broker-bounce rebalance oracle.
+
+- `test:e2e:rack-aware` checks range rack alignment against an independent Java vector, the node of the next Fetch after a preferred-read-replica answer, and no-op rack controls from the socket's own frames.
 
 ### Phase 9B — Producer parity: delivery deadline, memory bound, request size, partitioner, codecs, lifecycle
 

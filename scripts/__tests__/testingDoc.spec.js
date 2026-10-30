@@ -345,6 +345,19 @@ describe('documented live scenario scripts', () => {
         'never through this package row',
       ],
     },
+    {
+      script: 'test:e2e:rack-aware',
+      flag: 'RACK_AWARE_E2E',
+      spec: 'src/consumer/__tests__/rackAwareLive.spec.js',
+      compose: 'docker-compose.racks.yml',
+      budgetsMs: [150000],
+      wording: [
+        'replication factor 2 Java vector',
+        'next Fetch to an in-rack follower',
+        'no-op controls',
+        'never through this package row',
+      ],
+    },
   ]
 
   it.each(scenarios)('$script is one two-worker spec run through test:kafka', (row) => {

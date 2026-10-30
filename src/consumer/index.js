@@ -159,6 +159,7 @@ const parseDisconnectOptions = (options) => {
  * @param {number} [params.maxBytes]
  * @param {number} [params.maxWaitTimeInMs]
  * @param {number} [params.isolationLevel]
+ * @param {boolean} [params.rackAwareAssignment=false] opt-in range rack matching; other assigners ignore it
  * @param {string} [params.rackId]
  * @param {boolean} [params.checkCrcs=true] Verify the CRC32C checksum of every record batch
  *                                received (Java's `check.crcs`). A mismatch halts the partition
@@ -210,6 +211,7 @@ module.exports = (params) => {
     maxWaitTimeInMs = 5000,
     isolationLevel = ISOLATION_LEVEL.READ_COMMITTED,
     rackId = '',
+    rackAwareAssignment = false,
     checkCrcs = true,
     maxDecompressedBatchBytes = DEFAULT_MAX_DECOMPRESSED_BATCH_BYTES,
     groupInstanceId = null,
@@ -232,7 +234,9 @@ module.exports = (params) => {
   // build and no protocol to select from an empty list.
   const assigners = isConsumerProtocol
     ? []
-    : partitionAssigners.map((createAssigner) => createAssigner({ groupId, logger, cluster }))
+    : partitionAssigners.map((createAssigner) =>
+        createAssigner({ groupId, logger, cluster, rackAware: rackAwareAssignment })
+      )
 
   /** @type {Record<string, { fromBeginning?: boolean }>} */
   const topics = dictionary()

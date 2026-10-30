@@ -76,6 +76,8 @@ describe('leader union snapshot', () => {
 })
 
 const IdleWait = require('../idleWait')
+const LeaderUnionWatch = require('../leaderUnionWatch')
+const Generation = require('../../producer/generation')
 const Cluster = require('../../cluster')
 const { connectionOpts, newLogger } = require('testHelpers')
 
@@ -234,12 +236,13 @@ describe('guarded classic leader sync', () => {
     const group = roundGroup()
     const round = group.beginRebalanceRound()
     const topics = ['A']
-    await protocol.sync({
+    const result = await protocol.sync({
       topics,
       topicsSubscribed: topics,
       beforeSync() {},
       round: round.attempt(),
     })
+    expect(result.unionSnapshot).toEqual(new Map([['B', [1]]]))
     expect(assign.mock.calls[0][0].topics).toBe(topics)
     expect(assign.mock.calls[0][0].groupTopics).toEqual(['A', 'B'])
     expect(assign.mock.calls[0][0].groupTopicMetadata.get('B')).toEqual([{ partitionId: 1 }])
@@ -271,5 +274,324 @@ describe('guarded classic leader sync', () => {
     expect(await pending).toMatchObject({ type: 'JOIN_DEADLINE_EXCEEDED' })
     expect(protocol.coordinator.syncGroup).not.toHaveBeenCalled()
     round.retire()
+  })
+})
+
+const watchRows = (...ids) => ids.map((partitionId) => ({ partitionId }))
+const watchAnswer = (topic, ids, topicErrorCode = 0) => ({
+  topicMetadata: [{ topic, topicErrorCode, partitionMetadata: watchRows(...ids) }],
+})
+
+describe('LeaderUnionWatch', () => {
+  let now
+  let cluster
+  let watch
+
+  beforeEach(() => {
+    now = 0
+    jest.spyOn(performance, 'now').mockImplementation(() => now)
+    cluster = { groupMetadata: jest.fn(async () => watchAnswer('C', [0])) }
+    watch = new LeaderUnionWatch({ cluster, logger: newLogger(), metadataMaxAge: 5000 })
+  })
+  afterEach(() => jest.restoreAllMocks())
+
+  describe('snapshotOf', () => {
+    it('keeps the partition ids of each union-only topic, empty for one without rows', () => {
+      const metadata = new Map([['B', watchRows(2, 0)]])
+
+      expect(LeaderUnionWatch.snapshotOf(['B', 'C'], metadata)).toEqual(
+        new Map([
+          ['B', [2, 0]],
+          ['C', []],
+        ])
+      )
+    })
+
+    it('has nothing to watch without a union-only topic', () => {
+      expect(LeaderUnionWatch.snapshotOf([], new Map())).toBeNull()
+    })
+  })
+
+  describe('arm and clear', () => {
+    it('is idle until armed and idle again once cleared', () => {
+      expect(watch.armed).toBe(false)
+      watch.arm(new Map([['C', []]]))
+      expect(watch.armed).toBe(true)
+      watch.clear()
+      expect(watch.armed).toBe(false)
+    })
+
+    it.each([[null], [undefined]])('is idle when armed with %s', (snapshot) => {
+      watch.arm(new Map([['C', []]]))
+      watch.arm(snapshot)
+      expect(watch.armed).toBe(false)
+    })
+
+    it('forgets a latched drift when it is armed again', async () => {
+      watch.arm(new Map([['C', []]]))
+      now = 5000
+      await watch.poll(new Generation())
+      expect(watch.drift).toMatchObject({ topic: 'C', unknownPartitions: [0] })
+
+      watch.arm(new Map([['C', [0]]]))
+
+      expect(watch.drift).toBeNull()
+    })
+  })
+
+  describe('poll', () => {
+    it('reads nothing before the interval has passed, then once', async () => {
+      watch.arm(new Map([['C', []]]))
+      const fence = new Generation()
+
+      now = 4999
+      await watch.poll(fence)
+      expect(cluster.groupMetadata).not.toHaveBeenCalled()
+
+      now = 5000
+      await watch.poll(fence)
+      expect(cluster.groupMetadata).toHaveBeenCalledTimes(1)
+      expect(cluster.groupMetadata.mock.calls[0][0]).toMatchObject({
+        topics: ['C'],
+        allowAutoTopicCreation: false,
+        deadlineAt: 10000,
+      })
+    })
+
+    it('floors the interval at one second', async () => {
+      watch = new LeaderUnionWatch({ cluster, logger: newLogger(), metadataMaxAge: 0 })
+      watch.arm(new Map([['C', [0]]]))
+
+      now = 999
+      await watch.poll(new Generation())
+      expect(cluster.groupMetadata).not.toHaveBeenCalled()
+      now = 1000
+      await watch.poll(new Generation())
+      expect(cluster.groupMetadata).toHaveBeenCalledTimes(1)
+    })
+
+    it('shares one read between concurrent callers', async () => {
+      let release
+      cluster.groupMetadata.mockImplementation(
+        () =>
+          new Promise((resolve) => {
+            release = () => resolve(watchAnswer('C', [0]))
+          })
+      )
+      watch.arm(new Map([['C', []]]))
+      now = 5000
+      const fence = new Generation()
+
+      const first = watch.poll(fence)
+      const second = watch.poll(fence)
+      release()
+      await Promise.all([first, second])
+
+      expect(cluster.groupMetadata).toHaveBeenCalledTimes(1)
+      expect(watch.drift).toMatchObject({ topic: 'C' })
+    })
+
+    it('latches only gained partitions and ignores a topic the broker refused', async () => {
+      watch.arm(
+        new Map([
+          ['B', [0, 1]],
+          ['C', [0]],
+        ])
+      )
+      cluster.groupMetadata.mockResolvedValueOnce({
+        topicMetadata: [
+          { topic: 'B', topicErrorCode: 0, partitionMetadata: watchRows(1) },
+          { topic: 'C', topicErrorCode: 3, partitionMetadata: watchRows(0, 1, 2) },
+        ],
+      })
+      now = 5000
+      await watch.poll(new Generation())
+      expect(watch.drift).toBeNull()
+
+      cluster.groupMetadata.mockResolvedValueOnce(watchAnswer('C', [0, 1, 2]))
+      now = 10000
+      await watch.poll(new Generation())
+      expect(watch.drift).toEqual({ topic: 'C', unknownPartitions: [1, 2] })
+    })
+
+    it('reads no more once a drift is latched', async () => {
+      watch.arm(new Map([['C', []]]))
+      now = 5000
+      await watch.poll(new Generation())
+      now = 60000
+
+      await watch.poll(new Generation())
+
+      expect(cluster.groupMetadata).toHaveBeenCalledTimes(1)
+    })
+
+    it('swallows a failed read, keeps its snapshot and tries again after the next interval', async () => {
+      cluster.groupMetadata.mockRejectedValueOnce(new Error('reset by peer'))
+      watch.arm(new Map([['C', []]]))
+      now = 5000
+      await expect(watch.poll(new Generation())).resolves.toBeUndefined()
+      expect(watch.armed).toBe(true)
+      expect(watch.drift).toBeNull()
+
+      now = 9999
+      await watch.poll(new Generation())
+      expect(cluster.groupMetadata).toHaveBeenCalledTimes(1)
+      now = 10000
+      await watch.poll(new Generation())
+      expect(cluster.groupMetadata).toHaveBeenCalledTimes(2)
+      expect(watch.drift).toMatchObject({ topic: 'C' })
+    })
+
+    it('rejects with the close error of a closed fence and installs nothing', async () => {
+      let release
+      cluster.groupMetadata.mockImplementation(
+        () =>
+          new Promise((resolve) => {
+            release = () => resolve(watchAnswer('C', [0]))
+          })
+      )
+      watch.arm(new Map([['C', []]]))
+      now = 5000
+      const fence = new Generation()
+      const closing = new Error('closed')
+
+      const polling = watch.poll(fence)
+      fence.close(closing)
+      await expect(polling).rejects.toBe(closing)
+      watch.clear()
+      release()
+      await Promise.resolve()
+
+      expect(watch.drift).toBeNull()
+    })
+
+    it('drops the result of a read begun before the snapshot was replaced', async () => {
+      let release
+      cluster.groupMetadata.mockImplementationOnce(
+        () =>
+          new Promise((resolve) => {
+            release = () => resolve(watchAnswer('C', [0, 1]))
+          })
+      )
+      watch.arm(new Map([['C', []]]))
+      now = 5000
+      const polling = watch.poll(new Generation())
+
+      watch.arm(new Map([['C', [0, 1]]]))
+      release()
+      await polling
+
+      expect(watch.drift).toBeNull()
+      expect(watch.reading).toBeNull()
+    })
+
+    describe('the transmission guard of a read', () => {
+      let isLeader
+      let fence
+      const guardOfRead = async () => {
+        watch.arm(new Map([['C', []]]))
+        now = 5000
+        await watch.poll(fence)
+        return cluster.groupMetadata.mock.calls[0][0].guard
+      }
+
+      beforeEach(() => {
+        isLeader = true
+        fence = new Generation()
+        watch = new LeaderUnionWatch({
+          cluster,
+          logger: newLogger(),
+          metadataMaxAge: 5000,
+          isLeader: () => isLeader,
+        })
+      })
+
+      it('allows the current lifetime of a live run led by the member', async () => {
+        expect((await guardOfRead())()).toBeNull()
+      })
+
+      it.each([
+        ['the watch is cleared', () => watch.clear()],
+        ['the watch is armed again', () => watch.arm(new Map([['C', [0]]]))],
+        ['the run closes', () => fence.close(new Error('closed'))],
+        [
+          'the member stops leading',
+          () => {
+            isLeader = false
+          },
+        ],
+      ])('refuses once %s', async (_, retire) => {
+        const guard = await guardOfRead()
+
+        retire()
+
+        expect(guard()).toBeInstanceOf(Error)
+      })
+
+      it('publishes no drift from an answer that arrives after the member stopped leading', async () => {
+        cluster.groupMetadata.mockImplementation(async () => {
+          isLeader = false
+          return watchAnswer('C', [0])
+        })
+        watch.arm(new Map([['C', []]]))
+        now = 5000
+
+        await watch.poll(fence)
+
+        expect(watch.drift).toBeNull()
+      })
+    })
+
+    describe('a read retired while it is held', () => {
+      let fence
+      let registrations
+
+      beforeEach(() => {
+        cluster.groupMetadata.mockImplementation(() => new Promise(() => {}))
+        fence = new Generation()
+        registrations = []
+        const register = fence.register.bind(fence)
+        jest.spyOn(fence, 'register').mockImplementation((cancel) => {
+          const unregister = jest.fn(register(cancel))
+          registrations.push(unregister)
+          return unregister
+        })
+        watch.arm(new Map([['C', []]]))
+        now = 5000
+      })
+
+      it.each([
+        ['cleared', () => watch.clear()],
+        ['armed again', () => watch.arm(new Map([['C', [0]]]))],
+      ])('releases its waiting caller at once when %s', async (_, retire) => {
+        const polling = watch.poll(fence)
+        retire()
+
+        await expect(polling).resolves.toBeUndefined()
+
+        expect(registrations).not.toHaveLength(0)
+        for (const unregister of registrations) expect(unregister).toHaveBeenCalled()
+      })
+
+      it('lets a later read start under the new lifetime', async () => {
+        const polling = watch.poll(fence)
+        watch.arm(new Map([['C', []]]))
+        await polling
+        now = 10000
+
+        watch.poll(fence)
+
+        expect(cluster.groupMetadata).toHaveBeenCalledTimes(2)
+      })
+
+      it('still rejects with the close error when the run closed as well', async () => {
+        const closing = new Error('closed')
+        const polling = watch.poll(fence)
+        fence.close(closing)
+        watch.clear()
+
+        await expect(polling).rejects.toBe(closing)
+      })
+    })
   })
 })

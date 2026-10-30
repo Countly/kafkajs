@@ -317,6 +317,7 @@ kafka.consumer({
 | readUncommitted | Configures transactional isolation. The default false selects read_committed and filters aborted transactional records. Set true for read_uncommitted. Committed reads alone do not provide end-to-end exactly-once processing. | `false` |
 | maxInFlightRequests | Maximum requests in progress per connection. `null` means unbounded; `0` is rejected. | `5` |
 | rackId                 | Configure the "rack" in which the consumer resides to enable [follower fetching](#follower-fetching)                 | `null` _(fetch from the leader always)_ |
+| `rackAwareAssignment` | Match replica racks in the local `range` assigner, within range quotas. Other local assigners ignore it; consumer-protocol assignment is server-side. Requires a boolean. | `false` |
 | groupInstanceId        | Static membership id (KIP-345). See [Static membership](#static-membership)                                          | `null` _(dynamic membership)_ |
 | groupProtocol          | The group membership protocol: `'classic'` or `'consumer'` (KIP-848, Kafka 4.0+). See [Consumer group protocols](#group-protocols) | `'classic'` |
 | groupRemoteAssignor    | The server-side assignor to ask the coordinator for, under `groupProtocol: 'consumer'` only. `null` lets the coordinator pick its first configured assignor | `null` _(coordinator's choice)_ |
@@ -504,7 +505,7 @@ The Java client's default list is `[Range, CooperativeSticky]`. Range is eager, 
 | `sticky` | `sticky` | Kafka's `StickyAssignor`: balances partitions while moving as few of them as possible from their current owners. |
 | `cooperativeSticky` | `cooperative-sticky` | Kafka's `CooperativeStickyAssignor` (KIP-429): the same balancing as `sticky`, plus incremental rebalancing — a member keeps the partitions it is not losing instead of giving up everything at the start of each round. |
 
-`range`, `sticky` and `cooperativeSticky` use the same names and the same algorithms as the Java client, so a group can mix this client with Java consumers. Rack-aware assignment is not implemented: your `rackId` is sent to the leader and ignored when partitions are assigned.
+`range`, `sticky` and `cooperativeSticky` use the same names and the same algorithms as the Java client, so a group can mix this client with Java consumers. Set `rackAwareAssignment: true` to enable rack matching in the `range` assigner when this member is the group leader. It defaults to `false`. Members need `rackId`, and brokers need rack labels in Metadata. Range matches replica racks within its partition quotas and preserves co-partitioning; balance wins when alignment cannot satisfy the quotas. Missing or nonintersecting racks leave partition ownership unchanged. `sticky` and `cooperativeSticky` keep their current rack-blind assignment; `roundRobin` ignores the flag too. A custom assigner receives the additive `rackAware` factory argument and may ignore it. With the flag off, a Java range leader can still match racks while a JavaScript range leader uses plain range, so a mixed group's assignment can differ with its leader. Consumer-protocol groups use the broker's server-side assignor.
 
 When members subscribe to different topics, none of the four gives a member a partition of a topic it does not subscribe to: `roundRobin` skips such members as Java's `RoundRobinAssignor` does, and `sticky` and `cooperativeSticky` never hand a partition back to a previous owner that has left its topic.
 
@@ -628,7 +629,7 @@ Any value other than `0` or `1` is rejected when you create the consumer, with `
 
 It's possible to configure the strategy the consumer will use to distribute partitions amongst the consumer group. KafkaJS has a round robin assigner configured by default.
 
-assign receives { members, topics, groupTopics, groupTopicMetadata }. topics remains the leader's own subscription. groupTopics is the sorted union of every member's subscription. groupTopicMetadata is a ReadonlyMap from topic name to partition metadata. When the map is present, a missing name has no partitions; consult cluster metadata only when the entire map argument is absent. A leader obtains missing names from one bounded snapshot without adding permanent targets. A topic error is excluded; leaderless partition IDs remain available to the assigner.
+assign receives { members, topics, groupTopics, groupTopicMetadata }. topics remains the leader's own subscription. groupTopics is the sorted union of every member's subscription. groupTopicMetadata is a ReadonlyMap from topic name to partition metadata. When the map is present, a missing name has no partitions; consult cluster metadata only when the entire map argument is absent. A leader obtains missing names from one bounded snapshot without adding permanent targets. The leader keeps watching the topics only other members subscribe to: it rereads them, at most once per metadataMaxAge, without creating topics or adding targets, and rejoins through the ordinary stale-assignment path when one gains partitions. A topic error is excluded; leaderless partition IDs remain available to the assigner.
 
 A partition assigner is a function which returns an object with the following interface:
 
@@ -754,3 +755,5 @@ KafkaJS supports "follower fetching", where the consumer tries to fetch data pre
 The meaning of "rack" is very flexible, and can be used to model setups such as data centers, regions/availability zones, or other topologies.
 
 See also [this blog post](https://www.confluent.io/blog/multi-region-data-replication/) for the bigger context.
+
+Rack-aware assignment and follower fetching are separate features. Range's opt-in flag changes which member owns a partition. Follower fetching uses the broker's preferred-read-replica hint and the member's `rackId`; an eligible partition has a leader outside that rack and an online in-rack follower. A partition whose leader is already local need not fetch from a follower. Assignment alignment alone does not prove the next Fetch went to a follower.

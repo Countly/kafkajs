@@ -307,6 +307,11 @@ export interface ConsumerConfig {
   maxInFlightRequests?: number | null
   readUncommitted?: boolean
   rackId?: string
+  /** Opt-in range assignment using replica racks, balance first. Default false.
+   * Sticky, cooperative-sticky and round-robin ignore this option. A Java leader may still
+   * rack-match when this JS option is false. KIP-848 uses its server-side assignor.
+   */
+  rackAwareAssignment?: boolean
   groupInstanceId?: string
   /**
    * Which group membership protocol to use. `'classic'` (the default) is the JoinGroup/SyncGroup
@@ -336,6 +341,8 @@ export interface ConsumerConfig {
 }
 
 export type PartitionAssigner = (config: {
+  /** Opt-in range rack matching. Custom assigners may ignore it. */
+  rackAware?: boolean
   cluster: Cluster
   groupId: string
   logger: Logger

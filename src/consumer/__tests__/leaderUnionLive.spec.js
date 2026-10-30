@@ -5,7 +5,7 @@ const Broker = require('../../broker')
 const apiKeys = require('../../protocol/requests/apiKeys')
 const defaultSocketFactory = require('../../network/socketFactory')
 const { roundRobin, range } = require('../assigners')
-const { plainTextBrokers, secureRandom, writeEvidence } = require('testHelpers')
+const { plainTextBrokers, secureRandom, writeEvidence, wireVersionsOf } = require('testHelpers')
 const { Schedule } = require('../../../testHelpers/schedule')
 const { createChaosSocketFactory } = require('../../../testHelpers/chaosSocket')
 const {
@@ -74,10 +74,14 @@ const WAIT_MS = 30000
 const JAVA_START_MS = 60000
 const CLEANUP_BUDGET_MS = 15000
 const PARTITIONS = 4
+const GROWN_PARTITIONS = 8
 const RECORDS_PER_PARTITION = 3
 const MAX_WAIT_MS = 1000
 const HEARTBEAT_MS = 1000
 const METADATA_MAX_AGE_MS = 5000
+// The consumer's own default, far beyond WAIT_MS.
+const DEFAULT_METADATA_MAX_AGE_MS = 300000
+const MAX_TRACED_CALLS = 500
 const QUIET_MS = 2000
 const SESSION_TIMEOUT_MS = 30000
 const JOINER_REQUEST_TIMEOUT_MS = 3000
@@ -139,6 +143,35 @@ const partitionKeys = (topics) =>
   )
 
 /**
+ * @param {{ topic: string, partition: number, value: string }} record
+ * @returns {string} the identity a delivery is compared by: the same value on another topic or
+ *   partition is another record
+ */
+const identityOf = ({ topic, partition, value }) => `${topic}|${partition}|${value}`
+
+/**
+ * @param {Array<{ topic: string, partition: number, value: string }>} records
+ * @returns {string[]} the sorted identities, duplicates kept
+ */
+const sortedIdentities = (records) => records.map(identityOf).sort()
+
+/**
+ * @param {object[]} seats every seat of a case
+ * @returns {{ wireVersions?: Record<string, number> }} the version each API was sent at by the
+ *   JavaScript members, or nothing when none of them sent a request
+ */
+const wireOf = (seats) => {
+  const wireVersions = wireVersionsOf(
+    seats
+      .filter((seat) => seat instanceof Member)
+      .flatMap(({ versions }) =>
+        [...versions].map(([apiName, apiVersion]) => ({ apiName, apiVersion }))
+      )
+  )
+  return Object.keys(wireVersions).length > 0 ? { wireVersions } : {}
+}
+
+/**
  * Collects who owns what.
  * @param {Array<{ name: string, topics: string[], assignment: () => Record<string, number[]> }>} seats
  * @returns {{ owners: Record<string, string[]>, stray: string[] }} the owners of every owned
@@ -173,11 +206,12 @@ const isExclusive = ({ owners, stray }, keys) =>
  * @param {AbortSignal} scope the case scope
  * @param {object[]} seats
  * @param {string[]} topics
+ * @param {string[]} [keys] the `topic:partition` keys to own, when the topics are not all
+ *   `PARTITIONS` wide
  * @returns {Promise<{ owners: Record<string, string[]>, stray: string[] }>} what the seats hold
  * @throws {Error} when the seats do not settle exclusively within the wait
  */
-const settleOwnership = async (scope, seats, topics) => {
-  const keys = partitionKeys(topics)
+const settleOwnership = async (scope, seats, topics, keys = partitionKeys(topics)) => {
   await pollUntil(scope, WAIT_MS, () => isExclusive(ownershipOf(seats), keys), {
     label: 'The exclusive ownership',
   })
@@ -201,8 +235,9 @@ class Member {
   constructor({ id, name, brokers, groupId, topics, assigner, consumerOptions, kafkaOptions }) {
     this.name = name
     this.topics = topics
+    this.clientId = `e2e-leader-union-${name}-${id}`
     this.kafka = new Kafka({
-      clientId: `e2e-leader-union-${name}-${id}`,
+      clientId: this.clientId,
       brokers,
       logLevel: logLevel.NOTHING,
       ...kafkaOptions,
@@ -217,10 +252,17 @@ class Member {
     })
     /** @type {Array<{ at: number, payload: object }>} */
     this.joins = []
-    /** @type {number[]} when each rebalance began, `performance.now()` */
+    /** @type {Array<{ at: number, reason: string }>} when each rebalance began, `performance.now()` */
     this.rebalances = []
     this.unsubscribed = []
+    /** @type {Array<{ at: number, error: Error }>} */
     this.crashes = []
+    /** @type {Array<{ topic: string, type: string }>} subscriptions refused for a missing topic */
+    this.refusedSubscriptions = []
+    /** @type {Map<string, number>} the highest version each API was sent at */
+    this.versions = new Map()
+    /** @type {Array<{ at: number, duration: number, correlationId: number, broker: string }>} */
+    this.metadataRequests = []
     /** @type {Array<{ topic: string, partition: number, value: string }>} */
     this.deliveries = []
   }
@@ -241,16 +283,28 @@ class Member {
     consumer.on(consumer.events.GROUP_JOIN, ({ payload }) =>
       this.joins.push({ at: performance.now(), payload })
     )
-    consumer.on(consumer.events.REBALANCING, () => this.rebalances.push(performance.now()))
+    consumer.on(consumer.events.REBALANCING, ({ payload }) =>
+      this.rebalances.push({ at: performance.now(), reason: payload.reason })
+    )
+    consumer.on(consumer.events.REQUEST, ({ payload }) => {
+      const { apiName, apiVersion, correlationId, duration, broker } = payload
+      this.versions.set(apiName, Math.max(this.versions.get(apiName) ?? apiVersion, apiVersion))
+      if (apiName === 'Metadata') {
+        this.metadataRequests.push({ at: performance.now(), duration, correlationId, broker })
+      }
+    })
     consumer.on(consumer.events.RECEIVED_UNSUBSCRIBED_TOPICS, ({ payload }) =>
       this.unsubscribed.push(payload)
     )
-    consumer.on(consumer.events.CRASH, ({ payload }) => this.crashes.push(payload.error))
+    consumer.on(consumer.events.CRASH, ({ payload }) =>
+      this.crashes.push({ at: performance.now(), error: payload.error })
+    )
     await step(scope, 'The consumer connect', () => consumer.connect())
     for (const topic of this.topics) {
       await step(scope, 'The consumer subscription', () =>
         consumer.subscribe({ topic, fromBeginning: true }).catch((error) => {
           if (!missing.includes(topic) || error.type !== MISSING_TOPIC) throw error
+          this.refusedSubscriptions.push({ topic, type: error.type })
         })
       )
     }
@@ -307,9 +361,115 @@ class Member {
     return this.lastJoin()?.memberId
   }
 
-  /** @returns {string[]} the values the handler was given */
-  values() {
-    return this.deliveries.map(({ value }) => value)
+  /** @returns {string[]} the sorted identities the handler was given, duplicates kept */
+  identities() {
+    return sortedIdentities(this.deliveries)
+  }
+
+  /**
+   * What this member recorded, for an evidence row. Reads only what the instrumentation events and
+   * the Metadata trace kept, so it cannot fail a case that is already failing.
+   * @param {MetadataTrace} trace
+   * @param {number} since `performance.now()` from which Metadata is listed, 0 for all of it
+   * @returns {object} the member's subscription, refusals, joins, rebalances with their reason,
+   *   crashes, and the Metadata requests and answers since `since`
+   */
+  report(trace, since) {
+    return {
+      name: this.name,
+      subscribed: this.topics,
+      refusedSubscriptions: this.refusedSubscriptions,
+      joins: this.joins.map(({ at, payload }) => ({
+        at,
+        memberId: payload.memberId,
+        isLeader: payload.isLeader,
+        memberAssignment: payload.memberAssignment,
+      })),
+      rebalances: this.rebalances,
+      crashes: this.crashes.map(({ at, error }) => ({ at, error: describeError(error) })),
+      metadataRequestsSinceCreation: this.metadataRequests.filter(({ at }) => at >= since),
+      metadataCallsSinceCreation: trace.of(this.clientId, since),
+    }
+  }
+}
+
+/**
+ * Records the Metadata calls the members of one case make, with the topics each asked for and the
+ * topics, errors and partition counts each answer held, so a case that times out still shows what
+ * every member saw. It wraps `Broker#metadata` and changes nothing about a call's result. At most
+ * `MAX_TRACED_CALLS` calls are kept.
+ */
+class MetadataTrace {
+  /** Starts with no members and no spy. */
+  constructor() {
+    /** @type {Set<string>} client ids of the members being traced */
+    this.clientIds = new Set()
+    /** @type {Array<object>} */
+    this.calls = []
+    this.spy = null
+  }
+
+  /**
+   * @param {Member} member a member whose Metadata calls are kept
+   * @returns {void}
+   */
+  watch(member) {
+    this.clientIds.add(member.clientId)
+  }
+
+  /** @returns {void} begins recording; call `restore` to end it */
+  start() {
+    const original = Broker.prototype.metadata
+    const trace = this
+    this.spy = jest.spyOn(Broker.prototype, 'metadata').mockImplementation(async function (
+      ...args
+    ) {
+      const clientId = this.connectionPool?.clientId
+      if (!trace.clientIds.has(clientId) || trace.calls.length >= MAX_TRACED_CALLS) {
+        return original.apply(this, args)
+      }
+      const [topics = [], options = {}] = args
+      const call = {
+        clientId,
+        at: performance.now(),
+        asked: topics.map((topic) => String(topic.name ?? topic.topicId ?? topic)),
+        lenient: options.lenient === true,
+        answered: null,
+        error: null,
+      }
+      trace.calls.push(call)
+      try {
+        const response = await original.apply(this, args)
+        call.answered = response.topicMetadata.map(
+          ({ topic, topicErrorCode, partitionMetadata }) => ({
+            topic,
+            errorCode: topicErrorCode,
+            partitions: partitionMetadata.map(({ partitionId }) => partitionId),
+          })
+        )
+        return response
+      } catch (error) {
+        call.error = describeError(error)
+        throw error
+      }
+    })
+  }
+
+  /** @returns {void} stops recording */
+  restore() {
+    this.spy?.mockRestore()
+    this.spy = null
+  }
+
+  /**
+   * @param {string} clientId
+   * @param {number} since `performance.now()`
+   * @returns {object[]} that member's calls that began at or after `since`, oldest first
+   */
+  of(clientId, since) {
+    return this.calls
+      .filter((call) => call.clientId === clientId && call.at >= since)
+      .map(({ clientId: _, ...rest }) => rest)
   }
 }
 
@@ -427,22 +587,23 @@ class JavaSeat {
 }
 
 /**
- * Sends `records` marked records to each listed partition of a topic.
+ * Sends a marked record to each partition of a topic for every record index. The value carries the
+ * topic, so a record cannot stand in for the same record of another topic.
  * @param {AbortSignal} scope the case scope
  * @param {object} producer
  * @param {string} topic
  * @param {string} marker names the corpus, so no value repeats across episodes
- * @returns {Promise<string[]>} the values sent
+ * @returns {Promise<Array<{ topic: string, partition: number, value: string }>>} what was sent
  */
 const produce = async (scope, producer, topic, marker) => {
   const messages = Array.from({ length: PARTITIONS }, (_, partition) =>
     Array.from({ length: RECORDS_PER_PARTITION }, (_, n) => ({
       partition,
-      value: `${marker}-${partition}-${n}`,
+      value: `${marker}-${topic}-${partition}-${n}`,
     }))
   ).flat()
   await step(scope, 'The send', () => producer.send({ topic, acks: -1, messages }))
-  return messages.map(({ value }) => value)
+  return messages.map(({ partition, value }) => ({ topic, partition, value }))
 }
 
 /**
@@ -677,20 +838,21 @@ const unequalSubscriptions =
       await pollUntil(
         scope,
         WAIT_MS,
-        () => seats.flatMap((seat) => seat.values()).length >= expected.length,
+        () => seats.flatMap((seat) => seat.deliveries).length >= expected.length,
         { label: 'The deliveries' }
       )
       await delay(scope, QUIET_MS)
-      const delivered = seats.flatMap((seat) => seat.values())
+      const delivered = sortedIdentities(seats.flatMap((seat) => seat.deliveries))
       const committed = await awaitCommitted(scope, admin, groupId, [a, b])
 
       writeEvidence(EVIDENCE, {
         scenario: 'leader-union',
         case: `javascript-${name}`,
         config: { assignor: name, groupProtocol: 'classic', partitions: PARTITIONS },
+        ...wireOf(seats),
         leadership,
         ownership,
-        handlers: Object.fromEntries(seats.map((seat) => [seat.name, seat.values()])),
+        handlers: Object.fromEntries(seats.map((seat) => [seat.name, seat.identities()])),
         committed,
         rebalancesInWindow: seats.map(
           ({ rebalances }, i) => rebalances.length - rebalancesBefore[i]
@@ -701,7 +863,7 @@ const unequalSubscriptions =
       expect(leader.lastJoin().isLeader).toBe(true)
       expect(isExclusive(ownership, partitionKeys([a, b]))).toBe(true)
       for (const seat of seats) expect(seat.unsubscribed).toEqual([])
-      expect(delivered.slice().sort()).toEqual(expected.slice().sort())
+      expect(delivered).toEqual(sortedIdentities(expected))
       for (const topic of [a, b]) {
         expect(Object.values(committed[topic])).toEqual(
           Array(PARTITIONS).fill(String(RECORDS_PER_PARTITION))
@@ -773,6 +935,10 @@ const javaSeat =
         scenario: 'leader-union',
         case: `java-${javaLeads ? 'leads' : 'follows'}-${name}`,
         config: { assignor: name, javaAssignor: assignor, groupProtocol: 'classic', javaLeads },
+        ...wireOf(seats),
+        acceptance: 'assignment-only',
+        delivery:
+          'not exercised: the Java group member prints its assignments and neither prints nor commits records',
         leaderId,
         leadership,
         ownership,
@@ -828,6 +994,12 @@ const holdSyncGroup = (schedule, scope) => (socket) => {
  * leader's union snapshot is complete and lacks C; C is created, the round completes without it,
  * and the follower's own metadata refresh finds C and asks for a later round, which assigns every
  * partition of C to its subscriber. No manual rejoin or stop is involved.
+ *
+ * The leader keeps the default metadata age, far beyond the wait, so that only the follower can
+ * start the later round: the leader's own union watch is covered by the offline specs. The evidence
+ * row is written in a `finally`, so a case that fails or times out still records the stage it
+ * reached, each member's Metadata requests and answers since the creation, and the join,
+ * rebalance and crash events with their times.
  * @param {{ name: string, create: Function }} assignor
  * @returns {(scope: AbortSignal) => Promise<void>}
  */
@@ -836,94 +1008,268 @@ const topicCreatedInFirstRound =
   async (scope) =>
     withClient(
       scope,
-      async ({ admin, member, ownTopic, reserveTopic, createOwnedTopic: createNow }) => {
+      async ({ admin, member, ownTopic, reserveTopic, cleanup, createOwnedTopic: createNow }) => {
         const a = await ownTopic('a-')
         const c = reserveTopic('c-')
         const schedule = new Schedule()
         const chaos = createChaosSocketFactory(defaultSocketFactory())
-        const noCreate = { allowAutoTopicCreation: false, metadataMaxAge: METADATA_MAX_AGE_MS }
+        const trace = new MetadataTrace()
+        trace.start()
+        cleanup.add('metadata trace', () => trace.restore())
+        const seats = []
+        const timeline = {}
+        const state = { stage: 'starting', error: null, leadership: null, firstAssignment: null }
+        let ownership = null
+        try {
+          const leader = member({
+            name: 'leader',
+            topics: [a],
+            assigner: create,
+            consumerOptions: { allowAutoTopicCreation: false },
+            kafkaOptions: { socketFactory: chaos },
+          })
+          seats.push(leader)
+          trace.watch(leader)
+          await leader.start(scope)
+          state.leadership = leadershipOf(leader)
+          chaos.arm({}, holdSyncGroup(schedule, scope))
+          const held = schedule.hold({ api: 'SyncGroup' })
+          const follower = member({
+            name: 'follower',
+            topics: [c],
+            assigner: create,
+            consumerOptions: { allowAutoTopicCreation: false, metadataMaxAge: METADATA_MAX_AGE_MS },
+          })
+          seats.push(follower)
+          trace.watch(follower)
+          const joinsBefore = leader.joins.length
+          const starting = follower.begin(scope, { missing: [c] })
+          starting.catch(() => {})
+          state.stage = 'waiting for the held SyncGroup'
+          await bounded(scope, WAIT_MS, () => held.arrived(), { label: 'The held SyncGroup' })
+          timeline.snapshotAt = performance.now()
+
+          state.stage = 'creating the topic'
+          timeline.creationStartedAt = performance.now()
+          await createNow(c)
+          timeline.createdAt = performance.now()
+          held.release(PASS)
+          timeline.releasedAt = performance.now()
+          state.stage = 'waiting for the first round'
+          await starting
+          await pollUntil(scope, WAIT_MS, () => leader.joins.length > joinsBefore, {
+            label: 'The first round completion',
+          })
+          const firstRound = leader.joins[joinsBefore]
+          timeline.firstRoundAt = firstRound.at
+          await follower.whenJoined(scope)
+          state.firstAssignment = { ...follower.joins[0].payload.memberAssignment }
+
+          state.stage = 'waiting for the later assignment'
+          await pollUntil(
+            scope,
+            WAIT_MS,
+            () => (follower.assignment()[c] ?? []).length === PARTITIONS,
+            { label: 'The later assignment of the new topic' }
+          )
+          const detection = follower.rebalances.find(({ at }) => at > firstRound.at)
+          const later = follower.joins.find(
+            ({ payload }) => (payload.memberAssignment[c] ?? []).length > 0
+          )
+          timeline.detectedAt = detection?.at
+          timeline.detectedReason = detection?.reason
+          timeline.laterAt = later?.at
+          state.stage = 'settling the ownership'
+          ownership = await settleOwnership(scope, [leader, follower], [a, c])
+
+          state.stage = 'asserting'
+          expect(state.leadership).toEqual({
+            isLeader: true,
+            leaderIsSelf: true,
+            metadataAgrees: true,
+          })
+          expect(state.firstAssignment[c] ?? []).toEqual([])
+          expect(firstRound.payload.memberAssignment[c] ?? []).toEqual([])
+          expect(Object.values(timeline).every(Boolean)).toBe(true)
+          expect(timeline.snapshotAt).toBeLessThan(timeline.createdAt)
+          expect(timeline.createdAt).toBeLessThan(timeline.releasedAt)
+          expect(timeline.releasedAt).toBeLessThan(firstRound.at)
+          expect(firstRound.at).toBeLessThan(detection.at)
+          expect(detection.reason).toBe('stale-assignment')
+          expect(detection.at).toBeLessThan(later.at)
+          expect(later.payload.memberAssignment[c]).toEqual([0, 1, 2, 3])
+          expect(isExclusive(ownership, partitionKeys([a, c]))).toBe(true)
+          for (const seat of seats) {
+            expect(seat.unsubscribed).toEqual([])
+            expect(seat.crashes).toEqual([])
+          }
+          state.stage = 'passed'
+        } catch (error) {
+          state.error = describeError(error)
+          throw error
+        } finally {
+          writeEvidence(EVIDENCE, {
+            scenario: 'leader-union',
+            case: `late-topic-${name}`,
+            config: {
+              assignor: name,
+              groupProtocol: 'classic',
+              allowAutoTopicCreation: false,
+              leaderMetadataMaxAgeMs: DEFAULT_METADATA_MAX_AGE_MS,
+              followerMetadataMaxAgeMs: METADATA_MAX_AGE_MS,
+            },
+            ...wireOf(seats),
+            stage: state.stage,
+            error: state.error,
+            leadership: state.leadership,
+            topicCreation: { topic: c, partitions: PARTITIONS },
+            timeline,
+            firstAssignment: state.firstAssignment,
+            ownership,
+            members: seats.map((seat) => seat.report(trace, timeline.createdAt ?? 0)),
+          })
+        }
+      }
+    )
+
+/**
+ * The scenario with partitions added to a topic only the follower subscribes to. The leader
+ * subscribes to A and has the short metadata age; the follower subscribes to C, which exists, and
+ * has an age far beyond the wait, so that only the leader's union watch can notice the growth. Once
+ * the assignment is stable, C grows; the leader must start a round for `stale-assignment`, and the
+ * later assignment gives every new partition of C to its subscriber alone. The evidence row is
+ * written in a `finally`, as in the late-topic scenario.
+ * @param {{ name: string, create: Function }} assignor
+ * @returns {(scope: AbortSignal) => Promise<void>}
+ */
+const partitionsAddedToFollowerTopic =
+  ({ name, create }) =>
+  async (scope) =>
+    withClient(scope, async ({ admin, member, ownTopic, cleanup }) => {
+      const a = await ownTopic('a-')
+      const c = await ownTopic('c-')
+      const keys = [
+        ...partitionKeys([a]),
+        ...Array.from({ length: GROWN_PARTITIONS }, (_, partition) => `${c}:${partition}`),
+      ]
+      const trace = new MetadataTrace()
+      trace.start()
+      cleanup.add('metadata trace', () => trace.restore())
+      const seats = []
+      const timeline = {}
+      const state = { stage: 'starting', error: null, leadership: null, firstAssignment: null }
+      let ownership = null
+      try {
+        const options = { allowAutoTopicCreation: false }
         const leader = member({
           name: 'leader',
           topics: [a],
           assigner: create,
-          consumerOptions: noCreate,
-          kafkaOptions: { socketFactory: chaos },
+          consumerOptions: { ...options, metadataMaxAge: METADATA_MAX_AGE_MS },
         })
+        seats.push(leader)
+        trace.watch(leader)
+        state.stage = 'starting the leader'
         await leader.start(scope)
-        const leadership = leadershipOf(leader)
-        chaos.arm({}, holdSyncGroup(schedule, scope))
-        const held = schedule.hold({ api: 'SyncGroup' })
+        state.leadership = leadershipOf(leader)
         const follower = member({
           name: 'follower',
           topics: [c],
           assigner: create,
-          consumerOptions: noCreate,
+          consumerOptions: { ...options, metadataMaxAge: DEFAULT_METADATA_MAX_AGE_MS },
         })
+        seats.push(follower)
+        trace.watch(follower)
+        state.stage = 'starting the follower'
+        await follower.start(scope)
+        state.stage = 'settling the first assignment'
+        const first = await settleOwnership(scope, seats, [a, c])
+        state.firstAssignment = { ...follower.assignment() }
         const joinsBefore = leader.joins.length
-        const starting = follower.begin(scope, { missing: [c] })
-        starting.catch(() => {})
-        await bounded(scope, WAIT_MS, () => held.arrived(), { label: 'The held SyncGroup' })
-        const snapshotAt = performance.now()
 
-        await createNow(c)
-        const createdAt = performance.now()
-        held.release(PASS)
-        const releasedAt = performance.now()
-        await starting
-        await pollUntil(scope, WAIT_MS, () => leader.joins.length > joinsBefore, {
-          label: 'The first round completion',
-        })
-        const firstRound = leader.joins[joinsBefore]
-        await follower.whenJoined(scope)
-        const firstAssignment = { ...follower.joins[0].payload.memberAssignment }
-
+        state.stage = 'adding partitions'
+        timeline.growthStartedAt = performance.now()
+        await step(scope, 'The partition creation', () =>
+          admin.createPartitions({ topicPartitions: [{ topic: c, count: GROWN_PARTITIONS }] })
+        )
+        timeline.grownAt = performance.now()
+        state.stage = 'waiting for the leader to start a round'
         await pollUntil(
           scope,
           WAIT_MS,
-          () => (follower.assignment()[c] ?? []).length === PARTITIONS,
-          { label: 'The later assignment of the new topic' }
+          () => leader.rebalances.some(({ at }) => at > timeline.grownAt),
+          { label: 'The leader round for the grown topic' }
         )
-        const detectedAt = follower.rebalances.find((at) => at > firstRound.at)
-        const later = follower.joins.find(
-          ({ payload }) => (payload.memberAssignment[c] ?? []).length > 0
-        )
-        const ownership = await settleOwnership(scope, [leader, follower], [a, c])
+        const detection = leader.rebalances.find(({ at }) => at > timeline.grownAt)
+        timeline.detectedAt = detection.at
+        timeline.detectedReason = detection.reason
 
-        writeEvidence(EVIDENCE, {
-          scenario: 'leader-union',
-          case: `late-topic-${name}`,
-          config: { assignor: name, groupProtocol: 'classic', allowAutoTopicCreation: false },
-          leadership,
-          timeline: {
-            snapshotAt,
-            createdAt,
-            releasedAt,
-            firstRoundAt: firstRound.at,
-            detectedAt,
-            laterAt: later.at,
-          },
-          firstAssignment,
-          ownership,
+        state.stage = 'waiting for the later assignment'
+        await pollUntil(
+          scope,
+          WAIT_MS,
+          () => (follower.assignment()[c] ?? []).length === GROWN_PARTITIONS,
+          { label: 'The later assignment of the grown topic' }
+        )
+        const later = follower.joins.find(
+          ({ payload }) => (payload.memberAssignment[c] ?? []).length === GROWN_PARTITIONS
+        )
+        timeline.laterAt = later.at
+        state.stage = 'settling the ownership'
+        ownership = await settleOwnership(scope, seats, [a, c], keys)
+
+        state.stage = 'asserting'
+        expect(state.leadership).toEqual({
+          isLeader: true,
+          leaderIsSelf: true,
+          metadataAgrees: true,
         })
-        expect(leadership).toEqual({ isLeader: true, leaderIsSelf: true, metadataAgrees: true })
-        expect(firstAssignment[c] ?? []).toEqual([])
-        expect(firstRound.payload.memberAssignment[c] ?? []).toEqual([])
-        expect(
-          [snapshotAt, createdAt, releasedAt, firstRound.at, detectedAt, later.at].every(Boolean)
-        ).toBe(true)
-        expect(snapshotAt).toBeLessThan(createdAt)
-        expect(createdAt).toBeLessThan(releasedAt)
-        expect(releasedAt).toBeLessThan(firstRound.at)
-        expect(firstRound.at).toBeLessThan(detectedAt)
-        expect(detectedAt).toBeLessThan(later.at)
-        expect(later.payload.memberAssignment[c]).toEqual([0, 1, 2, 3])
-        expect(isExclusive(ownership, partitionKeys([a, c]))).toBe(true)
-        for (const seat of [leader, follower]) {
+        expect(isExclusive(first, partitionKeys([a, c]))).toBe(true)
+        expect(state.firstAssignment[c]).toHaveLength(PARTITIONS)
+        expect(leader.joins.length).toBeGreaterThan(joinsBefore)
+        expect(timeline.grownAt).toBeLessThan(timeline.detectedAt)
+        expect(detection.reason).toBe('stale-assignment')
+        expect(detection.at).toBeLessThan(later.at)
+        expect([...later.payload.memberAssignment[c]].sort((x, y) => x - y)).toEqual(
+          Array.from({ length: GROWN_PARTITIONS }, (_, partition) => partition)
+        )
+        expect(isExclusive(ownership, keys)).toBe(true)
+        expect(leader.assignment()[c] ?? []).toEqual([])
+        for (let partition = PARTITIONS; partition < GROWN_PARTITIONS; partition += 1) {
+          expect(ownership.owners[`${c}:${partition}`]).toEqual(['follower'])
+        }
+        expect(follower.rebalances.map(({ reason }) => reason)).not.toContain('stale-assignment')
+        for (const seat of seats) {
           expect(seat.unsubscribed).toEqual([])
           expect(seat.crashes).toEqual([])
         }
+        state.stage = 'passed'
+      } catch (error) {
+        state.error = describeError(error)
+        throw error
+      } finally {
+        writeEvidence(EVIDENCE, {
+          scenario: 'leader-union',
+          case: `follower-topic-growth-${name}`,
+          config: {
+            assignor: name,
+            groupProtocol: 'classic',
+            allowAutoTopicCreation: false,
+            leaderMetadataMaxAgeMs: METADATA_MAX_AGE_MS,
+            followerMetadataMaxAgeMs: DEFAULT_METADATA_MAX_AGE_MS,
+          },
+          ...wireOf(seats),
+          stage: state.stage,
+          error: state.error,
+          leadership: state.leadership,
+          growth: { topic: c, from: PARTITIONS, to: GROWN_PARTITIONS },
+          timeline,
+          firstAssignment: state.firstAssignment,
+          ownership,
+          members: seats.map((seat) => seat.report(trace, timeline.growthStartedAt ?? 0)),
+        })
       }
-    )
+    })
 
 /**
  * Drops the next JoinGroup responses of the sockets it is applied to, a finite number of times, and
@@ -1061,11 +1407,11 @@ const lostJoinResponses = () => async (scope) =>
     await pollUntil(
       scope,
       WAIT_MS,
-      () => [...stable, joiner].flatMap((seat) => seat.values()).length >= expected.length,
+      () => [...stable, joiner].flatMap((seat) => seat.deliveries).length >= expected.length,
       { label: 'The deliveries' }
     )
     await delay(scope, QUIET_MS)
-    const delivered = [...stable, joiner].flatMap((seat) => seat.values())
+    const delivered = sortedIdentities([...stable, joiner].flatMap((seat) => seat.deliveries))
     const committed = await awaitCommitted(scope, admin, groupId, [topic])
     const ownership = ownershipOf([...stable, joiner])
     const wall = (at) => new Date(performance.timeOrigin + at).toISOString()
@@ -1078,6 +1424,7 @@ const lostJoinResponses = () => async (scope) =>
         groupProtocol: 'classic',
         sessionTimeout: SESSION_TIMEOUT_MS,
       },
+      ...wireOf([...stable, joiner]),
       groupId,
       runId: id,
       joinerMemberId: joiner.memberId(),
@@ -1111,7 +1458,7 @@ const lostJoinResponses = () => async (scope) =>
     expect(recoveryMs).toBeLessThan(SESSION_TIMEOUT_MS)
     expect(isExclusive(ownership, partitionKeys([topic]))).toBe(true)
     expect(joiner.deliveries.length).toBeGreaterThan(0)
-    expect(delivered.slice().sort()).toEqual(expected.slice().sort())
+    expect(delivered).toEqual(sortedIdentities(expected))
     expect(Object.values(committed[topic])).toEqual(
       Array(PARTITIONS).fill(String(RECORDS_PER_PARTITION))
     )
@@ -1153,6 +1500,15 @@ describeLeaderUnion('Consumer > a leader with unequal subscriptions (live)', () 
       caseTimeout(CASE_BUDGET_MS)
     )
   }
+
+  test(
+    'assigns partitions added to a follower-only topic in a later round with the range assignor',
+    liveCase(
+      JOIN_CASE_BUDGET_MS,
+      partitionsAddedToFollowerTopic(ASSIGNORS.find(({ name }) => name === 'range'))
+    ),
+    caseTimeout(JOIN_CASE_BUDGET_MS)
+  )
 
   test(
     'keeps one member id through lost initial JoinGroup responses',

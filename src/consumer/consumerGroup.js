@@ -13,6 +13,7 @@ const Batch = require('./batch')
 const SeekOffsets = require('./seekOffsets')
 const SubscriptionState = require('./subscriptionState')
 const IdleWait = require('./idleWait')
+const LeaderUnionWatch = require('./leaderUnionWatch')
 const { FetchPreparation, fencedDelay } = require('./fetchPreparation')
 const PositionValidator = require('./positionValidator')
 const Outage = require('./outage')
@@ -284,6 +285,12 @@ module.exports = class ConsumerGroup {
     this.seekOffset = new SeekOffsets()
 
     this.partitionsPerSubscribedTopic = null
+    this.leaderUnionWatch = new LeaderUnionWatch({
+      cluster,
+      logger: this.logger,
+      metadataMaxAge,
+      isLeader: () => this.isLeader(),
+    })
     /**
      * Preferred read replica per topic and partition
      *
@@ -579,6 +586,7 @@ module.exports = class ConsumerGroup {
   /** Creates fresh run-owned idle state after the previous run was retired. @returns {void} */
   startIdleWait() {
     this.roundContext?.retire(consumerStoppingError())
+    this.leaderUnionWatch?.clear()
     this.idleWait.dispose()
     this.idleWait = this.createRun()
     this.subscriptionState.clearPauses()
@@ -593,6 +601,7 @@ module.exports = class ConsumerGroup {
    */
   onStopRequested() {
     this.roundContext?.retire(consumerStoppingError())
+    this.leaderUnionWatch?.clear()
     this.idleWait.dispose()
     this.subscriptionState.clearPauses()
     for (const [key, offset] of this.seekOffset) {
@@ -900,6 +909,7 @@ module.exports = class ConsumerGroup {
 
     this.groupMembership.setOwned(currentMemberAssignment)
     this.clearStaleAssignmentPending()
+    this.leaderUnionWatch.arm(result.unionSnapshot)
     this.pruneAssignmentState()
 
     return { assignment: currentMemberAssignment, added, revoked }
@@ -912,6 +922,7 @@ module.exports = class ConsumerGroup {
    */
   beginRebalanceRound() {
     this.roundContext?.retire()
+    this.leaderUnionWatch?.clear()
     const run = this.idleWait
     const leaderAttempt = Symbol('leader attempt')
     const roundDeadlineAt = performance.now() + this.rebalanceTimeout
@@ -1707,6 +1718,7 @@ module.exports = class ConsumerGroup {
     run.fence.check()
     await run.fence.wait(this.cluster.refreshMetadataIfNecessary({ fence: run.fence }))
     run.fence.check()
+    if (this.leaderUnionWatch.armed) await this.pollLeaderUnion(run.fence)
     this.checkForStaleAssignment()
 
     let prepared = null
@@ -2321,8 +2333,12 @@ module.exports = class ConsumerGroup {
    * an unlatched check would spin every fetcher for the whole duration of the round it asked for.
    * The latch is cleared by the apply, and by the rebalance chain's own `finally`.
    *
+   * A leader also reports a topic that only other members subscribe to once its union watch has
+   * seen that topic gain partitions.
+   *
    * @returns {void}
-   * @throws {KafkaJSStaleTopicMetadataAssignment} when a subscribed topic gained partitions
+   * @throws {KafkaJSStaleTopicMetadataAssignment} when a subscribed or union-only topic gained
+   *   partitions
    */
   checkForStaleAssignment() {
     if (!this.partitionsPerSubscribedTopic || this.staleAssignmentPending) {
@@ -2342,6 +2358,26 @@ module.exports = class ConsumerGroup {
         })
       }
     }
+
+    const { drift } = this.leaderUnionWatch
+    if (drift) {
+      this.staleAssignmentPending = true
+      throw new KafkaJSStaleTopicMetadataAssignment('Topic has been updated', drift)
+    }
+  }
+
+  /**
+   * Lets the leader's union watch reread the topics only other members subscribe to, so that a
+   * partition added to one of them reaches `checkForStaleAssignment`. A member that is no longer
+   * the leader stops watching instead.
+   * @private
+   * @param {Generation} fence the run's fence; a stop or restart cancels the read
+   * @returns {Promise<void>}
+   * @throws {Error} the fence's close error
+   */
+  async pollLeaderUnion(fence) {
+    if (!this.isLeader()) return this.leaderUnionWatch.clear()
+    await this.leaderUnionWatch.poll(fence)
   }
 
   /**
