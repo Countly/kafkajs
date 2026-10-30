@@ -306,6 +306,8 @@ module.exports = class ConsumerGroupProtocol {
    * @param {string|null} [options.serverAssignor] the coordinator-side assignor to ask for
    * @param {string[]} [options.topics] the subscribed topic names
    * @param {string|null} [options.subscribedTopicRegex] the broker-side pattern, when there is one
+   * @param {import('../subscription')|null} [options.subscription] the consumer's declarations when it
+   *   holds a client-side pattern; a reply is current only while its scope is
    * @param {number} [options.metadataMaxAge] how often an unresolved topic id may trigger a refresh
    * @param {object} [options.retry] the client's retry configuration, for the heartbeat backoff
    * @param {import('../../instrumentation/emitter')} options.instrumentationEmitter
@@ -320,6 +322,7 @@ module.exports = class ConsumerGroupProtocol {
     serverAssignor = null,
     topics = [],
     subscribedTopicRegex = null,
+    subscription = null,
     metadataMaxAge = 300000,
     ownership = null,
     retry = {},
@@ -356,6 +359,7 @@ module.exports = class ConsumerGroupProtocol {
 
     this.subscribedTopicNames = [...topics].sort()
     this.subscribedTopicRegex = subscribedTopicRegex
+    this.subscription = subscription
     this.regexUpdated = subscribedTopicRegex != null
 
     /** @type {{ localEpoch: number, byTopicId: Map<string, number[]> }|null} what the coordinator wants */
@@ -645,6 +649,18 @@ module.exports = class ConsumerGroupProtocol {
   }
 
   /**
+   * Replaces the names the next heartbeat declares. Ownership, the local assignment, the target and
+   * what was last sent stay as they are: the heartbeat copies the names when it builds a request
+   * and remembers what that request carried, so a change made while one is in flight goes out on
+   * the following tick. No heartbeat is requested here.
+   * @param {{names: string[]}} snapshot the newest desired subscription
+   * @returns {void}
+   */
+  updateSubscription({ names }) {
+    this.subscribedTopicNames = [...names].sort()
+  }
+
+  /**
    * Arms a fresh join attempt: a deferred that a heartbeat response resolves, a deadline that
    * bounds it, and one immediate joining heartbeat.
    *
@@ -816,14 +832,17 @@ module.exports = class ConsumerGroupProtocol {
   }
 
   /**
-   * Captures a membership and target identity that is never reused, even at equal local epochs.
+   * Captures a membership and target identity that is never reused, even at equal local epochs,
+   * and, for a client-pattern consumer, the metadata scope: an accepted mode change retires it.
    * @private
    * @returns {() => boolean} true only while this member may use the captured target
    */
   targetGuard() {
     const membership = this.membershipRevision
     const target = this.targetRevision
+    const scope = this.subscription?.captureScope()
     return () =>
+      (!scope || scope()) &&
       membership === this.membershipRevision &&
       target === this.targetRevision &&
       this.target != null &&

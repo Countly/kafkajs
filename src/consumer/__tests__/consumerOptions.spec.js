@@ -24,7 +24,12 @@ const kafka = () =>
 const fakeCluster = () => ({
   connect: jest.fn(async () => {}),
   disconnect: jest.fn(async () => {}),
-  refreshMetadata: jest.fn(async () => {}),
+  refreshMetadata: jest.fn(async ({ onMetadata } = {}) =>
+    onMetadata?.({ topicMetadata: [{ topic: 'events-a' }, { topic: 'other' }] })
+  ),
+  useConsumerMetadataScope: jest.fn(),
+  releaseConsumerMetadataScope: jest.fn(),
+  resetTargetTopics: jest.fn(async () => {}),
   refreshMetadataIfNecessary: jest.fn(async () => {}),
   removeBroker: jest.fn(),
   isConnected: () => true,
@@ -239,10 +244,57 @@ describe('Consumer > subscribe > regex', () => {
 
     await c.subscribe({ topics: [/^events-/] })
 
-    // A JavaScript RegExp in `topics` is matched once, here, against the metadata this client
-    // already has - unchanged from 2.2.4, and unrelated to the broker-evaluated `regex` form.
-    expect(cluster.metadata).toHaveBeenCalled()
+    // A JavaScript RegExp in `topics` is evaluated against an all-topic refresh and re-evaluated at
+    // later refreshes, unrelated to the broker-evaluated `regex` form: it names no target topic.
+    expect(cluster.refreshMetadata).toHaveBeenCalledWith(
+      expect.objectContaining({
+        metadataScope: expect.any(Object),
+        onMetadata: expect.any(Function),
+      })
+    )
+    expect(cluster.useConsumerMetadataScope).toHaveBeenCalledTimes(1)
+    expect(cluster.resetTargetTopics).toHaveBeenCalledWith([])
+    expect(cluster.addMultipleTargetTopics).not.toHaveBeenCalled()
+  })
+
+  it('leaves broker-regex text untouched and exclusive with names and client patterns', async () => {
+    const { consumer: c, cluster } = offlineConsumer({ groupProtocol: 'consumer' })
+    await c.subscribe({ topics: [/^events-/] })
+    const before = cluster.refreshMetadata.mock.calls.length
+
+    for (const mixed of [{ regex: 'events-(' }, { regex: 'events-(', topics: ['a'] }]) {
+      await expect(c.subscribe(mixed)).rejects.toThrow(
+        'Subscribe to topics or to a regex, not both'
+      )
+    }
+    expect(cluster.refreshMetadata).toHaveBeenCalledTimes(before)
+    expect(cluster.useConsumerMetadataScope).toHaveBeenCalledTimes(1)
+
+    const regexOnly = offlineConsumer({ groupProtocol: 'consumer' })
+    await regexOnly.consumer.subscribe({ regex: 'events-(' })
+    await expect(regexOnly.consumer.subscribe({ topics: [/^events-/] })).rejects.toThrow(
+      'Subscribe to topics or to a regex, not both'
+    )
+    expect(regexOnly.cluster.useConsumerMetadataScope).not.toHaveBeenCalled()
+  })
+
+  it('keeps the declarations and the cluster scope as they were when the refresh fails', async () => {
+    const { consumer: c, cluster } = offlineConsumer()
+    cluster.refreshMetadata.mockRejectedValueOnce(new Error('metadata unavailable'))
+
+    await expect(c.subscribe({ topics: [/^events-/] })).rejects.toThrow('metadata unavailable')
+    expect(cluster.releaseConsumerMetadataScope).toHaveBeenCalledTimes(1)
+
+    await c.subscribe({ topics: ['events-a'] })
     expect(cluster.addMultipleTargetTopics).toHaveBeenCalledWith(['events-a'])
+  })
+
+  it('rejects an invalid reset policy before any declaration or scope changes', async () => {
+    const { consumer: c, cluster } = offlineConsumer()
+
+    await expect(c.subscribe({ topics: [/^events-/], offsetReset: 'sideways' })).rejects.toThrow()
+    expect(cluster.useConsumerMetadataScope).not.toHaveBeenCalled()
+    expect(cluster.refreshMetadata).not.toHaveBeenCalled()
   })
 
   it('checks the combination before the protocol and the type', async () => {
@@ -547,6 +599,14 @@ describe('Consumer > configuration > pass-through', () => {
       fromBeginning: false,
       resetPolicy: { kind: 'latest' },
     })
+  })
+
+  it('hands a pattern consumer its declarations even when no topic matches', async () => {
+    const { group, rejections } = await capturedOptions({}, { topics: [/^nothing-/] })
+
+    expect(rejections).toEqual([])
+    expect(group.topics).toEqual([])
+    expect(group.subscription.hasPatterns()).toBe(true)
   })
 
   it('stores the policy for the regex forms too', async () => {

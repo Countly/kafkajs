@@ -108,6 +108,18 @@ class ResetObligations {
   }
 
   /**
+   * Drops the entries of every topic outside `topics`. A consumer whose subscription changes calls
+   * it so debts stay bounded by the names it can still read; a name that returns owes anew.
+   * @param {Set<string>} topics the names that keep their entries
+   * @returns {void}
+   */
+  retain(topics) {
+    for (const topic of this.entries.keys()) {
+      if (!topics.has(topic)) this.entries.delete(topic)
+    }
+  }
+
+  /**
    * Links this table to a group's operation ledger, so a mutation applied by any participant can
    * discharge it. Linking again replaces the previous link.
    * @param {import('./offsetOperations')} operations

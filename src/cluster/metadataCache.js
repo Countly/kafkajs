@@ -87,9 +87,11 @@ module.exports = class MetadataCache {
    * @param {object} [options]
    * @param {boolean} [options.full=false] true when the refresh was unscoped, i.e. the response
    *        describes every topic in the cluster
+   * @param {() => boolean} [options.isCurrent] refuses stale work before any cache/event effect
    * @returns {void}
    */
-  update(metadata, { full = false } = {}) {
+  update(metadata, { full = false, isCurrent = () => true } = {}) {
+    if (!isCurrent()) return
     const liveBrokerIds = this.liveBrokerIds(metadata)
 
     this.generation += 1
@@ -257,9 +259,11 @@ module.exports = class MetadataCache {
    * `applyLeaderHint` does, so the cached view and the routing view cannot diverge.
    *
    * @param {{ brokers: Array<{ nodeId: number }>, topicMetadata: Array<{ topic: string, topicId?: string|null, partitionMetadata: Array<{ partitionId: number, leader: number, leaderEpoch: number }> }> }} metadata decoded response; not mutated
+   * @param {{isCurrent?: () => boolean}} [options] composed scope and target installation guard
    * @returns {void}
    */
-  updateTopicsById(metadata) {
+  updateTopicsById(metadata, { isCurrent = () => true } = {}) {
+    if (!isCurrent()) return
     const liveBrokerIds = this.liveBrokerIds(metadata)
     let recreations = null
     let changed = false

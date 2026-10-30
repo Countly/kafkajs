@@ -65,6 +65,9 @@ const COOPERATIVE = 'cooperative'
  * @property {() => TopicPartitions[]} owned
  * @property {(topicPartitions: TopicPartitions[]) => void} narrowOwned shrink only
  * @property {(topicPartitions: TopicPartitions[]) => void} setOwned widen to what was applied
+ * @property {(snapshot: {names: string[], revision: number}) => void} updateSubscription takes the
+ *   newest desired subscription: the consumer protocol declares it on its next heartbeat, the
+ *   classic protocol on its next join
  */
 
 /** Precedence: the highest id in the intersection wins, matching the Java client. */

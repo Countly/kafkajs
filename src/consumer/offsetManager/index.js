@@ -1194,6 +1194,7 @@ module.exports = class OffsetManager {
     }
 
     const pendingPartitions = this.topics
+      .filter((topic) => this.obligations.current(topic) !== null)
       .map((topic) => ({
         topic,
         partitions: this.memberAssignment[topic]

@@ -347,6 +347,14 @@ module.exports = class ClassicGroupProtocol {
   }
 
   /**
+   * Takes the newest desired subscription. The classic protocol states its names in JoinGroup
+   * only, and a join reads the round's pinned names, so there is nothing to keep here.
+   * @param {{names: string[], revision: number}} snapshot the newest desired subscription
+   * @returns {void}
+   */
+  updateSubscription() {}
+
+  /**
    * One JoinGroup followed by one SyncGroup.
    * @param {{ topics: string[], topicsSubscribed: string[], beforeSync: () => void, round: object }} context
    * @returns {Promise<{ assignment: Object, userData: Buffer|null }>} the decoded member

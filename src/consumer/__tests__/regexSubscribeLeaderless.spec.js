@@ -94,8 +94,8 @@ describe('Consumer > a partition with no leader elsewhere in the cluster', () =>
 
     await expect(consumer.subscribe({ topics: [/^orders-/] })).resolves.toBeUndefined()
 
-    expect([...cluster.targetTopics].sort()).toEqual(['orders-1', 'orders-2'])
-    expect(created.asked.at(-1).sort()).toEqual(['orders-1', 'orders-2'])
+    expect([...cluster.targetTopics]).toEqual([])
+    expect(created.asked.at(-1)).toEqual([])
   })
 })
 

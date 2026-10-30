@@ -176,7 +176,7 @@ describe('consumer regression fixtures', () => {
       if (consumer) await consumer.disconnect()
       if (seam) seam.assertClean()
     })
-    it.failing('matches every partial topic name and preserves the caller expression', () => {
+    it('matches every partial topic name and preserves the caller expression', () => {
       expect({ topics: observed, callerIndex: expression.lastIndex }).toEqual({
         topics: names,
         callerIndex: originalIndex,

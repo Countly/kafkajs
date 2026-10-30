@@ -371,6 +371,19 @@ describe('documented live scenario scripts', () => {
       ],
     },
     {
+      script: 'test:e2e:regex-discovery',
+      flag: 'REGEX_DISCOVERY_E2E',
+      spec: 'src/consumer/__tests__/regexDiscoveryLive.spec.js',
+      compose: null,
+      budgetsMs: [180000],
+      wording: [
+        'created after subscription',
+        'removal without automatic recreation',
+        "fresh incarnation's offsets",
+        'metadataMaxAge: 5000',
+      ],
+    },
+    {
       script: 'test:e2e:topic-recreated',
       flag: 'TOPIC_RECREATED_E2E',
       spec: 'src/consumer/__tests__/topicRecreatedLive.spec.js',

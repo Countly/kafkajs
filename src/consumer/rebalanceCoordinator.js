@@ -390,6 +390,10 @@ module.exports = class RebalanceCoordinator {
                 ? 'assignment-changed'
                 : this.takeRejoinRequested()
 
+        // A level, not an event: a request that arrived while this chain ran was dropped, but the
+        // unapplied revision it stood for is still there.
+        reason ||= this.consumerGroup.subscriptionPending?.() ? 'subscription-changed' : null
+
         if (reason && protocol === 'consumer' && !this.runner.stopRequested) {
           await this.yieldBetweenRounds()
         }

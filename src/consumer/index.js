@@ -3,6 +3,7 @@ const Long = require('../utils/long')
 const dictionary = require('../utils/dictionary')
 const { initialRetryTime } = require('../retry/defaults')
 const ConsumerGroup = require('./consumerGroup')
+const Subscription = require('./subscription')
 const ResetObligations = require('./offsetManager/resetObligations')
 const { normalizeResetPolicy } = require('./offsetReset')
 const { createGroupDescriptions } = require('../admin/groupDescriptions')
@@ -241,6 +242,12 @@ module.exports = (params) => {
 
   /** @type {Record<string, { fromBeginning?: boolean, resetPolicy?: object }>} */
   const topics = dictionary()
+  /**
+   * Every subscription declaration for the life of this consumer: names, cloned patterns and the
+   * policy each carried. A client-side pattern makes discovery re-evaluate it at metadata
+   * refreshes; literal-only consumers keep their names in `topics`.
+   */
+  const declared = new Subscription()
   /** @type {string|null} the RE2 pattern a regex subscription sent, verbatim */
   let subscribedTopicRegex = null
   /** @type {{ fromBeginning: boolean, resetPolicy: object }|null} the options that subscription was made with */
@@ -331,7 +338,7 @@ module.exports = (params) => {
       try {
         const { topic, topicId } = payload
 
-        if (!Object.hasOwn(topics, topic)) {
+        if (!Object.hasOwn(topics, topic) && !declared.desired.topicConfigurations.has(topic)) {
           return
         }
 
@@ -350,9 +357,28 @@ module.exports = (params) => {
 
   ensureTopicRecreatedSubscription()
 
+  /**
+   * Makes this consumer's subscription the default metadata scope of its cluster while it holds a
+   * client-side pattern, so every refresh on the cluster asks for all topics and creates none.
+   * Idempotent; a literal-only consumer, which may borrow its creator's cluster, registers nothing.
+   * @returns {void}
+   */
+  const registerDiscoveryScope = () => {
+    if (declared.hasPatterns()) cluster.useConsumerMetadataScope(declared)
+  }
+
+  /**
+   * Gives the cluster's default scope back, only if this consumer registered it.
+   * @returns {void}
+   */
+  const releaseDiscoveryScope = () => {
+    if (declared.hasPatterns()) cluster.releaseConsumerMetadataScope(declared)
+  }
+
   /** @type {import("../../types").Consumer["connect"]} */
   const connect = async () => {
     ensureTopicRecreatedSubscription()
+    registerDiscoveryScope()
     await cluster.connect()
     instrumentationEmitter.emit(CONNECT)
   }
@@ -386,6 +412,7 @@ module.exports = (params) => {
         removeTopicRecreatedListener && removeTopicRecreatedListener()
         removeTopicRecreatedListener = null
         obligations.clear()
+        releaseDiscoveryScope()
       }
     }
   }
@@ -411,6 +438,7 @@ module.exports = (params) => {
         await runner.stop(options)
         runner = null
         consumerGroup = null
+        declared.retireRun()
         instrumentationEmitter.emit(STOP)
       }
 
@@ -457,7 +485,42 @@ module.exports = (params) => {
       removeTopicRecreatedListener && removeTopicRecreatedListener()
       removeTopicRecreatedListener = null
       obligations.clear()
+      releaseDiscoveryScope()
     }
+  }
+
+  /**
+   * Declares a call that holds a client-side pattern, or follows one, and evaluates the
+   * declarations against one all-topic metadata refresh. The cluster's targets become empty: while
+   * a pattern is declared every refresh asks for all topics and creates none. A failure puts the
+   * declarations back as they were.
+   * @param {Array<string|RegExp>} subscriptions the validated names and patterns of the call
+   * @param {{kind: string, durationMs?: number}} policy the call's normalized reset policy
+   * @returns {Promise<void>}
+   * @throws {Error} the refresh's own failure
+   */
+  const declarePatterns = async (subscriptions, policy) => {
+    const checkpoint = declared.checkpoint()
+    declared.add({ topics: subscriptions, policy })
+    cluster.useConsumerMetadataScope(declared)
+
+    try {
+      await cluster.refreshMetadata({
+        metadataScope: declared,
+        onMetadata: (metadata) => declared.evaluate(metadata),
+      })
+      await cluster.resetTargetTopics([])
+    } catch (error) {
+      declared.restore(checkpoint)
+      if (!declared.hasPatterns()) cluster.releaseConsumerMetadataScope(declared)
+      throw error
+    }
+
+    logger.debug('Subscription based on RegExp', {
+      groupId,
+      patterns: subscriptions.filter((entry) => entry instanceof RegExp).map(String),
+      matchedTopics: declared.desired.names,
+    })
   }
 
   /** @type {import("../../types").Consumer["subscribe"]} */
@@ -476,7 +539,7 @@ module.exports = (params) => {
     // The combination rule comes first, so a call that is wrong several ways reports the thing the
     // user has to change: you subscribe one way or the other, not both.
     if (
-      (wantsRegex && (wantsNames || keys(topics).length > 0)) ||
+      (wantsRegex && (wantsNames || keys(topics).length > 0 || declared.hasPatterns())) ||
       (wantsNames && subscribedTopicRegex != null)
     ) {
       throw new KafkaJSNonRetriableError('Subscribe to topics or to a regex, not both')
@@ -518,37 +581,17 @@ module.exports = (params) => {
       }
     }
 
-    const hasRegexSubscriptions = subscriptions.some(
-      (subscription) => subscription instanceof RegExp
-    )
-    const metadata = hasRegexSubscriptions ? await cluster.metadata() : undefined
-
-    const topicsToSubscribe = []
-    for (const subscription of subscriptions) {
-      const isRegExp = subscription instanceof RegExp
-      if (isRegExp) {
-        const topicRegExp = subscription
-        const matchedTopics = metadata.topicMetadata
-          .map(({ topic: topicName }) => topicName)
-          .filter((topicName) => topicRegExp.test(topicName))
-
-        logger.debug('Subscription based on RegExp', {
-          groupId,
-          topicRegExp: topicRegExp.toString(),
-          matchedTopics,
-        })
-
-        topicsToSubscribe.push(...matchedTopics)
-      } else {
-        topicsToSubscribe.push(subscription)
+    if (!subscriptions.some((entry) => entry instanceof RegExp) && !declared.hasPatterns()) {
+      declared.add({ topics: subscriptions, policy: resetPolicy })
+      for (const t of subscriptions) {
+        topics[t] = { fromBeginning, resetPolicy }
       }
+
+      await cluster.addMultipleTargetTopics(subscriptions)
+      return
     }
 
-    for (const t of topicsToSubscribe) {
-      topics[t] = { fromBeginning, resetPolicy }
-    }
-
-    await cluster.addMultipleTargetTopics(topicsToSubscribe)
+    await declarePatterns(subscriptions, resetPolicy)
   }
 
   /** @type {import("../../types").Consumer["run"]} */
@@ -572,10 +615,14 @@ module.exports = (params) => {
       ensureTopicRecreatedSubscription()
       logger.info('Starting', { groupId })
 
+      registerDiscoveryScope()
+      const discovering = declared.hasPatterns()
+
       consumerGroup = new ConsumerGroup({
         logger: rootLogger,
-        topics: keys(topics),
-        topicConfigurations: topics,
+        topics: discovering ? declared.desired.names : keys(topics),
+        topicConfigurations: discovering ? Subscription.configurationsOf(declared.desired) : topics,
+        subscription: discovering ? declared : null,
         retry,
         cluster,
         groupId,

@@ -828,10 +828,7 @@ says so, `groupProtocol: 'consumer'`.
   `heartbeatInterval` you configured. Expect the detection to lag the deadline by up to one
   server-driven heartbeat interval.
 
-- **A regex subscription's resolved topic set only grows.** Under `subscribe({ regex })` the names
-  the pattern has resolved to are remembered for the life of the membership: a topic the pattern
-  stops matching stays in the subscription until the consumer rebuilds its membership (a restart or
-  a crash recovery). It is bounded by the number of distinct topics the pattern ever matched.
+- **A broker-regex subscription's resolved names follow its applied target.** A name the coordinator no longer assigns is retired after the target applies, unless a literal retains it. It no longer accumulates for the whole membership. Final handlers, eligible commits and revoke work still see the old applied state.
 
 - **A commit for a group that no longer exists rejoins instead of crashing, and the broker's code
   for it changed.** `OffsetCommit` is now negotiated up to v9 against a Kafka 4.x broker. From v9
@@ -912,7 +909,7 @@ says so, `groupProtocol: 'consumer'`.
   `groupProtocol: 'consumer'`. The pattern is **RE2, evaluated by the broker**, not a JavaScript
   `RegExp`, so topics created later join the subscription without a client-side metadata poll. A
   consumer subscribes to names or to a regex, never both. A JavaScript `RegExp` inside `topics`
-  keeps its 2.2.4 behaviour under both protocols: matched client-side, once, at `subscribe()` time.
+  is matched client-side under both protocols and re-evaluated at existing metadata refresh opportunities. Its clones ignore g/y, and internal topics require an explicit literal name.
 - **`maxPrefetchBatches` is accepted but inert.** `0` (the default) and `1` behave identically:
   the fetch loop is exactly what it was. The one-deep prefetch the option was to control measured
   +2.45 % throughput against the ≥ +10 % the design required of it, and was withdrawn on that
@@ -954,6 +951,8 @@ Connection or coordinator failures in the consumer protocol no longer spend the 
 - **Rack-aware range assignment is opt-in.** Set `rackAwareAssignment: true` with `partitionAssigners: [PartitionAssigners.range]`, member rack IDs and broker rack labels to use it. The default is false; sticky, cooperative-sticky and round-robin ignore it. A Java leader can still rack-match with the option off on JavaScript members, so mixed-leader assignments can differ.
 
 - **Offset reset policies and the halt reasons.** Switches on `consumer.partition_halted` must handle `'no-offset'` and `'offset-out-of-range'`. The no-offset branch has `offset: null`; out-of-range has a decimal offset or null. Existing corrupt/decode branches keep decimal offsets and the inherited codec, limit and nextOffset fields. The `ConsumerOffsetReset` duration form requires TypeScript 4.1 or later. `fromBeginning` and its default stay unchanged. Explicit `fromBeginning` may accompany only its matching earliest/latest policy; either explicit boolean conflicts with none or by_duration. With by_duration and autoCommit disabled, no reset or subsequent seek automatically commits a timestamp, sentinel or real offset. Commit an actual offset explicitly when required.
+
+- If you subscribed a RegExp and relied on a fixed set of topics, pass the names instead: a consumer of literal names behaves as before. Internal topics are excluded from regex matches only; subscribe to one by name to read it. A pattern consumer caches the metadata of every topic in the cluster; on a very large cluster prefer a narrower pattern or the broker-side `subscribe({ regex })` under `groupProtocol: 'consumer'`. Subscription matching ignores g and y flags (other flags/partial matching preserved). A post-initial-discovery addition without incarnation-continuity proof starts from its reset policy, including conservatively a newly discovered name; initial subscription and continuously observed incarnation preserve ordinary committed-offset behavior. A post-initial addition without a usable topic ID is withheld from Fetch and OffsetFetch until metadata establishes its incarnation. Narrower patterns reduce matching/assignment work, not all-topics metadata bytes. metadataMaxAge (default 5 minutes) permits refresh at opportunities; blocked application handlers can delay discovery beyond it
 
 ### Admin
 

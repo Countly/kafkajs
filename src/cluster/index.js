@@ -69,6 +69,17 @@ const FAILED = 'failed'
  */
 const fenceArgs = (fence) => (fence ? [{ fence }] : [])
 
+/**
+ * A refresh's context as the trailing argument of a broker-pool call, or no argument at all: only
+ * the fields the caller set are forwarded, so an ordinary call keeps the shape it always had.
+ * @param {object} [context] fence, metadataScope, isCurrent, allowAutoTopicCreation, onMetadata
+ * @returns {[object]|[]}
+ */
+const refreshArgs = (context = {}) => {
+  const set = Object.fromEntries(Object.entries(context).filter(([, value]) => value !== undefined))
+  return Object.keys(set).length ? [set] : []
+}
+
 const PRIVATE = {
   CONNECT: Symbol('private:Cluster:connect'),
   REFRESH_METADATA: Symbol('private:Cluster:refreshMetadata'),
@@ -163,6 +174,8 @@ module.exports = class Cluster {
     this.targetTopicState = metadataMaxIdle === undefined ? null : new Map()
     this.topicPins = metadataMaxIdle === undefined ? null : new Map()
     this.nextTopicIncarnation = 0
+    /** @type {WeakMap<object, {topics: object[], byName: Map<string, object>}>} lookup index per accepted metadata object */
+    this.topicMetadataIndexes = new WeakMap()
     this.mutatingTargetTopics = new Lock({
       description: `updating target topics`,
       timeout: requestTimeout,
@@ -205,25 +218,37 @@ module.exports = class Cluster {
       return await this.brokerPool.connect(...fenceArgs(fence))
     }, fenceOf)
 
-    this[PRIVATE.REFRESH_METADATA] = sharedPromiseTo(async ({ fence } = {}) => {
+    // A refresh joins only calls of its own scope: a producer's fence, else the consumer's
+    // subscription key (it moves with the generation and the declaration revision), else the
+    // registration generation, so nothing joins a refresh begun before a mode change.
+    const shareScopeOf = ({ fence, metadataScope } = {}) =>
+      fence ??
+      (metadataScope ?? this.brokerPool.consumerMetadataScope)?.shareKey() ??
+      this.brokerPool.consumerMetadataGeneration ??
+      0
+
+    this[PRIVATE.REFRESH_METADATA] = sharedPromiseTo(async ({ fence, ...scope } = {}) => {
       fence?.check()
       this.pruneTargetTopics()
       if (this.targetTopicState !== null && this.targetTopics.size === 0) return
       return await this.brokerPool.refreshMetadata(
         Array.from(this.targetTopics),
-        ...fenceArgs(fence)
+        ...refreshArgs({ fence, ...scope })
       )
-    }, fenceOf)
+    }, shareScopeOf)
 
-    this[PRIVATE.REFRESH_METADATA_IF_NECESSARY] = sharedPromiseTo(async ({ fence } = {}) => {
-      fence?.check()
-      this.pruneTargetTopics()
-      if (this.targetTopicState !== null && this.targetTopics.size === 0) return
-      return await this.brokerPool.refreshMetadataIfNecessary(
-        Array.from(this.targetTopics),
-        ...fenceArgs(fence)
-      )
-    }, fenceOf)
+    this[PRIVATE.REFRESH_METADATA_IF_NECESSARY] = sharedPromiseTo(
+      async ({ fence, ...scope } = {}) => {
+        fence?.check()
+        this.pruneTargetTopics()
+        if (this.targetTopicState !== null && this.targetTopics.size === 0) return
+        return await this.brokerPool.refreshMetadataIfNecessary(
+          Array.from(this.targetTopics),
+          ...refreshArgs({ fence, ...scope })
+        )
+      },
+      shareScopeOf
+    )
 
     this[PRIVATE.FIND_CONTROLLER_BROKER] = sharedPromiseTo(async () => {
       const { metadata } = this.brokerPool
@@ -307,25 +332,39 @@ module.exports = class Cluster {
    * @param {import('../producer/generation')} [options.fence] the producer lifecycle asking: once
    *   it closed, the retries stop, no socket opens and a late response publishes nothing
    * @param {() => Error|null} [options.guard] a guarded refresh does not share an unguarded promise
+   * @param {object} [options.metadataScope] the subscription that issues scope and sequence tickets;
+   *   a registered default applies when omitted
+   * @param {() => boolean} [options.isCurrent] additional membership, target or lifecycle guard
+   * @param {boolean} [options.allowAutoTopicCreation] per-call creation override
+   * @param {(metadata: object) => void} [options.onMetadata] synchronous accepted-snapshot observer
    * @returns {Promise<void>}
    * @throws {Error} the lifecycle's close error
    * @throws {Error} original refresh failure or captured scope refusal
    */
-  async refreshMetadata({ fence, guard } = {}) {
-    if (guard)
-      return this.brokerPool.refreshMetadata(Array.from(this.targetTopics), { fence, guard })
-    await this[PRIVATE.REFRESH_METADATA]({ fence })
+  async refreshMetadata({ fence, guard, ...scope } = {}) {
+    if (guard) {
+      return this.brokerPool.refreshMetadata(Array.from(this.targetTopics), {
+        fence,
+        guard,
+        ...scope,
+      })
+    }
+    await this[PRIVATE.REFRESH_METADATA]({ fence, ...scope })
   }
 
   /**
    * @public
    * @param {object} [options]
    * @param {import('../producer/generation')} [options.fence] see `refreshMetadata`
+   * @param {object} [options.metadataScope] see `refreshMetadata`
+   * @param {() => boolean} [options.isCurrent] see `refreshMetadata`
+   * @param {boolean} [options.allowAutoTopicCreation] see `refreshMetadata`
+   * @param {(metadata: object) => void} [options.onMetadata] see `refreshMetadata`
    * @returns {Promise<void>}
    * @throws {Error} the lifecycle's close error
    */
-  async refreshMetadataIfNecessary({ fence } = {}) {
-    await this[PRIVATE.REFRESH_METADATA_IF_NECESSARY]({ fence })
+  async refreshMetadataIfNecessary({ fence, ...scope } = {}) {
+    await this[PRIVATE.REFRESH_METADATA_IF_NECESSARY]({ fence, ...scope })
   }
 
   /**
@@ -741,6 +780,58 @@ module.exports = class Cluster {
     }
   }
 
+  /**
+   * Registers the first client-pattern scope on its owning consumer cluster. This also fences
+   * earlier unscoped snapshot pre-steps. Literal-only temporary admin consumers do not register.
+   * @param {object} scope the consumer's stable subscription owner
+   * @returns {void}
+   */
+  useConsumerMetadataScope(scope) {
+    if (this.brokerPool.consumerMetadataScope === scope) return
+    this.brokerPool.consumerMetadataScope = scope
+    this.brokerPool.consumerMetadataGeneration =
+      (this.brokerPool.consumerMetadataGeneration ?? 0) + 1
+  }
+
+  /**
+   * Releases only the captured owner's default scope and fences every earlier refresh.
+   * A late old consumer cannot detach a replacement owner's scope.
+   * @param {object} scope the owner being disposed
+   * @returns {void}
+   */
+  releaseConsumerMetadataScope(scope) {
+    if (this.brokerPool.consumerMetadataScope !== scope) return
+    this.brokerPool.consumerMetadataScope = null
+    this.brokerPool.consumerMetadataGeneration =
+      (this.brokerPool.consumerMetadataGeneration ?? 0) + 1
+  }
+
+  /**
+   * Replaces consumer targets and prunes removed decoded/id state without issuing a request.
+   * Pattern callers pass an empty list. Captured guards are rechecked after the target lock.
+   * @param {string[]} names accepted desired target names
+   * @param {{isCurrent?: () => boolean}} [options]
+   * @returns {Promise<void>}
+   * @throws {Error} when acquiring the existing target lock fails
+   */
+  async resetTargetTopics(names, { isCurrent = () => true } = {}) {
+    const next = new Set(names)
+    if (!isCurrent()) return
+    await this.mutatingTargetTopics.acquire()
+    try {
+      if (!isCurrent()) return
+      for (const topic of this.targetTopics) {
+        if (next.has(topic)) continue
+        this.metadataCache.forget(topic)
+        this.brokerPool.forgetTopic(topic)
+      }
+      this.targetTopics = next
+      this.topicMetadataIndexes = new WeakMap()
+    } finally {
+      await this.mutatingTargetTopics.release()
+    }
+  }
+
   /** @type {() => string[]} */
   getNodeIds() {
     return this.brokerPool.getNodeIds()
@@ -846,8 +937,17 @@ module.exports = class Cluster {
       })
     }
 
-    const topicMetadata = metadata.topicMetadata.find((t) => t.topic === topic)
-    return topicMetadata ? topicMetadata.partitionMetadata : []
+    this.topicMetadataIndexes ??= new WeakMap()
+    let index = this.topicMetadataIndexes.get(metadata)
+    if (!index || index.topics !== metadata.topicMetadata) {
+      const byName = new Map()
+      for (const entry of metadata.topicMetadata) {
+        if (!byName.has(entry.topic)) byName.set(entry.topic, entry)
+      }
+      index = { topics: metadata.topicMetadata, byName }
+      this.topicMetadataIndexes.set(metadata, index)
+    }
+    return index.byName.get(topic)?.partitionMetadata ?? []
   }
 
   /**

@@ -12,6 +12,7 @@ const ResetObligations = require('./offsetManager/resetObligations')
 const Batch = require('./batch')
 const SeekOffsets = require('./seekOffsets')
 const SubscriptionState = require('./subscriptionState')
+const Subscription = require('./subscription')
 const IdleWait = require('./idleWait')
 const LeaderUnionWatch = require('./leaderUnionWatch')
 const { FetchPreparation, fencedDelay } = require('./fetchPreparation')
@@ -163,6 +164,10 @@ module.exports = class ConsumerGroup {
    *                                the options the regex subscription was made with (the legacy
    *                                flag and the normalized reset policy), copied to a name-keyed
    *                                `topicConfigurations` entry for every name the regex resolves to.
+   * @param {Subscription|null} [options.subscription=null] the consumer's declarations when it holds
+   *                                a client-side pattern: names are then discovered at metadata
+   *                                refreshes and published by revision, never by `topics` alone.
+   *                                Null for a literal-only consumer, whose names never change.
    * @param {0|1} [options.maxPrefetchBatches=0] reserved for a fetch layer that runs one Fetch
    *                                ahead of the workers. Accepted and stored; inert in this
    *                                release, and read by nothing.
@@ -201,6 +206,7 @@ module.exports = class ConsumerGroup {
     groupRemoteAssignor = null,
     subscribedTopicRegex = null,
     regexSubscription = null,
+    subscription = null,
     maxPrefetchBatches = 0,
     heartbeatInterval = 3000,
   }) {
@@ -248,6 +254,10 @@ module.exports = class ConsumerGroup {
     this.rebalanceTimeout = rebalanceTimeout
     this.subscribedTopicRegex = subscribedTopicRegex
     this.regexSubscription = regexSubscription
+    this.subscription = subscription
+    /** @type {{revision: number}|null} the newest discovered snapshot not yet handed to `updateSubscription` */
+    this.discovered = null
+    this.notifiedRevision = null
     this.maxPrefetchBatches = maxPrefetchBatches
 
     const membershipOptions = {
@@ -273,6 +283,7 @@ module.exports = class ConsumerGroup {
             serverAssignor: groupRemoteAssignor,
             topics: this.topics,
             subscribedTopicRegex,
+            subscription,
             metadataMaxAge,
             retry,
           })
@@ -679,7 +690,107 @@ module.exports = class ConsumerGroup {
   async connect() {
     await this.cluster.connect()
     this.instrumentationEmitter.emit(CONNECT)
-    await this.cluster.refreshMetadataIfNecessary()
+    // A pattern consumer's first running discovery is the observation that starts continuity, so it
+    // must not be skipped because the metadata happens to be fresh.
+    await (this.subscription ? this.refreshCluster() : this.cluster.refreshMetadataIfNecessary())
+  }
+
+  /**
+   * One metadata refresh on the cluster. A client-pattern consumer passes its subscription, the
+   * run's currency check and the observer, so an accepted response is evaluated and observed once
+   * inside its install and the newest desired revision is handed on afterwards. Any other consumer
+   * keeps the call shape it always had.
+   * @param {object} [options]
+   * @param {Generation} [options.fence] the run's terminal fence, binding the refresh to the run
+   * @param {boolean} [options.ifNecessary=false] refresh only when the cache is missing or expired
+   * @returns {Promise<void>}
+   * @throws {Error} the refresh's failure or the fence's close error
+   */
+  async refreshCluster({ fence, ifNecessary = false } = {}) {
+    if (!this.subscription) {
+      const args = boundTo(fence)
+      await (ifNecessary
+        ? this.cluster.refreshMetadataIfNecessary(...args)
+        : this.cluster.refreshMetadata(...args))
+      return
+    }
+
+    const run = this.idleWait
+    const isCurrent = () => this.idleWait === run && !run.disposed
+    const options = {
+      ...(fence && { fence }),
+      metadataScope: this.subscription,
+      isCurrent,
+      onMetadata: (metadata) => this.observeDiscovery(metadata),
+    }
+
+    await (ifNecessary
+      ? this.cluster.refreshMetadataIfNecessary(options)
+      : this.cluster.refreshMetadata(options))
+
+    if (this.discovered) {
+      const snapshot = this.discovered
+      this.discovered = null
+      await this.updateSubscription(snapshot, { isCurrent })
+    }
+  }
+
+  /**
+   * Evaluates and observes one accepted full response, synchronously inside its install. Evaluates
+   * once, owes the reset of every name that returned or appeared without a known equal incarnation
+   * before any of them can read a group offset, and keeps the newest snapshot for
+   * `updateSubscription`. A debt that is already owed for the same incarnation is left as it is.
+   * @param {object} metadata the accepted response
+   * @returns {void}
+   */
+  observeDiscovery(metadata) {
+    this.discovered = this.subscription.evaluate(metadata)
+    for (const { topic, topicId } of this.subscription.observe(metadata)) {
+      if (this.obligations.current(topic) === topicId) continue
+      this.obligations.owe(topic, topicId)
+      this.operations.touchTopic(topic)
+      this.invalidateTopic(topic)
+    }
+  }
+
+  /**
+   * Hands the newest desired subscription to the membership. Nothing is published or pruned here:
+   * the applied revision changes only when a round applies the pinned one, at the next control
+   * opportunity, so old handlers and their final commits keep the configuration they started with.
+   * @param {{revision: number, names: string[]}} snapshot a desired snapshot from `Subscription#evaluate`
+   * @param {object} [options]
+   * @param {() => boolean} [options.isCurrent] whether the run that discovered it is still current
+   * @returns {Promise<void>}
+   */
+  async updateSubscription(snapshot, { isCurrent = () => true } = {}) {
+    if (!isCurrent() || snapshot.revision === this.notifiedRevision) return
+    this.notifiedRevision = snapshot.revision
+    this.groupMembership.updateSubscription(snapshot)
+  }
+
+  /**
+   * Whether the desired subscription differs from the applied one. A level, not an event: it stays
+   * true until a round applies, so a request ignored during a round still gets its following round.
+   * @returns {boolean}
+   */
+  subscriptionPending() {
+    return this.subscription?.needsApply() ?? false
+  }
+
+  /**
+   * At a fetch opportunity, asks for one ordinary revoked reconciliation while the desired
+   * subscription is unapplied and no round is in flight. A round already running applies the pin it
+   * took and the coordinator's following round picks up anything newer.
+   * @returns {void}
+   */
+  checkSubscriptionChange() {
+    const coordinator = this.rebalanceCoordinator
+    if (!this.subscriptionPending() || !coordinator || coordinator.isRebalancing()) return
+    coordinator.requestRejoin({
+      kind: 'revoked',
+      reason: 'subscription-changed',
+      error: new KafkaJSError('The subscription changed'),
+    })
   }
 
   /**
@@ -722,7 +833,8 @@ module.exports = class ConsumerGroup {
       }
     }
     check()
-    const { groupId, generationId, memberId, topicsSubscribed, coordinator } = this
+    const { groupId, generationId, memberId, coordinator } = this
+    const topicsSubscribed = round?.pin ? round.pin.names : this.topicsSubscribed
     const decodedAssignment = result.assignment
     this.logger.debug('Received assignment', {
       groupId,
@@ -803,6 +915,7 @@ module.exports = class ConsumerGroup {
     // below is the widening half.
     check()
     this.ownership?.renew()
+    if (round?.pin) this.publishSubscription(round.pin)
     this.topics = currentMemberAssignment.map(({ topic }) => topic)
     this.groupMembership.narrowOwned(currentMemberAssignment)
 
@@ -935,6 +1048,8 @@ module.exports = class ConsumerGroup {
     })
     const waiters = new Set()
     const fence = new Generation()
+    // Pinned before the round's first await and kept through its retries and its apply.
+    const pin = this.subscription?.pin() ?? null
     let retired = null
     let issued = false
     let currentAttempt = leaderAttempt
@@ -944,8 +1059,10 @@ module.exports = class ConsumerGroup {
       roundDeadlineAt,
       /** Closed with the round, so work started for it stops dialling and retrying. */
       fence,
+      /** The desired subscription this round joins and applies; null without a client pattern. */
+      pin,
       allowAutoTopicCreation:
-        this.regexSubscription != null || this.subscribedTopicRegex != null
+        this.regexSubscription != null || this.subscribedTopicRegex != null || this.subscription
           ? false
           : this.cluster.allowAutoTopicCreation,
       /**
@@ -984,6 +1101,7 @@ module.exports = class ConsumerGroup {
       retire: (error = expired) => {
         if (retired) return
         retired = error
+        if (pin) this.subscription.abandon(pin)
         fence.close(error)
         for (const reject of waiters) reject(error)
         waiters.clear()
@@ -1112,15 +1230,18 @@ module.exports = class ConsumerGroup {
     return this.retrier(async (bail) => {
       const { membershipRevision } = this.groupMembership
       const attempt = round.attempt()
+      const topicsSubscribed = attempt.pin ? [...attempt.pin.names] : this.topicsSubscribed
       try {
         return await attempt.wait(() =>
           this.groupMembership.rebalance({
             topics: this.topics,
-            topicsSubscribed: this.topicsSubscribed,
+            topicsSubscribed,
             beforeSync: () => {
               const refusal = attempt.guard()
               if (refusal) throw refusal
-              this.partitionsPerSubscribedTopic = this.generatePartitionsPerSubscribedTopic()
+              this.partitionsPerSubscribedTopic = this.generatePartitionsPerSubscribedTopic(
+                attempt.pin?.names
+              )
             },
             growSubscription: (names) => {
               const refusal = attempt.guard()
@@ -1180,6 +1301,23 @@ module.exports = class ConsumerGroup {
     }
   }
 
+  /**
+   * Makes a round's pinned subscription the applied one, after the old owner's handlers, final
+   * commit and revoke work are done. Replaces the configuration the offset manager reads, then
+   * retires the pause intent and configuration of names that left. Synchronous, so no reader sees
+   * a half-applied revision.
+   * @param {{revision: number, names: string[], topicConfigurations: Map}} pin the round's pinned snapshot
+   * @returns {void}
+   * @throws {Error} the consumer-stopping error when the run was retired and the pin refuses
+   */
+  publishSubscription(pin) {
+    if (!this.subscription.apply(pin)) throw consumerStoppingError()
+    this.topicConfigurations = Subscription.configurationsOf(pin)
+    if (this.offsetManager) this.offsetManager.topicConfigurations = this.topicConfigurations
+    this.retainSubscription(pin.names)
+    this.obligations.retain(new Set([...pin.names, ...this.subscription.desired.names]))
+  }
+
   /** Prunes assignment-owned routing and queued seeks after either apply. @returns {void} */
   pruneAssignmentState() {
     const assigned = this.subscriptionState.assignedPartitionSetsByTopic
@@ -1215,6 +1353,10 @@ module.exports = class ConsumerGroup {
    * @returns {Promise<void>}
    */
   async growSubscription(names) {
+    // A client-pattern member's names come from its pinned revision: an assigned name that left it
+    // is filtered by the apply, never turned into a named target.
+    if (this.subscription) return
+
     const added = names.filter((name) => !this.topicsSubscribed.includes(name))
 
     if (!added.length) {
@@ -1673,7 +1815,7 @@ module.exports = class ConsumerGroup {
       }
 
       if (needsRefresh) {
-        await this.cluster.refreshMetadata({ fence: run.fence })
+        await this.refreshCluster({ fence: run.fence })
         run.fence.check()
       }
 
@@ -1726,8 +1868,9 @@ module.exports = class ConsumerGroup {
    */
   async prepareFetch(nodeId, run, ownershipToken) {
     run.fence.check()
-    await run.fence.wait(this.cluster.refreshMetadataIfNecessary({ fence: run.fence }))
+    await run.fence.wait(this.refreshCluster({ fence: run.fence, ifNecessary: true }))
     run.fence.check()
+    this.checkSubscriptionChange()
     if (this.leaderUnionWatch.armed) await this.pollLeaderUnion(run.fence)
     this.checkForStaleAssignment()
 
@@ -1797,6 +1940,7 @@ module.exports = class ConsumerGroup {
     const activeTopicPartitions = this.getActiveTopicPartitions()
 
     return topicPartitions
+      .filter(({ topic }) => this.obligations.current(topic) !== null)
       .map(({ topic, partitions }) => ({
         topic,
         partitions: partitions
@@ -1876,7 +2020,7 @@ module.exports = class ConsumerGroup {
       errorCode,
     })
 
-    await this.cluster.refreshMetadata(...boundTo(fence))
+    await this.refreshCluster({ fence })
   }
 
   /**
@@ -2230,7 +2374,7 @@ module.exports = class ConsumerGroup {
         error: e.message,
       })
 
-      await this.cluster.refreshMetadata(...boundTo(fence))
+      await this.refreshCluster({ fence })
       fence?.check()
       this.requestResync(e)
       return
@@ -2260,7 +2404,7 @@ module.exports = class ConsumerGroup {
 
     if (e.name === 'KafkaJSBrokerNotFound' || e.name === 'KafkaJSConnectionClosedError') {
       this.logger.debug(`${e.message}, refreshing metadata and retrying...`)
-      await this.cluster.refreshMetadata(...boundTo(fence))
+      await this.refreshCluster({ fence })
       fence?.check()
       return
     }
@@ -2448,10 +2592,14 @@ module.exports = class ConsumerGroup {
     }
   }
 
-  generatePartitionsPerSubscribedTopic() {
+  /**
+   * @param {string[]} [names] the subscription to map: the applied names, or a round's pinned ones
+   * @returns {Map<string, number[]>} each name's known partition ids, sorted
+   */
+  generatePartitionsPerSubscribedTopic(names = this.topicsSubscribed) {
     const map = new Map()
 
-    for (const topic of this.topicsSubscribed) {
+    for (const topic of names) {
       const partitions = this.cluster
         .findTopicPartitionMetadata(topic)
         .map((m) => m.partitionId)
@@ -2488,7 +2636,9 @@ module.exports = class ConsumerGroup {
     const newPartitionsPerSubscribedTopic = this.generatePartitionsPerSubscribedTopic()
 
     for (const [topic, partitions] of newPartitionsPerSubscribedTopic) {
-      const diff = arrayDiff(partitions, this.partitionsPerSubscribedTopic.get(topic))
+      const known = this.partitionsPerSubscribedTopic.get(topic)
+      if (known === undefined) continue
+      const diff = arrayDiff(partitions, known)
 
       if (diff.length > 0) {
         this.staleAssignmentPending = true

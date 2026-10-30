@@ -130,6 +130,10 @@ module.exports = class BrokerPool {
     this.metadataExpireAt = null
     /** Counts the responses published to `this.metadata`, so a refresh can tell it was superseded. */
     this.metadataPublications = 0
+    /** @type {import('../consumer/subscription')|null} default scope of a client-pattern consumer */
+    this.consumerMetadataScope = null
+    /** Advances when the default scope is registered or released, fencing earlier unscoped work. */
+    this.consumerMetadataGeneration = 0
     this.versions = null
 
     this.metadataRecoveryStrategy = metadataRecoveryStrategy ?? 'rebootstrap'
@@ -631,18 +635,50 @@ module.exports = class BrokerPool {
    * @param {import('../producer/generation')} [options.fence] the producer lifecycle asking: once
    *   it closed, the retries stop, no socket opens, and a response in flight publishes nothing
    * @param {() => Error|null} [options.guard] checked before attempts and cache/routing installation
+   * @param {object} [options.metadataScope] subscription that issues scope/sequence tickets
+   * @param {() => boolean} [options.isCurrent] additional membership/target/lifecycle guard
+   * @param {boolean} [options.allowAutoTopicCreation] per-call creation override
+   * @param {(metadata: object) => void} [options.onMetadata] synchronous accepted-snapshot observer
    * @returns {Promise<void>}
    * @throws {Error} the lifecycle's close error
    * @throws {Error} original refresh failure or caller refusal; expiry never triggers recovery work
    */
-  async refreshMetadata(topics, { fence, guard } = {}) {
+  async refreshMetadata(
+    topics,
+    {
+      fence,
+      guard,
+      metadataScope = this.consumerMetadataScope,
+      isCurrent = () => true,
+      allowAutoTopicCreation,
+      onMetadata,
+    } = {}
+  ) {
     const check = () => {
       const error = guard?.()
       if (error) throw error
     }
+    if (!isCurrent()) return
+    const modeGeneration = this.consumerMetadataGeneration ?? 0
+    const ticket = metadataScope?.captureMetadata()
+    const applicable = () =>
+      (this.consumerMetadataGeneration ?? 0) === modeGeneration &&
+      isCurrent() &&
+      (!ticket || ticket.isCurrent())
+    if (metadataScope?.hasPatterns()) {
+      topics = []
+      allowAutoTopicCreation = false
+    }
     const accept = this.captureTopics?.(topics || [])
+    const requestOptions = {
+      ...guardArgs(fence)[0],
+      ...(guard && { guard }),
+      ...(allowAutoTopicCreation !== undefined && { allowAutoTopicCreation }),
+    }
+    const requestArgs = Object.keys(requestOptions).length ? [requestOptions] : []
     try {
       await this.retryFor(fence)(async (bail, retryCount, retryTime) => {
+        if (!applicable()) return
         let broker
         try {
           check()
@@ -658,28 +694,23 @@ module.exports = class BrokerPool {
         // both of `Cluster`'s shared-promise guards) swaps `this.seedBroker` for a fresh instance
         // partway through, and re-reading it after the `await` below would mix the two seeds'
         // state within one attempt.
+        if (!applicable()) return
         const seedBroker = this.seedBroker
         const { host: seedHost, port: seedPort } = seedBroker ? seedBroker.connectionPool : {}
 
         try {
+          const response = await broker.metadata(topics, ...requestArgs)
+          fence?.check()
+          check()
+          if (!applicable()) return
           if (accept) {
-            const response = await broker.metadata(topics, ...guardArgs(fence))
-            fence?.check()
             const incoming = response.topicMetadata.filter(({ topic }) => accept(topic))
             const replaced = new Set(incoming.map(({ topic }) => topic))
             const retained = (this.metadata?.topicMetadata || []).filter(
               ({ topic }) => !replaced.has(topic)
             )
             this.metadata = { ...response, topicMetadata: [...retained, ...incoming] }
-          } else if (fence) {
-            const response = await broker.metadata(topics, ...guardArgs(fence))
-            fence.check()
-            this.metadata = response
           } else {
-            const response = await (guard
-              ? broker.metadata(topics, { guard })
-              : broker.metadata(topics))
-            check()
             this.metadata = response
           }
           // Captured synchronously, in the same statement-tick as the assignment above and
@@ -693,12 +724,21 @@ module.exports = class BrokerPool {
           const metadata = this.metadata
           const publication = ++this.metadataPublications
           const isLatest = () =>
-            this.metadataPublications === publication && !fence?.closed && !guard?.()
+            applicable() &&
+            this.metadataPublications === publication &&
+            !fence?.closed &&
+            !guard?.()
           // Applied here, on the statement after the assignment and before any await, so no
           // reader can observe the fresh response with the monotonic leader guard not yet
           // applied. An empty topic list is encoded as the null array, which asks for every topic
           // in the cluster - the cache prunes what such a response does not carry.
-          this.metadataCache.update(metadata, { full: !accept && (!topics || topics.length === 0) })
+          this.metadataCache.update(metadata, {
+            full: !accept && (!topics || topics.length === 0),
+            isCurrent: applicable,
+          })
+          if (!isLatest()) return
+          onMetadata?.(metadata)
+          if (!isLatest()) return
           this.metadataExpireAt = Date.now() + this.metadataMaxAge
 
           const previousBrokers = { ...this.brokers }
@@ -756,9 +796,11 @@ module.exports = class BrokerPool {
         } catch (e) {
           fence?.check()
           if (guard?.()) return bail(e)
+          if (!applicable()) return
           if (
             e.type === 'LEADER_NOT_AVAILABLE' ||
-            (broker.allowAutoTopicCreation && e.type === 'UNKNOWN_TOPIC_OR_PARTITION')
+            ((allowAutoTopicCreation ?? broker.allowAutoTopicCreation) &&
+              e.type === 'UNKNOWN_TOPIC_OR_PARTITION')
           ) {
             throw e
           }
@@ -767,9 +809,10 @@ module.exports = class BrokerPool {
         }
       })
 
-      this.onMetadataSuccess()
+      if (applicable()) this.onMetadataSuccess()
     } catch (e) {
       if (guard?.()) throw e
+      if (!applicable()) return
       if (!fence?.closed) await this.onMetadataFailure(e, { fence })
       throw e
     }
@@ -782,9 +825,10 @@ module.exports = class BrokerPool {
    */
   forgetTopic(topic) {
     if (this.metadata) {
-      this.metadata.topicMetadata = this.metadata.topicMetadata.filter(
-        (entry) => entry.topic !== topic
-      )
+      this.metadata = {
+        ...this.metadata,
+        topicMetadata: this.metadata.topicMetadata.filter((entry) => entry.topic !== topic),
+      }
     }
   }
 
@@ -868,7 +912,9 @@ module.exports = class BrokerPool {
    * @param {import('../producer/generation')} [options.fence] see `refreshMetadata`
    * @returns {Promise<null>}
    */
-  async refreshMetadataIfNecessary(topics, { fence } = {}) {
+  async refreshMetadataIfNecessary(topics, options = {}) {
+    const metadataScope = options.metadataScope ?? this.consumerMetadataScope
+    if (metadataScope?.hasPatterns()) topics = []
     const shouldRefresh =
       this.metadata == null ||
       this.metadataExpireAt == null ||
@@ -878,7 +924,10 @@ module.exports = class BrokerPool {
       )
 
     if (shouldRefresh) {
-      return fence ? this.refreshMetadata(topics, { fence }) : this.refreshMetadata(topics)
+      const context = metadataScope ? { ...options, metadataScope } : options
+      return Object.keys(context).length
+        ? this.refreshMetadata(topics, context)
+        : this.refreshMetadata(topics)
     }
   }
 

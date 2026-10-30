@@ -35,6 +35,8 @@ Versions before 3.0.0 are internal alpha tags and are not published.
 
 - The partition-halt error log reads `Halted a partition; seek it to resume`, for every halt reason.
 
+- **A `RegExp` subscription is re-evaluated at every metadata refresh**: topics created later that match join, topics deleted leave, internal topics (`__consumer_offsets`, …) are no longer matched by `/.*/`, and a `g` or `y` flag no longer drops matching topics. **A consumer that subscribes a pattern refreshes metadata for all topics** (as the Java client does); a literal topic subscribed beside a pattern is not auto-created by that consumer. A post-initial addition without a usable topic ID waits for metadata to establish its incarnation before Fetch or OffsetFetch
+
 #### Fixes
 
 - Fence unknown-target metadata responses before cache installation and keep periodic naming attempts after the fast discovery budget.
@@ -72,6 +74,8 @@ Versions before 3.0.0 are internal alpha tags and are not published.
 - Add independent leave/default, consumer fault and transient-state capture checks; assert both group protocols in the broker-bounce rebalance oracle.
 
 - `test:e2e:rack-aware` checks range rack alignment against an independent Java vector, the node of the next Fetch after a preferred-read-replica answer, and no-op rack controls from the socket's own frames.
+
+- Add isolated regex discovery and retirement checks and a subscription-evaluation benchmark with exact work controls.
 
 ### Phase 9B — Producer parity: delivery deadline, memory bound, request size, partitioner, codecs, lifecycle
 
@@ -410,7 +414,7 @@ Adopted upstream PRs are credited here by number as they land (Phase 2 onward).
 
 - **Poll-overrun detection is less immediate under `groupProtocol: 'consumer'`.** The deadline is still `maxPollInterval` and an overrun still costs the member its partitions, but the expiry is noticed on a heartbeat tick and never while a reconciliation is in flight, so detection can lag the deadline by up to one server-driven heartbeat interval rather than the `heartbeatInterval` you configured.
 
-- **A regex subscription's resolved topic set only grows.** Under `subscribe({ regex })` the names the pattern has resolved to are kept for the life of the membership: a topic the pattern stops matching stays in the subscription until the consumer rebuilds its membership. It is bounded by the number of distinct topics the pattern ever matched.
+- **A broker-regex subscription's resolved names follow its applied target.** Under `subscribe({ regex })` a name the coordinator no longer assigns is retired after the target applies, unless a literal retains it. It no longer accumulates for the life of the membership. Final handlers, eligible commits and revoke work still see the old applied state.
 
 - **`admin.describeGroups` and `consumer.describeGroup()` now negotiate `DescribeGroups` up to v6, and a group that does not exist is reported differently.** Against a 4.x broker the request used to be capped at v2, where a missing group came back as a row in state `Dead` with `errorCode: 0`. At v6 the broker answers `GROUP_ID_NOT_FOUND` (69) with a message. The row keeps the shape it has always had — `state: 'Dead'`, `members: []`, `protocol: ''`, `protocolType: ''` — and now also carries `errorCode: 69` and the broker's `errorMessage`: the call still resolves, is not retried (69 is not a retriable error), and still returns one row per requested group id. Code that tested `state === 'Dead'` keeps working; code that treats `errorCode: 0` as "the group exists", or that compares a whole row for deep equality, needs updating. Every other group-level error still fails the call and is still retried exactly as before. Rows also gain `errorMessage` and `authorizedOperations`, and members gain `groupInstanceId` (static membership).
 

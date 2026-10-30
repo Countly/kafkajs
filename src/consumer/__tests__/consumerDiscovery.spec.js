@@ -1,4 +1,5 @@
 const Protocol = require('../groupProtocol/consumer')
+const Subscription = require('../subscription')
 const Cluster = require('../../cluster')
 const MetadataCache = require('../../cluster/metadataCache')
 const Emitter = require('../../instrumentation/emitter')
@@ -158,6 +159,45 @@ describe('Consumer > target discovery', () => {
       expect([...h.p.unresolvedTopicIds]).toEqual([ID])
       expect(h.p.rebalanceCoordinator.requestRejoin).not.toHaveBeenCalled()
       expect(h.broker.metadata).toHaveBeenCalledTimes(1)
+    }
+  )
+  test.each(['bulk', 'per-id fallback'])(
+    'a retired metadata scope stops a held %s answer from any effect while a current twin resolves',
+    async (route) => {
+      const held = gate()
+      const h = build(async () => metadata())
+      h.p.subscription = new Subscription()
+      h.p.unresolvedTopicIds.add(ID)
+      h.p.unresolvedTopicIds.add(OTHER)
+      if (route === 'bulk') {
+        h.broker.metadata.mockImplementationOnce(() => held.promise)
+      } else {
+        h.broker.metadata.mockRejectedValueOnce(new KafkaJSProtocolError(createErrorFromCode(100)))
+        h.broker.metadata.mockImplementationOnce(() => held.promise)
+      }
+      const started = h.p.refreshMetadataForTopicIds([ID, OTHER])
+      await settle()
+      const sent = h.broker.metadata.mock.calls.length
+      h.p.subscription.retireMetadata()
+      const before = JSON.stringify([...h.cache.topics])
+      held.resolve(metadata())
+      await started
+      await settle()
+      expect(h.update).not.toHaveBeenCalled()
+      expect(JSON.stringify([...h.cache.topics])).toBe(before)
+      expect(h.cluster.brokerPool.metadata).toBe(h.old)
+      expect(h.broker.metadata).toHaveBeenCalledTimes(sent)
+      expect(h.p.unresolvedAttempts.size).toBe(0)
+      expect(h.p.rebalanceCoordinator.requestRejoin).not.toHaveBeenCalled()
+
+      h.broker.metadata.mockResolvedValue(metadata())
+      h.p.unresolvedTopicIds.add(ID)
+      h.p.state = 'RECONCILING'
+      h.p.evaluateTarget({ targetChanged: false })
+      await settle()
+      expect(h.update).toHaveBeenCalledTimes(1)
+      expect(h.cache.topicName(ID)).toBe('named')
+      expect(h.p.rebalanceCoordinator.requestRejoin).toHaveBeenCalledTimes(1)
     }
   )
   it('keeps metadata effects retired after stale bulk and per-id replies', async () => {
