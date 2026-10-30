@@ -27,6 +27,7 @@ const WAIT_MS = 30000
 const CLEANUP_BUDGET_MS = 15000
 const PARTITIONS = 6
 const RECORDS_PER_PARTITION = 100
+const HEAD_PER_PARTITION = 50
 const HANDLER_PAUSE_MS = 10
 const SESSION_TIMEOUT_MS = 30000
 const REBALANCE_TIMEOUT_MS = 60000
@@ -134,8 +135,9 @@ class ListenerScenario {
   }
 
   /**
-   * Creates the topic through the case's own admin, records its UUID, produces the fixed corpus
-   * and keeps what the broker acknowledged as the corpus, apart from anything delivered.
+   * Creates the topic through the case's own admin, records its UUID and produces the head of the
+   * corpus; the tail follows once the second member owns partitions, so it always has records
+   * left to deliver without any handler blocking.
    * @returns {Promise<void>}
    */
   async prepare() {
@@ -172,25 +174,37 @@ class ListenerScenario {
     const spy = traceFetches({ topic, sink: this.fetches, tick: () => this.tick() })
     cleanup.add('fetch trace', () => spy.mockRestore())
 
+    await this.produce(0, HEAD_PER_PARTITION)
+  }
+
+  /**
+   * Produces records `from` to `to` (exclusive) of every partition and keeps what the broker
+   * acknowledged as the corpus. The first call also fixes each partition's starting offset.
+   * @param {number} from first record index of each partition
+   * @param {number} to one past the last record index of each partition
+   * @returns {Promise<void>}
+   */
+  async produce(from, to) {
+    const { scope, topic } = this
     for (let partition = 0; partition < PARTITIONS; partition++) {
-      const messages = Array.from({ length: RECORDS_PER_PARTITION }, (_, index) => ({
+      const messages = Array.from({ length: to - from }, (_, i) => ({
         partition,
-        key: JSON.stringify({ incarnation: this.incarnation, partition, index }),
-        value: `value-${partition}-${index}`,
+        key: JSON.stringify({ incarnation: this.incarnation, partition, index: from + i }),
+        value: `value-${partition}-${from + i}`,
       }))
       const [ack] = await step(scope, `The production to partition ${partition}`, () =>
         this.producer.send({ topic, messages, acks: -1 })
       )
-      for (let index = 0; index < RECORDS_PER_PARTITION; index++) {
+      messages.forEach(({ value }, i) => {
         this.produced.push({
           topic,
           incarnation: this.incarnation,
           partition,
-          offset: Number(ack.baseOffset) + index,
-          value: messages[index].value,
+          offset: Number(ack.baseOffset) + i,
+          value,
         })
-      }
-      this.externalMap.set(partition, Number(ack.baseOffset))
+      })
+      if (from === 0) this.externalMap.set(partition, Number(ack.baseOffset))
     }
   }
 
@@ -556,6 +570,20 @@ const armBody = (label, arm) => async (scope) => {
         state.stage = 'second member'
         const second = await scenario.startMember('second')
         await second.starting
+        await pollUntil(
+          scope,
+          WAIT_MS,
+          () =>
+            scenario.hooks.some(
+              (h) =>
+                h.member === 'second' &&
+                h.kind === 'assigned' &&
+                h.returnedOrdinal &&
+                h.partitions.length > 0
+            ),
+          { label: 'The second member assignment' }
+        )
+        await scenario.produce(HEAD_PER_PARTITION, RECORDS_PER_PARTITION)
         await pollUntil(
           scope,
           WAIT_MS,
