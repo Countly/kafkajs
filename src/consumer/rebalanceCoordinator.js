@@ -1,4 +1,6 @@
 const describeThrown = require('../network/describeThrown')
+const handlerContext = require('./handlerContext')
+const RebalanceHooks = require('./rebalanceHooks')
 const { KafkaJSNonRetriableError } = require('../errors')
 const {
   REBALANCE_PATHS,
@@ -284,6 +286,9 @@ module.exports = class RebalanceCoordinator {
       }
 
       const round = this.consumerGroup.beginRebalanceRound()
+      const group = this.consumerGroup
+      const hooks = group.rebalanceHooks
+      const additionHold = hooks ? Object.freeze({}) : null
       try {
         if (reason) {
           this.instrumentationEmitter.emit(REBALANCING, {
@@ -308,6 +313,8 @@ module.exports = class RebalanceCoordinator {
           this.emitPartitions(PARTITIONS_LOST, previous)
         }
 
+        if (hooks) await this.prepareListenerRound({ round, kind, previous, rebuildOffsets })
+
         // Java's onJoinPrepare: the same rounds stop advertising ownership before they join, so
         // the JoinGroup carries no `OwnedPartitions` and no peer withholds a partition for a
         // member that has already given it up.
@@ -318,12 +325,15 @@ module.exports = class RebalanceCoordinator {
 
         const roundStartedAt = Date.now()
         const result = await this.consumerGroup.joinAndSync(round)
-        const { revoked, added } = await round.wait(() =>
+        const applyResult = () =>
           this.consumerGroup.applyRebalanceResult(result, {
             rebuildOffsets,
             round,
+            ...(additionHold && { additionHold }),
           })
-        )
+        // A listener's apply awaits user callbacks that carry their own deadline and retirement,
+        // so their typed outcome is not raced against the round's wait.
+        const { revoked, added } = await (hooks ? applyResult() : round.wait(applyResult))
 
         // Java's onJoinComplete: the round decides what the two events carry, not the apply. A
         // cooperative round reports the apply's delta; an eager one reports both whole sets; a lost
@@ -342,6 +352,17 @@ module.exports = class RebalanceCoordinator {
 
         if (tookOn.length) {
           this.emitPartitions(PARTITIONS_ASSIGNED, tookOn)
+        }
+
+        if (hooks) {
+          await group.invokeHook(
+            round,
+            'onPartitionsAssigned',
+            tookOn,
+            group.hookIdentity(round, tookOn)
+          )
+          const stale = round.guard()
+          if (stale) throw stale
         }
 
         const payload = {
@@ -374,6 +395,11 @@ module.exports = class RebalanceCoordinator {
           this.heartbeatManager.ensureStarted()
         }
 
+        // An ordinary callback failure finishes the live transitions above and then ends the chain,
+        // unchanged, before fetch admission restarts.
+        const listenerFailure = hooks && group.takeListenerFailure(round)
+        if (listenerFailure) throw listenerFailure
+
         // `kind` here is the ROUND kind, only 'lost' | 'revoked'. The MEMBERSHIP kind is a separate
         // variable: testing the round kind against 'classic' would be permanently false and would
         // delete the shipped classic cooperative follow-up below. Defaulted, because a group object
@@ -398,9 +424,62 @@ module.exports = class RebalanceCoordinator {
           await this.yieldBetweenRounds()
         }
       } finally {
+        if (hooks) this.finishListenerRound(round, additionHold)
         round.retire()
       }
     } while (reason)
+  }
+
+  /**
+   * The listener-only half of a round before it joins. A lost round dispatches the lost callback
+   * (the revoked one when absent) without waiting for any handler and only then quiesces for the
+   * rebuild. An eager round stops admission, quiesces under the round's budget, attempts the final
+   * commit and calls revoked with the whole previous assignment, including an empty one; a loss
+   * learned while doing so calls lost instead. A cooperative round does its revoke inside the apply.
+   * @private
+   * @param {object} options
+   * @param {object} options.round the captured round
+   * @param {'lost'|'revoked'|'initial'} options.kind the round kind
+   * @param {Array<import('./groupProtocol/interface').TopicPartitions>} options.previous the assignment held before the round
+   * @param {boolean} options.rebuildOffsets whether the round gives up everything
+   * @returns {Promise<void>}
+   * @throws {Error} typed quiescence expiry, the round's refusal or a non-ordinary callback failure
+   */
+  async prepareListenerRound({ round, kind, previous, rebuildOffsets }) {
+    const group = this.consumerGroup
+    const call = (name) =>
+      group.invokeHook(round, name, previous, group.hookIdentity(round, previous))
+    const quiesce = () =>
+      this.runner.quiesceRun({
+        deadlineAt: round.roundDeadlineAt,
+        identity: { round, membership: group.ownership.token() },
+      })
+
+    if (kind === 'lost') {
+      if (previous.length) await call('onPartitionsLost')
+      await quiesce()
+    } else if (rebuildOffsets) {
+      let lost = false
+      if (kind !== 'initial') lost = await this.runner.prepareEagerRound(round)
+      if (lost) {
+        if (previous.length) await call('onPartitionsLost')
+      } else {
+        await call('onPartitionsRevoked')
+      }
+    }
+  }
+
+  /**
+   * Releases only this round's own hold and admission stop, and wakes the captured run when that
+   * made work runnable.
+   * @private
+   * @param {object} round the captured round
+   * @param {object} additionHold the round's token for added partitions
+   * @returns {void}
+   */
+  finishListenerRound(round, additionHold) {
+    this.runner.releaseEagerRound?.()
+    this.consumerGroup.releaseHold(round, additionHold)
   }
 
   /**
@@ -487,20 +566,35 @@ module.exports = class RebalanceCoordinator {
 
     // Cooperative revocation: nothing stops the fetch manager, so nothing would ever settle
     // `start()` - the round has to be driven from here, in the background.
-    this.runRound(verdict.reason, verdict.kind).catch(async (error) => {
-      try {
-        // `onCrash` owns the CRASH event; if it throws there is nothing left to notify with, and
-        // this chain is nobody's `await`, so the rejection would be unobserved.
-        await this.runner.onCrash(error)
-      } catch (crashHandlerError) {
-        this.logger.error('Crash handler failed', {
-          groupId: this.groupId,
-          memberId: this.consumerGroup.memberId,
-          error: crashHandlerError.message || crashHandlerError,
-          cause: error.message || error,
-        })
-      }
-    })
+    // Created outside any handler or callback store, with its catch inside it: the internal chain
+    // and its observers must not inherit the triggering callback's authority.
+    this.runInternal(() =>
+      this.runRound(verdict.reason, verdict.kind).catch(async (error) => {
+        try {
+          // `onCrash` owns the CRASH event; if it throws there is nothing left to notify with, and
+          // this chain is nobody's `await`, so the rejection would be unobserved.
+          await this.runner.onCrash(error)
+        } catch (crashHandlerError) {
+          this.logger.error('Crash handler failed', {
+            groupId: this.groupId,
+            memberId: this.consumerGroup.memberId,
+            error: crashHandlerError.message || crashHandlerError,
+            cause: error.message || error,
+          })
+        }
+      })
+    )
+  }
+
+  /**
+   * Starts internal work outside every handler and callback store, so it and the observers it
+   * reaches never inherit the authority of the call that triggered it.
+   * @private
+   * @param {() => unknown} work internal work, including its failure sink
+   * @returns {unknown} the exact result of `work`
+   */
+  runInternal(work) {
+    return handlerContext.run(null, () => RebalanceHooks.outside(work))
   }
 
   /**

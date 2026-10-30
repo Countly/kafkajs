@@ -147,6 +147,7 @@ describe('Benchmarks > consumeThroughput', () => {
   describe('the flags', () => {
     test.each([
       [['--control', '2'], '--control must be 0 or 1, got 2'],
+      [['--listener', '2'], '--listener must be 0 or 1, got 2'],
       [['--otel', '3'], '--otel must be 0 or 1, got 3'],
       [['--intern-offsets', 'x'], '--intern-offsets must be 0 or 1, got NaN'],
       [
@@ -404,19 +405,28 @@ describe('Benchmarks > consumeThroughput', () => {
 
 const {
   DeliveryAccounting,
+  ListenerAccounting,
   verifyAccounting,
   accountingControl,
   consumeOnce,
 } = require('../consumeThroughput')
 
-/** @param {number[]} sizes records per batch @param {object} [options] teardown controls @returns {object} a public-API-shaped finite source */
-const countedSource = (sizes, { teardownTicks = 0n, failRun = false, failStop = false } = {}) => {
+/** @param {number[]} sizes records per batch @param {object} [options] teardown and listener controls @returns {object} a public-API-shaped finite source */
+const countedSource = (
+  sizes,
+  { teardownTicks = 0n, failRun = false, failStop = false, omit = [] } = {}
+) => {
   let clock = 0n
+  const topics = [{ topic: 't', partitions: [0] }]
+  let listener
   const consumer = {
     connect: jest.fn(async () => {}),
     subscribe: jest.fn(async () => {}),
     run: jest.fn(async (options) => {
       if (failRun) throw new Error('run failed')
+      listener = options.rebalanceListener
+      if (!omit.includes('startupRevoked')) await listener?.onPartitionsRevoked({ partitions: [] })
+      if (!omit.includes('assigned')) await listener?.onPartitionsAssigned({ partitions: topics })
       let offset = 0
       for (const size of sizes) {
         const messages = Array.from({ length: size }, () => ({
@@ -435,6 +445,8 @@ const countedSource = (sizes, { teardownTicks = 0n, failRun = false, failStop = 
     stop: jest.fn(async () => {
       clock += teardownTicks
       if (failStop) throw new Error('stop failed')
+      if (!omit.includes('teardownRevoked'))
+        await listener?.onPartitionsRevoked({ partitions: topics })
     }),
     disconnect: jest.fn(async () => {}),
   }
@@ -597,6 +609,83 @@ describe('Benchmarks > counted consume controls', () => {
           now: source.now,
         })
       ).rejects.toThrow(options.failRun ? 'run failed' : 'stop failed')
+      expect(source.consumer.disconnect).toHaveBeenCalledTimes(1)
+    }
+  )
+})
+
+describe('Benchmarks > listener controls', () => {
+  const run = (source, handler = 'eachBatch', listener = true) =>
+    consumeOnce(source.kafka, 1, undefined, {
+      handler,
+      messages: 12,
+      size: 2,
+      timeout: 50,
+      now: source.now,
+      listener,
+    })
+
+  test('initial assignment is required by the listener control', async () => {
+    await expect(run(countedSource([12], { omit: ['assigned'] }))).rejects.toThrow(
+      'Listener control requires initial assigned and graceful teardown revoked once'
+    )
+    await expect(run(countedSource([12]))).resolves.toMatchObject({ deliveredMessages: 12 })
+  })
+
+  test('graceful teardown revoke is required independently of eager startup revoke', async () => {
+    const source = countedSource([12], { omit: ['teardownRevoked'] })
+    await expect(run(source)).rejects.toThrow(
+      'Listener control requires initial assigned and graceful teardown revoked once'
+    )
+    // the eager startup revoke callback ran, and did not stand in for the teardown one
+    expect(source.consumer.run.mock.calls[0][0].rebalanceListener.onPartitionsRevoked).toEqual(
+      expect.any(Function)
+    )
+  })
+
+  test.each(['eachBatch', 'eachMessage'])(
+    '%s listener controls preserve message and batch accounting',
+    async (handler) => {
+      const grouped = await run(countedSource([4, 4, 4]), handler)
+      const other = await run(countedSource([3, 3, 3, 3]), handler)
+      expect(grouped.deliveredMessages).toBe(12)
+      expect(other.deliveredMessages).toBe(12)
+      expect(grouped.handlerEntries).toBe(handler === 'eachBatch' ? 3 : 12)
+      expect(other.handlerEntries).toBe(handler === 'eachBatch' ? 4 : 12)
+      expect(grouped.gapSamples).toBe(handler === 'eachBatch' ? 2 : 11)
+      expect(other.gapSamples).toBe(handler === 'eachBatch' ? 3 : 11)
+    }
+  )
+
+  test('teardown is outside the listener throughput interval', async () => {
+    const fast = await run(countedSource([3, 3, 3, 3]))
+    const slow = await run(countedSource([3, 3, 3, 3], { teardownTicks: 1000000000000n }))
+    expect(slow).toEqual(fast)
+  })
+
+  test('the counter ignores a startup revoke, a teardown assignment and a duplicate teardown revoke', () => {
+    const counter = new ListenerAccounting()
+    counter.onRevoked()
+    counter.onAssigned()
+    counter.beginTeardown()
+    counter.onAssigned()
+    counter.onRevoked()
+    expect(() => counter.verify()).not.toThrow()
+    counter.onRevoked()
+    expect(() => counter.verify()).toThrow('Listener control requires')
+  })
+
+  test('a run without the listener flag registers no callbacks and verifies nothing', async () => {
+    const source = countedSource([12])
+    await run(source, 'eachBatch', false)
+    expect(source.consumer.run.mock.calls[0][0].rebalanceListener).toBeUndefined()
+  })
+
+  test.each([{ failRun: true }, { failStop: true }])(
+    'listener addition keeps cleanup and error identity after %j',
+    async (options) => {
+      const source = countedSource([12], options)
+      await expect(run(source)).rejects.toThrow(options.failRun ? 'run failed' : 'stop failed')
       expect(source.consumer.disconnect).toHaveBeenCalledTimes(1)
     }
   )

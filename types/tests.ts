@@ -1440,3 +1440,36 @@ kafka.consumer({ groupId: 'custom-rack-range', partitionAssigners: [rackFactory]
     invalidPosition,
   ]
 }
+
+import {
+  ConsumerRebalanceListener as AwaitedListener,
+  KafkaJSRebalanceListenerError as ListenerFailure,
+} from './index'
+{
+  const hookConsumer = new Kafka({ brokers: ['localhost:1'] }).consumer({ groupId: 'hooks' })
+  const listener: AwaitedListener = {
+    onPartitionsAssigned: async (payload) => {
+      const member: string | null = payload.memberId
+      const generation: number | null = payload.generationId
+      void member
+      void generation
+      void payload.partitions
+    },
+  }
+  void hookConsumer.run({ rebalanceListener: listener })
+  void hookConsumer.enforceRebalance('external offsets changed')
+  const error = new ListenerFailure('callback', {
+    hook: 'onPartitionsAssigned',
+    reason: 'threw',
+    cause: new Error(),
+    thrownValue: Symbol('store'),
+  })
+  const cause: Error = error.cause
+  const original: unknown = error.thrownValue
+  void cause
+  void original
+  // @ts-expect-error callback must be a function
+  hookConsumer.run({ rebalanceListener: { onPartitionsLost: 1 } })
+  // @ts-expect-error reason must be a string
+  hookConsumer.enforceRebalance(5)
+}

@@ -407,6 +407,20 @@ describe('documented live scenario scripts', () => {
         'acceptance runs use the reviewed guarded live entry',
       ],
     },
+    {
+      script: 'test:e2e:rebalance-listener',
+      flag: 'REBALANCE_LISTENER_E2E',
+      spec: 'src/consumer/__tests__/rebalanceListenerLive.spec.js',
+      compose: null,
+      budgetsMs: [90000],
+      wording: [
+        'six partitions',
+        '600 records',
+        '90000 ms',
+        'rebalance-listener.jsonl',
+        'before first delivery',
+      ],
+    },
   ]
 
   it.each(scenarios)('$script is one two-worker spec run through test:kafka', (row) => {

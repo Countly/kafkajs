@@ -15,15 +15,18 @@ const SubscriptionState = require('./subscriptionState')
 const Subscription = require('./subscription')
 const IdleWait = require('./idleWait')
 const LeaderUnionWatch = require('./leaderUnionWatch')
-const { FetchPreparation, fencedDelay } = require('./fetchPreparation')
+const { FetchPreparation, InvocationPreparation, fencedDelay } = require('./fetchPreparation')
 const PositionValidator = require('./positionValidator')
 const Outage = require('./outage')
+const RebalanceHooks = require('./rebalanceHooks')
 const {
   events: { CONNECT, RECEIVED_UNSUBSCRIBED_TOPICS, LOG_TRUNCATION, PARTITION_HALTED },
 } = require('./instrumentationEvents')
 const {
   KafkaJSError,
+  KafkaJSCommitFailedError,
   KafkaJSNonRetriableError,
+  KafkaJSRebalanceListenerError,
   KafkaJSStaleTopicMetadataAssignment,
   KafkaJSNoOffsetError,
   isRebalancing,
@@ -189,6 +192,8 @@ module.exports = class ConsumerGroup {
    *                                joins a group, heartbeats or polls for membership.
    * @param {Record<string, Record<number, string>>} [options.privateOffsets] the committed-offset
    *                                cache of a consumer without a group, passed to every manager.
+   * @param {object|null} [options.rebalanceListener] the run's validated private callback table;
+   *   absent for a run without a listener, which keeps every existing path
    */
   constructor({
     retry,
@@ -228,6 +233,7 @@ module.exports = class ConsumerGroup {
     runIdentity = null,
     manual = null,
     privateOffsets = undefined,
+    rebalanceListener = null,
   }) {
     /** @type {import("../../types").Cluster} */
     this.cluster = cluster
@@ -259,6 +265,18 @@ module.exports = class ConsumerGroup {
       isStale: (cause) =>
         isStaleMembershipVerdict({ kind: 'lost', error: cause }, this.kind, this.generationId),
     })
+    /** @type {import('./rebalanceHooks')|null} awaited callbacks of this run, null without a listener */
+    this.rebalanceHooks = rebalanceListener
+      ? new RebalanceHooks(rebalanceListener, {
+          isCurrent: ({ round }) => !round.guard(),
+          onExpire: (error, { membership, round }) => {
+            this.ownership.lose(error, membership)
+            round.retire(error)
+          },
+        })
+      : null
+    /** @type {WeakMap<object, Error>} the first ordinary callback failure of each round */
+    this.listenerFailures = new WeakMap()
     this.acquired = new Map()
     this.acquireClock = 0
     /**
@@ -626,6 +644,7 @@ module.exports = class ConsumerGroup {
 
   /** Creates fresh run-owned idle state after the previous run was retired. @returns {void} */
   startIdleWait() {
+    this.rebalanceHooks?.retire({ run: this.idleWait }, consumerStoppingError())
     this.roundContext?.retire(consumerStoppingError())
     this.leaderUnionWatch?.clear()
     this.idleWait.dispose()
@@ -641,6 +660,7 @@ module.exports = class ConsumerGroup {
    * @returns {void}
    */
   onStopRequested() {
+    this.rebalanceHooks?.retire({ run: this.idleWait }, consumerStoppingError())
     this.roundContext?.retire(consumerStoppingError())
     this.leaderUnionWatch?.clear()
     this.idleWait.dispose()
@@ -841,11 +861,14 @@ module.exports = class ConsumerGroup {
    * Pause state survives either way: `subscriptionState.update()` replaces the assignment only.
    *
    * @param {{ assignment: Object, userData?: Buffer|null }} result the decoded sync result
-   * @param {{ rebuildOffsets?: boolean, round?: object }} [options] `rebuildOffsets: false` selects the
-   *   incremental apply; it still builds the first manager, because there is nothing to keep
+   * @param {{ rebuildOffsets?: boolean, round?: object, additionHold?: object }} [options]
+   *   `rebuildOffsets: false` selects the incremental apply; it still builds the first manager,
+   *   because there is nothing to keep. `additionHold` is the round's token for the partitions this
+   *   apply adds: they are held before they are published and the caller releases the token once
+   *   its assigned callback has returned.
    * @returns {Promise<import('./groupProtocol/interface').RebalanceResult>}
    */
-  async applyRebalanceResult(result, { rebuildOffsets = true, round } = {}) {
+  async applyRebalanceResult(result, { rebuildOffsets = true, round, additionHold } = {}) {
     const check = () => {
       const membershipError =
         this.kind === 'consumer' &&
@@ -934,7 +957,8 @@ module.exports = class ConsumerGroup {
     // Before anything prunes them, and before `updateAssignment` replaces the membership the
     // offset manager commits under.
     if (!rebuildOffsets && revoked.length) {
-      await this.commitBeforeRelease(revoked, { round })
+      if (this.rebalanceHooks) await this.releaseRevoked(revoked, round)
+      else await this.commitBeforeRelease(revoked, { round })
       check()
     }
 
@@ -1041,6 +1065,9 @@ module.exports = class ConsumerGroup {
         }
       }
     }
+    if (additionHold) {
+      this.subscriptionState.hold(rebuildOffsets ? currentMemberAssignment : added, additionHold)
+    }
     this.subscriptionState.update(currentMemberAssignment)
 
     // A copy: the assignment reaches third-party assigners here, and one that sorts or splices
@@ -1086,6 +1113,160 @@ module.exports = class ConsumerGroup {
       round: { guard, retire: () => {}, fence: run.fence },
     })
     refuse()
+  }
+
+  /**
+   * The payload every awaited callback receives: the event schema, copied at the stage it is built.
+   * @param {Array<import('./groupProtocol/interface').TopicPartitions>} partitions the callback's set
+   * @returns {{ groupId: string, memberId: string|null, generationId: number|null, partitions: Array }}
+   */
+  hookPayload(partitions) {
+    return {
+      groupId: this.groupId,
+      memberId: this.memberId,
+      generationId: this.generationId,
+      partitions: partitions.map(({ topic, partitions }) => ({
+        topic,
+        partitions: [...partitions],
+      })),
+    }
+  }
+
+  /**
+   * The immutable identity one callback invocation carries: the run and round, the membership
+   * token as it is now (a lost one stays lost) and a copy of each named partition's acquisition.
+   * @param {object} round the captured round
+   * @param {Array<import('./groupProtocol/interface').TopicPartitions>} partitions the callback's set
+   * @returns {{ run: object, round: object, membership: number, acquisitions: object[] }}
+   */
+  hookIdentity(round, partitions) {
+    const acquisitions = []
+    for (const { topic, partitions: ids } of partitions) {
+      for (const partition of ids) {
+        acquisitions.push({
+          topic,
+          partition,
+          assignmentEpoch: this.assignmentEpoch,
+          acquiredAt: this.acquired.get(`${topic}|${partition}`)?.acquiredAt ?? null,
+          topicId: this.cluster.topicId?.(topic),
+        })
+      }
+    }
+    return { run: round.run, round, membership: this.ownership.token(), acquisitions }
+  }
+
+  /**
+   * Compares the partitions a commit names with the original cells of the callback invocation that
+   * issues it. A named partition the invocation holds a cell for must still have the same
+   * assignment, acquisition and topic incarnation; one it holds no cell for keeps the ordinary
+   * explicit-offset rules.
+   * @param {object} context the invocation's frozen context
+   * @param {Array<{topic: string, partitions: Array<{partition: number}>}>} topics the commit's named partitions
+   * @returns {KafkaJSCommitFailedError|null} a refusal that writes nothing, or null
+   */
+  hookCommitRefusal({ acquisitions }, topics = []) {
+    for (const { topic, partitions } of topics) {
+      for (const { partition } of partitions) {
+        const cell = acquisitions.find((one) => one.topic === topic && one.partition === partition)
+        if (
+          cell &&
+          (cell.assignmentEpoch !== this.assignmentEpoch ||
+            cell.acquiredAt !== (this.acquired.get(`${topic}|${partition}`)?.acquiredAt ?? null) ||
+            cell.topicId !== this.cluster.topicId?.(topic))
+        ) {
+          return new KafkaJSCommitFailedError(
+            "The callback's acquisition of the partition changed before the commit",
+            { reason: 'stale-assignment' }
+          )
+        }
+      }
+    }
+    return null
+  }
+
+  /**
+   * Calls one awaited callback within the round's remaining budget. An ordinary throw is recorded
+   * as the round's first listener failure and the round carries on; a retired or expired round
+   * rethrows the round's own reason, so a stop stays a stop and a timeout stays typed.
+   * @param {object} round the captured round
+   * @param {'onPartitionsRevoked'|'onPartitionsAssigned'|'onPartitionsLost'} name the callback
+   * @param {Array<import('./groupProtocol/interface').TopicPartitions>} partitions the callback's set
+   * @param {object} identity the invocation identity from `hookIdentity`
+   * @returns {Promise<void>} resolves without a listener, or once the callback has settled
+   * @throws {Error} the round's refusal, or a non-ordinary callback failure
+   */
+  async invokeHook(round, name, partitions, identity) {
+    if (!this.rebalanceHooks?.has(name)) return
+    try {
+      await this.rebalanceHooks.invoke(name, this.hookPayload(partitions), {
+        deadlineAt: round.roundDeadlineAt,
+        identity,
+      })
+    } catch (error) {
+      const refusal = round.guard()
+      if (refusal) throw refusal
+      if (!(error instanceof KafkaJSRebalanceListenerError) || error.reason !== 'threw') throw error
+      if (!this.listenerFailures.has(round)) this.listenerFailures.set(round, error)
+    }
+  }
+
+  /**
+   * @param {object} round the captured round
+   * @returns {Error|undefined} the first ordinary callback failure of this round, cleared
+   */
+  takeListenerFailure(round) {
+    const failure = this.listenerFailures.get(round)
+    this.listenerFailures.delete(round)
+    return failure
+  }
+
+  /**
+   * A listener round's revoke half of a cooperative or consumer-protocol apply: new admission to the
+   * revoked partitions stops, only their running handlers are awaited (when a revoked callback
+   * exists), the eligible final commit runs, then the revoked callback. The hold is this call's own
+   * token and is released here, immediately before the caller narrows ownership.
+   * @private
+   * @param {Array<import('./groupProtocol/interface').TopicPartitions>} revoked the revoked delta
+   * @param {object} round the captured round
+   * @returns {Promise<void>}
+   * @throws {Error} typed quiescence expiry, the round's refusal or a non-ordinary failure
+   */
+  async releaseRevoked(revoked, round) {
+    const state = this.subscriptionState
+    const hold = Object.freeze({})
+    const identity = this.hookIdentity(round, revoked)
+    state.hold(revoked, hold)
+    try {
+      if (this.rebalanceHooks.has('onPartitionsRevoked')) {
+        await this.rebalanceCoordinator.runner.waitForPartitions(revoked, {
+          deadlineAt: round.roundDeadlineAt,
+          identity,
+        })
+      }
+      await this.commitBeforeRelease(revoked, { round })
+      await this.invokeHook(round, 'onPartitionsRevoked', revoked, identity)
+      const refusal = round.guard()
+      if (refusal) throw refusal
+    } finally {
+      this.releaseHold(round, hold)
+    }
+  }
+
+  /**
+   * Releases one hold token and wakes the captured run, never a replacement, when the release made
+   * work runnable.
+   * @param {object} round the captured round the token belongs to
+   * @param {object} hold the exact token
+   * @returns {void}
+   */
+  releaseHold(round, hold) {
+    if (
+      this.subscriptionState.release(hold) &&
+      this.idleWait === round.run &&
+      !round.run.disposed
+    ) {
+      round.run.wake()
+    }
   }
 
   /**
@@ -2743,6 +2924,10 @@ module.exports = class ConsumerGroup {
   /**
    * Resolves pending seek/reset work through the ordinary resolver, then reads the latest position.
    * A seek changes position without changing acquisition; revoke/reacquire and rebuild retire it.
+   * A rebalance callback may read while a stop is under way, so a close-time revoked callback sees
+   * the quiescent position. A read from a callback carries that invocation's guard and fence through
+   * seek, resolution and the answer, so a callback that settled, expired or was retired meanwhile
+   * publishes nothing and gets its refusal; a lost caller's read is refused too.
    * @param {{topic: string, partition: number}} entry validated public partition
    * @returns {Promise<string>} current nonnegative decimal next position, including sparse offsets
    * @throws {Error} on ownership retirement, reset refusal or unresolved bounded resolution
@@ -2756,19 +2941,35 @@ module.exports = class ConsumerGroup {
     const epoch = this.assignmentEpoch
     const token = this.ownership.token()
     const topicId = this.cluster.topicId(topic)
+    const invocation = RebalanceHooks.current()
     const current = () =>
       acquiredAt !== undefined &&
       manager &&
-      !this.isStopping() &&
+      (invocation !== undefined || !this.isStopping()) &&
       this.offsetManager === manager &&
       this.assignmentEpoch === epoch &&
       this.acquired.get(key)?.acquiredAt === acquiredAt &&
       this.cluster.topicId(topic) === topicId &&
       !this.ownership.refusal(token)
-    if (!current()) throw consumerStoppingError()
+    const refusal = () =>
+      RebalanceHooks.refusal(invocation) || (current() ? null : consumerStoppingError())
+    const preparation = invocation
+      ? new InvocationPreparation({
+          manager,
+          fence: RebalanceHooks.fence(invocation),
+          ownershipToken: token,
+          assignmentEpoch: epoch,
+          guard: refusal,
+        })
+      : undefined
+    const check = () => {
+      const error = refusal()
+      if (error) throw error
+    }
+    check()
     for (let pass = 0; pass < MAX_RESOLUTION_PASSES; pass++) {
-      await this.seekOffsets([{ topic, partitions: [partition] }])
-      if (!current()) throw consumerStoppingError()
+      await this.seekOffsets([{ topic, partitions: [partition] }], preparation)
+      check()
       const halted = this.haltedPartitions.get(key)
       if (halted && ['no-offset', 'offset-out-of-range'].includes(halted.reason)) throw halted.error
       if (this.hasSeekOffset({ topic, partition })) continue

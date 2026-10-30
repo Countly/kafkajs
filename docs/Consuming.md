@@ -490,6 +490,24 @@ Subscription and manual assignment are exclusive until `await consumer.unsubscri
 
 `await consumer.committed([{ topic, partition }])` reads stable committed offsets from the broker for this group, including unassigned partitions. It returns `{ topic, partition, offset, metadata }` rows; offset is a decimal string or null when no offset was committed, and metadata is a string or null. An empty array returns an empty array without a request. This observation is independent of local position and does not move it. OffsetFetch v8/v9 responses naming another group are refused with `KafkaJSInvariantViolation` naming the requested and returned groups.
 
+## <a name="rebalance-listeners"></a> Awaited rebalance listeners
+
+Pass optional `onPartitionsRevoked`, `onPartitionsAssigned` and `onPartitionsLost` functions in `consumer.run({ rebalanceListener })`. Each receives `{ groupId, memberId, generationId, partitions }` and may return a promise. The listener belongs to the run: crash restart retains it; stop followed by run may replace it. A manual consumer rejects listeners.
+
+On an ordinary eager round, revoked runs before joining, including the initial empty assignment. On cooperative and consumer-protocol rounds, admission stops only for revoked partitions; when a revoked callback is registered, their running handlers finish before the eligible final commit and revoked callback. Retained partitions continue. Assignment is visible inside assigned, while added partitions remain held from Fetch and handler admission until that callback completes. Assigned runs for every applied round, including an empty delta. Internal holds are separate from `paused()` and do not invalidate valid running handlers.
+
+Loss fences immediately, without waiting for handlers or committing; a nonempty lost set invokes lost once. If lost is absent, revoked receives that loss instead. Supply an explicit lost callback to avoid running normal offset-saving logic after loss. A stable close calls revoked before its eligible final commit and leave; a lost or in-progress round uses lost. Close logs callback failures and continues cleanup.
+
+Callbacks share the remaining rebalance deadline; each callback does not receive a new timeout. An ordinary exception records the first `KafkaJSRebalanceListenerError`, completes only the still-live transitions, then reaches CRASH and `restartOnFailure` without retrying the callback. Error throws retain the original cause; other throws retain their exact `thrownValue` and an Error cause. Expiry terminates and fences the round rather than publishing an assignment. External user side effects cannot be cancelled.
+
+Within assigned, await `committed()` to read broker offsets and metadata, then use `seek()` and await `position()` to load an external starting offset before delivery. Within revoked, `position()` reads quiescent next progress. Position is not proof of a durable broker commit. Hook seeks and local resolution do not settle a recreation reset; only the confirmed current-incarnation durable commit does.
+
+Client calls from a settled, expired or retired callback are refused. Valid callbacks can request stop, disconnect or unsubscribe without waiting on their own round; the returned request promise does not wait for cleanup completion. Calling run or subscribe from a hook is rejected. User promises that continue later keep their original authority and cannot mutate a replacement run.
+
+`await consumer.enforceRebalance(reason?)` requests a classic revoked rejoin and resolves when accepted. The default reason is `enforced-rebalance`; an explicit request while a round runs is a no-op. Manual and consumer-protocol consumers reject it. Custom assigner protocol metadata is rebuilt for the new join.
+
+Instrumentation events keep their existing timing and payloads and are not awaited callbacks. A group consumer's pre-run seek remains an error; an awaited assigned callback plus seek provides the equivalent. `currentLag` remains available through batch/admin lag recipes, and `max.poll.records` is not an option for push delivery; use byte bounds and eachMessage for one-record handler units.
+
 ## <a name="seek"></a> Seek
 
 To move the offset position in a topic/partition the `Consumer` provides the method `seek`. This method has to be called after the consumer is initialized and is running (after consumer#run).

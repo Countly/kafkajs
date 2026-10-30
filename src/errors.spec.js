@@ -323,6 +323,10 @@ describe('every error class this package exports carries an own, enumerable cate
     KafkaJSProducerClosedError: () => ['closed', { outcome: 'unsent' }],
     KafkaJSNoOffsetError: () => ['no offset', { topic: 't', partition: 0, reason: 'no-offset' }],
     KafkaJSAggregateError: () => ['two topics failed', []],
+    KafkaJSRebalanceListenerError: () => [
+      'callback failed',
+      { hook: 'onPartitionsRevoked', reason: 'threw', cause: new Error('boom') },
+    ],
   }
   const CLASSES = Object.entries(errors).filter(
     ([, value]) => typeof value === 'function' && value.prototype instanceof Error
@@ -954,5 +958,28 @@ describe('KafkaJSNoOffsetError', () => {
 
   test('is exported from the package entry as the same class', () => {
     expect(packageEntry.KafkaJSNoOffsetError).toBe(KafkaJSNoOffsetError)
+  })
+})
+
+describe('rebalance listener failure identity', () => {
+  it('retains the original Error cause and exact thrown value', () => {
+    expect(errors.KafkaJSRebalanceListenerError).toBeDefined()
+    const cause = new Error('external offset store')
+    const error = new errors.KafkaJSRebalanceListenerError('callback failed', {
+      hook: 'onPartitionsRevoked',
+      reason: 'threw',
+      cause,
+      thrownValue: cause,
+    })
+    expect(error).toBeInstanceOf(errors.KafkaJSNonRetriableError)
+    expect(error.name).toBe('KafkaJSRebalanceListenerError')
+    expect(error.cause).toBe(cause)
+    expect(error.thrownValue).toBe(cause)
+    expect(error.retriable).toBe(false)
+  })
+
+  it('is exported from the package entry as the same class', () => {
+    expect(errors.KafkaJSRebalanceListenerError).toBeDefined()
+    expect(packageEntry.KafkaJSRebalanceListenerError).toBe(errors.KafkaJSRebalanceListenerError)
   })
 })

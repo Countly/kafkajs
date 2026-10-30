@@ -69,6 +69,8 @@ Versions before 3.0.0 are internal alpha tags and are not published.
 
 - Manual assignment and unsubscribe; defensive assignment/subscription getters; next-position and broker-committed offset reads; a direct consumer constructor that may omit groupId. Assignment accepts the existing offsetReset policies. The lifecycle matrix gains 108 manual cells (434 in total).
 
+- Consumers can await run-scoped `rebalanceListener` callbacks and request a classic rejoin with `enforceRebalance(reason?)`. Added partitions remain held until the assigned callback completes; lost callbacks default to revoked. Callback failures surface as `KafkaJSRebalanceListenerError` with the original Error cause or exact non-Error `thrownValue`. Existing instrumentation remains observational and unawaited.
+
 #### Tooling
 
 - Extend transport fixtures with independently checked consumer error and Fetch-session variants.

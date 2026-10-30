@@ -24,6 +24,8 @@ module.exports = class SubscriptionState {
      */
     this.assignedPartitionSetsByTopic = new Map()
     this.subscriptionStatesByTopic = dictionary()
+    /** @type {Map<object, Map<string, Set<number>>>|null} token → held keys; null while none */
+    this.admissionHolds = null
   }
 
   /**
@@ -127,7 +129,9 @@ module.exports = class SubscriptionState {
   active() {
     return Object.values(this.assignedPartitionsByTopic).map(({ topic, partitions }) => ({
       topic,
-      partitions: partitions.filter((partition) => !this.isPaused(topic, partition)).sort(),
+      partitions: partitions
+        .filter((partition) => !this.isPaused(topic, partition) && !this.isHeld(topic, partition))
+        .sort(),
     }))
   }
 
@@ -174,6 +178,44 @@ module.exports = class SubscriptionState {
   /** Retires intent for one incarnation. @param {string} topic @returns {void} */
   retireTopic(topic) {
     delete this.subscriptionStatesByTopic[topic]
+  }
+
+  /**
+   * Holds new admission without changing ownership or user pause state.
+   * @param {Array<import('../../types').TopicPartitions>} partitions held keys, copied
+   * @param {object} token unique run/round-owned token
+   * @returns {void} the caller owns the same-run idle wake on release
+   */
+  hold(partitions, token) {
+    if (!this.admissionHolds) this.admissionHolds = new Map()
+    this.admissionHolds.set(
+      token,
+      new Map(partitions.map(({ topic, partitions }) => [topic, new Set(partitions)]))
+    )
+  }
+
+  /**
+   * @param {object} token exact holder token
+   * @returns {boolean} whether this token was removed; overlapping holders remain
+   */
+  release(token) {
+    if (!this.admissionHolds?.delete(token)) return false
+    if (this.admissionHolds.size === 0) this.admissionHolds = null
+    return true
+  }
+
+  /**
+   * Checks admission only; running-handler staleness must not use it.
+   * @param {string} topic topic key
+   * @param {number} partition partition ID
+   * @returns {boolean} whether any current token holds the key
+   */
+  isHeld(topic, partition) {
+    if (!this.admissionHolds) return false
+    for (const held of this.admissionHolds.values()) {
+      if (held.get(topic)?.has(partition)) return true
+    }
+    return false
   }
 
   /** Retires all pause intent at a run lifecycle boundary. @returns {void} */

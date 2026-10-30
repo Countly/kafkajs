@@ -659,3 +659,106 @@ it('R2§2:ManualFlushing', async () => {
     )
   }
 })
+it('R1§B1:seek', async () => {
+  const cluster = groupScript(createScriptedCluster({ nodes }), {
+    batches: 0,
+    committed: { 0: '99' },
+  })
+  const consumer = makeConsumer(cluster)
+  expect(() => consumer.seek({ topic: TOPIC, partition: 0, offset: '5' })).toThrow(
+    'Consumer group was not initialized, consumer#run must be called first'
+  )
+  await consumer.connect()
+  await consumer.subscribe({ topic: TOPIC, fromBeginning: true })
+  const firstFetch = hold(cluster, { api: 'Fetch' })
+  const hookGate = {}
+  hookGate.promise = new Promise((resolve) => {
+    hookGate.release = resolve
+  })
+  let entered = false
+  const running = consumer.run({
+    autoCommit: false,
+    eachMessage: async () => {},
+    rebalanceListener: {
+      onPartitionsAssigned: async () => {
+        consumer.seek({ topic: TOPIC, partition: 0, offset: '42' })
+        entered = true
+        await hookGate.promise
+      },
+    },
+  })
+  await until(() => entered)
+  await tick()
+  expect(cluster.requests().filter((r) => r.api === 'Fetch')).toHaveLength(0)
+  hookGate.release()
+  await running
+  await firstFetch.arrived()
+  expect(
+    cluster.requests().filter((r) => r.api === 'Fetch')[0].fields.topics[0].partitions[0]
+      .fetchOffset
+  ).toBe('42')
+  const stop = consumer.stop()
+  firstFetch.release({ partitions: [{ partition: 0, errorCode: 0, records: false }] })
+  await stop
+})
+it('R2§3:OnOffsetsFetched', async () => {
+  const cluster = groupScript(createScriptedCluster({ nodes }), {
+    batches: 0,
+    partitions: 2,
+    committed: { 0: '99', 1: '77' },
+  })
+  const consumer = makeConsumer(cluster)
+  await consumer.connect()
+  await consumer.subscribe({ topic: TOPIC, fromBeginning: true })
+  const firstFetch = hold(cluster, { api: 'Fetch' })
+  const hookGate = {}
+  hookGate.promise = new Promise((resolve) => {
+    hookGate.release = resolve
+  })
+  let adjusted
+  let positions
+  let entered = false
+  const running = consumer.run({
+    autoCommit: false,
+    eachMessage: async () => {},
+    rebalanceListener: {
+      onPartitionsAssigned: async () => {
+        const read = await consumer.committed(
+          [0, 1].map((partition) => ({ topic: TOPIC, partition }))
+        )
+        adjusted = read.map(({ partition, offset }) => [partition, offset])
+        consumer.seek({ topic: TOPIC, partition: 0, offset: String(Number(read[0].offset) - 10) })
+        consumer.seek({ topic: TOPIC, partition: 1, offset: String(Number(read[1].offset) - 20) })
+        positions = [
+          await consumer.position({ topic: TOPIC, partition: 0 }),
+          await consumer.position({ topic: TOPIC, partition: 1 }),
+        ]
+        entered = true
+        await hookGate.promise
+      },
+    },
+  })
+  await until(() => entered)
+  await tick()
+  expect(cluster.requests().filter((r) => r.api === 'Fetch')).toHaveLength(0)
+  hookGate.release()
+  await running
+  await firstFetch.arrived()
+  const first = cluster.requests().filter((r) => r.api === 'Fetch')[0].fields.topics[0].partitions
+  expect(adjusted).toEqual([
+    [0, '99'],
+    [1, '77'],
+  ])
+  expect(positions).toEqual(['89', '57'])
+  expect(
+    first.map(({ partition, fetchOffset }) => [partition, fetchOffset]).sort(([a], [b]) => a - b)
+  ).toEqual([
+    [0, '89'],
+    [1, '57'],
+  ])
+  const stop = consumer.stop()
+  firstFetch.release({
+    partitions: [0, 1].map((partition) => ({ partition, errorCode: 0, records: false })),
+  })
+  await stop
+})

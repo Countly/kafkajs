@@ -84,6 +84,28 @@ class KafkaJSNonRetriableError extends KafkaJSError {
 }
 
 /**
+ * A failed awaited rebalance callback, carrying its exact original failure.
+ * @class
+ */
+class KafkaJSRebalanceListenerError extends KafkaJSNonRetriableError {
+  /**
+   * @param {Error|string} e diagnostic message
+   * @param {object} options failure description
+   * @param {'onPartitionsRevoked'|'onPartitionsAssigned'|'onPartitionsLost'} options.hook callback
+   * @param {'threw'|'timeout'} options.reason failure kind
+   * @param {Error} options.cause original Error, or an Error normalized from a non-Error throw
+   * @param {unknown} [options.thrownValue] exact thrown value
+   */
+  constructor(e, { hook, reason, cause, thrownValue }) {
+    super(e, { cause })
+    this.name = 'KafkaJSRebalanceListenerError'
+    this.hook = hook
+    this.reason = reason
+    this.thrownValue = thrownValue
+  }
+}
+
+/**
  * A partition cannot obtain a starting position under the none reset policy.
  * Recovery is an explicit seek or an ordinary halt-lifecycle transition.
  * @class
@@ -800,6 +822,7 @@ class KafkaJSProducerClosedError extends KafkaJSNonRetriableError {
 
 module.exports = {
   KafkaJSNoOffsetError,
+  KafkaJSRebalanceListenerError,
   KafkaJSProducerClosedError,
   KafkaJSError,
   KafkaJSNonRetriableError,

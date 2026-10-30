@@ -104,6 +104,36 @@ class FetchPreparation {
 }
 
 /**
+ * The identity a position read from a rebalance callback resolves under: the offset manager,
+ * membership and assignment it started with, and a guard that also ends with the callback
+ * invocation, so a late answer after the invocation settled or expired is refused.
+ * It offers the fields of a `FetchPreparation` that seek and offset resolution use.
+ */
+class InvocationPreparation {
+  /**
+   * @param {object} options the identity captured before any await
+   * @param {object} options.manager the offset manager that resolves
+   * @param {import('../producer/generation')} options.fence the invocation's fence
+   * @param {number} options.ownershipToken the membership identity
+   * @param {number} options.assignmentEpoch the assignment the read is for
+   * @param {() => Error|null} options.guard the invocation and acquisition refusal
+   */
+  constructor({ manager, fence, ownershipToken, assignmentEpoch, guard }) {
+    this.manager = manager
+    this.fence = fence
+    this.ownershipToken = ownershipToken
+    this.assignmentEpoch = assignmentEpoch
+    this.guard = guard
+  }
+
+  /** @returns {void} @throws {Error} what `guard()` returned */
+  check() {
+    const refusal = this.guard()
+    if (refusal) throw refusal
+  }
+}
+
+/**
  * A delay bound to a terminal fence: its timer is cleared on settlement and on cancellation.
  * @param {import('../producer/generation')} fence the run's fence
  * @param {number} [ms] omitted, it yields once to the event loop (`setImmediate`)
@@ -125,4 +155,4 @@ const fencedDelay = (fence, ms) =>
     })
   })
 
-module.exports = { FetchPreparation, PreparationSuperseded, fencedDelay }
+module.exports = { FetchPreparation, InvocationPreparation, PreparationSuperseded, fencedDelay }

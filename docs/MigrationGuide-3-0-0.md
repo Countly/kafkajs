@@ -956,6 +956,8 @@ Connection or coordinator failures in the consumer protocol no longer spend the 
 
 - Pass a `groupId` for any consumer that subscribes. A consumer that only `assign`s partitions may omit it and reads without a group; null/empty/non-string groupId reject, groupMetadata also needs a group.
 - Treat a mismatching-group OffsetFetch refusal as an invalid broker response; do not use offsets from another group.
+- **Awaited rebalance callbacks are opt-in.** Pass `rebalanceListener` to `consumer.run` to load offsets before delivery or save final positions before ownership is released. An ordinary callback failure finishes only the still-live round and then crashes the run with `KafkaJSRebalanceListenerError`; the callback is not retried. Expiry fences and cleans the failed round. The lost callback defaults to revoked, but lost partitions cannot commit. Client calls from a settled, expired or retired invocation are refused, even after a new run starts. A valid callback may request stop/disconnect/unsubscribe without awaiting its own round; the request settles before cleanup completes. Manual consumers reject listeners. A run without a listener keeps its existing behavior.
+
 
 ### Admin
 

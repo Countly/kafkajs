@@ -1,16 +1,20 @@
 const { EventEmitter } = require('events')
+const { performance } = require('node:perf_hooks')
 const Long = require('../utils/long')
 const createRetry = require('../retry')
 const sleep = require('../utils/sleep')
+const describeThrown = require('../network/describeThrown')
 const {
   isKafkaJSError,
   isFencedInstance,
   isUnknownMemberId,
   KafkaJSCommitFailedError,
   KafkaJSNonRetriableError,
+  KafkaJSRebalanceListenerError,
   COORDINATOR_LOAD_IN_PROGRESS_CODE,
 } = require('../errors')
 const handlerContext = require('./handlerContext')
+const RebalanceHooks = require('./rebalanceHooks')
 
 const {
   events: { FETCH, FETCH_START, START_BATCH_PROCESS, END_BATCH_PROCESS },
@@ -28,6 +32,7 @@ const {
   sentOwnership,
   sentMembership,
   obsoleteOwnership,
+  consumerStoppingError,
 } = require('./rebalanceErrorContract')
 const { COOPERATIVE } = require('./groupProtocol/interface')
 
@@ -112,6 +117,15 @@ module.exports = class Runner extends EventEmitter {
       handler: (batch) => this.handleBatch(batch),
       concurrency,
     })
+
+    /**
+     * The run's awaited rebalance callbacks, or null without a listener: every listener-only branch
+     * below is gated on it, so a run without one keeps its existing paths.
+     * @type {import('./rebalanceHooks')|null}
+     */
+    this.rebalanceHooks = consumerGroup.rebalanceHooks ?? null
+    /** Admission-only stop used by a listener's eager round; unlike `quiescing` it is not a loss. */
+    this.admissionQuiescing = false
 
     this.running = false
     this.consuming = false
@@ -316,10 +330,23 @@ module.exports = class Runner extends EventEmitter {
         return
       }
 
+      /**
+       * Runs one rebalance for the loop. A failed awaited callback ends the loop through `bail`, so
+       * the retrier hands the typed error on unchanged instead of wrapping it.
+       */
+      const rebalance = async (verdict) => {
+        try {
+          await this.handleRebalanceError(verdict)
+        } catch (error) {
+          if (error instanceof KafkaJSRebalanceListenerError) return bail(error)
+          throw error
+        }
+      }
+
       const waiting = this.rebalanceCoordinator.takeVerdict()
 
       if (waiting) {
-        await this.handleRebalanceError(waiting)
+        await rebalance(waiting)
         return
       }
 
@@ -342,7 +369,7 @@ module.exports = class Runner extends EventEmitter {
           thrown && pending ? this.mergeThrownWithSlot(thrown, pending) : thrown || pending
 
         if (merged) {
-          await this.handleRebalanceError(merged)
+          await rebalance(merged)
           return
         }
 
@@ -388,7 +415,7 @@ module.exports = class Runner extends EventEmitter {
 
       const verdict = this.rebalanceCoordinator.takeVerdict()
       if (verdict) {
-        await this.handleRebalanceError(verdict)
+        await rebalance(verdict)
       }
     }
 
@@ -490,6 +517,17 @@ module.exports = class Runner extends EventEmitter {
 
     if (!stopsTheWorld) {
       return this.resolveRebalanceVerdict(verdict)
+    }
+
+    if (this.rebalanceHooks) {
+      // A listener's round prepares itself under its own budget: a loss dispatches the lost
+      // callback without waiting for handlers, an eager revoke quiesces before its revoked callback.
+      this.quiescing = lost
+      try {
+        return await this.resolveRebalanceVerdict({ ...verdict, membershipNotified: lost })
+      } finally {
+        this.quiescing = false
+      }
     }
 
     // Java runs onJoinPrepare between polls, never under a running handler. The round below
@@ -597,7 +635,9 @@ module.exports = class Runner extends EventEmitter {
       })
 
       try {
-        await this.autoCommitOffsets(null)
+        if (!(this.rebalanceHooks && this.consumerGroup.rebalanceProtocol() !== COOPERATIVE)) {
+          await this.autoCommitOffsets(null)
+        }
       } catch (error) {
         const failure = this.rebalanceCoordinator.classify(error, REBALANCE_PATHS.OFFSET_COMMIT)
         if (failure?.kind === 'lost') return this.resolveRebalanceVerdict(failure)
@@ -647,6 +687,7 @@ module.exports = class Runner extends EventEmitter {
       memberId: this.consumerGroup.memberId,
     })
 
+    const closing = this.rebalanceHooks ? this.closeEpisode() : null
     this.stopRequested = true
     this.running = false
     // Ends the inter-round yield at once, so a chain waiting one out does not hold this stop open.
@@ -673,6 +714,7 @@ module.exports = class Runner extends EventEmitter {
       // manager, so stopping it first cannot strand the round.
       await this.rebalanceCoordinator.idle()
       await this.waitForConsumer()
+      if (closing) await this.invokeCloseHook(closing)
 
       this.consumerGroup.clearAssignerState()
 
@@ -698,6 +740,73 @@ module.exports = class Runner extends EventEmitter {
         memberId: this.consumerGroup.memberId,
         error: e.message || e,
       })
+    }
+  }
+
+  /**
+   * Captures, before the stop latches, what a listener's close callback needs: the assignment the
+   * member holds and whether it is already lost or inside a round, which selects the lost callback.
+   * @private
+   * @returns {{ previous: Array<import('../../types').TopicPartitions>, lost: boolean }}
+   */
+  closeEpisode() {
+    const { ownership } = this.consumerGroup
+    return {
+      previous: this.consumerGroup.assigned(),
+      lost:
+        this.rebalanceCoordinator.isRebalancing() || Boolean(ownership?.refusal(ownership.token())),
+    }
+  }
+
+  /**
+   * Calls the revoked callback for a healthy close, or the lost callback for a lost or in-round one,
+   * once and only for a nonempty assignment, before the final commit and leave. The callback shares
+   * the group's rebalance timeout and runs outside the stop requester's handler and callback
+   * context; a failure is logged and the close goes on.
+   * @private
+   * @param {{ previous: Array<import('../../types').TopicPartitions>, lost: boolean }} episode
+   * @returns {Promise<void>} always resolves
+   */
+  async invokeCloseHook({ previous, lost }) {
+    if (previous.length === 0) return
+    const group = this.consumerGroup
+    const { ownership } = group
+    if (lost) ownership?.lose(consumerStoppingError(), ownership.token())
+    const deadlineAt = performance.now() + group.rebalanceTimeout
+    let retired = null
+    const round = {
+      run: {},
+      roundDeadlineAt: deadlineAt,
+      guard: () => retired || (performance.now() >= deadlineAt ? consumerStoppingError() : null),
+      retire: (error) => {
+        retired ||= error
+      },
+      wait: (work) => work(),
+    }
+    try {
+      // Whoever requested the stop, a handler or another callback, the close callback runs on its
+      // own authority: it must neither inherit nor be refused by the requester's identity.
+      await handlerContext.run(null, () =>
+        RebalanceHooks.outside(() =>
+          group.invokeHook(
+            round,
+            lost ? 'onPartitionsLost' : 'onPartitionsRevoked',
+            previous,
+            group.hookIdentity(round, previous)
+          )
+        )
+      )
+      const failure = group.takeListenerFailure(round)
+      if (failure) throw failure
+    } catch (error) {
+      this.logger.error('Rebalance callback failed while closing', {
+        groupId: group.groupId,
+        memberId: group.memberId,
+        error: describeThrown(error),
+      })
+    } finally {
+      round.retire(consumerStoppingError())
+      group.rebalanceHooks.retire({ run: round.run }, consumerStoppingError())
     }
   }
 
@@ -1184,6 +1293,24 @@ module.exports = class Runner extends EventEmitter {
       return
     }
 
+    // Admission only: a held key or an eager listener round drops queued work here and nowhere
+    // else, so a handler that already runs for the key stays valid. Checked before any await and
+    // in the same turn as the count below.
+    if (
+      this.rebalanceHooks &&
+      (this.admissionQuiescing ||
+        this.consumerGroup.subscriptionState.isHeld(batch.topic, batch.partition))
+    ) {
+      this.logger.debug('Dropping a queued batch for a partition held by a rebalance', {
+        groupId: this.consumerGroup.groupId,
+        memberId: this.consumerGroup.memberId,
+        topic: batch.topic,
+        partition: batch.partition,
+      })
+
+      return
+    }
+
     /** @param {import('./batch')} batch */
     const onBatch = async (batch) => {
       const startBatchProcess = Date.now()
@@ -1304,11 +1431,13 @@ module.exports = class Runner extends EventEmitter {
     }
 
     this.inFlightHandlers++
+    this.beginHookBatch(batch)
 
     try {
       await onBatch(batch)
     } finally {
       this.inFlightHandlers--
+      this.endHookBatch(batch)
 
       if (this.inFlightHandlers === 0) {
         this.emit(HANDLERS_IDLE)
@@ -1338,6 +1467,173 @@ module.exports = class Runner extends EventEmitter {
     })
 
     return new Promise((resolve) => this.once(HANDLERS_IDLE, () => resolve()))
+  }
+
+  /**
+   * Counts a batch after its final admission check, only with a revoked callback.
+   * @param {object} batch batch identity
+   * @returns {void} no per-message bookkeeping
+   */
+  beginHookBatch(batch) {
+    if (!this.rebalanceHooks?.has('onPartitionsRevoked')) return
+    this.hookHandlers ||= new Map()
+    const key = batch.ownershipKey || `${batch.topic}|${batch.partition}`
+    this.hookHandlers.set(key, (this.hookHandlers.get(key) || 0) + 1)
+  }
+
+  /**
+   * Finishes exactly the batch counted at admission, including failure and loss paths, and lets
+   * every quiescence waiter re-check.
+   * @param {object} batch batch identity
+   * @returns {void} wakes current waiters synchronously
+   */
+  endHookBatch(batch) {
+    if (this.hookHandlers) {
+      const key = batch.ownershipKey || `${batch.topic}|${batch.partition}`
+      const count = this.hookHandlers.get(key)
+      if (count === 1) this.hookHandlers.delete(key)
+      else if (count > 1) this.hookHandlers.set(key, count - 1)
+    }
+    if (this.hookWaiters) for (const check of this.hookWaiters) check()
+  }
+
+  /**
+   * Awaits only the specified partitions' running handlers under the unchanged round deadline.
+   * @param {Array<import('../../types').TopicPartitions>} partitions revoked keys
+   * @param {object} options captured invocation boundary
+   * @param {number} options.deadlineAt original absolute monotonic deadline
+   * @param {object} options.identity original run and round; round supplies guard/wait/retire
+   * @returns {Promise<void>} quiescent success, never expiry disguised as success
+   * @throws {KafkaJSRebalanceListenerError|Error} typed expiry or owner retirement
+   */
+  waitForPartitions(partitions, { deadlineAt, identity }) {
+    const keys = partitions.flatMap(({ topic, partitions }) =>
+      partitions.map((partition) => `${topic}|${partition}`)
+    )
+    return this.awaitQuiescence(() => keys.some((key) => this.hookHandlers?.has(key)), {
+      deadlineAt,
+      identity,
+    })
+  }
+
+  /**
+   * Stops the fetch layer and awaits every running handler under the unchanged round deadline.
+   * @param {object} options captured invocation boundary, as for `waitForPartitions`
+   * @param {number} options.deadlineAt original absolute monotonic deadline
+   * @param {object} options.identity original run and round
+   * @returns {Promise<void>} quiescent success
+   * @throws {KafkaJSRebalanceListenerError|Error} typed expiry or owner retirement
+   */
+  quiesceRun({ deadlineAt, identity }) {
+    let stopped = false
+    this.fetchManager.stop().then(() => {
+      stopped = true
+      for (const check of this.hookWaiters || []) check()
+    })
+    return this.awaitQuiescence(() => !stopped || this.inFlightHandlers > 0, {
+      deadlineAt,
+      identity,
+    })
+  }
+
+  /**
+   * A listener's eager preparation, run inside the round's own budget: admission stops, running
+   * handlers finish, then the final automatic commit is attempted. A failed commit never blocks the
+   * rebalance; a loss it reveals is reported to the caller, which then runs the lost callback.
+   * @param {object} round the captured round
+   * @returns {Promise<boolean>} whether the membership was lost during the preparation
+   * @throws {KafkaJSRebalanceListenerError|Error} typed quiescence expiry or round retirement
+   */
+  async prepareEagerRound(round) {
+    const ownership = this.consumerGroup.ownership
+    this.admissionQuiescing = true
+    await this.quiesceRun({
+      deadlineAt: round.roundDeadlineAt,
+      identity: { round, membership: ownership?.token() },
+    })
+    try {
+      await round.wait(() => this.autoCommitOffsets(null, round))
+    } catch (error) {
+      const refusal = round.guard()
+      if (refusal) throw refusal
+      this.logger.warn('Pre-rebalance offset commit failed; rejoining anyway', {
+        error: error.message,
+      })
+    }
+    return Boolean(ownership?.refusal(ownership.token()))
+  }
+
+  /** Ends the admission-only stop of an eager listener round. @returns {void} */
+  releaseEagerRound() {
+    this.admissionQuiescing = false
+  }
+
+  /**
+   * The shared waiter: resolves once `busy()` is false, rejects with the typed timeout at the
+   * deadline (fencing the captured membership and retiring the round) and unlinks its own timer and
+   * waiter on every exit. The promise is built lazily inside the round's wait, so a round that is
+   * already retired never constructs it.
+   * @private
+   * @param {() => boolean} busy whether any watched handler still runs
+   * @param {{ deadlineAt: number, identity: object }} options captured invocation boundary
+   * @returns {Promise<void>} quiescent success
+   * @throws {KafkaJSRebalanceListenerError|Error} typed expiry or owner retirement
+   */
+  async awaitQuiescence(busy, { deadlineAt, identity }) {
+    const { round } = identity
+    let timer, check, expired
+    const timeout = () => {
+      const cause = new Error('Revoked handlers did not quiesce within the rebalance deadline')
+      return new KafkaJSRebalanceListenerError(cause.message, {
+        hook: 'onPartitionsRevoked',
+        reason: 'timeout',
+        cause,
+      })
+    }
+    const expire = () => {
+      if (expired) return
+      expired = timeout()
+      this.consumerGroup.ownership?.lose(expired, identity.membership)
+      round.retire(expired)
+    }
+    const guard = () => {
+      if (!expired && performance.now() >= deadlineAt) expire()
+      return expired || round.guard()
+    }
+    const before = guard()
+    if (before) throw before
+    if (!busy()) return
+    this.hookWaiters ||= new Set()
+    const pending = () =>
+      new Promise((resolve, reject) => {
+        check = () => {
+          const refusal = guard()
+          if (refusal) return reject(refusal)
+          if (!busy()) resolve()
+        }
+        this.hookWaiters.add(check)
+        timer = setTimeout(
+          () => {
+            const refusal = guard()
+            if (refusal) reject(refusal)
+            else check()
+          },
+          Math.max(0, Math.ceil(deadlineAt - performance.now()))
+        )
+        check()
+      })
+    try {
+      await round.wait(pending)
+      const after = guard()
+      if (after) throw after
+    } catch (error) {
+      // The round's own timer can win the race by a rounding step: its expiry is this deadline.
+      if (error?.type === 'JOIN_DEADLINE_EXCEEDED') expire()
+      throw guard() || error
+    } finally {
+      clearTimeout(timer)
+      this.hookWaiters.delete(check)
+    }
   }
 
   /**
@@ -1376,12 +1672,14 @@ module.exports = class Runner extends EventEmitter {
    * Commits the resolved offsets unless autoCommit is off or the batch no longer owns the commit.
    * @param {object|null} [batch] the batch committing; defaults to the calling handler's, `null`
    *   for none, as a commit outside any handler passes
+   * @param {object|null} [round] the captured rebalance round the commit belongs to; its expiry or
+   *   retirement refuses the commit before and after transmission
    * @returns {Promise<void>|undefined} undefined when nothing is attempted
    */
-  autoCommitOffsets(batch = handlerContext.current() ?? null) {
-    if (this.autoCommit && !this.commitRefusal(undefined, batch)) {
-      const guard = () => this.commitRefusal(undefined, batch)
-      return this.consumerGroup.commitOffsets({}, { auto: true, guard })
+  autoCommitOffsets(batch = handlerContext.current() ?? null, round = null) {
+    const refusal = () => round?.guard() || this.commitRefusal(undefined, batch)
+    if (this.autoCommit && !refusal()) {
+      return this.consumerGroup.commitOffsets({}, { auto: true, guard: refusal })
     }
   }
 
@@ -1412,9 +1710,17 @@ module.exports = class Runner extends EventEmitter {
    */
   commitOffsets(offsets, batch = handlerContext.current() ?? null) {
     const ownership = this.consumerGroup.ownership
-    const token = ownership?.token()
+    // A commit from a rebalance callback keeps that invocation's membership, expiry and original
+    // acquisition cells through its retries and the sender; it never adopts what is current at
+    // transmission.
+    const invocation = RebalanceHooks.current()
+    const token = invocation ? invocation.context.membership : ownership?.token()
     const release = ownership?.retain(token)
-    const guard = () => this.commitRefusal(token, batch)
+    const guard = () =>
+      RebalanceHooks.refusal(invocation) ||
+      this.commitRefusal(token, batch) ||
+      (invocation && this.consumerGroup.hookCommitRefusal(invocation.context, offsets.topics)) ||
+      null
     if (!this.running) {
       this.logger.debug('consumer not running, exiting', {
         groupId: this.consumerGroup.groupId,

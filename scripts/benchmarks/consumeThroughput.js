@@ -5,6 +5,7 @@
  *          [--size 200] [--partitions 6] [--timeout <ms>] [--handler eachBatch|eachMessage]
  *          [--subscribe-channels 0|1] [--max-bytes-per-partition <n>]
  *          [--autocommit-threshold <n>] [--otel 0|1] [--intern-offsets 0|1] [--control 0|1]
+ *          [--listener 0|1]
  * Prints one JSON line: { messages, size, partitions, handler, subscribeChannels,
  *   messagesPerSecond, p50, p90, p99, handlerP99, deliveryGapP50, deliveryGapP90, deliveryGapP99,
  *   batches, deliveredMessages, deliveredBatches, handlerEntries, gapSamples, deliveredBytes,
@@ -18,6 +19,9 @@
  *
  * `--max-bytes-per-partition` sets the consumer option: 32768 gives the `eachBatch` arm about
  * 1 380 batches from 200 000 messages of 200 bytes, where the 1 MiB default gives about 45.
+ * `--listener 1` registers a rebalance listener with an assigned and a revoked callback on the same
+ * `run` call. It counts the initial assignment and the graceful-teardown revoke, outside the timed
+ * interval, and fails the run unless each happened once; the eager startup revoke does not count.
  * `--autocommit-threshold n` turns `autoCommit` on with that threshold. `--otel 1` registers the
  * instrumentation of this tree's `otel/` with a tracer and a meter provider that export nothing.
  * `--intern-offsets 1` keeps every offset string in a Map: a deliberate leak, the control that
@@ -69,6 +73,7 @@ const SUBSCRIBE_CHANNELS = arg('subscribe-channels', 0)
 const OTEL = arg('otel', 0)
 const INTERN_OFFSETS = arg('intern-offsets', 0)
 const CONTROL = arg('control', 0)
+const LISTENER = arg('listener', 0)
 const MAX_BYTES_PER_PARTITION = process.argv.includes('--max-bytes-per-partition')
   ? arg('max-bytes-per-partition')
   : undefined
@@ -93,6 +98,7 @@ for (const [name, value] of [
   ['otel', OTEL],
   ['intern-offsets', INTERN_OFFSETS],
   ['control', CONTROL],
+  ['listener', LISTENER],
 ]) {
   if (value !== 0 && value !== 1) {
     console.error(`--${name} must be 0 or 1, got ${value}`)
@@ -168,6 +174,44 @@ class DeliveryAccounting {
   }
 }
 
+/** Counts the two required listener stages independently from record and callback totals. */
+class ListenerAccounting {
+  /** Initializes one consume arm before setup. */
+  constructor() {
+    this.stage = 'startup'
+    this.assigned = 0
+    this.teardownRevoked = 0
+  }
+
+  /** @returns {void} records actual initial assignment callback entry */
+  onAssigned() {
+    if (this.stage === 'startup') this.assigned++
+  }
+
+  /** @returns {void} ignores eager startup revoke and records graceful teardown only */
+  onRevoked() {
+    if (this.stage === 'teardown') this.teardownRevoked++
+  }
+
+  /** @returns {void} called after finishedAt, immediately before consumer.stop */
+  beginTeardown() {
+    this.stage = 'teardown'
+  }
+
+  /**
+   * Requires the fixed stable one-member benchmark's actual callbacks.
+   * @returns {void} no performance claim
+   * @throws {Error} a missing, duplicate or misattributed invocation
+   */
+  verify() {
+    if (this.assigned !== 1 || this.teardownRevoked !== 1) {
+      throw new Error(
+        'Listener control requires initial assigned and graceful teardown revoked once'
+      )
+    }
+  }
+}
+
 /**
  * Checks observed counts against a separately declared finite source transcript.
  * @param {object} actual driver result
@@ -215,6 +259,7 @@ const accountingControl = async (handler) => {
       messages: 12,
       size: 2,
       timeout: 1000,
+      listener: false,
     })
     const entries = handler === 'eachBatch' ? sizes.length : 12
     verifyAccounting(result, {
@@ -385,6 +430,7 @@ const produceCorpus = (kafka) =>
  * @param {number} [options.size] corpus record bytes
  * @param {number} [options.timeout] drain deadline in milliseconds, armed after run resolves
  * @param {() => bigint} [options.now] monotonic measurement clock
+ * @param {boolean} [options.listener] registers the counted rebalance listener, as `--listener 1`
  * @returns {Promise<{ messagesPerSecond: number, p50: number, p90: number, p99: number,
  *   handlerP99: number, deliveryGapP50: number|null, deliveryGapP90: number|null, deliveryGapP99: number|null,
  *   batches: number, deliveredMessages: number, deliveredBatches: number, handlerEntries: number,
@@ -403,10 +449,18 @@ const consumeOnce = async (
     size = SIZE,
     timeout = TIMEOUT_MS,
     now = () => process.hrtime.bigint(),
+    listener = LISTENER === 1,
   } = {}
 ) => {
   const latencies = []
   const accounting = new DeliveryAccounting(handler)
+  const listenerAccounting = listener ? new ListenerAccounting() : undefined
+  const rebalanceListener = listener
+    ? {
+        onPartitionsAssigned: () => listenerAccounting.onAssigned(),
+        onPartitionsRevoked: () => listenerAccounting.onRevoked(),
+      }
+    : undefined
   let bytes = 0
   let finishedAt
   let startedAt
@@ -481,7 +535,10 @@ const consumeOnce = async (
     try {
       await consumer.connect()
       await consumer.subscribe({ topic: TOPIC, fromBeginning: true })
-      await consumer.run(handler === 'eachMessage' ? eachMessageArm : eachBatchArm)
+      await consumer.run({
+        ...(handler === 'eachMessage' ? eachMessageArm : eachBatchArm),
+        ...(rebalanceListener && { rebalanceListener }),
+      })
       const deadline = new Promise((_, reject) => {
         deadlineTimer = setTimeout(
           () =>
@@ -498,7 +555,9 @@ const consumeOnce = async (
     } finally {
       clearTimeout(deadlineTimer)
     }
+    listenerAccounting?.beginTeardown()
     await consumer.stop()
+    listenerAccounting?.verify()
   })
 
   if (startedAt === undefined || (size > 0 && bytes === 0)) {
@@ -600,6 +659,7 @@ module.exports = {
   countLedgerCalls,
   registerOtel,
   DeliveryAccounting,
+  ListenerAccounting,
   verifyAccounting,
   accountingControl,
   createTopic,

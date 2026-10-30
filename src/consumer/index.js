@@ -14,10 +14,15 @@ const { createGroupDescriptions } = require('../admin/groupDescriptions')
 const resolveGroupTimeouts = require('./groupTimeouts')
 const { selectRebalanceProtocol } = require('./groupProtocol/interface')
 const Runner = require('./runner')
+const RebalanceHooks = require('./rebalanceHooks')
 const { events, wrap: wrapEvent, unwrap: unwrapEvent } = require('./instrumentationEvents')
 const InstrumentationEventEmitter = require('../instrumentation/emitter')
 const { KafkaJSNonRetriableError, isFencedInstance } = require('../errors')
-const { isConsumerProtocolFatal, consumerStoppingError } = require('./rebalanceErrorContract')
+const {
+  isConsumerProtocolFatal,
+  consumerStoppingError,
+  stampOwnership,
+} = require('./rebalanceErrorContract')
 const { roundRobin } = require('./assigners')
 const {
   EARLIEST_OFFSET,
@@ -311,12 +316,15 @@ module.exports = (params) => {
   }
 
   /**
-   * Refuses a call made from a handler of a run that has since been retired, before it can read a
-   * replacement run's state. Detached callers and the current run's handlers pass.
-   * @throws {Error} `CONSUMER_STOPPING`
+   * Refuses a call made from a handler of a run that has since been retired, or from a rebalance
+   * callback invocation that is settled, expired or retired, before it can read or change a
+   * replacement run's state. Detached callers, the current run's handlers and a current callback pass.
+   * @throws {Error} `CONSUMER_STOPPING` or the callback's own refusal
    * @returns {void}
    */
   const refuseRetiredCaller = () => {
+    const refusal = RebalanceHooks.refusal()
+    if (refusal) throw refusal
     const identity = handlerContext.current()?.runIdentity
     if (identity && !identity.isCurrent()) throw consumerStoppingError()
   }
@@ -494,6 +502,23 @@ module.exports = (params) => {
   }
 
   /**
+   * Settles a lifecycle request made from inside a rebalance callback. The cleanup keeps running
+   * and its failure is logged; the caller's promise resolves on a later turn instead of awaiting
+   * the round that is itself waiting for that callback.
+   * @param {Promise<void>} cleanup the shared cleanup the request started
+   * @returns {Promise<void>} request acceptance
+   */
+  const acceptFromHook = (cleanup) => {
+    cleanup.catch((e) => {
+      logger.error(`Caught error while stopping from a rebalance callback: ${e.message}`, {
+        stack: e.stack,
+        groupId,
+      })
+    })
+    return new Promise((resolve) => setImmediate(resolve))
+  }
+
+  /**
    * Stops the consumer and disconnects the cluster. `leaveGroup` (KIP-1092) overrides whether the
    * member leaves its group: `true` removes it at once, whatever its kind, `false` keeps it in the
    * group until its session expires, and `undefined` is the default (a dynamic member leaves, a
@@ -509,7 +534,8 @@ module.exports = (params) => {
    */
   const disconnect = async (options) => {
     refuseRetiredCaller()
-    return shutDown(parseDisconnectOptions(options))
+    const cleanup = shutDown(parseDisconnectOptions(options))
+    return RebalanceHooks.current() ? acceptFromHook(cleanup) : cleanup
   }
 
   const stopShared = sharedPromiseTo(async (options) => {
@@ -550,7 +576,8 @@ module.exports = (params) => {
       return Promise.reject(error)
     }
     stopGeneration++
-    return stopShared()
+    const cleanup = stopShared()
+    return RebalanceHooks.current() ? acceptFromHook(cleanup) : cleanup
   }
 
   /**
@@ -612,11 +639,28 @@ module.exports = (params) => {
   }
 
   /**
+   * Refuses an API that no rebalance callback may call, even a current one, because it would
+   * replace the run that is waiting for that callback; a retired or expired caller is refused first.
+   * @param {string} api the public method name, for the message
+   * @returns {void}
+   * @throws {KafkaJSNonRetriableError} when called from inside a rebalance callback
+   * @throws {Error} `CONSUMER_STOPPING` or the callback refusal from a retired caller
+   */
+  const refuseFromHook = (api) => {
+    refuseRetiredCaller()
+    if (RebalanceHooks.current()) {
+      throw new KafkaJSNonRetriableError(
+        `consumer#${api} cannot be called from a rebalance callback`
+      )
+    }
+  }
+
+  /**
    * @type {import("../../types").Consumer["subscribe"]}
    * @throws {Error} `CONSUMER_STOPPING` from a handler of a retired run
    */
   const subscribe = async (subscription = {}) => {
-    refuseRetiredCaller()
+    refuseFromHook('subscribe')
     requireGroup()
     const { topic, topics: subscriptionTopics, regex } = subscription
     const resetPolicy = normalizeResetPolicy(subscription)
@@ -702,9 +746,11 @@ module.exports = (params) => {
   /**
    * @type {import("../../types").Consumer["run"]}
    * @throws {Error} `CONSUMER_STOPPING` from a handler of a retired run
+   * @throws {KafkaJSNonRetriableError} from a rebalance callback, or for an invalid
+   *   `rebalanceListener` (a manual consumer, a missing group, a non-object, a non-function hook)
    */
   const run = async (runOptions = {}) => {
-    refuseRetiredCaller()
+    refuseFromHook('run')
     const {
       autoCommitInterval = null,
       autoCommitThreshold = null,
@@ -712,6 +758,7 @@ module.exports = (params) => {
       partitionsConsumedConcurrently: concurrency = 1,
       eachBatch = null,
       eachMessage = null,
+      rebalanceListener,
     } = runOptions
     // Presence, not truthiness: a consumer without a group commits nothing unless told otherwise,
     // and is refused when it asks to.
@@ -722,6 +769,11 @@ module.exports = (params) => {
       )
     }
 
+    const listener = RebalanceHooks.validate(
+      rebalanceListener,
+      manual ? 'manual' : groupProtocol,
+      hasGroup
+    )
     ensureTopicRecreatedSubscription()
 
     if (consumerGroup) {
@@ -793,6 +845,7 @@ module.exports = (params) => {
         autoCommitThreshold,
         operations: offsetOperations(),
         obligations,
+        rebalanceListener: listener,
       })
       for (const seekEntry of seeks) consumerGroup.seek(seekEntry)
 
@@ -903,7 +956,10 @@ module.exports = (params) => {
           groupId,
         })
 
-        restartTimeout = setTimeout(() => start(onCrash), retryTime)
+        // Created outside any handler or callback store: the restart must not inherit its authority.
+        restartTimeout = handlerContext.run(null, () =>
+          RebalanceHooks.outside(() => setTimeout(() => start(onCrash), retryTime))
+        )
       }
     }
 
@@ -1040,6 +1096,45 @@ module.exports = (params) => {
     }
 
     consumerGroup.seek({ topic, partition, offset: seekOffset.toString() })
+  }
+
+  /**
+   * Requests one classic rejoin without waiting for it: an eager member commits and stops the world,
+   * a cooperative one runs a background round, and a call while a round runs is a no-op. The
+   * assigners' `protocol()` is rebuilt by the round itself, so changed user data is sent.
+   * @param {string} [reason='enforced-rebalance'] reported as the rebalance reason
+   * @returns {Promise<void>} resolves once the request is accepted, not when the round ends
+   * @throws {KafkaJSNonRetriableError} for a non-string reason, the consumer protocol, a manual
+   *   assignment, or a consumer that is not running
+   * @throws {Error} `CONSUMER_STOPPING` or the callback's refusal from a retired caller
+   */
+  const enforceRebalance = async (reason = 'enforced-rebalance') => {
+    refuseRetiredCaller()
+    if (typeof reason !== 'string') {
+      throw new KafkaJSNonRetriableError('enforceRebalance reason must be a string')
+    }
+    if (isConsumerProtocol) {
+      throw new KafkaJSNonRetriableError(
+        `enforceRebalance is not supported with groupProtocol 'consumer' (reason: ${reason})`
+      )
+    }
+    if (manual) {
+      throw new KafkaJSNonRetriableError(
+        `enforceRebalance is unavailable with manual assignment (reason: ${reason})`
+      )
+    }
+    if (!consumerGroup || !runner) {
+      throw new KafkaJSNonRetriableError(
+        `enforceRebalance requires a running group consumer (reason: ${reason})`
+      )
+    }
+    const { rebalanceCoordinator } = runner
+    if (rebalanceCoordinator.isRebalancing()) return
+    const error = stampOwnership(
+      new KafkaJSNonRetriableError(reason),
+      consumerGroup.ownership.token()
+    )
+    rebalanceCoordinator.requestRejoin({ kind: 'revoked', reason, error })
   }
 
   /**
@@ -1298,29 +1393,33 @@ module.exports = (params) => {
   /**
    * Stops the run first, then clears the subscription or manual selection with its targets, queued
    * seeks, reset debts and metadata scope, keeping the connection. A failed stop propagates and
-   * leaves the selection as it was. Idempotent.
+   * leaves the selection as it was. Idempotent. From a current rebalance callback it requests that
+   * cleanup and settles without awaiting it, as `stop()` does.
    * @type {import("../../types").Consumer["unsubscribe"]}
    * @throws {Error} what the stop failed with
    */
   const unsubscribe = async () => {
     refuseRetiredCaller()
     selectionRevision++
-    await stop()
-    await cluster.resetTargetTopics([], {
-      publish: () => {
-        releaseDiscoveryScope()
-        declared.clear()
-        manual = null
-        queuedSeeks.clear()
-        for (const name of keys(topics)) delete topics[name]
-        unregisteredTopics.clear()
-        subscribedTopicRegex = null
-        regexSubscription = null
-        retainTopics(new Set())
-        lastJoin = null
-        selectionRevision++
-      },
-    })
+    stopGeneration++
+    const cleanup = stopShared().then(() =>
+      cluster.resetTargetTopics([], {
+        publish: () => {
+          releaseDiscoveryScope()
+          declared.clear()
+          manual = null
+          queuedSeeks.clear()
+          for (const name of keys(topics)) delete topics[name]
+          unregisteredTopics.clear()
+          subscribedTopicRegex = null
+          regexSubscription = null
+          retainTopics(new Set())
+          lastJoin = null
+          selectionRevision++
+        },
+      })
+    )
+    return RebalanceHooks.current() ? acceptFromHook(cleanup) : cleanup
   }
 
   /**
@@ -1409,6 +1508,7 @@ module.exports = (params) => {
     committed,
     stop,
     run,
+    enforceRebalance,
     commitOffsets,
     seek,
     describeGroup,

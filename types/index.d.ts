@@ -1812,7 +1812,24 @@ export type ConsumerEachBatchPayload = EachBatchPayload
 export type EachBatchHandler = (payload: EachBatchPayload) => Promise<void>
 export type EachMessageHandler = (payload: EachMessagePayload) => Promise<void>
 
+/** What an awaited rebalance callback receives; the event payload at the stage it runs at. */
+export interface ConsumerRebalancePayload {
+  groupId: string
+  /** `null` before the first join of a classic member. */
+  memberId: string | null
+  generationId: number | null
+  partitions: TopicPartitions[]
+}
+/** Awaited run-scoped callbacks; an absent `onPartitionsLost` falls back to `onPartitionsRevoked`. */
+export interface ConsumerRebalanceListener {
+  onPartitionsRevoked?(payload: ConsumerRebalancePayload): void | Promise<void>
+  onPartitionsAssigned?(payload: ConsumerRebalancePayload): void | Promise<void>
+  onPartitionsLost?(payload: ConsumerRebalancePayload): void | Promise<void>
+}
+
 export type ConsumerRunConfig = {
+  /** Awaited rebalance callbacks owned by this run. */
+  rebalanceListener?: ConsumerRebalanceListener
   autoCommit?: boolean
   autoCommitInterval?: number | null
   autoCommitThreshold?: number | null
@@ -1875,6 +1892,11 @@ export type Consumer = {
   ): Promise<void>
   stop(): Promise<void>
   run(config?: ConsumerRunConfig): Promise<void>
+  /**
+   * Requests one classic rejoin (KIP-568) and resolves when it is accepted, not when the round ends.
+   * Rejects with the consumer protocol and with a consumer that is not running.
+   */
+  enforceRebalance(reason?: string): Promise<void>
   /**
    * The consumer's group membership, for `transaction.sendOffsets({ consumerGroupMetadata })`.
    * A snapshot taken at the call: read it again after every rebalance.
@@ -2256,6 +2278,25 @@ export class KafkaJSRecordTooLargeError extends KafkaJSNonRetriableError {
       limit: number
       topic?: string
       cause?: Error
+    }
+  )
+}
+
+/** An awaited rebalance callback failed: it threw, or its round ran out of time. Never retried. */
+export class KafkaJSRebalanceListenerError extends KafkaJSNonRetriableError {
+  readonly hook: 'onPartitionsRevoked' | 'onPartitionsAssigned' | 'onPartitionsLost'
+  readonly reason: 'threw' | 'timeout'
+  /** The original Error, or an Error normalized from a non-Error throw. */
+  readonly cause: Error
+  /** The exact thrown value. */
+  readonly thrownValue: unknown
+  constructor(
+    e: Error | string,
+    options: {
+      hook: KafkaJSRebalanceListenerError['hook']
+      reason: KafkaJSRebalanceListenerError['reason']
+      cause: Error
+      thrownValue?: unknown
     }
   )
 }

@@ -89,3 +89,19 @@ test('the no-offset error is exported by both entry points and is not retriable'
     assert.equal(error.reason, reason)
   }
 })
+
+test('the awaited callback error has the same constructor in both entry points', async () => {
+  const cjs = require(PKG)
+  const esm = await import(PKG)
+  assert.equal(typeof cjs.KafkaJSRebalanceListenerError, 'function')
+  assert.equal(esm.KafkaJSRebalanceListenerError, cjs.KafkaJSRebalanceListenerError)
+  const cause = new Error('external offset store')
+  const error = new esm.KafkaJSRebalanceListenerError('failed', {
+    hook: 'onPartitionsAssigned',
+    reason: 'threw',
+    cause,
+    thrownValue: cause,
+  })
+  assert.equal(error.cause, cause)
+  assert.equal(error.thrownValue, cause)
+})
