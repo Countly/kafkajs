@@ -21,6 +21,7 @@ const {
   pollUntil,
 } = require('../../producer/__tests__/fixtures/bounded')
 const { CleanupStack } = require('../../producer/__tests__/fixtures/liveProbe')
+const { gateNonce } = require('./fixtures/gateNonce')
 
 // Gated: it creates real KIP-848 groups and arms the state fixture's assignment gate. Run alone
 // through the guarded live entry: `npm run test:e2e:consumer-protocol-states` is the developer row.
@@ -590,10 +591,16 @@ const runCapture = async (scope, kind) => {
     logLevel: logLevel.NOTHING,
   })
   const admin = kafka.admin()
-  const capture = new StateCapture({ version, groupId, topic, nonce: `n${id}`, scope })
+  const capture = new StateCapture({ version, groupId, topic, nonce: gateNonce(id), scope })
   const control =
     kind === 'reconciling'
-      ? new StateCapture({ version, groupId: `${groupId}-control`, topic, nonce: `n${id}c`, scope })
+      ? new StateCapture({
+          version,
+          groupId: `${groupId}-control`,
+          topic,
+          nonce: gateNonce(id, 'c'),
+          scope,
+        })
       : null
   let topicStarted = false
   const cleanup = new CleanupStack()
