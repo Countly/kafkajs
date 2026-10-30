@@ -533,9 +533,9 @@ describe.each(['magic', 'decompression'])(
         ...(reason === 'decompression' && { nextOffset: '4', codec: 'gzip', limit: 1073741824 }),
       })
       expect(payload.error).toMatchObject({ reason, offset: '3', retriable: false })
-      expect(halt.errors.filter(({ message }) => message.includes('corrupt record batch'))).toEqual(
-        [expect.objectContaining({ topic: TOPIC, partition: 0, offset: '3', reason })]
-      )
+      expect(halt.errors.filter(({ message }) => message.includes('Halted a partition'))).toEqual([
+        expect.objectContaining({ topic: TOPIC, partition: 0, offset: '3', reason }),
+      ])
       expect(later).not.toContain(0)
       expect(halt.fetched(0).filter(({ partition }) => partition === 0)).toHaveLength(1)
       expect(halt.position(0)).toBe('3')
@@ -1003,7 +1003,7 @@ describe.each(['magic', 'decompression'])(
 
         expect(halt.halts).toHaveLength(1)
         expect(
-          halt.errors.filter(({ message }) => message.includes('corrupt record batch'))
+          halt.errors.filter(({ message }) => message.includes('Halted a partition'))
         ).toHaveLength(1)
         expect(halt.group.haltedPartitions.get(`${TOPIC}|0`)).toMatchObject({ offset: '0' })
       })

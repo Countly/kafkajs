@@ -165,8 +165,10 @@ const start = async (ctx, kind, { index, partition, partitions }) => {
  * What the ordering must leave, from the precedence rules alone: operations are fenced by what
  * was applied to their cell, or by a barrier, before they completed. A mutation applies unless a
  * newer-begun mutation applied first or a barrier came first; a read writes an unresolved cell
- * only if neither happened; every owed cell is reset by a write, a seek, a commit or a publication.
- * @returns {{ before: object[], after: string[] }} each cell's state before and after quiescence
+ * only if neither happened; an owed cell stays owed through any write of a read and is settled
+ * only by a confirmed seek, commit or publication.
+ * @returns {{ before: object[], after: string[], obligations: number }} each cell's state before
+ *   and after quiescence, and how many topics still owe a reset
  */
 const expectedState = (shape, partitionCount, order) => {
   const cells = Array.from({ length: partitionCount }, () => ({
@@ -194,7 +196,6 @@ const expectedState = (shape, partitionCount, order) => {
         if (!cell.fenced && cell.cache === undefined) {
           const reset = cell.owed || kind === 'resolver'
           cell.cache = reset ? (kind === 'resolver' ? RESOLVER_ANSWER : '0') : EPOCH_OFFSET
-          cell.owed = reset ? false : cell.owed
         }
       }
     } else if (MUTATIONS.has(kind)) {
@@ -219,7 +220,7 @@ const expectedState = (shape, partitionCount, order) => {
     cache === undefined ? (owed ? '0' : stored[partition]) : cache
   )
 
-  return { before, after }
+  return { before, after, obligations: cells.some(({ owed }) => owed) ? 1 : 0 }
 }
 
 /** Runs one ordering of one shape and returns what the manager holds, before and after quiescence. */
@@ -259,7 +260,7 @@ const check = async (name, shape, partitionCount, order, seed) => {
     expect(actual.committed).toEqual(expected.after)
     expect(actual.epochs.every((epoch) => epoch === -1)).toBe(true)
     expect(actual.ledger).toBe(0)
-    expect(actual.obligations).toBe(0)
+    expect(actual.obligations).toBe(expected.obligations)
   } catch (error) {
     error.message += `\n\nrecord in fixtures/schedules.json: ${JSON.stringify({ name, shape, partitions: partitionCount, order, seed })}`
     throw error

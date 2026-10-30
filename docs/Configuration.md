@@ -470,6 +470,10 @@ The function has the following signature: `(error: Error) => Promise<boolean>`
 
 When `restartOnFailure` is provided, it is authoritative for **every** terminal death of the consumer, retriable or not — this is a deliberate change from earlier versions, where the callback was only consulted for retriable errors. If you need to tell retriable and non-retriable errors apart inside the callback, inspect the error passed to it (for example `error.retriable` or `error.name === 'KafkaJSNumberOfRetriesExceeded'`).
 
+## Offset reset policy
+
+Offset reset policy is configured per subscribe call, rather than in the Kafka constructor. See [fromBeginning](Consuming.md#from-beginning) for earliest, latest, none and by_duration, their explicit fromBeginning conflicts and runtime validation. The duration declaration requires TypeScript 4.1 or later.
+
 ## Logging
 
 KafkaJS has a built-in `STDOUT` logger which outputs JSON. It also accepts a custom log creator which allows you to integrate your favorite logger library. There are 5 log levels available: `NOTHING`, `ERROR`, `WARN`, `INFO`, and `DEBUG`. `INFO` is configured by default.

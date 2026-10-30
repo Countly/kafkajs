@@ -1698,23 +1698,39 @@ export type ConsumerPartitionsEvent = InstrumentationEvent<{
 export type ConsumerPartitionsAssignedEvent = ConsumerPartitionsEvent
 export type ConsumerPartitionsRevokedEvent = ConsumerPartitionsEvent
 export type ConsumerPartitionsLostEvent = ConsumerPartitionsEvent
-/** A structurally corrupt Fetch batch halted one partition; a seek past the batch resumes it. */
-export interface ConsumerPartitionHaltedEventPayload {
+export interface ConsumerPartitionHaltedBase {
   groupId: string
   memberId: string
   topic: string
   partition: number
-  /** The first offset of the unreadable batch, as a decimal string. */
-  offset: string
-  reason: KafkaJSCorruptRecordError['reason']
-  error: KafkaJSCorruptRecordError
-  /** Where `consumer.seek` goes to skip the batch; only for a validated batch boundary. */
-  nextOffset?: string
-  /** The codec of a compressed batch, when present on the error. */
-  codec?: 'gzip' | 'snappy' | 'lz4' | 'zstd'
-  /** The bound in force: bytes, or records for a `count` over the record ceiling. */
-  limit?: number
 }
+/**
+ * One partition halted. A structurally corrupt Fetch batch halts it and a seek past the batch
+ * resumes it; under `offsetReset: 'none'` a missing, out-of-range or truncated position halts it
+ * until an explicit seek, a revoke, a recreation or a restart.
+ */
+export type ConsumerPartitionHaltedEventPayload = ConsumerPartitionHaltedBase &
+  (
+    | {
+        reason: KafkaJSCorruptRecordError['reason']
+        /** The first offset of the unreadable batch, as a decimal string. */
+        offset: string
+        error: KafkaJSCorruptRecordError
+        /** Where `consumer.seek` goes to skip the batch; only for a validated batch boundary. */
+        nextOffset?: string
+        /** The codec of a compressed batch, when present on the error. */
+        codec?: 'gzip' | 'snappy' | 'lz4' | 'zstd'
+        /** The bound in force: bytes, or records for a `count` over the record ceiling. */
+        limit?: number
+      }
+    | { reason: 'no-offset'; offset: null; error: KafkaJSNoOffsetError }
+    | {
+        reason: 'offset-out-of-range'
+        /** The offset the Fetch asked for, as a decimal string, when it is known. */
+        offset: string | null
+        error: KafkaJSNoOffsetError
+      }
+  )
 export type ConsumerPartitionHaltedEvent = InstrumentationEvent<ConsumerPartitionHaltedEventPayload>
 export type ConsumerPollIntervalExceededEvent = InstrumentationEvent<{
   groupId: string
@@ -1786,6 +1802,9 @@ export type ConsumerRunConfig = {
   eachMessage?: EachMessageHandler
 }
 
+/** Starting policy when no usable committed offset exists. TypeScript 4.1 or later. */
+export type ConsumerOffsetReset = 'earliest' | 'latest' | 'none' | `by_duration:${string}`
+
 /**
  * @deprecated Replaced by ConsumerSubscribeTopics
  */
@@ -1794,12 +1813,14 @@ export type ConsumerSubscribeTopic = {
   topics?: never
   regex?: never
   fromBeginning?: boolean
+  offsetReset?: ConsumerOffsetReset
 }
 export type ConsumerSubscribeTopics = {
   topics: (string | RegExp)[]
   topic?: never
   regex?: never
   fromBeginning?: boolean
+  offsetReset?: ConsumerOffsetReset
 }
 /**
  * A broker-evaluated regular expression subscription, available only under
@@ -1813,6 +1834,7 @@ export type ConsumerSubscribeRegex = {
   topic?: never
   topics?: never
   fromBeginning?: boolean
+  offsetReset?: ConsumerOffsetReset
 }
 
 export type Consumer = {
@@ -1994,6 +2016,21 @@ export class KafkaJSError extends Error {
 
 export class KafkaJSNonRetriableError extends KafkaJSError {
   constructor(e: Error | string)
+}
+
+/** A partition with the none policy needs an explicit starting position. */
+export class KafkaJSNoOffsetError extends KafkaJSNonRetriableError {
+  readonly topic: string
+  readonly partition: number
+  readonly reason: 'no-offset' | 'offset-out-of-range'
+  constructor(
+    e: Error | string,
+    options: {
+      topic: string
+      partition: number
+      reason: KafkaJSNoOffsetError['reason']
+    }
+  )
 }
 
 export class KafkaJSProtocolError extends KafkaJSError {

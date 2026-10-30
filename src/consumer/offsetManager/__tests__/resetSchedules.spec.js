@@ -41,8 +41,8 @@ describe('Consumer > OffsetManager > reset schedules', () => {
 
       expect(ctx.next()).toEqual('0')
       expect(ctx.committedAt()).toEqual('0')
-      expect(ctx.owed()).toBe(false)
-      expect(ctx.obligations.size()).toBe(0)
+      expect(ctx.owed()).toBe(true)
+      expect(ctx.obligations.size()).toBe(1)
     })
 
     test('P02 a cache cleared during ListOffsets and repopulated with the same id does not discard the reset', async () => {
@@ -60,7 +60,7 @@ describe('Consumer > OffsetManager > reset schedules', () => {
 
       expect(ctx.next()).toEqual('0')
       expect(ctx.committedAt()).toEqual('0')
-      expect(ctx.obligations.size()).toBe(0)
+      expect(ctx.obligations.size()).toBe(1)
     })
 
     test('P03 a resolver that starts after another has passed the reset does not seed the old offset', async () => {
@@ -79,7 +79,7 @@ describe('Consumer > OffsetManager > reset schedules', () => {
 
       expect(ctx.next()).toEqual('0')
       expect(ctx.committedAt()).toEqual('0')
-      expect(ctx.owed()).toBe(false)
+      expect(ctx.owed()).toBe(true)
     })
 
     test('P04 a first id learned during OffsetFetch is not a recreation: the committed offset is used at once', async () => {
@@ -117,7 +117,7 @@ describe('Consumer > OffsetManager > reset schedules', () => {
 
       expect(ctx.next()).toEqual('0')
       expect(ctx.committedAt()).toEqual('0')
-      expect(ctx.obligations.size()).toBe(0)
+      expect(ctx.obligations.size()).toBe(1)
     })
   })
 
@@ -187,7 +187,7 @@ describe('Consumer > OffsetManager > reset schedules', () => {
 
       expect(ctx.next()).toEqual('50')
       expect(ctx.committedAt()).toEqual('0')
-      expect(ctx.owed()).toBe(false)
+      expect(ctx.owed()).toBe(true)
     })
 
     test('P10 a seek without auto-commit between two resolvers survives the second one', async () => {
@@ -200,7 +200,7 @@ describe('Consumer > OffsetManager > reset schedules', () => {
 
       expect(ctx.next()).toEqual('500')
       expect(ctx.committedAt()).toEqual('0')
-      expect(ctx.owed()).toBe(false)
+      expect(ctx.owed()).toBe(true)
     })
   })
 
@@ -218,7 +218,7 @@ describe('Consumer > OffsetManager > reset schedules', () => {
 
       expect(ctx.next()).toEqual('0')
       expect(ctx.committedAt()).toEqual('0')
-      expect(ctx.owed()).toBe(false)
+      expect(ctx.owed()).toBe(true)
       expect(ctx.cluster.fetchTopicsOffset).toHaveBeenCalledTimes(2)
     })
 
@@ -281,7 +281,7 @@ describe('Consumer > OffsetManager > reset schedules', () => {
 
       expect(ctx.next()).toEqual('0')
       expect(ctx.committedAt()).toEqual('0')
-      expect(ctx.owed()).toBe(false)
+      expect(ctx.owed()).toBe(true)
     })
 
     test('P16 a known recreation during ListOffsets drops the old answer', async () => {
@@ -300,7 +300,7 @@ describe('Consumer > OffsetManager > reset schedules', () => {
 
       expect(ctx.next()).toEqual('0')
       expect(ctx.committedAt()).toEqual('0')
-      expect(ctx.owed()).toBe(false)
+      expect(ctx.owed()).toBe(true)
     })
 
     test('P17 an old OffsetFetch before a fresh resolution leaves the new reset to be applied', async () => {
@@ -320,11 +320,11 @@ describe('Consumer > OffsetManager > reset schedules', () => {
 
       expect(ctx.next()).toEqual('0')
       expect(ctx.committedAt()).toEqual('0')
-      expect(ctx.owed()).toBe(false)
+      expect(ctx.owed()).toBe(true)
     })
   })
 
-  describe('a sibling resolver settles the reset while an older request is in flight', () => {
+  describe('a sibling resolver resolves the reset while an older request is in flight', () => {
     test('N01 an OffsetFetch sent with an unknown id does not overwrite the reset a sibling made', async () => {
       const ctx = createScheduledOffsetManager()
       const old = ctx.schedule.hold({ api: 'OffsetFetch' })
@@ -339,7 +339,7 @@ describe('Consumer > OffsetManager > reset schedules', () => {
       await expect(stale).resolves.toBe(false)
       expect(ctx.next()).toEqual('0')
       expect(ctx.committedAt()).toEqual('0')
-      expect(ctx.obligations.size()).toBe(0)
+      expect(ctx.obligations.size()).toBe(1)
     })
 
     test('N02 a ListOffsets sent with an unknown id does not overwrite the reset a sibling made', async () => {
@@ -356,7 +356,7 @@ describe('Consumer > OffsetManager > reset schedules', () => {
       await expect(stale).resolves.toBe(false)
       expect(ctx.next()).toEqual('0')
       expect(ctx.committedAt()).toEqual('0')
-      expect(ctx.obligations.size()).toBe(0)
+      expect(ctx.obligations.size()).toBe(1)
     })
 
     test('N03 the same, when the sibling that reset the topic is a manager built by a rejoin', async () => {
@@ -374,7 +374,7 @@ describe('Consumer > OffsetManager > reset schedules', () => {
       await expect(stale).resolves.toBe(false)
       expect(rejoined.nextOffset(TOPIC, 0).toString()).toEqual('0')
       expect(ctx.committedAt()).toEqual('0')
-      expect(ctx.obligations.size()).toBe(0)
+      expect(ctx.obligations.size()).toBe(1)
     })
 
     test('N04 a resolver that finishes first keeps its reset when a sibling started with it finishes later', async () => {
@@ -385,7 +385,7 @@ describe('Consumer > OffsetManager > reset schedules', () => {
 
       expect(ctx.next()).toEqual('0')
       expect(ctx.committedAt()).toEqual('0')
-      expect(ctx.owed()).toBe(false)
+      expect(ctx.owed()).toBe(true)
     })
 
     test('N06 six overlapping resolvers settle on the reset', async () => {
@@ -396,7 +396,7 @@ describe('Consumer > OffsetManager > reset schedules', () => {
 
       expect(ctx.next()).toEqual('0')
       expect(ctx.committedAt()).toEqual('0')
-      expect(ctx.obligations.size()).toBe(0)
+      expect(ctx.obligations.size()).toBe(1)
     })
 
     test('N07 an OffsetFetch answered across a recreation, with the id unknown, is dropped and the next resolution resets', async () => {
@@ -416,7 +416,7 @@ describe('Consumer > OffsetManager > reset schedules', () => {
 
       expect(ctx.next()).toEqual('0')
       expect(ctx.committedAt()).toEqual('0')
-      expect(ctx.obligations.size()).toBe(0)
+      expect(ctx.obligations.size()).toBe(1)
     })
   })
 
@@ -469,12 +469,12 @@ describe('Consumer > OffsetManager > reset schedules', () => {
 
       expect(ctx.next()).toEqual('50')
       expect(ctx.committedAt()).toEqual('0')
-      expect(ctx.owed()).toBe(false)
+      expect(ctx.owed()).toBe(true)
     })
   })
 
   describe('an id learned or lost around a sibling that already reset the topic', () => {
-    test('G01 a sibling that learned the id first settles the reset for the resolver that did not know it', async () => {
+    test('G01 a sibling that learned the id first resolves the reset for the resolver that did not know it', async () => {
       const ctx = createScheduledOffsetManager()
       ctx.obligations.owe(TOPIC, NEW_ID)
       const first = ctx.schedule.hold({ api: 'OffsetFetch' })
@@ -488,7 +488,7 @@ describe('Consumer > OffsetManager > reset schedules', () => {
 
       expect(ctx.next()).toEqual('0')
       expect(ctx.committedAt()).toEqual('0')
-      expect(ctx.obligations.size()).toBe(0)
+      expect(ctx.obligations.size()).toBe(1)
     })
 
     test('G02 a later resolution cannot bring back the offset the reset replaced', async () => {
@@ -506,8 +506,8 @@ describe('Consumer > OffsetManager > reset schedules', () => {
 
       expect(ctx.next()).toEqual('0')
       expect(ctx.committedAt()).toEqual('0')
-      expect(ctx.cluster.fetchTopicsOffset).toHaveBeenCalledTimes(1)
-      expect(ctx.owed()).toBe(false)
+      expect(ctx.cluster.fetchTopicsOffset).toHaveBeenCalledTimes(2)
+      expect(ctx.owed()).toBe(true)
     })
 
     test('G03 a cleared metadata cache after the sibling reset does not let the old answer through', async () => {
@@ -524,7 +524,7 @@ describe('Consumer > OffsetManager > reset schedules', () => {
 
       expect(ctx.next()).toEqual('0')
       expect(ctx.committedAt()).toEqual('0')
-      expect(ctx.obligations.size()).toBe(0)
+      expect(ctx.obligations.size()).toBe(1)
     })
 
     test('G04 two resolvers that start under a new id and an owed reset end on the reset', async () => {
@@ -544,7 +544,7 @@ describe('Consumer > OffsetManager > reset schedules', () => {
 
       expect(ctx.next()).toEqual('0')
       expect(ctx.committedAt()).toEqual('0')
-      expect(ctx.obligations.size()).toBe(0)
+      expect(ctx.obligations.size()).toBe(1)
     })
   })
 
@@ -566,7 +566,7 @@ describe('Consumer > OffsetManager > reset schedules', () => {
       expect(ctx.cluster.fetchTopicsOffset).toHaveBeenCalledTimes(2)
       expect(ctx.next()).toEqual('0')
       expect(ctx.cache[TOPIC]).toEqual({ 0: '0' })
-      expect(ctx.obligations.size()).toBe(0)
+      expect(ctx.obligations.size()).toBe(1)
     })
 
     test('W2 a ListOffsets that fails leaves nothing written and the reset owed, so the next resolution resets again', async () => {
@@ -581,7 +581,7 @@ describe('Consumer > OffsetManager > reset schedules', () => {
       await ctx.manager.resolveOffsets()
 
       expect(ctx.cache[TOPIC]).toEqual({ 0: '0' })
-      expect(ctx.obligations.size()).toBe(0)
+      expect(ctx.obligations.size()).toBe(1)
       expect(ctx.next()).toEqual('0')
     })
 
@@ -602,7 +602,7 @@ describe('Consumer > OffsetManager > reset schedules', () => {
       await ctx.manager.resolveOffsets()
 
       expect(ctx.cache[TOPIC]).toEqual({ 0: '0' })
-      expect(ctx.obligations.size()).toBe(0)
+      expect(ctx.obligations.size()).toBe(1)
       expect(ctx.next()).toEqual('0')
     })
   })
@@ -669,7 +669,7 @@ describe('Consumer > OffsetManager > reset schedules', () => {
 
       expect(ctx.next()).toEqual('0')
       expect(ctx.committedAt()).toEqual('0')
-      expect(ctx.owed()).toBe(false)
+      expect(ctx.owed()).toBe(true)
     })
 
     test('C4 a seek whose commit completes after the partition was revoked and assigned again writes nothing', async () => {
@@ -943,12 +943,12 @@ describe('Consumer > OffsetManager > reset schedules', () => {
       expect(ctx.cluster.fetchTopicsOffset).not.toHaveBeenCalled()
     })
 
-    test('C13 a mutation settles the reset of an unknown topic id, and one made under an older incarnation settles nothing of the newer', async () => {
+    test('C13 a mutation made under an unknown topic id settles nothing, and neither does one made under an older incarnation', async () => {
       const ctx = owingConsumer()
       ctx.setTopicId(undefined)
       const sibling = ctx.build({ obligations: new ResetObligations() })
       await sibling.commitOffsets(commitOf(0, '70'))
-      expect(ctx.owed()).toBe(false)
+      expect(ctx.owed()).toBe(true)
 
       const older = ctx.operations.begin([{ topic: TOPIC, partition: 0 }], { mutation: true })
       ctx.obligations.owe(TOPIC, OLD_ID)
@@ -1079,7 +1079,7 @@ describe('Consumer > OffsetManager > reset schedules', () => {
       expect(ctx.operations.size()).toBe(0)
     })
 
-    test('L06 two hundred recreated topic names leave no entry behind, before and after a disconnect and reuse', async () => {
+    test('L06 two hundred recreated topic names stay owed until a disconnect, which leaves no entry behind, and reuse', async () => {
       const names = Array.from({ length: 200 }, (_, index) => `recreated-${index}`)
       const cache = {}
       const operations = new OffsetOperations()
@@ -1146,7 +1146,7 @@ describe('Consumer > OffsetManager > reset schedules', () => {
 
           await manager.resolveOffsets()
 
-          expect(obligations.size()).toBe(0)
+          expect(obligations.size()).toBe(200)
           expect(operations.size()).toBe(0)
           expect(names.every((name) => cache[name][0] === '0')).toBe(true)
           expect(manager.nextOffset(names[0], 0).toString()).toEqual('0')
@@ -1162,7 +1162,7 @@ describe('Consumer > OffsetManager > reset schedules', () => {
         })
         expect(operations.size()).toBe(0)
 
-        expect(obligations.size()).toBe(0)
+        expect(obligations.size()).toBe(200)
         await consumer.disconnect()
         expect(obligations.size()).toBe(0)
         expect(operations.size()).toBe(0)
@@ -1222,7 +1222,7 @@ describe('Consumer > OffsetManager > reset schedules', () => {
       await expect(ctx.manager.resolveOffsets()).resolves.toBe(true)
       expect(ctx.next()).toEqual('0')
       expect(ctx.committedAt()).toEqual('0')
-      expect(ctx.obligations.size()).toBe(0)
+      expect(ctx.obligations.size()).toBe(1)
       expect(ctx.operations.size()).toBe(0)
     })
 
@@ -1281,7 +1281,7 @@ describe('Consumer > OffsetManager > reset schedules', () => {
 
       await expect(resolving).resolves.toBe(true)
       expect(ctx.committedAt()).toEqual('0')
-      expect(ctx.owed()).toBe(false)
+      expect(ctx.owed()).toBe(true)
     })
 
     test.each([
@@ -1414,7 +1414,7 @@ describe('Consumer > OffsetManager > reset schedules', () => {
         expect(jest.getTimerCount()).toBe(0)
         expect(ctx.committedAt(0)).toEqual('0')
         expect(ctx.committedAt(1)).toEqual('0')
-        expect(ctx.obligations.size()).toBe(0)
+        expect(ctx.obligations.size()).toBe(1)
       } finally {
         jest.useRealTimers()
         await harness.broker.disconnect()

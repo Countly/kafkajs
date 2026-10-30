@@ -953,6 +953,8 @@ Connection or coordinator failures in the consumer protocol no longer spend the 
 
 - **Rack-aware range assignment is opt-in.** Set `rackAwareAssignment: true` with `partitionAssigners: [PartitionAssigners.range]`, member rack IDs and broker rack labels to use it. The default is false; sticky, cooperative-sticky and round-robin ignore it. A Java leader can still rack-match with the option off on JavaScript members, so mixed-leader assignments can differ.
 
+- **Offset reset policies and the halt reasons.** Switches on `consumer.partition_halted` must handle `'no-offset'` and `'offset-out-of-range'`. The no-offset branch has `offset: null`; out-of-range has a decimal offset or null. Existing corrupt/decode branches keep decimal offsets and the inherited codec, limit and nextOffset fields. The `ConsumerOffsetReset` duration form requires TypeScript 4.1 or later. `fromBeginning` and its default stay unchanged. Explicit `fromBeginning` may accompany only its matching earliest/latest policy; either explicit boolean conflicts with none or by_duration. With by_duration and autoCommit disabled, no reset or subsequent seek automatically commits a timestamp, sentinel or real offset. Commit an actual offset explicitly when required.
+
 ### Admin
 
 Group visibility and the admin client.

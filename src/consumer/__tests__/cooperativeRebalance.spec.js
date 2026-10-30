@@ -1215,7 +1215,7 @@ describe('Consumer > cooperative rebalance apply', () => {
 
     it('survives the pre-release commit writing a key the apply then deletes', async () => {
       const committedOffsets = {}
-      const cluster = { committedOffsets: () => committedOffsets }
+      const cluster = { committedOffsets: () => committedOffsets, topicId: () => undefined }
       const offsetCommit = jest.fn(async () => {})
       // Both managers are built BEFORE the cache is seeded: a fresh manager resets its own
       // partitions, so seeding first would be undone here rather than in production.

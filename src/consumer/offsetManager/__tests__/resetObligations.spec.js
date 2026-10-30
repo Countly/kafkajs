@@ -110,6 +110,30 @@ describe('Consumer > ResetObligations', () => {
       expect(obligations.size()).toBe(0)
     })
 
+    test('a partial or empty assignment does not delete a debt another known partition owes', () => {
+      obligations.owe(T, NEW)
+      obligations.discharge(T, 0)
+
+      obligations.settle(T, [], [0, 1])
+      obligations.settle(T, [0], [0, 1])
+      expect(obligations.size()).toBe(1)
+
+      obligations.discharge(T, 1)
+      obligations.settle(T, [], [0, 1])
+      expect(obligations.size()).toBe(0)
+    })
+
+    test('metadata that could not be verified keeps the debt', () => {
+      obligations.owe(T, NEW)
+      obligations.discharge(T, 0)
+
+      obligations.settle(T, [0], [])
+      expect(obligations.size()).toBe(1)
+
+      obligations.settle(T, [0])
+      expect(obligations.size()).toBe(0)
+    })
+
     test('a partition no longer assigned does not hold the entry', () => {
       obligations.owe(T, NEW)
       obligations.discharge(T, 1)

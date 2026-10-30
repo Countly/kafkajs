@@ -18,6 +18,7 @@ export const {
   ConfigTypes,
   KafkaJSError,
   KafkaJSNonRetriableError,
+  KafkaJSNoOffsetError,
   KafkaJSPartialMessageError,
   KafkaJSBrokerNotFound,
   KafkaJSProtocolError,

@@ -50,6 +50,7 @@ import {
   TransactionOffsets,
   KafkaJSErrorCategory,
   KafkaJSNonRetriableError,
+  KafkaJSNoOffsetError,
   KafkaJSRefreshRetriableError,
   KafkaJSTransactionAbortableError,
   KafkaJSApplicationRecoverableError,
@@ -446,23 +447,35 @@ consumer.on(consumer.events.PARTITIONS_LOST, e => {
   void generationId
 })
 consumer.on(consumer.events.PARTITION_HALTED, e => {
-  const offset: string = e.payload.offset
-  const reason: 'length' | 'magic' | 'count' | 'control' | 'checksum' | 'decompressed-size' | 'decompression' = e.payload.reason
-  const error: KafkaJSCorruptRecordError = e.payload.error
   const partition: number = e.payload.partition
-  const nextOffset: string | undefined = e.payload.nextOffset
-  const codec: 'gzip' | 'snappy' | 'lz4' | 'zstd' | undefined = e.payload.codec
-  const limit: number | undefined = e.payload.limit
-  // @ts-expect-error an unknown halt reason is not part of the event contract
-  const unknownReason: 'unknown' = e.payload.reason
-  void offset
-  void reason
-  void error
   void partition
-  void nextOffset
-  void codec
-  void limit
-  void unknownReason
+  if (e.payload.reason === 'no-offset') {
+    const missing: null = e.payload.offset
+    const refusal: KafkaJSNoOffsetError = e.payload.error
+    void missing
+    void refusal
+  } else if (e.payload.reason === 'offset-out-of-range') {
+    const attempted: string | null = e.payload.offset
+    const refusal: KafkaJSNoOffsetError = e.payload.error
+    void attempted
+    void refusal
+  } else {
+    const offset: string = e.payload.offset
+    const reason: 'length' | 'magic' | 'count' | 'control' | 'checksum' | 'decompressed-size' | 'decompression' = e.payload.reason
+    const error: KafkaJSCorruptRecordError = e.payload.error
+    const nextOffset: string | undefined = e.payload.nextOffset
+    const codec: 'gzip' | 'snappy' | 'lz4' | 'zstd' | undefined = e.payload.codec
+    const limit: number | undefined = e.payload.limit
+    // @ts-expect-error an unknown halt reason is not part of the event contract
+    const unknownReason: 'unknown' = e.payload.reason
+    void offset
+    void reason
+    void error
+    void nextOffset
+    void codec
+    void limit
+    void unknownReason
+  }
 })
 consumer.on(consumer.events.POLL_INTERVAL_EXCEEDED, e => {
   const elapsed: number = e.payload.elapsedMs
@@ -517,6 +530,22 @@ regexConsumer.subscribe({ regex: '^orders-.*', topics: ['t'] })
 regexConsumer.subscribe({ regex: '^orders-.*', topic: 't' })
 // @ts-expect-error and the two topic forms stay mutually exclusive
 regexConsumer.subscribe({ topic: 't', topics: ['t'] })
+
+// The reset policy compiles on every subscribe form, and the error carries its reason.
+regexConsumer.subscribe({ regex: '^orders-.*', offsetReset: 'by_duration:PT10M' })
+regexConsumer.subscribe({ topics: ['t'], offsetReset: 'none' })
+regexConsumer.subscribe({ topic: 't', offsetReset: 'earliest' })
+// @ts-expect-error a duration is a string
+regexConsumer.subscribe({ topics: ['t'], offsetReset: 600000 })
+// @ts-expect-error not a policy
+regexConsumer.subscribe({ topics: ['t'], offsetReset: 'sometimes' })
+const noOffset = new KafkaJSNoOffsetError('x', { topic: 't', partition: 0, reason: 'no-offset' })
+const noOffsetIsNonRetriable: KafkaJSNonRetriableError = noOffset
+const noOffsetReason: 'no-offset' | 'offset-out-of-range' = noOffset.reason
+const noOffsetPartition: number = noOffset.partition
+// @ts-expect-error not a reason
+new KafkaJSNoOffsetError('x', { topic: 't', partition: 0, reason: 'corrupt' })
+void [noOffsetIsNonRetriable, noOffsetReason, noOffsetPartition]
 
 // `groupRemoteAssignor: null` is the documented default and compiles under both protocols.
 kafka.consumer({ groupId: 'g', groupRemoteAssignor: null })

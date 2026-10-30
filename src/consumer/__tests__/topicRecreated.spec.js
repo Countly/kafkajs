@@ -241,7 +241,7 @@ describe('Consumer > topic recreation', () => {
       ).not.toThrow()
     })
 
-    test('a consumer that calls only subscribe() and run(), never connect(), still performs the one-shot reset on TOPIC_RECREATED', async () => {
+    test('a consumer that calls only subscribe() and run(), never connect(), still performs the reset on TOPIC_RECREATED', async () => {
       // The headline case: connect() is optional, so a connect()-time subscription would leave
       // this shape with zero listeners and the reset silently inert.
       const cluster = createCluster({ topicIds: { [TOPIC]: ID_B } })
@@ -251,8 +251,9 @@ describe('Consumer > topic recreation', () => {
       cluster.emitRecreated({ topic: TOPIC, previousTopicId: ID_A, topicId: ID_B })
       expect(obligations.current(TOPIC)).toEqual(ID_B)
 
-      // …and the obligation is really settled: a sync's OffsetManager, built with that same
-      // table, ignores the coordinator's committed offset once and resolves per fromBeginning.
+      // …and the obligation is really recorded: a sync's OffsetManager, built with that same
+      // table, ignores the coordinator's committed offset and resolves per fromBeginning, and the
+      // reset stays owed until a commit settles it.
       const fetched = []
       cluster.fetchTopicsOffset = async (topics) => {
         fetched.push(topics)
@@ -290,7 +291,7 @@ describe('Consumer > topic recreation', () => {
       expect(fetched).toHaveLength(1)
       expect(fetched[0][0]).toMatchObject({ topic: TOPIC, fromBeginning: true })
       expect(offsetManager.committedOffsets()[TOPIC][0]).toEqual('0')
-      expect(obligations.size()).toEqual(0)
+      expect(obligations.size()).toEqual(1)
     })
   })
 
@@ -434,7 +435,7 @@ describe('Consumer > topic recreation', () => {
       expect(offsetManager.committedOffsets()[TOPIC][0]).toEqual('99')
     })
 
-    test('resolveOffsets after a reset ignores the coordinator committed offset once and resolves per fromBeginning', async () => {
+    test('resolveOffsets after a reset ignores the coordinator committed offset until a commit settles the reset and resolves per fromBeginning', async () => {
       const obligations = owing(TOPIC, ID_B)
       const { offsetManager, fetched } = manager({
         obligations,
@@ -446,12 +447,12 @@ describe('Consumer > topic recreation', () => {
       expect(fetched).toHaveLength(1)
       expect(fetched[0][0]).toMatchObject({ topic: TOPIC, fromBeginning: true })
       expect(offsetManager.committedOffsets()[TOPIC][0]).toEqual('0')
-      expect(obligations.size()).toEqual(0)
+      expect(obligations.size()).toEqual(1)
 
-      // settled: the next resolution is normal again
+      // still owed: the next resolution resets again
       offsetManager.committedOffsets()[TOPIC] = {}
       await offsetManager.resolveOffsets()
-      expect(offsetManager.committedOffsets()[TOPIC][0]).toEqual('99')
+      expect(offsetManager.committedOffsets()[TOPIC][0]).toEqual('0')
     })
 
     test('a pending entry whose stamped topic id differs from a known cached id is dropped without resetting', async () => {
@@ -487,7 +488,7 @@ describe('Consumer > topic recreation', () => {
 
       expect(obligations.current('not-assigned')).toEqual(ID_B)
 
-      // …and is settled at the first resolveOffsets() after a sync assigns it - a fresh
+      // …and is resolved at the first resolveOffsets() after a sync assigns it - a fresh
       // OffsetManager, as a sync would build, sharing the same table by reference.
       const cluster = createCluster({ topicIds: { 'not-assigned': ID_B } })
       const fetched = []
@@ -526,7 +527,7 @@ describe('Consumer > topic recreation', () => {
 
       expect(fetched).toHaveLength(1)
       expect(assignedManager.committedOffsets()['not-assigned'][0]).toEqual('0')
-      expect(obligations.size()).toEqual(0)
+      expect(obligations.size()).toEqual(1)
     })
   })
 
@@ -591,7 +592,7 @@ describe('Consumer > topic recreation', () => {
       jest.restoreAllMocks()
     })
 
-    test('after N crash-restarts the emitter still has exactly one cluster.topic_recreated listener, and a TOPIC_RECREATED after a restart still performs the one-shot reset', async () => {
+    test('after N crash-restarts the emitter still has exactly one cluster.topic_recreated listener, and a TOPIC_RECREATED after a restart still performs the reset', async () => {
       // onCrash runs the disconnect cleanup unconditionally, which removes the listener, then
       // restarts through start() alone - reaching neither run() nor connect(). Without the ensure
       // call at the top of start(), the listener the first crash removed never comes back and
@@ -953,7 +954,9 @@ describe('Consumer > topic recreation', () => {
 
         await consumerGroup.seekOffsets([{ topic: TOPIC, partitions: [0] }])
 
-        expect(fetched).toEqual([])
+        // A confirmed commit settles the reset; a local seek leaves it owed and looked up again.
+        expect(fetched).toHaveLength(autoCommit ? 0 : 1)
+        expect(consumerGroup.obligations.isOwed(TOPIC, 0)).toBe(!autoCommit)
         if (autoCommit) {
           expect(offsetCommit).toHaveBeenCalled()
         }

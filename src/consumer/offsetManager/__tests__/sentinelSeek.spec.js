@@ -58,16 +58,13 @@ for (const autoCommit of [false, true]) {
         ctx.manager.topicConfigurations[TOPIC].fromBeginning = fromBeginning
         await seek(ctx, sentinel)
         await expect(ctx.manager.resolveOffsets()).resolves.toBe(true)
-        expect(ctx.cluster.fetchTopicsOffset).toHaveBeenCalledWith(
-          [
-            {
-              topic: TOPIC,
-              fromBeginning,
-              partitions: [{ partition: 0, timestamp: Number(sentinel) }],
-            },
-          ],
-          undefined
-        )
+        expect(ctx.cluster.fetchTopicsOffset).toHaveBeenCalledWith([
+          {
+            topic: TOPIC,
+            fromBeginning,
+            partitions: [{ partition: 0, timestamp: Number(sentinel) }],
+          },
+        ])
         expect(ctx.next()).toBe('37')
         expect(ctx.committedAt()).toBe('37')
         expect(ctx.manager.lastConsumedEpoch(TOPIC, 0)).toBe(-1)
@@ -84,19 +81,16 @@ test('opposite sentinels share one topic resolution without affecting an untouch
   await seek(ctx, '-2', 0)
   await seek(ctx, '-1', 1)
   await ctx.manager.resolveOffsets()
-  expect(ctx.cluster.fetchTopicsOffset).toHaveBeenCalledWith(
-    [
-      {
-        topic: TOPIC,
-        fromBeginning: true,
-        partitions: [
-          { partition: 0, timestamp: -2 },
-          { partition: 1, timestamp: -1 },
-        ],
-      },
-    ],
-    undefined
-  )
+  expect(ctx.cluster.fetchTopicsOffset).toHaveBeenCalledWith([
+    {
+      topic: TOPIC,
+      fromBeginning: true,
+      partitions: [
+        { partition: 0, timestamp: -2 },
+        { partition: 1, timestamp: -1 },
+      ],
+    },
+  ])
   expect([ctx.next(0), ctx.next(1), ctx.next(2)]).toEqual(['37', '37', '99'])
   expect(ctx.manager.pendingSeeks.size).toBe(0)
 })
@@ -295,18 +289,18 @@ test('topic recreation clears an old sentinel and leaves its reset obligation ow
   expect(ctx.owed()).toBe(true)
 })
 
-test('successful sentinel publication discharges the recreation obligation', async () => {
+test('successful sentinel publication leaves the recreation obligation owed', async () => {
   const ctx = fixture({ topicId: NEW_ID })
   ctx.obligations.owe(TOPIC, NEW_ID)
   await seek(ctx, '-1')
   expect(ctx.owed()).toBe(true)
   await ctx.manager.resolveOffsets()
-  expect(ctx.owed()).toBe(false)
-  expect(ctx.obligations.size()).toBe(0)
+  expect(ctx.owed()).toBe(true)
+  expect(ctx.obligations.size()).toBe(1)
   expect(ctx.manager.pendingSeeks.size).toBe(0)
 })
 
-test('a sentinel publication settles the reset of another consumer of the group too', async () => {
+test('a sentinel publication leaves the reset of another consumer of the group owed too', async () => {
   const ctx = fixture({ topicId: NEW_ID })
   const other = new ResetObligations()
   other.attachTo(ctx.operations)
@@ -315,7 +309,7 @@ test('a sentinel publication settles the reset of another consumer of the group 
   await seek(ctx, '-1')
   expect(other.isOwed(TOPIC, 0)).toBe(true)
   await ctx.manager.resolveOffsets()
-  expect(other.isOwed(TOPIC, 0)).toBe(false)
+  expect(other.isOwed(TOPIC, 0)).toBe(true)
   other.clear()
 })
 
@@ -349,8 +343,8 @@ const expectReset = (ctx, { position, cache, owedAtStop }) => {
   expect(position).toBe('0')
   expect(cache).toBe('0')
   expect(owedAtStop).toBe(true)
-  expect(ctx.owed()).toBe(false)
-  expect(ctx.obligations.size()).toBe(0)
+  expect(ctx.owed()).toBe(true)
+  expect(ctx.obligations.size()).toBe(1)
   expect(ctx.cluster.fetchTopicsOffset.mock.calls.at(-1)[0]).toEqual([
     { topic: TOPIC, fromBeginning: true, partitions: [{ partition: 0 }] },
   ])
@@ -451,13 +445,13 @@ test('a revocation with a pending sentinel leaves the recreation reset owed', as
   expect(ctx.owed()).toBe(true)
 })
 
-test('a concrete seek after a sentinel settles the recreation reset', async () => {
+test('a concrete seek without auto-commit after a sentinel leaves the recreation reset owed', async () => {
   const ctx = fixture({ topicId: NEW_ID })
   ctx.recreate(NEW_ID)
   await seek(ctx, '-1')
   expect(ctx.owed()).toBe(true)
   await seek(ctx, '44')
-  expect(ctx.owed()).toBe(false)
+  expect(ctx.owed()).toBe(true)
   expect(ctx.next()).toBe('44')
   expect(ctx.manager.pendingSeeks.size).toBe(0)
 })

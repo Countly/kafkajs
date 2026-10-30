@@ -18,6 +18,7 @@ const {
   KafkaJSInvalidConfigurationError,
   KafkaJSDeliveryTimeout,
   KafkaJSProducerClosedError,
+  KafkaJSNoOffsetError,
   KafkaJSAggregateError,
   KafkaJSFetcherRebalanceError,
   KafkaJSConnectionError,
@@ -320,6 +321,7 @@ describe('every error class this package exports carries an own, enumerable cate
     ],
     KafkaJSDeleteTopicRecordsError: () => [{ partitions: [] }],
     KafkaJSProducerClosedError: () => ['closed', { outcome: 'unsent' }],
+    KafkaJSNoOffsetError: () => ['no offset', { topic: 't', partition: 0, reason: 'no-offset' }],
     KafkaJSAggregateError: () => ['two topics failed', []],
   }
   const CLASSES = Object.entries(errors).filter(
@@ -928,5 +930,29 @@ describe('KafkaJSProducerClosedError', () => {
 
   test('is exported from the package entry as the same class', () => {
     expect(packageEntry.KafkaJSProducerClosedError).toBe(KafkaJSProducerClosedError)
+  })
+})
+
+describe('KafkaJSNoOffsetError', () => {
+  test.each(['no-offset', 'offset-out-of-range'])('carries the %s reason', (reason) => {
+    const error = new KafkaJSNoOffsetError('no starting position', {
+      topic: 't',
+      partition: 3,
+      reason,
+    })
+
+    expect(error).toBeInstanceOf(KafkaJSNonRetriableError)
+    expect(error).toMatchObject({
+      name: 'KafkaJSNoOffsetError',
+      message: 'no starting position',
+      topic: 't',
+      partition: 3,
+      reason,
+      retriable: false,
+    })
+  })
+
+  test('is exported from the package entry as the same class', () => {
+    expect(packageEntry.KafkaJSNoOffsetError).toBe(KafkaJSNoOffsetError)
   })
 })

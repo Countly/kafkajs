@@ -57,7 +57,7 @@ describe('Consumer > OffsetManager > reset schedules on the wire', () => {
 
     expect(wire.next()).toEqual('0')
     expect(wire.committedAt()).toEqual('0')
-    expect(wire.obligations.size()).toBe(0)
+    expect(wire.obligations.size()).toBe(1)
     expect(wire.requests().map(({ api }) => api)).toEqual([
       'OffsetFetch',
       'ListOffsets',
@@ -81,7 +81,7 @@ describe('Consumer > OffsetManager > reset schedules on the wire', () => {
 
     expect(wire.next()).toEqual('0')
     expect(wire.committedAt()).toEqual('0')
-    expect(wire.owed()).toBe(false)
+    expect(wire.owed()).toBe(true)
     expect(wire.requests().map(({ api }) => api)).toEqual([
       'OffsetFetch',
       'OffsetFetch',
@@ -105,7 +105,7 @@ describe('Consumer > OffsetManager > reset schedules on the wire', () => {
 
     expect(wire.next()).toEqual('0')
     expect(wire.committedAt()).toEqual('0')
-    expect(wire.owed()).toBe(false)
+    expect(wire.owed()).toBe(true)
     expect(sent(wire, 'ListOffsets')).toHaveLength(2)
   })
 
@@ -124,7 +124,7 @@ describe('Consumer > OffsetManager > reset schedules on the wire', () => {
 
     expect(rejoined.nextOffset(TOPIC, 0).toString()).toEqual('0')
     expect(wire.committedAt()).toEqual('0')
-    expect(wire.obligations.size()).toBe(0)
+    expect(wire.obligations.size()).toBe(1)
     expect(sent(wire, 'ListOffsets')).toHaveLength(2)
   })
 

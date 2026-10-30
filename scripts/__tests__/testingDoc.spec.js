@@ -358,6 +358,18 @@ describe('documented live scenario scripts', () => {
         'never through this package row',
       ],
     },
+    {
+      script: 'test:e2e:offset-reset',
+      flag: 'OFFSET_RESET_E2E',
+      spec: 'src/consumer/__tests__/offsetResetLive.spec.js',
+      compose: null,
+      budgetsMs: [90000],
+      wording: [
+        'explicit record timestamps',
+        'three partitions',
+        'explicit-commit broker-truth arm',
+      ],
+    },
   ]
 
   it.each(scenarios)('$script is one two-worker spec run through test:kafka', (row) => {

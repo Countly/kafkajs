@@ -992,14 +992,14 @@ const holdSyncGroup = (schedule, scope) => (socket) => {
  * The scenario with a topic created while a round is in flight: the follower subscribes to C
  * before it exists and the leader's first SyncGroup after that is held. Once it arrives, the
  * leader's union snapshot is complete and lacks C; C is created, the round completes without it,
- * and the follower's own metadata refresh finds C and asks for a later round, which assigns every
- * partition of C to its subscriber. No manual rejoin or stop is involved.
+ * and the leader's union watch finds C and starts a later round, which assigns every partition of C
+ * to its subscriber. No manual rejoin or stop is involved.
  *
- * The leader keeps the default metadata age, far beyond the wait, so that only the follower can
- * start the later round: the leader's own union watch is covered by the offline specs. The evidence
- * row is written in a `finally`, so a case that fails or times out still records the stage it
- * reached, each member's Metadata requests and answers since the creation, and the join,
- * rebalance and crash events with their times.
+ * Only the leader can start that round: a follower's rejoin with unchanged metadata is answered by
+ * the broker with the current generation. The follower's own rebalances are recorded as
+ * observations only. The evidence row is written in a `finally`, so a case that fails or times out
+ * still records the stage it reached, each member's Metadata requests and answers since the
+ * creation, and the join, rebalance and crash events with their times.
  * @param {{ name: string, create: Function }} assignor
  * @returns {(scope: AbortSignal) => Promise<void>}
  */
@@ -1020,12 +1020,13 @@ const topicCreatedInFirstRound =
         const timeline = {}
         const state = { stage: 'starting', error: null, leadership: null, firstAssignment: null }
         let ownership = null
+        let followerRebalances = []
         try {
           const leader = member({
             name: 'leader',
             topics: [a],
             assigner: create,
-            consumerOptions: { allowAutoTopicCreation: false },
+            consumerOptions: { allowAutoTopicCreation: false, metadataMaxAge: METADATA_MAX_AGE_MS },
             kafkaOptions: { socketFactory: chaos },
           })
           seats.push(leader)
@@ -1072,13 +1073,16 @@ const topicCreatedInFirstRound =
             () => (follower.assignment()[c] ?? []).length === PARTITIONS,
             { label: 'The later assignment of the new topic' }
           )
-          const detection = follower.rebalances.find(({ at }) => at > firstRound.at)
+          const detection = leader.rebalances.find(
+            ({ at, reason }) => at > firstRound.at && reason === 'stale-assignment'
+          )
           const later = follower.joins.find(
             ({ payload }) => (payload.memberAssignment[c] ?? []).length > 0
           )
           timeline.detectedAt = detection?.at
           timeline.detectedReason = detection?.reason
           timeline.laterAt = later?.at
+          followerRebalances = follower.rebalances.map(({ at, reason }) => ({ at, reason }))
           state.stage = 'settling the ownership'
           ownership = await settleOwnership(scope, [leader, follower], [a, c])
 
@@ -1115,7 +1119,7 @@ const topicCreatedInFirstRound =
               assignor: name,
               groupProtocol: 'classic',
               allowAutoTopicCreation: false,
-              leaderMetadataMaxAgeMs: DEFAULT_METADATA_MAX_AGE_MS,
+              leaderMetadataMaxAgeMs: METADATA_MAX_AGE_MS,
               followerMetadataMaxAgeMs: METADATA_MAX_AGE_MS,
             },
             ...wireOf(seats),
@@ -1124,6 +1128,7 @@ const topicCreatedInFirstRound =
             leadership: state.leadership,
             topicCreation: { topic: c, partitions: PARTITIONS },
             timeline,
+            followerRebalances,
             firstAssignment: state.firstAssignment,
             ownership,
             members: seats.map((seat) => seat.report(trace, timeline.createdAt ?? 0)),

@@ -402,14 +402,16 @@ describe('Consumer > configuration > pass-through', () => {
    * registry, and returns the options each was constructed with. The cluster's `connect` throws, so
    * the runner crashes right after both objects exist and nothing is left running.
    * @param {object} [config] extra consumer options
-   * @param {object} [subscription] the subscription to make before running
-   * @returns {Promise<{ group: object, runner: object }>}
+   * @param {object|object[]} [subscription] the subscription to make before running; a list is
+   *   made in order, and each rejection is collected in `rejections`
+   * @returns {Promise<{ group: object, runner: object, rejections: Error[] }>}
    */
   let group = null
   let runner = null
 
   const capturedOptions = async (config = {}, subscription = { topics: ['events-a'] }) => {
     const cluster = fakeCluster()
+    const rejections = []
     cluster.connect.mockImplementation(async () => {
       throw new KafkaJSNonRetriableError('nothing to connect to')
     })
@@ -450,12 +452,14 @@ describe('Consumer > configuration > pass-through', () => {
         ...config,
       })
 
-      await consumer.subscribe(subscription)
+      for (const each of [].concat(subscription)) {
+        await consumer.subscribe(each).catch((error) => rejections.push(error))
+      }
       await consumer.run({ eachMessage: async () => {} })
       await consumer.disconnect()
     })
 
-    return { group, runner }
+    return { group, runner, rejections, cluster }
   }
 
   it('hands the group and the runner the reconciled heartbeat interval', async () => {
@@ -474,7 +478,10 @@ describe('Consumer > configuration > pass-through', () => {
     expect(group.groupProtocol).toEqual('consumer')
     expect(group.groupRemoteAssignor).toEqual('uniform')
     expect(group.subscribedTopicRegex).toEqual('events-.*')
-    expect(group.regexSubscription).toEqual({ fromBeginning: true })
+    expect(group.regexSubscription).toEqual({
+      fromBeginning: true,
+      resetPolicy: { kind: 'earliest' },
+    })
     expect(group.maxPrefetchBatches).toEqual(1)
     expect(runner.maxPrefetchBatches).toEqual(1)
   })
@@ -503,5 +510,58 @@ describe('Consumer > configuration > pass-through', () => {
     expect(group.maxPrefetchBatches).toEqual(0)
     expect(runner.maxPrefetchBatches).toEqual(0)
     expect(group.assigners).toHaveLength(1)
+  })
+
+  it('invalid reset policy leaves targets and prior subscription unchanged', async () => {
+    const policy = { offsetReset: 'by_duration:PT5S' }
+    const { group, rejections, cluster } = await capturedOptions({}, [
+      { topics: ['events-a'], ...policy },
+      { topics: ['events-b'], offsetReset: 'by_duration:P1W' },
+      { topics: ['events-a'], offsetReset: 'none', fromBeginning: true },
+      { topics: ['events-a'], fromBeginning: 'yes' },
+    ])
+
+    expect(rejections).toHaveLength(3)
+    expect(rejections.map((error) => error.name)).toEqual(Array(3).fill('KafkaJSNonRetriableError'))
+    expect(cluster.addMultipleTargetTopics).toHaveBeenCalledTimes(1)
+    expect(group.topics).toEqual(['events-a'])
+    expect(group.topicConfigurations['events-a']).toEqual({
+      fromBeginning: false,
+      resetPolicy: { kind: 'by_duration', durationMs: 5000 },
+    })
+    expect(policy).toEqual({ offsetReset: 'by_duration:PT5S' })
+  })
+
+  it('last successful subscription policy wins per topic', async () => {
+    const { group } = await capturedOptions({}, [
+      { topics: ['events-a', 'events-b'], fromBeginning: true },
+      { topics: ['events-a'], offsetReset: 'none' },
+      { topics: ['events-b'], offsetReset: 'latest' },
+    ])
+
+    expect(group.topicConfigurations['events-a']).toEqual({
+      fromBeginning: false,
+      resetPolicy: { kind: 'none' },
+    })
+    expect(group.topicConfigurations['events-b']).toEqual({
+      fromBeginning: false,
+      resetPolicy: { kind: 'latest' },
+    })
+  })
+
+  it('stores the policy for the regex forms too', async () => {
+    const regex = await capturedOptions(
+      { groupProtocol: 'consumer' },
+      { regex: 'events-.*', offsetReset: 'by_duration:PT1M' }
+    )
+    expect(regex.group.regexSubscription).toEqual({
+      fromBeginning: false,
+      resetPolicy: { kind: 'by_duration', durationMs: 60000 },
+    })
+    const pattern = await capturedOptions({}, { topics: [/^events-/], offsetReset: 'earliest' })
+    expect(pattern.group.topicConfigurations['events-a']).toEqual({
+      fromBeginning: true,
+      resetPolicy: { kind: 'earliest' },
+    })
   })
 })

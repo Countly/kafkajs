@@ -5,6 +5,7 @@ import {
   CompressionTypes,
   KafkaJSError,
   KafkaJSCommitFailedError,
+  KafkaJSNoOffsetError,
   KafkaJSBufferExhaustedError,
   KafkaJSRecordTooLargeError,
   KafkaJSConnectionClosedError,
@@ -24,6 +25,18 @@ const refused: KafkaJSCommitFailedError = new KafkaJSCommitFailedError('x', { re
 void send
 void err
 void refused
+
+// The reset policy and the error a none-policy halt carries.
+const resetConsumer = kafka.consumer({ groupId: 'g' })
+void resetConsumer.subscribe({ topics: ['t'], offsetReset: 'by_duration:PT10M' })
+const noOffset: KafkaJSError = new KafkaJSNoOffsetError('x', { topic: 't', partition: 0, reason: 'no-offset' })
+void noOffset
+resetConsumer.on(resetConsumer.events.PARTITION_HALTED, e => {
+  if (e.payload.reason === 'no-offset') {
+    const missing: null = e.payload.offset
+    void missing
+  }
+})
 
 // Compression levels are optional and available on both the producer and direct broker API.
 const producerWithCompressionLevels = new Kafka({ brokers: ['localhost:9092'] }).producer({

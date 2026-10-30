@@ -4,6 +4,7 @@ const dictionary = require('../utils/dictionary')
 const { initialRetryTime } = require('../retry/defaults')
 const ConsumerGroup = require('./consumerGroup')
 const ResetObligations = require('./offsetManager/resetObligations')
+const { normalizeResetPolicy } = require('./offsetReset')
 const { createGroupDescriptions } = require('../admin/groupDescriptions')
 const resolveGroupTimeouts = require('./groupTimeouts')
 const { selectRebalanceProtocol } = require('./groupProtocol/interface')
@@ -238,11 +239,11 @@ module.exports = (params) => {
         createAssigner({ groupId, logger, cluster, rackAware: rackAwareAssignment })
       )
 
-  /** @type {Record<string, { fromBeginning?: boolean }>} */
+  /** @type {Record<string, { fromBeginning?: boolean, resetPolicy?: object }>} */
   const topics = dictionary()
   /** @type {string|null} the RE2 pattern a regex subscription sent, verbatim */
   let subscribedTopicRegex = null
-  /** @type {{ fromBeginning: boolean }|null} the options that subscription was made with */
+  /** @type {{ fromBeginning: boolean, resetPolicy: object }|null} the options that subscription was made with */
   let regexSubscription = null
   let runner = null
   /** @type {ConsumerGroup} */
@@ -461,7 +462,9 @@ module.exports = (params) => {
 
   /** @type {import("../../types").Consumer["subscribe"]} */
   const subscribe = async (subscription = {}) => {
-    const { topic, topics: subscriptionTopics, regex, fromBeginning = false } = subscription
+    const { topic, topics: subscriptionTopics, regex } = subscription
+    const resetPolicy = normalizeResetPolicy(subscription)
+    const fromBeginning = resetPolicy.kind === 'earliest'
 
     if (consumerGroup) {
       throw new KafkaJSNonRetriableError('Cannot subscribe to topic while consumer is running')
@@ -493,7 +496,7 @@ module.exports = (params) => {
       // Sent to the coordinator verbatim: RE2 is the broker's dialect, not JavaScript's, so there
       // is nothing this client can usefully validate about the pattern itself.
       subscribedTopicRegex = regex
-      regexSubscription = { fromBeginning }
+      regexSubscription = { fromBeginning, resetPolicy }
       return
     }
 
@@ -542,7 +545,7 @@ module.exports = (params) => {
     }
 
     for (const t of topicsToSubscribe) {
-      topics[t] = { fromBeginning }
+      topics[t] = { fromBeginning, resetPolicy }
     }
 
     await cluster.addMultipleTargetTopics(topicsToSubscribe)

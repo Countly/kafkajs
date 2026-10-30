@@ -30,6 +30,7 @@ describe('Consumer > OffsetMananger > commitOffsets', () => {
     mockCluster = {
       committedOffsets: jest.fn(() => ({})),
       refreshMetadata: jest.fn(() => ({})),
+      topicId: jest.fn(),
       findGroupCoordinator: jest.fn(async () => ({ isConnected: () => true, nodeId: 2 })),
     }
 

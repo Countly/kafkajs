@@ -74,18 +74,31 @@ class ResetObligations {
   }
 
   /**
-   * Deletes the entry once every currently assigned partition has discharged it.
+   * Deletes the entry once every partition of the incarnation has discharged it. An empty or
+   * partial assignment never deletes a debt another partition still owes: given the topic's known
+   * partitions, only a complete discharge of all of them deletes, and an empty list (metadata that
+   * could not be verified) deletes nothing. Retained entries are bounded by the live topics; a
+   * topic's retirement or the user's disconnect (`clear`) ends them.
    * @param {string} topic
-   * @param {Iterable<number>} assignedPartitions
+   * @param {Iterable<number>} assignedPartitions the partitions this member holds; the only ones
+   *   checked when `knownPartitions` is absent
+   * @param {Iterable<number>} [knownPartitions] every partition the metadata cache holds for the
+   *   topic. Absent for a caller with no metadata to offer, which keeps the assigned-only rule.
    * @returns {void}
    */
-  settle(topic, assignedPartitions) {
+  settle(topic, assignedPartitions, knownPartitions) {
     const entry = this.entries.get(topic)
     if (!entry) {
       return
     }
 
-    for (const partition of assignedPartitions) {
+    const partitions =
+      knownPartitions === undefined ? [...assignedPartitions] : [...knownPartitions]
+    if (knownPartitions !== undefined && partitions.length === 0) {
+      return
+    }
+
+    for (const partition of partitions) {
       if (!entry.discharged.has(partition)) {
         return
       }

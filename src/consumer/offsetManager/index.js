@@ -2,10 +2,10 @@ const Long = require('../../utils/long')
 const sleep = require('../../utils/sleep')
 const dictionary = require('../../utils/dictionary')
 const isInvalidOffset = require('./isInvalidOffset')
-const initializeConsumerOffsets = require('./initializeConsumerOffsets')
 const OffsetOperations = require('./offsetOperations')
 const { fencedDelay } = require('../fetchPreparation')
 const ResetObligations = require('./resetObligations')
+const { ResetResolver } = require('../offsetReset')
 const { KafkaJSError, KafkaJSCommitFailedError, isStaleCoordinator } = require('../../errors')
 const {
   stampGeneration,
@@ -21,6 +21,7 @@ const {
 
 const { keys, assign } = Object
 const indexTopics = (topics) => dictionary(topics.map((topic) => [topic, {}]))
+const NO_REFUSALS = Object.freeze([])
 
 /** @see https://github.com/apache/kafka/blob/4.3/clients/src/main/java/org/apache/kafka/common/protocol/Errors.java */
 const STALE_MEMBER_EPOCH = 'STALE_MEMBER_EPOCH'
@@ -124,6 +125,12 @@ module.exports = class OffsetManager {
    * @param {() => void} [options.markPolled] called before each UNSTABLE_OFFSET_COMMIT re-send: a
    *                                fetch round waiting on an open transaction is still polling, as
    *                                an empty round is. Defaults to a no-op.
+   * @param {(topic: string, partition: number, manager: OffsetManager, preparation?: object) => object} [options.captureResetContext=null]
+   *                                captures the group's identity for one cell (run, membership,
+   *                                assignment, acquisition, clock and topic id) before an offset
+   *                                resolution awaits anything; it travels with a `none` refusal so
+   *                                the group can tell a current answer from a stale one. Absent in
+   *                                isolated managers, whose refusals then carry no context.
    * @param {import('../../../types').Logger} [options.logger] where this manager reports a stale
    *                                member epoch and why an offset fetch is re-sent. Optional and
    *                                silent by default: the consumer group is the only production
@@ -154,6 +161,7 @@ module.exports = class OffsetManager {
     isStopping = null,
     isRebalancePending = null,
     markPolled = null,
+    captureResetContext = null,
     logger = SILENT_LOGGER,
   }) {
     this.cluster = cluster
@@ -195,6 +203,7 @@ module.exports = class OffsetManager {
     this.isStopping = isStopping || (() => false)
     this.isRebalancePending = isRebalancePending || (() => false)
     this.markPolled = markPolled || (() => {})
+    this.captureResetContext = captureResetContext
     this.logger = logger
 
     this.autoCommit = autoCommit
@@ -204,6 +213,13 @@ module.exports = class OffsetManager {
 
     /** @type {Map<string, Map<number, {timestamp: number, ticket: object}>>} */
     this.pendingSeeks = new Map()
+    /**
+     * The `none` refusals of the cells this manager holds, keyed by `topic|partition`, until a
+     * seek, a revoke, a recreation or the manager's retirement ends them. `taken` marks the ones
+     * `takeResetRefusals` already handed out.
+     * @type {Map<string, {refusal: object, taken: boolean}>}
+     */
+    this.resetRefusals = new Map()
     this.topics = keys(memberAssignment)
     this.clearAllOffsets()
   }
@@ -397,6 +413,7 @@ module.exports = class OffsetManager {
    */
   resetOffsetsForTopic(topic) {
     this.operations.touchTopic(topic)
+    this.retireResetRefusals(topic)
     for (const partition of this.pendingSeeks.get(topic)?.keys() || []) {
       this.clearPendingSeek(topic, partition)
     }
@@ -472,6 +489,7 @@ module.exports = class OffsetManager {
     for (const { topic, partitions } of revoked) {
       for (const partition of partitions) {
         this.clearOffsets({ topic, partition })
+        this.retireResetRefusals(topic, partition)
         this.operations.touch(topic, partition)
       }
     }
@@ -584,15 +602,98 @@ module.exports = class OffsetManager {
    * Commits the topic's default offset for one partition, then forgets what this member holds for
    * it, so the next resolution reads the committed offset back. The forgetting is skipped when a
    * newer operation or a barrier (a revoke, a recreation) reached the partition while the commit
-   * was in flight.
+   * was in flight. A `by_duration` topic is reset by `resetByDuration` instead: its timestamp is
+   * resolved to an actual offset, which is committed only with auto-commit enabled.
    * @param {import("../../../types").TopicPartition} topicPartition
    * @param {{guard: () => Error|null, fence: import('../../producer/generation')}} [preparation]
    *   the caller's immutable preparation identity; see `seek`
    * @returns {Promise<void>}
    */
   async setDefaultOffset({ topic, partition }, preparation) {
+    if (this.topicConfigurations[topic].resetPolicy?.kind === 'by_duration') {
+      return this.resetByDuration({ topic, partition }, preparation)
+    }
     const defaultOffset = this.cluster.defaultOffset(this.topicConfigurations[topic])
     await this.commitAndClear({ topic, partition, offset: defaultOffset }, preparation)
+  }
+
+  /**
+   * Resolves a duration reset under the mutation intent captured before lookup.
+   * Local resets fence older work; only a confirmed concrete commit discharges debt.
+   * @private
+   * @param {{topic:string,partition:number}} topicPartition current assigned cell
+   * @param {{guard: () => Error|null, fence: import('../../producer/generation')}} [preparation]
+   *   the caller's round identity: refused before the ticket begins, part of every currentness
+   *   check, and handed to both lookups and the commit; absent, behaves as without a round
+   * @returns {Promise<boolean>} false when superseded, otherwise actual position installed
+   * @throws {Error} lookup or identity-valid commit failure, or the preparation's refusal
+   */
+  async resetByDuration({ topic, partition }, preparation) {
+    this.refuse(preparation)
+    const ticket = this.operations.begin([{ topic, partition }], { mutation: true })
+    const requestedId = this.cluster.topicId(topic)
+    const token = this.ownership?.token()
+    const release = this.ownership?.retain(token)
+    const current = () => {
+      const known = this.cluster.topicId(topic)
+      return (
+        this.owns(topic, partition) &&
+        !this.isStopping() &&
+        !preparation?.guard() &&
+        !this.ownership?.refusal(token) &&
+        !this.operations.isSuperseded(ticket, topic, partition) &&
+        !(requestedId !== undefined && known !== undefined && requestedId !== known)
+      )
+    }
+    const guard = () =>
+      current() ? null : new KafkaJSCommitFailedError('Offset reset was superseded')
+    try {
+      if (!current()) return false
+      const { offsets } = await new ResetResolver(this.cluster).resolve(
+        [{ topic, partitions: [{ partition, offset: '-1' }] }],
+        this.topicConfigurations,
+        current,
+        () => null,
+        undefined,
+        preparation
+      )
+      if (!current()) return false
+      const actualOffset = offsets[0]?.partitions[0]?.offset
+      if (!/^[0-9]+$/.test(actualOffset || ''))
+        throw new KafkaJSError('Reset returned no actual offset')
+      if (this.autoCommit) {
+        const payload = {
+          groupId: this.groupId,
+          memberId: this.memberId,
+          groupGenerationId: this.generationId,
+          groupInstanceId: this.groupInstanceId,
+          topics: [{ topic, partitions: [{ partition, offset: actualOffset }] }],
+        }
+        await this.sendOffsetCommit(payload, {
+          guard,
+          ...(preparation && { fence: preparation.fence }),
+        })
+        if (!current()) return false
+        this.instrumentationEmitter.emit(COMMIT_OFFSETS, payload)
+      }
+      if (!current()) return false
+      this.clearPendingSeek(topic, partition)
+      this.committedOffsets()[topic][partition] = actualOffset
+      this.resolveOffset({
+        topic,
+        partition,
+        offset: Long.fromValue(actualOffset).subtract(1).toString(),
+        leaderEpoch: -1,
+      })
+      const confirmed =
+        this.autoCommit && requestedId !== undefined && requestedId === this.cluster.topicId(topic)
+      if (confirmed) this.operations.apply(ticket, topic, partition)
+      else this.operations.fence(ticket, topic, partition)
+      return true
+    } finally {
+      release?.()
+      this.operations.end(ticket)
+    }
   }
 
   /**
@@ -615,9 +716,10 @@ module.exports = class OffsetManager {
    *
    * A seek is a mutation of the offset ledger: it is applied unless a seek or commit that began
    * after it was applied first, or a barrier reached the partition while its commit was in
-   * flight. An applied concrete seek settles the topic's reset obligation for the partition. A
-   * sentinel seek fences older answers at once but settles the reset only when its boundary is
-   * published. Cancellation before publication (stop or rebuild) leaves the reset owed; a failed
+   * flight. A concrete seek without auto-commit changes only the local position. A
+   * sentinel seek fences older answers at once; publishing its boundary remains local.
+   * Recreation debt settles only after a successful concrete commit. Cancellation before
+   * publication (stop or rebuild) leaves the reset owed; a failed
    * ListOffsets leaves both the reset and the pending sentinel for the next resolution.
    *
    * @param {import("../../../types").TopicPartitionOffset} topicPartitionOffset
@@ -648,6 +750,7 @@ module.exports = class OffsetManager {
         this.pendingSeeks.set(topic, partitions)
       }
       partitions.set(partition, { timestamp: Number(offset), ticket })
+      this.retireResetRefusals(topic, partition)
       return true
     }
 
@@ -663,21 +766,26 @@ module.exports = class OffsetManager {
           // A seek names a position, not a record: nothing has been consumed at it yet.
           leaderEpoch: -1,
         })
-        this.operations.apply(ticket, topic, partition)
+        this.operations.fence(ticket, topic, partition)
       } finally {
         this.operations.end(ticket)
       }
 
+      this.retireResetRefusals(topic, partition)
       return true
     }
 
-    return this.commitAndClear({ topic, partition, offset }, preparation)
+    const applied = await this.commitAndClear({ topic, partition, offset }, preparation)
+    if (applied) this.retireResetRefusals(topic, partition)
+    return applied
   }
 
   /**
    * One OffsetCommit for a single partition followed by the clear of its cached offset, position
    * and epoch, under a mutation ticket: the clear is a post-await write, so it is applied only
-   * while the ticket is still current. A failed commit applies nothing and supersedes nothing.
+   * while the ticket is still current. A failed commit applies nothing and supersedes nothing. A
+   * concrete offset settles a recreation reset only when the topic is provably the incarnation the
+   * commit was sent for; a sentinel never does.
    * @private
    * @param {import("../../../types").TopicPartitionOffset} topicPartitionOffset
    * @param {{guard: () => Error|null}} [preparation] the caller's identity, conjoined with this
@@ -694,6 +802,7 @@ module.exports = class OffsetManager {
         : null
     this.refuse(preparation)
     const ticket = this.operations.begin([{ topic, partition }], { mutation: true })
+    const requestedId = this.cluster.topicId(topic)
     const release = this.ownership?.retain(token)
 
     try {
@@ -713,7 +822,9 @@ module.exports = class OffsetManager {
       }
 
       this.clearOffsets({ topic, partition })
-      this.operations.apply(ticket, topic, partition)
+      if (!isInvalidOffset(offset) && this.isConfirmedIncarnation(topic, requestedId)) {
+        this.operations.apply(ticket, topic, partition)
+      } else this.operations.fence(ticket, topic, partition)
       return true
     } catch (error) {
       if (error instanceof KafkaJSCommitFailedError) return false
@@ -960,13 +1071,14 @@ module.exports = class OffsetManager {
    */
   async sendAndRecordCommit(payload, topics, options) {
     const ticket = this.operations.begin(this.coveredCells(topics), { mutation: true })
+    const requestedIds = new Map(topics.map(({ topic }) => [topic, this.cluster.topicId(topic)]))
 
     try {
       await this.sendOffsetCommit(payload, options)
       this.instrumentationEmitter.emit(COMMIT_OFFSETS, payload)
       const refusal = options?.guard?.()
       if (refusal) throw refusal
-      this.recordCommitted(ticket, topics)
+      this.recordCommitted(ticket, topics, requestedIds)
     } finally {
       this.operations.end(ticket)
     }
@@ -974,13 +1086,17 @@ module.exports = class OffsetManager {
 
   /**
    * Writes the accepted offsets of a commit into the committed cache and applies the ticket to
-   * each written cell, which settles the cell's reset obligation for every consumer of the group.
+   * each written cell, which settles the cell's reset obligation for every consumer of the group
+   * when the topic is provably the incarnation the commit was sent for. Otherwise the cell is
+   * only fenced and the debt stays owed.
    * @private
    * @param {object} ticket
    * @param {{topic: string, partitions: {partition: number|string, offset: string}[]}[]} topics
+   * @param {Map<string, string|undefined>} [requestedIds] each topic's id when the commit was sent;
+   *   absent, nothing proves the incarnation
    * @returns {void}
    */
-  recordCommitted(ticket, topics) {
+  recordCommitted(ticket, topics, requestedIds = new Map()) {
     const committedOffsets = this.committedOffsets()
 
     for (const { topic, partitions } of topics) {
@@ -996,9 +1112,26 @@ module.exports = class OffsetManager {
 
       if (written.length > 0) {
         committedOffsets[topic] = assign({}, committedOffsets[topic], accepted)
-        written.forEach((partition) => this.operations.apply(ticket, topic, partition))
+        const confirmed = this.isConfirmedIncarnation(topic, requestedIds.get(topic))
+        written.forEach((partition) =>
+          confirmed
+            ? this.operations.apply(ticket, topic, partition)
+            : this.operations.fence(ticket, topic, partition)
+        )
       }
     }
+  }
+
+  /**
+   * Whether a write sent under `requestedId` provably belongs to the topic incarnation known now.
+   * An id unknown when the write began, or unknown or different now, proves nothing.
+   * @private
+   * @param {string} topic
+   * @param {string|undefined} requestedId the topic's id when the write was sent
+   * @returns {boolean}
+   */
+  isConfirmedIncarnation(topic, requestedId) {
+    return requestedId !== undefined && requestedId === this.cluster.topicId(topic)
   }
 
   /**
@@ -1030,11 +1163,17 @@ module.exports = class OffsetManager {
    * `ResetObligations`). The reset is applied here, after the OffsetFetch answer, to the owed
    * partitions: their offset becomes the invalid sentinel, so they resolve through ListOffsets per
    * the topic's `fromBeginning`. Reading an obligation does not consume it: a partition settles
-   * only when an offset is written for it or a seek or commit is applied, so a ListOffsets that
-   * throws leaves the reset owed.
+   * only when a concrete new-incarnation commit is confirmed, so local publication, local seek
+   * and a failed ListOffsets leave the reset owed.
    *
    * A cell whose answer was dropped keeps its invalid offset and is resolved again, at once by the
    * caller (`ConsumerGroup#seekOffsets`) and at the latest by the next fetch round.
+   *
+   * Unresolved cells go through `ResetResolver`, which applies each topic's reset policy. A cell
+   * the none policy refuses gets no position and no ListOffsets request: its refusal, carrying the
+   * identity captured before the first await, is held for `takeResetRefusals` and the cell is
+   * skipped until a seek, a revoke, a recreation or this manager's retirement ends it. A refusal
+   * is handled, not a dropped answer.
    *
    * @param {{guard: () => Error|null, fence: import('../../producer/generation')}} [preparation]
    *   a fetch round's immutable identity: checked after each await and before each request, reset
@@ -1048,8 +1187,9 @@ module.exports = class OffsetManager {
     this.refuse(preparation)
     const invalidOffset = (topic) => (partition) => {
       return (
-        this.pendingSeekTimestamp(topic, partition) !== undefined ||
-        isInvalidOffset(this.committedOffsets()[topic][partition])
+        !this.resetRefusals.get(topic)?.has(partition) &&
+        (this.pendingSeekTimestamp(topic, partition) !== undefined ||
+          isInvalidOffset(this.committedOffsets()[topic][partition]))
       )
     }
 
@@ -1073,6 +1213,7 @@ module.exports = class OffsetManager {
       const requestedIds = new Map(
         pendingPartitions.map(({ topic }) => [topic, this.cluster.topicId(topic)])
       )
+      const contexts = this.captureResetContexts(pendingPartitions, preparation)
       const { responses } = await this.fetchCommittedOffsets(pendingPartitions, preparation)
       this.refuse(preparation)
 
@@ -1090,31 +1231,37 @@ module.exports = class OffsetManager {
 
       this.markOwedResets(consumerOffsets)
       this.markPendingSeeks(consumerOffsets)
+      this.adoptLocalPositions(consumerOffsets)
       const epochSeeds = this.collectEpochSeeds(consumerOffsets)
 
-      const unresolvedPartitions = consumerOffsets.map(({ topic, partitions }) =>
-        assign(
-          {
-            topic,
-            partitions: partitions
-              .filter(({ offset }) => isInvalidOffset(offset))
-              .map(({ partition }) => {
-                const timestamp = this.pendingSeekTimestamp(topic, partition)
-                return timestamp === undefined ? { partition } : { partition, timestamp }
-              }),
-          },
-          this.topicConfigurations[topic]
-        )
-      )
-
       let offsets = consumerOffsets
-      if (unresolvedPartitions.some((t) => t.partitions.length > 0)) {
-        const topicOffsets = await this.cluster.fetchTopicsOffset(
-          unresolvedPartitions,
-          preparation && { fence: preparation.fence, guard: preparation.guard }
+      if (
+        consumerOffsets.some(({ partitions }) => partitions.some((p) => isInvalidOffset(p.offset)))
+      ) {
+        const current = (topic, partition) =>
+          this.owns(topic, partition) &&
+          !preparation?.guard() &&
+          !this.isStale(ticket, topic, partition, requestedIds)
+        const resolved = await new ResetResolver(this.cluster).resolve(
+          consumerOffsets,
+          this.topicConfigurations,
+          current,
+          (topic, partition) => contexts?.get(`${topic}|${partition}`) ?? null,
+          (topic, partition) => this.pendingSeekTimestamp(topic, partition),
+          preparation
         )
         this.refuse(preparation)
-        offsets = initializeConsumerOffsets(consumerOffsets, topicOffsets)
+        offsets = resolved.offsets.map(({ topic, partitions }) => ({
+          topic,
+          partitions: partitions.map(({ partition, offset }) => ({
+            partition,
+            offset: isInvalidOffset(offset) ? undefined : offset,
+          })),
+        }))
+        this.holdResetRefusals(resolved.refusals, requestedIds)
+        const total = consumerOffsets.reduce((sum, t) => sum + t.partitions.length, 0)
+        const handled = offsets.reduce((sum, t) => sum + t.partitions.length, 0)
+        complete = complete && handled + resolved.refusals.length === total
       }
 
       return this.applyResolution(ticket, offsets, epochSeeds, requestedIds) && complete
@@ -1167,6 +1314,28 @@ module.exports = class OffsetManager {
   }
 
   /**
+   * Under the none policy, treats an invalid answer for a cell this member already positioned (a
+   * local seek without auto-commit) as that position, so the cell is neither refused nor looked up
+   * and the committed cache can hold the position the fetch starts from. A cell with no local
+   * position is left for the resolver to refuse.
+   * @private
+   * @param {{topic: string, partitions: {partition: number, offset: string}[]}[]} entries mutated
+   *   in place
+   * @returns {void}
+   */
+  adoptLocalPositions(entries) {
+    for (const { topic, partitions } of entries) {
+      if (this.topicConfigurations[topic]?.resetPolicy?.kind !== 'none') continue
+      for (const entry of partitions) {
+        const position = this.resolvedOffsetAt(topic, entry.partition)
+        if (isInvalidOffset(entry.offset) && position != null && !isInvalidOffset(position)) {
+          entry.offset = position
+        }
+      }
+    }
+  }
+
+  /**
    * Releases one sentinel intent and its ledger ticket. Idempotent; does not fence a resolver.
    * @private
    * @param {string} topic
@@ -1188,8 +1357,8 @@ module.exports = class OffsetManager {
   }
 
   /**
-   * Ends a pending sentinel whose concrete boundary was just published, and settles the reset
-   * obligation its seek left owed in every attached consumer. A no-op for a cell without a pending
+   * Ends a pending sentinel whose concrete boundary was just published. Local publication
+   * leaves recreation debt owed until a concrete offset is durably committed. A no-op for a cell without a pending
    * sentinel. Only the resolution's final step calls it, after it checked the cell is current, so
    * the boundary never belongs to an earlier incarnation.
    * @private
@@ -1203,14 +1372,130 @@ module.exports = class OffsetManager {
       return
     }
     this.clearPendingSeek(topic, partition)
-    this.operations.discharge(topic, partition)
+  }
+
+  /**
+   * Captures the group's identity for every cell a resolution is about to ask about, before its
+   * first await, so an answer is judged by the identity it was asked under. Nothing is allocated
+   * for a manager without a capture callback.
+   * @private
+   * @param {{topic: string, partitions: {partition: number}[]}[]} pendingPartitions
+   * @param {object} [preparation] the fetch round's identity, captured with each cell
+   * @returns {Map<string, object>|null} the contexts by `topic|partition`, null without a callback
+   */
+  captureResetContexts(pendingPartitions, preparation) {
+    if (!this.captureResetContext) return null
+    const contexts = new Map()
+    for (const { topic, partitions } of pendingPartitions) {
+      for (const { partition } of partitions) {
+        contexts.set(
+          `${topic}|${partition}`,
+          this.captureResetContext(topic, partition, this, preparation)
+        )
+      }
+    }
+    return contexts
+  }
+
+  /**
+   * Keeps the refusals a resolution just produced, and skips their cells until a seek, a revoke,
+   * a recreation or this manager's retirement ends them. A refusal is never a position: nothing
+   * reaches the committed cache, the resolved offsets or the ledger. Synchronous, so it runs under
+   * the identity the resolver last checked.
+   * @private
+   * @param {{topic: string, partition: number}[]} refusals current refusals from the resolver
+   * @param {Map<string, string|undefined>} requestedIds each topic's id when the request went out
+   * @returns {void}
+   */
+  holdResetRefusals(refusals, requestedIds) {
+    for (const refusal of refusals) {
+      const { topic, partition } = refusal
+      const partitions = this.resetRefusals.get(topic) ?? new Map()
+      this.resetRefusals.set(topic, partitions)
+      partitions.set(partition, { refusal, taken: false, topicId: requestedIds.get(topic) })
+    }
+  }
+
+  /**
+   * Hands out the refusals no caller has taken yet. They stay held (the cells are skipped by later
+   * resolutions) until retired.
+   * @returns {ReadonlyArray<object>} each `{ topic, partition, offset, reason, error, context }`;
+   *   a shared empty array when there is nothing new
+   * @throws Never.
+   */
+  takeResetRefusals() {
+    if (this.resetRefusals.size === 0) return NO_REFUSALS
+    const fresh = []
+    for (const partitions of this.resetRefusals.values()) {
+      for (const entry of partitions.values()) {
+        if (!entry.taken) {
+          entry.taken = true
+          fresh.push(entry.refusal)
+        }
+      }
+    }
+    return fresh.length > 0 ? fresh : NO_REFUSALS
+  }
+
+  /**
+   * @param {string} topic
+   * @param {number} partition
+   * @returns {object|null} the held refusal while this member still owns the partition and the
+   *   topic is the incarnation it was raised for; a stale one is dropped
+   * @throws Never.
+   */
+  currentResetRefusal(topic, partition) {
+    const entry = this.resetRefusals.get(topic)?.get(partition)
+    if (!entry) return null
+    const known = this.cluster.topicId(topic)
+    if (
+      this.owns(topic, partition) &&
+      !(entry.topicId !== undefined && known !== undefined && entry.topicId !== known)
+    ) {
+      return entry.refusal
+    }
+    this.retireResetRefusals(topic, partition)
+    return null
+  }
+
+  /**
+   * Ends the held refusals of one partition, or of a whole topic, so the cell is resolved again.
+   * Called when a seek, a revoke or a recreation reaches it, and by the group for a refusal whose
+   * identity is no longer current.
+   * @param {string} topic
+   * @param {number} [partition] every partition of the topic when absent
+   * @returns {void}
+   */
+  retireResetRefusals(topic, partition) {
+    const partitions = this.resetRefusals.get(topic)
+    if (!partitions) return
+    if (partition === undefined) partitions.clear()
+    else partitions.delete(partition)
+    if (partitions.size === 0) this.resetRefusals.delete(topic)
+  }
+
+  /**
+   * The partitions the metadata cache holds for a topic, for the reset debt deletion guard.
+   * @private
+   * @param {string} topic
+   * @returns {number[]|undefined} undefined when the cluster has no metadata to offer (an isolated
+   *   manager), an empty list when it has none for this topic
+   */
+  knownPartitions(topic) {
+    if (typeof this.cluster.findTopicPartitionMetadata !== 'function') return undefined
+    try {
+      return this.cluster.findTopicPartitionMetadata(topic).map(({ partitionId }) => partitionId)
+    } catch {
+      return []
+    }
   }
 
   /**
    * Cancels all explicit sentinel seeks on stop or rebuild and fences this manager's own in-flight
    * resolutions of their cells, so a held boundary is never published for a cancelled intent. The
    * fence is an owner barrier: no other participant's ticket is affected. A cancelled sentinel
-   * settles no reset. Retains no ledger ticket, topic or partition after returning.
+   * settles no reset. Also ends the held `none` refusals, which belong to this manager's run.
+   * Retains no ledger ticket, topic or partition after returning.
    * @returns {void}
    * @throws Never.
    */
@@ -1222,6 +1507,7 @@ module.exports = class OffsetManager {
       }
     }
     this.pendingSeeks.clear()
+    this.resetRefusals.clear()
   }
 
   /**
@@ -1294,8 +1580,8 @@ module.exports = class OffsetManager {
 
   /**
    * The resolution's single final step, synchronous after both awaits: writes each answered cell
-   * that is still current and unresolved, discharges the reset it settles, deletes the obligations
-   * every assigned partition has discharged, and seeds the consumed leader epochs.
+   * that is still current and unresolved, retains recreation debt until a concrete commit,
+   * deletes obligations every assigned partition has durably discharged, and seeds epochs.
    * @private
    * @param {object} ticket the resolution's read ticket
    * @param {{topic: string, partitions: {partition: number, offset: string}[]}[]} offsets
@@ -1329,12 +1615,11 @@ module.exports = class OffsetManager {
         if (!isInvalidOffset(resolved[partition])) {
           this.settleSentinel(topic, partition)
         }
-        this.obligations.discharge(topic, partition, this.cluster.topicId(topic))
       }
 
       const assigned = this.assignedPartitions.get(topic)
       if (assigned) {
-        this.obligations.settle(topic, assigned)
+        this.obligations.settle(topic, assigned, this.knownPartitions(topic))
       }
     }
 
@@ -1394,7 +1679,11 @@ module.exports = class OffsetManager {
     }
 
     for (const topic of this.topics) {
-      this.obligations.settle(topic, this.assignedPartitions.get(topic))
+      this.obligations.settle(
+        topic,
+        this.assignedPartitions.get(topic),
+        this.knownPartitions(topic)
+      )
     }
   }
 

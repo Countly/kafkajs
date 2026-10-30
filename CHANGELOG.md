@@ -27,6 +27,14 @@ Versions before 3.0.0 are internal alpha tags and are not published.
 
 - Consumer-protocol consumers retry their own connection and coordinator outages without spending the fetch loop's retry budget. A learned fence or fatal error, poll expiry and explicit stop still end or replace membership; no client-side session timeout is inferred from the classic configuration.
 
+- `consumer.partition_halted` gains a discriminated offset shape and the reasons `'no-offset'` and `'offset-out-of-range'` (used only with `offsetReset: 'none'`). No-offset uses offset null; out-of-range uses the known decimal offset or null. Existing corrupt/decode offsets stay decimal strings and retain their decode fields. TypeScript ≥4.1 is now required for the duration template-literal type.
+
+- **A topic recreation's offset reset stays owed until a confirmed commit.** A local resolution, a seek with autoCommit disabled and a published sentinel boundary no longer settle it; stop/run, a crash restart or an assignment rebuild before the first confirmed commit of the new topic resolve the reset again instead of resuming the old topic's committed offset. A failed, stale or unconfirmed commit settles nothing, and a partial or empty assignment no longer deletes a debt another partition of the topic still owes.
+
+- `subscribe` rejects a non-boolean `fromBeginning` and an explicit `fromBeginning` that conflicts with `offsetReset` (none, by_duration, or the opposite of earliest/latest) with `KafkaJSNonRetriableError`, before any subscription state changes.
+
+- The partition-halt error log reads `Halted a partition; seek it to resume`, for every halt reason.
+
 #### Fixes
 
 - Fence unknown-target metadata responses before cache installation and keep periodic naming attempts after the fast discovery budget.
@@ -35,6 +43,8 @@ Versions before 3.0.0 are internal alpha tags and are not published.
 
 - **A classic leader now notices a partition added to a topic only other members subscribe to.** The union it assigned from was read once, during the sync, so a topic subscribed only by a follower could never make the leader rejoin (Java's leader compares its assignment snapshot with its metadata snapshot and rejoins on drift). The leader now rereads those topics with a bounded, non-installing Metadata request, at most once per `metadataMaxAge`, and asks for the ordinary stale-assignment rejoin when one gains partitions, including a topic that did not exist at assignment. The watch stops when leadership is lost, a new round starts or the consumer stops, never creates a topic, never adds to the leader's own targets, and costs a leader whose members share its subscription one property read per fetch round.
 
+- A topic recreation's reset can no longer be lost across stop/run, a crash restart or an assignment rebuild: the consumer no longer resumes the deleted topic's committed offset in the new topic.
+
 #### Additions
 
 - Pin the kept consumer defaults: classic groups with round-robin assignment, a 5 000 ms Fetch wait, a 10 MiB response target and committed transactional reads; document their limits and existing configuration escapes.
@@ -42,6 +52,8 @@ Versions before 3.0.0 are internal alpha tags and are not published.
 - Partition assigners receive optional groupTopics and groupTopicMetadata arguments. A supplied metadata map is authoritative, including missing names; built-in assigners use cluster metadata only when the entire map is absent.
 
 - Add opt-in rackAwareAssignment for range assignment; other assigners ignore it.
+
+- Add per-subscription offsetReset policies and KafkaJSNoOffsetError, with partition halts for none and timestamp-based by_duration resets.
 
 #### Tooling
 

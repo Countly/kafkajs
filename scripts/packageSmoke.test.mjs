@@ -76,3 +76,16 @@ test('the producer close error is exported with transmission evidence', async ()
     assert.equal(new cjs.KafkaJSProducerClosedError('closed', { outcome }).outcome, outcome)
   }
 })
+
+test('the no-offset error is exported by both entry points and is not retriable', async () => {
+  const cjs = require(PKG)
+  const esm = await import(PKG)
+  assert.equal(typeof cjs.KafkaJSNoOffsetError, 'function')
+  assert.equal(esm.KafkaJSNoOffsetError, cjs.KafkaJSNoOffsetError)
+  for (const reason of ['no-offset', 'offset-out-of-range']) {
+    const error = new cjs.KafkaJSNoOffsetError('no starting position', { topic: 't', partition: 0, reason })
+    assert.equal(error instanceof cjs.KafkaJSNonRetriableError, true)
+    assert.equal(error.retriable, false)
+    assert.equal(error.reason, reason)
+  }
+})

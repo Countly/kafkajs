@@ -188,6 +188,7 @@ describe('Instrumentation > where the events are emitted', () => {
       const offsetManager = new OffsetManager({
         cluster: {
           committedOffsets: jest.fn(() => ({})),
+          topicId: jest.fn(),
           refreshMetadata: jest.fn(() => ({})),
           findGroupCoordinator: jest.fn(async () => ({ isConnected: () => true, nodeId: 2 })),
         },
@@ -231,6 +232,7 @@ describe('Instrumentation > where the events are emitted', () => {
       const offsetManager = new OffsetManager({
         cluster: {
           committedOffsets: jest.fn(() => ({})),
+          topicId: jest.fn(),
           refreshMetadata: jest.fn(() => ({})),
           findGroupCoordinator: jest.fn(async () => ({ isConnected: () => true, nodeId: 2 })),
         },

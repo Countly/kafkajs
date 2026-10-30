@@ -84,6 +84,27 @@ class KafkaJSNonRetriableError extends KafkaJSError {
 }
 
 /**
+ * A partition cannot obtain a starting position under the none reset policy.
+ * Recovery is an explicit seek or an ordinary halt-lifecycle transition.
+ * @class
+ */
+class KafkaJSNoOffsetError extends KafkaJSNonRetriableError {
+  /**
+   * @param {Error|string} e diagnostic or original error
+   * @param {{topic:string,partition:number,reason:'no-offset'|'offset-out-of-range'}} options
+   * @returns {KafkaJSNoOffsetError} non-retriable partition refusal
+   * @throws Never for the declared options.
+   */
+  constructor(e, { topic, partition, reason }) {
+    super(e)
+    this.name = 'KafkaJSNoOffsetError'
+    this.topic = topic
+    this.partition = partition
+    this.reason = reason
+  }
+}
+
+/**
  * An error the broker reported by its Kafka error code. Its `category` is the one the code has on
  * every request; a category that depends on the request (INVALID_RECORD on Produce, say) is
  * stamped later by the producer's classifier, which knows which request failed. An error rebuilt
@@ -778,6 +799,7 @@ class KafkaJSProducerClosedError extends KafkaJSNonRetriableError {
 }
 
 module.exports = {
+  KafkaJSNoOffsetError,
   KafkaJSProducerClosedError,
   KafkaJSError,
   KafkaJSNonRetriableError,

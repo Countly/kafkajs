@@ -19,6 +19,7 @@ describe('Consumer > OffsetManager > groupInstanceId', () => {
     const mockCluster = {
       committedOffsets: jest.fn(() => ({})),
       defaultOffset: jest.fn(() => '0'),
+      topicId: jest.fn(),
     }
     const mockCoordinator = { offsetCommit: jest.fn() }
 

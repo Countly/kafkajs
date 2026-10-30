@@ -23,6 +23,7 @@ const {
 const {
   KafkaJSError,
   KafkaJSStaleTopicMetadataAssignment,
+  KafkaJSNoOffsetError,
   isRebalancing,
   isLostMember,
   isFatalMembership,
@@ -158,8 +159,9 @@ module.exports = class ConsumerGroup {
    *                                Consumer protocol only.
    * @param {string|null} [options.subscribedTopicRegex=null] an RE2 pattern sent to the coordinator
    *                                verbatim; consumer protocol only.
-   * @param {{ fromBeginning: boolean }|null} [options.regexSubscription=null] the options the regex
-   *                                subscription was made with, copied to a name-keyed
+   * @param {{ fromBeginning: boolean, resetPolicy: object }|null} [options.regexSubscription=null]
+   *                                the options the regex subscription was made with (the legacy
+   *                                flag and the normalized reset policy), copied to a name-keyed
    *                                `topicConfigurations` entry for every name the regex resolves to.
    * @param {0|1} [options.maxPrefetchBatches=0] reserved for a fetch layer that runs one Fetch
    *                                ahead of the workers. Accepted and stored; inert in this
@@ -848,6 +850,8 @@ module.exports = class ConsumerGroup {
         isStopping: () => this.isStopping(),
         isRebalancePending: () => Boolean(this.rebalanceCoordinator?.verdict),
         markPolled: () => this.rebalanceCoordinator?.pollTimer.poll(),
+        captureResetContext: (topic, partition, manager, preparation) =>
+          this.captureResetContext(topic, manager, preparation),
         logger: this.logger,
       })
       this.assignmentEpoch += 1
@@ -1547,6 +1551,7 @@ module.exports = class ConsumerGroup {
     const run = this.idleWait
     const ownershipToken = this.ownership.token()
     let prepared = null
+    let requestClock
     try {
       prepared = await this.prepareFetch(nodeId, run, ownershipToken)
       if (!prepared) return []
@@ -1555,7 +1560,7 @@ module.exports = class ConsumerGroup {
       // answer is refused if a seek, a reset or a recreation reaches the partition after this.
       prepared.check()
       const { assignmentEpoch, acquireClock } = prepared
-      const requestClock = this.acquireClock
+      requestClock = this.acquireClock
       const requests = this.buildFetchRequests(prepared.parts)
 
       if (!requests.length) {
@@ -1656,6 +1661,7 @@ module.exports = class ConsumerGroup {
           debug,
           assignmentEpoch,
           requestClock,
+          prepared,
           fence: run.fence,
         }
 
@@ -1684,7 +1690,11 @@ module.exports = class ConsumerGroup {
       stampOwnership(e, ownershipToken)
       if (obsoleteOwnership(this.ownership, e)) throw e
       try {
-        await this.recoverFromFetch(e, run.fence)
+        await this.recoverFromFetch(
+          e,
+          run.fence,
+          ...(prepared ? [this.fetchedResetContext(prepared, requestClock)] : [])
+        )
       } catch (recoveryError) {
         if (run.fence.closed) return []
         throw recoveryError
@@ -1896,6 +1906,8 @@ module.exports = class ConsumerGroup {
    * @param {boolean} context.debug whether debug logging is on for this round
    * @param {number} context.assignmentEpoch the assignment the round began under
    * @param {number} context.requestClock the acquisition clock when the request was built
+   * @param {FetchPreparation} context.prepared the round's preparation, whose identity a refusal
+   *   raised from this answer carries
    * @param {import('../producer/generation')} [context.fence] the terminal fence of the run that
    *   received the response; the recovery and hint work it starts is bound to it
    * @returns {Promise<boolean>} whether this partition asks for a metadata refresh
@@ -1928,7 +1940,12 @@ module.exports = class ConsumerGroup {
       if (action === 'offset-out-of-range') {
         // The existing recovery, for this partition only: drop the preferred replica if one is
         // set, otherwise reset per the topic's own fromBeginning.
-        await this.recoverFromOffsetOutOfRange({ topic: topicName, partition }, context.fence)
+        const requested = topicRequestData.partitions.find((p) => p.partition === partition)
+        await this.recoverFromOffsetOutOfRange(
+          { topic: topicName, partition, offset: requested && String(requested.fetchOffset) },
+          context.fence,
+          this.fetchedResetContext(context.prepared, context.requestClock, context.topicId)
+        )
       } else if (action === 'skip-and-forget-epoch') {
         // The client is ahead of this broker. Defending the cached epoch would make every retry
         // resend the same rejected value; forgetting it makes the next request carry -1 and the
@@ -2052,6 +2069,110 @@ module.exports = class ConsumerGroup {
   }
 
   /**
+   * Captures, before any await, the identity a reset resolution is asked under: the manager, the
+   * run's guard, the membership token, the assignment epoch and the acquisition clock. A resolution
+   * whose answer arrives later is judged by this, never by the identity current when it arrives.
+   * @private
+   * @param {string} topic
+   * @param {import('./offsetManager')} manager the manager that asks
+   * @param {FetchPreparation} [preparation] the fetch round the resolution belongs to
+   * @returns {{manager: object, guard: Function|null, token: number, assignmentEpoch: number,
+   *   requestClock: number, topicId: string|undefined}} an immutable record
+   */
+  captureResetContext(topic, manager, preparation) {
+    return {
+      manager,
+      guard: preparation?.guard ?? null,
+      token: preparation?.ownershipToken ?? this.ownership.token(),
+      assignmentEpoch: preparation?.assignmentEpoch ?? this.assignmentEpoch,
+      requestClock: this.acquireClock,
+      topicId: this.cluster.topicId(topic),
+    }
+  }
+
+  /**
+   * The identity of a fetched answer, for a refusal raised from it. Every field was captured when
+   * the request was built, so nothing here is read from the state after the response arrived.
+   * @private
+   * @param {FetchPreparation} prepared the round's preparation
+   * @param {number} requestClock the acquisition clock when the request was built
+   * @param {string} [topicId] the id the answer or the request keyed the topic with
+   * @returns {object} the same shape `captureResetContext` returns
+   */
+  fetchedResetContext(prepared, requestClock, topicId) {
+    return {
+      manager: prepared.manager,
+      guard: prepared.guard,
+      token: prepared.ownershipToken,
+      assignmentEpoch: prepared.assignmentEpoch,
+      requestClock,
+      topicId,
+    }
+  }
+
+  /**
+   * Whether a captured reset context still describes this member's partition: the same manager,
+   * run and membership, the same assignment, and no seek, revoke, reacquisition or recreation of
+   * the partition since the context's clock. Offset equality plays no part.
+   * @private
+   * @param {string} topic
+   * @param {number} partition
+   * @param {object|null} context a record from `captureResetContext` or a fetched round
+   * @returns {boolean}
+   */
+  isResetContextCurrent(topic, partition, context) {
+    if (!context || this.isStopping() || context.manager !== this.offsetManager) return false
+    const acquired = this.acquired.get(`${topic}|${partition}`)
+    return (
+      !context.guard?.() &&
+      !this.ownership.refusal(context.token) &&
+      this.assignmentEpoch === context.assignmentEpoch &&
+      acquired !== undefined &&
+      acquired.changedAt <= context.requestClock
+    )
+  }
+
+  /**
+   * Halts a partition the none policy refused, when its captured identity is still current, with
+   * the same store-first, one-event, one-log episode as a corruption halt. A stale refusal changes
+   * nothing. No position is derived: the partition waits for an explicit seek, a revoke, a
+   * recreation or a rebuild.
+   * @private
+   * @param {string} topic
+   * @param {number} partition
+   * @param {{offset: string|null, reason: 'no-offset'|'offset-out-of-range', error: Error}} marker
+   * @param {object|null} context the identity the refusal was raised under
+   * @returns {void}
+   */
+  installReset(topic, partition, marker, context) {
+    if (
+      this.isResetContextCurrent(topic, partition, context) &&
+      this.acceptHalt(topic, partition, marker, context)
+    ) {
+      this.reportHalt(topic, partition, marker)
+    }
+  }
+
+  /**
+   * Installs every refusal a manager's resolution has produced since the last call. A refusal
+   * whose captured identity is no longer current is dropped and retired in the manager, so the
+   * partition is resolved again under the identity that holds now instead of staying skipped.
+   * @private
+   * @param {import('./offsetManager')} manager the manager that resolved
+   * @returns {void}
+   */
+  installResetRefusals(manager) {
+    for (const refusal of manager.takeResetRefusals()) {
+      const { topic, partition, offset, reason, error, context } = refusal
+      if (this.isResetContextCurrent(topic, partition, context)) {
+        this.installReset(topic, partition, { offset, reason, error }, context)
+      } else {
+        manager.retireResetRefusals(topic, partition)
+      }
+    }
+  }
+
+  /**
    * Reports an accepted halt with optional nextOffset, codec and limit copied from its error.
    * Emits one `consumer.partition_halted` event and one error log. Both are
    * contained, so a listener or a logger that throws neither undoes the halt nor reaches the other
@@ -2078,7 +2199,7 @@ module.exports = class ConsumerGroup {
     }
 
     try {
-      this.logger.error('Halted a partition at a corrupt record batch; seek past it to resume', {
+      this.logger.error('Halted a partition; seek it to resume', {
         groupId,
         memberId,
         topic,
@@ -2096,11 +2217,12 @@ module.exports = class ConsumerGroup {
    * @param {Error} e
    * @param {import('../producer/generation')} [fence] the run that failed: its refreshes are bound
    *   to it, and it is checked before a rejoin is requested, so a retired run asks for nothing
+   * @param {object} [context] the identity of the round that failed, for a none refusal
    * @returns {Promise<void>}
    * @throws {Error} `e` itself when it is not one of the errors this method knows how to recover
    *   from, or the fence's close error
    */
-  async recoverFromFetch(e, fence) {
+  async recoverFromFetch(e, fence, context) {
     if (STALE_METADATA_ERRORS.includes(e.type) || e.name === 'KafkaJSTopicMetadataNotLoaded') {
       this.logger.debug('Stale cluster metadata, refreshing...', {
         groupId: this.groupId,
@@ -2127,7 +2249,7 @@ module.exports = class ConsumerGroup {
     }
 
     if (e.name === 'KafkaJSOffsetOutOfRange') {
-      await this.recoverFromOffsetOutOfRange(e, ...(fence ? [fence] : []))
+      await this.recoverFromOffsetOutOfRange(e, ...(fence ? [fence, context] : []))
       return
     }
 
@@ -2270,14 +2392,17 @@ module.exports = class ConsumerGroup {
 
   /**
    * Recovers one partition from `OFFSET_OUT_OF_RANGE`: drops a preferred read replica, or else
-   * resets the partition to its topic's default offset.
-   * @param {{topic: string, partition: number}} e the partition that was out of range
+   * resets the partition to its topic's default offset. Under the none policy the leader's answer
+   * halts the partition instead, with the offset that was requested, and resets nothing.
+   * @param {{topic: string, partition: number, offset?: string}} e the partition that was out of
+   *   range, with the decimal offset the request asked for when it is known
    * @param {import('../producer/generation')} [fence] the run that saw it: the reset commit is
    *   bound to it, and a retired run neither commits nor marks the partition changed
+   * @param {object} [context] the identity of the answer, captured when its request was built
    * @returns {Promise<void>}
    * @throws {Error} the fence's close error
    */
-  async recoverFromOffsetOutOfRange(e, fence) {
+  async recoverFromOffsetOutOfRange(e, fence, context) {
     // If we are fetching from a follower try with the leader before resetting offsets.
     // The stored value is { nodeId, expireAt } (see the JSDoc on
     // preferredReadReplicasPerTopicPartition), not a bare nodeId.
@@ -2291,6 +2416,21 @@ module.exports = class ConsumerGroup {
       })
       delete preferredReadReplicas[e.partition]
       this.routingChanged()
+    } else if (this.topicConfigurations[e.topic]?.resetPolicy?.kind === 'none') {
+      this.installReset(
+        e.topic,
+        e.partition,
+        {
+          offset: e.offset ?? null,
+          reason: 'offset-out-of-range',
+          error: new KafkaJSNoOffsetError('Offset out of range; seek the partition to resume', {
+            topic: e.topic,
+            partition: e.partition,
+            reason: 'offset-out-of-range',
+          }),
+        },
+        context
+      )
     } else {
       this.logger.error('Offset out of range, resetting to default offset', {
         topic: e.topic,
@@ -2434,6 +2574,7 @@ module.exports = class ConsumerGroup {
     for (let pass = 1; pass <= MAX_RESOLUTION_PASSES && !this.isStopping(); pass++) {
       const resolved = await manager.resolveOffsets(preparation)
       preparation?.check()
+      this.installResetRefusals(manager)
       if (resolved || pass === MAX_RESOLUTION_PASSES || this.isStopping()) {
         break
       }
@@ -2548,6 +2689,7 @@ module.exports = class ConsumerGroup {
               trackedEpoch,
               currentLeaderEpoch,
               generation,
+              requestClock: this.acquireClock,
               entry: this.positionValidator.entryOf(topic, partition),
             })
           }
@@ -2806,7 +2948,14 @@ module.exports = class ConsumerGroup {
         } else {
           const decided = preparation && this.positionValidator.entryOf(topic, entry.partition)
           try {
-            await this.applyValidationOutcome(topic, entry.partition, offset, outcome, preparation)
+            await this.applyValidationOutcome(
+              topic,
+              entry.partition,
+              offset,
+              outcome,
+              preparation,
+              entry.requestClock
+            )
             preparation?.check()
           } catch (e) {
             // `complete()` already recorded the partition as validated, so leaving it there would
@@ -2885,10 +3034,12 @@ module.exports = class ConsumerGroup {
    * @param {{action: string, divergingOffset: string|null, leaderEpoch: number}} outcome
    * @param {FetchPreparation} [preparation] the fetch round's identity: forwarded to the offset
    *   work and checked before the repositioning is marked and announced
+   * @param {number} [requestClock] the acquisition clock when the validation request was built;
+   *   with a preparation, it is the identity a none refusal of an unknown divergence carries
    * @returns {Promise<void>}
    * @throws {Error} the preparation's refusal
    */
-  async applyValidationOutcome(topic, partition, offset, outcome, preparation) {
+  async applyValidationOutcome(topic, partition, offset, outcome, preparation, requestClock) {
     if (outcome.action === 'truncated') {
       this.logger.warn('Log truncation detected, repositioning the partition', {
         groupId: this.groupId,
@@ -2913,12 +3064,29 @@ module.exports = class ConsumerGroup {
         partition,
         offset,
       })
-      await (preparation?.manager ?? this.offsetManager).setDefaultOffset(
-        { topic, partition },
-        preparation
-      )
-      preparation?.check()
-      this.markChanged(topic, partition)
+      if (this.topicConfigurations[topic]?.resetPolicy?.kind === 'none') {
+        this.installReset(
+          topic,
+          partition,
+          {
+            offset,
+            reason: 'offset-out-of-range',
+            error: new KafkaJSNoOffsetError('Log truncated at an unknown point; seek to resume', {
+              topic,
+              partition,
+              reason: 'offset-out-of-range',
+            }),
+          },
+          preparation && this.fetchedResetContext(preparation, requestClock)
+        )
+      } else {
+        await (preparation?.manager ?? this.offsetManager).setDefaultOffset(
+          { topic, partition },
+          preparation
+        )
+        preparation?.check()
+        this.markChanged(topic, partition)
+      }
     } else {
       return
     }
