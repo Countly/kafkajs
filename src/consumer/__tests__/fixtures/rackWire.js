@@ -196,20 +196,26 @@ class WireTranscript {
   }
 
   /**
+   * @param {Exchange} exchange a Fetch exchange whose request decoded
+   * @param {{ topic?: string|null, topicId?: string|null }} hint names the topic by id when it has
+   *   one, else by name
+   * @returns {object|undefined} the request's topic entry for the hinted topic
+   */
+  askedTopic({ fetch }, { topic, topicId }) {
+    return fetch.topics.find((t) => (topicId ? t.topicId === topicId : t.topic === topic))
+  }
+
+  /**
    * @param {{ at: number, partition: number, topic: string|null, topicId: string|null }} hint
    * @returns {Exchange|undefined} the first Fetch written after the hint's answer arrived that
    *   asks for the hinted partition of the hinted topic
    * @throws {Error} the decode failure of a Fetch request written after the hint
    */
-  nextFetch({ at, partition, topic, topicId }) {
+  nextFetch(hint) {
     return this.exchanges.find((x) => {
-      if (x.apiKey !== apiKeys.Fetch || x.at <= at) return false
+      if (x.apiKey !== apiKeys.Fetch || x.at <= hint.at) return false
       if (x.fetchError) throw x.fetchError
-      return x.fetch.topics.some(
-        (t) =>
-          (topicId ? t.topicId === topicId : t.topic === topic) &&
-          t.partitions.some((p) => p.partition === partition)
-      )
+      return this.askedTopic(x, hint)?.partitions.some((p) => p.partition === hint.partition)
     })
   }
 }

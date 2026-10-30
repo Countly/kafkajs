@@ -113,6 +113,20 @@ describe('Consumer > rack wire transcript', () => {
     expect(transcript.nextFetch({ ...hint, partition: 3 })).toBeUndefined()
   })
 
+  it('names the asked topic entry of a real Fetch v18 request, by id', async () => {
+    const transcript = new WireTranscript(plainSocket)
+    const socket = transcript.socketFactory({ host: 'localhost', port: 9092 })
+    socket.write(await fetchRequest(1, [1, 4]))
+    const [exchange] = transcript.exchanges
+
+    expect(exchange.apiVersion).toBe(18)
+    expect(transcript.askedTopic(exchange, { topicId: TOPIC_ID })).toMatchObject({
+      topicId: TOPIC_ID,
+      partitions: [{ partition: 1 }, { partition: 4 }],
+    })
+    expect(transcript.askedTopic(exchange, { topicId: 'other' })).toBeUndefined()
+  })
+
   it('keeps a SyncGroup answer and drops the answers of other apis', () => {
     const transcript = new WireTranscript(plainSocket)
     const socket = transcript.socketFactory({ host: 'localhost', port: 9092 })

@@ -805,15 +805,12 @@ describeRack('Consumer > rack-aware range assignment (live)', () => {
           for (const episode of Object.values(episodes)) {
             const { follower, hint, next } = episode.facts
             const [{ wire }] = episode.members
-            const asked = (fetch) =>
-              fetch.topics.find((t) =>
-                hint.topicId ? t.topicId === hint.topicId : t.topic === hint.topic
-              )
+            const asked = wire.askedTopic(next, hint)
             expect(hint.preferredReadReplica).toBe(follower)
             expect(wire.nodeOf(next)).toBe(follower)
             expect(next.fetch.rackId).toBe('rack-a')
             expect(next.fetch.rackId).toBe(hint.exchange.fetch.rackId)
-            expect(asked(next).topicId ?? asked(next).topic).toBe(hint.topicId ?? hint.topic)
+            expect(asked.topicId ?? asked.topic).toBe(hint.topicId ?? hint.topic)
             expectExactlyOnce(episode, episode.result.sent)
           }
         })
