@@ -161,8 +161,6 @@ class SentFields {
  * @returns {Object} the request, in wire field names, carrying only the fields that must be sent
  */
 const buildRequest = (protocol, { sendAllFields = false, leaveEpoch = null } = {}) => {
-  const { sentFields } = protocol
-
   const request = {
     GroupId: protocol.groupId,
     MemberId: protocol.memberId,
@@ -172,6 +170,12 @@ const buildRequest = (protocol, { sendAllFields = false, leaveEpoch = null } = {
   if (protocol.groupInstanceId != null) {
     request.InstanceId = protocol.groupInstanceId
   }
+
+  if (request.MemberEpoch === -1 || request.MemberEpoch === -2) {
+    return request
+  }
+
+  const { sentFields } = protocol
 
   if (sendAllFields && protocol.rackId != null) {
     request.RackId = protocol.rackId

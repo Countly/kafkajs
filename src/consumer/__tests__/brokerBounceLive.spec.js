@@ -1,9 +1,10 @@
+const RebalanceAssertions = require('./fixtures/rebalanceAssertions')
+const PRODUCTION_RETRY = require('../../retry/defaults')
 const Broker = require('../../broker')
 const { Kafka, logLevel, PartitionAssigners, ConfigResourceTypes } = require('../../../index')
 const ISOLATION_LEVEL = require('../../protocol/isolationLevel')
 const {
   createConnectionPool,
-  createTopic,
   newLogger,
   plainTextBrokers,
   secureRandom,
@@ -14,6 +15,17 @@ const { BrokerBouncer, NODES, waitForFullIsr } = require('../../../testHelpers/l
 const { readLog, endOffsets } = require('../../../testHelpers/rawLog')
 const { problemsOf } = require('../../../scripts/evidence/verify')
 const { createLedger, sleep, waitForCondition, withTimeout } = require('./fixtures/liveScenario')
+const {
+  CASE_JOIN_MS,
+  NEVER,
+  bounded,
+  caseTimeout,
+  delay,
+  liveCase,
+  liveRun,
+  pollUntil,
+} = require('../../producer/__tests__/fixtures/bounded')
+const { CleanupStack } = require('../../producer/__tests__/fixtures/liveProbe')
 
 // Gated: it pauses, stops and kills the compose brokers one at a time. Run alone, as the only
 // cluster user: `npm run test:e2e:broker-bounce`.
@@ -39,9 +51,10 @@ const HANDLER_MS = 5
 const STABLE_BUDGET_MS = 120000
 const SETTLE_BUDGET_MS = 30000
 const DELIVERY_BUDGET = { attempts: 240, delay: 250 } // 60 s
-const JOIN_BUDGET = { attempts: 240, delay: 250 } // 60 s
+const JOIN_BUDGET_MS = 60000
 const HOOK_BUDGET_MS = 180000
 const DISCONNECT_BUDGET_MS = 30000
+const BROKERS_BACK_MS = 120000
 // The whole lane: ten outages, each with its restore, ISR and stabilisation waits.
 const SCENARIO_BUDGET_MS = 15 * 60 * 1000
 const MEMBERSHIP = [
@@ -227,32 +240,8 @@ const rebalanceVerdict = (journal, outages) =>
     return { arm: outage.arm, kind, events: events.length, changes, violation }
   })
 
-/**
- * The groups whose rebalance verdict fails a run. The consumer-protocol group's verdict is only
- * recorded in the evidence: its membership outcome is left to that protocol's own outage handling.
- */
-const REBALANCE_ASSERTED = ['classic']
-
-/**
- * The first short-arm violation of an asserted group, which stops the run.
- * @param {Record<string, { kind: string, violation: boolean }>} verdicts one arm's verdict per group
- * @returns {[string, object]|undefined} the group and its verdict
- */
-const shortArmStop = (verdicts) =>
-  Object.entries(verdicts).find(
-    ([group, { kind, violation }]) =>
-      REBALANCE_ASSERTED.includes(group) && kind === 'short' && violation
-  )
-
-/**
- * Every rebalance violation of the asserted groups over the whole run.
- * @param {Record<string, { rebalances: { violation: boolean }[] }>} verdict the run's verdict per group
- * @returns {object[]}
- */
-const assertedRebalanceViolations = (verdict) =>
-  REBALANCE_ASSERTED.flatMap((group) =>
-    verdict[group].rebalances.filter(({ violation }) => violation)
-  )
+const shortArmStop = RebalanceAssertions.shortArmStop
+const assertedRebalanceViolations = RebalanceAssertions.violations
 
 /**
  * Oracle part 4, position: at quiescence each partition's committed offset is the highest
@@ -346,6 +335,17 @@ const awaitSettled = async (sends, budgetMs) => {
   )
   return settled
 }
+
+/**
+ * Awaits `work` under a case's scope: it starts only while the scope is live, and the awaiting
+ * code never resumes on an answer that arrives after the case's deadline.
+ * @template T
+ * @param {AbortSignal} scope the case's or hook's scope
+ * @param {() => Promise<T>} work
+ * @returns {Promise<T>} what `work` returned in time
+ * @throws {Error} `work`'s failure, or the reason the scope aborted with
+ */
+const scoped = (scope, work) => bounded(scope, Infinity, work)
 
 describe('Broker bounce oracle', () => {
   const journalOf = (entries, windowMs = 30000) => {
@@ -565,7 +565,7 @@ describe('Broker bounce oracle', () => {
     })
   })
 
-  test('only the classic group stops a run or fails it on a rebalance; the consumer group is recorded', () => {
+  test('both group protocols stop a short-arm violation and fail any rebalance violation', () => {
     const short = { arm: 'short', tDown: 1000, tRestored: 2000, outageMs: 1000 }
     const long = { arm: 'long', tDown: 100000, tRestored: 130000, outageMs: 30000 }
     const outages = [short, long]
@@ -597,8 +597,11 @@ describe('Broker bounce oracle', () => {
       true,
       true,
     ])
-    expect(consumerOnly.stops).toEqual([undefined, undefined])
-    expect(consumerOnly.failures).toEqual([])
+    expect(consumerOnly.stops).toEqual([
+      ['consumer', consumerOnly.verdict.consumer.rebalances[0]],
+      undefined,
+    ])
+    expect(consumerOnly.failures).toEqual(consumerOnly.verdict.consumer.rebalances)
     expect(classicShort.stops[0]).toEqual(['classic', classicShort.verdict.classic.rebalances[0]])
     expect(classicShort.failures).toHaveLength(1)
     expect(classicLong.stops).toEqual([undefined, undefined])
@@ -736,7 +739,7 @@ describeBounce('Broker bounce: durable log, delivery and rebalances across outag
    * @param {string} name
    * @param {object} options consumer options beyond the group's own
    */
-  const startMember = async (group, name, options) => {
+  const startMember = async (scope, group, name, options) => {
     const journal = journals[group]
     const consumer = kafka.consumer({
       groupId: group === 'classic' ? classicGroup : consumerGroup,
@@ -754,17 +757,19 @@ describeBounce('Broker bounce: durable log, delivery and rebalances across outag
     )
     consumer.on(consumer.events.COMMIT_OFFSETS, ({ payload }) => journal.committed(name, payload))
     members.push({ group, name, consumer })
-    await consumer.connect()
-    await consumer.subscribe({ topic, fromBeginning: true })
-    await consumer.run({
-      autoCommit: true,
-      autoCommitInterval: AUTO_COMMIT_INTERVAL_MS,
-      eachMessage: async ({ partition, message }) => {
-        const window = journal.started(name, { partition, offset: message.offset })
-        await sleep(HANDLER_MS)
-        journal.delivered(window, topic)
-      },
-    })
+    await scoped(scope, () => consumer.connect())
+    await scoped(scope, () => consumer.subscribe({ topic, fromBeginning: true }))
+    await scoped(scope, () =>
+      consumer.run({
+        autoCommit: true,
+        autoCommitInterval: AUTO_COMMIT_INTERVAL_MS,
+        eachMessage: async ({ partition, message }) => {
+          const window = journal.started(name, { partition, offset: message.offset })
+          await sleep(HANDLER_MS)
+          journal.delivered(window, topic)
+        },
+      })
+    )
   }
 
   /** @returns {Record<string, { memberId: string, generationId: number }[]>} by group */
@@ -812,9 +817,10 @@ describeBounce('Broker bounce: durable log, delivery and rebalances across outag
 
   /**
    * Waits until no member reports GROUP_JOIN or REBALANCING for the stabilisation window.
+   * @param {AbortSignal} scope the case's or hook's scope: no wait starts once it has aborted
    * @returns {Promise<number>} how long it took, ms
    */
-  const waitForStable = async () => {
+  const waitForStable = async (scope) => {
     const started = Date.now()
     const quietFor = () => {
       const last = Object.values(journals)
@@ -827,27 +833,33 @@ describeBounce('Broker bounce: durable log, delivery and rebalances across outag
       if (Date.now() - started > STABLE_BUDGET_MS) {
         throw new Error(`Groups not stable within ${STABLE_BUDGET_MS} ms`)
       }
-      await sleep(250)
+      await delay(scope, 250)
     }
     return Date.now() - started
   }
 
   /**
    * Runs one arm on one role's node and records the outage with both groups' classification.
+   * @param {AbortSignal} scope the case's scope: no step starts once the case has ended
    * @param {string} arm
    * @param {'coordinator'|'leader'|'follower'} role
    * @param {{ kind: 'pause'|'stop'|'kill', holdMs?: number }} step
    * @returns {Promise<void>}
    */
-  const runArm = async (arm, role, step) => {
-    const roles = await resolveRoles()
+  const runArm = async (scope, arm, role, step) => {
+    const roles = await scoped(scope, resolveRoles)
     const service = roles[role]
     const before = sampleMembership()
-    const outage = await bouncer.step({ service, ...step }, { admin, topics: [topic] })
-    await waitForFullIsr(admin, [topic])
-    const stabilisedMs = await waitForStable()
+    const issuedAt = Date.now()
+    const returned = await bouncer.step(
+      { service, ...step },
+      { admin, topics: [topic], signal: scope }
+    )
+    const outage = RebalanceAssertions.issueWindow(returned, issuedAt)
+    await scoped(scope, () => waitForFullIsr(admin, [topic]))
+    const stabilisedMs = await waitForStable(scope)
     // The verdict below reads the whole window: an event late in it belongs to this arm.
-    await sleep(Math.max(0, windowEnd(outage) - Date.now()))
+    await delay(scope, Math.max(0, windowEnd(outage) - Date.now()))
     const record = {
       ...outage,
       arm: `${arm}:${role}`,
@@ -887,38 +899,55 @@ describeBounce('Broker bounce: durable log, delivery and rebalances across outag
     }
   }
 
-  beforeAll(async () => {
-    startedAt = Date.now()
+  /**
+   * Builds the scenario's state: the topic, the checked cluster shape, the producer, four members
+   * and the send loop.
+   * @param {AbortSignal} scope the hook's scope: nothing starts or installs once it has aborted
+   * @returns {Promise<void>}
+   * @throws {Error} the cluster does not match the scenario, a member never joins, or the scope aborts
+   */
+  const setUp = async (scope) => {
     writeEvidence(EVIDENCE, { step: 'start', topic, partitions: PARTITIONS })
-    await bouncer.assertAllUp()
+    await scoped(scope, () => bouncer.assertAllUp())
     kafka = new Kafka({
       clientId: `broker-bounce-${runId}`,
+      retry: { ...PRODUCTION_RETRY },
       brokers: plainTextBrokers(),
       logLevel: logLevel.NOTHING,
     })
     admin = kafka.admin()
-    await admin.connect()
-    await createTopic({
-      topic,
-      partitions: PARTITIONS,
-      replicas: 3,
-      config: [{ name: 'min.insync.replicas', value: '2' }],
-    })
+    await scoped(scope, () => admin.connect())
+    await scoped(scope, () =>
+      admin.createTopics({
+        waitForLeaders: true,
+        timeout: 30000,
+        topics: [
+          {
+            topic,
+            numPartitions: PARTITIONS,
+            replicationFactor: 3,
+            configEntries: [{ name: 'min.insync.replicas', value: '2' }],
+          },
+        ],
+      })
+    )
 
-    const { resources } = await admin.describeConfigs({
-      includeSynonyms: false,
-      resources: [
-        { type: ConfigResourceTypes.TOPIC, name: topic, configNames: ['min.insync.replicas'] },
-        {
-          type: ConfigResourceTypes.BROKER,
-          name: '1',
-          configNames: [
-            'group.consumer.session.timeout.ms',
-            'group.consumer.heartbeat.interval.ms',
-          ],
-        },
-      ],
-    })
+    const { resources } = await scoped(scope, () =>
+      admin.describeConfigs({
+        includeSynonyms: false,
+        resources: [
+          { type: ConfigResourceTypes.TOPIC, name: topic, configNames: ['min.insync.replicas'] },
+          {
+            type: ConfigResourceTypes.BROKER,
+            name: '1',
+            configNames: [
+              'group.consumer.session.timeout.ms',
+              'group.consumer.heartbeat.interval.ms',
+            ],
+          },
+        ],
+      })
+    )
     const value = (name) =>
       resources.flatMap(({ configEntries }) => configEntries).find((e) => e.configName === name)
         ?.configValue
@@ -927,7 +956,7 @@ describeBounce('Broker bounce: durable log, delivery and rebalances across outag
       consumerSessionMs: Number(value('group.consumer.session.timeout.ms')),
       consumerHeartbeatMs: Number(value('group.consumer.heartbeat.interval.ms')),
     }
-    const { topics } = await admin.fetchTopicMetadata({ topics: [topic] })
+    const { topics } = await scoped(scope, () => admin.fetchTopicMetadata({ topics: [topic] }))
     readiness.replicas = topics[0].partitions.map(({ replicas }) => replicas.length)
     writeEvidence(EVIDENCE, { step: 'readiness', ...readiness })
     if (
@@ -946,39 +975,42 @@ describeBounce('Broker bounce: durable log, delivery and rebalances across outag
       // At least 60 s of attempts, against a longest planned outage of 45 s.
       retry: { retries: 40, initialRetryTime: 200, maxRetryTime: 2000 },
     })
-    await producer.connect()
+    await scoped(scope, () => producer.connect())
 
     const classic = { sessionTimeout: CLASSIC_SESSION_MS, heartbeatInterval: CLASSIC_HEARTBEAT_MS }
     const cooperative = { ...classic, partitionAssigners: [PartitionAssigners.cooperativeSticky] }
-    await startMember('classic', 'classic-static', {
+    await startMember(scope, 'classic', 'classic-static', {
       ...cooperative,
       groupInstanceId: `static-${runId}`,
     })
-    await startMember('classic', 'classic-dynamic', cooperative)
-    await startMember('consumer', 'consumer-1', {})
-    await startMember('consumer', 'consumer-2', {})
-    const joined = await waitForCondition(
+    await startMember(scope, 'classic', 'classic-dynamic', cooperative)
+    await startMember(scope, 'consumer', 'consumer-1', {})
+    await startMember(scope, 'consumer', 'consumer-2', {})
+    await pollUntil(
+      scope,
+      JOIN_BUDGET_MS,
       () =>
         members.every(({ name, group }) =>
           journals[group].entries.some((e) => e.kind === 'GROUP_JOIN' && e.member === name)
         ),
-      JOIN_BUDGET
+      { label: 'Every member joining its group' }
     )
-    if (!joined) throw new Error('Not every member joined its group')
-    await waitForStable()
+    await waitForStable(scope)
 
-    const names = (await admin.listTopics()).filter((name) =>
+    const names = (await scoped(scope, () => admin.listTopics())).filter((name) =>
       ['__consumer_offsets', '__transaction_state'].includes(name)
     )
-    const internal = await admin.fetchTopicMetadata({ topics: names })
-    const internalConfigs = await admin.describeConfigs({
-      includeSynonyms: false,
-      resources: names.map((name) => ({
-        type: ConfigResourceTypes.TOPIC,
-        name,
-        configNames: ['min.insync.replicas'],
-      })),
-    })
+    const internal = await scoped(scope, () => admin.fetchTopicMetadata({ topics: names }))
+    const internalConfigs = await scoped(scope, () =>
+      admin.describeConfigs({
+        includeSynonyms: false,
+        resources: names.map((name) => ({
+          type: ConfigResourceTypes.TOPIC,
+          name,
+          configNames: ['min.insync.replicas'],
+        })),
+      })
+    )
     writeEvidence(EVIDENCE, {
       step: 'internal-topics',
       replicas: Object.fromEntries(
@@ -995,6 +1027,7 @@ describeBounce('Broker bounce: durable log, delivery and rebalances across outag
       ),
     })
 
+    scope.throwIfAborted()
     timer = setInterval(() => {
       const value = seq++
       sends.push(
@@ -1009,83 +1042,110 @@ describeBounce('Broker bounce: durable log, delivery and rebalances across outag
         )
       )
     }, SEND_INTERVAL_MS)
+  }
+
+  beforeAll(async () => {
+    liveRun.assertClean()
+    startedAt = Date.now()
+    await bounded(NEVER, HOOK_BUDGET_MS - CASE_JOIN_MS, setUp, { label: 'The setup' })
   }, HOOK_BUDGET_MS)
 
+  // Runs whether or not the case was admitted: the setup created these clients either way. A
+  // cleanup that fails or runs out of time taints the run and fails the hook.
   afterAll(async () => {
     clearInterval(timer)
-    for (const { consumer } of members.reverse()) {
-      await withTimeout(
-        consumer.disconnect().catch(() => {}),
-        DISCONNECT_BUDGET_MS
+    const teardown = new CleanupStack()
+    const closing = (name, close) =>
+      teardown.add(name, (signal) =>
+        bounded(signal, DISCONNECT_BUDGET_MS, close, { label: `The ${name}` })
       )
+    teardown.add('broker check', (signal) =>
+      pollUntil(
+        signal,
+        BROKERS_BACK_MS,
+        async () => {
+          try {
+            await bouncer.assertAllUp()
+            return true
+          } catch {
+            return false
+          }
+        },
+        { label: 'Every broker answering again' }
+      )
+    )
+    closing('admin disconnect', () => admin?.disconnect())
+    closing('topic deletion', () => admin?.deleteTopics({ topics: [topic] }))
+    closing('producer disconnect', () => producer?.disconnect())
+    for (const { name, consumer } of members) {
+      closing(`${name} disconnect`, () => consumer.disconnect())
     }
-    await withTimeout(
-      producer?.disconnect().catch(() => {}),
-      DISCONNECT_BUDGET_MS
-    )
-    await admin?.deleteTopics({ topics: [topic] }).catch(() => {})
-    await withTimeout(
-      admin?.disconnect().catch(() => {}),
-      DISCONNECT_BUDGET_MS
-    )
+    await teardown.run(async () => {}, { budgetMs: HOOK_BUDGET_MS - CASE_JOIN_MS })
   }, HOOK_BUDGET_MS)
 
   test(
     'every outage arm keeps the log, delivery, rebalance, position and ownership oracle',
-    async () => {
+    liveCase(SCENARIO_BUDGET_MS, async (scope) => {
       for (const role of ['coordinator', 'leader', 'follower']) {
-        await runArm('A', role, { kind: 'pause', holdMs: PAUSE_MS })
+        await runArm(scope, 'A', role, { kind: 'pause', holdMs: PAUSE_MS })
       }
       for (const role of ['coordinator', 'leader', 'follower']) {
-        await runArm('B', role, { kind: 'stop' })
+        await runArm(scope, 'B', role, { kind: 'stop' })
       }
       for (const role of ['coordinator', 'leader', 'follower']) {
-        await runArm('C', role, { kind: 'kill' })
+        await runArm(scope, 'C', role, { kind: 'kill' })
       }
-      await runArm('D', 'coordinator', { kind: 'stop', holdMs: LONG_HOLD_MS })
+      await runArm(scope, 'D', 'coordinator', { kind: 'stop', holdMs: LONG_HOLD_MS })
 
       clearInterval(timer)
-      expect(await awaitSettled(sends, SETTLE_BUDGET_MS)).toBe(true)
-      const stable = await waitForCondition(
-        async () => {
-          const [high, stableEnd] = await Promise.all([
-            endOffsets({ brokers: plainTextBrokers(), topic }),
-            endOffsets({
-              brokers: plainTextBrokers(),
-              topic,
-              isolationLevel: ISOLATION_LEVEL.READ_COMMITTED,
-            }),
-          ])
-          return [...high].every(([partition, offset]) => stableEnd.get(partition) === offset)
-        },
-        { attempts: SETTLE_BUDGET_MS / 250, delay: 250 }
+      expect(await scoped(scope, () => awaitSettled(sends, SETTLE_BUDGET_MS))).toBe(true)
+      const stable = await scoped(scope, () =>
+        waitForCondition(
+          async () => {
+            const [high, stableEnd] = await Promise.all([
+              endOffsets({ brokers: plainTextBrokers(), topic }),
+              endOffsets({
+                brokers: plainTextBrokers(),
+                topic,
+                isolationLevel: ISOLATION_LEVEL.READ_COMMITTED,
+              }),
+            ])
+            return [...high].every(([partition, offset]) => stableEnd.get(partition) === offset)
+          },
+          { attempts: SETTLE_BUDGET_MS / 250, delay: 250 }
+        )
       )
       expect(stable).toBe(true)
 
-      const log = await readLog({ brokers: plainTextBrokers(), topic })
+      const log = await scoped(scope, () => readLog({ brokers: plainTextBrokers(), topic }))
       const logged = [...log.values()].flatMap(({ records }) =>
         records.map(({ value }) => JSON.parse(value).seq)
       )
       const logResult = logVerdict(acked, logged)
 
-      await waitForCondition(
-        () => Object.values(journals).every(({ ledger }) => ledger.summary().missing.length === 0),
-        DELIVERY_BUDGET
+      await scoped(scope, () =>
+        waitForCondition(
+          () =>
+            Object.values(journals).every(({ ledger }) => ledger.summary().missing.length === 0),
+          DELIVERY_BUDGET
+        )
       )
       const committedOf = async (groupId) => {
         const [{ partitions }] = await admin.fetchOffsets({ groupId, topics: [topic] })
         return new Map(partitions.map(({ partition, offset }) => [partition, offset]))
       }
       const positions = {}
-      await waitForCondition(async () => {
-        for (const [group, groupId] of [
-          ['classic', classicGroup],
-          ['consumer', consumerGroup],
-        ]) {
-          positions[group] = positionVerdict(journals[group], topic, await committedOf(groupId))
-        }
-        return Object.values(positions).every(({ behind }) => behind.length === 0)
-      }, DELIVERY_BUDGET)
+      await scoped(scope, () =>
+        waitForCondition(async () => {
+          for (const [group, groupId] of [
+            ['classic', classicGroup],
+            ['consumer', consumerGroup],
+          ]) {
+            positions[group] = positionVerdict(journals[group], topic, await committedOf(groupId))
+          }
+          return Object.values(positions).every(({ behind }) => behind.length === 0)
+        }, DELIVERY_BUDGET)
+      )
 
       const verdict = Object.fromEntries(
         Object.entries(journals).map(([group, journal]) => [
@@ -1116,8 +1176,8 @@ describeBounce('Broker bounce: durable log, delivery and rebalances across outag
         expect(verdict[group].ownership).toEqual({ overlaps: [], staleCommits: [] })
       }
       expect(Date.now() - startedAt).toBeLessThan(SCENARIO_BUDGET_MS)
-    },
-    SCENARIO_BUDGET_MS
+    }),
+    caseTimeout(SCENARIO_BUDGET_MS)
   )
 
   test('every evidence line of this run carries the stamps a verifier checks', () => {

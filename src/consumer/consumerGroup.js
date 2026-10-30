@@ -41,6 +41,7 @@ const ClassicGroupProtocol = require('./groupProtocol/classic')
 const ConsumerGroupProtocol = require('./groupProtocol/consumer')
 const {
   sentGeneration,
+  isStaleMembershipVerdict,
   stampOwnership,
   obsoleteOwnership,
   consumerStoppingError,
@@ -224,15 +225,9 @@ module.exports = class ConsumerGroup {
     this.maxDecompressedBatchBytes = maxDecompressedBatchBytes
     this.metadataMaxAge = metadataMaxAge
     this.operations = operations
-    // Classic only: a consumer-protocol epoch says nothing about staleness, and a member that
-    // holds no generation has none to be stale against.
     this.ownership = new GroupOwnership({
       isStale: (cause) =>
-        this.kind !== 'consumer' &&
-        this.generationId != null &&
-        Boolean(
-          this.rebalanceCoordinator?.isStaleGenerationVerdict({ kind: 'lost', error: cause })
-        ),
+        isStaleMembershipVerdict({ kind: 'lost', error: cause }, this.kind, this.generationId),
     })
     this.acquired = new Map()
     this.acquireClock = 0
@@ -702,8 +697,18 @@ module.exports = class ConsumerGroup {
    */
   async applyRebalanceResult(result, { rebuildOffsets = true, round } = {}) {
     const check = () => {
-      const error = round?.guard()
-      if (error) throw error
+      const membershipError =
+        this.kind === 'consumer' &&
+        (this.groupMembership.state === 'FATAL'
+          ? this.groupMembership.fatalError
+          : this.groupMembership.state === 'FENCED'
+            ? this.ownership?.refusal(this.ownership.token())?.cause
+            : null)
+      const error = round?.guard() || membershipError
+      if (error) {
+        round?.retire(error)
+        throw error
+      }
     }
     check()
     const { groupId, generationId, memberId, topicsSubscribed, coordinator } = this

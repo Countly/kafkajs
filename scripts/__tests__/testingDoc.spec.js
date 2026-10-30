@@ -332,6 +332,19 @@ describe('documented live scenario scripts', () => {
         'never through this package row',
       ],
     },
+    {
+      script: 'test:e2e:consumer-protocol-states',
+      flag: 'CONSUMER_PROTOCOL_STATES_E2E',
+      spec: 'src/consumer/__tests__/consumerProtocolStatesLive.spec.js',
+      compose: 'testHelpers/consumerGroupStates/compose.yml',
+      budgetsMs: [120000, 30000],
+      wording: [
+        'Reconciling and Assigning capture arms',
+        'Describe must remain serviceable',
+        'named topic created after subscription',
+        'never through this package row',
+      ],
+    },
   ]
 
   it.each(scenarios)('$script is one two-worker spec run through test:kafka', (row) => {

@@ -575,6 +575,8 @@ kafka.consumer({ groupId: 'my-group', groupProtocol: 'consumer', groupRemoteAssi
 
 A stock 4.x broker offers `uniform` and `range`. Leave `groupRemoteAssignor` unset (`null`) to let the coordinator pick its first configured assignor. A name the cluster does not offer is a fatal membership error: the consumer crashes and does not restart, because every rejoin would be answered the same way.
 
+A consumer-protocol target can contain a topic ID before its name is available. The client makes one immediate naming attempt when the known subset converges, then retries at metadata refresh opportunities after the fast attempt budget; it does not abandon the ID permanently. Responses from an old target or membership cannot update metadata for a replacement. A leave heartbeat sends member identity with the protocol's no-update defaults for subscription, assignment, rack and assignor fields. The next join sends full state. Connection and coordinator outages are retried without spending the fetch loop's retry budget until recovery, learned membership loss, poll expiry or an explicit stop; the classic session timeout is not a consumer-protocol expiry timer.
+
 ### Regex subscriptions
 
 Under `'consumer'` you can hand the coordinator a pattern instead of topic names:

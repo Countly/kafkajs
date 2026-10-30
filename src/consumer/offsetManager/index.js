@@ -361,7 +361,7 @@ module.exports = class OffsetManager {
    * @throws {Error} the preparation's refusal; absent, nothing changes
    */
   async getCoordinator(preparation) {
-    if (!this.coordinator.isConnected()) {
+    if (!this.coordinator?.isConnected()) {
       // findBroker() would resolve the same (stale) node after a failover; ask the cluster
       // which broker currently owns the group instead. Upstream PR #1779.
       const coordinator = await this.cluster.findGroupCoordinator(

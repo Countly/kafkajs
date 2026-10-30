@@ -74,9 +74,8 @@ const leaveEpochFor = (isStatic, leaveGroup) =>
   isStatic && leaveGroup !== true ? LEAVE_EPOCH_STATIC : LEAVE_EPOCH_DYNAMIC
 
 /**
- * How many refreshes may report the same topic id unresolved before it stops being asked for. An
- * id that is merely late is retried; one the cluster has now twice refused to name would otherwise
- * cost a Metadata request per metadata max age for the life of the membership.
+ * How many immediate misses are allowed before unknown ids use metadata-age retries.
+ * An id may become resolvable later, so the fast budget never ends periodic discovery.
  */
 const MAX_UNRESOLVED_ATTEMPTS = 2
 
@@ -360,6 +359,10 @@ module.exports = class ConsumerGroupProtocol {
     this.regexUpdated = subscribedTopicRegex != null
 
     /** @type {{ localEpoch: number, byTopicId: Map<string, number[]> }|null} what the coordinator wants */
+    this.membershipRevision = Symbol('membership')
+    this.targetRevision = Symbol('target')
+    this.immediateResolutionRevision = null
+    this.resolutionInFlight = null
     this.target = null
     /** @type {import('./interface').TopicPartitions[]} what this member has */
     this.ownedPartitions = []
@@ -616,8 +619,11 @@ module.exports = class ConsumerGroupProtocol {
       return { assignment: this.ownedAsObject(), userData: null }
     }
 
-    const resolved = await this.resolveAssignmentTopicNames(this.target)
-    await this.growSubscriptionWith(growSubscription, resolved.names)
+    const isCurrent = this.targetGuard()
+    const resolved = await this.resolveAssignmentTopicNames(this.target, isCurrent)
+    if (!isCurrent()) throw assignmentChangedError()
+    await this.growSubscriptionWith(growSubscription, resolved.names, isCurrent)
+    if (!isCurrent()) throw assignmentChangedError()
 
     // The coordinator sees no progress unless something is acknowledged, and an apply that changes
     // nothing never calls `setOwned` with a difference - so a subset that already equals what is
@@ -736,16 +742,20 @@ module.exports = class ConsumerGroupProtocol {
    * path; the member reconciles and acknowledges the resolvable subset meanwhile.
    * @private
    * @param {{ localEpoch: number, byTopicId: Map<string, number[]> }} target
+   * @param {() => boolean} [isCurrent] captured target lifetime
+   * @throws {Error} assignment changed while resolution was awaiting metadata
    * @returns {Promise<{ assignment: Object, byTopicId: Map<string, number[]>, names: string[], unresolved: string[] }>}
    */
-  async resolveAssignmentTopicNames(target) {
+  async resolveAssignmentTopicNames(target, isCurrent = this.targetGuard()) {
     let resolved = this.resolveFromCache(target)
 
     if (resolved.unresolved.length) {
       await this.refreshMetadataForTopicIds(resolved.unresolved)
+      if (!isCurrent()) throw assignmentChangedError()
       resolved = this.resolveFromCache(target)
     }
 
+    if (!isCurrent()) throw assignmentChangedError()
     this.recordResolution(resolved)
     return resolved
   }
@@ -806,37 +816,68 @@ module.exports = class ConsumerGroupProtocol {
   }
 
   /**
-   * One metadata request by topic id, for the ids still worth asking about.
-   *
-   * Failures are logged and swallowed: an id that cannot be resolved leaves its topic unserved for
-   * this membership, which is the stated trade, and must never fail the round. An id the cluster
-   * reports unresolved twice stops being asked for, so a topic this client may not see costs a
-   * bounded number of requests rather than one per metadata max age forever.
+   * Captures a membership and target identity that is never reused, even at equal local epochs.
    * @private
-   * @param {string[]} topicIds
-   * @returns {Promise<void>}
+   * @returns {() => boolean} true only while this member may use the captured target
    */
-  async refreshMetadataForTopicIds(topicIds) {
+  targetGuard() {
+    const membership = this.membershipRevision
+    const target = this.targetRevision
+    return () =>
+      membership === this.membershipRevision &&
+      target === this.targetRevision &&
+      this.target != null &&
+      !isNotInGroup(this.state) &&
+      !isLeavingGroup(this.state)
+  }
+
+  /**
+   * Resolves unknown ids once at a time per target. Two fast misses switch to metadata-age retries;
+   * they never permanently abandon an id. Retired work cannot install metadata or update counters.
+   * @private
+   * @param {string[]} topicIds ids still unnamed
+   * @param {{ periodic?: boolean }} [options] permits one slow retry after the fast budget
+   * @returns {Promise<void>} best effort; transport failures are logged and swallowed
+   */
+  async refreshMetadataForTopicIds(topicIds, { periodic = false } = {}) {
+    const revision = this.targetRevision
+    if (this.resolutionInFlight?.revision === revision) {
+      await this.resolutionInFlight.promise
+      return
+    }
+    const isCurrent = this.targetGuard()
+    if (!isCurrent()) return
     const askable = topicIds.filter(
-      (topicId) => (this.unresolvedAttempts.get(topicId) || 0) < MAX_UNRESOLVED_ATTEMPTS
+      (topicId) => periodic || (this.unresolvedAttempts.get(topicId) || 0) < MAX_UNRESOLVED_ATTEMPTS
     )
-
     if (!askable.length) return
-
     this.lastMetadataRefreshAt = Date.now()
-
-    try {
-      const outcome = await this.cluster.refreshMetadataForTopicIds(askable)
-
-      for (const topicId of (outcome && outcome.unresolved) || []) {
-        this.unresolvedAttempts.set(topicId, (this.unresolvedAttempts.get(topicId) || 0) + 1)
+    const record = { revision, promise: null }
+    this.resolutionInFlight = record
+    record.promise = Promise.resolve().then(async () => {
+      if (!isCurrent()) return
+      try {
+        const outcome = await this.cluster.refreshMetadataForTopicIds(askable, { isCurrent })
+        if (!isCurrent()) return
+        for (const topicId of outcome?.unresolved || []) {
+          this.unresolvedAttempts.set(
+            topicId,
+            Math.min(MAX_UNRESOLVED_ATTEMPTS, (this.unresolvedAttempts.get(topicId) || 0) + 1)
+          )
+        }
+      } catch (error) {
+        if (isCurrent())
+          this.logger.debug('Could not refresh metadata for the assigned topic ids', {
+            groupId: this.groupId,
+            topicIds: askable,
+            error: error.message,
+          })
       }
-    } catch (error) {
-      this.logger.debug('Could not refresh metadata for the assigned topic ids', {
-        groupId: this.groupId,
-        topicIds: askable,
-        error: error.message,
-      })
+    })
+    try {
+      await record.promise
+    } finally {
+      if (this.resolutionInFlight === record) this.resolutionInFlight = null
     }
   }
 
@@ -848,15 +889,19 @@ module.exports = class ConsumerGroupProtocol {
    * @private
    * @param {((names: string[]) => Promise<void>)|undefined} growSubscription
    * @param {string[]} names
+   * @param {() => boolean} [isCurrent] captured target lifetime
+   * @throws {Error} assignment changed during subscription growth
    * @returns {Promise<void>}
    */
-  async growSubscriptionWith(growSubscription, names) {
+  async growSubscriptionWith(growSubscription, names, isCurrent = this.targetGuard()) {
     if (!growSubscription) return
 
     const fresh = names.filter((name) => !this.grownTopicNames.has(name))
     if (!fresh.length) return
 
+    if (!isCurrent()) throw assignmentChangedError()
     await growSubscription(fresh)
+    if (!isCurrent()) throw assignmentChangedError()
     for (const name of fresh) {
       this.grownTopicNames.add(name)
     }
@@ -939,6 +984,11 @@ module.exports = class ConsumerGroupProtocol {
    * @returns {void}
    */
   clearTarget() {
+    this.membershipRevision = Symbol('membership')
+    this.targetRevision = Symbol('target')
+    this.immediateResolutionRevision = null
+    this.resolutionInFlight = null
+    this.lastMetadataRefreshAt = Date.now()
     this.#membershipAccepted = false
     this.target = null
     this.pendingResolved = null
@@ -1038,6 +1088,7 @@ module.exports = class ConsumerGroupProtocol {
     }
 
     const request = buildRequest(this, { sendAllFields, leaveEpoch })
+    if (leaveEpoch === -1 || leaveEpoch === -2) this.sentFields.reset()
     const sentUnderEpoch = request.MemberEpoch
     const stateAtRequest = this.state
 
@@ -1099,6 +1150,7 @@ module.exports = class ConsumerGroupProtocol {
    */
   onRequestGenerated({ leaveEpoch, stateAtRequest }) {
     if (leaveEpoch != null) {
+      this.sentFields.reset()
       if (stateAtRequest === LEAVING && this.state === LEAVING) {
         this.transitionTo(this.pollTimerExpired ? STALE : UNSUBSCRIBED)
       }
@@ -1199,6 +1251,8 @@ module.exports = class ConsumerGroupProtocol {
     }
 
     if (changed) {
+      this.targetRevision = Symbol('target')
+      this.immediateResolutionRevision = null
       // A new target is the coordinator asserting these ids exist, so the attempt budget starts
       // over: an id given up on under an older target is worth asking about again.
       for (const topicId of byTopicId.keys()) {
@@ -1237,14 +1291,10 @@ module.exports = class ConsumerGroupProtocol {
       }
     }
 
-    // A reconciliation step resolves unknown ids by id itself, and one is coming for every target
-    // this member has not converged on yet - so the converged case is the only one that can strand
-    // an id with nothing to resolve it.
-    const stepWillResolve = wasJoining || wasReconciling || !converged
-
-    this.refreshUnresolvedTopicIds({
-      immediate: (targetChanged || grew) && !stepWillResolve,
-    })
+    const immediate = converged && this.immediateResolutionRevision !== this.targetRevision
+    if (converged) this.immediateResolutionRevision = this.targetRevision
+    else this.immediateResolutionRevision = null
+    this.refreshUnresolvedTopicIds({ immediate })
   }
 
   /**
@@ -1255,8 +1305,8 @@ module.exports = class ConsumerGroupProtocol {
    * reconciliation step is coming to resolve them - the case nothing else covers, and without it a
    * topic assigned after the member reached its steady state (a regex match, or a subscribed name
    * whose topic was created later) is picked up only after a whole metadata max age. Otherwise on
-   * the metadata max age, as the slow retry for ids that stayed unresolved, bounded per id by the
-   * attempt cap in `refreshMetadataForTopicIds`.
+   * the metadata max age, as the slow retry for ids that stayed unresolved, at most once per
+   * metadata max age after the fast attempt budget.
    *
    * @see https://github.com/apache/kafka/blob/4.3/clients/src/main/java/org/apache/kafka/clients/consumer/internals/AbstractMembershipManager.java
    * @private
@@ -1264,43 +1314,33 @@ module.exports = class ConsumerGroupProtocol {
    * @returns {void}
    */
   refreshUnresolvedTopicIds({ immediate }) {
-    if (!this.unresolvedTopicIds.size) return
-    if (!immediate && Date.now() - this.lastMetadataRefreshAt < this.metadataMaxAge) return
-
+    if (!this.target || !this.unresolvedTopicIds.size) return
+    if (this.resolutionInFlight?.revision === this.targetRevision) return
+    const periodic = Date.now() - this.lastMetadataRefreshAt >= this.metadataMaxAge
+    if (!immediate && !periodic) return
     const topicIds = [...this.unresolvedTopicIds]
-    const { localEpoch } = this.target
-
-    // Deliberately not awaited - a heartbeat must not wait on metadata - so nothing raised here
-    // has a caller: the refresh swallows its own failures and the re-read is logged rather than
-    // left to the process as an unhandled rejection.
-    this.refreshMetadataForTopicIds(topicIds)
-      .then(() => this.onTopicIdsRefreshed(topicIds, localEpoch))
+    const isCurrent = this.targetGuard()
+    this.refreshMetadataForTopicIds(topicIds, { periodic })
+      .then(() => this.onTopicIdsRefreshed(topicIds, isCurrent))
       .catch((error) => {
-        this.logger.debug('Could not re-read the target after refreshing its topic ids', {
-          groupId: this.groupId,
-          error: error.message,
-        })
+        if (isCurrent())
+          this.logger.debug('Could not re-read the target after refreshing its topic ids', {
+            groupId: this.groupId,
+            error: error.message,
+          })
       })
   }
 
   /**
-   * Re-evaluates the target once a by-id refresh has run, so a name that has just arrived starts
-   * its round now rather than on the next heartbeat.
-   *
-   * Does nothing unless the refresh actually named one of the ids it asked about and the target it
-   * was resolving is still this member's: a refresh landing after a fencing, a leave or a newer
-   * target must not move the machine. The local epoch is the identity that matters - the target
-   * object is replaced by every heartbeat carrying an assignment, changed or not.
+   * Schedules reconciliation only for a current response that named a requested target id.
    * @private
-   * @param {string[]} topicIds the ids the refresh asked about
-   * @param {number} localEpoch the local epoch of the target it was resolving
+   * @param {string[]} topicIds requested ids
+   * @param {() => boolean} isCurrent captured membership/target predicate
    * @returns {void}
    */
-  onTopicIdsRefreshed(topicIds, localEpoch) {
-    if (this.target == null || this.target.localEpoch !== localEpoch) return
-    if (isNotInGroup(this.state) || isLeavingGroup(this.state)) return
+  onTopicIdsRefreshed(topicIds, isCurrent) {
+    if (!isCurrent()) return
     if (!topicIds.some((topicId) => this.cluster.topicName(topicId) != null)) return
-
     this.evaluateTarget({ targetChanged: false })
   }
 
@@ -1376,7 +1416,9 @@ module.exports = class ConsumerGroupProtocol {
     }
 
     if (code === UNSUPPORTED_VERSION || this.isUnsupportedApi(error)) {
-      return this.transitionToFatal(unsupportedConsumerProtocolError(error))
+      const unsupported = unsupportedConsumerProtocolError(error)
+      learnOwnershipLoss(this.ownership, unsupported, REBALANCE_PATHS.HEARTBEAT, 'consumer')
+      return this.transitionToFatal(unsupported)
     }
 
     if (code === INVALID_REGULAR_EXPRESSION) {
@@ -1632,7 +1674,6 @@ module.exports = class ConsumerGroupProtocol {
     this.#membershipAccepted = false
     this.ownedPartitions = []
     this.clearTarget()
-    this.sentFields.reset()
     this.localAssignment = { localEpoch: 0, byTopicId: new Map() }
     const isStatic = Boolean(this.groupInstanceId)
     this.memberEpoch = leaveEpochFor(isStatic, leaveGroup)

@@ -217,7 +217,7 @@ describe('consumer regression fixtures', () => {
       if (cluster) await cluster.disconnect()
       if (seam) seam.assertClean()
     })
-    it.failing('sends only identity and no-update fields when leaving the group', () => {
+    it('sends only identity and no-update fields when leaving the group', () => {
       expect(observed).toEqual({
         rebalanceTimeoutMs: -1,
         subscribedTopicNames: null,
@@ -296,7 +296,7 @@ describe('consumer regression fixtures', () => {
       if (cluster) await cluster.disconnect()
       if (seam) seam.assertClean()
     })
-    it.failing('immediately names a stranded target when both change flags are false', () => {
+    it('immediately names a stranded target when both change flags are false', () => {
       expect(observed).toBe(1)
     })
   })

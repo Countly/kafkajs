@@ -361,30 +361,38 @@ module.exports = class Cluster {
    * @see clients/src/main/resources/common/message/MetadataRequest.json
    * @public
    * @param {string[]} topicIds canonical uuid strings
+   * @param {{ isCurrent?: () => boolean }} [options] checked before requests and cache installs;
+   *   guarded old-version discovery reads names without installing global routing metadata
    * @returns {Promise<{ resolved: string[], unresolved: string[] }>} the requested ids, split by
    *   whether the cache can name them now. Duplicates and nulls are dropped from both lists.
    */
-  async refreshMetadataForTopicIds(topicIds) {
+  async refreshMetadataForTopicIds(topicIds, { isCurrent = () => true } = {}) {
     const ids = [...new Set(topicIds)].filter((topicId) => topicId != null)
 
-    if (ids.length === 0) {
+    if (!isCurrent() || ids.length === 0) {
       return { resolved: [], unresolved: [] }
     }
 
+    const guarded = arguments[1]?.isCurrent !== undefined
     let outcome = null
 
     try {
       outcome = await this.brokerPool.withBroker(async ({ broker }) => {
+        if (!isCurrent()) return FAILED
         const version = broker.negotiatedVersion(apiKeys.Metadata, requests.Metadata)
 
         if (version == null || version < 12) {
-          return TOO_OLD
+          if (!guarded) return TOO_OLD
+          const response = await broker.metadata()
+          if (!isCurrent()) return FAILED
+          this.metadataCache.updateTopicsById(response)
+          return RESOLVED
         }
 
-        return await this.fetchMetadataByTopicIds(broker, ids)
+        return await this.fetchMetadataByTopicIds(broker, ids, { isCurrent })
       })
 
-      if (outcome === TOO_OLD) {
+      if (outcome === TOO_OLD && isCurrent()) {
         this.logger.debug('Cannot request metadata by topic id; refreshing by name instead', {
           topicIds: ids,
         })
@@ -399,6 +407,8 @@ module.exports = class Cluster {
         error: e.message,
       })
     }
+
+    if (!isCurrent()) return { resolved: [], unresolved: [] }
 
     const resolution = {
       resolved: ids.filter((topicId) => this.metadataCache.topicName(topicId) != null),
@@ -432,15 +442,18 @@ module.exports = class Cluster {
    * @private
    * @param {import("../broker")} broker
    * @param {string[]} ids
+   * @param {{ isCurrent?: () => boolean }} [options] stale responses have no cache effects
    * @returns {Promise<'resolved'|'failed'>} whether the client managed to ask at all
    */
-  async fetchMetadataByTopicIds(broker, ids) {
+  async fetchMetadataByTopicIds(broker, ids, { isCurrent = () => true } = {}) {
     try {
-      this.metadataCache.updateTopicsById(
-        await broker.metadata(ids.map((topicId) => ({ topicId })))
-      )
+      if (!isCurrent()) return FAILED
+      const response = await broker.metadata(ids.map((topicId) => ({ topicId })))
+      if (!isCurrent()) return FAILED
+      this.metadataCache.updateTopicsById(response)
       return RESOLVED
     } catch (e) {
+      if (!isCurrent()) return FAILED
       if (ids.length === 1 || !isPerTopicError(e)) {
         this.logger.debug('Metadata by topic id failed; leaving the ids unresolved', {
           topicIds: ids,
@@ -455,9 +468,13 @@ module.exports = class Cluster {
       })
 
       for (const topicId of ids) {
+        if (!isCurrent()) return FAILED
         try {
-          this.metadataCache.updateTopicsById(await broker.metadata([{ topicId }]))
+          const response = await broker.metadata([{ topicId }])
+          if (!isCurrent()) return FAILED
+          this.metadataCache.updateTopicsById(response)
         } catch (topicError) {
+          if (!isCurrent()) return FAILED
           this.logger.debug('Topic id could not be resolved to a name', {
             topicId,
             error: topicError.message,

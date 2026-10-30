@@ -1231,6 +1231,67 @@ describe('request identities held across heartbeat answers', () => {
 })
 
 describe('completed join ownership', () => {
+  it.each([null, 25, 128])('keeps the pre-release apply boundary sound for %s', async (code) => {
+    const fixture = ownershipFixture({ kind: 'consumer' })
+    const { group, runner, ownership, manager, schedule, operations } = fixture
+    group.partitionsPerSubscribedTopic = new Map([[SCHEDULED_TOPIC, [0, 1]]])
+    group.groupMembership.setOwned([{ topic: SCHEDULED_TOPIC, partitions: [0, 1] }])
+    group.groupMembership.coordinator = fixture.coordinator
+    group.groupMembership.generationId = 1
+    group.groupMembership.memberId = 'member-a'
+    manager.resolveOffset({ topic: SCHEDULED_TOPIC, partition: 0, offset: '4' })
+    const token = ownership.token()
+    const gate = releasableOnce(schedule.hold({ api: 'OffsetCommit' }))
+    const published = []
+    const notify = group.subscriptionState.onAssignmentChange
+    group.subscriptionState.onAssignmentChange = () => {
+      published.push(ownership.token())
+      notify()
+    }
+    const round = group.beginRebalanceRound()
+    const applying = round.wait(() =>
+      group.applyRebalanceResult(
+        { assignment: { [SCHEDULED_TOPIC]: [1] }, userData: null },
+        { rebuildOffsets: false, round }
+      )
+    )
+    const settled = applying.then(
+      (result) => result,
+      (error) => error
+    )
+    try {
+      await within(gate.arrived(), 2000, 'the real pre-release commit')
+      expect(ownership.token()).toBe(token)
+      let error
+      if (code != null) {
+        error = stampOwnership(brokerError(code), token)
+        const verdict = runner.rebalanceCoordinator.classify(error, REBALANCE_PATHS.MEMBERSHIP)
+        expect(verdict.kind).toBe('lost')
+        runner.rebalanceCoordinator.requestRejoin(verdict)
+      }
+      gate.release()
+      const result = await within(settled, 2000, 'the held apply to settle')
+      await until(() => operations.size() === 0, 'pre-release operation cleanup')
+      if (code == null) {
+        expect(result).not.toBeInstanceOf(Error)
+        expect(published).toEqual([token + 1])
+        expect(ownership.token()).toBe(token + 1)
+      } else {
+        expect(result).toBe(error)
+        expect(published).toEqual([])
+        expect(ownership.token()).toBe(token)
+        expect(group.assigned()).toEqual([{ topic: SCHEDULED_TOPIC, partitions: [0, 1] }])
+        expect(runner.rebalanceCoordinator.takeVerdict().error).toBe(error)
+      }
+    } finally {
+      gate.release()
+      round.retire()
+      await settled
+      group.subscriptionState.onAssignmentChange = notify
+      await fixture.close()
+    }
+  })
+
   it('renews ownership before publishing the applied assignment', async () => {
     const fixture = ownershipFixture()
     const { runner, group, ownership } = fixture

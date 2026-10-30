@@ -21,7 +21,17 @@ Versions before 3.0.0 are internal alpha tags and are not published.
 
 - **Classic consumers retain the member id received in `MEMBER_ID_REQUIRED` across retried JoinGroup requests.** Retriable transport failures, coordinator rediscovery and join-round expiry keep the id for the same active local membership. `UNKNOWN_MEMBER_ID` clears it; `ILLEGAL_GENERATION` alone does not. Local leave, stop, disconnect or rebuild discards it, and `FENCED_INSTANCE_ID` remains fatal. This prevents these retries from creating additional abandoned members that delay rebalances until their session timeouts.
 
+- **The KIP-848 leave builder supplies only member identity; other fixed wire fields carry no-update defaults** (group, member id, epoch −1 or −2, instance id); it used to also send the subscription, the rebalance timeout and an empty partition list
+
+- **A named topic a KIP-848 member is assigned before its name is known is found promptly**, instead of up to `metadataMaxAge` later
+
+- Consumer-protocol consumers retry their own connection and coordinator outages without spending the fetch loop's retry budget. A learned fence or fatal error, poll expiry and explicit stop still end or replace membership; no client-side session timeout is inferred from the classic configuration.
+
 #### Fixes
+
+- Fence unknown-target metadata responses before cache installation and keep periodic naming attempts after the fast discovery budget.
+
+- Use one membership-staleness predicate for ownership loss and rebalance verdicts; a consumer epoch change does not retire a current ownership token.
 
 #### Additions
 
@@ -40,6 +50,8 @@ Versions before 3.0.0 are internal alpha tags and are not published.
 - `test:e2e:pause-resume` checks idle resume latency and pause survival through a rebalance.
 
 - `test:e2e:leader-union` checks unequal subscriptions, delayed topic creation and Java interoperability in both leader seats.
+
+- Add independent leave/default, consumer fault and transient-state capture checks; assert both group protocols in the broker-bounce rebalance oracle.
 
 ### Phase 9B — Producer parity: delivery deadline, memory bound, request size, partitioner, codecs, lifecycle
 

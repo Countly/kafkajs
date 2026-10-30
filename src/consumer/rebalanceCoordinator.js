@@ -1,10 +1,11 @@
 const describeThrown = require('../network/describeThrown')
-const { KafkaJSNonRetriableError, isFencedInstance, isUnknownMemberId } = require('../errors')
+const { KafkaJSNonRetriableError } = require('../errors')
 const {
+  REBALANCE_PATHS,
   rebalanceAction,
   rebalanceReason,
   pollIntervalExceededError,
-  sentGeneration,
+  isStaleMembershipVerdict,
   sentOwnership,
   stampOwnership,
   obsoleteOwnership,
@@ -44,13 +45,6 @@ const MAX_RECONCILE_YIELD_MS = 5000
  * `ConsumerGroup#joinAndSync` matches `UNKNOWN_MEMBER_ID`.
  */
 const CONSUMER_STOPPING = 'CONSUMER_STOPPING'
-
-/**
- * The second of the two codes a coordinator uses to stop recognising a consumer-protocol member.
- * The first, `UNKNOWN_MEMBER_ID`, already has an exported predicate.
- * @see https://github.com/apache/kafka/blob/4.3/clients/src/main/java/org/apache/kafka/common/protocol/Errors.java
- */
-const FENCED_MEMBER_EPOCH_CODE = 110
 
 /** The Java client's message, adapted to this client's option names. */
 const POLL_TIMEOUT_WARNING =
@@ -245,6 +239,17 @@ module.exports = class RebalanceCoordinator {
     try {
       await this.runRounds(reason, kind)
     } catch (error) {
+      if (
+        this.consumerGroup.kind === 'consumer' &&
+        this.consumerGroup.roundContext?.guard() === error &&
+        !obsoleteOwnership(this.consumerGroup.ownership, error) &&
+        rebalanceAction(error, REBALANCE_PATHS.MEMBERSHIP, {
+          kind: this.consumerGroup.kind,
+        }).action === 'lost'
+      ) {
+        // The retained LOST verdict owns recovery or termination after this chain settles.
+        return
+      }
       if (error && error.type === CONSUMER_STOPPING && this.runner.stopRequested) {
         this.logger.debug('Rebalance chain abandoned because the consumer is stopping', {
           groupId: this.groupId,
@@ -453,6 +458,9 @@ module.exports = class RebalanceCoordinator {
 
     if (aborting) {
       this.verdict = this.mergeVerdict(this.verdict, verdict)
+      if (verdict.kind === 'lost' && this.consumerGroup.kind === 'consumer') {
+        this.consumerGroup.roundContext?.retire(verdict.error)
+      }
       // Not awaited: `stop()` resolves only once every in-flight handler has returned, and on a
       // poll expiry that handler is by definition overrunning. The sink is required - an
       // un-awaited rejection terminates the process on Node 22+.
@@ -504,7 +512,8 @@ module.exports = class RebalanceCoordinator {
    * what makes the comparison possible.
    * @see clients/src/main/java/org/apache/kafka/clients/consumer/internals/AbstractCoordinator.java
    *
-   * Two verdicts are never stale by this rule: a fenced static member, which must die rather than
+   * Consumer-protocol epoch changes do not retire membership; ownership tokens do that.
+   * Two classic verdicts are never stale by this rule: a fenced static member, which must die rather than
    * rejoin, and any verdict that does not come from a group request's answer - a poll-interval
    * overrun, say, which resets the generation itself on purpose and carries no stamp.
    *
@@ -512,24 +521,13 @@ module.exports = class RebalanceCoordinator {
    * @returns {boolean}
    */
   isStaleGenerationVerdict(verdict) {
-    if (verdict.kind !== 'lost' || isFencedInstance(verdict.error)) {
-      return false
-    }
-
-    // Under the consumer group protocol the member epoch moves on every reconciliation, so
-    // comparing the epoch a fencing was sent under against the one held now carries no
-    // information - and the epoch is deliberately NOT zeroed when the member is fenced, so every
-    // fencing verdict would compare unequal and be dropped, leaving a member that sends nothing
-    // and never rejoins.
-    if (
-      this.consumerGroup.kind === 'consumer' &&
-      (isUnknownMemberId(verdict.error) || verdict.error.code === FENCED_MEMBER_EPOCH_CODE)
-    ) {
-      return false
-    }
-
-    const sentUnder = sentGeneration(verdict.error)
-    return sentUnder != null && sentUnder !== this.consumerGroup.generationId
+    // -1 is Kafka's "no generation": a stamped verdict is stale against a member that holds none,
+    // as it was before the shared predicate; ownership keeps its own null rule.
+    return isStaleMembershipVerdict(
+      verdict,
+      this.consumerGroup.kind,
+      this.consumerGroup.generationId ?? -1
+    )
   }
 
   /**

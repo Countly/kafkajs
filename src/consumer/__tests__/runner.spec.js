@@ -641,6 +641,16 @@ describe('Consumer > Runner', () => {
       expect(consumerGroup.memberId).toBeNull()
     })
 
+    it.each(['classic', 'consumer'])('handles heartbeat authorization under %s', async (kind) => {
+      consumerGroup.kind = kind
+      const error = new KafkaJSProtocolError(createErrorFromCode(29))
+      consumerGroup.heartbeat.mockRejectedValue(error)
+      if (kind === 'consumer') await expect(runner.heartbeat()).resolves.toBeUndefined()
+      else await expect(runner.heartbeat()).rejects.toBe(error)
+      expect(consumerGroup.onMembershipError).not.toHaveBeenCalled()
+      expect(onCrash).not.toHaveBeenCalled()
+    })
+
     it('heartbeats at the membership interval', async () => {
       asConsumerProtocol()
       const runner = createTestRunner()

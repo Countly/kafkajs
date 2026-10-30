@@ -425,21 +425,21 @@ describe('Consumer > groupProtocol > ConsumerGroupProtocol', () => {
       h.protocol.setOwned([{ topic: 'topic-a', partitions: [0] }])
       expect(h.refreshedIds).toHaveLength(1)
 
-      // Two heartbeats inside one max-age window add nothing; the one after it retries.
+      // Convergence spends one immediate attempt; the slow retry remains metadata-age bounded.
       jest.advanceTimersByTime(5000)
       await h.manager.tick()
       jest.advanceTimersByTime(4000)
       await h.manager.tick()
-      expect(h.refreshedIds).toHaveLength(1)
+      expect(h.refreshedIds).toHaveLength(2)
 
       jest.advanceTimersByTime(10000)
       await h.manager.tick()
 
-      expect(h.refreshedIds).toHaveLength(2)
-      expect(h.refreshedIds[1]).toEqual([TOPIC_ID_B])
+      expect(h.refreshedIds).toHaveLength(3)
+      expect(h.refreshedIds[2]).toEqual([TOPIC_ID_B])
     })
 
-    it('stops asking once the cluster has reported an id unresolved twice', async () => {
+    it('keeps slow discovery alive after two unresolved answers', async () => {
       const h = build({
         names: { [TOPIC_ID_A]: 'topic-a' },
         metadataMaxAge: 1000,
@@ -458,16 +458,15 @@ describe('Consumer > groupProtocol > ConsumerGroupProtocol', () => {
 
       jest.advanceTimersByTime(5000)
       await h.manager.tick()
-      expect(h.refreshedIds).toHaveLength(2)
+      expect(h.refreshedIds).toHaveLength(3)
 
-      // Two misses is the whole budget: every later heartbeat still finds the id unresolved and
-      // asks for nothing, so a topic this client may never see costs a bounded number of requests.
+      // A missing name can appear later, so each aged opportunity still asks once.
       for (let i = 0; i < 3; i++) {
         jest.advanceTimersByTime(5000)
         await h.manager.tick()
       }
 
-      expect(h.refreshedIds).toHaveLength(2)
+      expect(h.refreshedIds).toHaveLength(6)
       expect(h.protocol.needsReconciliation()).toBe(false)
     })
   })
@@ -518,7 +517,9 @@ describe('Consumer > groupProtocol > ConsumerGroupProtocol', () => {
 
       // The same turn as the response that named the id: no second heartbeat, and no wait for the
       // metadata max age, which is the shipped default 300000 here.
-      expect(h.cluster.refreshMetadataForTopicIds).toHaveBeenCalledWith([TOPIC_ID_B])
+      expect(h.cluster.refreshMetadataForTopicIds).toHaveBeenCalledWith([TOPIC_ID_B], {
+        isCurrent: expect.any(Function),
+      })
       expect(h.sent).toHaveLength(2)
 
       await flushRefresh()
@@ -553,12 +554,12 @@ describe('Consumer > groupProtocol > ConsumerGroupProtocol', () => {
       await h.manager.tick()
       expect(h.refreshedIds).toHaveLength(2)
 
-      // Two misses is the whole budget for one target, whatever the immediate ask spent of it.
+      // Exhausting the fast budget retains one attempt per metadata-age opportunity.
       for (let i = 0; i < 3; i++) {
         jest.advanceTimersByTime(11000)
         await h.manager.tick()
       }
-      expect(h.refreshedIds).toHaveLength(2)
+      expect(h.refreshedIds).toHaveLength(5)
 
       // A new target naming the same id is the coordinator asserting it exists, so it is asked for
       // again, at once.
@@ -572,8 +573,8 @@ describe('Consumer > groupProtocol > ConsumerGroupProtocol', () => {
       jest.advanceTimersByTime(5000)
       await h.manager.tick()
 
-      expect(h.refreshedIds).toHaveLength(3)
-      expect(h.refreshedIds[2]).toEqual([TOPIC_ID_B])
+      expect(h.refreshedIds).toHaveLength(6)
+      expect(h.refreshedIds[5]).toEqual([TOPIC_ID_B])
     })
 
     it('keeps a failure in the re-read after a refresh off the process', async () => {

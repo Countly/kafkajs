@@ -944,6 +944,12 @@ Groups whose members subscribe to different topics now assign every subscribed p
 
 - **Classic joins after connection loss.** No application change is required. KafkaJS 2.2.4 could discard the id assigned by `MEMBER_ID_REQUIRED` when the following JoinGroup failed; 3.0.0 reuses it while the same classic membership remains active. `UNKNOWN_MEMBER_ID` clears it before a fresh join. `FENCED_INSTANCE_ID` remains fatal and does not trigger automatic restart. Leave, stop, disconnect and membership rebuild discard the local id even when no LeaveGroup is sent or its acknowledgement is lost. Static members keep their configured `groupInstanceId` and existing leave policy; retaining a broker slot does not retain the local member id. A new consumer starts without a member id. This reduces retry-created abandoned members; it does not guarantee progress during an outage. No option restores the old behavior.
 
+- **The KIP-848 leave builder supplies only member identity; other fixed wire fields carry no-update defaults.** Nothing to do; the coordinator ignored the extra fields
+
+- **A named topic a KIP-848 member is assigned before its name is known is found promptly.** Nothing to do
+
+Connection or coordinator failures in the consumer protocol no longer spend the fetch loop's retry count while the client reconnects. Handler errors keep their existing retry treatment. Use stop/disconnect to end recovery, and keep handling membership loss and fatal errors. This does not change the three stale-member-epoch commit rules or add a background automatic-commit timer.
+
 ### Admin
 
 Group visibility and the admin client.

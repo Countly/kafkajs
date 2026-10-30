@@ -402,7 +402,23 @@ const learnOwnershipLoss = (ownership, error, path, kind) => {
   return false
 }
 
+/**
+ * Applies one generation-staleness rule at both ownership loss and verdict admission. Consumer
+ * epochs may advance inside the same membership; only the ownership token can retire that work.
+ * @param {{ kind: string, error: Error }} verdict candidate membership verdict
+ * @param {'classic'|'consumer'|'manual'} kind membership protocol
+ * @param {number|null} generationId current generation or member epoch
+ * @returns {boolean} true only for an old classic generation's non-static lost verdict
+ */
+const isStaleMembershipVerdict = (verdict, kind, generationId) => {
+  if (verdict.kind !== 'lost' || isFencedInstance(verdict.error) || kind === 'consumer')
+    return false
+  const sentUnder = sentGeneration(verdict.error)
+  return generationId != null && sentUnder != null && sentUnder !== generationId
+}
+
 module.exports = {
+  isStaleMembershipVerdict,
   REBALANCE_PATHS,
   rebalanceAction,
   rebalanceReason,

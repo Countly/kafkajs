@@ -859,7 +859,7 @@ describe('Consumer > broker outages', () => {
     })
   })
 
-  it('a consumer-protocol member keeps counting a lost connection against its retries', async () => {
+  it('a consumer-protocol member rides a lost connection without spending retries', async () => {
     const cluster = consumerProtocolScript(
       createScriptedCluster({ nodes: NODES, profile: 'consumer' }),
       { coordinator: COORDINATOR, batches: 1 }
@@ -872,16 +872,28 @@ describe('Consumer > broker outages', () => {
       maxWaitTimeInMs: 20,
       retry: RETRY,
     })
-    const events = { crashes: [], records: [] }
+    const events = { crashes: [], records: [], joins: [], rebalancing: [] }
+    consumer.on(consumer.events.GROUP_JOIN, ({ payload }) => events.joins.push(payload))
+    consumer.on(consumer.events.REBALANCING, ({ payload }) => events.rebalancing.push(payload))
     consumer.on(consumer.events.CRASH, ({ payload }) => events.crashes.push(payload))
     await start(events)
     await until(() => events.records.length === 1, 'the first record')
+    const joins = events.joins.length
+    const rebalances = events.rebalancing.length
     breaker.take(LEADER, 'refused')
-    await until(() => events.crashes.length > 0, 'a crash', 2000)
-
-    const [{ error }] = events.crashes
-    expect(error.name).toBe('KafkaJSNumberOfRetriesExceeded')
-    expect(lostConnection(error)).toBe(true)
+    await sleep(OUTAGE_MS)
+    const before = cluster.requests().filter(({ api }) => api === 'Fetch').length
+    breaker.restore(LEADER)
+    await until(
+      () => cluster.requests().filter(({ api }) => api === 'Fetch').length > before,
+      'a restored Fetch'
+    )
+    expect(events.crashes).toEqual([])
+    expect(events.joins).toHaveLength(joins)
+    expect(events.rebalancing).toHaveLength(rebalances)
+    await consumer.disconnect()
+    consumer = undefined
+    cluster.assertClean()
   })
 
   describe('a consumer-protocol member and its fencing', () => {

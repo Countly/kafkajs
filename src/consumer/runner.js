@@ -91,13 +91,13 @@ module.exports = class Runner extends EventEmitter {
     this.commitRetrier = createRetry(Object.assign({}, retry))
     this.backoff = createRetry.backoff(retry)
     /**
-     * The outages a classic member's fetch loop rides out, one per class of the client's own
+     * The transport outages a group member's fetch loop rides out, one per class of the client's own
      * requests in it: each ends only when a request of its own class succeeds.
      */
     this.outages = {
-      fetch: new Outage(sessionTimeout),
-      heartbeat: new Outage(sessionTimeout),
-      commit: new Outage(sessionTimeout),
+      fetch: new Outage(consumerGroup.kind === 'consumer' ? Infinity : sessionTimeout),
+      heartbeat: new Outage(consumerGroup.kind === 'consumer' ? Infinity : sessionTimeout),
+      commit: new Outage(consumerGroup.kind === 'consumer' ? Infinity : sessionTimeout),
     }
     /** @type {WeakMap<object, 'fetch'|'heartbeat'|'handler'>} where an error left the loop's work */
     this.requestClasses = new WeakMap()
@@ -254,7 +254,7 @@ module.exports = class Runner extends EventEmitter {
    *
    * An error from a membership a completed round already replaced is dropped after any waiting
    * verdict is handled, and the loop restarts instead of crashing the consumer. So does, for a
-   * classic member, a lost connection or a moved coordinator raised by one of the loop's own
+   * group member, a lost connection or a moved coordinator raised by one of the loop's own
    * requests (a Fetch round, a heartbeat, an automatic commit), after the retrier's first delay and
    * without spending a retry, until that class of request has failed for a session timeout with no
    * success (see `Outage`): the next round reconnects, and the heartbeat and the commit look the
@@ -442,6 +442,10 @@ module.exports = class Runner extends EventEmitter {
     if (lost) {
       const ownership = this.consumerGroup.ownership
       ownership?.lose(verdict.error, sentOwnership(verdict.error) ?? ownership.token())
+      if (this.consumerGroup.kind === 'consumer') {
+        this.consumerGroup.roundContext?.retire(verdict.error)
+        await this.rebalanceCoordinator.idle()
+      }
     }
 
     if (lost) {
@@ -706,6 +710,8 @@ module.exports = class Runner extends EventEmitter {
         this.rebalanceCoordinator.requestRejoin(verdict)
       }
 
+      if (this.consumerGroup.kind === 'consumer' && e.code === 29) return
+
       if (
         this.consumerGroup.rebalanceProtocol() === COOPERATIVE &&
         ((verdict && verdict.kind === 'revoked') ||
@@ -737,8 +743,7 @@ module.exports = class Runner extends EventEmitter {
    * An OffsetCommit loading error propagated by a handler keeps its request provenance, so a
    * classic member retries a commit helper's failure within the commit outage. A handler-propagated
    * `NOT_COORDINATOR` (16) keeps it too: an OffsetCommit 16 rides in the commit class, any other 16
-   * in the heartbeat class. Other handler errors keep their counted retries; consumer-protocol
-   * members do not ride outages.
+   * in the heartbeat class. Other handler errors keep their counted retries under both group protocols.
    * @private
    * @param {unknown} error
    * @returns {'fetch'|'heartbeat'|'commit'|undefined} undefined for other handler errors and for
@@ -756,13 +761,15 @@ module.exports = class Runner extends EventEmitter {
   }
 
   /**
-   * Whether this member's fetch loop rides out lost connections: a classic member's does. A
-   * consumer-protocol member keeps its counted retries.
+   * Whether the loop retries its own transport/coordinator outage without consuming retries.
+   * Classic uses the configured session window. Consumer protocol has no client session window:
+   * a learned fence, fatal error, poll expiry or explicit stop still ends or replaces membership.
    * @private
    * @returns {boolean}
    */
   ridesOutages() {
-    return (this.consumerGroup.kind || 'classic') === 'classic'
+    const kind = this.consumerGroup.kind || 'classic'
+    return kind === 'classic' || kind === 'consumer'
   }
 
   /**

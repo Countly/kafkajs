@@ -28,6 +28,12 @@ describe('Consumer > OffsetManager > getCoordinator', () => {
     expect(mockCluster.findGroupCoordinator).not.toHaveBeenCalled()
   })
 
+  it('re-discovers the coordinator when none is cached', async () => {
+    offsetManager.coordinator = null
+    await expect(offsetManager.getCoordinator()).resolves.toBe(mockNewCoordinator)
+    expect(mockCluster.findGroupCoordinator).toHaveBeenCalledWith({ groupId: 'test-group-id' })
+  })
+
   it('re-discovers the coordinator when the cached one is disconnected', async () => {
     mockCoordinator.isConnected.mockReturnValue(false)
     await expect(offsetManager.getCoordinator()).resolves.toBe(mockNewCoordinator)
