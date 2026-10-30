@@ -426,7 +426,8 @@ class ListenerScenario {
       for (const partition of cells) {
         let correlation = null
         let eligible = false
-        if (!closing || held) {
+        // A cell the member delivered nothing from has no offset to commit.
+        if ((!closing || held) && processed.get(partition) > 0) {
           try {
             correlation = this.correlated(member, partition, invocation, closing)
             eligible = true
