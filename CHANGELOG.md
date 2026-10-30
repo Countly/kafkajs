@@ -11,11 +11,23 @@ Versions before 3.0.0 are internal alpha tags and are not published.
 
 - **The classic `sessionTimeout` defaults to 45 000 ms** (was 30 000). `sessionTimeout` and `heartbeatInterval` are now validated: integers, `sessionTimeout` 1 to 2 147 483 647, `heartbeatInterval` lower than it; a JoinGroup the broker refuses as outside its session-timeout bounds fails with an actionable error
 
+- **A paused consumer resumes at once and an idle consumer stops at once**: `resume()`, `seek()`, an assignment change and `stop()` end the idle wait instead of waiting out `maxWaitTimeInMs` (default 5 000 ms), which is unchanged
+
+- **Pause state follows the subscription and the topic's incarnation**: it still survives a rebalance, but a pause on a topic that is deleted and recreated no longer applies to the new topic, and pause entries for topics that left a subscription are dropped
+
+- Completed admin offset operations release their idle group-cache and ledger holders when the last overlapping operation for that group settles. Other participants, pending operations and reset tables retain their existing ownership protections.
+
+- **The classic leader assigns the union of every member's subscription**: a topic only a non-leader member subscribes to is now assigned in the round, not left unassigned until a subscribed member leads. A custom assigner still receives `topics` unchanged and may read the new `groupTopics` and `groupTopicMetadata`
+
+- **Classic consumers retain the member id received in `MEMBER_ID_REQUIRED` across retried JoinGroup requests.** Retriable transport failures, coordinator rediscovery and join-round expiry keep the id for the same active local membership. `UNKNOWN_MEMBER_ID` clears it; `ILLEGAL_GENERATION` alone does not. Local leave, stop, disconnect or rebuild discards it, and `FENCED_INSTANCE_ID` remains fatal. This prevents these retries from creating additional abandoned members that delay rebalances until their session timeouts.
+
 #### Fixes
 
 #### Additions
 
 - Pin the kept consumer defaults: classic groups with round-robin assignment, a 5 000 ms Fetch wait, a 10 MiB response target and committed transactional reads; document their limits and existing configuration escapes.
+
+- Partition assigners receive optional groupTopics and groupTopicMetadata arguments. A supplied metadata map is authoritative, including missing names; built-in assigners use cluster metadata only when the entire map is absent.
 
 #### Tooling
 
@@ -24,6 +36,10 @@ Versions before 3.0.0 are internal alpha tags and are not published.
 - Add independent consumer-assignment/session vectors and dedicated rack, capacity and coordinator-state fixtures.
 
 - Count delivered records, batch entries and actual gap samples independently in consume measurements.
+
+- `test:e2e:pause-resume` checks idle resume latency and pause survival through a rebalance.
+
+- `test:e2e:leader-union` checks unequal subscriptions, delayed topic creation and Java interoperability in both leader seats.
 
 ### Phase 9B — Producer parity: delivery deadline, memory bound, request size, partitioner, codecs, lifecycle
 

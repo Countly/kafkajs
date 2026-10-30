@@ -6,6 +6,7 @@ const { MemberMetadata, MemberAssignment } = require('../assignerProtocol')
 const { createFakeCoordinator } = require('./fixtures/fetchHarness')
 const ClassicGroupProtocol = require('../groupProtocol/classic')
 const ConsumerGroup = require('../consumerGroup')
+const IdleWait = require('../idleWait')
 const InstrumentationEventEmitter = require('../../instrumentation/emitter')
 const {
   events: { GROUP_JOIN },
@@ -16,6 +17,25 @@ const { createErrorFromCode } = require('../../protocol/error')
 const sleep = require('../../utils/sleep')
 
 const FIXTURES = path.join(__dirname, 'fixtures', 'classicGroupProtocol')
+
+/** Rounds the cases below begin, retired after each case. */
+const rounds = []
+
+/** @returns {object} a real round over a private idle wait, for a protocol call made directly */
+const realRound = () => {
+  const group = Object.create(ConsumerGroup.prototype)
+  Object.assign(group, {
+    idleWait: new IdleWait(),
+    rebalanceTimeout: 60000,
+    cluster: { allowAutoTopicCreation: true },
+    isStopping: () => false,
+  })
+  const round = group.beginRebalanceRound()
+  rounds.push(round)
+  return round
+}
+
+afterEach(() => rounds.splice(0).forEach((round) => round.retire()))
 
 // Every value here is pinned: a golden frame that contains a timestamp or a generated id records
 // nothing. The metadata bytes come from the shipped v0 subscription encoder.
@@ -94,6 +114,7 @@ const recordFrames = async () => {
     cluster: {
       findGroupCoordinator: async () => broker,
       refreshMetadata: async () => {},
+      findTopicPartitionMetadata: () => [],
     },
     groupId: GROUP_ID,
     groupInstanceId: GROUP_INSTANCE_ID,
@@ -108,7 +129,12 @@ const recordFrames = async () => {
   // an empty one and produce different bytes.
   protocol.memberId = MEMBER_ID
 
-  await protocol.rebalance({ topics: TOPICS, topicsSubscribed: TOPICS, beforeSync: () => {} })
+  await protocol.rebalance({
+    topics: TOPICS,
+    topicsSubscribed: TOPICS,
+    beforeSync: () => {},
+    round: realRound(),
+  })
   await protocol.heartbeat({ interval: 0 })
   await protocol.leave()
 

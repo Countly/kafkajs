@@ -23,6 +23,9 @@ const build = (kind, failure) => {
     groupInstanceId: null,
     ownership,
     groupMembership: {},
+    forgetMemberId() {
+      this.memberId = null
+    },
     attach() {},
     getNodeIds: () => [],
     rebalanceProtocol: () => 'eager',

@@ -204,7 +204,10 @@ const toBrokerPayload = (request) => {
 class HeartbeatBackoff {
   /** @param {{ initialRetryTime?: number, maxRetryTime?: number, multiplier?: number, factor?: number }} [retry] */
   constructor(retry = {}) {
-    const { initialRetryTime, maxRetryTime, multiplier, factor } = { ...retryDefaults, ...retry }
+    const { initialRetryTime, maxRetryTime, multiplier, factor } = {
+      ...retryDefaults,
+      ...retry,
+    }
     this.initialRetryTime = initialRetryTime
     this.maxRetryTime = Math.min(maxRetryTime, HEARTBEAT_BACKOFF_MAX_MS)
     this.multiplier = multiplier
@@ -456,6 +459,15 @@ module.exports = class ConsumerGroupProtocol {
       memberId: this.generatedMemberId,
       attempted: value,
     })
+  }
+
+  /**
+   * Ignored, like the `memberId` setter: the generated id outlives every lost generation.
+   * @returns {boolean} false, nothing was forgotten
+   */
+  forgetMemberId() {
+    this.memberId = null
+    return false
   }
 
   /**
@@ -859,7 +871,10 @@ module.exports = class ConsumerGroupProtocol {
    * @returns {void}
    */
   adoptLocalAssignment(localEpoch, resolved) {
-    this.localAssignment = { localEpoch, byTopicId: new Map(resolved.byTopicId) }
+    this.localAssignment = {
+      localEpoch,
+      byTopicId: new Map(resolved.byTopicId),
+    }
 
     const live = this.target ? new Set(this.target.byTopicId.keys()) : new Set()
 
@@ -873,6 +888,14 @@ module.exports = class ConsumerGroupProtocol {
 
     for (const topicId of [...this.unresolvedAttempts.keys()]) {
       if (!live.has(topicId)) this.unresolvedAttempts.delete(topicId)
+    }
+    const names = new Set(this.subscribedTopicNames)
+    for (const topicId of live) {
+      const name = this.assignedTopicNames.get(topicId)
+      if (name !== undefined) names.add(name)
+    }
+    for (const name of this.grownTopicNames) {
+      if (!names.has(name)) this.grownTopicNames.delete(name)
     }
   }
 
@@ -1219,7 +1242,9 @@ module.exports = class ConsumerGroupProtocol {
     // an id with nothing to resolve it.
     const stepWillResolve = wasJoining || wasReconciling || !converged
 
-    this.refreshUnresolvedTopicIds({ immediate: (targetChanged || grew) && !stepWillResolve })
+    this.refreshUnresolvedTopicIds({
+      immediate: (targetChanged || grew) && !stepWillResolve,
+    })
   }
 
   /**
@@ -1617,7 +1642,10 @@ module.exports = class ConsumerGroupProtocol {
       this.logger.debug('Leaving without a heartbeat: the member was told to remain in the group', {
         groupId: this.groupId,
       })
-      this.onRequestGenerated({ leaveEpoch: this.memberEpoch, stateAtRequest: LEAVING })
+      this.onRequestGenerated({
+        leaveEpoch: this.memberEpoch,
+        stateAtRequest: LEAVING,
+      })
       return
     }
 
@@ -1626,7 +1654,10 @@ module.exports = class ConsumerGroupProtocol {
     // Sent directly, never through the heartbeat manager: by the time a leave runs the chain has
     // already been cancelled, and re-arming it would leave heartbeats running after the member has
     // gone and a timer holding the process open.
-    await this.sendHeartbeat({ sendAllFields: false, leaveEpoch: this.memberEpoch })
+    await this.sendHeartbeat({
+      sendAllFields: false,
+      leaveEpoch: this.memberEpoch,
+    })
   }
 
   /**
@@ -1774,7 +1805,10 @@ module.exports = class ConsumerGroupProtocol {
     const assigned = indexByTopic(assignment)
     const owned = indexByTopic(this.ownedPartitions)
 
-    return { added: subtract(assigned, owned), revoked: subtract(owned, assigned) }
+    return {
+      added: subtract(assigned, owned),
+      revoked: subtract(owned, assigned),
+    }
   }
 
   /** Static membership is available from the first version of this protocol. @returns {void} */

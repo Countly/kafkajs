@@ -54,3 +54,28 @@ process.on('SIGTERM', lifecycle.disconnect)
 
 new Kafka({ brokers: ['localhost:9092'] }).producer({ metadataMaxIdle: 5000 })
 new Kafka({ brokers: ['localhost:9092'] }).producer({ metadataMaxIdle: 2147483647 })
+
+import type {
+  Assigner as UnionAssignerContract,
+  PartitionMetadata as UnionPartitionMetadata,
+} from '@countly/kafkajs'
+const unionNode16: UnionAssignerContract = {
+  name: 'union-contract',
+  version: 0,
+  async assign({ topics, groupTopics, groupTopicMetadata }) {
+    const names: string[] = groupTopics ?? topics
+    const rows: UnionPartitionMetadata[] = groupTopicMetadata?.get(names[0]) ?? []
+    void rows
+    return []
+  },
+  protocol() {
+    return { name: 'union-contract', metadata: Buffer.alloc(0) }
+  },
+}
+void unionNode16.assign({ members: [], topics: [] })
+void unionNode16.assign({
+  members: [],
+  topics: [],
+  groupTopics: ['orders'],
+  groupTopicMetadata: new Map<string, UnionPartitionMetadata[]>(),
+})

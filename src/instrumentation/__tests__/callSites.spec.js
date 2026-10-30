@@ -295,6 +295,12 @@ describe('Instrumentation > where the events are emitted', () => {
         kind: 'classic',
         heartbeatInterval: jest.fn(() => 3000),
         onStopRequested: jest.fn(),
+        startIdleWait: jest.fn(),
+        beginRebalanceRound: jest.fn(() => ({
+          guard: () => null,
+          wait: (work) => work(),
+          retire: jest.fn(),
+        })),
         onMembershipError: jest.fn(),
         leaveForPollExpiry: jest.fn(async () => {}),
         needsReconciliation: jest.fn(() => false),

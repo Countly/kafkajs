@@ -1,4 +1,5 @@
 const { MemberMetadata, MemberAssignment } = require('../../assignerProtocol')
+const partitionMetadata = require('../partitionMetadata')
 const { compareMembers } = require('../memberInfo')
 const dictionary = require('../../../utils/dictionary')
 
@@ -28,8 +29,10 @@ module.exports = ({ cluster }) => ({
   /**
    * @param {{ members: import('types').GroupMember[], topics: string[] }} group
    * @returns {Promise<import('types').GroupMemberAssignment[]>}
+   * @param {string[]} [group.groupTopics] sorted union; own topics stays unchanged
+   * @param {ReadonlyMap<string, object[]>} [group.groupTopicMetadata] authoritative when present
    */
-  async assign({ members, topics }) {
+  async assign({ members, topics, groupTopics, groupTopicMetadata }) {
     const decoded = members
       .map((member) => ({
         memberId: member.memberId,
@@ -40,15 +43,14 @@ module.exports = ({ cluster }) => ({
 
     const assignment = new Map(decoded.map(({ memberId }) => [memberId, dictionary()]))
 
-    for (const topic of topics) {
+    for (const topic of groupTopics ?? topics) {
       const subscribed = decoded.filter(({ metadata }) => metadata.topics.includes(topic))
 
       if (subscribed.length === 0) {
         continue
       }
 
-      const partitions = cluster
-        .findTopicPartitionMetadata(topic)
+      const partitions = partitionMetadata(cluster, groupTopicMetadata, topic)
         .map(({ partitionId }) => partitionId)
         .sort((a, b) => a - b)
 
@@ -73,7 +75,10 @@ module.exports = ({ cluster }) => ({
     // decode - it reads the version off the buffer first.
     return [...assignment].map(([memberId, byTopic]) => ({
       memberId,
-      memberAssignment: MemberAssignment.encode({ version: this.version, assignment: byTopic }),
+      memberAssignment: MemberAssignment.encode({
+        version: this.version,
+        assignment: byTopic,
+      }),
     }))
   },
 

@@ -67,10 +67,15 @@ describe('Consumer > static membership (KIP-345)', () => {
   it('sends groupInstanceId on JoinGroup, SyncGroup and Heartbeat', async () => {
     await group.joinAndSync()
     expect(coordinator.joinGroup).toHaveBeenCalledWith(
-      expect.objectContaining({ groupInstanceId: GROUP_INSTANCE_ID })
+      expect.objectContaining({ groupInstanceId: GROUP_INSTANCE_ID }),
+      expect.objectContaining({
+        guard: expect.any(Function),
+        onMemberIdRequired: expect.any(Function),
+      })
     )
     expect(coordinator.syncGroup).toHaveBeenCalledWith(
-      expect.objectContaining({ groupInstanceId: GROUP_INSTANCE_ID })
+      expect.objectContaining({ groupInstanceId: GROUP_INSTANCE_ID }),
+      expect.objectContaining({ guard: expect.any(Function) })
     )
 
     group.lastRequest = 0

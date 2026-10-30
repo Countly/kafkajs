@@ -58,6 +58,8 @@ const COOPERATIVE = 'cooperative'
  *   commit, no partition events, the response ignored
  * @property {() => RebalanceProtocol} rebalanceProtocol
  * @property {(options?: { clearMemberId?: boolean }) => void} resetGeneration
+ * @property {(revision?: number) => boolean} forgetMemberId forgets the member id of the membership
+ *   the revision names, the current one when absent; false when it was retired or the protocol keeps its id
  * @property {() => TopicPartitions[]} owned
  * @property {(topicPartitions: TopicPartitions[]) => void} narrowOwned shrink only
  * @property {(topicPartitions: TopicPartitions[]) => void} setOwned widen to what was applied

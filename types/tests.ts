@@ -1258,3 +1258,29 @@ closeEvidence.outcome = 'unsent'
 
 new Kafka({ brokers: ['localhost:9092'] }).producer({ metadataMaxIdle: 5000 })
 new Kafka({ brokers: ['localhost:9092'] }).producer({ metadataMaxIdle: 2147483647 })
+
+const unionAssignerContract: kafkajs.Assigner = {
+  name: 'union-contract',
+  version: 0,
+  async assign({ members, topics, groupTopics, groupTopicMetadata }) {
+    const names: string[] = groupTopics ?? topics
+    const rows: PartitionMetadata[] = groupTopicMetadata?.get(names[0]) ?? []
+    void members
+    void rows
+    if (groupTopicMetadata) {
+      // @ts-expect-error A supplied group snapshot is readonly.
+      groupTopicMetadata.set('orders', [])
+    }
+    return []
+  },
+  protocol() {
+    return { name: 'union-contract', metadata: Buffer.alloc(0) }
+  },
+}
+void unionAssignerContract.assign({ members: [], topics: [] })
+void unionAssignerContract.assign({
+  members: [],
+  topics: ['orders'],
+  groupTopics: ['orders'],
+  groupTopicMetadata: new Map<string, PartitionMetadata[]>(),
+})

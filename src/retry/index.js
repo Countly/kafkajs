@@ -87,9 +87,10 @@ const assertMaxTotalTime = (maxTotalTime) => {
  * @param {(value: any) => void} resolve
  * @param {(error: Error) => void} reject
  * @param {(bail: (err: Error) => void, retryCount: number, retryTime: number) => Promise<any>} fn
+ * @param {object} [scope] private consumer round with guard, wait and cancellable delay
  * @returns {(retryTime: number, retryCount?: number) => void}
  */
-const createRetriable = (configs, backoff, resolve, reject, fn) => {
+const createRetriable = (configs, backoff, resolve, reject, fn, scope) => {
   let aborted = false
   const { retries, maxTotalTime } = configs
   const deadline = maxTotalTime == null ? Infinity : Date.now() + maxTotalTime
@@ -101,12 +102,18 @@ const createRetriable = (configs, backoff, resolve, reject, fn) => {
 
   const retry = (retryTime, retryCount = 0) => {
     if (aborted) return
+    const refusal = scope?.guard()
+    if (refusal) return bail(refusal)
 
     const nextRetryTime = backoff.next(retryTime)
     const shouldRetry = retryCount < retries
 
     const scheduleRetry = () => {
-      setTimeout(() => retry(nextRetryTime, retryCount + 1), retryTime)
+      if (scope) {
+        scope.delay(retryTime).then(() => retry(nextRetryTime, retryCount + 1), bail)
+      } else {
+        setTimeout(() => retry(nextRetryTime, retryCount + 1), retryTime)
+      }
     }
 
     fn(bail, retryCount, retryTime)
@@ -137,12 +144,13 @@ const createRetriable = (configs, backoff, resolve, reject, fn) => {
 }
 
 /**
- * @typedef {(fn: (bail: (err: Error) => void, retryCount: number, retryTime: number) => any) => Promise<ReturnType<fn>>} Retrier
+ * @typedef {(fn: (bail: (err: Error) => void, retryCount: number, retryTime: number) => any, scope?: object) => Promise<ReturnType<fn>>} Retrier
  */
 
 /**
  * Builds a retrier: it runs `fn`, and on a retriable failure runs it again after the backoff
- * schedule above, up to `retries` more times.
+ * schedule above, up to `retries` more times. An optional private call scope owns the whole
+ * promise and each backoff timer; callers without a scope retain the existing retry semantics.
  *
  * `maxTotalTime` (ms) adds a deadline measured from the first attempt: when the wait before the
  * next attempt would end past it, the retrier rejects with `KafkaJSDeliveryTimeout` - its `cause`
@@ -157,7 +165,7 @@ const createRetriable = (configs, backoff, resolve, reject, fn) => {
 const createRetry = (opts = {}) => {
   assertMaxTotalTime(opts?.maxTotalTime)
 
-  return (fn) => {
+  return (fn, scope) => {
     if (opts?.fence) {
       const configs = Object.assign({}, RETRY_DEFAULT, opts)
       return new FencedRetry({
@@ -167,12 +175,14 @@ const createRetry = (opts = {}) => {
         isRetriable: isErrorRetriable,
       }).promise
     }
-    return new Promise((resolve, reject) => {
-      const configs = Object.assign({}, RETRY_DEFAULT, opts)
-      const backoff = backoffOf(configs)
-      const start = createRetriable(configs, backoff, resolve, reject, fn)
-      start(backoff.initial())
-    })
+    const run = () =>
+      new Promise((resolve, reject) => {
+        const configs = Object.assign({}, RETRY_DEFAULT, opts)
+        const backoff = backoffOf(configs)
+        const start = createRetriable(configs, backoff, resolve, reject, fn, scope)
+        start(backoff.initial())
+      })
+    return scope ? scope.wait(run) : run()
   }
 }
 

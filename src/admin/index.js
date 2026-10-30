@@ -966,54 +966,56 @@ module.exports = ({
       throw new KafkaJSNonRetriableError(`Invalid partitions`)
     }
 
-    const consumer = createConsumer({
-      logger: rootLogger.namespace('Admin', LEVELS.NOTHING),
-      cluster,
-      groupId,
-    })
-
-    try {
-      await consumer.subscribe({ topic, fromBeginning: true })
-      const description = await consumer.describeGroup()
-
-      if (!isConsumerGroupRunning(description)) {
-        throw new KafkaJSNonRetriableError(
-          `The consumer group must have no running instances, current state: ${description.state}`
-        )
-      }
-
-      await new Promise((resolve, reject) => {
-        let committed = null
-        consumer.on(consumer.events.GROUP_JOIN, () => {
-          committed ??= commitSentinels(consumer, { groupId, topic, partitions })
-          committed.catch(() => {})
-        })
-        consumer.on(consumer.events.FETCH, () => {
-          committed
-            .finally(() => consumer.stop())
-            .then(resolve)
-            .catch(reject)
-        })
-
-        consumer
-          .run({
-            eachBatchAutoResolve: false,
-            eachBatch: async () => true,
-          })
-          .catch(reject)
-
-        // This consumer doesn't need to consume any data
-        consumer.pause([{ topic }])
-
-        for (const seekData of partitions) {
-          consumer.seek({ topic, ...seekData })
-        }
+    return cluster.withGroup(groupId, async () => {
+      const consumer = createConsumer({
+        logger: rootLogger.namespace('Admin', LEVELS.NOTHING),
+        cluster,
+        groupId,
       })
-    } finally {
-      // The consumer shares this admin's cluster, so it is disposed, not disconnected. A failed
-      // stop is already logged by the consumer and must not replace the call's own outcome.
-      await disposeConsumer(consumer).catch(() => {})
-    }
+
+      try {
+        await consumer.subscribe({ topic, fromBeginning: true })
+        const description = await consumer.describeGroup()
+
+        if (!isConsumerGroupRunning(description)) {
+          throw new KafkaJSNonRetriableError(
+            `The consumer group must have no running instances, current state: ${description.state}`
+          )
+        }
+
+        await new Promise((resolve, reject) => {
+          let committed = null
+          consumer.on(consumer.events.GROUP_JOIN, () => {
+            committed ??= commitSentinels(consumer, { groupId, topic, partitions })
+            committed.catch(() => {})
+          })
+          consumer.on(consumer.events.FETCH, () => {
+            committed
+              .finally(() => consumer.stop())
+              .then(resolve)
+              .catch(reject)
+          })
+
+          consumer
+            .run({
+              eachBatchAutoResolve: false,
+              eachBatch: async () => true,
+            })
+            .catch(reject)
+
+          // This consumer doesn't need to consume any data
+          consumer.pause([{ topic }])
+
+          for (const seekData of partitions) {
+            consumer.seek({ topic, ...seekData })
+          }
+        })
+      } finally {
+        // The consumer shares this admin's cluster, so it is disposed, not disconnected. A failed
+        // stop is already logged by the consumer and must not replace the call's own outcome.
+        await disposeConsumer(consumer).catch(() => {})
+      }
+    })
   }
 
   /**

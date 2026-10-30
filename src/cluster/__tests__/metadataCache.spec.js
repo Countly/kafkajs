@@ -589,6 +589,20 @@ describe('Cluster > MetadataCache', () => {
       expect(cluster.refreshMetadataBestEffort).toHaveBeenCalledTimes(1)
     })
 
+    it('binds the refresh a stale epoch starts to the fence of the caller', async () => {
+      const { cluster } = buildCluster('FENCED_LEADER_EPOCH')
+      const fence = new (require('../../producer/generation'))()
+
+      await expect(
+        cluster.fetchTopicsOffset([{ topic: 'test-topic', partitions: [{ partition: 0 }] }], {
+          fence,
+          guard: fence.guard,
+        })
+      ).rejects.toThrow('FENCED_LEADER_EPOCH')
+
+      expect(cluster.refreshMetadataBestEffort).toHaveBeenCalledWith(fence)
+    })
+
     it('keeps the epoch on FENCED_LEADER_EPOCH, where a refresh converges on its own', async () => {
       const { cluster, cache } = buildCluster('FENCED_LEADER_EPOCH')
 
@@ -602,5 +616,76 @@ describe('Cluster > MetadataCache', () => {
       expect(cache.leaderEpoch('test-topic', 1)).toEqual(7)
       expect(cluster.refreshMetadataBestEffort).toHaveBeenCalledTimes(1)
     })
+  })
+})
+
+describe('Cluster > MetadataCache > routing change notifications', () => {
+  const build = () => {
+    const cache = new MetadataCache({ logger: newLogger() })
+    const listener = jest.fn()
+    const unsubscribe = cache.onRoutingChange(listener)
+    return { cache, listener, unsubscribe }
+  }
+
+  it('notifies once per accepted install, after the cache holds the new leader', () => {
+    const { cache, listener } = build()
+    const seen = []
+    cache.onRoutingChange(() => seen.push(cache.leader('test-topic', 0)))
+    cache.update(response({ leader: 1 }))
+    expect(listener).toHaveBeenCalledTimes(1)
+    expect(seen).toEqual([1])
+  })
+
+  it('notifies for an accepted hint and stays silent for a rejected or unknown one', () => {
+    const { cache, listener } = build()
+    cache.update(response({ leaderEpoch: 5 }))
+    listener.mockClear()
+    expect(cache.applyLeaderHint('test-topic', 0, { leaderId: 2, leaderEpoch: 4 })).toBe(false)
+    expect(cache.applyLeaderHint('test-topic', 9, { leaderId: 2, leaderEpoch: 9 })).toBe(false)
+    expect(cache.applyLeaderHint('test-topic', 0, { leaderId: -1, leaderEpoch: 9 })).toBe(false)
+    expect(listener).not.toHaveBeenCalled()
+    expect(cache.applyLeaderHint('test-topic', 0, { leaderId: 2, leaderEpoch: 6 })).toBe(true)
+    expect(listener).toHaveBeenCalledTimes(1)
+  })
+
+  it('notifies a by-ID write-through only when it changed something', () => {
+    const { cache, listener } = build()
+    cache.update(response({ leader: 1, leaderEpoch: 5 }))
+    listener.mockClear()
+    cache.updateTopicsById(response({ leader: 1, leaderEpoch: 5 }))
+    expect(listener).not.toHaveBeenCalled()
+    cache.updateTopicsById(response({ leader: 2, leaderEpoch: 6 }))
+    expect(listener).toHaveBeenCalledTimes(1)
+  })
+
+  it('notifies for a recreation seen by ID, an epoch forget, a forget and a clear', () => {
+    const { cache, listener } = build()
+    cache.update(response({ topicId: ID_A }))
+    listener.mockClear()
+    cache.updateTopicsById(response({ topicId: ID_B }))
+    expect(listener).toHaveBeenCalledTimes(1)
+    cache.forgetLeaderEpoch('test-topic', 0)
+    expect(listener).toHaveBeenCalledTimes(2)
+    cache.forgetLeaderEpoch('absent', 0)
+    cache.forget('absent')
+    expect(listener).toHaveBeenCalledTimes(2)
+    cache.forget('test-topic')
+    expect(listener).toHaveBeenCalledTimes(3)
+    cache.clear()
+    expect(listener).toHaveBeenCalledTimes(4)
+  })
+
+  it('removes a listener synchronously and survives one that throws', () => {
+    const { cache, listener, unsubscribe } = build()
+    const survivor = jest.fn()
+    cache.onRoutingChange(() => {
+      throw new Error('listener failed')
+    })
+    cache.onRoutingChange(survivor)
+    unsubscribe()
+    unsubscribe()
+    cache.update(response())
+    expect(listener).not.toHaveBeenCalled()
+    expect(survivor).toHaveBeenCalledTimes(1)
   })
 })

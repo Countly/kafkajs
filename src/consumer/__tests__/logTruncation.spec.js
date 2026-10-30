@@ -73,11 +73,15 @@ describe('Consumer > position validation', () => {
     // The partition is read from a preferred replica (node 2) while its leader is node 0.
     const { group, requests, findBrokerCalls } = await createGroup({ preferredReadReplica: 2 })
 
-    await group.fetch(2)
+    // Validation drops the replica preference, so node 2 is owed nothing; the leader's round then
+    // fetches, and only after the validation.
+    await expect(group.fetch(2)).resolves.toEqual([])
+    await group.fetch(NODE_ID)
 
     const order = apiKeysOf(requests)
+    expect(order.indexOf(apiKeys.Fetch)).toBeGreaterThan(-1)
     expect(order.indexOf(apiKeys.OffsetForLeaderEpoch)).toBeLessThan(order.indexOf(apiKeys.Fetch))
-    expect(findBrokerCalls).toContainEqual({ nodeId: 0 }) // the leader, not the replica
+    expect(findBrokerCalls).toContainEqual(expect.objectContaining({ nodeId: 0 })) // the leader, not the replica
   })
 
   test('validatePositions never returns with a partition still awaiting', async () => {
@@ -151,6 +155,8 @@ describe('Consumer > position validation', () => {
       preferredReadReplica: NODE_ID,
     })
     const warn = jest.spyOn(logger, 'warn')
+    // The round fetches partition 0 alone, so the broker answers for that partition only.
+    setResponse(fetchResponse([{ partition: 0, errorCode: 0 }]))
 
     await group.fetch(NODE_ID)
 
@@ -284,7 +290,10 @@ describe('Consumer > position validation', () => {
 
       await group.fetch(NODE_ID)
 
-      expect(setDefaultOffset).toHaveBeenCalledWith({ topic: TOPIC, partition: 0 })
+      expect(setDefaultOffset).toHaveBeenCalledWith(
+        { topic: TOPIC, partition: 0 },
+        expect.objectContaining({ guard: expect.any(Function) })
+      )
       expect(events).toEqual([
         { topic: TOPIC, partition: 0, offset: '120', divergingOffset: null, leaderEpoch: -1 },
       ])

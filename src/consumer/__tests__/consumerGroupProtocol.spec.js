@@ -1534,6 +1534,15 @@ describe('Consumer > groupProtocol > ConsumerGroupProtocol', () => {
       expect(h.logged.debug.mock.calls[1][0]).toMatch(/member id/i)
     })
 
+    it('forgets nothing when asked to forget the member id', () => {
+      const h = build()
+      expect(typeof h.protocol.forgetMemberId).toBe('function')
+      const memberId = h.protocol.memberId
+
+      expect(h.protocol.forgetMemberId(0)).toBe(false)
+      expect(h.protocol.memberId).toEqual(memberId)
+    })
+
     it('ignores a generation assignment the same way, and says so at debug', async () => {
       const h = build()
       const epoch = h.protocol.memberEpoch

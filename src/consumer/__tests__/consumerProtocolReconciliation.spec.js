@@ -381,9 +381,11 @@ describe('Consumer > the consumer protocol reconciliation', () => {
   it('retries a join the coordinator never answered rather than dying on it', async () => {
     const { runner } = build({ script: [idle(1)], rebalanceTimeout: 50 })
 
-    // The deadline exists so a round always settles; the retry is what makes it recoverable.
+    // The deadline exists so a round always settles, and it is the one budget of the round: its
+    // expiry ends the join chain with the retriable deadline error instead of buying a fresh one.
     await expect(runner.rebalanceCoordinator.runRound(null, 'initial')).rejects.toMatchObject({
-      name: 'KafkaJSNumberOfRetriesExceeded',
+      type: 'JOIN_DEADLINE_EXCEEDED',
+      retriable: true,
     })
   })
 })

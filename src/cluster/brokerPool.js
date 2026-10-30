@@ -630,16 +630,24 @@ module.exports = class BrokerPool {
    * @param {object} [options]
    * @param {import('../producer/generation')} [options.fence] the producer lifecycle asking: once
    *   it closed, the retries stop, no socket opens, and a response in flight publishes nothing
+   * @param {() => Error|null} [options.guard] checked before attempts and cache/routing installation
    * @returns {Promise<void>}
    * @throws {Error} the lifecycle's close error
+   * @throws {Error} original refresh failure or caller refusal; expiry never triggers recovery work
    */
-  async refreshMetadata(topics, { fence } = {}) {
+  async refreshMetadata(topics, { fence, guard } = {}) {
+    const check = () => {
+      const error = guard?.()
+      if (error) throw error
+    }
     const accept = this.captureTopics?.(topics || [])
     try {
       await this.retryFor(fence)(async (bail, retryCount, retryTime) => {
         let broker
         try {
+          check()
           broker = await this.findConnectedBroker(...(fence ? [{ fence }] : []))
+          check()
         } catch (err) {
           return bail(err)
         }
@@ -668,7 +676,11 @@ module.exports = class BrokerPool {
             fence.check()
             this.metadata = response
           } else {
-            this.metadata = await broker.metadata(topics)
+            const response = await (guard
+              ? broker.metadata(topics, { guard })
+              : broker.metadata(topics))
+            check()
+            this.metadata = response
           }
           // Captured synchronously, in the same statement-tick as the assignment above and
           // before anything below can `await` - a concurrent rebootstrap nulls `this.metadata`
@@ -680,7 +692,8 @@ module.exports = class BrokerPool {
           // unavailability. Everything below reads this local instead.
           const metadata = this.metadata
           const publication = ++this.metadataPublications
-          const isLatest = () => this.metadataPublications === publication && !fence?.closed
+          const isLatest = () =>
+            this.metadataPublications === publication && !fence?.closed && !guard?.()
           // Applied here, on the statement after the assignment and before any await, so no
           // reader can observe the fresh response with the monotonic leader guard not yet
           // applied. An empty topic list is encoded as the null array, which asks for every topic
@@ -742,6 +755,7 @@ module.exports = class BrokerPool {
           }
         } catch (e) {
           fence?.check()
+          if (guard?.()) return bail(e)
           if (
             e.type === 'LEADER_NOT_AVAILABLE' ||
             (broker.allowAutoTopicCreation && e.type === 'UNKNOWN_TOPIC_OR_PARTITION')
@@ -755,6 +769,7 @@ module.exports = class BrokerPool {
 
       this.onMetadataSuccess()
     } catch (e) {
+      if (guard?.()) throw e
       if (!fence?.closed) await this.onMetadataFailure(e, { fence })
       throw e
     }

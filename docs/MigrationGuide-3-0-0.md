@@ -934,6 +934,16 @@ says so, `groupProtocol: 'consumer'`.
 
 - A consumer that stops heartbeating is now detected up to 15 seconds later (45 s instead of 30 s), and a static member may restart within 45 s without a rebalance. Set `sessionTimeout: 30000` to keep the old value. The KIP-848 session is the broker's `group.consumer.session.timeout.ms` and is unchanged
 
+Nothing to do; code that slept after `resume()` to ride out the wait can stop.
+
+If you paused a topic and an operator recreated it, pause it again after you see `consumer.cluster.topic_recreated`. Pausing a topic before it is assigned still works and lasts until the subscription changes.
+
+Admin offset-operation results and broker commits are unchanged. Idle local state can be released before `admin.disconnect()`; do not rely on an admin object retaining offsets from an earlier completed operation.
+
+Groups whose members subscribe to different topics now assign every subscribed partition. A custom assigner that should assign topics other members subscribe to reads `groupTopics` and `groupTopicMetadata`; one that ignores them behaves as before.
+
+- **Classic joins after connection loss.** No application change is required. KafkaJS 2.2.4 could discard the id assigned by `MEMBER_ID_REQUIRED` when the following JoinGroup failed; 3.0.0 reuses it while the same classic membership remains active. `UNKNOWN_MEMBER_ID` clears it before a fresh join. `FENCED_INSTANCE_ID` remains fatal and does not trigger automatic restart. Leave, stop, disconnect and membership rebuild discard the local id even when no LeaveGroup is sent or its acknowledgement is lost. Static members keep their configured `groupInstanceId` and existing leave policy; retaining a broker slot does not retain the local member id. A new consumer starts without a member id. This reduces retry-created abandoned members; it does not guarantee progress during an outage. No option restores the old behavior.
+
 ### Admin
 
 Group visibility and the admin client.

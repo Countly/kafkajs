@@ -1,6 +1,8 @@
 const Encoder = require('../../protocol/encoder')
 const { createGroupApiBroker } = require('./fixtures/groupApiHarness')
 const ClassicGroupProtocol = require('../../consumer/groupProtocol/classic')
+const ConsumerGroup = require('../../consumer/consumerGroup')
+const IdleWait = require('../../consumer/idleWait')
 const InstrumentationEventEmitter = require('../../instrumentation/emitter')
 const apiKeys = require('../../protocol/requests/apiKeys')
 const { newLogger } = require('testHelpers')
@@ -186,6 +188,25 @@ describe('Broker > the protocol the coordinator reports', () => {
   })
 
   describe('the classic consumer protocol', () => {
+    /** Rounds the cases below begin, retired after each case. */
+    const rounds = []
+
+    /** @returns {object} a real round over a private idle wait, for a protocol call made directly */
+    const realRound = () => {
+      const group = Object.create(ConsumerGroup.prototype)
+      Object.assign(group, {
+        idleWait: new IdleWait(),
+        rebalanceTimeout: 60000,
+        cluster: { allowAutoTopicCreation: true },
+        isStopping: () => false,
+      })
+      const round = group.beginRebalanceRound()
+      rounds.push(round)
+      return round
+    }
+
+    afterEach(() => rounds.splice(0).forEach((round) => round.retire()))
+
     const protocolFor = (coordinatorOrCluster) =>
       new ClassicGroupProtocol({
         cluster: coordinatorOrCluster,
@@ -202,7 +223,12 @@ describe('Broker > the protocol the coordinator reports', () => {
         logger: newLogger(),
       })
     const rebalance = (protocol) =>
-      protocol.rebalance({ topics: [], topicsSubscribed: [], beforeSync: () => {} })
+      protocol.rebalance({
+        topics: [],
+        topicsSubscribed: [],
+        beforeSync: () => {},
+        round: realRound(),
+      })
 
     /** A coordinator whose join reports the consumer protocol type and the one assigner. */
     const joinedCoordinator = () => ({
@@ -223,10 +249,15 @@ describe('Broker > the protocol the coordinator reports', () => {
       await rebalance(protocolFor({ findGroupCoordinator: async () => coordinator }))
 
       expect(coordinator.joinGroup).toHaveBeenCalledWith(
-        expect.objectContaining({ protocolType: 'consumer' })
+        expect.objectContaining({ protocolType: 'consumer' }),
+        expect.objectContaining({
+          guard: expect.any(Function),
+          onMemberIdRequired: expect.any(Function),
+        })
       )
       expect(coordinator.syncGroup).toHaveBeenCalledWith(
-        expect.objectContaining({ protocolType: 'consumer', protocolName: 'RoundRobinAssigner' })
+        expect.objectContaining({ protocolType: 'consumer', protocolName: 'RoundRobinAssigner' }),
+        expect.objectContaining({ guard: expect.any(Function) })
       )
     })
 

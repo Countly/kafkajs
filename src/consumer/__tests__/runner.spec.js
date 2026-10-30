@@ -10,7 +10,7 @@ const {
   KafkaJSDeliveryTimeout,
 } = require('../../errors')
 const { createErrorFromCode } = require('../../protocol/error')
-const { stampOffsetCommit } = require('../rebalanceErrorContract')
+const { stampOffsetCommit, stampMembership } = require('../rebalanceErrorContract')
 
 const UNKNOWN = -1
 const REBALANCE_IN_PROGRESS = 27
@@ -59,6 +59,9 @@ describe('Consumer > Runner', () => {
       leaderId: 'test-member',
       groupInstanceId: null,
       groupMembership: {},
+      forgetMemberId() {
+        this.memberId = null
+      },
       assignmentEpoch: 0,
       attach: jest.fn(),
       rebalanceProtocol: jest.fn(() => 'eager'),
@@ -88,6 +91,12 @@ describe('Consumer > Runner', () => {
       kind: 'classic',
       heartbeatInterval: jest.fn(() => 3000),
       onStopRequested: jest.fn(),
+      startIdleWait: jest.fn(),
+      beginRebalanceRound: jest.fn(() => ({
+        guard: () => null,
+        wait: (work) => work(),
+        retire: jest.fn(),
+      })),
       onMembershipError: jest.fn(),
       leaveForPollExpiry: jest.fn(async () => {}),
       needsReconciliation: jest.fn(() => false),
@@ -824,6 +833,19 @@ describe('Consumer > Runner', () => {
       })
 
       expect(consumerGroup.memberId).toBeNull()
+    })
+
+    it('forgets the member id on behalf of the membership the answer was sent under', async () => {
+      expect(typeof stampMembership).toBe('function')
+      const runner = createTestRunner()
+      runner.running = true
+      jest.spyOn(runner.rebalanceCoordinator, 'runRound').mockResolvedValue()
+      const forget = jest.spyOn(consumerGroup, 'forgetMemberId')
+      const answered = stampMembership(new KafkaJSProtocolError(createErrorFromCode(25)), 7)
+
+      await runner.handleRebalanceError({ kind: 'lost', reason: 'lost', error: answered })
+
+      expect(forget).toHaveBeenCalledWith(7)
     })
 
     it('classifies a bare fetch-path error with the membership kind', () => {

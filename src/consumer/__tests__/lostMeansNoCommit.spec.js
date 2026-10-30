@@ -1231,29 +1231,46 @@ describe('request identities held across heartbeat answers', () => {
 })
 
 describe('completed join ownership', () => {
-  it('renews ownership after the round applies its assignment', async () => {
+  it('renews ownership before publishing the applied assignment', async () => {
     const fixture = ownershipFixture()
     const { runner, group, ownership } = fixture
     const token = ownership.token()
     ownership.lose(brokerError(25), token)
-    const order = []
-    group.joinAndSync = async () => {
-      order.push('join')
-      return {}
+    group.partitionsPerSubscribedTopic = new Map([[SCHEDULED_TOPIC, [0, 1]]])
+    group.joinAndSync = async () => ({
+      assignment: { [SCHEDULED_TOPIC]: [0, 1] },
+      userData: null,
+    })
+    const published = []
+    const checkPublication = () => {
+      published.push({
+        token: ownership.token(),
+        refusal: ownership.refusal(ownership.token()),
+      })
     }
-    group.applyRebalanceResult = async () => {
-      order.push('apply')
-      return { added: [], revoked: [] }
+    const notify = group.subscriptionState.onAssignmentChange
+    group.subscriptionState.onAssignmentChange = () => {
+      checkPublication()
+      notify()
     }
+    const assignment = jest
+      .spyOn(group.groupMembership, 'notifyAssignment')
+      .mockImplementation(checkPublication)
     const renew = jest.spyOn(ownership, 'renew')
     const stop = jest.spyOn(runner.heartbeatManager, 'ensureStarted').mockImplementation(() => {})
     try {
       await runner.rebalanceCoordinator.runRound(null, 'initial')
-      expect(order).toEqual(['join', 'apply'])
+      expect(published).toEqual([
+        { token: token + 1, refusal: null },
+        { token: token + 1, refusal: null },
+      ])
       expect(renew).toHaveBeenCalledTimes(1)
       expect(ownership.token()).toBe(token + 1)
       expect(ownership.refusal(ownership.token())).toBeNull()
     } finally {
+      group.subscriptionState.onAssignmentChange = notify
+      assignment.mockRestore()
+      renew.mockRestore()
       stop.mockRestore()
       await fixture.close()
     }
@@ -1927,6 +1944,11 @@ describe.each([
       await within(gate.arrived(), 5000, 'the old heartbeat')
       await runner.rebalanceCoordinator.onPollExpired({ elapsedMs: 300001, isStatic })
       await member.rejoin()
+      if (kind === 'consumer') {
+        await within(protocol.heartbeat({ interval: 0 }), 5000, 'the replacement heartbeat')
+        await until(() => protocol.state === 'STABLE', 'the replacement acknowledgement')
+        member.pauseTimers()
+      }
       const target = protocol.target
       const state = protocol.state
       const fatal = protocol.fatalError
@@ -2537,7 +2559,10 @@ describe('fetch rounds of a replaced membership', () => {
         throw current
       }
       await expect(fixture.group.fetch(0)).resolves.toEqual([])
-      expect(recover).toHaveBeenCalledWith(current)
+      expect(recover).toHaveBeenCalledWith(
+        current,
+        expect.objectContaining({ guard: expect.any(Function), closed: false })
+      )
     } finally {
       await fixture.close()
     }

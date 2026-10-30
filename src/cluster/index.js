@@ -1,6 +1,7 @@
 const describeThrown = require('../network/describeThrown')
 const BrokerPool = require('./brokerPool')
 const MetadataCache = require('./metadataCache')
+const { joinDeadlineError } = require('../consumer/rebalanceErrorContract')
 const { CLUSTER_TOPIC_RECREATED } = require('./instrumentationEvents')
 const Lock = require('../utils/lock')
 const { isConnectionFailure } = require('../network/connectionFailure')
@@ -31,7 +32,9 @@ const { keys } = Object
 const LEADER_NOT_AVAILABLE = 5
 
 const mergeTopics = (obj, { topic, partitions }) =>
-  Object.assign(dictionary(), obj, { [topic]: [...(obj[topic] || []), ...partitions] })
+  Object.assign(dictionary(), obj, {
+    [topic]: [...(obj[topic] || []), ...partitions],
+  })
 
 /**
  * Metadata error codes that describe ONE topic rather than the request: the response carries them
@@ -170,7 +173,10 @@ module.exports = class Cluster {
     // retrying, rather than a real "no such topic".
     this.allowAutoTopicCreation = allowAutoTopicCreation
     this.instrumentationEmitter = instrumentationEmitter
-    this.metadataCache = new MetadataCache({ logger: rootLogger, instrumentationEmitter })
+    this.metadataCache = new MetadataCache({
+      logger: rootLogger,
+      instrumentationEmitter,
+    })
     this.brokerPool = new BrokerPool({
       connectionPoolBuilder: this.connectionPoolBuilder,
       logger: this.rootLogger,
@@ -190,6 +196,7 @@ module.exports = class Cluster {
     this.operationsByGroup = operations
     this.groupRegistry = GroupRegistry.forStores(offsets, operations)
     this.groupEntries = new Map()
+    this.groupScopes = new Map()
 
     // A producer lifecycle's call shares nothing with another lifecycle's: each is scoped by its fence.
     const fenceOf = ({ fence } = {}) => fence
@@ -299,10 +306,14 @@ module.exports = class Cluster {
    * @param {object} [options]
    * @param {import('../producer/generation')} [options.fence] the producer lifecycle asking: once
    *   it closed, the retries stop, no socket opens and a late response publishes nothing
+   * @param {() => Error|null} [options.guard] a guarded refresh does not share an unguarded promise
    * @returns {Promise<void>}
    * @throws {Error} the lifecycle's close error
+   * @throws {Error} original refresh failure or captured scope refusal
    */
-  async refreshMetadata({ fence } = {}) {
+  async refreshMetadata({ fence, guard } = {}) {
+    if (guard)
+      return this.brokerPool.refreshMetadata(Array.from(this.targetTopics), { fence, guard })
     await this[PRIVATE.REFRESH_METADATA]({ fence })
   }
 
@@ -455,6 +466,58 @@ module.exports = class Cluster {
       }
 
       return RESOLVED
+    }
+  }
+
+  /**
+   * Reads a one-broker leader snapshot without installing metadata or changing targets.
+   * @param {object} options per-attempt scope
+   * @param {string[]} options.topics missing union names
+   * @param {boolean} options.allowAutoTopicCreation effective subscription policy
+   * @param {number} options.deadlineAt absolute performance.now() deadline
+   * @param {() => Error|null} options.guard captured run and leader-attempt refusal
+   * @returns {Promise<object>} decoded snapshot, with topic/partition errors retained
+   * @throws {Error} original acquisition/auth/transport failure, or retriable join expiry
+   */
+  async groupMetadata({ topics, allowAutoTopicCreation, deadlineAt, guard }) {
+    const startedAt = performance.now()
+    const expired = joinDeadlineError({
+      rebalanceTimeoutMs: Math.max(0, deadlineAt - startedAt),
+    })
+    let finished = false
+    const refusal = () => guard() || (finished || performance.now() >= deadlineAt ? expired : null)
+    const check = () => {
+      const error = refusal()
+      if (error) throw error
+    }
+    check()
+    const brokers = Object.values(this.brokerPool.brokers)
+    const broker =
+      brokers.find((candidate) => candidate.isConnected()) ||
+      brokers[0] ||
+      this.brokerPool.seedBroker
+    if (!broker) throw new KafkaJSBrokerNotFound('No broker available for group metadata')
+    let timer
+    const timeout = new Promise((_, reject) => {
+      timer = setTimeout(() => reject(expired), Math.max(0, deadlineAt - performance.now()))
+    })
+    const read = async () => {
+      check()
+      await broker.connect()
+      check()
+      const result = await broker.metadata(topics, {
+        allowAutoTopicCreation,
+        lenient: true,
+        guard: refusal,
+      })
+      check()
+      return result
+    }
+    try {
+      return await Promise.race([read(), timeout])
+    } finally {
+      finished = true
+      clearTimeout(timer)
     }
   }
 
@@ -761,7 +824,9 @@ module.exports = class Cluster {
   findTopicPartitionMetadata(topic) {
     const { metadata } = this.brokerPool
     if (!metadata || !metadata.topicMetadata) {
-      throw new KafkaJSTopicMetadataNotLoaded('Topic metadata not loaded', { topic })
+      throw new KafkaJSTopicMetadataNotLoaded('Topic metadata not loaded', {
+        topic,
+      })
     }
 
     const topicMetadata = metadata.topicMetadata.find((t) => t.topic === topic)
@@ -828,6 +893,17 @@ module.exports = class Cluster {
    */
   forgetLeaderEpoch(topic, partition) {
     return this.metadataCache.forgetLeaderEpoch(topic, partition)
+  }
+
+  /**
+   * Subscribes to routing changes, synchronously after each is visible: an accepted metadata
+   * install, an accepted leader hint, a by-ID write-through or an invalidation. Internal, and
+   * independent of the instrumentation events.
+   * @param {() => void} handler called once per change
+   * @returns {() => void} idempotent unsubscribe
+   */
+  onRoutingChange(handler) {
+    return this.metadataCache.onRoutingChange(handler)
   }
 
   /**
@@ -947,7 +1023,11 @@ module.exports = class Cluster {
       }
 
       if (metadata.leader === null || metadata.leader === undefined) {
-        throw new KafkaJSError('Invalid partition metadata', { topic, partitionId, metadata })
+        throw new KafkaJSError('Invalid partition metadata', {
+          topic,
+          partitionId,
+          metadata,
+        })
       }
 
       if (metadata.leader < 0) {
@@ -1138,8 +1218,17 @@ module.exports = class Cluster {
    * metadata is refreshed here and the original error is rethrown, so the caller's own retrier
    * makes the next attempt with the epoch that refresh produced. The refresh is best-effort: a
    * failing refresh must not replace the retriable error the caller is about to retry on.
+   *
+   * @param {object[]} topics see above
+   * @param {object} [options] private, for a consumer's preparation round
+   * @param {import('../producer/generation')} [options.fence] the caller's terminal fence, for the broker lookups
+   *   and the metadata refresh a stale leader epoch starts
+   * @param {() => Error|null} [options.guard] the caller's immutable identity: checked before each
+   *   request is written and before any side effect of a failure, so a refused caller causes none
+   * @returns {Promise<object[]>} the offsets per topic
+   * @throws {Error} the guard's refusal, when it refuses
    */
-  async fetchTopicsOffset(topics) {
+  async fetchTopicsOffset(topics, { fence, guard } = {}) {
     const partitionsPerBroker = {}
     const topicConfigurations = dictionary()
 
@@ -1174,10 +1263,11 @@ module.exports = class Cluster {
 
     // Create a list of requests to fetch the offset of all partitions
     const offsetRequests = keys(partitionsPerBroker).map(async (nodeId) => {
-      const broker = await this.findBroker({ nodeId })
+      const broker = await this.findBroker({ nodeId, fence })
       const partitions = partitionsPerBroker[nodeId]
 
       const { responses: topicOffsets } = await broker.listOffsets({
+        guard,
         isolationLevel: this.isolationLevel,
         topics: keys(partitions).map((topic) => ({
           topic,
@@ -1190,6 +1280,9 @@ module.exports = class Cluster {
 
     // Execute all requests, merge and normalize the responses
     const responses = await Promise.all(offsetRequests).catch(async (e) => {
+      const refusal = guard?.()
+      if (refusal) throw refusal
+
       if (staleLeaderEpoch(e)) {
         // UNKNOWN_LEADER_EPOCH means this client is *ahead* of the broker, so defending the
         // cached epoch makes every retry resend the same rejected value. FENCED_LEADER_EPOCH is
@@ -1206,7 +1299,7 @@ module.exports = class Cluster {
           }
         }
 
-        await this.refreshMetadataBestEffort()
+        await this.refreshMetadataBestEffort(fence)
       }
 
       throw e
@@ -1242,6 +1335,36 @@ module.exports = class Cluster {
    */
   offsetOperations({ groupId }) {
     return this.groupEntry(groupId).ledger
+  }
+
+  /**
+   * Keeps admin offset work on one shared pair until the last overlapping operation settles.
+   * Ordinary consumer and producer cluster holders retain their existing lifetime.
+   * @param {string} groupId validated consumer group
+   * @param {() => Promise<*>} work offset work including temporary-member cleanup
+   * @returns {Promise<*>} original result
+   * @throws {Error} original work failure; registry release is synchronous
+   */
+  async withGroup(groupId, work) {
+    let scope = this.groupScopes.get(groupId)
+    if (!scope) {
+      scope = { count: 0, entry: null }
+      scope.entry = this.groupRegistry.acquire(groupId, scope)
+      this.groupScopes.set(groupId, scope)
+    }
+    scope.count += 1
+    try {
+      return await work()
+    } finally {
+      if (--scope.count === 0) {
+        if (this.groupScopes.get(groupId) === scope) this.groupScopes.delete(groupId)
+        if (this.groupEntries.get(groupId) === scope.entry) {
+          this.groupEntries.delete(groupId)
+          this.groupRegistry.release(groupId, this)
+        }
+        this.groupRegistry.release(groupId, scope)
+      }
+    }
   }
 
   /**

@@ -238,6 +238,31 @@ module.exports = class PositionValidator {
   /**
    * @param {string} topic
    * @param {number} partition
+   * @returns {object|undefined} the entry object `request()` just created or kept; its identity
+   *   is what `release()` compares, so a replacement entry is never mistaken for it
+   */
+  entryOf(topic, partition) {
+    return this.entries.get(this.getKey(topic, partition))
+  }
+
+  /**
+   * Returns the given entries to unvalidated, by identity, so a held or abandoned reply is not
+   * needed to remove orphan awaiting state. An entry that was validated, replaced or forgotten
+   * since is a different object and is left alone: a late call cannot delete a replacement entry.
+   * @param {{topic: string, partition: number, entry: object}[]} entries entries captured with
+   *   `entryOf`
+   * @returns {void}
+   */
+  release(entries) {
+    for (const { topic, partition, entry } of entries) {
+      const key = this.getKey(topic, partition)
+      if (this.entries.get(key) === entry) this.entries.delete(key)
+    }
+  }
+
+  /**
+   * @param {string} topic
+   * @param {number} partition
    * @returns {boolean} whether a request for this partition is in flight
    */
   isAwaiting(topic, partition) {

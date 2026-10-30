@@ -81,6 +81,12 @@ const build = ({
     // real HeartbeatManager rely on.
     heartbeatInterval: () => heartbeatInterval,
     onStopRequested: jest.fn(),
+    startIdleWait: jest.fn(),
+    beginRebalanceRound: jest.fn(() => ({
+      guard: () => null,
+      wait: (work) => work(),
+      retire: jest.fn(),
+    })),
     onMembershipError: jest.fn(() => calls.push('onMembershipError')),
   }
 
@@ -2233,6 +2239,7 @@ describe('Consumer > RebalanceCoordinator > the consumer group protocol', () => 
 
       expect(consumerGroup.applyRebalanceResult).toHaveBeenCalledWith(expect.anything(), {
         rebuildOffsets: true,
+        round: expect.any(Object),
       })
       expect(consumerGroup.forgetOwnedPartitions).toHaveBeenCalled()
     }

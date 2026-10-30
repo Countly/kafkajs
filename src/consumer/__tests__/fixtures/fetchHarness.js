@@ -3,6 +3,7 @@ const Connection = require('../../../network/connection')
 const Decoder = require('../../../protocol/decoder')
 const Encoder = require('../../../protocol/encoder')
 const ConsumerGroup = require('../../consumerGroup')
+const MetadataCache = require('../../../cluster/metadataCache')
 const OffsetManager = require('../../offsetManager')
 const { MemberAssignment } = require('../../assignerProtocol')
 const InstrumentationEventEmitter = require('../../../instrumentation/emitter')
@@ -526,8 +527,10 @@ const buildConsumerGroup = ({
   autoCommit,
   retry,
   position,
+  groupProtocol,
 }) => {
   const group = new ConsumerGroup({
+    groupProtocol,
     retry,
     cluster,
     groupId: 'test-group',
@@ -620,7 +623,10 @@ const buildConsumerGroup = ({
  * @param {number} [options.preferredReadReplica] seeds every partition's preferred read replica
  * @param {Record<number, number>} [options.partitionLeaders] the leader of each partition; every
  *   partition is led by `NODE_ID` unless this says otherwise
+ * @param {'classic'|'consumer'} [options.groupProtocol] the group's membership protocol
  * @returns {Promise<{ group: ConsumerGroup, cluster: object, broker: Broker, logger: object,
+ *   metadataCache: MetadataCache, leaders: Map<number, number>,
+ *   installRouting: (leaders: Record<number, number>) => void,
  *   offsetManager: OffsetManager, offsetCommit: jest.SpyInstance, joinAndSync: jest.SpyInstance,
  *   requestRejoin: jest.Mock,
  *   setResponse: (body: Buffer|(() => Buffer)) => void,
@@ -651,6 +657,7 @@ const createFetchGroup = async ({
   withholdValidationFor = [],
   preferredReadReplica,
   partitionLeaders,
+  groupProtocol = 'classic',
 } = {}) => {
   let nextResponse = fetchResponse(
     partitions.map((partition) => ({ partition, errorCode: 0 })),
@@ -702,6 +709,32 @@ const createFetchGroup = async ({
     ])
   )
   const findBrokerCalls = []
+  // The production cache publishes every routing change to the group, so a spec moves a leader by
+  // installing metadata or applying a hint through it, as `Cluster` does. `leaders` stays the
+  // routing the stand-in cluster answers with.
+  const metadataCache = new MetadataCache({ logger: newLogger() })
+  let metadataEpoch = leaderEpoch
+  const routingMetadata = () => ({
+    brokers: knownNodes.map((nodeId) => ({ nodeId, host: `kafka${nodeId}`, port: 9092 })),
+    topicMetadata: [
+      {
+        topic: TOPIC,
+        topicId: TOPIC_ID,
+        partitionMetadata: partitions.map((partitionId) => ({
+          partitionId,
+          leader: leaders.get(partitionId),
+          leaderEpoch: metadataEpoch,
+          offlineReplicas: [],
+        })),
+      },
+    ],
+  })
+  metadataCache.update(routingMetadata())
+  const installRouting = (moved = {}) => {
+    for (const [partition, leader] of Object.entries(moved)) leaders.set(Number(partition), leader)
+    metadataEpoch += 1
+    metadataCache.update(routingMetadata())
+  }
   const coordinator = {
     isConnected: () => true,
     joinGroup: async () => ({
@@ -720,6 +753,8 @@ const createFetchGroup = async ({
     offsetCommit: async () => ({}),
   }
   const cluster = {
+    metadataCache,
+    onRoutingChange: (handler) => metadataCache.onRoutingChange(handler),
     refreshMetadataIfNecessary: async () => {},
     refreshMetadata: jest.fn(async () => {}),
     findBroker: async (args) => {
@@ -739,10 +774,11 @@ const createFetchGroup = async ({
     topicId: () => TOPIC_ID,
     leaderEpoch: () => leaderEpoch,
     forgetLeaderEpoch: jest.fn(() => true),
-    applyLeaderHint: jest.fn(async ({ partition }) => {
+    applyLeaderHint: jest.fn(async ({ topic, partition, leaderId, leaderEpoch: hintEpoch }) => {
       if (applyLeaderHintResolves && applyLeaderHintMovesLeaderTo != null) {
         leaders.set(partition, applyLeaderHintMovesLeaderTo)
       }
+      metadataCache.applyLeaderHint(topic, partition, { leaderId, leaderEpoch: hintEpoch })
       return applyLeaderHintResolves
     }),
     hasNode: jest.fn((nodeId) => knownNodes.includes(Number(nodeId))),
@@ -757,6 +793,7 @@ const createFetchGroup = async ({
     autoCommit,
     retry,
     position,
+    groupProtocol,
   })
 
   for (const partition of partitions) {
@@ -793,6 +830,9 @@ const createFetchGroup = async ({
     cluster,
     broker,
     logger: group.logger,
+    metadataCache,
+    leaders,
+    installRouting,
     offsetManager: group.offsetManager,
     offsetCommit,
     joinAndSync,

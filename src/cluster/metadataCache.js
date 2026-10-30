@@ -58,6 +58,8 @@ module.exports = class MetadataCache {
     this.topicIds = new Map()
     /** Incremented once per `update()`; stamped onto every topic that response carried. */
     this.generation = 0
+    /** @type {Set<() => void>} synchronous internal listeners, independent of instrumentation */
+    this.routingListeners = new Set()
   }
 
   /**
@@ -161,6 +163,36 @@ module.exports = class MetadataCache {
     for (const recreation of recreations || []) {
       this.emit(CLUSTER_TOPIC_RECREATED, recreation)
     }
+
+    this.publishRoutingChange()
+  }
+
+  /**
+   * Subscribes to routing changes: every accepted metadata install, accepted leader hint, by-ID
+   * write-through and invalidation. The handler runs synchronously, after the change is visible,
+   * so it must only record and wake; it receives nothing. A handler that throws is logged and
+   * dropped, so one listener cannot take the metadata path down.
+   * @param {() => void} handler called once per change
+   * @returns {() => void} idempotent unsubscribe
+   */
+  onRoutingChange(handler) {
+    this.routingListeners.add(handler)
+    return () => this.routingListeners.delete(handler)
+  }
+
+  /**
+   * Notifies the routing listeners. Conservative: it does not diff what changed.
+   * @private
+   * @returns {void}
+   */
+  publishRoutingChange() {
+    for (const listener of this.routingListeners) {
+      try {
+        listener()
+      } catch (e) {
+        this.logger.error('Routing change listener threw, ignoring it', { error: e.message })
+      }
+    }
   }
 
   /**
@@ -173,6 +205,7 @@ module.exports = class MetadataCache {
     const entry = this.topics.get(topic)
     if (entry?.topicId != null) this.topicIds.delete(entry.topicId)
     this.topics.delete(topic)
+    if (entry) this.publishRoutingChange()
   }
 
   /**
@@ -229,6 +262,7 @@ module.exports = class MetadataCache {
   updateTopicsById(metadata) {
     const liveBrokerIds = this.liveBrokerIds(metadata)
     let recreations = null
+    let changed = false
 
     for (const topicMetadata of metadata.topicMetadata) {
       const name = topicMetadata.topic
@@ -245,7 +279,9 @@ module.exports = class MetadataCache {
         recreations.push(recreation)
       }
 
-      entry.topicId = this.usableTopicId(topicMetadata.topicId) ?? entry.topicId
+      const usableId = this.usableTopicId(topicMetadata.topicId)
+      changed = changed || (usableId != null && usableId !== entry.topicId)
+      entry.topicId = usableId ?? entry.topicId
 
       for (const partition of topicMetadata.partitionMetadata) {
         const cached = entry.partitions.get(partition.partitionId)
@@ -256,6 +292,7 @@ module.exports = class MetadataCache {
             leaderEpoch: partition.leaderEpoch,
             decoded: null,
           })
+          changed = true
           continue
         }
 
@@ -263,6 +300,10 @@ module.exports = class MetadataCache {
           continue
         }
 
+        changed =
+          changed ||
+          cached.leader !== partition.leader ||
+          cached.leaderEpoch !== partition.leaderEpoch
         cached.leader = partition.leader
         cached.leaderEpoch = partition.leaderEpoch
 
@@ -280,6 +321,8 @@ module.exports = class MetadataCache {
     for (const recreation of recreations || []) {
       this.emit(CLUSTER_TOPIC_RECREATED, recreation)
     }
+
+    if (changed || recreations) this.publishRoutingChange()
   }
 
   /**
@@ -395,6 +438,7 @@ module.exports = class MetadataCache {
       cached.decoded.leaderEpoch = leaderEpoch
     }
 
+    this.publishRoutingChange()
     return true
   }
 
@@ -430,6 +474,7 @@ module.exports = class MetadataCache {
       cached.decoded.leaderEpoch = UNKNOWN_EPOCH
     }
 
+    this.publishRoutingChange()
     return true
   }
 
@@ -477,6 +522,7 @@ module.exports = class MetadataCache {
   clear() {
     this.topics.clear()
     this.topicIds.clear()
+    this.publishRoutingChange()
   }
 
   /**

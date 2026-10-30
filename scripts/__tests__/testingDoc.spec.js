@@ -299,3 +299,56 @@ describe('documented offset ordering, shared state and telemetry containment', (
     expect(otelReadme).toContain('a rejection with the same reason')
   })
 })
+
+describe('documented live scenario scripts', () => {
+  /**
+   * One row per live scenario, appended by the task that creates its script. `budgetsMs` are the
+   * case budgets the scenario's paragraph states; `wording` is text only that paragraph may supply.
+   */
+  const scenarios = [
+    {
+      script: 'test:e2e:pause-resume',
+      flag: 'PAUSE_RESUME_E2E',
+      spec: 'src/consumer/__tests__/pauseResumeLive.spec.js',
+      compose: null,
+      budgetsMs: [60000],
+      wording: [
+        'maxWaitTimeInMs 5000',
+        'less than 1000 ms',
+        'remain paused through an ordinary rebalance',
+        'never through this package row',
+      ],
+    },
+    {
+      script: 'test:e2e:leader-union',
+      flag: 'LEADER_UNION_E2E',
+      spec: 'src/consumer/__tests__/leaderUnionLive.spec.js',
+      compose: null,
+      budgetsMs: [120000, 90000],
+      wording: [
+        'roundRobin and range',
+        'Java in both seats',
+        'topic creation during the first round',
+        'never through this package row',
+      ],
+    },
+  ]
+
+  it.each(scenarios)('$script is one two-worker spec run through test:kafka', (row) => {
+    const prefix = row.compose ? `COMPOSE_FILE=${row.compose} ` : ''
+    const pattern = row.spec.replace(/\./g, '\\\\.')
+    expect(fs.existsSync(path.join(root, row.spec))).toBe(true)
+    expect(scripts[row.script]).toBe(
+      `${prefix}npm run test:kafka -- "${row.flag}=1 npx jest --maxWorkers=2 --testPathPatterns '${pattern}'"`
+    )
+  })
+
+  it.each(scenarios)('$script is documented with its budget and its own wording', (row) => {
+    const block = page
+      .split('\n\n')
+      .find((paragraph) => paragraph.includes(`npm run ${row.script}`))
+    expect(block).toBeDefined()
+    for (const ms of row.budgetsMs) expect(block).toContain(`${ms} ms`)
+    for (const text of row.wording) expect(block).toContain(text)
+  })
+})

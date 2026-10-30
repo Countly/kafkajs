@@ -25,6 +25,7 @@ const {
   rebalanceReason,
   isConsumerProtocolFatal,
   sentOwnership,
+  sentMembership,
   obsoleteOwnership,
 } = require('./rebalanceErrorContract')
 const { COOPERATIVE } = require('./groupProtocol/interface')
@@ -197,6 +198,7 @@ module.exports = class Runner extends EventEmitter {
       return
     }
 
+    this.consumerGroup.startIdleWait()
     try {
       await this.consumerGroup.connect()
       // `running` is set BEFORE the first round: the round guard is `stopRequested`, which only
@@ -470,7 +472,10 @@ module.exports = class Runner extends EventEmitter {
       await this.fetchManager.stop()
       await this.waitForHandlers()
 
-      return await this.resolveRebalanceVerdict({ ...verdict, membershipNotified: lost })
+      return await this.resolveRebalanceVerdict({
+        ...verdict,
+        membershipNotified: lost,
+      })
     } finally {
       this.quiescing = false
     }
@@ -543,7 +548,7 @@ module.exports = class Runner extends EventEmitter {
         // Only an unrecognized member id needs a fresh one. A stale generation
         // (ILLEGAL_GENERATION) does not invalidate the member id itself, so keep it and avoid an
         // extra MEMBER_ID_REQUIRED round-trip.
-        this.consumerGroup.memberId = null
+        this.consumerGroup.forgetMemberId(sentMembership(e))
       }
 
       await this.rebalanceCoordinator.runRound(reason, 'lost')
@@ -646,7 +651,7 @@ module.exports = class Runner extends EventEmitter {
         this.consumerGroup.kind === 'classic' &&
         this.consumerGroup.groupInstanceId
       ) {
-        this.consumerGroup.memberId = null
+        this.consumerGroup.forgetMemberId()
       } else {
         await this.consumerGroup.leave(options)
       }
@@ -690,7 +695,9 @@ module.exports = class Runner extends EventEmitter {
    */
   async heartbeat() {
     try {
-      await this.consumerGroup.heartbeat({ interval: this.consumerGroup.heartbeatInterval() })
+      await this.consumerGroup.heartbeat({
+        interval: this.consumerGroup.heartbeatInterval(),
+      })
       this.outages.heartbeat.end()
     } catch (e) {
       const verdict = this.rebalanceCoordinator.classify(e, REBALANCE_PATHS.HEARTBEAT)
@@ -1207,7 +1214,13 @@ module.exports = class Runner extends EventEmitter {
       this.instrumentationEmitter.emit(START_BATCH_PROCESS, payload)
 
       const { topic, partition, assignmentEpoch, acquireClock, ownershipKey } = batch
-      const identity = { topic, partition, assignmentEpoch, acquireClock, ownershipKey }
+      const identity = {
+        topic,
+        partition,
+        assignmentEpoch,
+        acquireClock,
+        ownershipKey,
+      }
       if (this.eachMessage) {
         await handlerContext.run(identity, () => this.processEachMessage(batch))
       } else if (this.eachBatch) {
@@ -1303,7 +1316,9 @@ module.exports = class Runner extends EventEmitter {
     try {
       await this.autoCommitOffsets()
     } catch (error) {
-      this.logger.warn('Offset commit after a handler failure failed', { error: error.message })
+      this.logger.warn('Offset commit after a handler failure failed', {
+        error: error.message,
+      })
     }
   }
 

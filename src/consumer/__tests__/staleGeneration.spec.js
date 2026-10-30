@@ -37,10 +37,19 @@ const createRunner = (consumerGroupOverrides) => {
     leaderId: null,
     groupInstanceId: null,
     groupMembership: {},
+    forgetMemberId() {
+      this.memberId = null
+    },
     attach: jest.fn(),
     // The membership seam the runner drives: the real ConsumerGroup answers all three.
     heartbeatInterval: () => 3000,
     onStopRequested: jest.fn(),
+    startIdleWait: jest.fn(),
+    beginRebalanceRound: jest.fn(() => ({
+      guard: () => null,
+      wait: (work) => work(),
+      retire: jest.fn(),
+    })),
     onMembershipError: jest.fn(),
     rebalanceProtocol: () => 'eager',
     // `runChain` reads both before it can report a round: `assigned()` before the JoinGroup and

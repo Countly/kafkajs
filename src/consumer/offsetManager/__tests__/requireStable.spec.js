@@ -425,3 +425,181 @@ describe('Consumer > ConsumerGroup > the stable-offset wait wiring', () => {
     expect(pollTimer.poll).toHaveBeenCalledTimes(1)
   })
 })
+
+describe('Consumer > OffsetManager > a fetch round preparation', () => {
+  const Generation = require('../../../producer/generation')
+
+  afterEach(() => {
+    jest.useRealTimers()
+  })
+
+  const preparation = () => {
+    const fence = new Generation()
+    const state = { refusal: null }
+    return { fence, state, guard: () => state.refusal, close: (e) => fence.close(e) }
+  }
+
+  test('forwards the guard to OffsetFetch and answers unguarded callers as before', async () => {
+    const { manager, coordinator } = build()
+    const prepared = preparation()
+    await manager.resolveOffsets(prepared)
+    expect(coordinator.offsetFetch).toHaveBeenLastCalledWith(
+      expect.objectContaining({ guard: prepared.guard })
+    )
+    await manager.resolveOffsets()
+    expect(coordinator.offsetFetch.mock.calls[1][0]).not.toHaveProperty('guard')
+  })
+
+  test('a refusal after the reply publishes no resolution and ends the ticket', async () => {
+    const prepared = preparation()
+    const { manager } = build({
+      offsetFetch: jest.fn(async () => {
+        prepared.state.refusal = new Error('replaced')
+        return { responses: [{ topic: TOPIC, partitions: [{ partition: 0, offset: '9' }] }] }
+      }),
+    })
+    const before = { ...manager.committedOffsets()[TOPIC] }
+    await expect(manager.resolveOffsets(prepared)).rejects.toThrow('replaced')
+    expect(manager.committedOffsets()[TOPIC]).toEqual(before)
+  })
+
+  test('a refusal during the UNSTABLE re-send delay stops before another request and clears the timer', async () => {
+    jest.useFakeTimers()
+    const prepared = preparation()
+    const { manager, coordinator } = build({
+      offsetFetch: scripted(protocolError(UNSTABLE_OFFSET_COMMIT)),
+    })
+    const pending = manager.fetchCommittedOffsets(
+      [{ topic: TOPIC, partitions: [{ partition: 0 }] }],
+      prepared
+    )
+    const rejected = pending.catch((error) => error)
+    await jest.advanceTimersByTimeAsync(0)
+    expect(jest.getTimerCount()).toBe(1)
+    prepared.close(new Error('stopping'))
+    expect((await rejected).message).toBe('stopping')
+    expect(jest.getTimerCount()).toBe(0)
+    expect(coordinator.offsetFetch).toHaveBeenCalledTimes(1)
+  })
+
+  const held = () => {
+    const gate = {}
+    gate.promise = new Promise((resolve, reject) => {
+      gate.release = resolve
+      gate.fail = reject
+    })
+    return gate
+  }
+
+  /** A manager whose coordinator is disconnected and whose rediscovery is held open. */
+  const rediscovering = () => {
+    const { manager, coordinator } = build()
+    const discovery = held()
+    const stale = { isConnected: () => false }
+    manager.coordinator = stale
+    manager.cluster.findGroupCoordinator = jest.fn(() => discovery.promise)
+    return { manager, coordinator, discovery, stale }
+  }
+
+  test.each([
+    ['resolving offsets', (manager, prepared) => manager.resolveOffsets(prepared), 'offsetFetch'],
+    [
+      'committing a seek',
+      (manager, prepared) => manager.seek({ topic: TOPIC, partition: 0, offset: '5' }, prepared),
+      'offsetCommit',
+    ],
+  ])(
+    'coordinator discovery while %s is bound to the round and publishes nothing after it',
+    async (_, run, request) => {
+      const prepared = preparation()
+      const { manager, coordinator, discovery, stale } = rediscovering()
+      coordinator.offsetCommit = jest.fn(async () => ({}))
+      const pending = run(manager, prepared).catch((error) => error)
+      await Promise.resolve()
+      expect(manager.cluster.findGroupCoordinator).toHaveBeenCalledWith(
+        expect.objectContaining({ groupId: GROUP_ID, fence: prepared.fence })
+      )
+      const stopping = new Error('stopping')
+      prepared.state.refusal = stopping
+      prepared.close(stopping)
+      discovery.release(coordinator)
+      expect(await pending).toBe(stopping)
+      expect(manager.coordinator).toBe(stale)
+      expect(coordinator[request]).not.toHaveBeenCalled()
+    }
+  )
+
+  test('the metadata refresh a refused commit id starts is bound to the round', async () => {
+    const prepared = preparation()
+    const { manager, coordinator } = build()
+    coordinator.offsetCommit = jest.fn(async () => {
+      throw protocolError(100)
+    })
+    manager.cluster.refreshMetadata = jest.fn(async () => {})
+    await expect(
+      manager.seek({ topic: TOPIC, partition: 0, offset: '5' }, prepared)
+    ).rejects.toMatchObject({ type: 'UNKNOWN_TOPIC_ID' })
+    expect(manager.cluster.refreshMetadata).toHaveBeenCalledWith({ fence: prepared.fence })
+  })
+
+  test('an unguarded commit keeps the unfenced discovery and refresh calls', async () => {
+    const { manager, coordinator } = build()
+    coordinator.offsetCommit = jest.fn(async () => {
+      throw protocolError(100)
+    })
+    manager.coordinator = { isConnected: () => false }
+    manager.cluster.findGroupCoordinator = jest.fn(async () => coordinator)
+    manager.cluster.refreshMetadata = jest.fn(async () => {})
+    await expect(manager.seek({ topic: TOPIC, partition: 0, offset: '5' })).rejects.toBeDefined()
+    expect(manager.cluster.findGroupCoordinator).toHaveBeenCalledWith({ groupId: GROUP_ID })
+    expect(manager.cluster.refreshMetadata).toHaveBeenCalledWith()
+  })
+
+  test('a refused seek never reaches the commit', async () => {
+    const prepared = preparation()
+    prepared.state.refusal = new Error('replaced')
+    const { manager } = build()
+    const commit = jest.spyOn(manager, 'sendOffsetCommit')
+    await expect(
+      manager.seek({ topic: TOPIC, partition: 0, offset: '5' }, prepared)
+    ).rejects.toThrow('replaced')
+    expect(commit).not.toHaveBeenCalled()
+  })
+
+  test('a refusal that arrives with the commit reply throws and leaves the cell as it was', async () => {
+    const prepared = preparation()
+    const { manager } = build()
+    jest.spyOn(manager, 'sendOffsetCommit').mockImplementation(async () => {
+      prepared.state.refusal = new Error('replaced')
+    })
+    const before = { ...manager.committedOffsets()[TOPIC] }
+    expect(await manager.seek({ topic: TOPIC, partition: 0, offset: '5' }, prepared)).toBe(false)
+    expect(manager.committedOffsets()[TOPIC]).toEqual(before)
+  })
+})
+
+describe('late commit rejection', () => {
+  it('publishes no ownership loss or commit error once the caller run closed', async () => {
+    const Generation = require('../../../producer/generation')
+    const GroupOwnership = require('../../groupOwnership')
+    const { manager, coordinator } = build()
+    manager.ownership = new GroupOwnership()
+    manager.onCommitError = jest.fn()
+    const lose = jest.spyOn(manager.ownership, 'lose')
+    const fence = new Generation()
+    let rejectCommit
+    coordinator.offsetCommit = jest.fn(
+      () => new Promise((resolve, reject) => (rejectCommit = reject))
+    )
+    const pending = manager
+      .sendOffsetCommit({ groupGenerationId: 3, topics: [] }, { fence, guard: fence.guard })
+      .catch((e) => e)
+    for (let n = 0; n < 5; n++) await Promise.resolve()
+    expect(coordinator.offsetCommit).toHaveBeenCalledTimes(1)
+    fence.close(new Error('run stopped'))
+    rejectCommit(protocolError(25))
+    await pending
+    expect(lose).not.toHaveBeenCalled()
+    expect(manager.onCommitError).not.toHaveBeenCalled()
+  })
+})

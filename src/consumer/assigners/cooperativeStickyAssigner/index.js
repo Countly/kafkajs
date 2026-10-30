@@ -1,6 +1,7 @@
 const Encoder = require('../../../protocol/encoder')
 const Decoder = require('../../../protocol/decoder')
 const { MemberMetadata, MemberAssignment } = require('../../assignerProtocol')
+const partitionMetadata = require('../partitionMetadata')
 const {
   assignSticky,
   DEFAULT_GENERATION,
@@ -82,8 +83,10 @@ module.exports = ({ cluster }) => ({
   /**
    * @param {{ members: import('types').GroupMember[], topics: string[] }} group
    * @returns {Promise<import('types').GroupMemberAssignment[]>}
+   * @param {string[]} [group.groupTopics] sorted union; own topics stays unchanged
+   * @param {ReadonlyMap<string, object[]>} [group.groupTopicMetadata] authoritative when present
    */
-  async assign({ members, topics }) {
+  async assign({ members, topics, groupTopics, groupTopicMetadata }) {
     const decoded = members.map((member) => {
       const metadata = MemberMetadata.decode(member.memberMetadata)
       const ownedPartitions = metadata.ownedPartitions || []
@@ -98,19 +101,26 @@ module.exports = ({ cluster }) => ({
     })
 
     const partitionsPerTopic = dictionary()
-    for (const topic of topics) {
-      partitionsPerTopic[topic] = cluster
-        .findTopicPartitionMetadata(topic)
-        .map(({ partitionId }) => partitionId)
+    for (const topic of groupTopics ?? topics) {
+      partitionsPerTopic[topic] = partitionMetadata(cluster, groupTopicMetadata, topic).map(
+        ({ partitionId }) => partitionId
+      )
     }
 
     const contested = new Set()
-    const assignment = assignSticky({ partitionsPerTopic, members: decoded, contested })
+    const assignment = assignSticky({
+      partitionsPerTopic,
+      members: decoded,
+      contested,
+    })
     this.withholdTransferringPartitions(decoded, assignment, contested)
 
     return [...assignment].map(([memberId, byTopic]) => ({
       memberId,
-      memberAssignment: MemberAssignment.encode({ version: this.version, assignment: byTopic }),
+      memberAssignment: MemberAssignment.encode({
+        version: this.version,
+        assignment: byTopic,
+      }),
     }))
   },
 
@@ -132,7 +142,12 @@ module.exports = ({ cluster }) => ({
       const owned = new Set(flatten(ownedPartitions))
       const byTopic = assignment.get(memberId)
       const assigned = new Set(
-        flatten(Object.keys(byTopic).map((topic) => ({ topic, partitions: byTopic[topic] })))
+        flatten(
+          Object.keys(byTopic).map((topic) => ({
+            topic,
+            partitions: byTopic[topic],
+          }))
+        )
       )
 
       for (const key of assigned) {

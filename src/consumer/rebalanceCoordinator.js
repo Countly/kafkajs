@@ -278,106 +278,118 @@ module.exports = class RebalanceCoordinator {
         )
       }
 
-      if (reason) {
-        this.instrumentationEmitter.emit(REBALANCING, {
+      const round = this.consumerGroup.beginRebalanceRound()
+      try {
+        if (reason) {
+          this.instrumentationEmitter.emit(REBALANCING, {
+            groupId: this.groupId,
+            memberId: this.consumerGroup.memberId,
+            membershipProtocol: this.consumerGroup.kind || 'classic',
+            reason,
+          })
+        }
+
+        const previous = this.consumerGroup.assigned()
+        const cooperative = this.consumerGroup.rebalanceProtocol() === COOPERATIVE
+        // A round that gives everything up rebuilds from scratch: an eager round revoked its whole
+        // assignment before joining, and a lost one held its under a membership that is now void,
+        // so the incremental apply has nothing valid to keep.
+        const rebuildOffsets = kind === 'lost' || !cooperative
+
+        // Java's onPartitionsLost timing: the partitions are gone before the JoinGroup, not after
+        // the sync that replaces them.
+        // @see clients/src/main/java/org/apache/kafka/clients/consumer/ConsumerRebalanceListener.java
+        if (kind === 'lost' && previous.length) {
+          this.emitPartitions(PARTITIONS_LOST, previous)
+        }
+
+        // Java's onJoinPrepare: the same rounds stop advertising ownership before they join, so
+        // the JoinGroup carries no `OwnedPartitions` and no peer withholds a partition for a
+        // member that has already given it up.
+        // @see clients/src/main/java/org/apache/kafka/clients/consumer/internals/ConsumerCoordinator.java
+        if (rebuildOffsets) {
+          this.consumerGroup.forgetOwnedPartitions()
+        }
+
+        const roundStartedAt = Date.now()
+        const result = await this.consumerGroup.joinAndSync(round)
+        const { revoked, added } = await round.wait(() =>
+          this.consumerGroup.applyRebalanceResult(result, {
+            rebuildOffsets,
+            round,
+          })
+        )
+
+        // Java's onJoinComplete: the round decides what the two events carry, not the apply. A
+        // cooperative round reports the apply's delta; an eager one reports both whole sets; a lost
+        // one reports no revocation at all, because `PARTITIONS_LOST` already named those
+        // partitions.
+        const refusal = round.guard()
+        if (refusal) throw refusal
+        const assignment = this.consumerGroup.assigned()
+        const reportsDelta = cooperative && kind !== 'lost'
+        const gaveUp = kind === 'lost' ? [] : reportsDelta ? revoked : previous
+        const tookOn = reportsDelta ? added : assignment
+
+        if (gaveUp.length) {
+          this.emitPartitions(PARTITIONS_REVOKED, gaveUp)
+        }
+
+        if (tookOn.length) {
+          this.emitPartitions(PARTITIONS_ASSIGNED, tookOn)
+        }
+
+        const payload = {
           groupId: this.groupId,
           memberId: this.consumerGroup.memberId,
+          leaderId: this.consumerGroup.leaderId,
+          isLeader: this.consumerGroup.isLeader(),
+          memberAssignment: assignment.reduce(
+            (byTopic, { topic, partitions }) => ({
+              ...byTopic,
+              [topic]: partitions,
+            }),
+            {}
+          ),
+          groupProtocol: this.consumerGroup.groupProtocol,
           membershipProtocol: this.consumerGroup.kind || 'classic',
-          reason,
-        })
-      }
+          duration: Date.now() - roundStartedAt,
+          rebalanceProtocol: this.consumerGroup.rebalanceProtocol(),
+        }
 
-      const previous = this.consumerGroup.assigned()
-      const cooperative = this.consumerGroup.rebalanceProtocol() === COOPERATIVE
-      // A round that gives everything up rebuilds from scratch: an eager round revoked its whole
-      // assignment before joining, and a lost one held its under a membership that is now void,
-      // so the incremental apply has nothing valid to keep.
-      const rebuildOffsets = kind === 'lost' || !cooperative
+        this.onJoinComplete()
+        this.instrumentationEmitter.emit(GROUP_JOIN, payload)
+        this.logger.info('Consumer has joined the group', payload)
 
-      // Java's onPartitionsLost timing: the partitions are gone before the JoinGroup, not after
-      // the sync that replaces them.
-      // @see clients/src/main/java/org/apache/kafka/clients/consumer/ConsumerRebalanceListener.java
-      if (kind === 'lost' && previous.length) {
-        this.emitPartitions(PARTITIONS_LOST, previous)
-      }
+        this.pollTimer.reset()
 
-      // Java's onJoinPrepare: the same rounds stop advertising ownership before they join, so
-      // the JoinGroup carries no `OwnedPartitions` and no peer withholds a partition for a
-      // member that has already given it up.
-      // @see clients/src/main/java/org/apache/kafka/clients/consumer/internals/ConsumerCoordinator.java
-      if (rebuildOffsets) {
-        this.consumerGroup.forgetOwnedPartitions()
-      }
+        // Never re-arm a manager `Runner.stop()` has just cancelled: that would leave heartbeats
+        // running after LeaveGroup and a timer surviving stop().
+        if (!this.runner.stopRequested) {
+          this.heartbeatManager.ensureStarted()
+        }
 
-      const roundStartedAt = Date.now()
-      const result = await this.consumerGroup.joinAndSync()
-      const { revoked, added } = await this.consumerGroup.applyRebalanceResult(result, {
-        rebuildOffsets,
-      })
+        // `kind` here is the ROUND kind, only 'lost' | 'revoked'. The MEMBERSHIP kind is a separate
+        // variable: testing the round kind against 'classic' would be permanently false and would
+        // delete the shipped classic cooperative follow-up below. Defaulted, because a group object
+        // without the accessor is a classic one.
+        const protocol = this.consumerGroup.kind || 'classic'
 
-      // Java's onJoinComplete: the round decides what the two events carry, not the apply. A
-      // cooperative round reports the apply's delta; an eager one reports both whole sets; a lost
-      // one reports no revocation at all, because `PARTITIONS_LOST` already named those
-      // partitions.
-      const assignment = this.consumerGroup.assigned()
-      const reportsDelta = cooperative && kind !== 'lost'
-      const gaveUp = kind === 'lost' ? [] : reportsDelta ? revoked : previous
-      const tookOn = reportsDelta ? added : assignment
+        kind = this.takePendingKind() || 'revoked'
+        reason =
+          kind === 'lost'
+            ? this.takeRejoinRequested()
+            : revoked.length && cooperative && protocol === 'classic'
+              ? 'partitions-revoked'
+              : protocol === 'consumer' && this.consumerGroup.needsReconciliation()
+                ? 'assignment-changed'
+                : this.takeRejoinRequested()
 
-      if (gaveUp.length) {
-        this.emitPartitions(PARTITIONS_REVOKED, gaveUp)
-      }
-
-      if (tookOn.length) {
-        this.emitPartitions(PARTITIONS_ASSIGNED, tookOn)
-      }
-
-      const payload = {
-        groupId: this.groupId,
-        memberId: this.consumerGroup.memberId,
-        leaderId: this.consumerGroup.leaderId,
-        isLeader: this.consumerGroup.isLeader(),
-        memberAssignment: assignment.reduce(
-          (byTopic, { topic, partitions }) => ({ ...byTopic, [topic]: partitions }),
-          {}
-        ),
-        groupProtocol: this.consumerGroup.groupProtocol,
-        membershipProtocol: this.consumerGroup.kind || 'classic',
-        duration: Date.now() - roundStartedAt,
-        rebalanceProtocol: this.consumerGroup.rebalanceProtocol(),
-      }
-
-      this.consumerGroup.ownership?.renew()
-      this.onJoinComplete()
-      this.instrumentationEmitter.emit(GROUP_JOIN, payload)
-      this.logger.info('Consumer has joined the group', payload)
-
-      this.pollTimer.reset()
-
-      // Never re-arm a manager `Runner.stop()` has just cancelled: that would leave heartbeats
-      // running after LeaveGroup and a timer surviving stop().
-      if (!this.runner.stopRequested) {
-        this.heartbeatManager.ensureStarted()
-      }
-
-      // `kind` here is the ROUND kind, only 'lost' | 'revoked'. The MEMBERSHIP kind is a separate
-      // variable: testing the round kind against 'classic' would be permanently false and would
-      // delete the shipped classic cooperative follow-up below. Defaulted, because a group object
-      // without the accessor is a classic one.
-      const protocol = this.consumerGroup.kind || 'classic'
-
-      kind = this.takePendingKind() || 'revoked'
-      reason =
-        kind === 'lost'
-          ? this.takeRejoinRequested()
-          : revoked.length && cooperative && protocol === 'classic'
-            ? 'partitions-revoked'
-            : protocol === 'consumer' && this.consumerGroup.needsReconciliation()
-              ? 'assignment-changed'
-              : this.takeRejoinRequested()
-
-      if (reason && protocol === 'consumer' && !this.runner.stopRequested) {
-        await this.yieldBetweenRounds()
+        if (reason && protocol === 'consumer' && !this.runner.stopRequested) {
+          await this.yieldBetweenRounds()
+        }
+      } finally {
+        round.retire()
       }
     } while (reason)
   }

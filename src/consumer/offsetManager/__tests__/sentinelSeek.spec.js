@@ -58,13 +58,16 @@ for (const autoCommit of [false, true]) {
         ctx.manager.topicConfigurations[TOPIC].fromBeginning = fromBeginning
         await seek(ctx, sentinel)
         await expect(ctx.manager.resolveOffsets()).resolves.toBe(true)
-        expect(ctx.cluster.fetchTopicsOffset).toHaveBeenCalledWith([
-          {
-            topic: TOPIC,
-            fromBeginning,
-            partitions: [{ partition: 0, timestamp: Number(sentinel) }],
-          },
-        ])
+        expect(ctx.cluster.fetchTopicsOffset).toHaveBeenCalledWith(
+          [
+            {
+              topic: TOPIC,
+              fromBeginning,
+              partitions: [{ partition: 0, timestamp: Number(sentinel) }],
+            },
+          ],
+          undefined
+        )
         expect(ctx.next()).toBe('37')
         expect(ctx.committedAt()).toBe('37')
         expect(ctx.manager.lastConsumedEpoch(TOPIC, 0)).toBe(-1)
@@ -81,16 +84,19 @@ test('opposite sentinels share one topic resolution without affecting an untouch
   await seek(ctx, '-2', 0)
   await seek(ctx, '-1', 1)
   await ctx.manager.resolveOffsets()
-  expect(ctx.cluster.fetchTopicsOffset).toHaveBeenCalledWith([
-    {
-      topic: TOPIC,
-      fromBeginning: true,
-      partitions: [
-        { partition: 0, timestamp: -2 },
-        { partition: 1, timestamp: -1 },
-      ],
-    },
-  ])
+  expect(ctx.cluster.fetchTopicsOffset).toHaveBeenCalledWith(
+    [
+      {
+        topic: TOPIC,
+        fromBeginning: true,
+        partitions: [
+          { partition: 0, timestamp: -2 },
+          { partition: 1, timestamp: -1 },
+        ],
+      },
+    ],
+    undefined
+  )
   expect([ctx.next(0), ctx.next(1), ctx.next(2)]).toEqual(['37', '37', '99'])
   expect(ctx.manager.pendingSeeks.size).toBe(0)
 })

@@ -127,3 +127,22 @@ describe('Consumer > SubcriptionState > assignments', () => {
     ])
   })
 })
+
+describe('Consumer > SubscriptionState > assignment change callback', () => {
+  it('calls once at the end of assign and update, after the assignment is visible', () => {
+    const seen = []
+    const state = new SubscriptionState({
+      onAssignmentChange: () => seen.push(state.assigned()),
+    })
+    state.assign([{ topic: 'topic1', partitions: [0] }])
+    state.update([{ topic: 'topic1', partitions: [0, 1] }])
+    expect(seen).toEqual([
+      [{ topic: 'topic1', partitions: [0] }],
+      [{ topic: 'topic1', partitions: [0, 1] }],
+    ])
+  })
+
+  it('needs no callback', () => {
+    expect(() => new SubscriptionState().assign([])).not.toThrow()
+  })
+})

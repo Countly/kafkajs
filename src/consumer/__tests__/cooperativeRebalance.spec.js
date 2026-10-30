@@ -5,6 +5,7 @@ const Runner = require('../runner')
 const Batch = require('../batch')
 const ClassicGroupProtocol = require('../groupProtocol/classic')
 const RebalanceCoordinator = require('../rebalanceCoordinator')
+const IdleWait = require('../idleWait')
 const PollTimer = require('../pollTimer')
 const { MemberMetadata, MemberAssignment } = require('../assignerProtocol')
 const { COOPERATIVE, EAGER } = require('../groupProtocol/interface')
@@ -19,6 +20,25 @@ const {
   sentGeneration,
 } = require('../rebalanceErrorContract')
 const { newLogger } = require('testHelpers')
+
+/** Rounds the cases below begin, retired after each case. */
+const rounds = []
+
+/** @returns {object} a real round over a private idle wait, for a protocol call made directly */
+const realRound = () => {
+  const group = Object.create(ConsumerGroup.prototype)
+  Object.assign(group, {
+    idleWait: new IdleWait(),
+    rebalanceTimeout: 60000,
+    cluster: { allowAutoTopicCreation: true },
+    isStopping: () => false,
+  })
+  const round = group.beginRebalanceRound()
+  rounds.push(round)
+  return round
+}
+
+afterEach(() => rounds.splice(0).forEach((round) => round.retire()))
 
 const ILLEGAL_GENERATION = 22
 const FENCED_INSTANCE_ID = 82
@@ -122,6 +142,11 @@ const createCoordinator = () => {
     }),
     clearStaleAssignmentPending: jest.fn(),
     forgetOwnedPartitions: jest.fn(),
+    beginRebalanceRound: jest.fn(() => ({
+      guard: () => null,
+      wait: (work) => work(),
+      retire: jest.fn(),
+    })),
   }
 
   const fetchManager = {
@@ -426,11 +451,11 @@ describe('Consumer > cooperative rebalance apply', () => {
       const { coordinator, consumerGroup, applies } = createCoordinator()
 
       await coordinator.runRound('initial', 'initial')
-      expect(applies).toEqual([{ rebuildOffsets: false }])
+      expect(applies).toEqual([{ rebuildOffsets: false, round: expect.any(Object) }])
 
       consumerGroup.rebalanceProtocol = () => EAGER
       await coordinator.runRound('rebalance-in-progress', 'revoked')
-      expect(applies[1]).toEqual({ rebuildOffsets: true })
+      expect(applies[1]).toEqual({ rebuildOffsets: true, round: expect.any(Object) })
     })
 
     it('touches the fetch layer on neither side of a cooperative round', async () => {
@@ -1231,7 +1256,10 @@ describe('Consumer > cooperative rebalance apply', () => {
     const buildProtocol = ({ mode, groupProtocol, assignment }) => {
       const assigner = { name: groupProtocol, assign: jest.fn(async () => assignment) }
       const protocol = new ClassicGroupProtocol({
-        cluster: { refreshMetadata: jest.fn(async () => {}) },
+        cluster: {
+          refreshMetadata: jest.fn(async () => {}),
+          findTopicPartitionMetadata: () => [],
+        },
         groupId: 'cooperative-group',
         sessionTimeout: 30000,
         rebalanceTimeout: 60000,
@@ -1275,7 +1303,12 @@ describe('Consumer > cooperative rebalance apply', () => {
       })
 
       await expect(
-        protocol.sync({ topics: [TOPIC_A], topicsSubscribed: [TOPIC_A], beforeSync: () => {} })
+        protocol.sync({
+          topics: [TOPIC_A],
+          topicsSubscribed: [TOPIC_A],
+          beforeSync: () => {},
+          round: realRound(),
+        })
       ).rejects.toThrow(/topic-a-1.*member-1.*member-2|topic-a-1/)
 
       expect(protocol.coordinator.syncGroup).not.toHaveBeenCalled()
@@ -1289,7 +1322,12 @@ describe('Consumer > cooperative rebalance apply', () => {
       })
 
       const error = await protocol
-        .sync({ topics: [TOPIC_A], topicsSubscribed: [TOPIC_A], beforeSync: () => {} })
+        .sync({
+          topics: [TOPIC_A],
+          topicsSubscribed: [TOPIC_A],
+          beforeSync: () => {},
+          round: realRound(),
+        })
         .catch((e) => e)
 
       expect(error.name).toEqual('KafkaJSNonRetriableError')
@@ -1307,7 +1345,12 @@ describe('Consumer > cooperative rebalance apply', () => {
       })
 
       await expect(
-        protocol.sync({ topics: [TOPIC_A], topicsSubscribed: [TOPIC_A], beforeSync: () => {} })
+        protocol.sync({
+          topics: [TOPIC_A],
+          topicsSubscribed: [TOPIC_A],
+          beforeSync: () => {},
+          round: realRound(),
+        })
       ).resolves.toMatchObject({ assignment: {} })
     })
 
@@ -1319,7 +1362,12 @@ describe('Consumer > cooperative rebalance apply', () => {
       })
 
       await expect(
-        protocol.sync({ topics: [TOPIC_A], topicsSubscribed: [TOPIC_A], beforeSync: () => {} })
+        protocol.sync({
+          topics: [TOPIC_A],
+          topicsSubscribed: [TOPIC_A],
+          beforeSync: () => {},
+          round: realRound(),
+        })
       ).resolves.toMatchObject({ assignment: {} })
     })
 
@@ -1334,7 +1382,12 @@ describe('Consumer > cooperative rebalance apply', () => {
       })
 
       await expect(
-        protocol.sync({ topics: [TOPIC_A], topicsSubscribed: [TOPIC_A], beforeSync: () => {} })
+        protocol.sync({
+          topics: [TOPIC_A],
+          topicsSubscribed: [TOPIC_A],
+          beforeSync: () => {},
+          round: realRound(),
+        })
       ).resolves.toMatchObject({ assignment: {} })
     })
 
@@ -1355,7 +1408,12 @@ describe('Consumer > cooperative rebalance apply', () => {
       ]
 
       await expect(
-        protocol.sync({ topics: [TOPIC_A], topicsSubscribed: [TOPIC_A], beforeSync: () => {} })
+        protocol.sync({
+          topics: [TOPIC_A],
+          topicsSubscribed: [TOPIC_A],
+          beforeSync: () => {},
+          round: realRound(),
+        })
       ).resolves.toMatchObject({ assignment: {} })
     })
   })

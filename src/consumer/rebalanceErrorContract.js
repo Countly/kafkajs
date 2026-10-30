@@ -323,6 +323,7 @@ const unsupportedConsumerProtocolError = (cause) => {
  */
 const SENT_GENERATION = Symbol('rebalance:sentGenerationId')
 const SENT_OWNERSHIP = Symbol('rebalance:sentOwnership')
+const SENT_MEMBERSHIP = Symbol('rebalance:sentMembership')
 
 /**
  * Records the generation a failing group request was sent under.
@@ -357,6 +358,21 @@ const stampOwnership = (error, token) => {
 
 /** @param {Error} error @returns {number|undefined} its original membership identity */
 const sentOwnership = (error) => error && error[SENT_OWNERSHIP]
+
+/**
+ * Records the classic membership revision a group request was sent under, so an
+ * UNKNOWN_MEMBER_ID answer that outlives its membership cannot forget a later one.
+ * @param {Error} error the request's error
+ * @param {number|undefined} revision the membership revision when the request started
+ * @returns {Error} the same error, with a private stamp
+ */
+const stampMembership = (error, revision) => {
+  if (error && revision != null && error[SENT_MEMBERSHIP] == null) error[SENT_MEMBERSHIP] = revision
+  return error
+}
+
+/** @param {Error} error @returns {number|undefined} the membership revision its request began under */
+const sentMembership = (error) => error && error[SENT_MEMBERSHIP]
 
 /**
  * Whether an answer belongs to a membership already replaced. Unstamped local errors use current.
@@ -403,6 +419,8 @@ module.exports = {
   sentGeneration,
   stampOwnership,
   sentOwnership,
+  stampMembership,
+  sentMembership,
   obsoleteOwnership,
   learnOwnershipLoss,
 }

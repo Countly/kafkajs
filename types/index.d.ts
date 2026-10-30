@@ -395,7 +395,14 @@ export type GroupState = { name: string; metadata: Buffer }
 export type Assigner = {
   name: string
   version: number
-  assign(group: { members: GroupMember[]; topics: string[] }): Promise<GroupMemberAssignment[]>
+  assign(group: {
+    members: GroupMember[]
+    topics: string[]
+    /** Sorted union; topics remains the leader's own subscription. */
+    groupTopics?: string[]
+    /** Authoritative when present; an absent name has no partitions. */
+    groupTopicMetadata?: ReadonlyMap<string, PartitionMetadata[]>
+  }): Promise<GroupMemberAssignment[]>
   protocol(subscription: {
     topics: string[]
     ownedPartitions?: Array<{ topic: string; partitions: number[] }>

@@ -256,7 +256,7 @@ If the partition's leader changes and the new leader's log diverges from what th
 
 If a subscribed topic is deleted and recreated, the new topic is a different entity from the broker's point of view even though it has the same name — it gets a new topic id and starts back at offset 0. A committed offset from the old topic is meaningless against it, and because cleanup of the internal `__consumer_offsets` topic is asynchronous, that stale offset can still be there — and can still look like a perfectly valid offset into the new topic's log.
 
-When the consumer notices a subscribed topic has come back under a new id, it resets that topic's offsets once: it ignores the coordinator's committed offset for it and resolves the next offset from the configured boundary instead, per that subscription's [`fromBeginning`](#from-beginning) setting. This happens automatically and needs no configuration. Paused partitions stay paused across a recreation, since pausing is your intent, not offset state.
+When the consumer notices a subscribed topic has come back under a new id, it resets that topic's offsets once: it ignores the coordinator's committed offset for it and resolves the next offset from the configured boundary instead, per that subscription's [`fromBeginning`](#from-beginning) setting. This happens automatically and needs no configuration. A pause belongs to one topic incarnation. A recreated topic starts unpaused; pause it again after consumer.cluster.topic_recreated if needed. Ordinary rebalances preserve pause state.
 
 The reset stays owed for a partition until an offset for the new topic is applied to it: the reset's own resolution, or a [`seek`](#seek), a commit or the offsets of a confirmed transaction, the last three also when another client of the same `Kafka` instance makes them. A `ListOffsets` request that fails, an answer that predates the recreation and the consumer's automatic restart after a crash all leave it owed, so the next resolution still resets; `consumer.disconnect()` drops it. Once a partition is settled, the reset no longer applies to it, so a seek or commit for the new topic is never undone by it. A seek issued *before* the consumer noticed the recreation is dropped, since its target offset belonged to the topic's previous incarnation. Each member of a group resets on its own the first time it notices the recreation, unless another consumer of the group in the same `Kafka` instance settled the partition first.
 
@@ -371,9 +371,11 @@ A classic static member that leaves with `true` sends its member id and its `gro
 
 In order to pause and resume consuming from one or more topics, the `Consumer` provides the methods `pause` and `resume`. It also provides the `paused` method to get the list of all paused topics. Note that pausing a topic means that it won't be fetched in the next cycle and subsequent messages within the current batch won't be passed to an `eachMessage` handler.
 
-Calling `pause` with a topic that the consumer is not subscribed to is a no-op, calling `resume` with a topic that is not paused is also a no-op.
+A pause for a topic outside the subscription is retained until the next subscription lifecycle point. paused() lists only assigned partitions. Pause state survives ordinary eager, cooperative and consumer-protocol rebalances, and is retired when the topic leaves the subscription, the run ends or the topic is recreated. Calling `resume` with a topic that is not paused is also a no-op.
 
 > Note: Calling `resume` or `pause` while the consumer is not running will throw an error.
+
+resume(), seek(), an applied assignment or routing change, a topic reset and stop wake idle fetchers immediately. maxWaitTimeInMs still defaults to 5000 and continues to bound broker long polling; waking an idle fetcher does not cancel an in-flight Fetch. Admin offset operations release idle local group state after their last overlapping operation, while other holders and pending ledger work continue to protect shared state. A routing change that arrives while a fetcher is preparing its positions is picked up by one retry in the same round; during continuous routing churn a round prepares at most twice, and an idle round whose routing changed returns to the fetch loop instead of sleeping.
 
 Example: A situation where this could be useful is when an external dependency used by the consumer is under too much load. Here we want to `pause` consumption from a topic when this happens, and after a predefined interval we `resume` again:
 
@@ -623,6 +625,8 @@ Any value other than `0` or `1` is rejected when you create the consumer, with `
 ## <a name="custom-partition-assigner"></a> Custom partition assigner
 
 It's possible to configure the strategy the consumer will use to distribute partitions amongst the consumer group. KafkaJS has a round robin assigner configured by default.
+
+assign receives { members, topics, groupTopics, groupTopicMetadata }. topics remains the leader's own subscription. groupTopics is the sorted union of every member's subscription. groupTopicMetadata is a ReadonlyMap from topic name to partition metadata. When the map is present, a missing name has no partitions; consult cluster metadata only when the entire map argument is absent. A leader obtains missing names from one bounded snapshot without adding permanent targets. A topic error is excluded; leaderless partition IDs remain available to the assigner.
 
 A partition assigner is a function which returns an object with the following interface:
 

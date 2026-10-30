@@ -1,4 +1,5 @@
 const { MemberMetadata, MemberAssignment } = require('../../assignerProtocol')
+const partitionMetadata = require('../partitionMetadata')
 const { assignSticky, DEFAULT_GENERATION } = require('./stickyCore')
 const { stickyUserData } = require('./stickyUserData')
 const dictionary = require('../../../utils/dictionary')
@@ -33,8 +34,10 @@ module.exports = ({ cluster }) => ({
   /**
    * @param {{ members: import('types').GroupMember[], topics: string[] }} group
    * @returns {Promise<import('types').GroupMemberAssignment[]>}
+   * @param {string[]} [group.groupTopics] sorted union; own topics stays unchanged
+   * @param {ReadonlyMap<string, object[]>} [group.groupTopicMetadata] authoritative when present
    */
-  async assign({ members, topics }) {
+  async assign({ members, topics, groupTopics, groupTopicMetadata }) {
     const decoded = members.map((member) => {
       const metadata = MemberMetadata.decode(member.memberMetadata)
       const { assignment, generationId } = stickyUserData.decode(metadata.userData)
@@ -49,16 +52,19 @@ module.exports = ({ cluster }) => ({
     })
 
     const partitionsPerTopic = dictionary()
-    for (const topic of topics) {
-      partitionsPerTopic[topic] = cluster
-        .findTopicPartitionMetadata(topic)
-        .map(({ partitionId }) => partitionId)
+    for (const topic of groupTopics ?? topics) {
+      partitionsPerTopic[topic] = partitionMetadata(cluster, groupTopicMetadata, topic).map(
+        ({ partitionId }) => partitionId
+      )
     }
 
     return [...assignSticky({ partitionsPerTopic, members: decoded })].map(
       ([memberId, assignment]) => ({
         memberId,
-        memberAssignment: MemberAssignment.encode({ version: this.version, assignment }),
+        memberAssignment: MemberAssignment.encode({
+          version: this.version,
+          assignment,
+        }),
       })
     )
   },

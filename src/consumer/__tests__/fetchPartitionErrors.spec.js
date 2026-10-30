@@ -28,7 +28,10 @@ describe('Consumer > fetch partition error contract', () => {
       )
       const batches = await group.fetch(NODE_ID)
 
-      expect(setDefaultOffset).toHaveBeenCalledWith({ topic: TOPIC, partition: 0 })
+      expect(setDefaultOffset).toHaveBeenCalledWith(
+        { topic: TOPIC, partition: 0 },
+        { guard: group.idleWait.fence.guard, fence: group.idleWait.fence }
+      )
       expect(batches.map(({ partition }) => partition)).toEqual([1])
       // Every delivered batch carries the assignment it was fetched under, so one that outlives
       // that assignment can be recognised before it reaches a handler.

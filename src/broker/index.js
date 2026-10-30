@@ -130,7 +130,10 @@ const toVersionMap = (response) =>
   response.apiVersions.reduce(
     (obj, version) =>
       Object.assign(obj, {
-        [version.apiKey]: { minVersion: version.minVersion, maxVersion: version.maxVersion },
+        [version.apiKey]: {
+          minVersion: version.minVersion,
+          maxVersion: version.maxVersion,
+        },
       }),
     {}
   )
@@ -598,13 +601,18 @@ module.exports = class Broker {
    * @param {object} [options]
    * @param {(frameLength?: number) => Error|null} [options.guard] a producer's private pre-write
    *   check; it never reaches the request
+   * @param {boolean} [options.allowAutoTopicCreation] overrides only this request
+   * @param {boolean} [options.lenient=false] retains per-topic/partition errors in data
+   * @returns {Promise<object>} decoded response; no cache installation
+   * @throws {Error} original transport/auth/parse failure or guard refusal
    */
-  async metadata(topics = [], { guard } = {}) {
+  async metadata(topics = [], options = {}) {
+    const { guard, lenient = false, allowAutoTopicCreation = this.allowAutoTopicCreation } = options
     this.throwIfRefused(guard)
     const metadata = this.lookupRequest(apiKeys.Metadata, requests.Metadata)
     const shuffledTopics = shuffle(topics)
     return await this[PRIVATE.SEND_REQUEST](
-      metadata({ topics: shuffledTopics, allowAutoTopicCreation: this.allowAutoTopicCreation }),
+      metadata({ topics: shuffledTopics, allowAutoTopicCreation, lenient }),
       guard
     )
   }
@@ -727,7 +735,11 @@ module.exports = class Broker {
     this.throwIfRefused(guard)
     // The ceiling is permanent, not scaffolding: `Broker` is a public type and
     // `broker.produce({ topicData })` must keep working forever. A caller may still ask for less.
-    const ceiling = produceCeiling({ transactionalId, transactionVersion, topicIds })
+    const ceiling = produceCeiling({
+      transactionalId,
+      transactionVersion,
+      topicIds,
+    })
     const cap =
       ceiling === undefined
         ? maxVersion
@@ -741,7 +753,9 @@ module.exports = class Broker {
     const version =
       cap === undefined
         ? this.negotiatedVersion(apiKeys.Produce, requests.Produce)
-        : this.negotiatedVersion(apiKeys.Produce, requests.Produce, { [apiKeys.Produce]: cap })
+        : this.negotiatedVersion(apiKeys.Produce, requests.Produce, {
+            [apiKeys.Produce]: cap,
+          })
 
     if (ceiling === TRANSACTION_V2_PRODUCE_VERSION && version < TRANSACTION_V2_PRODUCE_VERSION) {
       const { minVersion, maxVersion: offeredMax } = this.versions[apiKeys.Produce]
@@ -784,7 +798,10 @@ module.exports = class Broker {
     return await this[PRIVATE.SEND_REQUEST](
       {
         ...protocolRequest,
-        response: { decode: protocolRequest.response.decode, parse: partitionResults },
+        response: {
+          decode: protocolRequest.response.decode,
+          parse: partitionResults,
+        },
       },
       guard
     )
@@ -827,6 +844,8 @@ module.exports = class Broker {
    *   this request. A request that supplies none is capped at the last version keyed by name, so a
    *   caller that knows nothing about topic ids keeps working unchanged.
    * @param {number} [request.maxVersion] an additional ceiling; the lower of the two wins.
+   * @param {(frameLength?: number) => Error|null} [request.guard] private pre-write check of the
+   *   consumer's fetch round; an error it returns rejects this one request before it is written
    * @returns {Promise<object>} `{ responses: [{ topicName, partitions }] }` at every version. An
    *   id this request did not ask for (a broker bug) comes back as `topicName: null` with its
    *   `topicId` intact; deciding what to do about that belongs to the caller, which is why nothing
@@ -844,7 +863,9 @@ module.exports = class Broker {
     rackId = '',
     checkCrcs = true,
     maxDecompressedBatchBytes,
+    guard,
   }) {
+    this.throwIfRefused(guard)
     // TODO: validate topics not null/empty
     // Ids are what v13+ is keyed by, so a request without them cannot be sent above v12. A caller
     // may still ask for something lower.
@@ -894,7 +915,7 @@ module.exports = class Broker {
       maxDecompressedBatchBytes,
     })
 
-    const response = await this[PRIVATE.SEND_REQUEST](built)
+    const response = await this[PRIVATE.SEND_REQUEST](built, guard)
 
     // `lookupRequest` returns a builder, so the negotiated version is only observable on the
     // request it built. Below v13 the response is already keyed by name and nothing is allocated.
@@ -1053,16 +1074,25 @@ module.exports = class Broker {
    * @returns {Promise}
    * @throws {KafkaJSProtocolError} INCONSISTENT_GROUP_PROTOCOL when the coordinator reports a
    *   protocol type (JoinGroup v7 and later) other than `protocolType`; a null report is accepted
+   * @param {object} [options] private request scope
+   * @param {() => Error|null} [options.guard] checked through both member-ID handshake sends
+   * @param {(memberId: string) => void} [options.onMemberIdRequired] called synchronously with the
+   *   id a MEMBER_ID_REQUIRED answer assigns, before the second send, so the caller keeps it
+   *   whether or not that send succeeds
    */
-  async joinGroup({
-    groupId,
-    sessionTimeout,
-    rebalanceTimeout,
-    memberId = '',
-    groupInstanceId = null,
-    protocolType = 'consumer',
-    groupProtocols,
-  }) {
+  async joinGroup(
+    {
+      groupId,
+      sessionTimeout,
+      rebalanceTimeout,
+      memberId = '',
+      groupInstanceId = null,
+      protocolType = 'consumer',
+      groupProtocols,
+    },
+    { guard, onMemberIdRequired } = {}
+  ) {
+    this.throwIfRefused(guard)
     const joinGroup = this.lookupRequest(apiKeys.JoinGroup, requests.JoinGroup)
     const makeRequest = (assignedMemberId = memberId) =>
       this[PRIVATE.SEND_REQUEST](
@@ -1074,7 +1104,8 @@ module.exports = class Broker {
           groupInstanceId,
           protocolType,
           groupProtocols,
-        })
+        }),
+        guard
       )
 
     let response
@@ -1085,6 +1116,7 @@ module.exports = class Broker {
         throw error
       }
 
+      onMemberIdRequired?.(error.memberId)
       response = await makeRequest(error.memberId)
     }
 
@@ -1143,18 +1175,24 @@ module.exports = class Broker {
    *   are given (a coordinator refuses a v5 request with either null); otherwise it is capped at v4.
    * @throws {KafkaJSProtocolError} INCONSISTENT_GROUP_PROTOCOL when the coordinator reports a
    *   protocol type or name other than the one sent; a null report is accepted
+   * @param {object} [options] private request scope
+   * @param {() => Error|null} [options.guard] checked through transmission of this assignment
    */
-  async syncGroup({
-    groupId,
-    generationId,
-    memberId,
-    groupInstanceId,
-    groupAssignment,
-    protocolType,
-    protocolName,
-    sessionTimeout,
-    rebalanceTimeout,
-  }) {
+  async syncGroup(
+    {
+      groupId,
+      generationId,
+      memberId,
+      groupInstanceId,
+      groupAssignment,
+      protocolType,
+      protocolName,
+      sessionTimeout,
+      rebalanceTimeout,
+    },
+    { guard } = {}
+  ) {
+    this.throwIfRefused(guard)
     const syncGroup = this.lookupRequestWithMax(
       apiKeys.SyncGroup,
       requests.SyncGroup,
@@ -1171,7 +1209,8 @@ module.exports = class Broker {
         protocolName,
         sessionTimeout,
         rebalanceTimeout,
-      })
+      }),
+      guard
     )
 
     assertSameProtocol(response.protocolType, protocolType)
@@ -1194,13 +1233,17 @@ module.exports = class Broker {
    * @property {number} partition
    * @property {number} [timestamp=-1]
    *
+   * @param {(frameLength?: number) => Error|null} [request.guard] private pre-write check of the
+   *   consumer's preparation round; an error it returns rejects this one request before it is written
    *
    * @returns {Promise}
    */
-  async listOffsets({ replicaId, isolationLevel, topics }) {
+  async listOffsets({ replicaId, isolationLevel, topics, guard }) {
+    this.throwIfRefused(guard)
     const listOffsets = this.lookupRequest(apiKeys.ListOffsets, requests.ListOffsets)
     const result = await this[PRIVATE.SEND_REQUEST](
-      listOffsets({ replicaId, isolationLevel, topics })
+      listOffsets({ replicaId, isolationLevel, topics }),
+      guard
     )
 
     // ListOffsets >= v1 will return a single `offset` rather than an array of `offsets` (ListOffsets V0).
@@ -1226,15 +1269,18 @@ module.exports = class Broker {
    * @public
    * @param {object} request
    * @param {{topic: string, partitions: {partition: number, currentLeaderEpoch?: number, leaderEpoch: number}[]}[]} request.topics
+   * @param {(frameLength?: number) => Error|null} [request.guard] private pre-write check of the
+   *   consumer's preparation round; an error it returns rejects this one request before it is written
    * @returns {Promise<object>} `{ throttleTime, clientSideThrottleTime, topics: [{ topic,
    *   partitions: [{ errorCode, partition, leaderEpoch, endOffset }] }] }`; `endOffset` is a string
    */
-  async offsetForLeaderEpoch({ topics }) {
+  async offsetForLeaderEpoch({ topics, guard }) {
+    this.throwIfRefused(guard)
     const offsetForLeaderEpoch = this.lookupRequest(
       apiKeys.OffsetForLeaderEpoch,
       requests.OffsetForLeaderEpoch
     )
-    return await this[PRIVATE.SEND_REQUEST](offsetForLeaderEpoch({ topics }))
+    return await this[PRIVATE.SEND_REQUEST](offsetForLeaderEpoch({ topics }), guard)
   }
 
   /**
@@ -1320,9 +1366,19 @@ module.exports = class Broker {
    *   partition that has a transactional offset commit pending, answering it with the retriable
    *   UNSTABLE_OFFSET_COMMIT instead (KIP-447, v7+; dropped below v7). The consumer asks for it;
    *   the admin client keeps the default.
+   * @param {(frameLength?: number) => Error|null} [request.guard] private pre-write check of the
+   *   consumer's preparation round; an error it returns rejects this one request before it is written
    * @returns {Promise}
    */
-  async offsetFetch({ groupId, topics, memberId = null, memberEpoch = -1, requireStable = false }) {
+  async offsetFetch({
+    groupId,
+    topics,
+    memberId = null,
+    memberEpoch = -1,
+    requireStable = false,
+    guard,
+  }) {
+    this.throwIfRefused(guard)
     const topicIds = offsetsTopicIds(topics)
     const offsetFetch = this.lookupRequestWithMax(
       apiKeys.OffsetFetch,
@@ -1330,7 +1386,15 @@ module.exports = class Broker {
       topicIds === undefined ? OFFSETS_TOPIC_NAMES_MAX_VERSION : undefined
     )
     return await this[PRIVATE.SEND_REQUEST](
-      offsetFetch({ groupId, topics, topicIds, memberId, memberEpoch, requireStable })
+      offsetFetch({
+        groupId,
+        topics,
+        topicIds,
+        memberId,
+        memberEpoch,
+        requireStable,
+      }),
+      guard
     )
   }
 

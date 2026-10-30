@@ -1,4 +1,5 @@
 const { MemberMetadata, MemberAssignment } = require('../../assignerProtocol')
+const partitionMetadata = require('../partitionMetadata')
 
 /**
  * RoundRobinAssigner: deals the partitions of `topics`, one topic after another in metadata order,
@@ -43,8 +44,10 @@ module.exports = ({ cluster }) => ({
    *                     }
    *                   ]
    *   A member that is dealt nothing is left out.
+   * @param {string[]} [group.groupTopics] sorted union; own topics stays unchanged
+   * @param {ReadonlyMap<string, object[]>} [group.groupTopicMetadata] authoritative when present
    */
-  async assign({ members, topics }) {
+  async assign({ members, topics, groupTopics, groupTopicMetadata }) {
     const membersCount = members.length
     const sortedMembers = members.map(({ memberId }) => memberId).sort()
     const subscriptions = new Map(
@@ -61,12 +64,12 @@ module.exports = ({ cluster }) => ({
     const assignment = {}
     let cursor = 0
 
-    for (const topic of topics) {
+    for (const topic of groupTopics ?? topics) {
       if (!sortedMembers.some((memberId) => subscribes(memberId, topic))) {
         continue
       }
 
-      for (const { partitionId } of cluster.findTopicPartitionMetadata(topic)) {
+      for (const { partitionId } of partitionMetadata(cluster, groupTopicMetadata, topic)) {
         while (!subscribes(sortedMembers[cursor % membersCount], topic)) {
           cursor++
         }

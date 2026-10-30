@@ -477,4 +477,30 @@ describe('Consumer > PositionValidator', () => {
       expect(validator.validatedAgainst(TOPIC, 0)).toEqual(5)
     })
   })
+
+  describe('release', () => {
+    const awaiting = (validator) => {
+      validator.request(TOPIC, 0, { offset: '10', trackedEpoch: 4, currentLeaderEpoch: 5 })
+      return { topic: TOPIC, partition: 0, entry: validator.entryOf(TOPIC, 0) }
+    }
+
+    it('returns its own pending entry to unvalidated', () => {
+      const validator = create()
+      validator.release([awaiting(validator)])
+      expect(validator.isAwaiting(TOPIC, 0)).toBe(false)
+      expect(validator.needsValidation(TOPIC, 0, 5)).toBe(true)
+    })
+
+    it('leaves a replacement or an already validated entry alone', () => {
+      const validator = create()
+      const stale = awaiting(validator)
+      validator.forgetTopic(TOPIC, [0])
+      const replacement = awaiting(validator)
+      validator.release([stale])
+      expect(validator.isAwaiting(TOPIC, 0)).toBe(true)
+      validator.markValidated(TOPIC, 0, 5)
+      validator.release([replacement])
+      expect(validator.validatedAgainst(TOPIC, 0)).toBe(5)
+    })
+  })
 })

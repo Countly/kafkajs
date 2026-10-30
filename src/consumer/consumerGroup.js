@@ -3,6 +3,7 @@ const sleep = require('../utils/sleep')
 const websiteUrl = require('../utils/websiteUrl')
 const arrayDiff = require('../utils/arrayDiff')
 const createRetry = require('../retry')
+const Generation = require('../producer/generation')
 
 const OffsetManager = require('./offsetManager')
 const OffsetOperations = require('./offsetManager/offsetOperations')
@@ -11,6 +12,8 @@ const ResetObligations = require('./offsetManager/resetObligations')
 const Batch = require('./batch')
 const SeekOffsets = require('./seekOffsets')
 const SubscriptionState = require('./subscriptionState')
+const IdleWait = require('./idleWait')
+const { FetchPreparation, fencedDelay } = require('./fetchPreparation')
 const PositionValidator = require('./positionValidator')
 const Outage = require('./outage')
 const {
@@ -41,6 +44,7 @@ const {
   stampOwnership,
   obsoleteOwnership,
   consumerStoppingError,
+  joinDeadlineError,
   REBALANCE_PATHS,
 } = require('./rebalanceErrorContract')
 const { EAGER } = require('./groupProtocol/interface')
@@ -89,6 +93,20 @@ const FETCH_TOPIC_NAMES_MAX_VERSION = 12
  * answer because a competing seek, commit or recreation reached the cell meanwhile.
  */
 const MAX_RESOLUTION_PASSES = 3
+
+/**
+ * How many node-filtered snapshots one `fetch(nodeId)` prepares at most. A routing change during
+ * the first yields once and prepares a replacement; after the second, only a snapshot that
+ * completed preparation is built, so churn can delay a round but never starve it.
+ */
+const MAX_PREPARATION_ATTEMPTS = 2
+
+/**
+ * @param {import('../producer/generation')} [fence] a run's terminal fence
+ * @returns {[{fence: import('../producer/generation')}]|[]} the options argument that binds a
+ *   cluster call to the run; none for an unfenced caller, which keeps its call shape
+ */
+const boundTo = (fence) => (fence ? [{ fence }] : [])
 
 module.exports = class ConsumerGroup {
   /**
@@ -307,7 +325,24 @@ module.exports = class ConsumerGroup {
     this.validationRetrier = createRetry({ retries: 2, maxRetryTime: 5000 })
 
     this.offsetManager = null
-    this.subscriptionState = new SubscriptionState()
+    /**
+     * Monotonic invalidation version for the inputs of node selection (leaders, preferred
+     * replicas, assignment). A prepared snapshot compares one integer to it. Never reset, so a
+     * snapshot of an older run can never look current.
+     * @type {number}
+     */
+    this.routingVersion = 0
+    /**
+     * Advances when the assignment, ownership or a topic incarnation is replaced, not for an
+     * ordinary leader move: it tells a prepared request that can still be sent after a routing
+     * change from one whose positions were replaced.
+     * @type {number}
+     */
+    this.preparationEpoch = 0
+    this.subscriptionState = new SubscriptionState({
+      onAssignmentChange: () => this.preparationChanged(),
+    })
+    this.idleWait = this.createRun()
 
     /** @type {Object|null} set by `attach`, absent until a `Runner` exists */
     this.rebalanceCoordinator = null
@@ -385,6 +420,16 @@ module.exports = class ConsumerGroup {
 
   set memberId(value) {
     this.groupMembership.memberId = value
+  }
+
+  /**
+   * Forgets the member id, for an UNKNOWN_MEMBER_ID answer or a local discard.
+   * @param {number} [revision] the membership revision the answered request began under; the
+   *   current membership when absent
+   * @returns {boolean} whether the id was forgotten
+   */
+  forgetMemberId(revision) {
+    return this.groupMembership.forgetMemberId(revision)
   }
 
   get generationId() {
@@ -499,12 +544,62 @@ module.exports = class ConsumerGroup {
   }
 
   /**
+   * Creates one run's idle state and subscribes it to routing changes. The run owns the
+   * unsubscribe: disposing it removes the listener synchronously, so a stopped, restarted or
+   * disposed consumer leaves none behind.
+   * A cluster without `onRoutingChange` publishes nothing: such a run is woken only by its own
+   * lifecycle events.
+   * @private
+   * @returns {IdleWait} an open run with its routing subscription registered on its fence
+   */
+  createRun() {
+    const run = new IdleWait()
+    const unsubscribe = this.cluster.onRoutingChange?.(() => {
+      if (!run.fence.closed) this.routingChanged()
+    })
+    if (unsubscribe) run.fence.register(unsubscribe)
+    return run
+  }
+
+  /**
+   * Publishes a change to the inputs of node selection: advances the routing version so every
+   * prepared snapshot becomes stale, then wakes current idle waiters. Neither saves a wake.
+   * @returns {void}
+   */
+  routingChanged() {
+    this.routingVersion += 1
+    this.idleWait.wake()
+  }
+
+  /**
+   * Publishes a replacement of the assignment, ownership or a topic incarnation: a preparation
+   * that began earlier can no longer be sent, and routing is stale as well.
+   * @returns {void}
+   */
+  preparationChanged() {
+    this.preparationEpoch += 1
+    this.routingChanged()
+  }
+
+  /** Creates fresh run-owned idle state after the previous run was retired. @returns {void} */
+  startIdleWait() {
+    this.roundContext?.retire(consumerStoppingError())
+    this.idleWait.dispose()
+    this.idleWait = this.createRun()
+    this.subscriptionState.clearPauses()
+    this.retainSubscription(this.topicsSubscribed)
+  }
+
+  /**
    * Tells the membership the consumer is shutting down, so a join waiting on the coordinator is
    * rejected rather than waiting for a heartbeat chain that is about to be cancelled. Cancels
    * queued sentinel seeks and pending sentinel resolutions for either group protocol.
    * @returns {void}
    */
   onStopRequested() {
+    this.roundContext?.retire(consumerStoppingError())
+    this.idleWait.dispose()
+    this.subscriptionState.clearPauses()
     for (const [key, offset] of this.seekOffset) {
       if (offset === '-2' || offset === '-1') {
         this.seekOffset.delete(key)
@@ -601,11 +696,16 @@ module.exports = class ConsumerGroup {
    * Pause state survives either way: `subscriptionState.update()` replaces the assignment only.
    *
    * @param {{ assignment: Object, userData?: Buffer|null }} result the decoded sync result
-   * @param {{ rebuildOffsets?: boolean }} [options] `rebuildOffsets: false` selects the
+   * @param {{ rebuildOffsets?: boolean, round?: object }} [options] `rebuildOffsets: false` selects the
    *   incremental apply; it still builds the first manager, because there is nothing to keep
    * @returns {Promise<import('./groupProtocol/interface').RebalanceResult>}
    */
-  async applyRebalanceResult(result, { rebuildOffsets = true } = {}) {
+  async applyRebalanceResult(result, { rebuildOffsets = true, round } = {}) {
+    const check = () => {
+      const error = round?.guard()
+      if (error) throw error
+    }
+    check()
     const { groupId, generationId, memberId, topicsSubscribed, coordinator } = this
     const decodedAssignment = result.assignment
     this.logger.debug('Received assignment', {
@@ -666,25 +766,28 @@ module.exports = class ConsumerGroup {
         // If the consumer is not aware of all assigned partitions, refresh metadata
         // and update the list of partitions per subscribed topic. It's enough to perform
         // this operation once since refresh metadata will update metadata for all topics
-        await this.cluster.refreshMetadata()
+        await this.cluster.refreshMetadata({ guard: round?.guard })
+        check()
         this.partitionsPerSubscribedTopic = this.generatePartitionsPerSubscribedTopic()
         break
       }
     }
-
-    this.topics = currentMemberAssignment.map(({ topic }) => topic)
 
     const { added, revoked } = this.groupMembership.diffAssignment(currentMemberAssignment)
 
     // Before anything prunes them, and before `updateAssignment` replaces the membership the
     // offset manager commits under.
     if (!rebuildOffsets && revoked.length) {
-      await this.commitBeforeRelease(revoked)
+      await this.commitBeforeRelease(revoked, { round })
+      check()
     }
 
     // Narrowed before the apply mutates anything: a revoked partition must stop being advertised
     // and stop accepting resolved offsets the instant the apply decides it is gone. `setOwned`
     // below is the widening half.
+    check()
+    this.ownership?.renew()
+    this.topics = currentMemberAssignment.map(({ topic }) => topic)
     this.groupMembership.narrowOwned(currentMemberAssignment)
 
     const memberAssignment = currentMemberAssignment.reduce(
@@ -726,6 +829,7 @@ module.exports = class ConsumerGroup {
           generationId: this.generationId,
           memberId: this.memberId,
           coordinator: this.coordinator,
+          revision: this.groupMembership.membershipRevision,
         }),
         isStopping: () => this.isStopping(),
         isRebalancePending: () => Boolean(this.rebalanceCoordinator?.verdict),
@@ -791,8 +895,138 @@ module.exports = class ConsumerGroup {
 
     this.groupMembership.setOwned(currentMemberAssignment)
     this.clearStaleAssignmentPending()
+    this.pruneAssignmentState()
 
     return { assignment: currentMemberAssignment, added, revoked }
+  }
+
+  /**
+   * Captures the run and one monotonic round budget before any round callback.
+   * @returns {object} immutable identity plus guarded remaining-time waits
+   * @throws {Error} an expired wait rejects with the existing retriable join-deadline error
+   */
+  beginRebalanceRound() {
+    this.roundContext?.retire()
+    const run = this.idleWait
+    const leaderAttempt = Symbol('leader attempt')
+    const roundDeadlineAt = performance.now() + this.rebalanceTimeout
+    const expired = joinDeadlineError({
+      rebalanceTimeoutMs: this.rebalanceTimeout,
+    })
+    const waiters = new Set()
+    const fence = new Generation()
+    let retired = null
+    let issued = false
+    let currentAttempt = leaderAttempt
+    const round = {
+      run,
+      leaderAttempt,
+      roundDeadlineAt,
+      /** Closed with the round, so work started for it stops dialling and retrying. */
+      fence,
+      allowAutoTopicCreation:
+        this.regexSubscription != null || this.subscribedTopicRegex != null
+          ? false
+          : this.cluster.allowAutoTopicCreation,
+      /**
+       * Captures a unique retry identity without renewing the round deadline.
+       * @returns {object} guarded leader context; the first keeps the pre-hook identity
+       */
+      attempt: () => {
+        const token = issued ? Symbol('leader attempt') : leaderAttempt
+        issued = true
+        currentAttempt = token
+        const guard = () => round.guard() || (currentAttempt !== token ? expired : null)
+        return Object.freeze({
+          ...round,
+          leaderAttempt: token,
+          guard,
+          wait: (work) =>
+            round.wait(async () => {
+              const before = guard()
+              if (before) throw before
+              const result = await work()
+              const after = guard()
+              if (after) throw after
+              return result
+            }),
+        })
+      },
+      /** @returns {Error|null} captured retirement or actual-time refusal */
+      guard: () =>
+        retired ||
+        (this.idleWait !== run || run.disposed || this.isStopping()
+          ? consumerStoppingError()
+          : this.roundContext !== round || performance.now() >= roundDeadlineAt
+            ? expired
+            : null),
+      /** @param {Error} [error] terminal reason; first reason wins @returns {void} */
+      retire: (error = expired) => {
+        if (retired) return
+        retired = error
+        fence.close(error)
+        for (const reject of waiters) reject(error)
+        waiters.clear()
+      },
+      /**
+       * Sleeps within the original budget and removes the owned timer on every exit.
+       * @param {number} ms requested backoff or polling delay in milliseconds
+       * @returns {Promise<void>} resolves after the delay while the round remains current
+       * @throws {Error} stop, replacement or original round expiry
+       */
+      delay: async (ms) => {
+        let timer
+        try {
+          await round.wait(
+            () =>
+              new Promise((resolve) => {
+                timer = setTimeout(resolve, ms)
+              })
+          )
+        } finally {
+          clearTimeout(timer)
+        }
+      },
+      /**
+       * Bounds one continuation with the unchanged round deadline.
+       * @param {() => Promise<*>} work lazy work, never started after refusal
+       * @returns {Promise<*>} original result or failure
+       * @throws {Error} original work failure, stop, replacement or join expiry
+       */
+      wait: async (work) => {
+        const check = () => {
+          const error = round.guard()
+          if (error) throw error
+        }
+        check()
+        let timer, rejectWait
+        const stopped = new Promise((_, reject) => {
+          rejectWait = reject
+          waiters.add(reject)
+          timer = setTimeout(
+            () => round.retire(expired),
+            Math.max(0, roundDeadlineAt - performance.now())
+          )
+        })
+        const task = Promise.resolve()
+          .then(() => {
+            check()
+            return work()
+          })
+          .then((result) => {
+            check()
+            return result
+          })
+        try {
+          return await Promise.race([task, stopped])
+        } finally {
+          waiters.delete(rejectWait)
+          clearTimeout(timer)
+        }
+      },
+    }
+    this.roundContext = Object.freeze(round)
+    return round
   }
 
   /**
@@ -815,14 +1049,15 @@ module.exports = class ConsumerGroup {
    * @returns {Promise<{ assignment: Object, userData: Buffer|null }>} the decoded sync result
    * @throws {Error} what the join retrier gave up with, when it is not a loss this method rides out
    *   or the outage has lasted the session timeout; `CONSUMER_STOPPING` when a stop came during one
+   * @param {object} [round] original pre-callback round identity and deadline
    */
-  async joinAndSync() {
-    if (this.kind === 'consumer') return this.joinAndSyncAttempt()
+  async joinAndSync(round = this.beginRebalanceRound()) {
+    if (this.kind === 'consumer') return this.joinAndSyncAttempt(round)
     const outage = new Outage(this.sessionTimeout)
 
     while (true) {
       try {
-        return await this.joinAndSyncAttempt()
+        return await this.joinAndSyncAttempt(round)
       } catch (e) {
         if (
           this.isStopping() &&
@@ -831,7 +1066,7 @@ module.exports = class ConsumerGroup {
         ) {
           throw consumerStoppingError()
         }
-        if (!outage.absorbs(e)) throw e
+        if (round.guard() || !outage.absorbs(e)) throw e
 
         const delay = this.backoff.initial()
         this.logger.warn('Lost the group coordinator while joining, trying again', {
@@ -840,7 +1075,7 @@ module.exports = class ConsumerGroup {
           error: describeThrown(e),
           delay,
         })
-        await sleep(delay)
+        await round.delay(delay)
         if (this.isStopping()) throw consumerStoppingError()
       }
     }
@@ -851,19 +1086,33 @@ module.exports = class ConsumerGroup {
    * @private
    * @returns {Promise<{ assignment: Object, userData: Buffer|null }>} the decoded sync result
    * @throws {Error} what the retrier gave up with
+   * @param {object} round original round; retries create attempts without renewing its time
    */
-  joinAndSyncAttempt() {
+  joinAndSyncAttempt(round) {
     return this.retrier(async (bail) => {
+      const { membershipRevision } = this.groupMembership
+      const attempt = round.attempt()
       try {
-        return await this.groupMembership.rebalance({
-          topics: this.topics,
-          topicsSubscribed: this.topicsSubscribed,
-          beforeSync: () => {
-            this.partitionsPerSubscribedTopic = this.generatePartitionsPerSubscribedTopic()
-          },
-          growSubscription: (names) => this.growSubscription(names),
-        })
+        return await attempt.wait(() =>
+          this.groupMembership.rebalance({
+            topics: this.topics,
+            topicsSubscribed: this.topicsSubscribed,
+            beforeSync: () => {
+              const refusal = attempt.guard()
+              if (refusal) throw refusal
+              this.partitionsPerSubscribedTopic = this.generatePartitionsPerSubscribedTopic()
+            },
+            growSubscription: (names) => {
+              const refusal = attempt.guard()
+              if (refusal) throw refusal
+              return this.growSubscription(names)
+            },
+            round: attempt,
+          })
+        )
       } catch (e) {
+        const refusal = attempt.guard()
+        if (refusal) return bail(e)
         if (isRebalancing(e)) {
           throw new KafkaJSError(e)
         }
@@ -872,7 +1121,7 @@ module.exports = class ConsumerGroup {
           // KIP-848 members keep their id for life: the coordinator answers 25 for an epoch it no
           // longer recognises, not for an id it wants replaced.
           if (this.kind === 'classic') {
-            this.memberId = null
+            this.forgetMemberId(membershipRevision)
           }
 
           throw new KafkaJSError(e)
@@ -886,15 +1135,49 @@ module.exports = class ConsumerGroup {
         }
 
         // A join the membership gave up on because the coordinator took longer than the rebalance
-        // timeout to answer. Retried rather than fatal: the next attempt starts a fresh deadline,
-        // and a round that never settles is what the deadline exists to prevent.
+        // timeout to answer. A retry replaces only its token within the original round budget;
+        // the round's own expiry is terminal for this chain.
         if (e.type === 'JOIN_DEADLINE_EXCEEDED') {
           throw new KafkaJSError(e)
         }
 
         bail(e)
       }
-    })
+    }, round)
+  }
+
+  /**
+   * Applies a subscription lifecycle, never a rebalance assignment.
+   * @param {string[]} topics accepted names with configuration already installed
+   * @returns {void}
+   */
+  retainSubscription(topics) {
+    this.topicsSubscribed = [...topics]
+    this.subscriptionState.retainTopics(topics)
+    const live = new Set(topics)
+    for (const topic of Object.keys(this.topicConfigurations)) {
+      if (!live.has(topic)) delete this.topicConfigurations[topic]
+    }
+  }
+
+  /** Prunes assignment-owned routing and queued seeks after either apply. @returns {void} */
+  pruneAssignmentState() {
+    const assigned = this.subscriptionState.assignedPartitionSetsByTopic
+    for (const topic of Object.keys(this.preferredReadReplicasPerTopicPartition)) {
+      if (!assigned.get(topic)?.size) delete this.preferredReadReplicasPerTopicPartition[topic]
+    }
+    for (const [key] of this.seekOffset) {
+      const [topic, partition] = JSON.parse(key)
+      if (!assigned.get(topic)?.has(partition)) this.seekOffset.delete(key)
+    }
+    if (this.kind === 'consumer' && this.subscribedTopicRegex != null) {
+      this.retainSubscription([
+        ...new Set([
+          ...this.groupMembership.subscribedTopicNames,
+          ...this.groupMembership.grownTopicNames,
+        ]),
+      ])
+    }
   }
 
   /**
@@ -949,9 +1232,11 @@ module.exports = class ConsumerGroup {
    * than once, the latest offset will be used on the next fetch.
    *
    * @param {import("../../types").TopicPartitionOffset} topicPartitionOffset
+   * @returns {void} queues intent and wakes idle fetchers; resolution remains next-round work
    */
   seek({ topic, partition, offset }) {
     this.seekOffset.set(topic, partition, offset)
+    this.idleWait.wake()
   }
 
   /**
@@ -975,6 +1260,8 @@ module.exports = class ConsumerGroup {
    * @returns {void}
    */
   invalidateTopic(topic) {
+    this.subscriptionState.retireTopic(topic)
+    this.preparationChanged()
     if (!this.offsetManager || !Object.hasOwn(this.offsetManager.memberAssignment, topic)) {
       return
     }
@@ -1010,11 +1297,17 @@ module.exports = class ConsumerGroup {
     this.subscriptionState.pause(topicPartitions)
   }
 
+  /**
+   * Resumes the requested pause intent and wakes idle fetchers in this run.
+   * @param {import('../../types').TopicPartitions[]} topicPartitions topics or partitions
+   * @returns {void} does not clear a corruption halt or cancel an in-flight Fetch
+   */
   resume(topicPartitions) {
     this.logger.info(`Resuming fetching from ${topicPartitions.length} topics`, {
       topicPartitions,
     })
     this.subscriptionState.resume(topicPartitions)
+    this.idleWait.wake()
   }
 
   assigned() {
@@ -1098,29 +1391,43 @@ module.exports = class ConsumerGroup {
    * @param {import('./groupProtocol/interface').TopicPartitions[]} partitions the partitions this
    *   member is about to stop owning
    * @returns {Promise<void>} always resolves
+   * @param {object} [options] private round scope
+   * @param {object} [options.round] owns the original monotonic budget, polls and transmission
    */
-  async commitBeforeRelease(partitions) {
+  async commitBeforeRelease(partitions, { round } = {}) {
     if (!this.autoCommit || !this.offsetManager || !partitions.length) {
       return
     }
 
-    const deadline = Date.now() + this.rebalanceTimeout
+    const deadline = round ? round.roundDeadlineAt : Date.now() + this.rebalanceTimeout
+    const capturedManager = this.offsetManager
+    const current = () => !round || (!round.guard() && this.offsetManager === capturedManager)
 
     for (;;) {
+      if (!current()) return
+      const manager = round ? capturedManager : this.offsetManager
       // The manager's membership snapshot is still the previous generation at this point: it is
       // written at construction and at `updateAssignment`, and this call deliberately precedes
       // both.
-      this.offsetManager.useMembership({
+      manager.useMembership({
         generationId: this.generationId,
         memberId: this.memberId,
         coordinator: this.coordinator,
       })
 
       try {
-        await this.offsetManager.commitOffsets({}, { partitions })
+        if (!current()) return
+        const commit = () => {
+          if (!current()) return
+          return manager.commitOffsets({}, { partitions, guard: round?.guard })
+        }
+        if (round) await round.wait(commit)
+        else await commit()
         return
       } catch (e) {
-        if (!(await this.awaitFreshEpochFor(e, deadline))) {
+        if (!current()) return
+        if (!(await this.awaitFreshEpochFor(e, deadline, round))) {
+          if (!current()) return
           this.logger.warn(
             'Commit before releasing partitions failed; proceeding with the rebalance',
             {
@@ -1144,22 +1451,32 @@ module.exports = class ConsumerGroup {
    * member a newer one - re-sending the same epoch would draw the same answer forever.
    * @private
    * @param {Error} error
-   * @param {number} deadline `Date.now()` past which the commit is abandoned
-   * @returns {Promise<boolean>}
+   * @param {number} deadline monotonic round deadline, or Date.now() without a round
+   * @param {object} [round] captured round; cancels polling on expiry, stop or replacement
+   * @returns {Promise<boolean>} false after retirement; standalone leave behavior is unchanged
    */
-  async awaitFreshEpochFor(error, deadline) {
+  async awaitFreshEpochFor(error, deadline, round) {
     if (this.kind !== 'consumer' || error.type !== STALE_MEMBER_EPOCH) {
       return false
     }
 
     const sentUnder = sentGeneration(error)
 
-    while (Date.now() < deadline && !this.isStopping()) {
+    while ((round ? performance.now() : Date.now()) < deadline && !this.isStopping()) {
+      if (round?.guard()) return false
       if (this.generationId > 0 && this.generationId !== sentUnder) {
         return true
       }
 
-      await sleep(STALE_EPOCH_POLL_INTERVAL)
+      if (round) {
+        try {
+          await round.delay(STALE_EPOCH_POLL_INTERVAL)
+        } catch (_) {
+          return false
+        }
+      } else {
+        await sleep(STALE_EPOCH_POLL_INTERVAL)
+      }
     }
 
     return false
@@ -1198,33 +1515,40 @@ module.exports = class ConsumerGroup {
    * Errors are not propagated: anything thrown is handed to `recoverFromFetch`, which either
    * recovers or rethrows, and the round then yields no batches.
    *
+   * Positions are prepared by `prepareFetch`, at most twice per call, and only that prepared
+   * snapshot is built. A stop or restart of the run, or a preparation replaced under it, returns
+   * an empty round without error; an idle round sleeps only while its snapshot is current.
+   *
+   * The run's fence follows the call to its end: every refresh, hint and recovery the response
+   * starts is bound to it, and each continuation checks it before it publishes, so a response
+   * still being processed at stop changes nothing in a replacement run and returns no batch.
+   *
    * @param {number} nodeId the broker to fetch from
    * @returns {Promise<Batch[]>} one batch per fetched partition; empty when nothing was owed,
    *   when the round was recovered from an error, or when every response entry was dropped
    */
   async fetch(nodeId) {
+    const run = this.idleWait
     const ownershipToken = this.ownership.token()
+    let prepared = null
     try {
-      await this.cluster.refreshMetadataIfNecessary()
-      this.checkForStaleAssignment()
-
-      let topicPartitions = this.subscriptionState.assigned()
-      topicPartitions = this.filterPartitionsByNode(nodeId, topicPartitions)
-      // Captured before anything is awaited: this is the assignment the request below is built
-      // from, and it is what every batch this round produces is stamped with.
-      const assignmentEpoch = this.assignmentEpoch
-      const acquireClock = this.acquireClock
-
-      await this.seekOffsets(topicPartitions)
-      await this.validatePositions(topicPartitions)
+      prepared = await this.prepareFetch(nodeId, run, ownershipToken)
+      if (!prepared) return []
 
       // The request is built from the positions as they stand now; a corruption marker in its
       // answer is refused if a seek, a reset or a recreation reaches the partition after this.
+      prepared.check()
+      const { assignmentEpoch, acquireClock } = prepared
       const requestClock = this.acquireClock
-      const requests = this.buildFetchRequests(topicPartitions)
+      const requests = this.buildFetchRequests(prepared.parts)
 
       if (!requests.length) {
-        await sleep(this.maxWaitTime)
+        // Registers only while the snapshot is current: an invalidated one returns through the
+        // fetcher's yield floor and a fresh snapshot is captured next round.
+        await run.wait(
+          prepared.idleDuration(this.maxWaitTime),
+          () => !run.fence.closed && prepared.isCurrent()
+        )
         return []
       }
 
@@ -1246,13 +1570,15 @@ module.exports = class ConsumerGroup {
         })
       }
 
-      const broker = await this.cluster.findBroker({ nodeId })
+      const broker = await run.fence.wait(this.cluster.findBroker({ nodeId, fence: run.fence }))
+      prepared.check()
 
       const {
         errorCode: topLevelErrorCode,
         responses,
         nodeEndpoints,
       } = await broker.fetch({
+        guard: prepared.guard,
         maxWaitTime: this.maxWaitTime,
         minBytes: this.minBytes,
         maxBytes: this.maxBytes,
@@ -1265,10 +1591,14 @@ module.exports = class ConsumerGroup {
         maxDecompressedBatchBytes: this.maxDecompressedBatchBytes,
       })
 
+      // A response that outlived its run is dropped whole: it must not apply hints, preferred
+      // replicas or offsets to a replacement run, and the wire request is not cancelled.
+      if (run.fence.closed) return []
+
       // The top-level code is only decoded from Fetch v7 up, so an older response carries none -
       // and `failure(undefined)` is true, which is why the guard is on the field's presence.
       if (topLevelErrorCode != null && failure(topLevelErrorCode)) {
-        await this.handleFetchTopLevelError(topLevelErrorCode)
+        await this.handleFetchTopLevelError(topLevelErrorCode, run.fence)
         return []
       }
 
@@ -1310,16 +1640,19 @@ module.exports = class ConsumerGroup {
           debug,
           assignmentEpoch,
           requestClock,
+          fence: run.fence,
         }
 
         for (const partitionData of partitions) {
           const partitionNeedsRefresh = await this.handleFetchedPartition(partitionData, context)
+          run.fence.check()
           needsRefresh = needsRefresh || partitionNeedsRefresh
         }
       }
 
       if (needsRefresh) {
-        await this.cluster.refreshMetadata()
+        await this.cluster.refreshMetadata({ fence: run.fence })
+        run.fence.check()
       }
 
       for (const batch of batches) {
@@ -1330,11 +1663,87 @@ module.exports = class ConsumerGroup {
 
       return batches
     } catch (e) {
+      // A retired run, or a preparation replaced under it, is a local outcome, not a failure.
+      if (run.fence.closed || prepared?.isSuperseded(e)) return []
       stampOwnership(e, ownershipToken)
       if (obsoleteOwnership(this.ownership, e)) throw e
-      await this.recoverFromFetch(e)
+      try {
+        await this.recoverFromFetch(e, run.fence)
+      } catch (recoveryError) {
+        if (run.fence.closed) return []
+        throw recoveryError
+      }
       return []
     }
+  }
+
+  /**
+   * Prepares the node's partitions for one Fetch, in at most `MAX_PREPARATION_ATTEMPTS` attempts.
+   *
+   * Each attempt captures one node-filtered snapshot with the routing version and the batch
+   * stamps it was taken under, then seeks and validates exactly those partitions. If routing
+   * changed meanwhile and an attempt remains, it yields once and prepares a replacement. After the
+   * last attempt it returns the snapshot that actually completed preparation, even if routing
+   * moved again: it never substitutes a newer filter result or admits a partition it did not
+   * prepare. The unchanged path costs one filter and scalar checks.
+   *
+   * Every wait is released when the run's fence closes, and every continuation checks the
+   * snapshot's guard, so a pending preparation never outlives a stop or restart.
+   *
+   * @private
+   * @param {number} nodeId the broker this round fetches from
+   * @param {IdleWait} run the run that owns this call, captured at entry
+   * @param {number} ownershipToken the membership identity captured before any await
+   * @returns {Promise<FetchPreparation|null>} the prepared snapshot, or null when there is
+   *   nothing safe to send: the run was retired or the last preparation was replaced
+   * @throws {Error} a real failure of the live run, for `recoverFromFetch`
+   */
+  async prepareFetch(nodeId, run, ownershipToken) {
+    run.fence.check()
+    await run.fence.wait(this.cluster.refreshMetadataIfNecessary({ fence: run.fence }))
+    run.fence.check()
+    this.checkForStaleAssignment()
+
+    let prepared = null
+    for (let attempt = 1; attempt <= MAX_PREPARATION_ATTEMPTS; attempt++) {
+      // Captured before anything is awaited: this is the assignment the request is built from,
+      // and it is what every batch this round produces is stamped with.
+      const snapshot = this.captureFetchPreparation(nodeId, run, ownershipToken)
+      prepared = null
+      try {
+        snapshot.check()
+        await run.fence.wait(this.seekOffsets(snapshot.parts, snapshot))
+        snapshot.check()
+        await run.fence.wait(this.validatePositions(snapshot.parts, snapshot))
+        snapshot.check()
+        prepared = snapshot
+      } catch (error) {
+        if (run.fence.closed) return null
+        if (!snapshot.isSuperseded(error)) throw error
+      }
+
+      if ((prepared && prepared.isCurrent()) || attempt === MAX_PREPARATION_ATTEMPTS) break
+      await fencedDelay(run.fence)
+      run.fence.check()
+    }
+
+    return prepared
+  }
+
+  /**
+   * Takes one node-filtered snapshot of the assignment. The filter runs once, with its lazy
+   * preferred-replica expiry cleanup, and the routing version is captured after it so that cleanup
+   * does not invalidate the snapshot it belongs to.
+   * @private
+   * @param {number} nodeId the broker this round fetches from
+   * @param {IdleWait} run the owning run
+   * @param {number} ownershipToken the membership identity captured by `fetch`
+   * @returns {FetchPreparation} the snapshot with its stamps
+   */
+  captureFetchPreparation(nodeId, run, ownershipToken) {
+    const routing = { expiresAt: Infinity }
+    const parts = this.filterPartitionsByNode(nodeId, this.subscriptionState.assigned(), routing)
+    return new FetchPreparation(this, run, parts, routing.expiresAt, ownershipToken)
   }
 
   /**
@@ -1422,12 +1831,14 @@ module.exports = class ConsumerGroup {
    *
    * @private
    * @param {number} errorCode the response's top-level code, already known to be a failure
+   * @param {import('../producer/generation')} [fence] the run that received the response: its
+   *   close ends the refresh, and a late answer installs nothing
    * @returns {Promise<void>} resolves once the round can be abandoned with no batches
    * @throws {Error} the error the code maps to, for a code with no classification: that keeps the
    *   recovery path a request-level fetch error has always taken - refresh and rejoin for stale
-   *   metadata, crash for anything else.
+   *   metadata, crash for anything else; or the fence's close error.
    */
-  async handleFetchTopLevelError(errorCode) {
+  async handleFetchTopLevelError(errorCode, fence) {
     if (topLevelFetchAction(errorCode) === 'throw') {
       throw createErrorFromCode(errorCode)
     }
@@ -1438,7 +1849,7 @@ module.exports = class ConsumerGroup {
       errorCode,
     })
 
-    await this.cluster.refreshMetadata()
+    await this.cluster.refreshMetadata(...boundTo(fence))
   }
 
   /**
@@ -1468,8 +1879,10 @@ module.exports = class ConsumerGroup {
    * @param {boolean} context.debug whether debug logging is on for this round
    * @param {number} context.assignmentEpoch the assignment the round began under
    * @param {number} context.requestClock the acquisition clock when the request was built
+   * @param {import('../producer/generation')} [context.fence] the terminal fence of the run that
+   *   received the response; the recovery and hint work it starts is bound to it
    * @returns {Promise<boolean>} whether this partition asks for a metadata refresh
-   * @throws {Error} the error an unclassified partition code maps to
+   * @throws {Error} the error an unclassified partition code maps to, or the fence's close error
    */
   async handleFetchedPartition(partitionData, context) {
     const { topicName, topicRequestData, preferredReadReplicas, nodeEndpoints, batches, debug } =
@@ -1498,7 +1911,7 @@ module.exports = class ConsumerGroup {
       if (action === 'offset-out-of-range') {
         // The existing recovery, for this partition only: drop the preferred replica if one is
         // set, otherwise reset per the topic's own fromBeginning.
-        await this.recoverFromOffsetOutOfRange({ topic: topicName, partition })
+        await this.recoverFromOffsetOutOfRange({ topic: topicName, partition }, context.fence)
       } else if (action === 'skip-and-forget-epoch') {
         // The client is ahead of this broker. Defending the cached epoch would make every retry
         // resend the same rejected value; forgetting it makes the next request carry -1 and the
@@ -1516,7 +1929,8 @@ module.exports = class ConsumerGroup {
           topicName,
           partition,
           partitionData.currentLeader,
-          nodeEndpoints
+          nodeEndpoints,
+          context.fence
         )
 
         // A partition whose hint was usable already knows where to go next round; one whose hint
@@ -1562,6 +1976,7 @@ module.exports = class ConsumerGroup {
         nodeId: preferredReadReplica,
         expireAt: Date.now() + this.metadataMaxAge,
       }
+      if (currentPreferredReadReplica !== preferredReadReplica) this.routingChanged()
     }
 
     if (
@@ -1662,11 +2077,13 @@ module.exports = class ConsumerGroup {
   /**
    * Recovers from an error thrown by a fetch round, or rethrows it.
    * @param {Error} e
+   * @param {import('../producer/generation')} [fence] the run that failed: its refreshes are bound
+   *   to it, and it is checked before a rejoin is requested, so a retired run asks for nothing
    * @returns {Promise<void>}
    * @throws {Error} `e` itself when it is not one of the errors this method knows how to recover
-   *   from
+   *   from, or the fence's close error
    */
-  async recoverFromFetch(e) {
+  async recoverFromFetch(e, fence) {
     if (STALE_METADATA_ERRORS.includes(e.type) || e.name === 'KafkaJSTopicMetadataNotLoaded') {
       this.logger.debug('Stale cluster metadata, refreshing...', {
         groupId: this.groupId,
@@ -1674,7 +2091,8 @@ module.exports = class ConsumerGroup {
         error: e.message,
       })
 
-      await this.cluster.refreshMetadata()
+      await this.cluster.refreshMetadata(...boundTo(fence))
+      fence?.check()
       this.requestResync(e)
       return
     }
@@ -1692,7 +2110,7 @@ module.exports = class ConsumerGroup {
     }
 
     if (e.name === 'KafkaJSOffsetOutOfRange') {
-      await this.recoverFromOffsetOutOfRange(e)
+      await this.recoverFromOffsetOutOfRange(e, ...(fence ? [fence] : []))
       return
     }
 
@@ -1703,7 +2121,8 @@ module.exports = class ConsumerGroup {
 
     if (e.name === 'KafkaJSBrokerNotFound' || e.name === 'KafkaJSConnectionClosedError') {
       this.logger.debug(`${e.message}, refreshing metadata and retrying...`)
-      await this.cluster.refreshMetadata()
+      await this.cluster.refreshMetadata(...boundTo(fence))
+      fence?.check()
       return
     }
 
@@ -1799,9 +2218,12 @@ module.exports = class ConsumerGroup {
    * @param {{ leaderId: number, leaderEpoch: number }|null} currentLeader
    * @param {{ nodeId: number, host: string, port: number, rack: string|null }[]} [nodeEndpoints]
    *   absent below Fetch v16, empty on a v16+ response that carried no hint
+   * @param {import('../producer/generation')} [fence] the run that received the response: its
+   *   close stops the endpoint work and a late answer is neither installed nor published
    * @returns {Promise<boolean>} true when the hint was applied and no refresh is needed for it
+   * @throws {Error} the fence's close error
    */
-  async applyFetchLeaderHint(topic, partition, currentLeader, nodeEndpoints) {
+  async applyFetchLeaderHint(topic, partition, currentLeader, nodeEndpoints, fence) {
     if (currentLeader == null || currentLeader.leaderId === -1) {
       return false
     }
@@ -1823,16 +2245,22 @@ module.exports = class ConsumerGroup {
       return false
     }
 
-    return await this.cluster.applyLeaderHint({
-      topic,
-      partition,
-      leaderId,
-      leaderEpoch,
-      nodeEndpoints: endpoints,
-    })
+    return await this.cluster.applyLeaderHint(
+      { topic, partition, leaderId, leaderEpoch, nodeEndpoints: endpoints },
+      ...boundTo(fence)
+    )
   }
 
-  async recoverFromOffsetOutOfRange(e) {
+  /**
+   * Recovers one partition from `OFFSET_OUT_OF_RANGE`: drops a preferred read replica, or else
+   * resets the partition to its topic's default offset.
+   * @param {{topic: string, partition: number}} e the partition that was out of range
+   * @param {import('../producer/generation')} [fence] the run that saw it: the reset commit is
+   *   bound to it, and a retired run neither commits nor marks the partition changed
+   * @returns {Promise<void>}
+   * @throws {Error} the fence's close error
+   */
+  async recoverFromOffsetOutOfRange(e, fence) {
     // If we are fetching from a follower try with the leader before resetting offsets.
     // The stored value is { nodeId, expireAt } (see the JSDoc on
     // preferredReadReplicasPerTopicPartition), not a bare nodeId.
@@ -1845,6 +2273,7 @@ module.exports = class ConsumerGroup {
         memberId: this.memberId,
       })
       delete preferredReadReplicas[e.partition]
+      this.routingChanged()
     } else {
       this.logger.error('Offset out of range, resetting to default offset', {
         topic: e.topic,
@@ -1853,10 +2282,11 @@ module.exports = class ConsumerGroup {
         memberId: this.memberId,
       })
 
-      await this.offsetManager.setDefaultOffset({
-        topic: e.topic,
-        partition: e.partition,
-      })
+      await this.offsetManager.setDefaultOffset(
+        { topic: e.topic, partition: e.partition },
+        ...(fence ? [{ guard: fence.guard, fence }] : [])
+      )
+      fence?.check()
       this.markChanged(e.topic, e.partition)
     }
   }
@@ -1924,12 +2354,21 @@ module.exports = class ConsumerGroup {
    * pass the round proceeds as it always did. A stop request ends the passes: stopping is checked
    * before each pass and after a pass returns, so no further pass starts once the round is about to
    * be discarded. A pass already in flight is not cancelled.
+   *
+   * Given a preparation, every step uses its captured offset manager and checks its guard before
+   * popping an intent, after every await, before the resolution retry and its yield, and before
+   * any local effect, so a late continuation of a retired or replaced preparation changes nothing.
+   * The retry yield is bound to the run's fence. Without one, nothing changes.
    * @param {import("../../types").TopicPartitions[]} topicPartitions
+   * @param {FetchPreparation} [preparation] the fetch round's identity
    * @returns {Promise<void>}
+   * @throws {Error} the preparation's refusal
    */
-  async seekOffsets(topicPartitions) {
+  async seekOffsets(topicPartitions, preparation) {
+    const manager = preparation ? preparation.manager : this.offsetManager
     for (const { topic, partitions } of topicPartitions) {
       for (const partition of partitions) {
+        preparation?.check()
         const seekEntry = this.seekOffset.pop(topic, partition)
         if (!seekEntry) {
           continue
@@ -1941,29 +2380,31 @@ module.exports = class ConsumerGroup {
           seek: seekEntry,
         })
 
-        if (await this.offsetManager.seek(seekEntry)) {
+        const applied = await manager.seek(seekEntry, preparation)
+        preparation?.check()
+        if (applied) {
           this.markChanged(topic, partition)
           this.haltedPartitions.delete(`${topic}|${partition}`)
+          this.idleWait.wake()
         }
       }
     }
 
     for (let pass = 1; pass <= MAX_RESOLUTION_PASSES && !this.isStopping(); pass++) {
-      if (
-        (await this.offsetManager.resolveOffsets()) ||
-        pass === MAX_RESOLUTION_PASSES ||
-        this.isStopping()
-      ) {
+      const resolved = await manager.resolveOffsets(preparation)
+      preparation?.check()
+      if (resolved || pass === MAX_RESOLUTION_PASSES || this.isStopping()) {
         break
       }
 
-      await new Promise((resolve) => setImmediate(resolve))
+      await (preparation ? fencedDelay(preparation.fence) : new Promise(setImmediate))
+      preparation?.check()
     }
 
     // Guarded, not just level-checked: this runs once per fetch round, and most rounds resolve
     // nothing, so the per-topic payload must not be built to be thrown away.
     if (this.logger.debugEnabled()) {
-      const committedOffsets = this.offsetManager.committedOffsets()
+      const committedOffsets = manager.committedOffsets()
       for (const { topic } of topicPartitions) {
         this.logger.debug('Resolved offsets', {
           groupId: this.groupId,
@@ -1998,11 +2439,18 @@ module.exports = class ConsumerGroup {
    *   which is a superset of what the request keeps: it also contains partitions with no committed
    *   offset, which are skipped here - there is no position to check, and reading one would create
    *   a resolved offset holding `undefined`.
+   * @param {FetchPreparation} [preparation] the fetch round's identity. Its refusal is never
+   *   swallowed by the fail-open policy above: it is rethrown, and the entries this call put in
+   *   flight are returned to unvalidated by identity, also at once when the run's fence closes,
+   *   so a held broker reply is not needed to remove them. Without one, nothing changes.
    * @returns {Promise<void>}
+   * @throws {Error} the preparation's refusal
    */
-  async validatePositions(topicPartitions) {
+  async validatePositions(topicPartitions, preparation) {
     let awaiting
-    const committedOffsets = this.offsetManager.committedOffsets()
+    let unregister
+    const manager = preparation ? preparation.manager : this.offsetManager
+    const committedOffsets = manager.committedOffsets()
 
     try {
       for (const { topic, partitions } of topicPartitions) {
@@ -2029,14 +2477,14 @@ module.exports = class ConsumerGroup {
             continue
           }
 
-          const trackedEpoch = this.offsetManager.lastConsumedEpoch(topic, partition)
+          const trackedEpoch = manager.lastConsumedEpoch(topic, partition)
           // No early return while validation is disabled: `request()` still answers 'validated'
           // rather than 'unchanged' for a partition whose leader epoch moved, and the
           // preferred-read-replica clearing below still has to happen - a replica chosen under the
           // old leader is not a safe place to keep reading from, whether or not this client is
           // still asking the leader about its position.
           const { action, generation } = this.positionValidator.request(topic, partition, {
-            offset: this.offsetManager.nextOffset(topic, partition).toString(),
+            offset: manager.nextOffset(topic, partition).toString(),
             trackedEpoch,
             currentLeaderEpoch,
           })
@@ -2046,21 +2494,33 @@ module.exports = class ConsumerGroup {
           }
 
           const replicas = this.preferredReadReplicasPerTopicPartition[topic]
-          if (replicas) {
+          if (replicas && replicas[partition] !== undefined) {
             delete replicas[partition]
+            this.routingChanged()
           }
 
           if (action === 'awaiting') {
             awaiting = awaiting || []
-            awaiting.push({ topic, partition, trackedEpoch, currentLeaderEpoch, generation })
+            awaiting.push({
+              topic,
+              partition,
+              trackedEpoch,
+              currentLeaderEpoch,
+              generation,
+              entry: this.positionValidator.entryOf(topic, partition),
+            })
           }
         }
       }
 
       if (awaiting) {
-        await this.runValidationRequests(awaiting)
+        const cancelled = awaiting
+        unregister = preparation?.fence.register(() => this.positionValidator.release(cancelled))
+        await this.runValidationRequests(awaiting, preparation)
       }
     } catch (e) {
+      const refusal = preparation?.guard()
+      if (refusal) throw refusal
       this.logger.warn('Position validation failed, fetching unvalidated', {
         groupId: this.groupId,
         memberId: this.memberId,
@@ -2069,10 +2529,16 @@ module.exports = class ConsumerGroup {
     } finally {
       // The invariant: no partition may be left awaiting with no request in flight. Carries the
       // generation each entry was requested under, so a sweep that runs after a rebalance cannot
-      // record another fetcher's fresh entry as validated against this round's epoch.
-      for (const { topic, partition, currentLeaderEpoch, generation } of awaiting || []) {
-        if (this.positionValidator.isAwaiting(topic, partition)) {
-          this.positionValidator.markValidated(topic, partition, currentLeaderEpoch, generation)
+      // record another fetcher's fresh entry as validated against this round's epoch. A refused
+      // preparation cancels its own entries by identity instead of validating anything.
+      unregister?.()
+      if (preparation?.guard()) {
+        this.positionValidator.release(awaiting || [])
+      } else {
+        for (const { topic, partition, currentLeaderEpoch, generation } of awaiting || []) {
+          if (this.positionValidator.isAwaiting(topic, partition)) {
+            this.positionValidator.markValidated(topic, partition, currentLeaderEpoch, generation)
+          }
         }
       }
     }
@@ -2088,10 +2554,11 @@ module.exports = class ConsumerGroup {
    *
    * @private
    * @param {{topic: string, partition: number, trackedEpoch: number, currentLeaderEpoch: number,
-   *   generation: number}[]} awaiting
+   *   generation: number, entry: object}[]} awaiting
+   * @param {FetchPreparation} [preparation] the fetch round's identity, see `validatePositions`
    * @returns {Promise<void>}
    */
-  async runValidationRequests(awaiting) {
+  async runValidationRequests(awaiting, preparation) {
     const entriesByTopic = new Map()
     for (const entry of awaiting) {
       const entries = entriesByTopic.get(entry.topic) || []
@@ -2117,7 +2584,9 @@ module.exports = class ConsumerGroup {
     }
 
     for (const [nodeId, topics] of perLeader) {
-      await this.validateOnLeader(nodeId, topics)
+      preparation?.check()
+      await this.validateOnLeader(nodeId, topics, preparation)
+      preparation?.check()
     }
   }
 
@@ -2131,9 +2600,12 @@ module.exports = class ConsumerGroup {
    * @private
    * @param {number} nodeId the leader of every partition in `topics`
    * @param {{topic: string, entries: object[]}[]} topics
+   * @param {FetchPreparation} [preparation] the fetch round's identity: checked after the broker
+   *   lookup and every reply, forwarded to the request, and the retry delays are bound to its fence
    * @returns {Promise<void>}
+   * @throws {Error} the preparation's refusal
    */
-  async validateOnLeader(nodeId, topics) {
+  async validateOnLeader(nodeId, topics, preparation) {
     // A non-retriable reply from an earlier leader in this same round switched validation off for
     // the assignment; asking the remaining leaders would buy nothing and cost a round trip each.
     if (this.positionValidator.isDisabled()) {
@@ -2141,7 +2613,8 @@ module.exports = class ConsumerGroup {
       return
     }
 
-    const broker = await this.cluster.findBroker({ nodeId })
+    const broker = await this.cluster.findBroker({ nodeId, fence: preparation?.fence })
+    preparation?.check()
     const version = broker.negotiatedVersion(
       apiKeys.OffsetForLeaderEpoch,
       requests.OffsetForLeaderEpoch
@@ -2162,9 +2635,13 @@ module.exports = class ConsumerGroup {
     }
 
     let pending = topics
+    const retrier = preparation
+      ? createRetry({ retries: 2, maxRetryTime: 5000, fence: preparation.fence })
+      : this.validationRetrier
 
     try {
-      await this.validationRetrier(async () => {
+      await retrier(async () => {
+        preparation?.check()
         const response = await broker.offsetForLeaderEpoch({
           topics: pending.map(({ topic, entries }) => ({
             topic,
@@ -2174,9 +2651,12 @@ module.exports = class ConsumerGroup {
               leaderEpoch: trackedEpoch,
             })),
           })),
+          guard: preparation?.guard,
         })
+        preparation?.check()
 
-        pending = await this.applyValidationResponse(pending, response)
+        pending = await this.applyValidationResponse(pending, response, preparation)
+        preparation?.check()
 
         if (pending.length > 0) {
           // `createRetry` only retries a thrown error, and the response codec deliberately does
@@ -2185,6 +2665,7 @@ module.exports = class ConsumerGroup {
         }
       })
     } catch (e) {
+      preparation?.check()
       if (e.name !== 'KafkaJSNumberOfRetriesExceeded') {
         throw e
       }
@@ -2222,11 +2703,16 @@ module.exports = class ConsumerGroup {
    * @private
    * @param {{topic: string, entries: object[]}[]} pending the partitions this attempt asked about
    * @param {object} response the decoded reply
+   * @param {FetchPreparation} [preparation] the fetch round's identity, checked before each
+   *   partition's outcome is applied; a refusal is rethrown after the partition it interrupted is
+   *   returned to unvalidated
    * @returns {Promise<{topic: string, entries: object[]}[]>} the partitions to ask again about,
    *   empty when the round is done. A partition the reply does not mention is left to the caller's
    *   awaiting sweep rather than retried: the broker answered without it.
+   * @throws {Error} the preparation's refusal
    */
-  async applyValidationResponse(pending, response) {
+  async applyValidationResponse(pending, response, preparation) {
+    const manager = preparation ? preparation.manager : this.offsetManager
     const replies = new Map()
     for (const { topic, partitions } of response.topics) {
       for (const reply of partitions) {
@@ -2241,6 +2727,7 @@ module.exports = class ConsumerGroup {
       const retriable = []
 
       for (const entry of entries) {
+        preparation?.check()
         const reply = replies.get(`${topic}|${entry.partition}`)
 
         if (!reply) {
@@ -2251,17 +2738,17 @@ module.exports = class ConsumerGroup {
         // OffsetOutOfRange recovery cleared it. There is no position left to compare the reply
         // with, and reading one would store `undefined` as its resolved offset. Left to the
         // caller's awaiting sweep, like a partition the reply never mentioned.
-        if (this.offsetManager.committedOffsets()[topic][entry.partition] == null) {
+        if (manager.committedOffsets()[topic][entry.partition] == null) {
           continue
         }
 
         // Read again now, not the pair captured when the request was made: comparing the captured
         // pair with itself could never detect a position that moved under the request.
-        const offset = this.offsetManager.nextOffset(topic, entry.partition).toString()
+        const offset = manager.nextOffset(topic, entry.partition).toString()
         const outcome = this.positionValidator.complete(
           topic,
           entry.partition,
-          { offset, trackedEpoch: this.offsetManager.lastConsumedEpoch(topic, entry.partition) },
+          { offset, trackedEpoch: manager.lastConsumedEpoch(topic, entry.partition) },
           {
             errorCode: reply.errorCode,
             endOffset: reply.endOffset,
@@ -2276,14 +2763,23 @@ module.exports = class ConsumerGroup {
         } else if (outcome.action === 'fatal') {
           fatal = true
         } else {
+          const decided = preparation && this.positionValidator.entryOf(topic, entry.partition)
           try {
-            await this.applyValidationOutcome(topic, entry.partition, offset, outcome)
+            await this.applyValidationOutcome(topic, entry.partition, offset, outcome, preparation)
+            preparation?.check()
           } catch (e) {
             // `complete()` already recorded the partition as validated, so leaving it there would
             // hide a divergence for good: the next round would answer 'unchanged' and the position
             // it was told to leave would stand, with no event and no second attempt. Returning the
-            // key to unvalidated is what makes the next round decide it again.
-            this.positionValidator.forgetTopic(topic, [entry.partition])
+            // key to unvalidated is what makes the next round decide it again. A refused
+            // preparation releases only the entry it decided, never a replacement's.
+            if (preparation) {
+              const released = [{ topic, partition: entry.partition, entry: decided }]
+              this.positionValidator.release(released)
+              preparation.check()
+            } else {
+              this.positionValidator.forgetTopic(topic, [entry.partition])
+            }
             this.logger.warn('Could not apply a position validation outcome, retrying next round', {
               groupId: this.groupId,
               memberId: this.memberId,
@@ -2346,9 +2842,12 @@ module.exports = class ConsumerGroup {
    * @param {number} partition
    * @param {string} offset the position that was validated
    * @param {{action: string, divergingOffset: string|null, leaderEpoch: number}} outcome
+   * @param {FetchPreparation} [preparation] the fetch round's identity: forwarded to the offset
+   *   work and checked before the repositioning is marked and announced
    * @returns {Promise<void>}
+   * @throws {Error} the preparation's refusal
    */
-  async applyValidationOutcome(topic, partition, offset, outcome) {
+  async applyValidationOutcome(topic, partition, offset, outcome, preparation) {
     if (outcome.action === 'truncated') {
       this.logger.warn('Log truncation detected, repositioning the partition', {
         groupId: this.groupId,
@@ -2360,7 +2859,11 @@ module.exports = class ConsumerGroup {
       // Applied inline, not through the seek queue: the queue is drained at the top of a round, so
       // a queued seek would land one round late - and would overwrite a user seek queued in the
       // same window, since the queue is last-writer-wins per key.
-      await this.offsetManager.seek({ topic, partition, offset: outcome.divergingOffset })
+      await (preparation?.manager ?? this.offsetManager).seek(
+        { topic, partition, offset: outcome.divergingOffset },
+        preparation
+      )
+      preparation?.check()
       this.markChanged(topic, partition)
     } else if (outcome.action === 'reset') {
       this.logger.warn('Log truncation detected but the divergence point is unknown, resetting', {
@@ -2369,7 +2872,11 @@ module.exports = class ConsumerGroup {
         partition,
         offset,
       })
-      await this.offsetManager.setDefaultOffset({ topic, partition })
+      await (preparation?.manager ?? this.offsetManager).setDefaultOffset(
+        { topic, partition },
+        preparation
+      )
+      preparation?.check()
       this.markChanged(topic, partition)
     } else {
       return
@@ -2393,6 +2900,9 @@ module.exports = class ConsumerGroup {
    *
    * @param {string} topic
    * @param {number[]} partitions
+   * @param {{expiresAt: number}} [routing] an optional observation: `expiresAt` is lowered to the
+   *   earliest preferred-replica expiry that decided a placement here. The no-preference path does
+   *   no extra work for it.
    * @returns {{[nodeId: number]: number[]}} per-node assignment of partitions
    * @throws {import('../errors').KafkaJSProtocolError} `LEADER_NOT_AVAILABLE`, for a partition
    *   whose leader is negative
@@ -2400,7 +2910,7 @@ module.exports = class ConsumerGroup {
    * @see https://github.com/apache/kafka/blob/4.3/clients/src/main/java/org/apache/kafka/clients/consumer/internals/AbstractFetch.java
    */
   // Invariant: The resulting object has each partition referenced exactly once
-  findReadReplicaForPartitions(topic, partitions) {
+  findReadReplicaForPartitions(topic, partitions, routing) {
     const partitionMetadata = this.cluster.findTopicPartitionMetadata(topic)
     const preferredReadReplicas = this.preferredReadReplicasPerTopicPartition[topic]
     return partitions.reduce((result, id) => {
@@ -2433,6 +2943,7 @@ module.exports = class ConsumerGroup {
           })
           // Drop the entry
           delete preferredReadReplicas[partitionId]
+          this.routingChanged()
         } else if (preferredReadReplica != null) {
           // Valid entry, check whether it is not offline
           // Note that we don't delete the preference here, and rather hope that eventually that replica comes online again
@@ -2448,6 +2959,7 @@ module.exports = class ConsumerGroup {
             })
           } else {
             nodeId = preferredReadReplica
+            if (routing && expireAt < routing.expiresAt) routing.expiresAt = expireAt
           }
         }
       }
@@ -2456,10 +2968,16 @@ module.exports = class ConsumerGroup {
     }, {})
   }
 
-  filterPartitionsByNode(nodeId, topicPartitions) {
+  /**
+   * @param {number} nodeId the broker a fetch round asks
+   * @param {import("../../types").TopicPartitions[]} topicPartitions the assignment
+   * @param {{expiresAt: number}} [routing] see `findReadReplicaForPartitions`
+   * @returns {import("../../types").TopicPartitions[]} the partitions routed to that node
+   */
+  filterPartitionsByNode(nodeId, topicPartitions, routing) {
     return topicPartitions.map(({ topic, partitions }) => ({
       topic,
-      partitions: this.findReadReplicaForPartitions(topic, partitions)[nodeId] || [],
+      partitions: this.findReadReplicaForPartitions(topic, partitions, routing)[nodeId] || [],
     }))
   }
 

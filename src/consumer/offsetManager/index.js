@@ -4,12 +4,14 @@ const dictionary = require('../../utils/dictionary')
 const isInvalidOffset = require('./isInvalidOffset')
 const initializeConsumerOffsets = require('./initializeConsumerOffsets')
 const OffsetOperations = require('./offsetOperations')
+const { fencedDelay } = require('../fetchPreparation')
 const ResetObligations = require('./resetObligations')
 const { KafkaJSError, KafkaJSCommitFailedError, isStaleCoordinator } = require('../../errors')
 const {
   stampGeneration,
   stampOffsetCommit,
   stampOwnership,
+  stampMembership,
   learnOwnershipLoss,
   REBALANCE_PATHS,
 } = require('../rebalanceErrorContract')
@@ -262,19 +264,23 @@ module.exports = class OffsetManager {
    * reads the topic's current id.
    * @private
    * @param {object} payload the `Broker#offsetCommit` payload
-   * @param {{guard?: Function}} [options] an immutable caller identity, checked through transmission and settlement
+   * @param {{guard?: Function, fence?: import('../../producer/generation')}} [options] an immutable
+   *   caller identity, checked through transmission and settlement, and the terminal fence that
+   *   binds the coordinator discovery and the metadata refresh a refused topic id starts
    * @returns {Promise<object>} the decoded response
-   * @throws {Error} whatever the coordinator answered, stamped
+   * @throws {Error} whatever the coordinator answered, stamped; a refusal from the caller's guard
+   *   replaces it before any ownership loss or commit-error callback is published
    */
-  async sendOffsetCommit(payload, { guard = null } = {}) {
+  async sendOffsetCommit(payload, { guard = null, fence } = {}) {
     const token = this.ownership?.token()
+    const { revision } = this.membership()
     const release = this.ownership?.retain(token)
     const check = () => this.ownership?.refusal(token) || guard?.() || null
 
     try {
       let refusal = check()
       if (refusal) throw refusal
-      const coordinator = await this.getCoordinator()
+      const coordinator = await this.getCoordinator(fence && { guard: check, fence })
       refusal = check()
       if (refusal) throw refusal
       const request = { ...payload, topics: this.withTopicIds(payload.topics) }
@@ -286,9 +292,16 @@ module.exports = class OffsetManager {
       if (refusal) throw refusal
       return result
     } catch (error) {
-      const stamped = stampOwnership(
-        stampGeneration(stampOffsetCommit(error), payload.groupGenerationId),
-        token
+      const stampRefusal = (refusal) =>
+        stampOwnership(
+          stampGeneration(stampOffsetCommit(refusal), payload.groupGenerationId),
+          token
+        )
+      const callerRefusal = guard?.()
+      if (callerRefusal) throw stampRefusal(callerRefusal)
+      const stamped = stampMembership(
+        stampOwnership(stampGeneration(stampOffsetCommit(error), payload.groupGenerationId), token),
+        revision
       )
       const lost = learnOwnershipLoss(
         this.ownership,
@@ -298,12 +311,8 @@ module.exports = class OffsetManager {
       )
       if (lost) this.onCommitError?.(stamped)
       const refusal = check()
-      if (refusal)
-        throw stampOwnership(
-          stampGeneration(stampOffsetCommit(refusal), payload.groupGenerationId),
-          token
-        )
-      if (error.type === UNKNOWN_TOPIC_ID) await this.refreshAfterUnknownTopicId()
+      if (refusal) throw stampRefusal(refusal)
+      if (error.type === UNKNOWN_TOPIC_ID) await this.refreshAfterUnknownTopicId(fence)
       throw stamped
     } finally {
       release?.()
@@ -332,24 +341,36 @@ module.exports = class OffsetManager {
    * the id the topic has now (or none, which sends by name). Best-effort: a refresh that fails must
    * not replace the retriable error the caller is waiting for.
    * @private
+   * @param {import('../../producer/generation')} [fence] the caller's terminal fence: its close
+   *   ends the refresh and a late answer installs nothing
    * @returns {Promise<void>}
    */
-  async refreshAfterUnknownTopicId() {
+  async refreshAfterUnknownTopicId(fence) {
     try {
-      await this.cluster.refreshMetadata()
+      await this.cluster.refreshMetadata(...(fence ? [{ fence }] : []))
     } catch (_) {
       // see above
     }
   }
 
   /**
+   * @param {{guard: () => Error|null, fence: import('../../producer/generation')}} [preparation]
+   *   a caller's identity: its fence binds the discovery's connections, retries and refreshes, and
+   *   its guard is checked before the answer is published, so a retired caller installs nothing
    * @returns {Promise<import("../../../types").Broker>}
+   * @throws {Error} the preparation's refusal; absent, nothing changes
    */
-  async getCoordinator() {
+  async getCoordinator(preparation) {
     if (!this.coordinator.isConnected()) {
       // findBroker() would resolve the same (stale) node after a failover; ask the cluster
       // which broker currently owns the group instead. Upstream PR #1779.
-      this.coordinator = await this.cluster.findGroupCoordinator({ groupId: this.groupId })
+      const coordinator = await this.cluster.findGroupCoordinator(
+        preparation
+          ? { groupId: this.groupId, fence: preparation.fence }
+          : { groupId: this.groupId }
+      )
+      this.refuse(preparation)
+      this.coordinator = coordinator
     }
 
     return this.coordinator
@@ -565,11 +586,25 @@ module.exports = class OffsetManager {
    * newer operation or a barrier (a revoke, a recreation) reached the partition while the commit
    * was in flight.
    * @param {import("../../../types").TopicPartition} topicPartition
+   * @param {{guard: () => Error|null, fence: import('../../producer/generation')}} [preparation]
+   *   the caller's immutable preparation identity; see `seek`
    * @returns {Promise<void>}
    */
-  async setDefaultOffset({ topic, partition }) {
+  async setDefaultOffset({ topic, partition }, preparation) {
     const defaultOffset = this.cluster.defaultOffset(this.topicConfigurations[topic])
-    await this.commitAndClear({ topic, partition, offset: defaultOffset })
+    await this.commitAndClear({ topic, partition, offset: defaultOffset }, preparation)
+  }
+
+  /**
+   * Refuses work for a caller whose identity was retired or replaced.
+   * @private
+   * @param {{guard: () => Error|null}} [preparation] absent for an unguarded caller
+   * @returns {void}
+   * @throws {Error} what the caller's guard returned
+   */
+  refuse(preparation) {
+    const refusal = preparation?.guard()
+    if (refusal) throw refusal
   }
 
   /**
@@ -586,13 +621,18 @@ module.exports = class OffsetManager {
    * ListOffsets leaves both the reset and the pending sentinel for the next resolution.
    *
    * @param {import("../../../types").TopicPartitionOffset} topicPartitionOffset
+   * @param {{guard: () => Error|null, fence: import('../../producer/generation')}} [preparation]
+   *   a fetch round's immutable identity, checked before the commit is written and after it
+   *   settles; absent for an unguarded caller, which behaves as before
    * @returns {Promise<boolean>} whether the seek was applied: `false` when the partition is not
    *                              currently assigned to this member, when this member lost its
    *                              membership, or when a newer operation or barrier superseded it
    *                              while its commit was in flight
-   * @throws {Error} whatever the offset conversion or the commit raised; the ticket ends either way
+   * @throws {Error} whatever the offset conversion or the commit raised, or the preparation's
+   *   refusal; the ticket ends either way
    */
-  async seek({ topic, partition, offset }) {
+  async seek({ topic, partition, offset }, preparation) {
+    this.refuse(preparation)
     if (this.ownership?.refusal(this.ownership.token())) return false
     if (!this.memberAssignment[topic] || !this.memberAssignment[topic].includes(partition)) {
       return false
@@ -631,7 +671,7 @@ module.exports = class OffsetManager {
       return true
     }
 
-    return this.commitAndClear({ topic, partition, offset })
+    return this.commitAndClear({ topic, partition, offset }, preparation)
   }
 
   /**
@@ -640,15 +680,21 @@ module.exports = class OffsetManager {
    * while the ticket is still current. A failed commit applies nothing and supersedes nothing.
    * @private
    * @param {import("../../../types").TopicPartitionOffset} topicPartitionOffset
+   * @param {{guard: () => Error|null}} [preparation] the caller's identity, conjoined with this
+   *   manager's own ownership guard; its refusal is thrown, not reported as `false`
    * @returns {Promise<boolean>} whether the clear was applied
    * @throws {Error} whatever the commit raised
    */
-  async commitAndClear({ topic, partition, offset }) {
+  async commitAndClear({ topic, partition, offset }, preparation) {
     const { groupId, generationId, memberId, groupInstanceId } = this
-    const ticket = this.operations.begin([{ topic, partition }], { mutation: true })
     const token = this.ownership?.token()
+    const guard =
+      this.ownership || preparation
+        ? () => preparation?.guard() || this.ownership?.refusal(token) || null
+        : null
+    this.refuse(preparation)
+    const ticket = this.operations.begin([{ topic, partition }], { mutation: true })
     const release = this.ownership?.retain(token)
-    const guard = this.ownership ? () => this.ownership.refusal(token) : null
 
     try {
       await this.sendOffsetCommit(
@@ -659,7 +705,7 @@ module.exports = class OffsetManager {
           groupInstanceId,
           topics: [{ topic, partitions: [{ partition, offset }] }],
         },
-        { guard }
+        { guard, ...(preparation && { fence: preparation.fence }) }
       )
 
       if (guard?.() || this.operations.isSuperseded(ticket, topic, partition)) {
@@ -990,11 +1036,16 @@ module.exports = class OffsetManager {
    * A cell whose answer was dropped keeps its invalid offset and is resolved again, at once by the
    * caller (`ConsumerGroup#seekOffsets`) and at the latest by the next fetch round.
    *
+   * @param {{guard: () => Error|null, fence: import('../../producer/generation')}} [preparation]
+   *   a fetch round's immutable identity: checked after each await and before each request, reset
+   *   marking and publication, so a refused round leaves no trace; absent, nothing changes
    * @returns {Promise<boolean>} `false` when an answer was dropped because the cell was superseded
    *                              or the topic was recreated while a request was in flight, `true`
    *                              otherwise (a cell a sibling had already resolved is not a drop)
+   * @throws {Error} the preparation's refusal; the ticket ends either way
    */
-  async resolveOffsets() {
+  async resolveOffsets(preparation) {
+    this.refuse(preparation)
     const invalidOffset = (topic) => (partition) => {
       return (
         this.pendingSeekTimestamp(topic, partition) !== undefined ||
@@ -1022,7 +1073,8 @@ module.exports = class OffsetManager {
       const requestedIds = new Map(
         pendingPartitions.map(({ topic }) => [topic, this.cluster.topicId(topic)])
       )
-      const { responses } = await this.fetchCommittedOffsets(pendingPartitions)
+      const { responses } = await this.fetchCommittedOffsets(pendingPartitions, preparation)
+      this.refuse(preparation)
 
       let complete = true
       const consumerOffsets = []
@@ -1057,7 +1109,11 @@ module.exports = class OffsetManager {
 
       let offsets = consumerOffsets
       if (unresolvedPartitions.some((t) => t.partitions.length > 0)) {
-        const topicOffsets = await this.cluster.fetchTopicsOffset(unresolvedPartitions)
+        const topicOffsets = await this.cluster.fetchTopicsOffset(
+          unresolvedPartitions,
+          preparation && { fence: preparation.fence, guard: preparation.guard }
+        )
+        this.refuse(preparation)
         offsets = initializeConsumerOffsets(consumerOffsets, topicOffsets)
       }
 
@@ -1371,20 +1427,26 @@ module.exports = class OffsetManager {
    * error table: that would change every other decoder of them, including the admin client's.
    * @private
    * @param {{topic: string, partitions: {partition: number}[]}[]} topics
+   * @param {{guard: () => Error|null, fence: import('../../producer/generation')}} [preparation]
+   *   a fetch round's identity: checked before every attempt and after every await, forwarded to
+   *   the request, and the re-send delay is bound to its fence so cancelling clears the timer
    * @returns {Promise<{responses: Array}>}
    * @throws {Error} the last error, once the deadline passes, the consumer is stopping, a
-   *   rebalance is pending, or - for a stale epoch - the member has no epoch
+   *   rebalance is pending, or - for a stale epoch - the member has no epoch; or the
+   *   preparation's refusal
    */
-  async fetchCommittedOffsets(topics) {
+  async fetchCommittedOffsets(topics, preparation) {
     const deadline = performance.now() + this.staleEpochTimeout
     let unstableInterval = RETRY_INTERVAL
 
     for (;;) {
+      this.refuse(preparation)
       if (this.membershipProtocol === 'consumer') {
         this.refreshMembership()
       }
 
-      const coordinator = await this.getCoordinator()
+      const coordinator = await this.getCoordinator(preparation)
+      this.refuse(preparation)
       const memberFields =
         this.membershipProtocol === 'consumer'
           ? { memberId: this.memberId, memberEpoch: this.generationId }
@@ -1396,8 +1458,10 @@ module.exports = class OffsetManager {
           topics: this.withTopicIds(topics),
           ...memberFields,
           requireStable: true,
+          ...(preparation && { guard: preparation.guard }),
         })
       } catch (e) {
+        this.refuse(preparation)
         const unstable = e.type === UNSTABLE_OFFSET_COMMIT
         const staleEpoch =
           e.type === STALE_MEMBER_EPOCH &&
@@ -1424,7 +1488,9 @@ module.exports = class OffsetManager {
           }
         )
 
-        await sleep(unstable ? unstableInterval : RETRY_INTERVAL)
+        const interval = unstable ? unstableInterval : RETRY_INTERVAL
+        await (preparation ? fencedDelay(preparation.fence, interval) : sleep(interval))
+        this.refuse(preparation)
 
         if (this.isStopping() || this.isRebalancePending()) {
           throw e

@@ -380,12 +380,12 @@ describe('Consumer > topic recreation', () => {
       expect(consumerGroup.seekOffset.has('other', 0)).toBe(true)
     })
 
-    test('paused partitions stay paused', () => {
+    test('a recreated topic starts unpaused', () => {
       const consumerGroup = group({ [TOPIC]: [0] })
       consumerGroup.subscriptionState.assign([{ topic: TOPIC, partitions: [0] }])
       consumerGroup.pause([{ topic: TOPIC, partitions: [0] }])
       consumerGroup.invalidateTopic(TOPIC)
-      expect(consumerGroup.subscriptionState.isPaused(TOPIC, 0)).toBe(true)
+      expect(consumerGroup.subscriptionState.isPaused(TOPIC, 0)).toBe(false)
     })
   })
 

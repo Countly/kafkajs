@@ -8,7 +8,13 @@ const createState = (topic) => ({
 })
 
 module.exports = class SubscriptionState {
-  constructor() {
+  /**
+   * @param {object} [options]
+   * @param {() => void} [options.onAssignmentChange] internal: called once at the end of every
+   *   `assign()` and `update()`, after the new assignment is visible
+   */
+  constructor({ onAssignmentChange = null } = {}) {
+    this.onAssignmentChange = onAssignmentChange
     this.assignedPartitionsByTopic = dictionary()
     /**
      * The same assignment as a membership index. Rebuilt in `assign()`, which runs once per
@@ -36,6 +42,8 @@ module.exports = class SubscriptionState {
     this.assignedPartitionSetsByTopic = new Map(
       topicPartitions.map(({ topic, partitions = [] }) => [topic, new Set(partitions)])
     )
+
+    this.onAssignmentChange?.()
   }
 
   /**
@@ -149,6 +157,28 @@ module.exports = class SubscriptionState {
   isAssigned(topic, partition) {
     const partitions = this.assignedPartitionSetsByTopic.get(topic)
     return partitions !== undefined && partitions.has(partition)
+  }
+
+  /**
+   * Retains pause intent only for an accepted subscription, independent of assignment.
+   * @param {Iterable<string>} topics accepted names
+   * @returns {void}
+   */
+  retainTopics(topics) {
+    const live = new Set(topics)
+    for (const topic of Object.keys(this.subscriptionStatesByTopic)) {
+      if (!live.has(topic)) this.retireTopic(topic)
+    }
+  }
+
+  /** Retires intent for one incarnation. @param {string} topic @returns {void} */
+  retireTopic(topic) {
+    delete this.subscriptionStatesByTopic[topic]
+  }
+
+  /** Retires all pause intent at a run lifecycle boundary. @returns {void} */
+  clearPauses() {
+    this.subscriptionStatesByTopic = dictionary()
   }
 
   isPaused(topic, partition) {

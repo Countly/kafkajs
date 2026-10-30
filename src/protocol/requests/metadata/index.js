@@ -96,13 +96,13 @@ const parseAllTopics = async (data) => {
  * the null array, is parsed by `parseAllTopics`; a request that names topics keeps its version's
  * own parse, which throws the first topic, then partition, error code.
  * @param {number|string} version
- * @param {{ topics?: Array<string|{ topicId: string }>, allowAutoTopicCreation?: boolean }} options
+ * @param {{ topics?: Array<string|{ topicId: string }>, allowAutoTopicCreation?: boolean, lenient?: boolean }} options
  *   `topics` is absent only when a request is built for its api key and version alone
  * @returns {{ request: object, response: { decode: Function, parse: Function } }}
  */
 const build = (version, options) => {
   const built = versions[version](options)
-  return options.topics?.length === 0
+  return options.lenient || options.topics?.length === 0
     ? { ...built, response: { ...built.response, parse: parseAllTopics } }
     : built
 }

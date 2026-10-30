@@ -82,7 +82,7 @@ describe('consumer regression fixtures', () => {
       jest.useRealTimers()
       if (h) await h.broker.disconnect()
     })
-    it.failing('resuming a paused partition ends the current idle wait', () => {
+    it('resuming a paused partition ends the current idle wait', () => {
       expect(observed).toBe(true)
     })
   })
