@@ -657,7 +657,10 @@ describe('Consumer > Runner', () => {
 
       await runner.heartbeat()
 
-      expect(consumerGroup.heartbeat).toHaveBeenCalledWith({ interval: 500 })
+      expect(consumerGroup.heartbeat).toHaveBeenCalledWith({
+        interval: 500,
+        guard: expect.any(Function),
+      })
     })
 
     it('routes every LOST verdict into the membership state machine, before the round', async () => {

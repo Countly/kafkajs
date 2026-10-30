@@ -126,6 +126,27 @@ const selectRebalanceProtocol = (assigners) => {
   )
 }
 
+const callDeadlines = new WeakSet()
+
+/**
+ * Marks the refusal a public API call's own deadline produced, so a layer that only sees the
+ * refusal can tell an expired call (its run and membership may still be current) from a retired
+ * run or a forced close. Held weakly, so it retains no error.
+ * @template {Error} E
+ * @param {E} error the timeout a public call's operation refuses with
+ * @returns {E} the same error
+ */
+const markCallDeadline = (error) => {
+  callDeadlines.add(error)
+  return error
+}
+
+/**
+ * @param {unknown} refusal what an operation's guard returned
+ * @returns {boolean} whether it is a refusal marked by `markCallDeadline`
+ */
+const isCallDeadline = (refusal) => callDeadlines.has(refusal)
+
 /**
  * One consumer control operation, with one monotonic budget and detachable owned waits.
  * Captured run, hook and ownership predicates remain caller-owned and are never recaptured.
@@ -323,6 +344,19 @@ class ConsumerOperation {
   }
 
   /**
+   * This operation as the private scope the shared retrier accepts, so that retrier's backoff timer
+   * is owned by the operation: retirement removes it and settles the retried call at once.
+   * @returns {{guard: () => Error|null, wait: Function, delay: (delay: number) => Promise<void>}}
+   */
+  retryScope() {
+    return {
+      guard: this.guard,
+      wait: (action) => this.wait(action),
+      delay: (delay) => this.sleep(delay),
+    }
+  }
+
+  /**
    * Retries only this consumer operation, retaining the original deadline across nested work.
    * Uses the existing backoff and error rules without scheduling an unowned shared-retrier timer.
    * @template T
@@ -386,4 +420,6 @@ module.exports = {
   COOPERATIVE,
   selectRebalanceProtocol,
   ConsumerOperation,
+  markCallDeadline,
+  isCallDeadline,
 }

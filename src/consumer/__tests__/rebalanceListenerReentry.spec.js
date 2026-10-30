@@ -558,4 +558,123 @@ describe('public re-entry from a rebalance callback', () => {
     expect(rig.spies.pause).not.toHaveBeenCalled()
     expect(rig.spies.leave).toHaveBeenCalledTimes(leaves)
   })
+
+  describe.each(['stop', 'disconnect', 'unsubscribe'])('a hook that requests %s', (api) => {
+    let held
+    afterEach(() => held?.release())
+
+    /** Runs a second round whose callback calls `api` once, with the cleanup held at the leave. */
+    const requestFromHook = async () => {
+      rig = createPublicRig()
+      rig.joins.push({ assignment: { [TOPIC]: [0, 1] }, generationId: 2 })
+      const leaving = (held = gate())
+      rig.spies.leave.mockImplementation(() => leaving.promise)
+      const seen = { hops: null, order: [], armed: false }
+      await rig.consumer.subscribe({ topic: TOPIC })
+      await rig.consumer.run({
+        eachMessage: () => {},
+        rebalanceListener: {
+          onPartitionsAssigned: async () => {
+            if (!seen.armed) return
+            let counting = true
+            let hops = 0
+            const spin = () => {
+              if (!counting || hops > 20) return
+              hops++
+              Promise.resolve().then(spin)
+            }
+            spin()
+            setImmediate(() => seen.order.push('immediate'))
+            await attempts[api](rig.consumer)
+            counting = false
+            seen.hops = hops
+            seen.order.push('accepted')
+          },
+        },
+      })
+      seen.armed = true
+      rig.joins.push({ assignment: { [TOPIC]: [0, 1] }, generationId: 3 })
+      await groupOf().rebalanceCoordinator.runRound('requested', 'revoked')
+      return { leaving, seen }
+    }
+
+    it('is accepted on the next microtask, before any timer or immediate', async () => {
+      const { leaving, seen } = await requestFromHook()
+      expect(seen.hops).toBeLessThanOrEqual(3)
+      expect(seen.order[0]).toBe('accepted')
+      leaving.release()
+      await new Promise((resolve) => setTimeout(resolve, 30))
+    })
+
+    it('leaves the full close to an outside caller, who joins it and waits for the cleanup', async () => {
+      const { leaving } = await requestFromHook()
+      let settled = false
+      const outside = attempts[api](rig.consumer).then(() => (settled = true))
+      await new Promise((resolve) => setTimeout(resolve, 30))
+      expect(rig.spies.leave).toHaveBeenCalledTimes(1)
+      expect(settled).toBe(false)
+      leaving.release()
+      await outside
+      expect(rig.spies.leave).toHaveBeenCalledTimes(1)
+    })
+  })
+
+  it('a hook-requested disconnect keeps the cleanup error for the outside caller', async () => {
+    rig = createPublicRig()
+    rig.joins.push({ assignment: { [TOPIC]: [0, 1] }, generationId: 2 })
+    let failTeardown
+    rig.cluster.disconnect.mockImplementationOnce(
+      () => new Promise((_resolve, reject) => (failTeardown = reject))
+    )
+    let acknowledged = false
+    await rig.consumer.subscribe({ topic: TOPIC })
+    await rig.consumer.run({
+      eachMessage: () => {},
+      rebalanceListener: {
+        onPartitionsAssigned: async () => {
+          await rig.consumer.disconnect()
+          acknowledged = true
+        },
+      },
+    })
+    await new Promise((resolve) => setTimeout(resolve, 30))
+    expect(acknowledged).toBe(true)
+    const outside = rig.consumer.disconnect().catch((error) => error)
+    failTeardown(new Error('teardown failed'))
+    expect((await outside).message).toBe('teardown failed')
+    expect(rig.cluster.disconnect).toHaveBeenCalledTimes(1)
+  })
+
+  it.each(['stop', 'disconnect', 'unsubscribe'])(
+    'a held hook of a force-closed run cannot %s the replacement run',
+    async (api) => {
+      rig = createPublicRig()
+      rig.joins.push({ assignment: { [TOPIC]: [0, 1] }, generationId: 2 })
+      const held = gate()
+      let late
+      await rig.consumer.subscribe({ topic: TOPIC })
+      const first = rig.consumer.run({
+        eachMessage: () => {},
+        rebalanceListener: {
+          onPartitionsAssigned: async () => {
+            await held.promise
+            late = await outcome(() => attempts[api](rig.consumer))
+          },
+        },
+      })
+      await settle()
+      await rig.consumer.disconnect({ timeout: 0 })
+      await first
+      rig.joins.push({ assignment: { [TOPIC]: [0, 1] }, generationId: 2 })
+      await rig.consumer.run({ eachMessage: () => {}, rebalanceListener: {} })
+      const leaves = rig.spies.leave.mock.calls.length
+      const disconnects = rig.cluster.disconnect.mock.calls.length
+      held.release()
+      await settle()
+      expect(late).toBeInstanceOf(Error)
+      expect(rig.spies.leave).toHaveBeenCalledTimes(leaves)
+      expect(rig.cluster.disconnect).toHaveBeenCalledTimes(disconnects)
+      expect(rig.consumer.assignment()).toEqual([{ topic: TOPIC, partitions: [0, 1] }])
+    }
+  )
 })

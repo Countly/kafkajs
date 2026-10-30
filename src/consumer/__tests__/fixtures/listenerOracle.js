@@ -13,10 +13,12 @@
  *   enteredOrdinal, returnedOrdinal, partitions: number[] }` for every callback invocation
  * - `fetches`: `{ member, partition, ordinal }` for the first Fetch of each acquisition
  * - `episodes`: one per completed revoke or close: `{ id, member, memberId, partition, incarnation,
- *   saved, processed, brokerObserved, eligible, correlation }`
+ *   saved, processed, brokerObserved, eligible, expected, correlation }`; an `expected` episode is
+ *   one the pre-response facts said must commit, so it must also be eligible
  * - `seeks`: `{ partition, from, to }` for every declared assigned-hook seek
  * - `replays`: `{ partition, from, to }` for every offset interval a crash or rejoin may repeat
  * - `members`: the member labels that joined
+ * - `requireExpected`: optional; when true, at least one episode must be `expected`
  */
 
 /** Fields a correlated commit response must carry, each non-null. */
@@ -57,6 +59,7 @@ const judge = (transcript) => {
     seeks,
     replays,
     members,
+    requireExpected,
   } = transcript
   const found = []
 
@@ -156,6 +159,11 @@ const judge = (transcript) => {
     if (episode.incarnation !== incarnation) {
       found.push(`episode ${episode.id} is of another incarnation`)
     }
+    if (episode.expected && !episode.eligible) {
+      found.push(
+        `episode ${episode.id} was expected to commit at close but no held commit followed`
+      )
+    }
     if (!episode.eligible) continue
     if (episode.brokerObserved == null) {
       found.push(`episode ${episode.id} has no broker-observed offset`)
@@ -185,6 +193,10 @@ const judge = (transcript) => {
         `episode ${episode.id} broker offset ${episode.brokerObserved} passes the processed ${episode.processed}`
       )
     }
+  }
+
+  if (requireExpected && !episodes.some(({ expected }) => expected)) {
+    found.push('no close episode was expected to commit, so the final commit was not exercised')
   }
 
   for (const [id, { count, partition, offset }] of seen) {
@@ -318,11 +330,13 @@ const exampleTranscript = () => {
         processed: 3,
         brokerObserved: 3,
         eligible: true,
+        expected: true,
         correlation: correlation(1, 'id-m2'),
       },
     ],
     seeks: [],
     replays: [],
+    requireExpected: true,
   }
 }
 

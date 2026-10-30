@@ -105,7 +105,12 @@ describe('Admin > setOffsets > the internal consumer is released on every exit',
     ).rejects.toThrow('Invalid partition')
 
     expect(listeners()).toBe(0)
-    expect(scripted.requests().map(({ api }) => api)).toContain('LeaveGroup')
+    // The disposal asks a start that is still connecting to stop first, so it may never join;
+    // a join that did happen is always left again.
+    const apis = scripted.requests().map(({ api }) => api)
+    expect(apis.filter((api) => api === 'LeaveGroup')).toHaveLength(
+      apis.filter((api) => api === 'JoinGroup').length
+    )
   })
 
   test('a reset followed by admin.disconnect() leaves no listener', async () => {

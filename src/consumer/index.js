@@ -9,11 +9,15 @@ const CommittedOffsetReader = require('./committedOffsets')
 const handlerContext = require('./handlerContext')
 const OffsetOperations = require('./offsetManager/offsetOperations')
 const Subscription = require('./subscription')
-const ResetObligations = require('./offsetManager/resetObligations')
+const ControlLifetime = require('./controlLifetime')
 const { normalizeResetPolicy } = require('./offsetReset')
 const { createGroupDescriptions } = require('../admin/groupDescriptions')
 const resolveGroupTimeouts = require('./groupTimeouts')
-const { selectRebalanceProtocol, ConsumerOperation } = require('./groupProtocol/interface')
+const {
+  selectRebalanceProtocol,
+  ConsumerOperation,
+  markCallDeadline,
+} = require('./groupProtocol/interface')
 const Runner = require('./runner')
 const RebalanceHooks = require('./rebalanceHooks')
 const { events, wrap: wrapEvent, unwrap: unwrapEvent } = require('./instrumentationEvents')
@@ -292,7 +296,6 @@ module.exports = (params) => {
   let runner = null
   /** @type {ConsumerGroup} */
   let consumerGroup = null
-  let restartTimeout = null
   // Bumped on every stop() and disconnect() invocation (including the disconnect onCrash triggers
   // internally as part of its own cleanup), so onCrash can tell whether a *separate* stop happened
   // while it was still deciding whether to restart (e.g. a slow restartOnFailure callback).
@@ -300,11 +303,16 @@ module.exports = (params) => {
   /**
    * The close in progress. Concurrent disconnects join its whole cleanup, so the first call's
    * timeout and leave choice govern; it is cleared when the cleanup settles.
-   * @type {{ operation: ConsumerOperation, promise: Promise<void> }|null}
+   * `joins` counts the later `disconnect()` calls that joined it.
+   * @type {{ operation: ConsumerOperation, promise: Promise<void>, joins: number }|null}
    */
   let closing = null
-  /** The deadline scopes of the public calls in flight, so a forced close can retire them. */
-  const activeCalls = new Set()
+  /**
+   * What the current explicit connection owns. An explicit disconnect marks it ending; the next
+   * connect, run or start then begins a new one, so a close settling late never touches it.
+   * @type {ControlLifetime}
+   */
+  let life = new ControlLifetime()
 
   const hasGroup = groupId !== undefined
   /**
@@ -360,9 +368,11 @@ module.exports = (params) => {
    * the call is made from one, and when a forced close retires the call or the calling handler's
    * run is retired. With none of these it never expires on its own, so an unset deadline keeps the
    * call's natural wait. The caller must `finish` it in a `finally`.
+   * @param {Set<ConsumerOperation>} calls the in-flight set of the lifetime the call belongs to, so
+   *   only that lifetime's forced close retires it
    * @returns {ConsumerOperation} the call's scope
    */
-  const beginCall = () => {
+  const beginCall = (calls) => {
     const invocation = RebalanceHooks.current()
     const identity = handlerContext.current()?.runIdentity
     const maxTotalTime = retry?.maxTotalTime
@@ -375,9 +385,11 @@ module.exports = (params) => {
         RebalanceHooks.refusal(invocation) ||
         (identity && !identity.isCurrent() ? consumerStoppingError() : null),
       onTimeout: (cause) =>
-        new KafkaJSDeliveryTimeout('The consumer call exceeded retry.maxTotalTime', { cause }),
+        markCallDeadline(
+          new KafkaJSDeliveryTimeout('The consumer call exceeded retry.maxTotalTime', { cause })
+        ),
     })
-    activeCalls.add(operation)
+    calls.add(operation)
     return operation
   }
 
@@ -389,11 +401,12 @@ module.exports = (params) => {
    * @throws {Error} the body's failure or the scope's refusal
    */
   const withinCall = async (work) => {
-    const operation = beginCall()
+    const { calls } = life
+    const operation = beginCall(calls)
     try {
       return await operation.wait(() => work(operation))
     } finally {
-      activeCalls.delete(operation)
+      calls.delete(operation)
       operation.finish()
     }
   }
@@ -459,28 +472,27 @@ module.exports = (params) => {
    * user disconnect empties them.
    * @type {ResetObligations}
    */
-  const obligations = new ResetObligations()
-  let removeTopicRecreatedListener = null
   let pendingStart = Promise.resolve()
 
   /**
-   * Subscribes to the cluster's topic-recreation event, at most once. Called at construction and
-   * again from connect(), run() and start(), so a consumer reused after disconnect() - including
-   * the restart onCrash schedules, which reaches start() alone - re-arms rather than running
-   * with the reset silently inert.
+   * Returns the lifetime that serves a connect, run or start, beginning a new one when an explicit
+   * disconnect has started on the current one, and subscribes it to the cluster's topic-recreation
+   * event, at most once per lifetime. Called at construction and again from connect(), run() and
+   * start(), so a consumer reused after disconnect() - including the restart onCrash schedules,
+   * which reaches start() alone - re-arms rather than running with the reset silently inert.
    *
    * The handler body is wrapped in try/catch: it runs synchronously inside the cluster's
    * `emit()`, called from `BrokerPool#refreshMetadata` - an uncaught throw here would escape as
    * a metadata-refresh failure and could itself trigger a rebootstrap, turning a topic
    * recreation into a connection storm.
-   * @returns {void}
+   * @returns {ControlLifetime} the lifetime now serving the caller
    */
-  const ensureTopicRecreatedSubscription = () => {
-    if (removeTopicRecreatedListener) {
-      return
-    }
+  const acquireLife = () => {
+    if (life.ending) life = new ControlLifetime(life.released ? life.obligations : undefined)
+    const owned = life
+    if (owned.removeListener) return owned
 
-    removeTopicRecreatedListener = cluster.onTopicRecreated(({ payload }) => {
+    owned.removeListener = cluster.onTopicRecreated(({ payload }) => {
       try {
         const { topic, topicId } = payload
 
@@ -492,7 +504,7 @@ module.exports = (params) => {
           return
         }
 
-        obligations.owe(topic, topicId)
+        owned.obligations.owe(topic, topicId)
         offsetOperations().touchTopic(topic)
         consumerGroup && consumerGroup.invalidateTopic(topic)
       } catch (e) {
@@ -503,9 +515,10 @@ module.exports = (params) => {
         })
       }
     })
+    return owned
   }
 
-  ensureTopicRecreatedSubscription()
+  acquireLife()
 
   /**
    * Makes this consumer's subscription the default metadata scope of its cluster while it holds a
@@ -526,14 +539,55 @@ module.exports = (params) => {
   }
 
   /**
+   * Ends a lifetime when its explicit disconnect or disposal settles: its connect fence retires, and
+   * its listener, debt and restart timer are released. The discovery scope goes back only while no
+   * replacement lifetime has begun, because a replacement registered the same declarations.
+   * @param {ControlLifetime} owned the lifetime the close began on
+   * @returns {void}
+   */
+  const endLife = (owned) => {
+    owned.ending = true
+    owned.fence.retire(consumerStoppingError())
+    owned.release()
+    if (life === owned) releaseDiscoveryScope()
+  }
+
+  /**
+   * The wait a connect, run or start owes the close that was already running when it began, so
+   * that close can never tear down the connection that replaces it: its cluster disconnect and
+   * group-registry cleanup finish first. A forced close bounds the wait by its own deadline; a
+   * plain one waits naturally, which is the order `disconnect()` then `connect()` always had. A
+   * close's own failure is its caller's to see, not the replacement's. A caller that is part of
+   * the run being closed (a handler or a rebalance callback) does not wait, because that close is
+   * waiting for it. Returns null with no close to wait for, so the caller stays synchronous up to
+   * the lifetime it acquires and a `disconnect()` made right after still retires it.
+   * @returns {Promise<void>|null} settles when that close has; rejects `CONSUMER_STOPPING` when a
+   *   `disconnect()` joined the close meanwhile, because it was asked after this call
+   */
+  const earlierClose = () => {
+    const earlier = closing
+    if (!earlier || RebalanceHooks.current() || handlerContext.current()) return null
+    const { joins } = earlier
+    return earlier.promise
+      .catch(() => {})
+      .then(() => {
+        if (earlier.joins !== joins) throw consumerStoppingError()
+      })
+  }
+
+  /**
    * @type {import("../../types").Consumer["connect"]}
-   * @throws {Error} `CONSUMER_STOPPING` from a handler of a retired run
+   * @throws {Error} `CONSUMER_STOPPING` from a handler of a retired run, or when a close ended this
+   *   connect's lifetime before it completed; no `CONNECT` is published then
    */
   const connect = async () => {
     refuseRetiredCaller()
-    ensureTopicRecreatedSubscription()
+    const waiting = earlierClose()
+    if (waiting) await waiting
+    const owned = acquireLife()
     registerDiscoveryScope()
-    await cluster.connect()
+    await cluster.connect({ fence: owned.fence })
+    owned.fence.check()
     instrumentationEmitter.emit(CONNECT)
   }
 
@@ -549,10 +603,11 @@ module.exports = (params) => {
    */
   const shutDown = async (stopOptions, { keepResets = false } = {}, operation) => {
     stopGeneration++
+    const owned = life
 
     try {
       if (operation) {
-        await closeWithin(operation, stopOptions)
+        await closeWithin(operation, stopOptions, owned)
       } else {
         await stopShared(stopOptions)
         logger.debug('consumer has stopped, disconnecting', { groupId })
@@ -566,14 +621,8 @@ module.exports = (params) => {
       })
       throw e
     } finally {
-      if (keepResets) {
-        obligations.unlink()
-      } else {
-        removeTopicRecreatedListener && removeTopicRecreatedListener()
-        removeTopicRecreatedListener = null
-        obligations.clear()
-        releaseDiscoveryScope()
-      }
+      if (keepResets) owned.obligations.unlink()
+      else endLife(owned)
     }
   }
 
@@ -586,9 +635,10 @@ module.exports = (params) => {
    * forced close settles claims no remote outcome, because a transmitted commit can still apply.
    * @param {ConsumerOperation} operation the close scope
    * @param {{ leaveGroup?: boolean }} [stopOptions]
+   * @param {ControlLifetime} owned the lifetime this close ends; its calls and connect are retired
    * @returns {Promise<void>} rejects only for an ordinary failure of a close that was not forced
    */
-  const closeWithin = async (operation, stopOptions) => {
+  const closeWithin = async (operation, stopOptions, owned) => {
     const captured = runner
     let disconnecting = null
     /** Starts the close's one cluster disconnect; later calls share it. */
@@ -604,7 +654,7 @@ module.exports = (params) => {
     const unregister = operation.register(() => {
       forced = true
       captured?.retire(consumerStoppingError())
-      for (const call of [...activeCalls]) call.retire(consumerStoppingError())
+      owned.retire(consumerStoppingError())
       disconnectCluster(0).then(forcedDone, (error) => {
         logger.warn('Disconnecting the cluster failed', { error: error.message })
         forcedDone()
@@ -636,6 +686,7 @@ module.exports = (params) => {
   const closeShared = (options) => {
     if (closing) {
       stopGeneration++
+      closing.joins++
       return closing.promise
     }
 
@@ -643,7 +694,8 @@ module.exports = (params) => {
     const operation = new ConsumerOperation({
       deadlineAt: timeout === undefined ? Infinity : performance.now() + timeout,
     })
-    const record = { operation, promise: null }
+    const record = { operation, promise: null, joins: 0 }
+    life.ending = true
     record.promise = shutDown(options, {}, operation).finally(() => {
       if (closing === record) closing = null
       operation.finish()
@@ -653,11 +705,11 @@ module.exports = (params) => {
   }
 
   /**
-   * Settles a lifecycle request made from inside a rebalance callback. The cleanup keeps running
-   * and its failure is logged; the caller's promise resolves on a later turn instead of awaiting
-   * the round that is itself waiting for that callback.
+   * Accepts a lifecycle request made from inside a rebalance callback. The cleanup keeps running
+   * and its failure is logged. The caller returns without awaiting it, so an async API settles on
+   * the next microtask instead of awaiting the round that is itself waiting for that callback.
    * @param {Promise<void>} cleanup the shared cleanup the request started
-   * @returns {Promise<void>} request acceptance
+   * @returns {void}
    */
   const acceptFromHook = (cleanup) => {
     cleanup.catch((e) => {
@@ -666,7 +718,6 @@ module.exports = (params) => {
         groupId,
       })
     })
-    return new Promise((resolve) => setImmediate(resolve))
   }
 
   /**
@@ -693,7 +744,8 @@ module.exports = (params) => {
   const disconnect = async (options) => {
     refuseRetiredCaller()
     const cleanup = closeShared(parseDisconnectOptions(options))
-    return RebalanceHooks.current() ? acceptFromHook(cleanup) : cleanup
+    if (RebalanceHooks.current()) return acceptFromHook(cleanup)
+    return cleanup
   }
 
   /**
@@ -706,6 +758,7 @@ module.exports = (params) => {
    */
   const stopShared = sharedPromiseTo(async (options, operation) => {
     runSlot = null
+    life.cancelRestart()
     const stopping = runner
     try {
       if (stopping) {
@@ -718,7 +771,6 @@ module.exports = (params) => {
         instrumentationEmitter.emit(STOP)
       }
 
-      clearTimeout(restartTimeout)
       logger.info('Stopped', { groupId })
     } catch (e) {
       logger.error(`Caught error when stopping the consumer: ${e.message}`, {
@@ -746,30 +798,29 @@ module.exports = (params) => {
     }
     stopGeneration++
     const cleanup = stopShared()
-    return RebalanceHooks.current() ? acceptFromHook(cleanup) : cleanup
+    if (!RebalanceHooks.current()) return cleanup
+    acceptFromHook(cleanup)
+    return Promise.resolve()
   }
 
   /**
-   * Ends a consumer that borrows its creator's cluster (see `disposeConsumer`): waits for a start
-   * that is still in flight, since a `stop()` that lands before the runner is running does
-   * nothing and the member would join and stay; stops it as `stop()` does; then gives up what it
-   * registered on the cluster, the topic-recreation listener and its reset obligations. Unlike
-   * `disconnect()` it leaves the cluster connected, because the cluster is shared with the
-   * operations around it. The consumer is not reused. Idempotent. The listener is released even
-   * when the stop fails, and the failure is rethrown.
+   * Ends a consumer that borrows its creator's cluster (see `disposeConsumer`): requests the stop
+   * first, so a start that is still connecting joins nothing, then waits for that start to settle;
+   * then gives up what it registered on the cluster, the topic-recreation listener and its reset
+   * obligations. Unlike `disconnect()` it leaves the cluster connected, because the cluster is
+   * shared with the operations around it. The consumer is not reused. Idempotent. The listener is
+   * released even when the stop fails, and the failure is rethrown.
    * @returns {Promise<void>}
    */
   const dispose = async () => {
     stopGeneration++
+    const owned = life
+    owned.ending = true
 
     try {
-      await pendingStart
-      await stopShared()
+      await Promise.all([stopShared(), pendingStart])
     } finally {
-      removeTopicRecreatedListener && removeTopicRecreatedListener()
-      removeTopicRecreatedListener = null
-      obligations.clear()
-      releaseDiscoveryScope()
+      endLife(owned)
     }
   }
 
@@ -943,7 +994,9 @@ module.exports = (params) => {
       manual ? 'manual' : groupProtocol,
       hasGroup
     )
-    ensureTopicRecreatedSubscription()
+    const waiting = earlierClose()
+    if (waiting) await waiting
+    acquireLife()
 
     if (consumerGroup) {
       logger.warn('consumer#run was called, but the consumer is already running', { groupId })
@@ -951,7 +1004,7 @@ module.exports = (params) => {
     }
 
     const start = async (onCrash) => {
-      ensureTopicRecreatedSubscription()
+      const owned = acquireLife()
       logger.info('Starting', { groupId })
 
       registerDiscoveryScope()
@@ -1014,7 +1067,7 @@ module.exports = (params) => {
         autoCommitInterval,
         autoCommitThreshold,
         operations: offsetOperations(),
-        obligations,
+        obligations: owned.obligations,
         rebalanceListener: listener,
       })
       for (const seekEntry of seeks) consumerGroup.seek(seekEntry)
@@ -1031,7 +1084,7 @@ module.exports = (params) => {
         eachBatchAutoResolve,
         eachBatch,
         eachMessage,
-        onCrash,
+        onCrash: (error) => onCrash(error, owned),
         onJoinComplete: () => recordJoin(group),
         concurrency,
         maxPrefetchBatches,
@@ -1042,12 +1095,19 @@ module.exports = (params) => {
       await started
     }
 
-    const onCrash = async (e) => {
+    const onCrash = async (e, owned) => {
       logger.error(`Crash: ${e.name}: ${e.message}`, {
         groupId,
         retryCount: e.retryCount,
         stack: e.stack,
       })
+
+      if (owned.fence.closed) {
+        logger.warn('A run of a closed connection crashed late; nothing more is done for it', {
+          groupId,
+        })
+        return
+      }
 
       if (e.name === 'KafkaJSConnectionClosedError') {
         cluster.removeBroker({ host: e.host, port: e.port, source: failureSourceOf(e) })
@@ -1102,7 +1162,7 @@ module.exports = (params) => {
         shouldRestart = false
       }
 
-      if (shouldRestart && stopGeneration !== crashStopGeneration) {
+      if (shouldRestart && (stopGeneration !== crashStopGeneration || owned.fence.closed)) {
         // The user called disconnect()/stop() during the crash cleanup or while restartOnFailure
         // was deciding: do not resurrect a consumer they believe is gone.
         logger.warn(
@@ -1127,10 +1187,11 @@ module.exports = (params) => {
         })
 
         // Created outside any handler or callback store: the restart must not inherit its authority.
-        restartTimeout = handlerContext.run(null, () =>
+        owned.restartTimer = handlerContext.run(null, () =>
           RebalanceHooks.outside(() =>
             setTimeout(() => {
-              if (stopGeneration === crashStopGeneration) start(onCrash)
+              owned.restartTimer = null
+              if (stopGeneration === crashStopGeneration && !owned.fence.closed) start(onCrash)
             }, retryTime)
           )
         )
@@ -1563,7 +1624,7 @@ module.exports = (params) => {
    * @returns {void}
    */
   const retainTopics = (keep) => {
-    obligations.retain(keep)
+    life.obligations.retain(keep)
     if (privateState) {
       for (const topic of keys(privateState.offsets)) {
         if (!keep.has(topic)) delete privateState.offsets[topic]
@@ -1602,7 +1663,8 @@ module.exports = (params) => {
         },
       })
     )
-    return RebalanceHooks.current() ? acceptFromHook(cleanup) : cleanup
+    if (RebalanceHooks.current()) return acceptFromHook(cleanup)
+    return cleanup
   }
 
   /**

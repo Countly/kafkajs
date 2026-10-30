@@ -7,6 +7,7 @@ const { fencedDelay } = require('../fetchPreparation')
 const ResetObligations = require('./resetObligations')
 const { ResetResolver } = require('../offsetReset')
 const { KafkaJSError, KafkaJSCommitFailedError, isStaleCoordinator } = require('../../errors')
+const { isCallDeadline } = require('../groupProtocol/interface')
 const {
   stampGeneration,
   stampOffsetCommit,
@@ -291,7 +292,9 @@ module.exports = class OffsetManager {
    *   binds the coordinator discovery and the metadata refresh a refused topic id starts
    * @returns {Promise<object>} the decoded response
    * @throws {Error} whatever the coordinator answered, stamped; a refusal from the caller's guard
-   *   replaces it before any ownership loss or commit-error callback is published
+   *   replaces it, and only a public call's expired deadline (`isCallDeadline`) first lets the
+   *   original answer's ownership loss be learned for its own token. A retired run or a forced
+   *   close publishes nothing
    */
   async sendOffsetCommit(payload, { guard = null, fence } = {}) {
     const token = this.ownership?.token()
@@ -319,19 +322,21 @@ module.exports = class OffsetManager {
           stampGeneration(stampOffsetCommit(refusal), payload.groupGenerationId),
           token
         )
-      const callerRefusal = guard?.()
-      if (callerRefusal) throw stampRefusal(callerRefusal)
       const stamped = stampMembership(
         stampOwnership(stampGeneration(stampOffsetCommit(error), payload.groupGenerationId), token),
         revision
       )
-      const lost = learnOwnershipLoss(
-        this.ownership,
-        stamped,
-        REBALANCE_PATHS.OFFSET_COMMIT,
-        this.membershipProtocol
-      )
-      if (lost) this.onCommitError?.(stamped)
+      const callerRefusal = guard?.()
+      if (!callerRefusal || isCallDeadline(callerRefusal)) {
+        const lost = learnOwnershipLoss(
+          this.ownership,
+          stamped,
+          REBALANCE_PATHS.OFFSET_COMMIT,
+          this.membershipProtocol
+        )
+        if (lost) this.onCommitError?.(stamped)
+      }
+      if (callerRefusal) throw stampRefusal(callerRefusal)
       const refusal = check()
       if (refusal) throw stampRefusal(refusal)
       if (error.type === UNKNOWN_TOPIC_ID) await this.refreshAfterUnknownTopicId(fence)

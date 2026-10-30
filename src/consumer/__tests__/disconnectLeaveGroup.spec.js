@@ -262,7 +262,7 @@ describe('Consumer > disconnect({ leaveGroup })', () => {
 
       await consumer.disconnect({ leaveGroup: false })
 
-      expect(commit).toHaveBeenCalledWith(OWNED)
+      expect(commit).toHaveBeenCalledWith(OWNED, { operation: expect.any(ConsumerOperation) })
       expect(revoked).toEqual([OWNED])
       expect(leaves).toEqual([])
     })

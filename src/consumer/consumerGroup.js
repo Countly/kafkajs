@@ -436,7 +436,7 @@ module.exports = class ConsumerGroup {
     this.groupMembership.attach({
       rebalanceCoordinator,
       heartbeatManager,
-      commitBeforeRelease: (partitions) => this.commitBeforeRelease(partitions),
+      commitBeforeRelease: (...args) => this.commitBeforeRelease(...args),
     })
   }
 
@@ -1085,7 +1085,7 @@ module.exports = class ConsumerGroup {
         const key = `${topic}|${partition}`
         if (!this.acquired.has(key)) {
           const acquiredAt = ++this.acquireClock
-          this.acquired.set(key, { acquiredAt, changedAt: acquiredAt })
+          this.acquired.set(key, { acquiredAt, changedAt: acquiredAt, recreatedAt: 0 })
         }
       }
     }
@@ -1697,7 +1697,7 @@ module.exports = class ConsumerGroup {
     this.positionValidator.forgetTopic(topic, this.offsetManager.memberAssignment[topic])
     this.offsetManager.resetOffsetsForTopic(topic)
     for (const partition of this.offsetManager.memberAssignment[topic]) {
-      this.markChanged(topic, partition)
+      this.markRecreated(topic, partition)
       this.haltedPartitions.delete(`${topic}|${partition}`)
     }
   }
@@ -1714,6 +1714,19 @@ module.exports = class ConsumerGroup {
   markChanged(topic, partition) {
     const acquired = this.acquired.get(`${topic}|${partition}`)
     if (acquired) acquired.changedAt = ++this.acquireClock
+  }
+
+  /**
+   * Records that the topic of an owned partition was recreated: a change as `markChanged` stamps,
+   * plus the same clock value as `recreatedAt`, so a batch fetched under an earlier clock is
+   * known to hold records of the old incarnation (`Runner#isRecreated`).
+   * @param {string} topic
+   * @param {number} partition
+   * @returns {void}
+   */
+  markRecreated(topic, partition) {
+    const acquired = this.acquired.get(`${topic}|${partition}`)
+    if (acquired) acquired.changedAt = acquired.recreatedAt = ++this.acquireClock
   }
 
   pause(topicPartitions) {
@@ -1817,21 +1830,28 @@ module.exports = class ConsumerGroup {
    * @param {import('./groupProtocol/interface').TopicPartitions[]} partitions the partitions this
    *   member is about to stop owning
    * @returns {Promise<void>} always resolves
-   * @param {object} [options] private round scope
+   * @param {object} [options] private scope; a rebalance `round` or a close `operation`, not both
    * @param {object} [options.round] owns the original monotonic budget, polls and transmission
+   * @param {import('./groupProtocol/interface').ConsumerOperation} [options.operation] the close that
+   *   owns a leave's final commit: it bounds and fences the lookup, the write, the stale-epoch wait
+   *   and the local publication, and the manager and token captured at entry stay the only ones used.
+   *   A runner that was retired refuses the commit whatever the scope.
    */
-  async commitBeforeRelease(partitions, { round } = {}) {
+  async commitBeforeRelease(partitions, { round, operation } = {}) {
     if (!this.autoCommit || !this.offsetManager || !partitions.length) {
       return
     }
 
-    const deadline = round ? round.roundDeadlineAt : Date.now() + this.rebalanceTimeout
+    const scope = round ?? this.closeScope(operation)
+    const deadline = scope ? scope.roundDeadlineAt : Date.now() + this.rebalanceTimeout
     const capturedManager = this.offsetManager
-    const current = () => !round || (!round.guard() && this.offsetManager === capturedManager)
+    const retired = () => this.rebalanceCoordinator?.runner?.retirement ?? null
+    const refusal = () => scope?.guard() || retired()
+    const current = () => !refusal() && (!scope || this.offsetManager === capturedManager)
 
     for (;;) {
       if (!current()) return
-      const manager = round ? capturedManager : this.offsetManager
+      const manager = scope ? capturedManager : this.offsetManager
       // The manager's membership snapshot is still the previous generation at this point: it is
       // written at construction and at `updateAssignment`, and this call deliberately precedes
       // both.
@@ -1845,14 +1865,14 @@ module.exports = class ConsumerGroup {
         if (!current()) return
         const commit = () => {
           if (!current()) return
-          return manager.commitOffsets({}, { partitions, guard: round?.guard })
+          return manager.commitOffsets({}, { partitions, guard: refusal, fence: operation })
         }
-        if (round) await round.wait(commit)
+        if (scope) await scope.wait(commit)
         else await commit()
         return
       } catch (e) {
         if (!current()) return
-        if (!(await this.awaitFreshEpochFor(e, deadline, round))) {
+        if (!(await this.awaitFreshEpochFor(e, deadline, scope))) {
           if (!current()) return
           this.logger.warn(
             'Commit before releasing partitions failed; proceeding with the rebalance',
@@ -1867,6 +1887,24 @@ module.exports = class ConsumerGroup {
           return
         }
       }
+    }
+  }
+
+  /**
+   * A close operation as the scope of a pre-release commit, with the round's shape: its guard, its
+   * cancellable wait and delay, and the monotonic deadline, which is the close's own and never later
+   * than the rebalance timeout.
+   * @private
+   * @param {import('./groupProtocol/interface').ConsumerOperation} [operation]
+   * @returns {object|undefined} undefined without an operation
+   */
+  closeScope(operation) {
+    if (!operation) return undefined
+    return {
+      guard: operation.guard,
+      wait: (action) => operation.wait(action),
+      delay: (delay) => operation.sleep(delay),
+      roundDeadlineAt: Math.min(operation.deadlineAt, performance.now() + this.rebalanceTimeout),
     }
   }
 
@@ -1917,8 +1955,8 @@ module.exports = class ConsumerGroup {
     )
   }
 
-  async heartbeat({ interval }) {
-    return this.groupMembership.heartbeat({ interval })
+  async heartbeat({ interval, guard }) {
+    return this.groupMembership.heartbeat({ interval, guard })
   }
 
   /**

@@ -1,5 +1,6 @@
 const { EventEmitter } = require('node:events')
 const { CommitEpisodeProbe } = require('./fixtures/commitEpisodeProbe')
+const { exampleTranscript, judge } = require('./fixtures/listenerOracle')
 const { CleanupStack } = require('../../producer/__tests__/fixtures/liveProbe')
 
 const OFFSET_COMMIT = 8
@@ -89,5 +90,32 @@ describe('CommitEpisodeProbe correlation', () => {
     expect(
       probe.correlate({ partition: 0, after: 0, before: Infinity, single: true })
     ).toMatchObject({ partition: 0, offset: 50, apiKey: OFFSET_COMMIT, correlationId: 9 })
+  })
+})
+
+describe('listener oracle expected close episode', () => {
+  it('accepts the example, whose second close episode is expected and eligible', () => {
+    expect(judge(exampleTranscript())).toEqual([])
+  })
+
+  it('rejects an expected episode whose held commit response never came', () => {
+    const transcript = exampleTranscript()
+    Object.assign(transcript.episodes[1], { eligible: false, correlation: null })
+    expect(judge(transcript)).toEqual([expect.stringMatching(/expected to commit at close/)])
+  })
+
+  it('rejects a transcript with no expected close episode when one is required', () => {
+    const transcript = exampleTranscript()
+    for (const episode of transcript.episodes) episode.expected = false
+    expect(judge(transcript)).toEqual([expect.stringMatching(/no close episode was expected/)])
+  })
+
+  it('accepts a legitimately empty close when no episode is required', () => {
+    const transcript = exampleTranscript()
+    transcript.requireExpected = false
+    for (const episode of transcript.episodes) {
+      Object.assign(episode, { expected: false, eligible: false, correlation: null })
+    }
+    expect(judge(transcript)).toEqual([])
   })
 })

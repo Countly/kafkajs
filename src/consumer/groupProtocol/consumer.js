@@ -397,7 +397,7 @@ module.exports = class ConsumerGroupProtocol {
     this.rebalanceCoordinator = null
     /** @type {Object|null} set by `attach` */
     this.heartbeatManager = null
-    /** @type {((partitions: import('./interface').TopicPartitions[]) => Promise<void>)|null} */
+    /** @type {((partitions: import('./interface').TopicPartitions[], options?: object) => Promise<void>)|null} */
     this.commitBeforeRelease = null
     /** @type {Promise<void>|null} the leave on the wire, whichever entry point started it */
     this.inFlightLeave = null
@@ -522,7 +522,7 @@ module.exports = class ConsumerGroupProtocol {
   /**
    * Late-bound collaborators.
    * @param {{ rebalanceCoordinator: Object, heartbeatManager: Object,
-   *   commitBeforeRelease?: ((partitions: import('./interface').TopicPartitions[]) => Promise<void>)|null }} deps
+   *   commitBeforeRelease?: ((partitions: import('./interface').TopicPartitions[], options?: object) => Promise<void>)|null }} deps
    * @returns {void}
    */
   attach({ rebalanceCoordinator, heartbeatManager, commitBeforeRelease = null }) {
@@ -1618,10 +1618,14 @@ module.exports = class ConsumerGroupProtocol {
 
   /**
    * The leave itself, run once however many callers asked for it: commit, report the partitions,
-   * send the leave heartbeat, park the member out of the group.
+   * send the leave heartbeat, park the member out of the group. Under a close `operation` the
+   * commit is bounded and fenced by it, and once it expires nothing further is reported, mutated or
+   * sent from this abandoned continuation.
    * @private
-   * @param {{ leaveGroup?: boolean }} [options] see `leave`
+   * @param {{ leaveGroup?: boolean, operation?: import('./interface').ConsumerOperation }} [options]
+   *   see `leave`
    * @returns {Promise<void>}
+   * @throws {Error} the operation's refusal, when it expired during the commit
    */
   async performLeave(options) {
     // Whatever join was in flight is abandoned by the leave, from every state, and it is FAILED
@@ -1645,15 +1649,18 @@ module.exports = class ConsumerGroupProtocol {
 
     const releasing = this.ownedPartitions
 
+    const operation = options?.operation
+
     if (this.memberEpoch > 0) {
-      await this.releaseOwnedPartitions(releasing)
+      await this.releaseOwnedPartitions(releasing, operation)
+      operation?.check()
       this.emitPartitions(PARTITIONS_REVOKED, releasing)
     } else if (releasing.length) {
       // Already out of the group: nothing may be committed under an epoch the coordinator dropped.
       this.emitPartitions(PARTITIONS_LOST, releasing)
     }
 
-    await this.sendLeaveHeartbeat(options?.leaveGroup, options?.operation)
+    await this.sendLeaveHeartbeat(options?.leaveGroup, operation)
   }
 
   /**
@@ -1728,15 +1735,20 @@ module.exports = class ConsumerGroupProtocol {
   }
 
   /**
+   * Commits what the member owns before it gives the partitions up. A failure is logged and the
+   * leave goes on, unless the close `operation` expired, which the caller checks next.
    * @private
    * @param {import('./interface').TopicPartitions[]} partitions
+   * @param {import('./interface').ConsumerOperation} [operation] the close that owns this leave
    * @returns {Promise<void>}
    */
-  async releaseOwnedPartitions(partitions) {
+  async releaseOwnedPartitions(partitions, operation) {
     if (!this.commitBeforeRelease || !partitions.length) return
 
     try {
-      await this.commitBeforeRelease(partitions)
+      await (operation
+        ? this.commitBeforeRelease(partitions, { operation })
+        : this.commitBeforeRelease(partitions))
     } catch (error) {
       this.logger.warn('Commit before leaving the group failed; leaving anyway', {
         groupId: this.groupId,

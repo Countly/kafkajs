@@ -367,7 +367,11 @@ class HaltCase {
     expect(this.group.assignmentEpoch).toBeGreaterThan(0)
     for (const partition of this.partitions) {
       const acquired = this.group.acquired.get(`${TOPIC}|${partition}`)
-      expect(acquired).toEqual({ acquiredAt: expect.any(Number), changedAt: expect.any(Number) })
+      expect(acquired).toEqual({
+        acquiredAt: expect.any(Number),
+        changedAt: expect.any(Number),
+        recreatedAt: 0,
+      })
       expect(acquired.acquiredAt).toBeGreaterThan(0)
       expect(acquired.changedAt).toBe(acquired.acquiredAt)
     }

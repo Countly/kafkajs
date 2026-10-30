@@ -366,6 +366,8 @@ await consumer.disconnect({ leaveGroup: false }) // do not tell the group, even 
 
 await consumer.disconnect({timeout:3000,leaveGroup:true}) bounds cleanup for the run captured at entry. At the boundary, client-owned timers, waits and queued unsent work are retired, and old continuations cannot change a replacement run. Application promises are detached if still pending. Operational cleanup of a valid call resolves; invalid options reject before state changes. A commit already transmitted before the boundary can still apply remotely, so read broker offsets before deciding its outcome.
 
+`connect()` or `run()` called while an earlier `disconnect()` is still running waits for that close to finish (a forced `timeout` ends the wait at its deadline), so a late close never disconnects the new connection. Calls made from a handler or rebalance callback of the run being closed do not wait.
+
 A classic static member that leaves with `true` sends its member id and its `groupInstanceId`, so the coordinator checks the pair and answers `FENCED_INSTANCE_ID` for a member id that is no longer the instance's current one instead of removing someone else's membership. The Java client sends the member id alone.
 
 ## <a name="pause-resume"></a> Pause & Resume
@@ -500,7 +502,7 @@ Callbacks share the remaining rebalance deadline; each callback does not receive
 
 Within assigned, await `committed()` to read broker offsets and metadata, then use `seek()` and await `position()` to load an external starting offset before delivery. Within revoked, `position()` reads quiescent next progress. Position is not proof of a durable broker commit. Hook seeks and local resolution do not settle a recreation reset; only the confirmed current-incarnation durable commit does.
 
-Client calls from a settled, expired or retired callback are refused. Valid callbacks can request stop, disconnect or unsubscribe without waiting on their own round; the returned request promise does not wait for cleanup completion. Calling run or subscribe from a hook is rejected. User promises that continue later keep their original authority and cannot mutate a replacement run.
+Client calls from a settled, expired or retired callback are refused. Valid callbacks can request stop, disconnect or unsubscribe without waiting on their own round; the returned promise settles on the next microtask and does not wait for cleanup completion; an outside caller of the same API waits for the whole shared close. Calling run or subscribe from a hook is rejected. User promises that continue later keep their original authority and cannot mutate a replacement run.
 
 `await consumer.enforceRebalance(reason?)` requests a classic revoked rejoin and resolves when accepted. The default reason is `enforced-rebalance`; an explicit request while a round runs is a no-op. Manual and consumer-protocol consumers reject it. Custom assigner protocol metadata is rebuilt for the new join.
 

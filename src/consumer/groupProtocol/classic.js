@@ -137,7 +137,7 @@ module.exports = class ClassicGroupProtocol {
     /** @type {Object|null} set by `attach`, absent until a `Runner` exists */
     this.heartbeatManager = null
 
-    this.sharedHeartbeat = sharedPromiseTo(async ({ interval }) => {
+    this.sharedHeartbeat = sharedPromiseTo(async ({ interval, guard }) => {
       const { groupId, generationId, memberId } = this
       const token = this.ownership?.token()
       const { membershipRevision } = this
@@ -153,7 +153,9 @@ module.exports = class ClassicGroupProtocol {
 
         try {
           const coordinator = await this.liveCoordinator()
-          await coordinator.heartbeat(payload)
+          const refusal = guard?.()
+          if (refusal) throw refusal
+          await coordinator.heartbeat(guard ? { ...payload, guard } : payload)
         } catch (e) {
           if (losesCoordinator(e)) {
             this.coordinatorUnknown = true
@@ -731,12 +733,14 @@ module.exports = class ClassicGroupProtocol {
 
   /**
    * Sends a heartbeat when the interval has passed, on a coordinator found again if the cached one
-   * was retired. Concurrent calls share one request.
-   * @param {{ interval: number }} options
+   * was retired. Concurrent calls share one request, and the first caller's `guard` governs it.
+   * @param {{ interval: number, guard?: () => Error|null }} options `guard` is the caller's refusal,
+   *   checked again after the coordinator lookup and before the write
    * @returns {Promise<void>}
+   * @throws {Error} the guard's refusal, when it refuses after the lookup
    */
-  async heartbeat({ interval }) {
-    return this.sharedHeartbeat({ interval })
+  async heartbeat({ interval, guard }) {
+    return this.sharedHeartbeat({ interval, guard })
   }
 
   /**

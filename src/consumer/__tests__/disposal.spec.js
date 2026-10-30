@@ -74,7 +74,7 @@ describe('Consumer > disposal of a consumer that borrows its creator cluster', (
     expect(cluster.disconnect).not.toHaveBeenCalled()
   })
 
-  test('a consumer still starting is stopped only once its start has settled', async () => {
+  test('a consumer still starting is asked to stop at once and disposal ends with its start', async () => {
     const cluster = createCluster()
     let settleStart
     jest.spyOn(Runner.prototype, 'start').mockReturnValue(new Promise((r) => (settleStart = r)))
@@ -83,9 +83,11 @@ describe('Consumer > disposal of a consumer that borrows its creator cluster', (
     await consumer.subscribe({ topic: TOPIC, fromBeginning: true })
     const running = consumer.run({ eachMessage: async () => {} })
 
-    const disposed = disposeConsumer(consumer)
+    let finished = false
+    const disposed = disposeConsumer(consumer).then(() => (finished = true))
     await new Promise((resolve) => setImmediate(resolve))
-    expect(stop).not.toHaveBeenCalled()
+    expect(stop).toHaveBeenCalledTimes(1)
+    expect(finished).toBe(false)
 
     settleStart()
     await Promise.all([running, disposed])

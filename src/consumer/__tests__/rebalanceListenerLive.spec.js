@@ -28,6 +28,8 @@ const CLEANUP_BUDGET_MS = 15000
 const PARTITIONS = 6
 const RECORDS_PER_PARTITION = 100
 const HEAD_PER_PARTITION = 50
+const TAIL_PER_PARTITION = 10
+const FINAL_AUTO_COMMIT_THRESHOLD = 1000000
 const HANDLER_PAUSE_MS = 10
 const SESSION_TIMEOUT_MS = 30000
 const REBALANCE_TIMEOUT_MS = 60000
@@ -118,6 +120,7 @@ class ListenerScenario {
     this.externalMap = new Map()
     this.produced = []
     this.deliveries = []
+    this.resolved = new Map()
     this.hooks = []
     this.fetches = []
     this.episodes = []
@@ -228,9 +231,10 @@ class ListenerScenario {
   /**
    * Starts one member whose callbacks load and save offsets through the external map.
    * @param {string} name the member label
+   * @param {number} [autoCommitThreshold] set on the member whose close must still hold progress
    * @returns {Promise<object>} the member
    */
-  async startMember(name) {
+  async startMember(name, autoCommitThreshold) {
     const { scope, cleanup, topic } = this
     const clientId = `e2e-p9c-listener-${this.id}-${name}`
     const chaos = createChaosSocketFactory(defaultSocketFactory())
@@ -253,7 +257,15 @@ class ListenerScenario {
             rebalanceTimeout: REBALANCE_TIMEOUT_MS,
           }),
     })
-    const member = { name, clientId, consumer, probe, assignedOnce: false, memberId: null }
+    const member = {
+      name,
+      clientId,
+      consumer,
+      probe,
+      assignedOnce: false,
+      memberId: null,
+      finalProgress: autoCommitThreshold !== undefined,
+    }
     this.members.push(name)
     cleanup.add(`consumer ${name}`, () => consumer.disconnect())
     probe.releaseOnCleanup(cleanup, name)
@@ -272,6 +284,7 @@ class ListenerScenario {
     const starting = step(scope, `The ${name} run`, () =>
       consumer.run({
         autoCommit: true,
+        autoCommitThreshold,
         partitionsConsumedConcurrently: 2,
         rebalanceListener: this.listenerOf(member),
         eachMessage: async ({ topic: delivered, partition, message }) => {
@@ -286,6 +299,7 @@ class ListenerScenario {
             ordinal,
           })
           await delay(scope, HANDLER_PAUSE_MS)
+          this.resolved.set(`${name}|${partition}`, Number(message.offset) + 1)
         },
       })
     )
@@ -381,6 +395,7 @@ class ListenerScenario {
    * Saves each revoked cell's quiescent position, reads the broker independently before the
    * callback returns, and records one episode per cell. At close the final commit response is held
    * after the broker acknowledged it, and the broker is read again while the member still waits.
+   * A close cell whose saved position is ahead of the broker's offset is expected to commit.
    * @param {object} member
    * @param {object} invocation
    * @param {number[]} cells the revoked partitions
@@ -402,8 +417,14 @@ class ListenerScenario {
     }
     const observed = await this.brokerOffsets()
     const closing = invocation.stage === 'close'
+    const expected = new Set(
+      closing ? cells.filter((cell) => saved.get(cell) > (observed.get(cell) ?? 0)) : []
+    )
+    if (closing && member.finalProgress && expected.size === 0) {
+      this.error ??= `The ${member.name} close callback found no cell ahead of the broker`
+    }
     if (closing) member.probe.arm()
-    invocation.pending = { cells, saved, processed, observed }
+    invocation.pending = { cells, saved, processed, observed, expected }
     member.episodesPending = [...(member.episodesPending ?? []), invocation]
   }
 
@@ -415,7 +436,7 @@ class ListenerScenario {
    */
   async completeEpisodes(member) {
     for (const invocation of member.episodesPending ?? []) {
-      const { cells, saved, processed, observed } = invocation.pending
+      const { cells, saved, processed, observed, expected } = invocation.pending
       const closing = invocation.stage === 'close'
       let brokerRead = observed
       let held = false
@@ -426,8 +447,9 @@ class ListenerScenario {
       for (const partition of cells) {
         let correlation = null
         let eligible = false
+        const mustCommit = closing && expected.has(partition)
         // A cell the member delivered nothing from has no offset to commit.
-        if ((!closing || held) && processed.get(partition) > 0) {
+        if (mustCommit ? held : !closing && processed.get(partition) > 0) {
           try {
             correlation = this.correlated(member, partition, invocation, closing)
             eligible = true
@@ -445,6 +467,7 @@ class ListenerScenario {
           processed: processed.get(partition),
           brokerObserved: brokerRead.get(partition) ?? null,
           eligible,
+          expected: mustCommit,
           correlation,
         })
       }
@@ -513,6 +536,41 @@ class ListenerScenario {
     await step(this.scope, `The ${member.name} disconnect`, () => closing)
   }
 
+  /**
+   * @param {string} name the member label
+   * @returns {boolean} whether, after its first-member peer's close callback returned, the member's
+   *   completed callbacks leave it owning every partition
+   */
+  ownsAllAfterPeerClose(name) {
+    if (!this.hooks.some((h) => h.stage === 'close' && h.member !== name && h.returnedOrdinal)) {
+      return false
+    }
+    const owned = new Set()
+    for (const hook of this.hooks) {
+      if (hook.member !== name || !hook.returnedOrdinal) continue
+      for (const partition of hook.partitions) {
+        if (hook.kind === 'assigned') owned.add(partition)
+        else owned.delete(partition)
+      }
+    }
+    return owned.size === PARTITIONS
+  }
+
+  /**
+   * @param {string} name the member label
+   * @returns {boolean} whether the member's handlers returned for the last acknowledged record of
+   *   every partition
+   */
+  resolvedAll(name) {
+    for (let partition = 0; partition < PARTITIONS; partition++) {
+      const last = Math.max(
+        ...this.produced.filter((p) => p.partition === partition).map((p) => p.offset)
+      )
+      if ((this.resolved.get(`${name}|${partition}`) ?? 0) < last + 1) return false
+    }
+    return true
+  }
+
   /** @returns {number} how many distinct records of the corpus were delivered at least once */
   coverage() {
     return new Set(this.deliveries.map((d) => `${d.partition}|${d.offset}`)).size
@@ -540,6 +598,7 @@ class ListenerScenario {
       episodes: this.episodes,
       seeks: this.seeks,
       replays: [],
+      requireExpected: true,
     }
   }
 }
@@ -569,7 +628,7 @@ const armBody = (label, arm) => async (scope) => {
         })
 
         state.stage = 'second member'
-        const second = await scenario.startMember('second')
+        const second = await scenario.startMember('second', FINAL_AUTO_COMMIT_THRESHOLD)
         await second.starting
         await pollUntil(
           scope,
@@ -615,12 +674,16 @@ const armBody = (label, arm) => async (scope) => {
 
         state.stage = 'first member leaves'
         await scenario.closeMember(first)
-        state.stage = 'the corpus'
+        state.stage = 'final progress'
+        await pollUntil(scope, WAIT_MS, () => scenario.ownsAllAfterPeerClose('second'), {
+          label: 'The second member reacquisition',
+        })
+        await scenario.produce(RECORDS_PER_PARTITION, RECORDS_PER_PARTITION + TAIL_PER_PARTITION)
         await pollUntil(
           scope,
           ARM_BUDGET_MS,
-          () => scenario.coverage() >= PARTITIONS * RECORDS_PER_PARTITION,
-          { label: 'The whole corpus' }
+          () => scenario.coverage() >= scenario.produced.length && scenario.resolvedAll('second'),
+          { label: 'The whole corpus and the second member progress' }
         )
         state.stage = 'second member leaves'
         await scenario.closeMember(second)
@@ -629,7 +692,9 @@ const armBody = (label, arm) => async (scope) => {
         verifyListenerEvidence(scenario.transcript())
         expect(scenario.seeks.length).toBeGreaterThan(0)
         for (const { read } of scenario.seeks) expect(read).toHaveProperty('metadata')
-        expect(scenario.produced).toHaveLength(PARTITIONS * RECORDS_PER_PARTITION)
+        expect(scenario.produced).toHaveLength(
+          PARTITIONS * (RECORDS_PER_PARTITION + TAIL_PER_PARTITION)
+        )
         expect(scenario.error).toBeNull()
         verdict = 'accepted'
         state.stage = 'passed'
@@ -644,15 +709,16 @@ const armBody = (label, arm) => async (scope) => {
           config: {
             protocol: arm.protocol,
             partitions: PARTITIONS,
-            records: PARTITIONS * RECORDS_PER_PARTITION,
+            records: PARTITIONS * (RECORDS_PER_PARTITION + TAIL_PER_PARTITION),
             members: 2,
             autoCommit: true,
+            finalAutoCommitThreshold: FINAL_AUTO_COMMIT_THRESHOLD,
             sessionTimeout: arm.sessionTimeout ?? null,
             rebalanceTimeout: arm.protocol === 'classic' ? REBALANCE_TIMEOUT_MS : null,
             budgetMs: ARM_BUDGET_MS,
           },
           replay: {
-            log: 'n/a: a fixed log of 600 records, acknowledged offsets kept apart from deliveries',
+            log: 'n/a: a fixed log of 660 records, acknowledged offsets kept apart from deliveries',
             offsets: 'every successful eligible episode equals its own saved quiescent position',
             handlers:
               'at least once by incarnation, partition and offset; repeats only in a declared interval',

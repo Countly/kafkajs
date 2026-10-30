@@ -154,6 +154,7 @@ module.exports = class Runner extends EventEmitter {
           isStatic: Boolean(this.consumerGroup.groupInstanceId),
         }),
       isRebalancing: () => this.rebalanceCoordinator.isRebalancing(),
+      guard: () => this.retirement ?? null,
     })
     this.rebalanceCoordinator = new RebalanceCoordinator({
       runner: this,
@@ -916,6 +917,7 @@ module.exports = class Runner extends EventEmitter {
     try {
       await this.consumerGroup.heartbeat({
         interval: this.consumerGroup.heartbeatInterval(),
+        guard: () => this.retirement ?? null,
       })
       this.outages.heartbeat.end()
     } catch (e) {
@@ -1045,12 +1047,11 @@ module.exports = class Runner extends EventEmitter {
         throw e
       }
 
-      this.consumerGroup.resolveOffset({
-        topic,
-        partition,
-        offset: message.offset,
-        leaderEpoch: message.batchContext ? message.batchContext.partitionLeaderEpoch : -1,
-      })
+      this.resolveBatchOffset(
+        batch,
+        message.offset,
+        message.batchContext ? message.batchContext.partitionLeaderEpoch : -1
+      )
 
       // The offset stays resolved - an EAGER quiesce still commits it through
       // `resolveRebalanceVerdict` - but a membership dropped while this message ran cannot carry
@@ -1099,12 +1100,7 @@ module.exports = class Runner extends EventEmitter {
               ? batch.lastOffset()
               : offset
 
-          this.consumerGroup.resolveOffset({
-            topic,
-            partition,
-            offset: offsetToResolve,
-            leaderEpoch: batch.leaderEpochAt(offsetToResolve),
-          })
+          this.resolveBatchOffset(batch, offsetToResolve, batch.leaderEpochAt(offsetToResolve))
         },
         heartbeat: () => this.heartbeat(),
         /**
@@ -1169,12 +1165,7 @@ module.exports = class Runner extends EventEmitter {
     // stop their consumers without resolving unprocessed offsets (issues/18)
     if (this.eachBatchAutoResolve) {
       const lastOffset = batch.lastOffset()
-      this.consumerGroup.resolveOffset({
-        topic,
-        partition,
-        offset: lastOffset,
-        leaderEpoch: batch.leaderEpochAt(lastOffset),
-      })
+      this.resolveBatchOffset(batch, lastOffset, batch.leaderEpochAt(lastOffset))
     }
   }
 
@@ -1290,9 +1281,10 @@ module.exports = class Runner extends EventEmitter {
   /**
    * Whether a batch has outlived the assignment it was fetched under.
    *
-   * Three ways it can: the partition moved to another member, it stayed but the offsets were
-   * replaced and the new assignment is already re-fetching the same records, or the membership
-   * itself was lost (a fence, an unknown member id, a poll-interval overrun). Either way,
+   * Four ways it can: the partition moved to another member, it stayed but the offsets were
+   * replaced and the new assignment is already re-fetching the same records, the membership
+   * itself was lost (a fence, an unknown member id, a poll-interval overrun), or its topic was
+   * recreated, so the records belong to the old incarnation (`isRecreated`). Either way,
    * delivering it duplicates records and committing for it moves an offset this member no longer
    * controls. Checked when a batch is picked up AND between messages, because a rebalance can
    * land in the middle of a batch a handler is already working through. A lost membership stops
@@ -1328,9 +1320,49 @@ module.exports = class Runner extends EventEmitter {
     const acquired = this.consumerGroup.acquired?.get(
       batch.ownershipKey || `${batch.topic}|${batch.partition}`
     )
-    if (batch.acquireClock != null && acquired && acquired.acquiredAt > batch.acquireClock)
+    if (
+      batch.acquireClock != null &&
+      acquired &&
+      (acquired.acquiredAt > batch.acquireClock || acquired.recreatedAt > batch.acquireClock)
+    )
       return true
     return !this.consumerGroup.isAssigned(batch.topic, batch.partition)
+  }
+
+  /**
+   * Whether the batch's topic was deleted and recreated after the batch was fetched, so its
+   * records belong to an incarnation this member no longer reads. Such a batch is stale for
+   * delivery and commits (`isBatchStale`), and its offsets are never resolved
+   * (`resolveBatchOffset`): they would name positions in a log that is not the new topic's. A
+   * handler already running may finish; Java likewise discards fetched data whose topic id no
+   * longer matches.
+   *
+   * @param {import('./batch')|object} batch a fetched batch or a handler's batch identity
+   * @returns {boolean}
+   */
+  isRecreated(batch) {
+    const acquired = this.consumerGroup.acquired?.get(
+      batch.ownershipKey || `${batch.topic}|${batch.partition}`
+    )
+    return batch.acquireClock != null && acquired?.recreatedAt > batch.acquireClock
+  }
+
+  /**
+   * Resolves the offset of a record a handler finished, unless the batch's topic was recreated
+   * since the batch was fetched, in which case the offset is dropped.
+   * @param {import('./batch')} batch the batch the record came from
+   * @param {string} offset the handled record's offset
+   * @param {number} leaderEpoch the epoch of the record at `offset`, -1 when none
+   * @returns {void}
+   */
+  resolveBatchOffset(batch, offset, leaderEpoch) {
+    if (this.isRecreated(batch)) return
+    this.consumerGroup.resolveOffset({
+      topic: batch.topic,
+      partition: batch.partition,
+      offset,
+      leaderEpoch,
+    })
   }
 
   /**
@@ -1441,12 +1473,7 @@ module.exports = class Runner extends EventEmitter {
         this.instrumentationEmitter.emit(START_BATCH_PROCESS, payload)
 
         const lastOffset = batch.lastOffset()
-        this.consumerGroup.resolveOffset({
-          topic: batch.topic,
-          partition: batch.partition,
-          offset: lastOffset,
-          leaderEpoch: batch.leaderEpochAt(lastOffset),
-        })
+        this.resolveBatchOffset(batch, lastOffset, batch.leaderEpochAt(lastOffset))
         await this.autoCommitOffsetsIfNecessary(null)
 
         this.instrumentationEmitter.emit(END_BATCH_PROCESS, {
@@ -1842,8 +1869,9 @@ module.exports = class Runner extends EventEmitter {
    *
    * With an API `operation` the whole call, first lookup included, runs under its one deadline: it
    * retries on the operation's own cancellable backoff and its guard refuses every later write. An
-   * operation with no deadline keeps the ordinary retrier, as an unset `retry.maxTotalTime` always
-   * did, and its guard still refuses writes once the call is retired.
+   * operation with no deadline keeps the ordinary retrier's schedule, as an unset `retry.maxTotalTime`
+   * always did, on backoff timers the operation owns: its guard refuses writes once the call is
+   * retired, and retirement removes a pending backoff timer and settles the call.
    * A commit made from a close callback runs while the stop is in progress; any other call
    * resolves at once, committing nothing, once the runner is no longer running.
    * @param {Object} offsets the offsets to commit
@@ -1882,7 +1910,7 @@ module.exports = class Runner extends EventEmitter {
     const retrier =
       operation && operation.deadlineAt !== Infinity
         ? (attempt) => operation.retry(attempt, this.retryOptions)
-        : this.commitRetrier
+        : (attempt) => this.commitRetrier(attempt, operation?.retryScope())
     return retrier(async (bail, retryCount, retryTime) => {
       try {
         const refusal = guard()

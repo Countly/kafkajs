@@ -31,7 +31,7 @@
 module.exports = class HeartbeatManager {
   /**
    * @param {object} options
-   * @param {{ heartbeat: (options: { interval: number }) => Promise<void> }} options.groupMembership
+   * @param {{ heartbeat: (options: { interval: number, guard?: () => Error|null }) => Promise<void> }} options.groupMembership
    * @param {import('./pollTimer')} options.pollTimer
    * @param {number} options.heartbeatInterval
    * @param {import('../../types').Logger} options.logger
@@ -41,6 +41,8 @@ module.exports = class HeartbeatManager {
    *   this manager, so the tick awaits it and then evaluates nothing further.
    * @param {() => boolean} [options.isRebalancing] whether a rebalance round is running right now;
    *   the poll deadline is not evaluated while one is
+   * @param {() => Error|null} [options.guard] the owner's refusal, handed to every heartbeat so a
+   *   request still awaiting its coordinator lookup sends nothing once the owner is retired
    */
   constructor({
     groupMembership,
@@ -50,6 +52,7 @@ module.exports = class HeartbeatManager {
     onError,
     onPollExpired,
     isRebalancing = () => false,
+    guard,
   }) {
     this.groupMembership = groupMembership
     this.pollTimer = pollTimer
@@ -58,6 +61,7 @@ module.exports = class HeartbeatManager {
     this.onError = onError
     this.onPollExpired = onPollExpired
     this.isRebalancing = isRebalancing
+    this.guard = guard
 
     this.handle = null
     this.disabled = false
@@ -254,7 +258,7 @@ module.exports = class HeartbeatManager {
     let rearm = false
 
     try {
-      await this.groupMembership.heartbeat({ interval: this.nextInterval() })
+      await this.groupMembership.heartbeat({ interval: this.nextInterval(), guard: this.guard })
     } catch (error) {
       // A result that landed after `stop()`, after the chain was re-armed under a new generation,
       // or inside the JoinGroup window belongs to a generation nobody is in any more: it is
