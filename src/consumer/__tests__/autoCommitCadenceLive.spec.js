@@ -25,6 +25,8 @@ const OFFER_EVERY_MS = 1000
 const OFFERS = QUIET_WINDOW_MS / OFFER_EVERY_MS
 const MAX_COMMIT_FRAMES = Math.ceil(QUIET_WINDOW_MS / INTERVAL_MS) + 2
 const MAX_WAIT_MS = 500
+/** The broker's smallest accepted session timeout, so the lost member's seat expires well inside a step. */
+const LOSS_SESSION_MS = 6000
 
 /**
  * One classic consumer over a fault wire that counts its commit frames. It delivers whole batches
@@ -38,8 +40,10 @@ class CadenceMember {
    * @param {LiveTopic} options.live
    * @param {string} options.name
    * @param {object} options.run the run options under test
+   * @param {number} [options.sessionTimeout] the classic session timeout in ms (the client default
+   *   when omitted); a member that is closed without leaving holds its group's next join this long
    */
-  constructor({ scope, cleanup, live, name, run }) {
+  constructor({ scope, cleanup, live, name, run, sessionTimeout }) {
     this.scope = scope
     this.live = live
     this.runOptions = run
@@ -49,7 +53,11 @@ class CadenceMember {
       brokers: live.brokers,
       logLevel: logLevel.NOTHING,
       socketFactory: this.wire.factory,
-    }).consumer({ groupId: live.groupId, maxWaitTimeInMs: MAX_WAIT_MS })
+    }).consumer({
+      groupId: live.groupId,
+      maxWaitTimeInMs: MAX_WAIT_MS,
+      ...(sessionTimeout === undefined ? {} : { sessionTimeout }),
+    })
     /** @type {Array<{topic: string, partition: number, value: string}>} */
     this.delivered = []
     this.batches = 0
@@ -285,6 +293,7 @@ describeCadence('Consumer > automatic commit cadence (live)', () => {
           live,
           name: 'first',
           run: { autoCommit: true, autoCommitInterval: 600000 },
+          sessionTimeout: LOSS_SESSION_MS,
         })
         await first.start()
         await first.delivery(20)
@@ -299,6 +308,7 @@ describeCadence('Consumer > automatic commit cadence (live)', () => {
           live,
           name: 'second',
           run: { autoCommit: true, autoCommitInterval: 600000 },
+          sessionTimeout: LOSS_SESSION_MS,
         })
         await second.start()
         await second.delivery(20)

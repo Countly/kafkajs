@@ -792,6 +792,77 @@ describe('a consumer close over a scripted broker', () => {
     expect(frames(rig.cluster, 'OffsetCommit')).toHaveLength(before)
   })
 
+  test('a replacement run starts after a held handler and a held hook are each detached', async () => {
+    await open()
+    const handlerGate = gate()
+    const hookGate = gate()
+    const detached = []
+    const delivered = []
+    let handlerHeld = false
+    let hookHeld = false
+    const consumer = rig.kafka.consumer({ groupId: GROUP, maxWaitTimeInMs: 20 })
+    consumers.push(consumer)
+    const runWith = ({ holdHandler = false, holdHook = false } = {}) => {
+      let entered = false
+      return consumer.run({
+        autoCommit: true,
+        autoCommitInterval: 60000,
+        rebalanceListener: holdHook
+          ? {
+              // Every eager round revokes the empty assignment first; only an owned one is held.
+              onPartitionsRevoked: async ({ partitions }) => {
+                if (partitions.length === 0) return
+                hookHeld = true
+                await hookGate.promise
+                detached.push(
+                  await consumer.commitOffsets([{ topic: TOPIC, partition: 0, offset: '1' }]).then(
+                    () => 'accepted',
+                    (error) => error.type ?? error.name
+                  )
+                )
+              },
+            }
+          : undefined,
+        eachMessage: async ({ message }) => {
+          delivered.push(message.value.toString())
+          if (holdHandler && !entered) {
+            entered = true
+            handlerHeld = true
+            await handlerGate.promise
+            detached.push(
+              await Promise.allSettled([
+                consumer.commitOffsets([{ topic: TOPIC, partition: 0, offset: '99' }]),
+              ]).then((results) => results.map(({ status }) => status))
+            )
+          }
+        },
+      })
+    }
+    const restart = async (options) => {
+      await consumer.connect()
+      await consumer.subscribe({ topic: TOPIC, fromBeginning: true })
+      await runWith(options)
+    }
+
+    await restart({ holdHandler: true })
+    await until(() => handlerHeld, 'the handler')
+    await consumer.disconnect({ timeout: BOUND_MS })
+
+    const before = delivered.length
+    await restart({ holdHook: true })
+    await until(() => delivered.length > before, 'the replacement deliveries')
+    handlerGate.resolve()
+    await until(() => detached.length === 1, 'the released handler')
+    expect(detached[0]).toEqual(['rejected'])
+
+    await consumer.disconnect({ timeout: BOUND_MS })
+    expect(hookHeld).toBe(true)
+    await restart()
+    hookGate.resolve()
+    await until(() => detached.length === 2, 'the released hook')
+    expect(detached[1]).not.toBe('accepted')
+  })
+
   test('hook disconnect acknowledges before its own cleanup completes', async () => {
     await open()
     const acknowledged = []

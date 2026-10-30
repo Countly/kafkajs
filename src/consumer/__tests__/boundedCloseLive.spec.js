@@ -108,7 +108,9 @@ class ClosingMember {
   /**
    * Connects, subscribes and runs. With `holdHandler` the handler enters once for the first record
    * and waits, after recording the closures a detached run would still hold; with `holdHook` the
-   * revoked callback waits the same way.
+   * revoked callback waits the same way, but only for owned partitions: every classic round also
+   * revokes the empty assignment before the first join, and a held callback there would keep `run`
+   * from resolving.
    * @param {object} [options]
    * @param {boolean} [options.holdHandler=false]
    * @param {boolean} [options.holdHook=false]
@@ -137,7 +139,8 @@ class ClosingMember {
           autoCommitInterval: 600000,
           rebalanceListener: holdHook
             ? {
-                onPartitionsRevoked: async () => {
+                onPartitionsRevoked: async ({ partitions }) => {
+                  if (partitions.length === 0) return
                   this.hookHeld = true
                   await hook
                   this.detached.push(
@@ -311,8 +314,9 @@ const detachedCase = (title, arm) => (scope) =>
     })
     observed.handlerCloseMs = await member.close()
     expect(observed.handlerCloseMs).toBeLessThan(CLOSE_TIMEOUT_MS + TEARDOWN_ALLOWANCE_MS)
+    const deliveredBefore = member.delivered.length
     await member.start({ holdHook: true })
-    await member.delivery(1)
+    await member.delivery(deliveredBefore + 1)
     member.releaseHandler()
     await pollUntil(scope, STEP_MS, () => member.detached.length >= 1, {
       label: 'The released handler',
