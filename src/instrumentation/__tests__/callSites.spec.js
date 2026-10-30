@@ -297,7 +297,7 @@ describe('Instrumentation > where the events are emitted', () => {
         kind: 'classic',
         heartbeatInterval: jest.fn(() => 3000),
         onStopRequested: jest.fn(),
-        startIdleWait: jest.fn(),
+        startIdleWait: jest.fn(() => ({})),
         beginRebalanceRound: jest.fn(() => ({
           guard: () => null,
           wait: (work) => work(),

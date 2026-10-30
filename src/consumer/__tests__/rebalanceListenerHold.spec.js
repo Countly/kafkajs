@@ -102,7 +102,7 @@ describe('admission holds against running handlers', () => {
       commitOffsetsIfNecessary: jest.fn(),
       heartbeat: jest.fn(),
       heartbeatInterval: () => 3000,
-      startIdleWait: jest.fn(),
+      startIdleWait: jest.fn(() => ({})),
       onStopRequested: jest.fn(),
       clearAssignerState: jest.fn(),
       leave: jest.fn(async () => {}),

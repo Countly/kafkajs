@@ -6,7 +6,13 @@
  * @see https://cwiki.apache.org/confluence/display/KAFKA/KIP-429%3A+Kafka+Consumer+Incremental+Rebalance+Protocol
  */
 
-const { KafkaJSNonRetriableError } = require('../../errors')
+const {
+  KafkaJSNonRetriableError,
+  KafkaJSDeliveryTimeout,
+  KafkaJSCommitFailedError,
+  KafkaJSNumberOfRetriesExceeded,
+} = require('../../errors')
+const createRetry = require('../../retry')
 
 /** Every member revokes its whole assignment before rejoining. */
 const EAGER = 'eager'
@@ -120,4 +126,264 @@ const selectRebalanceProtocol = (assigners) => {
   )
 }
 
-module.exports = { EAGER, COOPERATIVE, selectRebalanceProtocol }
+/**
+ * One consumer control operation, with one monotonic budget and detachable owned waits.
+ * Captured run, hook and ownership predicates remain caller-owned and are never recaptured.
+ * Retiring this scope does not cancel application promises or undo transmitted requests.
+ * Its `register`, `check` and `guard` match a producer `Generation`, so the same object is
+ * accepted as the `fence` of `Cluster`, `BrokerPool` and `createRetry`.
+ */
+class ConsumerOperation {
+  /**
+   * @param {object} [options] immutable entry context
+   * @param {number} [options.deadlineAt=Infinity] absolute performance.now() deadline
+   * @param {() => Error|null} [options.guard] original identity and ownership refusal
+   * @param {() => number} [options.now] monotonic clock, shared with the deadline owner
+   * @param {(cause?: Error) => Error} [options.onTimeout] original typed timeout factory
+   */
+  constructor({
+    deadlineAt = Infinity,
+    guard = () => null,
+    now = () => performance.now(),
+    onTimeout = (cause) =>
+      new KafkaJSDeliveryTimeout('Consumer operation deadline expired', { cause }),
+  } = {}) {
+    this.deadlineAt = deadlineAt
+    this.identityGuard = guard
+    this.now = now
+    this.onTimeout = onTimeout
+    this.error = null
+    this.lastError = undefined
+    this.waiters = new Set()
+    this.disposers = new Set()
+    this.timer = null
+    this.arm()
+  }
+
+  /**
+   * Checks time and original identity before an effect, including when timer delivery is late.
+   * A bound property, so it can be handed to the connection layer as a pre-write guard.
+   * @returns {Error|null} the first terminal refusal, stable across later checks
+   */
+  guard = () => {
+    if (this.error) return this.error
+    if (this.now() >= this.deadlineAt) this.retire(this.onTimeout(this.lastError))
+    if (!this.error) {
+      const error = this.identityGuard()
+      if (error) this.retire(error)
+    }
+    return this.error
+  }
+
+  /**
+   * Reports refusal to fence consumers that inspect lifecycle state before installing resources.
+   * @returns {boolean} true after retirement, identity refusal or actual deadline expiry
+   */
+  get closed() {
+    return this.guard() !== null
+  }
+
+  /**
+   * Throws a terminal refusal before starting work or publishing its result.
+   * @returns {void}
+   * @throws {Error} expiry, original identity refusal or explicit retirement
+   */
+  check() {
+    const error = this.guard()
+    if (error) throw error
+  }
+
+  /**
+   * Remaining original budget; this never renews it.
+   * @returns {number} nonnegative milliseconds, or Infinity
+   */
+  remaining() {
+    return Math.max(0, this.deadlineAt - this.now())
+  }
+
+  /**
+   * Owns at most one deadline wake. Early timer delivery re-arms the same original deadline.
+   * @private
+   * @returns {void}
+   */
+  arm() {
+    if (this.error || this.deadlineAt === Infinity) return
+    this.timer = setTimeout(
+      () => {
+        this.timer = null
+        if (!this.guard()) this.arm()
+      },
+      Math.min(2147483647, Math.max(0, Math.ceil(this.remaining())))
+    )
+  }
+
+  /**
+   * Registers synchronous client cleanup; the caller removes it when its resource settles.
+   * A retired operation cancels immediately.
+   * @param {(error: Error) => void} cancel remove one owned listener, timer or queue registration
+   * @returns {() => void} unregister without cancelling
+   */
+  register(cancel) {
+    const error = this.guard()
+    if (error) {
+      cancel(error)
+      return () => {}
+    }
+    this.disposers.add(cancel)
+    return () => this.disposers.delete(cancel)
+  }
+
+  /**
+   * Fences continuations, clears owned resources and rejects all client-facing waits once.
+   * Cleanup failures cannot prevent other cleanup or replace the first terminal reason.
+   * @param {Error} [error] original retirement reason
+   * @returns {void}
+   */
+  retire(error = new KafkaJSCommitFailedError('Consumer operation is no longer current')) {
+    if (this.error) return
+    this.error = error
+    if (this.timer !== null) clearTimeout(this.timer)
+    this.timer = null
+    for (const cancel of this.disposers) {
+      try {
+        cancel(error)
+      } catch {}
+    }
+    this.disposers.clear()
+    for (const reject of this.waiters) reject(error)
+    this.waiters.clear()
+  }
+
+  /**
+   * Releases a settled operation and refuses any orphaned continuation that retained it.
+   * @returns {void}
+   */
+  finish() {
+    this.retire()
+  }
+
+  /**
+   * Bounds a thunk without starting it after refusal; late rejection is always observed.
+   * Every effect inside the thunk must still call check after its own asynchronous boundaries.
+   * @template T
+   * @param {() => T|Promise<T>} action client operation or application callback invocation
+   * @returns {Promise<T>} settles at completion, expiry or explicit retirement
+   * @throws {Error} action failure, expiry or original identity refusal
+   */
+  wait(action) {
+    return new Promise((resolve, reject) => {
+      try {
+        this.check()
+      } catch (error) {
+        reject(error)
+        return
+      }
+      const fail = (error) => {
+        this.waiters.delete(fail)
+        reject(error)
+      }
+      this.waiters.add(fail)
+      let result
+      try {
+        result = action()
+      } catch (error) {
+        fail(error)
+        return
+      }
+      Promise.resolve(result).then((value) => {
+        this.waiters.delete(fail)
+        try {
+          this.check()
+          resolve(value)
+        } catch (error) {
+          reject(error)
+        }
+      }, fail)
+    })
+  }
+
+  /**
+   * Sleeps on a client-owned timer that retirement removes as well as settling the caller.
+   * @param {number} delay nonnegative milliseconds
+   * @returns {Promise<void>}
+   * @throws {Error} expiry, original identity refusal or explicit retirement
+   */
+  sleep(delay) {
+    return this.wait(
+      () =>
+        new Promise((resolve) => {
+          let unown = () => {}
+          const timer = setTimeout(() => {
+            unown()
+            resolve()
+          }, delay)
+          unown = this.register(() => clearTimeout(timer))
+        })
+    )
+  }
+
+  /**
+   * Retries only this consumer operation, retaining the original deadline across nested work.
+   * Uses the existing backoff and error rules without scheduling an unowned shared-retrier timer.
+   * @template T
+   * @param {(bail: (error: Error) => never, retryCount: number, retryTime: number) => T|Promise<T>} action attempt
+   * @param {object} [options] existing retry options; maxTotalTime is already captured at entry
+   * @returns {Promise<T>} accepted attempt result
+   * @throws {Error} original bail, terminal error, exhausted retry budget or scope refusal
+   */
+  async retry(action, options = {}) {
+    const configs = Object.assign({}, createRetry.defaults, options)
+    const backoff = createRetry.backoff(configs)
+    let retryTime = backoff.initial()
+    for (let retryCount = 0; ; retryCount++) {
+      this.check()
+      let bailed = false
+      let bailError
+      const bail = (error) => {
+        bailed = true
+        bailError = error || new Error('Aborted')
+        throw bailError
+      }
+      try {
+        const value = await this.wait(() => action(bail, retryCount, retryTime))
+        if (bailed) throw bailError
+        return value
+      } catch (error) {
+        this.check()
+        this.lastError = error
+        if (bailed) throw bailError
+        if (
+          error.retriable === false ||
+          ['RangeError', 'ReferenceError', 'SyntaxError', 'TypeError'].includes(error.name)
+        ) {
+          throw new KafkaJSNonRetriableError(error, {
+            cause: error.cause || error,
+          })
+        }
+        if (retryCount >= configs.retries) {
+          throw new KafkaJSNumberOfRetriesExceeded(error, {
+            retryCount,
+            retryTime,
+            cause: error.cause || error,
+          })
+        }
+        if (retryTime > this.remaining()) {
+          throw new KafkaJSDeliveryTimeout(
+            'Next consumer attempt would exceed its original deadline',
+            { cause: error }
+          )
+        }
+        const nextRetryTime = backoff.next(retryTime)
+        await this.sleep(retryTime)
+        retryTime = nextRetryTime
+      }
+    }
+  }
+}
+
+module.exports = {
+  EAGER,
+  COOPERATIVE,
+  selectRebalanceProtocol,
+  ConsumerOperation,
+}

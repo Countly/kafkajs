@@ -70,6 +70,10 @@ class GroupDescriptions {
 
   /**
    * @param {string[]} groupIds
+   * @param {{ operation?: import('../consumer/groupProtocol/interface').ConsumerOperation }} [context]
+   *   a consumer call's one deadline scope: its retries, lookups, refreshes and write guard replace
+   *   the ordinary ones, so nothing is retried, refreshed or sent once it expired. Absent for the
+   *   admin client, whose calls are unchanged.
    * @returns {Promise<{ groups: object[] }>} one row per id, NOT in input order, each carrying
    *          every field 2.2.4 returned plus the additive ones. An id a coordinator leaves out of
    *          its answer is described through the older API rather than dropped
@@ -78,9 +82,10 @@ class GroupDescriptions {
    *         newer API reports stays on that group's row instead; one DescribeGroups reports for an
    *         id that fell back to it fails the call, because that API's own parse throws every
    *         group-level code but GROUP_ID_NOT_FOUND
+   * @throws {Error} the operation's refusal once it expired or was retired
    */
-  async describe(groupIds) {
-    const described = await this.#describeByCoordinator(groupIds)
+  async describe(groupIds, { operation } = {}) {
+    const described = await this.#describeByCoordinator(groupIds, operation)
     const rows = described.filter(({ needsFallback }) => !needsFallback).map(({ row }) => row)
     const fallbacks = described.filter(({ needsFallback }) => needsFallback)
 
@@ -88,9 +93,12 @@ class GroupDescriptions {
       return { groups: rows }
     }
 
+    operation?.check()
     const classic = await this.#describeClassicByCoordinator(
-      fallbacks.map(({ groupId }) => groupId)
+      fallbacks.map(({ groupId }) => groupId),
+      operation
     )
+    operation?.check()
     const stashed = new Map(fallbacks.map(({ groupId, error }) => [groupId, error]))
 
     return {
@@ -107,11 +115,14 @@ class GroupDescriptions {
    * the fallback in one go.
    * @private
    * @param {string[]} groupIds
+   * @param {import('../consumer/groupProtocol/interface').ConsumerOperation} [operation]
    * @returns {Promise<Array<{ groupId: string, row?: object, needsFallback: boolean, error?: {errorCode: number, errorMessage: string|null} }>>}
    */
-  async #describeByCoordinator(groupIds) {
-    const batches = await this.#groupByCoordinator(groupIds)
-    const perBatch = await Promise.all(batches.map((batch) => this.#describeBatch(batch)))
+  async #describeByCoordinator(groupIds, operation) {
+    const batches = await this.#groupByCoordinator(groupIds, operation)
+    const perBatch = await Promise.all(
+      batches.map((batch) => this.#describeBatch(batch, operation))
+    )
 
     return perBatch.flat()
   }
@@ -127,27 +138,35 @@ class GroupDescriptions {
    *
    * @private
    * @param {{ coordinator: object, ids: string[] }} batch
+   * @param {import('../consumer/groupProtocol/interface').ConsumerOperation} [operation]
    * @returns {Promise<Array<{ groupId: string, row?: object, needsFallback: boolean, error?: object }>>}
    * @throws {KafkaJSNumberOfRetriesExceeded} when the coordinator never settles within the budget
    */
-  async #describeBatch({ coordinator, ids }) {
+  async #describeBatch({ coordinator, ids }, operation) {
     let target = coordinator
     let batchIds = ids
     let coordinatorMoved = false
     let response
 
+    const retried = (attempt) =>
+      operation ? operation.retry(attempt, this.retry) : createRetry(this.retry)(attempt)
+    const guarded = operation ? { guard: operation.guard } : {}
+
     try {
-      response = await createRetry(this.retry)(async () => {
+      response = await retried(async () => {
         if (coordinatorMoved) {
-          await this.cluster.refreshMetadata()
+          await this.cluster.refreshMetadata(...(operation ? [{ fence: operation }] : []))
+          operation?.check()
           // Regrouped, not re-pointed at the first id's new coordinator: a `__consumer_offsets`
           // leader move can split ids that shared a coordinator across two brokers, and sending
           // the whole batch to one of them would keep drawing NOT_COORDINATOR for the rest until
           // the budget ran out. Each sub-batch retries on its own from here.
-          const regrouped = await this.#groupByCoordinator(batchIds)
+          const regrouped = await this.#groupByCoordinator(batchIds, operation)
 
           if (regrouped.length > 1) {
-            const perBatch = await Promise.all(regrouped.map((batch) => this.#describeBatch(batch)))
+            const perBatch = await Promise.all(
+              regrouped.map((batch) => this.#describeBatch(batch, operation))
+            )
             return { split: perBatch.flat() }
           }
 
@@ -156,7 +175,8 @@ class GroupDescriptions {
           coordinatorMoved = false
         }
 
-        const answer = await target.consumerGroupDescribe({ groupIds: batchIds })
+        operation?.check()
+        const answer = await target.consumerGroupDescribe({ groupIds: batchIds, ...guarded })
         const unsettled = answer.groups.find(({ errorCode }) => RETRIES_BATCH.has(errorCode))
 
         if (unsettled) {
@@ -220,16 +240,24 @@ class GroupDescriptions {
    * One DescribeGroups per coordinator for the ids that routed.
    * @private
    * @param {string[]} groupIds
+   * @param {import('../consumer/groupProtocol/interface').ConsumerOperation} [operation]
    * @returns {Promise<object[]>} the raw key-15 rows
    */
-  async #describeClassicByCoordinator(groupIds) {
-    const batches = await this.#groupByCoordinator(groupIds)
+  async #describeClassicByCoordinator(groupIds, operation) {
+    const batches = await this.#groupByCoordinator(groupIds, operation)
 
     const perBatch = await Promise.all(
       batches.map(async ({ coordinator, ids }) => {
-        const { groups } = await createRetry(this.retry)(() =>
-          coordinator.describeGroups({ groupIds: ids })
-        )
+        const attempt = () => {
+          operation?.check()
+          return coordinator.describeGroups({
+            groupIds: ids,
+            ...(operation && { guard: operation.guard }),
+          })
+        }
+        const { groups } = await (operation
+          ? operation.retry(attempt, this.retry)
+          : createRetry(this.retry)(attempt))
 
         return groups
       })
@@ -243,15 +271,22 @@ class GroupDescriptions {
    * client has always used, kept so N ids do not become N round trips.
    * @private
    * @param {string[]} groupIds
+   * @param {import('../consumer/groupProtocol/interface').ConsumerOperation} [operation] its close
+   *   ends each lookup's retries and dials
    * @returns {Promise<Array<{ coordinator: object, ids: string[] }>>}
    */
-  async #groupByCoordinator(groupIds) {
-    const located = await Promise.all(
-      groupIds.map(async (groupId) => ({
-        groupId,
-        coordinator: await this.cluster.findGroupCoordinator({ groupId }),
-      }))
-    )
+  async #groupByCoordinator(groupIds, operation) {
+    const locate = () =>
+      Promise.all(
+        groupIds.map(async (groupId) => ({
+          groupId,
+          coordinator: await this.cluster.findGroupCoordinator({
+            groupId,
+            ...(operation && { fence: operation }),
+          }),
+        }))
+      )
+    const located = await (operation ? operation.wait(locate) : locate())
 
     const batches = new Map()
     for (const { groupId, coordinator } of located) {

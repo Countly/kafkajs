@@ -31,8 +31,11 @@ beforeEach(() => {
   resources = []
   gates = []
 })
+/** @type {Function[]} releases of the answer holds a test made, run before any client closes */
+const releases = []
 afterEach(async () => {
   const failures = []
+  for (const release of releases.splice(0)) release()
   for (const gate of gates) {
     try {
       if (gate.settle)
@@ -460,6 +463,176 @@ it('R1§B2:max.poll.records', async () => {
     ['k3', '3'],
   ])
   expect(Object.keys(consumer)).not.toContain('maxPollRecords')
+})
+/**
+ * Holds the answer of one scripted API after the broker received the request.
+ * @param {object} cluster scripted cluster
+ * @param {string} api API name
+ * @returns {{ hits: number, release: () => void }} the hold; released at test end
+ */
+const holdAnswer = (cluster, api) => {
+  const original = cluster.answerers.get(api)
+  let open = false
+  let wake
+  const opened = new Promise((resolve) => {
+    wake = resolve
+  })
+  const held = {
+    hits: 0,
+    release: () => {
+      open = true
+      wake()
+    },
+  }
+  cluster.answer(api, async (fields, record) => {
+    held.hits += 1
+    if (!open) await opened
+    return original(fields, record)
+  })
+  releases.push(held.release)
+  return held
+}
+/** @param {number} offset first and only offset @returns {Promise<Buffer>} a one-record batch */
+const oneRecordBatch = async (offset) =>
+  Buffer.from(
+    (
+      await RecordBatch.RecordBatch({
+        firstOffset: String(offset),
+        firstTimestamp: 1700000000000,
+        maxTimestamp: 1700000000000,
+        records: [Record({ value: Buffer.from(`v${offset}`) })],
+      })
+    ).buffer
+  )
+it('R1§B2:default.api.timeout.ms', async () => {
+  const bounded = { retries: 0, maxTotalTime: 250 }
+  const cell = [{ topic: TOPIC, partition: 0 }]
+  const build = (retryOptions) => {
+    const cluster = groupScript(createScriptedCluster({ nodes }))
+    const consumer = use(
+      new Kafka(cluster.kafkaOptions({ retry: retryOptions })).consumer({
+        groupId: 'equivalent',
+        retry: retryOptions,
+        maxWaitTimeInMs: 20,
+      }),
+      cluster
+    )
+    return { cluster, consumer }
+  }
+  const frames = (cluster, api) => cluster.requests().filter((r) => r.api === api).length
+
+  const lookup = build(bounded)
+  await lookup.consumer.connect()
+  const heldLookup = holdAnswer(lookup.cluster, 'FindCoordinator')
+  await expect(lookup.consumer.committed(cell)).rejects.toMatchObject({
+    name: 'KafkaJSDeliveryTimeout',
+  })
+  expect(heldLookup.hits).toBeGreaterThan(0)
+  heldLookup.release()
+  await tick()
+  expect(frames(lookup.cluster, 'OffsetFetch')).toBe(0)
+
+  const response = build(bounded)
+  await response.consumer.connect()
+  const heldResponse = holdAnswer(response.cluster, 'OffsetFetch')
+  await expect(response.consumer.committed(cell)).rejects.toMatchObject({
+    name: 'KafkaJSDeliveryTimeout',
+  })
+  expect(heldResponse.hits).toBe(1)
+
+  const commit = build(bounded)
+  await start(commit.consumer, async () => {})
+  await until(() => frames(commit.cluster, 'OffsetFetch') > 0)
+  const heldCommit = holdAnswer(commit.cluster, 'OffsetCommit')
+  await expect(
+    commit.consumer.commitOffsets([{ topic: TOPIC, partition: 0, offset: '1' }])
+  ).rejects.toMatchObject({ name: 'KafkaJSDeliveryTimeout' })
+  expect(heldCommit.hits).toBe(1)
+
+  const unset = build({ retries: 0 })
+  await unset.consumer.connect()
+  const heldUnset = holdAnswer(unset.cluster, 'OffsetFetch')
+  let settled = false
+  const reading = unset.consumer.committed(cell).then((rows) => {
+    settled = true
+    return rows
+  })
+  await until(() => heldUnset.hits === 1)
+  await new Promise((resolve) => setTimeout(resolve, 400))
+  expect(settled).toBe(false)
+  heldUnset.release()
+  await expect(reading).resolves.toHaveLength(1)
+})
+it('R1§B2:enable.auto.commit', async () => {
+  const first = await oneRecordBatch(0)
+  const second = await oneRecordBatch(1)
+  const frames = (cluster) => cluster.requests().filter((r) => r.api === 'OffsetCommit')
+  /** Runs one consumer over a batch, an idle gap and a second batch. */
+  const cadence = async (runOptions) => {
+    const cluster = groupScript(createScriptedCluster({ nodes }))
+    let fetches = 0
+    let release
+    const gap = new Promise((resolve) => {
+      release = resolve
+    })
+    cluster.answer('Fetch', async ({ maxWaitMs }) => {
+      fetches += 1
+      if (fetches === 1)
+        return { partitions: [{ partition: 0, errorCode: 0, highWatermark: '1', records: first }] }
+      if (fetches === 2) {
+        await gap
+        return { partitions: [{ partition: 0, errorCode: 0, highWatermark: '2', records: second }] }
+      }
+      await new Promise((resolve) => setTimeout(resolve, maxWaitMs))
+      return { partitions: [{ partition: 0, errorCode: 0, records: false }] }
+    })
+    const consumer = use(
+      new Kafka(cluster.kafkaOptions({ retry })).consumer({
+        groupId: 'equivalent',
+        retry,
+        maxWaitTimeInMs: 20,
+      }),
+      cluster
+    )
+    const seen = []
+    await consumer.connect()
+    await consumer.subscribe({ topic: TOPIC, fromBeginning: true })
+    await consumer.run({
+      eachMessage: async ({ message }) => seen.push(message.offset),
+      ...runOptions,
+    })
+    await until(() => seen.length === 1)
+    const afterBatch = frames(cluster).length
+    await new Promise((resolve) => setTimeout(resolve, 450))
+    const afterIdle = frames(cluster).length
+    release()
+    await until(() => seen.length === 2)
+    await tick()
+    return { afterBatch, afterIdle, final: frames(cluster).length, cluster }
+  }
+
+  const interval = await cadence({ autoCommit: true, autoCommitInterval: 200 })
+  expect(interval.afterBatch).toBe(0)
+  expect(interval.afterIdle).toBe(0)
+  expect(interval.final).toBe(1)
+
+  const threshold = await cadence({ autoCommit: true, autoCommitThreshold: 1 })
+  expect(threshold.afterBatch).toBe(1)
+
+  const both = await cadence({
+    autoCommit: true,
+    autoCommitInterval: 60000,
+    autoCommitThreshold: 2,
+  })
+  expect(both.afterBatch).toBe(0)
+  expect(both.final).toBe(1)
+
+  const neither = await cadence({ autoCommit: true })
+  expect(neither.afterBatch).toBe(1)
+  expect(neither.final).toBe(2)
+
+  const off = await cadence({ autoCommit: false })
+  expect(off.final).toBe(0)
 })
 it('R1§A2:compression.type', async () => {
   const cluster = producerScript(createScriptedCluster({ nodes }))

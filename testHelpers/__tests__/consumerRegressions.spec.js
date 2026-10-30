@@ -130,7 +130,7 @@ describe('consumer regression fixtures', () => {
       }
       if (h) await h.broker.disconnect()
     })
-    it.failing('batch completion preserves a configured commit interval', () => {
+    it('batch completion preserves a configured commit interval', () => {
       expect(observed).toBe(0)
     })
   })

@@ -2,6 +2,7 @@ const createConsumer = require('../index')
 const Runner = require('../runner')
 const ConsumerGroup = require('../consumerGroup')
 const ClassicGroupProtocol = require('../groupProtocol/classic')
+const { ConsumerOperation } = require('../groupProtocol/interface')
 const InstrumentationEventEmitter = require('../../instrumentation/emitter')
 const OffsetOperations = require('../offsetManager/offsetOperations')
 const leaveGroupV5 = require('../../protocol/requests/leaveGroup/v5/request')
@@ -212,7 +213,9 @@ describe('Consumer > disconnect({ leaveGroup })', () => {
 
         expect(leaveSpy).toHaveBeenCalledTimes(calls)
         if (calls) {
-          expect(leaveSpy).toHaveBeenCalledWith({ leaveGroup })
+          expect(leaveSpy).toHaveBeenCalledWith(
+            expect.objectContaining({ leaveGroup, operation: expect.any(ConsumerOperation) })
+          )
         }
       }
     )

@@ -100,7 +100,7 @@ await consumer.run({
 * `batch.highWatermark` is the last committed offset within the topic partition. It can be useful for calculating lag.
 * `resolveOffset()` is used to mark a message in the batch as processed. On a handler error, the consumer attempts to commit resolved progress only while membership and the batch remain usable; a failed progress commit does not replace the handler's own error.
 * `heartbeat(): Promise<void>` can be used to send heartbeat to the broker according to the set `heartbeatInterval` value in consumer [configuration](#options), which means if you invoke `heartbeat()` sooner than `heartbeatInterval` it will be ignored.
-* `commitOffsetsIfNecessary(offsets?): Promise<void>` is used to commit offsets based on the autoCommit configurations (`autoCommitInterval` and `autoCommitThreshold`). Note that auto commit won't happen in `eachBatch` if `commitOffsetsIfNecessary` is not invoked. Take a look at [autoCommit](#auto-commit) for more information.
+* commitOffsetsIfNecessary(offsets?): Promise<void> checks automatic commit eligibility at that call. Without explicit offsets, configured interval or threshold conditions apply. Batch completion also performs the applicable automatic check when autoCommit is enabled. See [autoCommit](#auto-commit) for the opportunity and idle-time behavior; explicit offsets retain the existing commit rules.
 * `uncommittedOffsets()` returns all offsets by topic-partition which have not yet been committed.
 * `isRunning()` returns true if consumer is in running state, else it returns false.
 * `isStale()` returns whether the messages in the batch have been rendered stale through some other operation and should be discarded. For example, when calling [`consumer.seek`](#seek) the messages in the batch should be discarded, as they are not at the offset we seeked to.
@@ -145,11 +145,9 @@ A guideline for setting `partitionsConsumedConcurrently` would be that it should
 
 ## <a name="auto-commit"></a> autoCommit
 
-The messages are always fetched in batches from Kafka, even when using the `eachMessage` handler. All resolved offsets will be committed to Kafka after processing the whole batch.
+Resolved offsets are committed at processing/check opportunities. With neither autoCommitInterval nor autoCommitThreshold set, successful data batches retain per-batch automatic commits. With either knob set, a batch-end check commits when the interval has elapsed or the threshold has been reached; either condition is sufficient when both are set. There is no background commit timer. A below-interval batch followed by idle time does not commit solely because the interval later elapses; a later processing/check opportunity can commit it.
 
-Committing offsets periodically during a batch allows the consumer to recover from group rebalancing, stale metadata and other issues before it has completed the entire batch. However, committing more often increases network traffic and slows down processing. Auto-commit offers more flexibility when committing offsets; there are two flavors available:
-
-`autoCommitInterval`: The consumer will commit offsets after a given period, for example, five seconds. Value in milliseconds. Default: `null`
+autoCommitInterval is the elapsed interval in milliseconds checked at an opportunity. autoCommitThreshold is the resolved-offset threshold checked at an opportunity. Both default to null. autoCommit:false disables automatic commits, including the final automatic attempt; explicit commits remain available. Fewer actual broker commits can increase redelivery after a crash. Classic graceful stop, disconnect and unsubscribe attempt eligible final progress even when the interval or threshold is not due, subject to ownership, halt bounds and any close deadline.
 
 ```javascript
 consumer.run({
@@ -158,16 +156,12 @@ consumer.run({
 })
 ```
 
-`autoCommitThreshold`: The consumer will commit offsets after resolving a given number of messages, for example, a hundred messages. Default: `null`
-
 ```javascript
 consumer.run({
   autoCommitThreshold: 100,
   // ...
 })
 ```
-
-Having both flavors at the same time is also possible, the consumer will commit the offsets if any of the use cases (interval or number of messages) happens.
 
 `autoCommit`: Advanced option to disable auto committing altogether. Instead, you can [manually commit offsets](#manual-commits). Default: `true`
 
@@ -204,7 +198,7 @@ For a classic member (the default `groupProtocol`), a lost connection is not a r
 
 When disabling [`autoCommit`](#auto-commit) you can still manually commit message offsets, in a couple of different ways:
 
-- By using the `commitOffsetsIfNecessary` method available in the `eachBatch` callback. The `commitOffsetsIfNecessary` method will still respect the other autoCommit options if set.
+- Use the public consumer.commitOffsets method for an explicit commit. The no-offset automatic check does not commit when autoCommit is false; supplying explicit offsets through an existing supported handler commit call retains its explicit-offset and ownership rules.
 - By [sending message offsets in a transaction](Transactions.md#offsets).
 - By using the `commitOffsets` method of the consumer (see below).
 
@@ -366,9 +360,11 @@ await consumer.disconnect({ leaveGroup: false }) // do not tell the group, even 
 
 - **`true` hands the partitions over at once.** The coordinator rebalances as soon as it learns the member is gone. A static member that leaves this way gives up its slot: a restart under the same `groupInstanceId` joins as a new member, so the group rebalances again.
 - **`false` is the consequence to know about.** A member that does not tell the group it is leaving is still a member: the group keeps assigning it its partitions, and nobody consumes them, until its session expires (`sessionTimeout` under the classic protocol, the broker's `group.consumer.session.timeout.ms` under the consumer protocol), and the group then rebalances. It suits a member that is about to come back as the same member, which is what a static member is; for a dynamic member it only moves the rebalance to the end of the session. For a static member `false` is what the default already does.
-- **Stopping itself does not change.** The consumer still stops fetching and waits for the handler that is running; under the consumer protocol it also still commits what it owns and emits `PARTITIONS_REVOKED`, whatever `leaveGroup` says.
-- **A second `disconnect()` that joins one already running keeps the first call's choice.** `consumer.stop()` takes no option, and a consumer that crashes and restarts always uses the default. `leaveGroup` applies to the stop that `disconnect()` itself performs: after a `stop()` there is nothing left to leave, so `disconnect({ leaveGroup: true })` sends nothing, and the same holds after the member has already been removed, for instance by a poll-interval overrun.
-- **Called without an argument, or with anything but an options object, `disconnect()` changes nothing.** An argument that is not an object is ignored, as it was in kafkajs 2.2.4, so `process.on('SIGTERM', consumer.disconnect)` (which passes the signal name) still works, and `disconnect(true)` does not mean "leave". An options object whose `leaveGroup` is anything but `true`, `false` or `undefined` throws `KafkaJSNonRetriableError` before anything is stopped.
+- Graceful stopping waits for eligible running work and the required close callbacks, then attempts eligible final automatic progress before leaving. Classic consumers now have this final attempt; consumer-protocol leave retains its existing one. leaveGroup controls the membership leave, independently of an eligible offset commit. Ownership loss, disabled automatic commits, no group identity, halt bounds or an exhausted timeout can suppress the attempt. Under the consumer protocol the consumer still commits what it owns and emits `PARTITIONS_REVOKED`, whatever `leaveGroup` says.
+- The first concurrent disconnect controls the entire close, including timeout and leaveGroup. A later call does not renew or shorten it. stop takes no timeout option. After a completed stop there is no membership left for a later disconnect to leave again. A consumer that crashes and restarts always uses the default.
+- A nonobject disconnect argument is ignored, preserving signal-handler compatibility. An object with an invalid timeout rejects with KafkaJSInvalidConfigurationError (invalidConfiguration); invalid leaveGroup retains KafkaJSNonRetriableError. Both reject before stopping. timeout is an integer from 0 to 2147483647 milliseconds; omission keeps natural waiting and zero starts no final commit or leave. `disconnect(true)` does not mean "leave", and `process.on('SIGTERM', consumer.disconnect)` still works.
+
+await consumer.disconnect({timeout:3000,leaveGroup:true}) bounds cleanup for the run captured at entry. At the boundary, client-owned timers, waits and queued unsent work are retired, and old continuations cannot change a replacement run. Application promises are detached if still pending. Operational cleanup of a valid call resolves; invalid options reject before state changes. A commit already transmitted before the boundary can still apply remotely, so read broker offsets before deciding its outcome.
 
 A classic static member that leaves with `true` sends its member id and its `groupInstanceId`, so the coordinator checks the pair and answers `FENCED_INSTANCE_ID` for a member id that is no longer the instance's current one instead of removing someone else's membership. The Java client sends the member id alone.
 
@@ -490,6 +486,8 @@ Subscription and manual assignment are exclusive until `await consumer.unsubscri
 
 `await consumer.committed([{ topic, partition }])` reads stable committed offsets from the broker for this group, including unassigned partitions. It returns `{ topic, partition, offset, metadata }` rows; offset is a decimal string or null when no offset was committed, and metadata is null whenever offset is null; otherwise it preserves the stored string (including the empty string) or null. An empty array returns an empty array without a request. This observation is independent of local position and does not move it. OffsetFetch v8/v9 responses naming another group are refused with `KafkaJSInvariantViolation` naming the requested and returned groups.
 
+If retry.maxTotalTime is set, commitOffsets, committed, position and describeGroup use one deadline captured at public entry. It covers coordinator lookup, connect/authentication, encoding, queueing, response, retry and seek/reset resolution for that call. Expiry raises KafkaJSDeliveryTimeout and refuses late local effects and unsent writes. Unset retains the prior waiting behavior. position remains the next applicable processing/fetch position; committed is a live RequireStable group read. An API timeout does not establish whether an already-transmitted commit applied at the broker.
+
 ## <a name="rebalance-listeners"></a> Awaited rebalance listeners
 
 Pass optional `onPartitionsRevoked`, `onPartitionsAssigned` and `onPartitionsLost` functions in `consumer.run({ rebalanceListener })`. Each receives `{ groupId, memberId, generationId, partitions }` and may return a promise. The listener belongs to the run: crash restart retains it; stop followed by run may replace it. A manual consumer rejects listeners.
@@ -539,6 +537,8 @@ After a manual assignment, a seek before run is queued once for the first start.
 ## <a name="halted-partitions"></a> Halted partitions
 
 When a fetched record batch is corrupt or past a decoding bound (a length below the minimum or negative, a magic byte outside 0 to 2, an impossible record count or one above the derived ceiling, a malformed control record, a CRC32C mismatch, or a compressed body that is malformed or past `maxDecompressedBatchBytes`), the consumer delivers the records before it and then **halts that partition**: it is no longer fetched, the other partitions and brokers keep delivering, and `consumer.partition_halted` fires once with `{ groupId, memberId, topic, partition, offset, reason, error, nextOffset?, codec?, limit? }`, where `offset` is the corrupt batch's first offset and `error` is the `KafkaJSCorruptRecordError`. One error is logged with it. Offsets the consumer derives itself (resolved offsets, automatic commits) never move past the batch, because it is never delivered; an offset you commit yourself keeps its ordinary meaning.
+
+Configured commit cadence and graceful close keep the same halt boundary. Eligible resolved records before a corrupt or unreadable batch can be committed automatically, including by the final close attempt; automatic progress does not cross the unreadable batch. A no-offset halt adds no derived position. Caller-supplied explicit offsets retain their existing ownership and halt rules. A failed or unconfirmed final commit does not by itself discharge a recreation reset obligation.
 
 Nothing skips the batch for you. To go on, `consumer.seek` the partition: past the batch to skip it, or at or before it to read it again (it halts again, and the event fires again, if the batch is still corrupt). The event fires when the batch is fetched, before the records ahead of it are processed. A seek made inside the `consumer.partition_halted` listener is applied at the start of the next fetch round, and like any seek it also drops those records if they are not yet processed (`eachMessage` skips them, `eachBatch` gets them with `isStale()` true); to keep them, seek once they have been processed. A rebalance that revokes the partition, a recreation of its topic and a restart also clear the halt; a recreated topic never inherits the halt of its previous incarnation. `pause()` and `resume()` do not clear it. An answer fetched before a seek, a reset or a recreation reached the partition never halts it.
 
@@ -758,6 +758,8 @@ kafka.consumer({
 ## <a name="describe-group"></a> Describe group
 
 > **Experimental** - This feature may be removed or changed in new versions of KafkaJS
+
+The `retry.maxTotalTime` deadline for this call is described under [Assignment, subscription and offsets](#consumer-getters).
 
 Returns metadata for the configured consumer group. It is routed exactly as [`admin.describeGroups`](Admin.md#describe-groups) is, so a group running either membership protocol describes itself correctly and both return the same row shape:
 

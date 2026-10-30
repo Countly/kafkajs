@@ -1076,11 +1076,12 @@ module.exports = class ConsumerGroupProtocol {
    * and a failure of it is stamped with that membership and not counted against the replacement.
    *
    * @see https://github.com/apache/kafka/blob/4.3/clients/src/main/java/org/apache/kafka/clients/consumer/internals/AbstractHeartbeatRequestManager.java
-   * @param {{ sendAllFields?: boolean, leaveEpoch?: number|null }} options
+   * @param {{ sendAllFields?: boolean, leaveEpoch?: number|null, guard?: () => Error|null }} options
+   *   `guard` is a leave's private pre-write refusal; it never reaches the request
    * @returns {Promise<void>}
    * @throws {Error} the classified error, for every path except a leave, whose errors are swallowed
    */
-  async sendHeartbeat({ sendAllFields = false, leaveEpoch = null }) {
+  async sendHeartbeat({ sendAllFields = false, leaveEpoch = null, guard }) {
     const ownershipToken = this.ownership?.token()
     if (!this.coordinator) {
       // A leave never LOOKS for a coordinator. `connect()` goes through the cluster's retrier, so
@@ -1116,9 +1117,12 @@ module.exports = class ConsumerGroupProtocol {
     this.backoff.takeDue()
 
     try {
-      const response = await this.coordinator.consumerGroupHeartbeat(toBrokerPayload(request))
+      const response = await this.coordinator.consumerGroupHeartbeat({
+        ...toBrokerPayload(request),
+        ...(guard && { guard }),
+      })
 
-      if (this.ownershipReplaced(ownershipToken)) return
+      if (this.ownershipReplaced(ownershipToken) || guard?.()) return
       this.sentFields.remember(request)
       if (request.SubscribedTopicRegex !== undefined) {
         this.regexUpdated = false
@@ -1571,7 +1575,8 @@ module.exports = class ConsumerGroupProtocol {
    * for a static member and nothing for a dynamic one, which is then left to expire. Everything
    * else a leave does (the commit, the revocation, the clearing) happens whatever its value. A call
    * that joins a leave already under way keeps that leave's choice.
-   * @param {{ leaveGroup?: boolean }} [options]
+   * @param {{ leaveGroup?: boolean, operation?: import('./interface').ConsumerOperation }} [options]
+   *   the close `operation`, when given, refuses the leave heartbeat's write once it expires
    * @returns {Promise<void>}
    */
   async leave(options) {
@@ -1648,7 +1653,7 @@ module.exports = class ConsumerGroupProtocol {
       this.emitPartitions(PARTITIONS_LOST, releasing)
     }
 
-    await this.sendLeaveHeartbeat(options?.leaveGroup)
+    await this.sendLeaveHeartbeat(options?.leaveGroup, options?.operation)
   }
 
   /**
@@ -1687,9 +1692,10 @@ module.exports = class ConsumerGroupProtocol {
    * leave ends the way one does when no coordinator is known.
    * @private
    * @param {boolean} [leaveGroup] the caller's choice, `undefined` for the default
+   * @param {import('./interface').ConsumerOperation} [operation] the close that owns this leave
    * @returns {Promise<void>}
    */
-  async sendLeaveHeartbeat(leaveGroup) {
+  async sendLeaveHeartbeat(leaveGroup, operation) {
     this.#membershipAccepted = false
     this.ownedPartitions = []
     this.clearTarget()
@@ -1717,6 +1723,7 @@ module.exports = class ConsumerGroupProtocol {
     await this.sendHeartbeat({
       sendAllFields: false,
       leaveEpoch: this.memberEpoch,
+      guard: operation?.guard,
     })
   }
 

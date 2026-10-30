@@ -952,6 +952,8 @@ module.exports = class OffsetManager {
    *   than by the caller, so a retry re-reads what is uncommitted now instead of replaying a list
    *   built before the last batch resolved. Ignored when `offsets.topics` is given.
    * @param {() => Error|null} [options.guard] immutable caller identity retained across retries
+   * @param {import('../../producer/generation')} [options.fence] the caller's terminal fence: its
+   *   close ends the coordinator discovery this commit starts
    * @param {boolean} [options.auto=false] this is the interval/threshold auto-commit rather than a
    *   deliberate one. A stale member epoch is logged and swallowed for it, because the next
    *   interval carries whatever epoch the heartbeats have installed by then; every other caller
@@ -975,11 +977,12 @@ module.exports = class OffsetManager {
    * Completes a commit while its outer operation retains the original membership identity.
    * @private
    * @param {object} offsets the selected offsets
-   * @param {{partitions?: object[], auto?: boolean, guard: Function}} options the immutable guard
+   * @param {{partitions?: object[], auto?: boolean, guard: Function, fence?: object}} options the
+   *   immutable guard and the caller's optional terminal fence
    * @returns {Promise<void>} automatic refusals resolve without publishing
    * @throws {Error} explicit refusals or the original broker error
    */
-  async commitWithOwnership(offsets, { partitions = null, auto = false, guard } = {}) {
+  async commitWithOwnership(offsets, { partitions = null, auto = false, guard, fence } = {}) {
     const refusal = this.ownership?.refusal(this.ownership.token()) || guard?.()
     if (refusal) {
       if (auto) {
@@ -1005,7 +1008,7 @@ module.exports = class OffsetManager {
     }
 
     try {
-      await this.sendAndRecordCommit(payload, topics, { guard })
+      await this.sendAndRecordCommit(payload, topics, { guard, fence })
       const refusal = guard?.()
       if (refusal) throw refusal
       this.lastCommit = Date.now()
@@ -1078,7 +1081,8 @@ module.exports = class OffsetManager {
    * @private
    * @param {object} payload the `Broker#offsetCommit` payload
    * @param {{topic: string, partitions: {partition: number|string, offset: string}[]}[]} topics
-   * @param {{guard?: Function}} [options] checked again before local publication
+   * @param {{guard?: Function, fence?: object}} [options] the guard is checked again before local
+   *   publication; the fence binds the coordinator discovery
    * @returns {Promise<void>}
    * @throws {Error} whatever the commit raised; nothing is recorded then
    */

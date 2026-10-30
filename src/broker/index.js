@@ -956,12 +956,16 @@ module.exports = class Broker {
    * @param {string} request.memberId The member id assigned by the group coordinator
    * @param {string} [request.groupInstanceId=null] Static membership id (KIP-345); identifies this
    *                                member across restarts. Requires Heartbeat v3+.
+   * @param {(frameLength?: number) => Error|null} [request.guard] private pre-write check of the
+   *   caller's operation; it never reaches the request
    * @returns {Promise}
    */
-  async heartbeat({ groupId, groupGenerationId, memberId, groupInstanceId }) {
+  async heartbeat({ groupId, groupGenerationId, memberId, groupInstanceId, guard }) {
+    this.throwIfRefused(guard)
     const heartbeat = this.lookupRequest(apiKeys.Heartbeat, requests.Heartbeat)
     return await this[PRIVATE.SEND_REQUEST](
-      heartbeat({ groupId, groupGenerationId, memberId, groupInstanceId })
+      heartbeat({ groupId, groupGenerationId, memberId, groupInstanceId }),
+      guard
     )
   }
 
@@ -986,6 +990,8 @@ module.exports = class Broker {
    * @param {string|null} [request.subscribedTopicRegex=null] requires v1; `''` clears a regex
    * @param {string|null} [request.serverAssignor=null]
    * @param {{topicId: string, partitions: number[]}[]|null} [request.topicPartitions=null]
+   * @param {(frameLength?: number) => Error|null} [request.guard] private pre-write check of the
+   *   caller's operation; it never reaches the request
    * @returns {Promise<object>} the decoded response, including a nullable `assignment`
    * @throws {KafkaJSNonRetriableError} when a regex is given and the broker only offers v0
    * @throws {KafkaJSServerDoesNotSupportApiKey} when the broker does not offer the API
@@ -1002,7 +1008,9 @@ module.exports = class Broker {
     subscribedTopicRegex = null,
     serverAssignor = null,
     topicPartitions = null,
+    guard,
   }) {
+    this.throwIfRefused(guard)
     // Only a regex needs the version up front, and this method runs once per heartbeat interval:
     // `negotiatedVersion` walks the implemented-version list, so it stays out of the common path.
     // It answers null when the broker offers nothing usable; that case belongs to `lookupRequest`
@@ -1037,7 +1045,8 @@ module.exports = class Broker {
         subscribedTopicRegex,
         serverAssignor,
         topicPartitions,
-      })
+      }),
+      guard
     )
   }
 
@@ -1145,15 +1154,19 @@ module.exports = class Broker {
    * @param {string} [request.reason] why the member leaves
    * @param {{ memberId: string, groupInstanceId?: string|null, reason?: string|null }[]} [request.members]
    *   the batch form; when given, the single-member fields are ignored
+   * @param {(frameLength?: number) => Error|null} [request.guard] private pre-write check of the
+   *   caller's operation; it never reaches the request
    * @returns {Promise<{ throttleTime: number, clientSideThrottleTime: number, errorCode: number,
    *   members: { memberId: string, groupInstanceId: string|null, errorCode: number }[] }>} the
    *   decoded answer at v3 and later (v0 to v2 answer `{ throttleTime, errorCode }`)
    * @throws {KafkaJSProtocolError} the first member's error (single form), or any top-level error
    */
-  async leaveGroup({ groupId, memberId, groupInstanceId, reason, members }) {
+  async leaveGroup({ groupId, memberId, groupInstanceId, reason, members, guard }) {
+    this.throwIfRefused(guard)
     const leaveGroup = this.lookupRequest(apiKeys.LeaveGroup, requests.LeaveGroup)
     return await this[PRIVATE.SEND_REQUEST](
-      leaveGroup({ groupId, memberId, groupInstanceId, reason, members })
+      leaveGroup({ groupId, memberId, groupInstanceId, reason, members }),
+      guard
     )
   }
 
@@ -1432,14 +1445,18 @@ module.exports = class Broker {
    * @param {object} request
    * @param {string[]} request.groupIds
    * @param {boolean} [request.includeAuthorizedOperations=false] requires v3+; ignored below it
+   * @param {(frameLength?: number) => Error|null} [request.guard] private pre-write check of the
+   *   caller's operation; it never reaches the request
    * @returns {Promise<object>} the decoded response
    * @throws {KafkaJSProtocolError} on any group-level error code other than `GROUP_ID_NOT_FOUND`
    * @see https://cwiki.apache.org/confluence/display/KAFKA/KIP-1043%3A+Administration+of+groups
    */
-  async describeGroups({ groupIds, includeAuthorizedOperations = false }) {
+  async describeGroups({ groupIds, includeAuthorizedOperations = false, guard }) {
+    this.throwIfRefused(guard)
     const describeGroups = this.lookupRequest(apiKeys.DescribeGroups, requests.DescribeGroups)
     return await this[PRIVATE.SEND_REQUEST](
-      describeGroups({ groupIds, includeAuthorizedOperations })
+      describeGroups({ groupIds, includeAuthorizedOperations }),
+      guard
     )
   }
 
@@ -1455,16 +1472,20 @@ module.exports = class Broker {
    * @param {object} request
    * @param {string[]} request.groupIds
    * @param {boolean} [request.includeAuthorizedOperations=false]
+   * @param {(frameLength?: number) => Error|null} [request.guard] private pre-write check of the
+   *   caller's operation; it never reaches the request
    * @returns {Promise<object>} the decoded response, one entry per requested group
    * @see https://github.com/apache/kafka/blob/4.3/clients/src/main/java/org/apache/kafka/clients/admin/internals/DescribeConsumerGroupsHandler.java
    */
-  async consumerGroupDescribe({ groupIds, includeAuthorizedOperations = false }) {
+  async consumerGroupDescribe({ groupIds, includeAuthorizedOperations = false, guard }) {
+    this.throwIfRefused(guard)
     const consumerGroupDescribe = this.lookupRequest(
       apiKeys.ConsumerGroupDescribe,
       requests.ConsumerGroupDescribe
     )
     return await this[PRIVATE.SEND_REQUEST](
-      consumerGroupDescribe({ groupIds, includeAuthorizedOperations })
+      consumerGroupDescribe({ groupIds, includeAuthorizedOperations }),
+      guard
     )
   }
 

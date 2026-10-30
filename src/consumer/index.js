@@ -1,3 +1,4 @@
+const { performance } = require('node:perf_hooks')
 const { failureSourceOf } = require('../broker/failureSource')
 const Long = require('../utils/long')
 const dictionary = require('../utils/dictionary')
@@ -12,12 +13,17 @@ const ResetObligations = require('./offsetManager/resetObligations')
 const { normalizeResetPolicy } = require('./offsetReset')
 const { createGroupDescriptions } = require('../admin/groupDescriptions')
 const resolveGroupTimeouts = require('./groupTimeouts')
-const { selectRebalanceProtocol } = require('./groupProtocol/interface')
+const { selectRebalanceProtocol, ConsumerOperation } = require('./groupProtocol/interface')
 const Runner = require('./runner')
 const RebalanceHooks = require('./rebalanceHooks')
 const { events, wrap: wrapEvent, unwrap: unwrapEvent } = require('./instrumentationEvents')
 const InstrumentationEventEmitter = require('../instrumentation/emitter')
-const { KafkaJSNonRetriableError, isFencedInstance } = require('../errors')
+const {
+  KafkaJSNonRetriableError,
+  KafkaJSInvalidConfigurationError,
+  KafkaJSDeliveryTimeout,
+  isFencedInstance,
+} = require('../errors')
 const {
   isConsumerProtocolFatal,
   consumerStoppingError,
@@ -127,28 +133,39 @@ const validateGroupProtocolOptions = (params) => {
 }
 
 /**
- * Reads a `disconnect()` argument: an options object, `{ leaveGroup?: boolean }`, or nothing.
+ * Reads a `disconnect()` argument: an options object with leaveGroup and timeout, or nothing.
  *
  * Anything that is not an object is ignored, exactly as kafkajs 2.2.4's `disconnect()` ignored
  * every argument: `process.on('SIGTERM', consumer.disconnect)` passes the signal name, and
  * rejecting it would surface as an unhandled rejection inside a signal handler.
  * @param {*} [options]
- * @returns {{ leaveGroup?: boolean }|undefined} what to hand to the stop: `undefined` when
+ * @returns {{ leaveGroup?: boolean, timeout?: number }|undefined} what to hand to the stop: `undefined` when
  *   `options` is absent (`null` included) or is not an object, so everything below sees an object
  *   or nothing
  * @throws {KafkaJSNonRetriableError} when `options` is an object whose `leaveGroup` is neither
  *   `undefined` nor a boolean
+ * @throws {KafkaJSInvalidConfigurationError} when timeout is not an integer from 0 to 2147483647
  */
 const parseDisconnectOptions = (options) => {
   if (options == null || typeof options !== 'object') {
     return undefined
   }
 
-  if (options.leaveGroup !== undefined && typeof options.leaveGroup !== 'boolean') {
+  const { leaveGroup, timeout } = options
+  if (leaveGroup !== undefined && typeof leaveGroup !== 'boolean') {
     throw new KafkaJSNonRetriableError('Argument "leaveGroup" must be a boolean')
   }
 
-  return options
+  if (
+    timeout !== undefined &&
+    (!Number.isInteger(timeout) || timeout < 0 || timeout > 2147483647)
+  ) {
+    throw new KafkaJSInvalidConfigurationError(
+      'Argument "timeout" must be an integer from 0 to 2147483647'
+    )
+  }
+
+  return { leaveGroup, timeout }
 }
 
 /**
@@ -280,6 +297,14 @@ module.exports = (params) => {
   // internally as part of its own cleanup), so onCrash can tell whether a *separate* stop happened
   // while it was still deciding whether to restart (e.g. a slow restartOnFailure callback).
   let stopGeneration = 0
+  /**
+   * The close in progress. Concurrent disconnects join its whole cleanup, so the first call's
+   * timeout and leave choice govern; it is cleared when the cleanup settles.
+   * @type {{ operation: ConsumerOperation, promise: Promise<void> }|null}
+   */
+  let closing = null
+  /** The deadline scopes of the public calls in flight, so a forced close can retire them. */
+  const activeCalls = new Set()
 
   const hasGroup = groupId !== undefined
   /**
@@ -330,6 +355,50 @@ module.exports = (params) => {
   }
 
   /**
+   * Opens the one deadline scope of a public call, captured at its entry before any lookup: it ends
+   * at `retry.maxTotalTime` when that is set, at the calling rebalance callback's own deadline when
+   * the call is made from one, and when a forced close retires the call or the calling handler's
+   * run is retired. With none of these it never expires on its own, so an unset deadline keeps the
+   * call's natural wait. The caller must `finish` it in a `finally`.
+   * @returns {ConsumerOperation} the call's scope
+   */
+  const beginCall = () => {
+    const invocation = RebalanceHooks.current()
+    const identity = handlerContext.current()?.runIdentity
+    const maxTotalTime = retry?.maxTotalTime
+    const operation = new ConsumerOperation({
+      deadlineAt: Math.min(
+        maxTotalTime == null ? Infinity : performance.now() + maxTotalTime,
+        invocation?.context.deadlineAt ?? Infinity
+      ),
+      guard: () =>
+        RebalanceHooks.refusal(invocation) ||
+        (identity && !identity.isCurrent() ? consumerStoppingError() : null),
+      onTimeout: (cause) =>
+        new KafkaJSDeliveryTimeout('The consumer call exceeded retry.maxTotalTime', { cause }),
+    })
+    activeCalls.add(operation)
+    return operation
+  }
+
+  /**
+   * Runs a public call's work under its own deadline scope and releases the scope however it ends.
+   * @template T
+   * @param {(operation: ConsumerOperation) => T|Promise<T>} work the call's body
+   * @returns {Promise<T>} the body's result, or the scope's refusal if it expired first
+   * @throws {Error} the body's failure or the scope's refusal
+   */
+  const withinCall = async (work) => {
+    const operation = beginCall()
+    try {
+      return await operation.wait(() => work(operation))
+    } finally {
+      activeCalls.delete(operation)
+      operation.finish()
+    }
+  }
+
+  /**
    * Subscribed mode exists from the declaration on: a client pattern counts whether or not it
    * currently matches a topic, because matches are observations that come and go.
    * @returns {boolean} whether any topic, broker regex or client pattern is subscribed
@@ -353,12 +422,13 @@ module.exports = (params) => {
   /**
    * Records the pair of the join that just completed. The runner calls it before `GROUP_JOIN`
    * is delivered, so a `kafkajs.consumer.group_join` subscriber and an `on()` listener both read
-   * the new pair from `groupMetadata()`.
+   * the new pair from `groupMetadata()`. A join of a run that has since been replaced records nothing.
+   * @param {ConsumerGroup} group the group of the run that joined
    * @returns {void}
    */
-  const recordJoin = () => {
-    if (consumerGroup) {
-      lastJoin = { generationId: consumerGroup.generationId, memberId: consumerGroup.memberId }
+  const recordJoin = (group) => {
+    if (consumerGroup && consumerGroup === group) {
+      lastJoin = { generationId: group.generationId, memberId: group.memberId }
     }
   }
 
@@ -473,15 +543,21 @@ module.exports = (params) => {
    * unlinks them and keeps them: the topics still owe those resets to the group it builds next.
    * @param {{ leaveGroup?: boolean }} [stopOptions]
    * @param {{ keepResets?: boolean }} [shutDownOptions] `true` for the crash handler
+   * @param {ConsumerOperation} [operation] the close that bounds this shutdown; absent, it waits
+   *   naturally
    * @returns {Promise<void>}
    */
-  const shutDown = async (stopOptions, { keepResets = false } = {}) => {
+  const shutDown = async (stopOptions, { keepResets = false } = {}, operation) => {
     stopGeneration++
 
     try {
-      await stopShared(stopOptions)
-      logger.debug('consumer has stopped, disconnecting', { groupId })
-      await cluster.disconnect()
+      if (operation) {
+        await closeWithin(operation, stopOptions)
+      } else {
+        await stopShared(stopOptions)
+        logger.debug('consumer has stopped, disconnecting', { groupId })
+        await cluster.disconnect()
+      }
       instrumentationEmitter.emit(DISCONNECT)
     } catch (e) {
       logger.error(`Caught error when disconnecting the consumer: ${e.message}`, {
@@ -499,6 +575,81 @@ module.exports = (params) => {
         releaseDiscoveryScope()
       }
     }
+  }
+
+  /**
+   * The stop and the cluster teardown of one close, under that close's operation. At its deadline,
+   * or at once for zero, the close is forced in one synchronous step: the captured run is retired
+   * (timers, rounds, hooks and waits end, and later commits and heartbeats of its handlers are
+   * refused), the public calls in flight are retired, and the connections close without draining.
+   * The close then resolves once the connections have closed, whatever failed on the way; what a
+   * forced close settles claims no remote outcome, because a transmitted commit can still apply.
+   * @param {ConsumerOperation} operation the close scope
+   * @param {{ leaveGroup?: boolean }} [stopOptions]
+   * @returns {Promise<void>} rejects only for an ordinary failure of a close that was not forced
+   */
+  const closeWithin = async (operation, stopOptions) => {
+    const captured = runner
+    let disconnecting = null
+    /** Starts the close's one cluster disconnect; later calls share it. */
+    const disconnectCluster = (drainTimeout) =>
+      (disconnecting ??= cluster.disconnect(
+        ...(drainTimeout === undefined ? [] : [{ drainTimeout }])
+      ))
+    let forced = false
+    let forcedDone
+    const forcedSettled = new Promise((resolve) => {
+      forcedDone = resolve
+    })
+    const unregister = operation.register(() => {
+      forced = true
+      captured?.retire(consumerStoppingError())
+      for (const call of [...activeCalls]) call.retire(consumerStoppingError())
+      disconnectCluster(0).then(forcedDone, (error) => {
+        logger.warn('Disconnecting the cluster failed', { error: error.message })
+        forcedDone()
+      })
+    })
+
+    try {
+      await Promise.race([stopShared(stopOptions, operation), forcedSettled])
+      logger.debug('consumer has stopped, disconnecting', { groupId })
+      const { deadlineAt } = operation
+      await disconnectCluster(deadlineAt === Infinity ? undefined : operation.remaining()).catch(
+        (error) => {
+          if (!forced) throw error
+        }
+      )
+      if (forced) await forcedSettled
+    } finally {
+      unregister()
+    }
+  }
+
+  /**
+   * Starts the one close of this consumer, or joins the one in progress. The first call captures
+   * the deadline from its `timeout` (none when omitted) and its leave choice; a later call, with
+   * or without options, neither renews nor shortens them.
+   * @param {{ leaveGroup?: boolean, timeout?: number }|undefined} options the validated options
+   * @returns {Promise<void>} the shared close
+   */
+  const closeShared = (options) => {
+    if (closing) {
+      stopGeneration++
+      return closing.promise
+    }
+
+    const timeout = options?.timeout
+    const operation = new ConsumerOperation({
+      deadlineAt: timeout === undefined ? Infinity : performance.now() + timeout,
+    })
+    const record = { operation, promise: null }
+    record.promise = shutDown(options, {}, operation).finally(() => {
+      if (closing === record) closing = null
+      operation.finish()
+    })
+    closing = record
+    return record.promise
   }
 
   /**
@@ -526,26 +677,44 @@ module.exports = (params) => {
    * Crashes and restarts always use the default, and so does a call whose argument is not an
    * options object.
    *
+   * The first concurrent call governs the whole close, `timeout` included: with `timeout` (ms,
+   * integer 0 to 2147483647) the close is bounded, and at the deadline the captured run is retired
+   * and the call resolves after the connections close; zero starts no final commit or leave, and
+   * omitted keeps the natural wait. A transmitted commit can still apply after the deadline.
+   *
    * @type {import("../../types").Consumer["disconnect"]}
-   * @param {{ leaveGroup?: boolean }} [options]
+   * @param {{ leaveGroup?: boolean, timeout?: number }} [options]
    * @throws {KafkaJSNonRetriableError} before anything is stopped, when `options` is an object
    *   whose `leaveGroup` is neither `undefined` nor a boolean
+   * @throws {KafkaJSInvalidConfigurationError} before anything is stopped, when `timeout` is not an
+   *   integer from 0 to 2147483647
    * @throws {Error} `CONSUMER_STOPPING` from a handler of a retired run, before anything is stopped
    */
   const disconnect = async (options) => {
     refuseRetiredCaller()
-    const cleanup = shutDown(parseDisconnectOptions(options))
+    const cleanup = closeShared(parseDisconnectOptions(options))
     return RebalanceHooks.current() ? acceptFromHook(cleanup) : cleanup
   }
 
-  const stopShared = sharedPromiseTo(async (options) => {
+  /**
+   * The one stop in flight, shared by every caller. It captures the runner it stops: the factory's
+   * references are cleared only if they are still that run's, so a replacement started meanwhile
+   * is never nulled by an old stop settling late.
+   * @param {{ leaveGroup?: boolean }} [options] the first caller's leave choice
+   * @param {ConsumerOperation} [operation] the close that bounds the stop, absent for a natural wait
+   * @returns {Promise<void>}
+   */
+  const stopShared = sharedPromiseTo(async (options, operation) => {
     runSlot = null
+    const stopping = runner
     try {
-      if (runner) {
-        await runner.stop(options)
-        runner = null
-        consumerGroup = null
-        declared.retireRun()
+      if (stopping) {
+        await stopping.stop(options, operation)
+        if (runner === stopping) {
+          runner = null
+          consumerGroup = null
+          declared.retireRun()
+        }
         instrumentationEmitter.emit(STOP)
       }
 
@@ -792,11 +961,12 @@ module.exports = (params) => {
       runSlot = token
       selectionRevision++
       const runIdentity = { isCurrent: () => runSlot === token }
+      let group = null
       // Taken before the first await, so a crash restart cannot replay a queued seek.
       const seeks = [...queuedSeeks.values()]
       queuedSeeks.clear()
 
-      consumerGroup = new ConsumerGroup({
+      group = consumerGroup = new ConsumerGroup({
         logger: rootLogger,
         topics: manual
           ? manual.partitions.map(({ topic }) => topic)
@@ -862,7 +1032,7 @@ module.exports = (params) => {
         eachBatch,
         eachMessage,
         onCrash,
-        onJoinComplete: recordJoin,
+        onJoinComplete: () => recordJoin(group),
         concurrency,
         maxPrefetchBatches,
       })
@@ -958,7 +1128,11 @@ module.exports = (params) => {
 
         // Created outside any handler or callback store: the restart must not inherit its authority.
         restartTimeout = handlerContext.run(null, () =>
-          RebalanceHooks.outside(() => setTimeout(() => start(onCrash), retryTime))
+          RebalanceHooks.outside(() =>
+            setTimeout(() => {
+              if (stopGeneration === crashStopGeneration) start(onCrash)
+            }, retryTime)
+          )
         )
       }
     }
@@ -1036,15 +1210,17 @@ module.exports = (params) => {
     }
 
     const topics = Object.keys(commitsByTopic)
-
-    return runner.commitOffsets({
+    const offsets = {
       topics: topics.map((topic) => {
         return {
           topic,
           partitions: commitsByTopic[topic],
         }
       }),
-    })
+    }
+    const committing = runner
+
+    return withinCall((operation) => committing.commitOffsets(offsets, undefined, { operation }))
   }
 
   /** @type {import("../../types").Consumer["seek"]} */
@@ -1145,15 +1321,20 @@ module.exports = (params) => {
    * directly - which is what this did - answers `GROUP_ID_NOT_FOUND` for a consumer-protocol group
    * and reports it as `Dead` with no members.
    *
+   * With `retry.maxTotalTime` set, one deadline from the call's entry covers the lookup, fallback,
+   * refresh and retries, and an expired call sends and installs nothing more.
+   *
    * @type {import("../../types").Consumer["describeGroup"]}
    */
   const describeGroup = async () => {
     requireGroup()
-    const { groups } = await createGroupDescriptions({
-      cluster,
-      retry,
-      logger: rootLogger,
-    }).describe([groupId])
+    const { groups } = await withinCall((operation) =>
+      createGroupDescriptions({
+        cluster,
+        retry,
+        logger: rootLogger,
+      }).describe([groupId], { operation })
+    )
 
     return groups.find((group) => group.groupId === groupId)
   }
@@ -1394,16 +1575,18 @@ module.exports = (params) => {
    * Stops the run first, then clears the subscription or manual selection with its targets, queued
    * seeks, reset debts and metadata scope, keeping the connection. A failed stop propagates and
    * leaves the selection as it was. Idempotent. From a current rebalance callback it requests that
-   * cleanup and settles without awaiting it, as `stop()` does.
+   * cleanup and settles without awaiting it, as `stop()` does. The clearing happens only if no
+   * later selection change or run start replaced the control this call began under.
    * @type {import("../../types").Consumer["unsubscribe"]}
    * @throws {Error} what the stop failed with
    */
   const unsubscribe = async () => {
     refuseRetiredCaller()
-    selectionRevision++
+    const revision = ++selectionRevision
     stopGeneration++
     const cleanup = stopShared().then(() =>
       cluster.resetTargetTopics([], {
+        isCurrent: () => selectionRevision === revision,
         publish: () => {
           releaseDiscoveryScope()
           declared.clear()
@@ -1462,7 +1645,9 @@ module.exports = (params) => {
         'Consumer group was not initialized, consumer#run must be called first'
       )
     }
-    return group.position({ topic: entry.topic, partition: entry.partition })
+    return withinCall((operation) =>
+      group.position({ topic: entry.topic, partition: entry.partition }, { operation })
+    )
   }
 
   /**
@@ -1488,7 +1673,9 @@ module.exports = (params) => {
       return { topic: entry.topic, partition: entry.partition }
     })
     if (entries.length === 0) return []
-    return new CommittedOffsetReader({ cluster, groupId, retry }).read(entries)
+    return withinCall((operation) =>
+      new CommittedOffsetReader({ cluster, groupId, retry }).read(entries, { operation })
+    )
   }
 
   /**

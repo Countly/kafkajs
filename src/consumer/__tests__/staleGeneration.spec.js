@@ -44,7 +44,7 @@ const createRunner = (consumerGroupOverrides) => {
     // The membership seam the runner drives: the real ConsumerGroup answers all three.
     heartbeatInterval: () => 3000,
     onStopRequested: jest.fn(),
-    startIdleWait: jest.fn(),
+    startIdleWait: jest.fn(() => ({})),
     beginRebalanceRound: jest.fn(() => ({
       guard: () => null,
       wait: (work) => work(),

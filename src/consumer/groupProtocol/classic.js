@@ -332,15 +332,17 @@ module.exports = class ClassicGroupProtocol {
    * client checks the coordinator's connection the same way (`checkAndGetCoordinator`).
    * @see https://github.com/apache/kafka/blob/4.3.1/clients/src/main/java/org/apache/kafka/clients/consumer/internals/AbstractCoordinator.java
    * @private
+   * @param {import('./interface').ConsumerOperation} [operation] a caller operation whose close ends
+   *   the lookup's retries and dials; absent for the ordinary lookup
    * @returns {Promise<import('../../../types').Broker>}
    */
-  async liveCoordinator() {
+  async liveCoordinator(operation) {
     if (
       this.coordinatorUnknown ||
       this.coordinator.retired === true ||
       !this.coordinator.isConnected()
     ) {
-      await this.connect()
+      await this.connect(operation && { fence: operation })
     }
 
     return this.coordinator
@@ -790,13 +792,15 @@ module.exports = class ClassicGroupProtocol {
    * its connection is closed.
    * The member id, joined or pending, is forgotten whether the request succeeds, fails or is not
    * sent, unless a newer membership replaced it while the request was in flight.
-   * @param {{ leaveGroup?: boolean }} [options] `false` sends no request and only forgets the
-   *   member id; `true` and `undefined` send it (nothing calls this for a static member that
-   *   leaves by default)
+   * @param {{ leaveGroup?: boolean, operation?: import('./interface').ConsumerOperation }} [options]
+   *   `false` sends no request and only forgets the member id; `true` and `undefined` send it
+   *   (nothing calls this for a static member that leaves by default). The close `operation`, when
+   *   given, bounds the coordinator lookup and refuses the write once it expires.
    * @returns {Promise<void>}
    * @throws {import('../../errors').KafkaJSProtocolError} the coordinator's error for this member
+   * @throws {Error} the operation's refusal
    */
-  async leave({ leaveGroup } = {}) {
+  async leave({ leaveGroup, operation } = {}) {
     const { groupId, groupInstanceId, joinCount, membershipRevision } = this
     const memberId = this.memberId || this.pendingMemberId
 
@@ -805,12 +809,14 @@ module.exports = class ClassicGroupProtocol {
         if (this.coordinatorUnknown) {
           this.logger.debug('Leaving without a LeaveGroup: no coordinator is known', { groupId })
         } else {
-          const coordinator = await this.liveCoordinator()
+          const coordinator = await this.liveCoordinator(operation)
+          operation?.check()
           await coordinator.leaveGroup({
             groupId,
             memberId,
             groupInstanceId,
             reason: LEAVE_REASON,
+            ...(operation && { guard: operation.guard }),
           })
         }
       }

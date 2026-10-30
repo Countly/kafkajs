@@ -17,19 +17,24 @@ class CommittedOffsetReader {
   constructor({ cluster, groupId, retry }) {
     this.cluster = cluster
     this.groupId = groupId
-    this.retrier = createRetry(Object.assign({}, retry))
+    this.retryOptions = Object.assign({}, retry)
+    this.retrier = createRetry(this.retryOptions)
   }
 
   /**
    * Reads one offset per requested pair, in input order.
    * @param {{topic: string, partition: number}[]} entries validated, non-empty and unique pairs
+   * @param {{ operation?: import('./groupProtocol/interface').ConsumerOperation }} [context] the
+   *   public call's one deadline scope: its retries, coordinator lookup and write guard replace the
+   *   ordinary retrier's, and nothing is returned once it expired
    * @returns {Promise<{topic: string, partition: number, offset: string|null, metadata: string|null}[]>}
    *   rows in input order; an offset the group never committed is `null`, not `'-1'`, and its
    *   metadata is `null` too (the broker answers `''` for it)
    * @throws {KafkaJSInvariantViolation} when the answer names another group or omits a requested cell
-   * @throws {Error} a broker or partition error once the retry budget is spent
+   * @throws {Error} a broker or partition error once the retry budget is spent, or the operation's
+   *   own refusal
    */
-  async read(entries) {
+  async read(entries, { operation } = {}) {
     const topics = []
     const byTopic = new Map()
     for (const { topic, partition } of entries) {
@@ -42,21 +47,30 @@ class CommittedOffsetReader {
       partitions.push({ partition })
     }
 
-    const { responses } = await this.retrier(async (bail) => {
+    const attempt = async (bail) => {
       try {
-        const coordinator = await this.cluster.findGroupCoordinator({ groupId: this.groupId })
+        const coordinator = await this.cluster.findGroupCoordinator({
+          groupId: this.groupId,
+          ...(operation && { fence: operation }),
+        })
+        operation?.check()
         return await coordinator.offsetFetch({
           groupId: this.groupId,
           topics,
           memberId: null,
           memberEpoch: -1,
           requireStable: true,
+          ...(operation && { guard: operation.guard }),
         })
       } catch (error) {
+        if (operation?.guard()) throw operation.guard()
         if (isStaleCoordinator(error) || error.retriable !== false) throw error
         return bail(error)
       }
-    })
+    }
+    const { responses } = await (operation
+      ? operation.retry(attempt, this.retryOptions)
+      : this.retrier(attempt))
 
     const cells = new Map()
     for (const { topic, partitions } of responses) {

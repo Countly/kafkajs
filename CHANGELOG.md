@@ -51,6 +51,8 @@ Versions before 3.0.0 are internal alpha tags and are not published.
 
 - The handler async context now carries the identity of the run that delivered the batch, and `seek`, `position`, `assign`, `unsubscribe`, `commitOffsets`, `subscribe`, `run`, `connect`, `pause`, `resume`, `stop` and `disconnect` called from a handler of a retired run reject with `CONSUMER_STOPPING` instead of acting on a replacement run.
 
+- With an automatic commit interval or threshold set, batch-end automatic commits now follow either eligible condition at processing/check opportunities. With neither set, per-batch behavior remains. Classic stop, disconnect and unsubscribe add a final automatic commit attempt when automatic commits are enabled and group identity, ownership, eligible progress, halt bounds and remaining close time allow it. Fewer commits can increase crash redelivery after the last broker-confirmed offset.
+
 #### Fixes
 
 - Fence unknown-target metadata responses before cache installation and keep periodic naming attempts after the fast discovery budget.
@@ -60,6 +62,8 @@ Versions before 3.0.0 are internal alpha tags and are not published.
 - **A classic leader now notices a partition added to a topic only other members subscribe to.** The union it assigned from was read once, during the sync, so a topic subscribed only by a follower could never make the leader rejoin (Java's leader compares its assignment snapshot with its metadata snapshot and rejoins on drift). The leader now rereads those topics with a bounded, non-installing Metadata request, at most once per `metadataMaxAge`, and asks for the ordinary stale-assignment rejoin when one gains partitions, including a topic that did not exist at assignment. The watch stops when leadership is lost, a new round starts or the consumer stops, never creates a topic, never adds to the leader's own targets, and costs a leader whose members share its subscription one property read per fetch round.
 
 - A topic recreation's reset can no longer be lost across stop/run, a crash restart or an assignment rebuild: the consumer no longer resumes the deleted topic's committed offset in the new topic.
+
+- Fence retired consumer cleanup, pending starts, restart decisions and detached callbacks so they cannot change a replacement run or send requests with its identity. Retain valid-prefix automatic progress below a corrupt or unreadable batch during graceful close.
 
 #### Additions
 
@@ -74,6 +78,10 @@ Versions before 3.0.0 are internal alpha tags and are not published.
 - Manual assignment and unsubscribe; defensive assignment/subscription getters; next-position and broker-committed offset reads; a direct consumer constructor that may omit groupId. Assignment accepts the existing offsetReset policies. The lifecycle matrix gains 108 manual cells (434 in total).
 
 - Consumers can await run-scoped `rebalanceListener` callbacks and request a classic rejoin with `enforceRebalance(reason?)`. Added partitions remain held until the assigned callback completes; lost callbacks default to revoked. Callback failures surface as `KafkaJSRebalanceListenerError` with the original Error cause or exact non-Error `thrownValue`. Existing instrumentation remains observational and unawaited.
+
+- Add an optional consumer disconnect timeout that bounds cleanup for the captured run. Concurrent disconnect calls retain the first timeout and leave choice; zero starts no final commit or leave, and omission keeps natural waiting. Existing signal-handler calls remain compatible.
+
+- When retry.maxTotalTime is configured, consumer commitOffsets, committed, position and describeGroup bound the whole call from public entry, including a held first request. Expiry raises KafkaJSDeliveryTimeout and refuses late local effects and unsent requests; a transmitted commit can still apply at the broker.
 
 #### Tooling
 

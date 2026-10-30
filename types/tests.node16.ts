@@ -246,3 +246,23 @@ import {
   // @ts-expect-error reason must be a string
   hookConsumer.enforceRebalance(5)
 }
+
+/**
+ * Checks bounded consumer close without changing the legacy signal signature.
+ * @param target consumer whose overloads are checked
+ * @returns resolved when the accepted examples have closed
+ */
+async function useBoundedDisconnect(target: import('@countly/kafkajs').Consumer): Promise<void> {
+  await target.disconnect({ timeout: 0 })
+  await target.disconnect({ timeout: 2147483647, leaveGroup: false })
+  await target.disconnect({ timeout: undefined, leaveGroup: true })
+  const signal: (name: 'SIGTERM') => void = target.disconnect
+  const parameters: Parameters<typeof target.disconnect> = []
+  void signal
+  void parameters
+  // @ts-expect-error Timeout is a millisecond number.
+  await target.disconnect({ timeout: '1000' })
+  // @ts-expect-error Leave choice remains boolean.
+  await target.disconnect({ timeout: 1000, leaveGroup: 'yes' })
+}
+void useBoundedDisconnect

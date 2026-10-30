@@ -81,7 +81,7 @@ const build = ({
     // real HeartbeatManager rely on.
     heartbeatInterval: () => heartbeatInterval,
     onStopRequested: jest.fn(),
-    startIdleWait: jest.fn(),
+    startIdleWait: jest.fn(() => ({})),
     beginRebalanceRound: jest.fn(() => ({
       guard: () => null,
       wait: (work) => work(),

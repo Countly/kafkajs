@@ -34,7 +34,7 @@ const {
   obsoleteOwnership,
   consumerStoppingError,
 } = require('./rebalanceErrorContract')
-const { COOPERATIVE } = require('./groupProtocol/interface')
+const { COOPERATIVE, ConsumerOperation } = require('./groupProtocol/interface')
 
 /** A coordinator that is not, or no longer, the group's (Kafka error code 16). */
 const NOT_COORDINATOR = 16
@@ -95,6 +95,7 @@ module.exports = class Runner extends EventEmitter {
     // operation of the runner keeps the deadline.
     this.fetchRetrier = createRetry(Object.assign({}, retry, { maxTotalTime: undefined }))
     this.commitRetrier = createRetry(Object.assign({}, retry))
+    this.retryOptions = Object.assign({}, retry)
     this.backoff = createRetry.backoff(retry)
     /**
      * The transport outages a group member's fetch loop rides out, one per class of the client's own
@@ -130,6 +131,10 @@ module.exports = class Runner extends EventEmitter {
     this.running = false
     this.consuming = false
     this.stopRequested = false
+    /** Whether the synchronous half of a stop has run; it runs once. */
+    this.stopLatched = false
+    /** @type {Error|null} the first terminal reason of a forced close; the run refuses all later work */
+    this.retirement = null
     /** Handlers currently inside `eachMessage`/`eachBatch`. */
     this.inFlightHandlers = 0
     /** Set while an eager rebalance is stopping the world; see `handleRebalanceError`. */
@@ -212,22 +217,26 @@ module.exports = class Runner extends EventEmitter {
    * Starts the run: connects, joins the group (or applies the local manual selection) and starts
    * fetching. A manual run sends no membership request and arms neither the heartbeat nor any
    * membership timer.
+   * A stop requested while the connection is still being made ends this start: it joins nothing.
    * @returns {Promise<void>} settles once the first round's apply is done and fetching is scheduled
    */
   async start() {
-    if (this.running) {
+    if (this.running || this.stopRequested) {
       return
     }
 
-    this.consumerGroup.startIdleWait()
+    const { fence } = this.consumerGroup.startIdleWait()
     try {
-      await this.consumerGroup.connect()
+      await this.consumerGroup.connect({ fence })
+      // A stop that landed while connecting has retired this run: it must not start running.
+      if (this.stopRequested) return
       // `running` is set BEFORE the first round: the round guard is `stopRequested`, which only
       // `stop()` sets, and guarding on `running` would have made the initial round dead code.
       this.running = true
       await this.runInitialRound()
     } catch (e) {
       this.running = false
+      if (this.stopRequested && e?.type === 'CONSUMER_STOPPING') return
 
       try {
         return await this.onCrash(e)
@@ -674,11 +683,19 @@ module.exports = class Runner extends EventEmitter {
    * Every value but `undefined` goes to the group's own `leave`, which knows what it means for its
    * protocol.
    *
+   * After the close callback a classic member makes one eligible final automatic commit, then
+   * leaves. Every awaited stage runs under one operation: a close deadline ends the wait, skips
+   * the stages that did not start and refuses the write of the ones that are queued. A stop
+   * requested before the run started only latches, so that start joins nothing.
+   *
    * @param {{ leaveGroup?: boolean }} [options]
-   * @returns {Promise<void>}
+   * @param {import('./groupProtocol/interface').ConsumerOperation} [operation] the close that owns
+   *   this stop; its deadline and identity bound every stage, none when the stop waits naturally
+   * @returns {Promise<void>} resolves also when the close deadline ended the stages
    */
-  async stop(options) {
+  async stop(options, operation) {
     if (!this.running) {
+      this.latchStop()
       return
     }
 
@@ -688,33 +705,23 @@ module.exports = class Runner extends EventEmitter {
     })
 
     const closing = this.rebalanceHooks ? this.closeEpisode() : null
-    this.stopRequested = true
-    this.running = false
-    // Ends the inter-round yield at once, so a chain waiting one out does not hold this stop open.
-    this.rebalanceCoordinator.notifyStopRequested()
-    // Before the manager is stopped, deliberately: a join waiting on its first heartbeat response
-    // is only retried by the chain this next line cancels, so the rejection has to be in flight
-    // first or `idle()` below never resolves.
-    this.consumerGroup.onStopRequested()
-    // Latched, not merely cancelled: the rebalance chain awaited below can still reach
-    // `requestTick()` through an acknowledgement or a coordinator move, and a chain armed there
-    // would outlive LeaveGroup and hold the event loop open after `disconnect()` resolved.
-    this.heartbeatManager.shutdown()
-    this.pollTimer.stop()
-    this.rebalanceCoordinator.clearVerdict()
+    this.latchStop()
+    const scope = operation ?? new ConsumerOperation()
 
     try {
       // The fetch layer goes first: with `running` already false every fetch returns [] without
       // awaiting anything, so a fetcher left spinning would resolve in microtasks only and starve
       // the event loop the background round needs to make progress on the wire.
-      await this.fetchManager.stop()
+      await scope.wait(() => this.fetchManager.stop())
       // A background cooperative round must finish before LeaveGroup, or its JoinGroup would
       // re-register a member this runner has just left. Bounded by the current round, which is
       // the property waitForConsumer() already has. Nothing in that round re-arms the fetch
       // manager, so stopping it first cannot strand the round.
-      await this.rebalanceCoordinator.idle()
-      await this.waitForConsumer()
-      if (closing) await this.invokeCloseHook(closing)
+      await scope.wait(() => this.rebalanceCoordinator.idle())
+      await scope.wait(() => this.waitForConsumer(scope))
+      if (closing) await scope.wait(() => this.invokeCloseHook(closing, scope))
+
+      await this.commitFinalOffsetsContained(scope)
 
       this.consumerGroup.clearAssignerState()
 
@@ -729,18 +736,65 @@ module.exports = class Runner extends EventEmitter {
       ) {
         this.consumerGroup.forgetMemberId()
       } else {
-        await this.consumerGroup.leave(options)
+        await scope.wait(() =>
+          this.consumerGroup.leave({ leaveGroup: options?.leaveGroup, operation: scope })
+        )
       }
     } catch (e) {
       // The shutdown continues either way - the runner is already stopped by this point - but a
       // LeaveGroup that never reached the coordinator costs the whole session timeout before the
-      // group reassigns, so it must not be swallowed silently.
-      this.logger.error('Error while stopping the consumer group', {
-        groupId: this.consumerGroup.groupId,
-        memberId: this.consumerGroup.memberId,
-        error: e.message || e,
-      })
+      // group reassigns, so it must not be swallowed silently. A close deadline is the caller's
+      // own bound, reported by the close, not an error of the stop.
+      if (!scope.guard()) {
+        this.logger.error('Error while stopping the consumer group', {
+          groupId: this.consumerGroup.groupId,
+          memberId: this.consumerGroup.memberId,
+          error: e.message || e,
+        })
+      }
+    } finally {
+      if (!operation) scope.finish()
     }
+  }
+
+  /**
+   * The synchronous half of a stop, run once: refuses new batches, ends the inter-round yield and
+   * the heartbeat and poll timers, retires the run's idle state and rounds and clears a waiting
+   * verdict. A stop that finds no running run still latches, so a start in flight joins nothing.
+   * @private
+   * @returns {void}
+   */
+  latchStop() {
+    if (this.stopLatched) return
+    this.stopLatched = true
+    this.stopRequested = true
+    this.running = false
+    // Ends the inter-round yield at once, so a chain waiting one out does not hold this stop open.
+    this.rebalanceCoordinator.notifyStopRequested()
+    // Before the manager is stopped, deliberately: a join waiting on its first heartbeat response
+    // is only retried by the chain this next line cancels, so the rejection has to be in flight
+    // first or `idle()` never resolves.
+    this.consumerGroup.onStopRequested()
+    // Latched, not merely cancelled: the rebalance chain awaited by `stop` can still reach
+    // `requestTick()` through an acknowledgement or a coordinator move, and a chain armed there
+    // would outlive LeaveGroup and hold the event loop open after `disconnect()` resolved.
+    this.heartbeatManager.shutdown()
+    this.pollTimer.stop()
+    this.rebalanceCoordinator.clearVerdict()
+  }
+
+  /**
+   * Retires this run for good when its close deadline passes: latches the stop and refuses every
+   * later commit, heartbeat and hook wait of the run, so a handler or callback that outlives it
+   * changes nothing. Synchronous and idempotent; application promises are left as they are.
+   * @param {Error} error the first terminal reason
+   * @returns {void}
+   */
+  retire(error) {
+    if (this.retirement) return
+    this.retirement = error
+    this.latchStop()
+    for (const check of this.hookWaiters || []) check()
   }
 
   /**
@@ -765,19 +819,27 @@ module.exports = class Runner extends EventEmitter {
    * context; a failure is logged and the close goes on.
    * @private
    * @param {{ previous: Array<import('../../types').TopicPartitions>, lost: boolean }} episode
+   * @param {import('./groupProtocol/interface').ConsumerOperation} [operation] the close that owns
+   *   the callback: its deadline shortens the rebalance timeout, its retirement expires the callback
    * @returns {Promise<void>} always resolves
    */
-  async invokeCloseHook({ previous, lost }) {
+  async invokeCloseHook({ previous, lost }, operation) {
     if (previous.length === 0) return
     const group = this.consumerGroup
     const { ownership } = group
     if (lost) ownership?.lose(consumerStoppingError(), ownership.token())
-    const deadlineAt = performance.now() + group.rebalanceTimeout
+    const deadlineAt = Math.min(
+      performance.now() + group.rebalanceTimeout,
+      operation?.deadlineAt ?? Infinity
+    )
     let retired = null
     const round = {
       run: {},
       roundDeadlineAt: deadlineAt,
-      guard: () => retired || (performance.now() >= deadlineAt ? consumerStoppingError() : null),
+      guard: () =>
+        retired ||
+        operation?.guard() ||
+        (performance.now() >= deadlineAt ? consumerStoppingError() : null),
       retire: (error) => {
         retired ||= error
       },
@@ -810,7 +872,13 @@ module.exports = class Runner extends EventEmitter {
     }
   }
 
-  waitForConsumer() {
+  /**
+   * Resolves once the fetch loop has finished.
+   * @param {import('./groupProtocol/interface').ConsumerOperation} [operation] the close that owns
+   *   the wait: its retirement removes this wait's listener, so none outlives a forced close
+   * @returns {Promise<void>}
+   */
+  waitForConsumer(operation) {
     return new Promise((resolve) => {
       if (!this.consuming) {
         return resolve()
@@ -821,7 +889,14 @@ module.exports = class Runner extends EventEmitter {
         memberId: this.consumerGroup.memberId,
       })
 
-      this.once(CONSUMING_STOP, () => resolve())
+      let unregister = () => {}
+      const done = () => {
+        unregister()
+        this.off(CONSUMING_STOP, done)
+        resolve()
+      }
+      this.on(CONSUMING_STOP, done)
+      if (operation) unregister = operation.register(() => this.off(CONSUMING_STOP, done))
     })
   }
 
@@ -837,6 +912,7 @@ module.exports = class Runner extends EventEmitter {
    * @returns {Promise<void>}
    */
   async heartbeat() {
+    if (this.retirement) throw this.retirement
     try {
       await this.consumerGroup.heartbeat({
         interval: this.consumerGroup.heartbeatInterval(),
@@ -1425,7 +1501,14 @@ module.exports = class Runner extends EventEmitter {
         return
       }
 
-      await this.autoCommitOffsets(batch)
+      if (
+        this.consumerGroup.offsetManager?.autoCommitInterval != null ||
+        this.consumerGroup.offsetManager?.autoCommitThreshold != null
+      ) {
+        await this.autoCommitOffsetsIfNecessary(batch)
+      } else {
+        await this.autoCommitOffsets(batch)
+      }
       this.outages.commit.end()
       await this.heartbeat()
     }
@@ -1640,9 +1723,11 @@ module.exports = class Runner extends EventEmitter {
    * Checks the immutable operation identity and the calling handler's original batch.
    * @param {number} [token] the captured token; automatic calls default to current
    * @param {object} [batch] the captured batch; detached callers have no batch
-   * @returns {KafkaJSCommitFailedError|null} a refusal without writing or changing membership
+   * @returns {Error|null} a refusal without writing or changing membership; a forced close's own
+   *   reason once this run is retired
    */
   commitRefusal(token = this.consumerGroup.ownership?.token(), batch = handlerContext.current()) {
+    if (this.retirement) return this.retirement
     const refusal = this.consumerGroup.ownership?.refusal(token)
     if (refusal) return refusal
     return batch && this.isBatchStale(batch)
@@ -1700,15 +1785,75 @@ module.exports = class Runner extends EventEmitter {
   }
 
   /**
+   * The close's one final attempt, contained: a failed commit is logged and the close goes on to
+   * leave, but a retired close ends the stop at once.
+   * @private
+   * @param {import('./groupProtocol/interface').ConsumerOperation} operation the close scope
+   * @returns {Promise<void>}
+   * @throws {Error} the close's own refusal, when it expired during the attempt
+   */
+  async commitFinalOffsetsContained(operation) {
+    try {
+      await this.commitFinalOffsets(operation)
+    } catch (error) {
+      operation.check()
+      this.logger.warn('Final automatic commit failed; leaving anyway', {
+        groupId: this.consumerGroup.groupId,
+        memberId: this.consumerGroup.memberId,
+        error: error.message || error,
+      })
+    }
+  }
+
+  /**
+   * Attempts eligible classic progress once before leaving the captured closing run.
+   * Consumer-protocol leave already owns its final attempt; manual behavior is unchanged.
+   * @param {import('./groupProtocol/interface').ConsumerOperation} operation original close scope
+   * @returns {Promise<void>} no attempt when automatic progress or ownership is ineligible
+   * @throws {Error} commit failure or retirement; the close owner logs and continues cleanup
+   */
+  async commitFinalOffsets(operation) {
+    const group = this.consumerGroup
+    const manager = group.offsetManager
+    const token = group.ownership?.token()
+    if (
+      !this.autoCommit ||
+      !group.groupId ||
+      group.kind !== 'classic' ||
+      !manager ||
+      operation.remaining() === 0 ||
+      operation.guard() ||
+      this.commitRefusal(token, null)
+    )
+      return
+    if (manager.selectUncommitted().length === 0) return
+    const guard = () =>
+      operation.guard() ||
+      (this.consumerGroup !== group || group.offsetManager !== manager
+        ? new KafkaJSCommitFailedError('The closing assignment was replaced')
+        : this.commitRefusal(token, null))
+    await operation.wait(() => group.commitOffsets({}, { auto: true, guard, fence: operation }))
+  }
+
+  /**
    * Commits the given offsets for `consumer.commitOffsets()`, retrying through the commit retrier:
    * unlike the fetch loop's, it keeps the client's `retry.maxTotalTime`, so it rejects with
    * `KafkaJSDeliveryTimeout` once the deadline passes.
+   *
+   * With an API `operation` the whole call, first lookup included, runs under its one deadline: it
+   * retries on the operation's own cancellable backoff and its guard refuses every later write. An
+   * operation with no deadline keeps the ordinary retrier, as an unset `retry.maxTotalTime` always
+   * did, and its guard still refuses writes once the call is retired.
+   * A commit made from a close callback runs while the stop is in progress; any other call
+   * resolves at once, committing nothing, once the runner is no longer running.
    * @param {Object} offsets the offsets to commit
    * @param {object} [batch] the original handler batch, absent for detached calls
+   * @param {{ operation?: import('./groupProtocol/interface').ConsumerOperation }} [context] the
+   *   public call's private deadline scope
    * @returns {Promise<void>} resolves at once, committing nothing, when the runner is not running
    * @throws {import('../errors').KafkaJSDeliveryTimeout|import('../errors').KafkaJSNumberOfRetriesExceeded|Error}
    */
-  commitOffsets(offsets, batch = handlerContext.current() ?? null) {
+  commitOffsets(offsets, batch = handlerContext.current() ?? null, { operation } = {}) {
     const ownership = this.consumerGroup.ownership
     // A commit from a rebalance callback keeps that invocation's membership, expiry and original
     // acquisition cells through its retries and the sender; it never adopts what is current at
@@ -1717,11 +1862,14 @@ module.exports = class Runner extends EventEmitter {
     const token = invocation ? invocation.context.membership : ownership?.token()
     const release = ownership?.retain(token)
     const guard = () =>
+      operation?.guard() ||
       RebalanceHooks.refusal(invocation) ||
       this.commitRefusal(token, batch) ||
       (invocation && this.consumerGroup.hookCommitRefusal(invocation.context, offsets.topics)) ||
       null
-    if (!this.running) {
+    // A close callback commits while the stop runs; its invocation guard still expires it.
+    const closing = Boolean(invocation) && this.stopRequested
+    if (!this.running && !closing) {
       this.logger.debug('consumer not running, exiting', {
         groupId: this.consumerGroup.groupId,
         memberId: this.consumerGroup.memberId,
@@ -1731,14 +1879,21 @@ module.exports = class Runner extends EventEmitter {
       return
     }
 
-    return this.commitRetrier(async (bail, retryCount, retryTime) => {
+    const retrier =
+      operation && operation.deadlineAt !== Infinity
+        ? (attempt) => operation.retry(attempt, this.retryOptions)
+        : this.commitRetrier
+    return retrier(async (bail, retryCount, retryTime) => {
       try {
         const refusal = guard()
         if (refusal) return bail(refusal)
-        await this.consumerGroup.commitOffsets(offsets, { guard })
+        await this.consumerGroup.commitOffsets(offsets, {
+          guard,
+          ...(operation && { fence: operation }),
+        })
       } catch (e) {
         if (e instanceof KafkaJSCommitFailedError) return bail(e)
-        if (!this.running) {
+        if (!this.running && !closing) {
           this.logger.debug('consumer not running, exiting', {
             error: e.message,
             groupId: this.consumerGroup.groupId,

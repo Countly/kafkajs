@@ -1885,7 +1885,15 @@ export type Consumer = {
    * `consumer.disconnect` itself to a signal handler still compiles. The signature without
    * parameters comes last so that `Parameters<Consumer['disconnect']>` is `[]`, as in 2.2.4.
    */
-  disconnect(options?: { leaveGroup?: boolean }): Promise<void>
+  /**
+   * Bounds this close in milliseconds when timeout is set (integer 0..2147483647).
+   * Zero starts no final commit or leave; omitted preserves natural waiting.
+   * Concurrent closes retain the first close's timeout and leave choice.
+   * A transmitted commit can still apply after the local deadline.
+   * @throws KafkaJSInvalidConfigurationError for an invalid timeout
+   * @throws KafkaJSNonRetriableError for an invalid leaveGroup value
+   */
+  disconnect(options?: { leaveGroup?: boolean; timeout?: number }): Promise<void>
   disconnect(): Promise<void>
   subscribe(
     subscription: ConsumerSubscribeTopics | ConsumerSubscribeTopic | ConsumerSubscribeRegex

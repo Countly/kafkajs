@@ -421,6 +421,22 @@ describe('documented live scenario scripts', () => {
         'before first delivery',
       ],
     },
+    {
+      script: 'test:e2e:bounded-close',
+      flag: 'BOUNDED_CLOSE_E2E',
+      spec: 'src/consumer/__tests__/boundedCloseLive.spec.js',
+      compose: null,
+      budgetsMs: [90000],
+      wording: ['coordinator blackhole'],
+    },
+    {
+      script: 'test:e2e:auto-commit',
+      flag: 'AUTO_COMMIT_E2E',
+      spec: 'src/consumer/__tests__/autoCommitCadenceLive.spec.js',
+      compose: null,
+      budgetsMs: [90000],
+      wording: ['quiet window'],
+    },
   ]
 
   it.each(scenarios)('$script is one two-worker spec run through test:kafka', (row) => {

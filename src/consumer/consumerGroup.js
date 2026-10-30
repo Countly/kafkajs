@@ -642,7 +642,10 @@ module.exports = class ConsumerGroup {
     this.routingChanged()
   }
 
-  /** Creates fresh run-owned idle state after the previous run was retired. @returns {void} */
+  /**
+   * Creates fresh run-owned idle state after the previous run was retired.
+   * @returns {IdleWait} the new run, whose `fence` closes when this run is stopped or retired
+   */
   startIdleWait() {
     this.rebalanceHooks?.retire({ run: this.idleWait }, consumerStoppingError())
     this.roundContext?.retire(consumerStoppingError())
@@ -651,6 +654,7 @@ module.exports = class ConsumerGroup {
     this.idleWait = this.createRun()
     this.subscriptionState.clearPauses()
     this.retainSubscription(this.topicsSubscribed)
+    return this.idleWait
   }
 
   /**
@@ -735,12 +739,24 @@ module.exports = class ConsumerGroup {
     return this.cluster.getNodeIds()
   }
 
-  async connect() {
-    await this.cluster.connect()
+  /**
+   * Connects the cluster and loads its first metadata. A run's fence ends the connect and the first
+   * refresh when the run is retired meanwhile, so a stop that lands during a held connect leaves
+   * nothing joined.
+   * @param {object} [options]
+   * @param {import('../producer/generation')} [options.fence] the run's terminal fence
+   * @returns {Promise<void>}
+   * @throws {Error} the cluster's failure, or the fence's close error
+   */
+  async connect({ fence } = {}) {
+    await this.cluster.connect(...boundTo(fence))
+    fence?.check()
     this.instrumentationEmitter.emit(CONNECT)
     // A pattern consumer's first running discovery is the observation that starts continuity, so it
     // must not be skipped because the metadata happens to be fresh.
-    await (this.subscription ? this.refreshCluster() : this.cluster.refreshMetadataIfNecessary())
+    await (this.subscription
+      ? this.refreshCluster({ fence })
+      : this.cluster.refreshMetadataIfNecessary(...boundTo(fence)))
   }
 
   /**
@@ -2936,11 +2952,15 @@ module.exports = class ConsumerGroup {
    * the quiescent position. A read from a callback carries that invocation's guard and fence through
    * seek, resolution and the answer, so a callback that settled, expired or was retired meanwhile
    * publishes nothing and gets its refusal; a lost caller's read is refused too.
+   * With a public-call `operation`, its one deadline and identity guard are carried the same way: its
+   * close ends the reads and delays, and an expired call publishes and answers nothing.
    * @param {{topic: string, partition: number}} entry validated public partition
+   * @param {{ operation?: import('./groupProtocol/interface').ConsumerOperation }} [context]
    * @returns {Promise<string>} current nonnegative decimal next position, including sparse offsets
-   * @throws {Error} on ownership retirement, reset refusal or unresolved bounded resolution
+   * @throws {Error} on ownership retirement, reset refusal, the operation's refusal or unresolved
+   *   bounded resolution
    */
-  async position(entry) {
+  async position(entry, { operation } = {}) {
     ManualGroupProtocol.validateTopicPartition(entry)
     const { topic, partition } = entry
     const key = `${topic}|${partition}`
@@ -2960,16 +2980,19 @@ module.exports = class ConsumerGroup {
       this.cluster.topicId(topic) === topicId &&
       !this.ownership.refusal(token)
     const refusal = () =>
-      RebalanceHooks.refusal(invocation) || (current() ? null : consumerStoppingError())
-    const preparation = invocation
-      ? new InvocationPreparation({
-          manager,
-          fence: RebalanceHooks.fence(invocation),
-          ownershipToken: token,
-          assignmentEpoch: epoch,
-          guard: refusal,
-        })
-      : undefined
+      operation?.guard() ||
+      RebalanceHooks.refusal(invocation) ||
+      (current() ? null : consumerStoppingError())
+    const preparation =
+      invocation || operation
+        ? new InvocationPreparation({
+            manager,
+            fence: operation ?? RebalanceHooks.fence(invocation),
+            ownershipToken: token,
+            assignmentEpoch: epoch,
+            guard: refusal,
+          })
+        : undefined
     const check = () => {
       const error = refusal()
       if (error) throw error
