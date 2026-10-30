@@ -252,6 +252,12 @@ module.exports = (params) => {
   /** @type {Record<string, { fromBeginning?: boolean, resetPolicy?: object }>} */
   const topics = dictionary()
   /**
+   * Names subscribed under the consumer protocol while their topic did not exist, so the cluster
+   * could not register them as targets. The group registers each once the coordinator assigns it.
+   * @type {Set<string>}
+   */
+  const unregisteredTopics = new Set()
+  /**
    * Every subscription declaration for the life of this consumer: names, cloned patterns and the
    * policy each carried. A client-side pattern makes discovery re-evaluate it at metadata
    * refreshes; literal-only consumers keep their names in `topics`.
@@ -680,7 +686,13 @@ module.exports = (params) => {
         topics[t] = { fromBeginning, resetPolicy }
       }
 
-      await cluster.addMultipleTargetTopics(subscriptions)
+      try {
+        await cluster.addMultipleTargetTopics(subscriptions)
+        for (const name of subscriptions) unregisteredTopics.delete(name)
+      } catch (error) {
+        if (!isConsumerProtocol || error.type !== 'UNKNOWN_TOPIC_OR_PARTITION') throw error
+        for (const name of subscriptions) unregisteredTopics.add(name)
+      }
       return
     }
 
@@ -773,6 +785,7 @@ module.exports = (params) => {
         groupRemoteAssignor,
         subscribedTopicRegex,
         regexSubscription,
+        unregisteredTopics,
         maxPrefetchBatches,
         metadataMaxAge,
         autoCommit,
@@ -1300,6 +1313,7 @@ module.exports = (params) => {
         manual = null
         queuedSeeks.clear()
         for (const name of keys(topics)) delete topics[name]
+        unregisteredTopics.clear()
         subscribedTopicRegex = null
         regexSubscription = null
         retainTopics(new Set())

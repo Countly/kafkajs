@@ -624,6 +624,7 @@ await consumer.subscribe({ regex: '^orders-.*', fromBeginning: true })
 - The coordinator holds the pattern and re-evaluates it as topics come and go, so a topic created *after* you subscribe joins the subscription on its own — no client-side metadata poll, no resubscribe.
 - One consumer subscribes to names or to a regex, never both: mixing them throws `Subscribe to topics or to a regex, not both`. Under `'classic'` the form itself is rejected, with `A regex subscription requires groupProtocol: 'consumer'`.
 - A JavaScript `RegExp` inside `topics` is matched client-side under both protocols and re-evaluated at existing metadata refresh opportunities, not once at `subscribe()` time. Its clones ignore `g` and `y`, and internal topics require an explicit literal name.
+- Under `groupProtocol: 'consumer'`, `subscribe({ topics: ['orders'] })` succeeds while `orders` does not exist and automatic topic creation is off; the topic is picked up soon after it is created. Under `'classic'` the same call rejects with `UNKNOWN_TOPIC_OR_PARTITION`.
 - Resolved broker-regex names follow the coordinator's current target after it applies. A name no longer in that target is retired unless it is retained by an explicit literal subscription; old applied state remains available through final handlers, eligible commits and revoke work. The client does not interpret the broker's RE2 pattern or add a client-side discovery timer.
 
 ### Fencing and loss

@@ -166,6 +166,11 @@ module.exports = class ConsumerGroup {
    *                                the options the regex subscription was made with (the legacy
    *                                flag and the normalized reset policy), copied to a name-keyed
    *                                `topicConfigurations` entry for every name the regex resolves to.
+   * @param {Set<string>} [options.unregisteredTopics] literal names subscribed while their topic did
+   *                                not exist (consumer protocol), owned by the long-lived `Consumer`
+   *                                and shared with every group it builds. `growSubscription`
+   *                                registers each as a cluster target when the coordinator assigns
+   *                                it, and removes it from the set.
    * @param {Subscription|null} [options.subscription=null] the consumer's declarations when it holds
    *                                a client-side pattern: names are then discovered at metadata
    *                                refreshes and published by revision, never by `topics` alone.
@@ -216,6 +221,7 @@ module.exports = class ConsumerGroup {
     groupRemoteAssignor = null,
     subscribedTopicRegex = null,
     regexSubscription = null,
+    unregisteredTopics = new Set(),
     subscription = null,
     maxPrefetchBatches = 0,
     heartbeatInterval = 3000,
@@ -269,6 +275,7 @@ module.exports = class ConsumerGroup {
     this.rebalanceTimeout = rebalanceTimeout
     this.subscribedTopicRegex = subscribedTopicRegex
     this.regexSubscription = regexSubscription
+    this.unregisteredTopics = unregisteredTopics
     this.subscription = subscription
     /** @type {{revision: number}|null} the newest discovered snapshot not yet handed to `updateSubscription` */
     this.discovered = null
@@ -1394,7 +1401,8 @@ module.exports = class ConsumerGroup {
    * Three things in order, each of which something downstream would otherwise trip over: the name
    * set, a name-keyed `topicConfigurations` entry (the offset manager indexes it positionally and
    * destructures the result), and a cluster target topic (without which metadata is never fetched
-   * for it).
+   * for it). A literal name subscribed before its topic existed already holds the first two and
+   * gets only the target, once.
    *
    * NEVER pushes: `this.topics` and `this.topicsSubscribed` are the same array object at
    * construction, so a mutation would edit both.
@@ -1407,8 +1415,9 @@ module.exports = class ConsumerGroup {
     if (this.subscription) return
 
     const added = names.filter((name) => !this.topicsSubscribed.includes(name))
+    const awaiting = names.filter((name) => this.unregisteredTopics.has(name))
 
-    if (!added.length) {
+    if (!added.length && !awaiting.length) {
       return
     }
 
@@ -1420,7 +1429,8 @@ module.exports = class ConsumerGroup {
       }
     }
 
-    await this.cluster.addMultipleTargetTopics(added)
+    await this.cluster.addMultipleTargetTopics([...added, ...awaiting])
+    for (const name of awaiting) this.unregisteredTopics.delete(name)
   }
 
   /**

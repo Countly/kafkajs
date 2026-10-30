@@ -25,6 +25,8 @@ Versions before 3.0.0 are internal alpha tags and are not published.
 
 - **A named topic a KIP-848 member is assigned before its name is known is found promptly**, instead of up to `metadataMaxAge` later
 
+- **Under `groupProtocol: 'consumer'`, `subscribe` to a literal topic that does not exist yet resolves** instead of rejecting with `UNKNOWN_TOPIC_OR_PARTITION` (automatic creation off). The name stays a desired subscription, the coordinator assigns the topic once it exists, and the member names it through the by-topic-id metadata path at once, not at `metadataMaxAge`, then registers it as a metadata target. `INVALID_TOPIC_EXCEPTION` and `TOPIC_AUTHORIZATION_FAILED` still reject. Classic is unchanged: it rejects as in 2.2.4.
+
 - Consumer-protocol consumers retry their own connection and coordinator outages without spending the fetch loop's retry budget. A learned fence or fatal error, poll expiry and explicit stop still end or replace membership; no client-side session timeout is inferred from the classic configuration.
 
 - `consumer.partition_halted` gains a discriminated offset shape and the reasons `'no-offset'` and `'offset-out-of-range'` (used only with `offsetReset: 'none'`). No-offset uses offset null; out-of-range uses the known decimal offset or null. Existing corrupt/decode offsets stay decimal strings and retain their decode fields. TypeScript ≥4.1 is now required for the duration template-literal type.
