@@ -1,5 +1,7 @@
 const { Kafka } = require('../../../index')
+const apiKeys = require('../../protocol/requests/apiKeys')
 const { createScriptedCluster, groupScript } = require('../../../testHelpers/scriptedCluster')
+const { createChaosSocketFactory } = require('../../../testHelpers/chaosSocket')
 const { waitForCondition } = require('./fixtures/liveScenario')
 
 const NODES = [{ id: 0, host: 'node0', port: 9092 }]
@@ -103,11 +105,12 @@ describe('Consumer > a JoinGroup lost while parked', () => {
    * Builds the consumer without connecting it.
    * @param {ReturnType<typeof createScriptedCluster>} cluster
    * @param {object} [overrides] consumer options laid over the defaults
+   * @param {object} [kafkaOverrides] client options laid over the cluster's
    * @returns {object[]} the crash events, filled as they happen
    */
-  const start = (cluster, overrides = {}) => {
+  const start = (cluster, overrides = {}, kafkaOverrides = {}) => {
     const crashes = []
-    consumer = new Kafka(cluster.kafkaOptions()).consumer({
+    consumer = new Kafka(cluster.kafkaOptions(kafkaOverrides)).consumer({
       groupId: 'join-member-id',
       heartbeatInterval: 20,
       maxWaitTimeInMs: 20,
@@ -153,6 +156,37 @@ describe('Consumer > a JoinGroup lost while parked', () => {
     const crashes = await join(cluster)
 
     expect(joinIds()).toEqual(['', 'assigned-1', 'assigned-1', 'assigned-1', 'assigned-1'])
+    expect(crashes).toEqual([])
+  })
+
+  it('keeps the one assigned id when the follow-up JoinGroup answers are dropped and the connection ends', async () => {
+    const { cluster, joinIds, allocations } = coordinator()
+    const chaos = createChaosSocketFactory(cluster.socketFactory)
+    const losses = 3
+    let lost = 0
+    let disarm
+    const arm = () => {
+      if (disarm) return
+      disarm = chaos.arm({}, (socket) => {
+        socket.dropResponses(1, { apiKey: apiKeys.JoinGroup, thenClose: true })
+        socket.once('end', () => {
+          lost += 1
+          if (lost === losses) disarm()
+        })
+      })
+    }
+
+    const crashes = start(cluster, {}, { socketFactory: chaos })
+    consumer.on(consumer.events.REQUEST, ({ payload }) => {
+      if (payload.apiName === 'JoinGroup') arm()
+    })
+    await consumer.connect()
+    await consumer.subscribe({ topic: 'test-topic', fromBeginning: true })
+    await consumer.run({ eachMessage: async () => {} })
+
+    expect(lost).toBe(losses)
+    expect(joinIds()).toEqual(['', ...Array(losses + 1).fill('assigned-1')])
+    expect(allocations()).toBe(1)
     expect(crashes).toEqual([])
   })
 

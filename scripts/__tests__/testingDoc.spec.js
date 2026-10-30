@@ -370,6 +370,19 @@ describe('documented live scenario scripts', () => {
         'explicit-commit broker-truth arm',
       ],
     },
+    {
+      script: 'test:e2e:topic-recreated',
+      flag: 'TOPIC_RECREATED_E2E',
+      spec: 'src/consumer/__tests__/topicRecreatedLive.spec.js',
+      compose: null,
+      budgetsMs: [120000],
+      wording: [
+        'resumes from fromBeginning',
+        'stale committed offset',
+        'topic-recreated.jsonl',
+        'never through this package row',
+      ],
+    },
   ]
 
   it.each(scenarios)('$script is one two-worker spec run through test:kafka', (row) => {

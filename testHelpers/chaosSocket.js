@@ -189,6 +189,7 @@ class ChaosSocket extends EventEmitter {
     this.killTimer = null
     this.requestRule = null
     this.responseRule = null
+    this.closeAfterDrop = false
     this.pending = new Map()
     this.requests = new FrameFilter({
       headerBytes: REQUEST_HEADER_BYTES,
@@ -292,13 +293,15 @@ class ChaosSocket extends EventEmitter {
 
   /**
    * Drops the next `count` complete response frames, or only those answering a request of
-   * `apiKey` written on this socket; the bytes around them arrive intact.
+   * `apiKey` written on this socket; the bytes around them arrive intact. With `thenClose`, the
+   * socket ends as a peer would right after each dropped frame, so the product sees a connection
+   * lost with its request parked, not an answer that never comes.
    * @param {number} count
-   * @param {{ apiKey?: number }} [select]
+   * @param {{ apiKey?: number, thenClose?: boolean }} [select]
    * @returns {void}
    */
-  dropResponses(count, { apiKey } = {}) {
-    this.responseRule = { count, apiKey }
+  dropResponses(count, { apiKey, thenClose = false } = {}) {
+    this.responseRule = { count, apiKey, thenClose }
   }
 
   /**
@@ -338,6 +341,10 @@ class ChaosSocket extends EventEmitter {
         return
       }
     }
+    if (this.closeAfterDrop && (!this.responses.dropping || this.responses.remaining === 0)) {
+      this.closed = true
+      this.reads.push(null, this.readDelay)
+    }
   }
 
   /**
@@ -366,6 +373,7 @@ class ChaosSocket extends EventEmitter {
     if (!rule || rule.count === 0) return false
     if (rule.apiKey !== undefined && rule.apiKey !== apiKey) return false
     rule.count -= 1
+    this.closeAfterDrop ||= rule.thenClose
     return true
   }
 

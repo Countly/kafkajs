@@ -65,8 +65,10 @@ class Member {
    * @param {import('../../../types').Consumer} options.consumer
    * @param {string} options.topic
    * @param {object} options.subscribe the options of `subscribe` besides the topic
+   * @param {AbortSignal} options.scope the case's; each startup step runs under it
    */
-  constructor({ consumer, topic, subscribe }) {
+  constructor({ consumer, topic, subscribe, scope }) {
+    this.scope = scope
     this.consumer = consumer
     this.topic = topic
     this.subscribeOptions = subscribe
@@ -86,9 +88,11 @@ class Member {
     consumer.on(consumer.events.PARTITION_HALTED, ({ payload }) => this.halts.push(payload))
     consumer.on(consumer.events.TOPIC_RECREATED, ({ payload }) => this.recreated.push(payload))
     consumer.on(consumer.events.CRASH, ({ payload }) => this.crashes.push(payload.error))
-    await consumer.connect()
-    await consumer.subscribe({ topic: this.topic, ...this.subscribeOptions })
-    await this.run()
+    await bounded(this.scope, Infinity, () => consumer.connect())
+    await bounded(this.scope, Infinity, () =>
+      consumer.subscribe({ topic: this.topic, ...this.subscribeOptions })
+    )
+    await bounded(this.scope, Infinity, () => this.run())
   }
 
   /** @returns {Promise<void>} */
@@ -301,7 +305,7 @@ class FakeLane {
       ...config,
     })
     cleanup.add('consumer', () => consumer.disconnect())
-    return new Member({ consumer, topic: this.topic, subscribe })
+    return new Member({ consumer, topic: this.topic, subscribe, scope: this.scope })
   }
 
   /**
@@ -510,7 +514,7 @@ class DockerLane {
       ...config,
     })
     cleanup.add('consumer', () => consumer.disconnect())
-    return new Member({ consumer, topic: this.topic, subscribe })
+    return new Member({ consumer, topic: this.topic, subscribe, scope: this.scope })
   }
 
   /** @returns {null} the broker's own ListOffsets frames are not observable here */
@@ -992,7 +996,11 @@ describeReset.each(lanes())('Consumer > offset reset policies (live, %s lane)', 
         )
         const oldAcknowledged = acknowledgedOf(lane, 0)
         const member = trace.join(
-          lane.member(cleanup, { metadataMaxAge: 500 }, { fromBeginning: true })
+          lane.member(
+            cleanup,
+            { metadataMaxAge: 500, allowAutoTopicCreation: false },
+            { fromBeginning: true }
+          )
         )
         trace.reach('start')
         await bounded(scope, Infinity, () => member.start())
@@ -1103,3 +1111,5 @@ describeReset.each(lanes())('Consumer > offset reset policies (live, %s lane)', 
     caseTimeout(CASE_BUDGET_MS)
   )
 })
+
+module.exports = { Member }

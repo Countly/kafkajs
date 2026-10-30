@@ -84,7 +84,6 @@ const DEFAULT_METADATA_MAX_AGE_MS = 300000
 const MAX_TRACED_CALLS = 500
 const QUIET_MS = 2000
 const SESSION_TIMEOUT_MS = 30000
-const JOINER_REQUEST_TIMEOUT_MS = 3000
 const LOSSES = 3
 const JOINER_START_MS = 45000
 const ARMED_LIMIT = 10
@@ -1279,7 +1278,10 @@ const partitionsAddedToFollowerTopic =
 /**
  * Drops the next JoinGroup responses of the sockets it is applied to, a finite number of times, and
  * counts what it dropped. A dropped response is a complete frame the broker sent, so the broker has
- * accepted the join whose answer the client never sees.
+ * accepted the join whose answer the client never sees. Each socket ends as a peer would right
+ * after its dropped frame: a client whose JoinGroup is parked waits out the whole rebalance timeout
+ * for an answer that never comes, and a join that expires that way is a failed round, not a retry,
+ * so the loss it can retry is a lost connection.
  */
 class JoinResponseLoss {
   /** @param {ReturnType<typeof createChaosSocketFactory>} chaos the joiner's socket factory */
@@ -1295,7 +1297,7 @@ class JoinResponseLoss {
     if (this.armed) return
     this.armed = true
     this.disarm = this.chaos.arm({}, (socket) =>
-      socket.dropResponses(ARMED_LIMIT, { apiKey: apiKeys.JoinGroup })
+      socket.dropResponses(ARMED_LIMIT, { apiKey: apiKeys.JoinGroup, thenClose: true })
     )
   }
 
@@ -1328,148 +1330,208 @@ class JoinResponseLoss {
 /**
  * The scenario of a joiner that loses the responses to its follow-up JoinGroup requests. The
  * joiner receives its member id, then loses at least three complete JoinGroup responses the broker
- * sent; once the injection ends the same consumer finishes joining. It must have asked for an id
- * once and presented that id on every later attempt, so the group holds exactly the expected
- * members, as the broker reports them, long before an abandoned member could age out.
+ * sent, each with its connection; once the injection ends the same consumer finishes joining. It
+ * must have asked for an id once and presented that id on every later attempt, so the group holds
+ * exactly the expected members, as the broker reports them, long before an abandoned member could
+ * age out.
+ *
+ * The connection ends with each dropped response because the JoinGroup request may block for the
+ * rebalance timeout plus 5 s, whatever `requestTimeout` says, and the round is over at the
+ * rebalance timeout itself: a response lost on a connection that stays open ends the round, not
+ * the wait.
  *
  * The broker's own log is not read here: a controller that needs it takes the coordinator's log
  * between the `from` and `to` of the evidence line, for the group id and member ids it records.
+ * The evidence row is written in a `finally`, so a case that fails or times out still records the
+ * stage it reached, the member ids seen, each JoinGroup attempt with its time and the number of
+ * responses dropped.
  * @returns {(scope: AbortSignal) => Promise<void>}
  */
 const lostJoinResponses = () => async (scope) =>
   withClient(scope, async ({ groupId, admin, producer, member, ownTopic, cleanup, id }) => {
-    const topic = await ownTopic('lost-')
-    const options = {
-      topics: [topic],
-      assigner: roundRobin,
-      consumerOptions: { sessionTimeout: SESSION_TIMEOUT_MS },
-    }
-    const stable = [
-      member({ name: 'stable-1', ...options }),
-      member({ name: 'stable-2', ...options }),
-    ]
-    for (const seat of stable) await seat.start(scope)
-    await settleOwnership(scope, stable, [topic])
-    const stableIds = stable.map((seat) => seat.consumer.groupMetadata().memberId)
-
-    const trace = traceCalls(Broker.prototype, 'joinGroup', ({ groupId: group, memberId }) =>
-      group === groupId ? { memberId } : null
-    )
-    cleanup.add('join trace', () => trace.restore())
-    const chaos = createChaosSocketFactory(defaultSocketFactory())
-    const loss = new JoinResponseLoss(chaos)
-    const joiner = member({
-      name: 'joiner',
-      ...options,
-      kafkaOptions: { socketFactory: chaos, requestTimeout: JOINER_REQUEST_TIMEOUT_MS },
-    })
-    const { consumer } = joiner
-    consumer.on(consumer.events.REQUEST, ({ payload }) => {
-      if (payload.apiName === 'JoinGroup') loss.arm()
-    })
-    const starting = joiner.begin(scope, { startMs: JOINER_START_MS })
-    starting.catch(() => {})
-    await Promise.race([
-      pollUntil(scope, WAIT_MS, () => loss.dropped() >= LOSSES, {
-        label: 'The lost JoinGroup responses',
-      }),
-      starting,
-    ])
-    const lost = loss.end()
-    await starting
-    await joiner.whenJoined(scope)
-
-    const expectedIds = [...stableIds, joiner.memberId()].sort()
-    let described
-    await pollUntil(
-      scope,
-      WAIT_MS,
-      async () => {
-        const { groups } = await admin.describeGroups([groupId])
-        described = groups[0]
-        return (
-          described.state === 'Stable' &&
-          described.members
-            .map(({ memberId }) => memberId)
-            .sort()
-            .join() === expectedIds.join()
-        )
-      },
-      { label: 'The stable group of every expected member' }
-    )
-    const stableAt = performance.now()
-    const calls = trace.entries.filter(({ memberId }) => !stableIds.includes(memberId))
-    const joinStartedAt = calls[0]?.at ?? stableAt
-    const recoveryMs = stableAt - joinStartedAt
-
-    await pollUntil(
-      scope,
-      WAIT_MS,
-      () => isExclusive(ownershipOf([...stable, joiner]), partitionKeys([topic])),
-      { label: 'The exclusive ownership after recovery' }
-    )
-    const expected = await produce(scope, producer, topic, `lost-${id}`)
-    await pollUntil(
-      scope,
-      WAIT_MS,
-      () => [...stable, joiner].flatMap((seat) => seat.deliveries).length >= expected.length,
-      { label: 'The deliveries' }
-    )
-    await delay(scope, QUIET_MS)
-    const delivered = sortedIdentities([...stable, joiner].flatMap((seat) => seat.deliveries))
-    const committed = await awaitCommitted(scope, admin, groupId, [topic])
-    const ownership = ownershipOf([...stable, joiner])
+    const state = { stage: 'starting', error: null }
+    const seats = []
     const wall = (at) => new Date(performance.timeOrigin + at).toISOString()
+    let topic = null
+    let stableIds = []
+    let trace = null
+    let loss = null
+    let joiner = null
+    let lost = null
+    let described = null
+    let ownership = null
+    let committed = null
+    let joinStartedAt = null
+    let stableAt = null
+    const joinCalls = () =>
+      (trace?.entries ?? []).filter(({ memberId }) => !stableIds.includes(memberId))
 
-    writeEvidence(EVIDENCE, {
-      scenario: 'leader-union',
-      case: 'lost-initial-join-group',
-      config: {
-        assignor: 'roundRobin',
-        groupProtocol: 'classic',
-        sessionTimeout: SESSION_TIMEOUT_MS,
-      },
-      ...wireOf([...stable, joiner]),
-      groupId,
-      runId: id,
-      joinerMemberId: joiner.memberId(),
-      stableIds,
-      coordinators: lost.endpoints,
-      droppedResponses: lost.dropped,
-      calls: calls.map(({ at, memberId, error }) => ({
-        at: wall(at),
-        memberId,
-        error: describeError(error),
-      })),
-      from: wall(joinStartedAt),
-      to: wall(stableAt),
-      recoveryMs,
-      group: { state: described.state, members: described.members.map(({ memberId }) => memberId) },
-      ownership,
-      committed,
-    })
-    const allocations = calls.filter(({ memberId }) => memberId === '')
-    expect(lost.dropped).toBeGreaterThanOrEqual(LOSSES)
-    expect(allocations).toHaveLength(1)
-    expect(calls[0]?.memberId).toBe('')
-    expect(calls.length).toBeGreaterThanOrEqual(LOSSES + 1)
-    expect(new Set(calls.slice(1).map(({ memberId }) => memberId))).toEqual(
-      new Set([joiner.memberId()])
-    )
-    expect(joiner.memberId()).toBeTruthy()
-    expect(stableIds).not.toContain(joiner.memberId())
-    expect(calls.map(({ error }) => error?.type).filter(Boolean)).not.toContain('UNKNOWN_MEMBER_ID')
-    expect(described.members.map(({ memberId }) => memberId).sort()).toEqual(expectedIds)
-    expect(recoveryMs).toBeLessThan(SESSION_TIMEOUT_MS)
-    expect(isExclusive(ownership, partitionKeys([topic]))).toBe(true)
-    expect(joiner.deliveries.length).toBeGreaterThan(0)
-    expect(delivered).toEqual(sortedIdentities(expected))
-    expect(Object.values(committed[topic])).toEqual(
-      Array(PARTITIONS).fill(String(RECORDS_PER_PARTITION))
-    )
-    for (const seat of [...stable, joiner]) {
-      expect(seat.unsubscribed).toEqual([])
-      expect(seat.crashes).toEqual([])
+    try {
+      topic = await ownTopic('lost-')
+      const options = {
+        topics: [topic],
+        assigner: roundRobin,
+        consumerOptions: { sessionTimeout: SESSION_TIMEOUT_MS },
+      }
+      const stable = [
+        member({ name: 'stable-1', ...options }),
+        member({ name: 'stable-2', ...options }),
+      ]
+      seats.push(...stable)
+      state.stage = 'starting the stable members'
+      for (const seat of stable) await seat.start(scope)
+      await settleOwnership(scope, stable, [topic])
+      stableIds = stable.map((seat) => seat.consumer.groupMetadata().memberId)
+
+      trace = traceCalls(Broker.prototype, 'joinGroup', ({ groupId: group, memberId }) =>
+        group === groupId ? { memberId } : null
+      )
+      cleanup.add('join trace', () => trace.restore())
+      const chaos = createChaosSocketFactory(defaultSocketFactory())
+      loss = new JoinResponseLoss(chaos)
+      joiner = member({
+        name: 'joiner',
+        ...options,
+        kafkaOptions: { socketFactory: chaos },
+      })
+      seats.push(joiner)
+      const { consumer } = joiner
+      consumer.on(consumer.events.REQUEST, ({ payload }) => {
+        if (payload.apiName === 'JoinGroup') loss.arm()
+      })
+      state.stage = 'losing the JoinGroup responses'
+      const starting = joiner.begin(scope, { startMs: JOINER_START_MS })
+      starting.catch(() => {})
+      await Promise.race([
+        pollUntil(scope, WAIT_MS, () => loss.dropped() >= LOSSES, {
+          label: 'The lost JoinGroup responses',
+        }),
+        starting,
+      ])
+      lost = loss.end()
+      state.stage = 'finishing the join'
+      await starting
+      await joiner.whenJoined(scope)
+
+      state.stage = 'waiting for the stable group'
+      const expectedIds = [...stableIds, joiner.memberId()].sort()
+      await pollUntil(
+        scope,
+        WAIT_MS,
+        async () => {
+          const { groups } = await admin.describeGroups([groupId])
+          described = groups[0]
+          return (
+            described.state === 'Stable' &&
+            described.members
+              .map(({ memberId }) => memberId)
+              .sort()
+              .join() === expectedIds.join()
+          )
+        },
+        { label: 'The stable group of every expected member' }
+      )
+      stableAt = performance.now()
+      const calls = joinCalls()
+      joinStartedAt = calls[0]?.at ?? stableAt
+      const recoveryMs = stableAt - joinStartedAt
+
+      state.stage = 'settling the ownership'
+      await pollUntil(
+        scope,
+        WAIT_MS,
+        () => isExclusive(ownershipOf(seats), partitionKeys([topic])),
+        { label: 'The exclusive ownership after recovery' }
+      )
+      state.stage = 'delivering'
+      const expected = await produce(scope, producer, topic, `lost-${id}`)
+      await pollUntil(
+        scope,
+        WAIT_MS,
+        () => seats.flatMap((seat) => seat.deliveries).length >= expected.length,
+        { label: 'The deliveries' }
+      )
+      await delay(scope, QUIET_MS)
+      const delivered = sortedIdentities(seats.flatMap((seat) => seat.deliveries))
+      committed = await awaitCommitted(scope, admin, groupId, [topic])
+      ownership = ownershipOf(seats)
+
+      state.stage = 'asserting'
+      const allocations = calls.filter(({ memberId }) => memberId === '')
+      expect(lost.dropped).toBeGreaterThanOrEqual(LOSSES)
+      expect(allocations).toHaveLength(1)
+      expect(calls[0]?.memberId).toBe('')
+      expect(calls.length).toBeGreaterThanOrEqual(LOSSES + 1)
+      expect(new Set(calls.slice(1).map(({ memberId }) => memberId))).toEqual(
+        new Set([joiner.memberId()])
+      )
+      expect(joiner.memberId()).toBeTruthy()
+      expect(stableIds).not.toContain(joiner.memberId())
+      expect(calls.map(({ error }) => error?.type).filter(Boolean)).not.toContain(
+        'UNKNOWN_MEMBER_ID'
+      )
+      expect(described.members.map(({ memberId }) => memberId).sort()).toEqual(expectedIds)
+      expect(recoveryMs).toBeLessThan(SESSION_TIMEOUT_MS)
+      expect(isExclusive(ownership, partitionKeys([topic]))).toBe(true)
+      expect(joiner.deliveries.length).toBeGreaterThan(0)
+      expect(delivered).toEqual(sortedIdentities(expected))
+      expect(Object.values(committed[topic])).toEqual(
+        Array(PARTITIONS).fill(String(RECORDS_PER_PARTITION))
+      )
+      for (const seat of seats) {
+        expect(seat.unsubscribed).toEqual([])
+        expect(seat.crashes).toEqual([])
+      }
+      state.stage = 'passed'
+    } catch (error) {
+      state.error = describeError(error)
+      throw error
+    } finally {
+      lost ??= loss?.end() ?? null
+      const calls = joinCalls()
+      writeEvidence(EVIDENCE, {
+        scenario: 'leader-union',
+        case: 'lost-initial-join-group',
+        config: {
+          assignor: 'roundRobin',
+          groupProtocol: 'classic',
+          sessionTimeout: SESSION_TIMEOUT_MS,
+        },
+        ...wireOf(seats),
+        stage: state.stage,
+        error: state.error,
+        groupId,
+        runId: id,
+        topic,
+        joinerMemberId: joiner?.memberId() ?? null,
+        stableIds,
+        memberIds: [
+          ...new Set([
+            ...stableIds,
+            ...calls.map(({ memberId }) => memberId).filter(Boolean),
+            ...(joiner?.joins ?? []).map(({ payload }) => payload.memberId),
+          ]),
+        ],
+        coordinators: lost?.endpoints ?? [],
+        droppedResponses: lost?.dropped ?? 0,
+        calls: calls.map(({ at, memberId, error }) => ({
+          at: wall(at),
+          memberId,
+          error: describeError(error),
+        })),
+        from: joinStartedAt === null ? null : wall(joinStartedAt),
+        to: stableAt === null ? null : wall(stableAt),
+        recoveryMs: stableAt === null ? null : stableAt - joinStartedAt,
+        group: described && {
+          state: described.state,
+          members: described.members.map(({ memberId }) => memberId),
+        },
+        ownership,
+        committed,
+        crashes: seats.flatMap(({ name, crashes }) =>
+          crashes.map(({ at, error }) => ({ name, at: wall(at), error: describeError(error) }))
+        ),
+      })
     }
   })
 

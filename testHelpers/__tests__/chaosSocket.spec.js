@@ -237,6 +237,66 @@ describe('ChaosSocket', () => {
     expect(read).toEqual([shortResponse])
   })
 
+  test('dropResponses with thenClose drops the answer, then ends and destroys the socket', () => {
+    const { socket, inner, read } = wrapped()
+    const ended = jest.fn()
+    socket.on('end', ended)
+    socket.write(requestFrame(11, 1))
+    socket.write(requestFrame(3, 2))
+
+    socket.dropResponses(1, { apiKey: 11, thenClose: true })
+    inner.emit('data', responseFrame(1, [1, 2, 3]))
+    inner.emit('data', responseFrame(2))
+
+    expect(read).toEqual([])
+    expect(ended).toHaveBeenCalledTimes(1)
+    expect(inner.destroyed).toBe(true)
+  })
+
+  test('dropResponses with thenClose delivers the other frames of the chunk, then ends', () => {
+    const { socket, inner, read } = wrapped()
+    const ended = jest.fn()
+    socket.on('end', ended)
+    socket.write(requestFrame(3, 1))
+    socket.write(requestFrame(11, 2))
+    const answers = [responseFrame(1), responseFrame(2, [9, 9]), responseFrame(3)]
+
+    socket.dropResponses(1, { apiKey: 11, thenClose: true })
+    inner.emit('data', Buffer.concat(answers))
+
+    expect(Buffer.concat(read)).toEqual(Buffer.concat([answers[0], answers[2]]))
+    expect(ended).toHaveBeenCalledTimes(1)
+  })
+
+  test('thenClose waits for the dropped response body before ending', () => {
+    const { socket, inner, read } = wrapped()
+    const ended = jest.fn()
+    socket.on('end', ended)
+    socket.write(requestFrame(11, 1))
+    socket.dropResponses(1, { apiKey: 11, thenClose: true })
+    const answer = responseFrame(1, [1, 2, 3])
+    inner.emit('data', answer.subarray(0, 8))
+    expect(ended).not.toHaveBeenCalled()
+    expect(inner.destroyed).toBe(false)
+    inner.emit('data', answer.subarray(8))
+    expect(read).toEqual([])
+    expect(ended).toHaveBeenCalledTimes(1)
+    expect(inner.destroyed).toBe(true)
+  })
+
+  test('dropResponses without thenClose leaves the socket open', () => {
+    const { socket, inner } = wrapped()
+    const ended = jest.fn()
+    socket.on('end', ended)
+    socket.write(requestFrame(11, 1))
+
+    socket.dropResponses(1, { apiKey: 11 })
+    inner.emit('data', responseFrame(1))
+
+    expect(ended).not.toHaveBeenCalled()
+    expect(inner.destroyed).toBe(false)
+  })
+
   test('truncateAndClose(0) delivers nothing and closes at the next read', () => {
     const { socket, inner, read } = wrapped()
     const ended = jest.fn()

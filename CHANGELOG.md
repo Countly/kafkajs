@@ -67,6 +67,8 @@ Versions before 3.0.0 are internal alpha tags and are not published.
 
 - `test:e2e:leader-union` checks unequal subscriptions, delayed topic creation and Java interoperability in both leader seats.
 
+- Add isolated Fetch-round measurements and an independent Fetch frame transcript.
+
 - Add independent leave/default, consumer fault and transient-state capture checks; assert both group protocols in the broker-bounce rebalance oracle.
 
 - `test:e2e:rack-aware` checks range rack alignment against an independent Java vector, the node of the next Fetch after a preferred-read-replica answer, and no-op rack controls from the socket's own frames.
