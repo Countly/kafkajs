@@ -244,9 +244,9 @@ const shortArmStop = RebalanceAssertions.shortArmStop
 const assertedRebalanceViolations = RebalanceAssertions.violations
 
 /**
- * Oracle part 4, position: at quiescence each partition's committed offset is the highest
- * delivered offset plus one, and no commit ever named more than what was delivered by then plus
- * one.
+ * Oracle part 4, position: once the members have closed gracefully, each partition's committed
+ * offset is the highest delivered offset plus one, and no commit ever named more than what was
+ * delivered by then plus one.
  * @param {GroupJournal} journal
  * @param {string} topic
  * @param {Map<number, string>} committed the group's committed offsets, by partition
@@ -1134,6 +1134,25 @@ describeBounce('Broker bounce: durable log, delivery and rebalances across outag
         const [{ partitions }] = await admin.fetchOffsets({ groupId, topics: [topic] })
         return new Map(partitions.map(({ partition, offset }) => [partition, offset]))
       }
+      const verdict = Object.fromEntries(
+        Object.entries(journals).map(([group, journal]) => [
+          group,
+          {
+            delivery: deliveryVerdict(journal, outages),
+            rebalances: rebalanceVerdict(journal, outages),
+            ownership: ownershipVerdict(journal, topic),
+          },
+        ])
+      )
+      // The interval cadence has no background timer: the tail after the last commit stays
+      // uncommitted while idle and is committed by the graceful close (docs/Consuming.md).
+      await Promise.all(
+        members.map(({ name, consumer }) =>
+          bounded(scope, DISCONNECT_BUDGET_MS, () => consumer.disconnect(), {
+            label: `The ${name} graceful close`,
+          })
+        )
+      )
       const positions = {}
       await scoped(scope, () =>
         waitForCondition(async () => {
@@ -1147,17 +1166,7 @@ describeBounce('Broker bounce: durable log, delivery and rebalances across outag
         }, DELIVERY_BUDGET)
       )
 
-      const verdict = Object.fromEntries(
-        Object.entries(journals).map(([group, journal]) => [
-          group,
-          {
-            delivery: deliveryVerdict(journal, outages),
-            rebalances: rebalanceVerdict(journal, outages),
-            position: positions[group],
-            ownership: ownershipVerdict(journal, topic),
-          },
-        ])
-      )
+      for (const group of Object.keys(journals)) verdict[group].position = positions[group]
       writeEvidence(EVIDENCE, {
         step: 'verdict',
         acked: acked.length,
