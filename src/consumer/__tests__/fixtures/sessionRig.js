@@ -349,27 +349,35 @@ const monotonicOf = (wallMs, wallNow = Date.now(), monotonicNow = performance.no
   monotonicNow - (wallNow - wallMs)
 
 /**
- * @param {object[]} observations every Fetch frame of the member
+ * Reads what a socket fault did to a node from the member's frames. A fault that closes or
+ * abandons a connection shows as the first frame on a connection opened after the arming; that
+ * frame settles it, whichever frame the fault took. The Fetch before it is lost when it was never
+ * answered. A truncation can close the connection between two answered Fetches and lose none.
+ * @param {object[]} observations every Fetch frame of the member, oldest first
  * @param {number} node
- * @returns {number|undefined} the connection of the node's newest frame, which a fault armed now
- *   reaches
+ * @param {number} armedThrough the newest connection id the fault was armed on: the wire's
+ *   `connections` when it was armed, which covers every socket then open and none opened later
+ * @returns {{ reconnected: object, lost: object|undefined }|undefined} the first frame on a later
+ *   connection and the unanswered frame sent just before it; undefined until the node reconnects
  */
-const connectionOf = (observations, node) =>
-  observations.findLast((o) => o.node === node)?.connection
+const faultOutcome = (observations, node, armedThrough) => {
+  const frames = observations.filter((o) => o.node === node)
+  const index = frames.findIndex((o) => o.connection > armedThrough)
+  if (index < 0) return undefined
+  const before = frames[index - 1]
+  return { reconnected: frames[index], lost: before?.answer === null ? before : undefined }
+}
 
 /**
- * Matches the Fetch a fault took. The request in flight when the fault is armed takes it, so the
- * frame may be older than the arming: it is told by its connection, not by its time.
- * @param {number} node
- * @param {number} connection the connection the fault was armed on
- * @returns {(o: object, index: number, all: object[]) => boolean} true for a frame sent on
- *   `connection` that was never answered, once the node shows a frame on another connection
+ * @param {string} name the fault
+ * @param {{ reconnected: object, lost: object|undefined }} outcome from `faultOutcome`
+ * @returns {string[]} how the outcome breaks the session oracle: after a lost Fetch the first
+ *   request on the new connection must be a full one (epoch 0)
  */
-const lostOnConnection = (node, connection) => (o, index, all) =>
-  o.node === node &&
-  o.connection === connection &&
-  o.answer === null &&
-  all.some((later) => later.node === node && later.at > o.at && later.connection !== connection)
+const faultProblems = (name, { reconnected, lost }) =>
+  lost && reconnected.sessionEpoch !== 0
+    ? [`${name}: epoch ${reconnected.sessionEpoch} followed a lost Fetch`]
+    : []
 
 /**
  * @param {object} evidence
@@ -849,12 +857,12 @@ module.exports = {
   commitProblems,
   corpusProblems,
   closeProblems,
-  connectionOf,
   deleteTopics,
+  faultOutcome,
+  faultProblems,
   followerProblems,
   holds,
   identity,
-  lostOnConnection,
   monotonicOf,
   moveProblems,
   sessionProblems,

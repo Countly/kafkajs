@@ -30,10 +30,10 @@ const {
   STEP_MS,
   closeProblems,
   commitProblems,
-  connectionOf,
   corpusProblems,
+  faultOutcome,
+  faultProblems,
   followerProblems,
-  lostOnConnection,
   monotonicOf,
   moveProblems,
   sessionFacts,
@@ -728,30 +728,30 @@ describeSessions('Consumer > Fetch sessions (live)', () => {
           blackholed: (socket) => socket.blackhole(),
         }
         rig.facts.faults = {}
+        const faultProblemList = []
         const expected = [...corpus]
         for (const [name, apply] of Object.entries(faults)) {
-          const armed = connectionOf(await member.wire.observations(), node)
           // Arms the sockets open now and none opened later, so the reconnect is clean.
+          const armedThrough = member.wire.connections
           chaos.arm(select, apply)()
-          const unanswered = await frameWhere(
-            rig,
-            member,
-            lostOnConnection(node, armed),
-            `The ${name} fault on node ${node}`
+          let outcome
+          await pollUntil(
+            rig.scope,
+            STEP_MS,
+            async () => {
+              outcome = faultOutcome(await member.wire.observations(), node, armedThrough)
+              return Boolean(outcome)
+            },
+            { delayMs: POLL_MS, label: `The ${name} fault on node ${node}` }
           )
           const records = await rig.produce(name, topic, PARTITION_LIST, 2)
           expected.push(...records)
           await rig.delivered(member, records)
-          const resumed = await frameWhere(
-            rig,
-            member,
-            (o) => o.node === node && o.at > unanswered.at && o.sessionEpoch === 0,
-            `The full request after the ${name} fault`
-          )
+          faultProblemList.push(...faultProblems(name, outcome))
           rig.facts.faults[name] = {
-            unansweredAt: unanswered.at,
-            resumedAt: resumed.at,
-            sameConnection: resumed.connection === unanswered.connection,
+            lostAt: outcome.lost?.at ?? null,
+            reconnectedAt: outcome.reconnected.at,
+            fullRequest: outcome.reconnected.sessionEpoch === 0,
           }
         }
         await rig.quiet()
@@ -759,9 +759,10 @@ describeSessions('Consumer > Fetch sessions (live)', () => {
           corpus: corpusProblems(expected, member.handled),
           commits: commitProblems(member.handled, await rig.committed(groupId, topic)),
           crashes: member.crashes.map((error) => error.message),
+          faults: faultProblemList,
         }
         rig.facts.problems = problems
-        expect(problems).toEqual({ corpus: [], commits: [], crashes: [] })
+        expect(problems).toEqual({ corpus: [], commits: [], crashes: [], faults: [] })
       })
     ),
     caseTimeout(CASE_BUDGET_MS)

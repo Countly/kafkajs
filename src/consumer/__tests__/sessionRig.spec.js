@@ -8,10 +8,10 @@ const {
   capacityProblems,
   closeProblems,
   commitProblems,
-  connectionOf,
   corpusProblems,
+  faultOutcome,
+  faultProblems,
   followerProblems,
-  lostOnConnection,
   monotonicOf,
   moveProblems,
   sessionFacts,
@@ -419,43 +419,95 @@ describe('capacityProblems', () => {
   })
 })
 
-describe('the fault and outage clocks', () => {
-  const sent = (node, connection, at, answered) => ({
-    node,
-    connection,
-    at,
-    answer: answered ? { rows: 0 } : null,
-  })
-
+describe('the outage clock', () => {
   it('puts a wall-clock moment on the monotonic clock the frames use', () => {
     expect(monotonicOf(1000, 1500, 90)).toBe(-410)
     expect(monotonicOf(1500, 1500, 90)).toBe(90)
     expect(monotonicOf(Date.now() - 50) - performance.now()).toBeLessThan(-40)
   })
+})
 
-  it('tells a dropped Fetch sent before the arming by its connection', () => {
-    const frames = [
-      sent(1, 4, 10, true),
-      sent(2, 5, 11, true),
-      sent(1, 4, 20, false),
-      sent(1, 8, 40, true),
-    ]
-    const armed = connectionOf(frames.slice(0, 2), 1)
-    const lost = lostOnConnection(1, armed)
+describe('the fault outcome', () => {
+  const NODE = 1
+  const sent = (connection, at, answered, sessionEpoch = 1, node = NODE) => ({
+    node,
+    connection,
+    at,
+    sessionEpoch,
+    answer: answered ? { rows: 0 } : null,
+  })
+  const other = sent(5, 12, true, 1, 2)
 
-    expect(armed).toBe(4)
-    expect(frames.findIndex(lost)).toBe(2)
-    expect(frames.filter(lost)).toHaveLength(1)
+  /**
+   * One arming, as the live case sees it: `pre` frames exist when the fault is armed, `post`
+   * frames come later, and `armedThrough` is the wire's connection count at the arming, so a
+   * socket opened by then is armed even when it has sent nothing. `lost` picks the frame the
+   * fault took, if any.
+   */
+  const scenarios = {
+    'already in flight at the arming': {
+      armedThrough: 7,
+      pre: [sent(4, 10, true), sent(4, 20, false)],
+      post: [sent(8, 30, true, 0)],
+      lost: (pre) => pre[1],
+    },
+    'the next frame after the arming': {
+      armedThrough: 7,
+      pre: [sent(4, 10, true)],
+      post: [sent(4, 20, false), sent(8, 30, true, 0)],
+      lost: (pre, post) => post[0],
+    },
+    'an armed socket that has sent nothing yet': {
+      armedThrough: 8,
+      pre: [sent(4, 10, true), sent(4, 15, false)],
+      post: [sent(8, 30, false), sent(10, 40, true, 0)],
+      lost: (pre, post) => post[0],
+    },
+  }
+
+  describe.each(['dropped', 'truncated', 'blackholed'])('%s', (kind) => {
+    const gap = kind === 'blackholed' ? 5000 : 0
+
+    it.each(Object.keys(scenarios))(
+      'settles on the reconnect and finds the lost Fetch: %s',
+      (name) => {
+        const { armedThrough, pre, post, lost } = scenarios[name]
+        const reconnected = { ...post.at(-1), at: post.at(-1).at + gap }
+        const after = [...post.slice(0, -1), reconnected]
+
+        const outcome = faultOutcome([other, ...pre, ...after], NODE, armedThrough)
+
+        expect(outcome.reconnected).toBe(reconnected)
+        expect(outcome.lost).toBe(lost(pre, after))
+        expect(faultProblems(kind, outcome)).toEqual([])
+      }
+    )
   })
 
-  it('waits for the reconnect and ignores another node or an older connection', () => {
-    const lost = lostOnConnection(1, 8)
+  it('settles a truncation that closed between two answered Fetches without a lost frame', () => {
+    const frames = [sent(8, 10, true), sent(8, 20, true), sent(10, 30, true, 2)]
 
-    expect([sent(1, 8, 20, false)].find(lost)).toBeUndefined()
-    expect([sent(1, 8, 20, false), sent(2, 5, 30, true)].find(lost)).toBeUndefined()
-    expect([sent(1, 4, 5, false), sent(1, 8, 20, true)].find(lost)).toBeUndefined()
-    expect([sent(1, 8, 20, false), sent(1, 9, 30, true)].find(lost)).toEqual(sent(1, 8, 20, false))
-    expect(connectionOf([], 1)).toBeUndefined()
+    const outcome = faultOutcome(frames, NODE, 8)
+
+    expect(outcome).toEqual({ reconnected: frames[2], lost: undefined })
+    expect(faultProblems('truncated', outcome)).toEqual([])
+  })
+
+  it('does not settle while the node stays on the armed connections or another node reconnects', () => {
+    const frames = [sent(4, 10, true), sent(4, 20, false), sent(9, 30, true, 0, 2)]
+
+    expect(faultOutcome(frames, NODE, 7)).toBeUndefined()
+    expect(faultOutcome([], NODE, 7)).toBeUndefined()
+  })
+
+  it('requires a full request after a lost Fetch and nothing after a clean close', () => {
+    const lost = sent(4, 20, false)
+
+    expect(faultProblems('dropped', { lost, reconnected: sent(8, 30, true, 3) })).toEqual([
+      'dropped: epoch 3 followed a lost Fetch',
+    ])
+    expect(faultProblems('dropped', { lost, reconnected: sent(8, 30, true, 0) })).toEqual([])
+    expect(faultProblems('truncated', { reconnected: sent(8, 30, true, 3) })).toEqual([])
   })
 })
 
