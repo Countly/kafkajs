@@ -34,7 +34,7 @@ const {
   obsoleteOwnership,
   consumerStoppingError,
 } = require('./rebalanceErrorContract')
-const { COOPERATIVE, ConsumerOperation } = require('./groupProtocol/interface')
+const { COOPERATIVE, ConsumerOperation, isCallDeadline } = require('./groupProtocol/interface')
 
 /** A coordinator that is not, or no longer, the group's (Kafka error code 16). */
 const NOT_COORDINATOR = 16
@@ -1889,14 +1889,21 @@ module.exports = class Runner extends EventEmitter {
     const invocation = RebalanceHooks.current()
     const token = invocation ? invocation.context.membership : ownership?.token()
     const release = ownership?.retain(token)
-    const guard = () =>
-      operation?.guard() ||
+    // A close callback commits while the stop runs; its invocation guard still expires it.
+    const closing = Boolean(invocation) && this.stopRequested
+    const authority = () =>
       RebalanceHooks.refusal(invocation) ||
       this.commitRefusal(token, batch) ||
       (invocation && this.consumerGroup.hookCommitRefusal(invocation.context, offsets.topics)) ||
       null
-    // A close callback commits while the stop runs; its invocation guard still expires it.
-    const closing = Boolean(invocation) && this.stopRequested
+    // An expired call's deadline stays its caller-facing error but never masks a later stop or
+    // retirement: the run's authority is checked first, so a retired run publishes nothing.
+    const guard = () => {
+      const call = operation?.guard()
+      if (!call) return authority()
+      if (!isCallDeadline(call)) return call
+      return (!this.running && !closing && consumerStoppingError()) || authority() || call
+    }
     if (!this.running && !closing) {
       this.logger.debug('consumer not running, exiting', {
         groupId: this.consumerGroup.groupId,

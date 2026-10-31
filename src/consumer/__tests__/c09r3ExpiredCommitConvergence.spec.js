@@ -1,5 +1,6 @@
 const Runner = require('../runner')
 const { KafkaJSDeliveryTimeout } = require('../../errors')
+const { consumerStoppingError } = require('../rebalanceErrorContract')
 const { CloseRig, until, pause } = require('./fixtures/closeRig')
 const { TOPIC, TOPIC_ID, prepareRecordBatches } = require('./fixtures/fetchHarness')
 
@@ -31,13 +32,16 @@ class ExpiredCommit {
     consumer.on(consumer.events.COMMIT_OFFSETS, () => this.commitEvents.push(1))
   }
 
-  /** @returns {Promise<ExpiredCommit>} a started member with a short public-call deadline */
-  static async open() {
+  /**
+   * @param {{ run?: object }} [options] extra `consumer.run` options
+   * @returns {Promise<ExpiredCommit>} a started member with a short public-call deadline
+   */
+  static async open({ run = {} } = {}) {
     const rig = await CloseRig.open({ protocol: 'consumer' })
     const start = jest.spyOn(Runner.prototype, 'start')
     const { consumer } = await rig.started({
       consumer: { retry: { maxTotalTime: 400, retries: 1, initialRetryTime: 10 } },
-      run: { autoCommit: false },
+      run: { autoCommit: false, ...run },
     })
     return new ExpiredCommit(rig, consumer, start.mock.instances[0])
   }
@@ -72,6 +76,23 @@ class ExpiredCommit {
     if (replaceToken) this.ownership.renew()
     held.release(answerWith(errorCode))
     return { error, token }
+  }
+
+  /**
+   * Writes one public commit, lets its own deadline expire, retires the run with `retire`, then
+   * answers the held request with `errorCode`.
+   * @param {number} errorCode what the coordinator answers
+   * @param {(member: ExpiredCommit) => Promise<void>} retire stops or force-closes the run
+   * @returns {Promise<Error>} the caller's outcome
+   */
+  async answerAfterRetirement(errorCode, retire) {
+    const held = this.rig.cluster.schedule.hold({ api: 'OffsetCommit' })
+    const committing = this.consumer.commitOffsets([COMMIT]).catch((error) => error)
+    await held.arrived()
+    const error = await committing
+    await retire(this)
+    held.release(answerWith(errorCode))
+    return error
   }
 
   /** @returns {Promise<void>} releases every hold and disconnects */
@@ -156,5 +177,70 @@ describe('a consumer-protocol commit answered after its public call expired', ()
     expect(rejoin).not.toHaveBeenCalled()
     expect(member.crashes).toEqual([])
     expect(member.rejoins()).toHaveLength(rejoinsBefore)
+  })
+
+  test('an answer about a replaced membership token is not learned at all (control)', async () => {
+    const lose = jest.spyOn(member.ownership, 'lose')
+    const { error } = await member.answerAfterExpiry(69, { replaceToken: true })
+
+    await expectNothingPublished(error)
+    await pause(150)
+    expect(lose).not.toHaveBeenCalled()
+  })
+
+  test('a close callback whose commit expired learns nothing once the run is retired', async () => {
+    await member.dispose()
+    const commits = []
+    const listener = {
+      onPartitionsRevoked: async ({ partitions }) => {
+        if (partitions.length > 0)
+          commits.push(member.consumer.commitOffsets([COMMIT]).catch((e) => e))
+        await Promise.all(commits)
+      },
+    }
+    member = await ExpiredCommit.open({ run: { rebalanceListener: listener } })
+    const lose = jest.spyOn(member.ownership, 'lose')
+    const held = member.rig.cluster.schedule.hold({ api: 'OffsetCommit' })
+    const leave = member.rig.cluster.schedule.hold({ api: 'ConsumerGroupHeartbeat' })
+    const stopping = member.consumer.stop()
+    await held.arrived()
+    expect(await commits[0]).toBeInstanceOf(KafkaJSDeliveryTimeout)
+    member.runner.retire(consumerStoppingError())
+    held.release(answerWith(69))
+    await pause(200)
+    expect(lose).not.toHaveBeenCalled()
+    leave.release()
+    await stopping.catch(() => {})
+  })
+
+  describe('when the run was retired before the late answer arrives', () => {
+    const stopped = (m) => m.consumer.stop()
+    const retired = async (m) => m.runner.retire(consumerStoppingError())
+    const forceClosed = async (m) => {
+      const leave = m.rig.cluster.schedule.hold({ api: 'ConsumerGroupHeartbeat' })
+      await m.consumer.disconnect({ timeout: 100 })
+      expect(m.runner.retirement).not.toBeNull()
+      leave.release()
+    }
+
+    test.each([
+      ['a stop', stopped],
+      ['the run retirement a forced close makes', retired],
+      ['a forced disconnect, its transport gone (control)', forceClosed],
+    ])(
+      'after %s a late answer is learned from nothing and published nowhere',
+      async (_, retire) => {
+        const lose = jest.spyOn(member.ownership, 'lose')
+        const rejoin = jest.spyOn(member.runner.rebalanceCoordinator, 'requestRejoin')
+        const error = await member.answerAfterRetirement(69, retire)
+
+        expect(error).toBeInstanceOf(KafkaJSDeliveryTimeout)
+        await pause(200)
+        expect(lose).not.toHaveBeenCalled()
+        expect(rejoin).not.toHaveBeenCalled()
+        expect(member.crashes).toEqual([])
+        expect(member.commitEvents).toEqual([])
+      }
+    )
   })
 })
