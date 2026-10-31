@@ -62,15 +62,17 @@ class ExpiredCommit {
    * Writes one public commit, lets its own deadline expire, moves the member epoch on within the
    * same membership token, then answers the held request with `errorCode`.
    * @param {number} errorCode what the coordinator answers
-   * @param {{ replaceToken?: boolean }} [options] `replaceToken` begins a new membership first
+   * @param {{ replaceToken?: boolean, beforeAnswer?: () => Promise<void> }} [options]
+   *   `replaceToken` begins a new membership first; `beforeAnswer` runs once the call has expired
    * @returns {Promise<{ error: Error, token: number }>} the caller's outcome and the sending token
    */
-  async answerAfterExpiry(errorCode, { replaceToken = false } = {}) {
+  async answerAfterExpiry(errorCode, { replaceToken = false, beforeAnswer } = {}) {
     const held = this.rig.cluster.schedule.hold({ api: 'OffsetCommit' })
     const token = this.ownership.token()
     const committing = this.consumer.commitOffsets([COMMIT]).catch((error) => error)
     await held.arrived()
     const error = await committing
+    await beforeAnswer?.()
     const { groupMembership } = this.group
     groupMembership.memberEpoch += 1
     if (replaceToken) this.ownership.renew()
@@ -138,6 +140,32 @@ describe('a consumer-protocol commit answered after its public call expired', ()
     await expectNothingPublished(error)
     expect(member.manager.committedOffsets()[TOPIC][0]).toBe(cached)
     expect(member.ownership.permanent).toBeNull()
+    expect(member.crashes).toEqual([])
+  })
+
+  test('a heartbeat answer built before the fence cannot complete the rejoin it overlaps', async () => {
+    const { schedule } = member.rig.cluster
+    const { groupMembership } = member.group
+    const rejoinsBefore = member.rejoins().length
+    let stale
+    let staleCall
+    await member.answerAfterExpiry(69, {
+      beforeAnswer: async () => {
+        stale = schedule.hold({ api: 'ConsumerGroupHeartbeat' })
+        staleCall = await stale.arrived()
+      },
+    })
+
+    await until(() => groupMembership.state === 'JOINING', 'the member joining anew')
+    stale.release({
+      memberId: staleCall.fields.memberId,
+      memberEpoch: staleCall.fields.memberEpoch,
+      heartbeatIntervalMs: 100,
+      assignment: null,
+    })
+
+    await until(() => member.rejoins().length > rejoinsBefore, 'the member rejoining at epoch 0')
+    await until(() => groupMembership.state === 'STABLE', 'the member stable again')
     expect(member.crashes).toEqual([])
   })
 

@@ -1123,6 +1123,7 @@ module.exports = class ConsumerGroupProtocol {
       })
 
       if (this.ownershipReplaced(ownershipToken) || guard?.()) return
+      if (this.answersEarlierMembership(stateAtRequest)) return
       this.sentFields.remember(request)
       if (request.SubscribedTopicRegex !== undefined) {
         this.regexUpdated = false
@@ -1163,6 +1164,18 @@ module.exports = class ConsumerGroupProtocol {
         this.onRequestGenerated({ leaveEpoch, stateAtRequest })
       }
     }
+  }
+
+  /**
+   * Whether an answer belongs to a request built before the member began joining anew. Taken as the
+   * join's answer it would install the old epoch over the zero the join sends, settle the join with
+   * no epoch-0 heartbeat, and leave the member heartbeating an epoch the coordinator fenced.
+   * @private
+   * @param {string} stateAtRequest the state the request was built in
+   * @returns {boolean}
+   */
+  answersEarlierMembership(stateAtRequest) {
+    return this.state === JOINING && stateAtRequest !== JOINING
   }
 
   /**
