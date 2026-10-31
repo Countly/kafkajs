@@ -369,6 +369,8 @@ decompress to far more. The consumer's `maxDecompressedBatchBytes` (1 GiB by def
 batch after decompression, for every codec; see
 [Decompression bound](Consuming.md#decompression-bound).
 
+Consumer Fetch byte settings are response targets, not a guarantee that every returned batch fits them. Kafka may return a first batch larger than `maxBytes` and `maxBytesPerPartition` so the consumer can make progress. Decoder safety limits remain independently enforced. A broker's ongoing long poll can delay a moved partition by up to `maxWaitTimeInMs` plus one round trip; changing a numeric Fetch concurrency cap is not required.
+
 ## Metadata recovery
 
 `metadataRecoveryStrategy` and `metadataRecoveryRebootstrapTriggerMs`, available on the `Kafka`

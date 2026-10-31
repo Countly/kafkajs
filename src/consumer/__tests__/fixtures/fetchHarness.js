@@ -384,9 +384,10 @@ const decodeOffsetForLeaderEpochRequests = (writes) =>
  * `answer` receives each outgoing request's header and returns the response body to play back;
  * each response is framed with the header version that request's api key and version imply.
  * @param {(header: { apiKey: number, apiVersion: number }) => Buffer} answer
+ * @param {(frame: Buffer, header: object) => Buffer[]} [chunks] complete-frame transport chunks
  * @returns {{ broker: Broker, state: { writes: Buffer[] } }}
  */
-const createFakeBroker = (answer) => {
+const createFakeBroker = (answer, chunks) => {
   const { factory, state } = createFakeSocketFactory()
   const connection = new Connection({
     host: '127.0.0.1',
@@ -404,8 +405,17 @@ const createFakeBroker = (answer) => {
     while (answered < state.writes.length) {
       const header = readRequestHeader(state.writes[answered])
       answered += 1
+      const responseState = chunks
+        ? {
+            socket: {
+              emit: (_event, frame) => {
+                for (const chunk of chunks(frame, header)) state.socket.emit('data', chunk)
+              },
+            },
+          }
+        : state
       respondWithFrame(
-        state,
+        responseState,
         header.correlationId,
         responseHeaderVersion(header.apiKey, header.apiVersion),
         answer(header)

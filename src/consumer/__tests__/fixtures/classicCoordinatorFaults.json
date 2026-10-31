@@ -1,0 +1,1002 @@
+[
+  {
+    "api": "JoinGroup",
+    "fault": 16,
+    "step": "first-current-answer",
+    "expectedState": "refind-retry",
+    "expectedWire": {
+      "afterLossOffsetCommits": 0,
+      "duplicateAssignments": 0
+    },
+    "maxRounds": 4,
+    "config": {
+      "groupProtocol": "classic",
+      "retry": {
+        "retries": 6,
+        "initialRetryTime": 100,
+        "factor": 0
+      }
+    },
+    "replay": {
+      "log": "n/a",
+      "committed": "confirmed-only",
+      "handler": "after-last-confirmed-commit"
+    }
+  },
+  {
+    "api": "JoinGroup",
+    "fault": 15,
+    "step": "first-current-answer",
+    "expectedState": "refind-retry",
+    "expectedWire": {
+      "afterLossOffsetCommits": 0,
+      "duplicateAssignments": 0
+    },
+    "maxRounds": 4,
+    "config": {
+      "groupProtocol": "classic",
+      "retry": {
+        "retries": 6,
+        "initialRetryTime": 100,
+        "factor": 0
+      }
+    },
+    "replay": {
+      "log": "n/a",
+      "committed": "confirmed-only",
+      "handler": "after-last-confirmed-commit"
+    }
+  },
+  {
+    "api": "JoinGroup",
+    "fault": 14,
+    "step": "first-current-answer",
+    "expectedState": "retry-backoff",
+    "expectedWire": {
+      "afterLossOffsetCommits": 0,
+      "duplicateAssignments": 0
+    },
+    "maxRounds": 4,
+    "config": {
+      "groupProtocol": "classic",
+      "retry": {
+        "retries": 6,
+        "initialRetryTime": 100,
+        "factor": 0
+      }
+    },
+    "replay": {
+      "log": "n/a",
+      "committed": "confirmed-only",
+      "handler": "after-last-confirmed-commit"
+    }
+  },
+  {
+    "api": "JoinGroup",
+    "fault": 25,
+    "step": "first-current-answer",
+    "expectedState": "clear-member-rejoin",
+    "expectedWire": {
+      "afterLossOffsetCommits": 0,
+      "duplicateAssignments": 0
+    },
+    "maxRounds": 4,
+    "config": {
+      "groupProtocol": "classic",
+      "retry": {
+        "retries": 6,
+        "initialRetryTime": 100,
+        "factor": 0
+      }
+    },
+    "replay": {
+      "log": "n/a",
+      "committed": "confirmed-only",
+      "handler": "after-last-confirmed-commit"
+    }
+  },
+  {
+    "api": "JoinGroup",
+    "fault": 22,
+    "step": "first-current-answer",
+    "expectedState": "not-a-join-answer",
+    "expectedWire": {
+      "afterLossOffsetCommits": 0,
+      "duplicateAssignments": 0
+    },
+    "maxRounds": 4,
+    "config": {
+      "groupProtocol": "classic",
+      "retry": {
+        "retries": 6,
+        "initialRetryTime": 100,
+        "factor": 0
+      }
+    },
+    "replay": {
+      "log": "n/a",
+      "committed": "confirmed-only",
+      "handler": "after-last-confirmed-commit"
+    }
+  },
+  {
+    "api": "JoinGroup",
+    "fault": 27,
+    "step": "first-current-answer",
+    "expectedState": "retry-join",
+    "expectedWire": {
+      "afterLossOffsetCommits": 0,
+      "duplicateAssignments": 0
+    },
+    "maxRounds": 4,
+    "config": {
+      "groupProtocol": "classic",
+      "retry": {
+        "retries": 6,
+        "initialRetryTime": 100,
+        "factor": 0
+      }
+    },
+    "replay": {
+      "log": "n/a",
+      "committed": "confirmed-only",
+      "handler": "after-last-confirmed-commit"
+    }
+  },
+  {
+    "api": "JoinGroup",
+    "fault": "disconnect",
+    "step": "first-current-answer",
+    "expectedState": "retry-keep-member",
+    "expectedWire": {
+      "afterLossOffsetCommits": 0,
+      "duplicateAssignments": 0
+    },
+    "maxRounds": 4,
+    "config": {
+      "groupProtocol": "classic",
+      "retry": {
+        "retries": 6,
+        "initialRetryTime": 100,
+        "factor": 0
+      }
+    },
+    "replay": {
+      "log": "n/a",
+      "committed": "confirmed-only",
+      "handler": "after-last-confirmed-commit"
+    }
+  },
+  {
+    "api": "JoinGroup",
+    "fault": "timeout",
+    "step": "first-current-answer",
+    "expectedState": "generation-close-retry",
+    "expectedWire": {
+      "afterLossOffsetCommits": 0,
+      "duplicateAssignments": 0
+    },
+    "maxRounds": 4,
+    "config": {
+      "groupProtocol": "classic",
+      "retry": {
+        "retries": 6,
+        "initialRetryTime": 100,
+        "factor": 0
+      }
+    },
+    "replay": {
+      "log": "n/a",
+      "committed": "confirmed-only",
+      "handler": "after-last-confirmed-commit"
+    }
+  },
+  {
+    "api": "SyncGroup",
+    "fault": 16,
+    "step": "first-current-answer",
+    "expectedState": "refind-retry",
+    "expectedWire": {
+      "afterLossOffsetCommits": 0,
+      "duplicateAssignments": 0
+    },
+    "maxRounds": 4,
+    "config": {
+      "groupProtocol": "classic",
+      "retry": {
+        "retries": 6,
+        "initialRetryTime": 100,
+        "factor": 0
+      }
+    },
+    "replay": {
+      "log": "n/a",
+      "committed": "confirmed-only",
+      "handler": "after-last-confirmed-commit"
+    }
+  },
+  {
+    "api": "SyncGroup",
+    "fault": 15,
+    "step": "first-current-answer",
+    "expectedState": "refind-retry",
+    "expectedWire": {
+      "afterLossOffsetCommits": 0,
+      "duplicateAssignments": 0
+    },
+    "maxRounds": 4,
+    "config": {
+      "groupProtocol": "classic",
+      "retry": {
+        "retries": 6,
+        "initialRetryTime": 100,
+        "factor": 0
+      }
+    },
+    "replay": {
+      "log": "n/a",
+      "committed": "confirmed-only",
+      "handler": "after-last-confirmed-commit"
+    }
+  },
+  {
+    "api": "SyncGroup",
+    "fault": 14,
+    "step": "first-current-answer",
+    "expectedState": "retry-sync",
+    "expectedWire": {
+      "afterLossOffsetCommits": 0,
+      "duplicateAssignments": 0
+    },
+    "maxRounds": 4,
+    "config": {
+      "groupProtocol": "classic",
+      "retry": {
+        "retries": 6,
+        "initialRetryTime": 100,
+        "factor": 0
+      }
+    },
+    "replay": {
+      "log": "n/a",
+      "committed": "confirmed-only",
+      "handler": "after-last-confirmed-commit"
+    }
+  },
+  {
+    "api": "SyncGroup",
+    "fault": 25,
+    "step": "first-current-answer",
+    "expectedState": "lost-clear-member",
+    "expectedWire": {
+      "afterLossOffsetCommits": 0,
+      "duplicateAssignments": 0
+    },
+    "maxRounds": 4,
+    "config": {
+      "groupProtocol": "classic",
+      "retry": {
+        "retries": 6,
+        "initialRetryTime": 100,
+        "factor": 0
+      }
+    },
+    "replay": {
+      "log": "n/a",
+      "committed": "confirmed-only",
+      "handler": "after-last-confirmed-commit"
+    }
+  },
+  {
+    "api": "SyncGroup",
+    "fault": 22,
+    "step": "first-current-answer",
+    "expectedState": "lost-keep-member",
+    "expectedWire": {
+      "afterLossOffsetCommits": 0,
+      "duplicateAssignments": 0
+    },
+    "maxRounds": 4,
+    "config": {
+      "groupProtocol": "classic",
+      "retry": {
+        "retries": 6,
+        "initialRetryTime": 100,
+        "factor": 0
+      }
+    },
+    "replay": {
+      "log": "n/a",
+      "committed": "confirmed-only",
+      "handler": "after-last-confirmed-commit"
+    }
+  },
+  {
+    "api": "SyncGroup",
+    "fault": 27,
+    "step": "first-current-answer",
+    "expectedState": "rejoin-keep-generation",
+    "expectedWire": {
+      "afterLossOffsetCommits": 0,
+      "duplicateAssignments": 0
+    },
+    "maxRounds": 4,
+    "config": {
+      "groupProtocol": "classic",
+      "retry": {
+        "retries": 6,
+        "initialRetryTime": 100,
+        "factor": 0
+      }
+    },
+    "replay": {
+      "log": "n/a",
+      "committed": "confirmed-only",
+      "handler": "after-last-confirmed-commit"
+    }
+  },
+  {
+    "api": "SyncGroup",
+    "fault": "disconnect",
+    "step": "first-current-answer",
+    "expectedState": "retry-keep-member",
+    "expectedWire": {
+      "afterLossOffsetCommits": 0,
+      "duplicateAssignments": 0
+    },
+    "maxRounds": 4,
+    "config": {
+      "groupProtocol": "classic",
+      "retry": {
+        "retries": 6,
+        "initialRetryTime": 100,
+        "factor": 0
+      }
+    },
+    "replay": {
+      "log": "n/a",
+      "committed": "confirmed-only",
+      "handler": "after-last-confirmed-commit"
+    }
+  },
+  {
+    "api": "SyncGroup",
+    "fault": "timeout",
+    "step": "first-current-answer",
+    "expectedState": "generation-close-retry",
+    "expectedWire": {
+      "afterLossOffsetCommits": 0,
+      "duplicateAssignments": 0
+    },
+    "maxRounds": 4,
+    "config": {
+      "groupProtocol": "classic",
+      "retry": {
+        "retries": 6,
+        "initialRetryTime": 100,
+        "factor": 0
+      }
+    },
+    "replay": {
+      "log": "n/a",
+      "committed": "confirmed-only",
+      "handler": "after-last-confirmed-commit"
+    }
+  },
+  {
+    "api": "Heartbeat",
+    "fault": 16,
+    "step": "first-current-answer",
+    "expectedState": "refind-no-verdict",
+    "expectedWire": {
+      "afterLossOffsetCommits": 0,
+      "duplicateAssignments": 0
+    },
+    "maxRounds": 4,
+    "config": {
+      "groupProtocol": "classic",
+      "retry": {
+        "retries": 6,
+        "initialRetryTime": 100,
+        "factor": 0
+      }
+    },
+    "replay": {
+      "log": "n/a",
+      "committed": "confirmed-only",
+      "handler": "after-last-confirmed-commit"
+    }
+  },
+  {
+    "api": "Heartbeat",
+    "fault": 15,
+    "step": "first-current-answer",
+    "expectedState": "refind-no-verdict",
+    "expectedWire": {
+      "afterLossOffsetCommits": 0,
+      "duplicateAssignments": 0
+    },
+    "maxRounds": 4,
+    "config": {
+      "groupProtocol": "classic",
+      "retry": {
+        "retries": 6,
+        "initialRetryTime": 100,
+        "factor": 0
+      }
+    },
+    "replay": {
+      "log": "n/a",
+      "committed": "confirmed-only",
+      "handler": "after-last-confirmed-commit"
+    }
+  },
+  {
+    "api": "Heartbeat",
+    "fault": 14,
+    "step": "first-current-answer",
+    "expectedState": "next-tick",
+    "expectedWire": {
+      "afterLossOffsetCommits": 0,
+      "duplicateAssignments": 0
+    },
+    "maxRounds": 4,
+    "config": {
+      "groupProtocol": "classic",
+      "retry": {
+        "retries": 6,
+        "initialRetryTime": 100,
+        "factor": 0
+      }
+    },
+    "replay": {
+      "log": "n/a",
+      "committed": "confirmed-only",
+      "handler": "after-last-confirmed-commit"
+    }
+  },
+  {
+    "api": "Heartbeat",
+    "fault": 25,
+    "step": "first-current-answer",
+    "expectedState": "lost-clear-member",
+    "expectedWire": {
+      "afterLossOffsetCommits": 0,
+      "duplicateAssignments": 0
+    },
+    "maxRounds": 4,
+    "config": {
+      "groupProtocol": "classic",
+      "retry": {
+        "retries": 6,
+        "initialRetryTime": 100,
+        "factor": 0
+      }
+    },
+    "replay": {
+      "log": "n/a",
+      "committed": "confirmed-only",
+      "handler": "after-last-confirmed-commit"
+    }
+  },
+  {
+    "api": "Heartbeat",
+    "fault": 22,
+    "step": "first-current-answer",
+    "expectedState": "lost-keep-member",
+    "expectedWire": {
+      "afterLossOffsetCommits": 0,
+      "duplicateAssignments": 0
+    },
+    "maxRounds": 4,
+    "config": {
+      "groupProtocol": "classic",
+      "retry": {
+        "retries": 6,
+        "initialRetryTime": 100,
+        "factor": 0
+      }
+    },
+    "replay": {
+      "log": "n/a",
+      "committed": "confirmed-only",
+      "handler": "after-last-confirmed-commit"
+    }
+  },
+  {
+    "api": "Heartbeat",
+    "fault": 27,
+    "step": "first-current-answer",
+    "expectedState": "rejoin-only-stable",
+    "expectedWire": {
+      "afterLossOffsetCommits": 0,
+      "duplicateAssignments": 0
+    },
+    "maxRounds": 4,
+    "config": {
+      "groupProtocol": "classic",
+      "retry": {
+        "retries": 6,
+        "initialRetryTime": 100,
+        "factor": 0
+      }
+    },
+    "replay": {
+      "log": "n/a",
+      "committed": "confirmed-only",
+      "handler": "after-last-confirmed-commit"
+    }
+  },
+  {
+    "api": "Heartbeat",
+    "fault": "disconnect",
+    "step": "first-current-answer",
+    "expectedState": "next-tick",
+    "expectedWire": {
+      "afterLossOffsetCommits": 0,
+      "duplicateAssignments": 0
+    },
+    "maxRounds": 4,
+    "config": {
+      "groupProtocol": "classic",
+      "retry": {
+        "retries": 6,
+        "initialRetryTime": 100,
+        "factor": 0
+      }
+    },
+    "replay": {
+      "log": "n/a",
+      "committed": "confirmed-only",
+      "handler": "after-last-confirmed-commit"
+    }
+  },
+  {
+    "api": "Heartbeat",
+    "fault": "timeout",
+    "step": "first-current-answer",
+    "expectedState": "generation-close-retry",
+    "expectedWire": {
+      "afterLossOffsetCommits": 0,
+      "duplicateAssignments": 0
+    },
+    "maxRounds": 4,
+    "config": {
+      "groupProtocol": "classic",
+      "retry": {
+        "retries": 6,
+        "initialRetryTime": 100,
+        "factor": 0
+      }
+    },
+    "replay": {
+      "log": "n/a",
+      "committed": "confirmed-only",
+      "handler": "after-last-confirmed-commit"
+    }
+  },
+  {
+    "api": "OffsetCommit",
+    "fault": 16,
+    "step": "first-current-answer",
+    "expectedState": "refind-retry-commit",
+    "expectedWire": {
+      "afterLossOffsetCommits": 0,
+      "duplicateAssignments": 0
+    },
+    "maxRounds": 4,
+    "config": {
+      "groupProtocol": "classic",
+      "retry": {
+        "retries": 6,
+        "initialRetryTime": 100,
+        "factor": 0
+      }
+    },
+    "replay": {
+      "log": "n/a",
+      "committed": "confirmed-only",
+      "handler": "after-last-confirmed-commit"
+    }
+  },
+  {
+    "api": "OffsetCommit",
+    "fault": 15,
+    "step": "first-current-answer",
+    "expectedState": "refind-retry-commit",
+    "expectedWire": {
+      "afterLossOffsetCommits": 0,
+      "duplicateAssignments": 0
+    },
+    "maxRounds": 4,
+    "config": {
+      "groupProtocol": "classic",
+      "retry": {
+        "retries": 6,
+        "initialRetryTime": 100,
+        "factor": 0
+      }
+    },
+    "replay": {
+      "log": "n/a",
+      "committed": "confirmed-only",
+      "handler": "after-last-confirmed-commit"
+    }
+  },
+  {
+    "api": "OffsetCommit",
+    "fault": 14,
+    "step": "first-current-answer",
+    "expectedState": "retry-commit",
+    "expectedWire": {
+      "afterLossOffsetCommits": 0,
+      "duplicateAssignments": 0
+    },
+    "maxRounds": 4,
+    "config": {
+      "groupProtocol": "classic",
+      "retry": {
+        "retries": 6,
+        "initialRetryTime": 100,
+        "factor": 0
+      }
+    },
+    "replay": {
+      "log": "n/a",
+      "committed": "confirmed-only",
+      "handler": "after-last-confirmed-commit"
+    }
+  },
+  {
+    "api": "OffsetCommit",
+    "fault": 25,
+    "step": "first-current-answer",
+    "expectedState": "lost-no-commit-clear-member",
+    "expectedWire": {
+      "afterLossOffsetCommits": 0,
+      "duplicateAssignments": 0
+    },
+    "maxRounds": 4,
+    "config": {
+      "groupProtocol": "classic",
+      "retry": {
+        "retries": 6,
+        "initialRetryTime": 100,
+        "factor": 0
+      }
+    },
+    "replay": {
+      "log": "n/a",
+      "committed": "confirmed-only",
+      "handler": "after-last-confirmed-commit"
+    }
+  },
+  {
+    "api": "OffsetCommit",
+    "fault": 22,
+    "step": "first-current-answer",
+    "expectedState": "lost-no-commit-keep-member",
+    "expectedWire": {
+      "afterLossOffsetCommits": 0,
+      "duplicateAssignments": 0
+    },
+    "maxRounds": 4,
+    "config": {
+      "groupProtocol": "classic",
+      "retry": {
+        "retries": 6,
+        "initialRetryTime": 100,
+        "factor": 0
+      }
+    },
+    "replay": {
+      "log": "n/a",
+      "committed": "confirmed-only",
+      "handler": "after-last-confirmed-commit"
+    }
+  },
+  {
+    "api": "OffsetCommit",
+    "fault": 27,
+    "step": "first-current-answer",
+    "expectedState": "revoked-commit-rejoin",
+    "expectedWire": {
+      "afterLossOffsetCommits": 0,
+      "duplicateAssignments": 0
+    },
+    "maxRounds": 4,
+    "config": {
+      "groupProtocol": "classic",
+      "retry": {
+        "retries": 6,
+        "initialRetryTime": 100,
+        "factor": 0
+      }
+    },
+    "replay": {
+      "log": "n/a",
+      "committed": "confirmed-only",
+      "handler": "after-last-confirmed-commit"
+    }
+  },
+  {
+    "api": "OffsetCommit",
+    "fault": "disconnect",
+    "step": "first-current-answer",
+    "expectedState": "retry-commit",
+    "expectedWire": {
+      "afterLossOffsetCommits": 0,
+      "duplicateAssignments": 0
+    },
+    "maxRounds": 4,
+    "config": {
+      "groupProtocol": "classic",
+      "retry": {
+        "retries": 6,
+        "initialRetryTime": 100,
+        "factor": 0
+      }
+    },
+    "replay": {
+      "log": "n/a",
+      "committed": "confirmed-only",
+      "handler": "after-last-confirmed-commit"
+    }
+  },
+  {
+    "api": "OffsetCommit",
+    "fault": "timeout",
+    "step": "first-current-answer",
+    "expectedState": "generation-close-retry",
+    "expectedWire": {
+      "afterLossOffsetCommits": 0,
+      "duplicateAssignments": 0
+    },
+    "maxRounds": 4,
+    "config": {
+      "groupProtocol": "classic",
+      "retry": {
+        "retries": 6,
+        "initialRetryTime": 100,
+        "factor": 0
+      }
+    },
+    "replay": {
+      "log": "n/a",
+      "committed": "confirmed-only",
+      "handler": "after-last-confirmed-commit"
+    }
+  },
+  {
+    "api": "LeaveGroup",
+    "fault": 16,
+    "step": "first-current-answer",
+    "expectedState": "log-forget",
+    "expectedWire": {
+      "afterLossOffsetCommits": 0,
+      "duplicateAssignments": 0
+    },
+    "maxRounds": 0,
+    "config": {
+      "groupProtocol": "classic",
+      "retry": {
+        "retries": 6,
+        "initialRetryTime": 100,
+        "factor": 0
+      }
+    },
+    "replay": {
+      "log": "n/a",
+      "committed": "confirmed-only",
+      "handler": "after-last-confirmed-commit"
+    }
+  },
+  {
+    "api": "LeaveGroup",
+    "fault": 15,
+    "step": "first-current-answer",
+    "expectedState": "log-forget",
+    "expectedWire": {
+      "afterLossOffsetCommits": 0,
+      "duplicateAssignments": 0
+    },
+    "maxRounds": 0,
+    "config": {
+      "groupProtocol": "classic",
+      "retry": {
+        "retries": 6,
+        "initialRetryTime": 100,
+        "factor": 0
+      }
+    },
+    "replay": {
+      "log": "n/a",
+      "committed": "confirmed-only",
+      "handler": "after-last-confirmed-commit"
+    }
+  },
+  {
+    "api": "LeaveGroup",
+    "fault": 14,
+    "step": "first-current-answer",
+    "expectedState": "log-forget",
+    "expectedWire": {
+      "afterLossOffsetCommits": 0,
+      "duplicateAssignments": 0
+    },
+    "maxRounds": 0,
+    "config": {
+      "groupProtocol": "classic",
+      "retry": {
+        "retries": 6,
+        "initialRetryTime": 100,
+        "factor": 0
+      }
+    },
+    "replay": {
+      "log": "n/a",
+      "committed": "confirmed-only",
+      "handler": "after-last-confirmed-commit"
+    }
+  },
+  {
+    "api": "LeaveGroup",
+    "fault": 25,
+    "step": "first-current-answer",
+    "expectedState": "ignore-forget",
+    "expectedWire": {
+      "afterLossOffsetCommits": 0,
+      "duplicateAssignments": 0
+    },
+    "maxRounds": 0,
+    "config": {
+      "groupProtocol": "classic",
+      "retry": {
+        "retries": 6,
+        "initialRetryTime": 100,
+        "factor": 0
+      }
+    },
+    "replay": {
+      "log": "n/a",
+      "committed": "confirmed-only",
+      "handler": "after-last-confirmed-commit"
+    }
+  },
+  {
+    "api": "LeaveGroup",
+    "fault": 22,
+    "step": "first-current-answer",
+    "expectedState": "ignore-forget",
+    "expectedWire": {
+      "afterLossOffsetCommits": 0,
+      "duplicateAssignments": 0
+    },
+    "maxRounds": 0,
+    "config": {
+      "groupProtocol": "classic",
+      "retry": {
+        "retries": 6,
+        "initialRetryTime": 100,
+        "factor": 0
+      }
+    },
+    "replay": {
+      "log": "n/a",
+      "committed": "confirmed-only",
+      "handler": "after-last-confirmed-commit"
+    }
+  },
+  {
+    "api": "LeaveGroup",
+    "fault": 27,
+    "step": "first-current-answer",
+    "expectedState": "not-a-leave-answer",
+    "expectedWire": {
+      "afterLossOffsetCommits": 0,
+      "duplicateAssignments": 0
+    },
+    "maxRounds": 0,
+    "config": {
+      "groupProtocol": "classic",
+      "retry": {
+        "retries": 6,
+        "initialRetryTime": 100,
+        "factor": 0
+      }
+    },
+    "replay": {
+      "log": "n/a",
+      "committed": "confirmed-only",
+      "handler": "after-last-confirmed-commit"
+    }
+  },
+  {
+    "api": "LeaveGroup",
+    "fault": "disconnect",
+    "step": "first-current-answer",
+    "expectedState": "log-forget",
+    "expectedWire": {
+      "afterLossOffsetCommits": 0,
+      "duplicateAssignments": 0
+    },
+    "maxRounds": 0,
+    "config": {
+      "groupProtocol": "classic",
+      "retry": {
+        "retries": 6,
+        "initialRetryTime": 100,
+        "factor": 0
+      }
+    },
+    "replay": {
+      "log": "n/a",
+      "committed": "confirmed-only",
+      "handler": "after-last-confirmed-commit"
+    }
+  },
+  {
+    "api": "LeaveGroup",
+    "fault": "timeout",
+    "step": "first-current-answer",
+    "expectedState": "generation-close-retry",
+    "expectedWire": {
+      "afterLossOffsetCommits": 0,
+      "duplicateAssignments": 0
+    },
+    "maxRounds": 0,
+    "config": {
+      "groupProtocol": "classic",
+      "retry": {
+        "retries": 6,
+        "initialRetryTime": 100,
+        "factor": 0
+      }
+    },
+    "replay": {
+      "log": "n/a",
+      "committed": "confirmed-only",
+      "handler": "after-last-confirmed-commit"
+    }
+  },
+  {
+    "api": "Heartbeat",
+    "fault": 25,
+    "step": "old-generation-answer",
+    "expectedState": "unchanged",
+    "expectedWire": {
+      "afterLossOffsetCommits": 0,
+      "duplicateAssignments": 0,
+      "extraRejoins": 0
+    },
+    "maxRounds": 0,
+    "config": {
+      "groupProtocol": "classic"
+    },
+    "replay": {
+      "log": "n/a",
+      "committed": "confirmed-only",
+      "handler": "none"
+    }
+  },
+  {
+    "api": "OffsetCommit",
+    "fault": 25,
+    "step": "old-generation-answer",
+    "expectedState": "unchanged",
+    "expectedWire": {
+      "afterLossOffsetCommits": 0,
+      "duplicateAssignments": 0,
+      "extraRejoins": 0
+    },
+    "maxRounds": 0,
+    "config": {
+      "groupProtocol": "classic"
+    },
+    "replay": {
+      "log": "n/a",
+      "committed": "confirmed-only",
+      "handler": "none"
+    }
+  }
+]

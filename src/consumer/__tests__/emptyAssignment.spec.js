@@ -1,6 +1,7 @@
 const { MemberMetadata, MemberAssignment } = require('../assignerProtocol')
 
 const createConsumer = require('../index')
+const { applySyncAnswer } = require('./fixtures/emptySyncApply')
 
 const {
   secureRandom,
@@ -127,4 +128,13 @@ describe('Consumer > valid empty Java assignments', () => {
       expect(MemberAssignment.decode(Buffer.alloc(0))).toBeNull()
     }
   )
+
+  test('a valid empty assignment from the wire is applied by the real group without a halt', async () => {
+    const seen = await applySyncAnswer(vector.expectedAssignmentBytesHex['m-1'])
+    expect(seen.crashes).toEqual([])
+    expect(seen.assigned).toEqual([[]])
+    expect(seen.joins[0].memberAssignment).toEqual({})
+    expect(seen.fetchesAfter).toBe(0)
+    expect(seen.heartbeats).toBeGreaterThan(0)
+  })
 })

@@ -247,7 +247,7 @@ describe('consumer regression fixtures', () => {
     afterEach(async () => {
       if (h) await h.broker.disconnect()
     })
-    it.failing('fetches a healthy sibling without a routing-induced rejoin', () => {
+    it('fetches a healthy sibling without a routing-induced rejoin', () => {
       expect(observed).toEqual({ partitions: [1], fetches: 1, rejoins: 0 })
     })
   })
@@ -372,7 +372,7 @@ describe('offline preferred read replica', () => {
   afterEach(async () => {
     if (h) await h.broker.disconnect()
   })
-  it.failing('uses the leader when the preferred replica is offline', () => {
+  it('uses the leader when the preferred replica is offline', () => {
     expect(observed).toEqual({ 0: [0] })
   })
 })

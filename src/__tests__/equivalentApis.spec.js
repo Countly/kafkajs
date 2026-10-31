@@ -7,7 +7,11 @@ const {
   groupScript,
   producerScript,
 } = require('../../testHelpers/scriptedCluster')
-const { prepareRecordBatches, TOPIC } = require('../consumer/__tests__/fixtures/fetchHarness')
+const {
+  prepareRecordBatches,
+  TOPIC,
+  TOPIC_ID,
+} = require('../consumer/__tests__/fixtures/fetchHarness')
 const RecordBatch = require('../protocol/recordBatch/v0')
 const Record = require('../protocol/recordBatch/record/v0')
 const Decoder = require('../protocol/decoder')
@@ -934,4 +938,91 @@ it('R2§3:OnOffsetsFetched', async () => {
     partitions: [0, 1].map((partition) => ({ partition, errorCode: 0, records: false })),
   })
   await stop
+})
+it('R2§3:MaxConcurrentFetches', async () => {
+  const threeNodes = [0, 1, 2].map((id) => ({ id, host: `node${id}`, port: 9092 + id }))
+  const cluster = groupScript(createScriptedCluster({ nodes: threeNodes }), {
+    partitions: 3,
+    batches: 0,
+    committed: { 0: '0', 1: '0', 2: '0' },
+  })
+  cluster.answer('Metadata', () => ({
+    brokers: threeNodes.map(({ id, host, port }) => ({ nodeId: id, host, port, rack: null })),
+    controllerId: 0,
+    topics: [
+      {
+        errorCode: 0,
+        name: TOPIC,
+        topicId: TOPIC_ID,
+        isInternal: false,
+        topicAuthorizedOperations: -2147483648,
+        partitions: [0, 1, 2].map((partitionIndex) => ({
+          errorCode: 0,
+          partitionIndex,
+          leaderId: partitionIndex,
+          leaderEpoch: 5,
+          replicas: [partitionIndex],
+          isr: [partitionIndex],
+          offlineReplicas: [],
+        })),
+      },
+    ],
+  }))
+  const fetchGates = threeNodes.map(({ id }) => hold(cluster, { api: 'Fetch', node: id }))
+  for (const [node, gate] of fetchGates.entries()) {
+    releases.push(() => {
+      if (gate.settle)
+        gate.release({ partitions: [{ partition: node, errorCode: 0, records: false }] })
+    })
+  }
+  const handler = {}
+  handler.promise = new Promise((resolve) => {
+    handler.release = resolve
+  })
+  releases.push(() => handler.release())
+  let handled = 0
+  const consumer = makeConsumer(cluster)
+  await start(consumer, async () => {
+    handled += 1
+    await handler.promise
+  })
+  await Promise.all(fetchGates.map((gate) => gate.arrived()))
+
+  /** @returns {{count: number[], peak: number[], peakTotal: number}} the Fetches written per node, and the most in flight at once */
+  const load = () => {
+    const open = [0, 0, 0]
+    const peak = [0, 0, 0]
+    let total = 0
+    let peakTotal = 0
+    for (const { api, kind, node } of cluster.timeline()) {
+      if (api !== 'Fetch') continue
+      const delta = kind === 'request' ? 1 : -1
+      open[node] += delta
+      total += delta
+      peak[node] = Math.max(peak[node], open[node])
+      peakTotal = Math.max(peakTotal, total)
+    }
+    const fetches = cluster.requests().filter(({ api }) => api === 'Fetch')
+    return {
+      count: threeNodes.map(({ id }) => fetches.filter(({ node }) => node === id).length),
+      peak,
+      peakTotal,
+    }
+  }
+
+  await tick()
+  expect(load()).toEqual({ count: [1, 1, 1], peak: [1, 1, 1], peakTotal: 3 })
+
+  fetchGates[1].release({ partitions: [{ partition: 1, errorCode: 0, records: true }] })
+  await until(() => handled === 1)
+  for (let turn = 0; turn < 20; turn++) await tick()
+  await new Promise((resolve) => setTimeout(resolve, 100))
+  expect(load().count).toEqual([1, 1, 1])
+
+  handler.release()
+  await until(() => load().count[1] === 2)
+  expect(load()).toMatchObject({ count: [1, 2, 1], peak: [1, 1, 1] })
+  expect(load().peakTotal).toBeLessThanOrEqual(3)
+  const [, second] = cluster.requests().filter(({ api, node }) => api === 'Fetch' && node === 1)
+  expect(second.fields.topics[0].partitions[0]).toMatchObject({ partition: 1, fetchOffset: '1' })
 })

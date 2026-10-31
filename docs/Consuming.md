@@ -589,6 +589,8 @@ Every consumer logs one INFO line when you create it, naming the rebalance proto
 
 Going straight to deploy 2 splits the group: members still running the old code and members running the new one share no assigner name, and the coordinator rejects the join with `INCONSISTENT_GROUP_PROTOCOL` until the rollout finishes. During deploy 2 the group is briefly mixed — some members computing eagerly, some cooperatively — which is safe, because an eager member's JoinGroup advertises no owned partitions at all — it gives everything up before it rejoins — and the cooperative algorithm never hands a partition to a member that still owns it.
 
+Classic assignment runs on the group leader. For very large assignments, `groupProtocol: 'consumer'` moves assignment to the broker. The retained large sticky-assignment workload and its measured limits are reported with the performance evidence; an unmeasured optimization is not a sizing guarantee.
+
 ## <a name="group-protocols"></a> Consumer group protocols
 
 A consumer group can run on either of two membership protocols. You choose with `groupProtocol`, and the default is unchanged.
@@ -814,3 +816,9 @@ The meaning of "rack" is very flexible, and can be used to model setups such as 
 See also [this blog post](https://www.confluent.io/blog/multi-region-data-replication/) for the bigger context.
 
 Rack-aware assignment and follower fetching are separate features. Range's opt-in flag changes which member owns a partition. Follower fetching uses the broker's preferred-read-replica hint and the member's `rackId`; an eligible partition has a leader outside that rack and an online in-rack follower. A partition whose leader is already local need not fetch from a follower. Assignment alignment alone does not prove the next Fetch went to a follower.
+
+A preferred follower is used only while its preference is valid and the replica is not listed in `offlineReplicas`. If that preferred replica is offline, the consumer falls back to the leader. Listing only the leader as offline does not exclude an online preferred follower. A partition with no leader waits for metadata while healthy partitions continue; it does not trigger a group rejoin solely because its leader is missing.
+
+After a leader move, an idle fetcher starts the moved partition in the next round. A fetcher already waiting for a Fetch response starts it when that request completes: at most `maxWaitTimeInMs` plus one round trip. An in-flight Fetch is not cancelled.
+
+The consumer has one fetcher per broker and at most one Fetch in flight per broker. A fetcher waits for its batches to drain before fetching again. There is no separate lower numeric concurrency cap; use `maxBytes` and handler processing to control retained response work.

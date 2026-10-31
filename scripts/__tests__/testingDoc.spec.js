@@ -437,6 +437,38 @@ describe('documented live scenario scripts', () => {
       budgetsMs: [90000],
       wording: ['quiet window'],
     },
+    {
+      script: 'test:e2e:group-faults',
+      flag: 'GROUP_FAULTS_E2E',
+      spec: 'src/consumer/__tests__/groupFaultsLive.spec.js',
+      compose: null,
+      budgetsMs: [300000],
+      wording: [
+        'duplicate static instance',
+        'short and long coordinator outages',
+        'reviewed guarded live entry',
+      ],
+    },
+    {
+      script: 'test:e2e:fetch-semantics',
+      flag: 'FETCH_SEMANTICS_E2E',
+      spec: 'src/consumer/__tests__/fetchSemanticsLive.spec.js',
+      compose: null,
+      budgetsMs: [120000, 90000],
+      wording: [
+        'open and aborted transactions',
+        'oversized first record',
+        'reviewed guarded live entry',
+      ],
+    },
+    {
+      script: 'test:e2e:fetch-routing',
+      flag: 'FETCH_ROUTING_E2E',
+      spec: 'src/consumer/__tests__/fetchRoutingLive.spec.js',
+      compose: null,
+      budgetsMs: [120000],
+      wording: ['sibling has no leader', 'idle and busy bounds', 'eligible follower'],
+    },
   ]
 
   it.each(scenarios)('$script is one two-worker spec run through test:kafka', (row) => {

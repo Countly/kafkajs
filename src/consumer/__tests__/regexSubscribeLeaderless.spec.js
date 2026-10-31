@@ -100,18 +100,18 @@ describe('Consumer > a partition with no leader elsewhere in the cluster', () =>
 })
 
 describe('Consumer > the fetch grouping, for a partition whose cached leader is negative', () => {
-  // As for any stale-metadata error raised before the request: the whole round is skipped and
-  // the next one is built on the refreshed metadata.
-  test('a fetch round sends no request, refreshes the metadata instead and resolves with no batch', async () => {
+  test('a fetch round sends the healthy partition and refreshes the metadata for the unavailable one', async () => {
     const { group, cluster, findBrokerCalls, setResponse } = await createFetchGroup({
       partitions: [0, 1],
       partitionLeaders: { 0: NODE_ID, 1: -1 },
     })
     setResponse(fetchResponse([{ partition: 0, errorCode: 0 }]))
 
-    await expect(group.fetch(NODE_ID)).resolves.toEqual([])
+    const batches = await group.fetch(NODE_ID)
+
+    expect(batches.map(({ partition }) => partition)).toEqual([0])
     expect(cluster.refreshMetadata).toHaveBeenCalledTimes(1)
-    expect(findBrokerCalls).toEqual([])
+    expect(findBrokerCalls).toEqual([{ nodeId: NODE_ID, fence: group.idleWait.fence }])
   })
 
   test.each([-1, -2])(
@@ -123,9 +123,7 @@ describe('Consumer > the fetch grouping, for a partition whose cached leader is 
         preferredReadReplica: 2,
       })
 
-      expect(() => group.findReadReplicaForPartitions(TOPIC, [0])).toThrow(
-        expect.objectContaining({ type: 'LEADER_NOT_AVAILABLE', code: 5, retriable: true })
-      )
+      expect(group.findReadReplicaForPartitions(TOPIC, [0])).toEqual({})
     }
   )
 

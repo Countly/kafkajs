@@ -967,6 +967,8 @@ With autoCommitInterval or autoCommitThreshold set, batch-end commits occur only
 Call consumer.disconnect({timeout:3000}) to bound this run's cleanup. Timeout is an integer from 0 to 2147483647 milliseconds; zero starts no final commit or leave, while omission retains natural waiting. The first concurrent disconnect controls timeout and leaveGroup. An invalid timeout rejects with KafkaJSInvalidConfigurationError before stopping; operational cleanup of a valid call resolves after fencing the captured run. Application callback promises can remain pending, but their expired run or hook identity cannot change a replacement. process.on('SIGTERM',consumer.disconnect) remains valid.
 
 retry.maxTotalTime adds a public-entry deadline only to consumer commitOffsets, committed, position and describeGroup. Unset keeps their prior behavior. A timeout does not prove an already-transmitted commit absent: read broker offsets before deciding what to replay. Automatic close commits can reach an eligible valid prefix below a corrupt/decode halt and cannot derive progress across the unreadable batch. A no-offset reset halt adds no derived progress. Recreation reset debt is settled only by a confirmed concrete commit for the current incarnation.
+- **Leader elections:** Nothing to do. A consumer that logged repeated `LEADER_NOT_AVAILABLE` rejoins during a leader election will no longer rejoin.
+- **Follower fetching:** No option change; rack-aware follower fetching avoids a replica known offline.
 
 
 ### Admin

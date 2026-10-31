@@ -16,6 +16,7 @@ import org.apache.kafka.clients.consumer.ConsumerGroupMetadata;
 import org.apache.kafka.clients.consumer.ConsumerPartitionAssignor;
 import org.apache.kafka.clients.consumer.CooperativeStickyAssignor;
 import org.apache.kafka.clients.consumer.RangeAssignor;
+import org.apache.kafka.clients.consumer.RoundRobinAssignor;
 import org.apache.kafka.clients.consumer.StickyAssignor;
 import org.apache.kafka.clients.consumer.internals.ConsumerProtocol;
 import org.apache.kafka.common.Cluster;
@@ -58,6 +59,7 @@ public final class GenerateAssignorVectors {
   private static final int DEFAULT_GENERATION = -1;
 
   private static final String RANGE = "range";
+  private static final String ROUND_ROBIN = "roundrobin";
   private static final String STICKY = "sticky";
   private static final String COOPERATIVE = "cooperative-sticky";
 
@@ -163,6 +165,8 @@ public final class GenerateAssignorVectors {
     switch (name) {
       case RANGE:
         return new RangeAssignor();
+      case ROUND_ROBIN:
+        return new RoundRobinAssignor();
       case STICKY:
         return new StickyAssignor();
       case COOPERATIVE:
@@ -202,6 +206,7 @@ public final class GenerateAssignorVectors {
   private static String run(CaseSpec spec, Cluster cluster) {
     List<Node> nodes = new ArrayList<>(cluster.nodes());
     nodes.sort(java.util.Comparator.comparingInt(Node::id));
+    short assignmentVersion = spec.assignor.equals(ROUND_ROBIN) ? (short) 0 : ASSIGNMENT_VERSION;
     Map<String, ConsumerPartitionAssignor.Subscription> subscriptions = new LinkedHashMap<>();
     Map<String, String> subscriptionBytes = new LinkedHashMap<>();
     Map<String, String> userDataBytes = new LinkedHashMap<>();
@@ -243,7 +248,7 @@ public final class GenerateAssignorVectors {
     json.append("  \"assignor\": ").append(quote(spec.assignor)).append(",\n");
     json.append("  \"caseId\": ").append(quote(spec.caseId)).append(",\n");
     json.append("  \"subscriptionVersion\": ").append(spec.subscriptionVersion).append(",\n");
-    json.append("  \"assignmentVersion\": ").append(ASSIGNMENT_VERSION).append(",\n");
+    json.append("  \"assignmentVersion\": ").append(assignmentVersion).append(",\n");
     json.append("  \"nodes\": [\n");
     for (int i = 0; i < nodes.size(); i++) {
       Node node = nodes.get(i);
@@ -336,7 +341,7 @@ public final class GenerateAssignorVectors {
               quote(
                   hex(
                       ConsumerProtocol.serializeAssignment(
-                          assignment.groupAssignment().get(memberId), ASSIGNMENT_VERSION))))
+                          assignment.groupAssignment().get(memberId), assignmentVersion))))
           .append(i + 1 < memberIds.size() ? ",\n" : "\n");
     }
     json.append("  }");
@@ -626,6 +631,17 @@ public final class GenerateAssignorVectors {
         List.of(fresh("m-1", a), fresh("m-2", a), fresh("m-3", a), fresh("m-4", a));
     cases.add(vector("more_consumers_than_partitions", RANGE, scarce, fourFresh));
     cases.add(vector("more_consumers_than_partitions", STICKY, scarce, fourFresh));
+    List<MemberSpec> roundRobinFresh = fourFresh.stream()
+        .map(member -> new MemberSpec(member.memberId, member.groupInstanceId, member.topics,
+            member.ownedPartitions, member.generationId, member.rackId, ByteBuffer.allocate(0)))
+        .toList();
+    cases.add(new CaseSpec("more_consumers_than_partitions", ROUND_ROBIN, scarce,
+        roundRobinFresh, (short) 0, null));
+    List<MemberSpec> fourCooperative = new ArrayList<>();
+    for (String memberId : List.of("m-1", "m-2", "m-3", "m-4")) {
+      fourCooperative.add(cooperativeMember(memberId, a, Collections.emptyList(), DEFAULT_GENERATION));
+    }
+    cases.add(vector("more_consumers_than_partitions", COOPERATIVE, scarce, fourCooperative));
 
     // Range divides each topic separately; sticky divides the pooled partitions.
     Map<String, Integer> twoTopics = topology("t-a", 4, "t-b", 7);

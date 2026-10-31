@@ -64,9 +64,6 @@ const dictionary = require('../utils/dictionary')
 /** @see https://github.com/apache/kafka/blob/4.3/clients/src/main/java/org/apache/kafka/common/protocol/Errors.java */
 const STALE_MEMBER_EPOCH = 'STALE_MEMBER_EPOCH'
 
-/** @see https://github.com/apache/kafka/blob/4.3/clients/src/main/java/org/apache/kafka/common/protocol/Errors.java */
-const LEADER_NOT_AVAILABLE = 5
-
 /** How often the pre-release commit re-checks whether the heartbeats have installed a new epoch. */
 const STALE_EPOCH_POLL_INTERVAL = 100
 
@@ -400,6 +397,15 @@ module.exports = class ConsumerGroup {
      * @type {number}
      */
     this.preparationEpoch = 0
+    /**
+     * The pending metadata refresh for partitions without a leader, shared by every node's fetcher
+     * of the current run, and when the last one started (`performance.now()`).
+     * @type {{ promise: Promise<void> }|null}
+     */
+    this.leaderlessRefresh = null
+    this.leaderlessRefreshAt = -Infinity
+    this.leaderlessRefreshInterval =
+      retry?.initialRetryTime ?? createRetry.defaults.initialRetryTime
     this.subscriptionState = new SubscriptionState({
       onAssignmentChange: () => this.preparationChanged(),
     })
@@ -650,6 +656,7 @@ module.exports = class ConsumerGroup {
     this.rebalanceHooks?.retire({ run: this.idleWait }, consumerStoppingError())
     this.roundContext?.retire(consumerStoppingError())
     this.leaderUnionWatch?.clear()
+    this.retireLeaderlessRefresh()
     this.idleWait.dispose()
     this.idleWait = this.createRun()
     this.subscriptionState.clearPauses()
@@ -667,6 +674,7 @@ module.exports = class ConsumerGroup {
     this.rebalanceHooks?.retire({ run: this.idleWait }, consumerStoppingError())
     this.roundContext?.retire(consumerStoppingError())
     this.leaderUnionWatch?.clear()
+    this.retireLeaderlessRefresh()
     this.idleWait.dispose()
     this.subscriptionState.clearPauses()
     for (const [key, offset] of this.seekOffset) {
@@ -2008,6 +2016,7 @@ module.exports = class ConsumerGroup {
       const requests = this.buildFetchRequests(prepared.parts)
 
       if (!requests.length) {
+        if (prepared.leaderless) await this.refreshLeaderlessMetadata(run)
         // Registers only while the snapshot is current: an invalidated one returns through the
         // fetcher's yield floor and a fresh snapshot is captured next round.
         await run.wait(
@@ -2119,6 +2128,9 @@ module.exports = class ConsumerGroup {
       if (needsRefresh) {
         await this.refreshCluster({ fence: run.fence })
         run.fence.check()
+      } else if (prepared.leaderless) {
+        await this.refreshLeaderlessMetadata(run)
+        run.fence.check()
       }
 
       for (const batch of batches) {
@@ -2213,9 +2225,16 @@ module.exports = class ConsumerGroup {
    * @returns {FetchPreparation} the snapshot with its stamps
    */
   captureFetchPreparation(nodeId, run, ownershipToken) {
-    const routing = { expiresAt: Infinity }
+    const routing = { expiresAt: Infinity, leaderless: false }
     const parts = this.filterPartitionsByNode(nodeId, this.subscriptionState.assigned(), routing)
-    return new FetchPreparation(this, run, parts, routing.expiresAt, ownershipToken)
+    return new FetchPreparation(
+      this,
+      run,
+      parts,
+      routing.expiresAt,
+      ownershipToken,
+      routing.leaderless
+    )
   }
 
   /**
@@ -3632,18 +3651,23 @@ module.exports = class ConsumerGroup {
   /**
    * For each of the partitions find the best nodeId to read it from. A partition whose leader is
    * negative (`-1`) has none and is read from nowhere, its preferred read replica included, as the
-   * Java consumer reads it from nowhere and asks for new metadata: this throws the retriable
-   * `LEADER_NOT_AVAILABLE`, which `recoverFromFetch` answers with a metadata refresh, so the fetch
-   * round it is part of sends nothing.
+   * Java consumer reads it from nowhere and asks for new metadata. It is left out of the result,
+   * never raised as an error, so the node's other partitions are still fetched; the caller learns
+   * of it through `routing.leaderless` and refreshes the metadata. A partition with no metadata
+   * row is left out too, and a row whose leader is `null` or `undefined` is invalid.
+   *
+   * A preferred read replica is used while its lease has not expired and the replica itself is not
+   * in the partition's `offlineReplicas`; otherwise the leader is. Only the preferred replica's
+   * state matters: a leader listed as offline does not exclude an online preferred follower.
    *
    * @param {string} topic
    * @param {number[]} partitions
-   * @param {{expiresAt: number}} [routing] an optional observation: `expiresAt` is lowered to the
-   *   earliest preferred-replica expiry that decided a placement here. The no-preference path does
-   *   no extra work for it.
+   * @param {{expiresAt?: number, leaderless?: boolean}} [routing] an optional observation:
+   *   `expiresAt` is lowered to the earliest preferred-replica expiry that decided a placement
+   *   here, and `leaderless` is set when a partition had no leader. The no-preference path does no
+   *   extra work for it.
    * @returns {{[nodeId: number]: number[]}} per-node assignment of partitions
-   * @throws {import('../errors').KafkaJSProtocolError} `LEADER_NOT_AVAILABLE`, for a partition
-   *   whose leader is negative
+   * @throws {import('../errors').KafkaJSError} for a metadata row whose leader is absent
    * @see Cluster~findLeaderForPartitions
    * @see https://github.com/apache/kafka/blob/4.3/clients/src/main/java/org/apache/kafka/clients/consumer/internals/AbstractFetch.java
    */
@@ -3663,7 +3687,8 @@ module.exports = class ConsumerGroup {
       }
 
       if (metadata.leader < 0) {
-        throw createErrorFromCode(LEADER_NOT_AVAILABLE)
+        if (routing) routing.leaderless = true
+        return result
       }
 
       // Pick the preferred replica if there is one, and it isn't known to be offline, otherwise the leader.
@@ -3686,7 +3711,7 @@ module.exports = class ConsumerGroup {
           // Valid entry, check whether it is not offline
           // Note that we don't delete the preference here, and rather hope that eventually that replica comes online again
           const offlineReplicas = metadata.offlineReplicas
-          if (Array.isArray(offlineReplicas) && offlineReplicas.includes(nodeId)) {
+          if (Array.isArray(offlineReplicas) && offlineReplicas.includes(preferredReadReplica)) {
             this.logger.debug('Preferred read replica is offline, using leader', {
               topic,
               partitionId,
@@ -3709,7 +3734,7 @@ module.exports = class ConsumerGroup {
   /**
    * @param {number} nodeId the broker a fetch round asks
    * @param {import("../../types").TopicPartitions[]} topicPartitions the assignment
-   * @param {{expiresAt: number}} [routing] see `findReadReplicaForPartitions`
+   * @param {{expiresAt?: number, leaderless?: boolean}} [routing] see `findReadReplicaForPartitions`
    * @returns {import("../../types").TopicPartitions[]} the partitions routed to that node
    */
   filterPartitionsByNode(nodeId, topicPartitions, routing) {
@@ -3717,6 +3742,58 @@ module.exports = class ConsumerGroup {
       topic,
       partitions: this.findReadReplicaForPartitions(topic, partitions, routing)[nodeId] || [],
     }))
+  }
+
+  /**
+   * Retires the pending refresh for unavailable leaders with its run, so a replacement run starts
+   * with none pending and no spacing owed. The old refresh settles on its own fence: it publishes
+   * nothing and cannot clear a replacement's entry.
+   * @private
+   * @returns {void}
+   */
+  retireLeaderlessRefresh() {
+    this.leaderlessRefresh = null
+    this.leaderlessRefreshAt = -Infinity
+  }
+
+  /**
+   * Refreshes the metadata because a partition has no leader, once for all the nodes' fetchers of
+   * a run. Callers share the pending refresh, and a new one starts at most once per initial retry
+   * interval, measured start to start; a due caller waits for its own refresh, an early one
+   * returns at once. There is no retry timer: the next round that finds a leader missing and the
+   * interval elapsed asks again.
+   *
+   * The refresh is bound to the run's fence, so a stop or restart settles every caller and the
+   * refresh publishes nothing afterwards. A failure is logged at debug level and never becomes a
+   * membership verdict or discards the round's healthy batches.
+   * @private
+   * @param {IdleWait} run the run that owns the calling round, captured before any await
+   * @returns {Promise<void>} resolves when the refresh settled, was not due, or the run stopped
+   */
+  async refreshLeaderlessMetadata(run) {
+    if (run.fence.closed) return
+    let attempt = this.leaderlessRefresh
+    if (!attempt) {
+      const now = performance.now()
+      if (now - this.leaderlessRefreshAt < this.leaderlessRefreshInterval) return
+      this.leaderlessRefreshAt = now
+      attempt = { promise: null }
+      attempt.promise = this.refreshCluster({ fence: run.fence })
+        .catch((error) => {
+          if (!run.fence.closed) {
+            this.logger.debug('Metadata refresh for unavailable leaders failed', {
+              groupId: this.groupId,
+              memberId: this.memberId,
+              error: describeThrown(error),
+            })
+          }
+        })
+        .finally(() => {
+          if (this.leaderlessRefresh === attempt) this.leaderlessRefresh = null
+        })
+      this.leaderlessRefresh = attempt
+    }
+    await run.fence.wait(attempt.promise).catch(() => {})
   }
 
   getActiveTopicPartitions() {

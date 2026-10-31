@@ -5,7 +5,7 @@
   {"api":"produce","version":11,"direction":"response","route":"capture.js CAPTURE_LIST","evidenceKind":"capture","disposition":"captured","reason":"a row of the capture list"},
   {"api":"produce","version":13,"direction":"response","route":"capture.js CAPTURE_LIST","evidenceKind":"capture","disposition":"captured","reason":"a row of the capture list"},
   {"api":"fetch","version":18,"direction":"request","route":"capture.js CAPTURE_LIST","evidenceKind":"capture","disposition":"captured","reason":"a row of the capture list","decodeSide":"walk, and the reader fetchV18.js"},
-  {"api":"fetch","version":18,"direction":"response","route":"capture.js CAPTURE_LIST","evidenceKind":"capture","disposition":"captured","reason":"a row of the capture list"},
+  {"api":"fetch","version":18,"direction":"response","route":"capture.js CAPTURE_LIST","evidenceKind":"capture","disposition":"captured","reason":"a row of the capture list","decodeSide":"the full decoded response, whole and in 200 seeded splits, through the real connection and broker in src/consumer/__tests__/fetchChunking.spec.js"},
   {"api":"findCoordinator","version":6,"direction":"request","route":"capture.js CAPTURE_LIST","evidenceKind":"capture","disposition":"captured","reason":"a row of the capture list","decodeSide":"walk, and the reader findCoordinatorV6.js"},
   {"api":"findCoordinator","version":6,"direction":"response","route":"capture.js CAPTURE_LIST","evidenceKind":"capture","disposition":"captured","reason":"a row of the capture list"},
   {"api":"offsetCommit","version":8,"direction":"request","route":"capture.js CAPTURE_LIST","evidenceKind":"capture","disposition":"captured","reason":"a row of the capture list","decodeSide":"walk"},

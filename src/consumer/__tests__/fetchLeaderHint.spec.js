@@ -400,3 +400,162 @@ describe('Consumer > v11 behaviour is unchanged at v18', () => {
     expect(batch.messages.map(({ offset }) => offset)).toEqual(['101'])
   })
 })
+
+describe('Consumer > a moved leader reaches its new node within the idle and busy bounds', () => {
+  const MAX_WAIT = 400
+  const ERROR_AT = 100
+  const POLL_DONE_AT = 350
+  const ROUND = 10
+  const HINT = { leaderId: 1, leaderEpoch: 9 }
+  const ENDPOINTS = [{ nodeId: 1, host: 'kafka1', port: 9093, rack: null }]
+
+  /** @returns {Promise<void>} lets continuations and real immediates run, with no virtual time */
+  const drain = async () => {
+    for (let round = 0; round < 8; round++) {
+      await new Promise(setImmediate)
+      await jest.advanceTimersByTimeAsync(0)
+    }
+  }
+
+  /** @returns {{promise: Promise<void>, release: () => void}} a request held open from outside */
+  const hold = () => {
+    const held = {}
+    held.promise = new Promise((resolve) => {
+      held.release = resolve
+    })
+    return held
+  }
+
+  /**
+   * Moves partition 0 from node 0 to node 1 under a running fetch manager and records, in virtual
+   * time, when node 0 answered with the error, when node 1's outstanding long poll completed, and
+   * when node 1 first asked for the moved partition. Node 0's Fetch and, when busy, node 1's long
+   * poll are held until the case releases them; every other Fetch is answered at once.
+   * @param {{hinted: boolean, busy: boolean}} arm whether the old leader names the new one, and
+   *   whether node 1 is in a long poll for another partition when the leader moves
+   * @returns {Promise<object>} the timeline and the counts the arm asserts
+   */
+  const moveLeader = async ({ hinted, busy }) => {
+    const h = await createFetchGroup({
+      partitions: busy ? [0, 1] : [0],
+      partitionLeaders: busy ? { 0: 0, 1: 1 } : { 0: 0 },
+      knownNodes: [0, 1],
+      applyLeaderHintMovesLeaderTo: 1,
+    })
+    jest.useFakeTimers({ doNotFake: ['setImmediate', 'nextTick'] })
+    h.group.maxWaitTime = MAX_WAIT
+    if (!hinted)
+      h.cluster.refreshMetadata.mockImplementation(async () => h.installRouting({ 0: 1 }))
+
+    const real = h.broker.fetch.bind(h.broker)
+    const frames = []
+    const holds = new Map([['0|0', hold()], ...(busy ? [['1|1', hold()]] : [])])
+    const errorBody = fetchResponse(
+      [
+        {
+          partition: 0,
+          errorCode: 6,
+          ...(hinted && { currentLeader: HINT }),
+        },
+      ],
+      { ...(hinted && { nodeEndpoints: ENDPOINTS }) }
+    )
+    h.cluster.findBroker = async ({ nodeId }) =>
+      Object.assign(Object.create(h.broker), {
+        fetch: async (request) => {
+          const partitions = request.topics.flatMap((t) => t.partitions.map((p) => p.partition))
+          const key = `${nodeId}|${partitions.join()}`
+          const frame = { nodeId, partitions, held: holds.has(key) }
+          frames.push(frame)
+          if (frame.held) await holds.get(key).promise
+          frame.at = Date.now()
+          h.setResponse(
+            key === '0|0'
+              ? errorBody
+              : fetchResponse(partitions.map((partition) => ({ partition, errorCode: 0 })))
+          )
+          const answer = await real(request)
+          frame.doneAt = Date.now()
+          return answer
+        },
+      })
+
+    const manager = createFetchManager({
+      logger: newLogger(),
+      getNodeIds: () => [0, 1],
+      fetch: (nodeId) => h.group.fetch(nodeId),
+      handler: async () => {},
+    })
+    const started = manager.start()
+    try {
+      await drain()
+      await jest.advanceTimersByTimeAsync(ERROR_AT)
+      holds.get('0|0').release()
+      await drain()
+      if (busy) {
+        await jest.advanceTimersByTimeAsync(POLL_DONE_AT - ERROR_AT)
+        holds.get('1|1').release()
+        await drain()
+      }
+      return {
+        errorAt: frames.find(({ held, nodeId }) => held && nodeId === 0).doneAt,
+        pollDoneAt: busy ? frames.find(({ held, nodeId }) => held && nodeId === 1).doneAt : null,
+        moved: frames.find(
+          ({ nodeId, partitions }) =>
+            nodeId === 1 &&
+            partitions.includes(0) &&
+            !(partitions.length === 1 && partitions[0] === 1)
+        ),
+        hints: h.cluster.applyLeaderHint.mock.calls.length,
+        refreshes: h.cluster.refreshMetadata.mock.calls.length,
+        rejoins: h.requestRejoin.mock.calls.length,
+        fetchers: manager.getFetchers().length,
+        frames,
+      }
+    } finally {
+      h.group.onStopRequested()
+      await drain()
+      await jest.advanceTimersByTimeAsync(MAX_WAIT + ROUND)
+      await manager.stop()
+      await started.catch(() => {})
+      holds.forEach(({ release }) => release())
+      jest.clearAllTimers()
+      jest.useRealTimers()
+      await h.broker.disconnect()
+    }
+  }
+
+  it.each([
+    ['hinted', true],
+    ['unhinted', false],
+  ])('%s: an idle new node asks for the partition in its next round', async (_name, hinted) => {
+    const timeline = await moveLeader({ hinted, busy: false })
+
+    expect(timeline.moved).toBeDefined()
+    expect(timeline.moved.at - timeline.errorAt).toBeLessThanOrEqual(ROUND)
+    expect(timeline.hints).toBe(hinted ? 1 : 0)
+    expect(timeline.refreshes).toBe(hinted ? 0 : 1)
+    expect(timeline.rejoins).toBe(0)
+    expect(timeline.fetchers).toBe(2)
+  })
+
+  it.each([
+    ['hinted', true],
+    ['unhinted', false],
+  ])(
+    '%s: a busy new node asks when its long poll completes, never cancelling it',
+    async (_name, hinted) => {
+      const timeline = await moveLeader({ hinted, busy: true })
+
+      expect(timeline.moved).toBeDefined()
+      expect(timeline.moved.at).toBeGreaterThanOrEqual(timeline.pollDoneAt)
+      expect(timeline.moved.at - timeline.pollDoneAt).toBeLessThanOrEqual(ROUND)
+      expect(timeline.moved.at - timeline.errorAt).toBeLessThanOrEqual(MAX_WAIT + ROUND)
+      expect(timeline.frames.filter(({ nodeId, held }) => nodeId === 1 && held)).toHaveLength(1)
+      expect(timeline.hints).toBe(hinted ? 1 : 0)
+      expect(timeline.refreshes).toBe(hinted ? 0 : 1)
+      expect(timeline.rejoins).toBe(0)
+      expect(timeline.fetchers).toBe(2)
+    }
+  )
+})

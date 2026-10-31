@@ -2,8 +2,9 @@
   "kafkaTag": "4.3.1",
   "javaClientsJar": "4.3.1",
   "javaClientsJarSha256": "52501b7b47510c66f898871adaf6d2968ab7246561d44ced43643a8a587f0b36",
+  "javaRuntime": "OpenJDK 21.0.13+9",
   "generators": {
-    "scripts/protocol/javaVectors/GenerateAssignorVectors.java": "b1acdb2e889cd38daa306333e7b3d646cde8cf0570fa9007edbd3ee18b56e34c",
+    "scripts/protocol/javaVectors/GenerateAssignorVectors.java": "6d3661c7643c21968b25577c8b33c71d2f3d499041c347116a97cbf29dbfae63",
     "scripts/protocol/javaVectors/GenerateMessageVectors.java": "bfec9c30648558e70653287f4467d2c785a10b3bbf1528fbf569d318c3adc544"
   },
   "messageSha256": {
@@ -21,6 +22,7 @@
     }
   },
   "vectors": {
+    "src/consumer/assigners/fixtures/cooperative-sticky/more_consumers_than_partitions_java.json": "6e38085f846cc837214eb47c127399287f747659f70c095583b0da60f61ed3f3",
     "src/consumer/assigners/fixtures/range/empty_range_java.json": "0773a7cd3a96ba7ffd57662836cecb0a42bc777688dd80b2bbbe033cd91c953a",
     "src/consumer/assigners/fixtures/range/rack_all_replicas_java_rack.json": "fdd4fdab9ebde8bd6179ac004918ef1cf829c8ed69a406e62efff225c3636bba",
     "src/consumer/assigners/fixtures/range/rack_balance_java_rack.json": "ef1470444fef69c6a89a765acbccc9a2bc6168c8a7947e1e87593b8644914546",
@@ -30,6 +32,7 @@
     "src/consumer/assigners/fixtures/range/rack_nonintersecting_java_rack.json": "fa92b95153f1a74a565e687704ad52e60ba446eb450ad45a0fff8f64ec08e1e0",
     "src/consumer/assigners/fixtures/range/subscription_v0_java.json": "e7df2b2d83c7a0e03ae65962e18f0636b67f802027947e2e0014b9f85f8180a2",
     "src/consumer/assigners/fixtures/range/subscription_v2_java.json": "ed46adba50ab35e03b673446c1cafc77df120e531c2fc5e52e3cb0d521535f13",
+    "src/consumer/assigners/fixtures/roundrobin/more_consumers_than_partitions_java.json": "4bdf7252dbffac720dd1012ce3ab59bcc4d160d43e0490fba917d444671d0935",
     "src/protocol/requests/fetch/fixtures/java/fetchRequest-v12-sessionClose.json": "b2d063c2fa45c86cea7b0c866d89650b388aaffc9b848b7042b25cfc5d407306",
     "src/protocol/requests/fetch/fixtures/java/fetchRequest-v12-sessionForgotten.json": "ed3df3315ff076615f3e2916791276364873d9f37d68aafe3f118f2d8d02f82e",
     "src/protocol/requests/fetch/fixtures/java/fetchRequest-v12-sessionFull.json": "6adfde672d4974b7c473b02eca7d4102491b634e2e13e3cfbf7120cf3f7c6ef5",
@@ -93,5 +96,11 @@
     "src/protocol/requests/fetch/fixtures/java/fetchResponse-v18-sessionError71.json": "d97ae45449f171eeaa4d52ea91a6d0025593d408acc8278a102f5e53e7976e10",
     "src/protocol/requests/fetch/fixtures/java/fetchResponse-v18-sessionFull.json": "d6cfd8d9457011da0e5f815e2441f903401fa016f1848d89dac467b16042d4b0",
     "src/protocol/requests/fetch/fixtures/java/fetchResponse-v18-sessionSparse.json": "cfead8b21ec8fc633f284e7dae897e4dbb83af74542ddb6635ff923aaf308e75"
-  }
+  },
+  "titles": [
+    "roundrobin scarce partitions reproduce independent subscription and assignment bytes",
+    "cooperative-sticky scarce partitions reproduce independent subscription and assignment bytes",
+    "a valid empty assignment applies without a corruption error",
+    "subscription versions zero and two decode the independent fields and re-encode the original bytes"
+  ]
 }

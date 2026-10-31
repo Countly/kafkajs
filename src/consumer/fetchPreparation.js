@@ -28,13 +28,16 @@ class FetchPreparation {
    * @param {import('../../types').TopicPartitions[]} parts the node-filtered assignment
    * @param {number} expiresAt earliest effective preferred-replica expiry in `parts`, or Infinity
    * @param {number} ownershipToken the membership identity the fetch captured before any await
+   * @param {boolean} [leaderless=false] whether an assigned partition had no leader when `parts`
+   *   was filtered
    */
-  constructor(group, run, parts, expiresAt, ownershipToken) {
+  constructor(group, run, parts, expiresAt, ownershipToken, leaderless = false) {
     this.group = group
     this.run = run
     this.parts = parts
     this.expiresAt = expiresAt
     this.ownershipToken = ownershipToken
+    this.leaderless = leaderless
     this.routingVersion = group.routingVersion
     this.preparationEpoch = group.preparationEpoch
     this.manager = group.offsetManager

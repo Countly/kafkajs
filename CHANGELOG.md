@@ -54,6 +54,10 @@ Versions before 3.0.0 are internal alpha tags and are not published.
 - With an automatic commit interval or threshold set, batch-end automatic commits now follow either eligible condition at processing/check opportunities. With neither set, per-batch behavior remains. Classic stop, disconnect and unsubscribe add a final automatic commit attempt when automatic commits are enabled and group identity, ownership, eligible progress, halt bounds and remaining close time allow it. Fewer commits can increase crash redelivery after the last broker-confirmed offset.
 - `consumer.connect()` and `consumer.run()` called while an earlier `disconnect()` of the same consumer is still closing now wait for that close to finish, so the close can never disconnect the connection that replaces it (a forced `timeout` bounds the wait; `disconnect()` then `connect()` always ran in that order). A call made from a handler or rebalance callback of the run being closed does not wait. A `disconnect()` asked after the waiting call makes it reject `CONSUMER_STOPPING`.
 
+- **A leaderless partition no longer stalls the consumer**: one partition with no leader used to make every fetch round of every broker fail and request a rejoin, so no partition was fetched until a leader appeared; now only that partition waits.
+
+- Preferred-replica routing now tests the preferred replica ID against offlineReplicas and falls back to the leader when that replica is offline.
+
 #### Fixes
 
 - Fence unknown-target metadata responses before cache installation and keep periodic naming attempts after the fast discovery budget.
@@ -112,6 +116,10 @@ Versions before 3.0.0 are internal alpha tags and are not published.
 - `test:e2e:rack-aware` checks range rack alignment against an independent Java vector, the node of the next Fetch after a preferred-read-replica answer, and no-op rack controls from the socket's own frames.
 
 - Add isolated regex discovery and retirement checks and a subscription-evaluation benchmark with exact work controls.
+
+- Add independent classic coordinator fault, group-size, Fetch chunking and Java assignment-vector scenarios, with dedicated group-fault and Fetch-semantics test commands.
+
+- Add routing, partial trailing-batch and per-broker Fetch concurrency regressions, with a dedicated Fetch-routing test command.
 
 ### Phase 9B — Producer parity: delivery deadline, memory bound, request size, partitioner, codecs, lifecycle
 

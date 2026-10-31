@@ -1,13 +1,13 @@
 const fs = require('fs')
 const path = require('path')
 const { newLogger } = require('testHelpers')
-const { range, sticky, cooperativeSticky } = require('..')
+const { range, roundRobin, sticky, cooperativeSticky } = require('..')
 const { MemberAssignment } = require('../../assignerProtocol')
 const { stickyUserData } = require('../stickyAssigner/stickyUserData')
 const Decoder = require('../../../protocol/decoder')
 
 const FIXTURES = path.join(__dirname, '..', 'fixtures')
-const ASSIGNERS = { range, sticky, 'cooperative-sticky': cooperativeSticky }
+const ASSIGNERS = { range, roundrobin: roundRobin, sticky, 'cooperative-sticky': cooperativeSticky }
 
 /**
  * Reads every committed golden vector.
@@ -266,6 +266,7 @@ const { MemberMetadata } = require('../../assignerProtocol')
 const Encoder = require('../../../protocol/encoder')
 const fetchPair = require('../../../../testHelpers/wire/fetchV18')
 const { decodeFetchRequest, fetchResponse } = require('../../__tests__/fixtures/fetchHarness')
+const { applySyncAnswer } = require('../../__tests__/fixtures/emptySyncApply')
 const REQUEST_CASES = ['sessionFull', 'sessionIncremental', 'sessionForgotten', 'sessionClose']
 const RESPONSE_CASES = [
   'sessionFull',
@@ -331,9 +332,14 @@ describe('Consumer > independent session and assignment evidence', () => {
       RACK_CASES.map((name) => `src/consumer/assigners/fixtures/range/rack_${name}_java_rack.json`),
       ['subscription_v0', 'subscription_v2', 'empty_range'].map(
         (name) => `src/consumer/assigners/fixtures/range/${name}_java.json`
+      ),
+      Object.keys(SCARCE).map(
+        (assignor) =>
+          `src/consumer/assigners/fixtures/${assignor}/more_consumers_than_partitions_java.json`
       )
     )
     expect(Object.keys(manifest.vectors).sort()).toEqual(expected.sort())
+    expect(manifest.titles).toEqual(EVIDENCE_TITLES)
     for (const [file, sha] of Object.entries(manifest.vectors)) expect(digest(file)).toBe(sha)
     for (const [file, sha] of Object.entries(manifest.generators)) expect(digest(file)).toBe(sha)
     for (const [name, sha] of Object.entries(manifest.messageSha256))
@@ -615,4 +621,218 @@ describe('Consumer > independent session and assignment evidence', () => {
       }
     }
   )
+})
+
+/**
+ * What each scarce-partition assignor of the independent corpus must answer, written from the
+ * Java generator's inputs and the version each case pins.
+ * @type {Record<string, {name: string, version: number, userData: Buffer, factory: Function}>}
+ */
+const SCARCE = {
+  roundrobin: {
+    name: 'RoundRobinAssigner',
+    version: 0,
+    userData: Buffer.alloc(0),
+    factory: roundRobin,
+  },
+  'cooperative-sticky': {
+    name: 'cooperative-sticky',
+    version: 3,
+    userData: Buffer.from('ffffffff', 'hex'),
+    factory: cooperativeSticky,
+  },
+}
+
+/** @param {string} assignor wire key of the scarce case @returns {string} its test title */
+const scarceTitle = (assignor) =>
+  `${assignor} scarce partitions reproduce independent subscription and assignment bytes`
+const VERSIONS_TITLE =
+  'subscription versions zero and two decode the independent fields and re-encode the original bytes'
+const EMPTY_TITLE = 'a valid empty assignment applies without a corruption error'
+/** The titles the evidence manifest records, in its order. */
+const EVIDENCE_TITLES = [
+  scarceTitle('roundrobin'),
+  scarceTitle('cooperative-sticky'),
+  EMPTY_TITLE,
+  VERSIONS_TITLE,
+]
+
+/** Which of the four members holds what, from the Java run: two partitions, four members. */
+const SCARCE_ASSIGNMENT = { 'm-1': { 't-a': [0] }, 'm-2': { 't-a': [1] }, 'm-3': {}, 'm-4': {} }
+
+/**
+ * @param {string} assignor wire key of the scarce case
+ * @returns {object} the committed Java vector of the case
+ */
+const scarceVector = (assignor) =>
+  JSON.parse(
+    fs.readFileSync(
+      path.join(FIXTURES, assignor, 'more_consumers_than_partitions_java.json'),
+      'utf8'
+    )
+  )
+
+/**
+ * Runs this client's assignor over a scarce vector's own subscriptions.
+ * @param {string} assignor wire key of the scarce case
+ * @returns {Promise<{[memberId: string]: Buffer}>} the assignment bytes by member, only for the
+ *   members the assignor returned
+ */
+const nativeScarce = async (assignor) => {
+  const vector = scarceVector(assignor)
+  const cluster = {
+    findTopicPartitionMetadata: (topic) =>
+      vector.topics[topic].map(({ partition, leader }) => ({ partitionId: partition, leader })),
+  }
+  const result = await SCARCE[assignor]
+    .factory({ cluster, groupId: 'golden', logger: newLogger() })
+    .assign({
+      members: vector.members.map(({ memberId, subscriptionBytesHex }) => ({
+        memberId,
+        groupInstanceId: null,
+        memberMetadata: Buffer.from(subscriptionBytesHex, 'hex'),
+      })),
+      topics: ['t-a'],
+    })
+  return Object.fromEntries(
+    result.map(({ memberId, memberAssignment }) => [memberId, memberAssignment])
+  )
+}
+
+describe.each(Object.keys(SCARCE))('Consumer > scarce partitions, %s', (assignor) => {
+  const { name, version, userData } = SCARCE[assignor]
+
+  test(scarceTitle(assignor), async () => {
+    const vector = scarceVector(assignor)
+    expect(vector.assignor).toBe(assignor)
+    expect(vector.members.map(({ memberId }) => memberId)).toEqual(['m-1', 'm-2', 'm-3', 'm-4'])
+    expect(vector.topics['t-a']).toHaveLength(2)
+
+    const subscription = {
+      version,
+      topics: ['t-a'],
+      userData,
+      ...(version >= 1 && { ownedPartitions: [] }),
+      ...(version >= 2 && { generationId: -1 }),
+      ...(version >= 3 && { rackId: null }),
+    }
+    for (const member of vector.members) {
+      const bytes = Buffer.from(member.subscriptionBytesHex, 'hex')
+      expect(MemberMetadata.decode(bytes)).toEqual(subscription)
+      expect(MemberMetadata.encode(subscription)).toEqual(bytes)
+      const own = SCARCE[assignor].factory({ cluster: {}, groupId: 'golden', logger: newLogger() })
+      expect(own.name).toBe(name)
+      expect(
+        own
+          .protocol({ topics: ['t-a'], ownedPartitions: [], generationId: -1, rackId: null })
+          .metadata.toString('hex')
+      ).toBe(member.subscriptionBytesHex)
+
+      const assignment = SCARCE_ASSIGNMENT[member.memberId]
+      expect(vector.expected[member.memberId]).toEqual(assignment)
+      const encoded = Buffer.from(vector.expectedAssignmentBytesHex[member.memberId], 'hex')
+      expect(vector.assignmentVersion).toBe(version)
+      expect(MemberAssignment.decode(encoded)).toEqual({ version, assignment, userData: null })
+      expect(MemberAssignment.encode({ version, assignment, userData: null })).toEqual(encoded)
+    }
+
+    const native = await nativeScarce(assignor)
+    const held = Object.entries(native).flatMap(([memberId, bytes]) =>
+      Object.entries(MemberAssignment.decode(bytes).assignment).flatMap(([topic, partitions]) =>
+        partitions.map((partition) => [memberId, `${topic}:${partition}`])
+      )
+    )
+    expect(held.map(([, partition]) => partition).sort()).toEqual(['t-a:0', 't-a:1'])
+    for (const [memberId, partition] of held) {
+      const wanted = SCARCE_ASSIGNMENT[memberId]['t-a'][0]
+      expect(partition).toBe(`t-a:${wanted}`)
+    }
+  })
+
+  test(`${assignor} keeps its assignment envelope observation separate from the Java bytes`, async () => {
+    const native = await nativeScarce(assignor)
+    const decoded = Object.fromEntries(
+      Object.entries(native).map(([memberId, bytes]) => [memberId, MemberAssignment.decode(bytes)])
+    )
+    const members = Object.keys(decoded)
+    expect(members).toEqual(
+      assignor === 'roundrobin' ? ['m-1', 'm-2'] : ['m-1', 'm-2', 'm-3', 'm-4']
+    )
+    for (const entry of Object.values(decoded)) {
+      expect(entry.version).toBe(version)
+      expect(entry.userData).toEqual(Buffer.alloc(0))
+    }
+  })
+
+  // The round-robin assignor leaves a member dealt nothing out of its answer; the Java one lists it.
+  const omitsEmptyMembers = assignor === 'roundrobin' ? it.failing : it
+  omitsEmptyMembers(`${assignor} native assignment answers an entry for every member`, async () => {
+    expect(Object.keys(await nativeScarce(assignor))).toEqual(['m-1', 'm-2', 'm-3', 'm-4'])
+  })
+
+  it.failing(`${assignor} native assignment bytes equal the Java bytes`, async () => {
+    const vector = scarceVector(assignor)
+    const native = await nativeScarce(assignor)
+    for (const [memberId, bytes] of Object.entries(native)) {
+      expect(bytes.toString('hex')).toBe(vector.expectedAssignmentBytesHex[memberId])
+    }
+  })
+})
+
+describe('Consumer > classic subscription versions and the valid empty assignment', () => {
+  const LITERAL = {
+    subscription_v0: { version: 0, topics: ['t-a'], userData: null },
+    subscription_v2: {
+      version: 2,
+      topics: ['t-a'],
+      userData: null,
+      ownedPartitions: [],
+      generationId: -1,
+    },
+  }
+  const ASSIGNMENT = { 'm-1': { 't-a': [0, 1] }, 'm-2': { 't-a': [2, 3] } }
+
+  test(VERSIONS_TITLE, () => {
+    for (const [name, fields] of Object.entries(LITERAL)) {
+      const vector = JSON.parse(
+        fs.readFileSync(path.join(FIXTURES, 'range', `${name}_java.json`), 'utf8')
+      )
+      expect(vector.subscriptionVersion).toBe(fields.version)
+      expect(vector.members.map(({ memberId }) => memberId)).toEqual(['m-1', 'm-2'])
+      for (const member of vector.members) {
+        const bytes = Buffer.from(member.subscriptionBytesHex, 'hex')
+        expect(MemberMetadata.decode(bytes)).toEqual(fields)
+        expect(MemberMetadata.encode(fields)).toEqual(bytes)
+        expect(vector.expected[member.memberId]).toEqual(ASSIGNMENT[member.memberId])
+        const assignment = Buffer.from(vector.expectedAssignmentBytesHex[member.memberId], 'hex')
+        const decoded = { version: 3, assignment: ASSIGNMENT[member.memberId], userData: null }
+        expect(MemberAssignment.decode(assignment)).toEqual(decoded)
+        expect(MemberAssignment.encode(decoded)).toEqual(assignment)
+      }
+    }
+  })
+
+  test(EMPTY_TITLE, async () => {
+    const vector = JSON.parse(
+      fs.readFileSync(path.join(FIXTURES, 'range', 'empty_range_java.json'), 'utf8')
+    )
+    for (const memberId of ['m-1', 'm-2']) {
+      const wire = vector.expectedAssignmentBytesHex[memberId]
+      expect(wire).toBe('000300000000ffffffff')
+      expect(MemberAssignment.decode(Buffer.from(wire, 'hex'))).toEqual({
+        version: 3,
+        assignment: {},
+        userData: null,
+      })
+      expect(MemberAssignment.decode(Buffer.alloc(0))).toBeNull()
+
+      const seen = await applySyncAnswer(wire)
+      expect(seen.crashes).toEqual([])
+      expect(seen.assigned).toEqual([[]])
+      expect(seen.joins[0].memberAssignment).toEqual({})
+      expect(seen.fetchesWhileHeld).toBe(0)
+      expect(seen.fetchesAfter).toBe(0)
+      expect(seen.heartbeats).toBeGreaterThan(0)
+    }
+  })
 })
