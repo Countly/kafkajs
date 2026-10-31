@@ -313,6 +313,8 @@ class FakeKafka {
     this.cluster = cluster
     this.socketFactory = socketFactory
     this.built = []
+    /** @type {Array<{ kind: string, options: object }>} the options every client was built with */
+    this.options = []
   }
 
   #build(client) {
@@ -324,11 +326,13 @@ class FakeKafka {
     return this.#build(new FakeAdmin(this.cluster, this.socketFactory))
   }
 
-  producer() {
+  producer(options = {}) {
+    this.options.push({ kind: 'producer', options })
     return this.#build(new FakeProducer(this.cluster, this.socketFactory))
   }
 
   consumer(options) {
+    this.options.push({ kind: 'consumer', options })
     return this.#build(new FakeConsumer(this.cluster, this.socketFactory, options))
   }
 }

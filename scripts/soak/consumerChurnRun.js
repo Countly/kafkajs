@@ -12,6 +12,7 @@ const {
   ChurnGroups,
   ConsumerChurnOracle,
   OfferScheduler,
+  acknowledgedViolations,
   interningControl,
   judgeQuietHeap,
   quietViolations,
@@ -558,12 +559,8 @@ class ConsumerChurnRun {
     if (plan.acceptance && (!interning || !interning.ok))
       violations.push('the interning sensitivity control did not see its own growth')
     if (this.unhandled > 0) violations.push(`unhandled rejections: ${this.unhandled}`)
-    for (const [phase, stat] of this.stats) {
-      if (plan.acceptance && (stat.acked ?? 0) < (settings.rate * stat.measuredMs) / 1000)
-        violations.push(
-          `${phase}: ${stat.acked ?? 0} acknowledged records, fewer than ${settings.rate}/s`
-        )
-    }
+    if (plan.acceptance)
+      violations.push(...acknowledgedViolations(this.stats, plan.phases, settings.rate))
     return {
       ok: violations.length === 0,
       acceptance: plan.acceptance,
@@ -707,7 +704,13 @@ class ChurnWorkloads {
   /** Opens the shared producer and admin, runs `body`, and closes them again before returning. */
   async #session(body) {
     this.admin = this.#track(this.kafka.admin())
-    this.producer = this.#track(this.kafka.producer({ idempotent: true, maxInFlightRequests: 5 }))
+    this.producer = this.#track(
+      this.kafka.producer({
+        idempotent: true,
+        maxInFlightRequests: 5,
+        allowAutoTopicCreation: false,
+      })
+    )
     try {
       await this.admin.connect()
       await this.producer.connect()
@@ -736,8 +739,14 @@ class ChurnWorkloads {
     return topic
   }
 
+  /**
+   * Creates a topic with the partitions and replication the workload relies on.
+   * @param {object} topic the claimed topic
+   * @throws {Error} when the topic already exists: a client's metadata request created it first,
+   *   with the broker's defaults, and the run would go on over fewer partitions than it offers to
+   */
   async #create(topic) {
-    await this.admin.createTopics({
+    const created = await this.admin.createTopics({
       topics: [
         {
           topic: topic.name,
@@ -748,6 +757,8 @@ class ChurnWorkloads {
       ],
       waitForLeaders: true,
     })
+    if (created === false)
+      throw new Error(`Topic ${topic.name} already existed when it was created`)
   }
 
   async #topic(name, partitions, context) {
@@ -828,6 +839,7 @@ class ChurnWorkloads {
         ...(options.instance ? { groupInstanceId: options.instance } : {}),
         metadataMaxAge: options.metadataMaxAge ?? 300000,
         maxWaitTimeInMs: 500,
+        allowAutoTopicCreation: false,
       })
     )
     return new ChurnMember({
@@ -866,6 +878,7 @@ class ChurnWorkloads {
         groupId: `${this.tag}-reader-${++this.nonce}`,
         metadataMaxAge: 300000,
         maxWaitTimeInMs: 500,
+        allowAutoTopicCreation: false,
       })
     )
     try {

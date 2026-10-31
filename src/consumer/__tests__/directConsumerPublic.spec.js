@@ -537,3 +537,38 @@ describe('A manual consumer over a scripted broker', () => {
     })
   })
 })
+
+describe('A consumer that was disconnected over a scripted broker', () => {
+  const CYCLES = 12
+  const PROCESS_EVENTS = ['unhandledRejection', 'uncaughtException', 'exit', 'SIGINT', 'SIGTERM']
+
+  test('leaves only the inert error listener on its sockets and nothing on the process', async () => {
+    const { cluster } = await scripted({ last: -1 })
+    const sockets = []
+    const kafka = new Kafka(
+      cluster.kafkaOptions({
+        socketFactory: (options) => {
+          const socket = cluster.socketFactory(options)
+          sockets.push(socket)
+          return socket
+        },
+      })
+    )
+    const processBefore = PROCESS_EVENTS.map((event) => process.listenerCount(event))
+    const lifecycle = async (cycle) => {
+      const consumer = kafka.consumer({ groupId: `closed-${cycle}`, maxWaitTimeInMs: 20 })
+      await consumer.connect()
+      await consumer.assign([{ topic: TOPIC, partitions: [0] }])
+      await consumer.run({ eachMessage: async () => {} })
+      await until(() => frames(cluster, 'Fetch').length > cycle, 'a fetch')
+      await consumer.disconnect()
+    }
+    for (let cycle = 0; cycle < CYCLES; cycle++) await lifecycle(cycle)
+    await until(() => sockets.every(({ destroyed }) => destroyed), 'every socket destroyed')
+    await new Promise((resolve) => setImmediate(resolve))
+
+    expect(sockets.length).toBeGreaterThanOrEqual(CYCLES)
+    expect(sockets.map((socket) => socket.eventNames())).toEqual(sockets.map(() => ['error']))
+    expect(PROCESS_EVENTS.map((event) => process.listenerCount(event))).toEqual(processBefore)
+  })
+})

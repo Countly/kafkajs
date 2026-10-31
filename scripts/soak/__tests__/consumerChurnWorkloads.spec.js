@@ -167,6 +167,33 @@ describe('Consumer churn profile > the real workloads, journal and oracle togeth
     expect(kafka.cluster.topics.size).toBeGreaterThan(0)
   }, 120000)
 
+  test('no client creates a topic of its own, so a recreated topic keeps its partitions', async () => {
+    const { run, kafka } = compose({ warmupMs: 0, phaseSeconds: 5 })
+    await run.run()
+    const kinds = new Set(kafka.options.map(({ kind }) => kind))
+    expect([...kinds].sort()).toEqual(['consumer', 'producer'])
+    for (const { options } of kafka.options) expect(options.allowAutoTopicCreation).toBe(false)
+  }, 60000)
+
+  test('a topic that already exists when the workload creates it fails the run', async () => {
+    const { run, lines } = compose({
+      warmupMs: 0,
+      phaseSeconds: 5,
+      fault: ({ kafka }) => {
+        const admin = kafka.admin.bind(kafka)
+        kafka.admin = () => {
+          const client = admin()
+          client.createTopics = async () => false
+          return client
+        }
+      },
+    })
+    await expect(run.run()).rejects.toThrow('already existed when it was created')
+    expect(lines.filter(({ kind }) => kind === 'verdict')).toEqual([
+      expect.objectContaining({ ok: false }),
+    ])
+  }, 60000)
+
   test('a failed disconnect fails the run, with one failing verdict and no passing one', async () => {
     const { run, lines } = compose({
       fault: ({ kafka }) => {

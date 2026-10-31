@@ -704,7 +704,8 @@ class ChurnJournal {
 
 /**
  * The client's WARN and ERROR log lines, kept as evidence beside the journal. Each line is one JSON
- * object in a bounded file; a `loss` is pointed at the lines of its group within `windowMs` of it.
+ * object in a bounded file; a `loss` is pointed at the lines of its group within `windowMs` of it, and at
+ * those of no group: a connection's lines name no group, and they carry the answer that caused a loss.
  * Nothing below WARN is kept, and memory holds only the recent lines and the unsettled losses.
  */
 class ChurnClientLog {
@@ -768,9 +769,11 @@ class ChurnClientLog {
   }
 
   #match(loss, line) {
-    if (line.group !== loss.group || Math.abs(line.at - loss.at) > this.windowMs) return
+    if (line.group !== undefined && line.group !== loss.group) return
+    if (Math.abs(line.at - loss.at) > this.windowMs) return
     loss.count += 1
-    if (loss.first.length < 3) loss.first.push(line.message)
+    if (loss.first.length < 3)
+      loss.first.push(line.error ? `${line.message}: ${line.error}` : line.message)
   }
 
   /**
@@ -826,7 +829,9 @@ class FrameTally {
  * What the profile can see of a client from outside: the sockets its `socketFactory` made, the
  * requests written on them and not yet answered (counted from the frames, with fragmentation and
  * coalescing handled), the listeners left on those sockets and the public instrumentation
- * registrations. A reading that was never observed is an error, not a zero.
+ * registrations. A closed socket is not kept: its listeners are counted as it closes, so the probe
+ * adds nothing to the heap it is measured against. A reading that was never observed is an error,
+ * not a zero.
  */
 class PublicConsumerProbe {
   /**
@@ -841,7 +846,7 @@ class PublicConsumerProbe {
       (() => countByType(process.getActiveResourcesInfo()))
     this.heap = heap
     this.open = new Set()
-    this.justClosed = []
+    this.mostLeftOnClosed = 0
     this.created = 0
     this.destroyed = 0
     this.abandoned = 0
@@ -886,8 +891,7 @@ class PublicConsumerProbe {
     this.destroyed += 1
     this.abandoned += state.outstanding.size
     state.outstanding.clear()
-    this.justClosed.push(state.socket)
-    if (this.justClosed.length > 64) this.justClosed.shift()
+    this.mostLeftOnClosed = Math.max(this.mostLeftOnClosed, listenerTotal(state.socket))
   }
 
   /**
@@ -920,8 +924,9 @@ class PublicConsumerProbe {
 
   /**
    * @returns {Promise<object>} sockets created and destroyed, requests still outstanding and those
-   *   a closed socket abandoned, listeners left on live and just-closed sockets, registrations,
-   *   active resources by type and, when a heap reader was given, the heap
+   *   a closed socket abandoned, listeners left on live sockets, the most left on any one socket
+   *   when it closed, registrations, active resources by type and, when a heap reader was given,
+   *   the heap
    * @throws {Error} when no socket was ever observed, so no zero here is unmeasured
    */
   async snapshot() {
@@ -936,7 +941,7 @@ class PublicConsumerProbe {
       requests: { outstanding, abandoned: this.abandoned, queueSize: this.queueSize },
       listeners: {
         open: listeners,
-        closed: this.justClosed.reduce((total, socket) => total + listenerTotal(socket), 0),
+        closed: this.mostLeftOnClosed,
         registrations: this.registrations.size,
       },
       activeResources: this.activeResources(),
@@ -955,6 +960,22 @@ const countByType = (types) => {
   for (const type of types) counts[type] = (counts[type] || 0) + 1
   return counts
 }
+
+/**
+ * Holds the records each phase acknowledged to the offered rate over the phase's offering window, the
+ * five planned minutes: the drain, the log read and the deletion that follow it are not offering time.
+ * @param {Map<string, { acked?: number, measuredMs?: number }>} stats what each phase recorded
+ * @param {Array<{ name: string, ms: number }>} phases the plan's phases
+ * @param {number} rate records per second the profile offers
+ * @returns {string[]} one violation for each phase that acknowledged fewer than `rate` per second
+ */
+const acknowledgedViolations = (stats, phases, rate) =>
+  phases
+    .filter(({ name, ms }) => (stats.get(name)?.acked ?? 0) < (rate * ms) / 1000)
+    .map(
+      ({ name }) =>
+        `${name}: ${stats.get(name)?.acked ?? 0} acknowledged records, fewer than ${rate}/s`
+    )
 
 /**
  * Compares a quiet reading with the baseline over every observed resource type, not a chosen few.
@@ -976,12 +997,17 @@ const quietViolations = (when, snapshot, baseline) => {
     violations.push(
       `${when}: ${snapshot.requests.abandoned - baseline.requests.abandoned} requests abandoned by a closed socket`
     )
-  for (const key of ['open', 'closed', 'registrations']) {
+  for (const key of ['open', 'registrations']) {
     if (snapshot.listeners[key] > baseline.listeners[key])
       violations.push(
         `${when}: ${snapshot.listeners[key] - baseline.listeners[key]} ${key} listeners left`
       )
   }
+  const extra = snapshot.listeners.closed - baseline.listeners.closed
+  if (extra > 0)
+    violations.push(
+      `${when}: a closed socket kept ${extra} more ${extra === 1 ? 'listener' : 'listeners'} than the baseline`
+    )
   for (const type of new Set([
     ...Object.keys(snapshot.activeResources),
     ...Object.keys(baseline.activeResources),
@@ -1205,6 +1231,7 @@ module.exports = {
   OfferScheduler,
   PublicConsumerProbe,
   YIELD_EVERY,
+  acknowledgedViolations,
   consumerChurnPlan,
   consumerControls,
   countByType,

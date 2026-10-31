@@ -2,6 +2,8 @@ const { EventEmitter } = require('node:events')
 const fs = require('node:fs')
 const os = require('node:os')
 const path = require('node:path')
+const v8 = require('node:v8')
+const vm = require('node:vm')
 const { KafkaJSCommitFailedError } = require('../../../index')
 const {
   CONSUMER_CHURN,
@@ -14,6 +16,7 @@ const {
   GapSampler,
   OfferScheduler,
   PublicConsumerProbe,
+  acknowledgedViolations,
   consumerChurnPlan,
   consumerControls,
   interningControl,
@@ -276,7 +279,7 @@ describe('Consumer churn profile > public probe', () => {
     })
   })
 
-  test('counts the listeners left on live and just-closed sockets', async () => {
+  test('counts the listeners left on live sockets and on a socket as it closes', async () => {
     const { probe, factory } = probed()
     const socket = factory({})
     socket.on('error', () => {})
@@ -285,6 +288,58 @@ describe('Consumer churn profile > public probe', () => {
     const closed = await probe.snapshot()
     expect(closed.listeners.open).toBe(0)
     expect(closed.listeners.closed).toBeGreaterThan(0)
+  })
+
+  describe('listeners left on closed sockets', () => {
+    /** The product keeps one inert `error` listener on a closed socket; `extra` adds another event. */
+    const closing = (probe, count, extra = []) => {
+      const factory = probe.wrap(() => {
+        const socket = fakeSocket()
+        socket.on('error', () => {})
+        for (const event of extra) socket.on(event, () => {})
+        return socket
+      })
+      for (let n = 0; n < count; n++) factory({}).emit('close')
+    }
+
+    test('reads the same after 38 closes as after 500, with the product leaving one listener per socket', async () => {
+      const probe = new PublicConsumerProbe({ activeResources: () => ({}) })
+      closing(probe, 38)
+      const baseline = await probe.snapshot()
+      closing(probe, 500)
+      const later = await probe.snapshot()
+      expect(later.listeners.closed).toBe(baseline.listeners.closed)
+      expect(quietViolations('after phase', later, baseline)).toEqual([])
+    })
+
+    test('names the one socket that kept more than the baseline, however many closed cleanly around it', async () => {
+      const probe = new PublicConsumerProbe({ activeResources: () => ({}) })
+      closing(probe, 38)
+      const baseline = await probe.snapshot()
+      closing(probe, 100)
+      closing(probe, 1, ['data'])
+      closing(probe, 100)
+      const violations = quietViolations('after phase', await probe.snapshot(), baseline)
+      expect(violations).toEqual([
+        'after phase: a closed socket kept 1 more listener than the baseline',
+      ])
+    })
+
+    test('keeps no closed socket alive', async () => {
+      v8.setFlagsFromString('--expose-gc')
+      const gc = vm.runInNewContext('gc')
+      const probe = new PublicConsumerProbe({ activeResources: () => ({}) })
+      const refs = []
+      const factory = probe.wrap(() => {
+        const socket = fakeSocket()
+        refs.push(new WeakRef(socket))
+        return socket
+      })
+      for (let n = 0; n < 10; n++) factory({}).emit('close')
+      await new Promise((resolve) => setImmediate(resolve))
+      gc()
+      expect(refs.filter((ref) => ref.deref() !== undefined)).toHaveLength(0)
+    })
   })
 
   test('tracks and removes the registrations made on a client', async () => {
@@ -343,7 +398,7 @@ describe('Consumer churn profile > public probe', () => {
       [
         'a listener left on a socket',
         { listeners: { open: 0, closed: 3, registrations: 0 } },
-        'closed listeners left',
+        'a closed socket kept 3 more listeners than the baseline',
       ],
       [
         'a registration left',
@@ -1197,6 +1252,37 @@ describe('Consumer churn profile > client log', () => {
     ])
   })
 
+  test('a loss names the lines of no group, which carry the broker answer, beside its own', () => {
+    const wall = { at: 100000 }
+    const clientLog = new ChurnClientLog({
+      file: path.join(dir, 'n.clientlog'),
+      wall: () => wall.at,
+    })
+    const warn = (log, at) =>
+      clientLog.add({
+        namespace: 'x',
+        level: 2,
+        log: { ...log, timestamp: new Date(at).toISOString() },
+      })
+    warn(
+      { message: 'Response OffsetCommit', error: 'Specified group generation id is not valid' },
+      99990
+    )
+    warn({ message: 'Response Heartbeat', error: 'The group is rebalancing' }, 80000)
+    warn({ message: 'elsewhere', groupId: 'other' }, 99995)
+    clientLog.noteLoss({ group: 'g', member: 'm' })
+    clientLog.close()
+    expect(clientLog.settle(true)).toEqual([
+      {
+        group: 'g',
+        member: 'm',
+        at: 100000,
+        count: 1,
+        first: ['Response OffsetCommit: Specified group generation id is not valid'],
+      },
+    ])
+  })
+
   test('the file and memory stay bounded', () => {
     const clientLog = new ChurnClientLog({ file: path.join(dir, 'b.clientlog'), maxLines: 3 })
     for (let index = 0; index < 1200; index++)
@@ -1235,5 +1321,28 @@ describe('Consumer churn profile > client log', () => {
     await handlers.onPartitionsRevoked({ partitions })
     await handlers.onPartitionsLost({ partitions })
     expect(onLoss.mock.calls).toEqual([[{ group: 'g', member: 'm' }]])
+  })
+})
+
+describe('Consumer churn profile > acknowledged records', () => {
+  const phases = [
+    { name: 'a', ms: 300000 },
+    { name: 'b', ms: 300000 },
+  ]
+
+  test('are held to the rate over the five planned minutes, not the drain after them', () => {
+    const stats = new Map([
+      ['a', { acked: 66000, measuredMs: 363000 }],
+      ['b', { acked: 59999, measuredMs: 300000 }],
+    ])
+    expect(acknowledgedViolations(stats, phases, 200)).toEqual([
+      'b: 59999 acknowledged records, fewer than 200/s',
+    ])
+  })
+
+  test('a phase that recorded nothing acknowledged nothing', () => {
+    expect(acknowledgedViolations(new Map([['a', { acked: 60000 }]]), phases, 200)).toEqual([
+      'b: 0 acknowledged records, fewer than 200/s',
+    ])
   })
 })
