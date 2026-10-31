@@ -32,6 +32,7 @@ const buildGroup = () => {
     },
     retrier: createRetry({ initialRetryTime: 2000, factor: 0, retries: 1 }),
     backoff: { initial: () => 2000 },
+    coordinatorLookup: { releaseUnfenced() {} },
   })
   return group
 }

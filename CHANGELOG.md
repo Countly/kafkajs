@@ -25,7 +25,7 @@ Versions before 3.0.0 are internal alpha tags and are not published.
 
 - **The classic leader assigns the union of every member's subscription**: a topic only a non-leader member subscribes to is now assigned in the round, not left unassigned until a subscribed member leads. A custom assigner still receives `topics` unchanged and may read the new `groupTopics` and `groupTopicMetadata`
 
-- **Classic consumers retain the member id received in `MEMBER_ID_REQUIRED` across retried JoinGroup requests.** Retriable transport failures, coordinator rediscovery and join-round expiry keep the id for the same active local membership. `UNKNOWN_MEMBER_ID` clears it; `ILLEGAL_GENERATION` alone does not. Local leave, stop, disconnect or rebuild discards it, and `FENCED_INSTANCE_ID` remains fatal. This prevents these retries from creating additional abandoned members that delay rebalances until their session timeouts.
+- **Classic consumers retain the member id received in `MEMBER_ID_REQUIRED` across retried JoinGroup requests.** Retriable transport failures, coordinator rediscovery and join-round expiry keep the id for the same active local membership. A consumer that restarts after a join or sync round expired rejoins under that id as well. `UNKNOWN_MEMBER_ID` clears it; `ILLEGAL_GENERATION` alone does not. Local leave, stop, disconnect or rebuild discards it, and `FENCED_INSTANCE_ID` remains fatal. This prevents these retries from creating additional abandoned members that delay rebalances until their session timeouts.
 
 - **The KIP-848 leave builder supplies only member identity; other fixed wire fields carry no-update defaults** (group, member id, epoch −1 or −2, instance id); it used to also send the subscription, the rebalance timeout and an empty partition list
 
@@ -62,6 +62,7 @@ Versions before 3.0.0 are internal alpha tags and are not published.
 - Preferred-replica routing now tests the preferred replica ID against offlineReplicas and falls back to the leader when that replica is offline.
 
 - Fetch sessions (KIP-227) are opt-in; set `fetchSessions: true` to enable them.
+- **`stop()` and `disconnect()` end a handler's API authority at once, so a handler's explicit `commitOffsets()` that is still waiting for the group coordinator when the stop begins can reject with `CONSUMER_STOPPING`.** In 2.2.4 such a commit could still finish while the stop waited for the batch. Now the rejection gives no promise that the commit completed, and an uncaught rejection is the handler's error, so the batch can be redelivered. Offsets committed before the stop began stay committed. A commit from outside the handlers and one made by an authorized close hook may still complete. To require that a commit finishes, drain the handlers and await the commit before calling `stop()` or `disconnect()`.
 
 #### Fixes
 
@@ -85,6 +86,14 @@ Versions before 3.0.0 are internal alpha tags and are not published.
 - A batch fetched before its topic was deleted and recreated no longer resolves offsets into the new topic. Its remaining records are not delivered, its offsets are dropped, and neither an automatic, a final nor an explicit `commitOffsets` from its handler can commit them. Before, a handler finishing old records after the recreation resolved their offset into the new incarnation's cell, and the close's final commit then wrote that offset (for example 8 against a new log of 0..2) and settled the reset the new incarnation still owed. A handler already running may finish.
 
 - Keep incremental Fetch state bound to its run and broker, preserve recorded topic IDs when forgetting partitions, decode sparse replies against the complete request map, and bound best-effort session closes within the captured close budget.
+
+- Round-robin group assignment now sends a valid empty assignment to each member that receives no partitions, including groups with more members than partitions.
+
+- A classic consumer crashes and restarts when a join or sync round outlasts the rebalance timeout; the restarted consumer now rejoins under the member id the expired round held, instead of asking the coordinator for a new member and leaving the old one to expire with its session. A restart after any other crash still joins as a new member, and an id the coordinator no longer knows is dropped by the rejoin, which asks for a fresh one.
+
+- `consumer.commitOffsets()` answered with `REBALANCE_IN_PROGRESS` still rejects with that error, and now also asks the group to rejoin, as the same answer to a heartbeat already did.
+
+- Consumer: one group-coordinator lookup per membership. While a heartbeat's FindCoordinator is pending, concurrent explicit `commitOffsets()` calls, automatic commits and joins now wait for that one lookup instead of each starting their own (N commits made N lookups), for the classic and the consumer group protocol. Each caller keeps its own deadline and close; one caller giving up does not cancel the others, and the lookup ends when its last caller or its membership does. A stop sends no frame for a pending lookup, and an answer for a retired membership is installed for no one. A handler's explicit commit that is still waiting on the lookup when a stop begins rejects with `CONSUMER_STOPPING` and gets no promise of completion (see Behavior changes); a commit from outside the handlers and an authorized close-hook commit may still complete through that lookup. Internal change (`src/consumer/coordinatorLookup.js`); no public API change. Closes the RB-07 duplicate-coordinator-load finding.
 
 #### Additions
 
@@ -126,11 +135,15 @@ Versions before 3.0.0 are internal alpha tags and are not published.
 
 - Add isolated regex discovery and retirement checks and a subscription-evaluation benchmark with exact work controls.
 
-- Add independent classic coordinator fault, group-size, Fetch chunking and Java assignment-vector scenarios, with dedicated group-fault and Fetch-semantics test commands.
+- Consumer coordinator fault scenarios, transaction visibility, large-record and partial-tail cases, assignment vectors and chunked Fetch responses have explicit independent expectations and final integration checks.
+
+- Add dedicated group-fault and Fetch-semantics test commands.
 
 - Add routing, partial trailing-batch and per-broker Fetch concurrency regressions, with a dedicated Fetch-routing test command.
 
 - Validate Fetch-session measurements against independent frames and real batch/message counts.
+
+- Add replayable consumer fault schedules, generated manual, rebalance-hook, forced-close and fetch-session lifecycle cases, and the `soak:consumer-churn` profile with independent log, broker-offset and handler checks, resource baselines and delivery-gap samples.
 
 ### Phase 9B — Producer parity: delivery deadline, memory bound, request size, partitioner, codecs, lifecycle
 

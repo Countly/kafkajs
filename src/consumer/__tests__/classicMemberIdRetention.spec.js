@@ -12,13 +12,14 @@ const METADATA = MemberMetadata.encode({ version: 0, topics: TOPICS })
  * A classic protocol over a coordinator that answers a join with an empty member id as the Broker
  * does after MEMBER_ID_REQUIRED: it reports the assigned id through `onMemberIdRequired`, then
  * loses the follow-up request. A join that names an id succeeds.
- * @param {{ groupInstanceId?: string|null }} [options] the static instance id the protocol is configured with
+ * @param {{ groupInstanceId?: string|null, retainedMemberId?: string|null }} [options] the static
+ *   instance id the protocol is configured with, and the id a crashed membership handed it
  * @returns {{ protocol: ClassicGroupProtocol, coordinator: object, hooks: { beforeNotify?: () => void },
  *   joinIds: () => string[], join: () => Promise<void>, assign: (...ids: string[]) => void }}
  *   `joinIds` is the member id of every JoinGroup the protocol sent; `assign` queues the ids the
  *   next handshakes assign
  */
-const build = ({ groupInstanceId = null } = {}) => {
+const build = ({ groupInstanceId = null, retainedMemberId = null } = {}) => {
   const queued = []
   const sent = []
   const hooks = {}
@@ -49,6 +50,7 @@ const build = ({ groupInstanceId = null } = {}) => {
     cluster: { findGroupCoordinator: async () => coordinator },
     groupId: 'retention-group',
     groupInstanceId,
+    retainedMemberId,
     sessionTimeout: 30000,
     rebalanceTimeout: 60000,
     assigners: [
@@ -285,6 +287,31 @@ describe('Consumer > classic member id retention', () => {
 
     expect(second.joinIds()).toEqual([''])
     expect(first.protocol.pendingMemberId).toBe('A')
+  })
+
+  it('sends a retained id in its first join without treating it as joined', async () => {
+    const retained = build({ retainedMemberId: 'kept' })
+
+    expect(retained.protocol.memberId).toBeNull()
+    expect(retained.protocol.retainableMemberId()).toBe('kept')
+    await retained.join()
+
+    expect(retained.joinIds()).toEqual(['kept'])
+    expect(retained.protocol.memberId).toBe('kept')
+  })
+
+  it('offers the joined id for a restart, else the pending one, and nothing once reset', async () => {
+    const lost = build()
+    expect(lost.protocol.retainableMemberId()).toBeNull()
+    lost.assign('A')
+    await expect(lost.join()).rejects.toThrow()
+    expect(lost.protocol.retainableMemberId()).toBe('A')
+
+    await lost.join()
+    expect(lost.protocol.retainableMemberId()).toBe('A')
+
+    lost.protocol.forgetMemberId()
+    expect(lost.protocol.retainableMemberId()).toBeNull()
   })
 
   describe('over the production Broker and Connection', () => {

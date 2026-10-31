@@ -634,3 +634,17 @@ describe('Consumer > ConsumerGroup > unassigned prototype topic seeks', () => {
     }
   )
 })
+
+describe('Consumer > ConsumerGroup > member id retention', () => {
+  it('offers a classic membership id and hands a retained one to the new classic membership', () => {
+    expect(createGroup().retainableMemberId()).toBe('member-1')
+    expect(createGroup({ retainedMemberId: 'kept' }).groupMembership.pendingMemberId).toBe('kept')
+  })
+
+  it('offers no id under the consumer protocol, which generates its own', () => {
+    const group = createGroup({ groupProtocol: 'consumer', retainedMemberId: 'kept' })
+
+    expect(group.retainableMemberId()).toBeNull()
+    expect(group.groupMembership.pendingMemberId).toBeUndefined()
+  })
+})

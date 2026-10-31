@@ -91,6 +91,52 @@ describe('pause across a rebalance on the real apply paths', () => {
     })
   })
 
+  it('pause intent survives ordinary rebalances but ends with its incarnation', async () => {
+    for (const [groupProtocol, options] of [
+      ['classic', { rebuildOffsets: true }],
+      ['classic', { rebuildOffsets: false }],
+      ['consumer', { rebuildOffsets: false }],
+    ]) {
+      h = await createFetchGroup({ partitions: [0, 1], groupProtocol })
+      h.group.partitionsPerSubscribedTopic = h.group.generatePartitionsPerSubscribedTopic()
+      const { group } = h
+      const state = group.subscriptionState
+      await apply([0, 1], options)
+      group.pause([{ topic: TOPIC }])
+      group.resume([{ topic: TOPIC, partitions: [1] }])
+      for (let round = 0; round < 3; round++) {
+        await apply([], options)
+        await apply([0, 1], options)
+      }
+      expect(group.paused()).toEqual([{ topic: TOPIC, partitions: [0] }])
+      expect(fetched(group)).toEqual([1])
+
+      const token = {}
+      state.hold([{ topic: TOPIC, partitions: [0, 1] }], token)
+      expect(group.paused()).toEqual([{ topic: TOPIC, partitions: [0] }])
+      expect(state.isPaused(TOPIC, 1)).toBe(false)
+      expect(state.isHeld(TOPIC, 1)).toBe(true)
+      state.release(token)
+
+      await apply([], options)
+      state.retainTopics([TOPIC])
+      await apply([0, 1], options)
+      expect(group.paused()).toEqual([{ topic: TOPIC, partitions: [0] }])
+
+      state.retainTopics([])
+      await apply([0, 1], options)
+      expect(group.paused()).toEqual([])
+      group.pause([{ topic: TOPIC, partitions: [1] }])
+      group.invalidateTopic(TOPIC)
+      expect(group.paused()).toEqual([])
+      group.pause([{ topic: TOPIC }, { topic: '__proto__' }])
+      group.onStopRequested()
+      expect(Object.keys(state.subscriptionStatesByTopic)).toEqual([])
+      await h.broker.disconnect()
+      h = null
+    }
+  })
+
   it('an unassigned incarnation change retires pause', async () => {
     h = await createFetchGroup({ partitions: [0] })
     h.group.offsetManager = null

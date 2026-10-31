@@ -4,6 +4,7 @@ const retryDefaults = require('../../retry/defaults')
 const apiKeys = require('../../protocol/requests/apiKeys')
 const { COOPERATIVE } = require('./interface')
 const { generateMemberId } = require('./memberId')
+const CoordinatorLookup = require('../coordinatorLookup')
 const { SentFields, buildRequest } = require('./heartbeatState')
 const {
   MEMBER_STATES,
@@ -310,6 +311,8 @@ module.exports = class ConsumerGroupProtocol {
    *   holds a client-side pattern; a reply is current only while its scope is
    * @param {number} [options.metadataMaxAge] how often an unresolved topic id may trigger a refresh
    * @param {object} [options.retry] the client's retry configuration, for the heartbeat backoff
+   * @param {import('../coordinatorLookup')} [options.coordinatorLookup] the membership's one
+   *   pending coordinator lookup, shared with its commits; this protocol's own when absent
    * @param {import('../../instrumentation/emitter')} options.instrumentationEmitter
    * @param {import('../../../types').Logger} options.logger
    */
@@ -326,10 +329,12 @@ module.exports = class ConsumerGroupProtocol {
     metadataMaxAge = 300000,
     ownership = null,
     retry = {},
+    coordinatorLookup = new CoordinatorLookup({ cluster, groupId }),
     instrumentationEmitter,
     logger,
   }) {
     this.cluster = cluster
+    this.coordinatorLookup = coordinatorLookup
     this.ownership = ownership
     this.groupId = groupId
     this.groupInstanceId = groupInstanceId
@@ -532,15 +537,16 @@ module.exports = class ConsumerGroupProtocol {
   }
 
   /**
-   * Resolves the group coordinator. A lookup that finishes after its membership was replaced
-   * publishes nothing: the answer may be older than what the replacement already learned.
+   * Resolves the group coordinator, through the membership's one pending lookup. A lookup that
+   * finishes after its membership was replaced publishes nothing: the answer may be older than
+   * what the replacement already learned.
    * @param {number} [ownershipToken] the membership the lookup serves, captured before the first
    *   await; defaults to the current one
    * @returns {Promise<void>}
    * @throws {Error} the lookup's own failure; the caller stamps it with the membership
    */
   async connect(ownershipToken = this.ownership?.token()) {
-    const coordinator = await this.cluster.findGroupCoordinator({ groupId: this.groupId })
+    const coordinator = await this.coordinatorLookup.find()
     if (!this.ownershipReplaced(ownershipToken)) this.coordinator = coordinator
   }
 

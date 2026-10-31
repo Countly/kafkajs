@@ -11,6 +11,7 @@ const {
   consumerProtocolScript,
 } = require('../../../../testHelpers/scriptedCluster')
 const { cooperativeSticky } = require('../../assigners')
+const { MemberAssignment } = require('../../assignerProtocol')
 const { TOPIC, prepareRecordBatches } = require('./fetchHarness')
 const { KafkaJSCommitFailedError } = require('../../../errors')
 
@@ -139,6 +140,34 @@ const runLifecycleCell = async (cell) => {
       : 0)
   const socketBaseline = () => scripted.sockets().filter((socket) => !socket.destroyed).length
   const beforeSockets = socketBaseline()
+  const sessions = cell.boundary.startsWith('session:')
+  if (sessions) {
+    let fetches = 0
+    scripted.answer('Fetch', async ({ maxWaitMs, topics }) => {
+      fetches += 1
+      if (fetches > 1) await new Promise((resolve) => setTimeout(resolve, maxWaitMs))
+      return {
+        sessionId: 7,
+        includeTopic: topics.length > 0,
+        partitions: (topics[0]?.partitions ?? []).map(({ partition }) => ({
+          partition,
+          errorCode: 0,
+          records: fetches <= 1,
+        })),
+      }
+    })
+  }
+  const stage = cell.boundary.startsWith('hook:') ? cell.boundary.slice('hook:'.length) : null
+  const hooks = stage
+    ? Object.fromEntries(
+        ['assigned', 'revoked', 'lost'].map((name) => [
+          `onPartitions${name[0].toUpperCase()}${name.slice(1)}`,
+          async () => {
+            if (name === stage) await at()
+          },
+        ])
+      )
+    : null
   let failed = false
   try {
     await prepareRecordBatches()
@@ -161,6 +190,7 @@ const runLifecycleCell = async (cell) => {
       maxInFlightRequests: 1,
       groupInstanceId: cell.membership === 'static' ? 'static-instance' : null,
       maxWaitTimeInMs: 20,
+      fetchSessions: sessions,
       ...options,
       ...(cell.event === 'crash' && ['in-join', 'in-sync'].includes(cell.boundary)
         ? { retry: { retries: 0, initialRetryTime: 1, restartOnFailure: async () => true } }
@@ -193,7 +223,17 @@ const runLifecycleCell = async (cell) => {
       gate.arrived().then(() => at())
       enabled = true
     }
-    if (['before-handler', 'in-handler'].includes(cell.boundary)) enabled = true
+    if (cell.boundary === 'session:initial') {
+      const gate = scripted.schedule.hold({ api: 'Fetch' })
+      cleanup.push(() => {
+        if (gate.settle) gate.release()
+      })
+      gate.arrived().then(() => at())
+    }
+    if (
+      ['before-handler', 'in-handler', 'hook:assigned', 'session:initial'].includes(cell.boundary)
+    )
+      enabled = true
     await consumer.connect()
     await consumer.subscribe({ topic: TOPIC, fromBeginning: true })
     starting = settled(
@@ -202,10 +242,20 @@ const runLifecycleCell = async (cell) => {
         eachBatch: async () => {
           if (cell.boundary === 'in-handler') await at()
         },
+        ...(hooks ? { rebalanceListener: hooks } : {}),
       })
     )
     await pump(() => runner != null, 'runner capture')
-    if (!['in-join', 'in-sync', 'before-handler', 'in-handler'].includes(cell.boundary)) {
+    if (
+      ![
+        'in-join',
+        'in-sync',
+        'before-handler',
+        'in-handler',
+        'hook:assigned',
+        'session:initial',
+      ].includes(cell.boundary)
+    ) {
       await pump(
         () => starting.done && runner.consumerGroup.offsetManager != null,
         'first assignment'
@@ -213,6 +263,41 @@ const runLifecycleCell = async (cell) => {
       if (starting.error) throw starting.error
       enabled = true
       const group = runner.consumerGroup
+      if (cell.boundary === 'session:inflight') {
+        const gate = scripted.schedule.hold({
+          api: 'Fetch',
+          match: ({ fields }) => fields.sessionId === 7,
+        })
+        cleanup.push(() => {
+          if (gate.settle) gate.release()
+        })
+        gate.arrived().then(() => at())
+      }
+      if (stage === 'revoked' && cell.protocol === 'classic-cooperative')
+        scripted.schedule.once(
+          { api: 'SyncGroup' },
+          {
+            memberAssignment: MemberAssignment.encode({ version: 1, assignment: {} }).toString(
+              'hex'
+            ),
+          }
+        )
+      if (stage === 'revoked' && cell.protocol === 'consumer')
+        scripted.schedule.once({ api: 'ConsumerGroupHeartbeat' }, ({ fields }) => ({
+          memberId: fields.memberId,
+          memberEpoch: fields.memberEpoch + 1,
+          heartbeatIntervalMs: 100,
+          assignment: { topicPartitions: [] },
+        }))
+      if (stage === 'revoked' || stage === 'lost') {
+        operation = settled(
+          runner.handleRebalanceError({
+            kind: stage,
+            reason: stage === 'lost' ? 'lost' : 'assignment',
+            error: new Error(stage),
+          })
+        )
+      }
       if (cell.boundary === 'commit:coordinator-lookup') {
         group.offsetManager.coordinator = { isConnected: () => false }
         wrap(Cluster.prototype, 'findGroupCoordinator', true)
@@ -347,11 +432,12 @@ const runLifecycleCell = async (cell) => {
     const framesBefore = scripted
       .requests()
       .filter((record) => record.api === 'OffsetCommit').length
-    const terminal = ['stop', 'disconnect'].includes(cell.event)
+    const terminal = ['stop', 'disconnect', 'force'].includes(cell.event)
     const learnedLoss = cell.event === 'poll-expiry'
     let event
     if (cell.event === 'stop') event = settled(consumer.stop())
     if (cell.event === 'disconnect') event = settled(consumer.disconnect())
+    if (cell.event === 'force') event = settled(consumer.disconnect({ timeout: 0 }))
     if (cell.event === 'crash' && initialGate) {
       const { KafkaJSConnectionClosedError } = require('../../../errors')
       initialGate.fail(new KafkaJSConnectionClosedError('join transport closed'))
@@ -381,8 +467,12 @@ const runLifecycleCell = async (cell) => {
             )
     if (learnedLoss) {
       expect(group.ownership.refusal(token)).toBeInstanceOf(KafkaJSCommitFailedError)
-      expect(group.ownership.refusal(token).reason).toBe('poll-interval-exceeded')
-      expect(group.ownership.refusal(token).cause.type).toBe('POLL_INTERVAL_EXCEEDED')
+      if (stage === 'lost') {
+        expect(group.ownership.refusal(token).reason).toBe('membership-lost')
+      } else {
+        expect(group.ownership.refusal(token).reason).toBe('poll-interval-exceeded')
+        expect(group.ownership.refusal(token).cause.type).toBe('POLL_INTERVAL_EXCEEDED')
+      }
     }
     release()
     cleanup.forEach((fn) => fn())
@@ -420,7 +510,7 @@ const runLifecycleCell = async (cell) => {
     expect(group.obligations.size()).toBe(0)
     expect(socketBaseline()).toBe(beforeSockets)
     expect(errors).toEqual([])
-    expect(running.length).toBeGreaterThan(0)
+    if (!(stage === 'assigned' && terminal)) expect(running.length).toBeGreaterThan(0)
     for (const loss of losses)
       expect(
         scripted

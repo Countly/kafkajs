@@ -79,6 +79,7 @@ const rig = ({ cached = false } = {}) => {
       heartbeatInterval: () => 3000,
       onStopRequested: () => {},
       retireFetchSessions: () => {},
+      retireCoordinatorLookup: () => {},
     },
     instrumentationEmitter: emitter,
     concurrency: 1,

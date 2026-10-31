@@ -2,6 +2,8 @@ const ConsumerGroup = require('../consumerGroup')
 const ConsumerProtocol = require('../groupProtocol/consumer')
 const SubscriptionState = require('../subscriptionState')
 const SeekOffsets = require('../seekOffsets')
+const Subscription = require('../subscription')
+const { FetchSessions } = require('../fetchSession')
 const dictionary = require('../../utils/dictionary')
 const ResetObligations = require('../offsetManager/resetObligations')
 const { createFetchGroup, TOPIC } = require('./fixtures/fetchHarness')
@@ -51,6 +53,79 @@ describe.each(['classic', 'consumer'])('%s retention core', (kind) => {
       expect(group.seekOffset.size).toBe(0)
       expect(protocol.grownTopicNames.size).toBe(0)
     }
+  })
+
+  it('every retained consumer structure follows its live owners after repeated replacement', () => {
+    const group = Object.create(ConsumerGroup.prototype)
+    const protocol = Object.create(ConsumerProtocol.prototype)
+    protocol.subscribedTopicNames = []
+    protocol.grownTopicNames = new Set()
+    protocol.assignedTopicNames = new Map()
+    protocol.unresolvedTopicIds = new Set()
+    protocol.unresolvedAttempts = new Map()
+    group.groupMembership = kind === 'consumer' ? protocol : { kind }
+    group.subscribedTopicRegex = '^orders-'
+    group.subscription = new Subscription()
+    group.subscription.add({ topics: [/^orders-/], policy: { kind: 'earliest' } })
+    group.subscriptionState = new SubscriptionState()
+    group.topicConfigurations = Object.create(null)
+    group.preferredReadReplicasPerTopicPartition = Object.create(null)
+    group.seekOffset = new SeekOffsets()
+    group.obligations = new ResetObligations()
+    group.offsetManager = null
+    const sessions = new FetchSessions({ sendClose: async () => {}, requestTimeout: 1, logger: {} })
+    const metadataOf = (names, cycle) => ({
+      topicMetadata: names.map((topic, n) => ({ topic, topicId: `id-${cycle}-${n}` })),
+    })
+    const publish = (names, cycle) => {
+      const metadata = metadataOf(names, cycle)
+      group.subscription.evaluate(metadata)
+      for (const { topic, topicId } of group.subscription.observe(metadata)) {
+        group.obligations.owe(topic, topicId)
+      }
+      group.publishSubscription(group.subscription.pin())
+    }
+    for (let cycle = 0; cycle < 500; cycle++) {
+      const names = Array.from({ length: 50 }, (_, n) => `orders-${cycle}-${n}`)
+      publish(names, cycle)
+      for (const topic of names) {
+        group.preferredReadReplicasPerTopicPartition[topic] = { 0: { nodeId: 1 } }
+        group.seekOffset.set(topic, 0, '1')
+        group.subscriptionState.pause([{ topic }])
+        if (kind === 'consumer') protocol.grownTopicNames.add(topic)
+      }
+      group.subscriptionState.assign(names.map((topic) => ({ topic, partitions: [0] })))
+      group.pruneAssignmentState()
+      const nodes = [cycle * 3, cycle * 3 + 1, cycle * 3 + 2]
+      for (const node of nodes) sessions.forNode(node)
+      sessions.retain(nodes)
+
+      expect(group.subscription.desired.names).toHaveLength(50)
+      expect(group.subscription.applied.names).toHaveLength(50)
+      expect(group.subscription.observed.size).toBe(50)
+      expect(Object.keys(group.topicConfigurations)).toHaveLength(50)
+      expect(Object.keys(group.subscriptionState.subscriptionStatesByTopic)).toHaveLength(50)
+      expect(Object.keys(group.preferredReadReplicasPerTopicPartition)).toHaveLength(50)
+      expect(group.seekOffset.size).toBe(50)
+      expect(group.obligations.size()).toBeLessThanOrEqual(50)
+      expect(sessions.sessions.size).toBe(3)
+      if (kind === 'consumer') expect(protocol.grownTopicNames.size).toBe(50)
+      if (kind === 'consumer') protocol.grownTopicNames.clear()
+
+      group.subscriptionState.assign([])
+      publish([], cycle)
+      group.pruneAssignmentState()
+      expect(group.subscription.desired.names).toHaveLength(0)
+      expect(group.subscription.applied.names).toHaveLength(0)
+      expect(group.subscription.observed.size).toBe(0)
+      expect(Object.keys(group.topicConfigurations)).toHaveLength(0)
+      expect(Object.keys(group.subscriptionState.subscriptionStatesByTopic)).toHaveLength(0)
+      expect(Object.keys(group.preferredReadReplicasPerTopicPartition)).toHaveLength(0)
+      expect(group.seekOffset.size).toBe(0)
+      expect(group.obligations.size()).toBe(0)
+    }
+    sessions.retireAll()
+    expect(sessions.sessions.size).toBe(0)
   })
 })
 
@@ -207,6 +282,103 @@ describe('admin registry operation lifetime', () => {
     expect(cluster.groupScopes.size).toBe(0)
     expect(cluster.groupEntries.size).toBe(0)
     expect(cluster.groupRegistry.entries.size).toBe(0)
+  })
+})
+
+describe('independent holders and durable reset debt', () => {
+  afterEach(() => jest.clearAllMocks())
+  it('independent holders and durable reset debt outlive only their actual work', async () => {
+    const { cluster, admin, offsets, operations } = adminRegistry()
+    const registry = cluster.groupRegistry
+    const run = {
+      setOffsets: (groupId) =>
+        admin.setOffsets({ groupId, topic: 'orders', partitions: [{ partition: 0, offset: '0' }] }),
+      resetOffsets: (groupId) => admin.resetOffsets({ groupId, topic: 'orders', earliest: true }),
+      fetchOffsets: (groupId) => admin.fetchOffsets({ groupId, topics: ['orders'] }),
+    }
+    for (const operation of Object.keys(run)) {
+      await run[operation](`idle-${operation}`)
+      expect(cluster.groupEntries.size).toBe(0)
+      expect(cluster.groupScopes.size).toBe(0)
+      expect(registry.entries.size).toBe(0)
+    }
+
+    const consumer = {}
+    const producer = {}
+    const shared = registry.acquire('shared', consumer)
+    registry.acquire('shared', producer)
+    const empty = shared.ledger.begin([])
+    const debt = new ResetObligations()
+    debt.owe('orders', 'new-incarnation')
+    debt.attachTo(shared.ledger)
+    await Promise.all([run.setOffsets('shared'), run.setOffsets('other')])
+    expect(registry.entries.has('other')).toBe(false)
+    expect(registry.entries.get('shared').holders.size).toBe(2)
+    registry.release('shared', consumer)
+    expect(registry.entries.has('shared')).toBe(true)
+    registry.release('shared', producer)
+    expect(registry.entries.has('shared')).toBe(true)
+    shared.ledger.end(empty)
+    debt.unlink()
+    expect(registry.entries.has('shared')).toBe(false)
+    expect(debt.isOwed('orders', 0)).toBe(true)
+    expect(offsets.size).toBe(0)
+    expect(operations.size).toBe(0)
+
+    const failure = new Error('subscription failed')
+    const failing = adminRegistry(failure)
+    await expect(
+      failing.admin.setOffsets({
+        groupId: 'failed',
+        topic: 'orders',
+        partitions: [{ partition: 0, offset: '0' }],
+      })
+    ).rejects.toBe(failure)
+    expect(failing.cluster.groupRegistry.entries.size).toBe(0)
+    await admin.disconnect()
+    await failing.admin.disconnect()
+    expect(registry.entries.size).toBe(0)
+    expect(cluster.groupEntries.size).toBe(0)
+  })
+})
+
+describe('recreation debt', () => {
+  it('recreation debt survives stop and partial assignment until a confirmed commit', () => {
+    const debt = new ResetObligations()
+    const known = [0, 1, 2]
+    debt.owe('orders', 'new-id')
+    debt.unlink()
+    expect(debt.isOwed('orders', 0)).toBe(true)
+
+    debt.settle('orders', [], known)
+    debt.settle('orders', [0], undefined)
+    expect(debt.size()).toBe(1)
+    debt.discharge('orders', 0, 'stale-id')
+    expect(debt.isOwed('orders', 0)).toBe(true)
+    expect(debt.current('orders', undefined)).toBe('new-id')
+
+    debt.discharge('orders', 0, 'new-id')
+    debt.settle('orders', [0], known)
+    expect(debt.size()).toBe(1)
+    expect(debt.isOwed('orders', 1)).toBe(true)
+    debt.settle('orders', [], [])
+    expect(debt.size()).toBe(1)
+
+    debt.discharge('orders', 1, 'new-id')
+    debt.discharge('orders', 2)
+    debt.settle('orders', [0, 1, 2], known)
+    expect(debt.size()).toBe(0)
+    expect(debt.isOwed('orders', 0)).toBe(false)
+  })
+  it('owes a newer incarnation after an ambiguous or recreated answer', () => {
+    const debt = new ResetObligations()
+    debt.owe('orders', 'first')
+    expect(debt.current('orders', 'second')).toBeUndefined()
+    expect(debt.size()).toBe(0)
+    debt.owe('orders', 'second')
+    debt.discharge('orders', 0, 'second')
+    debt.owe('orders', 'third')
+    expect(debt.isOwed('orders', 0)).toBe(true)
   })
 })
 

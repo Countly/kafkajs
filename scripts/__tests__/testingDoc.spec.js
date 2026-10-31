@@ -504,4 +504,22 @@ describe('documented live scenario scripts', () => {
     for (const ms of row.budgetsMs) expect(block).toContain(`${ms} ms`)
     for (const text of row.wording) expect(block).toContain(text)
   })
+
+  it('documents the consumer-churn soak profile and its script', () => {
+    expect(scripts['soak:consumer-churn']).toBe(
+      'npm run test:kafka -- "node --expose-gc scripts/soak/soak.js --profile consumer-churn"'
+    )
+    const block = page
+      .split('\n\n')
+      .find((paragraph) => paragraph.startsWith('`soak:consumer-churn`'))
+    expect(block).toBeDefined()
+    for (const text of [
+      'five minutes',
+      'three-minute warm-up',
+      '2,200-second',
+      'not acceptance evidence',
+    ])
+      expect(block).toContain(text)
+    expect(page).toContain('| `npm run soak:consumer-churn` |')
+  })
 })

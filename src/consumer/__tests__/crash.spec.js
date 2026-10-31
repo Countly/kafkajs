@@ -222,6 +222,7 @@ describe('Runner > crash handling from the fetch-loop path', () => {
     // The Fetch-session seams of stop and forced retirement; the real group always has both.
     closeFetchSessions: jest.fn(async () => {}),
     retireFetchSessions: jest.fn(),
+    retireCoordinatorLookup: jest.fn(),
     leave: jest.fn(async () => {}),
     getNodeIds: () => [],
     ...overrides,

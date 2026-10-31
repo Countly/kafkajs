@@ -1,0 +1,1810 @@
+[
+  {
+    "name": "classic-eager/reset-seek-commit-resolution",
+    "faultPoint": "OffsetFetch:answer",
+    "protocol": "classic-eager",
+    "feature": "offset-overlap",
+    "expectedWire": {
+      "afterLearnedLossOffsetCommit": 0,
+      "overlappingOwners": 0,
+      "unconsumedBytes": 0,
+      "convergenceRounds": 4
+    },
+    "config": {
+      "autoCommit": false,
+      "explicitCommit": "processed-current-owned",
+      "fetchSessions": false,
+      "partitions": [
+        0,
+        1
+      ],
+      "metadataMaxAge": 5000
+    },
+    "corpus": {
+      "topic": "t",
+      "incarnations": [
+        "incarnation-a",
+        "incarnation-b"
+      ],
+      "records": [
+        {
+          "partition": 0,
+          "offset": "0",
+          "sequence": "s0"
+        },
+        {
+          "partition": 1,
+          "offset": "0",
+          "sequence": "s1"
+        }
+      ]
+    },
+    "steps": [
+      "acquire",
+      "hold",
+      "resolve",
+      "release",
+      "observe-broker",
+      "drain",
+      "close"
+    ],
+    "replay": {
+      "log": "n/a-fixed-corpus",
+      "committed": "actual-broker-observed",
+      "handler": "same-offset",
+      "interval": {
+        "from": "0",
+        "to": "1",
+        "incarnation": "incarnation-a"
+      }
+    }
+  },
+  {
+    "name": "classic-eager/membership-during-handler",
+    "faultPoint": "handler:entered",
+    "protocol": "classic-eager",
+    "feature": "held-partition",
+    "expectedWire": {
+      "afterLearnedLossOffsetCommit": 0,
+      "overlappingOwners": 0,
+      "unconsumedBytes": 0,
+      "convergenceRounds": 4
+    },
+    "config": {
+      "autoCommit": false,
+      "explicitCommit": "processed-current-owned",
+      "fetchSessions": false,
+      "partitions": [
+        0,
+        1
+      ],
+      "metadataMaxAge": 5000
+    },
+    "corpus": {
+      "topic": "t",
+      "incarnations": [
+        "incarnation-a",
+        "incarnation-b"
+      ],
+      "records": [
+        {
+          "partition": 0,
+          "offset": "0",
+          "sequence": "s0"
+        },
+        {
+          "partition": 1,
+          "offset": "0",
+          "sequence": "s1"
+        }
+      ]
+    },
+    "steps": [
+      "acquire",
+      "hold",
+      "loss",
+      "release",
+      "observe-broker",
+      "drain",
+      "close"
+    ],
+    "replay": {
+      "log": "n/a-fixed-corpus",
+      "committed": "actual-broker-observed",
+      "handler": "crash",
+      "interval": {
+        "from": "0",
+        "to": "1",
+        "incarnation": "incarnation-a"
+      }
+    }
+  },
+  {
+    "name": "classic-eager/epoch-during-handler",
+    "faultPoint": "handler:entered",
+    "protocol": "classic-eager",
+    "feature": "hook",
+    "expectedWire": {
+      "afterLearnedLossOffsetCommit": 0,
+      "overlappingOwners": 0,
+      "unconsumedBytes": 0,
+      "convergenceRounds": 4
+    },
+    "config": {
+      "autoCommit": false,
+      "explicitCommit": "processed-current-owned",
+      "fetchSessions": false,
+      "partitions": [
+        0,
+        1
+      ],
+      "metadataMaxAge": 5000
+    },
+    "corpus": {
+      "topic": "t",
+      "incarnations": [
+        "incarnation-a",
+        "incarnation-b"
+      ],
+      "records": [
+        {
+          "partition": 0,
+          "offset": "0",
+          "sequence": "s0"
+        },
+        {
+          "partition": 1,
+          "offset": "0",
+          "sequence": "s1"
+        }
+      ]
+    },
+    "steps": [
+      "acquire",
+      "hold",
+      "epoch",
+      "release",
+      "observe-broker",
+      "drain",
+      "close"
+    ],
+    "replay": {
+      "log": "n/a-fixed-corpus",
+      "committed": "actual-broker-observed",
+      "handler": "none",
+      "interval": null
+    }
+  },
+  {
+    "name": "classic-eager/reconnect-mid-fetch",
+    "faultPoint": "Fetch:answer",
+    "protocol": "classic-eager",
+    "feature": "session",
+    "expectedWire": {
+      "afterLearnedLossOffsetCommit": 0,
+      "overlappingOwners": 0,
+      "unconsumedBytes": 0,
+      "convergenceRounds": 4
+    },
+    "config": {
+      "autoCommit": false,
+      "explicitCommit": "processed-current-owned",
+      "fetchSessions": true,
+      "partitions": [
+        0,
+        1
+      ],
+      "metadataMaxAge": 5000
+    },
+    "corpus": {
+      "topic": "t",
+      "incarnations": [
+        "incarnation-a",
+        "incarnation-b"
+      ],
+      "records": [
+        {
+          "partition": 0,
+          "offset": "0",
+          "sequence": "s0"
+        },
+        {
+          "partition": 1,
+          "offset": "0",
+          "sequence": "s1"
+        }
+      ]
+    },
+    "steps": [
+      "acquire",
+      "hold",
+      "reconnect",
+      "release",
+      "observe-broker",
+      "drain",
+      "close"
+    ],
+    "replay": {
+      "log": "n/a-fixed-corpus",
+      "committed": "actual-broker-observed",
+      "handler": "crash",
+      "interval": {
+        "from": "0",
+        "to": "1",
+        "incarnation": "incarnation-a"
+      }
+    }
+  },
+  {
+    "name": "classic-eager/recreate-mid-fetch",
+    "faultPoint": "Fetch:answer",
+    "protocol": "classic-eager",
+    "feature": "session",
+    "expectedWire": {
+      "afterLearnedLossOffsetCommit": 0,
+      "overlappingOwners": 0,
+      "unconsumedBytes": 0,
+      "convergenceRounds": 4
+    },
+    "config": {
+      "autoCommit": false,
+      "explicitCommit": "processed-current-owned",
+      "fetchSessions": true,
+      "partitions": [
+        0,
+        1
+      ],
+      "metadataMaxAge": 5000
+    },
+    "corpus": {
+      "topic": "t",
+      "incarnations": [
+        "incarnation-a",
+        "incarnation-b"
+      ],
+      "records": [
+        {
+          "partition": 0,
+          "offset": "0",
+          "sequence": "s0"
+        },
+        {
+          "partition": 1,
+          "offset": "0",
+          "sequence": "s1"
+        }
+      ]
+    },
+    "steps": [
+      "acquire",
+      "hold",
+      "recreate",
+      "release",
+      "observe-broker",
+      "drain",
+      "close"
+    ],
+    "replay": {
+      "log": "n/a-fixed-corpus",
+      "committed": "actual-broker-observed",
+      "handler": "reset",
+      "interval": {
+        "from": "0",
+        "to": "1",
+        "incarnation": "incarnation-a"
+      }
+    }
+  },
+  {
+    "name": "classic-eager/recreate-mid-discovery",
+    "faultPoint": "Metadata:answer",
+    "protocol": "classic-eager",
+    "feature": "discovery",
+    "expectedWire": {
+      "afterLearnedLossOffsetCommit": 0,
+      "overlappingOwners": 0,
+      "unconsumedBytes": 0,
+      "convergenceRounds": 4
+    },
+    "config": {
+      "autoCommit": false,
+      "explicitCommit": "processed-current-owned",
+      "fetchSessions": false,
+      "partitions": [
+        0,
+        1
+      ],
+      "metadataMaxAge": 5000
+    },
+    "corpus": {
+      "topic": "t",
+      "incarnations": [
+        "incarnation-a",
+        "incarnation-b"
+      ],
+      "records": [
+        {
+          "partition": 0,
+          "offset": "0",
+          "sequence": "s0"
+        },
+        {
+          "partition": 1,
+          "offset": "0",
+          "sequence": "s1"
+        }
+      ]
+    },
+    "steps": [
+      "acquire",
+      "hold",
+      "recreate",
+      "release",
+      "observe-broker",
+      "drain",
+      "close"
+    ],
+    "replay": {
+      "log": "n/a-fixed-corpus",
+      "committed": "actual-broker-observed",
+      "handler": "reset",
+      "interval": {
+        "from": "0",
+        "to": "1",
+        "incarnation": "incarnation-a"
+      }
+    }
+  },
+  {
+    "name": "classic-eager/rebalance-during-hook",
+    "faultPoint": "hook:assigned",
+    "protocol": "classic-eager",
+    "feature": "hook",
+    "expectedWire": {
+      "afterLearnedLossOffsetCommit": 0,
+      "overlappingOwners": 0,
+      "unconsumedBytes": 0,
+      "convergenceRounds": 4
+    },
+    "config": {
+      "autoCommit": false,
+      "explicitCommit": "processed-current-owned",
+      "fetchSessions": false,
+      "partitions": [
+        0,
+        1
+      ],
+      "metadataMaxAge": 5000
+    },
+    "corpus": {
+      "topic": "t",
+      "incarnations": [
+        "incarnation-a",
+        "incarnation-b"
+      ],
+      "records": [
+        {
+          "partition": 0,
+          "offset": "0",
+          "sequence": "s0"
+        },
+        {
+          "partition": 1,
+          "offset": "0",
+          "sequence": "s1"
+        }
+      ]
+    },
+    "steps": [
+      "acquire",
+      "hold",
+      "rebalance",
+      "release",
+      "observe-broker",
+      "drain",
+      "close"
+    ],
+    "replay": {
+      "log": "n/a-fixed-corpus",
+      "committed": "actual-broker-observed",
+      "handler": "none",
+      "interval": null
+    }
+  },
+  {
+    "name": "classic-eager/stop-during-round",
+    "faultPoint": "SyncGroup:answer",
+    "protocol": "classic-eager",
+    "feature": "hook",
+    "expectedWire": {
+      "afterLearnedLossOffsetCommit": 0,
+      "overlappingOwners": 0,
+      "unconsumedBytes": 0,
+      "convergenceRounds": 4
+    },
+    "config": {
+      "autoCommit": false,
+      "explicitCommit": "processed-current-owned",
+      "fetchSessions": false,
+      "partitions": [
+        0,
+        1
+      ],
+      "metadataMaxAge": 5000
+    },
+    "corpus": {
+      "topic": "t",
+      "incarnations": [
+        "incarnation-a",
+        "incarnation-b"
+      ],
+      "records": [
+        {
+          "partition": 0,
+          "offset": "0",
+          "sequence": "s0"
+        },
+        {
+          "partition": 1,
+          "offset": "0",
+          "sequence": "s1"
+        }
+      ]
+    },
+    "steps": [
+      "acquire",
+      "hold",
+      "stop",
+      "release",
+      "observe-broker",
+      "drain",
+      "close"
+    ],
+    "replay": {
+      "log": "n/a-fixed-corpus",
+      "committed": "actual-broker-observed",
+      "handler": "none",
+      "interval": null
+    }
+  },
+  {
+    "name": "classic-eager/wake-races-stop",
+    "faultPoint": "idle:registered",
+    "protocol": "classic-eager",
+    "feature": "idle-wake",
+    "expectedWire": {
+      "afterLearnedLossOffsetCommit": 0,
+      "overlappingOwners": 0,
+      "unconsumedBytes": 0,
+      "convergenceRounds": 4
+    },
+    "config": {
+      "autoCommit": false,
+      "explicitCommit": "processed-current-owned",
+      "fetchSessions": false,
+      "partitions": [
+        0,
+        1
+      ],
+      "metadataMaxAge": 5000
+    },
+    "corpus": {
+      "topic": "t",
+      "incarnations": [
+        "incarnation-a",
+        "incarnation-b"
+      ],
+      "records": [
+        {
+          "partition": 0,
+          "offset": "0",
+          "sequence": "s0"
+        },
+        {
+          "partition": 1,
+          "offset": "0",
+          "sequence": "s1"
+        }
+      ]
+    },
+    "steps": [
+      "acquire",
+      "hold",
+      "wake-stop",
+      "release",
+      "observe-broker",
+      "drain",
+      "close"
+    ],
+    "replay": {
+      "log": "n/a-fixed-corpus",
+      "committed": "actual-broker-observed",
+      "handler": "none",
+      "interval": null
+    }
+  },
+  {
+    "name": "classic-cooperative/reset-seek-commit-resolution",
+    "faultPoint": "OffsetFetch:answer",
+    "protocol": "classic-cooperative",
+    "feature": "offset-overlap",
+    "expectedWire": {
+      "afterLearnedLossOffsetCommit": 0,
+      "overlappingOwners": 0,
+      "unconsumedBytes": 0,
+      "convergenceRounds": 4
+    },
+    "config": {
+      "autoCommit": false,
+      "explicitCommit": "processed-current-owned",
+      "fetchSessions": false,
+      "partitions": [
+        0,
+        1
+      ],
+      "metadataMaxAge": 5000
+    },
+    "corpus": {
+      "topic": "t",
+      "incarnations": [
+        "incarnation-a",
+        "incarnation-b"
+      ],
+      "records": [
+        {
+          "partition": 0,
+          "offset": "0",
+          "sequence": "s0"
+        },
+        {
+          "partition": 1,
+          "offset": "0",
+          "sequence": "s1"
+        }
+      ]
+    },
+    "steps": [
+      "acquire",
+      "hold",
+      "resolve",
+      "release",
+      "observe-broker",
+      "drain",
+      "close"
+    ],
+    "replay": {
+      "log": "n/a-fixed-corpus",
+      "committed": "actual-broker-observed",
+      "handler": "same-offset",
+      "interval": {
+        "from": "0",
+        "to": "1",
+        "incarnation": "incarnation-a"
+      }
+    }
+  },
+  {
+    "name": "classic-cooperative/membership-during-handler",
+    "faultPoint": "handler:entered",
+    "protocol": "classic-cooperative",
+    "feature": "held-partition",
+    "expectedWire": {
+      "afterLearnedLossOffsetCommit": 0,
+      "overlappingOwners": 0,
+      "unconsumedBytes": 0,
+      "convergenceRounds": 4
+    },
+    "config": {
+      "autoCommit": false,
+      "explicitCommit": "processed-current-owned",
+      "fetchSessions": false,
+      "partitions": [
+        0,
+        1
+      ],
+      "metadataMaxAge": 5000
+    },
+    "corpus": {
+      "topic": "t",
+      "incarnations": [
+        "incarnation-a",
+        "incarnation-b"
+      ],
+      "records": [
+        {
+          "partition": 0,
+          "offset": "0",
+          "sequence": "s0"
+        },
+        {
+          "partition": 1,
+          "offset": "0",
+          "sequence": "s1"
+        }
+      ]
+    },
+    "steps": [
+      "acquire",
+      "hold",
+      "loss",
+      "release",
+      "observe-broker",
+      "drain",
+      "close"
+    ],
+    "replay": {
+      "log": "n/a-fixed-corpus",
+      "committed": "actual-broker-observed",
+      "handler": "crash",
+      "interval": {
+        "from": "0",
+        "to": "1",
+        "incarnation": "incarnation-a"
+      }
+    }
+  },
+  {
+    "name": "classic-cooperative/epoch-during-handler",
+    "faultPoint": "handler:entered",
+    "protocol": "classic-cooperative",
+    "feature": "hook",
+    "expectedWire": {
+      "afterLearnedLossOffsetCommit": 0,
+      "overlappingOwners": 0,
+      "unconsumedBytes": 0,
+      "convergenceRounds": 4
+    },
+    "config": {
+      "autoCommit": false,
+      "explicitCommit": "processed-current-owned",
+      "fetchSessions": false,
+      "partitions": [
+        0,
+        1
+      ],
+      "metadataMaxAge": 5000
+    },
+    "corpus": {
+      "topic": "t",
+      "incarnations": [
+        "incarnation-a",
+        "incarnation-b"
+      ],
+      "records": [
+        {
+          "partition": 0,
+          "offset": "0",
+          "sequence": "s0"
+        },
+        {
+          "partition": 1,
+          "offset": "0",
+          "sequence": "s1"
+        }
+      ]
+    },
+    "steps": [
+      "acquire",
+      "hold",
+      "epoch",
+      "release",
+      "observe-broker",
+      "drain",
+      "close"
+    ],
+    "replay": {
+      "log": "n/a-fixed-corpus",
+      "committed": "actual-broker-observed",
+      "handler": "none",
+      "interval": null
+    }
+  },
+  {
+    "name": "classic-cooperative/reconnect-mid-fetch",
+    "faultPoint": "Fetch:answer",
+    "protocol": "classic-cooperative",
+    "feature": "session",
+    "expectedWire": {
+      "afterLearnedLossOffsetCommit": 0,
+      "overlappingOwners": 0,
+      "unconsumedBytes": 0,
+      "convergenceRounds": 4
+    },
+    "config": {
+      "autoCommit": false,
+      "explicitCommit": "processed-current-owned",
+      "fetchSessions": true,
+      "partitions": [
+        0,
+        1
+      ],
+      "metadataMaxAge": 5000
+    },
+    "corpus": {
+      "topic": "t",
+      "incarnations": [
+        "incarnation-a",
+        "incarnation-b"
+      ],
+      "records": [
+        {
+          "partition": 0,
+          "offset": "0",
+          "sequence": "s0"
+        },
+        {
+          "partition": 1,
+          "offset": "0",
+          "sequence": "s1"
+        }
+      ]
+    },
+    "steps": [
+      "acquire",
+      "hold",
+      "reconnect",
+      "release",
+      "observe-broker",
+      "drain",
+      "close"
+    ],
+    "replay": {
+      "log": "n/a-fixed-corpus",
+      "committed": "actual-broker-observed",
+      "handler": "crash",
+      "interval": {
+        "from": "0",
+        "to": "1",
+        "incarnation": "incarnation-a"
+      }
+    }
+  },
+  {
+    "name": "classic-cooperative/recreate-mid-fetch",
+    "faultPoint": "Fetch:answer",
+    "protocol": "classic-cooperative",
+    "feature": "session",
+    "expectedWire": {
+      "afterLearnedLossOffsetCommit": 0,
+      "overlappingOwners": 0,
+      "unconsumedBytes": 0,
+      "convergenceRounds": 4
+    },
+    "config": {
+      "autoCommit": false,
+      "explicitCommit": "processed-current-owned",
+      "fetchSessions": true,
+      "partitions": [
+        0,
+        1
+      ],
+      "metadataMaxAge": 5000
+    },
+    "corpus": {
+      "topic": "t",
+      "incarnations": [
+        "incarnation-a",
+        "incarnation-b"
+      ],
+      "records": [
+        {
+          "partition": 0,
+          "offset": "0",
+          "sequence": "s0"
+        },
+        {
+          "partition": 1,
+          "offset": "0",
+          "sequence": "s1"
+        }
+      ]
+    },
+    "steps": [
+      "acquire",
+      "hold",
+      "recreate",
+      "release",
+      "observe-broker",
+      "drain",
+      "close"
+    ],
+    "replay": {
+      "log": "n/a-fixed-corpus",
+      "committed": "actual-broker-observed",
+      "handler": "reset",
+      "interval": {
+        "from": "0",
+        "to": "1",
+        "incarnation": "incarnation-a"
+      }
+    }
+  },
+  {
+    "name": "classic-cooperative/recreate-mid-discovery",
+    "faultPoint": "Metadata:answer",
+    "protocol": "classic-cooperative",
+    "feature": "discovery",
+    "expectedWire": {
+      "afterLearnedLossOffsetCommit": 0,
+      "overlappingOwners": 0,
+      "unconsumedBytes": 0,
+      "convergenceRounds": 4
+    },
+    "config": {
+      "autoCommit": false,
+      "explicitCommit": "processed-current-owned",
+      "fetchSessions": false,
+      "partitions": [
+        0,
+        1
+      ],
+      "metadataMaxAge": 5000
+    },
+    "corpus": {
+      "topic": "t",
+      "incarnations": [
+        "incarnation-a",
+        "incarnation-b"
+      ],
+      "records": [
+        {
+          "partition": 0,
+          "offset": "0",
+          "sequence": "s0"
+        },
+        {
+          "partition": 1,
+          "offset": "0",
+          "sequence": "s1"
+        }
+      ]
+    },
+    "steps": [
+      "acquire",
+      "hold",
+      "recreate",
+      "release",
+      "observe-broker",
+      "drain",
+      "close"
+    ],
+    "replay": {
+      "log": "n/a-fixed-corpus",
+      "committed": "actual-broker-observed",
+      "handler": "reset",
+      "interval": {
+        "from": "0",
+        "to": "1",
+        "incarnation": "incarnation-a"
+      }
+    }
+  },
+  {
+    "name": "classic-cooperative/rebalance-during-hook",
+    "faultPoint": "hook:assigned",
+    "protocol": "classic-cooperative",
+    "feature": "hook",
+    "expectedWire": {
+      "afterLearnedLossOffsetCommit": 0,
+      "overlappingOwners": 0,
+      "unconsumedBytes": 0,
+      "convergenceRounds": 4
+    },
+    "config": {
+      "autoCommit": false,
+      "explicitCommit": "processed-current-owned",
+      "fetchSessions": false,
+      "partitions": [
+        0,
+        1
+      ],
+      "metadataMaxAge": 5000
+    },
+    "corpus": {
+      "topic": "t",
+      "incarnations": [
+        "incarnation-a",
+        "incarnation-b"
+      ],
+      "records": [
+        {
+          "partition": 0,
+          "offset": "0",
+          "sequence": "s0"
+        },
+        {
+          "partition": 1,
+          "offset": "0",
+          "sequence": "s1"
+        }
+      ]
+    },
+    "steps": [
+      "acquire",
+      "hold",
+      "rebalance",
+      "release",
+      "observe-broker",
+      "drain",
+      "close"
+    ],
+    "replay": {
+      "log": "n/a-fixed-corpus",
+      "committed": "actual-broker-observed",
+      "handler": "none",
+      "interval": null
+    }
+  },
+  {
+    "name": "classic-cooperative/stop-during-round",
+    "faultPoint": "SyncGroup:answer",
+    "protocol": "classic-cooperative",
+    "feature": "hook",
+    "expectedWire": {
+      "afterLearnedLossOffsetCommit": 0,
+      "overlappingOwners": 0,
+      "unconsumedBytes": 0,
+      "convergenceRounds": 4
+    },
+    "config": {
+      "autoCommit": false,
+      "explicitCommit": "processed-current-owned",
+      "fetchSessions": false,
+      "partitions": [
+        0,
+        1
+      ],
+      "metadataMaxAge": 5000
+    },
+    "corpus": {
+      "topic": "t",
+      "incarnations": [
+        "incarnation-a",
+        "incarnation-b"
+      ],
+      "records": [
+        {
+          "partition": 0,
+          "offset": "0",
+          "sequence": "s0"
+        },
+        {
+          "partition": 1,
+          "offset": "0",
+          "sequence": "s1"
+        }
+      ]
+    },
+    "steps": [
+      "acquire",
+      "hold",
+      "stop",
+      "release",
+      "observe-broker",
+      "drain",
+      "close"
+    ],
+    "replay": {
+      "log": "n/a-fixed-corpus",
+      "committed": "actual-broker-observed",
+      "handler": "none",
+      "interval": null
+    }
+  },
+  {
+    "name": "classic-cooperative/wake-races-stop",
+    "faultPoint": "idle:registered",
+    "protocol": "classic-cooperative",
+    "feature": "idle-wake",
+    "expectedWire": {
+      "afterLearnedLossOffsetCommit": 0,
+      "overlappingOwners": 0,
+      "unconsumedBytes": 0,
+      "convergenceRounds": 4
+    },
+    "config": {
+      "autoCommit": false,
+      "explicitCommit": "processed-current-owned",
+      "fetchSessions": false,
+      "partitions": [
+        0,
+        1
+      ],
+      "metadataMaxAge": 5000
+    },
+    "corpus": {
+      "topic": "t",
+      "incarnations": [
+        "incarnation-a",
+        "incarnation-b"
+      ],
+      "records": [
+        {
+          "partition": 0,
+          "offset": "0",
+          "sequence": "s0"
+        },
+        {
+          "partition": 1,
+          "offset": "0",
+          "sequence": "s1"
+        }
+      ]
+    },
+    "steps": [
+      "acquire",
+      "hold",
+      "wake-stop",
+      "release",
+      "observe-broker",
+      "drain",
+      "close"
+    ],
+    "replay": {
+      "log": "n/a-fixed-corpus",
+      "committed": "actual-broker-observed",
+      "handler": "none",
+      "interval": null
+    }
+  },
+  {
+    "name": "consumer/reset-seek-commit-resolution",
+    "faultPoint": "OffsetFetch:answer",
+    "protocol": "consumer",
+    "feature": "offset-overlap",
+    "expectedWire": {
+      "afterLearnedLossOffsetCommit": 0,
+      "overlappingOwners": 0,
+      "unconsumedBytes": 0,
+      "convergenceRounds": 6
+    },
+    "config": {
+      "autoCommit": false,
+      "explicitCommit": "processed-current-owned",
+      "fetchSessions": false,
+      "partitions": [
+        0,
+        1
+      ],
+      "metadataMaxAge": 5000
+    },
+    "corpus": {
+      "topic": "t",
+      "incarnations": [
+        "incarnation-a",
+        "incarnation-b"
+      ],
+      "records": [
+        {
+          "partition": 0,
+          "offset": "0",
+          "sequence": "s0"
+        },
+        {
+          "partition": 1,
+          "offset": "0",
+          "sequence": "s1"
+        }
+      ]
+    },
+    "steps": [
+      "acquire",
+      "hold",
+      "resolve",
+      "release",
+      "observe-broker",
+      "drain",
+      "close"
+    ],
+    "replay": {
+      "log": "n/a-fixed-corpus",
+      "committed": "actual-broker-observed",
+      "handler": "same-offset",
+      "interval": {
+        "from": "0",
+        "to": "1",
+        "incarnation": "incarnation-a"
+      }
+    }
+  },
+  {
+    "name": "consumer/membership-during-handler",
+    "faultPoint": "handler:entered",
+    "protocol": "consumer",
+    "feature": "held-partition",
+    "expectedWire": {
+      "afterLearnedLossOffsetCommit": 0,
+      "overlappingOwners": 0,
+      "unconsumedBytes": 0,
+      "convergenceRounds": 6
+    },
+    "config": {
+      "autoCommit": false,
+      "explicitCommit": "processed-current-owned",
+      "fetchSessions": false,
+      "partitions": [
+        0,
+        1
+      ],
+      "metadataMaxAge": 5000
+    },
+    "corpus": {
+      "topic": "t",
+      "incarnations": [
+        "incarnation-a",
+        "incarnation-b"
+      ],
+      "records": [
+        {
+          "partition": 0,
+          "offset": "0",
+          "sequence": "s0"
+        },
+        {
+          "partition": 1,
+          "offset": "0",
+          "sequence": "s1"
+        }
+      ]
+    },
+    "steps": [
+      "acquire",
+      "hold",
+      "loss",
+      "release",
+      "observe-broker",
+      "drain",
+      "close"
+    ],
+    "replay": {
+      "log": "n/a-fixed-corpus",
+      "committed": "actual-broker-observed",
+      "handler": "crash",
+      "interval": {
+        "from": "0",
+        "to": "1",
+        "incarnation": "incarnation-a"
+      }
+    }
+  },
+  {
+    "name": "consumer/epoch-during-handler",
+    "faultPoint": "handler:entered",
+    "protocol": "consumer",
+    "feature": "hook",
+    "expectedWire": {
+      "afterLearnedLossOffsetCommit": 0,
+      "overlappingOwners": 0,
+      "unconsumedBytes": 0,
+      "convergenceRounds": 6
+    },
+    "config": {
+      "autoCommit": false,
+      "explicitCommit": "processed-current-owned",
+      "fetchSessions": false,
+      "partitions": [
+        0,
+        1
+      ],
+      "metadataMaxAge": 5000
+    },
+    "corpus": {
+      "topic": "t",
+      "incarnations": [
+        "incarnation-a",
+        "incarnation-b"
+      ],
+      "records": [
+        {
+          "partition": 0,
+          "offset": "0",
+          "sequence": "s0"
+        },
+        {
+          "partition": 1,
+          "offset": "0",
+          "sequence": "s1"
+        }
+      ]
+    },
+    "steps": [
+      "acquire",
+      "hold",
+      "epoch",
+      "release",
+      "observe-broker",
+      "drain",
+      "close"
+    ],
+    "replay": {
+      "log": "n/a-fixed-corpus",
+      "committed": "actual-broker-observed",
+      "handler": "none",
+      "interval": null
+    }
+  },
+  {
+    "name": "consumer/reconnect-mid-fetch",
+    "faultPoint": "Fetch:answer",
+    "protocol": "consumer",
+    "feature": "session",
+    "expectedWire": {
+      "afterLearnedLossOffsetCommit": 0,
+      "overlappingOwners": 0,
+      "unconsumedBytes": 0,
+      "convergenceRounds": 6
+    },
+    "config": {
+      "autoCommit": false,
+      "explicitCommit": "processed-current-owned",
+      "fetchSessions": true,
+      "partitions": [
+        0,
+        1
+      ],
+      "metadataMaxAge": 5000
+    },
+    "corpus": {
+      "topic": "t",
+      "incarnations": [
+        "incarnation-a",
+        "incarnation-b"
+      ],
+      "records": [
+        {
+          "partition": 0,
+          "offset": "0",
+          "sequence": "s0"
+        },
+        {
+          "partition": 1,
+          "offset": "0",
+          "sequence": "s1"
+        }
+      ]
+    },
+    "steps": [
+      "acquire",
+      "hold",
+      "reconnect",
+      "release",
+      "observe-broker",
+      "drain",
+      "close"
+    ],
+    "replay": {
+      "log": "n/a-fixed-corpus",
+      "committed": "actual-broker-observed",
+      "handler": "crash",
+      "interval": {
+        "from": "0",
+        "to": "1",
+        "incarnation": "incarnation-a"
+      }
+    }
+  },
+  {
+    "name": "consumer/recreate-mid-fetch",
+    "faultPoint": "Fetch:answer",
+    "protocol": "consumer",
+    "feature": "session",
+    "expectedWire": {
+      "afterLearnedLossOffsetCommit": 0,
+      "overlappingOwners": 0,
+      "unconsumedBytes": 0,
+      "convergenceRounds": 6
+    },
+    "config": {
+      "autoCommit": false,
+      "explicitCommit": "processed-current-owned",
+      "fetchSessions": true,
+      "partitions": [
+        0,
+        1
+      ],
+      "metadataMaxAge": 5000
+    },
+    "corpus": {
+      "topic": "t",
+      "incarnations": [
+        "incarnation-a",
+        "incarnation-b"
+      ],
+      "records": [
+        {
+          "partition": 0,
+          "offset": "0",
+          "sequence": "s0"
+        },
+        {
+          "partition": 1,
+          "offset": "0",
+          "sequence": "s1"
+        }
+      ]
+    },
+    "steps": [
+      "acquire",
+      "hold",
+      "recreate",
+      "release",
+      "observe-broker",
+      "drain",
+      "close"
+    ],
+    "replay": {
+      "log": "n/a-fixed-corpus",
+      "committed": "actual-broker-observed",
+      "handler": "reset",
+      "interval": {
+        "from": "0",
+        "to": "1",
+        "incarnation": "incarnation-a"
+      }
+    }
+  },
+  {
+    "name": "consumer/recreate-mid-discovery",
+    "faultPoint": "Metadata:answer",
+    "protocol": "consumer",
+    "feature": "discovery",
+    "expectedWire": {
+      "afterLearnedLossOffsetCommit": 0,
+      "overlappingOwners": 0,
+      "unconsumedBytes": 0,
+      "convergenceRounds": 6
+    },
+    "config": {
+      "autoCommit": false,
+      "explicitCommit": "processed-current-owned",
+      "fetchSessions": false,
+      "partitions": [
+        0,
+        1
+      ],
+      "metadataMaxAge": 5000
+    },
+    "corpus": {
+      "topic": "t",
+      "incarnations": [
+        "incarnation-a",
+        "incarnation-b"
+      ],
+      "records": [
+        {
+          "partition": 0,
+          "offset": "0",
+          "sequence": "s0"
+        },
+        {
+          "partition": 1,
+          "offset": "0",
+          "sequence": "s1"
+        }
+      ]
+    },
+    "steps": [
+      "acquire",
+      "hold",
+      "recreate",
+      "release",
+      "observe-broker",
+      "drain",
+      "close"
+    ],
+    "replay": {
+      "log": "n/a-fixed-corpus",
+      "committed": "actual-broker-observed",
+      "handler": "reset",
+      "interval": {
+        "from": "0",
+        "to": "1",
+        "incarnation": "incarnation-a"
+      }
+    }
+  },
+  {
+    "name": "consumer/rebalance-during-hook",
+    "faultPoint": "hook:assigned",
+    "protocol": "consumer",
+    "feature": "hook",
+    "expectedWire": {
+      "afterLearnedLossOffsetCommit": 0,
+      "overlappingOwners": 0,
+      "unconsumedBytes": 0,
+      "convergenceRounds": 6
+    },
+    "config": {
+      "autoCommit": false,
+      "explicitCommit": "processed-current-owned",
+      "fetchSessions": false,
+      "partitions": [
+        0,
+        1
+      ],
+      "metadataMaxAge": 5000
+    },
+    "corpus": {
+      "topic": "t",
+      "incarnations": [
+        "incarnation-a",
+        "incarnation-b"
+      ],
+      "records": [
+        {
+          "partition": 0,
+          "offset": "0",
+          "sequence": "s0"
+        },
+        {
+          "partition": 1,
+          "offset": "0",
+          "sequence": "s1"
+        }
+      ]
+    },
+    "steps": [
+      "acquire",
+      "hold",
+      "rebalance",
+      "release",
+      "observe-broker",
+      "drain",
+      "close"
+    ],
+    "replay": {
+      "log": "n/a-fixed-corpus",
+      "committed": "actual-broker-observed",
+      "handler": "none",
+      "interval": null
+    }
+  },
+  {
+    "name": "consumer/stop-during-round",
+    "faultPoint": "ConsumerGroupHeartbeat:answer",
+    "protocol": "consumer",
+    "feature": "hook",
+    "expectedWire": {
+      "afterLearnedLossOffsetCommit": 0,
+      "overlappingOwners": 0,
+      "unconsumedBytes": 0,
+      "convergenceRounds": 6
+    },
+    "config": {
+      "autoCommit": false,
+      "explicitCommit": "processed-current-owned",
+      "fetchSessions": false,
+      "partitions": [
+        0,
+        1
+      ],
+      "metadataMaxAge": 5000
+    },
+    "corpus": {
+      "topic": "t",
+      "incarnations": [
+        "incarnation-a",
+        "incarnation-b"
+      ],
+      "records": [
+        {
+          "partition": 0,
+          "offset": "0",
+          "sequence": "s0"
+        },
+        {
+          "partition": 1,
+          "offset": "0",
+          "sequence": "s1"
+        }
+      ]
+    },
+    "steps": [
+      "acquire",
+      "hold",
+      "stop",
+      "release",
+      "observe-broker",
+      "drain",
+      "close"
+    ],
+    "replay": {
+      "log": "n/a-fixed-corpus",
+      "committed": "actual-broker-observed",
+      "handler": "none",
+      "interval": null
+    }
+  },
+  {
+    "name": "consumer/wake-races-stop",
+    "faultPoint": "idle:registered",
+    "protocol": "consumer",
+    "feature": "idle-wake",
+    "expectedWire": {
+      "afterLearnedLossOffsetCommit": 0,
+      "overlappingOwners": 0,
+      "unconsumedBytes": 0,
+      "convergenceRounds": 6
+    },
+    "config": {
+      "autoCommit": false,
+      "explicitCommit": "processed-current-owned",
+      "fetchSessions": false,
+      "partitions": [
+        0,
+        1
+      ],
+      "metadataMaxAge": 5000
+    },
+    "corpus": {
+      "topic": "t",
+      "incarnations": [
+        "incarnation-a",
+        "incarnation-b"
+      ],
+      "records": [
+        {
+          "partition": 0,
+          "offset": "0",
+          "sequence": "s0"
+        },
+        {
+          "partition": 1,
+          "offset": "0",
+          "sequence": "s1"
+        }
+      ]
+    },
+    "steps": [
+      "acquire",
+      "hold",
+      "wake-stop",
+      "release",
+      "observe-broker",
+      "drain",
+      "close"
+    ],
+    "replay": {
+      "log": "n/a-fixed-corpus",
+      "committed": "actual-broker-observed",
+      "handler": "none",
+      "interval": null
+    }
+  },
+  {
+    "name": "manual/offset-overlap",
+    "faultPoint": "OffsetFetch:answer",
+    "protocol": "manual",
+    "feature": "offset-overlap",
+    "expectedWire": {
+      "JoinGroup": 0,
+      "SyncGroup": 0,
+      "Heartbeat": 0,
+      "ConsumerGroupHeartbeat": 0,
+      "LeaveGroup": 0,
+      "afterLearnedLossOffsetCommit": 0,
+      "unconsumedBytes": 0
+    },
+    "config": {
+      "autoCommit": false,
+      "explicitCommit": "processed-current-owned",
+      "groupId": "manual-offsets",
+      "fetchSessions": false,
+      "partitions": [
+        0,
+        1
+      ]
+    },
+    "corpus": {
+      "topic": "t",
+      "incarnations": [
+        "incarnation-a",
+        "incarnation-b"
+      ],
+      "records": [
+        {
+          "partition": 0,
+          "offset": "0",
+          "sequence": "s0"
+        },
+        {
+          "partition": 1,
+          "offset": "0",
+          "sequence": "s1"
+        }
+      ]
+    },
+    "steps": [
+      "assign",
+      "hold",
+      "seek",
+      "release",
+      "observe-broker",
+      "drain",
+      "close"
+    ],
+    "replay": {
+      "log": "n/a-fixed-corpus",
+      "committed": "actual-broker-observed",
+      "handler": "none",
+      "interval": null
+    }
+  },
+  {
+    "name": "manual/session",
+    "faultPoint": "Fetch:answer",
+    "protocol": "manual",
+    "feature": "session",
+    "expectedWire": {
+      "JoinGroup": 0,
+      "SyncGroup": 0,
+      "Heartbeat": 0,
+      "ConsumerGroupHeartbeat": 0,
+      "LeaveGroup": 0,
+      "afterLearnedLossOffsetCommit": 0,
+      "unconsumedBytes": 0
+    },
+    "config": {
+      "autoCommit": false,
+      "explicitCommit": "processed-current-owned",
+      "groupId": "manual-offsets",
+      "fetchSessions": true,
+      "partitions": [
+        0,
+        1
+      ]
+    },
+    "corpus": {
+      "topic": "t",
+      "incarnations": [
+        "incarnation-a",
+        "incarnation-b"
+      ],
+      "records": [
+        {
+          "partition": 0,
+          "offset": "0",
+          "sequence": "s0"
+        },
+        {
+          "partition": 1,
+          "offset": "0",
+          "sequence": "s1"
+        }
+      ]
+    },
+    "steps": [
+      "assign",
+      "hold",
+      "reconnect",
+      "release",
+      "observe-broker",
+      "drain",
+      "close"
+    ],
+    "replay": {
+      "log": "n/a-fixed-corpus",
+      "committed": "actual-broker-observed",
+      "handler": "none",
+      "interval": null
+    }
+  },
+  {
+    "name": "manual/idle-wake",
+    "faultPoint": "idle:registered",
+    "protocol": "manual",
+    "feature": "idle-wake",
+    "expectedWire": {
+      "JoinGroup": 0,
+      "SyncGroup": 0,
+      "Heartbeat": 0,
+      "ConsumerGroupHeartbeat": 0,
+      "LeaveGroup": 0,
+      "afterLearnedLossOffsetCommit": 0,
+      "unconsumedBytes": 0
+    },
+    "config": {
+      "autoCommit": false,
+      "explicitCommit": "processed-current-owned",
+      "groupId": "manual-offsets",
+      "fetchSessions": false,
+      "partitions": [
+        0,
+        1
+      ]
+    },
+    "corpus": {
+      "topic": "t",
+      "incarnations": [
+        "incarnation-a",
+        "incarnation-b"
+      ],
+      "records": [
+        {
+          "partition": 0,
+          "offset": "0",
+          "sequence": "s0"
+        },
+        {
+          "partition": 1,
+          "offset": "0",
+          "sequence": "s1"
+        }
+      ]
+    },
+    "steps": [
+      "assign",
+      "hold",
+      "wake-stop",
+      "release",
+      "observe-broker",
+      "drain",
+      "close"
+    ],
+    "replay": {
+      "log": "n/a-fixed-corpus",
+      "committed": "actual-broker-observed",
+      "handler": "none",
+      "interval": null
+    }
+  },
+  {
+    "name": "manual/discovery",
+    "faultPoint": "Metadata:answer",
+    "protocol": "manual",
+    "feature": "discovery",
+    "expectedWire": {
+      "JoinGroup": 0,
+      "SyncGroup": 0,
+      "Heartbeat": 0,
+      "ConsumerGroupHeartbeat": 0,
+      "LeaveGroup": 0,
+      "afterLearnedLossOffsetCommit": 0,
+      "unconsumedBytes": 0
+    },
+    "config": {
+      "autoCommit": false,
+      "explicitCommit": "processed-current-owned",
+      "groupId": "manual-offsets",
+      "fetchSessions": false,
+      "partitions": [
+        0,
+        1
+      ]
+    },
+    "corpus": {
+      "topic": "t",
+      "incarnations": [
+        "incarnation-a",
+        "incarnation-b"
+      ],
+      "records": [
+        {
+          "partition": 0,
+          "offset": "0",
+          "sequence": "s0"
+        },
+        {
+          "partition": 1,
+          "offset": "0",
+          "sequence": "s1"
+        }
+      ]
+    },
+    "steps": [
+      "assign",
+      "hold",
+      "recreate",
+      "release",
+      "observe-broker",
+      "drain",
+      "close"
+    ],
+    "replay": {
+      "log": "n/a-fixed-corpus",
+      "committed": "actual-broker-observed",
+      "handler": "reset",
+      "interval": null
+    }
+  }
+]

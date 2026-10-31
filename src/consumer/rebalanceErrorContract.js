@@ -304,6 +304,12 @@ const joinDeadlineError = ({ rebalanceTimeoutMs }) => {
 }
 
 /**
+ * @param {Error} error
+ * @returns {boolean} whether the error is a round's join deadline (see `joinDeadlineError`)
+ */
+const isJoinDeadline = (error) => error.type === 'JOIN_DEADLINE_EXCEEDED'
+
+/**
  * The cluster cannot speak the new group protocol: it answered UNSUPPORTED_VERSION to a heartbeat,
  * or it advertises no version of the heartbeat API at all.
  * @see https://cwiki.apache.org/confluence/display/KAFKA/KIP-848%3A+The+Next+Generation+of+the+Consumer+Rebalance+Protocol
@@ -437,6 +443,7 @@ module.exports = {
   assignmentChangedError,
   consumerStoppingError,
   joinDeadlineError,
+  isJoinDeadline,
   unsupportedConsumerProtocolError,
   stampGeneration,
   sentGeneration,

@@ -84,6 +84,7 @@ const build = ({
     // The Fetch-session seams of stop and forced retirement; the real group always has both.
     closeFetchSessions: jest.fn(async () => {}),
     retireFetchSessions: jest.fn(),
+    retireCoordinatorLookup: jest.fn(),
     startIdleWait: jest.fn(() => ({})),
     beginRebalanceRound: jest.fn(() => ({
       guard: () => null,

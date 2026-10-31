@@ -136,6 +136,10 @@ module.exports = class OffsetManager {
    *                                resolution awaits anything; it travels with a `none` refusal so
    *                                the group can tell a current answer from a stale one. Absent in
    *                                isolated managers, whose refusals then carry no context.
+   * @param {(fence?: object) => Promise<import("../../../types").Broker>} [options.findCoordinator]
+   *                                the membership's single-flight coordinator lookup, shared with
+   *                                its heartbeat, joins and other commits. Absent in isolated
+   *                                managers, which ask the cluster directly.
    * @param {import('../../../types').Logger} [options.logger] where this manager reports a stale
    *                                member epoch and why an offset fetch is re-sent. Optional and
    *                                silent by default: the consumer group is the only production
@@ -168,9 +172,12 @@ module.exports = class OffsetManager {
     isRebalancePending = null,
     markPolled = null,
     captureResetContext = null,
+    findCoordinator = (fence) =>
+      cluster.findGroupCoordinator(fence ? { groupId, fence } : { groupId }),
     logger = SILENT_LOGGER,
   }) {
     this.cluster = cluster
+    this.findCoordinator = findCoordinator
     this.coordinator = coordinator
 
     // memberAssignment format:
@@ -391,11 +398,7 @@ module.exports = class OffsetManager {
     if (!this.coordinator?.isConnected()) {
       // findBroker() would resolve the same (stale) node after a failover; ask the cluster
       // which broker currently owns the group instead. Upstream PR #1779.
-      const coordinator = await this.cluster.findGroupCoordinator(
-        preparation
-          ? { groupId: this.groupId, fence: preparation.fence }
-          : { groupId: this.groupId }
-      )
+      const coordinator = await this.findCoordinator(preparation?.fence)
       this.refuse(preparation)
       this.coordinator = coordinator
     }
@@ -1033,7 +1036,7 @@ module.exports = class OffsetManager {
       if (isStaleCoordinator(e)) {
         try {
           await this.cluster.refreshMetadata()
-          this.coordinator = await this.cluster.findGroupCoordinator({ groupId: this.groupId })
+          this.coordinator = await this.findCoordinator()
         } catch (_) {
           // best-effort recovery, see above -- fall through to rethrow the original `e`
         }

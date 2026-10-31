@@ -294,6 +294,7 @@ const roundGroup = (cluster, extra = {}) => {
     subscriptionState: { clearPauses() {} },
     seekOffset: new Map(),
     groupMembership: { onStopRequested() {} },
+    coordinatorLookup: { releaseUnfenced() {} },
     ...extra,
   })
 }
@@ -531,7 +532,7 @@ describe('leader union over the real transport', () => {
       await settled(syncing(protocol, round))
 
       const [frame] = env.frames('SyncGroup')
-      expect(assignments(frame)).toEqual({ a: { A: [0] }, b: { B: [2] } })
+      expect(assignments(frame)).toEqual({ a: { A: [0] }, b: { B: [2] }, c: {} })
       expect([...env.cluster.targetTopics]).toEqual(targets)
       expect(env.cluster.findTopicPartitionMetadata('B')).toEqual([])
       round.retire()
@@ -1055,7 +1056,7 @@ describe('leader union over the real transport', () => {
         true
       )
       expect(seen.topicMetadata[0].partitionMetadata).toHaveLength(2)
-      expect(assignments(firstSyncFrame)).toEqual({ a: { A: [0] } })
+      expect(assignments(firstSyncFrame)).toEqual({ a: { A: [0] }, b: {} })
       expect(assignments(laterSyncFrame).b).toEqual({ C: [0, 1] })
       expect([...env.cluster.targetTopics]).toEqual(targets)
       second.retire()

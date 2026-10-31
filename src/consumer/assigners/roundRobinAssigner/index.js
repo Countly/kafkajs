@@ -43,7 +43,7 @@ module.exports = ({ cluster }) => ({
    *                       },
    *                     }
    *                   ]
-   *   A member that is dealt nothing is left out.
+   *   Every member receives a valid assignment, including members with no partition.
    * @param {string[]} [group.groupTopics] sorted union; own topics stays unchanged
    * @param {ReadonlyMap<string, object[]>} [group.groupTopicMetadata] authoritative when present
    */
@@ -61,7 +61,9 @@ module.exports = ({ cluster }) => ({
       const subscribed = subscriptions.get(memberId)
       return subscribed === null || subscribed.has(topic)
     }
-    const assignment = {}
+    const assignment = Object.fromEntries(
+      sortedMembers.map((memberId) => [memberId, Object.create(null)])
+    )
     let cursor = 0
 
     for (const topic of groupTopics ?? topics) {

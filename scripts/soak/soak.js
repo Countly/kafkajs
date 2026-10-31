@@ -6,7 +6,7 @@
  * every 30 s, and checks the readings against the bounds of `bounds.js`.
  *
  * Usage: node --expose-gc scripts/soak/soak.js --profile
- *          <idle|member-churn|regex-topic-churn|outage|first-run|producer-churn>
+ *          <idle|member-churn|regex-topic-churn|outage|first-run|producer-churn|consumer-churn>
  *          [--phase-seconds <n>]
  *   (= npm run test:kafka -- "node --expose-gc scripts/soak/soak.js --profile first-run" for the
  *   15-minute run, `npm run soak:first-run`)
@@ -26,6 +26,10 @@
  *   first-run         5 minutes of idle, of member churn and of outage, the 15-minute screen
  *   producer-churn    5 minutes each of steady production, rolling broker restarts and buffer
  *                     pressure from one idempotent producer; see `ProducerChurn`
+ *   consumer-churn    one 3-minute warm-up, then 5 minutes each of member churn, regex-topic
+ *                     churn, pause and topic recreation, and a mostly idle 1000-partition
+ *                     assignment, judged by an independent log, broker-offset and handler check;
+ *                     see `ConsumerChurnRun`
  * Every phase ends by disconnecting its clients, also when it fails; the readings that must be zero
  * are taken there.
  * `--phase-seconds n` shortens every phase to n seconds: a smoke run of the driver, not of memory.
@@ -69,6 +73,7 @@ const {
   sequenceOf,
 } = require('./churnLedger')
 const { ClosingProbe } = require('./closingProbe')
+const { ConsumerChurnOracle } = require('./consumerChurn')
 
 const PARTITIONS = 6
 const MEMBER_CHURN_MS = 15000
@@ -136,6 +141,12 @@ const PROFILES = {
     { name: 'steady', workload: 'producerSteady', ms: PHASE_MS },
     { name: 'outage', workload: 'producerOutage', ms: PHASE_MS },
     { name: 'buffer-pressure', workload: 'producerPressure', ms: PHASE_MS },
+  ],
+  'consumer-churn': [
+    { name: 'member-churn', workload: 'consumerMemberChurn', ms: PHASE_MS },
+    { name: 'regex-topics', workload: 'consumerRegexTopics', ms: PHASE_MS },
+    { name: 'pause-recreate', workload: 'consumerPauseRecreate', ms: PHASE_MS },
+    { name: 'mostly-idle', workload: 'consumerMostlyIdle', ms: PHASE_MS },
   ],
   'first-run': [
     { name: 'idle', workload: 'idle', ms: PHASE_MS },
@@ -319,6 +330,8 @@ const instrument = (
  * @property {string} topic the topic of the run
  * @property {string} groupId the consumer group of the run
  * @property {ProducerChurn} [producerChurn] the owner of the producer-churn phases
+ * @property {{ runPhase: (name: string, ms: number) => Promise<void> }} [consumerChurn] the owner of the
+ *   consumer-churn phases
  */
 
 /**
@@ -327,6 +340,21 @@ const instrument = (
  * disconnect never hides the failure of the workload, and does not stop the others.
  */
 const WORKLOADS = {
+  /**
+   * Runs one measured phase of the consumer-churn profile through its owner, which keeps the clients
+   * public and disconnects them before it returns.
+   * @param {WorkloadContext & { consumerChurn: { runPhase: Function } }} context
+   * @param {number} ms Phase duration in milliseconds.
+   * @returns {Promise<void>} Resolves once the phase's clients are drained and disconnected.
+   * @throws {Error} For workload or cleanup failure.
+   */
+  consumerMemberChurn: (context, ms) => context.consumerChurn.runPhase('member-churn', ms),
+  /** Runs the regex-topic phase of the consumer-churn profile; see `consumerMemberChurn`. */
+  consumerRegexTopics: (context, ms) => context.consumerChurn.runPhase('regex-topics', ms),
+  /** Runs the pause and recreation phase of the consumer-churn profile; see `consumerMemberChurn`. */
+  consumerPauseRecreate: (context, ms) => context.consumerChurn.runPhase('pause-recreate', ms),
+  /** Runs the mostly idle phase of the consumer-churn profile; see `consumerMemberChurn`. */
+  consumerMostlyIdle: (context, ms) => context.consumerChurn.runPhase('mostly-idle', ms),
   /**
    * Runs the steady producer phase through its owned lifecycle.
    * @param {WorkloadContext & { producerChurn: ProducerChurn }} context
@@ -2056,6 +2084,55 @@ const buildProducerChurn = ({ brokers, phaseSeconds, phases }) => {
 }
 
 /**
+ * Builds the owner of the consumer-churn profile: a public client whose sockets the probe counts,
+ * the journal on disk and the four phase workloads. Nothing here imports the client's sources or
+ * reads its private members.
+ * @param {object} options
+ * @param {string[]} options.brokers
+ * @param {number|null} options.phaseSeconds a smoke run's phase length; such a run is never acceptance
+ * @returns {import('./consumerChurnRun').ConsumerChurnRun}
+ */
+const buildConsumerChurn = ({ brokers, phaseSeconds }) => {
+  const {
+    ChurnJournal,
+    GapSampler,
+    PublicConsumerProbe,
+    consumerChurnPlan,
+    publicSocketFactory,
+  } = require('./consumerChurn')
+  const { ChurnWorkloads, ConsumerChurnRun } = require('./consumerChurnRun')
+  const v8 = require('node:v8')
+  const heap = async () => {
+    globalThis.gc()
+    await sleep(100)
+    globalThis.gc()
+    return v8.getHeapStatistics().used_heap_size
+  }
+  const probe = new PublicConsumerProbe({ heap })
+  const kafka = new Kafka({
+    clientId: 'soak-consumer-churn',
+    brokers,
+    logLevel: logLevel.NOTHING,
+    socketFactory: probe.wrap(publicSocketFactory()),
+  })
+  const file = evidencePath('consumer-churn').replace(/\.jsonl$/, '.journal')
+  fs.mkdirSync(path.dirname(file), { recursive: true })
+  const workloads = new ChurnWorkloads({ kafka, probe, tag: `cc${Date.now().toString(36)}` })
+  return new ConsumerChurnRun({
+    workloads,
+    scope: workloads.groups,
+    probe,
+    journal: new ChurnJournal({ file }),
+    record: (line) => writeEvidence('consumer-churn', line),
+    plan: consumerChurnPlan(phaseSeconds),
+    clock: REAL_CLOCK,
+    sleep,
+    gaps: new GapSampler(phaseSeconds === null ? {} : { minimum: 1 }),
+    heap,
+  })
+}
+
+/**
  * Runs a profile against the cluster `brokers` names.
  * @param {string} profile a key of `PROFILES`
  * @param {object} [options]
@@ -2065,6 +2142,8 @@ const buildProducerChurn = ({ brokers, phaseSeconds, phases }) => {
  *   driver and not of memory
  * @param {(options: object) => { run: () => Promise<{ ok: boolean }>, close: () => Promise<void> }} [options.churn=buildProducerChurn]
  *   builds the owner of the `producer-churn` profile; a spec supplies its own
+ * @param {(options: object) => { run: () => Promise<{ ok: boolean }>, close: () => Promise<void> }} [options.consumerChurn=buildConsumerChurn]
+ *   builds the owner of the `consumer-churn` profile
  * @returns {Promise<{ ok: boolean }>} the verdict: `evaluate`'s for a consumer profile, the
  *   combined verdict of `ProducerChurn` for `producer-churn`
  * @throws {Error} unless the process runs with `--expose-gc`
@@ -2075,6 +2154,7 @@ const main = async (
     brokers = ['localhost:9092', 'localhost:9095', 'localhost:9098'],
     phaseSeconds = null,
     churn = buildProducerChurn,
+    consumerChurn = buildConsumerChurn,
   } = {}
 ) => {
   if (typeof globalThis.gc !== 'function') {
@@ -2084,6 +2164,15 @@ const main = async (
   const phases = phasesOf(profile, phaseSeconds)
   if (profile === 'producer-churn') {
     const owner = churn({ brokers, phaseSeconds, phases })
+    try {
+      return await owner.run()
+    } finally {
+      await owner.close()
+    }
+  }
+
+  if (profile === 'consumer-churn') {
+    const owner = consumerChurn({ brokers, phaseSeconds, phases })
     try {
       return await owner.run()
     } finally {
@@ -2123,6 +2212,8 @@ if (require.main === module) {
 
 module.exports = {
   CHURN,
+  ConsumerChurnOracle,
+  buildConsumerChurn,
   buildProducerChurn,
   forgettingDestroyed,
   PROFILES,

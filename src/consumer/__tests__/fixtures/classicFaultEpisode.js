@@ -101,7 +101,8 @@ const answerWithCode = (api, code) => {
 class ClassicFaultEpisode {
   /**
    * @param {{api: string, fault: number|string, step: string, expectedState: string, expectedWire:
-   *   object, maxRounds: number, config: object}} row one fixture row, kept as given. The
+   *   object, maxRounds: number, config: object}} row one fixture row, kept as given; `config` may
+   *   also carry a `requestTimeout` in milliseconds. The
    *   pseudo-fault `none` runs the healthy control and `late` the stale-answer schedules whose old
    *   answer is the healthy one.
    */
@@ -199,11 +200,11 @@ class ClassicFaultEpisode {
     })
     this.baseline = await this.probe.snapshot()
 
-    const { retry, groupProtocol } = this.row.config
+    const { retry, groupProtocol, requestTimeout = REQUEST_TIMEOUT_MS } = this.row.config
     this.consumer = new Kafka(
       this.cluster.kafkaOptions({
         logLevel: logLevel.NOTHING,
-        requestTimeout: REQUEST_TIMEOUT_MS,
+        requestTimeout,
         enforceRequestTimeout: true,
         retry,
       })
@@ -944,4 +945,12 @@ const FINDINGS = {
   },
 }
 
-module.exports = { ClassicFaultEpisode, CONTRACT, FINDINGS, MEMBER_ID, NODES, PARTITIONS }
+module.exports = {
+  ClassicFaultEpisode,
+  CONTRACT,
+  FINDINGS,
+  MEMBER_ID,
+  NODES,
+  PARTITIONS,
+  batchAt,
+}

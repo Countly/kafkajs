@@ -1,6 +1,6 @@
 const { createCoordinator } = require('../src/consumer/__tests__/fixtures/lifecycleCoordinator')
 
-const EVENTS = ['stop', 'disconnect', 'crash', 'rejoin', 'poll-expiry']
+const EVENTS = ['stop', 'disconnect', 'force', 'crash', 'rejoin', 'poll-expiry']
 const BOUNDARIES = [
   'before-handler',
   'in-handler',
@@ -16,10 +16,15 @@ const BOUNDARIES = [
   'in-leave',
   'poll-expiry:leave',
   'pre-release-commit',
+  'hook:revoked',
+  'hook:assigned',
+  'hook:lost',
+  'session:initial',
+  'session:inflight',
 ]
 const PROTOCOLS = ['classic-eager', 'classic-cooperative', 'consumer']
 const MEMBERSHIPS = ['dynamic', 'static']
-const MANUAL_EVENTS = ['stop', 'disconnect', 'crash', 'reassign', 'unsubscribe', 'rebuild']
+const MANUAL_EVENTS = ['stop', 'disconnect', 'force', 'crash', 'reassign', 'unsubscribe', 'rebuild']
 const MANUAL_COMMON_BOUNDARIES = [
   'before-handler',
   'in-handler',
@@ -69,7 +74,7 @@ const lifecycleCells = () => {
         for (const membership of MEMBERSHIPS) {
           if (
             ['in-join', 'in-sync'].includes(boundary) &&
-            (protocol === 'consumer' || ['stop', 'disconnect'].includes(event))
+            (protocol === 'consumer' || ['stop', 'disconnect', 'force'].includes(event))
           )
             continue
           if (boundary === 'in-leave' && protocol !== 'consumer' && membership === 'static')

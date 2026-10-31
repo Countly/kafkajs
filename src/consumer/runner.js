@@ -802,6 +802,7 @@ module.exports = class Runner extends EventEmitter {
     if (this.retirement) return
     this.retirement = error
     this.latchStop()
+    this.consumerGroup.retireCoordinatorLookup(error)
     this.consumerGroup.retireFetchSessions()
     for (const check of this.hookWaiters || []) check()
   }
@@ -1882,6 +1883,8 @@ module.exports = class Runner extends EventEmitter {
    * retired, and retirement removes a pending backoff timer and settles the call.
    * A commit made from a close callback runs while the stop is in progress; any other call
    * resolves at once, committing nothing, once the runner is no longer running.
+   * A commit answered with a rebalance in progress still rejects with that answer, and also asks
+   * the group to rejoin, as the same answer to a heartbeat does.
    * @param {Object} offsets the offsets to commit
    * @param {object} [batch] the original handler batch, absent for detached calls
    * @param {{ operation?: import('./groupProtocol/interface').ConsumerOperation }} [context] the
@@ -1949,6 +1952,9 @@ module.exports = class Runner extends EventEmitter {
         if (e.name === 'KafkaJSNotImplemented') {
           return bail(e)
         }
+
+        const verdict = this.rebalanceCoordinator.classify(e, REBALANCE_PATHS.OFFSET_COMMIT)
+        if (verdict?.kind === 'revoked') this.rebalanceCoordinator.requestRejoin(verdict)
 
         this.logger.debug('Error while committing offsets, trying again...', {
           groupId: this.consumerGroup.groupId,

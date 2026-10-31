@@ -14,6 +14,7 @@ const {
 } = require('../instrumentationEvents')
 const { EAGER, COOPERATIVE } = require('./interface')
 const LeaderUnionWatch = require('../leaderUnionWatch')
+const CoordinatorLookup = require('../coordinatorLookup')
 const {
   stampGeneration,
   stampOwnership,
@@ -68,6 +69,10 @@ module.exports = class ClassicGroupProtocol {
    * @param {import('../../../types').Assigner[]} options.assigners
    * @param {import('./interface').RebalanceProtocol} [options.mode]
    * @param {string} [options.rackId] the consumer's rack; the empty string means "no rack"
+   * @param {string|null} [options.retainedMemberId] an id a crashed membership of this consumer held;
+   *   the first JoinGroup sends it, as it would a pending id
+   * @param {import('../coordinatorLookup')} [options.coordinatorLookup] the membership's one
+   *   pending coordinator lookup, shared with its commits; this protocol's own when absent
    * @param {import('../../instrumentation/emitter')} options.instrumentationEmitter
    * @param {import('../../../types').Logger} options.logger
    */
@@ -82,10 +87,13 @@ module.exports = class ClassicGroupProtocol {
     assigners,
     mode = EAGER,
     rackId = '',
+    retainedMemberId = null,
+    coordinatorLookup = new CoordinatorLookup({ cluster, groupId }),
     instrumentationEmitter,
     logger,
   }) {
     this.cluster = cluster
+    this.coordinatorLookup = coordinatorLookup
     this.ownership = ownership
     this.groupId = groupId
     this.groupInstanceId = groupInstanceId
@@ -116,7 +124,7 @@ module.exports = class ClassicGroupProtocol {
     /** @type {string|null} the member id of the joined membership; see the `memberId` accessor */
     this.currentMemberId = null
     /** @type {string|null} the id a MEMBER_ID_REQUIRED answer assigned, not yet joined under */
-    this.pendingMemberId = null
+    this.pendingMemberId = retainedMemberId
     /**
      * Counts the memberships retired so far. Work captures it when its request starts and
      * `changeIdentity` compares it before any write, so an obsolete answer cannot touch a later
@@ -250,6 +258,14 @@ module.exports = class ClassicGroupProtocol {
   }
 
   /**
+   * The id a rejoin of this membership would send: the joined one, else the pending one.
+   * @returns {string|null}
+   */
+  retainableMemberId() {
+    return this.memberId || this.pendingMemberId
+  }
+
+  /**
    * Local write of the generation, applied to the current membership.
    * @param {number|null} value
    */
@@ -276,6 +292,7 @@ module.exports = class ClassicGroupProtocol {
       if (memberId === null) {
         this.pendingMemberId = null
         this.membershipRevision += 1
+        this.coordinatorLookup.detach()
       }
     }
     if (pendingMemberId !== undefined) this.pendingMemberId = pendingMemberId
@@ -312,16 +329,21 @@ module.exports = class ClassicGroupProtocol {
 
   /**
    * Resolves the group coordinator. Re-run on every join, so a coordinator that moved is
-   * re-discovered rather than reused. With a round, its fence ends the lookup's retries and dials
-   * when the round retires.
+   * re-discovered rather than reused, but it waits for the membership's pending lookup when there
+   * is one instead of starting another. With a round, its fence ends this caller's wait, and the
+   * lookup itself when no other caller is left.
    * @param {object} [round] the join's round; absent for a lookup outside a rebalance
    * @returns {Promise<void>}
+   * @throws {KafkaJSError} the retriable join-deadline error when the membership was retired while
+   *   the lookup ran: its answer is installed for no one
    */
   async connect(round) {
-    this.coordinator = await this.cluster.findGroupCoordinator({
-      groupId: this.groupId,
-      fence: round?.fence,
-    })
+    const { membershipRevision } = this
+    const coordinator = await this.coordinatorLookup.find(round?.fence)
+    if (this.membershipRevision !== membershipRevision) {
+      throw joinDeadlineError({ rebalanceTimeoutMs: this.rebalanceTimeout })
+    }
+    this.coordinator = coordinator
     this.coordinatorUnknown = false
   }
 

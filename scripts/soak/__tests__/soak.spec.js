@@ -1208,3 +1208,249 @@ describe('Soak > a run on the scripted cluster', () => {
     )
   })
 })
+
+describe('Consumer journal boundaries', () => {
+  const { ConsumerChurnOracle } = require('../soak')
+  test('has an independent journal verifier', () => {
+    expect(typeof ConsumerChurnOracle).toBe('function')
+  })
+  const record = {
+    incarnation: 'incarnation-a',
+    topic: 't',
+    partition: 0,
+    offset: '0',
+    sequence: 's0',
+    group: 'g',
+    owner: 'owner-a',
+  }
+  const observation = (kind, fields = {}) => ({ ...record, kind, ...fields })
+  const journal = () => [
+    observation('produce'),
+    observation('acquire'),
+    observation('read'),
+    observation('handler'),
+    observation('commit', { next: '1', brokerNext: '1' }),
+    observation('revoke'),
+    observation('delete'),
+  ]
+  const verify = (records) => new ConsumerChurnOracle(records, ['g']).verify()
+
+  test('keeps three independent sets with an actual broker commit', async () => {
+    await expect(verify(journal())).resolves.toEqual({ acknowledged: 1, delivered: 1, commits: 1 })
+  })
+  test.each([
+    ['read', 'acknowledged log loss'],
+    ['handler', 'delete before handler drain'],
+  ])('detects a missing %s observation', async (kind, diagnostic) => {
+    await expect(
+      verify(
+        journal().filter(
+          (r) => r.kind !== kind && r.kind !== 'commit' && (kind !== 'read' || r.kind !== 'delete')
+        )
+      )
+    ).rejects.toThrow(diagnostic)
+  })
+  test('refuses deletion before the acknowledged log is read', async () => {
+    const rows = journal()
+    rows.splice(2, 0, observation('delete'))
+    await expect(verify(rows)).rejects.toThrow('delete before log verification')
+  })
+  test('refuses stale incarnation progress with equal numeric offsets', async () => {
+    const rows = journal()
+    rows[4].incarnation = 'incarnation-old'
+    await expect(verify(rows)).rejects.toThrow('commit after ownership boundary')
+  })
+  test('refuses a commit inferred from a locally resolved promise', async () => {
+    const rows = journal()
+    delete rows[4].brokerNext
+    await expect(verify(rows)).rejects.toThrow('unconfirmed broker commit')
+  })
+  test('refuses a new handler after successful revoke', async () => {
+    const rows = journal()
+    rows.splice(6, 0, observation('handler'))
+    await expect(verify(rows)).rejects.toThrow('handler after ownership boundary')
+  })
+  test('refuses a commit by a superseded owner after it lost the partition', async () => {
+    const rows = journal()
+    rows.splice(5, 0, observation('loss'))
+    rows.splice(
+      6,
+      0,
+      observation('acquire', { owner: 'owner-b' }),
+      observation('commit', { next: '1', brokerNext: '1' })
+    )
+    await expect(verify(rows)).rejects.toThrow('commit after ownership boundary')
+  })
+  test('refuses replay below the confirmed commit even after reacquisition', async () => {
+    const rows = journal()
+    rows.splice(
+      6,
+      0,
+      observation('acquire', { owner: 'owner-b' }),
+      observation('replay', { reason: 'crash', from: '1', to: '1' }),
+      observation('handler', { owner: 'owner-b' })
+    )
+    await expect(verify(rows)).rejects.toThrow('undeclared handler replay')
+  })
+  test('accepts an explicit same-incarnation seek interval', async () => {
+    const rows = journal()
+    rows.splice(
+      4,
+      0,
+      observation('replay', { reason: 'seek', from: '0', to: '1' }),
+      observation('handler')
+    )
+    await expect(verify(rows)).resolves.toEqual({ acknowledged: 1, delivered: 2, commits: 1 })
+  })
+  describe('an uncommitted crash replay', () => {
+    const second = { offset: '1', sequence: 's1' }
+    const crashJournal = (...replayed) => [
+      observation('produce'),
+      observation('produce', second),
+      observation('acquire'),
+      observation('read'),
+      observation('read', second),
+      observation('handler'),
+      observation('commit', { next: '1', brokerNext: '1' }),
+      observation('handler', second),
+      observation('loss'),
+      observation('acquire', { owner: 'owner-b' }),
+      observation('replay', { reason: 'crash', from: '1', to: '2' }),
+      ...replayed,
+      observation('revoke', { owner: 'owner-b' }),
+      observation('delete'),
+    ]
+    test('starts at the last broker-confirmed position and is accepted once', async () => {
+      await expect(
+        verify(crashJournal(observation('handler', { ...second, owner: 'owner-b' })))
+      ).resolves.toEqual({ acknowledged: 2, delivered: 3, commits: 1 })
+    })
+    test('expires once the replayed interval is handled again', async () => {
+      const again = observation('handler', { ...second, owner: 'owner-b' })
+      await expect(verify(crashJournal(again, again))).rejects.toThrow('undeclared handler replay')
+    })
+  })
+  describe('contiguous eligible progress', () => {
+    const at = (offset) => ({ offset: String(offset), sequence: `s${offset}` })
+    const log = (offsets, deliver) => [
+      ...offsets.map((offset) => observation('produce', at(offset))),
+      observation('acquire'),
+      ...offsets.map((offset) => observation('read', at(offset))),
+      ...deliver.map((offset) => observation('handler', at(offset))),
+    ]
+    test('refuses a commit past an undelivered lower record', async () => {
+      const rows = [
+        ...log([0, 1, 2], [0, 2]),
+        observation('commit', { next: '3', brokerNext: '3' }),
+      ]
+      await expect(verify(rows)).rejects.toThrow('commit beyond processed position')
+    })
+    test('accepts a commit up to the first undelivered record', async () => {
+      const rows = [
+        ...log([0, 1, 2], [0, 2]),
+        observation('commit', { next: '1', brokerNext: '1' }),
+        observation('revoke'),
+      ]
+      const oracle = new ConsumerChurnOracle(rows, ['g'])
+      await oracle.feed(rows.slice(0, -1))
+      expect(oracle.counts.commits).toBe(1)
+    })
+    test('crosses offsets that were never acknowledged but not the end of the log', async () => {
+      const rows = log([0, 2], [0, 2])
+      await expect(
+        verify(
+          [...rows, observation('commit', { next: '3', brokerNext: '3' })].concat([
+            observation('revoke'),
+            observation('delete', at(0)),
+          ])
+        )
+      ).resolves.toEqual({ acknowledged: 2, delivered: 2, commits: 1 })
+      await expect(
+        verify([...rows, observation('commit', { next: '4', brokerNext: '4' })])
+      ).rejects.toThrow('commit beyond processed position')
+    })
+    test('starts at the broker position a group acquired', async () => {
+      const rows = [
+        ...[0, 1].map((offset) => observation('produce', at(offset))),
+        observation('acquire'),
+        observation('position', { next: '1' }),
+        ...[0, 1].map((offset) => observation('read', at(offset))),
+        observation('handler', at(1)),
+        observation('commit', { next: '2', brokerNext: '2' }),
+      ]
+      const oracle = new ConsumerChurnOracle(rows, ['g'])
+      await oracle.feed(rows)
+      expect(oracle.counts.commits).toBe(1)
+    })
+  })
+  describe('streaming segments', () => {
+    test('carries ownership across segments and evicts a deleted incarnation', async () => {
+      const rows = journal()
+      const oracle = new ConsumerChurnOracle([], ['g'])
+      await oracle.feed(rows.slice(0, 4))
+      expect(oracle.retained()).toEqual({ acknowledged: 1, scopes: 1 })
+      await oracle.feed(rows.slice(4))
+      expect(oracle.retained()).toEqual({ acknowledged: 0, scopes: 0 })
+      await expect(oracle.finish()).resolves.toEqual({ acknowledged: 1, delivered: 1, commits: 1 })
+    })
+    test('keeps live state bounded by the incarnations in flight', async () => {
+      const oracle = new ConsumerChurnOracle([], ['g'])
+      for (let i = 0; i < 200; i++) {
+        await oracle.feed(
+          journal().map((r) => ({ ...r, incarnation: `incarnation-${i}`, sequence: `s${i}` }))
+        )
+      }
+      expect(oracle.retained()).toEqual({ acknowledged: 0, scopes: 0 })
+      expect(oracle.counts.acknowledged).toBe(200)
+    })
+  })
+  test('refuses an unacknowledged record and overlapping owners', async () => {
+    const rows = journal()
+    rows.splice(3, 0, observation('handler', { sequence: 'other' }))
+    await expect(verify(rows)).rejects.toThrow('unexpected handler record')
+    const overlap = journal()
+    overlap.splice(2, 0, observation('acquire', { owner: 'owner-b' }))
+    await expect(verify(overlap)).rejects.toThrow('overlapping ownership')
+  })
+  test('does not round large offsets through Number', async () => {
+    const rows = journal().map((r) => ({ ...r, offset: '9007199254740993' }))
+    rows[4].next = rows[4].brokerNext = '9007199254740994'
+    await expect(verify(rows)).resolves.toEqual({ acknowledged: 1, delivered: 1, commits: 1 })
+  })
+  test('refuses missing delivery at a closed segment boundary', async () => {
+    const rows = journal().filter((row) => !['handler', 'commit', 'delete'].includes(row.kind))
+    await expect(verify(rows)).rejects.toThrow('acknowledged handler loss')
+  })
+  test('refuses a broker commit beyond processed progress', async () => {
+    const rows = journal()
+    rows[4].next = rows[4].brokerNext = '2'
+    await expect(verify(rows)).rejects.toThrow('commit beyond processed position')
+  })
+  test('refuses a crash replay interval below a confirmed boundary', async () => {
+    const rows = journal()
+    rows.splice(5, 0, observation('replay', { reason: 'crash', from: '0', to: '1' }))
+    await expect(verify(rows)).rejects.toThrow('replay boundary differs from confirmed commit')
+  })
+  test('requires every intended group to receive its corpus', async () => {
+    await expect(new ConsumerChurnOracle(journal(), ['g', 'silent']).verify()).rejects.toThrow(
+      'delete before handler drain'
+    )
+  })
+  test('yields while indexing a large closed journal', async () => {
+    const rows = Array.from({ length: 4096 }, (_, i) =>
+      journal().map((r) => ({
+        ...r,
+        sequence: `s${i}`,
+        incarnation: `incarnation-${i}`,
+      }))
+    ).flat()
+    let heartbeatRan = false
+    setImmediate(() => {
+      heartbeatRan = true
+    })
+    const pending = verify(rows)
+    expect(heartbeatRan).toBe(false)
+    await pending
+    expect(heartbeatRan).toBe(true)
+  })
+})

@@ -4,8 +4,8 @@ const { seeded } = require('../../../../scripts/benchmarks/stickyAssign')
 
 /**
  * The assigner as it was before it read the members' subscriptions: every partition of every
- * topic in `topics`, dealt over the members sorted by id. Kept as the reference the uniform case
- * must match byte for byte.
+ * topic in `topics`, dealt over the members sorted by id, leaving out a member dealt nothing. Kept
+ * as the reference the uniform case must match byte for byte for every member that is dealt one.
  * @param {{ findTopicPartitionMetadata: (topic: string) => Array<{ partitionId: number }> }} cluster
  * @param {{ members: Array<{ memberId: string }>, topics: string[] }} group
  * @returns {Array<{ memberId: string, memberAssignment: Buffer }>}
@@ -126,8 +126,22 @@ describe('Consumer > assigners > RoundRobinAssigner > subscriptions', () => {
 
       const result = await assigner.assign(group)
 
+      const dealt = previousAssign(
+        { findTopicPartitionMetadata: (topic) => metadata[topic] },
+        group
+      )
+      const empty = MemberAssignment.encode({ version: 0, assignment: {} })
       expect(result).toEqual(
-        previousAssign({ findTopicPartitionMetadata: (topic) => metadata[topic] }, group)
+        group.members
+          .map(({ memberId }) => memberId)
+          .sort()
+          .map(
+            (memberId) =>
+              dealt.find((entry) => entry.memberId === memberId) ?? {
+                memberId,
+                memberAssignment: empty,
+              }
+          )
       )
     }
   })
@@ -209,6 +223,7 @@ describe('Consumer > assigners > RoundRobinAssigner > subscriptions', () => {
 
     expect(decoded(result)).toEqual({
       'member-1': { 'topic-A': [0], 'topic-B': [0, 1] },
+      'member-2': {},
     })
   })
 })

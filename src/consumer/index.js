@@ -30,6 +30,7 @@ const {
 } = require('../errors')
 const {
   isConsumerProtocolFatal,
+  isJoinDeadline,
   consumerStoppingError,
   stampOwnership,
 } = require('./rebalanceErrorContract')
@@ -1012,6 +1013,9 @@ module.exports = (params) => {
       return
     }
 
+    /** The classic member id a crash by a round's join deadline hands to the restart. */
+    let retainedMemberId = null
+
     const start = async (onCrash) => {
       const owned = acquireLife()
       logger.info('Starting', { groupId })
@@ -1066,6 +1070,7 @@ module.exports = (params) => {
         fetchSessions,
         requestTimeout,
         groupInstanceId,
+        retainedMemberId,
         rebalanceProtocol,
         groupProtocol,
         groupRemoteAssignor,
@@ -1081,6 +1086,7 @@ module.exports = (params) => {
         obligations: owned.obligations,
         rebalanceListener: listener,
       })
+      retainedMemberId = null
       for (const seekEntry of seeks) consumerGroup.seek(seekEntry)
 
       runner = new Runner({
@@ -1124,6 +1130,18 @@ module.exports = (params) => {
         cluster.removeBroker({ host: e.host, port: e.port, source: failureSourceOf(e) })
       }
 
+      const getOriginalCause = (error) => {
+        if (error.cause) {
+          return getOriginalCause(error.cause)
+        }
+
+        return error
+      }
+
+      // The restart rejoins under the id the expired round held, read before the shutdown forgets it.
+      if (isJoinDeadline(getOriginalCause(e)))
+        retainedMemberId = consumerGroup?.retainableMemberId()
+
       // Cleaning up must never suppress the CRASH event: it is the only supervision signal a
       // user gets, because consumer.run() has already resolved by the time the runner dies.
       // shutDown() already logs this failure itself (and rethrows), so there is nothing
@@ -1132,14 +1150,6 @@ module.exports = (params) => {
       try {
         await shutDown(undefined, { keepResets: true })
       } catch {}
-
-      const getOriginalCause = (error) => {
-        if (error.cause) {
-          return getOriginalCause(error.cause)
-        }
-
-        return error
-      }
 
       const isErrorRetriable =
         e.name === 'KafkaJSNumberOfRetriesExceeded' || getOriginalCause(e).retriable === true

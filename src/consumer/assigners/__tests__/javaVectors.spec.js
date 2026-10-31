@@ -754,27 +754,27 @@ describe.each(Object.keys(SCARCE))('Consumer > scarce partitions, %s', (assignor
     const decoded = Object.fromEntries(
       Object.entries(native).map(([memberId, bytes]) => [memberId, MemberAssignment.decode(bytes)])
     )
-    const members = Object.keys(decoded)
-    expect(members).toEqual(
-      assignor === 'roundrobin' ? ['m-1', 'm-2'] : ['m-1', 'm-2', 'm-3', 'm-4']
-    )
+    expect(Object.keys(decoded)).toEqual(['m-1', 'm-2', 'm-3', 'm-4'])
     for (const entry of Object.values(decoded)) {
       expect(entry.version).toBe(version)
       expect(entry.userData).toEqual(Buffer.alloc(0))
     }
   })
 
-  // The round-robin assignor leaves a member dealt nothing out of its answer; the Java one lists it.
-  const omitsEmptyMembers = assignor === 'roundrobin' ? it.failing : it
-  omitsEmptyMembers(`${assignor} native assignment answers an entry for every member`, async () => {
+  test(`${assignor} native assignment answers an entry for every member`, async () => {
     expect(Object.keys(await nativeScarce(assignor))).toEqual(['m-1', 'm-2', 'm-3', 'm-4'])
   })
 
-  it.failing(`${assignor} native assignment bytes equal the Java bytes`, async () => {
+  // Java writes null userdata where this client's default is empty bytes: the one recorded raw difference.
+  test(`${assignor} native assignment bytes differ from the Java bytes only in the userdata`, async () => {
     const vector = scarceVector(assignor)
     const native = await nativeScarce(assignor)
+    expect(Object.keys(native)).toEqual(Object.keys(vector.expectedAssignmentBytesHex))
     for (const [memberId, bytes] of Object.entries(native)) {
-      expect(bytes.toString('hex')).toBe(vector.expectedAssignmentBytesHex[memberId])
+      const java = vector.expectedAssignmentBytesHex[memberId]
+      expect(java.endsWith('ffffffff')).toBe(true)
+      expect(bytes.toString('hex')).not.toBe(java)
+      expect(bytes.toString('hex')).toBe(`${java.slice(0, -8)}00000000`)
     }
   })
 })
@@ -834,5 +834,50 @@ describe('Consumer > classic subscription versions and the valid empty assignmen
       expect(seen.fetchesAfter).toBe(0)
       expect(seen.heartbeats).toBeGreaterThan(0)
     }
+  })
+})
+
+describe('Empty member assignment envelopes', () => {
+  test.each([
+    ['roundRobin', 0],
+    ['range', 3],
+    ['sticky', 3],
+    ['cooperativeSticky', 3],
+  ])('%s sends valid empty assignments to every surplus member', async (name, version) => {
+    const cluster = { findTopicPartitionMetadata: () => [{ partitionId: 0, leader: 0 }] }
+    const assigner = require('..')[name]({ cluster, groupId: 'empty', logger: newLogger() })
+    const members = ['a', 'b', 'c'].map((memberId) => ({
+      memberId,
+      memberMetadata: assigner.protocol({
+        topics: ['t'],
+        ownedPartitions: [],
+        generationId: -1,
+        rackId: null,
+      }).metadata,
+    }))
+    const result = await assigner.assign({ members, topics: ['t'] })
+    expect(result.map(({ memberId }) => memberId).sort()).toEqual(['a', 'b', 'c'])
+    for (const { memberId, memberAssignment } of result) {
+      if (memberId === 'a') continue
+      const expected = version === 0 ? '00000000000000000000' : '00030000000000000000'
+      expect(memberAssignment.toString('hex')).toBe(expected)
+      expect(MemberAssignment.decode(memberAssignment)).toEqual({
+        version,
+        assignment: {},
+        userData: Buffer.alloc(0),
+      })
+    }
+  })
+
+  test('distinguishes the native empty envelope from nullable Java userdata', () => {
+    const bytes = Buffer.from('000300000000ffffffff', 'hex')
+    const fields = { version: 3, assignment: {}, userData: null }
+    expect(MemberAssignment.decode(bytes)).toEqual(fields)
+    expect(MemberAssignment.encode(fields)).toEqual(bytes)
+    expect(MemberAssignment.encode({ version: 0, assignment: {} }).toString('hex')).toBe(
+      '00000000000000000000'
+    )
+    expect(MemberAssignment.decode(Buffer.alloc(0))).toBeNull()
+    expect(bytes).not.toEqual(MemberAssignment.encode({ version: 3, assignment: {} }))
   })
 })

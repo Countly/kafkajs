@@ -95,6 +95,7 @@ describe('Consumer > Runner', () => {
       // The Fetch-session seams of stop and forced retirement; the real group always has both.
       closeFetchSessions: jest.fn(async () => {}),
       retireFetchSessions: jest.fn(),
+      retireCoordinatorLookup: jest.fn(),
       startIdleWait: jest.fn(() => ({})),
       beginRebalanceRound: jest.fn(() => ({
         guard: () => null,
@@ -632,6 +633,7 @@ describe('Consumer > Runner', () => {
       runner.retire(new Error('again'))
 
       expect(consumerGroup.retireFetchSessions).toHaveBeenCalledTimes(1)
+      expect(consumerGroup.retireCoordinatorLookup.mock.calls).toEqual([[new Error('forced')]])
       expect(consumerGroup.closeFetchSessions).not.toHaveBeenCalled()
     })
   })

@@ -124,7 +124,64 @@ describe('classic coordinator faults over the real wire', () => {
     'finding for $api $fault',
     (row) => {
       const { title, check } = FINDINGS[`${row.api}:${row.fault}`]
-      it.failing(title, async () => check((await ran(row)).episode))
+      it(title, async () => check((await ran(row)).episode))
     }
+  )
+})
+
+describe('a crash restart that no round deadline caused', () => {
+  it(
+    'rejoins as a new member instead of under the crashed membership id',
+    async () => {
+      const [base] = rows.filter((row) => row.api === 'SyncGroup' && row.fault === 'timeout')
+      const episode = new ClassicFaultEpisode({
+        ...base,
+        fault: 23,
+        expectedState: 'crash-restart',
+        config: {
+          ...base.config,
+          retry: { ...base.config.retry, restartOnFailure: async () => true },
+        },
+      })
+      try {
+        await episode.open()
+        await episode.execute()
+        await episode.recover()
+        const [join] = episode.after().filter(({ api }) => api === 'JoinGroup')
+        expect(episode.crashes).toHaveLength(1)
+        expect(join.fields.memberId).toBe('')
+      } finally {
+        await episode.close()
+      }
+    },
+    EPISODE_TIMEOUT_MS
+  )
+})
+
+describe('a retained member id the coordinator no longer knows', () => {
+  it(
+    'is dropped by the rejoin, which asks for a fresh id and settles without another crash',
+    async () => {
+      const [row] = rows.filter((one) => one.api === 'SyncGroup' && one.fault === 'timeout')
+      const episode = new ClassicFaultEpisode(row)
+      try {
+        await episode.open()
+        episode.cluster.schedule.once(
+          { api: 'JoinGroup', match: ({ fields }) => episode.faulted !== null && fields.memberId },
+          { errorCode: 25 }
+        )
+        await episode.execute()
+        await episode.recover()
+        const sent = episode
+          .after()
+          .filter(({ api }) => api === 'JoinGroup')
+          .map(({ fields }) => fields.memberId)
+        expect(sent).toEqual(['member-1', '', 'member-1'])
+        expect(episode.crashes).toHaveLength(1)
+      } finally {
+        await episode.close()
+      }
+    },
+    EPISODE_TIMEOUT_MS
   )
 })

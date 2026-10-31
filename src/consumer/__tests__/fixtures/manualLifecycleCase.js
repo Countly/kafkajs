@@ -159,6 +159,7 @@ const runManualLifecycleCell = async (cell) => {
         operation = settled(consumer.position({ topic: TOPIC, partition: 0 }))
       }
       if (cell.boundary === 'commit:coordinator-lookup') {
+        await pump(() => scripted.requests().some(({ api }) => api === 'Fetch'), 'the first fetch')
         group().offsetManager.coordinator = { isConnected: () => false }
         wrap(Cluster.prototype, 'findGroupCoordinator')
       }
@@ -225,6 +226,7 @@ const runManualLifecycleCell = async (cell) => {
       consumer.run({ autoCommit: false, eachBatch: async () => {} }).catch(() => {})
     if (cell.event === 'stop') event = settled(consumer.stop())
     if (cell.event === 'disconnect') event = settled(consumer.disconnect())
+    if (cell.event === 'force') event = settled(consumer.disconnect({ timeout: 0 }))
     if (cell.event === 'unsubscribe') event = settled(consumer.unsubscribe())
     if (cell.event === 'crash') {
       event = settled(

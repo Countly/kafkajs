@@ -8,6 +8,7 @@ const Generation = require('../producer/generation')
 const OffsetManager = require('./offsetManager')
 const OffsetOperations = require('./offsetManager/offsetOperations')
 const GroupOwnership = require('./groupOwnership')
+const CoordinatorLookup = require('./coordinatorLookup')
 const ResetObligations = require('./offsetManager/resetObligations')
 const Batch = require('./batch')
 const SeekOffsets = require('./seekOffsets')
@@ -202,6 +203,8 @@ module.exports = class ConsumerGroup {
    *   sessions (KIP-227). `false` constructs no session state and sends full requests.
    * @param {number} [options.requestTimeout=30000] the client's request timeout; it caps a session
    *   close that has no disconnect deadline
+   * @param {string|null} [options.retainedMemberId=null] the classic member id a crashed run of this
+   *   consumer held, sent by the first JoinGroup; ignored under any other protocol
    */
   constructor({
     retry,
@@ -244,6 +247,7 @@ module.exports = class ConsumerGroup {
     rebalanceListener = null,
     fetchSessions = false,
     requestTimeout = 30000,
+    retainedMemberId = null,
   }) {
     /** @type {import("../../types").Cluster} */
     this.cluster = cluster
@@ -310,8 +314,12 @@ module.exports = class ConsumerGroup {
     this.notifiedRevision = null
     this.maxPrefetchBatches = maxPrefetchBatches
 
+    /** The one pending coordinator lookup of this membership, shared by its protocol and commits. */
+    this.coordinatorLookup = new CoordinatorLookup({ cluster, groupId })
+
     const membershipOptions = {
       ownership: this.ownership,
+      coordinatorLookup: this.coordinatorLookup,
       cluster,
       groupId,
       groupInstanceId,
@@ -349,6 +357,7 @@ module.exports = class ConsumerGroup {
             heartbeatInterval,
             assigners,
             mode: rebalanceProtocol,
+            retainedMemberId,
           })
 
     this.seekOffset = new SeekOffsets()
@@ -507,6 +516,15 @@ module.exports = class ConsumerGroup {
    */
   clearStaleAssignmentPending() {
     this.staleAssignmentPending = false
+  }
+
+  /**
+   * The member id a restarted run should rejoin under, so a crash that left the coordinator's
+   * membership in place does not orphan it for a session timeout.
+   * @returns {string|null} the classic member id, joined or pending; null under any other protocol
+   */
+  retainableMemberId() {
+    return this.kind === 'classic' ? this.groupMembership.retainableMemberId() : null
   }
 
   get memberId() {
@@ -694,11 +712,14 @@ module.exports = class ConsumerGroup {
 
   /**
    * Tells the membership the consumer is shutting down, so a join waiting on the coordinator is
-   * rejected rather than waiting for a heartbeat chain that is about to be cancelled. Cancels
-   * queued sentinel seeks and pending sentinel resolutions for either group protocol.
+   * rejected rather than waiting for a heartbeat chain that is about to be cancelled, and the
+   * heartbeat stops waiting on the coordinator lookup. Commits already waiting on it finish under
+   * their own fence; only a forced close ends the lookup for them. Cancels queued sentinel seeks and pending sentinel
+   * resolutions for either group protocol.
    * @returns {void}
    */
   onStopRequested() {
+    this.coordinatorLookup.releaseUnfenced(consumerStoppingError())
     this.rebalanceHooks?.retire({ run: this.idleWait }, consumerStoppingError())
     this.roundContext?.retire(consumerStoppingError())
     this.leaderUnionWatch?.clear()
@@ -800,6 +821,16 @@ module.exports = class ConsumerGroup {
    */
   retireFetchSessions() {
     this.fetchSessions?.retireAll()
+  }
+
+  /**
+   * Cancels the pending coordinator lookup for every caller, for a forced close: a commit still
+   * waiting on it fails with `error` and nothing is installed or written when it is answered.
+   * @param {Error} error the terminal reason
+   * @returns {void}
+   */
+  retireCoordinatorLookup(error) {
+    this.coordinatorLookup.retire(error)
   }
 
   /**
@@ -1084,6 +1115,7 @@ module.exports = class ConsumerGroup {
     // below is the widening half.
     check()
     this.ownership?.renew()
+    this.coordinatorLookup.detach()
     if (round?.pin) this.publishSubscription(round.pin)
     this.topics = currentMemberAssignment.map(({ topic }) => topic)
     this.groupMembership.narrowOwned(currentMemberAssignment)
@@ -1130,6 +1162,7 @@ module.exports = class ConsumerGroup {
           coordinator: this.coordinator,
           revision: this.groupMembership.membershipRevision,
         }),
+        findCoordinator: (fence) => this.coordinatorLookup.find(fence),
         isStopping: () => this.isStopping(),
         isRebalancePending: () => Boolean(this.rebalanceCoordinator?.verdict),
         markPolled: () => this.rebalanceCoordinator?.pollTimer.poll(),

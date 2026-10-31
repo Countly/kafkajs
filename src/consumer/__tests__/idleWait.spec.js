@@ -618,6 +618,109 @@ describe('idle wait on a real fetch round', () => {
     expect(h.group.idleWait.waiters.size).toBe(0)
   })
 
+  it('all lifecycle wake sources settle only the captured run waiters', async () => {
+    const yielded = jest.spyOn(global, 'setImmediate')
+    try {
+      for (const [name, wake] of sources) {
+        await pausedGroup({
+          partitions: [0, 1],
+          knownNodes: [0, 1],
+          partitionLeaders: { 0: 0, 1: 1 },
+        })
+        h.group.maxWaitTime = 5000
+        const saved = []
+        const timeout = global.setTimeout
+        const timers = jest.spyOn(global, 'setTimeout').mockImplementation((callback, ms) => {
+          saved.push(callback)
+          return timeout(callback, ms)
+        })
+        const timersBefore = jest.getTimerCount()
+        const old = [startFetch(0), startFetch(1)]
+        await settle()
+        expect(jest.getTimerCount() - timersBefore).toBe(2)
+        yielded.mockClear()
+        await wake()
+        expect(yielded).not.toHaveBeenCalled()
+        await settle()
+        for (const { settled } of old) expect(settled).toHaveBeenCalledTimes(1)
+        expect(jest.getTimerCount()).toBe(timersBefore)
+        await Promise.all(old.map(({ done }) => done))
+
+        const replaced = h.group.idleWait
+        h.group.startIdleWait()
+        expect(h.group.idleWait).not.toBe(replaced)
+        const fresh = jest.fn()
+        const waiting = h.group.idleWait.wait(5000).then(fresh)
+        expect(jest.getTimerCount() - timersBefore).toBe(1)
+        for (const callback of saved.slice(0, 2)) callback()
+        await settle()
+        expect(fresh).not.toHaveBeenCalled()
+        expect(jest.getTimerCount() - timersBefore).toBe(1)
+        h.group.idleWait.wake()
+        await waiting
+        expect(fresh).toHaveBeenCalledTimes(1)
+        expect(jest.getTimerCount()).toBe(timersBefore)
+        timers.mockRestore()
+        h.group.onStopRequested()
+        await h.broker.disconnect()
+        h = null
+        expect(name).toEqual(expect.any(String))
+      }
+    } finally {
+      yielded.mockRestore()
+    }
+  })
+
+  it('forgetting the final session partition precedes an idle wait without a spin', async () => {
+    h = await createFetchGroup({ fetchSessions: true, position: '5' })
+    fakeTimers()
+    h.group.maxWaitTime = 5000
+    h.setResponse(fetchResponse([{ partition: 0, errorCode: 0 }], { sessionId: 7 }))
+    await h.group.fetch(NODE_ID)
+    h.group.pause([{ topic: TOPIC }])
+    h.setResponse(fetchResponse([], { sessionId: 7, includeTopic: false }))
+    const sent = h.fetchFrames().length
+
+    const forgetting = startFetch(NODE_ID)
+    await settle()
+    await forgetting.done
+    const frames = h.fetchFrames()
+    expect(frames).toHaveLength(sent + 1)
+    expect(frames[sent]).toMatchObject({ sessionId: 7, topics: [] })
+    expect(frames[sent].forgottenTopics.flatMap(({ partitions }) => partitions)).toEqual([0])
+    expect(jest.getTimerCount()).toBe(0)
+
+    let rounds = 0
+    const loop = { running: true }
+    const worker = (async () => {
+      while (loop.running) {
+        rounds += 1
+        await h.group.fetch(NODE_ID)
+        await new Promise(setImmediate)
+      }
+    })()
+    await settle()
+    expect(rounds).toBe(1)
+    expect(jest.getTimerCount()).toBe(1)
+    const waiters = 1
+    for (let event = 0; event < 1000; event++) {
+      h.group.resume([{ topic: TOPIC }])
+      h.group.pause([{ topic: TOPIC }])
+      await settle()
+    }
+    expect(rounds).toBeLessThanOrEqual(1000 + waiters)
+    expect(h.fetchFrames()).toHaveLength(sent + 1)
+    loop.running = false
+    h.group.onStopRequested()
+    await settle()
+    await worker
+    const finished = rounds
+    await jest.advanceTimersByTimeAsync(5000)
+    expect(rounds).toBe(finished)
+    expect(jest.getTimerCount()).toBe(0)
+    expect(h.group.idleWait.waiters.size).toBe(0)
+  })
+
   it('disconnect ends an idle five second fetch within fifty milliseconds', async () => {
     await pausedGroup()
     const start = Date.now()
