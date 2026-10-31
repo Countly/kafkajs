@@ -25,33 +25,33 @@ module.exports = {
   // --coverageThreshold '{}' because it covers a strict subset of `src/`.
   // The three path keys below take their files OUT of the global aggregate, so the global numbers
   // are measured over the remaining files.
-  // Re-derived on 2026-10-27 from the 9B exit's two cold coverage runs on Kafka 4.3.1, the lower of
-  // the two (global S 98.81 / B 95.90 / F 98.80 / L 98.97). The global floors keep a few items of slack,
+  // Re-derived on 2026-10-31 from the 9C exit's two cold coverage runs on Kafka 4.3.1, the lower of
+  // the two (global S 98.92 / B 96.62 / F 98.92 / L 99.15). The global floors keep a few items of slack,
   // because the live suite decides some branches by broker timing; the global branch floor keeps
   // ten. A path key whose rounded-down floor would leave no spare item keeps one instead. No floor
   // is lower than before.
   coverageThreshold: {
     global: {
-      statements: 98.8,
-      branches: 95.7,
-      functions: 98.7,
-      lines: 98.9,
+      statements: 98.9,
+      branches: 96.4,
+      functions: 98.9,
+      lines: 99.1,
     },
-    // Measured 100.00 / 96.71 / 100.00 / 100.00. The sticky assigner's wide-shape case reaches
-    // PartitionMovements' repeat-move bookkeeping; stickyCore.js keeps 7 of its 137 branches
+    // Measured 99.84 / 97.74 / 100.00 / 99.82. The sticky assigner's wide-shape case reaches
+    // PartitionMovements' repeat-move bookkeeping; stickyCore.js keeps 4 of its 137 branches
     // uncovered.
     './src/consumer/assigners/': {
       statements: 99.8,
-      branches: 96.2,
-      functions: 99.1,
+      branches: 97.3,
+      functions: 99.3,
       lines: 99.8,
     },
-    // Measured 99.54 / 96.55 / 100.00 / 99.76.
+    // Measured 100.00 / 99.57 / 100.00 / 100.00.
     './src/consumer/groupProtocol/': {
-      statements: 99.4,
-      branches: 96.3,
+      statements: 99.9,
+      branches: 99.4,
       functions: 100.0,
-      lines: 99.6,
+      lines: 99.9,
     },
     // Every file of the producer's state is covered by its own unit specs, line for line and
     // branch for branch.

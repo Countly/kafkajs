@@ -121,6 +121,8 @@ Versions before 3.0.0 are internal alpha tags and are not published.
 
 #### Tooling
 
+- The coverage floors are re-derived at this release from two cold coverage runs on Kafka 4.3.1, the lower of the two: global 98.9 % statements, 96.4 % branches, 98.9 % functions, 99.1 % lines; `src/consumer/groupProtocol/` 99.9 / 99.4 / 100 / 99.9; `src/consumer/assigners/` branches 97.3 and functions 99.3. No floor is lower than before. The coverage run now executes its spec files in fixed batches of 25 instead of one broad run, and checks every batch's tests and coverage maps against a sealed list.
+
 - Extend transport fixtures with independently checked consumer error and Fetch-session variants.
 
 - Add independent consumer-assignment/session vectors and dedicated rack, capacity and coordinator-state fixtures.
