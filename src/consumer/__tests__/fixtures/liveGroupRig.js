@@ -1,5 +1,6 @@
 const { Kafka, logLevel } = require('../../../../index')
 const Broker = require('../../../broker')
+const ISOLATION_LEVEL = require('../../../protocol/isolationLevel')
 const {
   createConnectionPool,
   newLogger,
@@ -283,6 +284,8 @@ class JournalMember {
    * @param {LiveCorpus} options.corpus
    * @param {string} options.name names the client and the member in the evidence
    * @param {string} options.groupId
+   * @param {number} [options.isolationLevel] the fetch isolation level; the client takes it as
+   *   `readUncommitted`
    * @param {object} [options.consumer] consumer options: protocol, instance id, session timeout
    * @param {object} [options.run] run options
    * @param {Function} [options.socketFactory] the client's socket factory, to observe its frames
@@ -295,11 +298,17 @@ class JournalMember {
     corpus,
     name,
     groupId,
+    isolationLevel = ISOLATION_LEVEL.READ_COMMITTED,
     consumer = {},
     run = {},
     socketFactory,
     onMessage,
   }) {
+    if ('isolationLevel' in consumer) {
+      throw new Error(
+        'The client ignores consumer.isolationLevel: pass isolationLevel to the member'
+      )
+    }
     this.scope = scope
     this.corpus = corpus
     this.name = name
@@ -311,7 +320,12 @@ class JournalMember {
       brokers: corpus.brokers,
       logLevel: logLevel.NOTHING,
       ...(socketFactory ? { socketFactory } : {}),
-    }).consumer({ groupId, maxWaitTimeInMs: 500, ...consumer })
+    }).consumer({
+      groupId,
+      maxWaitTimeInMs: 500,
+      readUncommitted: isolationLevel === ISOLATION_LEVEL.READ_UNCOMMITTED,
+      ...consumer,
+    })
     /** @type {Array<{partition: number, offset: string, value: string, topic: string, seq: number}>} */
     this.delivered = []
     /** @type {Array<{kind: string, at: number, [key: string]: unknown}>} */

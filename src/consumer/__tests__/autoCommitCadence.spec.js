@@ -121,6 +121,24 @@ describe('batch-end automatic commit opportunities', () => {
     await h.runner.autoCommitOffsetsIfNecessary(null)
     expect(h.commit).toHaveBeenCalledTimes(1)
   })
+  test.each([
+    ['an interval after an idle gap leaves the tail of a burst uncommitted', 1000, '1'],
+    ['no knobs commits every batch end, so the tail settles', null, '2'],
+  ])('%s', async (_name, interval, settled) => {
+    h = setup({ interval })
+    await jest.advanceTimersByTimeAsync(1000)
+    const tail = new Batch('t', '0', {
+      partition: 0,
+      highWatermark: '2',
+      messages: [{ offset: '1', value: Buffer.from('v') }],
+    })
+    await h.runner.handleBatch(h.batch)
+    await h.runner.handleBatch(tail)
+    await jest.advanceTimersByTimeAsync(60000)
+    expect(h.manager.resolvedOffsetAt('t', 0)).toBe('2')
+    const last = h.commit.mock.calls.at(-1)[0].topics[0].partitions[0].offset
+    expect(last).toBe(settled)
+  })
   test('disabled automatic commit suppresses both paths', async () => {
     h = setup({ threshold: 1, autoCommit: false })
     await h.runner.handleBatch(h.batch)

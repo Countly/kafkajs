@@ -4,6 +4,13 @@ const MOVE_WAIT_MS = 5000
 const ROUND_ALLOWANCE_MS = 1000
 
 /**
+ * How the broker of an unhinted move goes down. A clean stop runs a controlled shutdown that moves
+ * the leaders first, so for about two seconds the old leader still answers and names the new one;
+ * only a kill leaves the client without a hint.
+ */
+const UNHINTED_OUTAGE = 'kill'
+
+/**
  * @param {object} measured what `Episode#measure` returned
  * @returns {string[]} how the move breaks its bound; empty when it meets it. A busy move needs a
  *   long poll written at or before the route and answered after it; none fails the arm.
@@ -36,4 +43,25 @@ const moveProblems = (measured) => {
   return problems
 }
 
-module.exports = { MOVE_WAIT_MS, ROUND_ALLOWANCE_MS, moveProblems }
+/**
+ * Reads through DescribeTopicPartitions: a plain `fetchTopicMetadata` waits for a missing leader
+ * and rejects with `KafkaJSTimeout` after 10 s, so it can never report one.
+ * @param {{ fetchTopicMetadata: Function }} admin a connected admin client
+ * @param {string} topic a topic of one partition
+ * @returns {Promise<number>} the leader of its partition 0, -1 when it has none
+ */
+const partitionLeader = async (admin, topic) => {
+  const { topics } = await admin.fetchTopicMetadata({
+    topics: [topic],
+    useDescribeTopicPartitions: true,
+  })
+  return topics[0].partitions[0].leader
+}
+
+module.exports = {
+  MOVE_WAIT_MS,
+  ROUND_ALLOWANCE_MS,
+  UNHINTED_OUTAGE,
+  moveProblems,
+  partitionLeader,
+}

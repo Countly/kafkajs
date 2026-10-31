@@ -31,7 +31,8 @@ const MIN_ISR = [{ name: 'min.insync.replicas', value: '2' }]
 const OPEN_RECORDS = 50
 const BLOCK_RECORDS = 10
 const INVISIBLE_MS = 5000
-const AUTO_COMMIT = { autoCommit: true, autoCommitInterval: 1000 }
+// No interval: it commits only when a later batch arrives, which strands the tail of a burst.
+const AUTO_COMMIT = { autoCommit: true }
 const LARGE_BYTES = 400000
 const MAX_BYTES = 100000
 const MAX_BYTES_PER_PARTITION = 50000
@@ -126,7 +127,7 @@ const isolationGroups = ({ scope, cleanup, corpus }) => {
       corpus,
       name,
       groupId: `${corpus.groupId}-${name}`,
-      consumer: { isolationLevel },
+      isolationLevel,
       run: AUTO_COMMIT,
     })
   return {

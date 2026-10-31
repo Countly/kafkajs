@@ -1,4 +1,15 @@
-const { MOVE_WAIT_MS, ROUND_ALLOWANCE_MS, moveProblems } = require('./fixtures/fetchRoutingOracle')
+const createAdmin = require('../../admin')
+const { createErrorFromCode } = require('../../protocol/error')
+const { newLogger } = require('testHelpers')
+const {
+  MOVE_WAIT_MS,
+  ROUND_ALLOWANCE_MS,
+  UNHINTED_OUTAGE,
+  moveProblems,
+  partitionLeader,
+} = require('./fixtures/fetchRoutingOracle')
+
+const LEADER_NOT_AVAILABLE = 5
 
 const busy = {
   kind: 'busy',
@@ -55,5 +66,58 @@ describe('Consumer > Fetch routing oracle (offline controls)', () => {
     expect(moveProblems(idle)).toEqual([])
     expect(moveProblems({ ...idle, priorFetches: 1 })).not.toEqual([])
     expect(moveProblems({ ...idle, nextAt: idle.routeAt + ROUND_ALLOWANCE_MS + 1 })).not.toEqual([])
+  })
+})
+
+describe('Consumer > Fetch routing oracle > the unhinted outage', () => {
+  it('kills the broker: a clean stop moves the leaders first and the old leader hints', () => {
+    expect(UNHINTED_OUTAGE).toBe('kill')
+  })
+})
+
+describe('Consumer > Fetch routing oracle > the leader of a partition', () => {
+  const leaderless = { topics: [{ partitions: [{ leader: -1 }] }] }
+
+  it('asks through DescribeTopicPartitions, which reports no leader as -1', async () => {
+    const admin = {
+      fetchTopicMetadata: jest.fn(async ({ useDescribeTopicPartitions }) => {
+        if (!useDescribeTopicPartitions) throw createErrorFromCode(LEADER_NOT_AVAILABLE)
+        return leaderless
+      }),
+    }
+
+    await expect(partitionLeader(admin, 't')).resolves.toBe(-1)
+    expect(admin.fetchTopicMetadata).toHaveBeenCalledWith({
+      topics: ['t'],
+      useDescribeTopicPartitions: true,
+    })
+  })
+
+  describe('why not a plain fetchTopicMetadata', () => {
+    beforeEach(() => jest.useFakeTimers())
+    afterEach(() => jest.useRealTimers())
+
+    it('waits for the leader and then rejects with the timeout', async () => {
+      const cluster = {
+        allowAutoTopicCreation: false,
+        metadata: jest.fn(async () => {
+          throw createErrorFromCode(LEADER_NOT_AVAILABLE)
+        }),
+      }
+      const admin = createAdmin({
+        logger: newLogger(),
+        retry: { retries: 0, initialRetryTime: 1, maxRetryTime: 1 },
+        cluster,
+      })
+      const settled = admin.fetchTopicMetadata({ topics: ['t'] }).then(
+        () => null,
+        (error) => error
+      )
+
+      await jest.advanceTimersByTimeAsync(10100)
+
+      expect(await settled).toMatchObject({ name: 'KafkaJSTimeout', message: 'Timeout' })
+      expect(cluster.metadata.mock.calls.length).toBeGreaterThan(1)
+    })
   })
 })

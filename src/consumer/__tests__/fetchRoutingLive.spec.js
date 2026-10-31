@@ -30,7 +30,13 @@ const {
   pollUntil,
 } = require('../../producer/__tests__/fixtures/bounded')
 const { WireTranscript } = require('./fixtures/rackWire')
-const { MOVE_WAIT_MS, ROUND_ALLOWANCE_MS, moveProblems } = require('./fixtures/fetchRoutingOracle')
+const {
+  MOVE_WAIT_MS,
+  ROUND_ALLOWANCE_MS,
+  UNHINTED_OUTAGE,
+  moveProblems,
+  partitionLeader,
+} = require('./fixtures/fetchRoutingOracle')
 
 // Gated: it stops a broker and moves leaders. Run alone through the guarded live entry:
 // `npm run test:e2e:fetch-routing` is the developer row.
@@ -431,11 +437,8 @@ class Episode {
    * @param {string} topic
    * @returns {Promise<number>} the leader of its partition 0, -1 when it has none
    */
-  async leaderOf(topic) {
-    const { topics } = await step(this.scope, 'The topic metadata', () =>
-      this.admin.fetchTopicMetadata({ topics: [topic] })
-    )
-    return topics[0].partitions[0].leader
+  leaderOf(topic) {
+    return step(this.scope, 'The topic metadata', () => partitionLeader(this.admin, topic))
   }
 
   /**
@@ -537,6 +540,7 @@ class Episode {
           errorAt = hint.at
           routeAt = hint.at
         } else {
+          if (hint) throw new Error('The old leader named the new one: the outage was not abrupt')
           const lost = wire.closes.find(
             ({ endpoint, at }) => endpoint === oldEndpoint && at >= since
           )
@@ -663,13 +667,14 @@ const siblingProblems = ({ outage, handled, window, events }) => {
  * back. The restore is also a cleanup, so a case that ends early still waits for it.
  * @param {BrokerBouncer} bouncer
  * @param {Episode} episode
- * @param {string} service the compose service to stop
+ * @param {string} service the compose service to take down
+ * @param {'stop'|'kill'} [kind] a clean stop by default
  * @returns {Promise<{ tDown: number, tRestored: number, outageMs: number }>} the outage, once the
  *   broker answers again and the in-sync replica sets are full
  */
-const startOutage = (bouncer, episode, service) => {
+const startOutage = (bouncer, episode, service, kind = 'stop') => {
   const outage = bouncer.step(
-    { service, kind: 'stop', holdMs: OUTAGE_HOLD_MS },
+    { service, kind, holdMs: OUTAGE_HOLD_MS },
     { admin: episode.admin, topics: episode.topics, signal: episode.scope }
   )
   outage.catch(() => {})
@@ -869,7 +874,7 @@ describeRouting('Consumer > Fetch routing around unavailable and moved leaders (
                 triggerPreferredElection(topic)
               }
             } else {
-              outage = startOutage(bouncer, episode, service)
+              outage = startOutage(bouncer, episode, service, UNHINTED_OUTAGE)
             }
             for (const move of moves) {
               measured.push(await episode.measure({ ...move, oldNode: roles.old, hinted, since }))

@@ -44,7 +44,8 @@ const RETURN_AFTER_MS = 5000
 const SHORT_HOLD_MS = 2000
 const LONG_HOLD_MS = 45000
 const OUTAGE_ALLOWANCE_MS = 150000
-const AUTO_COMMIT = { autoCommit: true, autoCommitInterval: 1000 }
+// No interval: it commits only when a later batch arrives, which strands the tail of a burst.
+const AUTO_COMMIT = { autoCommit: true }
 
 /**
  * @param {number} nodeId the broker's node id
