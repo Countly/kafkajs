@@ -808,36 +808,33 @@ module.exports = class Runner extends EventEmitter {
   }
 
   /**
-   * Captures, before the stop latches, what a listener's close callback needs: the assignment the
-   * member holds and whether it is already lost or inside a round, which selects the lost callback.
+   * Captures, before the stop latches, the assignment a listener's close callback names. Whether
+   * that callback is lost or revoked is decided only when it runs, after any round has settled.
    * @private
-   * @returns {{ previous: Array<import('../../types').TopicPartitions>, lost: boolean }}
+   * @returns {{ previous: Array<import('../../types').TopicPartitions> }}
    */
   closeEpisode() {
-    const { ownership } = this.consumerGroup
-    return {
-      previous: this.consumerGroup.assigned(),
-      lost:
-        this.rebalanceCoordinator.isRebalancing() || Boolean(ownership?.refusal(ownership.token())),
-    }
+    return { previous: this.consumerGroup.assigned() }
   }
 
   /**
-   * Calls the revoked callback for a healthy close, or the lost callback for a lost or in-round one,
-   * once and only for a nonempty assignment, before the final commit and leave. The callback shares
-   * the group's rebalance timeout and runs outside the stop requester's handler and callback
-   * context; a failure is logged and the close goes on.
+   * Calls the revoked callback for a close whose membership is intact, or the lost callback for one
+   * whose membership is already lost, once and only for a nonempty assignment, before the final
+   * commit and leave. A round still joining when the stop began does not make the close lost: the
+   * stop waits for it, and Java reads its own rebalance state only after a poll has finished. The
+   * callback shares the group's rebalance timeout and runs outside the stop requester's handler and
+   * callback context; a failure is logged and the close goes on.
    * @private
-   * @param {{ previous: Array<import('../../types').TopicPartitions>, lost: boolean }} episode
+   * @param {{ previous: Array<import('../../types').TopicPartitions> }} episode
    * @param {import('./groupProtocol/interface').ConsumerOperation} [operation] the close that owns
    *   the callback: its deadline shortens the rebalance timeout, its retirement expires the callback
    * @returns {Promise<void>} always resolves
    */
-  async invokeCloseHook({ previous, lost }, operation) {
+  async invokeCloseHook({ previous }, operation) {
     if (previous.length === 0) return
     const group = this.consumerGroup
     const { ownership } = group
-    if (lost) ownership?.lose(consumerStoppingError(), ownership.token())
+    const lost = Boolean(ownership?.refusal(ownership.token()))
     const deadlineAt = Math.min(
       performance.now() + group.rebalanceTimeout,
       operation?.deadlineAt ?? Infinity

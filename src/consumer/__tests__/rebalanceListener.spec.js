@@ -735,6 +735,53 @@ describe('awaited rebalance callbacks in a round', () => {
       await expect(rig.stop()).resolves.toBeUndefined()
       expect(rig.log).toEqual(['hook:onPartitionsRevoked', 'leave'])
     })
+
+    describe('while a cooperative round is joining', () => {
+      let seen
+      const startCooperative = async () => {
+        seen = []
+        rig = createHookRig({
+          mode: 'cooperative',
+          listener: (log) =>
+            eachHook(log, {
+              onPartitionsRevoked: ({ partitions: held }) => seen.push(['revoked', held]),
+              onPartitionsLost: ({ partitions: held }) => seen.push(['lost', held]),
+            }),
+        })
+        rig.joins.push({ assignment: { orders: [0, 1] }, generationId: 2 })
+        await rig.start()
+        rig.log.length = 0
+        seen.length = 0
+      }
+      const closeAround = async (assignment, afterStop) => {
+        const joining = gate()
+        rig.joins.push({ assignment, generationId: 3, gate: joining })
+        const round = rig.round('enforced').catch(() => {})
+        await settle()
+        expect(rig.coordinator.isRebalancing()).toBe(true)
+        const stopping = rig.stop()
+        await settle()
+        afterStop?.()
+        joining.release()
+        await Promise.all([round, stopping])
+      }
+
+      it('calls revoked, not lost, for a member whose membership is intact', async () => {
+        await startCooperative()
+        await closeAround({ orders: [0, 1] })
+        expect(seen).toEqual([['revoked', partitions(0, 1)]])
+        expect(rig.log).toContain('leave')
+      })
+
+      it('still calls lost when the membership is lost while the round runs', async () => {
+        await startCooperative()
+        await closeAround({ orders: [0, 1] }, () => {
+          const { ownership } = rig.group
+          ownership.lose(new Error('fenced'), ownership.token())
+        })
+        expect(seen.map(([kind]) => kind)).toEqual(['lost'])
+      })
+    })
   })
 })
 
@@ -804,6 +851,28 @@ describe('consumer.run({ rebalanceListener })', () => {
     expect(groups().at(-1).rebalanceHooks?.listener.onPartitionsAssigned).toBe(
       secondListener.onPartitionsAssigned
     )
+  })
+
+  it('a cooperative disconnect right after enforceRebalance calls revoked, not lost', async () => {
+    rig = createPublicRig({ cooperative: true, fetchLoop: true })
+    const calls = []
+    const joining = gate()
+    rig.joins.push({ assignment: { t: [0, 1] }, generationId: 2 })
+    await rig.consumer.subscribe({ topic: 't' })
+    await rig.consumer.run({
+      eachMessage: () => {},
+      rebalanceListener: {
+        onPartitionsRevoked: ({ partitions: held }) => calls.push(['revoked', held]),
+        onPartitionsLost: ({ partitions: held }) => calls.push(['lost', held]),
+      },
+    })
+    rig.joins.push({ assignment: { t: [0, 1] }, generationId: 3, gate: joining })
+    await rig.consumer.enforceRebalance('listener-live')
+    const closing = rig.consumer.disconnect()
+    await settle()
+    joining.release()
+    await closing
+    expect(calls).toEqual([['revoked', [{ topic: 't', partitions: [0, 1] }]]])
   })
 
   it.each(['eager', 'cooperative'])(
