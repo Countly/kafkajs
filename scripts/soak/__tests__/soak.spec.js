@@ -1330,6 +1330,66 @@ describe('Consumer journal boundaries', () => {
       await expect(verify(crashJournal(again, again))).rejects.toThrow('undeclared handler replay')
     })
   })
+  describe('a replay after an ownership ended without a confirmed commit', () => {
+    const second = { offset: '1', sequence: 's1' }
+    const again = (fields = {}) => observation('handler', { owner: 'owner-b', ...fields })
+    const reacquired = (end, position, ...after) => [
+      observation('produce'),
+      observation('produce', second),
+      observation('acquire'),
+      observation('position', { next: '0' }),
+      observation('read'),
+      observation('read', second),
+      observation('handler'),
+      observation('handler', second),
+      ...end,
+      observation('acquire', { owner: 'owner-b' }),
+      observation('position', { owner: 'owner-b', next: position }),
+      ...after,
+      observation('revoke', { owner: 'owner-b' }),
+      observation('delete'),
+    ]
+    const counts = { acknowledged: 2, delivered: 4, commits: 0 }
+    test.each([['loss'], ['revoke']])(
+      'accepts each record once again after a %s with nothing committed',
+      async (kind) => {
+        await expect(
+          verify(reacquired([observation(kind)], '0', again(), again(second)))
+        ).resolves.toEqual(counts)
+      }
+    )
+    test('accepts only the records from the position the broker returned', async () => {
+      const committed = [observation('commit', { next: '1', brokerNext: '1' }), observation('loss')]
+      const rows = (...after) => reacquired(committed, '1', ...after)
+      await expect(verify(rows(again(second)))).resolves.toEqual({
+        acknowledged: 2,
+        delivered: 3,
+        commits: 1,
+      })
+      await expect(verify(rows(again()))).rejects.toThrow('undeclared handler replay')
+    })
+    test('refuses a record replayed twice by the new owner', async () => {
+      await expect(
+        verify(reacquired([observation('loss')], '0', again(), again(), again(second)))
+      ).rejects.toThrow('undeclared handler replay')
+    })
+    test('refuses a position below a confirmed commit', async () => {
+      const committed = [observation('commit', { next: '2', brokerNext: '2' }), observation('loss')]
+      await expect(verify(reacquired(committed, '1', again(second)))).rejects.toThrow(
+        'position below confirmed commit'
+      )
+    })
+    test('grants nothing to a position that moves a held ownership', async () => {
+      const rows = journal()
+      rows.splice(4, 0, observation('position', { next: '0' }), observation('handler'))
+      await expect(verify(rows)).rejects.toThrow('undeclared handler replay')
+    })
+    test('grants nothing to a delivery repeated inside one ownership', async () => {
+      const rows = journal()
+      rows.splice(4, 0, observation('handler'))
+      await expect(verify(rows)).rejects.toThrow('undeclared handler replay')
+    })
+  })
   describe('contiguous eligible progress', () => {
     const at = (offset) => ({ offset: String(offset), sequence: `s${offset}` })
     const log = (offsets, deliver) => [

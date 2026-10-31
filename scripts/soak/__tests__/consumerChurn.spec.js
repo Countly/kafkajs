@@ -493,6 +493,26 @@ describe('Consumer churn profile > a member', () => {
     expect(gaps.enter).toHaveBeenCalledWith('g', 'p', 5)
   })
 
+  test('journals a commit in flight before a revoke and does not repeat it after', async () => {
+    const { member, appended, handlers, consumer, committed } = setup()
+    let release
+    const gate = new Promise((resolve) => (release = resolve))
+    consumer.commitOffsets.mockImplementation(async ([{ partition, offset }]) => {
+      await gate
+      committed[partition] = offset
+    })
+    await member.start(['t'])
+    await handlers.onPartitionsAssigned({ partitions: [{ topic: 't', partitions: [0] }] })
+    for (let offset = 0; offset < 24; offset++) await handlers.each(message(offset))
+    const delivering = handlers.each(message(24))
+    const revoking = handlers.onPartitionsRevoked({ partitions: [{ topic: 't', partitions: [0] }] })
+    release()
+    await Promise.all([delivering, revoking])
+    const kinds = appended.map(({ kind }) => kind).filter((kind) => kind !== 'handler')
+    expect(kinds).toEqual(['acquire', 'position', 'commit', 'revoke'])
+    expect(consumer.commitOffsets).toHaveBeenCalledTimes(1)
+  })
+
   test('commits before it reports a revoke, and never commits for a lost partition', async () => {
     const revoked = setup()
     await revoked.member.start(['t'])

@@ -29,8 +29,11 @@ const REPLAY_REASONS = Object.freeze(['seek', 'reset', 'crash'])
  * Records are objects with `kind`, `group`, `incarnation`, `topic`, `partition`, `offset`
  * (decimal string) and `sequence`; `owner` names the acquisition, and a `commit` also has `next`
  * and `brokerNext`. A `position` record moves a group's start, a `replay` declares an interval
- * `[from, to)` a group may legitimately handle again. A `produce` record may name its own intended
- * `groups`, a subset of the constructor's; without it every constructor group is intended.
+ * `[from, to)` a group may legitimately handle again, once per record. The `position` that follows
+ * an `acquire` is the broker's committed position: it may not lie below a confirmed commit, and it
+ * declares a crash replay of what an earlier ownership handled at or above it without a commit. A
+ * `produce` record may name its own intended `groups`, a subset of the constructor's; without it
+ * every constructor group is intended.
  */
 class ConsumerChurnOracle {
   /**
@@ -53,6 +56,8 @@ class ConsumerChurnOracle {
     this.starts = new Map()
     this.confirmed = new Map()
     this.replays = new Map()
+    this.highs = new Map()
+    this.entered = new Set()
   }
 
   /**
@@ -159,11 +164,14 @@ class ConsumerChurnOracle {
       case 'acquire':
         if (this.active.has(id)) this.#fail('overlapping ownership')
         this.active.set(id, record.owner)
+        this.replays.delete(id)
+        this.entered.add(id)
         break
       case 'revoke':
       case 'loss':
         if (this.active.get(id) !== record.owner) this.#fail('wrong ownership boundary')
         this.active.delete(id)
+        this.entered.delete(id)
         break
       case 'position':
         this.#position(record, id)
@@ -189,12 +197,19 @@ class ConsumerChurnOracle {
     }
   }
 
-  /** A broker read at acquisition, or an intentional move, fixes where the group's prefix starts. */
+  /**
+   * A broker read at acquisition, or an intentional move, fixes where the group's prefix starts. The
+   * read at acquisition must not undo a confirmed commit, and what an earlier ownership handled from
+   * there up is a crash replay.
+   */
   #position(record, id) {
     const start = BigInt(record.next)
     if (start < 0n) this.#fail('negative position')
     this.starts.set(id, start)
     this.cursors.delete(id)
+    if (!this.entered.delete(id)) return
+    if (start < (this.confirmed.get(id) ?? 0n)) this.#fail('position below confirmed commit')
+    if (this.highs.has(id)) this.#declare(record, id, start, this.highs.get(id) + 1n)
   }
 
   #replay(record, id) {
@@ -202,7 +217,23 @@ class ConsumerChurnOracle {
     if (BigInt(record.from) > BigInt(record.to)) this.#fail('reversed replay interval')
     if (record.reason === 'crash' && BigInt(record.from) !== (this.confirmed.get(id) || 0n))
       this.#fail('replay boundary differs from confirmed commit')
-    this.replays.set(id, record)
+    this.#declare(record, id, BigInt(record.from), BigInt(record.to))
+  }
+
+  /** Lets each record the group already handled in `[from, to)` be handled once more. */
+  #declare(record, id, from, to) {
+    const { offsets, keys } = this.logs.get(this.#log(record)) ?? { offsets: [], keys: [] }
+    let left = 0
+    offsets.forEach((offset, at) => {
+      if (
+        offset >= from &&
+        offset < to &&
+        this.handled.has(JSON.stringify([record.group, keys[at]]))
+      )
+        left += 1
+    })
+    if (left === 0) this.replays.delete(id)
+    else this.replays.set(id, { from, to, left, done: new Set() })
   }
 
   #handle(record, id, key) {
@@ -213,14 +244,21 @@ class ConsumerChurnOracle {
     if (this.active.get(id) !== record.owner) this.#fail('handler after ownership boundary')
     const deliveryKey = JSON.stringify([record.group, key])
     const offset = BigInt(record.offset)
-    if (this.handled.has(deliveryKey)) {
-      const replay = this.replays.get(id)
-      if (!replay || offset < BigInt(replay.from) || offset >= BigInt(replay.to))
-        this.#fail('undeclared handler replay')
-    }
+    if (this.handled.has(deliveryKey)) this.#replayed(id, offset)
+    this.entered.delete(id)
+    if (offset > (this.highs.get(id) ?? -1n)) this.highs.set(id, offset)
     this.handled.add(deliveryKey)
     this.counts.delivered += 1
     this.#advance(record, id, record.group)
+  }
+
+  /** Spends the declared replay of one record; it ends with the last record of its interval. */
+  #replayed(id, offset) {
+    const replay = this.replays.get(id)
+    if (!replay || offset < replay.from || offset >= replay.to || replay.done.has(offset))
+      this.#fail('undeclared handler replay')
+    replay.done.add(offset)
+    if (replay.done.size === replay.left) this.replays.delete(id)
   }
 
   /** Moves the group's contiguous prefix over every acknowledged offset it has now handled. */
@@ -229,9 +267,6 @@ class ConsumerChurnOracle {
     let at = this.#cursor(id, offsets)
     while (at < offsets.length && this.handled.has(JSON.stringify([group, keys[at]]))) at += 1
     this.cursors.set(id, at)
-    const replay = this.replays.get(id)
-    const passed = at < offsets.length ? offsets[at] : offsets[at - 1] + 1n
-    if (replay && passed >= BigInt(replay.to)) this.replays.delete(id)
   }
 
   #cursor(id, offsets) {
@@ -291,7 +326,15 @@ class ConsumerChurnOracle {
       const [owner, name] = JSON.parse(log)
       if (owner === incarnation && name === topic) this.logs.delete(log)
     }
-    for (const map of [this.cursors, this.starts, this.confirmed, this.replays, this.active]) {
+    for (const map of [
+      this.cursors,
+      this.starts,
+      this.confirmed,
+      this.replays,
+      this.active,
+      this.highs,
+      this.entered,
+    ]) {
       for (const id of map.keys()) {
         const [, owner, name] = JSON.parse(id)
         if (owner === incarnation && name === topic) map.delete(id)
@@ -979,6 +1022,20 @@ const consumerControls = () => {
       name: 'replay below the confirmed boundary',
       diagnostic: 'replay boundary differs from confirmed commit',
       records: insert(5, at('replay', { reason: 'crash', from: '0', to: '1' })),
+    },
+    {
+      name: 'position below the confirmed boundary',
+      diagnostic: 'position below confirmed commit',
+      records: insert(
+        6,
+        at('acquire', { owner: 'owner-b' }),
+        at('position', { owner: 'owner-b', next: '0' })
+      ),
+    },
+    {
+      name: 'delivery repeated inside one ownership',
+      diagnostic: 'undeclared handler replay',
+      records: insert(4, at('handler')),
     },
     {
       name: 'handler after revoke',

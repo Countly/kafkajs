@@ -85,6 +85,7 @@ class ChurnMember {
     this.committed = new Map()
     this.sinceCommit = 0
     this.acquisitions = 0
+    this.committing = Promise.resolve()
   }
 
   /**
@@ -214,9 +215,17 @@ class ChurnMember {
   /**
    * Commits every partition whose contiguous processed position moved, then reads the broker back.
    * A commit the client refuses because ownership ended is not an error and not an observation.
+   * Calls run one at a time, so a commit in flight is journaled before a later boundary and is
+   * never repeated by it.
    * @returns {Promise<void>}
    */
-  async commitAll() {
+  commitAll() {
+    const run = this.committing.then(() => this.#commitProcessed())
+    this.committing = run.catch(() => {})
+    return run
+  }
+
+  async #commitProcessed() {
     for (const key of [...this.processed.keys()]) {
       const [topic, partition] = splitKey(key)
       const held = this.#held(topic, partition)
