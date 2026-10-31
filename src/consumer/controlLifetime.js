@@ -3,10 +3,10 @@ const { ConsumerOperation } = require('./groupProtocol/interface')
 
 /**
  * What one explicit connection of a consumer owns: the fence of its connect, the deadline scopes of
- * its public calls, its topic-recreation registration with the resets it owes, and its crash-restart
- * timer. A consumer starts a new lifetime at the first connect, run or start after an explicit
- * disconnect began, so a close that settles late releases only what it owned and never what its
- * replacement registered. A stop and a crash restart keep the same lifetime and its debt.
+ * its public calls, and its topic-recreation registration with the resets it owes. A consumer
+ * starts a new lifetime at the first connect, run or start after an explicit disconnect began, so
+ * a close that settles late releases only what it owned and never what its replacement
+ * registered. A stop and a crash restart keep the same lifetime and its debt.
  */
 class ControlLifetime {
   /**
@@ -22,8 +22,8 @@ class ControlLifetime {
     this.obligations = obligations
     /** @type {(() => void)|null} removes the topic-recreation listener */
     this.removeListener = null
-    /** @type {ReturnType<typeof setTimeout>|null} the pending crash restart */
-    this.restartTimer = null
+    /** True once a forced close, at once or at its deadline, retired this lifetime. */
+    this.forced = false
     /** True once an explicit disconnect or disposal began; the next acquisition starts a new one. */
     this.ending = false
     /** True once `release` ran, so its debt table is empty and free to hand to a successor. */
@@ -31,26 +31,19 @@ class ControlLifetime {
   }
 
   /**
-   * Retires the connect fence and every public call in flight, cancelling their owned timers.
+   * Retires the connect fence and every public call in flight, cancelling their owned timers, for
+   * a forced close.
    * @param {Error} error the first terminal reason
    * @returns {void}
    */
   retire(error) {
+    this.forced = true
     this.fence.retire(error)
     for (const call of [...this.calls]) call.retire(error)
   }
 
   /**
-   * Cancels the pending crash restart, if any.
-   * @returns {void}
-   */
-  cancelRestart() {
-    clearTimeout(this.restartTimer)
-    this.restartTimer = null
-  }
-
-  /**
-   * Releases everything this lifetime registered: the listener, the debt and the restart timer.
+   * Releases everything this lifetime registered: the listener and the debt.
    * Idempotent; called once, synchronously, when its explicit disconnect settles.
    * @returns {void}
    */
@@ -58,7 +51,6 @@ class ControlLifetime {
     this.removeListener?.()
     this.removeListener = null
     this.obligations.clear()
-    this.cancelRestart()
     this.released = true
   }
 }

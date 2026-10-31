@@ -141,7 +141,10 @@ describe('Consumer > coordinator recovery', () => {
     // happened) and not by silently reconnecting the same cached broker reference via
     // findBroker(staleCoordinator), which the old code called directly.
     expect(rebalances).toHaveLength(0)
-    expect(findGroupCoordinatorSpy).toHaveBeenCalledWith({ groupId })
+    expect(findGroupCoordinatorSpy).toHaveBeenCalledWith({
+      groupId,
+      fence: expect.objectContaining({ guard: expect.any(Function) }),
+    })
     expect(findBrokerSpy).not.toHaveBeenCalledWith(cachedCoordinator)
   }, 60000)
 })

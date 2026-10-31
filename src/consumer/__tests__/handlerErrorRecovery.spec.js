@@ -128,6 +128,7 @@ describe('Consumer', () => {
 
       expect(offsets).toEqual({
         clientSideThrottleTime: expect.optional(0),
+        groupId,
         throttleTime: 0,
         errorCode: 0,
         responses: [
@@ -177,6 +178,7 @@ describe('Consumer', () => {
 
       expect(offsets).toEqual({
         clientSideThrottleTime: expect.optional(0),
+        groupId,
         throttleTime: 0,
         errorCode: 0,
         responses: [
@@ -261,6 +263,7 @@ describe('Consumer', () => {
 
       expect(offsets).toEqual({
         clientSideThrottleTime: expect.optional(0),
+        groupId,
         throttleTime: 0,
         errorCode: 0,
         responses: [

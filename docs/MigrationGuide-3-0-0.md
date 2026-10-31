@@ -451,6 +451,7 @@ says so, `groupProtocol: 'consumer'`.
   never restarts under `groupProtocol: 'consumer'`"). *What to do:* check that a
   `restartOnFailure` you already pass returns what you want for non-retriable errors too.
   A public disconnect that completes during crash cleanup also cancels the pending restart. The crash event reports `restart: false`; a later explicit connect/run can reuse the consumer.
+  A `consumer.disconnect()` that a `CRASH` listener makes does not cancel the restart, as in 2.2.4: the event has already reported `restart: true`, and the restart waits for that close to finish before the new run starts. That differs from the disconnect above, which finishes before `CRASH` is emitted, so the event reports `restart: false`. A forced close (`disconnect({ timeout: 0 })`), a close whose `timeout` expires, and any `stop()` or `disconnect()` asked after the restart is armed still cancel it, as does an explicit `run()`, which supersedes a pending automatic restart.
 
 - **`groupInstanceId` makes a static member that does not leave the group on
   `consumer.disconnect()`.**

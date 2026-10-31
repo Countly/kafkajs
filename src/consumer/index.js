@@ -311,6 +311,31 @@ module.exports = (params) => {
   // while it was still deciding whether to restart (e.g. a slow restartOnFailure callback).
   let stopGeneration = 0
   /**
+   * The one pending automatic restart after a crash: its timer and the lifetime that crashed. The
+   * object is the restart's identity, so a restart that was cancelled or superseded can tell. It
+   * acquires nothing, so cancelling it has nothing of the restart to release.
+   * @type {{ timer: ReturnType<typeof setTimeout>|null, crashed: ControlLifetime }|null}
+   */
+  let restart = null
+
+  /**
+   * Cancels the pending crash restart, both while its timer is armed and while it waits for a close.
+   * @returns {void}
+   */
+  const cancelRestart = () => {
+    if (restart) clearTimeout(restart.timer)
+    restart = null
+  }
+
+  /**
+   * Records that a stop or disconnect was asked, which cancels the pending crash restart.
+   * @returns {void}
+   */
+  const noteStop = () => {
+    stopGeneration++
+    cancelRestart()
+  }
+  /**
    * The close in progress. Concurrent disconnects join its whole cleanup, so the first call's
    * timeout and leave choice govern; it is cleared when the cleanup settles.
    * `joins` counts the later `disconnect()` calls that joined it.
@@ -554,7 +579,7 @@ module.exports = (params) => {
 
   /**
    * Ends a lifetime when its explicit disconnect or disposal settles: its connect fence retires, and
-   * its listener, debt and restart timer are released. The discovery scope goes back only while no
+   * its listener and debt are released. The discovery scope goes back only while no
    * replacement lifetime has begun, because a replacement registered the same declarations.
    * @param {ControlLifetime} owned the lifetime the close began on
    * @returns {void}
@@ -616,7 +641,7 @@ module.exports = (params) => {
    * @returns {Promise<void>}
    */
   const shutDown = async (stopOptions, { keepResets = false } = {}, operation) => {
-    stopGeneration++
+    noteStop()
     const owned = life
 
     try {
@@ -669,6 +694,7 @@ module.exports = (params) => {
       forced = true
       captured?.retire(consumerStoppingError())
       owned.retire(consumerStoppingError())
+      if (restart?.crashed === owned) cancelRestart()
       disconnectCluster(0).then(forcedDone, (error) => {
         logger.warn('Disconnecting the cluster failed', { error: error.message })
         forcedDone()
@@ -699,7 +725,7 @@ module.exports = (params) => {
    */
   const closeShared = (options) => {
     if (closing) {
-      stopGeneration++
+      noteStop()
       closing.joins++
       return closing.promise
     }
@@ -772,7 +798,6 @@ module.exports = (params) => {
    */
   const stopShared = sharedPromiseTo(async (options, operation) => {
     runSlot = null
-    life.cancelRestart()
     const stopping = runner
     try {
       if (stopping) {
@@ -810,7 +835,7 @@ module.exports = (params) => {
     } catch (error) {
       return Promise.reject(error)
     }
-    stopGeneration++
+    noteStop()
     const cleanup = stopShared()
     if (!RebalanceHooks.current()) return cleanup
     acceptFromHook(cleanup)
@@ -827,7 +852,7 @@ module.exports = (params) => {
    * @returns {Promise<void>}
    */
   const dispose = async () => {
-    stopGeneration++
+    noteStop()
     const owned = life
     owned.ending = true
 
@@ -1019,6 +1044,8 @@ module.exports = (params) => {
       manual ? 'manual' : groupProtocol,
       hasGroup
     )
+    // An explicit run supersedes a pending automatic restart, even one waiting on the same close.
+    if (!consumerGroup) cancelRestart()
     const waiting = earlierClose()
     if (waiting) await waiting
     acquireLife()
@@ -1127,6 +1154,29 @@ module.exports = (params) => {
       await started
     }
 
+    /**
+     * Restarts the run once the crash's restart timer fires. A close that a CRASH listener started
+     * finishes its cluster and group cleanup first, as for a public connect or run. A stop, a
+     * forced or expired close of the crashed connection, or an explicit run supersedes the restart,
+     * so it is dropped unless it is still the pending one and no run exists.
+     * @param {Function} onCrash the crash handler the new run reports to
+     * @param {{ crashed: ControlLifetime }} pending the restart's identity
+     * @returns {Promise<void>}
+     */
+    const restartAfterCrash = async (onCrash, pending) => {
+      const waiting = earlierClose()
+      if (waiting) {
+        try {
+          await waiting
+        } catch {
+          return
+        }
+      }
+      if (restart !== pending || pending.crashed.forced) return
+      restart = null
+      if (!consumerGroup) start(onCrash)
+    }
+
     const onCrash = async (e, owned) => {
       logger.error(`Crash: ${e.name}: ${e.message}`, {
         groupId,
@@ -1214,7 +1264,7 @@ module.exports = (params) => {
         restart: shouldRestart,
       })
 
-      if (shouldRestart) {
+      if (shouldRestart && !owned.forced) {
         const retryTime = e.retryTime || (retry && retry.initialRetryTime) || initialRetryTime
         logger.error(`Restarting the consumer in ${retryTime}ms`, {
           retryCount: e.retryCount,
@@ -1222,15 +1272,14 @@ module.exports = (params) => {
           groupId,
         })
 
+        const pending = { timer: null, crashed: owned }
         // Created outside any handler or callback store: the restart must not inherit its authority.
-        owned.restartTimer = handlerContext.run(null, () =>
+        pending.timer = handlerContext.run(null, () =>
           RebalanceHooks.outside(() =>
-            setTimeout(() => {
-              owned.restartTimer = null
-              if (stopGeneration === crashStopGeneration && !owned.fence.closed) start(onCrash)
-            }, retryTime)
+            setTimeout(() => restartAfterCrash(onCrash, pending), retryTime)
           )
         )
+        restart = pending
       }
     }
 
@@ -1701,7 +1750,7 @@ module.exports = (params) => {
   const unsubscribe = async () => {
     refuseRetiredCaller()
     const revision = ++selectionRevision
-    stopGeneration++
+    noteStop()
     const cleanup = stopShared().then(() =>
       cluster.resetTargetTopics([], {
         isCurrent: () => selectionRevision === revision,
