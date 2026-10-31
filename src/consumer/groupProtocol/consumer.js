@@ -1171,17 +1171,18 @@ module.exports = class ConsumerGroupProtocol {
   }
 
   /**
-   * Whether an answer belongs to a request built in an earlier membership: one the member has since
-   * been fenced out of, or left, and begun a new join after. A success would install the old epoch
-   * over the join's zero and settle the join with no epoch-0 heartbeat; a fencing error would fence
-   * the new join for the old one's loss. The revision moves only on those resets, never on
-   * reconciliation progress.
+   * Whether an answer belongs to a request built in an earlier membership while the member is
+   * joining anew (it was fenced out of, or left, that membership and began a new join). A success
+   * would install the old epoch over the join's zero and settle the join with no epoch-0
+   * heartbeat; a fencing error would fence the new join for the old one's loss. Outside a new join
+   * the answer is still processed, so a fencing learned from it reaches the member. The revision
+   * moves only on resets, never on reconciliation progress.
    * @private
    * @param {symbol} membershipAtRequest `membershipRevision` when the request was built
    * @returns {boolean}
    */
   answersEarlierMembership(membershipAtRequest) {
-    return membershipAtRequest !== this.membershipRevision
+    return this.state === JOINING && membershipAtRequest !== this.membershipRevision
   }
 
   /**
