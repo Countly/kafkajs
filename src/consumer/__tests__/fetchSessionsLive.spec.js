@@ -25,6 +25,7 @@ const {
   FETCH,
   MODES,
   POLL_MS,
+  RECREATE_PARTITIONS,
   SessionRig,
   STEP_MS,
   closeProblems,
@@ -56,6 +57,10 @@ const OUTAGE_HOLD_MS = 10000
 const CLOSE_BUDGET_MS = 10000
 const CLOSE_GRACE_MS = 2000
 const PARTITION_LIST = Array.from({ length: PARTITIONS }, (_, partition) => partition)
+const RECREATE_PARTITION_LIST = Array.from(
+  { length: RECREATE_PARTITIONS },
+  (_, partition) => partition
+)
 
 /**
  * Runs one case body with its own rig and cleanup, and writes the case's evidence row between the
@@ -552,15 +557,15 @@ describeSessions('Consumer > Fetch sessions (live)', () => {
         await rig.open()
         const topic = `${PREFIX}-recreate-${rig.id}`
         const groupId = `${PREFIX}-recreate-group-${rig.id}`
-        const oldId = await rig.createTopic({ topic, partitions: PARTITIONS })
+        const oldId = await rig.createTopic({ topic, partitions: RECREATE_PARTITIONS })
         const member = await rig.startMember({
           name: 'member',
           mode: 'classic eager dynamic',
           topic,
-          partitions: PARTITION_LIST,
+          partitions: RECREATE_PARTITION_LIST,
           groupId,
         })
-        const first = await rig.produce('first', topic, PARTITION_LIST, RECORDS)
+        const first = await rig.produce('first', topic, RECREATE_PARTITION_LIST, RECORDS)
         await rig.delivered(member, first)
 
         const recreatedAt = performance.now()
@@ -571,7 +576,7 @@ describeSessions('Consumer > Fetch sessions (live)', () => {
           rig.admin.createTopics({
             waitForLeaders: true,
             timeout: 20000,
-            topics: [{ topic, numPartitions: PARTITIONS, replicationFactor: 1 }],
+            topics: [{ topic, numPartitions: RECREATE_PARTITIONS, replicationFactor: 1 }],
           })
         )
         let newId
@@ -585,7 +590,7 @@ describeSessions('Consumer > Fetch sessions (live)', () => {
           { delayMs: POLL_MS, label: 'The new topic ID' }
         )
         Object.assign(rig.facts, { oldId, newId })
-        const second = await rig.produce('second', topic, PARTITION_LIST, RECORDS)
+        const second = await rig.produce('second', topic, RECREATE_PARTITION_LIST, RECORDS)
         await rig.delivered(member, second)
         await rig.quiet()
 

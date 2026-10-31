@@ -21,6 +21,14 @@ const QUIET_MS = 1000
 const DELIVERY_MS = 30000
 const WAIT_MS = 500
 const MISSING_TOPIC = 'UNKNOWN_TOPIC_OR_PARTITION'
+/**
+ * The partition count of the topic a live case deletes and recreates: the broker's default
+ * (`KAFKA_NUM_PARTITIONS` in the compose files). A subscribed consumer's metadata refresh brings a
+ * deleted topic back by itself, with that count and before the case's own `createTopics()`, which
+ * then answers "already exists" and is benign. Both paths then make the same topic, whichever
+ * wins the race.
+ */
+const RECREATE_PARTITIONS = 2
 
 /** The assignment modes a Fetch session must serve, each with the consumer options it needs. */
 const MODES = {
@@ -832,6 +840,7 @@ module.exports = {
   MODES,
   POLL_MS,
   QUIET_MS,
+  RECREATE_PARTITIONS,
   SessionRig,
   SessionWire,
   STEP_MS,

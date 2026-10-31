@@ -1,6 +1,9 @@
+const fs = require('fs')
+const path = require('path')
 const { TOPIC_ID, fetchResponse } = require('./fixtures/fetchHarness')
 const {
   FETCH,
+  RECREATE_PARTITIONS,
   SessionWire,
   capacityProblems,
   closeProblems,
@@ -454,4 +457,15 @@ describe('the fault and outage clocks', () => {
     expect([sent(1, 8, 20, false), sent(1, 9, 30, true)].find(lost)).toEqual(sent(1, 8, 20, false))
     expect(connectionOf([], 1)).toBeUndefined()
   })
+})
+
+describe('the recreated topic', () => {
+  it.each(['docker-compose.racks.yml', 'docker-compose.fetch-sessions.yml'])(
+    'has the partition count %s auto-creates a topic with',
+    (file) => {
+      const compose = fs.readFileSync(path.join(__dirname, '../../..', file), 'utf8')
+      const [, count] = compose.match(/KAFKA_NUM_PARTITIONS: '(\d+)'/)
+      expect(RECREATE_PARTITIONS).toBe(Number(count))
+    }
+  )
 })
