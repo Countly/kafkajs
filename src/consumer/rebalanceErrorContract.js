@@ -90,7 +90,7 @@ const stampOffsetCommit = (error) => {
  * @returns {boolean}
  */
 const isDeletedGroupCommit = (error) =>
-  error.code === GROUP_ID_NOT_FOUND && Boolean(error[OFFSET_COMMIT_ORIGIN])
+  error.code === GROUP_ID_NOT_FOUND && Boolean(carried(error, OFFSET_COMMIT_ORIGIN))
 
 /**
  * Whether an error came from an OffsetCommit this client sent: its coordinator lookup, the request
@@ -99,7 +99,7 @@ const isDeletedGroupCommit = (error) =>
  * @returns {boolean}
  */
 const isOffsetCommitError = (error) =>
-  error !== null && typeof error === 'object' && Boolean(error[OFFSET_COMMIT_ORIGIN])
+  error !== null && typeof error === 'object' && Boolean(carried(error, OFFSET_COMMIT_ORIGIN))
 
 /** The message the Java client gives when the cluster cannot speak the new group protocol. */
 const CONSUMER_PROTOCOL_UNSUPPORTED_MESSAGE =

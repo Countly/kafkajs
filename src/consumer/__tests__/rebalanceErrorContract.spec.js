@@ -12,10 +12,16 @@ const {
   sentMembership,
   isStaleMembershipVerdict,
   obsoleteOwnership,
+  isOffsetCommitError,
   REBALANCE_PATHS,
 } = require('../rebalanceErrorContract')
+const Runner = require('../runner')
 const GroupOwnership = require('../groupOwnership')
-const { KafkaJSNonRetriableError, KafkaJSNumberOfRetriesExceeded } = require('../../errors')
+const {
+  KafkaJSNonRetriableError,
+  KafkaJSNumberOfRetriesExceeded,
+  KafkaJSDeliveryTimeout,
+} = require('../../errors')
 const {
   isRebalancing,
   isLostMember,
@@ -525,6 +531,41 @@ describe('Consumer > rebalance error contract', () => {
       loop.cause = loop
 
       expect(sentGeneration(loop)).toBeUndefined()
+    })
+  })
+
+  describe('the commit origin through wrappers', () => {
+    const committed = (code) => stampOffsetCommit(createErrorFromCode(code))
+    const wrapped = (raw) => new KafkaJSNonRetriableError(raw, { cause: raw })
+
+    it.each([['classic'], ['consumer']])('keeps a wrapped code 69 a loss under %s', (kind) => {
+      const raw = committed(69)
+
+      expect(rebalanceAction(wrapped(raw), REBALANCE_PATHS.FETCH, { kind }).action).toBe('lost')
+    })
+
+    it.each([[14], [16]])('keeps a wrapped handler code %i on the commit outage path', (code) => {
+      const raw = committed(code)
+      const wrapper = wrapped(raw)
+      const requestClasses = new WeakMap([
+        [raw, 'handler'],
+        [wrapper, 'handler'],
+      ])
+
+      expect(Runner.prototype.requestClassOf.call({ requestClasses }, wrapper)).toBe('commit')
+    })
+
+    it('keeps the origin through a delivery timeout', () => {
+      const raw = committed(69)
+
+      expect(isOffsetCommitError(new KafkaJSDeliveryTimeout(raw, { cause: raw }))).toBe(true)
+    })
+
+    it('does not invent an origin for an unstamped wrapper (control)', () => {
+      const raw = createErrorFromCode(69)
+
+      expect(isOffsetCommitError(wrapped(raw))).toBe(false)
+      expect(rebalanceAction(wrapped(raw), REBALANCE_PATHS.FETCH).action).toBeNull()
     })
   })
 })
