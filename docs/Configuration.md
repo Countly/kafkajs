@@ -373,6 +373,8 @@ Consumer Fetch byte settings are response targets, not a guarantee that every re
 
 Incremental Fetch sessions are opt-in with `fetchSessions: true` on the consumer (default `false`); see [Fetch sessions](Consuming.md#fetch-sessions). They reduce repeated partition headers, while `maxResponseSize`, `maxBytes`, CRC checking and decompressed batch byte/record bounds still apply to every response.
 
+A consumer's `maxBytes` is a response target and does not cap process memory. See [memory with large assignments](Consuming.md#large-assignment-memory) for the measurement method and available sizing observations. Account for oversized first batches, decompression, concurrent brokers and records retained by the application.
+
 ## Metadata recovery
 
 `metadataRecoveryStrategy` and `metadataRecoveryRebootstrapTriggerMs`, available on the `Kafka`

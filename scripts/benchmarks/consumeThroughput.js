@@ -3,13 +3,13 @@
  * handling latency and the gap between consecutive handler entries.
  * Usage: node [--expose-gc] scripts/benchmarks/consumeThroughput.js [--messages 200000]
  *          [--size 200] [--partitions 6] [--timeout <ms>] [--handler eachBatch|eachMessage]
- *          [--subscribe-channels 0|1] [--max-bytes-per-partition <n>]
+ *          [--subscribe-channels 0|1] [--max-bytes-per-partition <n>] [--max-bytes <n>] [--rss]
  *          [--autocommit-threshold <n>] [--otel 0|1] [--intern-offsets 0|1] [--control 0|1]
  *          [--listener 0|1]
  * Prints one JSON line: { messages, size, partitions, handler, subscribeChannels,
  *   messagesPerSecond, p50, p90, p99, handlerP99, deliveryGapP50, deliveryGapP90, deliveryGapP99,
  *   batches, deliveredMessages, deliveredBatches, handlerEntries, gapSamples, deliveredBytes,
- *   heapRetainedBytes }
+ *   heapRetainedBytes, sizing? }
  *
  * `deliveryGap*` is the time between consecutive handler entries, so decode, queue wait, runner
  * work and a commit between two entries are inside it. `p50`, `p90`, `p99` and `handlerP99` (the
@@ -22,6 +22,11 @@
  * `--listener 1` registers a rebalance listener with an assigned and a revoked callback on the same
  * `run` call. It counts the initial assignment and the graceful-teardown revoke, outside the timed
  * interval, and fails the run unless each happened once; the eager startup revoke does not count.
+ * `--max-bytes n` sets the consumer's response target. `--rss` is the sizing observation, not a
+ * gate: it needs `--expose-gc`, `--partitions 1000` and `--max-bytes` 10485760, 26214400 or 52428800,
+ * puts a record on every partition explicitly, and adds `sizing` to the output (sampled RSS peak,
+ * process RSS high water, heap retained after two collections while the consumer still holds its
+ * assignment). A partition that received no data fails the run.
  * `--autocommit-threshold n` turns `autoCommit` on with that threshold. `--otel 1` registers the
  * instrumentation of this tree's `otel/` with a tracer and a meter provider that export nothing.
  * `--intern-offsets 1` keeps every offset string in a Map: a deliberate leak, the control that
@@ -59,6 +64,121 @@ const { Clients } = require('../clients')
 const subscribeChannels = require('./subscribeChannels')
 const { DeliveryAccounting } = require('./fetchFrameCounter')
 
+/**
+ * Samples memory while one benchmark consumer still owns its assignment.
+ * This observer is enabled only for sizing runs; its peaks are sampled, not a heap ceiling.
+ * @class
+ */
+class SizingObservation {
+  /**
+   * @param {object} options observation dependencies
+   * @param {number} options.partitions exact expected partition count
+   * @param {Function} [options.sample] returns RSS and heapUsed in bytes
+   * @param {Function} [options.collect] performs two collections 100 ms apart
+   * @param {Function} [options.highWater] process RSS high water in bytes since process start
+   * @returns {SizingObservation} inactive observer
+   * @throws {Error} for an invalid partition count
+   */
+  constructor({
+    partitions,
+    sample = () => process.memoryUsage(),
+    collect = doubleGC,
+    highWater = () => process.resourceUsage().maxRSS * 1024,
+  }) {
+    if (!Number.isInteger(partitions) || partitions < 1) throw new Error('Invalid partition count')
+    this.partitions = partitions
+    this.sample = sample
+    this.collect = collect
+    this.highWater = highWater
+    this.seen = new Set()
+  }
+
+  /**
+   * Starts a fresh baseline and a five millisecond sampler before consumer.run.
+   * @returns {void} observer started
+   * @throws {Error} if a memory sample fails
+   */
+  start() {
+    this.before = this.sample()
+    this.peakRSS = this.before.rss
+    this.peakHeap = this.before.heapUsed
+    this.timer = setInterval(() => this.samplePeak(), 5)
+  }
+
+  /**
+   * Records a memory sample without retaining consumer messages.
+   * @returns {void} peak RSS and heap updated
+   * @throws {Error} if a memory sample fails
+   */
+  samplePeak() {
+    const current = this.sample()
+    this.peakRSS = Math.max(this.peakRSS, current.rss)
+    this.peakHeap = Math.max(this.peakHeap, current.heapUsed)
+  }
+
+  /**
+   * Records a partition only when its handler received data.
+   * @param {number} partition the partition of a nonempty delivery
+   * @returns {void} coverage and sampled peaks updated
+   * @throws {Error} for an unexpected partition
+   */
+  observe(partition) {
+    if (!Number.isInteger(partition) || partition < 0 || partition >= this.partitions)
+      throw new Error(`Unexpected partition ${partition}`)
+    this.seen.add(partition)
+    this.samplePeak()
+  }
+
+  /**
+   * Reads retained memory before consumer.stop or disconnect, after two collections.
+   * @returns {Promise<object>} byte measurements and independently observed partition coverage
+   * @throws {Error} for missing partition data or a collection/sample failure
+   */
+  async finish() {
+    try {
+      this.samplePeak()
+    } finally {
+      this.dispose()
+    }
+    if (this.seen.size !== this.partitions)
+      throw new Error(`Data reached ${this.seen.size} of ${this.partitions} partitions`)
+    await this.collect()
+    const retained = this.sample()
+    return {
+      partitionsWithData: this.seen.size,
+      rssBeforeBytes: this.before.rss,
+      rssPeakBytes: this.peakRSS,
+      rssProcessPeakBytes: this.highWater(),
+      rssGrowthBytes: this.peakRSS - this.before.rss,
+      heapBeforeBytes: this.before.heapUsed,
+      heapPeakBytes: this.peakHeap,
+      heapRetainedBytes: retained.heapUsed,
+      heapRetainedGrowthBytes: retained.heapUsed - this.before.heapUsed,
+    }
+  }
+
+  /** Stops the sampler on every settlement path.
+   * @returns {void} no outstanding sampler timer
+   * @throws Never.
+   */
+  dispose() {
+    clearInterval(this.timer)
+    this.timer = undefined
+  }
+}
+
+/**
+ * Performs two explicit collections 100 ms apart for an active-assignment observation.
+ * @returns {Promise<void>} both collections complete
+ * @throws {Error} if exposed GC is unavailable
+ */
+async function doubleGC() {
+  if (typeof global.gc !== 'function') throw new Error('Sizing requires --expose-gc')
+  global.gc()
+  await new Promise((resolve) => setTimeout(resolve, 100))
+  global.gc()
+}
+
 const arg = (name, fallback) => {
   const i = process.argv.indexOf(`--${name}`)
   return i === -1 ? fallback : Number(process.argv[i + 1])
@@ -75,6 +195,8 @@ const OTEL = arg('otel', 0)
 const INTERN_OFFSETS = arg('intern-offsets', 0)
 const CONTROL = arg('control', 0)
 const LISTENER = arg('listener', 0)
+const RSS = process.argv.includes('--rss')
+const MAX_BYTES = process.argv.includes('--max-bytes') ? arg('max-bytes') : undefined
 const MAX_BYTES_PER_PARTITION = process.argv.includes('--max-bytes-per-partition')
   ? arg('max-bytes-per-partition')
   : undefined
@@ -107,6 +229,7 @@ for (const [name, value] of [
   }
 }
 for (const [name, value] of [
+  ['max-bytes', MAX_BYTES],
   ['max-bytes-per-partition', MAX_BYTES_PER_PARTITION],
   ['autocommit-threshold', AUTOCOMMIT_THRESHOLD],
 ]) {
@@ -114,6 +237,11 @@ for (const [name, value] of [
     console.error(`--${name} must be an integer of at least 1, got ${value}`)
     process.exit(1)
   }
+}
+
+if (MAX_BYTES !== undefined && MAX_BYTES > 2147483647) {
+  console.error('--max-bytes must be at most 2147483647')
+  process.exit(1)
 }
 
 const percentile = (sorted, p) => sorted[Math.min(sorted.length - 1, Math.floor(sorted.length * p))]
@@ -376,7 +504,10 @@ const produceCorpus = (kafka) =>
       const count = Math.min(PRODUCE_BATCH, MESSAGES - sent)
       await producer.send({
         topic: TOPIC,
-        messages: Array.from({ length: count }, () => ({ value })),
+        messages: Array.from({ length: count }, (_, index) => ({
+          value,
+          ...(RSS && { partition: (sent + index) % PARTITIONS }),
+        })),
       })
     }
   })
@@ -396,10 +527,12 @@ const produceCorpus = (kafka) =>
  * @param {number} [options.timeout] drain deadline in milliseconds, armed after run resolves
  * @param {() => bigint} [options.now] monotonic measurement clock
  * @param {boolean} [options.listener] registers the counted rebalance listener, as `--listener 1`
+ * @param {number} [options.maxBytes] response target passed unchanged to the consumer
+ * @param {SizingObservation} [options.sizing] sizing observer, finished before stop
  * @returns {Promise<{ messagesPerSecond: number, p50: number, p90: number, p99: number,
  *   handlerP99: number, deliveryGapP50: number|null, deliveryGapP90: number|null, deliveryGapP99: number|null,
  *   batches: number, deliveredMessages: number, deliveredBatches: number, handlerEntries: number,
- *   gapSamples: number, deliveredBytes: number }>} throughput over the consume phase, handling latency in ms and the gaps
+ *   gapSamples: number, deliveredBytes: number, sizing?: object }>} throughput over the consume phase, handling latency in ms and the gaps
  *   between handler entries in ms
  * @throws {Error} the failure of connect, subscribe, run or stop, or the drain deadline;
  *   after owner cleanup and timer clearing; a run with no bytes or a mismatched record total
@@ -415,6 +548,8 @@ const consumeOnce = async (
     timeout = TIMEOUT_MS,
     now = () => process.hrtime.bigint(),
     listener = LISTENER === 1,
+    maxBytes = MAX_BYTES,
+    sizing = RSS ? new SizingObservation({ partitions: PARTITIONS }) : undefined,
   } = {}
 ) => {
   const latencies = []
@@ -428,6 +563,7 @@ const consumeOnce = async (
     : undefined
   let bytes = 0
   let finishedAt
+  let sizingResult
   let startedAt
   let resolveWhenDrained
   const drained = new Promise((resolve) => {
@@ -445,6 +581,7 @@ const consumeOnce = async (
     eachBatch: async ({ batch }) => {
       const batchStartedAt = now()
       accounting.enter(batch.messages.length, batchStartedAt)
+      if (batch.messages.length > 0) sizing?.observe(batch.partition)
       if (startedAt === undefined) {
         startedAt = batchStartedAt
       }
@@ -470,6 +607,7 @@ const consumeOnce = async (
     eachMessage: async ({ partition, message }) => {
       const messageStartedAt = now()
       accounting.enter(1, messageStartedAt)
+      sizing?.observe(partition)
       if (startedAt === undefined) {
         startedAt = messageStartedAt
       }
@@ -491,6 +629,7 @@ const consumeOnce = async (
   await Clients.use(kafka, async (clients) => {
     const consumer = clients.consumer({
       groupId: `${TOPIC}-run-${run}`,
+      ...(maxBytes !== undefined && { maxBytes }),
       ...(MAX_BYTES_PER_PARTITION !== undefined && {
         maxBytesPerPartition: MAX_BYTES_PER_PARTITION,
       }),
@@ -500,6 +639,8 @@ const consumeOnce = async (
     try {
       await consumer.connect()
       await consumer.subscribe({ topic: TOPIC, fromBeginning: true })
+      if (sizing) await sizing.collect()
+      sizing?.start()
       await consumer.run({
         ...(handler === 'eachMessage' ? eachMessageArm : eachBatchArm),
         ...(rebalanceListener && { rebalanceListener }),
@@ -517,8 +658,11 @@ const consumeOnce = async (
       })
       await Promise.race([drained, deadline])
       finishedAt = now()
+      clearTimeout(deadlineTimer)
+      if (sizing) sizingResult = await sizing.finish()
     } finally {
       clearTimeout(deadlineTimer)
+      sizing?.dispose()
     }
     listenerAccounting?.beginTeardown()
     await consumer.stop()
@@ -538,6 +682,7 @@ const consumeOnce = async (
   const counts = accounting.result()
   return {
     messagesPerSecond: (accounting.messages / elapsedMs) * 1000,
+    ...(sizingResult && { sizing: sizingResult }),
     ...latency,
     handlerP99: latency.p99,
     ...counts,
@@ -549,6 +694,18 @@ const consumeOnce = async (
 ;(async () => {
   if (require.main !== module) {
     return
+  }
+
+  if (RSS) {
+    if (
+      PARTITIONS !== 1000 ||
+      MESSAGES < PARTITIONS ||
+      ![10485760, 26214400, 52428800].includes(MAX_BYTES)
+    )
+      throw new Error(
+        'Sizing requires 1000 populated partitions and max-bytes 10485760, 26214400 or 52428800'
+      )
+    await doubleGC()
   }
 
   if (OTEL === 1) {
@@ -619,6 +776,7 @@ const consumeOnce = async (
 })
 
 module.exports = {
+  SizingObservation,
   percentiles,
   deliveryGaps,
   countLedgerCalls,

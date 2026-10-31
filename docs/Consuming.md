@@ -327,6 +327,10 @@ The classic session default is 45 seconds. A member that stops heartbeating can 
 
 The kept Fetch wait is `maxWaitTimeInMs: 5000`, and the kept response target is `maxBytes: 10485760`. These values are configuration defaults, not memory measurements. Response sizing measurements for large assignments are reported with their workload and denominators when available.
 
+### <a name="large-assignment-memory"></a> Memory with large assignments
+
+`maxBytes` remains 10485760 (10 MiB). It is a response target, not a heap ceiling. An oversized first batch, decompression and concurrent Fetch requests to brokers can exceed it. Measurements for a consumer with 1000 populated partitions and response targets of 10, 25 and 50 MiB are pending on the release benchmark runners. No measured memory sizing recommendation is available yet. Size the heap for concurrent responses, decompressed batches and application-held records, and measure the application's actual workload before raising the response target.
+
 ## <a name="static-membership"></a> Static membership
 
 By default, a consumer is a **dynamic member** of its group: every time it disconnects (even briefly, e.g. a deploy), it leaves the group and the broker immediately rebalances the remaining members. Setting `groupInstanceId` makes the consumer a **static member** (KIP-345) instead — it keeps its identity and assigned partitions across a restart, as long as it reconnects within `sessionTimeout`.

@@ -690,3 +690,193 @@ describe('Benchmarks > listener controls', () => {
     }
   )
 })
+
+describe('Benchmarks > active assignment sizing', () => {
+  const snapshots = [
+    { rss: 100, heapUsed: 30 },
+    { rss: 140, heapUsed: 90 },
+    { rss: 120, heapUsed: 50 },
+  ]
+
+  const observation = (options = {}) => {
+    const { SizingObservation } = loadBenchmark()
+    let index = 0
+    return new SizingObservation({
+      partitions: 3,
+      sample: () => snapshots[Math.min(index++, snapshots.length - 1)],
+      collect: async () => {},
+      highWater: () => 160,
+      ...options,
+    })
+  }
+
+  test('records sampled peaks and retained growth before consumer cleanup', async () => {
+    const sizing = observation()
+    sizing.start()
+    sizing.observe(0)
+    sizing.observe(1)
+    sizing.observe(2)
+    expect(await sizing.finish()).toEqual({
+      partitionsWithData: 3,
+      rssBeforeBytes: 100,
+      rssPeakBytes: 140,
+      rssProcessPeakBytes: 160,
+      rssGrowthBytes: 40,
+      heapBeforeBytes: 30,
+      heapPeakBytes: 90,
+      heapRetainedBytes: 50,
+      heapRetainedGrowthBytes: 20,
+    })
+  })
+
+  test('refuses a corpus that missed an assigned partition', async () => {
+    const sizing = observation()
+    sizing.start()
+    sizing.observe(0)
+    sizing.observe(2)
+    await expect(sizing.finish()).rejects.toThrow('Data reached 2 of 3 partitions')
+  })
+
+  test('rejects an out of range partition instead of counting it as coverage', () => {
+    const sizing = observation()
+    sizing.start()
+    expect(() => sizing.observe(3)).toThrow('Unexpected partition 3')
+    sizing.dispose()
+  })
+
+  test('takes the final retained sample after both collections', async () => {
+    let collections = 0
+    const sizing = observation({
+      sample: () => ({ rss: 100, heapUsed: collections === 2 ? 40 : 80 }),
+      collect: async () => {
+        collections += 2
+      },
+    })
+    sizing.start()
+    for (const partition of [0, 1, 2]) sizing.observe(partition)
+    expect((await sizing.finish()).heapRetainedBytes).toBe(40)
+  })
+
+  test('disposes its sampler on a failed collection', async () => {
+    const failure = new Error('collection failed')
+    const sizing = observation({
+      collect: async () => {
+        throw failure
+      },
+    })
+    jest.useFakeTimers()
+    try {
+      sizing.start()
+      for (const partition of [0, 1, 2]) sizing.observe(partition)
+      await expect(sizing.finish()).rejects.toBe(failure)
+      expect(jest.getTimerCount()).toBe(0)
+    } finally {
+      sizing.dispose()
+      jest.useRealTimers()
+    }
+  })
+
+  test('a periodic sample sees a peak between handler entries', async () => {
+    jest.useFakeTimers()
+    let rss = 100
+    const sizing = observation({ sample: () => ({ rss, heapUsed: 30 }) })
+    try {
+      sizing.start()
+      rss = 140
+      await jest.advanceTimersByTimeAsync(5)
+      rss = 100
+      for (const partition of [0, 1, 2]) sizing.observe(partition)
+      expect((await sizing.finish()).rssPeakBytes).toBe(140)
+      expect(jest.getTimerCount()).toBe(0)
+    } finally {
+      sizing.dispose()
+      jest.useRealTimers()
+    }
+  })
+
+  test.each([10485760, 26214400, 52428800])(
+    'passes maxBytes %i to the consumer and samples while it is alive',
+    async (maxBytes) => {
+      const { consumeOnce } = loadBenchmark()
+      const events = []
+      const consumer = {
+        connect: async () => {},
+        subscribe: async () => {},
+        run: async ({ eachBatch }) => {
+          for (const partition of [0, 1, 2]) {
+            await eachBatch({ batch: { partition, messages: [{ value: Buffer.from('x') }] } })
+          }
+        },
+        stop: async () => {
+          events.push('stop')
+        },
+        disconnect: async () => {
+          events.push('disconnect')
+        },
+      }
+      let config
+      const kafka = {
+        consumer: (value) => {
+          config = value
+          return consumer
+        },
+      }
+      const sizing = observation({
+        collect: async () => {
+          events.push('collect')
+        },
+      })
+      const result = await consumeOnce(kafka, 1, undefined, {
+        messages: 3,
+        size: 1,
+        handler: 'eachBatch',
+        maxBytes,
+        sizing,
+      })
+      expect(config.maxBytes).toBe(maxBytes)
+      expect(result.sizing.partitionsWithData).toBe(3)
+      expect(events).toEqual(['collect', 'collect', 'stop', 'disconnect'])
+      expect(result.deliveredMessages).toBe(3)
+      expect(result.gapSamples).toBe(2)
+    }
+  )
+})
+
+test('sizing stops its sampler and disconnects after a run failure', async () => {
+  const { SizingObservation, consumeOnce } = loadBenchmark()
+  const error = new Error('run failed')
+  const sizing = new SizingObservation({
+    partitions: 1,
+    sample: () => ({ rss: 100, heapUsed: 30 }),
+    collect: async () => {},
+  })
+  const disconnect = jest.fn(async () => {})
+  const kafka = {
+    consumer: () => ({
+      connect: async () => {},
+      subscribe: async () => {},
+      run: async () => {
+        throw error
+      },
+      disconnect,
+    }),
+  }
+  jest.useFakeTimers()
+  try {
+    await expect(consumeOnce(kafka, 1, undefined, { sizing })).rejects.toBe(error)
+    expect(jest.getTimerCount()).toBe(0)
+    expect(disconnect).toHaveBeenCalledTimes(1)
+  } finally {
+    jest.useRealTimers()
+  }
+})
+
+test('sizing populates every partition explicitly in its corpus', async () => {
+  const { produceCorpus } = loadBenchmark('--rss', '--partitions', '1000', '--messages', '1000')
+  const send = jest.fn(async () => {})
+  const producer = { connect: async () => {}, disconnect: async () => {}, send }
+  await produceCorpus({ producer: () => producer })
+  expect(send.mock.calls[0][0].messages.map(({ partition }) => partition)).toEqual(
+    Array.from({ length: 1000 }, (_, index) => index)
+  )
+})
