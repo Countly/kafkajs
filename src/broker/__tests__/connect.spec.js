@@ -143,7 +143,7 @@ describe('Broker > connect', () => {
           expect(broker.isConnected()).toEqual(true)
         })
 
-        test('returns false when the session lifetime has expired', async () => {
+        test(`returns false when the session lifetime has expired with SASL ${e.name}`, async () => {
           const sessionLifetime = 15000
           const reauthenticationThreshold = 10000
           const connectionPool = createConnectionPool({ ...e.opts(), reauthenticationThreshold })
@@ -161,7 +161,7 @@ describe('Broker > connect', () => {
           expect(broker.isConnected()).toEqual(false)
         })
 
-        test('returns true when the session lifetime is 0', async () => {
+        test(`returns true when the session lifetime is 0 with SASL ${e.name}`, async () => {
           const connectionPool = createConnectionPool(e.opts())
           broker = new Broker({ connectionPool, logger: newLogger() })
 
