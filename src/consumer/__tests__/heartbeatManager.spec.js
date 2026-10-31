@@ -149,6 +149,55 @@ describe('Consumer > HeartbeatManager', () => {
     expect(jest.getTimerCount()).toEqual(0)
   })
 
+  it('re-arms instead of sending when a tick lands while a heartbeat is in flight', async () => {
+    let release
+    const heartbeat = jest.fn(() => new Promise((resolve) => (release = resolve)))
+    const { manager } = build({ groupMembership: { heartbeat } })
+    manager.ensureStarted()
+    await jest.advanceTimersByTimeAsync(100)
+    expect(jest.getTimerCount()).toEqual(0)
+
+    await manager.tick()
+
+    expect(heartbeat).toHaveBeenCalledTimes(1)
+    expect(jest.getTimerCount()).toEqual(1)
+
+    release()
+    manager.stop()
+    await jest.advanceTimersByTimeAsync(0)
+    expect(jest.getTimerCount()).toEqual(0)
+  })
+
+  it.each([
+    ['a message', 'handler broke', 'heartbeat failed', 'handler broke', 'heartbeat failed'],
+    ['no message', '', '', undefined, undefined],
+  ])(
+    'logs and keeps the chain when the error handler throws with %s',
+    async (_, handlerMessage, heartbeatMessage, loggedError, loggedCause) => {
+      const heartbeatError = new Error(heartbeatMessage)
+      const handlerError = new Error(handlerMessage)
+      const logged = jest.fn()
+      const logger = { namespace: () => ({ error: logged, debug: jest.fn() }) }
+      const heartbeat = jest.fn(async () => {
+        throw heartbeatError
+      })
+      const onError = jest.fn(() => {
+        throw handlerError
+      })
+      const { manager } = build({ groupMembership: { heartbeat }, logger, onError })
+      manager.ensureStarted()
+
+      await jest.advanceTimersByTimeAsync(100)
+
+      expect(logged).toHaveBeenCalledWith('Heartbeat error handler failed', {
+        error: loggedError ?? handlerError,
+        cause: loggedCause ?? heartbeatError,
+      })
+      expect(jest.getTimerCount()).toEqual(1)
+      manager.stop()
+    }
+  )
+
   it('does not unref its handle', async () => {
     const { manager } = build()
     const spy = jest.spyOn(global, 'setTimeout')

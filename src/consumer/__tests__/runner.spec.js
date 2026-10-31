@@ -318,6 +318,14 @@ describe('Consumer > Runner', () => {
       consumerGroup.commitOffsets.mockClear()
     })
 
+    it('does not retry a commit the group reports as not implemented', async () => {
+      const error = new KafkaJSNotImplemented('not implemented')
+      consumerGroup.commitOffsets.mockRejectedValue(error)
+      await runner.start()
+      await expect(runner.commitOffsets(offsets)).rejects.toBe(error)
+      expect(consumerGroup.commitOffsets).toHaveBeenCalledTimes(1)
+    })
+
     it('should commit offsets while running', async () => {
       await runner.start()
       await runner.commitOffsets(offsets)
@@ -974,6 +982,261 @@ describe('Consumer > Runner', () => {
         'handler',
         'logger',
       ])
+    })
+  })
+
+  describe('close, quiescence and crash edges', () => {
+    const roundOf = (guard = () => null, wait = (work) => work()) => ({
+      guard,
+      wait,
+      retire: jest.fn(),
+      roundDeadlineAt: performance.now() + 1000,
+    })
+
+    it('counts a handler batch down by its ownership key and wakes every waiter', () => {
+      const check = jest.fn()
+      runner.hookHandlers = new Map([
+        ['t|0', 2],
+        ['owned', 1],
+      ])
+      runner.hookWaiters = new Set([check])
+      runner.endHookBatch({ topic: 't', partition: 0 })
+      expect(runner.hookHandlers.get('t|0')).toBe(1)
+      runner.endHookBatch({ topic: 't', partition: 0 })
+      runner.endHookBatch({ ownershipKey: 'owned' })
+      expect([...runner.hookHandlers.keys()]).toEqual([])
+      expect(check).toHaveBeenCalledTimes(3)
+      runner.hookHandlers = undefined
+      runner.hookWaiters = undefined
+      expect(() => runner.endHookBatch({ topic: 't', partition: 0 })).not.toThrow()
+    })
+
+    it('wakes the quiescence waiters when the run is retired', () => {
+      const check = jest.fn()
+      runner.hookWaiters = new Set([check])
+      runner.retire(new Error('forced close'))
+      expect(check).toHaveBeenCalledTimes(1)
+      expect(consumerGroup.retireFetchSessions).toHaveBeenCalledTimes(1)
+    })
+
+    it('returns the retirement reason as the commit refusal of a retired run', () => {
+      const reason = new Error('forced close')
+      runner.retirement = reason
+      expect(runner.commitRefusal()).toBe(reason)
+    })
+
+    it('does not start a run that is already running', async () => {
+      runner.running = true
+      await runner.start()
+      expect(consumerGroup.startIdleWait).not.toHaveBeenCalled()
+    })
+
+    it('logs a crash handler that fails and still shuts the heartbeat down', async () => {
+      consumerGroup.connect.mockRejectedValue(new Error('connect failed'))
+      onCrash.mockRejectedValue(new Error('crash handler failed'))
+      const error = jest.spyOn(runner.logger, 'error')
+      await expect(runner.start()).resolves.toBeUndefined()
+      expect(error).toHaveBeenCalledWith(
+        'Crash handler failed',
+        expect.objectContaining({ error: 'crash handler failed', cause: 'connect failed' })
+      )
+    })
+
+    it('crashes a manual run whose local apply fails for another reason', async () => {
+      consumerGroup.kind = 'manual'
+      consumerGroup.applyManualAssignment = jest.fn().mockRejectedValue(new Error('apply failed'))
+      await runner.start()
+      expect(onCrash).toHaveBeenCalledWith(expect.objectContaining({ message: 'apply failed' }))
+    })
+
+    it('removes the stop waiter of a consumer that finishes, and of a close that is retired', async () => {
+      runner.consuming = true
+      const done = runner.waitForConsumer()
+      runner.emit('consuming-stop')
+      await done
+
+      let retire
+      const operation = { register: jest.fn((callback) => (retire = callback)) }
+      runner.waitForConsumer(operation)
+      const before = runner.listenerCount('consuming-stop')
+      retire()
+      expect(runner.listenerCount('consuming-stop')).toBe(before - 1)
+      expect(operation.register).toHaveBeenCalledTimes(1)
+      runner.consuming = false
+    })
+
+    it('refuses a quiescence wait whose round was already retired', async () => {
+      const refusal = new Error('round retired')
+      const busy = jest.fn(() => true)
+      await expect(
+        runner.awaitQuiescence(busy, {
+          deadlineAt: performance.now() + 1000,
+          identity: { round: roundOf(() => refusal) },
+        })
+      ).rejects.toBe(refusal)
+      expect(busy).not.toHaveBeenCalled()
+    })
+
+    it('rejects a quiescence wait when the round is retired while it waits', async () => {
+      const refusal = new Error('round retired')
+      let calls = 0
+      const round = roundOf(() => (++calls > 1 ? refusal : null))
+      await expect(
+        runner.awaitQuiescence(() => true, {
+          deadlineAt: performance.now() + 1000,
+          identity: { round },
+        })
+      ).rejects.toBe(refusal)
+      expect(runner.hookWaiters.size).toBe(0)
+    })
+
+    it('refuses a quiescence that completes in a round retired meanwhile', async () => {
+      const refusal = new Error('round retired')
+      let retired = false
+      let busy = true
+      const round = roundOf(
+        () => (retired ? refusal : null),
+        async (work) => {
+          const pending = work()
+          busy = false
+          for (const check of runner.hookWaiters) check()
+          await pending
+          retired = true
+        }
+      )
+      await expect(
+        runner.awaitQuiescence(() => busy, {
+          deadlineAt: performance.now() + 1000,
+          identity: { round },
+        })
+      ).rejects.toBe(refusal)
+    })
+
+    it('rethrows the wait failure of a round that holds no refusal', async () => {
+      const failure = new Error('wait failed')
+      const round = roundOf(
+        () => null,
+        async () => {
+          throw failure
+        }
+      )
+      await expect(
+        runner.awaitQuiescence(() => true, {
+          deadlineAt: performance.now() + 1000,
+          identity: { round },
+        })
+      ).rejects.toBe(failure)
+    })
+
+    it('expires a quiescence once even when the round reports its own join deadline later', async () => {
+      jest.useFakeTimers()
+      let now = 0
+      jest.spyOn(require('node:perf_hooks').performance, 'now').mockImplementation(() => now)
+      try {
+        const lose = jest.fn()
+        consumerGroup.ownership = { lose }
+        const deadlineError = Object.assign(new Error('join deadline'), {
+          type: 'JOIN_DEADLINE_EXCEEDED',
+        })
+        let release
+        const released = new Promise((resolve) => (release = resolve))
+        let roundFailed = false
+        const round = roundOf(
+          () => null,
+          async (work) => {
+            work().catch(() => {})
+            await released
+            roundFailed = true
+            throw deadlineError
+          }
+        )
+        const outcome = runner
+          .awaitQuiescence(() => true, { deadlineAt: 20, identity: { round, membership: 3 } })
+          .catch((error) => error)
+        now = 20
+        await jest.advanceTimersByTimeAsync(20)
+        expect(lose).toHaveBeenCalledTimes(1)
+        expect(roundFailed).toBe(false)
+        release()
+        expect(await outcome).toMatchObject({ reason: 'timeout' })
+        expect(roundFailed).toBe(true)
+        expect(lose).toHaveBeenCalledTimes(1)
+        expect(round.retire).toHaveBeenCalledTimes(1)
+      } finally {
+        jest.restoreAllMocks()
+        jest.useRealTimers()
+      }
+    })
+
+    it('settles on an early timer callback once the handlers are no longer busy', async () => {
+      jest.useFakeTimers()
+      jest.spyOn(require('node:perf_hooks').performance, 'now').mockImplementation(() => 0)
+      try {
+        let busy = true
+        const baseline = jest.getTimerCount()
+        const done = runner.awaitQuiescence(() => busy, {
+          deadlineAt: 20,
+          identity: { round: roundOf() },
+        })
+        busy = false
+        await jest.advanceTimersByTimeAsync(20)
+        await expect(done).resolves.toBeUndefined()
+        expect(runner.hookWaiters.size).toBe(0)
+        expect(jest.getTimerCount()).toBe(baseline)
+      } finally {
+        jest.restoreAllMocks()
+        jest.useRealTimers()
+      }
+    })
+
+    it('quiesces the run once the fetch manager has stopped', async () => {
+      runner.fetchManager = { stop: jest.fn(async () => {}) }
+      runner.inFlightHandlers = 0
+      await runner.quiesceRun({
+        deadlineAt: performance.now() + 1000,
+        identity: { round: roundOf(), membership: 1 },
+      })
+      expect(runner.fetchManager.stop).toHaveBeenCalledTimes(1)
+    })
+
+    it('rejoins after an eager preparation whose final commit failed', async () => {
+      jest.spyOn(runner, 'quiesceRun').mockResolvedValue()
+      runner.autoCommitOffsets = jest.fn().mockRejectedValue(new Error('commit failed'))
+      const warn = jest.spyOn(runner.logger, 'warn')
+      expect(await runner.prepareEagerRound(roundOf())).toBe(false)
+      expect(warn).toHaveBeenCalledWith('Pre-rebalance offset commit failed; rejoining anyway', {
+        error: 'commit failed',
+      })
+      expect(runner.admissionQuiescing).toBe(true)
+    })
+
+    it('stops an eager preparation whose round was retired during the commit', async () => {
+      jest.spyOn(runner, 'quiesceRun').mockResolvedValue()
+      runner.autoCommitOffsets = jest.fn().mockRejectedValue(new Error('commit failed'))
+      const refusal = new Error('round retired')
+      await expect(runner.prepareEagerRound(roundOf(() => refusal))).rejects.toBe(refusal)
+    })
+
+    it('runs the close callback without an operation and retires its round afterwards', async () => {
+      let round
+      consumerGroup.ownership = undefined
+      consumerGroup.rebalanceTimeout = 1000
+      consumerGroup.rebalanceHooks = { retire: jest.fn() }
+      consumerGroup.hookIdentity = jest.fn(() => ({}))
+      consumerGroup.takeListenerFailure = jest.fn(() => null)
+      consumerGroup.invokeHook = jest.fn(async (hookRound) => {
+        round = hookRound
+        await hookRound.wait(async () => {})
+      })
+      await runner.invokeCloseHook({ previous: [{ topic: 't', partitions: [0] }] })
+      expect(consumerGroup.invokeHook).toHaveBeenCalledWith(
+        expect.any(Object),
+        'onPartitionsRevoked',
+        [{ topic: 't', partitions: [0] }],
+        {}
+      )
+      expect(round.guard()).toMatchObject({ type: 'CONSUMER_STOPPING' })
+      expect(consumerGroup.rebalanceHooks.retire).toHaveBeenCalledTimes(1)
     })
   })
 })

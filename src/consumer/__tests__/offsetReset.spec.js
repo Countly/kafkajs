@@ -47,6 +47,7 @@ describe('offset reset', () => {
     'by_duration:PT1.1234567890S',
     'by_duration:PT9007199254740.992S',
     'by_duration:PT99999999999999999999999S',
+    'by_duration:P99999999999999D',
     'unknown',
   ])('rejects invalid form %j', (offsetReset) => {
     expect(() => normalizeResetPolicy({ offsetReset })).toThrow(KafkaJSNonRetriableError)
@@ -54,6 +55,8 @@ describe('offset reset', () => {
       "The value must be either 'earliest', 'latest', 'none'"
     )
   })
+  test('normalizes no options to the latest policy', () =>
+    expect(normalizeResetPolicy()).toEqual({ kind: 'latest' }))
   test.each([true, false])(
     'explicit boolean %j conflicts with none and duration',
     (fromBeginning) => {

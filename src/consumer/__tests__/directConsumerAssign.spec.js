@@ -112,6 +112,42 @@ describe('Manual assignment replaces its state in one step', () => {
     expect(cluster.brokerPool.metadata.topicMetadata.map(({ topic }) => topic)).not.toContain(TOPIC)
   })
 
+  test.each([
+    [null, 'assign options must be an object'],
+    [3, 'assign options must be an object'],
+    [[], 'assign options must be an object'],
+    [{ fromBeginning: 'yes' }, 'Argument "fromBeginning" must be a boolean'],
+  ])('refuses the assign options %j before touching the selection', async (options, message) => {
+    const consumer = track(wire.kafka.consumer({ groupId: 'options-group' }))
+    await consumer.connect()
+    await expect(consumer.assign([{ topic: TOPIC, partitions: [0] }], options)).rejects.toThrow(
+      message
+    )
+    expect(consumer.subscription()).toEqual([])
+  })
+
+  test('lists the assignment sorted by topic whatever order it was selected in', async () => {
+    const consumer = track(wire.kafka.consumer({ groupId: 'sorted-group', maxWaitTimeInMs: 20 }))
+    await consumer.connect()
+    const expected = [TOPIC, OTHER].sort()
+    for (const order of [expected, [...expected].reverse()]) {
+      await consumer.assign(order.map((topic) => ({ topic, partitions: [1, 0] })))
+      await consumer.run({ autoCommit: false, eachMessage: async () => {} })
+      expect(consumer.assignment()).toEqual(
+        expected.map((topic) => ({ topic, partitions: [0, 1] }))
+      )
+      await consumer.stop()
+    }
+  })
+
+  test('refuses a position read before the consumer ran', async () => {
+    const consumer = track(wire.kafka.consumer({ groupId: 'early-group' }))
+    await consumer.connect()
+    await expect(consumer.position({ topic: TOPIC, partition: 0 })).rejects.toThrow(
+      'Consumer group was not initialized'
+    )
+  })
+
   test('validates without installing: a rejected candidate leaves targets, cache and selection', async () => {
     const consumer = track(wire.kafka.consumer({ groupId: 'reject-group' }))
     await consumer.connect()

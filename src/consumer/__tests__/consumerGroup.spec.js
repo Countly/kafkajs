@@ -3,7 +3,7 @@ const ClassicGroupProtocol = require('../groupProtocol/classic')
 const ConsumerGroupProtocol = require('../groupProtocol/consumer')
 const InstrumentationEventEmitter = require('../../instrumentation/emitter')
 const { events } = require('../instrumentationEvents')
-const { KafkaJSProtocolError } = require('../../errors')
+const { KafkaJSProtocolError, KafkaJSConnectionError } = require('../../errors')
 const { createErrorFromCode } = require('../../protocol/error')
 const { joinDeadlineError, stampGeneration } = require('../rebalanceErrorContract')
 const { newLogger } = require('testHelpers')
@@ -646,5 +646,275 @@ describe('Consumer > ConsumerGroup > member id retention', () => {
 
     expect(group.retainableMemberId()).toBeNull()
     expect(group.groupMembership.pendingMemberId).toBeUndefined()
+  })
+})
+
+describe('Consumer > ConsumerGroup > guards and fallbacks', () => {
+  const MANUAL = [{ topic: TOPIC_A, partitions: [0] }]
+
+  test('a manual group without a run identity treats every run as current', () => {
+    const group = createGroup({ manual: MANUAL })
+    expect(group.kind).toBe('manual')
+    expect(group.groupMembership.runIdentity.isCurrent()).toBe(true)
+  })
+
+  test('a manual group applies nothing for a run that is already stopping', async () => {
+    const group = createGroup({ manual: MANUAL, runIdentity: { isCurrent: () => false } })
+    const rebalance = jest.spyOn(group.groupMembership, 'rebalance')
+    await expect(group.applyManualAssignment()).rejects.toThrow()
+    expect(rebalance).not.toHaveBeenCalled()
+  })
+
+  test('a manual group asks for no resync and sees no stale assignment', () => {
+    const group = createGroup({ manual: MANUAL })
+    const debug = jest.spyOn(group.logger, 'debug')
+    group.requestResync(new Error('stale'))
+    expect(debug).toHaveBeenCalledWith(expect.stringContaining('manual assignment is fixed'), {
+      error: 'stale',
+    })
+    expect(() => group.checkForStaleAssignment()).not.toThrow()
+  })
+
+  test('a topic the previous round never saw is not a stale assignment', () => {
+    const group = createGroup()
+    group.partitionsPerSubscribedTopic = new Map()
+    expect(() => group.checkForStaleAssignment()).not.toThrow()
+    expect(group.staleAssignmentPending).toBeFalsy()
+  })
+
+  test('the routing listener of a run stops reacting once the run is closed', () => {
+    const group = createGroup()
+    const unsubscribe = jest.fn()
+    let notify
+    group.cluster.onRoutingChange = jest.fn((listener) => {
+      notify = listener
+      return unsubscribe
+    })
+    const changed = jest.spyOn(group, 'routingChanged').mockImplementation(() => {})
+    const run = group.createRun()
+    notify()
+    expect(changed).toHaveBeenCalledTimes(1)
+    run.fence.close(new Error('run closed'))
+    expect(unsubscribe).toHaveBeenCalledTimes(1)
+    notify()
+    expect(changed).toHaveBeenCalledTimes(1)
+  })
+
+  test('refreshCluster defaults to a leaderless-tolerant metadata refresh', async () => {
+    const group = createGroup()
+    await group.refreshCluster()
+    expect(group.cluster.refreshMetadata).toHaveBeenCalledWith({ allowLeaderless: true })
+  })
+
+  test('discovery keeps a recreation debt that is already owed for the same incarnation', () => {
+    const group = createGroup()
+    group.obligations.owe(TOPIC_A, 'id-1')
+    group.subscription = {
+      evaluate: () => ({ revision: 1 }),
+      observe: () => [{ topic: TOPIC_A, topicId: 'id-1' }],
+    }
+    const invalidate = jest.spyOn(group, 'invalidateTopic').mockImplementation(() => {})
+    group.observeDiscovery({})
+    expect(group.discovered).toEqual({ revision: 1 })
+    expect(invalidate).not.toHaveBeenCalled()
+    group.subscription.observe = () => [{ topic: TOPIC_A, topicId: 'id-2' }]
+    group.observeDiscovery({})
+    expect(invalidate).toHaveBeenCalledWith(TOPIC_A)
+    expect(group.obligations.current(TOPIC_A)).toBe('id-2')
+  })
+
+  test('updateSubscription forwards each revision to the membership once', async () => {
+    const group = createGroup()
+    const update = jest
+      .spyOn(group.groupMembership, 'updateSubscription')
+      .mockImplementation(() => {})
+    await group.updateSubscription({ revision: 4, names: [] })
+    await group.updateSubscription({ revision: 4, names: [] })
+    await group.updateSubscription({ revision: 5, names: [] }, { isCurrent: () => false })
+    expect(update).toHaveBeenCalledTimes(1)
+    expect(group.notifiedRevision).toBe(4)
+  })
+
+  test('a hook identity of a partition acquired nowhere carries a null acquisition time', () => {
+    const group = createGroup()
+    const identity = group.hookIdentity({}, [{ topic: TOPIC_A, partitions: [0, 1] }])
+    expect(identity.acquisitions.map((cell) => cell.acquiredAt)).toEqual([null, null])
+  })
+
+  test('a hook commit is refused only for a cell whose acquisition changed', () => {
+    const group = createGroup()
+    const cell = {
+      topic: TOPIC_A,
+      partition: 0,
+      assignmentEpoch: group.assignmentEpoch,
+      acquiredAt: null,
+      topicId: undefined,
+    }
+    const topics = [{ topic: TOPIC_A, partitions: [{ partition: 0 }] }]
+    expect(group.hookCommitRefusal({ acquisitions: [] })).toBeNull()
+    expect(group.hookCommitRefusal({ acquisitions: [cell] }, topics)).toBeNull()
+    expect(group.hookCommitRefusal({ acquisitions: [{ ...cell, acquiredAt: 7 }] }, topics)).toEqual(
+      expect.objectContaining({ reason: 'stale-assignment' })
+    )
+  })
+
+  test('a callback failure that is not an ordinary throw is rethrown unchanged', async () => {
+    const group = createGroup()
+    const boom = new Error('boom')
+    group.rebalanceHooks = { has: () => true, invoke: jest.fn().mockRejectedValue(boom) }
+    const round = { guard: () => null, roundDeadlineAt: performance.now() + 1000 }
+    await expect(group.invokeHook(round, 'onPartitionsRevoked', [], {})).rejects.toBe(boom)
+    expect(group.listenerFailures.has(round)).toBe(false)
+  })
+
+  test('a fetch session response that matched no request partition starts a new session', async () => {
+    const group = createGroup()
+    const debug = jest.spyOn(group.logger, 'debug')
+    const refresh = jest.spyOn(group, 'refreshCluster').mockResolvedValue()
+    await group.refuseTrackedResponse({ errorCode: 0, responses: [{ topicName: TOPIC_A }] }, {})
+    expect(debug).toHaveBeenCalledWith(
+      expect.stringContaining('did not match its request'),
+      expect.any(Object)
+    )
+    expect(refresh).not.toHaveBeenCalled()
+  })
+})
+
+describe('Consumer > ConsumerGroup > the pre-release commit under a close operation', () => {
+  const PARTITIONS = [{ topic: TOPIC_A, partitions: [0] }]
+  const staleEpoch = () => {
+    const error = new KafkaJSProtocolError(createErrorFromCode(113))
+    error.type = 'STALE_MEMBER_EPOCH'
+    return error
+  }
+  const setup = (commitOffsets) => {
+    const group = createGroup({ groupProtocol: 'consumer' })
+    const runner = { stopRequested: false, retirement: null }
+    group.rebalanceCoordinator = { runner }
+    group.autoCommit = true
+    group.groupMembership.memberEpoch = 7
+    group.offsetManager = { useMembership: jest.fn(), commitOffsets: jest.fn(commitOffsets) }
+    const operation = {
+      guard: () => runner.retirement,
+      wait: jest.fn((action) => action()),
+      sleep: jest.fn(async () => {}),
+      deadlineAt: performance.now() + 5000,
+    }
+    return { group, runner, operation }
+  }
+
+  it('commits through the operation scope, fenced by the operation', async () => {
+    const { group, operation } = setup(async () => {})
+    await group.commitBeforeRelease(PARTITIONS, { operation })
+    expect(operation.wait).toHaveBeenCalledTimes(1)
+    expect(group.offsetManager.commitOffsets).toHaveBeenCalledWith(
+      {},
+      { partitions: PARTITIONS, guard: expect.any(Function), fence: operation }
+    )
+  })
+
+  it('waits on the operation for a newer epoch and then re-sends', async () => {
+    let attempts = 0
+    const { group, operation } = setup(async () => {
+      if (++attempts === 1) throw stampGeneration(staleEpoch(), 7)
+    })
+    operation.sleep.mockImplementation(async () => {
+      group.groupMembership.memberEpoch = 8
+    })
+    await group.commitBeforeRelease(PARTITIONS, { operation })
+    expect(operation.sleep).toHaveBeenCalledTimes(1)
+    expect(group.offsetManager.commitOffsets).toHaveBeenCalledTimes(2)
+  })
+
+  it('sends nothing for a runner that was already retired', async () => {
+    const { group, runner, operation } = setup(async () => {})
+    runner.retirement = new Error('retired')
+    await group.commitBeforeRelease(PARTITIONS, { operation })
+    expect(group.offsetManager.useMembership).not.toHaveBeenCalled()
+    expect(group.offsetManager.commitOffsets).not.toHaveBeenCalled()
+  })
+
+  it('sends nothing for a runner retired while the membership is installed', async () => {
+    const { group, runner, operation } = setup(async () => {})
+    group.offsetManager.useMembership.mockImplementation(() => {
+      runner.retirement = new Error('retired')
+    })
+    await group.commitBeforeRelease(PARTITIONS, { operation })
+    expect(group.offsetManager.commitOffsets).not.toHaveBeenCalled()
+  })
+
+  it('sends nothing for a runner retired before the scoped commit runs', async () => {
+    const { group, runner, operation } = setup(async () => {})
+    operation.wait.mockImplementation((action) => {
+      runner.retirement = new Error('retired')
+      return action()
+    })
+    await group.commitBeforeRelease(PARTITIONS, { operation })
+    expect(group.offsetManager.commitOffsets).not.toHaveBeenCalled()
+  })
+
+  it('stops waiting for a newer epoch once the round is refused', async () => {
+    const { group } = setup(async () => {})
+    const round = { guard: () => new Error('round closed'), delay: jest.fn() }
+    expect(
+      await group.awaitFreshEpochFor(
+        stampGeneration(staleEpoch(), 7),
+        performance.now() + 1000,
+        round
+      )
+    ).toBe(false)
+    expect(round.delay).not.toHaveBeenCalled()
+  })
+})
+
+describe('Consumer > ConsumerGroup > more guards', () => {
+  it('a pattern member never grows its subscription by assigned names', async () => {
+    const group = createGroup()
+    group.subscription = {}
+    const before = group.topicsSubscribed
+    await group.growSubscription(['events-z'])
+    expect(group.topicsSubscribed).toBe(before)
+    expect(group.cluster.addMultipleTargetTopics).not.toHaveBeenCalled()
+  })
+
+  it('a reset refusal without a current identity halts nothing', () => {
+    const group = createGroup()
+    const accept = jest.spyOn(group, 'acceptHalt')
+    expect(group.isResetContextCurrent(TOPIC_A, 0, null)).toBe(false)
+    expect(group.isResetContextCurrent(TOPIC_A, 0, { manager: {} })).toBe(false)
+    group.installReset(TOPIC_A, 0, { reason: 'no-offset' }, null)
+    expect(accept).not.toHaveBeenCalled()
+  })
+
+  it('a stop that arrives during the coordinator-loss backoff ends the join', async () => {
+    const group = createGroup()
+    group.groupMembership.rebalance = jest
+      .fn()
+      .mockRejectedValue(new KafkaJSConnectionError('down'))
+    const round = {
+      ...group.beginRebalanceRound(),
+      delay: jest.fn(async () => {
+        group.rebalanceCoordinator = { runner: { stopRequested: true } }
+      }),
+    }
+    await expect(group.joinAndSync(round)).rejects.toMatchObject({ type: 'CONSUMER_STOPPING' })
+    expect(round.delay).toHaveBeenCalledTimes(1)
+  })
+
+  it('a refused round stops a revoke after its callback ran', async () => {
+    const group = createGroup()
+    group.rebalanceHooks = { has: () => false }
+    jest.spyOn(group, 'commitBeforeRelease').mockResolvedValue()
+    jest.spyOn(group, 'invokeHook').mockResolvedValue()
+    const refusal = new Error('round retired')
+    const round = {
+      guard: () => refusal,
+      run: { disposed: false, wake: jest.fn() },
+      roundDeadlineAt: performance.now() + 1000,
+    }
+    await expect(group.releaseRevoked([{ topic: TOPIC_A, partitions: [0] }], round)).rejects.toBe(
+      refusal
+    )
+    expect(group.commitBeforeRelease).toHaveBeenCalledTimes(1)
   })
 })

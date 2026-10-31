@@ -79,6 +79,37 @@ describe('Manual consumer construction and local protocol', () => {
     )
     expect(cluster.findGroupCoordinator).not.toHaveBeenCalled()
   })
+  test('installs the discovered coordinator and reuses it while connected', async () => {
+    const { protocol, cluster } = create('offset-group')
+    const coordinator = { isConnected: () => true }
+    cluster.findGroupCoordinator.mockResolvedValue(coordinator)
+    expect(await protocol.liveCoordinator()).toBe(coordinator)
+    expect(await protocol.liveCoordinator()).toBe(coordinator)
+    expect(protocol.coordinator).toBe(coordinator)
+    expect(cluster.findGroupCoordinator).toHaveBeenCalledTimes(1)
+    expect(cluster.findGroupCoordinator).toHaveBeenCalledWith({ groupId: 'offset-group' })
+  })
+  test('answers the membership queries as a local, leaderless eager protocol', () => {
+    const { protocol } = create('offset-group')
+    expect(protocol.forgetMemberId(3)).toBe(false)
+    expect(protocol.isLeader()).toBe(false)
+    expect(protocol.rebalanceProtocol()).toBe('eager')
+    expect(protocol.heartbeatInterval()).toBe(Infinity)
+    expect(protocol.warnIfStaticMembershipInactive()).toBeUndefined()
+    expect(protocol.notifyAssignment({})).toBeUndefined()
+    expect(protocol.clearAssignerState()).toBeUndefined()
+  })
+  test.each([
+    ['leaveForPollExpiry', (protocol) => protocol.leaveForPollExpiry()],
+    ['resetGeneration', (protocol) => protocol.resetGeneration()],
+  ])('%s retires the run and drops ownership', async (_, retireWith) => {
+    const { protocol } = create('offset-group')
+    protocol.setOwned([{ topic: 'records', partitions: [0] }])
+    await retireWith(protocol)
+    expect(protocol.owned()).toEqual([])
+    await expect(protocol.connect()).rejects.toMatchObject({ type: 'CONSUMER_STOPPING' })
+    await expect(protocol.heartbeat()).rejects.toMatchObject({ type: 'CONSUMER_STOPPING' })
+  })
   test('never installs a held coordinator after run retirement', async () => {
     const { protocol, cluster, retire } = create('offset-group')
     let answer

@@ -114,6 +114,47 @@ test('duration misses use one latest fallback with only the missing partition', 
     now.mockRestore()
   }
 })
+test('a none refusal beside another topic lookup stays in the result', async () => {
+  const cluster = {
+    fetchTopicsOffset: jest
+      .fn()
+      .mockResolvedValue([{ topic: 'u', partitions: [{ partition: 0, offset: '5' }] }]),
+  }
+  const current = (topic) => topic !== 'gone'
+  const result = await new ResetResolver(cluster).resolve(
+    [
+      { topic: 't', partitions: [{ partition: 0, offset: '-1' }] },
+      { topic: 'gone', partitions: [{ partition: 0, offset: '-1' }] },
+      { topic: 'u', partitions: [{ partition: 0, offset: '-1' }] },
+    ],
+    {
+      t: { resetPolicy: { kind: 'none' } },
+      gone: { resetPolicy: { kind: 'none' } },
+      u: { resetPolicy: { kind: 'earliest' } },
+    },
+    current,
+    () => ({})
+  )
+  expect(result.refusals.map((r) => r.topic)).toEqual(['t'])
+  expect(result.offsets.find((o) => o.topic === 'u').partitions[0].offset).toBe('5')
+})
+test('a latest fallback that returns no real offset is refused', async () => {
+  const cluster = {
+    fetchTopicsOffset: jest
+      .fn()
+      .mockResolvedValueOnce([{ topic: 't', partitions: [{ partition: 0, offset: '-1' }] }])
+      .mockResolvedValueOnce([{ topic: 't', partitions: [{ partition: 0, offset: '-1' }] }]),
+  }
+  await expect(
+    new ResetResolver(cluster).resolve(
+      [{ topic: 't', partitions: [{ partition: 0, offset: '-1' }] }],
+      { t: { resetPolicy: { kind: 'by_duration', durationMs: 1000 } } },
+      () => true,
+      () => ({})
+    )
+  ).rejects.toThrow('Latest offset lookup returned no real offset')
+  expect(cluster.fetchTopicsOffset).toHaveBeenCalledTimes(2)
+})
 test('a current explicit sentinel seek overrides none without a refusal', async () => {
   const cluster = {
     fetchTopicsOffset: jest

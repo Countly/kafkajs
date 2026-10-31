@@ -354,6 +354,23 @@ describe('Consumer > groupProtocol > ConsumerGroupProtocol', () => {
       expect(h.protocol.state).toEqual(RECONCILING)
       expect(h.rebalanceCoordinator.requestRejoin).toHaveBeenCalledTimes(1)
     })
+
+    it('acknowledges again from RECONCILING without a resolved subset left to adopt', async () => {
+      const h = build({
+        answers: [heartbeatResponse({ assignment: assignmentOf([[TOPIC_ID_A, [0, 1]]]) })],
+      })
+
+      await await startStep(h)
+      h.protocol.setOwned([{ topic: 'topic-a', partitions: [0] }])
+      await h.manager.tick()
+      expect(h.protocol.state).toEqual(RECONCILING)
+      const adopted = h.protocol.localAssignment
+
+      h.protocol.setOwned([{ topic: 'topic-a', partitions: [0] }])
+
+      expect(h.protocol.state).toEqual(ACKNOWLEDGING)
+      expect(h.protocol.localAssignment).toBe(adopted)
+    })
   })
 
   describe('The target changes mid-round', () => {
@@ -2501,6 +2518,178 @@ describe('Consumer > groupProtocol > ConsumerGroupProtocol', () => {
       await await startStep(h)
 
       expect(h.protocol.memberEpoch).toEqual(9)
+    })
+  })
+
+  describe('A target retired while a step is in flight', () => {
+    const TARGET_B = assignmentOf([[TOPIC_ID_B, [0]]])
+    const fence = (h) => h.protocol.onMembershipError(createErrorFromCode(25))
+
+    /** A member holding a target of topic-a, with the step answered and its apply still pending. */
+    const reconciling = async (names = TOPIC_NAMES) => {
+      const h = build({
+        names,
+        answers: [heartbeatResponse({ assignment: assignmentOf([[TOPIC_ID_A, [0]]]) })],
+      })
+      await await startStep(h)
+      return h
+    }
+
+    it('abandons the step, and logs nothing, when a failed refresh lands after the fencing', async () => {
+      const h = build({ names: {}, answers: [heartbeatResponse({ assignment: TARGET_B })] })
+      h.cluster.refreshMetadataForTopicIds.mockImplementation(async () => {
+        fence(h)
+        throw new KafkaJSConnectionError('no route')
+      })
+
+      await expect(startStep(h).then((pending) => pending)).rejects.toMatchObject({
+        type: 'ASSIGNMENT_CHANGED',
+      })
+      expect(h.logged.debug).not.toHaveBeenCalledWith(
+        'Could not refresh metadata for the assigned topic ids',
+        expect.anything()
+      )
+    })
+
+    it('counts nothing against an id when the refresh answers with no outcome', async () => {
+      const h = build({ names: {}, answers: [heartbeatResponse({ assignment: TARGET_B })] })
+      h.cluster.refreshMetadataForTopicIds.mockResolvedValue(undefined)
+
+      const result = await await startStep(h)
+
+      expect(result.assignment).toEqual({})
+      expect(h.protocol.unresolvedAttempts.size).toBe(0)
+    })
+
+    it('throws the assignment change when the target retires right after its names resolve', async () => {
+      const h = build({
+        answers: [heartbeatResponse({ assignment: assignmentOf([[TOPIC_ID_A, [0]]]) })],
+      })
+      const resolve = h.protocol.resolveAssignmentTopicNames.bind(h.protocol)
+      jest.spyOn(h.protocol, 'resolveAssignmentTopicNames').mockImplementation(async (...args) => {
+        const resolved = await resolve(...args)
+        fence(h)
+        return resolved
+      })
+
+      await expect(startStep(h).then((pending) => pending)).rejects.toMatchObject({
+        type: 'ASSIGNMENT_CHANGED',
+      })
+    })
+
+    it('throws the assignment change when the target retires right after the subscription grew', async () => {
+      const h = build({
+        answers: [heartbeatResponse({ assignment: assignmentOf([[TOPIC_ID_A, [0]]]) })],
+      })
+      jest.spyOn(h.protocol, 'growSubscriptionWith').mockImplementation(async () => fence(h))
+
+      await expect(startStep(h).then((pending) => pending)).rejects.toMatchObject({
+        type: 'ASSIGNMENT_CHANGED',
+      })
+    })
+
+    it('records no grown name when the target retires while the subscription grows', async () => {
+      const h = build({
+        answers: [heartbeatResponse({ assignment: assignmentOf([[TOPIC_ID_A, [0]]]) })],
+      })
+      const growSubscription = jest.fn(async () => fence(h))
+
+      await expect(
+        startStep(h, context({ growSubscription })).then((pending) => pending)
+      ).rejects.toMatchObject({ type: 'ASSIGNMENT_CHANGED' })
+      expect(growSubscription).toHaveBeenCalledWith(['topic-a'])
+      expect(h.protocol.grownTopicNames.size).toBe(0)
+    })
+
+    it('refuses to grow the subscription, or to resolve names, for a target that is not current', async () => {
+      const h = build()
+      const growSubscription = jest.fn()
+      const target = { localEpoch: 1, byTopicId: new Map([[TOPIC_ID_A, [0]]]) }
+
+      await expect(h.protocol.growSubscriptionWith(growSubscription, ['x'])).rejects.toMatchObject({
+        type: 'ASSIGNMENT_CHANGED',
+      })
+      await expect(h.protocol.resolveAssignmentTopicNames(target)).rejects.toMatchObject({
+        type: 'ASSIGNMENT_CHANGED',
+      })
+      expect(growSubscription).not.toHaveBeenCalled()
+    })
+
+    it('asks the cluster for nothing without a current target, or once the target retired', async () => {
+      const h = await reconciling()
+      await h.protocol.refreshMetadataForTopicIds([TOPIC_ID_B])
+      expect(h.cluster.refreshMetadataForTopicIds).toHaveBeenCalledTimes(1)
+      h.cluster.refreshMetadataForTopicIds.mockClear()
+
+      h.protocol.unresolvedAttempts.clear()
+      const pending = h.protocol.refreshMetadataForTopicIds([TOPIC_ID_B])
+      fence(h)
+      await pending
+      await h.protocol.refreshMetadataForTopicIds([TOPIC_ID_B])
+
+      expect(h.cluster.refreshMetadataForTopicIds).not.toHaveBeenCalled()
+    })
+
+    it('logs nothing when a failed re-read finds the member no longer in the group', async () => {
+      const names = { [TOPIC_ID_A]: 'topic-a' }
+      const h = build({
+        names,
+        answers: [
+          heartbeatResponse({ assignment: assignmentOf([[TOPIC_ID_A, [0]]]) }),
+          heartbeatResponse({
+            memberEpoch: 2,
+            assignment: assignmentOf([
+              [TOPIC_ID_A, [0]],
+              [TOPIC_ID_B, [0]],
+            ]),
+          }),
+        ],
+      })
+      await await startStep(h)
+      h.protocol.setOwned([{ topic: 'topic-a', partitions: [0] }])
+      h.cluster.refreshMetadataForTopicIds.mockImplementation(async (ids) => {
+        names[TOPIC_ID_B] = 'topic-b'
+        return { resolved: ids, unresolved: [] }
+      })
+      h.rebalanceCoordinator.requestRejoin.mockImplementation(() => {
+        fence(h)
+        throw new Error('the round loop is gone')
+      })
+
+      await h.manager.tick()
+      await flushRefresh()
+
+      expect(h.protocol.state).toEqual(FENCED)
+      expect(h.logged.debug).not.toHaveBeenCalledWith(
+        'Could not re-read the target after refreshing its topic ids',
+        expect.anything()
+      )
+    })
+
+    it('narrows the acknowledgement to nothing when the target and the names are gone at the apply', async () => {
+      const names = { [TOPIC_ID_A]: 'topic-a' }
+      const h = await reconciling(names)
+      h.protocol.target = null
+      h.protocol.assignedTopicNames.clear()
+      delete names[TOPIC_ID_A]
+
+      h.protocol.setOwned([{ topic: 'topic-a', partitions: [0] }])
+
+      expect(h.protocol.state).toEqual(ACKNOWLEDGING)
+      expect(h.protocol.localAssignment).toEqual({ localEpoch: 0, byTopicId: new Map() })
+    })
+  })
+
+  describe('An invalid-pattern error that already carries the prefix', () => {
+    it('is not prefixed a second time', async () => {
+      const error = createErrorFromCode(128)
+      error.message = `Invalid RE2J SubscriptionPattern provided in the call to subscribe. ${error.message}`
+      const original = error.message
+      const h = build({ answers: [error] })
+
+      await expect(startStep(h).then((pending) => pending)).rejects.toThrow(original)
+      expect(error.message).toBe(original)
+      expect(h.protocol.state).toEqual(FATAL)
     })
   })
 })

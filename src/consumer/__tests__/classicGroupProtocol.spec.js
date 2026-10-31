@@ -420,6 +420,142 @@ describe('Consumer > groupProtocol > ClassicGroupProtocol > the seam members the
   })
 })
 
+describe('Consumer > classic group protocol > the leader round guards', () => {
+  const refusal = new Error('round retired')
+
+  /** @param {number} [refuseFrom] 1-based guard call from which the round refuses */
+  const fakeRound = (refuseFrom = Infinity, overrides = {}) => {
+    let calls = 0
+    return {
+      guard: jest.fn(() => (++calls >= refuseFrom ? refusal : null)),
+      wait: (operation) => operation(),
+      roundDeadlineAt: performance.now() + 60000,
+      allowAutoTopicCreation: true,
+      ...overrides,
+    }
+  }
+
+  const leader = (overrides = {}) => {
+    const protocol = buildProtocol({
+      cluster: {
+        findTopicPartitionMetadata: () => [],
+        refreshMetadata: async () => {},
+        groupMetadata: async () => ({ topicMetadata: [], brokers: [] }),
+      },
+      logger: newLogger(),
+      ...overrides,
+    })
+    Object.assign(protocol, {
+      leaderId: 'm1',
+      memberId: 'm1',
+      groupProtocol: 'custom',
+      members: [],
+    })
+    return protocol
+  }
+
+  it('refuses before reading any metadata when the round already retired', async () => {
+    const protocol = leader()
+    const findTopicPartitionMetadata = jest.spyOn(protocol.cluster, 'findTopicPartitionMetadata')
+    await expect(protocol.leaderMetadata([], ['a'], fakeRound(1))).rejects.toBe(refusal)
+    expect(findTopicPartitionMetadata).not.toHaveBeenCalled()
+  })
+
+  it('throws the guard error when the round deadline passed before the group topics load', async () => {
+    const protocol = leader()
+    const groupMetadata = jest.spyOn(protocol.cluster, 'groupMetadata')
+    const members = [
+      { memberId: 'm2', memberMetadata: MemberMetadata.encode({ version: 0, topics: ['b'] }) },
+    ]
+    const round = fakeRound(2, { roundDeadlineAt: performance.now() - 1 })
+    await expect(protocol.leaderMetadata(members, ['a'], round)).rejects.toBe(refusal)
+    expect(groupMetadata).not.toHaveBeenCalled()
+  })
+
+  it('keeps only requested, healthy group topics from the snapshot', async () => {
+    const protocol = leader()
+    const rows = [{ partitionId: 0, leader: 1, replicas: [1] }]
+    const groupMetadata = jest.spyOn(protocol.cluster, 'groupMetadata').mockResolvedValue({
+      brokers: [],
+      topicMetadata: [
+        { topic: 'b', topicErrorCode: 0, partitionMetadata: rows },
+        { topic: 'broken', topicErrorCode: 3, partitionMetadata: [] },
+        { topic: 'unrequested', topicErrorCode: 0, partitionMetadata: rows },
+      ],
+    })
+    const warn = jest.spyOn(protocol.logger, 'warn')
+    const members = [
+      {
+        memberId: 'm2',
+        memberMetadata: MemberMetadata.encode({ version: 0, topics: ['b', 'broken'] }),
+      },
+    ]
+    const { groupTopics, groupTopicMetadata } = await protocol.leaderMetadata(
+      members,
+      ['a'],
+      fakeRound()
+    )
+    expect(groupTopics).toEqual(['a', 'b', 'broken'])
+    expect([...groupTopicMetadata.keys()].sort()).toEqual(['a', 'b'])
+    expect(groupMetadata).toHaveBeenCalledWith(expect.objectContaining({ topics: ['b', 'broken'] }))
+    expect(warn).toHaveBeenCalledWith('Skipping unavailable group topic', {
+      topic: 'broken',
+      topicErrorCode: 3,
+    })
+  })
+
+  it('refuses at the end of the snapshot when the round retired meanwhile', async () => {
+    await expect(leader().leaderMetadata([], ['a'], fakeRound(2))).rejects.toBe(refusal)
+  })
+
+  it('fails the leader sync when the coordinator picked an assignor this member lacks', async () => {
+    const protocol = leader()
+    await expect(
+      protocol.sync({
+        topics: ['a'],
+        topicsSubscribed: ['a'],
+        beforeSync: jest.fn(),
+        round: fakeRound(),
+      })
+    ).rejects.toThrow('Unsupported partition assigner "custom"')
+  })
+
+  it('does not upload an assignment once the round retired during the assign window', async () => {
+    const syncGroup = jest.fn()
+    const beforeSync = jest.fn()
+    const protocol = leader({ assigners: [{ name: 'custom', assign: async () => [] }] })
+    protocol.coordinator = { syncGroup }
+    await expect(
+      protocol.sync({ topics: ['a'], topicsSubscribed: ['a'], beforeSync, round: fakeRound(3) })
+    ).rejects.toBe(refusal)
+    expect(beforeSync).not.toHaveBeenCalled()
+    expect(syncGroup).not.toHaveBeenCalled()
+  })
+
+  it('ignores an undecodable assigned buffer and still names the owners of a real conflict', () => {
+    const protocol = leader()
+    const owned = MemberMetadata.encode({
+      version: 1,
+      topics: ['a'],
+      userData: Buffer.alloc(0),
+      ownedPartitions: [{ topic: 'a', partitions: [0] }],
+    })
+    const members = [{ memberId: 'm1', memberMetadata: owned }]
+    const taken = MemberAssignment.encode({
+      version: 1,
+      assignment: { a: [0] },
+      userData: Buffer.alloc(0),
+    })
+    const assignment = [
+      { memberId: 'm3', memberAssignment: Buffer.alloc(0) },
+      { memberId: 'm2', memberAssignment: taken },
+    ]
+    expect(() => protocol.assertNoDoubleAssignment({ members, assignment })).toThrow(
+      'a-0 to m2 while m1 still owns it'
+    )
+  })
+})
+
 describe('Consumer > classic group protocol > a heartbeat that loses its coordinator', () => {
   const {
     KafkaJSConnectionError,

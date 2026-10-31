@@ -44,6 +44,7 @@ const build = ({
   heartbeatInterval = 3000,
   onJoinComplete,
   channels,
+  logger = newLogger(),
 } = {}) => {
   const calls = []
 
@@ -130,7 +131,7 @@ const build = ({
     heartbeatManager,
     pollTimer: new PollTimer({ pollDeadline: 8000 }),
     instrumentationEmitter,
-    logger: newLogger(),
+    logger,
     groupId: 'coordinator-group',
     onJoinComplete,
   })
@@ -2247,5 +2248,118 @@ describe('Consumer > RebalanceCoordinator > the consumer group protocol', () => 
       })
       expect(consumerGroup.forgetOwnedPartitions).toHaveBeenCalled()
     }
+  })
+})
+
+describe('Consumer > RebalanceCoordinator > rounds that a retired or manual run cuts short', () => {
+  const refusal = new Error('round retired')
+
+  /** Gives the built group the listener seams of a round that carries rebalance hooks. */
+  const withHooks = (built, { lost = false, refuseAfter = null } = {}) => {
+    const { consumerGroup, runner } = built
+    let refusing = false
+    consumerGroup.beginRebalanceRound.mockImplementation(() => ({
+      guard: () => (refusing ? refusal : null),
+      wait: (work) => work(),
+      retire: jest.fn(),
+      roundDeadlineAt: Infinity,
+    }))
+    Object.assign(consumerGroup, {
+      rebalanceHooks: {},
+      ownership: { token: () => 'membership' },
+      hookIdentity: jest.fn(() => ({})),
+      takeListenerFailure: jest.fn(() => null),
+      releaseHold: jest.fn(),
+      invokeHook: jest.fn(async (round, name) => {
+        if (name === refuseAfter) refusing = true
+      }),
+    })
+    Object.assign(runner, {
+      quiesceRun: jest.fn(async () => {}),
+      prepareEagerRound: jest.fn(async () => lost),
+      releaseEagerRound: jest.fn(),
+    })
+    return () => consumerGroup.invokeHook.mock.calls.map(([, name]) => name)
+  }
+
+  it('abandons a round whose apply finished after the round was retired', async () => {
+    const { coordinator, consumerGroup, emitted } = build({ assignment: [{ topic: 't' }] })
+    let refusing = false
+    consumerGroup.beginRebalanceRound.mockImplementation(() => ({
+      guard: () => (refusing ? refusal : null),
+      wait: (work) => work(),
+      retire: jest.fn(),
+    }))
+    consumerGroup.applyRebalanceResult.mockImplementation(async () => {
+      refusing = true
+      return { assignment: [], added: [], revoked: [] }
+    })
+
+    await expect(coordinator.runRound('stale', 'revoked')).rejects.toBe(refusal)
+    expect(payloadsOf(emitted, events.PARTITIONS_ASSIGNED)).toEqual([])
+  })
+
+  it('abandons a round retired during the assigned callback, before it reports the join', async () => {
+    const built = build({ assignment: [{ topic: 't', partitions: [0] }] })
+    const called = withHooks(built, { refuseAfter: 'onPartitionsAssigned' })
+
+    await expect(built.coordinator.runRound('stale', 'revoked')).rejects.toBe(refusal)
+    expect(called()).toContain('onPartitionsAssigned')
+    expect(payloadsOf(built.emitted, events.GROUP_JOIN)).toEqual([])
+    expect(built.consumerGroup.releaseHold).toHaveBeenCalledTimes(1)
+  })
+
+  it('reports an eager round that learned of a loss as lost, with the partitions it held', async () => {
+    const built = build({ assignment: [{ topic: 't', partitions: [0] }] })
+    const called = withHooks(built, { lost: true })
+
+    await built.coordinator.runRound('rebalance-in-progress', 'revoked')
+
+    expect(called()).toEqual(['onPartitionsLost', 'onPartitionsAssigned'])
+  })
+
+  it('calls no lost callback for an eager round that learned of a loss while holding nothing', async () => {
+    const built = build({ assignment: [] })
+    const called = withHooks(built, { lost: true })
+
+    await built.coordinator.runRound('rebalance-in-progress', 'revoked')
+
+    expect(called()).toEqual(['onPartitionsAssigned'])
+  })
+
+  it('has no membership to rejoin or expire for a manual run', async () => {
+    const { coordinator, consumerGroup, emitted } = build()
+    consumerGroup.kind = 'manual'
+
+    coordinator.requestRejoin({ kind: 'revoked', reason: 'stale', error: new Error('stale') })
+    await coordinator.onPollExpired({ elapsedMs: 9000, isStatic: false })
+    await coordinator.idle()
+
+    expect(consumerGroup.joinAndSync).not.toHaveBeenCalled()
+    expect(consumerGroup.leave).not.toHaveBeenCalled()
+    expect(payloadsOf(emitted, events.POLL_INTERVAL_EXCEEDED)).toEqual([])
+  })
+
+  it('logs a crash handler that fails with an error that carries no message', async () => {
+    let loggedOnce
+    const arrived = new Promise((resolve) => (loggedOnce = resolve))
+    const logged = jest.fn(() => loggedOnce())
+    const logger = { namespace: () => ({ error: logged, debug: jest.fn(), info: jest.fn() }) }
+    const { coordinator, consumerGroup, runner } = build({ mode: COOPERATIVE, logger })
+    const joinFailure = new Error('')
+    const handlerFailure = new Error('')
+    consumerGroup.joinAndSync.mockRejectedValue(joinFailure)
+    runner.onCrash.mockRejectedValue(handlerFailure)
+
+    coordinator.requestRejoin({ kind: 'revoked', reason: 'stale', error: new Error('stale') })
+    await coordinator.idle().catch(() => {})
+    await arrived
+
+    expect(logged).toHaveBeenCalledWith('Crash handler failed', {
+      groupId: 'coordinator-group',
+      memberId: 'member-1',
+      error: handlerFailure,
+      cause: joinFailure,
+    })
   })
 })

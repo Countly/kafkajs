@@ -3,7 +3,12 @@ const { createScriptedCluster, groupScript } = require('../../../testHelpers/scr
 const { RecordBatch } = require('../../protocol/recordBatch/v0')
 const RecordEncoder = require('../../protocol/recordBatch/record/v0')
 const { TOPIC } = require('./fixtures/fetchHarness')
-const { KafkaJSConnectionError } = require('../../errors')
+const {
+  KafkaJSConnectionError,
+  KafkaJSInvariantViolation,
+  KafkaJSNonRetriableError,
+} = require('../../errors')
+const CommittedOffsetReader = require('../committedOffsets')
 const Cluster = require('../../cluster')
 
 const NODE = { id: 0, host: 'node-0', port: 9092 }
@@ -348,6 +353,33 @@ describe('A manual consumer over a scripted broker', () => {
     expect(frames(cluster, 'ListOffsets').length).toBeGreaterThan(0)
   })
 
+  test('a replacement selection keeps the queued seeks it still selects and drops the rest', async () => {
+    wire = await scripted()
+    const { cluster, kafka } = wire
+    const consumer = track(kafka.consumer({ maxWaitTimeInMs: 20 }))
+    await consumer.connect()
+    await consumer.assign([{ topic: TOPIC, partitions: [0, 1] }])
+    consumer.seek({ topic: TOPIC, partition: 0, offset: '2' })
+    consumer.seek({ topic: TOPIC, partition: 1, offset: '1' })
+    await consumer.assign([{ topic: TOPIC, partitions: [1] }])
+    const delivered = []
+    await consumer.run({
+      eachMessage: async ({ partition, message }) => {
+        delivered.push([partition, message.offset])
+      },
+    })
+    await until(() => delivered.length === 2, 'records after the kept seek')
+    expect(delivered).toEqual([
+      [1, '1'],
+      [1, '2'],
+    ])
+    expect(
+      frames(cluster, 'Fetch').flatMap(({ fields }) =>
+        fields.topics.flatMap(({ partitions }) => partitions.map(({ partition }) => partition))
+      )
+    ).not.toContain(0)
+  })
+
   test('applies a seek queued before run once and never replays it after a crash restart', async () => {
     wire = await scripted()
     const { cluster, kafka } = wire
@@ -570,5 +602,62 @@ describe('A consumer that was disconnected over a scripted broker', () => {
     expect(sockets.length).toBeGreaterThanOrEqual(CYCLES)
     expect(sockets.map((socket) => socket.eventNames())).toEqual(sockets.map(() => ['error']))
     expect(PROCESS_EVENTS.map((event) => process.listenerCount(event))).toEqual(processBefore)
+  })
+})
+
+describe('CommittedOffsetReader over a stub coordinator', () => {
+  const ENTRIES = [{ topic: TOPIC, partition: 0 }]
+  const retry = { retries: 1, initialRetryTime: 1, maxRetryTime: 2 }
+
+  /** @param {Function} offsetFetch the coordinator answer @returns {object} reader plus its cluster */
+  const readerOver = (offsetFetch) => {
+    const cluster = { findGroupCoordinator: jest.fn(async () => ({ offsetFetch })) }
+    return { cluster, reader: new CommittedOffsetReader({ cluster, groupId: 'g', retry }) }
+  }
+  const answerWith = (cell) => async () => ({
+    responses: [{ topic: TOPIC, partitions: cell ? [{ partition: 0, ...cell }] : [] }],
+  })
+
+  test('reads without a call scope through its own retrier', async () => {
+    const { reader, cluster } = readerOver(answerWith({ offset: '5', metadata: 'm' }))
+    expect(await reader.read(ENTRIES)).toEqual([
+      { topic: TOPIC, partition: 0, offset: '5', metadata: 'm' },
+    ])
+    expect(cluster.findGroupCoordinator).toHaveBeenCalledWith({ groupId: 'g' })
+  })
+
+  test('refuses an answer that omits a requested cell', async () => {
+    const { reader } = readerOver(answerWith(null))
+    await expect(reader.read(ENTRIES)).rejects.toThrow(KafkaJSInvariantViolation)
+  })
+
+  test('does not retry a non-retriable broker error', async () => {
+    const offsetFetch = jest.fn().mockRejectedValue(new KafkaJSNonRetriableError('denied'))
+    const { reader } = readerOver(offsetFetch)
+    await expect(reader.read(ENTRIES)).rejects.toThrow('denied')
+    expect(offsetFetch).toHaveBeenCalledTimes(1)
+  })
+
+  test('retries a retriable broker error within its budget', async () => {
+    const offsetFetch = jest
+      .fn()
+      .mockRejectedValueOnce(new KafkaJSConnectionError('down'))
+      .mockImplementationOnce(answerWith({ offset: '2', metadata: '' }))
+    const { reader } = readerOver(offsetFetch)
+    expect((await reader.read(ENTRIES))[0].offset).toBe('2')
+    expect(offsetFetch).toHaveBeenCalledTimes(2)
+  })
+
+  test('a call scope that expired replaces the broker error', async () => {
+    const expired = new Error('call expired')
+    const operation = {
+      check: jest.fn(),
+      guard: jest.fn(() => expired),
+      retry: jest.fn((attempt) => attempt(() => {})),
+    }
+    const offsetFetch = jest.fn().mockRejectedValue(new KafkaJSConnectionError('down'))
+    const { reader } = readerOver(offsetFetch)
+    await expect(reader.read(ENTRIES, { operation })).rejects.toBe(expired)
+    expect(operation.retry).toHaveBeenCalledWith(expect.any(Function), retry)
   })
 })

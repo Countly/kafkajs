@@ -131,6 +131,58 @@ describe('hook quiescence and captured reentry', () => {
       )
     })
   })
+  it('skips a hook the listener does not define', async () => {
+    const revoked = jest.fn()
+    const hooks = new RebalanceHooks(
+      { onPartitionsRevoked: revoked },
+      { isCurrent: () => true, onExpire: jest.fn() }
+    )
+    const identity = { run: {}, round: {}, membership: 7, acquisitions: [] }
+    await hooks.invoke(
+      'onPartitionsAssigned',
+      {},
+      { deadlineAt: performance.now() + 1000, identity }
+    )
+    expect(revoked).not.toHaveBeenCalled()
+    expect(hooks.pending.size).toBe(0)
+  })
+  it('exposes the invocation fence, closed once the invocation settles, and expires once', async () => {
+    const onExpire = jest.fn()
+    let record
+    const hooks = new RebalanceHooks(
+      {
+        onPartitionsRevoked: () => {
+          record = RebalanceHooks.current()
+          expect(RebalanceHooks.fence(record).closed).toBe(false)
+          record.expire()
+          record.expire()
+        },
+      },
+      { isCurrent: () => true, onExpire }
+    )
+    const identity = { run: {}, round: {}, membership: 7, acquisitions: [] }
+    const error = await hooks
+      .invoke('onPartitionsRevoked', {}, { deadlineAt: performance.now() + 1000, identity })
+      .catch((e) => e)
+    expect(error.reason).toBe('timeout')
+    expect(onExpire).toHaveBeenCalledTimes(1)
+    expect(RebalanceHooks.fence(record).closed).toBe(true)
+  })
+  it('refuses a hook that returns after its round stopped being current', async () => {
+    let current = true
+    const hooks = new RebalanceHooks(
+      {
+        onPartitionsRevoked: () => {
+          current = false
+        },
+      },
+      { isCurrent: () => current, onExpire: jest.fn() }
+    )
+    const identity = { run: {}, round: {}, membership: 7, acquisitions: [] }
+    await expect(
+      hooks.invoke('onPartitionsRevoked', {}, { deadlineAt: performance.now() + 1000, identity })
+    ).rejects.toThrow('no longer current')
+  })
   it.each(['before waiter construction', 'inside waiter construction'])(
     'observes expiry %s with the real round and removes owned work',
     (boundary) => {

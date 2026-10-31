@@ -146,3 +146,36 @@ describe('Consumer > SubscriptionState > assignment change callback', () => {
     expect(() => new SubscriptionState().assign([])).not.toThrow()
   })
 })
+
+describe('Consumer > SubscriptionState > omitted and unusable arguments', () => {
+  let state
+  beforeEach(() => {
+    state = new SubscriptionState()
+  })
+
+  it('treats a bare assign, update, pause and resume as empty', () => {
+    state.assign([{ topic: 'topic1', partitions: [0] }])
+    state.update()
+    expect(state.assigned()).toEqual([])
+    state.assign()
+    expect(state.assigned()).toEqual([])
+    expect(() => state.pause()).not.toThrow()
+    expect(() => state.resume()).not.toThrow()
+  })
+
+  it('assigns a topic that names no partitions as an empty one', () => {
+    state.assign([{ topic: 'topic1' }])
+    expect(state.assigned()).toEqual([{ topic: 'topic1', partitions: [] }])
+  })
+
+  it('ignores a partitions value that is neither absent nor a list', () => {
+    state.assign([{ topic: 'topic1', partitions: [0, 1] }])
+    state.pause([{ topic: 'topic1', partitions: [0] }])
+
+    state.pause([{ topic: 'topic1', partitions: null }])
+    expect(state.paused()).toEqual([{ topic: 'topic1', partitions: [0] }])
+
+    state.resume([{ topic: 'topic1', partitions: null }])
+    expect(state.paused()).toEqual([{ topic: 'topic1', partitions: [0] }])
+  })
+})

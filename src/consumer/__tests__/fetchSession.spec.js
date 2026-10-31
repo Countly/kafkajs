@@ -281,3 +281,22 @@ test('a close without an explicit deadline caps its ordinary request budget at t
   expect(remaining).toBeLessThanOrEqual(2000)
   expect(remaining).toBeGreaterThan(0)
 })
+test('build refuses a closed session, a missing topic ID and a duplicate partition', () => {
+  const s = new FetchSession()
+  expect(() => build(s, request(), new Map())).toThrow('Fetch topic ID is missing')
+  const [{ topic, partitions }] = request()
+  expect(() => build(s, [{ topic, partitions: [partitions[0], partitions[0]] }])).toThrow(
+    'Duplicate Fetch partition'
+  )
+  s.close()
+  expect(() => build(s)).toThrow('Fetch session is closed')
+})
+test('a retired registry refuses new node sessions', () => {
+  const registry = new FetchSessions({
+    sendClose: jest.fn(),
+    requestTimeout: 5000,
+    logger: { debug: jest.fn() },
+  })
+  registry.retireAll()
+  expect(() => registry.forNode(1)).toThrow('Fetch sessions are closing')
+})

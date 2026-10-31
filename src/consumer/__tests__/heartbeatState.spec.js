@@ -197,6 +197,12 @@ describe('Consumer > groupProtocol > heartbeatState', () => {
       expect(localAssignmentEquals(null, null)).toBe(true)
     })
 
+    it('tells apart assignments that differ in one partition or in the topic', () => {
+      const base = localAssignment(1, [[TOPIC_A, [0, 1]]])
+      expect(localAssignmentEquals(base, localAssignment(1, [[TOPIC_A, [0, 2]]]))).toBe(false)
+      expect(localAssignmentEquals(base, localAssignment(1, [[TOPIC_B, [0, 1]]]))).toBe(false)
+    })
+
     it('sends an empty TopicPartitions list for a member that owns nothing', () => {
       const protocol = protocolDouble({ localAssignment: localAssignment(1, []) })
 

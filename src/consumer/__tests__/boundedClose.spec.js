@@ -297,6 +297,52 @@ describe('consumer control operation lifetime', () => {
     await expect(op.retry(attempt)).rejects.toBe(error)
     expect(attempt).toHaveBeenCalledTimes(1)
   })
+  test('a sleep whose timer fires at once still settles and leaves nothing registered', async () => {
+    const op = scope()
+    const timer = jest.spyOn(globalThis, 'setTimeout').mockImplementation((callback) => {
+      callback()
+      return 0
+    })
+    try {
+      await expect(op.sleep(5)).resolves.toBeUndefined()
+    } finally {
+      timer.mockRestore()
+    }
+    expect(jest.getTimerCount()).toBe(0)
+  })
+  test('a bail without an error fails with an Aborted error', async () => {
+    const op = scope()
+    const attempt = jest.fn((bail) => bail())
+    await expect(op.retry(attempt)).rejects.toThrow('Aborted')
+    expect(attempt).toHaveBeenCalledTimes(1)
+  })
+  test('a swallowed bail still fails the retry with the bail error', async () => {
+    const op = scope()
+    const error = new Error('bail')
+    const attempt = jest.fn((bail) => {
+      try {
+        bail(error)
+      } catch (ignored) {}
+      return 'done'
+    })
+    await expect(op.retry(attempt)).rejects.toBe(error)
+    expect(attempt).toHaveBeenCalledTimes(1)
+  })
+  test.each([
+    ['a non-retriable error', () => Object.assign(new Error('fatal'), { retriable: false })],
+    ['a programming error', () => new TypeError('bad call')],
+  ])('%s fails at once without a backoff', async (_, failure) => {
+    const op = scope()
+    const cause = failure()
+    const attempt = jest.fn(async () => {
+      throw cause
+    })
+    const error = await op.retry(attempt, { retries: 3 }).catch((e) => e)
+    expect(error).toBeInstanceOf(KafkaJSNonRetriableError)
+    expect(error.cause).toBe(cause)
+    expect(attempt).toHaveBeenCalledTimes(1)
+    expect(jest.getTimerCount()).toBe(0)
+  })
   test('retry records the existing exhaustion shape', async () => {
     const op = scope()
     const attempt = jest.fn(async () => {

@@ -1511,3 +1511,178 @@ describe('Consumer > OffsetManager > reset schedules', () => {
     })
   })
 })
+
+describe('Consumer > OffsetManager > reset edges', () => {
+  const durationManager = (options) => {
+    const ctx = createScheduledOffsetManager({ committed: '-1', listOffset: '12', ...options })
+    ctx.manager.topicConfigurations[TOPIC].resetPolicy = { kind: 'by_duration', durationMs: 1000 }
+    return ctx
+  }
+  const cell = { topic: TOPIC, partition: 0 }
+
+  test('a duration reset under the none policy has no actual offset to install', async () => {
+    const ctx = durationManager()
+    ctx.manager.topicConfigurations[TOPIC].resetPolicy = { kind: 'none' }
+    await expect(ctx.manager.resetByDuration(cell)).rejects.toThrow(
+      'Reset returned no actual offset'
+    )
+    expect(ctx.cluster.fetchTopicsOffset).not.toHaveBeenCalled()
+    expect(ctx.coordinator.offsetCommit).not.toHaveBeenCalled()
+  })
+
+  test('a duration reset of a stopping manager sends nothing', async () => {
+    const ctx = durationManager()
+    ctx.manager.isStopping = () => true
+    expect(await ctx.manager.resetByDuration(cell)).toBe(false)
+    expect(ctx.cluster.fetchTopicsOffset).not.toHaveBeenCalled()
+  })
+
+  test('a duration reset that stops during its commit publishes no position', async () => {
+    const ctx = durationManager({ autoCommit: true })
+    const commit = ctx.schedule.hold({ api: 'OffsetCommit' })
+    const resetting = ctx.manager.resetByDuration(cell).then(
+      (applied) => applied,
+      (error) => error
+    )
+    await commit.arrived()
+    ctx.manager.isStopping = () => true
+    commit.release({})
+    const outcome = await resetting
+    expect(outcome === false || outcome.name === 'KafkaJSCommitFailedError').toBe(true)
+    expect(ctx.cache[TOPIC]?.[0]).toBeUndefined()
+    expect(ctx.operations.size()).toBe(0)
+  })
+
+  test('a duration reset superseded after its last await publishes no position', async () => {
+    const ctx = durationManager()
+    let stopping = false
+    ctx.manager.isStopping = () => stopping
+    Object.defineProperty(ctx.manager, 'autoCommit', {
+      get() {
+        stopping = true
+        return false
+      },
+    })
+    expect(await ctx.manager.resetByDuration(cell)).toBe(false)
+    expect(ctx.cache[TOPIC]?.[0]).toBeUndefined()
+    expect(ctx.operations.size()).toBe(0)
+  })
+
+  test('a duration reset superseded right after its commit completes publishes no position', async () => {
+    const ctx = durationManager({ autoCommit: true })
+    let stopping = false
+    ctx.manager.isStopping = () => stopping
+    const send = ctx.manager.sendOffsetCommit.bind(ctx.manager)
+    ctx.manager.sendOffsetCommit = async (...args) => {
+      const result = await send(...args)
+      stopping = true
+      return result
+    }
+    expect(await ctx.manager.resetByDuration(cell)).toBe(false)
+    expect(ctx.coordinator.offsetCommit).toHaveBeenCalledTimes(1)
+    expect(ctx.cache[TOPIC]?.[0]).toBeUndefined()
+    expect(ctx.operations.size()).toBe(0)
+  })
+
+  test('a refusal without a captured context carries a null context and an unresolvable answer leaves the cell unset', async () => {
+    const ctx = createScheduledOffsetManager({ partitions: [0, 1], committed: '-1' })
+    ctx.manager.topicConfigurations[TOPIC].resetPolicy = { kind: 'none' }
+    await ctx.manager.resolveOffsets()
+    const refusals = ctx.manager.takeResetRefusals()
+    expect(refusals.map((r) => [r.partition, r.context])).toEqual([
+      [0, null],
+      [1, null],
+    ])
+
+    const open = createScheduledOffsetManager({ committed: '-1', listOffset: '-1' })
+    expect(await open.manager.resolveOffsets()).toBe(true)
+    expect(open.cache[TOPIC][0]).toBeUndefined()
+  })
+
+  test('a cell that went stale before publication is dropped and reported incomplete', () => {
+    const ctx = createScheduledOffsetManager({ partitions: [0, 1] })
+    const ticket = ctx.operations.begin([cell], { owner: ctx.manager })
+    jest.spyOn(ctx.manager, 'isStale').mockImplementation((t, topic, partition) => partition === 0)
+    ctx.cache[TOPIC] = { 0: '-1', 1: '-1' }
+    const complete = ctx.manager.applyResolution(
+      ticket,
+      [
+        {
+          topic: TOPIC,
+          partitions: [
+            { partition: 0, offset: '5' },
+            { partition: 1, offset: '6' },
+          ],
+        },
+      ],
+      [],
+      new Map()
+    )
+    ctx.operations.end(ticket)
+    expect(complete).toBe(false)
+    expect(ctx.cache[TOPIC]).toEqual({ 0: '-1', 1: '6' })
+  })
+
+  test('a held refusal survives while its topic keeps another and ends with the last', () => {
+    const { manager } = createScheduledOffsetManager({ partitions: [0, 1] })
+    manager.resetRefusals.set(
+      TOPIC,
+      new Map([
+        [0, {}],
+        [1, {}],
+      ])
+    )
+    manager.retireResetRefusals('other', 0)
+    manager.retireResetRefusals(TOPIC, 0)
+    expect([...manager.resetRefusals.get(TOPIC).keys()]).toEqual([1])
+    manager.retireResetRefusals(TOPIC)
+    expect(manager.resetRefusals.has(TOPIC)).toBe(false)
+  })
+
+  test('the known partitions of a topic the metadata cache cannot answer for are none', () => {
+    const { manager, cluster } = createScheduledOffsetManager()
+    expect(manager.knownPartitions(TOPIC)).toBeUndefined()
+    cluster.findTopicPartitionMetadata = jest.fn(() => {
+      throw new Error('no metadata')
+    })
+    expect(manager.knownPartitions(TOPIC)).toEqual([])
+    cluster.findTopicPartitionMetadata = () => [{ partitionId: 3 }]
+    expect(manager.knownPartitions(TOPIC)).toEqual([3])
+  })
+
+  test('forgetting an epoch or clearing offsets of a topic the manager never held is harmless', () => {
+    const { manager, cache } = createScheduledOffsetManager()
+    manager.forgetConsumedEpoch('unheld', 0)
+    delete cache[TOPIC]
+    delete manager.resolvedOffsets[TOPIC]
+    delete manager.resolvedEpochs[TOPIC]
+    expect(() => manager.clearOffsets(cell)).not.toThrow()
+    expect(manager.resolvedOffsets[TOPIC]).toBeUndefined()
+  })
+
+  test('a manager without a logger resolves a reset in silence', async () => {
+    const ctx = durationManager()
+    const manager = ctx.build({ logger: undefined })
+    manager.topicConfigurations[TOPIC].resetPolicy = { kind: 'by_duration', durationMs: 1000 }
+    const written = []
+    for (const level of ['debug', 'info', 'warn', 'error'])
+      jest.spyOn(manager.logger, level).mockImplementation((...args) => written.push(args))
+    try {
+      expect(await manager.resetByDuration(cell)).toBe(true)
+      expect(manager.committedOffsets()[TOPIC][0]).toBe('12')
+      expect(written).toEqual([])
+    } finally {
+      jest.restoreAllMocks()
+    }
+  })
+
+  test('commit helpers accept their optional arguments', () => {
+    const ctx = createScheduledOffsetManager({ autoCommit: true })
+    const ticket = ctx.operations.begin([cell], { mutation: true })
+    ctx.manager.recordCommitted(ticket, [
+      { topic: TOPIC, partitions: [{ partition: 0, offset: '4' }] },
+    ])
+    ctx.operations.end(ticket)
+    expect(ctx.cache[TOPIC][0]).toBe('4')
+  })
+})

@@ -280,6 +280,82 @@ describe('Consumer > assigners > stickyCore', () => {
     expect(allAssigned(assignment)).toHaveLength(6)
   })
 
+  test('treats a missing generation as the default one on the constrained path', () => {
+    const assign = (generationId) =>
+      plain(
+        assignSticky({
+          partitionsPerTopic: { 'topic-A': partitions(4) },
+          members: [
+            member('member-1', { owned: { 'topic-A': [0, 1] }, generationId }),
+            member('member-2', { owned: { 'topic-A': [0, 1] }, generationId: 3 }),
+          ],
+        })
+      )
+
+    expect(assign(null)).toEqual(assign(DEFAULT_GENERATION))
+    expect(assign(null)).toEqual({
+      'member-1': { 'topic-A': [2, 3] },
+      'member-2': { 'topic-A': [0, 1] },
+    })
+    expect(assign(3)).not.toEqual(assign(null))
+  })
+
+  test('treats a missing generation as the default one on the general path', () => {
+    const assignment = assignSticky({
+      partitionsPerTopic: { 'topic-A': partitions(9), 'topic-B': partitions(1) },
+      members: [
+        member('member-1', {
+          topics: ['topic-A', 'topic-B'],
+          owned: { 'topic-A': [0, 1, 2, 3, 4, 5], 'topic-B': [0] },
+          generationId: 9,
+        }),
+        member('member-2', {
+          topics: ['topic-A'],
+          owned: { 'topic-A': [0, 1, 2, 3, 4, 5] },
+          generationId: null,
+        }),
+      ],
+    })
+
+    expect(allAssigned(assignment)).toHaveLength(10)
+    expect(Math.max(...sizes(assignment)) - Math.min(...sizes(assignment))).toBeLessThanOrEqual(1)
+    expect(plain(assignment)['member-2']['topic-A'].length).toBeGreaterThan(0)
+  })
+
+  test('keeps owned partitions of equal number from several topics in topic order', () => {
+    const topics = ['topic-C', 'topic-B', 'topic-A']
+    const assignment = assignSticky({
+      partitionsPerTopic: { 'topic-A': [0], 'topic-B': [0], 'topic-C': [0] },
+      members: [
+        member('member-1', { topics, owned: { 'topic-C': [0], 'topic-B': [0], 'topic-A': [0] } }),
+        member('member-2', { topics }),
+      ],
+    })
+
+    expect(plain(assignment)['member-1']).toEqual({ 'topic-A': [0], 'topic-B': [0] })
+    expect(plain(assignment)['member-2']).toEqual({ 'topic-C': [0] })
+  })
+
+  test('orders topics with the same number of subscribers by name', () => {
+    const assignment = assignSticky({
+      partitionsPerTopic: {
+        'topic-D': [0],
+        'topic-B': [0],
+        'topic-A': [0],
+        'topic-C': [0],
+      },
+      members: [
+        member('member-1', { topics: ['topic-D', 'topic-A', 'topic-C', 'topic-B'] }),
+        member('member-2', { topics: ['topic-B', 'topic-C', 'topic-A'] }),
+      ],
+    })
+
+    expect(plain(assignment)).toEqual({
+      'member-1': { 'topic-B': [0], 'topic-D': [0] },
+      'member-2': { 'topic-A': [0], 'topic-C': [0] },
+    })
+  })
+
   test('sends a partition back to the owner it had in an older generation', () => {
     const assignment = assignSticky({
       partitionsPerTopic: { 'topic-A': partitions(9), 'topic-B': partitions(1) },
