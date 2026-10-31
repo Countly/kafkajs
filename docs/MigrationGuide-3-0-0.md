@@ -479,7 +479,7 @@ says so, `groupProtocol: 'consumer'`.
   consumer (or on `Broker#fetch`) to restore the 2.2.4 behavior of delivering corrupt records
   without checking them.
 
-- **A recreated topic resets that topic's consumer offsets once.** Previously, when a topic was
+- **A recreated topic resets that topic's consumer offsets, and keeps owing the reset until a confirmed commit.** Previously, when a topic was
   deleted and recreated under a running consumer, the consumer kept using the committed offset from
   the *previous* incarnation. Because the cleanup of `__consumer_offsets` is asynchronous, that
   stale offset was often still there, and if it happened to fall inside the new topic's offset
@@ -492,8 +492,7 @@ says so, `groupProtocol: 'consumer'`.
   incarnation settles it (a local resolution, or a seek with `autoCommit` off, does not), so a stop/run,
   a crash restart or an assignment rebuild before that commit resolves the reset again instead of
   resuming the old topic's offset; offsets committed against the *new* incarnation are never
-  discarded — and it is per that subscription's `fromBeginning`, not a global reset. Partitions you paused stay paused across a recreation, because pausing is user intent
-  rather than offset state. There is no opt-out. An application that relied on offsets surviving a
+  discarded — and it is per that subscription's `fromBeginning`, not a global reset. A pause belongs to one topic incarnation: a recreated topic starts unpaused, so pause it again after `consumer.cluster.topic_recreated` if needed. Ordinary rebalances still preserve pause state. There is no opt-out. An application that relied on offsets surviving a
   topic recreation must stop relying on it; it was never a guarantee the broker made.
   A reset observed while crash cleanup or `restartOnFailure` is pending is kept for the next run. A public disconnect clears the pending resets and removes the listener. The group's shared cache and ledger remain while another participant, attached reset table or open operation still needs them; after the last lifetime ends, both entries are released.
 
@@ -1157,8 +1156,8 @@ now logged.
   `consumer.cluster.rebootstrap`, `producer.cluster.rebootstrap` and
   `admin.cluster.rebootstrap` respectively. `TOPIC_RECREATED`'s payload is
   `{ topic, previousTopicId, topicId }` and fires when a topic name the client already had metadata
-  for comes back with a different topic id; on a consumer it accompanies the one-shot offset reset
-  ("A recreated topic resets that topic's consumer offsets once."), while on a producer and an admin
+  for comes back with a different topic id; on a consumer it accompanies the offset reset, which stays owed until a confirmed commit of the new incarnation
+  ("A recreated topic resets that topic's consumer offsets, and keeps owing the reset until a confirmed commit."), while on a producer and an admin
   client it is purely observational. `REBOOTSTRAP`'s payload is `{ reason }`, where `reason` is
   `'timeout'`, `'required'` or `'all-brokers-unavailable'` for the three triggers ("Client
   rebootstrap is on by default."); it never fires under `metadataRecoveryStrategy: 'none'`.

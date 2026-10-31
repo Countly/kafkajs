@@ -412,26 +412,26 @@ describe('A pending manual assignment does not outlive a forced close', () => {
     expect([...cluster.targetTopics]).toEqual([TOPIC])
   })
 
-  test('a candidate waiting for the target lock never publishes after its call deadline', async () => {
+  test('assign has no retry.maxTotalTime deadline of its own', async () => {
     const kafka = new Kafka(
       wire.cluster.kafkaOptions({
         logLevel: logLevel.NOTHING,
-        retry: { retries: 1, initialRetryTime: 10, maxRetryTime: 20, maxTotalTime: 150 },
+        retry: { retries: 1, initialRetryTime: 10, maxRetryTime: 20, maxTotalTime: 100 },
       })
     )
-    const consumer = track(kafka.consumer({ groupId: 'deadline-group' }))
+    const consumer = track(kafka.consumer({ groupId: 'no-deadline-group' }))
     await consumer.connect()
     await consumer.assign([{ topic: TOPIC, partitions: [0] }])
     const cluster = stage.mock.contexts[0]
     const reset = jest.spyOn(cluster, 'resetTargetTopics')
     await cluster.mutatingTargetTopics.acquire()
-    const old = outcomeOf(consumer.assign([{ topic: OTHER, partitions: [1] }]))
+    const pending = outcomeOf(consumer.assign([{ topic: OTHER, partitions: [1] }]))
     await until(() => reset.mock.calls.length === 1, 'the publication')
-
-    expect((await old).name).toBe('KafkaJSDeliveryTimeout')
+    await new Promise((resolve) => setTimeout(resolve, 400))
     await cluster.mutatingTargetTopics.release()
-    await new Promise((resolve) => setTimeout(resolve, 50))
-    expect([...cluster.targetTopics]).toEqual([TOPIC])
+
+    expect(await pending).toBe('published')
+    expect([...cluster.targetTopics]).toEqual([OTHER])
   })
 
   test.each([
@@ -676,5 +676,43 @@ describe('Cluster#stageMetadata with a refusing guard', () => {
 
     await expect(stage(() => null)).rejects.toThrow('stop')
     expect(seen[0]).toBeNull()
+  })
+})
+
+describe('A pattern subscription waiting to connect does not outlive a forced close', () => {
+  test('pattern broker acquisition refuses connect resumed after close', async () => {
+    const Broker = require('../../broker')
+    const wire = scripted()
+    const consumer = wire.kafka.consumer({ groupId: 'pattern-connect-group' })
+    let release
+    const gate = new Promise((resolve) => {
+      release = resolve
+    })
+    let arrived = false
+    const original = Broker.prototype.connect
+    jest.spyOn(Broker.prototype, 'connect').mockImplementationOnce(async function (...args) {
+      arrived = true
+      await gate
+      return original.apply(this, args)
+    })
+    try {
+      const pending = consumer.subscribe({ topics: [/./] }).then(
+        () => 'published',
+        (error) => error
+      )
+      await until(() => arrived, 'broker connect gate')
+      await consumer.disconnect({ timeout: 0 })
+      const count = wire.cluster.requests().length
+      release()
+      const outcome = await pending
+
+      expect(wire.cluster.requests().slice(count)).toEqual([])
+      expect(outcome).toMatchObject({ type: 'CONSUMER_STOPPING' })
+    } finally {
+      release()
+      await consumer.disconnect({ timeout: 0 })
+      jest.restoreAllMocks()
+      wire.cluster.assertClean()
+    }
   })
 })

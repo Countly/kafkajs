@@ -253,7 +253,9 @@ describe('Consumer > subscribe > regex', () => {
       })
     )
     expect(cluster.useConsumerMetadataScope).toHaveBeenCalledTimes(1)
-    expect(cluster.resetTargetTopics).toHaveBeenCalledWith([])
+    expect(cluster.resetTargetTopics).toHaveBeenCalledWith([], {
+      isCurrent: expect.any(Function),
+    })
     expect(cluster.addMultipleTargetTopics).not.toHaveBeenCalled()
   })
 
@@ -286,7 +288,9 @@ describe('Consumer > subscribe > regex', () => {
     expect(cluster.releaseConsumerMetadataScope).toHaveBeenCalledTimes(1)
 
     await c.subscribe({ topics: ['events-a'] })
-    expect(cluster.addMultipleTargetTopics).toHaveBeenCalledWith(['events-a'])
+    expect(cluster.addMultipleTargetTopics).toHaveBeenCalledWith(['events-a'], {
+      fence: expect.any(Object),
+    })
   })
 
   it('rejects an invalid reset policy before any declaration or scope changes', async () => {

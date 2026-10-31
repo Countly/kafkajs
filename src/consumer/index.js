@@ -380,12 +380,14 @@ module.exports = (params) => {
    * call's natural wait. The caller must `finish` it in a `finally`.
    * @param {Set<ConsumerOperation>} calls the in-flight set of the lifetime the call belongs to, so
    *   only that lifetime's forced close retires it
+   * @param {boolean} [bounded=true] whether `retry.maxTotalTime` ends the call; false keeps only
+   *   the lifetime, handler-run and rebalance-callback limits
    * @returns {ConsumerOperation} the call's scope
    */
-  const beginCall = (calls) => {
+  const beginCall = (calls, bounded = true) => {
     const invocation = RebalanceHooks.current()
     const identity = handlerContext.current()?.runIdentity
-    const maxTotalTime = retry?.maxTotalTime
+    const maxTotalTime = bounded ? retry?.maxTotalTime : undefined
     const operation = new ConsumerOperation({
       deadlineAt: Math.min(
         maxTotalTime == null ? Infinity : performance.now() + maxTotalTime,
@@ -408,12 +410,13 @@ module.exports = (params) => {
    * @template T
    * @param {(operation: ConsumerOperation) => T|Promise<T>} work the call's body
    * @param {ControlLifetime} [owned] the lifetime the call belongs to, the current one by default
+   * @param {boolean} [bounded=true] whether `retry.maxTotalTime` ends the call
    * @returns {Promise<T>} the body's result, or the scope's refusal if it expired first
    * @throws {Error} the body's failure or the scope's refusal
    */
-  const withinCall = async (work, owned = life) => {
+  const withinCall = async (work, owned = life, bounded = true) => {
     const { calls } = owned
-    const operation = beginCall(calls)
+    const operation = beginCall(calls, bounded)
     try {
       return await operation.wait(() => work(operation))
     } finally {
@@ -1570,7 +1573,9 @@ module.exports = (params) => {
    * The call belongs to the control lifetime it starts under, after any close already running has
    * settled, so it is one of that lifetime's calls in flight: a forced close ends it with the
    * close's refusal, and nothing it was still waiting for (a broker, a connection, the Metadata
-   * write, the target lock) reconnects or publishes afterwards.
+   * write, the target lock) reconnects or publishes afterwards. It carries no `retry.maxTotalTime`
+   * deadline of its own: that public-entry deadline covers only `commitOffsets`, `committed`,
+   * `position` and `describeGroup`.
    * @type {import("../../types").Consumer["assign"]}
    * @throws {KafkaJSNonRetriableError} for malformed input, a running consumer, an active
    *   subscription, an unknown partition, or a candidate superseded while it was validated
@@ -1612,57 +1617,61 @@ module.exports = (params) => {
     const waiting = earlierClose()
     if (waiting) await waiting
     const owned = acquireLife()
-    return withinCall(async (operation) => {
-      const revision = selectionRevision
-      const ticket = declared.captureMetadata()
-      const stale = () =>
-        refusal() ||
-        operation.guard() ||
-        owned.fence.guard() ||
-        (revision !== selectionRevision || !ticket.isCurrent()
-          ? new KafkaJSNonRetriableError('The assignment was superseded while it was validated')
-          : null)
+    return withinCall(
+      async (operation) => {
+        const revision = selectionRevision
+        const ticket = declared.captureMetadata()
+        const stale = () =>
+          refusal() ||
+          operation.guard() ||
+          owned.fence.guard() ||
+          (revision !== selectionRevision || !ticket.isCurrent()
+            ? new KafkaJSNonRetriableError('The assignment was superseded while it was validated')
+            : null)
 
-      const metadata = await cluster.stageMetadata({ topics: names, guard: stale })
-      for (const { topic, partitions: wanted } of partitions) {
-        const known = new Set(
-          metadata.topicMetadata
-            .filter((entry) => entry.topic === topic)
-            .flatMap((entry) => entry.partitionMetadata.map(({ partitionId }) => partitionId))
-        )
-        const unknown = wanted.filter((partition) => !known.has(partition))
-        if (unknown.length > 0) {
-          throw new KafkaJSNonRetriableError(
-            `Topic ${topic} has no partition ${unknown.join(', ')}`
+        const metadata = await cluster.stageMetadata({ topics: names, guard: stale })
+        for (const { topic, partitions: wanted } of partitions) {
+          const known = new Set(
+            metadata.topicMetadata
+              .filter((entry) => entry.topic === topic)
+              .flatMap((entry) => entry.partitionMetadata.map(({ partitionId }) => partitionId))
           )
-        }
-      }
-
-      const published = await cluster.resetTargetTopics(names, {
-        isCurrent: () => stale() === null,
-        publish: () => {
-          declared.retireMetadata()
-          manual = {
-            partitions,
-            configurations: Subscription.configurationsOf({
-              topicConfigurations: new Map(
-                names.map((name) => [name, { fromBeginning, offsetReset: resetPolicy }])
-              ),
-            }),
-          }
-          for (const [key, { topic, partition }] of queuedSeeks) {
-            const selected = partitions.some(
-              (row) => row.topic === topic && row.partitions.includes(partition)
+          const unknown = wanted.filter((partition) => !known.has(partition))
+          if (unknown.length > 0) {
+            throw new KafkaJSNonRetriableError(
+              `Topic ${topic} has no partition ${unknown.join(', ')}`
             )
-            if (!selected) queuedSeeks.delete(key)
           }
-          retainTopics(new Set(names))
-          lastJoin = null
-          selectionRevision++
-        },
-      })
-      if (published === false) throw stale() || consumerStoppingError()
-    }, owned)
+        }
+
+        const published = await cluster.resetTargetTopics(names, {
+          isCurrent: () => stale() === null,
+          publish: () => {
+            declared.retireMetadata()
+            manual = {
+              partitions,
+              configurations: Subscription.configurationsOf({
+                topicConfigurations: new Map(
+                  names.map((name) => [name, { fromBeginning, offsetReset: resetPolicy }])
+                ),
+              }),
+            }
+            for (const [key, { topic, partition }] of queuedSeeks) {
+              const selected = partitions.some(
+                (row) => row.topic === topic && row.partitions.includes(partition)
+              )
+              if (!selected) queuedSeeks.delete(key)
+            }
+            retainTopics(new Set(names))
+            lastJoin = null
+            selectionRevision++
+          },
+        })
+        if (published === false) throw stale() || consumerStoppingError()
+      },
+      owned,
+      false
+    )
   }
 
   /**
