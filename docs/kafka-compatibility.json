@@ -69,7 +69,7 @@
       "gap": "current",
       "onFloor": false,
       "belowFloor": [],
-      "notes": "v11 rack / preferred read replica (KIP-392), now fully handled: OFFSET_NOT_AVAILABLE (78) skips the partition for one round and keeps the follower, and an OFFSET_OUT_OF_RANGE from a follower drops the preferred replica and re-resolves against the leader. v12 flexible + LastFetchedEpoch (sent at its -1 default; truncation is detected through OffsetForLeaderEpoch instead), v13 topic IDs replace names (KIP-516; a request whose topics are not all known by id is capped at v12), v14 OFFSET_MOVED_TO_TIERED_STORAGE (KIP-405), v15 ReplicaState (KIP-903), v16 leader hints (KIP-951), v17 ReplicaDirectoryId (KIP-853), v18 HighWatermark (KIP-1166). Fetch sessions (KIP-227) are not implemented: every fetch is a full fetch (sessionId 0, sessionEpoch -1)."
+      "notes": "v11 rack / preferred read replica (KIP-392), now fully handled: OFFSET_NOT_AVAILABLE (78) skips the partition for one round and keeps the follower, and an OFFSET_OUT_OF_RANGE from a follower drops the preferred replica and re-resolves against the leader. v12 flexible + LastFetchedEpoch (sent at its -1 default; truncation is detected through OffsetForLeaderEpoch instead), v13 topic IDs replace names (KIP-516; a request whose topics are not all known by id is capped at v12), v14 OFFSET_MOVED_TO_TIERED_STORAGE (KIP-405), v15 ReplicaState (KIP-903), v16 leader hints (KIP-951), v17 ReplicaDirectoryId (KIP-853), v18 HighWatermark (KIP-1166). Fetch sessions (KIP-227) are supported with `fetchSessions: true` and remain opt-in by default. With `fetchSessions: false`, every fetch is a full fetch (sessionId 0, sessionEpoch -1); sparse session replies use the complete per-request topic mapping and all decoder bounds."
     },
     {
       "kafkaName": "ListOffsets",
@@ -1006,12 +1006,6 @@
   ],
   "waivers": [],
   "crossCutting": [
-    {
-      "gap": "No fetch sessions (KIP-227)",
-      "where": "fetch layer",
-      "impact": "Every fetch is a full request - sessionId 0, sessionEpoch -1, an empty forgotten-topics list - so a poll re-sends every assigned partition rather than only what changed. This is a decision, not an oversight: 3.0.0 ships sessionless, and the three fetch-session error codes are mapped defensively so an unexpected one cannot crash a consumer. Incremental fetch is the prerequisite for reducing request size on a large assignment.",
-      "owner": "backlog"
-    },
     {
       "gap": "Legacy message-format v0/v1 encoders are still in the tree (KIP-724)",
       "where": "src/protocol/message/v0, src/protocol/message/v1, src/protocol/messageSet encoders",

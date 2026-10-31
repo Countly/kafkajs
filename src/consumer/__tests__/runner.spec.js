@@ -11,6 +11,7 @@ const {
 } = require('../../errors')
 const { createErrorFromCode } = require('../../protocol/error')
 const { stampOffsetCommit, stampMembership } = require('../rebalanceErrorContract')
+const { ConsumerOperation } = require('../groupProtocol/interface')
 
 const UNKNOWN = -1
 const REBALANCE_IN_PROGRESS = 27
@@ -91,6 +92,9 @@ describe('Consumer > Runner', () => {
       kind: 'classic',
       heartbeatInterval: jest.fn(() => 3000),
       onStopRequested: jest.fn(),
+      // The Fetch-session seams of stop and forced retirement; the real group always has both.
+      closeFetchSessions: jest.fn(async () => {}),
+      retireFetchSessions: jest.fn(),
       startIdleWait: jest.fn(() => ({})),
       beginRebalanceRound: jest.fn(() => ({
         guard: () => null,
@@ -573,6 +577,62 @@ describe('Consumer > Runner', () => {
       expect(consumerGroup.leave).toHaveBeenCalled()
 
       runner = null
+    })
+  })
+
+  describe('Fetch sessions', () => {
+    it('closes them after the fetchers stopped, within the stop scope, before the leave', async () => {
+      const calls = []
+      const runner = createTestRunner()
+      runner.fetchManager = {
+        start: jest.fn(async () => {}),
+        stop: jest.fn(async () => calls.push('fetchManager.stop')),
+      }
+      consumerGroup.closeFetchSessions = jest.fn(async () => calls.push('closeFetchSessions'))
+      consumerGroup.leave = jest.fn(async () => calls.push('leave'))
+      const operation = new ConsumerOperation({ deadlineAt: performance.now() + 60000 })
+      runner.running = true
+
+      await runner.stop(undefined, operation)
+      operation.finish()
+
+      expect(calls).toEqual(['fetchManager.stop', 'closeFetchSessions', 'leave'])
+      const [scope] = consumerGroup.closeFetchSessions.mock.calls[0]
+      expect(scope).toEqual({ deadlineAt: operation.deadlineAt, guard: operation.guard })
+    })
+
+    it('passes no finite deadline when the stop has none, and still closes', async () => {
+      const runner = createTestRunner()
+      runner.running = true
+
+      await runner.stop()
+
+      const [scope] = consumerGroup.closeFetchSessions.mock.calls[0]
+      expect(scope.deadlineAt).toBe(Infinity)
+    })
+
+    it('starts no close while a fetcher still holds the stop, and still ends the stop', async () => {
+      const runner = createTestRunner()
+      runner.fetchManager = { start: jest.fn(), stop: jest.fn(() => new Promise(() => {})) }
+      const operation = new ConsumerOperation({ deadlineAt: performance.now() + 20 })
+      runner.running = true
+
+      await runner.stop(undefined, operation)
+      operation.finish()
+
+      expect(consumerGroup.closeFetchSessions).not.toHaveBeenCalled()
+      expect(consumerGroup.leave).not.toHaveBeenCalled()
+    })
+
+    it('retires them locally and sends nothing when a forced close retires the run', () => {
+      const runner = createTestRunner()
+      runner.running = true
+
+      runner.retire(new Error('forced'))
+      runner.retire(new Error('again'))
+
+      expect(consumerGroup.retireFetchSessions).toHaveBeenCalledTimes(1)
+      expect(consumerGroup.closeFetchSessions).not.toHaveBeenCalled()
     })
   })
 

@@ -104,6 +104,36 @@ describe('consumer configuration defaults', () => {
     })
   })
 
+  test('Fetch sessions are off by default and the factory carries the option and the timeout', async () => {
+    const defaults = await capturedOptions()
+    expect([defaults.fetchSessions, defaults.requestTimeout]).toEqual([false, 30000])
+
+    const enabled = await capturedOptions({ fetchSessions: true, requestTimeout: 4321 })
+    expect([enabled.fetchSessions, enabled.requestTimeout]).toEqual([true, 4321])
+  })
+
+  test('the public factory passes the session option and the client request timeout on', () => {
+    const received = []
+    jest.isolateModules(() => {
+      jest.doMock('../index', () => (params) => {
+        received.push(params)
+        return {}
+      })
+      const { Kafka: Isolated } = require('../../../index')
+      const client = new Isolated({ brokers: ['localhost:9092'], requestTimeout: 4321 })
+      client.consumer({ groupId: 'g' })
+      client.consumer({ groupId: 'g', fetchSessions: true })
+    })
+    jest.dontMock('../index')
+
+    expect(
+      received.map(({ fetchSessions, requestTimeout }) => [fetchSessions, requestTimeout])
+    ).toEqual([
+      [false, 4321],
+      [true, 4321],
+    ])
+  })
+
   test('the resolver default is independently forty-five seconds', () => {
     expect(resolveGroupTimeouts({ logger: newLogger() })).toEqual({
       rebalanceTimeout: 300000,

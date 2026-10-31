@@ -1493,3 +1493,13 @@ async function useBoundedDisconnect(target: import('./index').Consumer): Promise
   await target.disconnect({ timeout: 1000, leaveGroup: 'yes' })
 }
 void useBoundedDisconnect
+
+{
+  kafka.consumer({ groupId: 'sessions', fetchSessions: true })
+  kafka.consumer({ groupId: 'sessions', fetchSessions: false })
+  kafka.consumer({ fetchSessions: true })
+  const config: Parameters<Kafka['consumer']>[0] = { fetchSessions: false }
+  kafka.consumer(config)
+  // @ts-expect-error fetchSessions accepts only booleans
+  kafka.consumer({ groupId: 'sessions', fetchSessions: 'true' })
+}

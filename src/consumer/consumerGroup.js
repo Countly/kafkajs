@@ -16,6 +16,7 @@ const Subscription = require('./subscription')
 const IdleWait = require('./idleWait')
 const LeaderUnionWatch = require('./leaderUnionWatch')
 const { FetchPreparation, InvocationPreparation, fencedDelay } = require('./fetchPreparation')
+const { FetchSessions } = require('./fetchSession')
 const PositionValidator = require('./positionValidator')
 const Outage = require('./outage')
 const RebalanceHooks = require('./rebalanceHooks')
@@ -93,6 +94,12 @@ const STALE_METADATA_ERRORS = [
 // is capped here rather than being split across two versions.
 // @see clients/src/main/resources/common/message/FetchRequest.json (Apache Kafka 4.3.1)
 const FETCH_TOPIC_NAMES_MAX_VERSION = 12
+
+/** The first Fetch version that carries a session ID and epoch (KIP-227). */
+const FETCH_SESSION_MIN_VERSION = 7
+
+/** The first Fetch version keyed by topic ID rather than name (KIP-516). */
+const FETCH_TOPIC_IDS_MIN_VERSION = 13
 
 /**
  * How many times one `seekOffsets()` call resolves offsets again after a resolution dropped an
@@ -191,6 +198,10 @@ module.exports = class ConsumerGroup {
    *                                cache of a consumer without a group, passed to every manager.
    * @param {object|null} [options.rebalanceListener] the run's validated private callback table;
    *   absent for a run without a listener, which keeps every existing path
+   * @param {boolean} [options.fetchSessions=false] whether this run uses incremental Fetch
+   *   sessions (KIP-227). `false` constructs no session state and sends full requests.
+   * @param {number} [options.requestTimeout=30000] the client's request timeout; it caps a session
+   *   close that has no disconnect deadline
    */
   constructor({
     retry,
@@ -231,6 +242,8 @@ module.exports = class ConsumerGroup {
     manual = null,
     privateOffsets = undefined,
     rebalanceListener = null,
+    fetchSessions = false,
+    requestTimeout = 30000,
   }) {
     /** @type {import("../../types").Cluster} */
     this.cluster = cluster
@@ -339,6 +352,21 @@ module.exports = class ConsumerGroup {
           })
 
     this.seekOffset = new SeekOffsets()
+
+    /**
+     * The run's Fetch sessions, one per broker node; null when the option is off, which keeps
+     * every Fetch a full, sessionless request. A new group builds a new registry, so a restart
+     * never reuses a session.
+     * @type {FetchSessions|null}
+     */
+    this.fetchSessions = fetchSessions
+      ? new FetchSessions({
+          sendClose: (nodeId, fields, operation) =>
+            this.sendSessionClose(nodeId, fields, operation),
+          requestTimeout,
+          logger: this.logger,
+        })
+      : null
 
     this.partitionsPerSubscribedTopic = null
     this.leaderUnionWatch = new LeaderUnionWatch({
@@ -743,8 +771,63 @@ module.exports = class ConsumerGroup {
     return this.groupMembership.clearAssignerState()
   }
 
+  /**
+   * The broker nodes a fetcher runs for. With Fetch sessions it also retires the session of any
+   * node that left the set; an empty set is a refresh in progress and retires nothing.
+   * @returns {number[]} the current node IDs
+   */
   getNodeIds() {
-    return this.cluster.getNodeIds()
+    const nodeIds = this.cluster.getNodeIds()
+    if (this.fetchSessions && nodeIds.length) this.fetchSessions.retain(nodeIds)
+    return nodeIds
+  }
+
+  /**
+   * Closes this run's positive-ID Fetch sessions, best effort and in parallel, within the close
+   * that owns the call. Called after the fetchers stopped.
+   * @param {{deadlineAt?: number, guard?: () => Error|null}} [scope] the close's original deadline
+   *   and identity refusal; without a finite deadline the close is capped at two seconds
+   * @returns {Promise<void>} resolves when every close settled or the budget ended; never rejects
+   */
+  async closeFetchSessions(scope) {
+    if (this.fetchSessions) await this.fetchSessions.closeAll(scope)
+  }
+
+  /**
+   * Retires every Fetch session locally for a forced close, sending nothing: a fetcher may still
+   * hold a request, and no new network work races it.
+   * @returns {void}
+   */
+  retireFetchSessions() {
+    this.fetchSessions?.retireAll()
+  }
+
+  /**
+   * Sends one session-closing Fetch to a node under the close's operation: the lookup, the
+   * connection and the pre-write check all end at that operation's deadline.
+   * @private
+   * @param {number} nodeId the node that holds the session
+   * @param {{sessionId: number, sessionEpoch: number, topics: [], forgottenTopics: []}} fields
+   *   the close request: a positive session ID and the final epoch, with no partitions
+   * @param {import('./groupProtocol/interface').ConsumerOperation} operation the close scope
+   * @returns {Promise<void>}
+   * @throws {Error} the operation's refusal or the transport failure; the caller logs it
+   */
+  async sendSessionClose(nodeId, fields, operation) {
+    const broker = await this.cluster.findBroker({ nodeId, fence: operation })
+    operation.check()
+    await broker.fetch({
+      ...fields,
+      guard: operation.guard,
+      maxWaitTime: 0,
+      minBytes: 0,
+      maxBytes: this.maxBytes,
+      isolationLevel: this.isolationLevel,
+      topicIds: new Map(),
+      rackId: this.rackId,
+      checkCrcs: this.checkCrcs,
+      maxDecompressedBatchBytes: this.maxDecompressedBatchBytes,
+    })
   }
 
   /**
@@ -1987,6 +2070,13 @@ module.exports = class ConsumerGroup {
    * Errors are not propagated: anything thrown is handed to `recoverFromFetch`, which either
    * recovers or rethrows, and the round then yields no batches.
    *
+   * With Fetch sessions on (KIP-227) a broker version of 7 or above sends only what changed since
+   * the node's last accepted request, and the reply may omit partitions with nothing new. The
+   * session validates the reply as a whole before anything is published, a session error code
+   * only resets it, and every response row is read against this round's full desired map, never
+   * the wire diff. A node whose last partition just left sends one removal request, then idles.
+   * Without them the request is the plain full one, built exactly as before.
+   *
    * Positions are prepared by `prepareFetch`, at most twice per call, and only that prepared
    * snapshot is built. A stop or restart of the run, or a preparation replaced under it, returns
    * an empty round without error; an idle round sleeps only while its snapshot is current.
@@ -2014,19 +2104,15 @@ module.exports = class ConsumerGroup {
       const { assignmentEpoch, acquireClock } = prepared
       requestClock = this.acquireClock
       const requests = this.buildFetchRequests(prepared.parts)
+      const registry = this.fetchSessions
+      // With sessions, a node whose last partitions just left still owes the broker one removal.
+      const forgetting = requests.length === 0 ? registry?.active(nodeId) : undefined
 
-      if (!requests.length) {
-        if (prepared.leaderless) await this.refreshLeaderlessMetadata(run)
-        // Registers only while the snapshot is current: an invalidated one returns through the
-        // fetcher's yield floor and a fresh snapshot is captured next round.
-        await run.wait(
-          prepared.idleDuration(this.maxWaitTime),
-          () => !run.fence.closed && prepared.isCurrent()
-        )
-        return []
-      }
+      if (!requests.length && !forgetting) return await this.idleFetchRound(prepared, run)
 
-      const { topicIds, maxVersion } = this.resolveTopicIds(requests)
+      const { topicIds, maxVersion } = forgetting
+        ? this.forgettingAddressing(forgetting)
+        : this.resolveTopicIds(requests)
 
       if (this.logger.debugEnabled()) {
         this.logger.debug('Fetching', {
@@ -2047,27 +2133,72 @@ module.exports = class ConsumerGroup {
       const broker = await run.fence.wait(this.cluster.findBroker({ nodeId, fence: run.fence }))
       prepared.check()
 
-      const {
-        errorCode: topLevelErrorCode,
-        responses,
-        nodeEndpoints,
-      } = await broker.fetch({
-        guard: prepared.guard,
-        maxWaitTime: this.maxWaitTime,
-        minBytes: this.minBytes,
-        maxBytes: this.maxBytes,
-        isolationLevel: this.isolationLevel,
-        topics: requests,
-        topicIds,
-        maxVersion,
-        rackId: this.rackId,
-        checkCrcs: this.checkCrcs,
-        maxDecompressedBatchBytes: this.maxDecompressedBatchBytes,
-      })
+      let tracked = null
+      if (registry) {
+        const version = this.negotiatedFetchVersion(broker, maxVersion)
+        if (version == null || version < FETCH_SESSION_MIN_VERSION) {
+          registry.release(nodeId)
+          if (!requests.length) return await this.idleFetchRound(prepared, run)
+        } else {
+          tracked = this.trackFetch(
+            registry,
+            nodeId,
+            requests,
+            topicIds,
+            version >= FETCH_TOPIC_IDS_MIN_VERSION
+          )
+        }
+      }
+
+      let response
+      try {
+        response = await broker.fetch({
+          guard: prepared.guard,
+          maxWaitTime: this.maxWaitTime,
+          minBytes: this.minBytes,
+          maxBytes: this.maxBytes,
+          isolationLevel: this.isolationLevel,
+          topics: tracked ? tracked.wire.topics : requests,
+          topicIds: tracked ? tracked.wire.topicIds : topicIds,
+          maxVersion,
+          rackId: this.rackId,
+          checkCrcs: this.checkCrcs,
+          maxDecompressedBatchBytes: this.maxDecompressedBatchBytes,
+          sessionId: tracked?.wire.sessionId,
+          sessionEpoch: tracked?.wire.sessionEpoch,
+          forgottenTopics: tracked?.wire.forgottenTopics,
+        })
+      } catch (error) {
+        // A retired run's failure may only reset the session whose epoch it left unknown: replica
+        // hints and routing belong to the run that replaced it.
+        if (tracked && run.fence.closed) {
+          tracked.session.handleError(tracked.token)
+          return []
+        }
+        // A stale session's failure belongs to a node or run that moved on: it recovers nothing.
+        if (tracked && !this.failTrackedFetch(tracked, requests)) return []
+        throw error
+      }
 
       // A response that outlived its run is dropped whole: it must not apply hints, preferred
-      // replicas or offsets to a replacement run, and the wire request is not cancelled.
-      if (run.fence.closed) return []
+      // replicas or offsets to a replacement run, and the wire request is not cancelled. The
+      // broker may have advanced its epoch for it, so a session still waiting on it starts over.
+      if (run.fence.closed) {
+        tracked?.session.handleError(tracked.token)
+        return []
+      }
+
+      if (tracked) {
+        // Before anything is published: a stale answer changes nothing, and a refused one resets
+        // the session and is handled below its own contract.
+        if (!tracked.session.current(tracked.token)) return []
+        if (!tracked.session.handleResponse(tracked.token, response)) {
+          await this.refuseTrackedResponse(response, run.fence)
+          return []
+        }
+      }
+
+      const { errorCode: topLevelErrorCode, responses, nodeEndpoints } = response
 
       // The top-level code is only decoded from Fetch v7 up, so an older response carries none -
       // and `failure(undefined)` is true, which is why the guard is on the field's presence.
@@ -2157,6 +2288,135 @@ module.exports = class ConsumerGroup {
       }
       return []
     }
+  }
+
+  /**
+   * Waits out a round with nothing to ask this node: it sleeps while its snapshot stays current,
+   * after asking for the routing of partitions that have no leader.
+   * @private
+   * @param {FetchPreparation} prepared the round's snapshot
+   * @param {IdleWait} run the run that owns the round
+   * @returns {Promise<Batch[]>} always empty
+   */
+  async idleFetchRound(prepared, run) {
+    if (prepared.leaderless) await this.refreshLeaderlessMetadata(run)
+    // Registers only while the snapshot is current: an invalidated one returns through the
+    // fetcher's yield floor and a fresh snapshot is captured next round.
+    await run.wait(
+      prepared.idleDuration(this.maxWaitTime),
+      () => !run.fence.closed && prepared.isCurrent()
+    )
+    return []
+  }
+
+  /**
+   * How a removal-only request is addressed: in the mode its session last used, never decided by
+   * the metadata cache, which no longer lists the partitions being removed.
+   * @private
+   * @param {import('./fetchSession').FetchSession} session the node's session
+   * @returns {{topicIds: Map<string, string>|undefined, maxVersion: number|undefined}}
+   */
+  forgettingAddressing(session) {
+    return session.usesTopicIds
+      ? { topicIds: new Map(), maxVersion: undefined }
+      : { topicIds: undefined, maxVersion: FETCH_TOPIC_NAMES_MAX_VERSION }
+  }
+
+  /**
+   * The Fetch version this broker would select for a request with the same ceiling `Broker#fetch`
+   * derives, without building a request.
+   * @private
+   * @param {import('../broker')} broker the connected node
+   * @param {number|undefined} maxVersion the round's topic-name ceiling, if any
+   * @returns {number|null} the version, or null when the broker is not usable for Fetch
+   */
+  negotiatedFetchVersion(broker, maxVersion) {
+    return broker.negotiatedVersion(
+      apiKeys.Fetch,
+      requests.Fetch,
+      maxVersion === undefined ? {} : { [apiKeys.Fetch]: maxVersion }
+    )
+  }
+
+  /**
+   * Builds this round's session request. The session records the full desired map, so the wire
+   * carries only what changed; the caller keeps the full map for the response.
+   * @private
+   * @param {FetchSessions} registry the run's sessions
+   * @param {number} nodeId the node being fetched
+   * @param {object[]} requests the full desired entries
+   * @param {Map<string, string>|undefined} topicIds the full topic name to ID mapping
+   * @param {boolean} usesTopicIds whether the negotiated version is keyed by ID
+   * @returns {{session: import('./fetchSession').FetchSession, token: object, wire: object,
+   *   previous: Map<string, object>}} the request identity, wire fields and the cells held before
+   * @throws {Error} a retired registry, or a missing topic ID in ID mode
+   */
+  trackFetch(registry, nodeId, requests, topicIds, usesTopicIds) {
+    const session = registry.forNode(nodeId)
+    const previous = session.partitions
+    return { session, previous, ...session.build(requests, { topicIds, usesTopicIds }) }
+  }
+
+  /**
+   * Handles a send that threw for a tracked request: a current session is reset to a full request
+   * at the unchanged offsets, and the preferred replicas of its partitions are dropped, as the
+   * Java client does after a failed send.
+   * @private
+   * @param {{session: object, token: object, previous: Map<string, object>}} tracked the request
+   * @param {object[]} requests the round's full desired entries
+   * @returns {boolean} whether the session was current; a stale failure changes nothing
+   */
+  failTrackedFetch({ session, token, previous }, requests) {
+    if (!session.current(token)) return false
+    let cleared = false
+    const clear = (topic, partition) => {
+      const replicas = this.preferredReadReplicasPerTopicPartition[topic]
+      if (replicas && replicas[partition] != null) {
+        delete replicas[partition]
+        cleared = true
+      }
+    }
+    for (const cell of previous.values()) clear(cell.topic, cell.partition)
+    for (const { topic, partitions } of requests) {
+      for (const { partition } of partitions) clear(topic, partition)
+    }
+    if (cleared) this.routingChanged()
+    session.handleError(token)
+    return true
+  }
+
+  /**
+   * Applies the contract of a response the session refused. A top-level session code resets the
+   * session and refreshes metadata only for a topic ID error; any other top-level code keeps its
+   * ordinary classification. A response whose partitions did not match the session is dropped
+   * whole, and an unknown topic ID still asks for a refresh.
+   * @private
+   * @param {object} response the decoded response
+   * @param {import('../producer/generation')} fence the run that received it
+   * @returns {Promise<void>}
+   * @throws {Error} the error an unclassified top-level code maps to, or the fence's close error
+   */
+  async refuseTrackedResponse(response, fence) {
+    if (response.errorCode) {
+      await this.handleFetchTopLevelError(response.errorCode, fence, { session: true })
+      return
+    }
+
+    const unknownTopic = response.responses.find(({ topicName }) => topicName == null)
+    if (unknownTopic) {
+      this.logger.warn('Fetch response carried an unknown topic id, refreshing metadata', {
+        groupId: this.groupId,
+        memberId: this.memberId,
+        topicId: unknownTopic.topicId,
+      })
+      await this.refreshCluster({ fence })
+      return
+    }
+
+    this.logger.debug('Fetch session response did not match its request, starting a new session', {
+      groupId: this.groupId,
+      memberId: this.memberId,
+    })
   }
 
   /**
@@ -2325,14 +2585,26 @@ module.exports = class ConsumerGroup {
    * @param {number} errorCode the response's top-level code, already known to be a failure
    * @param {import('../producer/generation')} [fence] the run that received the response: its
    *   close ends the refresh, and a late answer installs nothing
+   * @param {{session?: boolean}} [options] the request was tracked by a Fetch session, whose
+   *   session-ID and epoch errors then only reset it and refresh nothing
    * @returns {Promise<void>} resolves once the round can be abandoned with no batches
    * @throws {Error} the error the code maps to, for a code with no classification: that keeps the
    *   recovery path a request-level fetch error has always taken - refresh and rejoin for stale
    *   metadata, crash for anything else; or the fence's close error.
    */
-  async handleFetchTopLevelError(errorCode, fence) {
-    if (topLevelFetchAction(errorCode) === 'throw') {
+  async handleFetchTopLevelError(errorCode, fence, { session = false } = {}) {
+    const action = topLevelFetchAction(errorCode, { session })
+    if (action === 'throw') {
       throw createErrorFromCode(errorCode)
+    }
+
+    if (action === 'session-reset') {
+      this.logger.debug('The broker reset the Fetch session', {
+        groupId: this.groupId,
+        memberId: this.memberId,
+        errorCode,
+      })
+      return
     }
 
     this.logger.warn('Fetch response carried a top-level error, refreshing metadata', {

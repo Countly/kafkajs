@@ -87,6 +87,7 @@ describe('the heartbeat guard is forwarded from the runner', () => {
       heartbeat,
       heartbeatInterval: () => 3000,
       onStopRequested: jest.fn(),
+      retireFetchSessions: jest.fn(),
       rebalanceProtocol: () => 'eager',
     }
     const runner = new Runner({

@@ -219,6 +219,9 @@ describe('Runner > crash handling from the fetch-loop path', () => {
     // `stop()` tells the membership before it cancels the heartbeat chain; the real ConsumerGroup
     // always answers this.
     onStopRequested: jest.fn(),
+    // The Fetch-session seams of stop and forced retirement; the real group always has both.
+    closeFetchSessions: jest.fn(async () => {}),
+    retireFetchSessions: jest.fn(),
     leave: jest.fn(async () => {}),
     getNodeIds: () => [],
     ...overrides,

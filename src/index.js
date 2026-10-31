@@ -539,7 +539,10 @@ module.exports = class Client {
    * `maxDecompressedBatchBytes` (default 1 GiB, an integer from 1 to 2147483647) is the most a
    * record batch may decompress to, for every codec; it also sets a ceiling of
    * `max(1, floor(bytes / 512))` records per batch. A batch past either halts its partition.
-   * @throws {KafkaJSNonRetriableError} for a non-boolean `rackAwareAssignment`
+   *
+   * `fetchSessions` (default `false`) opts in to incremental Fetch sessions (KIP-227); `false`
+   * keeps every Fetch a full request.
+   * @throws {KafkaJSNonRetriableError} for a non-boolean `rackAwareAssignment` or `fetchSessions`
    * @throws {KafkaJSInvalidConfigurationError} for an invalid `maxDecompressedBatchBytes`
    * @public
    */
@@ -567,7 +570,11 @@ module.exports = class Client {
     groupProtocol,
     groupRemoteAssignor,
     maxPrefetchBatches,
+    fetchSessions = false,
   } = {}) {
+    if (typeof fetchSessions !== 'boolean') {
+      throw new KafkaJSNonRetriableError('fetchSessions must be a boolean')
+    }
     if (typeof rackAwareAssignment !== 'boolean') {
       throw new KafkaJSNonRetriableError('rackAwareAssignment must be a boolean')
     }
@@ -620,6 +627,8 @@ module.exports = class Client {
       groupProtocol,
       groupRemoteAssignor,
       maxPrefetchBatches,
+      fetchSessions,
+      requestTimeout: this[PRIVATE.REQUEST_TIMEOUT],
     })
   }
 

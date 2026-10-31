@@ -371,6 +371,8 @@ batch after decompression, for every codec; see
 
 Consumer Fetch byte settings are response targets, not a guarantee that every returned batch fits them. Kafka may return a first batch larger than `maxBytes` and `maxBytesPerPartition` so the consumer can make progress. Decoder safety limits remain independently enforced. A broker's ongoing long poll can delay a moved partition by up to `maxWaitTimeInMs` plus one round trip; changing a numeric Fetch concurrency cap is not required.
 
+Incremental Fetch sessions are opt-in with `fetchSessions: true` on the consumer (default `false`); see [Fetch sessions](Consuming.md#fetch-sessions). They reduce repeated partition headers, while `maxResponseSize`, `maxBytes`, CRC checking and decompressed batch byte/record bounds still apply to every response.
+
 ## Metadata recovery
 
 `metadataRecoveryStrategy` and `metadataRecoveryRebootstrapTriggerMs`, available on the `Kafka`

@@ -845,6 +845,12 @@ module.exports = class Broker {
    *   this request. A request that supplies none is capped at the last version keyed by name, so a
    *   caller that knows nothing about topic ids keeps working unchanged.
    * @param {number} [request.maxVersion] an additional ceiling; the lower of the two wins.
+   * @param {number} [request.sessionId=0] the Fetch session this request belongs to (KIP-227)
+   * @param {number} [request.sessionEpoch=-1] -1 is sessionless or a session close, 0 a full
+   *   request, a positive value an incremental one. An incremental request is sent exactly as
+   *   given: its topics are a diff, so they are neither shuffled nor consolidated.
+   * @param {{topic: string, topicId?: string, partitions: number[]}[]} [request.forgottenTopics=[]]
+   *   partitions removed from the session; a `topicId` is the one recorded when they were added
    * @param {(frameLength?: number) => Error|null} [request.guard] private pre-write check of the
    *   consumer's fetch round; an error it returns rejects this one request before it is written
    * @returns {Promise<object>} `{ responses: [{ topicName, partitions }] }` at every version. An
@@ -864,6 +870,9 @@ module.exports = class Broker {
     rackId = '',
     checkCrcs = true,
     maxDecompressedBatchBytes,
+    sessionId = 0,
+    sessionEpoch = -1,
+    forgottenTopics = [],
     guard,
   }) {
     this.throwIfRefused(guard)
@@ -877,34 +886,40 @@ module.exports = class Broker {
 
     const fetch = this.lookupRequestWithMax(apiKeys.Fetch, requests.Fetch, cap)
 
-    // Shuffle topic-partitions to ensure fair response allocation across partitions (KIP-74)
-    const flattenedTopicPartitions = topics.reduce((topicPartitions, { topic, partitions }) => {
-      partitions.forEach((partition) => {
-        topicPartitions.push({ topic, partition })
-      })
-      return topicPartitions
-    }, [])
-
-    const shuffledTopicPartitions = shuffle(flattenedTopicPartitions)
-
-    // Consecutive partitions for the same topic can be combined into a single `topic` entry
-    const consolidatedTopicPartitions = shuffledTopicPartitions.reduce(
-      (topicPartitions, { topic, partition }) => {
-        const last = topicPartitions[topicPartitions.length - 1]
-
-        if (last != null && last.topic === topic) {
-          topicPartitions[topicPartitions.length - 1].partitions.push(partition)
-        } else {
-          topicPartitions.push({ topic, partitions: [partition] })
-        }
-
+    let consolidatedTopicPartitions = topics
+    if (sessionEpoch <= 0) {
+      // Shuffle topic-partitions to ensure fair response allocation across partitions (KIP-74)
+      const flattenedTopicPartitions = topics.reduce((topicPartitions, { topic, partitions }) => {
+        partitions.forEach((partition) => {
+          topicPartitions.push({ topic, partition })
+        })
         return topicPartitions
-      },
-      []
-    )
+      }, [])
+
+      const shuffledTopicPartitions = shuffle(flattenedTopicPartitions)
+
+      // Consecutive partitions for the same topic can be combined into a single `topic` entry
+      consolidatedTopicPartitions = shuffledTopicPartitions.reduce(
+        (topicPartitions, { topic, partition }) => {
+          const last = topicPartitions[topicPartitions.length - 1]
+
+          if (last != null && last.topic === topic) {
+            topicPartitions[topicPartitions.length - 1].partitions.push(partition)
+          } else {
+            topicPartitions.push({ topic, partitions: [partition] })
+          }
+
+          return topicPartitions
+        },
+        []
+      )
+    }
 
     const built = fetch({
       replicaId,
+      sessionId,
+      sessionEpoch,
+      forgottenTopics,
       isolationLevel,
       maxWaitTime,
       minBytes,

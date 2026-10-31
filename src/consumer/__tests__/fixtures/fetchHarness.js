@@ -538,9 +538,14 @@ const buildConsumerGroup = ({
   retry,
   position,
   groupProtocol,
+  fetchSessions,
+  requestTimeout,
+  rackId,
 }) => {
   const group = new ConsumerGroup({
     groupProtocol,
+    fetchSessions,
+    requestTimeout,
     retry,
     cluster,
     groupId: 'test-group',
@@ -559,7 +564,7 @@ const buildConsumerGroup = ({
     autoCommitInterval: null,
     autoCommitThreshold: null,
     isolationLevel: 0,
-    rackId: '',
+    rackId,
     checkCrcs,
     maxDecompressedBatchBytes,
     metadataMaxAge: 300000,
@@ -634,6 +639,9 @@ const buildConsumerGroup = ({
  * @param {Record<number, number>} [options.partitionLeaders] the leader of each partition; every
  *   partition is led by `NODE_ID` unless this says otherwise
  * @param {'classic'|'consumer'} [options.groupProtocol] the group's membership protocol
+ * @param {boolean} [options.fetchSessions] whether the group uses incremental Fetch sessions
+ * @param {number} [options.requestTimeout] the client request timeout a session close is capped by
+ * @param {string} [options.rackId] the group's rack
  * @returns {Promise<{ group: ConsumerGroup, cluster: object, broker: Broker, logger: object,
  *   metadataCache: MetadataCache, leaders: Map<number, number>,
  *   installRouting: (leaders: Record<number, number>) => void,
@@ -645,7 +653,8 @@ const buildConsumerGroup = ({
  *   requests: () => object[], validationRequests: () => object[],
  *   fetchRequestPartitions: () => number[], fetchRequestOffsets: () => string[],
  *   lastFetchRequest: () => object[],
- *   lastFetchApiVersion: () => number, lastFetchHeaderFields: () => object }>}
+ *   lastFetchApiVersion: () => number, lastFetchHeaderFields: () => object,
+ *   fetchFrames: () => object[], writes: () => Buffer[] }>}
  */
 const createFetchGroup = async ({
   partitions = [0],
@@ -668,6 +677,9 @@ const createFetchGroup = async ({
   preferredReadReplica,
   partitionLeaders,
   groupProtocol = 'classic',
+  fetchSessions = false,
+  requestTimeout,
+  rackId = '',
 } = {}) => {
   let nextResponse = fetchResponse(
     partitions.map((partition) => ({ partition, errorCode: 0 })),
@@ -792,6 +804,8 @@ const createFetchGroup = async ({
       return applyLeaderHintResolves
     }),
     hasNode: jest.fn((nodeId) => knownNodes.includes(Number(nodeId))),
+    getNodeIds: () => knownNodes,
+    removeBroker: jest.fn(),
   }
 
   const group = buildConsumerGroup({
@@ -804,6 +818,9 @@ const createFetchGroup = async ({
     retry,
     position,
     groupProtocol,
+    fetchSessions,
+    requestTimeout,
+    rackId,
   })
 
   for (const partition of partitions) {
@@ -859,6 +876,13 @@ const createFetchGroup = async ({
     requests: () => state.writes.map(readRequestHeader),
     /** Every OffsetForLeaderEpoch frame written to the socket, decoded, oldest first. */
     validationRequests: () => decodeOffsetForLeaderEpochRequests(state.writes),
+    /** Every frame written to the socket, oldest first. */
+    writes: () => state.writes,
+    /** Every Fetch frame written to the socket, decoded, oldest first. */
+    fetchFrames: () =>
+      state.writes
+        .filter((write) => readRequestHeader(write).apiKey === apiKeys.Fetch)
+        .map((write) => decodeFetchRequest([write])),
     /** The partitions of the last Fetch frame on the wire. */
     fetchRequestPartitions: () =>
       decodeFetchRequest(state.writes).topics[0].partitions.map(({ partition }) => partition),

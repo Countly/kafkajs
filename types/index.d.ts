@@ -300,6 +300,11 @@ export interface ConsumerConfig {
   maxBytes?: number
   maxWaitTimeInMs?: number
   /**
+   * Enable incremental Fetch sessions (KIP-227). Defaults to false.
+   * Set false to preserve full sessionless Fetch requests.
+   */
+  fetchSessions?: boolean
+  /**
    * Verify the CRC32C checksum of every record batch received (Java's `check.crcs`). Default
    * `true`. A mismatch halts the partition like any corrupt batch (`consumer.partition_halted`,
    * reason `checksum`): the records before the batch are delivered, the other partitions keep

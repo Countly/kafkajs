@@ -76,9 +76,14 @@ const partitionFetchAction = (errorCode) => PARTITION_ACTIONS.get(errorCode) || 
  * Classifies a failing top-level fetch error code. Only meaningful for a non-zero code: a
  * response whose top-level code is 0 is walked partition by partition instead.
  * @param {number} errorCode
- * @returns {'stale-metadata'|'throw'}
+ * @param {{session?: boolean}} [options] a request tracked by a FetchSession: its 70 and 71 only
+ *   reset the session and refresh nothing
+ * @returns {'stale-metadata'|'session-reset'|'throw'}
  */
-const topLevelFetchAction = (errorCode) => TOP_LEVEL_ACTIONS.get(errorCode) || 'throw'
+const topLevelFetchAction = (errorCode, { session = false } = {}) => {
+  if (session && (errorCode === 70 || errorCode === 71)) return 'session-reset'
+  return TOP_LEVEL_ACTIONS.get(errorCode) || 'throw'
+}
 
 /**
  * @param {number} errorCode

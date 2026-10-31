@@ -58,6 +58,8 @@ Versions before 3.0.0 are internal alpha tags and are not published.
 
 - Preferred-replica routing now tests the preferred replica ID against offlineReplicas and falls back to the leader when that replica is offline.
 
+- Fetch sessions (KIP-227) are opt-in; set `fetchSessions: true` to enable them.
+
 #### Fixes
 
 - Fence unknown-target metadata responses before cache installation and keep periodic naming attempts after the fast discovery budget.
@@ -79,6 +81,8 @@ Versions before 3.0.0 are internal alpha tags and are not published.
 - Disposing a consumer that borrows its creator's cluster (the temporary consumers of `admin.setOffsets` and `admin.resetOffsets`) now asks a start that is still connecting to stop first, so it never joins the group, instead of waiting for it to join and then leaving.
 - A batch fetched before its topic was deleted and recreated no longer resolves offsets into the new topic. Its remaining records are not delivered, its offsets are dropped, and neither an automatic, a final nor an explicit `commitOffsets` from its handler can commit them. Before, a handler finishing old records after the recreation resolved their offset into the new incarnation's cell, and the close's final commit then wrote that offset (for example 8 against a new log of 0..2) and settled the reset the new incarnation still owed. A handler already running may finish.
 
+- Keep incremental Fetch state bound to its run and broker, preserve recorded topic IDs when forgetting partitions, decode sparse replies against the complete request map, and bound best-effort session closes within the captured close budget.
+
 #### Additions
 
 - Pin the kept consumer defaults: classic groups with round-robin assignment, a 5 000 ms Fetch wait, a 10 MiB response target and committed transactional reads; document their limits and existing configuration escapes.
@@ -96,6 +100,8 @@ Versions before 3.0.0 are internal alpha tags and are not published.
 - Add an optional consumer disconnect timeout that bounds cleanup for the captured run. Concurrent disconnect calls retain the first timeout and leave choice; zero starts no final commit or leave, and omission keeps natural waiting. Existing signal-handler calls remain compatible.
 
 - When retry.maxTotalTime is configured, consumer commitOffsets, committed, position and describeGroup bound the whole call from public entry, including a held first request. Expiry raises KafkaJSDeliveryTimeout and refuses late local effects and unsent requests; a transmitted commit can still apply at the broker.
+
+- Add the boolean `fetchSessions` consumer option and the `test:e2e:fetch-sessions` and `test:e2e:fetch-sessions-capacity` correctness scenarios.
 
 #### Tooling
 
@@ -120,6 +126,8 @@ Versions before 3.0.0 are internal alpha tags and are not published.
 - Add independent classic coordinator fault, group-size, Fetch chunking and Java assignment-vector scenarios, with dedicated group-fault and Fetch-semantics test commands.
 
 - Add routing, partial trailing-batch and per-broker Fetch concurrency regressions, with a dedicated Fetch-routing test command.
+
+- Validate Fetch-session measurements against independent frames and real batch/message counts.
 
 ### Phase 9B — Producer parity: delivery deadline, memory bound, request size, partitioner, codecs, lifecycle
 

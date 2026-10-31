@@ -198,6 +198,10 @@ const parseDisconnectOptions = (options) => {
  * @param {number} [params.isolationLevel]
  * @param {boolean} [params.rackAwareAssignment=false] opt-in range rack matching; other assigners ignore it
  * @param {string} [params.rackId]
+ * @param {boolean} [params.fetchSessions=false] Enable incremental Fetch sessions (KIP-227). The
+ *   default is false, which preserves full requests.
+ * @param {number} [params.requestTimeout=30000] The client's request timeout, which caps a session
+ *   close that has no disconnect deadline.
  * @param {boolean} [params.checkCrcs=true] Verify the CRC32C checksum of every record batch
  *                                received (Java's `check.crcs`). A mismatch halts the partition
  *                                like any corrupt batch (`consumer.partition_halted`, reason
@@ -230,6 +234,9 @@ const parseDisconnectOptions = (options) => {
  * @returns {import("../../types").Consumer}
  */
 module.exports = (params) => {
+  if (params.fetchSessions !== undefined && typeof params.fetchSessions !== 'boolean') {
+    throw new KafkaJSNonRetriableError('fetchSessions must be a boolean')
+  }
   validateGroupProtocolOptions(params)
 
   const {
@@ -257,6 +264,8 @@ module.exports = (params) => {
     groupProtocol = 'classic',
     groupRemoteAssignor = null,
     maxPrefetchBatches = 0,
+    fetchSessions = false,
+    requestTimeout = 30000,
   } = params
 
   if (groupId !== undefined && (typeof groupId !== 'string' || groupId.length === 0)) {
@@ -1054,6 +1063,8 @@ module.exports = (params) => {
         rackId,
         checkCrcs,
         maxDecompressedBatchBytes,
+        fetchSessions,
+        requestTimeout,
         groupInstanceId,
         rebalanceProtocol,
         groupProtocol,

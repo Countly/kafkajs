@@ -714,6 +714,13 @@ module.exports = class Runner extends EventEmitter {
       // awaiting anything, so a fetcher left spinning would resolve in microtasks only and starve
       // the event loop the background round needs to make progress on the wire.
       await scope.wait(() => this.fetchManager.stop())
+      // Fetch sessions close only once no fetcher can still send, and within this close's budget.
+      await scope.wait(() =>
+        this.consumerGroup.closeFetchSessions({
+          deadlineAt: scope.deadlineAt,
+          guard: scope.guard,
+        })
+      )
       // A background cooperative round must finish before LeaveGroup, or its JoinGroup would
       // re-register a member this runner has just left. Bounded by the current round, which is
       // the property waitForConsumer() already has. Nothing in that round re-arms the fetch
@@ -795,6 +802,7 @@ module.exports = class Runner extends EventEmitter {
     if (this.retirement) return
     this.retirement = error
     this.latchStop()
+    this.consumerGroup.retireFetchSessions()
     for (const check of this.hookWaiters || []) check()
   }
 

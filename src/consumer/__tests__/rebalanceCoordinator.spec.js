@@ -81,6 +81,9 @@ const build = ({
     // real HeartbeatManager rely on.
     heartbeatInterval: () => heartbeatInterval,
     onStopRequested: jest.fn(),
+    // The Fetch-session seams of stop and forced retirement; the real group always has both.
+    closeFetchSessions: jest.fn(async () => {}),
+    retireFetchSessions: jest.fn(),
     startIdleWait: jest.fn(() => ({})),
     beginRebalanceRound: jest.fn(() => ({
       guard: () => null,

@@ -57,6 +57,7 @@ const { createRequire } = require('module')
 const { Kafka, logLevel } = require('../../index')
 const { Clients } = require('../clients')
 const subscribeChannels = require('./subscribeChannels')
+const { DeliveryAccounting } = require('./fetchFrameCounter')
 
 const arg = (name, fallback) => {
   const i = process.argv.indexOf(`--${name}`)
@@ -137,42 +138,6 @@ const percentiles = (values) => {
  */
 const deliveryGaps = (entries) =>
   entries.slice(1).map((entered, index) => Number(entered - entries[index]) / 1e6)
-
-/**
- * Counts records and actual callback timestamps for one handler arm. One instance belongs to one
- * run; it adds no clocks or per-record objects to the inherited handler loop.
- */
-class DeliveryAccounting {
-  /** @param {'eachBatch'|'eachMessage'} handler selected public callback */
-  constructor(handler) {
-    this.handler = handler
-    this.messages = 0
-    this.batches = 0
-    this.entries = []
-  }
-
-  /** @param {number} records actual batch length, or one message @param {bigint} at entry timestamp @returns {void} */
-  enter(records, at) {
-    this.entries.push(at)
-    this.messages += records
-    if (this.handler === 'eachBatch') this.batches += 1
-  }
-
-  /** @returns {object} independent message, batch, entry and actual-gap measurements */
-  result() {
-    const gaps = deliveryGaps(this.entries)
-    const latency = gaps.length ? percentiles(gaps) : { p50: null, p90: null, p99: null }
-    return {
-      deliveredMessages: this.messages,
-      deliveredBatches: this.batches,
-      handlerEntries: this.entries.length,
-      gapSamples: gaps.length,
-      deliveryGapP50: latency.p50,
-      deliveryGapP90: latency.p90,
-      deliveryGapP99: latency.p99,
-    }
-  }
-}
 
 /** Counts the two required listener stages independently from record and callback totals. */
 class ListenerAccounting {

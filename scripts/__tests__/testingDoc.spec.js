@@ -469,6 +469,22 @@ describe('documented live scenario scripts', () => {
       budgetsMs: [120000],
       wording: ['sibling has no leader', 'idle and busy bounds', 'eligible follower'],
     },
+    {
+      script: 'test:e2e:fetch-sessions',
+      flag: 'FETCH_SESSIONS_E2E',
+      spec: 'src/consumer/__tests__/fetchSessionsLive.spec.js',
+      compose: 'docker-compose.racks.yml',
+      budgetsMs: [120000],
+      wording: ['2001-partition limit probe', 'sparse eligible-follower', 'racks compose'],
+    },
+    {
+      script: 'test:e2e:fetch-sessions-capacity',
+      flag: 'FETCH_SESSIONS_CAPACITY_E2E',
+      spec: 'src/consumer/__tests__/fetchSessionsCapacityLive.spec.js',
+      compose: 'docker-compose.fetch-sessions.yml',
+      budgetsMs: [180000],
+      wording: ['eight-slot compose variant', 'same-group oracle control'],
+    },
   ]
 
   it.each(scenarios)('$script is one two-worker spec run through test:kafka', (row) => {

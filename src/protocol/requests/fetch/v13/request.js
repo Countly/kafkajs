@@ -73,9 +73,16 @@ const requireTopicId = (topicIds, topic) => {
   return topicId
 }
 
-const encodeForgottenTopics = ({ topic, partitions }, topicIds) =>
+/**
+ * Encodes a removal using the session's recorded ID, even after cache retirement.
+ * @param {object} entry topic, optional recorded topicId and partition numbers
+ * @param {Map<string,string>} topicIds current request mapping for legacy callers
+ * @returns {Encoder} forgotten topic fields
+ * @throws {KafkaJSInvariantViolation} no recorded or current ID
+ */
+const encodeForgottenTopics = ({ topic, topicId, partitions }, topicIds) =>
   new Encoder()
-    .writeUuid(requireTopicId(topicIds, topic))
+    .writeUuid(topicId ?? requireTopicId(topicIds, topic))
     .writeUVarIntArray(partitions, 'int32')
     .writeTaggedFields()
 
