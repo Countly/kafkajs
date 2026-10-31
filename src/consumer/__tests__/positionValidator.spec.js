@@ -113,16 +113,16 @@ describe('Consumer > PositionValidator', () => {
     })
 
     it.each([
-      ['-1', 4],
-      ['100', -1],
+      ['string offset -1', '-1', 4],
+      ['number epoch -1', '100', -1],
       // The decoded int64 may reach us as a string, a number or a Long: none of them may turn the
       // reset into a truncation to offset -1.
-      [-1, 4],
-      [Long.fromValue(-1), 4],
-      ['100', '-1'],
+      ['number offset -1', -1, 4],
+      ['Long offset -1', Long.fromValue(-1), 4],
+      ['string epoch -1', '100', '-1'],
     ])(
-      'resets when the end offset (%s) or leader epoch (%s) is undefined',
-      (endOffset, leaderEpoch) => {
+      'resets when the end offset or leader epoch is undefined (%s)',
+      (_, endOffset, leaderEpoch) => {
         const { validator, generation } = awaiting(create())
 
         expect(

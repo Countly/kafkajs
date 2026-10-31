@@ -8,14 +8,14 @@ const heartbeat = { 4: require('./heartbeat/v4/request') }
 const leaveGroup = { 4: require('./leaveGroup/v4/request'), 5: require('./leaveGroup/v5/request') }
 
 const CODECS = [
-  ['JoinGroup', joinGroup, 6, ['basic', 'staticMember']],
-  ['JoinGroup', joinGroup, 7, ['basic', 'staticMember']],
-  ['JoinGroup', joinGroup, 8, ['basic', 'staticMember', 'withReason']],
-  ['SyncGroup', syncGroup, 4, ['assignment']],
-  ['SyncGroup', syncGroup, 5, ['assignment', 'withProtocol']],
-  ['Heartbeat', heartbeat, 4, ['basic']],
-  ['LeaveGroup', leaveGroup, 4, ['oneMember', 'twoMembers']],
-  ['LeaveGroup', leaveGroup, 5, ['oneMember', 'twoMembers', 'withReason']],
+  ['JoinGroup', 6, joinGroup, ['basic', 'staticMember']],
+  ['JoinGroup', 7, joinGroup, ['basic', 'staticMember']],
+  ['JoinGroup', 8, joinGroup, ['basic', 'staticMember', 'withReason']],
+  ['SyncGroup', 4, syncGroup, ['assignment']],
+  ['SyncGroup', 5, syncGroup, ['assignment', 'withProtocol']],
+  ['Heartbeat', 4, heartbeat, ['basic']],
+  ['LeaveGroup', 4, leaveGroup, ['oneMember', 'twoMembers']],
+  ['LeaveGroup', 5, leaveGroup, ['oneMember', 'twoMembers', 'withReason']],
 ]
 
 const vector = (api, version, caseId) =>
@@ -42,7 +42,7 @@ const hexOf = async (request) => (await request.encode()).buffer.toString('hex')
 const build = (codecs, version, fields) => codecs[version](optionsOf(fields))
 
 describe('Protocol > Requests > the classic group codecs', () => {
-  describe.each(CODECS)('%s v%i', (api, codecs, version, cases) => {
+  describe.each(CODECS)('%s v%i', (api, version, codecs, cases) => {
     test.each(cases)('encodes the Apache 4.3.1 %s vector byte for byte', async (caseId) => {
       const { hex, fields } = vector(api, version, caseId)
 
@@ -51,10 +51,10 @@ describe('Protocol > Requests > the classic group codecs', () => {
   })
 
   describe.each([
-    ['SyncGroup', syncGroup, 4, 'assignment'],
-    ['SyncGroup', syncGroup, 5, 'withProtocol'],
-    ['Heartbeat', heartbeat, 4, 'basic'],
-  ])('%s v%i', (api, codecs, version, caseId) => {
+    ['SyncGroup', 4, syncGroup, 'assignment'],
+    ['SyncGroup', 5, syncGroup, 'withProtocol'],
+    ['Heartbeat', 4, heartbeat, 'basic'],
+  ])('%s v%i', (api, version, codecs, caseId) => {
     test('writes a dynamic member, which has no instance id, as the null marker (00)', async () => {
       // No Apache vector has one and it is what every default consumer sends; the vector with its
       // instance id swapped for the marker is the bytes the codec must write.

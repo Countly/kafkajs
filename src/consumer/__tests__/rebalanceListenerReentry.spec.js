@@ -459,6 +459,66 @@ describe('public re-entry from a rebalance callback', () => {
     })
   })
 
+  it('a cooperative revoked callback sees the old assignment and position, and its commit keeps ownership', async () => {
+    rig = createPublicRig({ cooperative: true })
+    rig.spies.commitOffsets.mockImplementation(async (_offsets, { guard }) => {
+      const refusal = guard()
+      if (refusal) throw refusal
+    })
+    const join = rig.spies.joinAndSync.getMockImplementation()
+    rig.spies.joinAndSync.mockImplementation(async function () {
+      const result = await join.call(this)
+      this.coordinator.offsetFetch = async () => ({
+        responses: [
+          {
+            topic: TOPIC,
+            partitions: [0, 1].map((partition) => ({
+              partition,
+              offset: '5',
+              metadata: null,
+              errorCode: 0,
+            })),
+          },
+        ],
+      })
+      return result
+    })
+    rig.joins.push({ assignment: { [TOPIC]: [0, 1] }, generationId: 2 })
+    const seen = []
+    await rig.consumer.subscribe({ topic: TOPIC })
+    await rig.consumer.run({
+      eachMessage: () => {},
+      rebalanceListener: {
+        onPartitionsRevoked: async ({ partitions }) => {
+          if (!partitions.length) return
+          seen.push({
+            assigned: groupOf().subscriptionState.isAssigned(TOPIC, 1),
+            acquired: groupOf().acquired.has(`${TOPIC}|1`),
+            position: await rig.consumer
+              .position({ topic: TOPIC, partition: 1 })
+              .catch((error) => error.message),
+            commit: await outcome(() =>
+              rig.consumer.commitOffsets([{ topic: TOPIC, partition: 1, offset: '5' }])
+            ),
+          })
+        },
+      },
+    })
+    rig.joins.push(
+      { assignment: { [TOPIC]: [0] }, generationId: 3 },
+      { assignment: { [TOPIC]: [0] }, generationId: 4 }
+    )
+    await groupOf().rebalanceCoordinator.runRound('requested', 'revoked')
+    expect(seen).toEqual([
+      {
+        assigned: true,
+        acquired: true,
+        position: '5',
+        commit: 'accepted',
+      },
+    ])
+  })
+
   it.each(['stop', 'disconnect', 'unsubscribe'])(
     'a valid callback requests %s without awaiting its own round, and the member leaves once',
     async (api) => {

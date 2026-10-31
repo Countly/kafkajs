@@ -33,7 +33,7 @@ describe('Consumer > rebalance protocol selection', () => {
     [[['cooperative'], ['cooperative', 'eager']], COOPERATIVE],
   ]
 
-  test.each(COMBINATIONS)('%p selects %s', (protocols, expected) => {
+  test.each(COMBINATIONS)('%j selects %s', (protocols, expected) => {
     const assigners = protocols.map((p, i) => assigner(`assigner-${i}`, p))
 
     expect(selectRebalanceProtocol(assigners)).toEqual(expected)

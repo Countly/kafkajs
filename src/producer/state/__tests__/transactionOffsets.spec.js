@@ -80,7 +80,7 @@ describe('Transactional offset staging', () => {
   })
 
   test.each([[[]], [[{ topic: 'topic', partitions: [] }]]])(
-    'empty topics acquire no fence',
+    'empty topics acquire no fence for %j',
     (input) => {
       const { offsets, ledger, cluster, call } = build()
       const begin = jest.spyOn(ledger, 'begin')

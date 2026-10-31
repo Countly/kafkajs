@@ -963,7 +963,7 @@ describe.each(['tv1', 'tv2'])('Producer > transactional offsets on the wire (%s)
     })
 
     test.each([[[]], [[{ topic: 'test-topic', partitions: [] }]]])(
-      'empty input retains version-specific wire behavior without staging',
+      'empty input %j retains version-specific wire behavior without staging',
       async (empty) => {
         wire = await openWire(profile)
         const before = wire.scripted.requests().length

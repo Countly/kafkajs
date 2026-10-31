@@ -14,14 +14,14 @@ const leaveGroup = {
 }
 
 const CODECS = [
-  ['JoinGroup', joinGroup, 6, ['ok']],
-  ['JoinGroup', joinGroup, 7, ['ok', 'protocolType', 'nullProtocolName']],
-  ['JoinGroup', joinGroup, 8, ['ok', 'protocolType', 'nullProtocolName']],
-  ['SyncGroup', syncGroup, 4, ['ok']],
-  ['SyncGroup', syncGroup, 5, ['ok', 'protocol']],
-  ['Heartbeat', heartbeat, 4, ['ok', 'error']],
-  ['LeaveGroup', leaveGroup, 4, ['ok', 'memberError']],
-  ['LeaveGroup', leaveGroup, 5, ['ok', 'memberError']],
+  ['JoinGroup', 6, joinGroup, ['ok']],
+  ['JoinGroup', 7, joinGroup, ['ok', 'protocolType', 'nullProtocolName']],
+  ['JoinGroup', 8, joinGroup, ['ok', 'protocolType', 'nullProtocolName']],
+  ['SyncGroup', 4, syncGroup, ['ok']],
+  ['SyncGroup', 5, syncGroup, ['ok', 'protocol']],
+  ['Heartbeat', 4, heartbeat, ['ok', 'error']],
+  ['LeaveGroup', 4, leaveGroup, ['ok', 'memberError']],
+  ['LeaveGroup', 5, leaveGroup, ['ok', 'memberError']],
 ]
 
 const vector = (api, version, caseId) => {
@@ -52,7 +52,7 @@ const expectedOf = ({ fields }) => {
 const UNSUPPORTED = new Encoder().writeInt32(0).writeInt16(35).buffer
 
 describe('Protocol > Requests > the classic group response codecs', () => {
-  describe.each(CODECS)('%s v%i', (api, codecs, version, cases) => {
+  describe.each(CODECS)('%s v%i', (api, version, codecs, cases) => {
     const { decode } = codecs[version]
 
     test.each(cases)('decodes the Apache 4.3.1 %s vector', async (caseId) => {

@@ -484,8 +484,9 @@ describe('awaited rebalance callbacks in a round', () => {
       Symbol('failed'),
       { code: 7 },
     ]
+    const labels = ['Error', 'string', 'null', 'undefined', 'hostile', 'symbol', 'plain object']
 
-    it.each(thrown.map((value) => [String(typeof value), value]))(
+    it.each(thrown.map((value, index) => [labels[index], value]))(
       'finishes the live round and ends the chain with the exact first error (%s)',
       async (_, value) => {
         const failure = value

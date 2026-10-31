@@ -119,27 +119,30 @@ describe('Manual consumer construction and local protocol', () => {
     expect(protocol.owned()).toEqual([{ topic: '__proto__', partitions: [2] }])
   })
   test.each([
-    undefined,
-    null,
-    {},
-    [],
-    [null],
-    [{ topic: '', partitions: [0] }],
-    [{ topic: 'a', partitions: [] }],
-    [{ topic: 'a' }],
-    [{ partitions: [0] }],
-    [{ topic: 'a', partitions: [NaN] }],
-    [{ topic: 'a', partitions: [Infinity] }],
-    [{ topic: 'a', partitions: [-1] }],
-    [{ topic: 'a', partitions: [0.5] }],
-    [{ topic: 'a', partitions: [2147483648] }],
-    [{ topic: 'a', partitions: ['0'] }],
-    [{ topic: 'a', partitions: [0, 0] }],
+    ['undefined', undefined],
+    ['null', null],
+    ['empty object', {}],
+    ['empty array', []],
+    ['null entry', [null]],
+    ['empty topic', [{ topic: '', partitions: [0] }]],
+    ['no partitions', [{ topic: 'a', partitions: [] }]],
+    ['missing partitions', [{ topic: 'a' }]],
+    ['missing topic', [{ partitions: [0] }]],
+    ['NaN partition', [{ topic: 'a', partitions: [NaN] }]],
+    ['Infinity partition', [{ topic: 'a', partitions: [Infinity] }]],
+    ['negative partition', [{ topic: 'a', partitions: [-1] }]],
+    ['fractional partition', [{ topic: 'a', partitions: [0.5] }]],
+    ['partition above int32', [{ topic: 'a', partitions: [2147483648] }]],
+    ['string partition', [{ topic: 'a', partitions: ['0'] }]],
+    ['repeated partition', [{ topic: 'a', partitions: [0, 0] }]],
     [
-      { topic: 'a', partitions: [0] },
-      { topic: 'a', partitions: [0] },
+      'repeated entry',
+      [
+        { topic: 'a', partitions: [0] },
+        { topic: 'a', partitions: [0] },
+      ],
     ],
-  ])('rejects malformed or duplicate assignment %p', (input) => {
+  ])('rejects malformed or duplicate assignment: %s', (_, input) => {
     expect(() => ManualGroupProtocol.validateAssignment(input)).toThrow(KafkaJSNonRetriableError)
   })
   test('accepts integer partition boundaries and repeated topics with distinct pairs', () => {

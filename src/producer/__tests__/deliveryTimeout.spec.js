@@ -54,7 +54,7 @@ describe('Producer > deliveryTimeout', () => {
       ['linger', { linger: -1 }, /linger must be an integer >= 0/],
       ['linger', { linger: 2.5 }, /linger must be an integer >= 0/],
       ['batchSize', { batchSize: 0 }, /batchSize must be an integer >= 1/],
-    ])('an invalid %s is refused', (_, options, message) => {
+    ])('an invalid %s (%j) is refused', (_, options, message) => {
       expect(() => createKafka().producer(options)).toThrow(message)
     })
 
