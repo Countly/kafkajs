@@ -332,6 +332,38 @@ const firstHolding = (observations, key, after) =>
   observations.find((o) => o.at > after && holds(o, key) === true)
 
 /**
+ * @param {number} wallMs a `Date.now()` moment
+ * @param {number} [wallNow] `Date.now()` now
+ * @param {number} [monotonicNow] `performance.now()` now
+ * @returns {number} the same moment on the `performance.now()` clock the wire's frames carry
+ */
+const monotonicOf = (wallMs, wallNow = Date.now(), monotonicNow = performance.now()) =>
+  monotonicNow - (wallNow - wallMs)
+
+/**
+ * @param {object[]} observations every Fetch frame of the member
+ * @param {number} node
+ * @returns {number|undefined} the connection of the node's newest frame, which a fault armed now
+ *   reaches
+ */
+const connectionOf = (observations, node) =>
+  observations.findLast((o) => o.node === node)?.connection
+
+/**
+ * Matches the Fetch a fault took. The request in flight when the fault is armed takes it, so the
+ * frame may be older than the arming: it is told by its connection, not by its time.
+ * @param {number} node
+ * @param {number} connection the connection the fault was armed on
+ * @returns {(o: object, index: number, all: object[]) => boolean} true for a frame sent on
+ *   `connection` that was never answered, once the node shows a frame on another connection
+ */
+const lostOnConnection = (node, connection) => (o, index, all) =>
+  o.node === node &&
+  o.connection === connection &&
+  o.answer === null &&
+  all.some((later) => later.node === node && later.at > o.at && later.connection !== connection)
+
+/**
  * @param {object} evidence
  * @param {object[]} evidence.observations every Fetch frame of the member
  * @param {string} evidence.key the moved partition's `topicId|partition`
@@ -530,12 +562,15 @@ class SessionRig {
     cleanup.add('producer', () => this.producer.disconnect())
     await step(scope, 'The producer connect', () => this.producer.connect())
     const { brokers } = await step(scope, 'The cluster read', () => this.admin.describeCluster())
-    this.racks = new Map(brokers.map(({ nodeId, rack }) => [nodeId, rack]))
     this.nodeIds = brokers.map(({ nodeId }) => nodeId).sort((a, b) => a - b)
     this.endpoints = new Map(brokers.map(({ nodeId, host, port }) => [nodeId, `${host}:${port}`]))
     this.cluster = createCluster({}, this.brokers)
     cleanup.add('cluster', () => this.cluster.disconnect())
     await step(scope, 'The cluster connect', () => this.cluster.connect())
+    const { brokers: racked } = await step(scope, 'The broker racks', () =>
+      this.cluster.metadata({ topics: [] })
+    )
+    this.racks = new Map(racked.map(({ nodeId, rack }) => [nodeId, rack]))
   }
 
   /**
@@ -805,10 +840,13 @@ module.exports = {
   commitProblems,
   corpusProblems,
   closeProblems,
+  connectionOf,
   deleteTopics,
   followerProblems,
   holds,
   identity,
+  lostOnConnection,
+  monotonicOf,
   moveProblems,
   sessionProblems,
   summarize,

@@ -161,7 +161,6 @@ describeCapacity('Consumer > Fetch session capacity (live)', () => {
         const topic = `${PREFIX}-cohort-${rig.id}`
         const groupId = `${PREFIX}-cohort-group-${rig.id}`
         await rig.createTopic({ topic, partitions: PARTITIONS })
-        const corpus = await rig.produce('first', topic, PARTITION_LIST, RECORDS)
 
         const members = []
         for (let index = 0; index < COHORT; index++) {
@@ -177,10 +176,16 @@ describeCapacity('Consumer > Fetch session capacity (live)', () => {
           )
         }
         const owned = () => members.flatMap((member) => member.owned(topic)).sort((a, b) => a - b)
-        await pollUntil(scope, STEP_MS, () => owned().join() === PARTITION_LIST.join(), {
-          delayMs: POLL_MS,
-          label: 'The exclusive split of the partitions',
-        })
+        await pollUntil(
+          scope,
+          STEP_MS,
+          () =>
+            owned().join() === PARTITION_LIST.join() &&
+            members.every((member) => member.owned(topic).length > 0),
+          { delayMs: POLL_MS, label: 'The exclusive split of the partitions' }
+        )
+        // Sent after the split: a member alone in the group would otherwise take the whole corpus.
+        const corpus = await rig.produce('first', topic, PARTITION_LIST, RECORDS)
         const everything = () =>
           new Set(members.flatMap(({ handled }) => handled.map((r) => r.value)))
         await pollUntil(scope, STEP_MS, () => corpus.every((r) => everything().has(r.value)), {

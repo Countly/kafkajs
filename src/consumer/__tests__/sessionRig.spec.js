@@ -5,8 +5,11 @@ const {
   capacityProblems,
   closeProblems,
   commitProblems,
+  connectionOf,
   corpusProblems,
   followerProblems,
+  lostOnConnection,
+  monotonicOf,
   moveProblems,
   sessionFacts,
   sessionProblems,
@@ -410,5 +413,45 @@ describe('capacityProblems', () => {
       'no consumer held a positive session',
       'no incremental request was accepted',
     ])
+  })
+})
+
+describe('the fault and outage clocks', () => {
+  const sent = (node, connection, at, answered) => ({
+    node,
+    connection,
+    at,
+    answer: answered ? { rows: 0 } : null,
+  })
+
+  it('puts a wall-clock moment on the monotonic clock the frames use', () => {
+    expect(monotonicOf(1000, 1500, 90)).toBe(-410)
+    expect(monotonicOf(1500, 1500, 90)).toBe(90)
+    expect(monotonicOf(Date.now() - 50) - performance.now()).toBeLessThan(-40)
+  })
+
+  it('tells a dropped Fetch sent before the arming by its connection', () => {
+    const frames = [
+      sent(1, 4, 10, true),
+      sent(2, 5, 11, true),
+      sent(1, 4, 20, false),
+      sent(1, 8, 40, true),
+    ]
+    const armed = connectionOf(frames.slice(0, 2), 1)
+    const lost = lostOnConnection(1, armed)
+
+    expect(armed).toBe(4)
+    expect(frames.findIndex(lost)).toBe(2)
+    expect(frames.filter(lost)).toHaveLength(1)
+  })
+
+  it('waits for the reconnect and ignores another node or an older connection', () => {
+    const lost = lostOnConnection(1, 8)
+
+    expect([sent(1, 8, 20, false)].find(lost)).toBeUndefined()
+    expect([sent(1, 8, 20, false), sent(2, 5, 30, true)].find(lost)).toBeUndefined()
+    expect([sent(1, 4, 5, false), sent(1, 8, 20, true)].find(lost)).toBeUndefined()
+    expect([sent(1, 8, 20, false), sent(1, 9, 30, true)].find(lost)).toEqual(sent(1, 8, 20, false))
+    expect(connectionOf([], 1)).toBeUndefined()
   })
 })

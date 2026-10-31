@@ -29,8 +29,11 @@ const {
   STEP_MS,
   closeProblems,
   commitProblems,
+  connectionOf,
   corpusProblems,
   followerProblems,
+  lostOnConnection,
+  monotonicOf,
   moveProblems,
   sessionFacts,
   sessionProblems,
@@ -673,8 +676,9 @@ describeSessions('Consumer > Fetch sessions (live)', () => {
           return Number(record.offset) >= (committedAtLoss.get(`${from}|${partition}`) ?? 0)
         }
         const observations = await member.wire.observations()
+        const downAt = monotonicOf(down.tDown)
         const resumed = observations.some(
-          (o) => o.node === stopped && o.at > down.tDown && o.sessionEpoch === 0
+          (o) => o.node === stopped && o.at > downAt && o.sessionEpoch === 0
         )
         const problems = {
           corpus: corpusProblems([...pre, ...during, ...post], member.handled, replays),
@@ -721,20 +725,13 @@ describeSessions('Consumer > Fetch sessions (live)', () => {
         rig.facts.faults = {}
         const expected = [...corpus]
         for (const [name, apply] of Object.entries(faults)) {
-          const armedAt = performance.now()
+          const armed = connectionOf(await member.wire.observations(), node)
           // Arms the sockets open now and none opened later, so the reconnect is clean.
           chaos.arm(select, apply)()
           const unanswered = await frameWhere(
             rig,
             member,
-            (o, index, all) =>
-              o.node === node &&
-              o.at > armedAt &&
-              o.answer === null &&
-              all.some(
-                (later) =>
-                  later.node === node && later.at > o.at && later.connection !== o.connection
-              ),
+            lostOnConnection(node, armed),
             `The ${name} fault on node ${node}`
           )
           const records = await rig.produce(name, topic, PARTITION_LIST, 2)
