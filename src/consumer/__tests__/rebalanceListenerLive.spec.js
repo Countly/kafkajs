@@ -430,7 +430,7 @@ class ListenerScenario {
 
   /**
    * Completes the episodes of every revoked invocation of a member: for a close, the held final
-   * commit response is read against the broker before it is released.
+   * commit response is read against the broker, then released so the member reports the commit.
    * @param {object} member
    * @returns {Promise<void>}
    */
@@ -441,8 +441,11 @@ class ListenerScenario {
       let brokerRead = observed
       let held = false
       if (closing) {
-        held = await member.probe.heldResponse(this.scope)
+        // Nothing is expected to commit, so there is no response to wait for.
+        held = expected.size > 0 && (await member.probe.heldResponse(this.scope))
         brokerRead = await this.brokerOffsets()
+        // The member reports its commit only once the response reaches it.
+        member.probe.release()
       }
       for (const partition of cells) {
         let correlation = null
@@ -451,7 +454,7 @@ class ListenerScenario {
         // A cell the member delivered nothing from has no offset to commit.
         if (mustCommit ? held : !closing && processed.get(partition) > 0) {
           try {
-            correlation = this.correlated(member, partition, invocation, closing)
+            correlation = await this.correlated(member, partition, invocation, closing)
             eligible = true
           } catch (error) {
             this.error ??= describeError(error)
@@ -471,7 +474,6 @@ class ListenerScenario {
           correlation,
         })
       }
-      if (closing) member.probe.release()
     }
     member.episodesPending = []
   }
@@ -481,14 +483,23 @@ class ListenerScenario {
    * @param {number} partition
    * @param {object} invocation the revoked callback's record
    * @param {boolean} closing whether the commit is the final one after the callback
-   * @returns {object} the correlated commit fields, with the topic and incarnation of the run
+   * @returns {Promise<object>} the correlated commit fields, with the topic and incarnation of the
+   *   run
    */
-  correlated(member, partition, invocation, closing) {
-    const found = member.probe.correlate(
-      closing
-        ? { partition, after: invocation.returnedOrdinal, before: Infinity, single: true }
-        : { partition, after: 0, before: invocation.enteredOrdinal, single: false }
-    )
+  async correlated(member, partition, invocation, closing) {
+    const found = closing
+      ? await member.probe.correlateReported(this.scope, {
+          partition,
+          after: invocation.returnedOrdinal,
+          before: Infinity,
+          single: true,
+        })
+      : member.probe.correlate({
+          partition,
+          after: 0,
+          before: invocation.enteredOrdinal,
+          single: false,
+        })
     return {
       apiKey: found.apiKey,
       correlationId: found.correlationId,

@@ -74,6 +74,36 @@ describe('CommitEpisodeProbe held response', () => {
 })
 
 describe('CommitEpisodeProbe correlation', () => {
+  it('finds the member commit event only after the held response is released', async () => {
+    let ordinal = 0
+    const socket = Object.assign(new EventEmitter(), { write: jest.fn(() => true) })
+    const probe = new CommitEpisodeProbe(
+      () => socket,
+      () => ++ordinal
+    )
+    const wrapped = probe.socketFactory({})
+    wrapped.on('data', () =>
+      probe.recordCommit({
+        groupId: 'g',
+        memberId: 'm',
+        topics: [{ topic: 't', partitions: [{ partition: '0', offset: '50' }] }],
+      })
+    )
+    probe.arm()
+    wrapped.write(request(OFFSET_COMMIT, 4))
+    socket.emit('data', response(4))
+    const query = { partition: 0, after: 0, before: Infinity, single: true }
+    const scope = new AbortController().signal
+    await expect(probe.heldResponse(scope)).resolves.toBe(true)
+    expect(() => probe.correlate(query)).toThrow(/missing/)
+    probe.release()
+    await expect(probe.correlateReported(scope, query)).resolves.toMatchObject({
+      partition: 0,
+      offset: 50,
+      correlationId: 4,
+    })
+  })
+
   it('matches a commit event whose partitions are string keys', () => {
     let ordinal = 0
     const socket = Object.assign(new EventEmitter(), { write: jest.fn(() => true) })

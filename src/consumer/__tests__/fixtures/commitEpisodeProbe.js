@@ -1,6 +1,7 @@
-const { delay } = require('../../../producer/__tests__/fixtures/bounded')
+const { delay, pollUntil } = require('../../../producer/__tests__/fixtures/bounded')
 
 const HELD_RESPONSE_MS = 20000
+const REPORTED_MS = 15000
 const OFFSET_COMMIT = 8
 
 /**
@@ -172,6 +173,32 @@ class CommitEpisodeProbe {
   }
 
   /**
+   * @param {{ partition: number, after: number, before: number }} query as for `correlate`
+   * @returns {object[]} the recorded commit events inside the ordinal window for the partition
+   */
+  matching({ partition, after, before }) {
+    return this.commits.filter(
+      (c) => c.partition === partition && c.ordinal > after && c.ordinal < before
+    )
+  }
+
+  /**
+   * Correlates once the member has reported the commit. The member emits `commit_offsets` only
+   * after the broker's response reaches it, so a held response must be released first.
+   * @param {AbortSignal} scope the case scope
+   * @param {object} query as for `correlate`
+   * @returns {Promise<object>} the correlated commit
+   * @throws {Error} when no event arrives in time, or as `correlate` does
+   */
+  async correlateReported(scope, query) {
+    await pollUntil(scope, REPORTED_MS, () => this.matching(query).length > 0, {
+      delayMs: 50,
+      label: `The commit event of partition ${query.partition}`,
+    })
+    return this.correlate(query)
+  }
+
+  /**
    * Joins a commit event to the request frame that carried it.
    * @param {object} query
    * @param {number} query.partition the partition of the episode
@@ -182,9 +209,7 @@ class CommitEpisodeProbe {
    * @throws {Error} when no commit, more than one where one is required, or no request, matches
    */
   correlate({ partition, after, before, single }) {
-    const matches = this.commits.filter(
-      (c) => c.partition === partition && c.ordinal > after && c.ordinal < before
-    )
+    const matches = this.matching({ partition, after, before })
     if (matches.length === 0 || (single && matches.length > 1)) {
       throw new Error(
         `The commit of partition ${partition} is ${matches.length === 0 ? 'missing' : 'ambiguous'} (${matches.length} events)`
