@@ -19,7 +19,7 @@ const RECENT_LINES = 500
 const YIELD_EVERY = 4096
 
 /** The kinds of replay a journal may declare. */
-const REPLAY_REASONS = Object.freeze(['seek', 'reset', 'crash'])
+const REPLAY_REASONS = Object.freeze(['seek', 'reset', 'crash', 'retry'])
 
 /**
  * Audits a closed, issue-ordered journal of acknowledged log records, ownership boundaries, handler
@@ -38,8 +38,10 @@ const REPLAY_REASONS = Object.freeze(['seek', 'reset', 'crash'])
  * `[from, to)` a group may legitimately handle again, once per record. The `position` that follows
  * an `acquire` is the broker's committed position: it may not lie below a confirmed commit, and it
  * declares a crash replay of what an earlier ownership handled at or above it without a commit. A
- * `produce` record may name its own intended `groups`, a subset of the constructor's; without it
- * every constructor group is intended.
+ * handler that threw has not completed its delivery, and the client retries that one record inside
+ * the same ownership: a `replay` of reason `retry` names the owner's last handled record and lets it
+ * be handled once more. A `produce` record may name its own intended `groups`, a subset of the
+ * constructor's; without it every constructor group is intended.
  */
 class ConsumerChurnOracle {
   /**
@@ -62,6 +64,8 @@ class ConsumerChurnOracle {
     this.starts = new Map()
     this.confirmed = new Map()
     this.replays = new Map()
+    this.retries = new Map()
+    this.lasts = new Map()
     this.highs = new Map()
     this.entered = new Set()
   }
@@ -171,6 +175,7 @@ class ConsumerChurnOracle {
         if (this.active.has(id)) this.#fail('overlapping ownership')
         this.active.set(id, record.owner)
         this.replays.delete(id)
+        this.retries.delete(id)
         this.entered.add(id)
         break
       case 'revoke':
@@ -221,9 +226,19 @@ class ConsumerChurnOracle {
   #replay(record, id) {
     if (!REPLAY_REASONS.includes(record.reason)) this.#fail('unknown replay reason')
     if (BigInt(record.from) > BigInt(record.to)) this.#fail('reversed replay interval')
+    if (record.reason === 'retry') return this.#retry(record, id)
     if (record.reason === 'crash' && BigInt(record.from) !== (this.confirmed.get(id) || 0n))
       this.#fail('replay boundary differs from confirmed commit')
     this.#declare(record, id, BigInt(record.from), BigInt(record.to))
+  }
+
+  /** A failed handler's record, and only the owner's last one, may be handled once more. */
+  #retry(record, id) {
+    const from = BigInt(record.from)
+    if (BigInt(record.to) !== from + 1n) this.#fail('retry is not one record')
+    if (this.active.get(id) !== record.owner) this.#fail('retry after ownership boundary')
+    if (this.lasts.get(id) !== from) this.#fail('retry of a record that is not the last handled')
+    this.retries.set(id, from)
   }
 
   /** Lets each record the group already handled in `[from, to)` be handled once more. */
@@ -252,14 +267,16 @@ class ConsumerChurnOracle {
     const offset = BigInt(record.offset)
     if (this.handled.has(deliveryKey)) this.#replayed(id, offset)
     this.entered.delete(id)
+    this.lasts.set(id, offset)
     if (offset > (this.highs.get(id) ?? -1n)) this.highs.set(id, offset)
     this.handled.add(deliveryKey)
     this.counts.delivered += 1
     this.#advance(record, id, record.group)
   }
 
-  /** Spends the declared replay of one record; it ends with the last record of its interval. */
+  /** Spends the declared retry or replay of one record; a replay ends with its interval's last record. */
   #replayed(id, offset) {
+    if (this.retries.get(id) === offset) return this.retries.delete(id)
     const replay = this.replays.get(id)
     if (!replay || offset < replay.from || offset >= replay.to || replay.done.has(offset))
       this.#fail('undeclared handler replay')
@@ -337,6 +354,8 @@ class ConsumerChurnOracle {
       this.starts,
       this.confirmed,
       this.replays,
+      this.retries,
+      this.lasts,
       this.active,
       this.highs,
       this.entered,

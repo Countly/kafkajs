@@ -1330,6 +1330,83 @@ describe('Consumer journal boundaries', () => {
       await expect(verify(crashJournal(again, again))).rejects.toThrow('undeclared handler replay')
     })
   })
+  describe('a retry after a handler threw', () => {
+    const second = { offset: '1', sequence: 's1' }
+    const retry = (from = '1', fields = {}) =>
+      observation('replay', { reason: 'retry', from, to: String(BigInt(from) + 1n), ...fields })
+    const retried = (...after) => [
+      observation('produce'),
+      observation('produce', second),
+      observation('acquire'),
+      observation('position', { next: '0' }),
+      observation('read'),
+      observation('read', second),
+      observation('handler'),
+      observation('handler', second),
+      ...after,
+      observation('revoke', {
+        owner: after.findLast((row) => row.kind === 'acquire')?.owner ?? 'owner-a',
+      }),
+      observation('delete'),
+    ]
+    const again = () => observation('handler', second)
+    const counts = { acknowledged: 2, delivered: 3, commits: 0 }
+    test('accepts the failed record once more inside the same ownership', async () => {
+      await expect(verify(retried(retry(), again()))).resolves.toEqual(counts)
+    })
+    test('is spent by that one redelivery', async () => {
+      await expect(verify(retried(retry(), again(), again()))).rejects.toThrow(
+        'undeclared handler replay'
+      )
+    })
+    test('is not a blanket allowance for a repeat nobody declared', async () => {
+      await expect(verify(retried(again()))).rejects.toThrow('undeclared handler replay')
+    })
+    test('covers only the record it names', async () => {
+      await expect(verify(retried(retry(), observation('handler')))).rejects.toThrow(
+        'undeclared handler replay'
+      )
+    })
+    test('names the last record the owner handled, not an earlier one', async () => {
+      await expect(verify(retried(retry('0'), observation('handler')))).rejects.toThrow(
+        'retry of a record that is not the last handled'
+      )
+    })
+    test('names exactly one record', async () => {
+      const wide = retry('1', { to: '3' })
+      await expect(verify(retried(wide, again()))).rejects.toThrow('retry is not one record')
+    })
+    test('is refused once the ownership ended', async () => {
+      const rows = retried(observation('loss'), retry(), again())
+      await expect(verify(rows)).rejects.toThrow('retry after ownership boundary')
+    })
+    test('does not outlive a new ownership', async () => {
+      const rows = retried(
+        retry(),
+        observation('revoke'),
+        observation('acquire', { owner: 'owner-b' }),
+        observation('position', { owner: 'owner-b', next: '2' }),
+        observation('handler', { ...second, owner: 'owner-b' })
+      )
+      await expect(verify(rows)).rejects.toThrow('undeclared handler replay')
+    })
+    test('leaves a pending crash replay window to its own records', async () => {
+      const crash = [
+        observation('loss'),
+        observation('acquire', { owner: 'owner-b' }),
+        observation('position', { owner: 'owner-b', next: '0' }),
+        observation('handler', { owner: 'owner-b' }),
+        retry('0', { owner: 'owner-b' }),
+        observation('handler', { owner: 'owner-b' }),
+        observation('handler', { ...second, owner: 'owner-b' }),
+      ]
+      await expect(verify(retried(...crash))).resolves.toEqual({
+        acknowledged: 2,
+        delivered: 5,
+        commits: 0,
+      })
+    })
+  })
   describe('a replay after an ownership ended without a confirmed commit', () => {
     const second = { offset: '1', sequence: 's1' }
     const again = (fields = {}) => observation('handler', { owner: 'owner-b', ...fields })

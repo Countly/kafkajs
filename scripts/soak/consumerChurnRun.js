@@ -192,6 +192,12 @@ class ChurnMember {
     }
   }
 
+  /**
+   * Journals one delivery and commits every `COMMIT_EVERY` handled records. A commit that throws
+   * fails the handler, so the client retries that record inside the same ownership: it is
+   * declared a `retry` replay while the ownership lasts. Once it ended, the next owner's position
+   * covers the redelivery.
+   */
   async #handle({ topic, partition, message }) {
     const held = this.#held(topic, partition)
     if (held === undefined) return
@@ -199,23 +205,24 @@ class ChurnMember {
     const [incarnation, sequence] = message.value.toString('latin1').split('|')
     const known = await this.acknowledged(topic, partition, message.offset, incarnation)
     if (this.owners.get(key) !== held) return
+    const scope = { group: this.group, owner: held.owner, incarnation, topic, partition }
     if (known) {
-      this.journal.append({
-        kind: 'handler',
-        group: this.group,
-        owner: held.owner,
-        incarnation,
-        topic,
-        partition,
-        offset: message.offset,
-        sequence,
-      })
+      this.journal.append({ kind: 'handler', ...scope, offset: message.offset, sequence })
       this.gaps?.enter(this.group, this.phase, this.clock.now())
       const delivered = `${this.group}|${incarnation}`
       this.handled.set(delivered, (this.handled.get(delivered) ?? 0) + 1)
     }
     this.processed.set(key, BigInt(message.offset) + 1n)
-    if (++this.sinceCommit % COMMIT_EVERY === 0) await this.commitAll()
+    if (++this.sinceCommit % COMMIT_EVERY !== 0) return
+    try {
+      await this.commitAll()
+    } catch (error) {
+      if (known && this.owners.get(key) === held) {
+        const to = String(BigInt(message.offset) + 1n)
+        this.journal.append({ kind: 'replay', reason: 'retry', ...scope, from: message.offset, to })
+      }
+      throw error
+    }
   }
 
   /**

@@ -35,12 +35,14 @@ describe('Consumer > an escaping commit error from a generation the member has l
   /**
    * Holds a commit sent while a rejoin is pending, answers the rejoin with generation 2 and then
    * the commit with ILLEGAL_GENERATION.
-   * @param {{ rejoin: boolean }} options false leaves the member at its generation: no rejoin runs
-   * @returns {Promise<{ lost: number, joins: number }>} the lost-membership rounds the runner
-   *   resolved, and the JoinGroup requests sent
+   * @param {{ rejoin: boolean, escape?: boolean }} options `rejoin` false leaves the member at its
+   *   generation: no rejoin runs; `escape` false has the handler catch the commit's error
+   * @returns {Promise<{ lost: number, joins: number, deliveries: number, fetchOffsets: string[] }>}
+   *   the lost-membership rounds the runner resolved, the JoinGroup requests sent, the handler
+   *   calls, and the offset each Fetch asked for
    */
-  const answerIllegalGeneration = async ({ rejoin }) => {
-    const cluster = groupScript(createScriptedCluster({ nodes: NODES }))
+  const answerIllegalGeneration = async ({ rejoin, escape = true }) => {
+    const cluster = groupScript(createScriptedCluster({ nodes: NODES }), { batches: 2 })
     const resolved = jest.spyOn(Runner.prototype, 'resolveRebalanceVerdict')
     consumer = new Kafka(cluster.kafkaOptions({ requestTimeout: 20000 })).consumer({
       groupId: 'escaping-commit',
@@ -51,6 +53,7 @@ describe('Consumer > an escaping commit error from a generation the member has l
     })
     const requests = (api) => cluster.requests().filter((request) => request.api === api)
     let commit
+    let deliveries = 0
     const handlerMayCommit = new Promise((resolve) => {
       release = resolve
     })
@@ -58,10 +61,11 @@ describe('Consumer > an escaping commit error from a generation the member has l
     await consumer.subscribe({ topic: TOPIC, fromBeginning: true })
     await consumer.run({
       eachMessage: async () => {
+        deliveries += 1
         await handlerMayCommit
         commit = consumer.commitOffsets([{ topic: TOPIC, partition: 0, offset: '1' }])
         commit.catch(() => {})
-        await commit
+        await (escape ? commit : commit.catch(() => {}))
       },
     })
     await until(() => requests('Fetch').length > 0, 'the first fetch')
@@ -87,11 +91,15 @@ describe('Consumer > an escaping commit error from a generation the member has l
     return {
       lost: resolved.mock.calls.filter(([verdict]) => verdict.kind === 'lost').length,
       joins: requests('JoinGroup').length,
+      deliveries,
+      fetchOffsets: requests('Fetch').map(
+        ({ fields }) => fields.topics[0].partitions[0].fetchOffset
+      ),
     }
   }
 
   it('does not lose the membership it already replaced by joining again', async () => {
-    expect(await answerIllegalGeneration({ rejoin: true })).toEqual({ lost: 0, joins: 2 })
+    expect(await answerIllegalGeneration({ rejoin: true })).toMatchObject({ lost: 0, joins: 2 })
   }, 20000)
 
   it('still loses the membership when the generation is the one the member holds (control)', async () => {
@@ -99,4 +107,23 @@ describe('Consumer > an escaping commit error from a generation the member has l
 
     expect(lost).toBe(1)
   }, 20000)
+
+  describe('a handler that fails on the commit error', () => {
+    it('is retried from the record it failed on, in the same membership', async () => {
+      const { lost, deliveries, fetchOffsets } = await answerIllegalGeneration({ rejoin: true })
+
+      expect({ lost, deliveries }).toEqual({ lost: 0, deliveries: 2 })
+      expect(fetchOffsets.slice(0, 3)).toEqual(['0', '0', '1'])
+    }, 20000)
+
+    it('is not retried when the handler caught the error (control)', async () => {
+      const { lost, deliveries, fetchOffsets } = await answerIllegalGeneration({
+        rejoin: true,
+        escape: false,
+      })
+
+      expect({ lost, deliveries }).toEqual({ lost: 0, deliveries: 1 })
+      expect(fetchOffsets.slice(0, 2)).toEqual(['0', '1'])
+    }, 20000)
+  })
 })

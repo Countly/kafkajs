@@ -607,6 +607,65 @@ describe('Consumer churn profile > a member', () => {
     expect(appended.map(({ kind }) => kind)).toEqual(['acquire', 'position', 'handler'])
   })
 
+  describe('a commit that fails inside the handler', () => {
+    const owned = async (options) => {
+      const harness = setup(options)
+      await harness.member.start(['t'])
+      await harness.handlers.onPartitionsAssigned({
+        partitions: [{ topic: 't', partitions: [0] }],
+      })
+      for (let offset = 0; offset < 24; offset++) await harness.handlers.each(message(offset))
+      return harness
+    }
+    const produced = (offset) => ({
+      kind: 'produce',
+      incarnation: 't.1',
+      topic: 't',
+      partition: 0,
+      offset: String(offset),
+      sequence: `s${offset}`,
+    })
+
+    test('declares the failed record a retry, which the real oracle spends on its redelivery', async () => {
+      const { appended, handlers, consumer } = await owned()
+      consumer.commitOffsets.mockRejectedValueOnce(new Error('illegal generation'))
+      await expect(handlers.each(message(24))).rejects.toThrow('illegal generation')
+      expect(appended.slice(-2)).toMatchObject([
+        { kind: 'handler', offset: '24' },
+        { kind: 'replay', reason: 'retry', owner: 'm-1', from: '24', to: '25' },
+      ])
+      await handlers.each(message(24))
+      const offsets = Array.from({ length: 25 }, (_, offset) => offset)
+      const rows = [...offsets.map(produced), ...appended]
+      await expect(new ConsumerChurnOracle([], ['g']).feed(rows)).resolves.toBeUndefined()
+      await expect(
+        new ConsumerChurnOracle([], ['g']).feed([...rows, ...appended.slice(-1)])
+      ).rejects.toThrow('undeclared handler replay')
+    })
+
+    test('declares nothing once the ownership was lost while the commit ran', async () => {
+      const { appended, handlers, consumer } = await owned()
+      let fail
+      consumer.commitOffsets.mockImplementationOnce(
+        () => new Promise((resolve, reject) => (fail = reject))
+      )
+      const delivering = handlers.each(message(24))
+      await new Promise(setImmediate)
+      expect(consumer.commitOffsets).toHaveBeenCalledTimes(1)
+      await handlers.onPartitionsLost({ partitions: [{ topic: 't', partitions: [0] }] })
+      fail(new Error('illegal generation'))
+      await expect(delivering).rejects.toThrow('illegal generation')
+      expect(appended.map(({ kind }) => kind)).not.toContain('replay')
+    })
+
+    test('declares nothing for a record that was never journaled', async () => {
+      const { appended, handlers, consumer } = await owned({ known: async () => false })
+      consumer.commitOffsets.mockRejectedValueOnce(new Error('illegal generation'))
+      await expect(handlers.each(message(24))).rejects.toThrow('illegal generation')
+      expect(appended.map(({ kind }) => kind)).toEqual(['acquire', 'position'])
+    })
+  })
+
   test('drops a delivery for a partition it does not own', async () => {
     const { member, appended, handlers } = setup()
     await member.start(['t'])
