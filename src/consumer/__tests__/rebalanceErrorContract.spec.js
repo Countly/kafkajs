@@ -4,8 +4,18 @@ const {
   pollIntervalExceededError,
   stampOffsetCommit,
   isDeletedGroupCommit,
+  stampGeneration,
+  sentGeneration,
+  stampOwnership,
+  sentOwnership,
+  stampMembership,
+  sentMembership,
+  isStaleMembershipVerdict,
+  obsoleteOwnership,
   REBALANCE_PATHS,
 } = require('../rebalanceErrorContract')
+const GroupOwnership = require('../groupOwnership')
+const { KafkaJSNonRetriableError, KafkaJSNumberOfRetriesExceeded } = require('../../errors')
 const {
   isRebalancing,
   isLostMember,
@@ -454,6 +464,67 @@ describe('Consumer > rebalance error contract', () => {
 
       expect(Object.keys(publicApi)).not.toContain('isFatalMembership')
       expect(Object.keys(publicApi)).not.toContain('CONSUMER_PROTOCOL_UNSUPPORTED')
+    })
+  })
+
+  describe('stamps on an error a retrier wrapped', () => {
+    const stamped = () => {
+      const error = createErrorFromCode(22)
+      stampGeneration(error, 7)
+      stampOwnership(error, 3)
+      stampMembership(error, 2)
+      return error
+    }
+
+    test.each([
+      ['non-retriable', (e) => new KafkaJSNonRetriableError(e, { cause: e })],
+      ['retries exceeded', (e) => new KafkaJSNumberOfRetriesExceeded(e, { cause: e })],
+      [
+        'wrapped twice',
+        (e) => {
+          const inner = new KafkaJSNonRetriableError(e, { cause: e })
+          return new KafkaJSNonRetriableError(inner, { cause: inner })
+        },
+      ],
+    ])('a %s wrapper reads the stamps of the error it wraps', (_, wrap) => {
+      const wrapper = wrap(stamped())
+
+      expect(sentGeneration(wrapper)).toBe(7)
+      expect(sentOwnership(wrapper)).toBe(3)
+      expect(sentMembership(wrapper)).toBe(2)
+    })
+
+    it('an unstamped error and its causes read as unstamped', () => {
+      const wrapper = new KafkaJSNonRetriableError(new Error('x'), { cause: new Error('y') })
+
+      expect(sentGeneration(wrapper)).toBeUndefined()
+      expect(sentOwnership(wrapper)).toBeUndefined()
+      expect(sentMembership(undefined)).toBeUndefined()
+      expect(sentGeneration('text')).toBeUndefined()
+    })
+
+    it('a wrapper of an old generation is stale, as the error it wraps is', () => {
+      const error = stamped()
+      const wrapper = new KafkaJSNonRetriableError(error, { cause: error })
+
+      expect(isStaleMembershipVerdict({ kind: 'lost', error: wrapper }, 'classic', 8)).toBe(true)
+      expect(isStaleMembershipVerdict({ kind: 'lost', error: wrapper }, 'classic', 7)).toBe(false)
+    })
+
+    it('a wrapper from a replaced membership is obsolete', () => {
+      const ownership = new GroupOwnership()
+      const error = stampOwnership(createErrorFromCode(22), ownership.token())
+      const wrapper = new KafkaJSNonRetriableError(error, { cause: error })
+      ownership.renew()
+
+      expect(obsoleteOwnership(ownership, wrapper)).toBe(true)
+    })
+
+    it('stops following a cause chain that never ends', () => {
+      const loop = new Error('loop')
+      loop.cause = loop
+
+      expect(sentGeneration(loop)).toBeUndefined()
     })
   })
 })

@@ -31,6 +31,25 @@ const INVALID_REQUEST = 42
 const UNKNOWN_MEMBER_ID = 25
 const FENCED_MEMBER_EPOCH = 110
 const GROUP_ID_NOT_FOUND = 69
+const MAX_CAUSE_DEPTH = 8
+
+/**
+ * Reads a private stamp off an error or, failing that, off the errors it wraps.
+ *
+ * A retrier re-wraps an error it will not retry (`KafkaJSNonRetriableError`, `KafkaJSNumberOfRetriesExceeded`)
+ * and the wrapper keeps `type` and `code` but none of the symbol stamps, so without this walk the answer of a
+ * request sent under an old generation or membership would read as one about the current one.
+ * @param {unknown} error
+ * @param {symbol} stamp
+ * @returns {*} the stamp's value, undefined when neither the error nor its first causes carry it
+ */
+const carried = (error, stamp) => {
+  for (let depth = 0; error && typeof error === 'object' && depth < MAX_CAUSE_DEPTH; depth++) {
+    if (error[stamp] != null) return error[stamp]
+    error = error.cause
+  }
+  return undefined
+}
 
 /**
  * Marks an error as one an OffsetCommit produced.
@@ -355,7 +374,7 @@ const stampGeneration = (error, generationId) => {
  * @param {Error} error
  * @returns {number|undefined} the generation the request behind this error was sent under
  */
-const sentGeneration = (error) => error && error[SENT_GENERATION]
+const sentGeneration = (error) => error && carried(error, SENT_GENERATION)
 
 /**
  * Records the membership identity captured before a group operation awaited anything.
@@ -369,7 +388,7 @@ const stampOwnership = (error, token) => {
 }
 
 /** @param {Error} error @returns {number|undefined} its original membership identity */
-const sentOwnership = (error) => error && error[SENT_OWNERSHIP]
+const sentOwnership = (error) => error && carried(error, SENT_OWNERSHIP)
 
 /**
  * Records the classic membership revision a group request was sent under, so an
@@ -384,7 +403,7 @@ const stampMembership = (error, revision) => {
 }
 
 /** @param {Error} error @returns {number|undefined} the membership revision its request began under */
-const sentMembership = (error) => error && error[SENT_MEMBERSHIP]
+const sentMembership = (error) => error && carried(error, SENT_MEMBERSHIP)
 
 /**
  * Whether an answer belongs to a membership already replaced. Unstamped local errors use current.

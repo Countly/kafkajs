@@ -9,6 +9,8 @@ Versions before 3.0.0 are internal alpha tags and are not published.
 
 #### Behavior changes
 
+- **A commit error that a handler lets escape no longer costs a member its membership after a rejoin.** The commit retrier re-wraps an `ILLEGAL_GENERATION` answer it will not retry, and the wrapper kept `type` and `code` but not the private record of the generation, membership and group instance the request was sent under. The staleness checks read none, so an answer to a commit sent before a rejoin, delivered after it, read as news about the current generation and ran a lost-membership round: `onPartitionsLost`, discarded uncommitted offsets and an extra join. The checks now read that record through the wrapper's `cause` chain, so such an answer is dropped as stale; an `ILLEGAL_GENERATION` for the generation the member holds still ends its membership.
+
 - Under `groupProtocol: 'consumer'`, a heartbeat answer, success or fencing error, to a request built before the member began joining anew is discarded. It no longer installs the old epoch over the join's zero, settles the join, or fences it, so the member sends its epoch-0 heartbeat after a fencing it learned from an offset commit.
 
 - Under `groupProtocol: 'consumer'`, assigned topics outside the round subscription are filtered without `RECEIVED_UNSUBSCRIBED_TOPICS` or its warning; a debug message records them. Classic behavior is unchanged.
