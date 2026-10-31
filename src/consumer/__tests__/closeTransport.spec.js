@@ -219,6 +219,21 @@ describe.each([true, false])(
       return consumer
     }
     const entry = () => shared.groupRegistry.entries.get(GROUP)
+    /**
+     * @param {import('../offsetManager/offsetOperations')} ledger
+     * @returns {Promise<void>} resolves when no ticket is open: at once, or as the last one ends
+     */
+    const settled = (ledger) =>
+      new Promise((resolve) => {
+        if (ledger.openTickets === 0) return resolve()
+        const end = ledger.end
+        ledger.end = function (ticket) {
+          end.call(this, ticket)
+          if (this.openTickets > 0) return
+          ledger.end = end
+          resolve()
+        }
+      })
 
     test('a held temporary start is asked to stop first, so it joins nothing once it is released', async () => {
       await open()
@@ -254,10 +269,33 @@ describe.each([true, false])(
       await disposeConsumer(borrowed)
 
       expect(entry().holders.size).toBe(holders)
+      await settled(entry().ledger)
       expect(entry().ledger.openTickets).toBe(0)
       expect(shared.isConnected()).toBe(true)
       await expect(peer.commitOffsets([{ ...CELL, offset: '3' }])).resolves.toBeUndefined()
       expect(rig.frames('OffsetCommit').length).toBeGreaterThan(0)
+    })
+
+    test('disposal does not wait for an answer it abandoned, and the ticket of that answer ends when it lands', async () => {
+      await open()
+      const borrowed = rig.consumer({ groupId: GROUP })
+      await borrowed.connect()
+      await borrowed.subscribe({ topic: TOPIC, fromBeginning: true })
+      const fetched = rig.hold('OffsetFetch')
+      await borrowed.run({ autoCommit: false, eachMessage: async () => {} })
+      await until(() => fetched.hits === 1, 'the held offset fetch')
+      const { ledger } = entry()
+      const commits = rig.frames('OffsetCommit').length
+
+      await disposeConsumer(borrowed)
+      expect(ledger.openTickets).toBe(1)
+
+      fetched.release()
+      await settled(ledger)
+      expect(ledger.openTickets).toBe(0)
+      expect(rig.frames('OffsetFetch')).toHaveLength(1)
+      expect(rig.frames('OffsetCommit')).toHaveLength(commits)
+      expect(shared.isConnected()).toBe(true)
     })
 
     test('the last release of the shared cluster retires the paired cache and ledger', async () => {
