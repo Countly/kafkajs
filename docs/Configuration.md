@@ -286,6 +286,12 @@ authentication mechanism.
 
 `groupId` is required for consumer subscription and group offset APIs. A consumer that only uses [manual assignment](Consuming.md#manual-assignment) may omit it or pass undefined; its offset state is private, automatic commits default to false and explicit autoCommit true rejects. Null, empty and non-string group IDs reject at construction. Configure this option on `kafka.consumer()`. Manual assignment uses no membership protocol, even when a group protocol option is configured.
 
+## Rack-aware assignment and rebalance listeners
+
+`rackAwareAssignment: true` on a consumer makes the local `range` assigner match replica racks within its quotas when this member leads the group. It needs `rackId` on the members and `broker.rack` on the brokers; the other local assigners ignore it, and the default is `false`. See [Consuming](Consuming.md#options).
+
+`consumer.run({ rebalanceListener })` takes optional awaited `onPartitionsRevoked`, `onPartitionsAssigned` and `onPartitionsLost` hooks. It is a `run` option, not a constructor option, and it needs a group. See [Awaited rebalance listeners](Consuming.md#rebalance-listeners).
+
 ## Connection Timeout
 
 Time in milliseconds to wait for a successful connection. The default value is: `1000`.

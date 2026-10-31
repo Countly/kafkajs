@@ -97,6 +97,7 @@ const PER_PARTITION = 10
 const COMMITTED = '6'
 const WAIT_BUDGET = { attempts: 240, delay: 250 } // 60 s
 const QUIET_MS = 1500
+const DISCOVERY_WAIT = { attempts: 80, delay: 250 } // 20 s
 const CASE_BUDGET_MS = 90000
 const DISCONNECT_BUDGET_MS = 15000
 const CODEC_CASE_BUDGET_MS = 180000 // five arms of setup, send, read and cleanup
@@ -267,6 +268,17 @@ const fakeArm = async (codec) => {
   const { messages } = await decodeField(recordsField(...batches.map(({ bytes }) => bytes)))
   return armOf(codec, batches, messages)
 }
+
+/**
+ * A delivery reduced to what the corpus compares: where it came from and its value.
+ * @param {{ topic: string, partition: number, message: { value: Buffer|null } }} delivery an `eachMessage` payload
+ * @returns {{ topic: string, partition: number, value: string }}
+ */
+const identityOf = ({ topic, partition, message }) => ({
+  topic,
+  partition,
+  value: String(message.value),
+})
 
 describe('Floor core expectations', () => {
   test('the expected version is the highest implemented one inside the offered range', () => {
@@ -902,6 +914,173 @@ describeFloor('Kafka floor core (live)', () => {
     CODEC_CASE_BUDGET_MS
   )
 
+  test.each([true, false])(
+    'manual assignment round trips with group offsets enabled %s',
+    async (withGroup) => {
+      const topic = await freshTopic('manual-consumer')
+      const groupId = `floor-manual-${secureRandom()}`
+      const corpus = ['one', 'two'].map((value) => ({ topic, partition: 0, value }))
+      const producer = await connected(kafka.producer())
+      await producer.send({
+        topic,
+        messages: corpus.map(({ partition, value }) => ({ partition, value })),
+      })
+      const consumer = await connected(kafka.consumer(withGroup ? { groupId } : {}))
+      const apiNames = []
+      const remove = consumer.on(consumer.events.REQUEST, ({ payload }) =>
+        apiNames.push(payload.apiName)
+      )
+      const delivered = []
+      const evidence = { case: 'consumer-manual', withGroup, delivered, apiNames, committed: null }
+      try {
+        await consumer.assign([{ topic, partitions: [0] }], { offsetReset: 'earliest' })
+        await consumer.run({
+          autoCommit: false,
+          eachMessage: async (payload) => delivered.push(identityOf(payload)),
+        })
+        expect(await waitForCondition(() => delivered.length === corpus.length, WAIT_BUDGET)).toBe(
+          true
+        )
+        expect(consumer.assignment()).toEqual([{ topic, partitions: [0] }])
+        if (withGroup) {
+          await consumer.commitOffsets([{ topic, partition: 0, offset: '2' }])
+          const [offsets] = await admin.fetchOffsets({ groupId, topics: [topic] })
+          evidence.committed = offsets.partitions[0].offset
+        }
+        await consumer.stop()
+        expect(await waitForCondition(() => apiNames.includes('Fetch'), WAIT_BUDGET)).toBe(true)
+        const named = (names) => apiNames.filter((name) => names.includes(name))
+
+        expect(delivered).toEqual(corpus)
+        expect(evidence.committed).toBe(withGroup ? '2' : null)
+        expect(
+          named(['JoinGroup', 'SyncGroup', 'Heartbeat', 'LeaveGroup', 'ConsumerGroupHeartbeat'])
+        ).toEqual([])
+        if (!withGroup) expect(named(['OffsetFetch', 'OffsetCommit'])).toEqual([])
+      } finally {
+        writeEvidence(EVIDENCE, evidence)
+        remove()
+        await consumer.stop()
+      }
+    },
+    CASE_BUDGET_MS
+  )
+
+  test(
+    'an awaited assignment listener holds delivery until it completes',
+    async () => {
+      const topic = await freshTopic('listener-consumer')
+      const corpus = [{ topic, partition: 0, value: 'one' }]
+      const producer = await connected(kafka.producer())
+      await producer.send({ topic, messages: [{ partition: 0, value: 'one' }] })
+      const consumer = await connected(
+        kafka.consumer({ groupId: `floor-listener-${secureRandom()}` })
+      )
+      let release
+      const held = new Promise((resolve) => {
+        release = resolve
+      })
+      const delivered = []
+      const evidence = {
+        case: 'consumer-listener',
+        entered: 0,
+        completed: 0,
+        earlyDeliveries: 0,
+        heldCompleted: null,
+        heldDelivered: null,
+        delivered,
+      }
+      let settled
+      try {
+        await consumer.subscribe({ topic, fromBeginning: true })
+        settled = consumer
+          .run({
+            autoCommit: false,
+            rebalanceListener: {
+              onPartitionsAssigned: async () => {
+                evidence.entered += 1
+                await held
+                evidence.completed += 1
+              },
+            },
+            eachMessage: async (payload) => {
+              if (evidence.completed === 0) evidence.earlyDeliveries += 1
+              delivered.push(identityOf(payload))
+            },
+          })
+          .then(
+            () => null,
+            (error) => error
+          )
+        expect(await waitForCondition(() => evidence.entered > 0, WAIT_BUDGET)).toBe(true)
+        await sleep(QUIET_MS)
+        evidence.heldCompleted = evidence.completed
+        evidence.heldDelivered = [...delivered]
+        release()
+        expect(await settled).toBeNull()
+        expect(await waitForCondition(() => delivered.length === corpus.length, WAIT_BUDGET)).toBe(
+          true
+        )
+        await consumer.stop()
+
+        expect(evidence.heldCompleted).toBe(0)
+        expect(evidence.heldDelivered).toEqual([])
+        expect(evidence.earlyDeliveries).toBe(0)
+        expect(evidence.entered).toBe(1)
+        expect(delivered).toEqual(corpus)
+      } finally {
+        writeEvidence(EVIDENCE, evidence)
+        release()
+        if (settled) await settled
+        await consumer.stop()
+      }
+    },
+    CASE_BUDGET_MS
+  )
+
+  test(
+    'a pattern consumer discovers a matching topic created after delivery starts',
+    async () => {
+      const first = await freshTopic('regex-consumer')
+      const second = `${first}-next`
+      const corpus = [
+        { topic: first, partition: 0, value: 'first' },
+        { topic: second, partition: 0, value: 'second' },
+      ]
+      const producer = await connected(kafka.producer())
+      const consumer = await connected(
+        kafka.consumer({
+          groupId: `floor-regex-${secureRandom()}`,
+          metadataMaxAge: 1000,
+          allowAutoTopicCreation: false,
+        })
+      )
+      const delivered = []
+      const evidence = { case: 'consumer-regex', delivered, discovered: false }
+      try {
+        await producer.send({ topic: first, messages: [{ partition: 0, value: 'first' }] })
+        await consumer.subscribe({ topic: new RegExp(`^${first}(?:-next)?$`), fromBeginning: true })
+        await consumer.run({
+          autoCommit: false,
+          eachMessage: async (payload) => delivered.push(identityOf(payload)),
+        })
+        expect(await waitForCondition(() => delivered.length === 1, WAIT_BUDGET)).toBe(true)
+        await createTopic({ topic: second, partitions: 1, replicas: 3 })
+        topics.push(second)
+        await producer.send({ topic: second, messages: [{ partition: 0, value: 'second' }] })
+        evidence.discovered = await waitForCondition(() => delivered.length === 2, DISCOVERY_WAIT)
+        await consumer.stop()
+
+        expect(evidence.discovered).toBe(true)
+        expect(delivered).toEqual(corpus)
+      } finally {
+        writeEvidence(EVIDENCE, evidence)
+        await consumer.stop()
+      }
+    },
+    CASE_BUDGET_MS
+  )
+
   test('every evidence line of this run carries the stamps a verifier checks', () => {
     const lines = evidenceLines(EVIDENCE).slice(linesBefore)
     const verified = {
@@ -911,8 +1090,31 @@ describeFloor('Kafka floor core (live)', () => {
     }
 
     expect(lines.map(({ case: name }) => name)).toEqual(
-      expect.arrayContaining(['F01', 'F02', 'F03', 'F04', 'F05', 'F06', 'F07-capability'])
+      expect.arrayContaining([
+        'F01',
+        'F02',
+        'F03',
+        'F04',
+        'F05',
+        'F06',
+        'F07-capability',
+        'consumer-listener',
+        'consumer-regex',
+      ])
     )
+    const ofCase = (name) => lines.filter(({ case: line }) => line === name)
+    expect(
+      ofCase('consumer-manual')
+        .map(({ withGroup, delivered, committed }) => [withGroup, delivered.length, committed])
+        .sort()
+    ).toEqual([
+      [false, 2, null],
+      [true, 2, '2'],
+    ])
+    expect(ofCase('consumer-listener')).toEqual([
+      expect.objectContaining({ heldCompleted: 0, heldDelivered: [], earlyDeliveries: 0 }),
+    ])
+    expect(ofCase('consumer-regex')).toEqual([expect.objectContaining({ discovered: true })])
     expect(lines.filter(({ case: name }) => name === 'F08')).toHaveLength(f08.length)
     for (const line of lines) expect(problemsOf(line, verified)).toEqual([])
   })

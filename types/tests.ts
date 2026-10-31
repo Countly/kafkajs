@@ -1474,6 +1474,37 @@ import {
   hookConsumer.enforceRebalance(5)
 }
 
+import {
+  ConsumerAssignOptions,
+  ConsumerCommittedOffset,
+  ConsumerOffsetReset,
+  ConsumerPartitionHaltedBase,
+  ConsumerRebalancePayload,
+} from './index'
+{
+  const resets: ConsumerOffsetReset[] = ['earliest', 'latest', 'none', 'by_duration:PT10M']
+  const assignOptions: ConsumerAssignOptions = { fromBeginning: true, offsetReset: resets[0] }
+  const payload: ConsumerRebalancePayload = { groupId: 'g', memberId: null, generationId: null, partitions: [] }
+  const base: ConsumerPartitionHaltedBase = { groupId: null, memberId: '', topic: 't', partition: 0 }
+  const row: ConsumerCommittedOffset = { topic: 't', partition: 0, offset: null, metadata: null }
+  const offset: string | null = row.offset
+  const metadata: string | null = row.metadata
+  const listenerFailure = new ListenerFailure('callback', {
+    hook: 'onPartitionsRevoked',
+    reason: 'timeout',
+    cause: new Error(),
+  })
+  const hook: 'onPartitionsRevoked' | 'onPartitionsAssigned' | 'onPartitionsLost' = listenerFailure.hook
+  const reason: 'threw' | 'timeout' = listenerFailure.reason
+  const name: string = listenerFailure.name
+  void [resets, assignOptions, payload, base, offset, metadata, hook, reason, name]
+  // @ts-expect-error a reset policy outside the declared forms
+  const invalidReset: ConsumerOffsetReset = 'sometimes'
+  // @ts-expect-error the duration form needs its prefix
+  const invalidDuration: ConsumerOffsetReset = 'PT10M'
+  void [invalidReset, invalidDuration]
+}
+
 /**
  * Checks bounded consumer close without changing the legacy signal signature.
  * @param target consumer whose overloads are checked

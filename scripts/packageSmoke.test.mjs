@@ -105,3 +105,30 @@ test('the awaited callback error has the same constructor in both entry points',
   assert.equal(error.cause, cause)
   assert.equal(error.thrownValue, cause)
 })
+
+test('the awaited callback error is a non-retriable error that carries its hook and reason', () => {
+  const { KafkaJSRebalanceListenerError, KafkaJSNonRetriableError } = require(PKG)
+  const cause = new Error('hook timed out')
+  const error = new KafkaJSRebalanceListenerError('failed', { hook: 'onPartitionsLost', reason: 'timeout', cause })
+  assert.equal(error instanceof KafkaJSNonRetriableError, true)
+  assert.equal(error.retriable, false)
+  assert.equal(error.hook, 'onPartitionsLost')
+  assert.equal(error.reason, 'timeout')
+})
+
+test('the packed consumer has the manual-assignment methods and validates its group identity and options', async () => {
+  const { Kafka, KafkaJSNonRetriableError, logLevel } = require(PKG)
+  const kafka = new Kafka({ brokers: ['localhost:9092'], logLevel: logLevel.NOTHING })
+  const direct = kafka.consumer({})
+  for (const name of ['assign', 'unsubscribe', 'assignment', 'subscription', 'position', 'committed', 'enforceRebalance']) {
+    assert.equal(typeof direct[name], 'function', name)
+  }
+  assert.equal(kafka.consumer({ groupId: undefined }).assignment().length, 0)
+  for (const groupId of ['', null]) {
+    assert.throws(() => kafka.consumer({ groupId }), KafkaJSNonRetriableError)
+  }
+  assert.throws(() => kafka.consumer({ groupId: 'g', fetchSessions: 'yes' }), KafkaJSNonRetriableError)
+  assert.throws(() => kafka.consumer({ groupId: 'g', rackAwareAssignment: 'yes' }), KafkaJSNonRetriableError)
+  await assert.rejects(direct.subscribe({ topic: 't' }), KafkaJSNonRetriableError)
+  await assert.rejects(direct.committed([]), KafkaJSNonRetriableError)
+})
