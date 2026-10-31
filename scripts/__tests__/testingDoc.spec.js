@@ -264,10 +264,11 @@ describe('documented offset ordering, shared state and telemetry containment', (
     expect(recreation).toContain(
       'The reset stays owed for a partition until an offset for the new topic is durably committed for it and that commit is confirmed against the new incarnation'
     )
-    expect(recreation).toContain('A `ListOffsets` request that fails')
-    expect(recreation).toContain("the consumer's automatic restart after a crash all leave it owed")
-    expect(recreation).toContain('`consumer.disconnect()` drops it')
-    expect(recreation).toContain('a seek or commit for the new topic is never undone by it')
+    expect(recreation).toContain('a `ListOffsets` request that fails')
+    expect(recreation).toContain('Resolving or seeking locally does not settle it')
+    expect(recreation).toContain("the consumer's automatic restart after a crash")
+    expect(recreation).toContain('`consumer.disconnect()` drops the debt')
+    expect(recreation).toContain('a later seek or commit for the new topic is never undone by it')
   })
   it('orders offset operations by when they began', () => {
     expect(recreation).toContain('ordered by when they began, not by when their answers arrive')
