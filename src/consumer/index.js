@@ -407,11 +407,12 @@ module.exports = (params) => {
    * Runs a public call's work under its own deadline scope and releases the scope however it ends.
    * @template T
    * @param {(operation: ConsumerOperation) => T|Promise<T>} work the call's body
+   * @param {ControlLifetime} [owned] the lifetime the call belongs to, the current one by default
    * @returns {Promise<T>} the body's result, or the scope's refusal if it expired first
    * @throws {Error} the body's failure or the scope's refusal
    */
-  const withinCall = async (work) => {
-    const { calls } = life
+  const withinCall = async (work, owned = life) => {
+    const { calls } = owned
     const operation = beginCall(calls)
     try {
       return await operation.wait(() => work(operation))
@@ -841,20 +842,26 @@ module.exports = (params) => {
    * declarations back as they were.
    * @param {Array<string|RegExp>} subscriptions the validated names and patterns of the call
    * @param {{kind: string, durationMs?: number}} policy the call's normalized reset policy
+   * @param {ControlLifetime} owned the lifetime the call began under; once its close is forced the
+   *   refresh stops, nothing reconnects and the targets are not replaced
    * @returns {Promise<void>}
-   * @throws {Error} the refresh's own failure
+   * @throws {Error} the refresh's own failure, or the close's refusal
    */
-  const declarePatterns = async (subscriptions, policy) => {
+  const declarePatterns = async (subscriptions, policy, owned) => {
     const checkpoint = declared.checkpoint()
     declared.add({ topics: subscriptions, policy })
     cluster.useConsumerMetadataScope(declared)
 
     try {
       await cluster.refreshMetadata({
+        fence: owned.fence,
         metadataScope: declared,
         onMetadata: (metadata) => declared.evaluate(metadata),
       })
-      await cluster.resetTargetTopics([])
+      const replaced = await cluster.resetTargetTopics([], {
+        isCurrent: () => !owned.fence.closed,
+      })
+      if (!replaced) owned.fence.check()
     } catch (error) {
       declared.restore(checkpoint)
       if (!declared.hasPatterns()) cluster.releaseConsumerMetadataScope(declared)
@@ -886,8 +893,12 @@ module.exports = (params) => {
   }
 
   /**
+   * A subscription that reaches the cluster belongs to the control lifetime it starts under: once a
+   * forced close retires that lifetime, the call stops, so it neither reconnects nor changes the
+   * targets afterwards.
    * @type {import("../../types").Consumer["subscribe"]}
-   * @throws {Error} `CONSUMER_STOPPING` from a handler of a retired run
+   * @throws {Error} `CONSUMER_STOPPING` from a handler of a retired run, or when a forced close
+   *   ended the call's lifetime meanwhile
    */
   const subscribe = async (subscription = {}) => {
     refuseFromHook('subscribe')
@@ -954,6 +965,7 @@ module.exports = (params) => {
       }
     }
 
+    const owned = acquireLife()
     if (!subscriptions.some((entry) => entry instanceof RegExp) && !declared.hasPatterns()) {
       declared.add({ topics: subscriptions, policy: resetPolicy })
       for (const t of subscriptions) {
@@ -961,7 +973,7 @@ module.exports = (params) => {
       }
 
       try {
-        await cluster.addMultipleTargetTopics(subscriptions)
+        await cluster.addMultipleTargetTopics(subscriptions, { fence: owned.fence })
         for (const name of subscriptions) unregisteredTopics.delete(name)
       } catch (error) {
         if (!isConsumerProtocol || error.type !== 'UNKNOWN_TOPIC_OR_PARTITION') throw error
@@ -970,7 +982,7 @@ module.exports = (params) => {
       return
     }
 
-    await declarePatterns(subscriptions, resetPolicy)
+    await declarePatterns(subscriptions, resetPolicy, owned)
   }
 
   /**
@@ -1554,9 +1566,15 @@ module.exports = (params) => {
    * together. Topics that left the selection lose their recreation debt, queued seeks and private
    * offsets; the selected ones keep them. A rejected or superseded candidate changes nothing, so
    * the previous selection stays usable. Exclusive with a subscription until `unsubscribe()`.
+   *
+   * The call belongs to the control lifetime it starts under, after any close already running has
+   * settled, so it is one of that lifetime's calls in flight: a forced close ends it with the
+   * close's refusal, and nothing it was still waiting for (a broker, a connection, the Metadata
+   * write, the target lock) reconnects or publishes afterwards.
    * @type {import("../../types").Consumer["assign"]}
    * @throws {KafkaJSNonRetriableError} for malformed input, a running consumer, an active
    *   subscription, an unknown partition, or a candidate superseded while it was validated
+   * @throws {Error} `CONSUMER_STOPPING` when a forced close ended its lifetime meanwhile
    */
   const assign = async (topicPartitions, options) => {
     refuseRetiredCaller()
@@ -1591,51 +1609,60 @@ module.exports = (params) => {
     const first = refusal()
     if (first) throw first
 
-    const revision = selectionRevision
-    const ticket = declared.captureMetadata()
-    const stale = () =>
-      refusal() ||
-      (revision !== selectionRevision || !ticket.isCurrent()
-        ? new KafkaJSNonRetriableError('The assignment was superseded while it was validated')
-        : null)
+    const waiting = earlierClose()
+    if (waiting) await waiting
+    const owned = acquireLife()
+    return withinCall(async (operation) => {
+      const revision = selectionRevision
+      const ticket = declared.captureMetadata()
+      const stale = () =>
+        refusal() ||
+        operation.guard() ||
+        owned.fence.guard() ||
+        (revision !== selectionRevision || !ticket.isCurrent()
+          ? new KafkaJSNonRetriableError('The assignment was superseded while it was validated')
+          : null)
 
-    const metadata = await cluster.stageMetadata({ topics: names, guard: stale })
-    for (const { topic, partitions: wanted } of partitions) {
-      const known = new Set(
-        metadata.topicMetadata
-          .filter((entry) => entry.topic === topic)
-          .flatMap((entry) => entry.partitionMetadata.map(({ partitionId }) => partitionId))
-      )
-      const unknown = wanted.filter((partition) => !known.has(partition))
-      if (unknown.length > 0) {
-        throw new KafkaJSNonRetriableError(`Topic ${topic} has no partition ${unknown.join(', ')}`)
-      }
-    }
-
-    const published = await cluster.resetTargetTopics(names, {
-      isCurrent: () => stale() === null,
-      publish: () => {
-        declared.retireMetadata()
-        manual = {
-          partitions,
-          configurations: Subscription.configurationsOf({
-            topicConfigurations: new Map(
-              names.map((name) => [name, { fromBeginning, offsetReset: resetPolicy }])
-            ),
-          }),
-        }
-        for (const [key, { topic, partition }] of queuedSeeks) {
-          const selected = partitions.some(
-            (row) => row.topic === topic && row.partitions.includes(partition)
+      const metadata = await cluster.stageMetadata({ topics: names, guard: stale })
+      for (const { topic, partitions: wanted } of partitions) {
+        const known = new Set(
+          metadata.topicMetadata
+            .filter((entry) => entry.topic === topic)
+            .flatMap((entry) => entry.partitionMetadata.map(({ partitionId }) => partitionId))
+        )
+        const unknown = wanted.filter((partition) => !known.has(partition))
+        if (unknown.length > 0) {
+          throw new KafkaJSNonRetriableError(
+            `Topic ${topic} has no partition ${unknown.join(', ')}`
           )
-          if (!selected) queuedSeeks.delete(key)
         }
-        retainTopics(new Set(names))
-        lastJoin = null
-        selectionRevision++
-      },
-    })
-    if (published === false) throw stale() || consumerStoppingError()
+      }
+
+      const published = await cluster.resetTargetTopics(names, {
+        isCurrent: () => stale() === null,
+        publish: () => {
+          declared.retireMetadata()
+          manual = {
+            partitions,
+            configurations: Subscription.configurationsOf({
+              topicConfigurations: new Map(
+                names.map((name) => [name, { fromBeginning, offsetReset: resetPolicy }])
+              ),
+            }),
+          }
+          for (const [key, { topic, partition }] of queuedSeeks) {
+            const selected = partitions.some(
+              (row) => row.topic === topic && row.partitions.includes(partition)
+            )
+            if (!selected) queuedSeeks.delete(key)
+          }
+          retainTopics(new Set(names))
+          lastJoin = null
+          selectionRevision++
+        },
+      })
+      if (published === false) throw stale() || consumerStoppingError()
+    }, owned)
   }
 
   /**

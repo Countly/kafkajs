@@ -1805,8 +1805,9 @@ module.exports = class ConsumerGroup {
    * Precedence with `seek()`: a seek pending here (queued but not yet applied) targets the
    * *old* incarnation and is dropped along with everything else, via `seekOffset.deleteTopic()`.
    * A seek issued *after* this call returns, applied in the same `seekOffsets()` cycle, targets
-   * the current incarnation and wins over the reset for that partition: an applied seek settles
-   * the partition's obligation (`OffsetOperations#apply`).
+   * the current incarnation and wins over the reset for that partition's local position; the
+   * obligation itself settles only when a confirmed current-incarnation commit is applied
+   * (`OffsetOperations#apply`), which a seek makes only with auto-commit on.
    *
    * @param {string} topic
    * @returns {void}
@@ -3379,8 +3380,9 @@ module.exports = class ConsumerGroup {
    * Applies every pending `seek()` for the given topic/partitions, then resolves offsets for the
    * rest. A seek applied here that lands on a topic with a pending recreation reset (set by
    * `invalidateTopic()` earlier in this same fetch cycle) wins over that reset for its own
-   * partition: an applied seek settles the partition's reset obligation (a sentinel seek once its
-   * boundary is published). An applied seek also clears the partition's halt, which is how an
+   * partition for its local position; the reset obligation settles only when a confirmed
+   * current-incarnation commit is applied, so a seek with auto-commit off or a sentinel boundary
+   * leaves it owed. An applied seek also clears the partition's halt, which is how an
    * application resumes a halted partition.
    *
    * A resolution that dropped an answer (a seek, commit or recreation reached the cell while the

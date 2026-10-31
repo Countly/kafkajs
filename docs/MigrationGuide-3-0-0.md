@@ -488,10 +488,11 @@ says so, `groupProtocol: 'consumer'`.
   say so. Now a metadata refresh that sees a subscribed topic come back with a different topic id
   emits `TOPIC_RECREATED`, drops the client's cached state for that topic, and resolves that
   topic's next offsets from the boundary the subscription configured (`fromBeginning`) instead of
-  from the coordinator's committed offset. The reset is **one-shot** — it applies at the first
-  offset resolution after the recreation and then stops, so offsets committed against the *new*
-  incarnation are never discarded — and it is per that subscription's `fromBeginning`, not a global
-  reset. Partitions you paused stay paused across a recreation, because pausing is user intent
+  from the coordinator's committed offset. The reset stays owed per partition until a confirmed commit of an offset for the *new*
+  incarnation settles it (a local resolution, or a seek with `autoCommit` off, does not), so a stop/run,
+  a crash restart or an assignment rebuild before that commit resolves the reset again instead of
+  resuming the old topic's offset; offsets committed against the *new* incarnation are never
+  discarded — and it is per that subscription's `fromBeginning`, not a global reset. Partitions you paused stay paused across a recreation, because pausing is user intent
   rather than offset state. There is no opt-out. An application that relied on offsets surviving a
   topic recreation must stop relying on it; it was never a guarantee the broker made.
   A reset observed while crash cleanup or `restartOnFailure` is pending is kept for the next run. A public disconnect clears the pending resets and removes the listener. The group's shared cache and ledger remain while another participant, attached reset table or open operation still needs them; after the last lifetime ends, both entries are released.

@@ -651,8 +651,9 @@ module.exports = class Cluster {
    * @public
    * @param {object} options
    * @param {string[]} options.topics the names to describe
-   * @param {() => Error|null} [options.guard] a caller's currentness check, evaluated before the
-   *   request is written and after it answers; its refusal replaces the answer
+   * @param {() => Error|null} [options.guard] a caller's currentness check, evaluated before every
+   *   attempt, broker connection and request write and after the answer; its refusal replaces the
+   *   answer and any failure of the attempt, so a refused caller never reconnects or retries
    * @returns {Promise<import("../../types").BrokerMetadata>} the decoded snapshot
    * @throws {Error} the guard's refusal, or the last broker error once the retry budget is spent
    */
@@ -661,18 +662,25 @@ module.exports = class Cluster {
       const before = guard?.()
       if (before) return bail(before)
 
-      const brokers = Object.values(this.brokerPool.brokers)
-      const broker =
-        brokers.find((candidate) => candidate.isConnected()) ||
-        brokers[0] ||
-        this.brokerPool.seedBroker
-      if (!broker) throw new KafkaJSBrokerNotFound('No broker available for staged metadata')
+      try {
+        const brokers = Object.values(this.brokerPool.brokers)
+        const broker =
+          brokers.find((candidate) => candidate.isConnected()) ||
+          brokers[0] ||
+          this.brokerPool.seedBroker
+        if (!broker) throw new KafkaJSBrokerNotFound('No broker available for staged metadata')
 
-      await broker.connect()
-      const metadata = await broker.metadata(topics, { guard: guard && (() => guard()) })
-      const after = guard?.()
-      if (after) return bail(after)
-      return metadata
+        const brokerGuard = guard && (() => guard())
+        await broker.connect({ guard: brokerGuard })
+        const metadata = await broker.metadata(topics, { guard: brokerGuard })
+        const after = guard?.()
+        if (after) return bail(after)
+        return metadata
+      } catch (error) {
+        const refusal = guard?.()
+        if (refusal) return bail(refusal)
+        throw error
+      }
     })
   }
 

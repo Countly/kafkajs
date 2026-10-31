@@ -260,9 +260,9 @@ describe('documented offset ordering, shared state and telemetry containment', (
     consuming.indexOf('<a name="topic-metadata"></a>')
   )
   const otelReadme = read('otel', 'README.md')
-  it('keeps a recreation reset owed until an offset for the new topic is applied', () => {
+  it('keeps a recreation reset owed until a confirmed commit for the new topic', () => {
     expect(recreation).toContain(
-      'The reset stays owed for a partition until an offset for the new topic is applied to it'
+      'The reset stays owed for a partition until an offset for the new topic is durably committed for it and that commit is confirmed against the new incarnation'
     )
     expect(recreation).toContain('A `ListOffsets` request that fails')
     expect(recreation).toContain("the consumer's automatic restart after a crash all leave it owed")

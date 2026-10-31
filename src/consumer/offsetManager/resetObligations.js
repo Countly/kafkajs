@@ -3,9 +3,11 @@
  *
  * Owned by the `Consumer` and shared by reference with every `ConsumerGroup` and `OffsetManager`
  * it builds, so an obligation survives the rebuilds a rebalance or a crash restart causes. An
- * obligation is not consumed by reading it: a partition settles only when a write, seek, commit or
- * publication is applied to it, so a failed ListOffsets or a dropped answer leaves it owed. Only a
- * user disconnect, through `clear()`, ends the obligations.
+ * obligation is not consumed by reading it: a partition settles only when a confirmed
+ * current-incarnation durable commit (an explicit or automatic commit, or a confirmed
+ * transaction's offsets) is applied to it. A local resolution, a seek with auto-commit off, a
+ * sentinel boundary, a failed ListOffsets or a dropped answer leave it owed. Only a user
+ * disconnect, through `clear()`, ends the obligations.
  */
 class ResetObligations {
   constructor() {
@@ -57,8 +59,8 @@ class ResetObligations {
   }
 
   /**
-   * An applied write, seek, commit or publication settled this partition for the new incarnation.
-   * Ignored when both the mutation's topic id and the stamp are known and differ.
+   * A confirmed durable commit settled this partition for the new incarnation. Ignored when both
+   * the mutation's topic id and the stamp are known and differ.
    * @param {string} topic
    * @param {number} partition
    * @param {string} [topicId] the topic id the mutation was made under, when known
