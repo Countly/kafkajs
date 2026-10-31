@@ -9,6 +9,12 @@
 const fs = require('node:fs')
 const { ENDPOINT_BYTES, SLOPE_BYTES_PER_MINUTE, median, slope } = require('./bounds')
 
+/** The numeric level of WARN; ERROR is below it. */
+const LOG_WARN = 2
+
+/** Client log lines kept in memory to name a loss's earlier window. */
+const RECENT_LINES = 500
+
 /** Traversal steps between two event-loop yields while a journal is checked. */
 const YIELD_EVERY = 4096
 
@@ -697,6 +703,98 @@ class ChurnJournal {
 }
 
 /**
+ * The client's WARN and ERROR log lines, kept as evidence beside the journal. Each line is one JSON
+ * object in a bounded file; a `loss` is pointed at the lines of its group within `windowMs` of it.
+ * Nothing below WARN is kept, and memory holds only the recent lines and the unsettled losses.
+ */
+class ChurnClientLog {
+  /**
+   * @param {object} options
+   * @param {string} options.file the JSON-lines file, created or truncated
+   * @param {number} [options.maxLines=5000] lines written to the file; later ones are only counted
+   * @param {number} [options.windowMs=5000] how close a line is to a loss to be named by it
+   * @param {() => number} [options.wall=Date.now] wall-clock milliseconds, as log timestamps are
+   * @param {typeof fs} [options.files=fs]
+   */
+  constructor({ file, maxLines = 5000, windowMs = 5000, wall = Date.now, files = fs }) {
+    Object.assign(this, { file, maxLines, windowMs, wall, files })
+    this.fd = files.openSync(file, 'w', 0o600)
+    this.written = 0
+    this.dropped = 0
+    this.recent = []
+    this.pending = []
+  }
+
+  /** @returns {(level: number) => (entry: object) => void} a `logCreator` writing into this log */
+  creator() {
+    return () => (entry) => this.add(entry)
+  }
+
+  /** @param {{ namespace: string, level: number, log: object }} entry a client log entry; INFO and DEBUG are ignored */
+  add({ namespace, level, log }) {
+    if (level > LOG_WARN) return
+    const { message, memberId, groupId, generationId, error, errorCode, timestamp } = log
+    const at = Date.parse(timestamp) || this.wall()
+    const line = {
+      at,
+      member: memberId,
+      group: groupId,
+      generation: generationId,
+      namespace,
+      message,
+      errorType: typeof error === 'object' && error !== null ? error.name : undefined,
+      errorCode: errorCode ?? error?.code ?? error?.type,
+    }
+    if (typeof error === 'string') line.error = error.slice(0, 200)
+    if (this.written < this.maxLines && this.fd !== null) {
+      this.files.writeSync(this.fd, `${JSON.stringify(line)}\n`)
+      this.written += 1
+    } else this.dropped += 1
+    this.recent.push(line)
+    if (this.recent.length > RECENT_LINES) this.recent.shift()
+    for (const loss of this.pending) this.#match(loss, line)
+  }
+
+  /**
+   * Starts the pointer of a lost round: the lines of its group in the window before it, and then those
+   * that arrive in the window after it.
+   * @param {{ group: string, member: string }} loss
+   */
+  noteLoss({ group, member }) {
+    const at = this.wall()
+    const loss = { group, member, at, count: 0, first: [] }
+    for (const line of this.recent) this.#match(loss, line)
+    this.pending.push(loss)
+  }
+
+  #match(loss, line) {
+    if (line.group !== loss.group || Math.abs(line.at - loss.at) > this.windowMs) return
+    loss.count += 1
+    if (loss.first.length < 3) loss.first.push(line.message)
+  }
+
+  /**
+   * @param {boolean} [all=false] settle losses whose window is still open too
+   * @returns {Array<{ group: string, member: string, at: number, count: number, first: string[] }>}
+   *   the pointers whose window has closed, each returned once
+   */
+  settle(all = false) {
+    const now = this.wall()
+    const done = this.pending.filter((loss) => all || now - loss.at > this.windowMs)
+    this.pending = this.pending.filter((loss) => !done.includes(loss))
+    return done
+  }
+
+  /** @returns {void} closes the file once */
+  close() {
+    if (this.fd === null) return
+    const { fd } = this
+    this.fd = null
+    this.files.closeSync(fd)
+  }
+}
+
+/**
  * Splits a byte stream into length-prefixed frames and reports each one's correlation id.
  */
 class FrameTally {
@@ -1097,6 +1195,7 @@ const publicSocketFactory = () => {
 
 module.exports = {
   CONSUMER_CHURN,
+  ChurnClientLog,
   ChurnDeadline,
   ChurnGroups,
   ChurnJournal,

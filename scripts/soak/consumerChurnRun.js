@@ -48,6 +48,8 @@ class ChurnMember {
    * @param {string} options.phase the measured phase, for the gap series
    * @param {{ now: () => number }} options.clock
    * @param {Map<string, number>} options.handled deliveries seen, by `group|incarnation`
+   * @param {(loss: { group: string, member: string }) => void} [options.onLoss] told when this member
+   *   journals a `loss` round
    * @param {(topic: string) => string|undefined} options.incarnationOf the current incarnation of a
    *   topic; a topic with none is not the profile's and is ignored
    * @param {(topic: string, partition: number, offset: string, incarnation: string) => boolean|Promise<boolean>} options.acknowledged
@@ -64,6 +66,7 @@ class ChurnMember {
     phase,
     clock,
     handled,
+    onLoss,
     incarnationOf,
     acknowledged,
   }) {
@@ -77,6 +80,7 @@ class ChurnMember {
       phase,
       clock,
       handled,
+      onLoss,
       incarnationOf,
       acknowledged,
     })
@@ -163,6 +167,7 @@ class ChurnMember {
   async #left(kind, partitions) {
     if (kind === 'revoke') await this.commitAll().catch(() => {})
     this.#end(kind, partitions)
+    if (kind === 'loss') this.onLoss?.({ group: this.group, member: this.label })
   }
 
   #end(kind, partitions) {
@@ -283,6 +288,8 @@ class ConsumerChurnRun {
    * @param {() => Promise<number>} [options.heap] the double-collected heap
    * @param {typeof CONSUMER_CHURN} [options.settings]
    * @param {number} [options.progressMs=CONSUMER_CHURN.progressMs]
+   * @param {import('./consumerChurn').ChurnClientLog} [options.clientLog] the client's WARN+ lines;
+   *   each `loss` round is recorded as a `loss` evidence row naming the lines near it
    */
   constructor({
     workloads,
@@ -298,6 +305,7 @@ class ConsumerChurnRun {
     heap,
     settings = CONSUMER_CHURN,
     progressMs = CONSUMER_CHURN.progressMs,
+    clientLog,
   }) {
     Object.assign(this, {
       workloads,
@@ -313,6 +321,7 @@ class ConsumerChurnRun {
       heap,
       settings,
       progressMs,
+      clientLog,
     })
     const phases = ['warm-up', ...plan.phases.map(({ name }) => name)]
     this.oracle = new ConsumerChurnOracle(
@@ -430,6 +439,8 @@ class ConsumerChurnRun {
     const failures = []
     for (const step of [
       () => this.workloads.close(),
+      () => this.#recordLosses(true),
+      () => this.clientLog?.close(),
       () => this.journal.close(),
       () => process.off('unhandledRejection', this.onUnhandled),
     ]) {
@@ -473,6 +484,19 @@ class ConsumerChurnRun {
       retained: this.oracle.retained(),
       counts: this.oracle.counts,
     })
+    this.#recordLosses()
+  }
+
+  /** Records each lost round whose client-log window has closed, or every one when `all`. */
+  #recordLosses(all = false) {
+    for (const loss of this.clientLog?.settle(all) ?? [])
+      this.record({
+        kind: 'loss',
+        group: loss.group,
+        member: loss.member,
+        at: loss.at,
+        clientLog: { count: loss.count, first: loss.first },
+      })
   }
 
   /**
@@ -631,9 +655,10 @@ class ChurnWorkloads {
    * @param {object} options.probe a `PublicConsumerProbe`, told about every client built
    * @param {string} options.tag a unique stem for topics and groups
    * @param {ChurnGroups} [options.groups] the group ids of every phase, shared with the run
+   * @param {import('./consumerChurn').ChurnClientLog} [options.clientLog] told of every lost round
    */
-  constructor({ kafka, probe, tag, groups = new ChurnGroups(tag) }) {
-    Object.assign(this, { kafka, probe, tag, groups })
+  constructor({ kafka, probe, tag, groups = new ChurnGroups(tag), clientLog }) {
+    Object.assign(this, { kafka, probe, tag, groups, clientLog })
     this.nonce = 0
     this.clients = new Map()
     this.handled = new Map()
@@ -815,6 +840,7 @@ class ChurnWorkloads {
       phase: context.phase(),
       clock: context.clock,
       handled: this.handled,
+      onLoss: (loss) => this.clientLog?.noteLoss(loss),
       incarnationOf: (name) => this.live.get(name)?.incarnation,
       acknowledged: (name, partition, offset, incarnation) =>
         this.acknowledged(name, partition, offset, incarnation),

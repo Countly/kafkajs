@@ -5,6 +5,7 @@ const path = require('node:path')
 const { KafkaJSCommitFailedError } = require('../../../index')
 const {
   CONSUMER_CHURN,
+  ChurnClientLog,
   ChurnDeadline,
   ChurnGroups,
   ChurnJournal,
@@ -721,6 +722,7 @@ describe('Consumer churn profile > the run', () => {
     heap = async () => 100 * MIB,
     clock = manualClock(),
     journalFeed = corpus,
+    clientLog,
   } = {}) => {
     const order = []
     const lines = []
@@ -758,6 +760,7 @@ describe('Consumer churn profile > the run', () => {
         }),
       },
       journal,
+      clientLog,
       record: (line) => lines.push(line),
       plan,
       clock,
@@ -792,6 +795,46 @@ describe('Consumer churn profile > the run', () => {
     expect(lines.filter(({ kind }) => kind === 'verdict')).toHaveLength(1)
     expect(lines.filter(({ kind }) => kind === 'quiet')).toHaveLength(15)
     expect(verdict.controls.every(({ ok }) => ok)).toBe(true)
+  })
+
+  test('records a lost round with the client log lines near it, and ignores a far or other-group line', async () => {
+    const wall = { at: 100000 }
+    const clientLog = new ChurnClientLog({
+      file: path.join(dir, 'run.clientlog'),
+      wall: () => wall.at,
+    })
+    const warn = (group, message, at) =>
+      clientLog.add({
+        namespace: 'Consumer',
+        level: 2,
+        log: { message, groupId: group, timestamp: new Date(at).toISOString() },
+      })
+    const { run, lines } = build({
+      clientLog,
+      workloads: {
+        memberChurn: async (context) => {
+          corpus(context.journal)
+          warn('g', 'before', 98000)
+          warn('other', 'elsewhere', 100000)
+          warn('g', 'too early', 80000)
+          clientLog.noteLoss({ group: 'g', member: 'm-1' })
+          wall.at += 1000
+          warn('g', 'after', wall.at)
+          wall.at += 10000
+        },
+      },
+    })
+    await run.run()
+    const rows = lines.filter(({ kind }) => kind === 'loss')
+    expect(rows).toEqual([
+      {
+        kind: 'loss',
+        group: 'g',
+        member: 'm-1',
+        at: 100000,
+        clientLog: { count: 2, first: ['before', 'after'] },
+      },
+    ])
   })
 
   test('runs the warm-up before the baseline only when the plan has one', async () => {
@@ -978,6 +1021,7 @@ describe('Consumer churn profile > group identities', () => {
       )
     } finally {
       owner.journal.close()
+      owner.clientLog.close()
     }
   })
 
@@ -1105,5 +1149,91 @@ describe('Consumer churn profile > the quiet point', () => {
     socket.emit('close')
     expect(probe.openSockets()).toBe(0)
     expect(socket.listenerCount('data')).toBe(0)
+  })
+})
+
+describe('Consumer churn profile > client log', () => {
+  let dir
+  beforeEach(() => {
+    dir = fs.mkdtempSync(path.join(process.env.TMPDIR ?? os.tmpdir(), 'churn-clientlog-'))
+  })
+  afterEach(() => fs.rmSync(dir, { recursive: true, force: true }))
+
+  const read = (file) =>
+    fs
+      .readFileSync(file, 'utf8')
+      .split('\n')
+      .filter(Boolean)
+      .map((line) => JSON.parse(line))
+
+  test('a WARN from a churn member lands with member and group; INFO and DEBUG do not', () => {
+    const file = path.join(dir, 'c.clientlog')
+    const clientLog = new ChurnClientLog({ file })
+    const log = clientLog.creator()(2)
+    const base = {
+      namespace: 'ConsumerGroup',
+      log: { groupId: 'g1', memberId: 'm-9', generationId: 4 },
+    }
+    log({
+      ...base,
+      level: 2,
+      log: { ...base.log, message: 'stale', error: { name: 'KafkaJSProtocolError', code: 22 } },
+    })
+    log({ ...base, level: 1, log: { ...base.log, message: 'boom', error: 'text' } })
+    log({ ...base, level: 4, log: { ...base.log, message: 'info' } })
+    log({ ...base, level: 5, log: { ...base.log, message: 'debug' } })
+    clientLog.close()
+    expect(read(file)).toMatchObject([
+      {
+        member: 'm-9',
+        group: 'g1',
+        generation: 4,
+        namespace: 'ConsumerGroup',
+        message: 'stale',
+        errorType: 'KafkaJSProtocolError',
+        errorCode: 22,
+      },
+      { message: 'boom', error: 'text' },
+    ])
+  })
+
+  test('the file and memory stay bounded', () => {
+    const clientLog = new ChurnClientLog({ file: path.join(dir, 'b.clientlog'), maxLines: 3 })
+    for (let index = 0; index < 1200; index++)
+      clientLog.add({ namespace: 'n', level: 2, log: { message: `m${index}`, groupId: 'g' } })
+    clientLog.close()
+    expect(read(path.join(dir, 'b.clientlog'))).toHaveLength(3)
+    expect(clientLog.dropped).toBe(1197)
+    expect(clientLog.recent.length).toBeLessThanOrEqual(500)
+  })
+
+  test('a member tells the log about its loss and not about a revoke', async () => {
+    const onLoss = jest.fn()
+    const handlers = {}
+    const member = new ChurnMember({
+      consumer: {
+        connect: async () => {},
+        subscribe: async () => {},
+        run: async (config) => Object.assign(handlers, config.rebalanceListener),
+        commitOffsets: async () => {},
+        disconnect: async () => {},
+      },
+      admin: {},
+      group: 'g',
+      label: 'm',
+      journal: { append: () => {} },
+      gaps: null,
+      phase: 'p',
+      clock: { now: () => 0 },
+      handled: new Map(),
+      onLoss,
+      incarnationOf: () => 't.1',
+      acknowledged: async () => true,
+    })
+    await member.start(['t'])
+    const partitions = [{ topic: 't', partitions: [0] }]
+    await handlers.onPartitionsRevoked({ partitions })
+    await handlers.onPartitionsLost({ partitions })
+    expect(onLoss.mock.calls).toEqual([[{ group: 'g', member: 'm' }]])
   })
 })

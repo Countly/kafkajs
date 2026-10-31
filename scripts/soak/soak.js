@@ -2097,6 +2097,7 @@ const buildConsumerChurn = ({ brokers, phaseSeconds }) => {
     ChurnJournal,
     GapSampler,
     PublicConsumerProbe,
+    ChurnClientLog,
     consumerChurnPlan,
     publicSocketFactory,
   } = require('./consumerChurn')
@@ -2109,20 +2110,30 @@ const buildConsumerChurn = ({ brokers, phaseSeconds }) => {
     return v8.getHeapStatistics().used_heap_size
   }
   const probe = new PublicConsumerProbe({ heap })
+  const file = evidencePath('consumer-churn').replace(/\.jsonl$/, '.journal')
+  fs.mkdirSync(path.dirname(file), { recursive: true })
+  const clientLog = new ChurnClientLog({
+    file: evidencePath('consumer-churn').replace(/\.jsonl$/, '.clientlog'),
+  })
   const kafka = new Kafka({
     clientId: 'soak-consumer-churn',
     brokers,
-    logLevel: logLevel.NOTHING,
+    logLevel: logLevel.WARN,
+    logCreator: clientLog.creator(),
     socketFactory: probe.wrap(publicSocketFactory()),
   })
-  const file = evidencePath('consumer-churn').replace(/\.jsonl$/, '.journal')
-  fs.mkdirSync(path.dirname(file), { recursive: true })
-  const workloads = new ChurnWorkloads({ kafka, probe, tag: `cc${Date.now().toString(36)}` })
+  const workloads = new ChurnWorkloads({
+    kafka,
+    probe,
+    tag: `cc${Date.now().toString(36)}`,
+    clientLog,
+  })
   return new ConsumerChurnRun({
     workloads,
     scope: workloads.groups,
     probe,
     journal: new ChurnJournal({ file }),
+    clientLog,
     record: (line) => writeEvidence('consumer-churn', line),
     plan: consumerChurnPlan(phaseSeconds),
     clock: REAL_CLOCK,
