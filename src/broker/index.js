@@ -604,16 +604,23 @@ module.exports = class Broker {
    *   check; it never reaches the request
    * @param {boolean} [options.allowAutoTopicCreation] overrides only this request
    * @param {boolean} [options.lenient=false] retains per-topic/partition errors in data
+   * @param {boolean} [options.allowLeaderless=false] keeps a partition without a leader in data;
+   *   other errors still throw
    * @returns {Promise<object>} decoded response; no cache installation
    * @throws {Error} original transport/auth/parse failure or guard refusal
    */
   async metadata(topics = [], options = {}) {
-    const { guard, lenient = false, allowAutoTopicCreation = this.allowAutoTopicCreation } = options
+    const {
+      guard,
+      lenient = false,
+      allowLeaderless = false,
+      allowAutoTopicCreation = this.allowAutoTopicCreation,
+    } = options
     this.throwIfRefused(guard)
     const metadata = this.lookupRequest(apiKeys.Metadata, requests.Metadata)
     const shuffledTopics = shuffle(topics)
     return await this[PRIVATE.SEND_REQUEST](
-      metadata({ topics: shuffledTopics, allowAutoTopicCreation, lenient }),
+      metadata({ topics: shuffledTopics, allowAutoTopicCreation, lenient, allowLeaderless }),
       guard
     )
   }

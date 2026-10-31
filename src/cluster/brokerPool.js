@@ -638,6 +638,8 @@ module.exports = class BrokerPool {
    * @param {object} [options.metadataScope] subscription that issues scope/sequence tickets
    * @param {() => boolean} [options.isCurrent] additional membership/target/lifecycle guard
    * @param {boolean} [options.allowAutoTopicCreation] per-call creation override
+   * @param {boolean} [options.allowLeaderless] a partition without a leader is installed as it is
+   *   (leader -1) instead of failing the refresh with `LEADER_NOT_AVAILABLE` until the retries end
    * @param {(metadata: object) => void} [options.onMetadata] synchronous accepted-snapshot observer
    * @returns {Promise<void>}
    * @throws {Error} the lifecycle's close error
@@ -651,6 +653,7 @@ module.exports = class BrokerPool {
       metadataScope = this.consumerMetadataScope,
       isCurrent = () => true,
       allowAutoTopicCreation,
+      allowLeaderless,
       onMetadata,
     } = {}
   ) {
@@ -674,6 +677,7 @@ module.exports = class BrokerPool {
       ...guardArgs(fence)[0],
       ...(guard && { guard }),
       ...(allowAutoTopicCreation !== undefined && { allowAutoTopicCreation }),
+      ...(allowLeaderless && { allowLeaderless }),
     }
     const requestArgs = Object.keys(requestOptions).length ? [requestOptions] : []
     try {

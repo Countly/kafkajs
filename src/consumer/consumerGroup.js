@@ -853,8 +853,9 @@ module.exports = class ConsumerGroup {
   /**
    * One metadata refresh on the cluster. A client-pattern consumer passes its subscription, the
    * run's currency check and the observer, so an accepted response is evaluated and observed once
-   * inside its install and the newest desired revision is handed on afterwards. Any other consumer
-   * keeps the call shape it always had.
+   * inside its install and the newest desired revision is handed on afterwards. Every refresh lets
+   * a partition without a leader through as leader -1, so routing skips it; a strict refresh would
+   * fail until its retries end and take the fetch loop down with it.
    * @param {object} [options]
    * @param {Generation} [options.fence] the run's terminal fence, binding the refresh to the run
    * @param {boolean} [options.ifNecessary=false] refresh only when the cache is missing or expired
@@ -863,10 +864,10 @@ module.exports = class ConsumerGroup {
    */
   async refreshCluster({ fence, ifNecessary = false } = {}) {
     if (!this.subscription) {
-      const args = boundTo(fence)
+      const options = { ...(fence && { fence }), allowLeaderless: true }
       await (ifNecessary
-        ? this.cluster.refreshMetadataIfNecessary(...args)
-        : this.cluster.refreshMetadata(...args))
+        ? this.cluster.refreshMetadataIfNecessary(options)
+        : this.cluster.refreshMetadata(options))
       return
     }
 
@@ -874,6 +875,7 @@ module.exports = class ConsumerGroup {
     const isCurrent = () => this.idleWait === run && !run.disposed
     const options = {
       ...(fence && { fence }),
+      allowLeaderless: true,
       metadataScope: this.subscription,
       isCurrent,
       onMetadata: (metadata) => this.observeDiscovery(metadata),

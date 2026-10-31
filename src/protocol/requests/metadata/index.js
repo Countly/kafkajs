@@ -1,5 +1,7 @@
 const { failure, createErrorFromCode } = require('../../error')
 
+const LEADER_NOT_AVAILABLE = 5
+
 const versions = {
   0: ({ topics }) => {
     const request = require('./v0/request')
@@ -92,18 +94,41 @@ const parseAllTopics = async (data) => {
 }
 
 /**
+ * Wraps a version's own parse so that a partition without a leader stays in the data. Every other
+ * topic or partition error still throws, as the wrapped parse decides.
+ * @param {(data: object) => Promise<object>|object} parse the version's own parse
+ * @returns {(data: object) => Promise<object>} a parse that resolves with `data`, unchanged
+ */
+const allowingLeaderless = (parse) => async (data) => {
+  await parse({
+    ...data,
+    topicMetadata: data.topicMetadata.map((topic) => ({
+      ...topic,
+      partitionMetadata: topic.partitionMetadata.filter(
+        ({ partitionErrorCode }) => partitionErrorCode !== LEADER_NOT_AVAILABLE
+      ),
+    })),
+  })
+  return data
+}
+
+/**
  * Builds one request at `version`. A request for every topic, an empty `topics` list written as
  * the null array, is parsed by `parseAllTopics`; a request that names topics keeps its version's
- * own parse, which throws the first topic, then partition, error code.
+ * own parse, which throws the first topic, then partition, error code, unless `allowLeaderless`
+ * lets a partition without a leader through.
  * @param {number|string} version
- * @param {{ topics?: Array<string|{ topicId: string }>, allowAutoTopicCreation?: boolean, lenient?: boolean }} options
+ * @param {{ topics?: Array<string|{ topicId: string }>, allowAutoTopicCreation?: boolean, lenient?: boolean, allowLeaderless?: boolean }} options
  *   `topics` is absent only when a request is built for its api key and version alone
  * @returns {{ request: object, response: { decode: Function, parse: Function } }}
  */
 const build = (version, options) => {
   const built = versions[version](options)
-  return options.lenient || options.topics?.length === 0
-    ? { ...built, response: { ...built.response, parse: parseAllTopics } }
+  if (options.lenient || options.topics?.length === 0) {
+    return { ...built, response: { ...built.response, parse: parseAllTopics } }
+  }
+  return options.allowLeaderless
+    ? { ...built, response: { ...built.response, parse: allowingLeaderless(built.response.parse) } }
     : built
 }
 

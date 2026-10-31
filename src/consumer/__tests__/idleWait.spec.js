@@ -1393,7 +1393,9 @@ describe('terminal run cancellation of work started by a run', () => {
     await drain()
     expect(h.cluster.refreshMetadata).toHaveBeenCalledTimes(1)
     const retired = restart()
-    expect(h.cluster.refreshMetadata).toHaveBeenCalledWith({ fence: retired.fence })
+    expect(h.cluster.refreshMetadata).toHaveBeenCalledWith(
+      expect.objectContaining({ fence: retired.fence })
+    )
     refresh.release()
     await expect(finish(pending)).resolves.toEqual([])
   })
@@ -1407,7 +1409,9 @@ describe('terminal run cancellation of work started by a run', () => {
     const pending = h.group.fetch(0)
     await drain()
     const retired = restart()
-    expect(h.cluster.refreshMetadata).toHaveBeenCalledWith({ fence: retired.fence })
+    expect(h.cluster.refreshMetadata).toHaveBeenCalledWith(
+      expect.objectContaining({ fence: retired.fence })
+    )
     refresh.release()
     await expect(finish(pending)).resolves.toEqual([])
   })
@@ -1426,7 +1430,9 @@ describe('terminal run cancellation of work started by a run', () => {
     const pending = h.group.fetch(0)
     await drain()
     const retired = restart()
-    expect(h.cluster.refreshMetadata).toHaveBeenCalledWith({ fence: retired.fence })
+    expect(h.cluster.refreshMetadata).toHaveBeenCalledWith(
+      expect.objectContaining({ fence: retired.fence })
+    )
     refresh.release()
     await expect(finish(pending)).resolves.toEqual([])
     expect(h.requestRejoin).not.toHaveBeenCalled()

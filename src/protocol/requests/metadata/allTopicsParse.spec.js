@@ -141,3 +141,45 @@ describe('Protocol > Requests > Metadata > a request for every topic', () => {
     }
   )
 })
+
+describe('Protocol > Requests > Metadata > a request that allows leaderless partitions', () => {
+  const allowing = (version, topics) =>
+    protocol({ version })({ topics, allowLeaderless: true }).response.parse
+
+  test.each(versions)('at v%s, keeps a partition without a leader in the data', async (version) => {
+    const data = leaderless(version)
+
+    await expect(allowing(version, ['test-topic'])(data)).resolves.toBe(data)
+    expect(data.topicMetadata[0].partitionMetadata[0]).toMatchObject({
+      partitionErrorCode: LEADER_NOT_AVAILABLE,
+      leader: -1,
+    })
+  })
+
+  test.each(versions)(
+    'at v%s, still throws a topic error and any other partition error',
+    async (version) => {
+      const denied = leaderless(version)
+      denied.topicMetadata[0].topicErrorCode = TOPIC_AUTHORIZATION_FAILED
+      await expect(allowing(version, ['test-topic'])(denied)).rejects.toMatchObject({
+        type: 'TOPIC_AUTHORIZATION_FAILED',
+      })
+
+      const other = leaderless(version)
+      other.topicMetadata[0].partitionMetadata.push({
+        partitionErrorCode: TOPIC_AUTHORIZATION_FAILED,
+        partitionId: 1,
+        leader: -1,
+      })
+      await expect(allowing(version, ['test-topic'])(other)).rejects.toMatchObject({
+        type: 'TOPIC_AUTHORIZATION_FAILED',
+      })
+    }
+  )
+
+  test.each(versions)('at v%s, a request that does not allow it still throws', async (version) => {
+    await expect(parseFor(version, ['test-topic'])(leaderless(version))).rejects.toMatchObject({
+      type: 'LEADER_NOT_AVAILABLE',
+    })
+  })
+})

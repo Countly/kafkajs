@@ -62,6 +62,21 @@ describe('routing with an unavailable leader', () => {
     expect(harness.requestRejoin).not.toHaveBeenCalled()
   })
 
+  it('asks every refresh of the round to let the leaderless partition through', async () => {
+    harness = await createFetchGroup({
+      partitions: [0, 1],
+      partitionLeaders: { 0: -1, 1: NODE_ID },
+    })
+    harness.cluster.refreshMetadataIfNecessary = jest.fn(async () => {})
+    harness.setResponse(fetchResponse([{ partition: 1, errorCode: 6 }]))
+
+    await harness.group.fetch(NODE_ID)
+
+    const lenient = expect.objectContaining({ allowLeaderless: true })
+    expect(harness.cluster.refreshMetadataIfNecessary).toHaveBeenCalledWith(lenient)
+    expect(harness.cluster.refreshMetadata).toHaveBeenCalledWith(lenient)
+  })
+
   it('still delivers the healthy sibling when the routing refresh fails', async () => {
     harness = await createFetchGroup({
       partitions: [0, 1],

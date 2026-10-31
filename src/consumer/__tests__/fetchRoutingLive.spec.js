@@ -36,6 +36,7 @@ const {
   UNHINTED_OUTAGE,
   moveProblems,
   partitionLeader,
+  siblingProblems,
 } = require('./fixtures/fetchRoutingOracle')
 
 // Gated: it stops a broker and moves leaders. Run alone through the guarded live entry:
@@ -244,7 +245,7 @@ class Episode {
     this.joins = []
     /** @type {object[]} */
     this.rebalances = []
-    /** @type {Error[]} */
+    /** @type {Array<{ at: number, restart: boolean, error: object|null }>} */
     this.crashes = []
     /** @type {Array<{ topic: string, partition: number, value: string }>} */
     this.acknowledged = []
@@ -331,7 +332,13 @@ class Episode {
     const off = [
       consumer.on(consumer.events.GROUP_JOIN, ({ payload }) => this.joins.push(payload)),
       consumer.on(consumer.events.REBALANCING, ({ payload }) => this.rebalances.push(payload)),
-      consumer.on(consumer.events.CRASH, ({ payload }) => this.crashes.push(payload.error)),
+      consumer.on(consumer.events.CRASH, ({ payload }) =>
+        this.crashes.push({
+          at: Date.now(),
+          restart: payload.restart,
+          error: describeError(payload.error),
+        })
+      ),
       consumer.on(consumer.events.COMMIT_OFFSETS, ({ payload }) => {
         for (const { topic, partitions } of payload.topics) {
           for (const { partition, offset } of partitions) {
@@ -563,7 +570,7 @@ class Episode {
         const prior = wire.exchanges.filter(
           (x) => x.apiKey === FETCH && x.endpoint === newEndpoint && x.at <= routeAt
         )
-        const outstanding = prior.at(-1)
+        const outstanding = prior.filter((x) => x.at <= errorAt).at(-1)
         found = {
           kind,
           hinted,
@@ -639,30 +646,6 @@ const commitProblems = (handled, committed) =>
   })
 
 /**
- * @param {object} evidence the sibling case's facts
- * @param {Array<{ topic: string, partition: number, value: string }>} evidence.outage the healthy
- *   records sent while the stopped broker was down
- * @param {object[]} evidence.handled
- * @param {{ tDown: number, tRestored: number }} evidence.window when the broker was down
- * @param {{ joins: number, rebalances: number, crashes: number }} evidence.events the membership
- *   events of the stable window
- * @returns {string[]} how the evidence breaks the case's oracle; empty when it meets it
- */
-const siblingProblems = ({ outage, handled, window, events }) => {
-  const problems = []
-  for (const record of outage) {
-    const first = handled.find((h) => identity(h) === identity(record))
-    if (!first || first.at < window.tDown || first.at > window.tRestored) {
-      problems.push(`${identity(record)} was not handled while the sibling had no leader`)
-    }
-  }
-  for (const [name, count] of Object.entries(events)) {
-    if (count !== 0) problems.push(`${count} ${name} in the stable window`)
-  }
-  return problems
-}
-
-/**
  * Takes the episode's old leader's broker down and, under the bouncer's one-down rule, brings it
  * back. The restore is also a cleanup, so a case that ends early still waits for it.
  * @param {BrokerBouncer} bouncer
@@ -732,6 +715,7 @@ const withRows = async (name, episodes, body) => {
             crashes: episode.crashes.length,
           },
           window: episode.window,
+          crashes: episode.crashes,
           caseError: failure ? describeError(failure) : null,
         })
       } catch (error) {
@@ -785,6 +769,7 @@ describeRouting('Consumer > Fetch routing around unavailable and moved leaders (
               label: 'The partition without a leader',
             }
           )
+          const leaderlessAt = Date.now()
           const during = await episode.produce('during', [healthyTopic])
           await episode.delivered(during)
           const down = await bounded(scope, Infinity, () => outage, { label: 'The outage' })
@@ -804,7 +789,7 @@ describeRouting('Consumer > Fetch routing around unavailable and moved leaders (
           const evidence = {
             outage: during,
             handled: episode.handled,
-            window: { tDown: down.tDown, tRestored: down.tRestored },
+            window: { leaderlessAt, tRestored: down.tRestored },
             events,
           }
           episode.facts.problems = {

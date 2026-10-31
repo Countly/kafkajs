@@ -3,6 +3,7 @@ const createAdmin = require('../../admin')
 const InstrumentationEventEmitter = require('../../instrumentation/emitter')
 const { CLUSTER_TOPIC_RECREATED } = require('../instrumentationEvents')
 const { createErrorFromCode } = require('../../protocol/error')
+const { requests } = require('../../protocol/requests')
 const {
   KafkaJSBrokerNotFound,
   KafkaJSConnectionError,
@@ -275,6 +276,46 @@ describe('Cluster > metadata contract', () => {
       expect(refresh).toHaveBeenCalledTimes(1)
       const calls = brokers.reduce((n, { metadata }) => n + metadata.mock.calls.length, 0)
       expect(calls).toBe(RETRY.retries + 1)
+    })
+  })
+
+  describe('a partition without a leader', () => {
+    /** Answers `metadata()` through the codec's own parse for the request it was given. */
+    const answerThroughParse = (brokers, data) =>
+      brokers.forEach(({ metadata }) =>
+        metadata.mockImplementation(async (topics, options = {}) =>
+          requests.Metadata.protocol({ version: 12 })({ topics, ...options }).response.parse(data)
+        )
+      )
+    const leaderlessAnswer = () => {
+      const data = answer({ leader: -1 })
+      data.topicMetadata[0].partitionMetadata[0].partitionErrorCode = 5
+      return data
+    }
+
+    test('fails a refresh that does not allow it, after the whole retry budget', async () => {
+      const { cluster, brokers } = build({ fresh: false })
+      answerThroughParse(brokers, leaderlessAnswer())
+      cluster.targetTopics.add(TOPIC)
+
+      const error = await cluster.refreshMetadata().catch((e) => e)
+
+      expect(error.type).toBe('LEADER_NOT_AVAILABLE')
+      const calls = brokers.reduce((n, { metadata }) => n + metadata.mock.calls.length, 0)
+      expect(calls).toBe(RETRY.retries + 1)
+      expect(cluster.brokerPool.metadata).toBeFalsy()
+    })
+
+    test('installs it as leader -1 in one attempt when the refresh allows it', async () => {
+      const { cluster, brokers } = build({ fresh: false })
+      answerThroughParse(brokers, leaderlessAnswer())
+      cluster.targetTopics.add(TOPIC)
+
+      await cluster.refreshMetadata({ allowLeaderless: true })
+
+      const calls = brokers.reduce((n, { metadata }) => n + metadata.mock.calls.length, 0)
+      expect(calls).toBe(1)
+      expect(cluster.metadataCache.leader(TOPIC, 0)).toBe(-1)
     })
   })
 

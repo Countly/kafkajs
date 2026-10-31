@@ -336,6 +336,7 @@ module.exports = class Cluster {
    *   a registered default applies when omitted
    * @param {() => boolean} [options.isCurrent] additional membership, target or lifecycle guard
    * @param {boolean} [options.allowAutoTopicCreation] per-call creation override
+   * @param {boolean} [options.allowLeaderless] see `BrokerPool#refreshMetadata`
    * @param {(metadata: object) => void} [options.onMetadata] synchronous accepted-snapshot observer
    * @returns {Promise<void>}
    * @throws {Error} the lifecycle's close error

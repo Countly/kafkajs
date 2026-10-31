@@ -55,6 +55,7 @@ Versions before 3.0.0 are internal alpha tags and are not published.
 - `consumer.connect()` and `consumer.run()` called while an earlier `disconnect()` of the same consumer is still closing now wait for that close to finish, so the close can never disconnect the connection that replaces it (a forced `timeout` bounds the wait; `disconnect()` then `connect()` always ran in that order). A call made from a handler or rebalance callback of the run being closed does not wait. A `disconnect()` asked after the waiting call makes it reject `CONSUMER_STOPPING`.
 
 - **A leaderless partition no longer stalls the consumer**: one partition with no leader used to make every fetch round of every broker fail and request a rejoin, so no partition was fetched until a leader appeared; now only that partition waits.
+- **A leaderless partition no longer crashes the consumer**: the fetch loop's metadata refresh named the subscribed topics, so a partition with no leader failed it with `LEADER_NOT_AVAILABLE` until its retries ended, twice in a row, and the consumer crashed and restarted about 20 seconds after the leader was lost. The refresh now keeps that partition at leader -1, so routing skips it as described above; the first refresh at `connect()` still waits for a leader.
 
 - Preferred-replica routing now tests the preferred replica ID against offlineReplicas and falls back to the leader when that replica is offline.
 

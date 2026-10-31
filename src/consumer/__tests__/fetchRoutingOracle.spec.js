@@ -7,6 +7,7 @@ const {
   UNHINTED_OUTAGE,
   moveProblems,
   partitionLeader,
+  siblingProblems,
 } = require('./fixtures/fetchRoutingOracle')
 
 const LEADER_NOT_AVAILABLE = 5
@@ -20,6 +21,7 @@ const busy = {
   refreshed: true,
   priorFetches: 1,
   pollWriteAt: 9000,
+  errorAt: 10000,
   routeAt: 10000,
   pollDoneAt: 10500,
   nextAt: 10600,
@@ -27,12 +29,12 @@ const busy = {
 const idle = { ...busy, kind: 'idle', priorFetches: 0, pollWriteAt: null, pollDoneAt: null }
 
 describe('Consumer > Fetch routing oracle (offline controls)', () => {
-  it('passes a long poll that is outstanding at the route', () => {
+  it('passes a long poll that is outstanding at the loss and the route', () => {
     expect(moveProblems(busy)).toEqual([])
   })
 
   it('fails a long poll that completed before the move', () => {
-    const done = { ...busy, routeAt: 10000, pollDoneAt: 9900, nextAt: 10100 }
+    const done = { ...busy, errorAt: 10000, routeAt: 10000, pollDoneAt: 9900, nextAt: 10100 }
     expect(moveProblems(done)).toContain('the long poll was not outstanding at the route')
   })
 
@@ -42,6 +44,58 @@ describe('Consumer > Fetch routing oracle (offline controls)', () => {
 
   it('fails a poll written after the route', () => {
     expect(moveProblems({ ...busy, pollWriteAt: 10001 })).not.toEqual([])
+  })
+
+  describe('an unhinted busy move, routed once the round it was in has ended', () => {
+    const unhinted = {
+      ...busy,
+      hinted: false,
+      hint: null,
+      anyHint: false,
+      pollWriteAt: 9000,
+      errorAt: 9800,
+      pollDoneAt: 10500,
+      routeAt: 10503,
+      nextAt: 10510,
+    }
+
+    it('passes a poll held at the loss whose end the route follows', () => {
+      expect(moveProblems(unhinted)).toEqual([])
+    })
+
+    it('passes the numbers of the live run that failed on the route anchor', () => {
+      const live = {
+        ...unhinted,
+        pollWriteAt: 73325.834949,
+        errorAt: 74108.908003,
+        pollDoneAt: 78328.846169,
+        routeAt: 78332.333731,
+        nextAt: 78337.735026,
+      }
+      expect(moveProblems(live)).toEqual([])
+    })
+
+    it('fails a poll that was answered before the loss', () => {
+      expect(
+        moveProblems({ ...unhinted, errorAt: 10600, nextAt: 10700, routeAt: 10650 })
+      ).toContain('the long poll was not outstanding at the route')
+    })
+
+    it('fails a poll written after the loss', () => {
+      expect(moveProblems({ ...unhinted, errorAt: 8900 })).toContain(
+        'the long poll was not outstanding at the route'
+      )
+    })
+
+    it('fails a Fetch that waits after the later of the poll end and the route', () => {
+      const slow = { ...unhinted, nextAt: unhinted.routeAt + ROUND_ALLOWANCE_MS + 1 }
+      expect(moveProblems(slow)).toContain('the route waited after the long poll')
+    })
+
+    it('does not charge a late route to the client when the Fetch follows it at once', () => {
+      const elected = { ...unhinted, routeAt: 12000, nextAt: 12010 }
+      expect(moveProblems(elected)).toEqual([])
+    })
   })
 
   it('fails a busy move with no prior Fetch, never an idle pass', () => {
@@ -119,5 +173,43 @@ describe('Consumer > Fetch routing oracle > the leader of a partition', () => {
       expect(await settled).toMatchObject({ name: 'KafkaJSTimeout', message: 'Timeout' })
       expect(cluster.metadata.mock.calls.length).toBeGreaterThan(1)
     })
+  })
+})
+
+describe('Consumer > Fetch routing oracle > the sibling window', () => {
+  const during = [{ topic: 't', partition: 0, value: 'during-0' }]
+  const calm = { joins: 0, rebalances: 0, crashes: 0 }
+
+  it('counts a record handled right after the leader was seen gone, before the stop returned', () => {
+    const handled = [{ ...during[0], at: 234028 }]
+    const window = { leaderlessAt: 234000, tRestored: 258252 }
+
+    expect(siblingProblems({ outage: during, handled, window, events: calm })).toEqual([])
+  })
+
+  it('fails a record handled before the leader was gone', () => {
+    const handled = [{ ...during[0], at: 233900 }]
+    const window = { leaderlessAt: 234000, tRestored: 258252 }
+
+    expect(siblingProblems({ outage: during, handled, window, events: calm })).toEqual([
+      't|0|during-0 was not handled while the sibling had no leader',
+    ])
+  })
+
+  it('fails a record handled only after the broker was back, or never', () => {
+    const window = { leaderlessAt: 234000, tRestored: 258252 }
+    const late = [{ ...during[0], at: 258253 }]
+
+    expect(siblingProblems({ outage: during, handled: late, window, events: calm })).toHaveLength(1)
+    expect(siblingProblems({ outage: during, handled: [], window, events: calm })).toHaveLength(1)
+  })
+
+  it('fails a join, a rebalance or a crash in the window', () => {
+    const handled = [{ ...during[0], at: 234028 }]
+    const window = { leaderlessAt: 234000, tRestored: 258252 }
+
+    expect(
+      siblingProblems({ outage: during, handled, window, events: { ...calm, crashes: 1 } })
+    ).toEqual(['1 crashes in the stable window'])
   })
 })
