@@ -369,11 +369,17 @@ class ConsumerChurnOracle {
 }
 
 /**
- * The fixed timing and workload of the profile, declared before any result: one actual warm-up,
- * four measured phases, and the inclusive child budget they sit in.
+ * The fixed timing and workload of the profile, declared before any result: a warm-up of one short
+ * pass of each shape, four measured phases, and the inclusive child budget they sit in.
  */
 const CONSUMER_CHURN = Object.freeze({
   warmupMs: 180000,
+  warmups: Object.freeze([
+    Object.freeze({ name: 'warm-member-churn', workload: 'memberChurn', ms: 50000 }),
+    Object.freeze({ name: 'warm-regex-topics', workload: 'regexTopics', ms: 40000 }),
+    Object.freeze({ name: 'warm-pause-recreate', workload: 'pauseRecreate', ms: 70000 }),
+    Object.freeze({ name: 'warm-mostly-idle', workload: 'mostlyIdle', ms: 20000 }),
+  ]),
   setupAndWarmupMs: 240000,
   phaseMs: 300000,
   transitionMs: 60000,
@@ -398,9 +404,12 @@ const CONSUMER_CHURN = Object.freeze({
   ]),
 })
 
-/** The suffix each phase adds to a group id; the warm-up shares the first phase's groups. */
+/** The suffix each phase and each warm-up pass adds to a group id; no two share a group. */
 const GROUP_SUFFIX = Object.freeze({
-  'warm-up': '',
+  'warm-member-churn': '-wm',
+  'warm-regex-topics': '-wrx',
+  'warm-pause-recreate': '-wpause',
+  'warm-mostly-idle': '-widle',
   'member-churn': '',
   'regex-topics': '-rx',
   'pause-recreate': '-pause',
@@ -423,7 +432,7 @@ class ChurnGroups {
 
   /**
    * @param {string} base a base group
-   * @param {string} phase the warm-up or a phase of the plan
+   * @param {string} phase a warm-up pass or a phase of the plan
    * @returns {string} the group id the clients of that phase join
    * @throws {Error} for a phase with no groups
    */
@@ -441,14 +450,16 @@ class ChurnGroups {
 
 /**
  * @param {number|null} phaseSeconds a smoke run's phase length, or none for the acceptance run
- * @returns {{ acceptance: boolean, warmupMs: number, phases: Array<{ name: string, workload: string, ms: number }> }}
- *   the four phases at their full length for acceptance; a shortened run is never acceptance
+ * @returns {{ acceptance: boolean, warmupMs: number, warmups: Array<{ name: string, workload: string, ms: number }>, phases: Array<{ name: string, workload: string, ms: number }> }}
+ *   the four warm-up passes and the four phases at their full length for acceptance; a shortened
+ *   run is never acceptance and takes no warm-up
  */
 const consumerChurnPlan = (phaseSeconds = null) => {
   const smoke = phaseSeconds !== null
   return {
     acceptance: !smoke,
     warmupMs: smoke ? 0 : CONSUMER_CHURN.warmupMs,
+    warmups: smoke ? [] : CONSUMER_CHURN.warmups.map((pass) => ({ ...pass })),
     phases: CONSUMER_CHURN.phases.map((phase) => ({
       ...phase,
       ms: smoke ? phaseSeconds * 1000 : CONSUMER_CHURN.phaseMs,
@@ -1073,6 +1084,36 @@ const judgeQuietHeap = (readings, { boundaries, minimum = CONSUMER_CHURN.quietSa
 }
 
 /**
+ * Pairs, for each shape, the heap it added in its warm-up pass with the heap it added in its
+ * measured pass. Each is the change in the median quiet heap since the previous point of its own
+ * sequence, so a shape that still grows in its second pass shows up as a large `secondPassBytes`.
+ * Informational: no bound is applied to it.
+ * @param {Array<{ boundary: string, heapUsed: number|undefined }>} readings every quiet reading
+ * @param {{ warm: string[], measured: string[], shapes: string[] }} points the boundaries of the
+ *   warm-up pass sequence and of the measured sequence, each starting with its own origin, and the
+ *   shape names, one for each pass after the origin
+ * @returns {Array<{ shape: string, firstPassBytes: number|null, secondPassBytes: number|null }>}
+ *   `null` where a point has no heap reading
+ */
+const shapeHeapGrowth = (readings, { warm, measured, shapes }) => {
+  const at = (boundary) => {
+    const heaps = readings
+      .filter((reading) => reading.boundary === boundary && reading.heapUsed !== undefined)
+      .map(({ heapUsed }) => heapUsed)
+    return heaps.length === 0 ? null : median(heaps)
+  }
+  const step = (points, index) => {
+    const [before, after] = [at(points[index]), at(points[index + 1])]
+    return before === null || after === null ? null : after - before
+  }
+  return shapes.map((shape, index) => ({
+    shape,
+    firstPassBytes: step(warm, index),
+    secondPassBytes: step(measured, index),
+  }))
+}
+
+/**
  * The interning sensitivity control: retains distinct small objects with varying values, takes the
  * double-collected heap and requires its growth to pass `interningGrowthBytes`; a constant or
  * reused object would not, so a disabled or interning observer fails it. The objects are released
@@ -1259,4 +1300,5 @@ module.exports = {
   publicSocketFactory,
   quietViolations,
   runControls,
+  shapeHeapGrowth,
 }

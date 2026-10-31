@@ -23,6 +23,7 @@ const {
   judgeQuietHeap,
   quietViolations,
   runControls,
+  shapeHeapGrowth,
 } = require('../consumerChurn')
 const { ChurnLogReader, ChurnMember, ConsumerChurnRun } = require('../consumerChurnRun')
 const { PROFILES, WORKLOADS, buildConsumerChurn, main, parseArgs } = require('../soak')
@@ -61,6 +62,20 @@ describe('Consumer churn profile > plan and registry', () => {
     ])
     const plan = consumerChurnPlan()
     expect(plan).toMatchObject({ acceptance: true, warmupMs: 180000 })
+    expect(plan.warmups.map(({ name, workload }) => [name, workload])).toEqual([
+      ['warm-member-churn', 'memberChurn'],
+      ['warm-regex-topics', 'regexTopics'],
+      ['warm-pause-recreate', 'pauseRecreate'],
+      ['warm-mostly-idle', 'mostlyIdle'],
+    ])
+    expect(plan.warmups.map(({ workload }) => workload)).toEqual(
+      plan.phases.map(({ workload }) => workload)
+    )
+    expect(plan.warmups.reduce((total, { ms }) => total + ms, 0)).toBe(plan.warmupMs)
+    expect(plan.warmups.every(({ ms }) => ms >= 20000)).toBe(true)
+    expect(Math.min(...plan.warmups.map(({ ms }) => ms))).toBe(
+      plan.warmups.find(({ workload }) => workload === 'mostlyIdle').ms
+    )
     expect(plan.phases.map(({ ms }) => ms)).toEqual([300000, 300000, 300000, 300000])
     expect(parseArgs(['--profile', 'consumer-churn'])).toEqual({
       profile: 'consumer-churn',
@@ -77,7 +92,7 @@ describe('Consumer churn profile > plan and registry', () => {
   })
 
   test('a shortened run is never acceptance and takes no warm-up', () => {
-    expect(consumerChurnPlan(5)).toMatchObject({ acceptance: false, warmupMs: 0 })
+    expect(consumerChurnPlan(5)).toMatchObject({ acceptance: false, warmupMs: 0, warmups: [] })
     expect(consumerChurnPlan(5).phases.every(({ ms }) => ms === 5000)).toBe(true)
   })
 
@@ -830,6 +845,18 @@ describe('Consumer churn profile > the run', () => {
   })
   afterEach(() => fs.rmSync(dir, { recursive: true, force: true }))
 
+  /** A plan with a one-pass-each warm-up of tiny lengths. */
+  const warmPlan = () => ({
+    ...consumerChurnPlan(1),
+    warmupMs: 10,
+    warmups: [
+      { name: 'warm-member-churn', workload: 'memberChurn', ms: 2 },
+      { name: 'warm-regex-topics', workload: 'regexTopics', ms: 3 },
+      { name: 'warm-pause-recreate', workload: 'pauseRecreate', ms: 4 },
+      { name: 'warm-mostly-idle', workload: 'mostlyIdle', ms: 1 },
+    ],
+  })
+
   const build = ({
     plan = consumerChurnPlan(1),
     workloads,
@@ -837,6 +864,7 @@ describe('Consumer churn profile > the run', () => {
     clock = manualClock(),
     journalFeed = corpus,
     clientLog,
+    snapshot,
   } = {}) => {
     const order = []
     const lines = []
@@ -845,7 +873,6 @@ describe('Consumer churn profile > the run', () => {
     const names = ['memberChurn', 'regexTopics', 'pauseRecreate', 'mostlyIdle']
     const real = {
       setup: async () => order.push('setup'),
-      warmup: async () => order.push('warmup'),
       drain: async (_, phase) => order.push(`drain ${phase}`),
       close: async () => order.push('close'),
       ...Object.fromEntries(
@@ -853,6 +880,7 @@ describe('Consumer churn profile > the run', () => {
           name,
           async (context) => {
             order.push(name)
+            if (!context.measured()) return
             for (const group of context.groups) {
               context.gaps.enter(group, context.phase(), 0)
               context.gaps.enter(group, context.phase(), 1)
@@ -870,7 +898,7 @@ describe('Consumer churn profile > the run', () => {
         openSockets: () => 0,
         snapshot: jest.fn(async () => {
           clock.advance(1000)
-          return quietReading()
+          return snapshot ? snapshot() : quietReading()
         }),
       },
       journal,
@@ -951,10 +979,86 @@ describe('Consumer churn profile > the run', () => {
     ])
   })
 
-  test('runs the warm-up before the baseline only when the plan has one', async () => {
-    const { run, order } = build({ plan: { ...consumerChurnPlan(1), warmupMs: 5 } })
+  test('runs one pass of every shape before the baseline, each in a phase of its own', async () => {
+    const { run, order, lines } = build({ plan: warmPlan() })
+    const seen = []
+    for (const name of ['memberChurn', 'regexTopics', 'pauseRecreate', 'mostlyIdle']) {
+      const real = run.workloads[name]
+      run.workloads[name] = async (context, ms) => {
+        seen.push([name, context.phase(), context.measured(), ms])
+        await real(context, ms)
+      }
+    }
     await run.run()
-    expect(order.slice(0, 3)).toEqual(['setup', 'warmup', 'memberChurn'])
+    expect(seen.slice(0, 4)).toEqual([
+      ['memberChurn', 'warm-member-churn', false, 2],
+      ['regexTopics', 'warm-regex-topics', false, 3],
+      ['pauseRecreate', 'warm-pause-recreate', false, 4],
+      ['mostlyIdle', 'warm-mostly-idle', false, 1],
+    ])
+    expect(seen.slice(4).map(([, phase, measured]) => [phase, measured])).toEqual([
+      ['member-churn', true],
+      ['regex-topics', true],
+      ['pause-recreate', true],
+      ['mostly-idle', true],
+    ])
+    expect(order.slice(0, 5)).toEqual([
+      'setup',
+      'memberChurn',
+      'drain warm-member-churn',
+      'regexTopics',
+      'drain warm-regex-topics',
+    ])
+    const boundaries = lines.filter(({ kind }) => kind === 'quiet').map(({ boundary }) => boundary)
+    expect(boundaries.indexOf('warm')).toBe(15)
+    expect([...new Set(boundaries.slice(0, 15))]).toEqual([
+      'warm-up',
+      'warm-member-churn',
+      'warm-regex-topics',
+      'warm-pause-recreate',
+      'warm-mostly-idle',
+    ])
+  })
+
+  test('a plan with no warm-up passes takes no warm-up reading', async () => {
+    const { run, order, lines } = build()
+    await run.run()
+    expect(order.slice(0, 2)).toEqual(['setup', 'memberChurn'])
+    expect(lines.filter(({ kind }) => kind === 'quiet')).toHaveLength(15)
+    expect(run.warmQuiets).toEqual([])
+  })
+
+  test('the warm-up readings stay out of the heap bound and the leftovers check', async () => {
+    let call = 0
+    const { run } = build({
+      plan: warmPlan(),
+      snapshot: () => ({ ...quietReading(), heapUsed: (call++ < 15 ? 10 : 100) * MIB }),
+    })
+    const verdict = await run.run()
+    expect(verdict.violations).toEqual([])
+    expect(verdict.heap.endpointBytes).toBe(0)
+  })
+
+  test('a shape that keeps growing in its second pass is shown in the verdict, not failed', async () => {
+    let call = 0
+    const { run, lines } = build({
+      plan: warmPlan(),
+      snapshot: () => {
+        call += 1
+        const boundary = Math.floor((call - 1) / 3)
+        const bytes = [10, 11, 13, 13, 14, 14, 15, 18, 18, 18][boundary] * 1000
+        return { ...quietReading(), heapUsed: bytes }
+      },
+    })
+    const verdict = await run.run()
+    expect(verdict.shapeHeap).toEqual([
+      { shape: 'member-churn', firstPassBytes: 1000, secondPassBytes: 1000 },
+      { shape: 'regex-topics', firstPassBytes: 2000, secondPassBytes: 3000 },
+      { shape: 'pause-recreate', firstPassBytes: 0, secondPassBytes: 0 },
+      { shape: 'mostly-idle', firstPassBytes: 1000, secondPassBytes: 0 },
+    ])
+    expect(lines.find(({ kind }) => kind === 'verdict').shapeHeap).toEqual(verdict.shapeHeap)
+    expect(verdict.violations.join()).not.toContain('shape')
   })
 
   test('a journal that loses an acknowledged record fails the verdict through the oracle', async () => {
@@ -1069,6 +1173,39 @@ describe('Consumer churn profile > the run', () => {
   })
 })
 
+describe('Consumer churn profile > shape heap growth', () => {
+  const points = { warm: ['w0', 'w1', 'w2'], measured: ['m0', 'm1', 'm2'], shapes: ['a', 'b'] }
+  const at = (boundary, ...heaps) => heaps.map((heapUsed) => ({ boundary, heapUsed }))
+
+  test('pairs each shape step in the warm-up with its step in the measured pass, by medians', () => {
+    const readings = [
+      ...at('w0', 100, 5000, 100),
+      ...at('w1', 150, 150, 9000),
+      ...at('w2', 400, 400, 400),
+      ...at('m0', 400, 400, 400),
+      ...at('m1', 410, 410, 410),
+      ...at('m2', 200, 200, 200),
+    ]
+    expect(shapeHeapGrowth(readings, points)).toEqual([
+      { shape: 'a', firstPassBytes: 50, secondPassBytes: 10 },
+      { shape: 'b', firstPassBytes: 250, secondPassBytes: -210 },
+    ])
+  })
+
+  test('is null for a step with a missing or heapless point, never a number made of nothing', () => {
+    const readings = [
+      ...at('w0', 1, 1, 1),
+      ...at('w1', 2, 2, 2),
+      ...at('m0', 5, 5, 5),
+      ...at('m1', undefined),
+    ]
+    expect(shapeHeapGrowth(readings, points)).toEqual([
+      { shape: 'a', firstPassBytes: 1, secondPassBytes: null },
+      { shape: 'b', firstPassBytes: null, secondPassBytes: null },
+    ])
+  })
+})
+
 describe('Consumer churn profile > oracle sensitivity', () => {
   test('the oracle named by the profile is the one the run uses', () => {
     expect(new ConsumerChurnOracle([], ['g']).retained()).toEqual({ acknowledged: 0, scopes: 0 })
@@ -1076,13 +1213,19 @@ describe('Consumer churn profile > oracle sensitivity', () => {
 })
 
 describe('Consumer churn profile > group identities', () => {
-  test('one mapping scopes every phase, and the warm-up shares the first phase', () => {
+  test('one mapping scopes every phase and every warm-up pass to groups of its own', () => {
     const groups = new ChurnGroups('tg')
     expect(groups.forPhase('member-churn')).toEqual([
       'member-churn-cooperative-tg',
       'member-churn-consumer-tg',
     ])
-    expect(groups.forPhase('warm-up')).toEqual(groups.forPhase('member-churn'))
+    expect(groups.id('x', 'warm-member-churn')).toBe('x-tg-wm')
+    expect(groups.id('x', 'warm-regex-topics')).toBe('x-tg-wrx')
+    expect(groups.id('x', 'warm-pause-recreate')).toBe('x-tg-wpause')
+    expect(groups.id('x', 'warm-mostly-idle')).toBe('x-tg-widle')
+    const phases = [...CONSUMER_CHURN.warmups, ...CONSUMER_CHURN.phases].map(({ name }) => name)
+    const ids = phases.map((phase) => groups.id('x', phase))
+    expect(new Set(ids).size).toBe(phases.length)
     expect(groups.id('x', 'regex-topics')).toBe('x-tg-rx')
     expect(groups.id('x', 'pause-recreate')).toBe('x-tg-pause')
     expect(groups.id('x', 'mostly-idle')).toBe('x-tg-idle')

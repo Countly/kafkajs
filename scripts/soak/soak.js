@@ -26,7 +26,8 @@
  *   first-run         5 minutes of idle, of member churn and of outage, the 15-minute screen
  *   producer-churn    5 minutes each of steady production, rolling broker restarts and buffer
  *                     pressure from one idempotent producer; see `ProducerChurn`
- *   consumer-churn    one 3-minute warm-up, then 5 minutes each of member churn, regex-topic
+ *   consumer-churn    a 3-minute warm-up of one short pass of each of the four shapes below, then
+ *                     5 minutes each of member churn, regex-topic
  *                     churn, pause and topic recreation, and a mostly idle 1000-partition
  *                     assignment, judged by an independent log, broker-offset and handler check;
  *                     see `ConsumerChurnRun`

@@ -17,6 +17,7 @@ const {
   judgeQuietHeap,
   quietViolations,
   runControls,
+  shapeHeapGrowth,
 } = require('./consumerChurn')
 
 const COMMIT_EVERY = 25
@@ -281,8 +282,9 @@ class ChurnMember {
 class ConsumerChurnRun {
   /**
    * @param {object} options
-   * @param {{ setup: Function, warmup: Function, drain: Function, close: Function, [phase: string]: Function }} options.workloads
-   *   each phase workload is `(context, ms) => Promise<void>` and leaves its clients disconnected
+   * @param {{ setup: Function, drain: Function, close: Function, [workload: string]: Function }} options.workloads
+   *   each shape workload is `(context, ms) => Promise<void>`, runs in the phase the run has set, and
+   *   leaves its clients disconnected
    * @param {object} options.probe a `PublicConsumerProbe`
    * @param {import('./consumerChurn').ChurnJournal} options.journal the issue-ordered observations
    * @param {(line: object) => void} options.record where every evidence line goes
@@ -331,12 +333,13 @@ class ConsumerChurnRun {
       progressMs,
       clientLog,
     })
-    const phases = ['warm-up', ...plan.phases.map(({ name }) => name)]
+    const phases = [...plan.warmups, ...plan.phases].map(({ name }) => name)
     this.oracle = new ConsumerChurnOracle(
       [],
       [...new Set(groups.flatMap((base) => phases.map((phase) => scope.id(base, phase))))]
     )
     this.quiets = []
+    this.warmQuiets = []
     this.stats = new Map()
     this.unhandled = 0
     this.onUnhandled = () => {
@@ -381,10 +384,7 @@ class ConsumerChurnRun {
       const context = (this.context = this.#context(deadline))
       this.phase = 'setup'
       await this.workloads.setup(context)
-      if (plan.warmupMs > 0) {
-        this.phase = 'warm-up'
-        await this.workloads.warmup(context, plan.warmupMs)
-      }
+      await this.#warmUp(context)
       this.baseline = await this.quiet('warm')
       for (const [index, { name, ms }] of plan.phases.entries()) {
         this.phase = name
@@ -418,6 +418,26 @@ class ConsumerChurnRun {
       throw error
     } finally {
       await this.close()
+    }
+  }
+
+  /**
+   * Runs one short pass of each shape, each in a phase of its own: its own groups and topics, and no
+   * gap series. After each pass the journal is verified and a quiet heap is read, kept apart from
+   * the measured series. A plan with no warm-up passes does nothing.
+   * @param {object} context the run's context
+   * @returns {Promise<void>}
+   */
+  async #warmUp(context) {
+    if (this.plan.warmups.length === 0) return
+    this.phase = 'warm-up'
+    await this.quiet('warm-up', this.warmQuiets)
+    for (const { name, workload, ms } of this.plan.warmups) {
+      this.phase = name
+      await this.workloads[workload](context, ms)
+      await this.workloads.drain(context, name)
+      await this.#verify()
+      await this.quiet(name, this.warmQuiets)
     }
   }
 
@@ -477,6 +497,7 @@ class ConsumerChurnRun {
       groups: this.groups,
       stats: this.stats,
       phase: () => this.phase,
+      measured: () => this.plan.phases.some(({ name }) => name === this.phase),
       offers: () =>
         new OfferScheduler({ rate: this.settings.rate + 20, clock: this.clock, sleep: this.sleep }),
     }
@@ -511,9 +532,10 @@ class ConsumerChurnRun {
    * One quiet point: every client closed and, within a bounded grace, every socket closed too; the
    * minimum number of matched readings taken, and the leftovers compared with the warm baseline.
    * @param {string} boundary
+   * @param {object[]} [into=this.quiets] the series the readings join
    * @returns {Promise<object>} the first reading of the point
    */
-  async quiet(boundary) {
+  async quiet(boundary, into = this.quiets) {
     const graceEnds = this.clock.now() + this.settings.socketGraceMs
     while (this.probe.openSockets() > 0 && this.clock.now() < graceEnds) await this.sleep(100)
     const readings = []
@@ -521,10 +543,21 @@ class ConsumerChurnRun {
       const snapshot = await this.probe.snapshot()
       const reading = { boundary, atMs: this.clock.now(), snapshot, heapUsed: snapshot.heapUsed }
       readings.push(reading)
-      this.quiets.push(reading)
+      into.push(reading)
       this.record({ kind: 'quiet', boundary, snapshot })
     }
     return readings[0].snapshot
+  }
+
+  /** @returns {object[]} each shape's heap growth in its warm-up pass and in its measured pass */
+  #shapeHeap() {
+    const { warmups, phases } = this.plan
+    if (warmups.length === 0) return []
+    return shapeHeapGrowth([...this.warmQuiets, ...this.quiets], {
+      warm: ['warm-up', ...warmups.map(({ name }) => name)],
+      measured: ['warm', ...phases.map(({ name }) => name)],
+      shapes: phases.map(({ name }) => name),
+    })
   }
 
   async #judge() {
@@ -560,6 +593,7 @@ class ConsumerChurnRun {
           slopeBytesPerMinute: null,
         }
     violations.push(...heap.violations)
+    const shapeHeap = this.#shapeHeap()
     const interning = this.heap
       ? await interningControl({ heap: this.heap, count: plan.acceptance ? undefined : 4096 })
       : null
@@ -576,6 +610,7 @@ class ConsumerChurnRun {
       controls,
       gaps: gaps.summary,
       heap,
+      shapeHeap,
       interning,
       phases: Object.fromEntries(this.stats),
     }
@@ -855,7 +890,7 @@ class ChurnWorkloads {
       group,
       label,
       journal: context.journal,
-      gaps: context.phase() === 'warm-up' ? null : context.gaps,
+      gaps: context.measured() ? context.gaps : null,
       phase: context.phase(),
       clock: context.clock,
       handled: this.handled,
@@ -950,19 +985,13 @@ class ChurnWorkloads {
     for (const topic of topics) await this.#delete(topic, context)
   }
 
-  /** @returns {Promise<void>} a light run of the member-churn shape, before the baseline */
-  warmup(context, ms) {
-    return this.memberChurn(context, ms, { warm: true })
-  }
-
   /**
    * Both groups, six partitions, up to three members each with one static, a dynamic one replaced every 20 s.
    * @param {object} context the run's context
    * @param {number} ms how long the phase lasts
-   * @param {{ warm?: boolean }} [options] a warm run does not churn
    * @returns {Promise<void>}
    */
-  memberChurn(context, ms, { warm = false } = {}) {
+  memberChurn(context, ms) {
     return this.#session(async () => {
       const topic = await this.#topic(`${this.tag}-member-${++this.nonce}`, 6, context)
       const members = []
@@ -1000,7 +1029,7 @@ class ChurnWorkloads {
       const live = await this.#run(context, ms, {
         topics: [topic],
         members,
-        fault: warm ? undefined : fault,
+        fault,
       })
       await this.#finish(context, live, members)
     })

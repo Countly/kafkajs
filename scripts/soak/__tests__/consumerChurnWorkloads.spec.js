@@ -13,6 +13,14 @@ const { FakeKafka, FakeSocket } = require('./churnClusterFake')
 
 const MIB = 1024 * 1024
 
+/** One short pass of each shape, in the order and under the names the plan gives them. */
+const WARMUPS = [
+  { name: 'warm-member-churn', workload: 'memberChurn', ms: 45000 },
+  { name: 'warm-regex-topics', workload: 'regexTopics', ms: 10000 },
+  { name: 'warm-pause-recreate', workload: 'pauseRecreate', ms: 10000 },
+  { name: 'warm-mostly-idle', workload: 'mostlyIdle', ms: 10000 },
+]
+
 /** A clock that moves only when something sleeps; a sleep also yields to the event loop once. */
 const fakeTime = () => {
   const clock = { at: 0, now: () => clock.at }
@@ -35,7 +43,7 @@ describe('Consumer churn profile > the real workloads, journal and oracle togeth
    * The real run over the real workloads and oracle, with fake public clients on a fake cluster.
    * `fault` may change the cluster or the clients before anything runs.
    */
-  const compose = ({ phaseSeconds = 70, warmupMs = 5000, fault = () => {} } = {}) => {
+  const compose = ({ phaseSeconds = 70, warmups = [], fault = () => {} } = {}) => {
     const probe = new PublicConsumerProbe({
       activeResources: () => ({}),
       heap: async () => 100 * MIB,
@@ -58,13 +66,21 @@ describe('Consumer churn profile > the real workloads, journal and oracle togeth
       return remove
     }
     const lines = []
+    let atBaseline = null
     const run = new ConsumerChurnRun({
       workloads,
       scope: workloads.groups,
       probe,
       journal,
-      record: (line) => lines.push(line),
-      plan: { ...consumerChurnPlan(phaseSeconds), warmupMs },
+      record: (line) => {
+        lines.push(line)
+        if (line.kind === 'quiet' && line.boundary === 'warm') atBaseline ??= appended.length
+      },
+      plan: {
+        ...consumerChurnPlan(phaseSeconds),
+        warmupMs: warmups.reduce((total, { ms }) => total + ms, 0),
+        warmups,
+      },
       clock,
       sleep,
       gaps: new GapSampler({ capacity: 64, minimum: 1 }),
@@ -74,7 +90,16 @@ describe('Consumer churn profile > the real workloads, journal and oracle togeth
       progressMs: 3600000,
     })
     fault({ kafka, workloads, run })
-    return { run, kafka, workloads, probe, appended, lines, peak: () => peakRegistrations }
+    return {
+      run,
+      kafka,
+      workloads,
+      probe,
+      appended,
+      lines,
+      beforeBaseline: () => appended.slice(0, atBaseline ?? 0),
+      peak: () => peakRegistrations,
+    }
   }
 
   test('every phase journals only what the oracle accepts, and every quiet point has no client open', async () => {
@@ -147,6 +172,34 @@ describe('Consumer churn profile > the real workloads, journal and oracle togeth
       expect(incarnation.startsWith(`${topic}.`)).toBe(true)
   }, 60000)
 
+  test('the warm-up runs all four shapes under groups of their own before the baseline, and measures none', async () => {
+    const { run, beforeBaseline, workloads } = compose({ warmups: WARMUPS })
+    const verdict = await run.run()
+    expect(verdict.violations).toEqual([])
+    const warm = beforeBaseline()
+    const groups = new Set(warm.filter(({ group }) => group).map(({ group }) => group))
+    expect([...groups].sort()).toEqual(
+      WARMUPS.flatMap(({ name }) => workloads.groups.forPhase(name)).sort()
+    )
+    for (const part of ['-member-', '-rx-', '-pause-', '-idle-'])
+      expect(warm.some(({ kind, topic }) => kind === 'acquire' && topic?.includes(part))).toBe(true)
+    const measured = new Set(workloads.groups.forPhase('member-churn'))
+    for (const group of groups) expect(measured).not.toContain(group)
+    expect([...run.gaps.series.keys()].some((key) => key.includes('warm'))).toBe(false)
+  }, 120000)
+
+  test('the warm-up replaces dynamic members, so a replacement is not first used in a measured phase', async () => {
+    const { run, beforeBaseline } = compose({ warmups: WARMUPS })
+    await run.run()
+    const labels = new Set(
+      beforeBaseline()
+        .filter(({ kind }) => kind === 'acquire')
+        .map(({ owner }) => owner.replace(/-\d+$/, ''))
+    )
+    expect(labels).toContain('dynamic-0-1')
+    expect(labels).toContain('dynamic-1-1')
+  }, 120000)
+
   test('retired members and their registrations leave at once, so clients do not grow with churn', async () => {
     const { run, peak, kafka } = compose({ phaseSeconds: 130 })
     await run.run()
@@ -168,7 +221,7 @@ describe('Consumer churn profile > the real workloads, journal and oracle togeth
   }, 120000)
 
   test('no client creates a topic of its own, so a recreated topic keeps its partitions', async () => {
-    const { run, kafka } = compose({ warmupMs: 0, phaseSeconds: 5 })
+    const { run, kafka } = compose({ phaseSeconds: 5 })
     await run.run()
     const kinds = new Set(kafka.options.map(({ kind }) => kind))
     expect([...kinds].sort()).toEqual(['consumer', 'producer'])
@@ -177,7 +230,6 @@ describe('Consumer churn profile > the real workloads, journal and oracle togeth
 
   test('a topic that already exists when the workload creates it fails the run', async () => {
     const { run, lines } = compose({
-      warmupMs: 0,
       phaseSeconds: 5,
       fault: ({ kafka }) => {
         const admin = kafka.admin.bind(kafka)
@@ -215,7 +267,7 @@ describe('Consumer churn profile > the real workloads, journal and oracle togeth
   }, 60000)
 
   test('a cleanup failure after the last phase is a failed verdict, not a passing one', async () => {
-    const { run, workloads, lines } = compose({ warmupMs: 0, phaseSeconds: 5 })
+    const { run, workloads, lines } = compose({ phaseSeconds: 5 })
     workloads.close = async () => {
       throw new Error('leftover client')
     }
@@ -254,7 +306,6 @@ describe('Consumer churn profile > the real workloads, journal and oracle togeth
 
   test('a record fetched before its acknowledgement arrives is journaled after the acknowledgement', async () => {
     const { run, appended } = compose({
-      warmupMs: 0,
       phaseSeconds: 5,
       fault: ({ kafka }) => {
         kafka.cluster.ackLag = true
