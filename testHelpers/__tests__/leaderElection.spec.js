@@ -169,6 +169,49 @@ describe('broker bounce helpers', () => {
         waitForFullIsr(client, ['workload'], { budgetMs: 20, delayMs: 5 })
       ).rejects.toThrow('ISR not full after 20 ms: workload-4')
     })
+
+    describe('a topic the asked broker does not host yet', () => {
+      const missing = () =>
+        Object.assign(new Error('missing'), { type: 'UNKNOWN_TOPIC_OR_PARTITION' })
+      const full = { topics: [{ name: 'workload', partitions: [partition(0, [1, 2, 3])] }] }
+      const clientFailing = (...failures) => {
+        const queue = [...failures]
+        return {
+          listTopics: jest.fn(async () => ['workload']),
+          fetchTopicMetadata: jest.fn(async () => {
+            if (queue.length > 0) throw queue.shift()
+            return full
+          }),
+        }
+      }
+
+      test('is waited through until the broker has caught up', async () => {
+        const client = clientFailing(missing(), missing())
+
+        await waitForFullIsr(client, ['workload'], { delayMs: 1 })
+
+        expect(client.fetchTopicMetadata).toHaveBeenCalledTimes(3)
+      })
+
+      test('rejects with that error when the budget runs out', async () => {
+        const client = clientFailing(...Array.from({ length: 1000 }, missing))
+
+        await expect(
+          waitForFullIsr(client, ['workload'], { budgetMs: 20, delayMs: 5 })
+        ).rejects.toMatchObject({ type: 'UNKNOWN_TOPIC_OR_PARTITION' })
+      })
+
+      test('does not hide any other error', async () => {
+        const client = clientFailing(
+          Object.assign(new Error('denied'), { type: 'TOPIC_AUTHORIZATION_FAILED' })
+        )
+
+        await expect(waitForFullIsr(client, ['workload'], { delayMs: 1 })).rejects.toMatchObject({
+          type: 'TOPIC_AUTHORIZATION_FAILED',
+        })
+        expect(client.fetchTopicMetadata).toHaveBeenCalledTimes(1)
+      })
+    })
   })
 
   describe('BrokerBouncer', () => {

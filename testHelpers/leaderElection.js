@@ -197,28 +197,35 @@ const answers = async ({ host, port }, { timeout = 2000, socketFactory } = {}) =
 /**
  * Waits until every partition of `topics`, and of the internal topics the cluster has, has its
  * whole replica set in sync (`isr.length === replicas.length`), as the brokers' metadata reports
- * it.
+ * it. A topic created a moment ago can still be unknown to the broker that answers
+ * (`UNKNOWN_TOPIC_OR_PARTITION`); that counts as not yet, until the budget runs out.
  *
  * @param {import('../types').Admin} admin a connected admin client
  * @param {string[]} topics the workload topics
  * @param {{ budgetMs?: number, delayMs?: number }} [options]
  * @returns {Promise<void>}
- * @throws {Error} naming the partitions still short when the budget runs out
+ * @throws {Error} naming the partitions still short, or the unknown-topic error, when the budget
+ *   runs out; any other metadata error as it is
  */
 const waitForFullIsr = async (admin, topics, { budgetMs = 60000, delayMs = 250 } = {}) => {
   const deadline = Date.now() + budgetMs
   for (;;) {
     const internal = (await admin.listTopics()).filter((name) => INTERNAL_TOPICS.includes(name))
-    const metadata = await admin.fetchTopicMetadata({ topics: [...topics, ...internal] })
-    const short = metadata.topics.flatMap(({ name, partitions }) =>
-      partitions
-        .filter(({ isr, replicas }) => isr.length !== replicas.length)
-        .map(({ partitionId }) => `${name}-${partitionId}`)
-    )
-    if (short.length === 0) return
-    if (Date.now() >= deadline) {
-      throw new Error(`ISR not full after ${budgetMs} ms: ${short.join(', ')}`)
+    let failure
+    try {
+      const metadata = await admin.fetchTopicMetadata({ topics: [...topics, ...internal] })
+      const short = metadata.topics.flatMap(({ name, partitions }) =>
+        partitions
+          .filter(({ isr, replicas }) => isr.length !== replicas.length)
+          .map(({ partitionId }) => `${name}-${partitionId}`)
+      )
+      if (short.length === 0) return
+      failure = new Error(`ISR not full after ${budgetMs} ms: ${short.join(', ')}`)
+    } catch (error) {
+      if (error.type !== 'UNKNOWN_TOPIC_OR_PARTITION') throw error
+      failure = error
     }
+    if (Date.now() >= deadline) throw failure
     await sleep(delayMs)
   }
 }
