@@ -1111,6 +1111,7 @@ module.exports = class ConsumerGroupProtocol {
     if (leaveEpoch === -1 || leaveEpoch === -2) this.sentFields.reset()
     const sentUnderEpoch = request.MemberEpoch
     const stateAtRequest = this.state
+    const membershipAtRequest = this.membershipRevision
 
     this.lastRequestAt = Date.now()
     this.immediatePending = false
@@ -1123,7 +1124,7 @@ module.exports = class ConsumerGroupProtocol {
       })
 
       if (this.ownershipReplaced(ownershipToken) || guard?.()) return
-      if (this.answersEarlierMembership(stateAtRequest)) return
+      if (this.answersEarlierMembership(membershipAtRequest)) return
       this.sentFields.remember(request)
       if (request.SubscribedTopicRegex !== undefined) {
         this.regexUpdated = false
@@ -1155,6 +1156,9 @@ module.exports = class ConsumerGroupProtocol {
         return
       }
 
+      const fencing = error.code === UNKNOWN_MEMBER_ID || error.code === FENCED_MEMBER_EPOCH
+      if (fencing && this.answersEarlierMembership(membershipAtRequest)) return
+
       throw stampOwnership(
         this.classifyHeartbeatError(stampGeneration(error, sentUnderEpoch)),
         ownershipToken
@@ -1167,15 +1171,17 @@ module.exports = class ConsumerGroupProtocol {
   }
 
   /**
-   * Whether an answer belongs to a request built before the member began joining anew. Taken as the
-   * join's answer it would install the old epoch over the zero the join sends, settle the join with
-   * no epoch-0 heartbeat, and leave the member heartbeating an epoch the coordinator fenced.
+   * Whether an answer belongs to a request built in an earlier membership: one the member has since
+   * been fenced out of, or left, and begun a new join after. A success would install the old epoch
+   * over the join's zero and settle the join with no epoch-0 heartbeat; a fencing error would fence
+   * the new join for the old one's loss. The revision moves only on those resets, never on
+   * reconciliation progress.
    * @private
-   * @param {string} stateAtRequest the state the request was built in
+   * @param {symbol} membershipAtRequest `membershipRevision` when the request was built
    * @returns {boolean}
    */
-  answersEarlierMembership(stateAtRequest) {
-    return this.state === JOINING && stateAtRequest !== JOINING
+  answersEarlierMembership(membershipAtRequest) {
+    return membershipAtRequest !== this.membershipRevision
   }
 
   /**

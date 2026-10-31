@@ -9,7 +9,7 @@ Versions before 3.0.0 are internal alpha tags and are not published.
 
 #### Behavior changes
 
-- Under `groupProtocol: 'consumer'`, a heartbeat answer to a request built before the member began joining anew is discarded. It no longer installs the old epoch over the join's zero or settles the join, so the member sends its epoch-0 heartbeat after a fencing it learned from an offset commit.
+- Under `groupProtocol: 'consumer'`, a heartbeat answer, success or fencing error, to a request built before the member began joining anew is discarded. It no longer installs the old epoch over the join's zero, settles the join, or fences it, so the member sends its epoch-0 heartbeat after a fencing it learned from an offset commit.
 
 - Under `groupProtocol: 'consumer'`, assigned topics outside the round subscription are filtered without `RECEIVED_UNSUBSCRIBED_TOPICS` or its warning; a debug message records them. Classic behavior is unchanged.
 

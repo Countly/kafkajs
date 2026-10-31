@@ -151,6 +151,59 @@ describe('Consumer > heartbeat fault matrix', () => {
   })
 })
 
+describe('Consumer > heartbeat answered after the member began joining anew', () => {
+  /** Holds a JOINING heartbeat, fences the member, starts a new join, then returns the join state. */
+  const heldAcrossRejoin = async () => {
+    const h = build('JOINING', failure(25))
+    let answer
+    let reject
+    h.broker.consumerGroupHeartbeat.mockImplementationOnce(
+      () =>
+        new Promise((resolve, rejectCall) => {
+          answer = resolve
+          reject = rejectCall
+        })
+    )
+    const heartbeat = h.p.sendHeartbeat({ sendAllFields: true })
+    h.p.onMembershipError(failure(25))
+    const joining = h.p.rebalance({ beforeSync() {} })
+    expect(h.p.state).toBe('JOINING')
+    return { h, heartbeat, joining, answer, reject }
+  }
+
+  test('a join response cannot settle a later join after UNKNOWN_MEMBER_ID', async () => {
+    const { h, heartbeat, joining, answer } = await heldAcrossRejoin()
+    answer({ memberEpoch: 7, heartbeatIntervalMs: 100, assignment: null })
+    await heartbeat
+    const epoch = h.p.memberEpoch
+    h.p.transitionToFenced(failure(25))
+    await joining.catch(() => {})
+    expect(epoch).toBe(0)
+  })
+
+  test('a join error cannot fence a later join after UNKNOWN_MEMBER_ID', async () => {
+    const { h, heartbeat, joining, reject } = await heldAcrossRejoin()
+    reject(failure(25))
+    await heartbeat.catch(() => {})
+    const state = h.p.state
+    h.p.transitionToFenced(failure(25))
+    await joining.catch(() => {})
+    expect(state).toBe('JOINING')
+  })
+
+  test('progress inside one membership keeps its answer', async () => {
+    const h = build('RECONCILING', failure(25))
+    const revision = h.p.membershipRevision
+    h.broker.consumerGroupHeartbeat.mockResolvedValue({
+      memberEpoch: 8,
+      heartbeatIntervalMs: 100,
+      assignment: null,
+    })
+    await h.p.sendHeartbeat({})
+    expect(h.p.membershipRevision).toBe(revision)
+    expect(h.p.memberEpoch).toBe(8)
+  })
+})
 const ConsumerGroup = require('../consumerGroup')
 const RebalanceCoordinator = require('../rebalanceCoordinator')
 const OffsetManager = require('../offsetManager')
