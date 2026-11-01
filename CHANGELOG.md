@@ -151,6 +151,18 @@ Versions before 3.0.0 are internal alpha tags and are not published.
 
 - Add replayable consumer fault schedules, generated manual, rebalance-hook, forced-close and fetch-session lifecycle cases, and the `soak:consumer-churn` profile with independent log, broker-offset and handler checks, resource baselines and delivery-gap samples.
 
+### Phase 9D — Client, security and admin breadth
+
+#### Behavior changes
+
+#### Fixes
+
+#### Additions
+
+#### Tooling
+
+- Track the nineteen admin-ledger APIs in the compatibility snapshot, the tracked list and the generated matrix, with named broker ranges.
+
 ### Phase 9B — Producer parity: delivery deadline, memory bound, request size, partitioner, codecs, lifecycle
 
 #### Behavior changes

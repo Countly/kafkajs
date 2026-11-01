@@ -37,21 +37,40 @@ module.exports = {
   24: 3, // AddPartitionsToTxn
   25: 3, // AddOffsetsToTxn
   26: 3, // EndTxn
+  27: 1, // WriteTxnMarkers
   28: 3, // TxnOffsetCommit
   29: 2, // DescribeAcls
   30: 2, // CreateAcls
   31: 2, // DeleteAcls
   32: 4, // DescribeConfigs
   33: 2, // AlterConfigs
+  34: 2, // AlterReplicaLogDirs
+  35: 2, // DescribeLogDirs
   36: 2, // SaslAuthenticate
   37: 2, // CreatePartitions
+  38: 2, // CreateDelegationToken
+  39: 2, // RenewDelegationToken
+  40: 2, // ExpireDelegationToken
+  41: 2, // DescribeDelegationToken
   42: 2, // DeleteGroups
+  43: 2, // ElectLeaders
   44: 1, // IncrementalAlterConfigs
   45: 0, // AlterPartitionReassignments
   46: 0, // ListPartitionReassignments
+  47: null, // OffsetDelete
+  48: 1, // DescribeClientQuotas
+  49: 1, // AlterClientQuotas
+  50: 0, // DescribeUserScramCredentials
+  51: 0, // AlterUserScramCredentials
+  57: 0, // UpdateFeatures
+  60: 0, // DescribeCluster
+  61: 0, // DescribeProducers
+  65: 0, // DescribeTransactions
+  66: 0, // ListTransactions
   68: 0, // ConsumerGroupHeartbeat
   69: 0, // ConsumerGroupDescribe
   71: 0, // GetTelemetrySubscriptions
   72: 0, // PushTelemetry
+  74: 0, // ListConfigResources
   75: 0, // DescribeTopicPartitions
 }

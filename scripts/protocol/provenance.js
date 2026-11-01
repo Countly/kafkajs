@@ -53,7 +53,8 @@ const pinnedJar = (root = REPO_ROOT) => {
 /**
  * @param {string} [root] the repository root
  * @returns {Record<string, { kafkaTag: string, messageSha256: { Request: string, Response: string },
- *   javaClientsJar: string|null }>} one entry per implemented API, by Apache message name
+ *   javaClientsJar: string|null }>} one entry per API of the request table whose message
+ *   definition the snapshot holds, implemented or not, by Apache message name
  */
 const compute = (root = REPO_ROOT) => {
   const tag = kafkaTag()
@@ -66,9 +67,9 @@ const compute = (root = REPO_ROOT) => {
   const messages = path.join(root, 'scripts', 'compat', 'messages', tag)
 
   return Object.fromEntries(
-    Object.entries(requests)
-      .filter(([, definition]) => definition.versions.length > 0)
-      .map(([key]) => messageOfKey(key))
+    Object.keys(requests)
+      .map(messageOfKey)
+      .filter((message) => fs.existsSync(path.join(messages, `${message}Request.json`)))
       .sort()
       .map((message) => [
         message,
