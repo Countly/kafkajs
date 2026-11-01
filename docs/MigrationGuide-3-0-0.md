@@ -1141,6 +1141,8 @@ Describe calls can request the optional raw authorized-operations mask; an unsup
 
 Topic-offset reads accept isolationLevel: 'read_committed' (the unchanged default) or 'read_uncommitted'. During an open transaction, the default high is the last stable offset; use read_uncommitted for high-watermark committed lag and a raw fetchOffsets read with resolveOffsets: false. Missing commits are distinct from zero. Broker errorMessage is separate from stable protocol messages. deleteTopicRecords still returns Promise<void>; inspect the existing error/cause chain for its failing partitions and read low watermarks with fetchTopicOffsets. listTopics remains string[]; fetchTopicMetadata() provides topicId and isInternal from the same fresh Metadata snapshot.
 
+Transaction diagnostics and recovery are available through `describeProducers`, `describeTransactions`, `listTransactions`, `abortTransaction` and `fenceProducers`. The Java `forceTerminateTransaction(id)` equivalent is `admin.fenceProducers({ transactionalIds: [id] })`; there is no separate method. Producer IDs and other 64-bit results are decimal strings. Diagnostic and fence calls return per-item errors, while `abortTransaction` resolves without a value or throws and `listTransactions` fails as a whole if a broker fails. All five calls use the admin `apiTimeout`; expiry cannot recall an abort or fence already sent. Existing producer transaction methods keep their behavior.
+
 ### Errors and events
 
 Error classes and categories, new instrumentation events and the payload keys they gain, and what is

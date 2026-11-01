@@ -1,0 +1,7 @@
+{
+  "message": "WriteTxnMarkersRequest",
+  "version": 2,
+  "case": "transactionVersionTwo",
+  "hex": "02002000000000000100070002076f726465727302000000020000000009020000",
+  "fields": {"markers":[{"producerId":"9007199254740993","producerEpoch":7,"transactionResult":false,"topics":[{"topic":"orders","partitions":[2]}],"coordinatorEpoch":9,"transactionVersion":2}]}
+}

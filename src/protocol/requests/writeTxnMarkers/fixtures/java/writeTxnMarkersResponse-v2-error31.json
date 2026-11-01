@@ -1,0 +1,7 @@
+{
+  "message": "WriteTxnMarkersResponse",
+  "version": 2,
+  "case": "error31",
+  "hex": "02002000000000000102076f72646572730200000002001f00000000",
+  "fields": {"markers":[{"producerId":"9007199254740993","topics":[{"topic":"orders","partitions":[{"partition":2,"errorCode":31}]}]}]}
+}

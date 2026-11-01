@@ -1694,3 +1694,20 @@ async function groupOffsetMethods(admin: import('./index').Admin) {
   await admin.fetchOffsetsForGroups({groups:[{groupId:'g'}],requireStable:'yes'})
   return {code,offset,metadata,epoch}
 }
+
+const transactionDescription: Promise<kafkajs.TransactionDescription[]> = admin.describeTransactions({ transactionalIds: ['tx'], apiTimeout: 10 })
+const transactionProducers = admin.describeProducers({ topicPartitions: [{ topic: 'orders', partitions: [0] }], brokerId: 0 })
+const transactionList = admin.listTransactions({ producerIds: ['9007199254740993', 1], durationFilter: 0, transactionalIdPattern: 'tx.*' })
+const transactionAbort: Promise<void> = admin.abortTransaction({ topic: 'orders', partition: 0, producerId: '9007199254740993', producerEpoch: 7, coordinatorEpoch: 9 })
+const transactionFence = admin.fenceProducers({ transactionalIds: ['tx'], transactionTimeout: 60000 })
+transactionProducers.then((rows) => { const id: string = rows[0].partitions[0].activeProducers[0].producerId; void id })
+transactionFence.then((rows) => { const id: string | null = rows[0].producerId; const error: kafkajs.KafkaJSError | null = rows[0].error; void id; void error })
+// @ts-expect-error broker RE2 filters are strings
+admin.listTransactions({ transactionalIdPattern: /tx/ })
+// @ts-expect-error transaction timeout is a number
+admin.fenceProducers({ transactionalIds: ['tx'], transactionTimeout: '60000' })
+// @ts-expect-error abort has no item result
+const transactionAbortItems: Promise<kafkajs.AdminItemResult[]> = admin.abortTransaction({ topic: 'orders', partition: 0, producerId: 1, producerEpoch: 0, coordinatorEpoch: 0 })
+// @ts-expect-error force termination is an equivalent invocation, not a new method
+admin.forceTerminateTransaction('tx')
+void transactionDescription; void transactionList; void transactionAbort; void transactionAbortItems

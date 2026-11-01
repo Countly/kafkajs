@@ -1,0 +1,89 @@
+[
+  {
+    "message": "ListTransactionsRequest",
+    "version": 0,
+    "case": "basic",
+    "hex": "03084f6e676f696e670c467574757265537461746502002000000000000100",
+    "fields": {
+      "states": ["Ongoing", "FutureState"],
+      "producerIds": ["9007199254740993"]
+    }
+  },
+  {
+    "message": "ListTransactionsResponse",
+    "version": 0,
+    "case": "ok",
+    "hex": "000000110000020c4675747572655374617465020574782d610020000000000001084f6e676f696e670000",
+    "fields": {
+      "throttleTime": 17,
+      "errorCode": 0,
+      "unknownStateFilters": ["FutureState"],
+      "transactions": [
+        {
+          "transactionalId": "tx-a",
+          "producerId": "9007199254740993",
+          "state": "Ongoing"
+        }
+      ]
+    }
+  },
+  {
+    "message": "ListTransactionsRequest",
+    "version": 1,
+    "case": "basic",
+    "hex": "03084f6e676f696e670c467574757265537461746502002000000000000100000000000000fa00",
+    "fields": {
+      "states": ["Ongoing", "FutureState"],
+      "producerIds": ["9007199254740993"],
+      "durationFilter": "250"
+    }
+  },
+  {
+    "message": "ListTransactionsResponse",
+    "version": 1,
+    "case": "ok",
+    "hex": "000000110000020c4675747572655374617465020574782d610020000000000001084f6e676f696e670000",
+    "fields": {
+      "throttleTime": 17,
+      "errorCode": 0,
+      "unknownStateFilters": ["FutureState"],
+      "transactions": [
+        {
+          "transactionalId": "tx-a",
+          "producerId": "9007199254740993",
+          "state": "Ongoing"
+        }
+      ]
+    }
+  },
+  {
+    "message": "ListTransactionsRequest",
+    "version": 2,
+    "case": "basic",
+    "hex": "03084f6e676f696e670c467574757265537461746502002000000000000100000000000000fa085e74782d2e2a2400",
+    "fields": {
+      "states": ["Ongoing", "FutureState"],
+      "producerIds": ["9007199254740993"],
+      "durationFilter": "250",
+      "transactionalIdPattern": "^tx-.*$"
+    }
+  },
+  {
+    "message": "ListTransactionsResponse",
+    "version": 2,
+    "case": "ok",
+    "hex": "000000110000020c4675747572655374617465020574782d610020000000000001084f6e676f696e670000",
+    "fields": {
+      "throttleTime": 17,
+      "errorCode": 0,
+      "unknownStateFilters": ["FutureState"],
+      "transactions": [
+        {
+          "transactionalId": "tx-a",
+          "producerId": "9007199254740993",
+          "state": "Ongoing"
+        }
+      ]
+    }
+  }
+]

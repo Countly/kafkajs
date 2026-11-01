@@ -99,6 +99,14 @@ An unconfirmed commit keeps its offsets staged for a confirmed retry. A commit c
 
 ## <a name="errors"></a> When something fails
 
+Use admin transaction diagnostics to inspect a stuck transaction from outside the producer: `describeTransactions({ transactionalIds })`, `describeProducers({ topicPartitions })` and `listTransactions({ states: ['Ongoing'] })`. Administrative recovery is separate from a producer's own transaction object. `abortTransaction` writes an abort marker for the specified producer epoch and partition; physical records remain, while `read_committed` hides aborted records. `fenceProducers` starts a new producer epoch through the transaction coordinator. The equivalent of Java's `forceTerminateTransaction(id)` is:
+
+```javascript
+await admin.fenceProducers({ transactionalIds: [id] })
+```
+
+The existing producer becomes unusable when it observes its fencing failure; create a new producer. An admin `apiTimeout` does not prove an already-sent abort or fence failed remotely. Check the returned per-id errors and re-read diagnostics before repeating recovery.
+
 Every error carries a `category` saying what to do about it:
 
 | `category`               | Meaning                                                                    | What to do                                                            |

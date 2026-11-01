@@ -31,7 +31,7 @@ Gap classes: `current` (fork max equals the Kafka max) · `behind:N` · `stub` (
 | AddPartitionsToTxn | 24 | 0-5 | v3+ | 0-3 | behind:2 | v2 PRODUCER_FENCED, v3 flexible. v3 is the client ceiling: the message definition keeps v4 (batched transactions, VerifyOnly) and v5 for broker-to-broker calls, so behind:2 is this API's steady state. Under transaction version 2 (KIP-890 part 2) a client does not send it: Produce v12 adds the partition implicitly. |
 | AddOffsetsToTxn | 25 | 0-4 | v3+ | 0-4 | current | v2 PRODUCER_FENCED, v3 flexible, v4 TRANSACTION_ABORTABLE (KIP-890). Under transaction version 2 (KIP-890 part 2) a client does not send it: TxnOffsetCommit v5 adds the offsets implicitly. |
 | EndTxn | 26 | 0-5 | v3+ | 0-5 | current | v2 PRODUCER_FENCED, v3 flexible, v4 TRANSACTION_ABORTABLE, v5 returns the producer id and epoch the coordinator bumped to (KIP-890 part 2). A transaction stays at v4 or below unless its coordinator finalizes transaction.version at level 2 or above in ApiVersions v3+; v5 being advertised is not the signal. |
-| WriteTxnMarkers | 27 | 1-2 | v1+ | — | stub | Written by a transaction coordinator to the leaders of the partitions in a transaction, and also sent by `abortTransaction`. v1 is the 4.0 baseline and flexible; v2 adds TransactionVersion (KIP-1228). Not yet implemented. |
+| WriteTxnMarkers | 27 | 1-2 | v1+ | 1-2 | current | Written by a transaction coordinator to the leaders of the partitions in a transaction, and also sent by `abortTransaction`. v1 is the 4.0 baseline and flexible; v2 adds TransactionVersion (KIP-1228). Not yet implemented. |
 | TxnOffsetCommit | 28 | 0-5 | v3+ | 0-5 | current | v2 committed leader epoch, v3 flexible with KIP-447 group metadata (generation, member id, group instance id), v4 TRANSACTION_ABORTABLE, v5 adds the offsets to the transaction itself under transaction version 2, so no AddOffsetsToTxn precedes it. A transaction stays at v4 or below unless its coordinator finalizes transaction.version at level 2 or above. |
 | DescribeAcls | 29 | 1-3 | v2+ | 1-3 | current | v1 is the 4.x floor; v3 adds the USER resource type, and every 4.x broker offers v1 to v3. |
 | CreateAcls | 30 | 1-3 | v2+ | 1-3 | current | v1 is the 4.x floor; v3 adds the USER resource type, and every 4.x broker offers v1 to v3. |
@@ -58,9 +58,9 @@ Gap classes: `current` (fork max equals the Kafka max) · `behind:N` · `stub` (
 | AlterUserScramCredentials | 51 | 0 | v0+ | — | stub |  |
 | UpdateFeatures | 57 | 0-2 | v0+ | — | stub |  |
 | DescribeCluster | 60 | 0-2 | v0+ | — | stub |  |
-| DescribeProducers | 61 | 0 | v0+ | — | stub |  |
-| DescribeTransactions | 65 | 0 | v0+ | — | stub |  |
-| ListTransactions | 66 | 0-2 | v0+ | — | stub |  |
+| DescribeProducers | 61 | 0 | v0+ | 0 | current |  |
+| DescribeTransactions | 65 | 0 | v0+ | 0 | current |  |
+| ListTransactions | 66 | 0-2 | v0+ | 0-2 | current |  |
 | ConsumerGroupHeartbeat | 68 | 0-1 | v0+ | 0-1 | current | Required for the KIP-848 consumer group protocol (groupProtocol: 'consumer'), GA since Kafka 4.0. |
 | ConsumerGroupDescribe | 69 | 0-1 | v0+ | 0-1 | current | Admin-side counterpart of KIP-848; needed so group descriptions stop reporting consumer-protocol groups as Dead. |
 | GetTelemetrySubscriptions | 71 | 0 | v0+ | — | not-planned | Client telemetry (KIP-714); deferred. |

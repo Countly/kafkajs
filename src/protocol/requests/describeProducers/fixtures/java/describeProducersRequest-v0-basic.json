@@ -1,0 +1,7 @@
+{
+  "message": "DescribeProducersRequest",
+  "version": 0,
+  "case": "basic",
+  "hex": "02076f72646572730300000000000000020000",
+  "fields": {"topics":[{"topic":"orders","partitions":[0,2]}]}
+}

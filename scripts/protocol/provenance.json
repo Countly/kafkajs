@@ -205,7 +205,7 @@
       "Request": "b7db1a8154ace225ca9eb3a35e78d038baeee567934a0a74265fce1ae4289fcd",
       "Response": "6019232d4144a18aed721cc50724304f4d6e260680ba0c1f373cf25346deb3b0"
     },
-    "javaClientsJar": null
+    "javaClientsJar": "4.3.1"
   },
   "DescribeTopicPartitions": {
     "kafkaTag": "4.3.1",
@@ -221,7 +221,7 @@
       "Request": "c0a31e10bc7525cd0d61a49e4035a8ab67ae49387d20db61205dc4a060f07769",
       "Response": "d14d889ed117bb0c2d5c2a39b3937f6df997abc443a5ad7ac754d4112ec6aeae"
     },
-    "javaClientsJar": null
+    "javaClientsJar": "4.3.1"
   },
   "DescribeUserScramCredentials": {
     "kafkaTag": "4.3.1",
@@ -349,7 +349,7 @@
       "Request": "b54931d4ab03cf2a6da501737b5e59709447448e680e54037a741b824bb94176",
       "Response": "154abac86cb57d4e87827194d890efb5a01deb16970e31476bbd4cc86686abed"
     },
-    "javaClientsJar": null
+    "javaClientsJar": "4.3.1"
   },
   "Metadata": {
     "kafkaTag": "4.3.1",
@@ -453,6 +453,6 @@
       "Request": "3845cb619a6da7b3d9ca8588d3f23e9a7adf6bf8fef3fe64ddc96013e49ac0f9",
       "Response": "0dc0ffd22775d3f05dc9a588ef8541d8e938651431350b75890d7fccb304af39"
     },
-    "javaClientsJar": null
+    "javaClientsJar": "4.3.1"
   }
 }

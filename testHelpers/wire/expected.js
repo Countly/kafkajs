@@ -18,6 +18,219 @@
  * numbers below are that file's.
  */
 module.exports = {
+  describeProducersV0: {
+    source: 'Apache Kafka 4.3.1 message layout; Java verification required',
+    request: {
+      topics: [
+        {
+          topic: 'orders',
+          partitions: [0, 2],
+        },
+      ],
+    },
+    response: {
+      throttleTime: 17,
+      topics: [
+        {
+          topic: 'orders',
+          partitions: [
+            {
+              partition: 0,
+              errorCode: 0,
+              errorMessage: null,
+              activeProducers: [
+                {
+                  producerId: '9007199254740993',
+                  producerEpoch: 65537,
+                  lastSequence: 23,
+                  lastTimestamp: '9007199254740994',
+                  coordinatorEpoch: 9,
+                  currentTxnStartOffset: '-1',
+                },
+              ],
+            },
+            {
+              partition: 2,
+              errorCode: 6,
+              errorMessage: 'moved',
+              activeProducers: [],
+            },
+          ],
+        },
+      ],
+    },
+  },
+  describeTransactionsV0: {
+    source: 'Apache Kafka 4.3.1 message layout; Java verification required',
+    request: {
+      transactionalIds: ['tx-a', 'tx-b'],
+    },
+    response: {
+      throttleTime: 17,
+      transactions: [
+        {
+          errorCode: 0,
+          transactionalId: 'tx-a',
+          state: 'Ongoing',
+          timeoutMs: 60000,
+          startTimeMs: '9007199254740994',
+          producerId: '9007199254740993',
+          producerEpoch: 7,
+          topics: [
+            {
+              topic: 'orders',
+              partitions: [0, 2],
+            },
+          ],
+        },
+        {
+          errorCode: 53,
+          transactionalId: 'tx-b',
+          state: 'Unknown',
+          timeoutMs: 0,
+          startTimeMs: '-1',
+          producerId: '-1',
+          producerEpoch: -1,
+          topics: [],
+        },
+      ],
+    },
+  },
+  listTransactionsV0: {
+    source: 'Apache Kafka 4.3.1 message layout; Java verification required',
+    request: {
+      states: ['Ongoing', 'FutureState'],
+      producerIds: ['9007199254740993'],
+    },
+    response: {
+      throttleTime: 17,
+      errorCode: 0,
+      unknownStateFilters: ['FutureState'],
+      transactions: [
+        {
+          transactionalId: 'tx-a',
+          producerId: '9007199254740993',
+          state: 'Ongoing',
+        },
+      ],
+    },
+  },
+  listTransactionsV1: {
+    source: 'Apache Kafka 4.3.1 message layout; Java verification required',
+    request: {
+      states: ['Ongoing', 'FutureState'],
+      producerIds: ['9007199254740993'],
+      durationFilter: '250',
+    },
+    response: {
+      throttleTime: 17,
+      errorCode: 0,
+      unknownStateFilters: ['FutureState'],
+      transactions: [
+        {
+          transactionalId: 'tx-a',
+          producerId: '9007199254740993',
+          state: 'Ongoing',
+        },
+      ],
+    },
+  },
+  listTransactionsV2: {
+    source: 'Apache Kafka 4.3.1 message layout; Java verification required',
+    request: {
+      states: ['Ongoing', 'FutureState'],
+      producerIds: ['9007199254740993'],
+      durationFilter: '250',
+      transactionalIdPattern: '^tx-.*$',
+    },
+    response: {
+      throttleTime: 17,
+      errorCode: 0,
+      unknownStateFilters: ['FutureState'],
+      transactions: [
+        {
+          transactionalId: 'tx-a',
+          producerId: '9007199254740993',
+          state: 'Ongoing',
+        },
+      ],
+    },
+  },
+  writeTxnMarkersV1: {
+    source: 'Apache Kafka 4.3.1 message layout; Java verification required',
+    request: {
+      markers: [
+        {
+          producerId: '9007199254740993',
+          producerEpoch: 7,
+          transactionResult: false,
+          topics: [
+            {
+              topic: 'orders',
+              partitions: [2],
+            },
+          ],
+          coordinatorEpoch: 9,
+        },
+      ],
+    },
+    response: {
+      markers: [
+        {
+          producerId: '9007199254740993',
+          topics: [
+            {
+              topic: 'orders',
+              partitions: [
+                {
+                  partition: 2,
+                  errorCode: 0,
+                },
+              ],
+            },
+          ],
+        },
+      ],
+    },
+  },
+  writeTxnMarkersV2: {
+    source: 'Apache Kafka 4.3.1 message layout; Java verification required',
+    request: {
+      markers: [
+        {
+          producerId: '9007199254740993',
+          producerEpoch: 7,
+          transactionResult: false,
+          topics: [
+            {
+              topic: 'orders',
+              partitions: [2],
+            },
+          ],
+          coordinatorEpoch: 9,
+          transactionVersion: 0,
+        },
+      ],
+    },
+    response: {
+      markers: [
+        {
+          producerId: '9007199254740993',
+          topics: [
+            {
+              topic: 'orders',
+              partitions: [
+                {
+                  partition: 2,
+                  errorCode: 0,
+                },
+              ],
+            },
+          ],
+        },
+      ],
+    },
+  },
   metadataV7: {
     source:
       'MetadataRequest/Response 4.3.1 v7 field literals; independent Java v7 serialization acceptance required',

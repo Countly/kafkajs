@@ -1070,3 +1070,43 @@ OngoingPartitionReassignment Structure:
 }
 ```
 **Note:** If a partition is not going through a reassignment, its AddingReplicas and RemovingReplicas fields will simply be empty.
+
+## Transaction administration
+
+`describeProducers` queries partition leaders by default. Pass `brokerId` to query that replica for every selected partition. A fixed replica's `NOT_LEADER_OR_FOLLOWER` is returned as partition data; automatic leader discovery relocates on that error. Producer state includes `producerId`, `producerEpoch`, `lastSequence`, `lastTimestamp`, `coordinatorEpoch` and `currentTxnStartOffset`. Every 64-bit value is a decimal string.
+
+```javascript
+const producers = await admin.describeProducers({
+  topicPartitions: [{ topic: 'orders', partitions: [0, 2] }],
+  apiTimeout: 10000,
+})
+const descriptions = await admin.describeTransactions({ transactionalIds: ['payments'] })
+const listed = await admin.listTransactions({
+  states: ['Ongoing'],
+  producerIds: ['9007199254740993'],
+  durationFilter: 60000,
+  transactionalIdPattern: '^payments-.*$',
+})
+```
+
+`describeTransactions` locates each transaction coordinator and batches ids sharing one coordinator. Its per-id results include state, timeout, start time, producer identity and participating topics. `listTransactions` asks every broker sequentially and returns `{ transactions, unknownStateFilters }`; any broker's final failure rejects the whole call. State names and unknown filters are broker strings. `transactionalIdPattern` is a RE2 string evaluated by the broker; it is never compiled as a JavaScript `RegExp`. A meaningful pattern needs ListTransactions v2; a duration filter needs v1. An unsupported meaningful filter throws `KafkaJSServerDoesNotSupportApiKey` naming the option, the version it needs and the broker's offered range. Omitted or empty filter arrays, and an empty pattern, mean no filter.
+
+`describeProducers`, `describeTransactions` and `fenceProducers` return `errorCode`, typed `error` and nullable `errorMessage` on each requested partition or id. Code 0 means success, a protocol code means a broker failure, and code -1 with a typed `error` means an unresolved local route, connection-setup or transport failure; that `error` is the original one, even when it carries a protocol code. Completed items are retained through retries and exhaustion. Unresolved local transaction descriptions use `Unknown`, timeout 0, decimal `'-1'` start/id, epoch -1 and empty topics; unsuccessful fences with no granted identity use null producerId/epoch.
+
+```javascript
+await admin.abortTransaction({
+  topic: 'orders',
+  partition: 0,
+  producerId: '9007199254740993',
+  producerEpoch: 7,
+  coordinatorEpoch: 9,
+})
+const fenced = await admin.fenceProducers({
+  transactionalIds: ['payments'],
+  transactionTimeout: 60000,
+})
+```
+
+`abortTransaction` sends one administrative abort marker to one partition leader, requires administrative broker permission and resolves `undefined` on success. It checks the exact marker identity. It does not erase records from the log or call the producer's `abort()` method; aborted transactional data remains physically present and is hidden from a `read_committed` consumer. `fenceProducers` uses FindCoordinator plus InitProducerId, with no existing producer identity, for each id. Its `transactionTimeout` defaults to 60000 ms and is independent of the API deadline. The Java `forceTerminateTransaction(id)` equivalent is `admin.fenceProducers({ transactionalIds: [id] })`. Once a producer observes its fencing failure, create a new producer instance as described in the transaction failure guidance.
+
+Public producer IDs must be nonnegative safe integral numbers or canonical decimal strings through 9223372036854775807. Use strings above Number.MAX_SAFE_INTEGER. Partitions/broker ids are integers 0..2147483647; abort producer epochs 0..32767 and coordinator epochs 0..2147483647. Transaction ids, topics and mutation lists are nonempty and unique. `durationFilter` is nonnegative safe integral milliseconds; `transactionTimeout` is integer 1..2147483647 ms. All five APIs accept `apiTimeout` and inherit the configured admin default. A timed-out mutation can already have applied remotely; inspect the broker state before deciding to repeat it.

@@ -9,6 +9,8 @@ We rely on a suite of largely integration tests, using `jest` as a test runner, 
 
 `npm run test:unit` runs the tests that don't need a running Kafka cluster (protocol encoding/decoding, utilities, retry logic, partitioners, assigners, loggers, instrumentation). Use this for fast, iterative feedback while working on broker-free code.
 
+Transaction administration has brokerless routing, capability, partial-result, validation and fake-socket coverage in `transactionDiagnostics.spec.js` and `abortFence.spec.js`. The four transaction codec families and seven wire pairs are checked against independent Apache Java vectors before registration. Live open-transaction, administrative abort visibility and producer-fencing evidence is owned by the admin-ledger live arm; the brokerless cases alone do not establish those outcomes.
+
 ## Integration tests
 
 Most of the test suite talks to a real Kafka cluster. `npm test` runs `npm run lint`, `npm run compat:check` and `npm run protocol:check`, boots the cluster, runs everything, and tears the cluster down again — it's a convenient local shortcut, but it is not what CI runs.

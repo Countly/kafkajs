@@ -1,0 +1,7 @@
+{
+  "message": "ListTransactionsRequest",
+  "version": 2,
+  "case": "basic",
+  "hex": "03084f6e676f696e670c467574757265537461746502002000000000000100000000000000fa085e74782d2e2a2400",
+  "fields": {"states":["Ongoing","FutureState"],"producerIds":["9007199254740993"],"durationFilter":"250","transactionalIdPattern":"^tx-.*$"}
+}

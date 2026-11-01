@@ -171,6 +171,8 @@ Versions before 3.0.0 are internal alpha tags and are not published.
 
 - Admin clients can delete committed group offsets with deleteOffsets and read several groups with fetchOffsetsForGroups. fetchOffsets accepts requireStable; its default remains false.
 
+- `admin.describeProducers`, `describeTransactions`, `listTransactions` (with the KIP-1152 `transactionalIdPattern` filter, a RE2 string evaluated by the broker), `abortTransaction` and `fenceProducers`; `forceTerminateTransaction` is `fenceProducers({ transactionalIds: [id] })`.
+
 - `connectionsMaxIdle`.
 
 - `AdminConfig.apiTimeout` and a per-call `apiTimeout`; `includeAuthorizedOperations` on group descriptions and `includeTopicAuthorizedOperations` on topic metadata. Requested supported masks retain the raw signed INT32 value; an absent, unsupported or unrequested mask is `null`.

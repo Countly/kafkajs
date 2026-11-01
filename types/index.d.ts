@@ -944,7 +944,68 @@ export interface OngoingPartitionReassignment {
   removingReplicas?: number[]
 }
 
+/** Topic names and their partition indexes, in caller order. */
+export type TopicPartitionList = Array<{ topic: string; partitions: number[] }>
+/** Producer state observed on a partition replica; int64 fields are decimal strings. */
+export interface TransactionProducerState {
+  producerId: string
+  producerEpoch: number
+  lastSequence: number
+  lastTimestamp: string
+  coordinatorEpoch: number
+  currentTxnStartOffset: string
+}
+/** One transaction coordinator's description, including broker sentinels on failed items. */
+export interface TransactionDescription extends AdminItemResult {
+  transactionalId: string
+  state: string
+  timeoutMs: number
+  startTimeMs: string
+  producerId: string
+  producerEpoch: number
+  topics: TopicPartitionList
+}
+
 export type Admin = {
+  /** Describes partition leaders or one named replica; errors are partition data.
+   * @param options unique topicPartitions and optional brokerId
+   * @returns topic results with lossless int64 producer state
+   * @throws invalid input, capability, malformed identity or apiTimeout
+   */
+  describeProducers(options: { topicPartitions: TopicPartitionList; brokerId?: number } & ApiTimeoutOption): Promise<Array<{
+    topic: string
+    partitions: Array<{ partition: number; activeProducers: TransactionProducerState[] } & AdminItemResult>
+  }>>
+  /** Describes ids batched per transaction coordinator; completed items are never retried.
+   * @param options unique nonempty transactionalIds
+   * @returns caller-ordered descriptions with per-id errors
+   * @throws invalid input, capability, malformed identity or apiTimeout
+   */
+  describeTransactions(options: { transactionalIds: string[] } & ApiTimeoutOption): Promise<TransactionDescription[]>
+  /** Lists every broker sequentially, failing the whole call if a broker fails.
+   * @param options optional filters; pattern is a broker RE2 string, meaningful pattern needs v2
+   * @returns combined transactions and unknown state names
+   * @throws invalid filter, unavailable capability, broker error or apiTimeout
+   */
+  listTransactions(options?: {
+    states?: string[]
+    producerIds?: Array<string | number>
+    durationFilter?: number
+    transactionalIdPattern?: string
+  } & ApiTimeoutOption): Promise<{ transactions: Array<{ transactionalId: string; producerId: string; state: string }>; unknownStateFilters: string[] }>
+  /** Writes one abort marker to the leader; an expired call can have applied remotely.
+   * @param options exact producer/topic/partition identity and epochs
+   * @returns completion without an item-result object
+   * @throws invalid input, capability, marker identity, terminal protocol or apiTimeout
+   */
+  abortTransaction(options: { topic: string; partition: number; producerId: string | number; producerEpoch: number; coordinatorEpoch: number } & ApiTimeoutOption): Promise<void>
+  /** Fences ids with InitProducerId's minus-one sentinels; existing producer objects are independent.
+   * @param options ids and transactionTimeout integer ms, default 60000
+   * @returns per-id producerId/epoch, or null on unresolved local failure
+   * @throws invalid input, capability or apiTimeout
+   */
+  fenceProducers(options: { transactionalIds: string[]; transactionTimeout?: number } & ApiTimeoutOption): Promise<Array<{ transactionalId: string; producerId: string | null; producerEpoch: number | null } & AdminItemResult>>
+
   connect(): Promise<void>
   disconnect(): Promise<void>
   listTopics(options?: ApiTimeoutOption): Promise<string[]>
@@ -1217,6 +1278,26 @@ export type LeaveGroupMember = {
 }
 
 export type Broker = {
+  /** Sends compact producer diagnostics to this replica. @param options wire topics @returns partition rows @throws capability, wire or deadline failure. */
+  describeProducers(options: { topics: TopicPartitionList }): Promise<{
+    throttleTime: number; clientSideThrottleTime: number
+    topics: Array<{ topic: string; partitions: Array<{ partition: number; errorCode: number; errorMessage: string | null; activeProducers: TransactionProducerState[] }> }>
+  }>
+  /** Describes transaction ids on this coordinator. @param options ids @returns raw rows @throws wire or capability failure. */
+  describeTransactions(options: { transactionalIds: string[] }): Promise<{
+    throttleTime: number; clientSideThrottleTime: number
+    transactions: Array<Omit<TransactionDescription, 'error' | 'errorMessage'>>
+  }>
+  /** Lists this broker, refusing unsupported meaningful filters. @param options filters @returns raw aggregate @throws broker or capability failure. */
+  listTransactions(options: { states: string[]; producerIds: string[]; durationFilter: string; transactionalIdPattern: string | null }): Promise<{
+    throttleTime: number; clientSideThrottleTime: number; errorCode: number
+    transactions: Array<{ transactionalId: string; producerId: string; state: string }>; unknownStateFilters: string[]
+  }>
+  /** Writes explicit markers to this broker. @param options marker fields @returns raw marker rows @throws capability or wire failure. */
+  writeTxnMarkers(options: { markers: Array<{ producerId: string; producerEpoch: number; transactionResult: boolean; topics: TopicPartitionList; coordinatorEpoch: number; transactionVersion?: number }> }): Promise<{
+    markers: Array<{ producerId: string; topics: Array<{ topic: string; partitions: Array<{ partition: number; errorCode: number }> }> }>
+  }>
+
   /**
    * The finalized features of the ApiVersions response the broker's current versions came from;
    * `{}` before the first negotiation.

@@ -1746,6 +1746,76 @@ module.exports = class Broker {
     return await this[PRIVATE.SEND_REQUEST](incrementalAlterConfigs({ resources, validateOnly }))
   }
 
+  /** Sends DescribeProducers to this selected broker, retaining item codes.
+   * @param {object} options wire fields @returns {Promise<object>} decoded fields
+   * @throws {Error} capability, protocol, lifecycle or deadline failure
+   */
+  async describeProducers(options) {
+    const build = this.transactionRequest(apiKeys.DescribeProducers, requests.DescribeProducers)
+    return this[PRIVATE.SEND_REQUEST](build(options))
+  }
+
+  /** Sends DescribeTransactions to this selected broker, retaining item codes.
+   * @param {object} options wire fields @returns {Promise<object>} decoded fields
+   * @throws {Error} capability, protocol, lifecycle or deadline failure
+   */
+  async describeTransactions(options) {
+    const build = this.transactionRequest(
+      apiKeys.DescribeTransactions,
+      requests.DescribeTransactions
+    )
+    return this[PRIVATE.SEND_REQUEST](build(options))
+  }
+
+  /** Sends WriteTxnMarkers to this selected broker, retaining item codes.
+   * @param {object} options wire fields @returns {Promise<object>} decoded fields
+   * @throws {Error} capability, protocol, lifecycle or deadline failure
+   */
+  async writeTxnMarkers(options) {
+    const build = this.transactionRequest(apiKeys.WriteTxnMarkers, requests.WriteTxnMarkers)
+    return this[PRIVATE.SEND_REQUEST](build(options))
+  }
+
+  /** Builds an admin transaction request with an explicit capability range diagnostic.
+   * @param {number} apiKey protocol key @param {object} definition implemented family
+   * @param {number} [required=0] minimum for requested filters
+   * @param {string} [option] requested option that needs the minimum, named in the diagnostic
+   * @returns {Function} negotiated builder @throws {KafkaJSServerDoesNotSupportApiKey} insufficient overlap
+   */
+  transactionRequest(apiKey, definition, required = 0, option) {
+    const version = this.negotiatedVersion(apiKey, definition)
+    if (version === null || version < required) {
+      const offered = this.versions?.[apiKey]
+      const name = Object.keys(apiKeys).find((name) => apiKeys[name] === apiKey)
+      throw new KafkaJSServerDoesNotSupportApiKey(
+        `${name}${option ? ` option ${option}` : ''} needs v${required} or newer; client implements v${definition.versions[0]}-v${definition.versions.at(-1)}; broker offers ${offered ? `v${offered.minVersion ?? 0}-v${offered.maxVersion}` : 'no range'}`,
+        { apiKey, apiName: name }
+      )
+    }
+    return this.lookupRequest(apiKey, definition)
+  }
+
+  /** Lists this broker's transactions with version-gated filters.
+   * @param {object} options wire filters @returns {Promise<object>} aggregate broker response
+   * @throws {Error} unsupported meaningful filter, named with its version, protocol or deadline failure
+   */
+  async listTransactions(options) {
+    const pattern = options.transactionalIdPattern
+    const [required, option] =
+      pattern !== null && pattern !== undefined && pattern !== ''
+        ? [2, 'transactionalIdPattern']
+        : options.durationFilter !== undefined && String(options.durationFilter) !== '-1'
+          ? [1, 'durationFilter']
+          : [0]
+    const build = this.transactionRequest(
+      apiKeys.ListTransactions,
+      requests.ListTransactions,
+      required,
+      option
+    )
+    return this[PRIVATE.SEND_REQUEST](build(options))
+  }
+
   /**
    * Send an `InitProducerId` request to fetch a PID and bump the producer epoch.
    *

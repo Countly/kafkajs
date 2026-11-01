@@ -29,4 +29,36 @@ const failureSourceOf = (error) => {
   }
 }
 
-module.exports = { attachFailureSource, failureSourceOf }
+const RESPONSE_SOURCE = Symbol('kafkajs:responseSource')
+
+/**
+ * Notes on an error that it ended the handling of a response, and the API key of the request that
+ * response answered. Setup requests (ApiVersions, SASL) note their own keys, so a caller can tell
+ * its request's broker reply from a failure on the way to sending it. Private and first-note-stays,
+ * like `attachFailureSource`.
+ * @param {*} error whatever decoding, parsing or the response guard threw
+ * @param {number} apiKey the answered request's API key
+ * @returns {void}
+ */
+const attachResponseSource = (error, apiKey) => {
+  try {
+    if (error !== null && typeof error === 'object' && !(RESPONSE_SOURCE in error)) {
+      Object.defineProperty(error, RESPONSE_SOURCE, { value: apiKey })
+    }
+  } catch {}
+}
+
+/**
+ * @param {*} error
+ * @returns {number|undefined} the API key of the request whose response handling raised the
+ *   error, when `attachResponseSource` noted it
+ */
+const responseSourceOf = (error) => {
+  try {
+    return error !== null && typeof error === 'object' ? error[RESPONSE_SOURCE] : undefined
+  } catch {
+    return undefined
+  }
+}
+
+module.exports = { attachFailureSource, failureSourceOf, attachResponseSource, responseSourceOf }

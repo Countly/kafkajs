@@ -1,0 +1,53 @@
+[
+  {
+    "message": "DescribeProducersRequest",
+    "version": 0,
+    "case": "basic",
+    "hex": "02076f72646572730300000000000000020000",
+    "fields": {
+      "topics": [
+        {
+          "topic": "orders",
+          "partitions": [0, 2]
+        }
+      ]
+    }
+  },
+  {
+    "message": "DescribeProducersResponse",
+    "version": 0,
+    "case": "ok",
+    "hex": "0000001102076f726465727303000000000000000200200000000000010001000100000017002000000000000200000009ffffffffffffffff0000000000020006066d6f76656401000000",
+    "fields": {
+      "throttleTime": 17,
+      "topics": [
+        {
+          "topic": "orders",
+          "partitions": [
+            {
+              "partition": 0,
+              "errorCode": 0,
+              "errorMessage": null,
+              "activeProducers": [
+                {
+                  "producerId": "9007199254740993",
+                  "producerEpoch": 65537,
+                  "lastSequence": 23,
+                  "lastTimestamp": "9007199254740994",
+                  "coordinatorEpoch": 9,
+                  "currentTxnStartOffset": "-1"
+                }
+              ]
+            },
+            {
+              "partition": 2,
+              "errorCode": 6,
+              "errorMessage": "moved",
+              "activeProducers": []
+            }
+          ]
+        }
+      ]
+    }
+  }
+]

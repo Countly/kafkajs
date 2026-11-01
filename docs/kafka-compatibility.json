@@ -627,9 +627,9 @@
     {
       "kafkaName": "WriteTxnMarkers",
       "apiKey": 27,
-      "forkName": null,
+      "forkName": "writeTxnMarkers",
       "apiKeysName": "WriteTxnMarkers",
-      "planned": "yes",
+      "planned": "done",
       "validVersions": [
         1,
         2
@@ -637,8 +637,11 @@
       "flexibleFrom": 1,
       "deprecatedVersions": null,
       "latestVersionUnstable": false,
-      "forkVersions": null,
-      "gap": "stub",
+      "forkVersions": [
+        1,
+        2
+      ],
+      "gap": "current",
       "onFloor": false,
       "belowFloor": [],
       "notes": "Written by a transaction coordinator to the leaders of the partitions in a transaction, and also sent by `abortTransaction`. v1 is the 4.0 baseline and flexible; v2 adds TransactionVersion (KIP-1228). Not yet implemented."
@@ -1190,9 +1193,9 @@
     {
       "kafkaName": "DescribeProducers",
       "apiKey": 61,
-      "forkName": null,
+      "forkName": "describeProducers",
       "apiKeysName": "DescribeProducers",
-      "planned": "yes",
+      "planned": "done",
       "validVersions": [
         0,
         0
@@ -1200,8 +1203,10 @@
       "flexibleFrom": 0,
       "deprecatedVersions": null,
       "latestVersionUnstable": false,
-      "forkVersions": null,
-      "gap": "stub",
+      "forkVersions": [
+        0
+      ],
+      "gap": "current",
       "onFloor": false,
       "belowFloor": [],
       "notes": ""
@@ -1209,9 +1214,9 @@
     {
       "kafkaName": "DescribeTransactions",
       "apiKey": 65,
-      "forkName": null,
+      "forkName": "describeTransactions",
       "apiKeysName": "DescribeTransactions",
-      "planned": "yes",
+      "planned": "done",
       "validVersions": [
         0,
         0
@@ -1219,8 +1224,10 @@
       "flexibleFrom": 0,
       "deprecatedVersions": null,
       "latestVersionUnstable": false,
-      "forkVersions": null,
-      "gap": "stub",
+      "forkVersions": [
+        0
+      ],
+      "gap": "current",
       "onFloor": false,
       "belowFloor": [],
       "notes": ""
@@ -1228,9 +1235,9 @@
     {
       "kafkaName": "ListTransactions",
       "apiKey": 66,
-      "forkName": null,
+      "forkName": "listTransactions",
       "apiKeysName": "ListTransactions",
-      "planned": "yes",
+      "planned": "done",
       "validVersions": [
         0,
         2
@@ -1238,8 +1245,12 @@
       "flexibleFrom": 0,
       "deprecatedVersions": null,
       "latestVersionUnstable": false,
-      "forkVersions": null,
-      "gap": "stub",
+      "forkVersions": [
+        0,
+        1,
+        2
+      ],
+      "gap": "current",
       "onFloor": false,
       "belowFloor": [],
       "notes": ""

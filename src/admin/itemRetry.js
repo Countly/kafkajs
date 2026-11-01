@@ -43,7 +43,9 @@ class ItemRetry {
   }
 
   /**
-   * Saves a broker row exactly once, retaining raw protocol code/message and unknown fields.
+   * Saves a broker or internal local-failure row once, retaining its typed error.
+   * Code -1 plus an Error is reserved for local unresolved routing/RPC failure; wire -1 without
+   * that Error still becomes the protocol UNKNOWN_SERVER_ERROR.
    * @param {object} item original requested cell
    * @param {object} row correlated broker row, with numeric errorCode
    * @returns {Error|null} retriable child to request another attempt, or null
@@ -51,7 +53,12 @@ class ItemRetry {
    */
   accept(item, row) {
     this.deadline?.check()
-    const error = row.errorCode === 0 ? null : createErrorFromCode(row.errorCode)
+    const error =
+      row.errorCode === 0
+        ? null
+        : row.errorCode === -1 && row.error instanceof Error
+          ? row.error
+          : createErrorFromCode(row.errorCode)
     const result = { ...item, ...row, error, errorMessage: this.sanitize(row.errorMessage ?? null) }
     if (error && this.retryable(row, item)) {
       this.last.set(this.keyOf(item), result)
