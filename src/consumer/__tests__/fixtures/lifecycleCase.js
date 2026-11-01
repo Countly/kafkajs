@@ -1,4 +1,3 @@
-const { performance: monotonicClock } = require('node:perf_hooks')
 const { Kafka } = require('../../../../index')
 const Runner = require('../../runner')
 const RequestQueue = require('../../../network/requestQueue')
@@ -14,7 +13,7 @@ const {
 const { cooperativeSticky } = require('../../assigners')
 const { MemberAssignment } = require('../../assignerProtocol')
 const { TOPIC, prepareRecordBatches } = require('./fetchHarness')
-const { KafkaJSCommitFailedError } = require('../../../errors')
+const { KafkaJSCommitFailedError, KafkaJSConnectionClosedError } = require('../../../errors')
 
 /**
  * Advances fake time with real socket-delivery turns, bounded by a deterministic step budget.
@@ -33,10 +32,17 @@ const pump = async (predicate, label) => {
 }
 
 /**
+ * Internal calls can settle with the stopping error or the closed connection on forced close.
+ * Public commits must instead report CONSUMER_STOPPING before held application work is released.
+ * @param {Error} error how the held call settled
+ * @returns {boolean} true when the error is one of the forced close's two retirements
+ */
+const isForcedRetirement = (error) =>
+  error.type === 'CONSUMER_STOPPING' || error instanceof KafkaJSConnectionClosedError
+
+/**
  * Drives one reviewed lifecycle cell through public factories and the real wire stack. Spies
  * hold existing boundaries; they add no production export or alternate membership machine.
- * Forced before-handler cells share the disconnect clock so timeout zero expires before natural
- * stop can reach the fetch manager. After teardown, force cells must start no more fetch rounds.
  * @param {{ event: string, boundary: string, protocol: string, membership: string }} cell
  * @returns {Promise<void>}
  */
@@ -46,12 +52,13 @@ const runLifecycleCell = async (cell) => {
   const release = () => {
     if (held.settle) held.release()
   }
+  const brokerAnswerTimers = new Set()
   const scripted = (cell.protocol === 'consumer' ? consumerProtocolScript : groupScript)(
     createScriptedCluster({
       nodes: [{ id: 0, host: 'node', port: 9092 }],
       profile: cell.protocol === 'consumer' ? 'consumer' : 'default',
     }),
-    { batches: 1 }
+    { batches: 1, brokerAnswerTimers }
   )
   const errors = []
   const unhandled = (error) => errors.push(error)
@@ -69,8 +76,6 @@ const runLifecycleCell = async (cell) => {
   let starting
   let initialGate
   const spies = []
-  if (cell.event === 'force' && cell.boundary === 'before-handler')
-    spies.push(jest.spyOn(performance, 'now').mockImplementation(() => monotonicClock.now()))
   const cleanup = []
   const pending = []
   const settled = (promise) => {
@@ -151,7 +156,14 @@ const runLifecycleCell = async (cell) => {
     let fetches = 0
     scripted.answer('Fetch', async ({ maxWaitMs, topics }) => {
       fetches += 1
-      if (fetches > 1) await new Promise((resolve) => setTimeout(resolve, maxWaitMs))
+      if (fetches > 1)
+        await new Promise((resolve) => {
+          const timer = setTimeout(() => {
+            brokerAnswerTimers.delete(timer)
+            resolve()
+          }, maxWaitMs)
+          brokerAnswerTimers.add(timer)
+        })
       return {
         sessionId: 7,
         includeTopic: topics.length > 0,
@@ -446,7 +458,6 @@ const runLifecycleCell = async (cell) => {
     if (cell.event === 'disconnect') event = settled(consumer.disconnect())
     if (cell.event === 'force') event = settled(consumer.disconnect({ timeout: 0 }))
     if (cell.event === 'crash' && initialGate) {
-      const { KafkaJSConnectionClosedError } = require('../../../errors')
       initialGate.fail(new KafkaJSConnectionClosedError('join transport closed'))
       event = starting
     } else if (cell.event === 'crash') {
@@ -481,8 +492,14 @@ const runLifecycleCell = async (cell) => {
         expect(group.ownership.refusal(token).cause.type).toBe('POLL_INTERVAL_EXCEEDED')
       }
     }
-    if (cell.event === 'force' && cell.boundary === 'before-handler')
-      await pump(() => event.done, 'forced close before handler release')
+    if (cell.event === 'force' && cell.boundary.startsWith('commit:')) {
+      await pump(() => event.done && operation.done, 'forced public commit before gate release')
+      expect(event.error).toBeNull()
+      expect(operation.error).toMatchObject({ type: 'CONSUMER_STOPPING' })
+      expect(manager.lastCommit).toBe(lastCommit)
+      expect(writes.slice(writeCount)).toEqual([])
+      expect(scripted.requests().filter((r) => r.api === 'OffsetCommit')).toHaveLength(framesBefore)
+    }
     release()
     cleanup.forEach((fn) => fn())
     await pump(() => event.done, 'event completion')
@@ -494,7 +511,18 @@ const runLifecycleCell = async (cell) => {
     }
     if (operation) {
       await pump(() => operation.done, 'held operation completion')
-      if (operation.error && !(operation.error instanceof KafkaJSCommitFailedError))
+      if (cell.event === 'force' && cell.boundary.startsWith('commit:')) {
+        expect(operation.error).toMatchObject({ type: 'CONSUMER_STOPPING' })
+        expect(manager.lastCommit).toBe(lastCommit)
+        expect(writes.slice(writeCount)).toEqual([])
+        expect(scripted.requests().filter((r) => r.api === 'OffsetCommit')).toHaveLength(
+          framesBefore
+        )
+      } else if (
+        operation.error &&
+        !(operation.error instanceof KafkaJSCommitFailedError) &&
+        !(cell.event === 'force' && isForcedRetirement(operation.error))
+      )
         throw operation.error
       if (learnedLoss && cell.boundary.startsWith('commit:')) {
         expect(operation.error).toBeInstanceOf(KafkaJSCommitFailedError)
@@ -555,8 +583,9 @@ const runLifecycleCell = async (cell) => {
       expect(cleanupErrors).toEqual([])
       expect(listeners()).toBe(0)
       expect(process.listenerCount('unhandledRejection')).toBe(baseline.unhandled)
-      expect(jest.getTimerCount()).toBe(baseline.timers)
       if (cell.event === 'force') {
+        expect(jest.getTimerCount()).toBe(baseline.timers + brokerAnswerTimers.size)
+        await pump(() => brokerAnswerTimers.size === 0, 'held broker answers')
         const fetched = fetchRounds.mock.calls.length
         for (let step = 0; step < 20; step++) {
           await new Promise(setImmediate)
@@ -564,6 +593,7 @@ const runLifecycleCell = async (cell) => {
         }
         expect(fetchRounds.mock.calls.length).toBe(fetched)
       }
+      expect(jest.getTimerCount()).toBe(baseline.timers)
     }
   }
 }
