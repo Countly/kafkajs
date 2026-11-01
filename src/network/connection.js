@@ -892,14 +892,12 @@ module.exports = class Connection {
    * @throws {Error} the error the guard returns, once the request is authenticated and encoded
    */
   async [PRIVATE.PREPARE]({ request, expectResponse, guard }) {
-    const enteredRefusal = guard && guard()
-    if (enteredRefusal) throw enteredRefusal
+    currentDeadline()?.check()
     if (!this.isAuthenticated() && isAuthenticatedRequest(request)) {
       await this[PRIVATE.AUTHENTICATE]()
     }
 
-    const authenticatedRefusal = guard && guard()
-    if (authenticatedRefusal) throw authenticatedRefusal
+    currentDeadline()?.check()
     this.failIfNotConnected()
 
     const { clientId } = this

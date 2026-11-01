@@ -722,7 +722,11 @@ module.exports = class BrokerPool {
       (names, requestOptions) =>
         requestOptions && Object.keys(requestOptions).length
           ? requestOptions
-          : JSON.stringify(names || [])
+          : JSON.stringify([
+              this.consumerMetadataGeneration ?? 0,
+              this.consumerMetadataScope?.shareKey() ?? null,
+              names || [],
+            ])
     )
     return this.metadataDiscovery(topics, options)
   }

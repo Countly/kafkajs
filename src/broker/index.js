@@ -2143,7 +2143,7 @@ module.exports = class Broker {
   async [PRIVATE.SEND_REQUEST](protocolRequest, guard) {
     const setupGuard = guard
     guard = withAdminGuard(guard)
-    this.throwIfRefused(guard)
+    currentDeadline()?.check()
     const pool = this.connectionPool
     let generation = pool.generation
     try {
@@ -2151,7 +2151,7 @@ module.exports = class Broker {
         ? pool.getConnectionByRequest(protocolRequest, { guard })
         : pool.getConnectionByRequest(protocolRequest))
       this.throwIfReplaced(pool)
-      this.throwIfRefused(guard)
+      currentDeadline()?.check()
 
       if (
         protocolRequest.request.apiKey !== apiKeys.ApiVersions &&
@@ -2159,7 +2159,7 @@ module.exports = class Broker {
       ) {
         await (setupGuard ? this.connect({ guard: setupGuard }) : this.connect())
         this.throwIfReplaced(pool)
-        this.throwIfRefused(guard)
+        currentDeadline()?.check()
       }
 
       if (!connection.isConnected()) {
@@ -2167,7 +2167,7 @@ module.exports = class Broker {
           ? pool.getConnectionByRequest(protocolRequest, { guard })
           : pool.getConnectionByRequest(protocolRequest))
         this.throwIfReplaced(pool)
-        this.throwIfRefused(guard)
+        currentDeadline()?.check()
       }
 
       this.throwIfRefused(guard)

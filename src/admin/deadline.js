@@ -112,12 +112,12 @@ class AdminDeadline {
     return new Promise((resolve, reject) => {
       let unown = () => {}
       let settled = false
-      const finish = (error, value) => {
+      const finish = (error, value, failed = true) => {
         if (settled) return
         settled = true
         unown()
         const refusal = this.refusal()
-        if (refusal || error) reject(refusal || error)
+        if (refusal || failed) reject(refusal || error)
         else resolve(value)
       }
       try {
@@ -129,7 +129,7 @@ class AdminDeadline {
         }
         this.check()
         Promise.resolve(work()).then(
-          (value) => finish(null, value),
+          (value) => finish(null, value, false),
           (error) => finish(error)
         )
       } catch (error) {
@@ -399,13 +399,13 @@ const waitForOf = (fn, options = {}) => {
         let totalWait = 0
         const until = ignoreTimeout ? Infinity : performance.now() + maxWait
         let unown = () => {}
-        const finish = (error, value) => {
+        const finish = (error, value, failed = true) => {
           if (done) return
           done = true
           clearTimeout(timer)
           clearTimeout(cap)
           unown()
-          if (error) reject(error)
+          if (failed) reject(error)
           else resolve(value)
         }
         const tick = async () => {
@@ -418,7 +418,7 @@ const waitForOf = (fn, options = {}) => {
             deadline.check()
             if (done) return
             if (performance.now() >= until) return finish(new KafkaJSTimeout(timeoutMessage))
-            if (value) finish(null, value)
+            if (value) finish(null, value, false)
             else timer = setTimeout(tick, delay)
           } catch (error) {
             finish(error)

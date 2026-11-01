@@ -31,6 +31,36 @@ describe('admin invocation deadlines', () => {
     jest.restoreAllMocks()
   })
 
+  it.each([null, undefined, false, 0, ''])('preserves rejected value %p', async (reason) => {
+    const { runWithDeadline } = require('../deadline')
+    const result = await runWithDeadline('failure', 100, () => Promise.reject(reason)).then(
+      (value) => ({ status: 'fulfilled', value }),
+      (error) => ({ status: 'rejected', error })
+    )
+    expect(result).toEqual({ status: 'rejected', error: reason })
+  })
+
+  it.each([null, undefined, false, 0, ''])('preserves polling rejection %p', async (reason) => {
+    const { runWithDeadline, waitForOf } = require('../deadline')
+    const result = observe(
+      runWithDeadline('poll', 100, () => waitForOf(() => Promise.reject(reason), { delay: 1 }))
+    )
+    await jest.advanceTimersByTimeAsync(1)
+    expect(result.settled).toBe(true)
+    expect(Object.prototype.hasOwnProperty.call(result, 'error')).toBe(true)
+    expect(result.error).toBe(reason)
+  })
+
+  it('preserves describeCluster rejection without apiTimeout', async () => {
+    const admin = createAdmin({
+      logger,
+      cluster: {
+        metadata: jest.fn().mockRejectedValue(null),
+      },
+    })
+    await expect(admin.describeCluster()).rejects.toBeNull()
+  })
+
   it('factory deadline ends a stalled lookup', async () => {
     const response = held()
     const admin = createAdmin({
