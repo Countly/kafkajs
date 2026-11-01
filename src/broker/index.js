@@ -1344,13 +1344,38 @@ module.exports = class Broker {
    * @param {(frameLength?: number) => Error|null} [request.guard] private pre-write check of the
    *   consumer's preparation round; an error it returns rejects this one request before it is written
    *
+   * @param {number} [request.minVersion=1] named specification capability floor
+   * @param {number} [request.maxVersion=9] explicit opt-in ceiling; ordinary reads retain v9
+   * @param {number} [request.timeout] remote-read broker timeout on v10+
    * @returns {Promise}
    */
-  async listOffsets({ replicaId, isolationLevel, topics, guard }) {
+  async listOffsets({
+    replicaId,
+    isolationLevel,
+    topics,
+    guard,
+    timeout,
+    minVersion = 1,
+    maxVersion = 9,
+  }) {
+    if (minVersion > 1)
+      this.requireStorageVersion(
+        apiKeys.ListOffsets,
+        requests.ListOffsets,
+        minVersion,
+        maxVersion,
+        { 7: 'maxTimestamp', 8: 'earliestLocal', 9: 'latestTiered', 11: 'earliestPendingUpload' }[
+          minVersion
+        ]
+      )
     this.throwIfRefused(guard)
-    const listOffsets = this.lookupRequest(apiKeys.ListOffsets, requests.ListOffsets)
+    const listOffsets = this.lookupRequestWithMax(
+      apiKeys.ListOffsets,
+      requests.ListOffsets,
+      maxVersion
+    )
     const result = await this[PRIVATE.SEND_REQUEST](
-      listOffsets({ replicaId, isolationLevel, topics }),
+      listOffsets({ replicaId, isolationLevel, topics, timeout }),
       guard
     )
 
@@ -1676,9 +1701,17 @@ module.exports = class Broker {
    *                                controller node.
    * @returns {Promise}
    */
-  async deleteTopics({ topics, timeout = 5000 }) {
+  async deleteTopics({ topics, topicIds, timeout = 5000 }) {
+    if (topicIds !== undefined)
+      this.requireStorageVersion(
+        apiKeys.DeleteTopics,
+        requests.DeleteTopics,
+        6,
+        undefined,
+        'topicIds'
+      )
     const deleteTopics = this.lookupRequest(apiKeys.DeleteTopics, requests.DeleteTopics)
-    return await this[PRIVATE.SEND_REQUEST](deleteTopics({ topics, timeout }))
+    return await this[PRIVATE.SEND_REQUEST](deleteTopics({ topics, topicIds, timeout }))
   }
 
   /**
@@ -2198,12 +2231,22 @@ module.exports = class Broker {
    * @param {number} [request.timeout]
    * @returns {Promise}
    */
-  async alterPartitionReassignments({ topics, timeout }) {
+  async alterPartitionReassignments({ topics, timeout, allowReplicationFactorChange = true }) {
+    if (!allowReplicationFactorChange)
+      this.requireStorageVersion(
+        apiKeys.AlterPartitionReassignments,
+        requests.AlterPartitionReassignments,
+        1,
+        undefined,
+        'allowReplicationFactorChange=false'
+      )
     const alterPartitionReassignments = this.lookupRequest(
       apiKeys.AlterPartitionReassignments,
       requests.AlterPartitionReassignments
     )
-    return await this[PRIVATE.SEND_REQUEST](alterPartitionReassignments({ topics, timeout }))
+    return await this[PRIVATE.SEND_REQUEST](
+      alterPartitionReassignments({ topics, timeout, allowReplicationFactorChange })
+    )
   }
 
   /**
@@ -2219,6 +2262,55 @@ module.exports = class Broker {
       requests.ListPartitionReassignments
     )
     return await this[PRIVATE.SEND_REQUEST](listPartitionReassignments({ topics, timeout }))
+  }
+
+  /** Refuses storage options that the negotiated version cannot encode.
+   * @param {number} apiKey protocol key
+   * @param {object} definition versioned builders
+   * @param {number} minimum option minimum
+   * @param {number} [maximum] internal ceiling
+   * @param {string} [option] unrepresentable option name
+   * @returns {void}
+   * @throws {KafkaJSServerDoesNotSupportApiKey} both client and broker ranges are reported
+   */
+  requireStorageVersion(apiKey, definition, minimum, maximum, option) {
+    const v = this.negotiatedVersion(
+      apiKey,
+      definition,
+      maximum === undefined ? undefined : { [apiKey]: maximum }
+    )
+    if (v !== null && v >= minimum) return
+    const range = this.versions?.[apiKey]
+    const versions = definition.versions.map(Number)
+    const apiName = Object.keys(apiKeys).find((name) => apiKeys[name] === apiKey)
+    throw new KafkaJSServerDoesNotSupportApiKey(
+      `${apiName} ${option ?? 'API'} requires v${minimum}; client implements v${Math.min(...versions)}-v${Math.max(...versions)}, broker supports ${range ? `v${range.minVersion}-v${range.maxVersion}` : 'absent'}`,
+      { apiKey, apiName }
+    )
+  }
+
+  /** Reads broker-local log directories; protocol errors remain data.
+   * @param {object} options nullable topics filter
+   * @returns {Promise<object>} decoded directory results
+   * @throws {Error} capability, transport or malformed frame
+   */
+  async describeLogDirs(options) {
+    this.requireStorageVersion(apiKeys.DescribeLogDirs, requests.DescribeLogDirs, 1)
+    return this[PRIVATE.SEND_REQUEST](
+      this.lookupRequest(apiKeys.DescribeLogDirs, requests.DescribeLogDirs)(options)
+    )
+  }
+
+  /** Moves replica logs on this broker; per-replica errors remain data.
+   * @param {object} options grouped directory selections
+   * @returns {Promise<object>} decoded replica outcomes
+   * @throws {Error} capability, transport or malformed frame
+   */
+  async alterReplicaLogDirs(options) {
+    this.requireStorageVersion(apiKeys.AlterReplicaLogDirs, requests.AlterReplicaLogDirs, 1)
+    return this[PRIVATE.SEND_REQUEST](
+      this.lookupRequest(apiKeys.AlterReplicaLogDirs, requests.AlterReplicaLogDirs)(options)
+    )
   }
 
   /**

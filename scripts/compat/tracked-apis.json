@@ -213,16 +213,16 @@
     {
       "kafkaName": "AlterReplicaLogDirs",
       "apiKey": 34,
-      "forkName": null,
+      "forkName": "alterReplicaLogDirs",
       "apiKeysName": "AlterReplicaLogDirs",
-      "planned": "yes"
+      "planned": "done"
     },
     {
       "kafkaName": "DescribeLogDirs",
       "apiKey": 35,
-      "forkName": null,
+      "forkName": "describeLogDirs",
       "apiKeysName": "DescribeLogDirs",
-      "planned": "yes"
+      "planned": "done"
     },
     {
       "kafkaName": "SaslAuthenticate",

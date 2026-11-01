@@ -11,7 +11,7 @@ const { DeleteTopics: apiKey } = require('../../apiKeys')
  * TimeoutMs => INT32 (0+)
  * TAG_BUFFER
  *
- * The request takes topic names, as it does at every version, and sends each one with the zero
+ * Names are sent with the zero
  * uuid, which is how the Java client deletes by name. A caller that needs a result for each name
  * reads it from the response's `topic`, never from its `topicId`, which is null (the zero uuid) for
  * a name the controller could not delete.
@@ -19,17 +19,24 @@ const { DeleteTopics: apiKey } = require('../../apiKeys')
  * @see clients/src/main/resources/common/message/DeleteTopicsRequest.json (Apache Kafka 4.3.1)
  *
  * @param {object} options
- * @param {string[]} options.topics the names of the topics to delete
+ * @param {string[]} [options.topics] the names of the topics to delete
+ * @param {string[]} [options.topicIds] canonical UUIDs; each is sent with a null name
  * @param {number} [options.timeout=5000]
  * @returns {object} the protocol request
  */
-module.exports = ({ topics, timeout = 5000 }) => ({
+module.exports = ({ topics, topicIds, timeout = 5000 }) => ({
   apiKey,
   apiVersion: 6,
   apiName: 'DeleteTopics',
   encode: async () => {
     return new Encoder()
-      .writeUVarIntArray(topics.map(encodeTopic))
+      .writeUVarIntArray(
+        topicIds === undefined
+          ? topics.map(encodeTopic)
+          : topicIds.map((id) =>
+              new Encoder().writeUVarIntString(null).writeUuid(id).writeTaggedFields()
+            )
+      )
       .writeInt32(timeout)
       .writeTaggedFields()
   },

@@ -1,0 +1,7 @@
+{
+  "message": "DescribeLogDirsRequest",
+  "version": 1,
+  "case": "storage",
+  "hex": "000000010001740000000100000000",
+  "fields": {"topics":[{"topic":"t","partitions":[0]}]}
+}

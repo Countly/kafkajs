@@ -1,0 +1,7 @@
+{
+  "message": "AlterReplicaLogDirsRequest",
+  "version": 2,
+  "case": "storage",
+  "hex": "02082f646174612f620202740200000000000000",
+  "fields": {"dirs":[{"path":"/data/b","topics":[{"topic":"t","partitions":[0]}]}]}
+}

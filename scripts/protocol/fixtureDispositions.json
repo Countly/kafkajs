@@ -63,10 +63,7 @@
     {"direction":"response","versions":[2],"test":"decodes the Apache 4.3.1 %s vector"}
   ]},
   {"family":"deleteTopics/hand","route":"hand","evidenceKind":"hand","disposition":"retain","reason":"hand-kept bytes v1; no golden stands on it"},
-  {"family":"deleteTopics/java","route":"javaVectors/GenerateMessageVectors.java","evidenceKind":"java-vector","disposition":"retain","reason":"Java vectors v2, v3, v4, v5, v6; goldens stand on it","goldens":[
-    {"direction":"request","versions":[6],"test":"encodes the Apache 4.3.1 byName vector byte for byte"},
-    {"direction":"response","versions":[6],"test":"decodes the Apache 4.3.1 %s vector with its topic id, topics sorted by name"}
-  ]},
+  {"family":"deleteTopics/java","route":"javaVectors/GenerateMessageVectors.java","evidenceKind":"java-vector","disposition":"retain","reason":"Java vectors v2, v3, v4, v5, v6; goldens stand on it","goldens":[{"direction":"request","versions":[6],"test":"encodes the Apache 4.3.1 byName vector byte for byte"},{"direction":"response","versions":[6],"test":"decodes the Apache 4.3.1 %s vector with its topic id, topics sorted by name"},{"direction":"request","versions":[6],"spec":"../../../testHelpers/__tests__/wire.spec.js","test":"%s compares both independently generated directions"},{"direction":"response","versions":[6],"spec":"../../../testHelpers/__tests__/wire.spec.js","test":"%s compares both independently generated directions"}]},
   {"family":"describeAcls/hand","route":"hand","evidenceKind":"hand","disposition":"retain","reason":"hand-kept bytes v1; no golden stands on it"},
   {"family":"describeAcls/java","route":"javaVectors/GenerateMessageVectors.java","evidenceKind":"java-vector","disposition":"retain","reason":"Java vectors v2, v3; goldens stand on it","goldens":[
     {"direction":"request","versions":[3],"test":"encodes the Apache 4.3.1 %s vector byte for byte"},
@@ -299,5 +296,9 @@
       "test": "Java vectors independently match every prescribed case"
     }
   ]
-}
+},
+  {"family":"describeLogDirs/java","route":"javaVectors/GenerateMessageVectors.java","evidenceKind":"java-vector","disposition":"retain","reason":"Independent generated storage messages; goldens stand on it","goldens":[{"direction":"request","versions":[1,2,3,4,5],"spec":"../../../testHelpers/__tests__/wire.spec.js","test":"%s compares both independently generated directions"},{"direction":"response","versions":[1,2,3,4,5],"spec":"../../../testHelpers/__tests__/wire.spec.js","test":"%s compares both independently generated directions"}]},
+  {"family":"alterReplicaLogDirs/java","route":"javaVectors/GenerateMessageVectors.java","evidenceKind":"java-vector","disposition":"retain","reason":"Independent generated storage messages; goldens stand on it","goldens":[{"direction":"request","versions":[1,2],"spec":"../../../testHelpers/__tests__/wire.spec.js","test":"%s compares both independently generated directions"},{"direction":"response","versions":[1,2],"spec":"../../../testHelpers/__tests__/wire.spec.js","test":"%s compares both independently generated directions"}]},
+  {"family":"listOffsets/java","route":"javaVectors/GenerateMessageVectors.java","evidenceKind":"java-vector","disposition":"retain","reason":"Independent generated storage messages; goldens stand on it","goldens":[{"direction":"request","versions":[10,11],"spec":"../../../testHelpers/__tests__/wire.spec.js","test":"%s compares both independently generated directions"},{"direction":"response","versions":[10,11],"spec":"../../../testHelpers/__tests__/wire.spec.js","test":"%s compares both independently generated directions"}]},
+  {"family":"alterPartitionReassignments/java","route":"javaVectors/GenerateMessageVectors.java","evidenceKind":"java-vector","disposition":"retain","reason":"Independent generated storage messages; goldens stand on it","goldens":[{"direction":"request","versions":[1],"spec":"../../../testHelpers/__tests__/wire.spec.js","test":"%s compares both independently generated directions"},{"direction":"response","versions":[1],"spec":"../../../testHelpers/__tests__/wire.spec.js","test":"%s compares both independently generated directions"}]}
 ]

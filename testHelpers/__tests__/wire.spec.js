@@ -1420,3 +1420,113 @@ describe('offset admin wire layouts', () => {
     }
   )
 })
+
+describe('storage layouts from independent literals', () => {
+  const cases = [
+    'describeLogDirsV1',
+    'describeLogDirsV2',
+    'describeLogDirsV3',
+    'describeLogDirsV4',
+    'describeLogDirsV5',
+    'alterReplicaLogDirsV1',
+    'alterReplicaLogDirsV2',
+    'listOffsetsV10',
+    'listOffsetsV11',
+    'alterPartitionReassignmentsV1',
+    'deleteTopicsV6',
+  ]
+  test.each(cases)('%s matches every request and response byte', async (name) => {
+    const expected = require('../wire/expected')[name]
+    const pair = require(`../wire/${name}`)
+    const folder = pair.api[0].toLowerCase() + pair.api.slice(1)
+    const requestFields =
+      pair.api === 'DeleteTopics'
+        ? {
+            topicIds: expected.request.topics.map((t) => t.topicId),
+            timeout: expected.request.timeout,
+          }
+        : expected.request
+    const request = require(`../../src/protocol/requests/${folder}/v${pair.version}/request`)(
+      requestFields
+    )
+    const bytes = (await request.encode()).buffer
+    expect(bytes.toString('hex')).toBe(expected.requestHex)
+    expect(pair.readRequest(Buffer.from(expected.requestHex, 'hex'))).toEqual(expected.request)
+    expect(pair.buildResponse().toString('hex')).toBe(expected.responseHex)
+    const codec = require(`../../src/protocol/requests/${folder}/v${pair.version}/response`)
+    const decoded = await codec.decode(Buffer.from(expected.responseHex, 'hex'))
+    if (pair.api === 'DescribeLogDirs') {
+      expect(decoded.logDirs).toEqual(
+        expected.response.logDirs.map((d) => ({
+          ...d,
+          totalBytes: d.totalBytes ?? null,
+          usableBytes: d.usableBytes ?? null,
+          isCordoned: d.isCordoned ?? null,
+        }))
+      )
+      expect(decoded.errorCode).toBe(0)
+    } else
+      for (const key of ['topics', 'responses', 'topicErrors'])
+        if (expected.response[key]) {
+          // Reassignment's frozen parser intentionally discards broker error text.
+          const data =
+            pair.api === 'AlterPartitionReassignments'
+              ? expected.response[key].map((t) => ({
+                  ...t,
+                  partitions: t.partitions.map(({ errorMessage, ...p }) => p),
+                }))
+              : expected.response[key]
+          expect(decoded[key]).toEqual(data)
+        }
+    expect(decoded.clientSideThrottleTime ?? decoded.throttleTime).toBe(17)
+    const { requestHeaderVersion, responseHeaderVersion } = require('../../src/protocol/headers')
+    const flexible = !(
+      pair.version === 1 && ['DescribeLogDirs', 'AlterReplicaLogDirs'].includes(pair.api)
+    )
+    expect(requestHeaderVersion(pair.apiKey, pair.version)).toBe(flexible ? 2 : 1)
+    expect(responseHeaderVersion(pair.apiKey, pair.version)).toBe(flexible ? 1 : 0)
+  })
+  test.each(cases)('%s independent reader rejects truncation and surplus', (name) => {
+    const expected = require('../wire/expected')[name]
+    const pair = require(`../wire/${name}`)
+    const body = Buffer.from(expected.requestHex, 'hex')
+    expect(() => pair.readRequest(body.subarray(0, -1))).toThrow()
+    expect(() => pair.readRequest(Buffer.concat([body, Buffer.from([0])]))).toThrow()
+  })
+  test.each([1, 2, 3, 4, 5])(
+    'directory v%i preserves all-topic null and explicit empty',
+    async (version) => {
+      const request = require(`../../src/protocol/requests/describeLogDirs/v${version}/request`)
+      const pair = require(`../wire/describeLogDirsV${version}`)
+      for (const topics of [null, []])
+        expect(pair.readRequest((await request({ topics }).encode()).buffer)).toEqual({ topics })
+    }
+  )
+})
+
+/** Requires genuine Java outputs; this suite is a mandatory generation gate, never auto-skipped. */
+describe('storage Java vectors', () => {
+  test.each([
+    'describeLogDirsV1',
+    'describeLogDirsV2',
+    'describeLogDirsV3',
+    'describeLogDirsV4',
+    'describeLogDirsV5',
+    'alterReplicaLogDirsV1',
+    'alterReplicaLogDirsV2',
+    'listOffsetsV10',
+    'listOffsetsV11',
+    'alterPartitionReassignmentsV1',
+    'deleteTopicsV6',
+  ])('%s compares both independently generated directions', async (name) => {
+    const e = require('../wire/expected')[name]
+    const pair = require(`../wire/${name}`)
+    const folder = pair.api[0].toLowerCase() + pair.api.slice(1)
+    for (const direction of ['Request', 'Response']) {
+      const filename = `${folder}${direction}-v${pair.version}-storage.json`
+      const vector = require(`../../src/protocol/requests/${folder}/fixtures/java/${filename}`)
+      expect(vector.hex).toBe(direction === 'Request' ? e.requestHex : e.responseHex)
+      expect(vector.fields).toEqual(direction === 'Request' ? e.request : e.response)
+    }
+  })
+})

@@ -10,6 +10,7 @@ const {
   waitForOf: waitFor,
 } = require('./deadline')
 const { createOffsets } = require('./offsets')
+const createLogDirs = require('./logDirs')
 const groupBy = require('../utils/groupBy')
 const createConsumer = require('../consumer')
 const { disposeConsumer } = require('../consumer/disposal')
@@ -655,12 +656,87 @@ module.exports = ({
     })
   }
 
-  /**
-   * @param {string[]} topics
-   * @param {number} [timeout=5000]
-   * @return {Promise}
+  /** Deletes names or canonical IDs with the existing void/throw contract.
+   * ID responses must cover the attempted set before cleanup. Confirmed IDs leave the mutation
+   * set before follow-up metadata refresh; metadata retries share the invocation deadline.
+   * @param {object} options exclusive topics or topicIds, with optional broker timeout
+   * @returns {Promise<void>} deletion and follow-up metadata refresh completed
+   * @throws {Error} validation, protocol, discovery or invocation failure
    */
-  const deleteTopics = async ({ topics, timeout }) => {
+  const deleteTopics = async ({ topics, topicIds, timeout } = {}) => {
+    if ((topics !== undefined) === (topicIds !== undefined))
+      throw new KafkaJSInvalidConfigurationError('Exactly one of topics or topicIds is required')
+    if (topicIds !== undefined) {
+      if (
+        !Array.isArray(topicIds) ||
+        topicIds.length === 0 ||
+        topicIds.some(
+          (id) =>
+            typeof id !== 'string' ||
+            !/^[0-9a-fA-F]{8}(-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}$/.test(id) ||
+            /^0{8}(-0{4}){3}-0{12}$/.test(id)
+        )
+      )
+        throw new KafkaJSInvalidConfigurationError('Invalid topicIds')
+      const ids = topicIds.map((id) => id.toLowerCase())
+      if (new Set(ids).size !== ids.length)
+        throw new KafkaJSInvalidConfigurationError('Duplicate topicIds')
+      let pending = ids
+      const knownNames = new Map()
+      const forget = (confirmed) => {
+        for (const id of confirmed) {
+          const name = knownNames.get(id)
+          if (name !== undefined && cluster.metadataCache?.topicId(name) === id)
+            cluster.targetTopics.delete(name)
+        }
+      }
+      await retrierOf(retry)(async (bail) => {
+        try {
+          checked(await waitOf(() => cluster.refreshMetadata()))
+          for (const id of pending) {
+            const name = cluster.metadataCache?.topicName(id)
+            if (name !== undefined && !knownNames.has(id)) knownNames.set(id, name)
+          }
+          const broker = checked(await waitOf(() => cluster.findControllerBroker()))
+          checked(await waitOf(() => broker.deleteTopics({ topicIds: pending, timeout })))
+          const confirmed = pending
+          pending = []
+          forget(confirmed)
+        } catch (error) {
+          const failures = error.topicErrors?.map((row) => ({
+            ...row,
+            topic: row.topic ?? row.topicId,
+          }))
+          if (failures) error.topicErrors = failures
+          if (failures) {
+            const failed = new Set(failures.map((row) => row.topicId))
+            forget(pending.filter((id) => !failed.has(id)))
+          }
+          if (
+            failures?.length > 0 &&
+            failures.every((row) => row.errorCode === THROTTLING_QUOTA_EXCEEDED_CODE)
+          ) {
+            const refused = new Set(failures.map((row) => row.topicId))
+            pending = pending.filter((id) => refused.has(id))
+            if (pending.length === 0) bail(error)
+            throw error
+          }
+          if (error.type === 'NOT_CONTROLLER') {
+            checked(await waitOf(() => cluster.refreshMetadata()))
+            throw error
+          }
+          bail(error)
+        }
+      })
+      return retrierOf(retry)(async (bail) => {
+        try {
+          checked(await waitOf(() => cluster.refreshMetadata()))
+        } catch (error) {
+          if (error.type === 'NOT_CONTROLLER') throw error
+          bail(error)
+        }
+      })
+    }
     if (!topics || !Array.isArray(topics)) {
       throw new KafkaJSNonRetriableError(`Invalid topics array ${topics}`)
     }
@@ -814,6 +890,45 @@ module.exports = ({
 
   const fetchTopicOffsetsByTimestamp = async (topic, timestamp, options) => {
     const isolationLevel = isolationOf(options)
+    const specs = {
+      maxTimestamp: [-3, 7],
+      earliestLocal: [-4, 8],
+      latestTiered: [-5, 9],
+      earliestPendingUpload: [-6, 11],
+    }
+    if (typeof timestamp === 'string') {
+      if (!Object.prototype.hasOwnProperty.call(specs, timestamp))
+        throw new KafkaJSInvalidConfigurationError('Invalid offset spec')
+      if (!topic || typeof topic !== 'string')
+        throw new KafkaJSNonRetriableError(`Invalid topic ${topic}`)
+      const [fromTimestamp, minVersion] = specs[timestamp]
+      return retrierOf(retry)(async (bail) => {
+        try {
+          checked(await waitOf(() => cluster.addTargetTopic(topic)))
+          checked(await waitOf(() => cluster.refreshMetadataIfNecessary()))
+          const partitions = cluster
+            .findTopicPartitionMetadata(topic)
+            .map((p) => ({ partition: p.partitionId }))
+          const rows = checked(
+            await waitOf(() =>
+              cluster.fetchTopicsOffset([{ topic, fromTimestamp, partitions }], {
+                isolationLevel,
+                minVersion,
+                maxVersion: 11,
+                timeout: 5000,
+              })
+            )
+          )
+          return rows[0].partitions.map(({ partition, offset }) => ({ partition, offset }))
+        } catch (error) {
+          if (staleMetadata(error) || staleLeaderEpoch(error)) {
+            checked(await waitOf(() => cluster.refreshMetadata()))
+            throw error
+          }
+          bail(error)
+        }
+      })
+    }
     if (!topic || typeof topic !== 'string') {
       throw new KafkaJSNonRetriableError(`Invalid topic ${topic}`)
     }
@@ -2414,7 +2529,13 @@ module.exports = ({
    * @throws {KafkaJSNumberOfRetriesExceeded|Error} what ended the retries, unchanged, when no
    *   partition was refused for good
    */
-  const alterPartitionReassignments = async ({ topics, timeout }) => {
+  const alterPartitionReassignments = async ({
+    topics,
+    timeout,
+    allowReplicationFactorChange = true,
+  }) => {
+    if (typeof allowReplicationFactorChange !== 'boolean')
+      throw new KafkaJSInvalidConfigurationError('Invalid allowReplicationFactorChange')
     if (!topics || !Array.isArray(topics)) {
       throw new KafkaJSNonRetriableError(`Invalid topics array ${topics}`)
     }
@@ -2493,7 +2614,11 @@ module.exports = ({
               const broker = checked(await waitOf(async () => cluster.findControllerBroker()))
               checked(
                 await waitOf(async () =>
-                  broker.alterPartitionReassignments({ topics: outcome.pending, timeout })
+                  broker.alterPartitionReassignments({
+                    topics: outcome.pending,
+                    timeout,
+                    allowReplicationFactorChange,
+                  })
                 )
               )
               outcome.succeeded()
@@ -2637,6 +2762,7 @@ module.exports = ({
       describeCluster,
       events,
       ...createOffsets({ cluster, retry }),
+      ...createLogDirs({ cluster, retry }),
       fetchOffsets,
       fetchTopicOffsets,
       fetchTopicOffsetsByTimestamp,
@@ -2671,6 +2797,9 @@ module.exports = ({
       fetchTopicMetadata: 0,
       describeCluster: 0,
       deleteOffsets: 0,
+      describeLogDirs: 0,
+      alterReplicaLogDirs: 0,
+      describeReplicaLogDirs: 0,
       fetchOffsetsForGroups: 0,
       fetchOffsets: 0,
       setOffsets: 0,

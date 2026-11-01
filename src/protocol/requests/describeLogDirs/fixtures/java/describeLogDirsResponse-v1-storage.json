@@ -1,0 +1,7 @@
+{
+  "message": "DescribeLogDirsResponse",
+  "version": 1,
+  "case": "storage",
+  "hex": "0000001100000001000000072f646174612f610000000100017400000001000000000020000000000001000000000000000201",
+  "fields": {"throttleTime":17,"errorCode":0,"logDirs":[{"errorCode":0,"path":"/data/a","topics":[{"topic":"t","partitions":[{"partition":0,"size":"9007199254740993","offsetLag":"2","isFuture":true}]}]}]}
+}

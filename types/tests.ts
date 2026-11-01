@@ -1711,3 +1711,22 @@ const transactionAbortItems: Promise<kafkajs.AdminItemResult[]> = admin.abortTra
 // @ts-expect-error force termination is an equivalent invocation, not a new method
 admin.forceTerminateTransaction('tx')
 void transactionDescription; void transactionList; void transactionAbort; void transactionAbortItems
+
+
+const directoryRows = admin.describeLogDirs({brokers:[1],topicPartitions:[{topic:'orders',partitions:[0]}],apiTimeout:1000})
+void directoryRows.then(rows=>{const capacity:string|null=rows[0].logDirs[0].totalBytes;const size:string=rows[0].logDirs[0].topics[0].partitions[0].size;void capacity;void size})
+void admin.describeReplicaLogDirs({replicas:[{topic:'orders',partition:0,brokerId:1}]})
+void admin.alterReplicaLogDirs({replicas:[{topic:'orders',partition:0,brokerId:1,logDir:'/data/b'}]})
+const deletingById:Promise<void>=admin.deleteTopics({topicIds:['00112233-4455-6677-8899-aabbccddeeff'],timeout:1000,apiTimeout:2000})
+void deletingById
+// @ts-expect-error names and ids are exclusive
+void admin.deleteTopics({topics:['orders'],topicIds:['00112233-4455-6677-8899-aabbccddeeff']})
+// @ts-expect-error one deletion identity form is required
+void admin.deleteTopics({})
+void admin.fetchTopicOffsetsByTimestamp('orders','maxTimestamp')
+void admin.fetchTopicOffsetsByTimestamp('orders','earliestLocal',{isolationLevel:'read_uncommitted'})
+void admin.fetchTopicOffsetsByTimestamp('orders','latestTiered')
+void admin.fetchTopicOffsetsByTimestamp('orders','earliestPendingUpload',{apiTimeout:1000})
+// @ts-expect-error named offset specs use exact spelling
+void admin.fetchTopicOffsetsByTimestamp('orders','maximumTimestamp')
+void admin.alterPartitionReassignments({topics:[{topic:'orders',partitionAssignment:[{partition:0,replicas:[1,2]}]}],allowReplicationFactorChange:false})
