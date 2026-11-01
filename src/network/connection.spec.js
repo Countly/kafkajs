@@ -178,15 +178,22 @@ describe('Network > Connection', () => {
           enforceRequestTimeout: true,
         })
       )
-      const originalProcessData = connection.processData
+      const originalProcessData = connection.processData.bind(connection)
+      const pendingReplies = []
 
-      connection.processData = async (data) => {
-        await sleep(100)
-        originalProcessData.apply(connection, [data])
+      // Allow extra time for the 50 ms timeout checks before processing replies.
+      connection.processData = (data) => {
+        const pendingReply = sleep(250).then(() => originalProcessData(data))
+        pendingReplies.push(pendingReply)
+        return pendingReply
       }
 
       await connection.connect()
-      await expect(connection.send(protocol)).rejects.toThrow(KafkaJSRequestTimeoutError)
+      try {
+        await expect(connection.send(protocol)).rejects.toThrow(KafkaJSRequestTimeoutError)
+      } finally {
+        await Promise.all(pendingReplies)
+      }
     })
 
     test('throttles the request queue', async () => {
