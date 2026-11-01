@@ -290,6 +290,27 @@ await admin.fetchOffsets({ groupId, topics: [topic], resolveOffsets: true })
 // ]
 ```
 
+`fetchOffsets({ groupId, topics, resolveOffsets, requireStable, apiTimeout })` keeps its existing result arrays and sentinel behavior. `requireStable` defaults to false; true asks the coordinator for stable transactional commits and requires OffsetFetch v7 or later. `resolveOffsets: false` reads raw commits and does not resolve/write sentinel values.
+
+`fetchOffsetsForGroups({ groups: [{ groupId, topics: [{ topic, partitions }] }], requireStable, apiTimeout })` returns one result per requested group in caller order. Omitted topics or partitions select all; explicit empty read selections return empty without wire work. Groups are batched per coordinator on OffsetFetch v8/v9; an older coordinator gets one request per group. Every group and partition has `errorCode`, `error` and nullable `errorMessage`; partition offsets are decimal strings, metadata is `string | null`, and leaderEpoch is `number | null`. Group or partition errors remain data, so inspect them even when the promise resolves. Stable-read retries do not re-send completed partitions. A local unresolved failure uses errorCode -1 and retains its Error. The existing single-group `fetchOffsets` throw/result contract is unchanged.
+
+## Delete consumer group offsets
+
+```javascript
+const result = await admin.deleteOffsets({
+  groupId: 'inactive-group',
+  topics: [{topic: 'orders', partitions: [0, 1]}],
+  apiTimeout: 60000,
+})
+for (const topic of result.topics) {
+  for (const partition of topic.partitions) {
+    if (partition.error) console.error(topic.topic, partition.partition, partition.errorCode)
+  }
+}
+```
+
+`deleteOffsets` deletes the requested committed offsets through the group coordinator using OffsetDelete v0. It returns one partition result per requested partition in caller order; partition errors are data. Group authorization failure, invalid/missing group or non-empty-group refusal rejects with `KafkaJSProtocolError`. Coordinator loading/movement is retried within the configured retry budget; completed partitions are retained and not sent again. The group/topic/partition mutation lists must be nonempty and unique. A timed-out deletion may already have reached the coordinator; the deadline does not prove that it was not applied.
+
 ## <a name="reset-offsets"></a> Reset consumer group offsets
 
 `resetOffsets` resets the consumer group offset to the earliest or latest offset (latest by default).

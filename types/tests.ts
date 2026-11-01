@@ -1662,3 +1662,18 @@ deadlineAdmin.describeGroups(['g'], { includeAuthorizedOperations: 1 })
 // @ts-expect-error topic flags have boolean type
 deadlineAdmin.fetchTopicMetadata({ includeTopicAuthorizedOperations: 'true' })
 void adminDeadlineConfig
+
+async function groupOffsetMethods(admin: import('./index').Admin) {
+  const deleted = await admin.deleteOffsets({groupId:'g',topics:[{topic:'t',partitions:[0]}],apiTimeout:20})
+  const code: number = deleted.topics[0].partitions[0].errorCode
+  const fetched = await admin.fetchOffsetsForGroups({groups:[{groupId:'g',topics:[{topic:'t',partitions:[0]}]}],requireStable:true})
+  const offset: string = fetched[0].topics[0].partitions[0].offset
+  const metadata: string | null = fetched[0].topics[0].partitions[0].metadata
+  const epoch: number | null = fetched[0].topics[0].partitions[0].leaderEpoch
+  await admin.fetchOffsets({groupId:'g',resolveOffsets:false,requireStable:true})
+  // @ts-expect-error partitions are numbers, not wire objects
+  await admin.deleteOffsets({groupId:'g',topics:[{topic:'t',partitions:[{partition:0}]}]})
+  // @ts-expect-error requireStable is a boolean
+  await admin.fetchOffsetsForGroups({groups:[{groupId:'g'}],requireStable:'yes'})
+  return {code,offset,metadata,epoch}
+}

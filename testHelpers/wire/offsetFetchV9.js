@@ -20,7 +20,8 @@ const encodeTopic = ({ topic, partitions }) =>
 
 /**
  * OffsetFetch v9 (flexible, grouped). The request names one group, its member and epoch, the
- * partitions to read and whether to wait for stable offsets; the response answers the one group
+ * partitions to read and whether to wait for stable offsets; explicit groups carries several.
+ * The response answers the requested groups
  * with an offset and leader epoch per partition (-1 for none). Offsets are decimal strings.
  *
  * Evidence: Java's structured vectors `offsetFetchRequest-v9-memberFields.json` and
@@ -58,14 +59,13 @@ module.exports = {
 
   /**
    * @param {Buffer} body the request body, after its header
-   * @returns {{ groupId: string, memberId: string|null, memberEpoch: number, topics:
-   *   Array<{ topic: string, partitions: Array<{ partition: number }> }>|null, requireStable:
-   *   boolean }} the one group the request names; `topics` is null for every topic
+   * @returns {object} single-group fields and requireStable, or groups and requireStable for
+   *   several groups; topics is null for every topic
    * @throws {Error} when the body is cut short or a byte follows its tag buffer
    */
   readRequest(body) {
     const decoder = new Decoder(body)
-    const [group] = decoder.readUVarIntArray((d) => {
+    const groups = decoder.readUVarIntArray((d) => {
       const read = {
         groupId: d.readUVarIntString(),
         memberId: d.readUVarIntString(),
@@ -88,6 +88,6 @@ module.exports = {
       throw new Error('OffsetFetch v9 request has a byte after its tag buffer')
     }
 
-    return { ...group, requireStable }
+    return groups.length === 1 ? { ...groups[0], requireStable } : { groups, requireStable }
   },
 }

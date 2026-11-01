@@ -214,5 +214,6 @@
     {"direction":"request","versions":[5],"test":"encodes the Apache 4.3.1 %s vector byte for byte"},
     {"direction":"response","versions":[5],"test":"decodes the Apache 4.3.1 %s vector into the v1 shape"}
   ]},
-  {"family":"recordBatch/zstd","route":"unknown: its origin is not recorded","evidenceKind":"hand","disposition":"remove","removed":"src/protocol/recordBatch/fixtures/v0_recordbatch_zstd.json","reason":"no spec read it, it decoded with attributes 0 and a Java reader once rejected its CRC; ZSTD batches are covered by the producer compression round trip and the live ZSTD produce case"}
+  {"family":"recordBatch/zstd","route":"unknown: its origin is not recorded","evidenceKind":"hand","disposition":"remove","removed":"src/protocol/recordBatch/fixtures/v0_recordbatch_zstd.json","reason":"no spec read it, it decoded with attributes 0 and a Java reader once rejected its CRC; ZSTD batches are covered by the producer compression round trip and the live ZSTD produce case"},
+  {"family":"offsetDelete/java","route":"javaVectors/GenerateMessageVectors.java","evidenceKind":"java-vector","disposition":"retain","reason":"Java OffsetDelete v0 request and response vectors","goldens":[{"direction":"request","versions":[0],"spec":"offsetDelete/v0/codec.spec.js","test":"encodes the Java request and decodes its mixed response"},{"direction":"response","versions":[0],"spec":"offsetDelete/v0/codec.spec.js","test":"encodes the Java request and decodes its mixed response"}]}
 ]

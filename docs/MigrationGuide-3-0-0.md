@@ -987,6 +987,8 @@ retry.maxTotalTime adds a public-entry deadline only to consumer commitOffsets, 
 
 ### Admin
 
+deleteOffsets returns partition errorCode/error results; group-level refusals reject. fetchOffsetsForGroups returns each group's own result and batches by coordinator, falling back to single-group requests below OffsetFetch v8. requireStable defaults to false; an explicit stable read requires v7 or later. A call deadline does not recall a deletion already transmitted.
+
 Group visibility and the admin client.
 
 - **`admin.listGroups()` rejects with the retrier's error class.** Every per-broker call now runs

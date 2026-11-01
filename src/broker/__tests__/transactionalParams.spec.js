@@ -172,16 +172,14 @@ describe('Broker > transactional request parameters', () => {
       }
     )
 
-    test('below v7 the flag is dropped: that body has no field for it', async () => {
+    test('refuses an explicit stable read below v7 before sending', async () => {
       const { broker, requests: sent } = pinnedAt(6)
       const { fields } = offsetFetchVector(7, 'requireStable')
-      const { groupId, topics } = fields
-      const { request } = requests.OffsetFetch.protocol({ version: 6 })({ groupId, topics })
-
-      await broker.offsetFetch(fields)
-
-      expect(sent[0].apiVersion).toEqual(6)
-      expect(sent[0].body.toString('hex')).toEqual((await request.encode()).buffer.toString('hex'))
+      await expect(broker.offsetFetch(fields)).rejects.toMatchObject({
+        name: 'KafkaJSServerDoesNotSupportApiKey',
+        message: expect.stringMatching(/client v1-v10; broker supports v1-v6/),
+      })
+      expect(sent).toHaveLength(0)
     })
   })
 

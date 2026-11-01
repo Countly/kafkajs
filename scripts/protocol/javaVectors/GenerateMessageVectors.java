@@ -61,6 +61,8 @@ import org.apache.kafka.common.message.ListGroupsRequestData;
 import org.apache.kafka.common.message.ListGroupsResponseData;
 import org.apache.kafka.common.message.OffsetCommitRequestData;
 import org.apache.kafka.common.message.OffsetCommitResponseData;
+import org.apache.kafka.common.message.OffsetDeleteRequestData;
+import org.apache.kafka.common.message.OffsetDeleteResponseData;
 import org.apache.kafka.common.message.OffsetFetchRequestData;
 import org.apache.kafka.common.message.OffsetFetchResponseData;
 import org.apache.kafka.common.message.SyncGroupRequestData;
@@ -341,6 +343,7 @@ public final class GenerateMessageVectors {
     vectors.addAll(offsetCommit());
     vectors.addAll(fetchSessions());
     vectors.addAll(offsetFetch());
+    vectors.addAll(offsetAdmin());
     vectors.addAll(offsetFetchRequireStable());
     vectors.addAll(offsetFetchIdentity());
     vectors.addAll(initProducerId());
@@ -1442,6 +1445,52 @@ public final class GenerateMessageVectors {
                                 kv("metadata", str(metadata)),
                                 kv("errorCode", "0"))))))));
   }
+
+  /** Produces classic deletion and several-group offset vectors from Apache message classes.
+   * @return independent bytes and literal source fields; no client codec participates
+   */
+  private static List<Vector> offsetAdmin() {
+    List<Vector> out = new ArrayList<>();
+    var requestedTopics = new OffsetDeleteRequestData.OffsetDeleteRequestTopicCollection();
+    requestedTopics.add(new OffsetDeleteRequestData.OffsetDeleteRequestTopic().setName("test-topic")
+        .setPartitions(Arrays.asList(
+            new OffsetDeleteRequestData.OffsetDeleteRequestPartition().setPartitionIndex(0),
+            new OffsetDeleteRequestData.OffsetDeleteRequestPartition().setPartitionIndex(1))));
+    var deleting = new OffsetDeleteRequestData().setGroupId("test-group").setTopics(requestedTopics);
+    var deletedPartitions = new OffsetDeleteResponseData.OffsetDeleteResponsePartitionCollection();
+    deletedPartitions.add(new OffsetDeleteResponseData.OffsetDeleteResponsePartition().setPartitionIndex(0).setErrorCode((short) 0));
+    deletedPartitions.add(new OffsetDeleteResponseData.OffsetDeleteResponsePartition().setPartitionIndex(1).setErrorCode((short) 3));
+    var deletedTopics = new OffsetDeleteResponseData.OffsetDeleteResponseTopicCollection();
+    deletedTopics.add(new OffsetDeleteResponseData.OffsetDeleteResponseTopic().setName("test-topic").setPartitions(deletedPartitions));
+    var deleted = new OffsetDeleteResponseData().setErrorCode((short) 0).setThrottleTimeMs(17).setTopics(deletedTopics);
+    out.add(new Vector("offsetDelete", "OffsetDeleteRequest", (short) 0, "basic", deleting, "{\"groupId\":\"test-group\",\"topics\":[{\"topic\":\"test-topic\",\"partitions\":[{\"partition\":0},{\"partition\":1}]}]}"));
+    out.add(new Vector("offsetDelete", "OffsetDeleteResponse", (short) 0, "mixed", deleted, "{\"errorCode\":0,\"throttleTime\":17,\"topics\":[{\"topic\":\"test-topic\",\"partitions\":[{\"partition\":0,\"errorCode\":0},{\"partition\":1,\"errorCode\":3}]}]}"));
+    for (short version : new short[] {8, 9}) {
+      List<OffsetFetchRequestData.OffsetFetchRequestGroup> requested = new ArrayList<>();
+      List<OffsetFetchResponseData.OffsetFetchResponseGroup> answered = new ArrayList<>();
+      for (String id : Arrays.asList("a", "b")) {
+        requested.add(new OffsetFetchRequestData.OffsetFetchRequestGroup().setGroupId(id)
+            .setMemberId(null).setMemberEpoch(-1).setTopics(Collections.singletonList(
+                new OffsetFetchRequestData.OffsetFetchRequestTopics().setName("t")
+                    .setPartitionIndexes(Collections.singletonList(0)))));
+        answered.add(new OffsetFetchResponseData.OffsetFetchResponseGroup().setGroupId(id).setErrorCode((short) 0)
+            .setTopics(Collections.singletonList(new OffsetFetchResponseData.OffsetFetchResponseTopics()
+                .setName("t").setPartitions(Collections.singletonList(new OffsetFetchResponseData.OffsetFetchResponsePartitions()
+                    .setPartitionIndex(0).setCommittedOffset(10L).setCommittedLeaderEpoch(3).setMetadata(null).setErrorCode((short) 0))))));
+      }
+      out.add(new Vector("offsetFetch", "OffsetFetchRequest", version, "severalGroups",
+          new OffsetFetchRequestData().setGroups(requested).setRequireStable(true), version == 9 ? "{\"groups\":[{\"groupId\":\"a\",\"topics\":[{\"topic\":\"t\",\"partitions\":[{\"partition\":0}]}],\"memberId\":null,\"memberEpoch\":-1},{\"groupId\":\"b\",\"topics\":[{\"topic\":\"t\",\"partitions\":[{\"partition\":0}]}],\"memberId\":null,\"memberEpoch\":-1}],\"requireStable\":true}" : "{\"groups\":[{\"groupId\":\"a\",\"topics\":[{\"topic\":\"t\",\"partitions\":[{\"partition\":0}]}]},{\"groupId\":\"b\",\"topics\":[{\"topic\":\"t\",\"partitions\":[{\"partition\":0}]}]}],\"requireStable\":true}"));
+      out.add(new Vector("offsetFetch", "OffsetFetchResponse", version, "severalGroups",
+          new OffsetFetchResponseData().setThrottleTimeMs(17).setGroups(answered), "{\"throttleTime\":17,\"groups\":[{\"groupId\":\"a\",\"errorCode\":0,\"topics\":[{\"topic\":\"t\",\"partitions\":[{\"partition\":0,\"offset\":\"10\",\"leaderEpoch\":3,\"metadata\":null,\"errorCode\":0}]}]},{\"groupId\":\"b\",\"errorCode\":0,\"topics\":[{\"topic\":\"t\",\"partitions\":[{\"partition\":0,\"offset\":\"10\",\"leaderEpoch\":3,\"metadata\":null,\"errorCode\":0}]}]}]}"));
+    }
+    var legacy = new OffsetFetchResponseData().setThrottleTimeMs(17).setErrorCode((short) 0)
+        .setTopics(Collections.singletonList(new OffsetFetchResponseData.OffsetFetchResponseTopic().setName("test-topic")
+            .setPartitions(Collections.singletonList(new OffsetFetchResponseData.OffsetFetchResponsePartition()
+                .setPartitionIndex(0).setCommittedOffset(10L).setCommittedLeaderEpoch(3).setMetadata(null).setErrorCode((short) 0)))));
+    out.add(new Vector("offsetFetch", "OffsetFetchResponse", (short) 7, "stable", legacy, "{\"throttleTime\":17,\"errorCode\":0,\"topics\":[{\"topic\":\"test-topic\",\"partitions\":[{\"partition\":0,\"offset\":\"10\",\"leaderEpoch\":3,\"metadata\":null,\"errorCode\":0}]}]}"));
+    return out;
+  }
+
 
   /**
    * OffsetFetch (9) v7-v9 requests, once with RequireStable and once without (KIP-447). The two

@@ -22,15 +22,20 @@ const { KafkaJSInvariantViolation } = require('../../../../errors')
  *   TAG_BUFFER
  * TAG_BUFFER
  *
- * v8 wraps the response in a `Groups` list (KIP-709). This client only ever requests one group,
+ * v8 wraps the response in a `Groups` list (KIP-709). An explicit groups binding preserves
+ * that list and checks requested identities. The legacy form still requests one group,
  * so exactly one is expected back; the single group is flattened into the shape every earlier
  * version returned (`responses[].topic`/`.partitions[]`, top-level `errorCode` taken from the
  * group's own error code) rather than growing a new `groups[]` shape for callers to learn.
  * @see https://cwiki.apache.org/confluence/display/KAFKA/KIP-709%3A+Extend+OffsetFetch+requests+to+accept+multiple+group+ids
  * @see clients/src/main/resources/common/message/OffsetFetchResponse.json (Apache Kafka 4.3.1)
+ * @param {Buffer} rawData response body
+ * @param {object} [options] groups binding; omitted preserves the single-group shape
+ * @returns {Promise<object>} correlated group results or the legacy flattened response
+ * @throws {KafkaJSInvariantViolation} duplicate, missing or unrequested response identities
  */
 
-const decode = async (rawData) => {
+const decode = async (rawData, options = {}) => {
   const decoder = new Decoder(rawData)
   const throttleTime = decoder.readInt32()
   const groups = Decoder.requireArray(
@@ -38,6 +43,14 @@ const decode = async (rawData) => {
     'OffsetFetchResponse.Groups'
   )
   decoder.readTaggedFields()
+
+  if (options.groups !== undefined) {
+    const { exact, validateTopics } = require('../responseIdentity')
+    exact(groups, options.groups, 'groupId', 'OffsetFetch group')
+    const requestedGroups = new Map(options.groups.map((row) => [row.groupId, row]))
+    for (const group of groups) validateTopics(group, requestedGroups.get(group.groupId).topics)
+    return { throttleTime: 0, clientSideThrottleTime: throttleTime, groups }
+  }
 
   if (groups.length !== 1) {
     throw new KafkaJSInvariantViolation(

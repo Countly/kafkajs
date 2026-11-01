@@ -1055,9 +1055,9 @@
     {
       "kafkaName": "OffsetDelete",
       "apiKey": 47,
-      "forkName": null,
+      "forkName": "offsetDelete",
       "apiKeysName": "OffsetDelete",
-      "planned": "yes",
+      "planned": "done",
       "validVersions": [
         0,
         0
@@ -1065,8 +1065,10 @@
       "flexibleFrom": null,
       "deprecatedVersions": null,
       "latestVersionUnstable": false,
-      "forkVersions": null,
-      "gap": "stub",
+      "forkVersions": [
+        0
+      ],
+      "gap": "current",
       "onFloor": false,
       "belowFloor": [],
       "notes": ""

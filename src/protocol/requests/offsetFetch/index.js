@@ -36,15 +36,33 @@ const versions = {
     const response = require('./v7/response')
     return { request: request({ groupId, topics, requireStable }), response }
   },
-  8: ({ groupId, topics, requireStable }) => {
+  8: ({ groupId, topics, groups, requireStable }) => {
     const request = require('./v8/request')
     const response = require('./v8/response')
-    return { request: request({ groupId, topics, requireStable }), response }
+    return {
+      request: request({ groupId, topics, groups, requireStable }),
+      response:
+        groups === undefined
+          ? response
+          : {
+              decode: (raw) => response.decode(raw, { groups }),
+              parse: async (data) => data,
+            },
+    }
   },
-  9: ({ groupId, topics, memberId, memberEpoch, requireStable }) => {
+  9: ({ groupId, topics, groups, memberId, memberEpoch, requireStable }) => {
     const request = require('./v9/request')
     const response = require('./v9/response')
-    return { request: request({ groupId, topics, memberId, memberEpoch, requireStable }), response }
+    return {
+      request: request({ groupId, topics, groups, memberId, memberEpoch, requireStable }),
+      response:
+        groups === undefined
+          ? response
+          : {
+              decode: (raw) => response.decode(raw, { groups }),
+              parse: async (data) => data,
+            },
+    }
   },
   // Keyed by topic id: the request's own name-to-id map is bound onto the response codec, so the
   // decoded answer still names its topics.

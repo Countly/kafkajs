@@ -971,10 +971,21 @@ listTopics(): Promise<string[]>
     useDescribeTopicPartitions?: boolean
     includeTopicAuthorizedOperations?: boolean
   }) & ApiTimeoutOption): Promise<{ topics: Array<ITopicMetadata> }>
+  deleteOffsets(options: { groupId: string; topics: Array<{topic: string; partitions: number[]}> } & ApiTimeoutOption): Promise<{
+    topics: Array<{topic: string; partitions: Array<{partition: number} & AdminItemResult>}>
+  }>
+  fetchOffsetsForGroups(options: {
+    groups: Array<{groupId: string; topics?: Array<{topic: string; partitions?: number[]}>}>
+    requireStable?: boolean
+  } & ApiTimeoutOption): Promise<Array<{
+    groupId: string
+    topics: Array<{topic: string; partitions: Array<{partition: number; offset: string; metadata: string | null; leaderEpoch: number | null} & AdminItemResult>}>
+  } & AdminItemResult>>
   fetchOffsets(options: ({
     groupId: string
     topics?: string[]
     resolveOffsets?: boolean
+    requireStable?: boolean
   }) & ApiTimeoutOption): Promise<Array<{ topic: string; partitions: FetchOffsetsPartition[] }>>
   fetchTopicOffsets(topic: string, options?: ApiTimeoutOption): Promise<Array<SeekEntry & { high: string; low: string }>>
 fetchTopicOffsets(topic: string): Promise<Array<SeekEntry & { high: string; low: string }>>

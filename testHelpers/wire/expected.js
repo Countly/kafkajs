@@ -669,3 +669,44 @@ module.exports = {
     },
   },
 }
+
+module.exports.offsetDeleteV0 = {
+  source:
+    'OffsetDeleteRequestData and OffsetDeleteResponseData; generated vector acceptance required',
+  request: {
+    groupId: 'test-group',
+    topics: [{ topic: 'test-topic', partitions: [{ partition: 0 }, { partition: 1 }] }],
+  },
+  response: {
+    errorCode: 0,
+    throttleTime: 17,
+    topics: [
+      {
+        topic: 'test-topic',
+        partitions: [
+          { partition: 0, errorCode: 0 },
+          { partition: 1, errorCode: 3 },
+        ],
+      },
+    ],
+  },
+}
+module.exports.offsetFetchV7 = {
+  source:
+    'OffsetFetchRequestData and OffsetFetchResponseData v7; generated vector acceptance required',
+  request: {
+    groupId: 'test-group',
+    topics: [{ topic: 'test-topic', partitions: [{ partition: 0 }] }],
+    requireStable: true,
+  },
+  response: {
+    errorCode: 0,
+    throttleTime: 17,
+    topics: [
+      {
+        topic: 'test-topic',
+        partitions: [{ partition: 0, offset: '10', leaderEpoch: 3, metadata: null, errorCode: 0 }],
+      },
+    ],
+  },
+}

@@ -304,9 +304,9 @@
     {
       "kafkaName": "OffsetDelete",
       "apiKey": 47,
-      "forkName": null,
+      "forkName": "offsetDelete",
       "apiKeysName": "OffsetDelete",
-      "planned": "yes"
+      "planned": "done"
     },
     {
       "kafkaName": "DescribeClientQuotas",
