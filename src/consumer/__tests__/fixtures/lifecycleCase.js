@@ -68,6 +68,7 @@ const runLifecycleCell = async (cell) => {
   }
   process.on('unhandledRejection', unhandled)
   let runner
+  let fetchRounds
   let consumer
   let enabled = false
   let used = false
@@ -263,6 +264,7 @@ const runLifecycleCell = async (cell) => {
       })
     )
     await pump(() => runner != null, 'runner capture')
+    fetchRounds = jest.spyOn(runner, 'fetch')
     if (
       ![
         'in-join',
@@ -584,6 +586,12 @@ const runLifecycleCell = async (cell) => {
       if (cell.event === 'force') {
         expect(jest.getTimerCount()).toBe(baseline.timers + brokerAnswerTimers.size)
         await pump(() => brokerAnswerTimers.size === 0, 'held broker answers')
+        const fetched = fetchRounds.mock.calls.length
+        for (let step = 0; step < 20; step++) {
+          await new Promise(setImmediate)
+          await jest.advanceTimersByTimeAsync(1)
+        }
+        expect(fetchRounds.mock.calls.length).toBe(fetched)
       }
       expect(jest.getTimerCount()).toBe(baseline.timers)
     }
