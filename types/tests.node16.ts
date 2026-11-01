@@ -102,8 +102,8 @@ kafka.consumer({ groupId: 'rack-range', rackAwareAssignment: 'true' })
 
 {
   const kafka = new Kafka({ brokers: ['unused:9092'] })
-  const direct: import('.').DirectConsumerConfig = {}
-  const grouped: import('.').ConsumerConfig = { groupId: 'typed-group' }
+  const direct: import('@countly/kafkajs').DirectConsumerConfig = {}
+  const grouped: import('@countly/kafkajs').ConsumerConfig = { groupId: 'typed-group' }
   const configs: Parameters<Kafka['consumer']>[0][] = [direct, grouped, { groupId: undefined }]
   for (const config of configs) kafka.consumer(config)
   const consumer = kafka.consumer(direct)
@@ -115,17 +115,17 @@ kafka.consumer({ groupId: 'rack-range', rackAwareAssignment: 'true' })
     fromBeginning: true,
   })
   consumer.unsubscribe()
-  const assignment: import('.').TopicPartitions[] = consumer.assignment()
+  const assignment: import('@countly/kafkajs').TopicPartitions[] = consumer.assignment()
   const subscription: string[] = consumer.subscription()
   const position: Promise<string> = consumer.position({ topic: 'records', partition: 0 })
-  const committed: Promise<import('.').ConsumerCommittedOffset[]> = consumer.committed([])
-  const group: import('.').ConsumerGroupMetadata = consumer.groupMetadata()
+  const committed: Promise<import('@countly/kafkajs').ConsumerCommittedOffset[]> = consumer.committed([])
+  const group: import('@countly/kafkajs').ConsumerGroupMetadata = consumer.groupMetadata()
   const noParameters: Parameters<typeof consumer.disconnect> = []
   consumer.disconnect()
   consumer.disconnect({ leaveGroup: true })
   process.on('SIGTERM', consumer.disconnect)
   // @ts-expect-error groupId is still required on the grouped configuration
-  const invalidGrouped: import('.').ConsumerConfig = {}
+  const invalidGrouped: import('@countly/kafkajs').ConsumerConfig = {}
   // @ts-expect-error runtime and declarations reject null group identity
   kafka.consumer({ groupId: null })
   // @ts-expect-error offsets are returned as decimal strings
@@ -144,7 +144,7 @@ kafka.consumer({ groupId: 'rack-range', rackAwareAssignment: 'true' })
     partition: 0,
     reason: 'no-offset',
   })
-  const inherited: import('.').ConsumerPartitionHaltedEventPayload = {
+  const inherited: import('@countly/kafkajs').ConsumerPartitionHaltedEventPayload = {
     groupId: 'typed-group',
     memberId: 'member',
     topic: 'records',
@@ -156,7 +156,7 @@ kafka.consumer({ groupId: 'rack-range', rackAwareAssignment: 'true' })
     limit: 1024,
     nextOffset: '18',
   }
-  const missing: import('.').ConsumerPartitionHaltedEventPayload = {
+  const missing: import('@countly/kafkajs').ConsumerPartitionHaltedEventPayload = {
     groupId: null,
     memberId: '',
     topic: 'records',
@@ -165,7 +165,7 @@ kafka.consumer({ groupId: 'rack-range', rackAwareAssignment: 'true' })
     offset: null,
     error: none,
   }
-  const outside: import('.').ConsumerPartitionHaltedEventPayload = {
+  const outside: import('@countly/kafkajs').ConsumerPartitionHaltedEventPayload = {
     groupId: null,
     memberId: '',
     topic: 'records',
@@ -174,8 +174,8 @@ kafka.consumer({ groupId: 'rack-range', rackAwareAssignment: 'true' })
     offset: '99',
     error: none,
   }
-  /** @param {import('.').ConsumerPartitionHaltedEventPayload} payload actual event payload */
-  const narrow = (payload: import('.').ConsumerPartitionHaltedEventPayload): void => {
+  /** @param {import('@countly/kafkajs').ConsumerPartitionHaltedEventPayload} payload actual event payload */
+  const narrow = (payload: import('@countly/kafkajs').ConsumerPartitionHaltedEventPayload): void => {
     const id: string | null = payload.groupId
     if (payload.reason === 'no-offset') {
       const offset: null = payload.offset

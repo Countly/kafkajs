@@ -27,6 +27,7 @@ const {
 } = require('../consumerChurn')
 const { ChurnLogReader, ChurnMember, ConsumerChurnRun } = require('../consumerChurnRun')
 const { PROFILES, WORKLOADS, buildConsumerChurn, main, parseArgs } = require('../soak')
+const { evidencePath } = require('../../../testHelpers/e2eEvidence')
 
 const MIB = 1024 * 1024
 
@@ -110,6 +111,9 @@ describe('Consumer churn profile > plan and registry', () => {
       close: jest.fn(async () => {}),
     }
     const build = jest.fn(() => owner)
+    const created = ['.journal', '.clientlog']
+      .map((ext) => evidencePath('consumer-churn').replace(/\.jsonl$/, ext))
+      .filter((file) => !fs.existsSync(file))
     try {
       const verdict = await main('consumer-churn', {
         brokers: ['unreachable.invalid:1'],
@@ -119,6 +123,7 @@ describe('Consumer churn profile > plan and registry', () => {
       expect(verdict).toEqual({ ok: true, acceptance: false })
     } finally {
       globalThis.gc = exposed
+      for (const file of created) fs.rmSync(file, { force: true })
     }
     expect(build).toHaveBeenCalledWith(expect.objectContaining({ phaseSeconds: 5 }))
     expect(owner.close).toHaveBeenCalledTimes(1)
@@ -1269,6 +1274,9 @@ describe('Consumer churn profile > group identities', () => {
   })
 
   test('the owner built for the profile joins the run and the workloads on one mapping', () => {
+    const created = ['.journal', '.clientlog']
+      .map((ext) => evidencePath('consumer-churn').replace(/\.jsonl$/, ext))
+      .filter((file) => !fs.existsSync(file))
     const owner = buildConsumerChurn({ brokers: ['localhost:1'], phaseSeconds: 4 })
     try {
       expect(owner).toBeInstanceOf(ConsumerChurnRun)
@@ -1279,6 +1287,7 @@ describe('Consumer churn profile > group identities', () => {
     } finally {
       owner.journal.close()
       owner.clientLog.close()
+      for (const file of created) fs.rmSync(file, { force: true })
     }
   })
 

@@ -1,4 +1,5 @@
 const path = require('path')
+const { execFile } = require('child_process')
 const zlib = require('zlib')
 const { loadCorpus, runCases, caseLabel } = require('../../../../testHelpers/fuzz')
 const { frame, block, runBlock } = require('../../../../testHelpers/lz4Frame')
@@ -30,25 +31,29 @@ try {
 const CODECS = ['gzip', 'snappy', ...(hasZstd ? ['zstd'] : []), ...(hasLz4 ? ['lz4'] : [])]
 const describeIfLz4 = hasLz4 ? describe : describe.skip
 
+const MEASURE = path.join(__dirname, 'fixtures', 'measureBomb.js')
+
 /**
- * The peak resident set size a piece of work adds, sampled every 2 ms. Decompression runs on the
- * thread pool, so the sampler keeps running while it does.
- * @param {() => Promise<void>} work
- * @returns {Promise<number>} bytes above the size before the work
+ * Decompresses a bomb in a fresh Node process, so the resident memory it reports holds only the
+ * decompression and none of this test runner's own allocation.
+ * @param {'gzip' | 'zstd' | 'lz4' | 'snappy'} codec
+ * @param {Buffer} bomb compressed bytes, handed to the child on stdin
+ * @returns {Promise<{ error: object, growth: number, nativeCalls: number, milliseconds: number }>}
+ * @throws {Error} with the child's stderr when it fails or exceeds the timeout
  */
-const peakGrowth = async (work) => {
-  const before = process.memoryUsage.rss()
-  let peak = before
-  const sampler = setInterval(() => {
-    peak = Math.max(peak, process.memoryUsage.rss())
-  }, 2)
-  try {
-    await work()
-  } finally {
-    clearInterval(sampler)
-  }
-  return Math.max(peak, process.memoryUsage.rss()) - before
-}
+const measure = (codec, bomb) =>
+  new Promise((resolve, reject) => {
+    const child = execFile(
+      process.execPath,
+      [MEASURE, codec],
+      { timeout: 50000, maxBuffer: MIB },
+      (error, stdout, stderr) =>
+        error
+          ? reject(new Error(`${codec} child failed: ${error.message}\n${stderr}`))
+          : resolve(JSON.parse(stdout))
+    )
+    child.stdin.end(bomb)
+  })
 
 // These run one at a time: a figure of resident memory is only meaningful when nothing else in
 // the process is allocating.
@@ -59,13 +64,7 @@ describe('Protocol > Compression > a bomb built by streaming', () => {
   test.each(['gzip', ...(hasZstd ? ['zstd'] : [])])(
     'a %s stream of 512 MiB is refused with a rise of at most the bound plus 16 MiB',
     async (name) => {
-      const bomb = await bombOf(name, 512)
-      const codec = lookupCodec(Types[name === 'gzip' ? 'GZIP' : 'ZSTD'])
-      let error
-
-      const growth = await peakGrowth(async () => {
-        error = await decompressBounded(codec, name === 'gzip' ? 1 : 4, bomb, LIMIT).catch((e) => e)
-      })
+      const { error, growth } = await measure(name, await bombOf(name, 512))
 
       expect(error).toMatchObject({ reason: 'decompressed-size', codec: name, limit: LIMIT })
       expect(growth).toBeLessThanOrEqual(ALLOWANCE)
@@ -75,28 +74,17 @@ describe('Protocol > Compression > a bomb built by streaming', () => {
 
   describeIfLz4('LZ4', () => {
     test('a frame of 4 GiB in 4 MiB blocks is refused before the native decoder, with no rise', async () => {
-      const native = jest.spyOn(require('lz4-napi'), 'decompressFrame')
-      try {
-        const bomb = frame({
-          maxSizeCode: 7,
-          blocks: Array.from({ length: 1000 }, () => block(runBlock(0, 4 * MIB))),
-        })
-        const codec = lookupCodec(Types.LZ4)
-        const started = Date.now()
-        let error
+      const bomb = frame({
+        maxSizeCode: 7,
+        blocks: Array.from({ length: 1000 }, () => block(runBlock(0, 4 * MIB))),
+      })
+      const { error, growth, nativeCalls, milliseconds } = await measure('lz4', bomb)
 
-        const growth = await peakGrowth(async () => {
-          error = await decompressBounded(codec, 3, bomb, LIMIT).catch((e) => e)
-        })
-
-        expect(error).toMatchObject({ reason: 'decompressed-size', codec: 'lz4', limit: LIMIT })
-        expect(native).not.toHaveBeenCalled()
-        expect(growth).toBeLessThanOrEqual(16 * MIB)
-        expect(Date.now() - started).toBeLessThan(SLOW_MS)
-      } finally {
-        native.mockRestore()
-      }
-    })
+      expect(error).toMatchObject({ reason: 'decompressed-size', codec: 'lz4', limit: LIMIT })
+      expect(nativeCalls).toBe(0)
+      expect(growth).toBeLessThanOrEqual(16 * MIB)
+      expect(milliseconds).toBeLessThan(SLOW_MS)
+    }, 60000)
 
     test('a legitimate frame of 300 MiB in 4 MiB blocks passes under the default bound of 1 GiB', async () => {
       const legitimate = frame({
@@ -113,13 +101,10 @@ describe('Protocol > Compression > a bomb built by streaming', () => {
   })
 
   test('a Snappy block declaring 2 GiB is refused before anything is allocated for it', async () => {
-    const lying = Buffer.from([0x80, 0x80, 0x80, 0x80, 0x08, 0x00, 0x61])
-    const codec = lookupCodec(Types.Snappy)
-    let error
-
-    const growth = await peakGrowth(async () => {
-      error = await decompressBounded(codec, 2, lying, LIMIT).catch((e) => e)
-    })
+    const { error, growth } = await measure(
+      'snappy',
+      Buffer.from([0x80, 0x80, 0x80, 0x80, 0x08, 0x00, 0x61])
+    )
 
     expect(error).toMatchObject({ reason: 'decompressed-size', codec: 'snappy' })
     expect(growth).toBeLessThanOrEqual(16 * MIB)
