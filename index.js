@@ -1,4 +1,5 @@
 const Kafka = require('./src')
+const oauthBearer = require('./src/oauth')
 const PartitionAssigners = require('./src/consumer/assigners')
 const AssignerProtocol = require('./src/consumer/assignerProtocol')
 const Partitioners = require('./src/producer/partitioners')
@@ -29,6 +30,7 @@ const { LEVELS } = require('./src/loggers')
 
 module.exports = {
   Kafka,
+  oauthBearer,
   PartitionAssigners,
   AssignerProtocol,
   Partitioners,
