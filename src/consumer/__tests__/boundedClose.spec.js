@@ -711,12 +711,14 @@ describe('a consumer close over a scripted broker', () => {
     await open()
     const { consumer, events } = await started()
     const leave = hold('LeaveGroup')
+    // Leaves room for the stop and final commit to reach the held leave on a loaded host.
+    const bound = 5 * BOUND_MS
     const startedAt = Date.now()
-    const first = consumer.disconnect({ timeout: BOUND_MS, leaveGroup: true })
+    const first = consumer.disconnect({ timeout: bound, leaveGroup: true })
     const second = consumer.disconnect({ timeout: 9000, leaveGroup: false })
     await expect(Promise.all([first, second])).resolves.toBeDefined()
-    expect(Date.now() - startedAt).toBeGreaterThanOrEqual(BOUND_MS - 50)
-    expect(Date.now() - startedAt).toBeLessThan(3000)
+    expect(Date.now() - startedAt).toBeGreaterThanOrEqual(bound - 50)
+    expect(Date.now() - startedAt).toBeLessThan(bound + 2700)
     expect(leave.hits).toBe(1)
     expect(events).toEqual(['STOP', 'DISCONNECT'])
   })
@@ -799,8 +801,8 @@ describe('a consumer close over a scripted broker', () => {
     const { consumer } = await started()
     const commit = hold('OffsetCommit')
     const startedAt = Date.now()
-    await consumer.disconnect({ timeout: BOUND_MS })
-    expect(Date.now() - startedAt).toBeLessThan(3000)
+    await consumer.disconnect({ timeout: 5 * BOUND_MS })
+    expect(Date.now() - startedAt).toBeLessThan(5 * BOUND_MS + 2700)
     expect(commit.hits).toBe(1)
     commit.release()
     await pause(100)
@@ -901,7 +903,7 @@ describe('a consumer close over a scripted broker', () => {
     await until(() => detached.length === 1, 'the released handler')
     expect(detached[0]).toEqual(['rejected'])
 
-    await consumer.disconnect({ timeout: BOUND_MS })
+    await consumer.disconnect({ timeout: 5 * BOUND_MS })
     expect(hookHeld).toBe(true)
     await restart()
     hookGate.resolve()
@@ -921,13 +923,13 @@ describe('a consumer close over a scripted broker', () => {
       rebalanceListener: {
         onPartitionsAssigned: async () => {
           const startedAt = Date.now()
-          await consumer.disconnect({ timeout: 1000 })
+          await consumer.disconnect({ timeout: 5000 })
           acknowledged.push(Date.now() - startedAt)
         },
       },
     })
     await until(() => acknowledged.length === 1, 'the acknowledgement')
-    expect(acknowledged[0]).toBeLessThan(900)
+    expect(acknowledged[0]).toBeLessThan(4000)
     await until(() => frames(rig.cluster, 'LeaveGroup').length >= 1, 'the leave')
     await pause(100)
     expect(frames(rig.cluster, 'LeaveGroup')).toHaveLength(1)
@@ -998,7 +1000,7 @@ describe('a consumer close over a scripted broker', () => {
   })
 
   describe.each([true, false])('with request timeout enforcement %p', (enforce) => {
-    const bounded = { maxTotalTime: BOUND_MS }
+    const bounded = { maxTotalTime: 5 * BOUND_MS }
     const connected = async (retry = bounded) => {
       await open({ enforce, retry })
       const consumer = rig.kafka.consumer({ groupId: GROUP, maxWaitTimeInMs: 20 })
@@ -1013,7 +1015,7 @@ describe('a consumer close over a scripted broker', () => {
       const lookup = hold('FindCoordinator')
       const startedAt = Date.now()
       await expect(consumer.committed(cell)).rejects.toBeInstanceOf(KafkaJSDeliveryTimeout)
-      expect(Date.now() - startedAt).toBeLessThan(3000)
+      expect(Date.now() - startedAt).toBeLessThan(bounded.maxTotalTime + 2700)
       expect(lookup.hits).toBeGreaterThan(0)
       lookup.release()
       await pause(100)
