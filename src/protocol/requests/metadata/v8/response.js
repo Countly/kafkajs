@@ -5,9 +5,9 @@ const { parse } = require('../v0/response')
  * MetadataResponse (Version: 8)
  *
  * Adds Topics.TopicAuthorizedOperations (8+, default -2147483648) after Partitions, and
- * ClusterAuthorizedOperations (8-10, default -2147483648) after Topics. The fork never requests
- * either bitfield (both request flags are sent `false`), so brokers return the default; nothing
- * in this client routes on these values yet.
+ * ClusterAuthorizedOperations (8-10, default -2147483648) after Topics. Topic masks can be
+ * requested by admin callers; this decoder preserves the signed bitfield unchanged. Routing
+ * never depends on authorization masks.
  * @see clients/src/main/resources/common/message/MetadataResponse.json
  */
 

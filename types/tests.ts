@@ -1618,3 +1618,38 @@ void closeResult
 void extensionValue
 void legacyCallback
 void helperCallback
+
+
+// Admin option overloads preserve the original tuple-based wrappers.
+type AdminTupleEqual<A, B> = (<T>() => T extends A ? 1 : 2) extends (<T>() => T extends B ? 1 : 2) ? true : false
+type AdminTupleAssert<T extends true> = T
+type AdminListTuple = AdminTupleAssert<AdminTupleEqual<Parameters<kafkajs.Admin['listTopics']>, []>>
+type AdminGroupTuple = AdminTupleAssert<AdminTupleEqual<Parameters<kafkajs.Admin['describeGroups']>, [groupIds: string[]]>>
+type AdminDeleteGroupTuple = AdminTupleAssert<AdminTupleEqual<Parameters<kafkajs.Admin['deleteGroups']>, [groupIds: string[]]>>
+type AdminOffsetsTuple = AdminTupleAssert<AdminTupleEqual<Parameters<kafkajs.Admin['fetchTopicOffsets']>, [topic: string]>>
+type AdminTimestampTuple = AdminTupleAssert<AdminTupleEqual<Parameters<kafkajs.Admin['fetchTopicOffsetsByTimestamp']>, [topic: string, timestamp?: number]>>
+type AdminClusterTuple = AdminTupleAssert<AdminTupleEqual<Parameters<kafkajs.Admin['describeCluster']>, []>>
+type AdminDisconnectTuple = AdminTupleAssert<AdminTupleEqual<Parameters<kafkajs.Admin['disconnect']>, []>>
+declare const deadlineAdmin: kafkajs.Admin
+const adminDeadlineConfig: kafkajs.AdminConfig = { apiTimeout: 2147483647 }
+const adminCallBudget: kafkajs.ApiTimeoutOption = { apiTimeout: 1 }
+deadlineAdmin.listTopics(adminCallBudget)
+deadlineAdmin.describeGroups(['g'], { apiTimeout: 5, includeAuthorizedOperations: true })
+deadlineAdmin.deleteGroups(['g'], adminCallBudget)
+deadlineAdmin.fetchTopicOffsets('t', adminCallBudget)
+deadlineAdmin.fetchTopicOffsetsByTimestamp('t', 1, adminCallBudget)
+deadlineAdmin.describeCluster(adminCallBudget)
+deadlineAdmin.fetchTopicMetadata({ topics: ['t'], includeTopicAuthorizedOperations: true, apiTimeout: 10 })
+deadlineAdmin.createTopics({ topics: [{ topic: 't' }], timeout: 30000, apiTimeout: 5000 })
+process.on('SIGTERM', deadlineAdmin.disconnect)
+const oldAdminTupleWrapper = (...args: Parameters<kafkajs.Admin['describeGroups']>) => deadlineAdmin.describeGroups(...args)
+oldAdminTupleWrapper(['g'])
+// @ts-expect-error tuple wrapper retains one argument
+oldAdminTupleWrapper(['g'], adminCallBudget)
+// @ts-expect-error budgets have number type
+deadlineAdmin.listTopics({ apiTimeout: '10' })
+// @ts-expect-error flags have boolean type
+deadlineAdmin.describeGroups(['g'], { includeAuthorizedOperations: 1 })
+// @ts-expect-error topic flags have boolean type
+deadlineAdmin.fetchTopicMetadata({ includeTopicAuthorizedOperations: 'true' })
+void adminDeadlineConfig

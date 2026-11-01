@@ -30,7 +30,7 @@ describe('admin retry ownership', () => {
     const groups = fs.readFileSync(path.join(__dirname, '..', 'groupDescriptions.js'), 'utf8')
     expect(sites).toHaveLength(20)
     expect(index.match(/retrierOf\(retry\)/g)).toHaveLength(18)
-    expect(groups.match(/retrierOf\(this\.retry\)/g)).toHaveLength(2)
+    expect(groups.match(/this\.#retrier\(context\)\(async/g)).toHaveLength(2)
     for (const method of sites.slice(0, 18))
       expect(index).toMatch(new RegExp(`const ${method} = async`))
   })

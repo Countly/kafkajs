@@ -164,7 +164,9 @@ describe('Cluster > metadata contract', () => {
       await cluster.metadata()
 
       expect(brokers[0].metadata).toHaveBeenCalledTimes(1)
-      expect(brokers[0].metadata).toHaveBeenCalledWith([])
+      expect(brokers[0].metadata).toHaveBeenCalledWith([], {
+        includeTopicAuthorizedOperations: false,
+      })
     })
 
     test('refreshes an expired cache, which writes the metadata cache, then asks the broker again', async () => {

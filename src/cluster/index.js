@@ -608,7 +608,7 @@ module.exports = class Cluster {
    * The answer is a snapshot: it is never merged into the metadata cache, never emits
    * `TOPIC_RECREATED` and never changes the target topics.
    * @public
-   * @param {{ topics?: string[] }} [options]
+   * @param {{ topics?: string[], includeTopicAuthorizedOperations?: boolean }} [options]
    * @returns {Promise<import("../../types").BrokerMetadata>}
    * @throws {Error} the last broker error, once every broker is connected to and has failed; or a
    *   refresh error other than `LEADER_NOT_AVAILABLE`, as it is
@@ -619,7 +619,7 @@ module.exports = class Cluster {
    * @throws {import("../errors").KafkaJSNonRetriableError} when the refresh spent its budget on
    *   `LEADER_NOT_AVAILABLE`, or broker selection fails in a way that cannot succeed
    */
-  async metadata({ topics = [] } = {}) {
+  async metadata({ topics = [], includeTopicAuthorizedOperations = false } = {}) {
     return this.retrier(async (bail, retryCount, retryTime) => {
       try {
         await this.brokerPool.refreshMetadataIfNecessary(topics)
@@ -634,7 +634,7 @@ module.exports = class Cluster {
       let lastError
       const metadata = await this.brokerPool.withBroker(async ({ broker }) => {
         try {
-          return await broker.metadata(topics)
+          return await broker.metadata(topics, { includeTopicAuthorizedOperations })
         } catch (e) {
           lastError = e
           throw e

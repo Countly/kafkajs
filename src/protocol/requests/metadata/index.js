@@ -43,35 +43,53 @@ const versions = {
     const response = require('./v7/response')
     return { request: request({ topics, allowAutoTopicCreation }), response }
   },
-  8: ({ topics, allowAutoTopicCreation }) => {
+  8: ({ topics, allowAutoTopicCreation, includeTopicAuthorizedOperations }) => {
     const request = require('./v8/request')
     const response = require('./v8/response')
-    return { request: request({ topics, allowAutoTopicCreation }), response }
+    return {
+      request: request({ topics, allowAutoTopicCreation, includeTopicAuthorizedOperations }),
+      response,
+    }
   },
-  9: ({ topics, allowAutoTopicCreation }) => {
+  9: ({ topics, allowAutoTopicCreation, includeTopicAuthorizedOperations }) => {
     const request = require('./v9/request')
     const response = require('./v9/response')
-    return { request: request({ topics, allowAutoTopicCreation }), response }
+    return {
+      request: request({ topics, allowAutoTopicCreation, includeTopicAuthorizedOperations }),
+      response,
+    }
   },
-  10: ({ topics, allowAutoTopicCreation }) => {
+  10: ({ topics, allowAutoTopicCreation, includeTopicAuthorizedOperations }) => {
     const request = require('./v10/request')
     const response = require('./v10/response')
-    return { request: request({ topics, allowAutoTopicCreation }), response }
+    return {
+      request: request({ topics, allowAutoTopicCreation, includeTopicAuthorizedOperations }),
+      response,
+    }
   },
-  11: ({ topics, allowAutoTopicCreation }) => {
+  11: ({ topics, allowAutoTopicCreation, includeTopicAuthorizedOperations }) => {
     const request = require('./v11/request')
     const response = require('./v11/response')
-    return { request: request({ topics, allowAutoTopicCreation }), response }
+    return {
+      request: request({ topics, allowAutoTopicCreation, includeTopicAuthorizedOperations }),
+      response,
+    }
   },
-  12: ({ topics, allowAutoTopicCreation }) => {
+  12: ({ topics, allowAutoTopicCreation, includeTopicAuthorizedOperations }) => {
     const request = require('./v12/request')
     const response = require('./v12/response')
-    return { request: request({ topics, allowAutoTopicCreation }), response }
+    return {
+      request: request({ topics, allowAutoTopicCreation, includeTopicAuthorizedOperations }),
+      response,
+    }
   },
-  13: ({ topics, allowAutoTopicCreation }) => {
+  13: ({ topics, allowAutoTopicCreation, includeTopicAuthorizedOperations }) => {
     const request = require('./v13/request')
     const response = require('./v13/response')
-    return { request: request({ topics, allowAutoTopicCreation }), response }
+    return {
+      request: request({ topics, allowAutoTopicCreation, includeTopicAuthorizedOperations }),
+      response,
+    }
   },
 }
 

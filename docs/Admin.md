@@ -17,6 +17,10 @@ Retry counts and backoff remain unchanged. The call ends at the earlier of retry
 
 For example, `createTopics({ topics, timeout: 30000, apiTimeout: 5000 })` can time out locally while the broker continues creating the topics. The error names the method and the API budget.
 
+## Authorized operations
+
+`describeGroups(groupIds, { includeAuthorizedOperations: true })` and `fetchTopicMetadata({ topics, includeTopicAuthorizedOperations: true })` can return `authorizedOperations?: number | null`. A requested supported value is the raw signed INT32 mask, including unknown bits. The sentinel `-2147483648`, an absent or unsupported field, and a field not requested are `null`. Metadata supports its request flag from v8; v7 completes with a null mask. No conversion to an operation-name array is performed.
+
 ```javascript
 const kafka = new Kafka(...)
 const admin = kafka.admin()
@@ -665,7 +669,7 @@ await admin.describeGroups([ 'testgroup' ])
 //     groupEpoch: null,                  // consumer groups only; null for a classic group
 //     assignmentEpoch: null,             // consumer groups only; null for a classic group
 //     assignorName: null,                // consumer groups only; null for a classic group
-//     authorizedOperations: null,        // always null today: authorized operations are not requested
+//     authorizedOperations: null,        // raw mask when requested, otherwise null
 //     members: [
 //       {
 //         clientHost: '/172.19.0.1',

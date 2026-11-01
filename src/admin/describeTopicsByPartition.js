@@ -237,10 +237,12 @@ const toPartitionMetadata = (partition) => ({
  * leader to find a leaderless partition. Unlike a Metadata request for named topics, this path
  * never waits for leaders. DescribeTopicPartitions never creates a topic.
  * @param {PageTopic[]} rows in name order
+ * @param {object} [options] optional authorization mask projection
+ * @param {boolean} [options.includeTopicAuthorizedOperations=false] retain supported signed masks
  * @returns {{ topics: object[] }}
  * @throws {KafkaJSProtocolError} for the first failing topic
  */
-const toTopicsMetadata = (rows) => {
+const toTopicsMetadata = (rows, { includeTopicAuthorizedOperations = false } = {}) => {
   const failed = rows.find(({ errorCode }) => errorCode !== 0)
 
   if (failed) {
@@ -248,18 +250,19 @@ const toTopicsMetadata = (rows) => {
   }
 
   return {
-    topics: rows.map(({ name, topicId, isInternal, partitions }) => ({
+    topics: rows.map(({ name, topicId, isInternal, partitions, topicAuthorizedOperations }) => ({
       name,
       topicId,
       isInternal,
+      authorizedOperations:
+        includeTopicAuthorizedOperations &&
+        topicAuthorizedOperations != null &&
+        topicAuthorizedOperations !== -2147483648
+          ? topicAuthorizedOperations
+          : null,
       partitions: partitions.map(toPartitionMetadata),
     })),
   }
 }
 
-module.exports = {
-  readTopicPages,
-  toTopicsMetadata,
-  withReadDeadline,
-  checkDeadline,
-}
+module.exports = { readTopicPages, toTopicsMetadata, withReadDeadline, checkDeadline }

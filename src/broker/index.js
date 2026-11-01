@@ -667,6 +667,7 @@ module.exports = class Broker {
    * @param {(frameLength?: number) => Error|null} [options.guard] a producer's private pre-write
    *   check; it never reaches the request
    * @param {boolean} [options.allowAutoTopicCreation] overrides only this request
+   * @param {boolean} [options.includeTopicAuthorizedOperations=false] requests raw topic masks from v8
    * @param {boolean} [options.lenient=false] retains per-topic/partition errors in data
    * @param {boolean} [options.allowLeaderless=false] keeps a partition without a leader in data;
    *   other errors still throw
@@ -678,13 +679,20 @@ module.exports = class Broker {
       guard,
       lenient = false,
       allowLeaderless = false,
+      includeTopicAuthorizedOperations = false,
       allowAutoTopicCreation = this.allowAutoTopicCreation,
     } = options
     this.throwIfRefused(guard)
     const metadata = this.lookupRequest(apiKeys.Metadata, requests.Metadata)
     const shuffledTopics = shuffle(topics)
     return await this[PRIVATE.SEND_REQUEST](
-      metadata({ topics: shuffledTopics, allowAutoTopicCreation, lenient, allowLeaderless }),
+      metadata({
+        topics: shuffledTopics,
+        allowAutoTopicCreation,
+        lenient,
+        allowLeaderless,
+        includeTopicAuthorizedOperations,
+      }),
       guard
     )
   }

@@ -127,10 +127,7 @@ const staticMembers = (members) => {
     instanceIds.add(instanceId)
   }
 
-  return [...instanceIds].map((groupInstanceId) => ({
-    memberId: '',
-    groupInstanceId,
-  }))
+  return [...instanceIds].map((groupInstanceId) => ({ memberId: '', groupInstanceId }))
 }
 
 /**
@@ -526,21 +523,13 @@ module.exports = ({
               broker = checked(await waitOf(async () => cluster.findControllerBroker()))
               checked(
                 await waitOf(async () =>
-                  broker.createTopics({
-                    topics: outcome.pending,
-                    validateOnly,
-                    timeout,
-                  })
+                  broker.createTopics({ topics: outcome.pending, validateOnly, timeout })
                 )
               )
               outcome.succeeded()
             } catch (e) {
               if (e.type === 'NOT_CONTROLLER') {
-                logger.warn('Could not create topics', {
-                  error: e.message,
-                  retryCount,
-                  retryTime,
-                })
+                logger.warn('Could not create topics', { error: e.message, retryCount, retryTime })
                 throw e
               }
 
@@ -623,20 +612,12 @@ module.exports = ({
         const broker = checked(await waitOf(async () => cluster.findControllerBroker()))
         checked(
           await waitOf(async () =>
-            broker.createPartitions({
-              topicPartitions: pending,
-              validateOnly,
-              timeout,
-            })
+            broker.createPartitions({ topicPartitions: pending, validateOnly, timeout })
           )
         )
       } catch (e) {
         if (e.type === 'NOT_CONTROLLER') {
-          logger.warn('Could not create topics', {
-            error: e.message,
-            retryCount,
-            retryTime,
-          })
+          logger.warn('Could not create topics', { error: e.message, retryCount, retryTime })
           throw e
         }
 
@@ -644,11 +625,7 @@ module.exports = ({
 
         if (refused) {
           pending = pending.filter(({ topic }) => refused.has(topic))
-          logger.warn('A quota refused partitions', {
-            topics: [...refused],
-            retryCount,
-            retryTime,
-          })
+          logger.warn('A quota refused partitions', { topics: [...refused], retryCount, retryTime })
           throw e
         }
 
@@ -712,11 +689,7 @@ module.exports = ({
         }
 
         if (['NOT_CONTROLLER', 'UNKNOWN_TOPIC_OR_PARTITION'].includes(e.type)) {
-          logger.warn('Could not delete topics', {
-            error: e.message,
-            retryCount,
-            retryTime,
-          })
+          logger.warn('Could not delete topics', { error: e.message, retryCount, retryTime })
           throw e
         }
 
@@ -897,9 +870,7 @@ module.exports = ({
             const partitions = checked(
               await waitOf(async () => findTopicPartitions(cluster, topic))
             )
-            const partitionsToFetch = partitions.map((partition) => ({
-              partition,
-            }))
+            const partitionsToFetch = partitions.map((partition) => ({ partition }))
             return { topic, partitions: partitionsToFetch }
           })
         )
@@ -939,11 +910,7 @@ module.exports = ({
 
               checked(
                 await waitOf(async () =>
-                  setOffsets({
-                    groupId,
-                    topic,
-                    partitions: recalculatedPartitions,
-                  })
+                  setOffsets({ groupId, topic, partitions: recalculatedPartitions })
                 )
               )
 
@@ -1093,11 +1060,7 @@ module.exports = ({
               new Promise((resolve, reject) => {
                 let committed = null
                 consumer.on(consumer.events.GROUP_JOIN, () => {
-                  committed ??= commitSentinels(consumer, {
-                    groupId,
-                    topic,
-                    partitions,
-                  })
+                  committed ??= commitSentinels(consumer, { groupId, topic, partitions })
                   committed.catch(() => {})
                 })
                 consumer.on(consumer.events.FETCH, () => {
@@ -1225,11 +1188,7 @@ module.exports = ({
         return { resources: responseResources }
       } catch (e) {
         if (e.type === 'NOT_CONTROLLER') {
-          logger.warn('Could not describe configs', {
-            error: e.message,
-            retryCount,
-            retryTime,
-          })
+          logger.warn('Could not describe configs', { error: e.message, retryCount, retryTime })
           throw e
         }
 
@@ -1315,11 +1274,7 @@ module.exports = ({
         return { resources: responseResources }
       } catch (e) {
         if (e.type === 'NOT_CONTROLLER') {
-          logger.warn('Could not alter configs', {
-            error: e.message,
-            retryCount,
-            retryTime,
-          })
+          logger.warn('Could not alter configs', { error: e.message, retryCount, retryTime })
           throw e
         }
 
@@ -1397,10 +1352,7 @@ module.exports = ({
           await waitOf(async () =>
             Promise.all(
               Array.from(resourcesByBroker, ([broker, group]) =>
-                broker.incrementalAlterConfigs({
-                  resources: group,
-                  validateOnly: !!validateOnly,
-                })
+                broker.incrementalAlterConfigs({ resources: group, validateOnly: !!validateOnly })
               )
             )
           )
@@ -1414,11 +1366,7 @@ module.exports = ({
         return { resources: inRequestOrder(resources, results) }
       } catch (e) {
         if (e.type === 'NOT_CONTROLLER') {
-          logger.warn('Could not alter configs', {
-            error: e.message,
-            retryCount,
-            retryTime,
-          })
+          logger.warn('Could not alter configs', { error: e.message, retryCount, retryTime })
           throw e
         }
 
@@ -1448,7 +1396,7 @@ module.exports = ({
    * @throws {KafkaJSNumberOfRetriesExceeded} when a retriable failure outlives the retry budget
    * @throws {KafkaJSTimeout} when the read is not done at its deadline
    */
-  const describeByPartitions = async (names) => {
+  const describeByPartitions = async (names, includeTopicAuthorizedOperations = false) => {
     const retrier = retrierOf(retry)
     const rows = checked(
       await waitOf(async () =>
@@ -1490,7 +1438,7 @@ module.exports = ({
       )
     )
 
-    return toTopicsMetadata(rows)
+    return toTopicsMetadata(rows, { includeTopicAuthorizedOperations })
   }
 
   /**
@@ -1542,7 +1490,16 @@ module.exports = ({
    * @property {Array<number>|null} [eligibleLeaderReplicas] only with `useDescribeTopicPartitions`
    * @property {Array<number>|null} [lastKnownElr] only with `useDescribeTopicPartitions`
    */
-  const fetchTopicMetadata = async ({ topics = [], useDescribeTopicPartitions = false } = {}) => {
+  const fetchTopicMetadata = async ({
+    topics = [],
+    useDescribeTopicPartitions = false,
+    includeTopicAuthorizedOperations = false,
+  } = {}) => {
+    if (typeof includeTopicAuthorizedOperations !== 'boolean') {
+      throw new (require('../errors').KafkaJSInvalidConfigurationError)(
+        'includeTopicAuthorizedOperations must be a boolean'
+      )
+    }
     if (topics) {
       topics.forEach((topic) => {
         if (!topic || typeof topic !== 'string') {
@@ -1553,7 +1510,9 @@ module.exports = ({
 
     if (useDescribeTopicPartitions && topics?.length > 0) {
       try {
-        return checked(await waitOf(async () => describeByPartitions(topics)))
+        return checked(
+          await waitOf(async () => describeByPartitions(topics, includeTopicAuthorizedOperations))
+        )
       } catch (e) {
         if (e.name !== 'KafkaJSServerDoesNotSupportApiKey') {
           throw e
@@ -1563,9 +1522,12 @@ module.exports = ({
 
     const metadata = checked(
       await waitOf(async () =>
-        retryOnLeaderNotAvailable(() => cluster.metadata({ topics }), {
-          allowAutoTopicCreation: cluster.allowAutoTopicCreation,
-        })
+        retryOnLeaderNotAvailable(
+          () => cluster.metadata({ topics, includeTopicAuthorizedOperations }),
+          {
+            allowAutoTopicCreation: cluster.allowAutoTopicCreation,
+          }
+        )
       )
     )
 
@@ -1575,6 +1537,12 @@ module.exports = ({
         partitions: topicMetadata.partitionMetadata,
         topicId: topicMetadata.topicId,
         isInternal: topicMetadata.isInternal,
+        authorizedOperations:
+          includeTopicAuthorizedOperations &&
+          topicMetadata.topicAuthorizedOperations != null &&
+          topicMetadata.topicAuthorizedOperations !== -2147483648
+            ? topicMetadata.topicAuthorizedOperations
+            : null,
       })),
     }
   }
@@ -1688,8 +1656,8 @@ module.exports = ({
    * @returns {Promise<{ groups: object[] }>}
    * @throws {Error} original routing/protocol failure or call deadline
    */
-  const describeGroups = async (groupIds) =>
-    createGroupDescriptions({ cluster, retry, logger: rootLogger }).describe(groupIds)
+  const describeGroups = async (groupIds, options = {}) =>
+    createGroupDescriptions({ cluster, retry, logger: rootLogger }).describe(groupIds, options)
 
   /**
    * Delete groups in a broker
@@ -1766,11 +1734,7 @@ module.exports = ({
         return results
       } catch (e) {
         if (e.type === 'NOT_CONTROLLER' || isStaleCoordinator(e)) {
-          logger.warn('Could not delete groups', {
-            error: e.message,
-            retryCount,
-            retryTime,
-          })
+          logger.warn('Could not delete groups', { error: e.message, retryCount, retryTime })
           throw e
         }
 
@@ -1976,10 +1940,7 @@ module.exports = ({
 
           if (leaderNotFoundErrors.length > 0) {
             return bail(
-              new KafkaJSDeleteTopicRecordsError({
-                topic,
-                partitions: leaderNotFoundErrors,
-              })
+              new KafkaJSDeleteTopicRecordsError({ topic, partitions: leaderNotFoundErrors })
             )
           }
 
@@ -2150,11 +2111,7 @@ module.exports = ({
         return true
       } catch (e) {
         if (e.type === 'NOT_CONTROLLER') {
-          logger.warn('Could not create ACL', {
-            error: e.message,
-            retryCount,
-            retryTime,
-          })
+          logger.warn('Could not create ACL', { error: e.message, retryCount, retryTime })
           throw e
         }
 
@@ -2264,11 +2221,7 @@ module.exports = ({
         return { resources }
       } catch (e) {
         if (e.type === 'NOT_CONTROLLER') {
-          logger.warn('Could not describe ACL', {
-            error: e.message,
-            retryCount,
-            retryTime,
-          })
+          logger.warn('Could not describe ACL', { error: e.message, retryCount, retryTime })
           throw e
         }
 
@@ -2387,11 +2340,7 @@ module.exports = ({
         return { filterResponses }
       } catch (e) {
         if (e.type === 'NOT_CONTROLLER') {
-          logger.warn('Could not delete ACL', {
-            error: e.message,
-            retryCount,
-            retryTime,
-          })
+          logger.warn('Could not delete ACL', { error: e.message, retryCount, retryTime })
           throw e
         }
 
@@ -2493,10 +2442,7 @@ module.exports = ({
               const broker = checked(await waitOf(async () => cluster.findControllerBroker()))
               checked(
                 await waitOf(async () =>
-                  broker.alterPartitionReassignments({
-                    topics: outcome.pending,
-                    timeout,
-                  })
+                  broker.alterPartitionReassignments({ topics: outcome.pending, timeout })
                 )
               )
               outcome.succeeded()
@@ -2596,11 +2542,7 @@ module.exports = ({
         return { topics: response.topics }
       } catch (e) {
         if (e.type === 'NOT_CONTROLLER') {
-          logger.warn('Could not reassign partitions', {
-            error: e.message,
-            retryCount,
-            retryTime,
-          })
+          logger.warn('Could not reassign partitions', { error: e.message, retryCount, retryTime })
           throw e
         }
 

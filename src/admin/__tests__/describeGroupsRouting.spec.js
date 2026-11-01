@@ -604,7 +604,7 @@ describe('Admin > describeGroups > routing', () => {
     })
     const admin = createAdmin({ logger: newLogger(), retry, cluster })
 
-    const { groups } = await admin.describeGroups(['g1'])
+    const { groups } = await admin.describeGroups(['g1'], { includeAuthorizedOperations: true })
 
     expect(groups[0]).toMatchObject({
       protocol: '',
@@ -694,7 +694,7 @@ describe('Admin > describeGroups > routing', () => {
     })
     const admin = createAdmin({ logger: newLogger(), retry, cluster })
 
-    const { groups } = await admin.describeGroups(['g1'])
+    const { groups } = await admin.describeGroups(['g1'], { includeAuthorizedOperations: true })
 
     expect(groups[0]).toMatchObject({
       protocolType: 'connect',
