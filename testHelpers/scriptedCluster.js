@@ -61,6 +61,17 @@ const PROFILES = {
     ['WriteTxnMarkers', 2],
   ],
   default: DEFAULT,
+  securityAdmin: [
+    ...DEFAULT,
+    ['DescribeClientQuotas', 1],
+    ['AlterClientQuotas', 1],
+    ['DescribeUserScramCredentials', 0],
+    ['AlterUserScramCredentials', 0],
+    ['CreateDelegationToken', 3],
+    ['RenewDelegationToken', 2],
+    ['ExpireDelegationToken', 2],
+    ['DescribeDelegationToken', 3],
+  ],
   sasl: [...DEFAULT, ['SaslHandshake', 1], ['SaslAuthenticate', 2]],
   consumer: [
     ...DEFAULT.filter(([api]) => api !== 'OffsetFetch' && api !== 'OffsetCommit'),

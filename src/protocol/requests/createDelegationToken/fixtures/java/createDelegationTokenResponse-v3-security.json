@@ -1,0 +1,7 @@
+{
+  "message": "CreateDelegationTokenResponse",
+  "version": 3,
+  "case": "security",
+  "hex": "000005557365720b746573742d6f776e657205557365720b746573742d6f776e657200200000000000010020000000000001002000000000000109746f6b656e2d696416686d61632d6d61726b65722d6f6e6c792d746573740000000000",
+  "fields": {"errorCode":0,"principalType":"User","principalName":"test-owner","tokenRequesterPrincipalType":"User","tokenRequesterPrincipalName":"test-owner","issueTimestampMs":"9007199254740993","expiryTimestampMs":"9007199254740993","maxTimestampMs":"9007199254740993","tokenId":"token-id","hmac":{"$bytes":"686d61632d6d61726b65722d6f6e6c792d74657374"},"throttleTimeMs":0}
+}

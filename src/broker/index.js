@@ -2314,6 +2314,113 @@ module.exports = class Broker {
   }
 
   /**
+   * Sends DescribeClientQuotas to this broker using its current negotiated capability.
+   * @param {object} fields normalized wire inputs
+   * @returns {Promise<object>} parsed response; item errors remain data
+   * @throws {Error} unsupported capability, transport or top-level protocol error
+   */
+  async describeClientQuotas(fields) {
+    const build = this.lookupRequest(apiKeys.DescribeClientQuotas, requests.DescribeClientQuotas)
+    return this[PRIVATE.SEND_REQUEST](build(fields))
+  }
+
+  /**
+   * Sends AlterClientQuotas to this broker using its current negotiated capability.
+   * @param {object} fields normalized wire inputs
+   * @returns {Promise<object>} parsed response; item errors remain data
+   * @throws {Error} unsupported capability, transport or top-level protocol error
+   */
+  async alterClientQuotas(fields) {
+    const build = this.lookupRequest(apiKeys.AlterClientQuotas, requests.AlterClientQuotas)
+    return this[PRIVATE.SEND_REQUEST](build(fields))
+  }
+
+  /**
+   * Sends DescribeUserScramCredentials to this broker using its current negotiated capability.
+   * @param {object} fields normalized wire inputs
+   * @returns {Promise<object>} parsed response; item errors remain data
+   * @throws {Error} unsupported capability, transport or top-level protocol error
+   */
+  async describeUserScramCredentials(fields) {
+    const build = this.lookupRequest(
+      apiKeys.DescribeUserScramCredentials,
+      requests.DescribeUserScramCredentials
+    )
+    return this[PRIVATE.SEND_REQUEST](build(fields))
+  }
+
+  /**
+   * Sends AlterUserScramCredentials to this broker using its current negotiated capability.
+   * @param {object} fields normalized wire inputs
+   * @returns {Promise<object>} parsed response; item errors remain data
+   * @throws {Error} unsupported capability, transport or top-level protocol error
+   */
+  async alterUserScramCredentials(fields) {
+    const build = this.lookupRequest(
+      apiKeys.AlterUserScramCredentials,
+      requests.AlterUserScramCredentials
+    )
+    return this[PRIVATE.SEND_REQUEST](build(fields))
+  }
+
+  /**
+   * Sends CreateDelegationToken to this broker using its current negotiated capability.
+   * @param {object} fields normalized wire inputs
+   * @returns {Promise<object>} parsed response; item errors remain data
+   * @throws {Error} unsupported capability, transport or top-level protocol error
+   */
+  async createDelegationToken(fields) {
+    const version = this.negotiatedVersion(
+      apiKeys.CreateDelegationToken,
+      requests.CreateDelegationToken
+    )
+    if (fields.ownerPrincipalType != null && version !== null && version < 3) {
+      throw new KafkaJSServerDoesNotSupportApiKey(
+        `CreateDelegationToken owner requires v3; broker supports v${version}`,
+        { apiKey: apiKeys.CreateDelegationToken, apiName: 'CreateDelegationToken' }
+      )
+    }
+    const build = this.lookupRequest(apiKeys.CreateDelegationToken, requests.CreateDelegationToken)
+    return this[PRIVATE.SEND_REQUEST](build(fields))
+  }
+
+  /**
+   * Sends RenewDelegationToken to this broker using its current negotiated capability.
+   * @param {object} fields normalized wire inputs
+   * @returns {Promise<object>} parsed response; item errors remain data
+   * @throws {Error} unsupported capability, transport or top-level protocol error
+   */
+  async renewDelegationToken(fields) {
+    const build = this.lookupRequest(apiKeys.RenewDelegationToken, requests.RenewDelegationToken)
+    return this[PRIVATE.SEND_REQUEST](build(fields))
+  }
+
+  /**
+   * Sends ExpireDelegationToken to this broker using its current negotiated capability.
+   * @param {object} fields normalized wire inputs
+   * @returns {Promise<object>} parsed response; item errors remain data
+   * @throws {Error} unsupported capability, transport or top-level protocol error
+   */
+  async expireDelegationToken(fields) {
+    const build = this.lookupRequest(apiKeys.ExpireDelegationToken, requests.ExpireDelegationToken)
+    return this[PRIVATE.SEND_REQUEST](build(fields))
+  }
+
+  /**
+   * Sends DescribeDelegationToken to this broker using its current negotiated capability.
+   * @param {object} fields normalized wire inputs
+   * @returns {Promise<object>} parsed response; item errors remain data
+   * @throws {Error} unsupported capability, transport or top-level protocol error
+   */
+  async describeDelegationToken(fields) {
+    const build = this.lookupRequest(
+      apiKeys.DescribeDelegationToken,
+      requests.DescribeDelegationToken
+    )
+    return this[PRIVATE.SEND_REQUEST](build(fields))
+  }
+
+  /**
    * Dispatches one built request over the pool.
    *
    * The connection is obtained **before** dispatching so a socket the pool has just

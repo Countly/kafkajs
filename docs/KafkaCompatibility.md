@@ -42,20 +42,20 @@ Gap classes: `current` (fork max equals the Kafka max) · `behind:N` · `stub` (
 | DescribeLogDirs | 35 | 1-5 | v2+ | 1-5 | current |  |
 | SaslAuthenticate | 36 | 0-2 | v2+ | 0-2 | current | v1 adds SessionLifetimeMs (KIP-368 re-authentication), v2 is flexible. The mechanism-provider contract is unchanged at every version: a provider returns INT32-length-prefixed bytes from request.encode() and receives them in response.decode() - v2 strips and re-wraps that prefix inside its own codec. |
 | CreatePartitions | 37 | 0-3 | v2+ | 0-3 | current |  |
-| CreateDelegationToken | 38 | 1-3 | v2+ | — | stub |  |
-| RenewDelegationToken | 39 | 1-2 | v2+ | — | stub |  |
-| ExpireDelegationToken | 40 | 1-2 | v2+ | — | stub |  |
-| DescribeDelegationToken | 41 | 1-3 | v2+ | — | stub |  |
+| CreateDelegationToken | 38 | 1-3 | v2+ | 1-3 | current |  |
+| RenewDelegationToken | 39 | 1-2 | v2+ | 1-2 | current |  |
+| ExpireDelegationToken | 40 | 1-2 | v2+ | 1-2 | current |  |
+| DescribeDelegationToken | 41 | 1-3 | v2+ | 1-3 | current |  |
 | DeleteGroups | 42 | 0-2 | v2+ | 0-2 | current |  |
 | ElectLeaders | 43 | 0-2 | v2+ | — | stub |  |
 | IncrementalAlterConfigs | 44 | 0-1 | v1+ | 0-1 | current | The merge-semantics alternative to AlterConfigs: each config entry names a SET, DELETE, APPEND or SUBTRACT, so the entries a request leaves out are untouched. |
 | AlterPartitionReassignments | 45 | 0-1 | v0+ | 0-1 | current | v0 is flexible (KIP-455). v1 implements AllowReplicationFactorChange (KIP-860), which defaults to true, preserving v0 behavior. Setting allowReplicationFactorChange to false requires v1 and rejects before sending on a v0-only broker. |
 | ListPartitionReassignments | 46 | 0 | v0+ | 0 | current | Kafka defines only v0 (KIP-455), a flexible version, so the fork is current. |
 | OffsetDelete | 47 | 0 | never | 0 | current |  |
-| DescribeClientQuotas | 48 | 0-1 | v1+ | — | stub |  |
-| AlterClientQuotas | 49 | 0-1 | v1+ | — | stub |  |
-| DescribeUserScramCredentials | 50 | 0 | v0+ | — | stub |  |
-| AlterUserScramCredentials | 51 | 0 | v0+ | — | stub |  |
+| DescribeClientQuotas | 48 | 0-1 | v1+ | 0-1 | current |  |
+| AlterClientQuotas | 49 | 0-1 | v1+ | 0-1 | current |  |
+| DescribeUserScramCredentials | 50 | 0 | v0+ | 0 | current |  |
+| AlterUserScramCredentials | 51 | 0 | v0+ | 0 | current |  |
 | UpdateFeatures | 57 | 0-2 | v0+ | — | stub |  |
 | DescribeCluster | 60 | 0-2 | v0+ | — | stub |  |
 | DescribeProducers | 61 | 0 | v0+ | 0 | current |  |

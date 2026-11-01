@@ -1114,6 +1114,62 @@ describeGroups(groupIds: string[]): Promise<GroupDescriptions>
     topics?: TopicPartitions[]
     timeout?: number
   }) & ApiTimeoutOption): Promise<ListPartitionReassignmentsResponse>
+  /** Security administration; apiTimeout inherits the original call budget.
+   * @param options validated filters or mutation inputs; credentials are never logged
+   * @returns the documented token, item results or quota entities
+   * @throws typed validation, capability, call-level broker or deadline error
+   */
+  describeClientQuotas(options: { components: Array<{ entityType: 'user' | 'client-id' | 'ip'; matchType: 'exact' | 'default' | 'any'; match?: string }>; strict?: boolean } & ApiTimeoutOption): Promise<Array<{
+    entity: Array<{ entityType: string; entityName: string | null }>; values: Record<string, number>
+  }>>
+  /** Security administration; apiTimeout inherits the original call budget.
+   * @param options validated filters or mutation inputs; credentials are never logged
+   * @returns the documented token, item results or quota entities
+   * @throws typed validation, capability, call-level broker or deadline error
+   */
+  alterClientQuotas(options: {
+    entries: Array<{ entity: Array<{ entityType: 'user' | 'client-id' | 'ip'; entityName: string | null }>; ops: QuotaOperation[] }>
+    validateOnly?: boolean
+  } & ApiTimeoutOption): Promise<Array<{ entity: Array<{ entityType: string; entityName: string | null }> } & AdminItemResult>>
+  /** Security administration; apiTimeout inherits the original call budget.
+   * @param options validated filters or mutation inputs; credentials are never logged
+   * @returns the documented token, item results or quota entities
+   * @throws typed validation, capability, call-level broker or deadline error
+   */
+  describeUserScramCredentials(options?: { users?: string[] | null } & ApiTimeoutOption): Promise<Array<{ user: string; credentials: Array<{ mechanism: 'SCRAM-SHA-256' | 'SCRAM-SHA-512'; iterations: number }> } & AdminItemResult>>
+  /** Security administration; apiTimeout inherits the original call budget.
+   * @param options validated filters or mutation inputs; credentials are never logged
+   * @returns the documented token, item results or quota entities
+   * @throws typed validation, capability, call-level broker or deadline error
+   */
+  alterUserScramCredentials(options: {
+    upsertions?: Array<{ user: string; mechanism: 'SCRAM-SHA-256' | 'SCRAM-SHA-512'; iterations: number; password: string; salt?: Buffer }>
+    deletions?: Array<{ user: string; mechanism: 'SCRAM-SHA-256' | 'SCRAM-SHA-512' }>
+  } & ApiTimeoutOption): Promise<Array<{ user: string } & AdminItemResult>>
+  /** Security administration; apiTimeout inherits the original call budget.
+   * @param options validated filters or mutation inputs; credentials are never logged
+   * @returns the documented token, item results or quota entities
+   * @throws typed validation, capability, call-level broker or deadline error
+   */
+  createDelegationToken(options?: { renewers?: Array<{ principalType: string; principalName: string }>; maxLifetimeMs?: number | string; owner?: { principalType: string; principalName: string } } & ApiTimeoutOption): Promise<DelegationToken>
+  /** Security administration; apiTimeout inherits the original call budget.
+   * @param options validated filters or mutation inputs; credentials are never logged
+   * @returns the documented token, item results or quota entities
+   * @throws typed validation, capability, call-level broker or deadline error
+   */
+  renewDelegationToken(options: { hmac: Buffer; renewPeriodMs?: number | string } & ApiTimeoutOption): Promise<{ expiryTimestampMs: string }>
+  /** Security administration; apiTimeout inherits the original call budget.
+   * @param options validated filters or mutation inputs; credentials are never logged
+   * @returns the documented token, item results or quota entities
+   * @throws typed validation, capability, call-level broker or deadline error
+   */
+  expireDelegationToken(options: { hmac: Buffer; expiryTimePeriodMs?: number | string } & ApiTimeoutOption): Promise<{ expiryTimestampMs: string }>
+  /** Security administration; apiTimeout inherits the original call budget.
+   * @param options validated filters or mutation inputs; credentials are never logged
+   * @returns the documented token, item results or quota entities
+   * @throws typed validation, capability, call-level broker or deadline error
+   */
+  describeDelegationToken(options?: { owners?: Array<{ principalType: string; principalName: string }> } & ApiTimeoutOption): Promise<DelegationToken[]>
   logger(): Logger
   on(
     eventName: AdminEvents['CONNECT'],
@@ -2788,4 +2844,15 @@ export interface KafkaJSStaleTopicMetadataAssignmentMetadata {
 export interface KafkaJSServerDoesNotSupportApiKeyMetadata {
   apiKey: number
   apiName: string
+}
+
+/** One quota mutation; removal and assignment are exclusive. */
+export type QuotaOperation = { key: string } & ({ remove: true; value?: never } | { value: number; remove?: false })
+
+/** A caller-owned delegation token. HMAC is sensitive and never appears in diagnostics. */
+export interface DelegationToken {
+  tokenId: string; hmac: Buffer
+  owner: { principalType: string; principalName: string }
+  renewers: Array<{ principalType: string; principalName: string }>
+  issueTimestampMs: string; expiryTimestampMs: string; maxTimestampMs: string
 }

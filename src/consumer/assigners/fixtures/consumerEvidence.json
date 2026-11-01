@@ -5,7 +5,7 @@
   "javaRuntime": "OpenJDK 21.0.13+9",
   "generators": {
     "scripts/protocol/javaVectors/GenerateAssignorVectors.java": "6d3661c7643c21968b25577c8b33c71d2f3d499041c347116a97cbf29dbfae63",
-    "scripts/protocol/javaVectors/GenerateMessageVectors.java": "6e78b8fd51df7930e75b5569cb0afc68fa280f98ddf16f7d4464ccd21be09610"
+    "scripts/protocol/javaVectors/GenerateMessageVectors.java": "1cb2111c323789b8557b61e91ac29749bd6ebe982c0b5d8124045d4f6015168a"
   },
   "messageSha256": {
     "FetchRequest": "40d679a103935abe707055c2f3dde3aefcdb0eb13a00e51a71f2e0832d2033ba",

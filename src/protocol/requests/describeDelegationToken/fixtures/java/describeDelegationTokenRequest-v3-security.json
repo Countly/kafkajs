@@ -1,0 +1,7 @@
+{
+  "message": "DescribeDelegationTokenRequest",
+  "version": 3,
+  "case": "security",
+  "hex": "0205557365720b746573742d6f776e65720000",
+  "fields": {"owners":[{"principalType":"User","principalName":"test-owner"}]}
+}

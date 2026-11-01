@@ -116,6 +116,15 @@ const PROJECTIONS = {
           }
         : fields,
   },
+  createDelegationToken: {
+    fields: ({ hmac, ...fields }) => ({ ...fields, hmac: hmac.$bytes }),
+  },
+  describeDelegationToken: {
+    fields: (fields) => ({
+      ...fields,
+      tokens: fields.tokens.map(({ hmac, ...token }) => ({ ...token, hmac: hmac.$bytes })),
+    }),
+  },
   // a broker and a partition are the values of their fields, in order: a broker is [nodeId, host,
   // port, rack]; a partition is [partitionErrorCode, partitionId, leader, leaderEpoch (v7 and
   // later), replicas, isr, offlineReplicas (v5 and later)]

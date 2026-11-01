@@ -1,0 +1,7 @@
+{
+  "message": "DescribeClientQuotasResponse",
+  "version": 0,
+  "case": "security",
+  "hex": "000000000000ffff0000000100000001000475736572ffff00000001001270726f64756365725f627974655f7261746540934a0000000000",
+  "fields": {"throttleTimeMs":0,"errorCode":0,"errorMessage":null,"entries":[{"entity":[{"entityType":"user","entityName":null}],"values":[{"key":"producer_byte_rate","value":1234.5}]}]}
+}

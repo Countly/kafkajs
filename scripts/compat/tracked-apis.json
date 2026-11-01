@@ -241,30 +241,30 @@
     {
       "kafkaName": "CreateDelegationToken",
       "apiKey": 38,
-      "forkName": null,
+      "forkName": "createDelegationToken",
       "apiKeysName": "CreateDelegationToken",
-      "planned": "yes"
+      "planned": "done"
     },
     {
       "kafkaName": "RenewDelegationToken",
       "apiKey": 39,
-      "forkName": null,
+      "forkName": "renewDelegationToken",
       "apiKeysName": "RenewDelegationToken",
-      "planned": "yes"
+      "planned": "done"
     },
     {
       "kafkaName": "ExpireDelegationToken",
       "apiKey": 40,
-      "forkName": null,
+      "forkName": "expireDelegationToken",
       "apiKeysName": "ExpireDelegationToken",
-      "planned": "yes"
+      "planned": "done"
     },
     {
       "kafkaName": "DescribeDelegationToken",
       "apiKey": 41,
-      "forkName": null,
+      "forkName": "describeDelegationToken",
       "apiKeysName": "DescribeDelegationToken",
-      "planned": "yes"
+      "planned": "done"
     },
     {
       "kafkaName": "DeleteGroups",
@@ -311,30 +311,30 @@
     {
       "kafkaName": "DescribeClientQuotas",
       "apiKey": 48,
-      "forkName": null,
+      "forkName": "describeClientQuotas",
       "apiKeysName": "DescribeClientQuotas",
-      "planned": "yes"
+      "planned": "done"
     },
     {
       "kafkaName": "AlterClientQuotas",
       "apiKey": 49,
-      "forkName": null,
+      "forkName": "alterClientQuotas",
       "apiKeysName": "AlterClientQuotas",
-      "planned": "yes"
+      "planned": "done"
     },
     {
       "kafkaName": "DescribeUserScramCredentials",
       "apiKey": 50,
-      "forkName": null,
+      "forkName": "describeUserScramCredentials",
       "apiKeysName": "DescribeUserScramCredentials",
-      "planned": "yes"
+      "planned": "done"
     },
     {
       "kafkaName": "AlterUserScramCredentials",
       "apiKey": 51,
-      "forkName": null,
+      "forkName": "alterUserScramCredentials",
       "apiKeysName": "AlterUserScramCredentials",
-      "planned": "yes"
+      "planned": "done"
     },
     {
       "kafkaName": "UpdateFeatures",

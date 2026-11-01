@@ -1126,3 +1126,66 @@ const fenced = await admin.fenceProducers({
 `abortTransaction` sends one administrative abort marker to one partition leader, requires administrative broker permission and resolves `undefined` on success. It checks the exact marker identity. It does not erase records from the log or call the producer's `abort()` method; aborted transactional data remains physically present and is hidden from a `read_committed` consumer. `fenceProducers` uses FindCoordinator plus InitProducerId, with no existing producer identity, for each id. Its `transactionTimeout` defaults to 60000 ms and is independent of the API deadline. The Java `forceTerminateTransaction(id)` equivalent is `admin.fenceProducers({ transactionalIds: [id] })`. Once a producer observes its fencing failure, create a new producer instance as described in the transaction failure guidance.
 
 Public producer IDs must be nonnegative safe integral numbers or canonical decimal strings through 9223372036854775807. Use strings above Number.MAX_SAFE_INTEGER. Partitions/broker ids are integers 0..2147483647; abort producer epochs 0..32767 and coordinator epochs 0..2147483647. Transaction ids, topics and mutation lists are nonempty and unique. `durationFilter` is nonnegative safe integral milliseconds; `transactionTimeout` is integer 1..2147483647 ms. All five APIs accept `apiTimeout` and inherit the configured admin default. A timed-out mutation can already have applied remotely; inspect the broker state before deciding to repeat it.
+
+## Client quotas
+
+`describeClientQuotas({ components, strict = false, apiTimeout })` reads matching entities. `components` is an array of `{ entityType, matchType, match? }`; entity types are `user`, `client-id` and `ip`. Each type appears once. An `exact` match requires a nonempty `match`; `default` and `any` omit it. Empty components selects all. Results are `{ entity, values }`, with numeric quota values.
+
+`alterClientQuotas({ entries, validateOnly = false, apiTimeout })` accepts nonempty entries of `{ entity, ops }`. Entity parts are `{ entityType, entityName }`, with null selecting the default entity. An operation is `{ key, value }` for a finite nonnegative numeric assignment or `{ key, remove: true }` for removal. Removal forbids value. Keys are the broker's strings; the client validates their shape and lets the broker validate their meaning. Duplicate entities, tuple types and operation keys are refused before discovery.
+
+Results retain input entity order and carry `errorCode`, a typed `error` or null, and `errorMessage`. Only unresolved retriable entries are retried. Completed successes and terminal results remain retained. A later route or connection-setup failure gives unresolved entries code -1 and the exact original local error, even when that error has a protocol code. Completed mutations are not sent again. `validateOnly: true` sends the broker's validation flag without applying changes or making an effects-polling request. Check state after an API timeout because an already-sent mutation may have applied.
+
+```js
+await admin.alterClientQuotas({
+  entries: [{ entity: [{ entityType: 'user', entityName: 'service' }], ops: [{ key: 'producer_byte_rate', value: 1048576 }] }],
+  validateOnly: true,
+})
+const quotas = await admin.describeClientQuotas({ components: [{ entityType: 'user', matchType: 'exact', match: 'service' }] })
+```
+
+## SCRAM credentials
+
+`describeUserScramCredentials({ users, apiTimeout }?)` returns per-user credential mechanisms/iteration counts and typed result errors. Omitted or null users selects all; an explicit empty list returns no results without a request. The request's own top-level broker error rejects the call. After users are known, a later route or setup failure retains completed users and gives unresolved users code -1 with the original typed local error. Passwords and derived credentials are never returned.
+
+`alterUserScramCredentials({ upsertions, deletions, apiTimeout })` requires at least one change. An upsertion is `{ user, mechanism, iterations, password, salt? }`; a deletion is `{ user, mechanism }`. Mechanisms are `SCRAM-SHA-256` or `SCRAM-SHA-512`, iterations are integers from 4096 to 16384, and password is a nonempty string. Salt is an optional Buffer of 1..1024 bytes; the default is 32 random bytes. Each user/mechanism pair appears once across both lists.
+
+The client derives the salted password locally, sends the salt and derived bytes rather than plaintext, and erases its owned working buffers after the call. A supplied salt Buffer is copied and remains caller-owned. Credential data and raw broker echoes are omitted from logs and result messages; diagnose from the typed error and protocol code. Results are one entry per affected user, in first-request order. Controller relocation and retriable rows resend only unresolved users. A later route or setup failure retains completed users and attaches the original typed local error with code -1 only to unresolved users. Capability, validation, invariant and deadline refusals still reject the whole call. The bootstrap `scripts/createScramCredentials.sh` remains available.
+
+```js
+await admin.alterUserScramCredentials({
+  upsertions: [{ user: 'service', mechanism: 'SCRAM-SHA-256', iterations: 4096, password: process.env.SCRAM_PASSWORD }],
+})
+const credentials = await admin.describeUserScramCredentials({ users: ['service'] })
+```
+
+## Delegation tokens
+
+`createDelegationToken({ renewers = [], maxLifetimeMs = -1, owner, apiTimeout }?)` creates a token. Principal pairs use nonempty `principalType` and `principalName`. An explicit owner requires broker support for CreateDelegationToken v3 and is refused below it. The default owner is the authenticated request principal.
+
+`renewDelegationToken({ hmac, renewPeriodMs = -1, apiTimeout })` and `expireDelegationToken({ hmac, expiryTimePeriodMs = -1, apiTimeout })` take a nonempty Buffer HMAC and return `{ expiryTimestampMs }`. Durations accept safe integral numbers or canonical decimal int64 strings. Create/renew accept -1 for the broker default or a positive value; expire also accepts 0 for immediate expiration. Other negative values, fractions, numeric strings with exponents/whitespace and unsafe numbers are refused.
+
+`describeDelegationToken({ owners, apiTimeout }?)` selects all visible owners when owners is omitted. An explicit empty list returns no results without a request. Owner/renewer lists reject duplicate principals. A token has `tokenId`, Buffer `hmac`, `owner`, `renewers`, and decimal-string `issueTimestampMs`, `expiryTimestampMs`, `maxTimestampMs`.
+
+HMAC is returned only to the authorized caller and is not cached or logged by the client. Token-admin diagnostics omit response data and failure payloads even when buffer diagnostics are enabled. A broker without token authentication returns the typed `DELEGATION_TOKEN_AUTH_DISABLED` error. Use an authenticated SASL listener on a broker with delegation tokens configured.
+
+```js
+const token = await admin.createDelegationToken({ renewers: [{ principalType: 'User', principalName: 'service' }] })
+await admin.renewDelegationToken({ hmac: token.hmac })
+const tokens = await admin.describeDelegationToken({ owners: [{ principalType: 'User', principalName: 'service' }] })
+await admin.expireDelegationToken({ hmac: token.hmac, expiryTimePeriodMs: 0 })
+```
+
+### Validation-only method table
+
+Exactly six Kafka requests carry a validation flag. `true` requests validation without applying a mutation, follow-up effects request or hypothetical cache update. UpdateFeatures refuses `true` on v0.
+
+| Method | Wire support | Guarantee |
+|---|---|---|
+| `createTopics` | CreateTopics from v1 | Validates without mutation, follow-up effects request or hypothetical cache update. |
+| `createPartitions` | CreatePartitions from v0 | Validates without mutation, follow-up effects request or hypothetical cache update. |
+| `alterConfigs` | AlterConfigs from v0 | Validates without mutation, follow-up effects request or hypothetical cache update. |
+| `incrementalAlterConfigs` | IncrementalAlterConfigs from v0 | Validates without mutation, follow-up effects request or hypothetical cache update. |
+| `alterClientQuotas` | AlterClientQuotas from v0 | Validates without mutation, follow-up effects request or hypothetical cache update. |
+| `updateFeatures` | UpdateFeatures v1+ | `validateOnly: true` validates without applying the change; no follow-up mutation or local cache update. |
+
+Delete operations, offset commits/reset helpers, ACL mutation, member removal, partition reassignment, leader election, transaction abort/fencing, replica-directory changes, SCRAM changes and token mutations have no wire validation form. Fetch/list/describe operations are reads; connect/disconnect are lifecycle operations. These methods do not offer `validateOnly`.

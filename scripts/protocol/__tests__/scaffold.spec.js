@@ -83,6 +83,15 @@ describe('scripts/protocol > scaffold', () => {
     expect(source).toContain(`api: '${message}',`)
   })
 
+  test.each([0, 1])('quota float64 fields scaffold as doubles at v%s', (version) => {
+    const request = scaffold('AlterClientQuotas', version, 'request')
+    const response = scaffold('DescribeClientQuotas', version, 'response')
+    expect(request).toContain('writeDouble(value)')
+    expect(response).toContain('decoder.readDouble()')
+    expect(request).toContain('FLOAT64')
+    expect(response).toContain('FLOAT64')
+  })
+
   describe('write()', () => {
     test('never overwrites an existing file', () => {
       const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'kafkajs-scaffold-'))

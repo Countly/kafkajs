@@ -887,9 +887,9 @@
     {
       "kafkaName": "CreateDelegationToken",
       "apiKey": 38,
-      "forkName": null,
+      "forkName": "createDelegationToken",
       "apiKeysName": "CreateDelegationToken",
-      "planned": "yes",
+      "planned": "done",
       "validVersions": [
         1,
         3
@@ -897,8 +897,12 @@
       "flexibleFrom": 2,
       "deprecatedVersions": null,
       "latestVersionUnstable": false,
-      "forkVersions": null,
-      "gap": "stub",
+      "forkVersions": [
+        1,
+        2,
+        3
+      ],
+      "gap": "current",
       "onFloor": false,
       "belowFloor": [],
       "notes": ""
@@ -906,9 +910,9 @@
     {
       "kafkaName": "RenewDelegationToken",
       "apiKey": 39,
-      "forkName": null,
+      "forkName": "renewDelegationToken",
       "apiKeysName": "RenewDelegationToken",
-      "planned": "yes",
+      "planned": "done",
       "validVersions": [
         1,
         2
@@ -916,8 +920,11 @@
       "flexibleFrom": 2,
       "deprecatedVersions": null,
       "latestVersionUnstable": false,
-      "forkVersions": null,
-      "gap": "stub",
+      "forkVersions": [
+        1,
+        2
+      ],
+      "gap": "current",
       "onFloor": false,
       "belowFloor": [],
       "notes": ""
@@ -925,9 +932,9 @@
     {
       "kafkaName": "ExpireDelegationToken",
       "apiKey": 40,
-      "forkName": null,
+      "forkName": "expireDelegationToken",
       "apiKeysName": "ExpireDelegationToken",
-      "planned": "yes",
+      "planned": "done",
       "validVersions": [
         1,
         2
@@ -935,8 +942,11 @@
       "flexibleFrom": 2,
       "deprecatedVersions": null,
       "latestVersionUnstable": false,
-      "forkVersions": null,
-      "gap": "stub",
+      "forkVersions": [
+        1,
+        2
+      ],
+      "gap": "current",
       "onFloor": false,
       "belowFloor": [],
       "notes": ""
@@ -944,9 +954,9 @@
     {
       "kafkaName": "DescribeDelegationToken",
       "apiKey": 41,
-      "forkName": null,
+      "forkName": "describeDelegationToken",
       "apiKeysName": "DescribeDelegationToken",
-      "planned": "yes",
+      "planned": "done",
       "validVersions": [
         1,
         3
@@ -954,8 +964,12 @@
       "flexibleFrom": 2,
       "deprecatedVersions": null,
       "latestVersionUnstable": false,
-      "forkVersions": null,
-      "gap": "stub",
+      "forkVersions": [
+        1,
+        2,
+        3
+      ],
+      "gap": "current",
       "onFloor": false,
       "belowFloor": [],
       "notes": ""
@@ -1091,9 +1105,9 @@
     {
       "kafkaName": "DescribeClientQuotas",
       "apiKey": 48,
-      "forkName": null,
+      "forkName": "describeClientQuotas",
       "apiKeysName": "DescribeClientQuotas",
-      "planned": "yes",
+      "planned": "done",
       "validVersions": [
         0,
         1
@@ -1101,8 +1115,11 @@
       "flexibleFrom": 1,
       "deprecatedVersions": null,
       "latestVersionUnstable": false,
-      "forkVersions": null,
-      "gap": "stub",
+      "forkVersions": [
+        0,
+        1
+      ],
+      "gap": "current",
       "onFloor": false,
       "belowFloor": [],
       "notes": ""
@@ -1110,9 +1127,9 @@
     {
       "kafkaName": "AlterClientQuotas",
       "apiKey": 49,
-      "forkName": null,
+      "forkName": "alterClientQuotas",
       "apiKeysName": "AlterClientQuotas",
-      "planned": "yes",
+      "planned": "done",
       "validVersions": [
         0,
         1
@@ -1120,8 +1137,11 @@
       "flexibleFrom": 1,
       "deprecatedVersions": null,
       "latestVersionUnstable": false,
-      "forkVersions": null,
-      "gap": "stub",
+      "forkVersions": [
+        0,
+        1
+      ],
+      "gap": "current",
       "onFloor": false,
       "belowFloor": [],
       "notes": ""
@@ -1129,9 +1149,9 @@
     {
       "kafkaName": "DescribeUserScramCredentials",
       "apiKey": 50,
-      "forkName": null,
+      "forkName": "describeUserScramCredentials",
       "apiKeysName": "DescribeUserScramCredentials",
-      "planned": "yes",
+      "planned": "done",
       "validVersions": [
         0,
         0
@@ -1139,8 +1159,10 @@
       "flexibleFrom": 0,
       "deprecatedVersions": null,
       "latestVersionUnstable": false,
-      "forkVersions": null,
-      "gap": "stub",
+      "forkVersions": [
+        0
+      ],
+      "gap": "current",
       "onFloor": false,
       "belowFloor": [],
       "notes": ""
@@ -1148,9 +1170,9 @@
     {
       "kafkaName": "AlterUserScramCredentials",
       "apiKey": 51,
-      "forkName": null,
+      "forkName": "alterUserScramCredentials",
       "apiKeysName": "AlterUserScramCredentials",
-      "planned": "yes",
+      "planned": "done",
       "validVersions": [
         0,
         0
@@ -1158,8 +1180,10 @@
       "flexibleFrom": 0,
       "deprecatedVersions": null,
       "latestVersionUnstable": false,
-      "forkVersions": null,
-      "gap": "stub",
+      "forkVersions": [
+        0
+      ],
+      "gap": "current",
       "onFloor": false,
       "belowFloor": [],
       "notes": ""

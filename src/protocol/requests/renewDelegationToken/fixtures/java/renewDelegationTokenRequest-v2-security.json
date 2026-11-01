@@ -1,0 +1,7 @@
+{
+  "message": "RenewDelegationTokenRequest",
+  "version": 2,
+  "case": "security",
+  "hex": "16686d61632d6d61726b65722d6f6e6c792d74657374ffffffffffffffff00",
+  "fields": {"hmac":{"$bytes":"686d61632d6d61726b65722d6f6e6c792d74657374"},"renewPeriodMs":"-1"}
+}

@@ -1,0 +1,7 @@
+{
+  "message": "AlterClientQuotasResponse",
+  "version": 1,
+  "case": "security",
+  "hex": "000000000200000002057573657200000000",
+  "fields": {"throttleTimeMs":0,"entries":[{"errorCode":0,"errorMessage":null,"entity":[{"entityType":"user","entityName":null}]}]}
+}

@@ -1,0 +1,7 @@
+{
+  "message": "DescribeDelegationTokenResponse",
+  "version": 1,
+  "case": "security",
+  "hex": "000000000001000455736572000a746573742d6f776e65720020000000000001002000000000000100200000000000010008746f6b656e2d696400000015686d61632d6d61726b65722d6f6e6c792d7465737400000001000455736572000a746573742d6f776e657200000000",
+  "fields": {"errorCode":0,"tokens":[{"principalType":"User","principalName":"test-owner","issueTimestamp":"9007199254740993","expiryTimestamp":"9007199254740993","maxTimestamp":"9007199254740993","tokenId":"token-id","hmac":{"$bytes":"686d61632d6d61726b65722d6f6e6c792d74657374"},"renewers":[{"principalType":"User","principalName":"test-owner"}]}],"throttleTimeMs":0}
+}

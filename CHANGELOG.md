@@ -155,6 +155,8 @@ Versions before 3.0.0 are internal alpha tags and are not published.
 
 #### Behavior changes
 
+- Token-admin diagnostics omit credentials and sensitive broker payloads. Error classes and fixed message prefixes remain stable.
+
 - **Idle connections are closed after 9 minutes** (540 000 ms, Java's `connections.max.idle.ms`; 2.2.4 never closed them) and reopened by the next request, with one more ApiVersions round trip: "Connections idle for 9 minutes are closed by default; the next request reconnects. This is below the default broker idle timeout but does not guarantee close ordering or eliminate races. `connectionsMaxIdle: 0` keeps connections open as before."
 
 - Admin calls take an `apiTimeout` (default 60 000 ms) and reject with `KafkaJSTimeout` when it passes; a mutation may have been applied. Retries are unchanged, unlike Java's unbounded retries inside the deadline. Existing broker-side `timeout` keeps its meaning.
@@ -170,6 +172,8 @@ Versions before 3.0.0 are internal alpha tags and are not published.
 #### Additions
 
 - `admin.describeLogDirs`, `alterReplicaLogDirs`, `describeReplicaLogDirs`; `fetchTopicOffsetsByTimestamp` accepts `'maxTimestamp'`, `'earliestLocal'`, `'latestTiered'` and `'earliestPendingUpload'`; `alterPartitionReassignments` accepts `allowReplicationFactorChange`.
+
+- `admin.describeClientQuotas`, `alterClientQuotas`, `describeUserScramCredentials`, `alterUserScramCredentials` and the four delegation-token methods.
 
 - Admin clients can delete committed group offsets with deleteOffsets and read several groups with fetchOffsetsForGroups. fetchOffsets accepts requireStable; its default remains false.
 
