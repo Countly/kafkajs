@@ -9,7 +9,7 @@
       "since": "2026-10-23"
     },
     "ListOffsets": {
-      "note": "v4 leader epoch (KIP-320), v6 flexible, v7 max-timestamp (KIP-734), v8 earliest-local offset (KIP-405), v9 last-tiered offset (KIP-1005). v10 (async remote list offsets, KIP-1075) and v11 (earliest pending upload offset, KIP-1023) are not yet implemented.",
+      "note": "v4 leader epoch (KIP-320), v6 flexible, v7 max-timestamp (KIP-734), v8 earliest-local offset (KIP-405), v9 last-tiered offset (KIP-1005), v10 asynchronous remote offset reads with TimeoutMs (KIP-1075), v11 earliest pending upload offset (KIP-1023). Named admin specs return raw broker offsets; consumer and numeric timestamp requests retain their version ceiling.",
       "since": "2026-09-03"
     },
     "Metadata": {
@@ -101,7 +101,7 @@
       "since": "2026-10-11"
     },
     "AlterPartitionReassignments": {
-      "note": "v0 is flexible (KIP-455): the codec writes its own body tag buffer, like every flexible codec, and the request header is chosen by the flexible framing. v1 adds AllowReplicationFactorChange (KIP-860), which defaults to true, the behavior v0 has; it is not implemented because nothing here asks to forbid a replication-factor change, so behind:1 is this API's steady state until something does.",
+      "note": "v0 is flexible (KIP-455). v1 implements AllowReplicationFactorChange (KIP-860), which defaults to true, preserving v0 behavior. Setting allowReplicationFactorChange to false requires v1 and rejects before sending on a v0-only broker.",
       "since": "2026-10-13"
     },
     "ListPartitionReassignments": {

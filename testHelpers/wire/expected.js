@@ -710,3 +710,422 @@ module.exports.offsetFetchV7 = {
     ],
   },
 }
+
+module.exports.describeLogDirsV1 = {
+  source: 'Kafka 4.3.1 schema literals; Java comparison required',
+  request: {
+    topics: [
+      {
+        topic: 't',
+        partitions: [0],
+      },
+    ],
+  },
+  response: {
+    throttleTime: 17,
+    errorCode: 0,
+    logDirs: [
+      {
+        errorCode: 0,
+        path: '/data/a',
+        topics: [
+          {
+            topic: 't',
+            partitions: [
+              {
+                partition: 0,
+                size: '9007199254740993',
+                offsetLag: '2',
+                isFuture: true,
+              },
+            ],
+          },
+        ],
+      },
+    ],
+  },
+}
+module.exports.describeLogDirsV2 = {
+  source: 'Kafka 4.3.1 schema literals; Java comparison required',
+  request: {
+    topics: [
+      {
+        topic: 't',
+        partitions: [0],
+      },
+    ],
+  },
+  response: {
+    throttleTime: 17,
+    errorCode: 0,
+    logDirs: [
+      {
+        errorCode: 0,
+        path: '/data/a',
+        topics: [
+          {
+            topic: 't',
+            partitions: [
+              {
+                partition: 0,
+                size: '9007199254740993',
+                offsetLag: '2',
+                isFuture: true,
+              },
+            ],
+          },
+        ],
+      },
+    ],
+  },
+}
+module.exports.describeLogDirsV3 = {
+  source: 'Kafka 4.3.1 schema literals; Java comparison required',
+  request: {
+    topics: [
+      {
+        topic: 't',
+        partitions: [0],
+      },
+    ],
+  },
+  response: {
+    throttleTime: 17,
+    errorCode: 0,
+    logDirs: [
+      {
+        errorCode: 0,
+        path: '/data/a',
+        topics: [
+          {
+            topic: 't',
+            partitions: [
+              {
+                partition: 0,
+                size: '9007199254740993',
+                offsetLag: '2',
+                isFuture: true,
+              },
+            ],
+          },
+        ],
+      },
+    ],
+  },
+}
+module.exports.describeLogDirsV4 = {
+  source: 'Kafka 4.3.1 schema literals; Java comparison required',
+  request: {
+    topics: [
+      {
+        topic: 't',
+        partitions: [0],
+      },
+    ],
+  },
+  response: {
+    throttleTime: 17,
+    errorCode: 0,
+    logDirs: [
+      {
+        errorCode: 0,
+        path: '/data/a',
+        topics: [
+          {
+            topic: 't',
+            partitions: [
+              {
+                partition: 0,
+                size: '9007199254740993',
+                offsetLag: '2',
+                isFuture: true,
+              },
+            ],
+          },
+        ],
+        totalBytes: '9007199254740995',
+        usableBytes: '9007199254740994',
+      },
+    ],
+  },
+}
+module.exports.describeLogDirsV5 = {
+  source: 'Kafka 4.3.1 schema literals; Java comparison required',
+  request: {
+    topics: [
+      {
+        topic: 't',
+        partitions: [0],
+      },
+    ],
+  },
+  response: {
+    throttleTime: 17,
+    errorCode: 0,
+    logDirs: [
+      {
+        errorCode: 0,
+        path: '/data/a',
+        topics: [
+          {
+            topic: 't',
+            partitions: [
+              {
+                partition: 0,
+                size: '9007199254740993',
+                offsetLag: '2',
+                isFuture: true,
+              },
+            ],
+          },
+        ],
+        totalBytes: '9007199254740995',
+        usableBytes: '9007199254740994',
+        isCordoned: true,
+      },
+    ],
+  },
+}
+module.exports.alterReplicaLogDirsV1 = {
+  source: 'Kafka 4.3.1 schema literals; Java comparison required',
+  request: {
+    dirs: [
+      {
+        path: '/data/b',
+        topics: [
+          {
+            topic: 't',
+            partitions: [0],
+          },
+        ],
+      },
+    ],
+  },
+  response: {
+    throttleTime: 17,
+    topics: [
+      {
+        topic: 't',
+        partitions: [
+          {
+            partition: 0,
+            errorCode: 57,
+          },
+        ],
+      },
+    ],
+  },
+}
+module.exports.alterReplicaLogDirsV2 = {
+  source: 'Kafka 4.3.1 schema literals; Java comparison required',
+  request: {
+    dirs: [
+      {
+        path: '/data/b',
+        topics: [
+          {
+            topic: 't',
+            partitions: [0],
+          },
+        ],
+      },
+    ],
+  },
+  response: {
+    throttleTime: 17,
+    topics: [
+      {
+        topic: 't',
+        partitions: [
+          {
+            partition: 0,
+            errorCode: 57,
+          },
+        ],
+      },
+    ],
+  },
+}
+module.exports.listOffsetsV10 = {
+  source: 'Kafka 4.3.1 schema literals; Java comparison required',
+  request: {
+    replicaId: -1,
+    isolationLevel: 1,
+    topics: [
+      {
+        topic: 't',
+        partitions: [
+          {
+            partition: 0,
+            currentLeaderEpoch: -1,
+            timestamp: '-5',
+          },
+        ],
+      },
+    ],
+    timeout: 5000,
+  },
+  response: {
+    throttleTime: 17,
+    responses: [
+      {
+        topic: 't',
+        partitions: [
+          {
+            partition: 0,
+            errorCode: 0,
+            timestamp: '-1',
+            offset: '-1',
+            leaderEpoch: -1,
+          },
+        ],
+      },
+    ],
+  },
+}
+module.exports.listOffsetsV11 = {
+  source: 'Kafka 4.3.1 schema literals; Java comparison required',
+  request: {
+    replicaId: -1,
+    isolationLevel: 1,
+    topics: [
+      {
+        topic: 't',
+        partitions: [
+          {
+            partition: 0,
+            currentLeaderEpoch: -1,
+            timestamp: '-6',
+          },
+        ],
+      },
+    ],
+    timeout: 5000,
+  },
+  response: {
+    throttleTime: 17,
+    responses: [
+      {
+        topic: 't',
+        partitions: [
+          {
+            partition: 0,
+            errorCode: 0,
+            timestamp: '-1',
+            offset: '-1',
+            leaderEpoch: -1,
+          },
+        ],
+      },
+    ],
+  },
+}
+module.exports.alterPartitionReassignmentsV1 = {
+  source: 'Kafka 4.3.1 schema literals; Java comparison required',
+  request: {
+    timeout: 5000,
+    allowReplicationFactorChange: false,
+    topics: [
+      {
+        topic: 't',
+        partitionAssignment: [
+          {
+            partition: 0,
+            replicas: [1, 2],
+          },
+        ],
+      },
+    ],
+  },
+  response: {
+    throttleTime: 17,
+    allowReplicationFactorChange: false,
+    errorCode: 0,
+    errorMessage: null,
+    responses: [
+      {
+        topic: 't',
+        partitions: [
+          {
+            partition: 0,
+            errorCode: 0,
+            errorMessage: null,
+          },
+        ],
+      },
+    ],
+  },
+}
+module.exports.deleteTopicsV6 = {
+  source: 'Kafka 4.3.1 schema literals; Java comparison required',
+  request: {
+    topics: [
+      {
+        topic: null,
+        topicId: '00112233-4455-6677-8899-aabbccddeeff',
+      },
+    ],
+    timeout: 5000,
+  },
+  response: {
+    throttleTime: 17,
+    topicErrors: [
+      {
+        topic: null,
+        topicId: '00112233-4455-6677-8899-aabbccddeeff',
+        errorCode: 89,
+        errorMessage: 'quota',
+      },
+    ],
+  },
+}
+
+Object.assign(module.exports.describeLogDirsV1, {
+  requestHex: '000000010001740000000100000000',
+  responseHex:
+    '0000001100000001000000072f646174612f610000000100017400000001000000000020000000000001000000000000000201',
+})
+Object.assign(module.exports.describeLogDirsV2, {
+  requestHex: '02027402000000000000',
+  responseHex:
+    '00000011020000082f646174612f610202740200000000002000000000000100000000000000020100000000',
+})
+Object.assign(module.exports.describeLogDirsV3, {
+  requestHex: '02027402000000000000',
+  responseHex:
+    '000000110000020000082f646174612f610202740200000000002000000000000100000000000000020100000000',
+})
+Object.assign(module.exports.describeLogDirsV4, {
+  requestHex: '02027402000000000000',
+  responseHex:
+    '000000110000020000082f646174612f61020274020000000000200000000000010000000000000002010000002000000000000300200000000000020000',
+})
+Object.assign(module.exports.describeLogDirsV5, {
+  requestHex: '02027402000000000000',
+  responseHex:
+    '000000110000020000082f646174612f6102027402000000000020000000000001000000000000000201000000200000000000030020000000000002010000',
+})
+Object.assign(module.exports.alterReplicaLogDirsV1, {
+  requestHex: '0000000100072f646174612f62000000010001740000000100000000',
+  responseHex: '000000110000000100017400000001000000000039',
+})
+Object.assign(module.exports.alterReplicaLogDirsV2, {
+  requestHex: '02082f646174612f620202740200000000000000',
+  responseHex: '0000001102027402000000000039000000',
+})
+Object.assign(module.exports.listOffsetsV10, {
+  requestHex: 'ffffffff010202740200000000fffffffffffffffffffffffb00000000138800',
+  responseHex: '0000001102027402000000000000ffffffffffffffffffffffffffffffffffffffff000000',
+})
+Object.assign(module.exports.listOffsetsV11, {
+  requestHex: 'ffffffff010202740200000000fffffffffffffffffffffffa00000000138800',
+  responseHex: '0000001102027402000000000000ffffffffffffffffffffffffffffffffffffffff000000',
+})
+Object.assign(module.exports.alterPartitionReassignmentsV1, {
+  requestHex: '00001388000202740200000000030000000100000002000000',
+  responseHex: '00000011000000000202740200000000000000000000',
+})
+Object.assign(module.exports.deleteTopicsV6, {
+  requestHex: '020000112233445566778899aabbccddeeff000000138800',
+  responseHex: '00000011020000112233445566778899aabbccddeeff00590671756f74610000',
+})

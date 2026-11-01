@@ -1141,6 +1141,10 @@ Describe calls can request the optional raw authorized-operations mask; an unsup
 
 Topic-offset reads accept isolationLevel: 'read_committed' (the unchanged default) or 'read_uncommitted'. During an open transaction, the default high is the last stable offset; use read_uncommitted for high-watermark committed lag and a raw fetchOffsets read with resolveOffsets: false. Missing commits are distinct from zero. Broker errorMessage is separate from stable protocol messages. deleteTopicRecords still returns Promise<void>; inspect the existing error/cause chain for its failing partitions and read low watermarks with fetchTopicOffsets. listTopics remains string[]; fetchTopicMetadata() provides topicId and isInternal from the same fresh Metadata snapshot.
 
+| Behavior | Configuration | Default | Migration | Area |
+| --- | --- | --- | --- | --- |
+| `deleteTopics` accepts `topicIds` as an exclusive alternative to `topics` (types and runtime: giving both or neither throws) | none needed | none | `deleteTopics({ topicIds })` deletes by topic id; `topics` and `topicIds` are exclusive. | Admin |
+
 ### Errors and events
 
 Error classes and categories, new instrumentation events and the payload keys they gain, and what is

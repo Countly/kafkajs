@@ -104,6 +104,18 @@ const NAMED = {
  * @type {Record<string, { decoded?: Function, fields?: Function, options?: Function }>}
  */
 const PROJECTIONS = {
+  alterPartitionReassignments: {
+    fields: ({ errorMessage, ...fields }, version) =>
+      version === 1
+        ? {
+            ...fields,
+            responses: fields.responses.map((topic) => ({
+              ...topic,
+              partitions: topic.partitions.map(({ errorMessage, ...partition }) => partition),
+            })),
+          }
+        : fields,
+  },
   // a broker and a partition are the values of their fields, in order: a broker is [nodeId, host,
   // port, rack]; a partition is [partitionErrorCode, partitionId, leader, leaderEpoch (v7 and
   // later), replicas, isr, offlineReplicas (v5 and later)]

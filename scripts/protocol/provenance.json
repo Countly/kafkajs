@@ -37,7 +37,7 @@
       "Request": "09ed6a85622e808357af2df8141e908b62871aff531f54fb6fa85875dcebbf6c",
       "Response": "449f1c0669ef193216066d605ae9dc87a7524006eb421b34e3ed2ed0d8012225"
     },
-    "javaClientsJar": null
+    "javaClientsJar": "4.3.1"
   },
   "AlterReplicaLogDirs": {
     "kafkaTag": "4.3.1",
@@ -45,7 +45,7 @@
       "Request": "36b2407c1b6964bf1a8b5e405fe317844c0f00d8e946efeaa3fb3df858ab373d",
       "Response": "23ecf9485b51be6433378e8ca82d2ff2d8db2255e2815fb68d7328eab8e07be1"
     },
-    "javaClientsJar": null
+    "javaClientsJar": "4.3.1"
   },
   "AlterUserScramCredentials": {
     "kafkaTag": "4.3.1",
@@ -197,7 +197,7 @@
       "Request": "63ba440915c66d6ed6f2e17ef4aac5d2eb36e1f14bc6bf9d3129b3ce6c99f218",
       "Response": "4e3b47c05309d177a004e11f2e317a65393294106e7074ae65f70921c29ebe53"
     },
-    "javaClientsJar": null
+    "javaClientsJar": "4.3.1"
   },
   "DescribeProducers": {
     "kafkaTag": "4.3.1",

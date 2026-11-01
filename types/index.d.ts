@@ -579,6 +579,9 @@ export interface ApiTimeoutOption {
   apiTimeout?: number
 }
 
+/** Named broker timestamp specifications; unsupported versions reject before transmission. */
+export type OffsetSpecName = 'maxTimestamp' | 'earliestLocal' | 'latestTiered' | 'earliestPendingUpload'
+
 /** Per-item result for the additive admin families; legacy void/aggregate contracts stay intact. */
 export interface AdminItemResult {
   errorCode: number
@@ -955,7 +958,7 @@ listTopics(): Promise<string[]>
     timeout?: number
     topics: ITopicConfig[]
   }) & ApiTimeoutOption): Promise<boolean>
-  deleteTopics(options: ({ topics: string[]; timeout?: number }) & ApiTimeoutOption): Promise<void>
+  deleteTopics(options: ({ topics: string[]; topicIds?: never } | { topicIds: string[]; topics?: never }) & { timeout?: number } & ApiTimeoutOption): Promise<void>
   createPartitions(options: ({
     validateOnly?: boolean
     timeout?: number
@@ -987,9 +990,15 @@ listTopics(): Promise<string[]>
     resolveOffsets?: boolean
     requireStable?: boolean
   }) & ApiTimeoutOption): Promise<Array<{ topic: string; partitions: FetchOffsetsPartition[] }>>
+  describeLogDirs(options?: { brokers?: number[]; topicPartitions?: Array<{topic:string;partitions:number[]}> | null } & ApiTimeoutOption): Promise<Array<{
+    brokerId:number; errorCode:number; error:KafkaJSError|null; errorMessage:string|null
+    logDirs:Array<{path:string;totalBytes:string|null;usableBytes:string|null;isCordoned:boolean|null;topics:Array<{topic:string;partitions:Array<{partition:number;size:string;offsetLag:string;isFuture:boolean}>}>} & AdminItemResult>
+  }>>
+  alterReplicaLogDirs(options:{replicas:Array<{topic:string;partition:number;brokerId:number;logDir:string}>} & ApiTimeoutOption):Promise<Array<{topic:string;partition:number;brokerId:number} & AdminItemResult>>
+  describeReplicaLogDirs(options:{replicas:Array<{topic:string;partition:number;brokerId:number}>} & ApiTimeoutOption):Promise<Array<{topic:string;partition:number;brokerId:number;currentLogDir:string|null;futureLogDir:string|null;currentOffsetLag:string|null;futureOffsetLag:string|null} & AdminItemResult>>
   fetchTopicOffsets(topic: string, options?: ApiTimeoutOption & { isolationLevel?: 'read_committed' | 'read_uncommitted' }): Promise<Array<SeekEntry & { high: string; low: string }>>
 fetchTopicOffsets(topic: string): Promise<Array<SeekEntry & { high: string; low: string }>>
-  fetchTopicOffsetsByTimestamp(topic: string, timestamp?: number, options?: ApiTimeoutOption & { isolationLevel?: 'read_committed' | 'read_uncommitted' }): Promise<Array<SeekEntry>>
+  fetchTopicOffsetsByTimestamp(topic: string, timestamp?: number | OffsetSpecName, options?: ApiTimeoutOption & { isolationLevel?: 'read_committed' | 'read_uncommitted' }): Promise<Array<SeekEntry>>
 fetchTopicOffsetsByTimestamp(topic: string, timestamp?: number): Promise<Array<SeekEntry>>
   describeCluster(options?: ApiTimeoutOption): Promise<{
     brokers: Array<{ nodeId: number; host: string; port: number }>
@@ -1038,6 +1047,7 @@ describeGroups(groupIds: string[]): Promise<GroupDescriptions>
   alterPartitionReassignments(request: ({
     topics: PartitionReassignment[]
     timeout?: number
+    allowReplicationFactorChange?: boolean
   }) & ApiTimeoutOption): Promise<void>
   listPartitionReassignments(request: ({
     topics?: TopicPartitions[]
@@ -1336,6 +1346,7 @@ export type Broker = {
   alterPartitionReassignments(request: {
     topics: PartitionReassignment[]
     timeout?: number
+    allowReplicationFactorChange?: boolean
   }): Promise<any>
   listPartitionReassignments(request: {
     topics?: TopicPartitions[]

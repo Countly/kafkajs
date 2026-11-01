@@ -105,6 +105,8 @@ Topic deletion is disabled by default in Apache Kafka versions prior to `1.0.0`.
 delete.topic.enable=true
 ```
 
+Delete by topic ID with `deleteTopics({ topicIds: [topicId], timeout })`. Exactly one of `topics` and `topicIds` is required. IDs must be unique canonical UUID strings and cannot be the zero UUID; letter case is normalized. ID deletion needs DeleteTopics v6. Both forms resolve with no value on success and keep the existing thrown-error contract. Failed ID entries retain `topicId`; their legacy string `topic` field is the broker's name when present, otherwise the canonical ID. Every response must cover exactly the IDs attempted on that round before results are accepted. Quota retries resend only the refused identities. A failure during the follow-up metadata refresh propagates without resending a confirmed deletion. `timeout` remains the broker timeout and `apiTimeout` bounds the whole call.
+
 ## <a name="create-partitions"></a> Create partitions
 
 `createPartitions` will resolve in case of success. The method will throw exceptions in case of errors.
@@ -230,6 +232,8 @@ await admin.fetchTopicOffsets(topic)
 // ]
 ```
 
+`fetchTopicOffsets` and consumer offset resolution keep their existing behavior. Named offset specifications are selected through `fetchTopicOffsetsByTimestamp`.
+
 ## <a name="fetch-topic-offsets-by-timestamp"></a> Fetch topic offsets by timestamp
 
 Specify a `timestamp` to get the earliest offset on each partition where the message's timestamp is greater than or equal to the given timestamp.
@@ -243,6 +247,10 @@ await admin.fetchTopicOffsetsByTimestamp(topic, timestamp)
 //   { partition: 1, offset: '3113' },
 // ]
 ```
+
+`fetchTopicOffsetsByTimestamp(topic, timestamp, options)` also accepts `'maxTimestamp'`, `'earliestLocal'`, `'latestTiered'` and `'earliestPendingUpload'`. Their broker timestamps are -3, -4, -5 and -6; they need ListOffsets v7, v8, v9 and v11 respectively. An unsupported specification rejects with `KafkaJSServerDoesNotSupportApiKey`. Named specifications return the raw broker offset, including -1 when no offset exists. Numeric timestamps keep their existing high-offset fallback. Both forms keep `read_committed` by default and accept `{ isolationLevel: 'read_uncommitted' }`.
+
+ListOffsets v10 carries the broker timeout for asynchronous remote reads; v11 adds the earliest pending upload specification. On a plain topic, `earliestLocal` is the log start and `latestTiered` is -1. Tiered storage must be configured on the broker to observe uploaded/local boundaries.
 
 ## Committed lag
 
@@ -1009,6 +1017,12 @@ Be aware that the security features might be disabled in your cluster. In that c
 KafkaJSProtocolError: Security features are disabled
 ```
 
+## Log directories
+
+`describeLogDirs({ brokers, topicPartitions })` reads the selected brokers, or all cached brokers when omitted. Omitted or null `topicPartitions` selects all topics; an explicit empty filter selects none. Results retain each broker and directory's `errorCode`, typed `error` and `errorMessage`. Partition `size` and `offsetLag` are decimal strings. `totalBytes` and `usableBytes` require DescribeLogDirs v4, and `isCordoned` requires v5; unsupported fields are null.
+
+`alterReplicaLogDirs({ replicas: [{ topic, partition, brokerId, logDir }] })` moves each replica to an absolute directory configured on its broker and returns per-replica outcomes. Successful mutations are retained while unresolved replicas retry. `describeReplicaLogDirs({ replicas })` reports current and future directories and offset lags; a replica absent on the broker has null locations. Source storage errors remain visible. Capability, authentication and validation failures reject the whole call even if another broker has completed; a late route or transport failure can be retained on the unresolved broker or item. Completed peers are not resent or disconnected. All three methods accept `apiTimeout`; an expired mutation may have reached the broker and has an unknown outcome.
+
 ## <a name="alter-partition-reassignments"></a> Alter Partition Reassignments
 This is used to reassign the replicas that partitions are on. This method will throw exceptions in the case of errors.
 
@@ -1028,6 +1042,8 @@ PartitionReassignment Structure:
 ```
 
 When some partitions are refused and others are not, the retries send only the partitions the broker said could still go through, each with the replicas you gave, and a topic whose partitions all went through is not sent again. A partition refused for good rejects the call with a `KafkaJSAggregateError`, as described under [Create topics](#create-topics). A topic whose `partitionAssignment` is empty is not sent.
+
+`allowReplicationFactorChange` defaults to true. Set it to false to reject a replication-factor change while allowing other reassignments. False requires AlterPartitionReassignments v1; a v0 broker rejects the option before sending. The method keeps its void success and thrown aggregate errors, retaining terminal children and retrying only the retriable subset.
 
 ## <a name="list-partition-reassignments"></a> List Partition Reassignments
 This is used to list current partition reassignments in progress. This method will throw exceptions in the case of errors and resolve to ListPartitionReassignmentsResponse on success. If a requested partition does not exist it will not be included in the response.

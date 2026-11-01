@@ -1,0 +1,7 @@
+{
+  "message": "ListOffsetsRequest",
+  "version": 11,
+  "case": "storage",
+  "hex": "ffffffff010202740200000000fffffffffffffffffffffffa00000000138800",
+  "fields": {"replicaId":-1,"isolationLevel":1,"topics":[{"topic":"t","partitions":[{"partition":0,"currentLeaderEpoch":-1,"timestamp":"-6"}]}],"timeout":5000}
+}

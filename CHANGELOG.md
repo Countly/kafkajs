@@ -169,6 +169,8 @@ Versions before 3.0.0 are internal alpha tags and are not published.
 
 #### Additions
 
+- `admin.describeLogDirs`, `alterReplicaLogDirs`, `describeReplicaLogDirs`; `fetchTopicOffsetsByTimestamp` accepts `'maxTimestamp'`, `'earliestLocal'`, `'latestTiered'` and `'earliestPendingUpload'`; `alterPartitionReassignments` accepts `allowReplicationFactorChange`.
+
 - Admin clients can delete committed group offsets with deleteOffsets and read several groups with fetchOffsetsForGroups. fetchOffsets accepts requireStable; its default remains false.
 
 - `connectionsMaxIdle`.

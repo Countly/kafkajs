@@ -1,0 +1,7 @@
+{
+  "message": "AlterReplicaLogDirsResponse",
+  "version": 2,
+  "case": "storage",
+  "hex": "0000001102027402000000000039000000",
+  "fields": {"throttleTime":17,"topics":[{"topic":"t","partitions":[{"partition":0,"errorCode":57}]}]}
+}

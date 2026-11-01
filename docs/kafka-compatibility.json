@@ -93,12 +93,14 @@
         6,
         7,
         8,
-        9
+        9,
+        10,
+        11
       ],
-      "gap": "behind:2",
+      "gap": "current",
       "onFloor": false,
       "belowFloor": [],
-      "notes": "v4 leader epoch (KIP-320), v6 flexible, v7 max-timestamp (KIP-734), v8 earliest-local offset (KIP-405), v9 last-tiered offset (KIP-1005). v10 (async remote list offsets, KIP-1075) and v11 (earliest pending upload offset, KIP-1023) are not yet implemented."
+      "notes": "v4 leader epoch (KIP-320), v6 flexible, v7 max-timestamp (KIP-734), v8 earliest-local offset (KIP-405), v9 last-tiered offset (KIP-1005), v10 asynchronous remote offset reads with TimeoutMs (KIP-1075), v11 earliest pending upload offset (KIP-1023). Named admin specs return raw broker offsets; consumer and numeric timestamp requests retain their version ceiling."
     },
     {
       "kafkaName": "Metadata",
@@ -788,9 +790,9 @@
     {
       "kafkaName": "AlterReplicaLogDirs",
       "apiKey": 34,
-      "forkName": null,
+      "forkName": "alterReplicaLogDirs",
       "apiKeysName": "AlterReplicaLogDirs",
-      "planned": "yes",
+      "planned": "done",
       "validVersions": [
         1,
         2
@@ -798,8 +800,11 @@
       "flexibleFrom": 2,
       "deprecatedVersions": null,
       "latestVersionUnstable": false,
-      "forkVersions": null,
-      "gap": "stub",
+      "forkVersions": [
+        1,
+        2
+      ],
+      "gap": "current",
       "onFloor": false,
       "belowFloor": [],
       "notes": ""
@@ -807,9 +812,9 @@
     {
       "kafkaName": "DescribeLogDirs",
       "apiKey": 35,
-      "forkName": null,
+      "forkName": "describeLogDirs",
       "apiKeysName": "DescribeLogDirs",
-      "planned": "yes",
+      "planned": "done",
       "validVersions": [
         1,
         5
@@ -817,8 +822,14 @@
       "flexibleFrom": 2,
       "deprecatedVersions": null,
       "latestVersionUnstable": false,
-      "forkVersions": null,
-      "gap": "stub",
+      "forkVersions": [
+        1,
+        2,
+        3,
+        4,
+        5
+      ],
+      "gap": "current",
       "onFloor": false,
       "belowFloor": [],
       "notes": ""
@@ -1024,12 +1035,13 @@
       "deprecatedVersions": null,
       "latestVersionUnstable": false,
       "forkVersions": [
-        0
+        0,
+        1
       ],
-      "gap": "behind:1",
+      "gap": "current",
       "onFloor": false,
       "belowFloor": [],
-      "notes": "v0 is flexible (KIP-455): the codec writes its own body tag buffer, like every flexible codec, and the request header is chosen by the flexible framing. v1 adds AllowReplicationFactorChange (KIP-860), which defaults to true, the behavior v0 has; it is not implemented because nothing here asks to forbid a replication-factor change, so behind:1 is this API's steady state until something does."
+      "notes": "v0 is flexible (KIP-455). v1 implements AllowReplicationFactorChange (KIP-860), which defaults to true, preserving v0 behavior. Setting allowReplicationFactorChange to false requires v1 and rejects before sending on a v0-only broker."
     },
     {
       "kafkaName": "ListPartitionReassignments",

@@ -1422,10 +1422,16 @@ module.exports = class Cluster {
    *   and the metadata refresh a stale leader epoch starts
    * @param {() => Error|null} [options.guard] the caller's immutable identity: checked before each
    *   request is written and before any side effect of a failure, so a refused caller causes none
+   * @param {number} [options.minVersion] named specification capability floor
+   * @param {number} [options.maxVersion] explicit named-read ceiling; omitted keeps broker default v9
+   * @param {number} [options.timeout] remote-read broker timeout
    * @returns {Promise<object[]>} the offsets per topic
    * @throws {Error} the guard's refusal, when it refuses
    */
-  async fetchTopicsOffset(topics, { fence, guard, isolationLevel = this.isolationLevel } = {}) {
+  async fetchTopicsOffset(
+    topics,
+    { fence, guard, isolationLevel = this.isolationLevel, minVersion, maxVersion, timeout } = {}
+  ) {
     const partitionsPerBroker = {}
     const topicConfigurations = dictionary()
 
@@ -1464,6 +1470,9 @@ module.exports = class Cluster {
       const partitions = partitionsPerBroker[nodeId]
 
       const { responses: topicOffsets } = await broker.listOffsets({
+        minVersion,
+        maxVersion,
+        timeout,
         guard,
         isolationLevel,
         topics: keys(partitions).map((topic) => ({

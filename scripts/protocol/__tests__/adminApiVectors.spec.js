@@ -850,7 +850,16 @@ describe('Java message vectors > admin and classic group APIs', () => {
         .readdirSync(path.join(REQUESTS, api, 'fixtures', 'java'))
         .filter((file) => !SHARED_DIRECTORIES.has(api) || V10.test(file))
 
-      expect(onDisk.sort()).toEqual(MANIFEST[api].map((name) => `${name}.json`).sort())
+      expect(onDisk.sort()).toEqual(
+        [
+          ...MANIFEST[api],
+          ...(api === 'deleteTopics'
+            ? ['deleteTopicsRequest-v6-storage', 'deleteTopicsResponse-v6-storage']
+            : []),
+        ]
+          .map((name) => `${name}.json`)
+          .sort()
+      )
     }
   )
 
