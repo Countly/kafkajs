@@ -1591,3 +1591,127 @@ describe('Consumer journal boundaries', () => {
     expect(heartbeatRan).toBe(true)
   })
 })
+
+const { IdleSocketCheck } = require('../soak')
+
+describe('Idle producer socket checks', () => {
+  const fixture = ({ retain = false, fakeReopen = false, alter = (row) => row } = {}) => {
+    let reads = 0
+    const producer = {
+      send: jest.fn(async () => {}),
+    }
+    const probe = {
+      snapshot: jest.fn(async () => {
+        reads++
+        const created = reads < 3 ? 2 : reads < 5 || fakeReopen ? 4 : 6
+        const open = (reads === 2 && !retain) || reads === 4 ? 0 : 2
+        const first = reads < 3 ? 1 : reads < 5 || fakeReopen ? 3 : 5
+        return alter(
+          {
+            socketNodes: ['leader', 'metadata'],
+            sockets: {
+              created,
+              destroyed: created - open,
+              open,
+              live: open
+                ? [
+                    { node: 'leader', id: first },
+                    { node: 'metadata', id: first + 1 },
+                  ]
+                : [],
+            },
+            queueDepth: 0,
+          },
+          reads
+        )
+      }),
+    }
+    const record = jest.fn()
+    const nap = jest.fn(async () => {})
+    return {
+      check: new IdleSocketCheck({ producer, probe, topic: 'idle', record, nap }),
+      producer,
+      record,
+      nap,
+    }
+  }
+  test('observes zero before reopening and checks bounded fresh node identities', async () => {
+    const { check, producer, record, nap } = fixture()
+    await check.cycle()
+    expect(producer.send).toHaveBeenCalledTimes(3)
+    expect(nap).toHaveBeenCalledWith(6000)
+    expect(record).toHaveBeenCalledWith(
+      expect.objectContaining({
+        kind: 'idle-cycle',
+        idle: expect.objectContaining({ sockets: expect.objectContaining({ open: 0 }) }),
+      })
+    )
+  })
+  test('a surviving socket fails before the second send', async () => {
+    const { check, producer } = fixture({ retain: true })
+    await expect(check.cycle()).rejects.toThrow('not reaped')
+    expect(producer.send).toHaveBeenCalledTimes(1)
+  })
+  test('the old socket count cannot impersonate a reconnect', async () => {
+    const { check } = fixture({ fakeReopen: true })
+    await expect(check.cycle()).rejects.toThrow('did not reopen')
+  })
+
+  test.each([
+    [
+      'duplicate endpoint',
+      (row) => {
+        row.sockets.live[1].node = 'leader'
+      },
+    ],
+    [
+      'unknown endpoint',
+      (row) => {
+        row.sockets.live[1].node = 'unknown'
+      },
+    ],
+    [
+      'stale identity with increased creation count',
+      (row) => {
+        row.sockets.live[0].id = 3
+      },
+    ],
+    [
+      'duplicate identity',
+      (row) => {
+        row.sockets.live[1].id = 5
+      },
+    ],
+  ])('rejects a reopened population with %s', async (_name, change) => {
+    const { check } = fixture({
+      alter: (row, read) => {
+        if (read === 5) change(row)
+        return row
+      },
+    })
+    await expect(check.cycle()).rejects.toThrow('did not reopen')
+  })
+  test.each([
+    [
+      'socket',
+      (row) => {
+        row.sockets.live = [{ node: 'leader', id: 4 }]
+      },
+    ],
+    [
+      'request',
+      (row) => {
+        row.queueDepth = 1
+      },
+    ],
+  ])('rejects a surviving %s in the second idle interval', async (_name, change) => {
+    const { check, producer } = fixture({
+      alter: (row, read) => {
+        if (read === 4) change(row)
+        return row
+      },
+    })
+    await expect(check.cycle()).rejects.toThrow('not reaped')
+    expect(producer.send).toHaveBeenCalledTimes(2)
+  })
+})

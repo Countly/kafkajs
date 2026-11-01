@@ -178,6 +178,8 @@ Versions before 3.0.0 are internal alpha tags and are not published.
 
 #### Tooling
 
+- Live scenarios for the connection setup budget and idle reaping; the soak's idle profile asserts that sockets are reaped and reopened.
+
 - The request-queue stamp benchmark.
 
 - `blackhole(id)` in the scripted cluster and the connection-setup benchmark.
