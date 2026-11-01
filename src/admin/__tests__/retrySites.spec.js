@@ -29,7 +29,20 @@ describe('admin retry ownership', () => {
     const index = fs.readFileSync(path.join(__dirname, '..', 'index.js'), 'utf8')
     const groups = fs.readFileSync(path.join(__dirname, '..', 'groupDescriptions.js'), 'utf8')
     expect(sites).toHaveLength(20)
-    expect(index.match(/retrierOf\(retry\)/g)).toHaveLength(18)
+    const owners = [...index.matchAll(/const (\w+) = async|retrierOf\(retry\)/g)]
+    const counts = new Map()
+    let owner
+    for (const match of owners) {
+      if (match[1]) owner = match[1]
+      else counts.set(owner, (counts.get(owner) || 0) + 1)
+    }
+    for (const method of sites.slice(0, 18)) {
+      expect([method, counts.get(method)]).toEqual([
+        method,
+        method === 'deleteTopics' ? 3 : method === 'fetchTopicOffsetsByTimestamp' ? 2 : 1,
+      ])
+    }
+    expect([...counts.values()].reduce((sum, count) => sum + count, 0)).toBe(21)
     expect(groups.match(/this\.#retrier\(context\)\(async/g)).toHaveLength(2)
     for (const method of sites.slice(0, 18))
       expect(index).toMatch(new RegExp(`const ${method} = async`))
