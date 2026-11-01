@@ -21,7 +21,7 @@
       "Request": "195bd3af15a5d91037d3394db88d433c9c62985e04a896310fe4074638cc3526",
       "Response": "db655393cbc6485bf10575f0dc4d29b3c47883a16a4162d190c74f4000cb6b6a"
     },
-    "javaClientsJar": null
+    "javaClientsJar": "4.3.1"
   },
   "AlterConfigs": {
     "kafkaTag": "4.3.1",
@@ -53,7 +53,7 @@
       "Request": "fcf7ca27e8028316c0957b346c93108c235388d06f829f7ecc5a304407719d26",
       "Response": "f9bba249467a5f499ae10523be22f96aab4ddc6bdff0f54f7cf0be030820ff2d"
     },
-    "javaClientsJar": null
+    "javaClientsJar": "4.3.1"
   },
   "ApiVersions": {
     "kafkaTag": "4.3.1",
@@ -93,7 +93,7 @@
       "Request": "159c3ed2d3d9e7f2ad4df8ece1783184ffe0b19de176e9a67a4ff76c90f36093",
       "Response": "f42e46e7433dd594e9a837e805f9cde1c90a63c86c6a05d28f541c4cac3f084e"
     },
-    "javaClientsJar": null
+    "javaClientsJar": "4.3.1"
   },
   "CreatePartitions": {
     "kafkaTag": "4.3.1",
@@ -157,7 +157,7 @@
       "Request": "16451280b34bfdb2dc706ee793ff85ab9553d10b1f57268652bcb244d0a9c270",
       "Response": "8835639bb0223508cdaa9b0eded648e5394c5311276995ff401ea9b58514a100"
     },
-    "javaClientsJar": null
+    "javaClientsJar": "4.3.1"
   },
   "DescribeCluster": {
     "kafkaTag": "4.3.1",
@@ -181,7 +181,7 @@
       "Request": "22fe3781b361acbd3951b31a4dd7f7db15f71315eb8b934404b8e76bea5b825b",
       "Response": "3306725d50bbca00ba4fad6d7e0dc8fff284ac7dcaf231e5d05398a4afa4b0b9"
     },
-    "javaClientsJar": null
+    "javaClientsJar": "4.3.1"
   },
   "DescribeGroups": {
     "kafkaTag": "4.3.1",
@@ -229,7 +229,7 @@
       "Request": "e3551378a9f2d59fb65de32641f79f40ea5a9b5a554ee668ed06d182c5064323",
       "Response": "2ead5ef7c1fc92546da6c50bc703e0ed13eee56ae108dfc76857c9069b6cde8b"
     },
-    "javaClientsJar": null
+    "javaClientsJar": "4.3.1"
   },
   "ElectLeaders": {
     "kafkaTag": "4.3.1",
@@ -253,7 +253,7 @@
       "Request": "a7f118857c35f3e6cf95b3b81eee31e13080ba92345b3016aa7525f6e70f9c3b",
       "Response": "e0e3e4c82e5cd796480b95b6dc79d691e8994fae89c77699d09fb8b351a322e7"
     },
-    "javaClientsJar": null
+    "javaClientsJar": "4.3.1"
   },
   "Fetch": {
     "kafkaTag": "4.3.1",
@@ -405,7 +405,7 @@
       "Request": "c87758d9a4f7abf1e7e457107ca0d84e22770c7b5aadf35b4f33b07ee847e544",
       "Response": "30d8490c8fcc122a11490a33949d24cdcbf1367ba6b3d9c04e5a4241c8b38842"
     },
-    "javaClientsJar": null
+    "javaClientsJar": "4.3.1"
   },
   "SaslAuthenticate": {
     "kafkaTag": "4.3.1",

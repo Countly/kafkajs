@@ -1,303 +1,1672 @@
 [
-  {"family":"addOffsetsToTxn/hand","route":"hand","evidenceKind":"hand","disposition":"retain","reason":"hand-kept bytes v0; no golden stands on it"},
-  {"family":"addOffsetsToTxn/java","route":"javaVectors/GenerateMessageVectors.java","evidenceKind":"java-vector","disposition":"retain","reason":"Java vectors v2, v3, v4; goldens stand on it","goldens":[
-    {"direction":"request","versions":[4],"test":"encodes the Apache 4.3.1 vector byte for byte"},
-    {"direction":"response","versions":[4],"test":"decodes the Apache 4.3.1 %s vector into the v1 shape"}
-  ]},
-  {"family":"addPartitionsToTxn/hand","route":"hand","evidenceKind":"hand","disposition":"retain","reason":"hand-kept bytes v0; no golden stands on it"},
-  {"family":"addPartitionsToTxn/java","route":"javaVectors/GenerateMessageVectors.java","evidenceKind":"java-vector","disposition":"retain","reason":"Java vectors v2, v3; goldens stand on it","goldens":[
-    {"direction":"request","versions":[3],"test":"encodes the Apache 4.3.1 vector byte for byte"},
-    {"direction":"response","versions":[3],"test":"decodes the Apache 4.3.1 %s vector into the v1 shape"}
-  ]},
-  {"family":"alterConfigs/hand","route":"hand","evidenceKind":"hand","disposition":"retain","reason":"hand-kept bytes v0; no golden stands on it"},
-  {"family":"alterConfigs/java","route":"javaVectors/GenerateMessageVectors.java","evidenceKind":"java-vector","disposition":"retain","reason":"Java vectors v2; goldens stand on it","goldens":[
-    {"direction":"request","versions":[2],"test":"encodes the Apache 4.3.1 %s vector byte for byte"},
-    {"direction":"response","versions":[2],"test":"decodes the Apache 4.3.1 %s vector"}
-  ]},
-  {"family":"alterPartitionReassignments/capture","route":"capture.js","evidenceKind":"capture","disposition":"retain","reason":"broker captures v0; goldens stand on it","goldens":[
-    {"direction":"request","versions":[0],"test":"encodes to match a captured Kafka 4.3.1 request"},
-    {"direction":"response","versions":[0],"test":"decodes a captured Kafka 4.3.1 response"}
-  ]},
-  {"family":"alterPartitionReassignments/hand","route":"hand","evidenceKind":"hand","disposition":"retain","reason":"hand-kept bytes v0; no golden stands on it"},
-  {"family":"apiVersions/capture","route":"capture.js","evidenceKind":"capture","disposition":"retain","reason":"broker captures v4; no golden stands on it"},
-  {"family":"apiVersions/hand","route":"hand","evidenceKind":"hand","disposition":"retain","reason":"hand-kept bytes v0, v1, v3, v4; no golden stands on it"},
-  {"family":"apiVersions/javaBuffer","route":"javaVectors/GenerateVectors.java","evidenceKind":"java-vector","disposition":"retain","reason":"Java vector bytes v3, v4; goldens stand on it","goldens":[
-    {"direction":"request","versions":[4],"test":"matches the vector produced by the Apache kafka-clients 4.3.1 codec"},
-    {"direction":"response","versions":[4],"test":"decodes the vector produced by the Apache kafka-clients 4.3.1 codec"}
-  ]},
-  {"family":"consumerGroupDescribe/java","route":"javaVectors/GenerateMessageVectors.java","evidenceKind":"java-vector","disposition":"retain","reason":"Java vectors v0, v1; goldens stand on it","goldens":[
-    {"direction":"request","versions":[1],"test":"encodes the %s vector byte-identically to the Apache 4.3.1 codec"},
-    {"direction":"response","versions":[1],"test":"decodes the memberType vector the Apache 4.3.1 codec produced"}
-  ]},
-  {"family":"consumerGroupHeartbeat/java","route":"javaVectors/GenerateMessageVectors.java","evidenceKind":"java-vector","disposition":"retain","reason":"Java vectors v0, v1; goldens stand on it","goldens":[
-    {"direction":"request","versions":[1],"test":"encodes the %s vector byte-identically to the Apache 4.3.1 codec"},
-    {"direction":"response","versions":[1],"test":"decodes the %s vector the Apache 4.3.1 codec produced"}
-  ]},
-  {"family":"createAcls/hand","route":"hand","evidenceKind":"hand","disposition":"retain","reason":"hand-kept bytes v1; no golden stands on it"},
-  {"family":"createAcls/java","route":"javaVectors/GenerateMessageVectors.java","evidenceKind":"java-vector","disposition":"retain","reason":"Java vectors v2, v3; goldens stand on it","goldens":[
-    {"direction":"request","versions":[3],"test":"encodes the Apache 4.3.1 %s vector byte for byte"},
-    {"direction":"response","versions":[3],"test":"decodes the Apache 4.3.1 %s vector"}
-  ]},
-  {"family":"createPartitions/hand","route":"hand","evidenceKind":"hand","disposition":"retain","reason":"hand-kept bytes v0, v1; no golden stands on it"},
-  {"family":"createPartitions/java","route":"javaVectors/GenerateMessageVectors.java","evidenceKind":"java-vector","disposition":"retain","reason":"Java vectors v2, v3; goldens stand on it","goldens":[
-    {"direction":"request","versions":[3],"test":"encodes the Apache 4.3.1 %s vector byte for byte"},
-    {"direction":"response","versions":[3],"test":"decodes the Apache 4.3.1 %s vector"}
-  ]},
-  {"family":"createTopics/hand","route":"hand","evidenceKind":"hand","disposition":"retain","reason":"hand-kept bytes v2; no golden stands on it"},
-  {"family":"createTopics/java","route":"javaVectors/GenerateMessageVectors.java","evidenceKind":"java-vector","disposition":"retain","reason":"Java vectors v4, v5, v6, v7; goldens stand on it","goldens":[
-    {"direction":"request","versions":[7],"test":"encodes the Apache 4.3.1 %s vector byte for byte"},
-    {"direction":"response","versions":[7],"test":"decodes the Apache 4.3.1 %s vector, topic id included"}
-  ]},
-  {"family":"deleteAcls/hand","route":"hand","evidenceKind":"hand","disposition":"retain","reason":"hand-kept bytes v1; no golden stands on it"},
-  {"family":"deleteAcls/java","route":"javaVectors/GenerateMessageVectors.java","evidenceKind":"java-vector","disposition":"retain","reason":"Java vectors v2, v3; goldens stand on it","goldens":[
-    {"direction":"request","versions":[3],"test":"encodes the Apache 4.3.1 %s vector byte for byte"},
-    {"direction":"response","versions":[3],"test":"decodes the Apache 4.3.1 %s vector"}
-  ]},
-  {"family":"deleteGroups/java","route":"javaVectors/GenerateMessageVectors.java","evidenceKind":"java-vector","disposition":"retain","reason":"Java vectors v2; goldens stand on it","goldens":[
-    {"direction":"request","versions":[2],"test":"encodes the Apache 4.3.1 basic vector byte for byte"},
-    {"direction":"response","versions":[2],"test":"decodes the Apache 4.3.1 ok vector, the throttle time as a number"}
-  ]},
-  {"family":"deleteRecords/hand","route":"hand","evidenceKind":"hand","disposition":"retain","reason":"hand-kept bytes v0; no golden stands on it"},
-  {"family":"deleteRecords/java","route":"javaVectors/GenerateMessageVectors.java","evidenceKind":"java-vector","disposition":"retain","reason":"Java vectors v2; goldens stand on it","goldens":[
-    {"direction":"request","versions":[2],"test":"encodes the Apache 4.3.1 basic vector byte for byte, offsets as int64"},
-    {"direction":"response","versions":[2],"test":"decodes the Apache 4.3.1 %s vector"}
-  ]},
-  {"family":"deleteTopics/hand","route":"hand","evidenceKind":"hand","disposition":"retain","reason":"hand-kept bytes v1; no golden stands on it"},
-  {"family":"deleteTopics/java","route":"javaVectors/GenerateMessageVectors.java","evidenceKind":"java-vector","disposition":"retain","reason":"Java vectors v2, v3, v4, v5, v6; goldens stand on it","goldens":[
-    {"direction":"request","versions":[6],"test":"encodes the Apache 4.3.1 byName vector byte for byte"},
-    {"direction":"response","versions":[6],"test":"decodes the Apache 4.3.1 %s vector with its topic id, topics sorted by name"}
-  ]},
-  {"family":"describeAcls/hand","route":"hand","evidenceKind":"hand","disposition":"retain","reason":"hand-kept bytes v1; no golden stands on it"},
-  {"family":"describeAcls/java","route":"javaVectors/GenerateMessageVectors.java","evidenceKind":"java-vector","disposition":"retain","reason":"Java vectors v2, v3; goldens stand on it","goldens":[
-    {"direction":"request","versions":[3],"test":"encodes the Apache 4.3.1 %s vector byte for byte"},
-    {"direction":"response","versions":[3],"test":"decodes the Apache 4.3.1 %s vector"}
-  ]},
-  {"family":"describeConfigs/hand","route":"hand","evidenceKind":"hand","disposition":"retain","reason":"hand-kept bytes v1; no golden stands on it"},
-  {"family":"describeConfigs/java","route":"javaVectors/GenerateMessageVectors.java","evidenceKind":"java-vector","disposition":"retain","reason":"Java vectors v3, v4; goldens stand on it","goldens":[
-    {"direction":"request","versions":[4],"test":"encodes the Apache 4.3.1 %s vector byte for byte"},
-    {"direction":"response","versions":[4],"test":"decodes the Apache 4.3.1 entries vector, new fields and derived isDefault included"}
-  ]},
-  {"family":"describeGroups/hand","route":"hand","evidenceKind":"hand","disposition":"retain","reason":"hand-kept bytes v0, v1; no golden stands on it"},
-  {"family":"describeGroups/java","route":"javaVectors/GenerateMessageVectors.java","evidenceKind":"java-vector","disposition":"retain","reason":"Java vectors v3, v4, v5, v6; goldens stand on it","goldens":[
-    {"direction":"request","versions":[6],"test":"encodes the oneGroup vector byte-identically to the Apache 4.3.1 codec"},
-    {"direction":"response","versions":[6],"test":"decodes the describedGroup vector the Apache 4.3.1 codec produced"}
-  ]},
-  {"family":"describeTopicPartitions/java","route":"javaVectors/GenerateMessageVectors.java","evidenceKind":"java-vector","disposition":"retain","reason":"Java vectors v0; goldens stand on it","goldens":[
-    {"direction":"request","versions":[0],"test":"encodes the Apache 4.3.1 %s vector byte for byte"},
-    {"direction":"response","versions":[0],"test":"decodes the Apache 4.3.1 %s vector"}
-  ]},
-  {"family":"endTxn/hand","route":"hand","evidenceKind":"hand","disposition":"retain","reason":"hand-kept bytes v0; no golden stands on it"},
-  {"family":"endTxn/java","route":"javaVectors/GenerateMessageVectors.java","evidenceKind":"java-vector","disposition":"retain","reason":"Java vectors v2, v3, v4, v5; goldens stand on it","goldens":[
-    {"direction":"request","versions":[4],"test":"encodes the Apache 4.3.1 %s vector byte for byte"},
-    {"direction":"response","versions":[4],"test":"decodes the Apache 4.3.1 %s vector into the v1 shape"},
-    {"direction":"request","versions":[5],"test":"encodes the Apache 4.3.1 %s vector byte for byte"},
-    {"direction":"response","versions":[5],"test":"decodes the Apache 4.3.1 %s vector, producer id and epoch included"}
-  ]},
-  {"family":"fetch/capture","route":"capture.js","evidenceKind":"capture","disposition":"retain","reason":"broker captures v18; no golden stands on it"},
-  {"family":"fetch/hand","route":"hand","evidenceKind":"hand","disposition":"retain","reason":"hand-kept bytes v4, v5, v6, v7, v8, v9, v10, v11, v12, v13, v15, v16; no golden stands on it"},
-  {"family":"fetch/java","route":"javaVectors/GenerateMessageVectors.java","evidenceKind":"java-vector","disposition":"retain","reason":"Independent Fetch session, sparse, forgotten and close/error vectors v12-v18; literal fields and bytes are asserted in src/consumer/assigners/__tests__/javaVectors.spec.js and each response is delivered whole and in 200 seeded splits through the real connection and broker in src/consumer/__tests__/fetchChunking.spec.js; codec goldens remain with fetch/javaBuffer"},
-  {"family":"fetch/javaBuffer","route":"javaVectors/GenerateVectors.java","evidenceKind":"java-vector","disposition":"retain","reason":"Java vector bytes v12, v13, v14, v15, v16, v17, v18; goldens stand on it","goldens":[
-    {"direction":"request","versions":[12],"test":"encodes byte-identically to the vector Apache own codec produced"},
-    {"direction":"response","versions":[12],"test":"decodes the vector Apache own codec produced"},
-    {"direction":"request","versions":[17],"test":"encodes byte-identically to the vector Apache own codec produced"},
-    {"direction":"response","versions":[17],"test":"decodes the vector Apache own codec produced"},
-    {"direction":"request","versions":[18],"test":"encodes byte-identically to the vector Apache own codec produced"},
-    {"direction":"response","versions":[18],"test":"decodes the vector Apache own codec produced"}
-  ]},
-  {"family":"findCoordinator/capture","route":"capture.js","evidenceKind":"capture","disposition":"retain","reason":"broker captures v6; no golden stands on it"},
-  {"family":"findCoordinator/hand","route":"hand","evidenceKind":"hand","disposition":"retain","reason":"hand-kept bytes v0, v1, v3, v4; no golden stands on it"},
-  {"family":"findCoordinator/javaBuffer","route":"javaVectors/GenerateVectors.java","evidenceKind":"java-vector","disposition":"retain","reason":"Java vector bytes v3, v4, v5, v6; goldens stand on it","goldens":[
-    {"direction":"request","versions":[6],"test":"encodes byte-identically to the Apache kafka-clients 4.3.1 codec"},
-    {"direction":"response","versions":[6],"test":"decodes the vector the Apache kafka-clients 4.3.1 codec produced"}
-  ]},
-  {"family":"heartbeat/hand","route":"hand","evidenceKind":"hand","disposition":"retain","reason":"hand-kept bytes v0, v1, v2, v3; no golden stands on it"},
-  {"family":"heartbeat/java","route":"javaVectors/GenerateMessageVectors.java","evidenceKind":"java-vector","disposition":"retain","reason":"Java vectors v4; goldens stand on it","goldens":[
-    {"direction":"request","versions":[4],"test":"encodes the Apache 4.3.1 %s vector byte for byte","spec":"groupRequests.spec.js"},
-    {"direction":"response","versions":[4],"test":"decodes the Apache 4.3.1 %s vector","spec":"groupResponses.spec.js"}
-  ]},
-  {"family":"incrementalAlterConfigs/java","route":"javaVectors/GenerateMessageVectors.java","evidenceKind":"java-vector","disposition":"retain","reason":"Java vectors v0, v1; goldens stand on it","goldens":[
-    {"direction":"request","versions":[1],"test":"encodes the Apache 4.3.1 %s vector byte for byte"},
-    {"direction":"response","versions":[1],"test":"decodes the Apache 4.3.1 %s vector"}
-  ]},
-  {"family":"initProducerId/capture","route":"capture.js","evidenceKind":"capture","disposition":"retain","reason":"broker captures v5; no golden stands on it"},
-  {"family":"initProducerId/hand","route":"hand","evidenceKind":"hand","disposition":"retain","reason":"hand-kept bytes v0, v2; no golden stands on it"},
-  {"family":"initProducerId/java","route":"javaVectors/GenerateMessageVectors.java","evidenceKind":"java-vector","disposition":"retain","reason":"Java vectors v3, v4, v5; goldens stand on it","goldens":[
-    {"direction":"request","versions":[5],"test":"encodes the Apache 4.3.1 %s vector byte for byte"}
-  ]},
-  {"family":"initProducerId/javaBuffer","route":"javaVectors/GenerateVectors.java","evidenceKind":"java-vector","disposition":"retain","reason":"Java vector bytes v2, v3, v4, v5; goldens stand on it","goldens":[
-    {"direction":"response","versions":[5],"test":"decodes the vector the Apache kafka-clients 4.3.1 codec produced"}
-  ]},
-  {"family":"joinGroup/hand","route":"hand","evidenceKind":"hand","disposition":"retain","reason":"hand-kept bytes v0, v1, v2, v5; no golden stands on it"},
-  {"family":"joinGroup/java","route":"javaVectors/GenerateMessageVectors.java","evidenceKind":"java-vector","disposition":"retain","reason":"Java vectors v6, v7, v8; goldens stand on it","goldens":[
-    {"direction":"request","versions":[8],"test":"encodes the Apache 4.3.1 %s vector byte for byte","spec":"groupRequests.spec.js"},
-    {"direction":"response","versions":[8],"test":"decodes the Apache 4.3.1 %s vector","spec":"groupResponses.spec.js"}
-  ]},
-  {"family":"leaveGroup/hand","route":"hand","evidenceKind":"hand","disposition":"retain","reason":"hand-kept bytes v0, v1, v2, v3; no golden stands on it"},
-  {"family":"leaveGroup/java","route":"javaVectors/GenerateMessageVectors.java","evidenceKind":"java-vector","disposition":"retain","reason":"Java vectors v4, v5; goldens stand on it","goldens":[
-    {"direction":"request","versions":[5],"test":"encodes the Apache 4.3.1 %s vector byte for byte","spec":"groupRequests.spec.js"},
-    {"direction":"response","versions":[5],"test":"decodes the Apache 4.3.1 %s vector","spec":"groupResponses.spec.js"}
-  ]},
-  {"family":"listGroups/java","route":"javaVectors/GenerateMessageVectors.java","evidenceKind":"java-vector","disposition":"retain","reason":"Java vectors v3, v4, v5; goldens stand on it","goldens":[
-    {"direction":"request","versions":[5],"test":"encodes the %s vector byte-identically to the Apache 4.3.1 codec"},
-    {"direction":"response","versions":[5],"test":"decodes the groups vector the Apache 4.3.1 codec produced"}
-  ]},
-  {"family":"listOffsets/capture","route":"capture.js","evidenceKind":"capture","disposition":"retain","reason":"broker captures v9; no golden stands on it"},
-  {"family":"listOffsets/hand","route":"hand","evidenceKind":"hand","disposition":"retain","reason":"hand-kept bytes v1, v2, v4, v6; no golden stands on it"},
-  {"family":"listOffsets/javaBuffer","route":"javaVectors/GenerateVectors.java","evidenceKind":"java-vector","disposition":"retain","reason":"Java vector bytes v4, v5, v6, v7, v8, v9; goldens stand on it","goldens":[
-    {"direction":"request","versions":[9],"test":"encodes byte-identically to the Apache kafka-clients 4.3.1 codec"},
-    {"direction":"response","versions":[9],"test":"decodes the vector the Apache kafka-clients 4.3.1 codec produced"}
-  ]},
-  {"family":"listPartitionReassignments/capture","route":"capture.js","evidenceKind":"capture","disposition":"retain","reason":"broker captures v0; goldens stand on it","goldens":[
-    {"direction":"request","versions":[0],"test":"encodes to match a captured Kafka 4.3.1 request"},
-    {"direction":"response","versions":[0],"test":"decodes a captured Kafka 4.3.1 response"}
-  ]},
-  {"family":"listPartitionReassignments/hand","route":"hand","evidenceKind":"hand","disposition":"retain","reason":"hand-kept bytes v0; no golden stands on it"},
-  {"family":"metadata/capture","route":"capture.js","evidenceKind":"capture","disposition":"retain","reason":"broker captures v12, v13; no golden stands on it"},
-  {"family":"metadata/hand","route":"hand","evidenceKind":"hand","disposition":"retain","reason":"hand-kept bytes v3, v4, v5, v7, v8, v9, v12, v13; no golden stands on it"},
-  {"family":"metadata/javaBuffer","route":"javaVectors/GenerateVectors.java","evidenceKind":"java-vector","disposition":"retain","reason":"Java vector bytes v9, v10, v11, v12, v13; goldens stand on it","goldens":[
-    {"direction":"request","versions":[13],"test":"encodes byte-identically to the Apache kafka-clients 4.3.1 codec"},
-    {"direction":"response","versions":[13],"test":"decodes the vector the Apache kafka-clients 4.3.1 codec produced"}
-  ]},
-  {"family":"offsetCommit/capture","route":"capture.js","evidenceKind":"capture","disposition":"retain","reason":"broker captures v8; no golden stands on it"},
-  {"family":"offsetCommit/hand","route":"hand","evidenceKind":"hand","disposition":"retain","reason":"hand-kept bytes v2, v3, v4, v5, v6, v8; no golden stands on it"},
-  {"family":"offsetCommit/java","route":"javaVectors/GenerateMessageVectors.java","evidenceKind":"java-vector","disposition":"retain","reason":"Java vectors v9, v10; goldens stand on it","goldens":[
-    {"direction":"request","versions":[9],"test":"encodes the vector byte-identically to the Apache 4.3.1 codec"},
-    {"direction":"response","versions":[9],"test":"decodes the vector the Apache 4.3.1 codec produced into the v8 shape"},
-    {"direction":"request","versions":[10],"test":"encodes the by-topic-id vector byte-identically to the Apache 4.3.1 codec"},
-    {"direction":"response","versions":[10],"test":"decodes the ok vector into the v8 shape, naming the topic from the request map"}
-  ]},
-  {"family":"offsetCommit/javaBuffer","route":"javaVectors/GenerateVectors.java","evidenceKind":"java-vector","disposition":"retain","reason":"Java vector bytes v6, v7, v8; no golden stands on it"},
-  {"family":"offsetFetch/capture","route":"capture.js","evidenceKind":"capture","disposition":"retain","reason":"broker captures v8; no golden stands on it"},
-  {"family":"offsetFetch/hand","route":"hand","evidenceKind":"hand","disposition":"retain","reason":"hand-kept bytes v1, v2, v3, v5, v8; no golden stands on it"},
-  {"family":"offsetFetch/java","route":"javaVectors/GenerateMessageVectors.java","evidenceKind":"java-vector","disposition":"retain","reason":"Java vectors v7, v8, v9, v10; goldens stand on it","goldens":[
-    {"direction":"request","versions":[9],"test":"encodes the Apache 4.3.1 %s vector byte for byte"},
-    {"direction":"response","versions":[9],"test":"decodes the vector the Apache 4.3.1 codec produced into the v8 shape"},
-    {"direction":"request","versions":[10],"test":"encodes the by-topic-id vector byte-identically to the Apache 4.3.1 codec"},
-    {"direction":"response","versions":[10],"test":"decodes the ok vector into the v8 shape, naming the topic from the request map"}
-  ]},
-  {"family":"offsetFetch/javaBuffer","route":"javaVectors/GenerateVectors.java","evidenceKind":"java-vector","disposition":"retain","reason":"Java vector bytes v5, v6, v7, v8; no golden stands on it"},
-  {"family":"offsetForLeaderEpoch/hand","route":"hand","evidenceKind":"hand","disposition":"retain","reason":"hand-kept bytes v3, v4; no golden stands on it"},
-  {"family":"offsetForLeaderEpoch/javaBuffer","route":"javaVectors/GenerateVectors.java","evidenceKind":"java-vector","disposition":"retain","reason":"Java vector bytes v3, v4; goldens stand on it","goldens":[
-    {"direction":"request","versions":[4],"test":"encodes byte-identically to the vector Apache own codec produced"},
-    {"direction":"response","versions":[4],"test":"decodes the vector Apache own codec produced"}
-  ]},
-  {"family":"produce/capture","route":"capture.js","evidenceKind":"capture","disposition":"retain","reason":"broker captures v11, v13; no golden stands on it"},
-  {"family":"produce/java","route":"javaVectors/GenerateMessageVectors.java produce","evidenceKind":"java-vector","disposition":"retain","reason":"fixed-record Produce v11/v12 request bodies; independent builder and reader assertions in testHelpers/__tests__/wire.spec.js"},
-  {"family":"produce/hand","route":"hand","evidenceKind":"hand","disposition":"retain","reason":"hand-kept bytes v3, v4, v5, v6, v7, v8, v9, v10, v11, v12, v13; goldens stand on it","goldens":[
-    {"direction":"request","versions":[11],"test":"encodes the hand-computed golden byte for byte"},
-    {"direction":"request","versions":[12],"test":"encodes the hand-computed golden byte for byte"},
-    {"direction":"request","versions":[13],"test":"encodes the hand-computed golden byte for byte"}
-  ]},
-  {"family":"produce/javaBuffer","route":"javaVectors/GenerateVectors.java","evidenceKind":"java-vector","disposition":"retain","reason":"Java vector bytes v8, v9, v10, v11, v12, v13; goldens stand on it","goldens":[
-    {"direction":"response","versions":[11],"test":"decodes the vector the Apache kafka-clients 4.3.1 codec produced"},
-    {"direction":"response","versions":[12],"test":"decodes the vector Apache own codec produced"},
-    {"direction":"response","versions":[13],"test":"decodes the vector Apache own codec produced"}
-  ]},
-  {"family":"saslAuthenticate/hand","route":"hand","evidenceKind":"hand","disposition":"retain","reason":"hand-kept bytes v0, v1, v2; no golden stands on it"},
-  {"family":"saslAuthenticate/javaBuffer","route":"javaVectors/GenerateVectors.java","evidenceKind":"java-vector","disposition":"retain","reason":"Java vector bytes v2; goldens stand on it","goldens":[
-    {"direction":"request","versions":[2],"test":"encodes byte-identically to the vector Apache own codec produced"},
-    {"direction":"response","versions":[2],"test":"decodes the vector Apache own codec produced"}
-  ]},
-  {"family":"saslHandshake/hand","route":"hand","evidenceKind":"hand","disposition":"retain","reason":"hand-kept bytes v1; goldens stand on it","goldens":[
-    {"direction":"request","versions":[1],"test":"encodes the hand-computed golden byte for byte"},
-    {"direction":"response","versions":[1],"test":"decodes the hand-computed golden"}
-  ]},
-  {"family":"syncGroup/hand","route":"hand","evidenceKind":"hand","disposition":"retain","reason":"hand-kept bytes v0, v1, v2, v3; no golden stands on it"},
-  {"family":"syncGroup/java","route":"javaVectors/GenerateMessageVectors.java","evidenceKind":"java-vector","disposition":"retain","reason":"Java vectors v4, v5; goldens stand on it","goldens":[
-    {"direction":"request","versions":[4,5],"test":"encodes the Apache 4.3.1 %s vector byte for byte","spec":"groupRequests.spec.js"},
-    {"direction":"response","versions":[4,5],"test":"decodes the Apache 4.3.1 %s vector","spec":"groupResponses.spec.js"}
-  ]},
-  {"family":"txnOffsetCommit/hand","route":"hand","evidenceKind":"hand","disposition":"retain","reason":"hand-kept bytes v0; no golden stands on it"},
-  {"family":"txnOffsetCommit/java","route":"javaVectors/GenerateMessageVectors.java","evidenceKind":"java-vector","disposition":"retain","reason":"Java vectors v2, v3, v4, v5; goldens stand on it","goldens":[
-    {"direction":"request","versions":[4],"test":"encodes the Apache 4.3.1 %s vector byte for byte"},
-    {"direction":"response","versions":[4],"test":"decodes the Apache 4.3.1 %s vector into the v1 shape"},
-    {"direction":"request","versions":[5],"test":"encodes the Apache 4.3.1 %s vector byte for byte"},
-    {"direction":"response","versions":[5],"test":"decodes the Apache 4.3.1 %s vector into the v1 shape"}
-  ]},
-  {"family":"recordBatch/zstd","route":"unknown: its origin is not recorded","evidenceKind":"hand","disposition":"remove","removed":"src/protocol/recordBatch/fixtures/v0_recordbatch_zstd.json","reason":"no spec read it, it decoded with attributes 0 and a Java reader once rejected its CRC; ZSTD batches are covered by the producer compression round trip and the live ZSTD produce case"},
-  {"family":"offsetDelete/java","route":"javaVectors/GenerateMessageVectors.java","evidenceKind":"java-vector","disposition":"retain","reason":"Java OffsetDelete v0 request and response vectors","goldens":[{"direction":"request","versions":[0],"spec":"offsetDelete/v0/codec.spec.js","test":"encodes the Java request and decodes its mixed response"},{"direction":"response","versions":[0],"spec":"offsetDelete/v0/codec.spec.js","test":"encodes the Java request and decodes its mixed response"}]},
-{
-  "family": "describeProducers/java",
-  "route": "javaVectors/GenerateMessageVectors.java",
-  "evidenceKind": "java-vector",
-  "disposition": "retain",
-  "reason": "Apache generated codecs, independently compared before registration",
-  "goldens": [
-    {
-      "direction": "request",
-      "versions": [0],
-      "spec": "describeProducers/describeProducers.spec.js",
-      "test": "Java vectors independently match every prescribed case"
-    },
-    {
-      "direction": "response",
-      "versions": [0],
-      "spec": "describeProducers/describeProducers.spec.js",
-      "test": "Java vectors independently match every prescribed case"
-    }
-  ]
-},
-{
-  "family": "describeTransactions/java",
-  "route": "javaVectors/GenerateMessageVectors.java",
-  "evidenceKind": "java-vector",
-  "disposition": "retain",
-  "reason": "Apache generated codecs, independently compared before registration",
-  "goldens": [
-    {
-      "direction": "request",
-      "versions": [0],
-      "spec": "describeTransactions/describeTransactions.spec.js",
-      "test": "Java vectors independently match every prescribed case"
-    },
-    {
-      "direction": "response",
-      "versions": [0],
-      "spec": "describeTransactions/describeTransactions.spec.js",
-      "test": "Java vectors independently match every prescribed case"
-    }
-  ]
-},
-{
-  "family": "listTransactions/java",
-  "route": "javaVectors/GenerateMessageVectors.java",
-  "evidenceKind": "java-vector",
-  "disposition": "retain",
-  "reason": "Apache generated codecs, independently compared before registration",
-  "goldens": [
-    {
-      "direction": "request",
-      "versions": [0, 1, 2],
-      "spec": "listTransactions/listTransactions.spec.js",
-      "test": "Java vectors independently match every prescribed case"
-    },
-    {
-      "direction": "response",
-      "versions": [0, 1, 2],
-      "spec": "listTransactions/listTransactions.spec.js",
-      "test": "Java vectors independently match every prescribed case"
-    }
-  ]
-},
-{
-  "family": "writeTxnMarkers/java",
-  "route": "javaVectors/GenerateMessageVectors.java",
-  "evidenceKind": "java-vector",
-  "disposition": "retain",
-  "reason": "Apache generated codecs, independently compared before registration",
-  "goldens": [
-    {
-      "direction": "request",
-      "versions": [1, 2],
-      "spec": "writeTxnMarkers/writeTxnMarkers.spec.js",
-      "test": "Java vectors independently match every prescribed case"
-    },
-    {
-      "direction": "response",
-      "versions": [1, 2],
-      "spec": "writeTxnMarkers/writeTxnMarkers.spec.js",
-      "test": "Java vectors independently match every prescribed case"
-    }
-  ]
-}
+  {
+    "family": "addOffsetsToTxn/hand",
+    "route": "hand",
+    "evidenceKind": "hand",
+    "disposition": "retain",
+    "reason": "hand-kept bytes v0; no golden stands on it"
+  },
+  {
+    "family": "addOffsetsToTxn/java",
+    "route": "javaVectors/GenerateMessageVectors.java",
+    "evidenceKind": "java-vector",
+    "disposition": "retain",
+    "reason": "Java vectors v2, v3, v4; goldens stand on it",
+    "goldens": [
+      {
+        "direction": "request",
+        "versions": [
+          4
+        ],
+        "test": "encodes the Apache 4.3.1 vector byte for byte"
+      },
+      {
+        "direction": "response",
+        "versions": [
+          4
+        ],
+        "test": "decodes the Apache 4.3.1 %s vector into the v1 shape"
+      }
+    ]
+  },
+  {
+    "family": "addPartitionsToTxn/hand",
+    "route": "hand",
+    "evidenceKind": "hand",
+    "disposition": "retain",
+    "reason": "hand-kept bytes v0; no golden stands on it"
+  },
+  {
+    "family": "addPartitionsToTxn/java",
+    "route": "javaVectors/GenerateMessageVectors.java",
+    "evidenceKind": "java-vector",
+    "disposition": "retain",
+    "reason": "Java vectors v2, v3; goldens stand on it",
+    "goldens": [
+      {
+        "direction": "request",
+        "versions": [
+          3
+        ],
+        "test": "encodes the Apache 4.3.1 vector byte for byte"
+      },
+      {
+        "direction": "response",
+        "versions": [
+          3
+        ],
+        "test": "decodes the Apache 4.3.1 %s vector into the v1 shape"
+      }
+    ]
+  },
+  {
+    "family": "alterClientQuotas/java",
+    "route": "javaVectors/GenerateMessageVectors.java",
+    "evidenceKind": "java-vector",
+    "disposition": "retain",
+    "reason": "Apache Kafka 4.3.1 generated security administration vectors",
+    "goldens": [
+      {
+        "direction": "request",
+        "versions": [
+          0,
+          1
+        ],
+        "test": "Java v%s request and response goldens",
+        "spec": "alterClientQuotas/codec.spec.js"
+      },
+      {
+        "direction": "response",
+        "versions": [
+          0,
+          1
+        ],
+        "test": "Java v%s request and response goldens",
+        "spec": "alterClientQuotas/codec.spec.js"
+      }
+    ]
+  },
+  {
+    "family": "alterConfigs/hand",
+    "route": "hand",
+    "evidenceKind": "hand",
+    "disposition": "retain",
+    "reason": "hand-kept bytes v0; no golden stands on it"
+  },
+  {
+    "family": "alterConfigs/java",
+    "route": "javaVectors/GenerateMessageVectors.java",
+    "evidenceKind": "java-vector",
+    "disposition": "retain",
+    "reason": "Java vectors v2; goldens stand on it",
+    "goldens": [
+      {
+        "direction": "request",
+        "versions": [
+          2
+        ],
+        "test": "encodes the Apache 4.3.1 %s vector byte for byte"
+      },
+      {
+        "direction": "response",
+        "versions": [
+          2
+        ],
+        "test": "decodes the Apache 4.3.1 %s vector"
+      }
+    ]
+  },
+  {
+    "family": "alterPartitionReassignments/capture",
+    "route": "capture.js",
+    "evidenceKind": "capture",
+    "disposition": "retain",
+    "reason": "broker captures v0; goldens stand on it",
+    "goldens": [
+      {
+        "direction": "request",
+        "versions": [
+          0
+        ],
+        "test": "encodes to match a captured Kafka 4.3.1 request"
+      },
+      {
+        "direction": "response",
+        "versions": [
+          0
+        ],
+        "test": "decodes a captured Kafka 4.3.1 response"
+      }
+    ]
+  },
+  {
+    "family": "alterPartitionReassignments/hand",
+    "route": "hand",
+    "evidenceKind": "hand",
+    "disposition": "retain",
+    "reason": "hand-kept bytes v0; no golden stands on it"
+  },
+  {
+    "family": "alterUserScramCredentials/java",
+    "route": "javaVectors/GenerateMessageVectors.java",
+    "evidenceKind": "java-vector",
+    "disposition": "retain",
+    "reason": "Apache Kafka 4.3.1 generated security administration vectors",
+    "goldens": [
+      {
+        "direction": "request",
+        "versions": [
+          0
+        ],
+        "test": "Java v%s request and response goldens",
+        "spec": "alterUserScramCredentials/codec.spec.js"
+      },
+      {
+        "direction": "response",
+        "versions": [
+          0
+        ],
+        "test": "Java v%s request and response goldens",
+        "spec": "alterUserScramCredentials/codec.spec.js"
+      }
+    ]
+  },
+  {
+    "family": "apiVersions/capture",
+    "route": "capture.js",
+    "evidenceKind": "capture",
+    "disposition": "retain",
+    "reason": "broker captures v4; no golden stands on it"
+  },
+  {
+    "family": "apiVersions/hand",
+    "route": "hand",
+    "evidenceKind": "hand",
+    "disposition": "retain",
+    "reason": "hand-kept bytes v0, v1, v3, v4; no golden stands on it"
+  },
+  {
+    "family": "apiVersions/javaBuffer",
+    "route": "javaVectors/GenerateVectors.java",
+    "evidenceKind": "java-vector",
+    "disposition": "retain",
+    "reason": "Java vector bytes v3, v4; goldens stand on it",
+    "goldens": [
+      {
+        "direction": "request",
+        "versions": [
+          4
+        ],
+        "test": "matches the vector produced by the Apache kafka-clients 4.3.1 codec"
+      },
+      {
+        "direction": "response",
+        "versions": [
+          4
+        ],
+        "test": "decodes the vector produced by the Apache kafka-clients 4.3.1 codec"
+      }
+    ]
+  },
+  {
+    "family": "consumerGroupDescribe/java",
+    "route": "javaVectors/GenerateMessageVectors.java",
+    "evidenceKind": "java-vector",
+    "disposition": "retain",
+    "reason": "Java vectors v0, v1; goldens stand on it",
+    "goldens": [
+      {
+        "direction": "request",
+        "versions": [
+          1
+        ],
+        "test": "encodes the %s vector byte-identically to the Apache 4.3.1 codec"
+      },
+      {
+        "direction": "response",
+        "versions": [
+          1
+        ],
+        "test": "decodes the memberType vector the Apache 4.3.1 codec produced"
+      }
+    ]
+  },
+  {
+    "family": "consumerGroupHeartbeat/java",
+    "route": "javaVectors/GenerateMessageVectors.java",
+    "evidenceKind": "java-vector",
+    "disposition": "retain",
+    "reason": "Java vectors v0, v1; goldens stand on it",
+    "goldens": [
+      {
+        "direction": "request",
+        "versions": [
+          1
+        ],
+        "test": "encodes the %s vector byte-identically to the Apache 4.3.1 codec"
+      },
+      {
+        "direction": "response",
+        "versions": [
+          1
+        ],
+        "test": "decodes the %s vector the Apache 4.3.1 codec produced"
+      }
+    ]
+  },
+  {
+    "family": "createAcls/hand",
+    "route": "hand",
+    "evidenceKind": "hand",
+    "disposition": "retain",
+    "reason": "hand-kept bytes v1; no golden stands on it"
+  },
+  {
+    "family": "createAcls/java",
+    "route": "javaVectors/GenerateMessageVectors.java",
+    "evidenceKind": "java-vector",
+    "disposition": "retain",
+    "reason": "Java vectors v2, v3; goldens stand on it",
+    "goldens": [
+      {
+        "direction": "request",
+        "versions": [
+          3
+        ],
+        "test": "encodes the Apache 4.3.1 %s vector byte for byte"
+      },
+      {
+        "direction": "response",
+        "versions": [
+          3
+        ],
+        "test": "decodes the Apache 4.3.1 %s vector"
+      }
+    ]
+  },
+  {
+    "family": "createDelegationToken/java",
+    "route": "javaVectors/GenerateMessageVectors.java",
+    "evidenceKind": "java-vector",
+    "disposition": "retain",
+    "reason": "Apache Kafka 4.3.1 generated security administration vectors",
+    "goldens": [
+      {
+        "direction": "request",
+        "versions": [
+          1,
+          2,
+          3
+        ],
+        "test": "Java v%s request and response goldens",
+        "spec": "createDelegationToken/codec.spec.js"
+      },
+      {
+        "direction": "response",
+        "versions": [
+          1,
+          2,
+          3
+        ],
+        "test": "Java v%s request and response goldens",
+        "spec": "createDelegationToken/codec.spec.js"
+      }
+    ]
+  },
+  {
+    "family": "createPartitions/hand",
+    "route": "hand",
+    "evidenceKind": "hand",
+    "disposition": "retain",
+    "reason": "hand-kept bytes v0, v1; no golden stands on it"
+  },
+  {
+    "family": "createPartitions/java",
+    "route": "javaVectors/GenerateMessageVectors.java",
+    "evidenceKind": "java-vector",
+    "disposition": "retain",
+    "reason": "Java vectors v2, v3; goldens stand on it",
+    "goldens": [
+      {
+        "direction": "request",
+        "versions": [
+          3
+        ],
+        "test": "encodes the Apache 4.3.1 %s vector byte for byte"
+      },
+      {
+        "direction": "response",
+        "versions": [
+          3
+        ],
+        "test": "decodes the Apache 4.3.1 %s vector"
+      }
+    ]
+  },
+  {
+    "family": "createTopics/hand",
+    "route": "hand",
+    "evidenceKind": "hand",
+    "disposition": "retain",
+    "reason": "hand-kept bytes v2; no golden stands on it"
+  },
+  {
+    "family": "createTopics/java",
+    "route": "javaVectors/GenerateMessageVectors.java",
+    "evidenceKind": "java-vector",
+    "disposition": "retain",
+    "reason": "Java vectors v4, v5, v6, v7; goldens stand on it",
+    "goldens": [
+      {
+        "direction": "request",
+        "versions": [
+          7
+        ],
+        "test": "encodes the Apache 4.3.1 %s vector byte for byte"
+      },
+      {
+        "direction": "response",
+        "versions": [
+          7
+        ],
+        "test": "decodes the Apache 4.3.1 %s vector, topic id included"
+      }
+    ]
+  },
+  {
+    "family": "deleteAcls/hand",
+    "route": "hand",
+    "evidenceKind": "hand",
+    "disposition": "retain",
+    "reason": "hand-kept bytes v1; no golden stands on it"
+  },
+  {
+    "family": "deleteAcls/java",
+    "route": "javaVectors/GenerateMessageVectors.java",
+    "evidenceKind": "java-vector",
+    "disposition": "retain",
+    "reason": "Java vectors v2, v3; goldens stand on it",
+    "goldens": [
+      {
+        "direction": "request",
+        "versions": [
+          3
+        ],
+        "test": "encodes the Apache 4.3.1 %s vector byte for byte"
+      },
+      {
+        "direction": "response",
+        "versions": [
+          3
+        ],
+        "test": "decodes the Apache 4.3.1 %s vector"
+      }
+    ]
+  },
+  {
+    "family": "deleteGroups/java",
+    "route": "javaVectors/GenerateMessageVectors.java",
+    "evidenceKind": "java-vector",
+    "disposition": "retain",
+    "reason": "Java vectors v2; goldens stand on it",
+    "goldens": [
+      {
+        "direction": "request",
+        "versions": [
+          2
+        ],
+        "test": "encodes the Apache 4.3.1 basic vector byte for byte"
+      },
+      {
+        "direction": "response",
+        "versions": [
+          2
+        ],
+        "test": "decodes the Apache 4.3.1 ok vector, the throttle time as a number"
+      }
+    ]
+  },
+  {
+    "family": "deleteRecords/hand",
+    "route": "hand",
+    "evidenceKind": "hand",
+    "disposition": "retain",
+    "reason": "hand-kept bytes v0; no golden stands on it"
+  },
+  {
+    "family": "deleteRecords/java",
+    "route": "javaVectors/GenerateMessageVectors.java",
+    "evidenceKind": "java-vector",
+    "disposition": "retain",
+    "reason": "Java vectors v2; goldens stand on it",
+    "goldens": [
+      {
+        "direction": "request",
+        "versions": [
+          2
+        ],
+        "test": "encodes the Apache 4.3.1 basic vector byte for byte, offsets as int64"
+      },
+      {
+        "direction": "response",
+        "versions": [
+          2
+        ],
+        "test": "decodes the Apache 4.3.1 %s vector"
+      }
+    ]
+  },
+  {
+    "family": "deleteTopics/hand",
+    "route": "hand",
+    "evidenceKind": "hand",
+    "disposition": "retain",
+    "reason": "hand-kept bytes v1; no golden stands on it"
+  },
+  {
+    "family": "deleteTopics/java",
+    "route": "javaVectors/GenerateMessageVectors.java",
+    "evidenceKind": "java-vector",
+    "disposition": "retain",
+    "reason": "Java vectors v2, v3, v4, v5, v6; goldens stand on it",
+    "goldens": [
+      {
+        "direction": "request",
+        "versions": [
+          6
+        ],
+        "test": "encodes the Apache 4.3.1 byName vector byte for byte"
+      },
+      {
+        "direction": "response",
+        "versions": [
+          6
+        ],
+        "test": "decodes the Apache 4.3.1 %s vector with its topic id, topics sorted by name"
+      }
+    ]
+  },
+  {
+    "family": "describeAcls/hand",
+    "route": "hand",
+    "evidenceKind": "hand",
+    "disposition": "retain",
+    "reason": "hand-kept bytes v1; no golden stands on it"
+  },
+  {
+    "family": "describeAcls/java",
+    "route": "javaVectors/GenerateMessageVectors.java",
+    "evidenceKind": "java-vector",
+    "disposition": "retain",
+    "reason": "Java vectors v2, v3; goldens stand on it",
+    "goldens": [
+      {
+        "direction": "request",
+        "versions": [
+          3
+        ],
+        "test": "encodes the Apache 4.3.1 %s vector byte for byte"
+      },
+      {
+        "direction": "response",
+        "versions": [
+          3
+        ],
+        "test": "decodes the Apache 4.3.1 %s vector"
+      }
+    ]
+  },
+  {
+    "family": "describeClientQuotas/java",
+    "route": "javaVectors/GenerateMessageVectors.java",
+    "evidenceKind": "java-vector",
+    "disposition": "retain",
+    "reason": "Apache Kafka 4.3.1 generated security administration vectors",
+    "goldens": [
+      {
+        "direction": "request",
+        "versions": [
+          0,
+          1
+        ],
+        "test": "Java v%s request and response goldens",
+        "spec": "describeClientQuotas/codec.spec.js"
+      },
+      {
+        "direction": "response",
+        "versions": [
+          0,
+          1
+        ],
+        "test": "Java v%s request and response goldens",
+        "spec": "describeClientQuotas/codec.spec.js"
+      }
+    ]
+  },
+  {
+    "family": "describeConfigs/hand",
+    "route": "hand",
+    "evidenceKind": "hand",
+    "disposition": "retain",
+    "reason": "hand-kept bytes v1; no golden stands on it"
+  },
+  {
+    "family": "describeConfigs/java",
+    "route": "javaVectors/GenerateMessageVectors.java",
+    "evidenceKind": "java-vector",
+    "disposition": "retain",
+    "reason": "Java vectors v3, v4; goldens stand on it",
+    "goldens": [
+      {
+        "direction": "request",
+        "versions": [
+          4
+        ],
+        "test": "encodes the Apache 4.3.1 %s vector byte for byte"
+      },
+      {
+        "direction": "response",
+        "versions": [
+          4
+        ],
+        "test": "decodes the Apache 4.3.1 entries vector, new fields and derived isDefault included"
+      }
+    ]
+  },
+  {
+    "family": "describeDelegationToken/java",
+    "route": "javaVectors/GenerateMessageVectors.java",
+    "evidenceKind": "java-vector",
+    "disposition": "retain",
+    "reason": "Apache Kafka 4.3.1 generated security administration vectors",
+    "goldens": [
+      {
+        "direction": "request",
+        "versions": [
+          1,
+          2,
+          3
+        ],
+        "test": "Java v%s request and response goldens",
+        "spec": "describeDelegationToken/codec.spec.js"
+      },
+      {
+        "direction": "response",
+        "versions": [
+          1,
+          2,
+          3
+        ],
+        "test": "Java v%s request and response goldens",
+        "spec": "describeDelegationToken/codec.spec.js"
+      }
+    ]
+  },
+  {
+    "family": "describeGroups/hand",
+    "route": "hand",
+    "evidenceKind": "hand",
+    "disposition": "retain",
+    "reason": "hand-kept bytes v0, v1; no golden stands on it"
+  },
+  {
+    "family": "describeGroups/java",
+    "route": "javaVectors/GenerateMessageVectors.java",
+    "evidenceKind": "java-vector",
+    "disposition": "retain",
+    "reason": "Java vectors v3, v4, v5, v6; goldens stand on it",
+    "goldens": [
+      {
+        "direction": "request",
+        "versions": [
+          6
+        ],
+        "test": "encodes the oneGroup vector byte-identically to the Apache 4.3.1 codec"
+      },
+      {
+        "direction": "response",
+        "versions": [
+          6
+        ],
+        "test": "decodes the describedGroup vector the Apache 4.3.1 codec produced"
+      }
+    ]
+  },
+  {
+    "family": "describeProducers/java",
+    "route": "javaVectors/GenerateMessageVectors.java",
+    "evidenceKind": "java-vector",
+    "disposition": "retain",
+    "reason": "Apache generated codecs, independently compared before registration",
+    "goldens": [
+      {
+        "direction": "request",
+        "versions": [
+          0
+        ],
+        "spec": "describeProducers/describeProducers.spec.js",
+        "test": "Java vectors independently match every prescribed case"
+      },
+      {
+        "direction": "response",
+        "versions": [
+          0
+        ],
+        "spec": "describeProducers/describeProducers.spec.js",
+        "test": "Java vectors independently match every prescribed case"
+      }
+    ]
+  },
+  {
+    "family": "describeTopicPartitions/java",
+    "route": "javaVectors/GenerateMessageVectors.java",
+    "evidenceKind": "java-vector",
+    "disposition": "retain",
+    "reason": "Java vectors v0; goldens stand on it",
+    "goldens": [
+      {
+        "direction": "request",
+        "versions": [
+          0
+        ],
+        "test": "encodes the Apache 4.3.1 %s vector byte for byte"
+      },
+      {
+        "direction": "response",
+        "versions": [
+          0
+        ],
+        "test": "decodes the Apache 4.3.1 %s vector"
+      }
+    ]
+  },
+  {
+    "family": "describeTransactions/java",
+    "route": "javaVectors/GenerateMessageVectors.java",
+    "evidenceKind": "java-vector",
+    "disposition": "retain",
+    "reason": "Apache generated codecs, independently compared before registration",
+    "goldens": [
+      {
+        "direction": "request",
+        "versions": [
+          0
+        ],
+        "spec": "describeTransactions/describeTransactions.spec.js",
+        "test": "Java vectors independently match every prescribed case"
+      },
+      {
+        "direction": "response",
+        "versions": [
+          0
+        ],
+        "spec": "describeTransactions/describeTransactions.spec.js",
+        "test": "Java vectors independently match every prescribed case"
+      }
+    ]
+  },
+  {
+    "family": "describeUserScramCredentials/java",
+    "route": "javaVectors/GenerateMessageVectors.java",
+    "evidenceKind": "java-vector",
+    "disposition": "retain",
+    "reason": "Apache Kafka 4.3.1 generated security administration vectors",
+    "goldens": [
+      {
+        "direction": "request",
+        "versions": [
+          0
+        ],
+        "test": "Java v%s request and response goldens",
+        "spec": "describeUserScramCredentials/codec.spec.js"
+      },
+      {
+        "direction": "response",
+        "versions": [
+          0
+        ],
+        "test": "Java v%s request and response goldens",
+        "spec": "describeUserScramCredentials/codec.spec.js"
+      }
+    ]
+  },
+  {
+    "family": "endTxn/hand",
+    "route": "hand",
+    "evidenceKind": "hand",
+    "disposition": "retain",
+    "reason": "hand-kept bytes v0; no golden stands on it"
+  },
+  {
+    "family": "endTxn/java",
+    "route": "javaVectors/GenerateMessageVectors.java",
+    "evidenceKind": "java-vector",
+    "disposition": "retain",
+    "reason": "Java vectors v2, v3, v4, v5; goldens stand on it",
+    "goldens": [
+      {
+        "direction": "request",
+        "versions": [
+          4
+        ],
+        "test": "encodes the Apache 4.3.1 %s vector byte for byte"
+      },
+      {
+        "direction": "response",
+        "versions": [
+          4
+        ],
+        "test": "decodes the Apache 4.3.1 %s vector into the v1 shape"
+      },
+      {
+        "direction": "request",
+        "versions": [
+          5
+        ],
+        "test": "encodes the Apache 4.3.1 %s vector byte for byte"
+      },
+      {
+        "direction": "response",
+        "versions": [
+          5
+        ],
+        "test": "decodes the Apache 4.3.1 %s vector, producer id and epoch included"
+      }
+    ]
+  },
+  {
+    "family": "expireDelegationToken/java",
+    "route": "javaVectors/GenerateMessageVectors.java",
+    "evidenceKind": "java-vector",
+    "disposition": "retain",
+    "reason": "Apache Kafka 4.3.1 generated security administration vectors",
+    "goldens": [
+      {
+        "direction": "request",
+        "versions": [
+          1,
+          2
+        ],
+        "test": "Java v%s request and response goldens",
+        "spec": "expireDelegationToken/codec.spec.js"
+      },
+      {
+        "direction": "response",
+        "versions": [
+          1,
+          2
+        ],
+        "test": "Java v%s request and response goldens",
+        "spec": "expireDelegationToken/codec.spec.js"
+      }
+    ]
+  },
+  {
+    "family": "fetch/capture",
+    "route": "capture.js",
+    "evidenceKind": "capture",
+    "disposition": "retain",
+    "reason": "broker captures v18; no golden stands on it"
+  },
+  {
+    "family": "fetch/hand",
+    "route": "hand",
+    "evidenceKind": "hand",
+    "disposition": "retain",
+    "reason": "hand-kept bytes v4, v5, v6, v7, v8, v9, v10, v11, v12, v13, v15, v16; no golden stands on it"
+  },
+  {
+    "family": "fetch/java",
+    "route": "javaVectors/GenerateMessageVectors.java",
+    "evidenceKind": "java-vector",
+    "disposition": "retain",
+    "reason": "Independent Fetch session, sparse, forgotten and close/error vectors v12-v18; literal fields and bytes are asserted in src/consumer/assigners/__tests__/javaVectors.spec.js and each response is delivered whole and in 200 seeded splits through the real connection and broker in src/consumer/__tests__/fetchChunking.spec.js; codec goldens remain with fetch/javaBuffer"
+  },
+  {
+    "family": "fetch/javaBuffer",
+    "route": "javaVectors/GenerateVectors.java",
+    "evidenceKind": "java-vector",
+    "disposition": "retain",
+    "reason": "Java vector bytes v12, v13, v14, v15, v16, v17, v18; goldens stand on it",
+    "goldens": [
+      {
+        "direction": "request",
+        "versions": [
+          12
+        ],
+        "test": "encodes byte-identically to the vector Apache own codec produced"
+      },
+      {
+        "direction": "response",
+        "versions": [
+          12
+        ],
+        "test": "decodes the vector Apache own codec produced"
+      },
+      {
+        "direction": "request",
+        "versions": [
+          17
+        ],
+        "test": "encodes byte-identically to the vector Apache own codec produced"
+      },
+      {
+        "direction": "response",
+        "versions": [
+          17
+        ],
+        "test": "decodes the vector Apache own codec produced"
+      },
+      {
+        "direction": "request",
+        "versions": [
+          18
+        ],
+        "test": "encodes byte-identically to the vector Apache own codec produced"
+      },
+      {
+        "direction": "response",
+        "versions": [
+          18
+        ],
+        "test": "decodes the vector Apache own codec produced"
+      }
+    ]
+  },
+  {
+    "family": "findCoordinator/capture",
+    "route": "capture.js",
+    "evidenceKind": "capture",
+    "disposition": "retain",
+    "reason": "broker captures v6; no golden stands on it"
+  },
+  {
+    "family": "findCoordinator/hand",
+    "route": "hand",
+    "evidenceKind": "hand",
+    "disposition": "retain",
+    "reason": "hand-kept bytes v0, v1, v3, v4; no golden stands on it"
+  },
+  {
+    "family": "findCoordinator/javaBuffer",
+    "route": "javaVectors/GenerateVectors.java",
+    "evidenceKind": "java-vector",
+    "disposition": "retain",
+    "reason": "Java vector bytes v3, v4, v5, v6; goldens stand on it",
+    "goldens": [
+      {
+        "direction": "request",
+        "versions": [
+          6
+        ],
+        "test": "encodes byte-identically to the Apache kafka-clients 4.3.1 codec"
+      },
+      {
+        "direction": "response",
+        "versions": [
+          6
+        ],
+        "test": "decodes the vector the Apache kafka-clients 4.3.1 codec produced"
+      }
+    ]
+  },
+  {
+    "family": "heartbeat/hand",
+    "route": "hand",
+    "evidenceKind": "hand",
+    "disposition": "retain",
+    "reason": "hand-kept bytes v0, v1, v2, v3; no golden stands on it"
+  },
+  {
+    "family": "heartbeat/java",
+    "route": "javaVectors/GenerateMessageVectors.java",
+    "evidenceKind": "java-vector",
+    "disposition": "retain",
+    "reason": "Java vectors v4; goldens stand on it",
+    "goldens": [
+      {
+        "direction": "request",
+        "versions": [
+          4
+        ],
+        "test": "encodes the Apache 4.3.1 %s vector byte for byte",
+        "spec": "groupRequests.spec.js"
+      },
+      {
+        "direction": "response",
+        "versions": [
+          4
+        ],
+        "test": "decodes the Apache 4.3.1 %s vector",
+        "spec": "groupResponses.spec.js"
+      }
+    ]
+  },
+  {
+    "family": "incrementalAlterConfigs/java",
+    "route": "javaVectors/GenerateMessageVectors.java",
+    "evidenceKind": "java-vector",
+    "disposition": "retain",
+    "reason": "Java vectors v0, v1; goldens stand on it",
+    "goldens": [
+      {
+        "direction": "request",
+        "versions": [
+          1
+        ],
+        "test": "encodes the Apache 4.3.1 %s vector byte for byte"
+      },
+      {
+        "direction": "response",
+        "versions": [
+          1
+        ],
+        "test": "decodes the Apache 4.3.1 %s vector"
+      }
+    ]
+  },
+  {
+    "family": "initProducerId/capture",
+    "route": "capture.js",
+    "evidenceKind": "capture",
+    "disposition": "retain",
+    "reason": "broker captures v5; no golden stands on it"
+  },
+  {
+    "family": "initProducerId/hand",
+    "route": "hand",
+    "evidenceKind": "hand",
+    "disposition": "retain",
+    "reason": "hand-kept bytes v0, v2; no golden stands on it"
+  },
+  {
+    "family": "initProducerId/java",
+    "route": "javaVectors/GenerateMessageVectors.java",
+    "evidenceKind": "java-vector",
+    "disposition": "retain",
+    "reason": "Java vectors v3, v4, v5; goldens stand on it",
+    "goldens": [
+      {
+        "direction": "request",
+        "versions": [
+          5
+        ],
+        "test": "encodes the Apache 4.3.1 %s vector byte for byte"
+      }
+    ]
+  },
+  {
+    "family": "initProducerId/javaBuffer",
+    "route": "javaVectors/GenerateVectors.java",
+    "evidenceKind": "java-vector",
+    "disposition": "retain",
+    "reason": "Java vector bytes v2, v3, v4, v5; goldens stand on it",
+    "goldens": [
+      {
+        "direction": "response",
+        "versions": [
+          5
+        ],
+        "test": "decodes the vector the Apache kafka-clients 4.3.1 codec produced"
+      }
+    ]
+  },
+  {
+    "family": "joinGroup/hand",
+    "route": "hand",
+    "evidenceKind": "hand",
+    "disposition": "retain",
+    "reason": "hand-kept bytes v0, v1, v2, v5; no golden stands on it"
+  },
+  {
+    "family": "joinGroup/java",
+    "route": "javaVectors/GenerateMessageVectors.java",
+    "evidenceKind": "java-vector",
+    "disposition": "retain",
+    "reason": "Java vectors v6, v7, v8; goldens stand on it",
+    "goldens": [
+      {
+        "direction": "request",
+        "versions": [
+          8
+        ],
+        "test": "encodes the Apache 4.3.1 %s vector byte for byte",
+        "spec": "groupRequests.spec.js"
+      },
+      {
+        "direction": "response",
+        "versions": [
+          8
+        ],
+        "test": "decodes the Apache 4.3.1 %s vector",
+        "spec": "groupResponses.spec.js"
+      }
+    ]
+  },
+  {
+    "family": "leaveGroup/hand",
+    "route": "hand",
+    "evidenceKind": "hand",
+    "disposition": "retain",
+    "reason": "hand-kept bytes v0, v1, v2, v3; no golden stands on it"
+  },
+  {
+    "family": "leaveGroup/java",
+    "route": "javaVectors/GenerateMessageVectors.java",
+    "evidenceKind": "java-vector",
+    "disposition": "retain",
+    "reason": "Java vectors v4, v5; goldens stand on it",
+    "goldens": [
+      {
+        "direction": "request",
+        "versions": [
+          5
+        ],
+        "test": "encodes the Apache 4.3.1 %s vector byte for byte",
+        "spec": "groupRequests.spec.js"
+      },
+      {
+        "direction": "response",
+        "versions": [
+          5
+        ],
+        "test": "decodes the Apache 4.3.1 %s vector",
+        "spec": "groupResponses.spec.js"
+      }
+    ]
+  },
+  {
+    "family": "listGroups/java",
+    "route": "javaVectors/GenerateMessageVectors.java",
+    "evidenceKind": "java-vector",
+    "disposition": "retain",
+    "reason": "Java vectors v3, v4, v5; goldens stand on it",
+    "goldens": [
+      {
+        "direction": "request",
+        "versions": [
+          5
+        ],
+        "test": "encodes the %s vector byte-identically to the Apache 4.3.1 codec"
+      },
+      {
+        "direction": "response",
+        "versions": [
+          5
+        ],
+        "test": "decodes the groups vector the Apache 4.3.1 codec produced"
+      }
+    ]
+  },
+  {
+    "family": "listOffsets/capture",
+    "route": "capture.js",
+    "evidenceKind": "capture",
+    "disposition": "retain",
+    "reason": "broker captures v9; no golden stands on it"
+  },
+  {
+    "family": "listOffsets/hand",
+    "route": "hand",
+    "evidenceKind": "hand",
+    "disposition": "retain",
+    "reason": "hand-kept bytes v1, v2, v4, v6; no golden stands on it"
+  },
+  {
+    "family": "listOffsets/javaBuffer",
+    "route": "javaVectors/GenerateVectors.java",
+    "evidenceKind": "java-vector",
+    "disposition": "retain",
+    "reason": "Java vector bytes v4, v5, v6, v7, v8, v9; goldens stand on it",
+    "goldens": [
+      {
+        "direction": "request",
+        "versions": [
+          9
+        ],
+        "test": "encodes byte-identically to the Apache kafka-clients 4.3.1 codec"
+      },
+      {
+        "direction": "response",
+        "versions": [
+          9
+        ],
+        "test": "decodes the vector the Apache kafka-clients 4.3.1 codec produced"
+      }
+    ]
+  },
+  {
+    "family": "listPartitionReassignments/capture",
+    "route": "capture.js",
+    "evidenceKind": "capture",
+    "disposition": "retain",
+    "reason": "broker captures v0; goldens stand on it",
+    "goldens": [
+      {
+        "direction": "request",
+        "versions": [
+          0
+        ],
+        "test": "encodes to match a captured Kafka 4.3.1 request"
+      },
+      {
+        "direction": "response",
+        "versions": [
+          0
+        ],
+        "test": "decodes a captured Kafka 4.3.1 response"
+      }
+    ]
+  },
+  {
+    "family": "listPartitionReassignments/hand",
+    "route": "hand",
+    "evidenceKind": "hand",
+    "disposition": "retain",
+    "reason": "hand-kept bytes v0; no golden stands on it"
+  },
+  {
+    "family": "listTransactions/java",
+    "route": "javaVectors/GenerateMessageVectors.java",
+    "evidenceKind": "java-vector",
+    "disposition": "retain",
+    "reason": "Apache generated codecs, independently compared before registration",
+    "goldens": [
+      {
+        "direction": "request",
+        "versions": [
+          0,
+          1,
+          2
+        ],
+        "spec": "listTransactions/listTransactions.spec.js",
+        "test": "Java vectors independently match every prescribed case"
+      },
+      {
+        "direction": "response",
+        "versions": [
+          0,
+          1,
+          2
+        ],
+        "spec": "listTransactions/listTransactions.spec.js",
+        "test": "Java vectors independently match every prescribed case"
+      }
+    ]
+  },
+  {
+    "family": "metadata/capture",
+    "route": "capture.js",
+    "evidenceKind": "capture",
+    "disposition": "retain",
+    "reason": "broker captures v12, v13; no golden stands on it"
+  },
+  {
+    "family": "metadata/hand",
+    "route": "hand",
+    "evidenceKind": "hand",
+    "disposition": "retain",
+    "reason": "hand-kept bytes v3, v4, v5, v7, v8, v9, v12, v13; no golden stands on it"
+  },
+  {
+    "family": "metadata/javaBuffer",
+    "route": "javaVectors/GenerateVectors.java",
+    "evidenceKind": "java-vector",
+    "disposition": "retain",
+    "reason": "Java vector bytes v9, v10, v11, v12, v13; goldens stand on it",
+    "goldens": [
+      {
+        "direction": "request",
+        "versions": [
+          13
+        ],
+        "test": "encodes byte-identically to the Apache kafka-clients 4.3.1 codec"
+      },
+      {
+        "direction": "response",
+        "versions": [
+          13
+        ],
+        "test": "decodes the vector the Apache kafka-clients 4.3.1 codec produced"
+      }
+    ]
+  },
+  {
+    "family": "offsetCommit/capture",
+    "route": "capture.js",
+    "evidenceKind": "capture",
+    "disposition": "retain",
+    "reason": "broker captures v8; no golden stands on it"
+  },
+  {
+    "family": "offsetCommit/hand",
+    "route": "hand",
+    "evidenceKind": "hand",
+    "disposition": "retain",
+    "reason": "hand-kept bytes v2, v3, v4, v5, v6, v8; no golden stands on it"
+  },
+  {
+    "family": "offsetCommit/java",
+    "route": "javaVectors/GenerateMessageVectors.java",
+    "evidenceKind": "java-vector",
+    "disposition": "retain",
+    "reason": "Java vectors v9, v10; goldens stand on it",
+    "goldens": [
+      {
+        "direction": "request",
+        "versions": [
+          9
+        ],
+        "test": "encodes the vector byte-identically to the Apache 4.3.1 codec"
+      },
+      {
+        "direction": "response",
+        "versions": [
+          9
+        ],
+        "test": "decodes the vector the Apache 4.3.1 codec produced into the v8 shape"
+      },
+      {
+        "direction": "request",
+        "versions": [
+          10
+        ],
+        "test": "encodes the by-topic-id vector byte-identically to the Apache 4.3.1 codec"
+      },
+      {
+        "direction": "response",
+        "versions": [
+          10
+        ],
+        "test": "decodes the ok vector into the v8 shape, naming the topic from the request map"
+      }
+    ]
+  },
+  {
+    "family": "offsetCommit/javaBuffer",
+    "route": "javaVectors/GenerateVectors.java",
+    "evidenceKind": "java-vector",
+    "disposition": "retain",
+    "reason": "Java vector bytes v6, v7, v8; no golden stands on it"
+  },
+  {
+    "family": "offsetDelete/java",
+    "route": "javaVectors/GenerateMessageVectors.java",
+    "evidenceKind": "java-vector",
+    "disposition": "retain",
+    "reason": "Java OffsetDelete v0 request and response vectors",
+    "goldens": [
+      {
+        "direction": "request",
+        "versions": [
+          0
+        ],
+        "spec": "offsetDelete/v0/codec.spec.js",
+        "test": "encodes the Java request and decodes its mixed response"
+      },
+      {
+        "direction": "response",
+        "versions": [
+          0
+        ],
+        "spec": "offsetDelete/v0/codec.spec.js",
+        "test": "encodes the Java request and decodes its mixed response"
+      }
+    ]
+  },
+  {
+    "family": "offsetFetch/capture",
+    "route": "capture.js",
+    "evidenceKind": "capture",
+    "disposition": "retain",
+    "reason": "broker captures v8; no golden stands on it"
+  },
+  {
+    "family": "offsetFetch/hand",
+    "route": "hand",
+    "evidenceKind": "hand",
+    "disposition": "retain",
+    "reason": "hand-kept bytes v1, v2, v3, v5, v8; no golden stands on it"
+  },
+  {
+    "family": "offsetFetch/java",
+    "route": "javaVectors/GenerateMessageVectors.java",
+    "evidenceKind": "java-vector",
+    "disposition": "retain",
+    "reason": "Java vectors v7, v8, v9, v10; goldens stand on it",
+    "goldens": [
+      {
+        "direction": "request",
+        "versions": [
+          9
+        ],
+        "test": "encodes the Apache 4.3.1 %s vector byte for byte"
+      },
+      {
+        "direction": "response",
+        "versions": [
+          9
+        ],
+        "test": "decodes the vector the Apache 4.3.1 codec produced into the v8 shape"
+      },
+      {
+        "direction": "request",
+        "versions": [
+          10
+        ],
+        "test": "encodes the by-topic-id vector byte-identically to the Apache 4.3.1 codec"
+      },
+      {
+        "direction": "response",
+        "versions": [
+          10
+        ],
+        "test": "decodes the ok vector into the v8 shape, naming the topic from the request map"
+      }
+    ]
+  },
+  {
+    "family": "offsetFetch/javaBuffer",
+    "route": "javaVectors/GenerateVectors.java",
+    "evidenceKind": "java-vector",
+    "disposition": "retain",
+    "reason": "Java vector bytes v5, v6, v7, v8; no golden stands on it"
+  },
+  {
+    "family": "offsetForLeaderEpoch/hand",
+    "route": "hand",
+    "evidenceKind": "hand",
+    "disposition": "retain",
+    "reason": "hand-kept bytes v3, v4; no golden stands on it"
+  },
+  {
+    "family": "offsetForLeaderEpoch/javaBuffer",
+    "route": "javaVectors/GenerateVectors.java",
+    "evidenceKind": "java-vector",
+    "disposition": "retain",
+    "reason": "Java vector bytes v3, v4; goldens stand on it",
+    "goldens": [
+      {
+        "direction": "request",
+        "versions": [
+          4
+        ],
+        "test": "encodes byte-identically to the vector Apache own codec produced"
+      },
+      {
+        "direction": "response",
+        "versions": [
+          4
+        ],
+        "test": "decodes the vector Apache own codec produced"
+      }
+    ]
+  },
+  {
+    "family": "produce/capture",
+    "route": "capture.js",
+    "evidenceKind": "capture",
+    "disposition": "retain",
+    "reason": "broker captures v11, v13; no golden stands on it"
+  },
+  {
+    "family": "produce/hand",
+    "route": "hand",
+    "evidenceKind": "hand",
+    "disposition": "retain",
+    "reason": "hand-kept bytes v3, v4, v5, v6, v7, v8, v9, v10, v11, v12, v13; goldens stand on it",
+    "goldens": [
+      {
+        "direction": "request",
+        "versions": [
+          11
+        ],
+        "test": "encodes the hand-computed golden byte for byte"
+      },
+      {
+        "direction": "request",
+        "versions": [
+          12
+        ],
+        "test": "encodes the hand-computed golden byte for byte"
+      },
+      {
+        "direction": "request",
+        "versions": [
+          13
+        ],
+        "test": "encodes the hand-computed golden byte for byte"
+      }
+    ]
+  },
+  {
+    "family": "produce/java",
+    "route": "javaVectors/GenerateMessageVectors.java produce",
+    "evidenceKind": "java-vector",
+    "disposition": "retain",
+    "reason": "fixed-record Produce v11/v12 request bodies; independent builder and reader assertions in testHelpers/__tests__/wire.spec.js"
+  },
+  {
+    "family": "produce/javaBuffer",
+    "route": "javaVectors/GenerateVectors.java",
+    "evidenceKind": "java-vector",
+    "disposition": "retain",
+    "reason": "Java vector bytes v8, v9, v10, v11, v12, v13; goldens stand on it",
+    "goldens": [
+      {
+        "direction": "response",
+        "versions": [
+          11
+        ],
+        "test": "decodes the vector the Apache kafka-clients 4.3.1 codec produced"
+      },
+      {
+        "direction": "response",
+        "versions": [
+          12
+        ],
+        "test": "decodes the vector Apache own codec produced"
+      },
+      {
+        "direction": "response",
+        "versions": [
+          13
+        ],
+        "test": "decodes the vector Apache own codec produced"
+      }
+    ]
+  },
+  {
+    "family": "recordBatch/zstd",
+    "route": "unknown: its origin is not recorded",
+    "evidenceKind": "hand",
+    "disposition": "remove",
+    "removed": "src/protocol/recordBatch/fixtures/v0_recordbatch_zstd.json",
+    "reason": "no spec read it, it decoded with attributes 0 and a Java reader once rejected its CRC; ZSTD batches are covered by the producer compression round trip and the live ZSTD produce case"
+  },
+  {
+    "family": "renewDelegationToken/java",
+    "route": "javaVectors/GenerateMessageVectors.java",
+    "evidenceKind": "java-vector",
+    "disposition": "retain",
+    "reason": "Apache Kafka 4.3.1 generated security administration vectors",
+    "goldens": [
+      {
+        "direction": "request",
+        "versions": [
+          1,
+          2
+        ],
+        "test": "Java v%s request and response goldens",
+        "spec": "renewDelegationToken/codec.spec.js"
+      },
+      {
+        "direction": "response",
+        "versions": [
+          1,
+          2
+        ],
+        "test": "Java v%s request and response goldens",
+        "spec": "renewDelegationToken/codec.spec.js"
+      }
+    ]
+  },
+  {
+    "family": "saslAuthenticate/hand",
+    "route": "hand",
+    "evidenceKind": "hand",
+    "disposition": "retain",
+    "reason": "hand-kept bytes v0, v1, v2; no golden stands on it"
+  },
+  {
+    "family": "saslAuthenticate/javaBuffer",
+    "route": "javaVectors/GenerateVectors.java",
+    "evidenceKind": "java-vector",
+    "disposition": "retain",
+    "reason": "Java vector bytes v2; goldens stand on it",
+    "goldens": [
+      {
+        "direction": "request",
+        "versions": [
+          2
+        ],
+        "test": "encodes byte-identically to the vector Apache own codec produced"
+      },
+      {
+        "direction": "response",
+        "versions": [
+          2
+        ],
+        "test": "decodes the vector Apache own codec produced"
+      }
+    ]
+  },
+  {
+    "family": "saslHandshake/hand",
+    "route": "hand",
+    "evidenceKind": "hand",
+    "disposition": "retain",
+    "reason": "hand-kept bytes v1; goldens stand on it",
+    "goldens": [
+      {
+        "direction": "request",
+        "versions": [
+          1
+        ],
+        "test": "encodes the hand-computed golden byte for byte"
+      },
+      {
+        "direction": "response",
+        "versions": [
+          1
+        ],
+        "test": "decodes the hand-computed golden"
+      }
+    ]
+  },
+  {
+    "family": "syncGroup/hand",
+    "route": "hand",
+    "evidenceKind": "hand",
+    "disposition": "retain",
+    "reason": "hand-kept bytes v0, v1, v2, v3; no golden stands on it"
+  },
+  {
+    "family": "syncGroup/java",
+    "route": "javaVectors/GenerateMessageVectors.java",
+    "evidenceKind": "java-vector",
+    "disposition": "retain",
+    "reason": "Java vectors v4, v5; goldens stand on it",
+    "goldens": [
+      {
+        "direction": "request",
+        "versions": [
+          4,
+          5
+        ],
+        "test": "encodes the Apache 4.3.1 %s vector byte for byte",
+        "spec": "groupRequests.spec.js"
+      },
+      {
+        "direction": "response",
+        "versions": [
+          4,
+          5
+        ],
+        "test": "decodes the Apache 4.3.1 %s vector",
+        "spec": "groupResponses.spec.js"
+      }
+    ]
+  },
+  {
+    "family": "txnOffsetCommit/hand",
+    "route": "hand",
+    "evidenceKind": "hand",
+    "disposition": "retain",
+    "reason": "hand-kept bytes v0; no golden stands on it"
+  },
+  {
+    "family": "txnOffsetCommit/java",
+    "route": "javaVectors/GenerateMessageVectors.java",
+    "evidenceKind": "java-vector",
+    "disposition": "retain",
+    "reason": "Java vectors v2, v3, v4, v5; goldens stand on it",
+    "goldens": [
+      {
+        "direction": "request",
+        "versions": [
+          4
+        ],
+        "test": "encodes the Apache 4.3.1 %s vector byte for byte"
+      },
+      {
+        "direction": "response",
+        "versions": [
+          4
+        ],
+        "test": "decodes the Apache 4.3.1 %s vector into the v1 shape"
+      },
+      {
+        "direction": "request",
+        "versions": [
+          5
+        ],
+        "test": "encodes the Apache 4.3.1 %s vector byte for byte"
+      },
+      {
+        "direction": "response",
+        "versions": [
+          5
+        ],
+        "test": "decodes the Apache 4.3.1 %s vector into the v1 shape"
+      }
+    ]
+  },
+  {
+    "family": "writeTxnMarkers/java",
+    "route": "javaVectors/GenerateMessageVectors.java",
+    "evidenceKind": "java-vector",
+    "disposition": "retain",
+    "reason": "Apache generated codecs, independently compared before registration",
+    "goldens": [
+      {
+        "direction": "request",
+        "versions": [
+          1,
+          2
+        ],
+        "spec": "writeTxnMarkers/writeTxnMarkers.spec.js",
+        "test": "Java vectors independently match every prescribed case"
+      },
+      {
+        "direction": "response",
+        "versions": [
+          1,
+          2
+        ],
+        "spec": "writeTxnMarkers/writeTxnMarkers.spec.js",
+        "test": "Java vectors independently match every prescribed case"
+      }
+    ]
+  }
 ]

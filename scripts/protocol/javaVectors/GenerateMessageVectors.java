@@ -287,6 +287,7 @@ public final class GenerateMessageVectors {
       written++;
     }
 
+    scramHiVectors(outputDir);
     System.out.println("vectors: " + written);
   }
 
@@ -570,6 +571,8 @@ return vectors;
     vectors.addAll(syncGroup());
     vectors.addAll(heartbeat());
     vectors.addAll(leaveGroup());
+    vectors.addAll(quotaScramAdmin());
+    vectors.addAll(delegationTokenAdmin());
     vectors.addAll(offsetCommitByTopicId());
     vectors.addAll(offsetFetchByTopicId());
     return vectors;
@@ -4276,4 +4279,348 @@ return vectors;
   private static String array(String... values) {
     return "[" + String.join(", ", values) + "]";
   }
+  /** Fixed synthetic vectors serialized by Apache Kafka.
+   * @return one request and response per implemented version
+   */
+  private static List<Vector> quotaScramAdmin() {
+    List<Vector> vectors = new ArrayList<>();
+    vectors.add(new Vector("describeClientQuotas", "DescribeClientQuotasRequest", (short) 0, "security",
+      new org.apache.kafka.common.message.DescribeClientQuotasRequestData()
+        .setComponents(List.of(new org.apache.kafka.common.message.DescribeClientQuotasRequestData.ComponentData()
+        .setEntityType("user")
+        .setMatchType((byte) 0)
+        .setMatch("test-user")))
+        .setStrict(false),
+      "{\"components\":[{\"entityType\":\"user\",\"matchType\":0,\"match\":\"test-user\"}],\"strict\":false}"));
+    vectors.add(new Vector("describeClientQuotas", "DescribeClientQuotasResponse", (short) 0, "security",
+      new org.apache.kafka.common.message.DescribeClientQuotasResponseData()
+        .setThrottleTimeMs(0)
+        .setErrorCode((short) 0)
+        .setErrorMessage(null)
+        .setEntries(List.of(new org.apache.kafka.common.message.DescribeClientQuotasResponseData.EntryData()
+        .setEntity(List.of(new org.apache.kafka.common.message.DescribeClientQuotasResponseData.EntityData()
+        .setEntityType("user")
+        .setEntityName(null)))
+        .setValues(List.of(new org.apache.kafka.common.message.DescribeClientQuotasResponseData.ValueData()
+        .setKey("producer_byte_rate")
+        .setValue(1234.5d))))),
+      "{\"throttleTimeMs\":0,\"errorCode\":0,\"errorMessage\":null,\"entries\":[{\"entity\":[{\"entityType\":\"user\",\"entityName\":null}],\"values\":[{\"key\":\"producer_byte_rate\",\"value\":1234.5}]}]}"));
+    vectors.add(new Vector("describeClientQuotas", "DescribeClientQuotasRequest", (short) 1, "security",
+      new org.apache.kafka.common.message.DescribeClientQuotasRequestData()
+        .setComponents(List.of(new org.apache.kafka.common.message.DescribeClientQuotasRequestData.ComponentData()
+        .setEntityType("user")
+        .setMatchType((byte) 0)
+        .setMatch("test-user")))
+        .setStrict(false),
+      "{\"components\":[{\"entityType\":\"user\",\"matchType\":0,\"match\":\"test-user\"}],\"strict\":false}"));
+    vectors.add(new Vector("describeClientQuotas", "DescribeClientQuotasResponse", (short) 1, "security",
+      new org.apache.kafka.common.message.DescribeClientQuotasResponseData()
+        .setThrottleTimeMs(0)
+        .setErrorCode((short) 0)
+        .setErrorMessage(null)
+        .setEntries(List.of(new org.apache.kafka.common.message.DescribeClientQuotasResponseData.EntryData()
+        .setEntity(List.of(new org.apache.kafka.common.message.DescribeClientQuotasResponseData.EntityData()
+        .setEntityType("user")
+        .setEntityName(null)))
+        .setValues(List.of(new org.apache.kafka.common.message.DescribeClientQuotasResponseData.ValueData()
+        .setKey("producer_byte_rate")
+        .setValue(1234.5d))))),
+      "{\"throttleTimeMs\":0,\"errorCode\":0,\"errorMessage\":null,\"entries\":[{\"entity\":[{\"entityType\":\"user\",\"entityName\":null}],\"values\":[{\"key\":\"producer_byte_rate\",\"value\":1234.5}]}]}"));
+    vectors.add(new Vector("alterClientQuotas", "AlterClientQuotasRequest", (short) 0, "security",
+      new org.apache.kafka.common.message.AlterClientQuotasRequestData()
+        .setEntries(List.of(new org.apache.kafka.common.message.AlterClientQuotasRequestData.EntryData()
+        .setEntity(List.of(new org.apache.kafka.common.message.AlterClientQuotasRequestData.EntityData()
+        .setEntityType("user")
+        .setEntityName(null)))
+        .setOps(List.of(new org.apache.kafka.common.message.AlterClientQuotasRequestData.OpData()
+        .setKey("producer_byte_rate")
+        .setValue(1234.5d)
+        .setRemove(false)))))
+        .setValidateOnly(true),
+      "{\"entries\":[{\"entity\":[{\"entityType\":\"user\",\"entityName\":null}],\"ops\":[{\"key\":\"producer_byte_rate\",\"value\":1234.5,\"remove\":false}]}],\"validateOnly\":true}"));
+    vectors.add(new Vector("alterClientQuotas", "AlterClientQuotasResponse", (short) 0, "security",
+      new org.apache.kafka.common.message.AlterClientQuotasResponseData()
+        .setThrottleTimeMs(0)
+        .setEntries(List.of(new org.apache.kafka.common.message.AlterClientQuotasResponseData.EntryData()
+        .setErrorCode((short) 0)
+        .setErrorMessage(null)
+        .setEntity(List.of(new org.apache.kafka.common.message.AlterClientQuotasResponseData.EntityData()
+        .setEntityType("user")
+        .setEntityName(null))))),
+      "{\"throttleTimeMs\":0,\"entries\":[{\"errorCode\":0,\"errorMessage\":null,\"entity\":[{\"entityType\":\"user\",\"entityName\":null}]}]}"));
+    vectors.add(new Vector("alterClientQuotas", "AlterClientQuotasRequest", (short) 1, "security",
+      new org.apache.kafka.common.message.AlterClientQuotasRequestData()
+        .setEntries(List.of(new org.apache.kafka.common.message.AlterClientQuotasRequestData.EntryData()
+        .setEntity(List.of(new org.apache.kafka.common.message.AlterClientQuotasRequestData.EntityData()
+        .setEntityType("user")
+        .setEntityName(null)))
+        .setOps(List.of(new org.apache.kafka.common.message.AlterClientQuotasRequestData.OpData()
+        .setKey("producer_byte_rate")
+        .setValue(1234.5d)
+        .setRemove(false)))))
+        .setValidateOnly(true),
+      "{\"entries\":[{\"entity\":[{\"entityType\":\"user\",\"entityName\":null}],\"ops\":[{\"key\":\"producer_byte_rate\",\"value\":1234.5,\"remove\":false}]}],\"validateOnly\":true}"));
+    vectors.add(new Vector("alterClientQuotas", "AlterClientQuotasResponse", (short) 1, "security",
+      new org.apache.kafka.common.message.AlterClientQuotasResponseData()
+        .setThrottleTimeMs(0)
+        .setEntries(List.of(new org.apache.kafka.common.message.AlterClientQuotasResponseData.EntryData()
+        .setErrorCode((short) 0)
+        .setErrorMessage(null)
+        .setEntity(List.of(new org.apache.kafka.common.message.AlterClientQuotasResponseData.EntityData()
+        .setEntityType("user")
+        .setEntityName(null))))),
+      "{\"throttleTimeMs\":0,\"entries\":[{\"errorCode\":0,\"errorMessage\":null,\"entity\":[{\"entityType\":\"user\",\"entityName\":null}]}]}"));
+    vectors.add(new Vector("describeUserScramCredentials", "DescribeUserScramCredentialsRequest", (short) 0, "security",
+      new org.apache.kafka.common.message.DescribeUserScramCredentialsRequestData()
+        .setUsers(List.of(new org.apache.kafka.common.message.DescribeUserScramCredentialsRequestData.UserName()
+        .setName("test-user"))),
+      "{\"users\":[{\"name\":\"test-user\"}]}"));
+    vectors.add(new Vector("describeUserScramCredentials", "DescribeUserScramCredentialsResponse", (short) 0, "security",
+      new org.apache.kafka.common.message.DescribeUserScramCredentialsResponseData()
+        .setThrottleTimeMs(0)
+        .setErrorCode((short) 0)
+        .setErrorMessage(null)
+        .setResults(List.of(new org.apache.kafka.common.message.DescribeUserScramCredentialsResponseData.DescribeUserScramCredentialsResult()
+        .setUser("test-user")
+        .setErrorCode((short) 0)
+        .setErrorMessage(null)
+        .setCredentialInfos(List.of(new org.apache.kafka.common.message.DescribeUserScramCredentialsResponseData.CredentialInfo()
+        .setMechanism((byte) 1)
+        .setIterations(4096))))),
+      "{\"throttleTimeMs\":0,\"errorCode\":0,\"errorMessage\":null,\"results\":[{\"user\":\"test-user\",\"errorCode\":0,\"errorMessage\":null,\"credentialInfos\":[{\"mechanism\":1,\"iterations\":4096}]}]}"));
+    vectors.add(new Vector("alterUserScramCredentials", "AlterUserScramCredentialsRequest", (short) 0, "security",
+      new org.apache.kafka.common.message.AlterUserScramCredentialsRequestData()
+        .setDeletions(List.of(new org.apache.kafka.common.message.AlterUserScramCredentialsRequestData.ScramCredentialDeletion()
+        .setName("test-user")
+        .setMechanism((byte) 1)))
+        .setUpsertions(List.of(new org.apache.kafka.common.message.AlterUserScramCredentialsRequestData.ScramCredentialUpsertion()
+        .setName("test-user")
+        .setMechanism((byte) 1)
+        .setIterations(4096)
+        .setSalt(java.util.HexFormat.of().parseHex("73616c742d6d61726b65722d6f6e6c792d74657374"))
+        .setSaltedPassword(java.util.HexFormat.of().parseHex("646572697665642d6d61726b65722d6f6e6c792d74657374")))),
+      "{\"deletions\":[{\"name\":\"test-user\",\"mechanism\":1}],\"upsertions\":[{\"name\":\"test-user\",\"mechanism\":1,\"iterations\":4096,\"salt\":{\"$bytes\":\"73616c742d6d61726b65722d6f6e6c792d74657374\"},\"saltedPassword\":{\"$bytes\":\"646572697665642d6d61726b65722d6f6e6c792d74657374\"}}]}"));
+    vectors.add(new Vector("alterUserScramCredentials", "AlterUserScramCredentialsResponse", (short) 0, "security",
+      new org.apache.kafka.common.message.AlterUserScramCredentialsResponseData()
+        .setThrottleTimeMs(0)
+        .setResults(List.of(new org.apache.kafka.common.message.AlterUserScramCredentialsResponseData.AlterUserScramCredentialsResult()
+        .setUser("test-user")
+        .setErrorCode((short) 0)
+        .setErrorMessage(null))),
+      "{\"throttleTimeMs\":0,\"results\":[{\"user\":\"test-user\",\"errorCode\":0,\"errorMessage\":null}]}"));
+    return vectors;
+  }
+
+  /** Fixed synthetic vectors serialized by Apache Kafka.
+   * @return one request and response per implemented version
+   */
+  private static List<Vector> delegationTokenAdmin() {
+    List<Vector> vectors = new ArrayList<>();
+    vectors.add(new Vector("createDelegationToken", "CreateDelegationTokenRequest", (short) 1, "security",
+      new org.apache.kafka.common.message.CreateDelegationTokenRequestData()
+        .setRenewers(List.of(new org.apache.kafka.common.message.CreateDelegationTokenRequestData.CreatableRenewers()
+        .setPrincipalType("User")
+        .setPrincipalName("test-owner")))
+        .setMaxLifetimeMs(-1L),
+      "{\"renewers\":[{\"principalType\":\"User\",\"principalName\":\"test-owner\"}],\"maxLifetimeMs\":\"-1\"}"));
+    vectors.add(new Vector("createDelegationToken", "CreateDelegationTokenResponse", (short) 1, "security",
+      new org.apache.kafka.common.message.CreateDelegationTokenResponseData()
+        .setErrorCode((short) 0)
+        .setPrincipalType("User")
+        .setPrincipalName("test-owner")
+        .setIssueTimestampMs(9007199254740993L)
+        .setExpiryTimestampMs(9007199254740993L)
+        .setMaxTimestampMs(9007199254740993L)
+        .setTokenId("token-id")
+        .setHmac(java.util.HexFormat.of().parseHex("686d61632d6d61726b65722d6f6e6c792d74657374"))
+        .setThrottleTimeMs(0),
+      "{\"errorCode\":0,\"principalType\":\"User\",\"principalName\":\"test-owner\",\"issueTimestampMs\":\"9007199254740993\",\"expiryTimestampMs\":\"9007199254740993\",\"maxTimestampMs\":\"9007199254740993\",\"tokenId\":\"token-id\",\"hmac\":{\"$bytes\":\"686d61632d6d61726b65722d6f6e6c792d74657374\"},\"throttleTimeMs\":0}"));
+    vectors.add(new Vector("createDelegationToken", "CreateDelegationTokenRequest", (short) 2, "security",
+      new org.apache.kafka.common.message.CreateDelegationTokenRequestData()
+        .setRenewers(List.of(new org.apache.kafka.common.message.CreateDelegationTokenRequestData.CreatableRenewers()
+        .setPrincipalType("User")
+        .setPrincipalName("test-owner")))
+        .setMaxLifetimeMs(-1L),
+      "{\"renewers\":[{\"principalType\":\"User\",\"principalName\":\"test-owner\"}],\"maxLifetimeMs\":\"-1\"}"));
+    vectors.add(new Vector("createDelegationToken", "CreateDelegationTokenResponse", (short) 2, "security",
+      new org.apache.kafka.common.message.CreateDelegationTokenResponseData()
+        .setErrorCode((short) 0)
+        .setPrincipalType("User")
+        .setPrincipalName("test-owner")
+        .setIssueTimestampMs(9007199254740993L)
+        .setExpiryTimestampMs(9007199254740993L)
+        .setMaxTimestampMs(9007199254740993L)
+        .setTokenId("token-id")
+        .setHmac(java.util.HexFormat.of().parseHex("686d61632d6d61726b65722d6f6e6c792d74657374"))
+        .setThrottleTimeMs(0),
+      "{\"errorCode\":0,\"principalType\":\"User\",\"principalName\":\"test-owner\",\"issueTimestampMs\":\"9007199254740993\",\"expiryTimestampMs\":\"9007199254740993\",\"maxTimestampMs\":\"9007199254740993\",\"tokenId\":\"token-id\",\"hmac\":{\"$bytes\":\"686d61632d6d61726b65722d6f6e6c792d74657374\"},\"throttleTimeMs\":0}"));
+    vectors.add(new Vector("createDelegationToken", "CreateDelegationTokenRequest", (short) 3, "security",
+      new org.apache.kafka.common.message.CreateDelegationTokenRequestData()
+        .setOwnerPrincipalType("User")
+        .setOwnerPrincipalName("test-owner")
+        .setRenewers(List.of(new org.apache.kafka.common.message.CreateDelegationTokenRequestData.CreatableRenewers()
+        .setPrincipalType("User")
+        .setPrincipalName("test-owner")))
+        .setMaxLifetimeMs(-1L),
+      "{\"ownerPrincipalType\":\"User\",\"ownerPrincipalName\":\"test-owner\",\"renewers\":[{\"principalType\":\"User\",\"principalName\":\"test-owner\"}],\"maxLifetimeMs\":\"-1\"}"));
+    vectors.add(new Vector("createDelegationToken", "CreateDelegationTokenResponse", (short) 3, "security",
+      new org.apache.kafka.common.message.CreateDelegationTokenResponseData()
+        .setErrorCode((short) 0)
+        .setPrincipalType("User")
+        .setPrincipalName("test-owner")
+        .setTokenRequesterPrincipalType("User")
+        .setTokenRequesterPrincipalName("test-owner")
+        .setIssueTimestampMs(9007199254740993L)
+        .setExpiryTimestampMs(9007199254740993L)
+        .setMaxTimestampMs(9007199254740993L)
+        .setTokenId("token-id")
+        .setHmac(java.util.HexFormat.of().parseHex("686d61632d6d61726b65722d6f6e6c792d74657374"))
+        .setThrottleTimeMs(0),
+      "{\"errorCode\":0,\"principalType\":\"User\",\"principalName\":\"test-owner\",\"tokenRequesterPrincipalType\":\"User\",\"tokenRequesterPrincipalName\":\"test-owner\",\"issueTimestampMs\":\"9007199254740993\",\"expiryTimestampMs\":\"9007199254740993\",\"maxTimestampMs\":\"9007199254740993\",\"tokenId\":\"token-id\",\"hmac\":{\"$bytes\":\"686d61632d6d61726b65722d6f6e6c792d74657374\"},\"throttleTimeMs\":0}"));
+    vectors.add(new Vector("renewDelegationToken", "RenewDelegationTokenRequest", (short) 1, "security",
+      new org.apache.kafka.common.message.RenewDelegationTokenRequestData()
+        .setHmac(java.util.HexFormat.of().parseHex("686d61632d6d61726b65722d6f6e6c792d74657374"))
+        .setRenewPeriodMs(-1L),
+      "{\"hmac\":{\"$bytes\":\"686d61632d6d61726b65722d6f6e6c792d74657374\"},\"renewPeriodMs\":\"-1\"}"));
+    vectors.add(new Vector("renewDelegationToken", "RenewDelegationTokenResponse", (short) 1, "security",
+      new org.apache.kafka.common.message.RenewDelegationTokenResponseData()
+        .setErrorCode((short) 0)
+        .setExpiryTimestampMs(9007199254740993L)
+        .setThrottleTimeMs(0),
+      "{\"errorCode\":0,\"expiryTimestampMs\":\"9007199254740993\",\"throttleTimeMs\":0}"));
+    vectors.add(new Vector("renewDelegationToken", "RenewDelegationTokenRequest", (short) 2, "security",
+      new org.apache.kafka.common.message.RenewDelegationTokenRequestData()
+        .setHmac(java.util.HexFormat.of().parseHex("686d61632d6d61726b65722d6f6e6c792d74657374"))
+        .setRenewPeriodMs(-1L),
+      "{\"hmac\":{\"$bytes\":\"686d61632d6d61726b65722d6f6e6c792d74657374\"},\"renewPeriodMs\":\"-1\"}"));
+    vectors.add(new Vector("renewDelegationToken", "RenewDelegationTokenResponse", (short) 2, "security",
+      new org.apache.kafka.common.message.RenewDelegationTokenResponseData()
+        .setErrorCode((short) 0)
+        .setExpiryTimestampMs(9007199254740993L)
+        .setThrottleTimeMs(0),
+      "{\"errorCode\":0,\"expiryTimestampMs\":\"9007199254740993\",\"throttleTimeMs\":0}"));
+    vectors.add(new Vector("expireDelegationToken", "ExpireDelegationTokenRequest", (short) 1, "security",
+      new org.apache.kafka.common.message.ExpireDelegationTokenRequestData()
+        .setHmac(java.util.HexFormat.of().parseHex("686d61632d6d61726b65722d6f6e6c792d74657374"))
+        .setExpiryTimePeriodMs(-1L),
+      "{\"hmac\":{\"$bytes\":\"686d61632d6d61726b65722d6f6e6c792d74657374\"},\"expiryTimePeriodMs\":\"-1\"}"));
+    vectors.add(new Vector("expireDelegationToken", "ExpireDelegationTokenResponse", (short) 1, "security",
+      new org.apache.kafka.common.message.ExpireDelegationTokenResponseData()
+        .setErrorCode((short) 0)
+        .setExpiryTimestampMs(9007199254740993L)
+        .setThrottleTimeMs(0),
+      "{\"errorCode\":0,\"expiryTimestampMs\":\"9007199254740993\",\"throttleTimeMs\":0}"));
+    vectors.add(new Vector("expireDelegationToken", "ExpireDelegationTokenRequest", (short) 2, "security",
+      new org.apache.kafka.common.message.ExpireDelegationTokenRequestData()
+        .setHmac(java.util.HexFormat.of().parseHex("686d61632d6d61726b65722d6f6e6c792d74657374"))
+        .setExpiryTimePeriodMs(-1L),
+      "{\"hmac\":{\"$bytes\":\"686d61632d6d61726b65722d6f6e6c792d74657374\"},\"expiryTimePeriodMs\":\"-1\"}"));
+    vectors.add(new Vector("expireDelegationToken", "ExpireDelegationTokenResponse", (short) 2, "security",
+      new org.apache.kafka.common.message.ExpireDelegationTokenResponseData()
+        .setErrorCode((short) 0)
+        .setExpiryTimestampMs(9007199254740993L)
+        .setThrottleTimeMs(0),
+      "{\"errorCode\":0,\"expiryTimestampMs\":\"9007199254740993\",\"throttleTimeMs\":0}"));
+    vectors.add(new Vector("describeDelegationToken", "DescribeDelegationTokenRequest", (short) 1, "security",
+      new org.apache.kafka.common.message.DescribeDelegationTokenRequestData()
+        .setOwners(List.of(new org.apache.kafka.common.message.DescribeDelegationTokenRequestData.DescribeDelegationTokenOwner()
+        .setPrincipalType("User")
+        .setPrincipalName("test-owner"))),
+      "{\"owners\":[{\"principalType\":\"User\",\"principalName\":\"test-owner\"}]}"));
+    vectors.add(new Vector("describeDelegationToken", "DescribeDelegationTokenResponse", (short) 1, "security",
+      new org.apache.kafka.common.message.DescribeDelegationTokenResponseData()
+        .setErrorCode((short) 0)
+        .setTokens(List.of(new org.apache.kafka.common.message.DescribeDelegationTokenResponseData.DescribedDelegationToken()
+        .setPrincipalType("User")
+        .setPrincipalName("test-owner")
+        .setIssueTimestamp(9007199254740993L)
+        .setExpiryTimestamp(9007199254740993L)
+        .setMaxTimestamp(9007199254740993L)
+        .setTokenId("token-id")
+        .setHmac(java.util.HexFormat.of().parseHex("686d61632d6d61726b65722d6f6e6c792d74657374"))
+        .setRenewers(List.of(new org.apache.kafka.common.message.DescribeDelegationTokenResponseData.DescribedDelegationTokenRenewer()
+        .setPrincipalType("User")
+        .setPrincipalName("test-owner")))))
+        .setThrottleTimeMs(0),
+      "{\"errorCode\":0,\"tokens\":[{\"principalType\":\"User\",\"principalName\":\"test-owner\",\"issueTimestamp\":\"9007199254740993\",\"expiryTimestamp\":\"9007199254740993\",\"maxTimestamp\":\"9007199254740993\",\"tokenId\":\"token-id\",\"hmac\":{\"$bytes\":\"686d61632d6d61726b65722d6f6e6c792d74657374\"},\"renewers\":[{\"principalType\":\"User\",\"principalName\":\"test-owner\"}]}],\"throttleTimeMs\":0}"));
+    vectors.add(new Vector("describeDelegationToken", "DescribeDelegationTokenRequest", (short) 2, "security",
+      new org.apache.kafka.common.message.DescribeDelegationTokenRequestData()
+        .setOwners(List.of(new org.apache.kafka.common.message.DescribeDelegationTokenRequestData.DescribeDelegationTokenOwner()
+        .setPrincipalType("User")
+        .setPrincipalName("test-owner"))),
+      "{\"owners\":[{\"principalType\":\"User\",\"principalName\":\"test-owner\"}]}"));
+    vectors.add(new Vector("describeDelegationToken", "DescribeDelegationTokenResponse", (short) 2, "security",
+      new org.apache.kafka.common.message.DescribeDelegationTokenResponseData()
+        .setErrorCode((short) 0)
+        .setTokens(List.of(new org.apache.kafka.common.message.DescribeDelegationTokenResponseData.DescribedDelegationToken()
+        .setPrincipalType("User")
+        .setPrincipalName("test-owner")
+        .setIssueTimestamp(9007199254740993L)
+        .setExpiryTimestamp(9007199254740993L)
+        .setMaxTimestamp(9007199254740993L)
+        .setTokenId("token-id")
+        .setHmac(java.util.HexFormat.of().parseHex("686d61632d6d61726b65722d6f6e6c792d74657374"))
+        .setRenewers(List.of(new org.apache.kafka.common.message.DescribeDelegationTokenResponseData.DescribedDelegationTokenRenewer()
+        .setPrincipalType("User")
+        .setPrincipalName("test-owner")))))
+        .setThrottleTimeMs(0),
+      "{\"errorCode\":0,\"tokens\":[{\"principalType\":\"User\",\"principalName\":\"test-owner\",\"issueTimestamp\":\"9007199254740993\",\"expiryTimestamp\":\"9007199254740993\",\"maxTimestamp\":\"9007199254740993\",\"tokenId\":\"token-id\",\"hmac\":{\"$bytes\":\"686d61632d6d61726b65722d6f6e6c792d74657374\"},\"renewers\":[{\"principalType\":\"User\",\"principalName\":\"test-owner\"}]}],\"throttleTimeMs\":0}"));
+    vectors.add(new Vector("describeDelegationToken", "DescribeDelegationTokenRequest", (short) 3, "security",
+      new org.apache.kafka.common.message.DescribeDelegationTokenRequestData()
+        .setOwners(List.of(new org.apache.kafka.common.message.DescribeDelegationTokenRequestData.DescribeDelegationTokenOwner()
+        .setPrincipalType("User")
+        .setPrincipalName("test-owner"))),
+      "{\"owners\":[{\"principalType\":\"User\",\"principalName\":\"test-owner\"}]}"));
+    vectors.add(new Vector("describeDelegationToken", "DescribeDelegationTokenResponse", (short) 3, "security",
+      new org.apache.kafka.common.message.DescribeDelegationTokenResponseData()
+        .setErrorCode((short) 0)
+        .setTokens(List.of(new org.apache.kafka.common.message.DescribeDelegationTokenResponseData.DescribedDelegationToken()
+        .setPrincipalType("User")
+        .setPrincipalName("test-owner")
+        .setTokenRequesterPrincipalType("User")
+        .setTokenRequesterPrincipalName("test-owner")
+        .setIssueTimestamp(9007199254740993L)
+        .setExpiryTimestamp(9007199254740993L)
+        .setMaxTimestamp(9007199254740993L)
+        .setTokenId("token-id")
+        .setHmac(java.util.HexFormat.of().parseHex("686d61632d6d61726b65722d6f6e6c792d74657374"))
+        .setRenewers(List.of(new org.apache.kafka.common.message.DescribeDelegationTokenResponseData.DescribedDelegationTokenRenewer()
+        .setPrincipalType("User")
+        .setPrincipalName("test-owner")))))
+        .setThrottleTimeMs(0),
+      "{\"errorCode\":0,\"tokens\":[{\"principalType\":\"User\",\"principalName\":\"test-owner\",\"tokenRequesterPrincipalType\":\"User\",\"tokenRequesterPrincipalName\":\"test-owner\",\"issueTimestamp\":\"9007199254740993\",\"expiryTimestamp\":\"9007199254740993\",\"maxTimestamp\":\"9007199254740993\",\"tokenId\":\"token-id\",\"hmac\":{\"$bytes\":\"686d61632d6d61726b65722d6f6e6c792d74657374\"},\"renewers\":[{\"principalType\":\"User\",\"principalName\":\"test-owner\"}]}],\"throttleTimeMs\":0}"));
+    return vectors;
+  }
+
+  /**
+   * Computes SCRAM Hi using Java's PBKDF2 implementation over synthetic fixed inputs.
+   * @param root repository receiving the independently computed credential fixtures
+   * @throws IOException derivation or write failure
+   */
+  private static void scramHiVectors(Path root) throws IOException {
+    Path dir = root.resolve("src/protocol/requests/alterUserScramCredentials/fixtures/java");
+    Files.createDirectories(dir);
+    for (String digest : List.of("SHA256", "SHA512")) {
+      char[] password = "password-marker-only-test".toCharArray();
+      byte[] salt = "salt-marker-only-test".getBytes(StandardCharsets.UTF_8);
+      javax.crypto.spec.PBEKeySpec spec = new javax.crypto.spec.PBEKeySpec(password, salt, 4096,
+          digest.equals("SHA256") ? 256 : 512);
+      try {
+        byte[] derived = javax.crypto.SecretKeyFactory.getInstance("PBKDF2WithHmac" + digest)
+            .generateSecret(spec).getEncoded();
+        String document = obj(kv("password", str("password-marker-only-test")),
+            kv("saltHex", str(java.util.HexFormat.of().formatHex(salt))),
+            kv("iterations", "4096"),
+            kv("hex", str(java.util.HexFormat.of().formatHex(derived))));
+        Files.writeString(dir.resolve("scramHi-" + digest.toLowerCase() + ".json"), document,
+            StandardCharsets.UTF_8);
+        Arrays.fill(derived, (byte) 0);
+      } catch (java.security.GeneralSecurityException error) {
+        throw new IOException("SCRAM vector derivation failed", error);
+      } finally {
+        spec.clearPassword(); Arrays.fill(password, '\0'); Arrays.fill(salt, (byte) 0);
+      }
+    }
+  }
+
 }

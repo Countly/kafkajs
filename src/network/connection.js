@@ -63,6 +63,16 @@ const isAuthenticatedRequest = (request) => {
   )
 }
 
+/** APIs whose broker payloads can contain credentials, including echoed error text. */
+const SENSITIVE_API_KEYS = new Set([
+  apiKeys.CreateDelegationToken,
+  apiKeys.RenewDelegationToken,
+  apiKeys.ExpireDelegationToken,
+  apiKeys.DescribeDelegationToken,
+  apiKeys.DescribeUserScramCredentials,
+  apiKeys.AlterUserScramCredentials,
+])
+
 const PRIVATE = {
   SHOULD_REAUTHENTICATE: Symbol('private:Connection:shouldReauthenticate'),
   AUTHENTICATE: Symbol('private:Connection:authenticate'),
@@ -897,6 +907,7 @@ module.exports = class Connection {
     guard = null,
     responseGuard = null,
   }) {
+    const sensitiveResponse = SENSITIVE_API_KEYS.has(request.apiKey)
     const attempt = this.connectAttempt
     this.preparing += 1
     let answered
@@ -947,7 +958,7 @@ module.exports = class Connection {
       this.logDebug(`Response ${requestInfo(entry)}`, {
         correlationId,
         size,
-        data: isFetchApi && !this.shouldLogFetchBuffer ? '[filtered]' : data,
+        data: sensitiveResponse || (isFetchApi && !this.shouldLogFetchBuffer) ? '[filtered]' : data,
       })
 
       return data
@@ -955,7 +966,7 @@ module.exports = class Connection {
       attachResponseSource(e, request.apiKey)
       if (logResponseError) {
         this.logError(`Response ${requestInfo(entry)}`, {
-          error: e.message,
+          error: sensitiveResponse ? 'Sensitive response failed' : e.message,
           correlationId,
           size,
         })
@@ -963,10 +974,13 @@ module.exports = class Connection {
 
       const isBuffer = Buffer.isBuffer(payload)
       this.logDebug(`Response ${requestInfo(entry)}`, {
-        error: e.message,
+        error: sensitiveResponse ? 'Sensitive response failed' : e.message,
         correlationId,
-        payload:
-          isBuffer && !this.shouldLogBuffers ? { type: 'Buffer', data: '[filtered]' } : payload,
+        payload: sensitiveResponse
+          ? '[filtered]'
+          : isBuffer && !this.shouldLogBuffers
+            ? { type: 'Buffer', data: '[filtered]' }
+            : payload,
       })
 
       throw e

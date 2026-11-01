@@ -1711,3 +1711,30 @@ const transactionAbortItems: Promise<kafkajs.AdminItemResult[]> = admin.abortTra
 // @ts-expect-error force termination is an equivalent invocation, not a new method
 admin.forceTerminateTransaction('tx')
 void transactionDescription; void transactionList; void transactionAbort; void transactionAbortItems
+
+
+async function quotaAndCredentialAdministration(admin: import('./index').Admin) {
+  const quotas = await admin.describeClientQuotas({components:[{entityType:'user',matchType:'default'}],strict:true,apiTimeout:10})
+  const values: Record<string,number> = quotas[0].values
+  const changed = await admin.alterClientQuotas({entries:[{entity:[{entityType:'user',entityName:null}],ops:[{key:'producer_byte_rate',value:1},{key:'consumer_byte_rate',remove:true}]}],validateOnly:true})
+  const credentials = await admin.describeUserScramCredentials({users:null})
+  const users = await admin.alterUserScramCredentials({upsertions:[{user:'test-user',mechanism:'SCRAM-SHA-256',iterations:4096,password:'password-marker-only-test',salt:Buffer.alloc(32)}],deletions:[{user:'other-user',mechanism:'SCRAM-SHA-512'}]})
+  // @ts-expect-error quota assignment and removal are exclusive
+  const invalidQuota: import('./index').QuotaOperation = {key:'k',value:1,remove:true}
+  // @ts-expect-error only SCRAM mechanisms can be administered
+  await admin.alterUserScramCredentials({deletions:[{user:'test-user',mechanism:'PLAIN'}]})
+  void [values,changed,credentials,users,invalidQuota]
+}
+void quotaAndCredentialAdministration
+
+async function tokenAdministration(admin: import('./index').Admin) {
+  const token: import('./index').DelegationToken = await admin.createDelegationToken({owner:{principalType:'User',principalName:'owner'},maxLifetimeMs:'9223372036854775807'})
+  const bytes: Buffer = token.hmac
+  const expiry: string = (await admin.renewDelegationToken({hmac:bytes,renewPeriodMs:-1})).expiryTimestampMs
+  await admin.expireDelegationToken({hmac:bytes,expiryTimePeriodMs:0})
+  const tokens: import('./index').DelegationToken[] = await admin.describeDelegationToken()
+  // @ts-expect-error token HMACs are buffers
+  await admin.renewDelegationToken({hmac:'test-hmac'})
+  void [expiry,tokens]
+}
+void tokenAdministration

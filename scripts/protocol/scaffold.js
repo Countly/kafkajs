@@ -169,6 +169,7 @@ class CodecScaffolder {
    * @returns {string} the Apache protocol wire-type name, e.g. `COMPACT_STRING`
    */
   scalarWireLabel(type, compact) {
+    if (type === 'float64') return 'FLOAT64'
     if (type === 'bool') return 'BOOLEAN'
     if (SCALAR_INT.test(type)) return type.toUpperCase()
     if (type === 'uuid') return 'UUID'
@@ -282,6 +283,7 @@ class CodecScaffolder {
    */
   scalarWriterCall(type, valueExpr) {
     const compact = this.flexible
+    if (type === 'float64') return `writeDouble(${valueExpr})`
     if (type === 'bool') return `writeBoolean(${valueExpr})`
     const int = SCALAR_INT.exec(type)
     if (int) return `writeInt${int[1]}(${valueExpr})`
@@ -323,6 +325,7 @@ class CodecScaffolder {
    */
   scalarReaderExpr(type) {
     const compact = this.flexible
+    if (type === 'float64') return 'decoder.readDouble()'
     if (type === 'bool') return 'decoder.readBoolean()'
     const int = SCALAR_INT.exec(type)
     if (int) return `decoder.readInt${int[1]}()`

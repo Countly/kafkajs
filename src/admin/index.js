@@ -1,3 +1,6 @@
+const createDelegationTokens = require('./delegationTokens')
+const createClientQuotas = require('./clientQuotas')
+const createScramCredentials = require('./scramCredentials')
 const createTransactions = require('./transactions')
 const { inspect } = require('util')
 const {
@@ -2657,6 +2660,9 @@ module.exports = ({
       deleteTopicRecords,
       alterPartitionReassignments,
       listPartitionReassignments,
+      ...createClientQuotas({ cluster, retry, logger }),
+      ...createScramCredentials({ cluster, retry, logger }),
+      ...createDelegationTokens({ cluster, retry, logger }),
     },
     {
       describeProducers: 0,
@@ -2686,6 +2692,14 @@ module.exports = ({
       deleteTopicRecords: 0,
       alterPartitionReassignments: 0,
       listPartitionReassignments: 0,
+      describeClientQuotas: 0,
+      alterClientQuotas: 0,
+      describeUserScramCredentials: 0,
+      alterUserScramCredentials: 0,
+      createDelegationToken: 0,
+      renewDelegationToken: 0,
+      expireDelegationToken: 0,
+      describeDelegationToken: 0,
       fetchTopicOffsets: 1,
       fetchTopicOffsetsByTimestamp: 2,
       describeGroups: 1,

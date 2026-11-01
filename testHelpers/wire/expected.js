@@ -923,3 +923,295 @@ module.exports.offsetFetchV7 = {
     ],
   },
 }
+
+/** Schema-derived literals; Java generation and comparison remain mandatory. */
+module.exports.securityAdmin = {
+  describeClientQuotasV0: {
+    request: {
+      components: [{ entityType: 'user', matchType: 0, match: 'test-user' }],
+      strict: false,
+    },
+    response: {
+      throttleTimeMs: 0,
+      errorCode: 0,
+      errorMessage: null,
+      entries: [
+        {
+          entity: [{ entityType: 'user', entityName: null }],
+          values: [{ key: 'producer_byte_rate', value: 1234.5 }],
+        },
+      ],
+    },
+    requestHex: '00000001000475736572000009746573742d7573657200',
+    responseHex:
+      '000000000000ffff0000000100000001000475736572ffff00000001001270726f64756365725f627974655f7261746540934a0000000000',
+  },
+  describeClientQuotasV1: {
+    request: {
+      components: [{ entityType: 'user', matchType: 0, match: 'test-user' }],
+      strict: false,
+    },
+    response: {
+      throttleTimeMs: 0,
+      errorCode: 0,
+      errorMessage: null,
+      entries: [
+        {
+          entity: [{ entityType: 'user', entityName: null }],
+          values: [{ key: 'producer_byte_rate', value: 1234.5 }],
+        },
+      ],
+    },
+    requestHex: '020575736572000a746573742d75736572000000',
+    responseHex:
+      '00000000000000020205757365720000021370726f64756365725f627974655f7261746540934a0000000000000000',
+  },
+  alterClientQuotasV0: {
+    request: {
+      entries: [
+        {
+          entity: [{ entityType: 'user', entityName: null }],
+          ops: [{ key: 'producer_byte_rate', value: 1234.5, remove: false }],
+        },
+      ],
+      validateOnly: true,
+    },
+    response: {
+      throttleTimeMs: 0,
+      entries: [
+        { errorCode: 0, errorMessage: null, entity: [{ entityType: 'user', entityName: null }] },
+      ],
+    },
+    requestHex:
+      '0000000100000001000475736572ffff00000001001270726f64756365725f627974655f7261746540934a00000000000001',
+    responseHex: '00000000000000010000ffff00000001000475736572ffff',
+  },
+  alterClientQuotasV1: {
+    request: {
+      entries: [
+        {
+          entity: [{ entityType: 'user', entityName: null }],
+          ops: [{ key: 'producer_byte_rate', value: 1234.5, remove: false }],
+        },
+      ],
+      validateOnly: true,
+    },
+    response: {
+      throttleTimeMs: 0,
+      entries: [
+        { errorCode: 0, errorMessage: null, entity: [{ entityType: 'user', entityName: null }] },
+      ],
+    },
+    requestHex:
+      '020205757365720000021370726f64756365725f627974655f7261746540934a00000000000000000100',
+    responseHex: '000000000200000002057573657200000000',
+  },
+  describeUserScramCredentialsV0: {
+    request: { users: [{ name: 'test-user' }] },
+    response: {
+      throttleTimeMs: 0,
+      errorCode: 0,
+      errorMessage: null,
+      results: [
+        {
+          user: 'test-user',
+          errorCode: 0,
+          errorMessage: null,
+          credentialInfos: [{ mechanism: 1, iterations: 4096 }],
+        },
+      ],
+    },
+    requestHex: '020a746573742d757365720000',
+    responseHex: '00000000000000020a746573742d75736572000000020100001000000000',
+  },
+  alterUserScramCredentialsV0: {
+    request: {
+      deletions: [{ name: 'test-user', mechanism: 1 }],
+      upsertions: [
+        {
+          name: 'test-user',
+          mechanism: 1,
+          iterations: 4096,
+          salt: Buffer.from('73616c742d6d61726b65722d6f6e6c792d74657374', 'hex'),
+          saltedPassword: Buffer.from('646572697665642d6d61726b65722d6f6e6c792d74657374', 'hex'),
+        },
+      ],
+    },
+    response: {
+      throttleTimeMs: 0,
+      results: [{ user: 'test-user', errorCode: 0, errorMessage: null }],
+    },
+    requestHex:
+      '020a746573742d757365720100020a746573742d7573657201000010001673616c742d6d61726b65722d6f6e6c792d7465737419646572697665642d6d61726b65722d6f6e6c792d746573740000',
+    responseHex: '00000000020a746573742d757365720000000000',
+  },
+  createDelegationTokenV1: {
+    request: {
+      renewers: [{ principalType: 'User', principalName: 'test-owner' }],
+      maxLifetimeMs: '-1',
+    },
+    response: {
+      errorCode: 0,
+      principalType: 'User',
+      principalName: 'test-owner',
+      issueTimestampMs: '9007199254740993',
+      expiryTimestampMs: '9007199254740993',
+      maxTimestampMs: '9007199254740993',
+      tokenId: 'token-id',
+      hmac: Buffer.from('686d61632d6d61726b65722d6f6e6c792d74657374', 'hex'),
+      throttleTimeMs: 0,
+    },
+    requestHex: '00000001000455736572000a746573742d6f776e6572ffffffffffffffff',
+    responseHex:
+      '0000000455736572000a746573742d6f776e65720020000000000001002000000000000100200000000000010008746f6b656e2d696400000015686d61632d6d61726b65722d6f6e6c792d7465737400000000',
+  },
+  createDelegationTokenV2: {
+    request: {
+      renewers: [{ principalType: 'User', principalName: 'test-owner' }],
+      maxLifetimeMs: '-1',
+    },
+    response: {
+      errorCode: 0,
+      principalType: 'User',
+      principalName: 'test-owner',
+      issueTimestampMs: '9007199254740993',
+      expiryTimestampMs: '9007199254740993',
+      maxTimestampMs: '9007199254740993',
+      tokenId: 'token-id',
+      hmac: Buffer.from('686d61632d6d61726b65722d6f6e6c792d74657374', 'hex'),
+      throttleTimeMs: 0,
+    },
+    requestHex: '0205557365720b746573742d6f776e657200ffffffffffffffff00',
+    responseHex:
+      '000005557365720b746573742d6f776e657200200000000000010020000000000001002000000000000109746f6b656e2d696416686d61632d6d61726b65722d6f6e6c792d746573740000000000',
+  },
+  createDelegationTokenV3: {
+    request: {
+      ownerPrincipalType: 'User',
+      ownerPrincipalName: 'test-owner',
+      renewers: [{ principalType: 'User', principalName: 'test-owner' }],
+      maxLifetimeMs: '-1',
+    },
+    response: {
+      errorCode: 0,
+      principalType: 'User',
+      principalName: 'test-owner',
+      tokenRequesterPrincipalType: 'User',
+      tokenRequesterPrincipalName: 'test-owner',
+      issueTimestampMs: '9007199254740993',
+      expiryTimestampMs: '9007199254740993',
+      maxTimestampMs: '9007199254740993',
+      tokenId: 'token-id',
+      hmac: Buffer.from('686d61632d6d61726b65722d6f6e6c792d74657374', 'hex'),
+      throttleTimeMs: 0,
+    },
+    requestHex:
+      '05557365720b746573742d6f776e65720205557365720b746573742d6f776e657200ffffffffffffffff00',
+    responseHex:
+      '000005557365720b746573742d6f776e657205557365720b746573742d6f776e657200200000000000010020000000000001002000000000000109746f6b656e2d696416686d61632d6d61726b65722d6f6e6c792d746573740000000000',
+  },
+  renewDelegationTokenV1: {
+    request: {
+      hmac: Buffer.from('686d61632d6d61726b65722d6f6e6c792d74657374', 'hex'),
+      renewPeriodMs: '-1',
+    },
+    response: { errorCode: 0, expiryTimestampMs: '9007199254740993', throttleTimeMs: 0 },
+    requestHex: '00000015686d61632d6d61726b65722d6f6e6c792d74657374ffffffffffffffff',
+    responseHex: '0000002000000000000100000000',
+  },
+  renewDelegationTokenV2: {
+    request: {
+      hmac: Buffer.from('686d61632d6d61726b65722d6f6e6c792d74657374', 'hex'),
+      renewPeriodMs: '-1',
+    },
+    response: { errorCode: 0, expiryTimestampMs: '9007199254740993', throttleTimeMs: 0 },
+    requestHex: '16686d61632d6d61726b65722d6f6e6c792d74657374ffffffffffffffff00',
+    responseHex: '000000200000000000010000000000',
+  },
+  expireDelegationTokenV1: {
+    request: {
+      hmac: Buffer.from('686d61632d6d61726b65722d6f6e6c792d74657374', 'hex'),
+      expiryTimePeriodMs: '-1',
+    },
+    response: { errorCode: 0, expiryTimestampMs: '9007199254740993', throttleTimeMs: 0 },
+    requestHex: '00000015686d61632d6d61726b65722d6f6e6c792d74657374ffffffffffffffff',
+    responseHex: '0000002000000000000100000000',
+  },
+  expireDelegationTokenV2: {
+    request: {
+      hmac: Buffer.from('686d61632d6d61726b65722d6f6e6c792d74657374', 'hex'),
+      expiryTimePeriodMs: '-1',
+    },
+    response: { errorCode: 0, expiryTimestampMs: '9007199254740993', throttleTimeMs: 0 },
+    requestHex: '16686d61632d6d61726b65722d6f6e6c792d74657374ffffffffffffffff00',
+    responseHex: '000000200000000000010000000000',
+  },
+  describeDelegationTokenV1: {
+    request: { owners: [{ principalType: 'User', principalName: 'test-owner' }] },
+    response: {
+      errorCode: 0,
+      tokens: [
+        {
+          principalType: 'User',
+          principalName: 'test-owner',
+          issueTimestamp: '9007199254740993',
+          expiryTimestamp: '9007199254740993',
+          maxTimestamp: '9007199254740993',
+          tokenId: 'token-id',
+          hmac: Buffer.from('686d61632d6d61726b65722d6f6e6c792d74657374', 'hex'),
+          renewers: [{ principalType: 'User', principalName: 'test-owner' }],
+        },
+      ],
+      throttleTimeMs: 0,
+    },
+    requestHex: '00000001000455736572000a746573742d6f776e6572',
+    responseHex:
+      '000000000001000455736572000a746573742d6f776e65720020000000000001002000000000000100200000000000010008746f6b656e2d696400000015686d61632d6d61726b65722d6f6e6c792d7465737400000001000455736572000a746573742d6f776e657200000000',
+  },
+  describeDelegationTokenV2: {
+    request: { owners: [{ principalType: 'User', principalName: 'test-owner' }] },
+    response: {
+      errorCode: 0,
+      tokens: [
+        {
+          principalType: 'User',
+          principalName: 'test-owner',
+          issueTimestamp: '9007199254740993',
+          expiryTimestamp: '9007199254740993',
+          maxTimestamp: '9007199254740993',
+          tokenId: 'token-id',
+          hmac: Buffer.from('686d61632d6d61726b65722d6f6e6c792d74657374', 'hex'),
+          renewers: [{ principalType: 'User', principalName: 'test-owner' }],
+        },
+      ],
+      throttleTimeMs: 0,
+    },
+    requestHex: '0205557365720b746573742d6f776e65720000',
+    responseHex:
+      '00000205557365720b746573742d6f776e657200200000000000010020000000000001002000000000000109746f6b656e2d696416686d61632d6d61726b65722d6f6e6c792d746573740205557365720b746573742d6f776e657200000000000000',
+  },
+  describeDelegationTokenV3: {
+    request: { owners: [{ principalType: 'User', principalName: 'test-owner' }] },
+    response: {
+      errorCode: 0,
+      tokens: [
+        {
+          principalType: 'User',
+          principalName: 'test-owner',
+          tokenRequesterPrincipalType: 'User',
+          tokenRequesterPrincipalName: 'test-owner',
+          issueTimestamp: '9007199254740993',
+          expiryTimestamp: '9007199254740993',
+          maxTimestamp: '9007199254740993',
+          tokenId: 'token-id',
+          hmac: Buffer.from('686d61632d6d61726b65722d6f6e6c792d74657374', 'hex'),
+          renewers: [{ principalType: 'User', principalName: 'test-owner' }],
+        },
+      ],
+      throttleTimeMs: 0,
+    },
+    requestHex: '0205557365720b746573742d6f776e65720000',
+    responseHex:
+      '00000205557365720b746573742d6f776e657205557365720b746573742d6f776e657200200000000000010020000000000001002000000000000109746f6b656e2d696416686d61632d6d61726b65722d6f6e6c792d746573740205557365720b746573742d6f776e657200000000000000',
+  },
+}

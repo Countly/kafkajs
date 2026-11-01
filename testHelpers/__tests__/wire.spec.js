@@ -1420,3 +1420,20 @@ describe('offset admin wire layouts', () => {
     }
   )
 })
+
+describe('security admin pairs', () => {
+  test.each(Object.entries(expected.securityAdmin))(
+    '%s matches independent literals in both directions',
+    (name, vector) => {
+      const pair = require('../wire/' + name)
+      expect(pair.readRequest(Buffer.from(vector.requestHex, 'hex'))).toEqual(vector.request)
+      expect(pair.buildResponse()).toEqual(Buffer.from(vector.responseHex, 'hex'))
+      expect(() =>
+        pair.readRequest(Buffer.concat([Buffer.from(vector.requestHex, 'hex'), Buffer.from([0])]))
+      ).toThrow()
+      expect(() =>
+        pair.readRequest(Buffer.from(vector.requestHex, 'hex').subarray(0, -1))
+      ).toThrow()
+    }
+  )
+})
