@@ -761,6 +761,7 @@ describeDirect.each(lanes())('Consumer > manual assignment (live, %s lane)', (la
         trace.keep({ outcome, failure, committed, counts: manual.frames.of(MEMBERSHIP_APIS) })
         if (lane.name === 'fake') expect(outcome).toBe('refused')
         if (outcome === 'accepted') expect(committed[0]?.offset).toBe('5')
+        await until(manual, scope, () => manual.delivered.length >= RECORDS, 'the manual partition')
         for (const api of MEMBERSHIP_APIS) expect(manual.frames.count(api)).toBe(0)
         expect(manual.membershipEvents).toEqual([])
         expect(manual.crashes).toEqual([])
