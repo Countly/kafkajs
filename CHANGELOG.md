@@ -168,8 +168,7 @@ Versions before 3.0.0 are internal alpha tags and are not published.
 #### Tooling
 
 - `blackhole(id)` in the scripted cluster and the connection-setup benchmark.
-
-
+- Track the nineteen admin-ledger APIs in the compatibility snapshot, the tracked list and the generated matrix, with named broker ranges.
 
 ### Phase 9B — Producer parity: delivery deadline, memory bound, request size, partitioner, codecs, lifecycle
 

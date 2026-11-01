@@ -15,6 +15,14 @@
     },
     "javaClientsJar": "4.3.1"
   },
+  "AlterClientQuotas": {
+    "kafkaTag": "4.3.1",
+    "messageSha256": {
+      "Request": "195bd3af15a5d91037d3394db88d433c9c62985e04a896310fe4074638cc3526",
+      "Response": "db655393cbc6485bf10575f0dc4d29b3c47883a16a4162d190c74f4000cb6b6a"
+    },
+    "javaClientsJar": null
+  },
   "AlterConfigs": {
     "kafkaTag": "4.3.1",
     "messageSha256": {
@@ -28,6 +36,22 @@
     "messageSha256": {
       "Request": "09ed6a85622e808357af2df8141e908b62871aff531f54fb6fa85875dcebbf6c",
       "Response": "449f1c0669ef193216066d605ae9dc87a7524006eb421b34e3ed2ed0d8012225"
+    },
+    "javaClientsJar": null
+  },
+  "AlterReplicaLogDirs": {
+    "kafkaTag": "4.3.1",
+    "messageSha256": {
+      "Request": "36b2407c1b6964bf1a8b5e405fe317844c0f00d8e946efeaa3fb3df858ab373d",
+      "Response": "23ecf9485b51be6433378e8ca82d2ff2d8db2255e2815fb68d7328eab8e07be1"
+    },
+    "javaClientsJar": null
+  },
+  "AlterUserScramCredentials": {
+    "kafkaTag": "4.3.1",
+    "messageSha256": {
+      "Request": "fcf7ca27e8028316c0957b346c93108c235388d06f829f7ecc5a304407719d26",
+      "Response": "f9bba249467a5f499ae10523be22f96aab4ddc6bdff0f54f7cf0be030820ff2d"
     },
     "javaClientsJar": null
   },
@@ -62,6 +86,14 @@
       "Response": "278d972a9379ea10be5a617bcaeedcfeea064da28d5fcd7b7f98dee13fd9242e"
     },
     "javaClientsJar": "4.3.1"
+  },
+  "CreateDelegationToken": {
+    "kafkaTag": "4.3.1",
+    "messageSha256": {
+      "Request": "159c3ed2d3d9e7f2ad4df8ece1783184ffe0b19de176e9a67a4ff76c90f36093",
+      "Response": "f42e46e7433dd594e9a837e805f9cde1c90a63c86c6a05d28f541c4cac3f084e"
+    },
+    "javaClientsJar": null
   },
   "CreatePartitions": {
     "kafkaTag": "4.3.1",
@@ -119,6 +151,22 @@
     },
     "javaClientsJar": "4.3.1"
   },
+  "DescribeClientQuotas": {
+    "kafkaTag": "4.3.1",
+    "messageSha256": {
+      "Request": "16451280b34bfdb2dc706ee793ff85ab9553d10b1f57268652bcb244d0a9c270",
+      "Response": "8835639bb0223508cdaa9b0eded648e5394c5311276995ff401ea9b58514a100"
+    },
+    "javaClientsJar": null
+  },
+  "DescribeCluster": {
+    "kafkaTag": "4.3.1",
+    "messageSha256": {
+      "Request": "821b86c736d98bdd3de825daa56edd30fb46d39b8a156f273f3985d0d09c00b1",
+      "Response": "04a23344c659434c30914a76f161d6705d2028864800e735b20fe85bb8efd407"
+    },
+    "javaClientsJar": null
+  },
   "DescribeConfigs": {
     "kafkaTag": "4.3.1",
     "messageSha256": {
@@ -126,6 +174,14 @@
       "Response": "b757a8100024f92f6f24436f86fed9c0bb9ba42e6ed18f3449dda1735e286e1d"
     },
     "javaClientsJar": "4.3.1"
+  },
+  "DescribeDelegationToken": {
+    "kafkaTag": "4.3.1",
+    "messageSha256": {
+      "Request": "22fe3781b361acbd3951b31a4dd7f7db15f71315eb8b934404b8e76bea5b825b",
+      "Response": "3306725d50bbca00ba4fad6d7e0dc8fff284ac7dcaf231e5d05398a4afa4b0b9"
+    },
+    "javaClientsJar": null
   },
   "DescribeGroups": {
     "kafkaTag": "4.3.1",
@@ -135,6 +191,22 @@
     },
     "javaClientsJar": "4.3.1"
   },
+  "DescribeLogDirs": {
+    "kafkaTag": "4.3.1",
+    "messageSha256": {
+      "Request": "63ba440915c66d6ed6f2e17ef4aac5d2eb36e1f14bc6bf9d3129b3ce6c99f218",
+      "Response": "4e3b47c05309d177a004e11f2e317a65393294106e7074ae65f70921c29ebe53"
+    },
+    "javaClientsJar": null
+  },
+  "DescribeProducers": {
+    "kafkaTag": "4.3.1",
+    "messageSha256": {
+      "Request": "b7db1a8154ace225ca9eb3a35e78d038baeee567934a0a74265fce1ae4289fcd",
+      "Response": "6019232d4144a18aed721cc50724304f4d6e260680ba0c1f373cf25346deb3b0"
+    },
+    "javaClientsJar": null
+  },
   "DescribeTopicPartitions": {
     "kafkaTag": "4.3.1",
     "messageSha256": {
@@ -143,6 +215,30 @@
     },
     "javaClientsJar": "4.3.1"
   },
+  "DescribeTransactions": {
+    "kafkaTag": "4.3.1",
+    "messageSha256": {
+      "Request": "c0a31e10bc7525cd0d61a49e4035a8ab67ae49387d20db61205dc4a060f07769",
+      "Response": "d14d889ed117bb0c2d5c2a39b3937f6df997abc443a5ad7ac754d4112ec6aeae"
+    },
+    "javaClientsJar": null
+  },
+  "DescribeUserScramCredentials": {
+    "kafkaTag": "4.3.1",
+    "messageSha256": {
+      "Request": "e3551378a9f2d59fb65de32641f79f40ea5a9b5a554ee668ed06d182c5064323",
+      "Response": "2ead5ef7c1fc92546da6c50bc703e0ed13eee56ae108dfc76857c9069b6cde8b"
+    },
+    "javaClientsJar": null
+  },
+  "ElectLeaders": {
+    "kafkaTag": "4.3.1",
+    "messageSha256": {
+      "Request": "3048a2c953cd8e1a3343269c6eb827070471c18a5e62f4232dbc247768d1b3f5",
+      "Response": "b47545dec74fc336fe46b0ad6d6ad416b8b4ff032d564cd23b2bf83ad093c400"
+    },
+    "javaClientsJar": null
+  },
   "EndTxn": {
     "kafkaTag": "4.3.1",
     "messageSha256": {
@@ -150,6 +246,14 @@
       "Response": "5b6ad18b4883e33be291367736c45c30b7240f9e6e6e168c9a8abac0755d561a"
     },
     "javaClientsJar": "4.3.1"
+  },
+  "ExpireDelegationToken": {
+    "kafkaTag": "4.3.1",
+    "messageSha256": {
+      "Request": "a7f118857c35f3e6cf95b3b81eee31e13080ba92345b3016aa7525f6e70f9c3b",
+      "Response": "e0e3e4c82e5cd796480b95b6dc79d691e8994fae89c77699d09fb8b351a322e7"
+    },
+    "javaClientsJar": null
   },
   "Fetch": {
     "kafkaTag": "4.3.1",
@@ -207,6 +311,14 @@
     },
     "javaClientsJar": "4.3.1"
   },
+  "ListConfigResources": {
+    "kafkaTag": "4.3.1",
+    "messageSha256": {
+      "Request": "3b8a841835ddd392cabb39c4e930f5fc3b7f0c74d8353311f729bee52e9b4f21",
+      "Response": "e41bf574f16f52df3b8b5de1013ad3cb93378c4d9d3f77c62fc26f6a7511ceed"
+    },
+    "javaClientsJar": null
+  },
   "ListGroups": {
     "kafkaTag": "4.3.1",
     "messageSha256": {
@@ -231,6 +343,14 @@
     },
     "javaClientsJar": null
   },
+  "ListTransactions": {
+    "kafkaTag": "4.3.1",
+    "messageSha256": {
+      "Request": "b54931d4ab03cf2a6da501737b5e59709447448e680e54037a741b824bb94176",
+      "Response": "154abac86cb57d4e87827194d890efb5a01deb16970e31476bbd4cc86686abed"
+    },
+    "javaClientsJar": null
+  },
   "Metadata": {
     "kafkaTag": "4.3.1",
     "messageSha256": {
@@ -246,6 +366,14 @@
       "Response": "6cc52093ca2378d170fdcf54a30647c8d1d5dab22b22fb85ac2346767bc8f629"
     },
     "javaClientsJar": "4.3.1"
+  },
+  "OffsetDelete": {
+    "kafkaTag": "4.3.1",
+    "messageSha256": {
+      "Request": "9508470c5727082e6212e8ca43e6966a79874495ead10cf724824b5934ee2a39",
+      "Response": "ea99e5b080ad9ed6b56d19e9e749b9a4e5c37dbcd6aa69a663e97ff9fc7a1656"
+    },
+    "javaClientsJar": null
   },
   "OffsetFetch": {
     "kafkaTag": "4.3.1",
@@ -270,6 +398,14 @@
       "Response": "ea483c690ec06f83b3dcd95c5ec53f239702f754a16963d62300b156a233614a"
     },
     "javaClientsJar": "4.3.1"
+  },
+  "RenewDelegationToken": {
+    "kafkaTag": "4.3.1",
+    "messageSha256": {
+      "Request": "c87758d9a4f7abf1e7e457107ca0d84e22770c7b5aadf35b4f33b07ee847e544",
+      "Response": "30d8490c8fcc122a11490a33949d24cdcbf1367ba6b3d9c04e5a4241c8b38842"
+    },
+    "javaClientsJar": null
   },
   "SaslAuthenticate": {
     "kafkaTag": "4.3.1",
@@ -302,5 +438,21 @@
       "Response": "2ef40e2c8e4365856516cbba6b4cc6e1f5bae7759c24e14fb13be5f5215ca1eb"
     },
     "javaClientsJar": "4.3.1"
+  },
+  "UpdateFeatures": {
+    "kafkaTag": "4.3.1",
+    "messageSha256": {
+      "Request": "afb94b3e2a0a6f14f7535128f61ecb00e4498f0b1a0820cd9740ae4f8a384a03",
+      "Response": "789762f475eafb2fa9823146f9368d7b8299687eb1e02a8a5493f2936561f7c4"
+    },
+    "javaClientsJar": null
+  },
+  "WriteTxnMarkers": {
+    "kafkaTag": "4.3.1",
+    "messageSha256": {
+      "Request": "3845cb619a6da7b3d9ca8588d3f23e9a7adf6bf8fef3fe64ddc96013e49ac0f9",
+      "Response": "0dc0ffd22775d3f05dc9a588ef8541d8e938651431350b75890d7fccb304af39"
+    },
+    "javaClientsJar": null
   }
 }

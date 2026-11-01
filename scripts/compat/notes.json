@@ -9,7 +9,7 @@
       "since": "2026-10-23"
     },
     "ListOffsets": {
-      "note": "v4 leader epoch (KIP-320), v6 flexible, v7 max-timestamp (KIP-734), v8 earliest-local offset (KIP-405), v9 last-tiered offset (KIP-1005). v10 (async remote list offsets, KIP-1075) and v11 (earliest pending upload offset, KIP-1023) are deliberate gaps, not a waiver: both are tiered-storage features this client does not use.",
+      "note": "v4 leader epoch (KIP-320), v6 flexible, v7 max-timestamp (KIP-734), v8 earliest-local offset (KIP-405), v9 last-tiered offset (KIP-1005). v10 (async remote list offsets, KIP-1075) and v11 (earliest pending upload offset, KIP-1023) are not yet implemented.",
       "since": "2026-09-03"
     },
     "Metadata": {
@@ -76,6 +76,10 @@
       "note": "v2 PRODUCER_FENCED, v3 flexible, v4 TRANSACTION_ABORTABLE, v5 returns the producer id and epoch the coordinator bumped to (KIP-890 part 2). A transaction stays at v4 or below unless its coordinator finalizes transaction.version at level 2 or above in ApiVersions v3+; v5 being advertised is not the signal.",
       "since": "2026-10-08"
     },
+    "WriteTxnMarkers": {
+      "note": "Written by a transaction coordinator to the leaders of the partitions in a transaction, and also sent by `abortTransaction`. v1 is the 4.0 baseline and flexible; v2 adds TransactionVersion (KIP-1228). Not yet implemented.",
+      "since": "2026-10-19"
+    },
     "TxnOffsetCommit": {
       "note": "v2 committed leader epoch, v3 flexible with KIP-447 group metadata (generation, member id, group instance id), v4 TRANSACTION_ABORTABLE, v5 adds the offsets to the transaction itself under transaction version 2, so no AddOffsetsToTxn precedes it. A transaction stays at v4 or below unless its coordinator finalizes transaction.version at level 2 or above.",
       "since": "2026-10-08"
@@ -119,6 +123,10 @@
     "ConsumerGroupDescribe": {
       "note": "Admin-side counterpart of KIP-848; needed so group descriptions stop reporting consumer-protocol groups as Dead.",
       "since": "2026-09-03"
+    },
+    "ListConfigResources": {
+      "note": "v0 is the old ListClientMetricsResources and lists only client-metrics resources; v1 adds a ResourceTypes filter (KIP-1142). Not yet implemented.",
+      "since": "2026-10-19"
     },
     "DescribeTopicPartitions": {
       "note": "Paginated describe of topics by name, with topic ids and eligible leader replicas; v0 is the only version and every 4.x broker offers it. The ELR arrays are null unless the cluster tracks them.",

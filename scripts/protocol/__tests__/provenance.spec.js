@@ -3,7 +3,7 @@
 const fs = require('fs')
 const os = require('os')
 const path = require('path')
-const { requests } = require('../../../src/protocol/requests')
+const trackedApis = require('../../compat/tracked-apis.json')
 const { compute, render, pinnedJar, checkProvenance, writeProvenance } = require('../provenance')
 
 const COMMITTED = path.join(__dirname, '..', 'provenance.json')
@@ -35,10 +35,10 @@ describe('scripts/protocol > provenance', () => {
   describe('what is recorded', () => {
     const provenance = compute()
 
-    test('one entry per implemented API, by its Apache message name', () => {
-      const implemented = Object.entries(requests).filter(([, { versions }]) => versions.length > 0)
+    test('one entry per tracked API that has a request slot, by its Apache message name', () => {
+      const slotted = trackedApis.tracked.filter(({ apiKeysName }) => apiKeysName !== null)
 
-      expect(Object.keys(provenance)).toHaveLength(implemented.length)
+      expect(Object.keys(provenance)).toEqual(slotted.map(({ kafkaName }) => kafkaName).sort())
       expect(Object.keys(provenance)).toContain('FindCoordinator')
       expect(Object.keys(provenance)).not.toContain('GroupCoordinator')
       expect(Object.keys(provenance)).toEqual([...Object.keys(provenance)].sort())
@@ -82,7 +82,7 @@ describe('scripts/protocol > provenance', () => {
       ])
     })
 
-    test('fails for an API that is missing from the file and for one that is no longer implemented', () => {
+    test('fails for an API that is missing from the file and for one the request table lacks', () => {
       const file = copyOfCommitted((p) => {
         delete p.Heartbeat
         p.Imaginary = p.Produce
