@@ -1,6 +1,6 @@
 const { MemberAssignment } = require('../consumer/assignerProtocol')
 const { createErrorFromCode } = require('../protocol/error')
-const createRetry = require('../retry')
+const { retrierOf, currentDeadline, withConsumerOperation } = require('./deadline')
 
 /** @see https://github.com/apache/kafka/blob/4.3/clients/src/main/java/org/apache/kafka/common/protocol/Errors.java */
 const GROUP_ID_NOT_FOUND = 69
@@ -69,11 +69,41 @@ class GroupDescriptions {
   }
 
   /**
+   * Preserves the consumer's operation retry executor; ordinary admin calls use the running deadline.
+   * @param {object} context per-call immutable operation reference
+   * @returns {Function} existing counted retrier under the captured operation
+   */
+  #retrier(context) {
+    const operation = context.operation
+    if (operation?.retry) return (action) => operation.retry(action, this.retry)
+    return operation?.retrier ? operation.retrier(this.retry) : retrierOf(this.retry)
+  }
+
+  /**
+   * Checks the captured consumer/admin operation in its awaiting continuation.
+   * @param {object} context original invocation
+   * @param {any} value result to publish only while current
+   * @returns {any} unchanged result
+   * @throws {Error} original operation refusal
+   */
+  #checked(context, value) {
+    context.operation?.check()
+    return value
+  }
+
+  /**
+   * Lazily enters a captured operation's wait, preserving consumer outside admin context.
+   * @param {object} context original invocation
+   * @param {Function} work not-yet-started operation
+   * @returns {Promise<any>|any} original result or bounded local wait
+   */
+  #wait(context, work) {
+    return context.operation ? context.operation.wait(work) : work()
+  }
+
+  /**
    * @param {string[]} groupIds
-   * @param {{ operation?: import('../consumer/groupProtocol/interface').ConsumerOperation }} [context]
-   *   a consumer call's one deadline scope: its retries, lookups, refreshes and write guard replace
-   *   the ordinary ones, so nothing is retried, refreshed or sent once it expired. Absent for the
-   *   admin client, whose calls are unchanged.
+   * @param {object} [options] original consumer operation and requested authorization flag
    * @returns {Promise<{ groups: object[] }>} one row per id, NOT in input order, each carrying
    *          every field 2.2.4 returned plus the additive ones. An id a coordinator leaves out of
    *          its answer is described through the older API rather than dropped
@@ -82,10 +112,43 @@ class GroupDescriptions {
    *         newer API reports stays on that group's row instead; one DescribeGroups reports for an
    *         id that fell back to it fails the call, because that API's own parse throws every
    *         group-level code but GROUP_ID_NOT_FOUND
-   * @throws {Error} the operation's refusal once it expired or was retired
    */
-  async describe(groupIds, { operation } = {}) {
-    const described = await this.#describeByCoordinator(groupIds, operation)
+  async describe(groupIds, options = {}) {
+    return withConsumerOperation(options.operation, async () => {
+      const coordinators = new Map()
+      const operation = currentDeadline()
+      const unown = operation?.own(() => coordinators.clear())
+      try {
+        return await this.#describe(groupIds, { ...options, coordinators })
+      } finally {
+        unown?.()
+        coordinators.clear()
+      }
+    })
+  }
+
+  /**
+   * Describes both protocols within the original operation and a call-local coordinator map.
+   * @param {string[]} groupIds requested ids
+   * @param {object} options original consumer operation and optional authorization flag
+   * @returns {Promise<{groups: object[]}>} unified rows
+   * @throws {Error} original protocol, retry, consumer or admin refusal
+   */
+  async #describe(groupIds, { operation, coordinators, includeAuthorizedOperations = false } = {}) {
+    if (typeof includeAuthorizedOperations !== 'boolean') {
+      const { KafkaJSInvalidConfigurationError } = require('../errors')
+      throw new KafkaJSInvalidConfigurationError('includeAuthorizedOperations must be a boolean')
+    }
+    const context = {
+      operation: operation || currentDeadline(),
+      consumerOperation: operation,
+      includeAuthorizedOperations,
+      coordinators,
+    }
+    const described = this.#checked(
+      context,
+      await this.#wait(context, async () => this.#describeByCoordinator(groupIds, context))
+    )
     const rows = described.filter(({ needsFallback }) => !needsFallback).map(({ row }) => row)
     const fallbacks = described.filter(({ needsFallback }) => needsFallback)
 
@@ -93,18 +156,27 @@ class GroupDescriptions {
       return { groups: rows }
     }
 
-    operation?.check()
-    const classic = await this.#describeClassicByCoordinator(
-      fallbacks.map(({ groupId }) => groupId),
-      operation
+    const classic = this.#checked(
+      context,
+      await this.#wait(context, async () =>
+        this.#describeClassicByCoordinator(
+          fallbacks.map(({ groupId }) => groupId),
+          context
+        )
+      )
     )
-    operation?.check()
     const stashed = new Map(fallbacks.map(({ groupId, error }) => [groupId, error]))
 
     return {
       groups: [
         ...rows,
-        ...classic.map((row) => this.#shapeClassicGroup(row, stashed.get(row.groupId))),
+        ...classic.map((row) =>
+          this.#shapeClassicGroup(
+            row,
+            stashed.get(row.groupId),
+            context.includeAuthorizedOperations
+          )
+        ),
       ],
     }
   }
@@ -115,13 +187,19 @@ class GroupDescriptions {
    * the fallback in one go.
    * @private
    * @param {string[]} groupIds
-   * @param {import('../consumer/groupProtocol/interface').ConsumerOperation} [operation]
+   * @param {object} context captured operation and per-call coordinator map
    * @returns {Promise<Array<{ groupId: string, row?: object, needsFallback: boolean, error?: {errorCode: number, errorMessage: string|null} }>>}
    */
-  async #describeByCoordinator(groupIds, operation) {
-    const batches = await this.#groupByCoordinator(groupIds, operation)
-    const perBatch = await Promise.all(
-      batches.map((batch) => this.#describeBatch(batch, operation))
+  async #describeByCoordinator(groupIds, context) {
+    const batches = this.#checked(
+      context,
+      await this.#wait(context, async () => this.#groupByCoordinator(groupIds, context))
+    )
+    const perBatch = this.#checked(
+      context,
+      await this.#wait(context, async () =>
+        Promise.all(batches.map((batch) => this.#describeBatch(batch, context)))
+      )
     )
 
     return perBatch.flat()
@@ -138,54 +216,76 @@ class GroupDescriptions {
    *
    * @private
    * @param {{ coordinator: object, ids: string[] }} batch
-   * @param {import('../consumer/groupProtocol/interface').ConsumerOperation} [operation]
+   * @param {object} context captured operation and per-call coordinator map
    * @returns {Promise<Array<{ groupId: string, row?: object, needsFallback: boolean, error?: object }>>}
    * @throws {KafkaJSNumberOfRetriesExceeded} when the coordinator never settles within the budget
    */
-  async #describeBatch({ coordinator, ids }, operation) {
+  async #describeBatch({ coordinator, ids }, context) {
     let target = coordinator
     let batchIds = ids
     let coordinatorMoved = false
     let response
 
-    const retried = (attempt) =>
-      operation ? operation.retry(attempt, this.retry) : createRetry(this.retry)(attempt)
-    const guarded = operation ? { guard: operation.guard } : {}
-
     try {
-      response = await retried(async () => {
-        if (coordinatorMoved) {
-          await this.cluster.refreshMetadata(...(operation ? [{ fence: operation }] : []))
-          operation?.check()
-          // Regrouped, not re-pointed at the first id's new coordinator: a `__consumer_offsets`
-          // leader move can split ids that shared a coordinator across two brokers, and sending
-          // the whole batch to one of them would keep drawing NOT_COORDINATOR for the rest until
-          // the budget ran out. Each sub-batch retries on its own from here.
-          const regrouped = await this.#groupByCoordinator(batchIds, operation)
+      response = this.#checked(
+        context,
+        await this.#wait(context, async () =>
+          this.#retrier(context)(async () => {
+            if (coordinatorMoved) {
+              this.#checked(
+                context,
+                await this.#wait(context, async () =>
+                  this.cluster.refreshMetadata(
+                    ...(context.consumerOperation ? [{ fence: context.consumerOperation }] : [])
+                  )
+                )
+              )
+              // Regrouped, not re-pointed at the first id's new coordinator: a `__consumer_offsets`
+              // leader move can split ids that shared a coordinator across two brokers, and sending
+              // the whole batch to one of them would keep drawing NOT_COORDINATOR for the rest until
+              // the budget ran out. Each sub-batch retries on its own from here.
+              for (const id of batchIds) context.coordinators.delete(id)
+              const regrouped = this.#checked(
+                context,
+                await this.#wait(context, async () => this.#groupByCoordinator(batchIds, context))
+              )
 
-          if (regrouped.length > 1) {
-            const perBatch = await Promise.all(
-              regrouped.map((batch) => this.#describeBatch(batch, operation))
+              if (regrouped.length > 1) {
+                const perBatch = this.#checked(
+                  context,
+                  await this.#wait(context, async () =>
+                    Promise.all(regrouped.map((batch) => this.#describeBatch(batch, context)))
+                  )
+                )
+                return { split: perBatch.flat() }
+              }
+
+              target = regrouped[0].coordinator
+              batchIds = regrouped[0].ids
+              coordinatorMoved = false
+            }
+
+            const answer = this.#checked(
+              context,
+              await this.#wait(context, async () =>
+                target.consumerGroupDescribe({
+                  groupIds: batchIds,
+                  ...(context.consumerOperation && { guard: context.consumerOperation.guard }),
+                  includeAuthorizedOperations: context.includeAuthorizedOperations,
+                })
+              )
             )
-            return { split: perBatch.flat() }
-          }
+            const unsettled = answer.groups.find(({ errorCode }) => RETRIES_BATCH.has(errorCode))
 
-          target = regrouped[0].coordinator
-          batchIds = regrouped[0].ids
-          coordinatorMoved = false
-        }
+            if (unsettled) {
+              coordinatorMoved = RE_FINDS_COORDINATOR.has(unsettled.errorCode)
+              throw createErrorFromCode(unsettled.errorCode)
+            }
 
-        operation?.check()
-        const answer = await target.consumerGroupDescribe({ groupIds: batchIds, ...guarded })
-        const unsettled = answer.groups.find(({ errorCode }) => RETRIES_BATCH.has(errorCode))
-
-        if (unsettled) {
-          coordinatorMoved = RE_FINDS_COORDINATOR.has(unsettled.errorCode)
-          throw createErrorFromCode(unsettled.errorCode)
-        }
-
-        return answer
-      })
+            return answer
+          })
+        )
+      )
     } catch (e) {
       if (doesNotSupportApiKey(e)) {
         this.logger.debug('Broker does not offer ConsumerGroupDescribe, describing as classic', {
@@ -207,7 +307,7 @@ class GroupDescriptions {
     const answered = new Set(response.groups.map(({ groupId }) => groupId))
 
     return [
-      ...response.groups.map((row) => this.#routeRow(row)),
+      ...response.groups.map((row) => this.#routeRow(row, context)),
       // An id the coordinator left out of its answer is described through the older API instead,
       // with no error to carry forward, rather than being dropped from the result.
       ...batchIds
@@ -220,9 +320,10 @@ class GroupDescriptions {
    * What to do with one ConsumerGroupDescribe row: shape it, or route it to the older API.
    * @private
    * @param {object} row
+   * @param {object} context captured operation and requested authorization flag
    * @returns {{ groupId: string, row?: object, needsFallback: boolean, error?: object }}
    */
-  #routeRow(row) {
+  #routeRow(row, context) {
     const { groupId, errorCode, errorMessage } = row
 
     if (ROUTES_TO_CLASSIC.has(errorCode)) {
@@ -233,37 +334,94 @@ class GroupDescriptions {
 
     // Anything else - including an authorization failure - surfaces on the row rather than
     // throwing, so one bad id cannot fail the whole call.
-    return { groupId, needsFallback: false, row: this.#shapeConsumerGroup(row) }
+    return {
+      groupId,
+      needsFallback: false,
+      row: this.#shapeConsumerGroup(row, context.includeAuthorizedOperations),
+    }
   }
 
   /**
    * One DescribeGroups per coordinator for the ids that routed.
    * @private
    * @param {string[]} groupIds
-   * @param {import('../consumer/groupProtocol/interface').ConsumerOperation} [operation]
+   * @param {object} context captured operation and per-call coordinator map
    * @returns {Promise<object[]>} the raw key-15 rows
    */
-  async #describeClassicByCoordinator(groupIds, operation) {
-    const batches = await this.#groupByCoordinator(groupIds, operation)
-
-    const perBatch = await Promise.all(
-      batches.map(async ({ coordinator, ids }) => {
-        const attempt = () => {
-          operation?.check()
-          return coordinator.describeGroups({
-            groupIds: ids,
-            ...(operation && { guard: operation.guard }),
-          })
-        }
-        const { groups } = await (operation
-          ? operation.retry(attempt, this.retry)
-          : createRetry(this.retry)(attempt))
-
-        return groups
-      })
+  async #describeClassicByCoordinator(groupIds, context) {
+    const batches = this.#checked(
+      context,
+      await this.#wait(context, async () => this.#groupByCoordinator(groupIds, context))
     )
+    return this.#checked(
+      context,
+      await this.#wait(context, async () =>
+        Promise.all(batches.map((batch) => this.#describeClassicBatch(batch.ids, context)))
+      )
+    ).flat()
+  }
 
-    return perBatch.flat()
+  /**
+   * Retries only unresolved classic ids using their located coordinators; a move can split a batch.
+   * @param {string[]} ids original ids on one initial coordinator
+   * @param {object} context original consumer/admin operation and per-call map
+   * @returns {Promise<object[]>} raw classic rows
+   * @throws {Error} original retry exhaustion, response error, or operation refusal
+   */
+  async #describeClassicBatch(ids, context) {
+    const pending = new Set(ids)
+    const completed = new Map()
+    this.#checked(
+      context,
+      await this.#wait(context, async () =>
+        this.#retrier(context)(async () => {
+          const batches = this.#checked(
+            context,
+            await this.#wait(context, async () => this.#groupByCoordinator([...pending], context))
+          )
+          let failure
+          let failed = false
+          this.#checked(
+            context,
+            await this.#wait(context, async () =>
+              Promise.allSettled(
+                batches.map(async ({ coordinator, ids: batchIds }) => {
+                  try {
+                    const { groups } = this.#checked(
+                      context,
+                      await this.#wait(context, async () =>
+                        coordinator.describeGroups({
+                          groupIds: batchIds,
+                          ...(context.consumerOperation && {
+                            guard: context.consumerOperation.guard,
+                          }),
+                          includeAuthorizedOperations: context.includeAuthorizedOperations,
+                        })
+                      )
+                    )
+                    for (const row of groups) {
+                      completed.set(row.groupId, row)
+                      pending.delete(row.groupId)
+                    }
+                  } catch (error) {
+                    if (!failed) {
+                      failed = true
+                      failure = error
+                    }
+                    if (RE_FINDS_COORDINATOR.has(error.code)) {
+                      for (const id of batchIds) context.coordinators.delete(id)
+                    }
+                    throw error
+                  }
+                })
+              )
+            )
+          )
+          if (failed) throw failure
+        })
+      )
+    )
+    return [...completed.values()]
   }
 
   /**
@@ -271,22 +429,34 @@ class GroupDescriptions {
    * client has always used, kept so N ids do not become N round trips.
    * @private
    * @param {string[]} groupIds
-   * @param {import('../consumer/groupProtocol/interface').ConsumerOperation} [operation] its close
-   *   ends each lookup's retries and dials
+   * @param {object} context captured operation and per-call coordinator map
    * @returns {Promise<Array<{ coordinator: object, ids: string[] }>>}
    */
-  async #groupByCoordinator(groupIds, operation) {
-    const locate = () =>
-      Promise.all(
-        groupIds.map(async (groupId) => ({
-          groupId,
-          coordinator: await this.cluster.findGroupCoordinator({
-            groupId,
-            ...(operation && { fence: operation }),
-          }),
-        }))
+  async #groupByCoordinator(groupIds, context) {
+    const located = this.#checked(
+      context,
+      await this.#wait(context, async () =>
+        Promise.all(
+          groupIds.map(async (groupId) => {
+            let coordinator = context.coordinators.get(groupId)
+            if (!coordinator) {
+              coordinator = this.#checked(
+                context,
+                await this.#wait(context, async () =>
+                  this.cluster.findGroupCoordinator({
+                    groupId,
+                    ...(context.consumerOperation && { fence: context.consumerOperation }),
+                    guard: currentDeadline()?.guard,
+                  })
+                )
+              )
+              context.coordinators.set(groupId, coordinator)
+            }
+            return { groupId, coordinator }
+          })
+        )
       )
-    const located = await (operation ? operation.wait(locate) : locate())
+    )
 
     const batches = new Map()
     for (const { groupId, coordinator } of located) {
@@ -302,9 +472,10 @@ class GroupDescriptions {
    * A ConsumerGroupDescribe row in the unified shape.
    * @private
    * @param {object} row
+   * @param {boolean} requested whether the mask was requested
    * @returns {object}
    */
-  #shapeConsumerGroup(row) {
+  #shapeConsumerGroup(row, requested) {
     // An errored row describes nothing: the coordinator answered a code instead of a group, so its
     // type and protocol are unknown rather than 'consumer'. Reporting them as 'consumer' would make
     // a dashboard call a classic group the caller merely lacks a Describe ACL for a KIP-848 group.
@@ -325,7 +496,11 @@ class GroupDescriptions {
       assignmentEpoch: row.assignmentEpoch,
       assignorName: row.assignorName == null ? null : row.assignorName,
       authorizedOperations:
-        row.authorizedOperations === NO_AUTHORIZED_OPERATIONS ? null : row.authorizedOperations,
+        !requested ||
+        row.authorizedOperations == null ||
+        row.authorizedOperations === NO_AUTHORIZED_OPERATIONS
+          ? null
+          : row.authorizedOperations,
       members: (row.members || []).map((member) => this.#shapeMember(member, 'consumer')),
     }
   }
@@ -339,9 +514,10 @@ class GroupDescriptions {
    * @private
    * @param {object} row
    * @param {{errorCode: number, errorMessage: string|null}} [stashed]
+   * @param {boolean} requested whether the mask was requested
    * @returns {object}
    */
-  #shapeClassicGroup(row, stashed) {
+  #shapeClassicGroup(row, stashed, requested) {
     // The Java admin rejects a classic group whose protocolType is neither "consumer" nor empty.
     // kafkajs has always returned such groups, so this client keeps returning them.
     // @see https://github.com/apache/kafka/blob/4.3/clients/src/main/java/org/apache/kafka/clients/admin/internals/DescribeConsumerGroupsHandler.java
@@ -363,7 +539,11 @@ class GroupDescriptions {
       assignmentEpoch: null,
       assignorName: null,
       authorizedOperations:
-        row.authorizedOperations === NO_AUTHORIZED_OPERATIONS ? null : row.authorizedOperations,
+        !requested ||
+        row.authorizedOperations == null ||
+        row.authorizedOperations === NO_AUTHORIZED_OPERATIONS
+          ? null
+          : row.authorizedOperations,
       members: (row.members || []).map((member) =>
         this.#shapeMember(member, 'classic', row.protocolType)
       ),

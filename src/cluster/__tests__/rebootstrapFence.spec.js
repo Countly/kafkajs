@@ -222,7 +222,8 @@ describe('rebootstrap and the producer lifecycle that asked for it', () => {
       expect(builds).toHaveLength(2)
       builds.forEach((build) => build.resolve(poolDouble('fresh')))
       await flushAll()
-      expect([first.state, second.state]).toEqual(['fulfilled', 'fulfilled'])
+      expect([first.state, second.state]).toEqual(['fulfilled', 'rejected'])
+      expect(second.value).toMatchObject({ name: 'KafkaJSConnectionError' })
     } finally {
       await cluster.disconnect({ drainTimeout: 0 })
     }

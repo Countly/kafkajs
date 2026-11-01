@@ -1,6 +1,8 @@
 /**
  * The fields of the wire vectors that carry bytes only (`{ type: 'Buffer', data }`), written out
  * as literals from the Java generator that produced them, never obtained by decoding the bytes.
+ * The metadataV7 construction literals are schema-derived until their separately required
+ * Java serialization/provenance comparison succeeds; its source entry identifies that gate.
  * Each entry names its source; the structured vectors (`hex` and `fields`) need no entry because
  * the vector holds its own fields.
  *
@@ -16,6 +18,45 @@
  * numbers below are that file's.
  */
 module.exports = {
+  metadataV7: {
+    source:
+      'MetadataRequest/Response 4.3.1 v7 field literals; independent Java v7 serialization acceptance required',
+    request: {
+      topics: ['test-topic'],
+      allowAutoTopicCreation: true,
+    },
+    response: {
+      throttleTime: 0,
+      brokers: [
+        {
+          nodeId: 0,
+          host: '127.0.0.1',
+          port: 9092,
+          rack: null,
+        },
+      ],
+      clusterId: 'test-cluster-id',
+      controllerId: 0,
+      topics: [
+        {
+          errorCode: 0,
+          name: 'test-topic',
+          isInternal: false,
+          partitions: [
+            {
+              errorCode: 0,
+              partitionIndex: 0,
+              leaderId: 1,
+              leaderEpoch: 5,
+              replicas: [1],
+              isr: [1],
+              offlineReplicas: [],
+            },
+          ],
+        },
+      ],
+    },
+  },
   apiVersionsV4: {
     source:
       'buildApiVersionsRequest l.262 (client software l.59-60), buildApiVersionsResponse l.275',

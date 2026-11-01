@@ -1308,3 +1308,46 @@ describe('independent record-containing Produce requests', () => {
     ).toEqual({ version: 2, bumpRequired: false })
   })
 })
+
+describe('Metadata v7 pair', () => {
+  const pair = require('../wire/metadataV7')
+  test('reads independent classic request literals', () => {
+    expect(pair.readRequest(Buffer.from('00000001000a746573742d746f70696301', 'hex'))).toEqual({
+      topics: ['test-topic'],
+      allowAutoTopicCreation: true,
+    })
+    expect(pair.readRequest(Buffer.from('ffffffff00', 'hex'))).toEqual({
+      topics: null,
+      allowAutoTopicCreation: false,
+    })
+  })
+  test('matches the independent classic response layout literals', async () => {
+    const hex =
+      '00000000000000010000000000093132372e302e302e3100002384ffff000f746573742d636c75737465722d696400000000000000010000000a746573742d746f706963000000000100000000000000000001000000050000000100000001000000010000000100000000'
+    expect(pair.buildResponse().toString('hex')).toBe(hex)
+    const result = await require('../../src/protocol/requests/metadata/v7/response').decode(
+      Buffer.from(hex, 'hex')
+    )
+    expect(result.topicMetadata[0]).toMatchObject({
+      topic: 'test-topic',
+      partitionMetadata: [
+        {
+          partitionId: 0,
+          leader: 1,
+          leaderEpoch: 5,
+          replicas: [1],
+          isr: [1],
+          offlineReplicas: [],
+          partitionErrorCode: 0,
+        },
+      ],
+    })
+    expect(result.topicMetadata[0].topicAuthorizedOperations).toBeUndefined()
+  })
+  test('rejects a cut request and trailing bytes', () => {
+    expect(() => pair.readRequest(Buffer.from('00000001000a74', 'hex'))).toThrow()
+    expect(() =>
+      pair.readRequest(Buffer.from('00000001000a746573742d746f7069630100', 'hex'))
+    ).toThrow()
+  })
+})

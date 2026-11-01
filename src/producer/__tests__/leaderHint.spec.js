@@ -323,11 +323,14 @@ describe('Producer > KIP-951 leader hint', () => {
     expect(pool.createBroker).toHaveBeenCalledWith(
       expect.objectContaining({ nodeId: 2, versions: pool.versions })
     )
-    expect(pool.buildConnectionPool).toHaveBeenCalledWith({
-      host: '127.0.0.2',
-      port: 9095,
-      rack: 'rack-b',
-    })
+    expect(pool.buildConnectionPool).toHaveBeenCalledWith(
+      {
+        host: '127.0.0.2',
+        port: 9095,
+        rack: 'rack-b',
+      },
+      { fence: undefined, isCurrent: expect.any(Function) }
+    )
     expect(pool.authenticationBlackout.get('127.0.0.1:9092')).toBeTruthy()
   })
 

@@ -570,6 +570,20 @@ export interface RetryOptions {
 
 export interface AdminConfig {
   retry?: RetryOptions
+  /** Default end-to-end call budget, integer 1..2147483647 ms; default 60000. */
+  apiTimeout?: number
+}
+
+/** Additive per-call budget; a transmitted mutation may already have been applied on timeout. */
+export interface ApiTimeoutOption {
+  apiTimeout?: number
+}
+
+/** Per-item result for the additive admin families; legacy void/aggregate contracts stay intact. */
+export interface AdminItemResult {
+  errorCode: number
+  error: KafkaJSError | null
+  errorMessage: string | null
 }
 
 export interface ITopicConfig {
@@ -587,6 +601,8 @@ export interface ITopicPartitionConfig {
 }
 
 export interface ITopicMetadata {
+  /** Raw signed INT32 mask; null if not requested, unsupported, absent or -2147483648. */
+  authorizedOperations?: number | null
   name: string
   partitions: PartitionMetadata[]
   /** The topic's id (KIP-516); `null` when the broker sends none, absent below Metadata v10. */
@@ -931,78 +947,89 @@ export interface OngoingPartitionReassignment {
 export type Admin = {
   connect(): Promise<void>
   disconnect(): Promise<void>
-  listTopics(): Promise<string[]>
-  createTopics(options: {
+  listTopics(options?: ApiTimeoutOption): Promise<string[]>
+listTopics(): Promise<string[]>
+  createTopics(options: ({
     validateOnly?: boolean
     waitForLeaders?: boolean
     timeout?: number
     topics: ITopicConfig[]
-  }): Promise<boolean>
-  deleteTopics(options: { topics: string[]; timeout?: number }): Promise<void>
-  createPartitions(options: {
+  }) & ApiTimeoutOption): Promise<boolean>
+  deleteTopics(options: ({ topics: string[]; timeout?: number }) & ApiTimeoutOption): Promise<void>
+  createPartitions(options: ({
     validateOnly?: boolean
     timeout?: number
     topicPartitions: ITopicPartitionConfig[]
-  }): Promise<boolean>
+  }) & ApiTimeoutOption): Promise<boolean>
   /**
    * With `useDescribeTopicPartitions` and at least one topic the topics are read through
    * DescribeTopicPartitions (KIP-966); without topics, or on a broker that lacks the API, through
    * Metadata, which lists every topic when none is named.
    */
-  fetchTopicMetadata(options?: {
+  fetchTopicMetadata(options?: ({
     topics?: string[]
     useDescribeTopicPartitions?: boolean
-  }): Promise<{ topics: Array<ITopicMetadata> }>
-  fetchOffsets(options: {
+    includeTopicAuthorizedOperations?: boolean
+  }) & ApiTimeoutOption): Promise<{ topics: Array<ITopicMetadata> }>
+  fetchOffsets(options: ({
     groupId: string
     topics?: string[]
     resolveOffsets?: boolean
-  }): Promise<Array<{ topic: string; partitions: FetchOffsetsPartition[] }>>
-  fetchTopicOffsets(topic: string): Promise<Array<SeekEntry & { high: string; low: string }>>
-  fetchTopicOffsetsByTimestamp(topic: string, timestamp?: number): Promise<Array<SeekEntry>>
-  describeCluster(): Promise<{
+  }) & ApiTimeoutOption): Promise<Array<{ topic: string; partitions: FetchOffsetsPartition[] }>>
+  fetchTopicOffsets(topic: string, options?: ApiTimeoutOption): Promise<Array<SeekEntry & { high: string; low: string }>>
+fetchTopicOffsets(topic: string): Promise<Array<SeekEntry & { high: string; low: string }>>
+  fetchTopicOffsetsByTimestamp(topic: string, timestamp?: number, options?: ApiTimeoutOption): Promise<Array<SeekEntry>>
+fetchTopicOffsetsByTimestamp(topic: string, timestamp?: number): Promise<Array<SeekEntry>>
+  describeCluster(options?: ApiTimeoutOption): Promise<{
     brokers: Array<{ nodeId: number; host: string; port: number }>
     controller: number | null
     clusterId: string
   }>
-  setOffsets(options: { groupId: string; topic: string; partitions: SeekEntry[] }): Promise<void>
-  resetOffsets(options: { groupId: string; topic: string; earliest: boolean }): Promise<void>
-  describeConfigs(configs: {
+describeCluster(): Promise<{
+    brokers: Array<{ nodeId: number; host: string; port: number }>
+    controller: number | null
+    clusterId: string
+  }>
+  setOffsets(options: ({ groupId: string; topic: string; partitions: SeekEntry[] }) & ApiTimeoutOption): Promise<void>
+  resetOffsets(options: ({ groupId: string; topic: string; earliest: boolean }) & ApiTimeoutOption): Promise<void>
+  describeConfigs(configs: ({
     resources: ResourceConfigQuery[]
     includeSynonyms: boolean
     /** Ask for each entry's `documentation`; sent from DescribeConfigs v3. */
     includeDocumentation?: boolean
-  }): Promise<DescribeConfigResponse>
-  alterConfigs(configs: { validateOnly: boolean; resources: IResourceConfig[] }): Promise<any>
+  }) & ApiTimeoutOption): Promise<DescribeConfigResponse>
+  alterConfigs(configs: ({ validateOnly: boolean; resources: IResourceConfig[] }) & ApiTimeoutOption): Promise<any>
   /**
    * A failed resource is a result with its own `errorCode`, not an error; `NOT_CONTROLLER` is
    * retried. An invalid argument throws `KafkaJSNonRetriableError` before anything is sent.
    */
-  incrementalAlterConfigs(configs: {
+  incrementalAlterConfigs(configs: ({
     validateOnly?: boolean
     resources: IncrementalResourceConfig[]
-  }): Promise<IncrementalAlterConfigsResult>
-  listGroups(options?: ListGroupsOptions): Promise<{ groups: GroupOverview[] }>
-  deleteGroups(groupIds: string[]): Promise<DeleteGroupsResult[]>
+  }) & ApiTimeoutOption): Promise<IncrementalAlterConfigsResult>
+  listGroups(options?: (ListGroupsOptions) & ApiTimeoutOption): Promise<{ groups: GroupOverview[] }>
+  deleteGroups(groupIds: string[], options?: ApiTimeoutOption): Promise<DeleteGroupsResult[]>
+deleteGroups(groupIds: string[]): Promise<DeleteGroupsResult[]>
   /** Without `members`, removes every member `describeGroups` reports. */
-  removeMembersFromConsumerGroup(options: {
+  removeMembersFromConsumerGroup(options: ({
     groupId: string
     members?: Array<{ groupInstanceId: string }>
     reason?: string | null
-  }): Promise<RemoveMembersResult>
-  describeGroups(groupIds: string[]): Promise<GroupDescriptions>
-  describeAcls(options: AclFilter): Promise<DescribeAclResponse>
-  deleteAcls(options: { filters: AclFilter[] }): Promise<DeleteAclResponse>
-  createAcls(options: { acl: AclEntry[] }): Promise<boolean>
-  deleteTopicRecords(options: { topic: string; partitions: SeekEntry[] }): Promise<void>
-  alterPartitionReassignments(request: {
+  }) & ApiTimeoutOption): Promise<RemoveMembersResult>
+  describeGroups(groupIds: string[], options?: ApiTimeoutOption & { includeAuthorizedOperations?: boolean }): Promise<GroupDescriptions>
+describeGroups(groupIds: string[]): Promise<GroupDescriptions>
+  describeAcls(options: (AclFilter) & ApiTimeoutOption): Promise<DescribeAclResponse>
+  deleteAcls(options: ({ filters: AclFilter[] }) & ApiTimeoutOption): Promise<DeleteAclResponse>
+  createAcls(options: ({ acl: AclEntry[] }) & ApiTimeoutOption): Promise<boolean>
+  deleteTopicRecords(options: ({ topic: string; partitions: SeekEntry[] }) & ApiTimeoutOption): Promise<void>
+  alterPartitionReassignments(request: ({
     topics: PartitionReassignment[]
     timeout?: number
-  }): Promise<void>
-  listPartitionReassignments(request: {
+  }) & ApiTimeoutOption): Promise<void>
+  listPartitionReassignments(request: ({
     topics?: TopicPartitions[]
     timeout?: number
-  }): Promise<ListPartitionReassignmentsResponse>
+  }) & ApiTimeoutOption): Promise<ListPartitionReassignmentsResponse>
   logger(): Logger
   on(
     eventName: AdminEvents['CONNECT'],

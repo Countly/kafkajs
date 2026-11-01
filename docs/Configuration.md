@@ -324,6 +324,10 @@ Invalid timeout/backoff values fail at construction with `KafkaJSInvalidConfigur
 
 `connectionsMaxIdle` closes a connection after 540000 ms of inactivity by default. Set it to `0` to keep idle connections open as before. It accepts integers from 0 to 2147483647; `undefined` uses the default. Numeric strings, `null`, fractions and non-finite values are rejected at construction with `KafkaJSInvalidConfigurationError`. A request being authenticated or encoded, a queued request and an in-flight request prevent reaping, including a long-poll Fetch. The next request reconnects and renegotiates ApiVersions. The client keeps TCP keepalive. The default is below the default broker idle timeout; it does not guarantee which side closes first or eliminate close races.
 
+## Admin
+
+`kafka.admin({ apiTimeout })` sets the default end-to-end budget of admin operations, in milliseconds (default 60000). Each admin operation can override it. It must be an integer from 1 to 2147483647. See [Admin call deadlines](Admin.md#call-deadlines) for unknown mutation outcomes, unchanged retry limits and the distinction from broker-side `timeout`.
+
 ## Request Timeout
 
 Time in milliseconds to wait for a successful request. The default value is: `30000`.

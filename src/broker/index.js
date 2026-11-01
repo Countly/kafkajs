@@ -1,3 +1,4 @@
+const { currentDeadline, checked, withAdminGuard, sharedSetup } = require('../admin/deadline')
 const Lock = require('../utils/lock')
 const describeThrown = require('../network/describeThrown')
 const { Types: Compression } = require('../protocol/message/compression')
@@ -356,6 +357,8 @@ module.exports = class Broker {
    * @throws {Error} the error the guard returned
    */
   async connect({ guard } = {}) {
+    const operation = currentDeadline()
+    if (operation) return operation.wait(() => sharedSetup(() => this.connect({ guard })))
     this.throwIfRetired()
     this.throwIfRefused(guard)
     await this.lock.acquire()
@@ -664,6 +667,7 @@ module.exports = class Broker {
    * @param {(frameLength?: number) => Error|null} [options.guard] a producer's private pre-write
    *   check; it never reaches the request
    * @param {boolean} [options.allowAutoTopicCreation] overrides only this request
+   * @param {boolean} [options.includeTopicAuthorizedOperations=false] requests raw topic masks from v8
    * @param {boolean} [options.lenient=false] retains per-topic/partition errors in data
    * @param {boolean} [options.allowLeaderless=false] keeps a partition without a leader in data;
    *   other errors still throw
@@ -675,13 +679,20 @@ module.exports = class Broker {
       guard,
       lenient = false,
       allowLeaderless = false,
+      includeTopicAuthorizedOperations = false,
       allowAutoTopicCreation = this.allowAutoTopicCreation,
     } = options
     this.throwIfRefused(guard)
     const metadata = this.lookupRequest(apiKeys.Metadata, requests.Metadata)
     const shuffledTopics = shuffle(topics)
     return await this[PRIVATE.SEND_REQUEST](
-      metadata({ topics: shuffledTopics, allowAutoTopicCreation, lenient, allowLeaderless }),
+      metadata({
+        topics: shuffledTopics,
+        allowAutoTopicCreation,
+        lenient,
+        allowLeaderless,
+        includeTopicAuthorizedOperations,
+      }),
       guard
     )
   }
@@ -1723,7 +1734,12 @@ module.exports = class Broker {
     this.throwIfRefused(guard)
     const initProducerId = this.lookupRequest(apiKeys.InitProducerId, requests.InitProducerId)
     return await this[PRIVATE.SEND_REQUEST](
-      initProducerId({ transactionalId, transactionTimeout, producerId, producerEpoch }),
+      initProducerId({
+        transactionalId,
+        transactionTimeout,
+        producerId,
+        producerEpoch,
+      }),
       guard
     )
   }
@@ -1755,7 +1771,12 @@ module.exports = class Broker {
       requests.AddPartitionsToTxn
     )
     return await this[PRIVATE.SEND_REQUEST](
-      addPartitionsToTxn({ transactionalId, producerId, producerEpoch, topics }),
+      addPartitionsToTxn({
+        transactionalId,
+        producerId,
+        producerEpoch,
+        topics,
+      }),
       guard
     )
   }
@@ -2128,6 +2149,9 @@ module.exports = class Broker {
    * @throws {Error} the error of the failed request, or the one the guard returned
    */
   async [PRIVATE.SEND_REQUEST](protocolRequest, guard) {
+    const setupGuard = guard
+    guard = withAdminGuard(guard)
+    currentDeadline()?.check()
     const pool = this.connectionPool
     let generation = pool.generation
     try {
@@ -2135,13 +2159,15 @@ module.exports = class Broker {
         ? pool.getConnectionByRequest(protocolRequest, { guard })
         : pool.getConnectionByRequest(protocolRequest))
       this.throwIfReplaced(pool)
+      currentDeadline()?.check()
 
       if (
         protocolRequest.request.apiKey !== apiKeys.ApiVersions &&
         this.versionsGeneration !== pool.generation
       ) {
-        await (guard ? this.connect({ guard }) : this.connect())
+        await (setupGuard ? this.connect({ guard: setupGuard }) : this.connect())
         this.throwIfReplaced(pool)
+        currentDeadline()?.check()
       }
 
       if (!connection.isConnected()) {
@@ -2149,12 +2175,14 @@ module.exports = class Broker {
           ? pool.getConnectionByRequest(protocolRequest, { guard })
           : pool.getConnectionByRequest(protocolRequest))
         this.throwIfReplaced(pool)
+        currentDeadline()?.check()
       }
 
       this.throwIfRefused(guard)
       generation = pool.generation
-      return await pool.send(protocolRequest, connection, guard ? { guard } : null, true)
+      return checked(await pool.send(protocolRequest, connection, guard ? { guard } : null, true))
     } catch (e) {
+      currentDeadline()?.check()
       attachFailureSource(e, { broker: this, generation })
       this.retireSibling(e, generation, pool)
 

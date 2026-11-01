@@ -1133,6 +1133,10 @@ Group visibility and the admin client.
   them); `retry: { retries: 0 }` makes a single attempt.
 - **A DescribeTopicPartitions read has one 60 s deadline.** `fetchTopicMetadata({ topics, useDescribeTopicPartitions: true })` rejects with `KafkaJSTimeout` when the read, every page and retry included, is not done within 60 s, and a topic recreated between two pages is read again from the start. *What to do:* nothing, unless your cluster pages that slowly; then use the default Metadata path (`useDescribeTopicPartitions: false`).
 
+Admin calls take an `apiTimeout` (default 60 000 ms) and reject with `KafkaJSTimeout` when it passes; a mutation may have been applied. Retries are unchanged, unlike Java's unbounded retries inside the deadline. Configure the default with `kafka.admin({ apiTimeout })`, or override one call. Values must be integers from 1 to 2147483647. A broker-side `timeout` remains independent and is not shortened on the wire.
+
+Describe calls can request the optional raw authorized-operations mask; an unsupported field returns null. The mask stays an optional `number | null`, with the signed INT32 value preserved. No mask-type migration is required.
+
 ### Errors and events
 
 Error classes and categories, new instrumentation events and the payload keys they gain, and what is

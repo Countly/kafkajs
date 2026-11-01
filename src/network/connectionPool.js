@@ -1,3 +1,4 @@
+const { withAdminGuard } = require('../admin/deadline')
 const apiKeys = require('../protocol/requests/apiKeys')
 const Connection = require('./connection')
 const { ConnectionSetupPolicy, NodeSetupStates, SetupAttempt } = require('./connectionSetup')
@@ -218,7 +219,15 @@ module.exports = class ConnectionPool {
       resolvedConnection.failIfNotConnected()
     }
     const guard = options?.guard
-    return resolvedConnection.send(guard ? { ...protocolRequest, guard } : protocolRequest)
+    return resolvedConnection.send(
+      guard
+        ? {
+            ...protocolRequest,
+            guard,
+            responseGuard: withAdminGuard(protocolRequest.responseGuard),
+          }
+        : protocolRequest
+    )
   }
 
   /**

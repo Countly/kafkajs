@@ -135,7 +135,7 @@ describe('Admin > fetchTopicMetadata > UNKNOWN_TOPIC_OR_PARTITION', () => {
     const cluster = { allowAutoTopicCreation: true, metadata }
 
     await expect(adminOver(cluster).fetchTopicMetadata({ topics: ['t'] })).resolves.toEqual({
-      topics: [{ name: 't', partitions: [] }],
+      topics: [{ name: 't', partitions: [], authorizedOperations: null }],
     })
 
     expect(metadata).toHaveBeenCalledTimes(2)

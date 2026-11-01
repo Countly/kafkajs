@@ -92,8 +92,11 @@ const stubSeed = (pool, metadata) => {
   pool.brokers = {}
   pool.seedBroker = seed
   pool.createSeedBroker = async () => {
+    const previous = seed
     seed = { ...seed }
     pool.seedBroker = seed
+    pool.closeObsolete(previous)
+    return seed
   }
   pool.buildConnectionPool = async (d) => ({
     ...d,
@@ -778,7 +781,7 @@ describe('BrokerPool > rebootstrap', () => {
       expect(events).toEqual([{ reason: 'timeout' }])
     })
 
-    test('the old brokers are disconnected even when the replacement seed cannot be built', async () => {
+    test('retains old brokers when the replacement seed cannot be built', async () => {
       const { cluster } = createCluster()
       const pool = cluster.brokerPool
       stubSeed(pool, async () => ok)
@@ -790,8 +793,8 @@ describe('BrokerPool > rebootstrap', () => {
 
       await expect(pool.rebootstrap('timeout')).rejects.toThrow('bad broker list')
 
-      expect(disconnect).toHaveBeenCalledTimes(1)
-      expect(pool.brokers).toEqual({})
+      expect(disconnect).not.toHaveBeenCalled()
+      expect(pool.brokers[1].disconnect).toBe(disconnect)
     })
 
     test('two direct rebootstrap() calls join one in-flight teardown', async () => {
