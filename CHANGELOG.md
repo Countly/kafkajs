@@ -196,6 +196,7 @@ Versions before 3.0.0 are internal alpha tags and are not published.
 
 - `blackhole(id)` in the scripted cluster and the connection-setup benchmark.
 - Track the nineteen admin-ledger APIs in the compatibility snapshot, the tracked list and the generated matrix, with named broker ranges.
+- The lifecycle matrix and consumer schedule specs fake the imported and the global monotonic clock together, so they pass late in a long-lived Jest worker; forced-close cells now exercise a real zero-timeout force. No library behaviour changed.
 
 ### Phase 9B — Producer parity: delivery deadline, memory bound, request size, partitioner, codecs, lifecycle
 

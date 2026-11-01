@@ -1,3 +1,4 @@
+const { useSharedFakeClock } = require('./fixtures/sharedFakeClock')
 const { lifecycleCells } = require('../../../testHelpers/lifecycle')
 const committed = require('../../../testHelpers/lifecycleCells.json')
 const { runLifecycleCell } = require('./fixtures/lifecycleCase')
@@ -49,7 +50,7 @@ describe('Consumer lifecycle matrix', () => {
     ).toEqual([])
   })
   describe.each(committed)('$event at $boundary on $protocol/$membership', (cell) => {
-    beforeEach(() => jest.useFakeTimers({ doNotFake: ['setImmediate'] }))
+    beforeEach(useSharedFakeClock)
     afterEach(() => {
       jest.useRealTimers()
       jest.restoreAllMocks()

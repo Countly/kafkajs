@@ -704,6 +704,7 @@ const answerMetadata = (cluster, { topic, partitions }) => {
  * @param {number} [options.generationId=1]
  * @param {Record<number, string>} [options.committed={}] committed offset by partition
  * @param {string} [options.earliest='0']
+ * @param {Set<ReturnType<typeof setTimeout>>} [options.brokerAnswerTimers] outstanding Fetch-answer timers
  * @param {number} [options.batches=1]
  * @param {number} [options.coordinator] the id of the node that is the group coordinator, the
  *   first node when omitted (the partitions are always led by the first)
@@ -719,6 +720,7 @@ const groupScript = (
     committed = {},
     earliest = '0',
     batches = 1,
+    brokerAnswerTimers = new Set(),
     coordinator,
   } = {}
 ) => {
@@ -781,7 +783,13 @@ const groupScript = (
       fetches += 1
       if (fetches > batches) {
         // Like a broker with nothing to return: hold the answer for the longest wait asked for.
-        await new Promise((resolve) => setTimeout(resolve, maxWaitMs))
+        await new Promise((resolve) => {
+          const timer = setTimeout(() => {
+            brokerAnswerTimers.delete(timer)
+            resolve()
+          }, maxWaitMs)
+          brokerAnswerTimers.add(timer)
+        })
       }
 
       return {
