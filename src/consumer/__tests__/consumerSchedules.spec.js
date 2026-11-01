@@ -1,3 +1,4 @@
+const { useSharedFakeClock } = require('./fixtures/sharedFakeClock')
 const rows = require('./fixtures/consumerSchedules.json')
 const { interleavings } = require('../../../testHelpers/schedule')
 const { lifecycleCells } = require('../../../testHelpers/lifecycle')
@@ -99,7 +100,7 @@ const variants = () =>
   )
 
 describe('Consumer schedule episodes on the real wire', () => {
-  beforeEach(() => jest.useFakeTimers({ doNotFake: ['setImmediate'] }))
+  beforeEach(useSharedFakeClock)
   afterEach(() => {
     jest.useRealTimers()
     jest.restoreAllMocks()
@@ -142,7 +143,7 @@ const interleavingRow = (protocol, order) => ({
 })
 
 describe.each(MODES)('Every ordering of the five rebalance actions on %s', (protocol) => {
-  beforeEach(() => jest.useFakeTimers({ doNotFake: ['setImmediate'] }))
+  beforeEach(useSharedFakeClock)
   afterEach(() => {
     jest.useRealTimers()
     jest.restoreAllMocks()
@@ -163,7 +164,7 @@ describe.each(MODES)('Every ordering of the five rebalance actions on %s', (prot
 })
 
 describe('Consumer schedule controls', () => {
-  beforeEach(() => jest.useFakeTimers({ doNotFake: ['setImmediate'] }))
+  beforeEach(useSharedFakeClock)
   afterEach(() => {
     jest.useRealTimers()
     jest.restoreAllMocks()
