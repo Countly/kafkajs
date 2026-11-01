@@ -351,6 +351,13 @@ describe('ScriptedCluster', () => {
       ).toThrow('ScriptedCluster: no node at elsewhere:1')
     })
 
+    test('disables idle reaping by default and preserves explicit idle limits', () => {
+      const cluster = createScriptedCluster({ nodes: NODES })
+
+      expect(cluster.kafkaOptions().connectionsMaxIdle).toBe(0)
+      expect(cluster.kafkaOptions({ connectionsMaxIdle: 25 }).connectionsMaxIdle).toBe(25)
+    })
+
     test('hands Kafka the endpoints, its own socket factory and the overrides given', () => {
       const cluster = createScriptedCluster({ nodes: NODES })
 

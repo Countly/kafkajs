@@ -398,6 +398,7 @@ const createFakeBroker = (answer, chunks) => {
     clientId: 'test-client',
     connectionTimeout: 1000,
     requestTimeout: 1000,
+    connectionsMaxIdle: 0,
     enforceRequestTimeout: false,
   })
 

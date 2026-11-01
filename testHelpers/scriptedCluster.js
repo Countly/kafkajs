@@ -407,6 +407,7 @@ class ScriptedCluster {
       logLevel: logLevel.NOTHING,
       connectionTimeout: 1000,
       requestTimeout: 5000,
+      connectionsMaxIdle: 0,
       ...overrides,
     }
   }
