@@ -1,4 +1,4 @@
-const { checked, shareMetadata, retrierOf } = require('../admin/deadline')
+const { checked, waitOf, shareMetadata, retrierOf } = require('../admin/deadline')
 const describeThrown = require('../network/describeThrown')
 const BrokerPool = require('./brokerPool')
 const MetadataCache = require('./metadataCache')
@@ -589,7 +589,8 @@ module.exports = class Cluster {
 
   /**
    * The cluster's metadata for `topics` (every topic when empty), as a broker answers it now. In
-   * three stages:
+   * three stages for named topics. An all-topics snapshot skips the cache refresh and uses
+   * the connected seed if no broker inventory exists, so listing sends one Metadata request.
    * 1. The refresh pre-step, `refreshMetadataIfNecessary`, which writes the metadata cache and
    *    emits `TOPIC_RECREATED` as any other route does, but only when the cache is missing,
    *    expired or lacks a named topic. The refresh retries `LEADER_NOT_AVAILABLE` on its own
@@ -625,7 +626,13 @@ module.exports = class Cluster {
   async metadata({ topics = [], includeTopicAuthorizedOperations = false } = {}) {
     return this.retrier(async (bail, retryCount, retryTime) => {
       try {
-        await this.brokerPool.refreshMetadataIfNecessary(topics)
+        if (topics.length === 0 && this.brokerPool.getNodeIds().length === 0) {
+          const broker = checked(await waitOf(() => this.findConnectedBroker()))
+          return checked(
+            await waitOf(() => broker.metadata(topics, { includeTopicAuthorizedOperations }))
+          )
+        }
+        if (topics.length > 0) await this.brokerPool.refreshMetadataIfNecessary(topics)
       } catch (e) {
         if (e.type === 'LEADER_NOT_AVAILABLE') {
           throw e
@@ -1409,7 +1416,8 @@ module.exports = class Cluster {
    * failing refresh must not replace the retriable error the caller is about to retry on.
    *
    * @param {object[]} topics see above
-   * @param {object} [options] private, for a consumer's preparation round
+   * @param {object} [options] per-call isolation and private consumer preparation guards
+   * @param {number} [options.isolationLevel=this.isolationLevel] wire isolation byte; leaves the default unchanged
    * @param {import('../producer/generation')} [options.fence] the caller's terminal fence, for the broker lookups
    *   and the metadata refresh a stale leader epoch starts
    * @param {() => Error|null} [options.guard] the caller's immutable identity: checked before each
@@ -1417,7 +1425,7 @@ module.exports = class Cluster {
    * @returns {Promise<object[]>} the offsets per topic
    * @throws {Error} the guard's refusal, when it refuses
    */
-  async fetchTopicsOffset(topics, { fence, guard } = {}) {
+  async fetchTopicsOffset(topics, { fence, guard, isolationLevel = this.isolationLevel } = {}) {
     const partitionsPerBroker = {}
     const topicConfigurations = dictionary()
 
@@ -1457,7 +1465,7 @@ module.exports = class Cluster {
 
       const { responses: topicOffsets } = await broker.listOffsets({
         guard,
-        isolationLevel: this.isolationLevel,
+        isolationLevel,
         topics: keys(partitions).map((topic) => ({
           topic,
           partitions: partitions[topic].map(addDefaultOffset(topic)),

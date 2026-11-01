@@ -366,11 +366,20 @@ class KafkaJSInvalidLongError extends KafkaJSNonRetriableError {
   }
 }
 
+/** A topic refusal with broker detail separate from the stable protocol message. */
 class KafkaJSCreateTopicError extends KafkaJSProtocolError {
-  constructor(e, topicName) {
+  /**
+   * @param {object|Error} e existing protocol error
+   * @param {string} [topicName] requested topic
+   * @param {string|null} [errorMessage=null] broker detail, never substituted into message
+   * @returns {KafkaJSCreateTopicError} compatible error with additive detail
+   * @throws Never.
+   */
+  constructor(e, topicName, errorMessage = null) {
     super(e)
     this.topic = topicName
     this.name = 'KafkaJSCreateTopicError'
+    this.errorMessage = errorMessage ?? null
   }
 }
 

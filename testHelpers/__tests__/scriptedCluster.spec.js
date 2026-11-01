@@ -182,10 +182,10 @@ describe('ScriptedCluster', () => {
       cluster.assertClean()
     })
 
-    /** The Metadata request that answers `listTopics`: the second, after the one refreshing the cache. */
+    /** The single fresh Metadata request that answers `listTopics`. */
     const answeringListTopics = (cluster) => ({
       api: 'Metadata',
-      match: () => cluster.requests().filter(({ api }) => api === 'Metadata').length === 2,
+      match: () => cluster.requests().filter(({ api }) => api === 'Metadata').length === 1,
     })
     const topicNamed = (name) => ({ ...literal.response.topics[0], name })
 
@@ -505,7 +505,7 @@ describe('ScriptedCluster', () => {
       await admin.connect()
       const gate = cluster.schedule.hold({
         api: 'Metadata',
-        match: () => cluster.requests().filter(({ api }) => api === 'Metadata').length === 2,
+        match: () => cluster.requests().filter(({ api }) => api === 'Metadata').length === 1,
       })
 
       const listing = admin.listTopics()

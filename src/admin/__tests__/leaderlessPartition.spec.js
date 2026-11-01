@@ -219,7 +219,7 @@ describe('Admin > a partition with no leader', () => {
     // The partition loses its leader, and a later answer for every topic is cached as it is.
     leaders[LEADERLESS] = [-1]
     cluster.brokerPool.metadataExpireAt = 0
-    await admin.listTopics()
+    await cluster.brokerPool.refreshMetadata([])
     leaders[LEADERLESS] = [2]
     const refreshes = asked('Metadata').length
 
@@ -245,7 +245,7 @@ describe('Admin > a partition with no leader', () => {
     const cachedLeaderless = async () => {
       const { admin, cluster, leaders } = harness
       await admin.connect()
-      await admin.listTopics()
+      await cluster.brokerPool.refreshMetadata([])
       jest.spyOn(cluster, 'addTargetTopic').mockResolvedValue()
       jest
         .spyOn(cluster, 'fetchTopicsOffset')
