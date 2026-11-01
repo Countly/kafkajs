@@ -794,7 +794,10 @@ module.exports = class Runner extends EventEmitter {
   /**
    * Retires this run for good when its close deadline passes: latches the stop and refuses every
    * later commit, heartbeat and hook wait of the run, so a handler or callback that outlives it
-   * changes nothing. Synchronous and idempotent; application promises are left as they are.
+   * changes nothing. Also stops the fetch manager, which never rejects: the close's own stop never
+   * reaches it once its deadline has passed, and with `running` false every fetch returns [] in
+   * microtasks, so a fetcher left running would spin on `setImmediate` for the life of the process.
+   * Synchronous and idempotent; application promises are left as they are.
    * @param {Error} error the first terminal reason
    * @returns {void}
    */
@@ -804,6 +807,7 @@ module.exports = class Runner extends EventEmitter {
     this.latchStop()
     this.consumerGroup.retireCoordinatorLookup(error)
     this.consumerGroup.retireFetchSessions()
+    this.fetchManager.stop()
     for (const check of this.hookWaiters || []) check()
   }
 

@@ -1019,6 +1019,17 @@ describe('Consumer > Runner', () => {
       expect(consumerGroup.retireFetchSessions).toHaveBeenCalledTimes(1)
     })
 
+    it('stops the fetch manager so no fetcher spins after a forced close', () => {
+      const runner = createTestRunner()
+      runner.fetchManager = { start: jest.fn(), stop: jest.fn(() => Promise.resolve()) }
+      runner.running = true
+
+      runner.retire(new Error('forced close'))
+      runner.retire(new Error('again'))
+
+      expect(runner.fetchManager.stop).toHaveBeenCalledTimes(1)
+    })
+
     it('returns the retirement reason as the commit refusal of a retired run', () => {
       const reason = new Error('forced close')
       runner.retirement = reason
