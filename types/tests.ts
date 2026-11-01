@@ -1534,3 +1534,18 @@ void useBoundedDisconnect
   // @ts-expect-error fetchSessions accepts only booleans
   kafka.consumer({ groupId: 'sessions', fetchSessions: 'true' })
 }
+
+const setupOptions: kafkajs.KafkaConfig = {
+  brokers: ['localhost:9092'],
+  connectionTimeout: 1000,
+  connectionTimeoutMax: 30000,
+  reconnectBackoff: 50,
+  reconnectBackoffMax: 1000,
+  authenticationTimeout: 10000,
+}
+const setupConstructor: ConstructorParameters<typeof Kafka> = [setupOptions]
+new Kafka(...setupConstructor)
+// @ts-expect-error New timeout maximum accepts numbers only.
+const invalidSetupMaximum: kafkajs.KafkaConfig = { brokers: [], connectionTimeoutMax: '30000' }
+// @ts-expect-error Backoff options accept numbers only.
+const invalidSetupBackoff: kafkajs.KafkaConfig = { brokers: [], reconnectBackoff: null }

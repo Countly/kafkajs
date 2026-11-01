@@ -1,3 +1,4 @@
+const setupPool = require('../../../testHelpers/setupPool')
 const Broker = require('../index')
 const { requests } = require('../../protocol/requests')
 const apiKeys = require('../../protocol/requests/apiKeys')
@@ -69,7 +70,7 @@ describe('Broker > connect (KIP-35 rule 7)', () => {
   })
 
   test('negotiates once per pool, not once per call', async () => {
-    const broker = new Broker({ connectionPool: pool, logger: newLogger() })
+    const broker = new Broker({ connectionPool: setupPool(pool), logger: newLogger() })
 
     await broker.connect()
     await broker.connect()
@@ -78,7 +79,7 @@ describe('Broker > connect (KIP-35 rule 7)', () => {
   })
 
   test('re-negotiates after the control socket is replaced', async () => {
-    const broker = new Broker({ connectionPool: pool, logger: newLogger() })
+    const broker = new Broker({ connectionPool: setupPool(pool), logger: newLogger() })
 
     await broker.connect()
     connections[0].connected = false // the broker closed the socket
@@ -88,7 +89,7 @@ describe('Broker > connect (KIP-35 rule 7)', () => {
   })
 
   test('re-negotiates once both sockets have been replaced', async () => {
-    const broker = new Broker({ connectionPool: pool, logger: newLogger() })
+    const broker = new Broker({ connectionPool: setupPool(pool), logger: newLogger() })
 
     await broker.connect()
     // Index 1 (Fetch) is brought up inside the pool, as ConnectionPool does when a fetch is
@@ -103,7 +104,7 @@ describe('Broker > connect (KIP-35 rule 7)', () => {
   })
 
   test('re-negotiates when only the other socket has been reconnected, even though the control socket is still up', async () => {
-    const broker = new Broker({ connectionPool: pool, logger: newLogger() })
+    const broker = new Broker({ connectionPool: setupPool(pool), logger: newLogger() })
 
     await broker.connect()
     // The pool re-establishes index 1 (Fetch) on its own; the control socket (index 0) is
@@ -121,7 +122,7 @@ describe('Broker > connect (KIP-35 rule 7)', () => {
 
   test('re-negotiates even when versions were injected by the broker pool', async () => {
     const broker = new Broker({
-      connectionPool: pool,
+      connectionPool: setupPool(pool),
       logger: newLogger(),
       versions: { 18: { minVersion: 0, maxVersion: 2 } },
     })
@@ -133,7 +134,7 @@ describe('Broker > connect (KIP-35 rule 7)', () => {
   })
 
   test('rebuilds lookupRequest from the fresh table and shares it with both sockets', async () => {
-    const broker = new Broker({ connectionPool: pool, logger: newLogger() })
+    const broker = new Broker({ connectionPool: setupPool(pool), logger: newLogger() })
 
     await broker.connect()
     const first = broker.lookupRequest
@@ -145,7 +146,7 @@ describe('Broker > connect (KIP-35 rule 7)', () => {
   })
 
   test('re-negotiates after the connection pool is replaced wholesale, even if the new pool reaches the same generation number', async () => {
-    const broker = new Broker({ connectionPool: pool, logger: newLogger() })
+    const broker = new Broker({ connectionPool: setupPool(pool), logger: newLogger() })
 
     await broker.connect()
     expect(apiVersionsCalls).toEqual(1)
@@ -159,7 +160,7 @@ describe('Broker > connect (KIP-35 rule 7)', () => {
       createFakeConnection(onApiVersions),
     ]
     const replacementPool = createFakePool(replacementConnections)
-    broker.replaceConnectionPool(replacementPool)
+    broker.replaceConnectionPool(setupPool(replacementPool))
 
     expect(broker.versionsGeneration).toBeNull()
 
@@ -180,7 +181,7 @@ describe('Broker > connect (KIP-35 rule 7)', () => {
       createFakeConnection(() => pendingApiVersions),
     ]
     const slowPool = createFakePool(slowConnections)
-    const broker = new Broker({ connectionPool: slowPool, logger: newLogger() })
+    const broker = new Broker({ connectionPool: setupPool(slowPool), logger: newLogger() })
 
     const connectPromise = broker.connect()
     await new Promise(setImmediate)

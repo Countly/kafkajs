@@ -32,9 +32,7 @@ const { keys } = Object
 const LEADER_NOT_AVAILABLE = 5
 
 const mergeTopics = (obj, { topic, partitions }) =>
-  Object.assign(dictionary(), obj, {
-    [topic]: [...(obj[topic] || []), ...partitions],
-  })
+  Object.assign(dictionary(), obj, { [topic]: [...(obj[topic] || []), ...partitions] })
 
 /**
  * Metadata error codes that describe ONE topic rather than the request: the response carries them
@@ -131,6 +129,10 @@ module.exports = class Cluster {
     sasl,
     clientId,
     connectionTimeout,
+    connectionTimeoutMax,
+    reconnectBackoff,
+    reconnectBackoffMax,
+    setupPolicy,
     authenticationTimeout,
     reauthenticationThreshold,
     requestTimeout = 30000,
@@ -161,6 +163,11 @@ module.exports = class Cluster {
       sasl,
       clientId,
       connectionTimeout,
+      connectionTimeoutMax,
+      reconnectBackoff,
+      reconnectBackoffMax,
+      setupPolicy,
+      authenticationTimeout,
       requestTimeout,
       drainTimeout: requestTimeout,
       enforceRequestTimeout,
@@ -186,10 +193,7 @@ module.exports = class Cluster {
     // retrying, rather than a real "no such topic".
     this.allowAutoTopicCreation = allowAutoTopicCreation
     this.instrumentationEmitter = instrumentationEmitter
-    this.metadataCache = new MetadataCache({
-      logger: rootLogger,
-      instrumentationEmitter,
-    })
+    this.metadataCache = new MetadataCache({ logger: rootLogger, instrumentationEmitter })
     this.brokerPool = new BrokerPool({
       connectionPoolBuilder: this.connectionPoolBuilder,
       logger: this.rootLogger,
@@ -1187,11 +1191,7 @@ module.exports = class Cluster {
       }
 
       if (metadata.leader === null || metadata.leader === undefined) {
-        throw new KafkaJSError('Invalid partition metadata', {
-          topic,
-          partitionId,
-          metadata,
-        })
+        throw new KafkaJSError('Invalid partition metadata', { topic, partitionId, metadata })
       }
 
       if (metadata.leader < 0) {

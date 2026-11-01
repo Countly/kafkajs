@@ -151,6 +151,26 @@ Versions before 3.0.0 are internal alpha tags and are not published.
 
 - Add replayable consumer fault schedules, generated manual, rebalance-hook, forced-close and fetch-session lifecycle cases, and the `soak:consumer-churn` profile with independent log, broker-offset and handler checks, resource baselines and delivery-gap samples.
 
+### Phase 9D — Client, security and admin breadth
+
+#### Behavior changes
+
+- `connectionTimeout` defaults to 10 000 ms and grows per node, with jitter, up to `connectionTimeoutMax` (30 000 ms) while a node keeps failing; it resets when the node is ready. A value you set stays flat. Java's `socket.connection.setup.timeout.ms` (KIP-601).
+- A broker must be ready (TCP, TLS, ApiVersions, SASL) within the setup timeout; a stalled ApiVersions or SASL exchange no longer waits for `requestTimeout`.
+- `authenticationTimeout` now bounds the SASL exchange (it only sized the blackout before). A token callback slower than 10 s needs a larger value.
+- Reconnects to a node whose connection failed wait 50 ms, growing to 1 000 ms; `reconnectBackoff` and `reconnectBackoffMax` tune it.
+- Timeouts now require positive integral values. Some legacy authentication values and fractional connection values could work. Invalid values throw `KafkaJSInvalidConfigurationError`; existing numeric strings remain accepted.
+
+#### Additions
+
+- New client options `connectionTimeoutMax`, `reconnectBackoff` and `reconnectBackoffMax`; `authenticationTimeout` is now enforced.
+
+#### Tooling
+
+- `blackhole(id)` in the scripted cluster and the connection-setup benchmark.
+
+
+
 ### Phase 9B — Producer parity: delivery deadline, memory bound, request size, partitioner, codecs, lifecycle
 
 #### Behavior changes
@@ -975,3 +995,4 @@ Adopted upstream PRs are credited here by number as they land (Phase 2 onward).
 - Test tooling: `testHelpers/chaosSocket.js`, a `socketFactory` wrapper that kills, blackholes, delays, cuts or drops whole frames of a live connection at the application level, never as a TCP proxy (`KAFKAJS_TEST_CHAOS=1` routes the helpers' shared factory through it); broker bounce helpers in `testHelpers/leaderElection.js` that take one compose broker down at a time, refuse to take a second, and always restore it; `testHelpers/rawLog.js`, which reads a topic's log straight from the partition leaders; the live scenarios `npm run test:e2e:broker-bounce`, `npm run test:e2e:request-timeout-close` and `npm run test:e2e:send-offsets-visibility`; and `npm run test:floor`, the core cases against the Kafka 4.0.2 floor broker.
 
 - The three quarantined specs are rewritten with controlled timing and run again: the request timeout and request queue size events on the in-process scripted cluster, and the partition reassignment listing as its completed shape against the compose cluster and its in-flight shape on the scripted cluster. `QUARANTINE.md` lists no skipped test. New specs pin the IPv6 bootstrap parsing, the DescribeTopicPartitions deadline, the authentication blackout across a pool rebuilt for an illegal SASL state, and 50 concurrent Metadata calls holding `maxInFlightRequests: 5` on both lanes and on the 4.0 floor.
+

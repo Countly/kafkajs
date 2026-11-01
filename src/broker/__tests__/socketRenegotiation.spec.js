@@ -1,3 +1,4 @@
+const setupPool = require('../../../testHelpers/setupPool')
 const Broker = require('../index')
 const Connection = require('../../network/connection')
 const Encoder = require('../../protocol/encoder')
@@ -114,7 +115,7 @@ const countApiVersionsRequests = (state) =>
 describe('Broker > per-socket ApiVersions re-negotiation', () => {
   test('a reconnected pooled socket re-negotiates before the next request, once', async () => {
     const { sockets, pool } = createPool()
-    const broker = new Broker({ connectionPool: pool, logger: newLogger() })
+    const broker = new Broker({ connectionPool: setupPool(pool), logger: newLogger() })
 
     await broker.connect()
     expect(broker.isConnected()).toBe(true)
@@ -136,7 +137,7 @@ describe('Broker > per-socket ApiVersions re-negotiation', () => {
 
   test('a request sent across a generation bump re-connects before dispatching', async () => {
     const { sockets, pool } = createPool()
-    const broker = new Broker({ connectionPool: pool, logger: newLogger() })
+    const broker = new Broker({ connectionPool: setupPool(pool), logger: newLogger() })
     await broker.connect()
 
     pool.bumpIndex1()
@@ -149,7 +150,7 @@ describe('Broker > per-socket ApiVersions re-negotiation', () => {
 
   test('ApiVersions itself does not re-enter connect()', async () => {
     const { sockets, pool } = createPool()
-    const broker = new Broker({ connectionPool: pool, logger: newLogger() })
+    const broker = new Broker({ connectionPool: setupPool(pool), logger: newLogger() })
 
     // connect() calls apiVersions() while holding its own non-reentrant lock; a generation check
     // that did not exempt ApiVersions would deadlock here instead of resolving.

@@ -1,6 +1,7 @@
 const { isNativeError } = require('util').types
 const describeThrown = require('../network/describeThrown')
 const Broker = require('../broker')
+const { NodeSetupStates } = require('../network/connectionSetup')
 const MetadataCache = require('./metadataCache')
 const createRetry = require('../retry')
 const shuffle = require('../utils/shuffle')
@@ -114,6 +115,8 @@ module.exports = class BrokerPool {
     // (see buildConnectionPool), so a pool rebuilt after a connection error (seed rotation,
     // illegal SASL state) keeps the blackout instead of starting over with an empty one.
     this.authenticationBlackout = new Map()
+    this.setupStates = null
+    this.setupMetadataEndpoints = new Map()
 
     this.createBroker = (options) =>
       new Broker({
@@ -235,6 +238,14 @@ module.exports = class BrokerPool {
     return fence ? createRetry({ ...this.retryOptions, fence }) : this.retrier
   }
 
+  /** Reconciles eligible endpoints while retaining active attempts. @returns {void} */
+  retainSetupEndpoints() {
+    this.setupStates?.retain([
+      ...(this.connectionPoolBuilder.bootstrapEndpoints || []),
+      ...this.setupMetadataEndpoints.values(),
+    ])
+  }
+
   /**
    * Builds a connection pool via the injected builder and stamps it with this client's
    * authenticationTimeout and this BrokerPool's shared authenticationBlackout map. Every pool
@@ -250,6 +261,9 @@ module.exports = class BrokerPool {
     const connectionPool = await this.connectionPoolBuilder.build(destination)
     connectionPool.authenticationTimeout = this.authenticationTimeout
     connectionPool.authenticationBlackout = this.authenticationBlackout
+    if (!this.setupStates) this.setupStates = new NodeSetupStates(connectionPool.setupPolicy)
+    connectionPool.setupStates = this.setupStates
+    this.retainSetupEndpoints()
     return connectionPool
   }
 
@@ -349,6 +363,8 @@ module.exports = class BrokerPool {
 
       if (isSeed) {
         this.replacePool(broker, connectionPool)
+        this.setupMetadataEndpoints.set(String(nodeId), `${host}:${port}`)
+        this.retainSetupEndpoints()
         continue
       }
 
@@ -359,6 +375,8 @@ module.exports = class BrokerPool {
         nodeId,
       })
       this.closeObsolete(broker)
+      this.setupMetadataEndpoints.set(String(nodeId), `${host}:${port}`)
+      this.retainSetupEndpoints()
     }
   }
 
@@ -545,6 +563,11 @@ module.exports = class BrokerPool {
    * @throws {Error} when a broker's disconnect fails
    */
   async disconnect(options) {
+    if (!options?.preserveSetupState) {
+      this.setupStates?.clear()
+      this.setupMetadataEndpoints.clear()
+    }
+    this.retainSetupEndpoints()
     const brokers = new Set(values(this.brokers))
     if (this.seedBroker) brokers.add(this.seedBroker)
     this.brokers = {}
@@ -745,6 +768,10 @@ module.exports = class BrokerPool {
           if (!isLatest()) return
           this.metadataExpireAt = Date.now() + this.metadataMaxAge
 
+          this.setupMetadataEndpoints = new Map(
+            metadata.brokers.map(({ nodeId, host, port }) => [String(nodeId), `${host}:${port}`])
+          )
+          this.retainSetupEndpoints()
           const previousBrokers = { ...this.brokers }
           const freshBrokerIds = new Set(metadata.brokers.map(({ nodeId }) => String(nodeId)))
           const seedAddressAdvertised = metadata.brokers.some(
@@ -770,7 +797,11 @@ module.exports = class BrokerPool {
               this.closeObsolete(previous)
               continue
             }
-            const connectionPool = await this.buildConnectionPool({ host, port, rack })
+            const connectionPool = await this.buildConnectionPool({
+              host,
+              port,
+              rack,
+            })
             if (
               !isLatest() ||
               this.brokers[nodeId] !== previous ||
@@ -1124,7 +1155,11 @@ module.exports = class BrokerPool {
 
         if (describeThrown(e, 'retriable') === 'true') throw e
         try {
-          this.logger.error(e, { retryCount, retryTime, stack: describeThrown(e, 'stack') })
+          this.logger.error(e, {
+            retryCount,
+            retryTime,
+            stack: describeThrown(e, 'stack'),
+          })
         } catch {}
         bail(e)
       }

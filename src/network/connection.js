@@ -17,6 +17,7 @@ const RequestQueue = require('./requestQueue')
 const { CONNECTION_STATUS, CONNECTED_STATUS } = require('./connectionStatus')
 const sharedPromiseTo = require('../utils/sharedPromiseTo')
 const Long = require('../utils/long')
+const { ConnectionSetupPolicy, SetupAttempt } = require('./connectionSetup')
 const SASLAuthenticator = require('../broker/saslAuthenticator')
 const apiKeys = require('../protocol/requests/apiKeys')
 const { responseHeaderVersion, RESPONSE_HEADER_V1 } = require('../protocol/headers')
@@ -89,7 +90,13 @@ module.exports = class Connection {
    *                             key "mechanism". Connection is not actively using the SASL attributes
    *                             but acting as a data object for this information
    * @param {number} [options.reauthenticationThreshold=10000]
-   * @param {number} options.connectionTimeout The connection timeout, in milliseconds
+   * @param {number} options.connectionTimeout Resolved base in milliseconds
+   * @param {number} [options.connectionTimeoutMax] Resolved setup ceiling
+   * @param {number} [options.reconnectBackoff] Resolved retry wait base
+   * @param {number} [options.reconnectBackoffMax] Resolved retry wait ceiling
+   * @param {number} [options.authenticationTimeout] Whole-SASL cap in milliseconds
+   * @param {ConnectionSetupPolicy} [options.setupPolicy] Policy resolved before downstream defaults
+   * @param {() => SetupAttempt} [options.beginSetup] Current shared node owner callback
    * @param {boolean} [options.enforceRequestTimeout]
    * @param {number} [options.maxResponseSize=104857600] The largest response body accepted, in bytes,
    *                                            the 4-byte length prefix excluded. A larger, negative or
@@ -118,6 +125,12 @@ module.exports = class Connection {
     sasl = null,
     clientId = 'kafkajs',
     connectionTimeout,
+    authenticationTimeout,
+    connectionTimeoutMax,
+    reconnectBackoff,
+    reconnectBackoffMax,
+    setupPolicy,
+    beginSetup,
     enforceRequestTimeout = true,
     maxResponseSize = DEFAULT_MAX_RESPONSE_SIZE,
     maxInFlightRequests = 5,
@@ -137,6 +150,24 @@ module.exports = class Connection {
 
     this.requestTimeout = requestTimeout
     this.connectionTimeout = connectionTimeout
+    this.setupPolicy =
+      setupPolicy ||
+      ConnectionSetupPolicy.resolve({
+        connectionTimeout,
+        connectionTimeoutMax,
+        reconnectBackoff,
+        reconnectBackoffMax,
+        authenticationTimeout,
+      })
+    this.connectionTimeout = this.setupPolicy.timeoutBase
+    this.connectionTimeoutMax = connectionTimeoutMax ?? this.setupPolicy.timeoutCeiling
+    this.reconnectBackoff = reconnectBackoff ?? this.setupPolicy.waitBase
+    this.reconnectBackoffMax = reconnectBackoffMax ?? this.setupPolicy.waitCeiling
+    this.authenticationTimeout = this.setupPolicy.authenticationTimeout
+    this.beginSetup =
+      beginSetup || (() => new SetupAttempt({ address: this.broker, policy: this.setupPolicy }))
+    this.setupAttempt = null
+    this.authEpisode = null
     this.reauthenticationThreshold = reauthenticationThreshold
     this.instrumentationEmitter = instrumentationEmitter
     this.onAuthenticationFailure = onAuthenticationFailure
@@ -188,13 +219,14 @@ module.exports = class Connection {
       broker: this.broker,
       logger: logger.namespace('RequestQueue'),
       isConnected: () => this.isConnected(),
-      onRequestTimeout: () =>
-        this.closeGeneration(
-          new KafkaJSConnectionClosedError('Closed connection', {
-            host: this.host,
-            port: this.port,
-          })
-        ),
+      onRequestTimeout: () => {
+        const error = new KafkaJSConnectionClosedError('Closed connection', {
+          host: this.host,
+          port: this.port,
+        })
+        this.setupAttempt?.fail(error)
+        this.closeGeneration(error)
+      },
     })
 
     this.versions = null
@@ -228,21 +260,30 @@ module.exports = class Connection {
      * @private
      * @returns {Promise}
      */
-    this[PRIVATE.AUTHENTICATE] = sharedPromiseTo(async () => {
-      if (this.sasl && !this.isAuthenticated()) {
-        const authenticator = new SASLAuthenticator(this, this.logger, this.versions)
+    this[PRIVATE.AUTHENTICATE] = () => this.authenticate()
 
-        await authenticator.authenticate()
-        this.authenticatedAt = process.hrtime()
-        this.sessionLifetime = Long.fromValue(authenticator.sessionLifetime)
+    this[PRIVATE.CONNECT] = sharedPromiseTo(async (supplied) => {
+      if (!supplied && this.connectionStatus === CONNECTION_STATUS.CONNECTED) return true
+      const attempt = supplied || this.beginSetup()
+      this.setupAttempt = attempt
+      try {
+        if (attempt.waitMs() > 0) await attempt.wait()
+        else attempt.assertCurrent()
+        attempt.arm((error) => {
+          if (this.setupAttempt === attempt) this.failGeneration(error)
+        })
+        await attempt.guard(this[PRIVATE.CONNECT_ATTEMPT](), {
+          phase: 'TCP/TLS',
+        })
+        if (!supplied && !attempt.brokerManaged) {
+          this.finishSetup(attempt)
+        }
+        return true
+      } catch (error) {
+        attempt.fail(error)
+        throw error
       }
     })
-
-    /**
-     * @private
-     * @returns {Promise}
-     */
-    this[PRIVATE.CONNECT] = sharedPromiseTo(() => this[PRIVATE.CONNECT_ATTEMPT]())
   }
 
   setVersions(versions) {
@@ -260,10 +301,12 @@ module.exports = class Connection {
    * time for this connection.
    *
    * @public
-   * @returns {Promise}
+   * @param {{ attempt?: SetupAttempt }} [options] externally managed broker readiness budget
+   * @returns {Promise<boolean>} socket established within its original budget
+   * @throws {KafkaJSConnectionError} on cancellation, expiry or transport failure
    */
-  connect() {
-    return this[PRIVATE.CONNECT]()
+  connect({ attempt } = {}) {
+    return this[PRIVATE.CONNECT](attempt)
   }
 
   /**
@@ -298,13 +341,11 @@ module.exports = class Connection {
 
       this.authenticatedAt = null
 
-      let timeoutId
       const attempt = ++this.connectAttempt
       this[PRIVATE.QUEUED] = Promise.resolve()
       const isCurrentAttempt = () => this.connectAttempt === attempt
 
       const abort = (error) => {
-        clearTimeout(timeoutId)
         this[PRIVATE.ABORT_CONNECT] = null
         reject(error)
       }
@@ -312,7 +353,6 @@ module.exports = class Connection {
 
       const onConnect = () => {
         if (!isCurrentAttempt()) return
-        clearTimeout(timeoutId)
         this[PRIVATE.ABORT_CONNECT] = null
         this.frames.reset()
         this.connectionStatus = CONNECTION_STATUS.CONNECTED
@@ -384,15 +424,18 @@ module.exports = class Connection {
       } catch (error) {
         const native = isNativeError(error)
         this.failGeneration(
-          native ? error : new KafkaJSNonRetriableError('Failed to connect', { cause: error }),
+          native
+            ? error
+            : new KafkaJSNonRetriableError('Failed to connect', {
+                cause: error,
+              }),
           native ? null : 'Failed to connect: '
         )
         return
       }
 
       try {
-        timeoutId = setTimeout(onTimeout, this.connectionTimeout)
-        this.socket = createSocket({
+        const socket = createSocket({
           socketFactory: this.socketFactory,
           host: this.host,
           port: this.port,
@@ -403,6 +446,11 @@ module.exports = class Connection {
           onError,
           onTimeout,
         })
+        if (!isCurrentAttempt()) {
+          socket.destroy()
+        } else {
+          this.socket = socket
+        }
       } catch (e) {
         this.failGeneration(
           new KafkaJSConnectionError('Failed to connect', {
@@ -438,6 +486,9 @@ module.exports = class Connection {
    * @returns {Promise<true>}
    */
   async disconnect({ drainTimeout } = {}) {
+    this.cancelSetup(
+      new KafkaJSConnectionError('Connection closed while connecting', { broker: this.broker })
+    )
     this.authenticatedAt = null
     this.connectionStatus = CONNECTION_STATUS.DISCONNECTING
     const abortConnect = this[PRIVATE.ABORT_CONNECT]
@@ -470,7 +521,10 @@ module.exports = class Connection {
     }
 
     this.closeGeneration(
-      new KafkaJSConnectionClosedError('Closed connection', { host: this.host, port: this.port }),
+      new KafkaJSConnectionClosedError('Closed connection', {
+        host: this.host,
+        port: this.port,
+      }),
       socket || this.socket
     )
     if (drainFailed) {
@@ -504,6 +558,7 @@ module.exports = class Connection {
    * @returns {void}
    */
   failGeneration(error, messagePrefix = null) {
+    this.setupAttempt?.fail(error)
     if (
       !this.socket &&
       !this[PRIVATE.ABORT_CONNECT] &&
@@ -533,6 +588,7 @@ module.exports = class Connection {
    * @returns {void}
    */
   closeGeneration(error, socket = this.socket) {
+    this.cancelSetup(error)
     const abortConnect = this[PRIVATE.ABORT_CONNECT]
     this[PRIVATE.ABORT_CONNECT] = null
     this.connectAttempt += 1
@@ -615,9 +671,79 @@ module.exports = class Connection {
     return reauthenticateAt.greaterThanOrEqual(this.sessionLifetime)
   }
 
-  /** @public */
-  async authenticate() {
-    await this[PRIVATE.AUTHENTICATE]()
+  /** Completes readiness once; idle tracking extends this single boundary.
+   * @param {SetupAttempt} attempt original ready attempt
+   * @returns {void}
+   * @throws {KafkaJSConnectionError} if the original budget ended
+   */
+  finishSetup(attempt) {
+    attempt.ready()
+    if (this.setupAttempt === attempt) this.setupAttempt = null
+  }
+
+  /**
+   * Cancels setup and detaches any shared authentication episode before teardown awaits.
+   * @param {Error} [error] close reason
+   * @returns {void}
+   */
+  cancelSetup(error) {
+    this.setupAttempt?.cancel(error)
+    this.setupAttempt = null
+    this.authEpisode?.budget.cancel(error)
+    this.authEpisode = null
+  }
+
+  /**
+   * Shares one bounded SASL episode on this socket; never adopts a replacement token.
+   * @param {{ attempt?: SetupAttempt }} [options] Broker setup budget when applicable
+   * @returns {Promise<void>}
+   * @throws {KafkaJSConnectionError} when the whole SASL phase expires
+   */
+  authenticate({ attempt = this.setupAttempt } = {}) {
+    if (!this.sasl || this.isAuthenticated()) return Promise.resolve()
+    if (this.authEpisode) return this.authEpisode.promise
+    const epoch = this.connectAttempt
+    const socket = this.socket
+    const budget =
+      attempt ||
+      new SetupAttempt({
+        address: this.broker,
+        policy: this.setupPolicy,
+        timeoutMs: this.authenticationTimeout,
+      })
+    const guard = () =>
+      budget.refusal() ||
+      (this.connectAttempt !== epoch || this.socket !== socket
+        ? new KafkaJSConnectionError('Authentication connection was replaced', {
+            broker: this.broker,
+          })
+        : null)
+    const episode = { budget, promise: null }
+    this.authEpisode = episode
+    if (!attempt)
+      budget.arm((error) => {
+        if (this.connectAttempt === epoch && this.socket === socket) this.failGeneration(error)
+      })
+    episode.promise = (async () => {
+      try {
+        const authenticator = new SASLAuthenticator(this, this.logger, this.versions, guard)
+        await budget.guard(authenticator.authenticate(), {
+          phase: 'SASL',
+          cap: this.authenticationTimeout,
+        })
+        const refusal = guard()
+        if (refusal) throw refusal
+        this.authenticatedAt = process.hrtime()
+        this.sessionLifetime = Long.fromValue(authenticator.sessionLifetime)
+        if (!attempt) budget.ready()
+      } catch (error) {
+        budget.fail(error)
+        throw error
+      } finally {
+        if (this.authEpisode === episode) this.authEpisode = null
+      }
+    })()
+    return episode.promise
   }
 
   /**
@@ -672,9 +798,18 @@ module.exports = class Connection {
    *                         encoded and again at the instant of transmission; an error it returns
    *                         rejects this one request, which is then written nowhere, takes no
    *                         in-flight slot and leaves the connection open.
+   * @param {(() => Error|null)|null} [protocol.responseGuard=null] original setup/authentication
+   *                         guard, checked after decode and parse before publishing side effects
    * @returns {Promise<data>} where data is the return of "response#parse"
    */
-  async send({ request, response, requestTimeout = null, logResponseError = true, guard = null }) {
+  async send({
+    request,
+    response,
+    requestTimeout = null,
+    logResponseError = true,
+    guard = null,
+    responseGuard = null,
+  }) {
     const attempt = this.connectAttempt
     const expectResponse = !request.expectResponse || request.expectResponse()
     const prepared = this[PRIVATE.PREPARE]({ request, expectResponse, guard })
@@ -702,6 +837,8 @@ module.exports = class Connection {
 
     try {
       const payloadDecoded = await response.decode(responseBody(entry, payload))
+      const decodedRefusal = responseGuard && responseGuard()
+      if (decodedRefusal) throw decodedRefusal
 
       /**
        * @see KIP-219
@@ -710,6 +847,8 @@ module.exports = class Connection {
       this.requestQueue.maybeThrottle(payloadDecoded.clientSideThrottleTime)
 
       const data = await response.parse(payloadDecoded)
+      const parsedRefusal = responseGuard && responseGuard()
+      if (parsedRefusal) throw parsedRefusal
       const isFetchApi = entry.apiName === 'Fetch'
       this.logDebug(`Response ${requestInfo(entry)}`, {
         correlationId,
@@ -756,7 +895,11 @@ module.exports = class Connection {
 
     const { clientId } = this
     const correlationId = this.nextCorrelationId()
-    const requestPayload = await createRequest({ request, correlationId, clientId })
+    const requestPayload = await createRequest({
+      request,
+      correlationId,
+      clientId,
+    })
     this.logDebug(`Request ${requestInfo(request)}`, {
       correlationId,
       expectResponse,
@@ -794,7 +937,14 @@ module.exports = class Connection {
     const answered = new Promise((resolve, reject) => {
       try {
         this.failIfNotConnected(attempt)
-        const entry = { apiKey, apiName, apiVersion, correlationId, resolve, reject }
+        const entry = {
+          apiKey,
+          apiName,
+          apiVersion,
+          correlationId,
+          resolve,
+          reject,
+        }
 
         this.requestQueue.push({
           entry,

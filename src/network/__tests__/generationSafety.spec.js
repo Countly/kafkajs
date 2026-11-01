@@ -328,7 +328,7 @@ describe('Network > generation failure boundaries', () => {
       const connecting = settle(connection.connect())
       expect(() => jest.advanceTimersByTime(30)).not.toThrow()
       expect(socket.destroyed).toBe(true)
-      expect((await connecting).error.message).toBe('Connection timeout')
+      expect((await connecting).error.message).toMatch(/TCP\/TLS.*30ms/)
       expect(connection.socket).toBeNull()
       expect(jest.getTimerCount()).toBe(0)
     } finally {

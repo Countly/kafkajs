@@ -1,3 +1,4 @@
+const setupPool = require('../../../testHelpers/setupPool')
 const Broker = require('../index')
 const Connection = require('../../network/connection')
 const Encoder = require('../../protocol/encoder')
@@ -93,7 +94,11 @@ const createFakeBroker = (answer) => {
     destroy: jest.fn(async () => connection.disconnect()),
   }
 
-  return { broker: new Broker({ connectionPool, logger: newLogger() }), connectionPool, state }
+  return {
+    broker: new Broker({ connectionPool: setupPool(connectionPool), logger: newLogger() }),
+    connectionPool,
+    state,
+  }
 }
 
 const versionsAsked = (state) => state.writes.map((frame) => readRequestHeader(frame).apiVersion)

@@ -1725,3 +1725,26 @@ describe('ScriptedCluster Fetch session deltas', () => {
     }
   })
 })
+
+test('a blackholed dial never connects and up only restores future dials', async () => {
+  jest.useFakeTimers()
+  const cluster = createScriptedCluster({ nodes: NODES })
+  const firstConnect = jest.fn()
+  const nextConnect = jest.fn()
+  const old = cluster.blackhole(0).socketFactory({ ...NODES[0], onConnect: firstConnect })
+  try {
+    await jest.advanceTimersByTimeAsync(10)
+    expect(firstConnect).not.toHaveBeenCalled()
+    cluster.up(0)
+    const next = cluster.socketFactory({ ...NODES[0], onConnect: nextConnect })
+    await jest.advanceTimersByTimeAsync(10)
+    expect(firstConnect).not.toHaveBeenCalled()
+    expect(nextConnect).toHaveBeenCalledTimes(1)
+    expect(() => cluster.pairFor('Produce', 0)).toThrow('advertises')
+    next.destroy()
+    cluster.assertClean()
+  } finally {
+    old.destroy()
+    jest.useRealTimers()
+  }
+})

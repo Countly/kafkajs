@@ -9,6 +9,7 @@ const InstrumentationEventEmitter = require('./instrumentation/emitter')
 const channels = require('./instrumentation/channels')
 const LoggerConsole = require('./loggers/console')
 const Cluster = require('./cluster')
+const { ConnectionSetupPolicy } = require('./network/connectionSetup')
 const createProducer = require('./producer')
 const { minimumRequestSize } = require('./producer/state/recordSize')
 const { MAX_DELAY } = require('./producer/deadline')
@@ -347,7 +348,10 @@ module.exports = class Client {
     ssl,
     sasl,
     clientId,
-    connectionTimeout = 1000,
+    connectionTimeout,
+    connectionTimeoutMax,
+    reconnectBackoff,
+    reconnectBackoffMax,
     authenticationTimeout,
     reauthenticationThreshold,
     requestTimeout,
@@ -367,6 +371,18 @@ module.exports = class Client {
     this[PRIVATE.REQUEST_TIMEOUT] = requestTimeout ?? DEFAULT_REQUEST_TIMEOUT
     this[PRIVATE.CLIENT_ID] = clientId
 
+    const setupPolicy = ConnectionSetupPolicy.resolve({
+      connectionTimeout,
+      connectionTimeoutMax,
+      reconnectBackoff,
+      reconnectBackoffMax,
+      authenticationTimeout,
+    })
+    connectionTimeout = setupPolicy.timeoutBase
+    connectionTimeoutMax = setupPolicy.timeoutCeiling
+    reconnectBackoff = setupPolicy.waitBase
+    reconnectBackoffMax = setupPolicy.waitCeiling
+    authenticationTimeout = setupPolicy.authenticationTimeout
     const validatedMaxResponseSize = validateMaxResponseSize(maxResponseSize)
     this[PRIVATE.MAX_RESPONSE_SIZE] = validatedMaxResponseSize
     const validatedMetadataRecoveryStrategy =
@@ -397,6 +413,10 @@ module.exports = class Client {
         sasl,
         clientId,
         connectionTimeout,
+        connectionTimeoutMax,
+        reconnectBackoff,
+        reconnectBackoffMax,
+        setupPolicy,
         authenticationTimeout,
         reauthenticationThreshold,
         requestTimeout,
@@ -593,7 +613,9 @@ module.exports = class Client {
         )
     }
 
-    const instrumentationEmitter = new InstrumentationEventEmitter({ channels: channels.consumer })
+    const instrumentationEmitter = new InstrumentationEventEmitter({
+      channels: channels.consumer,
+    })
     const cluster = this[PRIVATE.CREATE_CLUSTER]({
       metadataMaxAge,
       allowAutoTopicCreation,
@@ -636,7 +658,9 @@ module.exports = class Client {
    * @public
    */
   admin({ retry } = {}) {
-    const instrumentationEmitter = new InstrumentationEventEmitter({ channels: channels.admin })
+    const instrumentationEmitter = new InstrumentationEventEmitter({
+      channels: channels.admin,
+    })
     const cluster = this[PRIVATE.CREATE_CLUSTER]({
       allowAutoTopicCreation: false,
       instrumentationEmitter,

@@ -94,7 +94,7 @@ Note that the broker may be configured to reject your authentication attempt if 
 
 | option                    | description                                                                                                                                                                             | default |
 | ------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------- |
-| authenticationTimeout     | Timeout in ms for authentication requests                                                                                                                                               | `10000`  |
+| authenticationTimeout | Whole SASL exchange cap in ms, including a token callback or signer; integer 1..2147483647, legacy numeric string accepted. During setup the remaining readiness budget also applies. | `10000` |
 | reauthenticationThreshold | When periodic reauthentication (`connections.max.reauth.ms`) is configured on the broker side, reauthenticate when `reauthenticationThreshold` milliseconds remain of session lifetime. | `10000` |
 
 ### PLAIN/SCRAM Example
@@ -294,15 +294,31 @@ authentication mechanism.
 
 ## Connection Timeout
 
-Time in milliseconds to wait for a successful connection. The default value is: `1000`.
+A broker must become ready within one setup timeout, covering TCP, TLS, ApiVersions and SASL. With no explicit timeout, the base is 10000 ms and grows per address on consecutive physical setup failures, with ±20% jitter, up to `connectionTimeoutMax` (30000 ms). Any successful ready at that address resets the policy. A refused/reset connection still fails immediately; a blackholed node can take about 10, 20 and 30 seconds on successive attempts.
 
-```javascript
-new Kafka({
+An explicit `connectionTimeout` without `connectionTimeoutMax` is flat with no jitter: `connectionTimeout: 1000` restores exactly the legacy flat timeout value. Setting a maximum opts into growth. A maximum alone uses base `Math.min(10000, connectionTimeoutMax)`. A directly opened Fetch socket's setup budget ends at TCP/TLS; authentication has its own whole-SASL cap.
+
+| Option | Range and behavior | Default |
+|---|---|---|
+| connectionTimeout | Integer 1..2147483647 ms; legacy numeric string accepted. An explicit base alone stays flat. | 10000, growing |
+| connectionTimeoutMax | Integer 1..2147483647 ms, at least an explicit base; number only. | 30000 unless a base alone is set |
+| reconnectBackoff | Integer 0..2147483647 ms, number only; base alone is flat, 0 disables waits. | 50 |
+| reconnectBackoffMax | Integer 0..2147483647 ms, at least its base; number only. | 1000 unless a base alone is set |
+
+Reconnect waits are counted from a physical setup failure at that address, grow exponentially with ±20% jitter, and reset at ready. Explicit disconnect, retirement, idle close, caller timeout and credential rejection do not grow setup failure state. A caller's deadline can stop waiting while a shared physical setup continues to its own budget.
+
+```js
+const kafka = new Kafka({
   clientId: 'my-app',
   brokers: ['kafka1:9092', 'kafka2:9092'],
-  connectionTimeout: 3000
+  connectionTimeout: 3000,
+  connectionTimeoutMax: 30000,
+  reconnectBackoff: 50,
+  reconnectBackoffMax: 1000,
 })
 ```
+
+Invalid timeout/backoff values fail at construction with `KafkaJSInvalidConfigurationError` naming the option. The two legacy timeout options accept numeric strings; new options require numbers.
 
 ## Request Timeout
 

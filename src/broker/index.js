@@ -7,6 +7,7 @@ const { NO_TOPIC_ID } = require('../protocol/requests/topicIds')
 const { assertSameProtocol } = require('../protocol/requests/groupProtocolCheck')
 const {
   KafkaJSConnectionClosedError,
+  KafkaJSConnectionError,
   KafkaJSInvariantViolation,
   KafkaJSNonRetriableError,
   KafkaJSServerDoesNotSupportApiKey,
@@ -237,13 +238,16 @@ module.exports = class Broker {
     this.authenticationTimeout = authenticationTimeout
     this.allowAutoTopicCreation = allowAutoTopicCreation
 
-    // ConnectionPool doesn't otherwise know the client's authenticationTimeout; it needs it
-    // to size the post-SASL-failure blackout window (see ConnectionPool#recordAuthenticationFailure).
+    // Standalone and replacement pools must honor the Broker's legacy authenticationTimeout.
     this.connectionPool.authenticationTimeout = authenticationTimeout
+    for (const connection of this.connectionPool.pool) {
+      connection.authenticationTimeout = authenticationTimeout
+    }
 
-    // The lock timeout has twice the connectionTimeout because the same timeout is used
-    // for the first apiVersions call
-    const lockTimeout = 2 * this.connectionPool.connectionTimeout + this.authenticationTimeout
+    // A queued caller must outlast one complete setup and its maximum reconnect wait.
+    const lockTimeout =
+      this.connectionPool.setupPolicy.timeoutCeiling +
+      Math.ceil(1.2 * this.connectionPool.setupPolicy.waitCeiling)
     this.brokerAddress = `${this.connectionPool.host}:${this.connectionPool.port}`
 
     this.lock = new Lock({
@@ -282,6 +286,9 @@ module.exports = class Broker {
     connectionPool.continueGenerationFrom(this.connectionPool.generation)
     this.connectionPool = connectionPool
     this.connectionPool.authenticationTimeout = this.authenticationTimeout
+    for (const connection of this.connectionPool.pool) {
+      connection.authenticationTimeout = this.authenticationTimeout
+    }
     this.versionsGeneration = null
     this[PRIVATE.CAPPED_LOOKUPS].clear()
     return true
@@ -355,34 +362,63 @@ module.exports = class Broker {
         return
       }
 
-      const connection = await (guard
-        ? this.connectionPool.getConnection(0, { guard })
-        : this.connectionPool.getConnection())
-      this.throwIfRefused(guard)
-
-      // Read once: this is the generation the negotiated table below is learned at, not
-      // whatever the pool happens to report after the round trip (a concurrent socket coming
-      // up mid-negotiation must not be attributed to this table).
-      const generation = this.connectionPool.generation
-      if (this.versionsGeneration !== generation) {
-        const response = await this[PRIVATE.NEGOTIATE](guard)
-        this.throwIfRefused(guard)
-        const { finalizedFeatures, finalizedFeaturesEpoch } = toFinalizedFeatures(response)
-        this.versions = toVersionMap(response)
-        this.finalizedFeatures = finalizedFeatures
-        this.finalizedFeaturesEpoch = finalizedFeaturesEpoch
-        this.versionsGeneration = generation
+      const pool = this.connectionPool
+      const blackout = pool.authenticationBlackoutEntry()
+      if (
+        blackout &&
+        (!pool.pool[0].isConnected() || (pool.sasl && !pool.pool[0].isAuthenticated()))
+      ) {
+        await pool.getConnection()
       }
+      const connection = pool.pool[0]
+      const attempt =
+        connection.setupAttempt?.status === 'active' ? connection.setupAttempt : pool.beginSetup()
+      attempt.brokerManaged = true
+      let setupGeneration = pool.generation
+      const originalPool = () => {
+        attempt.assertCurrent()
+        this.throwIfRefused(guard)
+        this.throwIfRetired()
+        if (this.connectionPool !== pool)
+          throw new KafkaJSConnectionError('Connection pool was replaced', {
+            broker: this.brokerAddress,
+          })
+      }
+      try {
+        await connection.connect({ attempt })
+        originalPool()
 
-      this.throwIfRetired()
-      this.connectionPool.setVersions(this.versions)
-      this.lookupRequest = lookup(this.versions)
-      this[PRIVATE.CAPPED_LOOKUPS].clear()
+        // Read once: this is the generation the negotiated table below is learned at, not
+        // whatever the pool happens to report after the round trip (a concurrent socket coming
+        // up mid-negotiation must not be attributed to this table).
+        const generation = this.connectionPool.generation
+        setupGeneration = generation
+        if (this.versionsGeneration !== generation) {
+          const response = await attempt.guard(
+            this[PRIVATE.NEGOTIATE](() => attempt.refusal() || (guard && guard()), connection),
+            { phase: 'ApiVersions' }
+          )
+          originalPool()
+          const { finalizedFeatures, finalizedFeaturesEpoch } = toFinalizedFeatures(response)
+          this.versions = toVersionMap(response)
+          this.finalizedFeatures = finalizedFeatures
+          this.finalizedFeaturesEpoch = finalizedFeaturesEpoch
+          this.versionsGeneration = generation
+        }
 
-      this.throwIfRefused(guard)
-      await connection.authenticate()
-      this.throwIfRetired()
-      this.throwIfRefused(guard)
+        this.throwIfRetired()
+        this.connectionPool.setVersions(this.versions)
+        this.lookupRequest = lookup(this.versions)
+        this[PRIVATE.CAPPED_LOOKUPS].clear()
+
+        await connection.authenticate({ attempt })
+        originalPool()
+        connection.finishSetup(attempt)
+      } catch (error) {
+        attempt.fail(error)
+        attachFailureSource(error, { broker: this, generation: setupGeneration })
+        throw error
+      }
     } finally {
       await this.lock.release()
     }
@@ -455,12 +491,13 @@ module.exports = class Broker {
    * @returns {Promise<object>} the decoded ApiVersions response
    * @throws {KafkaJSNonRetriableError} when the broker rejects this client's software identity
    */
-  async [PRIVATE.NEGOTIATE](guard) {
+  async [PRIVATE.NEGOTIATE](guard, connection = null) {
     const bestImplementedVersion = Math.max(...requests.ApiVersions.versions.map(Number))
 
     try {
-      return await this[PRIVATE.API_VERSIONS_AT](bestImplementedVersion, guard)
+      return await this[PRIVATE.API_VERSIONS_AT](bestImplementedVersion, guard, connection)
     } catch (e) {
+      this.throwIfRefused(guard)
       if (e.type === 'INVALID_REQUEST') {
         await this.disconnect()
         throw new KafkaJSNonRetriableError(
@@ -482,7 +519,7 @@ module.exports = class Broker {
         bestImplementedVersion
       )
 
-      return await this[PRIVATE.API_VERSIONS_AT](retryVersion, guard)
+      return await this[PRIVATE.API_VERSIONS_AT](retryVersion, guard, connection)
     }
   }
 
@@ -560,8 +597,10 @@ module.exports = class Broker {
    * @param {number} version
    * @param {(frameLength?: number) => Error|null} [guard] a producer's private pre-write check
    */
-  async [PRIVATE.API_VERSIONS_AT](version, guard) {
+  async [PRIVATE.API_VERSIONS_AT](version, guard, connection = null) {
+    this.throwIfRefused(guard)
     const apiVersions = requests.ApiVersions.protocol({ version })
+    if (connection) return connection.send({ ...apiVersions(), guard, responseGuard: guard })
     return await this[PRIVATE.SEND_REQUEST](
       {
         ...apiVersions(),

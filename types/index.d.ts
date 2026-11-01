@@ -52,7 +52,15 @@ export interface KafkaConfig {
   ssl?: tls.ConnectionOptions | boolean
   sasl?: SASLOptions | Mechanism
   clientId?: string
+  /** Whole ready budget in ms; omitted 10000 growing to 30000, explicit base alone stays flat. */
   connectionTimeout?: number
+  /** Integer 1..2147483647, at least the explicit base. Max alone clamps the default base. */
+  connectionTimeoutMax?: number
+  /** Integer 0..2147483647; initial retry wait, default 50; base alone stays flat. */
+  reconnectBackoff?: number
+  /** Retry wait ceiling, default 1000; at least its base. */
+  reconnectBackoffMax?: number
+  /** Whole SASL exchange cap in ms, including supplier work; default 10000. */
   authenticationTimeout?: number
   reauthenticationThreshold?: number
   requestTimeout?: number

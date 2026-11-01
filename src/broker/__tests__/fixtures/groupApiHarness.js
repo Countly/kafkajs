@@ -1,3 +1,4 @@
+const setupPool = require('../../../../testHelpers/setupPool')
 const Broker = require('../../index')
 const Connection = require('../../../network/connection')
 const { lookup } = require('../../../protocol/requests')
@@ -81,7 +82,7 @@ const createGroupApiBroker = ({ versions, respond }) => {
     destroy: async () => connection.disconnect(),
   }
 
-  const broker = new Broker({ connectionPool: pool, logger: newLogger(), versions })
+  const broker = new Broker({ connectionPool: setupPool(pool), logger: newLogger(), versions })
   broker.lookupRequest = lookup(versions)
   broker.versionsGeneration = pool.generation
 

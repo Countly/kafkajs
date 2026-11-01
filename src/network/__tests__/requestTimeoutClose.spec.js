@@ -210,7 +210,7 @@ describe('Network > a request timeout fails its generation', () => {
 
       const outcome = await within(connecting, 3000, 'the timeout')
 
-      expect(outcome.error).toBeInstanceOf(KafkaJSRequestTimeoutError)
+      expect(outcome.error).toBeInstanceOf(KafkaJSConnectionError)
       expect(outcome.error.retriable).toBe(true)
       const [first] = cluster.sockets()
       expect(first.destroyed).toBe(true)

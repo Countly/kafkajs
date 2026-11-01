@@ -89,6 +89,8 @@ The awaited-listener scenario is `src/consumer/__tests__/rebalanceListenerLive.s
 
 The coordinator scenarios keep static replacement separate from short-outage membership windows. The unit Fetch chunking suite splits independent response frames through the real connection and broker path and retains any failing seed. Classic subscription versions zero and two, valid empty assignments and scarce partitions have independent Java bytes and fields. Live evidence keeps broker commits separate from log and handler delivery.
 
+Connection setup is covered by deterministic fake-socket cases for dial, ApiVersions, whole-SASL expiry, cancellation, node-state retention and late work. `blackhole(id)` holds future scripted dials until the client budget expires; `up(id)` restores only future dials. The connection-setup live scenario checks the declared attempt windows, reset after recovery and acknowledged record identity on the configured broker.
+
 ### Scenario lanes
 
 A scenario that holds with no fault injected runs on two lanes from one file: `describe.each(lanes())` from `testHelpers` gives it `fake` (the unit lane, in process) or `docker` (under `npm run test:kafka`, which exports `KAFKAJS_LANE=docker`), and `KAFKAJS_SCENARIO_LANES=fake,docker` asks for both. A scenario that injects a fault (a held answer, a dropped frame) runs on the fake lane unless the fault can be injected on a live cluster too.
@@ -140,6 +142,8 @@ The leader-union scenario runs classic roundRobin and range with unequal subscri
 Fetch-round CPU and allocation measurements run in P10 CI using the same driver on both comparison trees. They retain isolated site intervals, three-node whole-round work counters, interleaved samples, independent identical-configuration noise controls and observed no-GC allocation windows. An optional optimization is retained only with its declared site gain and whole-round bounds. Missing or inconclusive evidence is recorded and does not establish a gain.
 
 Consumer measurements count delivered records, batch callbacks and actual handler-entry gaps separately. Listener controls observe the initial assigned callback and the graceful revoked callback; teardown is outside the throughput interval. Fetch-session measurements correlate request and response bytes on every connection and use consumer-process CPU over the same delivery window. Idle measurements use bytes per second. Identical-tree, identical-configuration repetitions check noise separately from the previous-release comparison. A noisy session, insufficient gap samples, a failed work control or a collection inside an allocation window cannot establish a passing result. Large-assignment memory observations keep the consumer alive through the final collections and verify data on every assigned partition.
+
+`scripts/benchmarks/connectSetup.js` measures 2000 actual setup episodes per arm against an in-process server. Each episode establishes a distinct socket and negotiates ApiVersions; timing ends at ready, and cleanup completes outside the measured interval before the next episode. Run the same bytes on the previous and new trees with an interleaved A/A control. `--control 1` adds one measured millisecond per setup; it must exceed the declared 3% limit. Resource checks require zero remaining timers and sockets. A noisy or void session is not a pass.
 
 ### Chaos, broker bounces and the 4.0 floor
 

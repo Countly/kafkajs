@@ -635,12 +635,16 @@ module.exports = (params) => {
    * A user disconnect ends the consumer, so its reset obligations are emptied. A crash restart
    * unlinks them and keeps them: the topics still owe those resets to the group it builds next.
    * @param {{ leaveGroup?: boolean }} [stopOptions]
-   * @param {{ keepResets?: boolean }} [shutDownOptions] `true` for the crash handler
+   * @param {{ keepResets?: boolean, preserveSetupState?: boolean }} [shutDownOptions] `true` for the crash handler
    * @param {ConsumerOperation} [operation] the close that bounds this shutdown; absent, it waits
    *   naturally
    * @returns {Promise<void>}
    */
-  const shutDown = async (stopOptions, { keepResets = false } = {}, operation) => {
+  const shutDown = async (
+    stopOptions,
+    { keepResets = false, preserveSetupState = false } = {},
+    operation
+  ) => {
     noteStop()
     const owned = life
 
@@ -650,7 +654,7 @@ module.exports = (params) => {
       } else {
         await stopShared(stopOptions)
         logger.debug('consumer has stopped, disconnecting', { groupId })
-        await cluster.disconnect()
+        await cluster.disconnect(...(preserveSetupState ? [{ preserveSetupState }] : []))
       }
       instrumentationEmitter.emit(DISCONNECT)
     } catch (e) {
@@ -1213,7 +1217,7 @@ module.exports = (params) => {
       // further to log here; just make sure it cannot stop the CRASH event from firing.
       const crashStopGeneration = stopGeneration + 1
       try {
-        await shutDown(undefined, { keepResets: true })
+        await shutDown(undefined, { keepResets: true, preserveSetupState: true })
       } catch {}
 
       const isErrorRetriable =

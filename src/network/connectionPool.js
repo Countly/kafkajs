@@ -1,5 +1,6 @@
 const apiKeys = require('../protocol/requests/apiKeys')
 const Connection = require('./connection')
+const { ConnectionSetupPolicy, NodeSetupStates, SetupAttempt } = require('./connectionSetup')
 
 /** Number of slots: Fetch uses the second; every other API uses the first. @type {number} */
 const POOL_SIZE = 2
@@ -47,6 +48,9 @@ module.exports = class ConnectionPool {
     this.retired = false
     this.generationBase = options.generation ?? 0
     this.brokerAddress = `${this.host}:${this.port}`
+    this.setupPolicy = options.setupPolicy || ConnectionSetupPolicy.resolve(options)
+    this.setupStates = options.setupStates || new NodeSetupStates(this.setupPolicy)
+    if (!options.setupStates) this.setupStates.retain([this.brokerAddress])
 
     // Broker address -> blackout entry. Defaults to a pool-local map, but a BrokerPool
     // rebuilding this pool after a connection error injects its own long-lived map instead
@@ -57,6 +61,8 @@ module.exports = class ConnectionPool {
       () =>
         new Connection({
           ...options,
+          setupPolicy: this.setupPolicy,
+          beginSetup: () => this.beginSetup(),
           onAuthenticationFailure: (errorMessage) => this.recordAuthenticationFailure(errorMessage),
         })
     )
@@ -98,6 +104,16 @@ module.exports = class ConnectionPool {
     return { remainingMs, errorMessage: entry.errorMessage }
   }
 
+  /** Creates one attempt against the current shared owner. @returns {SetupAttempt} */
+  beginSetup() {
+    this.throwIfRetired()
+    return new SetupAttempt({
+      states: this.setupStates,
+      address: this.brokerAddress,
+      policy: this.setupPolicy,
+    })
+  }
+
   isConnected() {
     return this.pool.some((c) => c.isConnected())
   }
@@ -111,6 +127,7 @@ module.exports = class ConnectionPool {
    */
   retire() {
     this.retired = true
+    this.map((connection) => connection.cancelSetup())
   }
 
   /**

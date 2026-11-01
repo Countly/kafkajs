@@ -61,6 +61,11 @@ module.exports = ({
   drainTimeout,
   enforceRequestTimeout,
   connectionTimeout,
+  connectionTimeoutMax,
+  reconnectBackoff,
+  reconnectBackoffMax,
+  setupPolicy,
+  authenticationTimeout,
   maxInFlightRequests,
   maxResponseSize,
   logger,
@@ -68,6 +73,7 @@ module.exports = ({
   reauthenticationThreshold,
 }) => {
   let index = 0
+  let bootstrapEndpoints = new Set()
 
   const isValidBroker = (broker) => {
     return broker && typeof broker === 'string' && broker.length > 0
@@ -113,10 +119,20 @@ module.exports = ({
 
     validateBrokers(list)
 
+    bootstrapEndpoints = new Set(
+      list.map((text) => {
+        const { host, port } = parseBroker(text)
+        return `${host}:${port}`
+      })
+    )
     return list
   }
 
   return {
+    /** @returns {Set<string>} copy of the complete latest validated bootstrap endpoints */
+    get bootstrapEndpoints() {
+      return new Set(bootstrapEndpoints)
+    },
     build: async ({ host, port, rack } = {}) => {
       if (!host) {
         const list = await getBrokers()
@@ -135,6 +151,11 @@ module.exports = ({
         clientId,
         socketFactory,
         connectionTimeout,
+        connectionTimeoutMax,
+        reconnectBackoff,
+        reconnectBackoffMax,
+        setupPolicy,
+        authenticationTimeout,
         requestTimeout,
         drainTimeout,
         enforceRequestTimeout,

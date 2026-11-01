@@ -139,7 +139,9 @@ const reading = (what, read) => {
   try {
     return read()
   } catch (error) {
-    throw new Error(`ScriptedCluster: cannot read ${what}: ${error.message}`, { cause: error })
+    throw new Error(`ScriptedCluster: cannot read ${what}: ${error.message}`, {
+      cause: error,
+    })
   }
 }
 
@@ -178,7 +180,10 @@ const targetOf = (fields) => {
   const topic = entry.topic ?? entry.name
   const partitions = entry.partitions ?? []
   return partitions.length === 1
-    ? { topic, partition: partitions[0].partition ?? partitions[0].partitionIndex }
+    ? {
+        topic,
+        partition: partitions[0].partition ?? partitions[0].partitionIndex,
+      }
     : { topic }
 }
 
@@ -225,6 +230,7 @@ class ScriptedCluster {
     this.errors = []
     this.answerers = new Map()
     this.downNodes = new Set()
+    this.blackholedNodes = new Set()
     this.advertised = new Map(PROFILES[profile].map(([api, version]) => [api, [version, version]]))
     for (const [api, range] of Object.entries(advertise)) {
       if (
@@ -262,6 +268,7 @@ class ScriptedCluster {
    * @returns {ScriptedCluster} this
    */
   down(id) {
+    this.blackholedNodes.delete(id)
     this.downNodes.add(id)
     return this
   }
@@ -270,8 +277,20 @@ class ScriptedCluster {
    * @param {number} id the id of a node taken down with `down`
    * @returns {ScriptedCluster} this
    */
+  /** Holds future dials without connecting; up restores them, existing sockets stay unchanged.
+   * @param {number} id node id
+   * @returns {ScriptedCluster} this
+   */
+  blackhole(id) {
+    this.downNodes.delete(id)
+    this.blackholedNodes.add(id)
+    return this
+  }
+
+  /** Restores future dials; a held old dial remains held. @param {number} id node id @returns {ScriptedCluster} this */
   up(id) {
     this.downNodes.delete(id)
+    this.blackholedNodes.delete(id)
     return this
   }
 
@@ -295,7 +314,10 @@ class ScriptedCluster {
    */
   apiVersionsAnswer() {
     return this.profile === 'tv2'
-      ? { apiKeys: this.apiVersionsTable(), finalizedFeatures: TRANSACTION_V2_FEATURES }
+      ? {
+          apiKeys: this.apiVersionsTable(),
+          finalizedFeatures: TRANSACTION_V2_FEATURES,
+        }
       : { apiKeys: this.apiVersionsTable() }
   }
 
@@ -325,10 +347,22 @@ class ScriptedCluster {
    *   number, node?: number, correlationId?: number, generation?: number, label?: string }>}
    */
   timeline() {
-    const events = this.marks.map(({ order, label }) => ({ order, kind: 'mark', label }))
+    const events = this.marks.map(({ order, label }) => ({
+      order,
+      kind: 'mark',
+      label,
+    }))
     for (const { order, answeredOrder, api, version, node, correlationId, generation } of this
       .log) {
-      events.push({ order, kind: 'request', api, version, node, correlationId, generation })
+      events.push({
+        order,
+        kind: 'request',
+        api,
+        version,
+        node,
+        correlationId,
+        generation,
+      })
       if (answeredOrder !== undefined) {
         events.push({
           order: answeredOrder,
@@ -397,12 +431,17 @@ class ScriptedCluster {
       setImmediate(() => {
         refused.emit(
           'error',
-          Object.assign(new Error('connect ECONNREFUSED'), { code: 'ECONNREFUSED' })
+          Object.assign(new Error('connect ECONNREFUSED'), {
+            code: 'ECONNREFUSED',
+          })
         )
         refused.destroy()
       })
       return refused
     }
+
+    if (this.blackholedNodes.has(node.id))
+      return this.fake.factory({ host, port, onConnect: () => {} })
 
     const socket = this.fake.factory({ host, port, onConnect })
     const generation = this.fake.state.sockets.filter(
@@ -540,7 +579,12 @@ class ScriptedCluster {
         return this.apiVersionsAnswer()
       case 'Metadata':
         return {
-          brokers: this.nodes.map(({ id, host, port }) => ({ nodeId: id, host, port, rack: null })),
+          brokers: this.nodes.map(({ id, host, port }) => ({
+            nodeId: id,
+            host,
+            port,
+            rack: null,
+          })),
           controllerId: this.nodes[0].id,
           topics: [],
         }
@@ -584,7 +628,12 @@ const answerMetadata = (cluster, { topic, partitions }) => {
   const partitionIds = Array.from({ length: partitions }, (_, partition) => partition)
 
   return cluster.answer('Metadata', () => ({
-    brokers: cluster.nodes.map(({ id, host, port }) => ({ nodeId: id, host, port, rack: null })),
+    brokers: cluster.nodes.map(({ id, host, port }) => ({
+      nodeId: id,
+      host,
+      port,
+      rack: null,
+    })),
     controllerId: leader.id,
     topics: [
       {
@@ -718,7 +767,10 @@ const groupScript = (
     .answer('OffsetCommit', ({ topics }) => ({
       topics: topics.map((entry) => ({
         topic: entry.topic,
-        partitions: entry.partitions.map(({ partition }) => ({ partition, errorCode: 0 })),
+        partitions: entry.partitions.map(({ partition }) => ({
+          partition,
+          errorCode: 0,
+        })),
       })),
     }))
     .answer('LeaveGroup', ({ members }) => ({
@@ -762,14 +814,19 @@ const consumerProtocolScript = (cluster, options = {}) => {
       heartbeatIntervalMs,
       assignment:
         memberEpoch === 0
-          ? { topicPartitions: [{ topicId: TOPIC_ID, partitions: partitionIds }] }
+          ? {
+              topicPartitions: [{ topicId: TOPIC_ID, partitions: partitionIds }],
+            }
           : null,
     }))
     .answer('OffsetFetch', ({ groupId, topics }) => ({
       groupId,
       topics: positions(
         topics ?? [
-          { topicId: TOPIC_ID, partitions: partitionIds.map((partition) => ({ partition })) },
+          {
+            topicId: TOPIC_ID,
+            partitions: partitionIds.map((partition) => ({ partition })),
+          },
         ]
       ),
     }))
@@ -814,13 +871,19 @@ const producerScript = (cluster, { topic = TOPIC, partitions = 1 } = {}) =>
     .answer('AddPartitionsToTxn', ({ topics }) => ({
       errors: topics.map((entry) => ({
         topic: entry.topic,
-        partitionErrors: entry.partitions.map((partition) => ({ partition, errorCode: 0 })),
+        partitionErrors: entry.partitions.map((partition) => ({
+          partition,
+          errorCode: 0,
+        })),
       })),
     }))
     .answer('TxnOffsetCommit', ({ topics }) => ({
       topics: topics.map((entry) => ({
         topic: entry.topic,
-        partitions: entry.partitions.map(({ partition }) => ({ partition, errorCode: 0 })),
+        partitions: entry.partitions.map(({ partition }) => ({
+          partition,
+          errorCode: 0,
+        })),
       })),
     }))
 
