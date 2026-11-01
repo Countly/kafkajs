@@ -1,4 +1,4 @@
-const { Member } = require('./offsetResetLive.spec')
+const { Member } = require('./fixtures/offsetResetMember')
 
 describe('offset-reset live Member > start', () => {
   test('never subscribes or runs once the case scope aborted during connect', async () => {
