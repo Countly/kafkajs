@@ -125,7 +125,7 @@
       "since": "2026-09-03"
     },
     "ListConfigResources": {
-      "note": "v0 is the old ListClientMetricsResources and lists only client-metrics resources; v1 adds a ResourceTypes filter (KIP-1142). Not yet implemented.",
+      "note": "v0 is the old ListClientMetricsResources and lists only client-metrics resources; v1 adds a ResourceTypes filter (KIP-1142).",
       "since": "2026-10-19"
     },
     "DescribeTopicPartitions": {

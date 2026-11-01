@@ -20,6 +20,14 @@ import java.util.UUID;
 import java.util.function.Function;
 
 import org.apache.kafka.common.Uuid;
+import org.apache.kafka.common.message.ElectLeadersRequestData;
+import org.apache.kafka.common.message.ElectLeadersResponseData;
+import org.apache.kafka.common.message.UpdateFeaturesRequestData;
+import org.apache.kafka.common.message.UpdateFeaturesResponseData;
+import org.apache.kafka.common.message.DescribeClusterRequestData;
+import org.apache.kafka.common.message.DescribeClusterResponseData;
+import org.apache.kafka.common.message.ListConfigResourcesRequestData;
+import org.apache.kafka.common.message.ListConfigResourcesResponseData;
 import org.apache.kafka.common.message.FetchRequestData;
 import org.apache.kafka.common.message.FetchResponseData;
 import org.apache.kafka.common.message.AddOffsetsToTxnRequestData;
@@ -537,11 +545,235 @@ new WriteTxnMarkersResponseData()
 return vectors;
 }
 
+  /** Generates cluster/config bodies using Apache codecs before registry wiring.
+   * @return independent bodies; the expected fields are explicit literals
+   */
+  private static List<Vector> clusterResources() {
+    List<Vector> vectors=new ArrayList<>();
+vectors.add(new Vector("electLeaders","ElectLeadersRequest",(short) 0,"basic",
+new ElectLeadersRequestData()
+.setTopicPartitions(new ElectLeadersRequestData.TopicPartitionsCollection(Arrays.asList(new ElectLeadersRequestData.TopicPartitions()
+.setTopic("orders")
+.setPartitions(Arrays.asList(0, 2))).iterator()))
+.setTimeoutMs(60000),
+"{\"topicPartitions\":[{\"topic\":\"orders\",\"partitions\":[0,2]}],\"timeoutMs\":60000}"));
+vectors.add(new Vector("electLeaders","ElectLeadersResponse",(short) 0,"mixed",
+new ElectLeadersResponseData()
+.setThrottleTimeMs(17)
+.setReplicaElectionResults(Arrays.asList(new ElectLeadersResponseData.ReplicaElectionResult()
+.setTopic("orders")
+.setPartitionResult(Arrays.asList(new ElectLeadersResponseData.PartitionResult()
+.setPartitionId(0)
+.setErrorCode((short) 84)
+.setErrorMessage(null), new ElectLeadersResponseData.PartitionResult()
+.setPartitionId(2)
+.setErrorCode((short) 80)
+.setErrorMessage("no replica"))))),
+"{\"throttleTimeMs\":17,\"replicaElectionResults\":[{\"topic\":\"orders\",\"partitionResult\":[{\"partitionId\":0,\"errorCode\":84,\"errorMessage\":null},{\"partitionId\":2,\"errorCode\":80,\"errorMessage\":\"no replica\"}]}]}"));
+vectors.add(new Vector("electLeaders","ElectLeadersRequest",(short) 0,"all",
+new ElectLeadersRequestData()
+.setTopicPartitions(null)
+.setTimeoutMs(60000),
+"{\"topicPartitions\":null,\"timeoutMs\":60000}"));
+vectors.add(new Vector("electLeaders","ElectLeadersRequest",(short) 1,"basic",
+new ElectLeadersRequestData()
+.setElectionType((byte) 1)
+.setTopicPartitions(new ElectLeadersRequestData.TopicPartitionsCollection(Arrays.asList(new ElectLeadersRequestData.TopicPartitions()
+.setTopic("orders")
+.setPartitions(Arrays.asList(0, 2))).iterator()))
+.setTimeoutMs(60000),
+"{\"electionType\":1,\"topicPartitions\":[{\"topic\":\"orders\",\"partitions\":[0,2]}],\"timeoutMs\":60000}"));
+vectors.add(new Vector("electLeaders","ElectLeadersResponse",(short) 1,"mixed",
+new ElectLeadersResponseData()
+.setThrottleTimeMs(17)
+.setErrorCode((short) 0)
+.setReplicaElectionResults(Arrays.asList(new ElectLeadersResponseData.ReplicaElectionResult()
+.setTopic("orders")
+.setPartitionResult(Arrays.asList(new ElectLeadersResponseData.PartitionResult()
+.setPartitionId(0)
+.setErrorCode((short) 84)
+.setErrorMessage(null), new ElectLeadersResponseData.PartitionResult()
+.setPartitionId(2)
+.setErrorCode((short) 80)
+.setErrorMessage("no replica"))))),
+"{\"throttleTimeMs\":17,\"errorCode\":0,\"replicaElectionResults\":[{\"topic\":\"orders\",\"partitionResult\":[{\"partitionId\":0,\"errorCode\":84,\"errorMessage\":null},{\"partitionId\":2,\"errorCode\":80,\"errorMessage\":\"no replica\"}]}]}"));
+vectors.add(new Vector("electLeaders","ElectLeadersRequest",(short) 1,"all",
+new ElectLeadersRequestData()
+.setElectionType((byte) 1)
+.setTopicPartitions(null)
+.setTimeoutMs(60000),
+"{\"electionType\":1,\"topicPartitions\":null,\"timeoutMs\":60000}"));
+vectors.add(new Vector("electLeaders","ElectLeadersRequest",(short) 2,"basic",
+new ElectLeadersRequestData()
+.setElectionType((byte) 1)
+.setTopicPartitions(new ElectLeadersRequestData.TopicPartitionsCollection(Arrays.asList(new ElectLeadersRequestData.TopicPartitions()
+.setTopic("orders")
+.setPartitions(Arrays.asList(0, 2))).iterator()))
+.setTimeoutMs(60000),
+"{\"electionType\":1,\"topicPartitions\":[{\"topic\":\"orders\",\"partitions\":[0,2]}],\"timeoutMs\":60000}"));
+vectors.add(new Vector("electLeaders","ElectLeadersResponse",(short) 2,"mixed",
+new ElectLeadersResponseData()
+.setThrottleTimeMs(17)
+.setErrorCode((short) 0)
+.setReplicaElectionResults(Arrays.asList(new ElectLeadersResponseData.ReplicaElectionResult()
+.setTopic("orders")
+.setPartitionResult(Arrays.asList(new ElectLeadersResponseData.PartitionResult()
+.setPartitionId(0)
+.setErrorCode((short) 84)
+.setErrorMessage(null), new ElectLeadersResponseData.PartitionResult()
+.setPartitionId(2)
+.setErrorCode((short) 80)
+.setErrorMessage("no replica"))))),
+"{\"throttleTimeMs\":17,\"errorCode\":0,\"replicaElectionResults\":[{\"topic\":\"orders\",\"partitionResult\":[{\"partitionId\":0,\"errorCode\":84,\"errorMessage\":null},{\"partitionId\":2,\"errorCode\":80,\"errorMessage\":\"no replica\"}]}]}"));
+vectors.add(new Vector("electLeaders","ElectLeadersRequest",(short) 2,"all",
+new ElectLeadersRequestData()
+.setElectionType((byte) 1)
+.setTopicPartitions(null)
+.setTimeoutMs(60000),
+"{\"electionType\":1,\"topicPartitions\":null,\"timeoutMs\":60000}"));
+vectors.add(new Vector("updateFeatures","UpdateFeaturesRequest",(short) 0,"basic",
+new UpdateFeaturesRequestData()
+.setTimeoutMs(60000)
+.setFeatureUpdates(new UpdateFeaturesRequestData.FeatureUpdateKeyCollection(Arrays.asList(new UpdateFeaturesRequestData.FeatureUpdateKey()
+.setFeature("metadata.version")
+.setMaxVersionLevel((short) 25)
+.setAllowDowngrade(false)).iterator())),
+"{\"timeoutMs\":60000,\"featureUpdates\":[{\"feature\":\"metadata.version\",\"maxVersionLevel\":25,\"allowDowngrade\":false}]}"));
+vectors.add(new Vector("updateFeatures","UpdateFeaturesResponse",(short) 0,"mixed",
+new UpdateFeaturesResponseData()
+.setThrottleTimeMs(17)
+.setErrorCode((short) 0)
+.setErrorMessage(null)
+.setResults(new UpdateFeaturesResponseData.UpdatableFeatureResultCollection(Arrays.asList(new UpdateFeaturesResponseData.UpdatableFeatureResult()
+.setFeature("metadata.version")
+.setErrorCode((short) 42)
+.setErrorMessage("invalid feature")).iterator())),
+"{\"throttleTimeMs\":17,\"errorCode\":0,\"errorMessage\":null,\"results\":[{\"feature\":\"metadata.version\",\"errorCode\":42,\"errorMessage\":\"invalid feature\"}]}"));
+vectors.add(new Vector("updateFeatures","UpdateFeaturesRequest",(short) 1,"basic",
+new UpdateFeaturesRequestData()
+.setTimeoutMs(60000)
+.setFeatureUpdates(new UpdateFeaturesRequestData.FeatureUpdateKeyCollection(Arrays.asList(new UpdateFeaturesRequestData.FeatureUpdateKey()
+.setFeature("metadata.version")
+.setMaxVersionLevel((short) 25)
+.setUpgradeType((byte) 2)).iterator()))
+.setValidateOnly(true),
+"{\"timeoutMs\":60000,\"featureUpdates\":[{\"feature\":\"metadata.version\",\"maxVersionLevel\":25,\"upgradeType\":2}],\"validateOnly\":true}"));
+vectors.add(new Vector("updateFeatures","UpdateFeaturesResponse",(short) 1,"mixed",
+new UpdateFeaturesResponseData()
+.setThrottleTimeMs(17)
+.setErrorCode((short) 0)
+.setErrorMessage(null)
+.setResults(new UpdateFeaturesResponseData.UpdatableFeatureResultCollection(Arrays.asList(new UpdateFeaturesResponseData.UpdatableFeatureResult()
+.setFeature("metadata.version")
+.setErrorCode((short) 42)
+.setErrorMessage("invalid feature")).iterator())),
+"{\"throttleTimeMs\":17,\"errorCode\":0,\"errorMessage\":null,\"results\":[{\"feature\":\"metadata.version\",\"errorCode\":42,\"errorMessage\":\"invalid feature\"}]}"));
+vectors.add(new Vector("updateFeatures","UpdateFeaturesRequest",(short) 2,"basic",
+new UpdateFeaturesRequestData()
+.setTimeoutMs(60000)
+.setFeatureUpdates(new UpdateFeaturesRequestData.FeatureUpdateKeyCollection(Arrays.asList(new UpdateFeaturesRequestData.FeatureUpdateKey()
+.setFeature("metadata.version")
+.setMaxVersionLevel((short) 25)
+.setUpgradeType((byte) 2)).iterator()))
+.setValidateOnly(true),
+"{\"timeoutMs\":60000,\"featureUpdates\":[{\"feature\":\"metadata.version\",\"maxVersionLevel\":25,\"upgradeType\":2}],\"validateOnly\":true}"));
+vectors.add(new Vector("updateFeatures","UpdateFeaturesResponse",(short) 2,"mixed",
+new UpdateFeaturesResponseData()
+.setThrottleTimeMs(17)
+.setErrorCode((short) 0)
+.setErrorMessage(null),
+"{\"throttleTimeMs\":17,\"errorCode\":0,\"errorMessage\":null}"));
+vectors.add(new Vector("describeCluster","DescribeClusterRequest",(short) 0,"basic",
+new DescribeClusterRequestData()
+.setIncludeClusterAuthorizedOperations(true),
+"{\"includeClusterAuthorizedOperations\":true}"));
+vectors.add(new Vector("describeCluster","DescribeClusterResponse",(short) 0,"mixed",
+new DescribeClusterResponseData()
+.setThrottleTimeMs(17)
+.setErrorCode((short) 0)
+.setErrorMessage(null)
+.setClusterId("cluster-a")
+.setControllerId(-1)
+.setBrokers(new DescribeClusterResponseData.DescribeClusterBrokerCollection(Arrays.asList(new DescribeClusterResponseData.DescribeClusterBroker()
+.setBrokerId(1)
+.setHost("localhost")
+.setPort(9092)
+.setRack(null)).iterator()))
+.setClusterAuthorizedOperations(-2147483648),
+"{\"throttleTimeMs\":17,\"errorCode\":0,\"errorMessage\":null,\"clusterId\":\"cluster-a\",\"controllerId\":-1,\"brokers\":[{\"brokerId\":1,\"host\":\"localhost\",\"port\":9092,\"rack\":null}],\"clusterAuthorizedOperations\":-2147483648}"));
+vectors.add(new Vector("describeCluster","DescribeClusterRequest",(short) 1,"basic",
+new DescribeClusterRequestData()
+.setIncludeClusterAuthorizedOperations(true)
+.setEndpointType((byte) 1),
+"{\"includeClusterAuthorizedOperations\":true,\"endpointType\":1}"));
+vectors.add(new Vector("describeCluster","DescribeClusterResponse",(short) 1,"mixed",
+new DescribeClusterResponseData()
+.setThrottleTimeMs(17)
+.setErrorCode((short) 0)
+.setErrorMessage(null)
+.setEndpointType((byte) 1)
+.setClusterId("cluster-a")
+.setControllerId(-1)
+.setBrokers(new DescribeClusterResponseData.DescribeClusterBrokerCollection(Arrays.asList(new DescribeClusterResponseData.DescribeClusterBroker()
+.setBrokerId(1)
+.setHost("localhost")
+.setPort(9092)
+.setRack(null)).iterator()))
+.setClusterAuthorizedOperations(-2147483648),
+"{\"throttleTimeMs\":17,\"errorCode\":0,\"errorMessage\":null,\"endpointType\":1,\"clusterId\":\"cluster-a\",\"controllerId\":-1,\"brokers\":[{\"brokerId\":1,\"host\":\"localhost\",\"port\":9092,\"rack\":null}],\"clusterAuthorizedOperations\":-2147483648}"));
+vectors.add(new Vector("describeCluster","DescribeClusterRequest",(short) 2,"basic",
+new DescribeClusterRequestData()
+.setIncludeClusterAuthorizedOperations(true)
+.setEndpointType((byte) 1)
+.setIncludeFencedBrokers(true),
+"{\"includeClusterAuthorizedOperations\":true,\"endpointType\":1,\"includeFencedBrokers\":true}"));
+vectors.add(new Vector("describeCluster","DescribeClusterResponse",(short) 2,"mixed",
+new DescribeClusterResponseData()
+.setThrottleTimeMs(17)
+.setErrorCode((short) 0)
+.setErrorMessage(null)
+.setEndpointType((byte) 1)
+.setClusterId("cluster-a")
+.setControllerId(-1)
+.setBrokers(new DescribeClusterResponseData.DescribeClusterBrokerCollection(Arrays.asList(new DescribeClusterResponseData.DescribeClusterBroker()
+.setBrokerId(1)
+.setHost("localhost")
+.setPort(9092)
+.setRack(null)
+.setIsFenced(true)).iterator()))
+.setClusterAuthorizedOperations(-2147483648),
+"{\"throttleTimeMs\":17,\"errorCode\":0,\"errorMessage\":null,\"endpointType\":1,\"clusterId\":\"cluster-a\",\"controllerId\":-1,\"brokers\":[{\"brokerId\":1,\"host\":\"localhost\",\"port\":9092,\"rack\":null,\"isFenced\":true}],\"clusterAuthorizedOperations\":-2147483648}"));
+vectors.add(new Vector("listConfigResources","ListConfigResourcesRequest",(short) 0,"basic",
+new ListConfigResourcesRequestData(),
+"{}"));
+vectors.add(new Vector("listConfigResources","ListConfigResourcesResponse",(short) 0,"mixed",
+new ListConfigResourcesResponseData()
+.setThrottleTimeMs(17)
+.setErrorCode((short) 0)
+.setConfigResources(Arrays.asList(new ListConfigResourcesResponseData.ConfigResource()
+.setResourceName("subscription"))),
+"{\"throttleTimeMs\":17,\"errorCode\":0,\"configResources\":[{\"resourceName\":\"subscription\"}]}"));
+vectors.add(new Vector("listConfigResources","ListConfigResourcesRequest",(short) 1,"basic",
+new ListConfigResourcesRequestData()
+.setResourceTypes(Arrays.asList((byte) 16, (byte) 32)),
+"{\"resourceTypes\":[16,32]}"));
+vectors.add(new Vector("listConfigResources","ListConfigResourcesResponse",(short) 1,"mixed",
+new ListConfigResourcesResponseData()
+.setThrottleTimeMs(17)
+.setErrorCode((short) 0)
+.setConfigResources(Arrays.asList(new ListConfigResourcesResponseData.ConfigResource()
+.setResourceName("subscription")
+.setResourceType((byte) 16))),
+"{\"throttleTimeMs\":17,\"errorCode\":0,\"configResources\":[{\"resourceName\":\"subscription\",\"resourceType\":16}]}"));
+    return vectors;
+  }
+
   /** @return every vector this generator emits, in file order per API */
   private static List<Vector> vectors() {
     List<Vector> transactionVectors = transactionAdmin();
     List<Vector> vectors = new ArrayList<>();
     vectors.addAll(transactionVectors);
+    vectors.addAll(clusterResources());
     vectors.addAll(consumerGroupHeartbeat());
     vectors.addAll(consumerGroupDescribe());
     vectors.addAll(listGroups());

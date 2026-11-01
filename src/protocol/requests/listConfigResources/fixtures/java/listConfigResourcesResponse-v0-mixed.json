@@ -1,0 +1,7 @@
+{
+  "message": "ListConfigResourcesResponse",
+  "version": 0,
+  "case": "mixed",
+  "hex": "000000110000020d737562736372697074696f6e0000",
+  "fields": {"throttleTimeMs":17,"errorCode":0,"configResources":[{"resourceName":"subscription"}]}
+}

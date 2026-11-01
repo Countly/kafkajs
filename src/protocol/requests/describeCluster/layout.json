@@ -1,0 +1,101 @@
+[
+  {
+    "message": "DescribeClusterRequest",
+    "version": 0,
+    "case": "basic",
+    "fields": {
+      "includeClusterAuthorizedOperations": true
+    },
+    "hex": "0100"
+  },
+  {
+    "message": "DescribeClusterResponse",
+    "version": 0,
+    "case": "mixed",
+    "fields": {
+      "throttleTimeMs": 17,
+      "errorCode": 0,
+      "errorMessage": null,
+      "clusterId": "cluster-a",
+      "controllerId": -1,
+      "brokers": [
+        {
+          "brokerId": 1,
+          "host": "localhost",
+          "port": 9092,
+          "rack": null
+        }
+      ],
+      "clusterAuthorizedOperations": -2147483648
+    },
+    "hex": "000000110000000a636c75737465722d61ffffffff02000000010a6c6f63616c686f73740000238400008000000000"
+  },
+  {
+    "message": "DescribeClusterRequest",
+    "version": 1,
+    "case": "basic",
+    "fields": {
+      "includeClusterAuthorizedOperations": true,
+      "endpointType": 1
+    },
+    "hex": "010100"
+  },
+  {
+    "message": "DescribeClusterResponse",
+    "version": 1,
+    "case": "mixed",
+    "fields": {
+      "throttleTimeMs": 17,
+      "errorCode": 0,
+      "errorMessage": null,
+      "endpointType": 1,
+      "clusterId": "cluster-a",
+      "controllerId": -1,
+      "brokers": [
+        {
+          "brokerId": 1,
+          "host": "localhost",
+          "port": 9092,
+          "rack": null
+        }
+      ],
+      "clusterAuthorizedOperations": -2147483648
+    },
+    "hex": "00000011000000010a636c75737465722d61ffffffff02000000010a6c6f63616c686f73740000238400008000000000"
+  },
+  {
+    "message": "DescribeClusterRequest",
+    "version": 2,
+    "case": "basic",
+    "fields": {
+      "includeClusterAuthorizedOperations": true,
+      "endpointType": 1,
+      "includeFencedBrokers": true
+    },
+    "hex": "01010100"
+  },
+  {
+    "message": "DescribeClusterResponse",
+    "version": 2,
+    "case": "mixed",
+    "fields": {
+      "throttleTimeMs": 17,
+      "errorCode": 0,
+      "errorMessage": null,
+      "endpointType": 1,
+      "clusterId": "cluster-a",
+      "controllerId": -1,
+      "brokers": [
+        {
+          "brokerId": 1,
+          "host": "localhost",
+          "port": 9092,
+          "rack": null,
+          "isFenced": true
+        }
+      ],
+      "clusterAuthorizedOperations": -2147483648
+    },
+    "hex": "00000011000000010a636c75737465722d61ffffffff02000000010a6c6f63616c686f7374000023840001008000000000"
+  }
+]

@@ -72,6 +72,13 @@ const PROFILES = {
     ['ExpireDelegationToken', 2],
     ['DescribeDelegationToken', 3],
   ],
+  clusterAdmin: [
+    ...DEFAULT,
+    ['ElectLeaders', 2],
+    ['UpdateFeatures', 2],
+    ['DescribeCluster', 2],
+    ['ListConfigResources', 1],
+  ],
   sasl: [...DEFAULT, ['SaslHandshake', 1], ['SaslAuthenticate', 2]],
   consumer: [
     ...DEFAULT.filter(([api]) => api !== 'OffsetFetch' && api !== 'OffsetCommit'),

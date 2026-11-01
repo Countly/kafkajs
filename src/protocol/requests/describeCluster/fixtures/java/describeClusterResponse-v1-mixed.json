@@ -1,0 +1,7 @@
+{
+  "message": "DescribeClusterResponse",
+  "version": 1,
+  "case": "mixed",
+  "hex": "00000011000000010a636c75737465722d61ffffffff02000000010a6c6f63616c686f73740000238400008000000000",
+  "fields": {"throttleTimeMs":17,"errorCode":0,"errorMessage":null,"endpointType":1,"clusterId":"cluster-a","controllerId":-1,"brokers":[{"brokerId":1,"host":"localhost","port":9092,"rack":null}],"clusterAuthorizedOperations":-2147483648}
+}

@@ -502,10 +502,15 @@ module.exports = class Broker {
    * @see https://cwiki.apache.org/confluence/display/KAFKA/KIP-511%3A+Collect+and+Expose+Client%27s+Name+and+Version+in+the+Brokers
    *
    * @public
-   * @returns {Promise<import("../../types").ApiVersions>}
+   * @param {object} [options] internal fresh-response selection
+   * @param {boolean} [options.includeFeatures=false] return the complete fresh response
+   * @returns {Promise<import("../../types").ApiVersions>} version map by default, the complete
+   *   decoded response when `includeFeatures` is set
+   * @throws {Error} negotiation, protocol, lifecycle or deadline failure
    */
-  async apiVersions() {
-    return toVersionMap(await this[PRIVATE.NEGOTIATE]())
+  async apiVersions({ includeFeatures = false } = {}) {
+    const response = await this[PRIVATE.NEGOTIATE]()
+    return includeFeatures ? response : toVersionMap(response)
   }
 
   /**
@@ -668,6 +673,8 @@ module.exports = class Broker {
    *   check; it never reaches the request
    * @param {boolean} [options.allowAutoTopicCreation] overrides only this request
    * @param {boolean} [options.includeTopicAuthorizedOperations=false] requests raw topic masks from v8
+   * @param {boolean} [options.includeClusterAuthorizedOperations=false] requests the raw cluster mask
+   *   on Metadata v8-v10, capping the version at 10 when the broker offers one
    * @param {boolean} [options.lenient=false] retains per-topic/partition errors in data
    * @param {boolean} [options.allowLeaderless=false] keeps a partition without a leader in data;
    *   other errors still throw
@@ -680,10 +687,17 @@ module.exports = class Broker {
       lenient = false,
       allowLeaderless = false,
       includeTopicAuthorizedOperations = false,
+      includeClusterAuthorizedOperations = false,
       allowAutoTopicCreation = this.allowAutoTopicCreation,
     } = options
     this.throwIfRefused(guard)
-    const metadata = this.lookupRequest(apiKeys.Metadata, requests.Metadata)
+    const cap =
+      includeClusterAuthorizedOperations &&
+      this.negotiatedVersion(apiKeys.Metadata, requests.Metadata, { [apiKeys.Metadata]: 10 }) !==
+        null
+        ? 10
+        : undefined
+    const metadata = this.lookupRequestWithMax(apiKeys.Metadata, requests.Metadata, cap)
     const shuffledTopics = shuffle(topics)
     return await this[PRIVATE.SEND_REQUEST](
       metadata({
@@ -692,6 +706,7 @@ module.exports = class Broker {
         lenient,
         allowLeaderless,
         includeTopicAuthorizedOperations,
+        includeClusterAuthorizedOperations,
       }),
       guard
     )
@@ -1847,6 +1862,93 @@ module.exports = class Broker {
       option
     )
     return this[PRIVATE.SEND_REQUEST](build(options))
+  }
+
+  /**
+   * Selects a cluster API, refusing unavailable options before building or sending a request.
+   * @param {number} apiKey API key
+   * @param {object} definition API family with its implemented versions
+   * @param {number} [required=0] minimum version needed by the requested option
+   * @param {string} [option='operation'] option named in a capability refusal
+   * @returns {Function} builder for the highest mutually supported version
+   * @throws {KafkaJSServerDoesNotSupportApiKey} with both ranges when the option is unavailable
+   * @throws {Error} original selection failure, without wrapping or replacing its cause
+   */
+  clusterRequest(apiKey, definition, required = 0, option = 'operation') {
+    const version = this.negotiatedVersion(apiKey, definition)
+    if (version === null || version < required) {
+      const offered = this.versions?.[apiKey]
+      const apiName = Object.keys(apiKeys).find((n) => apiKeys[n] === apiKey)
+      const implemented = definition.versions.map(Number)
+      throw new KafkaJSServerDoesNotSupportApiKey(
+        `${option} requires ${apiName} v${required}+; ` +
+          `client implements v${Math.min(...implemented)}-v${Math.max(...implemented)}, ` +
+          `broker supports ${offered ? `v${offered.minVersion ?? 0}-v${offered.maxVersion}` : 'no range'}`,
+        { apiKey, apiName }
+      )
+    }
+    return this.lookupRequest(apiKey, definition)
+  }
+
+  /** Sends leader elections with the exact preferred-v0 equivalence. @param {object} options selection @returns {Promise<object>} raw item rows @throws {Error} capability, protocol or deadline failure */
+  async electLeaders({ electionType = 'preferred', topicPartitions = null }) {
+    const build = this.clusterRequest(
+      apiKeys.ElectLeaders,
+      requests.ElectLeaders,
+      electionType === 'unclean' ? 1 : 0,
+      'electionType'
+    )
+    return this[PRIVATE.SEND_REQUEST](
+      build({ electionType: electionType === 'unclean' ? 1 : 0, topicPartitions, timeoutMs: 60000 })
+    )
+  }
+
+  /** Sends feature updates, retaining the v2 aggregate-success marker. @param {object} options updates @returns {Promise<object>} results null only for v2 @throws {Error} capability, protocol or deadline failure */
+  async updateFeatures({ featureUpdates, validateOnly = false }) {
+    const required = validateOnly || featureUpdates.some((f) => f.upgradeType !== 'upgrade') ? 1 : 0
+    const build = this.clusterRequest(
+      apiKeys.UpdateFeatures,
+      requests.UpdateFeatures,
+      required,
+      'validateOnly or upgradeType'
+    )
+    const codes = { upgrade: 1, 'safe-downgrade': 2, 'unsafe-downgrade': 3 }
+    const request = build({
+      timeoutMs: 60000,
+      validateOnly,
+      featureUpdates: featureUpdates.map((f) => ({
+        feature: f.feature,
+        maxVersionLevel: f.maxVersionLevel,
+        upgradeType: codes[f.upgradeType],
+        allowDowngrade: false,
+      })),
+    })
+    const response = await this[PRIVATE.SEND_REQUEST](request)
+    return { ...response, results: request.request.apiVersion === 2 ? null : response.results }
+  }
+
+  /** Describes broker endpoints; fenced listing requires v2. @param {object} options flags @returns {Promise<object>} raw cluster body @throws {Error} capability, protocol or deadline failure */
+  async describeCluster(options) {
+    const build = this.clusterRequest(
+      apiKeys.DescribeCluster,
+      requests.DescribeCluster,
+      options.includeFencedBrokers ? 2 : 0,
+      'includeFencedBrokers'
+    )
+    return this[PRIVATE.SEND_REQUEST](build({ ...options, endpointType: 1 }))
+  }
+
+  /** Lists config resources; v0 permits only an absent filter or exactly CLIENT_METRICS. @param {object} options resourceTypes @returns {Promise<object>} resource identities @throws {Error} capability, protocol or deadline failure */
+  async listConfigResources({ resourceTypes = [] }) {
+    const required =
+      resourceTypes.length && !(resourceTypes.length === 1 && resourceTypes[0] === 16) ? 1 : 0
+    const build = this.clusterRequest(
+      apiKeys.ListConfigResources,
+      requests.ListConfigResources,
+      required,
+      'resourceTypes'
+    )
+    return this[PRIVATE.SEND_REQUEST](build({ resourceTypes }))
   }
 
   /**

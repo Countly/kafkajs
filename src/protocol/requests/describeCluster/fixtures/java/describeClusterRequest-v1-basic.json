@@ -1,0 +1,7 @@
+{
+  "message": "DescribeClusterRequest",
+  "version": 1,
+  "case": "basic",
+  "hex": "010100",
+  "fields": {"includeClusterAuthorizedOperations":true,"endpointType":1}
+}

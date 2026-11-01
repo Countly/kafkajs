@@ -231,6 +231,163 @@ module.exports = {
       ],
     },
   },
+  listConfigResourcesV1: {
+    source: 'GenerateMessageVectors.java clusterResources',
+    request: { resourceTypes: [16, 32] },
+    response: {
+      throttleTimeMs: 17,
+      errorCode: 0,
+      configResources: [{ resourceName: 'subscription', resourceType: 16 }],
+    },
+  },
+  listConfigResourcesV0: {
+    source: 'GenerateMessageVectors.java clusterResources',
+    request: {},
+    response: {
+      throttleTimeMs: 17,
+      errorCode: 0,
+      configResources: [{ resourceName: 'subscription' }],
+    },
+  },
+  describeClusterV2: {
+    source: 'GenerateMessageVectors.java clusterResources',
+    request: {
+      includeClusterAuthorizedOperations: true,
+      endpointType: 1,
+      includeFencedBrokers: true,
+    },
+    response: {
+      throttleTimeMs: 17,
+      errorCode: 0,
+      errorMessage: null,
+      endpointType: 1,
+      clusterId: 'cluster-a',
+      controllerId: -1,
+      brokers: [{ brokerId: 1, host: 'localhost', port: 9092, rack: null, isFenced: true }],
+      clusterAuthorizedOperations: -2147483648,
+    },
+  },
+  describeClusterV1: {
+    source: 'GenerateMessageVectors.java clusterResources',
+    request: { includeClusterAuthorizedOperations: true, endpointType: 1 },
+    response: {
+      throttleTimeMs: 17,
+      errorCode: 0,
+      errorMessage: null,
+      endpointType: 1,
+      clusterId: 'cluster-a',
+      controllerId: -1,
+      brokers: [{ brokerId: 1, host: 'localhost', port: 9092, rack: null }],
+      clusterAuthorizedOperations: -2147483648,
+    },
+  },
+  describeClusterV0: {
+    source: 'GenerateMessageVectors.java clusterResources',
+    request: { includeClusterAuthorizedOperations: true },
+    response: {
+      throttleTimeMs: 17,
+      errorCode: 0,
+      errorMessage: null,
+      clusterId: 'cluster-a',
+      controllerId: -1,
+      brokers: [{ brokerId: 1, host: 'localhost', port: 9092, rack: null }],
+      clusterAuthorizedOperations: -2147483648,
+    },
+  },
+  updateFeaturesV2: {
+    source: 'GenerateMessageVectors.java clusterResources',
+    request: {
+      timeoutMs: 60000,
+      featureUpdates: [{ feature: 'metadata.version', maxVersionLevel: 25, upgradeType: 2 }],
+      validateOnly: true,
+    },
+    response: { throttleTimeMs: 17, errorCode: 0, errorMessage: null },
+  },
+  updateFeaturesV1: {
+    source: 'GenerateMessageVectors.java clusterResources',
+    request: {
+      timeoutMs: 60000,
+      featureUpdates: [{ feature: 'metadata.version', maxVersionLevel: 25, upgradeType: 2 }],
+      validateOnly: true,
+    },
+    response: {
+      throttleTimeMs: 17,
+      errorCode: 0,
+      errorMessage: null,
+      results: [{ feature: 'metadata.version', errorCode: 42, errorMessage: 'invalid feature' }],
+    },
+  },
+  updateFeaturesV0: {
+    source: 'GenerateMessageVectors.java clusterResources',
+    request: {
+      timeoutMs: 60000,
+      featureUpdates: [{ feature: 'metadata.version', maxVersionLevel: 25, allowDowngrade: false }],
+    },
+    response: {
+      throttleTimeMs: 17,
+      errorCode: 0,
+      errorMessage: null,
+      results: [{ feature: 'metadata.version', errorCode: 42, errorMessage: 'invalid feature' }],
+    },
+  },
+  electLeadersV2: {
+    source: 'GenerateMessageVectors.java clusterResources',
+    request: {
+      electionType: 1,
+      topicPartitions: [{ topic: 'orders', partitions: [0, 2] }],
+      timeoutMs: 60000,
+    },
+    response: {
+      throttleTimeMs: 17,
+      errorCode: 0,
+      replicaElectionResults: [
+        {
+          topic: 'orders',
+          partitionResult: [
+            { partitionId: 0, errorCode: 84, errorMessage: null },
+            { partitionId: 2, errorCode: 80, errorMessage: 'no replica' },
+          ],
+        },
+      ],
+    },
+  },
+  electLeadersV1: {
+    source: 'GenerateMessageVectors.java clusterResources',
+    request: {
+      electionType: 1,
+      topicPartitions: [{ topic: 'orders', partitions: [0, 2] }],
+      timeoutMs: 60000,
+    },
+    response: {
+      throttleTimeMs: 17,
+      errorCode: 0,
+      replicaElectionResults: [
+        {
+          topic: 'orders',
+          partitionResult: [
+            { partitionId: 0, errorCode: 84, errorMessage: null },
+            { partitionId: 2, errorCode: 80, errorMessage: 'no replica' },
+          ],
+        },
+      ],
+    },
+  },
+  electLeadersV0: {
+    source: 'GenerateMessageVectors.java clusterResources',
+    request: { topicPartitions: [{ topic: 'orders', partitions: [0, 2] }], timeoutMs: 60000 },
+    response: {
+      throttleTimeMs: 17,
+      replicaElectionResults: [
+        {
+          topic: 'orders',
+          partitionResult: [
+            { partitionId: 0, errorCode: 84, errorMessage: null },
+            { partitionId: 2, errorCode: 80, errorMessage: 'no replica' },
+          ],
+        },
+      ],
+    },
+  },
   metadataV7: {
     source:
       'MetadataRequest/Response 4.3.1 v7 field literals; independent Java v7 serialization acceptance required',

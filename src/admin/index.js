@@ -2,6 +2,8 @@ const createDelegationTokens = require('./delegationTokens')
 const createClientQuotas = require('./clientQuotas')
 const createScramCredentials = require('./scramCredentials')
 const createTransactions = require('./transactions')
+const createClusterAdmin = require('./clusterAdmin')
+const createConfigResources = require('./configResources')
 const { inspect } = require('util')
 const {
   retrierOf,
@@ -67,7 +69,6 @@ const isolationOf = (options = {}) => {
 
 const { CONNECT, DISCONNECT } = events
 
-const NO_CONTROLLER_ID = -1
 const NOT_CONTROLLER_CODE = 41
 const GROUP_ID_NOT_FOUND_CODE = 69
 const CONSUMER_PROTOCOL_TYPE = 'consumer'
@@ -1717,42 +1718,6 @@ module.exports = ({
   }
 
   /**
-   * Describe cluster
-   *
-   * @return {Promise<ClusterMetadata>}
-   *
-   * @typedef {Object} ClusterMetadata
-   * @property {Array<Broker>} brokers
-   * @property {Number} controller Current controller id. Returns null if unknown.
-   * @property {String} clusterId
-   *
-   * @typedef {Object} Broker
-   * @property {Number} nodeId
-   * @property {String} host
-   * @property {Number} port
-   */
-  const describeCluster = async () => {
-    const {
-      brokers: nodes,
-      clusterId,
-      controllerId,
-    } = checked(await waitOf(async () => cluster.metadata({ topics: [] })))
-    const brokers = nodes.map(({ nodeId, host, port }) => ({
-      nodeId,
-      host,
-      port,
-    }))
-    const controller =
-      controllerId == null || controllerId === NO_CONTROLLER_ID ? null : controllerId
-
-    return {
-      brokers,
-      controller,
-      clusterId,
-    }
-  }
-
-  /**
    * Lists the groups every broker knows about, optionally filtered by state and by type.
    *
    * The fan-out is sequential and all-or-nothing: one unreachable broker fails the whole call, as
@@ -2762,7 +2727,8 @@ module.exports = ({
       deleteTopics,
       createPartitions,
       fetchTopicMetadata,
-      describeCluster,
+      ...createClusterAdmin({ cluster, retry }),
+      ...createConfigResources({ cluster, retry }),
       events,
       ...createOffsets({ cluster, retry }),
       ...createLogDirs({ cluster, retry }),
@@ -2807,6 +2773,10 @@ module.exports = ({
       alterReplicaLogDirs: 0,
       describeReplicaLogDirs: 0,
       fetchOffsetsForGroups: 0,
+      electLeaders: 0,
+      describeFeatures: 0,
+      updateFeatures: 0,
+      listConfigResources: 0,
       fetchOffsets: 0,
       setOffsets: 0,
       resetOffsets: 0,

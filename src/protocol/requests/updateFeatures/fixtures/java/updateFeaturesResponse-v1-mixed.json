@@ -1,0 +1,7 @@
+{
+  "message": "UpdateFeaturesResponse",
+  "version": 1,
+  "case": "mixed",
+  "hex": "0000001100000002116d657461646174612e76657273696f6e002a10696e76616c696420666561747572650000",
+  "fields": {"throttleTimeMs":17,"errorCode":0,"errorMessage":null,"results":[{"feature":"metadata.version","errorCode":42,"errorMessage":"invalid feature"}]}
+}
