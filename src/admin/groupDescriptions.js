@@ -379,10 +379,12 @@ class GroupDescriptions {
             context,
             await this.#wait(context, async () => this.#groupByCoordinator([...pending], context))
           )
+          let failure
+          let failed = false
           this.#checked(
             context,
             await this.#wait(context, async () =>
-              Promise.all(
+              Promise.allSettled(
                 batches.map(async ({ coordinator, ids: batchIds }) => {
                   try {
                     const { groups } = this.#checked(
@@ -402,6 +404,10 @@ class GroupDescriptions {
                       pending.delete(row.groupId)
                     }
                   } catch (error) {
+                    if (!failed) {
+                      failed = true
+                      failure = error
+                    }
                     if (RE_FINDS_COORDINATOR.has(error.code)) {
                       for (const id of batchIds) context.coordinators.delete(id)
                     }
@@ -411,6 +417,7 @@ class GroupDescriptions {
               )
             )
           )
+          if (failed) throw failure
         })
       )
     )

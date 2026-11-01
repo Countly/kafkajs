@@ -1,3 +1,5 @@
+const { createGroupDescriptions } = require('../groupDescriptions')
+const { createErrorFromCode } = require('../../protocol/error')
 const createAdmin = require('../index')
 const { MemberAssignment } = require('../../consumer/assignerProtocol')
 const { newLogger } = require('testHelpers')
@@ -766,4 +768,58 @@ describe('Admin > describeGroups > routing', () => {
     expect(groups[0].members[0].memberAssignment).toEqual(Buffer.from([0xff, 0xff]))
     expect(groups[0].members[1].assignment).toEqual([])
   })
+})
+
+const logger = { namespace: () => logger, debug() {} }
+test('does not duplicate an in-flight successful split classic batch', async () => {
+  jest.useFakeTimers()
+  const a = {
+    nodeId: 1,
+    describeGroups: jest
+      .fn()
+      .mockRejectedValueOnce(createErrorFromCode(16))
+      .mockResolvedValue({ groups: [{ groupId: 'a', errorCode: 0, members: [] }] }),
+  }
+  const b = {
+    nodeId: 2,
+    describeGroups: jest.fn(
+      () =>
+        new Promise((resolve) =>
+          setTimeout(() => resolve({ groups: [{ groupId: 'b', errorCode: 0, members: [] }] }), 20)
+        )
+    ),
+  }
+  const original = {
+    nodeId: 0,
+    consumerGroupDescribe: async () => ({
+      groups: ['a', 'b'].map((groupId) => ({ groupId, errorCode: 69 })),
+    }),
+    describeGroups: jest.fn().mockRejectedValue(createErrorFromCode(16)),
+  }
+  const cluster = {
+    findGroupCoordinator: jest
+      .fn()
+      .mockResolvedValueOnce(original)
+      .mockResolvedValueOnce(original)
+      .mockImplementation(async ({ groupId }) => (groupId === 'a' ? a : b)),
+  }
+  try {
+    const result = createGroupDescriptions({
+      cluster,
+      logger,
+      retry: { retries: 3, initialRetryTime: 1, factor: 0, multiplier: 1 },
+    })
+      .describe(['a', 'b'])
+      .then(
+        (value) => ({ value }),
+        (error) => ({ error })
+      )
+    await jest.advanceTimersByTimeAsync(100)
+    const outcome = await result
+    expect(outcome.error).toBeUndefined()
+    expect(outcome.value.groups.map((row) => row.groupId).sort()).toEqual(['a', 'b'])
+    expect(b.describeGroups).toHaveBeenCalledTimes(1)
+  } finally {
+    jest.useRealTimers()
+  }
 })
