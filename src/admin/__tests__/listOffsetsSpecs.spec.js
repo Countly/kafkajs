@@ -65,7 +65,7 @@ describe('offset specifications', () => {
     expect(read).toHaveBeenCalledTimes(2)
     expect(read.mock.calls.map((x) => x[1])).toEqual([{ isolationLevel: 1 }, { isolationLevel: 1 }])
   })
-  it.each(['MAX_TIMESTAMP', '', 'earliest', 'constructor', '123'])(
+  it.each(['MAX_TIMESTAMP', '', 'earliest', 'constructor', '123abc'])(
     'refuses unknown spec before discovery %p',
     async (spec) => {
       const { admin, cluster } = fixture()

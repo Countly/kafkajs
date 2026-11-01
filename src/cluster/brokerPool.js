@@ -495,6 +495,9 @@ module.exports = class BrokerPool {
    * `hasConnectedBrokers()` and `findConnectedBroker()`'s fallback, so it must never be unset -
    * nor point at a broker that is already tearing down - across the awaits in here.
    *
+   * Concurrent initial builds adopt the first installed seed; replacement builds retain their
+   * captured identity checks. A refused caller never adopts another caller's seed.
+   *
    * @public
    * @param {object} [options]
    * @param {import('../producer/generation')} [options.fence] the producer lifecycle asking: once
@@ -509,16 +512,17 @@ module.exports = class BrokerPool {
     const previousSeedBroker = this.seedBroker
     const ownsSeed = () => isCurrent() && this.seedBroker === previousSeedBroker
     const connectionPool = await this.buildConnectionPool(undefined, { fence, isCurrent: ownsSeed })
-    if (!connectionPool) throw new KafkaJSConnectionError('Seed broker build was superseded')
     if (
+      !connectionPool ||
       fence?.closed ||
       currentDeadline()?.guard() ||
       !isCurrent() ||
       this.seedBroker !== previousSeedBroker
     ) {
-      this.closePool(connectionPool)
+      if (connectionPool) this.closePool(connectionPool)
       fence?.check()
       checked(null)
+      if (!previousSeedBroker && this.seedBroker && isCurrent()) return this.seedBroker
       throw new KafkaJSConnectionError('Seed broker build was superseded')
     }
     this.seedBroker = this.createBroker({

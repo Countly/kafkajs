@@ -1,3 +1,5 @@
+const { EventEmitter } = require('events')
+const Connection = require('../connection')
 const Broker = require('../../broker')
 const ConnectionPool = require('../connectionPool')
 const { createScriptedCluster } = require('../../../testHelpers/scriptedCluster')
@@ -50,6 +52,44 @@ afterEach(async () => {
   expect(jest.getTimerCount()).toBe(0)
   gate = null
   jest.useRealTimers()
+})
+
+it.each([
+  [false, 'setup'],
+  [true, 'setup'],
+  [false, 'socket'],
+  [true, 'socket'],
+])('preserves the connect timeout error with ssl=%p and %s expiry', async (ssl, timer) => {
+  const socket = new EventEmitter()
+  socket.end = jest.fn()
+  socket.destroy = jest.fn()
+  socket.unref = jest.fn()
+  const connection = new Connection({
+    host: 'localhost',
+    port: 9093,
+    ssl,
+    logger,
+    connectionTimeout: 3000,
+    socketFactory: () => socket,
+  })
+  try {
+    const connecting = connection.connect().catch((error) => error)
+    if (timer === 'socket') socket.emit('timeout')
+    else await jest.advanceTimersByTimeAsync(3000)
+    const error = await connecting
+    expect(error).toBeInstanceOf(KafkaJSConnectionError)
+    expect(error.message).toBe('Connection timeout')
+    expect(error.broker).toBe('localhost:9093')
+    if (timer === 'setup') {
+      expect(error).toMatchObject({ phase: 'TCP/TLS', timeout: 3000 })
+    }
+    expect(connection.isConnected()).toBe(false)
+    expect(socket.destroy).toHaveBeenCalledTimes(1)
+    expect(connection.socket).toBeNull()
+    expect(jest.getTimerCount()).toBe(0)
+  } finally {
+    await connection.disconnect({ drainTimeout: 0 })
+  }
 })
 
 it('bounds an unanswered ApiVersions by the setup budget', async () => {
@@ -180,7 +220,8 @@ it('ends a blackholed dial at the node budget', async () => {
   expect(error).toBeUndefined()
   await jest.advanceTimersByTimeAsync(1)
   expect(error).toBeInstanceOf(KafkaJSConnectionError)
-  expect(error.message).toMatch(/TCP\/TLS.*300ms/)
+  expect(error.message).toBe('Connection timeout')
+  expect(error).toMatchObject({ phase: 'TCP/TLS', timeout: 300, broker: 'node:9092' })
 })
 
 it('shares the original budget when Broker joins a direct connection dial', async () => {

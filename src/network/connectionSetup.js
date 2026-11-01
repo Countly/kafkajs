@@ -313,13 +313,21 @@ class SetupAttempt {
     }
   }
 
-  /** Settles expiry before teardown; synchronous boundary checks use the same path. @returns {void} */
+  /**
+   * Settles expiry before teardown; boundary checks share this path. TCP/TLS keeps the
+   * legacy connection-error text; phase and budget remain available as error properties.
+   * @returns {void}
+   */
   expire() {
     if (this.status !== 'active') return
     const error = new KafkaJSConnectionError(
-      `Connection setup ${this.phase} timed out for ${this.address} (node timeout ${this.timeout}ms)`,
+      this.phase === 'TCP/TLS'
+        ? 'Connection timeout'
+        : `Connection setup ${this.phase} timed out for ${this.address} (node timeout ${this.timeout}ms)`,
       { broker: this.address }
     )
+    error.phase = this.phase
+    error.timeout = this.timeout
     this.fail(error)
     this.onExpire?.(error)
   }

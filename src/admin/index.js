@@ -886,7 +886,7 @@ module.exports = ({
 
   /**
    * @param {string} topic
-   * @param {number} [timestamp] timestamp in milliseconds
+   * @param {number|string} [timestamp] milliseconds, a decimal timestamp string or a named spec
    * @param {object} [options] isolationLevel and apiTimeout
    * @returns {Promise<object[]>} partition decimal offsets, falling back to high on no match
    * @throws {Error} validation, deadline or broker failure
@@ -900,7 +900,7 @@ module.exports = ({
       latestTiered: [-5, 9],
       earliestPendingUpload: [-6, 11],
     }
-    if (typeof timestamp === 'string') {
+    if (typeof timestamp === 'string' && !/^-?\d+$/.test(timestamp)) {
       if (!Object.prototype.hasOwnProperty.call(specs, timestamp))
         throw new KafkaJSInvalidConfigurationError('Invalid offset spec')
       if (!topic || typeof topic !== 'string')

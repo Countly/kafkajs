@@ -248,7 +248,7 @@ await admin.fetchTopicOffsetsByTimestamp(topic, timestamp)
 // ]
 ```
 
-`fetchTopicOffsetsByTimestamp(topic, timestamp, options)` also accepts `'maxTimestamp'`, `'earliestLocal'`, `'latestTiered'` and `'earliestPendingUpload'`. Their broker timestamps are -3, -4, -5 and -6; they need ListOffsets v7, v8, v9 and v11 respectively. An unsupported specification rejects with `KafkaJSServerDoesNotSupportApiKey`. Named specifications return the raw broker offset, including -1 when no offset exists. Numeric timestamps keep their existing high-offset fallback. Both forms keep `read_committed` by default and accept `{ isolationLevel: 'read_uncommitted' }`.
+`fetchTopicOffsetsByTimestamp(topic, timestamp, options)` also accepts `'maxTimestamp'`, `'earliestLocal'`, `'latestTiered'` and `'earliestPendingUpload'`. Their broker timestamps are -3, -4, -5 and -6; they need ListOffsets v7, v8, v9 and v11 respectively. An unsupported specification rejects with `KafkaJSServerDoesNotSupportApiKey`. Named specifications return the raw broker offset, including -1 when no offset exists. Numeric timestamps, including decimal strings such as a consumed message's `timestamp`, keep their existing high-offset fallback. Both forms keep `read_committed` by default and accept `{ isolationLevel: 'read_uncommitted' }`.
 
 ListOffsets v10 carries the broker timeout for asynchronous remote reads; v11 adds the earliest pending upload specification. On a plain topic, `earliestLocal` is the log start and `latestTiered` is -1. Tiered storage must be configured on the broker to observe uploaded/local boundaries.
 

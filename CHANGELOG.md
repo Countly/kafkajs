@@ -153,6 +153,8 @@ Versions before 3.0.0 are internal alpha tags and are not published.
 
 ### Phase 9D — Client, security and admin breadth
 
+- Preserve concurrent admin/producer/consumer connects over a shared cluster and decimal-string timestamps from consumed messages in `fetchTopicOffsetsByTimestamp`.
+
 #### Behavior changes
 
 - Token-admin diagnostics omit credentials and sensitive broker payloads. Error classes and fixed message prefixes remain stable.
