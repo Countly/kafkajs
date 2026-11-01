@@ -37,7 +37,7 @@ const healthyIdle = async ({ metadataMaxAge, duration = 0 } = {}) => {
    * @returns {Promise<object>} resource reading */
   const probe = {
     snapshot: async () => {
-      const row = await box.probe.snapshot()
+      const row = await pump(box.probe.snapshot())
       readings.push(row)
       return row
     },
@@ -141,6 +141,17 @@ const healthyIdle = async ({ metadataMaxAge, duration = 0 } = {}) => {
 
 test('a healthy idle cycle succeeds when the bootstrap differs from the topic leader', async () => {
   await healthyIdle()
+})
+
+test('a healthy idle cycle completes when GC enables delayed heap sampling', async () => {
+  const gc = globalThis.gc
+  try {
+    globalThis.gc = () => {}
+    await healthyIdle()
+  } finally {
+    globalThis.gc = gc
+    jest.useRealTimers()
+  }
 })
 
 test('healthy default metadata expiry does not fail a full duration idle profile', async () => {
