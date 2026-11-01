@@ -158,6 +158,7 @@ Versions before 3.0.0 are internal alpha tags and are not published.
 - `connectionTimeout` defaults to 10 000 ms and grows per node, with jitter, up to `connectionTimeoutMax` (30 000 ms) while a node keeps failing; it resets when the node is ready. A value you set stays flat. Java's `socket.connection.setup.timeout.ms` (KIP-601).
 - A broker must be ready (TCP, TLS, ApiVersions, SASL) within the setup timeout; a stalled ApiVersions or SASL exchange no longer waits for `requestTimeout`.
 - `authenticationTimeout` now bounds the SASL exchange (it only sized the blackout before). A token callback slower than 10 s needs a larger value.
+- Reauthentication on an established, negotiated connection uses this SASL cap without restarting the connection setup timeout, preserving non-retriable provider failures.
 - Reconnects to a node whose connection failed wait 50 ms, growing to 1 000 ms; `reconnectBackoff` and `reconnectBackoffMax` tune it.
 - Timeouts now require positive integral values. Some legacy authentication values and fractional connection values could work. Invalid values throw `KafkaJSInvalidConfigurationError`; existing numeric strings remain accepted.
 

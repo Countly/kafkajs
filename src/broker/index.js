@@ -342,6 +342,9 @@ module.exports = class Broker {
    * table is shared by both pooled sockets. The same negotiation also retains the broker's
    * finalized features (`finalizedFeatures`, `finalizedFeaturesEpoch`).
    *
+   * An established, negotiated connection reauthenticates under the SASL cap without starting
+   * another physical setup budget or changing the node's setup failure state.
+   *
    * @public
    * @param {object} [options]
    * @param {(frameLength?: number) => Error|null} [options.guard] a producer's private check of its
@@ -371,6 +374,26 @@ module.exports = class Broker {
         await pool.getConnection()
       }
       const connection = pool.pool[0]
+      if (
+        connection.isConnected() &&
+        !connection.setupAttempt &&
+        this.versionsGeneration === pool.generation
+      ) {
+        const generation = pool.generation
+        try {
+          await connection.authenticate()
+          this.throwIfRefused(guard)
+          this.throwIfRetired()
+          if (this.connectionPool !== pool)
+            throw new KafkaJSConnectionError('Connection pool was replaced', {
+              broker: this.brokerAddress,
+            })
+        } catch (error) {
+          attachFailureSource(error, { broker: this, generation })
+          throw error
+        }
+        return
+      }
       const attempt =
         connection.setupAttempt?.status === 'active' ? connection.setupAttempt : pool.beginSetup()
       attempt.brokerManaged = true

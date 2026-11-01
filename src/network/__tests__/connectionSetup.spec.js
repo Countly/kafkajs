@@ -3,7 +3,11 @@ const ConnectionPool = require('../connectionPool')
 const { createScriptedCluster } = require('../../../testHelpers/scriptedCluster')
 const { Schedule } = require('../../../testHelpers/schedule')
 const { createLogger } = require('../../loggers')
-const { KafkaJSConnectionError, KafkaJSConnectionClosedError } = require('../../errors')
+const {
+  KafkaJSConnectionError,
+  KafkaJSConnectionClosedError,
+  KafkaJSSASLAuthenticationError,
+} = require('../../errors')
 const { ConnectionSetupPolicy } = require('../connectionSetup')
 
 const logger = createLogger({ level: 0, logCreator: () => () => {} })
@@ -566,5 +570,60 @@ it.each(['protocol', 'mechanism', 'credentials', 'provider', 'retirement'])(
     expect(Boolean(broker.connectionPool.authenticationBlackoutEntry())).toBe(
       kind === 'credentials'
     )
+  }
+)
+
+it.each(['success', 'rejection', 'timeout'])(
+  'broker reauthentication uses the SASL cap after readiness: %s',
+  async (outcome) => {
+    await broker.disconnect({ drainTimeout: 0 })
+    const sasl = {
+      mechanism: 'plain',
+      authenticationProvider: () => ({ authenticate: async () => {} }),
+    }
+    arrange({ connectionTimeout: 100, authenticationTimeout: 400, sasl })
+    const initial = broker.connect()
+    await jest.advanceTimersByTimeAsync(10)
+    await initial
+    const pool = broker.connectionPool
+    const connection = pool.pool[0]
+    const socket = connection.socket
+    connection.authenticatedAt = null
+    const failure = new KafkaJSSASLAuthenticationError('SASL provider rejected')
+    sasl.authenticationProvider = () => ({
+      authenticate: async () => {
+        await new Promise((resolve) => setTimeout(resolve, outcome === 'timeout' ? 500 : 200))
+        if (outcome === 'rejection') throw failure
+      },
+    })
+    let result
+    const reauth = broker.connect().then(
+      () => {
+        result = true
+      },
+      (error) => {
+        result = error
+      }
+    )
+    try {
+      await jest.advanceTimersByTimeAsync(101)
+      expect(result).toBeUndefined()
+      expect(socket.destroyed).toBe(false)
+      await jest.advanceTimersByTimeAsync(300)
+      await reauth
+      if (outcome === 'timeout') {
+        expect(result).toBeInstanceOf(KafkaJSConnectionError)
+        expect(result.retriable).toBe(true)
+        expect(socket.destroyed).toBe(true)
+      } else {
+        expect(result).toBe(outcome === 'success' ? true : failure)
+        expect(socket.destroyed).toBe(false)
+      }
+      expect(cluster.sockets()).toHaveLength(1)
+      expect(cluster.requests().filter(({ api }) => api === 'ApiVersions')).toHaveLength(1)
+      expect(pool.setupStates.state(pool.brokerAddress, performance.now()).failures).toBe(0)
+    } finally {
+      await jest.advanceTimersByTimeAsync(500)
+    }
   }
 )
