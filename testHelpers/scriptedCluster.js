@@ -41,9 +41,10 @@ const DEFAULT = [...CLASSIC, ...PRODUCER]
  * client's own caps allow under that transaction version: a transactional Produce, EndTxn and
  * TxnOffsetCommit at v11, v4 and v4 under transaction version 1, and at v12, v5 and v5 under 2,
  * which also sends no AddPartitionsToTxn and no AddOffsetsToTxn.
- * @type {Record<'default'|'sasl'|'consumer'|'tv1'|'tv2', Array<[string, number]>>}
+ * @type {Record<'default'|'sasl'|'consumer'|'tv1'|'tv2'|'offsets', Array<[string, number]>>}
  */
 const PROFILES = {
+  offsets: [...DEFAULT, ['OffsetDelete', 0]],
   default: DEFAULT,
   sasl: [...DEFAULT, ['SaslHandshake', 1], ['SaslAuthenticate', 2]],
   consumer: [

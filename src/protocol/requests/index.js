@@ -74,7 +74,7 @@ const requests = {
   IncrementalAlterConfigs: require('./incrementalAlterConfigs'),
   AlterPartitionReassignments: require('./alterPartitionReassignments'),
   ListPartitionReassignments: require('./listPartitionReassignments'),
-  OffsetDelete: noImplementedRequestDefinitions,
+  OffsetDelete: require('./offsetDelete'),
   DescribeClientQuotas: noImplementedRequestDefinitions,
   AlterClientQuotas: noImplementedRequestDefinitions,
   DescribeUserScramCredentials: noImplementedRequestDefinitions,

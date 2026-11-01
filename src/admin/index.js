@@ -8,6 +8,7 @@ const {
   sharedSetup,
   waitForOf: waitFor,
 } = require('./deadline')
+const { createOffsets } = require('./offsets')
 const groupBy = require('../utils/groupBy')
 const createConsumer = require('../consumer')
 const { disposeConsumer } = require('../consumer/disposal')
@@ -886,10 +887,18 @@ module.exports = ({
    *
    * @param {string} groupId
    * @param {string[]} topics - list of topics to fetch offsets for, defaults to `[]` which fetches all topics for `groupId`.
+   * @param {boolean} [requireStable=false] request stable commits; requires OffsetFetch v7+
    * @param {boolean} [resolveOffsets=false]
    * @return {Promise}
    */
-  const fetchOffsets = async ({ groupId, topics, resolveOffsets = false }) => {
+  const fetchOffsets = async ({
+    groupId,
+    topics,
+    resolveOffsets = false,
+    requireStable = false,
+  }) => {
+    if (typeof requireStable !== 'boolean')
+      throw new KafkaJSInvalidConfigurationError('Invalid requireStable')
     if (!groupId) {
       throw new KafkaJSNonRetriableError(`Invalid groupId ${groupId}`)
     }
@@ -921,6 +930,7 @@ module.exports = ({
         coordinator.offsetFetch({
           groupId,
           topics: topicsToFetch,
+          ...(requireStable ? { requireStable } : {}),
         })
       )
     )
@@ -2624,6 +2634,7 @@ module.exports = ({
       fetchTopicMetadata,
       describeCluster,
       events,
+      ...createOffsets({ cluster, retry }),
       fetchOffsets,
       fetchTopicOffsets,
       fetchTopicOffsetsByTimestamp,
@@ -2652,6 +2663,8 @@ module.exports = ({
       createPartitions: 0,
       fetchTopicMetadata: 0,
       describeCluster: 0,
+      deleteOffsets: 0,
+      fetchOffsetsForGroups: 0,
       fetchOffsets: 0,
       setOffsets: 0,
       resetOffsets: 0,

@@ -10,12 +10,18 @@ const { OffsetFetch: apiKey } = require('../../apiKeys')
  *       partition => INT32
  */
 
+/** Builds a nullable all-topic request; existing empty-array and explicit bytes are retained.
+ * @param {object} options request selection
+ * @param {string} options.groupId group identity
+ * @param {object[]|null} options.topics null requests all topics
+ * @returns {object} v3 protocol request, also used by v4/v5 without retry work
+ */
 module.exports = ({ groupId, topics }) => ({
   apiKey,
   apiVersion: 3,
   apiName: 'OffsetFetch',
   encode: async () => {
-    return new Encoder().writeString(groupId).writeNullableArray(topics.map(encodeTopic))
+    return new Encoder().writeString(groupId).writeNullableArray(topics?.map(encodeTopic) ?? [])
   },
 })
 

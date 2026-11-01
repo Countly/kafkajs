@@ -51,7 +51,7 @@ Gap classes: `current` (fork max equals the Kafka max) · `behind:N` · `stub` (
 | IncrementalAlterConfigs | 44 | 0-1 | v1+ | 0-1 | current | The merge-semantics alternative to AlterConfigs: each config entry names a SET, DELETE, APPEND or SUBTRACT, so the entries a request leaves out are untouched. |
 | AlterPartitionReassignments | 45 | 0-1 | v0+ | 0 | behind:1 | v0 is flexible (KIP-455): the codec writes its own body tag buffer, like every flexible codec, and the request header is chosen by the flexible framing. v1 adds AllowReplicationFactorChange (KIP-860), which defaults to true, the behavior v0 has; it is not implemented because nothing here asks to forbid a replication-factor change, so behind:1 is this API's steady state until something does. |
 | ListPartitionReassignments | 46 | 0 | v0+ | 0 | current | Kafka defines only v0 (KIP-455), a flexible version, so the fork is current. |
-| OffsetDelete | 47 | 0 | never | — | stub |  |
+| OffsetDelete | 47 | 0 | never | 0 | current |  |
 | DescribeClientQuotas | 48 | 0-1 | v1+ | — | stub |  |
 | AlterClientQuotas | 49 | 0-1 | v1+ | — | stub |  |
 | DescribeUserScramCredentials | 50 | 0 | v0+ | — | stub |  |

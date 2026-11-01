@@ -156,6 +156,18 @@ const PROJECTIONS = {
       }
       const { groupId, ...rest } = fields
       if (version >= 9) return rest
+      if (version === 7 && fields.topics)
+        return {
+          throttleTime: fields.throttleTime,
+          errorCode: fields.errorCode,
+          responses: fields.topics.map(({ topic, partitions }) => ({
+            topic,
+            partitions: partitions.map(({ leaderEpoch, ...partition }) => ({
+              ...partition,
+              committedLeaderEpoch: leaderEpoch,
+            })),
+          })),
+        }
       if (version < 8) return fields
       return {
         throttleTime: fields.throttleTime,

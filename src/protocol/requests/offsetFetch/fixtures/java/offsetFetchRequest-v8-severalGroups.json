@@ -1,0 +1,7 @@
+{
+  "message": "OffsetFetchRequest",
+  "version": 8,
+  "case": "severalGroups",
+  "hex": "030261020274020000000000000262020274020000000000000100",
+  "fields": {"groups":[{"groupId":"a","topics":[{"topic":"t","partitions":[{"partition":0}]}]},{"groupId":"b","topics":[{"topic":"t","partitions":[{"partition":0}]}]}],"requireStable":true}
+}

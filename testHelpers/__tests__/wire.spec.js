@@ -35,6 +35,8 @@ const STRUCTURED = [
   ['syncGroupV5', 'syncGroup', 'SyncGroup', 5],
   ['heartbeatV4', 'heartbeat', 'Heartbeat', 4],
   ['leaveGroupV5', 'leaveGroup', 'LeaveGroup', 5],
+  ['offsetDeleteV0', 'offsetDelete', 'OffsetDelete', 0, 'mixed'],
+  ['offsetFetchV7', 'offsetFetch', 'OffsetFetch', 7, 'stable'],
   ['offsetFetchV9', 'offsetFetch', 'OffsetFetch', 9],
   ['offsetCommitV9', 'offsetCommit', 'OffsetCommit', 9],
   ['addPartitionsToTxnV3', 'addPartitionsToTxn', 'AddPartitionsToTxn', 3],
@@ -106,7 +108,7 @@ describe('wire pairs checked against structured Java vectors', () => {
       (_case, vector) => {
         const bytes = Buffer.concat([bytesOf(vector), Buffer.from([0xff])])
 
-        expect(() => pair.readRequest(bytes)).toThrow('its tag buffer')
+        expect(() => pair.readRequest(bytes)).toThrow(/its tag buffer|trailing bytes/)
       }
     )
 
@@ -1350,4 +1352,64 @@ describe('Metadata v7 pair', () => {
       pair.readRequest(Buffer.from('00000001000a746573742d746f7069630100', 'hex'))
     ).toThrow()
   })
+})
+
+describe('offset admin wire layouts', () => {
+  test('OffsetDelete has classic headers and independent field order', async () => {
+    const { requestHeaderVersion, responseHeaderVersion } = require('../../src/protocol/headers')
+    const pair = require('../wire/offsetDeleteV0')
+    const build = require('../../src/protocol/requests/offsetDelete/v0/request')
+    const expected = require('../wire/expected').offsetDeleteV0
+    expect(requestHeaderVersion(47, 0)).toBe(1)
+    expect(responseHeaderVersion(47, 0)).toBe(0)
+    const body = (await build(expected.request).encode()).buffer
+    expect(body.toString('hex')).toBe(
+      '000a746573742d67726f757000000001000a746573742d746f706963000000020000000000000001'
+    )
+    expect(pair.readRequest(body)).toEqual(expected.request)
+    expect(() => pair.readRequest(Buffer.concat([body, Buffer.from([0])]))).toThrow(/trailing/)
+    const answer = pair.buildResponse()
+    expect(answer.subarray(0, 6).toString('hex')).toBe('000000000011')
+    expect(
+      await require('../../src/protocol/requests/offsetDelete/v0/response').decode(answer)
+    ).toMatchObject({ errorCode: 0, clientSideThrottleTime: 17, topics: expected.response.topics })
+  })
+  test('v7 reader agrees with the existing independent Java request', () => {
+    const pair = require('../wire/offsetFetchV7')
+    const vector = require('../../src/protocol/requests/offsetFetch/fixtures/java/offsetFetchRequest-v7-requireStable.json')
+    expect(pair.readRequest(Buffer.from(vector.hex, 'hex'))).toEqual(vector.fields)
+  })
+  test('v9 preserves its single-group Java response and reads several groups', async () => {
+    const pair = require('../wire/offsetFetchV9')
+    const vector = require('../../src/protocol/requests/offsetFetch/fixtures/java/offsetFetchResponse-v9-basic.json')
+    expect(pair.buildResponse(vector.fields).toString('hex')).toBe(vector.hex)
+    const groups = ['a', 'b'].map((groupId) => ({
+      groupId,
+      topics: [{ topic: 't', partitions: [{ partition: 0 }] }],
+    }))
+    const request = require('../../src/protocol/requests/offsetFetch').protocol({ version: 9 })({
+      groups,
+      requireStable: true,
+    })
+    const fields = pair.readRequest((await request.request.encode()).buffer)
+    expect(fields).toEqual({
+      groups: groups.map((g) => ({ ...g, memberId: null, memberEpoch: -1 })),
+      requireStable: true,
+    })
+  })
+  test.each([8, 9])(
+    'v%i refuses duplicate missing and foreign groups before error parsing',
+    async (version) => {
+      const build = require('../../src/protocol/requests/offsetFetch').protocol({ version })
+      const groups = ['a', 'b'].map((groupId) => ({ groupId, topics: [] }))
+      for (const ids of [['a', 'a'], ['a'], ['a', 'foreign']]) {
+        const response = require('../wire/offsetFetchV9').buildResponse({
+          groups: ids.map((groupId) => ({ groupId, topics: [], errorCode: 30 })),
+        })
+        await expect(build({ groups }).response.decode(response)).rejects.toMatchObject({
+          name: 'KafkaJSInvariantViolation',
+        })
+      }
+    }
+  )
 })

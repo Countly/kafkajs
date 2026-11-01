@@ -1469,6 +1469,8 @@ module.exports = class Broker {
    *                  validates it together with the epoch from OffsetFetch v9 upward. A classic
    *                  member and an admin client pass nothing, which sends the field's own "no
    *                  membership" defaults; every version below 9 drops both fields.
+   * @param {object[]} [request.groups] explicit multi-group name-based input
+   * @param {boolean} [request.returnErrors=false] internal admin data-result mode
    * @param {number} [request.memberEpoch=-1] the consumer-protocol member epoch
    * @param {boolean} [request.requireStable=false] ask the coordinator to hold back the offset of a
    *   partition that has a transactional offset commit pending, answering it with the retriable
@@ -1481,13 +1483,15 @@ module.exports = class Broker {
   async offsetFetch({
     groupId,
     topics,
+    groups,
+    returnErrors = false,
     memberId = null,
     memberEpoch = -1,
     requireStable = false,
     guard,
   }) {
     this.throwIfRefused(guard)
-    const topicIds = offsetsTopicIds(topics)
+    const topicIds = groups === undefined ? offsetsTopicIds(topics) : undefined
     const offsetFetch = this.lookupRequestWithMax(
       apiKeys.OffsetFetch,
       requests.OffsetFetch,
@@ -1496,13 +1500,25 @@ module.exports = class Broker {
     const protocolRequest = offsetFetch({
       groupId,
       topics,
+      groups,
       topicIds,
       memberId,
       memberEpoch,
       requireStable,
     })
     const { apiVersion } = protocolRequest.request
-    if (apiVersion === 8 || apiVersion === 9) {
+    if (
+      (groups !== undefined && apiVersion < 8) ||
+      (requireStable && apiVersion < 7) ||
+      (topics == null && groups === undefined && apiVersion < 2)
+    ) {
+      const range = this.versions[apiKeys.OffsetFetch]
+      throw new KafkaJSServerDoesNotSupportApiKey(
+        `OffsetFetch client v1-v10; broker supports v${range.minVersion}-v${range.maxVersion}; groups require v8-v9 and stable reads require v7+; all-topic reads require v2+`,
+        { apiKey: apiKeys.OffsetFetch, apiName: 'OffsetFetch' }
+      )
+    }
+    if (groups === undefined && apiVersion <= 9) {
       const response = protocolRequest.response
       protocolRequest.response = {
         ...response,
@@ -1514,16 +1530,39 @@ module.exports = class Broker {
          * @throws {Error} for an ordinary matching-group protocol failure
          */
         parse: async (data) => {
-          if (data.groupId !== groupId) {
+          if (apiVersion >= 8 && data.groupId !== groupId) {
             throw new KafkaJSInvariantViolation(
               `OffsetFetch requested group "${groupId}" but received group "${data.groupId}"`
             )
           }
-          return response.parse(data)
+          if (returnErrors)
+            require('../protocol/requests/offsetFetch/responseIdentity').validateTopics(
+              { errorCode: data.errorCode ?? 0, topics: data.responses },
+              topics?.length ? topics : null
+            )
+          return returnErrors ? data : response.parse(data)
         },
       }
     }
     return await this[PRIVATE.SEND_REQUEST](protocolRequest, guard)
+  }
+
+  /** Deletes committed offsets through a group's coordinator, retaining all result codes.
+   * @param {object} options groupId and topics with partition objects
+   * @returns {Promise<object>} classic response and group/partition errors as data
+   * @throws {Error} transport, deadline or unsupported broker range
+   */
+  async offsetDelete({ groupId, topics }) {
+    const range = this.versions?.[apiKeys.OffsetDelete]
+    if (!range || range.minVersion > 0 || range.maxVersion < 0) {
+      const offered = range ? `v${range.minVersion}-v${range.maxVersion}` : 'absent'
+      throw new KafkaJSServerDoesNotSupportApiKey(
+        `OffsetDelete client implements v0-v0; broker supports ${offered}`,
+        { apiKey: apiKeys.OffsetDelete, apiName: 'OffsetDelete' }
+      )
+    }
+    const build = this.lookupRequest(apiKeys.OffsetDelete, requests.OffsetDelete)
+    return this[PRIVATE.SEND_REQUEST](build({ groupId, topics }))
   }
 
   /**

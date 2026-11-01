@@ -1,0 +1,7 @@
+{
+  "message": "OffsetDeleteResponse",
+  "version": 0,
+  "case": "mixed",
+  "hex": "00000000001100000001000a746573742d746f70696300000002000000000000000000010003",
+  "fields": {"errorCode":0,"throttleTime":17,"topics":[{"topic":"test-topic","partitions":[{"partition":0,"errorCode":0},{"partition":1,"errorCode":3}]}]}
+}

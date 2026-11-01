@@ -373,7 +373,7 @@
       "Request": "9508470c5727082e6212e8ca43e6966a79874495ead10cf724824b5934ee2a39",
       "Response": "ea99e5b080ad9ed6b56d19e9e749b9a4e5c37dbcd6aa69a663e97ff9fc7a1656"
     },
-    "javaClientsJar": null
+    "javaClientsJar": "4.3.1"
   },
   "OffsetFetch": {
     "kafkaTag": "4.3.1",
