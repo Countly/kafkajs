@@ -74,6 +74,10 @@ import {
   KafkaJSCreateTopicError,
   KafkaJSNoBrokerAvailableError,
   Cluster,
+  oauthBearer,
+  OAuthBearerHelperOptions,
+  OAuthBearerTokenProvider,
+  AssertionSupplier,
 } from './index'
 
 const { roundRobin } = PartitionAssigners
@@ -1267,6 +1271,7 @@ new KafkaJSRecordTooLargeError('x', { reason: 'frame', scope: 'record', size: 1,
 void [tooLargeReason]
 
 
+
 // Producer lifecycle calls preserve the signal handler and no-argument parameter tuple.
 const lifecycleProducer = new Kafka({ brokers: ['localhost:9092'] }).producer({ metadataMaxIdle: 5000 })
 void lifecycleProducer.flush()
@@ -1549,3 +1554,67 @@ new Kafka(...setupConstructor)
 const invalidSetupMaximum: kafkajs.KafkaConfig = { brokers: [], connectionTimeoutMax: '30000' }
 // @ts-expect-error Backoff options accept numbers only.
 const invalidSetupBackoff: kafkajs.KafkaConfig = { brokers: [], reconnectBackoff: null }
+
+// OAUTH BEARER HELPERS
+const helperOptions: OAuthBearerHelperOptions = {
+  timeout: 5000,
+  maxRetryTime: 8000,
+  retry: { initial: 100, max: 10000 },
+  refreshWindow: 0.8,
+  refreshJitter: 0.05,
+  minRefreshPeriod: 60000,
+  refreshBuffer: 300000,
+  clockSkew: 30000,
+  extensions: { trace: 'one' },
+  allowInsecure: false,
+  fetch,
+}
+const helperProvider: OAuthBearerTokenProvider = oauthBearer.clientCredentials({
+  ...helperOptions,
+  tokenEndpointUrl: 'https://issuer.example/token',
+  clientId: 'id',
+  clientSecret: 'secret',
+  scope: 'read',
+})
+const bareCallback: () => Promise<kafkajs.OauthbearerProviderResponse> = helperProvider
+const signedAssertion: AssertionSupplier = oauthBearer.signAssertion({
+  privateKey: Buffer.from('pem'),
+  algorithm: 'ES256',
+  claims: { iss: 'id', sub: 'id', aud: ['issuer'], tenant: { region: 'eu' } },
+  expiresIn: 300,
+  notBefore: 60,
+  jti: true,
+  keyId: 'key-one',
+  passphrase: 'phrase',
+})
+declare const keyObject: import('crypto').KeyObject
+const fileKeyAssertion: AssertionSupplier = oauthBearer.signAssertion({ privateKey: { file: 'key.pem' } })
+const objectKeyAssertion: kafkajs.AssertionSupplier = kafkajs.oauthBearer.signAssertion({ privateKey: keyObject })
+const asyncAssertion: AssertionSupplier = async () => 'header.payload.signature'
+oauthBearer.clientCredentials({ tokenEndpointUrl: 'https://issuer.example/token', clientId: 'id', clientAssertion: signedAssertion })
+oauthBearer.jwtBearer({ ...helperOptions, tokenEndpointUrl: 'https://issuer.example/token', assertion: asyncAssertion })
+const fileProvider: kafkajs.OAuthBearerTokenProvider = kafkajs.oauthBearer.fileToken({ path: 'access.jwt', clockSkew: 1000 })
+const closeResult: void = fileProvider.close()
+const helperResponse: Promise<kafkajs.OauthbearerProviderResponse> = helperProvider()
+const extensionValue: Promise<string | undefined> = helperResponse.then((response) => response.extensions?.trace)
+const legacyCallback: kafkajs.SASLOptions = {
+  mechanism: 'oauthbearer',
+  oauthBearerProvider: async () => ({ value: 'token', extensions: { trace: 'one' } }),
+}
+const helperCallback: kafkajs.SASLOptions = { mechanism: 'oauthbearer', oauthBearerProvider: helperProvider }
+// @ts-expect-error secret and assertion are exclusive
+oauthBearer.clientCredentials({ tokenEndpointUrl: 'https://issuer.example/token', clientId: 'id', clientSecret: 'secret', clientAssertion: signedAssertion })
+// @ts-expect-error one credential form is required
+oauthBearer.clientCredentials({ tokenEndpointUrl: 'https://issuer.example/token', clientId: 'id' })
+// @ts-expect-error a bare callback has no helper lifecycle
+bareCallback.close()
+// @ts-expect-error the algorithm is a closed union
+oauthBearer.signAssertion({ privateKey: 'pem', algorithm: 'HS256' })
+// @ts-expect-error extension values are strings
+oauthBearer.fileToken({ path: 'access.jwt', extensions: { trace: 1 } })
+void fileKeyAssertion
+void objectKeyAssertion
+void closeResult
+void extensionValue
+void legacyCallback
+void helperCallback

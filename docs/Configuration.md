@@ -116,6 +116,8 @@ new Kafka({
 
 ### OAUTHBEARER Example
 
+Use `oauthBearer.clientCredentials`, `oauthBearer.jwtBearer` or `oauthBearer.fileToken` to build the existing callback with shared retrieval and refresh. `oauthBearer.signAssertion` supplies locally signed assertions. See [OAuth helpers and recipes](OAuth.md) for options, lifecycle, discovery, token exchange, mTLS and remote signing. The helper's default `maxRetryTime` is 8000 ms; keep the retrieval budget below `authenticationTimeout`, or raise the SASL timeout for a slower callback. Disconnect clients before closing a provider they share.
+
 ```javascript
 new Kafka({
   clientId: 'my-app',

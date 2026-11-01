@@ -90,6 +90,87 @@ export type ISocketFactory = (args: ISocketFactoryArgs) => net.Socket
 
 export interface OauthbearerProviderResponse {
   value: string
+  /** SASL extensions sent with the token (RFC 7628 §3.1). */
+  extensions?: Record<string, string>
+}
+
+/**
+ * An `oauthBearerProvider` callback built by an `oauthBearer` helper. It shares one token
+ * retrieval among concurrent authentications and refreshes the token ahead of its expiry.
+ */
+export interface OAuthBearerTokenProvider {
+  (): Promise<OauthbearerProviderResponse>
+  /** Aborts an in-flight request, clears the timers and rejects later calls. Idempotent. */
+  close(): void
+}
+
+/** Options every `oauthBearer` provider factory accepts; each is optional. */
+export interface OAuthBearerHelperOptions {
+  /** One HTTP attempt in ms, headers and body included, clamped to the remaining budget. Default 5000. */
+  timeout?: number
+  /** Backoff between attempts in ms, doubling from `initial` up to `max`. Default 100 and 10000. */
+  retry?: { initial?: number; max?: number }
+  /** One retrieval in ms: supplier, file and key work, every attempt and backoff. Default 8000. */
+  maxRetryTime?: number
+  /** Fraction of the token lifetime after which it is refreshed. Default 0.8. */
+  refreshWindow?: number
+  /** Random spread around `refreshWindow`, as a fraction. Default 0.05. */
+  refreshJitter?: number
+  /** Earliest proactive refresh after a fetch, in ms. Default 60000. */
+  minRefreshPeriod?: number
+  /** Refresh at least this many ms before expiry where `minRefreshPeriod` allows. Default 300000. */
+  refreshBuffer?: number
+  /** A token counts as expired this many ms before its expiry. Default 30000. */
+  clockSkew?: number
+  /** SASL extensions copied into every response. */
+  extensions?: Record<string, string>
+  /** Accept an `http:` endpoint on a literal loopback host, for tests only. Default false. */
+  allowInsecure?: boolean
+  /** The transport, for a proxy or a private certificate authority. Default the global `fetch`. */
+  fetch?: typeof fetch
+}
+
+/** Returns a signed JWT assertion; called once per token request. */
+export type AssertionSupplier = () => string | Promise<string>
+
+/** Builders of the existing `oauthBearerProvider` callback, and a local assertion signer. */
+export const oauthBearer: {
+  /** The client-credentials grant, authenticated with a client secret or a client assertion. */
+  clientCredentials(
+    options: OAuthBearerHelperOptions & { tokenEndpointUrl: string; scope?: string; clientId: string } & (
+        | { clientSecret: string; clientAssertion?: never }
+        | { clientAssertion: AssertionSupplier; clientSecret?: never }
+      )
+  ): OAuthBearerTokenProvider
+  /** The JWT-bearer grant: the supplied assertion is the grant. */
+  jwtBearer(
+    options: OAuthBearerHelperOptions & {
+      tokenEndpointUrl: string
+      assertion: AssertionSupplier
+      scope?: string
+    }
+  ): OAuthBearerTokenProvider
+  /** A token file, read again when it changes or its token nears expiry. */
+  fileToken(options: OAuthBearerHelperOptions & { path: string }): OAuthBearerTokenProvider
+  /** A supplier of locally signed JWT assertions; not a token provider. */
+  signAssertion(options: {
+    /** PEM text, a PEM Buffer, a private key object, or a file read again when it changes. */
+    privateKey: string | Buffer | import('crypto').KeyObject | { file: string }
+    /** Default RS256. ECDSA signatures use the JOSE encoding. */
+    algorithm?: 'RS256' | 'RS384' | 'RS512' | 'ES256' | 'ES384' | 'ES512'
+    /** Claims added to every assertion; `iat`, `nbf`, `exp` and `jti` come only from the options below. */
+    claims?: { iss?: string; sub?: string; aud?: string | string[] } & Record<string, unknown>
+    /** Seconds from `iat` to `exp`. Default 300. */
+    expiresIn?: number
+    /** Seconds `nbf` precedes `iat`. Default 60. */
+    notBefore?: number
+    /** Add a random UUID `jti`. Default false. */
+    jti?: boolean
+    /** The header's `kid`. */
+    keyId?: string
+    /** Decrypts an encrypted PEM key. */
+    passphrase?: string
+  }): AssertionSupplier
 }
 
 type SASLMechanismOptionsMap = {

@@ -16,6 +16,7 @@ A pure-JavaScript [Apache Kafka](https://kafka.apache.org/) client for Node.js, 
 - GZIP, Snappy, LZ4 and ZSTD compression built in (LZ4 needs the optional `lz4-napi` dependency); registered codecs take precedence
 - PLAINTEXT, SSL and SASL_SSL connections
 - SASL PLAIN, SCRAM-SHA-256, SCRAM-SHA-512, OAUTHBEARER and AWS IAM
+- OAuth bearer token helpers and recipes ([OAuth.md](docs/OAuth.md))
 - Admin client
 
 ## Getting started

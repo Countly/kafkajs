@@ -164,6 +164,7 @@ Versions before 3.0.0 are internal alpha tags and are not published.
 #### Additions
 
 - New client options `connectionTimeoutMax`, `reconnectBackoff` and `reconnectBackoffMax`; `authenticationTimeout` is now enforced.
+- `oauthBearer.clientCredentials`, `jwtBearer`, `fileToken` and `signAssertion` build the existing `oauthBearerProvider` callback with a single-flight token cache; recipes for discovery, token exchange, mTLS and KMS-held keys are in `docs/OAuth.md`.
 
 #### Tooling
 

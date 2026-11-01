@@ -12,6 +12,7 @@ test('require and import resolve to the same module instance', async () => {
   assert.equal(esm.Kafka, cjs.Kafka)
   assert.equal(esm.default, cjs)
   assert.equal(esm.CompressionCodecs, cjs.CompressionCodecs)
+  assert.equal(esm.oauthBearer, cjs.oauthBearer)
 })
 
 test('the ESM wrapper re-exports every named export of index.js', async () => {
@@ -65,6 +66,21 @@ test('deep paths under src are not exported', () => {
 
 test('package.json stays reachable', () => {
   assert.equal(require(`${PKG}/package.json`).name, PKG)
+})
+
+test('OAuth helpers share their namespace across require and import', async () => {
+  const cjs = require(PKG)
+  const esm = await import(PKG)
+  assert.equal(esm.oauthBearer, cjs.oauthBearer)
+  assert.deepEqual(Object.keys(cjs.oauthBearer).sort(), ['clientCredentials', 'fileToken', 'jwtBearer', 'signAssertion'])
+  for (const name of Object.keys(cjs.oauthBearer)) assert.equal(typeof cjs.oauthBearer[name], 'function')
+  const provider = cjs.oauthBearer.clientCredentials({ tokenEndpointUrl: 'https://issuer.example/token', clientId: 'client', clientSecret: 'inert-secret' })
+  assert.equal(typeof provider, 'function')
+  assert.equal(typeof provider.close, 'function')
+  assert.equal(provider.close(), undefined)
+  provider.close()
+  await assert.rejects(provider(), cjs.KafkaJSSASLAuthenticationError)
+  assert.throws(() => require(`${PKG}/src/oauth`), { code: 'ERR_PACKAGE_PATH_NOT_EXPORTED' })
 })
 
 
