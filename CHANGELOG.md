@@ -155,6 +155,8 @@ Versions before 3.0.0 are internal alpha tags and are not published.
 
 #### Behavior changes
 
+- Admin calls take an `apiTimeout` (default 60 000 ms) and reject with `KafkaJSTimeout` when it passes; a mutation may have been applied. Retries are unchanged, unlike Java's unbounded retries inside the deadline. Existing broker-side `timeout` keeps its meaning.
+
 - `connectionTimeout` defaults to 10 000 ms and grows per node, with jitter, up to `connectionTimeoutMax` (30 000 ms) while a node keeps failing; it resets when the node is ready. A value you set stays flat. Java's `socket.connection.setup.timeout.ms` (KIP-601).
 - A broker must be ready (TCP, TLS, ApiVersions, SASL) within the setup timeout; a stalled ApiVersions or SASL exchange no longer waits for `requestTimeout`.
 - `authenticationTimeout` now bounds the SASL exchange (it only sized the blackout before). A token callback slower than 10 s needs a larger value.

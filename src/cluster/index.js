@@ -1,3 +1,4 @@
+const { checked, shareMetadata, retrierOf } = require('../admin/deadline')
 const describeThrown = require('../network/describeThrown')
 const BrokerPool = require('./brokerPool')
 const MetadataCache = require('./metadataCache')
@@ -5,7 +6,6 @@ const { joinDeadlineError } = require('../consumer/rebalanceErrorContract')
 const { CLUSTER_TOPIC_RECREATED } = require('./instrumentationEvents')
 const Lock = require('../utils/lock')
 const { isConnectionFailure } = require('../network/connectionFailure')
-const sharedPromiseTo = require('../utils/sharedPromiseTo')
 const createRetry = require('../retry')
 const connectionPoolBuilder = require('./connectionPoolBuilder')
 const GroupRegistry = require('./groupRegistry')
@@ -153,7 +153,7 @@ module.exports = class Cluster {
     this.rootLogger = rootLogger
     this.logger = rootLogger.namespace('Cluster')
     this.retryOptions = { ...retry }
-    this.retrier = createRetry(this.retryOptions)
+    this.retrier = (action) => retrierOf(this.retryOptions)(action)
     this.connectionPoolBuilder = connectionPoolBuilder({
       logger: rootLogger,
       instrumentationEmitter,
@@ -218,7 +218,7 @@ module.exports = class Cluster {
     // A producer lifecycle's call shares nothing with another lifecycle's: each is scoped by its fence.
     const fenceOf = ({ fence } = {}) => fence
 
-    this[PRIVATE.CONNECT] = sharedPromiseTo(async ({ fence } = {}) => {
+    this[PRIVATE.CONNECT] = shareMetadata(async ({ fence } = {}) => {
       return await this.brokerPool.connect(...fenceArgs(fence))
     }, fenceOf)
 
@@ -231,8 +231,9 @@ module.exports = class Cluster {
       this.brokerPool.consumerMetadataGeneration ??
       0
 
-    this[PRIVATE.REFRESH_METADATA] = sharedPromiseTo(async ({ fence, ...scope } = {}) => {
+    this[PRIVATE.REFRESH_METADATA] = shareMetadata(async ({ fence, ...scope } = {}) => {
       fence?.check()
+      checked(null)
       this.pruneTargetTopics()
       if (this.targetTopicState !== null && this.targetTopics.size === 0) return
       return await this.brokerPool.refreshMetadata(
@@ -241,9 +242,10 @@ module.exports = class Cluster {
       )
     }, shareScopeOf)
 
-    this[PRIVATE.REFRESH_METADATA_IF_NECESSARY] = sharedPromiseTo(
+    this[PRIVATE.REFRESH_METADATA_IF_NECESSARY] = shareMetadata(
       async ({ fence, ...scope } = {}) => {
         fence?.check()
+        checked(null)
         this.pruneTargetTopics()
         if (this.targetTopicState !== null && this.targetTopics.size === 0) return
         return await this.brokerPool.refreshMetadataIfNecessary(
@@ -254,7 +256,7 @@ module.exports = class Cluster {
       shareScopeOf
     )
 
-    this[PRIVATE.FIND_CONTROLLER_BROKER] = sharedPromiseTo(async () => {
+    this[PRIVATE.FIND_CONTROLLER_BROKER] = shareMetadata(async () => {
       const { metadata } = this.brokerPool
 
       if (!metadata || metadata.controllerId == null) {
@@ -709,10 +711,13 @@ module.exports = class Cluster {
    */
   async addMultipleTargetTopics(topics, { fence } = {}) {
     fence?.check()
+    checked(null)
     await this.mutatingTargetTopics.acquire()
 
     try {
+      checked(null)
       fence?.check()
+      checked(null)
       const previousSize = this.targetTopics.size
       const previousTopics = new Set(this.targetTopics)
       for (const topic of topics) {
@@ -727,6 +732,7 @@ module.exports = class Cluster {
           await this.refreshMetadata(...fenceArgs(fence))
         } catch (e) {
           fence?.check()
+          checked(null)
           if (
             e.type === 'INVALID_TOPIC_EXCEPTION' ||
             e.type === 'UNKNOWN_TOPIC_OR_PARTITION' ||
@@ -929,6 +935,7 @@ module.exports = class Cluster {
       return await this.brokerPool.findBroker({ nodeId, fence })
     } catch (e) {
       fence?.check()
+      checked(null)
       // The client probably has stale metadata
       if (
         describeThrown(e, 'name') === 'KafkaJSBrokerNotFound' ||
@@ -1127,6 +1134,7 @@ module.exports = class Cluster {
     { fence } = {}
   ) {
     fence?.check()
+    checked(null)
     // Mirrors MetadataCache#applyLeaderHint's own no-hint-offered guard, so this pre-check can
     // never itself pay for the endpoint work below on the broker's `{ -1, -1 }` default.
     if (leaderId === -1) {
@@ -1141,7 +1149,11 @@ module.exports = class Cluster {
 
     await this.brokerPool.applyNodeEndpoints(nodeEndpoints, ...fenceArgs(fence))
     fence?.check()
-    return this.metadataCache.applyLeaderHint(topic, partition, { leaderId, leaderEpoch })
+    checked(null)
+    return this.metadataCache.applyLeaderHint(topic, partition, {
+      leaderId,
+      leaderEpoch,
+    })
   }
 
   /**
@@ -1228,6 +1240,7 @@ module.exports = class Cluster {
           fence,
         })
         fence?.check()
+        checked(null)
 
         if (!this.brokerPool.hasNode(coordinator.nodeId)) {
           await this.brokerPool.applyNodeEndpoints(
@@ -1235,11 +1248,13 @@ module.exports = class Cluster {
             ...fenceArgs(fence)
           )
           fence?.check()
+          checked(null)
         }
 
         return await this.findBroker({ nodeId: coordinator.nodeId, fence })
       } catch (e) {
         fence?.check()
+        checked(null)
         // A new broker can join the cluster before we have the chance
         // to refresh metadata
         if (e.name === 'KafkaJSBrokerNotFound' || e.type === 'GROUP_COORDINATOR_NOT_AVAILABLE') {
@@ -1285,12 +1300,14 @@ module.exports = class Cluster {
       return await this.retryFor(fence)(async (bail, retryCount, retryTime) => {
         try {
           fence?.check()
+          checked(null)
           const brokerMetadata = await broker.findGroupCoordinator({
             groupId,
             coordinatorType,
             ...(fence ? { guard: fence.guard } : {}),
           })
           fence?.check()
+          checked(null)
           this.logger.debug('Found group coordinator', {
             broker: brokerMetadata.host,
             nodeId: brokerMetadata.coordinator.nodeId,
@@ -1298,6 +1315,7 @@ module.exports = class Cluster {
           return brokerMetadata
         } catch (e) {
           fence?.check()
+          checked(null)
           this.logger.debug('Tried to find group coordinator', {
             nodeId,
             groupId,
@@ -1324,8 +1342,12 @@ module.exports = class Cluster {
       brokerMetadata = await this.brokerPool.withBroker(findCoordinator, ...fenceArgs(fence))
     } else {
       const broker = await this.brokerPool.findConnectedBroker(...fenceArgs(fence))
-      brokerMetadata = await findCoordinator({ nodeId: broker.nodeId, broker }).catch((e) => {
+      brokerMetadata = await findCoordinator({
+        nodeId: broker.nodeId,
+        broker,
+      }).catch((e) => {
         fence?.check()
+        checked(null)
         if (e instanceof KafkaJSConnectionError || e instanceof KafkaJSRequestTimeoutError) {
           const message = `FindCoordinator failed on the seed broker: ${e.message}`
           throw new KafkaJSBrokerNotFound(message, { cause: e })

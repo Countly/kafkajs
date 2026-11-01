@@ -1,3 +1,4 @@
+const { currentDeadline, sharedSetup } = require('../admin/deadline')
 const { isNativeError } = require('util').types
 const describeThrown = require('./describeThrown')
 const createSocket = require('./socket')
@@ -306,6 +307,8 @@ module.exports = class Connection {
    * @throws {KafkaJSConnectionError} on cancellation, expiry or transport failure
    */
   connect({ attempt } = {}) {
+    const operation = currentDeadline()
+    if (operation) return operation.wait(() => sharedSetup(() => this[PRIVATE.CONNECT](attempt)))
     return this[PRIVATE.CONNECT](attempt)
   }
 
@@ -700,6 +703,8 @@ module.exports = class Connection {
    * @throws {KafkaJSConnectionError} when the whole SASL phase expires
    */
   authenticate({ attempt = this.setupAttempt } = {}) {
+    const operation = currentDeadline()
+    if (operation) return operation.wait(() => sharedSetup(() => this.authenticate({ attempt })))
     if (!this.sasl || this.isAuthenticated()) return Promise.resolve()
     if (this.authEpisode) return this.authEpisode.promise
     const epoch = this.connectAttempt
@@ -887,10 +892,14 @@ module.exports = class Connection {
    * @throws {Error} the error the guard returns, once the request is authenticated and encoded
    */
   async [PRIVATE.PREPARE]({ request, expectResponse, guard }) {
+    const enteredRefusal = guard && guard()
+    if (enteredRefusal) throw enteredRefusal
     if (!this.isAuthenticated() && isAuthenticatedRequest(request)) {
       await this[PRIVATE.AUTHENTICATE]()
     }
 
+    const authenticatedRefusal = guard && guard()
+    if (authenticatedRefusal) throw authenticatedRefusal
     this.failIfNotConnected()
 
     const { clientId } = this

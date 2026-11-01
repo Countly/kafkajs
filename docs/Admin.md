@@ -5,6 +5,18 @@ title: Admin Client
 
 The admin client hosts all the cluster operations, such as: `createTopics`, `createPartitions`, etc.
 
+## Call deadlines
+
+`kafka.admin({ apiTimeout: 60000 })` sets the default end-to-end budget of each admin operation. Every operation accepts a per-call `apiTimeout`; positional operations take an optional trailing options object. Values must be integers from 1 to 2147483647. Undefined uses the configured default.
+
+The budget includes discovery, broker selection, setup/authentication waiting, encoding, client-side queueing, retries and response waiting. Nested helpers share the original deadline. Expiry rejects with `KafkaJSTimeout`, clears local retry/page waits and unsent queued work, and prevents later call-state publication. A shared physical setup is not cancelled when one caller stops waiting.
+
+A request already transmitted is not recalled. A mutation may have been applied; a timeout reports an unknown outcome. Check the state before choosing whether to repeat it. A later call has its own deadline. The `timeout` option of mutation APIs remains the broker's timeout; `apiTimeout` does not rewrite it.
+
+Retry counts and backoff remain unchanged. The call ends at the earlier of retry exhaustion and its API deadline. This differs from Java's effectively unbounded default retry count within the API deadline.
+
+For example, `createTopics({ topics, timeout: 30000, apiTimeout: 5000 })` can time out locally while the broker continues creating the topics. The error names the method and the API budget.
+
 ```javascript
 const kafka = new Kafka(...)
 const admin = kafka.admin()

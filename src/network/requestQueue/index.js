@@ -1,3 +1,4 @@
+const { currentDeadline } = require('../../admin/deadline')
 const { EventEmitter } = require('events')
 const SocketRequest = require('./socketRequest')
 const describeThrown = require('../describeThrown')
@@ -183,14 +184,58 @@ module.exports = class RequestQueue extends EventEmitter {
    */
   push(pushedRequest) {
     const { correlationId } = pushedRequest.entry
+    const operation = currentDeadline()
+    operation?.check()
+    let unown = () => {}
+    if (operation) {
+      const entry = pushedRequest.entry
+      pushedRequest = {
+        ...pushedRequest,
+        entry: {
+          ...entry,
+          resolve: (value) => {
+            unown()
+            entry.resolve(value)
+          },
+          reject: (error) => {
+            unown()
+            entry.reject(error)
+          },
+        },
+      }
+    }
     const socketRequest = this.createSocketRequest(pushedRequest)
+    let enrolling = true
+    let refused = false
+    if (operation)
+      unown = operation.own((error) => {
+        const index = this.pending.indexOf(socketRequest)
+        if (index < 0 && !enrolling) return
+        refused = true
+        if (index >= 0) this.pending.splice(index, 1)
+        socketRequest.rejected(error)
+        if (this.pending.length === 0) {
+          clearTimeout(this.throttleCheckTimeoutId)
+          this.throttleCheckTimeoutId = null
+        }
+        this.emitQueueState()
+      })
+    if (refused) {
+      unown()
+      return
+    }
+    operation?.check()
 
     if (this.canSendSocketRequestImmediately()) {
+      operation?.check()
+      enrolling = false
       this.sendSocketRequest(socketRequest)
       return
     }
 
+    operation?.check()
     this.pending.push(socketRequest)
+    enrolling = false
     this.scheduleCheckPendingRequests()
 
     this.logger.debug(`Request enqueued`, {

@@ -1,3 +1,4 @@
+const { validateApiTimeout } = require('./admin/deadline')
 const { inspect } = require('util')
 const {
   createLogger,
@@ -655,9 +656,16 @@ module.exports = class Client {
   }
 
   /**
+   * Creates an admin client with a validated default call budget.
    * @public
+   * @param {object} [options] admin configuration
+   * @param {object} [options.retry] retry limits and backoff, unchanged by the API cap
+   * @param {number} [options.apiTimeout=60000] end-to-end call budget in milliseconds
+   * @returns {import('../types').Admin} admin client
+   * @throws {KafkaJSInvalidConfigurationError} for an invalid API budget before cluster creation
    */
-  admin({ retry } = {}) {
+  admin({ retry, apiTimeout } = {}) {
+    apiTimeout = validateApiTimeout(apiTimeout)
     const instrumentationEmitter = new InstrumentationEventEmitter({
       channels: channels.admin,
     })
@@ -667,6 +675,7 @@ module.exports = class Client {
     })
 
     return createAdmin({
+      apiTimeout,
       retry: { ...this[PRIVATE.CLUSTER_RETRY], ...retry },
       logger: this[PRIVATE.LOGGER],
       instrumentationEmitter,

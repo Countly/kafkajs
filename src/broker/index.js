@@ -1,3 +1,4 @@
+const { currentDeadline, checked, withAdminGuard, sharedSetup } = require('../admin/deadline')
 const Lock = require('../utils/lock')
 const describeThrown = require('../network/describeThrown')
 const { Types: Compression } = require('../protocol/message/compression')
@@ -355,6 +356,8 @@ module.exports = class Broker {
    * @throws {Error} the error the guard returned
    */
   async connect({ guard } = {}) {
+    const operation = currentDeadline()
+    if (operation) return operation.wait(() => sharedSetup(() => this.connect({ guard })))
     this.throwIfRetired()
     this.throwIfRefused(guard)
     await this.lock.acquire()
@@ -1724,7 +1727,12 @@ module.exports = class Broker {
     this.throwIfRefused(guard)
     const initProducerId = this.lookupRequest(apiKeys.InitProducerId, requests.InitProducerId)
     return await this[PRIVATE.SEND_REQUEST](
-      initProducerId({ transactionalId, transactionTimeout, producerId, producerEpoch }),
+      initProducerId({
+        transactionalId,
+        transactionTimeout,
+        producerId,
+        producerEpoch,
+      }),
       guard
     )
   }
@@ -1756,7 +1764,12 @@ module.exports = class Broker {
       requests.AddPartitionsToTxn
     )
     return await this[PRIVATE.SEND_REQUEST](
-      addPartitionsToTxn({ transactionalId, producerId, producerEpoch, topics }),
+      addPartitionsToTxn({
+        transactionalId,
+        producerId,
+        producerEpoch,
+        topics,
+      }),
       guard
     )
   }
@@ -2129,6 +2142,9 @@ module.exports = class Broker {
    * @throws {Error} the error of the failed request, or the one the guard returned
    */
   async [PRIVATE.SEND_REQUEST](protocolRequest, guard) {
+    const setupGuard = guard
+    guard = withAdminGuard(guard)
+    this.throwIfRefused(guard)
     const pool = this.connectionPool
     let generation = pool.generation
     try {
@@ -2136,13 +2152,15 @@ module.exports = class Broker {
         ? pool.getConnectionByRequest(protocolRequest, { guard })
         : pool.getConnectionByRequest(protocolRequest))
       this.throwIfReplaced(pool)
+      this.throwIfRefused(guard)
 
       if (
         protocolRequest.request.apiKey !== apiKeys.ApiVersions &&
         this.versionsGeneration !== pool.generation
       ) {
-        await (guard ? this.connect({ guard }) : this.connect())
+        await (setupGuard ? this.connect({ guard: setupGuard }) : this.connect())
         this.throwIfReplaced(pool)
+        this.throwIfRefused(guard)
       }
 
       if (!connection.isConnected()) {
@@ -2150,12 +2168,14 @@ module.exports = class Broker {
           ? pool.getConnectionByRequest(protocolRequest, { guard })
           : pool.getConnectionByRequest(protocolRequest))
         this.throwIfReplaced(pool)
+        this.throwIfRefused(guard)
       }
 
       this.throwIfRefused(guard)
       generation = pool.generation
-      return await pool.send(protocolRequest, connection, guard ? { guard } : null, true)
+      return checked(await pool.send(protocolRequest, connection, guard ? { guard } : null, true))
     } catch (e) {
+      currentDeadline()?.check()
       attachFailureSource(e, { broker: this, generation })
       this.retireSibling(e, generation, pool)
 

@@ -1,3 +1,10 @@
+const {
+  currentDeadline,
+  checked,
+  shareMetadata,
+  retrierOf,
+  withAdminGuard,
+} = require('../admin/deadline')
 const { isNativeError } = require('util').types
 const describeThrown = require('../network/describeThrown')
 const Broker = require('../broker')
@@ -5,7 +12,6 @@ const { NodeSetupStates } = require('../network/connectionSetup')
 const MetadataCache = require('./metadataCache')
 const createRetry = require('../retry')
 const shuffle = require('../utils/shuffle')
-const sharedPromiseTo = require('../utils/sharedPromiseTo')
 const { CLUSTER_REBOOTSTRAP } = require('./instrumentationEvents')
 const {
   KafkaJSBrokerNotFound,
@@ -106,7 +112,7 @@ module.exports = class BrokerPool {
     this.metadataMaxAge = metadataMaxAge || 0
     this.logger = logger.namespace('BrokerPool')
     this.retryOptions = assign({}, retry)
-    this.retrier = createRetry(this.retryOptions)
+    this.retrier = (action) => retrierOf(this.retryOptions)(action)
     this.authenticationTimeout = authenticationTimeout ?? 10000
     this.metadataCache = metadataCache ?? new MetadataCache({ logger })
     this.instrumentationEmitter = instrumentationEmitter ?? null
@@ -156,39 +162,39 @@ module.exports = class BrokerPool {
     /** A successful metadata response since the last rebootstrap arms triggers (a) and (c). */
     this.rebootstrapArmed = false
 
-    // A producer lifecycle's rebootstrap shares nothing with another's: each is scoped by its fence.
-    const fenceOf = (_reason, { fence } = {}) => fence
-
-    this[PRIVATE.REBOOTSTRAP] = sharedPromiseTo(async (reason, { fence } = {}) => {
-      fence?.check()
-      const brokers = new Set([this.seedBroker, ...values(this.brokers)])
-      this.metadata = null
-      this.metadataExpireAt = null
-      this.metadataCache.clear()
-
-      // The replacement seed is built, installed and only then is the previous one disconnected
-      // (see createSeedBroker), so `this.seedBroker` always points at a usable broker: a
-      // concurrent reader - `connect()`'s retry callback, `hasConnectedBrokers()` - landing in
-      // this window must never find it unset.
-      try {
-        await this.createSeedBroker({ fence })
-      } finally {
-        for (const broker of brokers) this.closeObsolete(broker)
-      }
-
-      fence?.check()
-      this.lastRebootstrapAt = Date.now()
-      // Both clocks reset, and they are reset for different reasons. `metadataUnavailableSince`
-      // is trigger (a)'s continuous-failure clock: clearing it means the next failure starts a
-      // fresh window, so a client that keeps failing rebootstraps once per window, every window.
-      // `rebootstrapArmed` is trigger (c)'s one-shot: only a *successful* metadata response
-      // re-arms it, so an unreachable cluster cannot produce one teardown per retry.
-      this.metadataUnavailableSince = null
-      this.rebootstrapArmed = false
-
-      this.logger.warn('Rebootstrapping the client from the configured broker list', { reason })
-      this.emit(CLUSTER_REBOOTSTRAP, { reason })
-    }, fenceOf)
+    this[PRIVATE.REBOOTSTRAP] = shareMetadata(
+      async (reason, { fence } = {}) => {
+        fence?.check()
+        checked(null)
+        const seed = this.seedBroker
+        const table = this.brokers
+        const publication = this.metadataPublications
+        const brokers = new Set([seed, ...values(table)])
+        const ownsRouting = () =>
+          this.brokers === table && this.metadataPublications === publication
+        const installed = await this.createSeedBroker({
+          fence,
+          isCurrent: () => ownsRouting() && this.seedBroker === seed,
+        })
+        fence?.check()
+        checked(null)
+        if (!ownsRouting() || this.seedBroker !== installed) {
+          throw new KafkaJSConnectionError('Recovery routing was superseded')
+        }
+        this.metadata = null
+        this.metadataExpireAt = null
+        this.metadataCache.clear()
+        for (const broker of brokers) {
+          if (broker !== seed && broker !== installed) this.closeObsolete(broker)
+        }
+        this.lastRebootstrapAt = Date.now()
+        this.metadataUnavailableSince = null
+        this.rebootstrapArmed = false
+        this.logger.warn('Rebootstrapping the client from the configured broker list', { reason })
+        this.emit(CLUSTER_REBOOTSTRAP, { reason })
+      },
+      (reason, { fence } = {}) => fence
+    )
   }
 
   /**
@@ -255,10 +261,29 @@ module.exports = class BrokerPool {
    *
    * @private
    * @param {{ host?: string, port?: number, rack?: string }} [destination]
-   * @returns {Promise<import("../network/connectionPool")>}
+   * @param {object} [options] captured installation ownership
+   * @param {import('../producer/generation')} [options.fence] original producer lifecycle
+   * @param {() => boolean} [options.isCurrent] routing identity checked before setup publication
+   * @returns {Promise<import("../network/connectionPool")|null>} a current pool with shared setup
+   *   state, or null after closing a stale routing build without publishing its setup inventory
+   * @throws {Error} original lifecycle or discovery refusal; closes only the unused pool
    */
-  async buildConnectionPool(destination) {
+  async buildConnectionPool(destination, { fence, isCurrent = () => true } = {}) {
+    const owner = currentDeadline()
+    fence?.check()
+    owner?.check()
     const connectionPool = await this.connectionPoolBuilder.build(destination)
+    try {
+      fence?.check()
+      owner?.check()
+    } catch (error) {
+      this.closePool(connectionPool)
+      throw error
+    }
+    if (!isCurrent()) {
+      this.closePool(connectionPool)
+      return null
+    }
     connectionPool.authenticationTimeout = this.authenticationTimeout
     connectionPool.authenticationBlackout = this.authenticationBlackout
     if (!this.setupStates) this.setupStates = new NodeSetupStates(connectionPool.setupPolicy)
@@ -321,6 +346,7 @@ module.exports = class BrokerPool {
    */
   async applyNodeEndpoints(nodeEndpoints, { fence } = {}) {
     fence?.check()
+    checked(null)
     if (!nodeEndpoints || nodeEndpoints.length === 0) {
       return
     }
@@ -350,10 +376,17 @@ module.exports = class BrokerPool {
       }
 
       const isSeed = broker !== undefined && broker === this.seedBroker
-      const connectionPool = await this.buildConnectionPool({ host, port, rack })
-      if (fence?.closed) {
+      const isCurrent = () =>
+        this.brokers[nodeId] === broker && (!isSeed || this.seedBroker === broker)
+      const connectionPool = await this.buildConnectionPool(
+        { host, port, rack },
+        { fence, isCurrent }
+      )
+      if (!connectionPool) continue
+      if (fence?.closed || currentDeadline()?.guard()) {
         this.closePool(connectionPool)
-        fence.check()
+        fence?.check()
+        checked(null)
       }
 
       if (this.brokers[nodeId] !== broker || (isSeed && this.seedBroker !== broker)) {
@@ -466,23 +499,34 @@ module.exports = class BrokerPool {
    * @param {object} [options]
    * @param {import('../producer/generation')} [options.fence] the producer lifecycle asking: once
    *   it closed, a pool built meanwhile is retired unused instead of installed
-   * @returns {Promise<void>}
-   * @throws {Error} the lifecycle's close error
+   * @param {() => boolean} [options.isCurrent] captured recovery routing identity
+   * @returns {Promise<Broker>} installed seed
+   * @throws {Error} original caller refusal or superseded recovery identity
    */
-  async createSeedBroker({ fence } = {}) {
-    const connectionPool = await this.buildConnectionPool()
-    if (fence?.closed) {
-      this.closePool(connectionPool)
-      fence.check()
-    }
+  async createSeedBroker({ fence, isCurrent = () => true } = {}) {
+    fence?.check()
+    checked(null)
     const previousSeedBroker = this.seedBroker
-
+    const ownsSeed = () => isCurrent() && this.seedBroker === previousSeedBroker
+    const connectionPool = await this.buildConnectionPool(undefined, { fence, isCurrent: ownsSeed })
+    if (!connectionPool) throw new KafkaJSConnectionError('Seed broker build was superseded')
+    if (
+      fence?.closed ||
+      currentDeadline()?.guard() ||
+      !isCurrent() ||
+      this.seedBroker !== previousSeedBroker
+    ) {
+      this.closePool(connectionPool)
+      fence?.check()
+      checked(null)
+      throw new KafkaJSConnectionError('Seed broker build was superseded')
+    }
     this.seedBroker = this.createBroker({
       connectionPool,
       logger: this.rootLogger,
     })
-
     this.closeObsolete(previousSeedBroker)
+    return this.seedBroker
   }
 
   /**
@@ -507,12 +551,14 @@ module.exports = class BrokerPool {
     }
 
     fence?.check()
+    checked(null)
     if (!this.seedBroker) {
       await this.createSeedBroker({ fence })
     }
 
     return this.retryFor(fence)(async (bail, retryCount, retryTime) => {
       fence?.check()
+      checked(null)
       const seedBroker = this.seedBroker
 
       if (!seedBroker) {
@@ -522,9 +568,11 @@ module.exports = class BrokerPool {
       try {
         await seedBroker.connect(...guardArgs(fence))
         fence?.check()
+        checked(null)
         this.versions = seedBroker.versions
       } catch (caught) {
         fence?.check()
+        checked(null)
         const e = isNativeError(caught)
           ? caught
           : new KafkaJSNonRetriableError(describeThrown(caught), { cause: caught })
@@ -668,7 +716,25 @@ module.exports = class BrokerPool {
    * @throws {Error} the lifecycle's close error
    * @throws {Error} original refresh failure or caller refusal; expiry never triggers recovery work
    */
-  async refreshMetadata(
+  async refreshMetadata(topics, options) {
+    this.metadataDiscovery ??= shareMetadata(
+      (names, requestOptions) => this.refreshMetadataUnshared(names, requestOptions),
+      (names, requestOptions) =>
+        requestOptions && Object.keys(requestOptions).length
+          ? requestOptions
+          : JSON.stringify(names || [])
+    )
+    return this.metadataDiscovery(topics, options)
+  }
+
+  /**
+   * Refreshes one discovery episode with the original subscription and lifecycle checks.
+   * @param {string[]} topics requested names
+   * @param {object} [options] original routing policy
+   * @returns {Promise<void>} installs only a current snapshot
+   * @throws {Error} original routing or episode refusal
+   */
+  async refreshMetadataUnshared(
     topics,
     {
       fence,
@@ -680,7 +746,10 @@ module.exports = class BrokerPool {
       onMetadata,
     } = {}
   ) {
+    guard = withAdminGuard(guard)
     const check = () => {
+      fence?.check()
+      checked(null)
       const error = guard?.()
       if (error) throw error
     }
@@ -688,6 +757,8 @@ module.exports = class BrokerPool {
     const modeGeneration = this.consumerMetadataGeneration ?? 0
     const ticket = metadataScope?.captureMetadata()
     const applicable = () =>
+      !fence?.closed &&
+      !guard?.() &&
       (this.consumerMetadataGeneration ?? 0) === modeGeneration &&
       isCurrent() &&
       (!ticket || ticket.isCurrent())
@@ -715,6 +786,7 @@ module.exports = class BrokerPool {
           return bail(err)
         }
         fence?.check()
+        checked(null)
 
         // Captured once, before any `await` in this callback: a concurrent rebootstrap (reachable
         // because `Cluster#metadata()` calls `refreshMetadataIfNecessary` directly, bypassing
@@ -797,11 +869,13 @@ module.exports = class BrokerPool {
               this.closeObsolete(previous)
               continue
             }
-            const connectionPool = await this.buildConnectionPool({
-              host,
-              port,
-              rack,
-            })
+            const ownsNode = () =>
+              isLatest() && this.brokers[nodeId] === previous && this.seedBroker === seedBroker
+            const connectionPool = await this.buildConnectionPool(
+              { host, port, rack },
+              { fence, isCurrent: ownsNode }
+            )
+            if (!connectionPool) continue
             if (
               !isLatest() ||
               this.brokers[nodeId] !== previous ||
@@ -846,6 +920,7 @@ module.exports = class BrokerPool {
 
       if (applicable()) this.onMetadataSuccess()
     } catch (e) {
+      check()
       if (guard?.()) throw e
       if (!applicable()) return
       if (!fence?.closed) await this.onMetadataFailure(e, { fence })
@@ -997,6 +1072,7 @@ module.exports = class BrokerPool {
    */
   async findBroker({ nodeId, fence }) {
     fence?.check()
+    checked(null)
     const broker = this.brokers[nodeId]
 
     if (!broker) {
@@ -1005,6 +1081,7 @@ module.exports = class BrokerPool {
 
     await this.connectBroker(broker, ...(fence ? [{ fence }] : []))
     fence?.check()
+    checked(null)
     return broker
   }
 
@@ -1030,6 +1107,7 @@ module.exports = class BrokerPool {
         return await callback({ nodeId, broker })
       } catch (e) {
         fence?.check()
+        checked(null)
       }
     }
 
@@ -1046,6 +1124,7 @@ module.exports = class BrokerPool {
    */
   async findConnectedBroker({ fence } = {}) {
     fence?.check()
+    checked(null)
     const nodeIds = shuffle(keys(this.brokers))
     const connectedBrokerId = nodeIds.find((nodeId) => this.brokers[nodeId].isConnected())
 
@@ -1060,10 +1139,12 @@ module.exports = class BrokerPool {
     let allFailuresWereAuthentication = nodeIds.length > 0
     for (const nodeId of nodeIds) {
       fence?.check()
+      checked(null)
       try {
         return await this.findBroker({ nodeId, fence })
       } catch (e) {
         fence?.check()
+        checked(null)
         if (!isAuthenticationFailure(e)) {
           allFailuresWereAuthentication = false
         }
@@ -1078,14 +1159,17 @@ module.exports = class BrokerPool {
     // last rebootstrap (which is what stops one unreachable cluster producing a teardown per
     // retrier iteration), and at least one failure that was not purely an authentication failure.
     fence?.check()
+    checked(null)
     if (this.shouldRebootstrapOnAllBrokersUnavailable(nodeIds, allFailuresWereAuthentication)) {
       await this.rebootstrap('all-brokers-unavailable', { fence })
       fence?.check()
+      checked(null)
     }
 
     // Failed to connect to all known brokers, metadata might be old
     await this.connect(...(fence ? [{ fence }] : []))
     fence?.check()
+    checked(null)
     return this.seedBroker
   }
 
@@ -1104,10 +1188,13 @@ module.exports = class BrokerPool {
     return this.retryFor(fence)(async (bail, retryCount, retryTime) => {
       try {
         fence?.check()
+        checked(null)
         await broker.connect(...guardArgs(fence))
         fence?.check()
+        checked(null)
       } catch (caught) {
         fence?.check()
+        checked(null)
         const e = isNativeError(caught)
           ? caught
           : new KafkaJSNonRetriableError(describeThrown(caught), { cause: caught })
@@ -1126,14 +1213,22 @@ module.exports = class BrokerPool {
           // replaceConnectionPool also resets versionsGeneration, so the next connect() always
           // re-negotiates against the replacement pool (KIP-35 rule 7) rather than comparing
           // against the generation the old, discarded pool had reached.
-          const replacement = await this.buildConnectionPool({
-            host: broker.connectionPool.host,
-            port: broker.connectionPool.port,
-            rack: broker.connectionPool.rack,
-          })
-          if (fence?.closed) {
+          const previousPool = broker.connectionPool
+          const isCurrent = () => broker.connectionPool === previousPool
+          const replacement = await this.buildConnectionPool(
+            { host: previousPool.host, port: previousPool.port, rack: previousPool.rack },
+            { fence, isCurrent }
+          )
+          if (!replacement)
+            return bail(new KafkaJSConnectionError('Broker pool build was superseded'))
+          if (fence?.closed || currentDeadline()?.guard()) {
             this.closePool(replacement)
-            fence.check()
+            fence?.check()
+            checked(null)
+          }
+          if (!isCurrent()) {
+            this.closePool(replacement)
+            return bail(new KafkaJSConnectionError('Broker pool build was superseded'))
           }
           this.replacePool(broker, replacement)
 

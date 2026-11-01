@@ -103,7 +103,7 @@ describe('producer metadata idle expiry', () => {
       entered = true
       return held.promise
     })
-    const old = cluster.brokerPool.refreshMetadata(['topic'])
+    const old = cluster.brokerPool.refreshMetadata(['topic'], { isCurrent: () => true })
     try {
       for (let i = 0; i < 20; i += 1) await Promise.resolve()
       expect(entered).toBe(true)
@@ -175,7 +175,7 @@ describe('producer metadata idle expiry', () => {
     await cluster.addTargetTopic('topic')
     const held = gate()
     broker.metadata.mockImplementationOnce(async () => held.promise)
-    const old = cluster.brokerPool.refreshMetadata(['topic'])
+    const old = cluster.brokerPool.refreshMetadata(['topic'], { isCurrent: () => true })
     try {
       for (let i = 0; i < 20; i += 1) await Promise.resolve()
       await jest.advanceTimersByTimeAsync(5000)
@@ -210,7 +210,7 @@ describe('producer metadata idle expiry', () => {
     await cluster.addTargetTopic('topic')
     const held = gate()
     broker.metadata.mockImplementationOnce(async () => held.promise)
-    const old = cluster.brokerPool.refreshMetadata(['topic'])
+    const old = cluster.brokerPool.refreshMetadata(['topic'], { isCurrent: () => true })
     try {
       for (let i = 0; i < 20; i += 1) await Promise.resolve()
       await jest.advanceTimersByTimeAsync(5000)
@@ -288,7 +288,7 @@ describe('producer metadata idle expiry', () => {
       expect(broker.metadata).toHaveBeenCalledTimes(2)
       await cluster.addTargetTopic('valid')
       expect(cluster.targetTopicState.get('valid').incarnation).toBeGreaterThan(incarnation)
-      expect(broker.metadata).toHaveBeenLastCalledWith(['valid'])
+      expect(broker.metadata).toHaveBeenLastCalledWith(['valid'], { guard: expect.any(Function) })
       expect(cluster.topicId('valid')).toBe(ID_A)
     })
 
@@ -443,7 +443,7 @@ describe('producer metadata idle expiry', () => {
       expect(cluster.targetTopics.has('topic')).toBe(true)
       cluster.targetTopics.clear()
       await cluster.refreshMetadata()
-      expect(broker.metadata).toHaveBeenLastCalledWith([])
+      expect(broker.metadata).toHaveBeenLastCalledWith([], { guard: expect.any(Function) })
       expect(cluster.targetTopicState).toBeNull()
     }
   )

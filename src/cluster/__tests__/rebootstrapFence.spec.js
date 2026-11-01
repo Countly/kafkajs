@@ -6,11 +6,14 @@ const { KafkaJSConnectionError } = require('../../errors')
 const { createErrorFromCode } = require('../../protocol/error')
 const { deferred, watch, flushAll } = require('../../producer/__tests__/fixtures/bufferHarness')
 const { newLogger } = require('testHelpers')
+const { ConnectionSetupPolicy } = require('../../network/connectionSetup')
 
 /** @param {string} host @returns {object} a connection pool that records its retirement */
 const poolDouble = (host) => ({
   host,
   port: 9092,
+  pool: [],
+  setupPolicy: ConnectionSetupPolicy.resolve({}),
   retire: jest.fn(),
   destroy: jest.fn(async () => {}),
 })
@@ -220,7 +223,8 @@ describe('rebootstrap and the producer lifecycle that asked for it', () => {
       expect(builds).toHaveLength(2)
       builds.forEach((build) => build.resolve(poolDouble('fresh')))
       await flushAll()
-      expect([first.state, second.state]).toEqual(['fulfilled', 'fulfilled'])
+      expect([first.state, second.state]).toEqual(['fulfilled', 'rejected'])
+      expect(second.value).toMatchObject({ name: 'KafkaJSConnectionError' })
     } finally {
       await cluster.disconnect({ drainTimeout: 0 })
     }

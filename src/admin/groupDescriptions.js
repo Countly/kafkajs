@@ -1,6 +1,6 @@
 const { MemberAssignment } = require('../consumer/assignerProtocol')
 const { createErrorFromCode } = require('../protocol/error')
-const createRetry = require('../retry')
+const { retrierOf, withConsumerOperation } = require('./deadline')
 
 /** @see https://github.com/apache/kafka/blob/4.3/clients/src/main/java/org/apache/kafka/common/protocol/Errors.java */
 const GROUP_ID_NOT_FOUND = 69
@@ -84,7 +84,18 @@ class GroupDescriptions {
    *         group-level code but GROUP_ID_NOT_FOUND
    * @throws {Error} the operation's refusal once it expired or was retired
    */
-  async describe(groupIds, { operation } = {}) {
+  async describe(groupIds, context = {}) {
+    return withConsumerOperation(context.operation, () => this.describeWithin(groupIds, context))
+  }
+
+  /**
+   * Describes groups under the captured caller scope, retaining per-coordinator retries.
+   * @param {string[]} groupIds requested groups
+   * @param {object} context original consumer operation when present
+   * @returns {Promise<object>} group descriptions
+   * @throws {Error} original routing failure or caller refusal
+   */
+  async describeWithin(groupIds, { operation } = {}) {
     const described = await this.#describeByCoordinator(groupIds, operation)
     const rows = described.filter(({ needsFallback }) => !needsFallback).map(({ row }) => row)
     const fallbacks = described.filter(({ needsFallback }) => needsFallback)
@@ -149,7 +160,7 @@ class GroupDescriptions {
     let response
 
     const retried = (attempt) =>
-      operation ? operation.retry(attempt, this.retry) : createRetry(this.retry)(attempt)
+      operation ? operation.retry(attempt, this.retry) : retrierOf(this.retry)(attempt)
     const guarded = operation ? { guard: operation.guard } : {}
 
     try {
@@ -257,7 +268,7 @@ class GroupDescriptions {
         }
         const { groups } = await (operation
           ? operation.retry(attempt, this.retry)
-          : createRetry(this.retry)(attempt))
+          : retrierOf(this.retry)(attempt))
 
         return groups
       })

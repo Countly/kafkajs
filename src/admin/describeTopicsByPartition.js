@@ -1,5 +1,6 @@
+const { currentDeadline, runWithDeadline } = require('./deadline')
 const { createErrorFromCode } = require('../protocol/error')
-const { KafkaJSError, KafkaJSNonRetriableError, KafkaJSTimeout } = require('../errors')
+const { KafkaJSError, KafkaJSNonRetriableError } = require('../errors')
 
 /**
  * The page size asked for. The broker lowers it to its own `max.request.partition.size.limit`, so
@@ -15,14 +16,9 @@ const PAGE_PARTITION_LIMIT = 2000
 const READ_TIMEOUT_MS = 60000
 
 /**
- * The private state of one read's deadline: `expired` once the deadline passed, and `pages`, the
- * topics read so far, which are dropped when it passes.
- * @typedef {{ expired: boolean, pages: Map<string, PageTopic>|null }} ReadDeadline
+ * One read's captured operation and detached page builder; the operation owns expiry.
+ * @typedef {{ operation: {check: Function, wait: Function, own: Function}, pages: Map<string, PageTopic>|null }} ReadDeadline
  */
-
-/** @returns {KafkaJSTimeout} the error a read rejects with at its deadline */
-const readTimeout = () =>
-  new KafkaJSTimeout(`DescribeTopicPartitions did not complete within ${READ_TIMEOUT_MS} ms`)
 
 /**
  * Runs `work` under one overall deadline taken now. At the deadline the returned promise rejects
@@ -36,22 +32,19 @@ const readTimeout = () =>
  * @throws {KafkaJSTimeout} at the deadline
  */
 const withReadDeadline = async (work, timeoutMs = READ_TIMEOUT_MS) => {
-  const deadline = { expired: false, pages: null }
-  let timer
-  const expiry = new Promise((resolve, reject) => {
-    timer = setTimeout(() => {
-      deadline.expired = true
-      deadline.pages = null
-      reject(readTimeout())
-    }, timeoutMs)
+  if (!currentDeadline()) {
+    return runWithDeadline('fetchTopicMetadata', timeoutMs, () => withReadDeadline(work, timeoutMs))
+  }
+  const operation = currentDeadline()
+  const deadline = { operation, pages: null }
+  const unown = operation.own(() => {
+    deadline.pages = null
   })
-  const running = work(deadline)
-  running.catch(() => {})
-
   try {
-    return await Promise.race([running, expiry])
+    return await operation.wait(() => work(deadline))
   } finally {
-    clearTimeout(timer)
+    unown()
+    deadline.pages = null
   }
 }
 
@@ -60,11 +53,7 @@ const withReadDeadline = async (work, timeoutMs = READ_TIMEOUT_MS) => {
  * @returns {void}
  * @throws {KafkaJSTimeout} once the deadline has passed
  */
-const checkDeadline = (deadline) => {
-  if (deadline.expired) {
-    throw readTimeout()
-  }
-}
+const checkDeadline = (deadline) => deadline.operation.check()
 
 /**
  * @typedef {object} PageTopic one topic as `Broker#describeTopicPartitions` decodes it, with the
@@ -268,4 +257,9 @@ const toTopicsMetadata = (rows) => {
   }
 }
 
-module.exports = { readTopicPages, toTopicsMetadata, withReadDeadline, checkDeadline }
+module.exports = {
+  readTopicPages,
+  toTopicsMetadata,
+  withReadDeadline,
+  checkDeadline,
+}

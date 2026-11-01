@@ -218,7 +218,9 @@ module.exports = class ConnectionPool {
       resolvedConnection.failIfNotConnected()
     }
     const guard = options?.guard
-    return resolvedConnection.send(guard ? { ...protocolRequest, guard } : protocolRequest)
+    return resolvedConnection.send(
+      guard ? { ...protocolRequest, guard, responseGuard: guard } : protocolRequest
+    )
   }
 
   /**

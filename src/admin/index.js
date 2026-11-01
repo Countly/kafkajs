@@ -1,6 +1,13 @@
 const { inspect } = require('util')
-const createRetry = require('../retry')
-const waitFor = require('../utils/waitFor')
+const {
+  retrierOf,
+  wrapAdmin,
+  validateApiTimeout,
+  checked,
+  waitOf,
+  sharedSetup,
+  waitForOf: waitFor,
+} = require('./deadline')
 const groupBy = require('../utils/groupBy')
 const createConsumer = require('../consumer')
 const { disposeConsumer } = require('../consumer/disposal')
@@ -76,7 +83,7 @@ const retryOnLeaderNotAvailable = (fn, opts = {}) => {
   const { allowAutoTopicCreation = false, waitForTopicPropagation = false } = opts
   const callback = async () => {
     try {
-      return await fn()
+      return checked(await waitOf(async () => fn()))
     } catch (e) {
       const isTopicStillAppearing =
         (allowAutoTopicCreation || waitForTopicPropagation) &&
@@ -120,7 +127,10 @@ const staticMembers = (members) => {
     instanceIds.add(instanceId)
   }
 
-  return [...instanceIds].map((groupInstanceId) => ({ memberId: '', groupInstanceId }))
+  return [...instanceIds].map((groupInstanceId) => ({
+    memberId: '',
+    groupInstanceId,
+  }))
 }
 
 /**
@@ -149,8 +159,8 @@ const toRemoveMemberResult = (sent, answered) => {
 }
 
 const findTopicPartitions = async (cluster, topic) => {
-  await cluster.addTargetTopic(topic)
-  await cluster.refreshMetadataIfNecessary()
+  checked(await waitOf(async () => cluster.addTargetTopic(topic)))
+  checked(await waitOf(async () => cluster.refreshMetadataIfNecessary()))
 
   return cluster
     .findTopicPartitionMetadata(topic)
@@ -384,6 +394,7 @@ const toPublicGroupOverview = (row) => {
  * @param {InstrumentationEventEmitter} [params.instrumentationEmitter]
  * @param {import('../../types').RetryOptions} params.retry
  * @param {import("../../types").Cluster} params.cluster
+ * @param {number} [params.apiTimeout=60000] validated default end-to-end call budget
  *
  * @returns {import("../../types").Admin}
  */
@@ -392,7 +403,9 @@ module.exports = ({
   instrumentationEmitter: rootInstrumentationEmitter,
   retry,
   cluster,
+  apiTimeout = 60000,
 }) => {
+  apiTimeout = validateApiTimeout(apiTimeout)
   const logger = rootLogger.namespace('Admin')
   const instrumentationEmitter = rootInstrumentationEmitter || new InstrumentationEventEmitter()
 
@@ -400,7 +413,7 @@ module.exports = ({
    * @returns {Promise}
    */
   const connect = async () => {
-    await cluster.connect()
+    await sharedSetup(() => cluster.connect())
     instrumentationEmitter.emit(CONNECT)
   }
 
@@ -408,7 +421,7 @@ module.exports = ({
    * @return {Promise}
    */
   const disconnect = async () => {
-    await cluster.disconnect()
+    await sharedSetup(() => cluster.disconnect())
     instrumentationEmitter.emit(DISCONNECT)
   }
 
@@ -416,7 +429,7 @@ module.exports = ({
    * @return {Promise}
    */
   const listTopics = async () => {
-    const { topicMetadata } = await cluster.metadata()
+    const { topicMetadata } = checked(await waitOf(async () => cluster.metadata()))
     const topics = topicMetadata.map((t) => t.topic)
     return topics
   }
@@ -500,39 +513,55 @@ module.exports = ({
       message: 'Topic creation errors',
       isBenign: (child) => child?.type === 'TOPIC_ALREADY_EXISTS',
     })
-    const retrier = createRetry(retry)
+    const retrier = retrierOf(retry)
     let broker
     let outstanding
 
     try {
-      await retrier(async (bail, retryCount, retryTime) => {
-        try {
-          await cluster.refreshMetadata()
-          broker = await cluster.findControllerBroker()
-          await broker.createTopics({ topics: outcome.pending, validateOnly, timeout })
-          outcome.succeeded()
-        } catch (e) {
-          if (e.type === 'NOT_CONTROLLER') {
-            logger.warn('Could not create topics', { error: e.message, retryCount, retryTime })
-            throw e
-          }
+      checked(
+        await waitOf(async () =>
+          retrier(async (bail, retryCount, retryTime) => {
+            try {
+              checked(await waitOf(async () => cluster.refreshMetadata()))
+              broker = checked(await waitOf(async () => cluster.findControllerBroker()))
+              checked(
+                await waitOf(async () =>
+                  broker.createTopics({
+                    topics: outcome.pending,
+                    validateOnly,
+                    timeout,
+                  })
+                )
+              )
+              outcome.succeeded()
+            } catch (e) {
+              if (e.type === 'NOT_CONTROLLER') {
+                logger.warn('Could not create topics', {
+                  error: e.message,
+                  retryCount,
+                  retryTime,
+                })
+                throw e
+              }
 
-          if (isPerItemFailure(e)) {
-            const retryable = outcome.settle(e)
-            if (retryable) {
-              logger.warn('Could not create some topics yet', {
-                topics: retryable.errors.map(({ topic }) => topic),
-                retryCount,
-                retryTime,
-              })
-              throw retryable
+              if (isPerItemFailure(e)) {
+                const retryable = outcome.settle(e)
+                if (retryable) {
+                  logger.warn('Could not create some topics yet', {
+                    topics: retryable.errors.map(({ topic }) => topic),
+                    retryCount,
+                    retryTime,
+                  })
+                  throw retryable
+                }
+                return
+              }
+
+              bail(e)
             }
-            return
-          }
-
-          bail(e)
-        }
-      })
+          })
+        )
+      )
     } catch (e) {
       outstanding = e
     }
@@ -540,13 +569,20 @@ module.exports = ({
     const everyTopicCreated = outcome.finish(outstanding)
 
     if (waitForLeaders && outcome.created.size > 0) {
-      await retryOnLeaderNotAvailable(async () => await broker.metadata([...outcome.created]), {
-        delay: 100,
-        maxWait: timeout,
-        timeoutMessage: 'Timed out while waiting for topic leaders',
-        // a validateOnly request creates nothing, so no topic is on its way to the broker
-        waitForTopicPropagation: !validateOnly,
-      })
+      checked(
+        await waitOf(async () =>
+          retryOnLeaderNotAvailable(
+            async () => checked(await waitOf(async () => broker.metadata([...outcome.created]))),
+            {
+              delay: 100,
+              maxWait: timeout,
+              timeoutMessage: 'Timed out while waiting for topic leaders',
+              // a validateOnly request creates nothing, so no topic is on its way to the broker
+              waitForTopicPropagation: !validateOnly,
+            }
+          )
+        )
+      )
     }
 
     return everyTopicCreated
@@ -578,17 +614,29 @@ module.exports = ({
       )
     }
 
-    const retrier = createRetry(retry)
+    const retrier = retrierOf(retry)
     let pending = topicPartitions
 
     return retrier(async (bail, retryCount, retryTime) => {
       try {
-        await cluster.refreshMetadata()
-        const broker = await cluster.findControllerBroker()
-        await broker.createPartitions({ topicPartitions: pending, validateOnly, timeout })
+        checked(await waitOf(async () => cluster.refreshMetadata()))
+        const broker = checked(await waitOf(async () => cluster.findControllerBroker()))
+        checked(
+          await waitOf(async () =>
+            broker.createPartitions({
+              topicPartitions: pending,
+              validateOnly,
+              timeout,
+            })
+          )
+        )
       } catch (e) {
         if (e.type === 'NOT_CONTROLLER') {
-          logger.warn('Could not create topics', { error: e.message, retryCount, retryTime })
+          logger.warn('Could not create topics', {
+            error: e.message,
+            retryCount,
+            retryTime,
+          })
           throw e
         }
 
@@ -596,7 +644,11 @@ module.exports = ({
 
         if (refused) {
           pending = pending.filter(({ topic }) => refused.has(topic))
-          logger.warn('A quota refused partitions', { topics: [...refused], retryCount, retryTime })
+          logger.warn('A quota refused partitions', {
+            topics: [...refused],
+            retryCount,
+            retryTime,
+          })
           throw e
         }
 
@@ -619,21 +671,23 @@ module.exports = ({
       throw new KafkaJSNonRetriableError('Invalid topics array, the names must be a valid string')
     }
 
-    const retrier = createRetry(retry)
+    const retrier = retrierOf(retry)
     let pending = topics
 
     return retrier(async (bail, retryCount, retryTime) => {
       try {
-        await cluster.refreshMetadata()
-        const broker = await cluster.findControllerBroker()
-        await broker.deleteTopics({ topics: pending, timeout })
+        checked(await waitOf(async () => cluster.refreshMetadata()))
+        const broker = checked(await waitOf(async () => cluster.findControllerBroker()))
+        checked(await waitOf(async () => broker.deleteTopics({ topics: pending, timeout })))
+
+        // Remove deleted topics
 
         // Remove deleted topics
         for (const topic of topics) {
           cluster.targetTopics.delete(topic)
         }
 
-        await cluster.refreshMetadata()
+        checked(await waitOf(async () => cluster.refreshMetadata()))
       } catch (e) {
         if (e.topicErrors) {
           // a name the broker did not list as failed was deleted: the next refresh must not ask for it
@@ -658,7 +712,11 @@ module.exports = ({
         }
 
         if (['NOT_CONTROLLER', 'UNKNOWN_TOPIC_OR_PARTITION'].includes(e.type)) {
-          logger.warn('Could not delete topics', { error: e.message, retryCount, retryTime })
+          logger.warn('Could not delete topics', {
+            error: e.message,
+            retryCount,
+            retryTime,
+          })
           throw e
         }
 
@@ -687,29 +745,37 @@ module.exports = ({
       throw new KafkaJSNonRetriableError(`Invalid topic ${topic}`)
     }
 
-    const retrier = createRetry(retry)
+    const retrier = retrierOf(retry)
 
     return retrier(async (bail, retryCount, retryTime) => {
       try {
-        await cluster.addTargetTopic(topic)
-        await cluster.refreshMetadataIfNecessary()
+        checked(await waitOf(async () => cluster.addTargetTopic(topic)))
+        checked(await waitOf(async () => cluster.refreshMetadataIfNecessary()))
 
         const metadata = cluster.findTopicPartitionMetadata(topic)
-        const high = await cluster.fetchTopicsOffset([
-          {
-            topic,
-            fromBeginning: false,
-            partitions: metadata.map((p) => ({ partition: p.partitionId })),
-          },
-        ])
+        const high = checked(
+          await waitOf(async () =>
+            cluster.fetchTopicsOffset([
+              {
+                topic,
+                fromBeginning: false,
+                partitions: metadata.map((p) => ({ partition: p.partitionId })),
+              },
+            ])
+          )
+        )
 
-        const low = await cluster.fetchTopicsOffset([
-          {
-            topic,
-            fromBeginning: true,
-            partitions: metadata.map((p) => ({ partition: p.partitionId })),
-          },
-        ])
+        const low = checked(
+          await waitOf(async () =>
+            cluster.fetchTopicsOffset([
+              {
+                topic,
+                fromBeginning: true,
+                partitions: metadata.map((p) => ({ partition: p.partitionId })),
+              },
+            ])
+          )
+        )
 
         const { partitions: highPartitions } = high.pop()
         const { partitions: lowPartitions } = low.pop()
@@ -724,7 +790,7 @@ module.exports = ({
         // Stale metadata - an unknown or moved partition, or a leader epoch the broker fenced -
         // is refreshed and retried; anything else fails fast.
         if (staleMetadata(e) || staleLeaderEpoch(e)) {
-          await cluster.refreshMetadata()
+          checked(await waitOf(async () => cluster.refreshMetadata()))
           throw e
         }
 
@@ -743,32 +809,40 @@ module.exports = ({
       throw new KafkaJSNonRetriableError(`Invalid topic ${topic}`)
     }
 
-    const retrier = createRetry(retry)
+    const retrier = retrierOf(retry)
 
     return retrier(async (bail, retryCount, retryTime) => {
       try {
-        await cluster.addTargetTopic(topic)
-        await cluster.refreshMetadataIfNecessary()
+        checked(await waitOf(async () => cluster.addTargetTopic(topic)))
+        checked(await waitOf(async () => cluster.refreshMetadataIfNecessary()))
 
         const metadata = cluster.findTopicPartitionMetadata(topic)
         const partitions = metadata.map((p) => ({ partition: p.partitionId }))
 
-        const high = await cluster.fetchTopicsOffset([
-          {
-            topic,
-            fromBeginning: false,
-            partitions,
-          },
-        ])
+        const high = checked(
+          await waitOf(async () =>
+            cluster.fetchTopicsOffset([
+              {
+                topic,
+                fromBeginning: false,
+                partitions,
+              },
+            ])
+          )
+        )
         const { partitions: highPartitions } = high.pop()
 
-        const offsets = await cluster.fetchTopicsOffset([
-          {
-            topic,
-            fromTimestamp: timestamp,
-            partitions,
-          },
-        ])
+        const offsets = checked(
+          await waitOf(async () =>
+            cluster.fetchTopicsOffset([
+              {
+                topic,
+                fromTimestamp: timestamp,
+                partitions,
+              },
+            ])
+          )
+        )
         const { partitions: lowPartitions } = offsets.pop()
 
         return lowPartitions.map(({ partition, offset }) => ({
@@ -783,7 +857,7 @@ module.exports = ({
         // Stale metadata - an unknown or moved partition, or a leader epoch the broker fenced -
         // is refreshed and retried; anything else fails fast.
         if (staleMetadata(e) || staleLeaderEpoch(e)) {
-          await cluster.refreshMetadata()
+          checked(await waitOf(async () => cluster.refreshMetadata()))
           throw e
         }
 
@@ -815,45 +889,71 @@ module.exports = ({
       throw new KafkaJSNonRetriableError('Expected topics array to be set')
     }
 
-    const coordinator = await cluster.findGroupCoordinator({ groupId })
-    const topicsToFetch = await Promise.all(
-      topics.map(async (topic) => {
-        const partitions = await findTopicPartitions(cluster, topic)
-        const partitionsToFetch = partitions.map((partition) => ({ partition }))
-        return { topic, partitions: partitionsToFetch }
-      })
+    const coordinator = checked(await waitOf(async () => cluster.findGroupCoordinator({ groupId })))
+    const topicsToFetch = checked(
+      await waitOf(async () =>
+        Promise.all(
+          topics.map(async (topic) => {
+            const partitions = checked(
+              await waitOf(async () => findTopicPartitions(cluster, topic))
+            )
+            const partitionsToFetch = partitions.map((partition) => ({
+              partition,
+            }))
+            return { topic, partitions: partitionsToFetch }
+          })
+        )
+      )
     )
-    let { responses: consumerOffsets } = await coordinator.offsetFetch({
-      groupId,
-      topics: topicsToFetch,
-    })
+    let { responses: consumerOffsets } = checked(
+      await waitOf(async () =>
+        coordinator.offsetFetch({
+          groupId,
+          topics: topicsToFetch,
+        })
+      )
+    )
 
     if (resolveOffsets) {
-      consumerOffsets = await Promise.all(
-        consumerOffsets.map(async ({ topic, partitions }) => {
-          const indexedOffsets = indexByPartition(await fetchTopicOffsets(topic))
-          const recalculatedPartitions = partitions.map(({ offset, partition, ...props }) => {
-            let resolvedOffset = offset
-            if (Number(offset) === EARLIEST_OFFSET) {
-              resolvedOffset = indexedOffsets[partition].low
-            }
-            if (Number(offset) === LATEST_OFFSET) {
-              resolvedOffset = indexedOffsets[partition].high
-            }
-            return {
-              partition,
-              offset: resolvedOffset,
-              ...props,
-            }
-          })
+      consumerOffsets = checked(
+        await waitOf(async () =>
+          Promise.all(
+            consumerOffsets.map(async ({ topic, partitions }) => {
+              const indexedOffsets = indexByPartition(
+                checked(await waitOf(async () => fetchTopicOffsets(topic)))
+              )
+              const recalculatedPartitions = partitions.map(({ offset, partition, ...props }) => {
+                let resolvedOffset = offset
+                if (Number(offset) === EARLIEST_OFFSET) {
+                  resolvedOffset = indexedOffsets[partition].low
+                }
+                if (Number(offset) === LATEST_OFFSET) {
+                  resolvedOffset = indexedOffsets[partition].high
+                }
+                return {
+                  partition,
+                  offset: resolvedOffset,
+                  ...props,
+                }
+              })
 
-          await setOffsets({ groupId, topic, partitions: recalculatedPartitions })
+              checked(
+                await waitOf(async () =>
+                  setOffsets({
+                    groupId,
+                    topic,
+                    partitions: recalculatedPartitions,
+                  })
+                )
+              )
 
-          return {
-            topic,
-            partitions: recalculatedPartitions,
-          }
-        })
+              return {
+                topic,
+                partitions: recalculatedPartitions,
+              }
+            })
+          )
+        )
       )
     }
 
@@ -883,7 +983,7 @@ module.exports = ({
       throw new KafkaJSNonRetriableError(`Invalid topic ${topic}`)
     }
 
-    const partitions = await findTopicPartitions(cluster, topic)
+    const partitions = checked(await waitOf(async () => findTopicPartitions(cluster, topic)))
     const partitionsToSeek = partitions.map((partition) => ({
       partition,
       offset: cluster.defaultOffset({ fromBeginning: earliest }),
@@ -917,14 +1017,18 @@ module.exports = ({
     if (sentinels.length === 0) return
 
     const { generationId, memberId, groupInstanceId } = consumer.groupMetadata()
-    const coordinator = await cluster.findGroupCoordinator({ groupId })
-    await coordinator.offsetCommit({
-      groupId,
-      groupGenerationId: generationId,
-      memberId,
-      groupInstanceId,
-      topics: [{ topic, partitions: sentinels }],
-    })
+    const coordinator = checked(await waitOf(async () => cluster.findGroupCoordinator({ groupId })))
+    checked(
+      await waitOf(async () =>
+        coordinator.offsetCommit({
+          groupId,
+          groupGenerationId: generationId,
+          memberId,
+          groupInstanceId,
+          topics: [{ topic, partitions: sentinels }],
+        })
+      )
+    )
   }
 
   /**
@@ -974,8 +1078,8 @@ module.exports = ({
       })
 
       try {
-        await consumer.subscribe({ topic, fromBeginning: true })
-        const description = await consumer.describeGroup()
+        checked(await waitOf(async () => consumer.subscribe({ topic, fromBeginning: true })))
+        const description = checked(await waitOf(async () => consumer.describeGroup()))
 
         if (!isConsumerGroupRunning(description)) {
           throw new KafkaJSNonRetriableError(
@@ -983,37 +1087,46 @@ module.exports = ({
           )
         }
 
-        await new Promise((resolve, reject) => {
-          let committed = null
-          consumer.on(consumer.events.GROUP_JOIN, () => {
-            committed ??= commitSentinels(consumer, { groupId, topic, partitions })
-            committed.catch(() => {})
-          })
-          consumer.on(consumer.events.FETCH, () => {
-            committed
-              .finally(() => consumer.stop())
-              .then(resolve)
-              .catch(reject)
-          })
+        checked(
+          await waitOf(
+            async () =>
+              new Promise((resolve, reject) => {
+                let committed = null
+                consumer.on(consumer.events.GROUP_JOIN, () => {
+                  committed ??= commitSentinels(consumer, {
+                    groupId,
+                    topic,
+                    partitions,
+                  })
+                  committed.catch(() => {})
+                })
+                consumer.on(consumer.events.FETCH, () => {
+                  committed
+                    .finally(() => consumer.stop())
+                    .then(resolve)
+                    .catch(reject)
+                })
 
-          consumer
-            .run({
-              eachBatchAutoResolve: false,
-              eachBatch: async () => true,
-            })
-            .catch(reject)
+                consumer
+                  .run({
+                    eachBatchAutoResolve: false,
+                    eachBatch: async () => true,
+                  })
+                  .catch(reject)
 
-          // This consumer doesn't need to consume any data
-          consumer.pause([{ topic }])
+                // This consumer doesn't need to consume any data
+                consumer.pause([{ topic }])
 
-          for (const seekData of partitions) {
-            consumer.seek({ topic, ...seekData })
-          }
-        })
+                for (const seekData of partitions) {
+                  consumer.seek({ topic, ...seekData })
+                }
+              })
+          )
+        )
       } finally {
         // The consumer shares this admin's cluster, so it is disposed, not disconnected. A failed
         // stop is already logged by the consumer and must not replace the call's own outcome.
-        await disposeConsumer(consumer).catch(() => {})
+        await sharedSetup(() => disposeConsumer(consumer).catch(() => {}))
       }
     })
   }
@@ -1042,7 +1155,7 @@ module.exports = ({
   const groupResourcesByBroker = ({ resources, defaultBroker }) =>
     groupBy(resources, async (resource) => {
       return isBrokerConfig(resource)
-        ? await cluster.findBroker({ nodeId: String(resource.name) })
+        ? checked(await waitOf(async () => cluster.findBroker({ nodeId: String(resource.name) })))
         : defaultBroker
     })
 
@@ -1076,16 +1189,20 @@ module.exports = ({
       )
     }
 
-    const retrier = createRetry(retry)
+    const retrier = retrierOf(retry)
 
     return retrier(async (bail, retryCount, retryTime) => {
       try {
-        await cluster.refreshMetadata()
-        const controller = await cluster.findControllerBroker()
-        const resourcerByBroker = await groupResourcesByBroker({
-          resources,
-          defaultBroker: controller,
-        })
+        checked(await waitOf(async () => cluster.refreshMetadata()))
+        const controller = checked(await waitOf(async () => cluster.findControllerBroker()))
+        const resourcerByBroker = checked(
+          await waitOf(async () =>
+            groupResourcesByBroker({
+              resources,
+              defaultBroker: controller,
+            })
+          )
+        )
 
         const describeConfigsAction = async (broker) => {
           const targetBroker = broker || controller
@@ -1097,7 +1214,9 @@ module.exports = ({
         }
 
         const brokers = Array.from(resourcerByBroker.keys())
-        const responses = await Promise.all(brokers.map(describeConfigsAction))
+        const responses = checked(
+          await waitOf(async () => Promise.all(brokers.map(describeConfigsAction)))
+        )
         const responseResources = responses.reduce(
           (result, { resources }) => [...result, ...resources],
           []
@@ -1106,7 +1225,11 @@ module.exports = ({
         return { resources: responseResources }
       } catch (e) {
         if (e.type === 'NOT_CONTROLLER') {
-          logger.warn('Could not describe configs', { error: e.message, retryCount, retryTime })
+          logger.warn('Could not describe configs', {
+            error: e.message,
+            retryCount,
+            retryTime,
+          })
           throw e
         }
 
@@ -1157,16 +1280,20 @@ module.exports = ({
       )
     }
 
-    const retrier = createRetry(retry)
+    const retrier = retrierOf(retry)
 
     return retrier(async (bail, retryCount, retryTime) => {
       try {
-        await cluster.refreshMetadata()
-        const controller = await cluster.findControllerBroker()
-        const resourcerByBroker = await groupResourcesByBroker({
-          resources,
-          defaultBroker: controller,
-        })
+        checked(await waitOf(async () => cluster.refreshMetadata()))
+        const controller = checked(await waitOf(async () => cluster.findControllerBroker()))
+        const resourcerByBroker = checked(
+          await waitOf(async () =>
+            groupResourcesByBroker({
+              resources,
+              defaultBroker: controller,
+            })
+          )
+        )
 
         const alterConfigsAction = async (broker) => {
           const targetBroker = broker || controller
@@ -1177,7 +1304,9 @@ module.exports = ({
         }
 
         const brokers = Array.from(resourcerByBroker.keys())
-        const responses = await Promise.all(brokers.map(alterConfigsAction))
+        const responses = checked(
+          await waitOf(async () => Promise.all(brokers.map(alterConfigsAction)))
+        )
         const responseResources = responses.reduce(
           (result, { resources }) => [...result, ...resources],
           []
@@ -1186,7 +1315,11 @@ module.exports = ({
         return { resources: responseResources }
       } catch (e) {
         if (e.type === 'NOT_CONTROLLER') {
-          logger.warn('Could not alter configs', { error: e.message, retryCount, retryTime })
+          logger.warn('Could not alter configs', {
+            error: e.message,
+            retryCount,
+            retryTime,
+          })
           throw e
         }
 
@@ -1246,19 +1379,30 @@ module.exports = ({
     assertResourceTypesAndNames(resources)
     assertIncrementalEntries(resources)
 
-    const retrier = createRetry(retry)
+    const retrier = retrierOf(retry)
 
     return retrier(async (bail, retryCount, retryTime) => {
       try {
-        await cluster.refreshMetadata()
-        const controller = await cluster.findControllerBroker()
-        const resourcesByBroker = await groupResourcesByBroker({
-          resources,
-          defaultBroker: controller,
-        })
-        const responses = await Promise.all(
-          Array.from(resourcesByBroker, ([broker, group]) =>
-            broker.incrementalAlterConfigs({ resources: group, validateOnly: !!validateOnly })
+        checked(await waitOf(async () => cluster.refreshMetadata()))
+        const controller = checked(await waitOf(async () => cluster.findControllerBroker()))
+        const resourcesByBroker = checked(
+          await waitOf(async () =>
+            groupResourcesByBroker({
+              resources,
+              defaultBroker: controller,
+            })
+          )
+        )
+        const responses = checked(
+          await waitOf(async () =>
+            Promise.all(
+              Array.from(resourcesByBroker, ([broker, group]) =>
+                broker.incrementalAlterConfigs({
+                  resources: group,
+                  validateOnly: !!validateOnly,
+                })
+              )
+            )
           )
         )
         const results = responses.flatMap((response) => response.resources)
@@ -1270,7 +1414,11 @@ module.exports = ({
         return { resources: inRequestOrder(resources, results) }
       } catch (e) {
         if (e.type === 'NOT_CONTROLLER') {
-          logger.warn('Could not alter configs', { error: e.message, retryCount, retryTime })
+          logger.warn('Could not alter configs', {
+            error: e.message,
+            retryCount,
+            retryTime,
+          })
           throw e
         }
 
@@ -1290,14 +1438,10 @@ module.exports = ({
    * again from the start the same way.
    *
    * The whole read, the metadata refresh and every attempt included, has one deadline of 60 s
-   * taken here: at the deadline the call rejects with `KafkaJSTimeout` whatever is stalled, also
-   * with `enforceRequestTimeout: false`, and a late page changes nothing. After the deadline the
-   * call starts no new attempt and creates no new page request. Work already in progress when the
-   * deadline passes is not cancelled, and its result is ignored: a metadata refresh may finish its
-   * own retries (`retry` bounds them, and other callers of the cluster share them), a broker
-   * selection may go on to connect to the next broker, and a page already queued (for example
-   * behind a broker's client-side throttle) may still be sent. The supported escape is the
-   * Metadata path, `useDescribeTopicPartitions: false`.
+   * inherited from the public call. At its actual monotonic deadline it rejects with
+   * `KafkaJSTimeout`, also with request timeout enforcement disabled. Expiry detaches local
+   * waits, pages, retry timers and unsent requests. Shared discovery stops only when no live
+   * caller remains; physical setup keeps its own budget. Already-written mutations may apply.
    * @param {string[]} names
    * @returns {Promise<TopicsMetadata>}
    * @throws {KafkaJSServerDoesNotSupportApiKey} when the broker does not offer the API
@@ -1305,29 +1449,45 @@ module.exports = ({
    * @throws {KafkaJSTimeout} when the read is not done at its deadline
    */
   const describeByPartitions = async (names) => {
-    const retrier = createRetry(retry)
-    const rows = await withReadDeadline((deadline) =>
-      retrier(async (bail, retryCount, retryTime) => {
-        try {
-          checkDeadline(deadline)
+    const retrier = retrierOf(retry)
+    const rows = checked(
+      await waitOf(async () =>
+        withReadDeadline((deadline) =>
+          retrier(async (bail, retryCount, retryTime) => {
+            try {
+              checkDeadline(deadline)
 
-          if (retryCount > 0) {
-            await cluster.refreshMetadata()
-          } else {
-            await cluster.refreshMetadataIfNecessary()
-          }
+              if (retryCount > 0) {
+                checked(await waitOf(async () => cluster.refreshMetadata()))
+              } else {
+                checked(await waitOf(async () => cluster.refreshMetadataIfNecessary()))
+              }
 
-          checkDeadline(deadline)
-          return await readTopicPages(await cluster.findConnectedBroker(), names, deadline)
-        } catch (e) {
-          if (e.retriable === true) {
-            logger.warn('Could not describe topics', { error: e.message, retryCount, retryTime })
-            throw e
-          }
+              checkDeadline(deadline)
+              return checked(
+                await waitOf(async () =>
+                  readTopicPages(
+                    checked(await waitOf(async () => cluster.findConnectedBroker())),
+                    names,
+                    deadline
+                  )
+                )
+              )
+            } catch (e) {
+              if (e.retriable === true) {
+                logger.warn('Could not describe topics', {
+                  error: e.message,
+                  retryCount,
+                  retryTime,
+                })
+                throw e
+              }
 
-          bail(e)
-        }
-      })
+              bail(e)
+            }
+          })
+        )
+      )
     )
 
     return toTopicsMetadata(rows)
@@ -1393,7 +1553,7 @@ module.exports = ({
 
     if (useDescribeTopicPartitions && topics?.length > 0) {
       try {
-        return await describeByPartitions(topics)
+        return checked(await waitOf(async () => describeByPartitions(topics)))
       } catch (e) {
         if (e.name !== 'KafkaJSServerDoesNotSupportApiKey') {
           throw e
@@ -1401,9 +1561,13 @@ module.exports = ({
       }
     }
 
-    const metadata = await retryOnLeaderNotAvailable(() => cluster.metadata({ topics }), {
-      allowAutoTopicCreation: cluster.allowAutoTopicCreation,
-    })
+    const metadata = checked(
+      await waitOf(async () =>
+        retryOnLeaderNotAvailable(() => cluster.metadata({ topics }), {
+          allowAutoTopicCreation: cluster.allowAutoTopicCreation,
+        })
+      )
+    )
 
     return {
       topics: metadata.topicMetadata.map((topicMetadata) => ({
@@ -1431,7 +1595,11 @@ module.exports = ({
    * @property {Number} port
    */
   const describeCluster = async () => {
-    const { brokers: nodes, clusterId, controllerId } = await cluster.metadata({ topics: [] })
+    const {
+      brokers: nodes,
+      clusterId,
+      controllerId,
+    } = checked(await waitOf(async () => cluster.metadata({ topics: [] })))
     const brokers = nodes.map(({ nodeId, host, port }) => ({
       nodeId,
       host,
@@ -1480,23 +1648,27 @@ module.exports = ({
     assertStringArray('states', states)
     assertStringArray('types', types)
 
-    await cluster.refreshMetadata()
+    checked(await waitOf(async () => cluster.refreshMetadata()))
     let groups = []
     for (const nodeId in cluster.brokerPool.brokers) {
-      const broker = await cluster.findBroker({ nodeId })
-      const response = await createRetry(retry)(async (bail) => {
-        try {
-          return await broker.listGroups({ states, types })
-        } catch (e) {
-          if (e.name === 'KafkaJSServerDoesNotSupportApiKey') {
-            // `bail` rejects with this instance rather than a wrapper, so the `apiKey`/`apiName`
-            // that name the unsupported request reach the caller.
-            return bail(e)
-          }
+      const broker = checked(await waitOf(async () => cluster.findBroker({ nodeId })))
+      const response = checked(
+        await waitOf(async () =>
+          retrierOf(retry)(async (bail) => {
+            try {
+              return checked(await waitOf(async () => broker.listGroups({ states, types })))
+            } catch (e) {
+              if (e.name === 'KafkaJSServerDoesNotSupportApiKey') {
+                // `bail` rejects with this instance rather than a wrapper, so the `apiKey`/`apiName`
+                // that name the unsupported request reach the caller.
+                return bail(e)
+              }
 
-          throw e
-        }
-      })
+              throw e
+            }
+          })
+        )
+      )
       groups = groups.concat(response.groups.map(toPublicGroupOverview))
     }
 
@@ -1511,7 +1683,10 @@ module.exports = ({
    * returned in the order the ids were given.
    *
    * @param {string[]} groupIds
+   * @param {object} [options] additive call budget and authorization mask flag
+   * @param {boolean} [options.includeAuthorizedOperations=false] request raw signed masks
    * @returns {Promise<{ groups: object[] }>}
+   * @throws {Error} original routing/protocol failure or call deadline
    */
   const describeGroups = async (groupIds) =>
     createGroupDescriptions({ cluster, retry, logger: rootLogger }).describe(groupIds)
@@ -1537,7 +1712,7 @@ module.exports = ({
       throw new KafkaJSNonRetriableError(`Invalid groupId name: ${JSON.stringify(invalidGroupId)}`)
     }
 
-    const retrier = createRetry(retry)
+    const retrier = retrierOf(retry)
 
     let results = []
 
@@ -1547,20 +1722,30 @@ module.exports = ({
       try {
         if (clonedGroupIds.length === 0) return []
 
-        await cluster.refreshMetadata()
+        checked(await waitOf(async () => cluster.refreshMetadata()))
 
         const brokersPerGroups = {}
         const brokersPerNode = {}
         for (const groupId of clonedGroupIds) {
-          const broker = await cluster.findGroupCoordinator({ groupId })
+          const broker = checked(
+            await waitOf(async () => cluster.findGroupCoordinator({ groupId }))
+          )
           if (brokersPerGroups[broker.nodeId] === undefined) brokersPerGroups[broker.nodeId] = []
           brokersPerGroups[broker.nodeId].push(groupId)
           brokersPerNode[broker.nodeId] = broker
         }
 
-        const res = await Promise.all(
-          Object.keys(brokersPerNode).map(
-            async (nodeId) => await brokersPerNode[nodeId].deleteGroups(brokersPerGroups[nodeId])
+        const res = checked(
+          await waitOf(async () =>
+            Promise.all(
+              Object.keys(brokersPerNode).map(async (nodeId) =>
+                checked(
+                  await waitOf(async () =>
+                    brokersPerNode[nodeId].deleteGroups(brokersPerGroups[nodeId])
+                  )
+                )
+              )
+            )
           )
         )
 
@@ -1581,7 +1766,11 @@ module.exports = ({
         return results
       } catch (e) {
         if (e.type === 'NOT_CONTROLLER' || isStaleCoordinator(e)) {
-          logger.warn('Could not delete groups', { error: e.message, retryCount, retryTime })
+          logger.warn('Could not delete groups', {
+            error: e.message,
+            retryCount,
+            retryTime,
+          })
           throw e
         }
 
@@ -1601,7 +1790,7 @@ module.exports = ({
   const describedMembers = async (groupId) => {
     const {
       groups: [group],
-    } = await describeGroups([groupId])
+    } = checked(await waitOf(async () => describeGroups([groupId])))
 
     if (group === undefined) {
       throw new KafkaJSNonRetriableError(`The coordinator described no group for ${groupId}`)
@@ -1664,7 +1853,10 @@ module.exports = ({
       )
     }
 
-    const leaving = members === undefined ? await describedMembers(groupId) : staticMembers(members)
+    const leaving =
+      members === undefined
+        ? checked(await waitOf(async () => describedMembers(groupId)))
+        : staticMembers(members)
 
     if (leaving.length === 0) {
       return []
@@ -1679,10 +1871,12 @@ module.exports = ({
       members: leaving.map((member) => ({ ...member, reason: sentReason })),
     }
 
-    return createRetry(retry)(async (bail, retryCount, retryTime) => {
+    return retrierOf(retry)(async (bail, retryCount, retryTime) => {
       try {
-        const coordinator = await cluster.findGroupCoordinator({ groupId })
-        const response = await coordinator.leaveGroup(request)
+        const coordinator = checked(
+          await waitOf(async () => cluster.findGroupCoordinator({ groupId }))
+        )
+        const response = checked(await waitOf(async () => coordinator.leaveGroup(request)))
 
         return leaving.map((member, index) => toRemoveMemberResult(member, response.members[index]))
       } catch (e) {
@@ -1737,11 +1931,11 @@ module.exports = ({
       throw new KafkaJSNonRetriableError(`Invalid partitions`)
     }
 
-    const topicOffsets = await fetchTopicOffsets(topic)
+    const topicOffsets = checked(await waitOf(async () => fetchTopicOffsets(topic)))
     /** @type {Object<string, { topic: string, partitions: SeekEntry[] }>|null} */
     let seekEntriesByBroker = null
 
-    const retrier = createRetry(retry)
+    const retrier = retrierOf(retry)
     return retrier(async (bail) => {
       try {
         if (seekEntriesByBroker === null) {
@@ -1782,7 +1976,10 @@ module.exports = ({
 
           if (leaderNotFoundErrors.length > 0) {
             return bail(
-              new KafkaJSDeleteTopicRecordsError({ topic, partitions: leaderNotFoundErrors })
+              new KafkaJSDeleteTopicRecordsError({
+                topic,
+                partitions: leaderNotFoundErrors,
+              })
             )
           }
 
@@ -1803,29 +2000,35 @@ module.exports = ({
         const brokerRequests = entries(seekEntriesByBroker).map(
           ([nodeId, { topic, partitions }]) =>
             async () => {
-              const broker = await cluster.findBroker({ nodeId })
-              await broker.deleteRecords({ topics: [{ topic, partitions }] })
+              const broker = checked(await waitOf(async () => cluster.findBroker({ nodeId })))
+              checked(
+                await waitOf(async () => broker.deleteRecords({ topics: [{ topic, partitions }] }))
+              )
               // remove successful entry so it's ignored on retry
               delete seekEntriesByBroker[nodeId]
             }
         )
 
-        await Promise.all(
-          brokerRequests.map((request) =>
-            request().catch((e) => {
-              if (e.name === 'KafkaJSDeleteTopicRecordsError') {
-                e.partitions.forEach(({ partition, offset, error }) => {
-                  partitionErrors.push({
-                    partition,
-                    offset,
-                    error,
-                  })
+        checked(
+          await waitOf(async () =>
+            Promise.all(
+              brokerRequests.map((request) =>
+                request().catch((e) => {
+                  if (e.name === 'KafkaJSDeleteTopicRecordsError') {
+                    e.partitions.forEach(({ partition, offset, error }) => {
+                      partitionErrors.push({
+                        partition,
+                        offset,
+                        error,
+                      })
+                    })
+                  } else {
+                    // then it's an unknown error, not from the broker response
+                    throw e
+                  }
                 })
-              } else {
-                // then it's an unknown error, not from the broker response
-                throw e
-              }
-            })
+              )
+            )
           )
         )
 
@@ -1843,7 +2046,7 @@ module.exports = ({
               ({ error }) => staleMetadata(error) || error.name === 'KafkaJSMetadataNotLoaded'
             ))
         ) {
-          await cluster.refreshMetadata()
+          checked(await waitOf(async () => cluster.refreshMetadata()))
         }
         throw e
       }
@@ -1865,6 +2068,8 @@ module.exports = ({
     }
 
     // Validate principal
+
+    // Validate principal
     if (acl.some(({ principal }) => typeof principal !== 'string')) {
       throw new KafkaJSNonRetriableError(
         'Invalid ACL array, the principals have to be a valid string'
@@ -1872,9 +2077,13 @@ module.exports = ({
     }
 
     // Validate host
+
+    // Validate host
     if (acl.some(({ host }) => typeof host !== 'string')) {
       throw new KafkaJSNonRetriableError('Invalid ACL array, the hosts have to be a valid string')
     }
+
+    // Validate resourceName
 
     // Validate resourceName
     if (acl.some(({ resourceName }) => typeof resourceName !== 'string')) {
@@ -1895,6 +2104,8 @@ module.exports = ({
     }
 
     // Validate resourcePatternTypes
+
+    // Validate resourcePatternTypes
     const validResourcePatternTypes = Object.values(RESOURCE_PATTERN_TYPES)
     invalidType = acl.find((i) => !validResourcePatternTypes.includes(i.resourcePatternType))
 
@@ -1905,6 +2116,8 @@ module.exports = ({
         )}`
       )
     }
+
+    // Validate permissionTypes
 
     // Validate permissionTypes
     const validPermissionTypes = Object.values(ACL_PERMISSION_TYPES)
@@ -1926,18 +2139,22 @@ module.exports = ({
       )
     }
 
-    const retrier = createRetry(retry)
+    const retrier = retrierOf(retry)
 
     return retrier(async (bail, retryCount, retryTime) => {
       try {
-        await cluster.refreshMetadata()
-        const broker = await cluster.findControllerBroker()
-        await broker.createAcls({ acl })
+        checked(await waitOf(async () => cluster.refreshMetadata()))
+        const broker = checked(await waitOf(async () => cluster.findControllerBroker()))
+        checked(await waitOf(async () => broker.createAcls({ acl })))
 
         return true
       } catch (e) {
         if (e.type === 'NOT_CONTROLLER') {
-          logger.warn('Could not create ACL', { error: e.message, retryCount, retryTime })
+          logger.warn('Could not create ACL', {
+            error: e.message,
+            retryCount,
+            retryTime,
+          })
           throw e
         }
 
@@ -1978,9 +2195,13 @@ module.exports = ({
     }
 
     // Validate host
+
+    // Validate host
     if (typeof host !== 'string' && typeof host !== 'undefined') {
       throw new KafkaJSNonRetriableError('Invalid host, the host have to be a valid string')
     }
+
+    // Validate resourceName
 
     // Validate resourceName
     if (typeof resourceName !== 'string' && typeof resourceName !== 'undefined') {
@@ -1996,6 +2217,8 @@ module.exports = ({
     }
 
     // Validate resourcePatternType
+
+    // Validate resourcePatternType
     const validResourcePatternTypes = Object.values(RESOURCE_PATTERN_TYPES)
     if (!validResourcePatternTypes.includes(resourcePatternType)) {
       throw new KafkaJSNonRetriableError(
@@ -2004,10 +2227,14 @@ module.exports = ({
     }
 
     // Validate permissionType
+
+    // Validate permissionType
     const validPermissionTypes = Object.values(ACL_PERMISSION_TYPES)
     if (!validPermissionTypes.includes(permissionType)) {
       throw new KafkaJSNonRetriableError(`Invalid permission type ${permissionType}`)
     }
+
+    // Validate resourceType
 
     // Validate resourceType
     const validResourceTypes = Object.values(ACL_RESOURCE_TYPES)
@@ -2015,25 +2242,33 @@ module.exports = ({
       throw new KafkaJSNonRetriableError(`Invalid resource type ${resourceType}`)
     }
 
-    const retrier = createRetry(retry)
+    const retrier = retrierOf(retry)
 
     return retrier(async (bail, retryCount, retryTime) => {
       try {
-        await cluster.refreshMetadata()
-        const broker = await cluster.findControllerBroker()
-        const { resources } = await broker.describeAcls({
-          resourceType,
-          resourceName,
-          resourcePatternType,
-          principal,
-          host,
-          operation,
-          permissionType,
-        })
+        checked(await waitOf(async () => cluster.refreshMetadata()))
+        const broker = checked(await waitOf(async () => cluster.findControllerBroker()))
+        const { resources } = checked(
+          await waitOf(async () =>
+            broker.describeAcls({
+              resourceType,
+              resourceName,
+              resourcePatternType,
+              principal,
+              host,
+              operation,
+              permissionType,
+            })
+          )
+        )
         return { resources }
       } catch (e) {
         if (e.type === 'NOT_CONTROLLER') {
-          logger.warn('Could not describe ACL', { error: e.message, retryCount, retryTime })
+          logger.warn('Could not describe ACL', {
+            error: e.message,
+            retryCount,
+            retryTime,
+          })
           throw e
         }
 
@@ -2058,6 +2293,8 @@ module.exports = ({
     }
 
     // Validate principal
+
+    // Validate principal
     if (
       filters.some(
         ({ principal }) => typeof principal !== 'string' && typeof principal !== 'undefined'
@@ -2069,11 +2306,15 @@ module.exports = ({
     }
 
     // Validate host
+
+    // Validate host
     if (filters.some(({ host }) => typeof host !== 'string' && typeof host !== 'undefined')) {
       throw new KafkaJSNonRetriableError(
         'Invalid ACL Filter array, the hosts have to be a valid string'
       )
     }
+
+    // Validate resourceName
 
     // Validate resourceName
     if (
@@ -2099,6 +2340,8 @@ module.exports = ({
     }
 
     // Validate resourcePatternTypes
+
+    // Validate resourcePatternTypes
     const validResourcePatternTypes = Object.values(RESOURCE_PATTERN_TYPES)
     invalidType = filters.find((i) => !validResourcePatternTypes.includes(i.resourcePatternType))
 
@@ -2109,6 +2352,8 @@ module.exports = ({
         )}`
       )
     }
+
+    // Validate permissionTypes
 
     // Validate permissionTypes
     const validPermissionTypes = Object.values(ACL_PERMISSION_TYPES)
@@ -2130,17 +2375,23 @@ module.exports = ({
       )
     }
 
-    const retrier = createRetry(retry)
+    const retrier = retrierOf(retry)
 
     return retrier(async (bail, retryCount, retryTime) => {
       try {
-        await cluster.refreshMetadata()
-        const broker = await cluster.findControllerBroker()
-        const { filterResponses } = await broker.deleteAcls({ filters })
+        checked(await waitOf(async () => cluster.refreshMetadata()))
+        const broker = checked(await waitOf(async () => cluster.findControllerBroker()))
+        const { filterResponses } = checked(
+          await waitOf(async () => broker.deleteAcls({ filters }))
+        )
         return { filterResponses }
       } catch (e) {
         if (e.type === 'NOT_CONTROLLER') {
-          logger.warn('Could not delete ACL', { error: e.message, retryCount, retryTime })
+          logger.warn('Could not delete ACL', {
+            error: e.message,
+            retryCount,
+            retryTime,
+          })
           throw e
         }
 
@@ -2230,44 +2481,55 @@ module.exports = ({
           .filter(({ partitionAssignment }) => partitionAssignment.length > 0),
       message: 'Errors altering partition reassignments',
     })
-    const retrier = createRetry(retry)
+    const retrier = retrierOf(retry)
     let outstanding
 
     try {
-      await retrier(async (bail, retryCount, retryTime) => {
-        try {
-          await cluster.refreshMetadata()
-          const broker = await cluster.findControllerBroker()
-          await broker.alterPartitionReassignments({ topics: outcome.pending, timeout })
-          outcome.succeeded()
-        } catch (e) {
-          if (e.type === 'NOT_CONTROLLER') {
-            logger.warn('Could not reassign partitions', {
-              error: e.message,
-              retryCount,
-              retryTime,
-            })
-            throw e
-          }
+      checked(
+        await waitOf(async () =>
+          retrier(async (bail, retryCount, retryTime) => {
+            try {
+              checked(await waitOf(async () => cluster.refreshMetadata()))
+              const broker = checked(await waitOf(async () => cluster.findControllerBroker()))
+              checked(
+                await waitOf(async () =>
+                  broker.alterPartitionReassignments({
+                    topics: outcome.pending,
+                    timeout,
+                  })
+                )
+              )
+              outcome.succeeded()
+            } catch (e) {
+              if (e.type === 'NOT_CONTROLLER') {
+                logger.warn('Could not reassign partitions', {
+                  error: e.message,
+                  retryCount,
+                  retryTime,
+                })
+                throw e
+              }
 
-          if (isPerItemFailure(e)) {
-            const retryable = outcome.settle(e)
-            if (retryable) {
-              logger.warn('Could not reassign some partitions yet', {
-                partitions: retryable.errors.map(({ topic, partition }) =>
-                  partitionKey(topic, partition)
-                ),
-                retryCount,
-                retryTime,
-              })
-              throw retryable
+              if (isPerItemFailure(e)) {
+                const retryable = outcome.settle(e)
+                if (retryable) {
+                  logger.warn('Could not reassign some partitions yet', {
+                    partitions: retryable.errors.map(({ topic, partition }) =>
+                      partitionKey(topic, partition)
+                    ),
+                    retryCount,
+                    retryTime,
+                  })
+                  throw retryable
+                }
+                return
+              }
+
+              bail(e)
             }
-            return
-          }
-
-          bail(e)
-        }
-      })
+          })
+        )
+      )
     } catch (e) {
       outstanding = e
     }
@@ -2321,18 +2583,24 @@ module.exports = ({
       }
     }
 
-    const retrier = createRetry(retry)
+    const retrier = retrierOf(retry)
 
     return retrier(async (bail, retryCount, retryTime) => {
       try {
-        await cluster.refreshMetadata()
-        const broker = await cluster.findControllerBroker()
-        const response = await broker.listPartitionReassignments({ topics, timeout })
+        checked(await waitOf(async () => cluster.refreshMetadata()))
+        const broker = checked(await waitOf(async () => cluster.findControllerBroker()))
+        const response = checked(
+          await waitOf(async () => broker.listPartitionReassignments({ topics, timeout }))
+        )
 
         return { topics: response.topics }
       } catch (e) {
         if (e.type === 'NOT_CONTROLLER') {
-          logger.warn('Could not reassign partitions', { error: e.message, retryCount, retryTime })
+          logger.warn('Could not reassign partitions', {
+            error: e.message,
+            retryCount,
+            retryTime,
+          })
           throw e
         }
 
@@ -2363,35 +2631,64 @@ module.exports = ({
    */
   const getLogger = () => logger
 
-  return {
-    connect,
-    disconnect,
-    listTopics,
-    createTopics,
-    deleteTopics,
-    createPartitions,
-    fetchTopicMetadata,
-    describeCluster,
-    events,
-    fetchOffsets,
-    fetchTopicOffsets,
-    fetchTopicOffsetsByTimestamp,
-    setOffsets,
-    resetOffsets,
-    describeConfigs,
-    alterConfigs,
-    incrementalAlterConfigs,
-    on,
-    logger: getLogger,
-    listGroups,
-    describeGroups,
-    deleteGroups,
-    removeMembersFromConsumerGroup,
-    describeAcls,
-    deleteAcls,
-    createAcls,
-    deleteTopicRecords,
-    alterPartitionReassignments,
-    listPartitionReassignments,
-  }
+  return wrapAdmin(
+    {
+      connect,
+      disconnect,
+      listTopics,
+      createTopics,
+      deleteTopics,
+      createPartitions,
+      fetchTopicMetadata,
+      describeCluster,
+      events,
+      fetchOffsets,
+      fetchTopicOffsets,
+      fetchTopicOffsetsByTimestamp,
+      setOffsets,
+      resetOffsets,
+      describeConfigs,
+      alterConfigs,
+      incrementalAlterConfigs,
+      on,
+      logger: getLogger,
+      listGroups,
+      describeGroups,
+      deleteGroups,
+      removeMembersFromConsumerGroup,
+      describeAcls,
+      deleteAcls,
+      createAcls,
+      deleteTopicRecords,
+      alterPartitionReassignments,
+      listPartitionReassignments,
+    },
+    {
+      listTopics: 0,
+      createTopics: 0,
+      deleteTopics: 0,
+      createPartitions: 0,
+      fetchTopicMetadata: 0,
+      describeCluster: 0,
+      fetchOffsets: 0,
+      setOffsets: 0,
+      resetOffsets: 0,
+      describeConfigs: 0,
+      alterConfigs: 0,
+      incrementalAlterConfigs: 0,
+      listGroups: 0,
+      removeMembersFromConsumerGroup: 0,
+      describeAcls: 0,
+      deleteAcls: 0,
+      createAcls: 0,
+      deleteTopicRecords: 0,
+      alterPartitionReassignments: 0,
+      listPartitionReassignments: 0,
+      fetchTopicOffsets: 1,
+      fetchTopicOffsetsByTimestamp: 2,
+      describeGroups: 1,
+      deleteGroups: 1,
+    },
+    apiTimeout
+  )
 }
