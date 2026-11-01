@@ -214,5 +214,89 @@
     {"direction":"request","versions":[5],"test":"encodes the Apache 4.3.1 %s vector byte for byte"},
     {"direction":"response","versions":[5],"test":"decodes the Apache 4.3.1 %s vector into the v1 shape"}
   ]},
-  {"family":"recordBatch/zstd","route":"unknown: its origin is not recorded","evidenceKind":"hand","disposition":"remove","removed":"src/protocol/recordBatch/fixtures/v0_recordbatch_zstd.json","reason":"no spec read it, it decoded with attributes 0 and a Java reader once rejected its CRC; ZSTD batches are covered by the producer compression round trip and the live ZSTD produce case"}
+  {"family":"recordBatch/zstd","route":"unknown: its origin is not recorded","evidenceKind":"hand","disposition":"remove","removed":"src/protocol/recordBatch/fixtures/v0_recordbatch_zstd.json","reason":"no spec read it, it decoded with attributes 0 and a Java reader once rejected its CRC; ZSTD batches are covered by the producer compression round trip and the live ZSTD produce case"},
+{
+  "family": "describeProducers/java",
+  "route": "javaVectors/GenerateMessageVectors.java",
+  "evidenceKind": "java-vector",
+  "disposition": "retain",
+  "reason": "Apache generated codecs, independently compared before registration",
+  "goldens": [
+    {
+      "direction": "request",
+      "versions": [0],
+      "spec": "describeProducers/describeProducers.spec.js",
+      "test": "Java vectors independently match every prescribed case"
+    },
+    {
+      "direction": "response",
+      "versions": [0],
+      "spec": "describeProducers/describeProducers.spec.js",
+      "test": "Java vectors independently match every prescribed case"
+    }
+  ]
+},
+{
+  "family": "describeTransactions/java",
+  "route": "javaVectors/GenerateMessageVectors.java",
+  "evidenceKind": "java-vector",
+  "disposition": "retain",
+  "reason": "Apache generated codecs, independently compared before registration",
+  "goldens": [
+    {
+      "direction": "request",
+      "versions": [0],
+      "spec": "describeTransactions/describeTransactions.spec.js",
+      "test": "Java vectors independently match every prescribed case"
+    },
+    {
+      "direction": "response",
+      "versions": [0],
+      "spec": "describeTransactions/describeTransactions.spec.js",
+      "test": "Java vectors independently match every prescribed case"
+    }
+  ]
+},
+{
+  "family": "listTransactions/java",
+  "route": "javaVectors/GenerateMessageVectors.java",
+  "evidenceKind": "java-vector",
+  "disposition": "retain",
+  "reason": "Apache generated codecs, independently compared before registration",
+  "goldens": [
+    {
+      "direction": "request",
+      "versions": [0, 1, 2],
+      "spec": "listTransactions/listTransactions.spec.js",
+      "test": "Java vectors independently match every prescribed case"
+    },
+    {
+      "direction": "response",
+      "versions": [0, 1, 2],
+      "spec": "listTransactions/listTransactions.spec.js",
+      "test": "Java vectors independently match every prescribed case"
+    }
+  ]
+},
+{
+  "family": "writeTxnMarkers/java",
+  "route": "javaVectors/GenerateMessageVectors.java",
+  "evidenceKind": "java-vector",
+  "disposition": "retain",
+  "reason": "Apache generated codecs, independently compared before registration",
+  "goldens": [
+    {
+      "direction": "request",
+      "versions": [1, 2],
+      "spec": "writeTxnMarkers/writeTxnMarkers.spec.js",
+      "test": "Java vectors independently match every prescribed case"
+    },
+    {
+      "direction": "response",
+      "versions": [1, 2],
+      "spec": "writeTxnMarkers/writeTxnMarkers.spec.js",
+      "test": "Java vectors independently match every prescribed case"
+    }
+  ]
+}
 ]

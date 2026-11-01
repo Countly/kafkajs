@@ -1,0 +1,7 @@
+{
+  "message": "DescribeTransactionsRequest",
+  "version": 0,
+  "case": "basic",
+  "hex": "030574782d610574782d6200",
+  "fields": {"transactionalIds":["tx-a","tx-b"]}
+}

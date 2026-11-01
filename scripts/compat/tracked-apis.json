@@ -164,9 +164,9 @@
     {
       "kafkaName": "WriteTxnMarkers",
       "apiKey": 27,
-      "forkName": null,
+      "forkName": "writeTxnMarkers",
       "apiKeysName": "WriteTxnMarkers",
-      "planned": "yes"
+      "planned": "done"
     },
     {
       "kafkaName": "TxnOffsetCommit",
@@ -353,23 +353,23 @@
     {
       "kafkaName": "DescribeProducers",
       "apiKey": 61,
-      "forkName": null,
+      "forkName": "describeProducers",
       "apiKeysName": "DescribeProducers",
-      "planned": "yes"
+      "planned": "done"
     },
     {
       "kafkaName": "DescribeTransactions",
       "apiKey": 65,
-      "forkName": null,
+      "forkName": "describeTransactions",
       "apiKeysName": "DescribeTransactions",
-      "planned": "yes"
+      "planned": "done"
     },
     {
       "kafkaName": "ListTransactions",
       "apiKey": 66,
-      "forkName": null,
+      "forkName": "listTransactions",
       "apiKeysName": "ListTransactions",
-      "planned": "yes"
+      "planned": "done"
     },
     {
       "kafkaName": "ConsumerGroupHeartbeat",

@@ -1,3 +1,11 @@
+import org.apache.kafka.common.message.WriteTxnMarkersResponseData;
+import org.apache.kafka.common.message.WriteTxnMarkersRequestData;
+import org.apache.kafka.common.message.ListTransactionsResponseData;
+import org.apache.kafka.common.message.ListTransactionsRequestData;
+import org.apache.kafka.common.message.DescribeTransactionsResponseData;
+import org.apache.kafka.common.message.DescribeTransactionsRequestData;
+import org.apache.kafka.common.message.DescribeProducersResponseData;
+import org.apache.kafka.common.message.DescribeProducersRequestData;
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
@@ -331,9 +339,206 @@ public final class GenerateMessageVectors {
     }
   }
 
+  /** Generates transaction administration bodies with Apache codecs.
+   * @return vectors; all int64 fixture fields stay decimal strings
+   */
+  private static List<Vector> transactionAdmin() {
+    List<Vector> vectors = new ArrayList<>();
+vectors.add(new Vector("describeProducers", "DescribeProducersRequest", (short) 0, "basic",
+new DescribeProducersRequestData()
+.setTopics(Arrays.asList(new DescribeProducersRequestData.TopicRequest()
+.setName("orders")
+.setPartitionIndexes(Arrays.asList(0, 2)))),
+"{\"topics\":[{\"topic\":\"orders\",\"partitions\":[0,2]}]}"));
+vectors.add(new Vector("describeProducers", "DescribeProducersResponse", (short) 0, "ok",
+new DescribeProducersResponseData()
+.setThrottleTimeMs(17)
+.setTopics(Arrays.asList(new DescribeProducersResponseData.TopicResponse()
+.setName("orders")
+.setPartitions(Arrays.asList(new DescribeProducersResponseData.PartitionResponse()
+.setPartitionIndex(0)
+.setErrorCode((short) 0)
+.setErrorMessage(null)
+.setActiveProducers(Arrays.asList(new DescribeProducersResponseData.ProducerState()
+.setProducerId(9007199254740993L)
+.setProducerEpoch(65537)
+.setLastSequence(23)
+.setLastTimestamp(9007199254740994L)
+.setCoordinatorEpoch(9)
+.setCurrentTxnStartOffset(-1L))), new DescribeProducersResponseData.PartitionResponse()
+.setPartitionIndex(2)
+.setErrorCode((short) 6)
+.setErrorMessage("moved")
+.setActiveProducers(Collections.emptyList()))))),
+"{\"throttleTime\":17,\"topics\":[{\"topic\":\"orders\",\"partitions\":[{\"partition\":0,\"errorCode\":0,\"errorMessage\":null,\"activeProducers\":[{\"producerId\":\"9007199254740993\",\"producerEpoch\":65537,\"lastSequence\":23,\"lastTimestamp\":\"9007199254740994\",\"coordinatorEpoch\":9,\"currentTxnStartOffset\":\"-1\"}]},{\"partition\":2,\"errorCode\":6,\"errorMessage\":\"moved\",\"activeProducers\":[]}]}]}"));
+vectors.add(new Vector("describeTransactions", "DescribeTransactionsRequest", (short) 0, "basic",
+new DescribeTransactionsRequestData()
+.setTransactionalIds(Arrays.asList("tx-a", "tx-b")),
+"{\"transactionalIds\":[\"tx-a\",\"tx-b\"]}"));
+vectors.add(new Vector("describeTransactions", "DescribeTransactionsResponse", (short) 0, "ok",
+new DescribeTransactionsResponseData()
+.setThrottleTimeMs(17)
+.setTransactionStates(Arrays.asList(new DescribeTransactionsResponseData.TransactionState()
+.setErrorCode((short) 0)
+.setTransactionalId("tx-a")
+.setTransactionState("Ongoing")
+.setTransactionTimeoutMs(60000)
+.setTransactionStartTimeMs(9007199254740994L)
+.setProducerId(9007199254740993L)
+.setProducerEpoch((short) 7)
+.setTopics(new DescribeTransactionsResponseData.TopicDataCollection(Arrays.asList(new DescribeTransactionsResponseData.TopicData()
+.setTopic("orders")
+.setPartitions(Arrays.asList(0, 2))).iterator())), new DescribeTransactionsResponseData.TransactionState()
+.setErrorCode((short) 53)
+.setTransactionalId("tx-b")
+.setTransactionState("Unknown")
+.setTransactionTimeoutMs(0)
+.setTransactionStartTimeMs(-1L)
+.setProducerId(-1L)
+.setProducerEpoch((short) -1)
+.setTopics(new DescribeTransactionsResponseData.TopicDataCollection()))),
+"{\"throttleTime\":17,\"transactions\":[{\"errorCode\":0,\"transactionalId\":\"tx-a\",\"state\":\"Ongoing\",\"timeoutMs\":60000,\"startTimeMs\":\"9007199254740994\",\"producerId\":\"9007199254740993\",\"producerEpoch\":7,\"topics\":[{\"topic\":\"orders\",\"partitions\":[0,2]}]},{\"errorCode\":53,\"transactionalId\":\"tx-b\",\"state\":\"Unknown\",\"timeoutMs\":0,\"startTimeMs\":\"-1\",\"producerId\":\"-1\",\"producerEpoch\":-1,\"topics\":[]}]}"));
+vectors.add(new Vector("listTransactions", "ListTransactionsRequest", (short) 0, "basic",
+new ListTransactionsRequestData()
+.setStateFilters(Arrays.asList("Ongoing", "FutureState"))
+.setProducerIdFilters(Arrays.asList(9007199254740993L)),
+"{\"states\":[\"Ongoing\",\"FutureState\"],\"producerIds\":[\"9007199254740993\"]}"));
+vectors.add(new Vector("listTransactions", "ListTransactionsResponse", (short) 0, "ok",
+new ListTransactionsResponseData()
+.setThrottleTimeMs(17)
+.setErrorCode((short) 0)
+.setUnknownStateFilters(Arrays.asList("FutureState"))
+.setTransactionStates(Arrays.asList(new ListTransactionsResponseData.TransactionState()
+.setTransactionalId("tx-a")
+.setProducerId(9007199254740993L)
+.setTransactionState("Ongoing"))),
+"{\"throttleTime\":17,\"errorCode\":0,\"unknownStateFilters\":[\"FutureState\"],\"transactions\":[{\"transactionalId\":\"tx-a\",\"producerId\":\"9007199254740993\",\"state\":\"Ongoing\"}]}"));
+vectors.add(new Vector("listTransactions", "ListTransactionsRequest", (short) 1, "basic",
+new ListTransactionsRequestData()
+.setStateFilters(Arrays.asList("Ongoing", "FutureState"))
+.setProducerIdFilters(Arrays.asList(9007199254740993L))
+.setDurationFilter(250L),
+"{\"states\":[\"Ongoing\",\"FutureState\"],\"producerIds\":[\"9007199254740993\"],\"durationFilter\":\"250\"}"));
+vectors.add(new Vector("listTransactions", "ListTransactionsResponse", (short) 1, "ok",
+new ListTransactionsResponseData()
+.setThrottleTimeMs(17)
+.setErrorCode((short) 0)
+.setUnknownStateFilters(Arrays.asList("FutureState"))
+.setTransactionStates(Arrays.asList(new ListTransactionsResponseData.TransactionState()
+.setTransactionalId("tx-a")
+.setProducerId(9007199254740993L)
+.setTransactionState("Ongoing"))),
+"{\"throttleTime\":17,\"errorCode\":0,\"unknownStateFilters\":[\"FutureState\"],\"transactions\":[{\"transactionalId\":\"tx-a\",\"producerId\":\"9007199254740993\",\"state\":\"Ongoing\"}]}"));
+vectors.add(new Vector("listTransactions", "ListTransactionsRequest", (short) 2, "basic",
+new ListTransactionsRequestData()
+.setStateFilters(Arrays.asList("Ongoing", "FutureState"))
+.setProducerIdFilters(Arrays.asList(9007199254740993L))
+.setDurationFilter(250L)
+.setTransactionalIdPattern("^tx-.*$"),
+"{\"states\":[\"Ongoing\",\"FutureState\"],\"producerIds\":[\"9007199254740993\"],\"durationFilter\":\"250\",\"transactionalIdPattern\":\"^tx-.*$\"}"));
+vectors.add(new Vector("listTransactions", "ListTransactionsResponse", (short) 2, "ok",
+new ListTransactionsResponseData()
+.setThrottleTimeMs(17)
+.setErrorCode((short) 0)
+.setUnknownStateFilters(Arrays.asList("FutureState"))
+.setTransactionStates(Arrays.asList(new ListTransactionsResponseData.TransactionState()
+.setTransactionalId("tx-a")
+.setProducerId(9007199254740993L)
+.setTransactionState("Ongoing"))),
+"{\"throttleTime\":17,\"errorCode\":0,\"unknownStateFilters\":[\"FutureState\"],\"transactions\":[{\"transactionalId\":\"tx-a\",\"producerId\":\"9007199254740993\",\"state\":\"Ongoing\"}]}"));
+vectors.add(new Vector("writeTxnMarkers", "WriteTxnMarkersRequest", (short) 1, "basic",
+new WriteTxnMarkersRequestData()
+.setMarkers(Arrays.asList(new WriteTxnMarkersRequestData.WritableTxnMarker()
+.setProducerId(9007199254740993L)
+.setProducerEpoch((short) 7)
+.setTransactionResult(false)
+.setTopics(Arrays.asList(new WriteTxnMarkersRequestData.WritableTxnMarkerTopic()
+.setName("orders")
+.setPartitionIndexes(Arrays.asList(2))))
+.setCoordinatorEpoch(9))),
+"{\"markers\":[{\"producerId\":\"9007199254740993\",\"producerEpoch\":7,\"transactionResult\":false,\"topics\":[{\"topic\":\"orders\",\"partitions\":[2]}],\"coordinatorEpoch\":9}]}"));
+vectors.add(new Vector("writeTxnMarkers", "WriteTxnMarkersResponse", (short) 1, "ok",
+new WriteTxnMarkersResponseData()
+.setMarkers(Arrays.asList(new WriteTxnMarkersResponseData.WritableTxnMarkerResult()
+.setProducerId(9007199254740993L)
+.setTopics(Arrays.asList(new WriteTxnMarkersResponseData.WritableTxnMarkerTopicResult()
+.setName("orders")
+.setPartitions(Arrays.asList(new WriteTxnMarkersResponseData.WritableTxnMarkerPartitionResult()
+.setPartitionIndex(2)
+.setErrorCode((short) 0))))))),
+"{\"markers\":[{\"producerId\":\"9007199254740993\",\"topics\":[{\"topic\":\"orders\",\"partitions\":[{\"partition\":2,\"errorCode\":0}]}]}]}"));
+vectors.add(new Vector("writeTxnMarkers", "WriteTxnMarkersRequest", (short) 2, "basic",
+new WriteTxnMarkersRequestData()
+.setMarkers(Arrays.asList(new WriteTxnMarkersRequestData.WritableTxnMarker()
+.setProducerId(9007199254740993L)
+.setProducerEpoch((short) 7)
+.setTransactionResult(false)
+.setTopics(Arrays.asList(new WriteTxnMarkersRequestData.WritableTxnMarkerTopic()
+.setName("orders")
+.setPartitionIndexes(Arrays.asList(2))))
+.setCoordinatorEpoch(9)
+.setTransactionVersion((byte) 0))),
+"{\"markers\":[{\"producerId\":\"9007199254740993\",\"producerEpoch\":7,\"transactionResult\":false,\"topics\":[{\"topic\":\"orders\",\"partitions\":[2]}],\"coordinatorEpoch\":9,\"transactionVersion\":0}]}"));
+vectors.add(new Vector("writeTxnMarkers", "WriteTxnMarkersResponse", (short) 2, "ok",
+new WriteTxnMarkersResponseData()
+.setMarkers(Arrays.asList(new WriteTxnMarkersResponseData.WritableTxnMarkerResult()
+.setProducerId(9007199254740993L)
+.setTopics(Arrays.asList(new WriteTxnMarkersResponseData.WritableTxnMarkerTopicResult()
+.setName("orders")
+.setPartitions(Arrays.asList(new WriteTxnMarkersResponseData.WritableTxnMarkerPartitionResult()
+.setPartitionIndex(2)
+.setErrorCode((short) 0))))))),
+"{\"markers\":[{\"producerId\":\"9007199254740993\",\"topics\":[{\"topic\":\"orders\",\"partitions\":[{\"partition\":2,\"errorCode\":0}]}]}]}"));
+vectors.add(new Vector("writeTxnMarkers", "WriteTxnMarkersRequest", (short) 2, "transactionVersionTwo",
+new WriteTxnMarkersRequestData()
+.setMarkers(Arrays.asList(new WriteTxnMarkersRequestData.WritableTxnMarker()
+.setProducerId(9007199254740993L)
+.setProducerEpoch((short) 7)
+.setTransactionResult(false)
+.setTopics(Arrays.asList(new WriteTxnMarkersRequestData.WritableTxnMarkerTopic()
+.setName("orders")
+.setPartitionIndexes(Arrays.asList(2))))
+.setCoordinatorEpoch(9)
+.setTransactionVersion((byte) 2))),
+"{\"markers\":[{\"producerId\":\"9007199254740993\",\"producerEpoch\":7,\"transactionResult\":false,\"topics\":[{\"topic\":\"orders\",\"partitions\":[2]}],\"coordinatorEpoch\":9,\"transactionVersion\":2}]}"));
+vectors.add(new Vector("writeTxnMarkers", "WriteTxnMarkersResponse", (short) 2, "error47",
+new WriteTxnMarkersResponseData()
+.setMarkers(Arrays.asList(new WriteTxnMarkersResponseData.WritableTxnMarkerResult()
+.setProducerId(9007199254740993L)
+.setTopics(Arrays.asList(new WriteTxnMarkersResponseData.WritableTxnMarkerTopicResult()
+.setName("orders")
+.setPartitions(Arrays.asList(new WriteTxnMarkersResponseData.WritableTxnMarkerPartitionResult()
+.setPartitionIndex(2)
+.setErrorCode((short) 47))))))),
+"{\"markers\":[{\"producerId\":\"9007199254740993\",\"topics\":[{\"topic\":\"orders\",\"partitions\":[{\"partition\":2,\"errorCode\":47}]}]}]}"));
+vectors.add(new Vector("writeTxnMarkers", "WriteTxnMarkersResponse", (short) 2, "error52",
+new WriteTxnMarkersResponseData()
+.setMarkers(Arrays.asList(new WriteTxnMarkersResponseData.WritableTxnMarkerResult()
+.setProducerId(9007199254740993L)
+.setTopics(Arrays.asList(new WriteTxnMarkersResponseData.WritableTxnMarkerTopicResult()
+.setName("orders")
+.setPartitions(Arrays.asList(new WriteTxnMarkersResponseData.WritableTxnMarkerPartitionResult()
+.setPartitionIndex(2)
+.setErrorCode((short) 52))))))),
+"{\"markers\":[{\"producerId\":\"9007199254740993\",\"topics\":[{\"topic\":\"orders\",\"partitions\":[{\"partition\":2,\"errorCode\":52}]}]}]}"));
+vectors.add(new Vector("writeTxnMarkers", "WriteTxnMarkersResponse", (short) 2, "error31",
+new WriteTxnMarkersResponseData()
+.setMarkers(Arrays.asList(new WriteTxnMarkersResponseData.WritableTxnMarkerResult()
+.setProducerId(9007199254740993L)
+.setTopics(Arrays.asList(new WriteTxnMarkersResponseData.WritableTxnMarkerTopicResult()
+.setName("orders")
+.setPartitions(Arrays.asList(new WriteTxnMarkersResponseData.WritableTxnMarkerPartitionResult()
+.setPartitionIndex(2)
+.setErrorCode((short) 31))))))),
+"{\"markers\":[{\"producerId\":\"9007199254740993\",\"topics\":[{\"topic\":\"orders\",\"partitions\":[{\"partition\":2,\"errorCode\":31}]}]}]}"));
+return vectors;
+}
+
   /** @return every vector this generator emits, in file order per API */
   private static List<Vector> vectors() {
+    List<Vector> transactionVectors = transactionAdmin();
     List<Vector> vectors = new ArrayList<>();
+    vectors.addAll(transactionVectors);
     vectors.addAll(consumerGroupHeartbeat());
     vectors.addAll(consumerGroupDescribe());
     vectors.addAll(listGroups());

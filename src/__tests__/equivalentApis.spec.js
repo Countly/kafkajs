@@ -1026,3 +1026,29 @@ it('R2§3:MaxConcurrentFetches', async () => {
   const [, second] = cluster.requests().filter(({ api, node }) => api === 'Fetch' && node === 1)
   expect(second.fields.topics[0].partitions[0]).toMatchObject({ partition: 1, fetchOffset: '1' })
 })
+
+it('R1§C:forceTerminateTransaction', async () => {
+  const createAdmin = require('../admin')
+  const request = require('../protocol/requests/initProducerId/v5/request')
+  const bodies = []
+  const broker = {
+    initProducerId: async (options) => {
+      bodies.push((await request(options).encode()).buffer.toString('hex'))
+      return { producerId: '9007199254740993', producerEpoch: 8 }
+    },
+  }
+  const cluster = {
+    findGroupCoordinator: async ({ coordinatorType }) => {
+      expect(coordinatorType).toBe(1)
+      return broker
+    },
+  }
+  const admin = createAdmin({ cluster, logger: logger(), retry })
+  const forceTerminateEquivalent = (id) => admin.fenceProducers({ transactionalIds: [id] })
+  const equivalent = await forceTerminateEquivalent('tx-a')
+  const direct = await admin.fenceProducers({ transactionalIds: ['tx-a'] })
+  expect(equivalent).toEqual(direct)
+  expect(bodies).toHaveLength(2)
+  expect(bodies[0]).toBe(bodies[1])
+  expect(admin.forceTerminateTransaction).toBeUndefined()
+})

@@ -1,3 +1,4 @@
+const createTransactions = require('./transactions')
 const { inspect } = require('util')
 const {
   retrierOf,
@@ -2575,6 +2576,7 @@ module.exports = ({
 
   return wrapAdmin(
     {
+      ...createTransactions({ cluster, retry }),
       connect,
       disconnect,
       listTopics,
@@ -2606,6 +2608,11 @@ module.exports = ({
       listPartitionReassignments,
     },
     {
+      describeProducers: 0,
+      describeTransactions: 0,
+      listTransactions: 0,
+      abortTransaction: 0,
+      fenceProducers: 0,
       listTopics: 0,
       createTopics: 0,
       deleteTopics: 0,

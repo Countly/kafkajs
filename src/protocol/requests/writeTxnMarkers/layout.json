@@ -1,0 +1,190 @@
+[
+  {
+    "message": "WriteTxnMarkersRequest",
+    "version": 1,
+    "case": "basic",
+    "hex": "02002000000000000100070002076f7264657273020000000200000000090000",
+    "fields": {
+      "markers": [
+        {
+          "producerId": "9007199254740993",
+          "producerEpoch": 7,
+          "transactionResult": false,
+          "topics": [
+            {
+              "topic": "orders",
+              "partitions": [2]
+            }
+          ],
+          "coordinatorEpoch": 9
+        }
+      ]
+    }
+  },
+  {
+    "message": "WriteTxnMarkersResponse",
+    "version": 1,
+    "case": "ok",
+    "hex": "02002000000000000102076f72646572730200000002000000000000",
+    "fields": {
+      "markers": [
+        {
+          "producerId": "9007199254740993",
+          "topics": [
+            {
+              "topic": "orders",
+              "partitions": [
+                {
+                  "partition": 2,
+                  "errorCode": 0
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "message": "WriteTxnMarkersRequest",
+    "version": 2,
+    "case": "basic",
+    "hex": "02002000000000000100070002076f726465727302000000020000000009000000",
+    "fields": {
+      "markers": [
+        {
+          "producerId": "9007199254740993",
+          "producerEpoch": 7,
+          "transactionResult": false,
+          "topics": [
+            {
+              "topic": "orders",
+              "partitions": [2]
+            }
+          ],
+          "coordinatorEpoch": 9,
+          "transactionVersion": 0
+        }
+      ]
+    }
+  },
+  {
+    "message": "WriteTxnMarkersResponse",
+    "version": 2,
+    "case": "ok",
+    "hex": "02002000000000000102076f72646572730200000002000000000000",
+    "fields": {
+      "markers": [
+        {
+          "producerId": "9007199254740993",
+          "topics": [
+            {
+              "topic": "orders",
+              "partitions": [
+                {
+                  "partition": 2,
+                  "errorCode": 0
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "message": "WriteTxnMarkersRequest",
+    "version": 2,
+    "case": "transactionVersionTwo",
+    "hex": "02002000000000000100070002076f726465727302000000020000000009020000",
+    "fields": {
+      "markers": [
+        {
+          "producerId": "9007199254740993",
+          "producerEpoch": 7,
+          "transactionResult": false,
+          "topics": [
+            {
+              "topic": "orders",
+              "partitions": [2]
+            }
+          ],
+          "coordinatorEpoch": 9,
+          "transactionVersion": 2
+        }
+      ]
+    }
+  },
+  {
+    "message": "WriteTxnMarkersResponse",
+    "version": 2,
+    "case": "error47",
+    "hex": "02002000000000000102076f72646572730200000002002f00000000",
+    "fields": {
+      "markers": [
+        {
+          "producerId": "9007199254740993",
+          "topics": [
+            {
+              "topic": "orders",
+              "partitions": [
+                {
+                  "partition": 2,
+                  "errorCode": 47
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "message": "WriteTxnMarkersResponse",
+    "version": 2,
+    "case": "error52",
+    "hex": "02002000000000000102076f72646572730200000002003400000000",
+    "fields": {
+      "markers": [
+        {
+          "producerId": "9007199254740993",
+          "topics": [
+            {
+              "topic": "orders",
+              "partitions": [
+                {
+                  "partition": 2,
+                  "errorCode": 52
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "message": "WriteTxnMarkersResponse",
+    "version": 2,
+    "case": "error31",
+    "hex": "02002000000000000102076f72646572730200000002001f00000000",
+    "fields": {
+      "markers": [
+        {
+          "producerId": "9007199254740993",
+          "topics": [
+            {
+              "topic": "orders",
+              "partitions": [
+                {
+                  "partition": 2,
+                  "errorCode": 31
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  }
+]

@@ -20,6 +20,7 @@ const sharedPromiseTo = require('../utils/sharedPromiseTo')
 const Long = require('../utils/long')
 const { ConnectionSetupPolicy, SetupAttempt } = require('./connectionSetup')
 const SASLAuthenticator = require('../broker/saslAuthenticator')
+const { attachResponseSource } = require('../broker/failureSource')
 const apiKeys = require('../protocol/requests/apiKeys')
 const { responseHeaderVersion, RESPONSE_HEADER_V1 } = require('../protocol/headers')
 
@@ -951,6 +952,7 @@ module.exports = class Connection {
 
       return data
     } catch (e) {
+      attachResponseSource(e, request.apiKey)
       if (logResponseError) {
         this.logError(`Response ${requestInfo(entry)}`, {
           error: e.message,
