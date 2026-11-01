@@ -326,8 +326,10 @@ module.exports = class Client {
    * @param {Object} options.ssl
    * @param {Object} options.sasl
    * @param {string} options.clientId
-   * @param {number} [options.connectionTimeout=1000] - in milliseconds
+   * @param {number} [options.connectionTimeout] Setup milliseconds; omitted base 10000 grows to 30000.
    * @param {number} options.authenticationTimeout - in milliseconds
+   * @param {number} [options.connectionsMaxIdle=540000] Idle milliseconds; 0 disables.
+   *   Must be an integer from 0 to 2147483647 or construction throws.
    * @param {number} options.reauthenticationThreshold - in milliseconds
    * @param {number} [options.requestTimeout=30000] - in milliseconds
    * @param {boolean} [options.enforceRequestTimeout]
@@ -353,6 +355,7 @@ module.exports = class Client {
     reconnectBackoff,
     reconnectBackoffMax,
     authenticationTimeout,
+    connectionsMaxIdle,
     reauthenticationThreshold,
     requestTimeout,
     enforceRequestTimeout = true,
@@ -384,6 +387,16 @@ module.exports = class Client {
     reconnectBackoffMax = setupPolicy.waitCeiling
     authenticationTimeout = setupPolicy.authenticationTimeout
     const validatedMaxResponseSize = validateMaxResponseSize(maxResponseSize)
+    if (
+      connectionsMaxIdle !== undefined &&
+      (!Number.isInteger(connectionsMaxIdle) ||
+        connectionsMaxIdle < 0 ||
+        connectionsMaxIdle > INT_32_MAX_VALUE)
+    ) {
+      throw new KafkaJSInvalidConfigurationError(
+        `connectionsMaxIdle must be an integer from 0 to ${INT_32_MAX_VALUE}`
+      )
+    }
     this[PRIVATE.MAX_RESPONSE_SIZE] = validatedMaxResponseSize
     const validatedMetadataRecoveryStrategy =
       validateMetadataRecoveryStrategy(metadataRecoveryStrategy)
@@ -418,6 +431,7 @@ module.exports = class Client {
         reconnectBackoffMax,
         setupPolicy,
         authenticationTimeout,
+        connectionsMaxIdle,
         reauthenticationThreshold,
         requestTimeout,
         enforceRequestTimeout,

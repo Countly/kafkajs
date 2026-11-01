@@ -127,3 +127,45 @@ it.each([
     seam.assertClean()
   }
 })
+
+{
+  const { Kafka, KafkaJSInvalidConfigurationError } = require('../../index')
+
+  describe('Idle connection options', () => {
+    test.each([-1, 1.1, NaN, Infinity, -Infinity, null, '1000', 'abc', true, {}, [], 2147483648])(
+      'rejects the invalid idle duration %# before dialing',
+      (connectionsMaxIdle) => {
+        const socketFactory = jest.fn()
+        expect(
+          () => new Kafka({ brokers: ['localhost:9092'], socketFactory, connectionsMaxIdle })
+        ).toThrow(KafkaJSInvalidConfigurationError)
+        expect(() => new Kafka({ brokers: ['localhost:9092'], connectionsMaxIdle })).toThrow(
+          'connectionsMaxIdle'
+        )
+        expect(socketFactory).not.toHaveBeenCalled()
+      }
+    )
+    test.each([
+      [undefined, 540000],
+      [0, 0],
+      [1, 1],
+      [2147483647, 2147483647],
+    ])(
+      'carries the idle duration through every constructor %#',
+      async (connectionsMaxIdle, expected) => {
+        const kafka = new Kafka({ brokers: ['localhost:9092'], ...{ connectionsMaxIdle } })
+        const key = Object.getOwnPropertySymbols(kafka).find(
+          ({ description }) => description === 'private:Kafka:createCluster'
+        )
+        const cluster = kafka[key]({})
+        const pool = await cluster.connectionPoolBuilder.build({ host: 'localhost', port: 9092 })
+        expect(pool.pool.map((connection) => connection.connectionsMaxIdle)).toEqual([
+          expected,
+          expected,
+        ])
+        expect(pool.pool.every((connection) => connection.socket == null)).toBe(true)
+        await pool.destroy({ drainTimeout: 0 })
+      }
+    )
+  })
+}

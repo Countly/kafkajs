@@ -56,6 +56,7 @@ module.exports = class RequestQueue extends EventEmitter {
 
     this.inflight = new Map()
     this.pending = []
+    this.lastActivityAt = Date.now()
 
     /**
      * Until when this request queue is throttled and shouldn't send requests
@@ -182,6 +183,7 @@ module.exports = class RequestQueue extends EventEmitter {
    * @param {PushedRequest} pushedRequest
    */
   push(pushedRequest) {
+    this.lastActivityAt = Date.now()
     const { correlationId } = pushedRequest.entry
     const socketRequest = this.createSocketRequest(pushedRequest)
 
@@ -215,6 +217,7 @@ module.exports = class RequestQueue extends EventEmitter {
     socketRequest.send()
 
     if (!socketRequest.expectResponse) {
+      this.lastActivityAt = socketRequest.sentAt
       this.logger.debug(`Request does not expect a response, resolving immediately`, {
         clientId: this.clientId,
         broker: this.broker,
@@ -239,6 +242,7 @@ module.exports = class RequestQueue extends EventEmitter {
    * @throws {Error} what sending a pending request, or an observer of that, threw
    */
   fulfillRequest({ correlationId, payload, size }) {
+    this.lastActivityAt = Date.now()
     const socketRequest = this.inflight.get(correlationId)
     this.inflight.delete(correlationId)
 
@@ -317,6 +321,16 @@ module.exports = class RequestQueue extends EventEmitter {
         cause: error,
       })
     } catch {}
+  }
+
+  /**
+   * Reports whether neither a queued nor an in-flight request exists. Encoding
+   * belongs to Connection and is checked there before this result permits reaping.
+   * @public
+   * @returns {boolean} true only when both populations are empty
+   */
+  isIdle() {
+    return this.pending.length === 0 && this.inflight.size === 0
   }
 
   /**

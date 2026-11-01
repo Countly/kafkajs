@@ -95,6 +95,7 @@ module.exports = class Cluster {
    * @param {string} options.clientId
    * @param {number} options.connectionTimeout - in milliseconds
    * @param {number} options.authenticationTimeout - in milliseconds
+   * @param {number} [options.connectionsMaxIdle] Idle milliseconds carried unchanged to each socket
    * @param {number} options.reauthenticationThreshold - in milliseconds
    * @param {number} [options.requestTimeout=30000] - in milliseconds
    * @param {boolean} [options.enforceRequestTimeout]
@@ -134,6 +135,7 @@ module.exports = class Cluster {
     reconnectBackoffMax,
     setupPolicy,
     authenticationTimeout,
+    connectionsMaxIdle,
     reauthenticationThreshold,
     requestTimeout = 30000,
     enforceRequestTimeout,
@@ -168,6 +170,7 @@ module.exports = class Cluster {
       reconnectBackoffMax,
       setupPolicy,
       authenticationTimeout,
+      connectionsMaxIdle,
       requestTimeout,
       drainTimeout: requestTimeout,
       enforceRequestTimeout,

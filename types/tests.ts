@@ -1618,3 +1618,12 @@ void closeResult
 void extensionValue
 void legacyCallback
 void helperCallback
+
+// Idle connection configuration remains optional in constructor inference.
+const idleConnectionConfig: ConstructorParameters<typeof Kafka>[0] = { brokers: ['localhost:9092'], connectionsMaxIdle: 0 }
+new Kafka(idleConnectionConfig)
+const idleConnectionArgs: ConstructorParameters<typeof Kafka> = [idleConnectionConfig]
+new Kafka(...idleConnectionArgs)
+new Kafka({ brokers: ['localhost:9092'], connectionsMaxIdle: 2147483647 })
+// @ts-expect-error new idle durations do not accept numeric strings
+new Kafka({ brokers: ['localhost:9092'], connectionsMaxIdle: '1000' })

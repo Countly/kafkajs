@@ -60,6 +60,12 @@ export interface KafkaConfig {
   reconnectBackoff?: number
   /** Retry wait ceiling, default 1000; at least its base. */
   reconnectBackoffMax?: number
+  /**
+   * Idle milliseconds before an empty connection is closed. Default 540000; 0 disables.
+   * Must be an integer 0..2147483647. The next request reconnects and renegotiates versions.
+   * Preparation, queued requests and in-flight requests prevent reaping.
+   */
+  connectionsMaxIdle?: number
   /** Whole SASL exchange cap in ms, including supplier work; default 10000. */
   authenticationTimeout?: number
   reauthenticationThreshold?: number

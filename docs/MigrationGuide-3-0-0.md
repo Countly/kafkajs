@@ -61,6 +61,8 @@ What to change to install the package and run it on a Kafka 4.x cluster.
 - **Timeout validation.** `connectionTimeout` and `authenticationTimeout` require integral values from 1 to 2147483647; legacy numeric strings are still accepted and converted. Zero, negative, fractional, non-finite, null and invalid types now throw `KafkaJSInvalidConfigurationError` at construction. The new maximum and backoff options accept numbers only; backoff permits zero. Some legacy authentication values and fractional connection values could work before. *What to do:* supply valid integers and a maximum at least its explicit base.
 - **`authenticationTimeout`.** The whole SASL exchange, including a token callback or IAM signer, now has a default 10000 ms cap. During broker setup it also fits within the remaining readiness budget. It previously sized the lock and credential blackout without enforcing this cap. *What to do:* raise `authenticationTimeout` for a slower callback or signer; OAuth helpers refresh ahead of time. Expiry is a retriable connection error; a broker credential rejection remains a non-retriable authentication error.
 
+- Connections idle for 9 minutes are closed by default; the next request reconnects. This is below the default broker idle timeout but does not guarantee close ordering or eliminate races. `connectionsMaxIdle: 0` keeps connections open as before.
+
 ### Producer
 
 - Remove the `kafkajs-snappy` registration to use the built-in codec, or keep it: yours wins. The built-in codec runs on the main thread (no native module), in short slices that yield to the event loop: about 100 MiB/s to decode, 40 MiB/s to encode

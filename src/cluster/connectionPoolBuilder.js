@@ -43,6 +43,7 @@ const parseBroker = (text) => {
  * @param {number} options.requestTimeout
  * @param {boolean} [options.enforceRequestTimeout]
  * @param {number} [options.connectionTimeout]
+ * @param {number} [options.connectionsMaxIdle] Idle milliseconds carried unchanged to each socket
  * @param {number|null} [options.maxInFlightRequests]
  * @param {number} [options.maxResponseSize] the response-size limit handed to every connection
  * @param {import("../../types").RetryOptions} [options.retry]
@@ -66,6 +67,7 @@ module.exports = ({
   reconnectBackoffMax,
   setupPolicy,
   authenticationTimeout,
+  connectionsMaxIdle,
   maxInFlightRequests,
   maxResponseSize,
   logger,
@@ -156,6 +158,7 @@ module.exports = ({
         reconnectBackoffMax,
         setupPolicy,
         authenticationTimeout,
+        connectionsMaxIdle,
         requestTimeout,
         drainTimeout,
         enforceRequestTimeout,

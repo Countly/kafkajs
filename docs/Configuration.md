@@ -322,6 +322,8 @@ const kafka = new Kafka({
 
 Invalid timeout/backoff values fail at construction with `KafkaJSInvalidConfigurationError` naming the option. The two legacy timeout options accept numeric strings; new options require numbers.
 
+`connectionsMaxIdle` closes a connection after 540000 ms of inactivity by default. Set it to `0` to keep idle connections open as before. It accepts integers from 0 to 2147483647; `undefined` uses the default. Numeric strings, `null`, fractions and non-finite values are rejected at construction with `KafkaJSInvalidConfigurationError`. A request being authenticated or encoded, a queued request and an in-flight request prevent reaping, including a long-poll Fetch. The next request reconnects and renegotiates ApiVersions. The client keeps TCP keepalive. The default is below the default broker idle timeout; it does not guarantee which side closes first or eliminate close races.
+
 ## Request Timeout
 
 Time in milliseconds to wait for a successful request. The default value is: `30000`.

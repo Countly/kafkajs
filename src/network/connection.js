@@ -95,6 +95,8 @@ module.exports = class Connection {
    * @param {number} [options.reconnectBackoff] Resolved retry wait base
    * @param {number} [options.reconnectBackoffMax] Resolved retry wait ceiling
    * @param {number} [options.authenticationTimeout] Whole-SASL cap in milliseconds
+   * @param {number} [options.connectionsMaxIdle=540000] Idle milliseconds; 0 disables.
+   *   Preparation, queued work and in-flight work prevent deliberate reaping.
    * @param {ConnectionSetupPolicy} [options.setupPolicy] Policy resolved before downstream defaults
    * @param {() => SetupAttempt} [options.beginSetup] Current shared node owner callback
    * @param {boolean} [options.enforceRequestTimeout]
@@ -126,6 +128,7 @@ module.exports = class Connection {
     clientId = 'kafkajs',
     connectionTimeout,
     authenticationTimeout,
+    connectionsMaxIdle = 540000,
     connectionTimeoutMax,
     reconnectBackoff,
     reconnectBackoffMax,
@@ -150,6 +153,10 @@ module.exports = class Connection {
 
     this.requestTimeout = requestTimeout
     this.connectionTimeout = connectionTimeout
+    this.connectionsMaxIdle = connectionsMaxIdle
+    this.preparing = 0
+    this.idleTimer = null
+    this.idleReadyAttempt = null
     this.setupPolicy =
       setupPolicy ||
       ConnectionSetupPolicy.resolve({
@@ -588,6 +595,10 @@ module.exports = class Connection {
    * @returns {void}
    */
   closeGeneration(error, socket = this.socket) {
+    clearTimeout(this.idleTimer)
+    this.idleTimer = null
+    this.idleReadyAttempt = null
+    this.preparing = 0
     this.cancelSetup(error)
     const abortConnect = this[PRIVATE.ABORT_CONNECT]
     this[PRIVATE.ABORT_CONNECT] = null
@@ -616,6 +627,71 @@ module.exports = class Connection {
     this.frames.reset()
     this.requestQueue.settleAll(error)
     this.requestQueue.destroy()
+  }
+
+  /**
+   * Starts idle accounting once this socket has reached its setup-ready boundary.
+   * Repeated ready notifications do not extend an existing idle period. The broker's
+   * primary socket is ready after versions and authentication; the dedicated Fetch
+   * socket uses the setup owner's transport-ready boundary.
+   * @private
+   * @returns {void}
+   */
+  markReady() {
+    if (!this.isConnected() || this.idleReadyAttempt === this.connectAttempt) return
+    this.idleReadyAttempt = this.connectAttempt
+    this.requestQueue.lastActivityAt = Date.now()
+    if (this.connectionsMaxIdle > 0) this.armIdle(this.connectionsMaxIdle)
+  }
+
+  /**
+   * Arms the one lazy idle deadline of the current socket. A cancelled callback is
+   * inert even when it is delivered after a replacement socket or timer exists.
+   * @private
+   * @param {number} afterMs milliseconds until the next eligibility check
+   * @returns {void}
+   */
+  armIdle(afterMs) {
+    clearTimeout(this.idleTimer)
+    const attempt = this.connectAttempt
+    const socket = this.socket
+    const timer = setTimeout(() => {
+      if (attempt !== this.connectAttempt || socket !== this.socket || this.idleTimer !== timer)
+        return
+      this.idleTimer = null
+      this.checkIdle()
+    }, afterMs)
+    this.idleTimer = timer
+    timer.unref()
+  }
+
+  /**
+   * Reaps only a ready, empty socket with no preparation in progress. Busy sockets
+   * wait a full period; recent activity waits only the remaining part. Deliberate
+   * reaping uses normal teardown and contributes no setup failure or new event.
+   * @private
+   * @returns {void}
+   */
+  checkIdle() {
+    if (!this.isConnected() || this.connectionsMaxIdle === 0) return
+    if (this.preparing > 0 || !this.requestQueue.isIdle()) {
+      this.armIdle(this.connectionsMaxIdle)
+      return
+    }
+    const idleFor = Date.now() - this.requestQueue.lastActivityAt
+    if (idleFor < this.connectionsMaxIdle) {
+      this.armIdle(this.connectionsMaxIdle - idleFor)
+      return
+    }
+    const closing = this.disconnect()
+    closing.catch((error) => {
+      try {
+        this.logError('Failed to close idle connection', { error })
+      } catch {}
+    })
+    try {
+      this.logDebug('Closing idle connection', { idleFor })
+    } catch {}
   }
 
   /**
@@ -679,6 +755,7 @@ module.exports = class Connection {
   finishSetup(attempt) {
     attempt.ready()
     if (this.setupAttempt === attempt) this.setupAttempt = null
+    this.markReady()
   }
 
   /**
@@ -695,6 +772,8 @@ module.exports = class Connection {
 
   /**
    * Shares one bounded SASL episode on this socket; never adopts a replacement token.
+   * Holds idle preparation once per episode, including token-provider work. An old
+   * episode cannot decrement preparation on the replacement connection.
    * @param {{ attempt?: SetupAttempt }} [options] Broker setup budget when applicable
    * @returns {Promise<void>}
    * @throws {KafkaJSConnectionError} when the whole SASL phase expires
@@ -720,6 +799,7 @@ module.exports = class Connection {
         : null)
     const episode = { budget, promise: null }
     this.authEpisode = episode
+    this.preparing += 1
     if (!attempt)
       budget.arm((error) => {
         if (this.connectAttempt === epoch && this.socket === socket) this.failGeneration(error)
@@ -740,6 +820,7 @@ module.exports = class Connection {
         budget.fail(error)
         throw error
       } finally {
+        if (epoch === this.connectAttempt) this.preparing -= 1
         if (this.authEpisode === episode) this.authEpisode = null
       }
     })()
@@ -811,24 +892,31 @@ module.exports = class Connection {
     responseGuard = null,
   }) {
     const attempt = this.connectAttempt
-    const expectResponse = !request.expectResponse || request.expectResponse()
-    const prepared = this[PRIVATE.PREPARE]({ request, expectResponse, guard })
-    const enqueue = (encoded) => this[PRIVATE.ENQUEUE](encoded, requestTimeout, attempt, guard)
+    this.preparing += 1
+    let answered
+    let expectResponse
+    try {
+      expectResponse = !request.expectResponse || request.expectResponse()
+      const prepared = this[PRIVATE.PREPARE]({ request, expectResponse, guard })
+      const enqueue = (encoded) => this[PRIVATE.ENQUEUE](encoded, requestTimeout, attempt, guard)
 
-    let queued
-    if (isAuthenticatedRequest(request)) {
-      // It may reject before the chain reaches it; marked handled so Node does not report it.
-      prepared.catch(() => {})
-      queued = this[PRIVATE.QUEUED].then(() => prepared).then(enqueue)
-      this[PRIVATE.QUEUED] = queued.then(
-        () => {},
-        () => {}
-      )
-    } else {
-      queued = prepared.then(enqueue)
+      let queued
+      if (isAuthenticatedRequest(request)) {
+        // It may reject before the chain reaches it; marked handled so Node does not report it.
+        prepared.catch(() => {})
+        queued = this[PRIVATE.QUEUED].then(() => prepared).then(enqueue)
+        this[PRIVATE.QUEUED] = queued.then(
+          () => {},
+          () => {}
+        )
+      } else {
+        queued = prepared.then(enqueue)
+      }
+
+      ;({ answered } = await queued)
+    } finally {
+      if (attempt === this.connectAttempt) this.preparing -= 1
     }
-
-    const { answered } = await queued
     const { correlationId, size, entry, payload } = await answered
 
     if (!expectResponse) {

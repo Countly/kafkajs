@@ -155,6 +155,8 @@ Versions before 3.0.0 are internal alpha tags and are not published.
 
 #### Behavior changes
 
+- **Idle connections are closed after 9 minutes** (540 000 ms, Java's `connections.max.idle.ms`; 2.2.4 never closed them) and reopened by the next request, with one more ApiVersions round trip: "Connections idle for 9 minutes are closed by default; the next request reconnects. This is below the default broker idle timeout but does not guarantee close ordering or eliminate races. `connectionsMaxIdle: 0` keeps connections open as before."
+
 - `connectionTimeout` defaults to 10 000 ms and grows per node, with jitter, up to `connectionTimeoutMax` (30 000 ms) while a node keeps failing; it resets when the node is ready. A value you set stays flat. Java's `socket.connection.setup.timeout.ms` (KIP-601).
 - A broker must be ready (TCP, TLS, ApiVersions, SASL) within the setup timeout; a stalled ApiVersions or SASL exchange no longer waits for `requestTimeout`.
 - `authenticationTimeout` now bounds the SASL exchange (it only sized the blackout before). A token callback slower than 10 s needs a larger value.
@@ -164,10 +166,14 @@ Versions before 3.0.0 are internal alpha tags and are not published.
 
 #### Additions
 
+- `connectionsMaxIdle`.
+
 - New client options `connectionTimeoutMax`, `reconnectBackoff` and `reconnectBackoffMax`; `authenticationTimeout` is now enforced.
 - `oauthBearer.clientCredentials`, `jwtBearer`, `fileToken` and `signAssertion` build the existing `oauthBearerProvider` callback with a single-flight token cache; recipes for discovery, token exchange, mTLS and KMS-held keys are in `docs/OAuth.md`.
 
 #### Tooling
+
+- The request-queue stamp benchmark.
 
 - `blackhole(id)` in the scripted cluster and the connection-setup benchmark.
 - Track the nineteen admin-ledger APIs in the compatibility snapshot, the tracked list and the generated matrix, with named broker ranges.
