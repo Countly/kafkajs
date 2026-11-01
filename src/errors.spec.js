@@ -983,3 +983,12 @@ describe('rebalance listener failure identity', () => {
     expect(packageEntry.KafkaJSRebalanceListenerError).toBe(errors.KafkaJSRebalanceListenerError)
   })
 })
+
+test('create-topic detail does not replace the protocol message', () => {
+  const { KafkaJSCreateTopicError } = require('./errors')
+  const source = require('./protocol/error').createErrorFromCode(36)
+  const error = new KafkaJSCreateTopicError(source, 't', 'broker detail')
+  expect(error.message).toBe(source.message)
+  expect(error.errorMessage).toBe('broker detail')
+  expect(new KafkaJSCreateTopicError(source, 't').errorMessage).toBeNull()
+})

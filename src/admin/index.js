@@ -16,6 +16,7 @@ const { events, wrap: wrapEvent, unwrap: unwrapEvent } = require('./instrumentat
 const { LEVELS } = require('../loggers')
 const {
   KafkaJSNonRetriableError,
+  KafkaJSInvalidConfigurationError,
   KafkaJSDeleteGroupsError,
   KafkaJSBrokerNotFound,
   KafkaJSDeleteTopicRecordsError,
@@ -39,6 +40,24 @@ const ACL_OPERATION_TYPES = require('../protocol/aclOperationTypes')
 const ACL_PERMISSION_TYPES = require('../protocol/aclPermissionTypes')
 const RESOURCE_PATTERN_TYPES = require('../protocol/resourcePatternTypes')
 const { EARLIEST_OFFSET, LATEST_OFFSET } = require('../constants')
+
+/** Maps the public isolation option without changing shared cluster defaults.
+ * @param {object} [options] invocation options, including its inherited API budget
+ * @returns {number} the ListOffsets isolation byte
+ * @throws {KafkaJSInvalidConfigurationError} for an invalid new option
+ */
+const isolationOf = (options = {}) => {
+  if (options === null || typeof options !== 'object' || Array.isArray(options)) {
+    throw new KafkaJSInvalidConfigurationError('isolationLevel options must be an object')
+  }
+  const { isolationLevel = 'read_committed' } = options
+  if (!['read_committed', 'read_uncommitted'].includes(isolationLevel)) {
+    throw new KafkaJSInvalidConfigurationError(
+      'isolationLevel must be read_committed or read_uncommitted'
+    )
+  }
+  return isolationLevel === 'read_committed' ? 1 : 0
+}
 
 const { CONNECT, DISCONNECT } = events
 
@@ -557,7 +576,7 @@ module.exports = ({
 
     const everyTopicCreated = outcome.finish(outstanding)
 
-    if (waitForLeaders && outcome.created.size > 0) {
+    if (!validateOnly && waitForLeaders && outcome.created.size > 0) {
       checked(
         await waitOf(async () =>
           retryOnLeaderNotAvailable(
@@ -710,10 +729,15 @@ module.exports = ({
   }
 
   /**
-   * @param {string} topic
+   * Reads low and high offsets at the selected isolation; the default remains committed.
+   * @param {string} topic topic name
+   * @param {object} [options] isolationLevel and apiTimeout
+   * @returns {Promise<object[]>} partition low/high decimal offsets
+   * @throws {Error} validation, deadline or broker failure
    */
 
-  const fetchTopicOffsets = async (topic) => {
+  const fetchTopicOffsets = async (topic, options) => {
+    const isolationLevel = isolationOf(options)
     if (!topic || typeof topic !== 'string') {
       throw new KafkaJSNonRetriableError(`Invalid topic ${topic}`)
     }
@@ -728,25 +752,31 @@ module.exports = ({
         const metadata = cluster.findTopicPartitionMetadata(topic)
         const high = checked(
           await waitOf(async () =>
-            cluster.fetchTopicsOffset([
-              {
-                topic,
-                fromBeginning: false,
-                partitions: metadata.map((p) => ({ partition: p.partitionId })),
-              },
-            ])
+            cluster.fetchTopicsOffset(
+              [
+                {
+                  topic,
+                  fromBeginning: false,
+                  partitions: metadata.map((p) => ({ partition: p.partitionId })),
+                },
+              ],
+              { isolationLevel }
+            )
           )
         )
 
         const low = checked(
           await waitOf(async () =>
-            cluster.fetchTopicsOffset([
-              {
-                topic,
-                fromBeginning: true,
-                partitions: metadata.map((p) => ({ partition: p.partitionId })),
-              },
-            ])
+            cluster.fetchTopicsOffset(
+              [
+                {
+                  topic,
+                  fromBeginning: true,
+                  partitions: metadata.map((p) => ({ partition: p.partitionId })),
+                },
+              ],
+              { isolationLevel }
+            )
           )
         )
 
@@ -774,10 +804,14 @@ module.exports = ({
 
   /**
    * @param {string} topic
-   * @param {number} [timestamp]
+   * @param {number} [timestamp] timestamp in milliseconds
+   * @param {object} [options] isolationLevel and apiTimeout
+   * @returns {Promise<object[]>} partition decimal offsets, falling back to high on no match
+   * @throws {Error} validation, deadline or broker failure
    */
 
-  const fetchTopicOffsetsByTimestamp = async (topic, timestamp) => {
+  const fetchTopicOffsetsByTimestamp = async (topic, timestamp, options) => {
+    const isolationLevel = isolationOf(options)
     if (!topic || typeof topic !== 'string') {
       throw new KafkaJSNonRetriableError(`Invalid topic ${topic}`)
     }
@@ -794,26 +828,32 @@ module.exports = ({
 
         const high = checked(
           await waitOf(async () =>
-            cluster.fetchTopicsOffset([
-              {
-                topic,
-                fromBeginning: false,
-                partitions,
-              },
-            ])
+            cluster.fetchTopicsOffset(
+              [
+                {
+                  topic,
+                  fromBeginning: false,
+                  partitions,
+                },
+              ],
+              { isolationLevel }
+            )
           )
         )
         const { partitions: highPartitions } = high.pop()
 
         const offsets = checked(
           await waitOf(async () =>
-            cluster.fetchTopicsOffset([
-              {
-                topic,
-                fromTimestamp: timestamp,
-                partitions,
-              },
-            ])
+            cluster.fetchTopicsOffset(
+              [
+                {
+                  topic,
+                  fromTimestamp: timestamp,
+                  partitions,
+                },
+              ],
+              { isolationLevel }
+            )
           )
         )
         const { partitions: lowPartitions } = offsets.pop()

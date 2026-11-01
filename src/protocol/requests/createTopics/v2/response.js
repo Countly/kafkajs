@@ -33,7 +33,12 @@ const parse = async (data) => {
     throw new KafkaJSAggregateError(
       'Topic creation errors',
       topicsWithError.map(
-        (error) => new KafkaJSCreateTopicError(createErrorFromCode(error.errorCode), error.topic)
+        (error) =>
+          new KafkaJSCreateTopicError(
+            createErrorFromCode(error.errorCode),
+            error.topic,
+            error.errorMessage ?? null
+          )
       )
     )
   }

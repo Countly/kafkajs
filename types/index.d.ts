@@ -976,9 +976,9 @@ listTopics(): Promise<string[]>
     topics?: string[]
     resolveOffsets?: boolean
   }) & ApiTimeoutOption): Promise<Array<{ topic: string; partitions: FetchOffsetsPartition[] }>>
-  fetchTopicOffsets(topic: string, options?: ApiTimeoutOption): Promise<Array<SeekEntry & { high: string; low: string }>>
+  fetchTopicOffsets(topic: string, options?: ApiTimeoutOption & { isolationLevel?: 'read_committed' | 'read_uncommitted' }): Promise<Array<SeekEntry & { high: string; low: string }>>
 fetchTopicOffsets(topic: string): Promise<Array<SeekEntry & { high: string; low: string }>>
-  fetchTopicOffsetsByTimestamp(topic: string, timestamp?: number, options?: ApiTimeoutOption): Promise<Array<SeekEntry>>
+  fetchTopicOffsetsByTimestamp(topic: string, timestamp?: number, options?: ApiTimeoutOption & { isolationLevel?: 'read_committed' | 'read_uncommitted' }): Promise<Array<SeekEntry>>
 fetchTopicOffsetsByTimestamp(topic: string, timestamp?: number): Promise<Array<SeekEntry>>
   describeCluster(options?: ApiTimeoutOption): Promise<{
     brokers: Array<{ nodeId: number; host: string; port: number }>
@@ -998,7 +998,9 @@ describeCluster(): Promise<{
     /** Ask for each entry's `documentation`; sent from DescribeConfigs v3. */
     includeDocumentation?: boolean
   }) & ApiTimeoutOption): Promise<DescribeConfigResponse>
-  alterConfigs(configs: ({ validateOnly: boolean; resources: IResourceConfig[] }) & ApiTimeoutOption): Promise<any>
+  alterConfigs(configs: ({ validateOnly: boolean; resources: IResourceConfig[] }) & ApiTimeoutOption): Promise<{
+    resources: Array<{ resourceType: number; resourceName: string; errorCode: number; errorMessage: string | null }>
+  }>
   /**
    * A failed resource is a result with its own `errorCode`, not an error; `NOT_CONTROLLER` is
    * retried. An invalid argument throws `KafkaJSNonRetriableError` before anything is sent.
@@ -2489,7 +2491,8 @@ export class KafkaJSAlterPartitionReassignmentsError extends KafkaJSProtocolErro
  */
 export class KafkaJSCreateTopicError extends KafkaJSProtocolError {
   readonly topic?: string
-  constructor(e: Error | string, topicName?: string)
+  readonly errorMessage: string | null
+  constructor(e: Error | string, topicName?: string, errorMessage?: string | null)
 }
 
 export class KafkaJSNumberOfRetriesExceeded extends KafkaJSNonRetriableError {
@@ -2578,7 +2581,7 @@ export class KafkaJSNoBrokerAvailableError extends KafkaJSError {
   constructor()
 }
 
-export class KafkaJSPartialMessageError extends KafkaJSError {
+export class KafkaJSPartialMessageError extends KafkaJSNonRetriableError {
   constructor()
   /**
    * @deprecated The Fetch decoder no longer sets it: a record-batch CRC32C mismatch (see
@@ -2587,27 +2590,27 @@ export class KafkaJSPartialMessageError extends KafkaJSError {
   crcMismatch?: boolean
 }
 
-export class KafkaJSSASLAuthenticationError extends KafkaJSError {
+export class KafkaJSSASLAuthenticationError extends KafkaJSNonRetriableError {
   constructor()
 }
 
-export class KafkaJSGroupCoordinatorNotFound extends KafkaJSError {
+export class KafkaJSGroupCoordinatorNotFound extends KafkaJSNonRetriableError {
   constructor()
 }
 
-export class KafkaJSNotImplemented extends KafkaJSError {
+export class KafkaJSNotImplemented extends KafkaJSNonRetriableError {
   constructor()
 }
 
-export class KafkaJSTimeout extends KafkaJSError {
+export class KafkaJSTimeout extends KafkaJSNonRetriableError {
   constructor()
 }
 
-export class KafkaJSLockTimeout extends KafkaJSError {
+export class KafkaJSLockTimeout extends KafkaJSTimeout {
   constructor()
 }
 
-export class KafkaJSUnsupportedMagicByteInMessageSet extends KafkaJSError {
+export class KafkaJSUnsupportedMagicByteInMessageSet extends KafkaJSNonRetriableError {
   constructor()
 }
 

@@ -85,15 +85,15 @@ describe('Admin > createTopics > waiting for the new topics to have leaders', ()
     expect(metadata).toHaveBeenCalledTimes(1)
   })
 
-  it('fails at once with the broker’s answer when the request only validates, since no topic is on its way', async () => {
+  it('does not wait for leaders when the request only validates', async () => {
     const metadata = failing(UNKNOWN_TOPIC_OR_PARTITION, UNKNOWN_TOPIC_OR_PARTITION)
     const { admin } = adminWith(metadata)
 
-    await expect(
-      admin.createTopics({ topics, validateOnly: true, timeout: 5000 })
-    ).rejects.toMatchObject({ type: 'UNKNOWN_TOPIC_OR_PARTITION' })
+    await expect(admin.createTopics({ topics, validateOnly: true, timeout: 5000 })).resolves.toBe(
+      true
+    )
 
-    expect(metadata).toHaveBeenCalledTimes(1)
+    expect(metadata).not.toHaveBeenCalled()
   })
 
   it('does not ask for leaders when waitForLeaders is false', async () => {

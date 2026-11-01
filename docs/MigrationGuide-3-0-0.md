@@ -1137,6 +1137,8 @@ Admin calls take an `apiTimeout` (default 60 000 ms) and reject with `KafkaJSTim
 
 Describe calls can request the optional raw authorized-operations mask; an unsupported field returns null. The mask stays an optional `number | null`, with the signed INT32 value preserved. No mask-type migration is required.
 
+Topic-offset reads accept isolationLevel: 'read_committed' (the unchanged default) or 'read_uncommitted'. During an open transaction, the default high is the last stable offset; use read_uncommitted for high-watermark committed lag and a raw fetchOffsets read with resolveOffsets: false. Missing commits are distinct from zero. Broker errorMessage is separate from stable protocol messages. deleteTopicRecords still returns Promise<void>; inspect the existing error/cause chain for its failing partitions and read low watermarks with fetchTopicOffsets. listTopics remains string[]; fetchTopicMetadata() provides topicId and isInternal from the same fresh Metadata snapshot.
+
 ### Errors and events
 
 Error classes and categories, new instrumentation events and the payload keys they gain, and what is
@@ -1447,3 +1449,5 @@ The runtime is unchanged by these; they can fail `tsc` on an existing codebase.
   table, which are strings; the declaration said `number[]`. Under `strict` a comparison such as
   `ids[0] === 1` is `TS2367` and `ids.includes(1)` is `TS2345`. Compare with `String(id)` or
   convert the element with `Number(id)`. The runtime is unchanged.
+The declared bases of KafkaJSPartialMessageError, KafkaJSSASLAuthenticationError, KafkaJSGroupCoordinatorNotFound, KafkaJSNotImplemented, KafkaJSTimeout and KafkaJSUnsupportedMagicByteInMessageSet now match KafkaJSNonRetriableError. KafkaJSLockTimeout extends KafkaJSTimeout. Runtime inheritance is unchanged.
+

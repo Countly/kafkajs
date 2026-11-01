@@ -176,6 +176,8 @@ Versions before 3.0.0 are internal alpha tags and are not published.
 - New client options `connectionTimeoutMax`, `reconnectBackoff` and `reconnectBackoffMax`; `authenticationTimeout` is now enforced.
 - `oauthBearer.clientCredentials`, `jwtBearer`, `fileToken` and `signAssertion` build the existing `oauthBearerProvider` callback with a single-flight token cache; recipes for discovery, token exchange, mTLS and KMS-held keys are in `docs/OAuth.md`.
 
+- Admin topic-offset reads accept an optional isolationLevel, defaulting to read_committed; read_uncommitted reads the high watermark. Legacy alterConfigs errors and KafkaJSCreateTopicError expose broker errorMessage separately from their stable messages.
+
 #### Tooling
 
 - Live scenarios for the connection setup budget and idle reaping; the soak's idle profile asserts that sockets are reaped and reopened.

@@ -214,9 +214,11 @@ const { topics } = await admin.fetchTopicMetadata({
 })
 ```
 
+`listTopics()` returns only names as `string[]`. `fetchTopicMetadata()` with no topics returns all those topics with `name`, `topicId`, `isInternal` and partition detail from one fresh Metadata request. Omitted `topicId` support is represented as null. Listing all topics does not add them to the target-topic set.
+
 ## <a name="fetch-topic-offsets"></a> Fetch topic offsets
 
-`fetchTopicOffsets` returns most recent offset for a topic.
+`fetchTopicOffsets(topic, options)` returns partition offsets, with `offset` equal to `high`. `options.isolationLevel` is `'read_committed'` by default or `'read_uncommitted'`. During an open transaction, the committed high is the last stable offset; the uncommitted high is the high watermark. `low` is the earliest retained offset. The existing no-options call keeps its default. `options.apiTimeout` bounds this invocation, independently of broker timeouts.
 
 ```javascript
 await admin.fetchTopicOffsets(topic)
@@ -232,6 +234,8 @@ await admin.fetchTopicOffsets(topic)
 
 Specify a `timestamp` to get the earliest offset on each partition where the message's timestamp is greater than or equal to the given timestamp.
 
+The optional third argument accepts the same `isolationLevel` and `apiTimeout`. Both the timestamp lookup and its high-offset fallback use that isolation. The default stays `'read_committed'`.
+
 ```javascript
 await admin.fetchTopicOffsetsByTimestamp(topic, timestamp)
 // [
@@ -239,6 +243,37 @@ await admin.fetchTopicOffsetsByTimestamp(topic, timestamp)
 //   { partition: 1, offset: '3113' },
 // ]
 ```
+
+## Committed lag
+
+Committed lag and processing lag measure different positions. Read group commits from the broker with `resolveOffsets: false` and the high watermark with `isolationLevel: 'read_uncommitted'`. The recipe below uses `BigInt` over decimal strings and reports an absent commit separately; its lag then covers the retained log from `low`. An omitted response partition is an invalid observation, not evidence of an absent commit.
+
+```javascript
+/** Computes committed lag from fresh broker observations, using lossless decimal arithmetic.
+ * @param {object} admin connected admin client
+ * @param {string} groupId group to observe
+ * @param {string} topic topic to observe
+ * @returns {Promise<object[]>} partition, hasCommit and decimal lag
+ * @throws {Error} broker refusal or an omitted requested partition
+ */
+async function committedLagFor(admin, groupId, topic) {
+  const fetched = await admin.fetchOffsets({ groupId, topics: [topic], resolveOffsets: false })
+  const bounds = await admin.fetchTopicOffsets(topic, { isolationLevel: 'read_uncommitted' })
+  const offsets = fetched.find((row) => row.topic === topic)?.partitions ?? []
+  return bounds.map(({ partition, high, low }) => {
+    const raw = offsets.find((row) => row.partition === partition)
+    if (!raw) throw new Error('The broker omitted a requested partition')
+    const hasCommit = raw.offset !== '-1'
+    return {
+      partition,
+      hasCommit,
+      lag: (BigInt(high) - BigInt(hasCommit ? raw.offset : low)).toString(),
+    }
+  })
+}
+```
+
+Batch processing lag is `HW - (lastBatchOffset + 1)`. It equals committed lag only after the committed **next** offset equals that exact batch-next offset at a stable high watermark, with no append between observations. For high100/lastBatch19, batch lag80 and commits0/20/50 give committed lag100/80/50. Merely selecting the same isolation does not align positions.
 
 ## <a name="fetch-offsets"></a> Fetch consumer group offsets
 
@@ -445,6 +480,19 @@ Example response:
     throttleTime: 0
 }
 ```
+
+## Validation-only requests and broker messages
+
+`createTopics`, `createPartitions`, `alterConfigs` and `incrementalAlterConfigs` accept `validateOnly: true`. Their validation request does not apply a mutation or make a follow-up request to wait for effects. Other methods support it only when their request schema has that field; a read-only or destructive method without the field does not gain validation behavior. Broker `errorMessage` is a separate `string | null` on legacy AlterConfigs errors/results and on `KafkaJSCreateTopicError`; stable `message`, class, type, code and retry properties retain their meanings. An empty broker message remains an empty string.
+
+| Method | Wire validation field | Minimum version |
+| --- | --- | --- |
+| `createTopics` | `validateOnly` | v1 |
+| `createPartitions` | `ValidateOnly` | v0 |
+| `alterConfigs` | `ValidateOnly` | v0 |
+| `incrementalAlterConfigs` | `ValidateOnly` | v0 |
+
+Destructive methods such as `deleteTopics`, `deleteTopicRecords` and offset deletion have no validation flag. Membership changes, ACL mutations and partition reassignments likewise have no validation field; reads and lifecycle calls do not validate mutations.
 
 ## <a name="alter-configs"></a> Alter configs
 
@@ -784,6 +832,8 @@ Delete records for a selected topic. This will delete all records from the earli
 Note that you cannot delete records in an arbitrary range (it will always be from the earliest available offset)
 
 The topic's offsets are read first, by a metadata request that names the topic: a partition without a leader is waited for within the `retry` budget, and one that stays without a leader fails the call as it fails `fetchTopicOffsets`, with a `KafkaJSNonRetriableError` whose `type` is `LEADER_NOT_AVAILABLE`, before anything is deleted. Each partition's request then goes to the leader the metadata names. A request that fails with a retriable error, such as a lost connection, is retried within the `retry` budget, at the same broker, and a broker that already deleted its partitions is not asked again; once the budget is spent the call rejects with `KafkaJSNumberOfRetriesExceeded`, whose `cause` is the last error. A partition the topic does not have rejects at once with `KafkaJSDeleteTopicRecordsError`, before anything is deleted, once that offsets read has succeeded: on a topic that stays without a leader, the offsets read fails first, with the `KafkaJSNonRetriableError` above.
+
+This call returns `Promise<void>`: full success resolves to `undefined` only after all requested partitions succeed. A partial broker refusal retains the existing error shape: the typed `KafkaJSDeleteTopicRecordsError` in the error/cause chain lists only failing partitions and their errors. A non-retriable broker refusal keeps its `KafkaJSNonRetriableError` wrapper; exhausted retries keep `KafkaJSNumberOfRetriesExceeded`. A successful broker is not sent again on retries. This method returns no low watermarks; read them with `fetchTopicOffsets`.
 
 ```javascript
 await admin.deleteTopicRecords({

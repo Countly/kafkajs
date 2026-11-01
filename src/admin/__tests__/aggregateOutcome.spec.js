@@ -550,18 +550,16 @@ describe('Admin > createTopics > an answer that names only some topics', () => {
       expect(broker.metadata).not.toHaveBeenCalled()
     })
 
-    test('fails at once with the broker’s answer for a request that only validates, since no topic is on its way', async () => {
+    test('does not wait for leaders after a validation-only request, including after a retry', async () => {
       const { admin, broker } = adminAnswering('createTopics', [
         topicsAnswer(['a', REQUEST_TIMED_OUT]),
         topicsAnswer(['a', OK]),
       ])
       broker.metadata.mockRejectedValue(createErrorFromCode(UNKNOWN_TOPIC_OR_PARTITION))
 
-      await expect(create(admin, { validateOnly: true })).rejects.toMatchObject({
-        type: 'UNKNOWN_TOPIC_OR_PARTITION',
-      })
+      await expect(create(admin, { validateOnly: true })).resolves.toBe(true)
 
-      expect(broker.metadata).toHaveBeenCalledTimes(1)
+      expect(broker.metadata).not.toHaveBeenCalled()
       expect(broker.createTopics.mock.calls.map(([request]) => request.validateOnly)).toEqual([
         true,
         true,

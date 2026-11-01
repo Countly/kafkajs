@@ -1,3 +1,4 @@
+import { KafkaJSPartialMessageError, KafkaJSSASLAuthenticationError, KafkaJSGroupCoordinatorNotFound, KafkaJSNotImplemented, KafkaJSTimeout, KafkaJSUnsupportedMagicByteInMessageSet, Admin } from './index'
 import * as fs from 'fs'
 
 import * as kafkajs from './index'
@@ -1662,3 +1663,19 @@ deadlineAdmin.describeGroups(['g'], { includeAuthorizedOperations: 1 })
 // @ts-expect-error topic flags have boolean type
 deadlineAdmin.fetchTopicMetadata({ includeTopicAuthorizedOperations: 'true' })
 void adminDeadlineConfig
+
+const inheritedNonRetriableErrors: KafkaJSNonRetriableError[] = [
+  new KafkaJSPartialMessageError(), new KafkaJSSASLAuthenticationError(),
+  new KafkaJSGroupCoordinatorNotFound(), new KafkaJSNotImplemented(),
+  new KafkaJSTimeout(), new KafkaJSUnsupportedMagicByteInMessageSet(),
+]
+const inheritedLockTimeout: KafkaJSTimeout = new KafkaJSLockTimeout()
+const createTopicDetail: string | null = new KafkaJSCreateTopicError(new Error('stable'), 't', 'detail').errorMessage
+async function offsetIsolationOptions(admin: Admin) {
+  await admin.fetchTopicOffsets('t', {isolationLevel: 'read_uncommitted', apiTimeout: 10})
+  await admin.fetchTopicOffsetsByTimestamp('t', 123, {isolationLevel: 'read_committed'})
+  // @ts-expect-error isolation is an exact lower-case value
+  await admin.fetchTopicOffsets('t', {isolationLevel: 'READ_COMMITTED'})
+  const deleting: () => Promise<void> = () => admin.deleteTopicRecords({topic: 't', partitions: [{partition: 0, offset: '1'}]})
+  return deleting
+}
