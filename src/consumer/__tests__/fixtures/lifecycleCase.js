@@ -1,3 +1,4 @@
+const { performance: monotonicClock } = require('node:perf_hooks')
 const { Kafka } = require('../../../../index')
 const Runner = require('../../runner')
 const RequestQueue = require('../../../network/requestQueue')
@@ -34,6 +35,8 @@ const pump = async (predicate, label) => {
 /**
  * Drives one reviewed lifecycle cell through public factories and the real wire stack. Spies
  * hold existing boundaries; they add no production export or alternate membership machine.
+ * Forced before-handler cells share the disconnect clock so timeout zero expires before natural
+ * stop can reach the fetch manager. After teardown, force cells must start no more fetch rounds.
  * @param {{ event: string, boundary: string, protocol: string, membership: string }} cell
  * @returns {Promise<void>}
  */
@@ -58,6 +61,7 @@ const runLifecycleCell = async (cell) => {
   }
   process.on('unhandledRejection', unhandled)
   let runner
+  let fetchRounds
   let consumer
   let enabled = false
   let used = false
@@ -65,6 +69,8 @@ const runLifecycleCell = async (cell) => {
   let starting
   let initialGate
   const spies = []
+  if (cell.event === 'force' && cell.boundary === 'before-handler')
+    spies.push(jest.spyOn(performance, 'now').mockImplementation(() => monotonicClock.now()))
   const cleanup = []
   const pending = []
   const settled = (promise) => {
@@ -246,6 +252,7 @@ const runLifecycleCell = async (cell) => {
       })
     )
     await pump(() => runner != null, 'runner capture')
+    fetchRounds = jest.spyOn(runner, 'fetch')
     if (
       ![
         'in-join',
@@ -474,6 +481,8 @@ const runLifecycleCell = async (cell) => {
         expect(group.ownership.refusal(token).cause.type).toBe('POLL_INTERVAL_EXCEEDED')
       }
     }
+    if (cell.event === 'force' && cell.boundary === 'before-handler')
+      await pump(() => event.done, 'forced close before handler release')
     release()
     cleanup.forEach((fn) => fn())
     await pump(() => event.done, 'event completion')
@@ -547,6 +556,14 @@ const runLifecycleCell = async (cell) => {
       expect(listeners()).toBe(0)
       expect(process.listenerCount('unhandledRejection')).toBe(baseline.unhandled)
       expect(jest.getTimerCount()).toBe(baseline.timers)
+      if (cell.event === 'force') {
+        const fetched = fetchRounds.mock.calls.length
+        for (let step = 0; step < 20; step++) {
+          await new Promise(setImmediate)
+          await jest.advanceTimersByTimeAsync(1)
+        }
+        expect(fetchRounds.mock.calls.length).toBe(fetched)
+      }
     }
   }
 }
