@@ -1,0 +1,99 @@
+[
+  {
+    "message": "UpdateFeaturesRequest",
+    "version": 0,
+    "case": "basic",
+    "fields": {
+      "timeoutMs": 60000,
+      "featureUpdates": [
+        {
+          "feature": "metadata.version",
+          "maxVersionLevel": 25,
+          "allowDowngrade": false
+        }
+      ]
+    },
+    "hex": "0000ea6002116d657461646174612e76657273696f6e0019000000"
+  },
+  {
+    "message": "UpdateFeaturesResponse",
+    "version": 0,
+    "case": "mixed",
+    "fields": {
+      "throttleTimeMs": 17,
+      "errorCode": 0,
+      "errorMessage": null,
+      "results": [
+        {
+          "feature": "metadata.version",
+          "errorCode": 42,
+          "errorMessage": "invalid feature"
+        }
+      ]
+    },
+    "hex": "0000001100000002116d657461646174612e76657273696f6e002a10696e76616c696420666561747572650000"
+  },
+  {
+    "message": "UpdateFeaturesRequest",
+    "version": 1,
+    "case": "basic",
+    "fields": {
+      "timeoutMs": 60000,
+      "featureUpdates": [
+        {
+          "feature": "metadata.version",
+          "maxVersionLevel": 25,
+          "upgradeType": 2
+        }
+      ],
+      "validateOnly": true
+    },
+    "hex": "0000ea6002116d657461646174612e76657273696f6e001902000100"
+  },
+  {
+    "message": "UpdateFeaturesResponse",
+    "version": 1,
+    "case": "mixed",
+    "fields": {
+      "throttleTimeMs": 17,
+      "errorCode": 0,
+      "errorMessage": null,
+      "results": [
+        {
+          "feature": "metadata.version",
+          "errorCode": 42,
+          "errorMessage": "invalid feature"
+        }
+      ]
+    },
+    "hex": "0000001100000002116d657461646174612e76657273696f6e002a10696e76616c696420666561747572650000"
+  },
+  {
+    "message": "UpdateFeaturesRequest",
+    "version": 2,
+    "case": "basic",
+    "fields": {
+      "timeoutMs": 60000,
+      "featureUpdates": [
+        {
+          "feature": "metadata.version",
+          "maxVersionLevel": 25,
+          "upgradeType": 2
+        }
+      ],
+      "validateOnly": true
+    },
+    "hex": "0000ea6002116d657461646174612e76657273696f6e001902000100"
+  },
+  {
+    "message": "UpdateFeaturesResponse",
+    "version": 2,
+    "case": "mixed",
+    "fields": {
+      "throttleTimeMs": 17,
+      "errorCode": 0,
+      "errorMessage": null
+    },
+    "hex": "0000001100000000"
+  }
+]

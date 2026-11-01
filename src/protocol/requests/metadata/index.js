@@ -43,27 +43,57 @@ const versions = {
     const response = require('./v7/response')
     return { request: request({ topics, allowAutoTopicCreation }), response }
   },
-  8: ({ topics, allowAutoTopicCreation, includeTopicAuthorizedOperations }) => {
+  8: ({
+    topics,
+    allowAutoTopicCreation,
+    includeTopicAuthorizedOperations,
+    includeClusterAuthorizedOperations,
+  }) => {
     const request = require('./v8/request')
     const response = require('./v8/response')
     return {
-      request: request({ topics, allowAutoTopicCreation, includeTopicAuthorizedOperations }),
+      request: request({
+        topics,
+        allowAutoTopicCreation,
+        includeTopicAuthorizedOperations,
+        includeClusterAuthorizedOperations,
+      }),
       response,
     }
   },
-  9: ({ topics, allowAutoTopicCreation, includeTopicAuthorizedOperations }) => {
+  9: ({
+    topics,
+    allowAutoTopicCreation,
+    includeTopicAuthorizedOperations,
+    includeClusterAuthorizedOperations,
+  }) => {
     const request = require('./v9/request')
     const response = require('./v9/response')
     return {
-      request: request({ topics, allowAutoTopicCreation, includeTopicAuthorizedOperations }),
+      request: request({
+        topics,
+        allowAutoTopicCreation,
+        includeTopicAuthorizedOperations,
+        includeClusterAuthorizedOperations,
+      }),
       response,
     }
   },
-  10: ({ topics, allowAutoTopicCreation, includeTopicAuthorizedOperations }) => {
+  10: ({
+    topics,
+    allowAutoTopicCreation,
+    includeTopicAuthorizedOperations,
+    includeClusterAuthorizedOperations,
+  }) => {
     const request = require('./v10/request')
     const response = require('./v10/response')
     return {
-      request: request({ topics, allowAutoTopicCreation, includeTopicAuthorizedOperations }),
+      request: request({
+        topics,
+        allowAutoTopicCreation,
+        includeTopicAuthorizedOperations,
+        includeClusterAuthorizedOperations,
+      }),
       response,
     }
   },

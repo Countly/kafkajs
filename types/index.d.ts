@@ -586,6 +586,9 @@ export interface AdminItemResult {
   errorMessage: string | null
 }
 
+/** Topics with their partition numbers; shared by the admin APIs that select partitions. */
+export type TopicPartitionList = Array<{ topic: string; partitions: number[] }>
+
 export interface ITopicConfig {
   topic: string
   numPartitions?: number
@@ -980,6 +983,46 @@ listTopics(): Promise<string[]>
 fetchTopicOffsets(topic: string): Promise<Array<SeekEntry & { high: string; low: string }>>
   fetchTopicOffsetsByTimestamp(topic: string, timestamp?: number, options?: ApiTimeoutOption & { isolationLevel?: 'read_committed' | 'read_uncommitted' }): Promise<Array<SeekEntry>>
 fetchTopicOffsetsByTimestamp(topic: string, timestamp?: number): Promise<Array<SeekEntry>>
+  /** Elects preferred or unclean leaders; retries only unresolved partitions. */
+  electLeaders(
+    options: {
+      electionType?: 'preferred' | 'unclean'
+      topicPartitions?: TopicPartitionList | null
+    } & ApiTimeoutOption,
+  ): Promise<Array<{ topic: string; partitions: Array<{ partition: number } & AdminItemResult> }>>
+  /** Reads fresh supported/finalized features, preserving the epoch as a decimal string. */
+  describeFeatures(options?: { brokerId?: number } & ApiTimeoutOption): Promise<{
+    supportedFeatures: Record<string, { minVersion: number; maxVersion: number }>
+    finalizedFeatures: Record<string, { minVersionLevel: number; maxVersionLevel: number }>
+    finalizedFeaturesEpoch: string | null
+  }>
+  /** Updates or validates features. Errors on individual features remain data. */
+  updateFeatures(
+    options: {
+      features: Array<{
+        name: string
+        maxVersionLevel: number
+        upgradeType?: 'upgrade' | 'safe-downgrade' | 'unsafe-downgrade'
+      }>
+      validateOnly?: boolean
+    } & ApiTimeoutOption,
+  ): Promise<Array<{ feature: string } & AdminItemResult>>
+  /** Lists resource identities; exactly CLIENT_METRICS is an explicit v0 filter equivalent. */
+  listConfigResources(
+    options?: { resourceTypes?: ConfigResourceTypes[] } & ApiTimeoutOption,
+  ): Promise<{ resources: Array<{ type: ConfigResourceTypes; name: string }> }>
+  /** Flags opt into DescribeCluster; no flag keeps the legacy Metadata request. */
+  describeCluster(
+    options?: {
+      includeAuthorizedOperations?: boolean
+      includeFencedBrokers?: boolean
+    } & ApiTimeoutOption,
+  ): Promise<{
+    brokers: Array<{ nodeId: number; host: string; port: number; fenced?: boolean }>
+    controller: number | null
+    clusterId: string
+    authorizedOperations?: number | null
+  }>
   describeCluster(options?: ApiTimeoutOption): Promise<{
     brokers: Array<{ nodeId: number; host: string; port: number }>
     controller: number | null

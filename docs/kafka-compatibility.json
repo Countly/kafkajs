@@ -972,9 +972,9 @@
     {
       "kafkaName": "ElectLeaders",
       "apiKey": 43,
-      "forkName": null,
+      "forkName": "electLeaders",
       "apiKeysName": "ElectLeaders",
-      "planned": "yes",
+      "planned": "done",
       "validVersions": [
         0,
         2
@@ -982,8 +982,12 @@
       "flexibleFrom": 2,
       "deprecatedVersions": null,
       "latestVersionUnstable": false,
-      "forkVersions": null,
-      "gap": "stub",
+      "forkVersions": [
+        0,
+        1,
+        2
+      ],
+      "gap": "current",
       "onFloor": false,
       "belowFloor": [],
       "notes": ""
@@ -1150,9 +1154,9 @@
     {
       "kafkaName": "UpdateFeatures",
       "apiKey": 57,
-      "forkName": null,
+      "forkName": "updateFeatures",
       "apiKeysName": "UpdateFeatures",
-      "planned": "yes",
+      "planned": "done",
       "validVersions": [
         0,
         2
@@ -1160,8 +1164,12 @@
       "flexibleFrom": 0,
       "deprecatedVersions": null,
       "latestVersionUnstable": false,
-      "forkVersions": null,
-      "gap": "stub",
+      "forkVersions": [
+        0,
+        1,
+        2
+      ],
+      "gap": "current",
       "onFloor": false,
       "belowFloor": [],
       "notes": ""
@@ -1169,9 +1177,9 @@
     {
       "kafkaName": "DescribeCluster",
       "apiKey": 60,
-      "forkName": null,
+      "forkName": "describeCluster",
       "apiKeysName": "DescribeCluster",
-      "planned": "yes",
+      "planned": "done",
       "validVersions": [
         0,
         2
@@ -1179,8 +1187,12 @@
       "flexibleFrom": 0,
       "deprecatedVersions": null,
       "latestVersionUnstable": false,
-      "forkVersions": null,
-      "gap": "stub",
+      "forkVersions": [
+        0,
+        1,
+        2
+      ],
+      "gap": "current",
       "onFloor": false,
       "belowFloor": [],
       "notes": ""
@@ -1327,9 +1339,9 @@
     {
       "kafkaName": "ListConfigResources",
       "apiKey": 74,
-      "forkName": null,
+      "forkName": "listConfigResources",
       "apiKeysName": "ListConfigResources",
-      "planned": "yes",
+      "planned": "done",
       "validVersions": [
         0,
         1
@@ -1337,11 +1349,14 @@
       "flexibleFrom": 0,
       "deprecatedVersions": null,
       "latestVersionUnstable": false,
-      "forkVersions": null,
-      "gap": "stub",
+      "forkVersions": [
+        0,
+        1
+      ],
+      "gap": "current",
       "onFloor": false,
       "belowFloor": [],
-      "notes": "v0 is the old ListClientMetricsResources and lists only client-metrics resources; v1 adds a ResourceTypes filter (KIP-1142). Not yet implemented."
+      "notes": "v0 is the old ListClientMetricsResources and lists only client-metrics resources; v1 adds a ResourceTypes filter (KIP-1142)."
     },
     {
       "kafkaName": "DescribeTopicPartitions",

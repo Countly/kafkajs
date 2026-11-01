@@ -1,0 +1,170 @@
+[
+  {
+    "message": "ElectLeadersRequest",
+    "version": 0,
+    "case": "basic",
+    "fields": {
+      "topicPartitions": [
+        {
+          "topic": "orders",
+          "partitions": [
+            0,
+            2
+          ]
+        }
+      ],
+      "timeoutMs": 60000
+    },
+    "hex": "0000000100066f72646572730000000200000000000000020000ea60"
+  },
+  {
+    "message": "ElectLeadersResponse",
+    "version": 0,
+    "case": "mixed",
+    "fields": {
+      "throttleTimeMs": 17,
+      "replicaElectionResults": [
+        {
+          "topic": "orders",
+          "partitionResult": [
+            {
+              "partitionId": 0,
+              "errorCode": 84,
+              "errorMessage": null
+            },
+            {
+              "partitionId": 2,
+              "errorCode": 80,
+              "errorMessage": "no replica"
+            }
+          ]
+        }
+      ]
+    },
+    "hex": "000000110000000100066f726465727300000002000000000054ffff000000020050000a6e6f207265706c696361"
+  },
+  {
+    "message": "ElectLeadersRequest",
+    "version": 0,
+    "case": "all",
+    "fields": {
+      "topicPartitions": null,
+      "timeoutMs": 60000
+    },
+    "hex": "ffffffff0000ea60"
+  },
+  {
+    "message": "ElectLeadersRequest",
+    "version": 1,
+    "case": "basic",
+    "fields": {
+      "electionType": 1,
+      "topicPartitions": [
+        {
+          "topic": "orders",
+          "partitions": [
+            0,
+            2
+          ]
+        }
+      ],
+      "timeoutMs": 60000
+    },
+    "hex": "010000000100066f72646572730000000200000000000000020000ea60"
+  },
+  {
+    "message": "ElectLeadersResponse",
+    "version": 1,
+    "case": "mixed",
+    "fields": {
+      "throttleTimeMs": 17,
+      "errorCode": 0,
+      "replicaElectionResults": [
+        {
+          "topic": "orders",
+          "partitionResult": [
+            {
+              "partitionId": 0,
+              "errorCode": 84,
+              "errorMessage": null
+            },
+            {
+              "partitionId": 2,
+              "errorCode": 80,
+              "errorMessage": "no replica"
+            }
+          ]
+        }
+      ]
+    },
+    "hex": "0000001100000000000100066f726465727300000002000000000054ffff000000020050000a6e6f207265706c696361"
+  },
+  {
+    "message": "ElectLeadersRequest",
+    "version": 1,
+    "case": "all",
+    "fields": {
+      "electionType": 1,
+      "topicPartitions": null,
+      "timeoutMs": 60000
+    },
+    "hex": "01ffffffff0000ea60"
+  },
+  {
+    "message": "ElectLeadersRequest",
+    "version": 2,
+    "case": "basic",
+    "fields": {
+      "electionType": 1,
+      "topicPartitions": [
+        {
+          "topic": "orders",
+          "partitions": [
+            0,
+            2
+          ]
+        }
+      ],
+      "timeoutMs": 60000
+    },
+    "hex": "0102076f7264657273030000000000000002000000ea6000"
+  },
+  {
+    "message": "ElectLeadersResponse",
+    "version": 2,
+    "case": "mixed",
+    "fields": {
+      "throttleTimeMs": 17,
+      "errorCode": 0,
+      "replicaElectionResults": [
+        {
+          "topic": "orders",
+          "partitionResult": [
+            {
+              "partitionId": 0,
+              "errorCode": 84,
+              "errorMessage": null
+            },
+            {
+              "partitionId": 2,
+              "errorCode": 80,
+              "errorMessage": "no replica"
+            }
+          ]
+        }
+      ]
+    },
+    "hex": "00000011000002076f72646572730300000000005400000000000200500b6e6f207265706c696361000000"
+  },
+  {
+    "message": "ElectLeadersRequest",
+    "version": 2,
+    "case": "all",
+    "fields": {
+      "electionType": 1,
+      "topicPartitions": null,
+      "timeoutMs": 60000
+    },
+    "hex": "01000000ea6000"
+  }
+]

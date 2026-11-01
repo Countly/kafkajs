@@ -50,3 +50,41 @@ describe('validation-only admin requests', () => {
     }
   )
 })
+
+test('updateFeatures sends validation flag without follow-up work', async () => {
+  const bytes = []
+  const cache = new Map([['metadata.version', 1]])
+  const broker = {
+    updateFeatures: jest.fn(async (fields) => {
+      const featureUpdates = fields.featureUpdates.map((f) => ({ ...f, upgradeType: 1 }))
+      bytes.push(
+        (
+          await require('../../protocol/requests/updateFeatures/v1/request')({
+            ...fields,
+            featureUpdates,
+          }).encode()
+        ).buffer
+      )
+      return { results: [{ feature: 'metadata.version', errorCode: 0, errorMessage: null }] }
+    }),
+  }
+  const metadata = jest.fn(async () => ({ topicMetadata: [] }))
+  const cluster = {
+    refreshMetadataIfNecessary: jest.fn(async () => {}),
+    refreshMetadata: jest.fn(async () => {}),
+    findControllerBroker: async () => broker,
+    metadata,
+    metadataCache: cache,
+  }
+  const admin = createAdmin({ cluster, logger, retry: { retries: 0 } })
+  await admin.updateFeatures({
+    features: [{ name: 'metadata.version', maxVersionLevel: 25 }],
+    validateOnly: true,
+  })
+  expect(bytes).toHaveLength(1)
+  const fields = require('../../../testHelpers/wire/updateFeaturesV1').readRequest(bytes[0])
+  expect(fields.validateOnly).toBe(true)
+  expect(broker.updateFeatures).toHaveBeenCalledTimes(1)
+  expect(metadata).not.toHaveBeenCalled()
+  expect([...cache]).toEqual([['metadata.version', 1]])
+})

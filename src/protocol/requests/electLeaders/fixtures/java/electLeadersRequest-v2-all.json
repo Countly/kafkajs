@@ -1,0 +1,7 @@
+{
+  "message": "ElectLeadersRequest",
+  "version": 2,
+  "case": "all",
+  "hex": "01000000ea6000",
+  "fields": {"electionType":1,"topicPartitions":null,"timeoutMs":60000}
+}

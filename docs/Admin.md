@@ -380,8 +380,11 @@ await admin.setOffsets({ groupId, topic, partitions: await admin.fetchTopicOffse
 
 ## <a name="describe-cluster"></a> Describe cluster
 
-Allows you to get information about the broker cluster. This is mostly useful
-for monitoring or operations, and is usually not relevant for typical event processing.
+`admin.describeCluster()` returns `{ brokers, controller, clusterId }`. Each broker has `nodeId`, `host` and `port`. A missing controller is `null`. With no true flag, the method keeps the existing Metadata request and result shape.
+
+`admin.describeCluster({ includeAuthorizedOperations: true })` asks for the raw signed authorization mask as `authorizedOperations`; the unsupported sentinel becomes `null`. It uses DescribeCluster where available. Otherwise Metadata returns the mask when its negotiated version can represent it, or `null`.
+
+`admin.describeCluster({ includeFencedBrokers: true })` adds `brokers[].fenced` and requires DescribeCluster v2. An older broker receives no request with the flag silently removed. Both flags are optional booleans, default `false`, and may be combined. Per-call `apiTimeout` uses the shared call deadline described in Call deadlines.
 
 ```javascript
 await admin.describeCluster()
@@ -393,6 +396,28 @@ await admin.describeCluster()
 //   clusterId: 'f8QmWTB8SQSLE6C99G4qzA'
 // }
 ```
+
+## Elect leaders
+
+`admin.electLeaders({ electionType: 'preferred', topicPartitions: [{ topic: 'orders', partitions: [0, 2] }] })` returns topic entries containing partition outcomes: `{ partition, errorCode, error, errorMessage }`. The default election type is `preferred`. `topicPartitions: null`, or an omitted selection, elects for all partitions. An explicit empty list returns [] without metadata, controller discovery or a request. Nonempty lists require unique topic/partition identities and nonblank topic names without NUL.
+
+`unclean` requires ElectLeaders v1 or later. Calls go to the controller. Only unresolved eligible partitions are retried; successful elections are not resent. Completed outcomes are retained before a controller refresh. A later refresh failure affects only unresolved partitions; when no retry remains, no refresh starts and the last per-partition error stays in the result. `ELECTION_NOT_NEEDED` and `PREFERRED_LEADER_NOT_AVAILABLE` are result data. Top-level failures and authentication refusals reject the call with the original typed error. `apiTimeout` is the client call budget, separate from the broker request's fixed 60000 ms timeout. A timeout after transmission can have an unknown remote outcome.
+
+## Describe features
+
+`admin.describeFeatures({ brokerId })` returns `{ supportedFeatures, finalizedFeatures, finalizedFeaturesEpoch }`. Omit `brokerId` to use a connected broker. Every call sends a fresh ApiVersions request. Supported features map each name to `{ minVersion, maxVersion }`; finalized features map each name to `{ minVersionLevel, maxVersionLevel }`. The epoch is a decimal string, or `null` when unavailable. This read does not replace the connection's version-negotiation snapshot. Features are not fields of `describeCluster`.
+
+## Update features
+
+`admin.updateFeatures({ features: [{ name: 'metadata.version', maxVersionLevel: 25, upgradeType: 'upgrade' }], validateOnly: true })` validates without applying the change. Feature names must be unique, nonblank and without NUL; levels are integers from 0 through 32767. The default upgrade type is `upgrade`; `safe-downgrade` and `unsafe-downgrade` are also available. The optional `validateOnly` boolean defaults to `false`. Validation and non-default upgrade types require UpdateFeatures v1 or later.
+
+The result is an array of `{ feature, errorCode, error, errorMessage }`. Older protocol versions return individual feature results; v2 success covers all requested features and has no individual wire result array. Top-level broker failures and authentication refusals reject the call with the original typed error. Retries preserve completed feature outcomes before controller refresh. A later refresh failure affects only unresolved features with its original typed error; when no retry remains, no refresh starts and last per-feature errors remain. A successful validation causes no follow-up mutation or local feature-cache update. Read fresh feature state with `describeFeatures`. Per-call `apiTimeout` covers discovery, retries and the response, and a transmitted mutation may have been applied when it expires.
+
+## List configuration resources
+
+`admin.listConfigResources({ resourceTypes: [ConfigResourceTypes.CLIENT_METRICS] })` returns `{ resources: [{ type, name }] }`. `resourceTypes` is an optional array of unique known `ConfigResourceTypes`; omitted or empty selects the version's default supported resources. A nonempty filter requires v1 except exactly `[CLIENT_METRICS]`, which is the explicit v0 equivalent. A v0 broker lists client-metrics resources only. Other filters are refused rather than silently dropped. `apiTimeout` is supported.
+
+The existing `describeConfigs`, `alterConfigs` and `incrementalAlterConfigs` resource shapes and routing stay unchanged, including `CLIENT_METRICS` and `GROUP`. The equivalent of Java's deprecated `listClientMetricsResources` is `listConfigResources({ resourceTypes: [CLIENT_METRICS] })`. No separate deprecated method is added. Telemetry subscription/push operations are a different feature.
 
 ## <a name="describe-configs"></a> Describe configs
 
@@ -483,7 +508,7 @@ Example response:
 
 ## Validation-only requests and broker messages
 
-`createTopics`, `createPartitions`, `alterConfigs` and `incrementalAlterConfigs` accept `validateOnly: true`. Their validation request does not apply a mutation or make a follow-up request to wait for effects. Other methods support it only when their request schema has that field; a read-only or destructive method without the field does not gain validation behavior. Broker `errorMessage` is a separate `string | null` on legacy AlterConfigs errors/results and on `KafkaJSCreateTopicError`; stable `message`, class, type, code and retry properties retain their meanings. An empty broker message remains an empty string.
+`createTopics`, `createPartitions`, `alterConfigs`, `incrementalAlterConfigs` and `updateFeatures` accept `validateOnly: true`. Their validation request does not apply a mutation or make a follow-up request to wait for effects. Other methods support it only when their request schema has that field; a read-only or destructive method without the field does not gain validation behavior. Broker `errorMessage` is a separate `string | null` on legacy AlterConfigs errors/results and on `KafkaJSCreateTopicError`; stable `message`, class, type, code and retry properties retain their meanings. An empty broker message remains an empty string.
 
 | Method | Wire validation field | Minimum version |
 | --- | --- | --- |
@@ -491,6 +516,7 @@ Example response:
 | `createPartitions` | `ValidateOnly` | v0 |
 | `alterConfigs` | `ValidateOnly` | v0 |
 | `incrementalAlterConfigs` | `ValidateOnly` | v0 |
+| `updateFeatures` | UpdateFeatures v1+ | `validateOnly: true` validates without applying the change; no follow-up mutation or local cache update. |
 
 Destructive methods such as `deleteTopics`, `deleteTopicRecords` and offset deletion have no validation flag. Membership changes, ACL mutations and partition reassignments likewise have no validation field; reads and lifecycle calls do not validate mutations.
 

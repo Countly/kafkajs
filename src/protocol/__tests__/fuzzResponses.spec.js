@@ -54,9 +54,11 @@ const COUNTS = {
   deleteRecords: 3,
   deleteTopics: 15,
   describeAcls: 4,
+  describeCluster: 3,
   describeConfigs: 3,
   describeGroups: 7,
   describeTopicPartitions: 6,
+  electLeaders: 3,
   endTxn: 10,
   findCoordinator: 12,
   heartbeat: 6,
@@ -64,6 +66,7 @@ const COUNTS = {
   initProducerId: 8,
   joinGroup: 11,
   leaveGroup: 8,
+  listConfigResources: 2,
   listGroups: 3,
   listOffsets: 12,
   listPartitionReassignments: 2,
@@ -76,6 +79,7 @@ const COUNTS = {
   saslHandshake: 1,
   syncGroup: 8,
   txnOffsetCommit: 9,
+  updateFeatures: 3,
 }
 
 const settle = () => new Promise((done) => setImmediate(() => setImmediate(done)))

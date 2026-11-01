@@ -47,7 +47,7 @@ Gap classes: `current` (fork max equals the Kafka max) · `behind:N` · `stub` (
 | ExpireDelegationToken | 40 | 1-2 | v2+ | — | stub |  |
 | DescribeDelegationToken | 41 | 1-3 | v2+ | — | stub |  |
 | DeleteGroups | 42 | 0-2 | v2+ | 0-2 | current |  |
-| ElectLeaders | 43 | 0-2 | v2+ | — | stub |  |
+| ElectLeaders | 43 | 0-2 | v2+ | 0-2 | current |  |
 | IncrementalAlterConfigs | 44 | 0-1 | v1+ | 0-1 | current | The merge-semantics alternative to AlterConfigs: each config entry names a SET, DELETE, APPEND or SUBTRACT, so the entries a request leaves out are untouched. |
 | AlterPartitionReassignments | 45 | 0-1 | v0+ | 0 | behind:1 | v0 is flexible (KIP-455): the codec writes its own body tag buffer, like every flexible codec, and the request header is chosen by the flexible framing. v1 adds AllowReplicationFactorChange (KIP-860), which defaults to true, the behavior v0 has; it is not implemented because nothing here asks to forbid a replication-factor change, so behind:1 is this API's steady state until something does. |
 | ListPartitionReassignments | 46 | 0 | v0+ | 0 | current | Kafka defines only v0 (KIP-455), a flexible version, so the fork is current. |
@@ -56,8 +56,8 @@ Gap classes: `current` (fork max equals the Kafka max) · `behind:N` · `stub` (
 | AlterClientQuotas | 49 | 0-1 | v1+ | — | stub |  |
 | DescribeUserScramCredentials | 50 | 0 | v0+ | — | stub |  |
 | AlterUserScramCredentials | 51 | 0 | v0+ | — | stub |  |
-| UpdateFeatures | 57 | 0-2 | v0+ | — | stub |  |
-| DescribeCluster | 60 | 0-2 | v0+ | — | stub |  |
+| UpdateFeatures | 57 | 0-2 | v0+ | 0-2 | current |  |
+| DescribeCluster | 60 | 0-2 | v0+ | 0-2 | current |  |
 | DescribeProducers | 61 | 0 | v0+ | — | stub |  |
 | DescribeTransactions | 65 | 0 | v0+ | — | stub |  |
 | ListTransactions | 66 | 0-2 | v0+ | — | stub |  |
@@ -65,7 +65,7 @@ Gap classes: `current` (fork max equals the Kafka max) · `behind:N` · `stub` (
 | ConsumerGroupDescribe | 69 | 0-1 | v0+ | 0-1 | current | Admin-side counterpart of KIP-848; needed so group descriptions stop reporting consumer-protocol groups as Dead. |
 | GetTelemetrySubscriptions | 71 | 0 | v0+ | — | not-planned | Client telemetry (KIP-714); deferred. |
 | PushTelemetry | 72 | 0 | v0+ | — | not-planned | Client telemetry (KIP-714); deferred. |
-| ListConfigResources | 74 | 0-1 | v0+ | — | stub | v0 is the old ListClientMetricsResources and lists only client-metrics resources; v1 adds a ResourceTypes filter (KIP-1142). Not yet implemented. |
+| ListConfigResources | 74 | 0-1 | v0+ | 0-1 | current | v0 is the old ListClientMetricsResources and lists only client-metrics resources; v1 adds a ResourceTypes filter (KIP-1142). |
 | DescribeTopicPartitions | 75 | 0 | v0+ | 0 | current | Paginated describe of topics by name, with topic ids and eligible leader replicas; v0 is the only version and every 4.x broker offers it. The ELR arrays are null unless the cluster tracks them. |
 
 ## Floor watch

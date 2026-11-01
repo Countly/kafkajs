@@ -165,7 +165,7 @@
       "Request": "821b86c736d98bdd3de825daa56edd30fb46d39b8a156f273f3985d0d09c00b1",
       "Response": "04a23344c659434c30914a76f161d6705d2028864800e735b20fe85bb8efd407"
     },
-    "javaClientsJar": null
+    "javaClientsJar": "4.3.1"
   },
   "DescribeConfigs": {
     "kafkaTag": "4.3.1",
@@ -237,7 +237,7 @@
       "Request": "3048a2c953cd8e1a3343269c6eb827070471c18a5e62f4232dbc247768d1b3f5",
       "Response": "b47545dec74fc336fe46b0ad6d6ad416b8b4ff032d564cd23b2bf83ad093c400"
     },
-    "javaClientsJar": null
+    "javaClientsJar": "4.3.1"
   },
   "EndTxn": {
     "kafkaTag": "4.3.1",
@@ -317,7 +317,7 @@
       "Request": "3b8a841835ddd392cabb39c4e930f5fc3b7f0c74d8353311f729bee52e9b4f21",
       "Response": "e41bf574f16f52df3b8b5de1013ad3cb93378c4d9d3f77c62fc26f6a7511ceed"
     },
-    "javaClientsJar": null
+    "javaClientsJar": "4.3.1"
   },
   "ListGroups": {
     "kafkaTag": "4.3.1",
@@ -445,7 +445,7 @@
       "Request": "afb94b3e2a0a6f14f7535128f61ecb00e4498f0b1a0820cd9740ae4f8a384a03",
       "Response": "789762f475eafb2fa9823146f9368d7b8299687eb1e02a8a5493f2936561f7c4"
     },
-    "javaClientsJar": null
+    "javaClientsJar": "4.3.1"
   },
   "WriteTxnMarkers": {
     "kafkaTag": "4.3.1",

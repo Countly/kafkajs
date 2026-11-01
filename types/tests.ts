@@ -1679,3 +1679,17 @@ async function offsetIsolationOptions(admin: Admin) {
   const deleting: () => Promise<void> = () => admin.deleteTopicRecords({topic: 't', partitions: [{partition: 0, offset: '1'}]})
   return deleting
 }
+
+admin.electLeaders({topicPartitions:null,apiTimeout:10,electionType:'unclean'}).then(rows=>{const p:number=rows[0].partitions[0].partition;const e:KafkaJSError|null=rows[0].partitions[0].error;void p;void e})
+admin.describeFeatures({brokerId:0}).then(r=>{const epoch:string|null=r.finalizedFeaturesEpoch;void epoch})
+admin.updateFeatures({features:[{name:'metadata.version',maxVersionLevel:0,upgradeType:'safe-downgrade'}],validateOnly:true}).then(rows=>{const f:string=rows[0].feature;void f})
+admin.listConfigResources({resourceTypes:[ConfigResourceTypes.CLIENT_METRICS]}).then(r=>{const t:ConfigResourceTypes=r.resources[0].type;void t})
+admin.describeCluster({includeAuthorizedOperations:true,includeFencedBrokers:true}).then(r=>{const f:boolean|undefined=r.brokers[0].fenced;const m:number|null|undefined=r.authorizedOperations;void f;void m})
+// @ts-expect-error election type is a declared enum
+admin.electLeaders({electionType:'random'})
+// @ts-expect-error upgrade type is a declared enum
+admin.updateFeatures({features:[{name:'a',maxVersionLevel:1,upgradeType:'random'}]})
+// @ts-expect-error cluster flags are boolean
+admin.describeCluster({includeFencedBrokers:'true'})
+// @ts-expect-error resource types are numeric enum members
+admin.listConfigResources({resourceTypes:['CLIENT_METRICS']})

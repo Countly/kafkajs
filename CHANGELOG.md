@@ -178,6 +178,8 @@ Versions before 3.0.0 are internal alpha tags and are not published.
 
 - Admin topic-offset reads accept an optional isolationLevel, defaulting to read_committed; read_uncommitted reads the high watermark. Legacy alterConfigs errors and KafkaJSCreateTopicError expose broker errorMessage separately from their stable messages.
 
+- `admin.electLeaders`, `describeFeatures`, `updateFeatures`, `listConfigResources`; `describeCluster` gains `includeAuthorizedOperations` and `includeFencedBrokers` and uses DescribeCluster when asked.
+
 #### Tooling
 
 - Live scenarios for the connection setup budget and idle reaping; the soak's idle profile asserts that sockets are reaped and reopened.

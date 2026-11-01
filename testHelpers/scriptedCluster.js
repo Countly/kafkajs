@@ -41,10 +41,17 @@ const DEFAULT = [...CLASSIC, ...PRODUCER]
  * client's own caps allow under that transaction version: a transactional Produce, EndTxn and
  * TxnOffsetCommit at v11, v4 and v4 under transaction version 1, and at v12, v5 and v5 under 2,
  * which also sends no AddPartitionsToTxn and no AddOffsetsToTxn.
- * @type {Record<'default'|'sasl'|'consumer'|'tv1'|'tv2', Array<[string, number]>>}
+ * @type {Record<'default'|'sasl'|'consumer'|'tv1'|'tv2'|'clusterAdmin', Array<[string, number]>>}
  */
 const PROFILES = {
   default: DEFAULT,
+  clusterAdmin: [
+    ...DEFAULT,
+    ['ElectLeaders', 2],
+    ['UpdateFeatures', 2],
+    ['DescribeCluster', 2],
+    ['ListConfigResources', 1],
+  ],
   sasl: [...DEFAULT, ['SaslHandshake', 1], ['SaslAuthenticate', 2]],
   consumer: [
     ...DEFAULT.filter(([api]) => api !== 'OffsetFetch' && api !== 'OffsetCommit'),

@@ -276,9 +276,9 @@
     {
       "kafkaName": "ElectLeaders",
       "apiKey": 43,
-      "forkName": null,
+      "forkName": "electLeaders",
       "apiKeysName": "ElectLeaders",
-      "planned": "yes"
+      "planned": "done"
     },
     {
       "kafkaName": "IncrementalAlterConfigs",
@@ -339,16 +339,16 @@
     {
       "kafkaName": "UpdateFeatures",
       "apiKey": 57,
-      "forkName": null,
+      "forkName": "updateFeatures",
       "apiKeysName": "UpdateFeatures",
-      "planned": "yes"
+      "planned": "done"
     },
     {
       "kafkaName": "DescribeCluster",
       "apiKey": 60,
-      "forkName": null,
+      "forkName": "describeCluster",
       "apiKeysName": "DescribeCluster",
-      "planned": "yes"
+      "planned": "done"
     },
     {
       "kafkaName": "DescribeProducers",
@@ -402,9 +402,9 @@
     {
       "kafkaName": "ListConfigResources",
       "apiKey": 74,
-      "forkName": null,
+      "forkName": "listConfigResources",
       "apiKeysName": "ListConfigResources",
-      "planned": "yes"
+      "planned": "done"
     },
     {
       "kafkaName": "DescribeTopicPartitions",
