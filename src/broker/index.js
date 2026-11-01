@@ -8,7 +8,6 @@ const { NO_TOPIC_ID } = require('../protocol/requests/topicIds')
 const { assertSameProtocol } = require('../protocol/requests/groupProtocolCheck')
 const {
   KafkaJSConnectionClosedError,
-  KafkaJSConnectionError,
   KafkaJSInvariantViolation,
   KafkaJSNonRetriableError,
   KafkaJSServerDoesNotSupportApiKey,
@@ -344,7 +343,8 @@ module.exports = class Broker {
    * finalized features (`finalizedFeatures`, `finalizedFeaturesEpoch`).
    *
    * An established, negotiated connection reauthenticates under the SASL cap without starting
-   * another physical setup budget or changing the node's setup failure state.
+   * another physical setup budget or changing the node's setup failure state. A replaced pool
+   * cancels its setup without recording a physical failure.
    *
    * @public
    * @param {object} [options]
@@ -353,6 +353,7 @@ module.exports = class Broker {
    *   after each: an error it returns is thrown, so a closed producer goes no further
    * @returns {Promise}
    * @throws {KafkaJSConnectionError} when this broker was retired
+   * @throws {KafkaJSConnectionClosedError} when its pool was replaced while connecting
    * @throws {Error} the error the guard returned
    */
   async connect({ guard } = {}) {
@@ -387,10 +388,7 @@ module.exports = class Broker {
           await connection.authenticate()
           this.throwIfRefused(guard)
           this.throwIfRetired()
-          if (this.connectionPool !== pool)
-            throw new KafkaJSConnectionError('Connection pool was replaced', {
-              broker: this.brokerAddress,
-            })
+          this.throwIfReplaced(pool)
         } catch (error) {
           attachFailureSource(error, { broker: this, generation })
           throw error
@@ -405,10 +403,7 @@ module.exports = class Broker {
         attempt.assertCurrent()
         this.throwIfRefused(guard)
         this.throwIfRetired()
-        if (this.connectionPool !== pool)
-          throw new KafkaJSConnectionError('Connection pool was replaced', {
-            broker: this.brokerAddress,
-          })
+        this.throwIfReplaced(pool)
       }
       try {
         await connection.connect({ attempt })
@@ -441,7 +436,11 @@ module.exports = class Broker {
         originalPool()
         connection.finishSetup(attempt)
       } catch (error) {
-        attempt.fail(error)
+        if (this.connectionPool !== pool) {
+          attempt.cancel(error)
+        } else {
+          attempt.fail(error)
+        }
         attachFailureSource(error, { broker: this, generation: setupGeneration })
         throw error
       }
