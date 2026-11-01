@@ -1,3 +1,4 @@
+const setupPool = require('../../../testHelpers/setupPool')
 const Broker = require('../../broker')
 const Connection = require('../../network/connection')
 const Encoder = require('../../protocol/encoder')
@@ -58,7 +59,7 @@ const createFakeBroker = (answer) => {
     }
   }
 
-  const connectionPool = {
+  const connectionPool = setupPool({
     host: '127.0.0.1',
     port: 9092,
     sasl: null,
@@ -83,7 +84,7 @@ const createFakeBroker = (answer) => {
     },
     setVersions: () => {},
     destroy: async () => connection.disconnect(),
-  }
+  })
 
   return { broker: new Broker({ connectionPool, logger: newLogger(), nodeId: NODE_ID }), state }
 }

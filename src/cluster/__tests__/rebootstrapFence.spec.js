@@ -1,3 +1,4 @@
+const setupPool = require('../../../testHelpers/setupPool')
 const Cluster = require('../index')
 const Generation = require('../../producer/generation')
 const InstrumentationEventEmitter = require('../../instrumentation/emitter')
@@ -8,12 +9,13 @@ const { deferred, watch, flushAll } = require('../../producer/__tests__/fixtures
 const { newLogger } = require('testHelpers')
 
 /** @param {string} host @returns {object} a connection pool that records its retirement */
-const poolDouble = (host) => ({
-  host,
-  port: 9092,
-  retire: jest.fn(),
-  destroy: jest.fn(async () => {}),
-})
+const poolDouble = (host) =>
+  setupPool({
+    host,
+    port: 9092,
+    retire: jest.fn(),
+    destroy: jest.fn(async () => {}),
+  })
 
 /**
  * A cluster whose seed fails every metadata request and whose next connection pools are the
