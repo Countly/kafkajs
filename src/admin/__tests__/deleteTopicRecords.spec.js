@@ -488,7 +488,7 @@ describe('Admin > deleteTopicRecords', () => {
   })
   test('keeps successful brokers out of retries and reports only the refused partition', async () => {
     const calls = new Map()
-    jest.spyOn(cluster, 'fetchTopicsOffset').mockResolvedValue([
+    jest.spyOn(cluster, 'fetchTopicsOffset').mockImplementation(async () => [
       {
         topic: topicName,
         partitions: [

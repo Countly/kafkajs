@@ -306,7 +306,7 @@ describe('Floor core expectations', () => {
       LeaveGroup: 5,
       OffsetFetch: 9,
       OffsetCommit: 9,
-      ListOffsets: 9,
+      ListOffsets: 10,
       Fetch: 17,
       OffsetForLeaderEpoch: 4,
       InitProducerId: 5,

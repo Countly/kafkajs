@@ -1,6 +1,8 @@
 const createAdmin = require('..')
 const createProducer = require('../../producer')
 const createConsumer = require('../../consumer')
+const { KafkaJSDeleteTopicRecordsError, KafkaJSNonRetriableError } = require('../../errors')
+const { createErrorFromCode } = require('../../protocol/error')
 const { createCluster, newLogger } = require('testHelpers')
 const { createScriptedCluster } = require('../../../testHelpers/scriptedCluster')
 
@@ -66,4 +68,99 @@ describe('legacy admin call patterns', () => {
       ])
     }
   )
+})
+
+describe('delete-records partial broker retries', () => {
+  it('keeps successful brokers out of retries and reports only the refused partition', async () => {
+    const topic = 't'
+    const brokers = [0, 1].map((nodeId) => ({
+      deleteRecords: jest.fn(async () => {
+        if (nodeId === 1) {
+          throw new KafkaJSDeleteTopicRecordsError({
+            topic,
+            partitions: [
+              {
+                partition: 1,
+                offset: '5',
+                error: createErrorFromCode(
+                  brokers[1].deleteRecords.mock.calls.length === 1 ? 6 : 1
+                ),
+              },
+            ],
+          })
+        }
+      }),
+    }))
+    const cluster = {
+      addTargetTopic: async () => {},
+      refreshMetadataIfNecessary: async () => {},
+      refreshMetadata: jest.fn(async () => {}),
+      findTopicPartitionMetadata: () => [{ partitionId: 0 }, { partitionId: 1 }],
+      fetchTopicsOffset: jest.fn(async () => [
+        {
+          topic,
+          partitions: [
+            { partition: 0, offset: '0' },
+            { partition: 1, offset: '0' },
+          ],
+        },
+      ]),
+      findLeaderForPartitions: () => ({ 0: [0], 1: [1] }),
+      findBroker: async ({ nodeId }) => brokers[Number(nodeId)],
+    }
+    const admin = createAdmin({
+      cluster,
+      logger: newLogger(),
+      retry: { retries: 1, initialRetryTime: 1, factor: 0 },
+    })
+    const error = await admin
+      .deleteTopicRecords({
+        topic,
+        partitions: [
+          { partition: 0, offset: '5' },
+          { partition: 1, offset: '5' },
+        ],
+      })
+      .catch((error) => error)
+    expect(error).toBeInstanceOf(KafkaJSNonRetriableError)
+    expect(error.cause).toBeInstanceOf(KafkaJSDeleteTopicRecordsError)
+    expect(error.cause.partitions).toEqual([
+      { partition: 1, offset: '5', error: expect.objectContaining({ code: 1 }) },
+    ])
+    expect(brokers[0].deleteRecords).toHaveBeenCalledTimes(1)
+    expect(brokers[1].deleteRecords).toHaveBeenCalledTimes(2)
+    expect(cluster.refreshMetadata).toHaveBeenCalledTimes(1)
+  })
+})
+
+describe('recorded broker version regressions', () => {
+  it('selects ListOffsets v10 from the recorded 4.0.2 range', () => {
+    const { requests, selectVersion } = require('../../protocol/requests')
+    const apiKeys = require('../../protocol/requests/apiKeys')
+    const ranges = require('../../../scripts/protocol/brokerRanges.json')
+    const [minVersion, maxVersion] = ranges['4.0.2'].ListOffsets
+    expect([minVersion, maxVersion]).toEqual([1, 10])
+    expect(
+      selectVersion(
+        { [apiKeys.ListOffsets]: { minVersion, maxVersion } },
+        apiKeys.ListOffsets,
+        requests.ListOffsets
+      )
+    ).toBe(10)
+  })
+
+  it('decodes the successful reassignment v1 response with the broker policy', async () => {
+    const response = require('../../protocol/requests/alterPartitionReassignments/v1/response')
+    const golden = require('../../protocol/requests/alterPartitionReassignments/fixtures/java/alterPartitionReassignmentsResponse-v1-storage.json')
+    const raw = Buffer.from(golden.hex, 'hex')
+    raw.writeInt32BE(0, 0)
+    raw.writeUInt8(1, 4)
+    const decoded = await response.parse(await response.decode(raw))
+    expect(decoded).toEqual({
+      throttleTime: 0,
+      allowReplicationFactorChange: true,
+      errorCode: 0,
+      responses: [{ topic: 't', partitions: [{ partition: 0, errorCode: 0 }] }],
+    })
+  })
 })
