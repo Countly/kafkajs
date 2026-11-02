@@ -85,17 +85,13 @@ module.exports = class SASLAuthenticator {
           responseGuard: this.guard,
         })
       } catch (e) {
-        // Only the raw protocol error carries the broker's own error_message and code;
-        // built-in mechanisms (plain/scram/oauthBearer/awsIam) re-wrap it into
-        // KafkaJSSASLAuthenticationError with a plain string, losing both. Report here,
-        // before that happens, then re-throw unchanged so the thrown class is unaffected.
+        // Only the raw protocol error still carries the code; mechanisms re-wrap it. The
+        // published text is built from stable fields alone, never from the error's message.
         this.check()
         if (e.code === SASL_AUTHENTICATION_FAILED_CODE) {
           this.connection.reportAuthenticationFailure(
             mechanism,
-            mechanism === 'GSSAPI'
-              ? `SASL GSSAPI authentication failed: broker=${this.connection.host}:${this.connection.port} stage=exchange`
-              : e.message
+            `SASL ${mechanism} authentication failed: broker=${this.connection.host}:${this.connection.port} stage=exchange`
           )
         }
         throw e

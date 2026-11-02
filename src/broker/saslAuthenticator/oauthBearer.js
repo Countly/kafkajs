@@ -12,6 +12,7 @@
 
 const { request } = require('../../protocol/sasl/oauthBearer')
 const { KafkaJSSASLAuthenticationError } = require('../../errors')
+const { failureDetail } = require('./failure')
 
 const oauthBearerAuthenticatorProvider =
   (sasl) =>
@@ -40,7 +41,7 @@ const oauthBearerAuthenticatorProvider =
           logger.debug('SASL OAUTHBEARER authentication successful', { broker })
         } catch (e) {
           const error = new KafkaJSSASLAuthenticationError(
-            `SASL OAUTHBEARER authentication failed: ${e.message}`
+            `SASL OAUTHBEARER authentication failed: ${failureDetail(e)}`
           )
           logger.error(error.message, { broker })
           throw error

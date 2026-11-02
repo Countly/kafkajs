@@ -17,7 +17,7 @@ describe('Protocol > Requests > SaslAuthenticate > v2', () => {
     await expect(parse(data)).resolves.toBeTruthy()
   })
 
-  test('an authentication failure still carries the broker message', async () => {
+  test('an authentication failure carries its code and fixed text, not the broker message', async () => {
     const data = {
       errorCode: 58,
       errorMessage: 'Invalid username or password',
@@ -26,7 +26,9 @@ describe('Protocol > Requests > SaslAuthenticate > v2', () => {
 
     await expect(parse(data)).rejects.toMatchObject({
       name: 'KafkaJSProtocolError',
-      message: 'Invalid username or password',
+      type: 'SASL_AUTHENTICATION_FAILED',
+      code: 58,
+      message: 'SASL Authentication failed',
     })
   })
 

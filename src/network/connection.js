@@ -65,6 +65,7 @@ const isAuthenticatedRequest = (request) => {
 
 /** APIs whose broker payloads can contain credentials, including echoed error text. */
 const SENSITIVE_API_KEYS = new Set([
+  apiKeys.SaslAuthenticate,
   apiKeys.CreateDelegationToken,
   apiKeys.RenewDelegationToken,
   apiKeys.ExpireDelegationToken,
@@ -121,11 +122,11 @@ module.exports = class Connection {
    *                                            max.in.flight.requests.per.connection default).
    *                                            Pass null for unbounded (the pre-3.0 behavior).
    * @param {import("../instrumentation/emitter")} [options.instrumentationEmitter=null]
-   * @param {(errorMessage: string) => void} [options.onAuthenticationFailure=null] Called with the
-   *                                            broker's error message when it rejects
-   *                                            SaslAuthenticate (code 58), after the
-   *                                            NETWORK_AUTHENTICATION_FAILURE event is emitted.
-   *                                            Used by ConnectionPool to blackout the broker.
+   * @param {(errorMessage: string) => void} [options.onAuthenticationFailure=null] Called with a
+   *                                            sanitized description (mechanism, broker, stage)
+   *                                            when the broker rejects SaslAuthenticate (code 58),
+   *                                            after the NETWORK_AUTHENTICATION_FAILURE event is
+   *                                            emitted. Used by ConnectionPool to blackout the broker.
    */
   constructor({
     host,
@@ -258,6 +259,7 @@ module.exports = class Connection {
       }
 
     this.logDebug = log('debug')
+    this.logWarn = log('warn')
     this.logError = log('error')
 
     const env = getEnv()
@@ -414,7 +416,9 @@ module.exports = class Connection {
           : new KafkaJSConnectionError('Connection closed while connecting', {
               broker: this.broker,
             })
+        const beforeHandshake = this.ssl && !this.isConnected()
         this.failGeneration(error)
+        if (beforeHandshake) this.warnPlaintextPeer()
       }
 
       const onError = (e) => {
@@ -423,10 +427,12 @@ module.exports = class Connection {
           broker: this.broker,
           code: e.code,
         })
+        const beforeHandshake = this.ssl && !this.isConnected() && e.code === 'ECONNRESET'
         this.failGeneration(error)
         try {
           this.logError(error.message, { stack: e.stack })
         } catch {}
+        if (beforeHandshake) this.warnPlaintextPeer()
       }
 
       const onTimeout = () => {
@@ -844,12 +850,28 @@ module.exports = class Connection {
   }
 
   /**
+   * Logs one warning for a TLS socket the peer closed before the handshake finished, which is
+   * what a plaintext listener does with a TLS client hello. The connection error itself keeps its
+   * class and message.
+   * @private
+   * @returns {void}
+   */
+  warnPlaintextPeer() {
+    try {
+      this.logWarn(
+        'The connection closed before the TLS handshake finished: is this a TLS client on a plaintext port?'
+      )
+    } catch {}
+  }
+
+  /**
    * @public
    * Reports a SASL authentication failure diagnosed from the broker's own response
    * (SASL_AUTHENTICATION_FAILED, code 58): emits NETWORK_AUTHENTICATION_FAILURE and lets
    * the owning ConnectionPool blackout this broker before the next connection attempt.
    * @param {string} mechanism
-   * @param {string} errorMessage
+   * @param {string} errorMessage a sanitized description built from stable fields; never the
+   *   broker's own text
    */
   reportAuthenticationFailure(mechanism, errorMessage) {
     if (this.instrumentationEmitter) {

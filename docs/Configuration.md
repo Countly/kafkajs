@@ -63,6 +63,41 @@ const kafka = new Kafka({
 Note that this discovery mechanism is only used to get the initial set of brokers (i.e. the seed brokers). After successfully connecting to
 a broker in this list, Kafka has its own mechanism for discovering the rest of the cluster.
 
+### Resolving broker addresses
+
+Each new connection resolves the broker's host name again and, with Node's default `autoSelectFamily`, tries every address the lookup returns, in turn, within the connection setup timeout. This is what Java's `client.dns.lookup=use_all_dns_ips` does, so there is no option for it. Each attempt but the last waits at most `net.getDefaultAutoSelectFamilyAttemptTimeout()` ms (250 ms on Node 22 and 24, 500 ms on Node 26). A custom `socketFactory` decides its own dialing.
+
+Java's `resolve_canonical_bootstrap_servers_only` replaces each bootstrap host by the canonical names of its addresses, for example so that a Kerberos service principal names the real host. Pass `brokers` as an async function that does the same; it runs again whenever the client rebuilds its bootstrap list:
+
+```javascript
+const { promises: dns } = require('dns')
+
+async function canonicalBrokers(bootstrap) {
+  const resolved = await Promise.all(
+    bootstrap.map(async (entry) => {
+      const separator = entry.lastIndexOf(':')
+      const host = entry.slice(0, separator)
+      const port = entry.slice(separator + 1)
+      const addresses = await dns.lookup(host, { all: true })
+      return Promise.all(
+        addresses.map(async ({ address }) => {
+          const [name] = await dns.reverse(address).catch(() => [address])
+          return `${name}:${port}`
+        })
+      )
+    })
+  )
+  return resolved.flat()
+}
+
+const kafka = new Kafka({
+  clientId: 'my-app',
+  brokers: () => canonicalBrokers(['kafka.example.com:9093']),
+})
+```
+
+An address without a reverse name stays an address, as in Java.
+
 ## SSL
 
 The `ssl` option can be used to configure the TLS sockets. The options are passed directly to [`tls.connect`](https://nodejs.org/api/tls.html#tls_tls_connect_options_callback) and used to create the TLS Secure Context, all options are accepted.
@@ -266,6 +301,12 @@ A complete breakdown can be found in the IAM User Guide's
 
 It is **highly recommended** that you use SSL for encryption when using `PLAIN` or `AWS`,
 otherwise credentials will be transmitted in cleartext!
+
+The client verifies the broker certificate by default (`rejectUnauthorized` stays `true` unless you set it), and checks it against the broker's host name, which it also sends as the TLS server name (SNI). An IP address is checked against the IP addresses the certificate lists. Set `ssl.servername` when the certificate names another host. TLS failures are a `KafkaJSConnectionError` whose `code` is Node's, for example `DEPTH_ZERO_SELF_SIGNED_CERT` or `ERR_TLS_CERT_ALTNAME_INVALID`.
+
+A listener that requires a client certificate refuses a client without one. With TLS 1.3 the handshake may complete first and the refusal arrive with the first read: the connection then fails with a `KafkaJSConnectionError` whose `code` ends in `CERTIFICATE_REQUIRED`.
+
+A plaintext client that reaches a TLS listener receives a TLS alert. The client refuses it as an oversized response frame, with a message that says the bytes look like a TLS alert. A TLS client that reaches a plaintext listener fails with its usual connection error, and the client logs one warning: "is this a TLS client on a plaintext port?".
 
 ### GSSAPI (Kerberos)
 
