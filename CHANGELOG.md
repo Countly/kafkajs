@@ -193,6 +193,10 @@ Versions before 3.0.0 are internal alpha tags and are not published.
 
 - `admin.electLeaders`, `describeFeatures`, `updateFeatures`, `listConfigResources`; `describeCluster` gains `includeAuthorizedOperations` and `includeFencedBrokers` and uses DescribeCluster when asked.
 
+- `sasl: { mechanism: 'gssapi' }` over the optional peer `kerberos` 7.0.0, loaded on first use; credentials come from the process environment, with no `kinit` and no subprocess.
+
+- `kerberos` is declared an optional peer dependency pinned to 7.0.0 and is never installed with the package.
+
 #### Tooling
 
 - Live scenarios for the connection setup budget and idle reaping; the soak's idle profile asserts that sockets are reaped and reopened.

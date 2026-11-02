@@ -19,6 +19,8 @@ custom authentication mechanisms can be introduced:
 property in `server.properties`. See the Kafka documentation for information on how to
 configure your brokers.
 
+An explicit `authenticationProvider` takes precedence over every built-in provider, including `GSSAPI`. A custom GSSAPI provider does not load the optional `kerberos` peer unless the custom implementation chooses to do so.
+
 ## Writing a custom authentication mechanism
 
 A custom authentication mechanism needs to fulfill the following interface:

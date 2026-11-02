@@ -179,7 +179,20 @@ export const oauthBearer: {
   }): AssertionSupplier
 }
 
+/** Environment-backed Kerberos authentication through the optional native peer.
+ * Authentication creates a new context and never manages or renews tickets.
+ */
+export interface GssapiSaslOptions {
+  /** Built-in mechanism name; custom Mechanism providers retain precedence. */
+  mechanism: 'gssapi'
+  /** Service component without @, slash or NUL; defaults to kafka. */
+  serviceName?: string
+  /** Credential principal and authorization identity; defaults to native credentials. */
+  principal?: string
+}
+
 type SASLMechanismOptionsMap = {
+  gssapi: Omit<GssapiSaslOptions, 'mechanism'>
   plain: { username: string; password: string }
   'scram-sha-256': { username: string; password: string }
   'scram-sha-512': { username: string; password: string }

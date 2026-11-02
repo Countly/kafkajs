@@ -63,6 +63,8 @@ What to change to install the package and run it on a Kafka 4.x cluster.
 
 - Connections idle for 9 minutes are closed by default; the next request reconnects. This is below the default broker idle timeout but does not guarantee close ordering or eliminate races. `connectionsMaxIdle: 0` keeps connections open as before.
 
+To use GSSAPI, install `kerberos@7.0.0` yourself. The client loads this optional peer at the first GSSAPI authentication. Provide credentials through `KRB5CCNAME` and `KRB5_CONFIG`; a client keytab through `KRB5_CLIENT_KTNAME` depends on the platform's Kerberos implementation. Ticket acquisition and renewal are the deployment's job. The client runs no `kinit` or subprocess and has no Linux or macOS password option. Existing custom authentication providers retain precedence.
+
 ### Producer
 
 - Remove the `kafkajs-snappy` registration to use the built-in codec, or keep it: yours wins. The built-in codec runs on the main thread (no native module), in short slices that yield to the event loop: about 100 MiB/s to decode, 40 MiB/s to encode

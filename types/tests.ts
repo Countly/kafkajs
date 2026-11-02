@@ -1771,3 +1771,19 @@ admin.updateFeatures({features:[{name:'a',maxVersionLevel:1,upgradeType:'random'
 admin.describeCluster({includeFencedBrokers:'true'})
 // @ts-expect-error resource types are numeric enum members
 admin.listConfigResources({resourceTypes:['CLIENT_METRICS']})
+
+// GSSAPI
+const gssapiOptions: import('./index').GssapiSaslOptions = { mechanism: 'gssapi' }
+new Kafka({ brokers: ['localhost:9192'], sasl: gssapiOptions })
+new Kafka({ brokers: ['localhost:9192'], sasl: { mechanism: 'gssapi', serviceName: 'kafka', principal: 'client@KAFKAJS.TEST' } })
+const invalidGssapiService: import('./index').GssapiSaslOptions = {
+  mechanism: 'gssapi',
+  // @ts-expect-error service names are strings
+  serviceName: 42,
+}
+const invalidGssapiPassword: import('./index').GssapiSaslOptions = {
+  mechanism: 'gssapi',
+  // @ts-expect-error credentials come from the environment
+  password: 'unsupported',
+}
+void [invalidGssapiService, invalidGssapiPassword]

@@ -5,10 +5,12 @@ const scram256AuthenticatorProvider = require('./scram256')
 const scram512AuthenticatorProvider = require('./scram512')
 const awsIAMAuthenticatorProvider = require('./awsIam')
 const oauthBearerAuthenticatorProvider = require('./oauthBearer')
+const gssapiAuthenticatorProvider = require('./gssapi')
 const { KafkaJSSASLAuthenticationError } = require('../../errors')
 
 const BUILT_IN_AUTHENTICATION_PROVIDERS = {
   AWS: awsIAMAuthenticatorProvider,
+  GSSAPI: gssapiAuthenticatorProvider,
   PLAIN: plainAuthenticatorProvider,
   OAUTHBEARER: oauthBearerAuthenticatorProvider,
   'SCRAM-SHA-256': scram256AuthenticatorProvider,
@@ -89,7 +91,12 @@ module.exports = class SASLAuthenticator {
         // before that happens, then re-throw unchanged so the thrown class is unaffected.
         this.check()
         if (e.code === SASL_AUTHENTICATION_FAILED_CODE) {
-          this.connection.reportAuthenticationFailure(mechanism, e.message)
+          this.connection.reportAuthenticationFailure(
+            mechanism,
+            mechanism === 'GSSAPI'
+              ? `SASL GSSAPI authentication failed: broker=${this.connection.host}:${this.connection.port} stage=exchange`
+              : e.message
+          )
         }
         throw e
       }

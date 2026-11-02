@@ -15,7 +15,7 @@ cd "$PACK_DIR"
 npm install --silent --no-audit --no-fund "./$TARBALL"
 cp "$ROOT/scripts/packageSmoke.test.mjs" ./packageSmoke.test.mjs
 node --input-type=module -e 'import { createRequire } from "node:module"; import { oauthBearer } from "@countly/kafkajs"; const require = createRequire(import.meta.url); if (oauthBearer !== require("@countly/kafkajs").oauthBearer) throw new Error("OAuth namespace differs")'
-node --test ./packageSmoke.test.mjs
+NODE_PATH= node --test ./packageSmoke.test.mjs
 
 # Types condition check: resolve the package name under node16 resolution from the temp project.
 # index.d.ts references Node builtin types (Buffer, net, tls), same as any real TS consumer would need.

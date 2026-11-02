@@ -267,6 +267,25 @@ A complete breakdown can be found in the IAM User Guide's
 It is **highly recommended** that you use SSL for encryption when using `PLAIN` or `AWS`,
 otherwise credentials will be transmitted in cleartext!
 
+### GSSAPI (Kerberos)
+
+Install the optional peer with `npm install kerberos@7.0.0`. Ordinary imports and other mechanisms do not load it. If it is absent or the installed version differs from 7.0.0, the first GSSAPI authentication throws `KafkaJSNotImplemented` with this installation command. Version validation occurs before native initialization.
+
+```javascript
+const kafka = new Kafka({
+  brokers: async () => ['broker.example.com:9192'],
+  sasl: { mechanism: 'gssapi', serviceName: 'kafka', principal: 'client@EXAMPLE.COM' },
+})
+```
+
+`serviceName` defaults to `kafka` and must be nonempty with no `@`, slash or NUL. `principal` is optional and must be nonempty without NUL when supplied. The service is `serviceName@connectedHost`. Return the broker's canonical principal hostname from an async brokers resolver; an IP literal may not identify that principal. The client does not rewrite DNS or the advertised broker addresses, so advertised names must also match their service principals.
+
+Credentials come from the process environment: `KRB5_CONFIG` and a usable `KRB5CCNAME`, or a platform-supported client keytab through `KRB5_CLIENT_KTNAME`. No client password path is provided. Each authentication and reauthentication creates a fresh native context so renewed credentials can be used. Acquisition, context and exchange failures become sanitized `KafkaJSSASLAuthenticationError` messages with the mechanism, broker and stable stage.
+
+Arrange ticket renewal outside this library. In Kubernetes, mount the realm configuration and a shared ticket-cache volume into the application and a renewal sidecar; give the sidecar its own keytab secret and renewal policy, and give the application access to the resulting cache. Set KRB5_CONFIG/KRB5CCNAME before starting the client. The client runs no subprocess or renewal timer. Initial client-keytab acquisition is platform dependent; verify it in the deployment before relying on an empty or expired cache.
+
+A custom `authenticationProvider` with mechanism `GSSAPI` overrides the built-in provider. The adapter negotiates authentication without a SASL security layer; use TLS for transport encryption when required.
+
 ### Custom Authentication Mechanisms
 
 If an authentication mechanism is not supported out of the box in KafkaJS, a custom authentication
