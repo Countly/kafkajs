@@ -1711,3 +1711,53 @@ describe('Producer > state > ProducerStateManager > a forced close', () => {
     expect(unsent.state()).toEqual(ABORTABLE_ERROR)
   })
 })
+
+describe('old identity gaps after a producer-wide epoch bump', () => {
+  const expire = (manager, batch) =>
+    manager.fail(batch, new KafkaJSDeliveryTimeout('deadline', { outcome: 'unknown' }), {
+      transmitted: true,
+    })
+
+  test('an old-epoch expiry restarts the stale partition without bumping the current epoch', async () => {
+    const manager = await idempotentManager()
+    const a = createBatch({ partition: 0 })
+    const b = createBatch({ partition: 1 })
+    send(manager, a, b)
+    expire(manager, a)
+    manager.resolveSequences()
+    expect(manager.producerEpoch).toBe(1)
+    expect(b.producerEpoch).toBe(0)
+    expect(b.entry.stale).toBe(true)
+    expire(manager, b)
+    manager.resolveSequences()
+    expect(manager.producerEpoch).toBe(1)
+    const next = createBatch({ partition: 1 })
+    expect(send(manager, next)).toEqual([next])
+    expect([next.producerEpoch, next.firstSequence]).toEqual([1, 0])
+  })
+
+  test('gaps collected in one pass share one epoch bump', async () => {
+    const manager = await idempotentManager()
+    const a = createBatch({ partition: 0 })
+    const b = createBatch({ partition: 1 })
+    send(manager, a, b)
+    for (const batch of [a, b]) expire(manager, batch)
+    manager.resolveSequences()
+    expect(manager.producerEpoch).toBe(1)
+    const next = createBatch({ partition: 1 })
+    expect(send(manager, next)).toEqual([next])
+    expect([next.producerEpoch, next.firstSequence]).toEqual([1, 0])
+  })
+
+  test('a newly written current-epoch near-deadline batch still requires recovery', async () => {
+    const manager = await idempotentManager()
+    for (const epoch of [0, 1, 2]) {
+      const batch = createBatch()
+      expect(send(manager, batch)).toEqual([batch])
+      expect(batch.producerEpoch).toBe(epoch)
+      expire(manager, batch)
+      manager.resolveSequences()
+      expect(manager.producerEpoch).toBe(epoch + 1)
+    }
+  })
+})

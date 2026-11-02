@@ -149,8 +149,22 @@ describe('Churn ledger > latency', () => {
 })
 
 describe('Churn ledger > what was read', () => {
+  test('accepts a 65th producer identity', () => {
+    const observed = new ObservedLog({ capacity: 65 })
+    for (let id = 0; id < 65; id++) observed.add(id, 0, 1, id, 0)
+    expect(observed.identityOverflow).toBe(0)
+  })
+
+  test('detects exact repeats among identities beyond the former limit', () => {
+    const observed = new ObservedLog({ capacity: 256 })
+    for (let id = 0; id < 256; id++) observed.add(id, id % 6, id, id % 17, id)
+    for (let id = 255; id >= 0; id--) observed.add(id, id % 6, id, id % 17, id)
+    expect(observed.identityOverflow).toBe(0)
+    expect(observed.repeatedIdentities).toBe(256)
+  })
+
   test('counts an id read again, a repeated identity, an id never offered and a bad sequence', () => {
-    const observed = new ObservedLog({ capacity: 8, identities: 2 })
+    const observed = new ObservedLog({ capacity: 8 })
     const add = ({ id, partition, pid, epoch, sequence }) =>
       observed.add(id, partition, pid, epoch, sequence)
 
@@ -170,9 +184,56 @@ describe('Churn ledger > what was read', () => {
       repeatedIdentities: 1,
       unexpected: 2,
       badSequences: 1,
-      identityOverflow: 1,
+      identityOverflow: 0,
     })
     expect(observed.seen[1]).toBe(2)
+  })
+
+  test('admits exactly capacity keys, rejects one more, and still detects admitted repeats', () => {
+    const observed = new ObservedLog({ capacity: 8 })
+    const ledger = new OfferLedger({ capacity: 8, partitions: 1 })
+    for (let id = 0; id < 8; id++) {
+      ledger.offer(0)
+      ledger.settle(id, STATUS.ACK)
+      observed.add(id, 0, 1, id, 0)
+    }
+    expect(mergeDurability(ledger, observed).ok).toBe(true)
+    observed.add(0, 0, 1, 8, 0)
+    observed.add(7, 0, 1, 7, 0)
+    expect(observed).toMatchObject({ identities: 8, identityOverflow: 1, repeatedIdentities: 1 })
+    expect(mergeDurability(ledger, observed).violations.join()).toContain(
+      '1 records exceed the raw-identity table capacity'
+    )
+  })
+
+  test('keeps all int64 producer bits, including adjacent ids beyond 2^53', () => {
+    const observed = new ObservedLog({ capacity: 8 })
+    const pids = [
+      0n,
+      9007199254740992n,
+      9007199254740993n,
+      9223372036854775807n,
+      -9223372036854775808n,
+      -1n,
+    ]
+    pids.forEach((pid, id) => observed.add(id, 0, pid, 0, 0))
+    expect(observed.repeatedIdentities).toBe(0)
+    pids.forEach((pid, id) => observed.add(id, 0, String(pid), 0, 0))
+    expect(observed.repeatedIdentities).toBe(pids.length)
+  })
+
+  test.each([9007199254740992, 9223372036854775808n, -9223372036854775809n])(
+    'rejects a producer id that cannot be represented losslessly: %s',
+    (pid) => {
+      const observed = new ObservedLog({ capacity: 8 })
+      expect(() => observed.add(0, 0, pid, 0, 0)).toThrow(RangeError)
+    }
+  )
+
+  test.each([-1, 8, 0.5, NaN, Infinity])('rejects bad sequence %s', (sequence) => {
+    const observed = new ObservedLog({ capacity: 8 })
+    observed.add(0, 0, 1, 0, sequence)
+    expect(observed).toMatchObject({ badSequences: 1, identities: 0 })
   })
 
   test('tell the same sequence of another partition, pid or epoch apart', () => {
@@ -182,20 +243,49 @@ describe('Churn ledger > what was read', () => {
     observed.add(1, 1, 1, 0, 0)
     observed.add(2, 0, 2, 0, 0)
     observed.add(3, 0, 1, 1, 0)
+    observed.add(4, 65536, 1, 0, 0)
 
     expect(observed.repeatedIdentities).toBe(0)
+    observed.add(4, 65536, 1, 0, 0)
+    expect(observed.repeatedIdentities).toBe(1)
   })
 
   test('forget everything on reset and keep their storage', () => {
-    const observed = new ObservedLog({ capacity: 8, identities: 1 })
-    const storage = [observed.seen, observed.bitmaps[0]]
+    const observed = new ObservedLog({ capacity: 8 })
+    const storage = [
+      observed.seen,
+      observed.pids,
+      observed.partitions,
+      observed.epochs,
+      observed.sequences,
+    ]
+    for (let id = 0; id < 8; id++) observed.add(id, 0, 1, id, 0)
     observed.add(0, 0, 1, 0, 0)
+    observed.add(0, 0, 1, 8, 0)
+    observed.add(-1, 0, 1, 0, 0)
+    observed.add(0, 0, 1, 0, -1)
 
     observed.reset()
     observed.add(0, 0, 1, 0, 0)
 
-    expect(observed).toMatchObject({ records: 1, repeatedIds: 0, repeatedIdentities: 0 })
-    expect([observed.seen, observed.bitmaps[0]]).toEqual(storage)
+    expect(observed).toMatchObject({
+      records: 1,
+      repeatedIds: 0,
+      repeatedIdentities: 0,
+      unexpected: 0,
+      badSequences: 0,
+      identityOverflow: 0,
+    })
+    const reused = [
+      observed.seen,
+      observed.pids,
+      observed.partitions,
+      observed.epochs,
+      observed.sequences,
+    ]
+    reused.forEach((buffer, index) => expect(buffer).toBe(storage[index]))
+    for (let id = 1; id < 8; id++) observed.add(id, 0, 1, id, 0)
+    expect(observed).toMatchObject({ identities: 8, identityOverflow: 0 })
   })
 })
 
