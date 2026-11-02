@@ -1,5 +1,6 @@
 const { Kafka, logLevel } = require('../../../index')
 const { secureRandom, plainTextBrokers, waitForTopicPropagation } = require('testHelpers')
+const { disconnectAll } = require('./fixtures/boundedCleanup')
 
 // Gated: both rows evict a member on purpose and would race the other consumer specs. Run them
 // alone: `npm run test:e2e:poll-guard`.
@@ -47,16 +48,6 @@ const waitForCondition = async (predicate, budget) => {
 }
 
 /**
- * Awaits `promise` but gives up after `ms`, so a teardown can never outlive its hook budget.
- * @param {Promise<unknown>} promise
- * @param {number} ms
- * @returns {Promise<void>}
- */
-const withTimeout = async (promise, ms) => {
-  await Promise.race([promise, sleep(ms)])
-}
-
-/**
  * Live confirmation that the poll-interval guard evicts a member whose handler overruns, and that
  * a static member takes the local half of that sequence without leaving the group.
  *
@@ -98,22 +89,11 @@ describePollGuard('Consumer > poll-interval guard (live)', () => {
     let consumer
 
     afterEach(async () => {
-      consumer &&
-        (await withTimeout(
-          consumer.disconnect().catch(() => {}),
-          DISCONNECT_BUDGET_MS
-        ))
-      producer &&
-        (await withTimeout(
-          producer.disconnect().catch(() => {}),
-          DISCONNECT_BUDGET_MS
-        ))
-      admin &&
-        (await withTimeout(
-          admin.disconnect().catch(() => {}),
-          DISCONNECT_BUDGET_MS
-        ))
-      consumer = producer = admin = kafka = null
+      try {
+        await disconnectAll([consumer, producer, admin], DISCONNECT_BUDGET_MS)
+      } finally {
+        consumer = producer = admin = kafka = null
+      }
     }, 60000)
 
     /**

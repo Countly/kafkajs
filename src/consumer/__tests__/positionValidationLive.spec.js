@@ -25,6 +25,7 @@ const {
   pollUntil,
 } = require('../../producer/__tests__/fixtures/bounded')
 const { positionOf, runWithEvidence } = require('./fixtures/evidenceCase')
+const { disconnectAll } = require('./fixtures/boundedCleanup')
 
 // Gated because both scenarios move leadership on the shared cluster, which is not safe alongside
 // the other consumer specs. Run them one at a time, each in its own foreground cluster:
@@ -44,19 +45,10 @@ const DELIVERY_BUDGET = { attempts: 120, delay: 500 } // 60 s - records already 
 const HINT_BUDGET = { attempts: 120, delay: 500 } // 60 s - one idle long poll plus the election
 const BROKER_RESTART_BUDGET = { attempts: 120, delay: 1000 } // 120 s - container start + registration
 const METADATA_BUDGET = { attempts: 60, delay: 1000 } // 60 s - post-election metadata convergence
-const DISCONNECT_BUDGET_MS = 15000 // one dead-broker request timeout plus slack
-
-/**
- * Awaits `promise` but gives up after `ms`, so a teardown can never outlive its hook budget: a
- * client with in-flight requests to a stopped container only fails them after its own
- * `requestTimeout`, and several such disconnects in a row can exceed Jest's hook timeout.
- * @param {Promise<unknown>} promise
- * @param {number} ms
- * @returns {Promise<void>}
- */
-const withTimeout = async (promise, ms) => {
-  await Promise.race([promise, sleep(ms)])
-}
+// One dead-broker request timeout plus slack: a client with in-flight requests to a stopped
+// container only fails them after its own `requestTimeout`, and several such disconnects in a row
+// can exceed Jest's hook timeout.
+const DISCONNECT_BUDGET_MS = 15000
 
 /**
  * Prints one line per phase of a live scenario with the elapsed time since the test started.
@@ -125,26 +117,12 @@ describeLeaderMove('Consumer > leader move during consumption (live)', () => {
   // every delivery, so removing it while a batch is still in flight would race the handler.
   afterEach(async () => {
     const admitted = liveRun.takeAdmission()
-    consumer &&
-      admitted &&
-      (await withTimeout(
-        consumer.disconnect().catch(() => {}),
-        DISCONNECT_BUDGET_MS
-      ))
-    producer &&
-      admitted &&
-      (await withTimeout(
-        producer.disconnect().catch(() => {}),
-        DISCONNECT_BUDGET_MS
-      ))
-    admin &&
-      admitted &&
-      (await withTimeout(
-        admin.disconnect().catch(() => {}),
-        DISCONNECT_BUDGET_MS
-      ))
-    applyLeaderHintSpy && applyLeaderHintSpy.mockRestore()
-    applyLeaderHintSpy = consumer = producer = admin = kafka = adminKafka = null
+    try {
+      admitted && (await disconnectAll([consumer, producer, admin], DISCONNECT_BUDGET_MS))
+    } finally {
+      applyLeaderHintSpy && applyLeaderHintSpy.mockRestore()
+      applyLeaderHintSpy = consumer = producer = admin = kafka = adminKafka = null
+    }
   })
 
   it(

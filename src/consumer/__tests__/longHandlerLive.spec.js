@@ -1,5 +1,6 @@
 const { Kafka, logLevel } = require('../../../index')
 const { secureRandom, plainTextBrokers, createTopic } = require('testHelpers')
+const { disconnectAll } = require('./fixtures/boundedCleanup')
 
 // Gated: each row parks a member for forty seconds and would race the other consumer specs. Run
 // them alone: `npm run test:e2e:long-handler`.
@@ -44,16 +45,6 @@ const waitForCondition = async (predicate, budget) => {
     await sleep(budget.delay)
   }
   return false
-}
-
-/**
- * Awaits `promise` but gives up after `ms`, so a teardown can never outlive its hook budget.
- * @param {Promise<unknown>} promise
- * @param {number} ms
- * @returns {Promise<void>}
- */
-const withTimeout = async (promise, ms) => {
-  await Promise.race([promise, sleep(ms)])
 }
 
 /**
@@ -125,17 +116,11 @@ describeLongHandler('Consumer > long handler (live)', () => {
     let consumer
 
     afterEach(async () => {
-      consumer &&
-        (await withTimeout(
-          consumer.disconnect().catch(() => {}),
-          DISCONNECT_BUDGET_MS
-        ))
-      producer &&
-        (await withTimeout(
-          producer.disconnect().catch(() => {}),
-          DISCONNECT_BUDGET_MS
-        ))
-      consumer = producer = kafka = null
+      try {
+        await disconnectAll([consumer, producer], DISCONNECT_BUDGET_MS)
+      } finally {
+        consumer = producer = kafka = null
+      }
     }, 60000)
 
     /**
