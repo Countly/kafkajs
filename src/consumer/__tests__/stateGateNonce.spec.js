@@ -1,3 +1,4 @@
+const { randomUUID } = require('node:crypto')
 const { secureRandom } = require('testHelpers')
 const { gateNonce } = require('./fixtures/gateNonce')
 
@@ -20,6 +21,8 @@ describe('Consumer > state gate nonce', () => {
   })
 
   it('rejects the old unbounded form', () => {
-    expect(`n${secureRandom()}`).not.toMatch(GUARD_NONCE)
+    const highPidId = `${'e'.repeat(20)}-4194304-${randomUUID()}`
+    expect(`n${highPidId}`).not.toMatch(GUARD_NONCE)
+    expect(gateNonce(highPidId)).toMatch(GUARD_NONCE)
   })
 })
