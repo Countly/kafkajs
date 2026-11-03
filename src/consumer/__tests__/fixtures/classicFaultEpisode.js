@@ -33,10 +33,11 @@ afterEach(() => {
 })
 
 /**
- * Records where each timer created while tracing is on was made, until the timer ends, so a
- * timer that outlives an episode can be named in the failure.
- * @returns {{ live: () => string[], disable: () => void }} the creation stacks of timers still
- *   active, and a stop
+ * Records where each timer created while tracing is on was made, until the timer ends. Only
+ * timers created while the episode is traced are judged, so timers left elsewhere in a
+ * long-lived Jest worker cannot fail it, and a leaked timer cannot hide behind one that ended.
+ * @returns {{ outliving: () => Promise<string[]>, disable: () => void }} the creation stacks of
+ *   the traced timers still active, and a stop
  */
 const traceTimers = () => {
   const live = new Map()
@@ -53,7 +54,12 @@ const traceTimers = () => {
     },
   }).enable()
   const tracer = {
-    live: () => [...live.values()],
+    outliving: async () => {
+      // Node reports a timer's end to `destroy` from a later check phase.
+      await new Promise(setImmediate)
+      await new Promise(setImmediate)
+      return [...live.values()]
+    },
     disable: () => {
       hook.disable()
       tracers.delete(tracer)
@@ -236,7 +242,6 @@ class ClassicFaultEpisode {
         created: this.cluster.sockets().length,
         destroyed: this.cluster.sockets().filter((socket) => socket.destroyed).length,
       }),
-      activeResources: true,
     })
     this.timers = traceTimers()
     this.baseline = await this.probe.snapshot()
@@ -628,12 +633,13 @@ class ClassicFaultEpisode {
   }
 
   /**
-   * Releases every held gate, closes the consumer, removes the listeners and compares the
-   * resources with the baseline taken before `open`. Runs in a `finally`, so a failed episode
-   * still leaves nothing behind.
+   * Releases every held gate, closes the consumer, removes the listeners, compares open sockets
+   * with the baseline `open` took before building the consumer and requires every timer created
+   * while the episode was traced to have ended. Runs in a `finally`, so a failed episode still
+   * leaves nothing behind.
    * @returns {Promise<void>}
-   * @throws {Error} when the consumer cannot be closed, the cluster refused a request, or a socket
-   *   or event-loop resource outlives the episode
+   * @throws {Error} when the consumer cannot be closed, the cluster refused a request, a socket
+   *   outlives the episode, or a timer it created is still active (named by its creation stack)
    */
   async close() {
     try {
@@ -646,12 +652,10 @@ class ClassicFaultEpisode {
       await pause(50)
       const after = await this.probe.snapshot()
       expect(after.sockets.open).toBe(this.baseline.sockets.open)
-      const timers = after.activeResources.Timeout ?? 0
-      const allowed = this.baseline.activeResources.Timeout ?? 0
-      if (timers > allowed) {
-        const origins = this.timers.live().join('\n\n')
+      const outliving = await this.timers.outliving()
+      if (outliving.length > 0) {
         throw new Error(
-          `${timers} timers outlive the episode (baseline ${allowed}); still active from it:\n${origins}`
+          `${outliving.length} timer(s) created by the episode outlive it:\n${outliving.join('\n\n')}`
         )
       }
     } finally {
