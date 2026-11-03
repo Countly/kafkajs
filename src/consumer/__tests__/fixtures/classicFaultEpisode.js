@@ -36,17 +36,17 @@ afterEach(() => {
  * Records where each timer created while tracing is on was made, until the timer ends. Only
  * timers created while the episode is traced are judged, so timers left elsewhere in a
  * long-lived Jest worker cannot fail it, and a leaked timer cannot hide behind one that ended.
- * @returns {{ outliving: () => Promise<string[]>, disable: () => void }} the creation stacks of
- *   the traced timers still active, and a stop
+ * @returns {{ outliving: () => Promise<string[]>, disable: () => void }} for each traced timer
+ *   still active, its delay, callback and creation stack; and a stop
  */
 const traceTimers = () => {
   const live = new Map()
   const hook = createHook({
-    init(id, type) {
+    init(id, type, triggerId, timer) {
       if (type !== 'Timeout') return
       const limit = Error.stackTraceLimit
-      Error.stackTraceLimit = 30
-      live.set(id, new Error('timer created').stack)
+      Error.stackTraceLimit = 40
+      live.set(id, { timer, stack: new Error('timer created').stack })
       Error.stackTraceLimit = limit
     },
     destroy(id) {
@@ -58,7 +58,12 @@ const traceTimers = () => {
       // Node reports a timer's end to `destroy` from a later check phase.
       await new Promise(setImmediate)
       await new Promise(setImmediate)
-      return [...live.values()]
+      // `@` instead of `at`, so Jest keeps the internal frames it would strip from a stack.
+      return [...live.values()].map(
+        ({ timer, stack }) =>
+          `${timer._idleTimeout} ms, ${String(timer._onTimeout).slice(0, 300)}\n` +
+          stack.replace(/^(\s+)at /gm, '$1@ ')
+      )
     },
     disable: () => {
       hook.disable()
