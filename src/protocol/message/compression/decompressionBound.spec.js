@@ -149,19 +149,19 @@ describe('Protocol > Compression > the decompression bound', () => {
     test.each([
       [
         'a typed refusal naming the size',
-        Object.assign(new Error('x'), { reason: 'decompressed-size' }),
         'decompressed-size',
+        Object.assign(new Error('x'), { reason: 'decompressed-size' }),
       ],
       [
         'the RangeError of Node maxOutputLength',
-        Object.assign(new RangeError('x'), { code: 'ERR_BUFFER_TOO_LARGE' }),
         'decompressed-size',
+        Object.assign(new RangeError('x'), { code: 'ERR_BUFFER_TOO_LARGE' }),
       ],
-      ['a RangeError of another kind', new RangeError('Invalid array length'), 'decompression'],
-      ['a TypeError', new TypeError('x'), 'decompression'],
-      ['a string', 'boom', 'decompression'],
-      ['undefined', undefined, 'decompression'],
-    ])('%s is %s', async (_, thrown, reason) => {
+      ['a RangeError of another kind', 'decompression', new RangeError('Invalid array length')],
+      ['a TypeError', 'decompression', new TypeError('x')],
+      ['a string', 'decompression', 'boom'],
+      ['undefined', 'decompression', undefined],
+    ])('%s is refused as %s', async (_, reason, thrown) => {
       const error = await refusal(decompressBounded(codecThrowing(thrown), 1, Buffer.alloc(1), 10))
 
       expect(error).toMatchObject({ reason, codec: 'gzip', limit: 10 })

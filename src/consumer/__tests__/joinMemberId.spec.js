@@ -275,13 +275,13 @@ describe('Consumer > a JoinGroup lost while parked', () => {
     })
 
     it.each([
-      ['SyncGroup', { errorCode: 22 }, 'ILLEGAL_GENERATION'],
-      ['Heartbeat', { errorCode: 22 }, 'ILLEGAL_GENERATION'],
-      ['Heartbeat', { errorCode: 14 }, 'COORDINATOR_LOAD_IN_PROGRESS'],
-      ['Heartbeat', { errorCode: 15 }, 'COORDINATOR_NOT_AVAILABLE'],
-      ['Heartbeat', { errorCode: 16 }, 'NOT_COORDINATOR'],
-      ['Heartbeat', KILLED, 'a connection lost on the heartbeat'],
-    ])('keeps the id through a %s failure: %s', async (api, fault) => {
+      ['SyncGroup', 'ILLEGAL_GENERATION', { errorCode: 22 }],
+      ['Heartbeat', 'ILLEGAL_GENERATION', { errorCode: 22 }],
+      ['Heartbeat', 'COORDINATOR_LOAD_IN_PROGRESS', { errorCode: 14 }],
+      ['Heartbeat', 'COORDINATOR_NOT_AVAILABLE', { errorCode: 15 }],
+      ['Heartbeat', 'NOT_COORDINATOR', { errorCode: 16 }],
+      ['Heartbeat', 'a connection lost on the heartbeat', KILLED],
+    ])('keeps the id through a %s failure: %s', async (api, _, fault) => {
       const { cluster, joinIds, frames, allocations } = coordinator()
       if (api === 'SyncGroup') cluster.schedule.once({ api }, fault)
       await join(cluster)
