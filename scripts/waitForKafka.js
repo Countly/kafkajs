@@ -53,7 +53,9 @@ const consumerGroupDescribe = (containerId) =>
   )
 
 console.log('\nFinding container ids...')
-const ids = ['kafka1', 'kafka2', 'kafka3'].map(findContainerId)
+const ids = (process.env.WAIT_FOR_KAFKA_NODES || 'kafka1,kafka2,kafka3')
+  .split(',')
+  .map(findContainerId)
 
 console.log('\nWaiting for nodes...')
 ids.forEach(waitForNode)

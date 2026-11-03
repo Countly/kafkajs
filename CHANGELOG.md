@@ -124,6 +124,10 @@ Versions before 3.0.0 are internal alpha tags and are not published.
 
 #### Tooling
 
+- The exit gate workflow runs each check as its own job, started by the `gate` label or a manual dispatch.
+
+- The exit checks run in CI from `scripts/ci/gate.json`, and `scripts/ci/checkIdentities.js` fails a gate job whose live specs skipped, failed or left an expected test out of the Jest report, including the unit script and its allowed skips. Node test reports enforce completed OTel runs and live identities; tracked-file hygiene sweeps compare against the previous release tag.
+
 - The coverage floors are re-derived at this release from two cold coverage runs on Kafka 4.3.1, the lower of the two: global 98.9 % statements, 96.4 % branches, 98.9 % functions, 99.1 % lines; `src/consumer/groupProtocol/` 99.9 / 99.4 / 100 / 99.9; `src/consumer/assigners/` branches 97.3 and functions 99.3. No floor is lower than before. The coverage run now executes its spec files in fixed batches of 25 instead of one broad run, and checks every batch's tests and coverage maps against a sealed list.
 
 - Extend transport fixtures with independently checked consumer error and Fetch-session variants.
