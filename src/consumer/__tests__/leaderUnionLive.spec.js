@@ -994,11 +994,13 @@ const holdSyncGroup = (schedule, scope) => (socket) => {
  * and the leader's union watch finds C and starts a later round, which assigns every partition of C
  * to its subscriber. No manual rejoin or stop is involved.
  *
- * Only the leader can start that round: a follower's rejoin with unchanged metadata is answered by
- * the broker with the current generation. The follower's own rebalances are recorded as
- * observations only. The evidence row is written in a `finally`, so a case that fails or times out
- * still records the stage it reached, each member's Metadata requests and answers since the
- * creation, and the join, rebalance and crash events with their times.
+ * The follower's metadata age exceeds the observation window, so its own discovery cannot start
+ * the later round before the leader watch reads C. A range follower can change its subscription
+ * protocol bytes on rejoin even with unchanged topics, because its generation has changed.
+ * The follower's own rebalances are recorded as observations only. The evidence row is written in
+ * a `finally`, so a case that fails or times out still records the stage it reached, each member's
+ * Metadata requests and answers since the creation, and the join, rebalance and crash events with
+ * their times.
  * @param {{ name: string, create: Function }} assignor
  * @returns {(scope: AbortSignal) => Promise<void>}
  */
@@ -1038,7 +1040,10 @@ const topicCreatedInFirstRound =
             name: 'follower',
             topics: [c],
             assigner: create,
-            consumerOptions: { allowAutoTopicCreation: false, metadataMaxAge: METADATA_MAX_AGE_MS },
+            consumerOptions: {
+              allowAutoTopicCreation: false,
+              metadataMaxAge: DEFAULT_METADATA_MAX_AGE_MS,
+            },
           })
           seats.push(follower)
           trace.watch(follower)
@@ -1119,7 +1124,7 @@ const topicCreatedInFirstRound =
               groupProtocol: 'classic',
               allowAutoTopicCreation: false,
               leaderMetadataMaxAgeMs: METADATA_MAX_AGE_MS,
-              followerMetadataMaxAgeMs: METADATA_MAX_AGE_MS,
+              followerMetadataMaxAgeMs: DEFAULT_METADATA_MAX_AGE_MS,
             },
             ...wireOf(seats),
             stage: state.stage,
