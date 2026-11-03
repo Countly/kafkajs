@@ -38,8 +38,8 @@ const throwTruncated = () => {
 }
 
 /**
- * Walks the first frame of a zstd stream (RFC 8878 §3.1) and throws when it ends before its last
- * block or checksum. Node 22's `zlib` returns the part it could decode, with no error, for such
+ * Walks the first frame of a zstd stream (RFC 8878 section 3.1) and throws when it ends before
+ * its last block or checksum. Node 22's `zlib` returns the part it could decode, with no error, for such
  * input; Node 24.20+/26.6+ reject it (nodejs/node#64593). Like `zlib`, it looks at the first
  * frame only. An unknown magic and a reserved block type are left to `zlib`, which rejects them
  * on every version; the reserved header bit does not change the layout, so such a frame is walked
