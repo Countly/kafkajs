@@ -68,6 +68,7 @@ Versions before 3.0.0 are internal alpha tags and are not published.
 
 #### Fixes
 
+- On Node 22, a truncated zstd record batch is now refused as `KafkaJSCorruptRecordError` (reason `decompression`), as on Node 24.20+ and 26.6+, instead of decoding as fewer records. Node 22's `zlib` does not reject truncated zstd input (nodejs/node#64593), so the codec checks the first frame's blocks and checksum itself on every Node version.
 - An ordinary `consumer.disconnect()` called from a `CRASH` listener no longer cancels the automatic restart, as in 2.2.4, which emits `CRASH` before it arms the restart timer. The restart waits for that close to finish its cluster and group cleanup, then starts a new run. A forced close (`disconnect({ timeout: 0 })`), a close whose `timeout` expires, and any `stop()` or `disconnect()` asked after the restart is armed still cancel it, as does an explicit `run()`, which supersedes a pending restart. A cancelled restart clears its timer at once and holds no listener or connection lifetime.
 - Fence unknown-target metadata responses before cache installation and keep periodic naming attempts after the fast discovery budget.
 
