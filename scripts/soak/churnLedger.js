@@ -24,9 +24,6 @@ const NAMES = ['none', 'pending', 'ack', 'unknown', 'unsent', 'unexpected']
 /** One in this many offered ids carries a produce-to-consume latency sample. */
 const LATENCY_SAMPLE_EVERY = 16
 
-/** The most `(partition, producer id, epoch)` identities one observation can tell apart. */
-const MAX_IDENTITIES = 64
-
 /** The bytes of the head of every record value: the offered id and the run tag. */
 const VALUE_HEAD_BYTES = 8
 
@@ -183,32 +180,36 @@ class OfferLedger {
 }
 
 /**
- * What a reader saw in the log, by offered id and by raw record identity, with fixed storage: a
- * saturating count per id, and for each producer identity a bitmap of the sequences it has seen,
- * so a repeated identity is found without any set or sort.
+ * Counts offered ids and exact raw identities without growing storage. Linear probing uses at
+ * most 75% of the slots; each slot is 18 bytes (int64 pid, int32 partition, int16 epoch, int32
+ * sequence). At capacity 1,804,096 the table is 43,298,316 bytes, plus capacity bytes for id counts.
+ * A sequence of -1 marks an empty slot; valid sequences are nonnegative integers below capacity.
  */
 class ObservedLog {
   /**
+   * Allocates all storage before sampling begins; at most capacity distinct raw keys are admitted.
    * @param {object} options
    * @param {number} options.capacity how many ids the offering ledger can hold
-   * @param {number} [options.identities=MAX_IDENTITIES]
    */
-  constructor({ capacity, identities = MAX_IDENTITIES }) {
+  constructor({ capacity }) {
     this.capacity = capacity
     this.seen = new Uint8Array(capacity)
-    this.bitmaps = Array.from({ length: identities }, () => new Uint8Array((capacity + 7) >> 3))
-    this.slots = new Map()
+    const slots = Math.max(1, Math.ceil(capacity / 0.75))
+    this.pids = new BigInt64Array(slots)
+    this.partitions = new Int32Array(slots)
+    this.epochs = new Int16Array(slots)
+    this.sequences = new Int32Array(slots)
     this.reset()
   }
 
   /**
-   * Forgets everything seen, so the same storage serves the next reading.
+   * Forgets every observation and reuses all buffers. Empty sequences hide the old key fields.
    * @returns {void}
    */
   reset() {
     this.seen.fill(0)
-    for (const bitmap of this.bitmaps) bitmap.fill(0)
-    this.slots.clear()
+    this.sequences.fill(-1)
+    this.identities = 0
     this.records = 0
     this.repeatedIds = 0
     this.repeatedIdentities = 0
@@ -218,13 +219,15 @@ class ObservedLog {
   }
 
   /**
-   * Takes one record of the log.
-   * @param {number} id the offered id its value carries; -1 for a value that is not this run's
-   * @param {number} partition
-   * @param {number} pid the producer id
-   * @param {number} epoch the producer epoch
-   * @param {number} sequence the record's producer sequence
+   * Takes one record. Duplicates remain detectable even after the distinct-key limit is reached.
+   * Producer ids must be supplied losslessly; use bigint or a decimal string beyond safe integers.
+   * @param {number} id the offered id; -1 for a value that is not this run's
+   * @param {number} partition int32 Kafka partition
+   * @param {bigint|string|number} pid signed int64 producer id
+   * @param {number} epoch int16 producer epoch
+   * @param {number} sequence integer producer sequence in [0, capacity)
    * @returns {void}
+   * @throws {SyntaxError|TypeError|RangeError} if pid is not a lossless signed int64
    */
   add(id, partition, pid, epoch, sequence) {
     this.records += 1
@@ -235,24 +238,45 @@ class ObservedLog {
     if (this.seen[id] > 0) this.repeatedIds += 1
     if (this.seen[id] < 2) this.seen[id] += 1
 
-    if (!(sequence >= 0 && sequence < this.capacity)) {
+    if (!(Number.isInteger(sequence) && sequence >= 0 && sequence < this.capacity)) {
       this.badSequences += 1
       return
     }
-    const key = `${partition}:${pid}:${epoch}`
-    let slot = this.slots.get(key)
-    if (slot === undefined) {
-      if (this.slots.size === this.bitmaps.length) {
-        this.identityOverflow += 1
+    if (typeof pid === 'number' && !Number.isSafeInteger(pid)) {
+      throw new RangeError('Producer id must be supplied as a lossless int64')
+    }
+    const producer = BigInt(pid)
+    if (BigInt.asIntN(64, producer) !== producer) {
+      throw new RangeError('Producer id is outside signed int64 range')
+    }
+    let hash = Number(BigInt.asUintN(32, producer))
+    hash = Math.imul(hash ^ Number(BigInt.asIntN(32, producer >> 32n)), 0x85ebca6b)
+    hash = Math.imul(hash ^ partition, 0x85ebca6b)
+    hash = Math.imul(hash ^ epoch, 0x85ebca6b)
+    hash = Math.imul(hash ^ sequence, 0x85ebca6b)
+    hash ^= hash >>> 16
+    let slot = (hash >>> 0) % this.sequences.length
+    while (this.sequences[slot] !== -1) {
+      if (
+        this.pids[slot] === producer &&
+        this.partitions[slot] === partition &&
+        this.epochs[slot] === epoch &&
+        this.sequences[slot] === sequence
+      ) {
+        this.repeatedIdentities += 1
         return
       }
-      slot = this.slots.size
-      this.slots.set(key, slot)
+      slot = (slot + 1) % this.sequences.length
     }
-    const bitmap = this.bitmaps[slot]
-    const mask = 1 << (sequence & 7)
-    if (bitmap[sequence >> 3] & mask) this.repeatedIdentities += 1
-    else bitmap[sequence >> 3] |= mask
+    if (this.identities === this.capacity) {
+      this.identityOverflow += 1
+      return
+    }
+    this.pids[slot] = producer
+    this.partitions[slot] = partition
+    this.epochs[slot] = epoch
+    this.sequences[slot] = sequence
+    this.identities += 1
   }
 }
 
@@ -335,7 +359,7 @@ const mergeDurability = (ledger, observed, view = 'log') => {
   }
   if (observed.badSequences || observed.identityOverflow) {
     violations.push(
-      `durability (${view}): ${observed.badSequences} sequences out of range and ${observed.identityOverflow} identities past the table`
+      `durability (${view}): ${observed.badSequences} sequences out of range and ${observed.identityOverflow} records exceed the raw-identity table capacity`
     )
   }
 
@@ -462,7 +486,6 @@ class ObservationJournal {
 module.exports = {
   STATUS,
   LATENCY_SAMPLE_EVERY,
-  MAX_IDENTITIES,
   VALUE_HEAD_BYTES,
   ENTRY_BYTES,
   encodeValue,

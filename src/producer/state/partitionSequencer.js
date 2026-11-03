@@ -709,9 +709,12 @@ class PartitionSequencer {
 
   /**
    * Settles every unresolved sequence whose partition has nothing in flight: `'cleared'` when the
-   * acknowledged sequences reach `nextSequence` (the expired batch's successors landed), `'gap'`
-   * otherwise - the caller bumps the epoch (idempotent-only) or arms the abortable error
-   * (transactional). Either way the mark is gone. Run before every drain.
+   * acknowledged sequences reach `nextSequence` (the expired batch's successors landed) or the
+   * partition is stale, `'gap'` otherwise - the caller bumps the epoch (idempotent-only) or arms
+   * the abortable error (transactional). A stale partition's gap needs no new identity: the
+   * producer-wide bump already moved it, and the next drain restarts it at sequence 0, so
+   * `'cleared'` there does not acknowledge the expired send. Either way the mark is gone. Run
+   * before every drain.
    * @see https://github.com/apache/kafka/blob/4.3/clients/src/main/java/org/apache/kafka/clients/producer/internals/TransactionManager.java
    * @returns {ReadonlyArray<{ topic: string, partition: number, outcome: 'cleared'|'gap' }>}
    */
@@ -731,7 +734,7 @@ class PartitionSequencer {
       resolved.push({
         topic: entry.topic,
         partition: entry.partition,
-        outcome: reached ? 'cleared' : 'gap',
+        outcome: reached || entry.stale ? 'cleared' : 'gap',
       })
       this.#dropIfIdle(entry)
     }

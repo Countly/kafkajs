@@ -1,3 +1,5 @@
+// eslint-disable-next-line n/no-unsupported-features/node-builtins -- test-only failure diagnostics
+const { createHook } = require('node:async_hooks')
 const { performance } = require('node:perf_hooks')
 const { Kafka, logLevel } = require('../../../../index')
 const { createScriptedCluster, groupScript } = require('../../../../testHelpers/scriptedCluster')
@@ -23,6 +25,49 @@ const DATA_PLANE = ['Fetch', 'ListOffsets', 'OffsetFetch', 'Metadata', 'ApiVersi
 
 /** @param {number} ms @returns {Promise<void>} resolves after the real delay */
 const pause = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
+
+/** Tracers still on; a test that hangs before `close` must not leave its hook on for the next. */
+const tracers = new Set()
+afterEach(() => {
+  for (const tracer of [...tracers]) tracer.disable()
+})
+
+/**
+ * Records where each timer created while tracing is on was made, until the timer ends. Only
+ * timers created while the episode is traced are judged, so timers left elsewhere in a
+ * long-lived Jest worker cannot fail it, and a leaked timer cannot hide behind one that ended.
+ * @returns {{ outliving: () => Promise<string[]>, disable: () => void }} the creation stacks of
+ *   the traced timers still active, and a stop
+ */
+const traceTimers = () => {
+  const live = new Map()
+  const hook = createHook({
+    init(id, type) {
+      if (type !== 'Timeout') return
+      const limit = Error.stackTraceLimit
+      Error.stackTraceLimit = 30
+      live.set(id, new Error('timer created').stack)
+      Error.stackTraceLimit = limit
+    },
+    destroy(id) {
+      live.delete(id)
+    },
+  }).enable()
+  const tracer = {
+    outliving: async () => {
+      // Node reports a timer's end to `destroy` from a later check phase.
+      await new Promise(setImmediate)
+      await new Promise(setImmediate)
+      return [...live.values()]
+    },
+    disable: () => {
+      hook.disable()
+      tracers.delete(tracer)
+    },
+  }
+  tracers.add(tracer)
+  return tracer
+}
 
 /**
  * @param {() => boolean} predicate
@@ -132,6 +177,7 @@ class ClassicFaultEpisode {
     this.cluster = null
     this.consumer = null
     this.probe = null
+    this.timers = null
   }
 
   /**
@@ -196,8 +242,8 @@ class ClassicFaultEpisode {
         created: this.cluster.sockets().length,
         destroyed: this.cluster.sockets().filter((socket) => socket.destroyed).length,
       }),
-      activeResources: true,
     })
+    this.timers = traceTimers()
     this.baseline = await this.probe.snapshot()
 
     const { retry, groupProtocol, requestTimeout = REQUEST_TIMEOUT_MS } = this.row.config
@@ -587,12 +633,13 @@ class ClassicFaultEpisode {
   }
 
   /**
-   * Releases every held gate, closes the consumer, removes the listeners and compares the
-   * resources with the baseline taken before `open`. Runs in a `finally`, so a failed episode
-   * still leaves nothing behind.
+   * Releases every held gate, closes the consumer, removes the listeners, compares open sockets
+   * with the baseline `open` took before building the consumer and requires every timer created
+   * while the episode was traced to have ended. Runs in a `finally`, so a failed episode still
+   * leaves nothing behind.
    * @returns {Promise<void>}
-   * @throws {Error} when the consumer cannot be closed, the cluster refused a request, or a socket
-   *   or event-loop resource outlives the episode
+   * @throws {Error} when the consumer cannot be closed, the cluster refused a request, a socket
+   *   outlives the episode, or a timer it created is still active (named by its creation stack)
    */
   async close() {
     try {
@@ -605,10 +652,14 @@ class ClassicFaultEpisode {
       await pause(50)
       const after = await this.probe.snapshot()
       expect(after.sockets.open).toBe(this.baseline.sockets.open)
-      expect(after.activeResources.Timeout ?? 0).toBeLessThanOrEqual(
-        this.baseline.activeResources.Timeout ?? 0
-      )
+      const outliving = await this.timers.outliving()
+      if (outliving.length > 0) {
+        throw new Error(
+          `${outliving.length} timer(s) created by the episode outlive it:\n${outliving.join('\n\n')}`
+        )
+      }
     } finally {
+      this.timers?.disable()
       for (const off of this.cleanup.splice(0)) off()
     }
   }

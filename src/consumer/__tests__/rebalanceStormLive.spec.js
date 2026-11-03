@@ -1,6 +1,7 @@
 const { Kafka, logLevel } = require('../../../index')
 const { cooperativeSticky } = require('../assigners')
 const { secureRandom, plainTextBrokers, createTopic } = require('testHelpers')
+const { withDeadline, disconnectAll, startTrackedMember } = require('./fixtures/boundedCleanup')
 
 // Gated: the storm holds the group in rebalance for a minute and would race the other consumer
 // specs. Run it alone: `npm run test:e2e:rebalance-storm`.
@@ -49,16 +50,6 @@ const waitForCondition = async (predicate, budget) => {
     await sleep(budget.delay)
   }
   return false
-}
-
-/**
- * Awaits `promise` but gives up after `ms`, so a teardown can never outlive its hook budget.
- * @param {Promise<unknown>} promise
- * @param {number} ms
- * @returns {Promise<void>}
- */
-const withTimeout = async (promise, ms) => {
-  await Promise.race([promise, sleep(ms)])
 }
 
 /**
@@ -270,20 +261,15 @@ describeRebalanceStorm('Consumer > cooperative rebalance storm (live)', () => {
     afterEach(async () => {
       producing.on = false
 
-      for (const member of members) {
-        await withTimeout(
-          member.consumer.disconnect().catch(() => {}),
+      try {
+        await disconnectAll(
+          [...members.map((member) => member.consumer), producer],
           DISCONNECT_BUDGET_MS
         )
+      } finally {
+        producer = kafka = null
+        members = []
       }
-
-      producer &&
-        (await withTimeout(
-          producer.disconnect().catch(() => {}),
-          DISCONNECT_BUDGET_MS
-        ))
-      producer = kafka = null
-      members = []
     }, 120000)
 
     it(
@@ -307,40 +293,20 @@ describeRebalanceStorm('Consumer > cooperative rebalance storm (live)', () => {
          * @param {string} label
          * @returns {Promise<object>} the member, with its own event log
          */
-        const startMember = async (label) => {
-          const consumer = kafka.consumer({
-            groupId,
-            ...membershipOptions,
-            maxWaitTimeInMs: MAX_WAIT_TIME_MS,
+        const startMember = async (label) =>
+          startTrackedMember({
+            kafka,
+            consumerOptions: {
+              groupId,
+              ...membershipOptions,
+              maxWaitTimeInMs: MAX_WAIT_TIME_MS,
+            },
+            label,
+            members,
+            crashes,
+            received,
+            topic,
           })
-
-          const member = { label, consumer, events: [], batches: [] }
-
-          for (const type of [consumer.events.REBALANCING, consumer.events.GROUP_JOIN]) {
-            consumer.on(type, ({ timestamp, payload }) =>
-              member.events.push({ type, timestamp, payload })
-            )
-          }
-          consumer.on(consumer.events.START_BATCH_PROCESS, ({ timestamp, payload }) =>
-            member.batches.push({ timestamp, payload })
-          )
-          consumer.on(consumer.events.CRASH, ({ payload }) => crashes.push({ label, ...payload }))
-
-          await consumer.connect()
-          await consumer.subscribe({ topic, fromBeginning: true })
-          consumer
-            .run({
-              eachBatch: async ({ batch }) => {
-                for (const message of batch.messages) {
-                  received.push(`${batch.partition}:${message.offset}`)
-                }
-              },
-            })
-            .catch((e) => crashes.push({ label, error: e }))
-
-          members.push(member)
-          return member
-        }
 
         /** @param {object} member @param {number} since @returns {Promise<boolean>} */
         const waitForJoin = (member, since) =>
@@ -401,7 +367,7 @@ describeRebalanceStorm('Consumer > cooperative rebalance storm (live)', () => {
         while (Date.now() - stormStartedAt < STORM_DURATION_MS) {
           const transient = await startMember(`C${cycles}`)
           await sleep(cycle.uptimeMs)
-          await withTimeout(transient.consumer.disconnect(), DISCONNECT_BUDGET_MS)
+          await withDeadline(transient.consumer.disconnect(), DISCONNECT_BUDGET_MS)
           members = members.filter((member) => member !== transient)
           await sleep(cycle.downtimeMs)
           cycles++

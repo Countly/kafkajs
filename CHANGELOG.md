@@ -68,6 +68,7 @@ Versions before 3.0.0 are internal alpha tags and are not published.
 
 #### Fixes
 
+- On Node 22, a truncated zstd record batch is now refused as `KafkaJSCorruptRecordError` (reason `decompression`), as on Node 24.20+ and 26.6+, instead of decoding as fewer records. Node 22's `zlib` does not reject truncated zstd input (nodejs/node#64593), so the codec checks the first frame's blocks and checksum itself on every Node version.
 - An ordinary `consumer.disconnect()` called from a `CRASH` listener no longer cancels the automatic restart, as in 2.2.4, which emits `CRASH` before it arms the restart timer. The restart waits for that close to finish its cluster and group cleanup, then starts a new run. A forced close (`disconnect({ timeout: 0 })`), a close whose `timeout` expires, and any `stop()` or `disconnect()` asked after the restart is armed still cancel it, as does an explicit `run()`, which supersedes a pending restart. A cancelled restart clears its timer at once and holds no listener or connection lifetime.
 - Fence unknown-target metadata responses before cache installation and keep periodic naming attempts after the fast discovery budget.
 
@@ -81,6 +82,7 @@ Versions before 3.0.0 are internal alpha tags and are not published.
 - A consumer-protocol close now bounds and fences the final commit that precedes the leave. Under `consumer.disconnect({ timeout })` the coordinator lookup, the OffsetCommit write and the local publication all belong to the close: once it expires, a late lookup sends no frame, a late response records no cache entry, debt or `consumer.commit_offsets` event, and the abandoned leave reports no revocation and changes no membership state. A runner retired by a forced close also refuses any pre-release commit it still has in flight.
 - A public `consumer.connect()` that a forced close ended no longer publishes `consumer.connect`; it rejects with `CONSUMER_STOPPING`, and the connect's retries end with the close. An old `disconnect()` that settles late releases only the topic-recreation listener, reset debt and discovery scope its own connection registered, never a replacement's. The calls in flight and the late crash of a closed run belong to the connection that started them, so a forced close or a stale crash cannot retire or stop the run that replaced it.
 - A forced close (`consumer.disconnect({ timeout: 0 })` or an expired `timeout`) now stops the run's fetchers. Retiring the run latched its stop but left them running, and with the run stopped every fetch returned empty in microtasks, so each fetcher looped on `setImmediate` for the life of the process, keeping a core busy and the process from exiting.
+- An idempotent producer no longer bumps its epoch again for a partition the previous bump already moved: when a batch written under an older epoch expires on such a partition, the partition restarts at sequence 0 under the current epoch, and one recovery pass bumps at most once. Under sustained delivery timeouts the producer used several extra epochs.
 - A `consumer.assign()` or `consumer.subscribe()` that was still waiting when a forced close (`disconnect({ timeout })`) ended its lifetime no longer reconnects, writes Metadata or changes the cluster's target topics afterwards: the call rejects with `CONSUMER_STOPPING` (a plain close also ends an `assign`; `assign` has no `retry.maxTotalTime` deadline of its own). An `assign` that begins while a close is running now waits for that close, as `connect()` and `run()` do, and one made after a completed close starts a lifetime of its own.
 - A classic heartbeat that was still awaiting its coordinator lookup when its run was retired now sends nothing, on both the timer path and the `heartbeat()` path.
 - A commit whose caller timed out locally, and that the coordinator then answers with a membership loss for the same membership, still fences that membership and requests the rejoin. The caller still receives its own timeout, and an answer about a replaced membership still changes nothing.
@@ -151,6 +153,8 @@ Versions before 3.0.0 are internal alpha tags and are not published.
 - Validate Fetch-session measurements against independent frames and real batch/message counts.
 
 - Add replayable consumer fault schedules, generated manual, rebalance-hook, forced-close and fetch-session lifecycle cases, and the `soak:consumer-churn` profile with independent log, broker-offset and handler checks, resource baselines and delivery-gap samples.
+- The lifecycle matrix and consumer schedule specs fake the imported and the global monotonic clock together, so they pass late in a long-lived Jest worker; forced-close cells now exercise a real zero-timeout force. No library behaviour changed.
+- The `soak:producer-churn` durability check keys its duplicate detection on each record's raw identity (partition, producer id, epoch, sequence) in a fixed table sized from the offered-record bound, instead of at most 64 producer identities, so a run with many legitimate epoch bumps is checked in full rather than failing on table capacity.
 
 ### Phase 9D — Client, security and admin breadth
 
@@ -201,7 +205,6 @@ Versions before 3.0.0 are internal alpha tags and are not published.
 
 - `blackhole(id)` in the scripted cluster and the connection-setup benchmark.
 - Track the nineteen admin-ledger APIs in the compatibility snapshot, the tracked list and the generated matrix, with named broker ranges.
-- The lifecycle matrix and consumer schedule specs fake the imported and the global monotonic clock together, so they pass late in a long-lived Jest worker; forced-close cells now exercise a real zero-timeout force. No library behaviour changed.
 
 ### Phase 9B — Producer parity: delivery deadline, memory bound, request size, partitioner, codecs, lifecycle
 

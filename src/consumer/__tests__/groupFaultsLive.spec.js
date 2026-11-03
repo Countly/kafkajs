@@ -206,6 +206,27 @@ const outageEpisode = async ({ scope, cleanup, corpus, observed, outage, moreRec
 }
 
 /**
+ * Commits each member's delivered next offsets through the public commit path; only for the stable short arm.
+ * @param {JournalMember[]} members
+ * @returns {Promise<void>}
+ */
+const commitHandled = async (members) => {
+  for (const member of members) {
+    const topics = new Map()
+    for (const { topic, partition, offset } of member.delivered) {
+      if (!topics.has(topic)) topics.set(topic, new Map())
+      const partitions = topics.get(topic)
+      const next = BigInt(offset) + 1n
+      if (next > (partitions.get(partition) ?? -1n)) partitions.set(partition, next)
+    }
+    const offsets = [...topics].flatMap(([topic, partitions]) =>
+      [...partitions].map(([partition, offset]) => ({ topic, partition, offset: String(offset) }))
+    )
+    if (offsets.length) await member.client.commitOffsets(offsets)
+  }
+}
+
+/**
  * Waits until every partition's broker-confirmed commit of a group reached what its members handled.
  * @param {AbortSignal} scope
  * @param {LiveCorpus} corpus
@@ -391,6 +412,7 @@ describeGroupFaults('Consumer > classic group faults (live)', () => {
               expect(member.membershipBetween(episode.window.issuedAt)).toEqual([])
           expect(episode.staticSurvived).toBe(true)
           expect(episode.replays).toEqual({ classic: [], consumer: [] })
+          await step(scope, 'The handled-offset commit boundary', () => commitHandled(run.classic))
           const committed = await untilCommitted(scope, corpus, corpus.groupId, run.classic)
           for (const [partition, next] of committed)
             expect(next).toBeGreaterThan(run.floors.classic.get(partition))

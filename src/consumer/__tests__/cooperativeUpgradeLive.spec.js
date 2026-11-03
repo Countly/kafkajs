@@ -1,6 +1,7 @@
 const { Kafka, logLevel } = require('../../../index')
 const { roundRobin, cooperativeSticky } = require('../assigners')
 const { secureRandom, plainTextBrokers, createTopic } = require('testHelpers')
+const { withDeadline, disconnectAll, startTrackedMember } = require('./fixtures/boundedCleanup')
 
 // Gated: the rolling upgrade needs its own cluster time and would race the other consumer specs.
 // Run it alone: `npm run test:e2e:cooperative-upgrade`.
@@ -37,16 +38,6 @@ const waitForCondition = async (predicate, budget = DELIVERY_BUDGET) => {
     await sleep(budget.delay)
   }
   return false
-}
-
-/**
- * Awaits `promise` but gives up after `ms`, so a teardown can never outlive its hook budget.
- * @param {Promise<unknown>} promise
- * @param {number} ms
- * @returns {Promise<void>}
- */
-const withTimeout = async (promise, ms) => {
-  await Promise.race([promise, sleep(ms)])
 }
 
 /**
@@ -171,20 +162,15 @@ describeCooperativeUpgrade('Consumer > cooperative rolling upgrade (live)', () =
   afterEach(async () => {
     producing.on = false
 
-    for (const member of members) {
-      await withTimeout(
-        member.consumer.disconnect().catch(() => {}),
+    try {
+      await disconnectAll(
+        [...members.map((member) => member.consumer), producer],
         DISCONNECT_BUDGET_MS
       )
+    } finally {
+      producer = kafka = null
+      members = []
     }
-
-    producer &&
-      (await withTimeout(
-        producer.disconnect().catch(() => {}),
-        DISCONNECT_BUDGET_MS
-      ))
-    producer = kafka = null
-    members = []
   }, 120000)
 
   it(
@@ -211,40 +197,20 @@ describeCooperativeUpgrade('Consumer > cooperative rolling upgrade (live)', () =
        * @param {import('types').PartitionAssigner[]} partitionAssigners
        * @returns {Promise<object>} the member, with its own event log
        */
-      const startMember = async (label, partitionAssigners) => {
-        const consumer = kafka.consumer({
-          groupId,
-          partitionAssigners,
-          maxWaitTimeInMs: MAX_WAIT_TIME_MS,
+      const startMember = async (label, partitionAssigners) =>
+        startTrackedMember({
+          kafka,
+          consumerOptions: {
+            groupId,
+            partitionAssigners,
+            maxWaitTimeInMs: MAX_WAIT_TIME_MS,
+          },
+          label,
+          members,
+          crashes,
+          received,
+          topic,
         })
-
-        const member = { label, consumer, events: [], batches: [] }
-
-        for (const type of [consumer.events.REBALANCING, consumer.events.GROUP_JOIN]) {
-          consumer.on(type, ({ timestamp, payload }) =>
-            member.events.push({ type, timestamp, payload })
-          )
-        }
-        consumer.on(consumer.events.START_BATCH_PROCESS, ({ timestamp, payload }) =>
-          member.batches.push({ timestamp, payload })
-        )
-        consumer.on(consumer.events.CRASH, ({ payload }) => crashes.push({ label, ...payload }))
-
-        await consumer.connect()
-        await consumer.subscribe({ topic, fromBeginning: true })
-        consumer
-          .run({
-            eachBatch: async ({ batch }) => {
-              for (const message of batch.messages) {
-                received.push(`${batch.partition}:${message.offset}`)
-              }
-            },
-          })
-          .catch((e) => crashes.push({ label, error: e }))
-
-        members.push(member)
-        return member
-      }
 
       /** @param {object} member @returns {Promise<boolean>} */
       const waitForJoin = (member, since) =>
@@ -296,7 +262,7 @@ describeCooperativeUpgrade('Consumer > cooperative rolling upgrade (live)', () =
 
       // Step 2, first half: A comes back with the cooperative assigner alone. The group protocol
       // is now cooperative-sticky, and A reports the cooperative mode while B still reports eager.
-      await withTimeout(memberA.consumer.disconnect(), DISCONNECT_BUDGET_MS)
+      await withDeadline(memberA.consumer.disconnect(), DISCONNECT_BUDGET_MS)
       const upgradeStartedAt = Date.now()
       const memberA2 = await startMember('A(step2)', [
         slowAssign(cooperativeSticky, SLOW_ASSIGN_MS),
@@ -306,7 +272,7 @@ describeCooperativeUpgrade('Consumer > cooperative rolling upgrade (live)', () =
 
       // Step 2, second half: B leaves and A2 converges onto the whole topic, so the round B2's
       // arrival triggers is the one that takes partitions away from a member that keeps others.
-      await withTimeout(memberB.consumer.disconnect(), DISCONNECT_BUDGET_MS)
+      await withDeadline(memberB.consumer.disconnect(), DISCONNECT_BUDGET_MS)
       const soleOwner = await waitForCondition(() => {
         const assignment = lastAssignment(memberA2).memberAssignment
         return (assignment[topic] || []).length === PARTITIONS
