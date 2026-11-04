@@ -68,18 +68,21 @@ live('raw classic follower heartbeat is pinned during the proven sync window', a
       members.push(member)
       await member.connect()
     }
-    const responses = await Promise.all(
-      members.map((member) =>
-        member.joinGroup({
-          groupId,
-          sessionTimeout: 30000,
-          rebalanceTimeout: 30000,
-          groupProtocols: [
-            { name: 'capture', metadata: MemberMetadata.encode({ version: 1, topics: [] }) },
-          ],
-        })
-      )
-    )
+    const join = (member, memberId) =>
+      member.joinGroup({
+        groupId,
+        memberId,
+        sessionTimeout: 30000,
+        rebalanceTimeout: 30000,
+        groupProtocols: [
+          { name: 'capture', metadata: MemberMetadata.encode({ version: 1, topics: [] }) },
+        ],
+      })
+    // With a zero initial rebalance delay a lone first join completes at once, so two concurrent
+    // first joins can land in different generations. A known member is always awaited: the first
+    // member joins alone, then rejoins while the second joins.
+    const { memberId: firstId } = await join(members[0])
+    const responses = await Promise.all([join(members[0], firstId), join(members[1])])
     joined.push(...responses)
     expect(responses[0].generationId).toBe(responses[1].generationId)
     expect(responses[0].memberId).not.toBe(responses[1].memberId)
