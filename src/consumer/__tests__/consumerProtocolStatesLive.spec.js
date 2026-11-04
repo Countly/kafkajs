@@ -1,3 +1,4 @@
+const { gateCommand } = require('../../../testHelpers/liveControl')
 const fs = require('fs')
 const path = require('path')
 const { execFile } = require('child_process')
@@ -315,26 +316,23 @@ class StateCapture {
   }
 
   /**
-   * Runs one operation of the existing guard's gate through a foreground child, never touching a
-   * container directly. Starts none under an aborted scope; a cleanup passes its own signal
-   * instead, which bounds the child and lets release and retire run after the case aborted.
+   * Runs one fixture gate operation through a bounded foreground child, using the guard when
+   * supplied and the fixture's mounted files otherwise. Starts none under an aborted scope;
+   * cleanup uses its own signal so release and retire can run after the case aborted.
    * @param {'arm'|'release'|'read'|'retire'} action
    * @param {{ signal?: AbortSignal }} [options] the cleanup's signal
    * @returns {Promise<object[]>} the fixture's events for this group and nonce
-   * @throws {Error} when the guard environment is absent, the child fails, or the scope aborted
+   * @throws {Error} when the ownership environment is incomplete, the child fails, or the scope aborted
    */
   async gate(action, { signal } = {}) {
-    const { P9_CLUSTER_GUARD: guard, P9_CLUSTER_MANIFEST: manifest } = process.env
-    if (!guard || !manifest) {
-      throw new Error('The state gate needs P9_CLUSTER_GUARD and P9_CLUSTER_MANIFEST')
-    }
+    const command = gateCommand(action, this.groupId, this.nonce)
     if (!signal) this.scope.throwIfAborted()
     if (action === 'arm') this.armed = true
-    const { stdout } = await run(
-      process.execPath,
-      [guard, 'gate', manifest, action, this.groupId, this.nonce],
-      { timeout: GATE_BUDGET_MS, killSignal: 'SIGKILL', signal: signal ?? this.scope }
-    )
+    const { stdout } = await run(process.execPath, command, {
+      timeout: GATE_BUDGET_MS,
+      killSignal: 'SIGKILL',
+      signal: signal ?? this.scope,
+    })
     return JSON.parse(stdout.trim() || '[]')
   }
 

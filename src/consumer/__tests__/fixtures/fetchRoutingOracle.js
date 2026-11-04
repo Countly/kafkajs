@@ -18,17 +18,22 @@ const UNHINTED_OUTAGE = 'kill'
  *   hint refreshes its metadata only once the fetch round it is in has ended, so the route comes
  *   at or after the poll's end by design. The wait after the poll is counted from the later of
  *   the poll's end and the route, so the cluster's own election time is not charged to the client.
+ *
+ *   A move that keeps the consumer's node set keeps the strict bounds. One that changes it makes
+ *   the fetch manager stop every fetcher, await its in-flight Fetches and recreate them, so every
+ *   destination starts within the wait and a round of the route and within a round of the drain
+ *   end (`drainEndAt`, the last in-flight Fetch's completion). No bound grows with a constant.
  */
 const moveProblems = (measured) => {
   const { kind, hinted, newNode, errorAt, routeAt, nextAt, priorFetches, hint, anyHint } = measured
-  const { pollWriteAt, pollDoneAt } = measured
+  const { pollWriteAt, pollDoneAt, nodeSetChanged, drainEndAt } = measured
   const problems = []
   if (hinted && hint?.leaderId !== newNode) problems.push('the old leader named no new leader')
   if (!hinted && anyHint) problems.push('a hint was present')
   if (!hinted && !measured.refreshed) problems.push('no metadata refresh before the route')
   if (kind === 'idle') {
     if (priorFetches !== 0) problems.push('the new node had a Fetch before the move')
-    if (nextAt - routeAt > ROUND_ALLOWANCE_MS)
+    if (!nodeSetChanged && nextAt - routeAt > ROUND_ALLOWANCE_MS)
       problems.push('the idle route took longer than a round')
   } else {
     if (pollWriteAt == null || pollDoneAt == null) {
@@ -37,11 +42,20 @@ const moveProblems = (measured) => {
       if (!(pollWriteAt <= errorAt && errorAt < pollDoneAt))
         problems.push('the long poll was not outstanding at the route')
       if (nextAt < pollDoneAt) problems.push('the route started before the long poll ended')
-      if (nextAt - Math.max(pollDoneAt, routeAt) > ROUND_ALLOWANCE_MS)
+      if (!nodeSetChanged && nextAt - Math.max(pollDoneAt, routeAt) > ROUND_ALLOWANCE_MS)
         problems.push('the route waited after the long poll')
     }
     if (nextAt - routeAt > MOVE_WAIT_MS + ROUND_ALLOWANCE_MS) {
       problems.push('the busy route took longer than the wait and a round')
+    }
+  }
+  if (nodeSetChanged) {
+    if (kind === 'idle' && nextAt - routeAt > MOVE_WAIT_MS + ROUND_ALLOWANCE_MS) {
+      problems.push('the idle route took longer than the wait and a round')
+    }
+    if (drainEndAt == null) problems.push('no drain end was measured for the node-set change')
+    else if (nextAt - drainEndAt > ROUND_ALLOWANCE_MS) {
+      problems.push('the fetchers started more than a round after the drain')
     }
   }
   return problems

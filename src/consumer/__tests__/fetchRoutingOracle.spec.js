@@ -123,6 +123,118 @@ describe('Consumer > Fetch routing oracle (offline controls)', () => {
   })
 })
 
+describe('Consumer > Fetch routing oracle > a move that changes the node set', () => {
+  // CI measured the route and destination starts, but no drain end.
+  // This replay assumes a shared drain ending promptly before the first recreated Fetch.
+  const unhintedIdle = {
+    kind: 'idle',
+    hinted: false,
+    newNode: 1,
+    errorAt: 59227.729882,
+    routeAt: 68995.814434,
+    nextAt: 74051.248941,
+    priorFetches: 0,
+    pollWriteAt: null,
+    pollDoneAt: null,
+    hint: null,
+    anyHint: false,
+    refreshed: true,
+    nodeSetChanged: true,
+    drainEndAt: 74046.1,
+  }
+  const unhintedBusy = {
+    ...unhintedIdle,
+    kind: 'busy',
+    newNode: 2,
+    nextAt: 74048.183506,
+    priorFetches: 4,
+    pollWriteAt: 58982.758603,
+    pollDoneAt: 63985.03353,
+  }
+
+  it('passes the CI route/start timestamps assuming a prompt shared drain', () => {
+    expect(moveProblems(unhintedIdle)).toEqual([])
+    expect(moveProblems(unhintedBusy)).toEqual([])
+  })
+
+  it('fails a start a full round after the drain end', () => {
+    const slow = (move) => ({ ...move, nextAt: move.drainEndAt + ROUND_ALLOWANCE_MS + 1 })
+
+    expect(moveProblems(slow(unhintedIdle))).toContain(
+      'the fetchers started more than a round after the drain'
+    )
+    expect(moveProblems(slow(unhintedBusy))).toContain(
+      'the fetchers started more than a round after the drain'
+    )
+  })
+
+  it('fails a drain end that was not measured', () => {
+    expect(moveProblems({ ...unhintedIdle, drainEndAt: null })).toContain(
+      'no drain end was measured for the node-set change'
+    )
+  })
+
+  it('fails a start later than the wait and a round after the route', () => {
+    const late = {
+      ...unhintedIdle,
+      routeAt: unhintedIdle.nextAt - MOVE_WAIT_MS - 100 - ROUND_ALLOWANCE_MS,
+    }
+
+    expect(moveProblems(late)).toContain('the idle route took longer than the wait and a round')
+    expect(moveProblems({ ...unhintedBusy, routeAt: late.routeAt })).toContain(
+      'the busy route took longer than the wait and a round'
+    )
+  })
+
+  it('still fails a busy move whose long poll was not outstanding at the loss', () => {
+    expect(moveProblems({ ...unhintedBusy, errorAt: 64000 })).toContain(
+      'the long poll was not outstanding at the route'
+    )
+  })
+
+  it('keeps the strict bounds when the node set is unchanged', () => {
+    const kept = { ...unhintedIdle, nodeSetChanged: false }
+
+    expect(moveProblems(kept)).toContain('the idle route took longer than a round')
+    expect(moveProblems({ ...unhintedBusy, nodeSetChanged: false })).toContain(
+      'the route waited after the long poll'
+    )
+  })
+
+  it('keeps the strict bounds for the hinted arm of the first CI run', () => {
+    const hintedIdle = {
+      kind: 'idle',
+      hinted: true,
+      newNode: 1,
+      errorAt: 47393.632323,
+      routeAt: 47393.632323,
+      nextAt: 47400.097163,
+      priorFetches: 0,
+      pollWriteAt: null,
+      pollDoneAt: null,
+      hint: { leaderId: 1, leaderEpoch: 1 },
+      anyHint: true,
+      refreshed: false,
+      nodeSetChanged: false,
+      drainEndAt: 47399.9,
+    }
+    const hintedBusy = {
+      ...hintedIdle,
+      kind: 'busy',
+      newNode: 2,
+      nextAt: 52401.254665,
+      priorFetches: 3,
+      pollWriteAt: 47391.856825,
+      pollDoneAt: 52394.258539,
+      hint: { leaderId: 2, leaderEpoch: 1 },
+    }
+
+    expect(moveProblems(hintedIdle)).toEqual([])
+    expect(moveProblems(hintedBusy)).toEqual([])
+    expect(moveProblems({ ...hintedIdle, nextAt: hintedIdle.routeAt + 5055 })).not.toEqual([])
+  })
+})
+
 describe('Consumer > Fetch routing oracle > the unhinted outage', () => {
   it('kills the broker: a clean stop moves the leaders first and the old leader hints', () => {
     expect(UNHINTED_OUTAGE).toBe('kill')
@@ -211,5 +323,132 @@ describe('Consumer > Fetch routing oracle > the sibling window', () => {
     expect(
       siblingProblems({ outage: during, handled, window, events: { ...calm, crashes: 1 } })
     ).toEqual(['1 crashes in the stable window'])
+  })
+})
+
+describe('Consumer > Fetch routing wire measurement', () => {
+  const { RoutingWire } = require('./fixtures/routingWire')
+  const Encoder = require('../../protocol/encoder')
+  const createRequest = require('../../protocol/request')
+  const { requests } = require('../../protocol/requests')
+  const { fetchResponse } = require('./fixtures/fetchHarness')
+  let wire
+
+  beforeEach(() => {
+    jest.useFakeTimers()
+    wire = new RoutingWire()
+  })
+
+  afterEach(() => jest.useRealTimers())
+
+  /**
+   * Writes a real Fetch frame at the current transcript clock, without opening a socket.
+   * @param {number} connection socket identity
+   * @param {number} correlationId request identity on that socket
+   * @returns {Promise<void>}
+   */
+  const fetch = async (connection, correlationId) => {
+    const { request } = requests.Fetch.protocol({ version: 18 })({
+      maxWaitTime: MOVE_WAIT_MS,
+      minBytes: 1,
+      maxBytes: 1024,
+      topics: [],
+      topicIds: new Map(),
+      rackId: '',
+    })
+    const { buffer } = await createRequest({ correlationId, clientId: 'routing-wire', request })
+    wire.write(connection, `broker:${connection}`, buffer)
+  }
+
+  /**
+   * Reads a framed Fetch answer at the current clock.
+   * @param {number} connection socket identity
+   * @param {number} correlationId request identity
+   * @returns {void}
+   */
+  const answer = (connection, correlationId) => {
+    const body = fetchResponse([], { apiVersion: 18 })
+    wire.read(
+      connection,
+      new Encoder()
+        .writeInt32(5 + body.length)
+        .writeInt32(correlationId)
+        .writeInt8(0)
+        .writeBuffer(body).buffer
+    )
+  }
+
+  it('rejects a late destination using the shared pre-recreation drain', async () => {
+    await fetch(1, 1)
+    await fetch(2, 1)
+    jest.advanceTimersByTime(200)
+    answer(1, 1)
+    answer(2, 1)
+    jest.advanceTimersByTime(10)
+    await fetch(1, 2)
+    jest.advanceTimersByTime(2790)
+    answer(1, 2)
+    jest.advanceTimersByTime(100)
+    await fetch(2, 2)
+
+    const drainEndAt = wire.drainEnd(100)
+    expect(drainEndAt).toBe(200)
+    for (const nextAt of [210, 3100]) {
+      const problems = moveProblems({
+        ...idle,
+        routeAt: 100,
+        nodeSetChanged: true,
+        drainEndAt,
+        nextAt,
+      })
+      expect(problems).toEqual(
+        nextAt === 210 ? [] : ['the fetchers started more than a round after the drain']
+      )
+    }
+  })
+
+  it('uses unanswered old Fetch socket closes and excludes recreated socket closes', async () => {
+    await fetch(1, 1)
+    jest.advanceTimersByTime(200)
+    wire.closes.push({ connection: 1, at: performance.now() })
+    jest.advanceTimersByTime(10)
+    await fetch(2, 1)
+    jest.advanceTimersByTime(2790)
+    wire.closes.push({ connection: 2, at: performance.now() })
+    jest.advanceTimersByTime(100)
+    await fetch(3, 1)
+
+    expect(wire.drainEnd(100)).toBe(200)
+  })
+
+  it('selects the latest Metadata response when answers arrive out of request order', async () => {
+    for (const correlationId of [1, 2]) {
+      const { request } = requests.Metadata.protocol({ version: 0 })({ topics: [] })
+      const { buffer } = await createRequest({ correlationId, clientId: 'routing-wire', request })
+      wire.write(1, 'broker:1', buffer)
+    }
+    for (const [correlationId, nodeId] of [
+      [2, 2],
+      [1, 1],
+    ]) {
+      jest.advanceTimersByTime(100)
+      const body = new Encoder()
+        .writeInt32(1)
+        .writeInt32(nodeId)
+        .writeString('broker')
+        .writeInt32(9092)
+        .writeInt32(0)
+      wire.read(
+        1,
+        new Encoder()
+          .writeInt32(4 + body.size())
+          .writeInt32(correlationId)
+          .writeEncoder(body).buffer
+      )
+    }
+
+    expect(await wire.nodeSetAt(201)).toEqual(new Set([1]))
+    expect(await wire.nodeSetAt(200)).toEqual(new Set([2]))
+    expect(await wire.nodeSetAt(200, true)).toEqual(new Set([1]))
   })
 })

@@ -133,7 +133,7 @@ jobs:
       - name: Build coordinator fixture
         if: fromJSON(steps.entry.outputs.check).needs.consumerGroupStates || fromJSON(steps.entry.outputs.check).compose == 'testHelpers/consumerGroupStates/compose.yml'
         run: |
-          ./testHelpers/consumerGroupStates/build.sh "$KAFKA_VERSION" "$RUNNER_TEMP/coordinator-build"
+          bash ./testHelpers/consumerGroupStates/build.sh "$KAFKA_VERSION" "$RUNNER_TEMP/coordinator-build"
           mkdir -p testHelpers/consumerGroupStates/runtime
           chmod 777 testHelpers/consumerGroupStates/runtime
           docker build --build-arg KAFKA_VERSION="$KAFKA_VERSION" -t "consumer-group-states:$KAFKA_VERSION" testHelpers/consumerGroupStates

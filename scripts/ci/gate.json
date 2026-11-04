@@ -4692,6 +4692,13 @@
         "src/consumer/__tests__/fetchRoutingOracle.spec.js › Consumer > Fetch routing oracle (offline controls) keeps the idle bounds",
         "src/consumer/__tests__/fetchRoutingOracle.spec.js › Consumer > Fetch routing oracle (offline controls) passes a long poll that is outstanding at the loss and the route",
         "src/consumer/__tests__/fetchRoutingOracle.spec.js › Consumer > Fetch routing oracle (offline controls) requires the hint when hinted and none when not",
+        "src/consumer/__tests__/fetchRoutingOracle.spec.js › Consumer > Fetch routing oracle > a move that changes the node set fails a drain end that was not measured",
+        "src/consumer/__tests__/fetchRoutingOracle.spec.js › Consumer > Fetch routing oracle > a move that changes the node set fails a start a full round after the drain end",
+        "src/consumer/__tests__/fetchRoutingOracle.spec.js › Consumer > Fetch routing oracle > a move that changes the node set fails a start later than the wait and a round after the route",
+        "src/consumer/__tests__/fetchRoutingOracle.spec.js › Consumer > Fetch routing oracle > a move that changes the node set keeps the strict bounds for the hinted arm of the first CI run",
+        "src/consumer/__tests__/fetchRoutingOracle.spec.js › Consumer > Fetch routing oracle > a move that changes the node set keeps the strict bounds when the node set is unchanged",
+        "src/consumer/__tests__/fetchRoutingOracle.spec.js › Consumer > Fetch routing oracle > a move that changes the node set passes the CI route/start timestamps assuming a prompt shared drain",
+        "src/consumer/__tests__/fetchRoutingOracle.spec.js › Consumer > Fetch routing oracle > a move that changes the node set still fails a busy move whose long poll was not outstanding at the loss",
         "src/consumer/__tests__/fetchRoutingOracle.spec.js › Consumer > Fetch routing oracle > the leader of a partition asks through DescribeTopicPartitions, which reports no leader as -1",
         "src/consumer/__tests__/fetchRoutingOracle.spec.js › Consumer > Fetch routing oracle > the leader of a partition why not a plain fetchTopicMetadata waits for the leader and then rejects with the timeout",
         "src/consumer/__tests__/fetchRoutingOracle.spec.js › Consumer > Fetch routing oracle > the sibling window counts a record handled right after the leader was seen gone, before the stop returned",
@@ -4699,6 +4706,9 @@
         "src/consumer/__tests__/fetchRoutingOracle.spec.js › Consumer > Fetch routing oracle > the sibling window fails a record handled before the leader was gone",
         "src/consumer/__tests__/fetchRoutingOracle.spec.js › Consumer > Fetch routing oracle > the sibling window fails a record handled only after the broker was back, or never",
         "src/consumer/__tests__/fetchRoutingOracle.spec.js › Consumer > Fetch routing oracle > the unhinted outage kills the broker: a clean stop moves the leaders first and the old leader hints",
+        "src/consumer/__tests__/fetchRoutingOracle.spec.js › Consumer > Fetch routing wire measurement rejects a late destination using the shared pre-recreation drain",
+        "src/consumer/__tests__/fetchRoutingOracle.spec.js › Consumer > Fetch routing wire measurement selects the latest Metadata response when answers arrive out of request order",
+        "src/consumer/__tests__/fetchRoutingOracle.spec.js › Consumer > Fetch routing wire measurement uses unanswered old Fetch socket closes and excludes recreated socket closes",
         "src/consumer/__tests__/fetchSession.spec.js › ID zero accepts valid full data and retries full next time",
         "src/consumer/__tests__/fetchSession.spec.js › ID zero accepts valid incremental data and retries full next time",
         "src/consumer/__tests__/fetchSession.spec.js › a changed bytes is sent in the next diff",
@@ -7388,6 +7398,11 @@
         "src/consumer/__tests__/topicRecreated.spec.js › Consumer > topic recreation seek precedence around a topic recreation a seek issued after the recreation wins over the reset for that partition (autoCommit: true)",
         "src/consumer/__tests__/topicRecreated.spec.js › Consumer > topic recreation seek precedence around a topic recreation a seek issued before the recreation is dropped by the reset (autoCommit: false)",
         "src/consumer/__tests__/topicRecreated.spec.js › Consumer > topic recreation seek precedence around a topic recreation a seek issued before the recreation is dropped by the reset (autoCommit: true)",
+        "src/consumer/__tests__/transientRetry.spec.js › Consumer > live fixtures > retrying a transient lookup does not start under a scope that has already aborted",
+        "src/consumer/__tests__/transientRetry.spec.js › Consumer > live fixtures > retrying a transient lookup looks again after a reset connection and returns the answer of the same lookup",
+        "src/consumer/__tests__/transientRetry.spec.js › Consumer > live fixtures > retrying a transient lookup makes no further lookup once the scope has aborted",
+        "src/consumer/__tests__/transientRetry.spec.js › Consumer > live fixtures > retrying a transient lookup stops at the deadline when every attempt is reset",
+        "src/consumer/__tests__/transientRetry.spec.js › Consumer > live fixtures > retrying a transient lookup throws a failure that is not retriable at once",
         "src/consumer/__tests__/wrappedCommitStamps.spec.js › Consumer > an escaping commit error from a generation the member has left a handler that fails on the commit error is not retried when the handler caught the error (control)",
         "src/consumer/__tests__/wrappedCommitStamps.spec.js › Consumer > an escaping commit error from a generation the member has left a handler that fails on the commit error is retried from the record it failed on, in the same membership",
         "src/consumer/__tests__/wrappedCommitStamps.spec.js › Consumer > an escaping commit error from a generation the member has left does not lose the membership it already replaced by joining again",
@@ -15121,6 +15136,22 @@
         "testHelpers/__tests__/leaderElection.spec.js › broker bounce helpers waitForFullIsr a topic the asked broker does not host yet rejects with that error when the budget runs out",
         "testHelpers/__tests__/leaderElection.spec.js › broker bounce helpers waitForFullIsr names the partitions still short when its budget runs out",
         "testHelpers/__tests__/leaderElection.spec.js › broker bounce helpers waitForFullIsr returns once every partition of the topics and the existing internal topics is in sync",
+        "testHelpers/__tests__/liveControl.spec.js › standalone assignment fixture arms, releases, filters complete events and retires the shared gate",
+        "testHelpers/__tests__/liveControl.spec.js › standalone assignment fixture refuses invalid operands with a multiline group",
+        "testHelpers/__tests__/liveControl.spec.js › standalone assignment fixture refuses invalid operands with a path in the nonce",
+        "testHelpers/__tests__/liveControl.spec.js › standalone assignment fixture refuses invalid operands with an unsupported action",
+        "testHelpers/__tests__/liveControl.spec.js › standalone live controls arm selects the state controller",
+        "testHelpers/__tests__/liveControl.spec.js › standalone live controls propagates a failed standalone broker start",
+        "testHelpers/__tests__/liveControl.spec.js › standalone live controls read selects the state controller",
+        "testHelpers/__tests__/liveControl.spec.js › standalone live controls refuses an incomplete environment with only P9_CLUSTER_GUARD",
+        "testHelpers/__tests__/liveControl.spec.js › standalone live controls refuses an incomplete environment with only P9_CLUSTER_MANIFEST",
+        "testHelpers/__tests__/liveControl.spec.js › standalone live controls refuses operations without a budget on either path",
+        "testHelpers/__tests__/liveControl.spec.js › standalone live controls release selects the state controller",
+        "testHelpers/__tests__/liveControl.spec.js › standalone live controls retire selects the state controller",
+        "testHelpers/__tests__/liveControl.spec.js › standalone live controls start preserves guarded argv and options",
+        "testHelpers/__tests__/liveControl.spec.js › standalone live controls start uses bounded standalone Compose",
+        "testHelpers/__tests__/liveControl.spec.js › standalone live controls stop preserves guarded argv and options",
+        "testHelpers/__tests__/liveControl.spec.js › standalone live controls stop uses bounded standalone Compose",
         "testHelpers/__tests__/lz4Frame.spec.js › testHelpers > lz4Frame frame a content size and a content checksum are accepted by the decoder",
         "testHelpers/__tests__/lz4Frame.spec.js › testHelpers > lz4Frame frame a stored block decodes to its bytes",
         "testHelpers/__tests__/lz4Frame.spec.js › testHelpers > lz4Frame frame writes the descriptor an independent encoder writes, a content checksum",
@@ -16083,11 +16114,7 @@
       "kind": "cluster",
       "compose": "docker-compose.yml",
       "env": {},
-      "jest": [
-        "--forceExit",
-        "--testPathPatterns",
-        "src/broker/.*"
-      ],
+      "jest": ["--forceExit", "--testPathPatterns", "src/broker/.*"],
       "jestScript": null,
       "nodeTest": null,
       "command": null,
@@ -16127,11 +16154,7 @@
       "kind": "cluster",
       "compose": "docker-compose.yml",
       "env": {},
-      "jest": [
-        "--forceExit",
-        "--testPathPatterns",
-        "src/admin/.*"
-      ],
+      "jest": ["--forceExit", "--testPathPatterns", "src/admin/.*"],
       "jestScript": null,
       "nodeTest": null,
       "command": null,
@@ -16188,11 +16211,7 @@
       "kind": "cluster",
       "compose": "docker-compose.yml",
       "env": {},
-      "jest": [
-        "--forceExit",
-        "--testPathPatterns",
-        "src/producer/.*"
-      ],
+      "jest": ["--forceExit", "--testPathPatterns", "src/producer/.*"],
       "jestScript": null,
       "nodeTest": null,
       "command": null,
@@ -16315,18 +16334,12 @@
       "kind": "cluster",
       "compose": "docker-compose.yml",
       "env": {},
-      "jest": [
-        "--forceExit",
-        "--testPathPatterns",
-        "src/consumer/.*.spec.js"
-      ],
+      "jest": ["--forceExit", "--testPathPatterns", "src/consumer/.*.spec.js"],
       "jestScript": null,
       "nodeTest": null,
       "command": null,
       "needs": {},
-      "evidence": [
-        "prototype-topics"
-      ],
+      "evidence": ["prototype-topics"],
       "titles": [],
       "capMinutes": 68,
       "allowedSkips": [
@@ -16495,18 +16508,12 @@
       "kind": "cluster",
       "compose": "docker-compose.yml",
       "env": {},
-      "jest": [
-        "--forceExit",
-        "--testPathPatterns",
-        "src/(?!(broker|admin|producer|consumer)/).*"
-      ],
+      "jest": ["--forceExit", "--testPathPatterns", "src/(?!(broker|admin|producer|consumer)/).*"],
       "jestScript": null,
       "nodeTest": null,
       "command": null,
       "needs": {},
-      "evidence": [
-        "max-in-flight"
-      ],
+      "evidence": ["max-in-flight"],
       "titles": [],
       "capMinutes": 48,
       "allowedSkips": [
@@ -16562,9 +16569,7 @@
       "nodeTest": null,
       "command": null,
       "needs": {},
-      "evidence": [
-        "broker-bounce"
-      ],
+      "evidence": ["broker-bounce"],
       "titles": [
         "src/consumer/__tests__/brokerBounceLive.spec.js › Broker bounce oracle classifies an outage per group from its measurement, never from the arm",
         "src/consumer/__tests__/brokerBounceLive.spec.js › Broker bounce oracle the log verdict finds an acked value missing and a value written twice",
@@ -16607,9 +16612,7 @@
       "nodeTest": null,
       "command": null,
       "needs": {},
-      "evidence": [
-        "request-timeout-close"
-      ],
+      "evidence": ["request-timeout-close"],
       "titles": [
         "src/network/__tests__/requestTimeoutCloseLive.spec.js › Request timeout closes its connection over real TCP (live) the timed-out connection is closed and the idempotent batches are resent in order, each once",
         "src/network/__tests__/requestTimeoutCloseLive.spec.js › Request timeout closes its connection over real TCP (live) every evidence line of this run carries the stamps a verifier checks"
@@ -16632,9 +16635,7 @@
       "nodeTest": null,
       "command": null,
       "needs": {},
-      "evidence": [
-        "send-offsets-visibility"
-      ],
+      "evidence": ["send-offsets-visibility"],
       "titles": [
         "src/producer/__tests__/sendOffsetsVisibilityLive.spec.js › Transactional offsets become visible after a confirmed commit (live) classic protocol a confirmed abort publishes nothing and the broker keeps the previous commit",
         "src/producer/__tests__/sendOffsetsVisibilityLive.spec.js › Transactional offsets become visible after a confirmed commit (live) classic protocol an EndTxn that never left keeps the outcome unknown, and the confirmed retry publishes once",
@@ -16672,9 +16673,7 @@
       "nodeTest": null,
       "command": null,
       "needs": {},
-      "evidence": [
-        "completing-rebalance"
-      ],
+      "evidence": ["completing-rebalance"],
       "titles": [
         "src/consumer/__tests__/completingRebalanceLive.spec.js › Completing rebalance capture oracle selects the observed broker version independently",
         "src/consumer/__tests__/completingRebalanceLive.spec.js › Completing rebalance capture oracle missing versions fail and a prototype property cannot supply an expectation",
@@ -16700,9 +16699,7 @@
       "nodeTest": null,
       "command": null,
       "needs": {},
-      "evidence": [
-        "auto-topic-creation"
-      ],
+      "evidence": ["auto-topic-creation"],
       "titles": [
         "src/consumer/__tests__/autoTopicCreation.spec.js › Auto topic creation on docker a deleted subscribed topic stays absent when auto creation is disabled"
       ],
@@ -16753,9 +16750,7 @@
       "nodeTest": null,
       "command": null,
       "needs": {},
-      "evidence": [
-        "delivery-timeout"
-      ],
+      "evidence": ["delivery-timeout"],
       "titles": [
         "src/producer/__tests__/deliveryTimeoutLive.spec.js › Producer > a lost Produce answer and the delivery deadline (live) an applied write with a lost answer settles at the delivery deadline"
       ],
@@ -16777,9 +16772,7 @@
       "nodeTest": null,
       "command": null,
       "needs": {},
-      "evidence": [
-        "oversized-record"
-      ],
+      "evidence": ["oversized-record"],
       "titles": [
         "src/producer/__tests__/oversizedRecordLive.spec.js › Producer > records above a size limit (live) a record no request can carry is refused before it is written, and the next send works: plain producer, acks 0",
         "src/producer/__tests__/oversizedRecordLive.spec.js › Producer > records above a size limit (live) a record no request can carry is refused before it is written, and the next send works: plain producer, acks 1",
@@ -16819,9 +16812,7 @@
       "nodeTest": null,
       "command": null,
       "needs": {},
-      "evidence": [
-        "ack-lost"
-      ],
+      "evidence": ["ack-lost"],
       "titles": [
         "src/producer/__tests__/ackLostLive.spec.js › Producer and consumer > a lost answer is retried without loss (live) a Produce answer lost after the append is retried and the caller resolves: idempotent producer, 1 copy in the log",
         "src/producer/__tests__/ackLostLive.spec.js › Producer and consumer > a lost answer is retried without loss (live) a Produce answer lost after the append is retried and the caller resolves: plain producer, 2 copy in the log",
@@ -16846,9 +16837,7 @@
       "nodeTest": null,
       "command": null,
       "needs": {},
-      "evidence": [
-        "topic-lifecycle-produce"
-      ],
+      "evidence": ["topic-lifecycle-produce"],
       "titles": [
         "src/producer/__tests__/topicLifecycleProduceLive.spec.js › Producer > a topic deleted, grown and recreated under sends (live) sends to a deleted topic fail typed within the delivery budget, every send settles and the producer still sends to another topic",
         "src/producer/__tests__/topicLifecycleProduceLive.spec.js › Producer > a topic deleted, grown and recreated under sends (live) keyless records reach the partitions added to a topic after the producer refreshed its metadata",
@@ -16872,9 +16861,7 @@
       "nodeTest": null,
       "command": null,
       "needs": {},
-      "evidence": [
-        "not-enough-replicas"
-      ],
+      "evidence": ["not-enough-replicas"],
       "titles": [
         "src/producer/__tests__/notEnoughReplicasLive.spec.js › Producer > one follower down under min.insync.replicas (live) a send needing every replica ends at the delivery deadline while a send needing two succeeds, and the markers follow once the follower is back"
       ],
@@ -16898,9 +16885,7 @@
       "needs": {
         "java": true
       },
-      "evidence": [
-        "compression"
-      ],
+      "evidence": ["compression"],
       "titles": [
         "src/producer/__tests__/compressionLive.spec.js › Producer > every codec across clients (live) the declared producer settings are accepted without connecting",
         "src/producer/__tests__/compressionLive.spec.js › Producer > every codec across clients (live) gzip JS producer to JS consumer: keys, values, order and count, and the broker holds the codec",
@@ -16935,9 +16920,7 @@
       "nodeTest": null,
       "command": null,
       "needs": {},
-      "evidence": [
-        "decompression-bound"
-      ],
+      "evidence": ["decompression-bound"],
       "titles": [
         "src/consumer/__tests__/decompressionBoundLive.spec.js › Consumer > a compressed batch past the decompression bound (live) halts only the partition holding the bomb, resumes it by seeking past the batch, and delivers it under a raised bound"
       ],
@@ -16959,9 +16942,7 @@
       "nodeTest": null,
       "command": null,
       "needs": {},
-      "evidence": [
-        "exactly-once-chaos"
-      ],
+      "evidence": ["exactly-once-chaos"],
       "titles": [
         "src/producer/__tests__/exactlyOnceChaosLive.spec.js › Producer > exactly-once copying under chaos (live) committed output survives connection replacement and restores broker positions",
         "src/producer/__tests__/exactlyOnceChaosLive.spec.js › Producer > exactly-once copying under chaos (live) committed output survives clean and hard rolling restarts"
@@ -16984,9 +16965,7 @@
       "nodeTest": null,
       "command": null,
       "needs": {},
-      "evidence": [
-        "txn-epoch-overflow"
-      ],
+      "evidence": ["txn-epoch-overflow"],
       "titles": [
         "src/producer/__tests__/transactionEpochOverflowLive.spec.js › Producer > transaction epoch overflow (live) renews the producer identity across the transaction epoch boundary"
       ],
@@ -17008,9 +16987,7 @@
       "nodeTest": null,
       "command": null,
       "needs": {},
-      "evidence": [
-        "txn-id-expiry"
-      ],
+      "evidence": ["txn-id-expiry"],
       "titles": [
         "src/producer/__tests__/transactionIdExpiryLive.spec.js › Producer > transactional id expiry (live) keeps committed records when an idle transaction identity expires"
       ],
@@ -17731,9 +17708,7 @@
       "nodeTest": {
         "blocks": 4,
         "skipped": "none",
-        "liveTests": [
-          1
-        ],
+        "liveTests": [1],
         "liveNames": [
           [
             "a producer to consumer round trip on a live cluster",
@@ -17813,9 +17788,7 @@
       "needs": {
         "java": true
       },
-      "evidence": [
-        "leader-union"
-      ],
+      "evidence": ["leader-union"],
       "titles": [
         "src/consumer/__tests__/leaderUnionLive.spec.js › Consumer > a leader with unequal subscriptions (live) assigns every partition of unequal JavaScript subscriptions with the roundRobin assignor",
         "src/consumer/__tests__/leaderUnionLive.spec.js › Consumer > a leader with unequal subscriptions (live) assigns every partition of unequal JavaScript subscriptions with the range assignor",
@@ -17846,9 +17819,7 @@
       "nodeTest": null,
       "command": null,
       "needs": {},
-      "evidence": [
-        "rebalance-listener"
-      ],
+      "evidence": ["rebalance-listener"],
       "titles": [
         "src/consumer/__tests__/rebalanceListenerLive.spec.js › Consumer > awaited rebalance listeners (live) classic eager: awaited hooks load and save offsets without early delivery",
         "src/consumer/__tests__/rebalanceListenerLive.spec.js › Consumer > awaited rebalance listeners (live) classic cooperative: awaited hooks load and save offsets without early delivery",
@@ -17880,9 +17851,7 @@
       "nodeTest": null,
       "command": null,
       "needs": {},
-      "evidence": [
-        "direct-consumer"
-      ],
+      "evidence": ["direct-consumer"],
       "titles": [
         "src/consumer/__tests__/directConsumerLive.spec.js › Consumer > manual assignment (live, docker lane) manual assignment with a group ID delivers the selected partitions through simple offsets only",
         "src/consumer/__tests__/directConsumerLive.spec.js › Consumer > manual assignment (live, docker lane) manual assignment without a group delivers with no group, coordinator or offset traffic",
@@ -17910,9 +17879,7 @@
       "nodeTest": null,
       "command": null,
       "needs": {},
-      "evidence": [
-        "offset-reset"
-      ],
+      "evidence": ["offset-reset"],
       "titles": [
         "src/consumer/__tests__/offsetResetLive.spec.js › Consumer > offset reset policies (live, docker lane) none halts only partitions without committed offsets and seek recovers",
         "src/consumer/__tests__/offsetResetLive.spec.js › Consumer > offset reset policies (live, docker lane) duration selects the explicit timestamp window and a missing window resolves to log end",
@@ -17941,9 +17908,7 @@
       "nodeTest": null,
       "command": null,
       "needs": {},
-      "evidence": [
-        "regex-discovery"
-      ],
+      "evidence": ["regex-discovery"],
       "titles": [
         "src/consumer/__tests__/regexDiscoveryLive.spec.js › Consumer > a client-side pattern over topics created and deleted (live) classic cooperative: discovers later matches and retires deleted incarnations without recreating topics",
         "src/consumer/__tests__/regexDiscoveryLive.spec.js › Consumer > a client-side pattern over topics created and deleted (live) consumer protocol: discovers later matches and retires deleted incarnations without recreating topics"
@@ -17966,9 +17931,7 @@
       "nodeTest": null,
       "command": null,
       "needs": {},
-      "evidence": [
-        "topic-recreated"
-      ],
+      "evidence": ["topic-recreated"],
       "titles": [
         "src/consumer/__tests__/topicRecreatedLive.spec.js › Consumer > topic recreation (live) TOPIC_RECREATED fires and the consumer resumes from fromBeginning",
         "src/consumer/__tests__/topicRecreatedLive.spec.js › Consumer > topic recreation (live) a stale committed offset inside the recreated topic range is ignored",
@@ -17993,9 +17956,7 @@
       "nodeTest": null,
       "command": null,
       "needs": {},
-      "evidence": [
-        "pause-resume"
-      ],
+      "evidence": ["pause-resume"],
       "titles": [
         "src/consumer/__tests__/pauseResumeLive.spec.js › Consumer > pause and resume (live) resumes a fully paused consumer in under one second",
         "src/consumer/__tests__/pauseResumeLive.spec.js › Consumer > pause and resume (live) keeps a paused partition silent through an eager classic rebalance",
@@ -18021,9 +17982,7 @@
       "nodeTest": null,
       "command": null,
       "needs": {},
-      "evidence": [
-        "fetch-sessions"
-      ],
+      "evidence": ["fetch-sessions"],
       "titles": [
         "src/consumer/__tests__/fetchSessionsLive.spec.js › Consumer > Fetch sessions (live) records the full Fetch limit for 1000 and 2001 partitions on one node",
         "src/consumer/__tests__/fetchSessionsLive.spec.js › Consumer > Fetch sessions (live) delivers a fresh corpus once through incremental and sparse replies (classic eager dynamic)",
@@ -18058,9 +18017,7 @@
       "nodeTest": null,
       "command": null,
       "needs": {},
-      "evidence": [
-        "fetch-sessions-capacity"
-      ],
+      "evidence": ["fetch-sessions-capacity"],
       "titles": [
         "src/consumer/__tests__/fetchSessionsCapacityLive.spec.js › Consumer > Fetch session capacity (live) meets the session cache limit with independent full-corpus consumers",
         "src/consumer/__tests__/fetchSessionsCapacityLive.spec.js › Consumer > Fetch session capacity (live) rejects a same-group cohort as independent full-corpus consumers"
@@ -18083,9 +18040,7 @@
       "nodeTest": null,
       "command": null,
       "needs": {},
-      "evidence": [
-        "bounded-close"
-      ],
+      "evidence": ["bounded-close"],
       "titles": [
         "src/consumer/__tests__/boundedCloseLive.spec.js › Consumer > bounded close (live) classic eager close fences a blackholed coordinator within the deadline",
         "src/consumer/__tests__/boundedCloseLive.spec.js › Consumer > bounded close (live) classic cooperative close fences a blackholed coordinator within the deadline",
@@ -18119,9 +18074,7 @@
       "nodeTest": null,
       "command": null,
       "needs": {},
-      "evidence": [
-        "auto-commit"
-      ],
+      "evidence": ["auto-commit"],
       "titles": [
         "src/consumer/__tests__/autoCommitCadenceLive.spec.js › Consumer > automatic commit cadence (live) a configured interval commits only at processing opportunities inside the quiet window",
         "src/consumer/__tests__/autoCommitCadenceLive.spec.js › Consumer > automatic commit cadence (live) a below-interval batch followed by idle commits only at the next processing opportunity",
@@ -18146,9 +18099,7 @@
       "nodeTest": null,
       "command": null,
       "needs": {},
-      "evidence": [
-        "consumer-protocol-states"
-      ],
+      "evidence": ["consumer-protocol-states"],
       "titles": [
         "src/consumer/__tests__/consumerProtocolStatesLive.spec.js › Consumer > consumer-protocol group states (live) captures reconciliation while a live owner withholds revocation",
         "src/consumer/__tests__/consumerProtocolStatesLive.spec.js › Consumer > consumer-protocol group states (live) captures assigning in the committed epoch gap while Describe remains serviceable",
@@ -18172,9 +18123,7 @@
       "nodeTest": null,
       "command": null,
       "needs": {},
-      "evidence": [
-        "rack-aware"
-      ],
+      "evidence": ["rack-aware"],
       "titles": [
         "src/consumer/__tests__/rackAwareLive.spec.js › Consumer > rack-aware range assignment (live) matches the Java range vector on nonuniform replica racks",
         "src/consumer/__tests__/rackAwareLive.spec.js › Consumer > rack-aware range assignment (live) uses an online in-rack follower on the next Fetch with either assignment flag",
@@ -18198,9 +18147,7 @@
       "nodeTest": null,
       "command": null,
       "needs": {},
-      "evidence": [
-        "fetch-routing"
-      ],
+      "evidence": ["fetch-routing"],
       "titles": [
         "src/consumer/__tests__/fetchRoutingLive.spec.js › Consumer > Fetch routing around unavailable and moved leaders (live) healthy partitions progress while a sibling has no leader",
         "src/consumer/__tests__/fetchRoutingLive.spec.js › Consumer > Fetch routing around unavailable and moved leaders (live) hinted and unhinted leader moves meet idle and busy bounds"
@@ -18223,9 +18170,7 @@
       "nodeTest": null,
       "command": null,
       "needs": {},
-      "evidence": [
-        "group-faults"
-      ],
+      "evidence": ["group-faults"],
       "titles": [
         "src/consumer/__tests__/groupFaultsLive.spec.js › Consumer > classic group faults (live) a duplicate static instance fences exactly one member without rebalancing its peers",
         "src/consumer/__tests__/groupFaultsLive.spec.js › Consumer > classic group faults (live) a static member returns within its session without rebalancing peers",
@@ -18250,9 +18195,7 @@
       "nodeTest": null,
       "command": null,
       "needs": {},
-      "evidence": [
-        "fetch-semantics"
-      ],
+      "evidence": ["fetch-semantics"],
       "titles": [
         "src/consumer/__tests__/fetchSemanticsLive.spec.js › Consumer > Fetch semantics (live) committed isolation excludes open and aborted transactions and all control records",
         "src/consumer/__tests__/fetchSemanticsLive.spec.js › Consumer > Fetch semantics (live) compacted transactional history preserves visibility rules",
@@ -18370,9 +18313,7 @@
       "nodeTest": null,
       "command": "node --expose-gc scripts/soak/soak.js --profile producer-churn",
       "needs": {},
-      "evidence": [
-        "producer-churn"
-      ],
+      "evidence": ["producer-churn"],
       "titles": [],
       "capMinutes": 28
     },
@@ -18386,9 +18327,7 @@
       "nodeTest": null,
       "command": "node --expose-gc scripts/soak/soak.js --profile consumer-churn",
       "needs": {},
-      "evidence": [
-        "consumer-churn"
-      ],
+      "evidence": ["consumer-churn"],
       "titles": [],
       "capMinutes": 37
     },
@@ -18397,12 +18336,7 @@
       "kind": "cluster",
       "compose": "docker-compose.yml",
       "env": {},
-      "jest": [
-        "--ci",
-        "--coverage",
-        "--maxWorkers=4",
-        "--forceExit"
-      ],
+      "jest": ["--ci", "--coverage", "--maxWorkers=4", "--forceExit"],
       "jestScript": null,
       "nodeTest": null,
       "command": null,
