@@ -131,6 +131,22 @@ describe('Consumer > prototype case containment', () => {
     expect(JSON.parse(run.report()).incompleteStage).toBe('teardown deleteTopics')
   })
 
+  test('a topic the controller already deleted counts as deleted once its absence is seen', async () => {
+    const run = new PrototypeCase('constructor', 'docker')
+    const admin = client()
+    const unknown = Object.assign(new Error('not hosted'), { type: 'UNKNOWN_TOPIC_OR_PARTITION' })
+    admin.listTopics = jest.fn().mockResolvedValueOnce(['constructor']).mockResolvedValue([])
+    admin.deleteTopics = jest
+      .fn()
+      .mockRejectedValue(Object.assign(new Error('x'), { cause: unknown }))
+    await run.connected(admin, 'admin')
+    run.admin = admin
+    await run.close()
+    expect(admin.deleteTopics).toHaveBeenCalledTimes(1)
+    expect(admin.listTopics).toHaveBeenCalledTimes(2)
+    expect(admin.disconnect).toHaveBeenCalledTimes(1)
+  })
+
   test('disconnect failures fail cleanup after all clients are attempted', async () => {
     const run = new PrototypeCase('constructor', 'fake')
     const first = client()

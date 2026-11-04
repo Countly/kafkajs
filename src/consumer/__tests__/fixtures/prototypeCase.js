@@ -369,7 +369,9 @@ class PrototypeCase {
 
   /**
    * Deletes only an existing topic, then observes its absence before any recreation can start.
-   * All other errors propagate; teardown supplies its own abort signal and failing deadline.
+   * A broker's metadata can still list a topic the controller already deleted, so an
+   * UNKNOWN_TOPIC_OR_PARTITION answer counts as deleted; absence is still observed. All other
+   * errors propagate; teardown supplies its own abort signal and failing deadline.
    * @param {object} admin connected, owned admin
    * @param {AbortSignal} signal polling cancellation
    * @returns {Promise<void>}
@@ -379,7 +381,9 @@ class PrototypeCase {
     signal.throwIfAborted()
     if ((await admin.listTopics()).includes(this.name)) {
       signal.throwIfAborted()
-      await admin.deleteTopics({ topics: [this.name] })
+      await admin.deleteTopics({ topics: [this.name] }).catch((error) => {
+        if (![error, error.cause].some((e) => e?.type === 'UNKNOWN_TOPIC_OR_PARTITION')) throw error
+      })
     }
     await until(
       async () => !(await admin.listTopics()).includes(this.name),
