@@ -4613,7 +4613,7 @@
         "src/consumer/__tests__/fetchLeaderHint.spec.js \u203a Consumer > KIP-951 leader hints on fetch endpoints that do not name the hinted leader fall back to the membership test",
         "src/consumer/__tests__/fetchLeaderHint.spec.js \u203a Consumer > KIP-951 leader hints on fetch the next round routes to the hinted node",
         "src/consumer/__tests__/fetchLeaderHint.spec.js \u203a Consumer > KIP-951 leader hints on fetch the node-id membership test survives the string/number boundary",
-        "src/consumer/__tests__/fetchLeaderHint.spec.js \u203a Consumer > a hint that adds an unknown node rebalances the fetchers, not the group every fetcher is recreated and no batch is lost across it",
+        "src/consumer/__tests__/fetchLeaderHint.spec.js \u203a Consumer > a hint that adds an unknown node rebalances the fetchers, not the group surviving fetchers stay in place and no batch is lost when a node is added",
         "src/consumer/__tests__/fetchLeaderHint.spec.js \u203a Consumer > a moved leader reaches its new node within the idle and busy bounds hinted: a busy new node asks when its long poll completes, never cancelling it",
         "src/consumer/__tests__/fetchLeaderHint.spec.js \u203a Consumer > a moved leader reaches its new node within the idle and busy bounds hinted: an idle new node asks for the partition in its next round",
         "src/consumer/__tests__/fetchLeaderHint.spec.js \u203a Consumer > a moved leader reaches its new node within the idle and busy bounds unhinted: a busy new node asks when its long poll completes, never cancelling it",

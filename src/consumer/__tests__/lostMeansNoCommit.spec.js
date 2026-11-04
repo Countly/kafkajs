@@ -2019,6 +2019,10 @@ describe.each([
       const fatal = protocol.fatalError
       const assignment = group.assigned()
       const fetchers = runner.fetchManager.getFetchers()
+      expect(fetchers.length).toBeGreaterThan(0)
+      const starts = jest.spyOn(runner.fetchManager, 'start')
+      const stops = jest.spyOn(runner.fetchManager, 'stop')
+      const fetcherStops = fetchers.map((fetcher) => jest.spyOn(fetcher, 'stop'))
       const slot = runner.rebalanceCoordinator.verdict
       const discard = jest.spyOn(group, 'discardUncommittedOffsets')
       const abandon = jest.spyOn(group.ownership, 'abandon')
@@ -2027,6 +2031,9 @@ describe.each([
         discard.mockRestore()
         abandon.mockRestore()
         round.mockRestore()
+        starts.mockRestore()
+        stops.mockRestore()
+        fetcherStops.forEach((stop) => stop.mockRestore())
       })
       if (code === null) gate.release()
       else gate.answer({ errorCode: code })
@@ -2043,7 +2050,14 @@ describe.each([
       expect(protocol.state).toBe(state)
       expect(protocol.fatalError).toBe(fatal)
       expect(group.assigned()).toEqual(assignment)
-      expect(runner.fetchManager.getFetchers()).toEqual(fetchers)
+      // Poll expiry already stopped the manager; an idle fetcher may finish draining while
+      // the old heartbeat settles. Its answer must cause no further lifecycle changes.
+      const remaining = runner.fetchManager.getFetchers()
+      expect(remaining.length).toBeGreaterThan(0)
+      remaining.forEach((fetcher) => expect(fetchers).toContain(fetcher))
+      expect(starts).not.toHaveBeenCalled()
+      expect(stops).not.toHaveBeenCalled()
+      fetcherStops.forEach((stop) => expect(stop).not.toHaveBeenCalled())
       expect(runner.rebalanceCoordinator.verdict).toBe(slot)
       expect(discard).not.toHaveBeenCalled()
       expect(abandon).not.toHaveBeenCalled()
