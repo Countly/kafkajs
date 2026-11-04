@@ -3,6 +3,7 @@ const path = require('path')
 const assert = require('assert')
 const Broker = require('../../broker')
 const { MemberMetadata } = require('../assignerProtocol')
+const waitFor = require('../../utils/waitFor')
 const { KafkaJSProtocolError } = require('../../errors')
 const { createConnectionPool, newLogger, secureRandom } = require('testHelpers')
 const { readBrokerVersion } = require('../../../testHelpers/brokerVersion')
@@ -78,11 +79,20 @@ live('raw classic follower heartbeat is pinned during the proven sync window', a
           { name: 'capture', metadata: MemberMetadata.encode({ version: 1, topics: [] }) },
         ],
       })
-    // With a zero initial rebalance delay a lone first join completes at once, so two concurrent
-    // first joins can land in different generations. A known member is always awaited: the first
-    // member joins alone, then rejoins while the second joins.
+    // With a zero initial rebalance delay a lone join completes at once, and a known member that
+    // rejoins before a newcomer gets the current generation back. So the first member joins alone,
+    // the second's join is seen to open a rebalance, and only then does the first rejoin: the
+    // coordinator holds the newcomer for it and both land in the new generation.
     const { memberId: firstId } = await join(members[0])
-    const responses = await Promise.all([join(members[0], firstId), join(members[1])])
+    const second = join(members[1])
+    await waitFor(
+      async () => {
+        const { groups } = await members[0].describeGroups({ groupIds: [groupId] })
+        return groups[0].state === 'PreparingRebalance'
+      },
+      { delay: 50, maxWait: 15000, timeoutMessage: 'The second join never opened a rebalance' }
+    )
+    const responses = await Promise.all([join(members[0], firstId), second])
     joined.push(...responses)
     expect(responses[0].generationId).toBe(responses[1].generationId)
     expect(responses[0].memberId).not.toBe(responses[1].memberId)
