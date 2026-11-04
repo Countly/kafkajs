@@ -68,6 +68,8 @@ Versions before 3.0.0 are internal alpha tags and are not published.
 
 - When a broker joins or leaves, the consumer no longer pauses every fetcher until all in-flight long polls end: surviving brokers keep fetching, a new broker gets a fetcher at once and only a departed broker's fetcher stops (2.2.4 drained and recreated all fetchers).
 
+- While a broker is unreachable, only its fetcher backs off and retries; the consumer keeps fetching from the other brokers (2.2.4 stopped and restarted every fetcher on each retry). Outage limits, warnings and events are unchanged.
+
 #### Fixes
 
 - On Node 22, a truncated zstd record batch is now refused as `KafkaJSCorruptRecordError` (reason `decompression`), as on Node 24.20+ and 26.6+, instead of decoding as fewer records. Node 22's `zlib` does not reject truncated zstd input (nodejs/node#64593), so the codec checks the first frame's blocks and checksum itself on every Node version.

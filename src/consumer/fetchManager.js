@@ -35,10 +35,16 @@ const differs = (wanted, current) => {
  * the old one has fully stopped, which keeps one Fetch in flight per node and the fetch-session
  * epochs serial. Kafkajs 2.2.4 stopped and awaited every fetcher before recreating them all.
  *
+ * A Fetch failure that `retryDelay` accepts, such as a lost connection to one broker, stays on its
+ * fetcher, which waits and retries while the others keep fetching. Any other fetcher error stops
+ * every fetcher and rejects `start()`, as does an accepted one once `retryDelay` stops accepting.
+ *
  * @param {object} options
  * @param {import('../../types').Logger} options.logger
  * @param {() => number[]} options.getNodeIds the node ids the cluster advertises now
  * @param {(nodeId: number) => Promise<import('../../types').Batch[]>} options.fetch
+ * @param {(error: Error) => number|undefined} [options.retryDelay] decides a failed Fetch: the
+ *   milliseconds its own fetcher waits before fetching again, or undefined to fail the manager
  * @param {import('./worker').Handler<T>} options.handler
  * @param {number} [options.concurrency]
  * @returns {object} manager lifecycle methods and the active fetchers; construction starts no work
@@ -48,6 +54,7 @@ const createFetchManager = ({
   logger: rootLogger,
   getNodeIds,
   fetch,
+  retryDelay,
   handler,
   concurrency = 1,
 }) => {
@@ -157,6 +164,7 @@ const createFetchManager = ({
       workerQueue,
       partitionAssignments,
       fetch: round,
+      retryDelay,
       logger,
     })
     /** @type {FetcherRun} */

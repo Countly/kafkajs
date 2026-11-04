@@ -115,6 +115,7 @@ module.exports = class Runner extends EventEmitter {
       logger: this.logger,
       getNodeIds: () => this.consumerGroup.getNodeIds(),
       fetch: (nodeId) => this.fetch(nodeId),
+      retryDelay: (error) => this.fetchRetryDelay(error),
       handler: (batch) => this.handleBatch(batch),
       concurrency,
     })
@@ -393,16 +394,8 @@ module.exports = class Runner extends EventEmitter {
           return
         }
 
-        const requestClass = this.requestClassOf(e)
-        if (requestClass && this.ridesOutages() && this.outages[requestClass].absorbs(e)) {
-          const delay = this.backoff.initial()
-          this.logger.warn('Lost a connection while fetching, trying again', {
-            groupId: this.consumerGroup.groupId,
-            memberId: this.consumerGroup.memberId,
-            error: e.message,
-            requestClass,
-            delay,
-          })
+        const delay = this.rideOutage(e)
+        if (delay !== undefined) {
           await sleep(delay)
           return true
         }
@@ -985,6 +978,58 @@ module.exports = class Runner extends EventEmitter {
         : undefined
     }
     return requestClass ?? (isOffsetCommitError(error) ? 'commit' : undefined)
+  }
+
+  /**
+   * Decides whether the loop rides `error` out as an outage of its own requests: the error's
+   * request class is one the group protocol rides and its outage still absorbs it. The caller
+   * waits the returned delay and tries again. Logs the warning the ride is reported with.
+   * @private
+   * @param {Error} error
+   * @returns {number|undefined} the backoff delay in milliseconds; undefined when the error is not
+   *   ridden out, which leaves it to the retrier's counted retries
+   */
+  rideOutage(error) {
+    const requestClass = this.requestClassOf(error)
+    if (!requestClass || !this.ridesOutages() || !this.outages[requestClass].absorbs(error)) {
+      return undefined
+    }
+
+    const delay = this.backoff.initial()
+    this.logger.warn('Lost a connection while fetching, trying again', {
+      groupId: this.consumerGroup.groupId,
+      memberId: this.consumerGroup.memberId,
+      error: error.message,
+      requestClass,
+      delay,
+    })
+    return delay
+  }
+
+  /**
+   * Decides whether one node's failed Fetch stays on that node's fetcher. It does when the fetch
+   * loop would ride the error out (`rideOutage`) and would not first turn it into a rebalance or
+   * drop it as an answer for a replaced membership, or find a verdict already waiting. Everything
+   * else reaches the loop through the fetch manager, as before. While no handler runs, the wait
+   * counts as a poll, as the fetch manager's restart did, so an outage does not expire the poll
+   * interval.
+   * @private
+   * @param {Error} error what a fetcher's Fetch threw
+   * @returns {number|undefined} the fetcher's backoff delay in milliseconds, or undefined
+   */
+  fetchRetryDelay(error) {
+    if (
+      this.requestClassOf(error) !== 'fetch' ||
+      this.rebalanceCoordinator.hasVerdict() ||
+      this.rebalanceCoordinator.classify(error, REBALANCE_PATHS.FETCH) ||
+      obsoleteOwnership(this.consumerGroup.ownership, error)
+    ) {
+      return undefined
+    }
+
+    const delay = this.rideOutage(error)
+    if (delay !== undefined && this.inFlightHandlers === 0) this.pollTimer.poll()
+    return delay
   }
 
   /**
