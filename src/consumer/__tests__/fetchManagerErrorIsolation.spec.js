@@ -1,5 +1,6 @@
 const createFetchManager = require('../fetchManager')
 const Runner = require('../runner')
+const { FetchOutage } = require('../outage')
 const InstrumentationEventEmitter = require('../../instrumentation/emitter')
 const { createLogger, LEVELS } = require('../../loggers')
 const { KafkaJSConnectionError } = require('../../errors')
@@ -147,7 +148,7 @@ describe('Fetch manager > a retriable fetch error stays on its fetcher', () => {
 
     expect([rig.count(1), rig.count(2), rig.count(3)]).toEqual([2, 2, 1])
     expect(retryDelay).toHaveBeenCalledTimes(1)
-    expect(retryDelay).toHaveBeenCalledWith(lost)
+    expect(retryDelay).toHaveBeenCalledWith(lost, 3)
     await advance(99)
     expect(rig.count(3)).toBe(1)
     await advance(1)
@@ -157,15 +158,16 @@ describe('Fetch manager > a retriable fetch error stays on its fetcher', () => {
   })
 
   it('surfaces an error the outage no longer absorbs to start() once, after every fetcher has stopped', async () => {
-    let absorbing = true
-    const retryDelay = jest.fn(() => (absorbing ? 100 : undefined))
+    const outage = new FetchOutage(100)
+    const retryDelay = jest.fn((error, nodeId) =>
+      outage.absorbs(error, performance.now(), nodeId) ? 100 : undefined
+    )
     const rig = new Rig([1, 2, 3], retryDelay)
     await rig.start()
     await rig.fail(3, new KafkaJSConnectionError('first'))
     await advance(100)
     expect(rig.count(3)).toBe(2)
 
-    absorbing = false
     const exhausted = new KafkaJSConnectionError('budget spent')
     await rig.fail(3, exhausted)
     const settled = track(rig.running)
@@ -194,7 +196,7 @@ describe('Fetch manager > a retriable fetch error stays on its fetcher', () => {
     await settle()
 
     await expect(rig.running).rejects.toBe(denied)
-    expect(retryDelay).toHaveBeenCalledWith(denied)
+    expect(retryDelay).toHaveBeenCalledWith(denied, 2)
     expect([rig.count(1), rig.count(2), rig.count(3)]).toEqual([1, 1, 1])
   })
 
@@ -338,7 +340,7 @@ describe('Runner > which fetch failures stay on their fetcher', () => {
       const runner = createRunner(kind)
       const error = lostFetch(runner)
 
-      const delay = runner.fetchRetryDelay(error)
+      const delay = runner.fetchRetryDelay(error, 3)
 
       expect(typeof delay).toBe('number')
       expect(warnings).toHaveLength(1)
@@ -357,15 +359,15 @@ describe('Runner > which fetch failures stay on their fetcher', () => {
   it('leaves a manual run to the retrier, whose counted retries it never rode out', () => {
     const runner = createRunner('manual')
 
-    expect(runner.fetchRetryDelay(lostFetch(runner))).toBeUndefined()
+    expect(runner.fetchRetryDelay(lostFetch(runner), 3)).toBeUndefined()
     expect(warnings).toEqual([])
   })
 
   it('leaves an error the fetch loop would not ride out to the loop', () => {
     const runner = createRunner()
 
-    expect(runner.fetchRetryDelay(new Error('not a connection'))).toBeUndefined()
-    expect(runner.fetchRetryDelay(new KafkaJSConnectionError('unmarked'))).toBeUndefined()
+    expect(runner.fetchRetryDelay(new Error('not a connection'), 3)).toBeUndefined()
+    expect(runner.fetchRetryDelay(new KafkaJSConnectionError('unmarked'), 3)).toBeUndefined()
     expect(warnings).toEqual([])
   })
 
@@ -375,17 +377,17 @@ describe('Runner > which fetch failures stay on their fetcher', () => {
       const runner = createRunner()
       const error = runner.markOwnRequest(new KafkaJSConnectionError('lost'), requestClass)
 
-      expect(runner.fetchRetryDelay(error)).toBeUndefined()
+      expect(runner.fetchRetryDelay(error, 3)).toBeUndefined()
       expect(warnings).toEqual([])
     }
   )
 
   it('stops accepting once the fetch outage has outlasted the session timeout, as the loop does', () => {
     const runner = createRunner()
-    runner.outages.fetch.since = performance.now() - 60000
+    runner.outages.fetch.absorbs(lostFetch(runner), performance.now() - 60000, 3)
 
-    expect(runner.fetchRetryDelay(lostFetch(runner))).toBeUndefined()
-    expect(runner.rideOutage(lostFetch(runner))).toBeUndefined()
+    expect(runner.fetchRetryDelay(lostFetch(runner), 3)).toBeUndefined()
+    expect(runner.rideOutage(lostFetch(runner), 3)).toBeUndefined()
     expect(warnings).toEqual([])
   })
 
@@ -393,7 +395,7 @@ describe('Runner > which fetch failures stay on their fetcher', () => {
     const runner = createRunner()
     jest.spyOn(runner.rebalanceCoordinator, 'classify').mockReturnValue({ kind: 'lost' })
 
-    expect(runner.fetchRetryDelay(lostFetch(runner))).toBeUndefined()
+    expect(runner.fetchRetryDelay(lostFetch(runner), 3)).toBeUndefined()
     expect(warnings).toEqual([])
   })
 
@@ -402,7 +404,7 @@ describe('Runner > which fetch failures stay on their fetcher', () => {
     const verdict = { kind: 'revoked', reason: 'rebalance-in-progress', error: new Error('x') }
     runner.rebalanceCoordinator.verdict = verdict
 
-    expect(runner.fetchRetryDelay(lostFetch(runner))).toBeUndefined()
+    expect(runner.fetchRetryDelay(lostFetch(runner), 3)).toBeUndefined()
     expect(runner.rebalanceCoordinator.verdict).toBe(verdict)
   })
 
@@ -411,7 +413,7 @@ describe('Runner > which fetch failures stay on their fetcher', () => {
     runner.consumerGroup.ownership = { token: () => 2 }
     const stale = stampOwnership(lostFetch(runner), 1)
 
-    expect(runner.fetchRetryDelay(stale)).toBeUndefined()
+    expect(runner.fetchRetryDelay(stale, 3)).toBeUndefined()
     expect(warnings).toEqual([])
   })
 
@@ -420,11 +422,11 @@ describe('Runner > which fetch failures stay on their fetcher', () => {
 
     runner.pollTimer.lastPollAt = 0
     runner.inFlightHandlers = 1
-    expect(runner.fetchRetryDelay(lostFetch(runner))).toEqual(expect.any(Number))
+    expect(runner.fetchRetryDelay(lostFetch(runner), 3)).toEqual(expect.any(Number))
     expect(runner.pollTimer.lastPollAt).toBe(0)
 
     runner.inFlightHandlers = 0
-    expect(runner.fetchRetryDelay(lostFetch(runner))).toEqual(expect.any(Number))
+    expect(runner.fetchRetryDelay(lostFetch(runner), 3)).toEqual(expect.any(Number))
     expect(runner.pollTimer.lastPollAt).toBeGreaterThan(0)
   })
 })

@@ -13,7 +13,7 @@ const EventEmitter = require('events')
  * @param {Map<string, string[]>} options.partitionAssignments
  * @param {(nodeId: number) => Promise<T[]>} options.fetch
  * @param {import('../../types').Logger} options.logger
- * @param {(error: Error) => number|undefined} [options.retryDelay] called with a failed `fetch`'s
+ * @param {(error: Error, nodeId: number) => number|undefined} [options.retryDelay] called with a failed `fetch`'s
  *   error: the milliseconds to wait before fetching again, or undefined to fail the fetcher
  * @template T
  */
@@ -65,7 +65,7 @@ const createFetcher = ({
     try {
       return await fetch(nodeId)
     } catch (error) {
-      const delay = retryDelay?.(error)
+      const delay = retryDelay?.(error, nodeId)
       if (delay === undefined) throw error
 
       if (isRunning) {

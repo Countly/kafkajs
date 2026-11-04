@@ -43,8 +43,10 @@ const differs = (wanted, current) => {
  * @param {import('../../types').Logger} options.logger
  * @param {() => number[]} options.getNodeIds the node ids the cluster advertises now
  * @param {(nodeId: number) => Promise<import('../../types').Batch[]>} options.fetch
- * @param {(error: Error) => number|undefined} [options.retryDelay] decides a failed Fetch: the
+ * @param {(error: Error, nodeId: number) => number|undefined} [options.retryDelay] decides a failed Fetch: the
  *   milliseconds its own fetcher waits before fetching again, or undefined to fail the manager
+ * @param {(nodeId: number) => void} [options.onRetire] forgets a removed or explicitly stopped
+ *   broker after its last Fetch settles; failure alone retains its outage for counted retries
  * @param {import('./worker').Handler<T>} options.handler
  * @param {number} [options.concurrency]
  * @returns {object} manager lifecycle methods and the active fetchers; construction starts no work
@@ -55,6 +57,7 @@ const createFetchManager = ({
   getNodeIds,
   fetch,
   retryDelay,
+  onRetire,
   handler,
   concurrency = 1,
 }) => {
@@ -186,6 +189,7 @@ const createFetchManager = ({
    */
   const release = (nodeId, run) => {
     if (runs.get(nodeId) === run) runs.delete(nodeId)
+    if (run.retiring) onRetire?.(nodeId)
     logger.debug('Fetcher stopped', { nodeId })
     sync()
 
@@ -241,6 +245,9 @@ const createFetchManager = ({
       throw new KafkaJSNoBrokerAvailableError()
     }
 
+    for (const nodeId of wanted) {
+      if (!nodeIds.includes(nodeId)) onRetire?.(nodeId)
+    }
     wanted = new Set(nodeIds)
     const drained = new Promise((resolve) => {
       settleStart = resolve
@@ -270,6 +277,8 @@ const createFetchManager = ({
       await stopFetchers()
     } catch (error) {
       logger.debug('Error while stopping fetchers', { error: error.message })
+    } finally {
+      for (const nodeId of wanted) onRetire?.(nodeId)
     }
   }
 

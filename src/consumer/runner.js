@@ -23,6 +23,7 @@ const createFetchManager = require('./fetchManager')
 const RebalanceCoordinator = require('./rebalanceCoordinator')
 const PollTimer = require('./pollTimer')
 const Outage = require('./outage')
+const { FetchOutage } = Outage
 const HeartbeatManager = require('./heartbeatManager')
 const {
   REBALANCE_PATHS,
@@ -102,12 +103,14 @@ module.exports = class Runner extends EventEmitter {
      * requests in it: each ends only when a request of its own class succeeds.
      */
     this.outages = {
-      fetch: new Outage(consumerGroup.kind === 'consumer' ? Infinity : sessionTimeout),
+      fetch: new FetchOutage(consumerGroup.kind === 'consumer' ? Infinity : sessionTimeout),
       heartbeat: new Outage(consumerGroup.kind === 'consumer' ? Infinity : sessionTimeout),
       commit: new Outage(consumerGroup.kind === 'consumer' ? Infinity : sessionTimeout),
     }
     /** @type {WeakMap<object, 'fetch'|'heartbeat'|'handler'>} where an error left the loop's work */
     this.requestClasses = new WeakMap()
+    /** @type {WeakMap<Error, number>} the broker whose Fetch raised an error, across manager retries */
+    this.fetchNodes = new WeakMap()
     this.onCrash = onCrash
     this.autoCommit = autoCommit
     this.maxPrefetchBatches = maxPrefetchBatches
@@ -115,7 +118,8 @@ module.exports = class Runner extends EventEmitter {
       logger: this.logger,
       getNodeIds: () => this.consumerGroup.getNodeIds(),
       fetch: (nodeId) => this.fetch(nodeId),
-      retryDelay: (error) => this.fetchRetryDelay(error),
+      retryDelay: (error, nodeId) => this.fetchRetryDelay(error, nodeId),
+      onRetire: (nodeId) => this.outages.fetch.end(nodeId),
       handler: (batch) => this.handleBatch(batch),
       concurrency,
     })
@@ -986,12 +990,17 @@ module.exports = class Runner extends EventEmitter {
    * waits the returned delay and tries again. Logs the warning the ride is reported with.
    * @private
    * @param {Error} error
+   * @param {number} [nodeId] the failed Fetch broker; inferred from its error in the outer loop
    * @returns {number|undefined} the backoff delay in milliseconds; undefined when the error is not
    *   ridden out, which leaves it to the retrier's counted retries
    */
-  rideOutage(error) {
+  rideOutage(error, nodeId = this.fetchNodes.get(error)) {
     const requestClass = this.requestClassOf(error)
-    if (!requestClass || !this.ridesOutages() || !this.outages[requestClass].absorbs(error)) {
+    if (
+      !requestClass ||
+      !this.ridesOutages() ||
+      !this.outages[requestClass].absorbs(error, performance.now(), nodeId)
+    ) {
       return undefined
     }
 
@@ -1015,9 +1024,10 @@ module.exports = class Runner extends EventEmitter {
    * interval.
    * @private
    * @param {Error} error what a fetcher's Fetch threw
+   * @param {number} nodeId the failed broker
    * @returns {number|undefined} the fetcher's backoff delay in milliseconds, or undefined
    */
-  fetchRetryDelay(error) {
+  fetchRetryDelay(error, nodeId) {
     if (
       this.requestClassOf(error) !== 'fetch' ||
       this.rebalanceCoordinator.hasVerdict() ||
@@ -1027,7 +1037,7 @@ module.exports = class Runner extends EventEmitter {
       return undefined
     }
 
-    const delay = this.rideOutage(error)
+    const delay = this.rideOutage(error, nodeId)
     if (delay !== undefined && this.inFlightHandlers === 0) this.pollTimer.poll()
     return delay
   }
@@ -1303,6 +1313,7 @@ module.exports = class Runner extends EventEmitter {
     try {
       batches = await this.consumerGroup.fetch(nodeId)
     } catch (e) {
+      if (e && typeof e === 'object') this.fetchNodes.set(e, nodeId)
       throw this.markOwnRequest(e, 'fetch')
     }
 
@@ -1326,8 +1337,7 @@ module.exports = class Runner extends EventEmitter {
       this.pollTimer.poll()
       await this.heartbeat()
     } else {
-      // A leader answered: the fetch outage the loop was riding out, if any, is over.
-      this.outages.fetch.end()
+      this.outages.fetch.end(nodeId)
     }
 
     return batches
