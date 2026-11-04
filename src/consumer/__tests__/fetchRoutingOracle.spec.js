@@ -124,8 +124,8 @@ describe('Consumer > Fetch routing oracle (offline controls)', () => {
 })
 
 describe('Consumer > Fetch routing oracle > a move that changes the node set', () => {
-  // CI measured the route and destination starts, but no drain end.
-  // This replay assumes a shared drain ending promptly before the first recreated Fetch.
+  // CI measured the route and destination starts, but no rebalance log.
+  // This replay assumes a shared rebalance-log time promptly before the first recreated Fetch.
   const unhintedIdle = {
     kind: 'idle',
     hinted: false,
@@ -328,6 +328,7 @@ describe('Consumer > Fetch routing oracle > the sibling window', () => {
 
 describe('Consumer > Fetch routing wire measurement', () => {
   const { RoutingWire } = require('./fixtures/routingWire')
+  const { FetcherRecreations } = require('./fixtures/fetcherRecreations')
   const Encoder = require('../../protocol/encoder')
   const createRequest = require('../../protocol/request')
   const { requests } = require('../../protocol/requests')
@@ -378,12 +379,45 @@ describe('Consumer > Fetch routing wire measurement', () => {
     )
   }
 
-  it('rejects a late destination using the shared pre-recreation drain', async () => {
+  it('passes an old fetcher writing after the route with an explicit rebalance boundary', async () => {
+    const observation = new FetcherRecreations()
+    const log = observation.logCreator(5)
+    await fetch(1, 1)
+    await fetch(2, 1)
+    jest.advanceTimersByTime(105)
+    answer(1, 1)
+    jest.advanceTimersByTime(5)
+    await fetch(1, 2)
+    jest.advanceTimersByTime(2890)
+    answer(1, 2)
+    answer(2, 1)
+    log({ namespace: 'FetchManager', log: { message: 'Rebalancing fetchers...' } })
+    jest.advanceTimersByTime(10)
+    await fetch(1, 3)
+    await fetch(2, 2)
+
+    const moves = [1, 2].map((connection) => ({
+      ...idle,
+      errorAt: 100,
+      routeAt: 100,
+      nextAt: wire.exchanges.filter((x) => x.connection === connection).at(-1).at,
+    }))
+    const boundary = observation.boundary(moves)
+    expect(boundary).toEqual({ nodeSetChanged: true, drainEndAt: 3000 })
+    for (const move of moves) expect(moveProblems({ ...move, ...boundary })).toEqual([])
+  })
+
+  it('rejects a late destination using the shared rebalance log', async () => {
+    const observation = new FetcherRecreations()
     await fetch(1, 1)
     await fetch(2, 1)
     jest.advanceTimersByTime(200)
     answer(1, 1)
     answer(2, 1)
+    observation.logCreator(5)({
+      namespace: 'FetchManager',
+      log: { message: 'Rebalancing fetchers...' },
+    })
     jest.advanceTimersByTime(10)
     await fetch(1, 2)
     jest.advanceTimersByTime(2790)
@@ -391,37 +425,26 @@ describe('Consumer > Fetch routing wire measurement', () => {
     jest.advanceTimersByTime(100)
     await fetch(2, 2)
 
-    const drainEndAt = wire.drainEnd(100)
-    expect(drainEndAt).toBe(200)
-    for (const nextAt of [210, 3100]) {
-      const problems = moveProblems({
-        ...idle,
-        routeAt: 100,
-        nodeSetChanged: true,
-        drainEndAt,
-        nextAt,
-      })
-      expect(problems).toEqual(
-        nextAt === 210 ? [] : ['the fetchers started more than a round after the drain']
+    const moves = [210, 3100].map((nextAt) => ({ ...idle, routeAt: 100, errorAt: 100, nextAt }))
+    const boundary = observation.boundary(moves)
+    expect(boundary).toEqual({ nodeSetChanged: true, drainEndAt: 200 })
+    for (const move of moves) {
+      expect(moveProblems({ ...move, ...boundary })).toEqual(
+        move.nextAt === 210 ? [] : ['the fetchers started more than a round after the drain']
       )
     }
   })
 
-  it('uses unanswered old Fetch socket closes and excludes recreated socket closes', async () => {
-    await fetch(1, 1)
-    jest.advanceTimersByTime(200)
-    wire.closes.push({ connection: 1, at: performance.now() })
-    jest.advanceTimersByTime(10)
-    await fetch(2, 1)
-    jest.advanceTimersByTime(2790)
-    wire.closes.push({ connection: 2, at: performance.now() })
-    jest.advanceTimersByTime(100)
-    await fetch(3, 1)
-
-    expect(wire.drainEnd(100)).toBe(200)
+  it('keeps strict bounds when no rebalance log was observed', () => {
+    const moves = [{ ...idle, errorAt: 100, routeAt: 100, nextAt: 3010 }]
+    const boundary = new FetcherRecreations().boundary(moves)
+    expect(boundary).toEqual({ nodeSetChanged: false, drainEndAt: null })
+    expect(moveProblems({ ...moves[0], ...boundary })).toEqual([
+      'the idle route took longer than a round',
+    ])
   })
 
-  it('selects the latest Metadata response when answers arrive out of request order', async () => {
+  it('selects the first Metadata route when answers arrive out of request order', async () => {
     for (const correlationId of [1, 2]) {
       const { request } = requests.Metadata.protocol({ version: 0 })({ topics: [] })
       const { buffer } = await createRequest({ correlationId, clientId: 'routing-wire', request })
@@ -437,7 +460,19 @@ describe('Consumer > Fetch routing wire measurement', () => {
         .writeInt32(nodeId)
         .writeString('broker')
         .writeInt32(9092)
-        .writeInt32(0)
+        .writeArray([
+          new Encoder()
+            .writeInt16(0)
+            .writeString('moved-topic')
+            .writeArray([
+              new Encoder()
+                .writeInt16(0)
+                .writeInt32(0)
+                .writeInt32(2)
+                .writeArray([2], 'int32')
+                .writeArray([2], 'int32'),
+            ]),
+        ])
       wire.read(
         1,
         new Encoder()
@@ -447,8 +482,21 @@ describe('Consumer > Fetch routing wire measurement', () => {
       )
     }
 
-    expect(await wire.nodeSetAt(201)).toEqual(new Set([1]))
-    expect(await wire.nodeSetAt(200)).toEqual(new Set([2]))
-    expect(await wire.nodeSetAt(200, true)).toEqual(new Set([1]))
+    const METADATA = require('../../protocol/requests/apiKeys').Metadata
+    const errorAt = 50
+    const topic = 'moved-topic'
+    const newNode = 2
+    expect((await wire.answers(METADATA)).map(({ at }) => at)).toEqual([200, 100])
+    const known = (await wire.answers(METADATA))
+      .sort((a, b) => a.at - b.at)
+      .find(
+        ({ at, decoded }) =>
+          at >= errorAt &&
+          decoded.topicMetadata
+            .find((t) => t.topic === topic)
+            ?.partitionMetadata.some((p) => p.partitionId === 0 && p.leader === newNode)
+      )
+    expect(known.at).toBe(100)
+    expect(known.decoded.brokers[0].nodeId).toBe(2)
   })
 })

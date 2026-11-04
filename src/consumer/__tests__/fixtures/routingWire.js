@@ -65,42 +65,6 @@ class RoutingWire extends WireTranscript {
   }
 
   /**
-   * @param {number} at `performance.now()`
-   * @param {boolean} [inclusive] whether an answer at `at` counts
-   * @returns {Promise<Set<number>|null>} the broker ids of the last Metadata answer before `at`,
-   *   the client's own view of the cluster; null when it had none
-   */
-  async nodeSetAt(at, inclusive = false) {
-    const answers = (await this.answers(METADATA)).filter((a) =>
-      inclusive ? a.at <= at : a.at < at
-    )
-    const last = answers.sort((a, b) => a.at - b.at).at(-1)
-    return last ? new Set(last.decoded.brokers.map(({ nodeId }) => nodeId)) : null
-  }
-
-  /**
-   * Measures one shared drain for a recreation episode, across every destination. The first
-   * Fetch written at or after the route belongs to the recreated set; only earlier requests
-   * contribute responses or, if unanswered, socket closes. Recreated Fetches never contribute.
-   * @param {number} routeAt time the changed node set became known
-   * @returns {number|null} last pre-recreation completion before the global restart, or null
-   */
-  drainEnd(routeAt) {
-    const fetches = this.exchanges.filter((x) => x.apiKey === FETCH)
-    const first = fetches.filter((x) => x.at >= routeAt).sort((a, b) => a.at - b.at)[0]
-    if (!first) return null
-    const ended = fetches
-      .filter((x) => x.at < first.at)
-      .map(
-        (x) =>
-          x.answer?.at ??
-          this.closes.find(({ connection, at }) => connection === x.connection && at >= x.at)?.at
-      )
-      .filter((at) => at !== undefined && at <= first.at)
-    return ended.length ? Math.max(...ended) : null
-  }
-
-  /**
    * @param {object} exchange an exchange whose answer was kept
    * @returns {Promise<object>} the answer's decoded body
    */
