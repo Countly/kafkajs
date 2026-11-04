@@ -27,6 +27,7 @@ const {
   pollUntil,
 } = require('../../producer/__tests__/fixtures/bounded')
 const { RoutingWire } = require('./fixtures/routingWire')
+const { FetcherRecreations } = require('./fixtures/fetcherRecreations')
 const {
   MOVE_WAIT_MS,
   ROUND_ALLOWANCE_MS,
@@ -154,6 +155,7 @@ class Episode {
     this.name = name
     this.brokers = plainTextBrokers()
     this.wire = new RoutingWire()
+    this.fetcherRecreations = new FetcherRecreations()
     /** @type {Array<{ topic: string, partition: number, offset: string, value: string, at: number }>} */
     this.handled = []
     /** @type {Array<{ topic: string, partition: number, offset: number, at: number }>} */
@@ -235,7 +237,8 @@ class Episode {
     const kafka = new Kafka({
       clientId: `${PREFIX}-${name}-member-${id}`,
       brokers: this.brokers,
-      logLevel: logLevel.NOTHING,
+      logLevel: logLevel.DEBUG,
+      logCreator: this.fetcherRecreations.logCreator,
       socketFactory: this.wire.socketFactory,
     })
     const consumer = kafka.consumer({
@@ -471,13 +474,15 @@ class Episode {
           )
           if (!lost) return false
           errorAt = lost.at
-          const known = (await wire.answers(METADATA)).find(
-            ({ at, decoded }) =>
-              at >= errorAt &&
-              decoded.topicMetadata
-                .find((t) => t.topic === topic)
-                ?.partitionMetadata.some((p) => p.partitionId === 0 && p.leader === newNode)
-          )
+          const known = (await wire.answers(METADATA))
+            .sort((a, b) => a.at - b.at)
+            .find(
+              ({ at, decoded }) =>
+                at >= errorAt &&
+                decoded.topicMetadata
+                  .find((t) => t.topic === topic)
+                  ?.partitionMetadata.some((p) => p.partitionId === 0 && p.leader === newNode)
+            )
           if (!known) return false
           routeAt = known.at
         }
@@ -489,8 +494,6 @@ class Episode {
           (x) => x.apiKey === FETCH && x.endpoint === newEndpoint && x.at <= routeAt
         )
         const outstanding = prior.filter((x) => x.at <= errorAt).at(-1)
-        const before = (await wire.nodeSetAt(errorAt)) ?? new Set(wire.nodes.values())
-        const after = (await wire.nodeSetAt(routeAt, true)) ?? before
         found = {
           kind,
           hinted,
@@ -503,7 +506,6 @@ class Episode {
           priorFetches: prior.length,
           pollWriteAt: outstanding?.at ?? null,
           pollDoneAt: outstanding?.answer?.at ?? null,
-          nodeSetChanged: before.size !== after.size || [...before].some((id) => !after.has(id)),
           hint: hint?.currentLeader ?? null,
           anyHint: fetched.some(({ currentLeader }) => currentLeader),
           refreshed: wire.exchanges.some(
@@ -786,10 +788,8 @@ describeRouting('Consumer > Fetch routing around unavailable and moved leaders (
               measured.push(await episode.measure({ ...move, oldNode: roles.old, hinted, since }))
             }
             episode.facts.moves = measured.filter((m) => m.hinted === hinted)
-            const drainEndAt = episode.wire.drainEnd(
-              Math.min(...episode.facts.moves.map(({ routeAt }) => routeAt))
-            )
-            for (const move of episode.facts.moves) move.drainEndAt = drainEndAt
+            const boundary = episode.fetcherRecreations.boundary(episode.facts.moves)
+            for (const move of episode.facts.moves) Object.assign(move, boundary)
             if (outage) {
               episode.facts.outage = await bounded(scope, Infinity, () => outage, {
                 label: 'The outage',
