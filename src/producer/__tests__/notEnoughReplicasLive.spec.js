@@ -366,7 +366,9 @@ describeReplicas('Producer > one follower down under min.insync.replicas (live)'
         expect(during.arms).toHaveLength(1 + RELAXED_SENDS)
         expect(rejected.error).toMatchObject({ name: 'KafkaJSDeliveryTimeout' })
         expect([PRE_APPEND, AFTER_APPEND]).toContain(rejectedType)
-        expect(rejected.ms).toBeGreaterThanOrEqual(DELIVERY_TIMEOUT_MS)
+        // Node timers keep whole-millisecond time, so a deadline timer can fire up to 1 ms before
+        // performance.now() says the full timeout has passed.
+        expect(rejected.ms).toBeGreaterThanOrEqual(DELIVERY_TIMEOUT_MS - 1)
         expect(rejected.ms).toBeLessThanOrEqual(DELIVERY_TIMEOUT_MS + DELIVERY_SLACK_MS)
         for (const { error, ms } of accepted) {
           expect(error).toBeNull()
