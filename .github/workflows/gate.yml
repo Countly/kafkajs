@@ -231,6 +231,8 @@ jobs:
             ${{ runner.temp }}/node-tests.tap
             .tmp/gate-sweeps/
             .tmp/e2e/
+            coverage/coverage-summary.json
+            coverage/lcov.info
             ${{ runner.temp }}/compose.log
       - name: Record result
         if: always()
