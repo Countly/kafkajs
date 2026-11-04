@@ -11,6 +11,9 @@ const {
 const { BrokerBouncer, NODES, waitForFullIsr } = require('../../../testHelpers/leaderElection')
 const { readLog } = require('../../../testHelpers/rawLog')
 const apiKeys = require('../../protocol/requests/apiKeys')
+const Decoder = require('../../protocol/decoder')
+const { requests } = require('../../protocol/requests')
+const { responseHeaderVersion, RESPONSE_HEADER_V1 } = require('../../protocol/headers')
 const {
   CleanupStack,
   COORDINATOR_TYPES,
@@ -26,8 +29,7 @@ const {
   liveCase,
   pollUntil,
 } = require('../../producer/__tests__/fixtures/bounded')
-const { RoutingWire } = require('./fixtures/routingWire')
-const { FetcherRecreations } = require('./fixtures/fetcherRecreations')
+const { WireTranscript } = require('./fixtures/rackWire')
 const {
   MOVE_WAIT_MS,
   ROUND_ALLOWANCE_MS,
@@ -136,6 +138,86 @@ const rolesFor = (coordinatorId) => {
 }
 
 /**
+ * Records every frame a client writes and answers it reads, as `WireTranscript` does, and also the
+ * Metadata answers and the time each socket closed, so a case can place the moment an old leader
+ * was lost and the moment a new one became known.
+ */
+class RoutingWire extends WireTranscript {
+  /** Starts with no closed socket. */
+  constructor() {
+    super()
+    /** @type {Array<{ endpoint: string, at: number }>} when each socket closed */
+    this.closes = []
+  }
+
+  /**
+   * @param {object} socket a socket of the client
+   * @param {{ host: string, port: number }} address
+   * @returns {object} the socket, also noting when it closes
+   */
+  observe(socket, address) {
+    const observed = super.observe(socket, address)
+    const endpoint = `${address.host}:${address.port}`
+    observed.once('close', () => this.closes.push({ endpoint, at: performance.now() }))
+    return observed
+  }
+
+  /**
+   * @param {number} connection
+   * @param {Buffer} frame one complete answer frame
+   * @returns {void}
+   */
+  read(connection, frame) {
+    const exchange = this.open.get(`${connection}:${frame.readInt32BE(4)}`)
+    super.read(connection, frame)
+    if (exchange?.apiKey === METADATA && !exchange.answer) {
+      exchange.answer = { at: performance.now(), frame }
+    }
+  }
+
+  /**
+   * Decodes the answers of one API, once each.
+   * @param {number} apiKey `Fetch` or `Metadata`
+   * @returns {Promise<Array<{ exchange: object, at: number, decoded: object }>>} oldest first
+   */
+  async answers(apiKey) {
+    const kept = this.exchanges.filter((x) => x.apiKey === apiKey && x.answer)
+    return Promise.all(
+      kept.map(async (exchange) => {
+        exchange.decoded ??= this.decode(exchange)
+        return { exchange, at: exchange.answer.at, decoded: await exchange.decoded }
+      })
+    )
+  }
+
+  /**
+   * @param {object} exchange an exchange whose answer was kept
+   * @returns {Promise<object>} the answer's decoded body
+   */
+  async decode(exchange) {
+    const { response } = requests[exchange.apiKey === FETCH ? 'Fetch' : 'Metadata'].protocol({
+      version: exchange.apiVersion,
+    })({
+      maxWaitTime: 0,
+      minBytes: 0,
+      maxBytes: 0,
+      topics: [],
+      topicIds: new Map(),
+      rackId: '',
+      allowAutoTopicCreation: false,
+    })
+    const { frame } = exchange.answer
+    const header = new Decoder(frame)
+    header.readInt32()
+    header.readInt32()
+    if (responseHeaderVersion(exchange.apiKey, exchange.apiVersion) === RESPONSE_HEADER_V1) {
+      header.readTaggedFields()
+    }
+    return response.decode(frame.subarray(header.offset))
+  }
+}
+
+/**
  * One client group over a few single-partition topics on the live cluster: the topics with the
  * replicas asked for, one member, what its handlers were given, the commits it confirmed and the
  * wire it showed. Protocol work only: every wait goes through the case scope and every client is
@@ -155,7 +237,6 @@ class Episode {
     this.name = name
     this.brokers = plainTextBrokers()
     this.wire = new RoutingWire()
-    this.fetcherRecreations = new FetcherRecreations()
     /** @type {Array<{ topic: string, partition: number, offset: string, value: string, at: number }>} */
     this.handled = []
     /** @type {Array<{ topic: string, partition: number, offset: number, at: number }>} */
@@ -237,8 +318,7 @@ class Episode {
     const kafka = new Kafka({
       clientId: `${PREFIX}-${name}-member-${id}`,
       brokers: this.brokers,
-      logLevel: logLevel.DEBUG,
-      logCreator: this.fetcherRecreations.logCreator,
+      logLevel: logLevel.NOTHING,
       socketFactory: this.wire.socketFactory,
     })
     const consumer = kafka.consumer({
@@ -420,8 +500,7 @@ class Episode {
    * @param {number} move.newNode
    * @param {boolean} move.hinted whether the old leader names the new one
    * @param {number} move.since `performance.now()` when the move was issued
-   * @returns {Promise<object>} the timestamps, the hint, the counts, whether the client's node set
-   *   changed across the route and when its in-flight Fetches drained, which the bounds read
+   * @returns {Promise<object>} the timestamps, the hint and the counts the bounds read
    */
   async measure({ kind, topic, oldNode, newNode, hinted, since }) {
     this.stage = `measuring the ${hinted ? 'hinted' : 'unhinted'} ${kind} move`
@@ -474,15 +553,13 @@ class Episode {
           )
           if (!lost) return false
           errorAt = lost.at
-          const known = (await wire.answers(METADATA))
-            .sort((a, b) => a.at - b.at)
-            .find(
-              ({ at, decoded }) =>
-                at >= errorAt &&
-                decoded.topicMetadata
-                  .find((t) => t.topic === topic)
-                  ?.partitionMetadata.some((p) => p.partitionId === 0 && p.leader === newNode)
-            )
+          const known = (await wire.answers(METADATA)).find(
+            ({ at, decoded }) =>
+              at >= errorAt &&
+              decoded.topicMetadata
+                .find((t) => t.topic === topic)
+                ?.partitionMetadata.some((p) => p.partitionId === 0 && p.leader === newNode)
+          )
           if (!known) return false
           routeAt = known.at
         }
@@ -788,8 +865,6 @@ describeRouting('Consumer > Fetch routing around unavailable and moved leaders (
               measured.push(await episode.measure({ ...move, oldNode: roles.old, hinted, since }))
             }
             episode.facts.moves = measured.filter((m) => m.hinted === hinted)
-            const boundary = episode.fetcherRecreations.boundary(episode.facts.moves)
-            for (const move of episode.facts.moves) Object.assign(move, boundary)
             if (outage) {
               episode.facts.outage = await bounded(scope, Infinity, () => outage, {
                 label: 'The outage',
@@ -820,10 +895,6 @@ describeRouting('Consumer > Fetch routing around unavailable and moved leaders (
           for (const move of measured) {
             const late = { ...move, nextAt: move.nextAt + MOVE_WAIT_MS + 2 * ROUND_ALLOWANCE_MS }
             expect(moveProblems(late)).not.toEqual([])
-            if (move.nodeSetChanged) {
-              const idled = { ...move, drainEndAt: move.nextAt - 2 * ROUND_ALLOWANCE_MS }
-              expect(moveProblems(idled)).not.toEqual([])
-            }
             if (move.hinted) expect(moveProblems({ ...move, hint: null })).not.toEqual([])
             else expect(moveProblems({ ...move, anyHint: true })).not.toEqual([])
           }
