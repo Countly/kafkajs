@@ -1,13 +1,15 @@
 const caches = new WeakMap()
 
 /**
- * Publication identities for one group's committed cache, independent of ledger retention.
- * Only cells with a private reset position need an identity. Publishing or clearing removes
- * that identity; the next private position receives a fresh one, even for the same offset.
+ * Publication revisions for one group's committed cache, independent of ledger retention.
+ * State is bounded by published or cleared cells and topics, never private reset positions.
+ * Capturing the cache sequence allocates nothing; later publications or clears supersede it.
  */
 class CommittedOffsetRevisions {
   /** @returns {CommittedOffsetRevisions} empty revision state. */
   constructor() {
+    this.seq = 0
+    this.cells = new Map()
     this.topics = new Map()
   }
 
@@ -26,49 +28,48 @@ class CommittedOffsetRevisions {
   }
 
   /**
-   * Captures a cell's current publication identity, including an absent shared cell.
-   * @param {string} topic topic name
-   * @param {number|string} partition partition id
-   * @returns {symbol} identity, stable until publication or invalidation
+   * Captures the cache sequence without retaining any private position or cell.
+   * @returns {number} sequence at capture time
    */
-  capture(topic, partition) {
-    let cells = this.topics.get(topic)
-    if (!cells) this.topics.set(topic, (cells = new Map()))
-    const key = String(partition)
-    if (!cells.has(key)) cells.set(key, Symbol('committed offset revision'))
-    return cells.get(key)
+  capture() {
+    return this.seq
   }
 
   /**
-   * Reads a revision without allocating on the fetch path.
+   * Checks whether a cell has been published or cleared since capture, without allocating.
    * @param {string} topic topic name
    * @param {number|string} partition partition id
-   * @returns {symbol|undefined} current identity
+   * @param {number} captured sequence at capture time
+   * @returns {boolean} whether the private position remains current
    */
-  current(topic, partition) {
-    return this.topics.get(topic)?.get(String(partition))
+  isCurrent(topic, partition, captured) {
+    const cell = this.cells.get(topic)?.get(String(partition))
+    const cleared = this.topics.get(topic)
+    return (
+      (cell === undefined || cell <= captured) && (cleared === undefined || cleared <= captured)
+    )
   }
 
   /**
    * Advances a cell's revision on every accepted publication or clear, even at the same value.
-   * Removing the old identity prevents reactivation and bounds state by tracked cells.
    * @param {string} topic topic name
    * @param {number|string} partition partition id
    * @returns {void}
    */
   advance(topic, partition) {
-    const cells = this.topics.get(topic)
-    cells?.delete(String(partition))
-    if (cells?.size === 0) this.topics.delete(topic)
+    let cells = this.cells.get(topic)
+    if (!cells) this.cells.set(topic, (cells = new Map()))
+    cells.set(String(partition), ++this.seq)
   }
 
   /**
-   * Invalidates all cells when a topic's shared cache is cleared.
+   * Invalidates a topic's cells and replaces their revisions with one topic stamp.
    * @param {string} topic topic name
    * @returns {void}
    */
   clearTopic(topic) {
-    this.topics.delete(topic)
+    this.topics.set(topic, ++this.seq)
+    this.cells.delete(topic)
   }
 }
 

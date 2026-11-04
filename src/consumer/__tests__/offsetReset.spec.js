@@ -494,7 +494,8 @@ test('a newer seek or commit wins a held duration reset in either completion ord
   const commitLast = createScheduledOffsetManager({ committed: '99', listOffset: '12' })
   commitLast.manager.topicConfigurations[TOPIC].resetPolicy = DURATION
   expect(await commitLast.manager.setDefaultOffset({ topic: TOPIC, partition: 0 })).toBe(true)
-  expect(commitLast.committedAt()).toBe('12')
+  expect(commitLast.heldAt()).toBe('12')
+  expect(commitLast.committedAt()).toBeUndefined()
   await commitLast.manager.commitOffsets(commitOf('3'))
   expect(commitLast.committedAt()).toBe('3')
   expect(commitLast.operations.size()).toBe(0)

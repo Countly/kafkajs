@@ -805,7 +805,7 @@ describe('Consumer > broker outages', () => {
       let removed = true
       jest
         .spyOn(runner.consumerGroup, 'getNodeIds')
-        .mockImplementation(() => getNodeIds().filter((nodeId) => !removed || nodeId !== 2))
+        .mockImplementation(() => getNodeIds().filter((nodeId) => !removed || nodeId !== '2'))
       await until(() => !runner.outages.fetch.nodes.has('2'), 'the removed broker retired')
       removed = false
       await until(() => runner.outages.fetch.nodes.has('2'), 'the returning broker clock')
@@ -824,7 +824,7 @@ describe('Consumer > broker outages', () => {
       let exhausted = false
       jest.spyOn(runner, 'fetchRetryDelay').mockImplementation((error, nodeId) => {
         const delay = retry(error, nodeId)
-        if (nodeId === 2 && delay === undefined) exhausted = true
+        if (nodeId === '2' && delay === undefined) exhausted = true
         return delay
       })
       let release
@@ -849,7 +849,7 @@ describe('Consumer > broker outages', () => {
         const ride = runner.rideOutage.bind(runner)
         jest.spyOn(runner, 'rideOutage').mockImplementation((error, nodeId) => {
           const delay = ride(error, nodeId)
-          if (nodeId === undefined && runner.fetchNodes.get(error) === 2) {
+          if (nodeId === undefined && runner.fetchNodes.get(error) === '2') {
             outerChecks.push({ since: runner.outages.fetch.nodes.get('2')?.since, delay })
           }
           return delay

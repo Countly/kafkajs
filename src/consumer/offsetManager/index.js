@@ -1916,7 +1916,7 @@ module.exports = class OffsetManager {
     /**
      * The positions this member's own reset policy, sentinel seek or local seek gave a cell, which
      * no other consumer of the group may read. See `holdResetPosition`.
-     * @type {{[topic: string]: {[partition: number]: {offset: string|undefined, revision: symbol}}}}
+     * @type {{[topic: string]: {[partition: number]: {offset: string|undefined, revision: number}}}}
      */
     this.resetPositions = indexTopics(this.topics)
 
@@ -1965,7 +1965,7 @@ module.exports = class OffsetManager {
     const own = this.resetPositions[topic]?.[partition]
     if (own !== undefined) {
       const revisions = CommittedOffsetRevisions.forCache(this.committedOffsets())
-      if (own.revision === revisions.current(topic, partition)) return own.offset
+      if (revisions.isCurrent(topic, partition, own.revision)) return own.offset
       delete this.resetPositions[topic][partition]
     }
     return shared
@@ -1987,10 +1987,7 @@ module.exports = class OffsetManager {
     this.resetPositions[topic] ??= {}
     this.resetPositions[topic][partition] = {
       offset,
-      revision: CommittedOffsetRevisions.forCache(this.committedOffsets()).capture(
-        topic,
-        partition
-      ),
+      revision: CommittedOffsetRevisions.forCache(this.committedOffsets()).capture(),
     }
   }
 

@@ -258,18 +258,24 @@ describe('Consumer > OffsetManager > reset positions stay private to the consume
   test('a manager same-value commit supersedes its own duration reset', async () => {
     const group = createGroup()
     const member = group.duration
+    const sibling = createMember(group, DURATION)
     await member.manager.commitOffsets({
       topics: [{ topic: TOPIC, partitions: [{ partition: 0, offset: '99' }] }],
     })
     member.answer('2')
     await member.manager.resetByDuration({ topic: TOPIC, partition: 0 })
     expect(member.manager.heldOffsetAt(TOPIC, 0)).toBe('2')
+    sibling.answer('3')
+    await sibling.manager.resetByDuration({ topic: TOPIC, partition: 0 })
+    expect(sibling.manager.heldOffsetAt(TOPIC, 0)).toBe('3')
     expect(group.cache[TOPIC][0]).toBe('99')
     await member.manager.commitOffsets({
       topics: [{ topic: TOPIC, partitions: [{ partition: 0, offset: '99' }] }],
     })
     expect(member.manager.heldOffsetAt(TOPIC, 0)).toBe('99')
     expect(member.manager.resetPositions[TOPIC][0]).toBeUndefined()
+    expect(sibling.manager.heldOffsetAt(TOPIC, 0)).toBe('99')
+    expect(sibling.manager.resetPositions[TOPIC][0]).toBeUndefined()
     expect(group.operations.size()).toBe(0)
   })
 })
