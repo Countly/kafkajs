@@ -123,7 +123,7 @@ describe('Consumer > OffsetManager > reset schedules on the wire', () => {
     await expect(stale).resolves.toBe(false)
 
     expect(rejoined.nextOffset(TOPIC, 0).toString()).toEqual('0')
-    expect(wire.committedAt()).toEqual('0')
+    expect(wire.committedAt(0, rejoined)).toEqual('0')
     expect(wire.obligations.size()).toBe(1)
     expect(sent(wire, 'ListOffsets')).toHaveLength(2)
   })

@@ -201,8 +201,7 @@ const createOffsetsOnTheWire = async ({
       await cluster.refreshMetadata()
     },
     next: (partition = 0) => manager.nextOffset(TOPIC, partition).toString(),
-    committedAt: (partition = 0) =>
-      cluster.committedOffsets({ groupId: GROUP_ID })[TOPIC][partition],
+    committedAt: (partition = 0, member = manager) => member.heldOffsetAt(TOPIC, partition),
     owed: (partition = 0) => obligations.isOwed(TOPIC, partition),
     requests: () =>
       scripted

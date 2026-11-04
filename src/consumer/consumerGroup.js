@@ -2553,7 +2553,7 @@ module.exports = class ConsumerGroup {
    *   fetch; a topic whose partitions were all filtered out is absent
    */
   buildFetchRequests(topicPartitions) {
-    const committedOffsets = this.offsetManager.committedOffsets()
+    const manager = this.offsetManager
     const activeTopicPartitions = this.getActiveTopicPartitions()
 
     return topicPartitions
@@ -2563,7 +2563,7 @@ module.exports = class ConsumerGroup {
         partitions: partitions
           .filter(
             (partition) =>
-              committedOffsets[topic][partition] != null &&
+              manager.heldOffsetAt(topic, partition) != null &&
               activeTopicPartitions[topic].has(partition) &&
               !this.positionValidator.isAwaiting(topic, partition) &&
               (this.haltedPartitions.size === 0 ||
@@ -3370,7 +3370,7 @@ module.exports = class ConsumerGroup {
       if (halted && ['no-offset', 'offset-out-of-range'].includes(halted.reason)) throw halted.error
       if (this.hasSeekOffset({ topic, partition })) continue
       const offset =
-        manager.resolvedOffsetAt(topic, partition) ?? manager.committedOffsets()[topic]?.[partition]
+        manager.resolvedOffsetAt(topic, partition) ?? manager.heldOffsetAt(topic, partition)
       if (typeof offset === 'string' && /^\d+$/.test(offset)) return offset
     }
     throw new KafkaJSNonRetriableError(`Position is not yet resolved for ${topic}[${partition}]`)
@@ -3489,7 +3489,6 @@ module.exports = class ConsumerGroup {
     let awaiting
     let unregister
     const manager = preparation ? preparation.manager : this.offsetManager
-    const committedOffsets = manager.committedOffsets()
 
     try {
       for (const { topic, partitions } of topicPartitions) {
@@ -3512,7 +3511,7 @@ module.exports = class ConsumerGroup {
           // The same filter the request build applies. `nextOffset()` writes the committed offset
           // into the resolved ones, so calling it for a partition whose offset was just cleared
           // would store `undefined` there and break the next commit.
-          if (committedOffsets[topic][partition] == null) {
+          if (manager.heldOffsetAt(topic, partition) == null) {
             continue
           }
 
@@ -3778,7 +3777,7 @@ module.exports = class ConsumerGroup {
         // OffsetOutOfRange recovery cleared it. There is no position left to compare the reply
         // with, and reading one would store `undefined` as its resolved offset. Left to the
         // caller's awaiting sweep, like a partition the reply never mentioned.
-        if (manager.committedOffsets()[topic][entry.partition] == null) {
+        if (manager.heldOffsetAt(topic, entry.partition) == null) {
           continue
         }
 

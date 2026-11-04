@@ -373,7 +373,7 @@ describe('Consumer > OffsetManager > reset schedules', () => {
 
       await expect(stale).resolves.toBe(false)
       expect(rejoined.nextOffset(TOPIC, 0).toString()).toEqual('0')
-      expect(ctx.committedAt()).toEqual('0')
+      expect(ctx.committedAt(0, rejoined)).toEqual('0')
       expect(ctx.obligations.size()).toBe(1)
     })
 
@@ -565,7 +565,8 @@ describe('Consumer > OffsetManager > reset schedules', () => {
 
       expect(ctx.cluster.fetchTopicsOffset).toHaveBeenCalledTimes(2)
       expect(ctx.next()).toEqual('0')
-      expect(ctx.cache[TOPIC]).toEqual({ 0: '0' })
+      expect(ctx.committedAt()).toEqual('0')
+      expect(ctx.cache[TOPIC]).toEqual({})
       expect(ctx.obligations.size()).toBe(1)
     })
 
@@ -580,7 +581,8 @@ describe('Consumer > OffsetManager > reset schedules', () => {
 
       await ctx.manager.resolveOffsets()
 
-      expect(ctx.cache[TOPIC]).toEqual({ 0: '0' })
+      expect(ctx.committedAt()).toEqual('0')
+      expect(ctx.cache[TOPIC]).toEqual({})
       expect(ctx.obligations.size()).toBe(1)
       expect(ctx.next()).toEqual('0')
     })
@@ -601,7 +603,8 @@ describe('Consumer > OffsetManager > reset schedules', () => {
       ctx.manager.resetOffsetsForTopic(TOPIC)
       await ctx.manager.resolveOffsets()
 
-      expect(ctx.cache[TOPIC]).toEqual({ 0: '0' })
+      expect(ctx.committedAt()).toEqual('0')
+      expect(ctx.cache[TOPIC]).toEqual({})
       expect(ctx.obligations.size()).toBe(1)
       expect(ctx.next()).toEqual('0')
     })
@@ -1148,7 +1151,8 @@ describe('Consumer > OffsetManager > reset schedules', () => {
 
           expect(obligations.size()).toBe(200)
           expect(operations.size()).toBe(0)
-          expect(names.every((name) => cache[name][0] === '0')).toBe(true)
+          expect(names.every((name) => manager.heldOffsetAt(name, 0) === '0')).toBe(true)
+          expect(names.every((name) => cache[name][0] === undefined)).toBe(true)
           expect(manager.nextOffset(names[0], 0).toString()).toEqual('0')
         }
 

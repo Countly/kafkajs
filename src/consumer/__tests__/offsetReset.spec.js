@@ -291,7 +291,7 @@ async function runRecreationTiming(mode) {
     assert.equal(owedBeforeStop, true)
     assert.equal(owedAfterStop, true)
     assert.equal(lists, 2)
-    assert.equal(cache.topic[0], value)
+    assert.equal(restarted.heldOffsetAt('topic', 0), value)
     assert.equal(operations.size(), 0)
     return result
   } finally {

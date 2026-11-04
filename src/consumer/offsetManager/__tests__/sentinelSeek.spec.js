@@ -335,7 +335,11 @@ const runAgain = async (ctx) => {
   const owedAtStop = ctx.owed()
   const next = ctx.rebuild()
   await next.resolveOffsets()
-  return { position: next.nextOffset(TOPIC, 0).toString(), cache: ctx.committedAt(), owedAtStop }
+  return {
+    position: next.nextOffset(TOPIC, 0).toString(),
+    cache: ctx.committedAt(0, next),
+    owedAtStop,
+  }
 }
 
 /** The reset ran: ListOffsets by the topic's own default, position and cache at its boundary. */

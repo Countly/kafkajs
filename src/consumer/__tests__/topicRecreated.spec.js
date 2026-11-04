@@ -290,7 +290,7 @@ describe('Consumer > topic recreation', () => {
 
       expect(fetched).toHaveLength(1)
       expect(fetched[0][0]).toMatchObject({ topic: TOPIC, fromBeginning: true })
-      expect(offsetManager.committedOffsets()[TOPIC][0]).toEqual('0')
+      expect(offsetManager.heldOffsetAt(TOPIC, 0)).toEqual('0')
       expect(obligations.size()).toEqual(1)
     })
   })
@@ -446,13 +446,13 @@ describe('Consumer > topic recreation', () => {
 
       expect(fetched).toHaveLength(1)
       expect(fetched[0][0]).toMatchObject({ topic: TOPIC, fromBeginning: true })
-      expect(offsetManager.committedOffsets()[TOPIC][0]).toEqual('0')
+      expect(offsetManager.heldOffsetAt(TOPIC, 0)).toEqual('0')
       expect(obligations.size()).toEqual(1)
 
       // still owed: the next resolution resets again
-      offsetManager.committedOffsets()[TOPIC] = {}
+      offsetManager.resetOffsetsForTopic(TOPIC)
       await offsetManager.resolveOffsets()
-      expect(offsetManager.committedOffsets()[TOPIC][0]).toEqual('0')
+      expect(offsetManager.heldOffsetAt(TOPIC, 0)).toEqual('0')
     })
 
     test('a pending entry whose stamped topic id differs from a known cached id is dropped without resetting', async () => {
@@ -477,7 +477,7 @@ describe('Consumer > topic recreation', () => {
       await offsetManager.resolveOffsets()
 
       expect(fetched).toHaveLength(1)
-      expect(offsetManager.committedOffsets()[TOPIC][0]).toEqual('0')
+      expect(offsetManager.heldOffsetAt(TOPIC, 0)).toEqual('0')
     })
 
     test('a subscribed-but-unassigned topic keeps its pending entry until a sync assigns it', async () => {
@@ -526,7 +526,7 @@ describe('Consumer > topic recreation', () => {
       await assignedManager.resolveOffsets()
 
       expect(fetched).toHaveLength(1)
-      expect(assignedManager.committedOffsets()['not-assigned'][0]).toEqual('0')
+      expect(assignedManager.heldOffsetAt('not-assigned', 0)).toEqual('0')
       expect(obligations.size()).toEqual(1)
     })
   })
@@ -571,7 +571,7 @@ describe('Consumer > topic recreation', () => {
 
     await offsetManager.resolveOffsets()
     expect(fetchedFromBeginning).toBe(true)
-    expect(offsetManager.committedOffsets()[TOPIC][0]).toEqual('0')
+    expect(offsetManager.heldOffsetAt(TOPIC, 0)).toEqual('0')
   })
 
   test('SeekOffsets#deleteTopic removes only that topic entries', () => {
@@ -936,7 +936,7 @@ describe('Consumer > topic recreation', () => {
         await consumerGroup.seekOffsets([{ topic: TOPIC, partitions: [0] }])
 
         expect(fetched).toHaveLength(1)
-        expect(consumerGroup.offsetManager.committedOffsets()[TOPIC][0]).toEqual('0')
+        expect(consumerGroup.offsetManager.heldOffsetAt(TOPIC, 0)).toEqual('0')
       }
     )
 

@@ -56,6 +56,11 @@ const PRIVATE = {
  * and the operation ledger are shared by every participant of the group on one `Kafka` instance,
  * and the reset obligations belong to the long-lived `Consumer`; all three are injected.
  *
+ * A position a reset policy, a sentinel seek or a local seek derives is this manager's own: it is
+ * never written into the shared cache as if committed and no sibling reads it, so members of one
+ * group with different policies each fetch from their own answer. Only commits (the coordinator's
+ * answer, an auto-commit, a transactional publication) are shared.
+ *
  * Writes are ordered through the ledger, not by arrival: `resolveOffsets` is a read that fills
  * unresolved cells from the coordinator or ListOffsets, while `seek`, `setDefaultOffset` and the
  * commits are mutations, and a stale answer never overwrites a newer operation. Every OffsetCommit
@@ -251,7 +256,7 @@ module.exports = class OffsetManager {
    * @returns {Long} the committed offset, or 0 when there is none or it is invalid
    */
   nextOffset(topic, partition) {
-    const committedOffset = this.committedOffsets()[topic][partition]
+    const committedOffset = this.heldOffsetAt(topic, partition)
 
     if (!this.resolvedOffsets[topic][partition] && committedOffset != null) {
       this.resolvedOffsets[topic][partition] = committedOffset
@@ -414,7 +419,7 @@ module.exports = class OffsetManager {
    * @returns {void}
    */
   resetOffset({ topic, partition }) {
-    this.resolvedOffsets[topic][partition] = this.committedOffsets()[topic][partition]
+    this.resolvedOffsets[topic][partition] = this.heldOffsetAt(topic, partition)
     this.resolvedEpochs[topic][partition] = -1
   }
 
@@ -432,6 +437,7 @@ module.exports = class OffsetManager {
       this.clearPendingSeek(topic, partition)
     }
     this.committedOffsets()[topic] = {}
+    this.resetPositions[topic] = {}
     this.resolvedOffsets[topic] = {}
     this.resolvedEpochs[topic] = {}
   }
@@ -496,6 +502,7 @@ module.exports = class OffsetManager {
     const committedOffsets = this.committedOffsets()
     for (const topic of this.topics) {
       committedOffsets[topic] = committedOffsets[topic] || {}
+      this.resetPositions[topic] = this.resetPositions[topic] || {}
       this.resolvedOffsets[topic] = this.resolvedOffsets[topic] || {}
       this.resolvedEpochs[topic] = this.resolvedEpochs[topic] || {}
     }
@@ -586,8 +593,6 @@ module.exports = class OffsetManager {
    * @returns {Long}
    */
   countResolvedOffsets() {
-    const committedOffsets = this.committedOffsets()
-
     const subtractOffsets = (resolvedOffset, committedOffset) => {
       // A key with no value is "nothing resolved", not an offset: `Long.fromValue` would throw.
       if (resolvedOffset == null) {
@@ -600,13 +605,10 @@ module.exports = class OffsetManager {
         : resolvedOffsetLong.subtract(Long.fromValue(committedOffset))
     }
 
-    const subtractPartitionOffsets = (resolvedTopicOffsets, committedTopicOffsets) =>
-      keys(resolvedTopicOffsets).map((partition) =>
-        subtractOffsets(resolvedTopicOffsets[partition], committedTopicOffsets[partition])
-      )
-
     const subtractTopicOffsets = (topic) =>
-      subtractPartitionOffsets(this.resolvedOffsets[topic], committedOffsets[topic])
+      keys(this.resolvedOffsets[topic]).map((partition) =>
+        subtractOffsets(this.resolvedOffsets[topic][partition], this.heldOffsetAt(topic, partition))
+      )
 
     const offsetsDiff = this.topics.flatMap(subtractTopicOffsets)
     return offsetsDiff.reduce((sum, offset) => sum.add(offset), Long.fromValue(0))
@@ -692,7 +694,10 @@ module.exports = class OffsetManager {
       }
       if (!current()) return false
       this.clearPendingSeek(topic, partition)
-      this.committedOffsets()[topic][partition] = actualOffset
+      if (this.autoCommit) {
+        this.committedOffsets()[topic][partition] = actualOffset
+        delete this.resetPositions[topic]?.[partition]
+      } else this.holdResetPosition(topic, partition, actualOffset)
       this.resolveOffset({
         topic,
         partition,
@@ -903,7 +908,7 @@ module.exports = class OffsetManager {
       ({ partition, offset }) => {
         return (
           offset != null &&
-          offset !== this.committedOffsets()[topic][partition] &&
+          offset !== this.heldOffsetAt(topic, partition) &&
           Long.fromValue(offset).greaterThanOrEqual(0)
         )
       }
@@ -1137,6 +1142,7 @@ module.exports = class OffsetManager {
 
       if (written.length > 0) {
         committedOffsets[topic] = assign({}, committedOffsets[topic], accepted)
+        for (const partition of written) delete this.resetPositions[topic]?.[partition]
         const confirmed = this.isConfirmedIncarnation(topic, requestedIds.get(topic))
         written.forEach((partition) =>
           confirmed
@@ -1181,7 +1187,8 @@ module.exports = class OffsetManager {
    * without fencing any other participant's. An answer is written only for a cell that no seek,
    * commit or barrier (a revoke, a reset, a recreation) reached since the ticket began and that
    * is still unresolved, so a newer operation's value is never overwritten and a resolver never
-   * replaces a sibling's. The leader epochs the coordinator committed are seeded in the same
+   * replaces a sibling's commit. A position the reset policy, a sentinel seek or the none policy's
+   * local position supplies stays private to this manager. The leader epochs the coordinator committed are seeded in the same
    * step, under the same check.
    *
    * A topic recreated while this member is subscribed owes a reset on every partition (see
@@ -1214,7 +1221,7 @@ module.exports = class OffsetManager {
       return (
         !this.resetRefusals.get(topic)?.has(partition) &&
         (this.pendingSeekTimestamp(topic, partition) !== undefined ||
-          isInvalidOffset(this.committedOffsets()[topic][partition]))
+          isInvalidOffset(this.heldOffsetAt(topic, partition)))
       )
     }
 
@@ -1257,6 +1264,7 @@ module.exports = class OffsetManager {
 
       this.markOwedResets(consumerOffsets)
       this.markPendingSeeks(consumerOffsets)
+      const derived = this.derivedCells(consumerOffsets)
       this.adoptLocalPositions(consumerOffsets)
       const epochSeeds = this.collectEpochSeeds(consumerOffsets)
 
@@ -1290,7 +1298,7 @@ module.exports = class OffsetManager {
         complete = complete && handled + resolved.refusals.length === total
       }
 
-      return this.applyResolution(ticket, offsets, epochSeeds, requestedIds) && complete
+      return this.applyResolution(ticket, offsets, epochSeeds, requestedIds, derived) && complete
     } finally {
       this.operations.end(ticket)
     }
@@ -1613,9 +1621,13 @@ module.exports = class OffsetManager {
    * @param {{topic: string, partitions: {partition: number, offset: string}[]}[]} offsets
    * @param {{topic: string, partition: number, offset: string, epoch: number}[]} epochSeeds
    * @param {Map<string, string|undefined>} requestedIds
+   * @param {Set<string>} [derived] the `topic|partition` cells whose answer comes from a reset
+   *   policy, a sentinel seek or a local position rather than from a commit. Those stay private to
+   *   this manager (`holdResetPosition`); only a commit the coordinator answered reaches the
+   *   group's shared cache. Defaults to none.
    * @returns {boolean} `false` when a cell was dropped as stale
    */
-  applyResolution(ticket, offsets, epochSeeds, requestedIds) {
+  applyResolution(ticket, offsets, epochSeeds, requestedIds, derived = new Set()) {
     const committedOffsets = this.committedOffsets()
     let complete = true
 
@@ -1627,10 +1639,11 @@ module.exports = class OffsetManager {
         if (this.isStale(ticket, topic, partition, requestedIds)) {
           complete = false
         } else if (
-          isInvalidOffset(committedOffsets[topic] && committedOffsets[topic][partition]) ||
+          isInvalidOffset(this.heldOffsetAt(topic, partition)) ||
           this.pendingSeekTimestamp(topic, partition) !== undefined
         ) {
-          resolved[partition] = offset
+          if (derived.has(`${topic}|${partition}`)) this.holdResetPosition(topic, partition, offset)
+          else resolved[partition] = offset
           written.push(partition)
         }
       }
@@ -1670,8 +1683,6 @@ module.exports = class OffsetManager {
    * @returns {void}
    */
   seedConsumedEpochs(ticket, seeds, requestedIds) {
-    const committedOffsets = this.committedOffsets()
-
     for (const { topic, partition, offset, epoch } of seeds) {
       const epochs = this.resolvedEpochs[topic]
       if (!epochs || this.isStale(ticket, topic, partition, requestedIds)) {
@@ -1679,7 +1690,7 @@ module.exports = class OffsetManager {
       }
 
       const position = this.resolvedOffsets[topic] && this.resolvedOffsets[topic][partition]
-      const held = committedOffsets[topic] && committedOffsets[topic][partition]
+      const held = this.heldOffsetAt(topic, partition)
       if (position != null ? position !== offset : held !== offset) {
         continue
       }
@@ -1850,6 +1861,10 @@ module.exports = class OffsetManager {
       delete committedOffsets[topic][partition]
     }
 
+    if (this.resetPositions[topic]) {
+      delete this.resetPositions[topic][partition]
+    }
+
     if (this.resolvedOffsets[topic]) {
       delete this.resolvedOffsets[topic][partition]
     }
@@ -1860,6 +1875,10 @@ module.exports = class OffsetManager {
   }
 
   /**
+   * Forgets everything this member holds for its assignment. It still deletes the assigned cells
+   * of the shared cache: a rebuilt assignment must read the coordinator again rather than resume
+   * from a cell written under the previous one, and only commits live there, so a sibling loses at
+   * most a cell it re-reads from the coordinator. Its reset positions are private and untouched.
    * @private
    */
   clearAllOffsets() {
@@ -1883,6 +1902,13 @@ module.exports = class OffsetManager {
     }
 
     this.resolvedOffsets = indexTopics(this.topics)
+
+    /**
+     * The positions this member's own reset policy, sentinel seek or local seek gave a cell, which
+     * no other consumer of the group may read. See `holdResetPosition`.
+     * @type {{[topic: string]: {[partition: number]: {offset: string|undefined, shadowed: string|undefined}}}}
+     */
+    this.resetPositions = indexTopics(this.topics)
 
     /**
      * The leader epoch of the last record consumed on each partition, beside its resolved offset.
@@ -1911,5 +1937,59 @@ module.exports = class OffsetManager {
     }
 
     return this[PRIVATE.COMMITTED_OFFSETS]
+  }
+
+  /**
+   * The offset this member treats as committed for a cell: the position its own reset gave it
+   * (`holdResetPosition`) while the shared cell is as it was then, else what the group's shared
+   * cache holds. A commit any participant writes to the shared cell afterwards (an auto-commit, a
+   * transactional publication) therefore takes over, as it did when the reset itself was written
+   * there. Every read of the fetch position's baseline goes through here; writes of real commits
+   * still go to `committedOffsets()`.
+   * @param {string} topic
+   * @param {number|string} partition
+   * @returns {string|undefined} the offset string, or undefined (or an invalid offset) when none
+   */
+  heldOffsetAt(topic, partition) {
+    const shared = this.committedOffsets()[topic]?.[partition]
+    const own = this.resetPositions[topic]?.[partition]
+    return own !== undefined && own.shadowed === shared ? own.offset : shared
+  }
+
+  /**
+   * Keeps a position derived from a reset policy, a sentinel seek or a local seek in this manager
+   * only, with the shared cell's value at that moment so a later commit in the shared cell can be
+   * told apart from it. A sibling consumer of the same group never reads it, so two members with
+   * different reset policies each fetch from their own answer. Replaced by the next one, and
+   * dropped with the cell by `clearOffsets`, `resetOffsetsForTopic` and this manager's own commit.
+   * @private
+   * @param {string} topic
+   * @param {number|string} partition
+   * @param {string|undefined} offset the derived position; undefined when it could not be resolved
+   * @returns {void}
+   */
+  holdResetPosition(topic, partition, offset) {
+    this.resetPositions[topic] ??= {}
+    this.resetPositions[topic][partition] = {
+      offset,
+      shadowed: this.committedOffsets()[topic]?.[partition],
+    }
+  }
+
+  /**
+   * The cells of an OffsetFetch answer that carry no concrete committed offset (none, or marked
+   * for a reset or a sentinel seek), whose position will come from this member alone.
+   * @private
+   * @param {{topic: string, partitions: {partition: number, offset: string}[]}[]} entries
+   * @returns {Set<string>} `topic|partition` keys
+   */
+  derivedCells(entries) {
+    const cells = new Set()
+    for (const { topic, partitions } of entries) {
+      for (const { partition, offset } of partitions) {
+        if (isInvalidOffset(offset)) cells.add(`${topic}|${partition}`)
+      }
+    }
+    return cells
   }
 }

@@ -160,7 +160,7 @@ const createScheduledOffsetManager = ({
       manager.resetOffsetsForTopic(TOPIC)
     },
     next: (partition = 0) => manager.nextOffset(TOPIC, partition).toString(),
-    committedAt: (partition = 0) => cache[TOPIC][partition],
+    committedAt: (partition = 0, member = manager) => member.heldOffsetAt(TOPIC, partition),
     owed: (partition = 0) => obligations.isOwed(TOPIC, partition),
   }
 }

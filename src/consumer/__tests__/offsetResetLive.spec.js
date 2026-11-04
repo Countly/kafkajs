@@ -573,8 +573,8 @@ class CaseTrace {
     this.stage = 'created'
     /** @type {FakeLane|DockerLane|null} */
     this.lane = null
-    /** @type {Member|null} */
-    this.member = null
+    /** @type {Map<string, Member>} every member the case started, by label */
+    this.members = new Map()
     /** @type {Record<string, unknown>} what the case retained as it went */
     this.facts = {}
   }
@@ -609,10 +609,11 @@ class CaseTrace {
 
   /**
    * @param {Member} member
+   * @param {string} [label] names the member in the row of a case with several
    * @returns {Member} the member, now traced
    */
-  join(member) {
-    this.member = member
+  join(member, label = `member-${this.members.size}`) {
+    this.members.set(label, member)
     return member
   }
 
@@ -641,7 +642,17 @@ class CaseTrace {
    * @returns {Promise<Error|null>} the write's failure, which never throws
    */
   async write(scope, failure) {
-    const { lane, member, facts } = this
+    const { lane, facts } = this
+    const members = [...this.members.values()]
+    const each = (field) => members.flatMap((member) => member[field] ?? [])
+    const describeHalts = (halts = []) =>
+      halts.map(({ partition, offset, reason, error }) => ({
+        partition,
+        offset,
+        reason,
+        retriable: error?.retriable,
+        isNoOffset: error instanceof KafkaJSNoOffsetError,
+      }))
     try {
       const reads =
         lane && (failure || facts.produced === undefined || facts.committed === undefined)
@@ -653,16 +664,22 @@ class CaseTrace {
         stage: this.stage,
         error: describeError(failure),
         acknowledged: lane?.acknowledged ?? [],
-        delivered: member?.delivered ?? [],
-        halts: (member?.halts ?? []).map(({ partition, offset, reason, error }) => ({
-          partition,
-          offset,
-          reason,
-          retriable: error?.retriable,
-          isNoOffset: error instanceof KafkaJSNoOffsetError,
-        })),
-        recreated: member?.recreated ?? [],
-        crashes: (member?.crashes ?? []).map((error) => describeError(error)),
+        delivered: each('delivered'),
+        halts: describeHalts(each('halts')),
+        recreated: each('recreated'),
+        crashes: each('crashes').map((error) => describeError(error)),
+        ...(members.length > 1 && {
+          members: Object.fromEntries(
+            [...this.members].map(([label, member]) => [
+              label,
+              {
+                delivered: member.delivered ?? [],
+                halts: describeHalts(member.halts),
+                crashes: (member.crashes ?? []).map((error) => describeError(error)),
+              },
+            ])
+          ),
+        }),
         listed: lane?.listed() ?? null,
         produced: facts.produced ?? truth?.produced,
         committed: facts.committed ?? truth?.committed,
@@ -1077,10 +1094,16 @@ describeReset.each(lanes())('Consumer > offset reset policies (live, %s lane)', 
           )
         }
         const members = {
-          earliest: trace.join(lane.member(cleanup, {}, { offsetReset: 'earliest' }, [0])),
-          latest: lane.member(cleanup, {}, { offsetReset: 'latest' }, [1]),
-          none: lane.member(cleanup, {}, { offsetReset: 'none' }, [2]),
-          duration: lane.member(cleanup, {}, { offsetReset: 'by_duration:PT3M' }, [0]),
+          earliest: trace.join(
+            lane.member(cleanup, {}, { offsetReset: 'earliest' }, [0]),
+            'earliest'
+          ),
+          latest: trace.join(lane.member(cleanup, {}, { offsetReset: 'latest' }, [1]), 'latest'),
+          none: trace.join(lane.member(cleanup, {}, { offsetReset: 'none' }, [2]), 'none'),
+          duration: trace.join(
+            lane.member(cleanup, {}, { offsetReset: 'by_duration:PT3M' }, [0]),
+            'duration'
+          ),
         }
         trace.reach('start')
         for (const member of Object.values(members)) {

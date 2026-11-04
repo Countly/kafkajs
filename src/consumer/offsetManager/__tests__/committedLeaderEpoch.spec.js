@@ -232,7 +232,8 @@ describe('Consumer > committed leader epoch', () => {
       expect(manager.lastConsumedEpoch(TOPIC, 0)).toEqual(4)
       expect(manager.lastConsumedEpoch(TOPIC, 1)).toEqual(-1)
       expect(manager.committedOffsets()[TOPIC][0]).toEqual('10')
-      expect(manager.committedOffsets()[TOPIC][1]).toEqual('0')
+      expect(manager.heldOffsetAt(TOPIC, 1)).toEqual('0')
+      expect(manager.committedOffsets()[TOPIC][1]).toBeUndefined()
     })
 
     it('an offset a pending topic reset invalidated does not seed its stale epoch', async () => {

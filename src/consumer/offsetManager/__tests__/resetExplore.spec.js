@@ -237,7 +237,7 @@ const explore = async (shape, partitionCount, order) => {
     await releases[at]()
   }
 
-  const before = partitions.map((p) => ({ cache: ctx.cache[TOPIC][p], owed: ctx.owed(p) }))
+  const before = partitions.map((p) => ({ cache: ctx.committedAt(p), owed: ctx.owed(p) }))
   for (let pass = 0; pass < 4 && !(await ctx.manager.resolveOffsets()); pass++);
 
   return {
