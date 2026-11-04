@@ -550,6 +550,7 @@ class Episode {
           (x) => x.apiKey === FETCH && x.endpoint === newEndpoint && x.at <= routeAt
         )
         const outstanding = pollAtRoute(prior, routeAt)
+        const atLoss = prior.filter((x) => x.at <= errorAt).at(-1)
         found = {
           kind,
           hinted,
@@ -560,6 +561,8 @@ class Episode {
           routeAt,
           nextAt: next.at,
           priorFetches: prior.length,
+          lossPollWriteAt: atLoss?.at ?? null,
+          lossPollDoneAt: atLoss?.answer?.at ?? null,
           pollWriteAt: outstanding?.at ?? null,
           pollDoneAt: outstanding?.answer?.at ?? null,
           hint: hint?.currentLeader ?? null,

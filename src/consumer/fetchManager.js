@@ -41,6 +41,7 @@ const differs = (wanted, current) => {
  * @param {(nodeId: number) => Promise<import('../../types').Batch[]>} options.fetch
  * @param {import('./worker').Handler<T>} options.handler
  * @param {number} [options.concurrency]
+ * @returns {object} manager lifecycle methods and the active fetchers; construction starts no work
  * @template T
  */
 const createFetchManager = ({
@@ -88,7 +89,8 @@ const createFetchManager = ({
    * cluster with no broker, as before.
    * @param {number} nodeId the node the calling fetcher serves
    * @returns {Promise<import('../../types').Batch[]>} the round's batches; none when the node has
-   *   left, so a fetcher of a departed node issues no further Fetch
+   *   left or the manager stopped or failed, including during reconciliation, so no further
+   *   Fetch is issued after a synchronous stop
    */
   const round = async (nodeId) => {
     if (!reconciling && !stopped && !failure) {
@@ -96,7 +98,7 @@ const createFetchManager = ({
       if (current.length !== 0 && differs(wanted, current)) reconcile(current)
     }
 
-    return wanted.has(nodeId) ? fetch(nodeId) : []
+    return !stopped && !failure && wanted.has(nodeId) ? fetch(nodeId) : []
   }
 
   /**
@@ -134,6 +136,7 @@ const createFetchManager = ({
       if (stopped || failure) return
 
       for (const nodeId of wanted) {
+        if (stopped || failure) break
         if (!runs.has(nodeId)) startRun(nodeId)
       }
     } finally {
@@ -143,7 +146,8 @@ const createFetchManager = ({
 
   /**
    * Starts the fetcher of a node. The run is registered before the fetcher starts, because the
-   * fetcher's first round runs synchronously.
+   * fetcher's first round runs synchronously. Its completion is assigned before logging so a
+   * stop from the log creator sees a running fetcher and can await its release.
    * @param {number} nodeId
    * @returns {void}
    */
@@ -158,11 +162,11 @@ const createFetchManager = ({
     /** @type {FetcherRun} */
     const run = { fetcher, retiring: false, done: null }
     runs.set(nodeId, run)
-    logger.debug('Fetcher started', { nodeId })
     run.done = fetcher
       .start()
       .then(undefined, fail)
       .then(() => release(nodeId, run))
+    logger.debug('Fetcher started', { nodeId })
   }
 
   /**
@@ -213,15 +217,16 @@ const createFetchManager = ({
   /**
    * Runs one fetcher per broker node until stopped or until a fetcher throws. A change of the
    * node set reconciles the fetchers in place and never ends this call. Clears the stop latch on
-   * entry, so a manager can be restarted.
+   * entry, before logging, so a manager can be restarted and a stop from the log creator sticks.
+   * A synchronous stop before the first fetcher starts settles without waiting for a release.
    * @returns {Promise<void>} resolves once `stop()` has drained every fetcher
    * @throws {KafkaJSNoBrokerAvailableError} when the cluster advertises no node at the start
    * @throws {Error} the first error a fetcher ended with, after every fetcher has stopped
    */
   const start = async () => {
-    logger.debug('Starting...')
     stopped = false
     failure = null
+    logger.debug('Starting...')
 
     const nodeIds = getNodeIds()
     if (nodeIds.length === 0) {
@@ -233,6 +238,10 @@ const createFetchManager = ({
       settleStart = resolve
     })
     sync()
+    if (runs.size === 0 && settleStart) {
+      settleStart()
+      settleStart = null
+    }
     await drained
 
     if (failure) {

@@ -44,13 +44,20 @@ class Rig {
     this.open = new Map()
     /** @type {Map<number, number>} the most fetches ever open at once, per node */
     this.peak = new Map()
+    /** @type {((nodeId: number) => void)|null} synchronous first-round instrumentation */
+    this.onFetch = null
+    /** @type {((log: object) => void)|null} synchronous log-creator instrumentation */
+    this.onLog = null
     this.running = null
     const logger = createLogger({
       level: LEVELS.DEBUG,
       logCreator:
         () =>
         ({ namespace, log }) => {
-          if (namespace === 'FetchManager') this.messages.push(log)
+          if (namespace === 'FetchManager') {
+            this.messages.push(log)
+            this.onLog?.(log)
+          }
         },
     })
     this.manager = createFetchManager({
@@ -72,11 +79,13 @@ class Rig {
     const open = (this.open.get(nodeId) ?? 0) + 1
     this.open.set(nodeId, open)
     this.peak.set(nodeId, Math.max(this.peak.get(nodeId) ?? 0, open))
-    return new Promise((resolve, reject) => {
+    const pending = new Promise((resolve, reject) => {
       const queue = this.pending.get(nodeId) ?? []
       queue.push({ resolve, reject })
       this.pending.set(nodeId, queue)
     })
+    this.onFetch?.(nodeId)
+    return pending
   }
 
   /**
@@ -297,6 +306,112 @@ describe('Consumer > FetchManager reconciliation', () => {
 
     expect(rig.count(2)).toBe(1)
     expect(rig.logged('Fetcher started')).toEqual([1, 2])
+  })
+
+  it('drains a synchronous stop in an added first round without starting the next node', async () => {
+    rig = new Rig([1, 2])
+    await rig.start()
+    const running = track(rig.running)
+    let stopping
+    rig.onFetch = (nodeId) => {
+      if (nodeId === 3) stopping = track(rig.manager.stop())
+    }
+    rig.nodeIds = [1, 2, 3, 4]
+    rig.answer(1)
+    await settle()
+
+    expect(rig.logged('Fetcher started')).toEqual([1, 2, 3])
+    expect(rig.count(1)).toBe(1)
+    expect(rig.count(4)).toBe(0)
+    expect(stopping.done).toBe(false)
+    rig.answer(2)
+    rig.answer(3)
+    await settle()
+
+    expect(stopping.done).toBe(true)
+    expect(running.done).toBe(true)
+    expect(rig.manager.getFetchers()).toEqual([])
+  })
+
+  it('drains a synchronous stop from the Fetcher started log', async () => {
+    rig = new Rig([1, 2])
+    let stopping
+    rig.onLog = ({ message }) => {
+      if (message === 'Fetcher started') stopping = track(rig.manager.stop())
+    }
+    await rig.start()
+    const running = track(rig.running)
+
+    expect(rig.logged('Fetcher started')).toEqual([1])
+    expect(rig.calls).toEqual([1])
+    rig.answer(1)
+    await settle()
+
+    expect(stopping.done).toBe(true)
+    expect(running.done).toBe(true)
+    expect(rig.manager.getFetchers()).toEqual([])
+  })
+
+  it('drains a synchronous stop in the initial first round', async () => {
+    rig = new Rig([1, 2])
+    let stopping
+    rig.onFetch = () => {
+      stopping = track(rig.manager.stop())
+    }
+    await rig.start()
+    const running = track(rig.running)
+
+    expect(rig.calls).toEqual([1])
+    rig.answer(1)
+    await settle()
+
+    expect(stopping.done).toBe(true)
+    expect(running.done).toBe(true)
+    expect(rig.manager.getFetchers()).toEqual([])
+  })
+
+  it('drains a synchronous stop when release restarts a returned node', async () => {
+    rig = new Rig([1, 2])
+    await rig.start()
+    rig.nodeIds = [1]
+    rig.answer(1)
+    await settle()
+    rig.nodeIds = [1, 2]
+    rig.answer(1)
+    await settle()
+    const running = track(rig.running)
+    let stopping
+    rig.onFetch = (nodeId) => {
+      if (nodeId === 2) stopping = track(rig.manager.stop())
+    }
+    rig.answer(2)
+    await settle()
+
+    expect(rig.count(2)).toBe(2)
+    expect(rig.peak.get(2)).toBe(1)
+    rig.answer(1)
+    rig.answer(2)
+    await settle()
+
+    expect(stopping.done).toBe(true)
+    expect(running.done).toBe(true)
+    expect(rig.manager.getFetchers()).toEqual([])
+  })
+
+  it('settles start after a synchronous stop from the Starting log', async () => {
+    rig = new Rig([1, 2])
+    let stopping
+    rig.onLog = ({ message }) => {
+      if (message === 'Starting...') stopping = track(rig.manager.stop())
+    }
+    await rig.start()
+    const running = track(rig.running)
+    await settle()
+
+    expect(rig.calls).toEqual([])
+    expect(stopping.done).toBe(true)
+    expect(running.done).toBe(true)
+    expect(rig.manager.getFetchers()).toEqual([])
   })
 
   it('rethrows a fetcher error after every other fetcher has stopped', async () => {

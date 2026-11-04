@@ -21,13 +21,23 @@ const busy = {
   anyHint: true,
   refreshed: true,
   priorFetches: 1,
+  lossPollWriteAt: 9000,
+  lossPollDoneAt: 10500,
   pollWriteAt: 9000,
   errorAt: 10000,
   routeAt: 10000,
   pollDoneAt: 10500,
   nextAt: 10600,
 }
-const idle = { ...busy, kind: 'idle', priorFetches: 0, pollWriteAt: null, pollDoneAt: null }
+const idle = {
+  ...busy,
+  kind: 'idle',
+  priorFetches: 0,
+  lossPollWriteAt: null,
+  lossPollDoneAt: null,
+  pollWriteAt: null,
+  pollDoneAt: null,
+}
 
 describe('Consumer > Fetch routing oracle (offline controls)', () => {
   it('passes a long poll that is outstanding at the loss and the route', () => {
@@ -35,12 +45,21 @@ describe('Consumer > Fetch routing oracle (offline controls)', () => {
   })
 
   it('fails a long poll that completed before the move', () => {
-    const done = { ...busy, errorAt: 10000, routeAt: 10000, pollDoneAt: 9900, nextAt: 10100 }
-    expect(moveProblems(done)).toContain('the long poll was not outstanding at the route')
+    const done = {
+      ...busy,
+      errorAt: 10000,
+      routeAt: 10000,
+      lossPollDoneAt: 9900,
+      pollDoneAt: 9900,
+      nextAt: 10100,
+    }
+    expect(moveProblems(done)).toContain('the long poll was not outstanding at the loss')
   })
 
   it('fails a poll answered at the route instant', () => {
-    expect(moveProblems({ ...busy, pollDoneAt: 10000, nextAt: 10100 })).not.toEqual([])
+    expect(
+      moveProblems({ ...busy, lossPollDoneAt: 10000, pollDoneAt: 10000, nextAt: 10100 })
+    ).not.toEqual([])
   })
 
   it('fails a poll written after the route', () => {
@@ -67,6 +86,8 @@ describe('Consumer > Fetch routing oracle (offline controls)', () => {
     it('passes the numbers of the live run that failed on the route anchor', () => {
       const live = {
         ...unhinted,
+        lossPollWriteAt: 73325.834949,
+        lossPollDoneAt: 78328.846169,
         pollWriteAt: 73325.834949,
         errorAt: 74108.908003,
         pollDoneAt: 78328.846169,
@@ -79,12 +100,12 @@ describe('Consumer > Fetch routing oracle (offline controls)', () => {
     it('fails a poll that was answered before the loss', () => {
       expect(
         moveProblems({ ...unhinted, errorAt: 10600, nextAt: 10700, routeAt: 10650 })
-      ).toContain('the long poll was not outstanding at the route')
+      ).toContain('the long poll was not outstanding at the loss')
     })
 
     it('fails a poll written after the loss', () => {
       expect(moveProblems({ ...unhinted, errorAt: 8900 })).toContain(
-        'the long poll was not outstanding at the route'
+        'the long poll was not outstanding at the loss'
       )
     })
 
@@ -100,7 +121,15 @@ describe('Consumer > Fetch routing oracle (offline controls)', () => {
   })
 
   it('fails a busy move with no prior Fetch, never an idle pass', () => {
-    const none = { ...busy, priorFetches: 0, pollWriteAt: null, pollDoneAt: null, nextAt: 10100 }
+    const none = {
+      ...busy,
+      priorFetches: 0,
+      lossPollWriteAt: null,
+      lossPollDoneAt: null,
+      pollWriteAt: null,
+      pollDoneAt: null,
+      nextAt: 10100,
+    }
     expect(moveProblems(none)).toContain('the new node had no long poll outstanding')
   })
 
@@ -136,6 +165,8 @@ describe('Consumer > Fetch routing oracle > a move around a node-set change', ()
     routeAt: 68995.814434,
     nextAt: 74051.248941,
     priorFetches: 0,
+    lossPollWriteAt: null,
+    lossPollDoneAt: null,
     pollWriteAt: null,
     pollDoneAt: null,
     hint: null,
@@ -148,6 +179,8 @@ describe('Consumer > Fetch routing oracle > a move around a node-set change', ()
     newNode: 2,
     nextAt: 74048.183506,
     priorFetches: 4,
+    lossPollWriteAt: 58982.758603,
+    lossPollDoneAt: 63985.03353,
     pollWriteAt: 58982.758603,
     pollDoneAt: 63985.03353,
   }
@@ -173,6 +206,38 @@ describe('Consumer > Fetch routing oracle > the poll the route met', () => {
   const first = { at: 100, answer: { at: 900 } }
   const second = { at: 950, answer: { at: 2000 } }
   const third = { at: 2100 }
+
+  it('passes separate polls outstanding at the loss and the route', () => {
+    const poll = pollAtRoute([first, second, third], 1500)
+    expect(
+      moveProblems({
+        ...busy,
+        errorAt: 500,
+        routeAt: 1500,
+        nextAt: 2010,
+        lossPollWriteAt: first.at,
+        lossPollDoneAt: first.answer.at,
+        pollWriteAt: poll.at,
+        pollDoneAt: poll.answer.at,
+      })
+    ).toEqual([])
+  })
+
+  it('fails separate polls when none was outstanding at the loss', () => {
+    const poll = pollAtRoute([first, second, third], 1500)
+    expect(
+      moveProblems({
+        ...busy,
+        errorAt: 500,
+        routeAt: 1500,
+        nextAt: 2010,
+        lossPollWriteAt: first.at,
+        lossPollDoneAt: 400,
+        pollWriteAt: poll.at,
+        pollDoneAt: poll.answer.at,
+      })
+    ).toEqual(['the long poll was not outstanding at the loss'])
+  })
 
   it('is the Fetch written last by the route, not the one outstanding at the loss', () => {
     expect(pollAtRoute([first, second, third], 1500)).toBe(second)
