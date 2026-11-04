@@ -1,11 +1,11 @@
-/** The most recreation times one observation keeps; later ones are counted, never stored. */
+/** The most entries of each kind one observation keeps; later ones are counted, never stored. */
 const MAX_TIMES = 100
 
 /**
- * Observes one consumer client's completed fetcher drains through its public log creator.
- * Each instance belongs to one Kafka client; other clients must use their own creator.
- * Only the recreation times are retained, so DEBUG traffic cannot inflate evidence. The times are
- * a diagnostic: no bound of the routing oracle reads them.
+ * Observes one consumer client's fetcher reconciliations and each fetcher's start and stop through
+ * its public log creator. Each instance belongs to one Kafka client; other clients must use their
+ * own creator. Only bounded, small records are retained, so DEBUG traffic cannot inflate evidence.
+ * They are a diagnostic: no bound of the routing oracle reads them.
  */
 class FetcherRecreations {
   /**
@@ -14,10 +14,18 @@ class FetcherRecreations {
    */
   constructor(now = () => performance.now()) {
     this.now = now
-    /** @type {number[]} when each recreation was logged, oldest first, at most `MAX_TIMES` */
-    this.times = []
+    /** @type {Array<{ at: number, added: number[], removed: number[] }>} oldest first, capped */
+    this.reconciliations = []
+    /** @type {Array<{ at: number, nodeId: number, event: 'started'|'stopped' }>} capped */
+    this.fetchers = []
+    /** How many entries of either kind the cap discarded. */
     this.dropped = 0
     this.logCreator = this.logCreator.bind(this)
+  }
+
+  /** @returns {number[]} when each reconciliation was logged, oldest first */
+  get times() {
+    return this.reconciliations.map(({ at }) => at)
   }
 
   /**
@@ -27,19 +35,37 @@ class FetcherRecreations {
    */
   logCreator(level) {
     return ({ namespace, log }) => {
-      if (namespace !== 'FetchManager' || log.message !== 'Rebalancing fetchers...') return
-      if (this.times.length < MAX_TIMES) this.times.push(this.now())
-      else this.dropped += 1
+      if (namespace !== 'FetchManager') return
+      if (log.message === 'Reconciling fetchers') {
+        this.keep(this.reconciliations, { at: this.now(), added: log.added, removed: log.removed })
+      } else if (log.message === 'Fetcher started' || log.message === 'Fetcher stopped') {
+        const event = log.message === 'Fetcher started' ? 'started' : 'stopped'
+        this.keep(this.fetchers, { at: this.now(), nodeId: log.nodeId, event })
+      }
     }
   }
 
   /**
-   * @param {number} at `performance.now()` of the earliest recreation wanted
-   * @returns {{ times: number[], dropped: number }} every recreation from `at` on, and how many
-   *   later ones the cap discarded
+   * @param {object[]} list the list to append to
+   * @param {object} entry
+   * @returns {void}
+   */
+  keep(list, entry) {
+    if (list.length < MAX_TIMES) list.push(entry)
+    else this.dropped += 1
+  }
+
+  /**
+   * @param {number} at `performance.now()` of the earliest entry wanted
+   * @returns {{ reconciliations: object[], fetchers: object[], dropped: number }} every entry from
+   *   `at` on, and how many later ones the cap discarded
    */
   since(at) {
-    return { times: this.times.filter((time) => time >= at), dropped: this.dropped }
+    return {
+      reconciliations: this.reconciliations.filter((entry) => entry.at >= at),
+      fetchers: this.fetchers.filter((entry) => entry.at >= at),
+      dropped: this.dropped,
+    }
   }
 }
 

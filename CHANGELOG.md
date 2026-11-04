@@ -66,6 +66,8 @@ Versions before 3.0.0 are internal alpha tags and are not published.
 - Fetch sessions (KIP-227) are opt-in; set `fetchSessions: true` to enable them.
 - **`stop()` and `disconnect()` end a handler's API authority at once, so a handler's explicit `commitOffsets()` that is still waiting for the group coordinator when the stop begins can reject with `CONSUMER_STOPPING`.** In 2.2.4 such a commit could still finish while the stop waited for the batch. Now the rejection gives no promise that the commit completed, and an uncaught rejection is the handler's error, so the batch can be redelivered. Offsets committed before the stop began stay committed. A commit from outside the handlers and one made by an authorized close hook may still complete. To require that a commit finishes, drain the handlers and await the commit before calling `stop()` or `disconnect()`.
 
+- When a broker joins or leaves, the consumer no longer pauses every fetcher until all in-flight long polls end: surviving brokers keep fetching, a new broker gets a fetcher at once and only a departed broker's fetcher stops (2.2.4 drained and recreated all fetchers).
+
 #### Fixes
 
 - On Node 22, a truncated zstd record batch is now refused as `KafkaJSCorruptRecordError` (reason `decompression`), as on Node 24.20+ and 26.6+, instead of decoding as fewer records. Node 22's `zlib` does not reject truncated zstd input (nodejs/node#64593), so the codec checks the first frame's blocks and checksum itself on every Node version.

@@ -7,6 +7,7 @@ const {
   UNHINTED_OUTAGE,
   moveProblems,
   partitionLeader,
+  pollAtRoute,
   siblingProblems,
 } = require('./fixtures/fetchRoutingOracle')
 
@@ -165,6 +166,25 @@ describe('Consumer > Fetch routing oracle > a move around a node-set change', ()
     const meets = { ...unhintedIdle, nextAt: unhintedIdle.routeAt + 10 }
     expect(moveProblems(meets)).toEqual([])
     expect(moveProblems({ ...meets, ...observation })).toEqual([])
+  })
+})
+
+describe('Consumer > Fetch routing oracle > the poll the route met', () => {
+  const first = { at: 100, answer: { at: 900 } }
+  const second = { at: 950, answer: { at: 2000 } }
+  const third = { at: 2100 }
+
+  it('is the Fetch written last by the route, not the one outstanding at the loss', () => {
+    expect(pollAtRoute([first, second, third], 1500)).toBe(second)
+  })
+
+  it('counts a Fetch written at the route instant and none written after it', () => {
+    expect(pollAtRoute([first, second, third], 950)).toBe(second)
+    expect(pollAtRoute([first, second, third], 949)).toBe(first)
+  })
+
+  it('is nothing when the node had written no Fetch by the route', () => {
+    expect(pollAtRoute([third], 1500)).toBeUndefined()
   })
 })
 

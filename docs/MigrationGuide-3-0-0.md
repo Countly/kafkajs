@@ -941,6 +941,8 @@ says so, `groupProtocol: 'consumer'`.
 
 Nothing to do; code that slept after `resume()` to ride out the wait can stop.
 
+- **A broker joining or leaving no longer pauses the other fetchers.** 2.2.4 stopped every fetcher, waited for all in-flight long polls and recreated them. 3.0.0 keeps the fetchers of surviving brokers running, starts a new broker's fetcher at once, and stops only a departed broker's fetcher. Nothing to do; there is at most one fetcher, and one Fetch in flight, per broker.
+
 If you paused a topic and an operator recreated it, pause it again after you see `consumer.cluster.topic_recreated`. Pausing a topic before it is assigned still works and lasts until the subscription changes.
 
 Admin offset-operation results and broker commits are unchanged. Idle local state can be released before `admin.disconnect()`; do not rely on an admin object retaining offsets from an earlier completed operation.

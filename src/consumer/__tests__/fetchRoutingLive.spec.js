@@ -29,12 +29,14 @@ const {
 const { RoutingWire } = require('./fixtures/routingWire')
 const { FetcherRecreations } = require('./fixtures/fetcherRecreations')
 const { RoutingChanges } = require('./fixtures/routingChanges')
+const { FetcherPhases, brokerSetChanges } = require('./fixtures/fetcherPhases')
 const {
   MOVE_WAIT_MS,
   ROUND_ALLOWANCE_MS,
   UNHINTED_OUTAGE,
   moveProblems,
   partitionLeader,
+  pollAtRoute,
   siblingProblems,
 } = require('./fixtures/fetchRoutingOracle')
 
@@ -157,6 +159,7 @@ class Episode {
     this.brokers = plainTextBrokers()
     this.wire = new RoutingWire()
     this.fetcherRecreations = new FetcherRecreations()
+    this.phases = new FetcherPhases()
     /** @type {RoutingChanges|null} watches the member's routing changes once the topics exist */
     this.routingChanges = null
     /** @type {Array<{ label: string, topic: string, partition: number }>} the traced partitions */
@@ -261,6 +264,8 @@ class Episode {
     this.consumer = consumer
     this.routingChanges.attach()
     cleanup.add('routing observer', () => this.routingChanges.detach())
+    this.phases.attach()
+    cleanup.add('phase observer', () => this.phases.detach())
     const off = [
       consumer.on(consumer.events.GROUP_JOIN, ({ payload }) => this.joins.push(payload)),
       consumer.on(consumer.events.REBALANCING, ({ payload }) => this.rebalances.push(payload)),
@@ -385,6 +390,7 @@ class Episode {
    * @returns {void}
    */
   windowStart() {
+    this.phases.open()
     this.window = {
       at: Date.now(),
       joins: this.joins.length,
@@ -413,6 +419,7 @@ class Episode {
     this.stage = 'closing'
     await step(this.scope, 'The consumer stop', () => this.consumer.disconnect())
     this.routingChanges.detach()
+    this.phases.detach()
     this.committed = new Map()
     for (const topic of this.topics) {
       const [{ partitions }] = await step(this.scope, 'The offset read', () =>
@@ -426,13 +433,18 @@ class Episode {
 
   /**
    * Collects what the case saw around the move, for the evidence row alone: no bound reads it. It
-   * answers the questions a late Fetch leaves open. Every fetcher recreation: was a later drain
-   * the one the destination waited for? Every routing change the member's cluster published from
-   * the move on, with the leader and epoch its cache held and the leader it routed by: was the
-   * moved partition's new leader accepted when the Metadata answer arrived? And the Fetches each
-   * node wrote and had answered from the move to one round after the last destination started.
-   * @returns {Promise<{ from: number, to: number, recreations: object, routing: object,
-   *   fetches: object }>} each part is capped, with the count of what the cap discarded
+   * answers the questions a late Fetch leaves open. Every fetcher reconciliation the fetch manager
+   * logged, with the nodes it added and removed, and each fetcher's start and stop: did a
+   * destination's fetcher wait on another node's? Every broker-set change a Metadata answer
+   * advertised, kept apart from the routing changes the member's cluster published from the move
+   * on, with the leader and epoch its cache held and the leader it routed by: was the moved
+   * partition's new leader accepted when the Metadata answer arrived? Where each node's fetcher
+   * was in its round (preparation, metadata wait, idle wait, heartbeat, Fetch written) from the
+   * window's start. And the Fetches each node wrote and had answered from the move to one round
+   * after the last destination started.
+   * @returns {Promise<{ from: number, to: number, fetcherManager: object, brokerSets: object,
+   *   routing: object, phases: object, fetches: object }>} each part is capped, with the count of
+   *   what the cap discarded
    */
   async diagnose() {
     const from = this.since ?? 0
@@ -448,8 +460,10 @@ class Episode {
     return {
       from,
       to,
-      recreations: this.fetcherRecreations.since(from),
+      fetcherManager: this.fetcherRecreations.since(from),
+      brokerSets: brokerSetChanges(await this.wire.answers(METADATA), from),
       routing: this.routingChanges?.since(from) ?? { changes: [], dropped: 0 },
+      phases: this.phases.since(from),
       fetches: await this.wire.fetchTrace({ from, to, targets }),
     }
   }
@@ -535,7 +549,7 @@ class Episode {
         const prior = wire.exchanges.filter(
           (x) => x.apiKey === FETCH && x.endpoint === newEndpoint && x.at <= routeAt
         )
-        const outstanding = prior.filter((x) => x.at <= errorAt).at(-1)
+        const outstanding = pollAtRoute(prior, routeAt)
         found = {
           kind,
           hinted,

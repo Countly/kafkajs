@@ -5,8 +5,8 @@ const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
 
 describe('Consumer > FetchManager stop', () => {
   it('settles start() even while a rebalance error is re-creating the fetchers', async () => {
-    // The pool keeps changing for the whole run, so the `while (true)` loop is genuinely still
-    // re-creating fetchers when stop() lands. A single flip would stabilise long before the
+    // The pool keeps changing for the whole run, so the manager is genuinely still reconciling
+    // its fetchers when stop() lands. A single flip would stabilise long before the
     // sleep and the case would pass against the UNFIXED file, proving nothing.
     let generation = 0
     const manager = createFetchManager({
@@ -50,10 +50,10 @@ describe('Consumer > FetchManager stop', () => {
     })
 
     const started = manager.start()
-    // Wait for the KafkaJSFetcherRebalanceError to fire and the loop to re-create. The deadline
-    // only bounds a regression: a manager that never re-creates times out instead of hanging.
+    // Wait for a round to notice the changed pool and the manager to reconcile. The deadline
+    // only bounds a regression: a manager that never reconciles times out instead of hanging.
     // The negative control a single shared latch would fail: fetching continued after the
-    // internal teardown, with a fetcher per node of the NEW pool.
+    // pool change, with a fetcher per node of the NEW pool.
     await waitFor(() => manager.getFetchers().length === 3, {
       ignoreTimeout: false,
       maxWait: 5000,
@@ -68,8 +68,8 @@ describe('Consumer > FetchManager stop', () => {
 
   it('clears the latch on the next start()', async () => {
     // The pool changes only while `unstable` is true. That gives a deterministic case with a
-    // genuine red: during the FIRST start() the pool keeps moving, so the `while (true)` loop is
-    // still re-creating fetchers when stop() lands and only the latch can settle it; the SECOND
+    // genuine red: during the FIRST start() the pool keeps moving, so the manager is still
+    // reconciling fetchers when stop() lands and only the latch can settle it; the SECOND
     // start() runs against a frozen pool, so exactly one fetcher exists and the assertion is
     // parity-independent.
     let unstable = true

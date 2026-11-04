@@ -49,16 +49,16 @@ describe('Consumer > repeated node-set changes around a leader move', () => {
 
   /**
    * @param {number} route fake clock when the move was installed
-   * @returns {{ withinRound: boolean, waited: number, recreations: number[] }} how long the idle
-   *   node took to write its first Fetch of the moved partition, and when each fetcher recreation
-   *   happened, both counted from the route
+   * @returns {{ withinRound: boolean, waited: number, reconciliations: number[] }} how long the
+   *   idle node took to write its first Fetch of the moved partition, and when each fetcher
+   *   reconciliation happened, both counted from the route
    */
   const report = (route) => {
     const waited = seam.waited(IDLE, MOVED, route)
     return {
       withinRound: waited <= ROUND_ALLOWANCE_MS,
       waited,
-      recreations: seam.recreations.times.map((at) => at - route),
+      reconciliations: seam.recreations.times.map((at) => at - route),
     }
   }
 
@@ -69,7 +69,7 @@ describe('Consumer > repeated node-set changes around a leader move', () => {
     seam.install({ leaders: { [MOVED]: IDLE }, epoch: EPOCH + 1 })
     await seam.advance(ROUND_ALLOWANCE_MS)
 
-    expect(report(route)).toMatchObject({ withinRound: true, recreations: [] })
+    expect(report(route)).toMatchObject({ withinRound: true, reconciliations: [] })
   })
 
   it('starts the idle node within a round of the move after the node set changed and changed back', async () => {
@@ -81,15 +81,22 @@ describe('Consumer > repeated node-set changes around a leader move', () => {
     expect(report(route)).toMatchObject({ withinRound: true })
   })
 
-  it('starts the idle node once the busy poll ends and the fetchers are recreated', async () => {
+  it('keeps the busy poll open while the idle node starts, and the lost node is reconciled away', async () => {
     await openSeam()
 
     const route = await loseReAddLoseThenMove()
     await seam.advance(ROUND_ALLOWANCE_MS)
+    const busyFetches = () => seam.fetches.filter(({ node }) => node === BUSY).length
+
+    expect(busyFetches()).toBe(1)
+    expect(seam.waited(IDLE, MOVED, route)).toBeLessThanOrEqual(ROUND_ALLOWANCE_MS)
+    expect(seam.recreations.since(0).reconciliations.flatMap(({ removed }) => removed)).toContain(
+      OLD
+    )
+
     seam.release(BUSY)
     await seam.advance(WAKE_MS)
 
-    expect(seam.recreations.times).toHaveLength(1)
-    expect(seam.waited(IDLE, MOVED, route)).toBeLessThanOrEqual(ROUND_ALLOWANCE_MS + 2 * WAKE_MS)
+    expect(busyFetches()).toBeGreaterThan(1)
   })
 })

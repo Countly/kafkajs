@@ -51,6 +51,15 @@ const moveProblems = (measured) => {
 }
 
 /**
+ * @param {Array<{ at: number }>} fetches the Fetches one node wrote, oldest first
+ * @param {number} routeAt when the new leader was routed
+ * @returns {object|undefined} the poll the route met: a node has one Fetch in flight, so it is the
+ *   one written last at or before the route. The one outstanding at the loss may have ended and
+ *   been replaced before the route, and only the later one bounds the route's start.
+ */
+const pollAtRoute = (fetches, routeAt) => fetches.filter(({ at }) => at <= routeAt).at(-1)
+
+/**
  * Reads through DescribeTopicPartitions: a plain `fetchTopicMetadata` waits for a missing leader
  * and rejects with `KafkaJSTimeout` after 10 s, so it can never report one.
  * @param {{ fetchTopicMetadata: Function }} admin a connected admin client
@@ -104,5 +113,6 @@ module.exports = {
   UNHINTED_OUTAGE,
   moveProblems,
   partitionLeader,
+  pollAtRoute,
   siblingProblems,
 }
