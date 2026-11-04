@@ -703,6 +703,7 @@ describe('Consumer > broker outages', () => {
     /**
      * Runs two partition leaders beside a separate coordinator, capturing the real runner while
      * keeping its Fetch and retry decisions intact. Both leaders continuously produce records.
+     * Outage clocks are keyed by the pool's string node ids.
      * @returns {object} the scenario, leaders, and access to the active runner
      */
     const leaders = () => {
@@ -754,12 +755,12 @@ describe('Consumer > broker outages', () => {
       await until(() => rig.events.records.length >= 4, 'both leaders producing')
       rig.breaker.take(2, 'reset')
       const runner = rig.runner()
-      await until(() => runner.outages.fetch.nodes.has(2), 'the failed broker clock')
-      const first = runner.outages.fetch.nodes.get(2).since
+      await until(() => runner.outages.fetch.nodes.has('2'), 'the failed broker clock')
+      const first = runner.outages.fetch.nodes.get('2').since
       const records = rig.events.records.length
       await sleep(500)
       expect(rig.events.records.length).toBeGreaterThan(records)
-      expect(runner.outages.fetch.nodes.get(2).since).toBe(first)
+      expect(runner.outages.fetch.nodes.get('2').since).toBe(first)
       expect(rig.events.crashes).toHaveLength(0)
       await until(() => rig.events.crashes.length > 0, 'the exhausted broker crash', 600)
       expect(performance.now() - first).toBeGreaterThanOrEqual(1000)
@@ -778,14 +779,14 @@ describe('Consumer > broker outages', () => {
       rig.breaker.take(2, 'reset')
       const runner = rig.runner()
       await until(() => runner.outages.fetch.nodes.size === 2, 'both broker clocks')
-      const first = runner.outages.fetch.nodes.get(2).since
+      const first = runner.outages.fetch.nodes.get('2').since
       await sleep(200)
       rig.breaker.restore(LEADER)
       await until(
-        () => !runner.outages.fetch.nodes.has(LEADER),
+        () => !runner.outages.fetch.nodes.has(String(LEADER)),
         'the recovered broker clock cleared'
       )
-      expect(runner.outages.fetch.nodes.get(2).since).toBe(first)
+      expect(runner.outages.fetch.nodes.get('2').since).toBe(first)
       expect(rig.events.crashes).toHaveLength(0)
       await until(() => rig.events.crashes.length > 0, 'the remaining broker crash', 600)
       expect(rig.events.crashes).toHaveLength(1)
@@ -798,17 +799,17 @@ describe('Consumer > broker outages', () => {
       await until(() => rig.events.records.length >= 4, 'both leaders producing')
       const runner = rig.runner()
       rig.breaker.take(2, 'reset')
-      await until(() => runner.outages.fetch.nodes.has(2), 'the failed broker clock')
-      const first = runner.outages.fetch.nodes.get(2).since
+      await until(() => runner.outages.fetch.nodes.has('2'), 'the failed broker clock')
+      const first = runner.outages.fetch.nodes.get('2').since
       const getNodeIds = runner.consumerGroup.getNodeIds.bind(runner.consumerGroup)
       let removed = true
       jest
         .spyOn(runner.consumerGroup, 'getNodeIds')
         .mockImplementation(() => getNodeIds().filter((nodeId) => !removed || nodeId !== 2))
-      await until(() => !runner.outages.fetch.nodes.has(2), 'the removed broker retired')
+      await until(() => !runner.outages.fetch.nodes.has('2'), 'the removed broker retired')
       removed = false
-      await until(() => runner.outages.fetch.nodes.has(2), 'the returning broker clock')
-      expect(runner.outages.fetch.nodes.get(2).since).toBeGreaterThan(first)
+      await until(() => runner.outages.fetch.nodes.has('2'), 'the returning broker clock')
+      expect(runner.outages.fetch.nodes.get('2').since).toBeGreaterThan(first)
       await consumer.stop()
       expect(runner.outages.fetch.nodes.size).toBe(0)
       expect(rig.events.crashes).toHaveLength(0)
@@ -842,21 +843,21 @@ describe('Consumer > broker outages', () => {
       try {
         await until(() => holding, 'a healthy fetch held open')
         rig.breaker.take(2, 'reset')
-        await until(() => runner.outages.fetch.nodes.has(2), 'the failed broker clock')
-        const first = runner.outages.fetch.nodes.get(2).since
+        await until(() => runner.outages.fetch.nodes.has('2'), 'the failed broker clock')
+        const first = runner.outages.fetch.nodes.get('2').since
         const outerChecks = []
         const ride = runner.rideOutage.bind(runner)
         jest.spyOn(runner, 'rideOutage').mockImplementation((error, nodeId) => {
           const delay = ride(error, nodeId)
           if (nodeId === undefined && runner.fetchNodes.get(error) === 2) {
-            outerChecks.push({ since: runner.outages.fetch.nodes.get(2)?.since, delay })
+            outerChecks.push({ since: runner.outages.fetch.nodes.get('2')?.since, delay })
           }
           return delay
         })
         await until(() => exhausted, 'budget exhaustion', 600)
         await sleep(30)
         expect(rig.events.crashes).toHaveLength(0)
-        expect(runner.outages.fetch.nodes.get(2).since).toBe(first)
+        expect(runner.outages.fetch.nodes.get('2').since).toBe(first)
         release()
         await until(() => rig.events.crashes.length > 0, 'the single crash', 600)
         expect(rig.events.crashes).toHaveLength(1)

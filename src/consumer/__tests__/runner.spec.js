@@ -981,6 +981,7 @@ describe('Consumer > Runner', () => {
         'getNodeIds',
         'handler',
         'logger',
+        'onRetire',
         'retryDelay',
       ])
     })

@@ -500,13 +500,15 @@ describe('Consumer > OffsetManager > resolveOffsets across a topic recreation', 
     expect(requests.map(({ topicId }) => topicId)).toEqual([OLD_ID, NEW_ID])
     requests[1].answer('77')
     await fresh
-    expect(committed[TOPIC]).toEqual({ 0: '0' })
+    expect(committed[TOPIC]).toEqual({})
+    expect(manager.heldOffsetAt(TOPIC, 0)).toEqual('0')
     expect(pending.size).toBe(1)
 
     requests[0].answer('99')
     await stale
 
-    expect(committed[TOPIC]).toEqual({ 0: '0' })
+    expect(committed[TOPIC]).toEqual({})
+    expect(manager.heldOffsetAt(TOPIC, 0)).toEqual('0')
     expect(manager.nextOffset(TOPIC, 0).toString()).toEqual('0')
   })
 
@@ -527,7 +529,8 @@ describe('Consumer > OffsetManager > resolveOffsets across a topic recreation', 
     requests[1].answer('99')
     await next
 
-    expect(committed[TOPIC]).toEqual({ 0: '0' })
+    expect(committed[TOPIC]).toEqual({})
+    expect(manager.heldOffsetAt(TOPIC, 0)).toEqual('0')
     expect(pending.size).toBe(1)
   })
 
@@ -559,7 +562,8 @@ describe('Consumer > OffsetManager > resolveOffsets across a topic recreation', 
     requests[1].answer('99')
     await next
 
-    expect(committed[TOPIC]).toEqual({ 0: '0' })
+    expect(committed[TOPIC]).toEqual({})
+    expect(manager.heldOffsetAt(TOPIC, 0)).toEqual('0')
     expect(pending.size).toBe(1)
   })
 
@@ -577,7 +581,8 @@ describe('Consumer > OffsetManager > resolveOffsets across a topic recreation', 
       setId(NEW_ID)
       held.release('0')
       await round
-      expect(committed[TOPIC]).toEqual({ 0: '0' })
+      expect(committed[TOPIC]).toEqual({})
+      expect(manager.heldOffsetAt(TOPIC, 0)).toEqual('0')
       await resolveAgain(manager, requests)
 
       expect(manager.nextOffset(TOPIC, 0).toString()).toEqual('0')
@@ -597,7 +602,8 @@ describe('Consumer > OffsetManager > resolveOffsets across a topic recreation', 
       setId(undefined)
       held.release('0')
       await round
-      expect(committed[TOPIC]).toEqual({ 0: '0' })
+      expect(committed[TOPIC]).toEqual({})
+      expect(manager.heldOffsetAt(TOPIC, 0)).toEqual('0')
       setId(NEW_ID)
       await resolveAgain(manager, requests)
 
@@ -653,7 +659,8 @@ describe('Consumer > OffsetManager > resolveOffsets across a topic recreation', 
 
       await resolveAgain(manager, requests)
 
-      expect(committed[TOPIC]).toEqual({ 0: '0' })
+      expect(committed[TOPIC]).toEqual({})
+      expect(manager.heldOffsetAt(TOPIC, 0)).toEqual('0')
       expect(pending.size).toBe(1)
     })
 
@@ -747,7 +754,8 @@ describe('Consumer > OffsetManager > resolveOffsets across a topic recreation', 
       const { manager, committed, pending } = await raceSibling(undefined)
 
       expect(pending.size).toBe(1)
-      expect(committed[TOPIC]).toEqual({ 0: '0' })
+      expect(committed[TOPIC]).toEqual({})
+      expect(manager.heldOffsetAt(TOPIC, 0)).toEqual('0')
       expect(manager.nextOffset(TOPIC, 0).toString()).toEqual('0')
     })
 
@@ -756,14 +764,16 @@ describe('Consumer > OffsetManager > resolveOffsets across a topic recreation', 
 
       await resolveAgain(manager, requests)
 
-      expect(committed[TOPIC]).toEqual({ 0: '0' })
+      expect(committed[TOPIC]).toEqual({})
+      expect(manager.heldOffsetAt(TOPIC, 0)).toEqual('0')
       expect(manager.nextOffset(TOPIC, 0).toString()).toEqual('0')
     })
 
     test('an answer sent under a known id does not overwrite it either, once the cache is cleared', async () => {
       const { manager, committed } = await raceSibling(OLD_ID, ({ setId }) => setId(undefined))
 
-      expect(committed[TOPIC]).toEqual({ 0: '0' })
+      expect(committed[TOPIC]).toEqual({})
+      expect(manager.heldOffsetAt(TOPIC, 0)).toEqual('0')
       expect(manager.nextOffset(TOPIC, 0).toString()).toEqual('0')
     })
 
@@ -780,7 +790,8 @@ describe('Consumer > OffsetManager > resolveOffsets across a topic recreation', 
       requests[0].answer('99')
       await slow
 
-      expect(committed[TOPIC]).toEqual({ 0: '0' })
+      expect(committed[TOPIC]).toEqual({})
+      expect(manager.heldOffsetAt(TOPIC, 0)).toEqual('0')
       expect(manager.nextOffset(TOPIC, 0).toString()).toEqual('0')
     })
 
@@ -822,12 +833,14 @@ describe('Consumer > OffsetManager > resolveOffsets across a topic recreation', 
       await flush()
       held.answerAt(1, '0')
       await fast
-      expect(committed[TOPIC]).toEqual({ 0: '0' })
+      expect(committed[TOPIC]).toEqual({})
+      expect(manager.heldOffsetAt(TOPIC, 0)).toEqual('0')
 
       held.answerAt(0, '500')
       await slow
 
-      expect(committed[TOPIC]).toEqual({ 0: '0' })
+      expect(committed[TOPIC]).toEqual({})
+      expect(manager.heldOffsetAt(TOPIC, 0)).toEqual('0')
       expect(pending.size).toBe(1)
     })
   })
@@ -862,7 +875,8 @@ describe('Consumer > OffsetManager > resolveOffsets across a topic recreation', 
         held.answerAt(1, '0')
       }
       await sibling
-      expect(committed[TOPIC]).toEqual({ 0: '0' })
+      expect(committed[TOPIC]).toEqual({})
+      expect(siblingManager.heldOffsetAt(TOPIC, 0)).toEqual('0')
       expect(context.pending.size).toBe(1)
 
       if (held) {
@@ -878,7 +892,8 @@ describe('Consumer > OffsetManager > resolveOffsets across a topic recreation', 
 
       await raceHiddenRecreation(context, context.manager)
 
-      expect(context.committed[TOPIC]).toEqual({ 0: '0' })
+      expect(context.committed[TOPIC]).toEqual({})
+      expect(context.manager.heldOffsetAt(TOPIC, 0)).toEqual('0')
       expect(context.manager.nextOffset(TOPIC, 0).toString()).toEqual('0')
     })
 
@@ -888,7 +903,8 @@ describe('Consumer > OffsetManager > resolveOffsets across a topic recreation', 
 
       await raceHiddenRecreation(context, context.manager, held)
 
-      expect(context.committed[TOPIC]).toEqual({ 0: '0' })
+      expect(context.committed[TOPIC]).toEqual({})
+      expect(context.manager.heldOffsetAt(TOPIC, 0)).toEqual('0')
       expect(context.manager.nextOffset(TOPIC, 0).toString()).toEqual('0')
     })
 
@@ -899,7 +915,8 @@ describe('Consumer > OffsetManager > resolveOffsets across a topic recreation', 
 
       await raceHiddenRecreation(context, rebuilt, held)
 
-      expect(context.committed[TOPIC]).toEqual({ 0: '0' })
+      expect(context.committed[TOPIC]).toEqual({})
+      expect(rebuilt.heldOffsetAt(TOPIC, 0)).toEqual('0')
       expect(rebuilt.nextOffset(TOPIC, 0).toString()).toEqual('0')
     })
   })
@@ -928,7 +945,8 @@ describe('Consumer > OffsetManager > resolveOffsets across a topic recreation', 
       await round
 
       expect(cluster.fetchTopicsOffset).toHaveBeenCalledTimes(1)
-      expect(committed[TOPIC]).toEqual({ 0: '5' })
+      expect(committed[TOPIC]).toEqual({})
+      expect(manager.heldOffsetAt(TOPIC, 0)).toEqual('5')
     })
 
     test('still applies a pending reset', async () => {
@@ -940,7 +958,8 @@ describe('Consumer > OffsetManager > resolveOffsets across a topic recreation', 
       requests[0].answer('99')
       await round
 
-      expect(committed[TOPIC]).toEqual({ 0: '5' })
+      expect(committed[TOPIC]).toEqual({})
+      expect(manager.heldOffsetAt(TOPIC, 0)).toEqual('5')
       expect(pending.size).toBe(1)
     })
   })

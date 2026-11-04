@@ -2560,25 +2560,24 @@ module.exports = class ConsumerGroup {
       .filter(({ topic }) => this.obligations.current(topic) !== null)
       .map(({ topic, partitions }) => ({
         topic,
-        partitions: partitions
-          .filter(
-            (partition) =>
-              manager.heldOffsetAt(topic, partition) != null &&
-              activeTopicPartitions[topic].has(partition) &&
-              !this.positionValidator.isAwaiting(topic, partition) &&
-              (this.haltedPartitions.size === 0 ||
-                !this.haltedPartitions.has(`${topic}|${partition}`))
-          )
-          .map((partition) => ({
-            partition,
-            fetchOffset: this.offsetManager.nextOffset(topic, partition).toString(),
-            // The client's current view of this partition's leader epoch, so the broker can
-            // reject a request built on metadata that has since moved. -1 when the cache has
-            // not seen the partition, which is the field's own wire default and means
-            // "do not fence".
-            currentLeaderEpoch: this.cluster.leaderEpoch(topic, partition),
-            maxBytes: this.maxBytesPerPartition,
-          })),
+        partitions: partitions.reduce((requests, partition) => {
+          const baseline = manager.heldOffsetAt(topic, partition)
+          if (
+            baseline != null &&
+            activeTopicPartitions[topic].has(partition) &&
+            !this.positionValidator.isAwaiting(topic, partition) &&
+            (this.haltedPartitions.size === 0 ||
+              !this.haltedPartitions.has(`${topic}|${partition}`))
+          ) {
+            requests.push({
+              partition,
+              fetchOffset: manager.nextOffset(topic, partition, baseline).toString(),
+              currentLeaderEpoch: this.cluster.leaderEpoch(topic, partition),
+              maxBytes: this.maxBytesPerPartition,
+            })
+          }
+          return requests
+        }, []),
       }))
       .filter(({ partitions }) => partitions.length)
   }

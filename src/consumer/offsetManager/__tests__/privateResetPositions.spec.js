@@ -203,7 +203,9 @@ describe('Consumer > OffsetManager > reset positions stay private to the consume
     await group.duration.manager.resolveOffsets()
     expect(group.duration.manager.heldOffsetAt(TOPIC, 0)).toBe('2')
 
-    group.cache[TOPIC][0] = '9'
+    await group.earliest.manager.commitOffsets({
+      topics: [{ topic: TOPIC, partitions: [{ partition: 0, offset: '9' }] }],
+    })
 
     expect(group.duration.manager.heldOffsetAt(TOPIC, 0)).toBe('9')
   })
@@ -220,5 +222,54 @@ describe('Consumer > OffsetManager > reset positions stay private to the consume
     await group.earliest.manager.resolveOffsets()
     group.earliest.manager.resetOffsetsForTopic(TOPIC)
     expect(group.earliest.manager.heldOffsetAt(TOPIC, 0)).toBeUndefined()
+  })
+
+  test('a sibling same-value commit supersedes a duration reset shadowing 99', async () => {
+    const group = createGroup()
+    await group.earliest.manager.commitOffsets({
+      topics: [{ topic: TOPIC, partitions: [{ partition: 0, offset: '99' }] }],
+    })
+    group.duration.answer('2')
+    await group.duration.manager.resetByDuration({ topic: TOPIC, partition: 0 })
+    expect(group.duration.manager.heldOffsetAt(TOPIC, 0)).toBe('2')
+    expect(group.cache[TOPIC][0]).toBe('99')
+    await group.earliest.manager.commitOffsets({
+      topics: [{ topic: TOPIC, partitions: [{ partition: 0, offset: '99' }] }],
+    })
+    expect(group.duration.manager.heldOffsetAt(TOPIC, 0)).toBe('99')
+    expect(group.duration.manager.resetPositions[TOPIC][0]).toBeUndefined()
+    expect(group.operations.size()).toBe(0)
+  })
+
+  test('a private reset never reappears after a sibling commit and assignment rebuild', async () => {
+    const group = createGroup()
+    group.duration.answer('2')
+    await group.duration.manager.resolveOffsets()
+    await group.earliest.manager.commitOffsets({
+      topics: [{ topic: TOPIC, partitions: [{ partition: 0, offset: '7' }] }],
+    })
+    expect(group.duration.manager.heldOffsetAt(TOPIC, 0)).toBe('7')
+    createMember(group, EARLIEST)
+    expect(group.duration.manager.heldOffsetAt(TOPIC, 0)).toBeUndefined()
+    expect(group.duration.manager.resetPositions[TOPIC][0]).toBeUndefined()
+    expect(group.operations.size()).toBe(0)
+  })
+
+  test('a manager same-value commit supersedes its own duration reset', async () => {
+    const group = createGroup()
+    const member = group.duration
+    await member.manager.commitOffsets({
+      topics: [{ topic: TOPIC, partitions: [{ partition: 0, offset: '99' }] }],
+    })
+    member.answer('2')
+    await member.manager.resetByDuration({ topic: TOPIC, partition: 0 })
+    expect(member.manager.heldOffsetAt(TOPIC, 0)).toBe('2')
+    expect(group.cache[TOPIC][0]).toBe('99')
+    await member.manager.commitOffsets({
+      topics: [{ topic: TOPIC, partitions: [{ partition: 0, offset: '99' }] }],
+    })
+    expect(member.manager.heldOffsetAt(TOPIC, 0)).toBe('99')
+    expect(member.manager.resetPositions[TOPIC][0]).toBeUndefined()
+    expect(group.operations.size()).toBe(0)
   })
 })

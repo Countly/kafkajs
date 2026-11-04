@@ -1,3 +1,4 @@
+const CommittedOffsetRevisions = require('../../cluster/committedOffsetRevisions')
 const Long = require('../../utils/long')
 const sleep = require('../../utils/sleep')
 const dictionary = require('../../utils/dictionary')
@@ -253,11 +254,10 @@ module.exports = class OffsetManager {
    *
    * @param {string} topic
    * @param {number} partition
+   * @param {string} [committedOffset] baseline already read by the fetch builder
    * @returns {Long} the committed offset, or 0 when there is none or it is invalid
    */
-  nextOffset(topic, partition) {
-    const committedOffset = this.heldOffsetAt(topic, partition)
-
+  nextOffset(topic, partition, committedOffset = this.heldOffsetAt(topic, partition)) {
     if (!this.resolvedOffsets[topic][partition] && committedOffset != null) {
       this.resolvedOffsets[topic][partition] = committedOffset
     }
@@ -436,6 +436,7 @@ module.exports = class OffsetManager {
     for (const partition of this.pendingSeeks.get(topic)?.keys() || []) {
       this.clearPendingSeek(topic, partition)
     }
+    CommittedOffsetRevisions.forCache(this.committedOffsets()).clearTopic(topic)
     this.committedOffsets()[topic] = {}
     this.resetPositions[topic] = {}
     this.resolvedOffsets[topic] = {}
@@ -695,6 +696,7 @@ module.exports = class OffsetManager {
       if (!current()) return false
       this.clearPendingSeek(topic, partition)
       if (this.autoCommit) {
+        CommittedOffsetRevisions.forCache(this.committedOffsets()).advance(topic, partition)
         this.committedOffsets()[topic][partition] = actualOffset
         delete this.resetPositions[topic]?.[partition]
       } else this.holdResetPosition(topic, partition, actualOffset)
@@ -1142,7 +1144,10 @@ module.exports = class OffsetManager {
 
       if (written.length > 0) {
         committedOffsets[topic] = assign({}, committedOffsets[topic], accepted)
-        for (const partition of written) delete this.resetPositions[topic]?.[partition]
+        for (const partition of written) {
+          CommittedOffsetRevisions.forCache(committedOffsets).advance(topic, partition)
+          delete this.resetPositions[topic]?.[partition]
+        }
         const confirmed = this.isConfirmedIncarnation(topic, requestedIds.get(topic))
         written.forEach((partition) =>
           confirmed
@@ -1643,7 +1648,10 @@ module.exports = class OffsetManager {
           this.pendingSeekTimestamp(topic, partition) !== undefined
         ) {
           if (derived.has(`${topic}|${partition}`)) this.holdResetPosition(topic, partition, offset)
-          else resolved[partition] = offset
+          else {
+            CommittedOffsetRevisions.forCache(committedOffsets).advance(topic, partition)
+            resolved[partition] = offset
+          }
           written.push(partition)
         }
       }
@@ -1651,7 +1659,7 @@ module.exports = class OffsetManager {
       committedOffsets[topic] = assign({}, committedOffsets[topic], resolved)
 
       for (const partition of written) {
-        if (!isInvalidOffset(resolved[partition])) {
+        if (!isInvalidOffset(this.heldOffsetAt(topic, partition))) {
           this.settleSentinel(topic, partition)
         }
       }
@@ -1857,6 +1865,7 @@ module.exports = class OffsetManager {
     // it prunes it.
     const committedOffsets = this.committedOffsets()
 
+    CommittedOffsetRevisions.forCache(committedOffsets).advance(topic, partition)
     if (committedOffsets[topic]) {
       delete committedOffsets[topic][partition]
     }
@@ -1893,6 +1902,7 @@ module.exports = class OffsetManager {
       }
 
       for (const partition of this.memberAssignment[topic]) {
+        CommittedOffsetRevisions.forCache(committedOffsets).advance(topic, partition)
         if (partitions) {
           delete partitions[partition]
         }
@@ -1906,7 +1916,7 @@ module.exports = class OffsetManager {
     /**
      * The positions this member's own reset policy, sentinel seek or local seek gave a cell, which
      * no other consumer of the group may read. See `holdResetPosition`.
-     * @type {{[topic: string]: {[partition: number]: {offset: string|undefined, shadowed: string|undefined}}}}
+     * @type {{[topic: string]: {[partition: number]: {offset: string|undefined, revision: symbol}}}}
      */
     this.resetPositions = indexTopics(this.topics)
 
@@ -1941,7 +1951,7 @@ module.exports = class OffsetManager {
 
   /**
    * The offset this member treats as committed for a cell: the position its own reset gave it
-   * (`holdResetPosition`) while the shared cell is as it was then, else what the group's shared
+   * (`holdResetPosition`) while the shared cell revision is unchanged, else what the group's shared
    * cache holds. A commit any participant writes to the shared cell afterwards (an auto-commit, a
    * transactional publication) therefore takes over, as it did when the reset itself was written
    * there. Every read of the fetch position's baseline goes through here; writes of real commits
@@ -1953,12 +1963,17 @@ module.exports = class OffsetManager {
   heldOffsetAt(topic, partition) {
     const shared = this.committedOffsets()[topic]?.[partition]
     const own = this.resetPositions[topic]?.[partition]
-    return own !== undefined && own.shadowed === shared ? own.offset : shared
+    if (own !== undefined) {
+      const revisions = CommittedOffsetRevisions.forCache(this.committedOffsets())
+      if (own.revision === revisions.current(topic, partition)) return own.offset
+      delete this.resetPositions[topic][partition]
+    }
+    return shared
   }
 
   /**
    * Keeps a position derived from a reset policy, a sentinel seek or a local seek in this manager
-   * only, with the shared cell's value at that moment so a later commit in the shared cell can be
+   * only, with the shared cell's revision at that moment so a later commit in the shared cell can be
    * told apart from it. A sibling consumer of the same group never reads it, so two members with
    * different reset policies each fetch from their own answer. Replaced by the next one, and
    * dropped with the cell by `clearOffsets`, `resetOffsetsForTopic` and this manager's own commit.
@@ -1972,7 +1987,10 @@ module.exports = class OffsetManager {
     this.resetPositions[topic] ??= {}
     this.resetPositions[topic][partition] = {
       offset,
-      shadowed: this.committedOffsets()[topic]?.[partition],
+      revision: CommittedOffsetRevisions.forCache(this.committedOffsets()).capture(
+        topic,
+        partition
+      ),
     }
   }
 

@@ -133,7 +133,7 @@ const start = async (ctx, kind, { index, partition, partitions }) => {
       const ticket = ctx.operations.begin([{ topic: TOPIC, partition }], { mutation: true })
       return async () => {
         if (!ctx.operations.isSuperseded(ticket, TOPIC, partition)) {
-          ctx.cache[TOPIC][partition] = value
+          ctx.publish(partition, value)
           ctx.operations.apply(ticket, TOPIC, partition)
         }
         ctx.operations.end(ticket)
@@ -173,6 +173,7 @@ const start = async (ctx, kind, { index, partition, partitions }) => {
 const expectedState = (shape, partitionCount, order) => {
   const cells = Array.from({ length: partitionCount }, () => ({
     cache: undefined,
+    shared: undefined,
     owed: true,
     fenced: false,
     barrier: false,
@@ -196,6 +197,7 @@ const expectedState = (shape, partitionCount, order) => {
         if (!cell.fenced && cell.cache === undefined) {
           const reset = cell.owed || kind === 'resolver'
           cell.cache = reset ? (kind === 'resolver' ? RESOLVER_ANSWER : '0') : EPOCH_OFFSET
+          if (!reset) cell.shared = EPOCH_OFFSET
         }
       }
     } else if (MUTATIONS.has(kind)) {
@@ -205,22 +207,37 @@ const expectedState = (shape, partitionCount, order) => {
         cell.fenced = true
         cell.owed = false
         cell.cache = kind.startsWith('seek') ? undefined : value
+        cell.shared = cell.cache
       }
     } else if (kind === 'recreate') {
       for (const cell of cells) {
-        Object.assign(cell, { cache: undefined, owed: true, fenced: true, barrier: true })
+        Object.assign(cell, {
+          cache: undefined,
+          shared: undefined,
+          owed: true,
+          fenced: true,
+          barrier: true,
+        })
       }
     } else if (kind === 'revoke') {
-      Object.assign(cells[partition], { cache: undefined, fenced: true, barrier: true })
+      Object.assign(cells[partition], {
+        cache: undefined,
+        shared: undefined,
+        fenced: true,
+        barrier: true,
+      })
     }
   }
 
-  const before = cells.map(({ cache, owed }) => ({ cache, owed }))
+  const before = cells.map(({ cache, shared, owed }) => ({ cache, shared, owed }))
   const after = cells.map(({ cache, owed }, partition) =>
     cache === undefined ? (owed ? '0' : stored[partition]) : cache
   )
 
-  return { before, after, obligations: cells.some(({ owed }) => owed) ? 1 : 0 }
+  const committed = cells.map(({ cache, shared, owed }, partition) =>
+    cache === undefined && !owed ? stored[partition] : shared
+  )
+  return { before, after, committed, obligations: cells.some(({ owed }) => owed) ? 1 : 0 }
 }
 
 /** Runs one ordering of one shape and returns what the manager holds, before and after quiescence. */
@@ -237,7 +254,11 @@ const explore = async (shape, partitionCount, order) => {
     await releases[at]()
   }
 
-  const before = partitions.map((p) => ({ cache: ctx.committedAt(p), owed: ctx.owed(p) }))
+  const before = partitions.map((p) => ({
+    cache: ctx.heldAt(p),
+    shared: ctx.committedAt(p),
+    owed: ctx.owed(p),
+  }))
   for (let pass = 0; pass < 4 && !(await ctx.manager.resolveOffsets()); pass++);
 
   return {
@@ -257,7 +278,7 @@ const check = async (name, shape, partitionCount, order, seed) => {
   try {
     expect(actual.before).toEqual(expected.before)
     expect(actual.after).toEqual(expected.after)
-    expect(actual.committed).toEqual(expected.after)
+    expect(actual.committed).toEqual(expected.committed)
     expect(actual.epochs.every((epoch) => epoch === -1)).toBe(true)
     expect(actual.ledger).toBe(0)
     expect(actual.obligations).toBe(expected.obligations)
