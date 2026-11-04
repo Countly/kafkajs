@@ -498,6 +498,7 @@ test('a newer seek or commit wins a held duration reset in either completion ord
   expect(commitLast.committedAt()).toBeUndefined()
   await commitLast.manager.commitOffsets(commitOf('3'))
   expect(commitLast.committedAt()).toBe('3')
+  expect(commitLast.heldAt()).toBe('3')
   expect(commitLast.operations.size()).toBe(0)
 })
 

@@ -1887,7 +1887,9 @@ module.exports = class OffsetManager {
    * Forgets everything this member holds for its assignment. It still deletes the assigned cells
    * of the shared cache: a rebuilt assignment must read the coordinator again rather than resume
    * from a cell written under the previous one, and only commits live there, so a sibling loses at
-   * most a cell it re-reads from the coordinator. Its reset positions are private and untouched.
+   * most a cell it re-reads from the coordinator. Clearing a cell advances its revision, so this
+   * member's reset positions for it go stale and are resolved again, as they were when they lived in
+   * the cell.
    * @private
    */
   clearAllOffsets() {

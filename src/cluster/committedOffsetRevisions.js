@@ -2,7 +2,8 @@ const caches = new WeakMap()
 
 /**
  * Publication revisions for one group's committed cache, independent of ledger retention.
- * State is bounded by published or cleared cells and topics, never private reset positions.
+ * It keeps one number per partition ever published or cleared and per topic ever cleared, never
+ * per private reset position, so it grows with the group's topology, as the cache's topic keys do.
  * Capturing the cache sequence allocates nothing; later publications or clears supersede it.
  */
 class CommittedOffsetRevisions {
