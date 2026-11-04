@@ -152,9 +152,11 @@ describe('createResourceProbe', () => {
       const probe = createResourceProbe({ heap: true, gc: realGc(), pause: async () => {} })
       const { heapUsed: before } = await probe.snapshot()
 
-      let retained = Array.from({ length: 400000 }, (_, i) => ({ i, text: `entry-${i}` }))
+      // A packed array of doubles costs 8 bytes per element on every V8 version (16 MB here);
+      // small objects vary with the engine's object layout and measured under 10 MB on Node 22.
+      let retained = new Array(2_000_000).fill(0.5)
       const { heapUsed: during } = await probe.snapshot()
-      expect(retained).toHaveLength(400000)
+      expect(retained).toHaveLength(2_000_000)
       retained = null
       const { heapUsed: after } = await probe.snapshot()
 
