@@ -30,6 +30,13 @@ const guardedCommand = (operation, args) => {
 }
 
 /**
+ * Resolves standalone Compose operands against the repository's selected cluster.
+ * @param {string[]} args Compose subcommand and operands
+ * @returns {string[]} Docker CLI operands; no process is started
+ */
+const composeArgs = (args) => ['compose', '-f', COMPOSE_FILE, ...args]
+
+/**
  * Runs `docker compose` against the cluster the tests are using. Defaults to the root compose
  * file; `COMPOSE_FILE` (relative to the repository root) overrides it, which is how a scenario
  * targets its own. A controller ownership environment routes controls through its bounded guard.
@@ -44,7 +51,7 @@ const compose = (...args) => {
   const guarded = guardedCommand('control', args)
   return guarded
     ? execFileSync('timeout', guarded, { stdio: 'pipe' })
-    : execFileSync('docker', ['compose', '-f', COMPOSE_FILE, ...args], { stdio: 'pipe' })
+    : execFileSync('docker', composeArgs(args), { stdio: 'pipe' })
 }
 
 /**
@@ -60,7 +67,7 @@ const composeAsync = (...args) => {
   const guarded = guardedCommand('control', args)
   return guarded
     ? promisify(execFile)('timeout', guarded)
-    : promisify(execFile)('docker', ['compose', '-f', COMPOSE_FILE, ...args])
+    : promisify(execFile)('docker', composeArgs(args))
 }
 
 /**
@@ -508,6 +515,7 @@ const triggerUncleanElection = (topic, partition = 0) =>
   ])
 
 module.exports = {
+  composeArgs,
   execInKafka1,
   compose,
   stopBroker,

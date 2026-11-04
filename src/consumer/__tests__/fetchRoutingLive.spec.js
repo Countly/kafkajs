@@ -11,9 +11,6 @@ const {
 const { BrokerBouncer, NODES, waitForFullIsr } = require('../../../testHelpers/leaderElection')
 const { readLog } = require('../../../testHelpers/rawLog')
 const apiKeys = require('../../protocol/requests/apiKeys')
-const Decoder = require('../../protocol/decoder')
-const { requests } = require('../../protocol/requests')
-const { responseHeaderVersion, RESPONSE_HEADER_V1 } = require('../../protocol/headers')
 const {
   CleanupStack,
   COORDINATOR_TYPES,
@@ -29,7 +26,7 @@ const {
   liveCase,
   pollUntil,
 } = require('../../producer/__tests__/fixtures/bounded')
-const { WireTranscript } = require('./fixtures/rackWire')
+const { RoutingWire } = require('./fixtures/routingWire')
 const {
   MOVE_WAIT_MS,
   ROUND_ALLOWANCE_MS,
@@ -135,86 +132,6 @@ const rolesFor = (coordinatorId) => {
   const [old] = ids.filter((nodeId) => nodeId !== coordinatorId).reverse()
   const [first, second] = ids.filter((nodeId) => nodeId !== old)
   return { old, first, second }
-}
-
-/**
- * Records every frame a client writes and answers it reads, as `WireTranscript` does, and also the
- * Metadata answers and the time each socket closed, so a case can place the moment an old leader
- * was lost and the moment a new one became known.
- */
-class RoutingWire extends WireTranscript {
-  /** Starts with no closed socket. */
-  constructor() {
-    super()
-    /** @type {Array<{ endpoint: string, at: number }>} when each socket closed */
-    this.closes = []
-  }
-
-  /**
-   * @param {object} socket a socket of the client
-   * @param {{ host: string, port: number }} address
-   * @returns {object} the socket, also noting when it closes
-   */
-  observe(socket, address) {
-    const observed = super.observe(socket, address)
-    const endpoint = `${address.host}:${address.port}`
-    observed.once('close', () => this.closes.push({ endpoint, at: performance.now() }))
-    return observed
-  }
-
-  /**
-   * @param {number} connection
-   * @param {Buffer} frame one complete answer frame
-   * @returns {void}
-   */
-  read(connection, frame) {
-    const exchange = this.open.get(`${connection}:${frame.readInt32BE(4)}`)
-    super.read(connection, frame)
-    if (exchange?.apiKey === METADATA && !exchange.answer) {
-      exchange.answer = { at: performance.now(), frame }
-    }
-  }
-
-  /**
-   * Decodes the answers of one API, once each.
-   * @param {number} apiKey `Fetch` or `Metadata`
-   * @returns {Promise<Array<{ exchange: object, at: number, decoded: object }>>} oldest first
-   */
-  async answers(apiKey) {
-    const kept = this.exchanges.filter((x) => x.apiKey === apiKey && x.answer)
-    return Promise.all(
-      kept.map(async (exchange) => {
-        exchange.decoded ??= this.decode(exchange)
-        return { exchange, at: exchange.answer.at, decoded: await exchange.decoded }
-      })
-    )
-  }
-
-  /**
-   * @param {object} exchange an exchange whose answer was kept
-   * @returns {Promise<object>} the answer's decoded body
-   */
-  async decode(exchange) {
-    const { response } = requests[exchange.apiKey === FETCH ? 'Fetch' : 'Metadata'].protocol({
-      version: exchange.apiVersion,
-    })({
-      maxWaitTime: 0,
-      minBytes: 0,
-      maxBytes: 0,
-      topics: [],
-      topicIds: new Map(),
-      rackId: '',
-      allowAutoTopicCreation: false,
-    })
-    const { frame } = exchange.answer
-    const header = new Decoder(frame)
-    header.readInt32()
-    header.readInt32()
-    if (responseHeaderVersion(exchange.apiKey, exchange.apiVersion) === RESPONSE_HEADER_V1) {
-      header.readTaggedFields()
-    }
-    return response.decode(frame.subarray(header.offset))
-  }
 }
 
 /**
@@ -500,7 +417,8 @@ class Episode {
    * @param {number} move.newNode
    * @param {boolean} move.hinted whether the old leader names the new one
    * @param {number} move.since `performance.now()` when the move was issued
-   * @returns {Promise<object>} the timestamps, the hint and the counts the bounds read
+   * @returns {Promise<object>} the timestamps, the hint, the counts, whether the client's node set
+   *   changed across the route and when its in-flight Fetches drained, which the bounds read
    */
   async measure({ kind, topic, oldNode, newNode, hinted, since }) {
     this.stage = `measuring the ${hinted ? 'hinted' : 'unhinted'} ${kind} move`
@@ -571,6 +489,8 @@ class Episode {
           (x) => x.apiKey === FETCH && x.endpoint === newEndpoint && x.at <= routeAt
         )
         const outstanding = prior.filter((x) => x.at <= errorAt).at(-1)
+        const before = (await wire.nodeSetAt(errorAt)) ?? new Set(wire.nodes.values())
+        const after = (await wire.nodeSetAt(routeAt, true)) ?? before
         found = {
           kind,
           hinted,
@@ -583,6 +503,7 @@ class Episode {
           priorFetches: prior.length,
           pollWriteAt: outstanding?.at ?? null,
           pollDoneAt: outstanding?.answer?.at ?? null,
+          nodeSetChanged: before.size !== after.size || [...before].some((id) => !after.has(id)),
           hint: hint?.currentLeader ?? null,
           anyHint: fetched.some(({ currentLeader }) => currentLeader),
           refreshed: wire.exchanges.some(
@@ -865,6 +786,10 @@ describeRouting('Consumer > Fetch routing around unavailable and moved leaders (
               measured.push(await episode.measure({ ...move, oldNode: roles.old, hinted, since }))
             }
             episode.facts.moves = measured.filter((m) => m.hinted === hinted)
+            const drainEndAt = episode.wire.drainEnd(
+              Math.min(...episode.facts.moves.map(({ routeAt }) => routeAt))
+            )
+            for (const move of episode.facts.moves) move.drainEndAt = drainEndAt
             if (outage) {
               episode.facts.outage = await bounded(scope, Infinity, () => outage, {
                 label: 'The outage',
@@ -895,6 +820,10 @@ describeRouting('Consumer > Fetch routing around unavailable and moved leaders (
           for (const move of measured) {
             const late = { ...move, nextAt: move.nextAt + MOVE_WAIT_MS + 2 * ROUND_ALLOWANCE_MS }
             expect(moveProblems(late)).not.toEqual([])
+            if (move.nodeSetChanged) {
+              const idled = { ...move, drainEndAt: move.nextAt - 2 * ROUND_ALLOWANCE_MS }
+              expect(moveProblems(idled)).not.toEqual([])
+            }
             if (move.hinted) expect(moveProblems({ ...move, hint: null })).not.toEqual([])
             else expect(moveProblems({ ...move, anyHint: true })).not.toEqual([])
           }
