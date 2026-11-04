@@ -124,7 +124,7 @@ Versions before 3.0.0 are internal alpha tags and are not published.
 
 #### Tooling
 
-- The exit gate workflow runs each check as its own job, started by the `gate` label or a manual dispatch, invokes the coordinator build with Bash, and supports bounded standalone broker and assignment-gate controls on fresh CI runners.
+- The exit gate workflow runs each check as its own job, started on every ready (non-draft) pull request, every push to master or a manual dispatch, invokes the coordinator build with Bash, and supports bounded standalone broker and assignment-gate controls on fresh CI runners.
 
 - The exit checks run in CI from `scripts/ci/gate.json`, and `scripts/ci/checkIdentities.js` fails a gate job whose live specs skipped, failed or left an expected test out of the Jest report, including the unit script and its allowed skips. Node test reports enforce completed OTel runs and live identities; tracked-file hygiene sweeps compare against the previous release tag.
 
