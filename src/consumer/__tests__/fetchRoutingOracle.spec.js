@@ -123,9 +123,10 @@ describe('Consumer > Fetch routing oracle (offline controls)', () => {
   })
 })
 
-describe('Consumer > Fetch routing oracle > a move that changes the node set', () => {
-  // CI measured the route and destination starts, but no rebalance log.
-  // This replay assumes a shared rebalance-log time promptly before the first recreated Fetch.
+describe('Consumer > Fetch routing oracle > a move around a node-set change', () => {
+  // The numbers of a CI run whose unhinted move started a long poll after the route. The
+  // observations a recreation leaves are diagnostics: they earn no allowance.
+  const observation = { nodeSetChanged: true, drainEndAt: 74046.1 }
   const unhintedIdle = {
     kind: 'idle',
     hinted: false,
@@ -139,8 +140,6 @@ describe('Consumer > Fetch routing oracle > a move that changes the node set', (
     hint: null,
     anyHint: false,
     refreshed: true,
-    nodeSetChanged: true,
-    drainEndAt: 74046.1,
   }
   const unhintedBusy = {
     ...unhintedIdle,
@@ -152,86 +151,20 @@ describe('Consumer > Fetch routing oracle > a move that changes the node set', (
     pollDoneAt: 63985.03353,
   }
 
-  it('passes the CI route/start timestamps assuming a prompt shared drain', () => {
-    expect(moveProblems(unhintedIdle)).toEqual([])
-    expect(moveProblems(unhintedBusy)).toEqual([])
+  it('fails an idle start a long poll after the route whatever a recreation observed', () => {
+    expect(moveProblems(unhintedIdle)).toEqual(['the idle route took longer than a round'])
+    expect(moveProblems({ ...unhintedIdle, ...observation })).toEqual(moveProblems(unhintedIdle))
   })
 
-  it('fails a start a full round after the drain end', () => {
-    const slow = (move) => ({ ...move, nextAt: move.drainEndAt + ROUND_ALLOWANCE_MS + 1 })
-
-    expect(moveProblems(slow(unhintedIdle))).toContain(
-      'the fetchers started more than a round after the drain'
-    )
-    expect(moveProblems(slow(unhintedBusy))).toContain(
-      'the fetchers started more than a round after the drain'
-    )
+  it('fails a busy start a long poll after the later of the poll end and the route', () => {
+    expect(moveProblems(unhintedBusy)).toEqual(['the route waited after the long poll'])
+    expect(moveProblems({ ...unhintedBusy, ...observation })).toEqual(moveProblems(unhintedBusy))
   })
 
-  it('fails a drain end that was not measured', () => {
-    expect(moveProblems({ ...unhintedIdle, drainEndAt: null })).toContain(
-      'no drain end was measured for the node-set change'
-    )
-  })
-
-  it('fails a start later than the wait and a round after the route', () => {
-    const late = {
-      ...unhintedIdle,
-      routeAt: unhintedIdle.nextAt - MOVE_WAIT_MS - 100 - ROUND_ALLOWANCE_MS,
-    }
-
-    expect(moveProblems(late)).toContain('the idle route took longer than the wait and a round')
-    expect(moveProblems({ ...unhintedBusy, routeAt: late.routeAt })).toContain(
-      'the busy route took longer than the wait and a round'
-    )
-  })
-
-  it('still fails a busy move whose long poll was not outstanding at the loss', () => {
-    expect(moveProblems({ ...unhintedBusy, errorAt: 64000 })).toContain(
-      'the long poll was not outstanding at the route'
-    )
-  })
-
-  it('keeps the strict bounds when the node set is unchanged', () => {
-    const kept = { ...unhintedIdle, nodeSetChanged: false }
-
-    expect(moveProblems(kept)).toContain('the idle route took longer than a round')
-    expect(moveProblems({ ...unhintedBusy, nodeSetChanged: false })).toContain(
-      'the route waited after the long poll'
-    )
-  })
-
-  it('keeps the strict bounds for the hinted arm of the first CI run', () => {
-    const hintedIdle = {
-      kind: 'idle',
-      hinted: true,
-      newNode: 1,
-      errorAt: 47393.632323,
-      routeAt: 47393.632323,
-      nextAt: 47400.097163,
-      priorFetches: 0,
-      pollWriteAt: null,
-      pollDoneAt: null,
-      hint: { leaderId: 1, leaderEpoch: 1 },
-      anyHint: true,
-      refreshed: false,
-      nodeSetChanged: false,
-      drainEndAt: 47399.9,
-    }
-    const hintedBusy = {
-      ...hintedIdle,
-      kind: 'busy',
-      newNode: 2,
-      nextAt: 52401.254665,
-      priorFetches: 3,
-      pollWriteAt: 47391.856825,
-      pollDoneAt: 52394.258539,
-      hint: { leaderId: 2, leaderEpoch: 1 },
-    }
-
-    expect(moveProblems(hintedIdle)).toEqual([])
-    expect(moveProblems(hintedBusy)).toEqual([])
-    expect(moveProblems({ ...hintedIdle, nextAt: hintedIdle.routeAt + 5055 })).not.toEqual([])
+  it('gives a move that meets the bounds the same verdict with or without the observation', () => {
+    const meets = { ...unhintedIdle, nextAt: unhintedIdle.routeAt + 10 }
+    expect(moveProblems(meets)).toEqual([])
+    expect(moveProblems({ ...meets, ...observation })).toEqual([])
   })
 })
 
@@ -327,12 +260,11 @@ describe('Consumer > Fetch routing oracle > the sibling window', () => {
 })
 
 describe('Consumer > Fetch routing wire measurement', () => {
-  const { RoutingWire } = require('./fixtures/routingWire')
-  const { FetcherRecreations } = require('./fixtures/fetcherRecreations')
+  const { RoutingWire, MAX_TRACE_ROWS } = require('./fixtures/routingWire')
   const Encoder = require('../../protocol/encoder')
   const createRequest = require('../../protocol/request')
   const { requests } = require('../../protocol/requests')
-  const { fetchResponse } = require('./fixtures/fetchHarness')
+  const { fetchResponse, TOPIC } = require('./fixtures/fetchHarness')
   let wire
 
   beforeEach(() => {
@@ -343,32 +275,38 @@ describe('Consumer > Fetch routing wire measurement', () => {
   afterEach(() => jest.useRealTimers())
 
   /**
-   * Writes a real Fetch frame at the current transcript clock, without opening a socket.
-   * @param {number} connection socket identity
+   * Writes a real v12 Fetch asking for partition 0 of one topic, at the current transcript clock.
+   * @param {number} connection socket identity, also the node id the transcript maps it to
    * @param {number} correlationId request identity on that socket
+   * @param {string[]} topics the topics asked for
    * @returns {Promise<void>}
    */
-  const fetch = async (connection, correlationId) => {
-    const { request } = requests.Fetch.protocol({ version: 18 })({
+  const fetchOf = async (connection, correlationId, topics) => {
+    const { request } = requests.Fetch.protocol({ version: 12 })({
       maxWaitTime: MOVE_WAIT_MS,
       minBytes: 1,
       maxBytes: 1024,
-      topics: [],
+      topics: topics.map((topic) => ({
+        topic,
+        partitions: [{ partition: 0, fetchOffset: '0', maxBytes: 1024 }],
+      })),
       topicIds: new Map(),
       rackId: '',
     })
     const { buffer } = await createRequest({ correlationId, clientId: 'routing-wire', request })
+    wire.nodes.set(`broker:${connection}`, connection)
     wire.write(connection, `broker:${connection}`, buffer)
   }
 
   /**
-   * Reads a framed Fetch answer at the current clock.
+   * Reads a framed v12 answer that gives partition 0 of the fake harness topic an error code.
    * @param {number} connection socket identity
    * @param {number} correlationId request identity
+   * @param {number} errorCode
    * @returns {void}
    */
-  const answer = (connection, correlationId) => {
-    const body = fetchResponse([], { apiVersion: 18 })
+  const answerWith = (connection, correlationId, errorCode) => {
+    const body = fetchResponse([{ partition: 0, errorCode }], { apiVersion: 12 })
     wire.read(
       connection,
       new Encoder()
@@ -379,69 +317,42 @@ describe('Consumer > Fetch routing wire measurement', () => {
     )
   }
 
-  it('passes an old fetcher writing after the route with an explicit rebalance boundary', async () => {
-    const observation = new FetcherRecreations()
-    const log = observation.logCreator(5)
-    await fetch(1, 1)
-    await fetch(2, 1)
-    jest.advanceTimersByTime(105)
-    answer(1, 1)
-    jest.advanceTimersByTime(5)
-    await fetch(1, 2)
-    jest.advanceTimersByTime(2890)
-    answer(1, 2)
-    answer(2, 1)
-    log({ namespace: 'FetchManager', log: { message: 'Rebalancing fetchers...' } })
-    jest.advanceTimersByTime(10)
-    await fetch(1, 3)
-    await fetch(2, 2)
-
-    const moves = [1, 2].map((connection) => ({
-      ...idle,
-      errorAt: 100,
-      routeAt: 100,
-      nextAt: wire.exchanges.filter((x) => x.connection === connection).at(-1).at,
-    }))
-    const boundary = observation.boundary(moves)
-    expect(boundary).toEqual({ nodeSetChanged: true, drainEndAt: 3000 })
-    for (const move of moves) expect(moveProblems({ ...move, ...boundary })).toEqual([])
-  })
-
-  it('rejects a late destination using the shared rebalance log', async () => {
-    const observation = new FetcherRecreations()
-    await fetch(1, 1)
-    await fetch(2, 1)
-    jest.advanceTimersByTime(200)
-    answer(1, 1)
-    answer(2, 1)
-    observation.logCreator(5)({
-      namespace: 'FetchManager',
-      log: { message: 'Rebalancing fetchers...' },
-    })
-    jest.advanceTimersByTime(10)
-    await fetch(1, 2)
-    jest.advanceTimersByTime(2790)
-    answer(1, 2)
+  it('traces the Fetches of each node in a window with what they asked for and what came back', async () => {
+    const targets = [
+      { label: 'moved', topic: TOPIC },
+      { label: 'other', topic: 'other-topic' },
+    ]
+    await fetchOf(1, 1, [TOPIC])
     jest.advanceTimersByTime(100)
-    await fetch(2, 2)
+    answerWith(1, 1, 6)
+    await fetchOf(2, 1, ['other-topic'])
+    jest.advanceTimersByTime(900)
+    await fetchOf(1, 2, [TOPIC, 'other-topic'])
 
-    const moves = [210, 3100].map((nextAt) => ({ ...idle, routeAt: 100, errorAt: 100, nextAt }))
-    const boundary = observation.boundary(moves)
-    expect(boundary).toEqual({ nodeSetChanged: true, drainEndAt: 200 })
-    for (const move of moves) {
-      expect(moveProblems({ ...move, ...boundary })).toEqual(
-        move.nextAt === 210 ? [] : ['the fetchers started more than a round after the drain']
-      )
-    }
+    expect(await wire.fetchTrace({ from: 50, to: 1000, targets })).toEqual({
+      rows: [
+        { node: 2, at: 100, answeredAt: null, asked: ['other'], errors: {} },
+        { node: 1, at: 1000, answeredAt: null, asked: ['moved', 'other'], errors: {} },
+      ],
+      dropped: 0,
+    })
+    const [first] = (await wire.fetchTrace({ from: 0, to: 0, targets })).rows
+    expect(first).toEqual({
+      node: 1,
+      at: 0,
+      answeredAt: 100,
+      asked: ['moved'],
+      errors: { moved: 6 },
+    })
   })
 
-  it('keeps strict bounds when no rebalance log was observed', () => {
-    const moves = [{ ...idle, errorAt: 100, routeAt: 100, nextAt: 3010 }]
-    const boundary = new FetcherRecreations().boundary(moves)
-    expect(boundary).toEqual({ nodeSetChanged: false, drainEndAt: null })
-    expect(moveProblems({ ...moves[0], ...boundary })).toEqual([
-      'the idle route took longer than a round',
-    ])
+  it('keeps a bounded number of trace rows and counts the rest', async () => {
+    for (let n = 1; n <= MAX_TRACE_ROWS + 3; n++) await fetchOf(1, n, [TOPIC])
+
+    const { rows, dropped } = await wire.fetchTrace({ from: 0, to: 0, targets: [] })
+
+    expect(rows).toHaveLength(MAX_TRACE_ROWS)
+    expect(dropped).toBe(3)
   })
 
   it('selects the first Metadata route when answers arrive out of request order', async () => {

@@ -1,7 +1,11 @@
+/** The most recreation times one observation keeps; later ones are counted, never stored. */
+const MAX_TIMES = 100
+
 /**
  * Observes one consumer client's completed fetcher drains through its public log creator.
  * Each instance belongs to one Kafka client; other clients must use their own creator.
- * Only the recreation boundary is retained, so DEBUG traffic cannot inflate evidence.
+ * Only the recreation times are retained, so DEBUG traffic cannot inflate evidence. The times are
+ * a diagnostic: no bound of the routing oracle reads them.
  */
 class FetcherRecreations {
   /**
@@ -10,7 +14,9 @@ class FetcherRecreations {
    */
   constructor(now = () => performance.now()) {
     this.now = now
+    /** @type {number[]} when each recreation was logged, oldest first, at most `MAX_TIMES` */
     this.times = []
+    this.dropped = 0
     this.logCreator = this.logCreator.bind(this)
   }
 
@@ -21,24 +27,20 @@ class FetcherRecreations {
    */
   logCreator(level) {
     return ({ namespace, log }) => {
-      if (namespace === 'FetchManager' && log.message === 'Rebalancing fetchers...') {
-        this.times.push(this.now())
-      }
+      if (namespace !== 'FetchManager' || log.message !== 'Rebalancing fetchers...') return
+      if (this.times.length < MAX_TIMES) this.times.push(this.now())
+      else this.dropped += 1
     }
   }
 
   /**
-   * Selects one shared recreation boundary after the loss and before every destination starts.
-   * Multiple destinations in one episode use this same value. No log keeps strict oracle bounds.
-   * @param {Array<{errorAt: number, nextAt: number}>} moves destinations of one move episode
-   * @returns {{nodeSetChanged: boolean, drainEndAt: number|null}} explicit observation
+   * @param {number} at `performance.now()` of the earliest recreation wanted
+   * @returns {{ times: number[], dropped: number }} every recreation from `at` on, and how many
+   *   later ones the cap discarded
    */
-  boundary(moves) {
-    const loss = Math.max(...moves.map(({ errorAt }) => errorAt))
-    const first = Math.min(...moves.map(({ nextAt }) => nextAt))
-    const drainEndAt = this.times.find((at) => at > loss && at < first) ?? null
-    return { nodeSetChanged: drainEndAt !== null, drainEndAt }
+  since(at) {
+    return { times: this.times.filter((time) => time >= at), dropped: this.dropped }
   }
 }
 
-module.exports = { FetcherRecreations }
+module.exports = { FetcherRecreations, MAX_TIMES }
