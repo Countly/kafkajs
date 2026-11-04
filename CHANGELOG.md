@@ -156,7 +156,7 @@ Versions before 3.0.0 are internal alpha tags and are not published.
 
 - Validate Fetch-session measurements against independent frames and real batch/message counts.
 
-- Add replayable consumer fault schedules, generated manual, rebalance-hook, forced-close and fetch-session lifecycle cases, and the `soak:consumer-churn` profile with independent log, broker-offset and handler checks, resource baselines and delivery-gap samples.
+- Add replayable consumer fault schedules, generated manual, rebalance-hook, forced-close and fetch-session lifecycle cases, and the `soak:consumer-churn` profile with independent log, broker-offset and handler checks, resource baselines and delivery-gap samples; named-topic soak subscriptions retry transient metadata propagation for up to five seconds.
 - The lifecycle matrix and consumer schedule specs fake the imported and the global monotonic clock together, so they pass late in a long-lived Jest worker; forced-close cells now exercise a real zero-timeout force. No library behaviour changed.
 - The `soak:producer-churn` durability check keys its duplicate detection on each record's raw identity (partition, producer id, epoch, sequence) in a fixed table sized from the offered-record bound, instead of at most 64 producer identities, so a run with many legitimate epoch bumps is checked in full rather than failing on table capacity.
 
