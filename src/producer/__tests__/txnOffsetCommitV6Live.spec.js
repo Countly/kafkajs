@@ -171,12 +171,12 @@ describeTxnOffsetCommitV6('Producer > TxnOffsetCommit v6 (live)', () => {
    */
   const readValues = async ({ readUncommitted = false } = {}) => {
     const readerGroup = `${groupId}-reader-${secureRandom()}`
+    groups.add(readerGroup)
     const reader = await connected(kafka.consumer({ groupId: readerGroup, readUncommitted }))
     const values = []
     await reader.subscribe({ topics: [topic], fromBeginning: true })
     await reader.run({ eachMessage: async ({ message }) => values.push(message.value.toString()) })
     expect(await waitFor(() => values.includes(SENTINEL))).toBe(true)
-    groups.add(readerGroup)
     return values.filter((value) => value !== SENTINEL)
   }
 
@@ -237,7 +237,15 @@ describeTxnOffsetCommitV6('Producer > TxnOffsetCommit v6 (live)', () => {
     for (const client of clients.reverse()) {
       await cleanup(() => withDeadline(client.disconnect(), CLEANUP_STEP_MS))
     }
-    await cleanup(() => withDeadline(admin.deleteGroups([...groups]), CLEANUP_STEP_MS))
+    // A group that never formed is already absent (69); any other refusal fails the cleanup.
+    await cleanup(() =>
+      withDeadline(
+        admin.deleteGroups([...groups]).catch((error) => {
+          if (!error.groups?.every(({ errorCode }) => errorCode === 69)) throw error
+        }),
+        CLEANUP_STEP_MS
+      )
+    )
     await cleanup(() => withDeadline(admin.deleteTopics({ topics: [topic] }), CLEANUP_STEP_MS))
     await cleanup(() => withDeadline(producer.disconnect(), CLEANUP_STEP_MS))
     await cleanup(() => withDeadline(admin.disconnect(), CLEANUP_STEP_MS))
@@ -259,6 +267,7 @@ describeTxnOffsetCommitV6('Producer > TxnOffsetCommit v6 (live)', () => {
       const handled = []
       let joined = false
       const sentinelProducer = await connected(kafka.producer())
+      groups.add(groupId)
       const consumer = await connected(
         kafka.consumer({ groupId, maxWaitTimeInMs: 100, sessionTimeout: 30000 })
       )
@@ -271,7 +280,6 @@ describeTxnOffsetCommitV6('Producer > TxnOffsetCommit v6 (live)', () => {
         eachMessage: async ({ message }) => handled.push(message.value.toString()),
       })
       expect(await waitFor(() => joined)).toBe(true)
-      groups.add(groupId)
       const baseline = await committedOffset()
       expect(baseline).toEqual('-1')
 
