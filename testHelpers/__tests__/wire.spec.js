@@ -31,6 +31,7 @@ const structured = (folder, version, direction) => {
  * `expected`, whose fields come from the Java generator's constructors.
  */
 const STRUCTURED = [
+  ['apiVersionsV5', 'apiVersions', 'ApiVersions', 5],
   ['describeProducersV0', 'describeProducers', 'DescribeProducers', 0],
   ['describeTransactionsV0', 'describeTransactions', 'DescribeTransactions', 0],
   ['listTransactionsV0', 'listTransactions', 'ListTransactions', 0],
@@ -293,6 +294,12 @@ describe('wire pairs with bytes fields', () => {
  * the vector's values and wrong for any other (a swapped pair of equal strings, a fixed width).
  */
 const VARIED = [
+  [
+    'apiVersionsV5',
+    'apiVersions/v5/response',
+    { apiKeys: [{ apiKey: 3, minVersion: 12, maxVersion: 12 }], throttleTime: 7 },
+    { apiVersions: [{ apiKey: 3, minVersion: 12, maxVersion: 12 }], clientSideThrottleTime: 7 },
+  ],
   [
     'apiVersionsV4',
     'apiVersions/v4/response',
@@ -674,6 +681,45 @@ const VARIED = [
     { errorCode: 58, errorMessage: 'bad', sessionLifetimeMs: '7' },
   ],
 ]
+
+describe('ApiVersions v5 pair', () => {
+  const pair = require('../wire/apiVersionsV5')
+  const unsupported = load(
+    'apiVersions/fixtures/java/apiVersionsResponse-v0-unsupportedVersion.json'
+  )
+
+  test('builds the bytes of the v0-shaped UNSUPPORTED_VERSION answer Java writes at version 0', () => {
+    expect(pair.buildUnsupportedVersionResponse(unsupported.fields).toString('hex')).toBe(
+      unsupported.hex
+    )
+    expect(pair.buildUnsupportedVersionResponse().toString('hex')).toBe(unsupported.hex)
+  })
+
+  test('answers an older broker’s range, not a fixed one', () => {
+    const body = pair.buildUnsupportedVersionResponse({
+      apiKeys: [{ apiKey: 18, minVersion: 0, maxVersion: 3 }],
+    })
+
+    expect(body.toString('hex')).toBe(
+      '0023' + // UNSUPPORTED_VERSION
+        '00000001' + // one entry, in a classic array
+        '0012' +
+        '0000' +
+        '0003' // ApiVersions, 0 to 3
+    )
+  })
+
+  test('reads the cluster id and node id of a request, which a v4 request does not carry', () => {
+    const request = load('apiVersions/fixtures/java/apiVersionsRequest-v5-known.json')
+
+    expect(pair.readRequest(bytesOf(request))).toEqual({
+      clientSoftwareName: 'countly-kafkajs',
+      clientSoftwareVersion: '3.0.0-alpha.4',
+      clusterId: 'test-cluster-id',
+      nodeId: 2,
+    })
+  })
+})
 
 describe('builders agree with the client’s decoder on fields the vectors do not hold', () => {
   test.each(VARIED)('%s', async (name, decoder, fields, decoded) => {

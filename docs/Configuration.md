@@ -489,6 +489,13 @@ new Kafka({
 
   With `'none'`, none of the above happen: a `REBOOTSTRAP_REQUIRED` response surfaces as the
   non-retriable `KafkaJSProtocolError` it already is, restoring the pre-3.0 behavior.
+
+  The second trigger also covers ApiVersions v5, which Kafka 4.4 brokers offer (KIP-1242): once
+  the client knows the cluster and a node, its ApiVersions request names the intended cluster id
+  and node id together, and a broker that is not that node answers `REBOOTSTRAP_REQUIRED`.
+  Bootstrap requests use no identity. `'none'` sends neither id and disables rebootstrap on
+  `REBOOTSTRAP_REQUIRED`; a returned protocol error still fails the request. Older brokers answer
+  the first request with `UNSUPPORTED_VERSION` and complete ApiVersions v4 negotiation.
 - `metadataRecoveryRebootstrapTriggerMs`: how long metadata must fail continuously before trigger
   1 above fires. Defaults to `300000` (5 minutes, matching the Java client). Must be an integer
   **≥ 1** — `0` is rejected rather than meaning "rebootstrap immediately": at `0` the trigger would

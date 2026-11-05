@@ -52,7 +52,7 @@ const COUNTS = {
   describeUserScramCredentials: 1,
   expireDelegationToken: 2,
   renewDelegationToken: 2,
-  apiVersions: 9,
+  apiVersions: 14,
   consumerGroupDescribe: 4,
   consumerGroupHeartbeat: 8,
   createAcls: 5,

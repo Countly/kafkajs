@@ -40,6 +40,24 @@ const hasBrokerMoved = (broker, { host, port }) =>
  */
 const guardArgs = (fence) => (fence ? [{ guard: fence.guard }] : [])
 
+/**
+ * The lifecycle a recovery checks, rebuilt from the private pre-write check a broker was called
+ * with: a broker is handed `fence.guard` and nothing else. It answers only `closed` and `check()`,
+ * all a rebootstrap asks of its fence, and keeps `guard` so recoveries of one lifecycle share.
+ * @param {() => Error|null} guard the check the failed `connect()` was called with
+ * @returns {{ guard: () => Error|null, closed: boolean, check: () => void }}
+ */
+const fenceOf = (guard) => ({
+  guard,
+  get closed() {
+    return Boolean(guard())
+  },
+  check() {
+    const refusal = guard()
+    if (refusal) throw refusal
+  },
+})
+
 // Bounds the `.cause` walk below: no currently-reachable chain is anywhere near this deep, so it
 // only guards against a future, accidentally self-referential `cause` looping forever.
 const MAX_CAUSE_CHAIN_DEPTH = 10
@@ -85,8 +103,10 @@ module.exports = class BrokerPool {
    * @param {number} [options.authenticationTimeout]
    * @param {number} [options.metadataMaxAge]
    * @param {'rebootstrap'|'none'} [options.metadataRecoveryStrategy='rebootstrap'] KIP-899/1102:
-   *   `'rebootstrap'` enables all three triggers in `refreshMetadata`/`findConnectedBroker`;
-   *   `'none'` disables them and leaves `REBOOTSTRAP_REQUIRED` (129) as a plain protocol error.
+   *   `'rebootstrap'` enables all three triggers in `refreshMetadata`/`findConnectedBroker`, and
+   *   the same recovery on a `REBOOTSTRAP_REQUIRED` answer to ApiVersions (KIP-1242);
+   *   `'none'` disables them, sends no cluster or node id in ApiVersions and leaves
+   *   `REBOOTSTRAP_REQUIRED` (129) as a plain protocol error.
    * @param {number} [options.metadataRecoveryRebootstrapTriggerMs=300000] how long metadata must
    *   fail *continuously* (trigger (a)) before a rebootstrap fires.
    */
@@ -124,12 +144,27 @@ module.exports = class BrokerPool {
     this.setupStates = null
     this.setupMetadataEndpoints = new Map()
 
-    this.createBroker = (options) =>
-      new Broker({
+    /**
+     * Every broker of this pool is built here, so each one names the identity the pool currently
+     * holds in its ApiVersions requests, follows the pool's recovery strategy and reports a
+     * REBOOTSTRAP_REQUIRED answer to `onApiVersionsFailure`.
+     * @param {object} options the `Broker` options the call site chooses
+     * @returns {Broker}
+     */
+    this.createBroker = (options) => {
+      const broker = new Broker({
         allowAutoTopicCreation,
         authenticationTimeout,
+        metadataRecoveryStrategy: this.metadataRecoveryStrategy,
+        metadataIdentity: () => ({
+          clusterId: this.metadata?.clusterId ?? null,
+          nodeId: broker.nodeId ?? -1,
+        }),
+        onApiVersionsFailure: (error, source) => this.onApiVersionsFailure(error, source),
         ...options,
       })
+      return broker
+    }
 
     this.brokers = {}
     /** @type {Broker | undefined} */
@@ -147,6 +182,9 @@ module.exports = class BrokerPool {
 
     this.metadataRecoveryStrategy = metadataRecoveryStrategy ?? 'rebootstrap'
     this.metadataRecoveryRebootstrapTriggerMs = metadataRecoveryRebootstrapTriggerMs ?? 300000
+
+    /** Failures `onApiVersionsFailure` already recovered from, so a surrounding catch skips them. */
+    this.recoveredFailures = new WeakSet()
 
     /** Set at the first failed metadata attempt following a success; cleared on any success. */
     this.metadataUnavailableSince = null
@@ -193,7 +231,7 @@ module.exports = class BrokerPool {
         this.logger.warn('Rebootstrapping the client from the configured broker list', { reason })
         this.emit(CLUSTER_REBOOTSTRAP, { reason })
       },
-      (reason, { fence } = {}) => fence
+      (reason, { fence } = {}) => fence?.guard ?? fence
     )
   }
 
@@ -980,7 +1018,7 @@ module.exports = class BrokerPool {
    * @returns {Promise<void>}
    */
   async onMetadataFailure(e, { fence } = {}) {
-    if (this.metadataRecoveryStrategy !== 'rebootstrap') {
+    if (this.metadataRecoveryStrategy !== 'rebootstrap' || this.recoveredFailures.has(e)) {
       return
     }
 
@@ -1018,6 +1056,49 @@ module.exports = class BrokerPool {
 
     if (now - this.metadataUnavailableSince >= this.metadataRecoveryRebootstrapTriggerMs) {
       await this.rebootstrap('timeout', { fence })
+    }
+  }
+
+  /**
+   * The one owner of a REBOOTSTRAP_REQUIRED answer to an ApiVersions request (KIP-1242), whether the
+   * request was a connection's negotiation or a fresh `apiVersions()` read. It runs the same
+   * recovery as a metadata failure of that kind, once per error: the error is then thrown on to
+   * its caller, and a metadata or connect catch that meets it again does nothing. Recovery is
+   * skipped when the broker no longer owns the pool the request went out on, or is no longer in
+   * this pool's tables, so an answer that outlived its broker never touches the replacement.
+   *
+   * A recovery that fails is logged and never rejects: the caller is already failing with the
+   * answer itself, which is the error it should see.
+   *
+   * A request made for a producer lifecycle (`guard`) is recovered under it, like a fenced metadata
+   * refresh: a lifecycle that closed, now or while the seed resolves, stops the recovery before it
+   * replaces the seed or publishes anything.
+   *
+   * @private
+   * @param {Error} error the typed REBOOTSTRAP_REQUIRED error
+   * @param {{broker: Broker, pool: import("../network/connectionPool"), guard?: () => Error|null}} source
+   *   the broker that sent the request, the pool it was sent on, and the lifecycle check the
+   *   request was made under, if any
+   * @returns {Promise<void>}
+   */
+  async onApiVersionsFailure(error, { broker, pool, guard }) {
+    const current =
+      !broker.retired &&
+      broker.connectionPool === pool &&
+      (broker === this.seedBroker || values(this.brokers).includes(broker))
+    if (!current) {
+      return
+    }
+
+    try {
+      await this.onMetadataFailure(error, { fence: guard && fenceOf(guard) })
+      this.recoveredFailures.add(error)
+    } catch (recoveryError) {
+      try {
+        this.logger.warn('Rebootstrap after an ApiVersions answer failed', {
+          error: describeThrown(recoveryError),
+        })
+      } catch {}
     }
   }
 

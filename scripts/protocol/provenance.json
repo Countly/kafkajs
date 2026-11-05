@@ -273,8 +273,56 @@
       "Request": "22d9d577e79f6088f3cc3a23f88bf7536021473f7ebbc1ccfe7ddd14035df18d",
       "Response": "ddd7e266763919dd68dbd900b6f8521bc5316cf2ea3ffefeeee99d3f91d68428"
     },
-    "javaClientsJar": "4.3.1",
+    "javaClientsJar": null,
     "javaVectors": [
+      {
+        "file": "src/protocol/requests/apiVersions/fixtures/java/apiVersionsRequest-v5-defaults.json",
+        "javaClientsJar": "4.4.0",
+        "javaClientsJarSha256": "1ab07317eb6633241392449d329dbdc5d9251e6ffc4926860f42dd966e88bdf9",
+        "fixtureSha256": "bc5c1cd121f325dc633422a71c0eeff2679aee33ee7f2dd151be9a4f9df62eab"
+      },
+      {
+        "file": "src/protocol/requests/apiVersions/fixtures/java/apiVersionsRequest-v5-known.json",
+        "javaClientsJar": "4.4.0",
+        "javaClientsJarSha256": "1ab07317eb6633241392449d329dbdc5d9251e6ffc4926860f42dd966e88bdf9",
+        "fixtureSha256": "b6b915d7575bcf0a2ea9391c3f0a281d5182458903235511ed28269a8b72b2e0"
+      },
+      {
+        "file": "src/protocol/requests/apiVersions/fixtures/java/apiVersionsRequest-v5-nonAscii.json",
+        "javaClientsJar": "4.4.0",
+        "javaClientsJarSha256": "1ab07317eb6633241392449d329dbdc5d9251e6ffc4926860f42dd966e88bdf9",
+        "fixtureSha256": "49d56f9674cbd818efc21655649ed23e6e8e73800a96af863e5acdbd2dc97a55"
+      },
+      {
+        "file": "src/protocol/requests/apiVersions/fixtures/java/apiVersionsResponse-v0-unsupportedVersion.json",
+        "javaClientsJar": "4.4.0",
+        "javaClientsJarSha256": "1ab07317eb6633241392449d329dbdc5d9251e6ffc4926860f42dd966e88bdf9",
+        "fixtureSha256": "4f8fe0b76992258cf0f3dc0a2c9105f5b4e1c9644c754ee7db6144a876a55584"
+      },
+      {
+        "file": "src/protocol/requests/apiVersions/fixtures/java/apiVersionsResponse-v5-features0.json",
+        "javaClientsJar": "4.4.0",
+        "javaClientsJarSha256": "1ab07317eb6633241392449d329dbdc5d9251e6ffc4926860f42dd966e88bdf9",
+        "fixtureSha256": "3137d53bc55dec024ab5d721c8142793832c02475067e25e185eda9aadb484bf"
+      },
+      {
+        "file": "src/protocol/requests/apiVersions/fixtures/java/apiVersionsResponse-v5-ok.json",
+        "javaClientsJar": "4.4.0",
+        "javaClientsJarSha256": "1ab07317eb6633241392449d329dbdc5d9251e6ffc4926860f42dd966e88bdf9",
+        "fixtureSha256": "36bf620d0821c060454e1339dbedae3629166b1292f9a524e70e0ee5f7b7d6f8"
+      },
+      {
+        "file": "src/protocol/requests/apiVersions/fixtures/java/apiVersionsResponse-v5-rebootstrapRequired.json",
+        "javaClientsJar": "4.4.0",
+        "javaClientsJarSha256": "1ab07317eb6633241392449d329dbdc5d9251e6ffc4926860f42dd966e88bdf9",
+        "fixtureSha256": "624177c609095f44e8a726f8400f1aab872c34bf2f1e7f7642dacabc5c0a2b3f"
+      },
+      {
+        "file": "src/protocol/requests/apiVersions/fixtures/java/apiVersionsResponse-v5-unknownTags.json",
+        "javaClientsJar": "4.4.0",
+        "javaClientsJarSha256": "1ab07317eb6633241392449d329dbdc5d9251e6ffc4926860f42dd966e88bdf9",
+        "fixtureSha256": "8bc35ef4cbb5c03351d12578a49cfb34227fce09c847a5f0b4d6c3ef6ba14484"
+      },
       {
         "file": "src/protocol/requests/apiVersions/fixtures/v3_request_java.json",
         "javaClientsJar": "4.3.1",

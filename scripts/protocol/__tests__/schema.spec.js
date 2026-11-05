@@ -214,6 +214,8 @@ describe('scripts/protocol > schema validation', () => {
       'src/protocol/requests/apiVersions/v3/response.js',
       'src/protocol/requests/apiVersions/v4/request.js',
       'src/protocol/requests/apiVersions/v4/response.js',
+      'src/protocol/requests/apiVersions/v5/request.js',
+      'src/protocol/requests/apiVersions/v5/response.js',
       'src/protocol/requests/consumerGroupDescribe/v0/request.js',
       'src/protocol/requests/consumerGroupDescribe/v0/response.js',
       'src/protocol/requests/consumerGroupDescribe/v1/request.js',

@@ -49,7 +49,7 @@
       "since": "2026-10-13"
     },
     "ApiVersions": {
-      "note": "v0-v3 omit every SupportedFeatures entry whose MinVersion is 0 (KAFKA-17011, fixed in v4 / Kafka 3.9), so a v3-only client sees a truncated feature list. The client asks for v4 first; a broker that does not support it answers UNSUPPORTED_VERSION with the versions it has, and the client asks again at the highest one both sides implement (only a broker below 3.9 does this, and the 4.0 floor excludes them).",
+      "note": "v0-v3 omit every SupportedFeatures entry whose MinVersion is 0 (KAFKA-17011, fixed in v4 / Kafka 3.9), so a v3-only client sees a truncated feature list. v5 (Kafka 4.4, KIP-1242) adds the intended ClusterId and NodeId to the request and the REBOOTSTRAP_REQUIRED answer. The client asks for v5 first and names the identity only once it knows both the cluster and the node; a broker that does not support v5 answers UNSUPPORTED_VERSION with the versions it has, and the client asks again at the highest one both sides implement (every broker below 4.4 does this and completes v4).",
       "since": "2026-10-13"
     },
     "CreateTopics": {

@@ -174,7 +174,7 @@ describe('Broker > finalized features', () => {
 
   test('a broker that only answers ApiVersions v2 finalizes nothing', async () => {
     const { broker } = build(({ apiVersion }) =>
-      apiVersion === 4 ? classicBody(UNSUPPORTED_VERSION, 2) : classicBody(0, 2)
+      apiVersion === 5 ? classicBody(UNSUPPORTED_VERSION, 2) : classicBody(0, 2)
     )
 
     await broker.connect()

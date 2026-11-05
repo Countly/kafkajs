@@ -190,6 +190,8 @@ Versions before 3.0.0 are internal alpha tags and are not published.
 
 - SCRAM authentication refuses a non-extending nonce, a non-integer or above-1 048 576 iteration count, and compares the server signature in constant time.
 
+- Against Kafka 4.4 brokers ApiVersions v5 checks the cluster and node ids (KIP-1242); `metadataRecoveryStrategy: 'none'` turns it off.
+
 #### Fixes
 
 - `KafkaJSNumberOfRetriesExceeded` names itself on the first line of its stack. It printed `KafkaJSNonRetriableError` there, its parent class, because the name was assigned after the stack was built (also in kafkajs 2.2.4).
@@ -245,6 +247,7 @@ Versions before 3.0.0 are internal alpha tags and are not published.
 - The Java message-vector generator targets the Kafka 4.4 client API, and `test:e2e:delete-groups-v3` runs `deleteGroupsV3Live.spec.js` (`DELETE_GROUPS_V3_E2E`) against the broker version under test.
 - The 4.0 floor set covers the admin ledger, connection, OAuth, GSSAPI and delegation-token capabilities and asserts the unsupported results.
 - `test:e2e:rack-aware-producer` runs `rackAwareProducerLive.spec.js` (`RACK_AWARE_PRODUCER_E2E`) on `docker-compose.racks.yml`; the consumer's `test:e2e:rack-aware` is a separate script and flag.
+- The scripted cluster answers a client's ApiVersions v5 request as a Kafka 4.3 broker does, with a v0-shaped UNSUPPORTED_VERSION, so the inherited scenarios negotiate v4 as they did. It leaves out of `requests()` only one refusal per negotiation, a socket's first request or the renegotiation after the client opened another socket to the node; a second negotiation on an unchanged connection stays visible. `apiVersionTrace()` lists every one, and `test:e2e:api-identity` runs `apiVersionsIdentityLive.spec.js` (`API_IDENTITY_E2E`) against the broker version under test.
 
 ### Phase 9B — Producer parity: delivery deadline, memory bound, request size, partitioner, codecs, lifecycle
 

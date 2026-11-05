@@ -443,6 +443,31 @@ module.exports = {
       finalizedFeatures: [{ name: 'metadata.version', minVersionLevel: 1, maxVersionLevel: 25 }],
     },
   },
+  apiVersionsV5: {
+    source:
+      'apiVersions() in GenerateMessageVectors.java (kafka-clients 4.4.0); the structured vectors apiVersionsRequest-v5-* and apiVersionsResponse-v5-*',
+    request: {
+      clientSoftwareName: 'countly-kafkajs',
+      clientSoftwareVersion: '3.0.0-alpha.4',
+      clusterId: null,
+      nodeId: -1,
+    },
+    response: {
+      errorCode: 0,
+      apiKeys: [
+        { apiKey: 0, minVersion: 3, maxVersion: 13 },
+        { apiKey: 18, minVersion: 0, maxVersion: 5 },
+      ],
+      throttleTime: 0,
+      supportedFeatures: [{ name: 'metadata.version', minVersion: 1, maxVersion: 25 }],
+      finalizedFeaturesEpoch: '7',
+      finalizedFeatures: [{ name: 'metadata.version', minVersionLevel: 1, maxVersionLevel: 25 }],
+    },
+    unsupportedVersion: {
+      errorCode: 35,
+      apiKeys: [{ apiKey: 18, minVersion: 0, maxVersion: 4 }],
+    },
+  },
 
   metadataV13: {
     source: 'buildMetadataRequest l.323, buildMetadataResponse l.352',

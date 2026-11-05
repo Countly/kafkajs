@@ -147,7 +147,10 @@ test('public calls traverse negotiated bytes on the strict socket seam', async (
       validateOnly: true,
     })
     expect(updated[0].errorCode).toBe(0)
-    const before = wire.requests().filter((r) => r.api === 'ApiVersions').length
+    // A fresh read on a connection that has negotiated asks v5 (a v4 broker refuses it), then v4.
+    const answered = () =>
+      wire.requests().filter((r) => r.api === 'ApiVersions' && r.version === 4).length
+    const before = answered()
     wire.answer('ApiVersions', () => ({
       ...wire.apiVersionsAnswer(),
       supportedFeatures: [{ name: 'metadata.version', minVersion: 1, maxVersion: 25 }],
@@ -158,7 +161,7 @@ test('public calls traverse negotiated bytes on the strict socket seam', async (
     expect(fresh.finalizedFeaturesEpoch).toBe('9007199254740993')
     expect(fresh.finalizedFeatures['metadata.version'].maxVersionLevel).toBe(25)
     await admin.describeFeatures()
-    expect(wire.requests().filter((r) => r.api === 'ApiVersions').length).toBe(before + 2)
+    expect(answered()).toBe(before + 2)
     const described = await admin.describeCluster({ includeFencedBrokers: true })
     expect(described.brokers[0].fenced).toBe(true)
     const listed = await admin.listConfigResources({ resourceTypes: [16] })
