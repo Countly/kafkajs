@@ -43,6 +43,16 @@ class AdminCleanupStack extends CleanupStack {
 /** Where raw receipts go when no guarded run directory is supplied; the gate uploads it. */
 const DEFAULT_RECEIPT_DIR = path.join('.tmp', 'e2e')
 
+/** The event-loop resource types a finished scenario must hand back as it found them. */
+const HELD_RESOURCES = ['Timeout', 'TCPSocketWrap', 'TCPServerWrap']
+
+/**
+ * Loop turns a destroyed handle gets to finish closing before it counts as retained. A closed
+ * socket or server stays in `process.getActiveResourcesInfo()` until its close callback has run,
+ * which is after the turn that destroyed it, so a count taken in that turn still holds it.
+ */
+const CLOSE_TURNS = 10
+
 /**
  * Owns one admin scenario, its absolute budget, clients and reverse-order restoration.
  * The scenario runs under a reviewed guard when `P9_CLUSTER_GUARD` and `P9_CLUSTER_MANIFEST` are
@@ -475,6 +485,36 @@ class AdminLiveProbe {
   }
 
   /**
+   * Compares what the scenario holds now with its baseline: open sockets, abort listeners on the
+   * owner signal and the event-loop resources of `HELD_RESOURCES`. A difference gets up to
+   * `CLOSE_TURNS` loop turns to disappear, because a handle the scenario already destroyed is
+   * still counted until the loop has run its close callback.
+   * @param {number} signalListeners abort listeners the owner signal had at the baseline
+   * @returns {Promise<string[]>} one `<name> (baseline <n>, after <m>)` entry per count that still
+   *   differs; counts only, never values
+   */
+  async retainedResources(signalListeners) {
+    let retained = []
+    for (let turn = 0; turn < CLOSE_TURNS; turn++) {
+      await new Promise((resolve) => setImmediate(resolve))
+      const after = await this.resourceProbe.snapshot()
+      retained = [
+        ['open sockets', this.baseline.sockets.open, after.sockets.open],
+        ['abort listeners', signalListeners, getEventListeners(this.signal, 'abort').length],
+        ...HELD_RESOURCES.map((key) => [
+          key,
+          this.baseline.activeResources[key] || 0,
+          after.activeResources[key] || 0,
+        ]),
+      ]
+        .filter(([, before, now]) => before !== now)
+        .map(([name, before, now]) => `${name} (baseline ${before}, after ${now})`)
+      if (!retained.length) break
+    }
+    return retained
+  }
+
+  /**
    * Runs work and every restoration within the inclusive deadline, preserving its primary failure.
    * @template T
    * @param {() => Promise<T>} work complete scenario body
@@ -507,16 +547,9 @@ class AdminLiveProbe {
       }
     }
     for (const credential of this.credentials) if (Buffer.isBuffer(credential)) credential.fill(0)
-    await new Promise((resolve) => setImmediate(resolve))
-    const after = await this.resourceProbe.snapshot()
-    if (
-      after.sockets.open !== this.baseline.sockets.open ||
-      getEventListeners(this.signal, 'abort').length !== signalListeners ||
-      ['Timeout', 'TCPSocketWrap', 'TCPServerWrap'].some(
-        (key) => (after.activeResources[key] || 0) !== (this.baseline.activeResources[key] || 0)
-      )
-    ) {
-      const error = new Error('Scenario retained resources')
+    const retained = await this.retainedResources(signalListeners)
+    if (retained.length) {
+      const error = new Error(`Scenario retained resources: ${retained.join('; ')}`)
       errors.push(error)
       liveRun.taint(error)
     }

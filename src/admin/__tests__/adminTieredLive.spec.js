@@ -96,6 +96,7 @@ suite('admin configured remote storage', () => {
         const compactUuid = Buffer.from(uuid.replaceAll('-', ''), 'hex').toString('base64url')
         const partitionDirectories = [`${topic}-0-${uuid}`, `${topic}-0-${compactUuid}`]
         const localRoot = `/tmp/kraft-combined-logs/${topic}-0`
+        // The broker image has BusyBox `find`, which has no -printf; `stat` prints each size.
         const files = async (directory) =>
           (
             await probe.host('kafka1', [
@@ -105,16 +106,20 @@ suite('admin configured remote storage', () => {
               'f',
               '-name',
               '*.log',
-              '-printf',
-              '%p\t%s\n',
+              '-exec',
+              'stat',
+              '-c',
+              '%s %n',
+              '{}',
+              ';',
             ])
           )
             .trim()
             .split('\n')
             .filter(Boolean)
             .map((line) => {
-              const [path, size] = line.split('\t')
-              return { path, size: Number(size) }
+              const space = line.indexOf(' ')
+              return { path: line.slice(space + 1), size: Number(line.slice(0, space)) }
             })
         let snapshot
         await probe.poll(async () => {

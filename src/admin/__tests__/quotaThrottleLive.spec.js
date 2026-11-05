@@ -205,17 +205,39 @@ suite('admin producer quotas', () => {
           })
           return { count, at }
         }
-        const quietBefore = await meter()
+        /**
+         * The leader creates a topic's own meter on its first append, so before the first produce
+         * the JMX tool fails with "No matched attributes"; this waits for the meter to exist.
+         * @returns {Promise<{ count: number, at: number }>} the first reading of the meter
+         * @throws {Error} any failure of the read other than the meter not existing yet
+         */
+        const awaitMeter = async () => {
+          let reading
+          await probe.poll(async () => {
+            try {
+              reading = await meter()
+            } catch (error) {
+              if (!error.message.includes('No matched attributes')) throw error
+              return false
+            }
+            return true
+          }, 1000)
+          return reading
+        }
+        const sendOne = () =>
+          probe.invoke(() =>
+            producer.send({
+              topic,
+              acks: -1,
+              messages: [{ value: Buffer.alloc(1024, 'x'), partition: 0 }],
+            })
+          )
+        expect(await sendOne()).toHaveLength(1)
+        const quietBefore = await awaitMeter()
+        expect(quietBefore.count).toBeGreaterThan(0)
         const quietAfter = await meter()
         expect(quietAfter.count).toBe(quietBefore.count)
-        const positive = await probe.invoke(() =>
-          producer.send({
-            topic,
-            acks: -1,
-            messages: [{ value: Buffer.alloc(1024, 'x'), partition: 0 }],
-          })
-        )
-        expect(positive).toHaveLength(1)
+        expect(await sendOne()).toHaveLength(1)
         const positiveAfter = await meter()
         expect(positiveAfter.count).toBeGreaterThan(quietAfter.count)
         await probe.invoke(removeQuota)

@@ -1,6 +1,7 @@
 const { createHash } = require('crypto')
+const { isDeepStrictEqual } = require('util')
 const { AdminLiveProbe } = require('./fixtures/liveAdmin')
-const { ConfigResourceTypes } = require('../../../index')
+const { ConfigResourceTypes, ConfigSource } = require('../../../index')
 const { liveCase, caseTimeout } = require('../../producer/__tests__/fixtures/bounded')
 
 const suite = process.env.ADMIN_LOGDIRS_E2E ? describe : describe.skip
@@ -67,6 +68,10 @@ suite('admin replica directories', () => {
         const destination = directories.find((directory) => directory !== source)
         expect(destination).not.toBe(source)
         const resource = { type: ConfigResourceTypes.BROKER, name: '1' }
+        /**
+         * The key is dynamic-only, so the broker lists it only while it is set.
+         * @returns {Promise<{ value: string, source: number }|null>} null when no entry is listed
+         */
         const readThrottle = async () => {
           const result = await probe.invoke(() =>
             admin.describeConfigs({ resources: [{ ...resource, configNames: [key] }] })
@@ -75,7 +80,27 @@ suite('admin replica directories', () => {
           const entry = result.resources[0].configEntries.find(
             ({ configName }) => configName === key
           )
-          return { value: entry.configValue, source: entry.configSource }
+          return entry ? { value: entry.configValue, source: entry.configSource } : null
+        }
+        /**
+         * Waits for the broker to apply a change, which reaches it from the metadata log.
+         * @param {{ value: string, source: number }|null} expected the entry to list, or null
+         * @returns {Promise<void>}
+         * @throws {Error} naming the key, the expected entry and the last one read
+         */
+        const awaitThrottle = async (expected) => {
+          let seen
+          await probe
+            .poll(async () => {
+              seen = await readThrottle()
+              return isDeepStrictEqual(seen, expected)
+            })
+            .catch((error) => {
+              throw new Error(
+                `Broker 1 did not list ${key} as ${JSON.stringify(expected)}; last read ${JSON.stringify(seen)}`,
+                { cause: error }
+              )
+            })
         }
         const original = await readThrottle()
         const setThrottle = (value) =>
@@ -87,12 +112,14 @@ suite('admin replica directories', () => {
               },
             ],
           })
-        probe.effects.add('restore replica movement throttle', async () => {
-          probe.items((await setThrottle(original.source === 2 ? original.value : null)).resources)
-          expect(await readThrottle()).toEqual(original)
-        })
+        const restoreThrottle = async () => {
+          const dynamic = original?.source === ConfigSource.DYNAMIC_BROKER_CONFIG
+          probe.items((await setThrottle(dynamic ? original.value : null)).resources)
+          await awaitThrottle(original)
+        }
+        probe.effects.add('restore replica movement throttle', restoreThrottle)
         probe.items((await probe.invoke(() => setThrottle('262144'))).resources)
-        expect((await readThrottle()).value).toBe('262144')
+        await awaitThrottle({ value: '262144', source: ConfigSource.DYNAMIC_BROKER_CONFIG })
         const moves = await probe.invoke(() =>
           admin.alterReplicaLogDirs({ replicas: [{ ...replica, logDir: destination }] })
         )
@@ -155,16 +182,12 @@ suite('admin replica directories', () => {
         expect(copies.some(({ logDir }) => logDir === source)).toBe(false)
         expect(copies.find(({ logDir }) => logDir === destination).isFuture).toBe(false)
         expect(corpus(await probe.physical(topic))).toEqual(before)
-        probe.items(
-          (await probe.invoke(() => setThrottle(original.source === 2 ? original.value : null)))
-            .resources
-        )
-        expect(await readThrottle()).toEqual(original)
+        await restoreThrottle()
         probe.record('replica movement and complete corpus', {
           source,
           destination,
           directoryVersion: version,
-          throttleSourceId: original.source,
+          throttleOriginalPresent: original !== null,
           futureObserved: true,
           currentChanged: true,
           sourceAbsent: true,

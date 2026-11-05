@@ -1,4 +1,5 @@
 const { getEventListeners } = require('events')
+const net = require('net')
 const mockClients = []
 const mockAdminOptions = []
 const mockActions = []
@@ -409,10 +410,74 @@ test('refuses a retained proxy listener resource', async () => {
     snapshot: jest
       .fn()
       .mockResolvedValueOnce({ sockets: { open: 0 }, activeResources: {} })
-      .mockResolvedValueOnce({ sockets: { open: 0 }, activeResources: { TCPServerWrap: 1 } }),
+      .mockResolvedValue({ sockets: { open: 0 }, activeResources: { TCPServerWrap: 1 } }),
   }
   await expect(probe.finish(async () => {})).rejects.toThrow('cleanup')
   expect(liveRun.tainted).toBe(true)
+})
+
+test('names each retained count with its baseline and its value after cleanup', async () => {
+  const { probe, owner } = scenario()
+  const listener = () => {}
+  probe.resourceProbe = {
+    snapshot: jest
+      .fn()
+      .mockResolvedValueOnce({
+        sockets: { open: 1 },
+        activeResources: { Timeout: 2, TCPSocketWrap: 1 },
+      })
+      .mockResolvedValue({
+        sockets: { open: 3 },
+        activeResources: { Timeout: 2, TCPSocketWrap: 4, TCPServerWrap: 1 },
+      }),
+  }
+  try {
+    const error = await probe
+      .finish(async () => {
+        owner.signal.addEventListener('abort', listener)
+      })
+      .catch((thrown) => thrown)
+    expect(error).toBeInstanceOf(AggregateError)
+    expect(error.errors.map(({ message }) => message)).toEqual([
+      'Scenario retained resources: open sockets (baseline 1, after 3); abort listeners (baseline 0, after 1); TCPSocketWrap (baseline 1, after 4); TCPServerWrap (baseline 0, after 1)',
+    ])
+  } finally {
+    owner.signal.removeEventListener('abort', listener)
+  }
+})
+
+test('does not call a handle that is still closing retained, and stops reading once it is gone', async () => {
+  const { probe } = scenario()
+  const baseline = { sockets: { open: 0 }, activeResources: { TCPSocketWrap: 1 } }
+  const closing = { sockets: { open: 0 }, activeResources: { TCPSocketWrap: 2 } }
+  const snapshot = jest
+    .fn()
+    .mockResolvedValueOnce(baseline)
+    .mockResolvedValueOnce(closing)
+    .mockResolvedValueOnce(closing)
+    .mockResolvedValue(baseline)
+  probe.resourceProbe = { snapshot }
+  await expect(probe.finish(async () => 'done')).resolves.toBe('done')
+  expect(snapshot).toHaveBeenCalledTimes(4)
+  expect(liveRun.tainted).toBe(false)
+})
+
+test('accepts a socket and a server that the last cleanup destroyed in the same loop turn', async () => {
+  const { probe } = scenario()
+  await expect(
+    probe.finish(async () => {
+      const server = net.createServer((peer) => peer.destroy())
+      await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve))
+      const socket = net.connect(server.address().port, '127.0.0.1')
+      await new Promise((resolve) => socket.once('connect', resolve))
+      probe.sockets.push(socket)
+      probe.cleanup.add('socket and server', () => {
+        socket.destroy()
+        server.close()
+      })
+    })
+  ).resolves.toBeUndefined()
+  expect(liveRun.tainted).toBe(false)
 })
 
 test('refuses retained owner signal listeners', async () => {

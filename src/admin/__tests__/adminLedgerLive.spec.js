@@ -4,6 +4,7 @@ const { inspect } = require('util')
 const { AdminLiveProbe } = require('./fixtures/liveAdmin')
 const Broker = require('../../broker')
 const Pool = require('../../network/connectionPool')
+const apiKeys = require('../../protocol/requests/apiKeys')
 const { saslBrokers, saslConnectionOpts } = require('testHelpers')
 const { readData } = require('../../producer/__tests__/fixtures/liveProbe')
 const { liveCase, caseTimeout, pollUntil } = require('../../producer/__tests__/fixtures/bounded')
@@ -217,11 +218,11 @@ class AdminLedgerScenario {
       [...this.groupIds].sort()
     )
     const requests = [...p.requests]
-    const findCoordinatorRequests = requests.filter(({ apiName }) => apiName === 'FindCoordinator')
-    const consumerDescribeRequests = requests.filter(
-      ({ apiName }) => apiName === 'ConsumerGroupDescribe'
-    )
-    const classicDescribeRequests = requests.filter(({ apiName }) => apiName === 'DescribeGroups')
+    // Request events name FindCoordinator (key 10) `GroupCoordinator`, so every api is matched by key.
+    const sent = (api) => requests.filter(({ apiKey }) => apiKey === apiKeys[api])
+    const findCoordinatorRequests = sent('GroupCoordinator')
+    const consumerDescribeRequests = sent('ConsumerGroupDescribe')
+    const classicDescribeRequests = sent('DescribeGroups')
     expect(findCoordinatorRequests).toHaveLength(5)
     expect(consumerDescribeRequests).toHaveLength(2)
     expect(classicDescribeRequests).toHaveLength(2)
