@@ -18743,7 +18743,9 @@
         "testHelpers/__tests__/wireOrder.spec.js \u203a connection identity and producer sequence domains accepts a sequence restart when the producer epoch changes",
         "testHelpers/__tests__/wireOrder.spec.js \u203a connection identity and producer sequence domains rejects a Metadata answer that shares an unanswered offset commit correlation id",
         "testHelpers/__tests__/wireOrder.spec.js \u203a connection identity and producer sequence domains rejects a producer sequence gap even when another producer sent the missing number",
-        "testHelpers/__tests__/wireOrder.spec.js \u203a connection identity and producer sequence domains rejects an older connection answer when the current offset commit is unanswered"
+        "testHelpers/__tests__/wireOrder.spec.js \u203a connection identity and producer sequence domains rejects an older connection answer when the current offset commit is unanswered",
+        "src/admin/__tests__/floorConditionalLive.spec.js \u203a Floor conditional expectations reads what each ApiVersions request names and the error code of its own answer",
+        "src/admin/__tests__/floorConditionalLive.spec.js \u203a Floor conditional expectations runs cleanup newest first, continues past a failure and reports only what it could not undo"
       ],
       "capMinutes": 85,
       "allowedSkips": [
@@ -19104,7 +19106,11 @@
         "src/producer/__tests__/transactionVersionLive.spec.js \u203a Producer > transaction protocol versions (live) transaction version 2 a transaction the coordinator aborted on its timeout: version 2 aborts and carries on, version 1 is fenced, and a commit of one is refused under both",
         "src/producer/__tests__/transactionVersionLive.spec.js \u203a Producer > transaction protocol versions (live) transaction version 2 ten transactions in a row: version 2 adopts the epoch each EndTxn returns and restarts sequences at 0, version 1 keeps one epoch and carries the sequences on",
         "src/producer/__tests__/txnOffsetCommitV6Live.spec.js \u203a Producer > TxnOffsetCommit v6 (live) a topic id the cache does not hold keeps the whole offset commit at v5, where the broker offers v6",
-        "src/producer/__tests__/txnOffsetCommitV6Live.spec.js \u203a Producer > TxnOffsetCommit v6 (live) commits offsets at the version the broker offers, only after the transaction commits, and an abort commits nothing"
+        "src/producer/__tests__/txnOffsetCommitV6Live.spec.js \u203a Producer > TxnOffsetCommit v6 (live) commits offsets at the version the broker offers, only after the transaction commits, and an abort commits nothing",
+        "src/admin/__tests__/floorConditionalLive.spec.js \u203a Conditional features on the negotiated floor ApiVersions retains the old identity-free path on the floor",
+        "src/admin/__tests__/floorConditionalLive.spec.js \u203a Conditional features on the negotiated floor Transactional offset commits retain the named-topic path on the floor",
+        "src/admin/__tests__/floorConditionalLive.spec.js \u203a Conditional features on the negotiated floor DeleteGroups retains the old wire contract on the floor",
+        "src/admin/__tests__/floorConditionalLive.spec.js \u203a Conditional features on the negotiated floor Built-in rack selection and custom authority work on the floor"
       ]
     },
     {
@@ -19230,7 +19236,10 @@
       "command": null,
       "needs": {},
       "evidence": [],
-      "titles": [],
+      "titles": [
+        "src/admin/__tests__/floorConditionalLive.spec.js \u203a Floor conditional expectations reads what each ApiVersions request names and the error code of its own answer",
+        "src/admin/__tests__/floorConditionalLive.spec.js \u203a Floor conditional expectations runs cleanup newest first, continues past a failure and reports only what it could not undo"
+      ],
       "capMinutes": 48,
       "allowedSkips": [
         "src/admin/__tests__/adminGroupVisibilityLive.spec.js \u203a Admin > group visibility (live) reports groupType and groupState on every row, for both protocols",
@@ -19283,7 +19292,11 @@
         "src/admin/__tests__/deleteGroupsV3Live.spec.js \u203a Admin > deleteGroups message per group (live) deletes a group whose member has stopped and leaves neither the group nor its commit",
         "src/admin/__tests__/deleteGroupsV3Live.spec.js \u203a Admin > deleteGroups message per group (live) refuses a missing group and a group with a member each under its own id, and leaves the member group as it was",
         "src/admin/__tests__/floorTokensLive.spec.js \u203a Delegation tokens on the negotiated floor creates, describes, renews and expires a delegation token",
-        "src/admin/__tests__/floorTokensLive.spec.js \u203a Delegation tokens on the negotiated floor rejects token administration on a plaintext channel without exposing credentials"
+        "src/admin/__tests__/floorTokensLive.spec.js \u203a Delegation tokens on the negotiated floor rejects token administration on a plaintext channel without exposing credentials",
+        "src/admin/__tests__/floorConditionalLive.spec.js \u203a Conditional features on the negotiated floor ApiVersions retains the old identity-free path on the floor",
+        "src/admin/__tests__/floorConditionalLive.spec.js \u203a Conditional features on the negotiated floor Transactional offset commits retain the named-topic path on the floor",
+        "src/admin/__tests__/floorConditionalLive.spec.js \u203a Conditional features on the negotiated floor DeleteGroups retains the old wire contract on the floor",
+        "src/admin/__tests__/floorConditionalLive.spec.js \u203a Conditional features on the negotiated floor Built-in rack selection and custom authority work on the floor"
       ]
     },
     {
@@ -22567,6 +22580,37 @@
       "titles": [
         "src/producer/__tests__/txnOffsetCommitV6Live.spec.js \u203a Producer > TxnOffsetCommit v6 (live) commits offsets at the version the broker offers, only after the transaction commits, and an abort commits nothing",
         "src/producer/__tests__/txnOffsetCommitV6Live.spec.js \u203a Producer > TxnOffsetCommit v6 (live) a topic id the cache does not hold keeps the whole offset commit at v5, where the broker offers v6"
+      ],
+      "capMinutes": 30
+    },
+    {
+      "id": "floor-conditional",
+      "kind": "cluster",
+      "compose": "docker-compose.racks.yml",
+      "kafkaVersion": "4.0.2",
+      "env": {
+        "FLOOR_CONDITIONAL_E2E": "1"
+      },
+      "jest": [
+        "--forceExit",
+        "--runInBand",
+        "--testPathPatterns",
+        "src/admin/__tests__/floorConditionalLive\\.spec\\.js"
+      ],
+      "jestScript": null,
+      "nodeTest": null,
+      "command": null,
+      "needs": {},
+      "evidence": [
+        "floor-conditional"
+      ],
+      "titles": [
+        "src/admin/__tests__/floorConditionalLive.spec.js \u203a Conditional features on the negotiated floor ApiVersions retains the old identity-free path on the floor",
+        "src/admin/__tests__/floorConditionalLive.spec.js \u203a Conditional features on the negotiated floor Transactional offset commits retain the named-topic path on the floor",
+        "src/admin/__tests__/floorConditionalLive.spec.js \u203a Conditional features on the negotiated floor DeleteGroups retains the old wire contract on the floor",
+        "src/admin/__tests__/floorConditionalLive.spec.js \u203a Conditional features on the negotiated floor Built-in rack selection and custom authority work on the floor",
+        "src/admin/__tests__/floorConditionalLive.spec.js \u203a Floor conditional expectations reads what each ApiVersions request names and the error code of its own answer",
+        "src/admin/__tests__/floorConditionalLive.spec.js \u203a Floor conditional expectations runs cleanup newest first, continues past a failure and reports only what it could not undo"
       ],
       "capMinutes": 30
     }
