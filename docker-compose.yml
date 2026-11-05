@@ -3,6 +3,8 @@
 x-kafka-common: &kafka-common
   image: apache/kafka:${KAFKA_VERSION:-4.3.1}
   environment: &kafka-env
+    # JMX is enabled for the broker process only, through KAFKA_JMX_PORT.
+    KAFKA_JMX_PORT: '9999'
     KAFKA_PROCESS_ROLES: 'broker,controller'
     KAFKA_CONTROLLER_QUORUM_VOTERS: '1@kafka1:19093,2@kafka2:19093,3@kafka3:19093'
     KAFKA_CONTROLLER_LISTENER_NAMES: 'CONTROLLER'

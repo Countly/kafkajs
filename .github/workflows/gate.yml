@@ -1,7 +1,9 @@
 # needs flags: java (JDK + cached client/codec jars), lz4 (native binding),
-# consumerGroupStates (patched coordinator image), kerberos (KDC image/state),
-# tls-required (tracked TLS fixtures), tokens, logdirs (compose-only), tiered (test jar/remote dir).
-# Future guarded live specs must also supply their reservation through check.env.
+# consumerGroupStates (patched coordinator image), kerberos (KDC image/state, Kerberos binding),
+# tls-required (tracked TLS fixtures), tokens (per-run delegation-token key), logdirs (compose-only),
+# tiered (test jar/remote dir).
+# A check may set kafkaVersion (major.minor.patch) to run on another broker release; absent means
+# DEFAULT_KAFKA_VERSION below. The live specs run against the job's own Compose cluster, without a guard.
 name: Exit gate
 on:
   workflow_dispatch:
@@ -20,10 +22,13 @@ concurrency:
   group: gate-${{ github.ref }}-${{ github.event.pull_request.draft == true }}
   cancel-in-progress: true
 env:
-  KAFKA_VERSION: 4.3.1
-  # Required before enabling the corresponding future arm; no digest is assumed.
-  KDC_BASE_IMAGE: ''
-  TIERED_JAR_SHA256: ''
+  # The broker release of every check that sets no kafkaVersion; the Read check step exports it as KAFKA_VERSION.
+  DEFAULT_KAFKA_VERSION: 4.3.1
+  # Ubuntu 24.04 (docker.io/library/ubuntu index digest, read from the registry 2026-11-05). The KDC
+  # Dockerfile installs the MIT Kerberos packages onto it when the base lacks them.
+  KDC_BASE_IMAGE: ubuntu:24.04@sha256:fe81560990fae86dc4743202b2cb4d3df98d0bcf949173cecef15ce1127ef852
+  # Maven Central's kafka-storage-4.3.1-test.jar.sha256, read 2026-11-05 and matched to the jar's own digest.
+  TIERED_JAR_SHA256: f3236936854c13815ffaa7f35a3f2d6861c125616cba5395b538b8680dded886
 jobs:
   plan:
     if: github.event_name != 'pull_request' || !github.event.pull_request.draft
@@ -56,6 +61,11 @@ jobs:
               }
               return { id, capMinutes }
             })
+          for (const check of gate.checks) {
+            if (check.kafkaVersion !== undefined && !/^\d+\.\d+\.\d+$/.test(check.kafkaVersion)) {
+              throw new Error(`Invalid kafkaVersion: ${check.id}`)
+            }
+          }
           if (!include.length) throw new Error('No checks selected')
           fs.appendFileSync(process.env.GITHUB_OUTPUT, `matrix=${JSON.stringify({ include })}\n`)
           NODE
@@ -93,9 +103,13 @@ jobs:
           for (const key of Object.keys(check.needs || {})) {
             if (!supported.includes(key)) throw new Error(`Unsupported needs flag: ${key}`)
           }
+          if (check.kafkaVersion !== undefined && !/^\d+\.\d+\.\d+$/.test(check.kafkaVersion)) {
+            throw new Error(`Invalid kafkaVersion: ${check.kafkaVersion}`)
+          }
           fs.writeFileSync(`${process.env.RUNNER_TEMP}/check.json`, JSON.stringify(check))
           fs.appendFileSync(process.env.GITHUB_OUTPUT, `check=${JSON.stringify(check)}\n`)
           fs.appendFileSync(process.env.GITHUB_ENV, `COMPOSE_FILE=${check.compose || 'docker-compose.yml'}\n`)
+          fs.appendFileSync(process.env.GITHUB_ENV, `KAFKA_VERSION=${check.kafkaVersion || process.env.DEFAULT_KAFKA_VERSION}\n`)
           NODE
       - uses: actions/setup-java@v4
         if: fromJSON(steps.entry.outputs.check).needs.java || fromJSON(steps.entry.outputs.check).needs.consumerGroupStates || fromJSON(steps.entry.outputs.check).compose == 'testHelpers/consumerGroupStates/compose.yml'
@@ -170,6 +184,18 @@ jobs:
           echo "KERBEROS_FIXTURE_DIR=$RUNNER_TEMP/kerberos" >> "$GITHUB_ENV"
           echo 'WAIT_FOR_KAFKA_NODES=kafka1' >> "$GITHUB_ENV"
           echo 'SKIP_SCRAM=1' >> "$GITHUB_ENV"
+      - name: Install the Kerberos client binding
+        if: fromJSON(steps.entry.outputs.check).needs.kerberos
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libkrb5-dev
+          npm install --no-save --no-audit --no-fund "kerberos@$(node -p "require('./package.json').peerDependencies.kerberos")"
+      - name: Generate the delegation-token key
+        if: fromJSON(steps.entry.outputs.check).needs.tokens
+        run: |
+          key="$(openssl rand -base64 48 | tr -d '\n')"
+          echo "::add-mask::$key"
+          echo "KAFKA_DELEGATION_TOKEN_SECRET_KEY=$key" >> "$GITHUB_ENV"
       - name: Prepare tiered storage
         if: fromJSON(steps.entry.outputs.check).needs.tiered
         run: |

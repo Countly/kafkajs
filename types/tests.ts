@@ -1787,3 +1787,13 @@ const invalidGssapiPassword: import('./index').GssapiSaslOptions = {
   password: 'unsupported',
 }
 void [invalidGssapiService, invalidGssapiPassword]
+
+// The final overload retains signal-handler and parameter-tuple compatibility.
+const adminCloseOptions: Promise<void> = admin.disconnect({ timeout: 0 })
+const adminCloseNatural: Promise<void> = admin.disconnect()
+type AdminDisconnectParameters = AdminTupleAssert<AdminTupleEqual<Parameters<kafkajs.Admin['disconnect']>, []>>
+process.once('SIGTERM', admin.disconnect)
+// @ts-expect-error timeout is numeric
+admin.disconnect({ timeout: '1' })
+// @ts-expect-error public options are an object
+admin.disconnect('SIGTERM')

@@ -1,27 +1,38 @@
 const { execFileSync } = require('node:child_process')
 const fs = require('node:fs')
 const path = require('node:path')
+const { StandaloneKdc } = require('./standalone')
 
-/** Talks only to the existing live reservation; it cannot start or tear down a cluster. */
+/**
+ * Talks only to the cluster the run already owns; it cannot start or tear down a cluster. Under a
+ * live reservation (`P9_CLUSTER_GUARD` and `P9_CLUSTER_MANIFEST`) the guard performs each operation;
+ * with neither set, the job's own Compose cluster does.
+ */
 class KdcFixture {
-  /** Binds the guard's manifest and test credential directory.
-   * @throws {Error} when the guard has not supplied the reservation
+  /** Binds the guard's manifest and test credential directory, or the standalone controller.
+   * @throws {Error} when only one of the guard and its manifest is supplied
    */
   constructor() {
     this.guard = process.env.P9_CLUSTER_GUARD
     this.manifest = process.env.P9_CLUSTER_MANIFEST
-    if (!this.guard || !this.manifest) throw new Error('A live reservation is required')
-    this.record = JSON.parse(fs.readFileSync(this.manifest, 'utf8'))
+    if (!this.guard !== !this.manifest) throw new Error('Incomplete cluster ownership environment')
+    if (this.guard) {
+      this.record = JSON.parse(fs.readFileSync(this.manifest, 'utf8'))
+    } else {
+      this.standalone = new StandaloneKdc()
+      this.record = { runDir: this.standalone.directory }
+    }
     this.events = []
   }
 
-  /** Requests one allow-listed operation after guard ownership validation.
+  /** Requests one allow-listed operation after guard ownership validation, or runs it standalone.
    * @param {string} operation KDC operation name
    * @param {string[]} [args] literal operation arguments
-   * @returns {object} validated JSON record from the guard
+   * @returns {object} validated JSON record from the guard, or the standalone controller's record
    * @throws {Error} invalid reservation, timeout or operation failure
    */
   control(operation, args = []) {
+    if (this.standalone) return this.standalone.control(operation, args)
     const output = execFileSync(
       'timeout',
       [
@@ -97,6 +108,7 @@ class KdcFixture {
    * @throws {Error} write failure
    */
   capture() {
+    fs.mkdirSync(this.record.runDir, { recursive: true })
     const target = path.join(this.record.runDir, 'gssapi-native-capture.json')
     fs.writeFileSync(target, JSON.stringify(this.events), { mode: 0o600, flag: 'wx' })
     return target

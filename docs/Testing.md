@@ -99,6 +99,34 @@ The GSSAPI scenario uses `docker-compose.kerberos.yml` with the cached KDC fixtu
 
 `test:e2e:tls-negative` runs `src/network/__tests__/tlsNegativeLive.spec.js` on `docker-compose.tls-required.yml`: the base cluster plus a listener on 9193–9195 that requires a client certificate. The client certificate is issued at run time from the tracked test CA by `scripts/generateKafkaCertificates.sh --client <dir>` into an ignored directory, and removed afterwards; no private key is committed. A client-certificate request completes first. Then the one-way listener refuses an untrusted CA and a wrong server name, the required listener refuses a client without a certificate, a plaintext client on 9093 and 9193 reaches the frame-cap diagnostic (the bytes each listener sent are recorded), and a TLS client on 9092 keeps its connection error and logs one warning. Run it only through the reviewed shared cluster guard. `src/network/__tests__/tlsNegative.spec.js` covers the same outcomes against local servers without a broker.
 
+Admin lifecycle and ledger checks run without a broker. The admin live scenarios run against the cluster the run owns: through the reviewed shared cluster guard when `P9_CLUSTER_GUARD` and `P9_CLUSTER_MANIFEST` are both set, and against the Compose cluster `COMPOSE_FILE` selects when neither is, which is how the exit gate runs them. Setting only one of the two is refused. A skipped scenario or missing fixture is not acceptance. Each run records the actual broker version, negotiated API versions, candidate tree, settings, oracle observations and cleanup result before teardown. Local runs use Kafka 4.3.1 and Node 26; other supported broker and Node lines belong to CI. Raw receipts, such as the broker byte counter of the quota scenario, go to `LIVE_WORK` when it is set and to `.tmp/e2e` otherwise.
+
+| Script | Fixture | Evidence |
+|---|---|---|
+| test:e2e:admin-ledger | ordinary cluster and separate ACL companion | admin-ledger.jsonl |
+| test:e2e:admin-logdirs | two formatted log directories | admin-logdirs.jsonl |
+| test:e2e:admin-tokens | per-run delegation-token key and SASL | admin-tokens.jsonl |
+| test:e2e:admin-lifecycle | ordinary cluster and held transport | admin-lifecycle.jsonl |
+| test:e2e:admin-quota | ordinary SASL cluster and broker byte counter | quota-throttle.jsonl |
+| test:e2e:admin-tiered | pinned remote-storage plugin | tiered-offsets.jsonl |
+
+The tiered scenario requires a real upload, local eviction and retained-record read. Plain-topic sentinels cannot replace it. Quota acceptance requires the fixed matched control, quota and recovery windows and an independent broker byte receipt. Run credentials are generated and removed per invocation; diagnostic evidence contains no credential material.
+
+The exit gate (`.github/workflows/gate.yml`, with its checks in `scripts/ci/gate.json`) runs each live arm as its own job on a fresh runner. A job passes only when Jest reports every title listed for it as passed and none as skipped, so a spec that skips itself fails the job. A check may set `kafkaVersion` (`major.minor.patch`) to run against another broker release; the workflow passes it to Compose as `KAFKA_VERSION`, and without it the gate's default release applies.
+
+| Check | Compose file | Flag | What the job prepares |
+|---|---|---|---|
+| e2e-gssapi | `docker-compose.kerberos.yml` | `GSSAPI_E2E` | the KDC image built from `testHelpers/kerberos/Dockerfile` onto a pinned Ubuntu base, the exact optional `kerberos` peer, and a fixture directory |
+| e2e-tls-negative | `docker-compose.tls-required.yml` | `TLS_NEGATIVE_E2E` | the tracked TLS fixtures; the spec issues its client certificate |
+| e2e-oauth-helpers | `docker-compose.oauthbearer.yml` | `OAUTH_HELPERS_E2E` | nothing |
+| e2e-idle-reap | `docker-compose.yml` | `IDLE_REAP_E2E` | nothing |
+| e2e-admin-ledger | `docker-compose.yml` | `ADMIN_LEDGER_E2E` | nothing |
+| e2e-admin-lifecycle | `docker-compose.yml` | `ADMIN_LIFECYCLE_E2E` | nothing |
+| e2e-admin-quota | `docker-compose.yml` | `ADMIN_QUOTA_E2E` | nothing; the brokers expose JMX on a container-local port through the image's own launcher, so `kafka-*.sh` tools run with `docker exec` are not affected |
+| e2e-admin-tokens | `docker-compose.tokens.yml` | `ADMIN_TOKENS_E2E` | a per-run delegation-token key, masked in the job log |
+| e2e-admin-logdirs | `docker-compose.logdirs.yml` | `ADMIN_LOGDIRS_E2E` | nothing; the brokers format both directories |
+| e2e-admin-tiered | `docker-compose.tiered.yml` | `ADMIN_TIERED_E2E` | the Kafka 4.3.1 storage test jar from Maven Central, checked against its SHA-256, and a remote-tier directory shared by the brokers |
+
 ### Scenario lanes
 
 A scenario that holds with no fault injected runs on two lanes from one file: `describe.each(lanes())` from `testHelpers` gives it `fake` (the unit lane, in process) or `docker` (under `npm run test:kafka`, which exports `KAFKAJS_LANE=docker`), and `KAFKAJS_SCENARIO_LANES=fake,docker` asks for both. A scenario that injects a fault (a held answer, a dropped frame) runs on the fake lane unless the fault can be injected on a live cluster too.

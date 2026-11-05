@@ -5,8 +5,10 @@ const createTransactions = require('./transactions')
 const createClusterAdmin = require('./clusterAdmin')
 const createConfigResources = require('./configResources')
 const { inspect } = require('util')
+const AdminLifecycle = require('./lifecycle')
 const {
   retrierOf,
+  currentDeadline,
   wrapAdmin,
   validateApiTimeout,
   checked,
@@ -432,21 +434,33 @@ module.exports = ({
   const logger = rootLogger.namespace('Admin')
   const instrumentationEmitter = rootInstrumentationEmitter || new InstrumentationEventEmitter()
 
-  /**
-   * @returns {Promise}
-   */
-  const connect = async () => {
-    await sharedSetup(() => cluster.connect())
-    instrumentationEmitter.emit(CONNECT)
-  }
+  const lifecycle = new AdminLifecycle({
+    cluster,
+    logger,
+    onDisconnect: () => instrumentationEmitter.emit(DISCONNECT),
+  })
 
   /**
-   * @return {Promise}
+   * Reopens only after the preceding close finishes; old setup can never publish into it.
+   * @returns {Promise<void>}
+   * @throws {Error} original setup error or captured lifecycle refusal
    */
-  const disconnect = async () => {
-    await sharedSetup(() => cluster.disconnect())
-    instrumentationEmitter.emit(DISCONNECT)
-  }
+  const connect = () =>
+    lifecycle.connect(async (generation) => {
+      await generation.wait(sharedSetup(() => cluster.connect({ fence: generation })))
+      const error = generation.guard()
+      if (error) throw error
+      instrumentationEmitter.emit(CONNECT)
+    })
+
+  /**
+   * Drains admitted calls, or closes their captured lifecycle by the first call's deadline.
+   * @param {{ timeout?: number }|unknown} [options] integer milliseconds; legacy arguments ignored
+   * @returns {Promise<void>} shared cleanup episode
+   * @throws {import('../errors').KafkaJSInvalidConfigurationError} rejected before mutation
+   * @throws {Error} original transport cleanup failure when draining naturally
+   */
+  const disconnect = (options) => lifecycle.disconnect(options)
 
   /**
    * @return {Promise}
@@ -1208,10 +1222,19 @@ module.exports = ({
     }
 
     return cluster.withGroup(groupId, async () => {
+      const round = currentDeadline()
       const consumer = createConsumer({
         logger: rootLogger.namespace('Admin', LEVELS.NOTHING),
         cluster,
         groupId,
+        ownsCluster: false,
+      })
+      /** Releases only the borrowed consumer under its original invocation's wire fence.
+       * @returns {Promise<void>} disposal failure cannot replace the call's own outcome
+       */
+      const dispose = () => round.run(() => disposeConsumer(consumer).catch(() => {}))
+      const unown = round.own(() => {
+        dispose().catch(() => {})
       })
 
       try {
@@ -1228,14 +1251,18 @@ module.exports = ({
           await waitOf(
             async () =>
               new Promise((resolve, reject) => {
+                consumer.on(consumer.events.CRASH, ({ payload }) => reject(payload.error))
                 let committed = null
                 consumer.on(consumer.events.GROUP_JOIN, () => {
-                  committed ??= commitSentinels(consumer, { groupId, topic, partitions })
+                  committed ??= round.wait(() =>
+                    commitSentinels(consumer, { groupId, topic, partitions })
+                  )
                   committed.catch(() => {})
                 })
                 consumer.on(consumer.events.FETCH, () => {
+                  if (round.expired) return
                   committed
-                    .finally(() => consumer.stop())
+                    .finally(() => disposeConsumer(consumer))
                     .then(resolve)
                     .catch(reject)
                 })
@@ -1259,7 +1286,8 @@ module.exports = ({
       } finally {
         // The consumer shares this admin's cluster, so it is disposed, not disconnected. A failed
         // stop is already logged by the consumer and must not replace the call's own outcome.
-        await sharedSetup(() => disposeConsumer(consumer).catch(() => {}))
+        unown()
+        await dispose()
       }
     })
   }
@@ -2804,6 +2832,7 @@ module.exports = ({
       describeGroups: 1,
       deleteGroups: 1,
     },
-    apiTimeout
+    apiTimeout,
+    lifecycle
   )
 }

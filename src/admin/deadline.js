@@ -32,16 +32,25 @@ class AdminDeadline {
    * Captures the budget once. Null is reserved for discovery ownership, which has no timer.
    * @param {string} method original public method name
    * @param {number|null} timeoutMs validated budget or internal discovery ownership
+   * @param {import('../producer/generation')|null} [lifecycle] captured admin lifecycle
+   * @param {number} [startedAt] monotonic public invocation entry time
    * @returns {AdminDeadline} active invocation
    */
-  constructor(method, timeoutMs) {
+  constructor(method, timeoutMs, lifecycle = null, startedAt = performance.now()) {
+    this.lifecycle = lifecycle
     this.method = method
     this.timeoutMs = timeoutMs
     this.token = Symbol(method)
-    this.deadlineAt = timeoutMs === null ? Infinity : performance.now() + timeoutMs
+    this.deadlineAt = timeoutMs === null ? Infinity : startedAt + timeoutMs
     this.reason = null
     this.cleanups = new Set()
-    this.timer = timeoutMs === null ? null : setTimeout(() => this.stop(this.timeout()), timeoutMs)
+    this.timer =
+      timeoutMs === null
+        ? null
+        : setTimeout(
+            () => this.stop(this.timeout()),
+            Math.max(0, this.deadlineAt - performance.now())
+          )
     this.guard = () => this.refusal()
   }
 
@@ -55,6 +64,8 @@ class AdminDeadline {
 
   /** @returns {Error|null} actual-clock refusal, including when timer delivery is withheld */
   refusal() {
+    const closed = this.lifecycle?.guard()
+    if (!this.reason && closed) this.stop(closed)
     if (!this.reason && performance.now() >= this.deadlineAt) this.stop(this.timeout())
     return this.reason
   }
@@ -128,7 +139,7 @@ class AdminDeadline {
           return
         }
         this.check()
-        Promise.resolve(work()).then(
+        Promise.resolve(context.run(this, work)).then(
           (value) => finish(null, value, false),
           (error) => finish(error)
         )
@@ -136,6 +147,18 @@ class AdminDeadline {
         finish(error)
       }
     })
+  }
+
+  /**
+   * Runs local disposal under the original scope even when invoked by an external event.
+   * Cleanup may run after retirement, but its transport still sees the original refusal.
+   * @template T
+   * @param {() => T} work local cleanup, never a new user operation
+   * @returns {T} cleanup result
+   * @throws {Error} cleanup failure
+   */
+  run(work) {
+    return context.run(this, work)
   }
 
   /**
@@ -248,22 +271,32 @@ const currentDeadline = () => context.getStore()
  * @param {string} method public method name
  * @param {number} timeoutMs validated budget
  * @param {() => Promise<T>|T} work unstarted method body
+ * @param {import('../producer/generation')|null} [lifecycle] original lifecycle, never renewed
+ * @param {number} [startedAt] monotonic public invocation entry, before lazy admission
  * @returns {Promise<T>}
  * @throws {Error} original failure or KafkaJSTimeout
  */
-const runWithDeadline = async (method, timeoutMs, work) => {
+const runWithDeadline = async (
+  method,
+  timeoutMs,
+  work,
+  lifecycle = null,
+  startedAt = performance.now()
+) => {
   const inherited = currentDeadline()
-  if (inherited) {
+  if (inherited && (!lifecycle || inherited.lifecycle === lifecycle)) {
     const result = await inherited.wait(work)
     inherited.check()
     return result
   }
-  const deadline = new AdminDeadline(method, timeoutMs)
+  const deadline = new AdminDeadline(method, timeoutMs, lifecycle, startedAt)
+  const unregister = lifecycle?.register((error) => deadline.stop(error))
   try {
     const result = await context.run(deadline, () => deadline.wait(work))
     deadline.check()
     return result
   } finally {
+    unregister?.()
     deadline.stop(new KafkaJSNonRetriableError('Admin invocation completed'))
   }
 }
@@ -455,16 +488,20 @@ const withAdminGuard = (guard, deadline = currentDeadline()) =>
  * @param {object} methods completed admin factory surface, including future family spreads
  * @param {object} optionsAt method to index of its public options argument
  * @param {number} defaultTimeout validated AdminConfig budget
+ * @param {import('./lifecycle')} [lifecycle] admission and shared close owner
  * @returns {object} wrapped admin surface
  * @throws {KafkaJSInvalidConfigurationError} per-call invalid apiTimeout, before method work
  */
-const wrapAdmin = (methods, optionsAt, defaultTimeout) => {
+const wrapAdmin = (methods, optionsAt, defaultTimeout, lifecycle) => {
   for (const [method, index] of Object.entries(optionsAt)) {
     const work = methods[method]
     if (typeof work !== 'function') throw new Error(`Missing admin operation ${method}`)
     methods[method] = async (...args) => {
+      const startedAt = performance.now()
       const timeoutMs = validateApiTimeout(args[index]?.apiTimeout, defaultTimeout)
-      return runWithDeadline(method, timeoutMs, () => work(...args))
+      const run = (generation) =>
+        runWithDeadline(method, timeoutMs, () => work(...args), generation, startedAt)
+      return lifecycle ? lifecycle.run(run) : run(null)
     }
   }
   return methods

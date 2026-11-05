@@ -174,6 +174,8 @@ Versions before 3.0.0 are internal alpha tags and are not published.
 
 - SASL failures and token-admin diagnostics omit credentials and sensitive broker payloads. Error classes and fixed message prefixes remain stable. Built-in SASL exchange wrappers preserve fixed, library-authored SCRAM validation reasons; other failures use the canonical protocol-code description or `Error` instead of broker or supplier text.
 
+- Admin operations after disconnect reject without dialing until an explicit connect opens a new lifecycle.
+
 - **Idle connections are closed after 9 minutes** (540 000 ms, Java's `connections.max.idle.ms`; 2.2.4 never closed them) and reopened by the next request, with one more ApiVersions round trip: "Connections idle for 9 minutes are closed by default; the next request reconnects. This is below the default broker idle timeout but does not guarantee close ordering or eliminate races. `connectionsMaxIdle: 0` keeps connections open as before."
 
 - Admin calls take an `apiTimeout` (default 60 000 ms) and reject with `KafkaJSTimeout` when it passes; a mutation may have been applied. Retries are unchanged, unlike Java's unbounded retries inside the deadline. Existing broker-side `timeout` keeps its meaning.
@@ -194,6 +196,8 @@ Versions before 3.0.0 are internal alpha tags and are not published.
 - A commit the broker refuses names the refused partition: the error carries `topic` and `partition`, as a refused Produce does.
 
 #### Additions
+
+- `admin.disconnect({ timeout })` closes by the deadline.
 
 - `admin.describeLogDirs`, `alterReplicaLogDirs`, `describeReplicaLogDirs`; `fetchTopicOffsetsByTimestamp` accepts `'maxTimestamp'`, `'earliestLocal'`, `'latestTiered'` and `'earliestPendingUpload'`; `alterPartitionReassignments` accepts `allowReplicationFactorChange`.
 
@@ -219,6 +223,10 @@ Versions before 3.0.0 are internal alpha tags and are not published.
 - `kerberos` is declared an optional peer dependency pinned to 7.0.0 and is never installed with the package.
 
 #### Tooling
+
+- Compose variants for delegation tokens, two log directories and tiered storage; the admin ledger table.
+
+- The exit gate runs the GSSAPI, TLS negative, OAuth helper, idle-reaping and admin live arms (ledger, lifecycle, quota, delegation tokens, log directories, tiered storage) as jobs of their own. A gate check can name its broker release with `kafkaVersion`. The admin live scenarios and the GSSAPI KDC fixture use the job's Compose cluster when no cluster guard is configured, and the base Compose cluster exposes broker JMX on a container-local port for the quota scenario's byte counter.
 
 - Live scenarios for the connection setup budget and idle reaping; the soak's idle profile asserts that sockets are reaped and reopened.
 
