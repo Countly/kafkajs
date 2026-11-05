@@ -331,6 +331,22 @@ const ELECTION_ATTEMPTS = 3
 const TRUTH_REQUEST_MS = 2000
 
 /**
+ * Maps a group id to its offsets partition using Java's string hash and Kafka's `Utils.abs`.
+ * @param {string} groupId the group to locate
+ * @param {number} partitionCount the offsets topic's broker-reported partition count
+ * @returns {number} the offsets partition id, including Kafka's MIN_VALUE special case
+ * @see https://raw.githubusercontent.com/apache/kafka/4.3/group-coordinator/src/main/java/org/apache/kafka/coordinator/group/GroupCoordinatorService.java
+ * @see https://raw.githubusercontent.com/apache/kafka/4.3/clients/src/main/java/org/apache/kafka/common/utils/Utils.java
+ */
+const groupOffsetsPartition = (groupId, partitionCount) => {
+  let hash = 0
+  for (let index = 0; index < groupId.length; index++) {
+    hash = (31 * hash + groupId.charCodeAt(index)) | 0
+  }
+  return (hash === -2147483648 ? 0 : Math.abs(hash)) % partitionCount
+}
+
+/**
  * @param {Array<{topic: string, partition: number, value: string}>} acknowledged one batch, in
  *   production order
  * @param {number} firstOffset the offset the batch's first record is expected at
@@ -364,6 +380,7 @@ const restartBroker = async (service, signal) => {
  */
 class TruncationArm {
   /**
+   * Owns one arm's clients, bounded cleanup and retained evidence.
    * @param {AbortSignal} scope the case's scope
    * @param {object} subscription the options of `subscribe` besides the topic
    */
@@ -392,6 +409,9 @@ class TruncationArm {
     this.truncations = []
     this.crashes = []
     this.joins = []
+    this.requests = []
+    this.requestTimeouts = []
+    this.completedBatches = []
     /** @type {Array<{ at: number, action: string }>} the broker pauses, stops and starts, in order */
     this.brokerActions = []
     /** @type {Record<string, unknown>} what the arm learned as it went */
@@ -506,11 +526,11 @@ class TruncationArm {
   }
 
   /**
-   * Reads the initial leader, which either replica may hold, and returns a group id whose
-   * coordinator is node 1, the surviving voter, so the group is not stranded while the other two
-   * nodes are paused, stopped or started. A lookup reset by a broker that is still starting is repeated
-   * for the same candidate; only a coordinator on another node moves on to the next one.
+   * Selects a group whose offsets partition prefers node 1 and has no replica on the node this
+   * arm freezes. A current coordinator of 1 alone is insufficient: a preferred election can move
+   * it to 2 before the freeze. The final lookup confirms that node 1 already coordinates the group.
    * @returns {Promise<string>}
+   * @throws {Error} when metadata or a lookup fails, or no suitable group is found
    */
   async pinnedGroup() {
     const { cluster, topic } = this
@@ -522,17 +542,42 @@ class TruncationArm {
     this.facts.initialLeader = this.leaderOf()
     expect([2, 3]).toContain(this.facts.initialLeader)
     this.at('select the pinned coordinator')
-    for (let attempt = 0; attempt < 60; attempt++) {
-      const candidate = `test-group-${secureRandom()}`
-      const coordinator = await retryTransient(
+    /**
+     * Retries a lookup reset by a broker that is still starting, for the same group id.
+     * @param {string} groupId the candidate group
+     * @returns {Promise<object>} the broker coordinating the group
+     * @throws {Error} when the lookup fails or exceeds its budget
+     */
+    const coordinatorFor = (groupId) =>
+      retryTransient(
         this.scope,
         TRUNCATION_STEP_MS,
-        () => cluster.findGroupCoordinator({ groupId: candidate }),
+        () => cluster.findGroupCoordinator({ groupId }),
         { label: 'The coordinator lookup' }
       )
-      if (coordinator.nodeId === 1) return candidate
+
+    // FindCoordinator creates the internal topic on an otherwise unused cluster.
+    await coordinatorFor(`test-group-${secureRandom()}`)
+    const { topics } = await this.step('The offsets topic metadata', () =>
+      this.admin.fetchTopicMetadata({ topics: ['__consumer_offsets'] })
+    )
+    const { partitions } = topics[0]
+    const eligible = partitions.filter(({ replicas }) => replicas[0] === 1 && !replicas.includes(2))
+    expect(eligible.length).toBeGreaterThan(0)
+
+    for (let attempt = 0; attempt < 1000; attempt++) {
+      const candidate = `test-group-${secureRandom()}`
+      const partition = eligible.find(
+        ({ partitionId }) => partitionId === groupOffsetsPartition(candidate, partitions.length)
+      )
+      if (!partition) continue
+      const coordinator = await coordinatorFor(candidate)
+      if (coordinator.nodeId === 1) {
+        this.facts.groupOffsetsPartition = partition
+        return candidate
+      }
     }
-    throw new Error('No group id is coordinated by node 1')
+    throw new Error('No group id has a coordinator on node 1 with replicas excluding node 2')
   }
 
   /** @returns {number} the node that leads partition 0 of the topic, from `cluster`'s cache */
@@ -573,8 +618,10 @@ class TruncationArm {
   }
 
   /**
-   * Subscribes and starts the consumer, retaining every delivery, truncation and crash.
+   * Subscribes and starts the consumer, retaining deliveries, batch completions, membership
+   * events and request outcomes so a failed election run identifies the requests that settled.
    * @returns {Promise<void>}
+   * @throws {Error} when connecting, subscribing or starting fails or exceeds its step budget
    */
   async start() {
     this.consumer = this.kafka.consumer({
@@ -589,6 +636,15 @@ class TruncationArm {
     )
     consumer.on(consumer.events.CRASH, (event) => this.crashes.push(event.payload))
     consumer.on(consumer.events.GROUP_JOIN, (event) => this.joins.push(event.payload))
+    consumer.on(consumer.events.REQUEST, ({ payload }) =>
+      this.requests.push({ at: Date.now() - this.startedAt, ...payload })
+    )
+    consumer.on(consumer.events.REQUEST_TIMEOUT, ({ payload }) =>
+      this.requestTimeouts.push({ at: Date.now() - this.startedAt, ...payload })
+    )
+    consumer.on(consumer.events.END_BATCH_PROCESS, ({ payload }) =>
+      this.completedBatches.push(payload)
+    )
     await this.step('The consumer connect', () => consumer.connect())
     await this.step('The subscription', () =>
       consumer.subscribe({ topic: this.topic, ...this.subscription })
@@ -662,6 +718,9 @@ class TruncationArm {
         truncations: this.truncations,
         crashes: this.crashes.map((crash) => describeError(crash.error ?? crash)),
         joins: this.joins.length,
+        requests: this.requests,
+        requestTimeouts: this.requestTimeouts,
+        completedBatches: this.completedBatches,
         brokerActions: this.brokerActions,
         brokerTruth: truth,
         ...this.facts,
@@ -748,6 +807,7 @@ describeLogTruncation('Consumer > unclean leader election (live)', () => {
    * @param {(context: {admin: object, topic: string, groupId: string}) => Promise<void>} [prepare]
    *   runs before the consumer joins, with the group still empty
    * @returns {() => Promise<void>} the case for `it`
+   * @throws {Error} from the case when a bounded step or an assertion fails
    */
   const truncationCase = (subscription, prepare) =>
     liveCase(TRUNCATION_BUDGET_MS, (scope) => {
@@ -773,7 +833,17 @@ describeLogTruncation('Consumer > unclean leader election (live)', () => {
         // kafka3 goes away and is waited out of the ISR, so what follows exists only on kafka2.
         arm.at('stop kafka3')
         await arm.broker('stop', 'kafka3')
-        await delay(scope, REPLICA_LAG_TIME_MAX_MS + 5000)
+        await arm.waitTolerating(
+          'Broker 3 leaving the ISR',
+          { attempts: (REPLICA_LAG_TIME_MAX_MS + 30000) / 1000, delay: 1000 },
+          async () => {
+            await arm.step('The ISR metadata refresh', () => arm.cluster.refreshMetadata())
+            const partition = arm.cluster
+              .findTopicPartitionMetadata(topic)
+              .find(({ partitionId }) => partitionId === 0)
+            return partition.leader === 2 && !partition.isr.includes(3)
+          }
+        )
         phase('kafka3 stopped and waited out of the ISR')
 
         arm.at('produce the second batch')
@@ -785,9 +855,14 @@ describeLogTruncation('Consumer > unclean leader election (live)', () => {
           DELIVERY_BUDGET,
           () => arm.received.length >= consumedBeforeTruncation
         )
-        // The runner resolves an offset after `eachMessage` returns, so give it a moment: the
-        // position the truncation is asserted against is the resolved one, not the delivered one.
-        await delay(scope, 2000)
+        await arm.wait('The second batch resolution', DELIVERY_BUDGET, () =>
+          arm.completedBatches.some(
+            ({ topic: name, partition, lastOffset }) =>
+              name === topic &&
+              partition === 0 &&
+              lastOffset === String(consumedBeforeTruncation - 1)
+          )
+        )
         phase('second batch consumed', { received: arm.received.length })
 
         // The only replica holding the second batch is paused, and the stale one comes back.
@@ -880,6 +955,7 @@ describeLogTruncation('Consumer > unclean leader election (live)', () => {
         // simply out of range on the new leader and the partition is reset per `fromBeginning`, so
         // both the event and the resume-point assertions below fail.
         const [truncation] = arm.truncations
+        expect(arm.joins).toHaveLength(1)
         expect(truncation.topic).toEqual(topic)
         expect(truncation.partition).toEqual(0)
         expect(truncation.offset).toEqual(String(consumedBeforeTruncation))
