@@ -27,6 +27,7 @@ const {
   createConnectionPool,
   newLogger,
   plainTextBrokers,
+  waitForTopicPropagation,
   saslBrokers,
   saslConnectionOpts,
   wireVersionsOf,
@@ -439,6 +440,8 @@ class FloorProbe {
         topics: [{ topic, numPartitions: partitions, replicationFactor }],
       })
     )
+    // CreateTopics answers once the controller commits; every broker learns the topic after it.
+    await this.invoke(() => waitForTopicPropagation(topic, partitions))
     return topic
   }
 
