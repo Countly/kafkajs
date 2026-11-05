@@ -233,6 +233,15 @@
       }
     ]
   },
+  "AlterShareGroupOffsets": {
+    "kafkaTag": "4.4.0",
+    "messageSha256": {
+      "Request": "3650ba32b42a0977b0375e6376980886cb0c99dc592a9fc1e847768786e479d4",
+      "Response": "f388f17dc34f89c6cfd2451adac103ccb2c58172ce445a984278b1b8ea8b7ef6"
+    },
+    "javaClientsJar": null,
+    "javaVectors": []
+  },
   "AlterUserScramCredentials": {
     "kafkaTag": "4.4.0",
     "messageSha256": {
@@ -997,6 +1006,15 @@
       }
     ]
   },
+  "DeleteShareGroupOffsets": {
+    "kafkaTag": "4.4.0",
+    "messageSha256": {
+      "Request": "a0450f46bdd8178c83d5cead0c53028f5ff282d382527fdbf53f0eaa0f39c8c6",
+      "Response": "d0d1264bee6371bd39e1d7020860329ef4cb791a51196e6dd643fe5b3084b0fe"
+    },
+    "javaClientsJar": null,
+    "javaVectors": []
+  },
   "DeleteTopics": {
     "kafkaTag": "4.4.0",
     "messageSha256": {
@@ -1542,6 +1560,15 @@
         "fixtureSha256": "d989c80f8a0b19630060fa924e60b8771e1a013bb45c493e172a30b2c4c3411b"
       }
     ]
+  },
+  "DescribeShareGroupOffsets": {
+    "kafkaTag": "4.4.0",
+    "messageSha256": {
+      "Request": "f1ff3872ed908875237c4f69a281b1fe07899837c57198b35497d343fce75021",
+      "Response": "5da70be446cd41ddf1de9d2e95779d43c606113bf633d89c3d492c69e240a4cb"
+    },
+    "javaClientsJar": null,
+    "javaVectors": []
   },
   "DescribeTopicPartitions": {
     "kafkaTag": "4.4.0",
@@ -3613,6 +3640,42 @@
     "messageSha256": {
       "Request": "2316215be78ce0bc79f5ce08f825cf317f3c104ac38ee609581454de7634df47",
       "Response": "a7aa00f2fa01ecf31674a39a243bd4d2d284c9cd1993ce6501f93b57c1f90ba9"
+    },
+    "javaClientsJar": null,
+    "javaVectors": []
+  },
+  "ShareAcknowledge": {
+    "kafkaTag": "4.4.0",
+    "messageSha256": {
+      "Request": "9f75e74cec5c35bbd5142a31e7116e981942ad194b916fafa775084764bc73d1",
+      "Response": "dbfd4f0fa6c9617a6823af7434167e57d5d748fb3c5d3fd623cad671777d912b"
+    },
+    "javaClientsJar": null,
+    "javaVectors": []
+  },
+  "ShareFetch": {
+    "kafkaTag": "4.4.0",
+    "messageSha256": {
+      "Request": "0290657f8faa79a24a9a53dab0ab949ae75095fd6cf414f2920e72c5da1723b2",
+      "Response": "fa90ee102ad98ce88b14f0d38a775d0e4b32c8e53e11577a3d93923089a69f5e"
+    },
+    "javaClientsJar": null,
+    "javaVectors": []
+  },
+  "ShareGroupDescribe": {
+    "kafkaTag": "4.4.0",
+    "messageSha256": {
+      "Request": "b363de3fb7454b17c15c9d0ad76ff0a9bc105416f32e617757077df946bbac24",
+      "Response": "5bca1927fd05b7c43d55a67fcee0a3e7230c1b498195301c86931d8807014fa3"
+    },
+    "javaClientsJar": null,
+    "javaVectors": []
+  },
+  "ShareGroupHeartbeat": {
+    "kafkaTag": "4.4.0",
+    "messageSha256": {
+      "Request": "199cf57ffa9ccafe4ae8aa2dd35cefbf5c36a3ce69864ce08c8b5982bf25cf8f",
+      "Response": "f8284acb296a502e7f16d2b0cae7bb3e0160cc8cfa0726c69dc88d1b7698255d"
     },
     "javaClientsJar": null,
     "javaVectors": []

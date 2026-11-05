@@ -67,6 +67,13 @@ Gap classes: `current` (fork max equals the Kafka max) · `behind:N` · `stub` (
 | PushTelemetry | 72 | 0 | v0+ | — | not-planned | Client telemetry (KIP-714); deferred. |
 | ListConfigResources | 74 | 0-1 | v0+ | 0-1 | current | v0 is the old ListClientMetricsResources and lists only client-metrics resources; v1 adds a ResourceTypes filter (KIP-1142). |
 | DescribeTopicPartitions | 75 | 0 | v0+ | 0 | current | Paginated describe of topics by name, with topic ids and eligible leader replicas; v0 is the only version and every 4.x broker offers it. The ELR arrays are null unless the cluster tracks them. |
+| ShareGroupHeartbeat | 76 | 1 | v0+ | — | stub |  |
+| ShareGroupDescribe | 77 | 1 | v0+ | — | stub |  |
+| ShareFetch | 78 | 1-2 | v0+ | — | stub |  |
+| ShareAcknowledge | 79 | 1-2 | v0+ | — | stub |  |
+| DescribeShareGroupOffsets | 90 | 0-1 | v0+ | — | stub |  |
+| AlterShareGroupOffsets | 91 | 0 | v0+ | — | stub |  |
+| DeleteShareGroupOffsets | 92 | 0 | v0+ | — | stub |  |
 
 ## Floor watch
 

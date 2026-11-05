@@ -1430,6 +1430,139 @@
       "onFloor": false,
       "belowFloor": [],
       "notes": "Paginated describe of topics by name, with topic ids and eligible leader replicas; v0 is the only version and every 4.x broker offers it. The ELR arrays are null unless the cluster tracks them."
+    },
+    {
+      "kafkaName": "ShareGroupHeartbeat",
+      "apiKey": 76,
+      "forkName": null,
+      "apiKeysName": "ShareGroupHeartbeat",
+      "planned": "yes",
+      "validVersions": [
+        1,
+        1
+      ],
+      "flexibleFrom": 0,
+      "deprecatedVersions": null,
+      "latestVersionUnstable": false,
+      "forkVersions": null,
+      "gap": "stub",
+      "onFloor": false,
+      "belowFloor": [],
+      "notes": ""
+    },
+    {
+      "kafkaName": "ShareGroupDescribe",
+      "apiKey": 77,
+      "forkName": null,
+      "apiKeysName": "ShareGroupDescribe",
+      "planned": "yes",
+      "validVersions": [
+        1,
+        1
+      ],
+      "flexibleFrom": 0,
+      "deprecatedVersions": null,
+      "latestVersionUnstable": false,
+      "forkVersions": null,
+      "gap": "stub",
+      "onFloor": false,
+      "belowFloor": [],
+      "notes": ""
+    },
+    {
+      "kafkaName": "ShareFetch",
+      "apiKey": 78,
+      "forkName": null,
+      "apiKeysName": "ShareFetch",
+      "planned": "yes",
+      "validVersions": [
+        1,
+        2
+      ],
+      "flexibleFrom": 0,
+      "deprecatedVersions": null,
+      "latestVersionUnstable": false,
+      "forkVersions": null,
+      "gap": "stub",
+      "onFloor": false,
+      "belowFloor": [],
+      "notes": ""
+    },
+    {
+      "kafkaName": "ShareAcknowledge",
+      "apiKey": 79,
+      "forkName": null,
+      "apiKeysName": "ShareAcknowledge",
+      "planned": "yes",
+      "validVersions": [
+        1,
+        2
+      ],
+      "flexibleFrom": 0,
+      "deprecatedVersions": null,
+      "latestVersionUnstable": false,
+      "forkVersions": null,
+      "gap": "stub",
+      "onFloor": false,
+      "belowFloor": [],
+      "notes": ""
+    },
+    {
+      "kafkaName": "DescribeShareGroupOffsets",
+      "apiKey": 90,
+      "forkName": null,
+      "apiKeysName": "DescribeShareGroupOffsets",
+      "planned": "yes",
+      "validVersions": [
+        0,
+        1
+      ],
+      "flexibleFrom": 0,
+      "deprecatedVersions": null,
+      "latestVersionUnstable": false,
+      "forkVersions": null,
+      "gap": "stub",
+      "onFloor": false,
+      "belowFloor": [],
+      "notes": ""
+    },
+    {
+      "kafkaName": "AlterShareGroupOffsets",
+      "apiKey": 91,
+      "forkName": null,
+      "apiKeysName": "AlterShareGroupOffsets",
+      "planned": "yes",
+      "validVersions": [
+        0,
+        0
+      ],
+      "flexibleFrom": 0,
+      "deprecatedVersions": null,
+      "latestVersionUnstable": false,
+      "forkVersions": null,
+      "gap": "stub",
+      "onFloor": false,
+      "belowFloor": [],
+      "notes": ""
+    },
+    {
+      "kafkaName": "DeleteShareGroupOffsets",
+      "apiKey": 92,
+      "forkName": null,
+      "apiKeysName": "DeleteShareGroupOffsets",
+      "planned": "yes",
+      "validVersions": [
+        0,
+        0
+      ],
+      "flexibleFrom": 0,
+      "deprecatedVersions": null,
+      "latestVersionUnstable": false,
+      "forkVersions": null,
+      "gap": "stub",
+      "onFloor": false,
+      "belowFloor": [],
+      "notes": ""
     }
   ],
   "waivers": [],

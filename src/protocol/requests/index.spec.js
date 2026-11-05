@@ -1,4 +1,4 @@
-const { KafkaJSServerDoesNotSupportApiKey } = require('../../errors')
+const { KafkaJSServerDoesNotSupportApiKey, KafkaJSNotImplemented } = require('../../errors')
 const apiKeys = require('./apiKeys')
 const { lookup, requests } = require('./index')
 
@@ -183,4 +183,269 @@ describe('Protocol > Requests', () => {
       })
     })
   })
+})
+
+/** The Apache Kafka releases whose message definitions the repository keeps a snapshot of. */
+const SNAPSHOT_TAGS = ['4.3.1', '4.4.0']
+
+describe('released share protocol inventory', () => {
+  const fs = require('fs')
+  const path = require('path')
+  const { createHash } = require('crypto')
+  const tracked = require('../../../scripts/compat/tracked-apis.json').tracked
+  const provenance = require('../../../scripts/protocol/provenance.json')
+  const ranges = require('../../../scripts/protocol/brokerRanges.json')
+  const { isFlexible, requestHeaderVersion, responseHeaderVersion } = require('../headers')
+  const messages = path.resolve(__dirname, '../../../scripts/compat/messages')
+
+  /** The 4.3.1 digest of key 76's response; its 4.4.0 file differs, the other thirteen do not. */
+  const HEARTBEAT_RESPONSE_4_3_1 =
+    '2fbdac30942cf96d89cc5e34d9441152ca13162ff61f3bb95ae9acd3926fbe2c'
+
+  /**
+   * One row per released share API: name, key, the one codec version this client will implement,
+   * and the SHA-256 of the 4.4.0 request and response definitions.
+   * @type {[string, number, number, string, string][]}
+   */
+  const share = [
+    [
+      'ShareGroupHeartbeat',
+      76,
+      1,
+      '199cf57ffa9ccafe4ae8aa2dd35cefbf5c36a3ce69864ce08c8b5982bf25cf8f',
+      'f8284acb296a502e7f16d2b0cae7bb3e0160cc8cfa0726c69dc88d1b7698255d',
+    ],
+    [
+      'ShareGroupDescribe',
+      77,
+      1,
+      'b363de3fb7454b17c15c9d0ad76ff0a9bc105416f32e617757077df946bbac24',
+      '5bca1927fd05b7c43d55a67fcee0a3e7230c1b498195301c86931d8807014fa3',
+    ],
+    [
+      'ShareFetch',
+      78,
+      2,
+      '0290657f8faa79a24a9a53dab0ab949ae75095fd6cf414f2920e72c5da1723b2',
+      'fa90ee102ad98ce88b14f0d38a775d0e4b32c8e53e11577a3d93923089a69f5e',
+    ],
+    [
+      'ShareAcknowledge',
+      79,
+      2,
+      '9f75e74cec5c35bbd5142a31e7116e981942ad194b916fafa775084764bc73d1',
+      'dbfd4f0fa6c9617a6823af7434167e57d5d748fb3c5d3fd623cad671777d912b',
+    ],
+    [
+      'DescribeShareGroupOffsets',
+      90,
+      1,
+      'f1ff3872ed908875237c4f69a281b1fe07899837c57198b35497d343fce75021',
+      '5da70be446cd41ddf1de9d2e95779d43c606113bf633d89c3d492c69e240a4cb',
+    ],
+    [
+      'AlterShareGroupOffsets',
+      91,
+      0,
+      '3650ba32b42a0977b0375e6376980886cb0c99dc592a9fc1e847768786e479d4',
+      'f388f17dc34f89c6cfd2451adac103ccb2c58172ce445a984278b1b8ea8b7ef6',
+    ],
+    [
+      'DeleteShareGroupOffsets',
+      92,
+      0,
+      'a0450f46bdd8178c83d5cead0c53028f5ff282d382527fdbf53f0eaa0f39c8c6',
+      'd0d1264bee6371bd39e1d7020860329ef4cb791a51196e6dd643fe5b3084b0fe',
+    ],
+  ]
+
+  /**
+   * @param {string} tag a snapshot tag
+   * @param {string} name a share API name
+   * @param {'Request'|'Response'} direction
+   * @param {string} hash the 4.4.0 digest of that definition
+   * @returns {string} the digest the definition must have in `tag`'s snapshot
+   */
+  const pinnedHash = (tag, name, direction, hash) =>
+    tag === '4.3.1' && name === 'ShareGroupHeartbeat' && direction === 'Response'
+      ? HEARTBEAT_RESPONSE_4_3_1
+      : hash
+
+  /** @param {string} name @returns {string} `name` with its first character lowercased */
+  const lowerCamel = (name) => name.charAt(0).toLowerCase() + name.slice(1)
+
+  test.each(share)(
+    '%s has sources, a name and a slot',
+    (name, key, version, requestHash, responseHash) => {
+      expect(apiKeys[name]).toBe(key)
+      const slot = requests[name]
+      const implemented = slot.versions.map(Number)
+      expect(implemented).toEqual(implemented.length ? [version] : [])
+      if (implemented.length) {
+        expect(slot.protocol).toEqual(expect.any(Function))
+      } else {
+        expect(slot).toBe(requests.LeaderAndIsr)
+        expect(() => slot.protocol()).toThrow(KafkaJSNotImplemented)
+      }
+      expect(tracked.find((row) => row.apiKey === key)).toMatchObject({
+        kafkaName: name,
+        apiKeysName: name,
+        forkName: implemented.length ? lowerCamel(name) : null,
+        planned: implemented.length ? 'done' : 'yes',
+      })
+      for (const tag of SNAPSHOT_TAGS) {
+        for (const [direction, hash] of [
+          ['Request', requestHash],
+          ['Response', responseHash],
+        ]) {
+          const file = path.join(messages, tag, name + direction + '.json')
+          expect(createHash('sha256').update(fs.readFileSync(file)).digest('hex')).toBe(
+            pinnedHash(tag, name, direction, hash)
+          )
+        }
+      }
+      expect(provenance[name]).toMatchObject({
+        kafkaTag: '4.4.0',
+        messageSha256: { Request: requestHash, Response: responseHash },
+      })
+      expect(isFlexible(key, 0)).toBe(true)
+      expect(requestHeaderVersion(key, version)).toBe(2)
+      expect(responseHeaderVersion(key, version)).toBe(1)
+      for (const [line, table] of Object.entries(ranges)) {
+        expect(table['ApiKey' + key]).toBeUndefined()
+        if (line === '4.0.2') expect(table[name]).toBeUndefined()
+        else expect(table[name]).toEqual([expect.any(Number), expect.any(Number)])
+      }
+    }
+  )
+
+  test('has no duplicate key or tracked name', () => {
+    expect(new Set(Object.values(apiKeys)).size).toBe(Object.keys(apiKeys).length)
+    expect(new Set(tracked.map((row) => row.apiKey)).size).toBe(tracked.length)
+    expect(new Set(tracked.map((row) => row.kafkaName)).size).toBe(tracked.length)
+  })
+})
+
+describe('released share source domains', () => {
+  const fs = require('fs')
+  const path = require('path')
+  const { parseMessage } = require('../../../scripts/compat/parse')
+  const ranges = require('../../../scripts/protocol/brokerRanges.json')
+  const messages = path.resolve(__dirname, '../../../scripts/compat/messages')
+
+  /** @type {[string, number, string][]} name, key and the `validVersions` of both definitions */
+  const rows = [
+    ['ShareGroupHeartbeat', 76, '1'],
+    ['ShareGroupDescribe', 77, '1'],
+    ['ShareFetch', 78, '1-2'],
+    ['ShareAcknowledge', 79, '1-2'],
+    ['DescribeShareGroupOffsets', 90, '0-1'],
+    ['AlterShareGroupOffsets', 91, '0'],
+    ['DeleteShareGroupOffsets', 92, '0'],
+  ]
+
+  const SHARE_NAMES = rows.map(([name]) => name)
+  const INTERNAL_KEYS = ['ApiKey83', 'ApiKey84', 'ApiKey85', 'ApiKey86', 'ApiKey87']
+
+  /**
+   * What each release recorded in `brokerRanges.json` must hold: the ranges it captured for the
+   * share APIs, by name, and for the broker-internal keys 83-87, which stay numbered. A release
+   * from before the share APIs existed is `{ absent: true }`: none of those names or keys may be
+   * recorded. Add an entry, from the capture itself, when a release is recorded.
+   * @type {Record<string, { absent: true } | { named: Record<string, number[]>, internal: Record<string, number[]> }>}
+   */
+  const captured = {
+    '4.0.2': { absent: true },
+    '4.1.2': {
+      named: {
+        ShareGroupHeartbeat: [1, 1],
+        ShareGroupDescribe: [1, 1],
+        ShareFetch: [1, 1],
+        ShareAcknowledge: [1, 1],
+        DescribeShareGroupOffsets: [0, 0],
+        AlterShareGroupOffsets: [0, 0],
+        DeleteShareGroupOffsets: [0, 0],
+      },
+      internal: {
+        ApiKey83: [0, 0],
+        ApiKey84: [0, 0],
+        ApiKey85: [0, 0],
+        ApiKey86: [0, 0],
+        ApiKey87: [0, 0],
+      },
+    },
+    '4.2.2': {
+      named: {
+        ShareGroupHeartbeat: [1, 1],
+        ShareGroupDescribe: [1, 1],
+        ShareFetch: [1, 2],
+        ShareAcknowledge: [1, 2],
+        DescribeShareGroupOffsets: [0, 1],
+        AlterShareGroupOffsets: [0, 0],
+        DeleteShareGroupOffsets: [0, 0],
+      },
+      internal: {
+        ApiKey83: [0, 0],
+        ApiKey84: [0, 0],
+        ApiKey85: [0, 1],
+        ApiKey86: [0, 0],
+        ApiKey87: [0, 1],
+      },
+    },
+    '4.3.1': {
+      named: {
+        ShareGroupHeartbeat: [1, 1],
+        ShareGroupDescribe: [1, 1],
+        ShareFetch: [1, 2],
+        ShareAcknowledge: [1, 2],
+        DescribeShareGroupOffsets: [0, 1],
+        AlterShareGroupOffsets: [0, 0],
+        DeleteShareGroupOffsets: [0, 0],
+      },
+      internal: {
+        ApiKey83: [0, 0],
+        ApiKey84: [0, 0],
+        ApiKey85: [0, 1],
+        ApiKey86: [0, 0],
+        ApiKey87: [0, 1],
+      },
+    },
+  }
+
+  test.each(rows)('%s pins the released source range', (name, key, validVersions) => {
+    for (const tag of SNAPSHOT_TAGS) {
+      for (const direction of ['Request', 'Response']) {
+        const definition = parseMessage(
+          fs.readFileSync(path.join(messages, tag, name + direction + '.json'), 'utf8')
+        )
+        expect(definition).toMatchObject({ apiKey: key, validVersions, flexibleVersions: '0+' })
+        if (direction === 'Request') expect(definition.listeners).toEqual(['broker'])
+      }
+    }
+  })
+
+  test.each([...new Set([...Object.keys(ranges), ...Object.keys(captured)])])(
+    '%s records the share ranges by name and the internal ones by key',
+    (line) => {
+      if (!Object.hasOwn(ranges, line)) {
+        throw new Error(
+          `${line} has a captured expectation but brokerRanges.json no longer records it`
+        )
+      }
+      if (!Object.hasOwn(captured, line)) {
+        throw new Error(
+          `brokerRanges.json records ${line}, which has no captured expectation: add its share ` +
+            'ranges and its ApiKey83-ApiKey87 ranges to `captured` from that capture'
+        )
+      }
+      const entry = captured[line]
+      const expected = entry.absent
+        ? Object.fromEntries([...SHARE_NAMES, ...INTERNAL_KEYS].map((name) => [name, undefined]))
+        : { ...entry.named, ...entry.internal }
+      expect(Object.keys(expected).sort()).toEqual([...SHARE_NAMES, ...INTERNAL_KEYS].sort())
+      for (const [name, range] of Object.entries(expected)) {
+        expect(ranges[line][name]).toEqual(range)
+      }
+    }
+  )
 })

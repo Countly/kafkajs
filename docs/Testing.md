@@ -11,6 +11,8 @@ We rely on a suite of largely integration tests, using `jest` as a test runner, 
 
 Transaction administration has brokerless routing, capability, partial-result, validation and fake-socket coverage in `transactionDiagnostics.spec.js` and `abortFence.spec.js`. The four transaction codec families and seven wire pairs are checked against independent Apache Java vectors before registration. Live open-transaction, administrative abort visibility and producer-fencing evidence is owned by the admin-ledger live arm; the brokerless cases alone do not establish those outcomes.
 
+The protocol inventory tests pin the released share-group message sources, API names, flexible headers and recorded broker ranges. Source inventory alone does not establish runtime share-group support.
+
 ## Integration tests
 
 Most of the test suite talks to a real Kafka cluster. `npm test` runs `npm run lint`, `npm run compat:check` and `npm run protocol:check`, boots the cluster, runs everything, and tears the cluster down again — it's a convenient local shortcut, but it is not what CI runs.
