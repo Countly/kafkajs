@@ -122,6 +122,40 @@ class AdminLedgerScenario {
   }
 
   /**
+   * Repeats a permission check while its grants reach the answering authorizers. Retries only
+   * authorization codes and the 2.2.4 coordinator-lookup error that can mask them.
+   * The caller asserts the first other result exactly and never repeats a successful mutation.
+   * @param {object} check permission operation and its public result selectors
+   * @param {() => Promise<any>} check.call operation under the newly created grants
+   * @param {Function} [check.item] item selector shared by positive and denied controls
+   * @param {Function} [check.positiveItem] item selector for a call-level denial
+   * @returns {Promise<any>} first result without an authorization failure
+   * @throws {Error} another call failure, abort or the probe's work deadline
+   */
+  async permissionAllowed(check) {
+    const p = this.probe
+    const authorizationCodes = [29, 30, 31, 53]
+    let result
+    await p.poll(async () => {
+      try {
+        result = await p.invoke(check.call)
+      } catch (error) {
+        if (authorizationCodes.includes(error.code)) return false
+        if (error.name === 'KafkaJSGroupCoordinatorNotFound') return false
+        throw error
+      }
+      const selected = (check.item || check.positiveItem)?.(result)
+      const items = [selected, ...(Array.isArray(result) ? result : [])]
+      return items.every(
+        (item) =>
+          !authorizationCodes.includes(item?.errorCode) &&
+          !(item?.errorCode === -1 && item.error?.name === 'KafkaJSGroupCoordinatorNotFound')
+      )
+    })
+    return result
+  }
+
+  /**
    * Emits one observed case only once, after all its assertions.
    * @param {string} name case identity
    * @param {object} facts nonsecret scalar evidence
@@ -1205,7 +1239,8 @@ class AdminLedgerScenario {
 
   /**
    * Proves minimum grants and typed denials with fresh nonsuperuser connections.
-   * This same case also runs from cold under the ACL profile.
+   * Each positive control waits for its grants under the probe's work deadline. This same case
+   * also runs from cold under the ACL profile.
    * @returns {Promise<void>}
    * @throws {Error} missing positive control, wrong failure level or cleanup failure
    */
@@ -1416,7 +1451,7 @@ class AdminLedgerScenario {
         operation: 7,
         code: 31,
         call: () => client.electLeaders({ electionType: 'preferred', topicPartitions: targets }),
-        item: (rows) => rows[0].partitions[0],
+        positiveItem: (rows) => rows[0].partitions[0],
         positiveCodes: [0, 84],
       },
       {
@@ -1430,7 +1465,7 @@ class AdminLedgerScenario {
             validateOnly: true,
             features: [{ name: feature, maxVersionLevel: level.maxVersionLevel }],
           }),
-        item: (rows) => rows[0],
+        positiveItem: (rows) => rows[0],
       },
       {
         name: 'configuration resources',
@@ -1455,6 +1490,7 @@ class AdminLedgerScenario {
         resourceName: 'kafka-cluster',
         operation: 7,
         code: 31,
+        errorName: 'KafkaJSAlterPartitionReassignmentsError',
         call: () =>
           client.alterPartitionReassignments({
             topics: [{ topic, partitionAssignment: [{ partition: 0, replicas }] }],
@@ -1605,7 +1641,7 @@ class AdminLedgerScenario {
       }
       expect(await p.invoke(() => root.createAcls({ acl: [acl] }))).toBe(true)
       {
-        const positive = await p.invoke(check.call)
+        const positive = await this.permissionAllowed(check)
         if (check.item || check.positiveItem)
           expect(check.positiveCodes || [0]).toContain(
             (check.item || check.positiveItem)(positive).errorCode
@@ -1667,7 +1703,10 @@ class AdminLedgerScenario {
           () => null,
           (error) => error
         )
-        expect(failure).toMatchObject({ code: check.code, name: 'KafkaJSProtocolError' })
+        expect(failure).toMatchObject({
+          code: check.code,
+          name: check.errorName || 'KafkaJSProtocolError',
+        })
         observedTypes.push(failure.type)
       }
       observedCodes.push(check.code)
