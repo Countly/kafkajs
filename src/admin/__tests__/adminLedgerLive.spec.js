@@ -79,16 +79,18 @@ class AdminLedgerScenario {
    * Opens an independent raw source and registers close before connection.
    * @param {string} host broker host
    * @param {number} port broker port
+   * @param {object} [security={}] optional SSL and SASL connection settings
    * @returns {Promise<Broker>} connected source
    * @throws {Error} connection or budget failure
    */
-  async raw(host, port) {
+  async raw(host, port, security = {}) {
     const p = this.probe
     const broker = new Broker({
       logger: p.logger,
       connectionPool: new Pool({
         host,
         port,
+        ...security,
         logger: p.logger,
         socketFactory: (args) => p.socket(args),
         connectionTimeout: 3000,
@@ -124,12 +126,14 @@ class AdminLedgerScenario {
   /**
    * Repeats a permission check while its grants reach the answering authorizers. Retries only
    * authorization codes and the 2.2.4 coordinator-lookup error that can mask them.
-   * The caller asserts the first other result exactly and never repeats a successful mutation.
+   * Filtered reads may also require a successful-result predicate. The caller asserts that result
+   * exactly and never repeats a successful mutation.
    * @param {object} check permission operation and its public result selectors
    * @param {() => Promise<any>} check.call operation under the newly created grants
    * @param {Function} [check.item] item selector shared by positive and denied controls
    * @param {Function} [check.positiveItem] item selector for a call-level denial
-   * @returns {Promise<any>} first result without an authorization failure
+   * @param {Function} [check.allowed] optional successful-result predicate for filtered reads
+   * @returns {Promise<any>} first authorized result satisfying the optional read predicate
    * @throws {Error} another call failure, abort or the probe's work deadline
    */
   async permissionAllowed(check) {
@@ -146,13 +150,105 @@ class AdminLedgerScenario {
       }
       const selected = (check.item || check.positiveItem)?.(result)
       const items = [selected, ...(Array.isArray(result) ? result : [])]
-      return items.every(
-        (item) =>
-          !authorizationCodes.includes(item?.errorCode) &&
-          !(item?.errorCode === -1 && item.error?.name === 'KafkaJSGroupCoordinatorNotFound')
+      return (
+        items.every(
+          (item) =>
+            !authorizationCodes.includes(item?.errorCode) &&
+            !(item?.errorCode === -1 && item.error?.name === 'KafkaJSGroupCoordinatorNotFound')
+        ) &&
+        (!check.allowed || check.allowed(result))
       )
     })
     return result
+  }
+
+  /**
+   * Waits for an exact read-only denial under the work deadline and returns that observation.
+   * Mutations run once, after their side-effect-free probe settles; without a proven probe they
+   * retain the one-shot assertion. Unexpected call failures and item codes fail immediately.
+   * @param {object} check operation, expected code and optional item selector
+   * @param {Function} check.call public operation or side-effect-free raw probe
+   * @param {number} check.code expected authorization error code
+   * @param {Function} [check.item] result item carrying errorCode
+   * @param {boolean} [check.mutating=false] never poll this call
+   * @param {(check: object) => Promise<any>} [check.deniedProbe] wait for the same authorization without mutation
+   * @param {number[]} [check.pendingCodes=[]] safe probe's expected pre-denial failures
+   * @returns {Promise<{result: any, error: Error|null}>} observed public result or call failure
+   * @throws {Error} unexpected failure, abort or work deadline
+   */
+  async permissionDenied(check) {
+    const p = this.probe
+    const observe = () =>
+      p.invoke(check.call).then(
+        (result) => ({ result, error: null }),
+        (error) => ({ result: null, error })
+      )
+    if (check.deniedProbe) await check.deniedProbe(check)
+    if (check.mutating) return observe()
+    let observed
+    await p.poll(async () => {
+      observed = await observe()
+      if (observed.error) {
+        if (observed.error.code === check.code) return true
+        if (check.pendingCodes?.includes(observed.error.code)) return false
+        throw observed.error
+      }
+      if (!check.item) return false
+      const { errorCode } = check.item(observed.result)
+      if (errorCode !== 0) expect(errorCode).toBe(check.code)
+      return errorCode === check.code
+    })
+    return observed
+  }
+
+  /**
+   * Waits for granted or denied operation bits while DESCRIBE is observable on every source.
+   * Observe ALLOW on every source before creating DENY, so a missing earlier grant cannot satisfy
+   * the denial wait while its publication is still pending.
+   * Kafka's AuthHelper.authorizedOperations uses the same authorizer actions as authorize:
+   * https://raw.githubusercontent.com/apache/kafka/4.3/core/src/main/scala/kafka/server/AuthHelper.scala
+   * KafkaApis.handleDescribeGroupsRequest and handleOffsetDeleteRequest use the same GROUP;
+   * handleAlterReplicaLogDirsRequest and handleWriteTxnMarkersRequest use the same CLUSTER.
+   * WriteTxnMarkers permits ALTER as an alternative to CLUSTER_ACTION, so both bits must be absent.
+   * https://raw.githubusercontent.com/apache/kafka/4.3/core/src/main/scala/kafka/server/KafkaApis.scala
+   * @param {Broker[]} sources all brokers for cluster checks, the coordinator for group checks
+   * @param {object} check resourceType, resourceName and operation under denial
+   * @param {boolean} allowed whether the operation must be granted or denied
+   * @returns {Promise<void>} after DESCRIBE is present and the operation bits match on every source
+   * @throws {Error} unexpected response, abort or work deadline
+   */
+  async permissionMaskSettled(sources, check, allowed) {
+    const p = this.probe
+    const operations = !allowed && check.operation === 9 ? [7, 9] : [check.operation]
+    await p.poll(async () => {
+      for (const broker of sources) {
+        let mask
+        if (check.resourceType === 3) {
+          const { groups } = await p.invoke(() =>
+            broker.describeGroups({
+              groupIds: [check.resourceName],
+              includeAuthorizedOperations: true,
+            })
+          )
+          expect(groups).toHaveLength(1)
+          if (groups[0].errorCode === 30) return false
+          expect(groups[0].errorCode).toBe(0)
+          mask = groups[0].authorizedOperations
+        } else {
+          const response = await p.invoke(() =>
+            broker.describeCluster({ includeClusterAuthorizedOperations: true })
+          )
+          mask = response.clusterAuthorizedOperations
+        }
+        expect(Number.isInteger(mask)).toBe(true)
+        if (
+          (mask & (1 << 8)) === 0 ||
+          operations.some((op) => Boolean(mask & (1 << op)) !== allowed)
+        )
+          return false
+      }
+      return true
+    })
   }
 
   /**
@@ -1239,8 +1335,9 @@ class AdminLedgerScenario {
 
   /**
    * Proves minimum grants and typed denials with fresh nonsuperuser connections.
-   * Each positive control waits for its grants under the probe's work deadline. This same case
-   * also runs from cold under the ACL profile.
+   * Positive controls and safe denial observations wait under the probe's work deadline.
+   * ListTransactions proves successful filtering; mutations run once after a proven safe probe,
+   * except topic-ID deletion, whose denial remains one-shot. This also runs cold in the ACL profile.
    * @returns {Promise<void>}
    * @throws {Error} missing positive control, wrong failure level or cleanup failure
    */
@@ -1282,39 +1379,12 @@ class AdminLedgerScenario {
       })
     expect(await p.invoke(() => root.createAcls({ acl: maskAcls }))).toBe(true)
     const [maskHost, maskPort] = saslBrokers()[0].split(':')
-    const maskRaw = new Broker({
-      logger: p.logger,
-      connectionPool: new Pool({
-        host: maskHost,
-        port: Number(maskPort),
-        ssl,
-        sasl: { mechanism: 'scram-sha-256', username: user, password },
-        logger: p.logger,
-        socketFactory: (args) => p.socket(args),
-      }),
-    })
-    p.cleanup.add('known authorizer raw source', () =>
-      maskRaw.disconnect({ drainTimeout: Math.min(5000, p.remaining()) })
-    )
-    await p.invoke(() => maskRaw.connect())
+    const security = { ssl, sasl: { mechanism: 'scram-sha-256', username: user, password } }
+    const maskRaw = await this.raw(maskHost, Number(maskPort), security)
     const coordinator = (
       await p.invoke(() => maskRaw.findGroupCoordinator({ groupId, coordinatorType: 0 }))
     ).coordinator
-    const groupRaw = new Broker({
-      logger: p.logger,
-      connectionPool: new Pool({
-        host: coordinator.host,
-        port: coordinator.port,
-        ssl,
-        sasl: { mechanism: 'scram-sha-256', username: user, password },
-        logger: p.logger,
-        socketFactory: (args) => p.socket(args),
-      }),
-    })
-    p.cleanup.add('known authorizer group source', () =>
-      groupRaw.disconnect({ drainTimeout: Math.min(5000, p.remaining()) })
-    )
-    await p.invoke(() => groupRaw.connect())
+    const groupRaw = await this.raw(coordinator.host, coordinator.port, security)
     const rawTopicMask = (
       await p.invoke(() => maskRaw.metadata([topic], { includeTopicAuthorizedOperations: true }))
     ).topicMetadata[0].topicAuthorizedOperations
@@ -1372,6 +1442,56 @@ class AdminLedgerScenario {
       root.describeReplicaLogDirs({ replicas: [{ topic, partition: 0, brokerId: replicas[0] }] })
     )
     p.items(directoryRows)
+    const { brokers } = await p.invoke(() => maskRaw.metadata([]))
+    expect(brokers.map(({ nodeId }) => nodeId).sort()).toEqual(
+      (await p.invoke(() => root.describeCluster())).brokers.map(({ nodeId }) => nodeId).sort()
+    )
+    const permissionSources = []
+    for (const { host, port } of brokers)
+      permissionSources.push(await this.raw(host, port, security))
+    /**
+     * Validates a feature update without changing it. ControllerApis authorizes cluster ALTER
+     * before UpdateFeatures, ElectLeaders, AlterPartitionReassignments and AlterUserScramCredentials.
+     * KafkaApis forwards all four to that controller with the same principal; FeatureControlManager
+     * returns no metadata records for validateOnly.
+     * https://raw.githubusercontent.com/apache/kafka/4.3/core/src/main/scala/kafka/server/ControllerApis.scala
+     * https://raw.githubusercontent.com/apache/kafka/4.3/core/src/main/scala/kafka/server/KafkaApis.scala
+     * https://raw.githubusercontent.com/apache/kafka/4.3/metadata/src/main/java/org/apache/kafka/controller/FeatureControlManager.java
+     * @returns {Promise<object[]>} validate-only feature results
+     * @throws {Error} authorization, validation or deadline failure
+     */
+    const validateFeature = () =>
+      client.updateFeatures({
+        validateOnly: true,
+        features: [{ name: feature, maxVersionLevel: level.maxVersionLevel }],
+      })
+    /**
+     * Waits for the controller's cluster ALTER denial through the validate-only feature request.
+     * @returns {Promise<object>} exact denial observation
+     * @throws {Error} unexpected response, abort or work deadline
+     */
+    const controllerAlterDenied = () => this.permissionDenied({ call: validateFeature, code: 31 })
+    /**
+     * Probes transactional WRITE on every broker without allocating or fencing a producer.
+     * KafkaApis.handleInitProducerIdRequest authorizes first; TransactionCoordinator rejects
+     * timeout 0 before reading or changing transaction state (TransactionStateManager requires >0).
+     * https://raw.githubusercontent.com/apache/kafka/4.3/core/src/main/scala/kafka/server/KafkaApis.scala
+     * https://raw.githubusercontent.com/apache/kafka/4.3/core/src/main/scala/kafka/coordinator/transaction/TransactionCoordinator.scala
+     * https://raw.githubusercontent.com/apache/kafka/4.3/core/src/main/scala/kafka/coordinator/transaction/TransactionStateManager.scala
+     * Every broker must return timeout validation under ALLOW before DENY is created, preventing
+     * a missing, still-pending WRITE grant from satisfying the later denial wait.
+     * @param {boolean} denied whether WRITE must be rejected or reach timeout validation
+     * @returns {Promise<void>} once every broker reports the expected authorization state
+     * @throws {Error} unexpected failure, abort or work deadline
+     */
+    const producerWriteSettled = async (denied) => {
+      for (const broker of permissionSources)
+        await this.permissionDenied({
+          call: () => broker.initProducerId({ transactionalId: txId, transactionTimeout: 0 }),
+          code: denied ? 53 : 50,
+          pendingCodes: denied ? [50] : [53],
+        })
+    }
     const checks = [
       {
         name: 'metadata',
@@ -1394,6 +1514,9 @@ class AdminLedgerScenario {
       },
       {
         name: 'offset deletion',
+        mutating: true,
+        allowedProbe: (check) => this.permissionMaskSettled([groupRaw], check, true),
+        deniedProbe: (check) => this.permissionMaskSettled([groupRaw], check, false),
         resourceType: 3,
         resourceName: groupId,
         operation: 6,
@@ -1421,6 +1544,9 @@ class AdminLedgerScenario {
       },
       {
         name: 'transaction abort',
+        mutating: true,
+        allowedProbe: (check) => this.permissionMaskSettled(permissionSources, check, true),
+        deniedProbe: (check) => this.permissionMaskSettled(permissionSources, check, false),
         resourceType: 4,
         resourceName: 'kafka-cluster',
         operation: 9,
@@ -1436,6 +1562,9 @@ class AdminLedgerScenario {
       },
       {
         name: 'producer fencing',
+        mutating: true,
+        allowedProbe: () => producerWriteSettled(false),
+        deniedProbe: () => producerWriteSettled(true),
         resourceType: 5,
         resourceName: txId,
         operation: 4,
@@ -1446,6 +1575,8 @@ class AdminLedgerScenario {
       },
       {
         name: 'leader election',
+        mutating: true,
+        deniedProbe: controllerAlterDenied,
         resourceType: 4,
         resourceName: 'kafka-cluster',
         operation: 7,
@@ -1460,11 +1591,7 @@ class AdminLedgerScenario {
         resourceName: 'kafka-cluster',
         operation: 7,
         code: 31,
-        call: () =>
-          client.updateFeatures({
-            validateOnly: true,
-            features: [{ name: feature, maxVersionLevel: level.maxVersionLevel }],
-          }),
+        call: validateFeature,
         positiveItem: (rows) => rows[0],
       },
       {
@@ -1486,6 +1613,8 @@ class AdminLedgerScenario {
       },
       {
         name: 'reassignment',
+        mutating: true,
+        deniedProbe: controllerAlterDenied,
         resourceType: 4,
         resourceName: 'kafka-cluster',
         operation: 7,
@@ -1499,6 +1628,9 @@ class AdminLedgerScenario {
       },
       {
         name: 'directory mutation',
+        mutating: true,
+        allowedProbe: (check) => this.permissionMaskSettled(permissionSources, check, true),
+        deniedProbe: (check) => this.permissionMaskSettled(permissionSources, check, false),
         resourceType: 4,
         resourceName: 'kafka-cluster',
         operation: 7,
@@ -1518,11 +1650,13 @@ class AdminLedgerScenario {
       },
       {
         name: 'list transactions',
-        resourceType: 4,
-        resourceName: 'kafka-cluster',
+        filtered: true,
+        resourceType: 5,
+        resourceName: txId,
         operation: 8,
-        code: 31,
         call: () => client.listTransactions({}),
+        allowed: (rows) =>
+          rows.transactions.some(({ transactionalId }) => transactionalId === txId),
       },
       {
         name: 'config mutation',
@@ -1556,6 +1690,8 @@ class AdminLedgerScenario {
       },
       {
         name: 'SCRAM mutation',
+        mutating: true,
+        deniedProbe: controllerAlterDenied,
         resourceType: 4,
         resourceName: 'kafka-cluster',
         operation: 7,
@@ -1568,6 +1704,7 @@ class AdminLedgerScenario {
       },
       {
         name: 'ID deletion',
+        mutating: true,
         resourceType: 2,
         resourceName: deletionTopic,
         operation: 6,
@@ -1630,8 +1767,10 @@ class AdminLedgerScenario {
         ].includes(check.name)
       )
         dependencies.push({ resourceType: 2, resourceName: topic, operation: 8 })
-      if (check.name === 'list transactions')
-        dependencies.push({ resourceType: 5, resourceName: txId, operation: 8 })
+      if (check.name === 'offset deletion')
+        dependencies.push({ resourceType: 3, resourceName: groupId, operation: 8 })
+      if (['transaction abort', 'directory mutation'].includes(check.name))
+        dependencies.push({ resourceType: 4, resourceName: 'kafka-cluster', operation: 8 })
       const dependencyAcls = dependencies.map((entry) => ({ ...acl, ...entry }))
       for (const dependency of dependencyAcls) {
         p.effects.add('remove dependency ACL', async () => {
@@ -1640,13 +1779,15 @@ class AdminLedgerScenario {
         expect(await p.invoke(() => root.createAcls({ acl: [dependency] }))).toBe(true)
       }
       expect(await p.invoke(() => root.createAcls({ acl: [acl] }))).toBe(true)
-      {
-        const positive = await this.permissionAllowed(check)
-        if (check.item || check.positiveItem)
-          expect(check.positiveCodes || [0]).toContain(
-            (check.item || check.positiveItem)(positive).errorCode
-          )
-      }
+      const positive = await this.permissionAllowed(check)
+      if (check.item || check.positiveItem)
+        expect(check.positiveCodes || [0]).toContain(
+          (check.item || check.positiveItem)(positive).errorCode
+        )
+      if (check.filtered)
+        expect(positive.transactions).toContainEqual(
+          expect.objectContaining({ transactionalId: txId })
+        )
       if (check.destructive) {
         await p.poll(async () => !(await p.invoke(() => root.listTopics())).includes(deletionTopic))
         expect(
@@ -1661,10 +1802,23 @@ class AdminLedgerScenario {
         expect(replacement).not.toBe(deletionId)
         deletionId = replacement
       }
+      if (check.allowedProbe) await check.allowedProbe(check)
       expect(await p.invoke(() => root.createAcls({ acl: [{ ...acl, permissionType: 2 }] }))).toBe(
         true
       )
-      if (check.deniedLookup) {
+      if (check.filtered) {
+        let filtered
+        await p.poll(async () => {
+          filtered = await p.invoke(check.call)
+          return !filtered.transactions.some(({ transactionalId }) => transactionalId === txId)
+        })
+        expect(filtered).toEqual({
+          ...positive,
+          transactions: positive.transactions.filter(
+            ({ transactionalId }) => transactionalId !== txId
+          ),
+        })
+      } else if (check.deniedLookup) {
         // DESCRIBE also guards the coordinator lookup. The broker refuses it with the check's code,
         // and the client surfaces a refused lookup as KafkaJSGroupCoordinatorNotFound, as kafkajs
         // 2.2.4 did. Both are polled: the deny reaches each broker's authorizer asynchronously.
@@ -1688,28 +1842,28 @@ class AdminLedgerScenario {
         expect(surfaced.errorCode).toBe(-1)
         expect(surfaced.error).toMatchObject({ name: 'KafkaJSGroupCoordinatorNotFound' })
         observedTypes.push(refused.type)
-      } else if (check.item) {
-        const failed = check.item(await p.invoke(check.call))
-        expect(failed.errorCode).toBe(check.code)
-        if (check.legacyItem) {
-          expect(typeof failed.errorMessage).toBe('string')
-          observedTypes.push('legacy item errorCode')
-        } else {
-          expect(failed.error).toMatchObject({ code: check.code, name: 'KafkaJSProtocolError' })
-          observedTypes.push(failed.error.type)
-        }
       } else {
-        const failure = await p.invoke(check.call).then(
-          () => null,
-          (error) => error
-        )
-        expect(failure).toMatchObject({
-          code: check.code,
-          name: check.errorName || 'KafkaJSProtocolError',
-        })
-        observedTypes.push(failure.type)
+        const { result, error } = await this.permissionDenied(check)
+        if (check.item) {
+          if (error) throw error
+          const failed = check.item(result)
+          expect(failed.errorCode).toBe(check.code)
+          if (check.legacyItem) {
+            expect(typeof failed.errorMessage).toBe('string')
+            observedTypes.push('legacy item errorCode')
+          } else {
+            expect(failed.error).toMatchObject({ code: check.code, name: 'KafkaJSProtocolError' })
+            observedTypes.push(failed.error.type)
+          }
+        } else {
+          expect(error).toMatchObject({
+            code: check.code,
+            name: check.errorName || 'KafkaJSProtocolError',
+          })
+          observedTypes.push(error.type)
+        }
       }
-      observedCodes.push(check.code)
+      if (!check.filtered) observedCodes.push(check.code)
       await this.removeAcls(root, { ...acl, permissionType: 1 }, [
         acl,
         { ...acl, permissionType: 2 },
@@ -1717,7 +1871,9 @@ class AdminLedgerScenario {
       for (const dependency of dependencyAcls) await this.removeAcls(root, dependency, [dependency])
       p.record(`permission ${check.name}`, {
         operationId: check.name,
-        authorizationCode: check.code,
+        ...(check.filtered
+          ? { outcomeId: 'success with transaction filtered', transactionAbsent: true }
+          : { authorizationCode: check.code }),
         dependencyCount: dependencyAcls.length,
         positivePresent: true,
       })
@@ -1725,6 +1881,7 @@ class AdminLedgerScenario {
     this.record('ACL positive controls and typed permission failures', {
       permissionCount: checks.length,
       operationIds: checks.map(({ name }) => name),
+      filteredOperationIds: checks.filter(({ filtered }) => filtered).map(({ name }) => name),
       authorizationTypeIds: observedTypes,
       authorizationCode: observedCodes,
       principalId: user,
