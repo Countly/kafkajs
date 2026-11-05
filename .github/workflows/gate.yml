@@ -206,6 +206,12 @@ jobs:
           key="$(openssl rand -base64 48 | tr -d '\n')"
           echo "::add-mask::$key"
           echo "KAFKA_DELEGATION_TOKEN_SECRET_KEY=$key" >> "$GITHUB_ENV"
+      - name: Restore tiered storage jar
+        uses: actions/cache@v4
+        if: fromJSON(steps.entry.outputs.check).needs.tiered
+        with:
+          path: testHelpers/kafka/plugins/kafka-storage-4.3.1-test.jar
+          key: tiered-jar-${{ env.TIERED_JAR_SHA256 }}
       - name: Prepare tiered storage
         if: fromJSON(steps.entry.outputs.check).needs.tiered
         run: |
@@ -213,7 +219,8 @@ jobs:
           mkdir -p testHelpers/kafka/plugins "$RUNNER_TEMP/tiered-remote"
           chmod 777 "$RUNNER_TEMP/tiered-remote"
           jar=testHelpers/kafka/plugins/kafka-storage-4.3.1-test.jar
-          curl --fail --location --retry 3 --max-time 120 https://repo.maven.apache.org/maven2/org/apache/kafka/kafka-storage/4.3.1/kafka-storage-4.3.1-test.jar -o "$jar"
+          # Maven Central answers runners with a transient 403 at times, which plain --retry skips.
+          [ -s "$jar" ] || curl --fail --location --retry 5 --retry-all-errors --retry-delay 10 --max-time 120 https://repo.maven.apache.org/maven2/org/apache/kafka/kafka-storage/4.3.1/kafka-storage-4.3.1-test.jar -o "$jar"
           printf '%s  %s\n' "$TIERED_JAR_SHA256" "$jar" | sha256sum --check -
           echo "TIERED_REMOTE_DIR=$RUNNER_TEMP/tiered-remote" >> "$GITHUB_ENV"
       - name: Run check
