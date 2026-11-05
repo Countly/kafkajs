@@ -111,11 +111,13 @@ class AdminLedgerScenario {
    * ControllerApis.deleteTopics removes the ID from its deletion set on either denial or the
    * cross-reference duplicate. ALLOW returns one (name, ID, 42) row; DENY with DESCRIBE returns
    * two (name, ID or zero UUID, 29) rows. The zero UUID decodes as null; response order is shuffled.
+   * KafkaApis forwards the original request buffer in an envelope without validating references.
    * @see https://raw.githubusercontent.com/apache/kafka/4.3/core/src/main/scala/kafka/server/ControllerApis.scala (lines 290-356)
+   * @see https://raw.githubusercontent.com/apache/kafka/4.3/core/src/main/scala/kafka/server/ForwardingManager.scala
    * @param {Broker} broker connected source using the permission principal
    * @param {string} topic existing topic name, which must still map to topicId
    * @param {string} topicId current ID of that same topic
-   * @returns {Promise<object[]>} every response identity and error code, without per-topic throws
+   * @returns {Promise<object[]>} every response identity, error code and message, without per-topic throws
    * @throws {Error} encoding, transport or decoding failure
    */
   async deletionProbe(broker, topic, topicId) {
@@ -139,12 +141,50 @@ class AdminLedgerScenario {
         /**
          * Retains error codes as observations rather than passing them to the throwing parser.
          * @param {object} data decoded v6 response
-         * @returns {Promise<object[]>} identities and codes, including every failed entry
+         * @returns {Promise<object[]>} identities, codes and messages, including every failed entry
          */
         parse: async ({ topicErrors }) =>
-          topicErrors.map(({ topic, topicId, errorCode }) => ({ topic, topicId, errorCode })),
+          topicErrors.map(({ topic, topicId, errorCode, errorMessage }) => ({
+            topic,
+            topicId,
+            errorCode,
+            errorMessage,
+          })),
       },
     })
+  }
+
+  /**
+   * Polls under the work deadline and, when labelled, records its final observation on either
+   * success or failure. Failure evidence and the rethrown error contain the same snapshot, even
+   * when the outer operation deadline wins the race with the inner poll's timeout.
+   * @param {string|undefined} label diagnostic phase; undefined keeps other checks unchanged
+   * @param {() => Promise<boolean>} predicate existing bounded observation and settlement condition
+   * @param {() => any} last explicit nonsecret result or error fields from the latest observation
+   * @returns {Promise<void>} after the predicate holds
+   * @throws {Error} original failure, or a labelled failure with its last observation and cause
+   */
+  async observedPoll(label, predicate, last) {
+    const p = this.probe
+    try {
+      await p.poll(predicate)
+    } catch (error) {
+      if (!label) throw error
+      const observationLast = JSON.stringify({
+        observation: last(),
+        failure: { name: error.name, message: error.message, code: error.code },
+      })
+      p.record('ID deletion wait', { phaseId: label, observationLast, settledPresent: false })
+      throw new Error(`${label}: ${error.message}; last observation: ${observationLast}`, {
+        cause: error,
+      })
+    }
+    if (label)
+      p.record('ID deletion wait', {
+        phaseId: label,
+        observationLast: JSON.stringify({ observation: last() }),
+        settledPresent: true,
+      })
   }
 
   /**
@@ -153,16 +193,23 @@ class AdminLedgerScenario {
    * @param {object} client admin that owns the ACLs
    * @param {object} filter complete delete filter, also used to describe what remains
    * @param {object[]} expected the ACLs the filter must delete, whatever order they come back in
+   * @param {string} [waitLabel] phase to include with the last DescribeAcls observation
    * @returns {Promise<void>}
    * @throws {Error} a failed answer, other ACLs deleted, or an ACL that remains until the budget ends
    */
-  async removeAcls(client, filter, expected) {
+  async removeAcls(client, filter, expected, waitLabel) {
     const p = this.probe
     const order = (rows) => rows.map((row) => JSON.stringify(aclIdentity(row))).sort()
     const deleted = deletedAcls(await p.invoke(() => client.deleteAcls({ filters: [filter] })))
     expect(order(deleted)).toEqual(order(expected))
-    await p.poll(
-      async () => (await p.invoke(() => client.describeAcls(filter))).resources.length === 0
+    let resources = null
+    await this.observedPoll(
+      waitLabel,
+      async () => {
+        ;({ resources } = await p.invoke(() => client.describeAcls(filter)))
+        return resources.length === 0
+      },
+      () => resources
     )
   }
 
@@ -176,6 +223,7 @@ class AdminLedgerScenario {
    * @param {Function} [check.item] item selector shared by positive and denied controls
    * @param {Function} [check.positiveItem] item selector for a call-level denial
    * @param {Function} [check.allowed] optional successful-result predicate for filtered reads
+   * @param {string} [check.waitLabel] phase to record with the last result or authorization failure
    * @returns {Promise<any>} first authorized result satisfying the optional read predicate
    * @throws {Error} another call failure, abort or the probe's work deadline
    */
@@ -183,25 +231,32 @@ class AdminLedgerScenario {
     const p = this.probe
     const authorizationCodes = [29, 30, 31, 53]
     let result
-    await p.poll(async () => {
-      try {
-        result = await p.invoke(check.call)
-      } catch (error) {
-        if (authorizationCodes.includes(error.code)) return false
-        if (error.name === 'KafkaJSGroupCoordinatorNotFound') return false
-        throw error
-      }
-      const selected = (check.item || check.positiveItem)?.(result)
-      const items = [selected, ...(Array.isArray(result) ? result : [])]
-      return (
-        items.every(
-          (item) =>
-            !authorizationCodes.includes(item?.errorCode) &&
-            !(item?.errorCode === -1 && item.error?.name === 'KafkaJSGroupCoordinatorNotFound')
-        ) &&
-        (!check.allowed || check.allowed(result))
-      )
-    })
+    let observation = { responsePresent: false }
+    await this.observedPoll(
+      check.waitLabel,
+      async () => {
+        try {
+          result = await p.invoke(check.call)
+          observation = { responsePresent: true, result }
+        } catch (error) {
+          observation = { error: { name: error.name, message: error.message, code: error.code } }
+          if (authorizationCodes.includes(error.code)) return false
+          if (error.name === 'KafkaJSGroupCoordinatorNotFound') return false
+          throw error
+        }
+        const selected = (check.item || check.positiveItem)?.(result)
+        const items = [selected, ...(Array.isArray(result) ? result : [])]
+        return (
+          items.every(
+            (item) =>
+              !authorizationCodes.includes(item?.errorCode) &&
+              !(item?.errorCode === -1 && item.error?.name === 'KafkaJSGroupCoordinatorNotFound')
+          ) &&
+          (!check.allowed || check.allowed(result))
+        )
+      },
+      () => observation
+    )
     return result
   }
 
@@ -1409,6 +1464,7 @@ class AdminLedgerScenario {
    * Topic DESCRIBE dependencies settle on every broker because the reused client retains metadata
    * targets even when the next operation authorizes a different resource or operation.
    * ListTransactions proves successful filtering; mutations run once after a proven safe probe.
+   * Every ID deletion wait preserves its last observation in evidence and failure diagnostics.
    * This also runs cold in the ACL profile.
    * @returns {Promise<void>}
    * @throws {Error} missing positive control, wrong failure level or cleanup failure
@@ -1548,40 +1604,67 @@ class AdminLedgerScenario {
     /**
      * Waits for the duplicate-reference DeleteTopics probe's exact ALLOW or DENY response.
      * Both phases use the recreated topic's current ID and prove it survives via metadata by ID.
+     * Each wait records its phase, requested identity and last response, including error messages.
      * @param {boolean} denied whether both references must report authorization failure
      * @returns {Promise<void>} after the controller observation and topic existence readback
      * @throws {Error} unexpected code, response identity, transport failure or work deadline
      */
     const deletionSettled = async (denied) => {
+      const phase = `ID deletion ${denied ? 'DENY' : 'ALLOW'}`
       const expected = denied
         ? [
-            { topic: deletionTopic, topicId: deletionId, errorCode: 29 },
-            { topic: deletionTopic, topicId: null, errorCode: 29 },
+            {
+              topic: deletionTopic,
+              topicId: deletionId,
+              errorCode: 29,
+              errorMessage: 'Topic authorization failed.',
+            },
+            {
+              topic: deletionTopic,
+              topicId: null,
+              errorCode: 29,
+              errorMessage: 'Topic authorization failed.',
+            },
           ]
-        : [{ topic: deletionTopic, topicId: deletionId, errorCode: 42 }]
-      let rows
-      await p.poll(async () => {
-        rows = await p.invoke(() => this.deletionProbe(maskRaw, deletionTopic, deletionId))
-        for (const { errorCode } of rows) expect([29, 42]).toContain(errorCode)
-        return (
-          rows.length === expected.length &&
-          expected.every((row) => rows.some((result) => isDeepStrictEqual(result, row)))
-        )
-      })
+        : [
+            {
+              topic: deletionTopic,
+              topicId: deletionId,
+              errorCode: 42,
+              errorMessage: 'The provided topic name maps to an ID that was already supplied.',
+            },
+          ]
+      let rows = null
+      await this.observedPoll(
+        `${phase} controller probe`,
+        async () => {
+          rows = await p.invoke(() => this.deletionProbe(maskRaw, deletionTopic, deletionId))
+          for (const { errorCode } of rows) expect([29, 42]).toContain(errorCode)
+          return (
+            rows.length === expected.length &&
+            expected.every((row) => rows.some((result) => isDeepStrictEqual(result, row)))
+          )
+        },
+        () => ({ topic: deletionTopic, topicId: deletionId, expected, rows })
+      )
       expect(rows).toHaveLength(expected.length)
       expect(rows).toEqual(expect.arrayContaining(expected))
-      let topicMetadata
-      await p.poll(async () => {
-        ;({ topicMetadata } = await p.invoke(() =>
-          this.seed.metadata([{ topicId: deletionId }], {
-            allowAutoTopicCreation: false,
-            lenient: true,
-          })
-        ))
-        expect(topicMetadata).toHaveLength(1)
-        expect([0, 100]).toContain(topicMetadata[0].topicErrorCode)
-        return topicMetadata[0].topicErrorCode === 0
-      })
+      let topicMetadata = null
+      await this.observedPoll(
+        `${phase} survival by ID`,
+        async () => {
+          ;({ topicMetadata } = await p.invoke(() =>
+            this.seed.metadata([{ topicId: deletionId }], {
+              allowAutoTopicCreation: false,
+              lenient: true,
+            })
+          ))
+          expect(topicMetadata).toHaveLength(1)
+          expect([0, 100]).toContain(topicMetadata[0].topicErrorCode)
+          return topicMetadata[0].topicErrorCode === 0
+        },
+        () => ({ topic: deletionTopic, topicId: deletionId, topicMetadata })
+      )
       expect(topicMetadata).toMatchObject([
         { topic: deletionTopic, topicId: deletionId, topicErrorCode: 0 },
       ])
@@ -1825,6 +1908,7 @@ class AdminLedgerScenario {
       },
       {
         name: 'ID deletion',
+        waitLabel: 'ID deletion positive public call',
         mutating: true,
         allowedProbe: () => deletionSettled(false),
         deniedProbe: () => deletionSettled(true),
@@ -1915,6 +1999,10 @@ class AdminLedgerScenario {
         if (dependency.resourceType === 2 && dependency.operation === 8) {
           for (const broker of permissionSources) {
             const metadata = await this.permissionAllowed({
+              waitLabel:
+                check.name === 'ID deletion'
+                  ? `ID deletion DESCRIBE ${dependency.resourceName} at ${broker.connectionPool.host}:${broker.connectionPool.port}`
+                  : undefined,
               call: () => broker.metadata([dependency.resourceName]),
             })
             expect(metadata.topicMetadata).toMatchObject([
@@ -1934,7 +2022,15 @@ class AdminLedgerScenario {
           expect.objectContaining({ transactionalId: txId })
         )
       if (check.destructive) {
-        await p.poll(async () => !(await p.invoke(() => root.listTopics())).includes(deletionTopic))
+        let topics = null
+        await this.observedPoll(
+          'ID deletion positive disappearance',
+          async () => {
+            topics = await p.invoke(() => root.listTopics())
+            return !topics.includes(deletionTopic)
+          },
+          () => ({ topic: deletionTopic, topicId: deletionId, topics })
+        )
         expect(
           await p.invoke(() =>
             root.createTopics({
@@ -2009,11 +2105,21 @@ class AdminLedgerScenario {
         }
       }
       if (!check.filtered) observedCodes.push(check.code)
-      await this.removeAcls(root, { ...acl, permissionType: 1 }, [
-        acl,
-        { ...acl, permissionType: 2 },
-      ])
-      for (const dependency of dependencyAcls) await this.removeAcls(root, dependency, [dependency])
+      await this.removeAcls(
+        root,
+        { ...acl, permissionType: 1 },
+        [acl, { ...acl, permissionType: 2 }],
+        check.name === 'ID deletion' ? 'ID deletion DELETE ACL removal' : undefined
+      )
+      for (const dependency of dependencyAcls)
+        await this.removeAcls(
+          root,
+          dependency,
+          [dependency],
+          check.name === 'ID deletion'
+            ? `ID deletion DESCRIBE ACL removal for ${dependency.resourceName}`
+            : undefined
+        )
       p.record(`permission ${check.name}`, {
         operationId: check.name,
         ...(check.filtered
