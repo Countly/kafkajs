@@ -506,6 +506,24 @@ describe('documented live scenario scripts', () => {
     for (const text of row.wording) expect(block).toContain(text)
   })
 
+  it('documents test:e2e:rack-aware-producer as the guarded racks entry, apart from the consumer row', () => {
+    const spec = 'src/producer/__tests__/rackAwareProducerLive.spec.js'
+    expect(fs.existsSync(path.join(root, spec))).toBe(true)
+    expect(scripts['test:e2e:rack-aware-producer']).toBe(
+      [
+        `timeout -k 20s 600s node "\${P9_CLUSTER_GUARD:?set P9_CLUSTER_GUARD to the reviewed guard}"`,
+        `\${KAFKA_VERSION:-4.3.1} racks RACK_AWARE_PRODUCER_E2E`,
+        spec,
+      ].join(' ')
+    )
+    expect(scripts['test:e2e:rack-aware']).toContain('RACK_AWARE_E2E=1')
+    const block = page.split('\n\n').find((paragraph) => paragraph.startsWith('Producer racks:'))
+    expect(block).toContain('npm run test:e2e:rack-aware-producer')
+    expect(block).toContain('180000 ms')
+    expect(block).toContain('docker-compose.racks.yml')
+    expect(block).toContain('sole cluster guard')
+  })
+
   it('documents the consumer-churn soak profile and its script', () => {
     expect(scripts['soak:consumer-churn']).toBe(
       'npm run test:kafka -- "node --expose-gc scripts/soak/soak.js --profile consumer-churn"'

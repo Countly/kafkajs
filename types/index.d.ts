@@ -217,6 +217,18 @@ export interface ProducerConfig {
    */
   compressionLevels?: { gzip?: number; zstd?: number }
   createPartitioner?: ICustomPartitioner
+  /**
+   * The producer's rack (KIP-1123): the `broker.rack` it runs in. It changes nothing unless
+   * `rackAware` is true. Defaults to `''`; not a string is rejected.
+   */
+  rackId?: string
+  /**
+   * With a non-empty `rackId`, the built-in partitioners prefer the partitions whose leader is in
+   * that rack for records without a key, and use every partition with a leader when none is.
+   * Records with a partition or a key keep their partition, and a custom `createPartitioner` is
+   * not affected. Defaults to `false`; true with an empty `rackId`, or not a boolean, is rejected.
+   */
+  rackAware?: boolean
   retry?: RetryOptions
   metadataMaxAge?: number
   allowAutoTopicCreation?: boolean

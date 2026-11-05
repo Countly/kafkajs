@@ -631,6 +631,14 @@ kafka.producer({ createPartitioner: Partitioners.UniformStickyPartitioner({ adap
 Partitioners.UniformStickyPartitioner({ adaptive: 'yes' })
 kafka.producer({ createPartitioner: Partitioners.DefaultPartitioner })
 
+// KIP-1123: the producer's rack and the opt-in to prefer the partitions led in it.
+kafka.producer({ rackId: 'rack-a', rackAware: true })
+kafka.producer({ rackId: 'rack-a' })
+// @ts-expect-error rackId is a string
+kafka.producer({ rackId: 7 })
+// @ts-expect-error rackAware is a boolean
+kafka.producer({ rackAware: 'yes' })
+
 // groupMetadata() and the two sendOffsets shapes.
 const runTransaction = async () => {
   const transactional = kafka.producer({ transactionalId: 'tx' })
