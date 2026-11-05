@@ -172,7 +172,10 @@ class AdminLiveProbe {
         logCreator: () => (entry) => this.logs.push(entry),
         socketFactory: (args) => this.socket(args),
       })
-      const client = kafka[kind](clientOptions)
+      // The base options keep admin calls to one attempt; an idempotent producer needs retries.
+      const settings =
+        kind === 'producer' ? { retry: { retries: 5 }, ...clientOptions } : clientOptions
+      const client = kafka[kind](settings)
       this.clients.push(client)
       this.cleanup.add(`${kind} disconnect`, () =>
         client.disconnect({ timeout: this.wholeMs(5000) })

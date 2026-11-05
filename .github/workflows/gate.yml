@@ -189,7 +189,15 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends libkrb5-dev
-          npm install --no-save --no-audit --no-fund "kerberos@$(node -p "require('./package.json').peerDependencies.kerberos")"
+          # kerberos is an optional peer, so the project install leaves it out; npm 11 also skips
+          # install scripts it was not told to allow, and the binding is built by one.
+          peer="$RUNNER_TEMP/kerberos-peer"
+          version="$(node -p "require('./package.json').peerDependencies.kerberos")"
+          npm install --prefix "$peer" --no-save --no-package-lock --no-audit --no-fund --allow-scripts=kerberos "kerberos@$version"
+          node -e "require(process.argv[1] + '/node_modules/kerberos')" "$peer" || npm rebuild --prefix "$peer" --allow-scripts=kerberos kerberos
+          node -e "require(process.argv[1] + '/node_modules/kerberos')" "$peer"
+          cp -Rn "$peer/node_modules/." node_modules/
+          node -e "require('kerberos'); console.log('kerberos', require('kerberos/package.json').version)"
       - name: Generate the delegation-token key
         if: fromJSON(steps.entry.outputs.check).needs.tokens
         run: |
