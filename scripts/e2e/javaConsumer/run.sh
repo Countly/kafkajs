@@ -1,6 +1,6 @@
 #!/bin/bash -e
 #
-# Runs one Java group member, or one Java transactional member, against the local test cluster,
+# Runs one Java group, transactional, or share member against the local test cluster,
 # for the mixed Java/JS interop scenarios. The jars are downloaded into a temporary directory and
 # are never committed.
 #
@@ -14,7 +14,9 @@
 #          <bootstrapServers> <transactionalId> <topic> <transactions> <recordsPerTransaction>
 #        scripts/e2e/javaConsumer/run.sh --role read-committed-consumer \
 #          <bootstrapServers> <groupId> <topic> <runForMs>
-#        scripts/e2e/javaConsumer/run.sh --role <either role> --probe
+#        scripts/e2e/javaConsumer/run.sh --role share-member [--halt-after <n>] \
+#          <bootstrapServers> <groupId> <topic> <runForMs>
+#        scripts/e2e/javaConsumer/run.sh --role <any role> --probe
 # Compression role: --role compressed-producer --compression gzip|snappy|lz4|zstd
 #   <bootstrapServers> <source> <topic> <records>
 # Requires: a JDK on PATH (javac + java), network access to Maven Central on first run.
@@ -48,13 +50,18 @@ fi
   -o "${SLF4J_JAR}"
 
 CP="${CLIENTS_JAR}:${SLF4J_JAR}${JAVA_CODEC_CLASSPATH:+:${JAVA_CODEC_CLASSPATH}}"
-javac -cp "${CP}" -d "${WORK_DIR}" "${SRC_DIR}/JavaGroupMember.java" "${SRC_DIR}/JavaTransactionalMember.java"
+javac -cp "${CP}" -d "${WORK_DIR}" "${SRC_DIR}/JavaGroupMember.java" "${SRC_DIR}/JavaTransactionalMember.java" "${SRC_DIR}/JavaShareMember.java"
 
-# --role selects the transactional member; without it the group member runs exactly as before.
+# --role selects a member; without it the group member runs exactly as before. Only the exact
+# value share-member selects the share member; every other role keeps the transactional member.
 MEMBER_CLASS="JavaGroupMember"
-for arg in "$@"; do
-  if [ "${arg}" = "--role" ]; then
+ARGS=("$@")
+for ((i=0; i<${#ARGS[@]}; i++)); do
+  if [ "${ARGS[i]}" = "--role" ]; then
     MEMBER_CLASS="JavaTransactionalMember"
+    if [ "${ARGS[i+1]:-}" = "share-member" ]; then
+      MEMBER_CLASS="JavaShareMember"
+    fi
   fi
 done
 
