@@ -567,6 +567,13 @@ describe('Floor command registration', () => {
       'FLOOR_TOKENS_E2E',
       'src/admin/__tests__/floorTokensLive.spec.js',
     ],
+    [
+      'test:floor:conditional',
+      900,
+      'racks',
+      'FLOOR_CONDITIONAL_E2E',
+      'src/admin/__tests__/floorConditionalLive.spec.js',
+    ],
   ]
 
   it('routes every floor script directly through the shared guard', () => {
@@ -583,6 +590,7 @@ describe('Floor command registration', () => {
       for (const pattern of [
         'src/broker/__tests__/floorGssapiLive\\.spec\\.js',
         'src/admin/__tests__/floorTokensLive\\.spec\\.js',
+        'src/admin/__tests__/floorConditionalLive\\.spec\\.js',
       ]) {
         expect(scripts[lane].split(pattern)).toHaveLength(2)
       }

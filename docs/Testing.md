@@ -207,6 +207,7 @@ Consumer measurements count delivered records, batch callbacks and actual handle
 | `test:floor:oauth` | OAuth validator | All helper forms, refresh and file rotation |
 | `test:floor:gssapi` | KDC | Initial authentication, observed ticket expiry, reconnect and re-authentication |
 | `test:floor:tokens` | Tokens enabled | Token lifecycle, plaintext refusal and secret-free diagnostics |
+| `test:floor:conditional` | Racks | ApiVersions, TxnOffsetCommit and DeleteGroups keep the versions the floor offers, and the producer's rack preference falls back and keeps a custom partitioner's choice |
 
 Kafka 4.0.2 floor executions belong to CI. Local gates use Kafka 4.3.1 and Node 26; a local broker run supplies no floor result. Run every floor variant cold through the shared guard and reservation, with the actual broker version stamped and evidence verified before owned teardown. A missing or unbootable image blocks acceptance. The final candidate repeats the complete base and variant family; an earlier floor receipt does not certify a later candidate. A skipped suite supplies no acceptance.
 
