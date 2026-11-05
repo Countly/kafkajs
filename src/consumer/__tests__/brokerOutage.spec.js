@@ -707,6 +707,8 @@ describe('Consumer > broker outages', () => {
      * Runs two partition leaders beside a separate coordinator, capturing the real runner while
      * keeping its Fetch and retry decisions intact. Both leaders continuously produce records.
      * Outage clocks are keyed by the pool's string node ids.
+     * Reconnect backoff is capped at 100 ms so the crash timing measures the outage deadline,
+     * not reconnect pacing.
      * @returns {object} the scenario, leaders, and access to the active runner
      */
     const leaders = () => {
@@ -717,7 +719,7 @@ describe('Consumer > broker outages', () => {
           heartbeatInterval: 100,
           retry: { ...RETRY, restartOnFailure: async () => false },
         },
-        {},
+        { reconnectBackoffMax: 100 },
         { nodes, partitions: 2 }
       )
       rig.cluster.answer('Metadata', () => ({
