@@ -55,14 +55,26 @@ describe('delete topics by id retries', () => {
 
   test('a NOT_CONTROLLER answer to the refresh after the delete is retried', async () => {
     const { admin, broker, cluster } = fixture()
+    const calls = []
     cluster.refreshMetadata
-      .mockResolvedValueOnce(undefined)
-      .mockRejectedValueOnce(createErrorFromCode(41))
+      .mockImplementationOnce(async () => {
+        calls.push('refresh')
+      })
+      .mockImplementationOnce(async () => {
+        calls.push('refresh failed')
+        throw createErrorFromCode(41)
+      })
+      .mockImplementation(async () => {
+        calls.push('refresh')
+      })
+    broker.deleteTopics.mockImplementation(async () => {
+      calls.push('delete')
+    })
 
     await admin.deleteTopics({ topicIds: [first] })
 
-    expect(broker.deleteTopics).toHaveBeenCalledTimes(1)
-    expect(cluster.refreshMetadata).toHaveBeenCalledTimes(3)
+    expect(calls).toEqual(['refresh', 'delete', 'refresh failed', 'refresh'])
+    expect(broker.deleteTopics.mock.calls.map(([request]) => request.topicIds)).toEqual([[first]])
   })
 
   test('any other failure of the refresh after the delete is not retried', async () => {

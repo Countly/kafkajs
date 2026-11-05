@@ -60,21 +60,32 @@ describe('log directory edges', () => {
       describeLogDirs: jest.fn(async () => ({ errorCode: 31, logDirs: [] })),
     })
 
-    const [result] = await admin.describeReplicaLogDirs({ replicas: [REPLICA] })
+    const asked = [REPLICA, { topic: 'payments', partition: 3, brokerId: 2 }]
 
-    expect({
-      ...REPLICA,
-      currentLogDir: result.currentLogDir,
-      futureLogDir: result.futureLogDir,
-      errorCode: result.errorCode,
-      errorType: result.error.type,
-    }).toEqual({
-      ...REPLICA,
-      currentLogDir: null,
-      futureLogDir: null,
-      errorCode: 31,
-      errorType: 'CLUSTER_AUTHORIZATION_FAILED',
-    })
+    const results = await admin.describeReplicaLogDirs({ replicas: asked })
+
+    expect(results).toHaveLength(2)
+    expect(
+      results.map((result) => ({
+        topic: result.topic,
+        partition: result.partition,
+        brokerId: result.brokerId,
+        currentLogDir: result.currentLogDir,
+        futureLogDir: result.futureLogDir,
+        errorCode: result.errorCode,
+        errorType: result.error.type,
+        errorMessage: result.errorMessage,
+      }))
+    ).toEqual(
+      asked.map((replica) => ({
+        ...replica,
+        currentLogDir: null,
+        futureLogDir: null,
+        errorCode: 31,
+        errorType: 'CLUSTER_AUTHORIZATION_FAILED',
+        errorMessage: null,
+      }))
+    )
   })
 })
 

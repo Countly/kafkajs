@@ -68,14 +68,18 @@ describe('Broker > admin request capabilities', () => {
     )
   })
 
-  test('a cluster request with no minimum builds from any overlapping range', () => {
+  test('a cluster request with no minimum builds from any overlapping range', async () => {
     const { broker } = brokerOver({
       [apiKeys.ListConfigResources]: { minVersion: 0, maxVersion: 1 },
     })
 
-    expect(
-      typeof broker.clusterRequest(apiKeys.ListConfigResources, requests.ListConfigResources)
-    ).toBe('function')
+    const build = broker.clusterRequest(apiKeys.ListConfigResources, requests.ListConfigResources)
+    const { request } = build({ resourceTypes: [16] })
+
+    expect(request.apiKey).toBe(apiKeys.ListConfigResources)
+    expect(request.apiVersion).toBe(1)
+    // compact resourceTypes [16], tag buffer
+    expect((await request.encode()).buffer.toString('hex')).toBe('021000')
   })
 
   test('electLeaders without options sends a preferred election of every partition at the newest version', async () => {
