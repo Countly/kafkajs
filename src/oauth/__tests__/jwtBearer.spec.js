@@ -342,7 +342,7 @@ describe('OAuth JWT bearer and signer', () => {
       [{}],
       [{ file: 'key.pem', key: 'pem' }],
       [{ path: 'key.pem' }],
-      [new Date()],
+      [new Date(0)],
     ])('privateKey %p is refused', (privateKey) => {
       expect(() => signAssertion({ privateKey })).toThrow(
         'Invalid OAuth bearer helper option: privateKey'

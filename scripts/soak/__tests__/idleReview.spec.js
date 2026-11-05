@@ -154,10 +154,11 @@ test('a healthy idle cycle completes when GC enables delayed heap sampling', asy
   }
 })
 
+// Replaying the full 420 s profile on fake timers takes about 95 s of CPU on a 2-core runner.
 test('healthy default metadata expiry does not fail a full duration idle profile', async () => {
   expect(PROFILES.idle).toEqual([{ name: 'idle', workload: 'idle', ms: 420000 }])
   await healthyIdle({ duration: PROFILES.idle[0].ms })
-})
+}, 300000)
 
 test('healthy metadata expiry at 9000 ms permits an additional metadata socket', async () => {
   await healthyIdle({ metadataMaxAge: 9000 })

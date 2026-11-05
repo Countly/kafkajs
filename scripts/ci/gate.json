@@ -10446,7 +10446,7 @@
         "src/oauth/__tests__/jwtBearer.spec.js \u203a OAuth JWT bearer and signer the local signer failed key rotation cannot continue using the old key",
         "src/oauth/__tests__/jwtBearer.spec.js \u203a OAuth JWT bearer and signer the local signer file key rotation changes the verifying key",
         "src/oauth/__tests__/jwtBearer.spec.js \u203a OAuth JWT bearer and signer the local signer jti false omits the identifier and an empty key id is kept",
-        "src/oauth/__tests__/jwtBearer.spec.js \u203a OAuth JWT bearer and signer the local signer privateKey 2026-11-05T13:58:14.710Z is refused",
+        "src/oauth/__tests__/jwtBearer.spec.js \u203a OAuth JWT bearer and signer the local signer privateKey 1970-01-01T00:00:00.000Z is refused",
         "src/oauth/__tests__/jwtBearer.spec.js \u203a OAuth JWT bearer and signer the local signer privateKey 5 is refused",
         "src/oauth/__tests__/jwtBearer.spec.js \u203a OAuth JWT bearer and signer the local signer privateKey [] is refused",
         "src/oauth/__tests__/jwtBearer.spec.js \u203a OAuth JWT bearer and signer the local signer privateKey null is refused",
