@@ -17898,6 +17898,8 @@
         "src/admin/__tests__/adminVersionsLive.spec.js \u203a Admin > topic, record, group and ACL APIs at their newest versions (live) every evidence line of this run carries the stamps a verifier checks",
         "src/admin/__tests__/createTopicsColdLive.spec.js \u203a Admin > createTopics on a cold cluster (live) 30 createTopics calls with waitForLeaders, 4 at a time, all succeed",
         "src/admin/__tests__/createTopicsColdLive.spec.js \u203a Admin > createTopics on a cold cluster (live) its evidence line carries the stamps a verifier checks",
+        "src/admin/__tests__/deleteGroupsV3Live.spec.js \u203a Admin > deleteGroups message per group (live) deletes a group whose member has stopped and leaves neither the group nor its commit",
+        "src/admin/__tests__/deleteGroupsV3Live.spec.js \u203a Admin > deleteGroups message per group (live) refuses a missing group and a group with a member each under its own id, and leaves the member group as it was",
         "src/admin/__tests__/describeTopicPartitionsLive.spec.js \u203a Admin > fetchTopicMetadata > DescribeTopicPartitions (live) a broker pages through 12 partitions one at a time and ends on a null cursor",
         "src/admin/__tests__/describeTopicPartitionsLive.spec.js \u203a Admin > fetchTopicMetadata > DescribeTopicPartitions (live) a topic that does not exist fails the call and is not created by it",
         "src/admin/__tests__/describeTopicPartitionsLive.spec.js \u203a Admin > fetchTopicMetadata > DescribeTopicPartitions (live) fetchTopicMetadata through DescribeTopicPartitions agrees with the Metadata path",
@@ -18365,7 +18367,9 @@
         "src/admin/__tests__/quotaThrottleLive.spec.js \u203a admin producer quotas applies a produce quota and recovers after removal",
         "src/admin/__tests__/adminTokensLive.spec.js \u203a admin delegation tokens creates renews and expires delegation tokens without diagnostic secrets",
         "src/admin/__tests__/adminLogDirsLive.spec.js \u203a admin replica directories moves a replica between configured directories without changing its log",
-        "src/admin/__tests__/adminTieredLive.spec.js \u203a admin configured remote storage reads retained records after remote upload and local eviction"
+        "src/admin/__tests__/adminTieredLive.spec.js \u203a admin configured remote storage reads retained records after remote upload and local eviction",
+        "src/admin/__tests__/deleteGroupsV3Live.spec.js \u203a Admin > deleteGroups message per group (live) deletes a group whose member has stopped and leaves neither the group nor its commit",
+        "src/admin/__tests__/deleteGroupsV3Live.spec.js \u203a Admin > deleteGroups message per group (live) refuses a missing group and a group with a member each under its own id, and leaves the member group as it was"
       ]
     },
     {
@@ -21209,8 +21213,62 @@
         "src/producer/__tests__/sendOffsetsLive.spec.js \u203a Producer > sendOffsets with group metadata (live) classic protocol a membership gone stale before sendOffsets makes it abortable; abort, rejoin and reprocess leave no duplicate and no gap",
         "src/producer/__tests__/sendOffsetsLive.spec.js \u203a Producer > sendOffsets with group metadata (live) consumer protocol offsets and output commit or abort together; the commit carries the consumer\u2019s membership, and the legacy group id still commits",
         "src/producer/__tests__/sendOffsetsLive.spec.js \u203a Producer > sendOffsets with group metadata (live) consumer protocol a joining consumer waits for the open transaction holding its group\u2019s offsets, a rebalance meanwhile does not, and nobody is evicted",
-        "src/producer/__tests__/sendOffsetsLive.spec.js \u203a Producer > sendOffsets with group metadata (live) consumer protocol a membership gone stale before sendOffsets makes it abortable; abort, rejoin and reprocess leave no duplicate and no gap"
+        "src/producer/__tests__/sendOffsetsLive.spec.js \u203a Producer > sendOffsets with group metadata (live) consumer protocol a membership gone stale before sendOffsets makes it abortable; abort, rejoin and reprocess leave no duplicate and no gap",
+        "src/admin/__tests__/deleteGroupsV3Live.spec.js \u203a Admin > deleteGroups message per group (live) deletes a group whose member has stopped and leaves neither the group nor its commit",
+        "src/admin/__tests__/deleteGroupsV3Live.spec.js \u203a Admin > deleteGroups message per group (live) refuses a missing group and a group with a member each under its own id, and leaves the member group as it was"
       ]
+    },
+    {
+      "id": "e2e-delete-groups-v3-4.4.0",
+      "kind": "cluster",
+      "compose": "docker-compose.yml",
+      "kafkaVersion": "4.4.0",
+      "env": {
+        "DELETE_GROUPS_V3_E2E": "1"
+      },
+      "jest": [
+        "--forceExit",
+        "--testPathPatterns",
+        "src/admin/__tests__/deleteGroupsV3Live\\.spec\\.js"
+      ],
+      "jestScript": null,
+      "nodeTest": null,
+      "command": null,
+      "needs": {},
+      "evidence": [
+        "delete-groups-v3"
+      ],
+      "titles": [
+        "src/admin/__tests__/deleteGroupsV3Live.spec.js \u203a Admin > deleteGroups message per group (live) deletes a group whose member has stopped and leaves neither the group nor its commit",
+        "src/admin/__tests__/deleteGroupsV3Live.spec.js \u203a Admin > deleteGroups message per group (live) refuses a missing group and a group with a member each under its own id, and leaves the member group as it was"
+      ],
+      "capMinutes": 30
+    },
+    {
+      "id": "e2e-delete-groups-v3-4.3.1",
+      "kind": "cluster",
+      "compose": "docker-compose.yml",
+      "kafkaVersion": "4.3.1",
+      "env": {
+        "DELETE_GROUPS_V3_E2E": "1"
+      },
+      "jest": [
+        "--forceExit",
+        "--testPathPatterns",
+        "src/admin/__tests__/deleteGroupsV3Live\\.spec\\.js"
+      ],
+      "jestScript": null,
+      "nodeTest": null,
+      "command": null,
+      "needs": {},
+      "evidence": [
+        "delete-groups-v3"
+      ],
+      "titles": [
+        "src/admin/__tests__/deleteGroupsV3Live.spec.js \u203a Admin > deleteGroups message per group (live) deletes a group whose member has stopped and leaves neither the group nor its commit",
+        "src/admin/__tests__/deleteGroupsV3Live.spec.js \u203a Admin > deleteGroups message per group (live) refuses a missing group and a group with a member each under its own id, and leaves the member group as it was"
+      ],
+      "capMinutes": 30
     }
   ]
 }
