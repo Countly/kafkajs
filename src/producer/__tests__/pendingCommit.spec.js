@@ -75,6 +75,8 @@ const createCommittingProducer = async ({ level = 2, retry = RETRY } = {}) => {
     logger,
     transactionalId: TRANSACTIONAL_ID,
     retry,
+    // The setup send must not inherit a short retry.maxTotalTime as its delivery deadline
+    deliveryTimeout: 30000,
   })
   await producer.connect()
   const transaction = await producer.transaction()

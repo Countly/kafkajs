@@ -56,7 +56,8 @@ describe('Consumer > OffsetManager > reset schedules on the wire', () => {
     await wire.manager.resolveOffsets()
 
     expect(wire.next()).toEqual('0')
-    expect(wire.committedAt()).toEqual('0')
+    expect(wire.heldAt()).toEqual('0')
+    expect(wire.committedAt()).toBeUndefined()
     expect(wire.obligations.size()).toBe(1)
     expect(wire.requests().map(({ api }) => api)).toEqual([
       'OffsetFetch',
@@ -75,12 +76,14 @@ describe('Consumer > OffsetManager > reset schedules on the wire', () => {
 
     await wire.recreate(NEW_ID)
     await wire.manager.resolveOffsets()
-    expect(wire.committedAt()).toEqual('0')
+    expect(wire.heldAt()).toEqual('0')
+    expect(wire.committedAt()).toBeUndefined()
     old.release(wire.answers.offsetFetch({ 0: '99' }))
     await expect(stale).resolves.toBe(false)
 
     expect(wire.next()).toEqual('0')
-    expect(wire.committedAt()).toEqual('0')
+    expect(wire.heldAt()).toEqual('0')
+    expect(wire.committedAt()).toBeUndefined()
     expect(wire.owed()).toBe(true)
     expect(wire.requests().map(({ api }) => api)).toEqual([
       'OffsetFetch',
@@ -104,7 +107,8 @@ describe('Consumer > OffsetManager > reset schedules on the wire', () => {
     await wire.manager.resolveOffsets()
 
     expect(wire.next()).toEqual('0')
-    expect(wire.committedAt()).toEqual('0')
+    expect(wire.heldAt()).toEqual('0')
+    expect(wire.committedAt()).toBeUndefined()
     expect(wire.owed()).toBe(true)
     expect(sent(wire, 'ListOffsets')).toHaveLength(2)
   })
@@ -123,7 +127,8 @@ describe('Consumer > OffsetManager > reset schedules on the wire', () => {
     await expect(stale).resolves.toBe(false)
 
     expect(rejoined.nextOffset(TOPIC, 0).toString()).toEqual('0')
-    expect(wire.committedAt()).toEqual('0')
+    expect(wire.heldAt(0, rejoined)).toEqual('0')
+    expect(wire.committedAt(0)).toBeUndefined()
     expect(wire.obligations.size()).toBe(1)
     expect(sent(wire, 'ListOffsets')).toHaveLength(2)
   })
@@ -158,6 +163,7 @@ describe('Consumer > OffsetManager > reset schedules on the wire', () => {
 
       expect(wire.next()).toEqual('500')
       expect(wire.committedAt()).toEqual('500')
+      expect(wire.heldAt()).toEqual('500')
       expect(wire.owed()).toBe(false)
       expect(sent(wire, 'OffsetCommit')[0].fields.topics[0].partitions[0].offset).toEqual('500')
       expect(wire.requests().every(({ version }) => version === 9)).toBe(true)

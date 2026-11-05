@@ -66,7 +66,13 @@ Versions before 3.0.0 are internal alpha tags and are not published.
 - Fetch sessions (KIP-227) are opt-in; set `fetchSessions: true` to enable them.
 - **`stop()` and `disconnect()` end a handler's API authority at once, so a handler's explicit `commitOffsets()` that is still waiting for the group coordinator when the stop begins can reject with `CONSUMER_STOPPING`.** In 2.2.4 such a commit could still finish while the stop waited for the batch. Now the rejection gives no promise that the commit completed, and an uncaught rejection is the handler's error, so the batch can be redelivered. Offsets committed before the stop began stay committed. A commit from outside the handlers and one made by an authorized close hook may still complete. To require that a commit finishes, drain the handlers and await the commit before calling `stop()` or `disconnect()`.
 
+- When a broker joins or leaves, the consumer no longer pauses every fetcher until all in-flight long polls end: surviving brokers keep fetching, a new broker gets a fetcher at once and only a departed broker's fetcher stops (2.2.4 drained and recreated all fetchers).
+
+- While a broker is unreachable, only its fetcher backs off and retries; the consumer keeps fetching from the other brokers (2.2.4 stopped and restarted every fetcher on each retry). Outage limits, warnings and events are unchanged.
+
 #### Fixes
+
+- A consumer's position derived from a reset policy (`earliest`, `latest`, duration, sentinel seek, or the `none` policy's local position) stays private to that consumer instead of being written into the group's shared committed-offset cache, so two consumers of one group with different reset policies no longer overwrite each other's starting position; real commits stay shared.
 
 - On Node 22, a truncated zstd record batch is now refused as `KafkaJSCorruptRecordError` (reason `decompression`), as on Node 24.20+ and 26.6+, instead of decoding as fewer records. Node 22's `zlib` does not reject truncated zstd input (nodejs/node#64593), so the codec checks the first frame's blocks and checksum itself on every Node version.
 - An ordinary `consumer.disconnect()` called from a `CRASH` listener no longer cancels the automatic restart, as in 2.2.4, which emits `CRASH` before it arms the restart timer. The restart waits for that close to finish its cluster and group cleanup, then starts a new run. A forced close (`disconnect({ timeout: 0 })`), a close whose `timeout` expires, and any `stop()` or `disconnect()` asked after the restart is armed still cancel it, as does an explicit `run()`, which supersedes a pending restart. A cancelled restart clears its timer at once and holds no listener or connection lifetime.
@@ -124,6 +130,10 @@ Versions before 3.0.0 are internal alpha tags and are not published.
 
 #### Tooling
 
+- The exit gate workflow runs each check as its own job, started on every ready (non-draft) pull request, every push to master or a manual dispatch, invokes the coordinator build with Bash, and supports bounded standalone broker and assignment-gate controls on fresh CI runners.
+
+- The exit checks run in CI from `scripts/ci/gate.json`, and `scripts/ci/checkIdentities.js` fails a gate job whose live specs skipped, failed or left an expected test out of the Jest report, including the unit script and its allowed skips. Node test reports enforce completed OTel runs and live identities; tracked-file hygiene sweeps compare against the previous release tag.
+
 - The coverage floors are re-derived at this release from two cold coverage runs on Kafka 4.3.1, the lower of the two: global 98.9 % statements, 96.4 % branches, 98.9 % functions, 99.1 % lines; `src/consumer/groupProtocol/` 99.9 / 99.4 / 100 / 99.9; `src/consumer/assigners/` branches 97.3 and functions 99.3. No floor is lower than before. The coverage run now executes its spec files in fixed batches of 25 instead of one broad run, and checks every batch's tests and coverage maps against a sealed list.
 
 - Extend transport fixtures with independently checked consumer error and Fetch-session variants.
@@ -152,7 +162,7 @@ Versions before 3.0.0 are internal alpha tags and are not published.
 
 - Validate Fetch-session measurements against independent frames and real batch/message counts.
 
-- Add replayable consumer fault schedules, generated manual, rebalance-hook, forced-close and fetch-session lifecycle cases, and the `soak:consumer-churn` profile with independent log, broker-offset and handler checks, resource baselines and delivery-gap samples.
+- Add replayable consumer fault schedules, generated manual, rebalance-hook, forced-close and fetch-session lifecycle cases, and the `soak:consumer-churn` profile with independent log, broker-offset and handler checks, resource baselines and delivery-gap samples; named-topic soak subscriptions retry transient metadata propagation for up to five seconds.
 - The lifecycle matrix and consumer schedule specs fake the imported and the global monotonic clock together, so they pass late in a long-lived Jest worker; forced-close cells now exercise a real zero-timeout force. No library behaviour changed.
 - The `soak:producer-churn` durability check keys its duplicate detection on each record's raw identity (partition, producer id, epoch, sequence) in a fixed table sized from the offered-record bound, instead of at most 64 producer identities, so a run with many legitimate epoch bumps is checked in full rather than failing on table capacity.
 

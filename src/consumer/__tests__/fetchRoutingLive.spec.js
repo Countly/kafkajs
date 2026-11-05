@@ -11,9 +11,6 @@ const {
 const { BrokerBouncer, NODES, waitForFullIsr } = require('../../../testHelpers/leaderElection')
 const { readLog } = require('../../../testHelpers/rawLog')
 const apiKeys = require('../../protocol/requests/apiKeys')
-const Decoder = require('../../protocol/decoder')
-const { requests } = require('../../protocol/requests')
-const { responseHeaderVersion, RESPONSE_HEADER_V1 } = require('../../protocol/headers')
 const {
   CleanupStack,
   COORDINATOR_TYPES,
@@ -29,13 +26,17 @@ const {
   liveCase,
   pollUntil,
 } = require('../../producer/__tests__/fixtures/bounded')
-const { WireTranscript } = require('./fixtures/rackWire')
+const { RoutingWire } = require('./fixtures/routingWire')
+const { FetcherRecreations } = require('./fixtures/fetcherRecreations')
+const { RoutingChanges } = require('./fixtures/routingChanges')
+const { FetcherPhases, brokerSetChanges } = require('./fixtures/fetcherPhases')
 const {
   MOVE_WAIT_MS,
   ROUND_ALLOWANCE_MS,
   UNHINTED_OUTAGE,
   moveProblems,
   partitionLeader,
+  pollAtRoute,
   siblingProblems,
 } = require('./fixtures/fetchRoutingOracle')
 
@@ -138,86 +139,6 @@ const rolesFor = (coordinatorId) => {
 }
 
 /**
- * Records every frame a client writes and answers it reads, as `WireTranscript` does, and also the
- * Metadata answers and the time each socket closed, so a case can place the moment an old leader
- * was lost and the moment a new one became known.
- */
-class RoutingWire extends WireTranscript {
-  /** Starts with no closed socket. */
-  constructor() {
-    super()
-    /** @type {Array<{ endpoint: string, at: number }>} when each socket closed */
-    this.closes = []
-  }
-
-  /**
-   * @param {object} socket a socket of the client
-   * @param {{ host: string, port: number }} address
-   * @returns {object} the socket, also noting when it closes
-   */
-  observe(socket, address) {
-    const observed = super.observe(socket, address)
-    const endpoint = `${address.host}:${address.port}`
-    observed.once('close', () => this.closes.push({ endpoint, at: performance.now() }))
-    return observed
-  }
-
-  /**
-   * @param {number} connection
-   * @param {Buffer} frame one complete answer frame
-   * @returns {void}
-   */
-  read(connection, frame) {
-    const exchange = this.open.get(`${connection}:${frame.readInt32BE(4)}`)
-    super.read(connection, frame)
-    if (exchange?.apiKey === METADATA && !exchange.answer) {
-      exchange.answer = { at: performance.now(), frame }
-    }
-  }
-
-  /**
-   * Decodes the answers of one API, once each.
-   * @param {number} apiKey `Fetch` or `Metadata`
-   * @returns {Promise<Array<{ exchange: object, at: number, decoded: object }>>} oldest first
-   */
-  async answers(apiKey) {
-    const kept = this.exchanges.filter((x) => x.apiKey === apiKey && x.answer)
-    return Promise.all(
-      kept.map(async (exchange) => {
-        exchange.decoded ??= this.decode(exchange)
-        return { exchange, at: exchange.answer.at, decoded: await exchange.decoded }
-      })
-    )
-  }
-
-  /**
-   * @param {object} exchange an exchange whose answer was kept
-   * @returns {Promise<object>} the answer's decoded body
-   */
-  async decode(exchange) {
-    const { response } = requests[exchange.apiKey === FETCH ? 'Fetch' : 'Metadata'].protocol({
-      version: exchange.apiVersion,
-    })({
-      maxWaitTime: 0,
-      minBytes: 0,
-      maxBytes: 0,
-      topics: [],
-      topicIds: new Map(),
-      rackId: '',
-      allowAutoTopicCreation: false,
-    })
-    const { frame } = exchange.answer
-    const header = new Decoder(frame)
-    header.readInt32()
-    header.readInt32()
-    if (responseHeaderVersion(exchange.apiKey, exchange.apiVersion) === RESPONSE_HEADER_V1) {
-      header.readTaggedFields()
-    }
-    return response.decode(frame.subarray(header.offset))
-  }
-}
-
-/**
  * One client group over a few single-partition topics on the live cluster: the topics with the
  * replicas asked for, one member, what its handlers were given, the commits it confirmed and the
  * wire it showed. Protocol work only: every wait goes through the case scope and every client is
@@ -237,6 +158,14 @@ class Episode {
     this.name = name
     this.brokers = plainTextBrokers()
     this.wire = new RoutingWire()
+    this.fetcherRecreations = new FetcherRecreations()
+    this.phases = new FetcherPhases()
+    /** @type {RoutingChanges|null} watches the member's routing changes once the topics exist */
+    this.routingChanges = null
+    /** @type {Array<{ label: string, topic: string, partition: number }>} the traced partitions */
+    this.targets = []
+    /** @type {number|null} `performance.now()` when the move was issued, the diagnostics' start */
+    this.since = null
     /** @type {Array<{ topic: string, partition: number, offset: string, value: string, at: number }>} */
     this.handled = []
     /** @type {Array<{ topic: string, partition: number, offset: number, at: number }>} */
@@ -261,13 +190,16 @@ class Episode {
   /**
    * Creates the topics with the replicas asked for, one partition each, and learns the cluster's
    * nodes and the topic ids.
-   * @param {Array<{ topic: string, replicas: number[] }>} topics
+   * @param {Array<{ topic: string, replicas: number[], label: string }>} topics `label` names the
+   *   topic's partition 0 in the diagnostics
    * @returns {Promise<void>}
    */
   async open(topics) {
     const { scope, cleanup, id, name } = this
     this.stage = 'opening'
     this.topics = topics.map(({ topic }) => topic)
+    this.targets = topics.map(({ topic, label }) => ({ label, topic, partition: 0 }))
+    this.routingChanges = new RoutingChanges(this.targets)
     this.kafka = new Kafka({
       clientId: `${PREFIX}-${name}-${id}`,
       brokers: this.brokers,
@@ -318,7 +250,8 @@ class Episode {
     const kafka = new Kafka({
       clientId: `${PREFIX}-${name}-member-${id}`,
       brokers: this.brokers,
-      logLevel: logLevel.NOTHING,
+      logLevel: logLevel.DEBUG,
+      logCreator: this.fetcherRecreations.logCreator,
       socketFactory: this.wire.socketFactory,
     })
     const consumer = kafka.consumer({
@@ -329,6 +262,10 @@ class Episode {
       sessionTimeout: 30000,
     })
     this.consumer = consumer
+    this.routingChanges.attach()
+    cleanup.add('routing observer', () => this.routingChanges.detach())
+    this.phases.attach()
+    cleanup.add('phase observer', () => this.phases.detach())
     const off = [
       consumer.on(consumer.events.GROUP_JOIN, ({ payload }) => this.joins.push(payload)),
       consumer.on(consumer.events.REBALANCING, ({ payload }) => this.rebalances.push(payload)),
@@ -453,6 +390,7 @@ class Episode {
    * @returns {void}
    */
   windowStart() {
+    this.phases.open()
     this.window = {
       at: Date.now(),
       joins: this.joins.length,
@@ -480,6 +418,8 @@ class Episode {
   async close() {
     this.stage = 'closing'
     await step(this.scope, 'The consumer stop', () => this.consumer.disconnect())
+    this.routingChanges.detach()
+    this.phases.detach()
     this.committed = new Map()
     for (const topic of this.topics) {
       const [{ partitions }] = await step(this.scope, 'The offset read', () =>
@@ -489,6 +429,43 @@ class Episode {
     }
     this.stage = 'closed'
     return this.committed
+  }
+
+  /**
+   * Collects what the case saw around the move, for the evidence row alone: no bound reads it. It
+   * answers the questions a late Fetch leaves open. Every fetcher reconciliation the fetch manager
+   * logged, with the nodes it added and removed, and each fetcher's start and stop: did a
+   * destination's fetcher wait on another node's? Every broker-set change a Metadata answer
+   * advertised, kept apart from the routing changes the member's cluster published from the move
+   * on, with the leader and epoch its cache held and the leader it routed by: was the moved
+   * partition's new leader accepted when the Metadata answer arrived? Where each node's fetcher
+   * was in its round (preparation, metadata wait, idle wait, heartbeat, Fetch written) from the
+   * window's start. And the Fetches each node wrote and had answered from the move to one round
+   * after the last destination started.
+   * @returns {Promise<{ from: number, to: number, fetcherManager: object, brokerSets: object,
+   *   routing: object, phases: object, fetches: object }>} each part is capped, with the count of
+   *   what the cap discarded
+   */
+  async diagnose() {
+    const from = this.since ?? 0
+    const moves = this.facts.moves ?? []
+    const to = moves.length
+      ? Math.max(...moves.map(({ nextAt }) => nextAt)) + ROUND_ALLOWANCE_MS
+      : performance.now()
+    const targets = this.targets.map(({ label, topic }) => ({
+      label,
+      topic,
+      topicId: this.ids?.get(topic),
+    }))
+    return {
+      from,
+      to,
+      fetcherManager: this.fetcherRecreations.since(from),
+      brokerSets: brokerSetChanges(await this.wire.answers(METADATA), from),
+      routing: this.routingChanges?.since(from) ?? { changes: [], dropped: 0 },
+      phases: this.phases.since(from),
+      fetches: await this.wire.fetchTrace({ from, to, targets }),
+    }
   }
 
   /**
@@ -553,13 +530,15 @@ class Episode {
           )
           if (!lost) return false
           errorAt = lost.at
-          const known = (await wire.answers(METADATA)).find(
-            ({ at, decoded }) =>
-              at >= errorAt &&
-              decoded.topicMetadata
-                .find((t) => t.topic === topic)
-                ?.partitionMetadata.some((p) => p.partitionId === 0 && p.leader === newNode)
-          )
+          const known = (await wire.answers(METADATA))
+            .sort((a, b) => a.at - b.at)
+            .find(
+              ({ at, decoded }) =>
+                at >= errorAt &&
+                decoded.topicMetadata
+                  .find((t) => t.topic === topic)
+                  ?.partitionMetadata.some((p) => p.partitionId === 0 && p.leader === newNode)
+            )
           if (!known) return false
           routeAt = known.at
         }
@@ -570,7 +549,8 @@ class Episode {
         const prior = wire.exchanges.filter(
           (x) => x.apiKey === FETCH && x.endpoint === newEndpoint && x.at <= routeAt
         )
-        const outstanding = prior.filter((x) => x.at <= errorAt).at(-1)
+        const outstanding = pollAtRoute(prior, routeAt)
+        const atLoss = prior.filter((x) => x.at <= errorAt).at(-1)
         found = {
           kind,
           hinted,
@@ -581,6 +561,8 @@ class Episode {
           routeAt,
           nextAt: next.at,
           priorFetches: prior.length,
+          lossPollWriteAt: atLoss?.at ?? null,
+          lossPollDoneAt: atLoss?.answer?.at ?? null,
           pollWriteAt: outstanding?.at ?? null,
           pollDoneAt: outstanding?.answer?.at ?? null,
           hint: hint?.currentLeader ?? null,
@@ -678,6 +660,18 @@ const withCase = (scope, body) => {
 }
 
 /**
+ * @param {Episode} episode
+ * @returns {Promise<object>} the episode's diagnostics, or why they could not be collected
+ */
+const diagnosticsOf = async (episode) => {
+  try {
+    return await episode.diagnose()
+  } catch (error) {
+    return { error: describeError(error) }
+  }
+}
+
+/**
  * Runs a case body and then, however it ended, writes the evidence row of each episode, so the
  * rows exist before any cleanup. A failed write never replaces the body's own failure; with none,
  * it is thrown, so a lost row is not read as a pass.
@@ -715,6 +709,7 @@ const withRows = async (name, episodes, body) => {
             crashes: episode.crashes.length,
           },
           window: episode.window,
+          diagnostics: await diagnosticsOf(episode),
           crashes: episode.crashes,
           caseError: failure ? describeError(failure) : null,
         })
@@ -744,8 +739,8 @@ describeRouting('Consumer > Fetch routing around unavailable and moved leaders (
           Object.assign(episode.facts, { coordinator, stopped, healthy, service })
 
           await episode.open([
-            { topic: healthyTopic, replicas: [healthy] },
-            { topic: stoppedTopic, replicas: [stopped] },
+            { topic: healthyTopic, replicas: [healthy], label: 'healthy' },
+            { topic: stoppedTopic, replicas: [stopped], label: 'stopped' },
           ])
           await episode.startConsumer({ groupId, maxWaitTimeInMs: SIBLING_WAIT_MS })
           const { groups } = await step(scope, 'The group read', () =>
@@ -837,9 +832,9 @@ describeRouting('Consumer > Fetch routing around unavailable and moved leaders (
             Object.assign(episode.facts, { hinted, roles, topics, service })
 
             await episode.open([
-              { topic: topics.idle, replicas: [roles.old, roles.first] },
-              { topic: topics.busy, replicas: [roles.old, roles.second] },
-              { topic: topics.poll, replicas: [roles.second] },
+              { topic: topics.idle, replicas: [roles.old, roles.first], label: 'idle' },
+              { topic: topics.busy, replicas: [roles.old, roles.second], label: 'busy' },
+              { topic: topics.poll, replicas: [roles.second], label: 'poll' },
             ])
             await episode.startConsumer({ groupId, maxWaitTimeInMs: MOVE_WAIT_MS })
             const pre = await episode.produce('pre', episode.topics)
@@ -851,6 +846,7 @@ describeRouting('Consumer > Fetch routing around unavailable and moved leaders (
               { kind: 'busy', topic: topics.busy, newNode: roles.second },
             ]
             const since = performance.now()
+            episode.since = since
             let outage = null
             if (hinted) {
               for (const { topic, newNode } of moves) {

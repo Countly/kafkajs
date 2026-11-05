@@ -20,6 +20,8 @@ const {
   shapeHeapGrowth,
 } = require('./consumerChurn')
 
+const { subscribeNamedTopic } = require('./subscribeNamedTopic')
+
 const COMMIT_EVERY = 25
 const DRAIN_POLL_MS = 100
 const DRAIN_MS = 45000
@@ -86,6 +88,7 @@ class ChurnMember {
       incarnationOf,
       acknowledged,
     })
+    this.stopping = false
     this.owners = new Map()
     this.processed = new Map()
     this.committed = new Map()
@@ -95,14 +98,25 @@ class ChurnMember {
   }
 
   /**
-   * Subscribes and runs. Resolves once `run` returned, not once a partition is assigned.
+   * Subscribes and runs. Named topics retry metadata propagation for up to five seconds.
+   * Resolves once `run` returned, not once a partition is assigned, or when stopped.
    * @param {Array<string|RegExp>} topics
    * @param {{ fromBeginning?: boolean }} [options]
    * @returns {Promise<void>}
+   * @throws {Error} for connect, subscribe or run failure after the bounded topic retry
    */
   async start(topics, { fromBeginning = true } = {}) {
     await this.consumer.connect()
-    for (const topic of topics) await this.consumer.subscribe({ topic, fromBeginning })
+    for (const topic of topics) {
+      if (this.stopping) return
+      const options = { topic, fromBeginning }
+      if (typeof topic === 'string') {
+        if (!(await subscribeNamedTopic(this.consumer, options, () => this.stopping))) return
+      } else {
+        await this.consumer.subscribe(options)
+      }
+    }
+    if (this.stopping) return
     await this.consumer.run({
       autoCommit: false,
       rebalanceListener: {
@@ -120,6 +134,7 @@ class ChurnMember {
    * @returns {Promise<void>}
    */
   async stop() {
+    this.stopping = true
     await this.commitAll().catch(() => {})
     this.#end(
       'revoke',
@@ -648,7 +663,7 @@ class ChurnLogReader {
     const unread = { count: topics.reduce((total, { acks }) => total + acks.size, 0) }
     await this.consumer.connect()
     for (const { name } of topics)
-      await this.consumer.subscribe({ topic: name, fromBeginning: true })
+      await subscribeNamedTopic(this.consumer, { topic: name, fromBeginning: true })
     await this.consumer.run({
       autoCommit: false,
       eachMessage: ({ topic: name, partition, message }) => {

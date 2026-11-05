@@ -36,8 +36,10 @@ fi
 
 $PWD/scripts/waitForKafka.js
 echo
-echo -e "Create SCRAM credentials"
-$PWD/scripts/createScramCredentials.sh
+if [ "${SKIP_SCRAM:-0}" != "1" ]; then
+  echo -e "Create SCRAM credentials"
+  $PWD/scripts/createScramCredentials.sh
+fi
 
 set +x
 echo

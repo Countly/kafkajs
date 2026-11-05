@@ -11,7 +11,7 @@ const { isConnectionLoss } = require('../network/connectionFailure')
  * a lost connection from `poll()`.
  * @see https://github.com/apache/kafka/blob/4.3.1/clients/src/main/java/org/apache/kafka/clients/consumer/internals/AbstractCoordinator.java
  */
-module.exports = class Outage {
+class Outage {
   /**
    * @param {number} limitMs how long an outage is ridden out: the member's session timeout
    */
@@ -46,3 +46,49 @@ module.exports = class Outage {
     this.since = null
   }
 }
+
+/**
+ * Fetch outages indexed by broker. Each clock uses Outage's classification and budget, so a
+ * productive sibling cannot renew a failed broker's deadline. Manager failure retains clocks
+ * for the runner's counted retries; removal and explicit stop retire them.
+ */
+class FetchOutage {
+  /**
+   * Creates independent broker clocks with the same budget.
+   * @param {number} limitMs the session window, or Infinity for consumer protocol
+   */
+  constructor(limitMs) {
+    this.limitMs = limitMs
+    this.nodes = new Map()
+  }
+
+  /**
+   * Decides a failed Fetch using only its broker's clock.
+   * @param {*} error the Fetch error
+   * @param {number} [now=performance.now()] monotonic milliseconds
+   * @param {number} nodeId the broker that failed
+   * @returns {boolean} whether the runner can ride out this failure
+   */
+  absorbs(error, now = performance.now(), nodeId) {
+    let outage = this.nodes.get(nodeId)
+    if (!outage) {
+      outage = new Outage(this.limitMs)
+      if (!outage.absorbs(error, now)) return false
+      this.nodes.set(nodeId, outage)
+      return true
+    }
+    return outage.absorbs(error, now)
+  }
+
+  /**
+   * Clears only the successful or retired broker's clock; never creates state.
+   * @param {number} nodeId the broker that succeeded or retired
+   * @returns {void}
+   */
+  end(nodeId) {
+    this.nodes.delete(nodeId)
+  }
+}
+
+module.exports = Outage
+module.exports.FetchOutage = FetchOutage

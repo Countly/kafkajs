@@ -26,6 +26,20 @@ const DATA_PLANE = ['Fetch', 'ListOffsets', 'OffsetFetch', 'Metadata', 'ApiVersi
 /** @param {number} ms @returns {Promise<void>} resolves after the real delay */
 const pause = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
 
+/** A frame inside Jest's own packages. */
+const JEST_OWN = /[\\/]node_modules[\\/](@jest[\\/]|jest-)/
+
+/**
+ * @param {string} stack a creation stack taken inside the async hook
+ * @returns {string} the first frame outside the hook, Node's internals and the timers module: the
+ *   code that asked for the timer
+ */
+const callerOf = (stack) =>
+  stack
+    .split('\n')
+    .slice(1)
+    .find((frame) => !/AsyncHook\.init|\(node:/.test(frame)) ?? ''
+
 /** Tracers still on; a test that hangs before `close` must not leave its hook on for the next. */
 const tracers = new Set()
 afterEach(() => {
@@ -36,18 +50,21 @@ afterEach(() => {
  * Records where each timer created while tracing is on was made, until the timer ends. Only
  * timers created while the episode is traced are judged, so timers left elsewhere in a
  * long-lived Jest worker cannot fail it, and a leaked timer cannot hide behind one that ended.
- * @returns {{ outliving: () => Promise<string[]>, disable: () => void }} the creation stacks of
- *   the traced timers still active, and a stop
+ * A timer whose direct caller is Jest itself is not the episode's: run in band, Jest's reporter
+ * shares the test process and debounces its status output with a 100 ms timer.
+ * @returns {{ outliving: () => Promise<string[]>, disable: () => void }} for each traced timer
+ *   still active, its delay, callback and creation stack; and a stop
  */
 const traceTimers = () => {
   const live = new Map()
   const hook = createHook({
-    init(id, type) {
+    init(id, type, triggerId, timer) {
       if (type !== 'Timeout') return
       const limit = Error.stackTraceLimit
-      Error.stackTraceLimit = 30
-      live.set(id, new Error('timer created').stack)
+      Error.stackTraceLimit = 40
+      const stack = new Error('timer created').stack
       Error.stackTraceLimit = limit
+      if (!JEST_OWN.test(callerOf(stack))) live.set(id, { timer, stack })
     },
     destroy(id) {
       live.delete(id)
@@ -58,7 +75,12 @@ const traceTimers = () => {
       // Node reports a timer's end to `destroy` from a later check phase.
       await new Promise(setImmediate)
       await new Promise(setImmediate)
-      return [...live.values()]
+      // `@` instead of `at`, so Jest keeps the internal frames it would strip from a stack.
+      return [...live.values()].map(
+        ({ timer, stack }) =>
+          `${timer._idleTimeout} ms, ${String(timer._onTimeout).slice(0, 300)}\n` +
+          stack.replace(/^(\s+)at /gm, '$1@ ')
+      )
     },
     disable: () => {
       hook.disable()

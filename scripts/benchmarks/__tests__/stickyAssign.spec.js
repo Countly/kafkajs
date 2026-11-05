@@ -826,13 +826,15 @@ module.exports = { ...real, sticky: wrap(real.sticky, (original, group) => {
       return { code, lines }
     }
 
-    test.each([
-      [['--shapes', 'stag-1+1']],
-      [['--runs', '0']],
-      [['--random', '-1', '--check', '--baseline-tree', REPO]],
-      [['--seed', '1.5']],
-      [['--check']],
-    ])('refuses %j with exit code 2', async (argv) => {
+    test.each(
+      [
+        ['--shapes', 'stag-1+1'],
+        ['--runs', '0'],
+        ['--random', '-1', '--check', '--baseline-tree', REPO],
+        ['--seed', '1.5'],
+        ['--check'],
+      ].map((argv) => [argv.map((arg) => (arg === REPO ? '<repo>' : arg)).join(' '), argv])
+    )('refuses %s with exit code 2', async (_, argv) => {
       const { code, lines } = await run(argv)
 
       expect(code).toEqual(2)

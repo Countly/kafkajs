@@ -6,7 +6,7 @@
 # The client must be a real directory in node_modules, never a link (`npm link`, or a `file:`
 # directory dependency): a symlinked package has no node_modules segment in its path, so the
 # instrumentation hooks never fire.
-set -e
+set -eo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 PACK_DIR="$(mktemp -d)"
 trap 'rm -rf "$PACK_DIR"' EXIT
@@ -22,23 +22,35 @@ if [ ! -f node_modules/@countly/kafkajs/package.json ] || [ -L node_modules/@cou
   exit 1
 fi
 
-node --test test/*.test.js
+# An explicit reporter keeps CI parsing independent of terminal detection and Node defaults.
+if [ -n "${NODE_TEST_REPORT:-}" ]; then
+  : > "$NODE_TEST_REPORT"
+fi
+run_tests() {
+  if [ -n "${NODE_TEST_REPORT:-}" ]; then
+    node --test-reporter=tap "$@" | tee -a "$NODE_TEST_REPORT"
+  else
+    node "$@"
+  fi
+}
+
+run_tests --test test/*.test.js
 
 # Each file runs in its own process: a loader or a registration hook applies to a whole process.
 for file in test/loader/*.test.js; do
   [ -e "$file" ] || continue
   echo "loader: $file"
-  node --experimental-loader=@opentelemetry/instrumentation/hook.mjs --test "$file"
+  run_tests --experimental-loader=@opentelemetry/instrumentation/hook.mjs --test "$file"
 done
 
 for file in test/plain/*.test.js; do
   [ -e "$file" ] || continue
   echo "plain: $file"
-  node --test "$file"
+  run_tests --test "$file"
 done
 
 for file in test/register/*.test.js; do
   [ -e "$file" ] || continue
   echo "register: $file"
-  node --import ./test/register/register.mjs --test "$file"
+  run_tests --import ./test/register/register.mjs --test "$file"
 done

@@ -266,7 +266,7 @@ describe('Consumer > KIP-951 leader hints on fetch', () => {
 })
 
 describe('Consumer > a hint that adds an unknown node rebalances the fetchers, not the group', () => {
-  test('every fetcher is recreated and no batch is lost across it', async () => {
+  test('surviving fetchers stay in place and no batch is lost when a node is added', async () => {
     const nodeIds = [0]
     const delivered = []
     const fetchedNodes = new Set()
@@ -293,20 +293,23 @@ describe('Consumer > a hint that adds an unknown node rebalances the fetchers, n
     })
 
     const started = fetchManager.start()
-    await new Promise((resolve) => setTimeout(resolve, 200))
-    await fetchManager.stop()
-    await started.catch(() => {})
+    const [survivor] = fetchManager.getFetchers()
+    try {
+      expect(survivor).toBeDefined()
+      await new Promise((resolve) => setTimeout(resolve, 200))
 
-    // The whole fetcher set was torn down and recreated: the new node is fetched from, and there
-    // is now one fetcher per node. Both are observations of the manager, not of the stub that
-    // published the node - without the rebalance the run ends with one fetcher, still fetching
-    // only node 0, and the partitions that moved are silently never fetched again.
-    expect([...fetchedNodes].sort()).toEqual([0, 2])
-    expect(fetchManager.getFetchers()).toHaveLength(2)
-
-    // The batch fetched in the round that triggered the rebalance was still handed to the worker
-    // queue rather than dropped on the teardown.
-    expect(delivered).toContain('a')
+      expect([...fetchedNodes].sort()).toEqual([0, 2])
+      const fetchers = fetchManager.getFetchers()
+      expect(fetchers).toHaveLength(2)
+      expect(fetchers[0]).toBe(survivor)
+      expect(fetchers[1]).not.toBe(survivor)
+      expect(delivered).toContain('a')
+      expect(delivered).toContain('r2')
+    } finally {
+      await fetchManager.stop()
+      await started
+    }
+    expect(fetchManager.getFetchers()).toEqual([])
   })
 })
 

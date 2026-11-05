@@ -12,11 +12,12 @@ const {
   waitForReassignmentToComplete,
   triggerPreferredElection,
   triggerUncleanElection,
-  stopBroker,
-  startBroker,
 } = require('testHelpers')
+const { createBrokerRun } = require('../../../testHelpers/liveControl')
+const { answers, NODES } = require('../../../testHelpers/leaderElection')
 const { CleanupStack, describeError } = require('../../producer/__tests__/fixtures/liveProbe')
 const {
+  NEVER,
   bounded,
   caseTimeout,
   delay,
@@ -26,6 +27,7 @@ const {
 } = require('../../producer/__tests__/fixtures/bounded')
 const { positionOf, runWithEvidence } = require('./fixtures/evidenceCase')
 const { disconnectAll } = require('./fixtures/boundedCleanup')
+const { retryTransient } = require('./fixtures/transientRetry')
 
 // Gated because both scenarios move leadership on the shared cluster, which is not safe alongside
 // the other consumer specs. Run them one at a time, each in its own foreground cluster:
@@ -303,8 +305,15 @@ const TRUNCATION_EVIDENCE = 'log-truncation'
 const TRUNCATION_BUDGET_MS = 420000
 /** What one awaited broker or client operation of a truncation arm may take. */
 const TRUNCATION_STEP_MS = 60000
-/** What a truncation arm's cleanup steps may take together: one dead-broker disconnect each. */
-const TRUNCATION_CLEANUP_BUDGET_MS = 4 * DISCONNECT_BUDGET_MS
+/** How long a restarted broker may take to answer, ms: container start plus registration. */
+const BROKER_READY_MS = 60000
+const brokerRun = createBrokerRun({ start: TRUNCATION_STEP_MS, stop: TRUNCATION_STEP_MS })
+/**
+ * What a truncation arm's cleanup steps may take together: one dead-broker disconnect each and the
+ * start and readiness of the two restarted brokers.
+ */
+const TRUNCATION_CLEANUP_BUDGET_MS =
+  4 * DISCONNECT_BUDGET_MS + 2 * (TRUNCATION_STEP_MS + BROKER_READY_MS)
 /** What each broker read of a truncation arm's evidence may take. */
 const TRUTH_MS = 5000
 
@@ -316,6 +325,21 @@ const TRUTH_MS = 5000
  */
 const expectedPositions = (acknowledged, firstOffset) =>
   acknowledged.map((record, index) => positionOf({ ...record, offset: firstOffset + index }))
+
+/**
+ * Starts a broker container and waits until it answers, so what runs next meets a ready cluster.
+ * @param {string} service the compose service
+ * @param {AbortSignal} signal ends the wait
+ * @returns {Promise<void>}
+ * @throws {Error} when starting fails or the broker does not answer within `BROKER_READY_MS`
+ */
+const restartBroker = async (service, signal) => {
+  await brokerRun('start', service, { signal })
+  await pollUntil(signal, BROKER_READY_MS, () => answers(NODES[service]), {
+    delayMs: 500,
+    label: `Broker ${service} readiness`,
+  })
+}
 
 /**
  * One unclean-election arm: its clients, its broker restarts, everything it retains for its
@@ -394,17 +418,16 @@ class TruncationArm {
   }
 
   /**
-   * Stops or starts a broker container; the call itself cannot be bounded, so it is recorded
-   * before it is made.
+   * Stops or starts a broker container within its operation budget, recording the action first.
    * @param {'stop'|'start'} action
    * @param {string} service
-   * @returns {void}
+   * @returns {Promise<object>} broker control output
+   * @throws {Error} when the control fails, times out or the scope aborts
    */
   broker(action, service) {
     this.brokerActions.push({ at: Date.now() - this.startedAt, action: `${action} ${service}` })
     this.scope.throwIfAborted()
-    if (action === 'stop') stopBroker(service)
-    else startBroker(service)
+    return brokerRun(action, service, { signal: this.scope })
   }
 
   /**
@@ -421,13 +444,7 @@ class TruncationArm {
     cleanup.add('producer', () => this.producer?.disconnect())
     cleanup.add('consumer', () => this.consumer?.disconnect())
     for (const service of ['kafka3', 'kafka2']) {
-      cleanup.add(`restart ${service}`, () => {
-        try {
-          startBroker(service)
-        } catch (e) {
-          // Already running, or compose is down - neither is a reason to skip the other service.
-        }
-      })
+      cleanup.add(`restart ${service}`, (signal) => restartBroker(service, signal))
     }
 
     this.at('connect')
@@ -460,7 +477,8 @@ class TruncationArm {
   /**
    * Reads the initial leader, which either replica may hold, and returns a group id whose
    * coordinator is node 1, the surviving voter, so the group is not stranded while the other two
-   * nodes are stopped and started.
+   * nodes are stopped and started. A lookup reset by a broker that is still starting is repeated
+   * for the same candidate; only a coordinator on another node moves on to the next one.
    * @returns {Promise<string>}
    */
   async pinnedGroup() {
@@ -472,10 +490,14 @@ class TruncationArm {
     await this.step('The metadata refresh', () => cluster.refreshMetadata())
     this.facts.initialLeader = this.leaderOf()
     expect([2, 3]).toContain(this.facts.initialLeader)
+    this.at('select the pinned coordinator')
     for (let attempt = 0; attempt < 60; attempt++) {
       const candidate = `test-group-${secureRandom()}`
-      const coordinator = await this.step('The coordinator lookup', () =>
-        cluster.findGroupCoordinator({ groupId: candidate })
+      const coordinator = await retryTransient(
+        this.scope,
+        TRUNCATION_STEP_MS,
+        () => cluster.findGroupCoordinator({ groupId: candidate }),
+        { label: 'The coordinator lookup' }
       )
       if (coordinator.nodeId === 1) return candidate
     }
@@ -652,16 +674,17 @@ class TruncationArm {
 describeLogTruncation('Consumer > unclean leader election (live)', () => {
   // The arm restarts its own brokers and closes its own clients; this is the net for a case whose
   // cleanup was cut short, because a stopped broker would otherwise degrade the shared cluster.
-  afterEach(() => {
-    if (!liveRun.takeAdmission()) return
-    for (const service of ['kafka2', 'kafka3']) {
-      try {
-        startBroker(service)
-      } catch (e) {
-        // Already running, or compose is down - neither is a reason to skip the other service.
-      }
-    }
-  }, 120000)
+  afterEach(
+    async () => {
+      if (!liveRun.takeAdmission()) return
+      const restarts = await Promise.allSettled(
+        ['kafka2', 'kafka3'].map((service) => restartBroker(service, NEVER))
+      )
+      const failed = restarts.find(({ status }) => status === 'rejected')
+      if (failed) throw failed.reason
+    },
+    TRUNCATION_STEP_MS + BROKER_READY_MS + 30000
+  )
 
   /**
    * The unclean-election scenario as one case. The subscription and an optional step before the
@@ -694,7 +717,7 @@ describeLogTruncation('Consumer > unclean leader election (live)', () => {
 
         // kafka3 goes away and is waited out of the ISR, so what follows exists only on kafka2.
         arm.at('stop kafka3')
-        arm.broker('stop', 'kafka3')
+        await arm.broker('stop', 'kafka3')
         await delay(scope, REPLICA_LAG_TIME_MAX_MS + 5000)
         phase('kafka3 stopped and waited out of the ISR')
 
@@ -714,8 +737,8 @@ describeLogTruncation('Consumer > unclean leader election (live)', () => {
 
         // The only replica holding the second batch is stopped, and the stale one comes back.
         arm.at('swap the brokers')
-        arm.broker('stop', 'kafka2')
-        arm.broker('start', 'kafka3')
+        await arm.broker('stop', 'kafka2')
+        await arm.broker('start', 'kafka3')
         arm.at('wait for kafka3')
         await arm.wait('Broker 3', BROKER_RESTART_BUDGET, async () => {
           try {

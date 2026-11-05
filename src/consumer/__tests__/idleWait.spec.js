@@ -1633,6 +1633,8 @@ describe('validation response continuation', () => {
     const { FetchPreparation } = require('../fetchPreparation')
     const prep = new FetchPreparation(group, group.idleWait, [], Infinity, group.ownership.token())
     group.offsetManager.committedOffsets = () => ({ orders: { 0: '0', 1: '0' } })
+    group.offsetManager.heldOffsetAt = (topic, partition) =>
+      group.offsetManager.committedOffsets()[topic][partition]
     group.offsetManager.nextOffset = () => ({ toString: () => '0' })
     group.offsetManager.lastConsumedEpoch = () => 1
     group.offsetManager.seek = async () => true
@@ -1677,6 +1679,7 @@ describe('validation response continuation', () => {
         prep
       )
       .catch(() => {})
+    expect(group.positionValidator.complete).toHaveBeenCalledTimes(2)
     expect(prep.fence.closed).toBe(true)
     expect(disable).not.toHaveBeenCalled()
     expect(markAll).not.toHaveBeenCalled()

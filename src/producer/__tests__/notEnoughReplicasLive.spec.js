@@ -1,5 +1,4 @@
-const { execFile } = require('child_process')
-const { promisify } = require('util')
+const { createBrokerRun } = require('../../../testHelpers/liveControl')
 const { Kafka, logLevel } = require('../../../index')
 const {
   plainTextBrokers,
@@ -30,7 +29,7 @@ const {
   isrIsFull,
 } = require('./fixtures/replicaOutage')
 
-// Gated: it stops one broker of the shared cluster, through the guarded entry only. Run alone:
+// Gated: it stops one broker of the shared cluster, on an isolated cluster. Run alone:
 // `npm run test:e2e:not-enough-replicas`.
 const describeReplicas = process.env.NOT_ENOUGH_REPLICAS_E2E === '1' ? describe : describe.skip
 
@@ -56,33 +55,7 @@ const REPLAY = Object.freeze({
   handlers: 'n/a',
 })
 
-const execFileAsync = promisify(execFile)
-
-/**
- * Runs one broker action through the guarded live entry, which owns the cluster this run started
- * and refuses any broker it did not create. The guard process is killed by the operating system at
- * the action's own budget and when `signal` aborts, so a stop or a start that hangs ends inside its
- * phase and is settled when this promise is.
- * @param {string} operation `stop` or `start`
- * @param {string} service `kafka1`, `kafka2` or `kafka3`
- * @param {object} [options]
- * @param {AbortSignal} [options.signal] the phase's, which kills the guard when it aborts
- * @returns {Promise<{ stdout: string, stderr: string }>}
- * @throws {Error} when the run was not started by the guarded entry, the operation has no budget,
- *   or the guard refuses
- */
-const guardedRun = (operation, service, { signal } = {}) => {
-  const { P9_CLUSTER_GUARD: guard, P9_CLUSTER_MANIFEST: manifest } = process.env
-  if (!guard || !manifest) {
-    throw new Error('This scenario stops a broker only through the guarded live entry')
-  }
-  if (GUARD_MS[operation] === undefined) throw new Error(`No guard budget for ${operation}`)
-  return execFileAsync(
-    'timeout',
-    [`${GUARD_MS[operation] / 1000}s`, 'node', guard, 'control', manifest, operation, service],
-    { signal }
-  )
-}
+const guardedRun = createBrokerRun(GUARD_MS)
 
 /**
  * Live proof of what an idempotent producer does while one follower of its partitions is down. A
@@ -91,7 +64,7 @@ const guardedRun = (operation, service, { signal } = {}) => {
  * NOT_ENOUGH_REPLICAS. A topic that needs two keeps accepting writes while the same follower stays
  * down, each send within the deadline. The follower is the one node that leads neither partition,
  * the other two voters stay up, and it is restored, and both partitions are back in sync, before
- * the recovery markers: the stop and start go through the guarded entry only.
+ * the recovery markers: the stop and start go through the guard or standalone Compose.
  *
  * The topology is pinned before the fault: both partitions' replica sets and leaders. While the
  * fault is reached only the chosen follower may leave the ISR, and around every measured send,
@@ -393,7 +366,9 @@ describeReplicas('Producer > one follower down under min.insync.replicas (live)'
         expect(during.arms).toHaveLength(1 + RELAXED_SENDS)
         expect(rejected.error).toMatchObject({ name: 'KafkaJSDeliveryTimeout' })
         expect([PRE_APPEND, AFTER_APPEND]).toContain(rejectedType)
-        expect(rejected.ms).toBeGreaterThanOrEqual(DELIVERY_TIMEOUT_MS)
+        // Node timers keep whole-millisecond time, so a deadline timer can fire up to 1 ms before
+        // performance.now() says the full timeout has passed.
+        expect(rejected.ms).toBeGreaterThanOrEqual(DELIVERY_TIMEOUT_MS - 1)
         expect(rejected.ms).toBeLessThanOrEqual(DELIVERY_TIMEOUT_MS + DELIVERY_SLACK_MS)
         for (const { error, ms } of accepted) {
           expect(error).toBeNull()

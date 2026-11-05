@@ -663,6 +663,11 @@ module.exports = class RebalanceCoordinator {
     return verdict
   }
 
+  /** @returns {boolean} whether a verdict waits in the slot, which stays untouched */
+  hasVerdict() {
+    return this.verdict !== null
+  }
+
   /** Drops whatever is in the slot, without acting on it. @returns {void} */
   clearVerdict() {
     this.verdict = null

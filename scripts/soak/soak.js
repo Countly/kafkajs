@@ -39,6 +39,7 @@
  * The gauges read internals: the clusters a `Kafka` builds, their request queues, and the
  * operation ledgers and reset obligations of its `operations` store.
  */
+const { subscribeNamedTopic } = require('./subscribeNamedTopic')
 const fs = require('node:fs')
 const path = require('node:path')
 const { Kafka, KafkaJSBufferExhaustedError, logLevel, PartitionAssigners } = require('../../index')
@@ -540,7 +541,7 @@ const WORKLOADS = {
       const consumer = clients.consumer({ groupId })
       if (producer) await producer.connect()
       await consumer.connect()
-      await consumer.subscribe({ topic, fromBeginning: false })
+      await subscribeNamedTopic(consumer, { topic, fromBeginning: false })
       await consumer.run({ eachMessage: async () => {} })
 
       const deadline = Date.now() + ms
@@ -574,7 +575,7 @@ const WORKLOADS = {
           partitionAssigners: [PartitionAssigners.cooperativeSticky],
         })
         await consumer.connect()
-        await consumer.subscribe({ topic, fromBeginning: false })
+        await subscribeNamedTopic(consumer, { topic, fromBeginning: false })
         await consumer.run({ eachMessage: async () => {} })
         return consumer
       }

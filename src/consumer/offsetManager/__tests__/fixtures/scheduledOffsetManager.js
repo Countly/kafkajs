@@ -1,3 +1,4 @@
+const Cluster = require('../../../../cluster')
 const OffsetManager = require('../../index')
 const ConsumerGroup = require('../../../consumerGroup')
 const OffsetOperations = require('../../offsetOperations')
@@ -147,6 +148,19 @@ const createScheduledOffsetManager = ({
     coordinator,
     cache,
     stored,
+    /**
+     * Publishes through the real cluster cache writer, including revision invalidation.
+     * @param {number|string} partition partition id
+     * @param {string} offset confirmed committed offset
+     * @returns {void}
+     */
+    publish: (partition, offset) =>
+      Cluster.prototype.markOffsetAsCommitted.call(cluster, {
+        groupId: GROUP_ID,
+        topic: TOPIC,
+        partition,
+        offset,
+      }),
     operations,
     obligations,
     setTopicId: (id) => {
@@ -161,6 +175,13 @@ const createScheduledOffsetManager = ({
     },
     next: (partition = 0) => manager.nextOffset(TOPIC, partition).toString(),
     committedAt: (partition = 0) => cache[TOPIC][partition],
+    /**
+     * Reads one member's effective baseline independently of the shared cache.
+     * @param {number} [partition=0] partition id
+     * @param {OffsetManager} [member=manager] member holding the position
+     * @returns {string|undefined} held offset
+     */
+    heldAt: (partition = 0, member = manager) => member.heldOffsetAt(TOPIC, partition),
     owed: (partition = 0) => obligations.isOwed(TOPIC, partition),
   }
 }
