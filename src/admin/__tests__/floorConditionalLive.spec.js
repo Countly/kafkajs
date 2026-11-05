@@ -884,11 +884,11 @@ describe('Floor conditional expectations', () => {
 
     tap.sent(connection, await frameOf(1, 5, { clusterId: 'cluster', nodeId: 2 }))
     tap.sent(connection, await frameOf(2, 4, { clusterId: 'cluster', nodeId: 2 }))
-    // An answer to a request that was never asked, and chunks that cut frames in the middle.
+    // Answers out of request order, one to a request never asked, and chunks that cut frames.
     const stream = Buffer.concat([
-      answerOf(1, UNSUPPORTED_VERSION, 10),
-      answerOf(3, 99),
       answerOf(2, NONE),
+      answerOf(3, 99),
+      answerOf(1, UNSUPPORTED_VERSION, 10),
     ])
     for (const [from, to] of [
       [0, 7],
