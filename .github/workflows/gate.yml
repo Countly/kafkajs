@@ -132,10 +132,23 @@ jobs:
       - name: Require native LZ4
         if: fromJSON(steps.entry.outputs.check).needs.lz4
         run: node -e "require('lz4-napi')"
+      # The patched coordinator jar is built from the Kafka source tarball with Gradle; a cache hit
+      # skips the downloads, and a miss retries them.
+      - uses: actions/cache@v4
+        if: fromJSON(steps.entry.outputs.check).needs.consumerGroupStates || fromJSON(steps.entry.outputs.check).compose == 'testHelpers/consumerGroupStates/compose.yml'
+        with:
+          path: testHelpers/consumerGroupStates/build
+          key: coordinator-v1-${{ env.KAFKA_VERSION }}-${{ hashFiles('testHelpers/consumerGroupStates/build.sh', 'testHelpers/consumerGroupStates/prepare.py', 'testHelpers/consumerGroupStates/*.patch') }}
       - name: Build coordinator fixture
         if: fromJSON(steps.entry.outputs.check).needs.consumerGroupStates || fromJSON(steps.entry.outputs.check).compose == 'testHelpers/consumerGroupStates/compose.yml'
         run: |
-          bash ./testHelpers/consumerGroupStates/build.sh "$KAFKA_VERSION" "$RUNNER_TEMP/coordinator-build"
+          jar="testHelpers/consumerGroupStates/build/$KAFKA_VERSION/kafka-group-coordinator-$KAFKA_VERSION.jar"
+          for attempt in 1 2 3; do
+            [ -s "$jar" ] && break
+            rm -rf "$RUNNER_TEMP/coordinator-build"
+            bash ./testHelpers/consumerGroupStates/build.sh "$KAFKA_VERSION" "$RUNNER_TEMP/coordinator-build" || { [ "$attempt" = 3 ] && exit 1; sleep 30; }
+          done
+          test -s "$jar"
           mkdir -p testHelpers/consumerGroupStates/runtime
           chmod 777 testHelpers/consumerGroupStates/runtime
           docker build --build-arg KAFKA_VERSION="$KAFKA_VERSION" -t "consumer-group-states:$KAFKA_VERSION" testHelpers/consumerGroupStates
