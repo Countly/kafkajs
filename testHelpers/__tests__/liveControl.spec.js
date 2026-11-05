@@ -79,6 +79,8 @@ describe('standalone live controls', () => {
           'kafka2',
         ],
       ],
+      // Every row passes all three values: a missing one makes Jest treat the third parameter as done.
+      {},
     ],
     [
       'guarded',
