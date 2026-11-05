@@ -61,6 +61,21 @@ const MAX_GROUP_CANDIDATES = 100
 /** The idle limit of the reopening case, and the gap between its sends. */
 const IDLE_MS = 5000
 const SEND_GAP_MS = 20000
+/**
+ * The cluster retries of a producer, which takes them from the Kafka options: its coordinator
+ * lookups run on the cluster's retrier, and the `retry` producer option does not reach it. On a
+ * fresh cluster the first transactional lookup is answered "coordinator not available" until the
+ * broker has created `__transaction_state`, which takes seconds; the delays here add up to 13 s.
+ * An idempotent producer also refuses to be built without retries.
+ * @see https://github.com/apache/kafka/blob/4.0.2/core/src/main/scala/kafka/server/KafkaApis.scala
+ */
+const PRODUCER_RETRY = {
+  retries: 10,
+  initialRetryTime: 100,
+  multiplier: 2,
+  maxRetryTime: 2000,
+  factor: 0,
+}
 /** The error codes the cases read from broker truth. */
 const PRODUCER_FENCED = 90
 const GROUP_ID_NOT_FOUND = 69
@@ -298,6 +313,7 @@ class FloorProbe {
 
   /**
    * Creates, owns and connects a public client; its disconnect is registered before it connects.
+   * Admin and consumer clients make one attempt per call; a producer gets `PRODUCER_RETRY`.
    * @param {'admin'|'consumer'|'producer'} kind the client factory
    * @param {object} [clientOptions] the factory's options
    * @param {object} [kafkaOptions] `Kafka` constructor overrides
@@ -309,7 +325,7 @@ class FloorProbe {
       const kafka = new Kafka({
         clientId: CLIENT_ID,
         brokers: plainTextBrokers(),
-        retry: { retries: 0 },
+        retry: kind === 'producer' ? PRODUCER_RETRY : { retries: 0 },
         ...kafkaOptions,
         logLevel: logLevel.DEBUG,
         logCreator: () => (entry) => this.logs.push(entry),
@@ -1221,9 +1237,9 @@ class FloorAdminCases {
       })
     )
     p.items(described.resources)
-    for (const configEntry of entries) {
+    for (const { name, value } of entries) {
       expect(described.resources[0].configEntries).toContainEqual(
-        expect.objectContaining(configEntry)
+        expect.objectContaining({ configName: name, configValue: value })
       )
     }
     p.items((await p.invoke(() => alter(AlterConfigOpTypes.DELETE))).resources)
@@ -1478,6 +1494,13 @@ class FloorAdminCases {
           strict: true,
         })
       )
+    // The controller commits a change before every broker applies it, so a read right after it
+    // may still answer the old state.
+    const readQuotaUntil = async (quota, settled) => {
+      let rows
+      await p.poll(async () => settled((rows = await readQuota(quota))))
+      return rows
+    }
     p.cleanup.add('remove quotas', async () => p.items(await alterQuota({ remove: true })))
     p.items(await p.invoke(() => alterQuota({ validateOnly: true })))
     for (const quota of quotas) expect(await readQuota(quota)).toEqual([])
@@ -1485,7 +1508,7 @@ class FloorAdminCases {
     const quotaReadback = []
     const byType = (entity) => [...entity].sort((a, b) => a.entityType.localeCompare(b.entityType))
     for (const quota of quotas) {
-      const rows = await readQuota(quota)
+      const rows = await readQuotaUntil(quota, (read) => read.length > 0)
       expect(rows).toHaveLength(1)
       expect(byType(rows[0].entity)).toEqual(byType(quota.entity))
       expect(rows[0].values).toEqual({ [key]: quota.value })
@@ -1493,7 +1516,9 @@ class FloorAdminCases {
     }
     expect(quotaReadback).toEqual(quotas.map(({ value }) => value))
     p.items(await p.invoke(() => alterQuota({ remove: true })))
-    for (const quota of quotas) expect(await readQuota(quota)).toEqual([])
+    for (const quota of quotas) {
+      expect(await readQuotaUntil(quota, (read) => read.length === 0)).toEqual([])
+    }
 
     const { ssl } = saslConnectionOpts()
     const previous = process.env.KAFKAJS_DEBUG_PROTOCOL_BUFFERS
@@ -1780,9 +1805,15 @@ class FloorAdminCases {
     const p = this.probe
     const topic = await p.topic({ name: 'held' })
     const { host, port } = await p.leaderNode(topic)
-    const before = p.sockets.length
-    const broker = await p.raw(host, port, { connectionsMaxIdle: IDLE_MS })
-    const dialed = p.sockets.slice(before)
+    const dialed = []
+    const broker = await p.raw(host, port, {
+      connectionsMaxIdle: IDLE_MS,
+      socketFactory: (options) => {
+        const socket = p.socket(options)
+        dialed.push(socket)
+        return socket
+      },
+    })
     expect(dialed).toHaveLength(1)
     let settled = false
     const outcome = p
@@ -1802,8 +1833,7 @@ class FloorAdminCases {
       })
     await p.invoke(() => delay(p.signal, IDLE_MS + 1500))
     expect(settled).toBe(false)
-    expect(p.sockets).toHaveLength(before + 1)
-    expect(p.sockets[before]).toBe(dialed[0])
+    expect(dialed).toHaveLength(1)
     const heldLongPollWasReaped = dialed[0].destroyed
     expect(heldLongPollWasReaped).toBe(false)
     const { response, error } = await outcome

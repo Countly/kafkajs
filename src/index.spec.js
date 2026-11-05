@@ -222,6 +222,8 @@ describe('Client', () => {
       linger: 5,
       batchSize: 16384,
       deliveryTimeout: 120000,
+      rackId: '',
+      rackAware: false,
     })
   })
 

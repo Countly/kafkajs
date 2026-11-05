@@ -2,7 +2,7 @@ const BrokerPool = require('../brokerPool')
 const builder = require('../connectionPoolBuilder')
 const { ConnectionSetupPolicy } = require('../../network/connectionSetup')
 const { KafkaJSConnectionError, KafkaJSProtocolError } = require('../../errors')
-const { createScriptedCluster } = require('../../../testHelpers/scriptedCluster')
+const { createScriptedCluster, NEGOTIATION_MS } = require('../../../testHelpers/scriptedCluster')
 const { createLogger } = require('../../loggers')
 const logger = createLogger({ level: 0, logCreator: () => () => {} })
 let pool, seam, bootstrap
@@ -102,7 +102,7 @@ it('deletes state after a real ready and keeps a second endpoint independent', a
   expect(second.setupStates.state('b:9092', 0).failures).toBe(0)
   const other = new (require('../../broker'))({ connectionPool: second, logger })
   const secondReady = other.connect()
-  await jest.advanceTimersByTimeAsync(1)
+  await jest.advanceTimersByTimeAsync(NEGOTIATION_MS)
   await secondReady
   expect(other.isConnected()).toBe(true)
   expect(pool.setupStates.state('a:9092', performance.now()).failures).toBe(2)
@@ -205,7 +205,7 @@ it.each([false, true])(
 
 it('authoritative address replacement bounds retained failures', async () => {
   const connect = pool.seedBroker.connect()
-  await jest.advanceTimersByTimeAsync(1)
+  await jest.advanceTimersByTimeAsync(NEGOTIATION_MS)
   await connect
   const owner = pool.setupStates
   const removed = owner.begin('removed:9092')
@@ -270,7 +270,7 @@ it('a ready node resets reconnect growth without delaying another node', async (
   const other = new (require('../../broker'))({ connectionPool: otherPool, logger })
   try {
     const otherReady = other.connect()
-    await jest.advanceTimersByTimeAsync(1)
+    await jest.advanceTimersByTimeAsync(NEGOTIATION_MS)
     await otherReady
     expect(other.isConnected()).toBe(true)
     expect(starts).toHaveLength(2)
