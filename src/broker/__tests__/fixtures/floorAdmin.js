@@ -1,5 +1,7 @@
 const { inspect } = require('node:util')
 const { randomBytes } = require('node:crypto')
+// eslint-disable-next-line n/no-unsupported-features/node-builtins -- test-only timer ownership
+const { createHook } = require('node:async_hooks')
 const Broker = require('../../index')
 const defaultSocketFactory = require('../../../network/socketFactory')
 const ISOLATION_LEVEL = require('../../../protocol/isolationLevel')
@@ -90,6 +92,42 @@ const refusalOf = (error) =>
 const deepest = (error) => chainOf(error).at(-1) ?? error
 
 /**
+ * Turns a rejection into a value, so a case can assert on the failure itself.
+ * @param {Promise<*>} promise the call under test
+ * @returns {Promise<*>} what it rejected with, or `null` when it resolved
+ */
+const rejectionOf = (promise) =>
+  promise.then(
+    () => null,
+    (error) => error
+  )
+
+/** The features no case moves: `metadata.version` has its own downgrade rules, `kraft.version` its own path. */
+const FIXED_FEATURES = new Set(['metadata.version', 'kraft.version'])
+
+/**
+ * Picks a feature update the controller can validate that differs from the finalized level: a safe
+ * downgrade by one level where the supported range allows it, else an upgrade by one.
+ * @param {{ finalizedFeatures: object, supportedFeatures: object }} features a `describeFeatures` answer
+ * @returns {{ name: string, level: number, target: number, upgradeType: string }|undefined}
+ *   the update, with the level it starts from; undefined when no feature has another legal level
+ */
+const differentLevel = ({ finalizedFeatures, supportedFeatures }) => {
+  const options = Object.keys(finalizedFeatures)
+    .sort()
+    .filter((name) => Object.hasOwn(supportedFeatures, name) && !FIXED_FEATURES.has(name))
+    .flatMap((name) => {
+      const { maxVersionLevel: level } = finalizedFeatures[name]
+      const { minVersion, maxVersion } = supportedFeatures[name]
+      return [
+        level > minVersion && { name, level, target: level - 1, upgradeType: 'safe-downgrade' },
+        level < maxVersion && { name, level, target: level + 1, upgradeType: 'upgrade' },
+      ].filter(Boolean)
+    })
+  return options.find(({ upgradeType }) => upgradeType === 'safe-downgrade') ?? options[0]
+}
+
+/**
  * Every encoding in which a credential could reach a log, a request record or a buffer dump.
  * @param {string|Buffer} secret the credential
  * @returns {string[]} the markers, none empty
@@ -103,6 +141,41 @@ const markersOf = (secret) => {
     bytes.toString('hex').match(/../g).join(' '),
     [...bytes].join(','),
   ]
+}
+
+/**
+ * Follows the timers created from `start` on, by identity, so a case can be held to the timers it
+ * made itself rather than to the process-wide count, which other work moves too.
+ */
+class TimerLedger {
+  /** Builds the hook; it does nothing until `start`. */
+  constructor() {
+    /** @type {Map<number, object>} the pending timers by async id */
+    this.pending = new Map()
+    this.hook = createHook({
+      init: (id, type, _trigger, resource) => {
+        if (type === 'Timeout') this.pending.set(id, resource)
+      },
+      destroy: (id) => this.pending.delete(id),
+    })
+  }
+
+  /** @returns {void} */
+  start() {
+    this.hook.enable()
+  }
+
+  /**
+   * Stops following timers. A cleared or fired timer is dropped by the hook after the turn that
+   * ended it, so the caller yields one turn first.
+   * @returns {object[]} the timers started since `start` that neither fired nor were cleared
+   */
+  stop() {
+    this.hook.disable()
+    const retained = [...this.pending.values()]
+    this.pending.clear()
+    return retained
+  }
 }
 
 /**
@@ -163,7 +236,7 @@ class FloorProbe {
     this.sockets = []
     this.markers = []
     this.removers = []
-    this.strictTimers = false
+    this.timers = null
     this.factory = defaultSocketFactory()
     this.logger = newLogger()
     this.resources = createResourceProbe({
@@ -173,6 +246,15 @@ class FloorProbe {
       }),
       activeResources: true,
     })
+  }
+
+  /**
+   * Starts holding the case to the timers it creates: `close` fails the case on any still pending.
+   * @returns {void}
+   */
+  trackTimers() {
+    this.timers = new TimerLedger()
+    this.timers.start()
   }
 
   /** @returns {number} milliseconds left inside the case's inclusive deadline */
@@ -335,6 +417,29 @@ class FloorProbe {
   }
 
   /**
+   * Opens a transaction and registers, before its first send, the one way this case settles it: an
+   * `abort` ends it through its producer when it is still active; a `fence` leaves it to the case's
+   * admin, which fences the transactional id.
+   * @param {object} producer a connected transactional producer
+   * @param {string} transactionalId the producer's transactional id
+   * @param {'abort'|'fence'} [settle] who ends the transaction at cleanup
+   * @returns {Promise<object>} the open transaction
+   */
+  async transaction(producer, transactionalId, settle = 'abort') {
+    const transaction = await this.invoke(() => producer.transaction())
+    if (settle === 'fence') {
+      this.cleanup.add('fence transaction', () =>
+        this.admin.fenceProducers({ transactionalIds: [transactionalId] })
+      )
+    } else {
+      this.cleanup.add('abort transaction', () =>
+        transaction.isActive() ? transaction.abort() : undefined
+      )
+    }
+    return transaction
+  }
+
+  /**
    * Polls an independent readback until it holds, inside the case's deadline.
    * @param {() => Promise<boolean>} predicate the readback
    * @param {number} [delayMs] the pause between reads
@@ -438,7 +543,8 @@ class FloorProbe {
 
   /**
    * Runs every restoration in reverse order of registration, then checks the case left no socket
-   * behind. Each restoration is attempted whatever an earlier one did.
+   * behind, and, once `trackTimers` was called, none of its own timers. Each restoration is
+   * attempted whatever an earlier one did.
    * @returns {Promise<Error[]>} the failures, none when everything was restored
    */
   async close() {
@@ -452,9 +558,12 @@ class FloorProbe {
       liveRun.taint(error)
       errors.push(error)
     }
-    const timers = (snapshot) => snapshot.activeResources?.Timeout ?? 0
-    if (this.strictTimers && this.baseline && timers(after) > timers(this.baseline)) {
-      const error = new Error('The case retained timers')
+    const owned = this.timers?.stop() ?? []
+    if (owned.length) {
+      const count = (snapshot = {}) => snapshot.activeResources?.Timeout ?? 0
+      const error = new Error(
+        `The case retained ${owned.length} of its own timers (process-wide Timeout count ${count(this.baseline)} before, ${count(after)} after)`
+      )
       liveRun.taint(error)
       errors.push(error)
     }
@@ -765,8 +874,7 @@ class FloorAdminCases {
       idempotent: true,
       maxInFlightRequests: 1,
     })
-    const transaction = await p.invoke(() => producer.transaction())
-    p.cleanup.add('abort transaction', () => (transaction.isActive() ? transaction.abort() : null))
+    const transaction = await p.transaction(producer, transactionalId)
     await p.invoke(() => transaction.send({ topic, messages: [{ value: 'open' }] }))
 
     const description = (
@@ -816,17 +924,14 @@ class FloorAdminCases {
     this.expectNegotiated('ListTransactions', facts.ListTransactions.selected)
 
     const mark = p.requests.length
-    const refusal = await p
-      .invoke(() =>
+    const refusal = await rejectionOf(
+      p.invoke(() =>
         admin.listTransactions({
           states: ['Ongoing'],
           transactionalIdPattern: `^${transactionalId}$`,
         })
       )
-      .then(
-        () => null,
-        (error) => error
-      )
+    )
     this.refuse(refusal, 'ListTransactions', 2, 'transactionalIdPattern')
     const patternFrames = p.requests
       .slice(mark)
@@ -868,13 +973,10 @@ class FloorAdminCases {
       idempotent: true,
       maxInFlightRequests: 1,
     })
-    p.cleanup.add('settle aborted transaction', () =>
-      admin.fenceProducers({ transactionalIds: [transactionalId] })
-    )
-    const warmup = await p.invoke(() => producer.transaction())
+    const warmup = await p.transaction(producer, transactionalId)
     await p.invoke(() => warmup.send({ topic, messages: [{ value: 'committed' }] }))
     await p.invoke(() => warmup.commit())
-    const open = await p.invoke(() => producer.transaction())
+    const open = await p.transaction(producer, transactionalId, 'fence')
     await p.invoke(() => open.send({ topic, messages: [{ value: 'aborted' }] }))
 
     const description = (
@@ -944,10 +1046,7 @@ class FloorAdminCases {
       idempotent: true,
       maxInFlightRequests: 1,
     })
-    p.cleanup.add('settle fenced transaction', () =>
-      admin.fenceProducers({ transactionalIds: [fencedId] })
-    )
-    const doomed = await p.invoke(() => victim.transaction())
+    const doomed = await p.transaction(victim, fencedId, 'fence')
     await p.invoke(() => doomed.send({ topic, messages: [{ value: 'fenced' }] }))
     const before = (
       await p.invoke(() => admin.describeTransactions({ transactionalIds: [fencedId] }))
@@ -958,12 +1057,9 @@ class FloorAdminCases {
     expect(
       fenced.producerId !== before.producerId || fenced.producerEpoch > before.producerEpoch
     ).toBe(true)
-    const refusal = await p
-      .invoke(() => doomed.send({ topic, messages: [{ value: 'must-refuse' }] }))
-      .then(
-        () => null,
-        (error) => error
-      )
+    const refusal = await rejectionOf(
+      p.invoke(() => doomed.send({ topic, messages: [{ value: 'must-refuse' }] }))
+    )
     const fencedSendCause = deepest(refusal)
     expect(fencedSendCause?.code).toBe(PRODUCER_FENCED)
     const successor = await p.client('producer', {
@@ -971,7 +1067,7 @@ class FloorAdminCases {
       idempotent: true,
       maxInFlightRequests: 1,
     })
-    const recovered = await p.invoke(() => successor.transaction())
+    const recovered = await p.transaction(successor, fencedId)
     await p.invoke(() => recovered.send({ topic, messages: [{ value: 'recovered' }] }))
     await p.invoke(() => recovered.commit())
 
@@ -1011,8 +1107,9 @@ class FloorAdminCases {
     this.expectNegotiated('DescribeCluster', facts.DescribeCluster.selected)
 
     const topic = await p.topic({ name: 'election' })
-    const { replicas } = await p.leaderNode(topic)
-    const reordered = [replicas[1], replicas[0], ...replicas.slice(2)]
+    const { nodeId: initialLeader, replicas } = await p.leaderNode(topic)
+    const preferred = replicas.find((nodeId) => nodeId !== initialLeader)
+    const reordered = [preferred, ...replicas.filter((nodeId) => nodeId !== preferred)]
     expect(
       await p.invoke(() =>
         admin.alterPartitionReassignments({
@@ -1023,32 +1120,56 @@ class FloorAdminCases {
     const metadataOf = async () =>
       (await p.invoke(() => admin.fetchTopicMetadata({ topics: [topic] }))).topics[0].partitions[0]
     await p.poll(async () => (await metadataOf()).replicas.join() === reordered.join())
+    const staged = await metadataOf()
+    expect(staged.leader).toBe(initialLeader)
+    expect(staged.leader).not.toBe(preferred)
     const elected = await p.invoke(() =>
       admin.electLeaders({
         electionType: 'preferred',
         topicPartitions: [{ topic, partitions: [0] }],
       })
     )
-    for (const row of elected) {
-      for (const partition of row.partitions) expect([0, 84]).toContain(partition.errorCode)
-    }
-    await p.poll(async () => (await metadataOf()).leader === reordered[0])
+    expect(elected).toHaveLength(1)
+    expect(elected[0].topic).toBe(topic)
+    expect(elected[0].partitions).toHaveLength(1)
+    expect(elected[0].partitions[0]).toMatchObject({ partition: 0, errorCode: 0 })
+    await p.poll(async () => (await metadataOf()).leader === preferred)
+    this.expectNegotiated('ElectLeaders', facts.ElectLeaders.selected)
 
     const featuresBeforeValidation = await p.invoke(() => admin.describeFeatures())
-    const entry = Object.entries(featuresBeforeValidation.finalizedFeatures).find(([name]) =>
-      Object.hasOwn(featuresBeforeValidation.supportedFeatures, name)
-    )
-    expect(Array.isArray(entry)).toBe(true)
-    const [featureName, feature] = entry
-    p.items(
-      await p.invoke(() =>
-        admin.updateFeatures({
-          validateOnly: true,
-          features: [{ name: featureName, maxVersionLevel: feature.maxVersionLevel }],
+    const change = differentLevel(featuresBeforeValidation)
+    expect(change).toBeDefined()
+    const { name: featureName } = change
+    const levelOf = (features) => features.finalizedFeatures[featureName].maxVersionLevel
+    p.cleanup.add('restore feature level', async () => {
+      const level = levelOf(await admin.describeFeatures())
+      if (level === change.level) return
+      p.items(
+        await admin.updateFeatures({
+          features: [
+            {
+              name: featureName,
+              maxVersionLevel: change.level,
+              upgradeType: level > change.level ? 'unsafe-downgrade' : 'upgrade',
+            },
+          ],
         })
       )
+    })
+    const validated = await p.invoke(() =>
+      admin.updateFeatures({
+        validateOnly: true,
+        features: [
+          { name: featureName, maxVersionLevel: change.target, upgradeType: change.upgradeType },
+        ],
+      })
     )
+    expect(validated).toHaveLength(1)
+    expect(validated[0]).toMatchObject({ feature: featureName, errorCode: 0 })
+    expect(validated[0].error).toBeFalsy()
+    this.expectNegotiated('UpdateFeatures', facts.UpdateFeatures.selected)
     const featuresAfterValidation = await p.invoke(() => admin.describeFeatures())
+    expect(levelOf(featuresAfterValidation)).toBe(change.level)
     expect(featuresAfterValidation).toEqual(featuresBeforeValidation)
 
     const type = ConfigResourceTypes.CLIENT_METRICS
@@ -1117,12 +1238,9 @@ class FloorAdminCases {
     this.expectNegotiated('ListConfigResources', facts.ListConfigResources.selected)
 
     const mark = p.requests.length
-    const refusal = await p
-      .invoke(() => admin.listConfigResources({ resourceTypes: [ConfigResourceTypes.TOPIC] }))
-      .then(
-        () => null,
-        (error) => error
-      )
+    const refusal = await rejectionOf(
+      p.invoke(() => admin.listConfigResources({ resourceTypes: [ConfigResourceTypes.TOPIC] }))
+    )
     this.refuse(refusal, 'ListConfigResources', 1, 'resourceTypes')
     const unsupportedFrames = p.requests
       .slice(mark)
@@ -1132,9 +1250,14 @@ class FloorAdminCases {
     p.record('F13', {
       clusterId: before.clusterId,
       fencedBrokerCount: before.brokers.filter(({ fenced }) => fenced).length,
-      electedLeader: reordered[0],
+      electedLeader: preferred,
+      leaderBeforeElection: staged.leader,
+      electionVersion: facts.ElectLeaders.selected,
       featureName,
-      featuresRestored: true,
+      featureLevel: change.level,
+      featureValidatedLevel: change.target,
+      featureUpdateVersion: facts.UpdateFeatures.selected,
+      featuresUnchanged: true,
       metricsResourcePresent: true,
       metricsResourceAbsentAfterDeletion: true,
       unsupportedFrames: unsupportedFrames.length,
@@ -1246,17 +1369,14 @@ class FloorAdminCases {
     const { broker, replicas } = await p.leader(topic)
 
     let mark = p.requests.length
-    const reassignmentRefusal = await p
-      .invoke(() =>
+    const reassignmentRefusal = await rejectionOf(
+      p.invoke(() =>
         admin.alterPartitionReassignments({
           allowReplicationFactorChange: false,
           topics: [{ topic, partitionAssignment: [{ partition: 0, replicas }] }],
         })
       )
-      .then(
-        () => null,
-        (error) => error
-      )
+    )
     this.refuse(
       reassignmentRefusal,
       'AlterPartitionReassignments',
@@ -1294,12 +1414,9 @@ class FloorAdminCases {
     expect(specVersions).toEqual([facts.ListOffsets.selected, facts.ListOffsets.selected])
 
     mark = p.requests.length
-    const specRefusal = await p
-      .invoke(() => admin.fetchTopicOffsetsByTimestamp(topic, 'earliestPendingUpload'))
-      .then(
-        () => null,
-        (error) => error
-      )
+    const specRefusal = await rejectionOf(
+      p.invoke(() => admin.fetchTopicOffsetsByTimestamp(topic, 'earliestPendingUpload'))
+    )
     this.refuse(specRefusal, 'ListOffsets', 11, 'earliestPendingUpload')
     const unsupportedFrames = p.requests
       .slice(mark)
@@ -1476,7 +1593,7 @@ class FloorAdminCases {
    */
   async connection() {
     const p = this.probe
-    p.strictTimers = true
+    p.trackTimers()
     const facts = await this.capabilities(['ApiVersions', 'Fetch'])
     await p.start()
     const attempts = await this.heldDial()
@@ -1518,13 +1635,7 @@ class FloorAdminCases {
     })
     const admin = kafka.admin()
     p.cleanup.add('held dial admin disconnect', () => admin.disconnect({ timeout: 5000 }))
-    const failed = () =>
-      p
-        .invoke(() => admin.connect())
-        .then(
-          () => null,
-          (error) => error
-        )
+    const failed = () => rejectionOf(p.invoke(() => admin.connect()))
     dial.holding = true
     expect(await failed()).toBeInstanceOf(KafkaJSError)
     expect(dial.attempts).toHaveLength(1)
@@ -1660,10 +1771,10 @@ class FloorAdminCases {
   }
 
   /**
-   * A fetch waiting on the broker is not an idle connection: its socket outlives the idle limit
-   * and the fetch completes normally.
+   * A fetch waiting on the broker is not an idle connection: it stays pending past the idle limit on
+   * the same open socket, then completes normally for exactly the requested partition.
    * @returns {Promise<boolean>} whether the held socket was closed early; false on success
-   * @throws {Error} when the socket is closed before the fetch answers or the fetch fails
+   * @throws {Error} when the fetch settles early, its socket is replaced or closed, or it fails
    */
   async heldLongPoll() {
     const p = this.probe
@@ -1671,7 +1782,10 @@ class FloorAdminCases {
     const { host, port } = await p.leaderNode(topic)
     const before = p.sockets.length
     const broker = await p.raw(host, port, { connectionsMaxIdle: IDLE_MS })
-    const pending = p
+    const dialed = p.sockets.slice(before)
+    expect(dialed).toHaveLength(1)
+    let settled = false
+    const outcome = p
       .invoke(() =>
         broker.fetch({
           minBytes: 1,
@@ -1683,14 +1797,22 @@ class FloorAdminCases {
         (response) => ({ response }),
         (error) => ({ error })
       )
+      .finally(() => {
+        settled = true
+      })
     await p.invoke(() => delay(p.signal, IDLE_MS + 1500))
-    const sockets = p.sockets.slice(before)
-    const heldLongPollWasReaped = sockets.some((socket) => socket.destroyed)
-    expect(sockets.length).toBeGreaterThan(0)
+    expect(settled).toBe(false)
+    expect(p.sockets).toHaveLength(before + 1)
+    expect(p.sockets[before]).toBe(dialed[0])
+    const heldLongPollWasReaped = dialed[0].destroyed
     expect(heldLongPollWasReaped).toBe(false)
-    const { response, error } = await pending
+    const { response, error } = await outcome
     expect(error).toBeUndefined()
-    expect(response.responses[0].partitions[0].errorCode).toBe(0)
+    expect(response.errorCode).toBe(0)
+    expect(response.responses).toHaveLength(1)
+    expect(response.responses[0].topicName).toBe(topic)
+    expect(response.responses[0].partitions).toHaveLength(1)
+    expect(response.responses[0].partitions[0]).toMatchObject({ partition: 0, errorCode: 0 })
     return heldLongPollWasReaped
   }
 
@@ -1724,12 +1846,7 @@ class FloorAdminCases {
     await p.invoke(() => admin.connect())
     const lift = chaos.arm({}, (socket) => socket.blackhole())
     const startedAt = performance.now()
-    const failure = await p
-      .invoke(() => admin.listTopics())
-      .then(
-        () => null,
-        (error) => error
-      )
+    const failure = await rejectionOf(p.invoke(() => admin.listTopics()))
     const deadlineAt = performance.now()
     const elapsed = Math.round(deadlineAt - startedAt)
     expect(failure).toBeInstanceOf(KafkaJSTimeout)
@@ -1771,8 +1888,11 @@ module.exports = {
   SuiteBudget,
   SUITE_MS,
   caseTimeout,
+  TimerLedger,
   deepest,
+  differentLevel,
   markersOf,
   refusalOf,
+  rejectionOf,
   runFloorCase,
 }

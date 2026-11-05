@@ -7,6 +7,7 @@ const path = require('node:path')
 const { Kafka, logLevel, oauthBearer } = require('../../..')
 const { saslBrokers, sslConnectionOpts, writeEvidence, wireVersionsOf } = require('testHelpers')
 const { waitForCondition, withTimeout } = require('../../consumer/__tests__/fixtures/liveScenario')
+const { CleanupStack } = require('../../producer/__tests__/fixtures/liveProbe')
 
 // Gated: it authenticates against the OAUTHBEARER compose (docker-compose.oauthbearer.yml). Run
 // alone: `npm run test:floor:oauth`.
@@ -44,6 +45,7 @@ describeLive('OAuth helpers against a live OAUTHBEARER broker', () => {
   const acknowledged = []
   const fileSupplied = []
   const clients = []
+  const cleanup = new CleanupStack()
   let issuer
   let issuerUrl
   let sockets
@@ -114,7 +116,29 @@ describeLive('OAuth helpers against a live OAUTHBEARER broker', () => {
     acknowledged.push({ id, partition: result.partition, offset: result.baseOffset })
   }
 
+  /**
+   * Disconnects every tracked client, each whatever the others did.
+   * @returns {Promise<void>}
+   * @throws {Error} the first disconnect failure, after all were attempted
+   */
+  const disconnectClients = async () => {
+    const results = await Promise.allSettled(
+      clients
+        .splice(0)
+        .reverse()
+        .map((client) => withTimeout(client.disconnect(), DISCONNECT_BUDGET_MS))
+    )
+    const failed = results.find(({ status }) => status === 'rejected')
+    if (failed) throw failed.reason
+  }
+
   beforeAll(async () => {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), 'oauth-helpers-live-'))
+    cleanup.add('temporary directory removal', () =>
+      fs.rmSync(dir, { recursive: true, force: true })
+    )
+    tokenFile = path.join(dir, 'access.jwt')
+    fs.writeFileSync(tokenFile, unsecured('file', 1).token)
     signingKeys = crypto.generateKeyPairSync('rsa', { modulusLength: 2048 })
     sockets = new Set()
     issuer = http.createServer(async (request, response) => {
@@ -138,25 +162,21 @@ describeLive('OAuth helpers against a live OAUTHBEARER broker', () => {
       socket.once('close', () => sockets.delete(socket))
     })
     await new Promise((resolve) => issuer.listen(0, '127.0.0.1', resolve))
-    issuerUrl = `http://127.0.0.1:${issuer.address().port}/token`
-    dir = fs.mkdtempSync(path.join(os.tmpdir(), 'oauth-helpers-live-'))
-    tokenFile = path.join(dir, 'access.jwt')
-    fs.writeFileSync(tokenFile, unsecured('file', 1).token)
-  }, HOOK_BUDGET_MS)
-
-  afterAll(async () => {
-    for (const client of clients.reverse())
-      await withTimeout(client.disconnect(), DISCONNECT_BUDGET_MS)
-    if (providers) Object.values(providers).forEach((provider) => provider.close())
-    if (issuer) {
+    cleanup.add('issuer shutdown', async () => {
       const closed = [...sockets].map(
         (socket) => new Promise((resolve) => socket.once('close', resolve))
       )
       issuer.closeIdleConnections()
       await new Promise((resolve) => issuer.close(resolve))
-      await withTimeout(Promise.all(closed), DISCONNECT_BUDGET_MS)
-    }
-    if (dir) fs.rmSync(dir, { recursive: true, force: true })
+      await Promise.all(closed)
+    })
+    cleanup.add('client disconnect', disconnectClients)
+    issuerUrl = `http://127.0.0.1:${issuer.address().port}/token`
+  }, HOOK_BUDGET_MS)
+
+  afterAll(async () => {
+    const failures = await cleanup.closeAll({ budgetMs: HOOK_BUDGET_MS - 5000 })
+    if (failures.length) throw new AggregateError(failures, 'The OAuth floor cleanup failed')
   }, HOOK_BUDGET_MS)
 
   test(
@@ -188,6 +208,7 @@ describeLive('OAuth helpers against a live OAUTHBEARER broker', () => {
         jwt: oauthBearer.jwtBearer({ ...helperOptions, assertion: signer('jwt') }),
         file: oauthBearer.fileToken({ ...helperOptions, path: tokenFile }),
       }
+      cleanup.add('provider close', () => Object.values(providers).forEach((p) => p.close()))
       const fileProvider = async () => {
         const response = await providers.file()
         fileSupplied.push(response.value)
@@ -197,17 +218,33 @@ describeLive('OAuth helpers against a live OAUTHBEARER broker', () => {
       // 1. One acquisition per HTTP form, with the refresh draw seeded at the window's centre.
       const receipt = {}
       const random = jest.spyOn(Math, 'random').mockReturnValue(0.5)
-      for (const form of HTTP_FORMS) {
-        const before = Date.now()
-        await providers[form]()
-        receipt[form] = { before, after: Date.now() }
+      try {
+        for (const form of HTTP_FORMS) {
+          const before = Date.now()
+          await providers[form]()
+          receipt[form] = { before, after: Date.now() }
+        }
+        await providers.file()
+      } finally {
+        random.mockRestore()
       }
-      await providers.file()
-      random.mockRestore()
       expect(HTTP_FORMS.map((form) => issued[form].length)).toEqual([1, 1, 1])
       expect(verified).toEqual([true, true])
 
-      // 2. A producer and an admin per form share its provider.
+      // 2. A producer and an admin per form share its provider. A separate admin on its own fresh
+      // tokens stays open to delete the topic after every other client has gone.
+      const janitor = kafkaFor(`oauth-helpers-janitor-${runId}`, async () => ({
+        value: unsecured('janitor', 1).token,
+      })).admin()
+      cleanup.add('janitor disconnect', () => janitor.disconnect())
+      cleanup.add('topic deletion', async () => {
+        try {
+          await janitor.deleteTopics({ topics: [topic] })
+        } catch (error) {
+          if (error.type !== 'UNKNOWN_TOPIC_OR_PARTITION') throw error
+        }
+      })
+      await janitor.connect()
       const producers = {}
       for (const form of [...HTTP_FORMS, 'file']) {
         const kafka = kafkaFor(
@@ -344,14 +381,42 @@ describeLive('OAuth helpers against a live OAUTHBEARER broker', () => {
   test(
     'closed providers reject later calls and the issuer keeps no sockets',
     async () => {
-      for (const client of clients.splice(0).reverse())
-        await withTimeout(client.disconnect(), DISCONNECT_BUDGET_MS)
+      await disconnectClients()
       Object.values(providers).forEach((provider) => provider.close())
       for (const provider of Object.values(providers))
         await expect(provider()).rejects.toThrow('closed')
       issuer.closeIdleConnections()
       const settled = await waitForCondition(() => sockets.size === 0, { attempts: 40, delay: 250 })
       expect(settled).toBe(true)
+    },
+    HOOK_BUDGET_MS
+  )
+
+  test(
+    'reads the SASL capability facts from an OAUTHBEARER-authenticated connection',
+    async () => {
+      const provider = oauthBearer.clientCredentials({
+        tokenEndpointUrl: issuerUrl,
+        allowInsecure: true,
+        timeout: 5000,
+        maxRetryTime: 8000,
+        clientId: 'live-secret-client',
+        clientSecret: 'inert-live-secret',
+      })
+      cleanup.add('capability provider close', () => provider.close())
+      const [host, port] = saslBrokers()[0].split(':')
+      const ranges = await FloorCapabilities.authenticated(
+        {
+          ...sslConnectionOpts(),
+          host,
+          port: Number(port),
+          sasl: { mechanism: 'oauthbearer', oauthBearerProvider: provider },
+        },
+        process.env.KAFKA_VERSION
+      )
+
+      writeEvidence(EVIDENCE, { case: 'F18-capability', authenticated: 'oauthbearer', ranges })
+      expect(Object.keys(ranges)).toEqual(['SaslHandshake', 'SaslAuthenticate'])
     },
     HOOK_BUDGET_MS
   )
@@ -376,25 +441,4 @@ describe('Floor OAuth expectations', () => {
       'Variant population differs'
     )
   })
-})
-
-const describeCapability = process.env.FLOOR_OAUTH_E2E === '1' ? describe : describe.skip
-
-describeCapability('Floor authenticated capability observation', () => {
-  test('checks the real authentication negotiation against the retained floor probe', async () => {
-    const Broker = require('../../broker')
-    const { createConnectionPool, newLogger } = require('testHelpers')
-    const broker = new Broker({ connectionPool: createConnectionPool(), logger: newLogger() })
-    try {
-      await broker.connect()
-      const ranges = FloorCapabilities.fromBroker(
-        broker,
-        ['SaslHandshake', 'SaslAuthenticate'],
-        process.env.KAFKA_VERSION
-      )
-      writeEvidence(EVIDENCE, { case: 'F18-capability', ranges })
-    } finally {
-      await broker.disconnect()
-    }
-  }, 30000)
 })

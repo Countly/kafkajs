@@ -99,8 +99,21 @@ describeTokens('Delegation tokens on the negotiated floor', () => {
       matches[0].hmac.length === token.hmac.length && timingSafeEqual(matches[0].hmac, token.hmac)
     expect(equal).toBe(true)
     observed.push('describe')
-    const renewed = await admin.renewDelegationToken({ hmac: token.hmac, renewPeriodMs: -1 })
-    expect(BigInt(renewed.expiryTimestampMs) >= BigInt(token.expiryTimestampMs)).toBe(true)
+    const expiryOf = async () =>
+      BigInt(
+        (await admin.describeDelegationToken()).find((item) => item.tokenId === token.tokenId)
+          .expiryTimestampMs
+      )
+    const shortened = await admin.expireDelegationToken({
+      hmac: token.hmac,
+      expiryTimePeriodMs: 30000,
+    })
+    expect(BigInt(shortened.expiryTimestampMs) < BigInt(token.expiryTimestampMs)).toBe(true)
+    expect(await expiryOf()).toBe(BigInt(shortened.expiryTimestampMs))
+    const renewed = await admin.renewDelegationToken({ hmac: token.hmac, renewPeriodMs: 90000 })
+    expect(BigInt(renewed.expiryTimestampMs) > BigInt(shortened.expiryTimestampMs)).toBe(true)
+    expect(BigInt(renewed.expiryTimestampMs) <= BigInt(token.maxTimestampMs)).toBe(true)
+    expect(await expiryOf()).toBe(BigInt(renewed.expiryTimestampMs))
     observed.push('renew')
     await admin.expireDelegationToken({ hmac: token.hmac, expiryTimePeriodMs: 0 })
     expired = true

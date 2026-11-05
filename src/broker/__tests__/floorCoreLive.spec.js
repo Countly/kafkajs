@@ -31,10 +31,13 @@ const {
   HeldDial,
   SuiteBudget,
   SUITE_MS,
+  TimerLedger,
   caseTimeout,
   deepest,
+  differentLevel,
   markersOf,
   refusalOf,
+  rejectionOf,
   runFloorCase,
 } = require('./fixtures/floorAdmin')
 const { createScriptedCluster, producerScript } = require('../../../testHelpers/scriptedCluster')
@@ -1192,6 +1195,30 @@ describe('Floor capability expectations', () => {
     ).toThrow('wrong refusal class')
   })
 
+  test('correlates each SASL request with its negotiated version and refuses a missing or other one', () => {
+    const ranges = { SaslHandshake: { selected: 1 }, SaslAuthenticate: { selected: 2 } }
+    const sent = (apiName, ...versions) => versions.map((apiVersion) => ({ apiName, apiVersion }))
+    const exchange = [
+      { apiName: 'ApiVersions', apiVersion: 4 },
+      ...sent('SaslHandshake', 1),
+      ...sent('SaslAuthenticate', 2, 2),
+    ]
+
+    expect(() => FloorCapabilities.correlate(ranges, exchange)).not.toThrow()
+    expect(() => FloorCapabilities.correlate(ranges, sent('SaslHandshake', 1))).toThrow(
+      'SaslAuthenticate: no request observed'
+    )
+    expect(() =>
+      FloorCapabilities.correlate(ranges, [
+        ...sent('SaslHandshake', 0),
+        ...sent('SaslAuthenticate', 2),
+      ])
+    ).toThrow('SaslHandshake: unnegotiated version sent')
+    expect(() =>
+      FloorCapabilities.correlate(ranges, [...exchange, ...sent('SaslAuthenticate', 1)])
+    ).toThrow('SaslAuthenticate: unnegotiated version sent')
+  })
+
   test('uses negotiated ranges even when an unrelated release label suggests a newer broker', () => {
     const tables = { ...inputs(), release: 'future' }
     expect(new FloorCapabilities(tables).version('ListTransactions')).toBe(1)
@@ -1236,6 +1263,79 @@ describe('Floor administration helpers', () => {
     expect(refusalOf(null)).toBeNull()
     expect(deepest(wrapped)).toBe(refusal)
     expect(deepest(loop)).toBe(loop.cause)
+  })
+
+  test('a rejection becomes the failure itself and a resolution becomes null', async () => {
+    const failure = new Error('refused')
+
+    expect(await rejectionOf(Promise.reject(failure))).toBe(failure)
+    expect(await rejectionOf(Promise.resolve('fine'))).toBeNull()
+  })
+
+  test('a feature update that differs from the finalized level downgrades first, upgrades next and skips fixed or unsupported features', () => {
+    const range = (minVersion, maxVersion) => ({ minVersion, maxVersion })
+    const supportedFeatures = {
+      'group.version': range(0, 1),
+      'kraft.version': range(0, 1),
+      'metadata.version': range(1, 26),
+      'share.version': range(0, 1),
+      'transaction.version': range(0, 2),
+    }
+    const finalized = (levels) => ({
+      supportedFeatures,
+      finalizedFeatures: Object.fromEntries(
+        Object.entries(levels).map(([name, level]) => [
+          name,
+          { minVersionLevel: level, maxVersionLevel: level },
+        ])
+      ),
+    })
+
+    expect(
+      differentLevel(
+        finalized({
+          'metadata.version': 20,
+          'kraft.version': 1,
+          'transaction.version': 2,
+          'group.version': 1,
+        })
+      )
+    ).toEqual({ name: 'group.version', level: 1, target: 0, upgradeType: 'safe-downgrade' })
+    expect(differentLevel(finalized({ 'metadata.version': 20, 'share.version': 0 }))).toEqual({
+      name: 'share.version',
+      level: 0,
+      target: 1,
+      upgradeType: 'upgrade',
+    })
+    expect(
+      differentLevel(finalized({ 'metadata.version': 20, 'kraft.version': 1 }))
+    ).toBeUndefined()
+    expect(differentLevel(finalized({ 'unsupported.version': 1 }))).toBeUndefined()
+    expect(
+      differentLevel({
+        supportedFeatures: { 'transaction.version': range(2, 2) },
+        finalizedFeatures: { 'transaction.version': { minVersionLevel: 2, maxVersionLevel: 2 } },
+      })
+    ).toBeUndefined()
+  })
+
+  test('a timer ledger reports the timers started since it began that are still pending, by identity', async () => {
+    const earlier = setTimeout(() => {}, 60000)
+    const ledger = new TimerLedger()
+    ledger.start()
+    const cleared = setTimeout(() => {}, 60000)
+    const retained = setTimeout(() => {}, 60000)
+    const fired = await new Promise((resolve) => {
+      const timer = setTimeout(() => resolve(timer), 1)
+    })
+    clearTimeout(cleared)
+    await new Promise((resolve) => setImmediate(resolve))
+    const pending = ledger.stop()
+    clearTimeout(earlier)
+    clearTimeout(retained)
+
+    expect(pending).toContain(retained)
+    for (const gone of [earlier, cleared, fired]) expect(pending).not.toContain(gone)
   })
 
   test('credential markers cover the encodings a log or a buffer dump can show', () => {

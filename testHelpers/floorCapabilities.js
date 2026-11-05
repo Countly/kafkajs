@@ -39,6 +39,58 @@ class FloorCapabilities {
   }
 
   /**
+   * Reads SASL capability facts from a connection that finished the real SASL exchange: the ranges
+   * come from an ApiVersions answer given after authentication, and the SASL requests of the
+   * exchange itself are correlated with them.
+   * @param {object} poolOptions Connection options holding the real `sasl` and transport settings.
+   * @param {string} floor Recorded probe entry selected for this invocation.
+   * @param {string[]} [names] The SASL APIs to observe.
+   * @returns {Promise<object>} The range facts per name, as `fromBroker` builds them.
+   * @throws {AssertionError|Error} On a failed authentication, or a SASL request that did not use
+   *   the negotiated version.
+   */
+  static async authenticated(poolOptions, floor, names = ['SaslHandshake', 'SaslAuthenticate']) {
+    const Broker = require('../src/broker')
+    const InstrumentationEventEmitter = require('../src/instrumentation/emitter')
+    const { NETWORK_REQUEST } = require('../src/network/instrumentationEvents')
+    const { createConnectionPool, newLogger } = require('./index')
+    const emitter = new InstrumentationEventEmitter()
+    const sent = []
+    emitter.addListener(NETWORK_REQUEST, ({ payload }) => sent.push(payload))
+    const broker = new Broker({
+      connectionPool: createConnectionPool({ ...poolOptions, instrumentationEmitter: emitter }),
+      logger: newLogger(),
+    })
+    try {
+      await broker.connect()
+      const ranges = FloorCapabilities.fromBroker(
+        { versions: await broker.apiVersions() },
+        names,
+        floor
+      )
+      FloorCapabilities.correlate(ranges, sent)
+      return ranges
+    } finally {
+      await broker.disconnect()
+    }
+  }
+
+  /**
+   * Requires every observed request of each named API to have used exactly its negotiated version.
+   * @param {object} ranges Range facts per API, each with its `selected` version.
+   * @param {Array<{ apiName: string, apiVersion: number }>} requests What the connection sent.
+   * @returns {void} After every API was seen and matched.
+   * @throws {AssertionError} When an API sent nothing, or sent another version.
+   */
+  static correlate(ranges, requests) {
+    for (const [name, { selected }] of Object.entries(ranges)) {
+      const versions = requests.filter(({ apiName }) => apiName === name).map((r) => r.apiVersion)
+      assert(versions.length > 0, `${name}: no request observed`)
+      assert.deepEqual(new Set(versions), new Set([selected]), `${name}: unnegotiated version sent`)
+    }
+  }
+
+  /**
    * Binds independently recorded, observed and implemented ranges.
    * @param {object} ranges Named maps with recorded, observed and implemented entries.
    * @returns {FloorCapabilities} A test-only range oracle.
