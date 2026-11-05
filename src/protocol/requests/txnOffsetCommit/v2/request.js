@@ -65,7 +65,7 @@ module.exports.schema = {
     { name: 'ProducerId', type: 'int64', versions: '0+' },
     { name: 'ProducerEpoch', type: 'int16', versions: '0+' },
     { name: 'Topics', type: '[]TxnOffsetCommitRequestTopic', versions: '0+' },
-    { name: 'Topics.Name', type: 'string', versions: '0+' },
+    { name: 'Topics.Name', type: 'string', versions: '0-5' },
     { name: 'Topics.Partitions', type: '[]TxnOffsetCommitRequestPartition', versions: '0+' },
     { name: 'Topics.Partitions.PartitionIndex', type: 'int32', versions: '0+' },
     { name: 'Topics.Partitions.CommittedOffset', type: 'int64', versions: '0+' },

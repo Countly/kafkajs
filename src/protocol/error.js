@@ -844,6 +844,26 @@ const errorCodes = [
     retriable: true,
     message: 'The limit of share sessions has been reached',
   },
+  {
+    type: 'GROUP_DELETION_FAILED',
+    code: 134,
+    retriable: false,
+    message:
+      'DeleteGroups could not complete; see the error message on the per-group result for details.',
+  },
+  {
+    type: 'STREAMS_TOPOLOGY_DESCRIPTION_UPDATE_FAILED',
+    code: 135,
+    retriable: false,
+    message:
+      'The broker could not process the topology description update; see the error message for details.',
+  },
+  {
+    type: 'CONTROLLER_ID_NOT_REGISTERED',
+    code: 136,
+    retriable: false,
+    message: 'The given controller ID was not registered.',
+  },
 ]
 
 const unknownErrorCode = (errorCode) => ({

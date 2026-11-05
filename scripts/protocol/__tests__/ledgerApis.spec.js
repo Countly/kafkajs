@@ -429,18 +429,33 @@ describe('scripts/protocol > admin ledger APIs', () => {
   })
 
   describe('the provenance record', () => {
+    /**
+     * The one ledger definition the 4.4.0 release changed (its Topics.Name became a map key),
+     * by the SHA-256 of the 4.4.0 file in the SHA-512 checked source release.
+     */
+    const CHANGED_IN_4_4_0 = {
+      DescribeProducers: {
+        Request: 'd6c4a35f9af9e5c88c96a0d9edf8f1bb247d7a8049cdd5e8b83b215fbe3c385b',
+      },
+    }
+
     test.each(LEDGER)(
       '%s: records the tag and the SHA-256 of both definitions',
       (name, apiKey, valid, flexibleFrom, requestSha, responseSha) => {
         const entry = readJson(PROVENANCE)[name]
 
         expect(entry).toBeDefined()
-        const { javaClientsJar, ...recorded } = entry
+        const { javaClientsJar, javaVectors, ...recorded } = entry
         expect(recorded).toEqual({
-          kafkaTag: '4.3.1',
-          messageSha256: { Request: requestSha, Response: responseSha },
+          kafkaTag: '4.4.0',
+          messageSha256: {
+            Request: requestSha,
+            Response: responseSha,
+            ...CHANGED_IN_4_4_0[name],
+          },
         })
         expect([null, '4.3.1']).toContain(javaClientsJar)
+        expect(javaVectors.every((vector) => vector.javaClientsJar === javaClientsJar)).toBe(true)
       }
     )
   })

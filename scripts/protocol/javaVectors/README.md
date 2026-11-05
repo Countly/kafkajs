@@ -64,7 +64,7 @@ that is removed afterwards when the variable is unset and reused when it is set.
 | DeleteTopics | 20 | 2, 3, 4, 5, 6 | 19 |
 | CreatePartitions | 37 | 2, 3 | 10 |
 | DeleteRecords | 21 | 2 | 3 |
-| DeleteGroups | 42 | 2 | 3 |
+| DeleteGroups | 42 | 2, 3 | 13 |
 | DescribeAcls | 29 | 2, 3 | 8 |
 | CreateAcls | 30 | 2, 3 | 7 |
 | DeleteAcls | 31 | 2, 3 | 8 |
@@ -103,6 +103,29 @@ byte for byte, so only the eight new files differ from the committed set.
 `runAssignors.sh` with no subcommand, or with `assignors`, does exactly what it did before, and
 `run.sh`/`GenerateVectors.java` are unchanged and still own every vector the message generator
 does not write.
+
+### The Kafka 4.4.0 jar and the source records
+
+`GenerateMessageVectors.java` is written against the Kafka 4.4 client API (the 4.4 message classes
+renamed `TxnOffsetCommitRequestData#setGenerationId` and made `DescribeProducersRequestData#setTopics`
+take a collection), so `messages` and `produce` need `KAFKA_CLIENTS_VERSION=4.4.0`; the default pin
+of the script stays 4.3.1 for the other modes. The DeleteGroups v3 vectors (request `basic`, `empty`,
+`nonAscii`; response `ok`, `error`, `nullEmptyNonempty`, `mixedOutcomes`, `nonAscii`, `noResults`,
+`unknownTags`) were written by that jar. A run with it also regenerated every committed vector of the
+generator byte for byte, so only those ten files are new.
+
+| Jar | SHA-256 |
+|---|---|
+| `kafka-clients-4.4.0.jar` | `1ab07317eb6633241392449d329dbdc5d9251e6ffc4926860f42dd966e88bdf9` |
+
+The hash matches the `.sha256` Maven Central publishes for the jar. Which jar wrote which fixture is
+recorded in `scripts/protocol/javaVectorSources.json`, one record per Java fixture:
+`{ javaClientsJar, javaClientsJarSha256, fixtureSha256 }`. The vectors written before the records
+existed name the 4.3.1 jar with a null hash (it was never kept); a record for any other jar must name
+the jar's SHA-256. `npm run protocol:generate` and `npm run protocol:check` refuse a vector with no
+record, a record with no vector, a record written twice and a fixture whose bytes changed after it was
+recorded, and copy the records into `scripts/protocol/provenance.json`. A generator script's default
+pin is never read as attribution. Add a record in the same commit as the fixture it describes.
 
 ### Fixture schema
 

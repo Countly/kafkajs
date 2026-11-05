@@ -1,0 +1,7 @@
+{
+  "message": "DeleteGroupsRequest",
+  "version": 3,
+  "case": "nonAscii",
+  "hex": "03116772757070652dc3a92de697a5e69cac0100",
+  "fields": { "groupIds": ["gruppe-é-日本", ""] }
+}

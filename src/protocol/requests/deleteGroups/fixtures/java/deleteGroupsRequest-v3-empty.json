@@ -1,0 +1,7 @@
+{
+  "message": "DeleteGroupsRequest",
+  "version": 3,
+  "case": "empty",
+  "hex": "0100",
+  "fields": { "groupIds": [] }
+}

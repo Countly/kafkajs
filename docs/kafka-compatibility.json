@@ -1,6 +1,6 @@
 {
   "generatedFrom": {
-    "kafkaTag": "4.3.1",
+    "kafkaTag": "4.4.0",
     "tool": "scripts/compat",
     "schemaVersion": 1
   },
@@ -411,7 +411,7 @@
       "planned": "done",
       "validVersions": [
         0,
-        4
+        5
       ],
       "flexibleFrom": 3,
       "deprecatedVersions": null,
@@ -423,7 +423,7 @@
         3,
         4
       ],
-      "gap": "current",
+      "gap": "behind:1",
       "onFloor": false,
       "belowFloor": [],
       "notes": "v0-v3 omit every SupportedFeatures entry whose MinVersion is 0 (KAFKA-17011, fixed in v4 / Kafka 3.9), so a v3-only client sees a truncated feature list. The client asks for v4 first; a broker that does not support it answers UNSUPPORTED_VERSION with the versions it has, and the client asks again at the highest one both sides implement (only a broker below 3.9 does this, and the 4.0 floor excludes them)."
@@ -656,7 +656,7 @@
       "planned": "done",
       "validVersions": [
         0,
-        5
+        6
       ],
       "flexibleFrom": 3,
       "deprecatedVersions": null,
@@ -669,7 +669,7 @@
         4,
         5
       ],
-      "gap": "current",
+      "gap": "behind:1",
       "onFloor": false,
       "belowFloor": [],
       "notes": "v2 committed leader epoch, v3 flexible with KIP-447 group metadata (generation, member id, group instance id), v4 TRANSACTION_ABORTABLE, v5 adds the offsets to the transaction itself under transaction version 2, so no AddOffsetsToTxn precedes it. A transaction stays at v4 or below unless its coordinator finalizes transaction.version at level 2 or above."
@@ -982,7 +982,7 @@
       "planned": "done",
       "validVersions": [
         0,
-        2
+        3
       ],
       "flexibleFrom": 2,
       "deprecatedVersions": null,
@@ -990,7 +990,8 @@
       "forkVersions": [
         0,
         1,
-        2
+        2,
+        3
       ],
       "gap": "current",
       "onFloor": false,
@@ -1440,8 +1441,8 @@
   ],
   "errors": {
     "counts": {
-      "kafka": 134,
-      "fork": 134
+      "kafka": 137,
+      "fork": 137
     },
     "missingInFork": [],
     "unknownToKafka": [],

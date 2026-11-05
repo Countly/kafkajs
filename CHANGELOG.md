@@ -217,6 +217,8 @@ Versions before 3.0.0 are internal alpha tags and are not published.
 
 - `kerberos` is declared an optional peer dependency pinned to 7.0.0 and is never installed with the package.
 
+- DeleteGroups v3 returns `errorMessage` per group; the error table gains `GROUP_DELETION_FAILED`, `STREAMS_TOPOLOGY_DESCRIPTION_UPDATE_FAILED` and `CONTROLLER_ID_NOT_REGISTERED`; the compatibility baseline moves to Kafka 4.4.x
+
 #### Tooling
 
 - Live scenarios for the connection setup budget and idle reaping; the soak's idle profile asserts that sockets are reaped and reopened.
@@ -226,6 +228,9 @@ Versions before 3.0.0 are internal alpha tags and are not published.
 - `blackhole(id)` in the scripted cluster and the connection-setup benchmark.
 - Track the nineteen admin-ledger APIs in the compatibility snapshot, the tracked list and the generated matrix, with named broker ranges.
 - Tests pin the SCRAM client checks, the TLS negatives, secret hygiene across the SASL mechanisms and the DNS behaviour.
+- `npm run compat:fetch -- --source-root <dir>` imports the message snapshot and the error snapshot from an unpacked Apache Kafka source release (its `gradle.properties` must hold the pinned version) instead of the network. The snapshot is Kafka 4.4.0; the 4.3.1 snapshots stay beside it.
+- `scripts/protocol/javaVectorSources.json` records, for each Java vector, the `kafka-clients` jar that wrote it, that jar's SHA-256 (null only for the 4.3.1 jar of the older vectors) and the fixture's own SHA-256; `npm run protocol:generate` and `protocol:check` refuse a missing, extra, duplicate or stale record and copy the records into `scripts/protocol/provenance.json`, where an API whose vectors came from two jars records no single jar.
+- The Java message-vector generator targets the Kafka 4.4 client API, and `test:e2e:delete-groups-v3` runs `deleteGroupsV3Live.spec.js` (`DELETE_GROUPS_V3_E2E`) against the broker version under test.
 
 ### Phase 9B — Producer parity: delivery deadline, memory bound, request size, partitioner, codecs, lifecycle
 

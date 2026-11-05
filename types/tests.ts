@@ -1651,6 +1651,15 @@ deadlineAdmin.fetchTopicOffsetsByTimestamp('t', 1, adminCallBudget)
 deadlineAdmin.describeCluster(adminCallBudget)
 deadlineAdmin.fetchTopicMetadata({ topics: ['t'], includeTopicAuthorizedOperations: true, apiTimeout: 10 })
 deadlineAdmin.createTopics({ topics: [{ topic: 't' }], timeout: 30000, apiTimeout: 5000 })
+
+// DeleteGroups v3 answers a message per group: text, null, or absent from an older broker; never a number.
+const deleteGroupsWithText: kafkajs.DeleteGroupsResult = { groupId: 'g', errorCode: 134, errorMessage: 'cleanup failed' }
+const deleteGroupsWithNull: kafkajs.DeleteGroupsResult = { groupId: 'g', errorCode: 0, errorMessage: null }
+const deleteGroupsWithoutMessage: kafkajs.DeleteGroupsResult = { groupId: 'g', errorCode: 0 }
+// @ts-expect-error the broker's message is text, never a number
+const deleteGroupsWithNumber: kafkajs.DeleteGroupsResult = { groupId: 'g', errorCode: 134, errorMessage: 7 }
+declare const deleteGroupsFailure: kafkajs.KafkaJSDeleteGroupsError
+const failedGroupMessage: string | null | undefined = deleteGroupsFailure.groups[0].errorMessage
 process.on('SIGTERM', deadlineAdmin.disconnect)
 const oldAdminTupleWrapper = (...args: Parameters<kafkajs.Admin['describeGroups']>) => deadlineAdmin.describeGroups(...args)
 oldAdminTupleWrapper(['g'])

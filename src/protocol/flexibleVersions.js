@@ -7,7 +7,7 @@
  * @see https://cwiki.apache.org/confluence/display/KAFKA/KIP-482%3A+The+Kafka+Protocol+should+Support+Optional+Tagged+Fields
  * @see https://kafka.apache.org/43/design/protocol
  *
- * Generated from the Apache Kafka 4.3.1 message definitions
+ * Generated from the Apache Kafka 4.4.0 message definitions
  * (clients/src/main/resources/common/message/<Name>Request.json).
  * Do not edit by hand — run `npm run protocol:generate`; `npm run protocol:check` fails on drift.
  *

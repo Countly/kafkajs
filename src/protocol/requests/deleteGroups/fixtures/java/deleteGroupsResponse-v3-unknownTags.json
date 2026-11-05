@@ -1,0 +1,7 @@
+{
+  "message": "DeleteGroupsResponse",
+  "version": 3,
+  "case": "unknownTags",
+  "hex": "00000019030b746573742d67726f7570000000010702aabb0c6f746865722d67726f757000860f636c65616e7570206661696c6564010702aabb010702aabb",
+  "fields": { "throttleTime": 25, "results": [{ "groupId": "test-group", "errorCode": 0, "errorMessage": null }, { "groupId": "other-group", "errorCode": 134, "errorMessage": "cleanup failed" }], "unknownTag": 7, "unknownTagBytes": [170, 187] }
+}

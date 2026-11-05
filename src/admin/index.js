@@ -1794,14 +1794,23 @@ module.exports = ({
     createGroupDescriptions({ cluster, retry, logger: rootLogger }).describe(groupIds, options)
 
   /**
-   * Delete groups in a broker
+   * Delete groups, each through its own group coordinator.
+   *
+   * A broker that speaks DeleteGroups v3 answers a message per group. It is kept as `errorMessage`
+   * (`null` when the broker sent none, `''` when it sent an empty one) on each result and on each
+   * failed group of the `KafkaJSDeleteGroupsError` that rejects the call; older brokers omit the
+   * property. A group that failed rejects the call once, with every failed group, and is not
+   * retried.
    *
    * @param {string[]} [groupIds]
    * @return {Promise<DeleteGroups>}
+   * @throws {KafkaJSDeleteGroupsError} `groups` holds `{ groupId, errorCode, error, errorMessage? }`
+   *   for each group that failed
    *
    * @typedef {Array} DeleteGroups
    * @property {string} groupId
    * @property {number} errorCode
+   * @property {string|null} [errorMessage] the broker's message for the group (DeleteGroups v3+)
    */
   const deleteGroups = async (groupIds) => {
     if (!groupIds || !Array.isArray(groupIds)) {
@@ -1853,9 +1862,12 @@ module.exports = ({
 
         const errors = res
           .flatMap(({ results }) =>
-            results.map(({ groupId, errorCode, error }) => {
-              return { groupId, errorCode, error }
-            })
+            results.map(({ groupId, errorCode, error, errorMessage }) => ({
+              groupId,
+              errorCode,
+              error,
+              ...(errorMessage !== undefined && { errorMessage }),
+            }))
           )
           .filter(({ errorCode }) => errorCode !== 0)
 

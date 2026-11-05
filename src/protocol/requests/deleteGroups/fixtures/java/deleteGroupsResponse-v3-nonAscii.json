@@ -1,0 +1,7 @@
+{
+  "message": "DeleteGroupsResponse",
+  "version": 3,
+  "case": "nonAscii",
+  "hex": "0000001903116772757070652dc3a92de697a5e69cac00861472c3a973756dc3a920e29c93206661696c656400010000000000",
+  "fields": { "throttleTime": 25, "results": [{ "groupId": "gruppe-é-日本", "errorCode": 134, "errorMessage": "résumé ✓ failed" }, { "groupId": "", "errorCode": 0, "errorMessage": null }] }
+}

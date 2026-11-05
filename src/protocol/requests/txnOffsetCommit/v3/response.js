@@ -65,7 +65,7 @@ module.exports.schema = {
   fields: [
     { name: 'ThrottleTimeMs', type: 'int32', versions: '0+' },
     { name: 'Topics', type: '[]TxnOffsetCommitResponseTopic', versions: '0+' },
-    { name: 'Topics.Name', type: 'string', versions: '0+' },
+    { name: 'Topics.Name', type: 'string', versions: '0-5' },
     { name: 'Topics.Partitions', type: '[]TxnOffsetCommitResponsePartition', versions: '0+' },
     { name: 'Topics.Partitions.PartitionIndex', type: 'int32', versions: '0+' },
     { name: 'Topics.Partitions.ErrorCode', type: 'int16', versions: '0+' },

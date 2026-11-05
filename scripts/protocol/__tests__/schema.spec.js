@@ -250,6 +250,8 @@ describe('scripts/protocol > schema validation', () => {
       'src/protocol/requests/deleteAcls/v3/response.js',
       'src/protocol/requests/deleteGroups/v2/request.js',
       'src/protocol/requests/deleteGroups/v2/response.js',
+      'src/protocol/requests/deleteGroups/v3/request.js',
+      'src/protocol/requests/deleteGroups/v3/response.js',
       'src/protocol/requests/deleteRecords/v2/request.js',
       'src/protocol/requests/deleteRecords/v2/response.js',
       'src/protocol/requests/deleteTopics/v2/request.js',
