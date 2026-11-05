@@ -1,5 +1,5 @@
 const { protocol, versions } = require('./index')
-const { KafkaJSInvariantViolation } = require('../../../errors')
+const { KafkaJSInvariantViolation, KafkaJSTransactionAbortableError } = require('../../../errors')
 
 const response = (caseId) => require(`./fixtures/java/txnOffsetCommitResponse-v6-${caseId}.json`)
 const request = (caseId) => require(`./fixtures/java/txnOffsetCommitRequest-v6-${caseId}.json`)
@@ -84,7 +84,9 @@ describe('Protocol > Requests > TxnOffsetCommit', () => {
     const data = await bound.decode(Buffer.from(response('ok').hex, 'hex'))
 
     expect(data.topics.map(({ topic }) => topic)).toEqual(['test-topic', null])
-    await expect(bound.parse(data)).rejects.toThrow(KafkaJSInvariantViolation)
+    const error = await bound.parse(data).catch((e) => e)
+    expect(error).toBeInstanceOf(KafkaJSTransactionAbortableError)
+    expect(error.cause).toBeInstanceOf(KafkaJSInvariantViolation)
   })
 
   test('v6 refuses an answer that does not correlate with the request before it reads an error code', async () => {
@@ -92,7 +94,28 @@ describe('Protocol > Requests > TxnOffsetCommit', () => {
     const data = await bound.decode(Buffer.from(response('staleMemberEpoch').hex, 'hex'))
 
     expect(data.topics[0].partitions[0].errorCode).toEqual(113)
-    await expect(bound.parse(data)).rejects.toThrow(KafkaJSInvariantViolation)
+    const error = await bound.parse(data).catch((e) => e)
+    expect(error).toBeInstanceOf(KafkaJSTransactionAbortableError)
+    expect(error.cause).toBeInstanceOf(KafkaJSInvariantViolation)
+  })
+
+  test('v6 leaves a topic with no partition out of the request and out of the answer it expects', async () => {
+    const { hex, fields } = request('groupMetadata')
+    const topics = [
+      { topic: 'test-topic', partitions: fields.topics[0].partitions },
+      { topic: 'empty-topic', partitions: [] },
+      { topic: 'other-topic', partitions: fields.topics[1].partitions },
+    ]
+    const { request: built, response: bound } = protocol({ version: 6 })({
+      ...fields,
+      topics,
+      topicIds: new Map([...topicIds(), ['empty-topic', REPLACEMENT_ID]]),
+    })
+
+    const data = await bound.decode(Buffer.from(response('ok').hex, 'hex'))
+
+    expect((await built.encode()).buffer.toString('hex')).toEqual(hex)
+    await expect(bound.parse(data)).resolves.toBe(data)
   })
 
   test('v6 throws the typed protocol error of an exactly correlated answer', async () => {

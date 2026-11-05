@@ -127,6 +127,36 @@ describe('Protocol > Requests > TxnOffsetCommit > v6', () => {
     expect((await RequestV6Protocol(asReported).encode()).buffer.toString('hex')).toEqual(found.hex)
   })
 
+  test('leaves a topic with no partition out of the body and asks no id for it', async () => {
+    const found = vector('groupMetadata')
+    const options = optionsOf(found)
+    const withEmpty = {
+      ...options,
+      topics: [
+        options.topics[0],
+        { topic: 'empty-topic', partitions: [] },
+        ...options.topics.slice(1),
+      ],
+    }
+
+    const { buffer } = await RequestV6Protocol(withEmpty).encode()
+
+    expect(withEmpty.topicIds.has('empty-topic')).toBe(false)
+    expect(buffer.toString('hex')).toEqual(found.hex)
+  })
+
+  test('keeps every topic of a request whose topics all hold no partition', async () => {
+    const options = optionsOf(vector('groupMetadata'))
+    const allEmpty = options.topics.map(({ topic }) => ({ topic, partitions: [] }))
+
+    const { buffer } = await RequestV6Protocol({ ...options, topics: allEmpty }).encode()
+
+    expect(readBody(buffer).topics).toEqual([
+      { topicId: TOPIC_ID, partitions: [] },
+      { topicId: OTHER_TOPIC_ID, partitions: [] },
+    ])
+  })
+
   test.each([
     ['no map at all', undefined],
     ['an empty map', new Map()],

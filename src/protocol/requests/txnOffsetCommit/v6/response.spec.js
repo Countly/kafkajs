@@ -1,5 +1,8 @@
 const { decode, parse, validate } = require('./response')
-const { KafkaJSInvariantViolation } = require('../../../../errors')
+const {
+  KafkaJSInvariantViolation,
+  KafkaJSTransactionAbortableError,
+} = require('../../../../errors')
 
 const vector = (caseId) => require(`../fixtures/java/txnOffsetCommitResponse-v6-${caseId}.json`)
 
@@ -160,7 +163,7 @@ describe('Protocol > Requests > TxnOffsetCommit > v6 response', () => {
       [
         'the same partition answered twice',
         ({ topics: [first, second] }) => [
-          { ...first, partitions: [first.partitions[0], first.partitions[0]] },
+          { ...first, partitions: [first.partitions[0], first.partitions[1], first.partitions[0]] },
           second,
         ],
       ],
@@ -179,11 +182,67 @@ describe('Protocol > Requests > TxnOffsetCommit > v6 response', () => {
         'a topic with no partitions where the request carried one',
         ({ topics: [first, second] }) => [first, { ...second, partitions: [] }],
       ],
-    ])('refuses %s as a typed invariant violation', async (_, change) => {
-      const data = await decoded('ok')
-      const answer = { ...data, topics: change(data) }
+    ])(
+      'refuses %s as an abortable error caused by a typed invariant violation',
+      async (_, change) => {
+        const data = await decoded('ok')
+        const answer = { ...data, topics: change(data) }
 
-      expect(() => validate(answer, REQUESTED)).toThrow(KafkaJSInvariantViolation)
+        let error
+        try {
+          validate(answer, REQUESTED)
+        } catch (thrown) {
+          error = thrown
+        }
+
+        expect(error).toBeInstanceOf(KafkaJSTransactionAbortableError)
+        expect(error.cause).toBeInstanceOf(KafkaJSInvariantViolation)
+      }
+    )
+
+    describe('for a request that carried a topic with no partition', () => {
+      const WITH_EMPTY = [...REQUESTED, { topic: 'empty-topic', partitions: [] }]
+
+      test('does not expect an answer for that topic', async () => {
+        const data = await decoded('ok')
+
+        expect(() => validate(data, WITH_EMPTY)).not.toThrow()
+      })
+
+      test('refuses an answer that names that topic, as foreign', async () => {
+        const data = await decoded('ok')
+        const answer = {
+          ...data,
+          topics: [...data.topics, { topic: 'empty-topic', partitions: [] }],
+        }
+
+        expect(() => validate(answer, WITH_EMPTY)).toThrow(KafkaJSTransactionAbortableError)
+      })
+
+      test('still requires every requested partition of the other topics', async () => {
+        const data = await decoded('ok')
+        const [first, second] = data.topics
+        const answer = {
+          ...data,
+          topics: [{ ...first, partitions: [first.partitions[0]] }, second],
+        }
+
+        expect(() => validate(answer, WITH_EMPTY)).toThrow(KafkaJSTransactionAbortableError)
+      })
+    })
+
+    describe('for a request whose topics all hold no partition', () => {
+      const ALL_EMPTY = [{ topic: 'test-topic', partitions: [] }]
+
+      test('accepts the answer that names each of them', () => {
+        const answer = { topics: [{ topic: 'test-topic', partitions: [] }] }
+
+        expect(() => validate(answer, ALL_EMPTY)).not.toThrow()
+      })
+
+      test('refuses an answer that names none of them', () => {
+        expect(() => validate({ topics: [] }, ALL_EMPTY)).toThrow(KafkaJSTransactionAbortableError)
+      })
     })
   })
 })

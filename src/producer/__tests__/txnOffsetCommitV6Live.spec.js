@@ -10,7 +10,8 @@ const {
   writeEvidence,
   wireVersionsOf,
 } = require('testHelpers')
-const { waitForCondition, withTimeout } = require('../../consumer/__tests__/fixtures/liveScenario')
+const { waitForCondition } = require('../../consumer/__tests__/fixtures/liveScenario')
+const { withDeadline } = require('../../consumer/__tests__/fixtures/boundedCleanup')
 
 // Gated: it holds a transaction open on purpose and creates a topic and groups on a live cluster.
 // Run it alone through `npm run test:e2e:txn-offset-commit-v6`; `KAFKA_VERSION` names the cluster
@@ -24,10 +25,19 @@ const EVIDENCE = 'txn-offset-commit-v6'
 const SCENARIO_BUDGET_MS = 180000
 const CASE_BUDGET_MS = 90000
 const HOOK_BUDGET_MS = 30000
-const DISCONNECT_BUDGET_MS = 10000
+// Teardown is one deadline per step, and its hook is given every step at its full deadline: the
+// clients the scenario opens (the group's consumer, two readers, the sentinel producer), then the
+// groups, the topic, the transactional producer and the admin.
+const CLEANUP_STEP_MS = 10000
+const MAX_CLIENTS = 4
+const CLEANUP_STEPS = MAX_CLIENTS + 4
+const CLEANUP_BUDGET_MS = CLEANUP_STEP_MS * CLEANUP_STEPS
 const WAIT_BUDGET = { attempts: 120, delay: 250 } // 30 s
-const QUIET_MS = 1500 // how long a reader waits for a record that should not exist
 const RECORDS = 5
+// The last record of the log, appended outside any transaction once both transactions ended. A
+// reader that has seen it has seen every record before it, so an exact comparison needs no quiet
+// period.
+const SENTINEL = 'end-of-log'
 const UUID = /^[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$/
 
 /**
@@ -67,7 +77,9 @@ const deferred = () => {
  * records are in the log, for a `read_uncommitted` reader, but not for the consumer. A topic whose
  * id the cache does not hold keeps the whole request at v5. Versions are read from `REQUEST`
  * events and from the private map the producer handed `Broker`; counts and versions are asserted,
- * never durations.
+ * never durations. The abort is read as applied when an OffsetFetch that requires stable offsets
+ * stops answering UNSTABLE_OFFSET_COMMIT, and the readers are read as complete when they reach a
+ * sentinel record appended after both transactions.
  *
  * @see https://github.com/apache/kafka/blob/4.4.0/clients/src/main/resources/common/message/TxnOffsetCommitRequest.json
  */
@@ -87,6 +99,8 @@ describeTxnOffsetCommitV6('Producer > TxnOffsetCommit v6 (live)', () => {
   /** @type {{ advertisedMax: number|null, transactionVersion: number, groupId: string, topicIds: [string, string][]|null }[]} */
   const offsetCommits = []
   const clients = []
+  /** every consumer group the scenario created, deleted after its members left */
+  const groups = new Set()
   /** what cleanup could not undo */
   const cleanupFailures = []
   const gate = { endTxn: null, endTxnReached: false, hideTopicIds: false }
@@ -101,10 +115,40 @@ describeTxnOffsetCommitV6('Producer > TxnOffsetCommit v6 (live)', () => {
     return client
   }
 
-  /** The group's committed (applied) next offset on partition 0, as a raw OffsetFetch says. */
-  const committedOffset = async (group = groupId) => {
-    const [{ partitions }] = await admin.fetchOffsets({ groupId: group, topics: [topic] })
+  /**
+   * The group's committed (applied) next offset on partition 0, as a raw OffsetFetch says. With
+   * `requireStable` the broker refuses with UNSTABLE_OFFSET_COMMIT while a transaction's offset
+   * commit for the partition is still pending.
+   */
+  const committedOffset = async (group = groupId, { requireStable = false } = {}) => {
+    const [{ partitions }] = await admin.fetchOffsets({
+      groupId: group,
+      topics: [topic],
+      requireStable,
+    })
     return partitions.find(({ partition }) => partition === 0).offset
+  }
+
+  /**
+   * The group's committed next offset once no transaction's offset commit is pending on it: a
+   * stable OffsetFetch is retried while the broker answers UNSTABLE_OFFSET_COMMIT, so a returned
+   * value is one the transaction's marker has already settled.
+   * @throws {Error} any other failure of the fetch, or when the commit is still pending after the
+   *   wait budget
+   */
+  const settledCommittedOffset = async (group = groupId) => {
+    let offset
+    const settled = await waitFor(async () => {
+      try {
+        offset = await committedOffset(group, { requireStable: true })
+        return true
+      } catch (error) {
+        if (error.type !== 'UNSTABLE_OFFSET_COMMIT') throw error
+        return false
+      }
+    })
+    expect(settled).toBe(true)
+    return offset
   }
 
   /**
@@ -121,19 +165,19 @@ describeTxnOffsetCommitV6('Producer > TxnOffsetCommit v6 (live)', () => {
   }
 
   /**
-   * Every value a fresh reader sees on the topic, once it has gone quiet: a `read_committed` reader,
-   * or with `readUncommitted` one that also sees the records an abort discarded.
+   * Every value a fresh reader sees on the topic up to the sentinel at the end of its log: a
+   * `read_committed` reader, or with `readUncommitted` one that also sees the records an abort
+   * discarded. The sentinel itself is not returned.
    */
-  const readValues = async (expected, { readUncommitted = false } = {}) => {
-    const reader = await connected(
-      kafka.consumer({ groupId: `${groupId}-reader-${secureRandom()}`, readUncommitted })
-    )
+  const readValues = async ({ readUncommitted = false } = {}) => {
+    const readerGroup = `${groupId}-reader-${secureRandom()}`
+    const reader = await connected(kafka.consumer({ groupId: readerGroup, readUncommitted }))
     const values = []
     await reader.subscribe({ topics: [topic], fromBeginning: true })
     await reader.run({ eachMessage: async ({ message }) => values.push(message.value.toString()) })
-    expect(await waitFor(() => values.length >= expected)).toBe(true)
-    await new Promise((resolve) => setTimeout(resolve, QUIET_MS))
-    return values
+    expect(await waitFor(() => values.includes(SENTINEL))).toBe(true)
+    groups.add(readerGroup)
+    return values.filter((value) => value !== SENTINEL)
   }
 
   /** Offsets for partition 0 of the topic: the group's next offset to read. */
@@ -191,15 +235,17 @@ describeTxnOffsetCommitV6('Producer > TxnOffsetCommit v6 (live)', () => {
     jest.restoreAllMocks()
     gate.endTxn?.resolve()
     for (const client of clients.reverse()) {
-      await cleanup(() => withTimeout(client.disconnect(), DISCONNECT_BUDGET_MS))
+      await cleanup(() => withDeadline(client.disconnect(), CLEANUP_STEP_MS))
     }
-    await cleanup(() => admin.deleteTopics({ topics: [topic] }))
-    await cleanup(() => withTimeout(producer.disconnect(), DISCONNECT_BUDGET_MS))
-    await cleanup(() => withTimeout(admin.disconnect(), DISCONNECT_BUDGET_MS))
+    await cleanup(() => withDeadline(admin.deleteGroups([...groups]), CLEANUP_STEP_MS))
+    await cleanup(() => withDeadline(admin.deleteTopics({ topics: [topic] }), CLEANUP_STEP_MS))
+    await cleanup(() => withDeadline(producer.disconnect(), CLEANUP_STEP_MS))
+    await cleanup(() => withDeadline(admin.disconnect(), CLEANUP_STEP_MS))
 
     expect(cleanupFailures).toEqual([])
+    expect(clients.length).toBeLessThanOrEqual(MAX_CLIENTS)
     expect(Date.now() - startedAt).toBeLessThan(SCENARIO_BUDGET_MS)
-  }, HOOK_BUDGET_MS)
+  }, CLEANUP_BUDGET_MS)
 
   const txnOffsetCommitVersions = () =>
     requests
@@ -212,6 +258,7 @@ describeTxnOffsetCommitV6('Producer > TxnOffsetCommit v6 (live)', () => {
       const expectedVersion = offeredVersion()
       const handled = []
       let joined = false
+      const sentinelProducer = await connected(kafka.producer())
       const consumer = await connected(
         kafka.consumer({ groupId, maxWaitTimeInMs: 100, sessionTimeout: 30000 })
       )
@@ -224,6 +271,7 @@ describeTxnOffsetCommitV6('Producer > TxnOffsetCommit v6 (live)', () => {
         eachMessage: async ({ message }) => handled.push(message.value.toString()),
       })
       expect(await waitFor(() => joined)).toBe(true)
+      groups.add(groupId)
       const baseline = await committedOffset()
       expect(baseline).toEqual('-1')
 
@@ -270,17 +318,16 @@ describeTxnOffsetCommitV6('Producer > TxnOffsetCommit v6 (live)', () => {
           return high === String(logEnd)
         })
       ).toBe(true)
-      await new Promise((resolve) => setTimeout(resolve, QUIET_MS))
-      const afterAbort = await committedOffset()
+      // the group coordinator applies its own marker separately: the offset is read once it has
+      const afterAbort = await settledCommittedOffset()
 
-      const physical = await readValues(committedIds.length + abortedIds.length, {
-        readUncommitted: true,
-      })
-      const visible = await readValues(committedIds.length)
-      expect(await waitFor(() => handled.length >= committedIds.length)).toBe(true)
-      await new Promise((resolve) => setTimeout(resolve, QUIET_MS))
-      await withTimeout(consumer.disconnect(), DISCONNECT_BUDGET_MS)
+      await sentinelProducer.send({ topic, messages: [{ partition: 0, value: SENTINEL }] })
+      const physical = await readValues({ readUncommitted: true })
+      const visible = await readValues()
+      expect(await waitFor(() => handled.includes(SENTINEL))).toBe(true)
+      await withDeadline(consumer.disconnect(), CLEANUP_STEP_MS)
 
+      const handledValues = handled.filter((value) => value !== SENTINEL)
       const wire = txnOffsetCommitVersions()
       writeEvidence(EVIDENCE, {
         step: 'commit-and-abort',
@@ -293,7 +340,7 @@ describeTxnOffsetCommitV6('Producer > TxnOffsetCommit v6 (live)', () => {
         recordIds: {
           physical: [...physical].sort(),
           committedVisible: [...visible].sort(),
-          handler: [...handled].sort(),
+          handler: handledValues.sort(),
         },
         topicIds: stagedCall.topicIds,
       })
@@ -314,7 +361,7 @@ describeTxnOffsetCommitV6('Producer > TxnOffsetCommit v6 (live)', () => {
       // exactly the records of the committed transaction are visible, once; the physical log has both
       expect([...physical].sort()).toEqual([...committedIds, ...abortedIds].sort())
       expect([...visible].sort()).toEqual([...committedIds].sort())
-      expect([...handled].sort()).toEqual([...committedIds].sort())
+      expect(handledValues.sort()).toEqual([...committedIds].sort())
     },
     CASE_BUDGET_MS
   )
@@ -338,6 +385,7 @@ describeTxnOffsetCommitV6('Producer > TxnOffsetCommit v6 (live)', () => {
         gate.hideTopicIds = false
       }
       const afterCommit = await committedOffsetReaching(7)
+      groups.add(groupId)
 
       const calls = offsetCommits.slice(before)
       const wire = txnOffsetCommitVersions().slice(versionsBefore)

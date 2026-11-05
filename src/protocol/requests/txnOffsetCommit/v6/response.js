@@ -1,6 +1,11 @@
 const Decoder = require('../../../decoder')
 const { parse } = require('../v0/response')
 const { exact } = require('../../offsetFetch/responseIdentity')
+const {
+  KafkaJSInvariantViolation,
+  KafkaJSTransactionAbortableError,
+} = require('../../../../errors')
+const { sentTopics } = require('./request')
 const responseV5 = require('../v5/response')
 
 /**
@@ -64,29 +69,41 @@ const decode = async (rawData, { topicNames = new Map() } = {}) => {
 }
 
 /**
- * Checks that the answer correlates exactly with the request: every requested topic once, every
- * requested partition of it once, and nothing else - whatever order the broker used. The broker
- * answers each topic it was asked about, so this is stricter than a client that only logs an id it
- * did not ask for, and it runs before `parse`, so an answer that cannot be correlated never reads
- * as a commit that went through.
+ * Checks that the answer correlates exactly with the request: every topic the request carried once,
+ * every requested partition of it once, and nothing else - whatever order the broker used. A topic
+ * the request left out for holding no partition (see `sentTopics`) is not expected: the broker
+ * answers only the topics it forwards. The check runs before `parse`, so an answer that cannot be
+ * correlated never reads as a commit that went through.
+ *
+ * A failed check is abortable, not fatal: nothing says what the coordinator did with the offsets,
+ * but no producer state is damaged, so the transaction can be aborted and the producer goes on. The
+ * identity violation is the abortable error's `cause`.
  * @param {{ topics: { topic: string|null, partitions: { partition: number }[] }[] }} data the
  *   decoded response
  * @param {{ topic: string, partitions: { partition: number|string }[] }[]} topics what the
  *   request committed
  * @returns {void}
- * @throws {import('../../../../errors').KafkaJSInvariantViolation} for a duplicate, foreign or
- *   missing topic or partition
+ * @throws {KafkaJSTransactionAbortableError} for a duplicate, foreign or missing topic or
+ *   partition; its `cause` is the `KafkaJSInvariantViolation` naming it
  */
 const validate = ({ topics: answered }, topics) => {
-  const requested = topics.map(({ topic, partitions }) => ({
+  const requested = sentTopics(topics).map(({ topic, partitions }) => ({
     topic,
     partitions: partitions.map(({ partition }) => ({ partition: Number(partition) })),
   }))
   const partitionsOf = new Map(requested.map(({ topic, partitions }) => [topic, partitions]))
 
-  exact(answered, requested, 'topic', 'TxnOffsetCommit topic')
-  for (const { topic, partitions } of answered) {
-    exact(partitions, partitionsOf.get(topic), 'partition', 'TxnOffsetCommit partition')
+  try {
+    exact(answered, requested, 'topic', 'TxnOffsetCommit topic')
+    for (const { topic, partitions } of answered) {
+      exact(partitions, partitionsOf.get(topic), 'partition', 'TxnOffsetCommit partition')
+    }
+  } catch (cause) {
+    if (!(cause instanceof KafkaJSInvariantViolation)) throw cause
+    throw new KafkaJSTransactionAbortableError(
+      `The TxnOffsetCommit answer does not match the request, so its offsets cannot be taken as committed: ${cause.message}`,
+      { cause }
+    )
   }
 }
 

@@ -27,7 +27,7 @@ const requestV5 = require('../v5/request')
  * v5's body with `Topics.Name` replaced by `Topics.TopicId`. Callers keep naming topics; the ids
  * come from `topicIds`, and a topic without one fails here, before anything is sent. The Broker
  * selects this version only for a request whose every topic has a usable id and whose transaction
- * runs transaction version 2.
+ * runs transaction version 2. A topic with no partition is not sent (see `sentTopics`).
  * @see clients/src/main/resources/common/message/TxnOffsetCommitRequest.json (Apache Kafka 4.4.0)
  *
  * @param {object} options the v5 builder's, plus `topicIds`
@@ -45,7 +45,7 @@ const requestV5 = require('../v5/request')
  * @returns {object} the protocol request
  * @throws {import('../../../../errors').KafkaJSInvariantViolation} when a topic has no usable id
  */
-module.exports = ({
+const request = ({
   transactionalId,
   groupId,
   producerId,
@@ -56,9 +56,10 @@ module.exports = ({
   topics = [],
   topicIds,
 }) => {
+  const sent = sentTopics(topics)
   const ids = requireTopicIds(
     'TxnOffsetCommit',
-    topics.map(({ topic }) => topic),
+    sent.map(({ topic }) => topic),
     topicIds,
     6
   )
@@ -76,11 +77,23 @@ module.exports = ({
         .writeInt32(generationId)
         .writeUVarIntString(memberId)
         .writeUVarIntString(groupInstanceId)
-        .writeUVarIntArray(
-          topics.map(({ partitions }, index) => encodeTopic(ids[index], partitions))
-        )
+        .writeUVarIntArray(sent.map(({ partitions }, index) => encodeTopic(ids[index], partitions)))
         .writeTaggedFields(),
   }
+}
+
+/**
+ * The topics a v6 request carries: those holding a partition. The group coordinator forwards and
+ * answers only those (`KafkaApis.handleTxnOffsetCommitRequest`), so an empty topic would never be
+ * answered, and the response check expects exactly these. A call whose topics are all empty keeps
+ * them all.
+ * @see core/src/main/scala/kafka/server/KafkaApis.scala (Apache Kafka 4.4.0)
+ * @param {{ topic: string, partitions: unknown[] }[]} topics what the caller committed
+ * @returns {{ topic: string, partitions: unknown[] }[]} the topics to send and to expect back
+ */
+const sentTopics = (topics) => {
+  const withPartitions = topics.filter(({ partitions }) => partitions.length > 0)
+  return withPartitions.length === 0 ? topics : withPartitions
 }
 
 const encodeTopic = (topicId, partitions) =>
@@ -96,6 +109,9 @@ const encodePartition = ({ partition, offset, leaderEpoch, metadata = null }) =>
     .writeInt32(leaderEpoch ?? -1)
     .writeUVarIntString(metadata)
     .writeTaggedFields()
+
+module.exports = request
+module.exports.sentTopics = sentTopics
 
 module.exports.schema = {
   ...requestV5.schema,

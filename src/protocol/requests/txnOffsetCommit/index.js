@@ -9,7 +9,7 @@ const { namesById } = require('../topicIds')
  * v6 keys topics by id (KIP-1319): its builder also takes `topicIds`, the request's own
  * name-to-id map, and binds the response to the topics that request named - captured when the
  * request is built, so a metadata change while it is in flight cannot rename an answer - and
- * refuses an answer that does not correlate with them exactly.
+ * refuses an answer that does not correlate with them exactly, with an abortable error.
  * @see https://github.com/apache/kafka/blob/4.3/clients/src/main/java/org/apache/kafka/common/requests/TxnOffsetCommitRequest.java
  */
 const versions = {

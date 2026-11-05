@@ -166,28 +166,30 @@ const createEosManager = ({
   const guardOf = (generation) => (generation ? { guard: generation.guard } : {})
 
   /**
-   * Re-reads the metadata of an offset commit's topics after the broker answered UNKNOWN_TOPIC_ID,
+   * Re-reads the metadata the producer's cluster tracks after the broker answered UNKNOWN_TOPIC_ID,
    * so the next attempt reads the id a recreated topic has now from the cache `cluster.topicId`
-   * reads. The topics become targets of this producer's cluster, which refreshes and later forgets
-   * them like any other. Best effort: a failed refresh leaves the original error to the retrier,
-   * but a closed lifecycle ends the attempt with its close error and publishes nothing.
-   * @param {object[]} topics the call's immutable snapshot topics
+   * reads. It never creates a topic and registers none: an offset commit's topics are not targets
+   * of this producer, and one that became a target here would stay eligible for automatic creation
+   * in every later refresh. A topic whose id the cache holds is already a target, so it is
+   * refreshed with the rest. The refresh is guarded, so it shares no promise with the send path's
+   * refreshes, which may create a topic. Best effort: a failed refresh leaves the original error
+   * to the retrier, but a closed lifecycle ends the attempt with its close error and publishes
+   * nothing.
    * @param {import('../generation')} [generation] the lifecycle the call captured
    * @returns {Promise<void>}
    * @throws {Error} the lifecycle's close error
    */
-  const refreshOffsetTopics = async (topics, generation) => {
-    const fence = generation ? { fence: generation } : {}
+  const refreshWithoutCreating = async (generation) => {
     try {
       generation?.check()
-      await cluster.addMultipleTargetTopics(
-        topics.map(({ topic }) => topic),
-        fence
-      )
-      await cluster.refreshMetadata(fence)
+      await cluster.refreshMetadata({
+        allowAutoTopicCreation: false,
+        ...(generation ? { fence: generation } : {}),
+        ...guardOf(generation),
+      })
     } catch (error) {
       generation?.check()
-      logger.debug('Could not refresh the topics of a transactional offset commit', {
+      logger.debug('Could not refresh the metadata after an unknown topic id', {
         error: error.message,
       })
     }
@@ -773,7 +775,9 @@ const createEosManager = ({
      * retried while it fails retriably, a moved group coordinator looked up again. Any other failure
      * arms the state its category calls for - a stale generation or member (ILLEGAL_GENERATION,
      * UNKNOWN_MEMBER_ID, FENCED_INSTANCE_ID, STALE_MEMBER_EPOCH) arms `ABORTABLE_ERROR`: abort, let
-     * the consumer rejoin, reprocess - and rejects with it.
+     * the consumer rejoin, reprocess - and rejects with it. So does a v6 answer that cannot be
+     * matched to its request. An UNKNOWN_TOPIC_ID answer (v6) refreshes the metadata the cluster
+     * tracks before the retry, and never creates a topic.
      *
      * Under version 2 offsets holding no partition are skipped, as the Java producer skips them:
      * nothing is sent and the transaction is not marked started, since the broker starts none for
@@ -907,7 +911,7 @@ const createEosManager = ({
                   })
                 }
                 if (e.type === 'UNKNOWN_TOPIC_ID') {
-                  await refreshOffsetTopics(snapshot.topics, generation)
+                  await refreshWithoutCreating(generation)
                 }
                 throw e
               }

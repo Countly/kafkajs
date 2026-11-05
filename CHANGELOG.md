@@ -176,7 +176,7 @@ Versions before 3.0.0 are internal alpha tags and are not published.
 
 - Admin operations after disconnect reject without dialing until an explicit connect opens a new lifecycle.
 
-- A `GROUP_ID_NOT_FOUND` answer to a transactional offset commit makes the transaction abortable, like `STALE_MEMBER_EPOCH`, where it was a producer-fatal `applicationRecoverable` error; on every other request it keeps its category. A broker that answers `UNKNOWN_TOPIC_ID` to a v6 commit makes the producer refresh the topics of the offsets before the existing bounded retry.
+- A `GROUP_ID_NOT_FOUND` answer to a transactional offset commit makes the transaction abortable, like `STALE_MEMBER_EPOCH`, where it was a producer-fatal `applicationRecoverable` error; on every other request it keeps its category. A broker that answers `UNKNOWN_TOPIC_ID` to a v6 commit makes the producer refresh its metadata before the existing bounded retry; that refresh never asks the broker to create a topic and adds no topic to the producer's targets. A v6 answer that cannot be matched to its request (a duplicate, foreign or missing topic or partition) makes the transaction abortable, so the producer survives, and stages nothing.
 
 - **Idle connections are closed after 9 minutes** (540 000 ms, Java's `connections.max.idle.ms`; 2.2.4 never closed them) and reopened by the next request, with one more ApiVersions round trip: "Connections idle for 9 minutes are closed by default; the next request reconnects. This is below the default broker idle timeout but does not guarantee close ordering or eliminate races. `connectionsMaxIdle: 0` keeps connections open as before."
 
@@ -231,7 +231,7 @@ Versions before 3.0.0 are internal alpha tags and are not published.
 
 - `rackId` and `rackAware` producer options (KIP-1123): with `rackAware: true` and a non-empty `rackId`, the built-in partitioners (the default `UniformStickyPartitioner`, `DefaultPartitioner` and its alias, `LegacyPartitioner`) prefer the partitions whose leader is in that rack for records without a key, and fall back to every partition with a leader when none is. A record with a `partition` or a key keeps its partition, and a custom `createPartitioner` is given the same arguments as before. Without the opt-in nothing changes.
 
-- TxnOffsetCommit v6 uses cached topic IDs on capable brokers (KIP-1319), with the existing named-topic fallback and commit-only offset publication.
+- TxnOffsetCommit v6 uses cached topic IDs on capable brokers (KIP-1319), with the existing named-topic fallback and commit-only offset publication. A topic with no partition is left out of the v6 request and of the answer it expects, as the broker answers only the topics it forwards.
 
 #### Tooling
 
