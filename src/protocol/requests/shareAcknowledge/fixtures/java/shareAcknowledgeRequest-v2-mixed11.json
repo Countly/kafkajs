@@ -1,0 +1,7 @@
+{
+  "message": "ShareAcknowledgeRequest",
+  "version": 2,
+  "case": "mixed11",
+  "hex": "0c73686172652d67726f75700d73686172652d6d656d6265720000000100020102030405060708090a0b0c0d0e0f10020000000004002000000000000100200000000000010202000020000000000002002000000000000c020100002000000000000d002000000000000d020300000000",
+  "fields": {"groupId":"share-group","memberId":"share-member","shareSessionEpoch":1,"isRenewAck":false,"topics":[{"topicId":"01020304-0506-0708-090a-0b0c0d0e0f10","partitions":[{"partitionIndex":0,"acknowledgementBatches":[{"firstOffset":"9007199254740993","lastOffset":"9007199254740993","acknowledgeTypes":[2]},{"firstOffset":"9007199254740994","lastOffset":"9007199254741004","acknowledgeTypes":[1]},{"firstOffset":"9007199254741005","lastOffset":"9007199254741005","acknowledgeTypes":[3]}]}]}]}
+}

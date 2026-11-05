@@ -1,0 +1,7 @@
+{
+  "message": "ShareFetchRequest",
+  "version": 2,
+  "case": "renew",
+  "hex": "0c73686172652d67726f75700d73686172652d6d656d6265720000000100000000000000007fffffff00000000000000000001020102030405060708090a0b0c0d0e0f100200000000020020000000000001002000000000000102040000000100",
+  "fields": {"groupId":"share-group","memberId":"share-member","shareSessionEpoch":1,"maxWaitMs":0,"minBytes":0,"maxBytes":2147483647,"maxRecords":0,"batchSize":0,"shareAcquireMode":0,"isRenewAck":true,"topics":[{"topicId":"01020304-0506-0708-090a-0b0c0d0e0f10","partitions":[{"partitionIndex":0,"acknowledgementBatches":[{"firstOffset":"9007199254740993","lastOffset":"9007199254740993","acknowledgeTypes":[4]}]}]}],"forgottenTopicsData":[]}
+}

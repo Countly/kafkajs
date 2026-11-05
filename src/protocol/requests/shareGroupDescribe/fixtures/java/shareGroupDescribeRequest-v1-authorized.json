@@ -1,0 +1,7 @@
+{
+  "message": "ShareGroupDescribeRequest",
+  "version": 1,
+  "case": "authorized",
+  "hex": "030c73686172652d67726f757007616273656e740100",
+  "fields": {"groupIds":["share-group","absent"],"includeAuthorizedOperations":true}
+}

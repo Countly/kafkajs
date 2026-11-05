@@ -364,3 +364,15 @@ Nodes carry no rack, which keeps Kafka's rack-aware path off and the vectors rep
 implementation that ignores racks. The vectors are reproduced by
 `src/consumer/assigners/__tests__/javaVectors.spec.js`, which fails rather than skips when one
 cannot be reproduced.
+
+Released share message vectors:
+
+| API | Version | Cases |
+| --- | --- | --- |
+| ShareGroupHeartbeat | 1 | Independent request bytes, literal response fields, nested tag buffers |
+| ShareGroupDescribe | 1 | Independent request bytes, literal response fields, nested tag buffers |
+| ShareFetch | 2 | Independent request bytes, literal response fields, nested tag buffers |
+| ShareAcknowledge | 2 | Independent request bytes, literal response fields, nested tag buffers |
+| DescribeShareGroupOffsets | 1 | Independent request bytes, literal response fields, nested tag buffers |
+| AlterShareGroupOffsets | 0 | Independent request bytes, literal response fields, nested tag buffers |
+| DeleteShareGroupOffsets | 0 | Independent request bytes, literal response fields, nested tag buffers |

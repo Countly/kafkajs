@@ -1,0 +1,7 @@
+{
+  "message": "AlterShareGroupOffsetsRequest",
+  "version": 0,
+  "case": "offsets",
+  "hex": "0c73686172652d67726f75700206616c7068610300000000002000000000000100000000027fffffffffffffff000000",
+  "fields": {"groupId":"share-group","topics":[{"topicName":"alpha","partitions":[{"partitionIndex":0,"startOffset":"9007199254740993"},{"partitionIndex":2,"startOffset":"9223372036854775807"}]}]}
+}

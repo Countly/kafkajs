@@ -13,6 +13,8 @@ Transaction administration has brokerless routing, capability, partial-result, v
 
 The protocol inventory tests pin the released share-group message sources, API names, flexible headers and recorded broker ranges. Source inventory alone does not establish runtime share-group support.
 
+The share-group codec tests compare requests and responses with independently generated Apache Kafka 4.4.0 message vectors. They cover compact fields, nested tagged fields, exact integer domains, nullable topics and malformed envelopes. Regenerate the message vectors with `KAFKA_CLIENTS_VERSION=4.4.0 scripts/protocol/javaVectors/runAssignors.sh messages` using a JDK 17 or newer.
+
 ## Integration tests
 
 Most of the test suite talks to a real Kafka cluster. `npm test` runs `npm run lint`, `npm run compat:check` and `npm run protocol:check`, boots the cluster, runs everything, and tears the cluster down again — it's a convenient local shortcut, but it is not what CI runs.

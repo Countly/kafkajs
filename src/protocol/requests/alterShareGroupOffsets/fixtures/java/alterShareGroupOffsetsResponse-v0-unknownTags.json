@@ -1,0 +1,7 @@
+{
+  "message": "AlterShareGroupOffsetsResponse",
+  "version": 0,
+  "case": "unknownTags",
+  "hex": "000000250000000206616c7068610102030405060708090a0b0c0d0e0f100300000000000000010a016100000002001d0764656e696564010a0161010a0161010a0161",
+  "fields": {"throttleTime":37,"errorCode":0,"errorMessage":null,"responses":[{"topicName":"alpha","topicId":"01020304-0506-0708-090a-0b0c0d0e0f10","partitions":[{"partitionIndex":0,"errorCode":0,"errorMessage":null},{"partitionIndex":2,"errorCode":29,"errorMessage":"denied"}]}]}
+}
