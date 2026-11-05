@@ -1,10 +1,12 @@
 const { randomBytes, pbkdf2Sync } = require('crypto')
 const { Kafka, AlterConfigOpTypes } = require('../../../index')
-const { inspect } = require('util')
+const { inspect, isDeepStrictEqual } = require('util')
 const { AdminLiveProbe } = require('./fixtures/liveAdmin')
 const Broker = require('../../broker')
 const Pool = require('../../network/connectionPool')
 const apiKeys = require('../../protocol/requests/apiKeys')
+const Encoder = require('../../protocol/encoder')
+const { decode: decodeDeleteTopics } = require('../../protocol/requests/deleteTopics/v6/response')
 const { saslBrokers, saslConnectionOpts } = require('testHelpers')
 const {
   fenceUntilSettled,
@@ -102,6 +104,47 @@ class AdminLedgerScenario {
     )
     await p.invoke(() => broker.connect())
     return broker
+  }
+
+  /**
+   * Probes controller DELETE authorization without deleting: both references identify one topic.
+   * ControllerApis.deleteTopics removes the ID from its deletion set on either denial or the
+   * cross-reference duplicate. ALLOW returns one (name, ID, 42) row; DENY with DESCRIBE returns
+   * two (name, ID or zero UUID, 29) rows. The zero UUID decodes as null; response order is shuffled.
+   * @see https://raw.githubusercontent.com/apache/kafka/4.3/core/src/main/scala/kafka/server/ControllerApis.scala (lines 290-356)
+   * @param {Broker} broker connected source using the permission principal
+   * @param {string} topic existing topic name, which must still map to topicId
+   * @param {string} topicId current ID of that same topic
+   * @returns {Promise<object[]>} every response identity and error code, without per-topic throws
+   * @throws {Error} encoding, transport or decoding failure
+   */
+  async deletionProbe(broker, topic, topicId) {
+    return broker.connectionPool.send({
+      request: {
+        apiKey: apiKeys.DeleteTopics,
+        apiVersion: 6,
+        apiName: 'DeleteTopics',
+        /** @returns {Promise<Encoder>} both references in one flexible v6 body */
+        encode: async () =>
+          new Encoder()
+            .writeUVarIntArray([
+              new Encoder().writeUVarIntString(null).writeUuid(topicId).writeTaggedFields(),
+              new Encoder().writeUVarIntString(topic).writeUuid(null).writeTaggedFields(),
+            ])
+            .writeInt32(5000)
+            .writeTaggedFields(),
+      },
+      response: {
+        decode: decodeDeleteTopics,
+        /**
+         * Retains error codes as observations rather than passing them to the throwing parser.
+         * @param {object} data decoded v6 response
+         * @returns {Promise<object[]>} identities and codes, including every failed entry
+         */
+        parse: async ({ topicErrors }) =>
+          topicErrors.map(({ topic, topicId, errorCode }) => ({ topic, topicId, errorCode })),
+      },
+    })
   }
 
   /**
@@ -1365,8 +1408,8 @@ class AdminLedgerScenario {
    * Positive controls and safe denial observations wait under the probe's work deadline.
    * Topic DESCRIBE dependencies settle on every broker because the reused client retains metadata
    * targets even when the next operation authorizes a different resource or operation.
-   * ListTransactions proves successful filtering; mutations run once after a proven safe probe,
-   * except topic-ID deletion, whose denial remains one-shot. This also runs cold in the ACL profile.
+   * ListTransactions proves successful filtering; mutations run once after a proven safe probe.
+   * This also runs cold in the ACL profile.
    * @returns {Promise<void>}
    * @throws {Error} missing positive control, wrong failure level or cleanup failure
    */
@@ -1502,6 +1545,47 @@ class AdminLedgerScenario {
      */
     const controllerAlterDenied = () =>
       this.permissionDenied({ call: validateFeature, code: 31, item: (rows) => rows[0] })
+    /**
+     * Waits for the duplicate-reference DeleteTopics probe's exact ALLOW or DENY response.
+     * Both phases use the recreated topic's current ID and prove it survives via metadata by ID.
+     * @param {boolean} denied whether both references must report authorization failure
+     * @returns {Promise<void>} after the controller observation and topic existence readback
+     * @throws {Error} unexpected code, response identity, transport failure or work deadline
+     */
+    const deletionSettled = async (denied) => {
+      const expected = denied
+        ? [
+            { topic: deletionTopic, topicId: deletionId, errorCode: 29 },
+            { topic: deletionTopic, topicId: null, errorCode: 29 },
+          ]
+        : [{ topic: deletionTopic, topicId: deletionId, errorCode: 42 }]
+      let rows
+      await p.poll(async () => {
+        rows = await p.invoke(() => this.deletionProbe(maskRaw, deletionTopic, deletionId))
+        for (const { errorCode } of rows) expect([29, 42]).toContain(errorCode)
+        return (
+          rows.length === expected.length &&
+          expected.every((row) => rows.some((result) => isDeepStrictEqual(result, row)))
+        )
+      })
+      expect(rows).toHaveLength(expected.length)
+      expect(rows).toEqual(expect.arrayContaining(expected))
+      let topicMetadata
+      await p.poll(async () => {
+        ;({ topicMetadata } = await p.invoke(() =>
+          this.seed.metadata([{ topicId: deletionId }], {
+            allowAutoTopicCreation: false,
+            lenient: true,
+          })
+        ))
+        expect(topicMetadata).toHaveLength(1)
+        expect([0, 100]).toContain(topicMetadata[0].topicErrorCode)
+        return topicMetadata[0].topicErrorCode === 0
+      })
+      expect(topicMetadata).toMatchObject([
+        { topic: deletionTopic, topicId: deletionId, topicErrorCode: 0 },
+      ])
+    }
     /**
      * Probes transactional WRITE on every broker without allocating or fencing a producer.
      * KafkaApis.handleInitProducerIdRequest authorizes first; TransactionCoordinator rejects
@@ -1742,6 +1826,8 @@ class AdminLedgerScenario {
       {
         name: 'ID deletion',
         mutating: true,
+        allowedProbe: () => deletionSettled(false),
+        deniedProbe: () => deletionSettled(true),
         resourceType: 2,
         resourceName: deletionTopic,
         operation: 6,
@@ -1796,6 +1882,8 @@ class AdminLedgerScenario {
         deletedAcls(await root.deleteAcls({ filters: [{ ...acl, permissionType: 1 }] }))
       })
       const dependencies = []
+      if (check.name === 'ID deletion')
+        dependencies.push({ resourceType: 2, resourceName: deletionTopic, operation: 8 })
       if (['offset deletion'].includes(check.name))
         dependencies.push({ resourceType: 2, resourceName: topic, operation: 3 })
       if (
