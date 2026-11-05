@@ -16242,7 +16242,8 @@
         "src/broker/__tests__/reauthenticate.spec.js \u203a Brokers re-authentication with SASL OAUTHBEARER Re-authenticate if needed before making a request",
         "src/broker/__tests__/reauthenticate.spec.js \u203a Brokers re-authentication with SASL OAUTHBEARER Re-authenticate only once with multiple parallel requests",
         "src/broker/__tests__/reauthenticate.spec.js \u203a Brokers re-authentication with SASL OAUTHBEARER Re-authenticate every request sent when re-authentication threshold is same as session lifetime",
-        "src/broker/__tests__/reauthenticate.spec.js \u203a Brokers re-authentication with SASL OAUTHBEARER Re-authenticates only once with multiple requests sent in parallel when re-authentication threshold is same as session lifetime"
+        "src/broker/__tests__/reauthenticate.spec.js \u203a Brokers re-authentication with SASL OAUTHBEARER Re-authenticates only once with multiple requests sent in parallel when re-authentication threshold is same as session lifetime",
+        "src/broker/__tests__/gssapiLive.spec.js \u203a GSSAPI with a ticket-granting service authenticates, negotiates no layer and rejects an observed expired cache"
       ]
     },
     {
@@ -16636,7 +16637,21 @@
         "src/cluster/__tests__/rebootstrapLive.spec.js \u203a Cluster > rebootstrap (live, cluster replaced on new ports) a client whose entire cluster is replaced rebootstraps and resumes producing and consuming",
         "src/instrumentation/__tests__/diagnosticsChannelLive.spec.js \u203a Instrumentation > diagnostics channels (live) a round trip reaches the channels with public event names, and the recipe counts what was consumed",
         "src/network/__tests__/requestTimeoutCloseLive.spec.js \u203a Request timeout closes its connection over real TCP (live) the timed-out connection is closed and the idempotent batches are resent in order, each once",
-        "src/network/__tests__/requestTimeoutCloseLive.spec.js \u203a Request timeout closes its connection over real TCP (live) every evidence line of this run carries the stamps a verifier checks"
+        "src/network/__tests__/requestTimeoutCloseLive.spec.js \u203a Request timeout closes its connection over real TCP (live) every evidence line of this run carries the stamps a verifier checks",
+        "src/oauth/__tests__/oauthHelpersLive.spec.js \u203a OAuth helpers against a live OAUTHBEARER broker producer and admin authenticate with every helper form, refresh in the window and read the log",
+        "src/oauth/__tests__/oauthHelpersLive.spec.js \u203a OAuth helpers against a live OAUTHBEARER broker closed providers reject later calls and the issuer keeps no sockets",
+        "src/network/__tests__/tlsNegativeLive.spec.js \u203a TLS negatives against real SSL listeners (live) a client certificate completes a Kafka request on the listener that requires one",
+        "src/network/__tests__/tlsNegativeLive.spec.js \u203a TLS negatives against real SSL listeners (live) the one-way listener refuses a CA the client does not trust, typed",
+        "src/network/__tests__/tlsNegativeLive.spec.js \u203a TLS negatives against real SSL listeners (live) the one-way listener refuses a server name the certificate does not carry, typed",
+        "src/network/__tests__/tlsNegativeLive.spec.js \u203a TLS negatives against real SSL listeners (live) the listener that requires a client certificate refuses a client without one, typed",
+        "src/network/__tests__/tlsNegativeLive.spec.js \u203a TLS negatives against real SSL listeners (live) a plaintext client on SSL listener 9093 is refused by the frame cap before allocation",
+        "src/network/__tests__/tlsNegativeLive.spec.js \u203a TLS negatives against real SSL listeners (live) a plaintext client on SSL listener 9193 is refused by the frame cap before allocation",
+        "src/network/__tests__/tlsNegativeLive.spec.js \u203a TLS negatives against real SSL listeners (live) a TLS client on the plaintext listener keeps its connection error and warns once",
+        "src/network/__tests__/tlsNegativeLive.spec.js \u203a TLS negatives against real SSL listeners (live) records every case of this run within the scenario budget",
+        "src/network/__tests__/idleReapingLive.spec.js \u203a Idle reaping live idle producer reconnects and all three replay sets remain exact",
+        "src/network/__tests__/idleReapingLive.spec.js \u203a Idle reaping live a live long poll is not reaped while its request is pending",
+        "src/network/__tests__/connectionSetupLive.spec.js \u203a Connection setup live setup budgets grow on one node and ready resets the next attempt",
+        "src/network/__tests__/connectionSetupLive.spec.js \u203a Connection setup live an explicit setup timeout stays flat without a maximum"
       ]
     },
     {
