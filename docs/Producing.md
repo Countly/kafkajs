@@ -371,9 +371,9 @@ const producer = kafka.producer({ rackId: 'rack-a', rackAware: true })
 ```
 
 - **Opt-in.** Without `rackAware: true` the producer behaves exactly as without these options; a `rackId` alone changes nothing. A `rackId` that is not a string, a `rackAware` that is not a boolean, and `rackAware: true` with an empty `rackId` make `kafka.producer()` throw `KafkaJSInvalidConfigurationError` before anything connects.
-- **Which partitioners.** `UniformStickyPartitioner` (the default, also with `adaptive` or `ignoreKeys`), `DefaultPartitioner` with its alias `JavaCompatiblePartitioner`, and `LegacyPartitioner`. A record without a key goes among the partitions that have a leader in the producer's rack; a sticky partition outside that set is left when the producer's metadata next changes, and an adaptive pick weighs only that set.
+- **Which partitioners.** `UniformStickyPartitioner` (the default, also with `adaptive` or `ignoreKeys`), `DefaultPartitioner` with its alias `JavaCompatiblePartitioner`, and `LegacyPartitioner`. A record without a key goes among the partitions that have a leader in the producer's rack; a sticky partition outside that set is left at the next record, and an adaptive pick weighs only that set.
 - **Fallback.** When no partition with a leader is in the rack, or the racks of the leaders are not known, the choice is the same as without the option: among every partition with a leader, or among all partitions when none has one. A rack is the one a broker reports in its metadata (`broker.rack`); a broker that reports none matches no `rackId`.
-- **Unchanged.** A record with a `partition` goes there, and a keyed record goes where `DefaultPartitioner` sends it, as in the Java client: neither reads a rack. With `UniformStickyPartitioner({ ignoreKeys: true })` a keyed record is a record without a key.
+- **Unchanged.** A record with a `partition` goes there, and a keyed record goes where the partitioner you chose already sends it (`DefaultPartitioner`'s hash is the Java client's; `LegacyPartitioner` keeps its own): neither reads a rack. With `UniformStickyPartitioner({ ignoreKeys: true })` a keyed record is a record without a key.
 
 ## <a name="retry"></a> Retry
 

@@ -17,12 +17,13 @@ const SWEEP_AT = 64
  * Picks the partition a topic's keyless records stick to next: uniformly at random among the
  * eligible partitions, or among all of them when none is eligible. Like the Java client's
  * built-in partitioner, the pick may land on the partition just left.
- * @param {{ partitionId: number, leader: number }[]} eligible the partitions `RackPreference`
- *   allows: the ones with a leader, or those of the producer's rack among them
+ * @param {RackPreference} racks which partitions are eligible: the ones with a leader, or those of
+ *   the producer's rack among them
  * @param {{ partitionId: number, leader: number }[]} partitionMetadata
  * @returns {number}
  */
-const pickPartition = (eligible, partitionMetadata) => {
+const pickPartition = (racks, partitionMetadata) => {
+  const eligible = racks.eligible(partitionMetadata)
   const candidates = eligible.length > 0 ? eligible : partitionMetadata
   return candidates[Math.floor(Math.random() * candidates.length)].partitionId
 }
@@ -52,9 +53,10 @@ const pickPartition = (eligible, partitionMetadata) => {
  * `partitioner.availability.timeout.ms` is not implemented.
  *
  * Eligible means having a leader. A producer that opted in with `rackAware: true` and a `rackId`
- * (KIP-1123) narrows that to the partitions whose leader is in its rack when any is, and a sticky
- * partition outside that set is left when the producer's metadata next changes. A record with a
- * partition or, unless `ignoreKeys`, a key never reads a rack.
+ * (KIP-1123) narrows that to the partitions whose leader is in its rack when any is, and checks
+ * the sticky partition against that set at every record, since a leader hint moves a leader in
+ * place; a partition outside the set is left at once. A record with a partition or, unless
+ * `ignoreKeys`, a key never reads a rack.
  * @see https://cwiki.apache.org/confluence/display/KAFKA/KIP-794%3A+Strictly+Uniform+Sticky+Partitioner
  * @see https://github.com/apache/kafka/blob/4.3.1/clients/src/main/java/org/apache/kafka/clients/producer/internals/BuiltInPartitioner.java
  * @param {object} [options]
@@ -105,41 +107,45 @@ const UniformStickyPartitioner = ({
     /**
      * The adaptive pick (`BuiltInPartitioner.nextPartition`): a cumulative table of
      * `maxQueue + 1 - queue(p)` over the eligible partitions, one random draw and a binary search
-     * for the first entry above it.
+     * for the first entry above it. It scans `partitionMetadata` in place, building no list.
      * @param {string} topic
-     * @param {{ partitionId: number, leader: number }[]} eligible
      * @param {{ partitionId: number, leader: number }[]} partitionMetadata
      * @returns {number}
      */
-    const weighted = (topic, eligible, partitionMetadata) => {
-      if (cumulative.length < eligible.length) {
-        cumulative = new Float64Array(eligible.length)
+    const weighted = (topic, partitionMetadata) => {
+      if (cumulative.length < partitionMetadata.length) {
+        cumulative = new Float64Array(partitionMetadata.length)
       }
+      const narrowed = racks.narrows(partitionMetadata)
+      let count = 0
       let max = -1
       let equal = true
-      for (let count = 0; count < eligible.length; count++) {
-        const queue = loadOf(topic, eligible[count].partitionId)
+      for (const partition of partitionMetadata) {
+        if (!racks.admits(partition, narrowed)) continue
+        const queue = loadOf(topic, partition.partitionId)
         equal = equal && (count === 0 || queue === max)
         max = Math.max(max, queue)
-        cumulative[count] = queue
+        cumulative[count++] = queue
       }
-      if (eligible.length < 2 || equal) {
-        return pickPartition(eligible, partitionMetadata)
+      if (count < 2 || equal) {
+        return pickPartition(racks, partitionMetadata)
       }
       let total = 0
-      for (let i = 0; i < eligible.length; i++) {
+      for (let i = 0; i < count; i++) {
         total += max + 1 - cumulative[i]
         cumulative[i] = total
       }
       const draw = Math.random() * total
       let low = 0
-      let high = eligible.length - 1
+      let high = count - 1
       while (low < high) {
         const middle = (low + high) >> 1
         if (cumulative[middle] > draw) high = middle
         else low = middle + 1
       }
-      return eligible[low].partitionId
+      for (const partition of partitionMetadata) {
+        if (racks.admits(partition, narrowed) && low-- === 0) return partition.partitionId
+      }
     }
 
     const partitioner = ({ topic, partitionMetadata, message }) => {
@@ -158,21 +164,15 @@ const UniformStickyPartitioner = ({
         current = { partition: -1, bytes: 0, usedAt: now, checked: null }
         sticky.set(topic, current)
       }
-      let eligible = null
-      if (current.checked !== partitionMetadata) {
-        current.checked = partitionMetadata
-        eligible = racks.eligible(partitionMetadata)
-        const candidates = eligible.length > 0 ? eligible : partitionMetadata
-        if (!candidates.some(({ partitionId }) => partitionId === current.partition)) {
-          current.partition = -1
-        }
+      if (current.partition >= 0 && (racks.enabled || current.checked !== partitionMetadata)) {
+        if (!racks.allows(partitionMetadata, current.partition)) current.partition = -1
       }
+      current.checked = partitionMetadata
       if (current.partition < 0) {
-        eligible ??= racks.eligible(partitionMetadata)
         current.partition =
           adaptive && loadOf !== null
-            ? weighted(topic, eligible, partitionMetadata)
-            : pickPartition(eligible, partitionMetadata)
+            ? weighted(topic, partitionMetadata)
+            : pickPartition(racks, partitionMetadata)
         current.bytes = 0
       }
 

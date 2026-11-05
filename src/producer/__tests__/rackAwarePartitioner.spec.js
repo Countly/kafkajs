@@ -21,53 +21,57 @@ const ROUND_ROBIN = [2, 7, 11, 2, 7, 11]
 const STICKY = [2, 2, 2, 2, 2, 2]
 /** `toPositive(murmur2(key)) % 3` of the keys below, as the Java client maps them. */
 const DEFAULT_KEYED = [1, 2, 1, 0, 2, 0]
+/** What each pick gives, from the same start, when partition 2 has no leader: only 7 and 11 are candidates. */
+const STICKY_LEADERLESS = [7, 7, 7]
+const ROUND_ROBIN_LEADERLESS = [11, 7, 11]
 /** The same keys under the hash KafkaJS used before 2.0.0. */
 const LEGACY_KEYED = [1, 0, 2, 0, 1, 0]
 const KEYS = ['a', 'b', 'c', 'key-1', 'key-2', 'order-17']
 const OPTED_IN = { rackId: 'rack-b', rackAware: true }
 
 /**
- * Every built-in form a producer takes as `createPartitioner`, with what it picks where no rack
- * decides (`unfiltered`) and where it puts the keys of `KEYS` (`keyed`).
- * @type {Array<[name: string, createPartitioner: Function|undefined, unfiltered: number[], keyed: number[]]>}
+ * Every distinct built-in form a producer takes as `createPartitioner`, with what it picks where
+ * no rack decides (`unfiltered`), where it puts the keys of `KEYS` (`keyed`) and what its first
+ * three picks are when partition 2 has no leader and no rack decides (`leaderless`).
+ * `JavaCompatiblePartitioner` is the same function as `DefaultPartitioner`, so it has no row.
+ * @type {Array<[name: string, createPartitioner: Function|undefined, unfiltered: number[], keyed: number[], leaderless: number[]]>}
  */
 const FORMS = [
-  ['no createPartitioner', undefined, STICKY, DEFAULT_KEYED],
+  ['no createPartitioner', undefined, STICKY, DEFAULT_KEYED, STICKY_LEADERLESS],
   [
     'createPartitioner UniformStickyPartitioner()',
     Partitioners.UniformStickyPartitioner(),
     STICKY,
     DEFAULT_KEYED,
+    STICKY_LEADERLESS,
   ],
   [
     'createPartitioner UniformStickyPartitioner uncalled',
     Partitioners.UniformStickyPartitioner,
     STICKY,
     DEFAULT_KEYED,
+    STICKY_LEADERLESS,
   ],
   [
     'createPartitioner UniformStickyPartitioner({ adaptive: true })',
     Partitioners.UniformStickyPartitioner({ adaptive: true }),
     STICKY,
     DEFAULT_KEYED,
+    STICKY_LEADERLESS,
   ],
   [
     'createPartitioner DefaultPartitioner',
     Partitioners.DefaultPartitioner,
     ROUND_ROBIN,
     DEFAULT_KEYED,
-  ],
-  [
-    'createPartitioner JavaCompatiblePartitioner',
-    Partitioners.JavaCompatiblePartitioner,
-    ROUND_ROBIN,
-    DEFAULT_KEYED,
+    ROUND_ROBIN_LEADERLESS,
   ],
   [
     'createPartitioner LegacyPartitioner',
     Partitioners.LegacyPartitioner,
     ROUND_ROBIN,
     LEGACY_KEYED,
+    ROUND_ROBIN_LEADERLESS,
   ],
 ]
 
@@ -111,36 +115,54 @@ const pick = (partitioner, partitionMetadata, message = { value: 'v' }) =>
 
 describe('Producer > rack-aware partitioning', () => {
   let producer, cluster
+  /** Every producer and cluster `open` made, so the cleanup closes each of them. */
+  const opened = []
 
-  /** A producer made by the exported `Kafka` class over a scripted cluster with the sparse topic. */
-  const start = async (options = {}, { racks = RACKS, leaders = LEADERS } = {}) => {
-    cluster = producerScript(createScriptedCluster({ nodes: NODES })).answer('Metadata', () => ({
-      brokers: NODES.map(({ id, host, port }) => ({ nodeId: id, host, port, rack: racks[id] })),
-      controllerId: 0,
-      topics: [
-        {
-          errorCode: 0,
-          name: TOPIC,
-          topicId: TOPIC_ID,
-          isInternal: false,
-          topicAuthorizedOperations: -2147483648,
-          partitions: IDS.map((partitionIndex, i) => ({
+  /**
+   * A connected producer made by the exported `Kafka` class over a scripted cluster of its own
+   * with the sparse topic.
+   * @returns {Promise<{ producer: object, cluster: object }>}
+   */
+  const open = async (options = {}, { racks = RACKS, leaders = LEADERS } = {}) => {
+    const scripted = producerScript(createScriptedCluster({ nodes: NODES })).answer(
+      'Metadata',
+      () => ({
+        brokers: NODES.map(({ id, host, port }) => ({ nodeId: id, host, port, rack: racks[id] })),
+        controllerId: 0,
+        topics: [
+          {
             errorCode: 0,
-            partitionIndex,
-            leaderId: leaders[i],
-            leaderEpoch: 5,
-            replicas: [leaders[i]],
-            isr: [leaders[i]],
-            offlineReplicas: [],
-          })),
-        },
-      ],
-    }))
-    producer = new Kafka(cluster.kafkaOptions({ brokers: ['node0:9092'] })).producer({
+            name: TOPIC,
+            topicId: TOPIC_ID,
+            isInternal: false,
+            topicAuthorizedOperations: -2147483648,
+            partitions: IDS.map((partitionIndex, i) => ({
+              errorCode: 0,
+              partitionIndex,
+              leaderId: leaders[i],
+              leaderEpoch: 5,
+              replicas: [leaders[i]],
+              isr: [leaders[i]],
+              offlineReplicas: [],
+            })),
+          },
+        ],
+      })
+    )
+    const made = new Kafka(scripted.kafkaOptions({ brokers: ['node0:9092'] })).producer({
       linger: 0,
       ...options,
     })
-    await producer.connect()
+    opened.push({ producer: made, cluster: scripted })
+    await made.connect()
+    return { producer: made, cluster: scripted }
+  }
+
+  /** `open`, kept as the producer and cluster the test sends through. */
+  const start = async (...args) => {
+    const started = await open(...args)
+    producer = started.producer
+    cluster = started.cluster
   }
 
   const sendKeyless = async (count = RECORDS) => {
@@ -150,8 +172,8 @@ describe('Producer > rack-aware partitioning', () => {
   }
 
   /** The topic, partition and record count of every batch the client wrote, in order. */
-  const written = () =>
-    cluster
+  const written = (scripted = cluster) =>
+    scripted
       .requests()
       .filter(({ api }) => api === 'Produce')
       .flatMap(({ fields }) =>
@@ -164,7 +186,8 @@ describe('Producer > rack-aware partitioning', () => {
         )
       )
 
-  const partitionsWritten = () => written().map(({ partition }) => partition)
+  const partitionsWritten = (scripted = cluster) =>
+    written(scripted).map(({ partition }) => partition)
 
   beforeEach(() => {
     jest.spyOn(Math, 'random').mockReturnValue(0)
@@ -172,8 +195,9 @@ describe('Producer > rack-aware partitioning', () => {
   })
 
   afterEach(async () => {
-    if (producer) await producer.disconnect()
-    if (cluster) cluster.assertClean()
+    for (const { producer: made } of opened) await made.disconnect()
+    for (const { cluster: scripted } of opened) scripted.assertClean()
+    opened.length = 0
     producer = cluster = null
     jest.restoreAllMocks()
   })
@@ -220,17 +244,16 @@ describe('Producer > rack-aware partitioning', () => {
 
   test('two producers with different racks each choose among the leaders of their own rack', async () => {
     const createPartitioner = Partitioners.DefaultPartitioner
-    const choices = {}
-    for (const rackId of ['rack-a', 'rack-b']) {
-      await start({ createPartitioner, rackId, rackAware: true })
-      await sendKeyless(4)
-      choices[rackId] = partitionsWritten()
-      await producer.disconnect()
-      producer = null
-      cluster.assertClean()
+    const inRackA = await open({ createPartitioner, rackId: 'rack-a', rackAware: true })
+    const inRackB = await open({ createPartitioner, rackId: 'rack-b', rackAware: true })
+
+    for (let i = 0; i < 4; i += 1) {
+      await inRackA.producer.send({ topic: TOPIC, messages: [{ value: `a-${i}` }] })
+      await inRackB.producer.send({ topic: TOPIC, messages: [{ value: `b-${i}` }] })
     }
 
-    expect(choices).toEqual({ 'rack-a': [11, 2, 11, 2], 'rack-b': [7, 7, 7, 7] })
+    expect(partitionsWritten(inRackA.cluster)).toEqual([11, 2, 11, 2])
+    expect(partitionsWritten(inRackB.cluster)).toEqual([7, 7, 7, 7])
   })
 
   test('the preference survives a disconnect and a connect of the same producer', async () => {
@@ -285,9 +308,9 @@ describe('Producer > rack-aware partitioning', () => {
   })
 
   describe('what the producer hands a built-in partitioner', () => {
-    /** A built-in whose `attach` is observed, with the racks it reads counted. */
+    /** A built-in whose `attach` is observed, with the node ids whose racks it reads recorded. */
     const observed = (createPartitioner) => {
-      const seen = { contexts: [], reads: 0 }
+      const seen = { contexts: [], reads: [] }
       return {
         seen,
         createPartitioner: () => {
@@ -298,7 +321,7 @@ describe('Producer > rack-aware partitioning', () => {
             original({
               ...context,
               rackOf: (nodeId) => {
-                seen.reads += 1
+                seen.reads.push(nodeId)
                 return context.rackOf(nodeId)
               },
             })
@@ -326,7 +349,7 @@ describe('Producer > rack-aware partitioning', () => {
 
         expect(seen.contexts).toHaveLength(1)
         expect(seen.contexts[0]).toMatchObject(expected)
-        expect(seen.reads).toBe(0)
+        expect(seen.reads).toEqual([])
         expect(partitionsWritten()).toEqual(ROUND_ROBIN)
       }
     )
@@ -338,7 +361,8 @@ describe('Producer > rack-aware partitioning', () => {
       await sendKeyless(1)
 
       expect(seen.contexts[0]).toMatchObject(OPTED_IN)
-      expect(seen.reads).toBeGreaterThan(0)
+      expect([...new Set(seen.reads)].sort()).toEqual([0, 1])
+      expect(partitionsWritten()).toEqual([7])
     })
   })
 })
@@ -385,6 +409,57 @@ describe('Producer > rack-aware partitioning > the partition functions', () => {
     expect(pick(partitioner, metadataOf([0, 0, 0]))).toBe(7)
   })
 
+  test('a leader hint that moves the sticky partition out of the rack, in the same partition list, makes the next record leave it', () => {
+    jest.spyOn(Math, 'random').mockReturnValue(0)
+    const { partitioner } = attached(Partitioners.UniformStickyPartitioner({ stickyBytes: 1e9 }), {
+      ...OPTED_IN,
+    })
+    const partitionMetadata = metadataOf([0, 1, 1])
+    expect([pick(partitioner, partitionMetadata), pick(partitioner, partitionMetadata)]).toEqual([
+      7, 7,
+    ])
+
+    // `MetadataCache.applyLeaderHint` changes the cached partition in place: same array, new leader
+    partitionMetadata[1].leader = 0
+
+    expect(pick(partitioner, partitionMetadata)).toBe(11)
+  })
+
+  test('a broker that changes rack under the same partition list makes the next record leave a partition that is no longer in the rack', () => {
+    jest.spyOn(Math, 'random').mockReturnValue(0)
+    const racks = { 0: 'rack-a', 1: 'rack-b' }
+    const { partitioner } = attached(Partitioners.UniformStickyPartitioner({ stickyBytes: 1e9 }), {
+      ...OPTED_IN,
+      racks,
+    })
+    const partitionMetadata = metadataOf(LEADERS)
+    expect([pick(partitioner, partitionMetadata), pick(partitioner, partitionMetadata)]).toEqual([
+      7, 7,
+    ])
+
+    // the brokers swap racks, as an endpoint hint may change a broker's rack in place
+    racks[0] = 'rack-b'
+    racks[1] = 'rack-a'
+
+    expect(pick(partitioner, partitionMetadata)).toBe(2)
+  })
+
+  test('without the opt-in a sticky partition is checked once for each partition list, not at every record', () => {
+    jest.spyOn(Math, 'random').mockReturnValue(0)
+    const { partitioner, reads } = attached(
+      Partitioners.UniformStickyPartitioner({ stickyBytes: 1e9 }),
+      { rackId: 'rack-b' }
+    )
+    const partitionMetadata = metadataOf(LEADERS)
+    expect(pick(partitioner, partitionMetadata)).toBe(2)
+
+    partitionMetadata[0].leader = -1
+
+    expect(pick(partitioner, partitionMetadata)).toBe(2)
+    expect(pick(partitioner, metadataOf([-1, 1, 0]))).toBe(7)
+    expect(reads).toEqual([])
+  })
+
   test('adaptive choices weigh only matching partitions', () => {
     const ids = [2, 7, 9]
     const loads = { 2: 0, 7: 0, 9: 10 }
@@ -402,13 +477,33 @@ describe('Producer > rack-aware partitioning > the partition functions', () => {
     )
     const partitionMetadata = metadataOf([0, 1, 1], ids)
 
-    // weights 11 for partition 7 and 1 for partition 9: a low draw is 7, a high one is 9
-    random.mockReturnValueOnce(0.01).mockReturnValueOnce(0.99)
-    const picks = [pick(partitioner, partitionMetadata), pick(partitioner, partitionMetadata)]
+    // weights 11 for partition 7 and 1 for partition 9, so 7 holds draws below 11/12 and 9 the
+    // rest; a uniform pick would split at 1/2, and send 0.75 to 9
+    random.mockReturnValueOnce(0.01).mockReturnValueOnce(0.99).mockReturnValueOnce(0.75)
+    const picks = [0, 1, 2].map(() => pick(partitioner, partitionMetadata))
 
-    expect(picks).toEqual([7, 9])
+    expect(picks).toEqual([7, 9, 7])
+    expect(random).toHaveBeenCalledTimes(3)
     expect([...asked].sort()).toEqual([7, 9])
   })
+
+  test.each(FORMS)(
+    'with %s, a rack nobody leads falls back to the partitions that have a leader',
+    (_name, createPartitioner, _unfiltered, _keyed, leaderless) => {
+      jest.spyOn(Math, 'random').mockReturnValue(0)
+      const factory = createPartitioner ?? Partitioners.UniformStickyPartitioner()
+      const variants = [
+        ['no broker is in the rack', { ...OPTED_IN, rackId: 'rack-z' }],
+        ['no broker has a known rack', { ...OPTED_IN, racks: {} }],
+      ]
+      for (const [, options] of variants) {
+        const { partitioner } = attached(factory, options)
+        const partitionMetadata = metadataOf([-1, 1, 0])
+
+        expect([0, 1, 2].map(() => pick(partitioner, partitionMetadata))).toEqual(leaderless)
+      }
+    }
+  )
 
   test.each(FORMS)(
     'explicit partition and keyed mappings remain stable with %s',
@@ -433,6 +528,10 @@ describe('Producer > rack-aware partitioning > the partition functions', () => {
       }
     }
   )
+
+  test('JavaCompatiblePartitioner is the DefaultPartitioner function, so it shares its rack choices', () => {
+    expect(Partitioners.JavaCompatiblePartitioner).toBe(Partitioners.DefaultPartitioner)
+  })
 
   test('ignoreKeys places a keyed record by rack like a keyless one', () => {
     jest.spyOn(Math, 'random').mockReturnValue(0)
@@ -541,5 +640,85 @@ describe('Producer > rack-aware partitioning > the options', () => {
     expect(eligibleWith({ rackAware: true })).toEqual(IDS)
     expect(eligibleWith({ rackAware: 'yes', rackId: 'rack-b' })).toEqual(IDS)
     expect(eligibleWith(OPTED_IN)).toEqual([7])
+  })
+})
+
+describe('Producer > rack-aware partitioning > the rack preference', () => {
+  const RackPreference = require('../partitioners/rackPreference')
+
+  /** @returns {{ preference: object, reads: number[] }} a preference attached as the producer does */
+  const preferenceOf = (context, racks = RACKS) => {
+    const reads = []
+    const preference = new RackPreference()
+    preference.attach({
+      rackOf: (nodeId) => {
+        reads.push(nodeId)
+        return racks[nodeId]
+      },
+      ...context,
+    })
+    return { preference, reads }
+  }
+
+  test.each([
+    ['a partition led in the rack', OPTED_IN, [0, 1, 0], 7, true],
+    ['a partition led outside the rack while another is led in it', OPTED_IN, [0, 1, 0], 2, false],
+    ['a partition led outside a rack nobody leads', OPTED_IN, [0, 0, 0], 2, true],
+    ['a leaderless partition while another has a leader', OPTED_IN, [-1, 1, 0], 2, false],
+    ['a leaderless partition while none has a leader', OPTED_IN, [-1, -1, -1], 2, true],
+    ['a partition the topic does not have', OPTED_IN, [0, 1, 0], 3, false],
+    ['a partition led with no rack known', { ...OPTED_IN, racks: {} }, [0, 1, 0], 2, true],
+    ['a led partition with the preference off', {}, [0, 1, 0], 2, true],
+    [
+      'a leaderless partition with the preference off, another has a leader',
+      {},
+      [-1, 1, 0],
+      2,
+      false,
+    ],
+    [
+      'a leaderless partition with the preference off, none has a leader',
+      {},
+      [-1, -1, -1],
+      7,
+      true,
+    ],
+    ['a partition the topic does not have with the preference off', {}, [0, 1, 0], 3, false],
+  ])('allows %s', (_name, { racks, ...context }, leaders, partition, allowed) => {
+    const { preference } = preferenceOf(context, racks)
+
+    expect(preference.allows(metadataOf(leaders), partition)).toBe(allowed)
+  })
+
+  test("allows reads no rack with the preference off, and the sticky partition leader's rack alone while it is in the rack", () => {
+    const off = preferenceOf({ rackId: 'rack-b' })
+    const on = preferenceOf(OPTED_IN)
+
+    expect(off.preference.allows(metadataOf(LEADERS), 2)).toBe(true)
+    expect(on.preference.allows(metadataOf(LEADERS), 7)).toBe(true)
+
+    expect(off.reads).toEqual([])
+    expect(on.reads).toEqual([1])
+  })
+
+  test('eligible agrees with allows for every partition of every leader layout', () => {
+    for (const leaders of [
+      [0, 1, 0],
+      [0, 0, 0],
+      [-1, 1, 0],
+      [-1, -1, -1],
+      [1, 1, -1],
+    ]) {
+      for (const context of [OPTED_IN, { rackId: 'rack-b' }]) {
+        const { preference } = preferenceOf(context)
+        const partitionMetadata = metadataOf(leaders)
+        const eligible = preference
+          .eligible(partitionMetadata)
+          .map(({ partitionId }) => partitionId)
+        const candidates = eligible.length > 0 ? eligible : IDS
+
+        expect(IDS.filter((id) => preference.allows(partitionMetadata, id))).toEqual(candidates)
+      }
+    }
   })
 })

@@ -7,7 +7,8 @@ const {
   wireVersionsOf,
 } = require('testHelpers')
 const { readLog } = require('../../../testHelpers/rawLog')
-const { waitForCondition, withTimeout } = require('../../consumer/__tests__/fixtures/liveScenario')
+const { waitForCondition } = require('../../consumer/__tests__/fixtures/liveScenario')
+const { withDeadline } = require('../../consumer/__tests__/fixtures/boundedCleanup')
 
 // Gated: it creates and deletes a topic on the three-rack cluster. Run it alone through
 // `npm run test:e2e:rack-aware-producer`; `KAFKA_VERSION` names the cluster under test.
@@ -176,7 +177,7 @@ describeRackAwareProducer('Producer > rack-aware partitioning (live)', () => {
       await producer.connect()
       await work(producer, before, () => wireVersionsOf(requests))
     } finally {
-      await withTimeout(producer.disconnect(), DISCONNECT_BUDGET_MS)
+      await withDeadline(producer.disconnect(), DISCONNECT_BUDGET_MS)
     }
     expect(await placementOf()).toEqual(before)
     await expectLogToEqualLedger()
@@ -214,8 +215,8 @@ describeRackAwareProducer('Producer > rack-aware partitioning (live)', () => {
       }
     }
     await cleanup(() => admin.deleteTopics({ topics: [topic], timeout: 10000 }))
-    await cleanup(() => withTimeout(cluster?.disconnect(), DISCONNECT_BUDGET_MS))
-    await cleanup(() => withTimeout(admin.disconnect(), DISCONNECT_BUDGET_MS))
+    await cleanup(() => withDeadline(cluster?.disconnect(), DISCONNECT_BUDGET_MS))
+    await cleanup(() => withDeadline(admin.disconnect(), DISCONNECT_BUDGET_MS))
 
     expect(cleanupFailures).toEqual([])
     expect(Date.now() - startedAt).toBeLessThan(SCENARIO_BUDGET_MS)
@@ -230,9 +231,16 @@ describeRackAwareProducer('Producer > rack-aware partitioning (live)', () => {
           const matching = ledIn(placement, OWN_RACK)
           expect(matching).toEqual([1, 4])
 
-          const acknowledged = await sendEach(producer, 'default', 12)
+          // a draw of 0 makes a pick that ignores the rack choose partition 0, led in rack-a
+          const draw = jest.spyOn(Math, 'random').mockReturnValue(0)
+          let acknowledged
+          try {
+            acknowledged = await sendEach(producer, 'default', 12)
+          } finally {
+            draw.mockRestore()
+          }
 
-          expect(acknowledged.filter(({ partition }) => !matching.includes(partition))).toEqual([])
+          expect(acknowledged.map(({ partition }) => partition)).toEqual(Array(12).fill(1))
           writeEvidence(EVIDENCE, {
             wireVersions: wireVersions(),
             step: 'default-partitioner',
@@ -256,6 +264,13 @@ describeRackAwareProducer('Producer > rack-aware partitioning (live)', () => {
 
           const acknowledged = await sendEach(producer, 'round-robin', 40)
 
+          const sequence = acknowledged.map(({ partition }) => partition)
+          const first = sequence[0]
+          expect(matching).toContain(first)
+          const second = matching.find((partition) => partition !== first)
+          expect(sequence).toEqual(
+            Array.from({ length: 40 }, (_, index) => (index % 2 === 0 ? first : second))
+          )
           expect(countsOf(acknowledged)).toEqual({ [matching[0]]: 20, [matching[1]]: 20 })
           writeEvidence(EVIDENCE, {
             wireVersions: wireVersions(),
