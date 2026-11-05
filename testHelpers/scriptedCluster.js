@@ -14,6 +14,14 @@ const { requests: clientRequests } = require('../src/protocol/requests')
 const DISCOVERY_VERSION = Math.max(...clientRequests.ApiVersions.versions.map(Number))
 
 /**
+ * The fake milliseconds a connect to a profile that offers ApiVersions v4 needs before its
+ * negotiation is answered, for a test that advances fake timers: the refused v5 request and the
+ * v4 request are each answered on a later turn, and a turn scheduled while a tick runs falls one
+ * fake millisecond after the one before. The dial itself is not counted.
+ */
+const NEGOTIATION_MS = 2
+
+/**
  * The pairs the bootstrap and the classic group protocol use: the one version of each that has a
  * wire pair, advertised with `min = max` so the client's version selection lands on it.
  * @type {Array<[string, number]>}
@@ -1079,4 +1087,5 @@ module.exports = {
   consumerProtocolScript,
   producerScript,
   PROFILES,
+  NEGOTIATION_MS,
 }

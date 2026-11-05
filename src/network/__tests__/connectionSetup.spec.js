@@ -2,7 +2,7 @@ const { EventEmitter } = require('events')
 const Connection = require('../connection')
 const Broker = require('../../broker')
 const ConnectionPool = require('../connectionPool')
-const { createScriptedCluster } = require('../../../testHelpers/scriptedCluster')
+const { createScriptedCluster, NEGOTIATION_MS } = require('../../../testHelpers/scriptedCluster')
 const { Schedule } = require('../../../testHelpers/schedule')
 const { createLogger } = require('../../loggers')
 const {
@@ -105,7 +105,9 @@ it('bounds an unanswered ApiVersions by the setup budget', async () => {
   )
   await jest.advanceTimersByTimeAsync(1)
   expect(gate.call.api).toBe('ApiVersions')
-  await jest.advanceTimersByTimeAsync(300)
+  await jest.advanceTimersByTimeAsync(298)
+  expect(outcome).toBeUndefined()
+  await jest.advanceTimersByTimeAsync(1)
   expect(outcome).toBeInstanceOf(KafkaJSConnectionError)
   expect(outcome.message).toMatch(/ApiVersions.*300ms/)
   expect(outcome.retriable).toBe(true)
@@ -159,7 +161,7 @@ it('bounds an unanswered handshake by the authentication cap', async () => {
   broker.connect().catch((error) => {
     outcome = error
   })
-  await jest.advanceTimersByTimeAsync(1)
+  await jest.advanceTimersByTimeAsync(NEGOTIATION_MS)
   expect(gate.call.api).toBe('SaslHandshake')
   await jest.advanceTimersByTimeAsync(400)
   expect(outcome).toBeInstanceOf(KafkaJSConnectionError)

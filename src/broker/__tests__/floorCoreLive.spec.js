@@ -1079,6 +1079,9 @@ describeFloor('Kafka floor core (live)', () => {
           eachMessage: async (payload) => delivered.push(identityOf(payload)),
         })
         expect(await waitForCondition(() => delivered.length === 1, WAIT_BUDGET)).toBe(true)
+        // Finding the new topic rebalances the group, and a member that has committed nothing
+        // restarts from the beginning, so the first record must be committed to stay delivered once.
+        await consumer.commitOffsets([{ topic: first, partition: 0, offset: '1' }])
         await createTopic({ topic: second, partitions: 1, replicas: 3 })
         topics.push(second)
         await producer.send({ topic: second, messages: [{ partition: 0, value: 'second' }] })

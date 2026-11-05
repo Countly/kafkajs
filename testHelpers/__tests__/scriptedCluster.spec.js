@@ -8,7 +8,11 @@ const {
   groupScript,
   producerScript,
   PROFILES,
+  NEGOTIATION_MS,
 } = require('../scriptedCluster')
+const Broker = require('../../src/broker')
+const ConnectionPool = require('../../src/network/connectionPool')
+const { createLogger } = require('../../src/loggers')
 const { lanes } = require('../lane')
 const { Schedule } = require('../schedule')
 const metadataV13 = require('../wire/metadataV13')
@@ -1943,6 +1947,40 @@ test('a blackholed dial never connects and up only restores future dials', async
     cluster.assertClean()
   } finally {
     old.destroy()
+    jest.useRealTimers()
+  }
+})
+
+test('a connect to a profile that offers ApiVersions v4 takes exactly NEGOTIATION_MS fake milliseconds', async () => {
+  jest.useFakeTimers()
+  const cluster = createScriptedCluster({ nodes: NODES })
+  const logger = createLogger({ level: 0, logCreator: () => () => {} })
+  const broker = new Broker({
+    connectionPool: new ConnectionPool({
+      host: NODES[0].host,
+      port: NODES[0].port,
+      logger,
+      socketFactory: cluster.socketFactory,
+      connectionTimeout: 300,
+      requestTimeout: 1500,
+    }),
+    logger,
+  })
+  try {
+    let ready = false
+    const connecting = broker.connect().then(() => {
+      ready = true
+    })
+    await jest.advanceTimersByTimeAsync(NEGOTIATION_MS - 1)
+    expect(ready).toBe(false)
+    expect(cluster.apiVersionTrace().map(({ version }) => version)).toEqual([5, 4])
+    await jest.advanceTimersByTimeAsync(1)
+    await connecting
+    expect(ready).toBe(true)
+  } finally {
+    await broker.disconnect({ drainTimeout: 0 })
+    await jest.advanceTimersByTimeAsync(1)
+    cluster.assertClean()
     jest.useRealTimers()
   }
 })

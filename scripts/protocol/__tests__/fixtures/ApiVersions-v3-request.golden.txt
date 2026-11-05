@@ -9,7 +9,7 @@ const { ApiVersions: apiKey } = require('../../apiKeys')
  * TAG_BUFFER
  *
  * @see https://kafka.apache.org/43/design/protocol
- * @see clients/src/main/resources/common/message/ApiVersionsRequest.json (Apache Kafka 4.3.1)
+ * @see clients/src/main/resources/common/message/ApiVersionsRequest.json (Apache Kafka 4.4.0)
  */
 module.exports = ({ clientSoftwareName, clientSoftwareVersion }) => ({
   apiKey,

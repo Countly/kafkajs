@@ -21293,7 +21293,22 @@
         "src/producer/__tests__/rackAwareProducerLive.spec.js \u203a Producer > rack-aware partitioning (live) a custom partitioner keeps its choice of a partition led outside the rack of a rack-aware producer",
         "src/broker/__tests__/apiVersionsIdentityLive.spec.js \u203a Broker > ApiVersions identity (live) a bootstrap broker is named no identity and a known node is named its cluster and node id",
         "src/broker/__tests__/apiVersionsIdentityLive.spec.js \u203a Broker > ApiVersions identity (live) a node that is another broker is refused with REBOOTSTRAP_REQUIRED on 4.4, recovered from once, and not noticed below it",
-        "src/broker/__tests__/apiVersionsIdentityLive.spec.js \u203a Broker > ApiVersions identity (live) none names no identity, so a misrouted node is neither refused nor recovered from"
+        "src/broker/__tests__/apiVersionsIdentityLive.spec.js \u203a Broker > ApiVersions identity (live) none names no identity, so a misrouted node is neither refused nor recovered from",
+        "src/broker/__tests__/gssapiLive.spec.js \u203a GSSAPI with a ticket-granting service authenticates, negotiates no layer and rejects an observed expired cache",
+        "src/oauth/__tests__/oauthHelpersLive.spec.js \u203a OAuth helpers against a live OAUTHBEARER broker producer and admin authenticate with every helper form, refresh in the window and read the log",
+        "src/oauth/__tests__/oauthHelpersLive.spec.js \u203a OAuth helpers against a live OAUTHBEARER broker closed providers reject later calls and the issuer keeps no sockets",
+        "src/network/__tests__/tlsNegativeLive.spec.js \u203a TLS negatives against real SSL listeners (live) a client certificate completes a Kafka request on the listener that requires one",
+        "src/network/__tests__/tlsNegativeLive.spec.js \u203a TLS negatives against real SSL listeners (live) the one-way listener refuses a CA the client does not trust, typed",
+        "src/network/__tests__/tlsNegativeLive.spec.js \u203a TLS negatives against real SSL listeners (live) the one-way listener refuses a server name the certificate does not carry, typed",
+        "src/network/__tests__/tlsNegativeLive.spec.js \u203a TLS negatives against real SSL listeners (live) the listener that requires a client certificate refuses a client without one, typed",
+        "src/network/__tests__/tlsNegativeLive.spec.js \u203a TLS negatives against real SSL listeners (live) a plaintext client on SSL listener 9093 is refused by the frame cap before allocation",
+        "src/network/__tests__/tlsNegativeLive.spec.js \u203a TLS negatives against real SSL listeners (live) a plaintext client on SSL listener 9193 is refused by the frame cap before allocation",
+        "src/network/__tests__/tlsNegativeLive.spec.js \u203a TLS negatives against real SSL listeners (live) a TLS client on the plaintext listener keeps its connection error and warns once",
+        "src/network/__tests__/tlsNegativeLive.spec.js \u203a TLS negatives against real SSL listeners (live) records every case of this run within the scenario budget",
+        "src/network/__tests__/idleReapingLive.spec.js \u203a Idle reaping live idle producer reconnects and all three replay sets remain exact",
+        "src/network/__tests__/idleReapingLive.spec.js \u203a Idle reaping live a live long poll is not reaped while its request is pending",
+        "src/network/__tests__/connectionSetupLive.spec.js \u203a Connection setup live setup budgets grow on one node and ready resets the next attempt",
+        "src/network/__tests__/connectionSetupLive.spec.js \u203a Connection setup live an explicit setup timeout stays flat without a maximum"
       ]
     },
     {

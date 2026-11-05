@@ -6,7 +6,7 @@ const Broker = require('../../src/broker')
 const ConnectionPool = require('../../src/network/connectionPool')
 const { createLogger } = require('../../src/loggers')
 const { readRequestHeader } = require('../../testHelpers/fakeSocket')
-const pair = require('../../testHelpers/wire/apiVersionsV4')
+const pair = require('../../testHelpers/wire/apiVersionsV5')
 const { createResourceProbe } = require('../../testHelpers/resourceProbe')
 
 /** Measures real ready episodes while keeping destruction outside the measured interval. */
@@ -31,7 +31,8 @@ class SetupBenchmark {
   }
 
   /**
-   * Reads complete frames independently of the product frame accumulator, accepting only v4.
+   * Reads complete frames independently of the product frame accumulator, accepting only the
+   * ApiVersions v5 a Kafka 4.4 broker is first asked, so each episode is one round trip.
    * @param {import('node:net').Socket} socket accepted server socket
    * @returns {void}
    */
@@ -53,11 +54,11 @@ class SetupBenchmark {
           pending = pending.subarray(length)
           const header = readRequestHeader(frame)
           assert.equal(header.apiKey, 18)
-          assert.equal(header.apiVersion, 4)
+          assert.equal(header.apiVersion, 5)
           pair.readRequest(frame.subarray(header.byteLength))
           this.negotiations++
           const body = pair.buildResponse({
-            apiKeys: [{ apiKey: 18, minVersion: 4, maxVersion: 4 }],
+            apiKeys: [{ apiKey: 18, minVersion: 5, maxVersion: 5 }],
           })
           const response = Buffer.alloc(8 + body.length)
           response.writeInt32BE(4 + body.length)
