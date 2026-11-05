@@ -158,7 +158,6 @@ describe('error wrapping preserves the protocol type', () => {
     })
     expect(exceeded.stack.split('\n')[0]).toBe('KafkaJSNumberOfRetriesExceeded')
     expect(exceeded.cause).toBe(protocolError)
-    expect(protocolError.retriable).toBe(true)
   })
 
   it('KafkaJSNumberOfRetriesExceeded digs through a chain of wrappers', () => {

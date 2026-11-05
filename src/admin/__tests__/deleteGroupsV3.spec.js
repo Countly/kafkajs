@@ -209,14 +209,15 @@ describe('Admin > deleteGroups > a coordinator retry', () => {
 
   test('a retry deletes the groups of the call, not what the caller later put in its array', async () => {
     const first = coordinator(1, ['one'])
-    const second = coordinator(2, ['two', 'three'], { failures: 1 })
+    const second = coordinator(2, ['two', 'three'])
     const { admin } = adminOver({ one: first, two: second, three: second })
     const groupIds = ['one', 'two']
+    second.deleteGroups.mockImplementationOnce(async () => {
+      groupIds.splice(0, groupIds.length, 'three')
+      throw stale()
+    })
 
-    const call = admin.deleteGroups(groupIds)
-    groupIds.splice(0, groupIds.length, 'three')
-
-    await expect(call).resolves.toEqual([deleted('one'), deleted('two')])
+    await expect(admin.deleteGroups(groupIds)).resolves.toEqual([deleted('one'), deleted('two')])
     expect(second.deleteGroups.mock.calls).toEqual([[['two']], [['two']]])
   })
 
