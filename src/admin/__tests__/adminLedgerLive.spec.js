@@ -752,11 +752,12 @@ class AdminLedgerScenario {
       })
     )
     p.items(created.resources)
-    const resources = await p.invoke(() => admin.listConfigResources({ resourceTypes: [16] }))
-    const metricsResourcePresent = resources.resources.some(
-      ({ name: key, type }) => key === resourceName && type === 16
-    )
-    expect(metricsResourcePresent).toBe(true)
+    // The listing may reach a broker that has not applied the new resource yet.
+    await p.poll(async () => {
+      const resources = await p.invoke(() => admin.listConfigResources({ resourceTypes: [16] }))
+      return resources.resources.some(({ name: key, type }) => key === resourceName && type === 16)
+    })
+    const metricsResourcePresent = true
     const described = await p.invoke(() =>
       admin.describeConfigs({
         resources: [
