@@ -17,6 +17,7 @@ const {
   connectionOpts,
   createConnectionPool,
   createTopic,
+  waitForTopicPropagation,
   newLogger,
   plainTextBrokers,
   secureRandom,
@@ -731,6 +732,8 @@ describeFloor('Kafka floor core (live)', () => {
         topics: [{ topic, numPartitions: 3, replicationFactor: 3 }],
         waitForLeaders: true,
       })
+      // The leader wait asks one broker; the metadata read below may reach any of them.
+      await waitForTopicPropagation(topic, 3)
       const metadata = await admin.fetchTopicMetadata({ topics: [topic] })
       const listed = await admin.listTopics()
       const cluster = await admin.describeCluster()

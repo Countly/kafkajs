@@ -812,11 +812,11 @@ class AdminLedgerScenario {
       await p.invoke(() =>
         admin.createPartitions({ validateOnly: true, topicPartitions: [{ topic, count: 2 }] })
       )
-    ).toBe(true)
+    ).toBeUndefined()
     expect((await metadata()).topics[0].partitions).toHaveLength(1)
     expect(
       await p.invoke(() => admin.createPartitions({ topicPartitions: [{ topic, count: 2 }] }))
-    ).toBe(true)
+    ).toBeUndefined()
     expect((await metadata()).topics[0].partitions).toHaveLength(2)
     const resource = { type: 2, name: topic }
     const configs = () =>
