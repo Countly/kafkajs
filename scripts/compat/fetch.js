@@ -12,12 +12,23 @@
  *   errors/<tag>.json                             extracted from Errors.java, plus a
  *                                                  mechanically derived `retriable` flag
  *
+ * `--source-root <dir>` reads the same files from an unpacked Apache Kafka source release
+ * instead of the network (its `gradle.properties` version must be the pinned tag), so a
+ * checksum-verified tarball is the only input.
+ *
  * It never edits tracked-apis.json: adopting a new API is a human decision. It
  * does report upstream *Request.json files that tracked-apis.json does not list.
  */
 
 const fs = require('fs')
 const path = require('path')
+
+/**
+ * Where upstream files are read from, by repository-relative path.
+ * @typedef {object} Source
+ * @property {(repoPath: string) => Promise<string>} read the file's text; rejects when absent
+ * @property {(repoPath: string) => Promise<string|null>} readIfExists the file's text, or `null`
+ */
 
 const RAW = 'https://raw.githubusercontent.com/apache/kafka'
 const MESSAGE_PATH = 'clients/src/main/resources/common/message'
@@ -101,6 +112,69 @@ const getIfExists = async (url) => {
   return response.text()
 }
 
+/**
+ * @param {string} tag Kafka git tag
+ * @returns {Source} the tagged tree on raw.githubusercontent.com
+ */
+const networkSource = (tag) => ({
+  read: (repoPath) => get(`${RAW}/${tag}/${repoPath}`),
+  readIfExists: (repoPath) => getIfExists(`${RAW}/${tag}/${repoPath}`),
+})
+
+/**
+ * Reads `repoPath` from under `base`, following links only while they stay inside it.
+ * A link swapped in after the check is not guarded: the tree is a verified, local download.
+ * @param {string} base the real path of the source root
+ * @param {string} repoPath a repository-relative path
+ * @returns {Promise<string>} the file's text
+ * @throws {Error} for an absolute path, a `..` segment, or a link that leaves the root; the
+ *   filesystem error (`ENOENT` when absent) otherwise
+ */
+const readWithin = async (base, repoPath) => {
+  if (path.isAbsolute(repoPath) || repoPath.split(/[\\/]/).includes('..')) {
+    throw new Error(`${repoPath} is not a path inside the source root`)
+  }
+  const real = await fs.promises.realpath(path.join(base, repoPath))
+  const inside = path.relative(base, real)
+  if (inside === '..' || inside.startsWith(`..${path.sep}`) || path.isAbsolute(inside)) {
+    throw new Error(`${repoPath} resolves outside the source root`)
+  }
+  return fs.promises.readFile(real, 'utf8')
+}
+
+/**
+ * @param {string} root an unpacked Apache Kafka source release; a missing root rejects, it is not
+ *   an absent file
+ * @returns {Source} that tree, read from disk; neither reader leaves the root, see `readWithin`
+ */
+const localSource = (root) => ({
+  read: async (repoPath) => readWithin(await fs.promises.realpath(root), repoPath),
+  readIfExists: async (repoPath) => {
+    const base = await fs.promises.realpath(root)
+    try {
+      return await readWithin(base, repoPath)
+    } catch (error) {
+      if (error.code === 'ENOENT') return null
+      throw error
+    }
+  },
+})
+
+/**
+ * @param {Source} source a local source release
+ * @param {string} tag the tag the snapshot is pinned to
+ * @returns {Promise<void>}
+ * @throws {Error} when the tree's `gradle.properties` names another version, or none
+ */
+const assertSourceVersion = async (source, tag) => {
+  const found = /^version=(\S+)$/m.exec((await source.readIfExists('gradle.properties')) || '')
+  if (found === null || found[1] !== tag) {
+    throw new Error(
+      `--source-root holds ${found === null ? 'no version' : found[1]}, not the pinned ${tag}`
+    )
+  }
+}
+
 /** The direct superclass simple name from one Java `class X extends Y` declaration, or `null`. */
 const parseExtendsClause = (source) => {
   const match = source.match(/\bclass\s+\S+\s+extends\s+([A-Za-z0-9_.]+)/)
@@ -125,15 +199,18 @@ const resolvesToRetriable = (name, extendsByName, seen = new Set()) => {
 }
 
 /**
- * Fetches the source of exception class `name`, per the resolution order documented on
+ * Reads the source of exception class `name`, per the resolution order documented on
  * `resolveExceptionHierarchy`: the common `errors` package, then `overridePaths`.
+ * @param {Source} source
+ * @param {string} name
+ * @param {Record<string, string>} overridePaths
  * @returns {Promise<string|null>} the Java source, or `null` if neither location has it.
  */
-const fetchExceptionSource = async (tag, name, overridePaths) => {
-  const defaultSource = await getIfExists(`${RAW}/${tag}/${EXCEPTIONS_DIR}/${name}.java`)
+const fetchExceptionSource = async (source, name, overridePaths) => {
+  const defaultSource = await source.readIfExists(`${EXCEPTIONS_DIR}/${name}.java`)
   if (defaultSource !== null) return defaultSource
   const overridePath = overridePaths[name]
-  return overridePath === undefined ? null : getIfExists(`${RAW}/${tag}/${overridePath}`)
+  return overridePath === undefined ? null : source.readIfExists(overridePath)
 }
 
 /**
@@ -147,9 +224,15 @@ const fetchExceptionSource = async (tag, name, overridePaths) => {
  * @param {string} tag Kafka git tag to fetch from.
  * @param {string[]} exceptionNames distinct exception class names (`Errors.java`'s `exception` field).
  * @param {Record<string, string>} overridePaths `exceptionPaths.json`: class name -> repo-relative path.
+ * @param {Source} [source] where the classes are read from; the tagged GitHub tree by default.
  * @returns {Promise<Map<string, boolean>>} exception name -> `retriable`.
  */
-const resolveExceptionHierarchy = async (tag, exceptionNames, overridePaths) => {
+const resolveExceptionHierarchy = async (
+  tag,
+  exceptionNames,
+  overridePaths,
+  source = networkSource(tag)
+) => {
   const extendsByName = new Map()
   const unresolved = []
   const queue = [...new Set(exceptionNames)]
@@ -159,12 +242,12 @@ const resolveExceptionHierarchy = async (tag, exceptionNames, overridePaths) => 
     const name = queue.shift()
     if (name === RETRIABLE_EXCEPTION || JAVA_LANG_EXCEPTION_ROOTS.has(name)) continue
 
-    const source = await fetchExceptionSource(tag, name, overridePaths)
-    if (source === null) {
+    const javaSource = await fetchExceptionSource(source, name, overridePaths)
+    if (javaSource === null) {
       unresolved.push(name)
       continue
     }
-    const parent = parseExtendsClause(source)
+    const parent = parseExtendsClause(javaSource)
     extendsByName.set(name, parent)
     if (parent !== null && !queued.has(parent)) {
       queued.add(parent)
@@ -222,27 +305,42 @@ const safeDiscover = async (tag, files) => {
   }
 }
 
+/**
+ * @param {string[]} argv the command-line arguments after the script name
+ * @returns {string|null} the value of `--source-root <dir>` or `--source-root=<dir>`, if given
+ * @throws {Error} when the flag has no value
+ */
+const sourceRootOf = (argv) => {
+  const at = argv.findIndex((arg) => arg === '--source-root' || arg.startsWith('--source-root='))
+  if (at === -1) return null
+  const value = argv[at].includes('=') ? argv[at].slice(argv[at].indexOf('=') + 1) : argv[at + 1]
+  if (!value || value.startsWith('--')) throw new Error('--source-root needs a directory')
+  return value
+}
+
 const main = async () => {
   const root = __dirname
   const config = JSON.parse(fs.readFileSync(path.join(root, 'config.json'), 'utf8'))
   const trackedApis = JSON.parse(fs.readFileSync(path.join(root, 'tracked-apis.json'), 'utf8'))
   const tag = config.kafkaTag
   const files = messageFiles(trackedApis.tracked)
+  const sourceRoot = sourceRootOf(process.argv)
+  const source = sourceRoot === null ? networkSource(tag) : localSource(sourceRoot)
+  if (sourceRoot !== null) await assertSourceVersion(source, tag)
 
   const messagesDir = path.join(root, 'messages', tag)
   const errorsDir = path.join(root, 'errors')
   fs.mkdirSync(messagesDir, { recursive: true })
   fs.mkdirSync(errorsDir, { recursive: true })
 
-  console.log(`fetching ${files.length} message definitions from apache/kafka@${tag}`)
+  console.log(`reading ${files.length} message definitions from apache/kafka@${tag}`)
   for (const name of files) {
-    const body = await get(`${RAW}/${tag}/${MESSAGE_PATH}/${name}`)
-    fs.writeFileSync(path.join(messagesDir, name), body)
+    fs.writeFileSync(path.join(messagesDir, name), await source.read(`${MESSAGE_PATH}/${name}`))
     console.log(`  ${name}`)
   }
 
-  console.log(`fetching ${ERRORS_PATH}`)
-  const errors = parseErrorsJava(await get(`${RAW}/${tag}/${ERRORS_PATH}`))
+  console.log(`reading ${ERRORS_PATH}`)
+  const errors = parseErrorsJava(await source.read(ERRORS_PATH))
   if (errors.length < 100) {
     throw new Error(`Errors.java: only ${errors.length} constants parsed, the file shape changed`)
   }
@@ -250,7 +348,12 @@ const main = async () => {
   const exceptionPaths = JSON.parse(fs.readFileSync(path.join(root, 'exceptionPaths.json'), 'utf8'))
   const exceptionNames = errors.map((error) => error.exception).filter((name) => name !== null)
   console.log(`resolving the exception hierarchy for ${exceptionNames.length} classes`)
-  const retriableByException = await resolveExceptionHierarchy(tag, exceptionNames, exceptionPaths)
+  const retriableByException = await resolveExceptionHierarchy(
+    tag,
+    exceptionNames,
+    exceptionPaths,
+    source
+  )
   const errorsWithRetriable = errors.map((error) => ({
     ...error,
     retriable: error.exception === null ? false : retriableByException.get(error.exception),
@@ -265,10 +368,16 @@ const main = async () => {
     }`
   )
 
-  if (process.argv.indexOf('--no-discover') === -1) await safeDiscover(tag, files)
+  if (sourceRoot === null && process.argv.indexOf('--no-discover') === -1) {
+    await safeDiscover(tag, files)
+  }
 }
 
 module.exports = {
+  networkSource,
+  localSource,
+  assertSourceVersion,
+  sourceRootOf,
   parseErrorsJava,
   joinJavaString,
   messageFiles,

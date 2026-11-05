@@ -63,7 +63,13 @@ const MANIFEST = {
   ],
   deleteGroups: [
     ...stems('deleteGroupsRequest', [2], ['basic']),
+    ...stems('deleteGroupsRequest', [3], ['basic', 'empty', 'nonAscii']),
     ...stems('deleteGroupsResponse', [2], ['ok', 'error']),
+    ...stems(
+      'deleteGroupsResponse',
+      [3],
+      ['ok', 'error', 'nullEmptyNonempty', 'mixedOutcomes', 'nonAscii', 'noResults', 'unknownTags']
+    ),
   ],
   describeAcls: [
     ...stems('describeAclsRequest', [2], [...ACL_BASIC, 'anyFilter']),
@@ -199,6 +205,7 @@ const compact = (text) => int(text.length + 1, 1) + Buffer.from(text).toString('
 const count = (elements) => int(elements + 1, 1)
 
 const TAGS = '00' // an empty tag buffer ends every flexible struct
+const UNKNOWN_TAG = '01' + '07' + '02' + 'aabb' // a tag buffer of one field: tag 7, two bytes
 const TOPIC = 'test-topic'
 const OTHER = 'other-topic'
 const THROTTLE = int(25, 4) // ThrottleTimeMs
@@ -492,6 +499,33 @@ const PINNED = [
     'deleteGroups',
     'deleteGroupsRequest-v2-basic',
     count(2) + compact('test-group') + compact('other-group') + TAGS,
+  ],
+  // DeleteGroups v3: the request body is v2's; the response adds a nullable ErrorMessage after each
+  // ErrorCode, 00 for null and 01 for empty, and a tag buffer closes every struct.
+  [
+    'deleteGroups',
+    'deleteGroupsRequest-v3-basic',
+    count(2) + compact('test-group') + compact('other-group') + TAGS,
+  ],
+  ['deleteGroups', 'deleteGroupsRequest-v3-empty', count(0) + TAGS],
+  [
+    'deleteGroups',
+    'deleteGroupsResponse-v3-nullEmptyNonempty',
+    THROTTLE +
+      count(3) +
+      (compact('test-group') + int(0, 2) + NULL_COMPACT + TAGS) +
+      (compact('other-group') + int(134, 2) + compact('') + TAGS) +
+      (compact('third-group') + int(134, 2) + compact('cleanup failed') + TAGS) +
+      TAGS,
+  ],
+  [
+    'deleteGroups',
+    'deleteGroupsResponse-v3-unknownTags',
+    THROTTLE +
+      count(2) +
+      (compact('test-group') + int(0, 2) + NULL_COMPACT + UNKNOWN_TAG) +
+      (compact('other-group') + int(134, 2) + compact('cleanup failed') + UNKNOWN_TAG) +
+      UNKNOWN_TAG,
   ],
   // ACLs: a USER resource is resource type 7.
   [
@@ -809,8 +843,8 @@ const ELR_CASES = [
 ]
 
 describe('Java message vectors > admin and classic group APIs', () => {
-  test('the manifest names one hundred and fifty-eight vectors', () => {
-    expect(ENTRIES).toHaveLength(158)
+  test('the manifest names one hundred and sixty-eight vectors', () => {
+    expect(ENTRIES).toHaveLength(168)
   })
 
   test.each(ENTRIES)('$name is on disk and is what its name says', ({ api, name }) => {

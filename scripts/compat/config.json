@@ -1,5 +1,5 @@
 {
-  "kafkaTag": "4.3.1",
+  "kafkaTag": "4.4.0",
   "schemaVersion": 1,
   "outputs": {
     "markdown": "docs/KafkaCompatibility.md",

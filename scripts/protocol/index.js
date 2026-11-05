@@ -6,7 +6,7 @@
  *
  *   npm run protocol:generate   rewrite src/protocol/flexibleVersions.js from the snapshot and
  *                               scripts/protocol/provenance.json from the snapshot, the fixtures
- *                               and the Java generators
+ *                               and scripts/protocol/javaVectorSources.json
  *   npm run protocol:check      regenerate in memory, diff against the committed files, check the
  *                               codec census, the agreement of every schema with its place, the
  *                               goldens, the fixture records and the provenance; report and exit 1

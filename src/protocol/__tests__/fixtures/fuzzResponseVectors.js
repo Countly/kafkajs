@@ -119,6 +119,11 @@ const PROJECTIONS = {
   createDelegationToken: {
     fields: ({ hmac, ...fields }) => ({ ...fields, hmac: hmac.$bytes }),
   },
+  // the two keys that describe the unknown tagged field every struct of one vector carries are
+  // not values a decoder returns
+  deleteGroups: {
+    fields: ({ unknownTag, unknownTagBytes, ...fields }) => fields,
+  },
   describeDelegationToken: {
     fields: (fields) => ({
       ...fields,

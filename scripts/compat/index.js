@@ -8,7 +8,8 @@
  *   npm run compat:check      regenerate in memory, diff against the committed files, run the
  *                             drift checks, print a report, exit 1 on any failure (--json for
  *                             machine output)
- *   npm run compat:fetch      refresh the committed snapshot from the pinned tag (network)
+ *   npm run compat:fetch      refresh the committed snapshot from the pinned tag (network), or, with
+ *                             `-- --source-root <dir>`, from an unpacked source release (offline)
  *
  * Nothing here reads or writes anything under src/ — this is inventory only.
  */
@@ -213,7 +214,9 @@ const main = async () => {
     await require('./fetch').run()
     return 0
   }
-  console.error('usage: node scripts/compat generate | check [--json] | fetch')
+  console.error(
+    'usage: node scripts/compat generate | check [--json] | fetch [--source-root <dir>]'
+  )
   return 1
 }
 

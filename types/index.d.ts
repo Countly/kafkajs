@@ -1947,6 +1947,8 @@ export type DeleteGroupsResult = {
   groupId: string
   errorCode?: number
   error?: KafkaJSProtocolError
+  /** The broker's message for the group: DeleteGroups v3 and later; `null` when it sent none. */
+  errorMessage?: string | null
 }
 
 export type ConsumerEvents = {

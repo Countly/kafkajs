@@ -59,7 +59,7 @@ const COUNTS = {
   createPartitions: 6,
   createTopics: 12,
   deleteAcls: 4,
-  deleteGroups: 2,
+  deleteGroups: 9,
   deleteRecords: 3,
   deleteTopics: 16,
   describeAcls: 4,

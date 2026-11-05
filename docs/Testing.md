@@ -127,6 +127,8 @@ The exit gate (`.github/workflows/gate.yml`, with its checks in `scripts/ci/gate
 | e2e-admin-logdirs | `docker-compose.logdirs.yml` | `ADMIN_LOGDIRS_E2E` | nothing; the brokers format both directories |
 | e2e-admin-tiered | `docker-compose.tiered.yml` | `ADMIN_TIERED_E2E` | the Kafka 4.3.1 storage test jar from Maven Central, checked against its SHA-256, and a remote-tier directory shared by the brokers |
 
+DeleteGroups v3: `KAFKA_VERSION=4.4.0 npm run test:e2e:delete-groups-v3`; repeat on 4.3.1 for the old-version control. The scenario deletes a stopped group that holds a committed offset and checks the result, the group's absence and its missing commit, then refuses a missing group and a group with a member under their own ids; at v3 each result carries `errorMessage`, at v2 it does not. This command uses the sole cluster guard and requires observed-version evidence.
+
 ### Scenario lanes
 
 A scenario that holds with no fault injected runs on two lanes from one file: `describe.each(lanes())` from `testHelpers` gives it `fake` (the unit lane, in process) or `docker` (under `npm run test:kafka`, which exports `KAFKAJS_LANE=docker`), and `KAFKAJS_SCENARIO_LANES=fake,docker` asks for both. A scenario that injects a fault (a held answer, a dropped frame) runs on the fake lane unless the fault can be injected on a live cluster too.

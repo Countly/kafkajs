@@ -1,0 +1,7 @@
+{
+  "message": "DeleteGroupsResponse",
+  "version": 3,
+  "case": "nullEmptyNonempty",
+  "hex": "00000019040b746573742d67726f7570000000000c6f746865722d67726f7570008601000c74686972642d67726f757000860f636c65616e7570206661696c65640000",
+  "fields": { "throttleTime": 25, "results": [{ "groupId": "test-group", "errorCode": 0, "errorMessage": null }, { "groupId": "other-group", "errorCode": 134, "errorMessage": "" }, { "groupId": "third-group", "errorCode": 134, "errorMessage": "cleanup failed" }] }
+}

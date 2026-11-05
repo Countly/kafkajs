@@ -1822,14 +1822,28 @@ module.exports = ({
     createGroupDescriptions({ cluster, retry, logger: rootLogger }).describe(groupIds, options)
 
   /**
-   * Delete groups in a broker
+   * Delete groups, each through its own group coordinator.
+   *
+   * A broker that speaks DeleteGroups v3 answers a message per group. It is kept as `errorMessage`
+   * (`null` when the broker sent none, `''` when it sent an empty one) on each result and on each
+   * failed group of the `KafkaJSDeleteGroupsError` that rejects the call; older brokers omit the
+   * property. A group that failed rejects the call once, with every failed group, and is not
+   * retried.
+   *
+   * Every coordinator's request settles before a retry. When one coordinator is stale or
+   * unavailable, the retry resends only the groups no coordinator has answered, so a group that was
+   * deleted is never sent again, and its row is kept for the result. Rows come back by attempt,
+   * then by coordinator.
    *
    * @param {string[]} [groupIds]
    * @return {Promise<DeleteGroups>}
+   * @throws {KafkaJSDeleteGroupsError} `groups` holds `{ groupId, errorCode, error, errorMessage? }`
+   *   for each group that failed
    *
    * @typedef {Array} DeleteGroups
    * @property {string} groupId
    * @property {number} errorCode
+   * @property {string|null} [errorMessage] the broker's message for the group (DeleteGroups v3+)
    */
   const deleteGroups = async (groupIds) => {
     if (!groupIds || !Array.isArray(groupIds)) {
@@ -1843,32 +1857,32 @@ module.exports = ({
     }
 
     const retrier = retrierOf(retry)
-
-    let results = []
-
-    let clonedGroupIds = groupIds.slice()
+    const requested = groupIds.slice()
+    const rowsByNode = {}
+    const answered = new Set()
 
     return retrier(async (bail, retryCount, retryTime) => {
       try {
-        if (clonedGroupIds.length === 0) return []
+        const pending = requested.filter((groupId) => !answered.has(groupId))
 
-        checked(await waitOf(async () => cluster.refreshMetadata()))
+        if (pending.length > 0) {
+          checked(await waitOf(async () => cluster.refreshMetadata()))
 
-        const brokersPerGroups = {}
-        const brokersPerNode = {}
-        for (const groupId of clonedGroupIds) {
-          const broker = checked(
-            await waitOf(async () => cluster.findGroupCoordinator({ groupId }))
-          )
-          if (brokersPerGroups[broker.nodeId] === undefined) brokersPerGroups[broker.nodeId] = []
-          brokersPerGroups[broker.nodeId].push(groupId)
-          brokersPerNode[broker.nodeId] = broker
-        }
+          const brokersPerGroups = {}
+          const brokersPerNode = {}
+          for (const groupId of pending) {
+            const broker = checked(
+              await waitOf(async () => cluster.findGroupCoordinator({ groupId }))
+            )
+            if (brokersPerGroups[broker.nodeId] === undefined) brokersPerGroups[broker.nodeId] = []
+            brokersPerGroups[broker.nodeId].push(groupId)
+            brokersPerNode[broker.nodeId] = broker
+          }
 
-        const res = checked(
-          await waitOf(async () =>
-            Promise.all(
-              Object.keys(brokersPerNode).map(async (nodeId) =>
+          const nodeIds = Object.keys(brokersPerNode)
+          const outcomes = checked(
+            await Promise.allSettled(
+              nodeIds.map(async (nodeId) =>
                 checked(
                   await waitOf(async () =>
                     brokersPerNode[nodeId].deleteGroups(brokersPerGroups[nodeId])
@@ -1877,21 +1891,30 @@ module.exports = ({
               )
             )
           )
-        )
 
-        const errors = res
-          .flatMap(({ results }) =>
-            results.map(({ groupId, errorCode, error }) => {
-              return { groupId, errorCode, error }
-            })
-          )
+          outcomes.forEach((outcome, index) => {
+            if (outcome.status !== 'fulfilled') return
+            const nodeId = nodeIds[index]
+            rowsByNode[nodeId] = [...(rowsByNode[nodeId] || []), ...outcome.value.results]
+            for (const groupId of brokersPerGroups[nodeId]) answered.add(groupId)
+          })
+
+          const rejected = outcomes.find(({ status }) => status === 'rejected')
+          if (rejected) throw rejected.reason
+        }
+
+        // Rows keep coordinator order, as a single attempt returns them, whichever attempt answered.
+        const results = Object.keys(rowsByNode).flatMap((nodeId) => rowsByNode[nodeId])
+        const errors = results
+          .map(({ groupId, errorCode, error, errorMessage }) => ({
+            groupId,
+            errorCode,
+            error,
+            ...(errorMessage !== undefined && { errorMessage }),
+          }))
           .filter(({ errorCode }) => errorCode !== 0)
 
-        clonedGroupIds = errors.map(({ groupId }) => groupId)
-
         if (errors.length > 0) throw new KafkaJSDeleteGroupsError('Error in DeleteGroups', errors)
-
-        results = res.flatMap(({ results }) => results)
 
         return results
       } catch (e) {

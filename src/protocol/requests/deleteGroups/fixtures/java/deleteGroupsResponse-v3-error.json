@@ -1,0 +1,7 @@
+{
+  "message": "DeleteGroupsResponse",
+  "version": 3,
+  "case": "error",
+  "hex": "00000019030b746573742d67726f75700044185468652067726f7570206973206e6f7420656d7074792e000c6f746865722d67726f757000451d47726f7570206f746865722d67726f7570206e6f7420666f756e642e0000",
+  "fields": { "throttleTime": 25, "results": [{ "groupId": "test-group", "errorCode": 68, "errorMessage": "The group is not empty." }, { "groupId": "other-group", "errorCode": 69, "errorMessage": "Group other-group not found." }] }
+}

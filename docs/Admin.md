@@ -1037,6 +1037,8 @@ try {
 }
 ```
 
+On brokers supporting DeleteGroups v3, each result includes `errorMessage: string | null`. Failed results in `KafkaJSDeleteGroupsError` retain the broker's per-group message. Older versions omit this optional field. The existing rejection and retry contracts are unchanged, except that a retry sends only the groups no coordinator has answered yet, so a group that was deleted is never sent again.
+
 ## <a name="remove-members"></a> Remove members from a consumer group
 
 Remove members from a group that no longer has the instances behind them, for example a static member whose pod is gone and whose slot would otherwise hold its partitions until `sessionTimeout` passes. It is not a way to stop a consumer: a member that is still running rejoins on its next heartbeat.

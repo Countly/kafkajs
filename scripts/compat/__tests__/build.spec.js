@@ -1,5 +1,7 @@
 'use strict'
 
+const fs = require('fs')
+const path = require('path')
 const { buildModel, toJsonArtifact, serializeJson, asciiCompare } = require('../build')
 const trackedApis = require('../tracked-apis.json')
 const config = require('../config.json')
@@ -79,5 +81,49 @@ describe('scripts/compat/build', () => {
   it('asciiCompare orders mixed-case and underscore keys byte-wise, not locale-aware', () => {
     const input = ['b_b', 'B_A', 'a', 'Z', 'A_B']
     expect(input.slice().sort(asciiCompare)).toEqual(['A_B', 'B_A', 'Z', 'a', 'b_b'])
+  })
+
+  describe('the pinned baseline', () => {
+    const REPO = path.join(__dirname, '..', '..', '..')
+    const read = (...parts) => fs.readFileSync(path.join(REPO, ...parts), 'utf8')
+
+    it('is Apache Kafka 4.4.0', () => {
+      expect(config.kafkaTag).toBe('4.4.0')
+    })
+
+    it('is the tag of the message snapshot, the error snapshot and every generated file', () => {
+      const tag = config.kafkaTag
+
+      expect(
+        fs.existsSync(path.join(__dirname, '..', 'messages', tag, 'DeleteGroupsResponse.json'))
+      ).toBe(true)
+      expect(JSON.parse(read('scripts', 'compat', 'errors', `${tag}.json`)).kafkaTag).toBe(tag)
+      expect(JSON.parse(read('docs', 'kafka-compatibility.json')).generatedFrom.kafkaTag).toBe(tag)
+      expect(read('docs', 'KafkaCompatibility.md')).toContain(
+        `Apache Kafka **${tag}** message definitions`
+      )
+      expect(read('src', 'protocol', 'flexibleVersions.js')).toContain(
+        `Generated from the Apache Kafka ${tag} message definitions`
+      )
+      const provenance = JSON.parse(read('scripts', 'protocol', 'provenance.json'))
+      expect(new Set(Object.values(provenance).map((entry) => entry.kafkaTag))).toEqual(
+        new Set([tag])
+      )
+    })
+
+    it('keeps the 4.3.1 snapshots beside it, with the same files as the pinned one', () => {
+      const names = (tag) => fs.readdirSync(path.join(__dirname, '..', 'messages', tag)).sort()
+
+      expect(names('4.3.1')).toEqual(names(config.kafkaTag))
+      expect(fs.existsSync(path.join(__dirname, '..', 'errors', '4.3.1.json'))).toBe(true)
+    })
+
+    it('reports DeleteGroups at the 4.4.0 maximum, 3', () => {
+      const api = model.apis.find((candidate) => candidate.kafkaName === 'DeleteGroups')
+
+      expect(api.validVersions).toEqual([0, 3])
+      expect(api.forkVersions).toEqual([0, 1, 2, 3])
+      expect(api.gap).toBe('current')
+    })
   })
 })

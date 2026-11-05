@@ -1,0 +1,7 @@
+{
+  "message": "DeleteGroupsRequest",
+  "version": 3,
+  "case": "basic",
+  "hex": "030b746573742d67726f75700c6f746865722d67726f757000",
+  "fields": { "groupIds": ["test-group", "other-group"] }
+}

@@ -2214,10 +2214,14 @@ module.exports = class Broker {
   }
 
   /**
-   * Send request to delete groups
+   * Send request to delete groups, at the highest DeleteGroups version both sides offer.
+   *
+   * Each result carries `groupId` and `errorCode`, and `error` when the code is a failure. From v3
+   * it also carries the broker's `errorMessage` (`null` when it sent none); older versions omit it.
    * @param {string[]} groupIds
    * @public
-   * @returns {Promise}
+   * @returns {Promise<{ throttleTimeMs: number, clientSideThrottleTime?: number,
+   *   results: { groupId: string, errorCode: number, errorMessage?: string|null, error?: Error }[] }>}
    */
   async deleteGroups(groupIds) {
     const deleteGroups = this.lookupRequest(apiKeys.DeleteGroups, requests.DeleteGroups)

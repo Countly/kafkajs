@@ -1,12 +1,12 @@
 # Kafka protocol compatibility
 
-Generated from the committed Apache Kafka **4.3.1** message definitions in `scripts/compat/messages/4.3.1/`. **Do not edit by hand** — run `npm run compat:generate`; `npm run compat:check` fails when this file and the generator disagree.
+Generated from the committed Apache Kafka **4.4.0** message definitions in `scripts/compat/messages/4.4.0/`. **Do not edit by hand** — run `npm run compat:generate`; `npm run compat:check` fails when this file and the generator disagree.
 
 Gap classes: `current` (fork max equals the Kafka max) · `behind:N` · `stub` (the key is known but unimplemented) · `missing` (planned, no codec) · `not-planned`. `on-floor` and `below-floor` are reported alongside the class, not instead of it.
 
 ## Summary
 
-| API | Key | Kafka 4.3.1 | Flexible from | Fork | Gap | Notes |
+| API | Key | Kafka 4.4.0 | Flexible from | Fork | Gap | Notes |
 |---|--:|---|---|---|---|---|
 | Produce | 0 | 3-13 | v9+ | 3-13 | current | v8 per-record errors (KIP-467), v9 flexible, v10 leader hints (KIP-951), v11 TRANSACTION_ABORTABLE (KIP-890), v12 transaction-version-2 implicit add-partitions (KIP-890 part 2), v13 topic IDs (KIP-516, Kafka 4.1; may return UNKNOWN_TOPIC_ID). |
 | Fetch | 1 | 4-18 | v12+ | 4-18 | current | v11 rack / preferred read replica (KIP-392), now fully handled: OFFSET_NOT_AVAILABLE (78) skips the partition for one round and keeps the follower, and an OFFSET_OUT_OF_RANGE from a follower drops the preferred replica and re-resolves against the leader. v12 flexible + LastFetchedEpoch (sent at its -1 default; truncation is detected through OffsetForLeaderEpoch instead), v13 topic IDs replace names (KIP-516; a request whose topics are not all known by id is capped at v12), v14 OFFSET_MOVED_TO_TIERED_STORAGE (KIP-405), v15 ReplicaState (KIP-903), v16 leader hints (KIP-951), v17 ReplicaDirectoryId (KIP-853), v18 HighWatermark (KIP-1166). Fetch sessions (KIP-227) are supported with `fetchSessions: true` and remain opt-in by default. With `fetchSessions: false`, every fetch is a full fetch (sessionId 0, sessionEpoch -1); sparse session replies use the complete per-request topic mapping and all decoder bounds. |
@@ -22,7 +22,7 @@ Gap classes: `current` (fork max equals the Kafka max) · `behind:N` · `stub` (
 | DescribeGroups | 15 | 0-6 | v5+ | 0-6 | current | v3 IncludeAuthorizedOperations/AuthorizedOperations (KIP-430), v4 member GroupInstanceId (KIP-345), v5 flexible, v6 per-group ErrorMessage and GROUP_ID_NOT_FOUND for a group that does not exist (KIP-1043). Below v6 a broker reports a KIP-848 consumer-protocol group as Dead, so describing one also needs ConsumerGroupDescribe (key 69) routing. |
 | ListGroups | 16 | 0-5 | v3+ | 0-5 | current | v3 flexible, v4 StatesFilter/GroupState (KIP-518), v5 TypesFilter/GroupType (KIP-848). Java's downgrade rule applies to the filters on older brokers: a state filter needs v4, and a type filter needs v5 unless it asks only for classic (and consumer), which a broker without group types answers identically unfiltered. |
 | SaslHandshake | 17 | 0-1 | never | 0-1 | current | Never flexible: v0 and v1 are the whole API, and both are implemented. |
-| ApiVersions | 18 | 0-4 | v3+ | 0-4 | current | v0-v3 omit every SupportedFeatures entry whose MinVersion is 0 (KAFKA-17011, fixed in v4 / Kafka 3.9), so a v3-only client sees a truncated feature list. The client asks for v4 first; a broker that does not support it answers UNSUPPORTED_VERSION with the versions it has, and the client asks again at the highest one both sides implement (only a broker below 3.9 does this, and the 4.0 floor excludes them). |
+| ApiVersions | 18 | 0-5 | v3+ | 0-4 | behind:1 | v0-v3 omit every SupportedFeatures entry whose MinVersion is 0 (KAFKA-17011, fixed in v4 / Kafka 3.9), so a v3-only client sees a truncated feature list. The client asks for v4 first; a broker that does not support it answers UNSUPPORTED_VERSION with the versions it has, and the client asks again at the highest one both sides implement (only a broker below 3.9 does this, and the 4.0 floor excludes them). |
 | CreateTopics | 19 | 2-7 | v5+ | 2-7 | current | v5 flexible, v7 returns topic IDs. |
 | DeleteTopics | 20 | 1-6 | v4+ | 1-6 | current | v6 can delete by topic ID; the fork sends each topic name with the zero uuid, as the Java client does when it is given names. |
 | DeleteRecords | 21 | 0-2 | v2+ | 0-2 | current |  |
@@ -32,7 +32,7 @@ Gap classes: `current` (fork max equals the Kafka max) · `behind:N` · `stub` (
 | AddOffsetsToTxn | 25 | 0-4 | v3+ | 0-4 | current | v2 PRODUCER_FENCED, v3 flexible, v4 TRANSACTION_ABORTABLE (KIP-890). Under transaction version 2 (KIP-890 part 2) a client does not send it: TxnOffsetCommit v5 adds the offsets implicitly. |
 | EndTxn | 26 | 0-5 | v3+ | 0-5 | current | v2 PRODUCER_FENCED, v3 flexible, v4 TRANSACTION_ABORTABLE, v5 returns the producer id and epoch the coordinator bumped to (KIP-890 part 2). A transaction stays at v4 or below unless its coordinator finalizes transaction.version at level 2 or above in ApiVersions v3+; v5 being advertised is not the signal. |
 | WriteTxnMarkers | 27 | 1-2 | v1+ | 1-2 | current | Written by a transaction coordinator to the leaders of the partitions in a transaction, and also sent by `abortTransaction`. v1 is the 4.0 baseline and flexible; v2 adds TransactionVersion (KIP-1228). Not yet implemented. |
-| TxnOffsetCommit | 28 | 0-5 | v3+ | 0-5 | current | v2 committed leader epoch, v3 flexible with KIP-447 group metadata (generation, member id, group instance id), v4 TRANSACTION_ABORTABLE, v5 adds the offsets to the transaction itself under transaction version 2, so no AddOffsetsToTxn precedes it. A transaction stays at v4 or below unless its coordinator finalizes transaction.version at level 2 or above. |
+| TxnOffsetCommit | 28 | 0-6 | v3+ | 0-5 | behind:1 | v2 committed leader epoch, v3 flexible with KIP-447 group metadata (generation, member id, group instance id), v4 TRANSACTION_ABORTABLE, v5 adds the offsets to the transaction itself under transaction version 2, so no AddOffsetsToTxn precedes it. A transaction stays at v4 or below unless its coordinator finalizes transaction.version at level 2 or above. |
 | DescribeAcls | 29 | 1-3 | v2+ | 1-3 | current | v1 is the 4.x floor; v3 adds the USER resource type, and every 4.x broker offers v1 to v3. |
 | CreateAcls | 30 | 1-3 | v2+ | 1-3 | current | v1 is the 4.x floor; v3 adds the USER resource type, and every 4.x broker offers v1 to v3. |
 | DeleteAcls | 31 | 1-3 | v2+ | 1-3 | current | v1 is the 4.x floor; v3 adds the USER resource type, and every 4.x broker offers v1 to v3. |
@@ -46,7 +46,7 @@ Gap classes: `current` (fork max equals the Kafka max) · `behind:N` · `stub` (
 | RenewDelegationToken | 39 | 1-2 | v2+ | 1-2 | current |  |
 | ExpireDelegationToken | 40 | 1-2 | v2+ | 1-2 | current |  |
 | DescribeDelegationToken | 41 | 1-3 | v2+ | 1-3 | current |  |
-| DeleteGroups | 42 | 0-2 | v2+ | 0-2 | current |  |
+| DeleteGroups | 42 | 0-3 | v2+ | 0-3 | current |  |
 | ElectLeaders | 43 | 0-2 | v2+ | 0-2 | current |  |
 | IncrementalAlterConfigs | 44 | 0-1 | v1+ | 0-1 | current | The merge-semantics alternative to AlterConfigs: each config entry names a SET, DELETE, APPEND or SUBTRACT, so the entries a request leaves out are untouched. |
 | AlterPartitionReassignments | 45 | 0-1 | v0+ | 0-1 | current | v0 is flexible (KIP-455). v1 implements AllowReplicationFactorChange (KIP-860), which defaults to true, preserving v0 behavior. Setting allowReplicationFactorChange to false requires v1 and rejects before sending on a v0-only broker. |
@@ -90,15 +90,15 @@ Not per-API, and not derivable from the message definitions. Each row names who 
 
 ## Error table
 
-`src/protocol/error.js` defines 134 codes; Kafka 4.3.1 defines 134 (excluding `NONE`, which is the success sentinel). `retriable` is derived from each error's exception hierarchy upstream and checked against this table: a mismatch is a failure.
+`src/protocol/error.js` defines 137 codes; Kafka 4.4.0 defines 137 (excluding `NONE`, which is the success sentinel). `retriable` is derived from each error's exception hierarchy upstream and checked against this table: a mismatch is a failure.
 
 - Defined upstream, missing here: **0** (reported, not a failure).
-- Defined here, unknown to Kafka 4.3.1: **0** (a failure).
+- Defined here, unknown to Kafka 4.4.0: **0** (a failure).
 - Type-name mismatches on a shared code: **0** (a failure), plus **5** accepted historical aliases.
 
 Accepted aliases (the KafkaJS name is public API and is deliberately kept):
 
-| Code | This client | Kafka 4.3.1 | Why |
+| Code | This client | Kafka 4.4.0 | Why |
 |--:|---|---|---|
 | -1 | UNKNOWN | UNKNOWN_SERVER_ERROR | KafkaJS has exposed this name as KafkaJSProtocolError.type since 1.x; renaming it is a breaking public-API change. |
 | 6 | NOT_LEADER_FOR_PARTITION | NOT_LEADER_OR_FOLLOWER | Kafka renamed the constant in 2.6 (KIP-392); the KafkaJS name is public API. |

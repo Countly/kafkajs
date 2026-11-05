@@ -1,0 +1,7 @@
+{
+  "message": "DeleteGroupsResponse",
+  "version": 3,
+  "case": "noResults",
+  "hex": "000000190100",
+  "fields": { "throttleTime": 25, "results": [] }
+}

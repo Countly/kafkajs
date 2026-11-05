@@ -88,6 +88,7 @@ import org.apache.kafka.common.message.TxnOffsetCommitResponseData;
 import org.apache.kafka.common.protocol.ByteBufferAccessor;
 import org.apache.kafka.common.protocol.Message;
 import org.apache.kafka.common.protocol.ObjectSerializationCache;
+import org.apache.kafka.common.protocol.types.RawTaggedField;
 
 /**
  * Generates golden byte vectors for the APIs the KIP-848 consumer protocol and its admin surface,
@@ -224,6 +225,15 @@ public final class GenerateMessageVectors {
   private static final short INVALID_REQUEST = 42;
   private static final short NON_EMPTY_GROUP = 68;
   private static final short TOPIC_DELETION_DISABLED = 73;
+  private static final short GROUP_DELETION_FAILED = 134;
+
+  /** A group id and a message that are not ASCII: "gruppe-é-日本" and "résumé ✓ failed". */
+  private static final String NON_ASCII_GROUP_ID = "gruppe-\u00e9-\u65e5\u672c";
+  private static final String NON_ASCII_MESSAGE = "r\u00e9sum\u00e9 \u2713 failed";
+
+  /** The unknown tagged field the {@code unknownTags} DeleteGroups vector writes into every struct. */
+  private static final int UNKNOWN_TAG = 7;
+  private static final byte[] UNKNOWN_TAG_DATA = {(byte) 0xaa, (byte) 0xbb};
 
   /** The ACL the {@code basic} cases carry, and the same on a {@code USER} resource (v3). */
   private static final Acl TOPIC_ACL =
@@ -357,9 +367,9 @@ public final class GenerateMessageVectors {
     List<Vector> vectors = new ArrayList<>();
 vectors.add(new Vector("describeProducers", "DescribeProducersRequest", (short) 0, "basic",
 new DescribeProducersRequestData()
-.setTopics(Arrays.asList(new DescribeProducersRequestData.TopicRequest()
+.setTopics(new DescribeProducersRequestData.TopicRequestCollection(Arrays.asList(new DescribeProducersRequestData.TopicRequest()
 .setName("orders")
-.setPartitionIndexes(Arrays.asList(0, 2)))),
+.setPartitionIndexes(Arrays.asList(0, 2))).iterator())),
 "{\"topics\":[{\"topic\":\"orders\",\"partitions\":[0,2]}]}"));
 vectors.add(new Vector("describeProducers", "DescribeProducersResponse", (short) 0, "ok",
 new DescribeProducersResponseData()
@@ -2390,7 +2400,7 @@ new ListConfigResourcesResponseData()
             .setGroupId(GROUP_ID)
             .setProducerId(PRODUCER_ID)
             .setProducerEpoch(PRODUCER_EPOCH)
-            .setGenerationId(generationId)
+            .setGenerationIdOrMemberEpoch(generationId)
             .setMemberId(memberId)
             .setGroupInstanceId(groupInstanceId)
             .setTopics(
@@ -3381,9 +3391,12 @@ new ListConfigResourcesResponseData()
   }
 
   /**
-   * DeleteGroups (42) v2, request and response: v1's body in flexible framing. Two groups are
-   * deleted; the answer is both deleted ({@code ok}) or one refused as non-empty and one unknown
-   * ({@code error}).
+   * DeleteGroups (42) v2 and v3, request and response. v2 is v1's body in flexible framing: two
+   * groups are deleted; the answer is both deleted ({@code ok}) or one refused as non-empty and one
+   * unknown ({@code error}). v3 keeps the request body and gives each result a nullable
+   * {@code ErrorMessage} after its error code: the cases pin a null, an empty and a non-empty
+   * message apart, a success beside one failure of each kind, non-ASCII text, an empty list, and
+   * one unknown tagged field in every struct.
    *
    * @return the key-42 vectors
    */
@@ -3414,7 +3427,90 @@ new ListConfigResourcesResponseData()
               obj(kv("throttleTime", num(THROTTLE_TIME_MS)), kv("results", results))));
     }
 
+    for (Object[] request : new Object[][] {
+        {"basic", List.of(GROUP_ID, OTHER_GROUP_ID)},
+        {"empty", List.<String>of()},
+        {"nonAscii", List.of(NON_ASCII_GROUP_ID, "")}}) {
+      @SuppressWarnings("unchecked")
+      List<String> groupIds = (List<String>) request[1];
+      vectors.add(
+          new Vector(api, "DeleteGroupsRequest", (short) 3, (String) request[0],
+              new DeleteGroupsRequestData().setGroupsNames(groupIds),
+              obj(kv("groupIds", strArray(groupIds)))));
+    }
+
+    vectors.add(
+        deletedV3("ok", false,
+            new Deleted(GROUP_ID, (short) 0, null), new Deleted(OTHER_GROUP_ID, (short) 0, null)));
+    vectors.add(
+        deletedV3("error", false,
+            new Deleted(GROUP_ID, NON_EMPTY_GROUP, "The group is not empty."),
+            new Deleted(OTHER_GROUP_ID, GROUP_ID_NOT_FOUND, "Group other-group not found.")));
+    vectors.add(
+        deletedV3("nullEmptyNonempty", false,
+            new Deleted(GROUP_ID, (short) 0, null),
+            new Deleted(OTHER_GROUP_ID, GROUP_DELETION_FAILED, ""),
+            new Deleted("third-group", GROUP_DELETION_FAILED, "cleanup failed")));
+    vectors.add(
+        deletedV3("mixedOutcomes", false,
+            new Deleted(GROUP_ID, (short) 0, null),
+            new Deleted(OTHER_GROUP_ID, GROUP_DELETION_FAILED, null),
+            new Deleted("third-group", GROUP_DELETION_FAILED, ""),
+            new Deleted("fourth-group", GROUP_DELETION_FAILED, "cleanup failed")));
+    vectors.add(
+        deletedV3("nonAscii", false,
+            new Deleted(NON_ASCII_GROUP_ID, GROUP_DELETION_FAILED, NON_ASCII_MESSAGE),
+            new Deleted("", (short) 0, null)));
+    vectors.add(deletedV3("noResults", false));
+    vectors.add(
+        deletedV3("unknownTags", true,
+            new Deleted(GROUP_ID, (short) 0, null),
+            new Deleted(OTHER_GROUP_ID, GROUP_DELETION_FAILED, "cleanup failed")));
+
     return vectors;
+  }
+
+  /** One DeleteGroups v3 result: its group, error code and message ({@code null} when none). */
+  private record Deleted(String groupId, short code, String message) {}
+
+  /**
+   * @param caseId the vector's case
+   * @param unknownTags whether the response and each result also carry one unknown tagged field
+   * @param results the per-group results, in order
+   * @return a DeleteGroups v3 response vector whose fixture restates the results
+   */
+  private static Vector deletedV3(String caseId, boolean unknownTags, Deleted... results) {
+    List<DeleteGroupsResponseData.DeletableGroupResult> built = new ArrayList<>();
+    List<String> restated = new ArrayList<>();
+    for (Deleted result : results) {
+      DeleteGroupsResponseData.DeletableGroupResult group =
+          deleted(result.groupId(), result.code()).setErrorMessage(result.message());
+      if (unknownTags) {
+        group.unknownTaggedFields().add(new RawTaggedField(UNKNOWN_TAG, UNKNOWN_TAG_DATA));
+      }
+      built.add(group);
+      restated.add(
+          obj(kv("groupId", str(result.groupId())), kv("errorCode", num(result.code())),
+              kv("errorMessage", str(result.message()))));
+    }
+
+    DeleteGroupsResponseData response =
+        new DeleteGroupsResponseData()
+            .setThrottleTimeMs(THROTTLE_TIME_MS)
+            .setResults(new DeleteGroupsResponseData.DeletableGroupResultCollection(built.iterator()));
+    List<String> fields =
+        new ArrayList<>(
+            List.of(
+                kv("throttleTime", num(THROTTLE_TIME_MS)),
+                kv("results", array(restated.toArray(new String[0])))));
+    if (unknownTags) {
+      response.unknownTaggedFields().add(new RawTaggedField(UNKNOWN_TAG, UNKNOWN_TAG_DATA));
+      fields.add(kv("unknownTag", num(UNKNOWN_TAG)));
+      fields.add(kv("unknownTagBytes", intArray(List.of(0xaa, 0xbb))));
+    }
+
+    return new Vector("deleteGroups", "DeleteGroupsResponse", (short) 3, caseId, response,
+        obj(fields.toArray(new String[0])));
   }
 
   /**

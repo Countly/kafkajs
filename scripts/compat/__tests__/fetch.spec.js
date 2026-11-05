@@ -1,6 +1,10 @@
 const fs = require('fs')
+const os = require('os')
 const path = require('path')
 const {
+  localSource,
+  assertSourceVersion,
+  sourceRootOf,
   parseErrorsJava,
   messageFiles,
   discover,
@@ -60,8 +64,8 @@ describe('scripts/compat/fetch', () => {
       expect(files).toContain('ProduceResponse.json')
     })
 
-    it('matches the committed snapshot exactly', () => {
-      const snapshot = fs.readdirSync(path.join(__dirname, '..', 'messages', '4.3.1')).sort()
+    it.each(['4.3.1', '4.4.0'])('matches the committed %s snapshot exactly', (tag) => {
+      const snapshot = fs.readdirSync(path.join(__dirname, '..', 'messages', tag)).sort()
       expect(files).toEqual(snapshot)
     })
   })
@@ -171,6 +175,191 @@ describe('scripts/compat/fetch', () => {
         expect(error.message).toContain('MysteryException')
         expect(error.unresolved).toEqual(['MysteryException'])
       }
+    })
+  })
+
+  describe('an unpacked source release (--source-root, no network)', () => {
+    const originalFetch = globalThis.fetch
+    const errors = 'clients/src/main/java/org/apache/kafka/common/errors'
+    let root
+
+    const write = (relative, text) => {
+      fs.mkdirSync(path.dirname(path.join(root, relative)), { recursive: true })
+      fs.writeFileSync(path.join(root, relative), text)
+    }
+
+    beforeEach(() => {
+      root = fs.mkdtempSync(path.join(os.tmpdir(), 'kafka-source-'))
+      globalThis.fetch = jest.fn()
+    })
+
+    afterEach(() => {
+      globalThis.fetch = originalFetch
+      fs.rmSync(root, { recursive: true, force: true })
+    })
+
+    it('reads a file by its repository path, and answers null for one that is absent', async () => {
+      write('a/b.json', '{"x":1}')
+
+      await expect(localSource(root).read('a/b.json')).resolves.toBe('{"x":1}')
+      await expect(localSource(root).readIfExists('a/b.json')).resolves.toBe('{"x":1}')
+      await expect(localSource(root).readIfExists('a/absent.json')).resolves.toBeNull()
+      await expect(localSource(root).read('a/absent.json')).rejects.toMatchObject({
+        code: 'ENOENT',
+      })
+    })
+
+    it('does not swallow a read that fails for another reason than absence', async () => {
+      fs.mkdirSync(path.join(root, 'a'))
+
+      await expect(localSource(root).readIfExists('a')).rejects.toMatchObject({ code: 'EISDIR' })
+    })
+
+    describe('a path that leaves the root', () => {
+      let outside
+      let secret
+
+      beforeEach(() => {
+        outside = fs.mkdtempSync(path.join(os.tmpdir(), 'kafka-outside-'))
+        secret = path.join(outside, 'secret.txt')
+        fs.writeFileSync(secret, 'outside')
+        write('a/b.json', '{"x":1}')
+      })
+
+      afterEach(() => {
+        fs.rmSync(outside, { recursive: true, force: true })
+      })
+
+      it.each(['read', 'readIfExists'])(
+        '%s refuses an absolute path and a .. path',
+        async (method) => {
+          const source = localSource(root)
+
+          await expect(source[method](secret)).rejects.toThrow(
+            'is not a path inside the source root'
+          )
+          await expect(source[method](path.relative(root, secret))).rejects.toThrow(
+            'is not a path inside the source root'
+          )
+          await expect(source[method]('a/../a/b.json')).rejects.toThrow(
+            'is not a path inside the source root'
+          )
+        }
+      )
+
+      it.each(['read', 'readIfExists'])(
+        '%s refuses a file link to a file outside',
+        async (method) => {
+          fs.symlinkSync(secret, path.join(root, 'a/link.txt'))
+
+          await expect(localSource(root)[method]('a/link.txt')).rejects.toThrow(
+            'resolves outside the source root'
+          )
+        }
+      )
+
+      it.each(['read', 'readIfExists'])(
+        '%s refuses a path through a directory link to a directory outside',
+        async (method) => {
+          fs.symlinkSync(outside, path.join(root, 'linked'), 'dir')
+
+          await expect(localSource(root)[method]('linked/secret.txt')).rejects.toThrow(
+            'resolves outside the source root'
+          )
+        }
+      )
+
+      it('follows a link that stays inside the root, and a root that is itself a link', async () => {
+        fs.symlinkSync(path.join(root, 'a/b.json'), path.join(root, 'a/inside.json'))
+        const viaLink = path.join(outside, 'root-link')
+        fs.symlinkSync(root, viaLink, 'dir')
+
+        await expect(localSource(root).read('a/inside.json')).resolves.toBe('{"x":1}')
+        await expect(localSource(viaLink).readIfExists('a/inside.json')).resolves.toBe('{"x":1}')
+      })
+
+      it('rejects a root that does not exist instead of reporting every file absent', async () => {
+        await expect(
+          localSource(path.join(root, 'missing')).readIfExists('a/b.json')
+        ).rejects.toMatchObject({ code: 'ENOENT' })
+      })
+    })
+
+    it('resolves the retriable flag through its own tree, and the override paths, without a fetch', async () => {
+      write(
+        `${errors}/UnknownTopicIdException.java`,
+        'public class UnknownTopicIdException extends InvalidMetadataException {\n}\n'
+      )
+      write(
+        `${errors}/InvalidMetadataException.java`,
+        'public class InvalidMetadataException extends RetriableException {\n}\n'
+      )
+      write(
+        `${errors}/GroupDeletionFailedException.java`,
+        'public class GroupDeletionFailedException extends ApiException {\n}\n'
+      )
+      write(
+        `${errors}/ApiException.java`,
+        'public class ApiException extends KafkaException {\n}\n'
+      )
+      write(
+        'clients/src/main/java/org/apache/kafka/common/KafkaException.java',
+        'public class KafkaException extends RuntimeException {\n}\n'
+      )
+
+      const result = await resolveExceptionHierarchy(
+        '4.4.0',
+        ['UnknownTopicIdException', 'GroupDeletionFailedException'],
+        { KafkaException: 'clients/src/main/java/org/apache/kafka/common/KafkaException.java' },
+        localSource(root)
+      )
+
+      expect(result.get('UnknownTopicIdException')).toBe(true)
+      expect(result.get('GroupDeletionFailedException')).toBe(false)
+      expect(globalThis.fetch).not.toHaveBeenCalled()
+    })
+
+    it('accepts a tree whose gradle.properties holds the pinned version', async () => {
+      write('gradle.properties', '# comment\nversion=4.4.0\norg.gradle.jvmargs=-Xmx2g\n')
+
+      await expect(assertSourceVersion(localSource(root), '4.4.0')).resolves.toBeUndefined()
+    })
+
+    it.each([
+      ['another version', 'version=4.3.1\n', 'holds 4.3.1, not the pinned 4.4.0'],
+      [
+        'a snapshot version',
+        'version=4.4.0-SNAPSHOT\n',
+        'holds 4.4.0-SNAPSHOT, not the pinned 4.4.0',
+      ],
+      ['no version line', 'group=org.apache.kafka\n', 'holds no version, not the pinned 4.4.0'],
+    ])('refuses a tree with %s', async (_why, properties, message) => {
+      write('gradle.properties', properties)
+
+      await expect(assertSourceVersion(localSource(root), '4.4.0')).rejects.toThrow(message)
+    })
+
+    it('refuses a tree with no gradle.properties', async () => {
+      await expect(assertSourceVersion(localSource(root), '4.4.0')).rejects.toThrow(
+        'holds no version, not the pinned 4.4.0'
+      )
+    })
+
+    it.each([
+      [['fetch'], null],
+      [['fetch', '--source-root', '/x/y'], '/x/y'],
+      [['fetch', '--source-root=/x/y'], '/x/y'],
+      [['fetch', '--no-discover', '--source-root=/a=b'], '/a=b'],
+    ])('reads the source root of %j as %p', (argv, expected) => {
+      expect(sourceRootOf(argv)).toBe(expected)
+    })
+
+    it.each([
+      [['fetch', '--source-root']],
+      [['fetch', '--source-root', '--no-discover']],
+      [['--source-root=']],
+    ])('refuses %j, a source root with no directory', (argv) => {
+      expect(() => sourceRootOf(argv)).toThrow('--source-root needs a directory')
     })
   })
 

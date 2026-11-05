@@ -87,6 +87,7 @@ scripts/compat/__tests__/render.spec.js:      for (const ignored of ['\x75pgrade
 scripts/compat/config.json:    "json": "docs/\x6bafka-compatibility.json"
 scripts/compat/index.js: *   npm run compat:generate   write docs/KafkaCompatibility.md + docs/\x6bafka-compatibility.json
 src/oauth/__tests__/oauthDocs.spec.js:      /\\/Users\\/|\\/home\\/|\\/var\\/tmp|new_countly|~\\/|C:\\\\|\x73uperpowers|\x75pgrade-ref|CLAUDE\\.md|AGENT\\.md|EXECUTION\\.md|\\b(?:Phase|Task|Wave) \\d/
+scripts/compat/__tests__/build.spec.js:      expect(JSON.parse(read('docs', '\x6bafka-compatibility.json')).generatedFrom.kafkaTag).toBe(tag)
 LIST
 )")
 NEW_LABELS=$(printf '%b\n' "$(cat <<'LIST'
