@@ -1829,12 +1829,13 @@ module.exports = ({
     }
 
     const retrier = retrierOf(retry)
-    const results = []
+    const requested = groupIds.slice()
+    const rowsByNode = {}
     const answered = new Set()
 
     return retrier(async (bail, retryCount, retryTime) => {
       try {
-        const pending = groupIds.filter((groupId) => !answered.has(groupId))
+        const pending = requested.filter((groupId) => !answered.has(groupId))
 
         if (pending.length > 0) {
           checked(await waitOf(async () => cluster.refreshMetadata()))
@@ -1865,14 +1866,17 @@ module.exports = ({
 
           outcomes.forEach((outcome, index) => {
             if (outcome.status !== 'fulfilled') return
-            for (const row of outcome.value.results) results.push(row)
-            for (const groupId of brokersPerGroups[nodeIds[index]]) answered.add(groupId)
+            const nodeId = nodeIds[index]
+            rowsByNode[nodeId] = [...(rowsByNode[nodeId] || []), ...outcome.value.results]
+            for (const groupId of brokersPerGroups[nodeId]) answered.add(groupId)
           })
 
           const rejected = outcomes.find(({ status }) => status === 'rejected')
           if (rejected) throw rejected.reason
         }
 
+        // Rows keep coordinator order, as a single attempt returns them, whichever attempt answered.
+        const results = Object.keys(rowsByNode).flatMap((nodeId) => rowsByNode[nodeId])
         const errors = results
           .map(({ groupId, errorCode, error, errorMessage }) => ({
             groupId,
