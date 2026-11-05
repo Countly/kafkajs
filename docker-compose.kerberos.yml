@@ -33,6 +33,7 @@ services:
       - ${KERBEROS_FIXTURE_DIR:?supply the owned fixture directory}:/state:ro
       - ./testHelpers/kerberos/krb5.kdc.conf:/etc/krb5.conf:ro
       - ./testHelpers/kerberos/server-jaas.conf:/etc/kafka/server-jaas.conf:ro
+      - ./testHelpers/kafka/dns.security:/etc/kafka/dns.security:ro
     environment:
       CLUSTER_ID: 9JrAXWqaTk-meTZW2p46oA
       KAFKA_NODE_ID: "1"
@@ -52,4 +53,4 @@ services:
       KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: "1"
       KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: "0"
       KAFKA_LOG_DIRS: /var/lib/kafka/data
-      KAFKA_OPTS: -Djava.security.auth.login.config=/etc/kafka/server-jaas.conf -Djava.security.krb5.conf=/etc/krb5.conf
+      KAFKA_OPTS: -Djava.security.auth.login.config=/etc/kafka/server-jaas.conf -Djava.security.krb5.conf=/etc/krb5.conf -Djava.security.properties=/etc/kafka/dns.security
