@@ -17903,6 +17903,8 @@
         "src/admin/__tests__/describeTopicPartitionsLive.spec.js \u203a Admin > fetchTopicMetadata > DescribeTopicPartitions (live) a broker pages through 12 partitions one at a time and ends on a null cursor",
         "src/admin/__tests__/describeTopicPartitionsLive.spec.js \u203a Admin > fetchTopicMetadata > DescribeTopicPartitions (live) a topic that does not exist fails the call and is not created by it",
         "src/admin/__tests__/describeTopicPartitionsLive.spec.js \u203a Admin > fetchTopicMetadata > DescribeTopicPartitions (live) fetchTopicMetadata through DescribeTopicPartitions agrees with the Metadata path",
+        "src/admin/__tests__/floorTokensLive.spec.js \u203a Delegation tokens on the negotiated floor creates, describes, renews and expires a delegation token",
+        "src/admin/__tests__/floorTokensLive.spec.js \u203a Delegation tokens on the negotiated floor rejects token administration on a plaintext channel without exposing credentials",
         "src/admin/__tests__/incrementalAlterConfigsLive.spec.js \u203a Admin > incrementalAlterConfigs and the config routing (live) BROKER with the empty name is described and altered at the cluster default by all three methods",
         "src/admin/__tests__/incrementalAlterConfigsLive.spec.js \u203a Admin > incrementalAlterConfigs and the config routing (live) CLIENT_METRICS: a subscription is set, described and deleted",
         "src/admin/__tests__/incrementalAlterConfigsLive.spec.js \u203a Admin > incrementalAlterConfigs and the config routing (live) GROUP: consumer.session.timeout.ms makes a GROUP_CONFIG entry and DELETE removes it",
@@ -17926,6 +17928,15 @@
         "src/admin/__tests__/removeMembersLive.spec.js \u203a Admin > removeMembersFromConsumerGroup (live, consumer) on a group with a dynamic and a static member an instance id the group does not know is UNKNOWN_MEMBER_ID in the results, not a rejection",
         "src/admin/__tests__/removeMembersLive.spec.js \u203a Admin > removeMembersFromConsumerGroup (live, consumer) on a group with a dynamic and a static member removing every member answers one removal for each",
         "src/admin/__tests__/removeMembersLive.spec.js \u203a Admin > removeMembersFromConsumerGroup (live, consumer) removes a static member that stopped without leaving, and the survivor takes its partitions well before the session timeout",
+        "src/broker/__tests__/floorCoreLive.spec.js \u203a Administration and connection capabilities on the floor aborts a physical transaction and fences the original producer",
+        "src/broker/__tests__/floorCoreLive.spec.js \u203a Administration and connection capabilities on the floor bounds setup, idle reopening and a stalled administrative call",
+        "src/broker/__tests__/floorCoreLive.spec.js \u203a Administration and connection capabilities on the floor deletes offsets and fetches three groups through negotiated versions",
+        "src/broker/__tests__/floorCoreLive.spec.js \u203a Administration and connection capabilities on the floor describes active transactions and refuses an unavailable pattern",
+        "src/broker/__tests__/floorCoreLive.spec.js \u203a Administration and connection capabilities on the floor every administration and connection evidence line carries the stamps a verifier checks",
+        "src/broker/__tests__/floorCoreLive.spec.js \u203a Administration and connection capabilities on the floor lists cluster resources and refuses filters absent from the negotiated version",
+        "src/broker/__tests__/floorCoreLive.spec.js \u203a Administration and connection capabilities on the floor reports replicas in their current directory without inventing a cordon flag",
+        "src/broker/__tests__/floorCoreLive.spec.js \u203a Administration and connection capabilities on the floor retains reassignment and offset-spec refusals on the negotiated floor",
+        "src/broker/__tests__/floorCoreLive.spec.js \u203a Administration and connection capabilities on the floor round trips quota and SCRAM administration without leaking credentials",
         "src/broker/__tests__/floorCoreLive.spec.js \u203a Kafka floor core (live) F01 negotiation: each API at the highest implemented version the floor broker offers",
         "src/broker/__tests__/floorCoreLive.spec.js \u203a Kafka floor core (live) F02 admin: topics, metadata, cluster and the groups the floor broker describes",
         "src/broker/__tests__/floorCoreLive.spec.js \u203a Kafka floor core (live) F03 idempotent read-back: 200 records with acks -1 are in the log in order, each once",
@@ -17942,6 +17953,8 @@
         "src/broker/__tests__/floorCoreLive.spec.js \u203a Kafka floor core (live) manual assignment round trips with group offsets enabled false",
         "src/broker/__tests__/floorCoreLive.spec.js \u203a Kafka floor core (live) manual assignment round trips with group offsets enabled true",
         "src/broker/__tests__/floorCoreLive.spec.js \u203a Kafka floor core (live) round trips every installed built-in codec without faults",
+        "src/broker/__tests__/floorGssapiLive.spec.js \u203a GSSAPI with a ticket-granting service authenticates, expires, reconnects and reauthenticates with the ticket service",
+        "src/broker/__tests__/floorGssapiLive.spec.js \u203a GSSAPI with a ticket-granting service reads the SASL capability facts from a GSSAPI-authenticated connection",
         "src/broker/__tests__/gssapiLive.spec.js \u203a GSSAPI with a ticket-granting service authenticates, negotiates no layer and rejects an observed expired cache",
         "src/consumer/__tests__/autoCommitCadenceLive.spec.js \u203a Consumer > automatic commit cadence (live) a below-interval batch followed by idle commits only at the next processing opportunity",
         "src/consumer/__tests__/autoCommitCadenceLive.spec.js \u203a Consumer > automatic commit cadence (live) a configured interval commits only at processing opportunities inside the quiet window",
@@ -18099,6 +18112,9 @@
         "src/network/__tests__/tlsNegativeLive.spec.js \u203a TLS negatives against real SSL listeners (live) the listener that requires a client certificate refuses a client without one, typed",
         "src/network/__tests__/tlsNegativeLive.spec.js \u203a TLS negatives against real SSL listeners (live) the one-way listener refuses a CA the client does not trust, typed",
         "src/network/__tests__/tlsNegativeLive.spec.js \u203a TLS negatives against real SSL listeners (live) the one-way listener refuses a server name the certificate does not carry, typed",
+        "src/oauth/__tests__/floorOAuthLive.spec.js \u203a OAuth helpers against a live OAUTHBEARER broker authenticates every helper form and observes refresh and file rotation",
+        "src/oauth/__tests__/floorOAuthLive.spec.js \u203a OAuth helpers against a live OAUTHBEARER broker closed providers reject later calls and the issuer keeps no sockets",
+        "src/oauth/__tests__/floorOAuthLive.spec.js \u203a OAuth helpers against a live OAUTHBEARER broker reads the SASL capability facts from an OAUTHBEARER-authenticated connection",
         "src/oauth/__tests__/oauthHelpersLive.spec.js \u203a OAuth helpers against a live OAUTHBEARER broker closed providers reject later calls and the issuer keeps no sockets",
         "src/oauth/__tests__/oauthHelpersLive.spec.js \u203a OAuth helpers against a live OAUTHBEARER broker producer and admin authenticate with every helper form, refresh in the window and read the log",
         "src/producer/__tests__/ackLostLive.spec.js \u203a Producer and consumer > a lost answer is retried without loss (live) a Fetch answer lost after the broker served it is retried at the same position and the handler sees each record once",
@@ -18300,7 +18316,18 @@
         "src/broker/__tests__/reauthenticate.spec.js \u203a Brokers re-authentication with SASL OAUTHBEARER Re-authenticate only once with multiple parallel requests",
         "src/broker/__tests__/reauthenticate.spec.js \u203a Brokers re-authentication with SASL OAUTHBEARER Re-authenticate every request sent when re-authentication threshold is same as session lifetime",
         "src/broker/__tests__/reauthenticate.spec.js \u203a Brokers re-authentication with SASL OAUTHBEARER Re-authenticates only once with multiple requests sent in parallel when re-authentication threshold is same as session lifetime",
-        "src/broker/__tests__/gssapiLive.spec.js \u203a GSSAPI with a ticket-granting service authenticates, negotiates no layer and rejects an observed expired cache"
+        "src/broker/__tests__/gssapiLive.spec.js \u203a GSSAPI with a ticket-granting service authenticates, negotiates no layer and rejects an observed expired cache",
+        "src/broker/__tests__/floorCoreLive.spec.js \u203a Administration and connection capabilities on the floor deletes offsets and fetches three groups through negotiated versions",
+        "src/broker/__tests__/floorCoreLive.spec.js \u203a Administration and connection capabilities on the floor describes active transactions and refuses an unavailable pattern",
+        "src/broker/__tests__/floorCoreLive.spec.js \u203a Administration and connection capabilities on the floor aborts a physical transaction and fences the original producer",
+        "src/broker/__tests__/floorCoreLive.spec.js \u203a Administration and connection capabilities on the floor lists cluster resources and refuses filters absent from the negotiated version",
+        "src/broker/__tests__/floorCoreLive.spec.js \u203a Administration and connection capabilities on the floor reports replicas in their current directory without inventing a cordon flag",
+        "src/broker/__tests__/floorCoreLive.spec.js \u203a Administration and connection capabilities on the floor retains reassignment and offset-spec refusals on the negotiated floor",
+        "src/broker/__tests__/floorCoreLive.spec.js \u203a Administration and connection capabilities on the floor round trips quota and SCRAM administration without leaking credentials",
+        "src/broker/__tests__/floorCoreLive.spec.js \u203a Administration and connection capabilities on the floor bounds setup, idle reopening and a stalled administrative call",
+        "src/broker/__tests__/floorCoreLive.spec.js \u203a Administration and connection capabilities on the floor every administration and connection evidence line carries the stamps a verifier checks",
+        "src/broker/__tests__/floorGssapiLive.spec.js \u203a GSSAPI with a ticket-granting service authenticates, expires, reconnects and reauthenticates with the ticket service",
+        "src/broker/__tests__/floorGssapiLive.spec.js \u203a GSSAPI with a ticket-granting service reads the SASL capability facts from a GSSAPI-authenticated connection"
       ]
     },
     {
@@ -18369,7 +18396,9 @@
         "src/admin/__tests__/adminLogDirsLive.spec.js \u203a admin replica directories moves a replica between configured directories without changing its log",
         "src/admin/__tests__/adminTieredLive.spec.js \u203a admin configured remote storage reads retained records after remote upload and local eviction",
         "src/admin/__tests__/deleteGroupsV3Live.spec.js \u203a Admin > deleteGroups message per group (live) deletes a group whose member has stopped and leaves neither the group nor its commit",
-        "src/admin/__tests__/deleteGroupsV3Live.spec.js \u203a Admin > deleteGroups message per group (live) refuses a missing group and a group with a member each under its own id, and leaves the member group as it was"
+        "src/admin/__tests__/deleteGroupsV3Live.spec.js \u203a Admin > deleteGroups message per group (live) refuses a missing group and a group with a member each under its own id, and leaves the member group as it was",
+        "src/admin/__tests__/floorTokensLive.spec.js \u203a Delegation tokens on the negotiated floor creates, describes, renews and expires a delegation token",
+        "src/admin/__tests__/floorTokensLive.spec.js \u203a Delegation tokens on the negotiated floor rejects token administration on a plaintext channel without exposing credentials"
       ]
     },
     {
@@ -18716,7 +18745,10 @@
         "src/network/__tests__/idleReapingLive.spec.js \u203a Idle reaping live idle producer reconnects and all three replay sets remain exact",
         "src/network/__tests__/idleReapingLive.spec.js \u203a Idle reaping live a live long poll is not reaped while its request is pending",
         "src/network/__tests__/connectionSetupLive.spec.js \u203a Connection setup live setup budgets grow on one node and ready resets the next attempt",
-        "src/network/__tests__/connectionSetupLive.spec.js \u203a Connection setup live an explicit setup timeout stays flat without a maximum"
+        "src/network/__tests__/connectionSetupLive.spec.js \u203a Connection setup live an explicit setup timeout stays flat without a maximum",
+        "src/oauth/__tests__/floorOAuthLive.spec.js \u203a OAuth helpers against a live OAUTHBEARER broker authenticates every helper form and observes refresh and file rotation",
+        "src/oauth/__tests__/floorOAuthLive.spec.js \u203a OAuth helpers against a live OAUTHBEARER broker closed providers reject later calls and the issuer keeps no sockets",
+        "src/oauth/__tests__/floorOAuthLive.spec.js \u203a OAuth helpers against a live OAUTHBEARER broker reads the SASL capability facts from an OAUTHBEARER-authenticated connection"
       ]
     },
     {
@@ -21215,7 +21247,23 @@
         "src/producer/__tests__/sendOffsetsLive.spec.js \u203a Producer > sendOffsets with group metadata (live) consumer protocol a joining consumer waits for the open transaction holding its group\u2019s offsets, a rebalance meanwhile does not, and nobody is evicted",
         "src/producer/__tests__/sendOffsetsLive.spec.js \u203a Producer > sendOffsets with group metadata (live) consumer protocol a membership gone stale before sendOffsets makes it abortable; abort, rejoin and reprocess leave no duplicate and no gap",
         "src/admin/__tests__/deleteGroupsV3Live.spec.js \u203a Admin > deleteGroups message per group (live) deletes a group whose member has stopped and leaves neither the group nor its commit",
-        "src/admin/__tests__/deleteGroupsV3Live.spec.js \u203a Admin > deleteGroups message per group (live) refuses a missing group and a group with a member each under its own id, and leaves the member group as it was"
+        "src/admin/__tests__/deleteGroupsV3Live.spec.js \u203a Admin > deleteGroups message per group (live) refuses a missing group and a group with a member each under its own id, and leaves the member group as it was",
+        "src/broker/__tests__/floorCoreLive.spec.js \u203a Administration and connection capabilities on the floor deletes offsets and fetches three groups through negotiated versions",
+        "src/broker/__tests__/floorCoreLive.spec.js \u203a Administration and connection capabilities on the floor describes active transactions and refuses an unavailable pattern",
+        "src/broker/__tests__/floorCoreLive.spec.js \u203a Administration and connection capabilities on the floor aborts a physical transaction and fences the original producer",
+        "src/broker/__tests__/floorCoreLive.spec.js \u203a Administration and connection capabilities on the floor lists cluster resources and refuses filters absent from the negotiated version",
+        "src/broker/__tests__/floorCoreLive.spec.js \u203a Administration and connection capabilities on the floor reports replicas in their current directory without inventing a cordon flag",
+        "src/broker/__tests__/floorCoreLive.spec.js \u203a Administration and connection capabilities on the floor retains reassignment and offset-spec refusals on the negotiated floor",
+        "src/broker/__tests__/floorCoreLive.spec.js \u203a Administration and connection capabilities on the floor round trips quota and SCRAM administration without leaking credentials",
+        "src/broker/__tests__/floorCoreLive.spec.js \u203a Administration and connection capabilities on the floor bounds setup, idle reopening and a stalled administrative call",
+        "src/broker/__tests__/floorCoreLive.spec.js \u203a Administration and connection capabilities on the floor every administration and connection evidence line carries the stamps a verifier checks",
+        "src/oauth/__tests__/floorOAuthLive.spec.js \u203a OAuth helpers against a live OAUTHBEARER broker authenticates every helper form and observes refresh and file rotation",
+        "src/oauth/__tests__/floorOAuthLive.spec.js \u203a OAuth helpers against a live OAUTHBEARER broker closed providers reject later calls and the issuer keeps no sockets",
+        "src/oauth/__tests__/floorOAuthLive.spec.js \u203a OAuth helpers against a live OAUTHBEARER broker reads the SASL capability facts from an OAUTHBEARER-authenticated connection",
+        "src/broker/__tests__/floorGssapiLive.spec.js \u203a GSSAPI with a ticket-granting service authenticates, expires, reconnects and reauthenticates with the ticket service",
+        "src/broker/__tests__/floorGssapiLive.spec.js \u203a GSSAPI with a ticket-granting service reads the SASL capability facts from a GSSAPI-authenticated connection",
+        "src/admin/__tests__/floorTokensLive.spec.js \u203a Delegation tokens on the negotiated floor creates, describes, renews and expires a delegation token",
+        "src/admin/__tests__/floorTokensLive.spec.js \u203a Delegation tokens on the negotiated floor rejects token administration on a plaintext channel without exposing credentials"
       ]
     },
     {
@@ -21269,6 +21317,169 @@
         "src/admin/__tests__/deleteGroupsV3Live.spec.js \u203a Admin > deleteGroups message per group (live) refuses a missing group and a group with a member each under its own id, and leaves the member group as it was"
       ],
       "capMinutes": 30
+    },
+    {
+      "id": "floor-core",
+      "kind": "cluster",
+      "compose": "docker-compose.yml",
+      "kafkaVersion": "4.0.2",
+      "env": {
+        "FLOOR_CORE_E2E": "1"
+      },
+      "jest": [
+        "--forceExit",
+        "--runInBand",
+        "--testPathPatterns",
+        "src/broker/__tests__/floorCoreLive\\.spec\\.js"
+      ],
+      "jestScript": null,
+      "nodeTest": null,
+      "command": null,
+      "needs": {},
+      "evidence": [
+        "floor-core"
+      ],
+      "titles": [
+        "src/broker/__tests__/floorCoreLive.spec.js \u203a Floor core expectations the expected version is the highest implemented one inside the offered range",
+        "src/broker/__tests__/floorCoreLive.spec.js \u203a Floor core expectations on the 4.0.2 floor the recorded ranges and the implemented codecs give these versions",
+        "src/broker/__tests__/floorCoreLive.spec.js \u203a Floor core expectations a coordinator selects transaction version 2 only at level 2 with a valid epoch",
+        "src/broker/__tests__/floorCoreLive.spec.js \u203a Floor core expectations a compressed codec that is not installed is an unmet cell, never a pass",
+        "src/broker/__tests__/floorCoreLive.spec.js \u203a Floor core expectations a codec arm fails on another batch codec, a lost idempotence or a changed pair",
+        "src/broker/__tests__/floorCoreLive.spec.js \u203a Floor capability expectations maps actual codec definitions and the retained probe without relying on a release label",
+        "src/broker/__tests__/floorCoreLive.spec.js \u203a Floor capability expectations selects the highest overlap of independently observed and implemented ranges",
+        "src/broker/__tests__/floorCoreLive.spec.js \u203a Floor capability expectations refuses a missing, invalid or stale observed range undefined",
+        "src/broker/__tests__/floorCoreLive.spec.js \u203a Floor capability expectations refuses a missing, invalid or stale observed range [2, 1]",
+        "src/broker/__tests__/floorCoreLive.spec.js \u203a Floor capability expectations refuses a missing, invalid or stale observed range [-1, 1]",
+        "src/broker/__tests__/floorCoreLive.spec.js \u203a Floor capability expectations refuses a missing, invalid or stale observed range [0, 0]",
+        "src/broker/__tests__/floorCoreLive.spec.js \u203a Floor capability expectations requires the option, needed version and both complete ranges in a typed refusal",
+        "src/broker/__tests__/floorCoreLive.spec.js \u203a Floor capability expectations uses negotiated ranges even when an unrelated release label suggests a newer broker",
+        "src/broker/__tests__/floorCoreLive.spec.js \u203a Floor capability expectations refuses a supported option represented as unsupported",
+        "src/broker/__tests__/floorCoreLive.spec.js \u203a Floor administration helpers a shared budget starts once, only shrinks and refuses a start with no cleanup reserve left",
+        "src/broker/__tests__/floorCoreLive.spec.js \u203a Floor administration helpers a typed refusal is found through its cause chain, and a cycle or a non-error ends the walk",
+        "src/broker/__tests__/floorCoreLive.spec.js \u203a Floor administration helpers credential markers cover the encodings a log or a buffer dump can show",
+        "src/broker/__tests__/floorCoreLive.spec.js \u203a Floor administration helpers a held dial withholds readiness, counts one attempt per destroyed socket and lets a free dial through",
+        "src/broker/__tests__/floorCoreLive.spec.js \u203a Kafka floor core (live) F01 negotiation: each API at the highest implemented version the floor broker offers",
+        "src/broker/__tests__/floorCoreLive.spec.js \u203a Kafka floor core (live) F02 admin: topics, metadata, cluster and the groups the floor broker describes",
+        "src/broker/__tests__/floorCoreLive.spec.js \u203a Kafka floor core (live) F03 idempotent read-back: 200 records with acks -1 are in the log in order, each once",
+        "src/broker/__tests__/floorCoreLive.spec.js \u203a Kafka floor core (live) F04 transactions: an abort is invisible, a commit and its offsets are visible",
+        "src/broker/__tests__/floorCoreLive.spec.js \u203a Kafka floor core (live) F05 classic eager: two members rebalance, commit and resume at the committed offset",
+        "src/broker/__tests__/floorCoreLive.spec.js \u203a Kafka floor core (live) F06 classic cooperative: two members rebalance, commit and resume at the committed offset",
+        "src/broker/__tests__/floorCoreLive.spec.js \u203a Kafka floor core (live) F07 consumer protocol: join, assignment, commit, and a second member reconciled in",
+        "src/broker/__tests__/floorCoreLive.spec.js \u203a Kafka floor core (live) F08 fault-free scenarios on the floor 50 concurrent Metadata calls keep at most 5 in flight and all resolve",
+        "src/broker/__tests__/floorCoreLive.spec.js \u203a Kafka floor core (live) F08 fault-free scenarios on the floor a deleted subscribed topic stays absent when auto creation is disabled",
+        "src/broker/__tests__/floorCoreLive.spec.js \u203a Kafka floor core (live) F08 fault-free scenarios on the floor topics named like Object.prototype members round-trip through a producer and a consumer",
+        "src/broker/__tests__/floorCoreLive.spec.js \u203a Kafka floor core (live) a pattern consumer discovers a matching topic created after delivery starts",
+        "src/broker/__tests__/floorCoreLive.spec.js \u203a Kafka floor core (live) an awaited assignment listener holds delivery until it completes",
+        "src/broker/__tests__/floorCoreLive.spec.js \u203a Kafka floor core (live) every evidence line of this run carries the stamps a verifier checks",
+        "src/broker/__tests__/floorCoreLive.spec.js \u203a Kafka floor core (live) manual assignment round trips with group offsets enabled false",
+        "src/broker/__tests__/floorCoreLive.spec.js \u203a Kafka floor core (live) manual assignment round trips with group offsets enabled true",
+        "src/broker/__tests__/floorCoreLive.spec.js \u203a Kafka floor core (live) round trips every installed built-in codec without faults",
+        "src/broker/__tests__/floorCoreLive.spec.js \u203a Administration and connection capabilities on the floor deletes offsets and fetches three groups through negotiated versions",
+        "src/broker/__tests__/floorCoreLive.spec.js \u203a Administration and connection capabilities on the floor describes active transactions and refuses an unavailable pattern",
+        "src/broker/__tests__/floorCoreLive.spec.js \u203a Administration and connection capabilities on the floor aborts a physical transaction and fences the original producer",
+        "src/broker/__tests__/floorCoreLive.spec.js \u203a Administration and connection capabilities on the floor lists cluster resources and refuses filters absent from the negotiated version",
+        "src/broker/__tests__/floorCoreLive.spec.js \u203a Administration and connection capabilities on the floor reports replicas in their current directory without inventing a cordon flag",
+        "src/broker/__tests__/floorCoreLive.spec.js \u203a Administration and connection capabilities on the floor retains reassignment and offset-spec refusals on the negotiated floor",
+        "src/broker/__tests__/floorCoreLive.spec.js \u203a Administration and connection capabilities on the floor round trips quota and SCRAM administration without leaking credentials",
+        "src/broker/__tests__/floorCoreLive.spec.js \u203a Administration and connection capabilities on the floor bounds setup, idle reopening and a stalled administrative call",
+        "src/broker/__tests__/floorCoreLive.spec.js \u203a Administration and connection capabilities on the floor every administration and connection evidence line carries the stamps a verifier checks"
+      ],
+      "capMinutes": 75,
+      "allowedSkips": [
+        "src/broker/__tests__/floorCoreLive.spec.js \u203a Floor core codec round trip (fake lane) round trips every installed built-in codec without faults"
+      ]
+    },
+    {
+      "id": "floor-oauth",
+      "kind": "cluster",
+      "compose": "docker-compose.oauthbearer.yml",
+      "kafkaVersion": "4.0.2",
+      "env": {
+        "FLOOR_OAUTH_E2E": "1"
+      },
+      "jest": [
+        "--forceExit",
+        "--testPathPatterns",
+        "src/oauth/__tests__/floorOAuthLive\\.spec\\.js"
+      ],
+      "jestScript": null,
+      "nodeTest": null,
+      "command": null,
+      "needs": {},
+      "evidence": [
+        "floor-oauth"
+      ],
+      "titles": [
+        "src/oauth/__tests__/floorOAuthLive.spec.js \u203a Floor OAuth expectations requires every named variant exactly once",
+        "src/oauth/__tests__/floorOAuthLive.spec.js \u203a Floor OAuth expectations refuses an omitted variant",
+        "src/oauth/__tests__/floorOAuthLive.spec.js \u203a Floor OAuth expectations refuses duplicate or extra variants",
+        "src/oauth/__tests__/floorOAuthLive.spec.js \u203a OAuth helpers against a live OAUTHBEARER broker authenticates every helper form and observes refresh and file rotation",
+        "src/oauth/__tests__/floorOAuthLive.spec.js \u203a OAuth helpers against a live OAUTHBEARER broker closed providers reject later calls and the issuer keeps no sockets",
+        "src/oauth/__tests__/floorOAuthLive.spec.js \u203a OAuth helpers against a live OAUTHBEARER broker reads the SASL capability facts from an OAUTHBEARER-authenticated connection"
+      ],
+      "capMinutes": 30
+    },
+    {
+      "id": "floor-gssapi",
+      "kind": "cluster",
+      "compose": "docker-compose.kerberos.yml",
+      "kafkaVersion": "4.0.2",
+      "env": {
+        "FLOOR_GSSAPI_E2E": "1"
+      },
+      "jest": [
+        "--forceExit",
+        "--testPathPatterns",
+        "src/broker/__tests__/floorGssapiLive\\.spec\\.js"
+      ],
+      "jestScript": null,
+      "nodeTest": null,
+      "command": null,
+      "needs": {
+        "kerberos": true
+      },
+      "evidence": [
+        "floor-gssapi"
+      ],
+      "titles": [
+        "src/broker/__tests__/floorGssapiLive.spec.js \u203a Floor GSSAPI expectations requires every named variant exactly once",
+        "src/broker/__tests__/floorGssapiLive.spec.js \u203a Floor GSSAPI expectations refuses an omitted variant",
+        "src/broker/__tests__/floorGssapiLive.spec.js \u203a Floor GSSAPI expectations refuses duplicate or extra variants",
+        "src/broker/__tests__/floorGssapiLive.spec.js \u203a GSSAPI with a ticket-granting service authenticates, expires, reconnects and reauthenticates with the ticket service",
+        "src/broker/__tests__/floorGssapiLive.spec.js \u203a GSSAPI with a ticket-granting service reads the SASL capability facts from a GSSAPI-authenticated connection"
+      ],
+      "capMinutes": 35
+    },
+    {
+      "id": "floor-tokens",
+      "kind": "cluster",
+      "compose": "docker-compose.tokens.yml",
+      "kafkaVersion": "4.0.2",
+      "env": {
+        "FLOOR_TOKENS_E2E": "1"
+      },
+      "jest": [
+        "--forceExit",
+        "--testPathPatterns",
+        "src/admin/__tests__/floorTokensLive\\.spec\\.js"
+      ],
+      "jestScript": null,
+      "nodeTest": null,
+      "command": null,
+      "needs": {
+        "tokens": true
+      },
+      "evidence": [
+        "floor-tokens"
+      ],
+      "titles": [
+        "src/admin/__tests__/floorTokensLive.spec.js \u203a Floor token expectations requires every named variant exactly once",
+        "src/admin/__tests__/floorTokensLive.spec.js \u203a Floor token expectations refuses an omitted variant",
+        "src/admin/__tests__/floorTokensLive.spec.js \u203a Floor token expectations refuses duplicate or extra variants",
+        "src/admin/__tests__/floorTokensLive.spec.js \u203a Delegation tokens on the negotiated floor creates, describes, renews and expires a delegation token",
+        "src/admin/__tests__/floorTokensLive.spec.js \u203a Delegation tokens on the negotiated floor rejects token administration on a plaintext channel without exposing credentials"
+      ],
+      "capMinutes": 25
     }
   ]
 }
