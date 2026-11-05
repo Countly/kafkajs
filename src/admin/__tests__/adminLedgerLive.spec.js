@@ -6,6 +6,10 @@ const Broker = require('../../broker')
 const Pool = require('../../network/connectionPool')
 const apiKeys = require('../../protocol/requests/apiKeys')
 const { saslBrokers, saslConnectionOpts } = require('testHelpers')
+const {
+  fenceUntilSettled,
+  describeScramUntilApplied,
+} = require('../../../testHelpers/adminCatchUp')
 const { readData } = require('../../producer/__tests__/fixtures/liveProbe')
 const { liveCase, caseTimeout, pollUntil } = require('../../producer/__tests__/fixtures/bounded')
 
@@ -550,7 +554,7 @@ class AdminLedgerScenario {
     p.effects.add('settle fenced transaction', () =>
       admin.fenceProducers({ transactionalIds: [fencedId] })
     )
-    const fenced = (await p.invoke(() => admin.fenceProducers({ transactionalIds: [fencedId] })))[0]
+    const [fenced] = await fenceUntilSettled(p, admin, fencedId)
     p.items(fenced)
     expect(
       fenced.producerId !== before.producerId || fenced.producerEpoch !== before.producerEpoch
@@ -1120,7 +1124,7 @@ class AdminLedgerScenario {
           })
         )
       )
-      const described = await p.invoke(() => admin.describeUserScramCredentials({ users: [user] }))
+      const described = await describeScramUntilApplied(p, admin, user)
       p.items(described)
       expect(described[0].credentials).toEqual([{ mechanism, iterations: 4096 }])
       for (const buffers of ['0', '1']) {

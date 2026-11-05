@@ -120,6 +120,13 @@ describe('standalone KDC fixture', () => {
       expect(fs.existsSync(`${record.cache}.pending`)).toBe(false)
     })
 
+    test('copies a client config that keeps the broker host name exactly as given', () => {
+      const { controller } = make({ lifetimeMs: HOUR, issuedAt: START })
+      const config = fs.readFileSync(controller.ticket('fresh').config, 'utf8')
+      expect(config).toMatch(/^ dns_canonicalize_hostname = false$/m)
+      expect(config).toMatch(/^ qualify_shortname = ""$/m)
+    })
+
     test('refuses a ticket whose lifetime is not the requested one, before copying anything', () => {
       const { controller, calls } = make({ lifetimeMs: HOUR / 2, issuedAt: START })
       expect(() => controller.ticket('fresh')).toThrow('Ticket lifetime or clock')

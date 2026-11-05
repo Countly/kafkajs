@@ -14,6 +14,10 @@ const {
 } = require('../../../errors')
 const { Kafka, AlterConfigOpTypes, logLevel } = require('../../../../index')
 const FloorCapabilities = require('../../../../testHelpers/floorCapabilities')
+const {
+  fenceUntilSettled,
+  describeScramUntilApplied,
+} = require('../../../../testHelpers/adminCatchUp')
 const { createChaosSocketFactory } = require('../../../../testHelpers/chaosSocket')
 const { createResourceProbe } = require('../../../../testHelpers/resourceProbe')
 const { readLog, endOffsets, committedRecords } = require('../../../../testHelpers/rawLog')
@@ -1068,7 +1072,7 @@ class FloorAdminCases {
       await p.invoke(() => admin.describeTransactions({ transactionalIds: [fencedId] }))
     )[0]
     p.items(before)
-    const [fenced] = await p.invoke(() => admin.fenceProducers({ transactionalIds: [fencedId] }))
+    const [fenced] = await fenceUntilSettled(p, admin, fencedId)
     p.items(fenced)
     expect(
       fenced.producerId !== before.producerId || fenced.producerEpoch > before.producerEpoch
@@ -1552,9 +1556,7 @@ class FloorAdminCases {
           })
         )
       )
-      const [described] = await p.invoke(() =>
-        admin.describeUserScramCredentials({ users: [scramUser] })
-      )
+      const [described] = await describeScramUntilApplied(p, admin, scramUser)
       p.items(described)
       expect(described.credentials).toEqual([{ mechanism, iterations: 4096 }])
       const authenticate = async (buffers) => {
@@ -1797,9 +1799,11 @@ class FloorAdminCases {
 
   /**
    * A fetch waiting on the broker is not an idle connection: it stays pending past the idle limit on
-   * the same open socket, then completes normally for exactly the requested partition.
-   * @returns {Promise<boolean>} whether the held socket was closed early; false on success
-   * @throws {Error} when the fetch settles early, its socket is replaced or closed, or it fails
+   * the pool's dedicated Fetch socket, which stays open, while the primary socket, idle since its
+   * setup exchange, is reaped; the fetch then completes normally for exactly the requested partition.
+   * @returns {Promise<boolean>} whether the held Fetch socket was closed early; false on success
+   * @throws {Error} when the fetch settles early, its socket is replaced or closed, the idle primary
+   *   socket is not reaped, or the fetch fails
    */
   async heldLongPoll() {
     const p = this.probe
@@ -1815,6 +1819,7 @@ class FloorAdminCases {
       },
     })
     expect(dialed).toHaveLength(1)
+    const [primary] = dialed
     let settled = false
     const outcome = p
       .invoke(() =>
@@ -1833,8 +1838,10 @@ class FloorAdminCases {
       })
     await p.invoke(() => delay(p.signal, IDLE_MS + 1500))
     expect(settled).toBe(false)
-    expect(dialed).toHaveLength(1)
-    const heldLongPollWasReaped = dialed[0].destroyed
+    expect(dialed).toHaveLength(2)
+    const fetchSocket = dialed[1]
+    expect(primary.destroyed).toBe(true)
+    const heldLongPollWasReaped = fetchSocket.destroyed
     expect(heldLongPollWasReaped).toBe(false)
     const { response, error } = await outcome
     expect(error).toBeUndefined()
