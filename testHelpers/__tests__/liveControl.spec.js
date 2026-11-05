@@ -66,6 +66,84 @@ describe('standalone live controls', () => {
     )
   })
 
+  test.each([
+    [
+      'standalone',
+      (operation) => [
+        'docker',
+        [
+          'compose',
+          '-f',
+          path.resolve(__dirname, '../../docker-compose.racks.yml'),
+          operation,
+          'kafka2',
+        ],
+      ],
+    ],
+    [
+      'guarded',
+      (operation) => [
+        'timeout',
+        ['15s', 'node', 'guard.js', 'control', 'manifest.json', operation, 'kafka2'],
+      ],
+      { P9_CLUSTER_GUARD: 'guard.js', P9_CLUSTER_MANIFEST: 'manifest.json' },
+    ],
+  ])('%s resume unpauses a broker before it starts it', async (mode, argv, guard) => {
+    Object.assign(process.env, guard)
+    const resume = helpers.createBrokerResume(
+      helpers.createBrokerRun({ unpause: 15000, start: 15000 })
+    )
+
+    await expect(resume('kafka2')).resolves.toBeUndefined()
+
+    expect(execFile.mock.calls.map(([command, args]) => [command, args])).toEqual([
+      argv('unpause'),
+      argv('start'),
+    ])
+  })
+
+  test('resume still starts a broker whose unpause failed because it was not paused', async () => {
+    execFile.mockImplementationOnce((command, args, options, callback) =>
+      callback(new Error('Container is not paused'))
+    )
+    const resume = helpers.createBrokerResume(
+      helpers.createBrokerRun({ unpause: 15000, start: 15000 })
+    )
+
+    await expect(resume('kafka2')).resolves.toBeUndefined()
+
+    expect(execFile.mock.calls.map(([, args]) => args.slice(-2))).toEqual([
+      ['unpause', 'kafka2'],
+      ['start', 'kafka2'],
+    ])
+  })
+
+  test('resume rejects with the failure of the start that follows its unpause', async () => {
+    execFile
+      .mockImplementationOnce((command, args, options, callback) => callback(null, 'ok'))
+      .mockImplementationOnce((command, args, options, callback) =>
+        callback(new Error('Broker start failed'))
+      )
+    const resume = helpers.createBrokerResume(
+      helpers.createBrokerRun({ unpause: 15000, start: 15000 })
+    )
+
+    await expect(resume('kafka2')).rejects.toThrow('Broker start failed')
+
+    expect(execFile.mock.calls.map(([, args]) => args.slice(-2))).toEqual([
+      ['unpause', 'kafka2'],
+      ['start', 'kafka2'],
+    ])
+  })
+
+  test('resume refuses a runner with no unpause budget before it starts anything', async () => {
+    const resume = helpers.createBrokerResume(helpers.createBrokerRun({ start: 15000 }))
+
+    await expect(resume('kafka2')).rejects.toThrow('No guard budget for unpause')
+
+    expect(execFile).not.toHaveBeenCalled()
+  })
+
   test.each(['P9_CLUSTER_GUARD', 'P9_CLUSTER_MANIFEST'])(
     'refuses an incomplete environment with only %s',
     (variable) => {

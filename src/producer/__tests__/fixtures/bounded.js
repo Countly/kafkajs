@@ -218,6 +218,45 @@ const pollUntil = (signal, ms, check, { delayMs = 250, label = 'The wait' } = {}
   )
 
 /**
+ * `pollUntil` for a check that throws while its condition does not hold yet. What the check
+ * throws counts as "not yet"; the last such failure is kept, so a time-out says why the condition
+ * never held and not only that it did not. A failure caused by the poll's own abort is not one.
+ * @param {AbortSignal} signal
+ * @param {number} ms the budget of the whole poll
+ * @param {(scope: AbortSignal) => boolean|Promise<boolean>} check answers true when the condition
+ *   holds; false or a throw when it does not yet
+ * @param {object} [options] as `pollUntil`
+ * @param {number} [options.delayMs=250] the pause between checks
+ * @param {string} [options.label] names the poll in its time-out message
+ * @returns {Promise<void>}
+ * @throws {Error} `<label> did not settle within <ms> ms; last error: <name>: <message>`, with
+ *   the last tolerated failure as its `cause`; the plain `pollUntil` error when no check threw
+ */
+const pollTolerating = async (signal, ms, check, options) => {
+  let last
+  try {
+    await pollUntil(
+      signal,
+      ms,
+      async (scope) => {
+        try {
+          return await check(scope)
+        } catch (error) {
+          if (scope.aborted) throw error
+          last = error
+          return false
+        }
+      },
+      options
+    )
+  } catch (error) {
+    if (last === undefined) throw error
+    const detail = `${last?.name ?? 'Error'}: ${String(last?.message ?? last).slice(0, 150)}`
+    throw new Error(`${error.message}; last error: ${detail}`, { cause: last })
+  }
+}
+
+/**
  * The Jest timeout of a live case: its budget plus the join reserve, so that `bounded`'s expiry,
  * which taints the run, always fires before Jest can abandon the case.
  * @param {number} budgetMs the case's budget, as given to `liveCase`
@@ -259,5 +298,6 @@ module.exports = {
   delay,
   liveCase,
   liveRun,
+  pollTolerating,
   pollUntil,
 }
