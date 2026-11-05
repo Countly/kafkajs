@@ -131,7 +131,29 @@ suite('admin replica directories', () => {
         }, 100)
         expect(future.currentLogDir).toBe(source)
         expect(future.futureLogDir).toBe(destination)
-        const dirs = await probe.invoke(() => admin.describeLogDirs({ brokers: [1] }))
+        let dirs
+        let futureCopy
+        /**
+         * Reads until the future replica contains data; creating its directory can precede copying.
+         * @returns {Promise<boolean>} whether the destination lists this partition as a nonempty future log
+         * @throws {Error} broker or directory failure, abort or the probe's work deadline
+         */
+        const futureHasData = async () => {
+          dirs = await probe.invoke(() => admin.describeLogDirs({ brokers: [1] }))
+          probe.items(dirs)
+          for (const { logDirs } of dirs) probe.items(logDirs)
+          futureCopy = dirs
+            .flatMap(({ logDirs }) => logDirs)
+            .find(({ path }) => path === destination)
+          const partitions = futureCopy?.topics.find((entry) => entry.topic === topic)?.partitions
+          return (
+            partitions?.length === 1 &&
+            partitions[0].partition === replica.partition &&
+            partitions[0].isFuture === true &&
+            BigInt(partitions[0].size) > 0n
+          )
+        }
+        await probe.poll(futureHasData, 100)
         const version = probe.requests
           .filter(({ apiName }) => apiName === 'DescribeLogDirs')
           .at(-1).apiVersion
@@ -158,9 +180,6 @@ suite('admin replica directories', () => {
               }
           }
         }
-        const futureCopy = dirs
-          .flatMap(({ logDirs }) => logDirs)
-          .find(({ path }) => path === destination)
         expect(
           futureCopy.topics.find((entry) => entry.topic === topic).partitions[0].isFuture
         ).toBe(true)
