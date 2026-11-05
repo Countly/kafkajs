@@ -143,10 +143,15 @@ const PROJECTIONS = {
       })),
     }),
   },
-  // every API a broker offers is a triple of numbers
+  // every API a broker offers is a triple of numbers; a vector names its list `apiKeys`, and the
+  // two keys that describe an unknown tagged field are not values a decoder returns
   apiVersions: {
     decoded: (value) =>
       value.apiVersions ? { ...value, apiVersions: triples(value.apiVersions) } : value,
+    fields: ({ apiKeys, unknownTag, unknownTagBytes, ...fields }) => ({
+      ...fields,
+      apiVersions: triples(apiKeys),
+    }),
   },
   // the decoder sorts topics by name, the wire lists them as sent
   deleteTopics: {

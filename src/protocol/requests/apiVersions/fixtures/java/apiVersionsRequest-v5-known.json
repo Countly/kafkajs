@@ -1,0 +1,7 @@
+{
+  "message": "ApiVersionsRequest",
+  "version": 5,
+  "case": "known",
+  "hex": "10636f756e746c792d6b61666b616a730e332e302e302d616c7068612e3410746573742d636c75737465722d69640000000200",
+  "fields": { "clientSoftwareName": "countly-kafkajs", "clientSoftwareVersion": "3.0.0-alpha.4", "clusterId": "test-cluster-id", "nodeId": 2 }
+}

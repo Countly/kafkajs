@@ -1,0 +1,7 @@
+{
+  "message": "ApiVersionsResponse",
+  "version": 5,
+  "case": "rebootstrapRequired",
+  "hex": "0081010000001900",
+  "fields": { "errorCode": 129, "apiKeys": [], "throttleTime": 25, "supportedFeatures": [], "finalizedFeaturesEpoch": "-1", "finalizedFeatures": [] }
+}

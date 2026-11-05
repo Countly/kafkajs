@@ -733,6 +733,102 @@ describe('ScriptedCluster', () => {
     })
   })
 
+  describe('ApiVersions discovery', () => {
+    /** The body of an ApiVersions v5 request: software, cluster id, node id, no tags. */
+    const v5Body = (clusterId, nodeId) =>
+      new Encoder()
+        .writeUVarIntString('raw')
+        .writeUVarIntString('1')
+        .writeUVarIntString(clusterId)
+        .writeInt32(nodeId)
+        .writeTaggedFields().buffer
+
+    /** What a broker that offers ApiVersions up to v4 answers a v5 request, framed for correlation id 1. */
+    const UNSUPPORTED_FRAME =
+      '00000010' + // size: the correlation id and the 12 bytes of the body
+      '00000001' + // correlation id
+      '0023' + // UNSUPPORTED_VERSION
+      '00000001' + // one entry, in a classic array
+      '0012' +
+      '0000' +
+      '0004' // ApiVersions, 0 to 4
+
+    test('answers the first v5 request of a profile that offers v4 as a v4 broker does, and logs it in the trace only', async () => {
+      const cluster = createScriptedCluster({ nodes: NODES })
+
+      const { frames } = await exchange(cluster, frameOf(apiKeys.ApiVersions, 5, v5Body('c', 2)))
+
+      expect(frames.map((frame) => frame.toString('hex'))).toEqual([UNSUPPORTED_FRAME])
+      expect(cluster.apiVersionTrace()).toMatchObject([
+        { version: 5, discovery: true, fields: { clusterId: 'c', nodeId: 2 } },
+      ])
+      expect(cluster.requests()).toEqual([])
+      expect(cluster.timeline()).toEqual([])
+      cluster.assertClean()
+    })
+
+    test('answers a v5 request like any other when the profile offers v5', async () => {
+      const cluster = createScriptedCluster({ nodes: NODES, advertise: { ApiVersions: [5, 5] } })
+
+      const { frames } = await exchange(cluster, frameOf(apiKeys.ApiVersions, 5, v5Body(null, -1)))
+
+      expect(frames).toHaveLength(1)
+      expect(cluster.requests()).toMatchObject([
+        { api: 'ApiVersions', version: 5, fields: { clusterId: null, nodeId: -1 } },
+      ])
+      expect(cluster.requests()[0]).not.toHaveProperty('discovery')
+      expect(cluster.apiVersionTrace()).toEqual(cluster.requests())
+      cluster.assertClean()
+    })
+
+    test('a client of a profile that offers v4 asks v5 and then v4, and the schedule sees only the second', async () => {
+      const cluster = createScriptedCluster({ nodes: NODES })
+      const admin = track(clientOf(cluster).admin())
+      const gate = cluster.schedule.hold({ api: 'ApiVersions' })
+
+      const connecting = admin.connect()
+      const call = await within(gate.arrived(), 5000, 'the held ApiVersions call')
+
+      expect(call).toMatchObject({ api: 'ApiVersions', version: 4 })
+      expect(cluster.apiVersionTrace().map(({ version }) => version)).toEqual([5, 4])
+      gate.release()
+      await connecting
+      expect(cluster.requests().map(({ version }) => version)).toEqual([4])
+      cluster.assertClean()
+    })
+
+    test('does not hand a discovery request to a scripted answer', async () => {
+      const cluster = createScriptedCluster({ nodes: NODES })
+      const seen = []
+      cluster.answer('ApiVersions', (_fields, { version }) => {
+        seen.push(version)
+        return cluster.apiVersionsAnswer()
+      })
+      const admin = track(clientOf(cluster).admin())
+
+      await admin.connect()
+
+      expect(seen).toEqual([4])
+      cluster.assertClean()
+    })
+
+    test('refuses a discovery request with a byte after its tag buffer, answers nothing and fails the test', async () => {
+      const cluster = createScriptedCluster({ nodes: NODES })
+      const frame = frameOf(apiKeys.ApiVersions, 5, v5Body('c', 2))
+
+      const { frames, socket } = await exchange(
+        cluster,
+        sized(Buffer.concat([frame.subarray(4), Buffer.from([0xff])]))
+      )
+
+      expect(frames).toHaveLength(0)
+      expect(socket.destroyed).toBe(true)
+      expect(() => cluster.assertClean()).toThrow(
+        /cannot read the ApiVersions v5 request: .*after its tag buffer/
+      )
+    })
+  })
+
   describe('OffsetForLeaderEpoch v4 request bodies', () => {
     const encodeRequest = require('../../src/protocol/requests/offsetForLeaderEpoch/v4/request')
     const java = Buffer.from(

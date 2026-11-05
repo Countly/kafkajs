@@ -36,6 +36,8 @@ import org.apache.kafka.common.message.AddPartitionsToTxnRequestData;
 import org.apache.kafka.common.message.AddPartitionsToTxnResponseData;
 import org.apache.kafka.common.message.AlterConfigsRequestData;
 import org.apache.kafka.common.message.AlterConfigsResponseData;
+import org.apache.kafka.common.message.ApiVersionsRequestData;
+import org.apache.kafka.common.message.ApiVersionsResponseData;
 import org.apache.kafka.common.message.ConsumerGroupDescribeRequestData;
 import org.apache.kafka.common.message.ConsumerGroupDescribeResponseData;
 import org.apache.kafka.common.message.ConsumerGroupHeartbeatRequestData;
@@ -808,6 +810,7 @@ new ListConfigResourcesResponseData()
     vectors.addAll(createPartitions());
     vectors.addAll(deleteRecords());
     vectors.addAll(deleteGroups());
+    vectors.addAll(apiVersions());
     vectors.addAll(acls());
     vectors.addAll(describeTopicPartitions());
     vectors.addAll(joinGroup());
@@ -3523,6 +3526,197 @@ new ListConfigResourcesResponseData()
     return new DeleteGroupsResponseData.DeletableGroupResult()
         .setGroupId(groupId)
         .setErrorCode(code);
+  }
+
+  /** The client identity every ApiVersions request vector carries. */
+  private static final String SOFTWARE_NAME = "countly-kafkajs";
+  private static final String SOFTWARE_VERSION = "3.0.0-alpha.4";
+
+  /** The cluster id and node the {@code known} ApiVersions request names. */
+  private static final String CLUSTER_ID = "test-cluster-id";
+  private static final int KNOWN_NODE_ID = 2;
+
+  /** REBOOTSTRAP_REQUIRED and UNSUPPORTED_VERSION, the two ApiVersions answers the client acts on. */
+  private static final short REBOOTSTRAP_REQUIRED = 129;
+  private static final short UNSUPPORTED_VERSION = 35;
+
+  /** One ApiVersions entry: the API key and the versions the broker offers for it. */
+  private record Offered(int apiKey, int minVersion, int maxVersion) {}
+
+  /** One supported feature: its name and the version range the broker supports. */
+  private record Supported(String name, int minVersion, int maxVersion) {}
+
+  /** One finalized feature: its name and the cluster-wide level range. */
+  private record Finalized(String name, int minVersionLevel, int maxVersionLevel) {}
+
+  /**
+   * ApiVersions (18) v5 (KIP-1242): the request adds a nullable {@code ClusterId} and an
+   * {@code NodeId} (default -1) after the client software; the response keeps v4's body and adds
+   * the {@code REBOOTSTRAP_REQUIRED} answer. The request cases pin the defaults apart from a known
+   * pair, and node 0 from the -1 default; the response cases are a full answer with no throttle,
+   * one whose features support version 0 (KAFKA-17011), the 129 answer a broker sends for a wrong
+   * cluster or node, and one unknown tagged field in every struct. The cases other than the full
+   * answer carry a throttle, so a decoder that skips it fails.
+   *
+   * <p>The last vector is the v0-shaped UNSUPPORTED_VERSION answer a broker that offers ApiVersions
+   * up to v4 gives to a v5 request: the error code and one classic array holding the broker's own
+   * ApiVersions range.
+   *
+   * @return the key-18 vectors
+   */
+  private static List<Vector> apiVersions() {
+    List<Vector> vectors = new ArrayList<>();
+
+    vectors.add(apiVersionsRequest("defaults", SOFTWARE_NAME, SOFTWARE_VERSION, null, -1));
+    vectors.add(
+        apiVersionsRequest("known", SOFTWARE_NAME, SOFTWARE_VERSION, CLUSTER_ID, KNOWN_NODE_ID));
+    vectors.add(
+        apiVersionsRequest(
+            "nonAscii", "kafkajs-é", "3.0.0-日本", "cluster-é-日本", 0));
+
+    List<Offered> offered = List.of(new Offered(0, 3, 13), new Offered(18, 0, 5));
+    List<Supported> supported = List.of(new Supported("metadata.version", 1, 25));
+    List<Finalized> finalized = List.of(new Finalized("metadata.version", 1, 25));
+    vectors.add(apiVersionsResponse("ok", (short) 0, 0, offered, supported, 7L, finalized, false));
+    vectors.add(
+        apiVersionsResponse(
+            "features0",
+            (short) 0,
+            THROTTLE_TIME_MS,
+            offered,
+            List.of(new Supported("metadata.version", 1, 25), new Supported("transaction.version", 0, 2)),
+            7L,
+            List.of(new Finalized("metadata.version", 25, 25), new Finalized("transaction.version", 2, 2)),
+            false));
+    vectors.add(
+        apiVersionsResponse(
+            "rebootstrapRequired", REBOOTSTRAP_REQUIRED, THROTTLE_TIME_MS, List.of(), List.of(), -1L,
+            List.of(), false));
+    vectors.add(
+        apiVersionsResponse(
+            "unknownTags", (short) 0, THROTTLE_TIME_MS, offered, supported, 7L, finalized, true));
+
+    ApiVersionsResponseData.ApiVersionCollection unsupportedKeys =
+        new ApiVersionsResponseData.ApiVersionCollection();
+    unsupportedKeys.add(
+        new ApiVersionsResponseData.ApiVersion().setApiKey((short) 18).setMinVersion((short) 0).setMaxVersion((short) 4));
+    vectors.add(
+        new Vector("apiVersions", "ApiVersionsResponse", (short) 0, "unsupportedVersion",
+            new ApiVersionsResponseData().setErrorCode(UNSUPPORTED_VERSION).setApiKeys(unsupportedKeys),
+            obj(
+                kv("errorCode", num(UNSUPPORTED_VERSION)),
+                kv("apiKeys", array(obj(kv("apiKey", num(18)), kv("minVersion", num(0)), kv("maxVersion", num(4))))))));
+
+    return vectors;
+  }
+
+  /**
+   * @param caseId the vector's case
+   * @param softwareName the client software name
+   * @param softwareVersion the client software version
+   * @param clusterId the cluster the client intends to reach, or {@code null}
+   * @param nodeId the node it intends to reach, or -1
+   * @return an ApiVersions v5 request vector
+   */
+  private static Vector apiVersionsRequest(
+      String caseId, String softwareName, String softwareVersion, String clusterId, int nodeId) {
+    return new Vector("apiVersions", "ApiVersionsRequest", (short) 5, caseId,
+        new ApiVersionsRequestData()
+            .setClientSoftwareName(softwareName)
+            .setClientSoftwareVersion(softwareVersion)
+            .setClusterId(clusterId)
+            .setNodeId(nodeId),
+        obj(
+            kv("clientSoftwareName", str(softwareName)),
+            kv("clientSoftwareVersion", str(softwareVersion)),
+            kv("clusterId", str(clusterId)),
+            kv("nodeId", num(nodeId))));
+  }
+
+  /**
+   * @param caseId the vector's case
+   * @param errorCode the top-level error
+   * @param throttle the throttle time the broker reports, in milliseconds
+   * @param offered the APIs the broker offers
+   * @param supported the features it supports
+   * @param epoch the finalized features epoch, -1 for none
+   * @param finalized the finalized features
+   * @param unknownTags whether the response and every struct also carry one unknown tagged field
+   * @return an ApiVersions v5 response vector whose fixture restates its fields
+   */
+  private static Vector apiVersionsResponse(
+      String caseId, short errorCode, int throttle, List<Offered> offered,
+      List<Supported> supported, long epoch, List<Finalized> finalized, boolean unknownTags) {
+    ApiVersionsResponseData response =
+        new ApiVersionsResponseData()
+            .setErrorCode(errorCode)
+            .setThrottleTimeMs(throttle)
+            .setFinalizedFeaturesEpoch(epoch);
+    List<String> offeredJson = new ArrayList<>();
+    for (Offered entry : offered) {
+      ApiVersionsResponseData.ApiVersion apiVersion =
+          new ApiVersionsResponseData.ApiVersion()
+              .setApiKey((short) entry.apiKey())
+              .setMinVersion((short) entry.minVersion())
+              .setMaxVersion((short) entry.maxVersion());
+      if (unknownTags) {
+        apiVersion.unknownTaggedFields().add(new RawTaggedField(UNKNOWN_TAG, UNKNOWN_TAG_DATA));
+      }
+      response.apiKeys().add(apiVersion);
+      offeredJson.add(
+          obj(kv("apiKey", num(entry.apiKey())), kv("minVersion", num(entry.minVersion())),
+              kv("maxVersion", num(entry.maxVersion()))));
+    }
+
+    List<String> supportedJson = new ArrayList<>();
+    for (Supported entry : supported) {
+      ApiVersionsResponseData.SupportedFeatureKey feature =
+          new ApiVersionsResponseData.SupportedFeatureKey()
+              .setName(entry.name())
+              .setMinVersion((short) entry.minVersion())
+              .setMaxVersion((short) entry.maxVersion());
+      if (unknownTags) {
+        feature.unknownTaggedFields().add(new RawTaggedField(UNKNOWN_TAG, UNKNOWN_TAG_DATA));
+      }
+      response.supportedFeatures().add(feature);
+      supportedJson.add(
+          obj(kv("name", str(entry.name())), kv("minVersion", num(entry.minVersion())),
+              kv("maxVersion", num(entry.maxVersion()))));
+    }
+
+    List<String> finalizedJson = new ArrayList<>();
+    for (Finalized entry : finalized) {
+      ApiVersionsResponseData.FinalizedFeatureKey feature =
+          new ApiVersionsResponseData.FinalizedFeatureKey()
+              .setName(entry.name())
+              .setMinVersionLevel((short) entry.minVersionLevel())
+              .setMaxVersionLevel((short) entry.maxVersionLevel());
+      if (unknownTags) {
+        feature.unknownTaggedFields().add(new RawTaggedField(UNKNOWN_TAG, UNKNOWN_TAG_DATA));
+      }
+      response.finalizedFeatures().add(feature);
+      finalizedJson.add(
+          obj(kv("name", str(entry.name())), kv("minVersionLevel", num(entry.minVersionLevel())),
+              kv("maxVersionLevel", num(entry.maxVersionLevel()))));
+    }
+
+    List<String> fields =
+        new ArrayList<>(
+            List.of(
+                kv("errorCode", num(errorCode)),
+                kv("apiKeys", array(offeredJson.toArray(new String[0]))),
+                kv("throttleTime", num(throttle)),
+                kv("supportedFeatures", array(supportedJson.toArray(new String[0]))),
+                kv("finalizedFeaturesEpoch", str(String.valueOf(epoch))),
+                kv("finalizedFeatures", array(finalizedJson.toArray(new String[0])))));
+    if (unknownTags) {
+      response.unknownTaggedFields().add(new RawTaggedField(UNKNOWN_TAG, UNKNOWN_TAG_DATA));
+      fields.add(kv("unknownTag", num(UNKNOWN_TAG)));
+      fields.add(kv("unknownTagBytes", intArray(List.of(0xaa, 0xbb))));
+    }
+
+    return new Vector("apiVersions", "ApiVersionsResponse", (short) 5, caseId, response,
+        obj(fields.toArray(new String[0])));
   }
 
   /** One ACL (or ACL filter): the seven values the three ACL APIs share. */

@@ -5,6 +5,13 @@ const apiKeys = require('../src/protocol/requests/apiKeys')
 const { logLevel } = require('../index')
 const { TOPIC, TOPIC_ID } = require('../src/consumer/__tests__/fixtures/fetchHarness')
 const { MemberAssignment } = require('../src/consumer/assignerProtocol')
+const { requests: clientRequests } = require('../src/protocol/requests')
+
+/**
+ * The ApiVersions version the client asks first: the highest it implements. A cluster that offers
+ * a lower one answers it as a broker of that version does, with a v0-shaped UNSUPPORTED_VERSION.
+ */
+const DISCOVERY_VERSION = Math.max(...clientRequests.ApiVersions.versions.map(Number))
 
 /**
  * The pairs the bootstrap and the classic group protocol use: the one version of each that has a
@@ -225,6 +232,14 @@ const targetOf = (fields) => {
  * A cluster that exists only as sockets: the real client connects to it through its public
  * `socketFactory` option, and every request it writes is answered in process.
  *
+ * ApiVersions discovery: the client's first ApiVersions request is at the highest version it
+ * implements. When the profile offers a lower one, that request is read by the pair of the
+ * client's version and answered at once with the v0-shaped UNSUPPORTED_VERSION body of a broker
+ * that offers ApiVersions up to the profile's version; the client then asks again at that version,
+ * and that request is the one logged, scheduled and answered as any other. The discovery request is
+ * in `apiVersionTrace()` only, so `requests()`, `timeline()` and the schedule see one ApiVersions
+ * request per negotiation, as they do for a broker that offers the client's version.
+ *
  * It owns the node endpoints, the ApiVersions table of its profile, routing of each request through
  * a `Schedule` (so a test can hold, answer or fail any of them), and the log of requests. It owns
  * no log, group, transaction, leadership, quota or ACL state: what an answer holds is whatever the
@@ -360,9 +375,21 @@ class ScriptedCluster {
     return [...this.fake.state.sockets]
   }
 
-  /** @returns {RequestRecord[]} every request the client wrote, oldest first */
+  /**
+   * @returns {RequestRecord[]} every request the client wrote, oldest first, without the
+   *   ApiVersions discovery requests (see `apiVersionTrace`)
+   */
   requests() {
-    return [...this.log]
+    return this.log.filter(({ discovery }) => !discovery)
+  }
+
+  /**
+   * @returns {RequestRecord[]} every ApiVersions request the client wrote, oldest first, the
+   *   discovery requests a lower-versioned profile refused with UNSUPPORTED_VERSION included:
+   *   `[5, 4]` per negotiation against a profile that offers v4, `[5]` against one that offers v5
+   */
+  apiVersionTrace() {
+    return this.log.filter(({ apiKey }) => apiKey === apiKeys.ApiVersions)
   }
 
   /**
@@ -386,8 +413,15 @@ class ScriptedCluster {
       kind: 'mark',
       label,
     }))
-    for (const { order, answeredOrder, api, version, node, correlationId, generation } of this
-      .log) {
+    for (const {
+      order,
+      answeredOrder,
+      api,
+      version,
+      node,
+      correlationId,
+      generation,
+    } of this.requests()) {
       events.push({
         order,
         kind: 'request',
@@ -505,6 +539,7 @@ class ScriptedCluster {
   accept(node, generation, frame) {
     const header = headerOf(frame)
     const api = apiNameOf(header.apiKey)
+    const discovery = this.isDiscovery(header)
     const record = {
       node: node.id,
       api,
@@ -513,15 +548,67 @@ class ScriptedCluster {
       correlationId: header.correlationId,
       generation,
       fields: null,
-      order: this.clock++,
+      order: discovery ? this.clock : this.clock++,
+      ...(discovery && { discovery: true }),
     }
     this.log.push(record)
 
-    const pair = this.pairFor(api, header.apiVersion)
+    const pair = discovery ? pairOf(api, header.apiVersion) : this.pairFor(api, header.apiVersion)
+    if (!pair) {
+      throw new Error(`ScriptedCluster: no response builder for ${api} v${header.apiVersion}`)
+    }
+
     record.fields = reading(`the ${api} v${header.apiVersion} request`, () =>
       pair.readRequest(frame.subarray(header.byteLength))
     )
     return { record, pair }
+  }
+
+  /**
+   * @private
+   * @param {{ apiKey: number, apiVersion: number }} header
+   * @returns {boolean} whether the request is the client's first ApiVersions request, at the
+   *   highest version it implements, to a profile that offers a lower one
+   */
+  isDiscovery({ apiKey, apiVersion }) {
+    const offered = this.advertised.get('ApiVersions')?.[0]
+    return (
+      apiKey === apiKeys.ApiVersions &&
+      apiVersion === DISCOVERY_VERSION &&
+      offered !== undefined &&
+      offered < DISCOVERY_VERSION
+    )
+  }
+
+  /**
+   * Answers a discovery request as a broker that offers ApiVersions up to the profile's version
+   * does: UNSUPPORTED_VERSION with a v0-shaped body naming that range, on a later turn of the event
+   * loop and not at all on a socket destroyed by then. It is not scheduled and not answered by a
+   * scripted answerer: the request the client asks next is.
+   * @private
+   * @param {import('events').EventEmitter} socket the socket the request came in on
+   * @param {RequestRecord} record the logged discovery request
+   * @param {WirePair} pair the pair of the version it asked, which builds the body
+   * @returns {void}
+   */
+  refuseDiscovery(socket, record, pair) {
+    setImmediate(() => {
+      if (socket.destroyed) return
+      respondWithFrame(
+        { socket },
+        record.correlationId,
+        responseHeaderVersion(record.apiKey, record.version),
+        pair.buildUnsupportedVersionResponse({
+          apiKeys: [
+            {
+              apiKey: apiKeys.ApiVersions,
+              minVersion: 0,
+              maxVersion: this.advertised.get('ApiVersions')[0],
+            },
+          ],
+        })
+      )
+    })
   }
 
   /**
@@ -570,6 +657,11 @@ class ScriptedCluster {
     }
 
     const { record, pair } = accepted
+    if (record.discovery) {
+      this.refuseDiscovery(socket, record, pair)
+      return
+    }
+
     this.schedule
       .run({ ...record, ...targetOf(record.fields) }, () => this.defaultAnswer(pair, record))
       .then((answer) => (answer === undefined ? this.defaultAnswer(pair, record) : answer))

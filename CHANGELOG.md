@@ -190,6 +190,8 @@ Versions before 3.0.0 are internal alpha tags and are not published.
 
 - SCRAM authentication refuses a non-extending nonce, a non-integer or above-1 048 576 iteration count, and compares the server signature in constant time.
 
+- Against Kafka 4.4 brokers ApiVersions v5 checks the cluster and node ids (KIP-1242); `metadataRecoveryStrategy: 'none'` turns it off.
+
 #### Fixes
 
 - `KafkaJSNumberOfRetriesExceeded` names itself on the first line of its stack. It printed `KafkaJSNonRetriableError` there, its parent class, because the name was assigned after the stack was built (also in kafkajs 2.2.4).
@@ -241,6 +243,7 @@ Versions before 3.0.0 are internal alpha tags and are not published.
 - `npm run compat:fetch -- --source-root <dir>` imports the message snapshot and the error snapshot from an unpacked Apache Kafka source release (its `gradle.properties` must hold the pinned version) instead of the network, and refuses an absolute path, a `..` segment or a link that leaves the root. The snapshot is Kafka 4.4.0; the 4.3.1 snapshots stay beside it.
 - `scripts/protocol/javaVectorSources.json` records, for each Java vector, the `kafka-clients` jar that wrote it, that jar's SHA-256 (null only for the 4.3.1 jar of the older vectors) and the fixture's own SHA-256; `npm run protocol:generate` and `protocol:check` refuse a missing, extra, duplicate (a key written twice, found by its decoded text whatever the file's layout) or stale record and copy the records into `scripts/protocol/provenance.json`, where an API whose vectors came from two jars records no single jar.
 - The Java message-vector generator targets the Kafka 4.4 client API, and `test:e2e:delete-groups-v3` runs `deleteGroupsV3Live.spec.js` (`DELETE_GROUPS_V3_E2E`) against the broker version under test.
+- The scripted cluster answers a client's first ApiVersions v5 request as a Kafka 4.3 broker does, with a v0-shaped UNSUPPORTED_VERSION, so the inherited scenarios negotiate v4 as they did; `apiVersionTrace()` lists the discovery request, and `test:e2e:api-identity` runs `apiVersionsIdentityLive.spec.js` (`API_IDENTITY_E2E`) against the broker version under test.
 
 ### Phase 9B — Producer parity: delivery deadline, memory bound, request size, partitioner, codecs, lifecycle
 

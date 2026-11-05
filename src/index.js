@@ -341,7 +341,9 @@ module.exports = class Client {
    * @param {import("../types").ISocketFactory} [options.socketFactory]
    * @param {'rebootstrap'|'none'} [options.metadataRecoveryStrategy='rebootstrap'] KIP-899/1102:
    *   `'rebootstrap'` rebuilds the client's connections and metadata from the configured broker
-   *   list when metadata is unreachable; `'none'` restores pre-3.0 behavior.
+   *   list when metadata is unreachable or a broker answers `REBOOTSTRAP_REQUIRED`, including to
+   *   an ApiVersions v5 request that names the intended cluster and node (KIP-1242); `'none'`
+   *   names no identity in ApiVersions and restores pre-3.0 behavior.
    * @param {number} [options.metadataRecoveryRebootstrapTriggerMs=300000] how long metadata must
    *   fail *continuously* before a rebootstrap is triggered. Must be an integer >= 1.
    * @throws {KafkaJSInvalidConfigurationError} for an invalid `maxResponseSize`

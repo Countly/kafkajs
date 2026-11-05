@@ -1,0 +1,7 @@
+{
+  "message": "ApiVersionsResponse",
+  "version": 5,
+  "case": "features0",
+  "hex": "00000300000003000d00001200000005000000001903003003116d657461646174612e76657273696f6e0001001900147472616e73616374696f6e2e76657273696f6e000000020001080000000000000007023003116d657461646174612e76657273696f6e0019001900147472616e73616374696f6e2e76657273696f6e0002000200",
+  "fields": { "errorCode": 0, "apiKeys": [{ "apiKey": 0, "minVersion": 3, "maxVersion": 13 }, { "apiKey": 18, "minVersion": 0, "maxVersion": 5 }], "throttleTime": 25, "supportedFeatures": [{ "name": "metadata.version", "minVersion": 1, "maxVersion": 25 }, { "name": "transaction.version", "minVersion": 0, "maxVersion": 2 }], "finalizedFeaturesEpoch": "7", "finalizedFeatures": [{ "name": "metadata.version", "minVersionLevel": 25, "maxVersionLevel": 25 }, { "name": "transaction.version", "minVersionLevel": 2, "maxVersionLevel": 2 }] }
+}

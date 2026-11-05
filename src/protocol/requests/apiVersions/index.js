@@ -26,6 +26,11 @@ const versions = {
     const response = require('./v4/response')
     return { request: request(), response, logResponseError }
   },
+  5: ({ clusterId, nodeId } = {}) => {
+    const request = require('./v5/request')
+    const response = require('./v5/response')
+    return { request: request({ clusterId, nodeId }), response, logResponseError }
+  },
 }
 
 module.exports = {

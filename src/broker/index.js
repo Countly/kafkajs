@@ -116,6 +116,8 @@ const PRIVATE = {
   API_VERSIONS_AT: Symbol('private:Broker:apiVersionsAt'),
   NEGOTIATE_API_VERSIONS_VERSION: Symbol('private:Broker:negotiateApiVersionsVersion'),
   NEGOTIATE: Symbol('private:Broker:negotiate'),
+  IDENTITY: Symbol('private:Broker:apiVersionsIdentity'),
+  RECOVER: Symbol('private:Broker:recoverFromApiVersions'),
   CAPPED_LOOKUPS: Symbol('private:Broker:cappedLookups'),
 }
 
@@ -190,6 +192,14 @@ module.exports = class Broker {
    * @param {boolean} [options.allowAutoTopicCreation=true] If this and the broker config 'auto.create.topics.enable'
    *                                                are true, topics that don't exist will be created when
    *                                                fetching metadata.
+   * @param {() => {clusterId: string|null, nodeId: number}} [options.metadataIdentity] private
+   *   getter of the cluster and node this broker is meant to be (KIP-1242), read when each
+   *   ApiVersions request is built and never cached; without one the requests name no identity
+   * @param {'rebootstrap'|'none'} [options.metadataRecoveryStrategy='rebootstrap'] `'none'` sends no
+   *   identity and ignores `REBOOTSTRAP_REQUIRED` as a recovery trigger
+   * @param {(error: Error, source: {broker: Broker, pool: object}) => Promise<void>} [options.onApiVersionsFailure]
+   *   private observer of a `REBOOTSTRAP_REQUIRED` answer to this broker's ApiVersions request,
+   *   awaited before the error is thrown; it must not reject
    */
   constructor({
     connectionPool,
@@ -198,6 +208,9 @@ module.exports = class Broker {
     versions = null,
     authenticationTimeout = 10000,
     allowAutoTopicCreation = true,
+    metadataIdentity = null,
+    metadataRecoveryStrategy = 'rebootstrap',
+    onApiVersionsFailure = null,
   }) {
     this.connectionPool = connectionPool
 
@@ -237,6 +250,9 @@ module.exports = class Broker {
     this.versionsGeneration = null
     this.authenticationTimeout = authenticationTimeout
     this.allowAutoTopicCreation = allowAutoTopicCreation
+    this.metadataIdentity = metadataIdentity
+    this.metadataRecoveryStrategy = metadataRecoveryStrategy
+    this.onApiVersionsFailure = onApiVersionsFailure
 
     // Standalone and replacement pools must honor the Broker's legacy authenticationTimeout.
     this.connectionPool.authenticationTimeout = authenticationTimeout
@@ -442,6 +458,7 @@ module.exports = class Broker {
           attempt.fail(error)
         }
         attachFailureSource(error, { broker: this, generation: setupGeneration })
+        await this[PRIVATE.RECOVER](error, pool)
         throw error
       }
     } finally {
@@ -495,11 +512,19 @@ module.exports = class Broker {
    * The client asks for the highest ApiVersions version it implements. A broker that does not
    * support it answers UNSUPPORTED_VERSION (35) with a **v0-shaped body** that still carries the
    * `api_keys` entry for ApiVersions itself, so the retry can pick the exact best version in one
-   * step. An empty array means a pre-2.4 broker: fall back to v0. INVALID_REQUEST (42) means the
-   * broker rejected the client software name or version and is fatal for this connection; it is
-   * only handled on the first attempt, since the retried version is always ≤ v2 and sends no
-   * client software identity for a broker to reject.
+   * step; a broker below Kafka 4.4 therefore completes the negotiation at v4 after a first v5
+   * request that named no identity it could check. An empty array means a pre-2.4 broker: fall
+   * back to v0. INVALID_REQUEST (42) means the broker rejected the client software name or version
+   * and is fatal for this connection; it is only handled on the first attempt, since the retried
+   * version is always ≤ v4 and sends no identity for a broker to reject.
+   *
+   * A v5 request names the cluster and node this broker is meant to be once both are known
+   * (KIP-1242). A broker that disagrees answers REBOOTSTRAP_REQUIRED (129), which this throws as
+   * the typed error; its two callers, `connect()` and `apiVersions()`, hand it to the pool's
+   * observer before they throw it on. Under `metadataRecoveryStrategy: 'none'` no identity is
+   * sent and the observer is never asked.
    * @see https://cwiki.apache.org/confluence/display/KAFKA/KIP-511%3A+Collect+and+Expose+Client%27s+Name+and+Version+in+the+Brokers
+   * @see https://cwiki.apache.org/confluence/display/KAFKA/KIP-1242%3A+Rebootstrap+on+cluster+or+node+mismatch
    *
    * @public
    * @param {object} [options] internal fresh-response selection
@@ -509,7 +534,15 @@ module.exports = class Broker {
    * @throws {Error} negotiation, protocol, lifecycle or deadline failure
    */
   async apiVersions({ includeFeatures = false } = {}) {
-    const response = await this[PRIVATE.NEGOTIATE]()
+    const pool = this.connectionPool
+    let response
+    try {
+      response = await this[PRIVATE.NEGOTIATE]()
+    } catch (error) {
+      await this[PRIVATE.RECOVER](error, pool)
+      throw error
+    }
+
     return includeFeatures ? response : toVersionMap(response)
   }
 
@@ -629,15 +662,54 @@ module.exports = class Broker {
    */
   async [PRIVATE.API_VERSIONS_AT](version, guard, connection = null) {
     this.throwIfRefused(guard)
-    const apiVersions = requests.ApiVersions.protocol({ version })
-    if (connection) return connection.send({ ...apiVersions(), guard, responseGuard: guard })
+    const apiVersions = requests.ApiVersions.protocol({ version })(this[PRIVATE.IDENTITY]())
+    if (connection) return connection.send({ ...apiVersions, guard, responseGuard: guard })
     return await this[PRIVATE.SEND_REQUEST](
       {
-        ...apiVersions(),
+        ...apiVersions,
         requestTimeout: this.connectionPool.connectionTimeout,
       },
       guard
     )
+  }
+
+  /**
+   * The identity a v5 ApiVersions request names, read now and never cached, so a cluster the pool
+   * has since learned or replaced is the one a later request names. Versions below 5 take no
+   * identity, so what this returns never reaches their bytes.
+   * @private
+   * @returns {{clusterId: string|null, nodeId: number}|undefined} undefined under the `none`
+   *   strategy and for a broker built without a getter, which name no identity
+   */
+  [PRIVATE.IDENTITY]() {
+    if (this.metadataRecoveryStrategy === 'none' || !this.metadataIdentity) return undefined
+    return this.metadataIdentity()
+  }
+
+  /**
+   * Hands a REBOOTSTRAP_REQUIRED answer to the pool's observer, unless this broker no longer owns
+   * the pool the request went out on or the strategy is `none`; any other error is left alone. It
+   * runs only after the caller has finished with its own state (`connect()` has recorded the
+   * failed attempt), because recovery retires this broker and cancels what is still set up on it.
+   * The caller throws the answer either way: the round trip that got it never succeeds or
+   * publishes anything.
+   * @private
+   * @param {Error} error what the negotiation failed with
+   * @param {import("../network/connectionPool")} pool the pool the negotiation started on
+   * @returns {Promise<void>} settles once the observer has; the observer does not reject
+   */
+  async [PRIVATE.RECOVER](error, pool) {
+    if (
+      error?.type !== 'REBOOTSTRAP_REQUIRED' ||
+      this.metadataRecoveryStrategy !== 'rebootstrap' ||
+      !this.onApiVersionsFailure ||
+      this.retired ||
+      this.connectionPool !== pool
+    ) {
+      return
+    }
+
+    await this.onApiVersionsFailure(error, { broker: this, pool })
   }
 
   /**
