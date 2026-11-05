@@ -6,6 +6,14 @@ const { liveCase, caseTimeout } = require('../../producer/__tests__/fixtures/bou
 
 const suite = process.env.ADMIN_TOKENS_E2E ? describe : describe.skip
 const budget = 120000
+/**
+ * The fixture brokers keep the default 24 hour token expiry. A new token expires at the earlier of
+ * its maximum lifetime and 24 hours from issue; a renewal, at the earlier of the maximum lifetime
+ * and the renew period (at most 24 hours) from now. A lifetime beyond 24 hours and a 24 hour
+ * period let a renewal made after time has passed move the expiry further.
+ */
+const LIFETIME_MS = '172800000'
+const RENEW_PERIOD_MS = '86400000'
 
 /** @param {Error} error public error @returns {Error} deepest typed protocol cause */
 const causeOf = (error) => {
@@ -42,7 +50,7 @@ suite('admin delegation tokens', () => {
           const renewer = { principalType: 'User', principalName: 'test' }
           const created = await probe
             .invoke(() =>
-              admin.createDelegationToken({ renewers: [renewer], maxLifetimeMs: '60000' })
+              admin.createDelegationToken({ renewers: [renewer], maxLifetimeMs: LIFETIME_MS })
             )
             .catch((error) => {
               if (configuredCount !== 3) {
@@ -121,15 +129,24 @@ suite('admin delegation tokens', () => {
             []
           )
           expect(probe.requests).toHaveLength(count)
-          const renewed = await probe.invoke(() =>
-            admin.renewDelegationToken({ hmac: created.hmac, renewPeriodMs: '60000' })
+          await probe.poll(
+            async () => BigInt(Date.now()) > BigInt(created.issueTimestampMs) + 1000n
           )
-          expect(BigInt(renewed.expiryTimestampMs)).toBeGreaterThanOrEqual(
+          const renewed = await probe.invoke(() =>
+            admin.renewDelegationToken({ hmac: created.hmac, renewPeriodMs: RENEW_PERIOD_MS })
+          )
+          expect(BigInt(renewed.expiryTimestampMs)).toBeGreaterThan(
             BigInt(created.expiryTimestampMs)
           )
           expect(BigInt(renewed.expiryTimestampMs)).toBeLessThanOrEqual(
             BigInt(created.maxTimestampMs)
           )
+          const afterRenewal = (
+            await probe.invoke(() => admin.describeDelegationToken({ owners: [created.owner] }))
+          ).filter(({ tokenId }) => tokenId === created.tokenId)
+          probe.credentials.push(...afterRenewal.map(({ hmac }) => hmac))
+          expect(afterRenewal).toHaveLength(1)
+          expect(BigInt(afterRenewal[0].expiryTimestampMs)).toBe(BigInt(renewed.expiryTimestampMs))
           await probe.invoke(() =>
             admin.expireDelegationToken({ hmac: created.hmac, expiryTimePeriodMs: '0' })
           )

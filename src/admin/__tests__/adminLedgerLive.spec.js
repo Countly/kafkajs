@@ -11,6 +11,49 @@ const { liveCase, caseTimeout } = require('../../producer/__tests__/fixtures/bou
 const suite = process.env.ADMIN_LEDGER_E2E ? describe : describe.skip
 const budget = 540000
 
+/**
+ * Maps a config entry as requested to the shape DescribeConfigs answers with.
+ * @param {{name: string, value: string}} entry request-side entry
+ * @returns {{configName: string, configValue: string}} response-side entry
+ */
+const asDescribed = ({ name, value }) => ({ configName: name, configValue: value })
+
+/**
+ * Picks the fields that identify an ACL, from an ACL or a DeleteAcls match.
+ * @param {object} acl ACL or match
+ * @returns {object} resource, pattern, principal, host, operation and permission
+ */
+const aclIdentity = ({
+  resourceType,
+  resourceName,
+  resourcePatternType,
+  principal,
+  host,
+  operation,
+  permissionType,
+}) => ({
+  resourceType,
+  resourceName,
+  resourcePatternType,
+  principal,
+  host,
+  operation,
+  permissionType,
+})
+
+/**
+ * Checks that a DeleteAcls answer to one filter succeeded, in the response and in every match.
+ * @param {{filterResponses: object[]}} answer public deleteAcls result
+ * @returns {object[]} identities of the ACLs the filter deleted, possibly none
+ * @throws {Error} not exactly one filter response, or any error code
+ */
+const deletedAcls = ({ filterResponses }) => {
+  expect(filterResponses).toHaveLength(1)
+  expect(filterResponses[0].errorCode).toBe(0)
+  for (const match of filterResponses[0].matchingAcls) expect(match.errorCode).toBe(0)
+  return filterResponses[0].matchingAcls.map(aclIdentity)
+}
+
 /** Serial broker observations with separate physical, committed and handler identities. */
 class AdminLedgerScenario {
   /** @param {AdminLiveProbe} probe bounded owner @returns {AdminLedgerScenario} scenario */
@@ -45,6 +88,25 @@ class AdminLedgerScenario {
     )
     await p.invoke(() => broker.connect())
     return broker
+  }
+
+  /**
+   * Deletes ACLs through one filter and proves the outcome: a single successful response that
+   * deleted exactly the expected ACLs, after which DescribeAcls finds nothing under the filter.
+   * @param {object} client admin that owns the ACLs
+   * @param {object} filter complete delete filter, also used to describe what remains
+   * @param {object[]} expected the ACLs the filter must delete, whatever order they come back in
+   * @returns {Promise<void>}
+   * @throws {Error} a failed answer, other ACLs deleted, or an ACL that remains until the budget ends
+   */
+  async removeAcls(client, filter, expected) {
+    const p = this.probe
+    const order = (rows) => rows.map((row) => JSON.stringify(aclIdentity(row))).sort()
+    const deleted = deletedAcls(await p.invoke(() => client.deleteAcls({ filters: [filter] })))
+    expect(order(deleted)).toEqual(order(expected))
+    await p.poll(
+      async () => (await p.invoke(() => client.describeAcls(filter))).resources.length === 0
+    )
   }
 
   /**
@@ -141,7 +203,7 @@ class AdminLedgerScenario {
     }
     const admin = kafka.admin()
     p.cleanup.add('metadata cache witness admin', () =>
-      admin.disconnect({ timeout: Math.min(5000, p.remaining()) })
+      admin.disconnect({ timeout: p.wholeMs(5000) })
     )
     p.removers.push(admin.on(admin.events.REQUEST, ({ payload }) => p.requests.push(payload)))
     await p.invoke(() => admin.connect())
@@ -560,18 +622,32 @@ class AdminLedgerScenario {
       )
     })
     const featuresBeforeValidation = await p.invoke(() => admin.describeFeatures())
-    const [name, feature] =
-      Object.entries(featuresBeforeValidation.finalizedFeatures).find(([key]) =>
-        Object.hasOwn(featuresBeforeValidation.supportedFeatures, key)
-      ) || []
-    expect(typeof name).toBe('string')
+    const lowered = Object.entries(featuresBeforeValidation.finalizedFeatures)
+      .filter(
+        ([key, { maxVersionLevel }]) =>
+          !['metadata.version', 'kraft.version'].includes(key) &&
+          featuresBeforeValidation.supportedFeatures[key]?.minVersion < maxVersionLevel
+      )
+      .sort(([a], [b]) => a.localeCompare(b))[0]
+    if (!lowered) throw new Error('No finalized feature has a lower supported level')
+    const [name, { maxVersionLevel: original }] = lowered
+    p.effects.add('restore validated feature level', async () => {
+      const current = (await admin.describeFeatures()).finalizedFeatures[name]
+      if (current?.maxVersionLevel !== original)
+        p.items(
+          await admin.updateFeatures({
+            features: [{ name, maxVersionLevel: original, upgradeType: 'upgrade' }],
+          })
+        )
+    })
     const updated = await p.invoke(() =>
       admin.updateFeatures({
         validateOnly: true,
-        features: [{ name, maxVersionLevel: feature.maxVersionLevel }],
+        features: [{ name, maxVersionLevel: original - 1, upgradeType: 'safe-downgrade' }],
       })
     )
     p.items(updated)
+    expect(updated.map(({ feature }) => feature)).toEqual([name])
     const featuresAfterValidation = await p.invoke(() => admin.describeFeatures())
     expect(featuresAfterValidation).toEqual(featuresBeforeValidation)
     const resourceName = `e2e-metrics-${this.id}`
@@ -622,7 +698,9 @@ class AdminLedgerScenario {
     )
     p.items(described.resources)
     for (const entry of entries)
-      expect(described.resources[0].configEntries).toContainEqual(expect.objectContaining(entry))
+      expect(described.resources[0].configEntries).toContainEqual(
+        expect.objectContaining(asDescribed(entry))
+      )
     p.items((await p.invoke(remove)).resources)
     let metricsResourceAbsentAfterDeletion = false
     await p.poll(async () => {
@@ -702,7 +780,7 @@ class AdminLedgerScenario {
       ).resources
     )
     expect((await configs()).resources[0].configEntries).toContainEqual(
-      expect.objectContaining(candidate[0])
+      expect.objectContaining(asDescribed(candidate[0]))
     )
     const changes = [{ name: 'retention.ms', value: '-1', operation: AlterConfigOpTypes.SET }]
     p.items(
@@ -716,7 +794,7 @@ class AdminLedgerScenario {
       ).resources
     )
     expect((await configs()).resources[0].configEntries).toContainEqual(
-      expect.objectContaining(candidate[0])
+      expect.objectContaining(asDescribed(candidate[0]))
     )
     p.items(
       (
@@ -726,7 +804,7 @@ class AdminLedgerScenario {
       ).resources
     )
     expect((await configs()).resources[0].configEntries).toContainEqual(
-      expect.objectContaining({ name: 'retention.ms', value: '-1' })
+      expect.objectContaining(asDescribed({ name: 'retention.ms', value: '-1' }))
     )
     const replicas = (await metadata()).topics[0].partitions[0].replicas
     const reassignment = (nodes) =>
@@ -934,15 +1012,13 @@ class AdminLedgerScenario {
       operation: 8,
       permissionType: 3,
     }
-    p.effects.add('remove topic ACL', () => admin.deleteAcls({ filters: [acl] }))
+    p.effects.add('remove topic ACL', async () => {
+      deletedAcls(await admin.deleteAcls({ filters: [acl] }))
+    })
     expect(await p.invoke(() => admin.createAcls({ acl: [acl] }))).toBe(true)
     const described = await p.invoke(() => admin.describeAcls(acl))
     expect(described.resources).toHaveLength(1)
-    const deleted = await p.invoke(() => admin.deleteAcls({ filters: [acl] }))
-    for (const filter of deleted.filterResponses) {
-      expect(filter.errorCode).toBe(0)
-      for (const match of filter.matchingAcls) expect(match.errorCode).toBe(0)
-    }
+    await this.removeAcls(admin, acl, [acl])
     const deletedTopicId = original.topicId
     expect(await p.invoke(() => admin.deleteTopics({ topicIds: [deletedTopicId] }))).toBeUndefined()
     await p.poll(async () => !(await p.invoke(() => admin.listTopics())).includes(topic))
@@ -1097,7 +1173,9 @@ class AdminLedgerScenario {
       { resourceType: 3, resourceName: groupId, operation: 6, permissionType: 2 },
     ].map((row) => ({ ...row, resourcePatternType: 3, principal: `User:${user}`, host: '*' }))
     for (const acl of maskAcls)
-      p.effects.add('remove mask ACL', () => root.deleteAcls({ filters: [acl] }))
+      p.effects.add('remove mask ACL', async () => {
+        deletedAcls(await root.deleteAcls({ filters: [acl] }))
+      })
     expect(await p.invoke(() => root.createAcls({ acl: maskAcls }))).toBe(true)
     const [maskHost, maskPort] = saslBrokers()[0].split(':')
     const maskRaw = new Broker({
@@ -1159,10 +1237,7 @@ class AdminLedgerScenario {
       groupMask: publicGroupMask,
       groupId,
     })
-    for (const acl of maskAcls) {
-      const removed = await p.invoke(() => root.deleteAcls({ filters: [acl] }))
-      for (const row of removed.filterResponses) expect(row.errorCode).toBe(0)
-    }
+    for (const acl of maskAcls) await this.removeAcls(root, acl, [acl])
     const txId = `e2e-acl-txn-${this.id}`
     const producer = await p.client('producer', { transactionalId: txId, idempotent: true })
     const warm = await p.invoke(() => producer.transaction())
@@ -1432,9 +1507,9 @@ class AdminLedgerScenario {
         operation: check.operation,
         permissionType: 3,
       }
-      p.effects.add('remove permission ACL', () =>
-        root.deleteAcls({ filters: [{ ...acl, permissionType: 1 }] })
-      )
+      p.effects.add('remove permission ACL', async () => {
+        deletedAcls(await root.deleteAcls({ filters: [{ ...acl, permissionType: 1 }] }))
+      })
       const dependencies = []
       if (['offset deletion'].includes(check.name))
         dependencies.push({ resourceType: 2, resourceName: topic, operation: 3 })
@@ -1451,7 +1526,9 @@ class AdminLedgerScenario {
         dependencies.push({ resourceType: 5, resourceName: txId, operation: 8 })
       const dependencyAcls = dependencies.map((entry) => ({ ...acl, ...entry }))
       for (const dependency of dependencyAcls) {
-        p.effects.add('remove dependency ACL', () => root.deleteAcls({ filters: [dependency] }))
+        p.effects.add('remove dependency ACL', async () => {
+          deletedAcls(await root.deleteAcls({ filters: [dependency] }))
+        })
         expect(await p.invoke(() => root.createAcls({ acl: [dependency] }))).toBe(true)
       }
       expect(await p.invoke(() => root.createAcls({ acl: [acl] }))).toBe(true)
@@ -1498,14 +1575,11 @@ class AdminLedgerScenario {
         observedTypes.push(failure.type)
       }
       observedCodes.push(check.code)
-      const removed = await p.invoke(() =>
-        root.deleteAcls({ filters: [{ ...acl, permissionType: 1 }] })
-      )
-      for (const response of removed.filterResponses) expect(response.errorCode).toBe(0)
-      for (const dependency of dependencyAcls) {
-        const deletion = await p.invoke(() => root.deleteAcls({ filters: [dependency] }))
-        for (const row of deletion.filterResponses) expect(row.errorCode).toBe(0)
-      }
+      await this.removeAcls(root, { ...acl, permissionType: 1 }, [
+        acl,
+        { ...acl, permissionType: 2 },
+      ])
+      for (const dependency of dependencyAcls) await this.removeAcls(root, dependency, [dependency])
       p.record(`permission ${check.name}`, {
         operationId: check.name,
         authorizationCode: check.code,

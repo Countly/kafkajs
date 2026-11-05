@@ -481,10 +481,16 @@ describe('admin lifecycle', () => {
         throw failure
       },
     })
-    await one.admin.listTopics().catch(async (error) => {
-      expect(error).toBe(failure)
-      await one.admin.disconnect()
-    })
+    let handled = false
+    await expect(
+      one.admin.listTopics().catch(async (error) => {
+        await one.admin.disconnect()
+        handled = true
+        throw error
+      })
+    ).rejects.toBe(failure)
+    expect(handled).toBe(true)
+    expect(one.cluster.disconnect).toHaveBeenCalledTimes(1)
     const two = fixture()
     const closed = held()
     two.admin.on(two.admin.events.CONNECT, () =>

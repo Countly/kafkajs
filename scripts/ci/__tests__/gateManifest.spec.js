@@ -76,6 +76,16 @@ describe('exit gate manifest', () => {
     }
   })
 
+  test('the frozen coverage run tolerates every skip a group check on the same compose file tolerates', () => {
+    const frozen = gate.checks.find(({ id }) => id === 'coverage-frozen')
+    const tolerated = new Set(frozen.allowedSkips)
+    const missing = gate.checks
+      .filter(({ id, compose }) => id.startsWith('group-') && compose === frozen.compose)
+      .flatMap(({ allowedSkips = [] }) => allowedSkips)
+      .filter((skip) => !tolerated.has(skip))
+    expect(missing).toEqual([])
+  })
+
   test('every expected title names an existing spec that its check selects', () => {
     for (const check of gate.checks) {
       if (!check.jest || !check.titles) continue

@@ -1,5 +1,6 @@
 const { getEventListeners } = require('events')
 const mockClients = []
+const mockAdminOptions = []
 const mockActions = []
 let mockConnectFailure
 const mockWrite = jest.fn()
@@ -13,8 +14,10 @@ jest.mock('fs', () => ({
 jest.mock('child_process', () => ({ execFile: (...args) => mockExec(...args) }))
 jest.mock('../../../index', () => ({
   Kafka: jest.fn().mockImplementation(() => ({
-    admin: () => {
+    admin: (options) => {
       const emitter = new (require('events').EventEmitter)()
+      let connected = false
+      mockAdminOptions.push(options)
       const client = {
         events: { REQUEST: 'request' },
         emitter,
@@ -25,8 +28,20 @@ jest.mock('../../../index', () => ({
         connect: jest.fn(async () => {
           mockActions.push('connect')
           if (mockConnectFailure) throw mockConnectFailure
+          connected = true
         }),
-        disconnect: jest.fn(async () => mockActions.push('disconnect')),
+        disconnect: jest.fn(async () => {
+          mockActions.push('disconnect')
+          connected = false
+        }),
+        createTopics: jest.fn(async () => true),
+        fetchTopicMetadata: jest.fn(async ({ topics }) => ({
+          topics: topics.map((name) => ({ name, topicId: `id-${name}` })),
+        })),
+        deleteTopics: jest.fn(async ({ topics }) => {
+          if (!connected) throw new Error('The admin is disconnected')
+          mockActions.push(`delete ${topics[0]}`)
+        }),
       }
       mockClients.push(client)
       return client
@@ -58,6 +73,7 @@ beforeEach(() => {
   liveRun.reset()
   jest.clearAllMocks()
   mockClients.length = 0
+  mockAdminOptions.length = 0
   mockActions.length = 0
   mockConnectFailure = undefined
   process.env.P9_CLUSTER_GUARD = 'fake-guard'
@@ -134,22 +150,6 @@ test('reserve refuses a mutation before invoking its thunk', () => {
   const work = jest.fn()
   expect(() => probe.invoke(work)).toThrow('reserve')
   expect(work).not.toHaveBeenCalled()
-})
-
-test('timeout taints and cancels a guarded command before another can start', async () => {
-  const { probe } = scenario()
-  probe.due = performance.now() + probe.reserve + 30
-  let commandSignal
-  mockExec.mockImplementation((file, argv, options, callback) => {
-    commandSignal = options.signal
-    commandSignal.addEventListener('abort', () => callback(commandSignal.reason), { once: true })
-    return { stdin: { end: jest.fn() } }
-  })
-  await expect(probe.host('kafka1', ['literal', 'a b'])).rejects.toThrow()
-  expect(commandSignal.aborted).toBe(true)
-  expect(liveRun.tainted).toBe(true)
-  expect(() => probe.host('kafka1', ['again'])).toThrow('earlier case')
-  expect(mockExec).toHaveBeenCalledTimes(1)
 })
 
 test('guard command keeps literal operands and manifest with bounded output', async () => {
@@ -283,36 +283,6 @@ test('owner cancellation preserves primary failure while effects precede client 
   expect(getEventListeners(owner.signal, 'abort')).toHaveLength(before)
 })
 
-test('cleanup budget cancels stuck effect and still attempts later cleanup', async () => {
-  const { probe } = scenario()
-  let stopped = false
-  const began = performance.now()
-  await expect(
-    probe.finish(async () => {
-      probe.due = performance.now() + 120
-      probe.cleanup.add('later', async () => mockActions.push('later'))
-      probe.effects.add(
-        'stuck',
-        (signal) =>
-          new Promise((resolve) =>
-            signal.addEventListener(
-              'abort',
-              () => {
-                stopped = true
-                resolve()
-              },
-              { once: true }
-            )
-          )
-      )
-    })
-  ).rejects.toThrow('cleanup')
-  expect(stopped).toBe(true)
-  expect(performance.now() - began).toBeLessThan(350)
-  expect(mockActions).toEqual(['later'])
-  expect(liveRun.tainted).toBe(true)
-})
-
 test('cleanup failure retains primary error and attempts every restoration', async () => {
   const { probe } = scenario()
   const primary = new Error('work')
@@ -396,37 +366,6 @@ test('refuses credential markers disguised as ordinary evidence', () => {
   expect(mockWrite).not.toHaveBeenCalled()
 })
 
-test('cleanup cancellation reaches a running guard child before the inclusive budget', async () => {
-  const { probe } = scenario()
-  let childSignal
-  let cancelledAt
-  const began = performance.now()
-  mockExec.mockImplementation((file, argv, options, callback) => {
-    childSignal = options.signal
-    childSignal.addEventListener(
-      'abort',
-      () => {
-        cancelledAt = performance.now()
-        callback(childSignal.reason)
-      },
-      { once: true }
-    )
-    return { stdin: { end: jest.fn() } }
-  })
-  await expect(
-    probe.finish(async () => {
-      probe.due = performance.now() + 1200
-      probe.effects.add('guard effect', () => probe.host('kafka1', ['restore']))
-      probe.cleanup.add('after guard', async () => {
-        expect(childSignal.aborted).toBe(true)
-        mockActions.push('after')
-      })
-    })
-  ).rejects.toThrow('cleanup')
-  expect(mockActions).toEqual(['after'])
-  expect(cancelledAt - began).toBeLessThan(1000)
-})
-
 test.each([null, 0, false])('retains a falsy primary failure (%#)', async (primary) => {
   const { probe } = scenario()
   await expect(
@@ -489,4 +428,187 @@ test('refuses retained owner signal listeners', async () => {
   } finally {
     owner.signal.removeEventListener('abort', listener)
   }
+})
+
+describe('deadlines under a fake clock', () => {
+  beforeEach(() =>
+    jest.useFakeTimers({ doNotFake: ['nextTick', 'queueMicrotask', 'setImmediate'] })
+  )
+  afterEach(() => jest.useRealTimers())
+
+  /**
+   * Swaps the event-loop probe, which refuses to read while timers are fake, for a constant one.
+   * @param {AdminLiveProbe} probe scenario under test
+   * @returns {void}
+   */
+  const stubResources = (probe) => {
+    const snapshot = { sockets: { open: 0 }, activeResources: {} }
+    probe.resourceProbe = { snapshot: async () => snapshot }
+  }
+
+  /**
+   * Advances the fake clock one millisecond at a time until the promise settles, so no deadline
+   * passes unseen.
+   * @param {Promise<unknown>} promise operation under test
+   * @returns {Promise<{value?: unknown, error?: unknown}>} how it settled
+   * @throws {Error} when it has not settled after 5000 simulated milliseconds
+   */
+  const settle = async (promise) => {
+    const outcome = { settled: false }
+    promise.then(
+      (value) => Object.assign(outcome, { settled: true, value }),
+      (error) => Object.assign(outcome, { settled: true, error })
+    )
+    for (let ms = 0; ms < 5000 && !outcome.settled; ms++) {
+      await jest.advanceTimersByTimeAsync(1)
+      await new Promise((resolve) => setImmediate(resolve))
+    }
+    if (!outcome.settled) throw new Error('Did not settle')
+    return outcome
+  }
+
+  test('a guarded command that outlives its allowance is cancelled, taints the run and blocks the next command', async () => {
+    const { probe } = scenario()
+    probe.due = performance.now() + probe.reserve + 30
+    let commandSignal
+    mockExec.mockImplementation((file, argv, options, callback) => {
+      commandSignal = options.signal
+      commandSignal.addEventListener('abort', () => callback(commandSignal.reason), { once: true })
+      return { stdin: { end: jest.fn() } }
+    })
+    const outcome = probe.host('kafka1', ['literal', 'a b']).then(
+      () => null,
+      (error) => error
+    )
+    await jest.advanceTimersByTimeAsync(29)
+    expect(commandSignal.aborted).toBe(false)
+    await jest.advanceTimersByTimeAsync(1)
+    expect((await outcome).message).toBe('The operation did not settle within 30 ms')
+    expect(commandSignal.aborted).toBe(true)
+    expect(liveRun.tainted).toBe(true)
+    expect(() => probe.host('kafka1', ['again'])).toThrow('earlier case')
+    expect(mockExec).toHaveBeenCalledTimes(1)
+  })
+
+  test('a stuck effect is cut off before the inclusive deadline and the later cleanup still runs', async () => {
+    const { probe } = scenario()
+    stubResources(probe)
+    const began = performance.now()
+    let stoppedAt
+    const { error } = await settle(
+      probe.finish(async () => {
+        probe.due = performance.now() + 120
+        probe.cleanup.add('later', async () => mockActions.push('later'))
+        probe.effects.add(
+          'stuck',
+          (signal) =>
+            new Promise((resolve) =>
+              signal.addEventListener(
+                'abort',
+                () => {
+                  stoppedAt = performance.now()
+                  mockActions.push('stopped')
+                  resolve()
+                },
+                { once: true }
+              )
+            )
+        )
+      })
+    )
+    expect(error).toBeInstanceOf(AggregateError)
+    expect(error.errors.map(({ message }) => message)).toEqual([
+      'stuck: The cleanup did not settle within 60 ms',
+    ])
+    expect(stoppedAt - began).toBeLessThan(120)
+    expect(mockActions).toEqual(['stopped', 'later'])
+    expect(liveRun.tainted).toBe(true)
+  })
+
+  test('cleanup cancellation reaches a running guard child before the next cleanup and the inclusive budget', async () => {
+    const { probe } = scenario()
+    stubResources(probe)
+    const began = performance.now()
+    let cancelledAt
+    mockExec.mockImplementation((file, argv, options, callback) => {
+      options.signal.addEventListener(
+        'abort',
+        () => {
+          cancelledAt = performance.now()
+          mockActions.push('child cancelled')
+          callback(options.signal.reason)
+        },
+        { once: true }
+      )
+      return { stdin: { end: jest.fn() } }
+    })
+    const { error } = await settle(
+      probe.finish(async () => {
+        probe.due = performance.now() + 1200
+        probe.effects.add('guard effect', () => probe.host('kafka1', ['restore']))
+        probe.cleanup.add('after guard', async () => mockActions.push('after'))
+      })
+    )
+    expect(error).toBeInstanceOf(AggregateError)
+    expect(error.errors.map(({ message }) => message)).toEqual([
+      'guard effect: The cleanup did not settle within 700 ms',
+    ])
+    expect(mockActions).toEqual(['child cancelled', 'after'])
+    expect(cancelledAt - began).toBeLessThan(1200)
+  })
+
+  /** @returns {AdminLiveProbe} a lifecycle scenario, whose cleanup reserve is 1000 ms */
+  const lifecycle = () =>
+    new AdminLiveProbe({
+      stem: 'admin-lifecycle',
+      signal: new AbortController().signal,
+      budgetMs: 10000,
+    })
+
+  test('an admin and its disconnect get whole milliseconds from a fractional allowance', async () => {
+    const probe = lifecycle()
+    stubResources(probe)
+    await probe.finish(async () => {
+      probe.due = performance.now() + probe.reserve + 2500.5
+      await probe.start()
+    })
+    expect(mockAdminOptions).toEqual([{ apiTimeout: 2500 }])
+    expect(mockClients[0].disconnect).toHaveBeenCalledExactlyOnceWith({ timeout: 3500 })
+  })
+
+  test('no admin is constructed once the work allowance is exhausted', async () => {
+    const probe = lifecycle()
+    probe.due = performance.now() + probe.reserve + 0.5
+    await expect(probe.start()).rejects.toThrow('Scenario cleanup reserve reached')
+    expect(Kafka).not.toHaveBeenCalled()
+    expect(mockClients).toEqual([])
+  })
+})
+
+describe('topic helper', () => {
+  test('creates a default topic when called without arguments and deletes it on a connected owner', async () => {
+    const { probe } = scenario()
+    let topic
+    await probe.finish(async () => {
+      const admin = await probe.start()
+      topic = await probe.topic()
+      expect(topic).toMatch(/^e2e-p9d-admin-ledger-data-[0-9a-f]{12}$/)
+      expect(admin.createTopics).toHaveBeenCalledExactlyOnceWith({
+        topics: [expect.objectContaining({ topic, numPartitions: 1, replicationFactor: 2 })],
+      })
+    })
+    expect(mockActions).toEqual(['connect', 'connect', `delete ${topic}`, 'disconnect'])
+  })
+
+  test('removes its topic through the owner a scenario closed for good, before closing it again', async () => {
+    const { probe } = scenario()
+    let topic
+    await probe.finish(async () => {
+      const admin = await probe.start()
+      topic = await probe.topic({ name: 'gone' })
+      await admin.disconnect()
+      mockActions.length = 0
+    })
+    expect(mockActions).toEqual(['connect', `delete ${topic}`, 'disconnect'])
+  })
 })

@@ -107,6 +107,16 @@ class AdminLiveProbe {
   }
 
   /**
+   * Converts the time left into the integer milliseconds the public clients accept.
+   * @param {number} [cap=Infinity] most milliseconds to allow
+   * @param {number} [held=0] milliseconds to keep unspent, e.g. the cleanup reserve
+   * @returns {number} whole milliseconds, never negative
+   */
+  wholeMs(cap = Infinity, held = 0) {
+    return Math.max(0, Math.floor(Math.min(cap, this.remaining() - held)))
+  }
+
+  /**
    * Executes one lazy operation without retries or outcome translation.
    * @template T
    * @param {() => Promise<T>} work signal-checked operation
@@ -137,14 +147,12 @@ class AdminLiveProbe {
    * Creates and connects an admin, registering bounded close before connection starts.
    * @param {object} [options] Kafka constructor overrides
    * @returns {Promise<import('../../../../types').Admin>} connected public admin
-   * @throws {Error} original construction/connect failure
+   * @throws {Error} no work allowance left, or original construction/connect failure
    */
   async start(options = {}) {
-    return this.client(
-      'admin',
-      { apiTimeout: Math.min(60000, this.remaining() - this.reserve) },
-      options
-    )
+    const apiTimeout = this.wholeMs(60000, this.reserve)
+    if (apiTimeout < 1) throw new Error('Scenario cleanup reserve reached')
+    return this.client('admin', { apiTimeout }, options)
   }
 
   /**
@@ -167,7 +175,7 @@ class AdminLiveProbe {
       const client = kafka[kind](clientOptions)
       this.clients.push(client)
       this.cleanup.add(`${kind} disconnect`, () =>
-        client.disconnect({ timeout: Math.min(5000, this.remaining()) })
+        client.disconnect({ timeout: this.wholeMs(5000) })
       )
       this.removers.push(
         client.on(client.events.REQUEST, ({ payload }) => this.requests.push(payload))
@@ -178,8 +186,10 @@ class AdminLiveProbe {
   }
 
   /**
-   * Creates a uniquely named topic, registering removal before the mutation.
-   * @param {object} options name suffix and public createTopics settings
+   * Creates a uniquely named topic, registering removal before the mutation. Removal reconnects the
+   * creating admin first, because a scenario may have closed it, and runs before that admin's own
+   * disconnect.
+   * @param {object} [options] name suffix and public createTopics settings
    * @returns {Promise<string>} actual topic name
    * @throws {Error} broker failure or incomplete metadata identity
    */
@@ -189,11 +199,14 @@ class AdminLiveProbe {
     replicationFactor = 2,
     configEntries = [],
     replicaAssignment,
-  }) {
+  } = {}) {
     const admin = this.clients.find((client) => typeof client.createTopics === 'function')
     if (!admin) throw new Error('Start an admin before creating topics')
     const topic = `e2e-p9d-${this.stem}-${name}-${randomBytes(6).toString('hex')}`
-    this.cleanup.add('delete topic', () => admin.deleteTopics({ topics: [topic] }))
+    this.cleanup.add('delete topic', async () => {
+      await admin.connect()
+      await admin.deleteTopics({ topics: [topic] })
+    })
     await this.invoke(() =>
       admin.createTopics({
         topics: [

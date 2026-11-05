@@ -204,19 +204,29 @@ suite('admin configured remote storage', () => {
         })
         await probe.invoke(() => consumer.subscribe({ topic, fromBeginning: true }))
         const retainedIds = []
+        const lastRetained = BigInt(bounds.high) - 1n
+        let reachedHigh = false
         await probe.invoke(() =>
           consumer.run({
             autoCommit: false,
             eachBatchAutoResolve: false,
-            eachBatch: async ({ batch, resolveOffset }) => {
-              for (const { offset, value } of batch.messages)
-                if (BigInt(offset) >= BigInt(bounds.low) && BigInt(offset) < BigInt(bounds.high))
+            eachBatch: async ({ batch, resolveOffset, pause }) => {
+              for (const { offset, value } of batch.messages) {
+                if (BigInt(offset) >= BigInt(bounds.low) && BigInt(offset) <= lastRetained)
                   retainedIds.push(value.toString().replace(/\0+$/, ''))
+                resolveOffset(offset)
+                if (BigInt(offset) >= lastRetained) {
+                  pause()
+                  reachedHigh = true
+                  return
+                }
+              }
             },
           })
         )
-        await probe.poll(async () => retainedIds.length >= expectedIds.length)
+        await probe.poll(async () => reachedHigh)
         await probe.invoke(() => consumer.stop())
+        expect(retainedIds).toEqual(expectedIds)
         const physical = await probe.physical(topic)
         expect(
           physical.get(0).records.map(({ value }) => value.toString().replace(/\0+$/, ''))
