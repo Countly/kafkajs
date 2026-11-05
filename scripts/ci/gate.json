@@ -18180,6 +18180,13 @@
         "src/producer/__tests__/oversizedRecordLive.spec.js \u203a Producer > records above a size limit (live) acks other than -1 are a typed configuration error before anything is written: transactional producer, acks 1",
         "src/producer/__tests__/producerIdRecoveryLive.spec.js \u203a Producer > producer-id recovery after the log start moves (live) a transactional producer commits its next transaction with no re-initialization",
         "src/producer/__tests__/producerIdRecoveryLive.spec.js \u203a Producer > producer-id recovery after the log start moves (live) an idempotent producer keeps its producer id, epoch and sequence across the deletion",
+        "src/producer/__tests__/rackAwareProducerLive.spec.js \u203a Producer > rack-aware partitioning (live) DefaultPartitioner of a rack-aware producer alternates over exactly the partitions led in its rack",
+        "src/producer/__tests__/rackAwareProducerLive.spec.js \u203a Producer > rack-aware partitioning (live) a custom partitioner keeps its choice of a partition led outside the rack of a rack-aware producer",
+        "src/producer/__tests__/rackAwareProducerLive.spec.js \u203a Producer > rack-aware partitioning (live) a producer with a rackId alone spreads keyless records over every partition",
+        "src/producer/__tests__/rackAwareProducerLive.spec.js \u203a Producer > rack-aware partitioning (live) a producer with rackAware: false and a rackId spreads keyless records over every partition",
+        "src/producer/__tests__/rackAwareProducerLive.spec.js \u203a Producer > rack-aware partitioning (live) a rack that no partition leader is in falls back to every partition",
+        "src/producer/__tests__/rackAwareProducerLive.spec.js \u203a Producer > rack-aware partitioning (live) explicit and keyed records of a rack-aware producer keep their partitions",
+        "src/producer/__tests__/rackAwareProducerLive.spec.js \u203a Producer > rack-aware partitioning (live) the default partitioner of a rack-aware producer sends keyless records to a partition led in its rack",
         "src/producer/__tests__/sendOffsetsLive.spec.js \u203a Producer > sendOffsets with group metadata (live) classic protocol a joining consumer waits for the open transaction holding its group\u2019s offsets, a rebalance meanwhile does not, and nobody is evicted",
         "src/producer/__tests__/sendOffsetsLive.spec.js \u203a Producer > sendOffsets with group metadata (live) classic protocol a membership gone stale before sendOffsets makes it abortable; abort, rejoin and reprocess leave no duplicate and no gap",
         "src/producer/__tests__/sendOffsetsLive.spec.js \u203a Producer > sendOffsets with group metadata (live) classic protocol offsets and output commit or abort together; the commit carries the consumer\u2019s membership, and the legacy group id still commits",
@@ -18525,7 +18532,14 @@
         "src/producer/__tests__/transactionVersionLive.spec.js \u203a Producer > transaction protocol versions (live) transaction version 2 a transaction the coordinator aborted on its timeout: version 2 aborts and carries on, version 1 is fenced, and a commit of one is refused under both",
         "src/producer/__tests__/transactionVersionLive.spec.js \u203a Producer > transaction protocol versions (live) transaction version 1 a committed and an aborted transaction send the requests of the version, and a read_committed reader sees the committed records only",
         "src/producer/__tests__/transactionVersionLive.spec.js \u203a Producer > transaction protocol versions (live) transaction version 1 ten transactions in a row: version 2 adopts the epoch each EndTxn returns and restarts sequences at 0, version 1 keeps one epoch and carries the sequences on",
-        "src/producer/__tests__/transactionVersionLive.spec.js \u203a Producer > transaction protocol versions (live) transaction version 1 a transaction the coordinator aborted on its timeout: version 2 aborts and carries on, version 1 is fenced, and a commit of one is refused under both"
+        "src/producer/__tests__/transactionVersionLive.spec.js \u203a Producer > transaction protocol versions (live) transaction version 1 a transaction the coordinator aborted on its timeout: version 2 aborts and carries on, version 1 is fenced, and a commit of one is refused under both",
+        "src/producer/__tests__/rackAwareProducerLive.spec.js \u203a Producer > rack-aware partitioning (live) the default partitioner of a rack-aware producer sends keyless records to a partition led in its rack",
+        "src/producer/__tests__/rackAwareProducerLive.spec.js \u203a Producer > rack-aware partitioning (live) DefaultPartitioner of a rack-aware producer alternates over exactly the partitions led in its rack",
+        "src/producer/__tests__/rackAwareProducerLive.spec.js \u203a Producer > rack-aware partitioning (live) a rack that no partition leader is in falls back to every partition",
+        "src/producer/__tests__/rackAwareProducerLive.spec.js \u203a Producer > rack-aware partitioning (live) a producer with a rackId alone spreads keyless records over every partition",
+        "src/producer/__tests__/rackAwareProducerLive.spec.js \u203a Producer > rack-aware partitioning (live) a producer with rackAware: false and a rackId spreads keyless records over every partition",
+        "src/producer/__tests__/rackAwareProducerLive.spec.js \u203a Producer > rack-aware partitioning (live) explicit and keyed records of a rack-aware producer keep their partitions",
+        "src/producer/__tests__/rackAwareProducerLive.spec.js \u203a Producer > rack-aware partitioning (live) a custom partitioner keeps its choice of a partition led outside the rack of a rack-aware producer"
       ]
     },
     {
@@ -21263,7 +21277,14 @@
         "src/broker/__tests__/floorGssapiLive.spec.js \u203a GSSAPI with a ticket-granting service authenticates, expires, reconnects and reauthenticates with the ticket service",
         "src/broker/__tests__/floorGssapiLive.spec.js \u203a GSSAPI with a ticket-granting service reads the SASL capability facts from a GSSAPI-authenticated connection",
         "src/admin/__tests__/floorTokensLive.spec.js \u203a Delegation tokens on the negotiated floor creates, describes, renews and expires a delegation token",
-        "src/admin/__tests__/floorTokensLive.spec.js \u203a Delegation tokens on the negotiated floor rejects token administration on a plaintext channel without exposing credentials"
+        "src/admin/__tests__/floorTokensLive.spec.js \u203a Delegation tokens on the negotiated floor rejects token administration on a plaintext channel without exposing credentials",
+        "src/producer/__tests__/rackAwareProducerLive.spec.js \u203a Producer > rack-aware partitioning (live) the default partitioner of a rack-aware producer sends keyless records to a partition led in its rack",
+        "src/producer/__tests__/rackAwareProducerLive.spec.js \u203a Producer > rack-aware partitioning (live) DefaultPartitioner of a rack-aware producer alternates over exactly the partitions led in its rack",
+        "src/producer/__tests__/rackAwareProducerLive.spec.js \u203a Producer > rack-aware partitioning (live) a rack that no partition leader is in falls back to every partition",
+        "src/producer/__tests__/rackAwareProducerLive.spec.js \u203a Producer > rack-aware partitioning (live) a producer with a rackId alone spreads keyless records over every partition",
+        "src/producer/__tests__/rackAwareProducerLive.spec.js \u203a Producer > rack-aware partitioning (live) a producer with rackAware: false and a rackId spreads keyless records over every partition",
+        "src/producer/__tests__/rackAwareProducerLive.spec.js \u203a Producer > rack-aware partitioning (live) explicit and keyed records of a rack-aware producer keep their partitions",
+        "src/producer/__tests__/rackAwareProducerLive.spec.js \u203a Producer > rack-aware partitioning (live) a custom partitioner keeps its choice of a partition led outside the rack of a rack-aware producer"
       ]
     },
     {
@@ -21480,6 +21501,68 @@
         "src/admin/__tests__/floorTokensLive.spec.js \u203a Delegation tokens on the negotiated floor rejects token administration on a plaintext channel without exposing credentials"
       ],
       "capMinutes": 25
+    },
+    {
+      "id": "e2e-rack-aware-producer-kafka-4-4",
+      "kind": "cluster",
+      "compose": "docker-compose.racks.yml",
+      "kafkaVersion": "4.4.0",
+      "env": {
+        "RACK_AWARE_PRODUCER_E2E": "1"
+      },
+      "jest": [
+        "--maxWorkers=2",
+        "--testPathPatterns",
+        "src/producer/__tests__/rackAwareProducerLive\\.spec\\.js"
+      ],
+      "jestScript": null,
+      "nodeTest": null,
+      "command": null,
+      "needs": {},
+      "evidence": [
+        "rack-aware-producer"
+      ],
+      "titles": [
+        "src/producer/__tests__/rackAwareProducerLive.spec.js \u203a Producer > rack-aware partitioning (live) the default partitioner of a rack-aware producer sends keyless records to a partition led in its rack",
+        "src/producer/__tests__/rackAwareProducerLive.spec.js \u203a Producer > rack-aware partitioning (live) DefaultPartitioner of a rack-aware producer alternates over exactly the partitions led in its rack",
+        "src/producer/__tests__/rackAwareProducerLive.spec.js \u203a Producer > rack-aware partitioning (live) a rack that no partition leader is in falls back to every partition",
+        "src/producer/__tests__/rackAwareProducerLive.spec.js \u203a Producer > rack-aware partitioning (live) a producer with a rackId alone spreads keyless records over every partition",
+        "src/producer/__tests__/rackAwareProducerLive.spec.js \u203a Producer > rack-aware partitioning (live) a producer with rackAware: false and a rackId spreads keyless records over every partition",
+        "src/producer/__tests__/rackAwareProducerLive.spec.js \u203a Producer > rack-aware partitioning (live) explicit and keyed records of a rack-aware producer keep their partitions",
+        "src/producer/__tests__/rackAwareProducerLive.spec.js \u203a Producer > rack-aware partitioning (live) a custom partitioner keeps its choice of a partition led outside the rack of a rack-aware producer"
+      ],
+      "capMinutes": 30
+    },
+    {
+      "id": "e2e-rack-aware-producer-kafka-4-3",
+      "kind": "cluster",
+      "compose": "docker-compose.racks.yml",
+      "kafkaVersion": "4.3.1",
+      "env": {
+        "RACK_AWARE_PRODUCER_E2E": "1"
+      },
+      "jest": [
+        "--maxWorkers=2",
+        "--testPathPatterns",
+        "src/producer/__tests__/rackAwareProducerLive\\.spec\\.js"
+      ],
+      "jestScript": null,
+      "nodeTest": null,
+      "command": null,
+      "needs": {},
+      "evidence": [
+        "rack-aware-producer"
+      ],
+      "titles": [
+        "src/producer/__tests__/rackAwareProducerLive.spec.js \u203a Producer > rack-aware partitioning (live) the default partitioner of a rack-aware producer sends keyless records to a partition led in its rack",
+        "src/producer/__tests__/rackAwareProducerLive.spec.js \u203a Producer > rack-aware partitioning (live) DefaultPartitioner of a rack-aware producer alternates over exactly the partitions led in its rack",
+        "src/producer/__tests__/rackAwareProducerLive.spec.js \u203a Producer > rack-aware partitioning (live) a rack that no partition leader is in falls back to every partition",
+        "src/producer/__tests__/rackAwareProducerLive.spec.js \u203a Producer > rack-aware partitioning (live) a producer with a rackId alone spreads keyless records over every partition",
+        "src/producer/__tests__/rackAwareProducerLive.spec.js \u203a Producer > rack-aware partitioning (live) a producer with rackAware: false and a rackId spreads keyless records over every partition",
+        "src/producer/__tests__/rackAwareProducerLive.spec.js \u203a Producer > rack-aware partitioning (live) explicit and keyed records of a rack-aware producer keep their partitions",
+        "src/producer/__tests__/rackAwareProducerLive.spec.js \u203a Producer > rack-aware partitioning (live) a custom partitioner keeps its choice of a partition led outside the rack of a rack-aware producer"
+      ],
+      "capMinutes": 30
     }
   ]
 }
