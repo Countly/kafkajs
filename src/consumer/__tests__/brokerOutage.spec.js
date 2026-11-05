@@ -164,8 +164,11 @@ describe('Consumer > broker outages', () => {
       retry: RETRY,
       ...options,
     })
-    const events = { crashes: [], joins: [], rebalancing: [], records: [] }
-    consumer.on(consumer.events.CRASH, ({ payload }) => events.crashes.push(payload))
+    const events = { crashes: [], crashedAt: [], joins: [], rebalancing: [], records: [] }
+    consumer.on(consumer.events.CRASH, ({ payload }) => {
+      events.crashes.push(payload)
+      events.crashedAt.push(performance.now())
+    })
     consumer.on(consumer.events.GROUP_JOIN, ({ payload }) => events.joins.push(payload))
     consumer.on(consumer.events.REBALANCING, ({ payload }) => events.rebalancing.push(payload))
     return { cluster, breaker, events }
@@ -763,8 +766,8 @@ describe('Consumer > broker outages', () => {
       expect(runner.outages.fetch.nodes.get('2').since).toBe(first)
       expect(rig.events.crashes).toHaveLength(0)
       await until(() => rig.events.crashes.length > 0, 'the exhausted broker crash', 600)
-      expect(performance.now() - first).toBeGreaterThanOrEqual(1000)
-      expect(performance.now() - first).toBeLessThan(2500)
+      expect(rig.events.crashedAt[0] - first).toBeGreaterThanOrEqual(1000)
+      expect(rig.events.crashedAt[0] - first).toBeLessThan(2500)
       expect(rig.events.crashes).toHaveLength(1)
       expect(rig.events.crashes[0].error.name).toBe('KafkaJSNumberOfRetriesExceeded')
       expect(lostConnection(rig.events.crashes[0].error)).toBe(true)
