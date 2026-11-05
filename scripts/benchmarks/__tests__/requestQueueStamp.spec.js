@@ -1,10 +1,12 @@
 const RequestQueueStamp = require('../requestQueueStamp')
 
+// `gc` is stubbed below, so no collection runs and a heap bound would measure the worker's garbage.
+
 test('the request fixture traverses preparation and fulfillment for each pair', async () => {
   const gc = globalThis.gc
   globalThis.gc = () => {}
   try {
-    const result = await new RequestQueueStamp({ pairs: 20 }).run()
+    const result = await new RequestQueueStamp({ pairs: 20, heapBudget: Infinity }).run()
     expect(result).toMatchObject({
       pairs: 20,
       prepared: 20,
@@ -21,7 +23,9 @@ test('the positive control counts exactly ten extra clock calls per completed pa
   const gc = globalThis.gc
   globalThis.gc = () => {}
   try {
-    expect(await new RequestQueueStamp({ pairs: 20, control: 1 }).run()).toMatchObject({
+    expect(
+      await new RequestQueueStamp({ pairs: 20, control: 1, heapBudget: Infinity }).run()
+    ).toMatchObject({
       extraClocks: 200,
     })
   } finally {

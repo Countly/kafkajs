@@ -19,14 +19,17 @@ class RequestQueueStamp {
    * @param {object} [options] untimed unit-smoke or session controls
    * @param {number} [options.pairs=2000000] actual completed pairs
    * @param {0|1} [options.control=0] ten extra clock calls per pair when enabled
+   * @param {number} [options.heapBudget=5242880] the most the heap may grow over a run, in bytes;
+   *   meaningful only with a real `gc`
    * @returns {RequestQueueStamp} an unopened driver
    * @throws {Error} for an invalid count or control
    */
-  constructor({ pairs = 2000000, control = 0 } = {}) {
+  constructor({ pairs = 2000000, control = 0, heapBudget = 5 * 1024 * 1024 } = {}) {
     assert(Number.isInteger(pairs) && pairs > 0)
     assert(control === 0 || control === 1)
     this.pairs = pairs
     this.control = control
+    this.heapBudget = heapBudget
     this.encoded = 0
     this.prepared = 0
     this.written = 0
@@ -128,7 +131,7 @@ class RequestQueueStamp {
       assert.equal(this.connection.requestQueue.inflight.size, 0)
       globalThis.gc()
       const heapGrowth = process.memoryUsage().heapUsed - heapBefore
-      assert(heapGrowth < 5 * 1024 * 1024, 'heap grew by at least 5 MiB')
+      assert(heapGrowth < this.heapBudget, `heap grew by at least ${this.heapBudget} bytes`)
       return {
         nsPerPair: Number(this.finishedAt - startedAt) / this.pairs,
         pairs: this.pairs,
