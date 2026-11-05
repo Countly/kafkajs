@@ -311,6 +311,15 @@ class RackTopic {
   }
 
   /**
+   * @returns {Promise<number[]>} the topic's partition ids in the order the metadata lists them,
+   *   which is the order a partitioner walks
+   */
+  async partitionOrder() {
+    await this.cluster.refreshMetadata()
+    return this.cluster.findTopicPartitionMetadata(this.topic).map(({ partitionId }) => partitionId)
+  }
+
+  /**
    * @returns {Promise<{ racks: Record<number, string|null>, leaders: Record<number, number> }>}
    *   what the cluster's current Metadata says of the brokers' racks and the partition leaders
    */
@@ -792,12 +801,19 @@ describeConditional('Conditional features on the negotiated floor', () => {
         return acknowledged
       }
 
+      let inRackPartition
       const inRack = await arm(
         { rackId: OWN_RACK, rackAware: true },
         async (producer, placement) => {
-          expect(fixture.ledIn(placement, OWN_RACK)).toEqual([1, 4])
-          // A draw of 0 makes a pick that ignores the rack choose partition 0, which is led in rack-a.
-          const draw = jest.spyOn(Math, 'random').mockReturnValue(0)
+          const own = fixture.ledIn(placement, OWN_RACK)
+          expect(own).toEqual([1, 4])
+          // The draw lands a pick that ignores the rack on a partition led outside it.
+          const order = await fixture.partitionOrder()
+          const value =
+            (order.findIndex((partition) => !own.includes(partition)) + 0.5) / order.length
+          const eligible = order.filter((partition) => own.includes(partition))
+          inRackPartition = eligible[Math.floor(value * eligible.length)]
+          const draw = jest.spyOn(Math, 'random').mockReturnValue(value)
           try {
             return await fixture.sendEach(producer, 'in-rack', 12, runId)
           } finally {
@@ -832,7 +848,7 @@ describeConditional('Conditional features on the negotiated floor', () => {
         }
       )
 
-      expect(inRack.map(({ partition }) => partition)).toEqual(Array(12).fill(1))
+      expect(inRack.map(({ partition }) => partition)).toEqual(Array(12).fill(inRackPartition))
       expect(countsOf(fallback)).toEqual(
         Object.fromEntries(ALL_PARTITIONS.map((partition) => [partition, 6]))
       )
