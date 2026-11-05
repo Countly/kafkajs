@@ -166,6 +166,24 @@ const PROJECTIONS = {
         ? { throttleTime: value.throttleTime, topics: topicsOf(value.responses, version) }
         : value,
   },
+  // from v6 a topic is named from the request's map and was sent as an id, and the two keys that
+  // describe the unknown tagged field every struct of one vector carries are not values a decoder
+  // returns; an id the map does not hold stays an id with a null name
+  txnOffsetCommit: {
+    options: (version) => (version >= 6 ? { topicNames: TOPIC_NAMES } : undefined),
+    decoded: (value, version) => {
+      if (version < 6) return value
+      const idOf = Object.fromEntries([...TOPIC_NAMES].map(([id, name]) => [name, id]))
+      return {
+        throttleTime: value.throttleTime,
+        topics: value.topics.map(({ topic, topicId, partitions }) => ({
+          topicId: topicId ?? idOf[topic],
+          partitions,
+        })),
+      }
+    },
+    fields: ({ unknownTag, unknownTagBytes, ...fields }) => fields,
+  },
   offsetFetch: {
     options: (version) => (version >= 10 ? { topicNames: TOPIC_NAMES } : undefined),
     decoded: (value, version) =>

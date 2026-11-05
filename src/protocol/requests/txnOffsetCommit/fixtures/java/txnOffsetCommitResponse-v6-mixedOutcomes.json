@@ -1,0 +1,7 @@
+{
+  "message": "TxnOffsetCommitResponse",
+  "version": 6,
+  "case": "mixedOutcomes",
+  "hex": "00000019030102030405060708090a0b0c0d0e0f10030000000000000000000001006400001112131415161718191a1b1c1d1e1f2002000000000071000000",
+  "fields": { "throttleTime": 25, "topics": [{ "topicId": "01020304-0506-0708-090a-0b0c0d0e0f10", "partitions": [{ "partition": 0, "errorCode": 0 }, { "partition": 1, "errorCode": 100 }] }, { "topicId": "11121314-1516-1718-191a-1b1c1d1e1f20", "partitions": [{ "partition": 0, "errorCode": 113 }] }] }
+}

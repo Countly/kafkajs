@@ -9,6 +9,7 @@ const {
   KafkaJSTransactionAbortableError,
 } = require('../../errors')
 const COORDINATOR_TYPES = require('../../protocol/coordinatorTypes')
+const { usableTopicIds } = require('../../protocol/requests/topicIds')
 const ProducerStateManager = require('../state')
 const { transactionStateFor } = require('../state/errorClassifier')
 const assert = require('assert')
@@ -163,6 +164,37 @@ const createEosManager = ({
 
   /** The private options a broker request takes for a captured lifecycle; none without one. */
   const guardOf = (generation) => (generation ? { guard: generation.guard } : {})
+
+  /**
+   * Re-reads the metadata the producer's cluster tracks after the broker answered UNKNOWN_TOPIC_ID,
+   * so the next attempt reads the id a recreated topic has now from the cache `cluster.topicId`
+   * reads. It never creates a topic and registers none: an offset commit's topics are not targets
+   * of this producer, and one that became a target here would stay eligible for automatic creation
+   * in every later refresh. A topic whose id the cache holds is already a target, so it is
+   * refreshed with the rest. The refresh is guarded, so it shares no promise with the send path's
+   * refreshes, which may create a topic. Best effort: a failed refresh leaves the original error
+   * to the retrier, but a closed lifecycle ends the attempt with its close error and publishes
+   * nothing.
+   * @param {import('../generation')} [generation] the lifecycle the call captured
+   * @returns {Promise<void>}
+   * @throws {Error} the lifecycle's close error
+   */
+  const refreshWithoutCreating = async (generation) => {
+    try {
+      generation?.check()
+      await cluster.refreshMetadata({
+        allowAutoTopicCreation: false,
+        ...(generation ? { fence: generation } : {}),
+        ...guardOf(generation),
+      })
+    } catch (error) {
+      generation?.check()
+      logger.debug('Could not refresh the metadata after an unknown topic id', {
+        error: error.message,
+      })
+    }
+    generation?.check()
+  }
 
   const findTransactionCoordinator = (generation) => {
     return cluster.findGroupCoordinator({
@@ -743,7 +775,9 @@ const createEosManager = ({
      * retried while it fails retriably, a moved group coordinator looked up again. Any other failure
      * arms the state its category calls for - a stale generation or member (ILLEGAL_GENERATION,
      * UNKNOWN_MEMBER_ID, FENCED_INSTANCE_ID, STALE_MEMBER_EPOCH) arms `ABORTABLE_ERROR`: abort, let
-     * the consumer rejoin, reprocess - and rejects with it.
+     * the consumer rejoin, reprocess - and rejects with it. So does a v6 answer that cannot be
+     * matched to its request. An UNKNOWN_TOPIC_ID answer (v6) refreshes the metadata the cluster
+     * tracks before the retry, and never creates a topic.
      *
      * Under version 2 offsets holding no partition are skipped, as the Java producer skips them:
      * nothing is sent and the transaction is not marked started, since the broker starts none for
@@ -842,6 +876,10 @@ const createEosManager = ({
           await retrierFor(generation)(async (bail, retryCount, retryTime) => {
             try {
               generation?.check()
+              const topicIds = usableTopicIds(
+                snapshot.topics.map(({ topic }) => topic),
+                (name) => cluster.topicId(name)
+              )
               await groupCoordinator.txnOffsetCommit({
                 transactionalId,
                 producerId: stateManager.producerId,
@@ -852,6 +890,7 @@ const createEosManager = ({
                 memberId,
                 groupInstanceId,
                 transactionVersion,
+                ...(topicIds ? { topicIds } : {}),
                 ...guardOf(generation),
               })
             } catch (e) {
@@ -870,6 +909,9 @@ const createEosManager = ({
                     coordinatorType: COORDINATOR_TYPES.GROUP,
                     ...(generation ? { fence: generation } : {}),
                   })
+                }
+                if (e.type === 'UNKNOWN_TOPIC_ID') {
+                  await refreshWithoutCreating(generation)
                 }
                 throw e
               }

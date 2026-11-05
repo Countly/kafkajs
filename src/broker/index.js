@@ -4,7 +4,7 @@ const describeThrown = require('../network/describeThrown')
 const { Types: Compression } = require('../protocol/message/compression')
 const { requests, lookup, selectVersion } = require('../protocol/requests')
 const { partitionResults } = require('../protocol/requests/produce/partitionResults')
-const { NO_TOPIC_ID } = require('../protocol/requests/topicIds')
+const { NO_TOPIC_ID, usableTopicIds } = require('../protocol/requests/topicIds')
 const { assertSameProtocol } = require('../protocol/requests/groupProtocolCheck')
 const {
   KafkaJSConnectionClosedError,
@@ -83,6 +83,29 @@ const TRANSACTION_V1_MAX_VERSIONS = {
  */
 const transactionVersionCap = (apiKey, transactionVersion) =>
   transactionVersion === 2 ? undefined : TRANSACTION_V1_MAX_VERSIONS[apiKey]
+
+// The last TxnOffsetCommit version keyed by topic name. A request whose topics do not all have a
+// usable id cannot be sent above it, whatever the broker advertises.
+// @see clients/src/main/resources/common/message/TxnOffsetCommitRequest.json (Apache Kafka 4.4.0)
+const TXN_OFFSET_COMMIT_TOPIC_NAMES_MAX_VERSION = 5
+
+/**
+ * The highest TxnOffsetCommit version one request may negotiate: the lower of its transaction
+ * version's ceiling and its topic ids'. A transaction under version 1 stays at v4 or below even
+ * when every topic has an id, because v5 and up carry the second part of KIP-890; a request
+ * keyed by name stays at v5 or below. Only transaction version 2 with every topic's id lifts both.
+ * @param {1|2} transactionVersion only 2 means transaction version 2
+ * @param {Map<string, string>|undefined} topicIds the ids of every topic, when all of them have one
+ * @returns {number|undefined} undefined when nothing caps the request
+ */
+const txnOffsetCommitCeiling = (transactionVersion, topicIds) => {
+  const ceilings = [
+    transactionVersionCap(apiKeys.TxnOffsetCommit, transactionVersion),
+    topicIds === undefined ? TXN_OFFSET_COMMIT_TOPIC_NAMES_MAX_VERSION : undefined,
+  ].filter((ceiling) => ceiling !== undefined)
+
+  return ceilings.length === 0 ? undefined : Math.min(...ceilings)
+}
 
 // A transactional Produce under transaction version 2 is sent at exactly this version: v13 keys
 // topics by id, while a transaction tracks its partitions by name.
@@ -2141,7 +2164,13 @@ module.exports = class Broker {
    * @param {string|null} [request.groupInstanceId=null] the consumer's static instance id
    * @param {1|2} [request.transactionVersion=1] the transaction version in force for this
    *   transaction: 1 keeps the request at v4 or below; 2 allows v5, which also adds the offsets to
-   *   the transaction (KIP-890)
+   *   the transaction (KIP-890), and v6 when every topic has an id
+   * @param {Map<string, string>} [request.topicIds] private: topic name to topic id, for the
+   *   topics that have one. Only when every topic in `topics` has a usable one (not missing, null
+   *   or the all-zero id) is the request keyed by id (v6, KIP-1319); otherwise, and on a broker
+   *   that offers v5 at most, it is keyed by name. The ids are read once, so the answer is
+   *   bound to the topics this request named even if the cluster's metadata changes meanwhile;
+   *   it is never given to a caller.
    * @param {(frameLength?: number) => Error|null} [request.guard] a producer's private pre-write
    *   check; it never reaches the request
    *
@@ -2169,13 +2198,18 @@ module.exports = class Broker {
     memberId = '',
     groupInstanceId = null,
     transactionVersion = 1,
+    topicIds,
     guard,
   }) {
     this.throwIfRefused(guard)
+    const idsOf = usableTopicIds(
+      topics.map(({ topic }) => topic),
+      (name) => topicIds?.get(name)
+    )
     const txnOffsetCommit = this.lookupRequestWithMax(
       apiKeys.TxnOffsetCommit,
       requests.TxnOffsetCommit,
-      transactionVersionCap(apiKeys.TxnOffsetCommit, transactionVersion)
+      txnOffsetCommitCeiling(transactionVersion, idsOf)
     )
     return await this[PRIVATE.SEND_REQUEST](
       txnOffsetCommit({
@@ -2187,6 +2221,7 @@ module.exports = class Broker {
         generationId,
         memberId,
         groupInstanceId,
+        topicIds: idsOf,
       }),
       guard
     )

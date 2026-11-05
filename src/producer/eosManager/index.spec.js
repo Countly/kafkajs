@@ -42,6 +42,7 @@ describe('Producer > eosManager', () => {
       offsetOperations: () => new OffsetOperations(),
       markOffsetAsCommitted: jest.fn(),
       refreshMetadataIfNecessary: jest.fn(),
+      topicId: jest.fn(),
       findGroupCoordinator: jest.fn().mockReturnValue(broker),
       findControllerBroker: jest.fn().mockReturnValue(broker),
       findConnectedBroker: jest.fn().mockReturnValue(broker),

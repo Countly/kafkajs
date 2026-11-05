@@ -1,4 +1,10 @@
-const { NO_TOPIC_ID, requireTopicIds, namesById, topicIdSchema } = require('./topicIds')
+const {
+  NO_TOPIC_ID,
+  usableTopicIds,
+  requireTopicIds,
+  namesById,
+  topicIdSchema,
+} = require('./topicIds')
 const { KafkaJSInvariantViolation } = require('../../errors')
 
 const ID_A = '01020304-0506-0708-090a-0b0c0d0e0f10'
@@ -29,6 +35,52 @@ describe('Protocol > Requests > topic ids', () => {
       expect(() => requireTopicIds('OffsetFetch', ['a'], topicIds)).toThrow(
         'OffsetFetch v10 request is missing a topic id for topic "a"'
       )
+    })
+  })
+
+  describe('requireTopicIds version', () => {
+    test('names the first version keyed by id, 10 unless the caller says otherwise', () => {
+      expect(() => requireTopicIds('TxnOffsetCommit', ['a'], undefined, 6)).toThrow(
+        'TxnOffsetCommit v6 request is missing a topic id for topic "a"'
+      )
+      expect(() => requireTopicIds('OffsetCommit', ['a'], undefined)).toThrow(
+        'OffsetCommit v10 request is missing a topic id for topic "a"'
+      )
+    })
+  })
+
+  describe('usableTopicIds', () => {
+    const ids = { a: ID_A, b: ID_B }
+
+    test('is the id of every topic, by name, when every one has a usable id', () => {
+      expect([...usableTopicIds(['a', 'b'], (name) => ids[name])]).toEqual([
+        ['a', ID_A],
+        ['b', ID_B],
+      ])
+    })
+
+    test.each([
+      ['an id the lookup does not know', 'c'],
+      ['a null id', 'null'],
+      ['the all-zero id', 'zero'],
+    ])('is nothing when one topic has %s, whatever the others have', (_, name) => {
+      const lookup = { ...ids, null: null, zero: NO_TOPIC_ID }
+
+      expect(usableTopicIds(['a', name, 'b'], (topic) => lookup[topic])).toBeUndefined()
+    })
+
+    test('is nothing for no topic at all, where there is nothing to key by id', () => {
+      expect(usableTopicIds([], () => ID_A)).toBeUndefined()
+    })
+
+    test('asks the lookup only as far as it needs to', () => {
+      const asked = []
+      usableTopicIds(['a', 'x', 'b'], (name) => {
+        asked.push(name)
+        return ids[name]
+      })
+
+      expect(asked).toEqual(['a', 'x'])
     })
   })
 

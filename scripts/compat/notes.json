@@ -81,7 +81,7 @@
       "since": "2026-10-19"
     },
     "TxnOffsetCommit": {
-      "note": "v2 committed leader epoch, v3 flexible with KIP-447 group metadata (generation, member id, group instance id), v4 TRANSACTION_ABORTABLE, v5 adds the offsets to the transaction itself under transaction version 2, so no AddOffsetsToTxn precedes it. A transaction stays at v4 or below unless its coordinator finalizes transaction.version at level 2 or above.",
+      "note": "v2 committed leader epoch, v3 flexible with KIP-447 group metadata (generation, member id, group instance id), v4 TRANSACTION_ABORTABLE, v5 adds the offsets to the transaction itself under transaction version 2, so no AddOffsetsToTxn precedes it, v6 topic IDs (KIP-1319, Kafka 4.4): a transaction sends it when its coordinator finalizes transaction.version at level 2 or above and the cache holds the id of every topic in the request; one unknown id keeps the whole request at v5, and a transaction at transaction version 1 stays at v4 or below whatever ids it has. v6 can answer GROUP_ID_NOT_FOUND, STALE_MEMBER_EPOCH and UNKNOWN_TOPIC_ID.",
       "since": "2026-10-08"
     },
     "DescribeAcls": {

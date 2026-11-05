@@ -92,7 +92,7 @@ const COUNTS = {
   saslAuthenticate: 6,
   saslHandshake: 1,
   syncGroup: 8,
-  txnOffsetCommit: 9,
+  txnOffsetCommit: 16,
   writeTxnMarkers: 5,
   updateFeatures: 3,
 }

@@ -3669,7 +3669,7 @@
       "Request": "e71cee31bdd5549e259c725e5c42e0f0948205e03589afc76b960e9dfca9e4dc",
       "Response": "5ce7a122b0fa8319c839cf419685b686eaf404d8c37520433bbc691578b846d5"
     },
-    "javaClientsJar": "4.3.1",
+    "javaClientsJar": null,
     "javaVectors": [
       {
         "file": "src/protocol/requests/txnOffsetCommit/fixtures/java/txnOffsetCommitRequest-v2-leaderEpoch.json",
@@ -3720,6 +3720,18 @@
         "fixtureSha256": "efc52cbd9862dedbba5b78964f7858206b654257a6befa29462b832b4e671891"
       },
       {
+        "file": "src/protocol/requests/txnOffsetCommit/fixtures/java/txnOffsetCommitRequest-v6-defaultMetadata.json",
+        "javaClientsJar": "4.4.0",
+        "javaClientsJarSha256": "1ab07317eb6633241392449d329dbdc5d9251e6ffc4926860f42dd966e88bdf9",
+        "fixtureSha256": "6aea9507181ac19b4098ecca42dfbfc7ab2d8f25e4f5e5ddd7febffbc04c950d"
+      },
+      {
+        "file": "src/protocol/requests/txnOffsetCommit/fixtures/java/txnOffsetCommitRequest-v6-groupMetadata.json",
+        "javaClientsJar": "4.4.0",
+        "javaClientsJarSha256": "1ab07317eb6633241392449d329dbdc5d9251e6ffc4926860f42dd966e88bdf9",
+        "fixtureSha256": "63f423173e5b13d30b6b6b0328b536b205f7745405057cfe4bb57a6c1735f074"
+      },
+      {
         "file": "src/protocol/requests/txnOffsetCommit/fixtures/java/txnOffsetCommitResponse-v2-error.json",
         "javaClientsJar": "4.3.1",
         "javaClientsJarSha256": null,
@@ -3766,6 +3778,48 @@
         "javaClientsJar": "4.3.1",
         "javaClientsJarSha256": null,
         "fixtureSha256": "b9fb496b0d2419a63722e0d89ca06555664cc0bd0baf9c3743e5663a7dfbeafb"
+      },
+      {
+        "file": "src/protocol/requests/txnOffsetCommit/fixtures/java/txnOffsetCommitResponse-v6-groupIdNotFound.json",
+        "javaClientsJar": "4.4.0",
+        "javaClientsJarSha256": "1ab07317eb6633241392449d329dbdc5d9251e6ffc4926860f42dd966e88bdf9",
+        "fixtureSha256": "118ee5f65043b2477dfaf4ea4b2949c057bcfdec719bf4f72fcf35c57425d4be"
+      },
+      {
+        "file": "src/protocol/requests/txnOffsetCommit/fixtures/java/txnOffsetCommitResponse-v6-mixedOutcomes.json",
+        "javaClientsJar": "4.4.0",
+        "javaClientsJarSha256": "1ab07317eb6633241392449d329dbdc5d9251e6ffc4926860f42dd966e88bdf9",
+        "fixtureSha256": "0c806bc64b65294ba75c40a27fade4882aead6b595393f9d0af4ce047eb3a180"
+      },
+      {
+        "file": "src/protocol/requests/txnOffsetCommit/fixtures/java/txnOffsetCommitResponse-v6-noTopics.json",
+        "javaClientsJar": "4.4.0",
+        "javaClientsJarSha256": "1ab07317eb6633241392449d329dbdc5d9251e6ffc4926860f42dd966e88bdf9",
+        "fixtureSha256": "0e54223e33f37240d8c44f10d142dbde9e6e6a6689a422f268f87597ace17ce8"
+      },
+      {
+        "file": "src/protocol/requests/txnOffsetCommit/fixtures/java/txnOffsetCommitResponse-v6-ok.json",
+        "javaClientsJar": "4.4.0",
+        "javaClientsJarSha256": "1ab07317eb6633241392449d329dbdc5d9251e6ffc4926860f42dd966e88bdf9",
+        "fixtureSha256": "72ada9427872ebe6050b4bad6ce7691089952e71d5551476270b1798defde33f"
+      },
+      {
+        "file": "src/protocol/requests/txnOffsetCommit/fixtures/java/txnOffsetCommitResponse-v6-staleMemberEpoch.json",
+        "javaClientsJar": "4.4.0",
+        "javaClientsJarSha256": "1ab07317eb6633241392449d329dbdc5d9251e6ffc4926860f42dd966e88bdf9",
+        "fixtureSha256": "bcfe17b92281b256a716d677df5af0df58bbec0a66429c781860c28542313eeb"
+      },
+      {
+        "file": "src/protocol/requests/txnOffsetCommit/fixtures/java/txnOffsetCommitResponse-v6-unknownTags.json",
+        "javaClientsJar": "4.4.0",
+        "javaClientsJarSha256": "1ab07317eb6633241392449d329dbdc5d9251e6ffc4926860f42dd966e88bdf9",
+        "fixtureSha256": "79fb86cba7becdb4a9f5c924736662e13fc16ae140a17be7af449582c6438989"
+      },
+      {
+        "file": "src/protocol/requests/txnOffsetCommit/fixtures/java/txnOffsetCommitResponse-v6-unknownTopicId.json",
+        "javaClientsJar": "4.4.0",
+        "javaClientsJarSha256": "1ab07317eb6633241392449d329dbdc5d9251e6ffc4926860f42dd966e88bdf9",
+        "fixtureSha256": "6b0de018be84b9d9469509ffd3c5612616fa1afc5b3a0c414df6a72192710b1f"
       }
     ]
   },
