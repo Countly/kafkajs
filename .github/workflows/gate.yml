@@ -193,8 +193,10 @@ jobs:
           # install scripts it was not told to allow, and the binding is built by one.
           peer="$RUNNER_TEMP/kerberos-peer"
           version="$(node -p "require('./package.json').peerDependencies.kerberos")"
-          npm install --prefix "$peer" --no-save --no-package-lock --no-audit --no-fund --allow-scripts=kerberos "kerberos@$version"
-          node -e "require(process.argv[1] + '/node_modules/kerberos')" "$peer" || npm rebuild --prefix "$peer" --allow-scripts=kerberos kerberos
+          # npm refuses --allow-scripts for a project install, so the prefix gets its own manifest.
+          mkdir -p "$peer"
+          printf '{"private":true,"allowScripts":{"kerberos":true}}\n' > "$peer/package.json"
+          npm install --prefix "$peer" --no-package-lock --no-audit --no-fund "kerberos@$version"
           node -e "require(process.argv[1] + '/node_modules/kerberos')" "$peer"
           cp -Rn "$peer/node_modules/." node_modules/
           node -e "require('kerberos'); console.log('kerberos', require('kerberos/package.json').version)"
