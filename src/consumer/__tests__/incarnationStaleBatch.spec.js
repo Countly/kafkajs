@@ -145,11 +145,19 @@ describe.each(['classic', 'consumer'])('an old-incarnation batch, %s protocol', 
       expect(rec.offset).toBe('3')
     })
 
+    /**
+     * A forced close need not send its final commit, so allow the fixture's polling budget.
+     * @returns {Promise<void>} resolves after the commit is observed and the consumer closes
+     * @throws {Error} if the commit is not observed within the budget or disconnect fails
+     */
     test('without a recreation the old batch commits as before', async () => {
       const { rec, consumer } = await open()
 
       await scenario.release()
-      await consumer.disconnect({ timeout: BOUND_MS })
+      await Promise.all([
+        consumer.disconnect({ timeout: 10000 }),
+        until(() => scenario.committed().length > 0, 'the old batch commit'),
+      ])
 
       expect(scenario.committed()).toEqual(['8'])
       expect(rec.offset).toBe('8')
