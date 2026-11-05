@@ -211,7 +211,9 @@ describeDeadline('Producer > a lost Produce answer and the delivery deadline (li
         expect(drop.dropped).toBe(1)
         expect(writesAtExpiry).toBe(1)
         expect(error).toMatchObject({ name: 'KafkaJSDeliveryTimeout', outcome: 'unknown' })
-        expect(elapsedMs).toBeGreaterThanOrEqual(DELIVERY_TIMEOUT_MS)
+        // Node timers keep whole-millisecond time, so a deadline timer can fire up to 1 ms before
+        // performance.now() says the full timeout has passed.
+        expect(elapsedMs).toBeGreaterThanOrEqual(DELIVERY_TIMEOUT_MS - 1)
         expect(elapsedMs).toBeLessThanOrEqual(DELIVERY_TIMEOUT_MS + 1000)
         expect(beforeResend.values.filter((value) => value === 'lost')).toHaveLength(1)
         expect(protocolErrors).not.toContain('OUT_OF_ORDER_SEQUENCE_NUMBER')

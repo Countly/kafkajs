@@ -66,7 +66,13 @@ Versions before 3.0.0 are internal alpha tags and are not published.
 - Fetch sessions (KIP-227) are opt-in; set `fetchSessions: true` to enable them.
 - **`stop()` and `disconnect()` end a handler's API authority at once, so a handler's explicit `commitOffsets()` that is still waiting for the group coordinator when the stop begins can reject with `CONSUMER_STOPPING`.** In 2.2.4 such a commit could still finish while the stop waited for the batch. Now the rejection gives no promise that the commit completed, and an uncaught rejection is the handler's error, so the batch can be redelivered. Offsets committed before the stop began stay committed. A commit from outside the handlers and one made by an authorized close hook may still complete. To require that a commit finishes, drain the handlers and await the commit before calling `stop()` or `disconnect()`.
 
+- When a broker joins or leaves, the consumer no longer pauses every fetcher until all in-flight long polls end: surviving brokers keep fetching, a new broker gets a fetcher at once and only a departed broker's fetcher stops (2.2.4 drained and recreated all fetchers).
+
+- While a broker is unreachable, only its fetcher backs off and retries; the consumer keeps fetching from the other brokers (2.2.4 stopped and restarted every fetcher on each retry). Outage limits, warnings and events are unchanged.
+
 #### Fixes
+
+- A consumer's position derived from a reset policy (`earliest`, `latest`, duration, sentinel seek, or the `none` policy's local position) stays private to that consumer instead of being written into the group's shared committed-offset cache, so two consumers of one group with different reset policies no longer overwrite each other's starting position; real commits stay shared.
 
 - On Node 22, a truncated zstd record batch is now refused as `KafkaJSCorruptRecordError` (reason `decompression`), as on Node 24.20+ and 26.6+, instead of decoding as fewer records. Node 22's `zlib` does not reject truncated zstd input (nodejs/node#64593), so the codec checks the first frame's blocks and checksum itself on every Node version.
 - An ordinary `consumer.disconnect()` called from a `CRASH` listener no longer cancels the automatic restart, as in 2.2.4, which emits `CRASH` before it arms the restart timer. The restart waits for that close to finish its cluster and group cleanup, then starts a new run. A forced close (`disconnect({ timeout: 0 })`), a close whose `timeout` expires, and any `stop()` or `disconnect()` asked after the restart is armed still cancel it, as does an explicit `run()`, which supersedes a pending restart. A cancelled restart clears its timer at once and holds no listener or connection lifetime.

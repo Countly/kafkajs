@@ -1,3 +1,4 @@
+const CommittedOffsetRevisions = require('./committedOffsetRevisions')
 const describeThrown = require('../network/describeThrown')
 const BrokerPool = require('./brokerPool')
 const MetadataCache = require('./metadataCache')
@@ -1557,6 +1558,7 @@ module.exports = class Cluster {
     const committedOffsets = this.committedOffsets({ groupId })
 
     committedOffsets[topic] = committedOffsets[topic] || {}
+    CommittedOffsetRevisions.forCache(committedOffsets).advance(topic, partition)
     committedOffsets[topic][partition] = offset
   }
 }

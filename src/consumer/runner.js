@@ -23,6 +23,7 @@ const createFetchManager = require('./fetchManager')
 const RebalanceCoordinator = require('./rebalanceCoordinator')
 const PollTimer = require('./pollTimer')
 const Outage = require('./outage')
+const { FetchOutage } = Outage
 const HeartbeatManager = require('./heartbeatManager')
 const {
   REBALANCE_PATHS,
@@ -102,12 +103,14 @@ module.exports = class Runner extends EventEmitter {
      * requests in it: each ends only when a request of its own class succeeds.
      */
     this.outages = {
-      fetch: new Outage(consumerGroup.kind === 'consumer' ? Infinity : sessionTimeout),
+      fetch: new FetchOutage(consumerGroup.kind === 'consumer' ? Infinity : sessionTimeout),
       heartbeat: new Outage(consumerGroup.kind === 'consumer' ? Infinity : sessionTimeout),
       commit: new Outage(consumerGroup.kind === 'consumer' ? Infinity : sessionTimeout),
     }
     /** @type {WeakMap<object, 'fetch'|'heartbeat'|'handler'>} where an error left the loop's work */
     this.requestClasses = new WeakMap()
+    /** @type {WeakMap<Error, number>} the broker whose Fetch raised an error, across manager retries */
+    this.fetchNodes = new WeakMap()
     this.onCrash = onCrash
     this.autoCommit = autoCommit
     this.maxPrefetchBatches = maxPrefetchBatches
@@ -115,6 +118,8 @@ module.exports = class Runner extends EventEmitter {
       logger: this.logger,
       getNodeIds: () => this.consumerGroup.getNodeIds(),
       fetch: (nodeId) => this.fetch(nodeId),
+      retryDelay: (error, nodeId) => this.fetchRetryDelay(error, nodeId),
+      onRetire: (nodeId) => this.outages.fetch.end(nodeId),
       handler: (batch) => this.handleBatch(batch),
       concurrency,
     })
@@ -393,16 +398,8 @@ module.exports = class Runner extends EventEmitter {
           return
         }
 
-        const requestClass = this.requestClassOf(e)
-        if (requestClass && this.ridesOutages() && this.outages[requestClass].absorbs(e)) {
-          const delay = this.backoff.initial()
-          this.logger.warn('Lost a connection while fetching, trying again', {
-            groupId: this.consumerGroup.groupId,
-            memberId: this.consumerGroup.memberId,
-            error: e.message,
-            requestClass,
-            delay,
-          })
+        const delay = this.rideOutage(e)
+        if (delay !== undefined) {
           await sleep(delay)
           return true
         }
@@ -988,6 +985,64 @@ module.exports = class Runner extends EventEmitter {
   }
 
   /**
+   * Decides whether the loop rides `error` out as an outage of its own requests: the error's
+   * request class is one the group protocol rides and its outage still absorbs it. The caller
+   * waits the returned delay and tries again. Logs the warning the ride is reported with.
+   * @private
+   * @param {Error} error
+   * @param {number} [nodeId] the failed Fetch broker; inferred from its error in the outer loop
+   * @returns {number|undefined} the backoff delay in milliseconds; undefined when the error is not
+   *   ridden out, which leaves it to the retrier's counted retries
+   */
+  rideOutage(error, nodeId = this.fetchNodes.get(error)) {
+    const requestClass = this.requestClassOf(error)
+    if (
+      !requestClass ||
+      !this.ridesOutages() ||
+      !this.outages[requestClass].absorbs(error, performance.now(), nodeId)
+    ) {
+      return undefined
+    }
+
+    const delay = this.backoff.initial()
+    this.logger.warn('Lost a connection while fetching, trying again', {
+      groupId: this.consumerGroup.groupId,
+      memberId: this.consumerGroup.memberId,
+      error: error.message,
+      requestClass,
+      delay,
+    })
+    return delay
+  }
+
+  /**
+   * Decides whether one node's failed Fetch stays on that node's fetcher. It does when the fetch
+   * loop would ride the error out (`rideOutage`) and would not first turn it into a rebalance or
+   * drop it as an answer for a replaced membership, or find a verdict already waiting. Everything
+   * else reaches the loop through the fetch manager, as before. While no handler runs, the wait
+   * counts as a poll, as the fetch manager's restart did, so an outage does not expire the poll
+   * interval.
+   * @private
+   * @param {Error} error what a fetcher's Fetch threw
+   * @param {number} nodeId the failed broker
+   * @returns {number|undefined} the fetcher's backoff delay in milliseconds, or undefined
+   */
+  fetchRetryDelay(error, nodeId) {
+    if (
+      this.requestClassOf(error) !== 'fetch' ||
+      this.rebalanceCoordinator.hasVerdict() ||
+      this.rebalanceCoordinator.classify(error, REBALANCE_PATHS.FETCH) ||
+      obsoleteOwnership(this.consumerGroup.ownership, error)
+    ) {
+      return undefined
+    }
+
+    const delay = this.rideOutage(error, nodeId)
+    if (delay !== undefined && this.inFlightHandlers === 0) this.pollTimer.poll()
+    return delay
+  }
+
+  /**
    * Whether the loop retries its own transport/coordinator outage without consuming retries.
    * Classic uses the configured session window. Consumer protocol has no client session window:
    * a learned fence, fatal error, poll expiry or explicit stop still ends or replaces membership.
@@ -1258,6 +1313,7 @@ module.exports = class Runner extends EventEmitter {
     try {
       batches = await this.consumerGroup.fetch(nodeId)
     } catch (e) {
+      if (e && typeof e === 'object') this.fetchNodes.set(e, nodeId)
       throw this.markOwnRequest(e, 'fetch')
     }
 
@@ -1281,8 +1337,7 @@ module.exports = class Runner extends EventEmitter {
       this.pollTimer.poll()
       await this.heartbeat()
     } else {
-      // A leader answered: the fetch outage the loop was riding out, if any, is over.
-      this.outages.fetch.end()
+      this.outages.fetch.end(nodeId)
     }
 
     return batches

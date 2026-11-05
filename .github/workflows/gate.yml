@@ -17,7 +17,7 @@ on:
 permissions:
   contents: read
 concurrency:
-  group: gate-${{ github.ref }}
+  group: gate-${{ github.ref }}-${{ github.event.pull_request.draft == true }}
   cancel-in-progress: true
 env:
   KAFKA_VERSION: 4.3.1
@@ -231,6 +231,8 @@ jobs:
             ${{ runner.temp }}/node-tests.tap
             .tmp/gate-sweeps/
             .tmp/e2e/
+            coverage/coverage-summary.json
+            coverage/lcov.info
             ${{ runner.temp }}/compose.log
       - name: Record result
         if: always()

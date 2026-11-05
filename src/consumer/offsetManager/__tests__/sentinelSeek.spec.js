@@ -66,7 +66,8 @@ for (const autoCommit of [false, true]) {
           },
         ])
         expect(ctx.next()).toBe('37')
-        expect(ctx.committedAt()).toBe('37')
+        expect(ctx.heldAt()).toBe('37')
+        expect(ctx.committedAt()).toBeUndefined()
         expect(ctx.manager.lastConsumedEpoch(TOPIC, 0)).toBe(-1)
         expect(ctx.coordinator.offsetCommit).not.toHaveBeenCalled()
         expect(ctx.manager.pendingSeeks.size).toBe(0)
@@ -335,11 +336,17 @@ const runAgain = async (ctx) => {
   const owedAtStop = ctx.owed()
   const next = ctx.rebuild()
   await next.resolveOffsets()
-  return { position: next.nextOffset(TOPIC, 0).toString(), cache: ctx.committedAt(), owedAtStop }
+  return {
+    position: next.nextOffset(TOPIC, 0).toString(),
+    cache: ctx.heldAt(0, next),
+    shared: ctx.committedAt(),
+    owedAtStop,
+  }
 }
 
 /** The reset ran: ListOffsets by the topic's own default, position and cache at its boundary. */
-const expectReset = (ctx, { position, cache, owedAtStop }) => {
+const expectReset = (ctx, { position, cache, shared, owedAtStop }) => {
+  expect(shared).toBeUndefined()
   expect(position).toBe('0')
   expect(cache).toBe('0')
   expect(owedAtStop).toBe(true)
@@ -531,6 +538,20 @@ test('a sibling cache fill does not erase a current explicit sentinel', async ()
   held.release(listOffsetsAnswer({ 0: '83' }))
   await resolving
   expect(ctx.next()).toBe('83')
+  expect(ctx.manager.pendingSeeks.size).toBe(0)
+  expect(ctx.operations.size()).toBe(0)
+})
+
+test('a successful sentinel settles its intent and a second resolution sends no ListOffsets', async () => {
+  const ctx = fixture({ listOffset: '37' })
+  await seek(ctx, '-1')
+  await ctx.manager.resolveOffsets()
+  expect(ctx.manager.pendingSeeks.size).toBe(0)
+  expect(ctx.operations.size()).toBe(0)
+  expect(ctx.heldAt()).toBe('37')
+  expect(ctx.committedAt()).toBeUndefined()
+  await ctx.manager.resolveOffsets()
+  expect(ctx.cluster.fetchTopicsOffset).toHaveBeenCalledTimes(1)
   expect(ctx.manager.pendingSeeks.size).toBe(0)
   expect(ctx.operations.size()).toBe(0)
 })

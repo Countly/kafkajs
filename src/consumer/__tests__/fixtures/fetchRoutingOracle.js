@@ -16,12 +16,16 @@ const UNHINTED_OUTAGE = 'kill'
  *   long poll written at or before the loss of the old leader and answered after it; none fails
  *   the arm. The loss, not the route, is the anchor because a client that lost a leader without a
  *   hint refreshes its metadata only once the fetch round it is in has ended, so the route comes
- *   at or after the poll's end by design. The wait after the poll is counted from the later of
- *   the poll's end and the route, so the cluster's own election time is not charged to the client.
+ *   at or after the poll's end by design. The route may meet a later poll; the wait after that
+ *   poll is counted from the later of its end and the route, so the cluster's own election time
+ *   is not charged to the client.
+ *
+ *   The bounds are strict for every move, whether or not the consumer's node set changed around
+ *   it: a node-set change or a fetcher recreation earns no allowance. Those are diagnostics only.
  */
 const moveProblems = (measured) => {
   const { kind, hinted, newNode, errorAt, routeAt, nextAt, priorFetches, hint, anyHint } = measured
-  const { pollWriteAt, pollDoneAt } = measured
+  const { lossPollWriteAt, lossPollDoneAt, pollWriteAt, pollDoneAt } = measured
   const problems = []
   if (hinted && hint?.leaderId !== newNode) problems.push('the old leader named no new leader')
   if (!hinted && anyHint) problems.push('a hint was present')
@@ -31,11 +35,15 @@ const moveProblems = (measured) => {
     if (nextAt - routeAt > ROUND_ALLOWANCE_MS)
       problems.push('the idle route took longer than a round')
   } else {
+    if (lossPollWriteAt == null || lossPollDoneAt == null) {
+      problems.push('the new node had no long poll outstanding')
+    } else if (!(lossPollWriteAt <= errorAt && errorAt < lossPollDoneAt)) {
+      problems.push('the long poll was not outstanding at the loss')
+    }
     if (pollWriteAt == null || pollDoneAt == null) {
       problems.push('the new node had no long poll outstanding')
     } else {
-      if (!(pollWriteAt <= errorAt && errorAt < pollDoneAt))
-        problems.push('the long poll was not outstanding at the route')
+      if (pollWriteAt > routeAt) problems.push('the long poll was written after the route')
       if (nextAt < pollDoneAt) problems.push('the route started before the long poll ended')
       if (nextAt - Math.max(pollDoneAt, routeAt) > ROUND_ALLOWANCE_MS)
         problems.push('the route waited after the long poll')
@@ -46,6 +54,15 @@ const moveProblems = (measured) => {
   }
   return problems
 }
+
+/**
+ * @param {Array<{ at: number }>} fetches the Fetches one node wrote, oldest first
+ * @param {number} routeAt when the new leader was routed
+ * @returns {object|undefined} the poll the route met: a node has one Fetch in flight, so it is the
+ *   one written last at or before the route. The one outstanding at the loss may have ended and
+ *   been replaced before the route, and only the later one bounds the route's start.
+ */
+const pollAtRoute = (fetches, routeAt) => fetches.filter(({ at }) => at <= routeAt).at(-1)
 
 /**
  * Reads through DescribeTopicPartitions: a plain `fetchTopicMetadata` waits for a missing leader
@@ -101,5 +118,6 @@ module.exports = {
   UNHINTED_OUTAGE,
   moveProblems,
   partitionLeader,
+  pollAtRoute,
   siblingProblems,
 }

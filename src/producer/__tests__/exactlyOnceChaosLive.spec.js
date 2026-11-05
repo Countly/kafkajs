@@ -181,7 +181,7 @@ const snapshotVerdict = (snapshots, visible, chunks) => {
  * a confirmed commit had already covered it. A record delivered again before any commit covered it
  * is the at-least-once redelivery the oracle allows.
  * @param {object[]} chunks every copy transaction begun: `{ instance, partition, first, last,
- *   startedAt, committedAt }`, offsets of the input
+ *   startedAt, committedAt, endedAt }`, offsets of the input
  * @param {number[]} ends the end offset of each input partition
  * @returns {{ missing: number, duplicatesAfterLastCommit: number, violations: object[] }}
  *   `duplicatesAfterLastCommit` counts the records delivered again that no confirmed commit covered
@@ -611,6 +611,7 @@ class Copier {
       startedAt: Date.now(),
       commitStartedAt: null,
       committedAt: null,
+      endedAt: null,
       outcome: 'failed',
     }
     scenario.chunks.push(entry)
@@ -659,6 +660,8 @@ class Copier {
       }
       this.fail(error, step)
       return false
+    } finally {
+      entry.endedAt = Date.now()
     }
   }
 
@@ -1154,9 +1157,12 @@ class CopierScenario {
           ...outage,
           round: name,
           copiedAtDown: this.copiedBefore(outage.tDown),
+          // A copy transaction in flight across the outage counts: during back-to-back hard kills
+          // one transaction can stay blocked on a killed broker and no new one starts.
           trafficNear: this.chunks.some(
-            ({ startedAt }) =>
-              startedAt >= outage.tDown - TRAFFIC_WINDOW_MS && startedAt <= outage.tRestored
+            ({ startedAt, endedAt }) =>
+              startedAt <= outage.tRestored &&
+              (endedAt ?? Infinity) >= outage.tDown - TRAFFIC_WINDOW_MS
           ),
         })
       }

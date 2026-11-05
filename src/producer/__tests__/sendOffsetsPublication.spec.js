@@ -536,13 +536,14 @@ describe.each(['tv1', 'tv2'])('Producer > transactional offsets on the wire (%s)
       const transaction = await producer.transaction()
       const ledger = runners[0].consumerGroup.operations
       for (let turn = 0; turn < 4000; turn++) {
-        const cache = runners[0].consumerGroup.cluster.committedOffsets({ groupId })
-        if (
-          ledger.size() === 0 &&
-          cache[TOPIC]?.[0]?.toString() === '0' &&
-          cache[TOPIC]?.[1]?.toString() === '0'
+        const positioned = new Set(
+          runners.flatMap(({ consumerGroup: { offsetManager: manager } }) =>
+            (manager.memberAssignment[TOPIC] ?? []).filter(
+              (partition) => manager.heldOffsetAt(TOPIC, partition)?.toString() === '0'
+            )
+          )
         )
-          break
+        if (ledger.size() === 0 && positioned.has(0) && positioned.has(1)) break
         await new Promise((resolve) => setTimeout(resolve, 1))
       }
       expect(ledger.size()).toBe(0)
