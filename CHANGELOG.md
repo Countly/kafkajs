@@ -225,6 +225,8 @@ Versions before 3.0.0 are internal alpha tags and are not published.
 
 - DeleteGroups v3 returns `errorMessage` per group; the error table gains `GROUP_DELETION_FAILED`, `STREAMS_TOPOLOGY_DESCRIPTION_UPDATE_FAILED` and `CONTROLLER_ID_NOT_REGISTERED`; the compatibility baseline moves to Kafka 4.4.x
 
+- `rackId` and `rackAware` producer options (KIP-1123): with `rackAware: true` and a non-empty `rackId`, the built-in partitioners (the default `UniformStickyPartitioner`, `DefaultPartitioner` and its alias, `LegacyPartitioner`) prefer the partitions whose leader is in that rack for records without a key, and fall back to every partition with a leader when none is. A record with a `partition` or a key keeps its partition, and a custom `createPartitioner` is given the same arguments as before. Without the opt-in nothing changes.
+
 #### Tooling
 
 - Compose variants for delegation tokens, two log directories and tiered storage; the admin ledger table.
@@ -242,6 +244,7 @@ Versions before 3.0.0 are internal alpha tags and are not published.
 - `scripts/protocol/javaVectorSources.json` records, for each Java vector, the `kafka-clients` jar that wrote it, that jar's SHA-256 (null only for the 4.3.1 jar of the older vectors) and the fixture's own SHA-256; `npm run protocol:generate` and `protocol:check` refuse a missing, extra, duplicate (a key written twice, found by its decoded text whatever the file's layout) or stale record and copy the records into `scripts/protocol/provenance.json`, where an API whose vectors came from two jars records no single jar.
 - The Java message-vector generator targets the Kafka 4.4 client API, and `test:e2e:delete-groups-v3` runs `deleteGroupsV3Live.spec.js` (`DELETE_GROUPS_V3_E2E`) against the broker version under test.
 - The 4.0 floor set covers the admin ledger, connection, OAuth, GSSAPI and delegation-token capabilities and asserts the unsupported results.
+- `test:e2e:rack-aware-producer` runs `rackAwareProducerLive.spec.js` (`RACK_AWARE_PRODUCER_E2E`) on `docker-compose.racks.yml`; the consumer's `test:e2e:rack-aware` is a separate script and flag.
 
 ### Phase 9B — Producer parity: delivery deadline, memory bound, request size, partitioner, codecs, lifecycle
 

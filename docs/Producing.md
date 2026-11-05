@@ -37,6 +37,8 @@ const producer = kafka.producer({
 | maxBlockMs | How long, in ms, a send waits for room in `bufferMemory` before it rejects with `KafkaJSBufferExhaustedError`, and never past its delivery deadline. An integer from 0 to 2147483647; 0 rejects a send that does not fit at once. See [Memory](#memory) | `60000` |
 | maxRequestSize | The largest Produce request, in bytes, counting its whole frame after compression. A record that no request can carry rejects with `KafkaJSRecordTooLargeError`; a send larger than one request is split at record boundaries. An integer from the smallest request this producer's `clientId` and `transactionalId` allow (named in the error) to 2147483647. See [Request size](#request-size) | `1048576` (1 MiB) |
 | metadataMaxIdle | Milliseconds an idle topic with no pending work is retained. An integer from 5000 to 2147483647; the next send reloads forgotten metadata. | `300000` |
+| rackId | The rack the producer runs in, the `broker.rack` value of the brokers near it (KIP-1123). A string; it changes nothing unless `rackAware` is `true`. See [Rack-aware partitioning](#rack-aware-partitioning) | `''` |
+| rackAware | Prefer the partitions whose leader is in `rackId` for records without a key, in the built-in partitioners. A boolean; `true` with an empty `rackId` is invalid. See [Rack-aware partitioning](#rack-aware-partitioning) | `false` |
 
 ## <a name="idempotence"></a> Idempotence
 
@@ -359,6 +361,19 @@ them: a partition is picked with probability proportional to the deepest queue p
 own, as the Java client's `partitioner.adaptive.partitioning.enable` does; equal queues pick
 uniformly. The producer's own default does not weigh. `partitioner.availability.timeout.ms` is not
 implemented.
+
+### <a name="rack-aware-partitioning"></a> Rack-aware partitioning
+
+`rackId` is a string (default `''`); `rackAware` is a boolean (default `false`). Set a nonempty `rackId` and `rackAware: true` to prefer available partitions whose leader is in that rack for unkeyed built-in partitioning. If none match, selection falls back to the ordinary candidates. Explicit partitions and keyed hashing retain their existing mapping. Custom partitioners receive the same three input keys and unfiltered metadata and retain full selection authority; rack preference does not apply to them. `rackAware: true` with an empty `rackId` is invalid.
+
+```javascript
+const producer = kafka.producer({ rackId: 'rack-a', rackAware: true })
+```
+
+- **Opt-in.** Without `rackAware: true` the producer behaves exactly as without these options; a `rackId` alone changes nothing. A `rackId` that is not a string, a `rackAware` that is not a boolean, and `rackAware: true` with an empty `rackId` make `kafka.producer()` throw `KafkaJSInvalidConfigurationError` before anything connects.
+- **Which partitioners.** `UniformStickyPartitioner` (the default, also with `adaptive` or `ignoreKeys`), `DefaultPartitioner` with its alias `JavaCompatiblePartitioner`, and `LegacyPartitioner`. A record without a key goes among the partitions that have a leader in the producer's rack; a sticky partition outside that set is left at the next record, and an adaptive pick weighs only that set.
+- **Fallback.** When no partition with a leader is in the rack, or the racks of the leaders are not known, the choice is the same as without the option: among every partition with a leader, or among all partitions when none has one. A rack is the one a broker reports in its metadata (`broker.rack`); a broker that reports none matches no `rackId`.
+- **Unchanged.** A record with a `partition` goes there, and a keyed record goes where the partitioner you chose already sends it (`DefaultPartitioner`'s hash is the Java client's; `LegacyPartitioner` keeps its own): neither reads a rack. With `UniformStickyPartitioner({ ignoreKeys: true })` a keyed record is a record without a key.
 
 ## <a name="retry"></a> Retry
 

@@ -1,4 +1,6 @@
 const randomBytes = require('./randomBytes')
+const RackPreference = require('../rackPreference')
+const { register } = require('../builtIn')
 
 // Based on the java client 0.10.2
 // https://github.com/apache/kafka/blob/0.10.2/clients/src/main/java/org/apache/kafka/clients/producer/internals/DefaultPartitioner.java
@@ -15,19 +17,25 @@ const toPositive = (x) => x & 0x7fffffff
  * The default partitioning strategy:
  *  - If a partition is specified in the message, use it
  *  - If no partition is specified but a key is present choose a partition based on a hash of the key
- *  - If no partition or key is present choose a partition in a round-robin fashion
+ *  - If no partition or key is present choose a partition in a round-robin fashion, over the
+ *    partitions that have a leader - or, once the producer opted in with `rackAware` and a
+ *    `rackId` (KIP-1123), over those whose leader is in that rack when any is
+ *
+ * The producer attaches its private context to the partition function this returns, as it does to
+ * every built-in partitioner; a record with a partition or a key never reads a rack.
+ * @param {(key: Buffer|string) => number} murmur2 the key hash
+ * @returns {import('../../../../types').ICustomPartitioner} a `createPartitioner`
  */
 module.exports = (murmur2) => () => {
   // no prototype: a topic may be named `toString` or `__proto__`
   const counters = Object.create(null)
+  const racks = new RackPreference()
 
-  return ({ topic, partitionMetadata, message }) => {
+  const partitioner = ({ topic, partitionMetadata, message }) => {
     if (!(topic in counters)) {
       counters[topic] = randomBytes(32).readUInt32BE(0)
     }
     const numPartitions = partitionMetadata.length
-    const availablePartitions = partitionMetadata.filter((p) => p.leader >= 0)
-    const numAvailablePartitions = availablePartitions.length
 
     if (message.partition !== null && message.partition !== undefined) {
       return message.partition
@@ -37,12 +45,22 @@ module.exports = (murmur2) => () => {
       return toPositive(murmur2(message.key)) % numPartitions
     }
 
-    if (numAvailablePartitions > 0) {
-      const i = toPositive(++counters[topic]) % numAvailablePartitions
-      return availablePartitions[i].partitionId
+    const eligiblePartitions = racks.eligible(partitionMetadata)
+    if (eligiblePartitions.length > 0) {
+      const i = toPositive(++counters[topic]) % eligiblePartitions.length
+      return eligiblePartitions[i].partitionId
     }
 
     // no partitions are available, give a non-available partition
     return toPositive(++counters[topic]) % numPartitions
   }
+
+  /**
+   * The producer's seam: called once with its private context.
+   * @param {{ rackOf: (nodeId: number) => string|undefined, rackId?: string,
+   *   rackAware?: boolean }} context
+   * @returns {void}
+   */
+  partitioner.attach = (context) => racks.attach(context)
+  return register(partitioner)
 }

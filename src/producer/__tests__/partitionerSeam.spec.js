@@ -126,7 +126,12 @@ describe('Producer > the partitioner seam', () => {
       await start(() => instance)
       await producer.send({ topic: TOPIC, messages: [{ value: 'v' }] })
       expect(attached).toHaveBeenCalledTimes(1)
-      expect(Object.keys(attached.mock.calls[0][0]).sort()).toEqual(['loadOf', 'rackOf'])
+      expect(Object.keys(attached.mock.calls[0][0]).sort()).toEqual([
+        'loadOf',
+        'rackAware',
+        'rackId',
+        'rackOf',
+      ])
       const random = jest.spyOn(Math, 'random').mockReturnValue(0.3)
       attach(instance, {
         loadOf: (_, partition) => (partition === 0 ? 100 : 0),
@@ -157,7 +162,8 @@ describe('Producer > the partitioner seam', () => {
     const [context] = seen.attached
 
     expect(seen.attached).toHaveLength(1)
-    expect(Object.keys(context).sort()).toEqual(['loadOf', 'rackOf'])
+    expect(Object.keys(context).sort()).toEqual(['loadOf', 'rackAware', 'rackId', 'rackOf'])
+    expect([context.rackId, context.rackAware]).toEqual(['', false])
     expect([context.loadOf(TOPIC, 0), context.loadOf(TOPIC, 1)]).toEqual([1, 0])
     expect([context.rackOf(0), context.rackOf(1), context.rackOf(9)]).toEqual([
       'rack-a',

@@ -15,7 +15,8 @@ const register = (partitioner) => {
  * Attaches the private producer context only to a registered built-in. A custom function's
  * properties are never inspected, including an unrelated or non-callable `attach` property.
  * @param {Function} partitioner
- * @param {{ loadOf: Function, rackOf: Function }} context
+ * @param {{ loadOf: Function, rackOf: Function, rackId: string, rackAware: boolean }} context the
+ *   producer's batch depths, its node racks and its rack options
  * @returns {void}
  */
 const attach = (partitioner, context) => {

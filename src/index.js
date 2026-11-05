@@ -12,6 +12,7 @@ const LoggerConsole = require('./loggers/console')
 const Cluster = require('./cluster')
 const { ConnectionSetupPolicy } = require('./network/connectionSetup')
 const createProducer = require('./producer')
+const RackPreference = require('./producer/partitioners/rackPreference')
 const { minimumRequestSize } = require('./producer/state/recordSize')
 const { MAX_DELAY } = require('./producer/deadline')
 const createConsumer = require('./consumer')
@@ -465,9 +466,17 @@ module.exports = class Client {
    * @param {number} [options.bufferMemory=33554432] bytes the producer's sends may hold at once
    * @param {number} [options.maxBlockMs=60000] ms a send waits for room in that buffer
    * @param {number} [options.metadataMaxIdle=300000] idle unpinned topic lifetime, 5000..2147483647 ms
+   * @param {string} [options.rackId=''] the producer's rack (KIP-1123), the broker's `broker.rack`
+   *   it is in
+   * @param {boolean} [options.rackAware=false] with a non-empty `rackId`, the built-in
+   *   partitioners prefer the partitions whose leader is in that rack for records without a key,
+   *   and use all partitions when none is; a record with a partition or a key and a custom
+   *   partitioner are unaffected
    * @returns {import("../types").Producer} the producer and its transaction factory
    * @throws {KafkaJSInvalidConfigurationError} for a setting idempotence asked for explicitly
-   *   does not allow, and for invalid delivery, buffer, request-size or compression-level options
+   *   does not allow, for invalid delivery, buffer, request-size or compression-level options, for
+   *   a `rackId` that is not a string or a `rackAware` that is not a boolean, and for `rackAware`
+   *   with an empty `rackId`
    */
   producer({
     createPartitioner,
@@ -486,6 +495,8 @@ module.exports = class Client {
     bufferMemory,
     maxBlockMs,
     maxRequestSize,
+    rackId = '',
+    rackAware = false,
   } = {}) {
     if (!(
       Number.isInteger(metadataMaxIdle) &&
@@ -496,6 +507,7 @@ module.exports = class Client {
         `metadataMaxIdle must be an integer >= 5000 and <= ${MAX_DELAY}, got ${inspect(metadataMaxIdle)}`
       )
     }
+    RackPreference.validate({ rackId, rackAware })
     const levels = resolveCompressionLevels(compressionLevels)
     validateBuffer({ bufferMemory, maxBlockMs })
     validateMaxRequestSize(maxRequestSize, this[PRIVATE.CLIENT_ID], transactionalId)
@@ -553,6 +565,8 @@ module.exports = class Client {
       clientId: this[PRIVATE.CLIENT_ID],
       maxRequestSize,
       instrumentationEmitter,
+      rackId,
+      rackAware,
     })
   }
 

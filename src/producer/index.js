@@ -5,6 +5,7 @@ const { MAX_DELAY } = require('./deadline')
 const { CONNECTION_STATUS } = require('../network/connectionStatus')
 const { UniformStickyPartitioner } = require('./partitioners/')
 const { attach: attachBuiltIn } = require('./partitioners/builtIn')
+const RackPreference = require('./partitioners/rackPreference')
 const InstrumentationEventEmitter = require('../instrumentation/emitter')
 const createEosManager = require('./eosManager')
 const createMessageProducer = require('./messageProducer')
@@ -158,10 +159,15 @@ const definedKeys = (options) =>
  * @param {number} [params.maxRequestSize=1048576] the largest Produce request in bytes, its whole
  *   frame counted, for its own sends and its transactions' (see `RequestBudget`)
  * @param {InstrumentationEventEmitter} [params.instrumentationEmitter]
+ * @param {string} [params.rackId=''] the producer's rack (KIP-1123)
+ * @param {boolean} [params.rackAware=false] whether the built-in partitioners prefer the partitions
+ *   whose leader is in `rackId` for records without a key; needs a non-empty `rackId`, and a custom
+ *   partitioner is never given either option
  *
  * @returns {import('../../types').Producer}
  * @throws {KafkaJSInvalidConfigurationError} `retry.retries` below 1 on a producer that asked for
- *   idempotence
+ *   idempotence, a `rackId` that is not a string, a `rackAware` that is not a boolean, or
+ *   `rackAware` with an empty `rackId`
  */
 const createProducer = ({
   cluster,
@@ -181,7 +187,10 @@ const createProducer = ({
   clientId,
   maxRequestSize = DEFAULTS.maxRequestSize,
   instrumentationEmitter: rootInstrumentationEmitter,
+  rackId = '',
+  rackAware = false,
 }) => {
+  RackPreference.validate({ rackId, rackAware })
   let connectionStatus = CONNECTION_STATUS.DISCONNECTED
   /**
    * @type {Promise<void>|null} while `disconnect()` cleans up, from its first step to its last:
@@ -349,6 +358,8 @@ const createProducer = ({
     loadOf: (topic, partition) =>
       depthOf(topic, partition) + (transactionalMessageProducer?.depthOf(topic, partition) ?? 0),
     rackOf: (nodeId) => cluster.brokerPool?.brokers[nodeId]?.connectionPool.rack ?? undefined,
+    rackId,
+    rackAware,
   })
   /**
    * @type {Promise<void>|null} the commit under way - a transaction's `commit()`, or the one
