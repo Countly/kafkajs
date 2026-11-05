@@ -324,7 +324,9 @@ const resumeBroker = createBrokerResume(brokerRun)
 const TRUNCATION_CLEANUP_BUDGET_MS =
   4 * DISCONNECT_BUDGET_MS + 2 * (TRUNCATION_FREEZE_MS + TRUNCATION_STEP_MS + BROKER_READY_MS)
 /** What each broker read of a truncation arm's evidence may take. */
-const TRUTH_MS = 5000
+const TRUTH_MS = 10000
+/** A request to a paused broker fails after this, so a read moves on to a live one. */
+const TRUTH_REQUEST_MS = 2000
 
 /**
  * @param {Array<{topic: string, partition: number, value: string}>} acknowledged one batch, in
@@ -609,17 +611,31 @@ class TruncationArm {
    * @returns {Promise<{ committed: unknown, endOffsets: unknown }>}
    */
   async readTruth() {
+    // A fresh admin: the arm's own may hold a connection to the paused broker, and a request on
+    // it waits out the default 30 s request timeout, past `TRUTH_MS`, which taints the run.
+    const admin = new Kafka({
+      clientId: 'consumer-unclean-election-truth',
+      brokers: plainTextBrokers(),
+      logLevel: logLevel.NOTHING,
+      requestTimeout: TRUTH_REQUEST_MS,
+    }).admin()
     const read = (label, op) =>
       bounded(this.scope, TRUTH_MS, op, { label }).catch((error) => ({
         unavailable: describeError(error),
       }))
-    return {
-      committed: await read('The committed read', () =>
-        this.admin.fetchOffsets({ groupId: this.groupId, topics: [this.topic] })
-      ),
-      endOffsets: await read('The end offsets read', () =>
-        this.admin.fetchTopicOffsets(this.topic)
-      ),
+    try {
+      await read('The truth admin connect', () => admin.connect())
+      return {
+        committed: await read('The committed read', () =>
+          admin.fetchOffsets({ groupId: this.groupId, topics: [this.topic] })
+        ),
+        endOffsets: await read('The end offsets read', () => admin.fetchTopicOffsets(this.topic)),
+      }
+    } finally {
+      // Not under the case scope: an aborted case still closes the admin it opened.
+      await bounded(NEVER, DISCONNECT_BUDGET_MS, () => admin.disconnect(), {
+        label: 'The truth admin disconnect',
+      }).catch(() => {})
     }
   }
 
