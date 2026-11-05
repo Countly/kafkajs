@@ -1363,6 +1363,8 @@ class AdminLedgerScenario {
   /**
    * Proves minimum grants and typed denials with fresh nonsuperuser connections.
    * Positive controls and safe denial observations wait under the probe's work deadline.
+   * Topic DESCRIBE dependencies settle on every broker because the reused client retains metadata
+   * targets even when the next operation authorizes a different resource or operation.
    * ListTransactions proves successful filtering; mutations run once after a proven safe probe,
    * except topic-ID deletion, whose denial remains one-shot. This also runs cold in the ACL profile.
    * @returns {Promise<void>}
@@ -1800,8 +1802,15 @@ class AdminLedgerScenario {
         [
           'producer diagnostics',
           'transaction abort',
+          'leader election',
+          'features',
+          'directories',
           'reassignment',
           'directory mutation',
+          'list transactions',
+          'config mutation',
+          'SCRAM mutation',
+          'ID deletion',
         ].includes(check.name)
       )
         dependencies.push({ resourceType: 2, resourceName: topic, operation: 8 })
@@ -1815,6 +1824,16 @@ class AdminLedgerScenario {
           deletedAcls(await root.deleteAcls({ filters: [dependency] }))
         })
         expect(await p.invoke(() => root.createAcls({ acl: [dependency] }))).toBe(true)
+        if (dependency.resourceType === 2 && dependency.operation === 8) {
+          for (const broker of permissionSources) {
+            const metadata = await this.permissionAllowed({
+              call: () => broker.metadata([dependency.resourceName]),
+            })
+            expect(metadata.topicMetadata).toMatchObject([
+              { topic: dependency.resourceName, topicErrorCode: 0 },
+            ])
+          }
+        }
       }
       expect(await p.invoke(() => root.createAcls({ acl: [acl] }))).toBe(true)
       const positive = await this.permissionAllowed(check)
