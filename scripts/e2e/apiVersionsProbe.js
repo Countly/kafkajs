@@ -5,9 +5,9 @@
  * ApiVersions probe: the version range a broker offers for each API the admin and classic-group
  * codecs target.
  *
- * Usage: npm run probe:api-versions [-- --all | -- --record=<file>]
- *   (= npm run test:kafka -- "node scripts/e2e/apiVersionsProbe.js"; `KAFKA_VERSION=4.2.2`,
- *   `4.1.2` or the floor `4.0.2` selects the cluster image, default 4.3.1)
+ * Usage inside a guard-owned fixture: node scripts/e2e/apiVersionsProbe.js [--all | --record=<file>] [--record-features=<file>]
+ * Run this probe only inside a fixture owned by the reviewed live guard.
+ * The fixture owner selects the broker version and records evidence before teardown.
  * Prints one JSON line, and appends it to `.tmp/e2e/api-versions-probe.jsonl`:
  *   {"event":"api-versions","kafkaVersion":"4.3.1","versions":{"Metadata":[0,13],…}}
  * where each value is `[minVersion, maxVersion]`, or `null` for an API the broker does not list.
@@ -19,6 +19,12 @@
  * into a JSON table `{ "<version>": { "<ApiName>": [min, max], … } }`, keeping the other entries:
  * that is how `scripts/protocol/brokerRanges.json` is written. `--record` needs its file as
  * `--record=<file>`; `--record`, `--record=` and `--record <file>` print a usage line and exit 1.
+ *
+ * With `--record-features=<file>` (which implies `--all`) it also reads the broker's finalized
+ * `share.version` off the same answer, prints and appends a second line
+ * `{"event":"finalized-features","kafkaVersion":"4.3.1","features":{"share.version":1}}` and merges
+ * `features` into that file the same way: that is how `scripts/protocol/brokerFeatures.json` is
+ * written. The file needs naming as `--record` does.
  *
  * Development-only. It reads one ApiVersions v4 answer from `localhost:9092` and creates nothing on
  * the cluster. A 4.1 broker hides an unstable last version from ApiVersions, so OffsetCommit and
@@ -139,13 +145,48 @@ const rangeOf = (entry, apiKey, names = apiNames()) =>
   entry[names.get(apiKey)] ?? entry[`ApiKey${apiKey}`]
 
 /**
- * Writes one broker version's offered ranges into a JSON table, creating the file when it is
- * missing, replacing that version's entry when it is there and leaving the others as they are.
- * Entries are ordered by version.
- * @param {string} file path of the JSON table, `{ "<version>": { "<ApiName>": [min, max], … } }`
+ * The name of the share-group feature whose finalized level gates share groups (KIP-932).
+ * @see https://github.com/apache/kafka/blob/4.4.0/server-common/src/main/java/org/apache/kafka/server/common/ShareVersion.java
+ */
+const SHARE_VERSION = 'share.version'
+
+/**
+ * The finalized `share.version` of an ApiVersions answer, as `brokerFeatures.json` records it: the
+ * finalized `maxVersionLevel` when the broker finalized the feature, `0` when it supports the
+ * feature without finalizing it (on the wire, level 0 is the absence of a finalized entry), and no
+ * key when the broker neither supports nor finalized it. A level is never inferred from the API
+ * ranges, and nothing is read from the epoch except that it is present.
+ * @param {{ supportedFeatures?: { name: string }[], finalizedFeatures?: { name: string, maxVersionLevel: number }[], finalizedFeaturesEpoch?: string }} answer
+ *   a decoded ApiVersions v3+ response; the epoch is the int64 decimal string the codec gives
+ * @returns {{ 'share.version'?: number }}
+ * @throws {Error} when the answer carries no finalized-features epoch (-1): such a broker has told
+ *   nothing about its features, so no level may be recorded for it
+ */
+const featuresOf = ({
+  supportedFeatures = [],
+  finalizedFeatures = [],
+  finalizedFeaturesEpoch = '-1',
+}) => {
+  if (BigInt(finalizedFeaturesEpoch) < 0n) {
+    throw new Error('The broker sent no finalized features (epoch -1): nothing to record')
+  }
+
+  const finalized = finalizedFeatures.find(({ name }) => name === SHARE_VERSION)
+  if (finalized) {
+    return { [SHARE_VERSION]: finalized.maxVersionLevel }
+  }
+
+  return supportedFeatures.some(({ name }) => name === SHARE_VERSION) ? { [SHARE_VERSION]: 0 } : {}
+}
+
+/**
+ * Writes one broker version's entry into a JSON table, creating the file when it is missing,
+ * replacing that version's entry when it is there and leaving the others as they are. Entries are
+ * ordered by version. It writes `brokerRanges.json` and `brokerFeatures.json`.
+ * @param {string} file path of the JSON table, `{ "<version>": { … }, … }`
  * @param {string} version `major.minor.patch`, as the broker reports it
- * @param {Record<string, [number, number]>} versions `[minVersion, maxVersion]` per API name, as
- *   `allVersionsOf` gives it
+ * @param {object} versions the version's entry: `[minVersion, maxVersion]` per API name, as
+ *   `allVersionsOf` gives it, or the features `featuresOf` gives
  * @returns {void}
  * @throws {Error} when `version` is not `major.minor.patch`
  */
@@ -180,14 +221,15 @@ const assertSameVersion = (reported, requested) => {
 }
 
 /**
- * One ApiVersions v4 round trip to `localhost:9092` over a fresh connection.
+ * One ApiVersions v4 round trip over a fresh connection, to `localhost:9092` unless told otherwise.
+ * @param {{ host?: string, port?: number }} [address] the broker's plaintext listener
  * @returns {Promise<{ apiVersions: object[] }>} the decoded response
  * @throws {Error} when the broker cannot be reached or answers with an error code
  */
-const readApiVersions = async () => {
+const readApiVersions = async ({ host = 'localhost', port = 9092 } = {}) => {
   const connection = new Connection({
-    host: 'localhost',
-    port: 9092,
+    host,
+    port,
     logger: createLogger({ level: LEVELS.NOTHING, logCreator: LoggerConsole }),
     socketFactory: defaultSocketFactory(),
     clientId: 'api-versions-probe',
@@ -203,49 +245,71 @@ const readApiVersions = async () => {
   }
 }
 
-const USAGE = 'Usage: node scripts/e2e/apiVersionsProbe.js [--all | --record=<file>]'
+const USAGE =
+  'Usage: node scripts/e2e/apiVersionsProbe.js [--all | --record=<file>] [--record-features=<file>]'
+
+/**
+ * The file a `<flag>=<file>` argument names.
+ * @param {string[]} argv the arguments after the script name
+ * @param {string} flag e.g. `--record`
+ * @returns {string|undefined} the file; `''` for the flag without one (`<flag>` or `<flag>=`);
+ *   `undefined` when the flag is absent
+ */
+const fileArgument = (argv, flag) =>
+  argv.find((arg) => arg === flag || arg.startsWith(`${flag}=`))?.slice(flag.length + 1)
 
 const DEFAULT_SOURCES = Object.freeze({ readApiVersions, readBrokerVersion, writeEvidence })
 
 /**
  * Runs the probe: reads one ApiVersions answer, prints the line, appends it to the evidence file
- * and, with `--record=<file>`, merges it into that table. `--all` and `--record` list every API
- * under the version the running broker reports; plain mode lists the probed APIs under
+ * and, with `--record=<file>`, merges it into that table; with `--record-features=<file>` it does
+ * the same with the finalized features of that answer. `--all` and both record flags list every
+ * API under the version the running broker reports; plain mode lists the probed APIs under
  * `KAFKA_VERSION` (default 4.3.1) and never asks the broker for its version.
  * @param {string[]} argv the arguments after the script name
  * @param {object} [sources] what the probe reads and writes; each defaults to the live one
- * @param {() => Promise<{ apiVersions: object[] }>} [sources.readApiVersions] the broker's answer
+ * @param {() => Promise<object>} [sources.readApiVersions] the broker's decoded answer
  * @param {() => string} [sources.readBrokerVersion] the version the running broker reports
  * @param {(name: string, record: object) => void} [sources.writeEvidence] the evidence writer
  * @returns {Promise<void>}
- * @throws {Error} with the usage when `--record` has no file, before anything is read; and when
- *   the broker is not the version `KAFKA_VERSION` asks for, before anything is written
+ * @throws {Error} with the usage when a record flag has no file, before anything is read; when
+ *   the broker is not the version `KAFKA_VERSION` asks for, and when `--record-features` meets an
+ *   answer without finalized features, before anything is written
  */
 const main = async (argv, sources = {}) => {
   const io = { ...DEFAULT_SOURCES, ...sources }
-  const record = argv
-    .find((arg) => arg === '--record' || arg.startsWith('--record='))
-    ?.slice('--record='.length)
-  if (record === '') {
+  const record = fileArgument(argv, '--record')
+  const recordFeatures = fileArgument(argv, '--record-features')
+  if (record === '' || recordFeatures === '') {
     throw new Error(USAGE)
   }
 
-  const all = argv.includes('--all') || record !== undefined
-  const { apiVersions } = await io.readApiVersions()
+  const all = argv.includes('--all') || record !== undefined || recordFeatures !== undefined
+  const answer = await io.readApiVersions()
   const kafkaVersion = all ? io.readBrokerVersion() : process.env.KAFKA_VERSION || '4.3.1'
 
   if (all) {
     assertSameVersion(kafkaVersion, process.env.KAFKA_VERSION)
   }
 
-  const versions = all ? allVersionsOf(apiVersions) : versionsOf(apiVersions)
+  const versions = all ? allVersionsOf(answer.apiVersions) : versionsOf(answer.apiVersions)
   const line = { event: 'api-versions', kafkaVersion, versions }
+  const featureLine = recordFeatures && {
+    event: 'finalized-features',
+    kafkaVersion,
+    features: featuresOf(answer),
+  }
   io.writeEvidence('api-versions-probe', line)
   if (record) {
     recordRanges(path.resolve(record), kafkaVersion, versions)
   }
 
   console.log(JSON.stringify(line))
+  if (featureLine) {
+    io.writeEvidence('api-versions-probe', featureLine)
+    recordRanges(path.resolve(recordFeatures), kafkaVersion, featureLine.features)
+    console.log(JSON.stringify(featureLine))
+  }
 }
 
 if (require.main === module) {
@@ -264,7 +328,10 @@ module.exports = {
   apiNames,
   allVersionsOf,
   rangeOf,
+  SHARE_VERSION,
+  featuresOf,
   recordRanges,
+  readApiVersions,
   assertSameVersion,
   main,
 }

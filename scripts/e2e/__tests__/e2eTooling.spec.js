@@ -20,6 +20,8 @@ const {
   allVersionsOf,
   apiNames,
   rangeOf,
+  SHARE_VERSION,
+  featuresOf,
   recordRanges,
   assertSameVersion,
   main,
@@ -510,6 +512,83 @@ describe('E2E tooling', () => {
           expect(fs.readdirSync(directory)).toEqual([])
         }
       )
+
+      describe('--record-features', () => {
+        const features = () => path.join(directory, 'features.json')
+        const answerOf = async (version) => decode(Buffer.from(CAPTURES[version]))
+
+        test('records the finalized share.version under the version the broker reports, after the API line', async () => {
+          const answer = await answerOf('4.3.1')
+          io.readApiVersions.mockResolvedValue(answer)
+          io.readBrokerVersion.mockReturnValue('4.3.1')
+          fs.writeFileSync(features(), '{\n  "4.0.2": {}\n}\n')
+          const featureLine = {
+            event: 'finalized-features',
+            kafkaVersion: '4.3.1',
+            features: { 'share.version': 1 },
+          }
+
+          await main([`--record-features=${features()}`], io)
+
+          expect(console.log.mock.calls.map(([text]) => JSON.parse(text).event)).toEqual([
+            'api-versions',
+            'finalized-features',
+          ])
+          expect(io.readBrokerVersion).toHaveBeenCalledTimes(1)
+          expect(JSON.parse(console.log.mock.calls[1][0])).toEqual(featureLine)
+          expect(io.writeEvidence.mock.calls).toEqual([
+            [
+              'api-versions-probe',
+              {
+                event: 'api-versions',
+                kafkaVersion: '4.3.1',
+                versions: allVersionsOf(answer.apiVersions),
+              },
+            ],
+            ['api-versions-probe', featureLine],
+          ])
+          expect(fs.readFileSync(features(), 'utf8')).toBe(
+            '{\n  "4.0.2": {},\n  "4.3.1": {\n    "share.version": 1\n  }\n}\n'
+          )
+          expect(fs.readdirSync(directory)).toEqual(['features.json'])
+        })
+
+        test('writes both tables from one answer when --record comes too', async () => {
+          const answer = await answerOf('4.1.2')
+          io.readApiVersions.mockResolvedValue(answer)
+          io.readBrokerVersion.mockReturnValue('4.1.2')
+
+          await main([`--record=${file}`, `--record-features=${features()}`], io)
+
+          expect(JSON.parse(fs.readFileSync(file, 'utf8'))).toEqual({
+            '4.1.2': allVersionsOf(answer.apiVersions),
+          })
+          expect(JSON.parse(fs.readFileSync(features(), 'utf8'))).toEqual({
+            '4.1.2': { 'share.version': 0 },
+          })
+        })
+
+        test.each([['--record-features='], ['--record-features']])(
+          'refuses %p, which names no file, before it reads or writes anything',
+          async (flag) => {
+            await expect(main([flag], io)).rejects.toThrow('Usage: node')
+
+            expect(io.readApiVersions).not.toHaveBeenCalled()
+            expect(io.writeEvidence).not.toHaveBeenCalled()
+            expect(fs.readdirSync(directory)).toEqual([])
+          }
+        )
+
+        test('stops before it writes anything on an answer that carries no finalized features', async () => {
+          await expect(
+            main([`--record=${file}`, `--record-features=${features()}`], io)
+          ).rejects.toThrow('The broker sent no finalized features (epoch -1): nothing to record')
+
+          expect(io.writeEvidence).not.toHaveBeenCalled()
+          expect(console.log).not.toHaveBeenCalled()
+          expect(fs.readdirSync(directory)).toEqual([])
+        })
+      })
     })
 
     describe('scripts/protocol/brokerRanges.json', () => {
@@ -548,6 +627,220 @@ describe('E2E tooling', () => {
         expect(versions.filter((version) => /^4\.0\.\d+$/.test(version))).toHaveLength(1)
       })
     })
+
+    describe('finalized features', () => {
+      const supported = [{ name: 'share.version', minVersion: 0, maxVersion: 1 }]
+
+      test.each([
+        ['4.3.1', { 'share.version': 1 }],
+        ['4.1.2', { 'share.version': 0 }],
+      ])(
+        'reads the share.version of a Kafka %s broker off its capture',
+        async (version, expected) => {
+          expect(featuresOf(await decode(Buffer.from(CAPTURES[version])))).toEqual(expected)
+        }
+      )
+
+      test.each([
+        [
+          'the finalized maximum level',
+          {
+            supportedFeatures: supported,
+            finalizedFeatures: [{ name: 'share.version', minVersionLevel: 0, maxVersionLevel: 1 }],
+            finalizedFeaturesEpoch: '45',
+          },
+          { 'share.version': 1 },
+        ],
+        [
+          'the finalized level 2 of a synthetic answer that supports 0 to 2',
+          {
+            supportedFeatures: [{ name: 'share.version', minVersion: 0, maxVersion: 2 }],
+            finalizedFeatures: [{ name: 'share.version', minVersionLevel: 0, maxVersionLevel: 2 }],
+            finalizedFeaturesEpoch: '120',
+          },
+          { 'share.version': 2 },
+        ],
+        [
+          '0 for a feature supported but not finalized',
+          { supportedFeatures: supported, finalizedFeatures: [], finalizedFeaturesEpoch: '359' },
+          { 'share.version': 0 },
+        ],
+        [
+          '0 for a feature supported but not finalized, at epoch 0',
+          { supportedFeatures: supported, finalizedFeatures: [], finalizedFeaturesEpoch: '0' },
+          { 'share.version': 0 },
+        ],
+        [
+          'no key for a broker without the feature',
+          {
+            supportedFeatures: [{ name: 'group.version', minVersion: 0, maxVersion: 1 }],
+            finalizedFeatures: [{ name: 'group.version', minVersionLevel: 1, maxVersionLevel: 1 }],
+            finalizedFeaturesEpoch: '25',
+          },
+          {},
+        ],
+        [
+          'a finalized level even when the broker lists no support for it',
+          {
+            supportedFeatures: [],
+            finalizedFeatures: [{ name: 'share.version', minVersionLevel: 2, maxVersionLevel: 2 }],
+            finalizedFeaturesEpoch: '7',
+          },
+          { 'share.version': 2 },
+        ],
+      ])('records %s', (_what, answer, expected) => {
+        expect(featuresOf(answer)).toEqual(expected)
+      })
+
+      test.each([['-1'], [undefined]])(
+        'refuses an answer whose finalized-features epoch is %p',
+        (finalizedFeaturesEpoch) => {
+          expect(() =>
+            featuresOf({
+              supportedFeatures: supported,
+              finalizedFeatures: [],
+              finalizedFeaturesEpoch,
+            })
+          ).toThrow('The broker sent no finalized features (epoch -1): nothing to record')
+        }
+      )
+    })
+
+    describe('scripts/protocol/brokerFeatures.json', () => {
+      const FEATURES = path.join(__dirname, '..', '..', 'protocol', 'brokerFeatures.json')
+      const features = () => JSON.parse(fs.readFileSync(FEATURES, 'utf8'))
+      const ranges = () => JSON.parse(fs.readFileSync(RANGES, 'utf8'))
+      const SHARE_API_KEYS = [76, 77, 78, 79, 90, 91, 92]
+
+      /**
+       * The `share.version` the capture of each recorded broker line showed: the finalized level,
+       * 0 for a broker that supports the feature without finalizing it, no key for one that does not
+       * support it. Add an entry, from the capture itself, when a line is recorded.
+       * @type {Record<string, { 'share.version'?: number }>}
+       */
+      const captured = {
+        '4.0.2': {},
+        '4.1.2': { 'share.version': 0 },
+        '4.2.2': { 'share.version': 1 },
+        '4.3.1': { 'share.version': 1 },
+      }
+
+      test.each([...new Set([...Object.keys(features()), ...Object.keys(captured)])])(
+        '%s records the share.version its capture showed',
+        (line) => {
+          if (!Object.hasOwn(features(), line)) {
+            throw new Error(
+              `${line} has a captured expectation but brokerFeatures.json no longer records it`
+            )
+          }
+          if (!Object.hasOwn(captured, line)) {
+            throw new Error(
+              `brokerFeatures.json records ${line}, which has no captured expectation: add its share.version to \`captured\` from that capture`
+            )
+          }
+
+          expect(features()[line]).toEqual(captured[line])
+        }
+      )
+
+      test('covers the lines of brokerRanges.json, in the layout the recorder writes', () => {
+        expect(Object.keys(features())).toEqual(Object.keys(ranges()))
+        expect(fs.readFileSync(FEATURES, 'utf8')).toBe(`${JSON.stringify(features(), null, 2)}\n`)
+      })
+
+      test.each(Object.keys(features()))(
+        'the %s line records share.version exactly when it offers the seven share APIs',
+        (line) => {
+          const offered = SHARE_API_KEYS.filter((apiKey) => rangeOf(ranges()[line] ?? {}, apiKey))
+
+          expect([0, SHARE_API_KEYS.length]).toContain(offered.length)
+          expect(SHARE_VERSION in features()[line]).toBe(offered.length === SHARE_API_KEYS.length)
+        }
+      )
+
+      test.each(['4.3.1', '4.1.2'])(
+        'the %s entry is what the probe reads off the capture of that broker',
+        async (version) => {
+          const answer = await decode(Buffer.from(CAPTURES[version]))
+
+          expect(features()[version]).toEqual(featuresOf(answer))
+        }
+      )
+    })
+  })
+
+  describe('share compose variants', () => {
+    const ROOT = path.join(__dirname, '..', '..', '..')
+    const VARIANTS = ['docker-compose.share.yml', 'docker-compose.share-limit.yml']
+    const read = (file) => fs.readFileSync(path.join(ROOT, file), 'utf8')
+    const DEAD_LETTER_QUEUE = /KAFKA_ERRORS_DEADLETTERQUEUE_|errors\.deadletterqueue\./i
+    const ANCHOR = "    KAFKA_CONNECTIONS_MAX_REAUTH_MS: '15000'\n"
+
+    /**
+     * The lines of a compose or property file that set something: every line but a full-line comment.
+     * @param {string} text
+     * @returns {string[]}
+     */
+    const settingsOf = (text) => text.split('\n').filter((line) => /^\s*[^\s#]/.test(line))
+
+    /**
+     * The settings that configure a dead-letter queue, whether written as a broker environment key
+     * (`KAFKA_ERRORS_DEADLETTERQUEUE_*`) or as a property or JVM option (`errors.deadletterqueue.*`).
+     * @param {string} text
+     * @returns {string[]}
+     */
+    const deadLetterSettings = (text) =>
+      settingsOf(text).filter((line) => DEAD_LETTER_QUEUE.test(line))
+
+    /**
+     * Every file a variant takes broker settings from: itself, the base file it extends and the
+     * broker config files it mounts.
+     * @param {string} name the variant
+     * @returns {string[]} repository-relative paths
+     */
+    const sourcesOf = (name) => {
+      const mounted = [...read(name).matchAll(/^\s+- \.\/(testHelpers\/kafka\/[^:\s]+):/gm)]
+      return [name, 'docker-compose.yml', ...mounted.map(([, file]) => file)]
+    }
+
+    test.each(VARIANTS)('%s and the configuration it inherits set no dead-letter queue', (name) => {
+      const sources = sourcesOf(name)
+
+      expect(sources).toEqual([
+        name,
+        'docker-compose.yml',
+        'testHelpers/kafka/dns.security',
+        'testHelpers/kafka/server-jaas.conf',
+      ])
+      expect(
+        sources.flatMap((file) =>
+          deadLetterSettings(read(file)).map((line) => `${file}: ${line.trim()}`)
+        )
+      ).toEqual([])
+    })
+
+    test.each([
+      ['an environment key', "    KAFKA_ERRORS_DEADLETTERQUEUE_TOPIC_NAME: 'dlq'"],
+      ['a property', 'errors.deadletterqueue.topic.name=dlq'],
+      ['a JVM option', "    KAFKA_OPTS: '-Derrors.deadletterqueue.copy.record.enable=true'"],
+    ])('flags %s as a dead-letter-queue setting', (_form, line) => {
+      expect(deadLetterSettings(`services:\n${line}\n`)).toEqual([line])
+    })
+
+    test('does not flag a comment that names a dead-letter-queue setting', () => {
+      expect(deadLetterSettings('# errors.deadletterqueue.topic.name is never set\n')).toEqual([])
+    })
+
+    test.each(VARIANTS)(
+      'flags a dead-letter-queue key added to the environment every broker of %s shares',
+      (name) => {
+        const added = "    KAFKA_ERRORS_DEADLETTERQUEUE_TOPIC_NAME: 'dlq'"
+        const text = read(name)
+
+        expect(text.split(ANCHOR)).toHaveLength(2)
+        expect(deadLetterSettings(text.replace(ANCHOR, `${ANCHOR}${added}\n`))).toEqual([added])
+      }
+    )
   })
 
   describe('the broker version command', () => {
