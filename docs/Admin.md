@@ -3,6 +3,192 @@ id: admin
 title: Admin Client
 ---
 
+## Admin lifecycle
+
+`admin.disconnect({ timeout })` closes by the deadline. `timeout` is an integer from 0 to
+2147483647 milliseconds; zero starts no new wire work. With no timeout, the admin drains
+calls already admitted. An invalid object timeout rejects `KafkaJSInvalidConfigurationError`
+before changing the lifecycle. Legacy non-object signal or callback arguments are ignored.
+Concurrent closes share the first valid call's deadline and one cleanup episode.
+
+Admin operations after disconnect reject without dialing until an explicit connect opens a new lifecycle.
+Call `await admin.connect()` to resume. A connect issued during close joins its cleanup first.
+An old lookup, authentication, encoder, queued write, response or temporary consumer cannot
+send, reconnect or clear the replacement lifecycle. A forced close reports an unknown outcome;
+a mutation already sent may have been applied. Inspect the broker state before repeating it.
+
+## Admin API ledger
+
+The following rows cover the complete public Admin method surface and its direct options.
+Array item fields and positional arguments are described in the method sections. Every wire
+family has four evidence kinds and exactly one live arm in the family table. These references
+are the test contract; acceptance requires the recorded outcomes on the tested artifact.
+`createTopics` returns a boolean, and legacy alterConfigs retains its compatibility contract.
+No file's presence proves a live run passed.
+
+| Public method | Direct options on any overload | Family |
+|---|---|---|
+| `describeProducers` | apiTimeout, brokerId, topicPartitions | transactions |
+| `describeTransactions` | apiTimeout, transactionalIds | transactions |
+| `listTransactions` | apiTimeout, durationFilter, producerIds, states, transactionalIdPattern | transactions |
+| `abortTransaction` | apiTimeout, coordinatorEpoch, partition, producerEpoch, producerId, topic | transactions |
+| `fenceProducers` | apiTimeout, transactionTimeout, transactionalIds | transactions |
+| `connect` | none | lifecycle |
+| `disconnect` | timeout | lifecycle |
+| `listTopics` | apiTimeout | metadata |
+| `createTopics` | apiTimeout, timeout, topics, validateOnly, waitForLeaders | topics |
+| `deleteTopics` | apiTimeout, timeout, topicIds, topics | topics |
+| `createPartitions` | apiTimeout, timeout, topicPartitions, validateOnly | topics |
+| `fetchTopicMetadata` | apiTimeout, includeTopicAuthorizedOperations, topics, useDescribeTopicPartitions | metadata |
+| `deleteOffsets` | apiTimeout, groupId, topics | offsets |
+| `fetchOffsetsForGroups` | apiTimeout, groups, requireStable | offsets |
+| `fetchOffsets` | apiTimeout, groupId, requireStable, resolveOffsets, topics | offsets |
+| `describeLogDirs` | apiTimeout, brokers, topicPartitions | log directories |
+| `alterReplicaLogDirs` | apiTimeout, replicas | log directories |
+| `describeReplicaLogDirs` | apiTimeout, replicas | log directories |
+| `fetchTopicOffsets` | apiTimeout, isolationLevel | offsets |
+| `fetchTopicOffsetsByTimestamp` | apiTimeout, isolationLevel | offset specifications |
+| `electLeaders` | apiTimeout, electionType, topicPartitions | cluster and features |
+| `describeFeatures` | apiTimeout, brokerId | cluster and features |
+| `updateFeatures` | apiTimeout, features, validateOnly | cluster and features |
+| `listConfigResources` | apiTimeout, resourceTypes | cluster and features |
+| `describeCluster` | apiTimeout, includeAuthorizedOperations, includeFencedBrokers | cluster and features |
+| `setOffsets` | apiTimeout, groupId, partitions, topic | offsets |
+| `resetOffsets` | apiTimeout, earliest, groupId, topic | offsets |
+| `describeConfigs` | apiTimeout, includeDocumentation, includeSynonyms, resources | configuration |
+| `alterConfigs` | apiTimeout, resources, validateOnly | configuration |
+| `incrementalAlterConfigs` | apiTimeout, resources, validateOnly | configuration |
+| `listGroups` | apiTimeout, states, types | groups |
+| `deleteGroups` | apiTimeout | groups |
+| `removeMembersFromConsumerGroup` | apiTimeout, groupId, members, reason | groups |
+| `describeGroups` | apiTimeout, includeAuthorizedOperations | groups |
+| `describeAcls` | apiTimeout, host, operation, permissionType, principal, resourceName, resourcePatternType, resourceType | ACLs |
+| `deleteAcls` | apiTimeout, filters | ACLs |
+| `createAcls` | acl, apiTimeout | ACLs |
+| `deleteTopicRecords` | apiTimeout, partitions, topic | offsets |
+| `alterPartitionReassignments` | allowReplicationFactorChange, apiTimeout, timeout, topics | reassignment |
+| `listPartitionReassignments` | apiTimeout, timeout, topics | reassignment |
+| `describeClientQuotas` | apiTimeout, components, strict | client quotas |
+| `alterClientQuotas` | apiTimeout, entries, validateOnly | client quotas |
+| `describeUserScramCredentials` | apiTimeout, users | SCRAM credentials |
+| `alterUserScramCredentials` | apiTimeout, deletions, upsertions | SCRAM credentials |
+| `createDelegationToken` | apiTimeout, maxLifetimeMs, owner, renewers | delegation tokens |
+| `renewDelegationToken` | apiTimeout, hmac, renewPeriodMs | delegation tokens |
+| `expireDelegationToken` | apiTimeout, expiryTimePeriodMs, hmac | delegation tokens |
+| `describeDelegationToken` | apiTimeout, owners | delegation tokens |
+| `logger` | none | instrumentation |
+| `on` | none | instrumentation |
+
+## Admin evidence by family
+
+Goldens include every negotiated version's independent request and response body fixtures,
+registered provenance and the protocol inventory check. The capability and partial-result
+columns name seam witnesses; inherited contracts also run in the cold admin group. Each
+live script below is a single owner even when it contains several cases or fixture controls.
+
+| Family | Goldens | Capability and downgrade | Partial result and error | Live arm |
+|---|---|---|---|---|
+| topics | src/protocol/requests/createTopics/; src/protocol/requests/deleteTopics/; src/protocol/requests/createPartitions/ | src/admin/__tests__/createTopicsWait.spec.js | src/admin/__tests__/aggregateOutcome.spec.js | test:e2e:admin-ledger |
+| metadata | src/protocol/requests/metadata/; src/protocol/requests/describeTopicPartitions/ | src/admin/__tests__/authorizedOperations.spec.js | src/admin/__tests__/describeTopicPartitionsAdmin.spec.js | test:e2e:admin-ledger |
+| ACLs | src/protocol/requests/describeAcls/; src/protocol/requests/createAcls/; src/protocol/requests/deleteAcls/ | src/admin/__tests__/aclResourceUser.spec.js | src/admin/__tests__/errorMessage.spec.js | test:e2e:admin-ledger |
+| configuration | src/protocol/requests/describeConfigs/; src/protocol/requests/alterConfigs/; src/protocol/requests/incrementalAlterConfigs/ | src/admin/__tests__/configRouting.spec.js | src/admin/__tests__/validateOnly.spec.js | test:e2e:admin-ledger |
+| groups | src/protocol/requests/describeGroups/; src/protocol/requests/listGroups/; src/protocol/requests/deleteGroups/; src/protocol/requests/leaveGroup/ | src/admin/__tests__/describeGroupsRouting.spec.js | src/admin/__tests__/adminGroupApis.spec.js | test:e2e:admin-ledger |
+| offsets | src/protocol/requests/offsetFetch/; src/protocol/requests/offsetCommit/; src/protocol/requests/offsetDelete/; src/protocol/requests/listOffsets/; src/protocol/requests/deleteRecords/ | src/admin/__tests__/fetchOffsetsIsolation.spec.js | src/admin/__tests__/fetchOffsetsForGroups.spec.js | test:e2e:admin-ledger |
+| offset specifications | src/protocol/requests/listOffsets/ | src/admin/__tests__/listOffsetsSpecs.spec.js | src/admin/__tests__/listOffsetsSpecs.spec.js | test:e2e:admin-tiered |
+| reassignment | src/protocol/requests/alterPartitionReassignments/; src/protocol/requests/listPartitionReassignments/ | src/admin/__tests__/alterPartitionReassignmentsV1.spec.js | src/admin/__tests__/alterPartitionReassignmentsV1.spec.js | test:e2e:admin-ledger |
+| transactions | src/protocol/requests/describeProducers/; src/protocol/requests/describeTransactions/; src/protocol/requests/listTransactions/; src/protocol/requests/writeTxnMarkers/; src/protocol/requests/initProducerId/ | src/admin/__tests__/transactionDiagnostics.spec.js | src/admin/__tests__/abortFence.spec.js | test:e2e:admin-ledger |
+| cluster and features | src/protocol/requests/describeCluster/; src/protocol/requests/electLeaders/; src/protocol/requests/apiVersions/; src/protocol/requests/updateFeatures/; src/protocol/requests/listConfigResources/ | src/admin/__tests__/features.spec.js | src/admin/__tests__/configResources.spec.js | test:e2e:admin-ledger |
+| log directories | src/protocol/requests/describeLogDirs/; src/protocol/requests/alterReplicaLogDirs/ | src/admin/__tests__/logDirs.spec.js | src/admin/__tests__/logDirs.spec.js | test:e2e:admin-logdirs |
+| client quotas | src/protocol/requests/describeClientQuotas/; src/protocol/requests/alterClientQuotas/ | src/admin/__tests__/clientQuotas.spec.js | src/admin/__tests__/securityAdminFailures.spec.js | test:e2e:admin-quota |
+| SCRAM credentials | src/protocol/requests/describeUserScramCredentials/; src/protocol/requests/alterUserScramCredentials/ | src/admin/__tests__/scramCredentials.spec.js | src/admin/__tests__/securityAdminFailures.spec.js | test:e2e:admin-ledger |
+| delegation tokens | src/protocol/requests/createDelegationToken/; src/protocol/requests/renewDelegationToken/; src/protocol/requests/expireDelegationToken/; src/protocol/requests/describeDelegationToken/ | src/admin/__tests__/delegationTokens.spec.js | src/admin/__tests__/delegationTokens.spec.js | test:e2e:admin-tokens |
+| lifecycle | not applicable: no wire codec | src/admin/__tests__/lifecycle.spec.js | src/admin/__tests__/lifecycle.spec.js | test:e2e:admin-lifecycle |
+| instrumentation | not applicable: no wire codec | src/admin/__tests__/lifecycle.spec.js | src/admin/__tests__/lifecycle.spec.js | test:e2e:admin-lifecycle |
+
+## Java administration dispositions
+
+This inventory follows Apache Kafka 4.3.1 Admin, including deprecated aliases. Every method
+also has the inherited AbstractOptions timeout unless the row states an excluded or deferred
+surface. Share administration belongs to the consumer-group extension; Streams administration
+and quorum/voter administration are excluded from this package. Client telemetry belongs to
+the telemetry extension; JVM metric registration has no JavaScript equivalent.
+
+| Java method or configuration | Disposition | JavaScript equivalent or reason | Java options and differences |
+|---|---|---|---|
+| abortTransaction | implemented | abortTransaction | AbortTransactionSpec producer identity; partition; coordinator epoch |
+| addRaftVoter | excluded | quorum and voter administration excluded | not implemented |
+| alterClientQuotas | implemented | alterClientQuotas | validateOnly; exact/default/any entity matching |
+| alterConsumerGroupOffsets | equivalent | setOffsets / resetOffsets | ordinary method fields and apiTimeout; no semantic option is silently dropped |
+| alterPartitionReassignments | implemented | alterPartitionReassignments | allowReplicationFactorChange; timeout |
+| alterReplicaLogDirs | implemented | alterReplicaLogDirs | replicas |
+| alterShareGroupOffsets | consumer groups | share-group administration belongs to its own extension | all options deferred with that surface |
+| alterStreamsGroupOffsets | excluded | Streams-group administration excluded | not implemented |
+| alterUserScramCredentials | implemented | alterUserScramCredentials | upsertions; deletions; salt; iterations; mechanism |
+| clientInstanceId | telemetry | client telemetry or JVM-only metrics | not part of admin RPC parity |
+| close | equivalent | disconnect({ timeout }) | natural drain or integer timeout; final no-argument overload |
+| createAcls | implemented | createAcls | ordinary method fields and apiTimeout; no semantic option is silently dropped |
+| createDelegationToken | implemented | createDelegationToken | owner; renewers; maxLifetimeMs |
+| createPartitions | implemented | createPartitions | validateOnly; existing quota retry |
+| createTopics | implemented | createTopics | validateOnly; retryOnQuotaViolation uses existing quota retry; timeoutMs maps to apiTimeout; broker timeout stays timeout |
+| deleteAcls | implemented | deleteAcls | ordinary method fields and apiTimeout; no semantic option is silently dropped |
+| deleteConsumerGroupOffsets | equivalent | deleteOffsets | ordinary method fields and apiTimeout; no semantic option is silently dropped |
+| deleteConsumerGroups | equivalent | deleteGroups | ordinary method fields and apiTimeout; no semantic option is silently dropped |
+| deleteRecords | equivalent | deleteTopicRecords | ordinary method fields and apiTimeout; no semantic option is silently dropped |
+| deleteShareGroupOffsets | consumer groups | share-group administration belongs to its own extension | all options deferred with that surface |
+| deleteShareGroups | consumer groups | share-group administration belongs to its own extension | all options deferred with that surface |
+| deleteStreamsGroupOffsets | excluded | Streams-group administration excluded | not implemented |
+| deleteStreamsGroups | excluded | Streams-group administration excluded | not implemented |
+| deleteTopics | implemented | deleteTopics | name or topic ID; retryOnQuotaViolation uses existing quota retry; timeoutMs maps to apiTimeout |
+| describeAcls | implemented | describeAcls | ordinary method fields and apiTimeout; no semantic option is silently dropped |
+| describeClassicGroups | equivalent | describeGroups | includeAuthorizedOperations; same classic group description facade |
+| describeClientQuotas | implemented | describeClientQuotas | components; strict |
+| describeCluster | implemented | describeCluster | includeAuthorizedOperations; includeFencedBrokers |
+| describeConfigs | implemented | describeConfigs | includeSynonyms; includeDocumentation; resource type routing |
+| describeConsumerGroups | equivalent | describeGroups | includeAuthorizedOperations |
+| describeDelegationToken | implemented | describeDelegationToken | owners |
+| describeFeatures | implemented | describeFeatures | nodeId maps to brokerId |
+| describeLogDirs | implemented | describeLogDirs | brokers; topicPartitions |
+| describeMetadataQuorum | excluded | quorum and voter administration excluded | not implemented |
+| describeProducers | implemented | describeProducers | brokerId; partitions |
+| describeReplicaLogDirs | implemented | describeReplicaLogDirs | replicas |
+| describeShareGroups | consumer groups | share-group administration belongs to its own extension | all options deferred with that surface |
+| describeStreamsGroups | excluded | Streams-group administration excluded | not implemented |
+| describeTopics | equivalent | fetchTopicMetadata | includeAuthorizedOperations maps to includeTopicAuthorizedOperations; partitionSizeLimitPerResponse uses the internal responsePartitionLimit |
+| describeTransactions | implemented | describeTransactions | transactionalIds |
+| describeUserScramCredentials | implemented | describeUserScramCredentials | users optional |
+| electLeaders | implemented | electLeaders | ElectionType; partitions |
+| expireDelegationToken | implemented | expireDelegationToken | hmac; expiryTimePeriodMs |
+| fenceProducers | implemented | fenceProducers | transactionTimeout; timeoutMs maps to apiTimeout |
+| forceTerminateTransaction | equivalent | fenceProducers({ transactionalIds: [id] }) | ordinary method fields and apiTimeout; no semantic option is silently dropped |
+| incrementalAlterConfigs | implemented | incrementalAlterConfigs | validateOnly |
+| listClientMetricsResources | equivalent | listConfigResources({ resourceTypes: [CLIENT_METRICS] }) | ordinary method fields and apiTimeout; no semantic option is silently dropped |
+| listConfigResources | implemented | listConfigResources | resourceTypes; CLIENT_METRICS-only downgrade |
+| listConsumerGroupOffsets | equivalent | fetchOffsets / fetchOffsetsForGroups | requireStable; partitions; multi-group batching by coordinator |
+| listConsumerGroups | equivalent | listGroups | inStates maps to states; withTypes maps to types |
+| listGroups | implemented | listGroups | states; types |
+| listOffsets | equivalent | fetchTopicOffsets / fetchTopicOffsetsByTimestamp | earliest; latest; timestamp; maxTimestamp; earliestLocal; latestTiered; earliestPendingUpload; isolationLevel |
+| listPartitionReassignments | implemented | listPartitionReassignments | ordinary method fields and apiTimeout; no semantic option is silently dropped |
+| listShareGroupOffsets | consumer groups | share-group administration belongs to its own extension | all options deferred with that surface |
+| listStreamsGroupOffsets | excluded | Streams-group administration excluded | not implemented |
+| listTopics | implemented | listTopics | listInternal: fetchTopicMetadata returns isInternal for caller filtering |
+| listTransactions | implemented | listTransactions | filterStates maps to states; filterProducerIds maps to producerIds; filterOnDuration maps to durationFilter; filterOnTransactionalIdPattern maps to transactionalIdPattern |
+| metrics | telemetry | client telemetry or JVM-only metrics | not part of admin RPC parity |
+| registerMetricForSubscription | telemetry | client telemetry or JVM-only metrics | not part of admin RPC parity |
+| removeMembersFromConsumerGroup | implemented | removeMembersFromConsumerGroup | ordinary method fields and apiTimeout; no semantic option is silently dropped |
+| removeRaftVoter | excluded | quorum and voter administration excluded | not implemented |
+| renewDelegationToken | implemented | renewDelegationToken | hmac; renewPeriodMs |
+| unregisterBroker | excluded | quorum and voter administration excluded | not implemented |
+| unregisterMetricFromSubscription | telemetry | client telemetry or JVM-only metrics | not part of admin RPC parity |
+| updateFeatures | implemented | updateFeatures | validateOnly; upgradeType; features |
+| alterConfigs | retained compatibility | legacy alterConfigs | retained although removed from Java Admin; validateOnly and separate errorMessage |
+| AbstractOptions.timeoutMs | implemented | apiTimeout on each operation | preserves broker timeout as a distinct option |
+| default.api.timeout.ms | implemented | AdminConfig.apiTimeout | 60000 ms; integer 1 through 2147483647 |
+| retries | retained compatibility | retry | counted retry limits differ from Java INT_MAX; the API deadline still bounds the call |
+
+UnregisterController is a protocol inventory exclusion, not a member of the Java 4.3.1 Admin
+interface. No Java method is invented for it. Deprecated listConsumerGroups/listClientMetricsResources
+and describeClassicGroups/listGroups keep explicit equivalent rows above.
+
 The admin client hosts all the cluster operations, such as: `createTopics`, `createPartitions`, etc.
 
 ## Call deadlines

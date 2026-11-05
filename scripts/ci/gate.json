@@ -16303,7 +16303,13 @@
         "src/admin/__tests__/removeMembersLive.spec.js \u203a Admin > removeMembersFromConsumerGroup (live, consumer) removes a static member that stopped without leaving, and the survivor takes its partitions well before the session timeout",
         "src/admin/__tests__/removeMembersLive.spec.js \u203a Admin > removeMembersFromConsumerGroup (live, consumer) on a group with a dynamic and a static member removing every member answers one removal for each",
         "src/admin/__tests__/removeMembersLive.spec.js \u203a Admin > removeMembersFromConsumerGroup (live, consumer) on a group with a dynamic and a static member an instance id the group does not know is UNKNOWN_MEMBER_ID in the results, not a rejection",
-        "src/admin/__tests__/removeMembersLive.spec.js \u203a Admin > removeMembersFromConsumerGroup (live, consumer) a group that does not exist answers every member UNKNOWN_MEMBER_ID, without a rejection"
+        "src/admin/__tests__/removeMembersLive.spec.js \u203a Admin > removeMembersFromConsumerGroup (live, consumer) a group that does not exist answers every member UNKNOWN_MEMBER_ID, without a rejection",
+        "src/admin/__tests__/adminLedgerLive.spec.js \u203a admin ledger completes the admin ledger against broker state",
+        "src/admin/__tests__/adminLifecycleLive.spec.js \u203a admin lifecycle on real sockets closes within its deadline and reconnects only explicitly",
+        "src/admin/__tests__/quotaThrottleLive.spec.js \u203a admin producer quotas applies a produce quota and recovers after removal",
+        "src/admin/__tests__/adminTokensLive.spec.js \u203a admin delegation tokens creates renews and expires delegation tokens without diagnostic secrets",
+        "src/admin/__tests__/adminLogDirsLive.spec.js \u203a admin replica directories moves a replica between configured directories without changing its log",
+        "src/admin/__tests__/adminTieredLive.spec.js \u203a admin configured remote storage reads retained records after remote upload and local eviction"
       ]
     },
     {
@@ -18465,6 +18471,266 @@
         "src/producer/__tests__/transactionRestartLive.spec.js \u203a Producer > transaction recovery (live) forced close preserves an unknown commit without local publication"
       ],
       "capMinutes": 60
+    },
+    {
+      "id": "e2e-gssapi",
+      "kind": "cluster",
+      "compose": "docker-compose.kerberos.yml",
+      "env": {
+        "GSSAPI_E2E": "1"
+      },
+      "jest": [
+        "--forceExit",
+        "--testPathPatterns",
+        "src/broker/__tests__/gssapiLive\\.spec\\.js"
+      ],
+      "jestScript": null,
+      "nodeTest": null,
+      "command": null,
+      "needs": {
+        "kerberos": true
+      },
+      "evidence": [
+        "gssapi"
+      ],
+      "titles": [
+        "src/broker/__tests__/gssapiLive.spec.js \u203a GSSAPI with a ticket-granting service authenticates, negotiates no layer and rejects an observed expired cache"
+      ],
+      "capMinutes": 30
+    },
+    {
+      "id": "e2e-tls-negative",
+      "kind": "cluster",
+      "compose": "docker-compose.tls-required.yml",
+      "env": {
+        "TLS_NEGATIVE_E2E": "1"
+      },
+      "jest": [
+        "--forceExit",
+        "--testPathPatterns",
+        "src/network/__tests__/tlsNegativeLive\\.spec\\.js"
+      ],
+      "jestScript": null,
+      "nodeTest": null,
+      "command": null,
+      "needs": {
+        "tls-required": true
+      },
+      "evidence": [
+        "tls-negative"
+      ],
+      "titles": [
+        "src/network/__tests__/tlsNegativeLive.spec.js \u203a TLS negatives against real SSL listeners (live) a client certificate completes a Kafka request on the listener that requires one",
+        "src/network/__tests__/tlsNegativeLive.spec.js \u203a TLS negatives against real SSL listeners (live) the one-way listener refuses a CA the client does not trust, typed",
+        "src/network/__tests__/tlsNegativeLive.spec.js \u203a TLS negatives against real SSL listeners (live) the one-way listener refuses a server name the certificate does not carry, typed",
+        "src/network/__tests__/tlsNegativeLive.spec.js \u203a TLS negatives against real SSL listeners (live) the listener that requires a client certificate refuses a client without one, typed",
+        "src/network/__tests__/tlsNegativeLive.spec.js \u203a TLS negatives against real SSL listeners (live) a plaintext client on SSL listener 9093 is refused by the frame cap before allocation",
+        "src/network/__tests__/tlsNegativeLive.spec.js \u203a TLS negatives against real SSL listeners (live) a plaintext client on SSL listener 9193 is refused by the frame cap before allocation",
+        "src/network/__tests__/tlsNegativeLive.spec.js \u203a TLS negatives against real SSL listeners (live) a TLS client on the plaintext listener keeps its connection error and warns once",
+        "src/network/__tests__/tlsNegativeLive.spec.js \u203a TLS negatives against real SSL listeners (live) records every case of this run within the scenario budget"
+      ],
+      "capMinutes": 30
+    },
+    {
+      "id": "e2e-oauth-helpers",
+      "kind": "cluster",
+      "compose": "docker-compose.oauthbearer.yml",
+      "env": {
+        "OAUTHBEARER_ENABLED": "1",
+        "OAUTH_HELPERS_E2E": "1"
+      },
+      "jest": [
+        "--forceExit",
+        "--testPathPatterns",
+        "src/oauth/__tests__/oauthHelpersLive\\.spec\\.js"
+      ],
+      "jestScript": null,
+      "nodeTest": null,
+      "command": null,
+      "needs": {},
+      "evidence": [
+        "oauth-helpers"
+      ],
+      "titles": [
+        "src/oauth/__tests__/oauthHelpersLive.spec.js \u203a OAuth helpers against a live OAUTHBEARER broker producer and admin authenticate with every helper form, refresh in the window and read the log",
+        "src/oauth/__tests__/oauthHelpersLive.spec.js \u203a OAuth helpers against a live OAUTHBEARER broker closed providers reject later calls and the issuer keeps no sockets"
+      ],
+      "capMinutes": 30
+    },
+    {
+      "id": "e2e-idle-reap",
+      "kind": "cluster",
+      "compose": "docker-compose.yml",
+      "env": {
+        "IDLE_REAP_E2E": "1"
+      },
+      "jest": [
+        "--forceExit",
+        "--testPathPatterns",
+        "src/network/__tests__/idleReapingLive\\.spec\\.js"
+      ],
+      "jestScript": null,
+      "nodeTest": null,
+      "command": null,
+      "needs": {},
+      "evidence": [
+        "idle-reap"
+      ],
+      "titles": [
+        "src/network/__tests__/idleReapingLive.spec.js \u203a Idle reaping live idle producer reconnects and all three replay sets remain exact",
+        "src/network/__tests__/idleReapingLive.spec.js \u203a Idle reaping live a live long poll is not reaped while its request is pending"
+      ],
+      "capMinutes": 30
+    },
+    {
+      "id": "e2e-admin-ledger",
+      "kind": "cluster",
+      "compose": "docker-compose.yml",
+      "env": {
+        "ADMIN_LEDGER_E2E": "1"
+      },
+      "jest": [
+        "--forceExit",
+        "--testPathPatterns",
+        "src/admin/__tests__/adminLedgerLive\\.spec\\.js"
+      ],
+      "jestScript": null,
+      "nodeTest": null,
+      "command": null,
+      "needs": {},
+      "evidence": [
+        "admin-ledger"
+      ],
+      "titles": [
+        "src/admin/__tests__/adminLedgerLive.spec.js \u203a admin ledger completes the admin ledger against broker state"
+      ],
+      "capMinutes": 45
+    },
+    {
+      "id": "e2e-admin-lifecycle",
+      "kind": "cluster",
+      "compose": "docker-compose.yml",
+      "env": {
+        "ADMIN_LIFECYCLE_E2E": "1"
+      },
+      "jest": [
+        "--forceExit",
+        "--testPathPatterns",
+        "src/admin/__tests__/adminLifecycleLive\\.spec\\.js"
+      ],
+      "jestScript": null,
+      "nodeTest": null,
+      "command": null,
+      "needs": {},
+      "evidence": [
+        "admin-lifecycle"
+      ],
+      "titles": [
+        "src/admin/__tests__/adminLifecycleLive.spec.js \u203a admin lifecycle on real sockets closes within its deadline and reconnects only explicitly"
+      ],
+      "capMinutes": 20
+    },
+    {
+      "id": "e2e-admin-quota",
+      "kind": "cluster",
+      "compose": "docker-compose.yml",
+      "env": {
+        "ADMIN_QUOTA_E2E": "1"
+      },
+      "jest": [
+        "--forceExit",
+        "--testPathPatterns",
+        "src/admin/__tests__/quotaThrottleLive\\.spec\\.js"
+      ],
+      "jestScript": null,
+      "nodeTest": null,
+      "command": null,
+      "needs": {},
+      "evidence": [
+        "quota-throttle"
+      ],
+      "titles": [
+        "src/admin/__tests__/quotaThrottleLive.spec.js \u203a admin producer quotas applies a produce quota and recovers after removal"
+      ],
+      "capMinutes": 30
+    },
+    {
+      "id": "e2e-admin-tokens",
+      "kind": "cluster",
+      "compose": "docker-compose.tokens.yml",
+      "env": {
+        "ADMIN_TOKENS_E2E": "1"
+      },
+      "jest": [
+        "--forceExit",
+        "--testPathPatterns",
+        "src/admin/__tests__/adminTokensLive\\.spec\\.js"
+      ],
+      "jestScript": null,
+      "nodeTest": null,
+      "command": null,
+      "needs": {
+        "tokens": true
+      },
+      "evidence": [
+        "admin-tokens"
+      ],
+      "titles": [
+        "src/admin/__tests__/adminTokensLive.spec.js \u203a admin delegation tokens creates renews and expires delegation tokens without diagnostic secrets"
+      ],
+      "capMinutes": 20
+    },
+    {
+      "id": "e2e-admin-logdirs",
+      "kind": "cluster",
+      "compose": "docker-compose.logdirs.yml",
+      "env": {
+        "ADMIN_LOGDIRS_E2E": "1"
+      },
+      "jest": [
+        "--forceExit",
+        "--testPathPatterns",
+        "src/admin/__tests__/adminLogDirsLive\\.spec\\.js"
+      ],
+      "jestScript": null,
+      "nodeTest": null,
+      "command": null,
+      "needs": {
+        "logdirs": true
+      },
+      "evidence": [
+        "admin-logdirs"
+      ],
+      "titles": [
+        "src/admin/__tests__/adminLogDirsLive.spec.js \u203a admin replica directories moves a replica between configured directories without changing its log"
+      ],
+      "capMinutes": 30
+    },
+    {
+      "id": "e2e-admin-tiered",
+      "kind": "cluster",
+      "compose": "docker-compose.tiered.yml",
+      "env": {
+        "ADMIN_TIERED_E2E": "1"
+      },
+      "jest": [
+        "--forceExit",
+        "--testPathPatterns",
+        "src/admin/__tests__/adminTieredLive\\.spec\\.js"
+      ],
+      "jestScript": null,
+      "nodeTest": null,
+      "command": null,
+      "needs": {
+        "tiered": true
+      },
+      "evidence": [
+        "tiered-offsets"
+      ],
+      "titles": [
+        "src/admin/__tests__/adminTieredLive.spec.js \u203a admin configured remote storage reads retained records after remote upload and local eviction"
+      ],
+      "capMinutes": 45
     },
     {
       "id": "rs-l14",

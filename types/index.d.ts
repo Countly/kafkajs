@@ -1024,6 +1024,16 @@ export type Admin = {
   fenceProducers(options: { transactionalIds: string[]; transactionTimeout?: number } & ApiTimeoutOption): Promise<Array<{ transactionalId: string; producerId: string | null; producerEpoch: number | null } & AdminItemResult>>
 
   connect(): Promise<void>
+  /**
+   * Drains admitted calls naturally, or forces their captured lifecycle closed at the deadline.
+   * Concurrent calls share the first valid deadline and cleanup. Invalid object timeouts reject
+   * before mutation; legacy non-object callback arguments are ignored at runtime.
+   * @param options timeout in milliseconds, an integer from 0 through 2147483647
+   * @returns shared cleanup; call connect() explicitly to resume operations afterwards
+   * @throws KafkaJSInvalidConfigurationError for an invalid object timeout
+   * @throws Error when natural transport cleanup fails
+   */
+  disconnect(options?: { timeout?: number }): Promise<void>
   disconnect(): Promise<void>
   listTopics(options?: ApiTimeoutOption): Promise<string[]>
 listTopics(): Promise<string[]>

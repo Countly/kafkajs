@@ -995,6 +995,8 @@ retry.maxTotalTime adds a public-entry deadline only to consumer commitOffsets, 
 
 ### Admin
 
+- **Admin lifecycle.** Admin operations after disconnect reject without dialing until an explicit connect opens a new lifecycle. Call `await admin.connect()` to resume; legacy implicit reconnection after close is no longer supported. Concurrent closes share cleanup and cannot affect the replacement lifecycle. `disconnect({ timeout })` accepts an integer from 0 through 2147483647 milliseconds; omitted timeout drains naturally, zero forces close immediately, and invalid object options reject before mutation. Non-object signal-handler arguments remain ignored. A forced close cannot undo a mutation already transmitted; inspect broker state before repeating it.
+
 - **Token-admin diagnostics.** Token-admin response data and failure payloads are filtered before logging, including when buffer diagnostics are enabled. Use the stable error class, type/code and broker fields for diagnosis. The authorized caller still receives the token HMAC as a Buffer; do not depend on raw diagnostic payloads.
 
 deleteOffsets returns partition errorCode/error results; group-level refusals reject. fetchOffsetsForGroups returns each group's own result and batches by coordinator, falling back to single-group requests below OffsetFetch v8. requireStable defaults to false; an explicit stable read requires v7 or later. A call deadline does not recall a deletion already transmitted.

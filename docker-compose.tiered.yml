@@ -1,0 +1,99 @@
+# Tiered-storage arm: the three-node cluster of docker-compose.yml with KIP-405 remote storage on. The
+# RemoteStorageManager is upstream LocalTieredStorage from the pinned cached Kafka 4.3.1 test jar.
+# A directory shared by the three brokers stands in for the remote tier, and the
+# remote log metadata is the default topic-based manager over the INTERNAL listener. Retention checks and
+# the remote copy task run every 5 s so a test sees an upload and a local eviction within a minute.
+# Select it with COMPOSE_FILE=docker-compose.tiered.yml.
+x-kafka-common: &kafka-common
+  image: apache/kafka:${KAFKA_VERSION:-4.3.1}
+  environment: &kafka-env
+    KAFKA_PROCESS_ROLES: 'broker,controller'
+    KAFKA_CONTROLLER_QUORUM_VOTERS: '1@kafka1:19093,2@kafka2:19093,3@kafka3:19093'
+    KAFKA_CONTROLLER_LISTENER_NAMES: 'CONTROLLER'
+    KAFKA_INTER_BROKER_LISTENER_NAME: 'INTERNAL'
+    KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: 'CONTROLLER:PLAINTEXT,INTERNAL:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT,SSL_HOST:SSL,SASL_SSL_HOST:SASL_SSL'
+    CLUSTER_ID: '9JrAXWqaTk-meTZW2p46oA'
+    KAFKA_LOG_DIRS: '/tmp/kraft-combined-logs'
+    KAFKA_AUTO_CREATE_TOPICS_ENABLE: 'true'
+    KAFKA_DEFAULT_REPLICATION_FACTOR: '2'
+    KAFKA_NUM_PARTITIONS: '2'
+    KAFKA_DELETE_TOPIC_ENABLE: 'true'
+    KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: '0'
+    KAFKA_GROUP_CONSUMER_HEARTBEAT_INTERVAL_MS: '500'
+    KAFKA_GROUP_CONSUMER_MIN_HEARTBEAT_INTERVAL_MS: '500'
+    KAFKA_GROUP_CONSUMER_SESSION_TIMEOUT_MS: '6000'
+    KAFKA_GROUP_CONSUMER_MIN_SESSION_TIMEOUT_MS: '6000'
+    KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: '2'
+    KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: '2'
+    KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: '1'
+    KAFKA_SHARE_COORDINATOR_STATE_TOPIC_REPLICATION_FACTOR: '2'
+    KAFKA_SHARE_COORDINATOR_STATE_TOPIC_MIN_ISR: '1'
+    KAFKA_CONNECTIONS_MAX_REAUTH_MS: '15000'
+    KAFKA_AUTHORIZER_CLASS_NAME: 'org.apache.kafka.metadata.authorizer.StandardAuthorizer'
+    KAFKA_ALLOW_EVERYONE_IF_NO_ACL_FOUND: 'true'
+    KAFKA_SUPER_USERS: 'User:ANONYMOUS'
+    KAFKA_SSL_KEYSTORE_LOCATION: '/etc/kafka/secrets/kafka.server.keystore.jks'
+    KAFKA_SSL_KEYSTORE_PASSWORD: 'testtest'
+    KAFKA_SSL_KEY_PASSWORD: 'testtest'
+    KAFKA_SSL_TRUSTSTORE_LOCATION: '/etc/kafka/secrets/kafka.server.truststore.jks'
+    KAFKA_SSL_TRUSTSTORE_PASSWORD: 'testtest'
+    KAFKA_SASL_ENABLED_MECHANISMS: 'PLAIN,SCRAM-SHA-256,SCRAM-SHA-512'
+    KAFKA_OPTS: '-Djava.security.auth.login.config=/etc/kafka/secrets/server-jaas.conf'
+    KAFKA_REMOTE_LOG_STORAGE_SYSTEM_ENABLE: 'true'
+    KAFKA_REMOTE_LOG_STORAGE_MANAGER_CLASS_NAME: 'org.apache.kafka.server.log.remote.storage.LocalTieredStorage'
+    KAFKA_REMOTE_LOG_STORAGE_MANAGER_CLASS_PATH: '/opt/kafka/plugins/kafka-storage-4.3.1-test.jar'
+    KAFKA_REMOTE_LOG_STORAGE_MANAGER_IMPL_PREFIX: 'rsm.config.'
+    KAFKA_RSM_CONFIG_DIR: '/var/lib/kafka/data/remote'
+    KAFKA_REMOTE_LOG_METADATA_MANAGER_LISTENER_NAME: 'INTERNAL'
+    KAFKA_REMOTE_LOG_METADATA_MANAGER_IMPL_PREFIX: 'rlmm.config.'
+    KAFKA_RLMM_CONFIG_REMOTE_LOG_METADATA_TOPIC_REPLICATION_FACTOR: '2'
+    KAFKA_RLMM_CONFIG_REMOTE_LOG_METADATA_TOPIC_MIN_ISR: '1'
+    KAFKA_RLMM_CONFIG_REMOTE_LOG_METADATA_TOPIC_NUM_PARTITIONS: '5'
+    KAFKA_REMOTE_LOG_MANAGER_TASK_INTERVAL_MS: '5000'
+    KAFKA_LOG_SEGMENT_BYTES: '1048576'
+    KAFKA_LOG_LOCAL_RETENTION_BYTES: '1048576'
+    KAFKA_LOG_RETENTION_CHECK_INTERVAL_MS: '5000'
+  volumes:
+    - ./testHelpers/certs/kafka.server.keystore.jks:/etc/kafka/secrets/kafka.server.keystore.jks:ro,z
+    - ./testHelpers/certs/kafka.server.truststore.jks:/etc/kafka/secrets/kafka.server.truststore.jks:ro,z
+    - ./testHelpers/kafka/server-jaas.conf:/etc/kafka/secrets/server-jaas.conf:ro,z
+    - ./testHelpers/kafka/plugins/kafka-storage-4.3.1-test.jar:/opt/kafka/plugins/kafka-storage-4.3.1-test.jar:ro,z
+    - ${TIERED_REMOTE_DIR:?set the directory the brokers share as the remote tier}:/var/lib/kafka/data
+
+services:
+  kafka1:
+    <<: *kafka-common
+    container_name: kafka1
+    hostname: kafka1
+    ports: ["9092:9092", "9093:9093", "9094:9094"]
+    labels: ['custom.project=kafkajs', 'custom.service=kafka1']
+    environment:
+      <<: *kafka-env
+      KAFKA_NODE_ID: '1'
+      KAFKA_LISTENERS: 'PLAINTEXT_HOST://0.0.0.0:9092,SSL_HOST://0.0.0.0:9093,SASL_SSL_HOST://0.0.0.0:9094,INTERNAL://0.0.0.0:29092,CONTROLLER://0.0.0.0:19093'
+      KAFKA_ADVERTISED_LISTENERS: 'PLAINTEXT_HOST://localhost:9092,SSL_HOST://localhost:9093,SASL_SSL_HOST://localhost:9094,INTERNAL://kafka1:29092'
+
+  kafka2:
+    <<: *kafka-common
+    container_name: kafka2
+    hostname: kafka2
+    ports: ["9095:9095", "9096:9096", "9097:9097"]
+    labels: ['custom.project=kafkajs', 'custom.service=kafka2']
+    environment:
+      <<: *kafka-env
+      KAFKA_NODE_ID: '2'
+      KAFKA_LISTENERS: 'PLAINTEXT_HOST://0.0.0.0:9095,SSL_HOST://0.0.0.0:9096,SASL_SSL_HOST://0.0.0.0:9097,INTERNAL://0.0.0.0:29095,CONTROLLER://0.0.0.0:19093'
+      KAFKA_ADVERTISED_LISTENERS: 'PLAINTEXT_HOST://localhost:9095,SSL_HOST://localhost:9096,SASL_SSL_HOST://localhost:9097,INTERNAL://kafka2:29095'
+
+  kafka3:
+    <<: *kafka-common
+    container_name: kafka3
+    hostname: kafka3
+    ports: ["9098:9098", "9099:9099", "9100:9100"]
+    labels: ['custom.project=kafkajs', 'custom.service=kafka3']
+    environment:
+      <<: *kafka-env
+      KAFKA_NODE_ID: '3'
+      KAFKA_LISTENERS: 'PLAINTEXT_HOST://0.0.0.0:9098,SSL_HOST://0.0.0.0:9099,SASL_SSL_HOST://0.0.0.0:9100,INTERNAL://0.0.0.0:29098,CONTROLLER://0.0.0.0:19093'
+      KAFKA_ADVERTISED_LISTENERS: 'PLAINTEXT_HOST://localhost:9098,SSL_HOST://localhost:9099,SASL_SSL_HOST://localhost:9100,INTERNAL://kafka3:29098'
+
