@@ -114,7 +114,7 @@ import org.apache.kafka.common.protocol.types.RawTaggedField;
  * {@code Assignment} struct.
  *
  * <p>The transaction vectors cover the versions a client sends: AddPartitionsToTxn v2-v3 (the
- * schema reserves v4+ for brokers), AddOffsetsToTxn v2-v4, EndTxn v2-v5, TxnOffsetCommit v2-v5,
+ * schema reserves v4+ for brokers), AddOffsetsToTxn v2-v4, EndTxn v2-v5, TxnOffsetCommit v2-v6,
  * InitProducerId v3-v5 and OffsetFetch v7-v9. A field the schema gives no wire presence in a
  * version ({@code 5+}, {@code 3+}) is left out of that vector's {@code fields}: the writer drops an
  * {@code ignorable} one silently (the EndTxn response's ProducerId and ProducerEpoch below v5) and
@@ -251,6 +251,13 @@ public final class GenerateMessageVectors {
   private static final short REBALANCE_IN_PROGRESS = 27;
   private static final short MEMBER_ID_REQUIRED = 79;
   private static final short UNKNOWN_TOPIC_ID = 100;
+  private static final short STALE_MEMBER_EPOCH = 113;
+
+  /** The first integer a double cannot tell from its neighbour: 2^53 + 1. */
+  private static final long BEYOND_SAFE_INTEGER = 9007199254740993L;
+
+  /** A committed metadata string that is not ASCII: "méta ✓ 日本". */
+  private static final String NON_ASCII_METADATA = "méta ✓ 日本";
 
   private GenerateMessageVectors() {}
 
@@ -802,6 +809,7 @@ new ListConfigResourcesResponseData()
     vectors.addAll(addOffsetsToTxn());
     vectors.addAll(endTxn());
     vectors.addAll(txnOffsetCommit());
+    vectors.addAll(txnOffsetCommitByTopicId());
     vectors.addAll(incrementalAlterConfigs());
     vectors.addAll(describeConfigs());
     vectors.addAll(alterConfigs());
@@ -2474,6 +2482,221 @@ new ListConfigResourcesResponseData()
                                 obj(
                                     kv("partition", String.valueOf(PARTITION_INDEX)),
                                     kv("errorCode", String.valueOf(errorCode))))))))));
+  }
+
+  /** One partition a TxnOffsetCommit v6 request commits. */
+  private record Committed(int partition, long offset, int leaderEpoch, String metadata) {}
+
+  /** One topic, named by id, a TxnOffsetCommit v6 request commits. */
+  private record CommittedTopic(String topicId, List<Committed> partitions) {}
+
+  /** One partition result of a TxnOffsetCommit v6 response. */
+  private record Answered(int partition, short code) {}
+
+  /** One topic, named by id, a TxnOffsetCommit v6 response answers. */
+  private record AnsweredTopic(String topicId, List<Answered> partitions) {}
+
+  /**
+   * TxnOffsetCommit (28) v6, request and response (KIP-1319): {@code TopicId} replaces {@code Name}
+   * in both. Every request commits the same two topics, so one id is read where the name was: three
+   * partitions between them, one offset beyond 2^53, one {@code null}, one empty and one non-ASCII
+   * metadata string. {@code defaultMetadata} carries the group metadata a bare {@code consumerGroupId}
+   * sends and {@code groupMetadata} a full membership. The responses answer the same topics: every
+   * partition committed ({@code ok}), then each of the three codes v6 adds to the response -
+   * GROUP_ID_NOT_FOUND (69), STALE_MEMBER_EPOCH (113) and UNKNOWN_TOPIC_ID (100) - on every
+   * partition they can name, {@code mixedOutcomes} with each of them beside a success, {@code
+   * unknownTags} with one unknown tagged field at the partition, topic and top level, and {@code
+   * noTopics}.
+   *
+   * @see <a href="https://github.com/apache/kafka/blob/4.4.0/clients/src/main/resources/common/message/TxnOffsetCommitRequest.json">TxnOffsetCommitRequest.json</a>
+   * @see <a href="https://github.com/apache/kafka/blob/4.4.0/clients/src/main/resources/common/message/TxnOffsetCommitResponse.json">TxnOffsetCommitResponse.json</a>
+   * @return the key-28 v6 vectors
+   */
+  private static List<Vector> txnOffsetCommitByTopicId() {
+    List<Vector> vectors = new ArrayList<>();
+    String api = "txnOffsetCommit";
+
+    vectors.add(txnOffsetCommitByTopicIdRequest(api, "defaultMetadata", -1, "", null));
+    vectors.add(
+        txnOffsetCommitByTopicIdRequest(
+            api, "groupMetadata", GENERATION_ID, MEMBER_ID, GROUP_INSTANCE_ID));
+
+    AnsweredTopic okA =
+        answeredTopic(TOPIC_ID, new Answered(0, (short) 0), new Answered(1, (short) 0));
+    AnsweredTopic okB = answeredTopic(OTHER_TOPIC_ID, new Answered(0, (short) 0));
+    vectors.add(txnOffsetCommitByTopicIdResponse(api, "ok", false, okA, okB));
+    vectors.add(
+        txnOffsetCommitByTopicIdResponse(
+            api, "groupIdNotFound", false,
+            answeredTopic(TOPIC_ID, new Answered(0, GROUP_ID_NOT_FOUND),
+                new Answered(1, GROUP_ID_NOT_FOUND)),
+            answeredTopic(OTHER_TOPIC_ID, new Answered(0, GROUP_ID_NOT_FOUND))));
+    vectors.add(
+        txnOffsetCommitByTopicIdResponse(
+            api, "staleMemberEpoch", false,
+            answeredTopic(TOPIC_ID, new Answered(0, STALE_MEMBER_EPOCH),
+                new Answered(1, STALE_MEMBER_EPOCH)),
+            answeredTopic(OTHER_TOPIC_ID, new Answered(0, STALE_MEMBER_EPOCH))));
+    vectors.add(
+        txnOffsetCommitByTopicIdResponse(
+            api, "unknownTopicId", false,
+            answeredTopic(TOPIC_ID, new Answered(0, UNKNOWN_TOPIC_ID),
+                new Answered(1, UNKNOWN_TOPIC_ID)),
+            okB));
+    vectors.add(
+        txnOffsetCommitByTopicIdResponse(
+            api, "mixedOutcomes", false,
+            answeredTopic(TOPIC_ID, new Answered(0, (short) 0), new Answered(1, UNKNOWN_TOPIC_ID)),
+            answeredTopic(OTHER_TOPIC_ID, new Answered(0, STALE_MEMBER_EPOCH))));
+    vectors.add(txnOffsetCommitByTopicIdResponse(api, "unknownTags", true, okA, okB));
+    vectors.add(txnOffsetCommitByTopicIdResponse(api, "noTopics", false));
+
+    return vectors;
+  }
+
+  /**
+   * @param topicId the topic's id in canonical form
+   * @param partitions its results, in order
+   * @return one answered topic
+   */
+  private static AnsweredTopic answeredTopic(String topicId, Answered... partitions) {
+    return new AnsweredTopic(topicId, List.of(partitions));
+  }
+
+  /**
+   * One TxnOffsetCommit v6 request for the two topics described on {@link
+   * #txnOffsetCommitByTopicId()}.
+   *
+   * @param api the fixtures directory name
+   * @param caseId the case name, which is also the file name's last part
+   * @param generationId the consumer group generation, -1 when the producer sends no group metadata
+   * @param memberId the consumer group member id, empty when there is no group metadata
+   * @param groupInstanceId the static member id, or null
+   * @return the vector
+   */
+  private static Vector txnOffsetCommitByTopicIdRequest(
+      String api, String caseId, int generationId, String memberId, String groupInstanceId) {
+    List<CommittedTopic> topics =
+        List.of(
+            new CommittedTopic(
+                TOPIC_ID,
+                List.of(
+                    new Committed(0, BEYOND_SAFE_INTEGER, COMMITTED_LEADER_EPOCH, null),
+                    new Committed(1, COMMITTED_OFFSET, -1, ""))),
+            new CommittedTopic(
+                OTHER_TOPIC_ID,
+                List.of(new Committed(0, Long.MAX_VALUE, 7, NON_ASCII_METADATA))));
+
+    List<TxnOffsetCommitRequestData.TxnOffsetCommitRequestTopic> built = new ArrayList<>();
+    List<String> restated = new ArrayList<>();
+    for (CommittedTopic topic : topics) {
+      List<TxnOffsetCommitRequestData.TxnOffsetCommitRequestPartition> partitions =
+          new ArrayList<>();
+      List<String> partitionsRestated = new ArrayList<>();
+      for (Committed committed : topic.partitions()) {
+        partitions.add(
+            new TxnOffsetCommitRequestData.TxnOffsetCommitRequestPartition()
+                .setPartitionIndex(committed.partition())
+                .setCommittedOffset(committed.offset())
+                .setCommittedLeaderEpoch(committed.leaderEpoch())
+                .setCommittedMetadata(committed.metadata()));
+        partitionsRestated.add(
+            obj(
+                kv("partition", num(committed.partition())),
+                kv("offset", str(String.valueOf(committed.offset()))),
+                kv("leaderEpoch", num(committed.leaderEpoch())),
+                kv("metadata", str(committed.metadata()))));
+      }
+      built.add(
+          new TxnOffsetCommitRequestData.TxnOffsetCommitRequestTopic()
+              .setTopicId(uuid(topic.topicId()))
+              .setPartitions(partitions));
+      restated.add(
+          obj(
+              kv("topicId", str(topic.topicId())),
+              kv("partitions", array(partitionsRestated.toArray(new String[0])))));
+    }
+
+    return new Vector(api, "TxnOffsetCommitRequest", (short) 6, caseId,
+        new TxnOffsetCommitRequestData()
+            .setTransactionalId(TRANSACTIONAL_ID)
+            .setGroupId(GROUP_ID)
+            .setProducerId(PRODUCER_ID)
+            .setProducerEpoch(PRODUCER_EPOCH)
+            .setGenerationIdOrMemberEpoch(generationId)
+            .setMemberId(memberId)
+            .setGroupInstanceId(groupInstanceId)
+            .setTopics(built),
+        obj(
+            kv("transactionalId", str(TRANSACTIONAL_ID)),
+            kv("groupId", str(GROUP_ID)),
+            kv("producerId", str(String.valueOf(PRODUCER_ID))),
+            kv("producerEpoch", String.valueOf(PRODUCER_EPOCH)),
+            kv("generationId", num(generationId)),
+            kv("memberId", str(memberId)),
+            kv("groupInstanceId", str(groupInstanceId)),
+            kv("topics", array(restated.toArray(new String[0])))));
+  }
+
+  /**
+   * One TxnOffsetCommit v6 response.
+   *
+   * @param api the fixtures directory name
+   * @param caseId the case name, which is also the file name's last part
+   * @param unknownTags whether the response, each topic and each partition also carry one unknown
+   *     tagged field
+   * @param topics the per-topic results, in order
+   * @return the vector, whose fixture restates the results
+   */
+  private static Vector txnOffsetCommitByTopicIdResponse(
+      String api, String caseId, boolean unknownTags, AnsweredTopic... topics) {
+    List<TxnOffsetCommitResponseData.TxnOffsetCommitResponseTopic> built = new ArrayList<>();
+    List<String> restated = new ArrayList<>();
+    for (AnsweredTopic topic : topics) {
+      List<TxnOffsetCommitResponseData.TxnOffsetCommitResponsePartition> partitions =
+          new ArrayList<>();
+      List<String> partitionsRestated = new ArrayList<>();
+      for (Answered answered : topic.partitions()) {
+        TxnOffsetCommitResponseData.TxnOffsetCommitResponsePartition partition =
+            new TxnOffsetCommitResponseData.TxnOffsetCommitResponsePartition()
+                .setPartitionIndex(answered.partition())
+                .setErrorCode(answered.code());
+        if (unknownTags) {
+          partition.unknownTaggedFields().add(new RawTaggedField(UNKNOWN_TAG, UNKNOWN_TAG_DATA));
+        }
+        partitions.add(partition);
+        partitionsRestated.add(
+            obj(kv("partition", num(answered.partition())), kv("errorCode", num(answered.code()))));
+      }
+      TxnOffsetCommitResponseData.TxnOffsetCommitResponseTopic entry =
+          new TxnOffsetCommitResponseData.TxnOffsetCommitResponseTopic()
+              .setTopicId(uuid(topic.topicId()))
+              .setPartitions(partitions);
+      if (unknownTags) {
+        entry.unknownTaggedFields().add(new RawTaggedField(UNKNOWN_TAG, UNKNOWN_TAG_DATA));
+      }
+      built.add(entry);
+      restated.add(
+          obj(
+              kv("topicId", str(topic.topicId())),
+              kv("partitions", array(partitionsRestated.toArray(new String[0])))));
+    }
+
+    TxnOffsetCommitResponseData response =
+        new TxnOffsetCommitResponseData().setThrottleTimeMs(TXN_THROTTLE_TIME_MS).setTopics(built);
+    List<String> fields =
+        new ArrayList<>(
+            List.of(
+                kv("throttleTime", num(TXN_THROTTLE_TIME_MS)),
+                kv("topics", array(restated.toArray(new String[0])))));
+    if (unknownTags) {
+      response.unknownTaggedFields().add(new RawTaggedField(UNKNOWN_TAG, UNKNOWN_TAG_DATA));
+      fields.add(kv("unknownTag", num(UNKNOWN_TAG)));
+      fields.add(kv("unknownTagBytes", intArray(List.of(0xaa, 0xbb))));
+    }
+
+    return new Vector(api, "TxnOffsetCommitResponse", (short) 6, caseId, response,
+        obj(fields.toArray(new String[0])));
   }
 
   /** @param value any number @return its JSON literal */

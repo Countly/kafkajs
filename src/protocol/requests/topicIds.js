@@ -4,21 +4,56 @@ const { KafkaJSInvariantViolation } = require('../../errors')
 const NO_TOPIC_ID = '00000000-0000-0000-0000-000000000000'
 
 /**
+ * Whether an id may be sent: present and not the all-zero id that stands for "no topic".
+ * @param {string|null|undefined} topicId
+ * @returns {boolean}
+ */
+const isUsableTopicId = (topicId) => topicId != null && topicId !== NO_TOPIC_ID
+
+/**
+ * The id of every named topic, or nothing when any one lacks a usable id. All or nothing, because
+ * a request keyed by id cannot name one topic by id and another by name.
+ * @param {string[]} names the topics a request names
+ * @param {(name: string) => string|null|undefined} idOf where an id is read from
+ * @returns {Map<string, string>|undefined} topic name to topic id, undefined for no names or when
+ *   any topic has no usable id
+ */
+const usableTopicIds = (names, idOf) => {
+  if (names.length === 0) {
+    return undefined
+  }
+
+  const topicIds = new Map()
+  for (const name of names) {
+    const topicId = idOf(name)
+
+    if (!isUsableTopicId(topicId)) {
+      return undefined
+    }
+
+    topicIds.set(name, topicId)
+  }
+
+  return topicIds
+}
+
+/**
  * The id of each named topic, in the order given. A request keyed by topic id must never carry a
  * missing or all-zero id: the broker would answer UNKNOWN_TOPIC_ID, so the builder refuses instead.
  * @param {string} api the API name, for the message
  * @param {string[]} names
  * @param {Map<string, string>} [topicIds] topic name to topic id
+ * @param {number} [version=10] the first version keyed by id, for the message
  * @returns {string[]} one id per name
  * @throws {KafkaJSInvariantViolation} naming the first topic without a usable id
  */
-const requireTopicIds = (api, names, topicIds) =>
+const requireTopicIds = (api, names, topicIds, version = 10) =>
   names.map((name) => {
     const topicId = topicIds == null ? undefined : topicIds.get(name)
 
-    if (topicId == null || topicId === NO_TOPIC_ID) {
+    if (!isUsableTopicId(topicId)) {
       throw new KafkaJSInvariantViolation(
-        `${api} v10 request is missing a topic id for topic "${name}"`
+        `${api} v${version} request is missing a topic id for topic "${name}"`
       )
     }
 
@@ -50,4 +85,4 @@ const topicIdSchema = (previous) => ({
   ),
 })
 
-module.exports = { NO_TOPIC_ID, requireTopicIds, namesById, topicIdSchema }
+module.exports = { NO_TOPIC_ID, usableTopicIds, requireTopicIds, namesById, topicIdSchema }

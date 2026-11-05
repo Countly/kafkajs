@@ -491,6 +491,8 @@ describe('scripts/protocol > schema validation', () => {
       'src/protocol/requests/txnOffsetCommit/v4/response.js',
       'src/protocol/requests/txnOffsetCommit/v5/request.js',
       'src/protocol/requests/txnOffsetCommit/v5/response.js',
+      'src/protocol/requests/txnOffsetCommit/v6/request.js',
+      'src/protocol/requests/txnOffsetCommit/v6/response.js',
       'src/protocol/requests/updateFeatures/v0/request.js',
       'src/protocol/requests/updateFeatures/v0/response.js',
       'src/protocol/requests/updateFeatures/v1/request.js',

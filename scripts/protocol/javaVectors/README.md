@@ -56,7 +56,7 @@ that is removed afterwards when the variable is unset and reused when it is set.
 | AddPartitionsToTxn | 24 | 2, 3 | 6 |
 | AddOffsetsToTxn | 25 | 2, 3, 4 | 9 |
 | EndTxn | 26 | 2, 3, 4, 5 | 17 |
-| TxnOffsetCommit | 28 | 2, 3, 4, 5 | 16 |
+| TxnOffsetCommit | 28 | 2, 3, 4, 5, 6 | 25 |
 | IncrementalAlterConfigs | 44 | 0, 1 | 16 |
 | DescribeConfigs | 32 | 3, 4 | 10 |
 | AlterConfigs | 33 | 2 | 4 |
@@ -111,8 +111,10 @@ renamed `TxnOffsetCommitRequestData#setGenerationId` and made `DescribeProducers
 take a collection), so `messages` and `produce` need `KAFKA_CLIENTS_VERSION=4.4.0`; the default pin
 of the script stays 4.3.1 for the other modes. The DeleteGroups v3 vectors (request `basic`, `empty`,
 `nonAscii`; response `ok`, `error`, `nullEmptyNonempty`, `mixedOutcomes`, `nonAscii`, `noResults`,
-`unknownTags`) were written by that jar. A run with it also regenerated every committed vector of the
-generator byte for byte, so only those ten files are new.
+`unknownTags`) and the TxnOffsetCommit v6 ones (request `defaultMetadata`, `groupMetadata`; response
+`ok`, `groupIdNotFound`, `staleMemberEpoch`, `unknownTopicId`, `mixedOutcomes`, `unknownTags`,
+`noTopics`) were written by that jar. A run with it also regenerated every committed vector of the
+generator byte for byte, so only those files are new.
 
 | Jar | SHA-256 |
 |---|---|

@@ -89,7 +89,9 @@ await transaction.sendOffsets({
 }]
 ```
 
-If the offset commit is refused because the consumer is no longer the member it was — `ILLEGAL_GENERATION` or `UNKNOWN_MEMBER_ID` under the classic protocol, `STALE_MEMBER_EPOCH` under `groupProtocol: 'consumer'`, or `FENCED_INSTANCE_ID` — `sendOffsets` rejects and the transaction can only be aborted: abort it, let the consumer rejoin, and process the records again from the committed offsets.
+If the offset commit is refused because the consumer is no longer the member it was — `ILLEGAL_GENERATION` or `UNKNOWN_MEMBER_ID` under the classic protocol, `STALE_MEMBER_EPOCH` under `groupProtocol: 'consumer'`, or `FENCED_INSTANCE_ID` — `sendOffsets` rejects and the transaction can only be aborted: abort it, let the consumer rejoin, and process the records again from the committed offsets. A `GROUP_ID_NOT_FOUND` from `TxnOffsetCommit` v6 (a group the coordinator does not know) is handled the same way.
+
+Transactional offset commits use topic IDs when every requested topic has a known ID and the broker supports `TxnOffsetCommit` v6 (Kafka 4.4, KIP-1319). If any ID is unavailable, the whole request stays at v5 or below; transaction-version constraints may require an older version. Group metadata is preserved. Offsets become published only after a confirmed transaction commit. Group metadata mismatch errors require aborting the transaction; unknown topic IDs use the existing bounded refresh and retry path.
 
 `sendOffsets` snapshots its topics, partitions, offsets, leader epochs and metadata when called. Calls on one transaction run one at a time in call order, including retries. The last successful call for a partition selects its value, even when offsets move backward.
 

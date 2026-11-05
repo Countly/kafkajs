@@ -9,6 +9,7 @@ const {
   KafkaJSTransactionAbortableError,
 } = require('../../errors')
 const COORDINATOR_TYPES = require('../../protocol/coordinatorTypes')
+const { usableTopicIds } = require('../../protocol/requests/topicIds')
 const ProducerStateManager = require('../state')
 const { transactionStateFor } = require('../state/errorClassifier')
 const assert = require('assert')
@@ -163,6 +164,35 @@ const createEosManager = ({
 
   /** The private options a broker request takes for a captured lifecycle; none without one. */
   const guardOf = (generation) => (generation ? { guard: generation.guard } : {})
+
+  /**
+   * Re-reads the metadata of an offset commit's topics after the broker answered UNKNOWN_TOPIC_ID,
+   * so the next attempt reads the id a recreated topic has now from the cache `cluster.topicId`
+   * reads. The topics become targets of this producer's cluster, which refreshes and later forgets
+   * them like any other. Best effort: a failed refresh leaves the original error to the retrier,
+   * but a closed lifecycle ends the attempt with its close error and publishes nothing.
+   * @param {object[]} topics the call's immutable snapshot topics
+   * @param {import('../generation')} [generation] the lifecycle the call captured
+   * @returns {Promise<void>}
+   * @throws {Error} the lifecycle's close error
+   */
+  const refreshOffsetTopics = async (topics, generation) => {
+    const fence = generation ? { fence: generation } : {}
+    try {
+      generation?.check()
+      await cluster.addMultipleTargetTopics(
+        topics.map(({ topic }) => topic),
+        fence
+      )
+      await cluster.refreshMetadata(fence)
+    } catch (error) {
+      generation?.check()
+      logger.debug('Could not refresh the topics of a transactional offset commit', {
+        error: error.message,
+      })
+    }
+    generation?.check()
+  }
 
   const findTransactionCoordinator = (generation) => {
     return cluster.findGroupCoordinator({
@@ -842,6 +872,10 @@ const createEosManager = ({
           await retrierFor(generation)(async (bail, retryCount, retryTime) => {
             try {
               generation?.check()
+              const topicIds = usableTopicIds(
+                snapshot.topics.map(({ topic }) => topic),
+                (name) => cluster.topicId(name)
+              )
               await groupCoordinator.txnOffsetCommit({
                 transactionalId,
                 producerId: stateManager.producerId,
@@ -852,6 +886,7 @@ const createEosManager = ({
                 memberId,
                 groupInstanceId,
                 transactionVersion,
+                ...(topicIds ? { topicIds } : {}),
                 ...guardOf(generation),
               })
             } catch (e) {
@@ -870,6 +905,9 @@ const createEosManager = ({
                     coordinatorType: COORDINATOR_TYPES.GROUP,
                     ...(generation ? { fence: generation } : {}),
                   })
+                }
+                if (e.type === 'UNKNOWN_TOPIC_ID') {
+                  await refreshOffsetTopics(snapshot.topics, generation)
                 }
                 throw e
               }

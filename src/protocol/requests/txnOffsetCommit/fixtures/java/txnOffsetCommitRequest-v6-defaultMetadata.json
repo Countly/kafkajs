@@ -1,0 +1,7 @@
+{
+  "message": "TxnOffsetCommitRequest",
+  "version": 6,
+  "case": "defaultMetadata",
+  "hex": "16746573742d7472616e73616374696f6e616c2d69640b746573742d67726f757000000000000003e80003ffffffff0100030102030405060708090a0b0c0d0e0f100300000000002000000000000100000003000000000001000000000000000affffffff0100001112131415161718191a1b1c1d1e1f2002000000007fffffffffffffff00000007116dc3a9746120e29c9320e697a5e69cac000000",
+  "fields": { "transactionalId": "test-transactional-id", "groupId": "test-group", "producerId": "1000", "producerEpoch": 3, "generationId": -1, "memberId": "", "groupInstanceId": null, "topics": [{ "topicId": "01020304-0506-0708-090a-0b0c0d0e0f10", "partitions": [{ "partition": 0, "offset": "9007199254740993", "leaderEpoch": 3, "metadata": null }, { "partition": 1, "offset": "10", "leaderEpoch": -1, "metadata": "" }] }, { "topicId": "11121314-1516-1718-191a-1b1c1d1e1f20", "partitions": [{ "partition": 0, "offset": "9223372036854775807", "leaderEpoch": 7, "metadata": "méta ✓ 日本" }] }] }
+}

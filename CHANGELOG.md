@@ -176,6 +176,8 @@ Versions before 3.0.0 are internal alpha tags and are not published.
 
 - Admin operations after disconnect reject without dialing until an explicit connect opens a new lifecycle.
 
+- A `GROUP_ID_NOT_FOUND` answer to a transactional offset commit makes the transaction abortable, like `STALE_MEMBER_EPOCH`, where it was a producer-fatal `applicationRecoverable` error; on every other request it keeps its category. A broker that answers `UNKNOWN_TOPIC_ID` to a v6 commit makes the producer refresh the topics of the offsets before the existing bounded retry.
+
 - **Idle connections are closed after 9 minutes** (540 000 ms, Java's `connections.max.idle.ms`; 2.2.4 never closed them) and reopened by the next request, with one more ApiVersions round trip: "Connections idle for 9 minutes are closed by default; the next request reconnects. This is below the default broker idle timeout but does not guarantee close ordering or eliminate races. `connectionsMaxIdle: 0` keeps connections open as before."
 
 - Admin calls take an `apiTimeout` (default 60 000 ms) and reject with `KafkaJSTimeout` when it passes; a mutation may have been applied. Retries are unchanged, unlike Java's unbounded retries inside the deadline. Existing broker-side `timeout` keeps its meaning.
@@ -229,6 +231,8 @@ Versions before 3.0.0 are internal alpha tags and are not published.
 
 - `rackId` and `rackAware` producer options (KIP-1123): with `rackAware: true` and a non-empty `rackId`, the built-in partitioners (the default `UniformStickyPartitioner`, `DefaultPartitioner` and its alias, `LegacyPartitioner`) prefer the partitions whose leader is in that rack for records without a key, and fall back to every partition with a leader when none is. A record with a `partition` or a key keeps its partition, and a custom `createPartitioner` is given the same arguments as before. Without the opt-in nothing changes.
 
+- TxnOffsetCommit v6 uses cached topic IDs on capable brokers (KIP-1319), with the existing named-topic fallback and commit-only offset publication.
+
 #### Tooling
 
 - Compose variants for delegation tokens, two log directories and tiered storage; the admin ledger table.
@@ -245,6 +249,7 @@ Versions before 3.0.0 are internal alpha tags and are not published.
 - `npm run compat:fetch -- --source-root <dir>` imports the message snapshot and the error snapshot from an unpacked Apache Kafka source release (its `gradle.properties` must hold the pinned version) instead of the network, and refuses an absolute path, a `..` segment or a link that leaves the root. The snapshot is Kafka 4.4.0; the 4.3.1 snapshots stay beside it.
 - `scripts/protocol/javaVectorSources.json` records, for each Java vector, the `kafka-clients` jar that wrote it, that jar's SHA-256 (null only for the 4.3.1 jar of the older vectors) and the fixture's own SHA-256; `npm run protocol:generate` and `protocol:check` refuse a missing, extra, duplicate (a key written twice, found by its decoded text whatever the file's layout) or stale record and copy the records into `scripts/protocol/provenance.json`, where an API whose vectors came from two jars records no single jar.
 - The Java message-vector generator targets the Kafka 4.4 client API, and `test:e2e:delete-groups-v3` runs `deleteGroupsV3Live.spec.js` (`DELETE_GROUPS_V3_E2E`) against the broker version under test.
+- The Java message-vector generator writes the TxnOffsetCommit v6 vectors with the 4.4.0 jar, and `test:e2e:txn-offset-commit-v6` runs `txnOffsetCommitV6Live.spec.js` (`TXN_OFFSET_COMMIT_V6_E2E`) against the broker version under test.
 - The 4.0 floor set covers the admin ledger, connection, OAuth, GSSAPI and delegation-token capabilities and asserts the unsupported results.
 - `test:e2e:rack-aware-producer` runs `rackAwareProducerLive.spec.js` (`RACK_AWARE_PRODUCER_E2E`) on `docker-compose.racks.yml`; the consumer's `test:e2e:rack-aware` is a separate script and flag.
 - The scripted cluster answers a client's ApiVersions v5 request as a Kafka 4.3 broker does, with a v0-shaped UNSUPPORTED_VERSION, so the inherited scenarios negotiate v4 as they did. It leaves out of `requests()` only one refusal per negotiation, a socket's first request or the renegotiation after the client opened another socket to the node; a second negotiation on an unchanged connection stays visible. `apiVersionTrace()` lists every one, and `test:e2e:api-identity` runs `apiVersionsIdentityLive.spec.js` (`API_IDENTITY_E2E`) against the broker version under test.
