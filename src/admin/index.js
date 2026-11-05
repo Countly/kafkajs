@@ -1802,6 +1802,11 @@ module.exports = ({
    * property. A group that failed rejects the call once, with every failed group, and is not
    * retried.
    *
+   * Every coordinator's request settles before a retry. When one coordinator is stale or
+   * unavailable, the retry resends only the groups no coordinator has answered, so a group that was
+   * deleted is never sent again, and its row is kept for the result. Rows come back by attempt,
+   * then by coordinator.
+   *
    * @param {string[]} [groupIds]
    * @return {Promise<DeleteGroups>}
    * @throws {KafkaJSDeleteGroupsError} `groups` holds `{ groupId, errorCode, error, errorMessage? }`
@@ -1824,32 +1829,31 @@ module.exports = ({
     }
 
     const retrier = retrierOf(retry)
-
-    let results = []
-
-    let clonedGroupIds = groupIds.slice()
+    const results = []
+    const answered = new Set()
 
     return retrier(async (bail, retryCount, retryTime) => {
       try {
-        if (clonedGroupIds.length === 0) return []
+        const pending = groupIds.filter((groupId) => !answered.has(groupId))
 
-        checked(await waitOf(async () => cluster.refreshMetadata()))
+        if (pending.length > 0) {
+          checked(await waitOf(async () => cluster.refreshMetadata()))
 
-        const brokersPerGroups = {}
-        const brokersPerNode = {}
-        for (const groupId of clonedGroupIds) {
-          const broker = checked(
-            await waitOf(async () => cluster.findGroupCoordinator({ groupId }))
-          )
-          if (brokersPerGroups[broker.nodeId] === undefined) brokersPerGroups[broker.nodeId] = []
-          brokersPerGroups[broker.nodeId].push(groupId)
-          brokersPerNode[broker.nodeId] = broker
-        }
+          const brokersPerGroups = {}
+          const brokersPerNode = {}
+          for (const groupId of pending) {
+            const broker = checked(
+              await waitOf(async () => cluster.findGroupCoordinator({ groupId }))
+            )
+            if (brokersPerGroups[broker.nodeId] === undefined) brokersPerGroups[broker.nodeId] = []
+            brokersPerGroups[broker.nodeId].push(groupId)
+            brokersPerNode[broker.nodeId] = broker
+          }
 
-        const res = checked(
-          await waitOf(async () =>
-            Promise.all(
-              Object.keys(brokersPerNode).map(async (nodeId) =>
+          const nodeIds = Object.keys(brokersPerNode)
+          const outcomes = checked(
+            await Promise.allSettled(
+              nodeIds.map(async (nodeId) =>
                 checked(
                   await waitOf(async () =>
                     brokersPerNode[nodeId].deleteGroups(brokersPerGroups[nodeId])
@@ -1858,24 +1862,27 @@ module.exports = ({
               )
             )
           )
-        )
 
-        const errors = res
-          .flatMap(({ results }) =>
-            results.map(({ groupId, errorCode, error, errorMessage }) => ({
-              groupId,
-              errorCode,
-              error,
-              ...(errorMessage !== undefined && { errorMessage }),
-            }))
-          )
+          outcomes.forEach((outcome, index) => {
+            if (outcome.status !== 'fulfilled') return
+            for (const row of outcome.value.results) results.push(row)
+            for (const groupId of brokersPerGroups[nodeIds[index]]) answered.add(groupId)
+          })
+
+          const rejected = outcomes.find(({ status }) => status === 'rejected')
+          if (rejected) throw rejected.reason
+        }
+
+        const errors = results
+          .map(({ groupId, errorCode, error, errorMessage }) => ({
+            groupId,
+            errorCode,
+            error,
+            ...(errorMessage !== undefined && { errorMessage }),
+          }))
           .filter(({ errorCode }) => errorCode !== 0)
 
-        clonedGroupIds = errors.map(({ groupId }) => groupId)
-
         if (errors.length > 0) throw new KafkaJSDeleteGroupsError('Error in DeleteGroups', errors)
-
-        results = res.flatMap(({ results }) => results)
 
         return results
       } catch (e) {

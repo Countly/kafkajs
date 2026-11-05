@@ -122,14 +122,37 @@ const networkSource = (tag) => ({
 })
 
 /**
- * @param {string} root an unpacked Apache Kafka source release
- * @returns {Source} that tree, read from disk
+ * Reads `repoPath` from under `base`, following links only while they stay inside it.
+ * A link swapped in after the check is not guarded: the tree is a verified, local download.
+ * @param {string} base the real path of the source root
+ * @param {string} repoPath a repository-relative path
+ * @returns {Promise<string>} the file's text
+ * @throws {Error} for an absolute path, a `..` segment, or a link that leaves the root; the
+ *   filesystem error (`ENOENT` when absent) otherwise
+ */
+const readWithin = async (base, repoPath) => {
+  if (path.isAbsolute(repoPath) || repoPath.split(/[\\/]/).includes('..')) {
+    throw new Error(`${repoPath} is not a path inside the source root`)
+  }
+  const real = await fs.promises.realpath(path.join(base, repoPath))
+  const inside = path.relative(base, real)
+  if (inside === '..' || inside.startsWith(`..${path.sep}`) || path.isAbsolute(inside)) {
+    throw new Error(`${repoPath} resolves outside the source root`)
+  }
+  return fs.promises.readFile(real, 'utf8')
+}
+
+/**
+ * @param {string} root an unpacked Apache Kafka source release; a missing root rejects, it is not
+ *   an absent file
+ * @returns {Source} that tree, read from disk; neither reader leaves the root, see `readWithin`
  */
 const localSource = (root) => ({
-  read: (repoPath) => fs.promises.readFile(path.join(root, repoPath), 'utf8'),
+  read: async (repoPath) => readWithin(await fs.promises.realpath(root), repoPath),
   readIfExists: async (repoPath) => {
+    const base = await fs.promises.realpath(root)
     try {
-      return await fs.promises.readFile(path.join(root, repoPath), 'utf8')
+      return await readWithin(base, repoPath)
     } catch (error) {
       if (error.code === 'ENOENT') return null
       throw error

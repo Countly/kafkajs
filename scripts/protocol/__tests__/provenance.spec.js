@@ -5,6 +5,7 @@ const os = require('os')
 const path = require('path')
 const trackedApis = require('../../compat/tracked-apis.json')
 const { compute, render, readSources, checkProvenance, writeProvenance } = require('../provenance')
+const { duplicateKeys } = require('../duplicateKeys')
 
 const COMMITTED = path.join(__dirname, '..', 'provenance.json')
 const COMMITTED_SOURCES = path.join(__dirname, '..', 'javaVectorSources.json')
@@ -353,6 +354,63 @@ describe('scripts/protocol > provenance', () => {
       ])
     })
 
+    describe('a record written twice', () => {
+      const FILE = fixture('heartbeat', 'heartbeatRequest-v4-basic')
+
+      /**
+       * The sources file with the record of `FILE` as two members, the second under the key
+       * `spelling` (which decodes to the same key), laid out with `indent`.
+       */
+      const writeTwice = (indent, spelling = FILE) => {
+        const root = makeRoot({
+          'heartbeatRequest-v4-basic': { directory: 'heartbeat', jar: OLD_JAR },
+        })
+        const member = JSON.stringify({ [FILE]: readRecords()[FILE] }, null, indent).slice(1, -1)
+        const second = member.replace(`"${FILE}"`, `"${spelling}"`)
+        fs.writeFileSync(
+          path.join(root, 'scripts', 'protocol', 'javaVectorSources.json'),
+          `{${member},${second}}`
+        )
+        return root
+      }
+
+      test.each([
+        ['minified', undefined],
+        ['tab-indented', '\t'],
+        ['four-space indented', 4],
+      ])('is found in %s JSON', (_layout, indent) => {
+        expect(readSources(writeTwice(indent)).problems).toEqual([
+          `duplicate source record for ${FILE}`,
+        ])
+      })
+
+      test.each([
+        ['an escaped slash', FILE.replaceAll('/', '\\/')],
+        ['a unicode-escaped slash', FILE.replaceAll('/', '\\u002f')],
+      ])('is found when the second key spells the path with %s', (_spelling, key) => {
+        expect(readSources(writeTwice(2, key)).problems).toEqual([
+          `duplicate source record for ${FILE}`,
+        ])
+      })
+
+      test('is found inside a record, naming the record it sits in', () => {
+        const root = makeRoot({
+          'heartbeatRequest-v4-basic': { directory: 'heartbeat', jar: OLD_JAR },
+        })
+        const text = fs
+          .readFileSync(path.join(root, 'scripts', 'protocol', 'javaVectorSources.json'), 'utf8')
+          .replace(
+            '"javaClientsJar": "4.3.1",',
+            '"javaClientsJar": "4.3.1", "javaClientsJar": "4.3.1",'
+          )
+        fs.writeFileSync(path.join(root, 'scripts', 'protocol', 'javaVectorSources.json'), text)
+
+        expect(readSources(root).problems).toEqual([
+          `duplicate key javaClientsJar in the source record for ${FILE}`,
+        ])
+      })
+    })
+
     test('a missing sources file is refused, by generate and by the check', () => {
       const root = makeRoot({
         'heartbeatRequest-v4-basic': { directory: 'heartbeat', jar: OLD_JAR },
@@ -394,5 +452,41 @@ describe('scripts/protocol > provenance', () => {
       ).toEqual([])
       expect(readSources(path.join(__dirname, '..', '..', '..')).problems).toEqual([])
     })
+  })
+})
+
+describe('scripts/protocol > duplicateKeys', () => {
+  test('braces, commas, colons and escaped quotes inside strings are not structure, and a repeat after them is still found', () => {
+    const text = String.raw`{"k{,}:\"[":"v,{[:\"","e":"q:\\","a":1,"a":2}`
+
+    expect(duplicateKeys(text)).toEqual([{ record: null, key: 'a' }])
+  })
+
+  test('a string equal to a key, as a value or an array item, is not a key', () => {
+    expect(duplicateKeys('{"a":"a","b":["a","a"],"c":{"a":"a"}}')).toEqual([])
+  })
+
+  test('a repeat is found in an object at any depth and names the top-level record it sits in', () => {
+    expect(duplicateKeys('{"r":{"x":1,"x":2},"s":{"x":1},"t":[{"y":1,"y":2}]}')).toEqual([
+      { record: 'r', key: 'x' },
+      { record: 't', key: 'y' },
+    ])
+  })
+
+  test('a repeat of a top-level key has no record, and the same key one level down is not a repeat', () => {
+    expect(duplicateKeys('{"a":1,"b":{"a":2},"a":3,"a":4}')).toEqual([
+      { record: null, key: 'a' },
+      { record: null, key: 'a' },
+    ])
+  })
+
+  test('keys are compared decoded, whatever the escaping or the whitespace', () => {
+    const text = String.raw`{ "a/b" : 1 ,
+	"a\/b":2,"a\u002fb":3}`
+
+    expect(duplicateKeys(text)).toEqual([
+      { record: null, key: 'a/b' },
+      { record: null, key: 'a/b' },
+    ])
   })
 })

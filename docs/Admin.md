@@ -851,7 +851,7 @@ try {
 }
 ```
 
-On brokers supporting DeleteGroups v3, each result includes `errorMessage: string | null`. Failed results in `KafkaJSDeleteGroupsError` retain the broker's per-group message. Older versions omit this optional field. The existing rejection and retry contracts are unchanged.
+On brokers supporting DeleteGroups v3, each result includes `errorMessage: string | null`. Failed results in `KafkaJSDeleteGroupsError` retain the broker's per-group message. Older versions omit this optional field. The existing rejection and retry contracts are unchanged, except that a retry sends only the groups no coordinator has answered yet, so a group that was deleted is never sent again.
 
 ## <a name="remove-members"></a> Remove members from a consumer group
 

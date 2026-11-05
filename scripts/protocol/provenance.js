@@ -20,6 +20,7 @@ const { requests } = require('../../src/protocol/requests')
 const { kafkaTag } = require('./table')
 const { messageOfKey, directoryOfMessage } = require('./apiNames')
 const { discoverFixtures } = require('./fixtureFamilies')
+const { duplicateKeys } = require('./duplicateKeys')
 
 const REPO_ROOT = path.join(__dirname, '..', '..')
 const OUTPUT = path.join(__dirname, 'provenance.json')
@@ -61,8 +62,9 @@ const javaFixtures = (root) =>
  * @param {string} root the repository root
  * @returns {{ records: Record<string, VectorSource>, problems: string[] }} the records (empty when
  *   the file is missing or unreadable) and every way they disagree with the repository: a record
- *   missing for a vector, one for a file that is no vector, one written twice, one with a fixture
- *   hash the file no longer has, and one whose jar or hashes are malformed or inconsistent
+ *   missing for a vector, one for a file that is no vector, a key written twice in any object
+ *   (compared decoded, whatever the layout or escaping), one with a fixture hash the file no
+ *   longer has, and one whose jar or hashes are malformed or inconsistent
  */
 const readSources = (root) => {
   const file = path.join(root, SOURCES_RELATIVE)
@@ -77,9 +79,12 @@ const readSources = (root) => {
   }
 
   const problems = []
-  const keys = [...text.matchAll(/^ {2}"([^"]+)": \{/gm)].map(([, key]) => key)
-  for (const key of new Set(keys.filter((candidate, at) => keys.indexOf(candidate) !== at))) {
-    problems.push(`duplicate source record for ${key}`)
+  for (const { record, key } of duplicateKeys(text)) {
+    problems.push(
+      record === null
+        ? `duplicate source record for ${key}`
+        : `duplicate key ${key} in the source record for ${record}`
+    )
   }
 
   const onDisk = new Set(javaFixtures(root).map(({ file: fixture }) => fixture))

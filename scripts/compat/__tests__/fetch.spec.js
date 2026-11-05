@@ -215,6 +215,76 @@ describe('scripts/compat/fetch', () => {
       await expect(localSource(root).readIfExists('a')).rejects.toMatchObject({ code: 'EISDIR' })
     })
 
+    describe('a path that leaves the root', () => {
+      let outside
+      let secret
+
+      beforeEach(() => {
+        outside = fs.mkdtempSync(path.join(os.tmpdir(), 'kafka-outside-'))
+        secret = path.join(outside, 'secret.txt')
+        fs.writeFileSync(secret, 'outside')
+        write('a/b.json', '{"x":1}')
+      })
+
+      afterEach(() => {
+        fs.rmSync(outside, { recursive: true, force: true })
+      })
+
+      it.each(['read', 'readIfExists'])(
+        '%s refuses an absolute path and a .. path',
+        async (method) => {
+          const source = localSource(root)
+
+          await expect(source[method](secret)).rejects.toThrow(
+            'is not a path inside the source root'
+          )
+          await expect(source[method](path.relative(root, secret))).rejects.toThrow(
+            'is not a path inside the source root'
+          )
+          await expect(source[method]('a/../a/b.json')).rejects.toThrow(
+            'is not a path inside the source root'
+          )
+        }
+      )
+
+      it.each(['read', 'readIfExists'])(
+        '%s refuses a file link to a file outside',
+        async (method) => {
+          fs.symlinkSync(secret, path.join(root, 'a/link.txt'))
+
+          await expect(localSource(root)[method]('a/link.txt')).rejects.toThrow(
+            'resolves outside the source root'
+          )
+        }
+      )
+
+      it.each(['read', 'readIfExists'])(
+        '%s refuses a path through a directory link to a directory outside',
+        async (method) => {
+          fs.symlinkSync(outside, path.join(root, 'linked'), 'dir')
+
+          await expect(localSource(root)[method]('linked/secret.txt')).rejects.toThrow(
+            'resolves outside the source root'
+          )
+        }
+      )
+
+      it('follows a link that stays inside the root, and a root that is itself a link', async () => {
+        fs.symlinkSync(path.join(root, 'a/b.json'), path.join(root, 'a/inside.json'))
+        const viaLink = path.join(outside, 'root-link')
+        fs.symlinkSync(root, viaLink, 'dir')
+
+        await expect(localSource(root).read('a/inside.json')).resolves.toBe('{"x":1}')
+        await expect(localSource(viaLink).readIfExists('a/inside.json')).resolves.toBe('{"x":1}')
+      })
+
+      it('rejects a root that does not exist instead of reporting every file absent', async () => {
+        await expect(
+          localSource(path.join(root, 'missing')).readIfExists('a/b.json')
+        ).rejects.toMatchObject({ code: 'ENOENT' })
+      })
+    })
+
     it('resolves the retriable flag through its own tree, and the override paths, without a fetch', async () => {
       write(
         `${errors}/UnknownTopicIdException.java`,
