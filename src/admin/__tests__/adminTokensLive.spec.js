@@ -97,11 +97,13 @@ suite('admin delegation tokens', () => {
             )
             expect(owned.owner).toEqual(owner)
             expect(owned.owner).not.toEqual(created.owner)
-            const tokens = await probe.invoke(() =>
-              admin.describeDelegationToken({ owners: [owner] })
-            )
-            probe.credentials.push(...tokens.map(({ hmac }) => hmac))
-            expect(tokens.map(({ tokenId }) => tokenId)).toContain(owned.tokenId)
+            await probe.poll(async () => {
+              const tokens = await probe.invoke(() =>
+                admin.describeDelegationToken({ owners: [owner] })
+              )
+              probe.credentials.push(...tokens.map(({ hmac }) => hmac))
+              return tokens.some(({ tokenId }) => tokenId === owned.tokenId)
+            })
           } else {
             await expect(
               probe.invoke(() => admin.createDelegationToken({ owner: renewer }))

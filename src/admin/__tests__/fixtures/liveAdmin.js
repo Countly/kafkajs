@@ -212,9 +212,10 @@ class AdminLiveProbe {
         topics: [
           {
             topic,
-            numPartitions: partitions,
-            replicationFactor,
-            replicaAssignment,
+            // Kafka refuses an explicit assignment together with a count or a factor (42).
+            ...(replicaAssignment
+              ? { replicaAssignment }
+              : { numPartitions: partitions, replicationFactor }),
             configEntries: [{ name: 'retention.ms', value: '-1' }, ...configEntries],
           },
         ],

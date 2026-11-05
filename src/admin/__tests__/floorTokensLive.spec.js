@@ -2,6 +2,7 @@ const FloorCapabilities = require('../../../testHelpers/floorCapabilities')
 const { timingSafeEqual } = require('node:crypto')
 const { inspect } = require('node:util')
 const { Kafka, logLevel, KafkaJSProtocolError } = require('../../..')
+const waitFor = require('../../utils/waitFor')
 const Broker = require('../../broker')
 const {
   saslBrokers,
@@ -92,32 +93,58 @@ describeTokens('Delegation tokens on the negotiated floor', () => {
     expect(BigInt(token.issueTimestampMs) <= BigInt(token.expiryTimestampMs)).toBe(true)
     expect(BigInt(token.expiryTimestampMs) <= BigInt(token.maxTimestampMs)).toBe(true)
     observed.push('create')
-    const described = await admin.describeDelegationToken()
+    // A token change reaches the answering broker's cache after the controller commits it.
+    const describedWhen = (predicate) =>
+      waitFor(
+        async () => {
+          const all = await admin.describeDelegationToken()
+          return predicate(all) && all
+        },
+        { delay: 250, maxWait: 15000, timeoutMessage: 'The token change never became visible' }
+      )
+    const described = await describedWhen((all) =>
+      all.some((item) => item.tokenId === token.tokenId)
+    )
     const matches = described.filter((item) => item.tokenId === token.tokenId)
     expect(matches.length).toBe(1)
     const equal =
       matches[0].hmac.length === token.hmac.length && timingSafeEqual(matches[0].hmac, token.hmac)
     expect(equal).toBe(true)
     observed.push('describe')
-    const expiryOf = async () =>
+    const expiryOf = async (expected) =>
       BigInt(
-        (await admin.describeDelegationToken()).find((item) => item.tokenId === token.tokenId)
-          .expiryTimestampMs
+        (
+          await describedWhen((all) =>
+            all.some(
+              (item) =>
+                item.tokenId === token.tokenId && BigInt(item.expiryTimestampMs) === expected
+            )
+          )
+        ).find((item) => item.tokenId === token.tokenId).expiryTimestampMs
       )
     const shortened = await admin.expireDelegationToken({
       hmac: token.hmac,
       expiryTimePeriodMs: 30000,
     })
     expect(BigInt(shortened.expiryTimestampMs) < BigInt(token.expiryTimestampMs)).toBe(true)
-    expect(await expiryOf()).toBe(BigInt(shortened.expiryTimestampMs))
+    expect(await expiryOf(BigInt(shortened.expiryTimestampMs))).toBe(
+      BigInt(shortened.expiryTimestampMs)
+    )
     const renewed = await admin.renewDelegationToken({ hmac: token.hmac, renewPeriodMs: 90000 })
     expect(BigInt(renewed.expiryTimestampMs) > BigInt(shortened.expiryTimestampMs)).toBe(true)
     expect(BigInt(renewed.expiryTimestampMs) <= BigInt(token.maxTimestampMs)).toBe(true)
-    expect(await expiryOf()).toBe(BigInt(renewed.expiryTimestampMs))
+    expect(await expiryOf(BigInt(renewed.expiryTimestampMs))).toBe(
+      BigInt(renewed.expiryTimestampMs)
+    )
     observed.push('renew')
     await admin.expireDelegationToken({ hmac: token.hmac, expiryTimePeriodMs: 0 })
     expired = true
-    const remaining = await admin.describeDelegationToken()
+    const remaining = await describedWhen((all) =>
+      all.every(
+        (item) =>
+          item.tokenId !== token.tokenId || BigInt(item.expiryTimestampMs) <= BigInt(Date.now())
+      )
+    )
     expect(
       remaining.every(
         (item) =>
