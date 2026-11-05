@@ -5,7 +5,13 @@ const http = require('node:http')
 const os = require('node:os')
 const path = require('node:path')
 const { Kafka, logLevel, oauthBearer } = require('../../..')
-const { saslBrokers, sslConnectionOpts, writeEvidence, wireVersionsOf } = require('testHelpers')
+const {
+  saslBrokers,
+  sslConnectionOpts,
+  waitForTopicPropagation,
+  writeEvidence,
+  wireVersionsOf,
+} = require('testHelpers')
 const { waitForCondition, withTimeout } = require('../../consumer/__tests__/fixtures/liveScenario')
 const { CleanupStack } = require('../../producer/__tests__/fixtures/liveProbe')
 
@@ -260,6 +266,8 @@ describeLive('OAuth helpers against a live OAUTHBEARER broker', () => {
             waitForLeaders: true,
             topics: [{ topic, numPartitions: 2, replicationFactor: 2 }],
           })
+          // The leader wait asks one broker; later reads may reach any of them.
+          await waitForTopicPropagation(topic, 2)
         }
         expect((await admin.fetchTopicMetadata({ topics: [topic] })).topics[0].name).toBe(topic)
         await produce(producers[form], form, 'first')

@@ -60,7 +60,8 @@ const DELETE_GROUPS_NO_MESSAGE_MAX = 2
  */
 const DESCRIBE_GROUPS_DEAD_CODE_FROM = 6
 /** The APIs a producer that never sends a transaction or an offset may use. */
-const PRODUCER_APIS = ['ApiVersions', 'Metadata', 'Produce']
+// A producer is idempotent by default, so it asks for a producer id before its first send.
+const PRODUCER_APIS = ['ApiVersions', 'Metadata', 'InitProducerId', 'Produce']
 
 /** The brokers' racks in `docker-compose.racks.yml`. */
 const BROKER_RACKS = { 1: 'rack-a', 2: 'rack-b', 3: 'rack-c' }
