@@ -17928,6 +17928,9 @@
         "src/admin/__tests__/removeMembersLive.spec.js \u203a Admin > removeMembersFromConsumerGroup (live, consumer) on a group with a dynamic and a static member an instance id the group does not know is UNKNOWN_MEMBER_ID in the results, not a rejection",
         "src/admin/__tests__/removeMembersLive.spec.js \u203a Admin > removeMembersFromConsumerGroup (live, consumer) on a group with a dynamic and a static member removing every member answers one removal for each",
         "src/admin/__tests__/removeMembersLive.spec.js \u203a Admin > removeMembersFromConsumerGroup (live, consumer) removes a static member that stopped without leaving, and the survivor takes its partitions well before the session timeout",
+        "src/broker/__tests__/apiVersionsIdentityLive.spec.js \u203a Broker > ApiVersions identity (live) a bootstrap broker is named no identity and a known node is named its cluster and node id",
+        "src/broker/__tests__/apiVersionsIdentityLive.spec.js \u203a Broker > ApiVersions identity (live) a node that is another broker is refused with REBOOTSTRAP_REQUIRED on 4.4, recovered from once, and not noticed below it",
+        "src/broker/__tests__/apiVersionsIdentityLive.spec.js \u203a Broker > ApiVersions identity (live) none names no identity, so a misrouted node is neither refused nor recovered from",
         "src/broker/__tests__/floorCoreLive.spec.js \u203a Administration and connection capabilities on the floor aborts a physical transaction and fences the original producer",
         "src/broker/__tests__/floorCoreLive.spec.js \u203a Administration and connection capabilities on the floor bounds setup, idle reopening and a stalled administrative call",
         "src/broker/__tests__/floorCoreLive.spec.js \u203a Administration and connection capabilities on the floor deletes offsets and fetches three groups through negotiated versions",
@@ -18334,7 +18337,10 @@
         "src/broker/__tests__/floorCoreLive.spec.js \u203a Administration and connection capabilities on the floor bounds setup, idle reopening and a stalled administrative call",
         "src/broker/__tests__/floorCoreLive.spec.js \u203a Administration and connection capabilities on the floor every administration and connection evidence line carries the stamps a verifier checks",
         "src/broker/__tests__/floorGssapiLive.spec.js \u203a GSSAPI with a ticket-granting service authenticates, expires, reconnects and reauthenticates with the ticket service",
-        "src/broker/__tests__/floorGssapiLive.spec.js \u203a GSSAPI with a ticket-granting service reads the SASL capability facts from a GSSAPI-authenticated connection"
+        "src/broker/__tests__/floorGssapiLive.spec.js \u203a GSSAPI with a ticket-granting service reads the SASL capability facts from a GSSAPI-authenticated connection",
+        "src/broker/__tests__/apiVersionsIdentityLive.spec.js \u203a Broker > ApiVersions identity (live) a bootstrap broker is named no identity and a known node is named its cluster and node id",
+        "src/broker/__tests__/apiVersionsIdentityLive.spec.js \u203a Broker > ApiVersions identity (live) a node that is another broker is refused with REBOOTSTRAP_REQUIRED on 4.4, recovered from once, and not noticed below it",
+        "src/broker/__tests__/apiVersionsIdentityLive.spec.js \u203a Broker > ApiVersions identity (live) none names no identity, so a misrouted node is neither refused nor recovered from"
       ]
     },
     {
@@ -21284,7 +21290,10 @@
         "src/producer/__tests__/rackAwareProducerLive.spec.js \u203a Producer > rack-aware partitioning (live) a producer with a rackId alone spreads keyless records over every partition",
         "src/producer/__tests__/rackAwareProducerLive.spec.js \u203a Producer > rack-aware partitioning (live) a producer with rackAware: false and a rackId spreads keyless records over every partition",
         "src/producer/__tests__/rackAwareProducerLive.spec.js \u203a Producer > rack-aware partitioning (live) explicit and keyed records of a rack-aware producer keep their partitions",
-        "src/producer/__tests__/rackAwareProducerLive.spec.js \u203a Producer > rack-aware partitioning (live) a custom partitioner keeps its choice of a partition led outside the rack of a rack-aware producer"
+        "src/producer/__tests__/rackAwareProducerLive.spec.js \u203a Producer > rack-aware partitioning (live) a custom partitioner keeps its choice of a partition led outside the rack of a rack-aware producer",
+        "src/broker/__tests__/apiVersionsIdentityLive.spec.js \u203a Broker > ApiVersions identity (live) a bootstrap broker is named no identity and a known node is named its cluster and node id",
+        "src/broker/__tests__/apiVersionsIdentityLive.spec.js \u203a Broker > ApiVersions identity (live) a node that is another broker is refused with REBOOTSTRAP_REQUIRED on 4.4, recovered from once, and not noticed below it",
+        "src/broker/__tests__/apiVersionsIdentityLive.spec.js \u203a Broker > ApiVersions identity (live) none names no identity, so a misrouted node is neither refused nor recovered from"
       ]
     },
     {
@@ -21561,6 +21570,60 @@
         "src/producer/__tests__/rackAwareProducerLive.spec.js \u203a Producer > rack-aware partitioning (live) a producer with rackAware: false and a rackId spreads keyless records over every partition",
         "src/producer/__tests__/rackAwareProducerLive.spec.js \u203a Producer > rack-aware partitioning (live) explicit and keyed records of a rack-aware producer keep their partitions",
         "src/producer/__tests__/rackAwareProducerLive.spec.js \u203a Producer > rack-aware partitioning (live) a custom partitioner keeps its choice of a partition led outside the rack of a rack-aware producer"
+      ],
+      "capMinutes": 30
+    },
+    {
+      "id": "e2e-api-identity-kafka-4-4",
+      "kind": "cluster",
+      "compose": "docker-compose.yml",
+      "kafkaVersion": "4.4.0",
+      "env": {
+        "API_IDENTITY_E2E": "1"
+      },
+      "jest": [
+        "--forceExit",
+        "--testPathPatterns",
+        "src/broker/__tests__/apiVersionsIdentityLive\\.spec\\.js"
+      ],
+      "jestScript": null,
+      "nodeTest": null,
+      "command": null,
+      "needs": {},
+      "evidence": [
+        "api-identity"
+      ],
+      "titles": [
+        "src/broker/__tests__/apiVersionsIdentityLive.spec.js \u203a Broker > ApiVersions identity (live) a bootstrap broker is named no identity and a known node is named its cluster and node id",
+        "src/broker/__tests__/apiVersionsIdentityLive.spec.js \u203a Broker > ApiVersions identity (live) a node that is another broker is refused with REBOOTSTRAP_REQUIRED on 4.4, recovered from once, and not noticed below it",
+        "src/broker/__tests__/apiVersionsIdentityLive.spec.js \u203a Broker > ApiVersions identity (live) none names no identity, so a misrouted node is neither refused nor recovered from"
+      ],
+      "capMinutes": 30
+    },
+    {
+      "id": "e2e-api-identity-kafka-4-3",
+      "kind": "cluster",
+      "compose": "docker-compose.yml",
+      "kafkaVersion": "4.3.1",
+      "env": {
+        "API_IDENTITY_E2E": "1"
+      },
+      "jest": [
+        "--forceExit",
+        "--testPathPatterns",
+        "src/broker/__tests__/apiVersionsIdentityLive\\.spec\\.js"
+      ],
+      "jestScript": null,
+      "nodeTest": null,
+      "command": null,
+      "needs": {},
+      "evidence": [
+        "api-identity"
+      ],
+      "titles": [
+        "src/broker/__tests__/apiVersionsIdentityLive.spec.js \u203a Broker > ApiVersions identity (live) a bootstrap broker is named no identity and a known node is named its cluster and node id",
+        "src/broker/__tests__/apiVersionsIdentityLive.spec.js \u203a Broker > ApiVersions identity (live) a node that is another broker is refused with REBOOTSTRAP_REQUIRED on 4.4, recovered from once, and not noticed below it",
+        "src/broker/__tests__/apiVersionsIdentityLive.spec.js \u203a Broker > ApiVersions identity (live) none names no identity, so a misrouted node is neither refused nor recovered from"
       ],
       "capMinutes": 30
     }
