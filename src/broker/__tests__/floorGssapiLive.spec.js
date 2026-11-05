@@ -103,9 +103,10 @@ live('GSSAPI with a ticket-granting service', () => {
         } finally {
           clearTimeout(timer)
         }
-        await consumer.stop()
         expect(seen).toEqual(corpus)
+        // Before stop: a stopped consumer has left its group and refuses manual commits.
         await consumer.commitOffsets([{ topic, partition: 0, offset: '20' }])
+        await consumer.stop()
         const committed = await admin.fetchOffsets({ groupId, topics: [topic] })
         expect(committed[0].partitions[0].offset).toBe('20')
         const raw = fixture.control('gssapi-log', [topic, groupId])
