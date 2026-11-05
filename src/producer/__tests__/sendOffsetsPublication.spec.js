@@ -535,17 +535,18 @@ describe.each(['tv1', 'tv2'])('Producer > transactional offsets on the wire (%s)
       }
       const transaction = await producer.transaction()
       const ledger = runners[0].consumerGroup.operations
-      for (let turn = 0; turn < 4000; turn++) {
-        const positioned = new Set(
-          runners.flatMap(({ consumerGroup: { offsetManager: manager } }) =>
-            (manager.memberAssignment[TOPIC] ?? []).filter(
-              (partition) => manager.heldOffsetAt(TOPIC, partition)?.toString() === '0'
-            )
-          )
+      // Every consumer, not just one of them, must hold both positions: a consumer that starts later
+      // clears the shared cells and sends the earlier one back to resolve, which opens a read.
+      const positioned = () =>
+        runners.length === consumers.length &&
+        runners.every(({ consumerGroup: { offsetManager: manager } }) =>
+          [0, 1].every((partition) => manager.heldOffsetAt(TOPIC, partition)?.toString() === '0')
         )
-        if (ledger.size() === 0 && positioned.has(0) && positioned.has(1)) break
+      for (let turn = 0; turn < 4000; turn++) {
+        if (ledger.size() === 0 && positioned()) break
         await new Promise((resolve) => setTimeout(resolve, 1))
       }
+      expect(positioned()).toBe(true)
       expect(ledger.size()).toBe(0)
       for (const runner of runners) {
         expect(runner.consumerGroup.operations).toBe(ledger)
