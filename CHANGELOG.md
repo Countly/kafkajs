@@ -190,6 +190,7 @@ Versions before 3.0.0 are internal alpha tags and are not published.
 
 #### Fixes
 
+- `KafkaJSNumberOfRetriesExceeded` names itself on the first line of its stack. It printed `KafkaJSNonRetriableError` there, its parent class, because the name was assigned after the stack was built (also in kafkajs 2.2.4).
 - A commit the broker refuses names the refused partition: the error carries `topic` and `partition`, as a refused Produce does.
 
 #### Additions

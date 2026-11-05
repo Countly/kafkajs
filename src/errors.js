@@ -170,10 +170,10 @@ class KafkaJSMemberIdRequired extends KafkaJSProtocolError {
 class KafkaJSNumberOfRetriesExceeded extends KafkaJSNonRetriableError {
   constructor(e, { retryCount, retryTime }) {
     super(e, { cause: e })
+    this.name = 'KafkaJSNumberOfRetriesExceeded'
     this.stack = `${this.name}\n  Caused by: ${e.stack}`
     this.retryCount = retryCount
     this.retryTime = retryTime
-    this.name = 'KafkaJSNumberOfRetriesExceeded'
 
     // The wrapped error may itself be a wrapper (KafkaJSError around a protocol error), so
     // walk the chain for the first typed link.

@@ -235,9 +235,28 @@ describeVisibility('Transactional offsets become visible after a confirmed commi
       )
     }, HOOK_BUDGET_MS)
 
+    /**
+     * Opens a transaction, waiting out a coordinator that is still loading (code 14): on a cold
+     * broker the first InitProducerId can wait for a producer-id block longer than the two attempts
+     * this producer's EndTxn cases need.
+     * @returns {Promise<object>}
+     */
+    const openTransaction = async () => {
+      const deadline = Date.now() + WAIT_BUDGET.attempts * WAIT_BUDGET.delay
+      for (;;) {
+        try {
+          return await producer.transaction()
+        } catch (error) {
+          const loading = error.name === 'KafkaJSNumberOfRetriesExceeded' && error.code === 14
+          if (!loading || Date.now() + WAIT_BUDGET.delay >= deadline) throw error
+          await sleep(WAIT_BUDGET.delay)
+        }
+      }
+    }
+
     /** @returns {Promise<object>} a transaction that has sent the offsets `SENT` */
     const sendOffsets = async () => {
-      const transaction = await producer.transaction()
+      const transaction = await openTransaction()
       await transaction.sendOffsets({
         consumerGroupMetadata: consumer.groupMetadata(),
         topics: [{ topic, partitions: [{ partition: 0, offset: SENT }] }],
