@@ -325,6 +325,8 @@ const TRUNCATION_CLEANUP_BUDGET_MS =
   4 * DISCONNECT_BUDGET_MS + 2 * (TRUNCATION_FREEZE_MS + TRUNCATION_STEP_MS + BROKER_READY_MS)
 /** What each broker read of a truncation arm's evidence may take. */
 const TRUTH_MS = 10000
+/** How many times the unclean election command runs before the case fails. */
+const ELECTION_ATTEMPTS = 3
 /** A request to a paused broker fails after this, so a read moves on to a live one. */
 const TRUTH_REQUEST_MS = 2000
 
@@ -823,8 +825,19 @@ describeLogTruncation('Consumer > unclean leader election (live)', () => {
         // shorter log.
         // @see tools/src/main/java/org/apache/kafka/tools/LeaderElectionCommand.java (Apache Kafka 4.3)
         arm.at('trigger the election')
-        arm.scope.throwIfAborted()
-        const electionOutput = triggerUncleanElection(topic).toString()
+        // A returning voter may not reach the controller yet ("channel manager timed out" in its
+        // log), and an election routed through it then times out, so the command is retried. The
+        // leader and end offset checked below are what prove the outcome.
+        let electionOutput
+        for (let attempt = 1; electionOutput === undefined; attempt++) {
+          arm.scope.throwIfAborted()
+          try {
+            electionOutput = triggerUncleanElection(topic).toString()
+          } catch (error) {
+            if (attempt === ELECTION_ATTEMPTS) throw error
+            await delay(arm.scope, 2000)
+          }
+        }
         arm.facts.electionOutput = electionOutput.trim()
         expect(electionOutput).toMatch(
           /(Successfully completed leader election|Valid replica already elected)/i
