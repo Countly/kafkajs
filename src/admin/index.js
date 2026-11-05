@@ -1850,9 +1850,9 @@ module.exports = ({
       throw new KafkaJSNonRetriableError(`Invalid groupIds array ${groupIds}`)
     }
 
-    const invalidGroupId = groupIds.some((g) => typeof g !== 'string')
+    const invalidGroupId = groupIds.find((g) => typeof g !== 'string')
 
-    if (invalidGroupId) {
+    if (groupIds.some((g) => typeof g !== 'string')) {
       throw new KafkaJSNonRetriableError(`Invalid groupId name: ${JSON.stringify(invalidGroupId)}`)
     }
 

@@ -196,6 +196,7 @@ Versions before 3.0.0 are internal alpha tags and are not published.
 
 #### Fixes
 
+- `admin.deleteGroups` names the group id it refuses (`Invalid groupId name: 1`); it printed `true`.
 - `KafkaJSNumberOfRetriesExceeded` names itself on the first line of its stack. It printed `KafkaJSNonRetriableError` there, its parent class, because the name was assigned after the stack was built (also in kafkajs 2.2.4).
 - A commit the broker refuses names the refused partition: the error carries `topic` and `partition`, as a refused Produce does.
 - `admin.deleteGroups` no longer sends a group again that a coordinator already answered. When one coordinator's request failed with a stale-coordinator error, 2.2.4 threw the other coordinators' answers away and resent every group, so a group it had deleted could come back as `GROUP_ID_NOT_FOUND`. Every coordinator request now settles before the retry, the retry sends only the groups no coordinator has answered, and each row is kept for the result.

@@ -18723,7 +18723,9 @@
         "src/producer/__tests__/transactionVersionLive.spec.js \u203a Producer > transaction protocol versions (live) transaction version 1 ten transactions in a row: version 2 adopts the epoch each EndTxn returns and restarts sequences at 0, version 1 keeps one epoch and carries the sequences on",
         "src/producer/__tests__/transactionVersionLive.spec.js \u203a Producer > transaction protocol versions (live) transaction version 2 a committed and an aborted transaction send the requests of the version, and a read_committed reader sees the committed records only",
         "src/producer/__tests__/transactionVersionLive.spec.js \u203a Producer > transaction protocol versions (live) transaction version 2 a transaction the coordinator aborted on its timeout: version 2 aborts and carries on, version 1 is fenced, and a commit of one is refused under both",
-        "src/producer/__tests__/transactionVersionLive.spec.js \u203a Producer > transaction protocol versions (live) transaction version 2 ten transactions in a row: version 2 adopts the epoch each EndTxn returns and restarts sequences at 0, version 1 keeps one epoch and carries the sequences on"
+        "src/producer/__tests__/transactionVersionLive.spec.js \u203a Producer > transaction protocol versions (live) transaction version 2 ten transactions in a row: version 2 adopts the epoch each EndTxn returns and restarts sequences at 0, version 1 keeps one epoch and carries the sequences on",
+        "src/producer/__tests__/txnOffsetCommitV6Live.spec.js \u203a Producer > TxnOffsetCommit v6 (live) a topic id the cache does not hold keeps the whole offset commit at v5, where the broker offers v6",
+        "src/producer/__tests__/txnOffsetCommitV6Live.spec.js \u203a Producer > TxnOffsetCommit v6 (live) commits offsets at the version the broker offers, only after the transaction commits, and an abort commits nothing"
       ]
     },
     {
@@ -19036,7 +19038,9 @@
         "src/producer/__tests__/rackAwareProducerLive.spec.js \u203a Producer > rack-aware partitioning (live) a producer with a rackId alone spreads keyless records over every partition",
         "src/producer/__tests__/rackAwareProducerLive.spec.js \u203a Producer > rack-aware partitioning (live) a producer with rackAware: false and a rackId spreads keyless records over every partition",
         "src/producer/__tests__/rackAwareProducerLive.spec.js \u203a Producer > rack-aware partitioning (live) explicit and keyed records of a rack-aware producer keep their partitions",
-        "src/producer/__tests__/rackAwareProducerLive.spec.js \u203a Producer > rack-aware partitioning (live) a custom partitioner keeps its choice of a partition led outside the rack of a rack-aware producer"
+        "src/producer/__tests__/rackAwareProducerLive.spec.js \u203a Producer > rack-aware partitioning (live) a custom partitioner keeps its choice of a partition led outside the rack of a rack-aware producer",
+        "src/producer/__tests__/txnOffsetCommitV6Live.spec.js \u203a Producer > TxnOffsetCommit v6 (live) commits offsets at the version the broker offers, only after the transaction commits, and an abort commits nothing",
+        "src/producer/__tests__/txnOffsetCommitV6Live.spec.js \u203a Producer > TxnOffsetCommit v6 (live) a topic id the cache does not hold keeps the whole offset commit at v5, where the broker offers v6"
       ]
     },
     {
@@ -21799,7 +21803,9 @@
         "src/network/__tests__/idleReapingLive.spec.js \u203a Idle reaping live idle producer reconnects and all three replay sets remain exact",
         "src/network/__tests__/idleReapingLive.spec.js \u203a Idle reaping live a live long poll is not reaped while its request is pending",
         "src/network/__tests__/connectionSetupLive.spec.js \u203a Connection setup live setup budgets grow on one node and ready resets the next attempt",
-        "src/network/__tests__/connectionSetupLive.spec.js \u203a Connection setup live an explicit setup timeout stays flat without a maximum"
+        "src/network/__tests__/connectionSetupLive.spec.js \u203a Connection setup live an explicit setup timeout stays flat without a maximum",
+        "src/producer/__tests__/txnOffsetCommitV6Live.spec.js \u203a Producer > TxnOffsetCommit v6 (live) commits offsets at the version the broker offers, only after the transaction commits, and an abort commits nothing",
+        "src/producer/__tests__/txnOffsetCommitV6Live.spec.js \u203a Producer > TxnOffsetCommit v6 (live) a topic id the cache does not hold keeps the whole offset commit at v5, where the broker offers v6"
       ]
     },
     {
@@ -22130,6 +22136,58 @@
         "src/broker/__tests__/apiVersionsIdentityLive.spec.js \u203a Broker > ApiVersions identity (live) a bootstrap broker is named no identity and a known node is named its cluster and node id",
         "src/broker/__tests__/apiVersionsIdentityLive.spec.js \u203a Broker > ApiVersions identity (live) a node that is another broker is refused with REBOOTSTRAP_REQUIRED on 4.4, recovered from once, and not noticed below it",
         "src/broker/__tests__/apiVersionsIdentityLive.spec.js \u203a Broker > ApiVersions identity (live) none names no identity, so a misrouted node is neither refused nor recovered from"
+      ],
+      "capMinutes": 30
+    },
+    {
+      "id": "e2e-txn-offset-commit-v6-kafka-4-4",
+      "kind": "cluster",
+      "compose": "docker-compose.yml",
+      "kafkaVersion": "4.4.0",
+      "env": {
+        "TXN_OFFSET_COMMIT_V6_E2E": "1"
+      },
+      "jest": [
+        "--forceExit",
+        "--testPathPatterns",
+        "src/producer/__tests__/txnOffsetCommitV6Live\\.spec\\.js"
+      ],
+      "jestScript": null,
+      "nodeTest": null,
+      "command": null,
+      "needs": {},
+      "evidence": [
+        "txn-offset-commit-v6"
+      ],
+      "titles": [
+        "src/producer/__tests__/txnOffsetCommitV6Live.spec.js \u203a Producer > TxnOffsetCommit v6 (live) commits offsets at the version the broker offers, only after the transaction commits, and an abort commits nothing",
+        "src/producer/__tests__/txnOffsetCommitV6Live.spec.js \u203a Producer > TxnOffsetCommit v6 (live) a topic id the cache does not hold keeps the whole offset commit at v5, where the broker offers v6"
+      ],
+      "capMinutes": 30
+    },
+    {
+      "id": "e2e-txn-offset-commit-v6-kafka-4-3",
+      "kind": "cluster",
+      "compose": "docker-compose.yml",
+      "kafkaVersion": "4.3.1",
+      "env": {
+        "TXN_OFFSET_COMMIT_V6_E2E": "1"
+      },
+      "jest": [
+        "--forceExit",
+        "--testPathPatterns",
+        "src/producer/__tests__/txnOffsetCommitV6Live\\.spec\\.js"
+      ],
+      "jestScript": null,
+      "nodeTest": null,
+      "command": null,
+      "needs": {},
+      "evidence": [
+        "txn-offset-commit-v6"
+      ],
+      "titles": [
+        "src/producer/__tests__/txnOffsetCommitV6Live.spec.js \u203a Producer > TxnOffsetCommit v6 (live) commits offsets at the version the broker offers, only after the transaction commits, and an abort commits nothing",
+        "src/producer/__tests__/txnOffsetCommitV6Live.spec.js \u203a Producer > TxnOffsetCommit v6 (live) a topic id the cache does not hold keeps the whole offset commit at v5, where the broker offers v6"
       ],
       "capMinutes": 30
     }

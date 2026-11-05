@@ -52,7 +52,7 @@ describe('admin argument validation', () => {
       'Empty topic partitions array',
     ],
     ['deleteGroups', [null], KafkaJSNonRetriableError, 'Invalid groupIds array null'],
-    ['deleteGroups', [[1]], KafkaJSNonRetriableError, 'Invalid groupId name'],
+    ['deleteGroups', [['ok', 1]], KafkaJSNonRetriableError, 'Invalid groupId name: 1'],
     ['createAcls', [{ acl: [] }], KafkaJSNonRetriableError, 'Empty ACL array'],
     ['deleteAcls', [{ filters: [] }], KafkaJSNonRetriableError, 'Empty ACL Filter array'],
     [
