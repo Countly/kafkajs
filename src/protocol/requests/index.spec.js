@@ -1,4 +1,4 @@
-const { KafkaJSServerDoesNotSupportApiKey } = require('../../errors')
+const { KafkaJSServerDoesNotSupportApiKey, KafkaJSNotImplemented } = require('../../errors')
 const apiKeys = require('./apiKeys')
 const { lookup, requests } = require('./index')
 
@@ -278,9 +278,15 @@ describe('released share protocol inventory', () => {
     '%s has sources, a name and a slot',
     (name, key, version, requestHash, responseHash) => {
       expect(apiKeys[name]).toBe(key)
-      expect(requests[name]).toBeDefined()
-      const implemented = requests[name].versions.map(Number)
+      const slot = requests[name]
+      const implemented = slot.versions.map(Number)
       expect(implemented).toEqual(implemented.length ? [version] : [])
+      if (implemented.length) {
+        expect(slot.protocol).toEqual(expect.any(Function))
+      } else {
+        expect(slot).toBe(requests.LeaderAndIsr)
+        expect(() => slot.protocol()).toThrow(KafkaJSNotImplemented)
+      }
       expect(tracked.find((row) => row.apiKey === key)).toMatchObject({
         kafkaName: name,
         apiKeysName: name,
@@ -338,12 +344,18 @@ describe('released share source domains', () => {
     ['DeleteShareGroupOffsets', 92, '0'],
   ]
 
+  const SHARE_NAMES = rows.map(([name]) => name)
+  const INTERNAL_KEYS = ['ApiKey83', 'ApiKey84', 'ApiKey85', 'ApiKey86', 'ApiKey87']
+
   /**
-   * The ranges each recorded line that offers the share APIs captured, by API name, and its
-   * broker-internal keys, which stay numbered.
-   * @type {Record<string, { named: Record<string, number[]>, internal: Record<string, number[]> }>}
+   * What each release recorded in `brokerRanges.json` must hold: the ranges it captured for the
+   * share APIs, by name, and for the broker-internal keys 83-87, which stay numbered. A release
+   * from before the share APIs existed is `{ absent: true }`: none of those names or keys may be
+   * recorded. Add an entry, from the capture itself, when a release is recorded.
+   * @type {Record<string, { absent: true } | { named: Record<string, number[]>, internal: Record<string, number[]> }>}
    */
   const captured = {
+    '4.0.2': { absent: true },
     '4.1.2': {
       named: {
         ShareGroupHeartbeat: [1, 1],
@@ -412,10 +424,26 @@ describe('released share source domains', () => {
     }
   })
 
-  test.each(Object.entries(captured))(
+  test.each([...new Set([...Object.keys(ranges), ...Object.keys(captured)])])(
     '%s records the share ranges by name and the internal ones by key',
-    (line, { named, internal }) => {
-      for (const [name, range] of Object.entries({ ...named, ...internal })) {
+    (line) => {
+      if (!Object.hasOwn(ranges, line)) {
+        throw new Error(
+          `${line} has a captured expectation but brokerRanges.json no longer records it`
+        )
+      }
+      if (!Object.hasOwn(captured, line)) {
+        throw new Error(
+          `brokerRanges.json records ${line}, which has no captured expectation: add its share ` +
+            'ranges and its ApiKey83-ApiKey87 ranges to `captured` from that capture'
+        )
+      }
+      const entry = captured[line]
+      const expected = entry.absent
+        ? Object.fromEntries([...SHARE_NAMES, ...INTERNAL_KEYS].map((name) => [name, undefined]))
+        : { ...entry.named, ...entry.internal }
+      expect(Object.keys(expected).sort()).toEqual([...SHARE_NAMES, ...INTERNAL_KEYS].sort())
+      for (const [name, range] of Object.entries(expected)) {
         expect(ranges[line][name]).toEqual(range)
       }
     }

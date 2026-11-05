@@ -266,9 +266,12 @@ Versions before 3.0.0 are internal alpha tags and are not published.
 
 - No existing public API, option default, event or runtime behaviour changes in this phase.
 
+#### Additions
+
 #### Tooling
 
 - Track the seven released share-group APIs (keys 76–79 and 90–92) in the Kafka 4.4.0 and 4.3.1 message snapshots and regenerate their protocol compatibility inventory. Source inventory alone does not add share-group support.
+- Add a Java share-consumer interoperability member and classpath probe.
 
 ### Phase 9B — Producer parity: delivery deadline, memory bound, request size, partitioner, codecs, lifecycle
 
