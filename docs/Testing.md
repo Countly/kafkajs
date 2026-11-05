@@ -193,6 +193,17 @@ Consumer measurements count delivered records, batch callbacks and actual handle
 
 `npm run test:floor` runs the core cases against the oldest supported broker line, `KAFKA_VERSION=4.0.2`: version negotiation against the ranges recorded in `scripts/protocol/brokerRanges.json`, admin, idempotent and transactional produce, the classic eager and cooperative groups and the consumer protocol, with every exclusion stated by capability in the spec's header.
 
+### Broker floor variants
+
+| Script | Compose fixture | Required capability proof |
+|---|---|---|
+| `test:floor` | base | Core, codecs, consumer and admin paths, connection budgets and exact unsupported-option diagnostics |
+| `test:floor:oauth` | OAuth validator | All helper forms, refresh and file rotation |
+| `test:floor:gssapi` | KDC | Initial authentication, observed ticket expiry, reconnect and re-authentication |
+| `test:floor:tokens` | Tokens enabled | Token lifecycle, plaintext refusal and secret-free diagnostics |
+
+Kafka 4.0.2 floor executions belong to CI. Local gates use Kafka 4.3.1 and Node 26; a local broker run supplies no floor result. Run every floor variant cold through the shared guard and reservation, with the actual broker version stamped and evidence verified before owned teardown. A missing or unbootable image blocks acceptance. The final candidate repeats the complete base and variant family; an earlier floor receipt does not certify a later candidate. A skipped suite supplies no acceptance.
+
 ### Skipped tests
 
 Some tests are intentionally skipped against certain broker versions or environments. The reasons are tracked in `QUARANTINE.md` at the repository root — check there before assuming a skip is accidental.
