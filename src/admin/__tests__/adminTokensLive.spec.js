@@ -141,12 +141,18 @@ suite('admin delegation tokens', () => {
           expect(BigInt(renewed.expiryTimestampMs)).toBeLessThanOrEqual(
             BigInt(created.maxTimestampMs)
           )
-          const afterRenewal = (
-            await probe.invoke(() => admin.describeDelegationToken({ owners: [created.owner] }))
-          ).filter(({ tokenId }) => tokenId === created.tokenId)
-          probe.credentials.push(...afterRenewal.map(({ hmac }) => hmac))
-          expect(afterRenewal).toHaveLength(1)
-          expect(BigInt(afterRenewal[0].expiryTimestampMs)).toBe(BigInt(renewed.expiryTimestampMs))
+          await probe.poll(async () => {
+            const tokens = await probe.invoke(() =>
+              admin.describeDelegationToken({ owners: [created.owner] })
+            )
+            probe.credentials.push(...tokens.map(({ hmac }) => hmac))
+            const matching = tokens.filter(({ tokenId }) => tokenId === created.tokenId)
+            expect(matching.length).toBeLessThanOrEqual(1)
+            return (
+              matching.length === 1 &&
+              BigInt(matching[0].expiryTimestampMs) === BigInt(renewed.expiryTimestampMs)
+            )
+          })
           await probe.invoke(() =>
             admin.expireDelegationToken({ hmac: created.hmac, expiryTimePeriodMs: '0' })
           )

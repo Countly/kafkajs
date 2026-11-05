@@ -6,7 +6,7 @@ const Broker = require('../../broker')
 const Pool = require('../../network/connectionPool')
 const { saslBrokers, saslConnectionOpts } = require('testHelpers')
 const { readData } = require('../../producer/__tests__/fixtures/liveProbe')
-const { liveCase, caseTimeout } = require('../../producer/__tests__/fixtures/bounded')
+const { liveCase, caseTimeout, pollUntil } = require('../../producer/__tests__/fixtures/bounded')
 
 const suite = process.env.ADMIN_LEDGER_E2E ? describe : describe.skip
 const budget = 540000
@@ -580,6 +580,46 @@ class AdminLedgerScenario {
   }
 
   /**
+   * Reads the finalized feature levels from each broker's own metadata.
+   * @param {number[]} nodeIds brokers to ask
+   * @returns {Promise<object[]>} finalized levels by feature name, one entry per broker in order
+   * @throws {Error} broker failure or budget exhaustion
+   */
+  async finalizedLevels(nodeIds) {
+    const p = this.probe
+    const levels = []
+    for (const brokerId of nodeIds)
+      levels.push(
+        (await p.invoke(() => this.admin.describeFeatures({ brokerId }))).finalizedFeatures
+      )
+    return levels
+  }
+
+  /**
+   * Creates a topic and waits until every broker's own metadata holds it. A broker that has the
+   * topic has applied every metadata record committed before this call, so a later read from it
+   * cannot be stale about an earlier change.
+   * @param {{host: string, port: number}[]} brokers brokers that must have caught up
+   * @returns {Promise<void>}
+   * @throws {Error} broker failure or budget exhaustion before every broker has the topic
+   */
+  async metadataBarrier(brokers) {
+    const p = this.probe
+    const topic = await p.topic({ name: 'barrier' })
+    const sources = []
+    for (const { host, port } of brokers) sources.push(await this.raw(host, port))
+    await p.poll(async () => {
+      for (const source of sources) {
+        const { topicMetadata } = await p.invoke(() =>
+          source.metadata([topic], { allowAutoTopicCreation: false, lenient: true })
+        )
+        if (topicMetadata[0]?.topicErrorCode !== 0) return false
+      }
+      return true
+    })
+  }
+
+  /**
    * Restores a fenced node, validates features and removes a real metrics subscription.
    * @returns {Promise<void>}
    * @throws {Error} broker health, election, feature or resource mismatch
@@ -631,14 +671,18 @@ class AdminLedgerScenario {
       .sort(([a], [b]) => a.localeCompare(b))[0]
     if (!lowered) throw new Error('No finalized feature has a lower supported level')
     const [name, { maxVersionLevel: original }] = lowered
-    p.effects.add('restore validated feature level', async () => {
-      const current = (await admin.describeFeatures()).finalizedFeatures[name]
-      if (current?.maxVersionLevel !== original)
-        p.items(
-          await admin.updateFeatures({
-            features: [{ name, maxVersionLevel: original, upgradeType: 'upgrade' }],
-          })
+    const nodeIds = before.brokers.map(({ nodeId }) => nodeId)
+    p.effects.add('restore validated feature level', async (signal) => {
+      p.items(
+        await admin.updateFeatures({
+          features: [{ name, maxVersionLevel: original, upgradeType: 'upgrade' }],
+        })
+      )
+      await pollUntil(signal, p.remaining(), async () =>
+        (await this.finalizedLevels(nodeIds)).every(
+          (levels) => levels[name]?.maxVersionLevel === original
         )
+      )
     })
     const updated = await p.invoke(() =>
       admin.updateFeatures({
@@ -648,8 +692,10 @@ class AdminLedgerScenario {
     )
     p.items(updated)
     expect(updated.map(({ feature }) => feature)).toEqual([name])
-    const featuresAfterValidation = await p.invoke(() => admin.describeFeatures())
-    expect(featuresAfterValidation).toEqual(featuresBeforeValidation)
+    await this.metadataBarrier(before.brokers)
+    expect(await this.finalizedLevels(nodeIds)).toEqual(
+      nodeIds.map(() => featuresBeforeValidation.finalizedFeatures)
+    )
     const resourceName = `e2e-metrics-${this.id}`
     const entries = [
       { name: 'interval.ms', value: '1000' },
