@@ -277,7 +277,8 @@ class StandaloneKdc {
             45000
           )
             .split('\n')
-            .filter(Boolean)
+            // The tool's own client may log to stdout; the record count below still has to match.
+            .filter((line) => line.startsWith('Offset:'))
     const log = lines.map((line) => {
       const match = /^Offset:(\d+)\s(.*)$/.exec(line)
       if (!match) throw new Error('Unreadable console-consumer line')

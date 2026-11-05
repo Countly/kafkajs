@@ -182,6 +182,22 @@ describe('standalone KDC fixture', () => {
       })
     })
 
+    test('reads the records among log lines the tool prints to stdout', () => {
+      const { controller } = make({
+        lifetimeMs: HOUR,
+        issuedAt: START,
+        outputs: {
+          'kafka-consumer-groups.sh': groups,
+          'kafka-console-consumer.sh':
+            '[2026-11-05 17:00:00,000] DEBUG Connection with kafka1 (Selector)\nOffset:0\trecord-0\nOffset:1\trecord-1\n',
+        },
+      })
+      expect(controller.control('gssapi-log', ['t', 'g']).log).toEqual([
+        { offset: '0', value: 'record-0' },
+        { offset: '1', value: 'record-1' },
+      ])
+    })
+
     test('refuses a read that returns fewer records than the log end', () => {
       const { controller } = make({
         lifetimeMs: HOUR,
