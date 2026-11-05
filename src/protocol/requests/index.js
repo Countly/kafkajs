@@ -18,8 +18,13 @@ const { KafkaJSServerDoesNotSupportApiKey, KafkaJSNotImplemented } = require('..
 /** @type {RequestDefinitions} */
 const noImplementedRequestDefinitions = {
   versions: [],
+  /**
+   * Rejects protocol construction for every unimplemented request.
+   * @returns {never}
+   * @throws {KafkaJSNotImplemented} Always, with a diagnostic message.
+   */
   protocol: () => {
-    throw new KafkaJSNotImplemented()
+    throw new KafkaJSNotImplemented('The requested API is not implemented')
   },
 }
 

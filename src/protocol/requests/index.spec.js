@@ -18,6 +18,13 @@ describe('Protocol > Requests', () => {
         })
       })
     })
+
+    test('an unimplemented request throws KafkaJSNotImplemented with a non-empty message', () => {
+      const { protocol } = requests.LeaderAndIsr
+
+      expect(protocol).toThrow(KafkaJSNotImplemented)
+      expect(protocol).toThrow(/\S/)
+    })
   })
   // The version factories of the two consumer-group APIs destructured their options
   // object with no default, so a shape probe - reading an api key, name and version without

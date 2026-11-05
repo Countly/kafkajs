@@ -268,6 +268,10 @@ Versions before 3.0.0 are internal alpha tags and are not published.
 
 #### Additions
 
+#### Fixes
+
+- Unimplemented request slots throw `KafkaJSNotImplemented` with a diagnostic message instead of a `TypeError`.
+
 #### Tooling
 
 - Track the seven released share-group APIs (keys 76–79 and 90–92) in the Kafka 4.4.0 and 4.3.1 message snapshots and regenerate their protocol compatibility inventory. Source inventory alone does not add share-group support.
