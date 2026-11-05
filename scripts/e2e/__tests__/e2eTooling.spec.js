@@ -599,4 +599,196 @@ describe('E2E tooling', () => {
       expect(() => readBrokerVersion()).toThrow('no such service: kafka1')
     })
   })
+
+  describe('Java member launcher', () => {
+    let directory
+    let cache
+    let bin
+    const launcher = path.join(__dirname, '..', 'javaConsumer', 'run.sh')
+
+    beforeEach(() => {
+      directory = fs.mkdtempSync(path.join(os.tmpdir(), 'java-launcher-'))
+      cache = path.join(directory, 'cache')
+      bin = path.join(directory, 'bin')
+      fs.mkdirSync(cache)
+      fs.mkdirSync(bin)
+      for (const name of ['kafka-clients-4.3.1.jar', 'slf4j-api-1.7.36.jar']) {
+        fs.writeFileSync(path.join(cache, name), '')
+      }
+      const tool = `#!/usr/bin/env node
+const fs = require('fs')
+const path = require('path')
+const command = path.basename(process.argv[1])
+const args = process.argv.slice(2)
+fs.appendFileSync(process.env.JAVA_TOOL_LOG, JSON.stringify({ command, args }) + '\\n')
+if (command === 'curl') process.exit(91)
+if (command === 'java' && process.env.JAVA_TOOL_FAILURE) {
+  process.stderr.write('NoClassDefFoundError: missing class\\n')
+  process.exit(23)
+}
+if (command === 'java') process.stdout.write(JSON.stringify({ args }) + '\\n')
+`
+      for (const name of ['java', 'javac', 'curl']) {
+        fs.writeFileSync(path.join(bin, name), tool, { mode: 0o755 })
+      }
+    })
+
+    afterEach(() => fs.rmSync(directory, { recursive: true, force: true }))
+
+    /**
+     * Executes the real shell launcher with cached jars and recording tool doubles. The launcher's
+     * offline switch and extra classpath, and the doubles' failure switch, are reset so an
+     * inherited value cannot change the result.
+     * @param {string[]} args arguments passed unchanged to the selected Java member
+     * @param {object} overrides environment additions; a key set to undefined is removed from the
+     *   child environment
+     * @returns {{status: number|null, stdout: string, stderr: string, calls: object[]}}
+     */
+    const launch = (args, overrides = {}) => {
+      const log = path.join(directory, 'tools.jsonl')
+      const run = spawnSync('timeout', ['600', 'bash', launcher, ...args], {
+        env: {
+          ...process.env,
+          PATH: `${bin}${path.delimiter}${process.env.PATH}`,
+          JAVA_E2E_WORK_DIR: cache,
+          JAVA_E2E_OFFLINE: '0',
+          JAVA_CODEC_CLASSPATH: '',
+          JAVA_TOOL_FAILURE: '',
+          JAVA_TOOL_LOG: log,
+          KAFKA_CLIENTS_VERSION: '4.3.1',
+          SLF4J_VERSION: '1.7.36',
+          ...overrides,
+        },
+        encoding: 'utf8',
+      })
+      const calls = fs.existsSync(log)
+        ? fs.readFileSync(log, 'utf8').trim().split('\n').map(JSON.parse)
+        : []
+      return { status: run.status, stdout: run.stdout, stderr: run.stderr, calls }
+    }
+
+    test.each([
+      ['group probe', ['--probe'], 'JavaGroupMember'],
+      [
+        'consumer protocol',
+        ['--group-protocol', 'consumer', 'host', 'group', 'topic', 'uniform', '100'],
+        'JavaGroupMember',
+      ],
+      [
+        'transactional producer',
+        ['--role', 'transactional-producer', '--probe'],
+        'JavaTransactionalMember',
+      ],
+      [
+        'committed reader',
+        ['--role', 'read-committed-consumer', '--probe'],
+        'JavaTransactionalMember',
+      ],
+      ['unknown legacy role', ['--role', 'unknown', '--probe'], 'JavaTransactionalMember'],
+      [
+        'near-match share role',
+        ['--role', 'share-member-extra', '--probe'],
+        'JavaTransactionalMember',
+      ],
+      ['share probe', ['--role', 'share-member', '--probe'], 'JavaShareMember'],
+      [
+        'share halt',
+        ['--role', 'share-member', '--halt-after', '2', 'host', 'group', 'topic', '100'],
+        'JavaShareMember',
+      ],
+    ])('routes %s with its arguments intact', (_name, args, member) => {
+      const run = launch(args)
+      expect(run.status).toBe(0)
+      expect(JSON.parse(run.stdout).args).toEqual([
+        '-cp',
+        [
+          path.join(cache, 'kafka-clients-4.3.1.jar'),
+          path.join(cache, 'slf4j-api-1.7.36.jar'),
+          cache,
+        ].join(path.delimiter),
+        member,
+        ...args,
+      ])
+      expect(run.calls.map(({ command }) => command)).toEqual(['javac', 'java'])
+    })
+
+    test('compiles all three members against the inherited two-jar classpath', () => {
+      const run = launch(['--role', 'share-member', '--probe'])
+      const source = path.dirname(launcher)
+      expect(run.status).toBe(0)
+      expect(run.calls[0].args).toEqual([
+        '-cp',
+        [
+          path.join(cache, 'kafka-clients-4.3.1.jar'),
+          path.join(cache, 'slf4j-api-1.7.36.jar'),
+        ].join(path.delimiter),
+        '-d',
+        cache,
+        ...['JavaGroupMember.java', 'JavaTransactionalMember.java', 'JavaShareMember.java'].map(
+          (name) => path.join(source, name)
+        ),
+      ])
+    })
+
+    test('keeps both jar-version overrides and leaves the caller-owned cache untouched', () => {
+      const planted = {
+        'kafka-clients-custom.jar': 'cached clients bytes',
+        'slf4j-api-custom.jar': 'cached slf4j bytes',
+        'caller-sentinel.txt': 'owned by the caller',
+      }
+      for (const [name, content] of Object.entries(planted)) {
+        fs.writeFileSync(path.join(cache, name), content)
+      }
+      const run = launch(['--probe'], { KAFKA_CLIENTS_VERSION: 'custom', SLF4J_VERSION: 'custom' })
+      expect(run.status).toBe(0)
+      expect(JSON.parse(run.stdout).args[1]).toBe(
+        [
+          path.join(cache, 'kafka-clients-custom.jar'),
+          path.join(cache, 'slf4j-api-custom.jar'),
+          cache,
+        ].join(path.delimiter)
+      )
+      for (const [name, content] of Object.entries(planted)) {
+        expect(fs.readFileSync(path.join(cache, name), 'utf8')).toBe(content)
+      }
+      expect(run.calls.map(({ command }) => command)).toEqual(['javac', 'java'])
+    })
+
+    test('falls back to the default jar versions when neither override is set', () => {
+      const run = launch(['--probe'], {
+        KAFKA_CLIENTS_VERSION: undefined,
+        SLF4J_VERSION: undefined,
+      })
+      const classpath = [
+        path.join(cache, 'kafka-clients-4.3.1.jar'),
+        path.join(cache, 'slf4j-api-1.7.36.jar'),
+      ].join(path.delimiter)
+      expect(run.status).toBe(0)
+      expect(run.calls.map(({ command }) => command)).toEqual(['javac', 'java'])
+      expect(run.calls[0].args[1]).toBe(classpath)
+      expect(run.calls[1].args[1]).toBe([classpath, cache].join(path.delimiter))
+    })
+
+    test('places the extra codec classpath after the jars in both the javac and java classpaths', () => {
+      const codec = [path.join(directory, 'codec-one.jar'), path.join(directory, 'codec-two.jar')]
+      const run = launch(['--probe'], { JAVA_CODEC_CLASSPATH: codec.join(path.delimiter) })
+      const compiled = [
+        path.join(cache, 'kafka-clients-4.3.1.jar'),
+        path.join(cache, 'slf4j-api-1.7.36.jar'),
+        ...codec,
+      ].join(path.delimiter)
+      expect(run.status).toBe(0)
+      expect(run.calls.map(({ command }) => command)).toEqual(['javac', 'java'])
+      expect(run.calls[0].args[1]).toBe(compiled)
+      expect(run.calls[1].args[1]).toBe([compiled, cache].join(path.delimiter))
+    })
+
+    test('propagates a selected member classpath failure', () => {
+      const run = launch(['--role', 'share-member', '--probe'], { JAVA_TOOL_FAILURE: '1' })
+      expect(run.status).toBe(23)
+      expect(run.stdout).toBe('')
+      expect(run.stderr).toContain('NoClassDefFoundError: missing class')
+      expect(run.calls.at(-1).args[2]).toBe('JavaShareMember')
+    })
+  })
 })

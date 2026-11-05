@@ -133,6 +133,15 @@ Transactional topic IDs: `KAFKA_VERSION=4.4.0 npm run test:e2e:txn-offset-commit
 
 Broker identity: `KAFKA_VERSION=4.4.0 npm run test:e2e:api-identity`; repeat with 4.3.1 for the old-version control. The scenario reads the ApiVersions requests off the wire: a bootstrap broker is named no identity and a known node is named its cluster id and node id. The misroute arm sends a node's connection to another broker: a 4.4 broker answers `REBOOTSTRAP_REQUIRED`, the client recovers once and the next public operation succeeds, while a broker below 4.4 completes the negotiation at v4 and does not notice. This command uses the sole cluster guard and requires observed-version evidence.
 
+The development-only Java share member uses the existing Java launcher and its cached Maven
+jars. Run `timeout 600 scripts/e2e/javaConsumer/run.sh --role share-member --probe` to compile
+and eagerly load its share classes without contacting a broker. The role uses explicit ACCEPT
+decisions and reports exact decimal-string offsets with optional delivery counts. Its
+`--halt-after N` arm halts after flushing the Nth record, before acknowledging it or committing
+that poll, with no close or shutdown hook. See the [Java member instructions](../scripts/e2e/javaConsumer/README.md)
+for the argument, output and exit contracts. Broker-free launcher tests use tool doubles;
+Java compilation and a successful probe are prerequisites, and do not certify interoperability.
+
 ### Scenario lanes
 
 A scenario that holds with no fault injected runs on two lanes from one file: `describe.each(lanes())` from `testHelpers` gives it `fake` (the unit lane, in process) or `docker` (under `npm run test:kafka`, which exports `KAFKAJS_LANE=docker`), and `KAFKAJS_SCENARIO_LANES=fake,docker` asks for both. A scenario that injects a fault (a held answer, a dropped frame) runs on the fake lane unless the fault can be injected on a live cluster too.
