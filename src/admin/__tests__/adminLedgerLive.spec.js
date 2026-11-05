@@ -1349,12 +1349,13 @@ class AdminLedgerScenario {
       },
       {
         name: 'groups',
-        item: (rows) => rows.groups[0],
+        positiveItem: (rows) => rows.groups[0],
         resourceType: 3,
         resourceName: groupId,
         operation: 8,
         code: 30,
         call: () => client.describeGroups([groupId], { includeAuthorizedOperations: true }),
+        deniedLookup: () => maskRaw.findGroupCoordinator({ groupId, coordinatorType: 0 }),
       },
       {
         name: 'offset deletion',
@@ -1381,6 +1382,7 @@ class AdminLedgerScenario {
         code: 53,
         call: () => client.describeTransactions({ transactionalIds: [txId] }),
         item: (rows) => rows[0],
+        deniedLookup: () => maskRaw.findGroupCoordinator({ groupId: txId, coordinatorType: 1 }),
       },
       {
         name: 'transaction abort',
@@ -1625,7 +1627,31 @@ class AdminLedgerScenario {
       expect(await p.invoke(() => root.createAcls({ acl: [{ ...acl, permissionType: 2 }] }))).toBe(
         true
       )
-      if (check.item) {
+      if (check.deniedLookup) {
+        // DESCRIBE also guards the coordinator lookup. The broker refuses it with the check's code,
+        // and the client surfaces a refused lookup as KafkaJSGroupCoordinatorNotFound, as kafkajs
+        // 2.2.4 did. Both are polled: the deny reaches each broker's authorizer asynchronously.
+        let refused
+        await p.poll(async () => {
+          refused = await p.invoke(check.deniedLookup).then(
+            () => null,
+            (error) => error
+          )
+          return refused !== null
+        })
+        expect(refused).toMatchObject({ code: check.code, name: 'KafkaJSProtocolError' })
+        let surfaced
+        await p.poll(async () => {
+          surfaced = await p.invoke(check.call).then(
+            (rows) => (check.item ? check.item(rows) : null),
+            (error) => ({ errorCode: -1, error })
+          )
+          return surfaced !== null && surfaced.errorCode !== 0
+        })
+        expect(surfaced.errorCode).toBe(-1)
+        expect(surfaced.error).toMatchObject({ name: 'KafkaJSGroupCoordinatorNotFound' })
+        observedTypes.push(refused.type)
+      } else if (check.item) {
         const failed = check.item(await p.invoke(check.call))
         expect(failed.errorCode).toBe(check.code)
         if (check.legacyItem) {
