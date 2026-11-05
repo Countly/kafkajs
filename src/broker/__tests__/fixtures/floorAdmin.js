@@ -1190,7 +1190,9 @@ class FloorAdminCases {
     this.expectNegotiated('UpdateFeatures', facts.UpdateFeatures.selected)
     const featuresAfterValidation = await p.invoke(() => admin.describeFeatures())
     expect(levelOf(featuresAfterValidation)).toBe(change.level)
-    expect(featuresAfterValidation).toEqual(featuresBeforeValidation)
+    // KRaft reports the metadata log offset as the epoch, so any metadata write moves it.
+    const withoutEpoch = ({ finalizedFeaturesEpoch, ...features }) => features
+    expect(withoutEpoch(featuresAfterValidation)).toEqual(withoutEpoch(featuresBeforeValidation))
 
     const type = ConfigResourceTypes.CLIENT_METRICS
     const createdResourceName = `e2e-floor-metrics-${this.id}`
