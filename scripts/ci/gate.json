@@ -21219,7 +21219,7 @@
       ]
     },
     {
-      "id": "e2e-delete-groups-v3-4.4.0",
+      "id": "e2e-delete-groups-v3-kafka-4-4",
       "kind": "cluster",
       "compose": "docker-compose.yml",
       "kafkaVersion": "4.4.0",
@@ -21245,7 +21245,7 @@
       "capMinutes": 30
     },
     {
-      "id": "e2e-delete-groups-v3-4.3.1",
+      "id": "e2e-delete-groups-v3-kafka-4-3",
       "kind": "cluster",
       "compose": "docker-compose.yml",
       "kafkaVersion": "4.3.1",
