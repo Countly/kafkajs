@@ -702,9 +702,10 @@ class TruncationArm {
  * batch exists only on its frozen log, but its container keeps its name in Docker's DNS. A stopped
  * container loses the name, and a restarted kafka3 that cannot resolve a quorum peer's name has
  * failed to register with the quorum and shut itself down. The controller fences the paused broker
- * after `broker.session.timeout.ms` (default 9 s); with `unclean.leader.election.enable` set on
- * the topic it then elects kafka3 as soon as kafka3 is active, which is why the explicit election
- * below may find the work already done.
+ * after `broker.session.timeout.ms` (default 9 s), and the case waits for that fence before it
+ * elects; with `unclean.leader.election.enable` set on the topic the controller then elects kafka3
+ * as soon as kafka3 is active, which is why the explicit election below may find the work already
+ * done.
  * @see https://kafka.apache.org/43/configuration/broker-configs/#brokerconfigs_broker.session.timeout.ms
  */
 describeLogTruncation('Consumer > unclean leader election (live)', () => {
@@ -782,6 +783,17 @@ describeLogTruncation('Consumer > unclean leader election (live)', () => {
           return true
         })
         phase('kafka2 paused, kafka3 back and reachable')
+
+        // Until the controller fences it, the paused node is still an alive broker, and the
+        // election tool can send its request there and time out.
+        arm.at('wait for the controller to fence kafka2')
+        await arm.waitTolerating('The fence of broker 2', METADATA_BUDGET, async () => {
+          const { brokers } = await arm.step('The cluster description', () =>
+            arm.admin.describeCluster({ includeFencedBrokers: true })
+          )
+          return brokers.some(({ nodeId, fenced }) => nodeId === 2 && fenced)
+        })
+        phase('kafka2 fenced')
 
         // `kafka-leader-election.sh` exits 0 in more than one situation, so the exit status alone
         // proves nothing - the printed outcome is what says which one happened. Two of them are
