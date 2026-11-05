@@ -14,6 +14,7 @@ const { Schedule } = require('../schedule')
 const metadataV13 = require('../wire/metadataV13')
 const { metadataV13: literal } = require('../wire/expected')
 const apiVersionsV4 = require('../wire/apiVersionsV4')
+const apiVersionsV5 = require('../wire/apiVersionsV5')
 const {
   prepareRecordBatches,
   TOPIC,
@@ -743,6 +744,12 @@ describe('ScriptedCluster', () => {
         .writeInt32(nodeId)
         .writeTaggedFields().buffer
 
+    /** The body of an ApiVersions v4 request: software and no tags. */
+    const v4Body = new Encoder()
+      .writeUVarIntString('raw')
+      .writeUVarIntString('1')
+      .writeTaggedFields().buffer
+
     /** What a broker that offers ApiVersions up to v4 answers a v5 request, framed for correlation id 1. */
     const UNSUPPORTED_FRAME =
       '00000010' + // size: the correlation id and the 12 bytes of the body
@@ -772,12 +779,100 @@ describe('ScriptedCluster', () => {
 
       const { frames } = await exchange(cluster, frameOf(apiKeys.ApiVersions, 5, v5Body(null, -1)))
 
-      expect(frames).toHaveLength(1)
+      // One frame: the size, correlation id 1 and no header tags (the ApiVersions response header
+      // is v0), then the profile's table as a v5 answer, with the range it advertises for ApiVersions.
+      const body = apiVersionsV5.buildResponse(cluster.apiVersionsAnswer())
+      expect(frames.map((frame) => frame.toString('hex'))).toEqual([
+        sized(Buffer.concat([Buffer.from('00000001', 'hex'), body])).toString('hex'),
+      ])
+      expect(body.toString('hex')).toContain('0012' + '0005' + '0005' + '00')
       expect(cluster.requests()).toMatchObject([
         { api: 'ApiVersions', version: 5, fields: { clusterId: null, nodeId: -1 } },
       ])
       expect(cluster.requests()[0]).not.toHaveProperty('discovery')
       expect(cluster.apiVersionTrace()).toEqual(cluster.requests())
+      cluster.assertClean()
+    })
+
+    test('lists a second negotiation on a connection that has not changed and refuses it as a v4 broker does', async () => {
+      const cluster = createScriptedCluster({ nodes: NODES })
+      const { socket, frames } = dial(cluster)
+
+      for (const [version, body] of [
+        [5, v5Body('c', 2)],
+        [4, v4Body],
+        [5, v5Body('c', 2)],
+      ]) {
+        socket.write(frameOf(apiKeys.ApiVersions, version, body))
+        await settle()
+      }
+
+      expect(
+        cluster.apiVersionTrace().map(({ version, discovery }) => [version, discovery === true])
+      ).toEqual([
+        [5, true],
+        [4, false],
+        [5, false],
+      ])
+      expect(cluster.requests().map(({ version }) => version)).toEqual([4, 5])
+      expect(frames).toHaveLength(3)
+      expect(frames[2].toString('hex')).toBe(UNSUPPORTED_FRAME)
+      expect(cluster.timeline().map(({ kind, version }) => [kind, version])).toEqual([
+        ['request', 4],
+        ['response', 4],
+        ['request', 5],
+        ['response', 5],
+      ])
+      cluster.assertClean()
+    })
+
+    test('keeps one renegotiation per socket opened to the node out of requests(), and lists the next', async () => {
+      const cluster = createScriptedCluster({ nodes: NODES })
+      const { socket } = dial(cluster)
+      const negotiate = async () => {
+        for (const [version, body] of [
+          [5, v5Body('c', 2)],
+          [4, v4Body],
+        ]) {
+          socket.write(frameOf(apiKeys.ApiVersions, version, body))
+          await settle()
+        }
+      }
+
+      await negotiate()
+      dial(cluster)
+      await negotiate()
+      await negotiate()
+
+      expect(
+        cluster.apiVersionTrace().map(({ version, discovery }) => [version, discovery === true])
+      ).toEqual([
+        [5, true],
+        [4, false],
+        [5, true],
+        [4, false],
+        [5, false],
+        [4, false],
+      ])
+      expect(cluster.requests().map(({ version }) => version)).toEqual([4, 4, 5, 4])
+      cluster.assertClean()
+    })
+
+    test('lists a v5 request that follows an application request', async () => {
+      const cluster = createScriptedCluster({ nodes: NODES })
+      const { socket } = dial(cluster)
+
+      socket.write(frameOf(apiKeys.Metadata, 13, METADATA_REQUEST))
+      await settle()
+      socket.write(frameOf(apiKeys.ApiVersions, 5, v5Body('c', 2)))
+      await settle()
+
+      expect(cluster.requests().map(({ api, version }) => [api, version])).toEqual([
+        ['Metadata', 13],
+        ['ApiVersions', 5],
+      ])
+      expect(cluster.apiVersionTrace()).toHaveLength(1)
+      expect(cluster.apiVersionTrace()[0]).not.toHaveProperty('discovery')
       cluster.assertClean()
     })
 

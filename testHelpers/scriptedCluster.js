@@ -127,6 +127,7 @@ const TRANSACTION_V2_FEATURES = [
  * @property {object|null} fields what the wire pair read from it; null when it could not be read
  * @property {number} order where it was written among the requests, answers and marks of the cluster
  * @property {number} [answeredOrder] where its answer was written, once it was
+ * @property {true} [discovery] set on the refused ApiVersions request `requests()` leaves out
  */
 
 /**
@@ -232,13 +233,17 @@ const targetOf = (fields) => {
  * A cluster that exists only as sockets: the real client connects to it through its public
  * `socketFactory` option, and every request it writes is answered in process.
  *
- * ApiVersions discovery: the client's first ApiVersions request is at the highest version it
- * implements. When the profile offers a lower one, that request is read by the pair of the
- * client's version and answered at once with the v0-shaped UNSUPPORTED_VERSION body of a broker
- * that offers ApiVersions up to the profile's version; the client then asks again at that version,
- * and that request is the one logged, scheduled and answered as any other. The discovery request is
- * in `apiVersionTrace()` only, so `requests()`, `timeline()` and the schedule see one ApiVersions
- * request per negotiation, as they do for a broker that offers the client's version.
+ * ApiVersions discovery: the client's ApiVersions request is at the highest version it implements.
+ * When the profile offers a lower one, that request is read by the pair of the client's version
+ * and answered at once with the v0-shaped UNSUPPORTED_VERSION body of a broker that offers
+ * ApiVersions up to the profile's version; the client then asks again at that version, and that
+ * request is the one logged, scheduled and answered as any other. `requests()`, `timeline()` and
+ * the schedule leave out one such refusal per negotiation, so they see one ApiVersions request per
+ * negotiation, as they do for a broker that offers the client's version: the first request of a
+ * socket, and the one that negotiates it again after the client opened another socket to the node,
+ * which is what it does when its pool's generation changes. Any other, a second negotiation on a
+ * connection that has not changed, is answered the same way but `requests()` and `timeline()` list
+ * it. Neither kind is scheduled, and `apiVersionTrace()` lists both.
  *
  * It owns the node endpoints, the ApiVersions table of its profile, routing of each request through
  * a `Schedule` (so a test can hold, answer or fail any of them), and the log of requests. It owns
@@ -274,6 +279,8 @@ class ScriptedCluster {
     this.profile = profile
     this.fake = createFakeSocketFactory()
     this.log = []
+    /** @type {Map<string, number>} sockets opened to a node when the socket last negotiated, by socket */
+    this.negotiatedAt = new Map()
     this.marks = []
     this.clock = 0
     this.errors = []
@@ -376,8 +383,8 @@ class ScriptedCluster {
   }
 
   /**
-   * @returns {RequestRecord[]} every request the client wrote, oldest first, without the
-   *   ApiVersions discovery requests (see `apiVersionTrace`)
+   * @returns {RequestRecord[]} every request the client wrote, oldest first, without the one
+   *   ApiVersions discovery request each negotiation is kept apart from (see `apiVersionTrace`)
    */
   requests() {
     return this.log.filter(({ discovery }) => !discovery)
@@ -386,7 +393,8 @@ class ScriptedCluster {
   /**
    * @returns {RequestRecord[]} every ApiVersions request the client wrote, oldest first, the
    *   discovery requests a lower-versioned profile refused with UNSUPPORTED_VERSION included:
-   *   `[5, 4]` per negotiation against a profile that offers v4, `[5]` against one that offers v5
+   *   `[5, 4]` per negotiation against a profile that offers v4, `[5]` against one that offers v5.
+   *   A refusal `requests()` does not list is marked `discovery: true`.
    */
   apiVersionTrace() {
     return this.log.filter(({ apiKey }) => apiKey === apiKeys.ApiVersions)
@@ -513,9 +521,7 @@ class ScriptedCluster {
       return this.fake.factory({ host, port, onConnect: () => {} })
 
     const socket = this.fake.factory({ host, port, onConnect })
-    const generation = this.fake.state.sockets.filter(
-      (other) => other.endpoint.host === host && other.endpoint.port === port
-    ).length
+    const generation = this.socketsOpenedTo(node)
     const write = socket.write
     socket.write = (buffer, ...rest) => {
       const result = write(buffer, ...rest)
@@ -527,19 +533,33 @@ class ScriptedCluster {
   }
 
   /**
+   * @private
+   * @param {{ host: string, port: number }} node
+   * @returns {number} how many sockets the client has opened to the node, refused dials included;
+   *   the last one's number is its `generation`
+   */
+  socketsOpenedTo({ host, port }) {
+    return this.fake.state.sockets.filter(
+      (other) => other.endpoint.host === host && other.endpoint.port === port
+    ).length
+  }
+
+  /**
    * Reads one request frame and logs it, before the request is answered or refused.
    * @private
-   * @param {{ id: number }} node the node the frame was written to
+   * @param {{ id: number, host: string, port: number }} node the node the frame was written to
    * @param {number} generation which connection of the node it came in on, counting from 1
    * @param {Buffer} frame one request, size prefix included
-   * @returns {{ record: RequestRecord, pair: WirePair }}
+   * @returns {{ record: RequestRecord, pair: WirePair, refused: boolean }} `refused` when a broker
+   *   of the profile answers it with UNSUPPORTED_VERSION
    * @throws {Error} when the frame is not one whole request the cluster advertises and has a pair
    *   for; a request whose header was read is logged with `fields: null` first
    */
   accept(node, generation, frame) {
     const header = headerOf(frame)
     const api = apiNameOf(header.apiKey)
-    const discovery = this.isDiscovery(header)
+    const refused = this.isRefusedApiVersions(header)
+    const discovery = refused && this.opensNegotiation(node, generation)
     const record = {
       node: node.id,
       api,
@@ -553,7 +573,7 @@ class ScriptedCluster {
     }
     this.log.push(record)
 
-    const pair = discovery ? pairOf(api, header.apiVersion) : this.pairFor(api, header.apiVersion)
+    const pair = refused ? pairOf(api, header.apiVersion) : this.pairFor(api, header.apiVersion)
     if (!pair) {
       throw new Error(`ScriptedCluster: no response builder for ${api} v${header.apiVersion}`)
     }
@@ -561,16 +581,16 @@ class ScriptedCluster {
     record.fields = reading(`the ${api} v${header.apiVersion} request`, () =>
       pair.readRequest(frame.subarray(header.byteLength))
     )
-    return { record, pair }
+    return { record, pair, refused }
   }
 
   /**
    * @private
    * @param {{ apiKey: number, apiVersion: number }} header
-   * @returns {boolean} whether the request is the client's first ApiVersions request, at the
-   *   highest version it implements, to a profile that offers a lower one
+   * @returns {boolean} whether the request is an ApiVersions request at the highest version the
+   *   client implements, to a profile that offers a lower one
    */
-  isDiscovery({ apiKey, apiVersion }) {
+  isRefusedApiVersions({ apiKey, apiVersion }) {
     const offered = this.advertised.get('ApiVersions')?.[0]
     return (
       apiKey === apiKeys.ApiVersions &&
@@ -581,19 +601,43 @@ class ScriptedCluster {
   }
 
   /**
-   * Answers a discovery request as a broker that offers ApiVersions up to the profile's version
-   * does: UNSUPPORTED_VERSION with a v0-shaped body naming that range, on a later turn of the event
-   * loop and not at all on a socket destroyed by then. It is not scheduled and not answered by a
-   * scripted answerer: the request the client asks next is.
+   * Whether a refused ApiVersions request is the one a negotiation is kept apart from: the first
+   * request of its socket, or the one that negotiates the socket again after another socket to the
+   * node was opened. It remembers that the socket negotiated, so a second one with nothing opened
+   * in between is not. Call it once per request, before the request is logged.
+   * @private
+   * @param {{ id: number, host: string, port: number }} node
+   * @param {number} generation which connection of the node the socket is, counting from 1
+   * @returns {boolean}
+   */
+  opensNegotiation(node, generation) {
+    const socket = `${node.id}/${generation}`
+    const opened = this.socketsOpenedTo(node)
+    const negotiatedAt = this.negotiatedAt.get(socket)
+    const opens =
+      negotiatedAt === undefined
+        ? !this.log.some((other) => other.node === node.id && other.generation === generation)
+        : negotiatedAt < opened
+    if (opens) this.negotiatedAt.set(socket, opened)
+    return opens
+  }
+
+  /**
+   * Answers a refused ApiVersions request as a broker that offers ApiVersions up to the profile's
+   * version does: UNSUPPORTED_VERSION with a v0-shaped body naming that range, on a later turn of
+   * the event loop and not at all on a socket destroyed by then. It is not scheduled and not
+   * answered by a scripted answerer: the request the client asks next is. One that `requests()`
+   * lists is marked answered, so `timeline()` shows its response.
    * @private
    * @param {import('events').EventEmitter} socket the socket the request came in on
-   * @param {RequestRecord} record the logged discovery request
+   * @param {RequestRecord} record the logged request
    * @param {WirePair} pair the pair of the version it asked, which builds the body
    * @returns {void}
    */
-  refuseDiscovery(socket, record, pair) {
+  refuseApiVersions(socket, record, pair) {
     setImmediate(() => {
       if (socket.destroyed) return
+      if (!record.discovery) record.answeredOrder = this.clock++
       respondWithFrame(
         { socket },
         record.correlationId,
@@ -642,7 +686,7 @@ class ScriptedCluster {
    * loop, and not at all on a socket destroyed by then.
    * @private
    * @param {import('events').EventEmitter} socket the socket the frame came in on
-   * @param {{ id: number }} node the node it was written to
+   * @param {{ id: number, host: string, port: number }} node the node it was written to
    * @param {number} generation which connection of the node the socket is, counting from 1
    * @param {Buffer} frame exactly one request, size prefix included
    * @returns {void}
@@ -656,9 +700,9 @@ class ScriptedCluster {
       return
     }
 
-    const { record, pair } = accepted
-    if (record.discovery) {
-      this.refuseDiscovery(socket, record, pair)
+    const { record, pair, refused } = accepted
+    if (refused) {
+      this.refuseApiVersions(socket, record, pair)
       return
     }
 

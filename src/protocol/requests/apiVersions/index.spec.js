@@ -1,4 +1,6 @@
 const ApiVersions = require('./index')
+const Encoder = require('../../encoder')
+const { CLIENT_SOFTWARE_NAME, clientSoftwareVersion } = require('../../clientSoftware')
 const ApiVersionsV0 = ApiVersions.protocol({ version: 0 })
 const ApiVersionsV1 = ApiVersions.protocol({ version: 1 })
 const ApiVersionsV2 = ApiVersions.protocol({ version: 2 })
@@ -40,9 +42,19 @@ describe('Protocol > Requests > ApiVersions', () => {
       const bytesOf = async (version, ...args) =>
         (await ApiVersions.protocol({ version })(...args).request.encode()).buffer.toString('hex')
 
-      expect(await bytesOf(5, identity)).not.toEqual(await bytesOf(5))
+      const software = new Encoder()
+        .writeUVarIntString(CLIENT_SOFTWARE_NAME)
+        .writeUVarIntString(clientSoftwareVersion()).buffer
+
+      // v5 writes the pair after the software: the cluster id as a compact string, the node as an
+      // int32, then the empty tag buffer; without one it writes the null cluster id and node -1.
+      expect(await bytesOf(5, identity)).toEqual(
+        software.toString('hex') + '0a636c75737465722d41' + '00000002' + '00'
+      )
+      expect(await bytesOf(5)).toEqual(software.toString('hex') + '00' + 'ffffffff' + '00')
       for (const version of [3, 4]) {
         expect(await bytesOf(version, identity)).toEqual(await bytesOf(version))
+        expect(await bytesOf(version, identity)).toEqual(software.toString('hex') + '00')
       }
     })
   })

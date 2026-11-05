@@ -197,9 +197,10 @@ module.exports = class Broker {
    *   ApiVersions request is built and never cached; without one the requests name no identity
    * @param {'rebootstrap'|'none'} [options.metadataRecoveryStrategy='rebootstrap'] `'none'` sends no
    *   identity and ignores `REBOOTSTRAP_REQUIRED` as a recovery trigger
-   * @param {(error: Error, source: {broker: Broker, pool: object}) => Promise<void>} [options.onApiVersionsFailure]
+   * @param {(error: Error, source: {broker: Broker, pool: object, guard?: (frameLength?: number) => Error|null}) => Promise<void>} [options.onApiVersionsFailure]
    *   private observer of a `REBOOTSTRAP_REQUIRED` answer to this broker's ApiVersions request,
-   *   awaited before the error is thrown; it must not reject
+   *   awaited before the error is thrown; it must not reject. `guard` is the lifecycle check the
+   *   failed `connect()` was called with, so recovery can stop when that lifecycle closes
    */
   constructor({
     connectionPool,
@@ -458,7 +459,7 @@ module.exports = class Broker {
           attempt.fail(error)
         }
         attachFailureSource(error, { broker: this, generation: setupGeneration })
-        await this[PRIVATE.RECOVER](error, pool)
+        await this[PRIVATE.RECOVER](error, pool, guard)
         throw error
       }
     } finally {
@@ -696,9 +697,11 @@ module.exports = class Broker {
    * @private
    * @param {Error} error what the negotiation failed with
    * @param {import("../network/connectionPool")} pool the pool the negotiation started on
+   * @param {(frameLength?: number) => Error|null} [guard] the lifecycle check of the `connect()`
+   *   that negotiated, handed on so the recovery it starts stops when that lifecycle closes
    * @returns {Promise<void>} settles once the observer has; the observer does not reject
    */
-  async [PRIVATE.RECOVER](error, pool) {
+  async [PRIVATE.RECOVER](error, pool, guard) {
     if (
       error?.type !== 'REBOOTSTRAP_REQUIRED' ||
       this.metadataRecoveryStrategy !== 'rebootstrap' ||
@@ -709,7 +712,7 @@ module.exports = class Broker {
       return
     }
 
-    await this.onApiVersionsFailure(error, { broker: this, pool })
+    await this.onApiVersionsFailure(error, { broker: this, pool, guard })
   }
 
   /**

@@ -14,7 +14,6 @@ const {
   writeEvidence,
   wireVersionsOf,
 } = require('testHelpers')
-const { withTimeout } = require('../../consumer/__tests__/fixtures/liveScenario')
 
 // Gated: it opens connections to a live three-broker cluster and sends some of them to the wrong
 // broker. Run it alone through `npm run test:e2e:api-identity`; `KAFKA_VERSION` names the cluster
@@ -28,6 +27,29 @@ const SCENARIO_BUDGET_MS = 120000
 const CASE_BUDGET_MS = 40000
 const HOOK_BUDGET_MS = 20000
 const DISCONNECT_BUDGET_MS = 10000
+
+/**
+ * Waits for one cleanup step and fails when it fails, or when it is not done in time: a cleanup that
+ * does not finish is a failure of the scenario, not a success.
+ * @param {Promise<unknown>} cleanup the step, such as a disconnect
+ * @param {string} what names the step in the failure
+ * @returns {Promise<void>}
+ * @throws {Error} the step's own failure, or a timeout naming `what`
+ */
+const closeWithin = async (cleanup, what) => {
+  let timer
+  const deadline = new Promise((_, reject) => {
+    timer = setTimeout(
+      () => reject(new Error(`${what} did not finish within ${DISCONNECT_BUDGET_MS} ms`)),
+      DISCONNECT_BUDGET_MS
+    )
+  })
+  try {
+    await Promise.race([cleanup, deadline])
+  } finally {
+    clearTimeout(timer)
+  }
+}
 
 /**
  * The ApiVersions version a broker of the lane's `KAFKA_VERSION` offers: v5, which checks the
@@ -128,16 +150,8 @@ describeApiIdentity('Broker > ApiVersions identity (live)', () => {
       retry: { retries: 3, initialRetryTime: 100, maxRetryTime: 500 },
     })
     closers.push(
-      () =>
-        withTimeout(
-          admin.disconnect().catch(() => {}),
-          DISCONNECT_BUDGET_MS
-        ),
-      () =>
-        withTimeout(
-          cluster.disconnect().catch(() => {}),
-          DISCONNECT_BUDGET_MS
-        )
+      () => closeWithin(admin.disconnect(), 'the admin disconnecting'),
+      () => closeWithin(cluster.disconnect(), 'the cluster disconnecting')
     )
 
     return { cluster, admin, events }
@@ -170,21 +184,25 @@ describeApiIdentity('Broker > ApiVersions identity (live)', () => {
       logLevel: logLevel.NOTHING,
     })
     const admin = kafka.admin()
-    await admin.connect()
     try {
+      await admin.connect()
       const { clusterId, brokers } = await admin.describeCluster()
       truth = { clusterId, brokers: brokers.sort((a, b) => a.nodeId - b.nodeId) }
     } finally {
-      await withTimeout(
-        admin.disconnect().catch(() => {}),
-        DISCONNECT_BUDGET_MS
-      )
+      await closeWithin(admin.disconnect(), 'the truth admin disconnecting')
     }
     expect(truth.brokers).toHaveLength(3)
   }, HOOK_BUDGET_MS)
 
   afterEach(async () => {
-    await Promise.all(closers.splice(0).map((close) => close()))
+    const outcomes = await Promise.allSettled(closers.splice(0).map((close) => close()))
+    const failures = outcomes.filter(({ status }) => status === 'rejected')
+    if (failures.length > 0) {
+      throw new AggregateError(
+        failures.map(({ reason }) => reason),
+        `${failures.length} cleanup step(s) failed`
+      )
+    }
     expect(Date.now() - startedAt).toBeLessThan(SCENARIO_BUDGET_MS)
   }, HOOK_BUDGET_MS)
 

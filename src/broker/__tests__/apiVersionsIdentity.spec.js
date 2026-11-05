@@ -3,6 +3,7 @@ const path = require('path')
 const Broker = require('..')
 const Cluster = require('../../cluster')
 const ConnectionPool = require('../../network/connectionPool')
+const Generation = require('../../producer/generation')
 const createAdmin = require('../../admin')
 const Encoder = require('../../protocol/encoder')
 const InstrumentationEventEmitter = require('../../instrumentation/emitter')
@@ -53,11 +54,6 @@ const until = async (predicate, what) => {
     await new Promise((resolve) => setTimeout(resolve, 5))
   }
   if (!predicate()) throw new Error(`${what} did not happen`)
-}
-
-/** Gives a late answer the turns it needs to be read and acted on, or to show that it is not. */
-const settle = async () => {
-  for (let turn = 0; turn < 10; turn++) await new Promise(setImmediate)
 }
 
 /** @returns {Buffer} the body of the last ApiVersions request the client wrote, after its header */
@@ -319,10 +315,14 @@ describe('ApiVersions v5 identity (KIP-1242)', () => {
     expect(broker.finalizedFeatures).toEqual(connected)
     expect(broker.finalizedFeaturesEpoch).toBe(7)
 
-    // Without the option the read answers the version map alone, as it always did.
-    await expect(broker.apiVersions()).resolves.toMatchObject({
-      18: { minVersion: 5, maxVersion: 5 },
-    })
+    // Without the option the read answers the version map alone, as it always did: one entry per
+    // API the broker offers, and none of the response's feature fields.
+    const table = Object.fromEntries(
+      wire
+        .apiVersionsTable()
+        .map(({ apiKey, minVersion, maxVersion }) => [apiKey, { minVersion, maxVersion }])
+    )
+    await expect(broker.apiVersions()).resolves.toEqual(table)
     expect(wire.apiVersionTrace().map(({ version }) => version)).toEqual([5, 5, 5])
   })
 
@@ -447,6 +447,61 @@ describe('ApiVersions v5 identity (KIP-1242)', () => {
       expect(cluster.brokerPool.rebootstrap).toHaveBeenCalledWith('required', { fence: undefined })
     })
 
+    test('a recovery whose producer lifecycle closes while its seed resolves publishes nothing', async () => {
+      const { wire, cluster, events } = open()
+      await cluster.connect()
+      await cluster.refreshMetadata()
+      const { brokerPool } = cluster
+      const seed = brokerPool.seedBroker
+      const metadata = brokerPool.metadata
+      // The broker's own connect, kept with its real implementation: it outlives the lifecycle.
+      const node = brokerPool.brokers[2]
+      const connects = []
+      const connect = node.connect.bind(node)
+      node.connect = (...args) => {
+        const call = connect(...args)
+        connects.push(
+          call.then(
+            () => null,
+            (error) => error
+          )
+        )
+        return call
+      }
+      // The recovery reaches its seed resolution, and waits there.
+      const { connectionPoolBuilder } = brokerPool
+      const build = connectionPoolBuilder.build.bind(connectionPoolBuilder)
+      let resolving
+      const resolvingStarted = new Promise((resolve) => (resolving = resolve))
+      let resolved
+      const resolveSeed = new Promise((resolve) => (resolved = resolve))
+      connectionPoolBuilder.build = async (...args) => {
+        resolving()
+        await resolveSeed
+        return build(...args)
+      }
+      wire.schedule.once({ api: 'ApiVersions', node: 2 }, REBOOTSTRAP_REQUIRED)
+      const lifecycle = new Generation()
+      const closed = new Error('the producer closed')
+
+      const attempt = brokerPool.findBroker({ nodeId: 2, fence: lifecycle }).catch((error) => error)
+      await resolvingStarted
+      expect(connects).toHaveLength(1)
+      expect(await Promise.race([connects[0], Promise.resolve('unsettled')])).toBe('unsettled')
+      expect(events).toEqual([])
+      lifecycle.close(closed)
+      expect(await attempt).toBe(closed)
+      resolved()
+
+      // The broker's connect is over once the recovery is: it fails with the answer it was given.
+      expect(await connects[0]).toMatchObject({ type: 'REBOOTSTRAP_REQUIRED' })
+      expect(events).toEqual([])
+      expect(brokerPool.seedBroker).toBe(seed)
+      expect(seed.retired).toBe(false)
+      expect(brokerPool.metadata).toBe(metadata)
+      expect(brokerPool.lastRebootstrapAt).toBeNull()
+    })
+
     test('a standalone broker rejects the typed error and publishes nothing', async () => {
       const { wire, broker } = standalone({ identity: { clusterId: 'cluster-A', nodeId: 2 } })
       wire.schedule.once({ api: 'ApiVersions' }, REBOOTSTRAP_REQUIRED)
@@ -519,19 +574,42 @@ describe('ApiVersions v5 identity (KIP-1242)', () => {
       const admin = await adminOf(cluster, { apiTimeout: 100 })
       await cluster.refreshMetadata()
       const seed = cluster.brokerPool.seedBroker
+      // The seed's own read, kept with its real implementation: it outlives the admin's timeout.
+      const reads = []
+      const apiVersions = seed.apiVersions.bind(seed)
+      seed.apiVersions = (...args) => {
+        const read = apiVersions(...args)
+        reads.push(
+          read.then(
+            () => null,
+            (error) => error
+          )
+        )
+        return read
+      }
       const gate = wire.schedule.hold({ api: 'ApiVersions' })
       const pending = admin.describeFeatures().catch((error) => error)
-      await gate.arrived()
-      expect(await pending).toMatchObject({ name: 'KafkaJSTimeout' })
+      const held = await gate.arrived()
+      const expired = await pending
+      expect(expired).toMatchObject({ name: 'KafkaJSTimeout' })
+      expect(reads).toHaveLength(1)
+      // The read outlived the timeout: it still waits for the held answer.
+      expect(await Promise.race([reads[0], Promise.resolve('unsettled')])).toBe('unsettled')
 
       gate.release(REBOOTSTRAP_REQUIRED)
-      await until(
-        () =>
-          wire.requests().some(({ api, answeredOrder }) => api === 'ApiVersions' && answeredOrder),
-        'the late answer being written'
-      )
-      await settle()
 
+      // The read is over once the late answer was read and acted on: it ends with the expiry,
+      // never with the answer, so nothing reaches the pool's recovery.
+      expect(await reads[0]).toBe(expired)
+      const late = wire
+        .requests()
+        .find(
+          ({ node, generation, correlationId }) =>
+            node === held.node &&
+            generation === held.generation &&
+            correlationId === held.correlationId
+        )
+      expect(late.answeredOrder).toEqual(expect.any(Number))
       expect(events).toEqual([])
       expect(cluster.brokerPool.seedBroker).toBe(seed)
       expect(seed.retired).toBe(false)

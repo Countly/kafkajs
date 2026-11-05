@@ -40,6 +40,24 @@ const hasBrokerMoved = (broker, { host, port }) =>
  */
 const guardArgs = (fence) => (fence ? [{ guard: fence.guard }] : [])
 
+/**
+ * The lifecycle a recovery checks, rebuilt from the private pre-write check a broker was called
+ * with: a broker is handed `fence.guard` and nothing else. It answers only `closed` and `check()`,
+ * all a rebootstrap asks of its fence, and keeps `guard` so recoveries of one lifecycle share.
+ * @param {() => Error|null} guard the check the failed `connect()` was called with
+ * @returns {{ guard: () => Error|null, closed: boolean, check: () => void }}
+ */
+const fenceOf = (guard) => ({
+  guard,
+  get closed() {
+    return Boolean(guard())
+  },
+  check() {
+    const refusal = guard()
+    if (refusal) throw refusal
+  },
+})
+
 // Bounds the `.cause` walk below: no currently-reachable chain is anywhere near this deep, so it
 // only guards against a future, accidentally self-referential `cause` looping forever.
 const MAX_CAUSE_CHAIN_DEPTH = 10
@@ -213,7 +231,7 @@ module.exports = class BrokerPool {
         this.logger.warn('Rebootstrapping the client from the configured broker list', { reason })
         this.emit(CLUSTER_REBOOTSTRAP, { reason })
       },
-      (reason, { fence } = {}) => fence
+      (reason, { fence } = {}) => fence?.guard ?? fence
     )
   }
 
@@ -1052,13 +1070,18 @@ module.exports = class BrokerPool {
    * A recovery that fails is logged and never rejects: the caller is already failing with the
    * answer itself, which is the error it should see.
    *
+   * A request made for a producer lifecycle (`guard`) is recovered under it, like a fenced metadata
+   * refresh: a lifecycle that closed, now or while the seed resolves, stops the recovery before it
+   * replaces the seed or publishes anything.
+   *
    * @private
    * @param {Error} error the typed REBOOTSTRAP_REQUIRED error
-   * @param {{broker: Broker, pool: import("../network/connectionPool")}} source the broker that
-   *   sent the request and the pool it was sent on
+   * @param {{broker: Broker, pool: import("../network/connectionPool"), guard?: () => Error|null}} source
+   *   the broker that sent the request, the pool it was sent on, and the lifecycle check the
+   *   request was made under, if any
    * @returns {Promise<void>}
    */
-  async onApiVersionsFailure(error, { broker, pool }) {
+  async onApiVersionsFailure(error, { broker, pool, guard }) {
     const current =
       !broker.retired &&
       broker.connectionPool === pool &&
@@ -1068,7 +1091,7 @@ module.exports = class BrokerPool {
     }
 
     try {
-      await this.onMetadataFailure(error)
+      await this.onMetadataFailure(error, { fence: guard && fenceOf(guard) })
       this.recoveredFailures.add(error)
     } catch (recoveryError) {
       try {
