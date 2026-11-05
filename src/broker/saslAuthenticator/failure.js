@@ -1,8 +1,21 @@
 const { isNativeError } = require('util').types
-const { KafkaJSSASLAuthenticationError, KafkaJSNonRetriableError } = require('../../errors')
+const errors = require('../../errors')
 const { createErrorFromCode } = require('../../protocol/error')
 
+const { KafkaJSSASLAuthenticationError, KafkaJSNonRetriableError, KafkaJSProtocolError } = errors
+
 const authoredErrors = new WeakSet()
+
+/** Classes a failure may be named by: this library's errors and the built-in programming errors. */
+const NAMEABLE_CLASSES = [
+  ...Object.values(errors).filter(
+    (value) => typeof value === 'function' && value.prototype instanceof Error
+  ),
+  TypeError,
+  RangeError,
+  ReferenceError,
+  SyntaxError,
+]
 
 const localReasons = new Set([
   'Buffers must be of the same length',
@@ -70,4 +83,37 @@ const failureDetail = (error) => {
   return 'Error'
 }
 
-module.exports = { failureDetail, trustedError }
+/**
+ * Finds the nearest class in `NAMEABLE_CLASSES` on a native error's prototype chain.
+ * @param {Error} error a native error, never a Proxy itself
+ * @returns {Function|undefined} the class, or undefined when the chain holds none
+ */
+const nameableClass = (error) => {
+  for (let proto = Object.getPrototypeOf(error); proto; proto = Object.getPrototypeOf(proto)) {
+    const Class = NAMEABLE_CLASSES.find((candidate) => candidate.prototype === proto)
+    if (Class) return Class
+  }
+  return undefined
+}
+
+/**
+ * Describes a failure by its class alone, for a message that must not carry the failure's text.
+ * The class is found by prototype identity in a closed list, never by reading `name`, and a
+ * protocol error adds the `type` and `code` the protocol table holds for its own integer `code`.
+ * Does not execute supplier property accessors or Proxy traps. A plain `Error`, a non-error, or a
+ * class outside the list names nothing, since it says nothing a reader can act on.
+ * @param {*} error the failure
+ * @returns {string} '' or ` cause=<Class>` with ` type=<TYPE> code=<n>` for a protocol error
+ */
+const failureCause = (error) => {
+  const Class = isNativeError(error) ? nameableClass(error) : undefined
+  if (!Class) return ''
+  const code = Object.getOwnPropertyDescriptor(error, 'code')?.value
+  const protocol =
+    error instanceof KafkaJSProtocolError && Number.isInteger(code)
+      ? ` type=${createErrorFromCode(code).type} code=${code}`
+      : ''
+  return ` cause=${Class.name}${protocol}`
+}
+
+module.exports = { failureDetail, failureCause, trustedError }

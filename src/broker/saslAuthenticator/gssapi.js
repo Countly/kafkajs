@@ -6,6 +6,14 @@ const {
   KafkaJSSASLAuthenticationError,
   KafkaJSInvalidConfigurationError,
 } = require('../../errors')
+const { failureCause } = require('./failure')
+
+/**
+ * RFC 4752 client reply for no security layer: the layer bit and a zero maximum buffer. The native
+ * wrap rebuilds its reply from these four octets and its `user` option, and takes only a boolean
+ * `protect`.
+ */
+const NO_LAYER = Buffer.from([1, 0, 0, 0])
 
 let kerberos
 
@@ -54,7 +62,8 @@ class GssapiAuthenticator {
   }
 
   /** Exchanges opaque mechanism bytes through the existing INT32-prefixed boundary.
-   * @param {string} token base64 native token
+   * @param {string|null} token base64 native token; the native step answers null when it has no
+   *   output token, and RFC 4752 then has the client respond with no data
    * @returns {Promise<string>} base64 server token
    * @throws {Error} original guarded transport refusal
    */
@@ -62,7 +71,7 @@ class GssapiAuthenticator {
     return this.saslAuthenticate({
       request: {
         /** @returns {Promise<Buffer>} one INT32-prefixed token */
-        encode: async () => new Encoder().writeBytes(Buffer.from(token, 'base64')).buffer,
+        encode: async () => new Encoder().writeBytes(Buffer.from(token ?? '', 'base64')).buffer,
       },
       response: {
         /** @param {Buffer} bytes INT32-prefixed mechanism response @returns {Promise<Buffer>} token */
@@ -76,10 +85,13 @@ class GssapiAuthenticator {
   /** Authenticates with a fresh context and selects the RFC 4752 no-security-layer bit.
    * Native context completion precedes SASL layer negotiation. Empty output tokens
    * still travel through SaslAuthenticate; success awaits the final broker status.
+   * A failure names its stage: `exchange:<n>` for the nth context exchange, `exchange:final`
+   * for the one that carries the layer reply, and the native step before it otherwise.
    * @returns {Promise<void>} completed authentication
    * @throws {KafkaJSInvalidConfigurationError} invalid serviceName or principal
    * @throws {KafkaJSNotImplemented} missing or unsupported optional peer
-   * @throws {KafkaJSSASLAuthenticationError} sanitized acquisition or exchange failure
+   * @throws {KafkaJSSASLAuthenticationError} acquisition or exchange failure, named by broker,
+   *   stage and the failure's class (with a protocol error's type and code), never its text
    */
   async authenticate() {
     const { serviceName = 'kafka', principal } = this.options
@@ -106,12 +118,13 @@ class GssapiAuthenticator {
       })
       stage = 'step'
       let token = await client.step('')
-      stage = 'exchange'
+      let round = 1
+      stage = 'exchange:1'
       let challenge = await this.exchange(token)
       while (!client.contextComplete) {
         stage = 'step'
         token = await client.step(challenge)
-        stage = 'exchange'
+        stage = `exchange:${++round}`
         challenge = await this.exchange(token)
       }
       stage = 'unwrap'
@@ -121,15 +134,14 @@ class GssapiAuthenticator {
       if (typeof identity !== 'string' || !identity || identity.includes('\0')) {
         throw new Error('Missing authorization identity')
       }
-      const reply = Buffer.concat([Buffer.from([1, 0, 0, 0]), Buffer.from(identity, 'utf8')])
       stage = 'wrap'
-      token = await client.wrap(reply.toString('base64'), { protect: 0 })
-      stage = 'exchange'
+      token = await client.wrap(NO_LAYER.toString('base64'), { user: identity, protect: false })
+      stage = 'exchange:final'
       await this.exchange(token)
     } catch (error) {
       if (stage === 'load' && error instanceof KafkaJSNotImplemented) throw error
       throw new KafkaJSSASLAuthenticationError(
-        `SASL GSSAPI authentication failed: broker=${this.broker} stage=${stage}`
+        `SASL GSSAPI authentication failed: broker=${this.broker} stage=${stage}${failureCause(error)}`
       )
     }
   }

@@ -17,6 +17,7 @@ const FloorCapabilities = require('../../../../testHelpers/floorCapabilities')
 const {
   fenceUntilSettled,
   describeScramUntilApplied,
+  TRANSACTION_COORDINATOR_APIS,
 } = require('../../../../testHelpers/adminCatchUp')
 const { createChaosSocketFactory } = require('../../../../testHelpers/chaosSocket')
 const { createResourceProbe } = require('../../../../testHelpers/resourceProbe')
@@ -81,9 +82,14 @@ const PRODUCER_RETRY = {
   factor: 0,
 }
 /** The error codes the cases read from broker truth. */
-const PRODUCER_FENCED = 90
 const GROUP_ID_NOT_FOUND = 69
 const RESOURCE_NOT_FOUND = 91
+/**
+ * What a partition leader answers a Produce whose producer epoch is behind the one it holds. The
+ * transaction coordinator's own answer to a stale epoch is PRODUCER_FENCED (90), and a leader that
+ * asks the coordinator to verify the partition translates that answer to this code.
+ */
+const INVALID_PRODUCER_EPOCH = 47
 
 /**
  * Walks an error's cause chain, once per link.
@@ -1077,11 +1083,21 @@ class FloorAdminCases {
     expect(
       fenced.producerId !== before.producerId || fenced.producerEpoch > before.producerEpoch
     ).toBe(true)
+    const sent = []
+    const stopRecording = victim.on(victim.events.REQUEST, ({ payload }) =>
+      sent.push(payload.apiName)
+    )
     const refusal = await rejectionOf(
       p.invoke(() => doomed.send({ topic, messages: [{ value: 'must-refuse' }] }))
     )
+    stopRecording()
     const fencedSendCause = deepest(refusal)
-    expect(fencedSendCause?.code).toBe(PRODUCER_FENCED)
+    expect(sent).toContain('Produce')
+    expect(sent.filter((api) => TRANSACTION_COORDINATOR_APIS.includes(api))).toEqual([])
+    expect(fencedSendCause).toMatchObject({
+      type: 'INVALID_PRODUCER_EPOCH',
+      code: INVALID_PRODUCER_EPOCH,
+    })
     const successor = await p.client('producer', {
       transactionalId: fencedId,
       idempotent: true,

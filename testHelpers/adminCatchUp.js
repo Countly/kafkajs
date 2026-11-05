@@ -2,6 +2,14 @@
 const CONCURRENT_TRANSACTIONS = 51
 /** A broker answers this for a credential it has not applied yet, as for one that never existed. */
 const RESOURCE_NOT_FOUND = 91
+/** The requests a transactional producer sends to its transaction coordinator. */
+const TRANSACTION_COORDINATOR_APIS = [
+  'InitProducerId',
+  'AddPartitionsToTxn',
+  'AddOffsetsToTxn',
+  'EndTxn',
+  'TxnOffsetCommit',
+]
 
 /**
  * The live admin probes make one attempt per call (`retry: { retries: 0 }`), so the repeats the
@@ -51,4 +59,4 @@ const describeScramUntilApplied = async (probe, admin, user) => {
   return rows
 }
 
-module.exports = { fenceUntilSettled, describeScramUntilApplied }
+module.exports = { fenceUntilSettled, describeScramUntilApplied, TRANSACTION_COORDINATOR_APIS }

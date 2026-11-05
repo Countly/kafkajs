@@ -48,6 +48,7 @@ services:
       KAFKA_SASL_KERBEROS_SERVICE_NAME: kafka
       KAFKA_LISTENER_NAME_GSSAPI_HOST_GSSAPI_SASL_JAAS_CONFIG: com.sun.security.auth.module.Krb5LoginModule required useKeyTab=true storeKey=true doNotPrompt=true keyTab="/state/kafka.keytab" principal="kafka/localhost@KAFKAJS.TEST";
       KAFKA_CONNECTIONS_MAX_REAUTH_MS: "15000"
+      KAFKA_LOG4J_LOGGERS: org.apache.kafka.common.security=DEBUG,org.apache.kafka.common.network.Selector=DEBUG
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: "1"
       KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: "1"
       KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: "1"

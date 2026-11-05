@@ -196,6 +196,8 @@ Versions before 3.0.0 are internal alpha tags and are not published.
 
 #### Fixes
 
+- SASL GSSAPI follows the native `kerberos` 7.0.0 contract. Its step answers `null` when it has no output token, which the adapter failed to encode; it now responds with no data, as RFC 4752 asks. Its wrap takes a boolean `protect` and the authorization identity as `user`, where the adapter passed a number and put the identity in the data.
+- A failed GSSAPI exchange names its step (`stage=exchange:1`, `exchange:2`, `exchange:final`) and, for a library or built-in programming error, its class, with a protocol error's `type` and `code`; the failure's text is still never published.
 - `admin.deleteGroups` names the group id it refuses (`Invalid groupId name: 1`); it printed `true`.
 - `KafkaJSNumberOfRetriesExceeded` names itself on the first line of its stack. It printed `KafkaJSNonRetriableError` there, its parent class, because the name was assigned after the stack was built (also in kafkajs 2.2.4).
 - A commit the broker refuses names the refused partition: the error carries `topic` and `partition`, as a refused Produce does.
@@ -240,6 +242,8 @@ Versions before 3.0.0 are internal alpha tags and are not published.
 
 - The exit gate runs the GSSAPI, TLS negative, OAuth helper, idle-reaping and admin live arms (ledger, lifecycle, quota, delegation tokens, log directories, tiered storage) as jobs of their own. A gate check can name its broker release with `kafkaVersion`. The admin live scenarios and the GSSAPI KDC fixture use the job's Compose cluster when no cluster guard is configured, and the base Compose cluster exposes broker JMX on a container-local port for the quota scenario's byte counter.
 
+- The Kerberos broker logs the Kafka security and network `Selector` loggers at DEBUG, so a failed GSSAPI exchange reaches the compose log.
+- The admin ledger and floor fence cases assert `INVALID_PRODUCER_EPOCH` (47), the answer a partition leader gives a Produce from a fenced producer, and that the refused send was a Produce with no request to the transaction coordinator, where they asserted `PRODUCER_FENCED` (90).
 - Live scenarios for the connection setup budget and idle reaping; the soak's idle profile asserts that sockets are reaped and reopened.
 
 - The request-queue stamp benchmark.

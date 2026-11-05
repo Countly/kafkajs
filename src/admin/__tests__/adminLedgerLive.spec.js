@@ -9,12 +9,19 @@ const { saslBrokers, saslConnectionOpts } = require('testHelpers')
 const {
   fenceUntilSettled,
   describeScramUntilApplied,
+  TRANSACTION_COORDINATOR_APIS,
 } = require('../../../testHelpers/adminCatchUp')
 const { readData } = require('../../producer/__tests__/fixtures/liveProbe')
 const { liveCase, caseTimeout, pollUntil } = require('../../producer/__tests__/fixtures/bounded')
 
 const suite = process.env.ADMIN_LEDGER_E2E ? describe : describe.skip
 const budget = 540000
+/**
+ * What a partition leader answers a Produce whose producer epoch is behind the one it holds. The
+ * transaction coordinator's own answer to a stale epoch is PRODUCER_FENCED (90), and a leader that
+ * asks the coordinator to verify the partition translates that answer to this code.
+ */
+const INVALID_PRODUCER_EPOCH = 47
 
 /**
  * Maps a config entry as requested to the shape DescribeConfigs answers with.
@@ -559,14 +566,24 @@ class AdminLedgerScenario {
     expect(
       fenced.producerId !== before.producerId || fenced.producerEpoch !== before.producerEpoch
     ).toBe(true)
+    const sent = []
+    const stopRecording = fencedProducer.on(fencedProducer.events.REQUEST, ({ payload }) =>
+      sent.push(payload.apiName)
+    )
     let fencedSendCause = await p
       .invoke(() => open.send({ topic, messages: [{ value: 'must-refuse' }] }))
       .then(
         () => null,
         (error) => error
       )
+    stopRecording()
     while (fencedSendCause?.cause) fencedSendCause = fencedSendCause.cause
-    expect(fencedSendCause.code).toBe(90)
+    expect(sent).toContain('Produce')
+    expect(sent.filter((api) => TRANSACTION_COORDINATOR_APIS.includes(api))).toEqual([])
+    expect(fencedSendCause).toMatchObject({
+      type: 'INVALID_PRODUCER_EPOCH',
+      code: INVALID_PRODUCER_EPOCH,
+    })
     this.record('transaction isolation administrative abort and fence', {
       transactionalId,
       producerId: state.producerId,

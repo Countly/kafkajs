@@ -1,5 +1,5 @@
 const SASLAuthenticator = require('./index')
-const { failureDetail, trustedError } = require('./failure')
+const { failureCause, failureDetail, trustedError } = require('./failure')
 const ConnectionPool = require('../../network/connectionPool')
 const InstrumentationEventEmitter = require('../../instrumentation/emitter')
 const { NETWORK_AUTHENTICATION_FAILURE } = require('../../network/instrumentationEvents')
@@ -329,5 +329,75 @@ describe('SASL inert diagnostic inspection', () => {
     const constructor = jest.fn()
     expect(failureDetail(trustedError(constructor, 'Malformed SCRAM server message'))).toBe('Error')
     expect(constructor).not.toHaveBeenCalled()
+  })
+})
+
+describe('SASL safe failure cause', () => {
+  test('names a library error by its class and nothing of its text', () => {
+    expect(failureCause(new KafkaJSConnectionError('secret'))).toBe(' cause=KafkaJSConnectionError')
+  })
+
+  test('names a protocol error with the type and code its protocol table holds', () => {
+    const error = Object.assign(createErrorFromCode(58), { message: 'secret', type: 'secret-type' })
+    expect(failureCause(error)).toBe(
+      ' cause=KafkaJSProtocolError type=SASL_AUTHENTICATION_FAILED code=58'
+    )
+  })
+
+  test('names the nearest known class of a subclass it does not know', () => {
+    class Custom extends TypeError {}
+    expect(failureCause(new Custom('secret'))).toBe(' cause=TypeError')
+  })
+
+  test('names a class by identity, not by a forged name or constructor', () => {
+    const forged = Object.assign(new KafkaJSConnectionError('x'), {
+      name: 'secret',
+      constructor: { name: 'secret' },
+    })
+    expect(failureCause(forged)).toBe(' cause=KafkaJSConnectionError')
+    expect(failureCause(Object.assign(new Error('x'), { name: 'TypeError' }))).toBe('')
+  })
+
+  test.each([
+    ['a plain Error', new Error('secret')],
+    ['an Error subclass of no known class', new (class Custom extends Error {})('secret')],
+    ['a string', 'secret'],
+    ['null', null],
+    ['undefined', undefined],
+    ['a protocol-shaped object', Object.create(KafkaJSProtocolError.prototype, {})],
+  ])('names nothing for %s', (_, failure) => {
+    expect(failureCause(failure)).toBe('')
+  })
+
+  test('adds no type or code for a code that is not an integer', () => {
+    const error = Object.assign(createErrorFromCode(58), { code: '58' })
+    expect(failureCause(error)).toBe(' cause=KafkaJSProtocolError')
+  })
+
+  test('does not invoke supplier Proxy traps', () => {
+    const calls = []
+    const error = new Proxy(new KafkaJSProtocolError(createErrorFromCode(58)), {
+      getPrototypeOf(target) {
+        calls.push('getPrototypeOf')
+        return Reflect.getPrototypeOf(target)
+      },
+      getOwnPropertyDescriptor(target, key) {
+        calls.push(`getOwnPropertyDescriptor ${String(key)}`)
+        return Reflect.getOwnPropertyDescriptor(target, key)
+      },
+      get(target, key) {
+        calls.push(`get ${String(key)}`)
+        return Reflect.get(target, key)
+      },
+    })
+    expect(failureCause(error)).toBe('')
+    expect(calls).toEqual([])
+  })
+
+  test('does not invoke a code getter', () => {
+    const code = jest.fn(() => 58)
+    const error = Object.defineProperty(createErrorFromCode(58), 'code', { get: code })
+    expect(failureCause(error)).toBe(' cause=KafkaJSProtocolError')
+    expect(code).not.toHaveBeenCalled()
   })
 })

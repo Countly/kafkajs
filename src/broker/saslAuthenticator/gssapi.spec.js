@@ -22,7 +22,12 @@ beforeEach(() => {
         return ''
       }),
     unwrap: jest.fn().mockResolvedValue(Buffer.from([7, 0, 16, 0]).toString('base64')),
-    wrap: jest.fn().mockResolvedValue(b64('wrapped')),
+    wrap: jest.fn(async (challenge, options = {}) => {
+      if (typeof options.protect !== 'boolean') {
+        throw new TypeError('options.protect must be a boolean.')
+      }
+      return b64('wrapped')
+    }),
   }
   native = {
     GSS_MECH_OID_KRB5: 'kerberos-oid',
@@ -45,6 +50,13 @@ afterEach(() => {
   jest.dontMock('kerberos/package.json')
   jest.dontMock('./plain')
 })
+
+/** Builds a SASL_AUTHENTICATION_FAILED refusal whose message carries the marker.
+ * It is built after the module reset, so its classes are the adapter's own.
+ * @returns {Error} protocol error
+ */
+const protocolRefusal = () =>
+  Object.assign(require('../../protocol/error').createErrorFromCode(58), { message: marker })
 
 /** Creates a decoded scripted peer without sockets or credentials.
  * @param {object} [options] SASL options
@@ -81,12 +93,23 @@ it('sends context tokens and a no-layer reply through the framed mechanism bound
   })
   expect(client.step.mock.calls).toEqual([[''], [b64('mutual')]])
   expect(client.unwrap).toHaveBeenCalledWith(b64('security-offer'))
-  expect(client.wrap).toHaveBeenCalledWith(
-    Buffer.concat([Buffer.from([1, 0, 0, 0]), Buffer.from('client@KAFKAJS.TEST')]).toString(
-      'base64'
-    ),
-    { protect: 0 }
-  )
+  expect(client.wrap).toHaveBeenCalledWith(b64(Buffer.from([1, 0, 0, 0])), {
+    user: 'client@KAFKAJS.TEST',
+    protect: false,
+  })
+  expect(sent).toEqual([Buffer.from('initial'), Buffer.alloc(0), Buffer.from('wrapped')])
+})
+
+it('sends no data when the native step has no output token, as the real binding answers', async () => {
+  const { auth, sent } = scenario()
+  client.step = jest
+    .fn()
+    .mockResolvedValueOnce(b64('initial'))
+    .mockImplementationOnce(async () => {
+      client.contextComplete = true
+      return null
+    })
+  await auth.authenticate()
   expect(sent).toEqual([Buffer.from('initial'), Buffer.alloc(0), Buffer.from('wrapped')])
 })
 
@@ -100,9 +123,7 @@ it('uses the configured service and principal without changing the connected hos
     principal: 'named@KAFKAJS.TEST',
     mechOID: 'kerberos-oid',
   })
-  expect(Buffer.from(client.wrap.mock.calls[0][0], 'base64').subarray(4).toString()).toBe(
-    'named@KAFKAJS.TEST'
-  )
+  expect(client.wrap.mock.calls[0][1]).toEqual({ user: 'named@KAFKAJS.TEST', protect: false })
 })
 
 it('does not reuse context when one provider instance authenticates twice', async () => {
@@ -188,6 +209,44 @@ it.each(['initialize', 'step', 'unwrap', 'wrap', 'exchange'])(
     expect(error.ticket).toBeUndefined()
   }
 )
+
+it.each([
+  [1, 'exchange:1'],
+  [2, 'exchange:2'],
+  [3, 'exchange:final'],
+])('fails the SaslAuthenticate call number %i as stage=%s', async (call, stage) => {
+  const { auth, saslAuthenticate } = scenario()
+  const original = saslAuthenticate.getMockImplementation()
+  for (let earlier = 1; earlier < call; earlier++) saslAuthenticate.mockImplementationOnce(original)
+  saslAuthenticate.mockRejectedValueOnce(new Error(marker))
+  await expect(auth.authenticate()).rejects.toMatchObject({
+    message: `SASL GSSAPI authentication failed: broker=localhost:9192 stage=${stage}`,
+  })
+  expect(saslAuthenticate).toHaveBeenCalledTimes(call)
+})
+
+it.each([
+  ['TypeError', () => new TypeError(marker), ' cause=TypeError'],
+  [
+    'KafkaJSConnectionError',
+    () => new errors.KafkaJSConnectionError(marker),
+    ' cause=KafkaJSConnectionError',
+  ],
+  [
+    'KafkaJSProtocolError with its type and code',
+    () => protocolRefusal(),
+    ' cause=KafkaJSProtocolError type=SASL_AUTHENTICATION_FAILED code=58',
+  ],
+])('names an exchange failure by class and not by text: %s', async (_, failure, cause) => {
+  const { auth, saslAuthenticate } = scenario()
+  saslAuthenticate.mockRejectedValueOnce(failure())
+  const error = await auth.authenticate().catch((e) => e)
+  expect(error.message).toBe(
+    `SASL GSSAPI authentication failed: broker=localhost:9192 stage=exchange:1${cause}`
+  )
+  expect(error.message).not.toContain(marker)
+  expect(error.cause).toBeUndefined()
+})
 
 it('gives a typed sanitized failure for an IP literal and accepts a canonical resolver result', async () => {
   native.initializeClient.mockRejectedValueOnce(new Error(marker))

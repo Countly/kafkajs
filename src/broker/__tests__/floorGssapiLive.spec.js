@@ -67,10 +67,8 @@ live('GSSAPI with a ticket-granting service', () => {
         expect(Buffer.from(offer.result, 'base64')).toHaveLength(4)
         expect(Buffer.from(offer.result, 'base64')[0] & 1).toBe(1)
         const wrap = fixture.events.find((event) => event.method === 'wrap')
-        const layer = Buffer.from(wrap.args[0], 'base64')
-        expect(layer.subarray(0, 4)).toEqual(Buffer.from([1, 0, 0, 0]))
-        expect(layer.subarray(4).toString()).toBe('client@KAFKAJS.TEST')
-        expect(wrap.args[1]).toEqual({ protect: 0 })
+        expect(Buffer.from(wrap.args[0], 'base64')).toEqual(Buffer.from([1, 0, 0, 0]))
+        expect(wrap.args[1]).toEqual({ user: 'client@KAFKAJS.TEST', protect: false })
         variants.push('initial')
         cleanup.add('topic deletion', async () => {
           fixture.select(fixture.ticket('fresh'))
