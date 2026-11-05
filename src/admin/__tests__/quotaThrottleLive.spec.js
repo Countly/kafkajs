@@ -271,6 +271,7 @@ suite('admin producer quotas', () => {
           quota,
           recovery,
           brokerBytes: after.count - before.count,
+          brokerElapsedMs: after.at - before.at,
           controlPending: control.maxPending,
           quotaPending: quota.maxPending,
           throttleMs,
@@ -288,6 +289,7 @@ suite('admin producer quotas', () => {
         QuotaOracle.verify(sample)
         probe.record('matched produce quota and recovery', {
           brokerBytes: sample.brokerBytes,
+          brokerElapsedMs: Math.round(sample.brokerElapsedMs),
           leaderBroker: leaderId,
           attemptedCount: sends.length,
           controlOfferedBytes: control.offeredBytes,

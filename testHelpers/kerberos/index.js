@@ -1,7 +1,33 @@
 const { execFileSync } = require('node:child_process')
 const fs = require('node:fs')
 const path = require('node:path')
+const vm = require('node:vm')
 const { StandaloneKdc } = require('./standalone')
+
+/**
+ * The real process environment. Jest gives a spec a copy of `process.env`, and a write to that
+ * copy never reaches `setenv`, so the native Kerberos library reads its own `KRB5_CONFIG` and
+ * `KRB5CCNAME` only from here. Outside Jest this is `process.env`.
+ */
+const NATIVE_ENV = vm.runInThisContext('process.env')
+
+/**
+ * Runs one native call and prints its failure, which the product reports without a cause, so a
+ * live run shows why it failed.
+ * @template T
+ * @param {string} method native method name
+ * @param {() => T|Promise<T>} call the native call
+ * @returns {Promise<T>} the call's result
+ * @throws {Error} the native failure, unchanged
+ */
+const reportingFailure = async (method, call) => {
+  try {
+    return await call()
+  } catch (error) {
+    process.stderr.write(`kerberos ${method} failed: ${error.message}\n`)
+    throw error
+  }
+}
 
 /**
  * Talks only to the cluster the run already owns; it cannot start or tear down a cluster. Under a
@@ -60,18 +86,20 @@ class KdcFixture {
     return this.control('gssapi-ticket', [name])
   }
 
-  /** Selects a cache before native initialization, without changing keytab state.
+  /** Selects a cache before native initialization, without changing keytab state. The selection
+   * is made in the real process environment and lasts until the next one.
    * @param {object} ticket validated guard record
    * @returns {void}
    */
   select(ticket) {
-    process.env.KRB5_CONFIG = ticket.config
-    process.env.KRB5CCNAME = ticket.cache
-    delete process.env.KRB5_CLIENT_KTNAME
+    NATIVE_ENV.KRB5_CONFIG = ticket.config
+    NATIVE_ENV.KRB5CCNAME = ticket.cache
+    delete NATIVE_ENV.KRB5_CLIENT_KTNAME
   }
 
   /** Captures native inputs/outputs privately for the real-KDC golden.
-   * The proxy preserves the binding's receiver and live completion/username getters.
+   * The proxy preserves the binding's receiver and live completion/username getters. A native
+   * rejection is printed with its message and rethrown unchanged.
    * @param {object} peer installed native peer
    * @returns {function():void} restoration callback
    */
@@ -80,7 +108,9 @@ class KdcFixture {
     const events = this.events
     peer.initializeClient = async function (service, options) {
       const context = events.filter((event) => event.method === 'initialize').length
-      const client = await initialize.call(peer, service, options)
+      const client = await reportingFailure('initializeClient', () =>
+        initialize.call(peer, service, options)
+      )
       events.push({ context, method: 'initialize', service, principal: options.principal })
       return new Proxy(client, {
         /** Preserves native receivers while recording only exchange methods.
@@ -91,7 +121,7 @@ class KdcFixture {
         get(target, name) {
           if (!['step', 'unwrap', 'wrap'].includes(name)) return Reflect.get(target, name, target)
           return async (...args) => {
-            const result = await target[name](...args)
+            const result = await reportingFailure(name, () => target[name](...args))
             events.push({ context, method: name, args, result, complete: target.contextComplete })
             return result
           }

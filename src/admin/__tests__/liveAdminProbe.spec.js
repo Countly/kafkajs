@@ -2,6 +2,7 @@ const { getEventListeners } = require('events')
 const net = require('net')
 const mockClients = []
 const mockAdminOptions = []
+const mockProducerOptions = []
 const mockActions = []
 let mockConnectFailure
 const mockWrite = jest.fn()
@@ -15,6 +16,19 @@ jest.mock('fs', () => ({
 jest.mock('child_process', () => ({ execFile: (...args) => mockExec(...args) }))
 jest.mock('../../../index', () => ({
   Kafka: jest.fn().mockImplementation(() => ({
+    producer: (options) => {
+      mockProducerOptions.push(options)
+      return {
+        events: { REQUEST: 'request' },
+        on: () => () => {},
+        connect: jest.fn(async () => {
+          mockActions.push('connect')
+        }),
+        disconnect: jest.fn(async () => {
+          mockActions.push('disconnect')
+        }),
+      }
+    },
     admin: (options) => {
       const emitter = new (require('events').EventEmitter)()
       let connected = false
@@ -57,6 +71,7 @@ jest.mock('testHelpers', () => ({
 }))
 
 const { Kafka } = require('../../../index')
+const createRetry = require('../../retry')
 const { AdminLiveProbe } = require('./fixtures/liveAdmin')
 const { liveRun } = require('../../producer/__tests__/fixtures/bounded')
 const env = { guard: process.env.P9_CLUSTER_GUARD, manifest: process.env.P9_CLUSTER_MANIFEST }
@@ -75,6 +90,7 @@ beforeEach(() => {
   jest.clearAllMocks()
   mockClients.length = 0
   mockAdminOptions.length = 0
+  mockProducerOptions.length = 0
   mockActions.length = 0
   mockConnectFailure = undefined
   process.env.P9_CLUSTER_GUARD = 'fake-guard'
@@ -687,5 +703,34 @@ describe('topic helper', () => {
       mockActions.length = 0
     })
     expect(mockActions).toEqual(['connect', `delete ${topic}`, 'disconnect'])
+  })
+})
+
+describe('client retries', () => {
+  /**
+   * @param {object} retry Kafka retry options
+   * @returns {number} milliseconds a retrier with them waits across all its retries
+   */
+  const totalWait = (retry) => {
+    const backoff = createRetry.backoff(retry)
+    let delay = backoff.initial()
+    let total = 0
+    for (let retries = 0; retries < retry.retries; retries++) {
+      total += delay
+      delay = backoff.next(delay)
+    }
+    return total
+  }
+
+  test('a producer waits out the broker creating __transaction_state on its cluster while an admin keeps one attempt', async () => {
+    const { probe } = scenario()
+    await probe.finish(async () => {
+      await probe.client('admin')
+      await probe.client('producer', { transactionalId: 'txn' })
+    })
+    const [admin, producer] = Kafka.mock.calls.map(([options]) => options)
+    expect(admin.retry).toEqual({ retries: 0 })
+    expect(totalWait(producer.retry)).toBeGreaterThanOrEqual(10000)
+    expect(mockProducerOptions).toEqual([{ transactionalId: 'txn' }])
   })
 })

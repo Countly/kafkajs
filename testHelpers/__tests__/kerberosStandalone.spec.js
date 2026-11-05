@@ -1,6 +1,7 @@
 const fs = require('node:fs')
 const os = require('node:os')
 const path = require('node:path')
+const vm = require('node:vm')
 const { StandaloneKdc, parseTgt, parseCommitted } = require('../kerberos/standalone')
 const KdcFixture = require('../kerberos')
 
@@ -227,5 +228,103 @@ describe('KdcFixture ownership', () => {
     delete process.env.P9_CLUSTER_MANIFEST
     process.env[name] = 'only-one'
     expect(() => new KdcFixture()).toThrow('Incomplete cluster ownership environment')
+  })
+})
+
+const GUARD_VARIABLES = ['P9_CLUSTER_GUARD', 'P9_CLUSTER_MANIFEST']
+
+/** Registers hooks that give each test the environment of a standalone fixture, then restore it. */
+const withoutGuard = () => {
+  const keep = GUARD_VARIABLES.map((name) => process.env[name])
+  beforeEach(() => {
+    for (const name of GUARD_VARIABLES) delete process.env[name]
+  })
+  afterEach(() => {
+    GUARD_VARIABLES.forEach((name, index) => {
+      if (keep[index] === undefined) delete process.env[name]
+      else process.env[name] = keep[index]
+    })
+  })
+}
+
+describe('KdcFixture credential selection', () => {
+  withoutGuard()
+  const NAMES = ['KRB5_CONFIG', 'KRB5CCNAME', 'KRB5_CLIENT_KTNAME']
+  // The real environment, which the native library reads; a spec's own `process.env` is a copy.
+  const native = vm.runInThisContext('process.env')
+  const keep = {}
+  beforeEach(() => {
+    for (const name of NAMES) keep[name] = native[name]
+  })
+  afterEach(() => {
+    for (const name of NAMES) {
+      if (keep[name] === undefined) delete native[name]
+      else native[name] = keep[name]
+    }
+  })
+
+  test('selects the Kerberos config and cache in the real environment and drops a client keytab', () => {
+    native.KRB5_CLIENT_KTNAME = '/stale/client.keytab'
+    new KdcFixture().select({ config: '/run/krb5.conf', cache: '/run/fresh.ccache' })
+    expect(native.KRB5_CONFIG).toBe('/run/krb5.conf')
+    expect(native.KRB5CCNAME).toBe('/run/fresh.ccache')
+    expect(native.KRB5_CLIENT_KTNAME).toBeUndefined()
+  })
+
+  test('replaces an earlier selection with the next one', () => {
+    const kdc = new KdcFixture()
+    kdc.select({ config: '/run/krb5.conf', cache: '/run/fresh.ccache' })
+    kdc.select({ config: '/run/krb5.conf', cache: '/run/expired.ccache' })
+    expect(native.KRB5CCNAME).toBe('/run/expired.ccache')
+  })
+})
+
+describe('KdcFixture observation', () => {
+  withoutGuard()
+  let write
+  beforeEach(() => {
+    write = jest.spyOn(process.stderr, 'write').mockImplementation(() => true)
+  })
+  afterEach(() => write.mockRestore())
+
+  test('prints a native initialization failure and rejects with it unchanged', async () => {
+    const failure = new Error('No Kerberos credentials available')
+    const peer = { initializeClient: jest.fn().mockRejectedValue(failure) }
+    const kdc = new KdcFixture()
+    const restore = kdc.observe(peer)
+    await expect(peer.initializeClient('kafka@localhost', { principal: 'p' })).rejects.toBe(failure)
+    restore()
+    expect(write).toHaveBeenCalledExactlyOnceWith(
+      'kerberos initializeClient failed: No Kerberos credentials available\n'
+    )
+    expect(kdc.events).toEqual([])
+  })
+
+  test('prints a native exchange failure and records no event for the failed call', async () => {
+    const failure = new Error('Ticket expired')
+    const client = { step: jest.fn().mockRejectedValue(failure), contextComplete: false }
+    const peer = { initializeClient: jest.fn().mockResolvedValue(client) }
+    const kdc = new KdcFixture()
+    const restore = kdc.observe(peer)
+    const observed = await peer.initializeClient('kafka@localhost', { principal: 'p' })
+    await expect(observed.step('')).rejects.toBe(failure)
+    restore()
+    expect(write).toHaveBeenCalledExactlyOnceWith('kerberos step failed: Ticket expired\n')
+    expect(kdc.events.map(({ method }) => method)).toEqual(['initialize'])
+  })
+
+  test('records a successful exchange and prints nothing', async () => {
+    const client = { step: jest.fn().mockResolvedValue('token'), contextComplete: true }
+    const peer = { initializeClient: jest.fn().mockResolvedValue(client) }
+    const kdc = new KdcFixture()
+    const restore = kdc.observe(peer)
+    const observed = await peer.initializeClient('kafka@localhost', { principal: 'p' })
+    await expect(observed.step('')).resolves.toBe('token')
+    restore()
+    expect(write).not.toHaveBeenCalled()
+    expect(kdc.events).toEqual([
+      { context: 0, method: 'initialize', service: 'kafka@localhost', principal: 'p' },
+      { context: 0, method: 'step', args: [''], result: 'token', complete: true },
+    ])
   })
 })

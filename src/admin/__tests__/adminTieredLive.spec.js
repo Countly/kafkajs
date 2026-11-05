@@ -1,27 +1,11 @@
 const { createHash } = require('crypto')
-const Decoder = require('../../protocol/decoder')
-const decodeBatch = require('../../protocol/recordBatch/v0/decoder')
 const { AdminLiveProbe } = require('./fixtures/liveAdmin')
-const { StorageOracle } = require('./fixtures/liveOracles')
+const { StorageOracle, decodeSegment } = require('./fixtures/liveOracles')
 const { liveCase, caseTimeout } = require('../../producer/__tests__/fixtures/bounded')
 
 const suite = process.env.ADMIN_TIERED_E2E ? describe : describe.skip
 const budget = 540000
 const jarHash = 'f3236936854c13815ffaa7f35a3f2d6861c125616cba5395b538b8680dded886'
-
-/** @param {Buffer} data complete sealed log file @returns {Promise<object[]>} CRC-checked records */
-const decode = async (data) => {
-  const records = []
-  let offset = 0
-  while (offset < data.length) {
-    if (offset + 12 > data.length) throw new Error('Incomplete segment snapshot')
-    const size = data.readInt32BE(offset + 8) + 12
-    if (size < 61 || offset + size > data.length) throw new Error('Incomplete segment batch')
-    records.push(...(await decodeBatch(new Decoder(data.subarray(offset, offset + size)))))
-    offset += size
-  }
-  return records
-}
 
 suite('admin configured remote storage', () => {
   test(
@@ -143,7 +127,7 @@ suite('admin configured remote storage', () => {
             const encoded = await probe.host('kafka1', ['base64', '-w', '0', file.path])
             const bytes = Buffer.from(encoded, 'base64')
             if (bytes.length !== file.size) throw new Error('Remote snapshot changed during read')
-            decoded.push(...(await decode(bytes)))
+            decoded.push(...(await decodeSegment(bytes)))
           }
           decoded.sort((a, b) => Number(BigInt(a.offset) - BigInt(b.offset)))
           const unique = [...new Map(decoded.map((record) => [record.offset, record])).values()]
@@ -158,7 +142,7 @@ suite('admin configured remote storage', () => {
             const base = BigInt(file.path.split('/').pop().split('.')[0])
             if (base <= BigInt(remoteLast)) continue
             const encoded = await probe.host('kafka1', ['base64', '-w', '0', file.path])
-            const data = await decode(Buffer.from(encoded, 'base64'))
+            const data = await decodeSegment(Buffer.from(encoded, 'base64'))
             if (data.length) pending.push(data[0].offset)
           }
           const again = (await files(root))

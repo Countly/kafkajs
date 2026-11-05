@@ -47,6 +47,21 @@ const DEFAULT_RECEIPT_DIR = path.join('.tmp', 'e2e')
 const HELD_RESOURCES = ['Timeout', 'TCPSocketWrap', 'TCPServerWrap']
 
 /**
+ * The cluster retries of a producer, which takes them from the Kafka options: its coordinator
+ * lookups run on the cluster's retrier, and the `retry` producer option does not reach it. On a
+ * fresh cluster the first transactional lookup is answered "coordinator not available" until the
+ * broker has created `__transaction_state`, which takes seconds; the delays here add up to 13 s.
+ * @see https://github.com/apache/kafka/blob/4.3.1/core/src/main/scala/kafka/server/KafkaApis.scala
+ */
+const PRODUCER_RETRY = {
+  retries: 10,
+  initialRetryTime: 100,
+  multiplier: 2,
+  maxRetryTime: 2000,
+  factor: 0,
+}
+
+/**
  * Loop turns a destroyed handle gets to finish closing before it counts as retained. A closed
  * socket or server stays in `process.getActiveResourcesInfo()` until its close callback has run,
  * which is after the turn that destroyed it, so a count taken in that turn still holds it.
@@ -177,15 +192,14 @@ class AdminLiveProbe {
     return this.invoke(async () => {
       const kafka = new Kafka({
         ...this.baseOptions,
+        ...(kind === 'producer' ? { retry: PRODUCER_RETRY } : {}),
         ...options,
         logLevel: LEVELS.DEBUG,
         logCreator: () => (entry) => this.logs.push(entry),
         socketFactory: (args) => this.socket(args),
       })
-      // The base options keep admin calls to one attempt; an idempotent producer needs retries.
-      const settings =
-        kind === 'producer' ? { retry: { retries: 5 }, ...clientOptions } : clientOptions
-      const client = kafka[kind](settings)
+      // The base options keep admin calls to one attempt; a producer gets `PRODUCER_RETRY` above.
+      const client = kafka[kind](clientOptions)
       this.clients.push(client)
       this.cleanup.add(`${kind} disconnect`, () =>
         client.disconnect({ timeout: this.wholeMs(5000) })
