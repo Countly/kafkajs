@@ -202,6 +202,33 @@ class AdminLedgerScenario {
   }
 
   /**
+   * Observes a read's ALLOW on every eligible broker before DENY is created, then its exact DENY
+   * on those same sources. A shuffled public read cannot substitute a missing grant for a denial.
+   * @param {Broker[]} sources every broker eligible to answer the public read
+   * @param {object} check raw read and expected call-level authorization code
+   * @param {(broker: Broker) => Promise<object>} check.brokerCall side-effect-free raw read
+   * @param {number} check.code expected authorization error code
+   * @param {boolean} allowed whether every source must allow or deny the read
+   * @returns {Promise<void>} after every source reports the expected authorization state
+   * @throws {Error} unexpected response, abort or work deadline
+   */
+  async permissionReadSettled(sources, check, allowed) {
+    for (const broker of sources) {
+      const probe = {
+        call: () => check.brokerCall(broker),
+        code: check.code,
+        item: (response) => response,
+      }
+      if (allowed) {
+        const response = await this.permissionAllowed(probe)
+        expect(response.errorCode).toBe(0)
+      } else {
+        await this.permissionDenied(probe)
+      }
+    }
+  }
+
+  /**
    * Waits for granted or denied operation bits while DESCRIBE is observable on every source.
    * Observe ALLOW on every source before creating DENY, so a missing earlier grant cannot satisfy
    * the denial wait while its publication is still pending.
@@ -1467,10 +1494,12 @@ class AdminLedgerScenario {
       })
     /**
      * Waits for the controller's cluster ALTER denial through the validate-only feature request.
+     * Successful item results remain pending; any item failure other than the denial fails at once.
      * @returns {Promise<object>} exact denial observation
      * @throws {Error} unexpected response, abort or work deadline
      */
-    const controllerAlterDenied = () => this.permissionDenied({ call: validateFeature, code: 31 })
+    const controllerAlterDenied = () =>
+      this.permissionDenied({ call: validateFeature, code: 31, item: (rows) => rows[0] })
     /**
      * Probes transactional WRITE on every broker without allocating or fencing a producer.
      * KafkaApis.handleInitProducerIdRequest authorizes first; TransactionCoordinator rejects
@@ -1596,6 +1625,9 @@ class AdminLedgerScenario {
       },
       {
         name: 'configuration resources',
+        allowedProbe: (check) => this.permissionReadSettled(permissionSources, check, true),
+        deniedProbe: (check) => this.permissionReadSettled(permissionSources, check, false),
+        brokerCall: (broker) => broker.listConfigResources({ resourceTypes: [16] }),
         resourceType: 4,
         resourceName: 'kafka-cluster',
         operation: 10,
@@ -1682,6 +1714,9 @@ class AdminLedgerScenario {
       },
       {
         name: 'quota description',
+        allowedProbe: (check) => this.permissionReadSettled(permissionSources, check, true),
+        deniedProbe: (check) => this.permissionReadSettled(permissionSources, check, false),
+        brokerCall: (broker) => broker.describeClientQuotas({ components: [], strict: false }),
         resourceType: 4,
         resourceName: 'kafka-cluster',
         operation: 10,
@@ -1732,6 +1767,9 @@ class AdminLedgerScenario {
       },
       {
         name: 'SCRAM',
+        allowedProbe: (check) => this.permissionReadSettled(permissionSources, check, true),
+        deniedProbe: (check) => this.permissionReadSettled(permissionSources, check, false),
+        brokerCall: (broker) => broker.describeUserScramCredentials({ users: [{ name: user }] }),
         resourceType: 4,
         resourceName: 'kafka-cluster',
         operation: 8,
