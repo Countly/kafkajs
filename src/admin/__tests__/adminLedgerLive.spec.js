@@ -1405,7 +1405,8 @@ class AdminLedgerScenario {
         resourceName: txId,
         operation: 4,
         code: 53,
-        call: () => client.fenceProducers({ transactionalIds: [txId] }),
+        // The open transaction may still be completing, which the coordinator answers with 51.
+        call: () => fenceUntilSettled(p, client, txId),
         item: (rows) => rows[0],
       },
       {
