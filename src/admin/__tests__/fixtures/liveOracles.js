@@ -109,8 +109,8 @@ const setProduceQuota = (admin) =>
     entries: [
       {
         entity: [
-          { entityType: 'user', entityName: 'p9d-quota' },
-          { entityType: 'client-id', entityName: 'p9d-quota' },
+          { entityType: 'user', entityName: 'live-quota' },
+          { entityType: 'client-id', entityName: 'live-quota' },
         ],
         ops: [{ key: 'producer_byte_rate', value: 65536 }],
       },

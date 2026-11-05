@@ -7,8 +7,8 @@ const { liveCase, caseTimeout, delay } = require('../../producer/__tests__/fixtu
 const suite = process.env.ADMIN_QUOTA_E2E ? describe : describe.skip
 const budget = 180000
 const entity = [
-  { entityType: 'user', entityName: 'p9d-quota' },
-  { entityType: 'client-id', entityName: 'p9d-quota' },
+  { entityType: 'user', entityName: 'live-quota' },
+  { entityType: 'client-id', entityName: 'live-quota' },
 ]
 
 suite('admin producer quotas', () => {
@@ -18,7 +18,7 @@ suite('admin producer quotas', () => {
       const probe = new AdminLiveProbe({ stem: 'quota-throttle', signal, budgetMs: budget })
       await probe.finish(async () => {
         const admin = await probe.start()
-        const user = 'p9d-quota'
+        const user = 'live-quota'
         const password = randomBytes(32).toString('base64')
         probe.credentials.push(Buffer.from(password))
         probe.effects.add('remove SCRAM principal', () =>
@@ -55,7 +55,7 @@ suite('admin producer quotas', () => {
           'producer',
           { idempotent: true, bufferMemory: 134217728, maxInFlightRequests: 1 },
           {
-            clientId: 'p9d-quota',
+            clientId: 'live-quota',
             brokers: saslBrokers(),
             ssl,
             sasl: { mechanism: 'scram-sha-256', username: user, password },
