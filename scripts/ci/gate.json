@@ -22197,7 +22197,11 @@
         "src/network/__tests__/connectionSetupLive.spec.js \u203a Connection setup live setup budgets grow on one node and ready resets the next attempt",
         "src/network/__tests__/connectionSetupLive.spec.js \u203a Connection setup live an explicit setup timeout stays flat without a maximum",
         "src/producer/__tests__/txnOffsetCommitV6Live.spec.js \u203a Producer > TxnOffsetCommit v6 (live) commits offsets at the version the broker offers, only after the transaction commits, and an abort commits nothing",
-        "src/producer/__tests__/txnOffsetCommitV6Live.spec.js \u203a Producer > TxnOffsetCommit v6 (live) a topic id the cache does not hold keeps the whole offset commit at v5, where the broker offers v6"
+        "src/producer/__tests__/txnOffsetCommitV6Live.spec.js \u203a Producer > TxnOffsetCommit v6 (live) a topic id the cache does not hold keeps the whole offset commit at v5, where the broker offers v6",
+        "src/admin/__tests__/floorConditionalLive.spec.js \u203a Conditional features on the negotiated floor ApiVersions retains the old identity-free path on the floor",
+        "src/admin/__tests__/floorConditionalLive.spec.js \u203a Conditional features on the negotiated floor Transactional offset commits retain the named-topic path on the floor",
+        "src/admin/__tests__/floorConditionalLive.spec.js \u203a Conditional features on the negotiated floor DeleteGroups retains the old wire contract on the floor",
+        "src/admin/__tests__/floorConditionalLive.spec.js \u203a Conditional features on the negotiated floor Built-in rack selection and custom authority work on the floor"
       ]
     },
     {
