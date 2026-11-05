@@ -126,7 +126,7 @@ describe('Broker > SASL Authenticator > SCRAM', () => {
           original:
             'r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=4096',
           r: 'rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0',
-          s: 'W22ZaJ0SNY7soEsUEjb6gQ',
+          s: 'W22ZaJ0SNY7soEsUEjb6gQ==',
           i: '4096',
         }
 

@@ -5,10 +5,12 @@ const scram256AuthenticatorProvider = require('./scram256')
 const scram512AuthenticatorProvider = require('./scram512')
 const awsIAMAuthenticatorProvider = require('./awsIam')
 const oauthBearerAuthenticatorProvider = require('./oauthBearer')
+const gssapiAuthenticatorProvider = require('./gssapi')
 const { KafkaJSSASLAuthenticationError } = require('../../errors')
 
 const BUILT_IN_AUTHENTICATION_PROVIDERS = {
   AWS: awsIAMAuthenticatorProvider,
+  GSSAPI: gssapiAuthenticatorProvider,
   PLAIN: plainAuthenticatorProvider,
   OAUTHBEARER: oauthBearerAuthenticatorProvider,
   'SCRAM-SHA-256': scram256AuthenticatorProvider,
@@ -83,13 +85,14 @@ module.exports = class SASLAuthenticator {
           responseGuard: this.guard,
         })
       } catch (e) {
-        // Only the raw protocol error carries the broker's own error_message and code;
-        // built-in mechanisms (plain/scram/oauthBearer/awsIam) re-wrap it into
-        // KafkaJSSASLAuthenticationError with a plain string, losing both. Report here,
-        // before that happens, then re-throw unchanged so the thrown class is unaffected.
+        // Only the raw protocol error still carries the code; mechanisms re-wrap it. The
+        // published text is built from stable fields alone, never from the error's message.
         this.check()
         if (e.code === SASL_AUTHENTICATION_FAILED_CODE) {
-          this.connection.reportAuthenticationFailure(mechanism, e.message)
+          this.connection.reportAuthenticationFailure(
+            mechanism,
+            `SASL ${mechanism} authentication failed: broker=${this.connection.host}:${this.connection.port} stage=exchange`
+          )
         }
         throw e
       }

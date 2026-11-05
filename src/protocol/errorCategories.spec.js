@@ -91,7 +91,7 @@ describe('categoryOf', () => {
 })
 
 describe('a protocol error carries its category from construction', () => {
-  test('the SASL authentication failure its parser builds by hand is invalidConfiguration', async () => {
+  test('the SASL authentication failure its parser throws is invalidConfiguration', async () => {
     const error = await parse({
       errorCode: 58,
       errorMessage: 'Invalid username or password',
@@ -103,7 +103,7 @@ describe('a protocol error carries its category from construction', () => {
       type: 'SASL_AUTHENTICATION_FAILED',
       code: 58,
       retriable: false,
-      message: 'Invalid username or password',
+      message: 'SASL Authentication failed',
       category: 'invalidConfiguration',
     })
   })

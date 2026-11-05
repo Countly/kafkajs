@@ -74,8 +74,9 @@ module.exports = class ConnectionPool {
    * broker out for `max(authenticationTimeout, 1000ms)`, so getConnection() refuses to
    * (re)authenticate immediately and turn a bad credential into a reconnect storm.
    * @public
-   * @param {string} errorMessage The broker's own error message, surfaced again if a later
-   *                              attempt is refused during the blackout.
+   * @param {string} errorMessage A sanitized description of the failure (mechanism, broker,
+   *                              stage), surfaced again if a later attempt is refused during
+   *                              the blackout; never the broker's own text.
    */
   recordAuthenticationFailure(errorMessage) {
     const blackoutMs = Math.max(this.authenticationTimeout || 0, MIN_AUTHENTICATION_BLACKOUT_MS)

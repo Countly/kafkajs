@@ -1,15 +1,6 @@
 const Decoder = require('../../../decoder')
 const Encoder = require('../../../encoder')
-const {
-  failure,
-  createErrorFromCode,
-  failIfVersionNotSupported,
-  errorCodes,
-} = require('../../../error')
-
-const { KafkaJSProtocolError } = require('../../../../errors')
-const SASL_AUTHENTICATION_FAILED = 58
-const protocolAuthError = errorCodes.find((e) => e.code === SASL_AUTHENTICATION_FAILED)
+const { failure, createErrorFromCode, failIfVersionNotSupported } = require('../../../error')
 
 /**
  * SaslAuthenticate Response (Version: 0) => error_code error_message sasl_auth_bytes
@@ -38,14 +29,15 @@ const decode = async (rawData) => {
   }
 }
 
+/**
+ * Throws a failed answer as the protocol error of its code, with that code's fixed text. The
+ * broker's `error_message` is free text the server chose and may echo what the client sent, so it
+ * is not copied into the error.
+ * @param {{ errorCode: number }} data the decoded response
+ * @returns {Promise<object>} the response, when it succeeded
+ * @throws {import('../../../../errors').KafkaJSProtocolError} for a failure code
+ */
 const parse = async (data) => {
-  if (data.errorCode === SASL_AUTHENTICATION_FAILED && data.errorMessage) {
-    throw new KafkaJSProtocolError({
-      ...protocolAuthError,
-      message: data.errorMessage,
-    })
-  }
-
   if (failure(data.errorCode)) {
     throw createErrorFromCode(data.errorCode)
   }

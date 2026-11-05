@@ -172,7 +172,7 @@ Versions before 3.0.0 are internal alpha tags and are not published.
 
 #### Behavior changes
 
-- Token-admin diagnostics omit credentials and sensitive broker payloads. Error classes and fixed message prefixes remain stable.
+- SASL failures and token-admin diagnostics omit credentials and sensitive broker payloads. Error classes and fixed message prefixes remain stable. Built-in SASL exchange wrappers preserve fixed, library-authored SCRAM validation reasons; other failures use the canonical protocol-code description or `Error` instead of broker or supplier text.
 
 - **Idle connections are closed after 9 minutes** (540 000 ms, Java's `connections.max.idle.ms`; 2.2.4 never closed them) and reopened by the next request, with one more ApiVersions round trip: "Connections idle for 9 minutes are closed by default; the next request reconnects. This is below the default broker idle timeout but does not guarantee close ordering or eliminate races. `connectionsMaxIdle: 0` keeps connections open as before."
 
@@ -185,6 +185,12 @@ Versions before 3.0.0 are internal alpha tags and are not published.
 - Reauthentication on an established, negotiated connection uses this SASL cap without restarting the connection setup timeout, preserving non-retriable provider failures.
 - Reconnects to a node whose connection failed wait 50 ms, growing to 1 000 ms; `reconnectBackoff` and `reconnectBackoffMax` tune it.
 - Timeouts now require positive integral values. Some legacy authentication values and fractional connection values could work. Invalid values throw `KafkaJSInvalidConfigurationError`; existing numeric strings remain accepted.
+
+- SCRAM authentication refuses a non-extending nonce, a non-integer or above-1 048 576 iteration count, and compares the server signature in constant time.
+
+#### Fixes
+
+- A commit the broker refuses names the refused partition: the error carries `topic` and `partition`, as a refused Produce does.
 
 #### Additions
 
@@ -207,6 +213,10 @@ Versions before 3.0.0 are internal alpha tags and are not published.
 
 - `admin.electLeaders`, `describeFeatures`, `updateFeatures`, `listConfigResources`; `describeCluster` gains `includeAuthorizedOperations` and `includeFencedBrokers` and uses DescribeCluster when asked.
 
+- `sasl: { mechanism: 'gssapi' }` over the optional peer `kerberos` 7.0.0, loaded on first use; credentials come from the process environment, with no `kinit` and no subprocess.
+
+- `kerberos` is declared an optional peer dependency pinned to 7.0.0 and is never installed with the package.
+
 #### Tooling
 
 - Live scenarios for the connection setup budget and idle reaping; the soak's idle profile asserts that sockets are reaped and reopened.
@@ -215,6 +225,7 @@ Versions before 3.0.0 are internal alpha tags and are not published.
 
 - `blackhole(id)` in the scripted cluster and the connection-setup benchmark.
 - Track the nineteen admin-ledger APIs in the compatibility snapshot, the tracked list and the generated matrix, with named broker ranges.
+- Tests pin the SCRAM client checks, the TLS negatives, secret hygiene across the SASL mechanisms and the DNS behaviour.
 
 ### Phase 9B — Producer parity: delivery deadline, memory bound, request size, partitioner, codecs, lifecycle
 

@@ -63,6 +63,10 @@ What to change to install the package and run it on a Kafka 4.x cluster.
 
 - Connections idle for 9 minutes are closed by default; the next request reconnects. This is below the default broker idle timeout but does not guarantee close ordering or eliminate races. `connectionsMaxIdle: 0` keeps connections open as before.
 
+To use GSSAPI, install `kerberos@7.0.0` yourself. The client loads this optional peer at the first GSSAPI authentication. Provide credentials through `KRB5CCNAME` and `KRB5_CONFIG`; a client keytab through `KRB5_CLIENT_KTNAME` depends on the platform's Kerberos implementation. Ticket acquisition and renewal are the deployment's job. The client runs no `kinit` or subprocess and has no Linux or macOS password option. Existing custom authentication providers retain precedence.
+
+- **SCRAM server checks.** SCRAM authentication now refuses, before deriving any key, a server-first message whose nonce does not extend the client's (an equal nonce included), whose iteration count is not an integer or is above 1 048 576, or that has a mandatory-extension, unknown or repeated attribute; it compares the server signature in constant time, and a server error attribute fails the exchange without its text. *What to do:* nothing for a Kafka broker, whose credentials allow at most 16 384 iterations. A server that asks for more needs the credential's iteration count lowered; there is no option to relax the checks.
+
 ### Producer
 
 - Remove the `kafkajs-snappy` registration to use the built-in codec, or keep it: yours wins. The built-in codec runs on the main thread (no native module), in short slices that yield to the event loop: about 100 MiB/s to decode, 40 MiB/s to encode
@@ -1279,6 +1283,8 @@ now logged.
 - **A forced producer close reports `KafkaJSProducerClosedError` with transmission evidence.** `outcome` is `'unsent'` for work that was never written and `'unknown'` for anything written at least once, which may still have been applied by the broker. The error is non-retriable and its `category` is `abortable`. A class without an `outcome`, or the absence of an error, proves nothing about delivery.
 
 - Switches handling partition-halted reasons keep the two reset reasons added with offsetReset. No-group CRASH/halt groupId is null. Existing corrupt/decode offset stays decimal and decode metadata fields remain available. TypeScript ≥4.1 remains required for the duration template-literal type.
+
+- **SASL diagnostics.** A broker's SASL error message, its authentication bytes, a SCRAM server error and what a token endpoint answered no longer reach error messages, causes, log lines, the `AUTHENTICATION_FAILURE` event or the reconnect blackout. Error classes and prefixes such as `SASL PLAIN authentication failed:` are unchanged; the text after the prefix preserves fixed, library-authored SCRAM validation reasons, uses the canonical description for a protocol error code (for example `SASL Authentication failed`), and is `Error` for other broker or supplier failures, the protocol error keeps its `type` and `code`, and the event's `errorMessage` reads `SASL <MECHANISM> authentication failed: broker=<host:port> stage=exchange`. *What to do:* diagnose from the error class, the protocol error's `type` and `code`, and the event's `broker` and `mechanism`; read the broker's own log for its message. Nothing restores the broker text.
 
 ### Protocol
 

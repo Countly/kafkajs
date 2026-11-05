@@ -7,6 +7,23 @@ DIR="$(cd "$(dirname "$0")/.." && pwd)/testHelpers/certs"
 PASS=testtest
 DAYS=3650
 SAN="DNS:localhost,DNS:kafka1,DNS:kafka2,DNS:kafka3,IP:127.0.0.1"
+
+# --client <directory>: issues a short-lived client certificate from the tracked test CA into an
+# ignored directory, for the listener that requires client authentication. Never commit it.
+if [ "${1:-}" = "--client" ]; then
+  OUT="${2:?usage: generateKafkaCertificates.sh --client <directory>}"
+  mkdir -p "$OUT"
+  openssl req -new -newkey rsa:2048 -nodes -subj "/O=kafkajs/OU=kafkajs/CN=kafkajs-test-client" \
+    -keyout "$OUT/client.key" -out "$OUT/client.csr" 2>/dev/null
+  printf "extendedKeyUsage=clientAuth\nkeyUsage=digitalSignature,keyEncipherment\n" > "$OUT/client.ext"
+  openssl x509 -req -sha256 -in "$OUT/client.csr" -CA "$DIR/cert-signed" -CAkey "$DIR/ca-key" \
+    -CAserial "$OUT/ca.srl" -CAcreateserial -out "$OUT/client.pem" -days 2 -extfile "$OUT/client.ext" 2>/dev/null
+  chmod 600 "$OUT/client.key"
+  rm -f "$OUT/client.csr" "$OUT/client.ext" "$OUT/ca.srl"
+  echo "client certificate issued in $OUT"
+  exit 0
+fi
+
 WORK="$(mktemp -d)"
 
 rm -f "$DIR"/ca-key "$DIR"/ca-cert.srl "$DIR"/cert-file "$DIR"/cert-signed \

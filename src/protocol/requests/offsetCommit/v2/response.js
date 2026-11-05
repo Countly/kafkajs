@@ -27,13 +27,24 @@ const decodePartitions = (decoder) => ({
   errorCode: decoder.readInt16(),
 })
 
+/**
+ * Throws the first failed partition's error code as a protocol error that names the partition,
+ * as a Produce failure does (`topic`, `partition`); a response without a failure is returned.
+ * Every OffsetCommit version parses here.
+ * @param {{ responses: Array<{ topic: string|null, partitions: Array<{ partition: number,
+ *   errorCode: number }> }> }} data the decoded response
+ * @returns {Promise<object>} the response
+ * @throws {import('../../../../errors').KafkaJSProtocolError} carrying `topic` and `partition`
+ */
 const parse = async (data) => {
-  const partitionsWithError = data.responses.flatMap((response) =>
-    response.partitions.filter((partition) => failure(partition.errorCode))
-  )
-  const partitionWithError = partitionsWithError[0]
-  if (partitionWithError) {
-    throw createErrorFromCode(partitionWithError.errorCode)
+  for (const { topic, partitions } of data.responses) {
+    const failed = partitions.find((partition) => failure(partition.errorCode))
+    if (failed) {
+      const error = createErrorFromCode(failed.errorCode)
+      error.topic = topic
+      error.partition = failed.partition
+      throw error
+    }
   }
 
   return data
