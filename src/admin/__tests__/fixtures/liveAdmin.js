@@ -485,13 +485,14 @@ class AdminLiveProbe {
   }
 
   /**
-   * Compares what the scenario holds now with its baseline: open sockets, abort listeners on the
+   * Finds what the scenario holds beyond its baseline: open sockets, abort listeners on the
    * owner signal and the event-loop resources of `HELD_RESOURCES`. A difference gets up to
    * `CLOSE_TURNS` loop turns to disappear, because a handle the scenario already destroyed is
-   * still counted until the loop has run its close callback.
+   * still counted until the loop has run its close callback. A count below its baseline is not
+   * retention: the baseline can include setup work that finished during the scenario.
    * @param {number} signalListeners abort listeners the owner signal had at the baseline
-   * @returns {Promise<string[]>} one `<name> (baseline <n>, after <m>)` entry per count that still
-   *   differs; counts only, never values
+   * @returns {Promise<string[]>} one `<name> (baseline <n>, after <m>)` entry per count still above
+   *   its baseline; counts only, never values
    */
   async retainedResources(signalListeners) {
     let retained = []
@@ -507,7 +508,7 @@ class AdminLiveProbe {
           after.activeResources[key] || 0,
         ]),
       ]
-        .filter(([, before, now]) => before !== now)
+        .filter(([, before, now]) => now > before)
         .map(([name, before, now]) => `${name} (baseline ${before}, after ${now})`)
       if (!retained.length) break
     }

@@ -446,6 +446,18 @@ test('names each retained count with its baseline and its value after cleanup', 
   }
 })
 
+test('does not call a count below its baseline retained', async () => {
+  const { probe } = scenario()
+  probe.resourceProbe = {
+    snapshot: jest
+      .fn()
+      .mockResolvedValueOnce({ sockets: { open: 2 }, activeResources: { Timeout: 7 } })
+      .mockResolvedValue({ sockets: { open: 1 }, activeResources: { Timeout: 4 } }),
+  }
+  await expect(probe.finish(async () => 'done')).resolves.toBe('done')
+  expect(liveRun.tainted).toBe(false)
+})
+
 test('does not call a handle that is still closing retained, and stops reading once it is gone', async () => {
   const { probe } = scenario()
   const baseline = { sockets: { open: 0 }, activeResources: { TCPSocketWrap: 1 } }
