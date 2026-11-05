@@ -260,6 +260,16 @@ Versions before 3.0.0 are internal alpha tags and are not published.
 - `test:floor:conditional` runs `floorConditionalLive.spec.js` (`FLOOR_CONDITIONAL_E2E`) on `docker-compose.racks.yml` against Kafka 4.0.2: ApiVersions, TxnOffsetCommit and DeleteGroups keep the versions the floor's ranges offer and the producer's rack preference falls back, each by the range oracle and never by a version string.
 - The scripted cluster answers a client's ApiVersions v5 request as a Kafka 4.3 broker does, with a v0-shaped UNSUPPORTED_VERSION, so the inherited scenarios negotiate v4 as they did. It leaves out of `requests()` only one refusal per negotiation, a socket's first request or the renegotiation after the client opened another socket to the node; a second negotiation on an unchanged connection stays visible. `apiVersionTrace()` lists every one, and `test:e2e:api-identity` runs `apiVersionsIdentityLive.spec.js` (`API_IDENTITY_E2E`) against the broker version under test.
 
+### Phase 9E — Share groups
+
+#### Behavior changes
+
+- No existing public API, option default, event or runtime behaviour changes in this phase.
+
+#### Tooling
+
+- Track the seven released share-group APIs (keys 76–79 and 90–92) in the Kafka 4.4.0 and 4.3.1 message snapshots and regenerate their protocol compatibility inventory. Source inventory alone does not add share-group support.
+
 ### Phase 9B — Producer parity: delivery deadline, memory bound, request size, partitioner, codecs, lifecycle
 
 #### Behavior changes
