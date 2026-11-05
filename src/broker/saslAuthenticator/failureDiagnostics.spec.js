@@ -394,6 +394,29 @@ describe('SASL safe failure cause', () => {
     expect(calls).toEqual([])
   })
 
+  test('stops at a Proxy in the prototype chain without invoking its traps', () => {
+    const calls = []
+    const ancestor = new Proxy(KafkaJSProtocolError.prototype, {
+      getPrototypeOf() {
+        calls.push('getPrototypeOf')
+        throw new Error('secret')
+      },
+    })
+    const error = Object.setPrototypeOf(new Error('secret'), ancestor)
+    expect(failureCause(error)).toBe('')
+    expect(calls).toEqual([])
+  })
+
+  test('adds no type or code for an integer outside the protocol table', () => {
+    const forged = Object.assign(
+      Object.setPrototypeOf(new Error('secret'), KafkaJSProtocolError.prototype),
+      {
+        code: 8675309,
+      }
+    )
+    expect(failureCause(forged)).toBe(' cause=KafkaJSProtocolError')
+  })
+
   test('does not invoke a code getter', () => {
     const code = jest.fn(() => 58)
     const error = Object.defineProperty(createErrorFromCode(58), 'code', { get: code })

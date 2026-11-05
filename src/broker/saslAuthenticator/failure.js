@@ -1,6 +1,6 @@
-const { isNativeError } = require('util').types
+const { isNativeError, isProxy } = require('util').types
 const errors = require('../../errors')
-const { createErrorFromCode } = require('../../protocol/error')
+const { createErrorFromCode, errorCodes } = require('../../protocol/error')
 
 const { KafkaJSSASLAuthenticationError, KafkaJSNonRetriableError, KafkaJSProtocolError } = errors
 
@@ -84,12 +84,14 @@ const failureDetail = (error) => {
 }
 
 /**
- * Finds the nearest class in `NAMEABLE_CLASSES` on a native error's prototype chain.
+ * Finds the nearest class in `NAMEABLE_CLASSES` on a native error's prototype chain. A Proxy in
+ * the chain ends the walk before its traps can run.
  * @param {Error} error a native error, never a Proxy itself
  * @returns {Function|undefined} the class, or undefined when the chain holds none
  */
 const nameableClass = (error) => {
   for (let proto = Object.getPrototypeOf(error); proto; proto = Object.getPrototypeOf(proto)) {
+    if (isProxy(proto)) return undefined
     const Class = NAMEABLE_CLASSES.find((candidate) => candidate.prototype === proto)
     if (Class) return Class
   }
@@ -99,7 +101,7 @@ const nameableClass = (error) => {
 /**
  * Describes a failure by its class alone, for a message that must not carry the failure's text.
  * The class is found by prototype identity in a closed list, never by reading `name`, and a
- * protocol error adds the `type` and `code` the protocol table holds for its own integer `code`.
+ * protocol error adds `type` and `code` only when its own `code` is in the protocol table.
  * Does not execute supplier property accessors or Proxy traps. A plain `Error`, a non-error, or a
  * class outside the list names nothing, since it says nothing a reader can act on.
  * @param {*} error the failure
@@ -109,10 +111,10 @@ const failureCause = (error) => {
   const Class = isNativeError(error) ? nameableClass(error) : undefined
   if (!Class) return ''
   const code = Object.getOwnPropertyDescriptor(error, 'code')?.value
-  const protocol =
-    error instanceof KafkaJSProtocolError && Number.isInteger(code)
-      ? ` type=${createErrorFromCode(code).type} code=${code}`
-      : ''
+  const known =
+    (Class === KafkaJSProtocolError || Class.prototype instanceof KafkaJSProtocolError) &&
+    errorCodes.some((entry) => entry.code === code)
+  const protocol = known ? ` type=${createErrorFromCode(code).type} code=${code}` : ''
   return ` cause=${Class.name}${protocol}`
 }
 
