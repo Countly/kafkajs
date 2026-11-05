@@ -96,9 +96,10 @@ class RackPreference {
 
   /**
    * Whether a topic's sticky partition may still be used: the topic has it and `eligible` would
-   * offer it, or offers nothing so every partition is a candidate. Allocates nothing, and is
-   * constant time while the partition is still led in the producer's rack (or, with the
-   * preference off, led at all); otherwise it is linear in the partition count.
+   * offer it, or offers nothing so every partition is a candidate. Allocates nothing. It is
+   * constant time when the partition id indexes its own entry (as Kafka's ids 0..n-1 do) and the
+   * partition is still led in the producer's rack (or, with the preference off, led at all);
+   * otherwise it is linear in the partition count.
    * @param {{ partitionId: number, leader: number }[]} partitionMetadata
    * @param {number} partition the sticky partition's id
    * @returns {boolean}
