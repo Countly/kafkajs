@@ -226,6 +226,7 @@ Versions before 3.0.0 are internal alpha tags and are not published.
 - `blackhole(id)` in the scripted cluster and the connection-setup benchmark.
 - Track the nineteen admin-ledger APIs in the compatibility snapshot, the tracked list and the generated matrix, with named broker ranges.
 - Tests pin the SCRAM client checks, the TLS negatives, secret hygiene across the SASL mechanisms and the DNS behaviour.
+- The 4.0 floor set covers the admin ledger, connection, OAuth, GSSAPI and delegation-token capabilities and asserts the unsupported results.
 
 ### Phase 9B — Producer parity: delivery deadline, memory bound, request size, partitioner, codecs, lifecycle
 

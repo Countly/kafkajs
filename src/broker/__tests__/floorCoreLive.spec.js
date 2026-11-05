@@ -5,7 +5,7 @@ const COORDINATOR_TYPES = require('../../protocol/coordinatorTypes')
 const ISOLATION_LEVEL = require('../../protocol/isolationLevel')
 const { Kafka, CompressionTypes, logLevel, PartitionAssigners } = require('../../../index')
 const { lookupCodec } = require('../../protocol/message/compression')
-const { KafkaJSNotImplemented } = require('../../errors')
+const { KafkaJSNotImplemented, KafkaJSServerDoesNotSupportApiKey } = require('../../errors')
 const {
   decodeField,
   recordsField,
@@ -26,6 +26,17 @@ const {
 } = require('testHelpers')
 const { problemsOf } = require('../../../scripts/evidence/verify')
 const { lanes } = require('../../../testHelpers/lane')
+const FloorCapabilities = require('../../../testHelpers/floorCapabilities')
+const {
+  HeldDial,
+  SuiteBudget,
+  SUITE_MS,
+  caseTimeout,
+  deepest,
+  markersOf,
+  refusalOf,
+  runFloorCase,
+} = require('./fixtures/floorAdmin')
 const { createScriptedCluster, producerScript } = require('../../../testHelpers/scriptedCluster')
 const { TOPIC } = require('../../consumer/__tests__/fixtures/fetchHarness')
 const { WireTap, scanBatches } = require('../../producer/__tests__/fixtures/liveWire')
@@ -1116,6 +1127,180 @@ describeFloor('Kafka floor core (live)', () => {
     ])
     expect(ofCase('consumer-regex')).toEqual([expect.objectContaining({ discovered: true })])
     expect(lines.filter(({ case: name }) => name === 'F08')).toHaveLength(f08.length)
+    for (const line of lines) expect(problemsOf(line, verified)).toEqual([])
+  })
+})
+
+describe('Floor capability expectations', () => {
+  const inputs = () => ({
+    recorded: { ListTransactions: [0, 1] },
+    observed: { ListTransactions: [0, 1] },
+    implemented: { ListTransactions: [0, 1, 2] },
+  })
+
+  test('maps actual codec definitions and the retained probe without relying on a release label', () => {
+    const names = ['ListOffsets', 'ListTransactions', 'ListConfigResources']
+    const versions = Object.fromEntries(
+      names.map((name) => {
+        const [minVersion, maxVersion] = rangeOf(brokerRanges['4.0.2'], apiKeys[name])
+        return [apiKeys[name], { minVersion, maxVersion }]
+      })
+    )
+    const ranges = FloorCapabilities.fromBroker({ versions }, names, '4.0.2')
+    expect(ranges.ListOffsets.selected).toBe(10)
+    expect(ranges.ListTransactions.selected).toBe(1)
+    expect(ranges.ListConfigResources.selected).toBe(0)
+    delete versions[apiKeys.ListOffsets]
+    expect(() => FloorCapabilities.fromBroker({ versions }, names, '4.0.2')).toThrow(
+      'missing range'
+    )
+  })
+
+  test('selects the highest overlap of independently observed and implemented ranges', () => {
+    expect(new FloorCapabilities(inputs()).version('ListTransactions')).toBe(1)
+  })
+
+  test.each([undefined, [2, 1], [-1, 1], [0, 0]])(
+    'refuses a missing, invalid or stale observed range %p',
+    (range) => {
+      const tables = inputs()
+      tables.observed.ListTransactions = range
+      expect(() => new FloorCapabilities(tables).version('ListTransactions')).toThrow()
+    }
+  )
+
+  test('requires the option, needed version and both complete ranges in a typed refusal', () => {
+    const oracle = new FloorCapabilities(inputs())
+    const text =
+      'ListTransactions transactionalIdPattern needs v2; client implements v0-v2; broker offers v0-v1'
+    const error = new KafkaJSServerDoesNotSupportApiKey(text)
+    expect(() =>
+      oracle.unsupported(error, 'ListTransactions', 2, 'transactionalIdPattern')
+    ).not.toThrow()
+    for (const removed of ['ListTransactions', 'transactionalIdPattern', 'v2;', 'v0-v2', 'v0-v1']) {
+      expect(() =>
+        oracle.unsupported(
+          new KafkaJSServerDoesNotSupportApiKey(text.replace(removed, '')),
+          'ListTransactions',
+          2,
+          'transactionalIdPattern'
+        )
+      ).toThrow()
+    }
+    expect(() =>
+      oracle.unsupported(new Error(text), 'ListTransactions', 2, 'transactionalIdPattern')
+    ).toThrow('wrong refusal class')
+  })
+
+  test('uses negotiated ranges even when an unrelated release label suggests a newer broker', () => {
+    const tables = { ...inputs(), release: 'future' }
+    expect(new FloorCapabilities(tables).version('ListTransactions')).toBe(1)
+  })
+
+  test('refuses a supported option represented as unsupported', () => {
+    const tables = inputs()
+    tables.observed.ListTransactions = [0, 2]
+    tables.recorded.ListTransactions = [0, 2]
+    expect(() =>
+      new FloorCapabilities(tables).unsupported(
+        new Error(),
+        'ListTransactions',
+        2,
+        'transactionalIdPattern'
+      )
+    ).toThrow('option is supported')
+  })
+})
+
+describe('Floor administration helpers', () => {
+  test('a shared budget starts once, only shrinks and refuses a start with no cleanup reserve left', () => {
+    const budget = new SuiteBudget({ totalMs: 60000, reserveMs: 100 })
+    const first = budget.take()
+    const second = budget.take()
+
+    expect(first).toBeLessThanOrEqual(60000)
+    expect(second).toBeLessThanOrEqual(first)
+    expect(() => new SuiteBudget({ totalMs: 50, reserveMs: 100 }).take()).toThrow(
+      'The shared administration budget is exhausted'
+    )
+  })
+
+  test('a typed refusal is found through its cause chain, and a cycle or a non-error ends the walk', () => {
+    const refusal = new KafkaJSServerDoesNotSupportApiKey('refused')
+    const wrapped = new Error('outer', { cause: new Error('middle', { cause: refusal }) })
+    const loop = new Error('a')
+    loop.cause = new Error('b', { cause: loop })
+
+    expect(refusalOf(wrapped)).toBe(refusal)
+    expect(refusalOf(loop)).toBe(loop)
+    expect(refusalOf(null)).toBeNull()
+    expect(deepest(wrapped)).toBe(refusal)
+    expect(deepest(loop)).toBe(loop.cause)
+  })
+
+  test('credential markers cover the encodings a log or a buffer dump can show', () => {
+    expect(markersOf('ab')).toEqual(['ab', '6162', 'YWI=', '61 62', '97,98'])
+    expect(markersOf(Buffer.from([0xff]))).toContain('ff')
+  })
+
+  test('a held dial withholds readiness, counts one attempt per destroyed socket and lets a free dial through', () => {
+    const made = []
+    const transport = (options) => {
+      const socket = { destroyed: false, options, destroy: () => (socket.destroyed = true) }
+      made.push(socket)
+      return socket
+    }
+    const dial = new HeldDial(transport)
+    const ready = []
+    dial.holding = true
+    const held = dial.factory({ onConnect: () => ready.push('held') })
+    made[0].options.onConnect()
+    held.destroy()
+    held.destroy()
+    dial.holding = false
+    dial.factory({ onConnect: () => ready.push('free') })
+    made[1].options.onConnect()
+
+    expect(ready).toEqual(['free'])
+    expect(dial.attempts).toHaveLength(1)
+    expect(dial.attempts[0]).toBeGreaterThanOrEqual(0)
+    expect(dial.sockets).toEqual(made)
+  })
+})
+
+describeFloor('Administration and connection capabilities on the floor', () => {
+  const budget = new SuiteBudget()
+  const CASES = ['F10', 'F11', 'F12', 'F13', 'F14', 'F15', 'F16', 'F17']
+  /** @param {string} title the exact case title @param {string} method the case it runs */
+  const floorCase = (title, method) =>
+    test(title, () => runFloorCase(budget, method), caseTimeout(SUITE_MS))
+
+  floorCase('deletes offsets and fetches three groups through negotiated versions', 'offsets')
+  floorCase('describes active transactions and refuses an unavailable pattern', 'diagnostics')
+  floorCase('aborts a physical transaction and fences the original producer', 'abortFence')
+  floorCase(
+    'lists cluster resources and refuses filters absent from the negotiated version',
+    'cluster'
+  )
+  floorCase(
+    'reports replicas in their current directory without inventing a cordon flag',
+    'logDirs'
+  )
+  floorCase('retains reassignment and offset-spec refusals on the negotiated floor', 'reassignment')
+  floorCase('round trips quota and SCRAM administration without leaking credentials', 'security')
+  floorCase('bounds setup, idle reopening and a stalled administrative call', 'connection')
+
+  test('every administration and connection evidence line carries the stamps a verifier checks', () => {
+    const lines = evidenceLines(EVIDENCE)
+      .slice(linesBefore)
+      .filter(({ case: name }) => CASES.includes(name))
+    const verified = {
+      tree: process.env.KAFKAJS_TREE || 'unfrozen',
+      node: process.version,
+      brokerVersion: process.env.KAFKA_VERSION,
+    }
+
+    expect(lines.map(({ case: name }) => name).sort()).toEqual(CASES)
     for (const line of lines) expect(problemsOf(line, verified)).toEqual([])
   })
 })

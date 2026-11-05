@@ -524,3 +524,56 @@ describe('documented live scenario scripts', () => {
     expect(page).toContain('| `npm run soak:consumer-churn` |')
   })
 })
+
+describe('Floor command registration', () => {
+  const routes = [
+    ['test:floor', 3600, 'tv2', 'FLOOR_CORE_E2E', 'src/broker/__tests__/floorCoreLive.spec.js'],
+    [
+      'test:floor:oauth',
+      900,
+      'oauthbearer',
+      'FLOOR_OAUTH_E2E',
+      'src/oauth/__tests__/floorOAuthLive.spec.js',
+    ],
+    [
+      'test:floor:gssapi',
+      1200,
+      'kerberos',
+      'FLOOR_GSSAPI_E2E',
+      'src/broker/__tests__/floorGssapiLive.spec.js',
+    ],
+    [
+      'test:floor:tokens',
+      600,
+      'tokens',
+      'FLOOR_TOKENS_E2E',
+      'src/admin/__tests__/floorTokensLive.spec.js',
+    ],
+  ]
+
+  it('routes every floor script directly through the shared guard', () => {
+    for (const [name, cap, profile, flag, spec] of routes) {
+      expect(scripts[name]).toBe(
+        `timeout --kill-after=10s ${cap}s node "$P9_CLUSTER_GUARD" 4.0.2 ${profile} ${flag} ${spec}`
+      )
+    }
+  })
+
+  it('retains the OAuth wildcard and registers each other sibling once in both unit lanes', () => {
+    for (const lane of ['test:unit', 'test:coverage:unit']) {
+      expect(scripts[lane]).toContain('src/oauth/.*')
+      for (const pattern of [
+        'src/broker/__tests__/floorGssapiLive\\.spec\\.js',
+        'src/admin/__tests__/floorTokensLive\\.spec\\.js',
+      ]) {
+        expect(scripts[lane].split(pattern)).toHaveLength(2)
+      }
+    }
+  })
+
+  it('documents each floor variant and its nonlocal execution owner', () => {
+    for (const [script] of routes) expect(page).toContain('`' + script + '`')
+    expect(page).toContain('Kafka 4.0.2 floor executions belong to CI.')
+    expect(page).toContain('A missing or unbootable image blocks acceptance.')
+  })
+})
