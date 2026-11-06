@@ -4347,6 +4347,7 @@ const changeLeaderAnswer = async (evidence, request, mutate) => {
                 records: partition.messages.map((message) =>
                   record({
                     ...message,
+                    headers: Object.entries(message.headers ?? {}),
                     offsetDelta: Number(
                       BigInt(message.offset) - BigInt(partition.messages[0].offset)
                     ),
