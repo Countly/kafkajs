@@ -984,6 +984,11 @@ if (command === 'java') process.stdout.write(JSON.stringify({ args }) + '\\n')
       ],
       ['share probe', ['--role', 'share-member', '--probe'], 'JavaShareMember'],
       [
+        'share poll journal',
+        ['--role', 'share-member', '--report-polls', 'host', 'group', 'topic', '100'],
+        'JavaShareMember',
+      ],
+      [
         'share halt',
         ['--role', 'share-member', '--halt-after', '2', 'host', 'group', 'topic', '100'],
         'JavaShareMember',
