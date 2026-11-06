@@ -619,7 +619,14 @@ class Member {
       if (hold) {
         this.hold = null
         this.held = entry
-        const timer = setInterval(() => payload.renew().catch(() => {}), RENEW_MS)
+        const timer = setInterval(() => {
+          try {
+            payload.renew().catch(() => {})
+          } catch {
+            // A revoked call refuses renewal synchronously; there is nothing left to renew.
+            clearInterval(timer)
+          }
+        }, RENEW_MS)
         try {
           await hold.promise
         } finally {
