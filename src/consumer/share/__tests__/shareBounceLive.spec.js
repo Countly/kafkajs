@@ -67,7 +67,8 @@ const LATE_BURST_MS = 1000
 const WARMUP_APPENDS = 2000
 const MAX_OUTAGE_MS = 45000
 const MAX_HELD = 300
-const MAX_REPLAY = 6 * MAX_HELD
+const BOUNCE_COUNT = 6
+const MAX_REPLAY = BOUNCE_COUNT * MAX_HELD
 const MEMBERSHIP_QUIET_MS = 3000
 const OLD_TIMESTAMP = '1700000000000'
 const SERVICES = ['kafka1', 'kafka2', 'kafka3']
@@ -581,11 +582,12 @@ class BounceEvidence {
       (episode) => precedes(episode, cut) && cut.at <= (episode.restoredAt ?? Infinity)
     )
     if (!bounce) return
-    const history = unresolvedAt(entries, this, cut)
     const scopes = new Map()
-    for (const scope of interruptedScopes(entries, this, kind, event)) {
+    for (const scope of interruptedScopes(entries, this, kind, event, bounce)) {
       if (scope.nodeId === bounce.nodeId) scopes.set(JSON.stringify(scope), scope)
     }
+    if (!scopes.size) return
+    const history = unresolvedAt(entries, this, cut)
     for (const scope of scopes.values()) {
       if (bounce.interruptions.some((prior) => samePartition(prior.scope, scope))) continue
       const obligations = history.filter((entry) => sameAuthority(authority(entry), scope))
@@ -597,17 +599,17 @@ class BounceEvidence {
           event: event.id,
           scope,
           obligations: obligations.map((entry) =>
-            obligation(entry, snapshots, bounce.index, this, cut)
+            obligation(entry, snapshots, bounce.index, this, cut, true)
           ),
           carried,
           lateEntries: obligations.filter((entry) => precedes(bounce, entry)).map(({ id }) => id),
           history: history.map(({ id }) => id),
         })
       )
-      if (new Set(history.map(({ identity }) => identity)).size > MAX_HELD)
-        this.owner.captureProblems.push('Interruption unresolved history exceeds its allowance')
-      if (effectiveObligations(bounce).size > MAX_HELD)
-        this.owner.captureProblems.push('Combined interruption history exceeds its allowance')
+      this.owner.captureProblems.push(
+        ...historyAccounting(entries, snapshots, this, cut).problems,
+        ...admissionAccounting(snapshots).problems
+      )
     }
   }
 
@@ -912,9 +914,10 @@ const interrupts = (kind, event, scope) => {
  * @param {BounceEvidence} evidence Original acquisitions and retirements.
  * @param {string} kind Primitive observation type.
  * @param {object} event Original primitive event.
+ * @param {object} [bounce] Excludes partitions whose first interruption is already frozen.
  * @returns {object[]} Affected authorities, newest open first for each partition.
  */
-const interruptedScopes = (entries, evidence, kind, event) => {
+const interruptedScopes = (entries, evidence, kind, event, bounce) => {
   const cut = interruptionEvent(kind, event)
   const originals = [
     ...entries.filter((entry) => precedes(entry, cut)),
@@ -930,7 +933,11 @@ const interruptedScopes = (entries, evidence, kind, event) => {
         acquisition,
       })),
   ]
-    .filter((entry) => entry.acquisition?.source?.frames[0])
+    .filter(
+      (entry) =>
+        entry.acquisition?.source?.frames[0] &&
+        !bounce?.interruptions.some(({ scope }) => samePartition(scope, entry))
+    )
     .sort((a, b) => b.acquisition.adoptedAt - a.acquisition.adoptedAt)
   const scopes = new Map()
   for (const entry of originals) {
@@ -970,9 +977,10 @@ const unresolvedAt = (entries, evidence, cut) => {
 /** @param {object} bounce Frozen episode. @returns {Map} Its combined identity and attempt projections. */
 const effectiveObligations = (bounce) => {
   const identities = new Map()
-  const snapshots = bounce.interruptions?.length
-    ? bounce.interruptions
-    : [{ obligations: [], carried: bounce.carried ?? [] }]
+  const snapshots = [
+    { obligations: [], carried: bounce.carried ?? [] },
+    ...(bounce.interruptions ?? []),
+  ]
   for (const cut of snapshots)
     for (const held of [...cut.obligations, ...cut.carried]) {
       if (!identities.has(held.identity)) identities.set(held.identity, [])
@@ -988,9 +996,10 @@ const effectiveObligations = (bounce) => {
  * @param {number} index Episode recording this observation.
  * @param {BounceEvidence} evidence Original ticket journal.
  * @param {object} cut Observation boundary.
+ * @param {boolean} [admit] Whether this observation is a qualifying interruption.
  * @returns {object} Original attempt and tickets, retaining the first interruption attribution.
  */
-const obligation = (entry, bounces, index, evidence, cut) => ({
+const obligation = (entry, bounces, index, evidence, cut, admit = false) => ({
   identity: entry.identity,
   entry: entry.id,
   cohort: entry.acquisition?.id,
@@ -1005,9 +1014,8 @@ const obligation = (entry, bounces, index, evidence, cut) => ({
   originatingEpisode:
     bounces.find(
       (episode) =>
-        episode.index < index &&
-        [...effectiveObligations(episode).values()].flat().some((held) => held.entry === entry.id)
-    )?.index ?? index,
+        episode.index < index && newObligations(episode).some((held) => held.entry === entry.id)
+    )?.index ?? (admit ? index : null),
 })
 
 /**
@@ -1071,110 +1079,267 @@ const matchingInterruption = (entry, bounce, evidence, after = Infinity) => {
 }
 
 /**
- * Recomputes both freezes from independent journals; final settlement cannot rewrite membership.
+ * @param {object} bounce Original interruption snapshots.
+ * @returns {object[]} Immutable new attempts; copies of earlier admissions are excluded.
+ */
+const newObligations = (bounce) => [
+  ...new Map(
+    (bounce.interruptions ?? [])
+      .flatMap(({ obligations }) => obligations)
+      .filter(({ originatingEpisode }) => originatingEpisode === bounce.index)
+      .map((held) => [held.entry, held])
+  ).values(),
+]
+
+/**
+ * @param {object[]} bounces Independently reconstructed or actively captured admissions.
+ * @returns {object} Separate new, carried and eligible identity budgets with attempt references.
+ */
+const admissionAccounting = (bounces) => {
+  const problems = []
+  const admitted = new Map()
+  const union = new Set()
+  const effectiveUnion = new Set()
+  const episodes = bounces.map((bounce, position) => {
+    const newly = newObligations(bounce)
+    const newIdentities = new Set(newly.map(({ identity }) => identity))
+    const carry = [
+      ...new Map(
+        [bounce, ...(bounce.interruptions ?? [])]
+          .flatMap(({ carried }) => carried ?? [])
+          .map((held) => [held.entry, held])
+      ).values(),
+    ]
+    const carriedIdentities = new Set(carry.map(({ identity }) => identity))
+    const effective = effectiveObligations(bounce)
+    for (const identity of effective.keys()) effectiveUnion.add(identity)
+    if (bounce.index !== position || position >= BOUNCE_COUNT)
+      problems.push('Fault admission requires one of the six original episodes')
+    for (const held of carry) {
+      const original = admitted.get(held.entry)
+      if (!original || JSON.stringify(original) !== JSON.stringify(held))
+        problems.push(`bounce ${bounce.index} has unattributed carry`)
+    }
+    for (const held of newly) {
+      if (admitted.has(held.entry))
+        problems.push(`bounce ${bounce.index} admits an original attempt twice`)
+      admitted.set(held.entry, held)
+      union.add(held.identity)
+    }
+    if (newIdentities.size > MAX_HELD)
+      problems.push(`bounce ${bounce.index} new uncertainty exceeds its allowance`)
+    if (
+      carriedIdentities.size > MAX_HELD * position ||
+      effective.size > newIdentities.size + carriedIdentities.size ||
+      effective.size > MAX_HELD * (position + 1)
+    )
+      problems.push(`bounce ${bounce.index} combined freeze exceeds its allowance`)
+    return {
+      index: bounce.index,
+      newCount: newIdentities.size,
+      newIdentities: [...newIdentities],
+      admissions: newly,
+      carriedCount: carriedIdentities.size,
+      carried: carry,
+      frozenCount: effective.size,
+      frozenIdentities: [...effective.keys()],
+    }
+  })
+  if (
+    episodes.reduce((sum, { newCount }) => sum + newCount, 0) > MAX_REPLAY ||
+    union.size > MAX_REPLAY ||
+    JSON.stringify([...union].sort()) !== JSON.stringify([...effectiveUnion].sort())
+  )
+    problems.push('Combined interruption union exceeds its allowance')
+  return { episodes, eligibleIdentities: [...union], problems }
+}
+
+/**
+ * Decomposes complete unresolved history without treating retired unknowns as live pending work.
+ * @param {object[]} entries Original handler journal, including retired attempts.
+ * @param {object[]} bounces Admissions captured before or at this observation.
+ * @param {BounceEvidence} evidence Primitive loss and outcome journals.
+ * @param {object} cut Original observation boundary.
+ * @returns {object} Independent live/history/admitted counts and unexplained retired attempts.
+ */
+const historyAccounting = (entries, bounces, evidence, cut) => {
+  const history = unresolvedAt(entries, evidence, cut)
+  const losses = interruptionJournal(evidence)
+  const pending = history.filter(
+    (entry) =>
+      !losses.some(
+        ({ kind, event }) =>
+          precedes(interruptionEvent(kind, event), cut) && interrupts(kind, event, authority(entry))
+      ) &&
+      !evidence.results(entry).some((outcome) => outcome.type !== 'renew' && precedes(outcome, cut))
+  )
+  const pendingIds = new Set(pending.map(({ id }) => id))
+  const admissions = new Map(
+    bounces.flatMap((bounce) =>
+      (bounce.interruptions ?? [])
+        .filter((snapshot) => !precedes(cut, snapshot))
+        .flatMap(({ obligations }) => obligations)
+        .filter(({ originatingEpisode }) => originatingEpisode === bounce.index)
+        .map((held) => [held.entry, held])
+    )
+  )
+  const retained = history.filter(({ id }) => admissions.has(id))
+  const liveIdentities = new Set(pending.map(({ identity }) => identity))
+  const retainedIdentities = new Set(retained.map(({ identity }) => identity))
+  const historyIdentities = new Set(history.map(({ identity }) => identity))
+  const problems = []
+  if (history.some(({ id }) => !pendingIds.has(id) && !admissions.has(id)))
+    problems.push('Unresolved retired history has no original admission')
+  if (liveIdentities.size > MAX_HELD) problems.push('Live pending work exceeds its allowance')
+  if (historyIdentities.size > MAX_HELD + retainedIdentities.size)
+    problems.push('Unresolved history exceeds its live plus admitted allowance')
+  return {
+    at: cut.at,
+    order: cut.order,
+    liveCount: liveIdentities.size,
+    liveEntries: pending.map(({ id }) => id),
+    retainedCount: retainedIdentities.size,
+    retained: retained.map(({ id }) => admissions.get(id)),
+    historyCount: historyIdentities.size,
+    history: history.map(({ id }) => id),
+    problems,
+  }
+}
+
+/**
+ * Rebuilds admissions and ownership solely from command, loss, handler and receipt observations.
+ * Supplied freezes and originatingEpisode fields cannot create or remove a qualifying scope.
+ * @param {object[]} entries Original handler journal.
+ * @param {object[]} bounces Archived episode restoration boundaries.
+ * @param {BounceEvidence} evidence Primitive observations.
+ * @returns {object[]} Reconstructed command and first-interruption snapshots.
+ */
+const reconstructFreezes = (entries, bounces, evidence) => {
+  const reconstructed = []
+  const journal = [
+    ...interruptionJournal(evidence),
+    ...evidence.commands.map((event) => ({ kind: 'command', event })),
+  ].sort((a, b) => {
+    const first = interruptionEvent(a.kind, a.event)
+    const second = interruptionEvent(b.kind, b.event)
+    return first.at - second.at || first.order - second.order
+  })
+  for (const { kind, event } of journal) {
+    const cut = interruptionEvent(kind, event)
+    if (kind === 'command') {
+      const history = unresolvedAt(entries, evidence, cut)
+      const bounce = {
+        ...event,
+        held: new Set(history.map(({ identity }) => identity)),
+        obligations: history.map((entry) =>
+          obligation(entry, reconstructed, event.index, evidence, cut)
+        ),
+        carried: carriedAt(reconstructed, event, history),
+        interruptions: [],
+        restoredAt: bounces.find(({ index }) => index === event.index)?.restoredAt,
+      }
+      reconstructed.push(bounce)
+      continue
+    }
+    const bounce = reconstructed.findLast(
+      (episode) => precedes(episode, cut) && cut.at <= (episode.restoredAt ?? Infinity)
+    )
+    if (!bounce) continue
+    for (const scope of interruptedScopes(entries, evidence, kind, event, bounce)) {
+      if (
+        scope.nodeId !== bounce.nodeId ||
+        bounce.interruptions.some((prior) => samePartition(prior.scope, scope))
+      )
+        continue
+      const history = unresolvedAt(entries, evidence, cut)
+      const scoped = history.filter((entry) => sameAuthority(authority(entry), scope))
+      bounce.interruptions.push({
+        ...cut,
+        kind,
+        event: event.id,
+        scope,
+        obligations: scoped.map((entry) =>
+          obligation(entry, reconstructed, bounce.index, evidence, cut, true)
+        ),
+        carried: carriedAt(reconstructed, bounce, history),
+        lateEntries: scoped.filter((entry) => precedes(bounce, entry)).map(({ id }) => id),
+        history: history.map(({ id }) => id),
+      })
+    }
+  }
+  return reconstructed
+}
+
+/**
+ * Recomputes both freezes and budgets; final settlement cannot rewrite membership or ownership.
  * @param {object[]} entries All original handlers.
  * @param {object[]} bounces Archived command and interruption snapshots.
  * @param {BounceEvidence} evidence Primitive observations and actual receipts.
- * @returns {string[]} Snapshot disagreement and shared-budget failures.
+ * @returns {object} Separate budgets, reconstructed cuts and all disagreements.
  */
-const freezeProblems = (entries, bounces, evidence) => {
-  const problems = []
-  const union = new Set()
-  const journal = interruptionJournal(evidence)
-  const ids = (rows) => rows.map(({ id, entry }) => entry ?? id).sort((a, b) => a - b)
-  for (const bounce of bounces) {
-    const command = evidence.commands.find(({ index }) => index === bounce.index)
+const freezeAccounting = (entries, bounces, evidence) => {
+  const reconstructed = reconstructFreezes(entries, bounces, evidence)
+  const accounting = admissionAccounting(reconstructed)
+  const problems = [...accounting.problems]
+  const observations = []
+  if (reconstructed.length !== bounces.length) problems.push('Command journal length mismatch')
+  for (const [position, bounce] of reconstructed.entries()) {
+    const supplied = bounces[position]
     if (
-      !command ||
-      command.at !== bounce.at ||
-      command.order !== bounce.order ||
-      command.nodeId !== bounce.nodeId ||
-      command.kind !== bounce.kind ||
-      command.service !== bounce.service
-    )
+      !supplied ||
+      ['index', 'at', 'order', 'nodeId', 'kind', 'service'].some(
+        (key) => bounce[key] !== supplied[key]
+      )
+    ) {
       problems.push(`bounce ${bounce.index} command observation changed`)
-    const early = unresolvedAt(entries, evidence, bounce)
+      continue
+    }
     if (
-      JSON.stringify(
-        early.map((entry) => obligation(entry, bounces, bounce.index, evidence, bounce))
-      ) !== JSON.stringify(bounce.obligations) ||
-      JSON.stringify([...new Set(early.map(({ identity }) => identity))].sort()) !==
-        JSON.stringify([...bounce.held].sort()) ||
-      JSON.stringify(carriedAt(bounces, bounce, early)) !== JSON.stringify(bounce.carried)
+      JSON.stringify(bounce.obligations) !== JSON.stringify(supplied.obligations) ||
+      JSON.stringify([...bounce.held].sort()) !== JSON.stringify([...supplied.held].sort()) ||
+      JSON.stringify(bounce.carried) !== JSON.stringify(supplied.carried)
     )
       problems.push(`bounce ${bounce.index} command snapshot disagrees with the journal`)
-    const partitions = []
-    for (const cut of bounce.interruptions ?? []) {
-      const primitive = journal.find(
-        ({ kind, event }) => kind === cut.kind && event.id === cut.event
-      )
-      const relevant = journal
-        .filter(
-          ({ kind, event }) =>
-            interrupts(kind, event, cut.scope) && precedes(bounce, interruptionEvent(kind, event))
-        )
-        .sort((a, b) => {
-          const x = interruptionEvent(a.kind, a.event)
-          const y = interruptionEvent(b.kind, b.event)
-          return x.at - y.at || x.order - y.order
-        })
-      const first = relevant[0]
-      const ambiguous = relevant.some(
-        (other) =>
-          other !== first &&
-          !precedes(
-            interruptionEvent(first.kind, first.event),
-            interruptionEvent(other.kind, other.event)
-          ) &&
-          !precedes(
-            interruptionEvent(other.kind, other.event),
-            interruptionEvent(first.kind, first.event)
-          )
+    if (JSON.stringify(bounce.interruptions) !== JSON.stringify(supplied.interruptions))
+      problems.push(`bounce ${bounce.index} interruption snapshot disagrees with the journal`)
+    const early = historyAccounting(entries, reconstructed, evidence, bounce)
+    observations.push({ bounce: bounce.index, phase: 'command', ...early })
+    problems.push(...early.problems)
+    if (early.historyCount > MAX_HELD * (position + 1))
+      problems.push(`bounce ${bounce.index} command history exceeds its allowance`)
+    for (const cut of bounce.interruptions) {
+      const relevant = interruptionJournal(evidence).filter(
+        ({ kind, event }) =>
+          interrupts(kind, event, cut.scope) && precedes(bounce, interruptionEvent(kind, event))
       )
       if (
-        !primitive ||
-        first !== primitive ||
-        ambiguous ||
-        !sameAuthority(interruptionEvent(cut.kind, primitive.event), {
-          at: cut.at,
-          order: cut.order,
-        }) ||
-        cut.scope.nodeId !== bounce.nodeId ||
-        (primitive &&
-          !sameAuthority(
-            interruptedScopes(entries, evidence, cut.kind, primitive.event).find((scope) =>
-              samePartition(scope, cut.scope)
-            ),
-            cut.scope
-          )) ||
-        cut.at > bounce.restoredAt + MEMBERSHIP_QUIET_MS ||
-        partitions.some((scope) => samePartition(scope, cut.scope))
+        relevant.some(({ kind, event }) => {
+          const stamp = interruptionEvent(kind, event)
+          return !(kind === cut.kind && event.id === cut.event) && !precedes(cut, stamp)
+        })
       )
         problems.push(`bounce ${bounce.index} lacks its first original interruption`)
-      partitions.push(cut.scope)
-      const history = unresolvedAt(entries, evidence, cut)
-      const scoped = history.filter((entry) => sameAuthority(authority(entry), cut.scope))
-      if (
-        JSON.stringify(ids(history)) !== JSON.stringify([...cut.history].sort((a, b) => a - b)) ||
-        JSON.stringify(
-          scoped.map((entry) => obligation(entry, bounces, bounce.index, evidence, cut))
-        ) !== JSON.stringify(cut.obligations) ||
-        JSON.stringify(carriedAt(bounces, bounce, history)) !== JSON.stringify(cut.carried) ||
-        JSON.stringify(scoped.filter((entry) => precedes(bounce, entry)).map(({ id }) => id)) !==
-          JSON.stringify(cut.lateEntries)
-      )
-        problems.push(`bounce ${bounce.index} interruption snapshot disagrees with the journal`)
-      if (new Set(history.map(({ identity }) => identity)).size > MAX_HELD)
-        problems.push(`bounce ${bounce.index} unresolved history exceeds its allowance`)
+      const history = historyAccounting(entries, reconstructed, evidence, cut)
+      observations.push({
+        bounce: bounce.index,
+        phase: 'interruption',
+        scope: cut.scope,
+        ...history,
+      })
+      problems.push(...history.problems)
     }
-    const effective = effectiveObligations(bounce)
-    for (const identity of effective.keys()) union.add(identity)
-    if (bounce.held.size > MAX_HELD || effective.size > MAX_HELD)
-      problems.push(`bounce ${bounce.index} combined freeze exceeds its allowance`)
   }
-  if (union.size > MAX_REPLAY) problems.push('Combined interruption union exceeds its allowance')
-  return problems
+  return { ...accounting, observations, problems }
 }
+
+/**
+ * @param {object[]} entries All original handlers.
+ * @param {object[]} bounces Archived freezes.
+ * @param {BounceEvidence} evidence Independent primitive journals.
+ * @returns {string[]} Snapshot disagreement and budget failures.
+ */
+const freezeProblems = (entries, bounces, evidence) =>
+  freezeAccounting(entries, bounces, evidence).problems
 
 /**
  * Proves disjoint serving-epoch bounds using source-node local epoch observations and down barriers.
@@ -1285,6 +1450,68 @@ const epochAdvance = (old, next, bounce, samples, exchanges) => {
 }
 
 /**
+ * Checks event charges against original admissions, independently of when recovery arrived.
+ * @param {object[]} extras Actual extra handler events with their preceding handler references.
+ * @param {object[]} episodes Independently reconstructed new pools.
+ * @returns {object} Event counts and ownership, duplication and budget violations.
+ */
+const replayBudgets = (extras, episodes) => {
+  const problems = []
+  const owners = new Map(
+    episodes.flatMap(({ admissions }) => admissions.map((held) => [held.entry, held]))
+  )
+  const charged = new Set()
+  for (const extra of extras) {
+    const original = owners.get(extra.originalEntry)
+    if (
+      !original ||
+      original.originatingEpisode !== extra.bounce ||
+      original.identity !== extra.identity
+    )
+      problems.push(`${extra.identity} has a changed original replay charge`)
+    if (charged.has(extra.entry)) problems.push(`${extra.identity} charged an entry twice`)
+    charged.add(extra.entry)
+  }
+  const perBounce = episodes.map(({ index }) => {
+    const count = extras.filter(({ bounce }) => bounce === index).length
+    if (count > MAX_HELD) problems.push(`bounce ${index} took ${count} extra entries`)
+    return count
+  })
+  if (extras.length > MAX_REPLAY) problems.push(`${extras.length} extra entries in total`)
+  return { perBounce, problems }
+}
+
+/**
+ * @param {object[]} unknown Provisional or terminal unknown identities and supporting attempts.
+ * @param {object[]} episodes Independently reconstructed new pools.
+ * @returns {object} Unknown counts without renewing the allowance of carried candidates.
+ */
+const unknownBudgets = (unknown, episodes) => {
+  const problems = []
+  const owners = new Map(
+    episodes.flatMap(({ admissions }) => admissions.map((held) => [held.entry, held]))
+  )
+  const identities = new Set()
+  for (const candidate of unknown) {
+    const original = owners.get(candidate.entry)
+    if (
+      !original ||
+      original.originatingEpisode !== candidate.bounce ||
+      original.identity !== candidate.identity ||
+      identities.has(candidate.identity)
+    )
+      problems.push(`${candidate.identity} has a changed or duplicate unknown charge`)
+    identities.add(candidate.identity)
+  }
+  const perBounce = episodes.map(
+    ({ index }) => unknown.filter(({ bounce }) => bounce === index).length
+  )
+  if (perBounce.some((count) => count > MAX_HELD) || unknown.length > MAX_REPLAY)
+    problems.push('Unknown settlement exceeds the frozen fault allowance')
+  return { perBounce, problems }
+}
+
+/**
  * Recomputes once-only dispatch and independently charged replay from the original journals.
  * @param {object[]} entries All handler starts in order.
  * @param {object[]} bounces Immutable held sets, obligations and down/restore observations.
@@ -1295,7 +1522,8 @@ const epochAdvance = (old, next, bounce, samples, exchanges) => {
 const auditReplay = (entries, bounces, corpus, evidence) => {
   const previous = new Map()
   const dispatched = new Set()
-  const problems = freezeProblems(entries, bounces, evidence)
+  const uncertainty = freezeAccounting(entries, bounces, evidence)
+  const problems = [...uncertainty.problems]
   const extras = []
   for (const entry of entries) {
     const old = previous.get(entry.identity)
@@ -1332,6 +1560,7 @@ const auditReplay = (entries, bounces, corpus, evidence) => {
         extras.push({
           identity: entry.identity,
           entry: entry.id,
+          originalEntry: old.id,
           bounce: bounce.index,
           deliveryCount: entry.deliveryCount,
           at: entry.at,
@@ -1341,15 +1570,9 @@ const auditReplay = (entries, bounces, corpus, evidence) => {
     }
     previous.set(entry.identity, entry)
   }
-  const perBounce = bounces.map(({ index, held }) => {
-    if (held.size > MAX_HELD)
-      problems.push(`bounce ${index} held ${held.size} unresolved identities`)
-    const count = extras.filter(({ bounce }) => bounce === index).length
-    if (count > MAX_HELD) problems.push(`bounce ${index} took ${count} extra entries`)
-    return count
-  })
-  if (extras.length > MAX_REPLAY) problems.push(`${extras.length} extra entries in total`)
-  return { extras, perBounce, problems }
+  const budget = replayBudgets(extras, uncertainty.episodes)
+  problems.push(...budget.problems)
+  return { extras, perBounce: budget.perBounce, uncertainty, problems }
 }
 
 /**
@@ -1361,7 +1584,8 @@ const auditReplay = (entries, bounces, corpus, evidence) => {
  * @returns {object} Disjoint successful/candidate identity sets and missing identities.
  */
 const settlementCandidates = (entries, corpus, bounces, evidence) => {
-  const problems = freezeProblems(entries, bounces, evidence)
+  const uncertainty = freezeAccounting(entries, bounces, evidence)
+  const problems = [...uncertainty.problems]
   const successful = new Set()
   const last = new Map()
   for (const entry of entries) {
@@ -1485,19 +1709,17 @@ const settlementCandidates = (entries, corpus, bounces, evidence) => {
       })
     }
   }
-  const perBounce = bounces.map(
-    ({ index }) => unknown.filter(({ bounce }) => bounce === index).length
-  )
-  const heldUnion = new Set(bounces.flatMap((bounce) => [...effectiveObligations(bounce).keys()]))
-  if (
-    perBounce.some((count) => count > MAX_HELD) ||
-    unknown.length > MAX_REPLAY ||
-    heldUnion.size > MAX_REPLAY
-  )
-    problems.push('Unknown settlement exceeds the frozen fault allowance')
-  if (bounces.some(({ held }) => held.size > MAX_HELD))
-    problems.push('Unresolved held history exceeds its allowance')
-  return { successful: [...successful].sort(), unknown, missing, unresolved, perBounce, problems }
+  const budget = unknownBudgets(unknown, uncertainty.episodes)
+  problems.push(...budget.problems)
+  return {
+    successful: [...successful].sort(),
+    unknown,
+    missing,
+    unresolved,
+    perBounce: budget.perBounce,
+    uncertainty,
+    problems,
+  }
 }
 
 /**
@@ -2160,8 +2382,11 @@ class ShareBounceCase {
       interruptions: [],
       carried: immutable(carriedAt(this.snapshots, { index }, unresolved)),
     })
-    if (held.size > MAX_HELD)
-      throw new Error(`Frozen unresolved history has ${held.size} identities`)
+    const accounting = historyAccounting(this.entries, this.snapshots, this.evidence, cut)
+    const problems = [...accounting.problems, ...admissionAccounting(this.snapshots).problems]
+    if (held.size > MAX_HELD * (index + 1))
+      problems.push(`Command history has ${held.size} identities`)
+    if (problems.length) throw new Error(problems.join('; '))
     if (unresolved.some(({ identity }) => !corpus.has(identity))) {
       this.row('unresolved-before-producer-receipt', { identities: [...held] })
     }
@@ -2505,7 +2730,8 @@ class ShareBounceCase {
       })
     }
     expect(this.joins).toHaveLength(1)
-    for (const { held } of this.snapshots) expect(held.size).toBeLessThanOrEqual(MAX_HELD)
+    for (const { index, held } of this.snapshots)
+      expect(held.size).toBeLessThanOrEqual(MAX_HELD * (index + 1))
     expect(this.captureProblems).toEqual([])
     this.replay = auditReplay(this.entries, this.snapshots, new Set(this.expected), this.evidence)
     expect(this.replay.problems).toEqual([])
@@ -2653,6 +2879,17 @@ class ShareBounceCase {
       terminalUnknown: this.terminalVerified ? (this.settlement?.unknown ?? []) : [],
       wire: this.tap.allFrames.filter(({ apiKey }) => [3, 76, 78, 79].includes(apiKey)),
       frozen: this.snapshots.map(({ held, ...rest }) => ({ ...rest, held: [...held] })),
+      uncertainty: freezeAccounting(this.entries, this.snapshots, this.evidence),
+      replay: this.replay,
+      counts: {
+        successfulAccept: this.settlement?.successful.length ?? 0,
+        replayEvents: this.replay?.extras.length ?? 0,
+        replayPerEpisode: this.replay?.perBounce ?? [],
+        provisionalUnknown: this.settlement?.unknown.length ?? 0,
+        provisionalUnknownPerEpisode: this.settlement?.perBounce ?? [],
+        terminalUnknown: this.terminalVerified ? (this.settlement?.unknown.length ?? 0) : 0,
+        terminalUnknownPerEpisode: this.terminalVerified ? (this.settlement?.perBounce ?? []) : [],
+      },
       effective: this.snapshots.map((bounce) => ({
         index: bounce.index,
         identities: [...effectiveObligations(bounce).keys()],
@@ -3382,7 +3619,7 @@ const lostAcceptFixture = (
  * Builds independent corpus, acquisition and outcome streams at the replay/unknown boundaries.
  * Each original socket loss retains all requests outstanding on that socket.
  * @param {number} count Distinct identities to exercise.
- * @param {number} perEpisode Frozen identities in each sequential episode.
+ * @param {number|number[]} perEpisode New identities in each sequential episode.
  * @param {boolean} unknown Whether to script lost Accepts instead of higher-count replays.
  * @returns {object} Combined evidence without deriving expected multiplicities from dispatches.
  */
@@ -3396,7 +3633,12 @@ const budgetFixture = (count, perEpisode, unknown) => {
   for (let index = 0; index < count; index++) {
     const f = replayFixture({ count: 2, offset: String(index) })
     const proof = unknown ? lostAcceptFixture(f) : null
-    const episode = Math.floor(index / perEpisode)
+    const episode = Array.isArray(perEpisode)
+      ? perEpisode.findIndex(
+          (_count, position) =>
+            index < perEpisode.slice(0, position + 1).reduce((sum, size) => sum + size, 0)
+        )
+      : Math.floor(index / perEpisode)
     const shift = episode * 100
     for (const entry of f.entries) {
       entry.id += 2 * index
@@ -3497,9 +3739,173 @@ const budgetFixture = (count, perEpisode, unknown) => {
   return combined
 }
 
+/**
+ * Scripts six unknown pools and the remaining real Accepts against a fixed three-partition corpus.
+ * @returns {object} Full terminal proof with 1800 unknown and 28200 successful identities.
+ */
+const terminalBudgetFixture = () => {
+  const fixture = budgetFixture(MAX_REPLAY, MAX_HELD, true)
+  const { evidence } = fixture
+  evidence.acquisitions = fixture.entries.map(({ acquisition }) => acquisition)
+  evidence.exchanges = evidence.exchanges.filter(
+    (exchange) =>
+      evidence.acquisitions.some(({ source }) => source === exchange) || exchange.tickets.length
+  )
+  for (const [index, entry] of fixture.entries.entries()) {
+    const partition = Math.floor(index / MAX_HELD) % PARTITIONS
+    const offset = String(
+      Math.floor(index / (MAX_HELD * PARTITIONS)) * MAX_HELD + (index % MAX_HELD)
+    )
+    entry.partition = partition
+    entry.offset = offset
+    entry.acquisition.partition = partition
+    const source = entry.acquisition.source
+    source.model[0].partition = partition
+    source.response.responses[0].partitions[0].partitionIndex = partition
+    source.frames[0].request.topics[0].partitions[0].partitionIndex = partition
+    entry.acquisition.acquiredRecords[0].firstOffset = offset
+    entry.acquisition.acquiredRecords[0].lastOffset = offset
+    for (const exchange of evidence.exchangesByCohort.get(entry.acquisition.id)) {
+      exchange.frames[0].request.topics[0].partitions[0].partitionIndex = partition
+      for (const ticket of exchange.tickets)
+        for (const batch of ticket.batches) batch.firstOffset = batch.lastOffset = offset
+      for (const batch of exchange.frames[0].request.topics[0].partitions[0].acknowledgementBatches)
+        batch.firstOffset = batch.lastOffset = offset
+    }
+    for (const outcome of evidence.outcomesByCohort.get(entry.acquisition.id))
+      outcome.firstOffset = outcome.lastOffset = offset
+    entry.identity = shareRecordIdentity({
+      topic: entry.topic,
+      partition,
+      offset,
+      key: Buffer.from('k'),
+      value: Buffer.from('v'),
+    })
+  }
+  const batchesPerPartition = (RECORDS - MAX_REPLAY) / PARTITIONS / BURST_SIZE
+  for (let batch = 0; batch < (RECORDS - MAX_REPLAY) / BURST_SIZE; batch++) {
+    const partition = Math.floor(batch / batchesPerPartition)
+    const first = MAX_REPLAY / PARTITIONS + (batch % batchesPerPartition) * BURST_SIZE
+    const last = first + BURST_SIZE - 1
+    const entry = replayFixture({ offset: String(first) }).old
+    const acquisition = entry.acquisition
+    const source = acquisition.source
+    const frame = source.frames[0]
+    const id = 100000000 + batch
+    const at = 600 + batch * 6
+    Object.assign(source, { id, open: id, pool: id, generation: id })
+    Object.assign(frame, { id, socket: id, at, responseAt: at + 1 })
+    Object.assign(acquisition, {
+      id,
+      token: id,
+      ledger: id,
+      exchange: id,
+      responseIdentity: id,
+      open: id,
+      pool: id,
+      generation: id,
+      partition,
+      adoptedAt: at + 2,
+    })
+    source.model[0].partition = partition
+    source.response.responses[0].partitions[0].partitionIndex = partition
+    frame.request.topics[0].partitions[0].partitionIndex = partition
+    acquisition.acquiredRecords[0].lastOffset = String(last)
+    Object.assign(entry, { id: 2 * MAX_REPLAY + batch * BURST_SIZE, partition, at: at + 3 })
+    evidence.acquisitions.push(acquisition)
+    evidence.exchanges.push(source)
+    for (let offset = first; offset <= last; offset++) {
+      const handler = { ...entry, id: entry.id + offset - first, offset: String(offset) }
+      handler.identity = shareRecordIdentity({
+        topic: entry.topic,
+        partition,
+        offset: handler.offset,
+        key: Buffer.from('k'),
+        value: Buffer.from('v'),
+      })
+      fixture.entries.push(handler)
+    }
+    successfulAcceptFixture(evidence, entry, at + 4)
+    const receipt = evidence.exchangesByCohort.get(acquisition.id)[0]
+    receipt.frames[0].request.topics[0].partitions[0].acknowledgementBatches[0].lastOffset =
+      String(last)
+    receipt.tickets[0].batches[0].lastOffset = String(last)
+    evidence.results(entry)[0].lastOffset = String(last)
+  }
+  captureFreezes(fixture)
+  const { topic, topicId, groupId } = fixture.entries[0]
+  const corpus = Array.from({ length: RECORDS }, (_value, index) =>
+    shareRecordIdentity({
+      topic,
+      partition: Math.floor(index / 10000),
+      offset: String(index % 10000),
+      key: Buffer.from('k'),
+      value: Buffer.from('v'),
+    })
+  )
+  const partitions = Array.from({ length: PARTITIONS }, (_value, partition) => ({
+    partition,
+    floor: '0',
+    end: '10000',
+  }))
+  const rows = [
+    {
+      topic,
+      topicId,
+      partitions: partitions.map(({ partition }) => ({
+        partition,
+        startOffset: '0',
+        lag: '0',
+        errorCode: 0,
+        leaderEpoch: 2,
+      })),
+    },
+  ]
+  const position = {
+    groupId,
+    topicId,
+    named: rows,
+    all: JSON.parse(JSON.stringify(rows)),
+    ends: partitions.map(({ partition }) => ({ partition, high: '10000' })),
+  }
+  return {
+    ...fixture,
+    corpus,
+    raw: [...corpus],
+    target: { groupId, topic, partitions },
+    limits: [5, 5, 5],
+    before: position,
+    after: JSON.parse(JSON.stringify(position)),
+    quiet: {
+      activeAt: 3000,
+      endedAt: 8001,
+      delivered: [],
+      assignment: [{ topic, partitions: [0, 1, 2] }],
+      events: [
+        { name: 'GROUP_JOIN', at: 2999, payload: {} },
+        { name: 'REQUEST', at: 8000, payload: { apiName: 'ShareFetch' } },
+      ],
+    },
+  }
+}
+
 describe('share bounce acquisition and settlement sensitivity', () => {
   const audit = ({ entries, bounces, corpus, evidence }) =>
     auditReplay(entries, bounces, new Set(corpus), evidence)
+
+  it('permits 1800 terminal unknowns only beside 28200 real Accepts and complete terminal proof', () => {
+    const proof = terminalBudgetFixture()
+    const result = auditTerminal(proof)
+    expect(result.problems).toEqual([])
+    expect(result.settlement.successful).toHaveLength(28200)
+    expect(result.settlement.unknown).toHaveLength(1800)
+    expect(result.settlement.perBounce).toEqual(Array(6).fill(300))
+    expect(
+      proof.evidence.outcomes.filter(({ error }) => error?.reason === 'session-lost')
+    ).toHaveLength(1800)
+    proof.after = null
+    expect(auditTerminal(proof).problems).toContain('Incomplete terminal proof')
+  })
 
   it('samples sibling brokers independently and follows an overlapping sample with a fresh one', async () => {
     let complete
@@ -3759,7 +4165,8 @@ describe('share bounce acquisition and settlement sensitivity', () => {
 
   it('retains the original episode across later held sets and rejects a duplicate charge', () => {
     const fixture = replayFixture({ count: 2 })
-    fixture.bounces.push({ ...fixture.bounces[0], index: 1, at: 19 })
+    fixture.bounces.push({ ...fixture.bounces[0], index: 1, at: 19, downAt: 20, restoredAt: 30 })
+    captureFreezes(fixture)
     expect(audit(fixture).perBounce).toEqual([1, 0])
     fixture.entries.push(fixture.next)
     expect(audit(fixture).problems.length).toBeGreaterThan(0)
@@ -3777,8 +4184,7 @@ describe('share bounce acquisition and settlement sensitivity', () => {
             boundary.evidence
           )
         : audit(boundary)
-      if (unknown) expect(result.problems.length).toBeGreaterThan(0)
-      else expect(result.problems).toEqual([])
+      expect(result.problems).toEqual([])
       expect(result.perBounce).toEqual([300, 300, 300, 300, 300, 300])
       const overEpisode = budgetFixture(301, 301, unknown)
       const episodeResult = unknown
@@ -4052,6 +4458,380 @@ describe('share bounce acquisition and settlement sensitivity', () => {
     }
   })
 
+  it('retains the archived-size 133 carry plus two live groups of 100 without inventing receipts', () => {
+    const fixture = budgetFixture(333, [33, 100, 200], true)
+    for (const entry of fixture.entries.slice(-100)) {
+      const related = fixture.evidence.exchanges.filter(
+        (exchange) =>
+          exchange === entry.acquisition.source ||
+          exchange.tickets.some(({ cohort }) => cohort === entry.acquisition.id)
+      )
+      entry.acquisition.open = 99
+      for (const exchange of related) {
+        exchange.nodeId = 3
+        exchange.open = 99
+        exchange.endpoint = 'node-3'
+        for (const frame of exchange.frames) {
+          frame.socket = 99
+          frame.endpoint = 'node-3'
+        }
+      }
+    }
+    captureFreezes(fixture)
+    const accounting = freezeAccounting(fixture.entries, fixture.bounces, fixture.evidence)
+    expect(accounting.problems).toEqual([])
+    expect(
+      accounting.observations.find(({ bounce, phase }) => bounce === 2 && phase === 'command')
+    ).toMatchObject({ historyCount: 333, liveCount: 200, retainedCount: 133 })
+    const carry = fixture.bounces[2].carried
+    expect(carry.filter(({ originatingEpisode }) => originatingEpisode === 0)).toHaveLength(33)
+    expect(carry.filter(({ originatingEpisode }) => originatingEpisode === 1)).toHaveLength(100)
+    expect(fixture.evidence.outcomes.filter(({ error }) => error === null)).toEqual([])
+  })
+
+  it.each([300, 301])('separates live and new limits from 133 carried identities (%s)', (count) => {
+    const fixture = budgetFixture(133 + count, [33, 100, count], true)
+    const accounting = freezeAccounting(fixture.entries, fixture.bounces, fixture.evidence)
+    expect(fixture.bounces[2].held.size).toBe(133 + count)
+    expect(accounting.episodes[2]).toMatchObject({
+      newCount: count,
+      carriedCount: 133,
+      frozenCount: 133 + count,
+    })
+    expect(accounting.problems.includes('Live pending work exceeds its allowance')).toBe(
+      count > 300
+    )
+    expect(accounting.problems.includes('bounce 2 new uncertainty exceeds its allowance')).toBe(
+      count > 300
+    )
+    if (count === 300) expect(accounting.problems).toEqual([])
+  })
+
+  it('keeps all six disjoint admissions while bounding carry at each command and cut', () => {
+    const fixture = budgetFixture(1800, 300, true)
+    const accounting = freezeAccounting(fixture.entries, fixture.bounces, fixture.evidence)
+    expect(accounting.problems).toEqual([])
+    expect(accounting.eligibleIdentities).toHaveLength(1800)
+    expect(accounting.episodes.map(({ newCount }) => newCount)).toEqual(Array(6).fill(300))
+    for (const [index, bounce] of fixture.bounces.entries()) {
+      expect(bounce.held.size).toBe(300 * (index + 1))
+      expect(effectiveObligations(bounce).size).toBe(300 * (index + 1))
+      expect(accounting.episodes[index].carriedCount).toBe(300 * index)
+    }
+    const last = fixture.bounces[5]
+    fixture.bounces.push({ ...last, index: 6, at: 607, interruptions: [] })
+    fixture.evidence.commands.push({ ...fixture.evidence.commands[5], index: 6, at: 607 })
+    expect(freezeProblems(fixture.entries, fixture.bounces, fixture.evidence)).toContain(
+      'Fault admission requires one of the six original episodes'
+    )
+  })
+
+  it('accounts for 2100 raw unresolved identities without enlarging the 1800 eligible union', () => {
+    const fixture = budgetFixture(2100, 300, true)
+    fixture.bounces = fixture.bounces.slice(0, 6)
+    fixture.evidence.commands = fixture.evidence.commands.slice(0, 6)
+    const cut = { at: 607 }
+    const history = historyAccounting(fixture.entries, fixture.bounces, fixture.evidence, cut)
+    expect(history).toMatchObject({
+      historyCount: 2100,
+      liveCount: 300,
+      retainedCount: 1800,
+      problems: [],
+    })
+    const accounting = freezeAccounting(fixture.entries, fixture.bounces, fixture.evidence)
+    expect(accounting.problems).toEqual([])
+    expect(accounting.eligibleIdentities).toHaveLength(1800)
+    expect(effectiveObligations(fixture.bounces[5]).size).toBe(1800)
+    const ordinary = fixture.entries[1800]
+    expect(
+      unknownBudgets(
+        [{ identity: ordinary.identity, entry: ordinary.id, bounce: 5 }],
+        accounting.episodes
+      ).problems.length
+    ).toBeGreaterThan(0)
+    expect(
+      replayBudgets(
+        [{ identity: ordinary.identity, originalEntry: ordinary.id, entry: 90000, bounce: 5 }],
+        accounting.episodes
+      ).problems.length
+    ).toBeGreaterThan(0)
+    fixture.evidence.retirements.push({
+      ...fixture.evidence.retirements.at(-1),
+      id: 90000,
+      at: 606,
+    })
+    expect(
+      historyAccounting(fixture.entries, fixture.bounces, fixture.evidence, cut).problems
+    ).toContain('Unresolved retired history has no original admission')
+  })
+
+  it('rejects 301 ordinary live identities even beside the complete admitted history', () => {
+    const fixture = budgetFixture(2101, [300, 300, 300, 300, 300, 300, 301], true)
+    fixture.bounces = fixture.bounces.slice(0, 6)
+    const history = historyAccounting(fixture.entries, fixture.bounces, fixture.evidence, {
+      at: 607,
+    })
+    expect(history.problems).toContain('Live pending work exceeds its allowance')
+  })
+
+  it('does not refresh an admission or unknown charge through repeated loss callbacks and later freezes', () => {
+    const fixture = budgetFixture(6, 1, true)
+    const original = JSON.stringify(fixture.bounces[0].interruptions)
+    const loss = fixture.evidence.owner.tap.socketEvents[0]
+    fixture.evidence.owner.tap.socketEvents.push({ ...loss, id: 90000, at: loss.at + 1 })
+    captureFreezes(fixture)
+    const result = settlementCandidates(
+      fixture.entries,
+      new Set(fixture.corpus),
+      fixture.bounces,
+      fixture.evidence
+    )
+    expect(result.problems).toEqual([])
+    expect(result.perBounce).toEqual([1, 1, 1, 1, 1, 1])
+    expect(JSON.stringify(fixture.bounces[0].interruptions)).toBe(original)
+    expect(result.uncertainty.episodes.map(({ newCount }) => newCount)).toEqual([1, 1, 1, 1, 1, 1])
+    const candidate = result.unknown[0]
+    expect(
+      unknownBudgets([{ ...candidate, bounce: 3 }], result.uncertainty.episodes).problems.length
+    ).toBeGreaterThan(0)
+    expect(
+      unknownBudgets([candidate, candidate], result.uncertainty.episodes).problems.length
+    ).toBeGreaterThan(0)
+  })
+
+  it('charges a delayed recovery to its original episode and never refunds frozen admissions', () => {
+    const fixture = budgetFixture(4, 1, false)
+    const recovery = fixture.entries.find(({ id }) => id === 1)
+    const shift = 300
+    recovery.at += shift
+    recovery.acquisition.adoptedAt += shift
+    recovery.acquisition.source.frames[0].at += shift
+    recovery.acquisition.source.frames[0].responseAt += shift
+    for (const exchange of fixture.evidence.exchangesByCohort.get(recovery.acquisition.id)) {
+      exchange.frames[0].at += shift
+      exchange.frames[0].responseAt += shift
+    }
+    for (const outcome of fixture.evidence.results(recovery)) outcome.at += shift
+    fixture.entries.sort((a, b) => a.at - b.at)
+    captureFreezes(fixture)
+    const result = audit(fixture)
+    expect(result.problems).toEqual([])
+    expect(result.perBounce).toEqual([1, 1, 1, 1])
+    const extra = result.extras.find(({ entry }) => entry === recovery.id)
+    expect(extra.bounce).toBe(0)
+    expect(result.uncertainty.episodes[0].newCount).toBe(1)
+    expect(
+      replayBudgets([{ ...extra, bounce: 3 }], result.uncertainty.episodes).problems.length
+    ).toBeGreaterThan(0)
+    expect(
+      replayBudgets([extra, extra], result.uncertainty.episodes).problems.length
+    ).toBeGreaterThan(0)
+    const before = JSON.stringify(fixture.bounces[0].interruptions)
+    expect(fixture.bounces[3].carried.some(({ entry }) => entry === 0)).toBe(true)
+    expect(
+      historyAccounting(fixture.entries, fixture.bounces, fixture.evidence, { at: 330 }).retained
+    ).not.toEqual(expect.arrayContaining([expect.objectContaining({ entry: 0 })]))
+    expect(JSON.stringify(fixture.bounces[0].interruptions)).toBe(before)
+    expect(fixture.evidence.results(recovery)[0].error).toBeNull()
+  })
+
+  it('admits a distinct later interrupted attempt even when its identity already occurs in carry', () => {
+    const fixture = budgetFixture(2, 1, true)
+    const [old, later] = fixture.entries
+    later.offset = old.offset
+    later.identity = old.identity
+    later.deliveryCount = 2
+    later.acquisition.acquiredRecords[0].deliveryCount = 2
+    for (const range of later.acquisition.acquiredRecords) {
+      range.firstOffset = old.offset
+      range.lastOffset = old.offset
+    }
+    for (const exchange of fixture.evidence.exchanges) {
+      if (exchange.open !== later.acquisition.open) continue
+      for (const ticket of exchange.tickets)
+        for (const batch of ticket.batches) batch.firstOffset = batch.lastOffset = old.offset
+      for (const frame of exchange.frames)
+        for (const topic of frame.request.topics)
+          for (const partition of topic.partitions)
+            for (const batch of partition.acknowledgementBatches)
+              batch.firstOffset = batch.lastOffset = old.offset
+    }
+    for (const outcome of fixture.evidence.outcomesByCohort.get(later.acquisition.id))
+      outcome.firstOffset = outcome.lastOffset = old.offset
+    fixture.corpus = [old.identity]
+    captureFreezes(fixture)
+    const result = audit(fixture)
+    expect(result.problems).toEqual([])
+    expect(result.uncertainty.episodes.map(({ newCount }) => newCount)).toEqual([1, 1])
+    expect(result.uncertainty.eligibleIdentities).toEqual([old.identity])
+    expect(effectiveObligations(fixture.bounces[1]).get(old.identity)).toHaveLength(2)
+    const candidates = settlementCandidates(
+      fixture.entries,
+      new Set(fixture.corpus),
+      fixture.bounces,
+      fixture.evidence
+    )
+    expect(candidates.problems).toEqual([])
+    expect(candidates.perBounce).toEqual([0, 1])
+    expect(candidates.unknown[0].entry).toBe(later.id)
+  })
+
+  it.each([
+    [
+      'new attempt labelled carry',
+      (bounce) => {
+        const cut = bounce.interruptions[0]
+        const held = { ...cut.obligations[0], originatingEpisode: 0 }
+        bounce.interruptions[0] = { ...cut, obligations: [], carried: [...cut.carried, held] }
+      },
+    ],
+    [
+      'forged original owner',
+      (bounce) => {
+        const cut = bounce.interruptions[0]
+        bounce.interruptions[0] = {
+          ...cut,
+          carried: cut.carried.map((held) => ({ ...held, originatingEpisode: 1 })),
+        }
+      },
+    ],
+    [
+      'borrowed socket',
+      (bounce) => {
+        const cut = bounce.interruptions[0]
+        bounce.interruptions[0] = {
+          ...cut,
+          carried: cut.carried.map((held) => ({
+            ...held,
+            authority: { ...held.authority, socket: 999 },
+          })),
+        }
+      },
+    ],
+    [
+      'omitted carry',
+      (bounce) => {
+        const cut = bounce.interruptions[0]
+        bounce.interruptions[0] = { ...cut, carried: cut.carried.slice(1) }
+      },
+    ],
+    [
+      'omitted entire interruption',
+      (bounce) => {
+        bounce.interruptions = []
+      },
+    ],
+  ])('reconstructs provenance despite %s with unchanged primitive journals', (_name, mutate) => {
+    const fixture = budgetFixture(3, 1, true)
+    const primitive = JSON.stringify(fixture.evidence.retirements)
+    mutate(fixture.bounces[2])
+    expect(
+      freezeProblems(fixture.entries, fixture.bounces, fixture.evidence).length
+    ).toBeGreaterThan(0)
+    expect(JSON.stringify(fixture.evidence.retirements)).toBe(primitive)
+  })
+
+  it.each([false, true])(
+    'keeps 300/1800 event and unknown budgets separate from carry (%s)',
+    (unknown) => {
+      const fixture = budgetFixture(1800, 300, unknown)
+      const result = unknown
+        ? settlementCandidates(
+            fixture.entries,
+            new Set(fixture.corpus),
+            fixture.bounces,
+            fixture.evidence
+          )
+        : audit(fixture)
+      const charges = unknown ? result.unknown : result.extras
+      const budget = unknown ? unknownBudgets : replayBudgets
+      const episodes = result.uncertainty.episodes
+      expect(budget(charges, episodes).problems).toEqual([])
+      const originOverflow = [...charges.slice(0, 300), { ...charges[0], entry: 90000 }]
+      expect(budget(originOverflow, episodes).perBounce[0]).toBe(301)
+      expect(budget(originOverflow, episodes).problems.length).toBeGreaterThan(0)
+      const totalOverflow = [...charges, { ...charges[0], entry: 90000 }]
+      expect(budget(totalOverflow, episodes).problems.length).toBeGreaterThan(0)
+      const moved = originOverflow.map((charge, index) =>
+        index === 300 ? { ...charge, bounce: 3 } : charge
+      )
+      expect(budget(moved, episodes).problems.length).toBeGreaterThan(0)
+    }
+  )
+
+  it.each([300, 301])(
+    'checks the historical new pool across staggered scopes with carry (%s)',
+    (count) => {
+      const fixture = budgetFixture(133 + count, [33, 100, count], true)
+      const current = fixture.entries.slice(133)
+      const later = current.slice(150)
+      const originalOpen = later[0].acquisition.open
+      for (const entry of later) {
+        entry.at = 210
+        entry.partition = 1
+        entry.acquisition.partition = 1
+        entry.acquisition.open = 99
+        entry.acquisition.adoptedAt = 209.4
+        const source = entry.acquisition.source
+        source.open = 99
+        source.model[0].partition = 1
+        source.response.responses[0].partitions[0].partitionIndex = 1
+        source.frames[0].at = 209
+        source.frames[0].responseAt = 209.2
+        source.frames[0].socket = 99
+        source.frames[0].request.topics[0].partitions[0].partitionIndex = 1
+        const exchange = fixture.evidence.exchangesByCohort.get(entry.acquisition.id)[0]
+        exchange.open = 99
+        exchange.prepared.at = 210.2
+        exchange.failedAt = 211.1
+        exchange.frames[0].socket = 99
+        exchange.frames[0].at = 210.5
+        exchange.frames[0].lostAt = 211
+        exchange.frames[0].request.topics[0].partitions[0].partitionIndex = 1
+        fixture.evidence.results(entry)[0].at = 211.4
+        entry.identity = shareRecordIdentity({
+          topic: entry.topic,
+          partition: 1,
+          offset: entry.offset,
+          key: Buffer.from('k'),
+          value: Buffer.from('v'),
+        })
+      }
+      const movedRequests = new Set(
+        later.map(
+          (entry) => fixture.evidence.exchangesByCohort.get(entry.acquisition.id)[0].frames[0].id
+        )
+      )
+      for (const event of fixture.evidence.owner.tap.socketEvents)
+        event.outstanding = event.outstanding.filter((id) => !movedRequests.has(id))
+      fixture.evidence.owner.tap.socketEvents.push({
+        id: 90000,
+        socket: 99,
+        at: 211,
+        event: 'end',
+        outstanding: later.map(
+          (entry) => fixture.evidence.exchangesByCohort.get(entry.acquisition.id)[0].frames[0].id
+        ),
+      })
+      fixture.evidence.retirements.push({
+        ...fixture.evidence.retirements.find(({ open }) => open === originalOpen),
+        id: 90000,
+        open: 99,
+        at: 211.2,
+      })
+      fixture.bounces[2].downAt = 212
+      captureFreezes(fixture)
+      const result = freezeAccounting(fixture.entries, fixture.bounces, fixture.evidence)
+      expect(result.observations.every(({ liveCount }) => liveCount <= 300)).toBe(true)
+      expect(result.episodes[2].newCount).toBe(count)
+      expect(result.episodes[2].carriedCount).toBe(133)
+      expect(result.problems.includes('bounce 2 new uncertainty exceeds its allowance')).toBe(
+        count > 300
+      )
+      if (count === 300) expect(result.problems).toEqual([])
+    }
+  )
+
   it('matches every outstanding Accept to the first shared socket loss', () => {
     const fixture = budgetFixture(2, 2, true)
     /** @returns {object} Candidates recomputed from the original loss and request evidence. */
@@ -4080,7 +4860,7 @@ describe('share bounce acquisition and settlement sensitivity', () => {
       fixture.evidence
     )
     expect(result.perBounce).toEqual([300, 1])
-    expect(result.problems).toContain('bounce 1 unresolved history exceeds its allowance')
+    expect(result.problems).toEqual([])
     expect(fixture.bounces[1].held.size).toBe(301)
     expect(effectiveObligations(fixture.bounces[1]).size).toBe(301)
     expect(fixture.bounces[1].interruptions[0].carried).toHaveLength(300)
