@@ -675,6 +675,26 @@ describe('share session socket integration', () => {
       return next
     }
 
+    /** What the replacement shows once its records are handled and acknowledged: its own identity on both, one accepted range, no failure. */
+    const REPLACEMENT_OUTCOME = {
+      handled: [
+        ['10', { owner: 'replacement' }],
+        ['11', { owner: 'replacement' }],
+      ],
+      results: [['10', '11', 'accept', undefined]],
+    }
+
+    /** @returns {{handled: Array<[string, object]>, results: Array<Array<*>>}} The public record of a run: what it handled with which acquisition identity, and every settlement with its failure. */
+    const publicOutcome = (run) => ({
+      handled: run.handled.map(({ offset, token }) => [offset, token]),
+      results: run.results.map(({ firstOffset, lastOffset, type, error }) => [
+        firstOffset,
+        lastOffset,
+        type,
+        error,
+      ]),
+    })
+
     /** What a run holds and has shown, so "nothing changed" is one comparison. */
     const state = (run) => ({
       results: run.results.length,
@@ -703,12 +723,7 @@ describe('share session socket integration', () => {
       const next = replace(old)
       await next.loop.poll()
       await next.loop.poll()
-      expect(next.handled.map(({ offset }) => offset)).toEqual(['10', '11'])
-      expect(next.handled[0].token).toEqual({ owner: 'replacement' })
-      expect(next.results.filter((outcome) => !outcome.error)).toEqual([
-        expect.objectContaining({ firstOffset: '10', lastOffset: '11', type: 'accept' }),
-      ])
-      expect(next.results.filter((outcome) => outcome.error)).toEqual([])
+      expect(publicOutcome(next)).toEqual(REPLACEMENT_OUTCOME)
       return next
     }
 
@@ -720,6 +735,7 @@ describe('share session socket integration', () => {
       expect((await staleOutcome).error.message).toBe('run closed')
       await flush()
       expect(state(next)).toEqual(before)
+      expect(publicOutcome(next)).toEqual(REPLACEMENT_OUTCOME)
       expect(old.handled).toEqual([])
       expect(old.results).toEqual([])
       expect([...old.session.model.keys()]).toEqual([])
@@ -797,6 +813,7 @@ describe('share session socket integration', () => {
           fetchAnswer([part({ partition: 0, code: 6, leader: hint(1, 9) })], {
             nodeEndpoints: [{ nodeId: 1, host: 'node1', port: 9092, rack: null }],
           }),
+          acquiresTen(),
           fetchAnswer([part({ partition: 0, code: 6, leader: hint(2, 8) })], {
             nodeEndpoints: [{ nodeId: 2, host: 'node2', port: 9092, rack: null }],
           }),
@@ -812,14 +829,17 @@ describe('share session socket integration', () => {
       })
       const stale = settled(old.loop.poll())
       await entered.promise
-      old.operation.retire(new Error('run closed'))
-      const next = replace(old)
-      await next.loop.poll()
+      const next = await replaced(old)
+      const move = {
+        topic: 'topic-a',
+        topicId: A,
+        partition: 0,
+        leaderId: 2,
+        reason: 'leader-moved',
+      }
       expect(real.cluster.cachedLeader('topic-a', 0)).toBe(2)
       expect(real.cluster.leaderEpoch('topic-a', 0)).toBe(8)
-      expect(next.moves).toEqual([
-        { topic: 'topic-a', topicId: A, partition: 0, leaderId: 2, reason: 'leader-moved' },
-      ])
+      expect(next.moves).toEqual([move])
       const before = state(next)
       held.resolve()
       expect((await stale).error.message).toBe('run closed')
@@ -827,7 +847,9 @@ describe('share session socket integration', () => {
       expect(real.cluster.cachedLeader('topic-a', 0)).toBe(2)
       expect(real.cluster.leaderEpoch('topic-a', 0)).toBe(8)
       expect(old.moves).toEqual([])
+      expect(next.moves).toEqual([move])
       expect(state(next)).toEqual(before)
+      expect(publicOutcome(next)).toEqual(REPLACEMENT_OUTCOME)
       expect(real.refreshes()).toBe(0)
     })
   })

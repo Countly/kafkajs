@@ -20,6 +20,7 @@ const {
 } = require('../../../../testHelpers/shareHarness')
 const { ConsumerOperation } = require('../../groupProtocol/interface')
 const {
+  KafkaJSInvariantViolation,
   KafkaJSProtocolError,
   KafkaJSShareAcknowledgementError,
   KafkaJSShareGroupsNotSupportedError,
@@ -328,6 +329,26 @@ const keepLog = () => {
   const at = (level) => (message, extra) => lines.push({ level, message, ...extra })
   return { lines, error: at('error'), warn: at('warn'), info: at('info'), debug: at('debug') }
 }
+/**
+ * @param {object} captured What `captureFinal` froze.
+ * @param {() => Error|null} [guard] The closing predicate; it never refuses by default.
+ * @returns {object} The `closing` option of `finishNode`, with the episode's own operation, which
+ *   has no deadline, so it only ever ends by `finish`.
+ */
+const episode = (captured, guard = () => null) => ({
+  guard,
+  captured,
+  operation: new ConsumerOperation(),
+})
+const SOCKET_EVENTS = ['data', 'end', 'error', 'close', 'timeout', 'connect']
+/**
+ * @param {object} socket A fake socket.
+ * @returns {Record<string, number>} How many listeners it has for each event the client uses.
+ */
+const listeners = (socket) =>
+  Object.fromEntries(SOCKET_EVENTS.map((name) => [name, socket.listenerCount(name)]))
+/** What a closed data socket keeps: the client removes only these three listeners and keeps `error`, inert. */
+const REMOVED_ON_CLOSE = { data: 0, end: 0, timeout: 0 }
 const A0 = { topicId: A, partition: 0 }
 const A1 = { topicId: A, partition: 1 }
 const batchOf = (first, last, type) => ({
@@ -770,6 +791,7 @@ describe('share node socket integration', () => {
           h.clock.time = 105
           return fetchAnswer([part({ partition: 0 })])
         },
+        fetchAnswer([acquire(0, 10, ['x'])]),
       ])
       let ended = false
       const first = settled(m.loop.poll()).then((outcome) => {
@@ -792,7 +814,9 @@ describe('share node socket integration', () => {
       expect(m.sleeps).toEqual([45, 1])
       expect(fetchFrames(h)).toHaveLength(1)
       const second = await m.loop.poll()
-      expect(second.sentAt).toBe(150)
+      expect(second).toMatchObject({ sentAt: 150, empty: false })
+      expect(m.sleeps).toEqual([45, 1])
+      expect(m.timers).toEqual([])
       expect(fetchFrames(h)).toHaveLength(2)
       expect(fetchFrames(h)[0].fields).toMatchObject({
         maxWaitMs: options.maxWaitTimeInMs,
@@ -1114,10 +1138,16 @@ describe('share node socket integration', () => {
       await m.loop.poll()
       inject(h, m, A, 0, 20, 'old', { decide: false })
       const order = []
-      real.cluster.onTopicRecreated(() => order.push('recreated'))
+      const observe = (step) =>
+        order.push({
+          step,
+          cachedTopicId: real.cluster.topicId('topic-a'),
+          model: [...m.session.model.keys()],
+        })
+      real.cluster.onTopicRecreated(() => observe('topic recreated'))
       const notified = m.loop.onResults
       m.loop.onResults = (results, row) => {
-        if (results.some((outcome) => outcome.error)) order.push('old identity retired')
+        if (results.some((outcome) => outcome.error)) observe('old identity retired')
         notified(results, row)
       }
       real.table.set('topic-a', {
@@ -1130,10 +1160,14 @@ describe('share node socket integration', () => {
       await m.loop.poll()
       expect(real.refreshes()).toBe(1)
       expect(real.recreated).toHaveLength(1)
-      expect(order).toEqual(['recreated', 'old identity retired'])
+      expect(order).toEqual([
+        { step: 'topic recreated', cachedTopicId: B, model: [`${A}:0`] },
+        { step: 'old identity retired', cachedTopicId: B, model: [`${A}:0`] },
+      ])
       expect(failures(m)).toHaveLength(1)
       expect(failures(m)[0]).toMatchObject({ firstOffset: '20', lastOffset: '20' })
       expect(failures(m)[0].error.reason).toBe('session-lost')
+      expect(m.loop.cohorts.size).toBe(0)
       expect(fetchFrames(h)).toHaveLength(2)
       m.want = [{ topicId: B, partition: 0 }]
       await m.loop.poll()
@@ -1142,6 +1176,7 @@ describe('share node socket integration', () => {
         { topicId: B, partitions: [{ partitionIndex: 0, acknowledgementBatches: [] }] },
       ])
       expect(next.forgottenTopicsData).toEqual([{ topicId: A, partitions: [0] }])
+      expect([...m.session.model.keys()]).toEqual([`${B}:0`])
     })
 
     test('a metadata refresh finished after retirement installs nothing and the replacement keeps its state', async () => {
@@ -1252,7 +1287,7 @@ describe('share node socket integration', () => {
           const m = await fatalWithSibling(code)
           const captured = m.loop.captureFinal()
           expect(captured.prepared).toHaveLength(1)
-          await m.loop.finishNode({ closing: { guard: () => null, captured } })
+          await m.loop.finishNode({ closing: episode(captured) })
           const finals = frames(h.cluster, 79)
           expect(finals).toHaveLength(1)
           expect(finals[0].fields.topics).toEqual([
@@ -1612,6 +1647,31 @@ describe('share node socket integration', () => {
         expect(fetchFrames(h)[1].fields.topics).toEqual([])
       }
     )
+
+    test('retiring the node ends the backoff wait inside the FIFO slot and releases the close queued behind it', async () => {
+      h = await harness({ loop: { retry: NO_DELAY } })
+      const [m] = h.members
+      m.want = [A0]
+      m.holdSleeps()
+      h.script('ShareFetch', [fetchAnswer([acquire(0, 10, ['a', 'b'])])])
+      h.script('ShareAcknowledge', [topError(133)])
+      await m.loop.poll()
+      const flushed = settled(m.loop.acknowledge())
+      expect((await m.nextTimer()).delay).toBe(50)
+      const closing = settled(m.loop.finishNode())
+      await flush()
+      expect(frames(h.cluster, 79)).toHaveLength(1)
+      m.operation.retire(new Error('closing budget spent'))
+      expect((await flushed).error.message).toBe('closing budget spent')
+      expect((await closing).error.message).toBe('closing budget spent')
+      expect(m.timers).toHaveLength(1)
+      expect(frames(h.cluster, 79)).toHaveLength(1)
+      expect([m.operation.waiters.size, m.operation.disposers.size]).toEqual([0, 0])
+      expect([m.session.queue.length, m.loop.exchanges.size, m.loop.cohorts.size]).toEqual([
+        0, 0, 0,
+      ])
+      expect(m.session.closed).toBe(true)
+    })
   })
 
   describe('requests with nothing to send', () => {
@@ -1775,7 +1835,7 @@ describe('share node socket integration', () => {
       expect(captured.prepared).toHaveLength(1)
       m.operation.retire(new Error('run closed'))
       expect(m.session.refusal(m.session.token)).toBeInstanceOf(Error)
-      await m.loop.finishNode({ closing: { guard: () => null, captured } })
+      await m.loop.finishNode({ closing: episode(captured) })
       const finals = frames(h.cluster, 79)
       expect(finals).toHaveLength(1)
       expect(finals[0].fields).toMatchObject({ shareSessionEpoch: -1 })
@@ -1793,7 +1853,7 @@ describe('share node socket integration', () => {
       const m = await established()
       const captured = m.loop.captureFinal()
       const queue = m.pool.pool[1].requestQueue
-      await m.loop.finishNode({ closing: { guard: () => new Error('revoked'), captured } })
+      await m.loop.finishNode({ closing: episode(captured, () => new Error('revoked')) })
       expect(frames(h.cluster, 79)).toHaveLength(0)
       expect(failures(m).map(({ error }) => error.reason)).toEqual(['not-sent'])
       expect(okResults(m)).toEqual([])
@@ -1825,7 +1885,7 @@ describe('share node socket integration', () => {
       expect(failures(m)[0]).toMatchObject({ partition: 1, firstOffset: '50', lastOffset: '50' })
       expect(failures(m)[0].error.reason).toBe('session-lost')
       expect(okResults(m)).toEqual([])
-      await m.loop.finishNode({ closing: { guard: () => null, captured } })
+      await m.loop.finishNode({ closing: episode(captured) })
       const finals = frames(h.cluster, 79)
       expect(finals).toHaveLength(1)
       expect(finals[0].fields).toMatchObject({ shareSessionEpoch: -1, isRenewAck: false })
@@ -1871,13 +1931,65 @@ describe('share node socket integration', () => {
       }
     })
 
+    test('a captured close without its closing operation is refused before anything is written', async () => {
+      const m = await established()
+      const captured = m.loop.captureFinal()
+      const refusal = (
+        await settled(m.loop.finishNode({ closing: { guard: () => null, captured } }))
+      ).error
+      expect(refusal).toBeInstanceOf(KafkaJSInvariantViolation)
+      expect(refusal.message).toMatch(/A captured close requires its closing operation/)
+      expect(frames(h.cluster, 79)).toHaveLength(0)
+      expect(failures(m).map(({ error }) => error.reason)).toEqual(['not-sent'])
+      expect(okResults(m)).toEqual([])
+      expect([m.loop.cohorts.size, m.loop.exchanges.size, m.session.queue.length]).toEqual([
+        0, 0, 0,
+      ])
+      expect(m.session.closed).toBe(true)
+    })
+
+    test('an unanswered captured final written after the node was disposed settles on expiry and closes its own socket', async () => {
+      const m = await established()
+      const connection = m.pool.pool[1]
+      const { socket, requestQueue: queue } = connection
+      const baseline = listeners(socket)
+      expect(baseline.data).toBeGreaterThan(0)
+      const captured = m.loop.captureFinal()
+      const gate = h.hold({ api: 'ShareAcknowledge' })
+      const operation = new ConsumerOperation({ deadlineAt: 2000, now: () => h.clock.time })
+      try {
+        m.loop.dispose(new Error('node closed'), { preserve: captured })
+        const closing = m.loop.finishNode({
+          closing: { guard: operation.guard, captured, operation },
+        })
+        await gate.arrived()
+        expect(frames(h.cluster, 79)).toHaveLength(1)
+        expect(m.loop.exchanges.size).toBe(1)
+        expect(failures(m)).toEqual([])
+        expect(connection.isConnected()).toBe(true)
+        h.clock.time = 2000
+        expect(operation.guard()).toBeInstanceOf(Error)
+        await closing
+        expect(failures(m).map(({ error }) => error.reason)).toEqual(['session-lost'])
+        expect(okResults(m)).toEqual([])
+        expect(m.loop.exchanges.size).toBe(0)
+        await until(() => !connection.isConnected(), 'the unanswered final transport to close')
+        expect(listeners(socket)).toEqual({ ...baseline, ...REMOVED_ON_CLOSE })
+        expect([queue.pending.length, queue.inflight.size]).toEqual([0, 0])
+        expect([operation.waiters.size, operation.disposers.size]).toEqual([0, 0])
+        expect([m.session.queue.length, m.loop.cohorts.size]).toEqual([0, 0])
+      } finally {
+        operation.finish()
+      }
+    })
+
     test('a final answered after its predicate expired publishes no acceptance', async () => {
       const m = await established()
       const captured = m.loop.captureFinal()
       const gate = h.hold({ api: 'ShareAcknowledge' })
       let expired = false
       const closing = m.loop.finishNode({
-        closing: { guard: () => (expired ? new Error('closing expired') : null), captured },
+        closing: episode(captured, () => (expired ? new Error('closing expired') : null)),
       })
       await gate.arrived()
       expired = true
@@ -1899,10 +2011,6 @@ describe('share node socket integration', () => {
   })
 
   describe('resources', () => {
-    const EVENTS = ['data', 'end', 'error', 'close', 'timeout', 'connect']
-    const listeners = (socket) =>
-      Object.fromEntries(EVENTS.map((name) => [name, socket.listenerCount(name)]))
-
     test('disposing a node removes a throttled request that was never written, with its timer', async () => {
       h = await harness()
       const [m] = h.members
@@ -1952,6 +2060,9 @@ describe('share node socket integration', () => {
       await m.loop.poll()
       const connection = m.pool.pool[1]
       const queue = connection.requestQueue
+      const dataSocket = connection.socket
+      const dataBaseline = listeners(dataSocket)
+      expect(dataBaseline.data).toBeGreaterThan(0)
       const heartbeat = listeners(m.pool.pool[0].socket)
       const sockets = h.cluster.sockets().length
       const gate = h.hold({ api: 'ShareFetch' })
@@ -1962,6 +2073,7 @@ describe('share node socket integration', () => {
       m.loop.dispose(new Error('node closed'))
       expect((await round).error.message).toBe('node closed')
       await until(() => !connection.isConnected(), 'the data socket to close')
+      expect(listeners(dataSocket)).toEqual({ ...dataBaseline, ...REMOVED_ON_CLOSE })
       expect([queue.inflight.size, queue.pending.length]).toEqual([0, 0])
       expect([m.operation.waiters.size, m.operation.disposers.size]).toEqual([0, 0])
       expect([m.session.queue.length, m.loop.exchanges.size, m.loop.cohorts.size]).toEqual([

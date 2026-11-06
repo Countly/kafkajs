@@ -2,8 +2,11 @@ const createRetry = require('../../retry')
 const apiKeys = require('../../protocol/requests/apiKeys')
 const { requests } = require('../../protocol/requests')
 const { withConsumerOperation } = require('../../admin/deadline')
-const { KafkaJSNonRetriableError, KafkaJSShareGroupsNotSupportedError } = require('../../errors')
-const { ConsumerOperation } = require('../groupProtocol/interface')
+const {
+  KafkaJSInvariantViolation,
+  KafkaJSNonRetriableError,
+  KafkaJSShareGroupsNotSupportedError,
+} = require('../../errors')
 const { ShareAckLedger, validateAcknowledgements } = require('./shareAckLedger')
 const { ShareRecordWalk } = require('./shareRecordWalk')
 const { ShareSession } = require('./shareSession')
@@ -64,7 +67,7 @@ const keyOf = (topicId, partition) => `${topicId}:${partition}`
  * @property {(frameLength?: number) => Error|null} guard Original-authority pre-write check.
  * @property {{connection: object}|null} binding The data socket the request was bound to.
  * @property {boolean} [settled] Final only: true once the transport call itself ended, whatever
- *   its owner's wait did, so `dispose` closes the socket of an unanswered request and no other.
+ *   its owner's wait did, so only the socket of a request still unanswered is ever closed.
  */
 
 /**
@@ -1263,13 +1266,14 @@ class ShareFetchLoop {
    * closing sends only its preserved terminal subset under its own predicate. Repeated calls share
    * the first.
    * @param {object} [options] Closing context.
-   * @param {{guard: () => Error|null, captured: object, operation?: ConsumerOperation}} [options.closing]
+   * @param {{guard: (frameLength?: number) => Error|null, captured: object, operation: import('../groupProtocol/interface').ConsumerOperation}} [options.closing]
    *   A captured close: `captured` comes from {@link ShareFetchLoop#captureFinal}, `guard` is the
    *   immutable closing predicate of the closing episode and `operation` is the episode's own
-   *   operation. The final's wait and its queue registration belong to that operation, so its
-   *   expiry settles an unanswered final; an episode that can expire must supply it, because a
-   *   predicate alone cannot wake a waiting request.
+   *   operation, which is required: the final's wait and its queue registration belong to it, so
+   *   its expiry settles an unanswered final, and a predicate alone cannot wake a waiting request.
+   *   A close without an operation settles its captured tickets not sent and rejects.
    * @returns {Promise<void>} Resolves when the node is disposed.
+   * @throws {KafkaJSInvariantViolation} When a captured close has no operation.
    * @throws {Error} The final's failure; the node is disposed regardless.
    */
   finishNode({ closing } = {}) {
@@ -1282,8 +1286,9 @@ class ShareFetchLoop {
 
   /**
    * @private
-   * @param {{guard: Function, captured: object}} [closing] A captured close.
+   * @param {{guard: Function, captured: object, operation: object}} [closing] A captured close.
    * @returns {Promise<void>}
+   * @throws {KafkaJSInvariantViolation} When a captured close has no operation.
    */
   async finish(closing) {
     try {
@@ -1335,28 +1340,34 @@ class ShareFetchLoop {
 
   /**
    * Writes a captured final once, after ordinary retirement, under the closing predicate and the
-   * captured binding alone. The final is an active exchange of this node, so a final that was
-   * written and never answered is found and its transport closed by `dispose`, and its wait belongs
-   * to the closing operation, so the episode's expiry settles it session-lost. The predicate is
-   * checked again after the answer, and an answer that arrives after it refused is not published
-   * as acceptance.
+   * captured binding alone. The final's wait belongs to the closing operation, so the episode's
+   * expiry settles an unanswered final session-lost, and the final tears down its own exchange and
+   * transport whether or not the node was disposed first. The predicate is checked again after the
+   * answer, and an answer that arrives after it refused is not published as acceptance.
    * @private
-   * @param {{guard: (frameLength?: number) => Error|null, captured: object, operation?: ConsumerOperation}} closing
-   *   The closing context. Without an operation, a private one without a deadline owns the wait.
+   * @param {{guard: (frameLength?: number) => Error|null, captured: object, operation?: import('../groupProtocol/interface').ConsumerOperation}} closing
+   *   The closing context; its operation is required.
    * @returns {Promise<void>}
+   * @throws {KafkaJSInvariantViolation} When there is no operation; the captured tickets are first
+   *   settled not sent.
    */
   async sendFinal({ guard, captured, operation }) {
-    const owned = operation ?? new ConsumerOperation({ guard, now: this.now })
-    try {
-      await this.writeFinal(owned, guard, captured)
-    } finally {
-      if (!operation) owned.finish()
+    if (!operation) {
+      const error = new KafkaJSInvariantViolation('A captured close requires its closing operation')
+      this.settleAll(captured.prepared, 'not-sent', error)
+      throw error
     }
+    await this.writeFinal(operation, guard, captured)
   }
 
   /**
+   * Sends the final and settles its tickets exactly once. An unanswered final, written and not
+   * answered when the wait ends, is removed from the active exchanges and its exact data socket is
+   * closed here, independently of the node's disposed flag; an unwritten or already ended one only
+   * leaves the active exchanges.
    * @private
-   * @param {ConsumerOperation} operation Owns the final's wait and its queue registration.
+   * @param {import('../groupProtocol/interface').ConsumerOperation} operation Owns the final's
+   *   wait and its queue registration.
    * @param {(frameLength?: number) => Error|null} guard The closing predicate.
    * @param {{binding: object, prepared: object[], fields: object, descriptor: object}} captured
    *   What {@link ShareFetchLoop#captureFinal} froze.
@@ -1403,7 +1414,9 @@ class ShareFetchLoop {
       )
     } catch (error) {
       const written = exchange.sentAt !== undefined
-      if (!written || exchange.settled) this.exchanges.delete(exchange)
+      this.exchanges.delete(exchange)
+      if (written && !exchange.settled && !ShareSession.bindingLost(binding))
+        this.closeSocket(binding.connection)
       this.settleAll(prepared, written ? 'session-lost' : 'not-sent', error)
       return
     }
@@ -1442,9 +1455,10 @@ class ShareFetchLoop {
   /**
    * Disposes the node once: revokes admissions, settles every acquisition, retires the session
    * (queued requests reject, the operation's waits, timers and still-queued network requests are
-   * removed) and closes the data socket of every request that was written and is still
-   * unanswered, ordinary or final, but only while that socket is still the one it was written on.
-   * A replacement socket or the membership socket is never touched.
+   * removed) and closes the data socket of every request this node still tracks as written and
+   * unanswered, but only while that socket is still the one it was written on. A replacement
+   * socket or the membership socket is never touched. A captured final that is written after
+   * this call is not tracked here: {@link ShareFetchLoop#finishNode} tears it down itself.
    * @param {Error} [cause] Why the node ends.
    * @param {object} [options] Disposal options.
    * @param {'session-lost'|'membership-lost'|'not-sent'} [options.reason='session-lost'] The
@@ -1463,10 +1477,19 @@ class ShareFetchLoop {
         unanswered.add(binding.connection)
     this.invalidateAll(reason, preserve)
     this.session.retire(cause || new KafkaJSNonRetriableError('Share node was disposed'))
-    for (const connection of unanswered)
-      connection.disconnect({ drainTimeout }).catch((error) => {
-        this.logger.error('Share data connection close failed', { error: error.message })
-      })
+    for (const connection of unanswered) this.closeSocket(connection, drainTimeout)
+  }
+
+  /**
+   * @private
+   * @param {{disconnect: (options: {drainTimeout: number}) => Promise<*>}} connection A data socket.
+   * @param {number} [drainTimeout=0] Milliseconds it may drain before it closes.
+   * @returns {void} Closes it in the background; a failure is logged, never thrown.
+   */
+  closeSocket(connection, drainTimeout = 0) {
+    connection.disconnect({ drainTimeout }).catch((error) => {
+      this.logger.error('Share data connection close failed', { error: error.message })
+    })
   }
 
   /**

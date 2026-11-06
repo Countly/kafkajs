@@ -269,6 +269,10 @@ const harness = async ({
       timers: [],
     }
     let holding = false
+    /**
+     * Makes every later pacing sleep of this run wait in `run.timers` until the test releases it.
+     * @returns {void}
+     */
     run.holdSleeps = () => {
       holding = true
     }
@@ -360,11 +364,25 @@ const harness = async ({
     newPool,
     runOn,
     gates,
+    /**
+     * Holds every call that matches `selector` at the wire until the test releases it; `close`
+     * releases a gate the test left unsettled.
+     * @param {object} selector Which calls to hold, for example `{ api: 'ShareFetch' }`.
+     * @returns {object} The schedule's gate: `arrived()`, `release(value?)` and `fail(error)`.
+     */
     hold(selector) {
       const gate = schedule.hold(selector)
       gates.push(gate)
       return gate
     },
+    /**
+     * Answers the next calls of `api`, on any node, from `steps` in order.
+     * @param {'ShareFetch'|'ShareAcknowledge'|'Metadata'} api The request's API name.
+     * @param {Array<object|((fields: object, call: object) => object|undefined)>} [steps] One
+     *   answer, or a function that builds it from the request's fields and may return nothing, per
+     *   call. A call past the end, or a step that gives nothing, gets the quiet broker's answer.
+     * @returns {void}
+     */
     script(api, steps = []) {
       const queue = [...steps]
       cluster.answer(api, (fields, call) => {
@@ -373,6 +391,14 @@ const harness = async ({
         return answer ?? echo(api, fields)
       })
     },
+    /**
+     * Like `script`, with a separate list of answers for each node, so concurrent nodes never take
+     * each other's steps.
+     * @param {'ShareFetch'|'ShareAcknowledge'} api The request's API name.
+     * @param {Record<number, Array<object|((fields: object, call: object) => object|undefined)>>} byNode
+     *   The ordered steps by node id; the lists are consumed.
+     * @returns {void}
+     */
     scriptNodes(api, byNode) {
       cluster.answer(api, (fields, call) => {
         const step = byNode[call.node]?.shift()
@@ -440,15 +466,25 @@ const harness = async ({
       for (const run of runs) run.loop.cluster = real
       return { cluster: real, table, recreated, refreshes: () => metadataFrames() - baseline }
     },
+    /**
+     * Ends the harness: releases every unsettled gate and held timer, disposes every loop, closes
+     * the real cluster and destroys every pool, then asks the scripted cluster for its first
+     * recorded failure, such as a request it had no answer for.
+     * @returns {Promise<void>}
+     * @throws {Error} The scripted cluster's first recorded failure, or else the first failure to
+     *   disconnect the real cluster; everything else is closed before either is thrown.
+     */
     async close() {
       for (const gate of gates) if (gate.settle) gate.release()
       for (const run of runs) {
         run.loop.dispose()
         for (const timer of [...run.timers]) timer.release()
       }
-      await Promise.all(closers.map((close) => close().catch(() => {})))
+      const disconnected = await Promise.allSettled(closers.map((close) => close()))
       await Promise.all(pools.map((created) => created.destroy({ drainTimeout: 0 })))
       cluster.assertClean()
+      const failed = disconnected.find(({ status }) => status === 'rejected')
+      if (failed) throw failed.reason
     },
   }
 }
