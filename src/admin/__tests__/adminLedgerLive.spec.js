@@ -1,5 +1,6 @@
 const { randomBytes, pbkdf2Sync } = require('crypto')
 const { Kafka, AlterConfigOpTypes } = require('../../../index')
+const { KafkaJSConnectionError } = require('../../errors')
 const { inspect, isDeepStrictEqual } = require('util')
 const { AdminLiveProbe } = require('./fixtures/liveAdmin')
 const Broker = require('../../broker')
@@ -898,6 +899,9 @@ class AdminLedgerScenario {
 
   /**
    * Restores a fenced node, validates features and removes a real metrics subscription.
+   * Only restart readbacks tolerate connection failures, under the existing work deadline.
+   * The restarted node must answer ApiVersions before cluster restoration is accepted.
+   * @see https://raw.githubusercontent.com/apache/kafka/4.3/core/src/main/scala/kafka/server/BrokerServer.scala
    * @returns {Promise<void>}
    * @throws {Error} broker health, election, feature or resource mismatch
    */
@@ -918,20 +922,55 @@ class AdminLedgerScenario {
     const thirdId = Number((await p.host('kafka3', ['printenv', 'KAFKA_NODE_ID'])).trim())
     const third = before.brokers.find(({ nodeId }) => nodeId === thirdId)
     expect(third).toBeDefined()
+    /**
+     * Treats a restart's transport failure as an incomplete observation, retaining its identity.
+     * @param {string} operationId readback API and phase
+     * @param {() => Promise<object>} read one readback without broker mutations
+     * @returns {Promise<object|null>} response, or null while a connection is unavailable
+     * @throws {Error} any failure whose cause is not a connection failure
+     */
+    const restartRead = async (operationId, read) => {
+      try {
+        return await p.invoke(read)
+      } catch (error) {
+        let cause = error
+        while (cause.cause) cause = cause.cause
+        if (!(cause instanceof KafkaJSConnectionError)) throw error
+        p.record('broker restart read failure', {
+          operationId,
+          destination: cause.broker || 'unknown',
+          errorCode: cause.code || cause.name,
+        })
+        return null
+      }
+    }
     await p.control('stop', 'kafka3')
     let fencedBroker
     await p.poll(async () => {
-      const observation = await p.invoke(() =>
+      const observation = await restartRead('DescribeCluster while fenced', () =>
         admin.describeCluster({ includeFencedBrokers: true })
       )
+      if (!observation) return false
       fencedBroker = observation.brokers.find(({ nodeId }) => nodeId === third.nodeId)
       return fencedBroker?.fenced === true
     })
     expect(fencedBroker.fenced).toBe(true)
     await p.control('start', 'kafka3')
+    // An unfenced metadata entry can precede the restarted node's client listener readiness.
+    await p.poll(async () =>
+      Boolean(
+        await restartRead('ApiVersions after restart', () => this.raw(third.host, third.port))
+      )
+    )
     await p.poll(async () => {
-      const all = await p.invoke(() => admin.describeCluster({ includeFencedBrokers: true }))
-      const metadata = await p.invoke(() => admin.fetchTopicMetadata({ topics: [this.topic] }))
+      const all = await restartRead('DescribeCluster after restart', () =>
+        admin.describeCluster({ includeFencedBrokers: true })
+      )
+      if (!all) return false
+      const metadata = await restartRead('Metadata after restart', () =>
+        admin.fetchTopicMetadata({ topics: [this.topic] })
+      )
+      if (!metadata) return false
       return (
         all.brokers.length === 3 &&
         all.brokers.every(({ fenced }) => !fenced) &&
