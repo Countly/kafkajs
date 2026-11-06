@@ -2809,6 +2809,31 @@ export class KafkaJSServerDoesNotSupportApiKey extends KafkaJSNonRetriableError 
   constructor(e: Error | string, metadata?: KafkaJSServerDoesNotSupportApiKeyMetadata)
 }
 
+/** Why a cluster cannot run share groups for this client. */
+export type ShareGroupsNotSupportedReason =
+  | 'api-not-advertised'
+  | 'api-version-range'
+  | 'feature-disabled'
+  | 'refused-by-broker'
+
+/**
+ * The cluster cannot run share groups for this client: it does not offer the APIs, offers only
+ * versions this client does not implement (Kafka 4.1 shipped a preview), has `share.version` below
+ * 1, or answered `UNSUPPORTED_VERSION`. Non-retriable.
+ */
+export class KafkaJSShareGroupsNotSupportedError extends KafkaJSServerDoesNotSupportApiKey {
+  readonly reason: ShareGroupsNotSupportedReason
+  /** The finalized level of `share.version` when the broker reported one, else `null`. */
+  readonly shareVersion: number | null
+  constructor(
+    e: Error | string,
+    metadata: KafkaJSServerDoesNotSupportApiKeyMetadata & {
+      reason: ShareGroupsNotSupportedReason
+      shareVersion?: number | null
+    }
+  )
+}
+
 export class KafkaJSBrokerNotFound extends KafkaJSError {
   constructor()
 }

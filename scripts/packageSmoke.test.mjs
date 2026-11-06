@@ -221,3 +221,16 @@ test('the packed client authenticates with PLAIN and reports the absent GSSAPI p
     await new Promise((resolve, reject) => server.close(error => error ? reject(error) : resolve()))
   }
 })
+
+test('share capability errors keep the unsupported API class across entry points', async () => {
+  const cjs = require(PKG)
+  const esm = await import(PKG)
+  assert.equal(esm.KafkaJSShareGroupsNotSupportedError, cjs.KafkaJSShareGroupsNotSupportedError)
+  const error = new cjs.KafkaJSShareGroupsNotSupportedError('unsupported', {
+    apiKey: 78, apiName: 'ShareFetch', reason: 'api-version-range', shareVersion: 0
+  })
+  assert.ok(error instanceof cjs.KafkaJSServerDoesNotSupportApiKey)
+  assert.equal(error.retriable, false)
+  assert.equal(error.apiName, 'ShareFetch')
+  assert.equal(error.reason, 'api-version-range')
+})

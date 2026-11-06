@@ -55,10 +55,24 @@ const DEFAULT = [...CLASSIC, ...PRODUCER]
  * classic base beside their transaction pairs, and each advertises exactly the versions the
  * client's own caps allow under that transaction version: a transactional Produce, EndTxn and
  * TxnOffsetCommit at v11, v4 and v4 under transaction version 1, and at v12, v5 and v5 under 2,
- * which also sends no AddPartitionsToTxn and no AddOffsetsToTxn.
- * @type {Record<'default'|'sasl'|'consumer'|'tv1'|'tv2'|'offsets'|'transactions'|'storage'|'securityAdmin'|'clusterAdmin', Array<[string, number]>>}
+ * which also sends no AddPartitionsToTxn and no AddOffsetsToTxn. The `share` profile advertises the
+ * bootstrap pairs and the seven released share-group APIs at their one implemented version each;
+ * only the runtime pairs (ShareGroupHeartbeat, ShareFetch, ShareAcknowledge) have wire files yet.
+ * @type {Record<'default'|'sasl'|'consumer'|'tv1'|'tv2'|'offsets'|'transactions'|'storage'|'securityAdmin'|'clusterAdmin'|'share', Array<[string, number]>>}
  */
 const PROFILES = {
+  share: [
+    ['ApiVersions', 4],
+    ['Metadata', 13],
+    ['FindCoordinator', 6],
+    ['ShareGroupHeartbeat', 1],
+    ['ShareGroupDescribe', 1],
+    ['ShareFetch', 2],
+    ['ShareAcknowledge', 2],
+    ['DescribeShareGroupOffsets', 1],
+    ['AlterShareGroupOffsets', 0],
+    ['DeleteShareGroupOffsets', 0],
+  ],
   storage: [
     ...DEFAULT.filter(([api]) => api !== 'ListOffsets'),
     ['ListOffsets', 11],
@@ -272,7 +286,7 @@ class ScriptedCluster {
    * @param {Array<{ id: number, host: string, port: number }>} options.nodes the endpoints the
    *   client may dial; a dial to any other endpoint fails
    * @param {Schedule} [options.schedule] routes the calls; one is made when omitted
-   * @param {'default'|'sasl'|'consumer'|'tv1'|'tv2'|'offsets'|'transactions'|'storage'|'securityAdmin'|'clusterAdmin'} [options.profile='default'] what the cluster advertises
+   * @param {'default'|'sasl'|'consumer'|'tv1'|'tv2'|'offsets'|'transactions'|'storage'|'securityAdmin'|'clusterAdmin'|'share'} [options.profile='default'] what the cluster advertises
    * @param {Record<string, [number, number]>} [options.advertise] `[version, version]` per API
    *   name, over the profile's: how a test makes the client negotiate another single version, the
    *   only one the cluster then accepts; a non-singleton range is rejected
@@ -372,11 +386,21 @@ class ScriptedCluster {
 
   /**
    * @returns {{ apiKeys: Array<{ apiKey: number, minVersion: number, maxVersion: number }>,
+   *   finalizedFeaturesEpoch?: number,
    *   finalizedFeatures?: Array<{ name: string, minVersionLevel: number, maxVersionLevel: number }> }}
-   *   the fields the ApiVersions answer is built from: the table, and under `tv2` the finalized
-   *   `transaction.version` at level 2, which is what makes a client choose transaction version 2
+   *   the fields the ApiVersions answer is built from: the table, under `tv2` the finalized
+   *   `transaction.version` at level 2, which is what makes a client choose transaction version 2,
+   *   and under `share` the finalized `share.version` at level 1 with feature epoch 7
    */
   apiVersionsAnswer() {
+    if (this.profile === 'share') {
+      return {
+        apiKeys: this.apiVersionsTable(),
+        finalizedFeaturesEpoch: 7,
+        finalizedFeatures: [{ name: 'share.version', minVersionLevel: 1, maxVersionLevel: 1 }],
+      }
+    }
+
     return this.profile === 'tv2'
       ? {
           apiKeys: this.apiVersionsTable(),
@@ -1075,6 +1099,23 @@ const producerScript = (cluster, { topic = TOPIC, partitions = 1 } = {}) =>
     }))
 
 /**
+ * Installs literal share-group answers without simulating membership, sessions, a log or
+ * ownership: each row's `response` is returned as it is and the wire pair supplies any field it
+ * omits. A repeated API replaces its earlier answer, and the schedule stays the only place that
+ * orders calls. Intended for the `share` profile.
+ * @param {ScriptedCluster} cluster
+ * @param {Array<{ api: string, response: object }>} rows literal answers, applied in order
+ * @returns {ScriptedCluster} the cluster; no group or acknowledgement state is kept
+ */
+const shareScript = (cluster, rows) => {
+  for (const { api, response } of rows) {
+    cluster.answer(api, () => response)
+  }
+
+  return cluster
+}
+
+/**
  * @param {ConstructorParameters<typeof ScriptedCluster>[0]} options
  * @returns {ScriptedCluster}
  */
@@ -1086,6 +1127,7 @@ module.exports = {
   groupScript,
   consumerProtocolScript,
   producerScript,
+  shareScript,
   PROFILES,
   NEGOTIATION_MS,
 }

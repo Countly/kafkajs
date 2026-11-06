@@ -266,6 +266,28 @@ class KafkaJSServerDoesNotSupportApiKey extends KafkaJSNonRetriableError {
   }
 }
 
+/**
+ * The cluster cannot run share groups for this client. A subclass of the unsupported-API error, so
+ * existing handlers still see it; non-retriable, because repeating the request cannot help.
+ * @extends KafkaJSServerDoesNotSupportApiKey
+ */
+class KafkaJSShareGroupsNotSupportedError extends KafkaJSServerDoesNotSupportApiKey {
+  /**
+   * @param {Error|string} e Original cause or message; name the refused ranges in the message.
+   * @param {object} metadata The refusal, from the capability check or a runtime classifier.
+   * @param {number} metadata.apiKey Refused share API key.
+   * @param {string} metadata.apiName Protocol name of that API.
+   * @param {'api-not-advertised'|'api-version-range'|'feature-disabled'|'refused-by-broker'} metadata.reason Stage that refused.
+   * @param {number|null} [metadata.shareVersion=null] Finalized `share.version` level, or null when the broker reported no feature epoch.
+   */
+  constructor(e, { apiKey, apiName, reason, shareVersion = null }) {
+    super(e, { apiKey, apiName })
+    this.name = 'KafkaJSShareGroupsNotSupportedError'
+    this.reason = reason
+    this.shareVersion = shareVersion
+  }
+}
+
 class KafkaJSBrokerNotFound extends KafkaJSError {
   constructor() {
     super(...arguments)
@@ -854,6 +876,7 @@ module.exports = {
   KafkaJSTimeout,
   KafkaJSLockTimeout,
   KafkaJSServerDoesNotSupportApiKey,
+  KafkaJSShareGroupsNotSupportedError,
   KafkaJSUnsupportedMagicByteInMessageSet,
   KafkaJSDeleteTopicRecordsError,
   KafkaJSInvariantViolation,

@@ -1177,6 +1177,135 @@ module.exports = class Broker {
   }
 
   /**
+   * Sends ShareGroupHeartbeat at the negotiated released version through the guarded transport.
+   * Broker error codes, including 35, come back as data: nothing here retries or classifies them.
+   * @public
+   * @param {object} request Camel-case wire fields of the selected codec.
+   * @param {object} [options] Private send context, never serialized.
+   * @param {(frameLength?: number) => Error|null} [options.guard] The caller's pre-write refusal.
+   * @returns {Promise<object>} The decoded response.
+   * @throws {Error} The guard's refusal, an unsupported version, or an encoding or transport failure.
+   */
+  async shareGroupHeartbeat(request, { guard } = {}) {
+    this.throwIfRefused(guard)
+    const build = this.lookupRequest(apiKeys.ShareGroupHeartbeat, requests.ShareGroupHeartbeat)
+    return await this[PRIVATE.SEND_REQUEST](build(request), guard)
+  }
+
+  /**
+   * Sends ShareGroupDescribe at the negotiated released version through the guarded transport.
+   * Broker error codes, including 35, come back as data: nothing here retries or classifies them.
+   * @public
+   * @param {object} request Camel-case wire fields of the selected codec.
+   * @param {object} [options] Private send context, never serialized.
+   * @param {(frameLength?: number) => Error|null} [options.guard] The caller's pre-write refusal.
+   * @returns {Promise<object>} The decoded response.
+   * @throws {Error} The guard's refusal, an unsupported version, or an encoding or transport failure.
+   */
+  async shareGroupDescribe(request, { guard } = {}) {
+    this.throwIfRefused(guard)
+    const build = this.lookupRequest(apiKeys.ShareGroupDescribe, requests.ShareGroupDescribe)
+    return await this[PRIVATE.SEND_REQUEST](build(request), guard)
+  }
+
+  /**
+   * Sends ShareFetch at the negotiated released version through the guarded transport. The record
+   * decoding options are bound to this request's response decoder and never reach the wire.
+   * Broker error codes, including 35, come back as data: nothing here retries or classifies them.
+   * @public
+   * @param {object} request Camel-case wire fields of the selected codec.
+   * @param {boolean} [request.checkCrcs=true] Validate record batch checksums.
+   * @param {number} [request.maxDecompressedBatchBytes] Decompression ceiling for one batch, in bytes.
+   * @param {object} [options] Private send context, never serialized.
+   * @param {(frameLength?: number) => Error|null} [options.guard] The caller's pre-write refusal.
+   * @returns {Promise<object>} The decoded response, with acquired ranges, hints and endpoints intact.
+   * @throws {Error} The guard's refusal, an unsupported version, or an encoding or transport failure.
+   */
+  async shareFetch(request, { guard } = {}) {
+    this.throwIfRefused(guard)
+    const { checkCrcs = true, maxDecompressedBatchBytes, ...fields } = request
+    const build = this.lookupRequest(apiKeys.ShareFetch, requests.ShareFetch)
+    const built = build(fields)
+    const response = built.response
+    const decodeOptions = { checkCrcs, maxDecompressedBatchBytes }
+    built.response = { ...response, decode: (bytes) => response.decode(bytes, decodeOptions) }
+    return await this[PRIVATE.SEND_REQUEST](built, guard)
+  }
+
+  /**
+   * Sends ShareAcknowledge at the negotiated released version through the guarded transport.
+   * Broker error codes, including 35, come back as data: nothing here retries or classifies them.
+   * @public
+   * @param {object} request Camel-case wire fields of the selected codec.
+   * @param {object} [options] Private send context, never serialized.
+   * @param {(frameLength?: number) => Error|null} [options.guard] The caller's pre-write refusal.
+   * @returns {Promise<object>} The decoded response.
+   * @throws {Error} The guard's refusal, an unsupported version, or an encoding or transport failure.
+   */
+  async shareAcknowledge(request, { guard } = {}) {
+    this.throwIfRefused(guard)
+    const build = this.lookupRequest(apiKeys.ShareAcknowledge, requests.ShareAcknowledge)
+    return await this[PRIVATE.SEND_REQUEST](build(request), guard)
+  }
+
+  /**
+   * Sends DescribeShareGroupOffsets at the negotiated released version through the guarded transport.
+   * Broker error codes, including 35, come back as data: nothing here retries or classifies them.
+   * @public
+   * @param {object} request Camel-case wire fields of the selected codec.
+   * @param {object} [options] Private send context, never serialized.
+   * @param {(frameLength?: number) => Error|null} [options.guard] The caller's pre-write refusal.
+   * @returns {Promise<object>} The decoded response.
+   * @throws {Error} The guard's refusal, an unsupported version, or an encoding or transport failure.
+   */
+  async describeShareGroupOffsets(request, { guard } = {}) {
+    this.throwIfRefused(guard)
+    const build = this.lookupRequest(
+      apiKeys.DescribeShareGroupOffsets,
+      requests.DescribeShareGroupOffsets
+    )
+    return await this[PRIVATE.SEND_REQUEST](build(request), guard)
+  }
+
+  /**
+   * Sends AlterShareGroupOffsets at the negotiated released version through the guarded transport.
+   * Broker error codes, including 35, come back as data: nothing here retries or classifies them.
+   * @public
+   * @param {object} request Camel-case wire fields of the selected codec.
+   * @param {object} [options] Private send context, never serialized.
+   * @param {(frameLength?: number) => Error|null} [options.guard] The caller's pre-write refusal.
+   * @returns {Promise<object>} The decoded response.
+   * @throws {Error} The guard's refusal, an unsupported version, or an encoding or transport failure.
+   */
+  async alterShareGroupOffsets(request, { guard } = {}) {
+    this.throwIfRefused(guard)
+    const build = this.lookupRequest(
+      apiKeys.AlterShareGroupOffsets,
+      requests.AlterShareGroupOffsets
+    )
+    return await this[PRIVATE.SEND_REQUEST](build(request), guard)
+  }
+
+  /**
+   * Sends DeleteShareGroupOffsets at the negotiated released version through the guarded transport.
+   * Broker error codes, including 35, come back as data: nothing here retries or classifies them.
+   * @public
+   * @param {object} request Camel-case wire fields of the selected codec.
+   * @param {object} [options] Private send context, never serialized.
+   * @param {(frameLength?: number) => Error|null} [options.guard] The caller's pre-write refusal.
+   * @returns {Promise<object>} The decoded response.
+   * @throws {Error} The guard's refusal, an unsupported version, or an encoding or transport failure.
+   */
+  async deleteShareGroupOffsets(request, { guard } = {}) {
+    this.throwIfRefused(guard)
+    const build = this.lookupRequest(
+      apiKeys.DeleteShareGroupOffsets,
+      requests.DeleteShareGroupOffsets
+    )
+    return await this[PRIVATE.SEND_REQUEST](build(request), guard)
+  }
+
+  /**
    * One KIP-848 ConsumerGroupHeartbeat: the entire membership protocol for a consumer-protocol
    * member - join, keep-alive, assignment acknowledgement and leave are all this request, told
    * apart by `memberEpoch` and by which fields carry a value.
