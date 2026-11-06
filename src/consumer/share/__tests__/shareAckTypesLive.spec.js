@@ -476,12 +476,16 @@ class AckTypesCase {
 
   /**
    * Creates the topic and group config, checks the broker's delivery limit, connects the admin and
-   * the transactional producer, and measures the baseline later resource checks compare against.
+   * the transactional producer. The cleanup baseline precedes all connected test clients.
    * @param {AbortSignal} scope the case scope
    * @returns {Promise<void>}
    */
   async setup(scope) {
-    this.beforeAdmin = await this.probe.snapshot()
+    // CleanupStack and assertShareCleanup each hold one deadline during the final sample.
+    this.beforeAdmin = await bounded(scope, 60000, () =>
+      bounded(scope, 10000, () => this.probe.snapshot())
+    )
+    this.baseline = this.beforeAdmin
     this.admin = this.client('admin').admin()
     this.admin.on(this.admin.events.REQUEST, ({ payload }) => this.requests.push(payload))
     this.stack.add('prove cleanup and disconnect admin', (signal) => this.cleanup(signal))
@@ -504,9 +508,6 @@ class AckTypesCase {
     )
     await this.requireDeliveryLimit(scope)
     await bounded(scope, 10000, () => this.admin.listGroups())
-    this.baseline = await bounded(scope, 60000, () =>
-      bounded(scope, 10000, () => this.probe.snapshot())
-    )
     const metadata = await bounded(scope, Infinity, () =>
       this.admin.fetchTopicMetadata({ topics: [this.topic] })
     )
@@ -930,7 +931,7 @@ class AckTypesCase {
   }
 
   /**
-   * Proves owned objects are gone and resources are back at baseline, then disconnects the admin.
+   * Proves owned objects are gone, closes the admin, then compares the pre-client baseline.
    * It runs last in the cleanup order.
    * @param {AbortSignal} signal the cleanup scope
    * @returns {Promise<void>}
@@ -938,24 +939,13 @@ class AckTypesCase {
   async cleanup(signal) {
     try {
       if (this.baseline) {
-        await pollUntil(
-          signal,
-          3000,
-          () =>
-            this.tap.socketCounts().created - this.tap.socketCounts().destroyed <=
-            this.baseline.sockets.open,
-          {
-            delayMs: 50,
-            label: 'The sockets closing',
-          }
-        )
         this.after = await assertShareCleanup(
           this.admin,
           [this.group],
           [this.topic],
           this.baseline,
           this.probe,
-          { signal }
+          { signal, disconnectAdmin: true }
         )
       }
     } finally {

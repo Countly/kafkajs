@@ -496,7 +496,9 @@ class IsolationCase {
             await this.admin.describeCluster()
             await this.admin.listGroups()
           })
-          probeBase = await this.sample(scope)
+          // The helper proves absence before closing admin and sampling this same client-free
+          // context. Both sample() and the helper hold exactly one proof deadline.
+          probeBase = pre
           this.row('resource-baseline', { resources: summarize(probeBase) })
           await this.stack.run(
             async () => {
@@ -512,7 +514,7 @@ class IsolationCase {
             [this.topic],
             probeBase,
             this.probe,
-            { signal: scope }
+            { signal: scope, disconnectAdmin: true }
           )
         },
         { budgetMs: PROOF_MS }
