@@ -1863,7 +1863,7 @@ class SessionCase {
       logLevel: logLevel.NOTHING,
       clientId: `share-session-admin-${this.nonce}`,
       ...(action === 'leader' && {
-        socketFactory: this.tap.wrap(defaultSocketFactory, 'admin'),
+        socketFactory: this.tap.wrap(defaultSocketFactory(), 'admin'),
       }),
     }).admin()
     this.stack = new CleanupStack()
