@@ -29,6 +29,35 @@ const {
  * Checks observations without answering a request or making a client decision.
  * The scenario supplies issuance identities captured from real calls, not wire counters.
  */
+
+/**
+ * Serializes a value with object keys sorted, so equal observations compare equal whatever their
+ * key order.
+ * @param {*} value An observation value.
+ * @returns {string} Its canonical JSON.
+ */
+const canonicalJson = (value) =>
+  JSON.stringify(value, (key, field) =>
+    field && typeof field === 'object' && !Array.isArray(field)
+      ? Object.fromEntries(
+          Object.keys(field)
+            .sort()
+            .map((name) => [name, field[name]])
+        )
+      : field
+  )
+
+/**
+ * Turns literal observation sets into sorted multisets: arrival order across independent nodes is
+ * not part of the oracle, while every field and every duplicate is.
+ * @param {Object<string, Array<*>>} sets Observation sets by name.
+ * @returns {Object<string, string[]>} Sorted canonical entries per set.
+ */
+const canonicalSets = (sets) =>
+  Object.fromEntries(
+    Object.entries(sets).map(([name, values]) => [name, values.map(canonicalJson).sort()])
+  )
+
 class FaultAudit {
   /** @returns {FaultAudit} An empty observer with compact interval storage. */
   constructor() {
@@ -1236,7 +1265,11 @@ class FaultCase {
       reason: event.error?.reason ?? null,
       code: event.error?.cause?.code ?? null,
     }))
-    assert.deepEqual({ handlers, mutations, settlements }, expected, 'literal row observation sets')
+    assert.deepEqual(
+      canonicalSets({ handlers, mutations, settlements }),
+      canonicalSets(expected),
+      'literal row observation sets'
+    )
   }
 
   /**

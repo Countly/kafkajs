@@ -13,6 +13,7 @@ const {
 const ConnectionPool = require('../../../network/connectionPool')
 const RequestQueue = require('../../../network/requestQueue')
 const { requests } = require('../../../protocol/requests')
+const { readRequestHeader } = require('../../../../testHelpers/fakeSocket')
 
 const {
   FaultAudit,
@@ -25,6 +26,7 @@ const {
   codesOf,
   track,
   covers,
+  dataPart,
 } = require('../../../../testHelpers/shareFaultAudit')
 
 /**
@@ -65,19 +67,27 @@ const listed = (fields) =>
  * hides behind an omitted sibling unless the row asks for it.
  * @param {78|79} api The frame's API key.
  * @param {object} fields The frame's decoded fields.
- * @param {{code?: number, partition?: number, ack?: number, omit?: boolean, duplicate?: boolean}} spec
+ * @param {{code?: number, partition?: number, ack?: number, omit?: boolean, duplicate?: boolean,
+ *   target?: number, sibling?: boolean}} spec
  *   `code` is a top-level error; `partition` is the selected partition's error (the fetch error
  *   for API 78, the acknowledgement error for API 79); `ack` is a ShareFetch acknowledge error.
  * @returns {object} The answer object for the scripted cluster.
  */
-const faultAnswer = (api, fields, { code, partition, ack, omit, duplicate, target = 1 }) => {
+const faultAnswer = (
+  api,
+  fields,
+  { code, partition, ack, omit, duplicate, target = 1, sibling = false }
+) => {
   if (code !== undefined) return api === 78 ? topError(code) : ackAnswer([], { errorCode: code })
   const rows = listed(fields).filter(({ topicId, partition: index }) => {
     return !(omit && topicId === IDS.A && index === target)
   })
+  if (sibling && !rows.some((row) => row.topicId === IDS.A && row.partition === 2))
+    rows.push({ topicId: IDS.A, partition: 2 })
   const selected = (row) => row.topicId === IDS.A && row.partition === target
   const build = (row) => {
     if (api === 79) return { ...row, code: selected(row) ? partition : 0 }
+    if (sibling && row.topicId === IDS.A && row.partition === 2) return dataPart(2)
     return part({
       topicId: row.topicId,
       partition: row.partition,
@@ -118,7 +128,12 @@ class DataFaultCase extends FaultCase {
    */
   fetchAnswerFor(fields) {
     const answer = super.fetchAnswerFor(fields)
-    return { ...answer, acquisitionLockTimeoutMs: this.lockMs }
+    return {
+      ...answer,
+      acquisitionLockTimeoutMs: listed(fields).some(({ partition }) => partition === 1)
+        ? this.lockMs
+        : 15000,
+    }
   }
 
   /**
@@ -233,7 +248,13 @@ class DataFaultCase extends FaultCase {
   }
 }
 
-/** Literal fault, phase and outcome rows; the runtime driver must not mutate this oracle. */
+const MILLION_LAST = '9007199255740992'
+
+/**
+ * Literal row oracles. Handler tuples are [UUID, partition, offset, key hex, value hex, count];
+ * mutation tuples are [UUID, partition, first, last, types]; settlement tuples are
+ * [UUID, partition, first, last, type, reason, cause code]. No tuple is inferred from a provider.
+ */
 const rows = [
   {
     fault: 'partition 121',
@@ -252,6 +273,28 @@ const rows = [
       oldAckResends: 0,
       nextEpoch: 3,
     },
+    observations: {
+      handlers: [
+        [IDS.A, 0, H, '6b', '76', 2],
+        [IDS.A, 0, J, '6b', '76', 2],
+        [IDS.A, 1, H, '6b', '76', 2],
+        [IDS.A, 1, J, '6b', '76', 2],
+        [IDS.A, 2, H, '6b', '76', 2],
+        [IDS.A, 2, J, '6b', '76', 2],
+      ],
+      mutations: [
+        [IDS.A, 0, H, J, [1]],
+        [IDS.A, 1, H, H, [1]],
+        [IDS.A, 1, J, J, [1]],
+        [IDS.A, 2, H, J, [1]],
+      ],
+      settlements: [
+        [IDS.A, 0, H, J, 'accept', null, null],
+        [IDS.A, 1, H, H, 'accept', 'rejected-by-broker', 121],
+        [IDS.A, 1, J, J, 'accept', null, null],
+        [IDS.A, 2, H, J, 'accept', null, null],
+      ],
+    },
   },
   {
     fault: 'partition 121',
@@ -273,6 +316,26 @@ const rows = [
       revokedResult: 'accepted',
       revokedWire: 'eligible terminal frame',
     },
+    observations: {
+      handlers: [
+        [IDS.A, 0, H, '6b', '76', 2],
+        [IDS.A, 0, J, '6b', '76', 2],
+        [IDS.A, 1, H, '6b', '76', 2],
+        [IDS.A, 1, J, '6b', '76', 2],
+      ],
+      mutations: [
+        [IDS.A, 0, H, J, [1]],
+        [IDS.A, 1, H, H, [1]],
+        [IDS.A, 1, J, J, [1]],
+        [IDS.A, 2, H, J, [2]],
+      ],
+      settlements: [
+        [IDS.A, 0, H, J, 'accept', null, null],
+        [IDS.A, 1, H, H, 'accept', 'rejected-by-broker', 121],
+        [IDS.A, 1, J, J, 'accept', null, null],
+        [IDS.A, 2, H, J, 'release', null, null],
+      ],
+    },
   },
   {
     fault: 'partition 6',
@@ -290,6 +353,28 @@ const rows = [
       revoked: [],
       oldAckResends: 0,
       nextEpoch: 3,
+    },
+    observations: {
+      handlers: [
+        [IDS.A, 0, H, '6b', '76', 2],
+        [IDS.A, 0, J, '6b', '76', 2],
+        [IDS.A, 1, H, '6b', '76', 2],
+        [IDS.A, 1, J, '6b', '76', 2],
+        [IDS.A, 2, H, '6b', '76', 2],
+        [IDS.A, 2, J, '6b', '76', 2],
+      ],
+      mutations: [
+        [IDS.A, 0, H, J, [1]],
+        [IDS.A, 1, H, H, [1]],
+        [IDS.A, 1, J, J, [1]],
+        [IDS.A, 2, H, J, [1]],
+      ],
+      settlements: [
+        [IDS.A, 0, H, J, 'accept', null, null],
+        [IDS.A, 1, H, H, 'accept', 'session-lost', 6],
+        [IDS.A, 1, J, J, 'accept', null, null],
+        [IDS.A, 2, H, J, 'accept', null, null],
+      ],
     },
   },
   {
@@ -311,6 +396,26 @@ const rows = [
       revokedType: 'release',
       revokedResult: 'accepted',
       revokedWire: 'eligible terminal frame',
+    },
+    observations: {
+      handlers: [
+        [IDS.A, 0, H, '6b', '76', 2],
+        [IDS.A, 0, J, '6b', '76', 2],
+        [IDS.A, 1, H, '6b', '76', 2],
+        [IDS.A, 1, J, '6b', '76', 2],
+      ],
+      mutations: [
+        [IDS.A, 0, H, J, [1]],
+        [IDS.A, 1, H, H, [1]],
+        [IDS.A, 1, J, J, [1]],
+        [IDS.A, 2, H, J, [2]],
+      ],
+      settlements: [
+        [IDS.A, 0, H, J, 'accept', null, null],
+        [IDS.A, 1, H, H, 'accept', 'session-lost', 6],
+        [IDS.A, 1, J, J, 'accept', null, null],
+        [IDS.A, 2, H, J, 'release', null, null],
+      ],
     },
   },
   {
@@ -330,6 +435,28 @@ const rows = [
       oldAckResends: 0,
       nextEpoch: 3,
     },
+    observations: {
+      handlers: [
+        [IDS.A, 0, H, '6b', '76', 2],
+        [IDS.A, 0, J, '6b', '76', 2],
+        [IDS.A, 1, H, '6b', '76', 2],
+        [IDS.A, 1, J, '6b', '76', 2],
+        [IDS.A, 2, H, '6b', '76', 2],
+        [IDS.A, 2, J, '6b', '76', 2],
+      ],
+      mutations: [
+        [IDS.A, 0, H, J, [1]],
+        [IDS.A, 1, H, H, [1]],
+        [IDS.A, 1, J, J, [1]],
+        [IDS.A, 2, H, J, [1]],
+      ],
+      settlements: [
+        [IDS.A, 0, H, J, 'accept', null, null],
+        [IDS.A, 1, H, H, 'accept', 'rejected-by-broker', 100],
+        [IDS.A, 1, J, J, 'accept', null, null],
+        [IDS.A, 2, H, J, 'accept', null, null],
+      ],
+    },
   },
   {
     fault: 'partition 100',
@@ -351,6 +478,26 @@ const rows = [
       revokedResult: 'accepted',
       revokedWire: 'eligible terminal frame',
     },
+    observations: {
+      handlers: [
+        [IDS.A, 0, H, '6b', '76', 2],
+        [IDS.A, 0, J, '6b', '76', 2],
+        [IDS.A, 1, H, '6b', '76', 2],
+        [IDS.A, 1, J, '6b', '76', 2],
+      ],
+      mutations: [
+        [IDS.A, 0, H, J, [1]],
+        [IDS.A, 1, H, H, [1]],
+        [IDS.A, 1, J, J, [1]],
+        [IDS.A, 2, H, J, [2]],
+      ],
+      settlements: [
+        [IDS.A, 0, H, J, 'accept', null, null],
+        [IDS.A, 1, H, H, 'accept', 'rejected-by-broker', 100],
+        [IDS.A, 1, J, J, 'accept', null, null],
+        [IDS.A, 2, H, J, 'release', null, null],
+      ],
+    },
   },
   {
     fault: 'top 122',
@@ -368,6 +515,24 @@ const rows = [
       revoked: [],
       oldAckResends: 0,
       nextEpoch: 0,
+    },
+    observations: {
+      handlers: [
+        [IDS.A, 0, H, '6b', '76', 2],
+        [IDS.A, 0, J, '6b', '76', 2],
+        [IDS.A, 1, H, '6b', '76', 2],
+        [IDS.A, 1, J, '6b', '76', 2],
+      ],
+      mutations: [
+        [IDS.A, 0, H, J, [1]],
+        [IDS.A, 1, H, H, [1]],
+      ],
+      settlements: [
+        [IDS.A, 0, H, J, 'accept', null, null],
+        [IDS.A, 1, H, H, 'accept', 'session-lost', 122],
+        [IDS.A, 1, J, J, 'release', 'session-lost', 122],
+        [IDS.A, 2, H, J, 'release', 'session-lost', 122],
+      ],
     },
   },
   {
@@ -390,6 +555,24 @@ const rows = [
       revokedResult: 'session-lost',
       revokedWire: 'none',
     },
+    observations: {
+      handlers: [
+        [IDS.A, 0, H, '6b', '76', 2],
+        [IDS.A, 0, J, '6b', '76', 2],
+        [IDS.A, 1, H, '6b', '76', 2],
+        [IDS.A, 1, J, '6b', '76', 2],
+      ],
+      mutations: [
+        [IDS.A, 0, H, J, [1]],
+        [IDS.A, 1, H, H, [1]],
+      ],
+      settlements: [
+        [IDS.A, 0, H, J, 'accept', null, null],
+        [IDS.A, 1, H, H, 'accept', 'session-lost', 122],
+        [IDS.A, 1, J, J, 'release', 'session-lost', 122],
+        [IDS.A, 2, H, J, 'release', 'session-lost', 122],
+      ],
+    },
   },
   {
     fault: 'top 123',
@@ -407,6 +590,24 @@ const rows = [
       revoked: [],
       oldAckResends: 0,
       nextEpoch: 0,
+    },
+    observations: {
+      handlers: [
+        [IDS.A, 0, H, '6b', '76', 2],
+        [IDS.A, 0, J, '6b', '76', 2],
+        [IDS.A, 1, H, '6b', '76', 2],
+        [IDS.A, 1, J, '6b', '76', 2],
+      ],
+      mutations: [
+        [IDS.A, 0, H, J, [1]],
+        [IDS.A, 1, H, H, [1]],
+      ],
+      settlements: [
+        [IDS.A, 0, H, J, 'accept', null, null],
+        [IDS.A, 1, H, H, 'accept', 'session-lost', 123],
+        [IDS.A, 1, J, J, 'release', 'session-lost', 123],
+        [IDS.A, 2, H, J, 'release', 'session-lost', 123],
+      ],
     },
   },
   {
@@ -428,6 +629,24 @@ const rows = [
       revokedType: 'release',
       revokedResult: 'session-lost',
       revokedWire: 'none',
+    },
+    observations: {
+      handlers: [
+        [IDS.A, 0, H, '6b', '76', 2],
+        [IDS.A, 0, J, '6b', '76', 2],
+        [IDS.A, 1, H, '6b', '76', 2],
+        [IDS.A, 1, J, '6b', '76', 2],
+      ],
+      mutations: [
+        [IDS.A, 0, H, J, [1]],
+        [IDS.A, 1, H, H, [1]],
+      ],
+      settlements: [
+        [IDS.A, 0, H, J, 'accept', null, null],
+        [IDS.A, 1, H, H, 'accept', 'session-lost', 123],
+        [IDS.A, 1, J, J, 'release', 'session-lost', 123],
+        [IDS.A, 2, H, J, 'release', 'session-lost', 123],
+      ],
     },
   },
   {
@@ -446,6 +665,28 @@ const rows = [
       revoked: [],
       oldAckResends: 0,
       nextEpoch: 3,
+    },
+    observations: {
+      handlers: [
+        [IDS.A, 0, H, '6b', '76', 2],
+        [IDS.A, 0, J, '6b', '76', 2],
+        [IDS.A, 1, H, '6b', '76', 2],
+        [IDS.A, 1, J, '6b', '76', 2],
+        [IDS.A, 2, H, '6b', '76', 2],
+        [IDS.A, 2, J, '6b', '76', 2],
+      ],
+      mutations: [
+        [IDS.A, 0, H, J, [1]],
+        [IDS.A, 1, H, H, [1]],
+        [IDS.A, 1, J, J, [1]],
+        [IDS.A, 2, H, J, [1]],
+      ],
+      settlements: [
+        [IDS.A, 0, H, J, 'accept', null, null],
+        [IDS.A, 1, H, H, 'accept', 'rejected-by-broker', 133],
+        [IDS.A, 1, J, J, 'accept', null, null],
+        [IDS.A, 2, H, J, 'accept', null, null],
+      ],
     },
   },
   {
@@ -468,6 +709,26 @@ const rows = [
       revokedResult: 'accepted',
       revokedWire: 'eligible terminal frame',
     },
+    observations: {
+      handlers: [
+        [IDS.A, 0, H, '6b', '76', 2],
+        [IDS.A, 0, J, '6b', '76', 2],
+        [IDS.A, 1, H, '6b', '76', 2],
+        [IDS.A, 1, J, '6b', '76', 2],
+      ],
+      mutations: [
+        [IDS.A, 0, H, J, [1]],
+        [IDS.A, 1, H, H, [1]],
+        [IDS.A, 1, J, J, [1]],
+        [IDS.A, 2, H, J, [2]],
+      ],
+      settlements: [
+        [IDS.A, 0, H, J, 'accept', null, null],
+        [IDS.A, 1, H, H, 'accept', 'rejected-by-broker', 133],
+        [IDS.A, 1, J, J, 'accept', null, null],
+        [IDS.A, 2, H, J, 'release', null, null],
+      ],
+    },
   },
   {
     fault: 'disconnect',
@@ -485,6 +746,24 @@ const rows = [
       revoked: [],
       oldAckResends: 0,
       nextEpoch: 0,
+    },
+    observations: {
+      handlers: [
+        [IDS.A, 0, H, '6b', '76', 2],
+        [IDS.A, 0, J, '6b', '76', 2],
+        [IDS.A, 1, H, '6b', '76', 2],
+        [IDS.A, 1, J, '6b', '76', 2],
+      ],
+      mutations: [
+        [IDS.A, 0, H, J, [1]],
+        [IDS.A, 1, H, H, [1]],
+      ],
+      settlements: [
+        [IDS.A, 0, H, J, 'accept', null, null],
+        [IDS.A, 1, H, H, 'accept', 'session-lost', null],
+        [IDS.A, 1, J, J, 'release', 'session-lost', null],
+        [IDS.A, 2, H, J, 'release', 'session-lost', null],
+      ],
     },
   },
   {
@@ -507,6 +786,24 @@ const rows = [
       revokedResult: 'session-lost',
       revokedWire: 'none',
     },
+    observations: {
+      handlers: [
+        [IDS.A, 0, H, '6b', '76', 2],
+        [IDS.A, 0, J, '6b', '76', 2],
+        [IDS.A, 1, H, '6b', '76', 2],
+        [IDS.A, 1, J, '6b', '76', 2],
+      ],
+      mutations: [
+        [IDS.A, 0, H, J, [1]],
+        [IDS.A, 1, H, H, [1]],
+      ],
+      settlements: [
+        [IDS.A, 0, H, J, 'accept', null, null],
+        [IDS.A, 1, H, H, 'accept', 'session-lost', null],
+        [IDS.A, 1, J, J, 'release', 'session-lost', null],
+        [IDS.A, 2, H, J, 'release', 'session-lost', null],
+      ],
+    },
   },
   {
     fault: 'timeout',
@@ -524,6 +821,24 @@ const rows = [
       revoked: [],
       oldAckResends: 0,
       nextEpoch: 0,
+    },
+    observations: {
+      handlers: [
+        [IDS.A, 0, H, '6b', '76', 2],
+        [IDS.A, 0, J, '6b', '76', 2],
+        [IDS.A, 1, H, '6b', '76', 2],
+        [IDS.A, 1, J, '6b', '76', 2],
+      ],
+      mutations: [
+        [IDS.A, 0, H, J, [1]],
+        [IDS.A, 1, H, H, [1]],
+      ],
+      settlements: [
+        [IDS.A, 0, H, J, 'accept', null, null],
+        [IDS.A, 1, H, H, 'accept', 'session-lost', null],
+        [IDS.A, 1, J, J, 'release', 'session-lost', null],
+        [IDS.A, 2, H, J, 'release', 'session-lost', null],
+      ],
     },
   },
   {
@@ -545,6 +860,24 @@ const rows = [
       revokedType: 'release',
       revokedResult: 'session-lost',
       revokedWire: 'none',
+    },
+    observations: {
+      handlers: [
+        [IDS.A, 0, H, '6b', '76', 2],
+        [IDS.A, 0, J, '6b', '76', 2],
+        [IDS.A, 1, H, '6b', '76', 2],
+        [IDS.A, 1, J, '6b', '76', 2],
+      ],
+      mutations: [
+        [IDS.A, 0, H, J, [1]],
+        [IDS.A, 1, H, H, [1]],
+      ],
+      settlements: [
+        [IDS.A, 0, H, J, 'accept', null, null],
+        [IDS.A, 1, H, H, 'accept', 'session-lost', null],
+        [IDS.A, 1, J, J, 'release', 'session-lost', null],
+        [IDS.A, 2, H, J, 'release', 'session-lost', null],
+      ],
     },
   },
   {
@@ -564,6 +897,26 @@ const rows = [
       oldAckResends: 0,
       nextEpoch: 3,
     },
+    observations: {
+      handlers: [
+        [IDS.A, 0, H, '6b', '76', 2],
+        [IDS.A, 0, J, '6b', '76', 2],
+        [IDS.A, 1, H, '6b', '76', 2],
+        [IDS.A, 1, J, '6b', '76', 2],
+        [IDS.A, 2, H, '6b', '76', 2],
+        [IDS.A, 2, J, '6b', '76', 2],
+      ],
+      mutations: [
+        [IDS.A, 0, H, J, [1]],
+        [IDS.A, 1, H, J, [1]],
+        [IDS.A, 2, H, J, [1]],
+      ],
+      settlements: [
+        [IDS.A, 0, H, J, 'accept', null, null],
+        [IDS.A, 1, H, J, 'accept', 'rejected-by-broker', 121],
+        [IDS.A, 2, H, J, 'accept', null, null],
+      ],
+    },
   },
   {
     fault: 'partition 121',
@@ -585,6 +938,24 @@ const rows = [
       revokedResult: 'accepted',
       revokedWire: 'eligible terminal frame',
     },
+    observations: {
+      handlers: [
+        [IDS.A, 0, H, '6b', '76', 2],
+        [IDS.A, 0, J, '6b', '76', 2],
+        [IDS.A, 1, H, '6b', '76', 2],
+        [IDS.A, 1, J, '6b', '76', 2],
+      ],
+      mutations: [
+        [IDS.A, 0, H, J, [1]],
+        [IDS.A, 1, H, J, [1]],
+        [IDS.A, 2, H, J, [2]],
+      ],
+      settlements: [
+        [IDS.A, 0, H, J, 'accept', null, null],
+        [IDS.A, 1, H, J, 'accept', 'rejected-by-broker', 121],
+        [IDS.A, 2, H, J, 'release', null, null],
+      ],
+    },
   },
   {
     fault: 'partition 6',
@@ -602,6 +973,26 @@ const rows = [
       revoked: [],
       oldAckResends: 0,
       nextEpoch: 3,
+    },
+    observations: {
+      handlers: [
+        [IDS.A, 0, H, '6b', '76', 2],
+        [IDS.A, 0, J, '6b', '76', 2],
+        [IDS.A, 1, H, '6b', '76', 2],
+        [IDS.A, 1, J, '6b', '76', 2],
+        [IDS.A, 2, H, '6b', '76', 2],
+        [IDS.A, 2, J, '6b', '76', 2],
+      ],
+      mutations: [
+        [IDS.A, 0, H, J, [1]],
+        [IDS.A, 1, H, J, [1]],
+        [IDS.A, 2, H, J, [1]],
+      ],
+      settlements: [
+        [IDS.A, 0, H, J, 'accept', null, null],
+        [IDS.A, 1, H, J, 'accept', 'session-lost', 6],
+        [IDS.A, 2, H, J, 'accept', null, null],
+      ],
     },
   },
   {
@@ -624,6 +1015,24 @@ const rows = [
       revokedResult: 'accepted',
       revokedWire: 'eligible terminal frame',
     },
+    observations: {
+      handlers: [
+        [IDS.A, 0, H, '6b', '76', 2],
+        [IDS.A, 0, J, '6b', '76', 2],
+        [IDS.A, 1, H, '6b', '76', 2],
+        [IDS.A, 1, J, '6b', '76', 2],
+      ],
+      mutations: [
+        [IDS.A, 0, H, J, [1]],
+        [IDS.A, 1, H, J, [1]],
+        [IDS.A, 2, H, J, [2]],
+      ],
+      settlements: [
+        [IDS.A, 0, H, J, 'accept', null, null],
+        [IDS.A, 1, H, J, 'accept', 'session-lost', 6],
+        [IDS.A, 2, H, J, 'release', null, null],
+      ],
+    },
   },
   {
     fault: 'partition 100',
@@ -641,6 +1050,26 @@ const rows = [
       revoked: [],
       oldAckResends: 0,
       nextEpoch: 3,
+    },
+    observations: {
+      handlers: [
+        [IDS.A, 0, H, '6b', '76', 2],
+        [IDS.A, 0, J, '6b', '76', 2],
+        [IDS.A, 1, H, '6b', '76', 2],
+        [IDS.A, 1, J, '6b', '76', 2],
+        [IDS.A, 2, H, '6b', '76', 2],
+        [IDS.A, 2, J, '6b', '76', 2],
+      ],
+      mutations: [
+        [IDS.A, 0, H, J, [1]],
+        [IDS.A, 1, H, J, [1]],
+        [IDS.A, 2, H, J, [1]],
+      ],
+      settlements: [
+        [IDS.A, 0, H, J, 'accept', null, null],
+        [IDS.A, 1, H, J, 'accept', 'rejected-by-broker', 100],
+        [IDS.A, 2, H, J, 'accept', null, null],
+      ],
     },
   },
   {
@@ -663,6 +1092,24 @@ const rows = [
       revokedResult: 'accepted',
       revokedWire: 'eligible terminal frame',
     },
+    observations: {
+      handlers: [
+        [IDS.A, 0, H, '6b', '76', 2],
+        [IDS.A, 0, J, '6b', '76', 2],
+        [IDS.A, 1, H, '6b', '76', 2],
+        [IDS.A, 1, J, '6b', '76', 2],
+      ],
+      mutations: [
+        [IDS.A, 0, H, J, [1]],
+        [IDS.A, 1, H, J, [1]],
+        [IDS.A, 2, H, J, [2]],
+      ],
+      settlements: [
+        [IDS.A, 0, H, J, 'accept', null, null],
+        [IDS.A, 1, H, J, 'accept', 'rejected-by-broker', 100],
+        [IDS.A, 2, H, J, 'release', null, null],
+      ],
+    },
   },
   {
     fault: 'top 122',
@@ -680,6 +1127,26 @@ const rows = [
       revoked: [],
       oldAckResends: 0,
       nextEpoch: 0,
+    },
+    observations: {
+      handlers: [
+        [IDS.A, 0, H, '6b', '76', 2],
+        [IDS.A, 0, J, '6b', '76', 2],
+        [IDS.A, 1, H, '6b', '76', 2],
+        [IDS.A, 1, J, '6b', '76', 2],
+        [IDS.A, 2, H, '6b', '76', 2],
+        [IDS.A, 2, J, '6b', '76', 2],
+      ],
+      mutations: [
+        [IDS.A, 0, H, J, [1]],
+        [IDS.A, 1, H, J, [1]],
+        [IDS.A, 2, H, J, [1]],
+      ],
+      settlements: [
+        [IDS.A, 0, H, J, 'accept', null, null],
+        [IDS.A, 1, H, J, 'accept', 'session-lost', 122],
+        [IDS.A, 2, H, J, 'accept', 'session-lost', 122],
+      ],
     },
   },
   {
@@ -701,6 +1168,24 @@ const rows = [
       revokedType: 'release',
       revokedResult: 'session-lost',
       revokedWire: 'none',
+    },
+    observations: {
+      handlers: [
+        [IDS.A, 0, H, '6b', '76', 2],
+        [IDS.A, 0, J, '6b', '76', 2],
+        [IDS.A, 1, H, '6b', '76', 2],
+        [IDS.A, 1, J, '6b', '76', 2],
+      ],
+      mutations: [
+        [IDS.A, 0, H, J, [1]],
+        [IDS.A, 1, H, J, [1]],
+        [IDS.A, 2, H, J, [2]],
+      ],
+      settlements: [
+        [IDS.A, 0, H, J, 'accept', null, null],
+        [IDS.A, 1, H, J, 'accept', 'session-lost', 122],
+        [IDS.A, 2, H, J, 'release', 'session-lost', 122],
+      ],
     },
   },
   {
@@ -720,6 +1205,26 @@ const rows = [
       oldAckResends: 0,
       nextEpoch: 0,
     },
+    observations: {
+      handlers: [
+        [IDS.A, 0, H, '6b', '76', 2],
+        [IDS.A, 0, J, '6b', '76', 2],
+        [IDS.A, 1, H, '6b', '76', 2],
+        [IDS.A, 1, J, '6b', '76', 2],
+        [IDS.A, 2, H, '6b', '76', 2],
+        [IDS.A, 2, J, '6b', '76', 2],
+      ],
+      mutations: [
+        [IDS.A, 0, H, J, [1]],
+        [IDS.A, 1, H, J, [1]],
+        [IDS.A, 2, H, J, [1]],
+      ],
+      settlements: [
+        [IDS.A, 0, H, J, 'accept', null, null],
+        [IDS.A, 1, H, J, 'accept', 'session-lost', 123],
+        [IDS.A, 2, H, J, 'accept', 'session-lost', 123],
+      ],
+    },
   },
   {
     fault: 'top 123',
@@ -741,6 +1246,24 @@ const rows = [
       revokedResult: 'session-lost',
       revokedWire: 'none',
     },
+    observations: {
+      handlers: [
+        [IDS.A, 0, H, '6b', '76', 2],
+        [IDS.A, 0, J, '6b', '76', 2],
+        [IDS.A, 1, H, '6b', '76', 2],
+        [IDS.A, 1, J, '6b', '76', 2],
+      ],
+      mutations: [
+        [IDS.A, 0, H, J, [1]],
+        [IDS.A, 1, H, J, [1]],
+        [IDS.A, 2, H, J, [2]],
+      ],
+      settlements: [
+        [IDS.A, 0, H, J, 'accept', null, null],
+        [IDS.A, 1, H, J, 'accept', 'session-lost', 123],
+        [IDS.A, 2, H, J, 'release', 'session-lost', 123],
+      ],
+    },
   },
   {
     fault: 'top 133',
@@ -758,6 +1281,26 @@ const rows = [
       revoked: [],
       oldAckResends: 0,
       nextEpoch: 0,
+    },
+    observations: {
+      handlers: [
+        [IDS.A, 0, H, '6b', '76', 2],
+        [IDS.A, 0, J, '6b', '76', 2],
+        [IDS.A, 1, H, '6b', '76', 2],
+        [IDS.A, 1, J, '6b', '76', 2],
+        [IDS.A, 2, H, '6b', '76', 2],
+        [IDS.A, 2, J, '6b', '76', 2],
+      ],
+      mutations: [
+        [IDS.A, 0, H, J, [1]],
+        [IDS.A, 1, H, J, [1]],
+        [IDS.A, 2, H, J, [1]],
+      ],
+      settlements: [
+        [IDS.A, 0, H, J, 'accept', null, null],
+        [IDS.A, 1, H, J, 'accept', 'session-lost', 133],
+        [IDS.A, 2, H, J, 'accept', 'session-lost', 133],
+      ],
     },
   },
   {
@@ -779,6 +1322,24 @@ const rows = [
       revokedType: 'release',
       revokedResult: 'session-lost',
       revokedWire: 'none',
+    },
+    observations: {
+      handlers: [
+        [IDS.A, 0, H, '6b', '76', 2],
+        [IDS.A, 0, J, '6b', '76', 2],
+        [IDS.A, 1, H, '6b', '76', 2],
+        [IDS.A, 1, J, '6b', '76', 2],
+      ],
+      mutations: [
+        [IDS.A, 0, H, J, [1]],
+        [IDS.A, 1, H, J, [1]],
+        [IDS.A, 2, H, J, [2]],
+      ],
+      settlements: [
+        [IDS.A, 0, H, J, 'accept', null, null],
+        [IDS.A, 1, H, J, 'accept', 'session-lost', 133],
+        [IDS.A, 2, H, J, 'release', 'session-lost', 133],
+      ],
     },
   },
   {
@@ -798,6 +1359,26 @@ const rows = [
       oldAckResends: 0,
       nextEpoch: 0,
     },
+    observations: {
+      handlers: [
+        [IDS.A, 0, H, '6b', '76', 2],
+        [IDS.A, 0, J, '6b', '76', 2],
+        [IDS.A, 1, H, '6b', '76', 2],
+        [IDS.A, 1, J, '6b', '76', 2],
+        [IDS.A, 2, H, '6b', '76', 2],
+        [IDS.A, 2, J, '6b', '76', 2],
+      ],
+      mutations: [
+        [IDS.A, 0, H, J, [1]],
+        [IDS.A, 1, H, J, [1]],
+        [IDS.A, 2, H, J, [1]],
+      ],
+      settlements: [
+        [IDS.A, 0, H, J, 'accept', null, null],
+        [IDS.A, 1, H, J, 'accept', 'session-lost', null],
+        [IDS.A, 2, H, J, 'accept', 'session-lost', null],
+      ],
+    },
   },
   {
     fault: 'disconnect',
@@ -819,6 +1400,24 @@ const rows = [
       revokedResult: 'session-lost',
       revokedWire: 'none',
     },
+    observations: {
+      handlers: [
+        [IDS.A, 0, H, '6b', '76', 2],
+        [IDS.A, 0, J, '6b', '76', 2],
+        [IDS.A, 1, H, '6b', '76', 2],
+        [IDS.A, 1, J, '6b', '76', 2],
+      ],
+      mutations: [
+        [IDS.A, 0, H, J, [1]],
+        [IDS.A, 1, H, J, [1]],
+        [IDS.A, 2, H, J, [2]],
+      ],
+      settlements: [
+        [IDS.A, 0, H, J, 'accept', null, null],
+        [IDS.A, 1, H, J, 'accept', 'session-lost', null],
+        [IDS.A, 2, H, J, 'release', 'session-lost', null],
+      ],
+    },
   },
   {
     fault: 'timeout',
@@ -836,6 +1435,26 @@ const rows = [
       revoked: [],
       oldAckResends: 0,
       nextEpoch: 0,
+    },
+    observations: {
+      handlers: [
+        [IDS.A, 0, H, '6b', '76', 2],
+        [IDS.A, 0, J, '6b', '76', 2],
+        [IDS.A, 1, H, '6b', '76', 2],
+        [IDS.A, 1, J, '6b', '76', 2],
+        [IDS.A, 2, H, '6b', '76', 2],
+        [IDS.A, 2, J, '6b', '76', 2],
+      ],
+      mutations: [
+        [IDS.A, 0, H, J, [1]],
+        [IDS.A, 1, H, J, [1]],
+        [IDS.A, 2, H, J, [1]],
+      ],
+      settlements: [
+        [IDS.A, 0, H, J, 'accept', null, null],
+        [IDS.A, 1, H, J, 'accept', 'session-lost', null],
+        [IDS.A, 2, H, J, 'accept', 'session-lost', null],
+      ],
     },
   },
   {
@@ -857,6 +1476,24 @@ const rows = [
       revokedType: 'release',
       revokedResult: 'session-lost',
       revokedWire: 'none',
+    },
+    observations: {
+      handlers: [
+        [IDS.A, 0, H, '6b', '76', 2],
+        [IDS.A, 0, J, '6b', '76', 2],
+        [IDS.A, 1, H, '6b', '76', 2],
+        [IDS.A, 1, J, '6b', '76', 2],
+      ],
+      mutations: [
+        [IDS.A, 0, H, J, [1]],
+        [IDS.A, 1, H, J, [1]],
+        [IDS.A, 2, H, J, [2]],
+      ],
+      settlements: [
+        [IDS.A, 0, H, J, 'accept', null, null],
+        [IDS.A, 1, H, J, 'accept', 'session-lost', null],
+        [IDS.A, 2, H, J, 'release', 'session-lost', null],
+      ],
     },
   },
   {
@@ -875,6 +1512,28 @@ const rows = [
       revoked: [],
       oldAckResends: 0,
       nextEpoch: null,
+    },
+    observations: {
+      handlers: [
+        [IDS.A, 0, H, '6b', '76', 2],
+        [IDS.A, 0, H, '6b', '76', 2],
+        [IDS.A, 0, J, '6b', '76', 2],
+        [IDS.A, 1, H, '6b', '76', 2],
+      ],
+      mutations: [
+        [IDS.A, 0, J, J, [2]],
+        [IDS.A, 0, H, J, [1]],
+        [IDS.A, 1, H, J, [1, 2]],
+        [IDS.A, 2, H, J, [2]],
+      ],
+      settlements: [
+        [IDS.A, 0, H, H, 'release', 'membership-lost', null],
+        [IDS.A, 0, J, J, 'release', null, null],
+        [IDS.A, 0, H, J, 'accept', null, null],
+        [IDS.A, 1, H, H, 'accept', 'rejected-by-broker', 121],
+        [IDS.A, 1, J, J, 'release', 'rejected-by-broker', 121],
+        [IDS.A, 2, H, J, 'release', null, null],
+      ],
     },
   },
   {
@@ -897,6 +1556,28 @@ const rows = [
       revokedResult: 'accepted',
       revokedWire: 'eligible terminal frame',
     },
+    observations: {
+      handlers: [
+        [IDS.A, 0, H, '6b', '76', 2],
+        [IDS.A, 0, H, '6b', '76', 2],
+        [IDS.A, 0, J, '6b', '76', 2],
+        [IDS.A, 1, H, '6b', '76', 2],
+      ],
+      mutations: [
+        [IDS.A, 0, J, J, [2]],
+        [IDS.A, 0, H, J, [1]],
+        [IDS.A, 1, H, J, [1, 2]],
+        [IDS.A, 2, H, J, [2]],
+      ],
+      settlements: [
+        [IDS.A, 0, H, H, 'release', 'membership-lost', null],
+        [IDS.A, 0, J, J, 'release', null, null],
+        [IDS.A, 0, H, J, 'accept', null, null],
+        [IDS.A, 1, H, H, 'accept', 'rejected-by-broker', 121],
+        [IDS.A, 1, J, J, 'release', 'rejected-by-broker', 121],
+        [IDS.A, 2, H, J, 'release', null, null],
+      ],
+    },
   },
   {
     fault: 'partition 6',
@@ -914,6 +1595,28 @@ const rows = [
       revoked: [],
       oldAckResends: 0,
       nextEpoch: null,
+    },
+    observations: {
+      handlers: [
+        [IDS.A, 0, H, '6b', '76', 2],
+        [IDS.A, 0, H, '6b', '76', 2],
+        [IDS.A, 0, J, '6b', '76', 2],
+        [IDS.A, 1, H, '6b', '76', 2],
+      ],
+      mutations: [
+        [IDS.A, 0, J, J, [2]],
+        [IDS.A, 0, H, J, [1]],
+        [IDS.A, 1, H, J, [1, 2]],
+        [IDS.A, 2, H, J, [2]],
+      ],
+      settlements: [
+        [IDS.A, 0, H, H, 'release', 'membership-lost', null],
+        [IDS.A, 0, J, J, 'release', null, null],
+        [IDS.A, 0, H, J, 'accept', null, null],
+        [IDS.A, 1, H, H, 'accept', 'session-lost', 6],
+        [IDS.A, 1, J, J, 'release', 'session-lost', 6],
+        [IDS.A, 2, H, J, 'release', null, null],
+      ],
     },
   },
   {
@@ -936,6 +1639,28 @@ const rows = [
       revokedResult: 'accepted',
       revokedWire: 'eligible terminal frame',
     },
+    observations: {
+      handlers: [
+        [IDS.A, 0, H, '6b', '76', 2],
+        [IDS.A, 0, H, '6b', '76', 2],
+        [IDS.A, 0, J, '6b', '76', 2],
+        [IDS.A, 1, H, '6b', '76', 2],
+      ],
+      mutations: [
+        [IDS.A, 0, J, J, [2]],
+        [IDS.A, 0, H, J, [1]],
+        [IDS.A, 1, H, J, [1, 2]],
+        [IDS.A, 2, H, J, [2]],
+      ],
+      settlements: [
+        [IDS.A, 0, H, H, 'release', 'membership-lost', null],
+        [IDS.A, 0, J, J, 'release', null, null],
+        [IDS.A, 0, H, J, 'accept', null, null],
+        [IDS.A, 1, H, H, 'accept', 'session-lost', 6],
+        [IDS.A, 1, J, J, 'release', 'session-lost', 6],
+        [IDS.A, 2, H, J, 'release', null, null],
+      ],
+    },
   },
   {
     fault: 'partition 100',
@@ -953,6 +1678,28 @@ const rows = [
       revoked: [],
       oldAckResends: 0,
       nextEpoch: null,
+    },
+    observations: {
+      handlers: [
+        [IDS.A, 0, H, '6b', '76', 2],
+        [IDS.A, 0, H, '6b', '76', 2],
+        [IDS.A, 0, J, '6b', '76', 2],
+        [IDS.A, 1, H, '6b', '76', 2],
+      ],
+      mutations: [
+        [IDS.A, 0, J, J, [2]],
+        [IDS.A, 0, H, J, [1]],
+        [IDS.A, 1, H, J, [1, 2]],
+        [IDS.A, 2, H, J, [2]],
+      ],
+      settlements: [
+        [IDS.A, 0, H, H, 'release', 'membership-lost', null],
+        [IDS.A, 0, J, J, 'release', null, null],
+        [IDS.A, 0, H, J, 'accept', null, null],
+        [IDS.A, 1, H, H, 'accept', 'rejected-by-broker', 100],
+        [IDS.A, 1, J, J, 'release', 'rejected-by-broker', 100],
+        [IDS.A, 2, H, J, 'release', null, null],
+      ],
     },
   },
   {
@@ -975,6 +1722,28 @@ const rows = [
       revokedResult: 'accepted',
       revokedWire: 'eligible terminal frame',
     },
+    observations: {
+      handlers: [
+        [IDS.A, 0, H, '6b', '76', 2],
+        [IDS.A, 0, H, '6b', '76', 2],
+        [IDS.A, 0, J, '6b', '76', 2],
+        [IDS.A, 1, H, '6b', '76', 2],
+      ],
+      mutations: [
+        [IDS.A, 0, J, J, [2]],
+        [IDS.A, 0, H, J, [1]],
+        [IDS.A, 1, H, J, [1, 2]],
+        [IDS.A, 2, H, J, [2]],
+      ],
+      settlements: [
+        [IDS.A, 0, H, H, 'release', 'membership-lost', null],
+        [IDS.A, 0, J, J, 'release', null, null],
+        [IDS.A, 0, H, J, 'accept', null, null],
+        [IDS.A, 1, H, H, 'accept', 'rejected-by-broker', 100],
+        [IDS.A, 1, J, J, 'release', 'rejected-by-broker', 100],
+        [IDS.A, 2, H, J, 'release', null, null],
+      ],
+    },
   },
   {
     fault: 'top 122',
@@ -983,7 +1752,7 @@ const rows = [
       action: 'close',
       state: 'UNSUBSCRIBED',
       rounds: 8,
-      result: 'rejected-by-broker',
+      result: 'session-lost',
       cause: 122,
       reset: false,
       terminal: true,
@@ -993,6 +1762,28 @@ const rows = [
       oldAckResends: 0,
       nextEpoch: null,
     },
+    observations: {
+      handlers: [
+        [IDS.A, 0, H, '6b', '76', 2],
+        [IDS.A, 0, H, '6b', '76', 2],
+        [IDS.A, 0, J, '6b', '76', 2],
+        [IDS.A, 1, H, '6b', '76', 2],
+      ],
+      mutations: [
+        [IDS.A, 0, J, J, [2]],
+        [IDS.A, 0, H, J, [1]],
+        [IDS.A, 1, H, J, [1, 2]],
+        [IDS.A, 2, H, J, [2]],
+      ],
+      settlements: [
+        [IDS.A, 0, H, H, 'release', 'membership-lost', null],
+        [IDS.A, 0, J, J, 'release', null, null],
+        [IDS.A, 0, H, J, 'accept', null, null],
+        [IDS.A, 1, H, H, 'accept', 'session-lost', 122],
+        [IDS.A, 1, J, J, 'release', 'session-lost', 122],
+        [IDS.A, 2, H, J, 'release', 'session-lost', 122],
+      ],
+    },
   },
   {
     fault: 'top 122',
@@ -1001,8 +1792,174 @@ const rows = [
       action: 'close',
       state: 'UNSUBSCRIBED',
       rounds: 8,
-      result: 'rejected-by-broker',
+      result: 'session-lost',
       cause: 122,
+      reset: false,
+      terminal: true,
+      selected: ['A:1@9007199254740993'],
+      held: ['A:0@9007199254740993'],
+      revoked: ['A:2@9007199254740993', 'A:2@9007199254740994'],
+      oldAckResends: 0,
+      nextEpoch: null,
+      revokedType: 'release',
+      revokedResult: 'session-lost',
+      revokedWire: 'eligible terminal frame',
+    },
+    observations: {
+      handlers: [
+        [IDS.A, 0, H, '6b', '76', 2],
+        [IDS.A, 0, H, '6b', '76', 2],
+        [IDS.A, 0, J, '6b', '76', 2],
+        [IDS.A, 1, H, '6b', '76', 2],
+      ],
+      mutations: [
+        [IDS.A, 0, J, J, [2]],
+        [IDS.A, 0, H, J, [1]],
+        [IDS.A, 1, H, J, [1, 2]],
+        [IDS.A, 2, H, J, [2]],
+      ],
+      settlements: [
+        [IDS.A, 0, H, H, 'release', 'membership-lost', null],
+        [IDS.A, 0, J, J, 'release', null, null],
+        [IDS.A, 0, H, J, 'accept', null, null],
+        [IDS.A, 1, H, H, 'accept', 'session-lost', 122],
+        [IDS.A, 1, J, J, 'release', 'session-lost', 122],
+        [IDS.A, 2, H, J, 'release', 'session-lost', 122],
+      ],
+    },
+  },
+  {
+    fault: 'top 123',
+    step: 'close; held handler',
+    expected: {
+      action: 'close',
+      state: 'UNSUBSCRIBED',
+      rounds: 8,
+      result: 'session-lost',
+      cause: 123,
+      reset: false,
+      terminal: true,
+      selected: ['A:1@9007199254740993'],
+      held: ['A:0@9007199254740993'],
+      revoked: [],
+      oldAckResends: 0,
+      nextEpoch: null,
+    },
+    observations: {
+      handlers: [
+        [IDS.A, 0, H, '6b', '76', 2],
+        [IDS.A, 0, H, '6b', '76', 2],
+        [IDS.A, 0, J, '6b', '76', 2],
+        [IDS.A, 1, H, '6b', '76', 2],
+      ],
+      mutations: [
+        [IDS.A, 0, J, J, [2]],
+        [IDS.A, 0, H, J, [1]],
+        [IDS.A, 1, H, J, [1, 2]],
+        [IDS.A, 2, H, J, [2]],
+      ],
+      settlements: [
+        [IDS.A, 0, H, H, 'release', 'membership-lost', null],
+        [IDS.A, 0, J, J, 'release', null, null],
+        [IDS.A, 0, H, J, 'accept', null, null],
+        [IDS.A, 1, H, H, 'accept', 'session-lost', 123],
+        [IDS.A, 1, J, J, 'release', 'session-lost', 123],
+        [IDS.A, 2, H, J, 'release', 'session-lost', 123],
+      ],
+    },
+  },
+  {
+    fault: 'top 123',
+    step: 'close; held handler and revoked partition',
+    expected: {
+      action: 'close',
+      state: 'UNSUBSCRIBED',
+      rounds: 8,
+      result: 'session-lost',
+      cause: 123,
+      reset: false,
+      terminal: true,
+      selected: ['A:1@9007199254740993'],
+      held: ['A:0@9007199254740993'],
+      revoked: ['A:2@9007199254740993', 'A:2@9007199254740994'],
+      oldAckResends: 0,
+      nextEpoch: null,
+      revokedType: 'release',
+      revokedResult: 'session-lost',
+      revokedWire: 'eligible terminal frame',
+    },
+    observations: {
+      handlers: [
+        [IDS.A, 0, H, '6b', '76', 2],
+        [IDS.A, 0, H, '6b', '76', 2],
+        [IDS.A, 0, J, '6b', '76', 2],
+        [IDS.A, 1, H, '6b', '76', 2],
+      ],
+      mutations: [
+        [IDS.A, 0, J, J, [2]],
+        [IDS.A, 0, H, J, [1]],
+        [IDS.A, 1, H, J, [1, 2]],
+        [IDS.A, 2, H, J, [2]],
+      ],
+      settlements: [
+        [IDS.A, 0, H, H, 'release', 'membership-lost', null],
+        [IDS.A, 0, J, J, 'release', null, null],
+        [IDS.A, 0, H, J, 'accept', null, null],
+        [IDS.A, 1, H, H, 'accept', 'session-lost', 123],
+        [IDS.A, 1, J, J, 'release', 'session-lost', 123],
+        [IDS.A, 2, H, J, 'release', 'session-lost', 123],
+      ],
+    },
+  },
+  {
+    fault: 'top 133',
+    step: 'close; held handler',
+    expected: {
+      action: 'close',
+      state: 'UNSUBSCRIBED',
+      rounds: 8,
+      result: 'rejected-by-broker',
+      cause: 133,
+      reset: false,
+      terminal: true,
+      selected: ['A:1@9007199254740993'],
+      held: ['A:0@9007199254740993'],
+      revoked: [],
+      oldAckResends: 0,
+      nextEpoch: null,
+    },
+    observations: {
+      handlers: [
+        [IDS.A, 0, H, '6b', '76', 2],
+        [IDS.A, 0, H, '6b', '76', 2],
+        [IDS.A, 0, J, '6b', '76', 2],
+        [IDS.A, 1, H, '6b', '76', 2],
+      ],
+      mutations: [
+        [IDS.A, 0, J, J, [2]],
+        [IDS.A, 0, H, J, [1]],
+        [IDS.A, 1, H, J, [1, 2]],
+        [IDS.A, 2, H, J, [2]],
+      ],
+      settlements: [
+        [IDS.A, 0, H, H, 'release', 'membership-lost', null],
+        [IDS.A, 0, J, J, 'release', null, null],
+        [IDS.A, 0, H, J, 'accept', null, null],
+        [IDS.A, 1, H, H, 'accept', 'rejected-by-broker', 133],
+        [IDS.A, 1, J, J, 'release', 'rejected-by-broker', 133],
+        [IDS.A, 2, H, J, 'release', 'rejected-by-broker', 133],
+      ],
+    },
+  },
+  {
+    fault: 'top 133',
+    step: 'close; held handler and revoked partition',
+    expected: {
+      action: 'close',
+      state: 'UNSUBSCRIBED',
+      rounds: 8,
+      result: 'rejected-by-broker',
+      cause: 133,
       reset: false,
       terminal: true,
       selected: ['A:1@9007199254740993'],
@@ -1014,83 +1971,27 @@ const rows = [
       revokedResult: 'rejected-by-broker',
       revokedWire: 'eligible terminal frame',
     },
-  },
-  {
-    fault: 'top 123',
-    step: 'close; held handler',
-    expected: {
-      action: 'close',
-      state: 'UNSUBSCRIBED',
-      rounds: 8,
-      result: 'rejected-by-broker',
-      cause: 123,
-      reset: false,
-      terminal: true,
-      selected: ['A:1@9007199254740993'],
-      held: ['A:0@9007199254740993'],
-      revoked: [],
-      oldAckResends: 0,
-      nextEpoch: null,
-    },
-  },
-  {
-    fault: 'top 123',
-    step: 'close; held handler and revoked partition',
-    expected: {
-      action: 'close',
-      state: 'UNSUBSCRIBED',
-      rounds: 8,
-      result: 'rejected-by-broker',
-      cause: 123,
-      reset: false,
-      terminal: true,
-      selected: ['A:1@9007199254740993'],
-      held: ['A:0@9007199254740993'],
-      revoked: ['A:2@9007199254740993', 'A:2@9007199254740994'],
-      oldAckResends: 0,
-      nextEpoch: null,
-      revokedType: 'release',
-      revokedResult: 'rejected-by-broker',
-      revokedWire: 'eligible terminal frame',
-    },
-  },
-  {
-    fault: 'top 133',
-    step: 'close; held handler',
-    expected: {
-      action: 'close',
-      state: 'UNSUBSCRIBED',
-      rounds: 8,
-      result: 'rejected-by-broker',
-      cause: 133,
-      reset: false,
-      terminal: true,
-      selected: ['A:1@9007199254740993'],
-      held: ['A:0@9007199254740993'],
-      revoked: [],
-      oldAckResends: 0,
-      nextEpoch: null,
-    },
-  },
-  {
-    fault: 'top 133',
-    step: 'close; held handler and revoked partition',
-    expected: {
-      action: 'close',
-      state: 'UNSUBSCRIBED',
-      rounds: 8,
-      result: 'rejected-by-broker',
-      cause: 133,
-      reset: false,
-      terminal: true,
-      selected: ['A:1@9007199254740993'],
-      held: ['A:0@9007199254740993'],
-      revoked: ['A:2@9007199254740993', 'A:2@9007199254740994'],
-      oldAckResends: 0,
-      nextEpoch: null,
-      revokedType: 'release',
-      revokedResult: 'rejected-by-broker',
-      revokedWire: 'eligible terminal frame',
+    observations: {
+      handlers: [
+        [IDS.A, 0, H, '6b', '76', 2],
+        [IDS.A, 0, H, '6b', '76', 2],
+        [IDS.A, 0, J, '6b', '76', 2],
+        [IDS.A, 1, H, '6b', '76', 2],
+      ],
+      mutations: [
+        [IDS.A, 0, J, J, [2]],
+        [IDS.A, 0, H, J, [1]],
+        [IDS.A, 1, H, J, [1, 2]],
+        [IDS.A, 2, H, J, [2]],
+      ],
+      settlements: [
+        [IDS.A, 0, H, H, 'release', 'membership-lost', null],
+        [IDS.A, 0, J, J, 'release', null, null],
+        [IDS.A, 0, H, J, 'accept', null, null],
+        [IDS.A, 1, H, H, 'accept', 'rejected-by-broker', 133],
+        [IDS.A, 1, J, J, 'release', 'rejected-by-broker', 133],
+        [IDS.A, 2, H, J, 'release', 'rejected-by-broker', 133],
+      ],
     },
   },
   {
@@ -1109,6 +2010,28 @@ const rows = [
       revoked: [],
       oldAckResends: 0,
       nextEpoch: null,
+    },
+    observations: {
+      handlers: [
+        [IDS.A, 0, H, '6b', '76', 2],
+        [IDS.A, 0, H, '6b', '76', 2],
+        [IDS.A, 0, J, '6b', '76', 2],
+        [IDS.A, 1, H, '6b', '76', 2],
+      ],
+      mutations: [
+        [IDS.A, 0, J, J, [2]],
+        [IDS.A, 0, H, J, [1]],
+        [IDS.A, 1, H, J, [1, 2]],
+        [IDS.A, 2, H, J, [2]],
+      ],
+      settlements: [
+        [IDS.A, 0, H, H, 'release', 'membership-lost', null],
+        [IDS.A, 0, J, J, 'release', null, null],
+        [IDS.A, 0, H, J, 'accept', null, null],
+        [IDS.A, 1, H, H, 'accept', 'session-lost', null],
+        [IDS.A, 1, J, J, 'release', 'session-lost', null],
+        [IDS.A, 2, H, J, 'release', 'session-lost', null],
+      ],
     },
   },
   {
@@ -1131,6 +2054,28 @@ const rows = [
       revokedResult: 'session-lost',
       revokedWire: 'eligible terminal frame',
     },
+    observations: {
+      handlers: [
+        [IDS.A, 0, H, '6b', '76', 2],
+        [IDS.A, 0, H, '6b', '76', 2],
+        [IDS.A, 0, J, '6b', '76', 2],
+        [IDS.A, 1, H, '6b', '76', 2],
+      ],
+      mutations: [
+        [IDS.A, 0, J, J, [2]],
+        [IDS.A, 0, H, J, [1]],
+        [IDS.A, 1, H, J, [1, 2]],
+        [IDS.A, 2, H, J, [2]],
+      ],
+      settlements: [
+        [IDS.A, 0, H, H, 'release', 'membership-lost', null],
+        [IDS.A, 0, J, J, 'release', null, null],
+        [IDS.A, 0, H, J, 'accept', null, null],
+        [IDS.A, 1, H, H, 'accept', 'session-lost', null],
+        [IDS.A, 1, J, J, 'release', 'session-lost', null],
+        [IDS.A, 2, H, J, 'release', 'session-lost', null],
+      ],
+    },
   },
   {
     fault: 'timeout',
@@ -1148,6 +2093,28 @@ const rows = [
       revoked: [],
       oldAckResends: 0,
       nextEpoch: null,
+    },
+    observations: {
+      handlers: [
+        [IDS.A, 0, H, '6b', '76', 2],
+        [IDS.A, 0, H, '6b', '76', 2],
+        [IDS.A, 0, J, '6b', '76', 2],
+        [IDS.A, 1, H, '6b', '76', 2],
+      ],
+      mutations: [
+        [IDS.A, 0, J, J, [2]],
+        [IDS.A, 0, H, J, [1]],
+        [IDS.A, 1, H, J, [1, 2]],
+        [IDS.A, 2, H, J, [2]],
+      ],
+      settlements: [
+        [IDS.A, 0, H, H, 'release', 'membership-lost', null],
+        [IDS.A, 0, J, J, 'release', null, null],
+        [IDS.A, 0, H, J, 'accept', null, null],
+        [IDS.A, 1, H, H, 'accept', 'session-lost', null],
+        [IDS.A, 1, J, J, 'release', 'session-lost', null],
+        [IDS.A, 2, H, J, 'release', 'session-lost', null],
+      ],
     },
   },
   {
@@ -1169,6 +2136,28 @@ const rows = [
       revokedType: 'release',
       revokedResult: 'session-lost',
       revokedWire: 'eligible terminal frame',
+    },
+    observations: {
+      handlers: [
+        [IDS.A, 0, H, '6b', '76', 2],
+        [IDS.A, 0, H, '6b', '76', 2],
+        [IDS.A, 0, J, '6b', '76', 2],
+        [IDS.A, 1, H, '6b', '76', 2],
+      ],
+      mutations: [
+        [IDS.A, 0, J, J, [2]],
+        [IDS.A, 0, H, J, [1]],
+        [IDS.A, 1, H, J, [1, 2]],
+        [IDS.A, 2, H, J, [2]],
+      ],
+      settlements: [
+        [IDS.A, 0, H, H, 'release', 'membership-lost', null],
+        [IDS.A, 0, J, J, 'release', null, null],
+        [IDS.A, 0, H, J, 'accept', null, null],
+        [IDS.A, 1, H, H, 'accept', 'session-lost', null],
+        [IDS.A, 1, J, J, 'release', 'session-lost', null],
+        [IDS.A, 2, H, J, 'release', 'session-lost', null],
+      ],
     },
   },
   {
@@ -1188,6 +2177,28 @@ const rows = [
       oldAckResends: 0,
       nextEpoch: 3,
     },
+    observations: {
+      handlers: [
+        [IDS.A, 0, H, '6b', '76', 2],
+        [IDS.A, 0, J, '6b', '76', 2],
+        [IDS.A, 1, H, '6b', '76', 2],
+        [IDS.A, 1, J, '6b', '76', 2],
+        [IDS.A, 2, H, '6b', '76', 2],
+        [IDS.A, 2, J, '6b', '76', 2],
+      ],
+      mutations: [
+        [IDS.A, 0, H, J, [1]],
+        [IDS.A, 1, H, H, [4]],
+        [IDS.A, 1, H, J, [1]],
+        [IDS.A, 2, H, J, [1]],
+      ],
+      settlements: [
+        [IDS.A, 0, H, J, 'accept', null, null],
+        [IDS.A, 1, H, H, 'renew', 'rejected-by-broker', 121],
+        [IDS.A, 1, H, J, 'accept', null, null],
+        [IDS.A, 2, H, J, 'accept', null, null],
+      ],
+    },
   },
   {
     fault: 'partition 121',
@@ -1209,6 +2220,26 @@ const rows = [
       revokedResult: 'accepted',
       revokedWire: 'eligible terminal frame',
     },
+    observations: {
+      handlers: [
+        [IDS.A, 0, H, '6b', '76', 2],
+        [IDS.A, 0, J, '6b', '76', 2],
+        [IDS.A, 1, H, '6b', '76', 2],
+        [IDS.A, 1, J, '6b', '76', 2],
+      ],
+      mutations: [
+        [IDS.A, 0, H, J, [1]],
+        [IDS.A, 1, H, H, [4]],
+        [IDS.A, 1, H, J, [1]],
+        [IDS.A, 2, H, J, [2]],
+      ],
+      settlements: [
+        [IDS.A, 0, H, J, 'accept', null, null],
+        [IDS.A, 1, H, H, 'renew', 'rejected-by-broker', 121],
+        [IDS.A, 1, H, J, 'accept', null, null],
+        [IDS.A, 2, H, J, 'release', null, null],
+      ],
+    },
   },
   {
     fault: 'partition 6',
@@ -1226,6 +2257,28 @@ const rows = [
       revoked: [],
       oldAckResends: 0,
       nextEpoch: 3,
+    },
+    observations: {
+      handlers: [
+        [IDS.A, 0, H, '6b', '76', 2],
+        [IDS.A, 0, J, '6b', '76', 2],
+        [IDS.A, 1, H, '6b', '76', 2],
+        [IDS.A, 1, J, '6b', '76', 2],
+        [IDS.A, 2, H, '6b', '76', 2],
+        [IDS.A, 2, J, '6b', '76', 2],
+      ],
+      mutations: [
+        [IDS.A, 0, H, J, [1]],
+        [IDS.A, 1, H, H, [4]],
+        [IDS.A, 1, H, J, [1]],
+        [IDS.A, 2, H, J, [1]],
+      ],
+      settlements: [
+        [IDS.A, 0, H, J, 'accept', null, null],
+        [IDS.A, 1, H, H, 'renew', 'session-lost', 6],
+        [IDS.A, 1, H, J, 'accept', null, null],
+        [IDS.A, 2, H, J, 'accept', null, null],
+      ],
     },
   },
   {
@@ -1247,6 +2300,26 @@ const rows = [
       revokedType: 'release',
       revokedResult: 'accepted',
       revokedWire: 'eligible terminal frame',
+    },
+    observations: {
+      handlers: [
+        [IDS.A, 0, H, '6b', '76', 2],
+        [IDS.A, 0, J, '6b', '76', 2],
+        [IDS.A, 1, H, '6b', '76', 2],
+        [IDS.A, 1, J, '6b', '76', 2],
+      ],
+      mutations: [
+        [IDS.A, 0, H, J, [1]],
+        [IDS.A, 1, H, H, [4]],
+        [IDS.A, 1, H, J, [1]],
+        [IDS.A, 2, H, J, [2]],
+      ],
+      settlements: [
+        [IDS.A, 0, H, J, 'accept', null, null],
+        [IDS.A, 1, H, H, 'renew', 'session-lost', 6],
+        [IDS.A, 1, H, J, 'accept', null, null],
+        [IDS.A, 2, H, J, 'release', null, null],
+      ],
     },
   },
   {
@@ -1266,6 +2339,28 @@ const rows = [
       oldAckResends: 0,
       nextEpoch: 3,
     },
+    observations: {
+      handlers: [
+        [IDS.A, 0, H, '6b', '76', 2],
+        [IDS.A, 0, J, '6b', '76', 2],
+        [IDS.A, 1, H, '6b', '76', 2],
+        [IDS.A, 1, J, '6b', '76', 2],
+        [IDS.A, 2, H, '6b', '76', 2],
+        [IDS.A, 2, J, '6b', '76', 2],
+      ],
+      mutations: [
+        [IDS.A, 0, H, J, [1]],
+        [IDS.A, 1, H, H, [4]],
+        [IDS.A, 1, H, J, [1]],
+        [IDS.A, 2, H, J, [1]],
+      ],
+      settlements: [
+        [IDS.A, 0, H, J, 'accept', null, null],
+        [IDS.A, 1, H, H, 'renew', 'rejected-by-broker', 100],
+        [IDS.A, 1, H, J, 'accept', null, null],
+        [IDS.A, 2, H, J, 'accept', null, null],
+      ],
+    },
   },
   {
     fault: 'partition 100',
@@ -1287,6 +2382,26 @@ const rows = [
       revokedResult: 'accepted',
       revokedWire: 'eligible terminal frame',
     },
+    observations: {
+      handlers: [
+        [IDS.A, 0, H, '6b', '76', 2],
+        [IDS.A, 0, J, '6b', '76', 2],
+        [IDS.A, 1, H, '6b', '76', 2],
+        [IDS.A, 1, J, '6b', '76', 2],
+      ],
+      mutations: [
+        [IDS.A, 0, H, J, [1]],
+        [IDS.A, 1, H, H, [4]],
+        [IDS.A, 1, H, J, [1]],
+        [IDS.A, 2, H, J, [2]],
+      ],
+      settlements: [
+        [IDS.A, 0, H, J, 'accept', null, null],
+        [IDS.A, 1, H, H, 'renew', 'rejected-by-broker', 100],
+        [IDS.A, 1, H, J, 'accept', null, null],
+        [IDS.A, 2, H, J, 'release', null, null],
+      ],
+    },
   },
   {
     fault: 'top 122',
@@ -1304,6 +2419,23 @@ const rows = [
       revoked: [],
       oldAckResends: 0,
       nextEpoch: 0,
+    },
+    observations: {
+      handlers: [
+        [IDS.A, 0, H, '6b', '76', 2],
+        [IDS.A, 0, J, '6b', '76', 2],
+        [IDS.A, 1, H, '6b', '76', 2],
+      ],
+      mutations: [
+        [IDS.A, 0, H, J, [1]],
+        [IDS.A, 1, H, H, [4]],
+      ],
+      settlements: [
+        [IDS.A, 0, H, J, 'accept', null, null],
+        [IDS.A, 1, H, H, 'renew', 'session-lost', 122],
+        [IDS.A, 1, H, J, 'release', 'session-lost', 122],
+        [IDS.A, 2, H, J, 'release', 'session-lost', 122],
+      ],
     },
   },
   {
@@ -1326,6 +2458,23 @@ const rows = [
       revokedResult: 'session-lost',
       revokedWire: 'none',
     },
+    observations: {
+      handlers: [
+        [IDS.A, 0, H, '6b', '76', 2],
+        [IDS.A, 0, J, '6b', '76', 2],
+        [IDS.A, 1, H, '6b', '76', 2],
+      ],
+      mutations: [
+        [IDS.A, 0, H, J, [1]],
+        [IDS.A, 1, H, H, [4]],
+      ],
+      settlements: [
+        [IDS.A, 0, H, J, 'accept', null, null],
+        [IDS.A, 1, H, H, 'renew', 'session-lost', 122],
+        [IDS.A, 1, H, J, 'release', 'session-lost', 122],
+        [IDS.A, 2, H, J, 'release', 'session-lost', 122],
+      ],
+    },
   },
   {
     fault: 'top 123',
@@ -1343,6 +2492,23 @@ const rows = [
       revoked: [],
       oldAckResends: 0,
       nextEpoch: 0,
+    },
+    observations: {
+      handlers: [
+        [IDS.A, 0, H, '6b', '76', 2],
+        [IDS.A, 0, J, '6b', '76', 2],
+        [IDS.A, 1, H, '6b', '76', 2],
+      ],
+      mutations: [
+        [IDS.A, 0, H, J, [1]],
+        [IDS.A, 1, H, H, [4]],
+      ],
+      settlements: [
+        [IDS.A, 0, H, J, 'accept', null, null],
+        [IDS.A, 1, H, H, 'renew', 'session-lost', 123],
+        [IDS.A, 1, H, J, 'release', 'session-lost', 123],
+        [IDS.A, 2, H, J, 'release', 'session-lost', 123],
+      ],
     },
   },
   {
@@ -1364,6 +2530,23 @@ const rows = [
       revokedType: 'release',
       revokedResult: 'session-lost',
       revokedWire: 'none',
+    },
+    observations: {
+      handlers: [
+        [IDS.A, 0, H, '6b', '76', 2],
+        [IDS.A, 0, J, '6b', '76', 2],
+        [IDS.A, 1, H, '6b', '76', 2],
+      ],
+      mutations: [
+        [IDS.A, 0, H, J, [1]],
+        [IDS.A, 1, H, H, [4]],
+      ],
+      settlements: [
+        [IDS.A, 0, H, J, 'accept', null, null],
+        [IDS.A, 1, H, H, 'renew', 'session-lost', 123],
+        [IDS.A, 1, H, J, 'release', 'session-lost', 123],
+        [IDS.A, 2, H, J, 'release', 'session-lost', 123],
+      ],
     },
   },
   {
@@ -1382,6 +2565,28 @@ const rows = [
       revoked: [],
       oldAckResends: 0,
       nextEpoch: 3,
+    },
+    observations: {
+      handlers: [
+        [IDS.A, 0, H, '6b', '76', 2],
+        [IDS.A, 0, J, '6b', '76', 2],
+        [IDS.A, 1, H, '6b', '76', 2],
+        [IDS.A, 1, J, '6b', '76', 2],
+        [IDS.A, 2, H, '6b', '76', 2],
+        [IDS.A, 2, J, '6b', '76', 2],
+      ],
+      mutations: [
+        [IDS.A, 0, H, J, [1]],
+        [IDS.A, 1, H, H, [4]],
+        [IDS.A, 1, H, J, [1]],
+        [IDS.A, 2, H, J, [1]],
+      ],
+      settlements: [
+        [IDS.A, 0, H, J, 'accept', null, null],
+        [IDS.A, 1, H, H, 'renew', 'rejected-by-broker', 133],
+        [IDS.A, 1, H, J, 'accept', null, null],
+        [IDS.A, 2, H, J, 'accept', null, null],
+      ],
     },
   },
   {
@@ -1404,6 +2609,26 @@ const rows = [
       revokedResult: 'accepted',
       revokedWire: 'eligible terminal frame',
     },
+    observations: {
+      handlers: [
+        [IDS.A, 0, H, '6b', '76', 2],
+        [IDS.A, 0, J, '6b', '76', 2],
+        [IDS.A, 1, H, '6b', '76', 2],
+        [IDS.A, 1, J, '6b', '76', 2],
+      ],
+      mutations: [
+        [IDS.A, 0, H, J, [1]],
+        [IDS.A, 1, H, H, [4]],
+        [IDS.A, 1, H, J, [1]],
+        [IDS.A, 2, H, J, [2]],
+      ],
+      settlements: [
+        [IDS.A, 0, H, J, 'accept', null, null],
+        [IDS.A, 1, H, H, 'renew', 'rejected-by-broker', 133],
+        [IDS.A, 1, H, J, 'accept', null, null],
+        [IDS.A, 2, H, J, 'release', null, null],
+      ],
+    },
   },
   {
     fault: 'disconnect',
@@ -1421,6 +2646,23 @@ const rows = [
       revoked: [],
       oldAckResends: 0,
       nextEpoch: 0,
+    },
+    observations: {
+      handlers: [
+        [IDS.A, 0, H, '6b', '76', 2],
+        [IDS.A, 0, J, '6b', '76', 2],
+        [IDS.A, 1, H, '6b', '76', 2],
+      ],
+      mutations: [
+        [IDS.A, 0, H, J, [1]],
+        [IDS.A, 1, H, H, [4]],
+      ],
+      settlements: [
+        [IDS.A, 0, H, J, 'accept', null, null],
+        [IDS.A, 1, H, H, 'renew', 'session-lost', null],
+        [IDS.A, 1, H, J, 'release', 'session-lost', null],
+        [IDS.A, 2, H, J, 'release', 'session-lost', null],
+      ],
     },
   },
   {
@@ -1443,6 +2685,23 @@ const rows = [
       revokedResult: 'session-lost',
       revokedWire: 'none',
     },
+    observations: {
+      handlers: [
+        [IDS.A, 0, H, '6b', '76', 2],
+        [IDS.A, 0, J, '6b', '76', 2],
+        [IDS.A, 1, H, '6b', '76', 2],
+      ],
+      mutations: [
+        [IDS.A, 0, H, J, [1]],
+        [IDS.A, 1, H, H, [4]],
+      ],
+      settlements: [
+        [IDS.A, 0, H, J, 'accept', null, null],
+        [IDS.A, 1, H, H, 'renew', 'session-lost', null],
+        [IDS.A, 1, H, J, 'release', 'session-lost', null],
+        [IDS.A, 2, H, J, 'release', 'session-lost', null],
+      ],
+    },
   },
   {
     fault: 'timeout',
@@ -1460,6 +2719,23 @@ const rows = [
       revoked: [],
       oldAckResends: 0,
       nextEpoch: 0,
+    },
+    observations: {
+      handlers: [
+        [IDS.A, 0, H, '6b', '76', 2],
+        [IDS.A, 0, J, '6b', '76', 2],
+        [IDS.A, 1, H, '6b', '76', 2],
+      ],
+      mutations: [
+        [IDS.A, 0, H, J, [1]],
+        [IDS.A, 1, H, H, [4]],
+      ],
+      settlements: [
+        [IDS.A, 0, H, J, 'accept', null, null],
+        [IDS.A, 1, H, H, 'renew', 'session-lost', null],
+        [IDS.A, 1, H, J, 'release', 'session-lost', null],
+        [IDS.A, 2, H, J, 'release', 'session-lost', null],
+      ],
     },
   },
   {
@@ -1482,6 +2758,23 @@ const rows = [
       revokedResult: 'session-lost',
       revokedWire: 'none',
     },
+    observations: {
+      handlers: [
+        [IDS.A, 0, H, '6b', '76', 2],
+        [IDS.A, 0, J, '6b', '76', 2],
+        [IDS.A, 1, H, '6b', '76', 2],
+      ],
+      mutations: [
+        [IDS.A, 0, H, J, [1]],
+        [IDS.A, 1, H, H, [4]],
+      ],
+      settlements: [
+        [IDS.A, 0, H, J, 'accept', null, null],
+        [IDS.A, 1, H, H, 'renew', 'session-lost', null],
+        [IDS.A, 1, H, J, 'release', 'session-lost', null],
+        [IDS.A, 2, H, J, 'release', 'session-lost', null],
+      ],
+    },
   },
   {
     fault: 'partition 74',
@@ -1495,6 +2788,28 @@ const rows = [
       oldAckResends: 0,
       result: 'session-lost',
       cause: 74,
+    },
+    observations: {
+      handlers: [
+        [IDS.A, 0, H, '6b', '76', 2],
+        [IDS.A, 0, J, '6b', '76', 2],
+        [IDS.A, 1, H, '6b', '76', 2],
+        [IDS.A, 1, J, '6b', '76', 2],
+        [IDS.A, 2, H, '6b', '76', 2],
+        [IDS.A, 2, J, '6b', '76', 2],
+      ],
+      mutations: [
+        [IDS.A, 0, H, J, [1]],
+        [IDS.A, 1, H, H, [1]],
+        [IDS.A, 1, J, J, [1]],
+        [IDS.A, 2, H, J, [1]],
+      ],
+      settlements: [
+        [IDS.A, 0, H, J, 'accept', null, null],
+        [IDS.A, 1, H, H, 'accept', 'session-lost', 74],
+        [IDS.A, 1, J, J, 'accept', null, null],
+        [IDS.A, 2, H, J, 'accept', null, null],
+      ],
     },
   },
   {
@@ -1510,6 +2825,28 @@ const rows = [
       result: 'rejected-by-broker',
       cause: -1,
     },
+    observations: {
+      handlers: [
+        [IDS.A, 0, H, '6b', '76', 2],
+        [IDS.A, 0, J, '6b', '76', 2],
+        [IDS.A, 1, H, '6b', '76', 2],
+        [IDS.A, 1, J, '6b', '76', 2],
+        [IDS.A, 2, H, '6b', '76', 2],
+        [IDS.A, 2, J, '6b', '76', 2],
+      ],
+      mutations: [
+        [IDS.A, 0, H, J, [1]],
+        [IDS.A, 1, H, H, [1]],
+        [IDS.A, 1, J, J, [1]],
+        [IDS.A, 2, H, J, [1]],
+      ],
+      settlements: [
+        [IDS.A, 0, H, J, 'accept', null, null],
+        [IDS.A, 1, H, H, 'accept', 'rejected-by-broker', -1],
+        [IDS.A, 1, J, J, 'accept', null, null],
+        [IDS.A, 2, H, J, 'accept', null, null],
+      ],
+    },
   },
   {
     fault: 'omitted partition',
@@ -1523,6 +2860,28 @@ const rows = [
       oldAckResends: 0,
       result: 'rejected-by-broker',
       cause: 'invalid response',
+    },
+    observations: {
+      handlers: [
+        [IDS.A, 0, H, '6b', '76', 2],
+        [IDS.A, 0, J, '6b', '76', 2],
+        [IDS.A, 1, H, '6b', '76', 2],
+        [IDS.A, 1, J, '6b', '76', 2],
+        [IDS.A, 2, H, '6b', '76', 2],
+        [IDS.A, 2, J, '6b', '76', 2],
+      ],
+      mutations: [
+        [IDS.A, 0, H, J, [1]],
+        [IDS.A, 1, H, H, [1]],
+        [IDS.A, 1, J, J, [1]],
+        [IDS.A, 2, H, J, [1]],
+      ],
+      settlements: [
+        [IDS.A, 0, H, J, 'accept', null, null],
+        [IDS.A, 1, H, H, 'accept', 'rejected-by-broker', null],
+        [IDS.A, 1, J, J, 'accept', null, null],
+        [IDS.A, 2, H, J, 'accept', null, null],
+      ],
     },
   },
   {
@@ -1538,6 +2897,28 @@ const rows = [
       result: 'rejected-by-broker',
       cause: 'invalid response',
     },
+    observations: {
+      handlers: [
+        [IDS.A, 0, H, '6b', '76', 2],
+        [IDS.A, 0, J, '6b', '76', 2],
+        [IDS.A, 1, H, '6b', '76', 2],
+        [IDS.A, 1, J, '6b', '76', 2],
+        [IDS.A, 2, H, '6b', '76', 2],
+        [IDS.A, 2, J, '6b', '76', 2],
+      ],
+      mutations: [
+        [IDS.A, 0, H, J, [1]],
+        [IDS.A, 1, H, H, [1]],
+        [IDS.A, 1, J, J, [1]],
+        [IDS.A, 2, H, J, [1]],
+      ],
+      settlements: [
+        [IDS.A, 0, H, J, 'accept', null, null],
+        [IDS.A, 1, H, H, 'accept', 'rejected-by-broker', null],
+        [IDS.A, 1, J, J, 'accept', null, null],
+        [IDS.A, 2, H, J, 'accept', null, null],
+      ],
+    },
   },
   {
     fault: 'top 35',
@@ -1552,6 +2933,29 @@ const rows = [
       result: 'rejected-by-broker',
       cause: 35,
     },
+    observations: {
+      handlers: [
+        [IDS.A, 0, H, '6b', '76', 2],
+        [IDS.A, 0, H, '6b', '76', 2],
+        [IDS.A, 0, J, '6b', '76', 2],
+        [IDS.A, 1, H, '6b', '76', 2],
+        [IDS.A, 1, J, '6b', '76', 2],
+      ],
+      mutations: [
+        [IDS.A, 0, J, J, [2]],
+        [IDS.A, 0, H, J, [1]],
+        [IDS.A, 1, H, H, [1]],
+        [IDS.A, 2, H, J, [2]],
+      ],
+      settlements: [
+        [IDS.A, 0, H, H, 'release', 'membership-lost', null],
+        [IDS.A, 0, J, J, 'release', null, null],
+        [IDS.A, 0, H, J, 'accept', null, null],
+        [IDS.A, 1, H, H, 'accept', 'rejected-by-broker', 35],
+        [IDS.A, 1, J, J, 'release', 'membership-lost', null],
+        [IDS.A, 2, H, J, 'release', null, null],
+      ],
+    },
   },
   {
     fault: 'top 30',
@@ -1565,6 +2969,29 @@ const rows = [
       oldAckResends: 0,
       result: 'rejected-by-broker',
       cause: 30,
+    },
+    observations: {
+      handlers: [
+        [IDS.A, 0, H, '6b', '76', 2],
+        [IDS.A, 0, H, '6b', '76', 2],
+        [IDS.A, 0, J, '6b', '76', 2],
+        [IDS.A, 1, H, '6b', '76', 2],
+        [IDS.A, 1, J, '6b', '76', 2],
+      ],
+      mutations: [
+        [IDS.A, 0, J, J, [2]],
+        [IDS.A, 0, H, J, [1]],
+        [IDS.A, 1, H, H, [1]],
+        [IDS.A, 2, H, J, [2]],
+      ],
+      settlements: [
+        [IDS.A, 0, H, H, 'release', 'membership-lost', null],
+        [IDS.A, 0, J, J, 'release', null, null],
+        [IDS.A, 0, H, J, 'accept', null, null],
+        [IDS.A, 1, H, H, 'accept', 'rejected-by-broker', 30],
+        [IDS.A, 1, J, J, 'release', 'membership-lost', null],
+        [IDS.A, 2, H, J, 'release', null, null],
+      ],
     },
   },
   {
@@ -1580,6 +3007,26 @@ const rows = [
       result: 'session-lost',
       cause: 74,
     },
+    observations: {
+      handlers: [
+        [IDS.A, 0, H, '6b', '76', 2],
+        [IDS.A, 0, J, '6b', '76', 2],
+        [IDS.A, 1, H, '6b', '76', 2],
+        [IDS.A, 1, J, '6b', '76', 2],
+        [IDS.A, 2, H, '6b', '76', 2],
+        [IDS.A, 2, J, '6b', '76', 2],
+      ],
+      mutations: [
+        [IDS.A, 0, H, J, [1]],
+        [IDS.A, 1, H, J, [1]],
+        [IDS.A, 2, H, J, [1]],
+      ],
+      settlements: [
+        [IDS.A, 0, H, J, 'accept', null, null],
+        [IDS.A, 1, H, J, 'accept', 'session-lost', 74],
+        [IDS.A, 2, H, J, 'accept', null, null],
+      ],
+    },
   },
   {
     fault: 'partition unknown',
@@ -1593,6 +3040,26 @@ const rows = [
       oldAckResends: 0,
       result: 'rejected-by-broker',
       cause: -1,
+    },
+    observations: {
+      handlers: [
+        [IDS.A, 0, H, '6b', '76', 2],
+        [IDS.A, 0, J, '6b', '76', 2],
+        [IDS.A, 1, H, '6b', '76', 2],
+        [IDS.A, 1, J, '6b', '76', 2],
+        [IDS.A, 2, H, '6b', '76', 2],
+        [IDS.A, 2, J, '6b', '76', 2],
+      ],
+      mutations: [
+        [IDS.A, 0, H, J, [1]],
+        [IDS.A, 1, H, J, [1]],
+        [IDS.A, 2, H, J, [1]],
+      ],
+      settlements: [
+        [IDS.A, 0, H, J, 'accept', null, null],
+        [IDS.A, 1, H, J, 'accept', 'rejected-by-broker', -1],
+        [IDS.A, 2, H, J, 'accept', null, null],
+      ],
     },
   },
   {
@@ -1608,6 +3075,26 @@ const rows = [
       result: 'rejected-by-broker',
       cause: 'invalid response',
     },
+    observations: {
+      handlers: [
+        [IDS.A, 0, H, '6b', '76', 2],
+        [IDS.A, 0, J, '6b', '76', 2],
+        [IDS.A, 1, H, '6b', '76', 2],
+        [IDS.A, 1, J, '6b', '76', 2],
+        [IDS.A, 2, H, '6b', '76', 2],
+        [IDS.A, 2, J, '6b', '76', 2],
+      ],
+      mutations: [
+        [IDS.A, 0, H, J, [1]],
+        [IDS.A, 1, H, J, [1]],
+        [IDS.A, 2, H, J, [1]],
+      ],
+      settlements: [
+        [IDS.A, 0, H, J, 'accept', null, null],
+        [IDS.A, 1, H, J, 'accept', 'rejected-by-broker', null],
+        [IDS.A, 2, H, J, 'accept', null, null],
+      ],
+    },
   },
   {
     fault: 'duplicate partition',
@@ -1621,6 +3108,26 @@ const rows = [
       oldAckResends: 0,
       result: 'rejected-by-broker',
       cause: 'invalid response',
+    },
+    observations: {
+      handlers: [
+        [IDS.A, 0, H, '6b', '76', 2],
+        [IDS.A, 0, J, '6b', '76', 2],
+        [IDS.A, 1, H, '6b', '76', 2],
+        [IDS.A, 1, J, '6b', '76', 2],
+        [IDS.A, 2, H, '6b', '76', 2],
+        [IDS.A, 2, J, '6b', '76', 2],
+      ],
+      mutations: [
+        [IDS.A, 0, H, J, [1]],
+        [IDS.A, 1, H, J, [1]],
+        [IDS.A, 2, H, J, [1]],
+      ],
+      settlements: [
+        [IDS.A, 0, H, J, 'accept', null, null],
+        [IDS.A, 1, H, J, 'accept', 'rejected-by-broker', null],
+        [IDS.A, 2, H, J, 'accept', null, null],
+      ],
     },
   },
   {
@@ -1636,6 +3143,30 @@ const rows = [
       result: 'rejected-by-broker',
       cause: 35,
     },
+    observations: {
+      handlers: [
+        [IDS.A, 0, H, '6b', '76', 2],
+        [IDS.A, 0, H, '6b', '76', 2],
+        [IDS.A, 0, J, '6b', '76', 2],
+        [IDS.A, 1, H, '6b', '76', 2],
+        [IDS.A, 1, J, '6b', '76', 2],
+        [IDS.A, 2, H, '6b', '76', 2],
+        [IDS.A, 2, J, '6b', '76', 2],
+      ],
+      mutations: [
+        [IDS.A, 0, J, J, [2]],
+        [IDS.A, 0, H, J, [1]],
+        [IDS.A, 1, H, J, [1]],
+        [IDS.A, 2, H, J, [1]],
+      ],
+      settlements: [
+        [IDS.A, 0, H, H, 'release', 'membership-lost', null],
+        [IDS.A, 0, J, J, 'release', null, null],
+        [IDS.A, 0, H, J, 'accept', null, null],
+        [IDS.A, 1, H, J, 'accept', 'rejected-by-broker', 35],
+        [IDS.A, 2, H, J, 'accept', 'rejected-by-broker', 35],
+      ],
+    },
   },
   {
     fault: 'top 30',
@@ -1649,6 +3180,30 @@ const rows = [
       oldAckResends: 0,
       result: 'rejected-by-broker',
       cause: 30,
+    },
+    observations: {
+      handlers: [
+        [IDS.A, 0, H, '6b', '76', 2],
+        [IDS.A, 0, H, '6b', '76', 2],
+        [IDS.A, 0, J, '6b', '76', 2],
+        [IDS.A, 1, H, '6b', '76', 2],
+        [IDS.A, 1, J, '6b', '76', 2],
+        [IDS.A, 2, H, '6b', '76', 2],
+        [IDS.A, 2, J, '6b', '76', 2],
+      ],
+      mutations: [
+        [IDS.A, 0, J, J, [2]],
+        [IDS.A, 0, H, J, [1]],
+        [IDS.A, 1, H, J, [1]],
+        [IDS.A, 2, H, J, [1]],
+      ],
+      settlements: [
+        [IDS.A, 0, H, H, 'release', 'membership-lost', null],
+        [IDS.A, 0, J, J, 'release', null, null],
+        [IDS.A, 0, H, J, 'accept', null, null],
+        [IDS.A, 1, H, J, 'accept', 'rejected-by-broker', 30],
+        [IDS.A, 2, H, J, 'accept', 'rejected-by-broker', 30],
+      ],
     },
   },
   {
@@ -1664,6 +3219,28 @@ const rows = [
       result: 'session-lost',
       cause: 74,
     },
+    observations: {
+      handlers: [
+        [IDS.A, 0, H, '6b', '76', 2],
+        [IDS.A, 0, H, '6b', '76', 2],
+        [IDS.A, 0, J, '6b', '76', 2],
+        [IDS.A, 1, H, '6b', '76', 2],
+      ],
+      mutations: [
+        [IDS.A, 0, J, J, [2]],
+        [IDS.A, 0, H, J, [1]],
+        [IDS.A, 1, H, J, [1, 2]],
+        [IDS.A, 2, H, J, [2]],
+      ],
+      settlements: [
+        [IDS.A, 0, H, H, 'release', 'membership-lost', null],
+        [IDS.A, 0, J, J, 'release', null, null],
+        [IDS.A, 0, H, J, 'accept', null, null],
+        [IDS.A, 1, H, H, 'accept', 'session-lost', 74],
+        [IDS.A, 1, J, J, 'release', 'session-lost', 74],
+        [IDS.A, 2, H, J, 'release', null, null],
+      ],
+    },
   },
   {
     fault: 'partition unknown',
@@ -1677,6 +3254,28 @@ const rows = [
       oldAckResends: 0,
       result: 'rejected-by-broker',
       cause: -1,
+    },
+    observations: {
+      handlers: [
+        [IDS.A, 0, H, '6b', '76', 2],
+        [IDS.A, 0, H, '6b', '76', 2],
+        [IDS.A, 0, J, '6b', '76', 2],
+        [IDS.A, 1, H, '6b', '76', 2],
+      ],
+      mutations: [
+        [IDS.A, 0, J, J, [2]],
+        [IDS.A, 0, H, J, [1]],
+        [IDS.A, 1, H, J, [1, 2]],
+        [IDS.A, 2, H, J, [2]],
+      ],
+      settlements: [
+        [IDS.A, 0, H, H, 'release', 'membership-lost', null],
+        [IDS.A, 0, J, J, 'release', null, null],
+        [IDS.A, 0, H, J, 'accept', null, null],
+        [IDS.A, 1, H, H, 'accept', 'rejected-by-broker', -1],
+        [IDS.A, 1, J, J, 'release', 'rejected-by-broker', -1],
+        [IDS.A, 2, H, J, 'release', null, null],
+      ],
     },
   },
   {
@@ -1692,6 +3291,28 @@ const rows = [
       result: 'rejected-by-broker',
       cause: 'invalid response',
     },
+    observations: {
+      handlers: [
+        [IDS.A, 0, H, '6b', '76', 2],
+        [IDS.A, 0, H, '6b', '76', 2],
+        [IDS.A, 0, J, '6b', '76', 2],
+        [IDS.A, 1, H, '6b', '76', 2],
+      ],
+      mutations: [
+        [IDS.A, 0, J, J, [2]],
+        [IDS.A, 0, H, J, [1]],
+        [IDS.A, 1, H, J, [1, 2]],
+        [IDS.A, 2, H, J, [2]],
+      ],
+      settlements: [
+        [IDS.A, 0, H, H, 'release', 'membership-lost', null],
+        [IDS.A, 0, J, J, 'release', null, null],
+        [IDS.A, 0, H, J, 'accept', null, null],
+        [IDS.A, 1, H, H, 'accept', 'rejected-by-broker', null],
+        [IDS.A, 1, J, J, 'release', 'rejected-by-broker', null],
+        [IDS.A, 2, H, J, 'release', null, null],
+      ],
+    },
   },
   {
     fault: 'duplicate partition',
@@ -1705,6 +3326,28 @@ const rows = [
       oldAckResends: 0,
       result: 'rejected-by-broker',
       cause: 'invalid response',
+    },
+    observations: {
+      handlers: [
+        [IDS.A, 0, H, '6b', '76', 2],
+        [IDS.A, 0, H, '6b', '76', 2],
+        [IDS.A, 0, J, '6b', '76', 2],
+        [IDS.A, 1, H, '6b', '76', 2],
+      ],
+      mutations: [
+        [IDS.A, 0, J, J, [2]],
+        [IDS.A, 0, H, J, [1]],
+        [IDS.A, 1, H, J, [1, 2]],
+        [IDS.A, 2, H, J, [2]],
+      ],
+      settlements: [
+        [IDS.A, 0, H, H, 'release', 'membership-lost', null],
+        [IDS.A, 0, J, J, 'release', null, null],
+        [IDS.A, 0, H, J, 'accept', null, null],
+        [IDS.A, 1, H, H, 'accept', 'rejected-by-broker', null],
+        [IDS.A, 1, J, J, 'release', 'rejected-by-broker', null],
+        [IDS.A, 2, H, J, 'release', null, null],
+      ],
     },
   },
   {
@@ -1720,6 +3363,28 @@ const rows = [
       result: 'rejected-by-broker',
       cause: 35,
     },
+    observations: {
+      handlers: [
+        [IDS.A, 0, H, '6b', '76', 2],
+        [IDS.A, 0, H, '6b', '76', 2],
+        [IDS.A, 0, J, '6b', '76', 2],
+        [IDS.A, 1, H, '6b', '76', 2],
+      ],
+      mutations: [
+        [IDS.A, 0, J, J, [2]],
+        [IDS.A, 0, H, J, [1]],
+        [IDS.A, 1, H, J, [1, 2]],
+        [IDS.A, 2, H, J, [2]],
+      ],
+      settlements: [
+        [IDS.A, 0, H, H, 'release', 'membership-lost', null],
+        [IDS.A, 0, J, J, 'release', null, null],
+        [IDS.A, 0, H, J, 'accept', null, null],
+        [IDS.A, 1, H, H, 'accept', 'rejected-by-broker', 35],
+        [IDS.A, 1, J, J, 'release', 'rejected-by-broker', 35],
+        [IDS.A, 2, H, J, 'release', 'rejected-by-broker', 35],
+      ],
+    },
   },
   {
     fault: 'top 30',
@@ -1733,6 +3398,28 @@ const rows = [
       oldAckResends: 0,
       result: 'rejected-by-broker',
       cause: 30,
+    },
+    observations: {
+      handlers: [
+        [IDS.A, 0, H, '6b', '76', 2],
+        [IDS.A, 0, H, '6b', '76', 2],
+        [IDS.A, 0, J, '6b', '76', 2],
+        [IDS.A, 1, H, '6b', '76', 2],
+      ],
+      mutations: [
+        [IDS.A, 0, J, J, [2]],
+        [IDS.A, 0, H, J, [1]],
+        [IDS.A, 1, H, J, [1, 2]],
+        [IDS.A, 2, H, J, [2]],
+      ],
+      settlements: [
+        [IDS.A, 0, H, H, 'release', 'membership-lost', null],
+        [IDS.A, 0, J, J, 'release', null, null],
+        [IDS.A, 0, H, J, 'accept', null, null],
+        [IDS.A, 1, H, H, 'accept', 'rejected-by-broker', 30],
+        [IDS.A, 1, J, J, 'release', 'rejected-by-broker', 30],
+        [IDS.A, 2, H, J, 'release', 'rejected-by-broker', 30],
+      ],
     },
   },
   {
@@ -1748,6 +3435,28 @@ const rows = [
       result: 'session-lost',
       cause: 74,
     },
+    observations: {
+      handlers: [
+        [IDS.A, 0, H, '6b', '76', 2],
+        [IDS.A, 0, J, '6b', '76', 2],
+        [IDS.A, 1, H, '6b', '76', 2],
+        [IDS.A, 1, J, '6b', '76', 2],
+        [IDS.A, 2, H, '6b', '76', 2],
+        [IDS.A, 2, J, '6b', '76', 2],
+      ],
+      mutations: [
+        [IDS.A, 0, H, J, [1]],
+        [IDS.A, 1, H, H, [4]],
+        [IDS.A, 1, H, J, [1]],
+        [IDS.A, 2, H, J, [1]],
+      ],
+      settlements: [
+        [IDS.A, 0, H, J, 'accept', null, null],
+        [IDS.A, 1, H, H, 'renew', 'session-lost', 74],
+        [IDS.A, 1, H, J, 'accept', null, null],
+        [IDS.A, 2, H, J, 'accept', null, null],
+      ],
+    },
   },
   {
     fault: 'partition unknown',
@@ -1761,6 +3470,28 @@ const rows = [
       oldAckResends: 0,
       result: 'rejected-by-broker',
       cause: -1,
+    },
+    observations: {
+      handlers: [
+        [IDS.A, 0, H, '6b', '76', 2],
+        [IDS.A, 0, J, '6b', '76', 2],
+        [IDS.A, 1, H, '6b', '76', 2],
+        [IDS.A, 1, J, '6b', '76', 2],
+        [IDS.A, 2, H, '6b', '76', 2],
+        [IDS.A, 2, J, '6b', '76', 2],
+      ],
+      mutations: [
+        [IDS.A, 0, H, J, [1]],
+        [IDS.A, 1, H, H, [4]],
+        [IDS.A, 1, H, J, [1]],
+        [IDS.A, 2, H, J, [1]],
+      ],
+      settlements: [
+        [IDS.A, 0, H, J, 'accept', null, null],
+        [IDS.A, 1, H, H, 'renew', 'rejected-by-broker', -1],
+        [IDS.A, 1, H, J, 'accept', null, null],
+        [IDS.A, 2, H, J, 'accept', null, null],
+      ],
     },
   },
   {
@@ -1776,6 +3507,28 @@ const rows = [
       result: 'rejected-by-broker',
       cause: 'invalid response',
     },
+    observations: {
+      handlers: [
+        [IDS.A, 0, H, '6b', '76', 2],
+        [IDS.A, 0, J, '6b', '76', 2],
+        [IDS.A, 1, H, '6b', '76', 2],
+        [IDS.A, 1, J, '6b', '76', 2],
+        [IDS.A, 2, H, '6b', '76', 2],
+        [IDS.A, 2, J, '6b', '76', 2],
+      ],
+      mutations: [
+        [IDS.A, 0, H, J, [1]],
+        [IDS.A, 1, H, H, [4]],
+        [IDS.A, 1, H, J, [1]],
+        [IDS.A, 2, H, J, [1]],
+      ],
+      settlements: [
+        [IDS.A, 0, H, J, 'accept', null, null],
+        [IDS.A, 1, H, H, 'renew', 'rejected-by-broker', null],
+        [IDS.A, 1, H, J, 'accept', null, null],
+        [IDS.A, 2, H, J, 'accept', null, null],
+      ],
+    },
   },
   {
     fault: 'duplicate partition',
@@ -1789,6 +3542,28 @@ const rows = [
       oldAckResends: 0,
       result: 'rejected-by-broker',
       cause: 'invalid response',
+    },
+    observations: {
+      handlers: [
+        [IDS.A, 0, H, '6b', '76', 2],
+        [IDS.A, 0, J, '6b', '76', 2],
+        [IDS.A, 1, H, '6b', '76', 2],
+        [IDS.A, 1, J, '6b', '76', 2],
+        [IDS.A, 2, H, '6b', '76', 2],
+        [IDS.A, 2, J, '6b', '76', 2],
+      ],
+      mutations: [
+        [IDS.A, 0, H, J, [1]],
+        [IDS.A, 1, H, H, [4]],
+        [IDS.A, 1, H, J, [1]],
+        [IDS.A, 2, H, J, [1]],
+      ],
+      settlements: [
+        [IDS.A, 0, H, J, 'accept', null, null],
+        [IDS.A, 1, H, H, 'renew', 'rejected-by-broker', null],
+        [IDS.A, 1, H, J, 'accept', null, null],
+        [IDS.A, 2, H, J, 'accept', null, null],
+      ],
     },
   },
   {
@@ -1804,6 +3579,30 @@ const rows = [
       result: 'rejected-by-broker',
       cause: 35,
     },
+    observations: {
+      handlers: [
+        [IDS.A, 0, H, '6b', '76', 2],
+        [IDS.A, 0, H, '6b', '76', 2],
+        [IDS.A, 0, J, '6b', '76', 2],
+        [IDS.A, 1, H, '6b', '76', 2],
+      ],
+      mutations: [
+        [IDS.A, 0, J, J, [2]],
+        [IDS.A, 0, H, J, [1]],
+        [IDS.A, 1, H, H, [4]],
+        [IDS.A, 1, J, J, [2]],
+        [IDS.A, 2, H, J, [2]],
+      ],
+      settlements: [
+        [IDS.A, 0, H, H, 'release', 'membership-lost', null],
+        [IDS.A, 0, J, J, 'release', null, null],
+        [IDS.A, 0, H, J, 'accept', null, null],
+        [IDS.A, 1, H, H, 'renew', 'rejected-by-broker', 35],
+        [IDS.A, 1, H, H, 'release', 'membership-lost', null],
+        [IDS.A, 1, J, J, 'release', null, null],
+        [IDS.A, 2, H, J, 'release', null, null],
+      ],
+    },
   },
   {
     fault: 'top 30',
@@ -1817,6 +3616,30 @@ const rows = [
       oldAckResends: 0,
       result: 'rejected-by-broker',
       cause: 30,
+    },
+    observations: {
+      handlers: [
+        [IDS.A, 0, H, '6b', '76', 2],
+        [IDS.A, 0, H, '6b', '76', 2],
+        [IDS.A, 0, J, '6b', '76', 2],
+        [IDS.A, 1, H, '6b', '76', 2],
+      ],
+      mutations: [
+        [IDS.A, 0, J, J, [2]],
+        [IDS.A, 0, H, J, [1]],
+        [IDS.A, 1, H, H, [4]],
+        [IDS.A, 1, J, J, [2]],
+        [IDS.A, 2, H, J, [2]],
+      ],
+      settlements: [
+        [IDS.A, 0, H, H, 'release', 'membership-lost', null],
+        [IDS.A, 0, J, J, 'release', null, null],
+        [IDS.A, 0, H, J, 'accept', null, null],
+        [IDS.A, 1, H, H, 'renew', 'rejected-by-broker', 30],
+        [IDS.A, 1, H, H, 'release', 'membership-lost', null],
+        [IDS.A, 1, J, J, 'release', null, null],
+        [IDS.A, 2, H, J, 'release', null, null],
+      ],
     },
   },
   {
@@ -1833,6 +3656,26 @@ const rows = [
       cause: null,
       fetchCode: 6,
     },
+    observations: {
+      handlers: [
+        [IDS.A, 0, H, '6b', '76', 2],
+        [IDS.A, 0, J, '6b', '76', 2],
+        [IDS.A, 1, H, '6b', '76', 2],
+        [IDS.A, 1, J, '6b', '76', 2],
+        [IDS.A, 2, H, '6b', '76', 2],
+        [IDS.A, 2, J, '6b', '76', 2],
+      ],
+      mutations: [
+        [IDS.A, 0, H, J, [1]],
+        [IDS.A, 1, H, J, [1]],
+        [IDS.A, 2, H, J, [1]],
+      ],
+      settlements: [
+        [IDS.A, 0, H, J, 'accept', null, null],
+        [IDS.A, 1, H, J, 'accept', null, null],
+        [IDS.A, 2, H, J, 'accept', null, null],
+      ],
+    },
   },
   {
     fault: 'failed ack successful fetch',
@@ -1848,6 +3691,26 @@ const rows = [
       cause: 121,
       fetchCode: 0,
     },
+    observations: {
+      handlers: [
+        [IDS.A, 0, H, '6b', '76', 2],
+        [IDS.A, 0, J, '6b', '76', 2],
+        [IDS.A, 1, H, '6b', '76', 2],
+        [IDS.A, 1, J, '6b', '76', 2],
+        [IDS.A, 2, H, '6b', '76', 2],
+        [IDS.A, 2, J, '6b', '76', 2],
+      ],
+      mutations: [
+        [IDS.A, 0, H, J, [1]],
+        [IDS.A, 1, H, J, [1]],
+        [IDS.A, 2, H, J, [1]],
+      ],
+      settlements: [
+        [IDS.A, 0, H, J, 'accept', null, null],
+        [IDS.A, 1, H, J, 'accept', 'rejected-by-broker', 121],
+        [IDS.A, 2, H, J, 'accept', null, null],
+      ],
+    },
   },
   {
     fault: 'held acknowledgement connect',
@@ -1863,6 +3726,27 @@ const rows = [
       lateEffects: 0,
       replacement: ['B:0@9007199254740993'],
     },
+    observations: {
+      handlers: [
+        [IDS.A, 0, H, '6b', '76', 2],
+        [IDS.A, 1, H, '6b', '76', 2],
+        [IDS.A, 1, J, '6b', '76', 2],
+        [IDS.B, 0, H, '6b', '76', 2],
+        [IDS.B, 0, J, '6b', '76', 2],
+      ],
+      mutations: [
+        [IDS.A, 0, J, J, [2]],
+        [IDS.B, 0, H, J, [1]],
+      ],
+      settlements: [
+        [IDS.A, 0, H, H, 'release', 'membership-lost', null],
+        [IDS.A, 0, J, J, 'release', null, null],
+        [IDS.A, 1, H, H, 'accept', 'membership-lost', null],
+        [IDS.A, 1, J, J, 'release', 'membership-lost', null],
+        [IDS.A, 2, H, J, 'release', 'membership-lost', null],
+        [IDS.B, 0, H, J, 'accept', null, null],
+      ],
+    },
   },
   {
     fault: 'held acknowledgement connect',
@@ -1877,6 +3761,27 @@ const rows = [
       finals: 0,
       lateEffects: 0,
       replacement: ['B:0@9007199254740993'],
+    },
+    observations: {
+      handlers: [
+        [IDS.A, 0, H, '6b', '76', 2],
+        [IDS.A, 1, H, '6b', '76', 2],
+        [IDS.A, 1, J, '6b', '76', 2],
+        [IDS.B, 0, H, '6b', '76', 2],
+        [IDS.B, 0, J, '6b', '76', 2],
+      ],
+      mutations: [
+        [IDS.A, 0, J, J, [2]],
+        [IDS.B, 0, H, J, [1]],
+      ],
+      settlements: [
+        [IDS.A, 0, H, H, 'release', 'membership-lost', null],
+        [IDS.A, 0, J, J, 'release', null, null],
+        [IDS.A, 1, H, H, 'accept', 'membership-lost', null],
+        [IDS.A, 1, J, J, 'release', 'membership-lost', null],
+        [IDS.A, 2, H, J, 'release', 'membership-lost', null],
+        [IDS.B, 0, H, J, 'accept', null, null],
+      ],
     },
   },
   {
@@ -1893,24 +3798,68 @@ const rows = [
       lateEffects: 0,
       replacement: ['B:0@9007199254740993'],
     },
-  },
-  {
-    fault: 'held acknowledgement connect',
-    step: 'captured current',
-    expected: {
-      action: 'guard',
-      state: 'STABLE',
-      rounds: 8,
-      enforce: false,
-      writes: 1,
-      accepted: true,
-      finals: 1,
-      lateEffects: 0,
-      replacement: ['B:0@9007199254740993'],
+    observations: {
+      handlers: [
+        [IDS.A, 0, H, '6b', '76', 2],
+        [IDS.A, 1, H, '6b', '76', 2],
+        [IDS.B, 0, H, '6b', '76', 2],
+        [IDS.B, 0, J, '6b', '76', 2],
+      ],
+      mutations: [
+        [IDS.A, 0, J, J, [2]],
+        [IDS.A, 1, H, J, [1, 2]],
+        [IDS.A, 2, H, J, [2]],
+        [IDS.B, 0, H, J, [1]],
+      ],
+      settlements: [
+        [IDS.A, 0, H, H, 'release', 'membership-lost', null],
+        [IDS.A, 0, J, J, 'release', null, null],
+        [IDS.A, 1, H, H, 'accept', null, null],
+        [IDS.A, 1, J, J, 'release', null, null],
+        [IDS.A, 2, H, J, 'release', null, null],
+        [IDS.B, 0, H, J, 'accept', null, null],
+      ],
     },
   },
   {
     fault: 'held acknowledgement connect',
+    step: 'captured current',
+    expected: {
+      action: 'guard',
+      state: 'STABLE',
+      rounds: 8,
+      enforce: false,
+      writes: 1,
+      accepted: true,
+      finals: 1,
+      lateEffects: 0,
+      replacement: ['B:0@9007199254740993'],
+    },
+    observations: {
+      handlers: [
+        [IDS.A, 0, H, '6b', '76', 2],
+        [IDS.A, 1, H, '6b', '76', 2],
+        [IDS.B, 0, H, '6b', '76', 2],
+        [IDS.B, 0, J, '6b', '76', 2],
+      ],
+      mutations: [
+        [IDS.A, 0, J, J, [2]],
+        [IDS.A, 1, H, J, [1, 2]],
+        [IDS.A, 2, H, J, [2]],
+        [IDS.B, 0, H, J, [1]],
+      ],
+      settlements: [
+        [IDS.A, 0, H, H, 'release', 'membership-lost', null],
+        [IDS.A, 0, J, J, 'release', null, null],
+        [IDS.A, 1, H, H, 'accept', null, null],
+        [IDS.A, 1, J, J, 'release', null, null],
+        [IDS.A, 2, H, J, 'release', null, null],
+        [IDS.B, 0, H, J, 'accept', null, null],
+      ],
+    },
+  },
+  {
+    fault: 'held acknowledgement connect',
     step: 'captured revoked',
     expected: {
       action: 'guard',
@@ -1922,6 +3871,26 @@ const rows = [
       finals: 0,
       lateEffects: 0,
       replacement: ['B:0@9007199254740993'],
+    },
+    observations: {
+      handlers: [
+        [IDS.A, 0, H, '6b', '76', 2],
+        [IDS.A, 1, H, '6b', '76', 2],
+        [IDS.B, 0, H, '6b', '76', 2],
+        [IDS.B, 0, J, '6b', '76', 2],
+      ],
+      mutations: [
+        [IDS.A, 0, J, J, [2]],
+        [IDS.B, 0, H, J, [1]],
+      ],
+      settlements: [
+        [IDS.A, 0, H, H, 'release', 'membership-lost', null],
+        [IDS.A, 0, J, J, 'release', null, null],
+        [IDS.A, 1, H, H, 'accept', 'not-sent', null],
+        [IDS.A, 1, J, J, 'release', 'not-sent', null],
+        [IDS.A, 2, H, J, 'release', 'not-sent', null],
+        [IDS.B, 0, H, J, 'accept', null, null],
+      ],
     },
   },
   {
@@ -1938,20 +3907,25 @@ const rows = [
       lateEffects: 0,
       replacement: ['B:0@9007199254740993'],
     },
-  },
-  {
-    fault: 'held acknowledgement connect',
-    step: 'captured expired',
-    expected: {
-      action: 'guard',
-      state: 'STABLE',
-      rounds: 8,
-      enforce: true,
-      writes: 0,
-      accepted: false,
-      finals: 0,
-      lateEffects: 0,
-      replacement: ['B:0@9007199254740993'],
+    observations: {
+      handlers: [
+        [IDS.A, 0, H, '6b', '76', 2],
+        [IDS.A, 1, H, '6b', '76', 2],
+        [IDS.B, 0, H, '6b', '76', 2],
+        [IDS.B, 0, J, '6b', '76', 2],
+      ],
+      mutations: [
+        [IDS.A, 0, J, J, [2]],
+        [IDS.B, 0, H, J, [1]],
+      ],
+      settlements: [
+        [IDS.A, 0, H, H, 'release', 'membership-lost', null],
+        [IDS.A, 0, J, J, 'release', null, null],
+        [IDS.A, 1, H, H, 'accept', 'not-sent', null],
+        [IDS.A, 1, J, J, 'release', 'not-sent', null],
+        [IDS.A, 2, H, J, 'release', 'not-sent', null],
+        [IDS.B, 0, H, J, 'accept', null, null],
+      ],
     },
   },
   {
@@ -1961,12 +3935,66 @@ const rows = [
       action: 'guard',
       state: 'STABLE',
       rounds: 8,
+      enforce: true,
+      writes: 0,
+      accepted: false,
+      finals: 0,
+      lateEffects: 0,
+      replacement: ['B:0@9007199254740993'],
+    },
+    observations: {
+      handlers: [
+        [IDS.A, 0, H, '6b', '76', 2],
+        [IDS.A, 1, H, '6b', '76', 2],
+        [IDS.B, 0, H, '6b', '76', 2],
+        [IDS.B, 0, J, '6b', '76', 2],
+      ],
+      mutations: [
+        [IDS.A, 0, J, J, [2]],
+        [IDS.B, 0, H, J, [1]],
+      ],
+      settlements: [
+        [IDS.A, 0, H, H, 'release', 'membership-lost', null],
+        [IDS.A, 0, J, J, 'release', null, null],
+        [IDS.A, 1, H, H, 'accept', 'not-sent', null],
+        [IDS.A, 1, J, J, 'release', 'not-sent', null],
+        [IDS.A, 2, H, J, 'release', 'not-sent', null],
+        [IDS.B, 0, H, J, 'accept', null, null],
+      ],
+    },
+  },
+  {
+    fault: 'held acknowledgement connect',
+    step: 'captured expired',
+    expected: {
+      action: 'guard',
+      state: 'STABLE',
+      rounds: 8,
       enforce: false,
       writes: 0,
       accepted: false,
       finals: 0,
       lateEffects: 0,
       replacement: ['B:0@9007199254740993'],
+    },
+    observations: {
+      handlers: [
+        [IDS.A, 0, H, '6b', '76', 2],
+        [IDS.A, 1, H, '6b', '76', 2],
+        [IDS.B, 0, H, '6b', '76', 2],
+        [IDS.B, 0, J, '6b', '76', 2],
+      ],
+      mutations: [
+        [IDS.A, 0, H, J, [2]],
+        [IDS.B, 0, H, J, [1]],
+      ],
+      settlements: [
+        [IDS.A, 0, H, J, 'release', null, null],
+        [IDS.A, 1, H, H, 'accept', 'not-sent', null],
+        [IDS.A, 1, J, J, 'release', 'not-sent', null],
+        [IDS.A, 2, H, J, 'release', 'not-sent', null],
+        [IDS.B, 0, H, J, 'accept', null, null],
+      ],
     },
   },
   {
@@ -1983,6 +4011,27 @@ const rows = [
       lateEffects: 0,
       replacement: ['B:0@9007199254740993'],
     },
+    observations: {
+      handlers: [
+        [IDS.A, 0, H, '6b', '76', 2],
+        [IDS.A, 1, H, '6b', '76', 2],
+        [IDS.A, 1, J, '6b', '76', 2],
+        [IDS.B, 0, H, '6b', '76', 2],
+        [IDS.B, 0, J, '6b', '76', 2],
+      ],
+      mutations: [
+        [IDS.A, 0, J, J, [2]],
+        [IDS.B, 0, H, J, [1]],
+      ],
+      settlements: [
+        [IDS.A, 0, H, H, 'release', 'membership-lost', null],
+        [IDS.A, 0, J, J, 'release', null, null],
+        [IDS.A, 1, H, H, 'accept', 'membership-lost', null],
+        [IDS.A, 1, J, J, 'release', 'membership-lost', null],
+        [IDS.A, 2, H, J, 'release', 'membership-lost', null],
+        [IDS.B, 0, H, J, 'accept', null, null],
+      ],
+    },
   },
   {
     fault: 'held acknowledgement encode',
@@ -1998,6 +4047,27 @@ const rows = [
       lateEffects: 0,
       replacement: ['B:0@9007199254740993'],
     },
+    observations: {
+      handlers: [
+        [IDS.A, 0, H, '6b', '76', 2],
+        [IDS.A, 1, H, '6b', '76', 2],
+        [IDS.A, 1, J, '6b', '76', 2],
+        [IDS.B, 0, H, '6b', '76', 2],
+        [IDS.B, 0, J, '6b', '76', 2],
+      ],
+      mutations: [
+        [IDS.A, 0, J, J, [2]],
+        [IDS.B, 0, H, J, [1]],
+      ],
+      settlements: [
+        [IDS.A, 0, H, H, 'release', 'membership-lost', null],
+        [IDS.A, 0, J, J, 'release', null, null],
+        [IDS.A, 1, H, H, 'accept', 'membership-lost', null],
+        [IDS.A, 1, J, J, 'release', 'membership-lost', null],
+        [IDS.A, 2, H, J, 'release', 'membership-lost', null],
+        [IDS.B, 0, H, J, 'accept', null, null],
+      ],
+    },
   },
   {
     fault: 'held acknowledgement encode',
@@ -2013,6 +4083,28 @@ const rows = [
       lateEffects: 0,
       replacement: ['B:0@9007199254740993'],
     },
+    observations: {
+      handlers: [
+        [IDS.A, 0, H, '6b', '76', 2],
+        [IDS.A, 1, H, '6b', '76', 2],
+        [IDS.B, 0, H, '6b', '76', 2],
+        [IDS.B, 0, J, '6b', '76', 2],
+      ],
+      mutations: [
+        [IDS.A, 0, J, J, [2]],
+        [IDS.A, 1, H, J, [1, 2]],
+        [IDS.A, 2, H, J, [2]],
+        [IDS.B, 0, H, J, [1]],
+      ],
+      settlements: [
+        [IDS.A, 0, H, H, 'release', 'membership-lost', null],
+        [IDS.A, 0, J, J, 'release', null, null],
+        [IDS.A, 1, H, H, 'accept', null, null],
+        [IDS.A, 1, J, J, 'release', null, null],
+        [IDS.A, 2, H, J, 'release', null, null],
+        [IDS.B, 0, H, J, 'accept', null, null],
+      ],
+    },
   },
   {
     fault: 'held acknowledgement encode',
@@ -2027,6 +4119,28 @@ const rows = [
       finals: 1,
       lateEffects: 0,
       replacement: ['B:0@9007199254740993'],
+    },
+    observations: {
+      handlers: [
+        [IDS.A, 0, H, '6b', '76', 2],
+        [IDS.A, 1, H, '6b', '76', 2],
+        [IDS.B, 0, H, '6b', '76', 2],
+        [IDS.B, 0, J, '6b', '76', 2],
+      ],
+      mutations: [
+        [IDS.A, 0, J, J, [2]],
+        [IDS.A, 1, H, J, [1, 2]],
+        [IDS.A, 2, H, J, [2]],
+        [IDS.B, 0, H, J, [1]],
+      ],
+      settlements: [
+        [IDS.A, 0, H, H, 'release', 'membership-lost', null],
+        [IDS.A, 0, J, J, 'release', null, null],
+        [IDS.A, 1, H, H, 'accept', null, null],
+        [IDS.A, 1, J, J, 'release', null, null],
+        [IDS.A, 2, H, J, 'release', null, null],
+        [IDS.B, 0, H, J, 'accept', null, null],
+      ],
     },
   },
   {
@@ -2043,6 +4157,26 @@ const rows = [
       lateEffects: 0,
       replacement: ['B:0@9007199254740993'],
     },
+    observations: {
+      handlers: [
+        [IDS.A, 0, H, '6b', '76', 2],
+        [IDS.A, 1, H, '6b', '76', 2],
+        [IDS.B, 0, H, '6b', '76', 2],
+        [IDS.B, 0, J, '6b', '76', 2],
+      ],
+      mutations: [
+        [IDS.A, 0, J, J, [2]],
+        [IDS.B, 0, H, J, [1]],
+      ],
+      settlements: [
+        [IDS.A, 0, H, H, 'release', 'membership-lost', null],
+        [IDS.A, 0, J, J, 'release', null, null],
+        [IDS.A, 1, H, H, 'accept', 'not-sent', null],
+        [IDS.A, 1, J, J, 'release', 'not-sent', null],
+        [IDS.A, 2, H, J, 'release', 'not-sent', null],
+        [IDS.B, 0, H, J, 'accept', null, null],
+      ],
+    },
   },
   {
     fault: 'held acknowledgement encode',
@@ -2057,6 +4191,26 @@ const rows = [
       finals: 0,
       lateEffects: 0,
       replacement: ['B:0@9007199254740993'],
+    },
+    observations: {
+      handlers: [
+        [IDS.A, 0, H, '6b', '76', 2],
+        [IDS.A, 1, H, '6b', '76', 2],
+        [IDS.B, 0, H, '6b', '76', 2],
+        [IDS.B, 0, J, '6b', '76', 2],
+      ],
+      mutations: [
+        [IDS.A, 0, J, J, [2]],
+        [IDS.B, 0, H, J, [1]],
+      ],
+      settlements: [
+        [IDS.A, 0, H, H, 'release', 'membership-lost', null],
+        [IDS.A, 0, J, J, 'release', null, null],
+        [IDS.A, 1, H, H, 'accept', 'not-sent', null],
+        [IDS.A, 1, J, J, 'release', 'not-sent', null],
+        [IDS.A, 2, H, J, 'release', 'not-sent', null],
+        [IDS.B, 0, H, J, 'accept', null, null],
+      ],
     },
   },
   {
@@ -2073,6 +4227,26 @@ const rows = [
       lateEffects: 0,
       replacement: ['B:0@9007199254740993'],
     },
+    observations: {
+      handlers: [
+        [IDS.A, 0, H, '6b', '76', 2],
+        [IDS.A, 1, H, '6b', '76', 2],
+        [IDS.B, 0, H, '6b', '76', 2],
+        [IDS.B, 0, J, '6b', '76', 2],
+      ],
+      mutations: [
+        [IDS.A, 0, J, J, [2]],
+        [IDS.B, 0, H, J, [1]],
+      ],
+      settlements: [
+        [IDS.A, 0, H, H, 'release', 'membership-lost', null],
+        [IDS.A, 0, J, J, 'release', null, null],
+        [IDS.A, 1, H, H, 'accept', 'not-sent', null],
+        [IDS.A, 1, J, J, 'release', 'not-sent', null],
+        [IDS.A, 2, H, J, 'release', 'not-sent', null],
+        [IDS.B, 0, H, J, 'accept', null, null],
+      ],
+    },
   },
   {
     fault: 'held acknowledgement encode',
@@ -2087,6 +4261,25 @@ const rows = [
       finals: 0,
       lateEffects: 0,
       replacement: ['B:0@9007199254740993'],
+    },
+    observations: {
+      handlers: [
+        [IDS.A, 0, H, '6b', '76', 2],
+        [IDS.A, 1, H, '6b', '76', 2],
+        [IDS.B, 0, H, '6b', '76', 2],
+        [IDS.B, 0, J, '6b', '76', 2],
+      ],
+      mutations: [
+        [IDS.A, 0, H, J, [2]],
+        [IDS.B, 0, H, J, [1]],
+      ],
+      settlements: [
+        [IDS.A, 0, H, J, 'release', null, null],
+        [IDS.A, 1, H, H, 'accept', 'not-sent', null],
+        [IDS.A, 1, J, J, 'release', 'not-sent', null],
+        [IDS.A, 2, H, J, 'release', 'not-sent', null],
+        [IDS.B, 0, H, J, 'accept', null, null],
+      ],
     },
   },
   {
@@ -2103,6 +4296,27 @@ const rows = [
       lateEffects: 0,
       replacement: ['B:0@9007199254740993'],
     },
+    observations: {
+      handlers: [
+        [IDS.A, 0, H, '6b', '76', 2],
+        [IDS.A, 1, H, '6b', '76', 2],
+        [IDS.A, 1, J, '6b', '76', 2],
+        [IDS.B, 0, H, '6b', '76', 2],
+        [IDS.B, 0, J, '6b', '76', 2],
+      ],
+      mutations: [
+        [IDS.A, 0, J, J, [2]],
+        [IDS.B, 0, H, J, [1]],
+      ],
+      settlements: [
+        [IDS.A, 0, H, H, 'release', 'membership-lost', null],
+        [IDS.A, 0, J, J, 'release', null, null],
+        [IDS.A, 1, H, H, 'accept', 'membership-lost', null],
+        [IDS.A, 1, J, J, 'release', 'membership-lost', null],
+        [IDS.A, 2, H, J, 'release', 'membership-lost', null],
+        [IDS.B, 0, H, J, 'accept', null, null],
+      ],
+    },
   },
   {
     fault: 'held acknowledgement queue',
@@ -2118,6 +4332,27 @@ const rows = [
       lateEffects: 0,
       replacement: ['B:0@9007199254740993'],
     },
+    observations: {
+      handlers: [
+        [IDS.A, 0, H, '6b', '76', 2],
+        [IDS.A, 1, H, '6b', '76', 2],
+        [IDS.A, 1, J, '6b', '76', 2],
+        [IDS.B, 0, H, '6b', '76', 2],
+        [IDS.B, 0, J, '6b', '76', 2],
+      ],
+      mutations: [
+        [IDS.A, 0, J, J, [2]],
+        [IDS.B, 0, H, J, [1]],
+      ],
+      settlements: [
+        [IDS.A, 0, H, H, 'release', 'membership-lost', null],
+        [IDS.A, 0, J, J, 'release', null, null],
+        [IDS.A, 1, H, H, 'accept', 'membership-lost', null],
+        [IDS.A, 1, J, J, 'release', 'membership-lost', null],
+        [IDS.A, 2, H, J, 'release', 'membership-lost', null],
+        [IDS.B, 0, H, J, 'accept', null, null],
+      ],
+    },
   },
   {
     fault: 'held acknowledgement queue',
@@ -2133,6 +4368,28 @@ const rows = [
       lateEffects: 0,
       replacement: ['B:0@9007199254740993'],
     },
+    observations: {
+      handlers: [
+        [IDS.A, 0, H, '6b', '76', 2],
+        [IDS.A, 1, H, '6b', '76', 2],
+        [IDS.B, 0, H, '6b', '76', 2],
+        [IDS.B, 0, J, '6b', '76', 2],
+      ],
+      mutations: [
+        [IDS.A, 0, J, J, [2]],
+        [IDS.A, 1, H, J, [1, 2]],
+        [IDS.A, 2, H, J, [2]],
+        [IDS.B, 0, H, J, [1]],
+      ],
+      settlements: [
+        [IDS.A, 0, H, H, 'release', 'membership-lost', null],
+        [IDS.A, 0, J, J, 'release', null, null],
+        [IDS.A, 1, H, H, 'accept', null, null],
+        [IDS.A, 1, J, J, 'release', null, null],
+        [IDS.A, 2, H, J, 'release', null, null],
+        [IDS.B, 0, H, J, 'accept', null, null],
+      ],
+    },
   },
   {
     fault: 'held acknowledgement queue',
@@ -2147,6 +4404,28 @@ const rows = [
       finals: 1,
       lateEffects: 0,
       replacement: ['B:0@9007199254740993'],
+    },
+    observations: {
+      handlers: [
+        [IDS.A, 0, H, '6b', '76', 2],
+        [IDS.A, 1, H, '6b', '76', 2],
+        [IDS.B, 0, H, '6b', '76', 2],
+        [IDS.B, 0, J, '6b', '76', 2],
+      ],
+      mutations: [
+        [IDS.A, 0, J, J, [2]],
+        [IDS.A, 1, H, J, [1, 2]],
+        [IDS.A, 2, H, J, [2]],
+        [IDS.B, 0, H, J, [1]],
+      ],
+      settlements: [
+        [IDS.A, 0, H, H, 'release', 'membership-lost', null],
+        [IDS.A, 0, J, J, 'release', null, null],
+        [IDS.A, 1, H, H, 'accept', null, null],
+        [IDS.A, 1, J, J, 'release', null, null],
+        [IDS.A, 2, H, J, 'release', null, null],
+        [IDS.B, 0, H, J, 'accept', null, null],
+      ],
     },
   },
   {
@@ -2163,6 +4442,26 @@ const rows = [
       lateEffects: 0,
       replacement: ['B:0@9007199254740993'],
     },
+    observations: {
+      handlers: [
+        [IDS.A, 0, H, '6b', '76', 2],
+        [IDS.A, 1, H, '6b', '76', 2],
+        [IDS.B, 0, H, '6b', '76', 2],
+        [IDS.B, 0, J, '6b', '76', 2],
+      ],
+      mutations: [
+        [IDS.A, 0, J, J, [2]],
+        [IDS.B, 0, H, J, [1]],
+      ],
+      settlements: [
+        [IDS.A, 0, H, H, 'release', 'membership-lost', null],
+        [IDS.A, 0, J, J, 'release', null, null],
+        [IDS.A, 1, H, H, 'accept', 'not-sent', null],
+        [IDS.A, 1, J, J, 'release', 'not-sent', null],
+        [IDS.A, 2, H, J, 'release', 'not-sent', null],
+        [IDS.B, 0, H, J, 'accept', null, null],
+      ],
+    },
   },
   {
     fault: 'held acknowledgement queue',
@@ -2177,6 +4476,26 @@ const rows = [
       finals: 0,
       lateEffects: 0,
       replacement: ['B:0@9007199254740993'],
+    },
+    observations: {
+      handlers: [
+        [IDS.A, 0, H, '6b', '76', 2],
+        [IDS.A, 1, H, '6b', '76', 2],
+        [IDS.B, 0, H, '6b', '76', 2],
+        [IDS.B, 0, J, '6b', '76', 2],
+      ],
+      mutations: [
+        [IDS.A, 0, J, J, [2]],
+        [IDS.B, 0, H, J, [1]],
+      ],
+      settlements: [
+        [IDS.A, 0, H, H, 'release', 'membership-lost', null],
+        [IDS.A, 0, J, J, 'release', null, null],
+        [IDS.A, 1, H, H, 'accept', 'not-sent', null],
+        [IDS.A, 1, J, J, 'release', 'not-sent', null],
+        [IDS.A, 2, H, J, 'release', 'not-sent', null],
+        [IDS.B, 0, H, J, 'accept', null, null],
+      ],
     },
   },
   {
@@ -2193,6 +4512,26 @@ const rows = [
       lateEffects: 0,
       replacement: ['B:0@9007199254740993'],
     },
+    observations: {
+      handlers: [
+        [IDS.A, 0, H, '6b', '76', 2],
+        [IDS.A, 1, H, '6b', '76', 2],
+        [IDS.B, 0, H, '6b', '76', 2],
+        [IDS.B, 0, J, '6b', '76', 2],
+      ],
+      mutations: [
+        [IDS.A, 0, J, J, [2]],
+        [IDS.B, 0, H, J, [1]],
+      ],
+      settlements: [
+        [IDS.A, 0, H, H, 'release', 'membership-lost', null],
+        [IDS.A, 0, J, J, 'release', null, null],
+        [IDS.A, 1, H, H, 'accept', 'not-sent', null],
+        [IDS.A, 1, J, J, 'release', 'not-sent', null],
+        [IDS.A, 2, H, J, 'release', 'not-sent', null],
+        [IDS.B, 0, H, J, 'accept', null, null],
+      ],
+    },
   },
   {
     fault: 'held acknowledgement queue',
@@ -2207,6 +4546,25 @@ const rows = [
       finals: 0,
       lateEffects: 0,
       replacement: ['B:0@9007199254740993'],
+    },
+    observations: {
+      handlers: [
+        [IDS.A, 0, H, '6b', '76', 2],
+        [IDS.A, 1, H, '6b', '76', 2],
+        [IDS.B, 0, H, '6b', '76', 2],
+        [IDS.B, 0, J, '6b', '76', 2],
+      ],
+      mutations: [
+        [IDS.A, 0, H, J, [2]],
+        [IDS.B, 0, H, J, [1]],
+      ],
+      settlements: [
+        [IDS.A, 0, H, J, 'release', null, null],
+        [IDS.A, 1, H, H, 'accept', 'not-sent', null],
+        [IDS.A, 1, J, J, 'release', 'not-sent', null],
+        [IDS.A, 2, H, J, 'release', 'not-sent', null],
+        [IDS.B, 0, H, J, 'accept', null, null],
+      ],
     },
   },
   {
@@ -2223,6 +4581,28 @@ const rows = [
       lateEffects: 0,
       replacement: ['B:0@9007199254740993'],
     },
+    observations: {
+      handlers: [
+        [IDS.A, 0, H, '6b', '76', 2],
+        [IDS.A, 1, H, '6b', '76', 2],
+        [IDS.A, 1, J, '6b', '76', 2],
+        [IDS.B, 0, H, '6b', '76', 2],
+        [IDS.B, 0, J, '6b', '76', 2],
+      ],
+      mutations: [
+        [IDS.A, 0, J, J, [2]],
+        [IDS.A, 1, H, H, [1]],
+        [IDS.B, 0, H, J, [1]],
+      ],
+      settlements: [
+        [IDS.A, 0, H, H, 'release', 'membership-lost', null],
+        [IDS.A, 0, J, J, 'release', null, null],
+        [IDS.A, 1, H, H, 'accept', 'membership-lost', null],
+        [IDS.A, 1, J, J, 'release', 'membership-lost', null],
+        [IDS.A, 2, H, J, 'release', 'membership-lost', null],
+        [IDS.B, 0, H, J, 'accept', null, null],
+      ],
+    },
   },
   {
     fault: 'held acknowledgement response',
@@ -2238,6 +4618,28 @@ const rows = [
       lateEffects: 0,
       replacement: ['B:0@9007199254740993'],
     },
+    observations: {
+      handlers: [
+        [IDS.A, 0, H, '6b', '76', 2],
+        [IDS.A, 1, H, '6b', '76', 2],
+        [IDS.A, 1, J, '6b', '76', 2],
+        [IDS.B, 0, H, '6b', '76', 2],
+        [IDS.B, 0, J, '6b', '76', 2],
+      ],
+      mutations: [
+        [IDS.A, 0, J, J, [2]],
+        [IDS.A, 1, H, H, [1]],
+        [IDS.B, 0, H, J, [1]],
+      ],
+      settlements: [
+        [IDS.A, 0, H, H, 'release', 'membership-lost', null],
+        [IDS.A, 0, J, J, 'release', null, null],
+        [IDS.A, 1, H, H, 'accept', 'membership-lost', null],
+        [IDS.A, 1, J, J, 'release', 'membership-lost', null],
+        [IDS.A, 2, H, J, 'release', 'membership-lost', null],
+        [IDS.B, 0, H, J, 'accept', null, null],
+      ],
+    },
   },
   {
     fault: 'held acknowledgement response',
@@ -2253,6 +4655,28 @@ const rows = [
       lateEffects: 0,
       replacement: ['B:0@9007199254740993'],
     },
+    observations: {
+      handlers: [
+        [IDS.A, 0, H, '6b', '76', 2],
+        [IDS.A, 1, H, '6b', '76', 2],
+        [IDS.B, 0, H, '6b', '76', 2],
+        [IDS.B, 0, J, '6b', '76', 2],
+      ],
+      mutations: [
+        [IDS.A, 0, J, J, [2]],
+        [IDS.A, 1, H, J, [1, 2]],
+        [IDS.A, 2, H, J, [2]],
+        [IDS.B, 0, H, J, [1]],
+      ],
+      settlements: [
+        [IDS.A, 0, H, H, 'release', 'membership-lost', null],
+        [IDS.A, 0, J, J, 'release', null, null],
+        [IDS.A, 1, H, H, 'accept', null, null],
+        [IDS.A, 1, J, J, 'release', null, null],
+        [IDS.A, 2, H, J, 'release', null, null],
+        [IDS.B, 0, H, J, 'accept', null, null],
+      ],
+    },
   },
   {
     fault: 'held acknowledgement response',
@@ -2267,6 +4691,28 @@ const rows = [
       finals: 1,
       lateEffects: 0,
       replacement: ['B:0@9007199254740993'],
+    },
+    observations: {
+      handlers: [
+        [IDS.A, 0, H, '6b', '76', 2],
+        [IDS.A, 1, H, '6b', '76', 2],
+        [IDS.B, 0, H, '6b', '76', 2],
+        [IDS.B, 0, J, '6b', '76', 2],
+      ],
+      mutations: [
+        [IDS.A, 0, J, J, [2]],
+        [IDS.A, 1, H, J, [1, 2]],
+        [IDS.A, 2, H, J, [2]],
+        [IDS.B, 0, H, J, [1]],
+      ],
+      settlements: [
+        [IDS.A, 0, H, H, 'release', 'membership-lost', null],
+        [IDS.A, 0, J, J, 'release', null, null],
+        [IDS.A, 1, H, H, 'accept', null, null],
+        [IDS.A, 1, J, J, 'release', null, null],
+        [IDS.A, 2, H, J, 'release', null, null],
+        [IDS.B, 0, H, J, 'accept', null, null],
+      ],
     },
   },
   {
@@ -2283,6 +4729,28 @@ const rows = [
       lateEffects: 0,
       replacement: ['B:0@9007199254740993'],
     },
+    observations: {
+      handlers: [
+        [IDS.A, 0, H, '6b', '76', 2],
+        [IDS.A, 1, H, '6b', '76', 2],
+        [IDS.B, 0, H, '6b', '76', 2],
+        [IDS.B, 0, J, '6b', '76', 2],
+      ],
+      mutations: [
+        [IDS.A, 0, J, J, [2]],
+        [IDS.A, 1, H, J, [1, 2]],
+        [IDS.A, 2, H, J, [2]],
+        [IDS.B, 0, H, J, [1]],
+      ],
+      settlements: [
+        [IDS.A, 0, H, H, 'release', 'membership-lost', null],
+        [IDS.A, 0, J, J, 'release', null, null],
+        [IDS.A, 1, H, H, 'accept', 'session-lost', null],
+        [IDS.A, 1, J, J, 'release', 'session-lost', null],
+        [IDS.A, 2, H, J, 'release', 'session-lost', null],
+        [IDS.B, 0, H, J, 'accept', null, null],
+      ],
+    },
   },
   {
     fault: 'held acknowledgement response',
@@ -2297,6 +4765,28 @@ const rows = [
       finals: 0,
       lateEffects: 0,
       replacement: ['B:0@9007199254740993'],
+    },
+    observations: {
+      handlers: [
+        [IDS.A, 0, H, '6b', '76', 2],
+        [IDS.A, 1, H, '6b', '76', 2],
+        [IDS.B, 0, H, '6b', '76', 2],
+        [IDS.B, 0, J, '6b', '76', 2],
+      ],
+      mutations: [
+        [IDS.A, 0, J, J, [2]],
+        [IDS.A, 1, H, J, [1, 2]],
+        [IDS.A, 2, H, J, [2]],
+        [IDS.B, 0, H, J, [1]],
+      ],
+      settlements: [
+        [IDS.A, 0, H, H, 'release', 'membership-lost', null],
+        [IDS.A, 0, J, J, 'release', null, null],
+        [IDS.A, 1, H, H, 'accept', 'session-lost', null],
+        [IDS.A, 1, J, J, 'release', 'session-lost', null],
+        [IDS.A, 2, H, J, 'release', 'session-lost', null],
+        [IDS.B, 0, H, J, 'accept', null, null],
+      ],
     },
   },
   {
@@ -2313,6 +4803,28 @@ const rows = [
       lateEffects: 0,
       replacement: ['B:0@9007199254740993'],
     },
+    observations: {
+      handlers: [
+        [IDS.A, 0, H, '6b', '76', 2],
+        [IDS.A, 1, H, '6b', '76', 2],
+        [IDS.B, 0, H, '6b', '76', 2],
+        [IDS.B, 0, J, '6b', '76', 2],
+      ],
+      mutations: [
+        [IDS.A, 0, J, J, [2]],
+        [IDS.A, 1, H, J, [1, 2]],
+        [IDS.A, 2, H, J, [2]],
+        [IDS.B, 0, H, J, [1]],
+      ],
+      settlements: [
+        [IDS.A, 0, H, H, 'release', 'membership-lost', null],
+        [IDS.A, 0, J, J, 'release', null, null],
+        [IDS.A, 1, H, H, 'accept', 'session-lost', null],
+        [IDS.A, 1, J, J, 'release', 'session-lost', null],
+        [IDS.A, 2, H, J, 'release', 'session-lost', null],
+        [IDS.B, 0, H, J, 'accept', null, null],
+      ],
+    },
   },
   {
     fault: 'held acknowledgement response',
@@ -2327,6 +4839,27 @@ const rows = [
       finals: 0,
       lateEffects: 0,
       replacement: ['B:0@9007199254740993'],
+    },
+    observations: {
+      handlers: [
+        [IDS.A, 0, H, '6b', '76', 2],
+        [IDS.A, 1, H, '6b', '76', 2],
+        [IDS.B, 0, H, '6b', '76', 2],
+        [IDS.B, 0, J, '6b', '76', 2],
+      ],
+      mutations: [
+        [IDS.A, 0, H, J, [2]],
+        [IDS.A, 1, H, J, [1, 2]],
+        [IDS.A, 2, H, J, [2]],
+        [IDS.B, 0, H, J, [1]],
+      ],
+      settlements: [
+        [IDS.A, 0, H, J, 'release', null, null],
+        [IDS.A, 1, H, H, 'accept', 'session-lost', null],
+        [IDS.A, 1, J, J, 'release', 'session-lost', null],
+        [IDS.A, 2, H, J, 'release', 'session-lost', null],
+        [IDS.B, 0, H, J, 'accept', null, null],
+      ],
     },
   },
   {
@@ -2343,6 +4876,20 @@ const rows = [
       result: 'rejected-by-broker',
       cause: 121,
     },
+    observations: {
+      handlers: [
+        [IDS.A, 0, H, '6b', '76', 2],
+        [IDS.A, 0, J, '6b', '76', 2],
+      ],
+      mutations: [
+        [IDS.A, 0, H, J, [1]],
+        [IDS.A, 1, H, MILLION_LAST, [2]],
+      ],
+      settlements: [
+        [IDS.A, 0, H, J, 'accept', null, null],
+        [IDS.A, 1, H, MILLION_LAST, 'release', 'rejected-by-broker', 121],
+      ],
+    },
   },
   {
     fault: 'compact million offset success',
@@ -2357,6 +4904,20 @@ const rows = [
       type: 'gap',
       result: 'accepted',
     },
+    observations: {
+      handlers: [
+        [IDS.A, 0, H, '6b', '76', 2],
+        [IDS.A, 0, J, '6b', '76', 2],
+      ],
+      mutations: [
+        [IDS.A, 0, H, J, [1]],
+        [IDS.A, 1, H, MILLION_LAST, [0]],
+      ],
+      settlements: [
+        [IDS.A, 0, H, J, 'accept', null, null],
+        [IDS.A, 1, H, MILLION_LAST, 'gap', null, null],
+      ],
+    },
   },
   {
     fault: 'two flushes settle disjoint terminal subsets',
@@ -2368,6 +4929,28 @@ const rows = [
       first: ['9007199254740993', '9007199254740994'],
       results: ['accept', 'reject'],
       terminalCount: 2,
+    },
+    observations: {
+      handlers: [
+        [IDS.A, 0, H, '6b', '76', 2],
+        [IDS.A, 0, J, '6b', '76', 2],
+        [IDS.A, 1, H, '6b', '76', 2],
+        [IDS.A, 1, J, '6b', '76', 2],
+        [IDS.A, 2, H, '6b', '76', 2],
+        [IDS.A, 2, J, '6b', '76', 2],
+      ],
+      mutations: [
+        [IDS.A, 0, H, J, [1]],
+        [IDS.A, 2, H, J, [1]],
+        [IDS.A, 1, H, H, [1]],
+        [IDS.A, 1, J, J, [3]],
+      ],
+      settlements: [
+        [IDS.A, 0, H, J, 'accept', null, null],
+        [IDS.A, 2, H, J, 'accept', null, null],
+        [IDS.A, 1, H, H, 'accept', null, null],
+        [IDS.A, 1, J, J, 'reject', null, null],
+      ],
     },
   },
   {
@@ -2381,6 +4964,30 @@ const rows = [
       terminal: 1,
       deliveryCount: 2,
     },
+    observations: {
+      handlers: [
+        [IDS.A, 0, H, '6b', '76', 2],
+        [IDS.A, 0, J, '6b', '76', 2],
+        [IDS.A, 1, H, '6b', '76', 2],
+        [IDS.A, 1, J, '6b', '76', 2],
+        [IDS.A, 2, H, '6b', '76', 2],
+        [IDS.A, 2, J, '6b', '76', 2],
+      ],
+      mutations: [
+        [IDS.A, 0, H, J, [1]],
+        [IDS.A, 2, H, J, [1]],
+        [IDS.A, 1, H, H, [4]],
+        [IDS.A, 1, H, H, [4]],
+        [IDS.A, 1, H, J, [1]],
+      ],
+      settlements: [
+        [IDS.A, 0, H, J, 'accept', null, null],
+        [IDS.A, 2, H, J, 'accept', null, null],
+        [IDS.A, 1, H, H, 'renew', null, null],
+        [IDS.A, 1, H, H, 'renew', null, null],
+        [IDS.A, 1, H, J, 'accept', null, null],
+      ],
+    },
   },
   {
     fault: 'unawaited renew blocks terminal prepare',
@@ -2391,6 +4998,28 @@ const rows = [
       rounds: 8,
       order: ['renew answer', 'terminal prepare', 'fetch'],
       unhandled: 0,
+    },
+    observations: {
+      handlers: [
+        [IDS.A, 0, H, '6b', '76', 2],
+        [IDS.A, 0, J, '6b', '76', 2],
+        [IDS.A, 1, H, '6b', '76', 2],
+        [IDS.A, 1, J, '6b', '76', 2],
+        [IDS.A, 2, H, '6b', '76', 2],
+        [IDS.A, 2, J, '6b', '76', 2],
+      ],
+      mutations: [
+        [IDS.A, 0, H, J, [1]],
+        [IDS.A, 2, H, J, [1]],
+        [IDS.A, 1, H, H, [4]],
+        [IDS.A, 1, H, J, [1]],
+      ],
+      settlements: [
+        [IDS.A, 0, H, J, 'accept', null, null],
+        [IDS.A, 2, H, J, 'accept', null, null],
+        [IDS.A, 1, H, H, 'renew', null, null],
+        [IDS.A, 1, H, J, 'accept', null, null],
+      ],
     },
   },
   {
@@ -2404,6 +5033,30 @@ const rows = [
       unchanged: ['9007199254740994'],
       deliveryCount: 2,
     },
+    observations: {
+      handlers: [
+        [IDS.A, 0, H, '6b', '76', 2],
+        [IDS.A, 0, J, '6b', '76', 2],
+        [IDS.A, 1, H, '6b', '76', 2],
+        [IDS.A, 1, J, '6b', '76', 2],
+        [IDS.A, 2, H, '6b', '76', 2],
+        [IDS.A, 2, J, '6b', '76', 2],
+      ],
+      mutations: [
+        [IDS.A, 0, H, J, [1]],
+        [IDS.A, 2, H, J, [1]],
+        [IDS.A, 1, H, H, [4]],
+        [IDS.A, 1, H, H, [4]],
+        [IDS.A, 1, H, J, [1]],
+      ],
+      settlements: [
+        [IDS.A, 0, H, J, 'accept', null, null],
+        [IDS.A, 2, H, J, 'accept', null, null],
+        [IDS.A, 1, H, H, 'renew', null, null],
+        [IDS.A, 1, H, H, 'renew', 'rejected-by-broker', 121],
+        [IDS.A, 1, H, J, 'accept', null, null],
+      ],
+    },
   },
   {
     fault: 'same offsets new acquisition rejects old callback',
@@ -2416,6 +5069,27 @@ const rows = [
       distinct: true,
       replacement: ['A:1@9007199254740993'],
     },
+    observations: {
+      handlers: [
+        [IDS.A, 0, H, '6b', '76', 2],
+        [IDS.A, 0, J, '6b', '76', 2],
+        [IDS.A, 1, H, '6b', '76', 2],
+        [IDS.A, 1, H, '6b', '76', 2],
+        [IDS.A, 1, J, '6b', '76', 2],
+      ],
+      mutations: [
+        [IDS.A, 0, H, J, [1]],
+        [IDS.A, 1, H, H, [4]],
+        [IDS.A, 1, H, J, [1]],
+      ],
+      settlements: [
+        [IDS.A, 0, H, J, 'accept', null, null],
+        [IDS.A, 1, H, H, 'renew', 'session-lost', 122],
+        [IDS.A, 1, H, J, 'release', 'session-lost', 122],
+        [IDS.A, 1, H, J, 'accept', null, null],
+        [IDS.A, 2, H, J, 'release', 'session-lost', 122],
+      ],
+    },
   },
   {
     fault: 'observer reentry cannot settle twice',
@@ -2427,6 +5101,26 @@ const rows = [
       terminal: 1,
       reentry: 'stop',
       listenerFailures: ['sync', 'async'],
+    },
+    observations: {
+      handlers: [
+        [IDS.A, 0, H, '6b', '76', 2],
+        [IDS.A, 1, H, '6b', '76', 2],
+        [IDS.A, 1, J, '6b', '76', 2],
+      ],
+      mutations: [
+        [IDS.A, 0, H, J, [1, 2]],
+        [IDS.A, 1, H, H, [1]],
+        [IDS.A, 1, J, J, [4]],
+        [IDS.A, 1, J, J, [1]],
+      ],
+      settlements: [
+        [IDS.A, 0, H, H, 'accept', null, null],
+        [IDS.A, 0, J, J, 'release', null, null],
+        [IDS.A, 1, H, H, 'accept', null, null],
+        [IDS.A, 1, J, J, 'renew', null, null],
+        [IDS.A, 1, J, J, 'accept', null, null],
+      ],
     },
   },
 ]
@@ -2449,7 +5143,6 @@ const FAULT_SPECS = {
   timeout: { transport: 'timeout' },
 }
 const KINDS = ['flush', 'piggyback', 'close', 'renew']
-const MILLION_LAST = '9007199255740992'
 
 /**
  * Drives one literal acknowledgement row through the public share consumer over the scripted
@@ -2470,7 +5163,8 @@ class AcknowledgementFaultCase extends DataFaultCase {
     this.spec = base
     this.family = { guard: 'guard', compact: 'compact' }[row.expected.action] ?? 'kind'
     if (row.fault === 'successful ack failed fetch') this.spec = { partition: 6 }
-    else if (row.fault === 'failed ack successful fetch') this.spec = { ack: 121, partition: 0 }
+    else if (row.fault === 'failed ack successful fetch')
+      this.spec = { ack: 121, partition: 0, sibling: true }
     else if (
       this.kind === 'piggyback' &&
       base?.partition !== undefined &&
@@ -2522,7 +5216,7 @@ class AcknowledgementFaultCase extends DataFaultCase {
       api: 'ShareGroupHeartbeat',
       match: ({ fields }) => fields.memberEpoch > 0,
     })
-    await this.pump(50)
+    await this.advanceUntil(() => gate.call !== null, 'the steady heartbeat')
     await this.arrival(gate)
     await flush()
     return gate
@@ -2576,7 +5270,12 @@ class AcknowledgementFaultCase extends DataFaultCase {
    * @returns {Promise<void>}
    */
   async reachPiggyback(startOptions) {
-    await this.begin({ hold: [A0_H, A1_H], expectCalls: 2, startOptions })
+    await this.begin({
+      hold: [A0_H, A1_H],
+      expectCalls: 2,
+      startOptions,
+      supply: this.spec.sibling ? ['A:0', 'A:1'] : ['A:0', 'A:1', 'A:2'],
+    })
     this.gate = this.holdFrame(
       78,
       ({ node, fields }) =>
@@ -2642,12 +5341,21 @@ class AcknowledgementFaultCase extends DataFaultCase {
           : codesOf(this.seen.crashes[0].error).includes(expected.cause)
       )
     }
-    if (this.kind === 'close') await until(() => this.closing.settled, 'the disconnect')
+    if (this.kind === 'close') await this.advanceUntil(() => this.closing.settled, 'the disconnect')
     if (this.kind === 'renew') {
-      await until(() => this.renewal.settled, 'the renewal outcome')
+      await this.advanceUntil(() => this.renewal.settled, 'the renewal outcome')
       assert(this.renewal.error, 'the faulted renewal rejects')
       assert.equal(this.renewal.error.reason, expected.result)
-      assert.equal(this.terminalFor(1, H).length, 0, 'a renewal settles nothing terminally')
+      const retired = expected.reset || fatal
+      const terminal = this.terminalFor(1, H)
+      assert.equal(terminal.length, Number(retired), 'only retirement settles terminal work')
+      if (retired) {
+        assert.equal(terminal[0].type, 'release')
+        assert.equal(terminal[0].error.reason, expected.reset ? 'session-lost' : 'membership-lost')
+      }
+      assert.equal(this.renewal.error, this.resultsOf(1).find((ack) => ack.type === 'renew').error)
+      if (typeof expected.cause === 'number')
+        assert(codesOf(this.renewal.error).includes(expected.cause), 'original renewal cause')
     } else if (this.row.fault !== 'omitted partition' && this.row.fault !== 'duplicate partition') {
       await until(() => this.terminalFor(1, H).length >= 1, 'the terminal result of A1/H')
       this.assertResult(1, H, expected.result, expected.cause)
@@ -2657,7 +5365,7 @@ class AcknowledgementFaultCase extends DataFaultCase {
     }
     if (expected.reset) {
       assert.equal(this.seen.resets.length, this.resetsBefore + 1, 'one session reset')
-    } else if (!fatal && this.kind !== 'close') {
+    } else if (!fatal && this.kind !== 'close' && this.row.expected.fetchCode !== 6) {
       assert.equal(this.seen.resets.length, this.resetsBefore, 'no session reset')
     }
     if (this.kind === 'close') {
@@ -2670,6 +5378,19 @@ class AcknowledgementFaultCase extends DataFaultCase {
     const held = this.callOf(A0_H)
     if (fatal || this.kind === 'close') assert.equal(held.isRunning(), false)
     else assert.equal(held.isRunning(), true)
+    if (expected.fetchCode === 6)
+      assert.equal(
+        this.seen.resets.length,
+        this.resetsBefore + 1,
+        'the fetch retires its partition'
+      )
+    if (this.spec.sibling) {
+      await this.advanceUntil(() => this.acceptedBoth(2), 'the new sibling acquisition settles')
+      assert.deepEqual(
+        this.calls.filter(({ partition }) => partition === 2).map(({ offset }) => offset),
+        [H, J]
+      )
+    }
     this.assertNoResends()
     if (this.revoke) await this.verifyRevoked()
   }
@@ -2698,12 +5419,36 @@ class AcknowledgementFaultCase extends DataFaultCase {
     )
     this.releaseAll()
     await this.advanceUntil(
-      () => this.resultsOf(2).some((ack) => ack.type === expected.revokedType),
-      'the revoked records settle'
+      () => [H, J].every((offset) => covers(this.resultsOf(2), offset)),
+      'both revoked records settle'
     )
-    const [outcome] = this.resultsOf(2).filter((ack) => ack.type === expected.revokedType)
-    if (expected.revokedResult === 'accepted') assert.equal(outcome.error, null)
-    else if (outcome.error) assert.equal(outcome.error.reason, expected.revokedResult)
+    const outcomes = this.resultsOf(2).filter(({ type }) => type !== 'renew')
+    for (const offset of [H, J]) {
+      const selected = outcomes.filter((outcome) => covers([outcome], offset))
+      assert.equal(selected.length, 1, `exactly one revoked result for ${offset}`)
+      assert.equal(selected[0].type, expected.revokedType)
+      if (expected.revokedResult === 'accepted') assert.equal(selected[0].error, null)
+      else {
+        assert(selected[0].error, 'a revoked failure must include its error')
+        assert.equal(selected[0].error.reason, expected.revokedResult)
+        if (typeof expected.cause === 'number')
+          assert(codesOf(selected[0].error).includes(expected.cause), 'original revoked cause')
+      }
+    }
+    const mutations = this.frames(78, 79).flatMap(({ fields }) =>
+      (fields.topics || []).flatMap(({ topicId, partitions }) =>
+        partitions
+          .filter(({ partitionIndex }) => topicId === IDS.A && partitionIndex === 2)
+          .flatMap(({ acknowledgementBatches }) => acknowledgementBatches)
+      )
+    )
+    assert.deepEqual(
+      mutations,
+      expected.revokedWire === 'none'
+        ? []
+        : [{ firstOffset: H, lastOffset: J, acknowledgeTypes: [2] }],
+      'the exact permitted revoked transmission set'
+    )
   }
 
   /** @returns {Promise<void>} Kind rows: current work or a new run still works. */
@@ -2731,7 +5476,11 @@ class AcknowledgementFaultCase extends DataFaultCase {
     const startOptions = { requestTimeout: 1000, enforce: this.enforce }
     if (this.captured) {
       await this.start({ retry: RETRY_250, ...startOptions })
-      this.onStart = (call) => (call.identity === A1_H ? call.acknowledge('accept') : undefined)
+      this.onStart = (call) => {
+        if (call.identity === A1_H) call.acknowledge('accept')
+        if (call.identity === A0_H && this.row.step === 'captured expired' && !this.enforce)
+          call.acknowledge('release')
+      }
       this.supplyOnce('A:0', 'A:1', 'A:2')
       this.hold(A0_H)
       this.hold(A1_H)
@@ -2739,8 +5488,15 @@ class AcknowledgementFaultCase extends DataFaultCase {
       await until(() => this.calls.length >= 2, 'the held handlers')
       this.framesBefore = this.countFrames()
       this.pending = this.boundaryHold(this.boundary, 79, -1)
-      this.closing = track(this.h.consumer.disconnect({ timeout: 400 }))
-      await this.pump(300)
+      this.capOnly = this.row.step === 'captured expired' && !this.enforce
+      this.closing = track(
+        this.capOnly ? this.h.consumer.stop() : this.h.consumer.disconnect({ timeout: 400 })
+      )
+      await this.pump(this.capOnly ? 250 : 300)
+      if (this.capOnly) {
+        this.release(A0_H)
+        this.release(A1_H)
+      }
     } else {
       this.lockMs = 400
       await this.begin({ hold: [A0_H, A1_H, A1_J], expectCalls: 2, startOptions })
@@ -2793,9 +5549,15 @@ class AcknowledgementFaultCase extends DataFaultCase {
         protocolRequest,
         ...rest
       ) {
-        if (protocolRequest?.request?.apiKey !== apiKey || !isNode1(this) || !take())
+        if (protocolRequest?.request?.apiKey !== apiKey || !isNode1(this) || taken)
           return original.call(this, protocolRequest, ...rest)
-        return gate.promise.then(() => original.call(this, protocolRequest, ...rest))
+        taken = true
+        const pending = original.call(this, protocolRequest, ...rest)
+        return pending.then(async (connection) => {
+          reached = true
+          await gate.promise
+          return connection
+        })
       })
     } else if (boundary === 'encode') {
       const original = requests.ShareAcknowledge.protocol
@@ -2805,34 +5567,39 @@ class AcknowledgementFaultCase extends DataFaultCase {
           const built = factory(options)
           const matches =
             epoch === -1 ? options?.shareSessionEpoch === -1 : options?.shareSessionEpoch > 0
-          if (!matches || taken) return built
+          const selected = options.topics?.some((topic) =>
+            topic.partitions.some(({ partitionIndex }) => partitionIndex === 1)
+          )
+          if (!matches || !selected || taken) return built
           const { encode } = built.request
           return {
             ...built,
             request: {
               ...built.request,
               encode: async () => {
+                const encoded = await encode.call(built.request)
                 take()
                 await gate.promise
-                return encode()
+                return encoded
               },
             },
           }
         }
       })
     } else {
-      const original = RequestQueue.prototype.push
-      jest.spyOn(RequestQueue.prototype, 'push').mockImplementation(function (pushed) {
-        if (pushed.entry.apiKey !== apiKey || !take()) return original.call(this, pushed)
-        gate.promise.then(() => {
-          try {
-            original.call(this, pushed)
-          } catch (error) {
-            pushed.entry.reject(error)
-          }
+      const owner = this
+      const original = RequestQueue.prototype.sendSocketRequest
+      jest
+        .spyOn(RequestQueue.prototype, 'sendSocketRequest')
+        .mockImplementation(function (request) {
+          if (request.entry.apiKey !== apiKey || this.broker !== 'node1:9092' || !take())
+            return original.call(this, request)
+          owner.observe(
+            gate.promise.then(() => original.call(this, request)),
+            'queue transmission'
+          )
+          return undefined
         })
-        return undefined
-      })
     }
     this.heldGates.push({ identity: `boundary:${boundary}`, gate })
     return { reached: () => reached, release: () => gate.resolve() }
@@ -2842,6 +5609,10 @@ class AcknowledgementFaultCase extends DataFaultCase {
   async inject_guard() {
     const { step } = this.row
     if (!this.captured) {
+      this.rejoin = this.holdWire({
+        api: 'ShareGroupHeartbeat',
+        match: ({ fields }) => fields.memberEpoch === 0,
+      })
       this.fenced = true
       const gate = await this.holdBeatSteady()
       gate.release({ errorCode: 110 })
@@ -2851,27 +5622,51 @@ class AcknowledgementFaultCase extends DataFaultCase {
     if (step === 'captured revoked') {
       this.observe(this.h.consumer.disconnect({ timeout: 0 }), 'disconnect')
       await flush()
-    } else if (step === 'captured expired') await this.pump(2000)
+    } else if (step === 'captured expired') {
+      const episode = [...this.observer.runs].at(-1).closing
+      const deadline = Math.min(episode.deadlineAt, episode.finalDeadline)
+      assert.equal(deadline - episode.now(), this.capOnly ? 1000 : 100, 'the remaining D/F budget')
+      const now = episode.now()
+      jest.setSystemTime(Date.now() + deadline - now)
+      const originalNow = performance.now.bind(performance)
+      jest.spyOn(performance, 'now').mockImplementation(() => originalNow() + deadline - now)
+      assert.equal(episode.now(), deadline, 'deadline equality without timer delivery')
+      assert.equal(episode.revoked, false, 'the deadline wake has not run')
+    }
   }
 
   /** @returns {Promise<void>} Guard rows: writes, finals, acceptance and no late effect. */
   async verify_guard() {
     const { expected } = this.row
-    assert.equal(
-      this.steadyAtHold - this.framesBefore,
-      expected.writes,
-      'frames written at the hold'
-    )
+    const historical = this.boundary === 'response' ? 1 : 0
+    assert.equal(this.steadyAtHold - this.framesBefore, historical, 'historical frames at the hold')
+    assert.equal(this.rawAckWrites(), this.countFrames(), 'original socket writes at the hold')
     const results = this.seen.acks.length
     this.pending.release()
-    await flush()
-    await flush()
+    if (this.captured) await until(() => this.closing.settled, 'the captured close settles')
+    else await flush()
+    assert.equal(this.countFrames() - this.framesBefore, expected.writes, 'permitted total writes')
+    assert.equal(this.rawAckWrites(), this.countFrames(), 'original socket writes after release')
     const finals = this.finals().filter(({ node }) => node === 1).length
-    assert.equal(finals, expected.finals, 'final frames of node 1')
+    const historicalFinals = this.captured ? historical : 0
+    assert.equal(
+      finals - historicalFinals,
+      this.row.step === 'captured current' ? 1 - historicalFinals : expected.finals,
+      'additional final frames'
+    )
     const accepted = this.terminalFor(1, H).some((ack) => !ack.error)
     assert.equal(accepted, expected.accepted, 'the held request is accepted only when current')
     if (!this.captured) assert.equal(this.seen.acks.length, results, 'no late effect')
     assert.equal(this.seen.crashes.length, 0)
+  }
+
+  /** @returns {number} API 79 writes on original node-1 sockets, including destroyed sockets. */
+  rawAckWrites() {
+    return this.cluster
+      .sockets()
+      .filter(({ endpoint }) => endpoint.host === 'node1')
+      .flatMap(({ writes }) => writes)
+      .filter((frame) => readRequestHeader(frame).apiKey === 79).length
   }
 
   /** @returns {Promise<void>} Guard rows: the replacement membership delivers B0/H. */
@@ -2883,7 +5678,8 @@ class AcknowledgementFaultCase extends DataFaultCase {
       this.releaseAll()
       await this.run()
     } else {
-      const gate = await this.holdBeatSteady()
+      await this.advanceUntil(() => this.rejoin.call !== null, 'the replacement join')
+      const gate = this.rejoin
       gate.release({
         errorCode: 0,
         errorMessage: null,
@@ -2900,6 +5696,30 @@ class AcknowledgementFaultCase extends DataFaultCase {
     await flush()
     assert.equal(this.calls.filter((call) => call.identity === identity).length, 1)
     this.releaseAll()
+    await this.advanceUntil(
+      () =>
+        [H, J].every((offset) =>
+          this.observer.published.some(
+            ({ cohort, event }) =>
+              cohort.topicId === IDS.B && !event.error && covers([event], offset)
+          )
+        ),
+      'both replacement records are accepted'
+    )
+    if (!this.captured) {
+      const finals = this.finals().filter(({ node }) => node === 1).length
+      const before = this.finals().length
+      const pending = track(this.h.consumer.stop())
+      this.releaseAll()
+      await this.advanceUntil(() => pending.settled, 'the current replacement final')
+      assert.deepEqual(
+        this.finals()
+          .slice(before)
+          .map(({ node }) => node),
+        [0]
+      )
+      assert.equal(this.finals().filter(({ node }) => node === 1).length, finals)
+    }
   }
 
   /** @returns {Promise<void>} Compact rows: each has its own scenario. */
@@ -2925,8 +5745,80 @@ class AcknowledgementFaultCase extends DataFaultCase {
     await flush()
   }
 
+  /**
+   * Reads a held offset's exact deadline through its original ledger's eligibility query.
+   * @param {object} ledger Original acquisition ledger.
+   * @param {string} offset Exact held offset.
+   * @returns {number} The first ineligible monotonic millisecond, checked on both sides.
+   * @throws {AssertionError} If the deadline is outside the declared fixture bounds.
+   */
+  heldDeadline(ledger, offset) {
+    let before = 0
+    let after = 100000
+    assert.equal(ledger.canStart(offset, before), true)
+    assert.equal(ledger.canStart(offset, after), false)
+    while (after - before > 1) {
+      const middle = Math.floor((before + after) / 2)
+      if (ledger.canStart(offset, middle)) before = middle
+      else after = middle
+    }
+    assert.equal(ledger.canStart(offset, after - 1), true)
+    assert.equal(ledger.canStart(offset, after), false)
+    return after
+  }
+
+  /**
+   * Compares the row's complete literal multisets after cleanup; duplicate entries remain visible.
+   * Cross-node scheduling does not impose a global handler or settlement order.
+   * @param {{handlers: Array[], mutations: Array[], settlements: Array[]}} expected Literal tuples.
+   * @returns {void}
+   * @throws {AssertionError} For any missing, extra or changed handler, mutation or settlement.
+   */
+  assertObservations(expected) {
+    const handlers = this.calls.map(
+      ({ topicId, partition, offset, keyBytes, valueBytes, deliveryCount }) => [
+        topicId,
+        partition,
+        offset,
+        keyBytes,
+        valueBytes,
+        deliveryCount,
+      ]
+    )
+    const mutations = this.frames(78, 79).flatMap(({ fields }) =>
+      (fields.topics || []).flatMap(({ topicId, partitions }) =>
+        partitions.flatMap(({ partitionIndex, acknowledgementBatches }) =>
+          acknowledgementBatches.map(({ firstOffset, lastOffset, acknowledgeTypes }) => [
+            topicId,
+            partitionIndex,
+            firstOffset,
+            lastOffset,
+            acknowledgeTypes,
+          ])
+        )
+      )
+    )
+    const settlements = this.observer.published.map(({ cohort, event }) => [
+      cohort.topicId,
+      cohort.partition,
+      event.firstOffset,
+      event.lastOffset,
+      event.type,
+      event.error?.reason ?? null,
+      event.error?.cause?.code ?? null,
+    ])
+    const canonical = (entries) => entries.map((entry) => JSON.stringify(entry)).sort()
+    for (const [key, actual] of Object.entries({ handlers, mutations, settlements }))
+      assert.deepEqual(canonical(actual), canonical(expected[key]), `complete literal ${key}`)
+  }
+
   /** @returns {Promise<void>} Replays frames, handlers and results through the audit. */
   async assertInvariants() {
+    this.releaseAll()
+    await this.advanceUntil(
+      () => [...this.observer.ledgers.keys()].every((ledger) => ledger.size === 0),
+      'the complete acquisition outcomes'
+    )
     this.replay()
     if (this.auditFailures.length) throw this.auditFailures[0]
     assert.deepEqual(this.unhandled, [])
@@ -2938,7 +5830,7 @@ class AcknowledgementFaultCase extends DataFaultCase {
  * @returns {object} A ShareFetch partition answer acquiring a million offsets with no records.
  */
 const millionPart = (corrupt) => {
-  const records = corrupt ? Buffer.from(recordsHex(H, ['x']), 'hex') : Buffer.alloc(0)
+  const records = corrupt ? Buffer.from(recordsHex(H, []), 'hex') : Buffer.alloc(0)
   if (corrupt) records[records.length - 1] ^= 0xff
   return part({
     topicId: IDS.A,
@@ -2951,13 +5843,18 @@ const millionPart = (corrupt) => {
 /** Compact-result scenarios by row fault, each run with the case as `this`. */
 const COMPACT = {
   'compact million offset error': {
+    /** @returns {Promise<void>} Reaches the scenario through the original public runtime. */
     async reach() {
       await this.start({ retry: RETRY_250 })
-      this.cluster.answer('ShareFetch', (fields, record) =>
-        record.node === 1 && !this.served
-          ? ((this.served = true), fetchAnswer([millionPart(true)]))
-          : this.fetchAnswerFor(fields)
-      )
+      this.cluster.answer('ShareFetch', (fields, record) => {
+        if (record.node === 1 && !this.served) {
+          this.served = true
+          return fetchAnswer([millionPart(true)])
+        }
+        if (record.node === 1 && batchesOf({ fields }).length)
+          return faultAnswer(78, fields, { ack: 121 })
+        return this.fetchAnswerFor(fields)
+      })
       this.cluster.answer('ShareAcknowledge', (fields) =>
         ackAnswer(
           listed(fields).map(({ topicId, partition }) => ({ topicId, partition, code: 121 }))
@@ -2967,6 +5864,7 @@ const COMPACT = {
       this.hold(A0_H)
       await this.join()
     },
+    /** @returns {Promise<void>} Asserts the literal compact outcome and its original identity. */
     async verify() {
       const { expected } = this.row
       await this.advanceUntil(
@@ -2983,6 +5881,7 @@ const COMPACT = {
     },
   },
   'compact million offset success': {
+    /** @returns {Promise<void>} Reaches the scenario through the original public runtime. */
     async reach() {
       await this.start({ retry: RETRY_250 })
       this.cluster.answer('ShareFetch', (fields, record) =>
@@ -2994,6 +5893,7 @@ const COMPACT = {
       this.hold(A0_H)
       await this.join()
     },
+    /** @returns {Promise<void>} Asserts the literal compact outcome and its original identity. */
     async verify() {
       const { expected } = this.row
       await this.advanceUntil(
@@ -3008,6 +5908,7 @@ const COMPACT = {
     },
   },
   'two flushes settle disjoint terminal subsets': {
+    /** @returns {Promise<void>} Reaches the scenario through the original public runtime. */
     async reach() {
       this.lockMs = 400
       this.onStart = (call) => call.acknowledge(call.identity === A1_J ? 'reject' : 'accept')
@@ -3015,6 +5916,7 @@ const COMPACT = {
       await this.pump(250)
       this.release(A1_H)
     },
+    /** @returns {Promise<void>} Asserts the literal compact outcome and its original identity. */
     async verify() {
       await until(() => this.terminalFor(1, H).length >= 1, 'the first flush result')
       await until(() => this.calls.some((call) => call.identity === A1_J), 'the J handler')
@@ -3031,12 +5933,14 @@ const COMPACT = {
     },
   },
   'renew twice then terminal once': {
+    /** @returns {Promise<void>} Reaches the scenario through the original public runtime. */
     async reach() {
       await this.begin({ hold: [A0_H, A1_H], expectCalls: 2 })
       this.call = this.callOf(A1_H)
       await this.call.renew()
       await this.call.renew()
     },
+    /** @returns {Promise<void>} Asserts the literal compact outcome and its original identity. */
     async verify() {
       const { expected } = this.row
       assert.equal(
@@ -3050,27 +5954,38 @@ const COMPACT = {
     },
   },
   'unawaited renew blocks terminal prepare': {
+    /** @returns {Promise<void>} Reaches the scenario through the original public runtime. */
     async reach() {
       await this.begin({ hold: [A0_H, A1_H], expectCalls: 2 })
       this.call = this.callOf(A1_H)
       this.gate = this.holdFrame(79, ({ node, fields }) => node === 1 && fields.isRenewAck === true)
+      this.terminalPrepares = []
+      this.observer.watch(this.call.cohort.ledger, 'prepare', (ledger, [options], next) => {
+        if (!options.renewOffsets) this.terminalPrepares.push(options)
+        return next()
+      })
+      this.terminalBefore = this.frames(78, 79).filter(({ node }) => node === 1).length
       this.renewal = track(this.call.renew())
       await this.arrival(this.gate)
     },
+    /** @returns {Promise<void>} Applies the fixed disturbance to the reached original operation. */
     async inject() {
+      assert.equal(this.renewal.settled, false)
+      assert.deepEqual(this.terminalPrepares, [])
       this.release(A1_H)
       await this.pump(100)
-      this.terminalFrames = () =>
-        this.frames(79, 78).filter(
-          (frame) =>
-            frame.node === 1 &&
-            frame.fields.shareSessionEpoch > 0 &&
-            batchesOf(frame).some((batch) => batch.acknowledgeTypes.some((type) => type !== 4))
-        ).length
-      this.before = this.terminalFrames()
+      assert.equal(this.renewal.settled, false)
+      assert.deepEqual(this.terminalPrepares, [], 'no preparation during the held renewal')
+      assert.equal(
+        this.frames(78, 79).filter(({ node }) => node === 1).length,
+        this.terminalBefore + 1,
+        'only the renewal is written'
+      )
     },
+    /** @returns {Promise<void>} Asserts the literal compact outcome and its original identity. */
     async verify() {
-      assert.equal(this.terminalFrames(), this.before, 'terminal preparation waits for the renewal')
+      assert.equal(this.renewal.settled, false)
+      assert.deepEqual(this.terminalPrepares, [], 'terminal preparation waits for the renewal')
       this.gate.release()
       await until(() => this.renewal.settled, 'the renewal answer')
       await this.advanceUntil(() => this.terminalFor(1, H).length >= 1, 'the terminal result')
@@ -3079,41 +5994,101 @@ const COMPACT = {
     },
   },
   'renew selected deadline only': {
+    /** @returns {Promise<void>} Reaches the scenario through the original public runtime. */
     async reach() {
       await this.begin({ hold: [A0_H, A1_H], expectCalls: 2 })
       this.call = this.callOf(A1_H)
+      const opening = this.observer.writes.find(
+        ({ apiKey, fields }) =>
+          apiKey === 78 && listed(fields).some(({ partition }) => partition === 1)
+      )
+      const cohort = this.call.cohort
+      const loop = [...this.observer.loops.keys()].find((loop) =>
+        [...loop.cohorts.values()].some((rows) => rows.includes(cohort))
+      )
+      assert(opening, 'the original acquisition write')
+      this.deadline = this.heldDeadline(cohort.ledger, H)
+      assert.equal(this.heldDeadline(cohort.ledger, J), this.deadline)
+      this.beforeDecisions = cohort.ledger.size
+      await this.pump(100)
+      this.renewSentAt = loop.now()
       this.gate = this.holdFrame(79, ({ node, fields }) => node === 1 && fields.isRenewAck === true)
       this.renewal = track(this.call.renew())
       await this.arrival(this.gate)
     },
+    /** @returns {Promise<void>} Asserts the literal compact outcome and its original identity. */
     async verify() {
       const { expected } = this.row
+      const ledger = this.call.cohort.ledger
       const batches = batchesOf(this.gate.call)
-      assert.deepEqual(
-        batches.map(({ firstOffset, lastOffset }) => [firstOffset, lastOffset]),
-        [[expected.selected[0], expected.selected[0]]]
+      assert.deepEqual(batches, [
+        {
+          firstOffset: expected.selected[0],
+          lastOffset: expected.selected[0],
+          acknowledgeTypes: [4],
+        },
+      ])
+      assert.equal(this.heldDeadline(ledger, H), this.deadline)
+      assert.equal(this.heldDeadline(ledger, J), this.deadline)
+      this.gate.release(
+        ackAnswer([{ topicId: IDS.A, partition: 1 }], { acquisitionLockTimeoutMs: 20000 })
       )
-      assert.equal(covers(batches, J), false, 'the unselected sibling is not part of the renewal')
-      this.gate.release()
       await until(() => this.renewal.settled, 'the renewal answer')
       assert.equal(this.renewal.error, null)
+      const renewed = this.heldDeadline(ledger, H)
+      assert.equal(renewed, this.renewSentAt + 20000)
+      assert(renewed > this.deadline)
+      assert.equal(this.heldDeadline(ledger, J), this.deadline, 'J deadline is unchanged')
+      assert.equal(ledger.size, this.beforeDecisions)
+      const failed = this.holdFrame(
+        79,
+        ({ node, fields }) => node === 1 && fields.isRenewAck === true
+      )
+      const pending = this.call.renew()
+      this.expectRejection(pending, {
+        name: 'KafkaJSShareAcknowledgementError',
+        message: 'Acknowledgement was not confirmed',
+        reason: 'rejected-by-broker',
+      })
+      const rejection = track(pending)
+      await this.arrival(failed)
+      failed.release(ackAnswer([{ topicId: IDS.A, partition: 1, code: 121 }]))
+      await until(() => rejection.settled, 'the failed renewal')
+      assert.equal(rejection.error.reason, 'rejected-by-broker')
+      assert(codesOf(rejection.error).includes(121))
+      assert.equal(this.heldDeadline(ledger, H), renewed, 'failed renewal keeps H deadline')
+      assert.equal(this.heldDeadline(ledger, J), this.deadline, 'failed renewal keeps J deadline')
+      assert.equal(ledger.size, this.beforeDecisions)
       assert.equal(this.call.deliveryCount, expected.deliveryCount)
     },
   },
   'same offsets new acquisition rejects old callback': {
+    /** @returns {Promise<void>} Reaches the scenario through the original public runtime. */
     async reach() {
       this.supplyOnce('A:1')
       await this.begin({ hold: [A0_H, A1_H], expectCalls: 2 })
       this.old = this.callOf(A1_H)
       this.gate = this.holdFrame(79, ({ node, fields }) => node === 1 && fields.isRenewAck === true)
-      this.renewal = track(this.old.renew())
+      const pending = this.old.renew()
+      this.expectRejection(pending, {
+        name: 'KafkaJSShareAcknowledgementError',
+        message: 'Acknowledgement was not confirmed',
+        reason: 'session-lost',
+      })
+      this.renewal = track(pending)
       await this.arrival(this.gate)
     },
+    /** @returns {Promise<void>} Applies the fixed disturbance to the reached original operation. */
     async inject() {
       this.supplyOnce('A:1')
       this.gate.release(ackAnswer([], { errorCode: 122 }))
+      await until(() => this.renewal.settled, 'the lost renewal')
+      assert.equal(this.renewal.error.reason, 'session-lost')
+      this.release(A1_H)
+      this.hold(A1_H)
       await flush()
     },
+    /** @returns {Promise<void>} Asserts the literal compact outcome and its original identity. */
     async verify() {
       await this.advanceUntil(
         () => this.calls.filter((call) => call.identity === A1_H).length === 2,
@@ -3128,9 +6103,11 @@ const COMPACT = {
     },
   },
   'observer reentry cannot settle twice': {
+    /** @returns {Promise<void>} Reaches the scenario through the original public runtime. */
     async reach() {
       this.lockMs = 400
       this.stops = []
+      this.onStart = (call) => (call.identity === A1_J ? call.renew() : undefined)
       await this.start({ retry: RETRY_250 })
       const { events, on } = this.h.consumer
       this.removers.push(
@@ -3153,6 +6130,7 @@ const COMPACT = {
       await this.pump(250)
       this.release(A1_H)
     },
+    /** @returns {Promise<void>} Asserts the literal compact outcome and its original identity. */
     async verify() {
       await this.advanceUntil(() => this.terminalFor(1, H).length >= 1, 'the terminal result')
       await flush()
@@ -3187,6 +6165,11 @@ describe('share acknowledgement faults', () => {
       } catch (error) {
         failures.push(error)
       }
+    }
+    try {
+      scenario.assertObservations(row.observations)
+    } catch (error) {
+      failures.push(error)
     }
     try {
       scenario.cluster?.assertClean()

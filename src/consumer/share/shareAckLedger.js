@@ -443,7 +443,7 @@ class ShareAckLedger {
   settle(ticket, { token, result = 'ok', present = true, cause, sentAt, lockDuration } = {}) {
     const pending = this.#pending.get(ticket)
     if (!pending) return []
-    if (token !== this.#token) return this.invalidate('session-lost')
+    if (token !== this.#token) return this.invalidate('session-lost', null, cause)
     if (!present) {
       result = 'rejected-by-broker'
       cause = cause || new KafkaJSNonRetriableError('Acknowledgement response omitted a partition')
@@ -476,10 +476,11 @@ class ShareAckLedger {
    * ticket and separate closing predicate to the session. Retirement never authorizes a write.
    * @param {'session-lost'|'membership-lost'|'not-sent'} reason Loss classification.
    * @param {object|null} [preserveTicket=null] Already-prepared terminal ticket owned by closing.
+   * @param {Error} [cause] Original failure retained by every renewal and terminal error.
    * @returns {object[]} Failed compact outcomes once; preserved ticket remains settleable once.
    * @throws {KafkaJSNonRetriableError} For invalid reason or a foreign/nonterminal preserved ticket.
    */
-  invalidate(reason, preserveTicket = null) {
+  invalidate(reason, preserveTicket = null, cause) {
     if (!['session-lost', 'membership-lost', 'not-sent'].includes(reason))
       throw new KafkaJSNonRetriableError('Invalid retirement reason')
     const keep = preserveTicket && this.#pending.get(preserveTicket)
@@ -491,10 +492,11 @@ class ShareAckLedger {
     for (const [ticket, pending] of this.#pending) {
       if (ticket === preserveTicket) continue
       if (pending.isRenewAck)
-        for (const outcome of this.#outcomes(pending.entries, true, reason)) results.push(outcome)
+        for (const outcome of this.#outcomes(pending.entries, true, reason, cause))
+          results.push(outcome)
       this.#pending.delete(ticket)
     }
-    for (const outcome of this.#outcomes(entries, false, reason)) results.push(outcome)
+    for (const outcome of this.#outcomes(entries, false, reason, cause)) results.push(outcome)
     for (const entry of entries) this.#entries.delete(String(entry.first))
     this.#retired = true
     this.#flushEntry = null

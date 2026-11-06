@@ -1,6 +1,7 @@
 const assert = require('node:assert/strict')
 const {
   ackAnswer,
+  acquired,
   deferred,
   fetchAnswer,
   flush,
@@ -8,6 +9,7 @@ const {
   topError,
   until,
 } = require('../../../../testHelpers/shareHarness')
+const javaRecord = require('../../../../testHelpers/wire/expected').shareFetchV2
 const ConnectionPool = require('../../../network/connectionPool')
 const RequestQueue = require('../../../network/requestQueue')
 const { requests } = require('../../../protocol/requests')
@@ -22,7 +24,6 @@ const {
   H,
   J,
   STALE_CALL,
-  advance,
   dataPart,
   codesOf,
   track,
@@ -40,7 +41,7 @@ const batchesOf = ({ fields }) =>
 
 const A0_H = `A:0@${H}`
 const A1_H = `A:1@${H}`
-const NODE_ENDPOINT = { nodeId: 2, host: 'node2', port: 9092, rack: null }
+const NODE_ENDPOINT = { nodeId: 2, host: 'node2', port: 9094, rack: null }
 const RETRY_250 = {
   initialRetryTime: 250,
   maxRetryTime: 250,
@@ -115,11 +116,47 @@ class DataFaultCase extends FaultCase {
   }
 
   /**
-   * @param {object} fields A decoded ShareFetch request.
-   * @returns {object} Records for supplied partitions, with the case's lock duration.
+   * Installs the session-aware broker fixture after the original client setup.
+   * @param {object} options Original start options.
+   * @returns {Promise<void>}
    */
-  fetchAnswerFor(fields) {
-    const answer = super.fetchAnswerFor(fields)
+  async start(options) {
+    await super.start(options)
+    this.cluster.answer('ShareFetch', (fields, record) => this.fetchAnswerFor(fields, record))
+  }
+
+  /**
+   * Serves supplied acquisitions from the broker's independently decoded incremental model.
+   * Omitted request partitions remain in that model until a fetch explicitly forgets them.
+   * @param {object} fields A decoded ShareFetch request.
+   * @param {object} record The independently recorded request on its original socket.
+   * @returns {object} A's H/J or B's H control, with the case's lock duration.
+   */
+  fetchAnswerFor(fields, record) {
+    const model = new Map()
+    for (const frame of this.frames(78, 79)) {
+      if (frame.node !== record.node || frame.generation !== record.generation) continue
+      if ([0, -1].includes(frame.fields.shareSessionEpoch)) model.clear()
+      for (const { topicId, partition } of listed(frame.fields))
+        model.set(`${topicId}:${partition}`, { topicId, partition })
+      for (const topic of frame.fields.forgottenTopicsData || [])
+        for (const partition of topic.partitions) model.delete(`${topic.topicId}:${partition}`)
+      if (frame.correlationId === record.correlationId) break
+    }
+    const topics = new Map()
+    for (const { topicId, partition } of model.values()) {
+      if (!topics.has(topicId)) topics.set(topicId, { topicId, partitions: [] })
+      topics.get(topicId).partitions.push({ partitionIndex: partition })
+    }
+    const answer = super.fetchAnswerFor({ ...fields, topics: [...topics.values()] })
+    for (const topic of answer.responses) {
+      if (topic.topicId !== IDS.B) continue
+      for (const partition of topic.partitions) {
+        if (!partition.acquiredRecords.length) continue
+        partition.acquiredRecords = [acquired(H, H, 2)]
+        partition.records = javaRecord.recordsHex
+      }
+    }
     return { ...answer, acquisitionLockTimeoutMs: this.lockMs }
   }
 
@@ -129,7 +166,8 @@ class DataFaultCase extends FaultCase {
    * @param {string[]} [options.hold] Records whose handlers wait.
    * @param {number} [options.expectCalls] Handler entries to wait for.
    * @param {object} [options.startOptions] Options of {@link FaultCase#start}.
-   * @param {string[]} [options.supply] Partitions that get one acquisition of H and J.
+   * @param {string[]} [options.supply] Partitions supplied with acquisitions of H and J.
+   * @param {object} [options.supplyCounts] Literal acquisition counts overriding the default one.
    * @returns {Promise<void>}
    */
   async begin({
@@ -137,10 +175,12 @@ class DataFaultCase extends FaultCase {
     expectCalls = 5,
     startOptions = {},
     supply = ['A:0', 'A:1', 'A:2'],
+    supplyCounts = {},
   } = {}) {
     await this.start({ retry: RETRY_250, ...startOptions })
     await this.armBeforeJoin?.()
     this.supplyOnce(...supply)
+    for (const [key, count] of Object.entries(supplyCounts)) this.supply.set(key, count)
     for (const identity of hold) this.hold(identity)
     await this.join()
     if (expectCalls) await until(() => this.calls.length >= expectCalls, 'the original handlers')
@@ -176,7 +216,8 @@ class DataFaultCase extends FaultCase {
     await flush()
     if (spec.transport) {
       this.transportGate = gate
-      await this.fireTransport(spec.transport)
+      if (spec.transport === 'timeout') await this.pump(3100)
+      else await this.fireTransport(spec.transport)
     } else gate.release(faultAnswer(call.apiKey, call.fields, { target: this.target, ...spec }))
     await flush()
   }
@@ -218,6 +259,24 @@ class DataFaultCase extends FaultCase {
   }
 
   /**
+   * Finds a schedule gate's copied call in the independently recorded transmission sequence.
+   * @param {object} record The original request or its schedule copy.
+   * @returns {number} Its exact node/socket/correlation index.
+   * @throws {AssertionError} If the request was not written.
+   */
+  wireIndex(record) {
+    const index = this.frames(76, 78, 79).findIndex(
+      (candidate) =>
+        candidate.node === record.node &&
+        candidate.generation === record.generation &&
+        candidate.correlationId === record.correlationId &&
+        candidate.apiKey === record.apiKey
+    )
+    assert(index >= 0, 'original wire record')
+    return index
+  }
+
+  /**
    * @param {number} node A node id.
    * @returns {object[]} The ShareFetch and ShareAcknowledge frames written to the node.
    */
@@ -234,6 +293,893 @@ class DataFaultCase extends FaultCase {
     return this.frameLog(node)[from]
   }
 }
+
+/** Literal complete observation sets; tuple expansion only substitutes fixed fixture notation. */
+const OBSERVATIONS = {
+  accepted: {
+    handlers: [
+      ['A', 0, 'HJ'],
+      ['A', 1, 'HJ'],
+      ['A', 2, 'HJ'],
+    ],
+    mutations: [
+      ['A', 0, 'HJ', [1]],
+      ['A', 1, 'HJ', [1]],
+      ['A', 2, 'HJ', [1]],
+    ],
+    settlements: [
+      ['A', 0, 'HJ', 'accept', null, null],
+      ['A', 1, 'HJ', 'accept', null, null],
+      ['A', 2, 'HJ', 'accept', null, null],
+    ],
+  },
+  empty: { handlers: [], mutations: [], settlements: [] },
+  a0: {
+    handlers: [['A', 0, 'HJ']],
+    mutations: [['A', 0, 'HJ', [1]]],
+    settlements: [['A', 0, 'HJ', 'accept', null, null]],
+  },
+  capacity: {
+    handlers: [
+      ['A', 0, 'HJ'],
+      ['A', 1, 'HJ'],
+    ],
+    mutations: [
+      ['A', 0, 'HJ', [1]],
+      ['A', 1, 'HJ', [1]],
+    ],
+    settlements: [
+      ['A', 0, 'HJ', 'accept', null, null],
+      ['A', 1, 'HJ', 'accept', null, null],
+    ],
+  },
+  final: {
+    handlers: [['A', 0, 'H']],
+    mutations: [['A', 0, 'J', [2]]],
+    settlements: [
+      ['A', 0, 'H', 'release', 'membership-lost', null],
+      ['A', 0, 'J', 'release', null, null],
+    ],
+  },
+  openTerminal: {
+    handlers: [
+      ['A', 0, 'H'],
+      ['A', 0, 'HJ'],
+      ['A', 1, 'HJ'],
+      ['A', 2, 'HJ'],
+    ],
+    mutations: [
+      ['A', 0, 'HJ', [1]],
+      ['A', 1, 'HJ', [1]],
+      ['A', 2, 'HJ', [1]],
+      ['A', 0, 'J', [2]],
+    ],
+    settlements: [
+      ['A', 0, 'HJ', 'accept', null, null],
+      ['A', 1, 'HJ', 'accept', null, null],
+      ['A', 2, 'HJ', 'accept', null, null],
+      ['A', 0, 'H', 'release', 'membership-lost', null],
+      ['A', 0, 'J', 'release', null, null],
+    ],
+  },
+  incrementalAccepted: {
+    handlers: [
+      ['A', 0, 'HJ'],
+      ['A', 1, 'HJ'],
+      ['A', 1, 'HJ'],
+      ['A', 2, 'HJ'],
+    ],
+    mutations: [
+      ['A', 0, 'HJ', [1]],
+      ['A', 1, 'HJ', [1]],
+      ['A', 1, 'HJ', [1]],
+      ['A', 2, 'HJ', [1]],
+    ],
+    settlements: [
+      ['A', 0, 'HJ', 'accept', null, null],
+      ['A', 1, 'HJ', 'accept', null, null],
+      ['A', 2, 'HJ', 'accept', null, null],
+      ['A', 1, 'HJ', 'accept', null, null],
+    ],
+  },
+  incrementalLost: {
+    handlers: [
+      ['A', 0, 'HJ'],
+      ['A', 1, 'HJ'],
+      ['A', 1, 'HJ'],
+      ['A', 2, 'HJ'],
+    ],
+    mutations: [
+      ['A', 0, 'HJ', [1]],
+      ['A', 1, 'HJ', [1]],
+      ['A', 1, 'HJ', [1]],
+      ['A', 2, 'HJ', [1]],
+    ],
+    settlements: [
+      ['A', 0, 'HJ', 'accept', null, null],
+      ['A', 1, 'HJ', 'accept', null, null],
+      ['A', 2, 'HJ', 'accept', null, null],
+      ['A', 1, 'HJ', 'accept', 'session-lost', null],
+    ],
+  },
+  incrementalLost122: {
+    handlers: [
+      ['A', 0, 'HJ'],
+      ['A', 1, 'HJ'],
+      ['A', 1, 'HJ'],
+      ['A', 2, 'HJ'],
+    ],
+    mutations: [
+      ['A', 0, 'HJ', [1]],
+      ['A', 1, 'HJ', [1]],
+      ['A', 1, 'HJ', [1]],
+      ['A', 2, 'HJ', [1]],
+    ],
+    settlements: [
+      ['A', 0, 'HJ', 'accept', null, null],
+      ['A', 1, 'HJ', 'accept', null, null],
+      ['A', 2, 'HJ', 'accept', null, null],
+      ['A', 1, 'HJ', 'accept', 'session-lost', 122],
+    ],
+  },
+  incrementalLost123: {
+    handlers: [
+      ['A', 0, 'HJ'],
+      ['A', 1, 'HJ'],
+      ['A', 1, 'HJ'],
+      ['A', 2, 'HJ'],
+    ],
+    mutations: [
+      ['A', 0, 'HJ', [1]],
+      ['A', 1, 'HJ', [1]],
+      ['A', 1, 'HJ', [1]],
+      ['A', 2, 'HJ', [1]],
+    ],
+    settlements: [
+      ['A', 0, 'HJ', 'accept', null, null],
+      ['A', 1, 'HJ', 'accept', null, null],
+      ['A', 2, 'HJ', 'accept', null, null],
+      ['A', 1, 'HJ', 'accept', 'session-lost', 123],
+    ],
+  },
+  incrementalLost133: {
+    handlers: [
+      ['A', 0, 'HJ'],
+      ['A', 1, 'HJ'],
+      ['A', 1, 'HJ'],
+      ['A', 2, 'HJ'],
+    ],
+    mutations: [
+      ['A', 0, 'HJ', [1]],
+      ['A', 1, 'HJ', [1]],
+      ['A', 1, 'HJ', [1]],
+      ['A', 2, 'HJ', [1]],
+    ],
+    settlements: [
+      ['A', 0, 'HJ', 'accept', null, null],
+      ['A', 1, 'HJ', 'accept', null, null],
+      ['A', 2, 'HJ', 'accept', null, null],
+      ['A', 1, 'HJ', 'accept', 'session-lost', 133],
+    ],
+  },
+  incrementalUnknown: {
+    handlers: [
+      ['A', 0, 'HJ'],
+      ['A', 1, 'HJ'],
+      ['A', 1, 'HJ'],
+      ['A', 2, 'HJ'],
+    ],
+    mutations: [
+      ['A', 0, 'HJ', [1]],
+      ['A', 1, 'HJ', [1]],
+      ['A', 1, 'HJ', [1]],
+      ['A', 2, 'HJ', [1]],
+    ],
+    settlements: [
+      ['A', 0, 'HJ', 'accept', null, null],
+      ['A', 1, 'HJ', 'accept', null, null],
+      ['A', 2, 'HJ', 'accept', null, null],
+      ['A', 1, 'HJ', 'accept', 'rejected-by-broker', -1],
+    ],
+  },
+  incrementalRetry: {
+    handlers: [
+      ['A', 0, 'HJ'],
+      ['A', 1, 'HJ'],
+      ['A', 1, 'HJ'],
+      ['A', 2, 'HJ'],
+    ],
+    mutations: [
+      ['A', 0, 'HJ', [1]],
+      ['A', 1, 'HJ', [1]],
+      ['A', 1, 'HJ', [1]],
+      ['A', 2, 'HJ', [1]],
+    ],
+    settlements: [
+      ['A', 0, 'HJ', 'accept', null, null],
+      ['A', 1, 'HJ', 'accept', null, null],
+      ['A', 2, 'HJ', 'accept', null, null],
+      ['A', 1, 'HJ', 'accept', 'rejected-by-broker', 7],
+    ],
+  },
+  incrementalTerminal35: {
+    handlers: [
+      ['A', 0, 'H'],
+      ['A', 1, 'HJ'],
+      ['A', 1, 'HJ'],
+      ['A', 2, 'HJ'],
+      ['A', 0, 'HJ'],
+    ],
+    mutations: [
+      ['A', 0, 'HJ', [1]],
+      ['A', 1, 'HJ', [1]],
+      ['A', 1, 'HJ', [1]],
+      ['A', 2, 'HJ', [1]],
+      ['A', 0, 'J', [2]],
+    ],
+    settlements: [
+      ['A', 1, 'HJ', 'accept', null, null],
+      ['A', 2, 'HJ', 'accept', null, null],
+      ['A', 1, 'HJ', 'accept', 'rejected-by-broker', 35],
+      ['A', 0, 'HJ', 'accept', null, null],
+      ['A', 0, 'H', 'release', 'membership-lost', null],
+      ['A', 0, 'J', 'release', null, null],
+    ],
+  },
+  incrementalTerminal30: {
+    handlers: [
+      ['A', 0, 'H'],
+      ['A', 1, 'HJ'],
+      ['A', 1, 'HJ'],
+      ['A', 2, 'HJ'],
+      ['A', 0, 'HJ'],
+    ],
+    mutations: [
+      ['A', 0, 'HJ', [1]],
+      ['A', 1, 'HJ', [1]],
+      ['A', 1, 'HJ', [1]],
+      ['A', 2, 'HJ', [1]],
+      ['A', 0, 'J', [2]],
+    ],
+    settlements: [
+      ['A', 1, 'HJ', 'accept', null, null],
+      ['A', 2, 'HJ', 'accept', null, null],
+      ['A', 1, 'HJ', 'accept', 'rejected-by-broker', 30],
+      ['A', 0, 'HJ', 'accept', null, null],
+      ['A', 0, 'H', 'release', 'membership-lost', null],
+      ['A', 0, 'J', 'release', null, null],
+    ],
+  },
+  incrementalTerminal25: {
+    handlers: [
+      ['A', 0, 'H'],
+      ['A', 1, 'HJ'],
+      ['A', 1, 'HJ'],
+      ['A', 2, 'HJ'],
+      ['A', 0, 'HJ'],
+    ],
+    mutations: [
+      ['A', 0, 'HJ', [1]],
+      ['A', 1, 'HJ', [1]],
+      ['A', 1, 'HJ', [1]],
+      ['A', 2, 'HJ', [1]],
+      ['A', 0, 'J', [2]],
+    ],
+    settlements: [
+      ['A', 1, 'HJ', 'accept', null, null],
+      ['A', 2, 'HJ', 'accept', null, null],
+      ['A', 1, 'HJ', 'accept', 'session-lost', 25],
+      ['A', 0, 'HJ', 'accept', null, null],
+      ['A', 0, 'H', 'release', 'membership-lost', null],
+      ['A', 0, 'J', 'release', null, null],
+    ],
+  },
+  incrementalTerminal42: {
+    handlers: [
+      ['A', 0, 'H'],
+      ['A', 1, 'HJ'],
+      ['A', 1, 'HJ'],
+      ['A', 2, 'HJ'],
+      ['A', 0, 'HJ'],
+    ],
+    mutations: [
+      ['A', 0, 'HJ', [1]],
+      ['A', 1, 'HJ', [1]],
+      ['A', 1, 'HJ', [1]],
+      ['A', 2, 'HJ', [1]],
+      ['A', 0, 'J', [2]],
+    ],
+    settlements: [
+      ['A', 1, 'HJ', 'accept', null, null],
+      ['A', 2, 'HJ', 'accept', null, null],
+      ['A', 1, 'HJ', 'accept', 'rejected-by-broker', 42],
+      ['A', 0, 'HJ', 'accept', null, null],
+      ['A', 0, 'H', 'release', 'membership-lost', null],
+      ['A', 0, 'J', 'release', null, null],
+    ],
+  },
+  ackRetry133: {
+    handlers: [
+      ['A', 0, 'HJ'],
+      ['A', 1, 'HJ'],
+      ['A', 2, 'HJ'],
+    ],
+    mutations: [
+      ['A', 0, 'HJ', [1]],
+      ['A', 1, 'HJ', [1]],
+      ['A', 2, 'HJ', [1]],
+      ['A', 0, 'H', [4]],
+      ['A', 0, 'H', [4]],
+      ['A', 0, 'H', [4]],
+    ],
+    settlements: [
+      ['A', 0, 'HJ', 'accept', null, null],
+      ['A', 1, 'HJ', 'accept', null, null],
+      ['A', 2, 'HJ', 'accept', null, null],
+      ['A', 0, 'H', 'renew', null, null],
+      ['A', 0, 'H', 'renew', 'rejected-by-broker', 133],
+      ['A', 0, 'H', 'renew', null, null],
+    ],
+  },
+  ackUnknown: {
+    handlers: [
+      ['A', 0, 'HJ'],
+      ['A', 1, 'HJ'],
+      ['A', 2, 'HJ'],
+    ],
+    mutations: [
+      ['A', 0, 'HJ', [1]],
+      ['A', 1, 'HJ', [1]],
+      ['A', 2, 'HJ', [1]],
+      ['A', 0, 'H', [4]],
+      ['A', 0, 'H', [4]],
+      ['A', 0, 'H', [4]],
+    ],
+    settlements: [
+      ['A', 0, 'HJ', 'accept', null, null],
+      ['A', 1, 'HJ', 'accept', null, null],
+      ['A', 2, 'HJ', 'accept', null, null],
+      ['A', 0, 'H', 'renew', null, null],
+      ['A', 0, 'H', 'renew', 'rejected-by-broker', -1],
+      ['A', 0, 'H', 'renew', null, null],
+    ],
+  },
+  ackRetry7: {
+    handlers: [
+      ['A', 0, 'HJ'],
+      ['A', 1, 'HJ'],
+      ['A', 2, 'HJ'],
+    ],
+    mutations: [
+      ['A', 0, 'HJ', [1]],
+      ['A', 1, 'HJ', [1]],
+      ['A', 2, 'HJ', [1]],
+      ['A', 0, 'H', [4]],
+      ['A', 0, 'H', [4]],
+      ['A', 0, 'H', [4]],
+    ],
+    settlements: [
+      ['A', 0, 'HJ', 'accept', null, null],
+      ['A', 1, 'HJ', 'accept', null, null],
+      ['A', 2, 'HJ', 'accept', null, null],
+      ['A', 0, 'H', 'renew', null, null],
+      ['A', 0, 'H', 'renew', 'rejected-by-broker', 7],
+      ['A', 0, 'H', 'renew', null, null],
+    ],
+  },
+  ackReset: {
+    handlers: [
+      ['A', 0, 'H'],
+      ['A', 1, 'HJ'],
+      ['A', 2, 'HJ'],
+      ['A', 0, 'HJ'],
+    ],
+    mutations: [
+      ['A', 1, 'HJ', [1]],
+      ['A', 2, 'HJ', [1]],
+      ['A', 0, 'H', [4]],
+      ['A', 0, 'H', [4]],
+      ['A', 0, 'HJ', [1]],
+    ],
+    settlements: [
+      ['A', 1, 'HJ', 'accept', null, null],
+      ['A', 2, 'HJ', 'accept', null, null],
+      ['A', 0, 'H', 'renew', null, null],
+      ['A', 0, 'H', 'renew', 'session-lost', null],
+      ['A', 0, 'HJ', 'release', 'session-lost', null],
+      ['A', 0, 'HJ', 'accept', null, null],
+    ],
+  },
+  ackReset122: {
+    handlers: [
+      ['A', 0, 'H'],
+      ['A', 1, 'HJ'],
+      ['A', 2, 'HJ'],
+      ['A', 0, 'HJ'],
+    ],
+    mutations: [
+      ['A', 1, 'HJ', [1]],
+      ['A', 2, 'HJ', [1]],
+      ['A', 0, 'H', [4]],
+      ['A', 0, 'H', [4]],
+      ['A', 0, 'HJ', [1]],
+    ],
+    settlements: [
+      ['A', 1, 'HJ', 'accept', null, null],
+      ['A', 2, 'HJ', 'accept', null, null],
+      ['A', 0, 'H', 'renew', null, null],
+      ['A', 0, 'H', 'renew', 'session-lost', 122],
+      ['A', 0, 'HJ', 'release', 'session-lost', 122],
+      ['A', 0, 'HJ', 'accept', null, null],
+    ],
+  },
+  ackReset123: {
+    handlers: [
+      ['A', 0, 'H'],
+      ['A', 1, 'HJ'],
+      ['A', 2, 'HJ'],
+      ['A', 0, 'HJ'],
+    ],
+    mutations: [
+      ['A', 1, 'HJ', [1]],
+      ['A', 2, 'HJ', [1]],
+      ['A', 0, 'H', [4]],
+      ['A', 0, 'H', [4]],
+      ['A', 0, 'HJ', [1]],
+    ],
+    settlements: [
+      ['A', 1, 'HJ', 'accept', null, null],
+      ['A', 2, 'HJ', 'accept', null, null],
+      ['A', 0, 'H', 'renew', null, null],
+      ['A', 0, 'H', 'renew', 'session-lost', 123],
+      ['A', 0, 'HJ', 'release', 'session-lost', 123],
+      ['A', 0, 'HJ', 'accept', null, null],
+    ],
+  },
+  ackLost6: {
+    handlers: [
+      ['A', 0, 'H'],
+      ['A', 1, 'HJ'],
+      ['A', 2, 'HJ'],
+      ['A', 0, 'HJ'],
+    ],
+    mutations: [
+      ['A', 1, 'HJ', [1]],
+      ['A', 2, 'HJ', [1]],
+      ['A', 0, 'H', [4]],
+      ['A', 0, 'H', [4]],
+      ['A', 0, 'HJ', [1]],
+    ],
+    settlements: [
+      ['A', 1, 'HJ', 'accept', null, null],
+      ['A', 2, 'HJ', 'accept', null, null],
+      ['A', 0, 'H', 'renew', null, null],
+      ['A', 0, 'H', 'renew', 'session-lost', 6],
+      ['A', 0, 'HJ', 'release', 'session-lost', 6],
+      ['A', 0, 'HJ', 'accept', null, null],
+    ],
+  },
+  ackLost35: {
+    handlers: [
+      ['A', 0, 'H'],
+      ['A', 1, 'HJ'],
+      ['A', 2, 'HJ'],
+      ['A', 0, 'HJ'],
+    ],
+    mutations: [
+      ['A', 1, 'HJ', [1]],
+      ['A', 2, 'HJ', [1]],
+      ['A', 0, 'H', [4]],
+      ['A', 0, 'H', [4]],
+      ['A', 0, 'HJ', [1]],
+    ],
+    settlements: [
+      ['A', 1, 'HJ', 'accept', null, null],
+      ['A', 2, 'HJ', 'accept', null, null],
+      ['A', 0, 'H', 'renew', null, null],
+      ['A', 0, 'H', 'renew', 'rejected-by-broker', 35],
+      ['A', 0, 'HJ', 'release', 'membership-lost', null],
+      ['A', 0, 'HJ', 'accept', null, null],
+    ],
+  },
+  ackLost30: {
+    handlers: [
+      ['A', 0, 'H'],
+      ['A', 1, 'HJ'],
+      ['A', 2, 'HJ'],
+      ['A', 0, 'HJ'],
+    ],
+    mutations: [
+      ['A', 1, 'HJ', [1]],
+      ['A', 2, 'HJ', [1]],
+      ['A', 0, 'H', [4]],
+      ['A', 0, 'H', [4]],
+      ['A', 0, 'HJ', [1]],
+    ],
+    settlements: [
+      ['A', 1, 'HJ', 'accept', null, null],
+      ['A', 2, 'HJ', 'accept', null, null],
+      ['A', 0, 'H', 'renew', null, null],
+      ['A', 0, 'H', 'renew', 'rejected-by-broker', 30],
+      ['A', 0, 'HJ', 'release', 'membership-lost', null],
+      ['A', 0, 'HJ', 'accept', null, null],
+    ],
+  },
+  ackLost25: {
+    handlers: [
+      ['A', 0, 'H'],
+      ['A', 1, 'HJ'],
+      ['A', 2, 'HJ'],
+      ['A', 0, 'HJ'],
+    ],
+    mutations: [
+      ['A', 1, 'HJ', [1]],
+      ['A', 2, 'HJ', [1]],
+      ['A', 0, 'H', [4]],
+      ['A', 0, 'H', [4]],
+      ['A', 0, 'HJ', [1]],
+    ],
+    settlements: [
+      ['A', 1, 'HJ', 'accept', null, null],
+      ['A', 2, 'HJ', 'accept', null, null],
+      ['A', 0, 'H', 'renew', null, null],
+      ['A', 0, 'H', 'renew', 'session-lost', 25],
+      ['A', 0, 'HJ', 'release', 'membership-lost', null],
+      ['A', 0, 'HJ', 'accept', null, null],
+    ],
+  },
+  ackLost42: {
+    handlers: [
+      ['A', 0, 'H'],
+      ['A', 1, 'HJ'],
+      ['A', 2, 'HJ'],
+      ['A', 0, 'HJ'],
+    ],
+    mutations: [
+      ['A', 1, 'HJ', [1]],
+      ['A', 2, 'HJ', [1]],
+      ['A', 0, 'H', [4]],
+      ['A', 0, 'H', [4]],
+      ['A', 0, 'HJ', [1]],
+    ],
+    settlements: [
+      ['A', 1, 'HJ', 'accept', null, null],
+      ['A', 2, 'HJ', 'accept', null, null],
+      ['A', 0, 'H', 'renew', null, null],
+      ['A', 0, 'H', 'renew', 'rejected-by-broker', 42],
+      ['A', 0, 'HJ', 'release', 'membership-lost', null],
+      ['A', 0, 'HJ', 'accept', null, null],
+    ],
+  },
+  partitionFatal: {
+    handlers: [
+      ['A', 0, 'H'],
+      ['B', 0, 'H'],
+    ],
+    mutations: [
+      ['B', 0, 'H', [1]],
+      ['A', 0, 'J', [2]],
+    ],
+    settlements: [
+      ['B', 0, 'H', 'accept', null, null],
+      ['A', 0, 'H', 'release', 'membership-lost', null],
+      ['A', 0, 'J', 'release', null, null],
+    ],
+  },
+  partitionSiblingFatal: {
+    handlers: [
+      ['A', 0, 'H'],
+      ['B', 0, 'H'],
+    ],
+    mutations: [
+      ['A', 0, 'J', [2]],
+      ['B', 0, 'H', [1]],
+    ],
+    settlements: [
+      ['A', 0, 'H', 'release', 'membership-lost', null],
+      ['A', 0, 'J', 'release', null, null],
+      ['A', 2, 'HJ', 'release', 'membership-lost', null],
+      ['B', 0, 'H', 'accept', null, null],
+    ],
+  },
+  incrementalPartitionFatal: {
+    handlers: [
+      ['A', 0, 'H'],
+      ['A', 1, 'HJ'],
+      ['A', 1, 'HJ'],
+      ['A', 2, 'HJ'],
+      ['B', 0, 'H'],
+    ],
+    mutations: [
+      ['A', 1, 'HJ', [1]],
+      ['A', 1, 'HJ', [1]],
+      ['A', 2, 'HJ', [1]],
+      ['B', 0, 'H', [1]],
+      ['A', 0, 'J', [2]],
+    ],
+    settlements: [
+      ['A', 1, 'HJ', 'accept', null, null],
+      ['A', 1, 'HJ', 'accept', null, null],
+      ['A', 2, 'HJ', 'accept', null, null],
+      ['B', 0, 'H', 'accept', null, null],
+      ['A', 0, 'H', 'release', 'membership-lost', null],
+      ['A', 0, 'J', 'release', null, null],
+    ],
+  },
+  fifo: {
+    handlers: [['A', 0, 'HJ']],
+    mutations: [
+      ['A', 0, 'H', [4]],
+      ['A', 0, 'H', [1]],
+      ['A', 0, 'J', [1]],
+    ],
+    settlements: [
+      ['A', 0, 'H', 'renew', null, null],
+      ['A', 0, 'H', 'accept', null, null],
+      ['A', 0, 'J', 'accept', null, null],
+    ],
+  },
+  queuedReset: {
+    handlers: [
+      ['A', 0, 'H'],
+      ['A', 1, 'HJ'],
+      ['A', 2, 'HJ'],
+    ],
+    mutations: [
+      ['A', 0, 'H', [4]],
+      ['A', 1, 'HJ', [1]],
+      ['A', 2, 'HJ', [1]],
+    ],
+    settlements: [
+      ['A', 0, 'H', 'renew', 'session-lost', null],
+      ['A', 0, 'HJ', 'release', 'session-lost', null],
+      ['A', 1, 'HJ', 'accept', null, null],
+      ['A', 2, 'HJ', 'accept', null, null],
+    ],
+  },
+  replacementCurrent: {
+    handlers: [
+      ['A', 0, 'H'],
+      ['B', 0, 'H'],
+    ],
+    mutations: [
+      ['A', 0, 'HJ', [1, 2]],
+      ['B', 0, 'H', [1]],
+    ],
+    settlements: [
+      ['A', 0, 'H', 'accept', null, null],
+      ['A', 0, 'J', 'release', null, null],
+      ['B', 0, 'H', 'accept', null, null],
+    ],
+  },
+  replacementFenced: {
+    handlers: [
+      ['A', 0, 'H'],
+      ['B', 0, 'H'],
+    ],
+    mutations: [
+      ['B', 0, 'H', [1]],
+      ['A', 0, 'J', [2]],
+    ],
+    settlements: [
+      ['B', 0, 'H', 'accept', null, null],
+      ['A', 0, 'H', 'release', 'membership-lost', null],
+      ['A', 0, 'J', 'release', null, null],
+    ],
+  },
+  reacquired: {
+    handlers: [
+      ['A', 0, 'HJ'],
+      ['A', 1, 'H'],
+      ['A', 1, 'HJ'],
+    ],
+    mutations: [
+      ['A', 0, 'HJ', [1]],
+      ['A', 1, 'H', [4]],
+      ['A', 1, 'H', [4]],
+      ['A', 1, 'HJ', [1]],
+    ],
+    settlements: [
+      ['A', 0, 'HJ', 'accept', null, null],
+      ['A', 1, 'H', 'renew', null, null],
+      ['A', 1, 'H', 'renew', 'session-lost', 122],
+      ['A', 1, 'HJ', 'release', 'session-lost', 122],
+      ['A', 1, 'HJ', 'accept', null, null],
+    ],
+  },
+  forget: {
+    handlers: [
+      ['A', 0, 'HJ'],
+      ['A', 1, 'HJ'],
+    ],
+    mutations: [
+      ['A', 0, 'HJ', [1]],
+      ['A', 1, 'HJ', [1]],
+      ['A', 2, 'HJ', [2]],
+    ],
+    settlements: [
+      ['A', 0, 'HJ', 'accept', null, null],
+      ['A', 1, 'HJ', 'accept', null, null],
+      ['A', 2, 'HJ', 'release', null, null],
+    ],
+  },
+  flushForget: {
+    handlers: [
+      ['A', 0, 'HJ'],
+      ['A', 1, 'HJ'],
+    ],
+    mutations: [
+      ['A', 0, 'HJ', [1]],
+      ['A', 1, 'H', [1]],
+      ['A', 1, 'J', [1]],
+      ['A', 2, 'HJ', [2]],
+    ],
+    settlements: [
+      ['A', 0, 'HJ', 'accept', null, null],
+      ['A', 1, 'H', 'accept', null, null],
+      ['A', 1, 'J', 'accept', null, null],
+      ['A', 2, 'HJ', 'release', null, null],
+    ],
+  },
+  renewedForget: {
+    handlers: [
+      ['A', 0, 'HJ'],
+      ['A', 1, 'HJ'],
+      ['A', 2, 'H'],
+    ],
+    mutations: [
+      ['A', 0, 'HJ', [1]],
+      ['A', 1, 'HJ', [1]],
+      ['A', 2, 'H', [4]],
+      ['A', 2, 'HJ', [1, 2]],
+    ],
+    settlements: [
+      ['A', 0, 'HJ', 'accept', null, null],
+      ['A', 1, 'HJ', 'accept', null, null],
+      ['A', 2, 'H', 'renew', null, null],
+      ['A', 2, 'H', 'accept', null, null],
+      ['A', 2, 'J', 'release', null, null],
+    ],
+  },
+}
+
+/**
+ * Expands immutable UUID/offset notation without consulting a client, response or observation.
+ * @param {object} literal Complete literal handler, mutation and settlement tuple arrays.
+ * @returns {object} The shared audit's observation schema, retaining every duplicate.
+ */
+const literalObservations = (literal) => {
+  const offsets = { H: [H, H], J: [J, J], HJ: [H, J] }
+  return {
+    handlers: literal.handlers.flatMap(([alias, partition, range]) =>
+      (range === 'HJ' ? [H, J] : [offsets[range][0]]).map((offset) => ({
+        topicId: IDS[alias],
+        partition,
+        offset,
+        key: '6b',
+        value: '76',
+        deliveryCount: 2,
+      }))
+    ),
+    mutations: literal.mutations.map(([alias, partition, range, acknowledgeTypes]) => ({
+      topicId: IDS[alias],
+      partition,
+      firstOffset: offsets[range][0],
+      lastOffset: offsets[range][1],
+      acknowledgeTypes,
+    })),
+    settlements: literal.settlements.map(([alias, partition, range, type, reason, code]) => ({
+      topicId: IDS[alias],
+      partition,
+      firstOffset: offsets[range][0],
+      lastOffset: offsets[range][1],
+      type,
+      reason,
+      code,
+    })),
+  }
+}
+
+const ROW_OBSERVATIONS = [
+  OBSERVATIONS.accepted,
+  OBSERVATIONS.accepted,
+  OBSERVATIONS.accepted,
+  OBSERVATIONS.accepted,
+  OBSERVATIONS.accepted,
+  OBSERVATIONS.accepted,
+  OBSERVATIONS.accepted,
+  OBSERVATIONS.openTerminal,
+  OBSERVATIONS.openTerminal,
+  OBSERVATIONS.openTerminal,
+  OBSERVATIONS.accepted,
+  OBSERVATIONS.openTerminal,
+  OBSERVATIONS.incrementalLost122,
+  OBSERVATIONS.incrementalLost123,
+  OBSERVATIONS.incrementalLost133,
+  OBSERVATIONS.incrementalLost,
+  OBSERVATIONS.incrementalLost,
+  OBSERVATIONS.incrementalUnknown,
+  OBSERVATIONS.incrementalAccepted,
+  OBSERVATIONS.incrementalTerminal35,
+  OBSERVATIONS.incrementalTerminal30,
+  OBSERVATIONS.incrementalTerminal25,
+  OBSERVATIONS.incrementalRetry,
+  OBSERVATIONS.incrementalTerminal42,
+  OBSERVATIONS.ackReset122,
+  OBSERVATIONS.ackReset123,
+  OBSERVATIONS.ackRetry133,
+  OBSERVATIONS.ackReset,
+  OBSERVATIONS.ackReset,
+  OBSERVATIONS.ackUnknown,
+  OBSERVATIONS.ackLost6,
+  OBSERVATIONS.ackLost35,
+  OBSERVATIONS.ackLost30,
+  OBSERVATIONS.ackLost25,
+  OBSERVATIONS.ackRetry7,
+  OBSERVATIONS.ackLost42,
+  OBSERVATIONS.accepted,
+  OBSERVATIONS.partitionSiblingFatal,
+  OBSERVATIONS.accepted,
+  OBSERVATIONS.accepted,
+  OBSERVATIONS.accepted,
+  OBSERVATIONS.accepted,
+  OBSERVATIONS.accepted,
+  OBSERVATIONS.accepted,
+  OBSERVATIONS.accepted,
+  OBSERVATIONS.partitionFatal,
+  OBSERVATIONS.accepted,
+  OBSERVATIONS.partitionFatal,
+  OBSERVATIONS.accepted,
+  OBSERVATIONS.partitionFatal,
+  OBSERVATIONS.incrementalAccepted,
+  OBSERVATIONS.incrementalAccepted,
+  OBSERVATIONS.incrementalAccepted,
+  OBSERVATIONS.incrementalAccepted,
+  OBSERVATIONS.incrementalAccepted,
+  OBSERVATIONS.incrementalAccepted,
+  OBSERVATIONS.incrementalAccepted,
+  OBSERVATIONS.incrementalPartitionFatal,
+  OBSERVATIONS.incrementalAccepted,
+  OBSERVATIONS.incrementalPartitionFatal,
+  OBSERVATIONS.incrementalAccepted,
+  OBSERVATIONS.incrementalPartitionFatal,
+  OBSERVATIONS.accepted,
+  OBSERVATIONS.accepted,
+  OBSERVATIONS.a0,
+  OBSERVATIONS.fifo,
+  OBSERVATIONS.queuedReset,
+  OBSERVATIONS.empty,
+  OBSERVATIONS.empty,
+  OBSERVATIONS.a0,
+  OBSERVATIONS.a0,
+  OBSERVATIONS.replacementCurrent,
+  OBSERVATIONS.reacquired,
+  OBSERVATIONS.a0,
+  OBSERVATIONS.a0,
+  OBSERVATIONS.forget,
+  OBSERVATIONS.forget,
+  OBSERVATIONS.flushForget,
+  OBSERVATIONS.renewedForget,
+  OBSERVATIONS.a0,
+  OBSERVATIONS.capacity,
+  OBSERVATIONS.empty,
+  OBSERVATIONS.replacementCurrent,
+  OBSERVATIONS.replacementCurrent,
+  OBSERVATIONS.replacementFenced,
+  OBSERVATIONS.replacementFenced,
+  OBSERVATIONS.replacementCurrent,
+  OBSERVATIONS.replacementCurrent,
+  OBSERVATIONS.replacementFenced,
+  OBSERVATIONS.replacementFenced,
+  OBSERVATIONS.replacementCurrent,
+  OBSERVATIONS.replacementCurrent,
+  OBSERVATIONS.replacementFenced,
+  OBSERVATIONS.replacementFenced,
+  OBSERVATIONS.replacementCurrent,
+  OBSERVATIONS.replacementCurrent,
+  OBSERVATIONS.replacementFenced,
+  OBSERVATIONS.replacementFenced,
+].map(literalObservations)
 
 /** Literal fault, phase and outcome rows; the runtime driver must not mutate this oracle. */
 const rows = [
@@ -516,7 +1462,7 @@ const rows = [
       rounds: 8,
       nextEpoch: 0,
       held: 'session-lost',
-      request: 'session-lost',
+      request: 'accepted',
       backoff: 'none',
       sameOpen: false,
       oldAckResends: 0,
@@ -1633,7 +2579,10 @@ const rows = [
       replacement: ['B:0@9007199254740993'],
     },
   },
-]
+].map((row, index) => ({
+  ...row,
+  expected: { ...row.expected, observations: ROW_OBSERVATIONS[index] },
+}))
 
 const SPECS = {
   'top 122': { code: 122 },
@@ -1701,8 +2650,7 @@ class SessionFaultCase extends DataFaultCase {
   /** @returns {Promise<void>} Starts a client sized for the row's fault. */
   async reach_primary() {
     const { step } = this.row
-    const timeout = this.transport === 'timeout'
-    const startOptions = { requestTimeout: timeout ? 1000 : 30000 }
+    const startOptions = { requestTimeout: this.transport === 'timeout' ? 3000 : 30000 }
     if (step === 'open fetch') {
       this.armBeforeJoin = async () => {
         this.gate = this.holdFrame(
@@ -1712,14 +2660,17 @@ class SessionFaultCase extends DataFaultCase {
       }
       await this.begin({ expectCalls: 1, startOptions })
     } else if (step === 'incremental fetch') {
-      this.supply.set('A:1', 2)
       this.armBeforeJoin = async () => {
         this.gate = this.holdFrame(
           78,
           ({ node, fields }) => node === 1 && fields.shareSessionEpoch === 2
         )
       }
-      await this.begin({ expectCalls: 7, startOptions })
+      await this.begin({ expectCalls: 1, startOptions, supplyCounts: { 'A:1': 2 } })
+      await this.advanceUntil(
+        () => this.calls.length === 7 && this.gate.call !== null,
+        'seven handlers and the epoch-two frame'
+      )
     } else {
       await this.begin({ expectCalls: 1, startOptions })
       const held = this.callOf(A0_H)
@@ -1728,7 +2679,13 @@ class SessionFaultCase extends DataFaultCase {
         79,
         ({ node, fields }) => node === 0 && fields.shareSessionEpoch === 2
       )
-      this.renewal = track(held.renew())
+      this.renewal = track(
+        this.expectRejection(held.renew(), {
+          name: 'KafkaJSShareAcknowledgementError',
+          message: 'Acknowledgement was not confirmed',
+          reason: this.row.expected.request,
+        })
+      )
     }
     await this.arrival(this.gate)
   }
@@ -1738,11 +2695,15 @@ class SessionFaultCase extends DataFaultCase {
     this.before = this.frameLog(this.node).length
     this.startedAt = Date.now()
     this.resetsBefore = this.seen.resets.length
+    this.oldCohorts = new Set(
+      this.observer.writes[this.wireIndex(this.gate.call)].prepared.map(({ row }) => row)
+    )
+    if (this.row.expected.action === 'fence') this.supplyOnce('A:0')
     await this.fire(this.gate, this.spec)
+    this.faultAt = Date.now()
   }
 
   /**
-   * @param {number} expected Frames expected after the fault.
    * @returns {Promise<object>} The first frame of the affected node after the fault.
    */
   async nextFrameOnNode() {
@@ -1764,9 +2725,7 @@ class SessionFaultCase extends DataFaultCase {
     else if (action === 'move') await this.verifyMove()
     else await this.verifyFatalSession()
     if (acks && expected.request !== 'none') {
-      const result = { 'session-lost': 'session-lost', 'rejected-by-broker': 'rejected-by-broker' }[
-        expected.request
-      ]
+      const result = expected.request
       this.assertResult(
         1,
         H,
@@ -1795,19 +2754,32 @@ class SessionFaultCase extends DataFaultCase {
     assert.equal(this.seen.resets.length, this.resetsBefore + 1)
     assert.equal(this.seen.resets.at(-1).nodeId, this.node)
     const immediate = expected.backoff === 'first immediate then delayed'
-    if (immediate) await until(() => this.frameLog(this.node).length > this.before, 'the reopen')
-    else {
+    if (this.row.step === 'acknowledgement only') {
+      const held = this.callOf(A0_H)
+      assert.equal(held.isRunning(), true)
+      assert.throws(() => held.acknowledge('accept'), { message: STALE_CALL })
+      this.supplyOnce('A:0')
+      this.reacquisitionSupplied = true
+      this.release(A0_H)
+    }
+    if (immediate) {
+      if (this.row.step === 'acknowledgement only')
+        await this.advanceUntil(() => this.frameLog(this.node).length > this.before, 'the reopen')
+      else await until(() => this.frameLog(this.node).length > this.before, 'the reopen')
+    } else {
       await flush()
       assert.equal(this.frameLog(this.node).length, this.before, 'the reopen waits')
     }
     const next = await this.nextFrameOnNode()
     assert.equal(next.fields.shareSessionEpoch, expected.nextEpoch)
     assert.deepEqual(batchesOf(next), [], 'no old acknowledgements on the opening request')
-    if (!immediate) assert(Date.now() - this.startedAt >= 50, 'the reopen is delayed')
+    if (!immediate) assert(Date.now() - this.faultAt >= 250, 'the reopen is delayed')
     assert.equal(next.apiKey, 78)
     assert.notEqual(next.generation, undefined)
-    const later = this.frameLog(this.node).slice(this.before).flatMap(batchesOf)
-    assert.equal(later.length, 0, 'old acknowledgements are never resent')
+    const following = this.wireIndex(this.gate.call) + 1
+    for (const write of this.observer.writes.slice(following))
+      for (const { row } of write.prepared)
+        assert.equal(this.oldCohorts.has(row), false, 'old acknowledgements are never resent')
   }
 
   /** @returns {Promise<void>} A plain error: the same open, epoch advanced, retried under backoff. */
@@ -1815,9 +2787,18 @@ class SessionFaultCase extends DataFaultCase {
     const { expected, step } = this.row
     await flush()
     assert.equal(this.seen.resets.length, this.resetsBefore, 'no session reset')
-    if (step === 'acknowledgement only') {
+    if (step === 'acknowledgement only' && expected.action === 'session-lost') {
+      const held = this.callOf(A0_H)
+      assert.throws(() => held.acknowledge('accept'), { message: STALE_CALL })
+      this.supplyOnce('A:0')
+      this.reacquisitionSupplied = true
+      this.release(A0_H)
+    } else if (step === 'acknowledgement only') {
       this.renewalAfter = track(this.callOf(A0_H).renew())
-      await until(() => this.frameLog(0).length > this.before, 'the next frame of node 0')
+      await this.advanceUntil(
+        () => this.frameLog(0).length > this.before,
+        'the next frame of node 0'
+      )
     }
     const next = await this.nextFrameOnNode()
     assert.equal(next.fields.shareSessionEpoch, expected.nextEpoch)
@@ -1866,6 +2847,13 @@ class SessionFaultCase extends DataFaultCase {
   /** @returns {Promise<void>} Primary rows: a current acquisition or a new run still works. */
   async replacement_primary() {
     const { action } = this.row.expected
+    if (
+      action === 'fence' &&
+      this.calls.some((call) => call.identity === A0_H && call !== this.callOf(A0_H))
+    ) {
+      this.releaseAll()
+      return
+    }
     if (['fatal'].includes(action) || this.row.expected.held === 'membership-lost') {
       this.supplyOnce('A:0')
       const calls = this.calls.length
@@ -1874,7 +2862,13 @@ class SessionFaultCase extends DataFaultCase {
       await this.advanceUntil(() => this.calls.length > calls, 'the replacement delivery')
       return
     }
-    if (this.row.expected.held === 'session-lost') this.supplyOnce('A:0')
+    if (
+      this.row.expected.held === 'session-lost' &&
+      this.node === 0 &&
+      !this.reacquisitionSupplied &&
+      !this.calls.some((call) => call.identity === A0_H && call !== this.callOf(A0_H))
+    )
+      this.supplyOnce('A:0')
     this.release(A0_H)
     await this.advanceUntil(() => this.acceptedBoth(0), 'the current terminal acceptance')
     this.releaseAll()
@@ -1901,11 +2895,15 @@ class SessionFaultCase extends DataFaultCase {
       this.gate = this.holdFrame(
         78,
         ({ node, fields }) =>
-          node === 1 &&
-          (step === 'open fetch' ? fields.shareSessionEpoch === 0 : fields.shareSessionEpoch >= 1)
+          node === 1 && fields.shareSessionEpoch === (step === 'open fetch' ? 0 : 2)
       )
     }
-    await this.begin({ expectCalls: step === 'open fetch' ? 1 : 5 })
+    await this.begin({
+      expectCalls: 1,
+      supplyCounts: step === 'open fetch' ? {} : { 'A:1': 2 },
+    })
+    await this.advanceUntil(() => this.gate.call !== null, 'the partition fault frame')
+    if (step === 'incremental fetch') assert.equal(this.calls.length, 7)
     await this.arrival(this.gate)
   }
 
@@ -1933,12 +2931,14 @@ class SessionFaultCase extends DataFaultCase {
   async verify_partition() {
     const { expected } = this.row
     const sibling = this.callOf(expected.sibling[0])
-    if (expected.action === 'fatal') {
+    if (expected.action.startsWith('fatal')) {
       await until(() => this.seen.crashes.length === 1, 'the crash event')
       const [crash] = this.seen.crashes
       assert.equal(crash.restart, false)
       assert(codesOf(crash.error).includes(expected.cause))
-      assert.equal(crash.error.retriable === false || codesOf(crash.error).includes(2), true)
+      assert.equal(crash.error.retriable, false)
+      if (expected.action === 'fatal protocol')
+        assert.equal(crash.error.name, 'KafkaJSProtocolError')
       if (expected.settled) {
         await flush()
         for (const offset of [H, J]) {
@@ -1983,8 +2983,15 @@ class SessionFaultCase extends DataFaultCase {
 
   /** @returns {Promise<void>} Partition rows: the held sibling finishes under current authority. */
   async replacement_partition() {
-    if (this.row.expected.action === 'fatal') {
+    if (this.row.expected.action.startsWith('fatal')) {
+      this.h.table.set(NAME, { topicId: IDS.B, partitions: [{ leader: 0, epoch: 2 }] })
+      this.supplyOnce('B:0')
       this.releaseAll()
+      await this.run()
+      await this.advanceUntil(
+        () => this.calls.some(({ identity }) => identity === `B:0@${H}`),
+        'the current replacement after the fatal partition'
+      )
       return
     }
     this.release(A0_H)
@@ -2028,6 +3035,17 @@ class SessionFaultCase extends DataFaultCase {
   /** @returns {Promise<void>} Boundary rows: hold node 1's next fetch at its stage, then retire it. */
   async inject_guard() {
     const boundary = this.row.fault.replace('held data ', '')
+    await until(
+      () =>
+        this.frameLog(1).length === 1 &&
+        [...this.observer.loops.keys()].some(
+          (loop) => loop.session.binding?.broker.nodeId === 1 && loop.session.epoch === 1
+        ),
+      'the established guarded session'
+    )
+    this.guardedOpen = [...this.observer.loops.keys()].find(
+      (loop) => loop.session.binding?.broker.nodeId === 1
+    ).session.token
     this.steadyBefore = this.steadyFrames()
     this.pending = this.boundaryHold(boundary)
     await this.pump(50)
@@ -2035,7 +3053,7 @@ class SessionFaultCase extends DataFaultCase {
     await flush()
     this.steadyAtHold = this.steadyFrames()
     if (this.row.step === 'session reset') {
-      this.cluster.sockets()[(this.frameLog(1)[0].generation ?? 1) - 1].emit('end')
+      this.socketFor(this.frameLog(1)[0]).emit('end')
       await flush()
     } else {
       const gate = await this.holdBeatSteady()
@@ -2110,18 +3128,26 @@ class SessionFaultCase extends DataFaultCase {
         }
       })
     } else {
-      const original = RequestQueue.prototype.push
-      jest.spyOn(RequestQueue.prototype, 'push').mockImplementation(function (pushed) {
-        if (pushed.entry.apiKey !== 78 || !take()) return original.call(this, pushed)
-        gate.promise.then(() => {
-          try {
-            original.call(this, pushed)
-          } catch (error) {
-            pushed.entry.reject(error)
-          }
+      let queue = null
+      let released = false
+      const push = RequestQueue.prototype.push
+      const canSend = RequestQueue.prototype.canSendSocketRequestImmediately
+      jest
+        .spyOn(RequestQueue.prototype, 'canSendSocketRequestImmediately')
+        .mockImplementation(function () {
+          return this === queue && !released ? false : canSend.call(this)
         })
-        return undefined
+      jest.spyOn(RequestQueue.prototype, 'push').mockImplementation(function (request) {
+        if (request.entry.apiKey === 78 && this.broker === 'node1:9093' && take()) queue = this
+        return push.call(this, request)
       })
+      this.observe(
+        gate.promise.then(() => {
+          released = true
+          queue?.checkPendingRequests()
+        }),
+        'queue release'
+      )
     }
     this.heldGates.push({ identity: `boundary:${boundary}`, gate })
     return { reached: () => reached, release: () => gate.resolve() }
@@ -2129,7 +3155,12 @@ class SessionFaultCase extends DataFaultCase {
 
   /** @returns {number} Established-session ShareFetch frames written to node 1. */
   steadyFrames() {
-    return this.frameLog(1).filter(({ fields }) => fields.shareSessionEpoch > 0).length
+    return this.observer.writes.filter(
+      ({ open, fields, socket }) =>
+        open === this.guardedOpen &&
+        fields.shareSessionEpoch > 0 &&
+        socket.endpoint.host === 'node1'
+    ).length
   }
 
   /** @returns {Promise<void>} Boundary rows: zero or one old write, no late effect. */
@@ -2159,17 +3190,23 @@ class SessionFaultCase extends DataFaultCase {
     this.supplyOnce('B:0')
     if (this.row.step === 'replacement membership')
       await this.advanceUntil(() => this.joins().length >= 2, 'the rejoin')
-    else {
-      const gate = await this.holdBeatSteady()
-      gate.release({
-        errorCode: 0,
-        errorMessage: null,
-        memberId: gate.call.fields.memberId,
-        memberEpoch: 2,
-        heartbeatIntervalMs: 50,
-        assignment: { topicPartitions: [{ topicId: IDS.B, partitions: [0] }] },
-      })
-    }
+    const gate = await this.holdBeatSteady()
+    gate.release({
+      errorCode: 0,
+      errorMessage: null,
+      memberId: gate.call.fields.memberId,
+      memberEpoch: 2,
+      heartbeatIntervalMs: 50,
+      assignment: { topicPartitions: [{ topicId: IDS.B, partitions: [0] }] },
+    })
+    await until(
+      () =>
+        this.observer.assignments.some(({ assignment }) =>
+          assignment.some(({ topicId }) => topicId === IDS.B)
+        ),
+      'the B assignment'
+    )
+    this.release(A0_H)
     await this.advanceUntil(
       () => this.calls.some((call) => call.identity === identity),
       'the replacement delivery'
@@ -2179,9 +3216,56 @@ class SessionFaultCase extends DataFaultCase {
     this.releaseAll()
   }
 
-  /** @returns {Promise<void>} Replays frames, handlers and results through the audit. */
+  /**
+   * Runs an independent mechanics companion after this case's complete receipt and cleanup.
+   * @param {object} options Literal fixture overrides; never provider state.
+   * @returns {Promise<void>}
+   * @throws {AggregateError} Preserves the companion's primary and unconditional cleanup failures.
+   */
+  async companion(options) {
+    await this.assertInvariants()
+    await this.dispose()
+    const scenario = new SessionFaultCase(this.row)
+    Object.assign(scenario, options, { isCompanion: true })
+    const failures = []
+    try {
+      await scenario.reach()
+      await scenario.inject()
+      await scenario.verify()
+      await scenario.replacement()
+      await scenario.assertInvariants()
+    } catch (error) {
+      failures.push(error)
+    }
+    for (const finish of [
+      () => scenario.dispose(),
+      () => scenario.assertBaseline(),
+      () => scenario.cluster?.assertClean(),
+    ]) {
+      try {
+        await finish()
+      } catch (error) {
+        failures.push(error)
+      }
+    }
+    if (failures.length) throw new AggregateError(failures, 'Mechanics companion failed')
+  }
+
+  /** @returns {Promise<void>} Drains released controls and replays the complete literal sets. */
   async assertInvariants() {
-    this.replay()
+    if (this.h) {
+      if (!this.disposed) {
+        this.releaseAll()
+        await this.advanceUntil(
+          () => [...this.observer.ledgers.keys()].every((ledger) => ledger.size === 0),
+          'all original acquisition outcomes'
+        )
+        await flush()
+      }
+      this.replay()
+    } else {
+      assert.deepEqual(this.row.expected.observations, literalObservations(OBSERVATIONS.empty))
+    }
     if (this.auditFailures.length) throw this.auditFailures[0]
     assert.deepEqual(this.unhandled, [])
   }
@@ -2274,32 +3358,67 @@ const MECHANICS = {
     },
   },
   'held answer blocks renewal and flush': {
+    /** @returns {Promise<void>} Reaches the original production operation with its literal supply and gates. */
     async reach() {
-      await this.begin({ expectCalls: 1 })
-      this.held = this.callOf(A0_H)
-      this.gate = this.holdFrame(79, ({ node }) => node === 0)
-      this.first = track(this.held.renew())
-      await this.arrival(this.gate)
-      this.second = track(this.held.renew())
+      this.armBeforeJoin = async () => {
+        this.gate = this.holdFrame(
+          78,
+          ({ node, fields }) => node === 0 && fields.shareSessionEpoch === 1
+        )
+      }
+      await this.begin({ expectCalls: 0, supply: [], hold: [A0_H, `A:0@${J}`] })
+      await this.advanceUntil(() => this.gate.call !== null, 'the held fetch')
     },
+    /** @returns {Promise<void>} Checks the exact literal wire sequence, outcomes and replacement authority. */
     async verify() {
+      const written = this.frameLog(0).length
       await this.pump(100)
+      assert.equal(this.frameLog(0).length, written, 'no request passes the held fetch')
+      this.gate.release(fetchAnswer([dataPart(0)]))
+      await until(() => this.callOf(A0_H), 'the acquired handler')
+      await this.pump(7501)
+      const renew = this.holdFrame(79, ({ node }) => node === 0)
+      this.first = track(this.callOf(A0_H).renew())
+      await this.arrival(renew)
+      this.release(A0_H)
+      await until(
+        () => this.calls.some(({ identity }) => identity === `A:0@${J}`),
+        'the held J handler'
+      )
+      const loop = [...this.observer.loops.keys()].find(
+        (candidate) => candidate.session.binding?.broker.nodeId === 0
+      )
+      assert(loop.session.queue.length >= 1, 'the terminal flush queues behind the renewal')
+      assert.equal(this.first.settled, false, 'the renewal answer remains held')
       assert.equal(
         this.frames(79).filter(({ node }) => node === 0).length,
         this.row.expected.inFlight
       )
-      this.gate.release()
-      await until(() => this.second.settled, 'the queued renewal')
+      renew.release()
+      await until(() => this.terminalFor(0, H).length === 1, 'the terminal flush result')
+      const frames = this.frameLog(0).slice(1)
       assert.deepEqual(
-        this.frames(79)
-          .filter(({ node }) => node === 0)
-          .map(({ fields }) => fields.shareSessionEpoch),
-        [1, 2]
+        frames.map(({ apiKey, fields }) =>
+          apiKey === 78 ? 'fetch' : fields.isRenewAck ? 'renew' : 'flush'
+        ),
+        this.row.expected.order
       )
+      assert.deepEqual(
+        frames.map(({ fields }) => fields.shareSessionEpoch),
+        this.row.expected.epochs
+      )
+      assert.equal(this.first.settled, true)
       assert.equal(this.first.error, null)
+      assert.deepEqual(batchesOf(frames[1]), [
+        { firstOffset: H, lastOffset: H, acknowledgeTypes: [4] },
+      ])
+      assert.deepEqual(batchesOf(frames[2]), [
+        { firstOffset: H, lastOffset: H, acknowledgeTypes: [1] },
+      ])
     },
   },
   'queued reset rejects before held answer': {
+    /** @returns {Promise<void>} Reaches the original production operation with its literal supply and gates. */
     async reach() {
       await this.begin({ expectCalls: 1 })
       this.held = this.callOf(A0_H)
@@ -2314,46 +3433,91 @@ const MECHANICS = {
       await this.arrival(this.gate)
       this.second = track(
         this.expectRejection(this.held.renew(), {
-          name: 'KafkaJSShareAcknowledgementError',
-          message: 'Acknowledgement was not confirmed',
-          reason: 'session-lost',
+          name: 'KafkaJSConnectionClosedError',
+          message: 'Closed connection',
         })
       )
+      const loop = [...this.observer.loops.keys()].find(
+        (candidate) => candidate.session.binding?.broker.nodeId === 0
+      )
+      assert.equal(loop.session.queue.length, 1)
+      const reset = loop.session.reset
+      const owner = this
+      jest.spyOn(loop.session, 'reset').mockImplementation(function (reason, cause) {
+        owner.resetCause = cause
+        return reset.call(this, reason, cause)
+      })
+      this.queuedBuilder = jest.fn(loop.session.queue[0].work)
+      loop.session.queue[0].work = this.queuedBuilder
       await flush()
     },
+    /** @returns {Promise<void>} Applies the declared fault to its captured original provider. */
     async inject() {
-      this.cluster.sockets()[this.gate.call.generation - 1].emit('end')
+      this.socketFor(this.gate.call).emit('end')
       await flush()
     },
+    /** @returns {Promise<void>} Checks the exact literal wire sequence, outcomes and replacement authority. */
     async verify() {
       await until(() => this.second.settled, 'the queued renewal')
-      assert.equal(this.second.error.reason, 'session-lost')
+      assert.equal(this.second.error.name, 'KafkaJSConnectionClosedError')
+      assert.equal(this.second.error.message, 'Closed connection')
+      assert.equal(this.second.error, this.resetCause)
+      assert.notEqual(this.gate.settle, null, 'the old answer remains held')
+      assert.equal(this.first.settled, false, 'the written caller still owes its backoff')
+      await this.pump(250)
+      await until(() => this.first.settled, 'the written renewal loss')
+      assert.equal(this.first.error.reason, 'session-lost')
       assert.equal(this.frames(79).filter(({ node }) => node === 0).length, 1)
-      assert.equal(this.row.expected.builderCalls, 0)
+      assert.equal(this.queuedBuilder.mock.calls.length, this.row.expected.builderCalls)
     },
   },
   'fetch limit always delays': {
+    /** @returns {Promise<void>} Reaches the original production operation with its literal supply and gates. */
     async reach() {
       this.times = []
-      await this.start({ retry: RETRY_250 })
-      this.t0 = Date.now()
+      await this.start({ retry: { ...RETRY_250, initialRetryTime: this.limitInitialRetry ?? 250 } })
+      this.t0 = null
       this.cluster.answer('ShareFetch', (fields, record) => {
         if (record.node === 1 && fields.shareSessionEpoch === 0) {
+          this.t0 ??= Date.now()
           const elapsed = Date.now() - this.t0
           this.times.push(elapsed)
           if (elapsed < 5000) return topError(133)
         }
-        return this.fetchAnswerFor(fields)
+        return this.fetchAnswerFor(fields, record)
       })
     },
+    /** @returns {Promise<void>} Applies the declared fault to its captured original provider. */
     async inject() {
       await this.run()
-      for (let step = 0; step < 21; step++) await this.pump(250)
+      await until(() => this.times.length === 1, 'the first limited fetch')
+      for (let step = 1; step <= 20; step++) {
+        await until(
+          () => this.seen.resets.filter(({ nodeId }) => nodeId === 1).length === step,
+          'the limited fetch reset'
+        )
+        await flush()
+        await this.pump(250)
+        await until(() => this.times.length === step + 1, 'the next limited fetch')
+      }
     },
+    /** @returns {Promise<void>} Checks the exact literal wire sequence, outcomes and replacement authority. */
     async verify() {
       const { expected } = this.row
       assert.deepEqual(this.times.slice(0, expected.times.length), expected.times)
-      assert(this.times.filter((time) => time < 5000).length <= expected.maxFrames)
+      assert.equal(this.times.filter((time) => time < 5000).length, expected.maxFrames)
+      assert.equal(this.times.at(-1), 5000)
+      await until(
+        () =>
+          [...this.observer.loops.keys()].some(
+            (loop) =>
+              loop.session.binding?.broker.nodeId === 1 &&
+              loop.session.epoch === 1 &&
+              loop.session.resetStreak === 0
+          ),
+        'the accepted five-second fetch'
+      )
+      if (!this.isCompanion) await this.companion({ limitInitialRetry: 0 })
     },
   },
   'consecutive resets delay then success clears streak': {
@@ -2362,10 +3526,10 @@ const MECHANICS = {
       let node1 = 0
       await this.start({ retry: RETRY_250 })
       this.cluster.answer('ShareFetch', (fields, record) => {
-        if (record.node !== 1) return this.fetchAnswerFor(fields)
+        if (record.node !== 1) return this.fetchAnswerFor(fields, record)
         node1++
         this.stamps.push([fields.shareSessionEpoch, Date.now()])
-        return [2, 3, 5].includes(node1) ? topError(122) : this.fetchAnswerFor(fields)
+        return [2, 3, 5].includes(node1) ? topError(122) : this.fetchAnswerFor(fields, record)
       })
     },
     async inject() {
@@ -2394,6 +3558,7 @@ const MECHANICS = {
     },
   },
   'slot zero reconnect keeps data session': {
+    /** @returns {Promise<void>} Reaches the original production operation with its literal supply and gates. */
     async reach() {
       this.supplyOnce('A:0')
       this.armBeforeJoin = async () => {
@@ -2405,13 +3570,15 @@ const MECHANICS = {
       await this.begin({ expectCalls: 1, hold: [], supply: ['A:0'] })
       await this.arrival(this.gate)
     },
+    /** @returns {Promise<void>} Applies the declared fault to its captured original provider. */
     async inject() {
       const [join] = this.frames(76)
-      this.cluster.sockets()[join.generation - 1].emit('end')
+      this.socketFor(join).emit('end')
       await this.pump(50)
       this.gate.release()
       await flush()
     },
+    /** @returns {Promise<void>} Checks the exact literal wire sequence, outcomes and replacement authority. */
     async verify() {
       await this.advanceUntil(() => this.frameLog(0).length >= 3, 'two more node 0 frames')
       assert.deepEqual(
@@ -2425,6 +3592,7 @@ const MECHANICS = {
     },
   },
   'slot one disconnect resets before counter changes': {
+    /** @returns {Promise<void>} Reaches the original production operation with its literal supply and gates. */
     async reach() {
       this.supplyOnce('A:0')
       this.armBeforeJoin = async () => {
@@ -2434,12 +3602,15 @@ const MECHANICS = {
         )
       }
       await this.begin({ expectCalls: 1, supply: ['A:0'] })
+      await this.advanceUntil(() => this.gate.call !== null, 'the epoch-two frame')
       await this.arrival(this.gate)
     },
+    /** @returns {Promise<void>} Applies the declared fault to its captured original provider. */
     async inject() {
-      this.cluster.sockets()[this.gate.call.generation - 1].emit('end')
+      this.socketFor(this.gate.call).emit('end')
       await flush()
     },
+    /** @returns {Promise<void>} Checks the exact literal wire sequence, outcomes and replacement authority. */
     async verify() {
       await this.advanceUntil(() => this.frameLog(1).length >= 4, 'the reopening frame')
       assert.deepEqual(
@@ -2453,6 +3624,7 @@ const MECHANICS = {
     },
   },
   'same generation different pool refuses old work': {
+    /** @returns {Promise<void>} Reaches the original production operation with its literal supply and gates. */
     async reach() {
       this.armBeforeJoin = async () => {
         this.gate = this.holdFrame(78, ({ node }) => node === 1)
@@ -2460,15 +3632,46 @@ const MECHANICS = {
       await this.begin({ expectCalls: 1 })
       await this.arrival(this.gate)
     },
+    /** @returns {Promise<void>} Applies the declared fault to its captured original provider. */
     async inject() {
       this.written = this.frameLog(1).length
-      this.h.cluster.sockets()[this.gate.call.generation - 1].emit('end')
-      await flush()
-      this.gate.release()
-      await flush()
+      const loop = [...this.observer.loops.keys()].find(
+        (candidate) => candidate.session.binding?.broker.nodeId === 1
+      )
+      this.oldBinding = loop.session.binding
+      const { broker, pool, generation } = this.oldBinding
+      const replacement = await loop.cluster.brokerPool.buildConnectionPool({
+        host: pool.host,
+        port: pool.port,
+        rack: pool.rack,
+      })
+      try {
+        await replacement.pool[1].connect()
+        assert.equal(replacement.generationFor(78), generation)
+        broker.connectionPool = replacement
+        assert.notEqual(broker.connectionPool, pool)
+        assert.equal(this.oldBinding.connection.isConnected(), true)
+        assert.equal(ShareSession.bindingLost(this.oldBinding), true)
+        assert.equal(
+          loop.session.refusal(loop.session.token).message,
+          'Share session connection was lost'
+        )
+        this.gate.release()
+        await flush()
+      } finally {
+        await (broker.connectionPool === replacement ? pool : replacement).destroy({
+          drainTimeout: 0,
+        })
+      }
     },
+    /** @returns {Promise<void>} Checks the exact literal wire sequence, outcomes and replacement authority. */
     async verify() {
-      assert.equal(this.frameLog(1).length - this.written, this.row.expected.oldWrites)
+      assert.equal(
+        this.frameLog(1)
+          .slice(this.written)
+          .filter((record) => this.socketFor(record) === this.socketFor(this.gate.call)).length,
+        this.row.expected.oldWrites
+      )
       this.h.table.set(NAME, { topicId: IDS.B, partitions: [{ leader: 0, epoch: 2 }] })
       this.supplyOnce('B:0')
       const gate = await this.holdBeatSteady()
@@ -2480,6 +3683,14 @@ const MECHANICS = {
         heartbeatIntervalMs: 50,
         assignment: { topicPartitions: [{ topicId: IDS.B, partitions: [0] }] },
       })
+      await until(
+        () =>
+          this.observer.assignments.some(({ assignment }) =>
+            assignment.some(({ topicId }) => topicId === IDS.B)
+          ),
+        'the B assignment'
+      )
+      this.release(A0_H)
       await this.advanceUntil(
         () => this.calls.some((call) => call.identity === this.row.expected.replacement[0]),
         'the replacement delivery'
@@ -2487,15 +3698,21 @@ const MECHANICS = {
     },
   },
   'same offset clock epoch different acquisition': {
+    /** @returns {Promise<void>} Reaches the original production operation with its literal supply and gates. */
     async reach() {
-      await this.begin({ expectCalls: 1, supply: ['A:0'] })
-      this.old = this.callOf(A0_H)
+      this.callTimes = new Map()
+      this.onStart = (call) => this.callTimes.set(call, Date.now())
+      await this.begin({ expectCalls: 2, supply: ['A:0', 'A:1'], hold: [A0_H, A1_H] })
+      this.old = this.callOf(A1_H)
+      this.fixedDate = this.callTimes.get(this.old)
+      jest.spyOn(Date, 'now').mockReturnValue(this.fixedDate)
       this.renewal = track(this.old.renew())
       await flush()
     },
+    /** @returns {Promise<void>} Applies the declared fault to its captured original provider. */
     async inject() {
-      this.supplyOnce('A:0')
-      const gate = this.holdFrame(79, ({ node }) => node === 0)
+      this.supplyOnce('A:1')
+      const gate = this.holdFrame(79, ({ node }) => node === 1)
       this.renewalTwo = track(
         this.expectRejection(this.old.renew(), {
           name: 'KafkaJSShareAcknowledgementError',
@@ -2505,15 +3722,29 @@ const MECHANICS = {
       )
       await this.arrival(gate)
       gate.release(ackAnswer([], { errorCode: 122 }))
+      await until(
+        () => this.seen.resets.some(({ nodeId }) => nodeId === 1),
+        'the old acquisition reset'
+      )
+      this.release(A1_H)
       await flush()
     },
+    /** @returns {Promise<void>} Checks the exact literal wire sequence, outcomes and replacement authority. */
     async verify() {
       await this.advanceUntil(
-        () => this.calls.filter((call) => call.identity === A0_H).length === 2,
+        () => this.calls.filter((call) => call.identity === A1_H).length === 2,
         'the reacquisition'
       )
-      const [old, fresh] = this.calls.filter((call) => call.identity === A0_H)
+      const [old, fresh] = this.calls.filter((call) => call.identity === A1_H)
       assert.notEqual(old.token, fresh.token)
+      assert.equal(this.callTimes.get(fresh), this.fixedDate)
+      assert.equal(fresh.offset, old.offset)
+      assert.deepEqual(
+        this.frameLog(1)
+          .filter(({ fields }) => fields.shareSessionEpoch === 0)
+          .map(({ fields }) => fields.shareSessionEpoch),
+        [0, 0]
+      )
       assert.throws(() => old.acknowledge('accept'), { message: STALE_CALL })
       assert.equal(this.row.expected.distinct, true)
       assert.equal(fresh.isRunning(), true)
@@ -2566,30 +3797,40 @@ const MECHANICS = {
   'first fetch after flush forgets': forgetting('first fetch'),
   'renewed held partition remains until terminal': forgetting('renewed'),
   'empty round minimum fifty milliseconds': {
+    /** @returns {Promise<void>} Holds the original empty fetch response. */
     async reach() {
-      this.stamps = []
-      await this.start({ retry: RETRY_250 })
-      this.cluster.answer('ShareFetch', (fields, record) => {
-        if (record.node === 1) this.stamps.push(Date.now())
-        return this.fetchAnswerFor(fields)
+      this.armBeforeJoin = async () => {
+        this.gate = this.holdFrame(78, ({ node }) => node === 1)
+      }
+      await this.begin({
+        expectCalls: 1,
+        supply: ['A:0'],
+        startOptions: { share: this.emptyOptions ?? {} },
       })
-      this.supplyOnce('A:0')
-      this.hold(A0_H)
-      await this.join()
-      await until(() => this.stamps.length >= 1, 'the first node 1 frame')
+      await this.arrival(this.gate)
+      this.sentAt = Date.now()
     },
+    /** @returns {Promise<void>} Proves the send-to-send minimum with a delayed response. */
     async verify() {
-      await this.advanceUntil(() => this.stamps.length >= 3, 'three empty rounds')
-      const gaps = [1, 2].map((index) => this.stamps[index] - this.stamps[index - 1])
-      assert.deepEqual(
-        gaps.map((gap) => gap >= 50),
-        [true, true]
-      )
-      assert.equal(this.stamps.length <= this.row.expected.maxFrames, true)
-      const before = this.stamps.length
-      await advance(49)
+      const before = this.frameLog(1).length
+      await this.pump(5)
+      this.gate.release(fetchAnswer([]))
       await flush()
-      assert.equal(this.stamps.length, before, 'no frame before fifty milliseconds')
+      await this.pump(44)
+      assert.equal(Date.now() - this.sentAt, 49)
+      assert.equal(this.frameLog(1).length, before, 'no frame at send time plus 49')
+      await this.pump(1)
+      await until(() => this.frameLog(1).length === before + 1, 'the fifty-millisecond fetch')
+      assert.equal(Date.now() - this.sentAt, 50)
+      assert.equal(
+        this.frameLog(1).at(-1).fields.maxWaitMs,
+        this.emptyOptions?.maxWaitTimeInMs ?? 500
+      )
+      assert.equal(this.frameLog(1).at(-1).fields.minBytes, this.emptyOptions?.minBytes ?? 1)
+      if (!this.isCompanion) {
+        await this.companion({ emptyOptions: { maxWaitTimeInMs: 0 } })
+        await this.companion({ emptyOptions: { minBytes: 0 } })
+      }
     },
   },
   'independent node capacities and no prefetch': {
@@ -2617,17 +3858,24 @@ const MECHANICS = {
     },
   },
   'final errors never reopen': {
+    /** @returns {Promise<void>} Reaches the original production operation with its literal supply and gates. */
     async reach() {},
+    /** @returns {Promise<void>} Checks the exact literal wire sequence, outcomes and replacement authority. */
     async verify() {
       for (const code of this.row.expected.codes) {
         const scenario = new SessionFaultCase({
           fault: 'final',
           step: 'closing',
-          expected: { ...this.row.expected, rounds: 8 },
+          expected: {
+            ...this.row.expected,
+            rounds: 8,
+            observations: literalObservations(OBSERVATIONS.final),
+          },
         })
         const failures = []
         try {
           await scenario.finalWith(code)
+          await scenario.assertInvariants()
         } catch (error) {
           failures.push(error)
         }
@@ -2636,7 +3884,18 @@ const MECHANICS = {
         } catch (error) {
           failures.push(error)
         }
-        if (failures.length) throw new AggregateError(failures, 'Final fault subcase failed')
+        for (const check of [
+          () => scenario.assertBaseline(),
+          () => scenario.cluster?.assertClean(),
+        ]) {
+          try {
+            await check()
+          } catch (error) {
+            failures.push(error)
+          }
+        }
+        if (failures.length)
+          throw new AggregateError(failures, `Final fault subcase ${code} failed`)
       }
     },
   },
@@ -2644,36 +3903,75 @@ const MECHANICS = {
 
 /**
  * @param {'same frame'|'ack only'|'first fetch'|'renewed'} kind Which forgetting rule is read.
- * @returns {object} A mechanics scenario: A2 is revoked while A1/H holds node 1 busy.
+ * @returns {object} A mechanics scenario with a held node-1 invocation and A2's exact terminal set.
  */
 function forgetting(kind) {
   return {
+    /** @returns {Promise<void>} Holds node 1 before the selected partition can complete. */
     async reach() {
+      const renewed = kind === 'renewed'
       this.supplyOnce('A:0', 'A:1', 'A:2')
       this.hold(A0_H)
-      this.hold(A1_H)
+      this.hold(renewed ? `A:2@${H}` : A1_H)
       await this.start({ retry: RETRY_250 })
+      if (kind === 'ack only') {
+        this.beatShape = (fields, answer) => ({
+          ...answer,
+          assignment: { topicPartitions: [{ topicId: IDS.A, partitions: [0, 1] }] },
+        })
+        this.gate = this.holdFrame(
+          78,
+          ({ node, fields }) => node === 1 && fields.shareSessionEpoch === 0
+        )
+      }
       await this.join()
-      await until(() => this.calls.length >= 2, 'the held handlers')
-      if (kind === 'renewed') {
-        this.renewed = track(this.callOf(A1_H).renew())
+      if (kind === 'ack only') {
+        await this.arrival(this.gate)
+        assert.deepEqual(listed(this.gate.call.fields), [{ topicId: IDS.A, partition: 1 }])
+        this.supply.delete('A:1')
+        this.supply.delete('A:2')
+        this.gate.release(fetchAnswer([dataPart(1), dataPart(2)]))
+      }
+      await until(
+        () => this.calls.some(({ identity }) => identity === (renewed ? `A:2@${H}` : A1_H)),
+        'the selected held handler'
+      )
+      this.loop = [...this.observer.loops.keys()].find(
+        (loop) => loop.session.binding?.broker.nodeId === 1
+      )
+      if (kind === 'ack only')
+        assert.equal(this.loop.session.model.has(`${IDS.A}:2`), false, 'A2 was never listed')
+      if (renewed) {
+        this.renewed = track(this.calls.find(({ identity }) => identity === `A:2@${H}`).renew())
         await until(() => this.renewed.settled, 'the renewal')
+        assert.equal(this.renewed.error, null)
       }
     },
+    /** @returns {Promise<void>} Revokes A2 and makes terminal work eligible at the declared boundary. */
     async inject() {
-      const gate = await this.holdBeatSteady()
-      gate.release({
-        errorCode: 0,
-        errorMessage: null,
-        memberId: gate.call.fields.memberId,
-        memberEpoch: 1,
-        heartbeatIntervalMs: 50,
-        assignment: { topicPartitions: [{ topicId: IDS.A, partitions: [0, 1] }] },
-      })
-      await flush()
+      if (kind !== 'ack only') {
+        const gate = await this.holdBeatSteady()
+        gate.release({
+          errorCode: 0,
+          errorMessage: null,
+          memberId: gate.call.fields.memberId,
+          memberEpoch: 1,
+          heartbeatIntervalMs: 50,
+          assignment: { topicPartitions: [{ topicId: IDS.A, partitions: [0, 1] }] },
+        })
+        await flush()
+      }
+      if (kind === 'renewed') {
+        const before = this.frameLog(1).length
+        await this.pump(100)
+        assert.equal(this.frameLog(1).length, before, 'held A2 prevents a fetching request')
+        assert.equal(this.loop.session.model.has(`${IDS.A}:2`), true)
+      }
+      if (kind === 'first fetch') await this.pump(7501)
       this.beforeRelease = this.frames(78, 79).length
-      this.release(A1_H)
+      this.release(kind === 'renewed' ? `A:2@${H}` : A1_H)
     },
+    /** @returns {Promise<void>} Reads the exact terminal, forget and subsequent-fetch transcript. */
     async verify() {
       const { expected } = this.row
       const forgotten = (frame) =>
@@ -2681,35 +3979,66 @@ function forgetting(kind) {
           topic.partitions.map((partition) => `${ALIAS.get(topic.topicId)}:${partition}`)
         )
       await this.advanceUntil(
-        () => this.frames(78, 79).some((frame) => forgotten(frame).includes('A:2')),
+        () => this.frameLog(1).some((frame) => forgotten(frame).includes('A:2')),
         'the frame that forgets A2'
       )
-      const frame = this.frames(78, 79).find((candidate) => forgotten(candidate).includes('A:2'))
+      const frame = this.frameLog(1).find((candidate) => forgotten(candidate).includes('A:2'))
+      const beforeForget = this.frames(78, 79).slice(0, this.frames(78, 79).indexOf(frame))
       if (kind === 'renewed') {
-        assert.deepEqual(
-          this.frames(78, 79).slice(0, this.beforeRelease).flatMap(forgotten),
-          expected.renewForgotten
-        )
+        assert.deepEqual(beforeForget.flatMap(forgotten), expected.renewForgotten)
         assert.deepEqual(forgotten(frame), expected.terminalForgotten)
-        return
-      }
-      assert.deepEqual(forgotten(frame), expected.forgotten)
-      assert.deepEqual(
-        listed(frame.fields)
-          .map(({ partition }) => `A:${partition}`)
-          .filter((key) => key === 'A:2'),
-        expected.topics
-      )
-      if (kind === 'same frame')
-        assert(
-          batchesOf(frame).some((batch) => batch.firstOffset === H && batch.lastOffset === J),
-          'the last acknowledgements ride the forgetting frame'
+      } else {
+        assert.deepEqual(forgotten(frame), expected.forgotten)
+        assert.deepEqual(
+          listed(frame.fields)
+            .filter(({ partition }) => partition === 2)
+            .map(({ partition }) => `A:${partition}`),
+          ['A:2']
         )
-      if (kind === 'first fetch') assert.equal(frame.apiKey, 78)
-      const later = this.frames(78, 79)
-        .slice(this.frames(78, 79).indexOf(frame) + 1)
-        .flatMap((candidate) => listed(candidate.fields).map(({ partition }) => `A:${partition}`))
-      assert.equal(later.includes('A:2'), expected.laterTopics.length > 0)
+      }
+      assert.equal(frame.apiKey, 78)
+      const acks = frame.fields.topics.flatMap(({ topicId, partitions }) =>
+        partitions
+          .filter(({ partitionIndex }) => topicId === IDS.A && partitionIndex === 2)
+          .flatMap(({ acknowledgementBatches }) => acknowledgementBatches)
+      )
+      assert.deepEqual(acks, [
+        { firstOffset: H, lastOffset: J, acknowledgeTypes: kind === 'renewed' ? [1, 2] : [2] },
+      ])
+      if (kind === 'first fetch') {
+        const frames = this.frames(78, 79)
+          .slice(this.beforeRelease)
+          .filter(({ node }) => node === 1)
+        const index = frames.indexOf(frame)
+        assert(index > 0, 'a flush precedes the forgetting fetch')
+        assert.deepEqual(
+          frames.slice(index - 1, index + 1).map(({ apiKey }) => apiKey),
+          expected.order
+        )
+        assert.equal(
+          frames.slice(0, index).some(({ apiKey }) => apiKey === 78),
+          false
+        )
+      }
+      const written = this.frameLog(1).length
+      await this.advanceUntil(() => this.frameLog(1).length > written, 'the following fetch')
+      const later = this.frameLog(1).slice(this.frameLog(1).indexOf(frame) + 1)
+      assert.deepEqual(
+        later.flatMap((candidate) =>
+          listed(candidate.fields)
+            .filter(({ partition }) => partition === 2)
+            .map(() => 'A:2')
+        ),
+        []
+      )
+      const terminal = this.terminalFor(2, H)
+      assert.equal(terminal.length, 1)
+      assert.equal(terminal[0].error, null)
+      if (kind !== 'renewed')
+        assert.equal(
+          this.calls.some(({ partition }) => partition === 2),
+          false
+        )
     },
   }
 }
@@ -2735,7 +4064,10 @@ SessionFaultCase.prototype.removeNode1 = async function removeNode1() {
 SessionFaultCase.prototype.finalWith = async function finalWith(code) {
   await this.begin({ expectCalls: 1, supply: ['A:0'] })
   await this.advanceUntil(() => this.frameLog(1).length >= 2, 'node 1 established')
-  const gate = this.holdFrame(79, ({ fields }) => fields.shareSessionEpoch === -1)
+  const gate = this.holdFrame(
+    79,
+    ({ node, fields }) => node === 1 && fields.shareSessionEpoch === -1
+  )
   const closing = track(this.h.consumer.disconnect({ timeout: 400 }))
   await this.pump(300)
   await this.arrival(gate)
@@ -2795,6 +4127,13 @@ describe('session fault observations', () => {
       new Set(rows.map((row) => `${row.fault} / ${row.step} / ${row.expected.enforce ?? ''}`)).size
     ).toBe(98)
     expect(rows.every((row) => row.expected.rounds >= 8)).toBe(true)
+    expect(ROW_OBSERVATIONS).toHaveLength(98)
+    for (const { expected } of rows)
+      expect(Object.keys(expected.observations).sort()).toEqual([
+        'handlers',
+        'mutations',
+        'settlements',
+      ])
   })
 
   test('rejects opening acknowledgements seen by the independent reader', () => {

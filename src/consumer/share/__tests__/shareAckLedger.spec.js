@@ -199,6 +199,53 @@ describe('deterministic compact acknowledgement ledger', () => {
     expect(ledger.settle(ticket, { token })).toEqual([])
     expect(ledger.size).toBe(0)
   })
+  test('retirement keeps optional causes on renewal and terminal failures while preserving a final ticket', () => {
+    for (const cause of [createErrorFromCode(122), undefined]) {
+      const { ledger, token } = make()
+      ledger.complete(['1'], 'accept')
+      const { ticket: final } = ledger.prepare({ token })
+      const { ticket: renewal } = ledger.prepare({ token, renewOffsets: ['2'] })
+      ledger.decide('3', 'reject')
+      const results = cause
+        ? ledger.invalidate('session-lost', final, cause)
+        : ledger.invalidate('session-lost', final)
+      expect(results).toEqual([
+        {
+          firstOffset: '2',
+          lastOffset: '2',
+          type: 'renew',
+          error: expect.any(KafkaJSShareAcknowledgementError),
+        },
+        {
+          firstOffset: '2',
+          lastOffset: '2',
+          type: 'release',
+          error: expect.any(KafkaJSShareAcknowledgementError),
+        },
+        {
+          firstOffset: '3',
+          lastOffset: '3',
+          type: 'reject',
+          error: expect.any(KafkaJSShareAcknowledgementError),
+        },
+      ])
+      for (const outcome of results) {
+        expect(outcome.error.cause).toBe(cause)
+        expect(outcome.error.reason).toBe('session-lost')
+        expect(outcome.error.ranges).toEqual([
+          { firstOffset: outcome.firstOffset, lastOffset: outcome.lastOffset },
+        ])
+      }
+      expect(ledger.size).toBe(1)
+      expect(ledger.invalidate('session-lost', final, cause)).toEqual([])
+      expect(ledger.settle(renewal, { token })).toEqual([])
+      expect(ledger.settle(final, { token })).toEqual([
+        { firstOffset: '1', lastOffset: '1', type: 'accept', error: null },
+      ])
+      expect(ledger.settle(final, { token })).toEqual([])
+      expect(ledger.size).toBe(0)
+    }
+  })
   test('a million-offset absent remainder stays compact through failure and error serialization', () => {
     const walk = {
       deliver: { records: [], deliveryCounts: new Uint16Array(0) },
