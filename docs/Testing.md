@@ -21,6 +21,8 @@ Share membership tests use scripted sockets for heartbeat fields, membership err
 
 Share record-walk tests check exact acquired ranges, control-record gaps and compact release of the undecoded remainder after every decode halt. Ledger and lock tests check compact acknowledgement encoding, local wire validation, single-use outcomes and pre-write lock deadlines. Fixed property seeds cover boundary offsets and overlapping, adjacent and gapped ranges. The internal walk benchmark checks independent identities and work-skipping controls; timing and memory acceptance require a quiet host. Public share-session, renewal and range-event behavior has separate integration acceptance.
 
+Share session and node-loop tests check serialized request epochs, piggybacked acknowledgements and the first eligible forgotten-partition frame. Scripted socket cases check renewal and flush ordering, independent fetch and acknowledgement errors, leader hints and empty-round pacing. Per-node record limits and cleanup have separate assertions. Public shutdown and session fault matrices provide the later integration acceptance.
+
 ## Integration tests
 
 Most of the test suite talks to a real Kafka cluster. `npm test` runs `npm run lint`, `npm run compat:check` and `npm run protocol:check`, boots the cluster, runs everything, and tears the cluster down again — it's a convenient local shortcut, but it is not what CI runs.
