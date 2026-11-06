@@ -13,6 +13,7 @@ const {
   setShareGroupConfigs,
   shareRecordIdentity,
   assertShareCleanup,
+  captureShareCleanupBaseline,
 } = require('../../../../testHelpers/shareFixtures')
 const {
   createResourceProbe,
@@ -490,14 +491,15 @@ class IsolationCase {
       await outer.run(
         async () => {
           this.gauge.install()
-          pre = await this.sample(scope)
+          pre = await captureShareCleanupBaseline(this.probe, {
+            signal: scope,
+            cleanupStack: false,
+          })
           await bounded(scope, STEP_MS, () => this.admin.connect())
           await bounded(scope, STEP_MS, async () => {
             await this.admin.describeCluster()
             await this.admin.listGroups()
           })
-          // The helper proves absence before closing admin and sampling this same client-free
-          // context. Both sample() and the helper hold exactly one proof deadline.
           probeBase = pre
           this.row('resource-baseline', { resources: summarize(probeBase) })
           await this.stack.run(

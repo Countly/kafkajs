@@ -1,7 +1,10 @@
 const fs = require('fs')
 const os = require('os')
 const path = require('path')
+const { EventEmitter } = require('events')
 const helpers = require('../index')
+const { createResourceProbe } = require('../resourceProbe')
+const { createFakeSocketFactory, socketCounts } = require('../fakeSocket')
 const {
   SHARE_TOPIC_PREFIX,
   shareTopicName,
@@ -350,9 +353,11 @@ describe('share live fixture observations', () => {
     shareRecordIdentity,
     ShareHandlerLog,
     verifierMember,
+    captureShareCleanupBaseline,
     assertShareCleanup,
   } = require('../shareFixtures')
-  const { liveRun } = require('../../src/producer/__tests__/fixtures/bounded')
+  const { NEVER, bounded, liveRun } = require('../../src/producer/__tests__/fixtures/bounded')
+  const { CleanupStack } = require('../../src/producer/__tests__/fixtures/liveProbe')
   const record = {
     topic: 'records',
     partition: 0,
@@ -483,7 +488,136 @@ describe('share live fixture observations', () => {
   const admin = () => ({
     listGroups: async () => ({ groups: [{ groupId: 'ordinary' }] }),
     listTopics: async () => [],
+    disconnect: async () => {},
   })
+
+  it.each([true, false])(
+    'passes identical real-timer sampling with a cleanup stack: %s',
+    async (cleanupStack) => {
+      const probe = createResourceProbe({
+        emitters: { client: new EventEmitter() },
+        sockets: () => ({ created: 0, destroyed: 0 }),
+        queueDepth: () => 0,
+        ledgerSize: () => 0,
+        activeResources: true,
+      })
+      await bounded(NEVER, 2000, async (scope) => {
+        const before = await captureShareCleanupBaseline(probe, { signal: scope, cleanupStack })
+        let after
+        const prove = async (signal) => {
+          after = await assertShareCleanup(admin(), [], [], before, probe, {
+            signal,
+            disconnectAdmin: true,
+          })
+        }
+        if (cleanupStack) {
+          const cleanup = new CleanupStack()
+          cleanup.add('prove cleanup', prove)
+          await cleanup.run(async () => {}, { budgetMs: 15000 })
+        } else {
+          await prove(scope)
+        }
+        expect(after).toEqual(before)
+      })
+    }
+  )
+
+  it.each(['Timeout', 'socket', 'listener', 'queued request', 'ledger entry'])(
+    'rejects one extra client resource under identical sampling bounds: %s',
+    async (resource) => {
+      const emitter = new EventEmitter()
+      const { factory, state } = createFakeSocketFactory()
+      const queue = []
+      const ledger = new Set()
+      const probe = createResourceProbe({
+        emitters: { client: emitter },
+        sockets: () => socketCounts(state),
+        queueDepth: () => queue.length,
+        ledgerSize: () => ledger.size,
+        activeResources: true,
+      })
+      const before = await captureShareCleanupBaseline(probe, { cleanupStack: false })
+      let timer
+      try {
+        if (resource === 'Timeout') timer = setTimeout(() => {}, 60000)
+        if (resource === 'socket') factory({ host: 'broker', port: 9092, onConnect: () => {} })
+        if (resource === 'listener') emitter.on('data', () => {})
+        if (resource === 'queued request') queue.push({})
+        if (resource === 'ledger entry') ledger.add({})
+        const error = await assertShareCleanup(admin(), [], [], before, probe).catch((e) => e)
+        expect(error).toBeInstanceOf(Error)
+        expect(error.message).toContain('Share resources did not return to baseline')
+        expect(error.message).toContain('baseline:')
+        expect(error.message).toContain('lastAfter:')
+        expect(error.message).toContain('diff:')
+        if (resource === 'Timeout') {
+          expect(error.message).toContain('diff: { activeResources:')
+          expect(error.message).toContain(`Timeout: ${before.activeResources.Timeout + 1}`)
+        }
+        if (resource === 'socket') {
+          expect(error.message).toContain('sockets: { baseline: 0, lastAfter: 1 }')
+        }
+        if (resource === 'listener') {
+          expect(error.message).toContain(
+            'listeners: { baseline: { client: 0 }, lastAfter: { client: 1 } }'
+          )
+        }
+        if (resource === 'queued request') {
+          expect(error.message).toContain('queueDepth: { baseline: 0, lastAfter: 1 }')
+        }
+        if (resource === 'ledger entry') {
+          expect(error.message).toContain('ledgerSize: { baseline: 0, lastAfter: 1 }')
+        }
+      } finally {
+        clearTimeout(timer)
+        state.sockets.forEach((socket) => socket.destroy())
+        emitter.removeAllListeners()
+      }
+    }
+  )
+
+  it.each([100, 20000])(
+    'reports the last diff when cleanup or its enclosing %d ms deadline expires',
+    async (outerMs) => {
+      jest.useFakeTimers()
+      const before = { ...snapshot(), activeResources: { Timeout: 2 } }
+      const last = { ...snapshot(), activeResources: { Timeout: 3 } }
+      const pending = bounded(NEVER, outerMs, (signal) =>
+        assertShareCleanup(
+          admin(),
+          [],
+          [],
+          before,
+          { snapshot: async () => last },
+          { signal, disconnectAdmin: true }
+        )
+      ).catch((error) => error)
+      await jest.advanceTimersByTimeAsync(10500)
+      const error = await pending
+      expect(error.message).toContain(`did not settle within ${Math.min(outerMs, 10000)} ms`)
+      expect(error.message).toContain('baseline:')
+      expect(error.message).toContain('lastAfter:')
+      expect(error.message).toContain('diff:')
+      expect(error.message).toContain('Timeout: 2')
+      expect(error.message).toContain('Timeout: 3')
+      expect(jest.getTimerCount()).toBe(0)
+    }
+  )
+
+  it.each(['listeners', 'sockets', 'queueDepth', 'ledgerSize', 'activeResources'])(
+    'reports a missing %s measurement instead of supplying zero',
+    async (key) => {
+      const after = snapshot()
+      delete after[key]
+      const error = await assertShareCleanup(admin(), [], [], snapshot(), {
+        snapshot: async () => after,
+      }).catch((e) => e)
+      expect(error.message).toContain(`Missing resource measurement: ${key}`)
+      expect(error.message).toContain('baseline:')
+      expect(error.message).toContain('lastAfter:')
+      expect(error.message).toContain('diff:')
+    }
+  )
 
   it('proves owned objects absent and unrelated presence with cumulative socket totals', async () => {
     const after = { ...snapshot(), sockets: { created: 9, destroyed: 9, open: 0 } }
@@ -509,16 +643,18 @@ describe('share live fixture observations', () => {
       if (fault === 'sibling') api.listGroups = async () => ({ groups: [] })
       if (fault === 'resource') after.ledgerSize = 1
       if (fault === 'measurement') delete after.activeResources
-      await expect(
-        assertShareCleanup(
-          api,
-          ['owned'],
-          ['owned-topic'],
-          snapshot(),
-          { snapshot: async () => after },
-          { unrelated: ['ordinary'] }
-        )
-      ).rejects.toThrow()
+      const error = await assertShareCleanup(
+        api,
+        ['owned'],
+        ['owned-topic'],
+        snapshot(),
+        { snapshot: async () => after },
+        { unrelated: ['ordinary'] }
+      ).catch((e) => e)
+      expect(error).toBeInstanceOf(Error)
+      expect(error.message).toContain('baseline:')
+      expect(error.message).toContain('lastAfter:')
+      expect(error.message).toContain('diff:')
     }
   )
 
