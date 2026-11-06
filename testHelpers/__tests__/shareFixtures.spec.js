@@ -1,4 +1,5 @@
 const fs = require('fs')
+const os = require('os')
 const path = require('path')
 const helpers = require('../index')
 const {
@@ -341,5 +342,230 @@ describe('share-group fixtures', () => {
         expect(shared.filter((line) => settings.includes(line))).toEqual(settings)
       }
     )
+  })
+})
+
+describe('share live fixture observations', () => {
+  const {
+    shareRecordIdentity,
+    ShareHandlerLog,
+    verifierMember,
+    assertShareCleanup,
+  } = require('../shareFixtures')
+  const { liveRun } = require('../../src/producer/__tests__/fixtures/bounded')
+  const record = {
+    topic: 'records',
+    partition: 0,
+    offset: '9007199254740993',
+    key: Buffer.from('a'),
+    value: Buffer.from('b'),
+    deliveryCount: 1,
+  }
+  let directory
+  beforeEach(() => {
+    liveRun.reset()
+    directory = fs.mkdtempSync(path.join(os.tmpdir(), 'share-log-'))
+  })
+  afterEach(() => {
+    jest.useRealTimers()
+    fs.rmSync(directory, { recursive: true, force: true })
+    liveRun.reset()
+  })
+
+  it('keeps decimal offsets and nullable bytes in collision-free identities', () => {
+    expect(shareRecordIdentity(record)).toBe('["records",0,"9007199254740993","61","62"]')
+    expect(shareRecordIdentity({ ...record, offset: '9007199254740992' })).not.toBe(
+      shareRecordIdentity(record)
+    )
+    expect(shareRecordIdentity({ ...record, value: null })).not.toBe(
+      shareRecordIdentity({ ...record, value: Buffer.alloc(0) })
+    )
+    expect(() => shareRecordIdentity({ ...record, offset: 1 })).toThrow('decimal offset')
+  })
+
+  it('records starts durably and reconstructs only the original held invocations', () => {
+    const file = path.join(directory, 'member.jsonl')
+    const journal = new ShareHandlerLog(file, 'child')
+    try {
+      const first = journal.start(record)
+      const second = journal.start({ ...record, deliveryCount: 2 })
+      journal.finish(first)
+      expect(ShareHandlerLog.read(file).held).toEqual([shareRecordIdentity(record)])
+      expect(
+        ShareHandlerLog.read(file).rows.map(({ event, invocation }) => [event, invocation])
+      ).toEqual([
+        ['start', 1],
+        ['start', 2],
+        ['finish', 1],
+      ])
+      expect(
+        ShareHandlerLog.read(file)
+          .rows.filter(({ event }) => event === 'start')
+          .map(({ deliveryCount }) => deliveryCount)
+      ).toEqual([1, 2])
+      expect(second).toBe(2)
+      expect(() => journal.finish(first)).toThrow('Unknown handler invocation')
+    } finally {
+      journal.close()
+    }
+    journal.close()
+    expect(() => journal.start(record)).toThrow('closed')
+  })
+
+  it('refuses truncated journals and duplicate completion instead of widening the held set', () => {
+    const file = path.join(directory, 'bad.jsonl')
+    fs.writeFileSync(file, '{')
+    expect(() => ShareHandlerLog.read(file)).toThrow('Incomplete')
+    fs.writeFileSync(file, '{"event":"finish","invocation":1}\n')
+    expect(() => ShareHandlerLog.read(file)).toThrow('order')
+  })
+
+  it('observes a complete post-join verifier window and disconnects its member', async () => {
+    jest.useFakeTimers()
+    let handler
+    let joined
+    const join = new Promise((resolve) => {
+      joined = resolve
+    })
+    const remove = jest.fn()
+    const client = {
+      events: { CRASH: 'crash' },
+      on: jest.fn(() => remove),
+      connect: jest.fn(async () => {}),
+      subscribe: jest.fn(async () => {}),
+      run: jest.fn(async ({ eachMessage }) => {
+        handler = eachMessage
+        joined()
+      }),
+      disconnect: jest.fn(async () => {}),
+    }
+    const kafka = { shareConsumer: jest.fn(() => client) }
+    const pending = verifierMember('existing', 'records', { kafka, windowMs: 5000 })
+    await join
+    await handler({ topic: 'records', partition: 0, message: record })
+    await jest.advanceTimersByTimeAsync(4999)
+    expect(client.disconnect).not.toHaveBeenCalled()
+    await jest.advanceTimersByTimeAsync(1)
+    expect(await pending).toEqual([{ identity: shareRecordIdentity(record), deliveryCount: 1 }])
+    expect(client.subscribe).toHaveBeenCalledWith({ topics: ['records'] })
+    expect(client.disconnect).toHaveBeenCalledWith({ timeout: 2000 })
+    expect(remove).toHaveBeenCalledTimes(1)
+    expect(jest.getTimerCount()).toBe(0)
+  })
+
+  it('keeps verifier join failure primary and taints a failed disconnect', async () => {
+    const primary = new Error('join refused')
+    const client = {
+      events: { CRASH: 'crash' },
+      on: () => () => {},
+      connect: async () => {
+        throw primary
+      },
+      disconnect: async () => {
+        throw new Error('close refused')
+      },
+    }
+    const caught = await verifierMember('existing', 'records', {
+      kafka: { shareConsumer: () => client },
+    }).catch((e) => e)
+    expect(caught).toBe(primary)
+    expect(caught.cleanupErrors).toHaveLength(1)
+    expect(liveRun.tainted).toBe(true)
+  })
+
+  const snapshot = () => ({
+    listeners: { client: 0 },
+    sockets: { created: 2, destroyed: 2, open: 0 },
+    queueDepth: 0,
+    ledgerSize: 0,
+    activeResources: {},
+  })
+  const admin = () => ({
+    listGroups: async () => ({ groups: [{ groupId: 'ordinary' }] }),
+    listTopics: async () => [],
+  })
+
+  it('proves owned objects absent and unrelated presence with cumulative socket totals', async () => {
+    const after = { ...snapshot(), sockets: { created: 9, destroyed: 9, open: 0 } }
+    expect(
+      await assertShareCleanup(
+        admin(),
+        ['owned'],
+        ['owned-topic'],
+        snapshot(),
+        { snapshot: async () => after },
+        { unrelated: ['ordinary'] }
+      )
+    ).toBe(after)
+  })
+
+  it.each(['group', 'topic', 'sibling', 'resource', 'measurement'])(
+    'rejects a false cleanup proof: %s',
+    async (fault) => {
+      const api = admin()
+      const after = snapshot()
+      if (fault === 'group') api.listGroups = async () => ({ groups: [{ groupId: 'owned' }] })
+      if (fault === 'topic') api.listTopics = async () => ['owned-topic']
+      if (fault === 'sibling') api.listGroups = async () => ({ groups: [] })
+      if (fault === 'resource') after.ledgerSize = 1
+      if (fault === 'measurement') delete after.activeResources
+      await expect(
+        assertShareCleanup(
+          api,
+          ['owned'],
+          ['owned-topic'],
+          snapshot(),
+          { snapshot: async () => after },
+          { unrelated: ['ordinary'] }
+        )
+      ).rejects.toThrow()
+    }
+  )
+
+  it('refuses missing or invalid measurements even when both snapshots match', async () => {
+    for (const corrupt of [
+      (value) => delete value.sockets.open,
+      (value) => {
+        value.queueDepth = -1
+      },
+      (value) => {
+        value.listeners.client = 0.5
+      },
+      (value) => {
+        value.sockets.open = 1
+      },
+    ]) {
+      const before = snapshot()
+      corrupt(before)
+      await expect(
+        assertShareCleanup(admin(), [], [], before, {
+          snapshot: async () => structuredClone(before),
+        })
+      ).rejects.toThrow()
+    }
+  })
+
+  it('refuses malformed identity and delivery facts in a complete journal line', () => {
+    const file = path.join(directory, 'invalid.jsonl')
+    const valid = {
+      member: 'child',
+      event: 'start',
+      invocation: 1,
+      identity: shareRecordIdentity(record),
+      deliveryCount: 1,
+    }
+    for (const corrupt of [
+      (value) => delete value.member,
+      (value) => delete value.identity,
+      (value) => delete value.deliveryCount,
+      (value) => {
+        value.identity = '["records",0,"1","xz",null]'
+      },
+    ]) {
+      const row = { ...valid }
+      corrupt(row)
+      fs.writeFileSync(file, JSON.stringify(row) + '\n')
+      expect(() => ShareHandlerLog.read(file)).toThrow()
+    }
   })
 })

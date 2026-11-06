@@ -1,3 +1,4 @@
+const fs = require('fs')
 const sleep = require('../src/utils/sleep')
 const CONFIG_RESOURCE_TYPES = require('../src/protocol/configResourceTypes')
 const CONFIG_SOURCE = require('../src/protocol/configSource')
@@ -130,4 +131,275 @@ const setShareGroupConfigs = async (admin, group, kv, { timeout = 10000, interva
   }
 }
 
-module.exports = { SHARE_TOPIC_PREFIX, shareTopicName, createShareTopic, setShareGroupConfigs }
+/**
+ * A stable delivered-record identity, including bytes and the exact decimal broker offset.
+ * @param {{ topic: string, partition: number, offset: string, key: Buffer|null, value: Buffer|null }} record
+ * @returns {string} a collision-free JSON tuple; delivery count is an observation, not identity
+ * @throws {Error} for a missing topic/partition or a nondecimal offset
+ */
+const shareRecordIdentity = ({ topic, partition, offset, key, value }) => {
+  if (
+    typeof topic !== 'string' ||
+    !Number.isInteger(partition) ||
+    partition < 0 ||
+    typeof offset !== 'string' ||
+    !/^(0|[1-9][0-9]*)$/.test(offset)
+  ) {
+    throw new Error('A share record needs a topic, partition and decimal offset')
+  }
+  return JSON.stringify([
+    topic,
+    partition,
+    offset,
+    key === null ? null : key.toString('hex'),
+    value === null ? null : value.toString('hex'),
+  ])
+}
+
+/**
+ * A synchronous handler journal: each start is fsynced before the handler can block or be killed,
+ * so a parent can read exactly which invocations never finished. A finish records that a handler
+ * returned, never that the broker accepted its decision.
+ */
+class ShareHandlerLog {
+  /**
+   * @param {string} file fresh, exclusive journal path owned by this invocation
+   * @param {string} member client label; broker member id is recorded separately in evidence
+   * @throws {Error} on an existing file or filesystem failure
+   */
+  constructor(file, member) {
+    this.fd = fs.openSync(file, 'wx', 0o600)
+    this.member = member
+    this.sequence = 0
+    this.held = new Map()
+  }
+
+  /**
+   * @param {object} record delivered record plus topic and partition
+   * @returns {number} original invocation id, unique even on redelivery
+   * @throws {Error} on invalid identity, a closed journal or failed durable write
+   */
+  start(record) {
+    const identity = shareRecordIdentity(record)
+    const invocation = ++this.sequence
+    this.append({ event: 'start', invocation, identity, deliveryCount: record.deliveryCount })
+    this.held.set(invocation, identity)
+    return invocation
+  }
+
+  /**
+   * @param {number} invocation the exact start to complete
+   * @returns {void}
+   * @throws {Error} if unknown/already complete, closed or the write fails
+   */
+  finish(invocation) {
+    if (!this.held.has(invocation)) throw new Error('Unknown handler invocation')
+    this.append({ event: 'finish', invocation })
+    this.held.delete(invocation)
+  }
+
+  /**
+   * @param {object} row immutable journal fact, never an acknowledgement success claim
+   * @returns {void}
+   * @throws {Error} on a closed journal or filesystem failure
+   */
+  append(row) {
+    if (this.fd === null) throw new Error('Handler journal is closed')
+    fs.writeSync(this.fd, `${JSON.stringify({ member: this.member, ...row })}\n`)
+    fs.fsyncSync(this.fd)
+  }
+
+  /**
+   * @returns {void} closes the descriptor at most once
+   * @throws {Error} on filesystem failure
+   */
+  close() {
+    if (this.fd === null) return
+    fs.closeSync(this.fd)
+    this.fd = null
+  }
+
+  /**
+   * Replays journal facts without inferring completion from handler return or broker state.
+   * @param {string} file this invocation's child journal
+   * @returns {{ rows: object[], held: string[] }} held identities with multiplicity
+   * @throws {Error} on malformed, truncated, out-of-order or duplicate-completion input
+   */
+  static read(file) {
+    const text = fs.readFileSync(file, 'utf8')
+    if (text && !text.endsWith('\n')) throw new Error('Incomplete handler journal')
+    const rows = text
+      .split('\n')
+      .filter(Boolean)
+      .map((row) => JSON.parse(row))
+    const held = new Map()
+    let sequence = 0
+    const member = rows[0]?.member
+    for (const row of rows) {
+      if (
+        !row ||
+        typeof member !== 'string' ||
+        !member ||
+        row.member !== member ||
+        !Number.isSafeInteger(row.invocation) ||
+        row.invocation < 1
+      ) {
+        throw new Error('Invalid handler journal order or fact')
+      }
+      if (row.event === 'start' && row.invocation === sequence + 1) {
+        const tuple = JSON.parse(row.identity)
+        if (
+          !Array.isArray(tuple) ||
+          tuple.length !== 5 ||
+          !tuple.slice(3).every((bytes) => bytes === null || /^(?:[0-9a-f]{2})*$/.test(bytes)) ||
+          !Number.isSafeInteger(row.deliveryCount) ||
+          row.deliveryCount < 1 ||
+          shareRecordIdentity({
+            topic: tuple[0],
+            partition: tuple[1],
+            offset: tuple[2],
+            key: tuple[3] === null ? null : Buffer.from(tuple[3], 'hex'),
+            value: tuple[4] === null ? null : Buffer.from(tuple[4], 'hex'),
+          }) !== row.identity
+        ) {
+          throw new Error('Invalid handler journal identity or delivery count')
+        }
+        sequence = row.invocation
+        held.set(row.invocation, row.identity)
+      } else if (row.event === 'finish' && held.has(row.invocation)) {
+        held.delete(row.invocation)
+      } else throw new Error('Invalid handler journal order')
+    }
+    return { rows, held: [...held.values()] }
+  }
+}
+
+/**
+ * Runs a fresh member in an existing group, starting its observation window only after join.
+ * It does not set configs, reset offsets, produce data or invent acquisition state. Every await
+ * is bounded by the inherited harness. Abort/expiry or failed cleanup taints that spec's run;
+ * work ignoring abort may finish later and is contained by the sole guard.
+ * @param {string} group existing group id
+ * @param {string} topic topic to observe
+ * @param {object} [options] injected Kafka and enclosing signal for live callers
+ * @param {object} [options.kafka] defaults to the repository's plaintext Kafka configuration
+ * @param {AbortSignal} [options.signal] enclosing case scope
+ * @param {number} [options.windowMs=5000] post-join observation window
+ * @returns {Promise<object[]>} actual delivered identities and delivery counts
+ * @throws {Error} on join, crash, bound or cleanup failure
+ */
+const verifierMember = async (group, topic, { kafka, signal, windowMs = 5000 } = {}) => {
+  const { NEVER, bounded, delay } = require('../src/producer/__tests__/fixtures/bounded')
+  const { CleanupStack } = require('../src/producer/__tests__/fixtures/liveProbe')
+  const { Kafka, logLevel } = require('../index')
+  const owner = signal || NEVER
+  const client = (
+    kafka || new Kafka({ brokers: helpers.plainTextBrokers(), logLevel: logLevel.NOTHING })
+  ).shareConsumer({ groupId: group, maxRecords: 100, acknowledgementMode: 'implicit' })
+  const cleanup = new CleanupStack()
+  const delivered = []
+  const crashes = []
+  const remove = client.on(client.events.CRASH, ({ payload }) => {
+    crashes.push(payload.error)
+  })
+  cleanup.add('remove verifier listener', () => remove())
+  cleanup.add('disconnect verifier', () => client.disconnect({ timeout: 2000 }))
+  return cleanup.run(
+    async () => {
+      await bounded(owner, 10000, () => client.connect())
+      await bounded(owner, 10000, () => client.subscribe({ topics: [topic] }))
+      await bounded(owner, 10000, () =>
+        client.run({
+          eachMessage: async ({ topic: name, partition, message }) => {
+            delivered.push({
+              identity: shareRecordIdentity({ ...message, topic: name, partition }),
+              deliveryCount: message.deliveryCount,
+            })
+          },
+        })
+      )
+      await delay(owner, windowMs)
+      if (crashes.length) throw crashes[0]
+      return delivered
+    },
+    { budgetMs: 3000 }
+  )
+}
+
+/**
+ * Proves owned groups/topics absent and measured owners back at baseline after CleanupStack.
+ * Unrelated groups are checked for presence only, never whole-cluster list equality.
+ * @param {object} admin still-connected admin; disconnected after this proof
+ * @param {string[]} groups owned group ids
+ * @param {string[]} topics owned topic names
+ * @param {object} baseline measured pre-client snapshot
+ * @param {{ snapshot: Function }} probe original owners' resource probe
+ * @param {object} [options] unrelated group ids and case signal
+ * @param {string[]} [options.unrelated=[]] previously observed unrelated groups
+ * @param {AbortSignal} [options.signal] enclosing cleanup scope
+ * @returns {Promise<object>} final measured snapshot
+ * @throws {Error} on missing measurement, retained resource, leftover group/topic or harmed sibling
+ */
+const assertShareCleanup = async (
+  admin,
+  groups,
+  topics,
+  baseline,
+  probe,
+  { unrelated = [], signal } = {}
+) => {
+  const { isDeepStrictEqual } = require('util')
+  const { NEVER, bounded } = require('../src/producer/__tests__/fixtures/bounded')
+  return bounded(signal || NEVER, 10000, async (scope) => {
+    const { groups: listed } = await bounded(scope, Infinity, () => admin.listGroups())
+    const names = new Set(listed.map(({ groupId }) => groupId))
+    const remaining = await bounded(scope, Infinity, () => admin.listTopics())
+    if (groups.some((id) => names.has(id)) || topics.some((name) => remaining.includes(name))) {
+      throw new Error('Share fixture remains after cleanup')
+    }
+    if (unrelated.some((id) => !names.has(id))) throw new Error('Unrelated group disappeared')
+    const after = await bounded(scope, Infinity, () => probe.snapshot())
+    for (const snapshot of [baseline, after]) {
+      for (const key of ['listeners', 'sockets', 'queueDepth', 'ledgerSize', 'activeResources']) {
+        if (snapshot?.[key] === undefined) throw new Error(`Missing resource measurement: ${key}`)
+      }
+      const count = (value) => Number.isSafeInteger(value) && value >= 0
+      const counts = (value) =>
+        value !== null &&
+        typeof value === 'object' &&
+        !Array.isArray(value) &&
+        Object.values(value).every(count)
+      if (
+        !counts(snapshot.listeners) ||
+        !counts(snapshot.activeResources) ||
+        !count(snapshot.queueDepth) ||
+        !count(snapshot.ledgerSize) ||
+        !['created', 'destroyed', 'open'].every((key) => count(snapshot.sockets?.[key])) ||
+        snapshot.sockets.created - snapshot.sockets.destroyed !== snapshot.sockets.open
+      ) {
+        throw new Error('Invalid resource measurement')
+      }
+    }
+    if (
+      after.sockets.open !== baseline.sockets.open ||
+      after.queueDepth !== baseline.queueDepth ||
+      after.ledgerSize !== baseline.ledgerSize ||
+      !isDeepStrictEqual(after.listeners, baseline.listeners) ||
+      !isDeepStrictEqual(after.activeResources, baseline.activeResources)
+    ) {
+      throw new Error('Share resources did not return to baseline')
+    }
+    return after
+  })
+}
+
+module.exports = {
+  SHARE_TOPIC_PREFIX,
+  shareTopicName,
+  createShareTopic,
+  setShareGroupConfigs,
+  shareRecordIdentity,
+  ShareHandlerLog,
+  verifierMember,
+  assertShareCleanup,
+}
