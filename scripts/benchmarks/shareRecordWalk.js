@@ -96,8 +96,8 @@ const expansionControl = (input) => {
 const verify = (output, input) => {
   const actual = new Set()
   for (const { record } of output.deliver) {
-    assert(input.expected.has(record.offset))
-    assert(!actual.has(record.offset))
+    assert(input.expected.has(record.offset), 'delivered offset was not generated')
+    assert(!actual.has(record.offset), 'delivered offset repeated')
     actual.add(record.offset)
   }
   assert.equal(actual.size, input.delivered)
@@ -107,14 +107,16 @@ const verify = (output, input) => {
   for (const range of output.gaps) {
     const first = BigInt(range.firstOffset)
     const last = BigInt(range.lastOffset)
-    assert(first > prior && last >= first)
+    assert(first > prior && last >= first, 'gaps must ascend without overlap')
     const low = Number(first)
     const high = Number(last)
     assert(
-      low >= 0 && high <= Number(input.acquiredRecords[input.acquiredRecords.length - 1].lastOffset)
+      low >= 0 &&
+        high <= Number(input.acquiredRecords[input.acquiredRecords.length - 1].lastOffset),
+      'gap lies outside the acquired span'
     )
-    assert(Math.floor(low / 503) === Math.floor(high / 503))
-    assert(low % 503 >= 250 && high % 503 <= 499)
+    assert(Math.floor(low / 503) === Math.floor(high / 503), 'gap crosses an unacquired offset')
+    assert(low % 503 >= 250 && high % 503 <= 499, 'gap covers a delivered offset')
     gapCount += last - first + 1n
     prior = last
   }

@@ -1,5 +1,7 @@
 const { KafkaJSNonRetriableError } = require('../../errors')
 const MAX_OFFSET = 9223372036854775807n
+const OFFSET_TYPES = new Set(['string', 'bigint', 'number'])
+const OFFSET_TEXT = /^(0|[1-9][0-9]*)$/
 
 /**
  * Parses an exact nonnegative signed-int64 offset without rounding.
@@ -9,9 +11,9 @@ const MAX_OFFSET = 9223372036854775807n
  */
 const parseOffset = (value) => {
   if (
-    !['string', 'bigint', 'number'].includes(typeof value) ||
+    !OFFSET_TYPES.has(typeof value) ||
     (typeof value === 'number' && !Number.isSafeInteger(value)) ||
-    !/^(0|[1-9][0-9]*)$/.test(String(value))
+    !OFFSET_TEXT.test(String(value))
   ) {
     throw new KafkaJSNonRetriableError('Offset must be an exact nonnegative integer')
   }
@@ -86,6 +88,44 @@ const appendRange = (output, first, last, deliveryCount) => {
   }
 }
 
+/** A forward-only cursor over decoded records that parses and orders each offset exactly once. */
+class RecordCursor {
+  /**
+   * @param {object[]} messages Decoded records with decimal offsets, ascending (equal offsets allowed).
+   * @returns {RecordCursor} Cursor on the first record, already validated.
+   * @throws {KafkaJSNonRetriableError} If the first offset is malformed.
+   */
+  constructor(messages) {
+    this.messages = messages
+    this.index = -1
+    this.offset = -1n
+    this.advance()
+  }
+
+  /** @returns {boolean} True once every record has been consumed. */
+  get done() {
+    return this.index >= this.messages.length
+  }
+
+  /** @returns {object} Current record; callers check `done` first. */
+  get record() {
+    return this.messages[this.index]
+  }
+
+  /**
+   * Moves to the next record and validates its offset against the previous one.
+   * @returns {void} After the last record, `done` is true and `offset` keeps the last offset.
+   * @throws {KafkaJSNonRetriableError} For a malformed, unsafe, overflowing or descending offset.
+   */
+  advance() {
+    this.index++
+    if (this.done) return
+    const offset = parseOffset(this.messages[this.index].offset)
+    if (offset < this.offset) throw new KafkaJSNonRetriableError('Record offsets must be ascending')
+    this.offset = offset
+  }
+}
+
 /** Exact acquired-range normalization and two-pointer classification of a decoded partition. */
 class ShareRecordWalk {
   /**
@@ -151,30 +191,29 @@ class ShareRecordWalk {
    * @param {object} [input.corruption] Existing reason/offset/error marker; presence means halted.
    * @param {object} [logger] Existing logger with warn().
    * @returns {{deliver:object[],gaps:object[],release:object[],reject:object[]}} Compact classification.
-   * @throws {KafkaJSNonRetriableError} For malformed acquisitions or descending record offsets.
+   * @throws {KafkaJSNonRetriableError} For malformed acquisitions or malformed or descending record
+   * offsets, including records past the last acquired range; each offset is parsed once.
    */
   static walk({ acquiredRecords, messages, corruption }, logger) {
     const ranges = ShareRecordWalk.normalize(acquiredRecords, logger)
     if (corruption && logger)
       logger.error('Share fetch decoding halted', { error: corruption.error })
-    let previous = -1n
-    for (const record of messages) {
-      const current = parseOffset(record.offset)
-      if (current < previous) throw new KafkaJSNonRetriableError('Record offsets must be ascending')
-      previous = current
-    }
-    const frontier = corruption ? previous : MAX_OFFSET
+    const frontier = !corruption
+      ? MAX_OFFSET
+      : messages.length
+        ? parseOffset(messages[messages.length - 1].offset)
+        : -1n
+    const records = new RecordCursor(messages)
     const output = { deliver: [], gaps: [], release: [], reject: [] }
-    let index = 0
     for (const range of ranges) {
       const first = BigInt(range.firstOffset)
       const last = BigInt(range.lastOffset)
       const end = last < frontier ? last : frontier
       let cursor = first
-      while (index < messages.length && BigInt(messages[index].offset) < first) index++
-      while (index < messages.length && BigInt(messages[index].offset) <= end) {
-        const record = messages[index++]
-        const at = BigInt(record.offset)
+      while (!records.done && records.offset < first) records.advance()
+      while (!records.done && records.offset <= end) {
+        const { record, offset: at } = records
+        records.advance()
         if (at < cursor) continue
         appendRange(output.gaps, cursor, at - 1n)
         if (record.isControlRecord) appendRange(output.gaps, at, at)
@@ -184,6 +223,7 @@ class ShareRecordWalk {
       appendRange(output.gaps, cursor, end)
       appendRange(output.release, end < first ? first : end + 1n, last)
     }
+    while (!records.done) records.advance()
     return output
   }
 }

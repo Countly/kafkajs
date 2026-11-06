@@ -6,6 +6,7 @@ const range = (first, last, deliveryCount = 1) => ({
   lastOffset: String(last),
   deliveryCount,
 })
+const failure = (Class, message) => expect.objectContaining({ name: Class.name, message })
 const record = (offset, isControlRecord = false) => ({ offset: String(offset), isControlRecord })
 const span = (first, last) => ({ firstOffset: String(first), lastOffset: String(last) })
 
@@ -188,16 +189,67 @@ describe('deterministic acquired record walk', () => {
       })
     }
   )
-  test.each([-1, 1.5, 9007199254740992, '-1', '01', '9223372036854775808', '1e3', {}, null])(
-    'rejects malformed offset %p',
-    (value) => expect(() => parseOffset(value)).toThrow(KafkaJSNonRetriableError)
+  test.each([
+    [-1, 'Offset must be an exact nonnegative integer'],
+    [1.5, 'Offset must be an exact nonnegative integer'],
+    [9007199254740992, 'Offset must be an exact nonnegative integer'],
+    ['-1', 'Offset must be an exact nonnegative integer'],
+    ['01', 'Offset must be an exact nonnegative integer'],
+    ['9223372036854775808', 'Offset exceeds signed int64'],
+    ['1e3', 'Offset must be an exact nonnegative integer'],
+    [{}, 'Offset must be an exact nonnegative integer'],
+    [null, 'Offset must be an exact nonnegative integer'],
+  ])('rejects malformed offset %p', (value, message) =>
+    expect(() => parseOffset(value)).toThrow(failure(KafkaJSNonRetriableError, message))
   )
   test('rejects malformed ranges, counts and descending messages', () => {
     for (const row of [range(2, 1), range(1, 2, 0), range(1, 2, 32768)])
-      expect(() => ShareRecordWalk.normalize([row])).toThrow(KafkaJSNonRetriableError)
+      expect(() => ShareRecordWalk.normalize([row])).toThrow(
+        failure(KafkaJSNonRetriableError, 'Invalid acquired range or delivery count')
+      )
     expect(() =>
       ShareRecordWalk.walk({ acquiredRecords: [range(1, 2)], messages: [record(2), record(1)] })
-    ).toThrow(KafkaJSNonRetriableError)
+    ).toThrow(failure(KafkaJSNonRetriableError, 'Record offsets must be ascending'))
+  })
+  test.each([
+    [
+      'a malformed offset after the last acquired range',
+      { acquiredRecords: [range(1, 1)], messages: [record(1), record(2), { offset: 'oops' }] },
+      'Offset must be an exact nonnegative integer',
+    ],
+    [
+      'a descending offset after the last acquired range',
+      { acquiredRecords: [range(1, 1)], messages: [record(1), record(5), record(4)] },
+      'Record offsets must be ascending',
+    ],
+    [
+      'a malformed offset with no acquired range',
+      { acquiredRecords: [], messages: [record(1), { offset: '-1' }] },
+      'Offset must be an exact nonnegative integer',
+    ],
+    [
+      'a descending offset in a halted prefix',
+      {
+        acquiredRecords: [range(1, 9)],
+        messages: [record(3), record(2)],
+        corruption: { reason: 'count', offset: '4', error: new Error('halted') },
+      },
+      'Record offsets must be ascending',
+    ],
+  ])('refuses %s', (_label, input, message) =>
+    expect(() => ShareRecordWalk.walk(input)).toThrow(failure(KafkaJSNonRetriableError, message))
+  )
+  test('parses each decoded offset once instead of once per pass', () => {
+    const messages = Array.from({ length: 1000 }, (_, i) => record(i))
+    const parse = jest.spyOn(global, 'BigInt')
+    let calls
+    try {
+      ShareRecordWalk.walk({ acquiredRecords: [range(0, 999)], messages })
+    } finally {
+      calls = parse.mock.calls.length
+      parse.mockRestore()
+    }
+    expect(calls - messages.length).toBeLessThan(10)
   })
   test('deduplicates repeated decoded offsets and handles more than the argument limit', () => {
     expect(
@@ -248,7 +300,8 @@ describe('deterministic acquired record walk', () => {
 })
 
 describe('fixed-seed acquired walk properties', () => {
-  test.each(Array.from({ length: 200 }, (_, i) => 2026102300 + i))('seed %i', (seed) => {
+  test.each(Array.from({ length: 200 }, (_, i) => [i]))('case %i', (index) => {
+    const seed = 2026102300 + index
     const random = mulberry32(seed)
     const base = [0n, 9007199254740993n, 9223372036854775700n][seed % 3]
     const acquiredRecords = Array.from({ length: 8 }, () => {

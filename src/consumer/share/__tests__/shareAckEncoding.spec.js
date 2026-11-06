@@ -9,6 +9,9 @@ const row = (offset, type, automatic = false, last = offset) => ({
   type,
   automatic,
 })
+const failure = (Class, message) => expect.objectContaining({ name: Class.name, message })
+const OVERLAP = 'Overlapping or unbounded mixed acknowledgement entries'
+const BOUNDS = 'Invalid acknowledgement batch bounds or type count'
 const batch = (first, last, types) => ({
   firstOffset: String(first),
   lastOffset: String(last),
@@ -67,24 +70,24 @@ describe('deterministic acknowledgement encoding', () => {
   test('broker validator permits touching boundaries while encoder refuses overlap', () => {
     expect(() => validateAcknowledgements([batch(1, 2, [1]), batch(2, 3, [2])])).not.toThrow()
     expect(() => encodeAcknowledgements([row(1, 1, true, 2), row(2, 2, true, 3)])).toThrow(
-      'Overlapping'
+      failure(KafkaJSNonRetriableError, OVERLAP)
     )
   })
-  test.each(
-    [
-      [batch(2, 1, [1])],
-      [batch(1, 3, [])],
-      [batch(1, 3, [1, 2])],
-      [batch(1, 1, [4])],
-      [batch(1, 1, [-1])],
-      [batch(1, 1, [5])],
-      [batch(1, 1, [1.5])],
-      [batch('-1', 1, [1])],
-      [batch(0, '9223372036854775808', [1])],
-      [batch(1, 3, [1]), batch(2, 4, [1])],
-    ].map((batches) => [batches])
-  )('locally refuses broker-invalid batches %p', (batches) =>
-    expect(() => validateAcknowledgements(batches)).toThrow(KafkaJSNonRetriableError)
+  test.each([
+    [[batch(2, 1, [1])], BOUNDS],
+    [[batch(1, 3, [])], BOUNDS],
+    [[batch(1, 3, [1, 2])], BOUNDS],
+    [[batch(1, 1, [4])], 'Invalid acknowledgement type'],
+    [[batch(1, 1, [-1])], 'Invalid acknowledgement type'],
+    [[batch(1, 1, [5])], 'Invalid acknowledgement type'],
+    [[batch(1, 1, [1.5])], 'Invalid acknowledgement type'],
+    [[batch('-1', 1, [1])], 'Offset must be an exact nonnegative integer'],
+    [[batch(0, '9223372036854775808', [1])], 'Offset exceeds signed int64'],
+    [[batch(1, 3, [1]), batch(2, 4, [1])], BOUNDS],
+  ])('locally refuses broker-invalid batches %p', (batches, message) =>
+    expect(() => validateAcknowledgements(batches)).toThrow(
+      failure(KafkaJSNonRetriableError, message)
+    )
   )
   test('type four requires a renew request and leaves other valid types permitted', () => {
     expect(() => validateAcknowledgements([batch(1, 1, [4])], { isRenewAck: true })).not.toThrow()
@@ -160,7 +163,8 @@ describe('deterministic acknowledgement encoding', () => {
 })
 
 describe('fixed-seed ledger encoding properties', () => {
-  test.each(Array.from({ length: 200 }, (_, i) => 2026102500 + i))('seed %i', (seed) => {
+  test.each(Array.from({ length: 200 }, (_, i) => [i]))('case %i', (index) => {
+    const seed = 2026102500 + index
     const random = mulberry32(seed)
     const base = seed % 2 ? 9007199254740993n : 0n
     let next = base
@@ -170,6 +174,8 @@ describe('fixed-seed ledger encoding properties', () => {
     })
     check(entries)
     check(entries, true)
-    if (entries.length > 1) expect(() => encodeAcknowledgements([entries[0], entries[0]])).toThrow()
+    expect(() => encodeAcknowledgements([entries[0], entries[0]])).toThrow(
+      failure(KafkaJSNonRetriableError, OVERLAP)
+    )
   })
 })

@@ -2,6 +2,8 @@ const { ShareRecordWalk } = require('../shareRecordWalk')
 const { ShareAckLedger } = require('../shareAckLedger')
 const { KafkaJSNonRetriableError, KafkaJSShareAcknowledgementError } = require('../../../errors')
 const { createErrorFromCode } = require('../../../protocol/error')
+const failure = (Class, message) => expect.objectContaining({ name: Class.name, message })
+const OUTSIDE = 'Acknowledgement is outside its active handler acquisition'
 const make = (overrides = {}) => {
   const token = Symbol('acquisition')
   const walk = ShareRecordWalk.walk({
@@ -34,7 +36,7 @@ describe('deterministic compact acknowledgement ledger', () => {
     expect(ticket.acknowledgementBatches).toEqual([
       { firstOffset: '1', lastOffset: '1', acknowledgeTypes: [3] },
     ])
-    expect(() => ledger.decide('1', 'accept')).toThrow(KafkaJSNonRetriableError)
+    expect(() => ledger.decide('1', 'accept')).toThrow(failure(KafkaJSNonRetriableError, OUTSIDE))
     expect(ledger.prepare({ token }).ticket).toBeNull()
     expect(ledger.settle(ticket, { token })).toEqual([
       { firstOffset: '1', lastOffset: '1', type: 'reject', error: null },
@@ -44,10 +46,14 @@ describe('deterministic compact acknowledgement ledger', () => {
   })
   test('completion validates all offsets atomically and rejects late or foreign calls', () => {
     const { ledger, token } = make()
-    expect(() => ledger.complete(['1', '99'], 'accept')).toThrow(KafkaJSNonRetriableError)
+    expect(() => ledger.complete(['1', '99'], 'accept')).toThrow(
+      failure(KafkaJSNonRetriableError, OUTSIDE)
+    )
     expect(ledger.prepare({ token }).ticket).toBeNull()
     ledger.decide('1')
-    expect(() => ledger.decide('1', 'renew')).toThrow(KafkaJSNonRetriableError)
+    expect(() => ledger.decide('1', 'renew')).toThrow(
+      failure(KafkaJSNonRetriableError, 'Invalid terminal acknowledgement')
+    )
     ledger.complete(['1', '1', '2', '3'], 'release')
     const { ticket } = ledger.prepare({ token })
     expect(ledger.settle(ticket, { token }).map((r) => r.type)).toEqual(['accept', 'release'])
@@ -82,7 +88,8 @@ describe('deterministic compact acknowledgement ledger', () => {
     const { ticket } = ledger.prepare({ token })
     const results = ledger.settle(ticket, { token, present: false })
     expect(results[0].error.reason).toBe('rejected-by-broker')
-    expect(results[0].error.cause.message).toContain('omitted a partition')
+    expect(results[0].error.cause).toBeInstanceOf(KafkaJSNonRetriableError)
+    expect(results[0].error.cause.message).toBe('Acknowledgement response omitted a partition')
     expect(ledger.size).toBe(0)
   })
   test('numeric equality cannot replace opaque issuance identity', () => {
@@ -91,9 +98,54 @@ describe('deterministic compact acknowledgement ledger', () => {
     ledger.complete(['1', '2', '3'], 'accept')
     const result = ledger.prepare({ token: { epoch: 1, sentAt: 100 } })
     expect(result.ticket).toBeNull()
+    expect(result.results).toEqual([
+      {
+        firstOffset: '1',
+        lastOffset: '3',
+        type: 'accept',
+        error: expect.any(KafkaJSShareAcknowledgementError),
+      },
+    ])
     expect(result.results[0].error.reason).toBe('session-lost')
     expect(ledger.prepare({ token: original }).ticket).toBeNull()
     expect(ledger.size).toBe(0)
+  })
+  test('a stale-token settlement fails sent and held entries as session-lost exactly once', () => {
+    const { ledger, token } = make()
+    ledger.complete(['1', '2'], 'accept')
+    const { ticket } = ledger.prepare({ token })
+    const results = ledger.settle(ticket, { token: Symbol('stale') })
+    expect(results).toEqual([
+      {
+        firstOffset: '1',
+        lastOffset: '2',
+        type: 'accept',
+        error: expect.any(KafkaJSShareAcknowledgementError),
+      },
+      {
+        firstOffset: '3',
+        lastOffset: '3',
+        type: 'release',
+        error: expect.any(KafkaJSShareAcknowledgementError),
+      },
+    ])
+    expect(results[0].error).toMatchObject({
+      reason: 'session-lost',
+      topic: '__proto__',
+      partition: 0,
+      ranges: [{ firstOffset: '1', lastOffset: '2' }],
+    })
+    expect(results[1].error).toMatchObject({
+      reason: 'session-lost',
+      ranges: [{ firstOffset: '3', lastOffset: '3' }],
+    })
+    expect(ledger.size).toBe(0)
+    expect(ledger.settle(ticket, { token })).toEqual([])
+    expect(ledger.settle(ticket, { token: Symbol('stale') })).toEqual([])
+    expect(ledger.prepare({ token })).toEqual({ ticket: null, results: [] })
+    expect(() => ledger.complete(['3'], 'accept')).toThrow(
+      failure(KafkaJSNonRetriableError, OUTSIDE)
+    )
   })
   test('one partition cannot combine two acquisitions, while distinct partitions group', () => {
     const a = make()
@@ -104,7 +156,9 @@ describe('deterministic compact acknowledgement ledger', () => {
       ledger: x.ledger,
       ticket: x.ledger.prepare({ token: x.token }).ticket,
     }))
-    expect(() => ShareAckLedger.requestTopics(prepared.slice(0, 2))).toThrow('One acquisition')
+    expect(() => ShareAckLedger.requestTopics(prepared.slice(0, 2))).toThrow(
+      failure(KafkaJSNonRetriableError, 'One acquisition per partition per request is required')
+    )
     expect(
       ShareAckLedger.requestTopics([prepared[0], prepared[2]])[0].partitions.map(
         (p) => p.partitionIndex
@@ -119,7 +173,7 @@ describe('deterministic compact acknowledgement ledger', () => {
     expect(lost).toHaveLength(1)
     expect(lost[0].firstOffset).toBe('2')
     expect(lost[0].lastOffset).toBe('3')
-    expect(() => ledger.decide('2')).toThrow(KafkaJSNonRetriableError)
+    expect(() => ledger.decide('2')).toThrow(failure(KafkaJSNonRetriableError, OUTSIDE))
     expect(ledger.prepare({ token }).ticket).toBeNull()
     expect(ledger.settle(ticket, { token })[0].error).toBeNull()
     expect(ledger.settle(ticket, { token })).toEqual([])
@@ -147,10 +201,114 @@ describe('deterministic compact acknowledgement ledger', () => {
   })
 })
 
+describe('mixed delivery, gap, hole and release acquisition above 2^53', () => {
+  const BASE = 9007199254740993n
+  const at = (n) => String(BASE + BigInt(n))
+  const span = (first, last) => ({ firstOffset: at(first), lastOffset: at(last) })
+  const batch = (first, last, acknowledgeTypes) => ({ ...span(first, last), acknowledgeTypes })
+  const outcome = (first, last, type) => ({ ...span(first, last), type })
+  const withoutError = ({ error, ...range }) => range
+  const record = (n, isControlRecord = false) => ({ offset: at(n), isControlRecord })
+  const mixed = () => {
+    const walk = ShareRecordWalk.walk({
+      acquiredRecords: [
+        { ...span(0, 3), deliveryCount: 2 },
+        { ...span(6, 9), deliveryCount: 3 },
+      ],
+      messages: [record(0), record(1), record(3, true), record(6), record(7)],
+      corruption: { reason: 'checksum', offset: at(8), error: new Error('decode halted') },
+    })
+    expect(walk.deliver.map((item) => item.record.offset)).toEqual([at(0), at(1), at(6), at(7)])
+    expect(walk.gaps).toEqual([span(2, 3)])
+    expect(walk.release).toEqual([span(8, 9)])
+    return make({ walk })
+  }
+
+  test('one ticket carries exact batches with the unacquired hole omitted and gaps as type zero', () => {
+    const { ledger, token } = mixed()
+    ledger.decide(at(1), 'reject')
+    ledger.decide(at(6), 'release')
+    ledger.complete([at(0), at(1), at(6), at(7)], 'accept')
+    const { ticket } = ledger.prepare({ token })
+    expect(ticket.acknowledgementBatches).toEqual([
+      batch(0, 1, [1, 3]),
+      batch(2, 3, [0]),
+      batch(6, 7, [2, 1]),
+      batch(8, 9, [2]),
+    ])
+    const results = ledger.settle(ticket, { token })
+    expect(results.map(withoutError)).toEqual([
+      outcome(0, 0, 'accept'),
+      outcome(1, 1, 'reject'),
+      outcome(2, 3, 'gap'),
+      outcome(6, 6, 'release'),
+      outcome(7, 7, 'accept'),
+      outcome(8, 9, 'release'),
+    ])
+    expect(results.map((result) => result.error)).toEqual(Array(6).fill(null))
+    expect(ledger.size).toBe(0)
+  })
+
+  test('a failed settlement reports gaps as gaps and never as accepted ranges', () => {
+    const { ledger, token } = mixed()
+    ledger.complete([at(0), at(1), at(6), at(7)], 'accept')
+    const { ticket } = ledger.prepare({ token })
+    const results = ledger.settle(ticket, { token, result: 'rejected-by-broker' })
+    expect(results.map(withoutError)).toEqual([
+      outcome(0, 1, 'accept'),
+      outcome(2, 3, 'gap'),
+      outcome(6, 7, 'accept'),
+      outcome(8, 9, 'release'),
+    ])
+    for (const result of results) {
+      expect(result.error).toBeInstanceOf(KafkaJSShareAcknowledgementError)
+      expect(result.error.reason).toBe('rejected-by-broker')
+    }
+    expect(results[0].error).toBe(results[2].error)
+    expect(results[0].error.ranges).toEqual([span(0, 1), span(6, 7)])
+    expect(results[1].error.ranges).toEqual([span(2, 3)])
+    expect(results[3].error.ranges).toEqual([span(8, 9)])
+    expect(ledger.size).toBe(0)
+  })
+
+  test('automatic gap and release ranges go out alone before any handler completes', () => {
+    const { ledger, token } = mixed()
+    expect(ledger.size).toBe(6)
+    const first = ledger.prepare({ token }).ticket
+    expect(first.acknowledgementBatches).toEqual([batch(2, 3, [0]), batch(8, 9, [2])])
+    expect(ledger.settle(first, { token }).map(withoutError)).toEqual([
+      outcome(2, 3, 'gap'),
+      outcome(8, 9, 'release'),
+    ])
+    expect(ledger.size).toBe(4)
+    ledger.decide(at(1), 'reject')
+    ledger.complete([at(0), at(1), at(6), at(7)], 'accept')
+    const second = ledger.prepare({ token }).ticket
+    expect(second.acknowledgementBatches).toEqual([batch(0, 1, [1, 3]), batch(6, 7, [1])])
+    expect(ledger.settle(second, { token }).map(withoutError)).toEqual([
+      outcome(0, 0, 'accept'),
+      outcome(1, 1, 'reject'),
+      outcome(6, 7, 'accept'),
+    ])
+    expect(ledger.size).toBe(0)
+  })
+})
+
 describe('fixed-seed ledger settlement properties', () => {
   const { mulberry32 } = require('../../../../testHelpers/schedule')
-  test.each(Array.from({ length: 200 }, (_, i) => 2026102700 + i))('seed %i', (seed) => {
-    const random = mulberry32(seed)
+  const WIRE = { accept: 1, release: 2, reject: 3 }
+  const expand = (batches) => {
+    const types = new Map()
+    for (const { firstOffset, lastOffset, acknowledgeTypes } of batches)
+      for (let n = BigInt(firstOffset); n <= BigInt(lastOffset); n++) {
+        expect(types.has(String(n))).toBe(false)
+        const position = Number(n - BigInt(firstOffset))
+        types.set(String(n), acknowledgeTypes[acknowledgeTypes.length === 1 ? 0 : position])
+      }
+    return types
+  }
+  test.each(Array.from({ length: 200 }, (_, i) => [i]))('case %i', (index) => {
+    const random = mulberry32(2026102700 + index)
     const { ledger, token } = make()
     const expected = new Map()
     const offsets = ['1', '2', '3']
@@ -167,6 +325,9 @@ describe('fixed-seed ledger settlement properties', () => {
     }
     ledger.complete(offsets, 'accept')
     const { ticket } = ledger.prepare({ token })
+    expect(expand(ticket.acknowledgementBatches)).toEqual(
+      new Map([...expected].map(([offset, type]) => [offset, WIRE[type]]))
+    )
     const results = ledger.settle(ticket, { token })
     const actual = new Map()
     for (const r of results)

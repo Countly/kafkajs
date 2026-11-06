@@ -1,5 +1,9 @@
 const { ShareRecordWalk } = require('../shareRecordWalk')
 const { ShareAckLedger, lockDeadline } = require('../shareAckLedger')
+const { KafkaJSNonRetriableError, KafkaJSShareAcknowledgementError } = require('../../../errors')
+const failure = (Class, message) => expect.objectContaining({ name: Class.name, message })
+const OUTSIDE = 'Acknowledgement is outside its active handler acquisition'
+const BAD_DEADLINE = 'Invalid acquisition lock deadline'
 const make = (options = {}) => {
   const token = Symbol('acquisition')
   const walk = ShareRecordWalk.walk({
@@ -88,8 +92,11 @@ describe('deterministic acquisition locks', () => {
       cause: new Error('121'),
     })
     expect(result[0].error.reason).toBe('rejected-by-broker')
+    expect(ledger.canStart('1', 1099)).toBe(true)
     expect(ledger.canStart('1', 1100)).toBe(false)
     expect(ledger.settle(ticket, { token, sentAt: 9999, lockDuration: 9000 })).toEqual([])
+    expect(ledger.canStart('1', 1099)).toBe(true)
+    expect(ledger.canStart('1', 1100)).toBe(false)
     ledger.complete(['1'], 'accept')
     expect(ledger.prepare({ token }).ticket.acknowledgementBatches[0].acknowledgeTypes).toEqual([3])
   })
@@ -97,7 +104,7 @@ describe('deterministic acquisition locks', () => {
     const { ledger, token } = make()
     const { ticket } = ledger.prepare({ token, renewOffsets: ['1', '2'] })
     expect(() => ledger.settle(ticket, { token, sentAt: NaN, lockDuration: 1000 })).toThrow(
-      'deadline'
+      failure(KafkaJSNonRetriableError, BAD_DEADLINE)
     )
     expect(ledger.canStart('1', 1100)).toBe(false)
     ledger.settle(ticket, { token, sentAt: 900 })
@@ -113,6 +120,70 @@ describe('deterministic acquisition locks', () => {
     expect(ledger.prepare({ token: Symbol('other'), renewOffsets: ['1'] }).ticket).toBeNull()
     expect(ledger.size).toBe(0)
   })
+  test('a stale token cannot prepare a renewal on a fresh ledger and retires it exactly once', () => {
+    const { ledger, token } = make()
+    const stale = Symbol('stale')
+    const { ticket, results } = ledger.prepare({ token: stale, renewOffsets: ['1'] })
+    expect(ticket).toBeNull()
+    expect(results).toEqual([
+      {
+        firstOffset: '1',
+        lastOffset: '3',
+        type: 'release',
+        error: expect.any(KafkaJSShareAcknowledgementError),
+      },
+    ])
+    expect(results[0].error).toMatchObject({
+      reason: 'session-lost',
+      topic: 'topic',
+      partition: 0,
+      retriable: false,
+      ranges: [{ firstOffset: '1', lastOffset: '3' }],
+    })
+    expect(ledger.size).toBe(0)
+    expect(ledger.prepare({ token })).toEqual({ ticket: null, results: [] })
+    expect(ledger.prepare({ token: stale, renewOffsets: ['1'] })).toEqual({
+      ticket: null,
+      results: [],
+    })
+    expect(ledger.invalidate('session-lost')).toEqual([])
+    expect(() => ledger.canStart('1', 1099)).toThrow(failure(KafkaJSNonRetriableError, OUTSIDE))
+  })
+  test('a stale-token settlement fails the renewal and every held entry as session-lost, once', () => {
+    const { ledger, token } = make()
+    const { ticket } = ledger.prepare({ token, renewOffsets: ['1'] })
+    const results = ledger.settle(ticket, {
+      token: Symbol('stale'),
+      sentAt: 900,
+      lockDuration: 2000,
+    })
+    expect(results).toEqual([
+      {
+        firstOffset: '1',
+        lastOffset: '1',
+        type: 'renew',
+        error: expect.any(KafkaJSShareAcknowledgementError),
+      },
+      {
+        firstOffset: '1',
+        lastOffset: '3',
+        type: 'release',
+        error: expect.any(KafkaJSShareAcknowledgementError),
+      },
+    ])
+    expect(results[0].error).toMatchObject({
+      reason: 'session-lost',
+      ranges: [{ firstOffset: '1', lastOffset: '1' }],
+    })
+    expect(results[1].error).toMatchObject({
+      reason: 'session-lost',
+      ranges: [{ firstOffset: '1', lastOffset: '3' }],
+    })
+    expect(ledger.size).toBe(0)
+    expect(ledger.settle(ticket, { token, sentAt: 900, lockDuration: 2000 })).toEqual([])
+    expect(ledger.prepare({ token, renewOffsets: ['1'] })).toEqual({ ticket: null, results: [] })
+    expect(() => ledger.canStart('1', 1099)).toThrow(failure(KafkaJSNonRetriableError, OUTSIDE))
+  })
   test.each([
     [NaN, 1],
     [-1, 1],
@@ -121,6 +192,8 @@ describe('deterministic acquisition locks', () => {
     [0, 2147483648],
     [Infinity, 1],
   ])('rejects clock %p and duration %p', (time, duration) =>
-    expect(() => lockDeadline(time, duration)).toThrow()
+    expect(() => lockDeadline(time, duration)).toThrow(
+      failure(KafkaJSNonRetriableError, BAD_DEADLINE)
+    )
   )
 })
