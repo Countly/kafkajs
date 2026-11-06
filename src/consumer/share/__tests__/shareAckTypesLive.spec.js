@@ -1,7 +1,9 @@
 const {
   acknowledgementResults,
   acknowledgementRequests,
-  pollSharePosition,
+  awaitTerminalSharePosition,
+  assertQuietTerminalGroup,
+  ShareAcknowledgementObserver,
 } = require('../../../../testHelpers/shareLiveDiagnostics')
 const net = require('net')
 const { EventEmitter } = require('events')
@@ -25,7 +27,6 @@ const {
   setShareGroupConfigs,
   shareRecordIdentity,
   shareTopicName,
-  verifierMember,
 } = require('../../../../testHelpers/shareFixtures')
 const { readLog } = require('../../../../testHelpers/rawLog')
 const { createResourceProbe } = require('../../../../testHelpers/resourceProbe')
@@ -375,6 +376,7 @@ class AckTypesCase {
     this.group = `e2e-p9e-ack-group-${this.nonce}`
     this.stack = new CleanupStack()
     this.tap = new ShareWireTap()
+    this.acknowledgements = new ShareAcknowledgementObserver()
     this.probe = createResourceProbe({
       emitters: { process },
       sockets: () => this.tap.socketCounts(),
@@ -441,6 +443,7 @@ class AckTypesCase {
         })
       ),
       acknowledgementRequests: acknowledgementRequests(this.tap.frames),
+      acknowledgementResponses: this.acknowledgements.evidence(this.group),
     }
   }
 
@@ -451,6 +454,7 @@ class AckTypesCase {
    * @throws {Error} the first assertion or fixture failure, with cleanup failures attached
    */
   async run(scope) {
+    this.acknowledgements.install()
     try {
       await this.stack.run(
         async () => {
@@ -465,6 +469,8 @@ class AckTypesCase {
     } catch (error) {
       this.row('case-failed', { error: describeError(error), ...this.progress() })
       throw error
+    } finally {
+      this.acknowledgements.restore()
     }
   }
 
@@ -501,6 +507,10 @@ class AckTypesCase {
     this.baseline = await bounded(scope, 60000, () =>
       bounded(scope, 10000, () => this.probe.snapshot())
     )
+    const metadata = await bounded(scope, Infinity, () =>
+      this.admin.fetchTopicMetadata({ topics: [this.topic] })
+    )
+    this.topicId = metadata.topics.find(({ name }) => name === this.topic).topicId
     this.row('config-readback', { group: this.groupConfig, client: this.clientConfig })
     this.row('resource-baseline', { snapshot: this.baseline })
 
@@ -690,9 +700,11 @@ class AckTypesCase {
   async observe(scope) {
     await this.checkLog(scope)
     this.checkHandler()
-    this.broker = await this.awaitBrokerEnd(scope)
-    await pollUntil(scope, 20000, () => this.eventsMatch(), { label: 'All terminal events' })
+    await pollUntil(scope, 20000, () => this.eventsMatch() && this.responsesMatch(), {
+      label: 'All terminal events',
+    })
     this.checkAcknowledgements()
+    this.broker = await this.awaitBrokerEnd(scope)
   }
 
   /**
@@ -818,12 +830,24 @@ class AckTypesCase {
     )
   }
 
+  /** @returns {boolean} Exact successful class outcomes, including the fifth Releases and marker Gap. */
+  responsesMatch() {
+    const types = this.acknowledgements.types(this.group, this.topicId, 0)
+    return (
+      types.size === RECORDS + 1 &&
+      this.expectations().every(
+        ([offset, , expected]) => JSON.stringify(types.get(offset)) === JSON.stringify(expected)
+      )
+    )
+  }
+
   /**
    * Checks the terminal events and the written ranges against each class: confirmed results,
    * application types on the wire, and a Gap only for the marker.
    * @returns {void}
    */
   checkAcknowledgements() {
+    expect(this.responsesMatch()).toBe(true)
     const events = this.terminalEvents()
     const wire = this.wireTypes()
     const wrong = this.expectations()
@@ -851,56 +875,29 @@ class AckTypesCase {
   }
 
   /**
-   * Waits until the share start offset equals the log end and the lag is zero or unknown, in both
-   * the named and the all-topics listing.
-   * @param {AbortSignal} scope the case scope
-   * @returns {Promise<object[]>} one terminal row for the partition
+   * Requires agreeing terminal listings, known zero lag and the independent fixed log ends.
+   * @param {AbortSignal} scope Case scope.
+   * @returns {Promise<object[]>} Actual persisted rows.
    */
   async awaitBrokerEnd(scope) {
-    let row
-    const last = { named: null, all: null }
-    await pollSharePosition(
-      scope,
-      20000,
-      async (poll) => {
-        last.named = await bounded(poll, 10000, () =>
-          this.admin.listShareGroupOffsets({
-            groupId: this.group,
-            topics: [{ topic: this.topic, partitions: [0] }],
-            apiTimeout: 8000,
-          })
-        )
-        last.all = await bounded(poll, 10000, () =>
-          this.admin.listShareGroupOffsets({ groupId: this.group, apiTimeout: 8000 })
-        )
-        const pick = (listing) =>
-          listing
-            .find(({ topic }) => topic === this.topic)
-            ?.partitions.find((p) => p.partition === 0)
-        const first = pick(last.named)
-        row = {
-          groupId: this.group,
-          topic: this.topic,
-          partition: 0,
-          errorCode: first?.errorCode,
-          startOffset: first?.startOffset,
-          logEnd: this.log.get(0).endOffset,
-          lag: first?.lag,
-        }
-        return (
-          row.errorCode === 0 &&
-          row.startOffset === row.logEnd &&
-          (row.lag === '0' || row.lag === null) &&
-          JSON.stringify(pick(last.all)) === JSON.stringify(first)
-        )
+    const position = await awaitTerminalSharePosition(
+      this.admin,
+      {
+        groupId: this.group,
+        topic: this.topic,
+        partitions: [...this.log].map(([partition, { endOffset }]) => ({
+          partition,
+          floor: '0',
+          end: endOffset,
+        })),
       },
       {
-        label: 'The broker share offsets',
-        snapshot: () => ({ groupId: this.group, topic: this.topic, row, ...last }),
+        signal: scope,
+        timeoutMs: 20000,
         record: (fields) => this.row('broker-position', { ...fields, ...this.progress() }),
       }
     )
-    return [row]
+    return position.rows
   }
 
   /**
@@ -910,10 +907,24 @@ class AckTypesCase {
    */
   async finish(scope) {
     await bounded(scope, 10000, () => this.member.consumer.disconnect({ timeout: 5000 }))
-    const verified = await bounded(scope, 30000, (inner) =>
-      verifierMember(this.group, this.topic, { kafka: this.client('verifier'), signal: inner })
-    )
-    expect(verified).toEqual([])
+    const verified = await assertQuietTerminalGroup({
+      kafka: this.client('verifier'),
+      admin: this.admin,
+      groupId: this.group,
+      topic: this.topic,
+      partitions: [...this.log].map(([partition, { endOffset }]) => ({
+        partition,
+        floor: '0',
+        end: endOffset,
+      })),
+      signal: scope,
+      timeoutMs: 30000,
+      record: (fields) => this.row('quiet-verifier', fields),
+    })
+    this.broker = verified.position.rows
+    this.quiet = verified
+    expect(verified.delivered).toEqual([])
+    this.checkAcknowledgements()
     expect(this.entries).toHaveLength(EXPECTED_ENTRIES)
     expect(this.member.crashes.map((error) => error.message)).toEqual([])
   }
@@ -1076,6 +1087,8 @@ class AckTypesCase {
           actual: sortedEntries(this.handled),
         },
         broker: this.broker,
+        acknowledgements: this.acknowledgements.evidence(this.group),
+        quiet: this.quiet,
       },
       resources: {
         before: this.resourceSummary(this.baseline),
