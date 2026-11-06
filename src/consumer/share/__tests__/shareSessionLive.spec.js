@@ -896,7 +896,9 @@ class SessionCase {
             await this.admin.describeCluster()
             await this.admin.listGroups()
           })
-          base = await this.sample(scope)
+          // assertShareCleanup closes admin before sampling, matching this pre-client point
+          // and sample()'s single proof deadline even after lazy admin connections have grown.
+          base = pre
           this.row('resource-baseline', { resources: summarize(base) })
           await this.stack.run(
             async () => {
@@ -915,7 +917,7 @@ class SessionCase {
             [this.topic],
             base,
             this.probe,
-            { signal: scope }
+            { signal: scope, disconnectAdmin: true }
           )
         },
         { budgetMs: PROOF_MS }
