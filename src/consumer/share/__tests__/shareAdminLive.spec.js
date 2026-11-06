@@ -62,7 +62,6 @@ const TIMESTAMP = '1700000000000'
 const GROUP_ALIAS = 'share-group'
 const GROUP_ID_NOT_FOUND = 69
 const NON_EMPTY_GROUP = 68
-const GROUP_SUBSCRIBED_TO_TOPIC = 86
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
 
 /**
@@ -568,12 +567,16 @@ class AdminCase {
   /**
    * Registers every cleanup before anything is created, then creates the share topic with its
    * twenty records, the ordinary topic with its group and one committed offset, and takes the
-   * resource baseline before any consumer exists.
+   * resource baseline before any test client connects.
    * @param {AbortSignal} scope
    * @returns {Promise<void>}
    */
   async setup(scope) {
     liveRun.assertClean()
+    // The final proof has one CleanupStack deadline and one assertShareCleanup deadline.
+    this.baseline = await bounded(scope, 10000, () =>
+      bounded(scope, 10000, () => this.probe.snapshot())
+    )
     const common = { brokers: plainTextBrokers(), logLevel: logLevel.NOTHING, retry: { factor: 0 } }
     this.adminKafka = new Kafka({ ...common, clientId: `e2e-p9e-admin-${this.id}` })
     this.kafka = new Kafka({
@@ -606,9 +609,6 @@ class AdminCase {
     await this.produceCorpus(scope)
     await bounded(scope, 10000, () => this.admin.listGroups())
     this.ledgers.install()
-    this.baseline = await bounded(scope, 10000, () =>
-      bounded(scope, 10000, () => this.probe.snapshot())
-    )
     this.note('resource-baseline', { snapshot: this.baseline })
     await this.startOrdinary(scope)
   }
@@ -1045,8 +1045,8 @@ class AdminCase {
   }
 
   /**
-   * With the member present: records the actual refusal of an offset alter, the subscribed
-   * offset deletion (a topic error as data) and the refused group deletion (a typed error).
+   * With the workload member present: records the actual refusal of an offset alter and
+   * requires NON_EMPTY_GROUP (68) for offset deletion and group deletion.
    * @param {AbortSignal} scope
    * @returns {Promise<void>}
    */
@@ -1062,17 +1062,24 @@ class AdminCase {
     )
     this.note('fault', { stage: 'alter-with-member', group: GROUP_ALIAS, outcome: alterRefusal })
 
-    const subscribed = await bounded(scope, STEP_MS, () =>
-      this.admin.deleteShareGroupOffsets({
-        groupId: group,
-        topics: [topic],
-        apiTimeout: API_TIMEOUT_MS,
-      })
+    const subscribed = await outcomeOf(() =>
+      bounded(scope, STEP_MS, () =>
+        this.admin.deleteShareGroupOffsets({
+          groupId: group,
+          topics: [topic],
+          apiTimeout: API_TIMEOUT_MS,
+        })
+      )
     )
-    expect(subscribed.map(({ topic: name, errorCode }) => ({ topic: name, errorCode }))).toEqual([
-      { topic, errorCode: GROUP_SUBSCRIBED_TO_TOPIC },
-    ])
-    this.note('fault', { stage: 'delete-offsets-subscribed', results: serialize(subscribed) })
+    expect(subscribed).toMatchObject({
+      kind: 'throw',
+      error: { name: 'KafkaJSProtocolError', type: 'NON_EMPTY_GROUP', code: NON_EMPTY_GROUP },
+    })
+    this.note('fault', {
+      stage: 'delete-offsets-subscribed',
+      memberId: this.share.memberId,
+      outcome: subscribed,
+    })
 
     let refusal
     try {
@@ -1109,6 +1116,7 @@ class AdminCase {
     const group = this.groups.share
     const topic = this.topics.share
     await bounded(scope, 10000, () => this.share.consumer.disconnect({ timeout: 5000 }))
+    await this.untilEmpty(scope, group)
     const quiet = await assertQuietTerminalGroup({
       kafka: this.kafka,
       admin: this.admin,
@@ -1179,7 +1187,11 @@ class AdminCase {
         const { groups } = await this.admin.describeShareGroups([group], {
           apiTimeout: API_TIMEOUT_MS,
         })
-        return groups[0].members.length === 0
+        const [described] = groups
+        expect(groups).toHaveLength(1)
+        expect(described.groupId).toBe(group)
+        expect(described.errorCode).toBe(0)
+        return described.state === 'Empty' && described.members.length === 0
       },
       { delayMs: 200, label: 'The empty share group' }
     )
@@ -1335,7 +1347,7 @@ class AdminCase {
         Object.values(this.topics).filter(Boolean),
         this.baseline,
         this.probe,
-        { signal }
+        { signal, disconnectAdmin: true }
       ),
     }
   }

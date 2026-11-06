@@ -321,6 +321,98 @@ describe('public share shutdown contract', () => {
     expect(h.order).toEqual(['stop', 'disconnect'])
   })
 
+  test('captures four choices and loses six undecided batch records at a bounded disconnect', async () => {
+    const clock = new Clock()
+    clock.install()
+    await start({
+      kafka: { requestTimeout: 1000 },
+      share: { acknowledgementMode: 'explicit', maxRecords: 10 },
+    })
+    h.script('ShareFetch', [
+      fetchAnswer([
+        acquire(
+          0,
+          0,
+          Array.from({ length: 10 }, (_, i) => `v${i}`)
+        ),
+      ]),
+    ])
+
+    const gate = hold()
+    let saved
+    let entered = 0
+    let returned = false
+    await h.consumer.run({
+      eachBatch: tracked(async (payload) => {
+        saved = payload
+        entered++
+        for (const message of payload.batch.messages.slice(0, 4)) {
+          payload.acknowledge(message, 'accept')
+        }
+        await gate.promise
+        returned = true
+      }),
+    })
+    await until(() => entered === 1, 'the blocked ten-message batch')
+    expect(saved.batch.messages.map(({ offset }) => offset)).toEqual([
+      '0',
+      '1',
+      '2',
+      '3',
+      '4',
+      '5',
+      '6',
+      '7',
+      '8',
+      '9',
+    ])
+
+    const fetchCount = h.frames(78).length
+    const closing = h.consumer.disconnect({ timeout: 400 })
+    await clock.advance(299)
+    expect(finals()).toHaveLength(0)
+    expect(returned).toBe(false)
+    await clock.advance(1)
+    await until(() => finals().length === 1, 'the captured final')
+    await closing
+
+    const final = finals()[0]
+    expect(final.fields.isRenewAck).toBe(false)
+    expect(final.fields.topics).toHaveLength(1)
+    expect(final.fields.topics[0].topicId).toBe(A)
+    expect(final.fields.topics[0].partitions).toHaveLength(1)
+    expect(final.fields.topics[0].partitions[0]).toMatchObject({
+      partitionIndex: 0,
+      acknowledgementBatches: [
+        {
+          firstOffset: '0',
+          lastOffset: '3',
+          acknowledgeTypes: [1],
+        },
+      ],
+    })
+    expect(h.acks).toEqual([
+      [0, '4', '9', 'release', 'membership-lost'],
+      [0, '0', '3', 'accept', null],
+    ])
+    expect(leaves()).toHaveLength(1)
+    expect(final.answeredOrder).toBeLessThan(leaves()[0].order)
+    expect(h.frames(78)).toHaveLength(fetchCount)
+    expect(h.order).toEqual(['stop', 'disconnect'])
+    expect(returned).toBe(false)
+
+    const frameCount = h.frames(76, 78, 79).length
+    const resultCount = h.acks.length
+    expectStale(() => saved.acknowledge(saved.batch.messages[4], 'accept'))
+    expectStale(() => saved.renew())
+    gate.resolve()
+    await until(() => returned, 'the abandoned batch return')
+    await flush()
+    expect(entered).toBe(1)
+    expect(h.frames(76, 78, 79)).toHaveLength(frameCount)
+    expect(h.acks).toHaveLength(resultCount)
+  })
+
   test('keeps invalid deadline calls from stopping the current handler', async () => {
     await start()
     h.script('ShareFetch', [fetchAnswer([acquire(0, 0, ['a'])])])

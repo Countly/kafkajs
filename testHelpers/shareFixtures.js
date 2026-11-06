@@ -366,7 +366,7 @@ const verifierMember = async (group, topic, { kafka, signal, windowMs = 5000 } =
 /**
  * Proves owned groups/topics absent and measured owners back at baseline after CleanupStack.
  * Unrelated groups are checked for presence only, never whole-cluster list equality.
- * @param {object} admin still-connected admin; disconnected after this proof
+ * @param {object} admin still-connected admin used to prove fixture absence
  * @param {string[]} groups owned group ids
  * @param {string[]} topics owned topic names
  * @param {object} baseline measured pre-client snapshot
@@ -374,6 +374,8 @@ const verifierMember = async (group, topic, { kafka, signal, windowMs = 5000 } =
  * @param {object} [options] unrelated group ids and case signal
  * @param {string[]} [options.unrelated=[]] previously observed unrelated groups
  * @param {AbortSignal} [options.signal] enclosing cleanup scope
+ * @param {boolean} [options.disconnectAdmin=false] close admin before measuring against a
+ *   pre-admin baseline; callers must sample under matching deadline scopes
  * @returns {Promise<object>} final measured snapshot
  * @throws {Error} on missing measurement, retained resource, leftover group/topic or harmed sibling
  */
@@ -383,10 +385,10 @@ const assertShareCleanup = async (
   topics,
   baseline,
   probe,
-  { unrelated = [], signal } = {}
+  { unrelated = [], signal, disconnectAdmin = false } = {}
 ) => {
   const { isDeepStrictEqual } = require('util')
-  const { NEVER, bounded } = require('../src/producer/__tests__/fixtures/bounded')
+  const { NEVER, bounded, pollUntil } = require('../src/producer/__tests__/fixtures/bounded')
   return bounded(signal || NEVER, 10000, async (scope) => {
     const { groups: listed } = await bounded(scope, Infinity, () => admin.listGroups())
     const names = new Set(listed.map(({ groupId }) => groupId))
@@ -395,37 +397,60 @@ const assertShareCleanup = async (
       throw new Error('Share fixture remains after cleanup')
     }
     if (unrelated.some((id) => !names.has(id))) throw new Error('Unrelated group disappeared')
-    const after = await bounded(scope, Infinity, () => probe.snapshot())
-    for (const snapshot of [baseline, after]) {
-      for (const key of ['listeners', 'sockets', 'queueDepth', 'ledgerSize', 'activeResources']) {
-        if (snapshot?.[key] === undefined) throw new Error(`Missing resource measurement: ${key}`)
-      }
-      const count = (value) => Number.isSafeInteger(value) && value >= 0
-      const counts = (value) =>
-        value !== null &&
-        typeof value === 'object' &&
-        !Array.isArray(value) &&
-        Object.values(value).every(count)
-      if (
-        !counts(snapshot.listeners) ||
-        !counts(snapshot.activeResources) ||
-        !count(snapshot.queueDepth) ||
-        !count(snapshot.ledgerSize) ||
-        !['created', 'destroyed', 'open'].every((key) => count(snapshot.sockets?.[key])) ||
-        snapshot.sockets.created - snapshot.sockets.destroyed !== snapshot.sockets.open
-      ) {
-        throw new Error('Invalid resource measurement')
-      }
-    }
-    if (
-      after.sockets.open !== baseline.sockets.open ||
-      after.queueDepth !== baseline.queueDepth ||
-      after.ledgerSize !== baseline.ledgerSize ||
-      !isDeepStrictEqual(after.listeners, baseline.listeners) ||
-      !isDeepStrictEqual(after.activeResources, baseline.activeResources)
-    ) {
-      throw new Error('Share resources did not return to baseline')
-    }
+    // Admin lazily opens broker connections during the case. Its request-queue timers are not
+    // a stable baseline while it remains connected. Close it only after the absence proof, so
+    // pre-admin callers compare two points with every test client closed.
+    if (disconnectAdmin) await bounded(scope, Infinity, () => admin.disconnect())
+    let after
+    await pollUntil(
+      scope,
+      Infinity,
+      async (sampleScope) => {
+        after = await bounded(sampleScope, Infinity, () => probe.snapshot())
+        for (const snapshot of [baseline, after]) {
+          for (const key of [
+            'listeners',
+            'sockets',
+            'queueDepth',
+            'ledgerSize',
+            'activeResources',
+          ]) {
+            if (snapshot?.[key] === undefined)
+              throw new Error(`Missing resource measurement: ${key}`)
+          }
+          const count = (value) => Number.isSafeInteger(value) && value >= 0
+          const counts = (value) =>
+            value !== null &&
+            typeof value === 'object' &&
+            !Array.isArray(value) &&
+            Object.values(value).every(count)
+          if (
+            !counts(snapshot.listeners) ||
+            !counts(snapshot.activeResources) ||
+            !count(snapshot.queueDepth) ||
+            !count(snapshot.ledgerSize) ||
+            !['created', 'destroyed', 'open'].every((key) => count(snapshot.sockets?.[key])) ||
+            snapshot.sockets.created - snapshot.sockets.destroyed !== snapshot.sockets.open
+          ) {
+            throw new Error('Invalid resource measurement')
+          }
+        }
+        // A socket's close callback can trail disconnect's promise. Wait within the existing
+        // proof bound, without adding another deadline timer to the sampled context. Equality
+        // stays exact: one retained socket, timer, listener, queued request or ledger entry fails.
+        const restored =
+          after.sockets.open === baseline.sockets.open &&
+          after.queueDepth === baseline.queueDepth &&
+          after.ledgerSize === baseline.ledgerSize &&
+          isDeepStrictEqual(after.listeners, baseline.listeners) &&
+          isDeepStrictEqual(after.activeResources, baseline.activeResources)
+        if (!restored && !disconnectAdmin) {
+          throw new Error('Share resources did not return to baseline')
+        }
+        return restored
+      },
+      { delayMs: 50, label: 'Share resources returning to baseline' }
+    )
     return after
   })
 }

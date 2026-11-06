@@ -869,6 +869,10 @@ class SessionCase {
             headerBytes: byteLength,
           }))
       ),
+      settlement: Object.values(this.groups).map((groupId) => ({
+        groupId,
+        ...this.missingAccepts(groupId),
+      })),
     }
   }
 
@@ -896,7 +900,9 @@ class SessionCase {
             await this.admin.describeCluster()
             await this.admin.listGroups()
           })
-          base = await this.sample(scope)
+          // assertShareCleanup closes admin before sampling, matching this pre-client point
+          // and sample()'s single proof deadline even after lazy admin connections have grown.
+          base = pre
           this.row('resource-baseline', { resources: summarize(base) })
           await this.stack.run(
             async () => {
@@ -915,7 +921,7 @@ class SessionCase {
             [this.topic],
             base,
             this.probe,
-            { signal: scope }
+            { signal: scope, disconnectAdmin: true }
           )
         },
         { budgetMs: PROOF_MS }
@@ -1126,11 +1132,12 @@ class SessionCase {
   }
 
   /**
-   * Checks successful Accept coverage for this group without combining independent groups.
+   * Identifies missing successful Accepts without combining independent groups or replacing a
+   * lost public outcome with a response observed below the fault layer.
    * @param {string} group Group being observed.
-   * @returns {boolean} Whether the group's successful results cover all 300 identities.
+   * @returns {{missingPublic: string[], missingWire: string[]}} Unconfirmed corpus offsets.
    */
-  acceptedGroup(group) {
+  missingAccepts(group) {
     const accepted = new Set()
     for (const { groupId, acks } of Object.values(this.members)) {
       if (groupId !== group) continue
@@ -1140,9 +1147,21 @@ class SessionCase {
       }
     }
     const wire = this.sockets.acknowledgements.confirmed(group, this.topicId, 0)
-    return this.expected.every(
-      (identity) => accepted.has(JSON.parse(identity)[2]) && wire.has(JSON.parse(identity)[2])
-    )
+    const expected = this.expected.map((identity) => JSON.parse(identity)[2])
+    return {
+      missingPublic: expected.filter((offset) => !accepted.has(offset)),
+      missingWire: expected.filter((offset) => !wire.has(offset)),
+    }
+  }
+
+  /**
+   * Checks successful public and wire Accept coverage for this group.
+   * @param {string} group Group being observed.
+   * @returns {boolean} Whether both sources cover the entire immutable corpus.
+   */
+  acceptedGroup(group) {
+    const { missingPublic, missingWire } = this.missingAccepts(group)
+    return missingPublic.length === 0 && missingWire.length === 0
   }
 
   /**
@@ -1312,7 +1331,6 @@ class SessionCase {
 
     await this.awaitDelivered(scope, member, RECORDS)
     await this.verifyLog(scope)
-    const record = await this.awaitStart(scope, group)
     const closedAt = dropped.ref.closedAt
     this.assertRecovery(member, { dropped, carried, droppedOffsets, droppedIdentities, closedAt })
 
@@ -1322,6 +1340,7 @@ class SessionCase {
       startedHeldAtFault: startedHeld,
       acquiredNeverDelivered: droppedIdentities,
     })
+    const record = await this.awaitStart(scope, group)
     this.handlerExpected = expected
     this.handlers = { A: member.identities() }
     this.broker = [record]
