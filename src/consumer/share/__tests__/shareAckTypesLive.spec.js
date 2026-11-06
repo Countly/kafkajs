@@ -24,6 +24,7 @@ const {
 } = require('testHelpers')
 const {
   assertShareCleanup,
+  captureShareCleanupBaseline,
   setShareGroupConfigs,
   shareRecordIdentity,
   shareTopicName,
@@ -481,10 +482,7 @@ class AckTypesCase {
    * @returns {Promise<void>}
    */
   async setup(scope) {
-    // CleanupStack and assertShareCleanup each hold one deadline during the final sample.
-    this.beforeAdmin = await bounded(scope, 60000, () =>
-      bounded(scope, 10000, () => this.probe.snapshot())
-    )
+    this.beforeAdmin = await captureShareCleanupBaseline(this.probe, { signal: scope })
     this.baseline = this.beforeAdmin
     this.admin = this.client('admin').admin()
     this.admin.on(this.admin.events.REQUEST, ({ payload }) => this.requests.push(payload))
