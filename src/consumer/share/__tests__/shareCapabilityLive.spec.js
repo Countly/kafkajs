@@ -5,9 +5,6 @@ const { isDeepStrictEqual } = require('util')
 const {
   Kafka,
   logLevel,
-  AlterConfigOpTypes,
-  ConfigResourceTypes,
-  ConfigSource,
   KafkaJSServerDoesNotSupportApiKey,
   KafkaJSShareGroupsNotSupportedError,
 } = require('../../../../index')
@@ -23,6 +20,7 @@ const {
   assertShareCleanup,
   captureShareCleanupBaseline,
   setShareGroupConfigs,
+  resetShareGroupConfigs,
   shareRecordIdentity,
   shareTopicName,
 } = require('../../../../testHelpers/shareFixtures')
@@ -525,7 +523,10 @@ class CapabilityCase {
     this.title = TITLE_DISABLED
     this.budgetMs = DISABLED_BUDGET_MS
     try {
-      this.baseline = await this.measure(scope)
+      this.baseline = await captureShareCleanupBaseline(this.probe, {
+        signal: scope,
+        cleanupStack: false,
+      })
       this.row('resource-baseline', { snapshot: this.baseline })
       const run = new FeatureOffRun({
         capture: () => this.captureOriginal(scope),
@@ -596,7 +597,10 @@ class CapabilityCase {
    * @returns {Promise<void>}
    */
   async refused(scope, expected) {
-    this.baseline = await this.measure(scope)
+    this.baseline = await captureShareCleanupBaseline(this.probe, {
+      signal: scope,
+      cleanupStack: false,
+    })
     this.row('resource-baseline', { snapshot: this.baseline })
     const capture = await this.capture(scope)
     let attempt
@@ -1030,6 +1034,14 @@ class CapabilityCase {
       if (this.sentinelCreated) {
         await bounded(signal, 15000, () => this.admin.connect())
         await this.deleteGroup(signal, this.sentinel)
+        this.after = await assertShareCleanup(
+          this.admin,
+          [this.group, this.sentinel],
+          [this.topic],
+          this.baseline,
+          this.probe,
+          { signal, disconnectAdmin: true }
+        )
       }
     } catch (error) {
       failure ??= error
@@ -1100,32 +1112,7 @@ class CapabilityCase {
    * @throws {Error} when the broker refuses or an override remains
    */
   async resetConfigs(signal) {
-    const names = Object.keys(GROUP_CONFIG)
-    const { resources } = await bounded(signal, 8000, () =>
-      this.admin.incrementalAlterConfigs({
-        resources: [
-          {
-            type: ConfigResourceTypes.GROUP,
-            name: this.group,
-            configEntries: names.map((name) => ({ name, operation: AlterConfigOpTypes.DELETE })),
-          },
-        ],
-      })
-    )
-    if (resources[0].errorCode !== 0) {
-      throw new Error(`Config reset refused: ${resources[0].errorCode}`)
-    }
-    const read = await bounded(signal, 8000, () =>
-      this.admin.describeConfigs({
-        resources: [{ type: ConfigResourceTypes.GROUP, name: this.group, configNames: names }],
-      })
-    )
-    const left = read.resources[0].configEntries.filter(
-      ({ configSource }) => configSource === ConfigSource.GROUP_CONFIG
-    )
-    if (left.length > 0) {
-      throw new Error(`Group config overrides remain: ${left.map((entry) => entry.configName)}`)
-    }
+    await resetShareGroupConfigs(this.admin, this.group, Object.keys(GROUP_CONFIG), { signal })
   }
 
   /**

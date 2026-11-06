@@ -10,6 +10,7 @@ const {
   shareTopicName,
   createShareTopic,
   setShareGroupConfigs,
+  resetShareGroupConfigs,
 } = require('../shareFixtures')
 
 // Literal wire values (DescribeConfigs ConfigSource, ConfigResource.Type, AlterConfigOp.OpType).
@@ -267,6 +268,64 @@ describe('share-group fixtures', () => {
     })
   })
 
+  describe('resetShareGroupConfigs', () => {
+    beforeEach(() => jest.useFakeTimers())
+    afterEach(() => jest.useRealTimers())
+
+    test('deletes once and waits for stale group overrides to disappear', async () => {
+      const api = fakeAdmin([
+        answer([entry('share.auto.offset.reset', 'earliest', GROUP_CONFIG)]),
+        answer([entry('share.auto.offset.reset', 'latest', DEFAULT_CONFIG)]),
+      ])
+      const pending = resetShareGroupConfigs(api, GROUP, Object.keys(EARLIEST))
+      const state = track(pending)
+      await jest.advanceTimersByTimeAsync(0)
+      expect(state.settled).toBe(false)
+      await jest.advanceTimersByTimeAsync(100)
+      await expect(pending).resolves.toBeUndefined()
+      expect(api.incrementalAlterConfigs).toHaveBeenCalledTimes(1)
+      expect(api.incrementalAlterConfigs).toHaveBeenCalledWith({
+        resources: [
+          {
+            type: GROUP_RESOURCE,
+            name: GROUP,
+            configEntries: [{ name: 'share.auto.offset.reset', operation: 1 }],
+          },
+        ],
+      })
+      expect(api.describeConfigs).toHaveBeenCalledTimes(2)
+      expect(jest.getTimerCount()).toBe(0)
+    })
+
+    test('fails if an override never disappears without repeating the delete', async () => {
+      const api = fakeAdmin([answer([entry('share.auto.offset.reset', 'earliest', GROUP_CONFIG)])])
+      const pending = resetShareGroupConfigs(api, GROUP, Object.keys(EARLIEST)).catch((e) => e)
+      await jest.advanceTimersByTimeAsync(8500)
+      expect((await pending).message).toContain('did not settle within 8000 ms')
+      expect(api.incrementalAlterConfigs).toHaveBeenCalledTimes(1)
+      expect(jest.getTimerCount()).toBe(0)
+    })
+
+    test.each([
+      answer([], TOPIC_RESOURCE),
+      answer([], GROUP_RESOURCE, 'another-group'),
+      { resources: [{ ...answer([]).resources[0], errorCode: 30 }] },
+    ])('refuses an absent or unsuccessful GROUP readback: %j', async (read) => {
+      const api = fakeAdmin([read])
+      await expect(resetShareGroupConfigs(api, GROUP, Object.keys(EARLIEST))).rejects.toThrow(
+        'Missing successful group config readback'
+      )
+    })
+
+    test('fails immediately on a refused delete', async () => {
+      const api = fakeAdmin([answer([])], { errorCode: 30 })
+      await expect(resetShareGroupConfigs(api, GROUP, Object.keys(EARLIEST))).rejects.toThrow(
+        'Config reset refused: 30'
+      )
+      expect(api.describeConfigs).not.toHaveBeenCalled()
+    })
+  })
+
   describe('topics', () => {
     afterEach(() => jest.restoreAllMocks())
 
@@ -521,6 +580,75 @@ describe('share live fixture observations', () => {
       })
     }
   )
+
+  it.each([false, true])(
+    'waits for a foreign socket and its timer to close, then detects a real leak: %s',
+    async (leak) => {
+      jest.useFakeTimers()
+      let foreign = true
+      let leaked = false
+      const probe = {
+        snapshot: jest.fn(async () => ({
+          ...snapshot(),
+          activeResources: {
+            Timeout: 2 + Number(foreign) + Number(leaked),
+            ...(foreign || leaked ? { TCPSocketWrap: 1 } : {}),
+          },
+        })),
+      }
+      const pending = captureShareCleanupBaseline(probe, { cleanupStack: false })
+      const state = track(pending)
+      await jest.advanceTimersByTimeAsync(300)
+      expect(state.settled).toBe(false)
+      foreign = false
+      await jest.advanceTimersByTimeAsync(200)
+      const before = await pending
+      expect(before.activeResources).toEqual({ Timeout: 2 })
+      leaked = leak
+      const proof = assertShareCleanup(admin(), [], [], before, probe).catch((e) => e)
+      await jest.advanceTimersByTimeAsync(1)
+      if (leak) {
+        expect(await proof).toBeInstanceOf(Error)
+        expect((await proof).message).toContain('Share resources did not return to baseline')
+      } else {
+        expect(await proof).toEqual(before)
+      }
+      expect(jest.getTimerCount()).toBe(0)
+    }
+  )
+
+  it('requires consecutive stable timer samples after the foreign sockets close', async () => {
+    jest.useFakeTimers()
+    let timerClosing = true
+    const probe = {
+      snapshot: async () => ({
+        ...snapshot(),
+        activeResources: { Timeout: timerClosing ? 3 : 2 },
+      }),
+    }
+    const pending = captureShareCleanupBaseline(probe, { cleanupStack: false })
+    const state = track(pending)
+    await jest.advanceTimersByTimeAsync(60)
+    timerClosing = false
+    await jest.advanceTimersByTimeAsync(70)
+    expect(state.settled).toBe(false)
+    await jest.advanceTimersByTimeAsync(100)
+    expect((await pending).activeResources).toEqual({ Timeout: 2 })
+    expect(jest.getTimerCount()).toBe(0)
+  })
+
+  it('rejects a persistent foreign socket within the existing baseline bound', async () => {
+    jest.useFakeTimers()
+    const pending = captureShareCleanupBaseline(
+      {
+        snapshot: async () => ({ ...snapshot(), activeResources: { TCPSocketWrap: 1 } }),
+      },
+      { cleanupStack: false }
+    ).catch((e) => e)
+    await jest.advanceTimersByTimeAsync(10500)
+    expect((await pending).message).toContain('did not settle within 10000 ms')
+    expect(jest.getTimerCount()).toBe(0)
+  })
 
   it.each(['Timeout', 'socket', 'listener', 'queued request', 'ledger entry'])(
     'rejects one extra client resource under identical sampling bounds: %s',

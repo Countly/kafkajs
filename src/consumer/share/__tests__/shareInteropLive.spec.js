@@ -6,13 +6,7 @@ const path = require('path')
 const { EventEmitter } = require('events')
 const { StringDecoder } = require('string_decoder')
 const { spawn, spawnSync } = require('child_process')
-const {
-  Kafka,
-  logLevel,
-  AlterConfigOpTypes,
-  ConfigResourceTypes,
-  ConfigSource,
-} = require('../../../../index')
+const { Kafka, logLevel } = require('../../../../index')
 const {
   createTopic,
   plainTextBrokers,
@@ -26,6 +20,7 @@ const {
   assertShareCleanup,
   captureShareCleanupBaseline,
   setShareGroupConfigs,
+  resetShareGroupConfigs,
   shareRecordIdentity,
   shareTopicName,
 } = require('../../../../testHelpers/shareFixtures')
@@ -587,7 +582,6 @@ class JavaShareMember {
     })
     child.once('error', (error) => {
       this.spawnError = error
-      this.settle()
     })
     child.once('exit', (code, signal) => {
       this.exit = { code, signal, at: performance.now() }
@@ -1510,32 +1504,7 @@ class ShareInteropCase {
    * @throws {Error} when the broker refuses or an override remains
    */
   async resetConfigs(signal) {
-    const names = Object.keys(GROUP_CONFIG)
-    const { resources } = await bounded(signal, 8000, () =>
-      this.admin.incrementalAlterConfigs({
-        resources: [
-          {
-            type: ConfigResourceTypes.GROUP,
-            name: this.group,
-            configEntries: names.map((name) => ({ name, operation: AlterConfigOpTypes.DELETE })),
-          },
-        ],
-      })
-    )
-    if (resources[0].errorCode !== 0) {
-      throw new Error(`Config reset refused: ${resources[0].errorCode}`)
-    }
-    const read = await bounded(signal, 8000, () =>
-      this.admin.describeConfigs({
-        resources: [{ type: ConfigResourceTypes.GROUP, name: this.group, configNames: names }],
-      })
-    )
-    const left = read.resources[0].configEntries.filter(
-      ({ configSource }) => configSource === ConfigSource.GROUP_CONFIG
-    )
-    if (left.length > 0) {
-      throw new Error(`Group config overrides remain: ${left.map((e) => e.configName)}`)
-    }
+    await resetShareGroupConfigs(this.admin, this.group, Object.keys(GROUP_CONFIG), { signal })
   }
 
   /**

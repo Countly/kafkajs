@@ -8,13 +8,7 @@ const { ShareRun } = require('../shareRun')
 const { KafkaJSShareAcknowledgementError } = require('../../../errors')
 const fetchWire = require('../../../../testHelpers/wire/shareFetchV2')
 const ackWire = require('../../../../testHelpers/wire/shareAcknowledgeV2')
-const {
-  Kafka,
-  logLevel,
-  AlterConfigOpTypes,
-  ConfigResourceTypes,
-  ConfigSource,
-} = require('../../../../index')
+const { Kafka, logLevel, ConfigResourceTypes } = require('../../../../index')
 const {
   createTopic,
   plainTextBrokers,
@@ -27,6 +21,7 @@ const {
   assertShareCleanup,
   captureShareCleanupBaseline,
   setShareGroupConfigs,
+  resetShareGroupConfigs,
   shareRecordIdentity,
   shareTopicName,
 } = require('../../../../testHelpers/shareFixtures')
@@ -865,6 +860,7 @@ const settlementCandidates = (entries, corpus, bounces, evidence) => {
   }
   const unknown = []
   const missing = []
+  const unresolved = []
   for (const identity of corpus) {
     if (successful.has(identity)) continue
     const entry = last.get(identity)
@@ -921,7 +917,29 @@ const settlementCandidates = (entries, corpus, bounces, evidence) => {
         }
       }
     if (candidate) unknown.push(candidate)
-    else missing.push(identity)
+    else {
+      missing.push(identity)
+      unresolved.push({
+        identity,
+        entry: entry?.id,
+        handlerAt: entry?.at,
+        frozenEpisodes: bounces
+          .filter((episode) => episode.obligations.some((held) => held.entry === entry?.id))
+          .map(({ index, nodeId, at, downAt }) => ({ index, nodeId, at, downAt })),
+        outcomes: entry?.acquisition ? evidence.results(entry) : [],
+        accepts: entry?.acquisition
+          ? evidence.results(entry).flatMap((outcome) =>
+              evidence.acceptsFor(entry, outcome).map((exchange) => ({
+                exchange: exchange.id,
+                nodeId: exchange.nodeId,
+                writtenAt: exchange.frames[0].at,
+                lostAt: exchange.frames[0].lostAt,
+                failedAt: exchange.failedAt,
+              }))
+            )
+          : [],
+      })
+    }
   }
   const perBounce = bounces.map(
     ({ index }) => unknown.filter(({ bounce }) => bounce === index).length
@@ -935,7 +953,7 @@ const settlementCandidates = (entries, corpus, bounces, evidence) => {
     problems.push('Unknown settlement exceeds the frozen fault allowance')
   if (bounces.some(({ held }) => held.size > MAX_HELD))
     problems.push('Unresolved held history exceeds its allowance')
-  return { successful: [...successful].sort(), unknown, missing, perBounce, problems }
+  return { successful: [...successful].sort(), unknown, missing, unresolved, perBounce, problems }
 }
 
 /**
@@ -1825,25 +1843,41 @@ class ShareBounceCase {
    * @returns {Promise<void>}
    */
   async drain(scope) {
-    await pollUntil(
-      scope,
-      60000,
-      () => {
-        this.settlement = settlementCandidates(
-          this.entries,
-          new Set(this.expected),
-          this.snapshots,
-          this.evidence
-        )
-        return (
-          this.expected.length === RECORDS &&
-          this.expected.every((identity) => this.seen.has(identity)) &&
-          this.settlement.missing.length === 0 &&
-          this.settlement.problems.length === 0
-        )
-      },
-      { label: 'Every identity settling', delayMs: 500 }
-    )
+    let previous
+    try {
+      await pollUntil(
+        scope,
+        60000,
+        () => {
+          this.settlement = settlementCandidates(
+            this.entries,
+            new Set(this.expected),
+            this.snapshots,
+            this.evidence
+          )
+          const counts = {
+            handled: this.seen.size,
+            successful: this.settlement.successful.length,
+            unknownCandidates: this.settlement.unknown.length,
+            missing: this.settlement.missing.length,
+            problems: this.settlement.problems,
+          }
+          const current = JSON.stringify(counts)
+          if (current !== previous) this.row('settlement-progress', counts)
+          previous = current
+          return (
+            this.expected.length === RECORDS &&
+            this.expected.every((identity) => this.seen.has(identity)) &&
+            this.settlement.missing.length === 0 &&
+            this.settlement.problems.length === 0
+          )
+        },
+        { label: 'Every identity settling', delayMs: 500 }
+      )
+    } catch (error) {
+      this.row('unresolved-settlement', { identities: this.settlement?.unresolved ?? [] })
+      throw error
+    }
   }
 
   /**
@@ -2185,32 +2219,7 @@ class ShareBounceCase {
    * @throws {Error} when the broker refuses or an override remains
    */
   async resetConfigs(signal) {
-    const names = Object.keys(this.groupConfig)
-    const { resources } = await bounded(signal, 8000, () =>
-      this.admin.incrementalAlterConfigs({
-        resources: [
-          {
-            type: ConfigResourceTypes.GROUP,
-            name: this.group,
-            configEntries: names.map((name) => ({ name, operation: AlterConfigOpTypes.DELETE })),
-          },
-        ],
-      })
-    )
-    if (resources[0].errorCode !== 0) {
-      throw new Error(`Config reset refused: ${resources[0].errorCode}`)
-    }
-    const read = await bounded(signal, 8000, () =>
-      this.admin.describeConfigs({
-        resources: [{ type: ConfigResourceTypes.GROUP, name: this.group, configNames: names }],
-      })
-    )
-    const left = read.resources[0].configEntries.filter(
-      ({ configSource }) => configSource === ConfigSource.GROUP_CONFIG
-    )
-    if (left.length > 0) {
-      throw new Error(`Group config overrides remain: ${left.map((e) => e.configName)}`)
-    }
+    await resetShareGroupConfigs(this.admin, this.group, Object.keys(this.groupConfig), { signal })
   }
 
   /**
@@ -2999,6 +3008,31 @@ describe('share bounce acquisition and settlement sensitivity', () => {
     proof.bounces[0].inFlight = []
     proof.evidence.exchanges.at(-1).frames[0].at = 7.5
     expect(auditTerminal(proof).problems).toEqual([])
+  })
+
+  it('does not charge a post-freeze handler to a later unrelated bounce', () => {
+    const proof = lostAcceptFixture(replayFixture())
+    const original = proof.bounces[0]
+    proof.bounces.push({
+      ...original,
+      index: 1,
+      nodeId: 2,
+      at: 19,
+      downAt: 20,
+      restoredAt: 30,
+    })
+    original.at = 3
+    original.held = new Set()
+    original.obligations = []
+    const settlement = auditTerminal(proof).settlement
+    expect(settlement.unknown).toEqual([])
+    expect(settlement.missing).toEqual(proof.corpus)
+    expect(settlement.unresolved[0]).toMatchObject({
+      entry: 0,
+      handlerAt: 4,
+      frozenEpisodes: [{ index: 1, nodeId: 2, at: 19, downAt: 20 }],
+      accepts: [{ exchange: 100, nodeId: 1, writtenAt: 6, lostAt: 8, failedAt: 8 }],
+    })
   })
 
   it('requires recovery when the lost Accept was not applied and retains its old unknown history', () => {

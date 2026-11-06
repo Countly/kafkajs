@@ -132,6 +132,54 @@ const setShareGroupConfigs = async (admin, group, kv, { timeout = 10000, interva
 }
 
 /**
+ * Deletes the given group overrides once, then waits for the broker's readback to catch up.
+ * @param {object} admin Connected admin client.
+ * @param {string} group Owned group id.
+ * @param {string[]} names Config names to restore to defaults.
+ * @param {{ signal?: AbortSignal }} [options] Enclosing cleanup scope.
+ * @returns {Promise<void>} Once every override is absent from the GROUP resource.
+ * @throws {Error} On refusal, missing readback or an override remaining at the deadline.
+ */
+const resetShareGroupConfigs = async (admin, group, names, { signal } = {}) => {
+  const { NEVER, bounded, pollUntil } = require('../src/producer/__tests__/fixtures/bounded')
+  await bounded(signal || NEVER, 8000, async (scope) => {
+    const resource = { type: CONFIG_RESOURCE_TYPES.GROUP, name: group }
+    const { resources } = await bounded(scope, Infinity, () =>
+      admin.incrementalAlterConfigs({
+        resources: [
+          {
+            ...resource,
+            configEntries: names.map((name) => ({ name, operation: ALTER_CONFIG_OP_TYPES.DELETE })),
+          },
+        ],
+      })
+    )
+    if (resources[0].errorCode !== 0) {
+      throw new Error(`Config reset refused: ${resources[0].errorCode}`)
+    }
+    await pollUntil(
+      scope,
+      Infinity,
+      async () => {
+        const read = await admin.describeConfigs({
+          resources: [{ ...resource, configNames: names }],
+        })
+        const row = read.resources.find(
+          ({ resourceType, resourceName }) =>
+            resourceType === resource.type && resourceName === group
+        )
+        if (!row || row.errorCode !== 0) throw new Error('Missing successful group config readback')
+        return !row.configEntries.some(
+          ({ configName, configSource }) =>
+            names.includes(configName) && configSource === CONFIG_SOURCE.GROUP_CONFIG
+        )
+      },
+      { delayMs: 100, label: 'Group config overrides disappearing' }
+    )
+  })
+}
+
+/**
  * A stable delivered-record identity, including bytes and the exact decimal broker offset.
  * @param {{ topic: string, partition: number, offset: string, key: Buffer|null, value: Buffer|null }} record
  * @returns {string} a collision-free JSON tuple; delivery count is an observation, not identity
@@ -378,7 +426,44 @@ const sampleShareCleanup = async (probe, signal) => {
 }
 
 /**
- * Captures the client-free baseline through the same deadline and sampling path as cleanup.
+ * Validates the required measurements and selects the values that cleanup must restore exactly.
+ * Cumulative socket totals can grow; the number of open sockets must return to its baseline.
+ * @param {object} snapshot Original probe measurement.
+ * @returns {object} Comparable resource counts without inferred defaults.
+ * @throws {Error} When any required measurement is missing or invalid.
+ */
+const shareCleanupResources = (snapshot) => {
+  for (const key of ['listeners', 'sockets', 'queueDepth', 'ledgerSize', 'activeResources']) {
+    if (snapshot?.[key] === undefined) throw new Error(`Missing resource measurement: ${key}`)
+  }
+  const count = (value) => Number.isSafeInteger(value) && value >= 0
+  const counts = (value) =>
+    value !== null &&
+    typeof value === 'object' &&
+    !Array.isArray(value) &&
+    Object.values(value).every(count)
+  if (
+    !counts(snapshot.listeners) ||
+    !counts(snapshot.activeResources) ||
+    !count(snapshot.queueDepth) ||
+    !count(snapshot.ledgerSize) ||
+    !['created', 'destroyed', 'open'].every((key) => count(snapshot.sockets?.[key])) ||
+    snapshot.sockets.created - snapshot.sockets.destroyed !== snapshot.sockets.open
+  ) {
+    throw new Error('Invalid resource measurement')
+  }
+  return {
+    listeners: snapshot.listeners,
+    sockets: snapshot.sockets.open,
+    queueDepth: snapshot.queueDepth,
+    ledgerSize: snapshot.ledgerSize,
+    activeResources: snapshot.activeResources,
+  }
+}
+
+/**
+ * Captures three equal samples, 50 ms apart, with no foreign network or child-process resources.
+ * Uses the same deadline and sampling path as cleanup; it never rebases the after comparison.
  * Topic-propagation connections belong to the fixture and are closed at both sampling points.
  * Call outside any workload-only bound, before connecting clients. The enclosing case deadline
  * must remain active through the cleanup proof.
@@ -390,14 +475,34 @@ const sampleShareCleanup = async (probe, signal) => {
  * @throws {Error} on abort, failed fixture disconnect or measurement
  */
 const captureShareCleanupBaseline = async (probe, { signal, cleanupStack = true } = {}) => {
-  const { NEVER, bounded } = require('../src/producer/__tests__/fixtures/bounded')
+  const { isDeepStrictEqual } = require('util')
+  const { NEVER, bounded, pollUntil } = require('../src/producer/__tests__/fixtures/bounded')
   const { CleanupStack } = require('../src/producer/__tests__/fixtures/liveProbe')
   const owner = signal || NEVER
   let baseline
   const capture = (scope) =>
     bounded(AbortSignal.any([owner, scope]), 10000, async (inner) => {
       await bounded(inner, Infinity, () => helpers.disconnectPropagationBrokers())
-      baseline = await sampleShareCleanup(probe, inner)
+      let previous
+      let stable = 0
+      await pollUntil(
+        inner,
+        Infinity,
+        async (sampleScope) => {
+          baseline = await sampleShareCleanup(probe, sampleScope)
+          const resources = shareCleanupResources(baseline)
+          const active = resources.activeResources
+          const foreign =
+            (active.TCPSocketWrap ?? 0) > resources.sockets ||
+            ['TCPServerWrap', 'TCPConnectWrap', 'ShutdownWrap', 'ProcessWrap'].some(
+              (type) => (active[type] ?? 0) > 0
+            )
+          stable = !foreign && isDeepStrictEqual(resources, previous) ? stable + 1 : 1
+          previous = resources
+          return !foreign && stable >= 3
+        },
+        { delayMs: 50, label: 'Share resource baseline becoming quiet' }
+      )
       return baseline
     })
   if (!cleanupStack) return capture(owner)
@@ -453,34 +558,10 @@ const assertShareCleanup = async (
         Infinity,
         async (sampleScope) => {
           after = await sampleShareCleanup(probe, sampleScope)
-          for (const snapshot of [baseline, after]) {
-            for (const key of keys) {
-              if (snapshot?.[key] === undefined)
-                throw new Error(`Missing resource measurement: ${key}`)
-            }
-            const count = (value) => Number.isSafeInteger(value) && value >= 0
-            const counts = (value) =>
-              value !== null &&
-              typeof value === 'object' &&
-              !Array.isArray(value) &&
-              Object.values(value).every(count)
-            if (
-              !counts(snapshot.listeners) ||
-              !counts(snapshot.activeResources) ||
-              !count(snapshot.queueDepth) ||
-              !count(snapshot.ledgerSize) ||
-              !['created', 'destroyed', 'open'].every((key) => count(snapshot.sockets?.[key])) ||
-              snapshot.sockets.created - snapshot.sockets.destroyed !== snapshot.sockets.open
-            ) {
-              throw new Error('Invalid resource measurement')
-            }
-          }
-          const restored =
-            after.sockets.open === baseline.sockets.open &&
-            after.queueDepth === baseline.queueDepth &&
-            after.ledgerSize === baseline.ledgerSize &&
-            isDeepStrictEqual(after.listeners, baseline.listeners) &&
-            isDeepStrictEqual(after.activeResources, baseline.activeResources)
+          const restored = isDeepStrictEqual(
+            shareCleanupResources(after),
+            shareCleanupResources(baseline)
+          )
           if (!restored && !disconnectAdmin) {
             throw new Error('Share resources did not return to baseline')
           }
@@ -514,6 +595,7 @@ module.exports = {
   shareTopicName,
   createShareTopic,
   setShareGroupConfigs,
+  resetShareGroupConfigs,
   shareRecordIdentity,
   ShareHandlerLog,
   verifierMember,
