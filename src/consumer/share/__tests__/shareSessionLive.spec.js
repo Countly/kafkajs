@@ -1471,7 +1471,10 @@ const assertLeaderReplayEvidence = async (evidence, terminal = false) => {
     expect(handler.ledger).toBe(handler.originalLedger)
     expect(handler.acquisition).toBe(handler.originalToken)
     expect(adoption.records).toEqual(adoption.original.records)
-    expect(adoption.deliveryCounts).toEqual(adoption.original.deliveryCounts)
+    expect(adoption.deliveryCounts).toBeInstanceOf(Uint16Array)
+    expect(Array.from(adoption.deliveryCounts)).toEqual(
+      Array.from(adoption.original.deliveryCounts)
+    )
     const index = adoption.records.findIndex(({ offset }) => offset === handler.offset)
     expect(index).toBeGreaterThanOrEqual(0)
     expect(adoption.records[index]).toEqual({
@@ -3986,7 +3989,7 @@ const scriptedLeaderReplay = async (count) => {
   const adopt = (source, message, deliveryCount) => {
     const token = Symbol('acquisition')
     const walk = {
-      deliver: { records: [message], deliveryCounts: [deliveryCount] },
+      deliver: { records: [message], deliveryCounts: new Uint16Array([deliveryCount]) },
       gaps: [],
       release: [],
       reject: [],
@@ -4913,7 +4916,7 @@ describe('held leader-move replay sensitivity', () => {
       const evidence = await scriptedLeaderReplay(1)
       evidence.capture.handlers[1].deliveryCount = deliveryCount
       const adoption = evidence.capture.acquisitions[1]
-      adoption.deliveryCounts = [deliveryCount]
+      adoption.deliveryCounts = new Uint16Array([deliveryCount])
       adoption.original.deliveryCounts = [deliveryCount]
       const request = evidence.capture.frames.find(({ exchange }) => exchange === adoption.exchange)
       await changeLeaderAnswer(evidence, request, (answer) => {
@@ -4927,7 +4930,7 @@ describe('held leader-move replay sensitivity', () => {
     const evidence = await scriptedLeaderReplay(1)
     evidence.capture.handlers[0].deliveryCount = 2
     const adoption = evidence.capture.acquisitions[0]
-    adoption.deliveryCounts = [2]
+    adoption.deliveryCounts = new Uint16Array([2])
     adoption.original.deliveryCounts = [2]
     const request = evidence.capture.frames.find(({ exchange }) => exchange === adoption.exchange)
     await changeLeaderAnswer(evidence, request, (answer) => {
