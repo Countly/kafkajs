@@ -1911,7 +1911,7 @@ namespace ShareConsumerSurface {
   const duration: number | null = share.acquisitionLockTimeoutMs()
   void [parameters, duration, share.subscription(), share.assignment(), share.logger(), share.stop(), share.disconnect({ timeout: 0 })]
   const admin = kafka.admin()
-  void [admin.describeShareGroups(['g']), admin.listShareGroupOffsets({ groupId: 'g' }), admin.alterShareGroupOffsets({ groupId: 'g', topics: [{ topic: 't', partitions: [{ partition: 0, offset: '9007199254740993' }] }] }), admin.deleteShareGroupOffsets({ groupId: 'g', topics: ['t'] }), admin.deleteGroups(['g'])]
+  void [admin.describeShareGroups(['g']), admin.listShareGroupOffsets({ groupId: 'g' }), admin.alterShareGroupOffsets({ groupId: 'g', topics: [{ topic: 't', partitions: [{ partition: 0, offset: '9007199254740993' }] }] }), admin.deleteShareGroupOffsets({ groupId: 'g', topics: ['t'] }), admin.deleteGroups(['g']), admin.listGroups({ types: ['share'] })]
   const error: Error = new ShareSurface.KafkaJSShareGroupsNotSupportedError('unsupported', { apiKey: 78, apiName: 'shareFetch', reason: 'api-version-range' })
   if (error instanceof ShareSurface.KafkaJSShareGroupsNotSupportedError) {
     const base: ShareSurface.KafkaJSServerDoesNotSupportApiKey = error; void [base, error.reason]

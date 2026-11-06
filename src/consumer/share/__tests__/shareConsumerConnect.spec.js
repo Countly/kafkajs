@@ -1,6 +1,9 @@
+const Cluster = require('../../../cluster')
 const {
   A,
+  acquire,
   deferred,
+  fetchAnswer,
   flush,
   shareClient,
   topError,
@@ -42,6 +45,7 @@ describe('public share connection contract', () => {
     const closing = clients
     clients = []
     for (const h of closing) await h.close()
+    jest.restoreAllMocks()
   })
 
   test('refuses missing share APIs before sending a share frame', async () => {
@@ -119,10 +123,18 @@ describe('public share connection contract', () => {
     expect(second.crashes[0].restart).toBe(false)
   })
 
-  test('gates each new leader before a share request', async () => {
+  test('gates each new leader before a share request without blocking a supported sibling', async () => {
     const h = open({
       nodes: 2,
-      topics: { 'topic-a': { topicId: A, partitions: [{ leader: 1, epoch: 1 }] } },
+      topics: {
+        'topic-a': {
+          topicId: A,
+          partitions: [
+            { leader: 0, epoch: 1 },
+            { leader: 1, epoch: 1 },
+          ],
+        },
+      },
     })
     h.cluster.answer('ApiVersions', (fields, record) => {
       const base = h.cluster.apiVersionsAnswer()
@@ -130,13 +142,36 @@ describe('public share connection contract', () => {
         ? { ...base, apiKeys: base.apiKeys.filter(({ apiKey }) => apiKey !== 78) }
         : base
     })
+    h.script('ShareFetch', [fetchAnswer([acquire(0, 0, ['a'])])])
     const seen = observe(h)
+    const crashed = deferred()
+    h.consumer.on(h.consumer.events.CRASH, () => crashed.resolve())
     await subscribe(h)
-    await run(h)
-    await until(() => seen.crashes.length === 1, 'the crash event')
+    const gate = h.hold({ api: 'ApiVersions', node: 1 })
+    const delivered = deferred()
+    const handled = []
+    await run(h, {
+      eachMessage: async ({ partition, message }) => {
+        handled.push([partition, message.offset])
+        delivered.resolve()
+      },
+    })
+    await gate.arrived()
+    await delivered.promise
+    expect(handled).toEqual([[0, '0']])
+    expect(seen.crashes).toHaveLength(0)
+    expect(h.frames(78, 79).filter(({ node }) => node === 1)).toHaveLength(0)
+    gate.release()
+    await crashed.promise
+    expect(seen.crashes).toHaveLength(1)
     expect(seen.crashes[0].error).toBeInstanceOf(KafkaJSShareGroupsNotSupportedError)
     expect(seen.crashes[0].error).toMatchObject({ reason: 'api-not-advertised', apiKey: 78 })
+    expect(seen.crashes[0].restart).toBe(false)
     expect(h.frames(78, 79).filter(({ node }) => node === 1)).toHaveLength(0)
+    expect(h.consumer.assignment()).toEqual([])
+    const frames = h.frames(76, 78, 79).length
+    await flush()
+    expect(h.frames(76, 78, 79)).toHaveLength(frames)
     await expect(h.consumer.stop()).resolves.toBeUndefined()
   })
 
@@ -184,6 +219,30 @@ describe('public share connection contract', () => {
     expect(second.connects).toHaveLength(0)
     await expect(raced.consumer.connect()).resolves.toBeUndefined()
     expect(second.connects).toHaveLength(1)
+  })
+
+  test('retires a coordinator lookup held across a disconnect and reconnects nothing', async () => {
+    const lookups = []
+    const original = Cluster.prototype.findGroupCoordinator
+    jest.spyOn(Cluster.prototype, 'findGroupCoordinator').mockImplementation(function (...args) {
+      const promise = original.apply(this, args)
+      lookups.push(promise)
+      return promise
+    })
+    const h = open()
+    await subscribe(h)
+    const gate = h.hold({ api: 'FindCoordinator' })
+    const running = run(h)
+    await gate.arrived()
+    expect(lookups).toHaveLength(1)
+    await h.consumer.disconnect({ timeout: 0 })
+    await running
+    const sockets = h.cluster.sockets().length
+    await expect(lookups[0]).rejects.toThrow('Share membership is no longer current')
+    gate.release()
+    await flush()
+    expect(h.cluster.sockets()).toHaveLength(sockets)
+    expect(h.frames(76)).toHaveLength(0)
   })
 
   test('resolves run after the first accepted join', async () => {

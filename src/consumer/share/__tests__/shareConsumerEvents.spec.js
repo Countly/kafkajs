@@ -102,8 +102,13 @@ describe('Share consumer observer containment', () => {
 
 describe('public share event contract', () => {
   const {
+    A,
     acquire,
+    acquired,
+    deferred,
     fetchAnswer,
+    part,
+    recordsHex,
     shareClient,
     until,
   } = require('../../../../testHelpers/shareHarness')
@@ -228,5 +233,89 @@ describe('public share event contract', () => {
       expect(seen[name][0].payload).toBeUndefined()
     }
     expect(seen.GROUP_JOIN).toHaveLength(1)
+  })
+
+  test('publishes one membership session reset counting only the discarded delivered records', async () => {
+    h = shareClient()
+    const seen = record(['SESSION_RESET', 'ACKNOWLEDGE'])
+    h.script('ShareFetch', [
+      fetchAnswer([
+        part({ partition: 0, acquire: [acquired(0, 5)], records: recordsHex(0, ['a', 'b', 'c']) }),
+      ]),
+    ])
+    await h.consumer.subscribe({ topics: ['topic-a'] })
+    const settled = deferred()
+    h.consumer.on(h.consumer.events.ACKNOWLEDGE, () => {
+      if (seen.ACKNOWLEDGE.length === 2) settled.resolve()
+    })
+    const second = deferred()
+    const hold = deferred()
+    await h.consumer.run({
+      eachMessage: async ({ message }) => {
+        if (message.offset === '0') throw new Error('first fails')
+        second.resolve()
+        await hold.promise
+      },
+    })
+    await Promise.all([settled.promise, second.promise])
+    expect(seen.ACKNOWLEDGE.map(({ payload }) => payload)).toEqual([
+      {
+        topic: 'topic-a',
+        partition: 0,
+        firstOffset: '0',
+        lastOffset: '0',
+        type: 'release',
+        error: null,
+      },
+      {
+        topic: 'topic-a',
+        partition: 0,
+        firstOffset: '3',
+        lastOffset: '5',
+        type: 'gap',
+        error: null,
+      },
+    ])
+    expect(seen.SESSION_RESET).toHaveLength(0)
+    await h.consumer.disconnect({ timeout: 0 })
+    expect(seen.SESSION_RESET.map(({ type, payload }) => ({ type, ...payload }))).toEqual([
+      {
+        type: 'share_consumer.session_reset',
+        nodeId: 0,
+        reason: 'membership',
+        recordsDropped: 1,
+      },
+    ])
+    hold.resolve()
+  })
+
+  test('publishes one membership session reset for each discarded node session', async () => {
+    h = shareClient({
+      nodes: 2,
+      topics: {
+        'topic-a': {
+          topicId: A,
+          partitions: [
+            { leader: 0, epoch: 1 },
+            { leader: 1, epoch: 1 },
+          ],
+        },
+      },
+    })
+    const seen = record(['SESSION_RESET', 'FETCH'])
+    await h.consumer.subscribe({ topics: ['topic-a'] })
+    const opened = deferred()
+    h.consumer.on(h.consumer.events.FETCH, () => {
+      if (new Set(seen.FETCH.map(({ payload }) => payload.nodeId)).size === 2) opened.resolve()
+    })
+    await h.consumer.run({ eachMessage: async () => {} })
+    await opened.promise
+    await h.consumer.disconnect({ timeout: 0 })
+    expect(
+      seen.SESSION_RESET.map(({ payload }) => payload).sort((a, b) => a.nodeId - b.nodeId)
+    ).toEqual([
+      { nodeId: 0, reason: 'membership', recordsDropped: 0 },
+      { nodeId: 1, reason: 'membership', recordsDropped: 0 },
+    ])
   })
 })

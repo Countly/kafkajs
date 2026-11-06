@@ -1,4 +1,5 @@
 const { ShareCloseEpisode } = require('../shareCloseEpisode')
+const { ShareRun } = require('../shareRun')
 
 /** @param {object} options Case overrides. @returns {object} Episode and controlled actual clock. */
 const setup = ({ timeout, requestTimeout = 1000 } = {}) => {
@@ -125,6 +126,7 @@ describe('public share shutdown contract', () => {
   afterEach(async () => {
     await h?.close()
     h = undefined
+    jest.restoreAllMocks()
   })
   /** @param {object} [options] `shareClient` options. @returns {Promise<object>} A subscribed client. */
   const start = async (options) => {
@@ -264,5 +266,127 @@ describe('public share shutdown contract', () => {
     const joins = h.frames(76).filter(({ fields }) => fields.memberEpoch === 0)
     expect(new Set(joins.map(({ fields }) => fields.memberId)).size).toBe(2)
     expect(h.consumer.assignment()).toEqual([{ topic: 'topic-a', partitions: [0] }])
+  })
+  /** @returns {object[]} Every run the client starts, oldest first: state a test cannot read publicly. */
+  const captureRuns = () => {
+    const runs = []
+    const original = ShareRun.prototype.start
+    jest.spyOn(ShareRun.prototype, 'start').mockImplementation(function () {
+      runs.push(this)
+      return original.call(this)
+    })
+    return runs
+  }
+  /**
+   * Fences the running member, with its handler held and its captured final held at the wire.
+   * @returns {Promise<{final: object, gate: object}>} The held final request and the handler's gate.
+   */
+  const fenceWithHeldFinal = async () => {
+    await start()
+    h.script('ShareFetch', [fetchAnswer([acquire(0, 0, ['a'])])])
+    let fence = false
+    h.script(
+      'ShareGroupHeartbeat',
+      Array.from({ length: 100 }, () => () => {
+        if (!fence) return undefined
+        fence = false
+        return { errorCode: 110 }
+      })
+    )
+    const final = h.hold({ api: 'ShareAcknowledge' })
+    const gate = deferred()
+    const started = deferred()
+    await h.consumer.run({
+      eachMessage: async ({ acknowledge }) => {
+        acknowledge()
+        started.resolve()
+        await gate.promise
+      },
+    })
+    await started.promise
+    fence = true
+    await final.arrived()
+    return { final, gate }
+  }
+
+  test('starts no handler after a disconnect that arrives during an earlier one', async () => {
+    await start()
+    h.script('ShareFetch', [fetchAnswer([acquire(0, 0, ['a', 'b', 'c'])])])
+    const started = []
+    let closing
+    let running
+    await h.consumer.run({
+      eachMessage: async ({ message, isRunning }) => {
+        started.push(message.offset)
+        closing = h.consumer.disconnect()
+        running = isRunning()
+      },
+    })
+    await until(() => closing !== undefined, 'the disconnect')
+    await closing
+    expect(started).toEqual(['0'])
+    expect(running).toBe(false)
+    expect(finals()[0].fields.topics[0].partitions[0].acknowledgementBatches).toEqual([
+      { firstOffset: '0', lastOffset: '2', acknowledgeTypes: [1, 2, 2] },
+    ])
+  })
+
+  test('ends the run when a stop arrives during a fence recovery close', async () => {
+    const { final, gate } = await fenceWithHeldFinal()
+    let stopped = false
+    const stopping = h.consumer.stop().then(() => {
+      stopped = true
+    })
+    await flush()
+    expect(stopped).toBe(false)
+    final.release()
+    await stopping
+    expect(h.order).toEqual(['stop'])
+    gate.resolve()
+    await expect(h.consumer.run({ eachMessage: async () => {} })).resolves.toBeUndefined()
+    const joins = h.frames(76).filter(({ fields }) => fields.memberEpoch === 0)
+    expect(new Set(joins.map(({ fields }) => fields.memberId)).size).toBe(2)
+  })
+
+  test('keeps the heartbeat chain suspended while a fenced run closes and resumes it after', async () => {
+    const runs = captureRuns()
+    const { final, gate } = await fenceWithHeldFinal()
+    const [run] = runs
+    const joinFrames = () => h.frames(76).filter(({ fields }) => fields.memberEpoch === 0)
+    expect(run.manager.isRunning()).toBe(false)
+    expect(joinFrames()).toHaveLength(1)
+    const rejoined = deferred()
+    h.consumer.on(h.consumer.events.GROUP_JOIN, () => rejoined.resolve())
+    final.release()
+    await rejoined.promise
+    expect(run.manager.isRunning()).toBe(true)
+    expect(joinFrames()).toHaveLength(2)
+    gate.resolve()
+  })
+
+  test('freezes handler authority in the tick a crash cuts a waiting stop short', async () => {
+    const runs = captureRuns()
+    await start()
+    h.script('ShareFetch', [fetchAnswer([acquire(0, 0, ['a'])])])
+    const gate = deferred()
+    const started = deferred()
+    const saved = {}
+    await h.consumer.run({
+      eachMessage: async ({ acknowledge, renew }) => {
+        Object.assign(saved, { acknowledge, renew })
+        started.resolve()
+        await gate.promise
+      },
+    })
+    await started.promise
+    const stopping = h.consumer.stop()
+    await flush()
+    expect(finals()).toHaveLength(0)
+    const crashed = runs[0].crash(new Error('terminal'))
+    expect(() => saved.acknowledge('reject')).toThrow('no longer current')
+    expect(() => saved.renew()).toThrow('no longer current')
+    gate.resolve()
+    await Promise.all([crashed, stopping])
+    expect(h.frames(79).filter(({ fields }) => fields.isRenewAck)).toHaveLength(0)
   })
 })

@@ -11,6 +11,35 @@ const TYPE_CODES = Object.freeze({ accept: 1, release: 2, reject: 3 })
 const compareOffsets = (a, b) => a.length - b.length || (a < b ? -1 : a > b ? 1 : 0)
 
 /**
+ * @param {Array<{offset: string}>} records Records ascending by offset.
+ * @param {string} offset An exact decimal offset.
+ * @param {boolean} inclusive Whether a record at `offset` counts as before it.
+ * @returns {number} How many records lie before `offset` (or at it, when `inclusive`).
+ */
+const countBefore = (records, offset, inclusive) => {
+  let low = 0
+  let high = records.length
+  while (low < high) {
+    const middle = (low + high) >>> 1
+    const order = compareOffsets(records[middle].offset, offset)
+    if (order < 0 || (inclusive && order === 0)) low = middle + 1
+    else high = middle
+  }
+  return low
+}
+
+/**
+ * Counts delivered records inside one compact range without a per-record pass, so a million-offset
+ * range costs two binary searches.
+ * @param {Array<{offset: string}>} records Delivered records, ascending by offset.
+ * @param {string} firstOffset Inclusive lower bound, an exact decimal offset.
+ * @param {string} lastOffset Inclusive upper bound, an exact decimal offset.
+ * @returns {number} How many records have an offset in `[firstOffset, lastOffset]`.
+ */
+const countWithin = (records, firstOffset, lastOffset) =>
+  countBefore(records, lastOffset, true) - countBefore(records, firstOffset, false)
+
+/**
  * Owns one handler invocation's provisional decisions and its original authority.
  *
  * It views `records[start, end)` of one acquisition's delivered records, which the walk keeps in
@@ -193,6 +222,20 @@ class ShareHandlerCall {
   }
 
   /**
+   * Finds the messages of this call whose acquisition lock ended, without allocating when none did.
+   * @param {number} now Monotonic milliseconds.
+   * @returns {string[]|null} Their offsets, ascending, or null when every lock is still running.
+   */
+  expiredAt(now) {
+    let expired = null
+    for (let i = this.start; i < this.end; i++) {
+      const { offset } = this.records[i]
+      if (!this.ledger.canStart(offset, now)) (expired ??= []).push(offset)
+    }
+    return expired
+  }
+
+  /**
    * Offsets of the messages that have a local decision.
    * @private
    * @param {boolean} decided True for decided messages, false for undecided ones.
@@ -219,7 +262,7 @@ class ShareHandlerCall {
     if (!this.authority.current()) return null
     const stopping = this.authority.stopping()
     const release = failed || (this.batch && stopping) || this.mode === 'explicit'
-    this.ledger.complete(this.offsets(), release ? 'release' : 'accept')
+    this.ledger.completeRange(this.records, this.start, this.end, release ? 'release' : 'accept')
     if (failed || stopping || this.mode !== 'explicit' || this.decided === this.size) return null
     return this.omission()
   }
@@ -260,4 +303,4 @@ class ShareHandlerCall {
   }
 }
 
-module.exports = { ShareHandlerCall }
+module.exports = { ShareHandlerCall, countWithin }

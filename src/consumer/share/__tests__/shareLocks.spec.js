@@ -391,6 +391,24 @@ describe('public share renewal contract', () => {
     expect(h.events.acks.filter(({ type }) => type === 'accept')).toHaveLength(1)
   })
 
+  test('reports the last renewed duration when a later renewal keeps it', async () => {
+    await start()
+    h.script('ShareFetch', [lock(1000, ['a'])])
+    h.script('ShareAcknowledge', [
+      ackAnswer([{ partition: 0 }], { acquisitionLockTimeoutMs: 2000 }),
+      ackAnswer([{ partition: 0 }], { acquisitionLockTimeoutMs: 0 }),
+    ])
+    const seen = []
+    await h.consumer.run({
+      eachMessage: async ({ renew }) => {
+        seen.push(await renew(), await renew())
+      },
+    })
+    await until(() => seen.length === 2, 'two renewals')
+    expect(seen).toEqual([2000, 2000])
+    expect(h.consumer.acquisitionLockTimeoutMs()).toBe(2000)
+  })
+
   test('rejects invalid batch renewal selectors without traffic', async () => {
     await start()
     h.script('ShareFetch', [lock(1000, ['a', 'b'])])

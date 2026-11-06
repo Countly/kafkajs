@@ -1,4 +1,5 @@
 const { ShareHandlerCall } = require('../shareRunner')
+const { countWithin } = require('../shareHandlerCall')
 const { ShareAckLedger } = require('../shareAckLedger')
 const { KafkaJSNonRetriableError } = require('../../../errors')
 
@@ -210,6 +211,40 @@ describe('Share consumer handler decisions', () => {
     expect(() => first.acknowledge('reject')).toThrow(KafkaJSNonRetriableError)
     expect(c.ledger.prepare({ token: c.token }).ticket).not.toBeNull()
   })
+  test('completes and observes a call without building an offset array', () => {
+    for (const mode of ['implicit', 'explicit']) {
+      const c = setup({ mode, offsets: ['0', '1', '2'] })
+      const offsets = jest.spyOn(c.call, 'offsets')
+      const byOffsets = jest.spyOn(c.ledger, 'complete')
+      const byRange = jest.spyOn(c.ledger, 'completeRange')
+      expect(c.call.expiredAt(500)).toBeNull()
+      expect(c.call.expiredAt(1000)).toEqual(['0', '1', '2'])
+      c.call.complete()
+      expect(byRange).toHaveBeenCalledTimes(1)
+      expect(byRange).toHaveBeenCalledWith(
+        c.messages,
+        0,
+        3,
+        mode === 'explicit' ? 'release' : 'accept'
+      )
+      expect(offsets).not.toHaveBeenCalled()
+      expect(byOffsets).not.toHaveBeenCalled()
+      expect(types(c)).toEqual([mode === 'explicit' ? 2 : 1])
+    }
+  })
+  test('counts the delivered records inside a compact range by exact int64 offset', () => {
+    const records = ['0', '1', '2', '9', '10', '100', '9007199254740993'].map((offset) => ({
+      offset,
+    }))
+    expect(countWithin(records, '1', '9')).toBe(3)
+    expect(countWithin(records, '3', '8')).toBe(0)
+    expect(countWithin(records, '0', '9007199254740993')).toBe(7)
+    expect(countWithin(records, '10', '100')).toBe(2)
+    expect(countWithin(records, '11', '99')).toBe(0)
+    expect(countWithin(records, '9007199254740992', '9007199254740994')).toBe(1)
+    expect(countWithin(records, '9007199254740994', '9007199254740999')).toBe(0)
+    expect(countWithin([], '0', '9')).toBe(0)
+  })
   test('freezing a running call keeps only its explicit choices', () => {
     const c = setup({ offsets: ['0', '1', '2'] })
     c.call.acknowledge(c.messages[0], 'reject')
@@ -225,6 +260,7 @@ describe('public share handler contract', () => {
   const {
     acquire,
     acquired,
+    ackAnswer,
     fetchAnswer,
     flush,
     part,
@@ -236,6 +272,7 @@ describe('public share handler contract', () => {
   afterEach(async () => {
     await h?.close()
     h = undefined
+    jest.restoreAllMocks()
   })
   /** @param {object} [options] `shareClient` options. @returns {Promise<object>} Subscribed client with observers. */
   const start = async (options) => {
@@ -476,21 +513,86 @@ describe('public share handler contract', () => {
     expect(stamps[4] - stamps[3]).toBeLessThan(599)
   })
 
-  test('does not fetch while a returned handler renewal is pending', async () => {
+  test('does not fetch while a returned handler renewal is pending and then resolves it', async () => {
     await start()
     h.script('ShareFetch', [answer(['a'])])
+    h.script('ShareAcknowledge', [
+      ackAnswer([{ partition: 0 }], { acquisitionLockTimeoutMs: 2000 }),
+    ])
     const gate = h.hold({ api: 'ShareAcknowledge' })
+    const renewals = []
     await h.consumer.run({
       eachMessage: async ({ renew }) => {
-        renew().catch(() => {})
+        renewals.push(renew())
       },
     })
     await gate.arrived()
     const fetches = h.frames(78).length
+    let settled = false
+    renewals[0].then(
+      () => (settled = true),
+      () => (settled = true)
+    )
     await flush()
+    expect(settled).toBe(false)
     expect(h.frames(78)).toHaveLength(fetches)
     expect(h.frames(79)).toHaveLength(1)
     gate.release()
+    await expect(renewals[0]).resolves.toBe(2000)
     await until(() => h.frames(78).length > fetches, 'the next fetch after the renewal settled')
+  })
+
+  test('does not fetch while a returned handler renewal is pending and then rejects its refusal', async () => {
+    await start()
+    h.script('ShareFetch', [answer(['a'])])
+    h.script('ShareAcknowledge', [ackAnswer([{ partition: 0, code: 121 }])])
+    const gate = h.hold({ api: 'ShareAcknowledge' })
+    const renewals = []
+    await h.consumer.run({
+      eachMessage: async ({ renew }) => {
+        renewals.push(renew())
+      },
+    })
+    await gate.arrived()
+    const fetches = h.frames(78).length
+    let settled = false
+    renewals[0].then(
+      () => (settled = true),
+      () => (settled = true)
+    )
+    await flush()
+    expect(settled).toBe(false)
+    expect(h.frames(78)).toHaveLength(fetches)
+    gate.release()
+    await expect(renewals[0]).rejects.toMatchObject({
+      name: 'KafkaJSShareAcknowledgementError',
+      reason: 'rejected-by-broker',
+      ranges: [{ firstOffset: '0', lastOffset: '0' }],
+    })
+    expect(h.consumer.acquisitionLockTimeoutMs()).toBe(15000)
+    await until(() => h.frames(78).length > fetches, 'the next fetch after the refusal settled')
+  })
+
+  test('builds no offset array for a successful call in either handler form', async () => {
+    const offsets = jest.spyOn(ShareHandlerCall.prototype, 'offsets')
+    const byOffsets = jest.spyOn(ShareAckLedger.prototype, 'complete')
+    for (const handler of ['eachMessage', 'eachBatch']) {
+      await start()
+      offsets.mockClear()
+      byOffsets.mockClear()
+      h.script('ShareFetch', [answer(['a', 'b', 'c'])])
+      let handled = 0
+      await h.consumer.run({
+        [handler]: async (payload) => {
+          handled += payload.batch ? payload.batch.messages.length : 1
+        },
+      })
+      await until(() => handled === 3 && h.acks.length >= 1, 'the settled acknowledgement')
+      expect(h.acks[0]).toMatchObject({ firstOffset: '0', lastOffset: '2', type: 'accept' })
+      expect(offsets).not.toHaveBeenCalled()
+      expect(byOffsets).not.toHaveBeenCalled()
+      await h.close()
+      h = undefined
+    }
   })
 })

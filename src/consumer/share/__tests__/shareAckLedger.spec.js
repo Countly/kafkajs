@@ -59,6 +59,26 @@ describe('deterministic compact acknowledgement ledger', () => {
     expect(ledger.settle(ticket, { token }).map((r) => r.type)).toEqual(['accept', 'release'])
     expect(ledger.size).toBe(0)
   })
+  test('range completion promotes only the selected records and validates before mutating', () => {
+    const { ledger, token } = make()
+    const records = [{ offset: '1' }, { offset: '2' }, { offset: '3' }]
+    ledger.decide('2', 'reject')
+    expect(() => ledger.completeRange([records[0], { offset: '99' }], 0, 2, 'accept')).toThrow(
+      failure(KafkaJSNonRetriableError, OUTSIDE)
+    )
+    expect(() => ledger.completeRange(records, 0, 3, 'done')).toThrow(
+      failure(KafkaJSNonRetriableError, 'Invalid default acknowledgement')
+    )
+    expect(ledger.prepare({ token }).ticket).toBeNull()
+    ledger.completeRange(records, 1, 3, 'release')
+    ledger.completeRange(records, 3, 3, 'accept')
+    expect(ledger.prepare({ token }).ticket.acknowledgementBatches).toEqual([
+      { firstOffset: '2', lastOffset: '3', acknowledgeTypes: [3, 2] },
+    ])
+    expect(() => ledger.completeRange(records, 1, 2, 'accept')).toThrow(
+      failure(KafkaJSNonRetriableError, OUTSIDE)
+    )
+  })
   test.each(['session-lost', 'membership-lost', 'not-sent', 'rejected-by-broker'])(
     'settles %s once and never resends',
     (reason) => {

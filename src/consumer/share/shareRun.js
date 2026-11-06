@@ -6,7 +6,7 @@ const HeartbeatManager = require('../heartbeatManager')
 const { ShareMembership, SharePollView } = require('./shareMembership')
 const { ShareSession } = require('./shareSession')
 const { ShareFetchLoop } = require('./shareFetchLoop')
-const { ShareHandlerCall } = require('./shareHandlerCall')
+const { ShareHandlerCall, countWithin } = require('./shareHandlerCall')
 const { ShareCloseEpisode } = require('./shareCloseEpisode')
 const { events } = require('./instrumentationEvents')
 const { KafkaJSNonRetriableError, KafkaJSShareGroupsNotSupportedError } = require('../../errors')
@@ -81,6 +81,7 @@ class ShareRun {
     this.coordinator = null
     this.facade = null
     this.waiters = new Set()
+    this.lookups = new Set()
     this.firstJoin = deferred()
     this.membership = new ShareMembership({
       cluster: this.membershipCluster(),
@@ -146,8 +147,9 @@ class ShareRun {
 
   /**
    * The narrow Cluster facade the membership runs on. Coordinator lookup is delegated to the
-   * original Cluster, gated by the share capability, and returns a cached per-run object whose
-   * only transport method forwards to the original Broker and observes the answer.
+   * original Cluster under an operation bound to the asking membership, gated by the share
+   * capability, and returns a cached per-run object whose only transport method forwards to the
+   * original Broker and observes the answer.
    * @private
    * @returns {object} `{ findGroupCoordinator, topicName, refreshMetadataForTopicIds }`.
    */
@@ -156,18 +158,58 @@ class ShareRun {
     return {
       topicName: (topicId) => cluster.topicName(topicId),
       refreshMetadataForTopicIds: (ids, scope) => cluster.refreshMetadataForTopicIds(ids, scope),
-      findGroupCoordinator: async ({ groupId }) => {
-        const broker = await cluster.findGroupCoordinator({ groupId })
-        this.runner.checkCapability(broker, [apiKeys.ShareGroupHeartbeat])
-        if (this.facade?.broker !== broker) {
-          this.facade = {
-            broker,
-            shareGroupHeartbeat: (request, options) => this.transmit(broker, request, options),
-          }
-        }
-        return this.facade
-      },
+      findGroupCoordinator: ({ groupId }) => this.lookupCoordinator(groupId),
     }
+  }
+
+  /**
+   * Finds the group coordinator for the membership that asks now. The lookup is fenced by an
+   * operation that refuses once the run retired or that membership closed or was replaced, so a
+   * late answer installs nothing, opens no connection and sends no frame, and the retries stop.
+   * Every refusal coincides with the membership no longer being current, so the membership
+   * discards the failure instead of classifying it.
+   * @private
+   * @param {string} groupId Share group id.
+   * @returns {Promise<{broker: object, shareGroupHeartbeat: Function}>} The cached coordinator facade.
+   * @throws {Error} The refusal of the retired lookup, or the capability error of the coordinator.
+   */
+  async lookupCoordinator(groupId) {
+    const { membership } = this
+    const issued = membership.token
+    const lookup = new ConsumerOperation({
+      guard: () =>
+        this.retired || membership.closed || membership.token !== issued
+          ? new KafkaJSNonRetriableError('Share membership is no longer current')
+          : null,
+    })
+    this.lookups.add(lookup)
+    try {
+      const broker = await this.options.cluster.findGroupCoordinator({ groupId, fence: lookup })
+      lookup.check()
+      this.runner.checkCapability(broker, [apiKeys.ShareGroupHeartbeat])
+      if (this.facade?.broker !== broker) {
+        this.facade = {
+          broker,
+          shareGroupHeartbeat: (request, options) => this.transmit(broker, request, options),
+        }
+      }
+      return this.facade
+    } finally {
+      this.lookups.delete(lookup)
+      lookup.finish()
+    }
+  }
+
+  /**
+   * Retires every coordinator lookup in flight, so none can outlive the membership it served.
+   * Callers run it only once that membership is closed or replaced.
+   * @private
+   * @returns {void}
+   */
+  retireLookups() {
+    if (this.lookups.size === 0) return
+    const refusal = new KafkaJSNonRetriableError('Share membership is no longer current')
+    for (const lookup of this.lookups) lookup.retire(refusal)
   }
 
   /**
@@ -527,7 +569,9 @@ class ShareRun {
   }
 
   /**
-   * Counts delivered records of retired acquisitions and publishes each compact result once.
+   * Counts the delivered records that a lost outcome discarded, and publishes each compact result
+   * once. Automatic spans, records settled earlier and the nonterminal renew echo of a lost
+   * renewal are not counted: only delivered records inside a lost terminal range are.
    * @private
    * @param {object} node The node record.
    * @param {object[]} results Compact ledger results.
@@ -535,13 +579,15 @@ class ShareRun {
    * @returns {void}
    */
   onResults(node, results, cohort) {
-    if (
-      results.some(
-        (outcome) =>
-          outcome.error?.reason === 'session-lost' || outcome.error?.reason === 'membership-lost'
-      )
-    )
-      node.dropped += cohort.walk.deliver.records.length
+    for (const outcome of results) {
+      const reason = outcome.error?.reason
+      if (outcome.type !== 'renew' && (reason === 'session-lost' || reason === 'membership-lost'))
+        node.dropped += countWithin(
+          cohort.walk.deliver.records,
+          outcome.firstOffset,
+          outcome.lastOffset
+        )
+    }
     this.runner.publishResults(cohort, results)
   }
 
@@ -605,6 +651,7 @@ class ShareRun {
     if (records.length === 0) return
     const authority = this.authorityOf(node, cohort)
     cohort.key = `${cohort.topicId}:${cohort.partition}`
+    cohort.lockDuration = node.lockDuration
     node.active = { cohort, records, next: 0, call: null }
     if (this.batch) await this.dispatchBatch(node, cohort, authority)
     else {
@@ -694,9 +741,7 @@ class ShareRun {
       batch: false,
     })
     node.active.call = call
-    await this.invoke(node, cohort, call, () =>
-      this.handler(call.messagePayload(cohort.topic, cohort.partition))
-    )
+    await this.invoke(node, cohort, call, call.messagePayload(cohort.topic, cohort.partition))
     return this.ordinaryRefusal(node.issued) === null
   }
 
@@ -716,10 +761,9 @@ class ShareRun {
       records = records.filter((record) => !cohort.expired.has(record.offset))
       cohort.expired = null
     }
-    cohort.walk.deliver.records.forEach((record, i) => {
-      record.deliveryCount = deliveryCounts[i]
-    })
-    node.active.next = cohort.walk.deliver.records.length
+    const delivered = cohort.walk.deliver.records
+    for (let i = 0; i < delivered.length; i++) delivered[i].deliveryCount = deliveryCounts[i]
+    node.active.next = delivered.length
     const call = new ShareHandlerCall({
       ledger: cohort.ledger,
       records,
@@ -732,9 +776,9 @@ class ShareRun {
       topic: cohort.topic,
       partition: cohort.partition,
       messages: records,
-      acquisitionLockTimeoutMs: node.lockDuration,
+      acquisitionLockTimeoutMs: cohort.lockDuration,
     }
-    await this.invoke(node, cohort, call, () => this.handler(call.batchPayload(batch)))
+    await this.invoke(node, cohort, call, call.batchPayload(batch))
   }
 
   /**
@@ -748,10 +792,7 @@ class ShareRun {
   releaseFrom(node, cohort, from) {
     if (this.ordinaryRefusal(node.issued) !== null || !node.loop.isLive(cohort)) return
     const { records } = cohort.walk.deliver
-    cohort.ledger.complete(
-      records.slice(from).map((record) => record.offset),
-      'release'
-    )
+    cohort.ledger.completeRange(records, from, records.length, 'release')
     if (node.active?.cohort === cohort) node.active.next = records.length
   }
 
@@ -777,17 +818,17 @@ class ShareRun {
    * @param {object} node The node record.
    * @param {object} cohort The acquisition.
    * @param {ShareHandlerCall} call The original invocation.
-   * @param {() => Promise<void>} run Calls the application handler with its payload.
+   * @param {object} payload The public payload built from `call`, handed to the application handler.
    * @returns {Promise<void>}
    * @throws {Error} The explicit-omission verdict.
    */
-  async invoke(node, cohort, call, run) {
+  async invoke(node, cohort, call, payload) {
     const pollCall = this.poll.begin(node.id)
     let failed = false
     let thrown
     try {
       if (pollCall === null) throw new KafkaJSNonRetriableError('Share run is no longer polling')
-      await run()
+      await this.handler(payload)
     } catch (error) {
       failed = true
       thrown = error
@@ -818,9 +859,8 @@ class ShareRun {
    * @returns {void}
    */
   observeLateReturn(cohort, call) {
-    const now = performance.now()
-    const expired = call.offsets().filter((offset) => !cohort.ledger.canStart(offset, now))
-    if (expired.length)
+    const expired = call.expiredAt(performance.now())
+    if (expired)
       this.runner.emit(events.LOCK_EXPIRED, {
         topic: cohort.topic,
         partition: cohort.partition,
@@ -878,7 +918,9 @@ class ShareRun {
   /**
    * Renews the selected offsets through the node's FIFO. A refusal rejects with the ledger's
    * compact error; success resolves with the broker's duration only while this acquisition is
-   * still current. The promise is observed here, so an unawaited renewal never escapes.
+   * still current. An answer that keeps the duration reports the one this acquisition last had:
+   * the fetch's, or that of its last successful renewal. The promise is observed here, so an
+   * unawaited renewal never escapes.
    * @private
    * @param {object} node The node record.
    * @param {object} cohort The original acquisition.
@@ -890,9 +932,11 @@ class ShareRun {
       const result = await node.loop.acknowledge({ renew: [{ cohort, offsets }] })
       const refused = this.ordinaryRefusal(node.issued)
       if (refused) throw refused
-      const duration = result.lockDuration ?? node.lockDuration
-      if (result.lockDuration !== undefined) this.runner.latestLockDuration = result.lockDuration
-      return duration
+      if (result.lockDuration !== undefined) {
+        cohort.lockDuration = result.lockDuration
+        this.runner.latestLockDuration = result.lockDuration
+      }
+      return cohort.lockDuration
     })()
     promise.catch(() => {})
     return promise
@@ -938,14 +982,18 @@ class ShareRun {
       this.authorityToken = this.membership.token
       return
     }
+    this.retireLookups()
     if (oldToken !== this.authorityToken || this.closing) return
     this.beginClose(reason === 'fenced' ? 'fence' : 'crash')
   }
 
   /**
-   * Starts or joins this run's one close. Forced kinds (`crash`, `fence`, `poll`) freeze at once;
-   * `stop` and `disconnect` wait naturally for running handlers until the handler boundary.
-   * Later calls reuse the episode, so a disconnect never recaptures a replacement run.
+   * Starts or joins this run's one close. Forced kinds (`crash`, `fence`, `poll`) freeze at once,
+   * also when they escalate a natural close in progress; `stop` and `disconnect` latch the stop
+   * request synchronously, so no handler starts after them, and wait naturally for running
+   * handlers until the handler boundary. A stop or disconnect that arrives while a fence or poll
+   * recovery is closing ends the run once that recovery cleanup is done. Later calls reuse the
+   * episode, so a disconnect never recaptures a replacement run.
    * @param {'stop'|'disconnect'|'crash'|'fence'|'poll'} kind Why the run closes.
    * @param {number} [timeout] Validated disconnect timeout, when this call supplies one.
    * @param {number} [startedAt] Original public entry time of that call.
@@ -953,15 +1001,16 @@ class ShareRun {
    */
   beginClose(kind, timeout, startedAt) {
     const forced = kind === 'crash' || kind === 'fence' || kind === 'poll'
+    if (!forced) this.stopRequested = true
     let episode = this.closing
     if (episode) {
       if (kind === 'disconnect') {
         episode.disconnect(timeout, startedAt)
         episode.closeSockets = true
         this.armBoundary(episode)
-        if (episode.revoked) episode.boundary?.resolve()
+        if (episode.revoked) this.escalate(episode)
       }
-      if (forced) episode.boundary?.resolve()
+      if (forced) this.escalate(episode)
       return episode
     }
     episode = new ShareCloseEpisode({ run: this, requestTimeout: this.options.requestTimeout })
@@ -977,6 +1026,19 @@ class ShareRun {
     if (kind === 'disconnect') episode.disconnect(timeout, startedAt)
     this.close(episode).then(done.resolve, done.resolve)
     return episode
+  }
+
+  /**
+   * Moves a natural close to its forced boundary: eligible terminal work is frozen and ordinary
+   * authority retired in this very tick, so an old callback that runs before the close's own
+   * continuation can no longer decide or renew. The close then proceeds to its traffic.
+   * @private
+   * @param {ShareCloseEpisode} episode The run's natural episode.
+   * @returns {void}
+   */
+  escalate(episode) {
+    this.freeze(episode)
+    episode.boundary?.resolve()
   }
 
   /**
@@ -1040,7 +1102,9 @@ class ShareRun {
    * unstarted records are released, then every idle established node captures one terminal
    * ticket per partition, and only then is ordinary authority retired and every node disposed,
    * which settles the uncaptured remainder membership-lost. Busy and unopened nodes capture
-   * nothing.
+   * nothing. Every session discarded this way publishes one `session_reset` with reason
+   * `membership`. The heartbeat chain is suspended for a poll or fence recovery, so no join can
+   * overlap its traffic, and ended for good by every other kind.
    * @private
    * @param {ShareCloseEpisode} episode The run's episode.
    * @returns {void}
@@ -1060,18 +1124,21 @@ class ShareRun {
     episode.freeze(bindings)
     this.authorityToken = null
     this.admitting = false
-    if (episode.kind === 'poll') this.manager.stop()
-    else if (episode.kind !== 'fence') {
+    if (episode.kind === 'poll' || episode.kind === 'fence') this.manager.stop()
+    else {
       this.manager.shutdown()
       this.poll.stop()
     }
     for (const node of this.nodes.values()) {
+      const discarded = node.loop !== null && !node.loop.disposed
       node.loop?.dispose(new KafkaJSNonRetriableError('Share run closed'), {
         reason: 'membership-lost',
         preserve: node.captured,
       })
       node.operation.retire(new KafkaJSNonRetriableError('Share run closed'))
       node.pacing.retire(new KafkaJSNonRetriableError('Share run closed'))
+      if (discarded && (node.session.epoch !== 0 || node.dropped > 0))
+        this.onSessionReset(node, 'membership')
     }
   }
 
@@ -1085,10 +1152,8 @@ class ShareRun {
     const release = (cohort, from) => {
       if (!node.loop.isLive(cohort)) return
       try {
-        cohort.ledger.complete(
-          cohort.walk.deliver.records.slice(from).map((record) => record.offset),
-          'release'
-        )
+        const { records } = cohort.walk.deliver
+        cohort.ledger.completeRange(records, from, records.length, 'release')
       } catch (error) {
         this.options.logger.debug('Share unstarted release skipped', { error: error.message })
       }
@@ -1220,8 +1285,10 @@ class ShareRun {
   }
 
   /**
-   * Completes the episode for its kind: a stop or disconnect ends the run, a fence resumes it for
-   * the rejoin, and a crash is finished by its supervisor.
+   * Completes the episode for its kind: a stop or disconnect ends the run, and so does a fence or
+   * poll recovery that a stop or disconnect arrived in. Otherwise a fence resumes the run for the
+   * rejoin, restarting the suspended heartbeat chain, a poll recovery waits for its own rejoin,
+   * and a crash is finished by its supervisor.
    * @private
    * @param {ShareCloseEpisode} episode The run's episode.
    * @returns {void}
@@ -1229,16 +1296,20 @@ class ShareRun {
   afterClose(episode) {
     this.closed = true
     const { kind } = episode
-    if (kind === 'stop' || kind === 'disconnect') {
+    const recovery = kind === 'fence' || kind === 'poll'
+    if (kind === 'stop' || kind === 'disconnect' || (recovery && this.stopRequested)) {
       this.runner.emit(events.STOP)
       this.finishRun()
-    } else if (kind === 'fence' || kind === 'poll') {
+    } else if (recovery) {
       this.nodes.clear()
       this.closing = null
       this.closed = false
-      this.admitting = !this.stopRequested
+      this.admitting = true
       episode.finish()
-      if (kind === 'fence') this.syncNodes()
+      if (kind === 'fence') {
+        this.manager.ensureStarted()
+        this.syncNodes()
+      }
       return
     }
     episode.finish()
@@ -1257,6 +1328,8 @@ class ShareRun {
     this.admitting = false
     this.manager.shutdown()
     this.poll.stop()
+    this.notifyDrained()
+    this.retireLookups()
     this.membership.stop()
     this.unrouted()
     this.operation.finish()
@@ -1271,7 +1344,6 @@ class ShareRun {
    * @returns {Promise<void>} Settles when the close ended.
    */
   stop() {
-    this.stopRequested = true
     this.firstJoin.settled || this.firstJoin.resolve()
     return this.beginClose('stop').done
   }
@@ -1306,6 +1378,7 @@ class ShareRun {
     const captured = this.poll.captureExpired()
     const episode = this.beginClose('poll')
     await episode.done.catch(() => {})
+    if (this.stopRequested || this.retired || this.crashed) return
     await this.membership.leavePromise
     await this.drained(captured)
     if (this.stopRequested || this.retired || this.crashed) return
